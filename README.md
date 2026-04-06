@@ -30,7 +30,7 @@ The result is consistent frame delivery within the VRR window with no tearing at
 
 **Fake Fullscreen** — Intercepts exclusive fullscreen requests and forces borderless windowed mode instead. The game thinks it's in exclusive fullscreen while actually running borderless. Works on DXGI games (DX11/DX12) via ReShade's create_swapchain and set_fullscreen_state events.
 
-**Correct Reflex Integration** — The driver's NvAPI_D3D_Sleep call is always forwarded (never swallowed), preserving Reflex's JIT timing model. When the scheduler is inactive, the game's own Reflex params pass through to the driver unmodified.
+**Reflex Integration** — The driver's NvAPI_D3D_Sleep call is always forwarded (never swallowed), preserving Reflex's JIT timing model. When the scheduler is inactive, the game's own Reflex params pass through to the driver unmodified.
 
 **Focus Recovery** — On alt-tab return, the predictor and overload state are fully flushed so the scheduler re-learns frame times within 8 frames instead of staying stuck in overload with stale predictions.
 
