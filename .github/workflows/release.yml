@@ -87,8 +87,4 @@ jobs:
           $parts[2] = [int]$parts[2] + 1
           $newVer = $parts -join '.'
           $newVer | Out-File -FilePath VERSION -Encoding utf8 -NoNewline
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add VERSION
-          git commit -m "Bump version to $newVer [skip ci]"
-          git push
+          echo "Next version will be $newVer (update VERSION file manually before next release)"
