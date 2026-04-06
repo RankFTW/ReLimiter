@@ -264,8 +264,7 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         LOG_ERROR("LoadConfig exception 0x%08X", GetExceptionCode());
     }
     s_hModule = hModule;
-    LOG_INFO("Config loaded: target_fps=%d, mode=%s",
-             g_config.target_fps, g_config.pacing_mode.c_str());
+    LOG_INFO("Config loaded: target_fps=%d", g_config.target_fps);
 
     if (MH_Initialize() != MH_OK) {
         LOG_ERROR("MH_Initialize failed");

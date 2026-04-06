@@ -2,6 +2,8 @@
 #include "display_resolver.h"
 #include "swapchain_manager.h"
 #include "wake_guard.h"
+#include "config.h"
+#include "scheduler.h"
 #include "logger.h"
 #include <cmath>
 #include <cstring>
@@ -246,6 +248,20 @@ void PollGSyncState() {
                  vrr_info.bIsVRREnabled, vrr_info.bIsVRRPossible,
                  vrr_info.bIsVRRRequested, vrr_info.bIsDisplayInVRRMode,
                  new_state ? "active" : "inactive", display_id);
+
+        // First launch + VRR confirmed: default cap to Reflex VRR cap (hz - hz²/3600)
+        if (new_state && Config_IsFirstLaunch()) {
+            double hz = g_ceiling_hz.load(std::memory_order_relaxed);
+            if (hz > 1.0) {
+                int vrr_cap = static_cast<int>(hz - (hz * hz / 3600.0));
+                if (vrr_cap > 0) {
+                    g_config.target_fps = vrr_cap;
+                    ApplyConfig();
+                    SaveConfig();
+                    LOG_INFO("First launch: target_fps defaulted to VRR cap %d (ceiling %.0f Hz)", vrr_cap, hz);
+                }
+            }
+        }
     }
 
     if (new_state != old_state)

@@ -14,10 +14,13 @@ static std::atomic<EnforcementPath> s_active_path{EnforcementPath::None};
 static std::atomic<ActiveAPI>       s_prev_api{ActiveAPI::None};
 
 // ── Output FPS (all presents including FG) ──
-// Moved from api_bridge.cpp — counts every present callback.
+// Rolling 1-second window of present timestamps. FPS = count of presents
+// in the window. Simple, accurate, no smoothing artifacts.
 std::atomic<double> g_output_fps{0.0};
-static int64_t s_present_count_qpc = 0;
-static uint32_t s_present_count = 0;
+static constexpr int MAX_PRESENT_TIMESTAMPS = 512; // enough for 500+ FPS
+static int64_t s_present_ts[MAX_PRESENT_TIMESTAMPS] = {};
+static int     s_present_head = 0;
+static int     s_present_count = 0;
 
 // ── Path selection logic ──
 
@@ -89,21 +92,29 @@ void EnfDisp_OnSwapchainDestroy(bool full_teardown) {
 // ── Present event routing ──
 
 void EnfDisp_OnPresent(int64_t now_qpc) {
-    // ── Output FPS: count every present (including FG frames) ──
+    // ── Output FPS + 1% low: rolling 1-second window of present timestamps ──
     {
-        s_present_count++;
-        if (s_present_count_qpc == 0) {
-            s_present_count_qpc = now_qpc;
-            s_present_count = 1;
-        } else {
-            double elapsed_us = qpc_to_us(now_qpc - s_present_count_qpc);
-            if (elapsed_us >= 500000.0) { // update twice per second
-                g_output_fps.store(s_present_count * 1000000.0 / elapsed_us,
-                                   std::memory_order_relaxed);
-                s_present_count_qpc = now_qpc;
-                s_present_count = 0;
-            }
+        // Record this present
+        s_present_ts[s_present_head] = now_qpc;
+        s_present_head = (s_present_head + 1) % MAX_PRESENT_TIMESTAMPS;
+        if (s_present_count < MAX_PRESENT_TIMESTAMPS)
+            s_present_count++;
+
+        // Collect timestamps within the last 1 second into a sorted array
+        LARGE_INTEGER freq;
+        QueryPerformanceFrequency(&freq);
+        int64_t one_sec = freq.QuadPart;
+        int64_t cutoff = now_qpc - one_sec;
+
+        static int64_t window_ts[MAX_PRESENT_TIMESTAMPS];
+        int wcount = 0;
+        for (int i = 0; i < s_present_count; i++) {
+            if (s_present_ts[i] >= cutoff)
+                window_ts[wcount++] = s_present_ts[i];
         }
+
+        // Output FPS: simply the count of presents in the window
+        g_output_fps.store(static_cast<double>(wcount), std::memory_order_relaxed);
     }
 
     // If path was set to None by a full teardown, don't re-evaluate.

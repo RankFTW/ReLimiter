@@ -1,7 +1,6 @@
 #include "config.h"
 #include "scheduler.h"
 #include "wake_guard.h"
-#include "pll.h"
 #include "logger.h"
 #include <Windows.h>
 #include <string>
@@ -10,6 +9,7 @@
 Config g_config;
 
 static char s_ini_path[MAX_PATH] = {};
+static bool s_first_launch = false;
 
 // ── Simple INI helpers ──
 static std::string ReadINIString(const char* section, const char* key,
@@ -62,6 +62,55 @@ static void WriteINIBool(const char* section, const char* key, bool val,
     WriteINIString(section, key, val ? "true" : "false", path);
 }
 
+// ── Clamp helper ──
+template<typename T>
+static T Clamp(T val, T lo, T hi) { return val < lo ? lo : (val > hi ? hi : val); }
+
+// ── Validate a string against a whitelist, reset to default if invalid ──
+static void ValidateEnum(std::string& val, const char* const* allowed, int count, const char* def) {
+    for (int i = 0; i < count; i++)
+        if (val == allowed[i]) return;
+    LOG_WARN("Config: invalid value '%s', resetting to '%s'", val.c_str(), def);
+    val = def;
+}
+
+void ValidateConfig() {
+    // ── Core ──
+    if (g_config.target_fps != 0)
+        g_config.target_fps = Clamp(g_config.target_fps, 30, 1000);
+
+    static const char* enforce_markers[] = {"SimulationStart", "RenderSubmitStart", "Present"};
+    ValidateEnum(g_config.enforcement_marker, enforce_markers, 3, "SimulationStart");
+
+    // ── Wake Guard ──
+    g_config.initial_wake_guard_us = Clamp(g_config.initial_wake_guard_us, 0.0, 10000.0);
+
+    // ── OSD ──
+    g_config.osd_x               = Clamp(g_config.osd_x, 0.0f, 1.0f);
+    g_config.osd_y               = Clamp(g_config.osd_y, 0.0f, 1.0f);
+    g_config.osd_opacity          = Clamp(g_config.osd_opacity, 0.0f, 1.0f);
+    g_config.osd_scale            = Clamp(g_config.osd_scale, 0.5f, 2.0f);
+    g_config.osd_text_brightness  = Clamp(g_config.osd_text_brightness, 0.0f, 1.0f);
+
+    // ── Window mode ──
+    static const char* window_modes[] = {"default", "borderless", "fullscreen"};
+    ValidateEnum(g_config.window_mode, window_modes, 3, "default");
+
+    // ── Background FPS ──
+    if (g_config.background_fps != 0)
+        g_config.background_fps = Clamp(g_config.background_fps, 30, 60);
+
+    // ── VSync ──
+    static const char* vsync_modes[] = {"game", "off", "on"};
+    ValidateEnum(g_config.vsync_mode, vsync_modes, 3, "game");
+
+    // ── Logging ──
+    static const char* log_levels[] = {"error", "warn", "info", "debug"};
+    ValidateEnum(g_config.log_level, log_levels, 4, "info");
+}
+
+bool Config_IsFirstLaunch() { return s_first_launch; }
+
 void LoadConfig(HMODULE hModule) {
     // Build INI path next to the DLL
     GetModuleFileNameA(hModule, s_ini_path, MAX_PATH);
@@ -74,36 +123,16 @@ void LoadConfig(HMODULE hModule) {
 
     LOG_INFO("Config: INI path = %s", s_ini_path);
 
+    // Detect first launch: INI file does not yet exist
+    s_first_launch = (GetFileAttributesA(s_ini_path) == INVALID_FILE_ATTRIBUTES);
+
     const char* S = "FrameLimiter";
     const char* P = s_ini_path;
 
     LOG_INFO("Config: reading values...");
     g_config.target_fps              = ReadINIInt(S, "target_fps", 0, P);
-    g_config.pacing_mode             = ReadINIString(S, "pacing_mode", "auto", P);
     g_config.enforcement_marker      = ReadINIString(S, "enforcement_marker", "SimulationStart", P);
-    g_config.ceiling_margin_base     = ReadINIDouble(S, "ceiling_margin_base", 0.03, P);
-    g_config.ceiling_margin_shrink_alpha = ReadINIDouble(S, "ceiling_margin_shrink_alpha", 0.02, P);
-    g_config.vrr_floor_hz            = ReadINIDouble(S, "vrr_floor_hz", 0.0, P);
-    g_config.predictor_percentile    = ReadINIDouble(S, "predictor_percentile", 0.80, P);
-    g_config.predictor_window        = ReadINIInt(S, "predictor_window", 128, P);
-    g_config.damping_base            = ReadINIDouble(S, "damping_base", 0.25, P);
-    g_config.damping_cv_scale        = ReadINIDouble(S, "damping_cv_scale", 5.0, P);
     g_config.initial_wake_guard_us   = ReadINIDouble(S, "initial_wake_guard_us", 800.0, P);
-    g_config.pll_kp                  = ReadINIDouble(S, "pll_kp", 0.05, P);
-    g_config.pll_ki                  = ReadINIDouble(S, "pll_ki", 0.002, P);
-    g_config.vblank_source           = ReadINIString(S, "vblank_source", "auto", P);
-    g_config.dtc_alpha               = ReadINIDouble(S, "dtc_alpha", 0.03, P);
-    g_config.dtc_max_us              = ReadINIDouble(S, "dtc_max_us", 1000.0, P);
-    g_config.fg_aware                = ReadINIBool(S, "fg_aware", true, P);
-    g_config.fg_ramp_ms              = ReadINIDouble(S, "fg_ramp_ms", 50.0, P);
-    g_config.spin_method             = ReadINIString(S, "spin_method", "auto", P);
-    g_config.gsync_mode              = ReadINIString(S, "gsync_mode", "auto", P);
-    g_config.block_flip_metering     = ReadINIBool(S, "block_flip_metering", true, P);
-    g_config.disable_frame_splitting = ReadINIBool(S, "disable_frame_splitting", true, P);
-    g_config.exclusive_pacing        = ReadINIBool(S, "exclusive_pacing", true, P);
-    g_config.overload_enter_frac     = ReadINIDouble(S, "overload_enter_frac", 0.03, P);
-    g_config.overload_exit_frac      = ReadINIDouble(S, "overload_exit_frac", 0.07, P);
-    g_config.overload_consecutive    = ReadINIInt(S, "overload_consecutive", 3, P);
     g_config.osd_enabled             = ReadINIBool(S, "osd_enabled", false, P);
     g_config.osd_x                   = static_cast<float>(ReadINIDouble(S, "osd_x", 0.005, P));
     g_config.osd_y                   = static_cast<float>(ReadINIDouble(S, "osd_y", 0.005, P));
@@ -112,7 +141,6 @@ void LoadConfig(HMODULE hModule) {
     g_config.osd_show_fps            = ReadINIBool(S, "osd_show_fps", false, P);
     g_config.osd_show_frametime      = ReadINIBool(S, "osd_show_frametime", false, P);
     g_config.osd_show_frametime_graph = ReadINIBool(S, "osd_show_frametime_graph", false, P);
-    g_config.osd_show_pipeline       = ReadINIBool(S, "osd_show_pipeline", false, P);
     g_config.osd_show_fg             = ReadINIBool(S, "osd_show_fg", false, P);
     g_config.osd_show_limiter        = ReadINIBool(S, "osd_show_limiter", false, P);
     g_config.osd_show_pqi            = ReadINIBool(S, "osd_show_pqi", false, P);
@@ -120,7 +148,6 @@ void LoadConfig(HMODULE hModule) {
     g_config.osd_show_pqi_breakdown  = ReadINIBool(S, "osd_show_pqi_breakdown", false, P);
     g_config.osd_show_1pct_low       = ReadINIBool(S, "osd_show_1pct_low", false, P);
     g_config.osd_show_smoothness     = ReadINIBool(S, "osd_show_smoothness", false, P);
-    g_config.osd_show_gsync_status   = ReadINIBool(S, "osd_show_gsync_status", false, P);
     g_config.osd_scale               = static_cast<float>(ReadINIDouble(S, "osd_scale", 1.0, P));
     g_config.osd_drop_shadow         = ReadINIBool(S, "osd_drop_shadow", true, P);
     g_config.osd_text_brightness     = static_cast<float>(ReadINIDouble(S, "osd_text_brightness", 1.0, P));
@@ -130,16 +157,16 @@ void LoadConfig(HMODULE hModule) {
     g_config.vsync_mode              = ReadINIString(S, "vsync_mode", "game", P);
     g_config.log_level               = ReadINIString(S, "log_level", "warn", P);
     g_config.csv_enabled             = ReadINIBool(S, "csv_enabled", false, P);
-    g_config.csv_path                = ReadINIString(S, "csv_path", "", P);
-    g_config.csv_toggle_key          = ReadINIString(S, "csv_toggle_key", "F11", P);
-    g_config.baseline_duration_s     = ReadINIDouble(S, "baseline_duration_s", 30.0, P);
     g_config.reflex_inject           = ReadINIBool(S, "reflex_inject", false, P);
 
     LOG_INFO("Config: values read, calling ApplyConfig...");
+    ValidateConfig();
     ApplyConfig();
     LOG_INFO("Config: ApplyConfig done");
 
-    // Always write INI to create it with defaults if it doesn't exist
+    // Delete the entire section and rewrite it clean.
+    // This purges stale keys left over from older versions.
+    WritePrivateProfileStringA(S, nullptr, nullptr, P);
     SaveConfig();
 }
 
@@ -150,31 +177,8 @@ void SaveConfig() {
     const char* P = s_ini_path;
 
     WriteINIInt(S, "target_fps", g_config.target_fps, P);
-    WriteINIString(S, "pacing_mode", g_config.pacing_mode.c_str(), P);
     WriteINIString(S, "enforcement_marker", g_config.enforcement_marker.c_str(), P);
-    WriteINIDouble(S, "ceiling_margin_base", g_config.ceiling_margin_base, P);
-    WriteINIDouble(S, "ceiling_margin_shrink_alpha", g_config.ceiling_margin_shrink_alpha, P);
-    WriteINIDouble(S, "vrr_floor_hz", g_config.vrr_floor_hz, P);
-    WriteINIDouble(S, "predictor_percentile", g_config.predictor_percentile, P);
-    WriteINIInt(S, "predictor_window", g_config.predictor_window, P);
-    WriteINIDouble(S, "damping_base", g_config.damping_base, P);
-    WriteINIDouble(S, "damping_cv_scale", g_config.damping_cv_scale, P);
     WriteINIDouble(S, "initial_wake_guard_us", g_config.initial_wake_guard_us, P);
-    WriteINIDouble(S, "pll_kp", g_config.pll_kp, P);
-    WriteINIDouble(S, "pll_ki", g_config.pll_ki, P);
-    WriteINIString(S, "vblank_source", g_config.vblank_source.c_str(), P);
-    WriteINIDouble(S, "dtc_alpha", g_config.dtc_alpha, P);
-    WriteINIDouble(S, "dtc_max_us", g_config.dtc_max_us, P);
-    WriteINIBool(S, "fg_aware", g_config.fg_aware, P);
-    WriteINIDouble(S, "fg_ramp_ms", g_config.fg_ramp_ms, P);
-    WriteINIString(S, "spin_method", g_config.spin_method.c_str(), P);
-    WriteINIString(S, "gsync_mode", g_config.gsync_mode.c_str(), P);
-    WriteINIBool(S, "block_flip_metering", g_config.block_flip_metering, P);
-    WriteINIBool(S, "disable_frame_splitting", g_config.disable_frame_splitting, P);
-    WriteINIBool(S, "exclusive_pacing", g_config.exclusive_pacing, P);
-    WriteINIDouble(S, "overload_enter_frac", g_config.overload_enter_frac, P);
-    WriteINIDouble(S, "overload_exit_frac", g_config.overload_exit_frac, P);
-    WriteINIInt(S, "overload_consecutive", g_config.overload_consecutive, P);
     WriteINIBool(S, "osd_enabled", g_config.osd_enabled, P);
     WriteINIDouble(S, "osd_x", g_config.osd_x, P);
     WriteINIDouble(S, "osd_y", g_config.osd_y, P);
@@ -183,7 +187,6 @@ void SaveConfig() {
     WriteINIBool(S, "osd_show_fps", g_config.osd_show_fps, P);
     WriteINIBool(S, "osd_show_frametime", g_config.osd_show_frametime, P);
     WriteINIBool(S, "osd_show_frametime_graph", g_config.osd_show_frametime_graph, P);
-    WriteINIBool(S, "osd_show_pipeline", g_config.osd_show_pipeline, P);
     WriteINIBool(S, "osd_show_fg", g_config.osd_show_fg, P);
     WriteINIBool(S, "osd_show_limiter", g_config.osd_show_limiter, P);
     WriteINIBool(S, "osd_show_pqi", g_config.osd_show_pqi, P);
@@ -191,7 +194,6 @@ void SaveConfig() {
     WriteINIBool(S, "osd_show_pqi_breakdown", g_config.osd_show_pqi_breakdown, P);
     WriteINIBool(S, "osd_show_1pct_low", g_config.osd_show_1pct_low, P);
     WriteINIBool(S, "osd_show_smoothness", g_config.osd_show_smoothness, P);
-    WriteINIBool(S, "osd_show_gsync_status", g_config.osd_show_gsync_status, P);
     WriteINIDouble(S, "osd_scale", g_config.osd_scale, P);
     WriteINIBool(S, "osd_drop_shadow", g_config.osd_drop_shadow, P);
     WriteINIDouble(S, "osd_text_brightness", g_config.osd_text_brightness, P);
@@ -201,9 +203,6 @@ void SaveConfig() {
     WriteINIString(S, "vsync_mode", g_config.vsync_mode.c_str(), P);
     WriteINIString(S, "log_level", g_config.log_level.c_str(), P);
     WriteINIBool(S, "csv_enabled", g_config.csv_enabled, P);
-    WriteINIString(S, "csv_path", g_config.csv_path.c_str(), P);
-    WriteINIString(S, "csv_toggle_key", g_config.csv_toggle_key.c_str(), P);
-    WriteINIDouble(S, "baseline_duration_s", g_config.baseline_duration_s, P);
     WriteINIBool(S, "reflex_inject", g_config.reflex_inject, P);
 }
 

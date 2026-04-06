@@ -103,6 +103,9 @@ static void MoveWindowToMonitor(int idx) {
 }
 
 void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
+    // Dirty flag — set by any config change, triggers SaveConfig at end of frame
+    bool config_dirty = false;
+
     // ════════════════════════════════════════════
     // SECTION 1: FPS
     // ════════════════════════════════════════════
@@ -126,6 +129,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             g_user_target_fps.store(reflex_cap, std::memory_order_relaxed);
             g_config.target_fps = reflex_cap;
             s_target_edit = reflex_cap;
+            config_dirty = true;
         }
     }
     ImGui::SameLine();
@@ -135,6 +139,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             g_user_target_fps.store(target, std::memory_order_relaxed);
             g_config.target_fps = target;
             s_target_edit = target;
+            config_dirty = true;
         }
     }
     ImGui::SameLine();
@@ -142,6 +147,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         g_user_target_fps.store(0, std::memory_order_relaxed);
         g_config.target_fps = 0;
         s_target_edit = 0;
+        config_dirty = true;
     }
     if (reflex_cap > 0) {
         char tip[128];
@@ -167,6 +173,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         if (s_target_edit > 0 && s_target_edit < 30) s_target_edit = 30;
         g_user_target_fps.store(s_target_edit, std::memory_order_relaxed);
         g_config.target_fps = s_target_edit;
+        config_dirty = true;
     }
     HelpTip("The FPS the limiter will target. 0 = no limiting. Minimum is 30.");
 
@@ -178,6 +185,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             g_user_target_fps.store(p, std::memory_order_relaxed);
             g_config.target_fps = p;
             s_target_edit = p;
+            config_dirty = true;
         }
     }
 
@@ -197,6 +205,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         if (s_bg_edit > 0 && s_bg_edit < 30) s_bg_edit = 30;
         g_background_fps.store(s_bg_edit, std::memory_order_relaxed);
         g_config.background_fps = s_bg_edit;
+        config_dirty = true;
     }
     HelpTip("FPS cap when the game window loses focus. 0 = uncapped. Minimum is 30.");
 
@@ -214,6 +223,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                     if (i != current_vsync) {
                         const char* mode_str[] = {"game", "off", "on"};
                         g_config.vsync_mode = mode_str[i];
+                        config_dirty = true;
                         // Apply immediately for OpenGL
                         VSync_ApplyOpenGL();
                     }
@@ -229,17 +239,20 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     // ════════════════════════════════════════════
     ImGui::Separator();
     if (ImGui::CollapsingHeader("OSD")) {
-        ImGui::Checkbox("Show OSD", &g_config.osd_enabled);
+        if (ImGui::Checkbox("Show OSD", &g_config.osd_enabled)) config_dirty = true;
         HelpTip("Toggle the in-game overlay on or off.");
         float osd_x_pct = g_config.osd_x * 100.0f;
         float osd_y_pct = g_config.osd_y * 100.0f;
         if (ImGui::SliderFloat("OSD X", &osd_x_pct, 0.0f, 100.0f, "%.1f%%"))
             g_config.osd_x = osd_x_pct / 100.0f;
+        if (ImGui::IsItemDeactivatedAfterEdit()) config_dirty = true;
         HelpTip("Horizontal position of the overlay as a percentage of screen width.");
         if (ImGui::SliderFloat("OSD Y", &osd_y_pct, 0.0f, 100.0f, "%.1f%%"))
             g_config.osd_y = osd_y_pct / 100.0f;
+        if (ImGui::IsItemDeactivatedAfterEdit()) config_dirty = true;
         HelpTip("Vertical position of the overlay as a percentage of screen height.");
         ImGui::SliderFloat("OSD Opacity", &g_config.osd_opacity, 0.0f, 1.0f, "%.2f");
+        if (ImGui::IsItemDeactivatedAfterEdit()) config_dirty = true;
         HelpTip("Background transparency of the overlay. 0 = fully transparent, 1 = fully opaque.");
 
         // ── Appearance ──
@@ -248,47 +261,49 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         float scale_pct = g_config.osd_scale * 100.0f;
         if (ImGui::SliderFloat("OSD Scale", &scale_pct, 50.0f, 200.0f, "%.0f%%"))
             g_config.osd_scale = scale_pct / 100.0f;
+        if (ImGui::IsItemDeactivatedAfterEdit()) config_dirty = true;
         HelpTip("Scale the entire OSD overlay. 100%% is default size.");
-        ImGui::Checkbox("Drop Shadow", &g_config.osd_drop_shadow);
+        if (ImGui::Checkbox("Drop Shadow", &g_config.osd_drop_shadow)) config_dirty = true;
         HelpTip("Draw a shadow behind OSD text for better readability.");
         ImGui::SliderFloat("Text Brightness", &g_config.osd_text_brightness, 0.0f, 1.0f, "%.2f");
+        if (ImGui::IsItemDeactivatedAfterEdit()) config_dirty = true;
         HelpTip("Brightness of the OSD text. 1.0 = full white, 0.0 = black.");
 
         // ── Elements by category ──
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.9f, 1.0f), "Performance");
-        ImGui::Checkbox("FPS##osd_elem", &g_config.osd_show_fps);
+        if (ImGui::Checkbox("FPS##osd_elem", &g_config.osd_show_fps)) config_dirty = true;
         HelpTip("Show the current FPS. When Frame Generation is active, shows both output and render FPS.");
-        ImGui::Checkbox("1%% Low##osd_elem", &g_config.osd_show_1pct_low);
+        if (ImGui::Checkbox("1%% Low##osd_elem", &g_config.osd_show_1pct_low)) config_dirty = true;
         HelpTip("Show the 1%% low FPS over a rolling window. Uses display FPS when Frame Generation is active.");
-        ImGui::Checkbox("Frametime##osd_elem", &g_config.osd_show_frametime);
+        if (ImGui::Checkbox("Frametime##osd_elem", &g_config.osd_show_frametime)) config_dirty = true;
         HelpTip("Show the current frame time in milliseconds.");
-        ImGui::Checkbox("Frametime Graph##osd_elem", &g_config.osd_show_frametime_graph);
+        if (ImGui::Checkbox("Frametime Graph##osd_elem", &g_config.osd_show_frametime_graph)) config_dirty = true;
         HelpTip("Show a rolling graph of recent frame times.");
 
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Latency");
-        ImGui::Checkbox("CPU Latency##osd_elem", &g_config.osd_show_cpu_latency);
+        if (ImGui::Checkbox("CPU Latency##osd_elem", &g_config.osd_show_cpu_latency)) config_dirty = true;
         HelpTip("CPU pipeline time: SIM_START to RENDERSUBMIT_END. Measures how long the CPU spends on simulation + render submission.");
 
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "Quality");
-        ImGui::Checkbox("PQI##osd_elem", &g_config.osd_show_pqi);
+        if (ImGui::Checkbox("PQI##osd_elem", &g_config.osd_show_pqi)) config_dirty = true;
         HelpTip("Pacing Quality Index: a 0-100%% composite score. Green=great, yellow=ok, red=poor.");
         if (g_config.osd_show_pqi) {
             ImGui::Indent();
-            ImGui::Checkbox("Show Breakdown##osd_elem", &g_config.osd_show_pqi_breakdown);
+            if (ImGui::Checkbox("Show Breakdown##osd_elem", &g_config.osd_show_pqi_breakdown)) config_dirty = true;
             HelpTip("Show individual PQI sub-scores: cadence, stutter, and deadline.");
             ImGui::Unindent();
         }
-        ImGui::Checkbox("Smoothness##osd_elem", &g_config.osd_show_smoothness);
+        if (ImGui::Checkbox("Smoothness##osd_elem", &g_config.osd_show_smoothness)) config_dirty = true;
         HelpTip("Frame interval deviation from target in milliseconds. Lower = smoother. Green < 0.5ms, yellow < 1.5ms, red above. EMA-smoothed, skips loading screen outliers.");
 
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Pipeline");
-        ImGui::Checkbox("Frame Generation##osd_elem", &g_config.osd_show_fg);
+        if (ImGui::Checkbox("Frame Generation##osd_elem", &g_config.osd_show_fg)) config_dirty = true;
         HelpTip("Show whether DLSS Frame Generation is active and its multiplier.");
-        ImGui::Checkbox("Limiter / Tier##osd_elem", &g_config.osd_show_limiter);
+        if (ImGui::Checkbox("Limiter / Tier##osd_elem", &g_config.osd_show_limiter)) config_dirty = true;
         HelpTip("Show how much time the limiter added and the current degradation tier (T0=full, T4=suspended).");
     }
 
@@ -335,6 +350,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                         if (hwnd) {
                             const char* mode_str[] = {"default", "borderless", "fullscreen"};
                             g_config.window_mode = mode_str[i];
+                            config_dirty = true;
 
                             struct WMData { HWND hwnd; int mode; };
                             auto* data = new WMData{ hwnd, i };
@@ -383,7 +399,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         HelpTip("Default restores the game's normal window. Borderless removes borders and fills the screen. Fullscreen does the same but keeps the window topmost.");
 
         ImGui::Spacing();
-        ImGui::Checkbox("Fake Fullscreen", &g_config.fake_fullscreen);
+        if (ImGui::Checkbox("Fake Fullscreen", &g_config.fake_fullscreen)) config_dirty = true;
         HelpTip("Intercept exclusive fullscreen and run as borderless window instead. "
                 "The game still thinks it's in exclusive fullscreen. "
                 "Takes effect on next fullscreen transition or game restart.");
@@ -398,6 +414,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         bool inject = g_config.reflex_inject;
         if (ImGui::Checkbox("Inject Reflex Markers", &inject)) {
             g_config.reflex_inject = inject;
+            config_dirty = true;
         }
         HelpTip("Synthesize NVIDIA Reflex markers for non-Reflex games. "
                 "Enables driver-side JIT pacing and GPU clock boost. "
@@ -418,6 +435,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         if (ImGui::Checkbox("Advanced Logging", &csv)) {
             g_config.csv_enabled = csv;
             CSV_SetEnabled(csv);
+            config_dirty = true;
         }
         HelpTip("Enable per-frame CSV telemetry recording. Toggle in-game with the CSV hotkey (default F11).");
     }
@@ -471,6 +489,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
 
                     g_config.osd_toggle_key = name;
                     s_capturing = false;
+                    config_dirty = true;
                     break;
                 }
             }
@@ -540,13 +559,9 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         ImGui::TextColored(present_ok ? col_ok : col_bad, "PRESENT %s", present_ok ? "ok" : "X");
     }
 
-    // Periodic save
-    static DWORD s_last_save_tick = 0;
-    DWORD now_tick = GetTickCount();
-    if (now_tick - s_last_save_tick > 2000) {
+    // Save immediately when any setting was changed this frame
+    if (config_dirty)
         SaveConfig();
-        s_last_save_tick = now_tick;
-    }
 }
 
 // ── 1% low tracking ──
@@ -562,10 +577,15 @@ static double Compute1PctLowFPS() {
     for (int i = 0; i < n; i++)
         sorted[i] = s_low_history[i];
     std::sort(sorted, sorted + n);
-    int idx = static_cast<int>(0.99 * (n - 1));
-    double worst_ft_us = sorted[idx];
-    if (worst_ft_us > 0.0)
-        return 1000000.0 / worst_ft_us;
+    // 1% low: average the slowest 1% of frame times, convert to FPS
+    int tail_start = static_cast<int>(0.99 * (n - 1));
+    int tail_count = n - tail_start;
+    double sum = 0.0;
+    for (int i = tail_start; i < n; i++)
+        sum += sorted[i];
+    double avg_worst = sum / tail_count;
+    if (avg_worst > 0.0)
+        return 1000000.0 / avg_worst;
     return 0.0;
 }
 
