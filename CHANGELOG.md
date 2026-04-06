@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.0.1
+## 3.1.0
 - Fixed config saving logic and removed dead config values
 - Fixed output FPS display
 - Added first launch detection with auto VRR cap enforcement
