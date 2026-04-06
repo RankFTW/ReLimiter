@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.0.1
+- Fixed config saving logic and removed dead config values
+- Fixed output FPS display
+- Added first launch detection with auto VRR cap enforcement
+- Fixed FPS limit only applying after setting change is complete
+- Added config validation
+
 ## 3.0.0
 - Precision frame pacing for NVIDIA G-Sync/VRR displays via ReShade addon
 - Adaptive render time prediction with regime break detection

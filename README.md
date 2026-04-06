@@ -26,7 +26,7 @@ ReLimiter intercepts frame delivery between the game and the display driver. For
 
 ## Known Limitations / WIP
 
-- **No DMFG support** — DLSS Multi Frame Generation is not supported
+- **No DMFG support** — DLSS Dynamic Multi Frame Generation is not supported
 - **Smooth Motion** — Shows incorrect FPS. Cap to half of Reflex cap as a workaround
 - **Some Vulkan games** — Older Vulkan titles may not work. Newer ones should be fine
 - **Latency** — Not higher than native Reflex, but not actively optimized beyond that yet
