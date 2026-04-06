@@ -59,25 +59,25 @@ struct Config {
     int overload_consecutive = 3;
 
     // OSD
-    bool osd_enabled = true;
+    bool osd_enabled = false;
     float osd_x = 0.005f;              // 0.0–1.0 screen percentage
     float osd_y = 0.005f;              // 0.0–1.0 screen percentage
     float osd_opacity = 0.6f;
     std::string osd_toggle_key = "F12";
 
     // OSD element visibility
-    bool osd_show_fps = true;
-    bool osd_show_frametime = true;
+    bool osd_show_fps = false;
+    bool osd_show_frametime = false;
     bool osd_show_frametime_graph = false;
-    bool osd_show_pipeline = true;
-    bool osd_show_fg = true;
-    bool osd_show_limiter = true;
-    bool osd_show_pqi = true;
-    bool osd_show_cpu_latency = true;
-    bool osd_show_pqi_breakdown = true;
-    bool osd_show_1pct_low = true;
-    bool osd_show_smoothness = true;
-    bool osd_show_gsync_status = true;
+    bool osd_show_pipeline = false;
+    bool osd_show_fg = false;
+    bool osd_show_limiter = false;
+    bool osd_show_pqi = false;
+    bool osd_show_cpu_latency = false;
+    bool osd_show_pqi_breakdown = false;
+    bool osd_show_1pct_low = false;
+    bool osd_show_smoothness = false;
+    bool osd_show_gsync_status = false;
 
     // OSD appearance
     float osd_scale = 1.0f;                // 0.5 – 2.0 (50% – 200%)

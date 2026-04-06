@@ -18,7 +18,7 @@ The result is consistent frame delivery within the VRR window with no tearing at
 
 **VRR Ceiling Protection** — A PRESENT_START gate holds early-finishing frames at the deadline so they don't present above the monitor's VRR ceiling. The gate stays active even during GPU overload to maintain cadence at VRR boundaries without adding latency.
 
-**Overload Bypass** — When the GPU can't keep up, the limiter transparently steps aside. Hysteresis prevents oscillation (5 frames to enter, 8 to exit), and a post-overload warmup period prevents stutter on re-entry.
+**Overload Bypass** — When the GPU can't keep up, the limiter transparently steps aside. Hysteresis prevents oscillation, and a post-overload warmup period prevents stutter on re-entry.
 
 **LFC Guard** — When the target interval would drop below the VRR floor, the interval is rounded up to the nearest ceiling multiple to prevent Low Framerate Compensation from kicking in with visible judder.
 
@@ -26,19 +26,61 @@ The result is consistent frame delivery within the VRR window with no tearing at
 
 **Background FPS Cap** — Configurable FPS limit when the game loses focus. Actively enforced, saving GPU power when alt-tabbed.
 
+**VSync Override** — Three-way control (Game / Off / On) that overrides the game's VSync setting. Works on both DXGI (hooks IDXGISwapChain::Present) and OpenGL (hooks gdi32!SwapBuffers + wglSwapIntervalEXT). Periodically re-applies to counteract games that re-enable VSync on focus changes.
+
+**Fake Fullscreen** — Intercepts exclusive fullscreen requests and forces borderless windowed mode instead. The game thinks it's in exclusive fullscreen while actually running borderless. Works on DXGI games (DX11/DX12) via ReShade's create_swapchain and set_fullscreen_state events.
+
 **Correct Reflex Integration** — The driver's NvAPI_D3D_Sleep call is always forwarded (never swallowed), preserving Reflex's JIT timing model. When the scheduler is inactive, the game's own Reflex params pass through to the driver unmodified.
+
+**Focus Recovery** — On alt-tab return, the predictor and overload state are fully flushed so the scheduler re-learns frame times within 8 frames instead of staying stuck in overload with stale predictions.
 
 ## Supported APIs
 
 - **DX12** — Full support via NvAPI Reflex marker interception (SIMULATION_START enforcement)
 - **DX11** — Present-based enforcement with frame latency control via IDXGIDevice1
 - **Vulkan** — Present-based enforcement, or SIMULATION_START enforcement via Streamline PCL marker hooks when available
+- **OpenGL** — Present-based enforcement with VSync override via gdi32!SwapBuffers hook
 
-## OSD and Settings
+## OSD
 
-The in-game overlay shows FPS (with render/output split when FG is active), 1% low, frametime with rolling graph, render latency, PQI score with breakdown, FG status, limiter tier, G-Sync state, and recording indicators. All elements are individually toggleable with configurable scale, shadow, brightness, and position.
+The in-game overlay shows:
+- FPS (with render/output split when FG is active)
+- 1% low FPS
+- Frametime (ms) with optional rolling graph
+- CPU latency (SIM_START to RENDERSUBMIT_END)
+- PQI score with breakdown (cadence, stutter, deadline)
+- Smoothness (frame interval deviation)
+- Frame Generation status and multiplier
+- Limiter added latency and tier
+- Overload indicator
+- Recording and baseline capture indicators
 
-The ReShade settings panel provides FPS target (VRR Cap / Custom / Off), quick presets (30/60/120/240), background FPS slider, full OSD appearance controls, monitor selector with window move, and window mode switching (Default / Borderless / Fullscreen).
+All elements are individually toggleable with configurable scale, shadow, brightness, and position. Toggle with a configurable hotkey (default F12).
+
+## ReShade Settings Panel
+
+**FPS Section**
+- Target FPS: VRR Cap / Custom / Off radio buttons, slider (0 or 30-360), quick presets (30/60/120/240)
+- Background FPS: slider (0 or 30-60)
+- VSync: Game / Off / On combo
+
+**OSD Section** (collapsible)
+- Show OSD, position (X/Y), opacity
+- Scale, drop shadow, text brightness
+- Per-element toggles grouped by category (Performance, Latency, Quality, Pipeline)
+
+**Screen Section** (collapsible)
+- Display selector with window move
+- Window Mode: Default / Borderless / Fullscreen
+- Fake Fullscreen checkbox
+
+**Advanced Section** (collapsible)
+- Inject Reflex Markers (with active/waiting status)
+- Advanced Logging (CSV telemetry toggle)
+
+**Always Visible**
+- OSD Toggle Key with capture UI
+- Status info: API, Reflex status, Streamline, Enforcement mode, G-Sync/Mode, Pipeline health (SIM/RENDER/PRESENT)
 
 ## Pacing Quality Index (PQI)
 
@@ -49,7 +91,7 @@ A 0-100% composite score measuring frame delivery quality over a rolling 300-fra
 
 ## Telemetry
 
-Per-frame CSV recording (toggle with F11) captures 28 columns including predicted/actual frame time, sleep durations, wake error, ceiling margin, stress level, CV, tier, overload state, FG divisor, scanout error, queue depth, PQI scores, and stall diagnostics. A baseline comparison mode records N seconds without the limiter, then N seconds with it, and writes a side-by-side PQI report.
+Per-frame CSV recording (toggle with F11 or via Advanced Logging checkbox) captures 28+ columns including predicted/actual frame time, sleep durations, wake error, ceiling margin, stress level, CV, tier, overload state, FG divisor, scanout error, queue depth, PQI scores, and stall diagnostics. A baseline comparison mode records N seconds without the limiter, then N seconds with it, and writes a side-by-side PQI report.
 
 ## Building From Source
 

@@ -1,0 +1,94 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $ver = (Get-Content VERSION).Trim()
+          echo "VERSION=$ver" >> $env:GITHUB_OUTPUT
+
+      - name: Check if tag exists
+        id: check_tag
+        shell: pwsh
+        run: |
+          $tag = "v${{ steps.version.outputs.VERSION }}"
+          $exists = git tag -l $tag
+          if ($exists) {
+            echo "TAG_EXISTS=true" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "TAG_EXISTS=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Setup MSBuild
+        if: steps.check_tag.outputs.TAG_EXISTS == 'false'
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Configure CMake
+        if: steps.check_tag.outputs.TAG_EXISTS == 'false'
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build Release
+        if: steps.check_tag.outputs.TAG_EXISTS == 'false'
+        run: cmake --build build --config Release
+
+      - name: Extract changelog for this version
+        if: steps.check_tag.outputs.TAG_EXISTS == 'false'
+        id: changelog
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.version.outputs.VERSION }}"
+          $content = Get-Content CHANGELOG.md -Raw
+          # Extract section for this version
+          $pattern = "(?ms)## $([regex]::Escape($ver))\r?\n(.*?)(?=\r?\n## |\z)"
+          if ($content -match $pattern) {
+            $notes = $Matches[1].Trim()
+          } else {
+            $notes = "Release v$ver"
+          }
+          # Write to file to avoid escaping issues
+          $notes | Out-File -FilePath release_notes.txt -Encoding utf8
+          echo "NOTES_FILE=release_notes.txt" >> $env:GITHUB_OUTPUT
+
+      - name: Create tag and release
+        if: steps.check_tag.outputs.TAG_EXISTS == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.VERSION }}
+          name: ReLimiter v${{ steps.version.outputs.VERSION }}
+          body_path: release_notes.txt
+          files: build/bin/Release/relimiter.addon64
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bump version for next release
+        if: steps.check_tag.outputs.TAG_EXISTS == 'false'
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.version.outputs.VERSION }}"
+          $parts = $ver.Split('.')
+          $parts[2] = [int]$parts[2] + 1
+          $newVer = $parts -join '.'
+          $newVer | Out-File -FilePath VERSION -Encoding utf8 -NoNewline
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git commit -m "Bump version to $newVer [skip ci]"
+          git push
