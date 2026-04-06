@@ -1,0 +1,9 @@
+[submodule "deps/reshade"]
+	path = deps/reshade
+	url = https://github.com/crosire/reshade.git
+[submodule "deps/nvapi"]
+	path = deps/nvapi
+	url = https://github.com/NVIDIA/nvapi.git
+[submodule "deps/vulkan-headers"]
+	path = deps/vulkan-headers
+	url = https://github.com/KhronosGroup/Vulkan-Headers.git
