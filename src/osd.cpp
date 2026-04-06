@@ -106,7 +106,14 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     // ════════════════════════════════════════════
     // SECTION 1: FPS
     // ════════════════════════════════════════════
-    int target = g_user_target_fps.load(std::memory_order_relaxed);
+    // Use a static so the slider value persists across frames while
+    // the user is dragging or typing. Only sync from the atomic when
+    // the widget is idle, preventing snap-back during interaction.
+    static int s_target_edit = g_user_target_fps.load(std::memory_order_relaxed);
+    static bool s_target_active = false;
+    if (!s_target_active)
+        s_target_edit = g_user_target_fps.load(std::memory_order_relaxed);
+    int target = s_target_edit;
 
     // Compute Reflex VRR cap: fps = hz - hz^2/3600, floored
     double ceiling_hz = g_ceiling_hz.load(std::memory_order_relaxed);
@@ -118,6 +125,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         if (reflex_cap > 0) {
             g_user_target_fps.store(reflex_cap, std::memory_order_relaxed);
             g_config.target_fps = reflex_cap;
+            s_target_edit = reflex_cap;
         }
     }
     ImGui::SameLine();
@@ -126,12 +134,14 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             target = 60;
             g_user_target_fps.store(target, std::memory_order_relaxed);
             g_config.target_fps = target;
+            s_target_edit = target;
         }
     }
     ImGui::SameLine();
     if (ImGui::RadioButton("Off", target == 0)) {
         g_user_target_fps.store(0, std::memory_order_relaxed);
         g_config.target_fps = 0;
+        s_target_edit = 0;
     }
     if (reflex_cap > 0) {
         char tip[128];
@@ -145,17 +155,18 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     }
 
     char slider_fmt[32];
-    if (target == 0)
+    if (s_target_edit == 0)
         snprintf(slider_fmt, sizeof(slider_fmt), "Off");
-    else if (target == reflex_cap && reflex_cap > 0)
+    else if (s_target_edit == reflex_cap && reflex_cap > 0)
         snprintf(slider_fmt, sizeof(slider_fmt), "%%d (VRR)");
     else
         snprintf(slider_fmt, sizeof(slider_fmt), "%%d");
-    if (ImGui::SliderInt("Target FPS", &target, 0, 360, slider_fmt)) {
-        // Enforce minimum: 0 (off) or 30+, nothing in between
-        if (target > 0 && target < 30) target = 30;
-        g_user_target_fps.store(target, std::memory_order_relaxed);
-        g_config.target_fps = target;
+    ImGui::SliderInt("Target FPS", &s_target_edit, 0, 360, slider_fmt);
+    s_target_active = ImGui::IsItemActive();
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        if (s_target_edit > 0 && s_target_edit < 30) s_target_edit = 30;
+        g_user_target_fps.store(s_target_edit, std::memory_order_relaxed);
+        g_config.target_fps = s_target_edit;
     }
     HelpTip("The FPS the limiter will target. 0 = no limiting. Minimum is 30.");
 
@@ -166,21 +177,26 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         if (ImGui::Button(label)) {
             g_user_target_fps.store(p, std::memory_order_relaxed);
             g_config.target_fps = p;
+            s_target_edit = p;
         }
     }
 
     ImGui::Spacing();
-    int bg_fps = g_background_fps.load(std::memory_order_relaxed);
+    static int s_bg_edit = g_background_fps.load(std::memory_order_relaxed);
+    static bool s_bg_active = false;
+    if (!s_bg_active)
+        s_bg_edit = g_background_fps.load(std::memory_order_relaxed);
     char bg_fmt[32];
-    if (bg_fps == 0)
+    if (s_bg_edit == 0)
         snprintf(bg_fmt, sizeof(bg_fmt), "Uncapped");
     else
         snprintf(bg_fmt, sizeof(bg_fmt), "%%d");
-    if (ImGui::SliderInt("Background FPS", &bg_fps, 0, 60, bg_fmt)) {
-        // Enforce minimum: 0 (uncapped) or 30+, nothing in between
-        if (bg_fps > 0 && bg_fps < 30) bg_fps = 30;
-        g_background_fps.store(bg_fps, std::memory_order_relaxed);
-        g_config.background_fps = bg_fps;
+    ImGui::SliderInt("Background FPS", &s_bg_edit, 0, 60, bg_fmt);
+    s_bg_active = ImGui::IsItemActive();
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        if (s_bg_edit > 0 && s_bg_edit < 30) s_bg_edit = 30;
+        g_background_fps.store(s_bg_edit, std::memory_order_relaxed);
+        g_config.background_fps = s_bg_edit;
     }
     HelpTip("FPS cap when the game window loses focus. 0 = uncapped. Minimum is 30.");
 
