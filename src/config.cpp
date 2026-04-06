@@ -9,6 +9,7 @@
 Config g_config;
 
 static char s_ini_path[MAX_PATH] = {};
+static bool s_first_launch = false;
 
 // ── Simple INI helpers ──
 static std::string ReadINIString(const char* section, const char* key,
@@ -108,6 +109,8 @@ void ValidateConfig() {
     ValidateEnum(g_config.log_level, log_levels, 4, "info");
 }
 
+bool Config_IsFirstLaunch() { return s_first_launch; }
+
 void LoadConfig(HMODULE hModule) {
     // Build INI path next to the DLL
     GetModuleFileNameA(hModule, s_ini_path, MAX_PATH);
@@ -119,6 +122,9 @@ void LoadConfig(HMODULE hModule) {
     else strcat(s_ini_path, ".ini");
 
     LOG_INFO("Config: INI path = %s", s_ini_path);
+
+    // Detect first launch: INI file does not yet exist
+    s_first_launch = (GetFileAttributesA(s_ini_path) == INVALID_FILE_ATTRIBUTES);
 
     const char* S = "FrameLimiter";
     const char* P = s_ini_path;

@@ -63,6 +63,9 @@ struct Config {
 
 extern Config g_config;
 
+// Returns true if no INI file existed before LoadConfig ran (first launch).
+bool Config_IsFirstLaunch();
+
 // Load config from INI file next to the DLL.
 void LoadConfig(HMODULE hModule);
 
