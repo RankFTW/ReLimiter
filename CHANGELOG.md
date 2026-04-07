@@ -1,5 +1,9 @@
 # Changelog
 
+## 3.1.1
+- Fixed Frame Generation not being detected in games that never call slDLSSGGetState (e.g. Horizon Forbidden West), causing fg_div to stay at 1.0, incorrect FPS display, and wrong pacing intervals
+- Fixed G-Sync not being detected in OpenGL games (e.g. OpenMW) because nvapi64.dll isn't auto-loaded by the driver for OpenGL — now force-loads it when needed
+
 ## 3.1.0
 - Fixed config saving logic and removed dead config values
 - Fixed output FPS display

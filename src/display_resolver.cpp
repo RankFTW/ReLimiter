@@ -36,7 +36,13 @@ static void ResolveNvAPI() {
     if (s_nvapi_resolved) return;
     s_nvapi_resolved = true;
 
+    // Try already-loaded first, then force-load. OpenGL games (e.g. OpenMW)
+    // don't load nvapi64.dll automatically — unlike DX11/DX12 where the
+    // NVIDIA driver loads it. Without it, display resolution fails and
+    // G-Sync state can't be queried.
     HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
+    if (!nvapi)
+        nvapi = LoadLibraryW(L"nvapi64.dll");
     if (!nvapi) return;
 
     s_NvAPI_QueryInterface = reinterpret_cast<void*(*)(NvU32)>(
