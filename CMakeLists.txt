@@ -12,6 +12,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 # Full source list with minimal dllmain to test static init freeze
 set(ADDON_SOURCES
     src/dllmain.cpp
+    src/cadence_meter.cpp
     src/ceiling_margin.cpp
     src/config.cpp
     src/correlator.cpp
@@ -23,6 +24,7 @@ set(ADDON_SOURCES
     src/feedback.cpp
     src/fg_divisor.cpp
     src/flip_metering.cpp
+    src/flip_model.cpp
     src/flush.cpp
     src/frame_latency_controller.cpp
     src/frame_splitting.cpp
@@ -42,6 +44,7 @@ set(ADDON_SOURCES
     src/streamline_hooks.cpp
     src/stress_detector.cpp
     src/swapchain_manager.cpp
+    src/system_hardening.cpp
     src/tier.cpp
     src/timer_hooks.cpp
     src/tsc_cal.cpp

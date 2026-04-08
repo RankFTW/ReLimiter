@@ -48,6 +48,29 @@ static sl_Result __cdecl Detour_SetOptions(const void* vp, const void* opts) {
             int prev = g_fg_multiplier.exchange(numFrames, std::memory_order_relaxed);
             if (numFrames != prev) {
                 LOG_INFO("FG multiplier changed: %d -> %d (divisor=%d)", prev, numFrames, numFrames + 1);
+
+                // Infer FG presenting state from SetOptions when the game
+                // never calls GetState (e.g. Horizon Forbidden West).
+                // SetOptions with numFramesToGenerate > 0 is authoritative
+                // evidence that FG is enabled. GetState can still refine
+                // this if the game does call it later.
+                bool inferred_presenting = (numFrames > 0);
+                bool prev_presenting = g_fg_presenting.load(std::memory_order_relaxed);
+                if (inferred_presenting != prev_presenting) {
+                    g_fg_presenting.store(inferred_presenting, std::memory_order_relaxed);
+                    LOG_INFO("FG presenting (inferred from SetOptions): %s -> %s",
+                             prev_presenting ? "yes" : "no",
+                             inferred_presenting ? "yes" : "no");
+                }
+                bool inferred_active = (numFrames > 0);
+                bool prev_active = g_fg_active.load(std::memory_order_relaxed);
+                if (inferred_active != prev_active) {
+                    g_fg_active.store(inferred_active, std::memory_order_relaxed);
+                    LOG_INFO("FG active (inferred from SetOptions): %s -> %s",
+                             prev_active ? "yes" : "no",
+                             inferred_active ? "yes" : "no");
+                }
+
                 OnFGStateChange();
             }
         }
@@ -88,6 +111,13 @@ static sl_Result __cdecl Detour_GetState(const void* vp, void* state, const void
                              prev_presenting ? "yes" : "no", presenting ? "yes" : "no",
                              frames_presented);
                     OnFGStateChange();
+                }
+            } else {
+                static bool s_version_warned = false;
+                if (!s_version_warned) {
+                    s_version_warned = true;
+                    LOG_WARN("GetState: version=%zu at offset 24 — "
+                             "numFramesActuallyPresented read skipped", version);
                 }
             }
         }

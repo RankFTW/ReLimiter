@@ -139,9 +139,19 @@ void EnfDisp_OnPresent(int64_t now_qpc) {
             break;
 
         case EnforcementPath::NvAPIMarkers:
+            // Marker-based: enforcement normally happens in Hook_SetLatencyMarker.
+            // Fallback to present-based when markers stop flowing (menus,
+            // loading screens, cutscenes). VkEnforce_OnPresent has its own
+            // AreNvAPIMarkersFlowing() guard that early-returns when markers
+            // resume, so the handoff back is automatic.
+            if (!AreNvAPIMarkersFlowing())
+                VkEnforce_OnPresent(now_qpc);
+            break;
+
         case EnforcementPath::PCLMarkers:
-            // Marker-based paths: enforcement happens in the marker hooks
-            // (Hook_SetLatencyMarker / Hooked_slPCLSetMarker). No-op here.
+            // Same fallback logic for Vulkan+Streamline PCL marker path.
+            if (!PCL_MarkersFlowing())
+                VkEnforce_OnPresent(now_qpc);
             break;
 
         case EnforcementPath::None:
