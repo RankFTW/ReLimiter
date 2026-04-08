@@ -33,6 +33,13 @@ static PFN_slDLSSGSetOptions    s_orig_SetOptions           = nullptr;
 static PFN_slDLSSGGetState      s_orig_GetState             = nullptr;
 
 // ── Detour: SetOptions — forward first, then read on success ──
+// ── Track whether SetOptions has ever configured FG ──
+// Games that load Streamline for Reflex only (e.g. MH Stories 3) never
+// call slDLSSGSetOptions. Without this guard, Detour_GetState reads
+// uninitialized memory from the state struct and falsely reports
+// "FG active", triggering flushes and state transitions that crash.
+static std::atomic<bool> s_setoptions_ever_called{false};
+
 static sl_Result __cdecl Detour_SetOptions(const void* vp, const void* opts) {
     sl_Result result;
     __try {
@@ -46,6 +53,7 @@ static sl_Result __cdecl Detour_SetOptions(const void* vp, const void* opts) {
             int numFrames = *reinterpret_cast<const int*>(
                 reinterpret_cast<const uint8_t*>(opts) + 36);
             int prev = g_fg_multiplier.exchange(numFrames, std::memory_order_relaxed);
+            s_setoptions_ever_called.store(true, std::memory_order_relaxed);
             if (numFrames != prev) {
                 LOG_INFO("FG multiplier changed: %d -> %d (divisor=%d)", prev, numFrames, numFrames + 1);
 
@@ -90,6 +98,12 @@ static sl_Result __cdecl Detour_GetState(const void* vp, void* state, const void
     }
     __try {
         if (result == sl_eOk && state) {
+            // Only trust GetState if SetOptions has actually configured FG.
+            // Games that load Streamline for Reflex only never call SetOptions,
+            // so the state struct may contain uninitialized data.
+            if (!s_setoptions_ever_called.load(std::memory_order_relaxed))
+                return result;
+
             const uint8_t* p = reinterpret_cast<const uint8_t*>(state);
 
             int status = *reinterpret_cast<const int*>(p + 40);

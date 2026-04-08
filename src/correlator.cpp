@@ -9,12 +9,17 @@
 DXGIStatsSource g_correlator;
 IDXGISwapChain* g_stats_swapchain = nullptr;
 IDXGISwapChain* g_presenting_swapchain = nullptr;
+static bool s_stats_swapchain_is_unwrapped = false;
 
 // ── Streamline unwrap ──
 using slGetNativeInterface_pfn = int (*)(void* proxy, void** native);
 
 static IDXGISwapChain* TryStreamlineUnwrap(IDXGISwapChain* sc) {
-    if (!sc) return nullptr;
+    // DISABLED: Streamline unwrap causes reference count inconsistency
+    // that prevents proper swapchain teardown, leading to E_ACCESSDENIED
+    // on swapchain recreation and Streamline crash in sl.common.dll.
+    // The old correlator never unwrapped — stats work fine without it.
+    return nullptr;
 
     static HMODULE sl_mod = nullptr;
     static slGetNativeInterface_pfn sl_func = nullptr;
@@ -42,8 +47,9 @@ static IDXGISwapChain* TryStreamlineUnwrap(IDXGISwapChain* sc) {
         if (SUCCEEDED(unk->QueryInterface(__uuidof(IDXGISwapChain),
                                            reinterpret_cast<void**>(&real_sc)))) {
             LOG_INFO("Streamline unwrap: proxy=%p -> real=%p", sc, real_sc);
-            real_sc->Release();
-            return reinterpret_cast<IDXGISwapChain*>(native);
+            // Keep the AddRef from QueryInterface — caller's lifetime is
+            // tied to the swapchain. Released in OnSwapchainDestroyed.
+            return real_sc;
         }
     }
 
@@ -71,6 +77,7 @@ IDXGISwapChain* TryResolveStatsSwapchain() {
         if (SUCCEEDED(hr)) {
             LOG_INFO("Stats resolved: presenting swapchain %p works directly", sc);
             g_stats_swapchain = sc;
+            s_stats_swapchain_is_unwrapped = false;
             g_correlator.use_output_stats = false;
             g_correlator.resolved = true;
             return sc;
@@ -87,6 +94,7 @@ IDXGISwapChain* TryResolveStatsSwapchain() {
         if (SUCCEEDED(hr)) {
             LOG_INFO("Stats resolved: unwrapped swapchain %p works", unwrapped);
             g_stats_swapchain = unwrapped;
+            s_stats_swapchain_is_unwrapped = true;
             g_correlator.use_output_stats = false;
             g_correlator.resolved = true;
             return unwrapped;
@@ -119,6 +127,10 @@ IDXGISwapChain* TryResolveStatsSwapchain() {
     }
 
     LOG_WARN("Stats resolution failed: no source responds to GetFrameStatistics");
+    // If we unwrapped but didn't store it, release the AddRef
+    if (unwrapped && unwrapped != g_stats_swapchain) {
+        unwrapped->Release();
+    }
     return nullptr;
 }
 
@@ -140,25 +152,33 @@ HRESULT DXGIStatsSource::QueryFrameStatistics(DXGI_FRAME_STATISTICS& stats) {
         if (!resolved) return E_FAIL;
     }
 
-    try {
+    __try {
+        // Re-check after capturing pointers — OnSwapchainDestroyed may have
+        // run between our first check and here, freeing the swapchain.
         IDXGIOutput* output = cached_output;
-        if (use_output_stats && output)
+        if (use_output_stats && output) {
+            if (permanently_disabled.load(std::memory_order_acquire))
+                return E_FAIL;
             return output->GetFrameStatistics(&stats);
+        }
 
         IDXGISwapChain* sc = g_stats_swapchain;
         if (!sc)
             sc = g_presenting_swapchain ? g_presenting_swapchain : g_swapchain;
         if (!sc) return E_FAIL;
 
+        if (permanently_disabled.load(std::memory_order_acquire))
+            return E_FAIL;
+
         HRESULT hr = sc->GetFrameStatistics(&stats);
         if (FAILED(hr)) {
-            // Source went bad — mark unresolved so we retry
             resolved = false;
             resolve_fail_count = 0;
         }
         return hr;
-    } catch (...) {
-        LOG_WARN("DXGIStatsSource: C++ exception in QueryFrameStatistics, disabling");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        LOG_WARN("DXGIStatsSource: SEH exception in QueryFrameStatistics (0x%08X), disabling",
+                 GetExceptionCode());
         permanently_disabled.store(true, std::memory_order_relaxed);
         return E_FAIL;
     }
@@ -174,6 +194,10 @@ void DXGIStatsSource::TryResolve() {
 }
 
 void DXGIStatsSource::OnPresentingSwapchainChanged() {
+    if (s_stats_swapchain_is_unwrapped && g_stats_swapchain) {
+        g_stats_swapchain->Release();
+        s_stats_swapchain_is_unwrapped = false;
+    }
     g_stats_swapchain = nullptr;
     use_output_stats = false;
     if (cached_output) {
@@ -191,6 +215,10 @@ void DXGIStatsSource::OnPresentingSwapchainChanged() {
 
 void DXGIStatsSource::OnSwapchainDestroyed() {
     permanently_disabled.store(true, std::memory_order_release);
+    if (s_stats_swapchain_is_unwrapped && g_stats_swapchain) {
+        g_stats_swapchain->Release();
+        s_stats_swapchain_is_unwrapped = false;
+    }
     g_stats_swapchain = nullptr;
     g_presenting_swapchain = nullptr;
     use_output_stats = false;
