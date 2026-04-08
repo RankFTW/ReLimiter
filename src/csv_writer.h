@@ -36,6 +36,12 @@ struct FrameRow {
     int      predictor_warm;     // 1 if predictor had >= 8 samples
     double   smoothness_us;      // EMA of |actual - target| deviation
     int      reflex_injected;    // 1 if Reflex injection was active this frame
+    // ── Cadence feedback ──
+    double   present_interval_us;          // actual presentation interval from DXGI
+    double   present_cadence_smoothness_us; // EMA of presentation deviation
+    double   present_bias_us;              // current bias correction value
+    int      feedback_rate;                // adaptive window size (8 or 16)
+    double   feedback_alpha;               // current α (0.05 or 0.10)
 };
 
 // Initialize CSV writer. Starts background thread.

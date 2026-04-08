@@ -10,6 +10,7 @@
 #include "feedback.h"
 #include "correlator.h"
 #include "stress_detector.h"
+#include "cadence_meter.h"
 #include "nvapi_hooks.h"
 #include "pll.h"
 #include "presentation_gate.h"
@@ -42,7 +43,6 @@ std::atomic<bool>    g_skip_present_gate{false};
 // ── VRR scheduler state ──
 static int64_t s_last_present_deadline = 0;
 static int64_t s_last_enforcement_ts = 0;
-static double  s_deadline_bias_us = 0.0;
 
 // LFC hysteresis
 static int  s_lfc_below_count = 0;
@@ -103,9 +103,6 @@ void OnMarker(uint64_t frameID, int64_t now) {
         g_predictor.OnEnforcement(frameID, qpc_now.QuadPart);
         return;
     }
-
-    // Correlator overflow check
-    g_correlator.CheckOverflow();
 
     // Background FPS cap check (§III.4)
     // Use swapchain-derived HWND for focus comparison (Req 8.1, 8.4)
@@ -231,7 +228,7 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         predictor_warm = false;
         s_last_present_deadline = now;
         ResetDamping();
-        g_correlator.Reset();
+        g_cadence_meter.Reset();
         g_ceiling_stress = CeilingStressDetector();
         ResetFeedbackAccumulators();
         s_overload_active = false;
@@ -323,13 +320,11 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     // a pipelined GPU, especially with FG. Using predicted for exit causes the
     // system to get stuck in overload even when throughput has plenty of headroom.
     //
-    // Suppressed during post-warmup grace period — the predictor's first
-    // predictions are unreliable (small window, possible outliers from
-    // the transition). Let it settle before allowing overload entry.
+    // Overload detection with hysteresis.
+    // ENTRY and EXIT use actual throughput (enforcement-to-enforcement).
     double enter_threshold = effective_interval * OVERLOAD_ENTER_FRAC;
     double exit_threshold  = effective_interval * OVERLOAD_EXIT_FRAC;
 
-    // Actual throughput for overload detection
     double actual_ft = g_actual_frame_time_us.load(std::memory_order_relaxed);
     double throughput_slack = effective_interval - actual_ft;
 
@@ -410,20 +405,17 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         present_based = (EnfDisp_GetActivePath() == EnforcementPath::PresentBased);
 
         if (present_based) {
-            // Present-based: the frame already rendered. Sleep until the
-            // current frame's deadline minus a small margin for wake jitter.
-            //
-            // this_frame_deadline was set by the previous frame's scheduler
-            // pass. The sleep naturally adapts: if this frame rendered fast,
-            // now is early → longer sleep. If slow, now is late → shorter
-            // sleep (or no sleep if past deadline).
-            //
-            // No predicted subtraction needed — render already happened.
-            // The 150µs margin matches the marker-based path's fixed offset
-            // and absorbs HWSpin landing variance.
+            // Present-based (DX11): no cadence bias applied.
+            // The DXGI SyncQPCTime offset includes DWM composition and
+            // present-to-scanout pipeline latency that isn't correctable
+            // from the scheduler. Bias feedback is suppressed for this path.
+            // Cadence measurement still runs for PQI diagnostics.
             raw_wake = this_frame_deadline - us_to_qpc(150.0);
         } else {
-            raw_wake = next_deadline - predicted_qpc - us_to_qpc(wake_guard);
+            // Apply CadenceMeter bias: positive bias = frames late → wake earlier
+            double cadence_bias = g_cadence_meter.bias_ctrl.GetBias();
+            raw_wake = next_deadline - predicted_qpc - us_to_qpc(wake_guard)
+                     - us_to_qpc(cadence_bias);
         }
         raw_wake = (std::max)(raw_wake, now);
 
@@ -522,12 +514,10 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     { LARGE_INTEGER tmp; QueryPerformanceCounter(&tmp); driver_sleep_end = tmp.QuadPart; }
     MaybeUpdateSleepMode(effective_interval, should_sleep);
 
-    // Feedback: drain correlator every frame
-    DrainCorrelator(s_overload_active);
-
-    // Displayed-time correction: every 30 frames
-    if (frameID % 30 == 0)
-        ApplyDisplayedTimeBias(s_last_present_deadline, s_deadline_bias_us);
+    // Feedback: drain correlator every frame, feed CadenceMeter
+    g_cadence_meter.SetSuppressed(s_overload_active || !predictor_warm ||
+                                   s_post_overload_warmup > 0 || s_background_mode);
+    DrainCorrelator(s_overload_active, effective_interval);
 
     // ── Telemetry ──
     Baseline_Tick();
@@ -565,7 +555,18 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         ? g_adaptive_wake_guard.LastFinalError()
         : 0.0;
 
-    PQI_Push(telemetry_ft, effective_interval, 
+    // PQI: use actual presentation interval when CadenceMeter is warm.
+    // Exception: present-based (DX11) — DXGI SyncQPCTime is vblank-quantized
+    // by the DWM scheduler even on flip model swapchains, producing a noisy
+    // 1-vblank / 2-vblank alternation pattern that doesn't reflect actual
+    // display output. Use the scheduler's own frame time instead.
+    double pqi_frame_time = telemetry_ft;
+    if (!present_based && g_cadence_meter.IsWarm()) {
+        double pi = g_cadence_meter.present_interval_us.load(std::memory_order_relaxed);
+        if (pi > 0.0) pqi_frame_time = pi;
+    }
+
+    PQI_Push(pqi_frame_time, effective_interval, 
              final_wake_error, g_adaptive_wake_guard.Get());
 
     PQIScores pqi = PQI_GetRolling();
@@ -587,7 +588,7 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     row.fg_divisor = ComputeFGDivisor();
     row.mode = 0; // VRR
     row.scanout_error_us = GetLastScanoutErrorUs();
-    row.queue_depth = static_cast<int>(g_correlator.next_seq - g_correlator.last_retired_seq);
+    row.queue_depth = 0; // retired with correlator gutting
     row.api = (SwapMgr_GetActiveAPI() == ActiveAPI::Vulkan) ? 1
             : (SwapMgr_GetActiveAPI() == ActiveAPI::DX11) ? 2
             : (SwapMgr_GetActiveAPI() == ActiveAPI::OpenGL) ? 3 : 0;
@@ -606,6 +607,11 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     row.predictor_warm = predictor_warm ? 1 : 0;
     row.smoothness_us = g_smoothness_us.load(std::memory_order_relaxed);
     row.reflex_injected = ReflexInject_IsActive() ? 1 : 0;
+    row.present_interval_us = g_cadence_meter.present_interval_us.load(std::memory_order_relaxed);
+    row.present_cadence_smoothness_us = g_cadence_meter.cadence_smoothness_us.load(std::memory_order_relaxed);
+    row.present_bias_us = g_cadence_meter.bias_ctrl.GetBias();
+    row.feedback_rate = g_cadence_meter.bias_ctrl.GetWindowSize();
+    row.feedback_alpha = g_cadence_meter.bias_ctrl.GetAlpha();
     s_prev_actual_ft = telemetry_ft;
 
     CSV_Push(row);
@@ -697,4 +703,5 @@ static void FlushAll() {
     g_predictor.predicted_us = 0.0;
     g_predictor.ema_us = 0.0;
     g_predictor.cv = 0.0;
+    g_cadence_meter.Reset();
 }

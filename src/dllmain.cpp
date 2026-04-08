@@ -10,6 +10,7 @@
 #include "loadlib_hooks.h"
 #include "streamline_hooks.h"
 #include "timer_hooks.h"
+#include "system_hardening.h"
 #include "marker_log.h"
 #include "tsc_cal.h"
 #include "hw_spin.h"
@@ -29,6 +30,7 @@
 #include "correlator.h"
 #include "display_resolver.h"
 #include "vsync_control.h"
+#include "flip_model.h"
 
 // g_swapchain moved to flush.cpp (managed by OnInitSwapchain/OnDestroySwapchain)
 // g_presenting_swapchain moved to correlator.cpp (read-only consumer)
@@ -96,13 +98,30 @@ static void on_destroy_device(reshade::api::device* device) {
 }
 static void on_init_swapchain(reshade::api::swapchain* sc, bool resize) {
     SwapMgr_OnInitSwapchain(sc, resize);
+    // Apply GPU thread priority on first swapchain init
+    if (!resize) {
+        uint64_t native = sc->get_native();
+        if (native)
+            Hardening_OnDevice(reinterpret_cast<void*>(native));
+    }
 }
 static void on_destroy_swapchain(reshade::api::swapchain* sc, bool resize) {
     SwapMgr_OnDestroySwapchain(sc, resize);
 }
 
 // ── Fake Fullscreen: intercept exclusive fullscreen → borderless window ──
-static bool on_create_swapchain(reshade::api::device_api, reshade::api::swapchain_desc& desc, void* hwnd) {
+// ── Flip Model Override: upgrade bitblt → FLIP_DISCARD for DX11 VRR ──
+static bool on_create_swapchain(reshade::api::device_api api, reshade::api::swapchain_desc& desc, void* hwnd) {
+    bool modified = false;
+
+    // Flip model override (DX11 only — DX12 games already use flip model)
+    if (api == reshade::api::device_api::d3d11) {
+        if (FlipModel_TryUpgrade(desc.present_mode, desc.present_flags,
+                                  desc.back_buffer_count, desc.fullscreen_state)) {
+            modified = true;
+        }
+    }
+
     if (g_config.fake_fullscreen && desc.fullscreen_state) {
         desc.fullscreen_state = false;
         LOG_INFO("Fake fullscreen: blocked exclusive fullscreen at swapchain creation");
@@ -127,7 +146,7 @@ static bool on_create_swapchain(reshade::api::device_api, reshade::api::swapchai
         }
         return true; // modified
     }
-    return false;
+    return modified;
 }
 
 static bool on_set_fullscreen_state(reshade::api::swapchain*, bool fullscreen, void*) {
@@ -144,6 +163,9 @@ static void on_present(reshade::api::command_queue* queue,
                        const reshade::api::rect* dest_rect,
                        uint32_t dirty_rect_count,
                        const reshade::api::rect* dirty_rects) {
+    // MMCSS registration for the present thread (once)
+    Hardening_OnFirstPresent();
+
     // ── Late init: detect device/swapchain that were created before addon loaded ──
     if (sc && !SwapMgr_IsValid()) {
         reshade::api::device* dev = sc->get_device();
@@ -213,6 +235,9 @@ static void on_present(reshade::api::command_queue* queue,
 
                 // Install DXGI VSync hook on first swapchain capture
                 VSync_InstallDXGIHooks(native);
+
+                // Check factory tearing support for flip model override
+                FlipModel_CheckTearingSupport(native);
             }
         }
     }
@@ -285,6 +310,8 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
     __try {
         InstallTimerHooks();
         LOG_INFO("Timer hooks installed");
+
+        Hardening_Init();
 
         // NvAPI and Streamline hooks are deferred to the first on_present.
         // This lets the game's rendering pipeline fully initialize before
@@ -371,6 +398,7 @@ void WINAPI AddonUninit(HMODULE /*addon_module*/, HMODULE /*reshade_module*/) {
     StopDisplayPollThread();
     RestoreFrameSplitting();
     RemoveTimerHooks();
+    Hardening_Shutdown();
     DisableAllHooks();
     MH_Uninitialize();
     CloseSleepTimer();
@@ -403,6 +431,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             StopDisplayPollThread();
             RestoreFrameSplitting();
             RemoveTimerHooks();
+            Hardening_Shutdown();
             DisableAllHooks();
             MH_Uninitialize();
             CloseSleepTimer();

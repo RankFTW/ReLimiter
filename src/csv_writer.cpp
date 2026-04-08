@@ -26,7 +26,9 @@ static const char* CSV_HEADER =
     "damping_correction_us,tier,overload,fg_divisor,mode,scanout_error_us,"
     "queue_depth,api,pqi,cadence_score,stutter_score,deadline_score,jitter_us,"
     "own_sleep_us,driver_sleep_us,gate_sleep_us,deadline_drift_us,predictor_warm,"
-    "smoothness_us,reflex_injected\n";
+    "smoothness_us,reflex_injected,"
+    "present_interval_us,present_cadence_smoothness_us,present_bias_us,"
+    "feedback_rate,feedback_alpha\n";
 
 static void OpenNewFile() {
     if (s_file) { fclose(s_file); s_file = nullptr; }
@@ -48,7 +50,8 @@ static void WriteRow(const FrameRow& r) {
     fprintf(s_file,
         "%llu,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.3f,%.4f,"
         "%.1f,%d,%d,%.2f,%d,%.1f,%d,%d,%.1f,%.3f,%.3f,%.3f,%.1f,"
-        "%.1f,%.1f,%.1f,%.1f,%d,%.1f,%d\n",
+        "%.1f,%.1f,%.1f,%.1f,%d,%.1f,%d,"
+        "%.1f,%.1f,%.1f,%d,%.4f\n",
         r.frame_id, r.timestamp_us, r.predicted_us, r.effective_interval_us,
         r.actual_frame_time_us, r.sleep_duration_us, r.wake_error_us,
         r.ceiling_margin_us, r.stress_level, r.cv,
@@ -57,7 +60,9 @@ static void WriteRow(const FrameRow& r) {
         r.pqi, r.cadence_score, r.stutter_score, r.deadline_score, r.jitter_us,
         r.own_sleep_us, r.driver_sleep_us, r.gate_sleep_us,
         r.deadline_drift_us, r.predictor_warm, r.smoothness_us,
-        r.reflex_injected);
+        r.reflex_injected,
+        r.present_interval_us, r.present_cadence_smoothness_us,
+        r.present_bias_us, r.feedback_rate, r.feedback_alpha);
 }
 
 static void WriterThread() {

@@ -37,12 +37,12 @@ bool AreMarkersFlowing() {
 }
 
 bool IsCorrelatorValid() {
-    // Vulkan/DX11/OpenGL path doesn't use the DXGI correlator — report as valid
+    // Vulkan/DX11/OpenGL path doesn't use DXGI stats — report as valid
     ActiveAPI api = SwapMgr_GetActiveAPI();
     if (api == ActiveAPI::Vulkan || api == ActiveAPI::DX11 || api == ActiveAPI::OpenGL)
         return true;
-    return !g_correlator.needs_recalibration &&
-           (g_correlator.next_seq - g_correlator.last_retired_seq) < 32;
+    // DX12: check if DXGI stats source is responding
+    return g_correlator.IsStatsAvailable();
 }
 
 bool IsNvAPIAvailable() {

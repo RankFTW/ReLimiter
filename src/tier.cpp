@@ -2,6 +2,7 @@
 #include "health.h"
 #include "correlator.h"
 #include "swapchain_manager.h"
+#include "enforcement_dispatcher.h"
 #include "logger.h"
 
 // File-static T3 diagnostic counter — reset on recovery so we log again
@@ -25,14 +26,25 @@ Tier CheckTier() {
     s_t3_diag_count = 0;
 
     // Vulkan/DX11 path: no DXGI correlator or DXGI stats — skip T2b/T2a/T1 checks.
+    // Marker-based enforcement (NvAPI/PCL) also skips the correlator — scanout
+    // estimation is too noisy with FG. These paths get T2a (stale feedback)
+    // which is correct: pacing works fine without correlator data, the tier
+    // just reflects that scanout feedback isn't available.
     ActiveAPI active_api = SwapMgr_GetActiveAPI();
     if (active_api == ActiveAPI::Vulkan || active_api == ActiveAPI::DX11 || active_api == ActiveAPI::OpenGL) {
         return Tier2a;
     }
 
-    // Tier 2b: Invalid feedback — correlator broken
-    if (g_correlator.needs_recalibration ||
-        (g_correlator.next_seq - g_correlator.last_retired_seq) >= 32)
+    // Marker-based paths: correlator intentionally disabled, skip T2b check
+    EnforcementPath path = EnfDisp_GetActivePath();
+    if (path == EnforcementPath::NvAPIMarkers || path == EnforcementPath::PCLMarkers) {
+        if (!IsNvAPIAvailable())
+            return Tier1;
+        return Tier0;
+    }
+
+    // Tier 2b: Invalid feedback — DXGI stats unavailable
+    if (!IsCorrelatorValid())
         return Tier2b;
 
     // Tier 2a: Stale feedback — DXGI stats went stale

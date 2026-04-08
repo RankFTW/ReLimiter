@@ -59,6 +59,9 @@ struct Config {
 
     // Reflex Injection
     bool reflex_inject = false;         // Synthesize Reflex markers for non-Reflex games
+
+    // Flip Model Override (DX11)
+    bool flip_model_override = false;   // Force DXGI_SWAP_EFFECT_FLIP_DISCARD on DX11 bitblt swapchains
 };
 
 extern Config g_config;

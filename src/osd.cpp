@@ -22,6 +22,7 @@
 #include "health.h"
 #include "reflex_inject.h"
 #include "presentation_gate.h"
+#include "flip_model.h"
 #include <string>
 #include <atomic>
 #include <algorithm>
@@ -429,6 +430,25 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Waiting for device)");
         }
 
+        // Flip Model Override toggle (DX11 only)
+        ImGui::Spacing();
+        bool flip_override = g_config.flip_model_override;
+        if (ImGui::Checkbox("Flip Model Override", &flip_override)) {
+            g_config.flip_model_override = flip_override;
+            config_dirty = true;
+        }
+        if (FlipModel_WasApplied()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(Active)");
+        } else if (g_config.flip_model_override && SwapMgr_GetActiveAPI() == ActiveAPI::DX11) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Restart required)");
+        }
+        HelpTip("Force DX11 games from bitblt to flip model presentation. "
+                "Enables true VRR/G-Sync operation and eliminates DWM composition stutter. "
+                "May break some games that use GDI interop or MSAA. "
+                "Requires game restart to take effect.");
+
         // Advanced Logging toggle
         ImGui::Spacing();
         bool csv = g_config.csv_enabled;
@@ -530,7 +550,8 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
 
         ImGui::Text("API: %s  |  Reflex: %s  |  Streamline: %s",
                     api_name, reflex_str, IsStreamlinePresent() ? "Yes" : "No");
-        ImGui::Text("Enforce: %s", enforce_mode);
+        ImGui::Text("Enforce: %s%s", enforce_mode,
+                    FlipModel_WasApplied() ? "  |  Flip Model: Active" : "");
 
         bool gsync = g_gsync_active.load(std::memory_order_relaxed);
         PacingMode mode = g_pacing_mode.load(std::memory_order_relaxed);
