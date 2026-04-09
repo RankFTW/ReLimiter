@@ -104,11 +104,15 @@ static void on_destroy_device(reshade::api::device* device) {
 }
 static void on_init_swapchain(reshade::api::swapchain* sc, bool resize) {
     SwapMgr_OnInitSwapchain(sc, resize);
-    // Apply GPU thread priority on first swapchain init
+    // Apply GPU thread priority on first swapchain init (DXGI only — Vulkan
+    // native handles are VkSwapchainKHR, not IDXGISwapChain*)
     if (!resize) {
-        uint64_t native = sc->get_native();
-        if (native)
-            Hardening_OnDevice(reinterpret_cast<void*>(native));
+        ActiveAPI api = SwapMgr_GetActiveAPI();
+        if (api == ActiveAPI::DX12 || api == ActiveAPI::DX11) {
+            uint64_t native = sc->get_native();
+            if (native)
+                Hardening_OnDevice(reinterpret_cast<void*>(native));
+        }
     }
 }
 static void on_destroy_swapchain(reshade::api::swapchain* sc, bool resize) {
@@ -211,7 +215,26 @@ static void on_present(reshade::api::command_queue* queue,
     // last capture (handles DX11 launcher → DX12 gameplay transition where
     // Streamline reuses the same proxy pointer for both).
     if (sc) {
-        ActiveAPI api = SwapMgr_GetActiveAPI();
+        // Derive API from the swapchain's own device rather than the cached
+        // global state. SwapMgr_GetActiveAPI() can be stale during API
+        // transitions (e.g. DX12 launcher → Vulkan gameplay) because
+        // on_present may fire before SwapMgr_OnInitDevice updates the API.
+        // Using the wrong API here causes a VkSwapchainKHR to be cast as
+        // IDXGISwapChain*, leading to a crash when VSync_InstallDXGIHooks
+        // dereferences the Vulkan handle as a COM vtable.
+        ActiveAPI api = ActiveAPI::None;
+        reshade::api::device* present_dev = sc->get_device();
+        if (present_dev) {
+            switch (present_dev->get_api()) {
+                case reshade::api::device_api::d3d11:  api = ActiveAPI::DX11;  break;
+                case reshade::api::device_api::d3d12:  api = ActiveAPI::DX12;  break;
+                case reshade::api::device_api::vulkan: api = ActiveAPI::Vulkan; break;
+                case reshade::api::device_api::opengl: api = ActiveAPI::OpenGL; break;
+                default: break;
+            }
+        }
+        if (api == ActiveAPI::None)
+            api = SwapMgr_GetActiveAPI(); // fallback to cached if device unavailable
 
         // Vulkan native handles are VkSwapchainKHR — NOT IDXGISwapChain*.
         // Casting them to IDXGISwapChain* and storing in g_presenting_swapchain
