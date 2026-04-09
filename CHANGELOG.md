@@ -1,6 +1,11 @@
 # Changelog
 
 
+## 3.1.3
+
+### Bug Fixes
+- Fixed crash when Frame Latency Controller modifies DX12 waitable swapchain queue depth (e.g. God of War Ragnarök) — disabled FLC for all DX12 swapchains. Some games expect a specific queue depth and corrupt state when `SetMaximumFrameLatency` changes it. DX11 FLC is unaffected.
+
 ## 3.1.2
 
 ### New Features

@@ -96,59 +96,64 @@ static void ApplyDX11FrameLatency(uint64_t native_handle) {
     }
 }
 
-// ── DX12: IDXGISwapChain2::SetMaximumFrameLatency(1) on waitable swapchains ──
+// ── DX12: skip entirely ──
+// DX12 waitable swapchains are not safe to modify — some games (e.g. GoWR)
+// crash when SetMaximumFrameLatency changes the queue depth. Non-waitable
+// swapchains already rely on Reflex bLowLatencyMode. Skip all DX12 FLC.
+// TODO: revisit with FG-aware deferred undo/reapply approach.
 static void ApplyDX12FrameLatency(uint64_t native_handle) {
-    auto* sc = reinterpret_cast<IDXGISwapChain*>(native_handle);
+    LOG_INFO("FLC: DX12 skipped (queue depth managed by game/Reflex)");
 
-    __try {
-        // Check if swapchain was created with DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
-        DXGI_SWAP_CHAIN_DESC desc = {};
-        HRESULT hr = sc->GetDesc(&desc);
-        if (FAILED(hr)) {
-            LOG_WARN("FLC: DX12 GetDesc failed hr=0x%08X", hr);
-            return;
-        }
-
-        if (!(desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)) {
-            // Non-waitable swapchain — skip DXGI calls, rely on Reflex bLowLatencyMode
-            LOG_INFO("FLC: DX12 non-waitable swapchain, skipping DXGI frame latency (Reflex manages queue depth)");
-            return;
-        }
-
-        // Waitable swapchain — need IDXGISwapChain2::SetMaximumFrameLatency(1)
-        // If Streamline is loaded, unwrap the proxy first
-        IDXGISwapChain2* sc2 = nullptr;
-        bool from_streamline = false;
-
-        if (GetStreamlineUnwrapFunc()) {
-            sc2 = UnwrapStreamlineProxy(sc);
-            if (sc2) {
-                from_streamline = true;
-                LOG_INFO("FLC: DX12 using Streamline-unwrapped native interface for frame latency");
-            }
-        }
-
-        // If no Streamline proxy (or unwrap failed), QI directly
-        if (!sc2) {
-            hr = sc->QueryInterface(__uuidof(IDXGISwapChain2),
-                                     reinterpret_cast<void**>(&sc2));
-            if (FAILED(hr) || !sc2) {
-                LOG_WARN("FLC: DX12 QI for IDXGISwapChain2 failed hr=0x%08X", hr);
-                return;
-            }
-        }
-
-        hr = sc2->SetMaximumFrameLatency(1);
-        if (SUCCEEDED(hr))
-            LOG_INFO("FLC: DX12 waitable frame latency set to 1 via IDXGISwapChain2%s",
-                     from_streamline ? " (Streamline native)" : "");
-        else
-            LOG_WARN("FLC: DX12 IDXGISwapChain2::SetMaximumFrameLatency failed hr=0x%08X", hr);
-
-        sc2->Release();
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        LOG_WARN("FLC: exception in DX12 frame latency path (handle=0x%llX)", native_handle);
-    }
+    // DISABLED: crashes GoWR and potentially other DX12 waitable games.
+    // The game's renderer expects a specific queue depth and corrupts
+    // state when SetMaximumFrameLatency changes it.
+    //
+    // auto* sc = reinterpret_cast<IDXGISwapChain*>(native_handle);
+    //
+    // __try {
+    //     DXGI_SWAP_CHAIN_DESC desc = {};
+    //     HRESULT hr = sc->GetDesc(&desc);
+    //     if (FAILED(hr)) {
+    //         LOG_WARN("FLC: DX12 GetDesc failed hr=0x%08X", hr);
+    //         return;
+    //     }
+    //
+    //     if (!(desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)) {
+    //         LOG_INFO("FLC: DX12 non-waitable swapchain, skipping DXGI frame latency (Reflex manages queue depth)");
+    //         return;
+    //     }
+    //
+    //     IDXGISwapChain2* sc2 = nullptr;
+    //     bool from_streamline = false;
+    //
+    //     if (GetStreamlineUnwrapFunc()) {
+    //         sc2 = UnwrapStreamlineProxy(sc);
+    //         if (sc2) {
+    //             from_streamline = true;
+    //             LOG_INFO("FLC: DX12 using Streamline-unwrapped native interface for frame latency");
+    //         }
+    //     }
+    //
+    //     if (!sc2) {
+    //         hr = sc->QueryInterface(__uuidof(IDXGISwapChain2),
+    //                                  reinterpret_cast<void**>(&sc2));
+    //         if (FAILED(hr) || !sc2) {
+    //             LOG_WARN("FLC: DX12 QI for IDXGISwapChain2 failed hr=0x%08X", hr);
+    //             return;
+    //         }
+    //     }
+    //
+    //     hr = sc2->SetMaximumFrameLatency(1);
+    //     if (SUCCEEDED(hr))
+    //         LOG_INFO("FLC: DX12 waitable frame latency set to 1 via IDXGISwapChain2%s",
+    //                  from_streamline ? " (Streamline native)" : "");
+    //     else
+    //         LOG_WARN("FLC: DX12 IDXGISwapChain2::SetMaximumFrameLatency failed hr=0x%08X", hr);
+    //
+    //     sc2->Release();
+    // } __except (EXCEPTION_EXECUTE_HANDLER) {
+    //     LOG_WARN("FLC: exception in DX12 frame latency path (handle=0x%llX)", native_handle);
+    // }
 }
 
 // ── Public API ──
