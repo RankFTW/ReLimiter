@@ -49,16 +49,14 @@ static int  s_lfc_below_count = 0;
 static int  s_lfc_above_count = 0;
 static bool s_lfc_active = false;
 
-// Overload hysteresis
-static bool s_overload_active = false;
-static int  s_overload_consecutive = 0;
-static int  s_recovery_consecutive = 0;
-static constexpr double OVERLOAD_ENTER_FRAC = 0.03;
-static constexpr double OVERLOAD_EXIT_FRAC  = 0.15;  // wider exit band to prevent oscillation
-
-// Post-overload warmup: gate stays disabled for N frames after overload exit
-static int s_post_overload_warmup = 0;
-static constexpr int POST_OVERLOAD_WARMUP_FRAMES = 16;
+// Deadline miss tracking (replaces binary overload hysteresis).
+// A frame "misses" when the deadline chain falls behind `now`, i.e. the game
+// couldn't finish within the target interval. The miss ratio is an EMA of
+// per-frame miss events (1.0 = missed, 0.0 = on time). Downstream consumers
+// use the continuous ratio instead of a binary flag, giving smooth transitions
+// between GPU-bound and sleep-capable states.
+static double s_miss_ratio = 0.0;
+static constexpr double MISS_EMA_ALPHA = 0.08;  // ~12-frame response time
 
 // Background FPS cap
 static bool s_was_focused = true;
@@ -67,11 +65,12 @@ static bool s_background_mode = false;
 // Telemetry tracking
 static int64_t s_prev_enforcement_ts = 0;
 static double  s_prev_actual_ft = 0.0;
+static double  s_last_own_sleep_us = 0.0;
+static double  s_ema_non_sleep_us = 0.0;  // EMA of observed non-sleep time
 
 // ── Forward declarations ──
 static void OnMarker_VRR(uint64_t frameID, int64_t now);
 static void OnMarker_Fixed(uint64_t frameID, int64_t now);
-static void OnOverloadExit(int64_t now);
 static double ComputeEffectiveInterval_Fixed();
 static void FlushAll();
 
@@ -131,8 +130,8 @@ void OnMarker(uint64_t frameID, int64_t now) {
         s_background_mode = true;
     } else if (focused && !s_was_focused) {
         s_background_mode = false;
-        LOG_INFO("Focus regained — FlushAll (overload=%d, predicted=%.1f)",
-                 s_overload_active ? 1 : 0, g_predictor.predicted_us);
+        LOG_INFO("Focus regained — FlushAll (miss_ratio=%.2f, predicted=%.1f)",
+                 s_miss_ratio, g_predictor.predicted_us);
         FlushAll();
     }
     s_was_focused = focused;
@@ -231,10 +230,9 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         g_cadence_meter.Reset();
         g_ceiling_stress = CeilingStressDetector();
         ResetFeedbackAccumulators();
-        s_overload_active = false;
-        s_overload_consecutive = 0;
-        s_recovery_consecutive = 0;
-        s_post_overload_warmup = 0;
+        s_miss_ratio = 0.0;
+        s_ema_non_sleep_us = 0.0;
+        s_last_own_sleep_us = 0.0;
         g_overload_active_flag.store(false, std::memory_order_relaxed);
     }
     s_last_fg_divisor_raw = fg_divisor_raw;
@@ -312,115 +310,95 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     if (s_post_warmup_grace > 0)
         s_post_warmup_grace--;
 
-    // Overload detection with hysteresis
-    // ENTRY uses predicted vs effective_interval — if the predictor says frames
-    // take longer than the interval, we can't sleep without missing deadlines.
-    // EXIT uses actual throughput (enforcement-to-enforcement) — pipeline latency
-    // (SIM_START to PRESENT_END) is naturally longer than throughput interval in
-    // a pipelined GPU, especially with FG. Using predicted for exit causes the
-    // system to get stuck in overload even when throughput has plenty of headroom.
-    //
-    // Overload detection with hysteresis.
-    // ENTRY and EXIT use actual throughput (enforcement-to-enforcement).
-    double enter_threshold = effective_interval * OVERLOAD_ENTER_FRAC;
-    double exit_threshold  = effective_interval * OVERLOAD_EXIT_FRAC;
+    // ── Deadline miss tracking ──
+    // A frame "misses" when the deadline chain falls behind `now`.
+    // The miss ratio is a continuous EMA — no binary state, no hysteresis
+    // counters, no state flushing on transitions. The deadline catch-up
+    // logic (below) handles recovery naturally: a missed frame re-anchors
+    // to `now`, producing minimal sleep on the next frame, then the chain
+    // gradually resumes full sleep as frames land on time.
+    // We defer the actual miss ratio update until after the deadline is
+    // computed (below), since that's where we know if the frame missed.
 
-    double actual_ft = g_actual_frame_time_us.load(std::memory_order_relaxed);
-    double throughput_slack = effective_interval - actual_ft;
-
-    if (!s_overload_active) {
-        if (s_post_warmup_grace > 0) {
-            s_overload_consecutive = 0;
-        } else if (throughput_slack < -enter_threshold && actual_ft > 0) {
-            s_overload_consecutive++;
-            if (s_overload_consecutive >= 5) {
-                s_overload_active = true;
-                s_overload_consecutive = 0;
-            }
-        } else {
-            s_overload_consecutive = 0;
-        }
-    } else {
-        // Exit when throughput has headroom OR when the GPU is within 5%
-        // of the interval. The 5% band handles the edge case where the GPU
-        // runs at ~99% of the interval — technically "overloaded" but close
-        // enough that the scheduler should try to pace. Normal frame-to-frame
-        // variance (±500µs) can spike above 2%, so 5% absorbs that noise.
-        // If it truly can't keep up, the 5-frame entry check re-triggers.
-        bool has_headroom = throughput_slack > exit_threshold;
-        bool near_target = actual_ft > 0 && actual_ft < effective_interval * 1.05;
-        if (has_headroom || near_target) {
-            s_recovery_consecutive++;
-            if (s_recovery_consecutive >= 8) {
-                s_overload_active = false;
-                s_recovery_consecutive = 0;
-                OnOverloadExit(now);
-            }
-        } else {
-            s_recovery_consecutive = 0;
-        }
-    }
-
-    g_overload_active_flag.store(s_overload_active, std::memory_order_relaxed);
-
-    // Deadline + wake computation — runs for ALL states including overload.
-    // During overload, the deadline still advances and the gate still works,
-    // but the actual sleep is suppressed (should_sleep=false). This maintains
-    // consistent frame cadence at VRR boundaries without adding latency.
+    // Deadline + wake computation.
+    // The deadline chain maintains cadence by advancing one interval per frame.
+    // When the deadline falls behind (frame took longer than interval), we
+    // re-anchor to `now` so the next sleep resumes smoothly. This IS the
+    // miss recovery — no separate overload state needed.
     int64_t raw_wake;
-    int64_t this_frame_deadline = s_last_present_deadline; // before advance
+    int64_t this_frame_deadline;
     bool present_based = false;
+    bool frame_missed = false;
+    bool overload_active = s_miss_ratio > 0.5;  // snapshot for this frame
     if (!predictor_warm) {
         // Predictor cold: passthrough, don't advance deadline
         raw_wake = now;
+        this_frame_deadline = now;
         s_last_present_deadline = now;
     } else {
-        // Normal JIT path — runs during both normal and overload states
         int64_t next_deadline = s_last_present_deadline +
             us_to_qpc(effective_interval);
-        int64_t predicted_qpc = us_to_qpc(predicted);
 
-        // Catch-up: if the deadline is already in the past (frame took longer
-        // than the interval), re-anchor to now + interval. The old code used
-        // now + predicted, which set the deadline too close to now and caused
-        // cumulative forward drift (each catch-up added ~predicted of excess).
-        if (next_deadline < now)
-            next_deadline = now + us_to_qpc(effective_interval);
+        // Catch-up: if the deadline is in the past, re-anchor to now.
+        // This frame missed its target. The next frame will compute
+        // now + interval, giving a smooth ramp back to full sleep.
+        if (next_deadline < now) {
+            frame_missed = true;
+            next_deadline = now;
+        }
 
         // Deadline drift clamp
         int64_t max_deadline = now + us_to_qpc(effective_interval * 2.0);
         if (next_deadline > max_deadline)
             next_deadline = max_deadline;
 
+        this_frame_deadline = next_deadline;
+        s_last_present_deadline = next_deadline;
+
+        // ── Update miss ratio EMA ──
+        // 1.0 = missed (deadline was in the past), 0.0 = on time.
+        // The EMA smooths this into a continuous 0.0–1.0 signal.
+        double miss_sample = frame_missed ? 1.0 : 0.0;
+        s_miss_ratio += MISS_EMA_ALPHA * (miss_sample - s_miss_ratio);
+
+        // Publish for external consumers (OSD, predictor, stress detector).
+        // Threshold at 0.5 for the binary flag — equivalent to ~6 consecutive
+        // misses with alpha=0.08, similar to the old 10-frame hysteresis but
+        // with smooth ramp-in/ramp-out instead of a hard edge.
+        overload_active = s_miss_ratio > 0.5;
+        g_overload_active_flag.store(overload_active, std::memory_order_relaxed);
+
         double wake_guard = g_adaptive_wake_guard.Get();
 
-        // Use the enforcement dispatcher's authoritative path to determine
-        // whether we're in present-based mode. The dispatcher uses a sticky
-        // flag (s_ever_seen_nvapi) that survives temporary marker gaps during
-        // alt-tab / loading screens. Querying AreNvAPIMarkersFlowing() here
-        // independently would disagree with the dispatcher during those gaps,
-        // causing the scheduler to use the present-based deadline formula
-        // (no predicted subtraction) while enforcement actually triggers at
-        // SIMULATION_START — resulting in massive oversleep and stall cascades.
         present_based = (EnfDisp_GetActivePath() == EnforcementPath::PresentBased);
 
         if (present_based) {
-            // Present-based (DX11): no cadence bias applied.
-            // The DXGI SyncQPCTime offset includes DWM composition and
-            // present-to-scanout pipeline latency that isn't correctable
-            // from the scheduler. Bias feedback is suppressed for this path.
-            // Cadence measurement still runs for PQI diagnostics.
             raw_wake = this_frame_deadline - us_to_qpc(150.0);
         } else {
-            // Apply CadenceMeter bias: positive bias = frames late → wake earlier
+            // Use the larger of predicted render time and an EMA of observed
+            // non-sleep time from previous frames. The predictor only measures
+            // enforcement → PRESENT_START, but the game may have its own
+            // internal limiter that adds time the predictor doesn't see.
+            // The EMA smooths frame-to-frame variance so a single frame
+            // where the game skips its limiter doesn't cause overshoot.
+            double actual_ft = g_actual_frame_time_us.load(std::memory_order_relaxed);
+            double last_own_sleep = s_last_own_sleep_us;
+            double observed_non_sleep = (actual_ft > last_own_sleep && last_own_sleep > 0.0)
+                ? (actual_ft - last_own_sleep) : predicted;
+
+            // Update EMA (alpha=0.15: responds in ~7 frames, stable otherwise)
+            if (s_ema_non_sleep_us == 0.0)
+                s_ema_non_sleep_us = observed_non_sleep;
+            else
+                s_ema_non_sleep_us += 0.15 * (observed_non_sleep - s_ema_non_sleep_us);
+
+            double frame_cost = (std::max)(predicted, s_ema_non_sleep_us);
+
             double cadence_bias = g_cadence_meter.bias_ctrl.GetBias();
-            raw_wake = next_deadline - predicted_qpc - us_to_qpc(wake_guard)
-                     - us_to_qpc(cadence_bias);
+            raw_wake = next_deadline - us_to_qpc(wake_guard)
+                     - us_to_qpc(wake_guard) - us_to_qpc(cadence_bias);
         }
         raw_wake = (std::max)(raw_wake, now);
-
-        this_frame_deadline = next_deadline;
-        s_last_present_deadline = next_deadline;
     }
 
     // Damping (skip when predictor cold or present-based).
@@ -442,18 +420,13 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
             damped_wake = now + max_sleep_qpc;
     }
 
-    // Post-overload warmup countdown
-    if (s_post_overload_warmup > 0)
-        s_post_overload_warmup--;
-
     // Publish deadline for PRESENT_START gate.
     // this_frame_deadline is the deadline for the CURRENT frame's present,
     // not the next frame's. The gate holds early-finishing frames until
     // this deadline to avoid presenting above the VRR ceiling.
-    // Active during overload too — the gate only holds early frames,
-    // so it doesn't add latency when GPU-bound.
-    bool gate_active = !s_background_mode &&
-                       s_post_overload_warmup == 0 && predictor_warm;
+    // When miss ratio is high, the gate is disabled — frames are already
+    // arriving late, so gating would only add latency.
+    bool gate_active = !s_background_mode && !overload_active && predictor_warm;
     if (gate_active) {
         g_next_deadline.store(this_frame_deadline, std::memory_order_relaxed);
     } else {
@@ -466,26 +439,24 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     QueryPerformanceCounter(&qpc_now);
     s_last_enforcement_ts = qpc_now.QuadPart;
 
-    // Log overload state transitions
+    // Log significant miss ratio changes
     static bool s_prev_overload = false;
-    if (s_overload_active != s_prev_overload) {
-        LOG_WARN("Overload %s: predicted=%.1f, effective=%.1f, slack=%.1f",
-                 s_overload_active ? "ENTER" : "EXIT",
-                 predicted, effective_interval, effective_interval - predicted);
-        s_prev_overload = s_overload_active;
+    if (overload_active != s_prev_overload) {
+        LOG_WARN("Miss ratio %s (%.2f): predicted=%.1f, effective=%.1f",
+                 overload_active ? "HIGH" : "LOW",
+                 s_miss_ratio, predicted, effective_interval);
+        s_prev_overload = overload_active;
     }
 
     if (predictor_warm)
         UpdateDampingBaseline(s_last_enforcement_ts);
 
-    // Perform our own sleep when actively enforcing (non-overload).
-    // During overload, passthrough to the driver sleep instead.
-    // Skip sleep when predictor is cold — we need real frame data before enforcing.
-    // Skip sleep during post-overload warmup — predictor data is stale from
-    // the overload period and would cause oversleep stutters on exit.
+    // Sleep when predictor is warm. During overload, the normal wake formula
+    // naturally produces minimal/zero sleep (predicted ≈ effective_interval
+    // after clamping), so there's no hard cliff from sleeping to not-sleeping.
+    // The deadline catch-up logic handles frames that exceed the interval.
     int64_t own_sleep_start = 0, own_sleep_end = 0;
-    bool should_sleep = !s_overload_active && predictor_warm
-                     && s_post_overload_warmup == 0;
+    bool should_sleep = predictor_warm;
     if (should_sleep && damped_wake > now) {
         QueryPerformanceCounter(&qpc_now);
         own_sleep_start = qpc_now.QuadPart;
@@ -493,6 +464,10 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         QueryPerformanceCounter(&qpc_now);
         own_sleep_end = qpc_now.QuadPart;
     }
+
+    // Track own sleep duration for next frame's non-sleep time calculation
+    s_last_own_sleep_us = (own_sleep_end > own_sleep_start)
+        ? qpc_to_us(own_sleep_end - own_sleep_start) : 0.0;
 
     // Record enforcement timestamp BEFORE driver sleep.
     // Only re-stamp the predictor's pending frame when we actually slept.
@@ -515,9 +490,9 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     MaybeUpdateSleepMode(effective_interval, should_sleep);
 
     // Feedback: drain correlator every frame, feed CadenceMeter
-    g_cadence_meter.SetSuppressed(s_overload_active || !predictor_warm ||
-                                   s_post_overload_warmup > 0 || s_background_mode);
-    DrainCorrelator(s_overload_active, effective_interval);
+    g_cadence_meter.SetSuppressed(overload_active || !predictor_warm ||
+                                   s_background_mode);
+    DrainCorrelator(overload_active, effective_interval);
 
     // ── Telemetry ──
     Baseline_Tick();
@@ -530,13 +505,12 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         g_actual_frame_time_us.store(telemetry_ft, std::memory_order_relaxed);
 
     // Smoothness: EMA of |actual - target| deviation, skipping outliers.
-    // During overload the gate still paces frames at the VRR boundary,
-    // but the target interval is unreachable. Measuring against it would
-    // report ~8ms deviation even though frame-to-frame consistency is
-    // excellent (~100µs jitter). Use frame-to-frame delta instead.
+    // When miss ratio is high, the target interval is unreachable. Measuring
+    // against it would report large deviation even though frame-to-frame
+    // consistency may be good. Use frame-to-frame delta instead.
     if (telemetry_ft > 0.0 && telemetry_ft < effective_interval * 4.0) {
         double deviation;
-        if (s_overload_active && s_prev_actual_ft > 0.0) {
+        if (overload_active && s_prev_actual_ft > 0.0) {
             deviation = std::abs(telemetry_ft - s_prev_actual_ft);
         } else {
             deviation = std::abs(telemetry_ft - effective_interval);
@@ -555,13 +529,14 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         ? g_adaptive_wake_guard.LastFinalError()
         : 0.0;
 
-    // PQI: use actual presentation interval when CadenceMeter is warm.
-    // Exception: present-based (DX11) — DXGI SyncQPCTime is vblank-quantized
-    // by the DWM scheduler even on flip model swapchains, producing a noisy
-    // 1-vblank / 2-vblank alternation pattern that doesn't reflect actual
-    // display output. Use the scheduler's own frame time instead.
+    // PQI: use actual presentation interval when CadenceMeter has reliable data.
+    // With FG active, DXGI intervals are polluted (alternating short/long).
+    // Reflex provides clean per-real-frame timing even with FG.
+    // Use CadenceMeter when: no FG (DXGI is fine), or Reflex is feeding.
     double pqi_frame_time = telemetry_ft;
-    if (!present_based && g_cadence_meter.IsWarm()) {
+    bool fg_active = ComputeFGDivisorRaw() > 1;
+    bool reflex_feeding = IsReflexCadenceActive();
+    if (!present_based && g_cadence_meter.IsWarm() && (!fg_active || reflex_feeding)) {
         double pi = g_cadence_meter.present_interval_us.load(std::memory_order_relaxed);
         if (pi > 0.0) pqi_frame_time = pi;
     }
@@ -584,7 +559,7 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     row.cv = g_predictor.cv;
     row.damping_correction_us = 0.0; // TODO: expose from damping
     row.tier = static_cast<int>(g_current_tier);
-    row.overload = s_overload_active ? 1 : 0;
+    row.overload = overload_active ? 1 : 0;
     row.fg_divisor = ComputeFGDivisor();
     row.mode = 0; // VRR
     row.scanout_error_us = GetLastScanoutErrorUs();
@@ -624,36 +599,13 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
                  "predicted=%.0f effective=%.0f tier=%d overload=%d warm=%d",
                  frameID, row.driver_sleep_us, row.own_sleep_us,
                  predicted, effective_interval, g_current_tier,
-                 s_overload_active ? 1 : 0, predictor_warm ? 1 : 0);
+                 overload_active ? 1 : 0, predictor_warm ? 1 : 0);
     } else if (telemetry_ft > 50000.0) {
         LOG_WARN("STALL: frame=%llu actual_ft=%.0fus driver_sleep=%.0fus "
                  "own_sleep=%.0fus deadline_drift=%.0fus",
                  frameID, telemetry_ft, row.driver_sleep_us,
                  row.own_sleep_us, row.deadline_drift_us);
     }
-}
-
-// ── Overload exit ──
-static void OnOverloadExit(int64_t now) {
-    s_last_present_deadline = now;
-    g_ceiling_stress.FlushOverloadData();
-    ResetDamping();
-    s_post_overload_warmup = POST_OVERLOAD_WARMUP_FRAMES;
-
-    // DON'T partial-reset the predictor here. The old approach (keep last 16
-    // frames) preserved overload-era frame times that were measured without
-    // our sleep overhead. These short measurements made the predictor think
-    // frames were fast, which immediately re-triggered overload on exit.
-    //
-    // Instead, let the predictor keep its full window. The overload-era
-    // samples will age out naturally as new enforcing-era samples arrive.
-    // The predictor's P80 + safety margin will be conservative (biased by
-    // the overload samples) which is exactly what we want — it prevents
-    // immediate re-entry by predicting longer frame times.
-    //
-    // Reset cv to moderate default so the safety margin isn't extreme.
-    g_predictor.cv = 0.15;
-    g_predictor.ema_us = 0.0;
 }
 
 // ── Fixed mode: §II.5 ──
@@ -689,13 +641,10 @@ static double ComputeEffectiveInterval_Fixed() {
 static void FlushAll() {
     Flush(FLUSH_ALL);
     s_last_present_deadline = 0;
-    s_overload_active = false;
-    s_overload_consecutive = 0;
-    s_recovery_consecutive = 0;
+    s_miss_ratio = 0.0;
     s_lfc_active = false;
     s_lfc_below_count = 0;
     s_lfc_above_count = 0;
-    s_post_overload_warmup = 0;
     g_overload_active_flag.store(false, std::memory_order_relaxed);
 
     // Also reset the predictor's cached EMA so the first frame after
@@ -703,5 +652,7 @@ static void FlushAll() {
     g_predictor.predicted_us = 0.0;
     g_predictor.ema_us = 0.0;
     g_predictor.cv = 0.0;
+    s_last_own_sleep_us = 0.0;
+    s_ema_non_sleep_us = 0.0;
     g_cadence_meter.Reset();
 }

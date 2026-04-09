@@ -7,6 +7,7 @@
 #include "wake_guard.h"
 #include "display_state.h"
 #include "nvapi_hooks.h"
+#include "fg_divisor.h"
 #include "logger.h"
 #include <Windows.h>
 #include <dxgi.h>
@@ -44,6 +45,9 @@ struct NV_LATENCY_RESULT_PARAMS_LOCAL {
     uint8_t rsvd[32];
 };
 
+static_assert(sizeof(NV_LATENCY_FRAME_REPORT) == 240,
+              "NV_LATENCY_FRAME_REPORT size mismatch with NVAPI SDK");
+
 using PFN_NvAPI_D3D_GetLatency = int(__cdecl*)(IUnknown*, NV_LATENCY_RESULT_PARAMS_LOCAL*);
 static PFN_NvAPI_D3D_GetLatency s_get_latency = nullptr;
 static bool s_get_latency_resolved = false;
@@ -67,29 +71,123 @@ static void ResolveGetLatency() {
 }
 
 // Try to get the latest Reflex frame report. Returns true if a new frame was found.
+static int s_reflex_call_count = 0;
+static int s_reflex_found_count = 0;
+static int s_reflex_empty_ring = 0;
+static int s_reflex_all_zero_gpu = 0;
+static int s_reflex_all_stale = 0;
+
 static bool TryIngestReflexLatency(double effective_interval_us) {
     if (!s_get_latency || !g_dev) return false;
 
     NV_LATENCY_RESULT_PARAMS_LOCAL params = {};
-    // Version: sizeof | (1 << 16)
     params.version = sizeof(NV_LATENCY_RESULT_PARAMS_LOCAL) | (1 << 16);
 
-    int status = s_get_latency(g_dev, &params);
-    if (status != 0) return false;
+    static bool s_logged_version = false;
+    if (!s_logged_version) {
+        LOG_INFO("Feedback: GetLatency version=0x%08X (sizeof=%zu)",
+                 params.version, sizeof(NV_LATENCY_RESULT_PARAMS_LOCAL));
+        s_logged_version = true;
+    }
+
+    int status;
+    __try {
+        status = s_get_latency(g_dev, &params);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_WARN("Feedback: GetLatency crashed (device transitional?) — disabling");
+        g_dev = nullptr;
+        return false;
+    }
+    if (status != 0) {
+        static bool s_warned_status = false;
+        if (!s_warned_status) {
+            LOG_WARN("Feedback: NvAPI_D3D_GetLatency returned status %d — falling back to DXGI", status);
+            s_warned_status = true;
+        }
+        return false;
+    }
+
+    s_reflex_call_count++;
+
+    // Diagnostic: scan the ring buffer
+    int non_zero_frames = 0;
+    int non_zero_gpu_ft = 0;
+    uint64_t newest_frame_id = 0;
+    uint32_t newest_gpu_ft = 0;
+    uint32_t newest_active_rt = 0;
+    for (int i = 0; i < 64; i++) {
+        const auto& r = params.frameReport[i];
+        if (r.frameID != 0) {
+            non_zero_frames++;
+            if (r.gpuFrameTimeUs != 0) non_zero_gpu_ft++;
+            if (r.frameID > newest_frame_id) {
+                newest_frame_id = r.frameID;
+                newest_gpu_ft = r.gpuFrameTimeUs;
+                newest_active_rt = r.gpuActiveRenderTimeUs;
+            }
+        }
+    }
+
+    // Verbose log every 300 calls (~5 seconds at 60fps)
+    if (s_reflex_call_count % 300 == 1) {
+        LOG_INFO("Feedback: Reflex ring scan — calls=%d, found=%d, "
+                 "non_zero_frames=%d, non_zero_gpu_ft=%d, "
+                 "newest_fid=%llu, newest_gpu_ft=%u, newest_active_rt=%u, "
+                 "last_processed_fid=%llu",
+                 s_reflex_call_count, s_reflex_found_count,
+                 non_zero_frames, non_zero_gpu_ft,
+                 newest_frame_id, newest_gpu_ft, newest_active_rt,
+                 s_last_reflex_frame_id);
+
+        // Dump the newest report's full timing chain
+        for (int i = 63; i >= 0; i--) {
+            const auto& r = params.frameReport[i];
+            if (r.frameID == 0) continue;
+            LOG_INFO("Feedback: Reflex report fid=%llu — "
+                     "simStart=%llu, simEnd=%llu, "
+                     "renderSubmitStart=%llu, renderSubmitEnd=%llu, "
+                     "presentStart=%llu, presentEnd=%llu, "
+                     "driverStart=%llu, driverEnd=%llu, "
+                     "gpuRenderStart=%llu, gpuRenderEnd=%llu, "
+                     "gpuActiveRenderTimeUs=%u, gpuFrameTimeUs=%u, "
+                     "aiFrameTimeUs=%u",
+                     r.frameID,
+                     r.simStartTime, r.simEndTime,
+                     r.renderSubmitStartTime, r.renderSubmitEndTime,
+                     r.presentStartTime, r.presentEndTime,
+                     r.driverStartTime, r.driverEndTime,
+                     r.gpuRenderStartTime, r.gpuRenderEndTime,
+                     r.gpuActiveRenderTimeUs, r.gpuFrameTimeUs,
+                     r.aiFrameTimeUs);
+            break; // just the newest
+        }
+    }
+
+    if (non_zero_frames == 0) {
+        s_reflex_empty_ring++;
+        return false;
+    }
 
     // Find the most recent frame report with a valid gpuFrameTimeUs.
-    // Reports are in a ring buffer of 64 entries, newest last.
     bool found = false;
     for (int i = 63; i >= 0; i--) {
         const auto& r = params.frameReport[i];
         if (r.frameID == 0 || r.gpuFrameTimeUs == 0) continue;
-        if (r.frameID <= s_last_reflex_frame_id) break; // already processed
+        if (r.frameID <= s_last_reflex_frame_id) break;
 
         double ft = static_cast<double>(r.gpuFrameTimeUs);
         g_cadence_meter.IngestReflex(ft, effective_interval_us);
         s_last_reflex_frame_id = r.frameID;
+        s_reflex_found_count++;
         found = true;
-        break; // only process the newest unprocessed frame
+        break;
+    }
+
+    if (!found) {
+        if (non_zero_gpu_ft == 0)
+            s_reflex_all_zero_gpu++;
+        else
+            s_reflex_all_stale++;
     }
 
     return found;
@@ -105,8 +203,21 @@ void DrainCorrelator(bool overload_active, double effective_interval_us) {
     ResolveGetLatency();
     bool reflex_fed = TryIngestReflexLatency(effective_interval_us);
 
+    static bool s_logged_source = false;
+    static int s_drain_count = 0;
+    s_drain_count++;
+    if (!s_logged_source && g_cadence_meter.present_intervals_us.Size() >= 8) {
+        LOG_INFO("Feedback: initial cadence bias source = %s", reflex_fed ? "Reflex" : "DXGI");
+        s_logged_source = true;
+    }
+    if (s_drain_count % 300 == 0) {
+        LOG_INFO("Feedback: cadence bias source = %s, bias=%.1fus, reflex_found=%d/%d",
+                 reflex_fed ? "Reflex" : "DXGI",
+                 g_cadence_meter.bias_ctrl.GetBias(),
+                 s_reflex_found_count, s_reflex_call_count);
+    }
+
     // ── DXGI stats path (DX11, or DX12 fallback when Reflex unavailable) ──
-    // Always run for refresh estimation and stress detector, even if Reflex fed the bias.
     ActiveAPI api = SwapMgr_GetActiveAPI();
     if (api == ActiveAPI::Vulkan || api == ActiveAPI::OpenGL)
         return;
@@ -120,16 +231,16 @@ void DrainCorrelator(bool overload_active, double effective_interval_us) {
 
     RecordDXGIStatsUpdate();
 
-    // Feed CadenceMeter from DXGI only if Reflex didn't provide data.
-    // When Reflex is active, DXGI still provides refresh estimation and
-    // stress detector data, but the bias comes from the more precise source.
+    // Feed CadenceMeter from DXGI only if Reflex didn't provide data
+    // AND Frame Generation is not active. With FG, DXGI sees both real and
+    // generated presents but SyncQPCTime is vblank-quantized, producing
+    // alternating short/long intervals that don't reflect actual cadence.
     //
-    // DX11 present-based: suppress bias/smoothness from DXGI stats.
-    // SyncQPCTime is vblank-quantized by the DWM scheduler even on flip model
-    // swapchains, producing a noisy 1-vblank / 2-vblank alternation that
-    // doesn't reflect actual display output. Pass target=0 to keep refresh
-    // estimation running while suppressing bias accumulation.
-    bool suppress_dxgi_bias = reflex_fed || (api == ActiveAPI::DX11);
+    // DX11 present-based: also suppress bias/smoothness from DXGI stats.
+    //
+    // When suppressed, only update refresh estimation — don't push intervals.
+    bool fg_active = ComputeFGDivisorRaw() > 1;
+    bool suppress_dxgi_bias = reflex_fed || fg_active || (api == ActiveAPI::DX11);
     if (!suppress_dxgi_bias) {
         g_cadence_meter.Ingest(
             stats.PresentCount,
@@ -137,12 +248,22 @@ void DrainCorrelator(bool overload_active, double effective_interval_us) {
             stats.SyncRefreshCount,
             effective_interval_us);
     } else {
-        // Still update refresh estimation from DXGI
-        g_cadence_meter.Ingest(
-            stats.PresentCount,
-            stats.SyncQPCTime.QuadPart,
-            stats.SyncRefreshCount,
-            0.0); // target=0 suppresses bias/smoothness from DXGI path
+        // Only update refresh estimation from DXGI — don't push intervals
+        // or smoothness/bias. With FG or DX11, DXGI intervals are unreliable.
+        uint32_t refresh_delta = stats.SyncRefreshCount - g_cadence_meter.prev_sync_refresh;
+        if (refresh_delta > 0 && stats.SyncQPCTime.QuadPart > g_cadence_meter.prev_sync_qpc) {
+            int64_t qpc_delta = stats.SyncQPCTime.QuadPart - g_cadence_meter.prev_sync_qpc;
+            double refresh_per_vblank = qpc_to_us(qpc_delta) /
+                                        static_cast<double>(refresh_delta);
+            if (refresh_per_vblank > CadenceMeter::MIN_REFRESH_US &&
+                refresh_per_vblank < CadenceMeter::MAX_REFRESH_US) {
+                g_cadence_meter.dxgi_refresh_us.store(refresh_per_vblank, std::memory_order_relaxed);
+            }
+        }
+        g_cadence_meter.prev_sync_qpc = stats.SyncQPCTime.QuadPart;
+        g_cadence_meter.prev_present_count = stats.PresentCount;
+        g_cadence_meter.prev_sync_refresh = stats.SyncRefreshCount;
+        g_cadence_meter.has_prev = true;
     }
 
     // ── Update g_estimated_refresh_us from CadenceMeter in VRR mode ──
@@ -179,4 +300,8 @@ void ResetFeedbackAccumulators() {
 
 double GetLastScanoutErrorUs() {
     return g_cadence_meter.present_bias_us.load(std::memory_order_relaxed);
+}
+
+bool IsReflexCadenceActive() {
+    return s_reflex_found_count > 0;
 }

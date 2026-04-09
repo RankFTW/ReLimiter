@@ -94,6 +94,12 @@ static void on_init_device(reshade::api::device* device) {
     SwapMgr_OnInitDevice(device);
 }
 static void on_destroy_device(reshade::api::device* device) {
+    // Clear g_dev if this is the device we captured for GetLatency.
+    // Prevents stale pointer crashes during device transitions (alt-tab, resize).
+    if (g_dev) {
+        g_dev = nullptr;
+        LOG_INFO("NvAPI: g_dev cleared on device destroy");
+    }
     SwapMgr_OnDestroyDevice(device);
 }
 static void on_init_swapchain(reshade::api::swapchain* sc, bool resize) {
@@ -241,6 +247,9 @@ static void on_present(reshade::api::command_queue* queue,
             }
         }
     }
+
+    // Check deferred FG inference (promotes or revokes after confirmation window)
+    CheckDeferredFGInference();
 
     LARGE_INTEGER now_qpc;
     QueryPerformanceCounter(&now_qpc);

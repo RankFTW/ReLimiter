@@ -11,3 +11,6 @@ void ResetFeedbackAccumulators();
 
 // Last presentation bias (for telemetry). Returns 0 if no samples.
 double GetLastScanoutErrorUs();
+
+// Returns true if Reflex GetLatency has successfully fed cadence data.
+bool IsReflexCadenceActive();

@@ -122,6 +122,14 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
                  params->markerType, params->frameID);
     }
 
+    // Capture device for GetLatency if not already set.
+    // Some games (Streamline/DLSS-G) never call SetSleepMode through NvAPI,
+    // so g_dev stays null. The marker hook always receives the device.
+    if (!g_dev && dev) {
+        g_dev = dev;
+        LOG_INFO("NvAPI: device captured from SetLatencyMarker");
+    }
+
     if (CallerIsRTSS()) {
         return s_orig_set_latency_marker(dev, params);
     }

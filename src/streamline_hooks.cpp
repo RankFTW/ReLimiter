@@ -40,6 +40,19 @@ static PFN_slDLSSGGetState      s_orig_GetState             = nullptr;
 // "FG active", triggering flushes and state transitions that crash.
 static std::atomic<bool> s_setoptions_ever_called{false};
 
+// ── Deferred FG inference ──
+// SetOptions with numFrames > 0 sets the multiplier and starts a
+// confirmation window. If GetState confirms numFramesActuallyPresented > 1
+// within the window, FG is real. If the window expires without
+// confirmation, the inference is revoked (game uses Streamline for
+// Reflex only, e.g. MH Stories 3). For games that never call GetState
+// (e.g. HFW), the inference sticks after the window.
+static std::atomic<bool> s_fg_inference_pending{false};
+static std::atomic<int64_t> s_fg_inference_start_qpc{0};
+static std::atomic<bool> s_fg_confirmed_by_getstate{false};
+static std::atomic<uint32_t> s_getstate_call_count{0};
+static constexpr int64_t FG_CONFIRMATION_WINDOW_US = 3000000; // 3 seconds
+
 static sl_Result __cdecl Detour_SetOptions(const void* vp, const void* opts) {
     sl_Result result;
     __try {
@@ -57,19 +70,7 @@ static sl_Result __cdecl Detour_SetOptions(const void* vp, const void* opts) {
             if (numFrames != prev) {
                 LOG_INFO("FG multiplier changed: %d -> %d (divisor=%d)", prev, numFrames, numFrames + 1);
 
-                // Infer FG presenting state from SetOptions when the game
-                // never calls GetState (e.g. Horizon Forbidden West).
-                // SetOptions with numFramesToGenerate > 0 is authoritative
-                // evidence that FG is enabled. GetState can still refine
-                // this if the game does call it later.
-                bool inferred_presenting = (numFrames > 0);
-                bool prev_presenting = g_fg_presenting.load(std::memory_order_relaxed);
-                if (inferred_presenting != prev_presenting) {
-                    g_fg_presenting.store(inferred_presenting, std::memory_order_relaxed);
-                    LOG_INFO("FG presenting (inferred from SetOptions): %s -> %s",
-                             prev_presenting ? "yes" : "no",
-                             inferred_presenting ? "yes" : "no");
-                }
+                // Set active state from SetOptions — the game configured FG.
                 bool inferred_active = (numFrames > 0);
                 bool prev_active = g_fg_active.load(std::memory_order_relaxed);
                 if (inferred_active != prev_active) {
@@ -77,6 +78,28 @@ static sl_Result __cdecl Detour_SetOptions(const void* vp, const void* opts) {
                     LOG_INFO("FG active (inferred from SetOptions): %s -> %s",
                              prev_active ? "yes" : "no",
                              inferred_active ? "yes" : "no");
+                }
+
+                // Don't set g_fg_presenting immediately — defer to GetState
+                // confirmation. Games like MH Stories 3 call SetOptions with
+                // numFrames=1 internally but never actually produce FG frames.
+                // Start a confirmation window; if GetState doesn't confirm
+                // within it, presenting stays false.
+                if (numFrames > 0 && !g_fg_presenting.load(std::memory_order_relaxed)) {
+                    LARGE_INTEGER now;
+                    QueryPerformanceCounter(&now);
+                    s_fg_inference_start_qpc.store(now.QuadPart, std::memory_order_relaxed);
+                    s_fg_inference_pending.store(true, std::memory_order_relaxed);
+                    s_fg_confirmed_by_getstate.store(false, std::memory_order_relaxed);
+                    LOG_INFO("FG presenting deferred — waiting for GetState confirmation");
+                } else if (numFrames == 0) {
+                    // FG disabled — clear everything
+                    s_fg_inference_pending.store(false, std::memory_order_relaxed);
+                    bool prev_presenting = g_fg_presenting.load(std::memory_order_relaxed);
+                    if (prev_presenting) {
+                        g_fg_presenting.store(false, std::memory_order_relaxed);
+                        LOG_INFO("FG presenting (from SetOptions): yes -> no");
+                    }
                 }
 
                 OnFGStateChange();
@@ -104,6 +127,8 @@ static sl_Result __cdecl Detour_GetState(const void* vp, void* state, const void
             if (!s_setoptions_ever_called.load(std::memory_order_relaxed))
                 return result;
 
+            s_getstate_call_count.fetch_add(1, std::memory_order_relaxed);
+
             const uint8_t* p = reinterpret_cast<const uint8_t*>(state);
 
             int status = *reinterpret_cast<const int*>(p + 40);
@@ -120,6 +145,30 @@ static sl_Result __cdecl Detour_GetState(const void* vp, void* state, const void
                 uint32_t frames_presented = *reinterpret_cast<const uint32_t*>(p + 48);
                 bool presenting = (frames_presented > 1);
                 bool prev_presenting = g_fg_presenting.exchange(presenting, std::memory_order_relaxed);
+
+                // If GetState confirms FG is presenting, mark confirmed
+                // so the deferred inference from SetOptions is validated.
+                if (presenting && s_fg_inference_pending.load(std::memory_order_relaxed)) {
+                    s_fg_confirmed_by_getstate.store(true, std::memory_order_relaxed);
+                    s_fg_inference_pending.store(false, std::memory_order_relaxed);
+                }
+
+                // If GetState says NOT presenting and inference is pending,
+                // check if the confirmation window has expired.
+                if (!presenting && s_fg_inference_pending.load(std::memory_order_relaxed)) {
+                    LARGE_INTEGER now, freq;
+                    QueryPerformanceCounter(&now);
+                    QueryPerformanceFrequency(&freq);
+                    int64_t start = s_fg_inference_start_qpc.load(std::memory_order_relaxed);
+                    int64_t elapsed_us = (now.QuadPart - start) * 1000000 / freq.QuadPart;
+                    if (elapsed_us > FG_CONFIRMATION_WINDOW_US) {
+                        // Window expired, GetState says not presenting — revoke
+                        s_fg_inference_pending.store(false, std::memory_order_relaxed);
+                        LOG_INFO("FG inference revoked — GetState reports not presenting after %.1fs",
+                                 elapsed_us / 1000000.0);
+                    }
+                }
+
                 if (presenting != prev_presenting) {
                     LOG_INFO("FG presenting: %s -> %s (numFramesActuallyPresented=%u)",
                              prev_presenting ? "yes" : "no", presenting ? "yes" : "no",
@@ -163,6 +212,46 @@ static sl_Result __cdecl Detour_slGetFeatureFunction(uint32_t feature, const cha
     }
 
     return result;
+}
+
+// ── Deferred FG inference check (called each frame from scheduler) ──
+void CheckDeferredFGInference() {
+    if (!s_fg_inference_pending.load(std::memory_order_relaxed))
+        return;
+
+    LARGE_INTEGER now, freq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    int64_t start = s_fg_inference_start_qpc.load(std::memory_order_relaxed);
+    int64_t elapsed_us = (now.QuadPart - start) * 1000000 / freq.QuadPart;
+
+    if (elapsed_us > FG_CONFIRMATION_WINDOW_US) {
+        s_fg_inference_pending.store(false, std::memory_order_relaxed);
+
+        if (s_fg_confirmed_by_getstate.load(std::memory_order_relaxed)) {
+            // GetState confirmed — already set, nothing to do
+            return;
+        }
+
+        // Window expired without GetState confirming.
+        // Check: did GetState ever fire during the window?
+        // If not, promote the inference (HFW case — game never calls GetState).
+        // If GetState did fire and said not presenting, don't promote (MH Stories 3).
+        uint32_t getstate_calls = s_getstate_call_count.load(std::memory_order_relaxed);
+        if (getstate_calls == 0) {
+            // GetState was never called — game doesn't poll it.
+            // Promote the inference (HFW case).
+            g_fg_presenting.store(true, std::memory_order_relaxed);
+            LOG_INFO("FG presenting promoted (GetState never called, %.1fs elapsed)",
+                     elapsed_us / 1000000.0);
+            OnFGStateChange();
+        } else {
+            // GetState IS being called but never confirmed presenting.
+            // This is the MH Stories 3 case — revoke.
+            LOG_INFO("FG presenting NOT promoted — GetState called %u times but never confirmed (%.1fs)",
+                     getstate_calls, elapsed_us / 1000000.0);
+        }
+    }
 }
 
 // ── Entry point: called when sl.interposer.dll is loaded ──
