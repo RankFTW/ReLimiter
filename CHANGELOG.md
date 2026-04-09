@@ -1,19 +1,35 @@
 # Changelog
 
+
+## 3.1.2
+
+### New Features
+- Added cadence metering — measures actual presentation cadence from DXGI frame statistics with adaptive bias correction for the scheduler
+- Added DX11 flip model override — forces bitblt swapchains to FLIP_DISCARD for true VRR operation and reduced DWM composition latency
+- Added system hardening — MMCSS present-thread registration, GPU scheduling priority, Win11 power throttling bypass, DWM MMCSS opt-in
+- Added Reflex latency feedback — reads NvAPI_D3D_GetLatency ring buffer for GPU frame time and active render time, used as cadence bias source when available
+
+### Bug Fixes
+- Fixed FPS cap not enforcing during menus, cutscenes, and loading screens in DX12 Reflex games (e.g. Monster Hunter Stories 3, Expedition 33) — falls back to present-based enforcement when NvAPI/PCL markers stop flowing
+- Fixed false-positive Frame Generation detection in Reflex-only games (e.g. MH Stories 3) — added `s_setoptions_ever_called` guard so GetState doesn't read uninitialized FG state
+- Fixed deferred FG inference for games that never call GetState (e.g. Horizon Forbidden West) — 3-second confirmation window promotes or revokes FG presenting based on GetState behavior
+- Fixed Streamline swapchain unwrap crash — disabled `TryStreamlineUnwrap` to prevent reference count mismatch causing `E_ACCESSDENIED` on swapchain recreation
+- Fixed stale NvAPI device pointer crash — clears `g_dev` on device destroy, captures from SetLatencyMarker when SetSleepMode is never called
+- Added SEH exception handling in correlator `QueryFrameStatistics` and streamline hook detours
+
+### Improvements
+- Simplified correlator — major rewrite replacing complex calibration/sequencing with a direct DXGI stats source
+- Reworked feedback system — cadence meter integration replacing raw correlator-based feedback, with Reflex ring buffer as preferred bias source
+- Reworked scheduler — simplified overload detection, improved deadline catch-up logic, added interval-change detection for FG/FPS transitions
+- Improved hardware spin loop with better TSC calibration and method detection
+- Simplified stress detector interface
+- Added VSync hook improvements for DX11/DX12
+- Added vblank thread enhancements
+- Improved PCL marker hooks with deadline snapshot before enforcement
+
 ## 3.1.1
 - Fixed Frame Generation not being detected in games that never call slDLSSGGetState (e.g. Horizon Forbidden West), causing fg_div to stay at 1.0, incorrect FPS display, and wrong pacing intervals
 - Fixed G-Sync not being detected in OpenGL games (e.g. OpenMW) because nvapi64.dll isn't auto-loaded by the driver for OpenGL — now force-loads it when needed
-- Fixed FPS cap not enforcing during menus, cutscenes, and loading screens in DX12 Reflex games (e.g. Monster Hunter Stories 3, Expedition 33) — falls back to present-based enforcement when NvAPI/PCL markers stop flowing
-- Added cadence metering — measures actual presentation cadence from DXGI frame statistics with adaptive bias correction for the scheduler
-- Added DX11 flip model override — forces bitblt swapchains to FLIP_DISCARD for true VRR operation and reduced DWM composition latency
-- Added system hardening — MMCSS thread registration, DXGI device-level optimizations for frame pacing quality
-- Simplified correlator — major rewrite removing ~300 lines, streamlined calibration and stale detection
-- Reworked feedback system with cadence meter integration replacing raw correlator-based feedback
-- Improved hardware spin loop with better TSC handling
-- Reworked stress detector with simplified interface
-- Added VSync control improvements for DX11/DX12
-- Added vblank thread enhancements
-- Various scheduler and predictor optimizations
 
 ## 3.1.0
 - Fixed config saving logic and removed dead config values
