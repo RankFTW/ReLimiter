@@ -2,24 +2,15 @@
 
 #include <cstdint>
 
-// DrainCorrelator: every frame. Detects FG inserts, retires presents,
-// feeds stress detector, accumulates scanout error.
-// ApplyDisplayedTimeBias: every 30 frames. Nudges deadline track from
-// accumulated scanout error.
-// Spec §5.5.
+// DrainCorrelator: every frame. Queries DXGI stats, feeds CadenceMeter
+// and stress detector. Replaces the old retirement-based feedback loop.
+void DrainCorrelator(bool overload_active, double effective_interval_us);
 
-// Scheduler state passed in from the caller (scheduler owns these).
-struct FeedbackState {
-    bool overload_active = false;
-    int64_t& last_present_deadline;
-    double& deadline_bias_us;
-};
-
-void DrainCorrelator(bool overload_active);
-void ApplyDisplayedTimeBias(int64_t& last_present_deadline, double& deadline_bias_us);
-
-// Reset accumulated scanout error (called on flush).
+// Reset CadenceMeter and feedback state (called on flush).
 void ResetFeedbackAccumulators();
 
-// Last scanout error average (for telemetry). Returns 0 if no samples.
+// Last presentation bias (for telemetry). Returns 0 if no samples.
 double GetLastScanoutErrorUs();
+
+// Returns true if Reflex GetLatency has successfully fed cadence data.
+bool IsReflexCadenceActive();

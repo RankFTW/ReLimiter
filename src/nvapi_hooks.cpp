@@ -7,6 +7,7 @@
 #include "config.h"
 #include "health.h"
 #include "pcl_hooks.h"
+#include "enforcement_dispatcher.h"
 
 #include "presentation_gate.h"
 #include "wake_guard.h"
@@ -121,6 +122,14 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
                  params->markerType, params->frameID);
     }
 
+    // Capture device for GetLatency if not already set.
+    // Some games (Streamline/DLSS-G) never call SetSleepMode through NvAPI,
+    // so g_dev stays null. The marker hook always receives the device.
+    if (!g_dev && dev) {
+        g_dev = dev;
+        LOG_INFO("NvAPI: device captured from SetLatencyMarker");
+    }
+
     if (CallerIsRTSS()) {
         return s_orig_set_latency_marker(dev, params);
     }
@@ -162,22 +171,23 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
             s_enforcement_marker = RENDERSUBMIT_START;
     }
 
+    // Snapshot the deadline BEFORE enforcement advances it.
+    // The scheduler's OnMarker advances g_next_deadline to the next frame's
+    // target. PRESENT_START needs the current frame's deadline for the
+    // correlator's scanout error calculation.
+    static int64_t s_pre_enforcement_deadline = 0;
+    if (params->markerType == s_enforcement_marker)
+        s_pre_enforcement_deadline = g_next_deadline.load(std::memory_order_relaxed);
+
     if (params->markerType == s_enforcement_marker && !PCL_MarkersFlowing())
         OnMarker(params->frameID, ts.QuadPart);
 
-    // Feed correlator at PRESENT_START
-    // Only attempt calibration after the presenting swapchain has been
-    // captured from the present callback — before that, the swapchain
-    // is likely a Streamline proxy that doesn't support GetFrameStatistics.
-    if (params->markerType == PRESENT_START && g_presenting_swapchain) {
-        if (g_correlator.needs_recalibration)
-            g_correlator.Calibrate();
-        if (!g_correlator.needs_recalibration) {
-            g_correlator.OnPresent(params->frameID,
-                g_next_deadline.load(std::memory_order_relaxed));
-        }
-    }
-
+    // Feed correlator at PRESENT_START — only for present-based enforcement.
+    // Marker-based paths (NvAPI/PCL) have unreliable scanout estimation with
+    // FG because the gap between submission and PresentCount varies by 1-3
+    // refresh periods frame-to-frame, producing ~6-22ms of noise that the
+    // feedback loop can't track. The pacing quality from markers alone is
+    // already excellent — the correlator just adds noise.
     // PRESENT_START gate: delegated to shared Presentation_Gate module
     if (params->markerType == PRESENT_START) {
         PresentGate_Execute(ts.QuadPart, params->frameID);

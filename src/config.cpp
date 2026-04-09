@@ -158,6 +158,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.log_level               = ReadINIString(S, "log_level", "warn", P);
     g_config.csv_enabled             = ReadINIBool(S, "csv_enabled", false, P);
     g_config.reflex_inject           = ReadINIBool(S, "reflex_inject", false, P);
+    g_config.flip_model_override     = ReadINIBool(S, "flip_model_override", false, P);
 
     LOG_INFO("Config: values read, calling ApplyConfig...");
     ValidateConfig();
@@ -204,6 +205,7 @@ void SaveConfig() {
     WriteINIString(S, "log_level", g_config.log_level.c_str(), P);
     WriteINIBool(S, "csv_enabled", g_config.csv_enabled, P);
     WriteINIBool(S, "reflex_inject", g_config.reflex_inject, P);
+    WriteINIBool(S, "flip_model_override", g_config.flip_model_override, P);
 }
 
 void ApplyConfig() {

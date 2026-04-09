@@ -144,6 +144,12 @@ static HRESULT STDMETHODCALLTYPE Hooked_Present(IDXGISwapChain* self, UINT SyncI
         override_interval = 0;
         // Add ALLOW_TEARING if the swapchain supports it
         override_flags |= DXGI_PRESENT_ALLOW_TEARING;
+        static bool s_off_logged = false;
+        if (!s_off_logged) {
+            s_off_logged = true;
+            LOG_INFO("VSync: first present with mode=off (interval=0, ALLOW_TEARING added, "
+                     "game_interval=%u, game_flags=0x%X)", SyncInterval, Flags);
+        }
     } else if (g_config.vsync_mode == "on") {
         override_interval = 1;
         // Strip ALLOW_TEARING — incompatible with sync_interval > 0
@@ -155,6 +161,19 @@ static HRESULT STDMETHODCALLTYPE Hooked_Present(IDXGISwapChain* self, UINT SyncI
     // If ALLOW_TEARING failed (swapchain doesn't support it), retry without
     if (hr == DXGI_ERROR_INVALID_CALL && g_config.vsync_mode == "off" &&
         (override_flags & DXGI_PRESENT_ALLOW_TEARING)) {
+        static bool s_tearing_fail_logged = false;
+        if (!s_tearing_fail_logged) {
+            s_tearing_fail_logged = true;
+            LOG_WARN("VSync: DXGI_PRESENT_ALLOW_TEARING rejected (swapchain missing flag?), "
+                     "falling back to SyncInterval=0 without tearing");
+
+            // Log the swapchain's actual flags for diagnosis
+            DXGI_SWAP_CHAIN_DESC desc = {};
+            if (SUCCEEDED(self->GetDesc(&desc))) {
+                LOG_WARN("VSync: swapchain SwapEffect=%d, Flags=0x%X, BufferCount=%u, Windowed=%d",
+                         desc.SwapEffect, desc.Flags, desc.BufferCount, desc.Windowed);
+            }
+        }
         hr = s_orig_Present(self, 0, Flags);
     }
 

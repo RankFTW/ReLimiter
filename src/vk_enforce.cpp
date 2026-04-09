@@ -105,19 +105,6 @@ void VkEnforce_OnPresent(int64_t now_qpc) {
 
     // ── DXGI present-based: feed correlator ──
     // When DX12/DX11 runs without NvAPI markers, the correlator normally
-    // never gets submissions (OnPresent is in the marker hook). Feed it
-    // here so scanout feedback works for present-based DXGI paths.
-    // Vulkan/OpenGL have no DXGI GetFrameStatistics — skip.
-    ActiveAPI api = SwapMgr_GetActiveAPI();
-    if (api != ActiveAPI::Vulkan && api != ActiveAPI::OpenGL && api != ActiveAPI::None && g_presenting_swapchain) {
-        if (g_correlator.needs_recalibration)
-            g_correlator.Calibrate();
-        if (!g_correlator.needs_recalibration) {
-            g_correlator.OnPresent(frameID,
-                g_next_deadline.load(std::memory_order_relaxed));
-        }
-    }
-
     // Call the shared scheduler enforcement point.
     // Pass a fresh timestamp so the scheduler's `now` reflects the actual
     // time at sleep decision, not the stale present-event time. The overhead

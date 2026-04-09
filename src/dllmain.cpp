@@ -10,6 +10,7 @@
 #include "loadlib_hooks.h"
 #include "streamline_hooks.h"
 #include "timer_hooks.h"
+#include "system_hardening.h"
 #include "marker_log.h"
 #include "tsc_cal.h"
 #include "hw_spin.h"
@@ -29,6 +30,7 @@
 #include "correlator.h"
 #include "display_resolver.h"
 #include "vsync_control.h"
+#include "flip_model.h"
 
 // g_swapchain moved to flush.cpp (managed by OnInitSwapchain/OnDestroySwapchain)
 // g_presenting_swapchain moved to correlator.cpp (read-only consumer)
@@ -92,17 +94,44 @@ static void on_init_device(reshade::api::device* device) {
     SwapMgr_OnInitDevice(device);
 }
 static void on_destroy_device(reshade::api::device* device) {
+    // Clear g_dev if this is the device we captured for GetLatency.
+    // Prevents stale pointer crashes during device transitions (alt-tab, resize).
+    if (g_dev) {
+        g_dev = nullptr;
+        LOG_INFO("NvAPI: g_dev cleared on device destroy");
+    }
     SwapMgr_OnDestroyDevice(device);
 }
 static void on_init_swapchain(reshade::api::swapchain* sc, bool resize) {
     SwapMgr_OnInitSwapchain(sc, resize);
+    // Apply GPU thread priority on first swapchain init (DXGI only — Vulkan
+    // native handles are VkSwapchainKHR, not IDXGISwapChain*)
+    if (!resize) {
+        ActiveAPI api = SwapMgr_GetActiveAPI();
+        if (api == ActiveAPI::DX12 || api == ActiveAPI::DX11) {
+            uint64_t native = sc->get_native();
+            if (native)
+                Hardening_OnDevice(reinterpret_cast<void*>(native));
+        }
+    }
 }
 static void on_destroy_swapchain(reshade::api::swapchain* sc, bool resize) {
     SwapMgr_OnDestroySwapchain(sc, resize);
 }
 
 // ── Fake Fullscreen: intercept exclusive fullscreen → borderless window ──
-static bool on_create_swapchain(reshade::api::device_api, reshade::api::swapchain_desc& desc, void* hwnd) {
+// ── Flip Model Override: upgrade bitblt → FLIP_DISCARD for DX11 VRR ──
+static bool on_create_swapchain(reshade::api::device_api api, reshade::api::swapchain_desc& desc, void* hwnd) {
+    bool modified = false;
+
+    // Flip model override (DX11 only — DX12 games already use flip model)
+    if (api == reshade::api::device_api::d3d11) {
+        if (FlipModel_TryUpgrade(desc.present_mode, desc.present_flags,
+                                  desc.back_buffer_count, desc.fullscreen_state)) {
+            modified = true;
+        }
+    }
+
     if (g_config.fake_fullscreen && desc.fullscreen_state) {
         desc.fullscreen_state = false;
         LOG_INFO("Fake fullscreen: blocked exclusive fullscreen at swapchain creation");
@@ -127,7 +156,7 @@ static bool on_create_swapchain(reshade::api::device_api, reshade::api::swapchai
         }
         return true; // modified
     }
-    return false;
+    return modified;
 }
 
 static bool on_set_fullscreen_state(reshade::api::swapchain*, bool fullscreen, void*) {
@@ -144,6 +173,9 @@ static void on_present(reshade::api::command_queue* queue,
                        const reshade::api::rect* dest_rect,
                        uint32_t dirty_rect_count,
                        const reshade::api::rect* dirty_rects) {
+    // MMCSS registration for the present thread (once)
+    Hardening_OnFirstPresent();
+
     // ── Late init: detect device/swapchain that were created before addon loaded ──
     if (sc && !SwapMgr_IsValid()) {
         reshade::api::device* dev = sc->get_device();
@@ -183,7 +215,26 @@ static void on_present(reshade::api::command_queue* queue,
     // last capture (handles DX11 launcher → DX12 gameplay transition where
     // Streamline reuses the same proxy pointer for both).
     if (sc) {
-        ActiveAPI api = SwapMgr_GetActiveAPI();
+        // Derive API from the swapchain's own device rather than the cached
+        // global state. SwapMgr_GetActiveAPI() can be stale during API
+        // transitions (e.g. DX12 launcher → Vulkan gameplay) because
+        // on_present may fire before SwapMgr_OnInitDevice updates the API.
+        // Using the wrong API here causes a VkSwapchainKHR to be cast as
+        // IDXGISwapChain*, leading to a crash when VSync_InstallDXGIHooks
+        // dereferences the Vulkan handle as a COM vtable.
+        ActiveAPI api = ActiveAPI::None;
+        reshade::api::device* present_dev = sc->get_device();
+        if (present_dev) {
+            switch (present_dev->get_api()) {
+                case reshade::api::device_api::d3d11:  api = ActiveAPI::DX11;  break;
+                case reshade::api::device_api::d3d12:  api = ActiveAPI::DX12;  break;
+                case reshade::api::device_api::vulkan: api = ActiveAPI::Vulkan; break;
+                case reshade::api::device_api::opengl: api = ActiveAPI::OpenGL; break;
+                default: break;
+            }
+        }
+        if (api == ActiveAPI::None)
+            api = SwapMgr_GetActiveAPI(); // fallback to cached if device unavailable
 
         // Vulkan native handles are VkSwapchainKHR — NOT IDXGISwapChain*.
         // Casting them to IDXGISwapChain* and storing in g_presenting_swapchain
@@ -213,9 +264,15 @@ static void on_present(reshade::api::command_queue* queue,
 
                 // Install DXGI VSync hook on first swapchain capture
                 VSync_InstallDXGIHooks(native);
+
+                // Check factory tearing support for flip model override
+                FlipModel_CheckTearingSupport(native);
             }
         }
     }
+
+    // Check deferred FG inference (promotes or revokes after confirmation window)
+    CheckDeferredFGInference();
 
     LARGE_INTEGER now_qpc;
     QueryPerformanceCounter(&now_qpc);
@@ -285,6 +342,8 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
     __try {
         InstallTimerHooks();
         LOG_INFO("Timer hooks installed");
+
+        Hardening_Init();
 
         // NvAPI and Streamline hooks are deferred to the first on_present.
         // This lets the game's rendering pipeline fully initialize before
@@ -371,6 +430,7 @@ void WINAPI AddonUninit(HMODULE /*addon_module*/, HMODULE /*reshade_module*/) {
     StopDisplayPollThread();
     RestoreFrameSplitting();
     RemoveTimerHooks();
+    Hardening_Shutdown();
     DisableAllHooks();
     MH_Uninitialize();
     CloseSleepTimer();
@@ -403,6 +463,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             StopDisplayPollThread();
             RestoreFrameSplitting();
             RemoveTimerHooks();
+            Hardening_Shutdown();
             DisableAllHooks();
             MH_Uninitialize();
             CloseSleepTimer();

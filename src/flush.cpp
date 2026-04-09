@@ -24,15 +24,8 @@ extern void SetOccluded(bool v);
 void Flush(uint32_t modules) {
     LOG_INFO("Flush: modules=0x%X", modules);
     if (modules & FLUSH_CORRELATOR) {
-        // Clear failure counters — a flush is an external signal that
-        // conditions changed (FG toggle, present failure, etc.), so
-        // the correlator should get a clean slate, not carry over
-        // stale/overflow history from the previous regime.
-        // Reset() handles suspend backoff + calibration state.
-        g_correlator.stale_count = 0;
-        g_correlator.overflow_count = 0;
-        g_correlator.resolve_attempts = 0;
-        g_correlator.Reset();
+        // Reset CadenceMeter and feedback state
+        ResetFeedbackAccumulators();
     }
 
     if (modules & FLUSH_STRESS) {

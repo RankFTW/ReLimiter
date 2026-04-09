@@ -144,6 +144,7 @@ static void VBlankThreadProc() {
 }
 
 void StartVBlankThread() {
+    if (s_vblank_running.load(std::memory_order_relaxed)) return; // already running
     s_vblank_running.store(true, std::memory_order_relaxed);
     s_vblank_thread = std::thread(VBlankThreadProc);
 }
@@ -153,4 +154,21 @@ void StopVBlankThread() {
     if (s_vblank_thread.joinable())
         s_vblank_thread.join();
     s_last_vblank_qpc = 0;
+}
+
+bool IsVBlankThreadRunning() {
+    return s_vblank_running.load(std::memory_order_relaxed);
+}
+
+void UpdateVBlankThreadForMode(PacingMode mode) {
+    if (mode == PacingMode::Fixed) {
+        // Fixed mode needs real vblank edges for PLL
+        if (!IsVBlankThreadRunning())
+            StartVBlankThread();
+    } else {
+        // VRR mode: CadenceMeter handles refresh estimation from DXGI stats.
+        // Stop the vblank thread to avoid redundant kernel-mode waits.
+        if (IsVBlankThreadRunning())
+            StopVBlankThread();
+    }
 }

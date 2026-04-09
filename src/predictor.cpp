@@ -125,10 +125,11 @@ double Predictor::Predict() {
         ema_us += 0.10 * (frame_times_us.Latest() - ema_us);
     }
 
-    // Small fixed safety margin — enough to absorb normal jitter without
-    // the runaway behavior of cv-scaled safety. 1ms covers P95 of
-    // frame-to-frame render time variation in typical workloads.
-    predicted_us = ema_us + 1000.0;
+    // Small fixed safety margin — absorbs single-frame render time spikes
+    // that the EMA hasn't tracked yet. Kept small because the CadenceMeter's
+    // adaptive bias controller handles systematic correction via closed-loop
+    // feedback from actual presentation timing.
+    predicted_us = ema_us + 250.0;
 
     // Floor: never predict less than 1ms (prevents division issues downstream)
     predicted_us = (std::max)(predicted_us, 1000.0);

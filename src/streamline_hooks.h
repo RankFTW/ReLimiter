@@ -14,3 +14,7 @@ extern std::atomic<bool> g_fg_presenting;  // true when FG is actually producing
 
 // Called from LoadLibrary hook when sl.interposer.dll is detected.
 void HookStreamlinePCL(HMODULE hInterposer);
+
+// Called each frame from the scheduler to check if deferred FG inference
+// should be promoted (for games that never call GetState, e.g. HFW).
+void CheckDeferredFGInference();
