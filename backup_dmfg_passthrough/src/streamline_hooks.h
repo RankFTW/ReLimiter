@@ -12,10 +12,6 @@ extern std::atomic<int>  g_fg_multiplier;  // raw numFramesToGenerate
 extern std::atomic<bool> g_fg_active;
 extern std::atomic<bool> g_fg_presenting;  // true when FG is actually producing frames
 
-// Actual runtime FG multiplier from slDLSSGGetState (numFramesActuallyPresented).
-// Updated each time GetState fires. Independent of render pacing — safe for cadence computation.
-extern std::atomic<int>  g_fg_actual_multiplier;
-
 // DMFG state — DLSSGMode: 0=eOff, 1=eOn (static FG), 2=eAuto (Dynamic MFG)
 extern std::atomic<int>  g_fg_mode;
 

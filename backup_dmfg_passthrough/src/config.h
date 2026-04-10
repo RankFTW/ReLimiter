@@ -65,9 +65,6 @@ struct Config {
 
     // Dynamic MFG Passthrough — disable pacing when DLSS 4.5 Dynamic MFG is active
     bool dynamic_mfg_passthrough = false;
-
-    // DMFG Output Cap — target output FPS when DMFG is active (0 = no cap)
-    int dmfg_output_cap = 0;
 };
 
 extern Config g_config;

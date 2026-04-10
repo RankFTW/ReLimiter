@@ -76,11 +76,6 @@ static double s_last_own_sleep_cap_us = 0.0;   // sleep time from last cap frame
 static int    s_prev_cap_mult = 0;             // for logging multiplier transitions
 static int    s_prev_output_cap = 0;           // for detecting cap 0↔nonzero transitions
 
-// ── EMA-smoothed actual multiplier ──
-// g_fg_actual_multiplier bounces every GetState call (e.g. 2→6→3→5 on
-// consecutive calls). Smooth it so the cadence interval doesn't whipsaw.
-static double s_ema_mult = 0.0;
-
 // ── Output feedback controller (v5) ──
 // Uses g_output_fps directly as the sole feedback signal. No probes, no
 // render_fps estimation. g_output_fps IS VRR-saturated at ~165, but:
@@ -93,14 +88,6 @@ static double s_interval_correction_us = 0.0;
 static int    s_feedback_frame_counter = 0;
 static constexpr int FEEDBACK_TICK_FRAMES = 15;       // check every 15 render frames (~0.3s)
 static constexpr double FEEDBACK_MAX_CORRECTION = 30000.0; // max 30ms added
-
-// ── Periodic uncap probe ──
-// Every UNCAP_INTERVAL_FRAMES, force output_cap to 0 for exactly 1 frame.
-// This lets the driver see the natural render speed without our pacing.
-// The cap is restored on the very next frame.
-static int  s_uncap_frame_counter = 0;
-static bool s_uncap_active = false;
-static constexpr int UNCAP_INTERVAL_FRAMES = 300; // ~5s at ~60fps render
 
 // ── Forward declarations ──
 static void OnMarker_VRR(uint64_t frameID, int64_t now);
@@ -187,78 +174,29 @@ void OnMarker(uint64_t frameID, int64_t now) {
 
         int output_cap = g_dmfg_output_cap.load(std::memory_order_relaxed);
 
-        // ── Periodic uncap probe: remove cap for 1 frame every ~5s ──
-        // Acts as if the user set cap=0 then immediately restored it.
-        // Lets the driver see the real render speed and recalibrate.
-        if (output_cap > 0) {
-            if (s_uncap_active) {
-                // This is the uncap frame — force passthrough
-                output_cap = 0;
-                s_uncap_active = false;
-                // Don't reset the counter — it was already reset when we triggered
-            } else {
-                s_uncap_frame_counter++;
-                if (s_uncap_frame_counter >= UNCAP_INTERVAL_FRAMES) {
-                    s_uncap_frame_counter = 0;
-                    s_uncap_active = true;
-                    output_cap = 0;  // this frame is the uncap frame
-                }
-            }
-        } else {
-            // Cap is off — reset probe state
-            s_uncap_frame_counter = 0;
-            s_uncap_active = false;
-        }
-
         // Detect cap 0↔nonzero transitions — reset predictor state (Req 4.4)
-        // Skip transition detection during uncap probe frames to avoid
-        // resetting feedback state on the temporary 1-frame passthrough.
-        int real_cap = g_dmfg_output_cap.load(std::memory_order_relaxed);
-        if ((real_cap > 0) != (s_prev_output_cap > 0)) {
+        if ((output_cap > 0) != (s_prev_output_cap > 0)) {
             s_ema_render_cost = 0.0;
             s_last_own_sleep_cap_us = 0.0;
             s_prev_cap_mult = 0;
             s_interval_correction_us = 0.0;
             s_feedback_frame_counter = 0;
-            s_ema_mult = 0.0;
             LOG_INFO("DMFG cap transition: %d -> %d, resetting predictor state",
-                     s_prev_output_cap, real_cap);
+                     s_prev_output_cap, output_cap);
         }
-        s_prev_output_cap = real_cap;
+        s_prev_output_cap = output_cap;
 
         if (output_cap > 0) {
             // ── DMFG Output Cap v5: output-feedback only ──
             // No probes, no render_fps estimation. Uses g_output_fps as the
-            // sole feedback signal.
+            // sole feedback signal. Base cadence from ComputeFGDivisorRaw().
             //
-            // Multiplier: use g_fg_actual_multiplier (from GetState) as the
-            // primary source — it reflects the driver's ACTUAL dynamic
-            // multiplier (3x, 5x, 6x etc.), not just the game's request.
-            // Fall back to ComputeFGDivisorRaw() if GetState hasn't fired yet.
-            //
-            // NEVER use g_output_fps / render_fps for the multiplier —
+            // NEVER use g_output_fps / render_fps for the per-frame multiplier —
             // that's circular. See HANDOFF.md for the full failure history.
-            int raw_mult = g_fg_actual_multiplier.load(std::memory_order_relaxed);
-            if (raw_mult < 2)
-                raw_mult = ComputeFGDivisorRaw();  // fallback to Streamline hints
-            if (raw_mult < 2)
-                raw_mult = 2;  // absolute minimum for DMFG
-            raw_mult = (std::min)(raw_mult, 6);
-
-            // EMA-smooth the multiplier to filter per-GetState-call noise.
-            // Alpha 0.08 = ~12 frame time constant. Tracks real transitions
-            // (3x→6x over seconds) but rejects single-call bouncing.
-            if (s_ema_mult < 1.5)
-                s_ema_mult = static_cast<double>(raw_mult);  // seed
-            else
-                s_ema_mult += 0.08 * (static_cast<double>(raw_mult) - s_ema_mult);
-
-            // Use the smoothed value for cadence, clamped to [2, 6]
-            double mult_d = (std::max)(2.0, (std::min)(s_ema_mult, 6.0));
-
-            // Log transitions based on rounded smoothed value
-            int mult = static_cast<int>(mult_d + 0.5);
-            if (mult < 2) mult = 2;
+            int mult = ComputeFGDivisorRaw();
+            if (mult < 2)
+                mult = 2;  // absolute minimum for DMFG
+            mult = (std::min)(mult, 6);
 
             // Log multiplier transitions (Req 6.5)
             if (mult != s_prev_cap_mult && s_prev_cap_mult != 0) {
@@ -267,7 +205,7 @@ void OnMarker(uint64_t frameID, int64_t now) {
             s_prev_cap_mult = mult;
 
             // Cadence computation (Req 5.1, 5.2) + output feedback correction
-            double base_interval = (mult_d / static_cast<double>(output_cap)) * 1e6;
+            double base_interval = (static_cast<double>(mult) / static_cast<double>(output_cap)) * 1e6;
             double target_interval = base_interval + s_interval_correction_us;
             target_interval = (std::max)(2000.0, (std::min)(target_interval, 200000.0));
 
@@ -341,7 +279,7 @@ void OnMarker(uint64_t frameID, int64_t now) {
             row.frame_id = frameID;
             row.timestamp_us = qpc_to_us(qpc_now.QuadPart);
             row.actual_frame_time_us = telemetry_ft;
-            row.fg_divisor = mult_d;
+            row.fg_divisor = static_cast<double>(mult);
             row.predicted_us = g_predictor.predicted_us;
             row.sleep_duration_us = target_interval;  // target, not actual (Req 8.2)
             row.overload = 0;

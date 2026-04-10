@@ -108,14 +108,6 @@ void ValidateConfig() {
     // ── Logging ──
     static const char* log_levels[] = {"error", "warn", "info", "debug"};
     ValidateEnum(g_config.log_level, log_levels, 4, "info");
-
-    // ── DMFG Output Cap ──
-    if (g_config.dmfg_output_cap < 0)
-        g_config.dmfg_output_cap = 0;
-    else if (g_config.dmfg_output_cap >= 1 && g_config.dmfg_output_cap < 30)
-        g_config.dmfg_output_cap = 30;
-    else if (g_config.dmfg_output_cap > 360)
-        g_config.dmfg_output_cap = 360;
 }
 
 bool Config_IsFirstLaunch() { return s_first_launch; }
@@ -169,7 +161,6 @@ void LoadConfig(HMODULE hModule) {
     g_config.reflex_inject           = ReadINIBool(S, "reflex_inject", false, P);
     g_config.flip_model_override     = ReadINIBool(S, "flip_model_override", false, P);
     g_config.dynamic_mfg_passthrough = ReadINIBool(S, "dynamic_mfg_passthrough", false, P);
-    g_config.dmfg_output_cap         = ReadINIInt(S, "dmfg_output_cap", 0, P);
 
     LOG_INFO("Config: values read, calling ApplyConfig...");
     ValidateConfig();
@@ -218,7 +209,6 @@ void SaveConfig() {
     WriteINIBool(S, "reflex_inject", g_config.reflex_inject, P);
     WriteINIBool(S, "flip_model_override", g_config.flip_model_override, P);
     WriteINIBool(S, "dynamic_mfg_passthrough", g_config.dynamic_mfg_passthrough, P);
-    WriteINIInt(S, "dmfg_output_cap", g_config.dmfg_output_cap, P);
 }
 
 void ApplyConfig() {
@@ -231,7 +221,4 @@ void ApplyConfig() {
     // Force DMFG passthrough mode when config toggle is enabled
     if (g_config.dynamic_mfg_passthrough)
         g_fg_mode.store(2, std::memory_order_relaxed);
-
-    // DMFG output cap
-    g_dmfg_output_cap.store(g_config.dmfg_output_cap, std::memory_order_relaxed);
 }

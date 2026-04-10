@@ -472,46 +472,6 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 "Disables frame pacing so the driver can dynamically adjust the FG multiplier. "
                 "OSD and telemetry remain active. Leave off for static FG or non-FG games.");
 
-        // DMFG Output Cap slider — visible when DMFG is active or passthrough is enabled
-        if (IsDmfgActive() || g_config.dynamic_mfg_passthrough) {
-            ImGui::Spacing();
-            static int s_cap_edit = g_config.dmfg_output_cap;
-            static bool s_cap_active = false;
-            if (!s_cap_active)
-                s_cap_edit = g_config.dmfg_output_cap;
-
-            char cap_fmt[32];
-            if (s_cap_edit == 0)
-                snprintf(cap_fmt, sizeof(cap_fmt), "Off");
-            else
-                snprintf(cap_fmt, sizeof(cap_fmt), "%%d");
-            ImGui::SliderInt("DMFG Output Cap", &s_cap_edit, 0, 360, cap_fmt);
-            s_cap_active = ImGui::IsItemActive();
-            if (ImGui::IsItemDeactivatedAfterEdit()) {
-                if (s_cap_edit > 0 && s_cap_edit < 30) s_cap_edit = 30;
-                g_config.dmfg_output_cap = s_cap_edit;
-                g_dmfg_output_cap.store(s_cap_edit, std::memory_order_relaxed);
-                config_dirty = true;
-            }
-
-            // VRR quick-set button
-            if (reflex_cap > 0) {
-                ImGui::SameLine();
-                char vrr_label[32];
-                snprintf(vrr_label, sizeof(vrr_label), "VRR (%d)", reflex_cap);
-                if (ImGui::Button(vrr_label)) {
-                    s_cap_edit = reflex_cap;
-                    g_config.dmfg_output_cap = reflex_cap;
-                    g_dmfg_output_cap.store(reflex_cap, std::memory_order_relaxed);
-                    config_dirty = true;
-                }
-            }
-
-            HelpTip("Cap the output (display) FPS when DMFG is active. "
-                    "Set to your VRR ceiling (e.g. 157) to prevent tearing above the VRR window. "
-                    "0 = no cap (full passthrough).");
-        }
-
         // Advanced Logging toggle
         ImGui::Spacing();
         bool csv = g_config.csv_enabled;
@@ -952,33 +912,18 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         // PIPELINE (light blue)
         // ═══════════════════════════════════
         if (g_config.osd_show_fg) {
-            char buf[48];
+            char buf[32];
             if (IsDmfgActive()) {
-                int actual_mult = g_fg_actual_multiplier.load(std::memory_order_relaxed);
-                int cap = g_dmfg_output_cap.load(std::memory_order_relaxed);
-                if (cap > 0) {
-                    // Cap active: show multiplier from GetState + cap value (Req 7.1)
-                    if (actual_mult >= 2)
-                        snprintf(buf, sizeof(buf), "FG: Dynamic %dx [Cap: %d]", actual_mult, cap);
+                // Show inferred multiplier from output/render FPS ratio
+                double output = g_output_fps.load(std::memory_order_relaxed);
+                if (output > 0.0 && s_real_fps > 1.0) {
+                    int inferred = static_cast<int>(output / s_real_fps + 0.5);
+                    if (inferred >= 2 && inferred <= 8)
+                        snprintf(buf, sizeof(buf), "FG: Dynamic %dx", inferred);
                     else
-                        snprintf(buf, sizeof(buf), "FG: Dynamic [Cap: %d]", cap);
+                        snprintf(buf, sizeof(buf), "FG: Dynamic");
                 } else {
-                    // Cap=0: existing display unchanged (Req 7.2)
-                    if (actual_mult >= 2)
-                        snprintf(buf, sizeof(buf), "FG: Dynamic %dx", actual_mult);
-                    else {
-                        // Fallback: infer from output/render ratio for display only
-                        double output = g_output_fps.load(std::memory_order_relaxed);
-                        if (output > 0.0 && s_real_fps > 1.0) {
-                            int inferred = static_cast<int>(output / s_real_fps + 0.5);
-                            if (inferred >= 2 && inferred <= 8)
-                                snprintf(buf, sizeof(buf), "FG: Dynamic %dx", inferred);
-                            else
-                                snprintf(buf, sizeof(buf), "FG: Dynamic");
-                        } else {
-                            snprintf(buf, sizeof(buf), "FG: Dynamic");
-                        }
-                    }
+                    snprintf(buf, sizeof(buf), "FG: Dynamic");
                 }
             } else {
                 snprintf(buf, sizeof(buf), "FG: %s", fg_label);

@@ -9,7 +9,6 @@
 std::atomic<int>  g_fg_multiplier{0};
 std::atomic<bool> g_fg_active{false};
 std::atomic<bool> g_fg_presenting{false};
-std::atomic<int>  g_fg_actual_multiplier{0};
 
 // DMFG state — DLSSGMode: 0=eOff, 1=eOn (static FG), 2=eAuto (Dynamic MFG)
 std::atomic<int>  g_fg_mode{0};
@@ -174,15 +173,6 @@ static sl_Result __cdecl Detour_GetState(const void* vp, void* state, const void
                 uint32_t frames_presented = *reinterpret_cast<const uint32_t*>(p + 48);
                 bool presenting = (frames_presented > 1);
                 bool prev_presenting = g_fg_presenting.exchange(presenting, std::memory_order_relaxed);
-
-                // Store actual runtime multiplier, clamped to [0, 6].
-                // This is the driver's real dynamic FG ratio — independent of render pacing.
-                int clamped_mult = static_cast<int>((std::min)(frames_presented, 6u));
-                int prev_mult = g_fg_actual_multiplier.exchange(clamped_mult, std::memory_order_relaxed);
-                if (clamped_mult != prev_mult) {
-                    LOG_INFO("FG actual multiplier changed: %d -> %d (raw numFramesActuallyPresented=%u)",
-                             prev_mult, clamped_mult, frames_presented);
-                }
 
                 // If GetState confirms FG is presenting, mark confirmed
                 // so the deferred inference from SetOptions is validated.
