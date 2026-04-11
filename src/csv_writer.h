@@ -42,6 +42,15 @@ struct FrameRow {
     double   present_bias_us;              // current bias correction value
     int      feedback_rate;                // adaptive window size (8 or 16)
     double   feedback_alpha;               // current α (0.05 or 0.10)
+    // ── Reflex pipeline timing ──
+    double   reflex_pipeline_latency_us;   // present→gpuRenderEnd (DX12 Reflex only)
+    double   reflex_queue_trend_us;        // GPU render duration delta (stutter predictor)
+    // ── Extended Reflex timing ──
+    double   reflex_present_duration_us;   // presentStart→presentEnd (flip queue pressure)
+    double   reflex_gpu_active_us;         // GPU active render time (excludes idle bubbles)
+    double   reflex_ai_frame_time_us;      // DLSS FG time (0 when FG inactive)
+    double   reflex_cpu_latency_us;        // simStart→presentStart (full CPU latency)
+    double   gate_margin_us;               // adaptive gate margin used this frame
 };
 
 // Initialize CSV writer. Starts background thread.

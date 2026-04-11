@@ -20,6 +20,17 @@ void AdaptiveBiasController::AddSample(double bias_sample_us) {
 
     // EMA correction
     bias_us += alpha * avg_bias;
+
+    // Proportional fast-track: when the window average is large, the EMA
+    // alone takes too many windows to converge. Apply an immediate
+    // proportional correction so the controller can track step changes
+    // in presentation latency within 1-2 windows instead of 5-10.
+    if (std::abs(avg_bias) > PROPORTIONAL_THRESHOLD_US) {
+        double excess = avg_bias - (avg_bias > 0.0 ? PROPORTIONAL_THRESHOLD_US
+                                                    : -PROPORTIONAL_THRESHOLD_US);
+        bias_us += PROPORTIONAL_GAIN * excess;
+    }
+
     bias_us = std::clamp(bias_us, -MAX_BIAS, MAX_BIAS);
 
     // Sign tracking for rate adaptation

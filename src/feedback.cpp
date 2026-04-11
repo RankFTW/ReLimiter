@@ -53,6 +53,41 @@ static PFN_NvAPI_D3D_GetLatency s_get_latency = nullptr;
 static bool s_get_latency_resolved = false;
 static uint64_t s_last_reflex_frame_id = 0;
 
+// ── Reflex pipeline timing atomics ──
+std::atomic<double> g_reflex_pipeline_latency_us{0.0};
+std::atomic<double> g_reflex_queue_trend_us{0.0};
+
+// ── Extended Reflex timing atomics ──
+// Present call duration: presentStart → presentEnd. Measures how long the
+// CPU blocks in the present call (driver submission + flip queue wait).
+// High values indicate flip queue pressure or compositor contention.
+std::atomic<double> g_reflex_present_duration_us{0.0};
+
+// GPU active render time: actual shader execution time excluding idle
+// bubbles between draw calls. When gpuActiveRenderTimeUs << gpuRenderDuration,
+// the GPU has pipeline bubbles (CPU submission bottleneck or sync stalls).
+std::atomic<double> g_reflex_gpu_active_us{0.0};
+
+// AI frame time (DLSS Frame Generation): time spent generating the
+// interpolated frame. Non-zero only when FG is active. Provides a
+// driver-authoritative FG detection signal independent of Streamline hooks.
+std::atomic<double> g_reflex_ai_frame_time_us{0.0};
+
+// Full CPU latency: simStart → presentStart. The total time the CPU
+// spent on this frame from simulation start to present call. This is
+// the "game latency" in NVIDIA's terminology — the part of the pipeline
+// the scheduler can't control but needs to predict.
+std::atomic<double> g_reflex_cpu_latency_us{0.0};
+
+// Present-end timestamp (QPC): the moment the present call returned.
+// This is the closest available proxy for when the frame entered the
+// driver's flip queue. Used by the scheduler for scanout-anchored
+// deadline computation.
+std::atomic<int64_t> g_reflex_present_end_qpc{0};
+
+// Previous frame's GPU render duration for queue trend detection
+static double s_prev_gpu_render_duration_us = 0.0;
+
 static void ResolveGetLatency() {
     if (s_get_latency_resolved) return;
     s_get_latency_resolved = true;
@@ -169,6 +204,7 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
     }
 
     // Find the most recent frame report with a valid gpuFrameTimeUs.
+    // Also extract pipeline timing for the scheduler's deadline correction.
     bool found = false;
     for (int i = 63; i >= 0; i--) {
         const auto& r = params.frameReport[i];
@@ -177,6 +213,93 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
 
         double ft = static_cast<double>(r.gpuFrameTimeUs);
         g_cadence_meter.IngestReflex(ft, effective_interval_us);
+
+        // ── Pipeline latency: present call → GPU render end ──
+        // This measures how long the frame sits in the driver/GPU pipeline
+        // after the present call before it's ready for scanout.
+        // The DX12 equivalent of VK_EXT_present_timing's
+        // QUEUE_OPERATIONS_END → IMAGE_FIRST_PIXEL_OUT delta.
+        if (r.presentStartTime > 0 && r.gpuRenderEndTime > 0 &&
+            r.gpuRenderEndTime > r.presentStartTime) {
+            double pipeline_us = qpc_to_us(
+                static_cast<int64_t>(r.gpuRenderEndTime - r.presentStartTime));
+            if (pipeline_us > 0.0 && pipeline_us < effective_interval_us * 2.0) {
+                g_reflex_pipeline_latency_us.store(pipeline_us,
+                    std::memory_order_relaxed);
+            }
+        }
+
+        // ── Queue depth trend: is GPU work growing frame-over-frame? ──
+        // Compare consecutive gpuRenderEnd - gpuRenderStart durations.
+        // A positive trend means the GPU is taking longer each frame —
+        // the flip queue is building up and a stutter is ~2 frames away.
+        if (r.gpuRenderStartTime > 0 && r.gpuRenderEndTime > r.gpuRenderStartTime) {
+            double render_dur_us = qpc_to_us(
+                static_cast<int64_t>(r.gpuRenderEndTime - r.gpuRenderStartTime));
+            if (s_prev_gpu_render_duration_us > 0.0) {
+                double trend = render_dur_us - s_prev_gpu_render_duration_us;
+                g_reflex_queue_trend_us.store(trend, std::memory_order_relaxed);
+            }
+            s_prev_gpu_render_duration_us = render_dur_us;
+        }
+
+        // ── Present call duration: presentStart → presentEnd ──
+        // Measures CPU-side present overhead. High values indicate the
+        // flip queue is full (driver blocking until a buffer is available)
+        // or compositor contention in windowed/borderless modes.
+        if (r.presentStartTime > 0 && r.presentEndTime > 0 &&
+            r.presentEndTime > r.presentStartTime) {
+            double present_dur_us = qpc_to_us(
+                static_cast<int64_t>(r.presentEndTime - r.presentStartTime));
+            if (present_dur_us < effective_interval_us * 3.0) {
+                g_reflex_present_duration_us.store(present_dur_us,
+                    std::memory_order_relaxed);
+            }
+        }
+
+        // ── Present-end timestamp for scanout anchor ──
+        // The scheduler uses this as the closest proxy for when the frame
+        // entered the flip queue. Combined with gpuFrameTimeUs (which
+        // measures the display cadence), this anchors the deadline chain
+        // to actual display events.
+        if (r.presentEndTime > 0) {
+            g_reflex_present_end_qpc.store(
+                static_cast<int64_t>(r.presentEndTime),
+                std::memory_order_relaxed);
+        }
+
+        // ── GPU active render time ──
+        // Actual shader execution excluding idle bubbles. When this is
+        // much less than the full render duration (gpuRenderEnd - Start),
+        // the GPU has pipeline stalls from CPU submission bottlenecks.
+        if (r.gpuActiveRenderTimeUs > 0) {
+            g_reflex_gpu_active_us.store(
+                static_cast<double>(r.gpuActiveRenderTimeUs),
+                std::memory_order_relaxed);
+        }
+
+        // ── AI frame time (DLSS Frame Generation) ──
+        // Non-zero only when FG is generating interpolated frames.
+        // Provides a driver-authoritative FG detection signal that
+        // doesn't depend on Streamline hook interception.
+        g_reflex_ai_frame_time_us.store(
+            static_cast<double>(r.aiFrameTimeUs),
+            std::memory_order_relaxed);
+
+        // ── Full CPU latency: simStart → presentStart ──
+        // The total CPU-side frame time from simulation start to the
+        // present call. This is the "game latency" — the time the game
+        // spends on CPU work before handing off to the GPU.
+        if (r.simStartTime > 0 && r.presentStartTime > 0 &&
+            r.presentStartTime > r.simStartTime) {
+            double cpu_lat_us = qpc_to_us(
+                static_cast<int64_t>(r.presentStartTime - r.simStartTime));
+            if (cpu_lat_us > 0.0 && cpu_lat_us < effective_interval_us * 3.0) {
+                g_reflex_cpu_latency_us.store(cpu_lat_us,
+                    std::memory_order_relaxed);
+            }
+        }
+
         s_last_reflex_frame_id = r.frameID;
         s_reflex_found_count++;
         found = true;
@@ -296,6 +419,14 @@ void ResetFeedbackAccumulators() {
     s_expected_present_count = 0;
     s_has_prev_present = false;
     s_last_reflex_frame_id = 0;
+    s_prev_gpu_render_duration_us = 0.0;
+    g_reflex_pipeline_latency_us.store(0.0, std::memory_order_relaxed);
+    g_reflex_queue_trend_us.store(0.0, std::memory_order_relaxed);
+    g_reflex_present_duration_us.store(0.0, std::memory_order_relaxed);
+    g_reflex_gpu_active_us.store(0.0, std::memory_order_relaxed);
+    g_reflex_ai_frame_time_us.store(0.0, std::memory_order_relaxed);
+    g_reflex_cpu_latency_us.store(0.0, std::memory_order_relaxed);
+    g_reflex_present_end_qpc.store(0, std::memory_order_relaxed);
 }
 
 double GetLastScanoutErrorUs() {

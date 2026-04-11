@@ -9,6 +9,35 @@
 // ── Gate sleep telemetry ──
 std::atomic<double> g_last_gate_sleep_us{0.0};
 
+// ── Phase-stabilized presentation gate ──
+//
+// Problem: the scheduler absorbs CPU-side frame time variance into own_sleep,
+// keeping enforcement-to-enforcement locked to the target interval. But this
+// means the *phase* of the present within the interval varies — when the game
+// takes longer, the present arrives later relative to the deadline. This phase
+// jitter propagates through the GPU's 2-deep pipeline and appears as
+// presentation cadence error ~2 frames later.
+//
+// Solution: hold the present call until a fixed phase offset before the
+// deadline, regardless of when the CPU finished. This is the software
+// equivalent of VK_EXT_present_timing's presentAtAbsoluteTime — the
+// presentation engine holds the frame until a target time, decoupling
+// submission phase from CPU arrival phase.
+//
+// The gate target is: deadline - PHASE_OFFSET_US
+// where PHASE_OFFSET_US is a small fixed margin (~150µs) to ensure the
+// present enters the driver before the deadline. Frames arriving after
+// the gate target pass through immediately (they're already late).
+//
+// The gate uses pure HWSpin for the hold. HWSpin's implementations
+// (TPAUSE/MWAITX/RDTSC) are all power-efficient for the expected hold
+// durations (typically < 5ms). Using the waitable timer (CoarseSleep)
+// is unsafe here — the Windows timer can overshoot by 15ms+ at default
+// resolution, turning a 1ms hold request into an 18ms stall that pushes
+// the present far past the deadline and can crash the frame pipeline.
+
+static constexpr double PHASE_OFFSET_US = 0.0;  // hold to the deadline itself
+
 void PresentGate_Execute(int64_t timestamp_qpc, uint64_t frame_id) {
     g_last_gate_sleep_us.store(0.0, std::memory_order_relaxed);
 
@@ -16,32 +45,44 @@ void PresentGate_Execute(int64_t timestamp_qpc, uint64_t frame_id) {
         return;
 
     int64_t deadline = g_next_deadline.load(std::memory_order_relaxed);
-    if (deadline <= 0 || timestamp_qpc >= deadline)
+    if (deadline <= 0)
         return;
 
-    double delta_us = qpc_to_us(deadline - timestamp_qpc);
-    double max_gate_us = g_ceiling_interval_us.load(std::memory_order_relaxed) * 0.5;
+    // Gate target: fixed phase offset before the deadline.
+    // This is where we want every present to land, regardless of when
+    // the CPU finished rendering.
+    int64_t gate_target = deadline - us_to_qpc(PHASE_OFFSET_US);
 
-    if (delta_us <= 0.0)
-        return;
+    if (timestamp_qpc >= gate_target)
+        return;  // already at or past the target phase — pass through
+
+    double delta_us = qpc_to_us(gate_target - timestamp_qpc);
+
+    // Safety clamp: don't hold longer than 85% of the effective interval.
+    // Protects against stale deadlines from FG intermediate presents or
+    // deadline chain anomalies. At 37 Hz (27ms interval), max hold is ~23ms.
+    // At 111 Hz (9ms interval), max hold is ~7.6ms.
+    double effective_us = g_ceiling_interval_us.load(std::memory_order_relaxed);
+    double max_gate_us = effective_us * 0.85;
 
     if (delta_us >= max_gate_us) {
-        // Expected with FG — multiple presents per scheduler frame means
-        // intermediate presents see a deadline that's a full effective_interval
-        // ahead. This is normal, not an error. Don't log to avoid spam.
+        // Deadline is too far ahead — stale or FG intermediate. Don't hold.
         return;
     }
 
-    // Spin until deadline
-    HWSpin(deadline);
+    // Pure HWSpin to the gate target. TPAUSE/MWAITX enter low-power
+    // C0.1/C0.2/C1 states so this doesn't burn excessive power even for
+    // multi-millisecond holds. The RDTSC fallback does busy-wait but
+    // with _mm_pause between QPC checks (~50µs granularity).
+    HWSpin(gate_target);
 
     LARGE_INTEGER after;
     QueryPerformanceCounter(&after);
     double gate_us = qpc_to_us(after.QuadPart - timestamp_qpc);
     g_last_gate_sleep_us.store(gate_us, std::memory_order_relaxed);
 
-    if (gate_us > 5000.0) {
-        LOG_WARN("GATE_STALL: frame=%llu gate=%.0fus delta=%.0fus max=%.0fus",
+    if (gate_us > effective_us * 0.5) {
+        LOG_WARN("GATE_LONG: frame=%llu gate=%.0fus delta=%.0fus max=%.0fus",
                  frame_id, gate_us, delta_us, max_gate_us);
     }
 }
