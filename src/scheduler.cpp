@@ -246,12 +246,20 @@ void OnMarker(uint64_t frameID, int64_t now) {
             raw_mult = (std::min)(raw_mult, 6);
 
             // EMA-smooth the multiplier to filter per-GetState-call noise.
-            // Alpha 0.08 = ~12 frame time constant. Tracks real transitions
+            // Alpha 0.15 = ~7 frame time constant. Tracks real transitions
             // (3x→6x over seconds) but rejects single-call bouncing.
+            // Jump detection: if raw differs by >1 from EMA, snap halfway.
             if (s_ema_mult < 1.5)
                 s_ema_mult = static_cast<double>(raw_mult);  // seed
-            else
-                s_ema_mult += 0.08 * (static_cast<double>(raw_mult) - s_ema_mult);
+            else {
+                double diff = static_cast<double>(raw_mult) - s_ema_mult;
+                if (std::abs(diff) > 1.0) {
+                    // Large jump — snap halfway to respond faster
+                    s_ema_mult += diff * 0.5;
+                } else {
+                    s_ema_mult += 0.15 * diff;
+                }
+            }
 
             // Use the smoothed value for cadence, clamped to [2, 6]
             double mult_d = (std::max)(2.0, (std::min)(s_ema_mult, 6.0));
