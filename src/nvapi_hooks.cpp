@@ -190,7 +190,8 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
     // already excellent — the correlator just adds noise.
     // PRESENT_START gate: delegated to shared Presentation_Gate module
     if (params->markerType == PRESENT_START) {
-        PresentGate_Execute(ts.QuadPart, params->frameID);
+        PresentGate_Execute(ts.QuadPart, params->frameID,
+                            s_pre_enforcement_deadline);
     }
 
     return result;

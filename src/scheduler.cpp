@@ -468,7 +468,15 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
             double observed_non_sleep;
             if (last_own_sleep > 100.0 && actual_ft > last_own_sleep) {
                 observed_non_sleep = actual_ft - last_own_sleep - last_gate;
-                if (observed_non_sleep < predicted * 0.5)
+                // Sanity floor: reject nonsensically low values that indicate
+                // a measurement error (e.g., gate hold not subtracted).
+                // The original floor of predicted*0.5 was too aggressive —
+                // with the gate snapshot fix (S40), 83% of frames are gated
+                // and game_cpu legitimately drops to ~2500µs while predicted
+                // is ~5250µs. The 0.5 floor caught 14% of frames and inflated
+                // the EMA, causing overshoot clustering (lag1=+0.51).
+                // Lowered to 0.2 to only catch truly broken values.
+                if (observed_non_sleep < predicted * 0.2)
                     observed_non_sleep = predicted;  // sanity floor
             } else {
                 observed_non_sleep = predicted;

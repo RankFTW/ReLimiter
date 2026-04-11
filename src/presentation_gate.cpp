@@ -38,13 +38,18 @@ std::atomic<double> g_last_gate_sleep_us{0.0};
 
 static constexpr double PHASE_OFFSET_US = 0.0;  // hold to the deadline itself
 
-void PresentGate_Execute(int64_t timestamp_qpc, uint64_t frame_id) {
+void PresentGate_Execute(int64_t timestamp_qpc, uint64_t frame_id,
+                         int64_t deadline_qpc) {
     g_last_gate_sleep_us.store(0.0, std::memory_order_relaxed);
 
     if (g_skip_present_gate.load(std::memory_order_relaxed))
         return;
 
-    int64_t deadline = g_next_deadline.load(std::memory_order_relaxed);
+    // Use the caller-provided deadline (snapshotted before enforcement
+    // advanced it). Falls back to the atomic if no snapshot provided.
+    int64_t deadline = (deadline_qpc > 0)
+        ? deadline_qpc
+        : g_next_deadline.load(std::memory_order_relaxed);
     if (deadline <= 0)
         return;
 

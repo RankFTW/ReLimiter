@@ -97,7 +97,8 @@ static int32_t Hooked_slPCLSetMarker(uint32_t marker, const void* frame) {
     // noisy with FG (gap varies by 1-3 refresh periods per frame).
     // Present-based paths feed the correlator from vk_enforce.cpp instead.
     if (type == PRESENT_START) {
-        PresentGate_Execute(ts.QuadPart, frameID);
+        PresentGate_Execute(ts.QuadPart, frameID,
+                            s_pre_enforcement_deadline);
     }
 
     // Forward to Streamline
