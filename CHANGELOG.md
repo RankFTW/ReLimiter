@@ -1,6 +1,17 @@
 # Changelog
 
 
+## 3.1.4
+
+### Improvements
+- Reduced frame delivery stutter by stabilizing the phase of each present call relative to the display deadline — frames now land at a consistent point in the interval regardless of CPU timing variance
+- Fixed presentation gate reading the wrong deadline (next frame's instead of current frame's), which caused the gate to reject most frames and rarely activate
+- Improved deadline chain smoothing — blends actual frame time into the deadline advance to reduce the alternating overshoot/undershoot pattern in frame delivery
+- Added overload detection hysteresis to prevent rapid on/off flipping when the game is borderline GPU-bound
+- Faster cadence bias convergence — large presentation drift corrections now apply within 1-2 measurement windows instead of 5-10
+- Added Reflex pipeline timing extraction for more accurate presentation latency correction on DX12 Reflex games
+- Added 7 new CSV telemetry columns for pipeline analysis: reflex pipeline latency, queue trend, present duration, GPU active time, AI frame time, CPU latency, and gate margin
+
 ## 3.1.3
 
 ### Bug Fixes
