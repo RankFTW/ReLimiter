@@ -347,3 +347,7 @@ bool IsDmfgActive() {
     return g_fg_mode.load(std::memory_order_relaxed) == 2
         || IsDmfgSession();
 }
+
+bool IsNvSmoothMotionActive() {
+    return GetModuleHandleW(L"nvpresent64.dll") != nullptr;
+}

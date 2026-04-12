@@ -37,3 +37,7 @@ bool IsDmfgSession();
 // Returns true if g_fg_mode == 2 OR IsDmfgSession() returns true.
 // Single authoritative DMFG check for all subsystems.
 bool IsDmfgActive();
+
+// Returns true if NVIDIA Smooth Motion (nvpresent64.dll) is loaded.
+// SM is a driver-level 2x frame gen — always doubles output FPS.
+bool IsNvSmoothMotionActive();

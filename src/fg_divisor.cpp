@@ -36,6 +36,11 @@ static double SmoothTransition(double current, double target) {
 }
 
 int ComputeFGDivisorRaw() {
+    // NVIDIA Smooth Motion: always 2x (one generated frame per rendered frame).
+    // User sets target as desired output FPS, scheduler halves for render pacing.
+    if (IsNvSmoothMotionActive())
+        return 2;
+
     bool presenting = g_fg_presenting.load(std::memory_order_relaxed);
     int mult = g_fg_multiplier.load(std::memory_order_relaxed);
     if (presenting && mult > 0)

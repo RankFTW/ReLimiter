@@ -8,6 +8,7 @@
 #include "health.h"
 #include "pcl_hooks.h"
 #include "enforcement_dispatcher.h"
+#include "streamline_hooks.h"
 
 #include "presentation_gate.h"
 #include "wake_guard.h"
@@ -88,6 +89,11 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
 // with minimumIntervalUs=0. Forwarding at the game's natural call point
 // preserves optimal pipeline timing for non-overload throughput.
 static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
+    // Smooth Motion: bypass Reflex Sleep entirely — SM controls presentation
+    // timing at the driver level, and Sleep calls conflict with it.
+    if (IsNvSmoothMotionActive())
+        return NVAPI_OK;
+
     if (s_orig_sleep) {
         LARGE_INTEGER t0, t1;
         QueryPerformanceCounter(&t0);

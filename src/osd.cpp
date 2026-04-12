@@ -866,7 +866,9 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         s_ft_history_idx = (s_ft_history_idx + 1) % FT_HISTORY_SIZE;
         if (ft > 0.0) {
             double display_ft = ft;
-            if (fg_presenting && fg_mult > 0)
+            if (IsNvSmoothMotionActive())
+                display_ft = ft / 2.0;  // SM always 2x
+            else if (fg_presenting && fg_mult > 0)
                 display_ft = ft / static_cast<double>(fg_mult + 1);
             s_low_history[s_low_history_idx] = display_ft;
             s_low_history_idx = (s_low_history_idx + 1) % LOW_HISTORY_SIZE;
@@ -879,7 +881,10 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         if (g_config.osd_show_fps) {
             double output = g_output_fps.load(std::memory_order_relaxed);
             char buf[64];
-            if (IsDmfgActive() && output > 0.0) {
+            if (IsNvSmoothMotionActive()) {
+                // Smooth Motion: s_real_fps is the render rate, SM doubles at driver level
+                snprintf(buf, sizeof(buf), "%.1f fps (%.1f render)", s_real_fps * 2.0, s_real_fps);
+            } else if (IsDmfgActive() && output > 0.0) {
                 // DMFG: derive render FPS from output / multiplier.
                 // s_real_fps is enforcement-to-enforcement which in passthrough
                 // mode measures CPU submission rate, not actual render rate.
@@ -969,7 +974,9 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         // ═══════════════════════════════════
         if (g_config.osd_show_fg) {
             char buf[48];
-            if (IsDmfgActive()) {
+            if (IsNvSmoothMotionActive()) {
+                snprintf(buf, sizeof(buf), "FG: Smooth Motion");
+            } else if (IsDmfgActive()) {
                 int actual_mult = g_fg_actual_multiplier.load(std::memory_order_relaxed);
                 int cap = g_dmfg_output_cap.load(std::memory_order_relaxed);
                 if (cap > 0) {
