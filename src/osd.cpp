@@ -824,9 +824,15 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
     if (!g_config.osd_enabled) return;
 
     // Real FPS from enforcement-to-enforcement interval (CPU frames only)
+    // EMA-smoothed so the OSD number is readable instead of flickering.
     double ft = g_actual_frame_time_us.load(std::memory_order_relaxed);
-    if (ft > 0.0)
-        s_real_fps = 1000000.0 / ft;
+    if (ft > 0.0) {
+        double instant_fps = 1000000.0 / ft;
+        if (s_real_fps > 0.0)
+            s_real_fps += 0.08 * (instant_fps - s_real_fps);
+        else
+            s_real_fps = instant_fps;
+    }
 
     const char* fg_label = "off";
     int fg_mult = g_fg_multiplier.load(std::memory_order_relaxed);
