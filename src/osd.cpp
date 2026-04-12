@@ -407,6 +407,77 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     }
 
     // ════════════════════════════════════════════
+    // SECTION: Frame Generation (collapsible)
+    // ════════════════════════════════════════════
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Dynamic MFG")) {
+        // DMFG Compatibility toggle
+        bool dmfg_pass = g_config.dynamic_mfg_passthrough;
+        if (ImGui::Checkbox("DMFG Compatibility", &dmfg_pass)) {
+            g_config.dynamic_mfg_passthrough = dmfg_pass;
+            if (dmfg_pass)
+                g_fg_mode.store(2, std::memory_order_relaxed);
+            else
+                g_fg_mode.store(0, std::memory_order_relaxed);
+            config_dirty = true;
+        }
+        // Status indicator
+        if (IsDmfgActive()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(Active)");
+        } else if (g_config.dynamic_mfg_passthrough) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Forced)");
+        }
+        HelpTip("Required for DLSS Dynamic Multi Frame Generation (DMFG). "
+                "Hands frame pacing to the driver so it can freely adjust the FG multiplier. "
+                "Set the Output Cap below to cap output FPS (e.g. to your VRR ceiling) "
+                "while keeping the dynamic multiplier intact — something the game's own limiter can't do. "
+                "ReLimiter continues providing OSD, telemetry, and FG detection. "
+                "Auto-detected for most games; enable manually if detection misses.");
+
+        // DMFG Output Cap slider — always visible in this section
+        {
+            ImGui::Spacing();
+            static int s_cap_edit = g_config.dmfg_output_cap;
+            static bool s_cap_active = false;
+            if (!s_cap_active)
+                s_cap_edit = g_config.dmfg_output_cap;
+
+            char cap_fmt[32];
+            if (s_cap_edit == 0)
+                snprintf(cap_fmt, sizeof(cap_fmt), "Off");
+            else
+                snprintf(cap_fmt, sizeof(cap_fmt), "%%d");
+            ImGui::SliderInt("DMFG Output Cap", &s_cap_edit, 0, 360, cap_fmt);
+            s_cap_active = ImGui::IsItemActive();
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                if (s_cap_edit > 0 && s_cap_edit < 30) s_cap_edit = 30;
+                g_config.dmfg_output_cap = s_cap_edit;
+                g_dmfg_output_cap.store(s_cap_edit, std::memory_order_relaxed);
+                config_dirty = true;
+            }
+
+            // VRR quick-set button
+            if (reflex_cap > 0) {
+                ImGui::SameLine();
+                char vrr_label[32];
+                snprintf(vrr_label, sizeof(vrr_label), "VRR (%d)", reflex_cap);
+                if (ImGui::Button(vrr_label)) {
+                    s_cap_edit = reflex_cap;
+                    g_config.dmfg_output_cap = reflex_cap;
+                    g_dmfg_output_cap.store(reflex_cap, std::memory_order_relaxed);
+                    config_dirty = true;
+                }
+            }
+
+            HelpTip("Cap the output (display) FPS when DMFG is active. "
+                    "Set to your VRR ceiling (e.g. 157) to prevent tearing above the VRR window. "
+                    "0 = no cap (full passthrough).");
+        }
+    }
+
+    // ════════════════════════════════════════════
     // SECTION 4: Advanced (collapsible)
     // ════════════════════════════════════════════
     ImGui::Separator();
@@ -448,69 +519,6 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 "Enables true VRR/G-Sync operation and eliminates DWM composition stutter. "
                 "May break some games that use GDI interop or MSAA. "
                 "Requires game restart to take effect.");
-
-        // Dynamic MFG Passthrough toggle
-        ImGui::Spacing();
-        bool dmfg_pass = g_config.dynamic_mfg_passthrough;
-        if (ImGui::Checkbox("Dynamic MFG Passthrough", &dmfg_pass)) {
-            g_config.dynamic_mfg_passthrough = dmfg_pass;
-            if (dmfg_pass)
-                g_fg_mode.store(2, std::memory_order_relaxed);
-            else
-                g_fg_mode.store(0, std::memory_order_relaxed);
-            config_dirty = true;
-        }
-        // Status indicator
-        if (IsDmfgActive()) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(Active)");
-        } else if (g_config.dynamic_mfg_passthrough) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Forced)");
-        }
-        HelpTip("Enable when using DLSS 4.5 Dynamic Multi Frame Generation. "
-                "Disables frame pacing so the driver can dynamically adjust the FG multiplier. "
-                "OSD and telemetry remain active. Leave off for static FG or non-FG games.");
-
-        // DMFG Output Cap slider — visible when DMFG is active or passthrough is enabled
-        if (IsDmfgActive() || g_config.dynamic_mfg_passthrough) {
-            ImGui::Spacing();
-            static int s_cap_edit = g_config.dmfg_output_cap;
-            static bool s_cap_active = false;
-            if (!s_cap_active)
-                s_cap_edit = g_config.dmfg_output_cap;
-
-            char cap_fmt[32];
-            if (s_cap_edit == 0)
-                snprintf(cap_fmt, sizeof(cap_fmt), "Off");
-            else
-                snprintf(cap_fmt, sizeof(cap_fmt), "%%d");
-            ImGui::SliderInt("DMFG Output Cap", &s_cap_edit, 0, 360, cap_fmt);
-            s_cap_active = ImGui::IsItemActive();
-            if (ImGui::IsItemDeactivatedAfterEdit()) {
-                if (s_cap_edit > 0 && s_cap_edit < 30) s_cap_edit = 30;
-                g_config.dmfg_output_cap = s_cap_edit;
-                g_dmfg_output_cap.store(s_cap_edit, std::memory_order_relaxed);
-                config_dirty = true;
-            }
-
-            // VRR quick-set button
-            if (reflex_cap > 0) {
-                ImGui::SameLine();
-                char vrr_label[32];
-                snprintf(vrr_label, sizeof(vrr_label), "VRR (%d)", reflex_cap);
-                if (ImGui::Button(vrr_label)) {
-                    s_cap_edit = reflex_cap;
-                    g_config.dmfg_output_cap = reflex_cap;
-                    g_dmfg_output_cap.store(reflex_cap, std::memory_order_relaxed);
-                    config_dirty = true;
-                }
-            }
-
-            HelpTip("Cap the output (display) FPS when DMFG is active. "
-                    "Set to your VRR ceiling (e.g. 157) to prevent tearing above the VRR window. "
-                    "0 = no cap (full passthrough).");
-        }
 
         // Advanced Logging toggle
         ImGui::Spacing();
@@ -871,14 +879,21 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         if (g_config.osd_show_fps) {
             double output = g_output_fps.load(std::memory_order_relaxed);
             char buf[64];
-            if (IsDmfgActive() && output > 0.0 && s_real_fps > 0.0) {
-                // DMFG: show output FPS and render FPS from enforcement interval
+            if (IsDmfgActive() && output > 0.0) {
+                // DMFG: derive render FPS from output / multiplier.
+                // s_real_fps is enforcement-to-enforcement which in passthrough
+                // mode measures CPU submission rate, not actual render rate.
+                int actual_mult = g_fg_actual_multiplier.load(std::memory_order_relaxed);
+                double render_fps;
+                if (actual_mult >= 2)
+                    render_fps = output / static_cast<double>(actual_mult);
+                else
+                    render_fps = s_real_fps;  // fallback if multiplier unknown
+                snprintf(buf, sizeof(buf), "%.1f fps (%.1f render)", output, render_fps);
+            } else if (output > 0.0 && fg_presenting && fg_mult > 0)
                 snprintf(buf, sizeof(buf), "%.1f fps (%.1f render)", output, s_real_fps);
-            } else if (output > 0.0 && fg_presenting && fg_mult > 0) {
-                snprintf(buf, sizeof(buf), "%.1f fps (%.1f render)", output, s_real_fps);
-            } else {
+            else
                 snprintf(buf, sizeof(buf), "%.1f fps", s_real_fps);
-            }
             OSDTextColored(ColPerf(), buf);
         }
 
@@ -911,19 +926,20 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
 
         // ═══════════════════════════════════
         // QUALITY (green/yellow/red)
+        // — hidden during DMFG passthrough (scheduler isn't pacing, scores are meaningless)
         // ═══════════════════════════════════
         PQIScores pqi = {};
-        if (g_config.osd_show_pqi || g_config.osd_show_pqi_breakdown)
+        if (!IsDmfgActive() && (g_config.osd_show_pqi || g_config.osd_show_pqi_breakdown))
             pqi = PQI_GetRolling();
 
-        if (g_config.osd_show_pqi) {
+        if (!IsDmfgActive() && g_config.osd_show_pqi) {
             ImVec4 pqi_color = PQIColor(pqi.pqi / 100.0);
             char buf[32];
             snprintf(buf, sizeof(buf), "PQI: %.0f%%", pqi.pqi);
             OSDTextColored(pqi_color, buf);
         }
 
-        if (g_config.osd_show_pqi && g_config.osd_show_pqi_breakdown) {
+        if (!IsDmfgActive() && g_config.osd_show_pqi && g_config.osd_show_pqi_breakdown) {
             char buf[64];
             snprintf(buf, sizeof(buf), " Cadence: %.0f%%", pqi.cadence * 100.0);
             OSDTextColored(PQIColor(pqi.cadence), buf);
@@ -957,17 +973,14 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                 int actual_mult = g_fg_actual_multiplier.load(std::memory_order_relaxed);
                 int cap = g_dmfg_output_cap.load(std::memory_order_relaxed);
                 if (cap > 0) {
-                    // Cap active: show multiplier from GetState + cap value (Req 7.1)
                     if (actual_mult >= 2)
                         snprintf(buf, sizeof(buf), "FG: Dynamic %dx [Cap: %d]", actual_mult, cap);
                     else
                         snprintf(buf, sizeof(buf), "FG: Dynamic [Cap: %d]", cap);
                 } else {
-                    // Cap=0: existing display unchanged (Req 7.2)
                     if (actual_mult >= 2)
                         snprintf(buf, sizeof(buf), "FG: Dynamic %dx", actual_mult);
                     else {
-                        // Fallback: infer from output/render ratio for display only
                         double output = g_output_fps.load(std::memory_order_relaxed);
                         if (output > 0.0 && s_real_fps > 1.0) {
                             int inferred = static_cast<int>(output / s_real_fps + 0.5);
@@ -986,7 +999,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             OSDTextColored(ColPipeline(), buf);
         }
 
-        if (g_config.osd_show_limiter) {
+        if (g_config.osd_show_limiter && !IsDmfgActive()) {
             char buf[48];
             snprintf(buf, sizeof(buf), "Limiter: +%.1f ms  T%d", limiter_added_ms, tier);
             OSDTextColored(ColPipeline(), buf);
@@ -1015,7 +1028,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         // ═══════════════════════════════════
         // FRAMETIME GRAPH
         // ═══════════════════════════════════
-        if (g_config.osd_show_frametime_graph) {
+        if (g_config.osd_show_frametime_graph && !IsDmfgActive()) {
             float ordered[FT_HISTORY_SIZE];
             float data_max = 0.0f;
             float data_min = 1e9f;

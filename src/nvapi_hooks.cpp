@@ -14,6 +14,7 @@
 #include "logger.h"
 #include <intrin.h>
 #include <atomic>
+#include <algorithm>
 
 // ── Trampolines ──
 PFN_NvAPI_D3D_SetSleepMode     s_orig_sleep_mode      = nullptr;
@@ -51,12 +52,7 @@ static bool s_game_params_captured = false;
 // Reflex settings when switching from active pacing to uncapped mode.
 static NV_SET_SLEEP_MODE_PARAMS s_game_last_params = {};
 
-// ── Hook: SetSleepMode — capture game params, forward with overrides ──
-// Per NVAPI reference: bLowLatencyMode enables Reflex JIT pacing,
-// bLowLatencyBoost requests max GPU clocks, bUseMarkersToOptimize
-// allows driver runtime optimizations from latency markers.
-// minimumIntervalUs = max(game_requested, our_computed) to respect
-// intentional game throttles (e.g. 30fps cutscene locks).
+// ── Hook: SetSleepMode — capture game params, forward unmodified ──
 static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_PARAMS* params) {
     if (!g_dev) {
         g_dev = pDev;
@@ -71,15 +67,12 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
     }
 
     // Always store the full game params and actual requested interval.
-    // s_game_last_params is used by scheduler transition forwarding (Req 9.4)
-    // to restore the game's Reflex settings when switching to uncapped mode.
     if (params) {
         s_game_last_params = *params;
         g_game_requested_interval.store(params->minimumIntervalUs, std::memory_order_relaxed);
     }
 
-    // Always forward game's params directly to the driver.
-    // We no longer call SetSleepMode ourselves — let the game control it.
+    // Forward game's params unmodified.
     if (s_orig_sleep_mode) {
         __try {
             return s_orig_sleep_mode(pDev, params);
@@ -190,7 +183,8 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
     // already excellent — the correlator just adds noise.
     // PRESENT_START gate: delegated to shared Presentation_Gate module
     if (params->markerType == PRESENT_START) {
-        PresentGate_Execute(ts.QuadPart, params->frameID);
+        PresentGate_Execute(ts.QuadPart, params->frameID,
+                            s_pre_enforcement_deadline);
     }
 
     return result;

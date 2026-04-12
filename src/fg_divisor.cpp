@@ -38,21 +38,9 @@ static double SmoothTransition(double current, double target) {
 int ComputeFGDivisorRaw() {
     bool presenting = g_fg_presenting.load(std::memory_order_relaxed);
     int mult = g_fg_multiplier.load(std::memory_order_relaxed);
-    int base = (presenting && mult > 0) ? mult + 1 : 1;
-
-    // DMFG latency hint: when no FG DLL is loaded and the game requests
-    // deep queue depth (≥3), use the latency as a multiplier hint.
-    // Clamped to 6 (max DMFG multiplier). When FG DLL is loaded,
-    // ignore the hint — standard DLSS FG uses the Streamline multiplier.
-    if (!IsFGDllLoaded()) {
-        uint32_t lat = g_game_requested_latency.load(std::memory_order_relaxed);
-        if (lat >= 3) {
-            int hint = static_cast<int>((std::min)(lat, 6u));
-            return (std::max)(base, hint);
-        }
-    }
-
-    return base;
+    if (presenting && mult > 0)
+        return mult + 1; // 1→2×, 2→3×, 3→4×, ..., 5→6×
+    return 1;
 }
 
 double ComputeFGDivisor() {

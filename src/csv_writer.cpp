@@ -28,7 +28,10 @@ static const char* CSV_HEADER =
     "own_sleep_us,driver_sleep_us,gate_sleep_us,deadline_drift_us,predictor_warm,"
     "smoothness_us,reflex_injected,"
     "present_interval_us,present_cadence_smoothness_us,present_bias_us,"
-    "feedback_rate,feedback_alpha\n";
+    "feedback_rate,feedback_alpha,"
+    "reflex_pipeline_latency_us,reflex_queue_trend_us,"
+    "reflex_present_duration_us,reflex_gpu_active_us,"
+    "reflex_ai_frame_time_us,reflex_cpu_latency_us,gate_margin_us\n";
 
 static void OpenNewFile() {
     if (s_file) { fclose(s_file); s_file = nullptr; }
@@ -51,7 +54,9 @@ static void WriteRow(const FrameRow& r) {
         "%llu,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.3f,%.4f,"
         "%.1f,%d,%d,%.2f,%d,%.1f,%d,%d,%.1f,%.3f,%.3f,%.3f,%.1f,"
         "%.1f,%.1f,%.1f,%.1f,%d,%.1f,%d,"
-        "%.1f,%.1f,%.1f,%d,%.4f\n",
+        "%.1f,%.1f,%.1f,%d,%.4f,"
+        "%.1f,%.1f,"
+        "%.1f,%.1f,%.1f,%.1f,%.1f\n",
         r.frame_id, r.timestamp_us, r.predicted_us, r.effective_interval_us,
         r.actual_frame_time_us, r.sleep_duration_us, r.wake_error_us,
         r.ceiling_margin_us, r.stress_level, r.cv,
@@ -62,7 +67,11 @@ static void WriteRow(const FrameRow& r) {
         r.deadline_drift_us, r.predictor_warm, r.smoothness_us,
         r.reflex_injected,
         r.present_interval_us, r.present_cadence_smoothness_us,
-        r.present_bias_us, r.feedback_rate, r.feedback_alpha);
+        r.present_bias_us, r.feedback_rate, r.feedback_alpha,
+        r.reflex_pipeline_latency_us, r.reflex_queue_trend_us,
+        r.reflex_present_duration_us, r.reflex_gpu_active_us,
+        r.reflex_ai_frame_time_us, r.reflex_cpu_latency_us,
+        r.gate_margin_us);
 }
 
 static void WriterThread() {

@@ -12,15 +12,14 @@ extern std::atomic<int>  g_fg_multiplier;  // raw numFramesToGenerate
 extern std::atomic<bool> g_fg_active;
 extern std::atomic<bool> g_fg_presenting;  // true when FG is actually producing frames
 
-// Actual runtime FG multiplier from slDLSSGGetState (numFramesActuallyPresented).
-// Updated each time GetState fires. Independent of render pacing — safe for cadence computation.
-extern std::atomic<int>  g_fg_actual_multiplier;
-
 // DMFG state — DLSSGMode: 0=eOff, 1=eOn (static FG), 2=eAuto (Dynamic MFG)
 extern std::atomic<int>  g_fg_mode;
 
 // Game's requested MaxFrameLatency, captured by FLC vtable hook
 extern std::atomic<uint32_t> g_game_requested_latency;
+
+// Driver-reported actual FG multiplier from GetState
+extern std::atomic<int> g_fg_actual_multiplier;
 
 // Called from LoadLibrary hook when sl.interposer.dll is detected.
 void HookStreamlinePCL(HMODULE hInterposer);
@@ -29,13 +28,12 @@ void HookStreamlinePCL(HMODULE hInterposer);
 // should be promoted (for games that never call GetState, e.g. HFW).
 void CheckDeferredFGInference();
 
+// Returns true if the FG runtime DLL is loaded (nvngx_dlssg.dll etc.)
+bool IsFGDllLoaded();
+
+// Returns true if DMFG is inferred from latency hint (latency >= 4, no FG DLL)
+bool IsDmfgSession();
+
 // Returns true if g_fg_mode == 2 OR IsDmfgSession() returns true.
 // Single authoritative DMFG check for all subsystems.
 bool IsDmfgActive();
-
-// Returns true if Game_Requested_Latency >= 4 AND no FG DLL is loaded.
-// Indicates driver-side DMFG without Streamline signaling.
-bool IsDmfgSession();
-
-// Returns true if any of the 4 known FG DLLs are loaded in the process.
-bool IsFGDllLoaded();

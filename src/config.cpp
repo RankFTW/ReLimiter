@@ -108,14 +108,6 @@ void ValidateConfig() {
     // ── Logging ──
     static const char* log_levels[] = {"error", "warn", "info", "debug"};
     ValidateEnum(g_config.log_level, log_levels, 4, "info");
-
-    // ── DMFG Output Cap ──
-    if (g_config.dmfg_output_cap < 0)
-        g_config.dmfg_output_cap = 0;
-    else if (g_config.dmfg_output_cap >= 1 && g_config.dmfg_output_cap < 30)
-        g_config.dmfg_output_cap = 30;
-    else if (g_config.dmfg_output_cap > 360)
-        g_config.dmfg_output_cap = 360;
 }
 
 bool Config_IsFirstLaunch() { return s_first_launch; }

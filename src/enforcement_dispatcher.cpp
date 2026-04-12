@@ -118,7 +118,7 @@ void EnfDisp_OnPresent(int64_t now_qpc) {
         g_output_fps.store(static_cast<double>(wcount), std::memory_order_relaxed);
     }
 
-    // ── DMFG passthrough: skip enforcement dispatch, FPS counter already updated ──
+    // DMFG passthrough: skip enforcement dispatch, FPS counter already updated
     if (IsDmfgActive())
         return;
 

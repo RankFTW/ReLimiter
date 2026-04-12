@@ -12,11 +12,17 @@
 
 struct AdaptiveBiasController {
     static constexpr double MAX_BIAS          = 1500.0;
-    static constexpr int    CONSERVATIVE_WIN  = 16;
-    static constexpr int    AGGRESSIVE_WIN    = 8;
-    static constexpr double CONSERVATIVE_ALPHA = 0.05;
-    static constexpr double AGGRESSIVE_ALPHA   = 0.10;
+    static constexpr int    CONSERVATIVE_WIN  = 12;
+    static constexpr int    AGGRESSIVE_WIN    = 6;
+    static constexpr double CONSERVATIVE_ALPHA = 0.08;
+    static constexpr double AGGRESSIVE_ALPHA   = 0.15;
     static constexpr int    PROMOTION_THRESHOLD = 3;
+    // Proportional gain: when the average window bias exceeds this threshold,
+    // apply an immediate proportional correction on top of the EMA update.
+    // This lets the controller fast-track large errors instead of slowly
+    // integrating them over many windows.
+    static constexpr double PROPORTIONAL_THRESHOLD_US = 300.0;
+    static constexpr double PROPORTIONAL_GAIN         = 0.25;
 
     enum class Rate { Conservative, Aggressive };
 

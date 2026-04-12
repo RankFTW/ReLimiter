@@ -1,6 +1,6 @@
 #include "streamline_hooks.h"
-#include "config.h"
 #include "hooks.h"
+#include "config.h"
 #include "flush.h"
 #include "logger.h"
 #include <cstring>
@@ -9,13 +9,15 @@
 std::atomic<int>  g_fg_multiplier{0};
 std::atomic<bool> g_fg_active{false};
 std::atomic<bool> g_fg_presenting{false};
-std::atomic<int>  g_fg_actual_multiplier{0};
 
 // DMFG state — DLSSGMode: 0=eOff, 1=eOn (static FG), 2=eAuto (Dynamic MFG)
 std::atomic<int>  g_fg_mode{0};
 
 // Game's requested MaxFrameLatency, captured by FLC vtable hook
 std::atomic<uint32_t> g_game_requested_latency{0};
+
+// Driver-reported actual FG multiplier from GetState
+std::atomic<int> g_fg_actual_multiplier{0};
 
 // Track numFramesActuallyPresented to detect real FG frame production.
 // Per the Streamline SDK header (sl_dlss_g.h), this field reports the
@@ -252,26 +254,6 @@ static sl_Result __cdecl Detour_slGetFeatureFunction(uint32_t feature, const cha
     return result;
 }
 
-// ── DMFG detection functions ──
-
-bool IsFGDllLoaded() {
-    if (GetModuleHandleW(L"nvngx_dlssg.dll"))  return true;
-    if (GetModuleHandleW(L"_nvngx_dlssg.dll")) return true;
-    if (GetModuleHandleW(L"sl.dlss_g.dll"))    return true;
-    if (GetModuleHandleW(L"dlss-g.dll"))       return true;
-    return false;
-}
-
-bool IsDmfgSession() {
-    return g_game_requested_latency.load(std::memory_order_relaxed) >= 4
-        && !IsFGDllLoaded();
-}
-
-bool IsDmfgActive() {
-    return g_fg_mode.load(std::memory_order_relaxed) == 2
-        || IsDmfgSession();
-}
-
 // ── Deferred FG inference check (called each frame from scheduler) ──
 void CheckDeferredFGInference() {
     if (!s_fg_inference_pending.load(std::memory_order_relaxed))
@@ -344,4 +326,24 @@ void HookStreamlinePCL(HMODULE hInterposer) {
             LOG_INFO("Streamline: proactively hooked slDLSSGGetState");
         }
     }
+}
+
+// ── DMFG detection functions ──
+
+bool IsFGDllLoaded() {
+    if (GetModuleHandleW(L"nvngx_dlssg.dll"))  return true;
+    if (GetModuleHandleW(L"_nvngx_dlssg.dll")) return true;
+    if (GetModuleHandleW(L"sl.dlss_g.dll"))    return true;
+    if (GetModuleHandleW(L"dlss-g.dll"))       return true;
+    return false;
+}
+
+bool IsDmfgSession() {
+    return g_game_requested_latency.load(std::memory_order_relaxed) >= 4
+        && !IsFGDllLoaded();
+}
+
+bool IsDmfgActive() {
+    return g_fg_mode.load(std::memory_order_relaxed) == 2
+        || IsDmfgSession();
 }

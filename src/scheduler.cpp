@@ -11,6 +11,7 @@
 #include "correlator.h"
 #include "stress_detector.h"
 #include "cadence_meter.h"
+#include "feedback.h"
 #include "nvapi_hooks.h"
 #include "pll.h"
 #include "presentation_gate.h"
@@ -70,6 +71,38 @@ static double  s_prev_actual_ft = 0.0;
 static double  s_last_own_sleep_us = 0.0;
 static double  s_ema_non_sleep_us = 0.0;  // EMA of observed non-sleep time
 
+// Presentation-aware latency correction: EMA of the gap between the
+// scheduler's actual_frame_time and the measured present_interval.
+// When the display consistently shows frames later than the scheduler
+// expects, this captures the pipeline latency offset.
+static double  s_ema_present_latency_us = 0.0;
+
+// ── Scanout-anchored deadline state ──
+// Tracks the last known presentation interval from Reflex gpuFrameTimeUs
+// (or CadenceMeter as fallback). Used to anchor the deadline chain to
+// actual display events rather than the enforcement timestamp, eliminating
+// the integrator dynamics that cause lag-1 oscillation.
+// See: VK_EXT_present_timing research — the deadline tracks reality
+// rather than an idealized clock.
+static int64_t s_last_scanout_anchor_qpc = 0;
+
+// ── Deadline chain oscillation tracking ──
+// The deadline chain acts as a discrete integrator: when frame N overshoots
+// by X µs, drift decreases by X µs, causing frame N+1 to sleep X µs less
+// and undershoot by ~X µs. This produces a lag-1 autocorrelation of ~-0.54
+// in frame time deviations — a systematic alternating overshoot/undershoot.
+//
+// We track the previous frame's deviation for diagnostics. Direct correction
+// (adding alpha * prev_deviation to the wake target) was attempted but creates
+// a resonant feedback loop — the correction changes the actual frame time,
+// which changes the deviation, which amplifies the next correction. The
+// session 26 data showed this escalating from ±235µs to ±1500µs.
+//
+// The oscillation is inherent to the deadline chain's integrator dynamics.
+// The correct fix must operate on the deadline chain itself (e.g., filtering
+// the deadline advance) rather than patching the wake target.
+static double s_prev_frame_deviation_us = 0.0;
+
 // ── DMFG output cap JIT predictor state ──
 static double s_ema_render_cost = 0.0;         // EMA of native render cost (µs)
 static double s_last_own_sleep_cap_us = 0.0;   // sleep time from last cap frame
@@ -77,30 +110,18 @@ static int    s_prev_cap_mult = 0;             // for logging multiplier transit
 static int    s_prev_output_cap = 0;           // for detecting cap 0↔nonzero transitions
 
 // ── EMA-smoothed actual multiplier ──
-// g_fg_actual_multiplier bounces every GetState call (e.g. 2→6→3→5 on
-// consecutive calls). Smooth it so the cadence interval doesn't whipsaw.
 static double s_ema_mult = 0.0;
 
 // ── Output feedback controller (v5) ──
-// Uses g_output_fps directly as the sole feedback signal. No probes, no
-// render_fps estimation. g_output_fps IS VRR-saturated at ~165, but:
-//   - If g_output_fps > cap: we're overshooting → grow correction
-//   - If g_output_fps < cap - 3: we're undershooting → fast decay
-//   - Within ±3fps: slow decay toward zero
-// This avoids the circular feedback loop of render_fps × base_mult.
-// See HANDOFF.md for the full failure history of approaches 1-7.
 static double s_interval_correction_us = 0.0;
 static int    s_feedback_frame_counter = 0;
-static constexpr int FEEDBACK_TICK_FRAMES = 15;       // check every 15 render frames (~0.3s)
-static constexpr double FEEDBACK_MAX_CORRECTION = 30000.0; // max 30ms added
+static constexpr int FEEDBACK_TICK_FRAMES = 15;
+static constexpr double FEEDBACK_MAX_CORRECTION = 30000.0;
 
 // ── Periodic uncap probe ──
-// Every UNCAP_INTERVAL_FRAMES, force output_cap to 0 for exactly 1 frame.
-// This lets the driver see the natural render speed without our pacing.
-// The cap is restored on the very next frame.
 static int  s_uncap_frame_counter = 0;
 static bool s_uncap_active = false;
-static constexpr int UNCAP_INTERVAL_FRAMES = 300; // ~5s at ~60fps render
+static constexpr int UNCAP_INTERVAL_FRAMES = 60; // ~1s at ~60fps render
 
 // ── Forward declarations ──
 static void OnMarker_VRR(uint64_t frameID, int64_t now);
@@ -138,15 +159,6 @@ void OnMarker(uint64_t frameID, int64_t now) {
     }
 
     // ── DMFG: passthrough or output cap pacing ──
-    // When DMFG is active, we either pass through (cap=0) or pace native frames
-    // to achieve a target output FPS (cap>0). The JIT predictor models only the
-    // native frame pipeline — FG is invisible downstream processing.
-    //
-    // CRITICAL: The FG multiplier for cadence computation comes from
-    // g_fg_actual_multiplier (set by slDLSSGGetState), NOT from g_output_fps / render_fps.
-    // Deriving the multiplier from the output/render ratio while pacing creates a
-    // circular feedback loop that oscillates. See .kiro/specs/dmfg-output-cap/HANDOFF.md
-    // for the full failure history of 7 dead-end approaches that all hit this problem.
     if (IsDmfgActive()) {
         static bool s_dmfg_logged = false;
         if (!s_dmfg_logged) {
@@ -154,20 +166,20 @@ void OnMarker(uint64_t frameID, int64_t now) {
             s_dmfg_logged = true;
         }
 
-        // Health/tier/inference checks run unchanged (Req 9.1)
+        // Disable the presentation gate — we're not pacing, stale deadlines
+        // from a previous non-DMFG session could cause spurious holds.
+        g_next_deadline.store(0, std::memory_order_relaxed);
+        g_skip_present_gate.store(true, std::memory_order_relaxed);
+
         CheckDeferredFGInference();
 
         LARGE_INTEGER qpc_now;
         QueryPerformanceCounter(&qpc_now);
         int64_t ts = qpc_now.QuadPart;
 
-        // Track frame time for OSD and telemetry
         double telemetry_ft = (s_prev_enforcement_ts > 0)
             ? qpc_to_us(ts - s_prev_enforcement_ts) : 0.0;
 
-        // CRITICAL: Save prev_enforcement BEFORE updating s_prev_enforcement_ts.
-        // The sleep target must anchor to the PREVIOUS frame's timestamp, not current.
-        // This was a bug in previous attempts (Dead End 4 in HANDOFF.md).
         int64_t prev_enforcement = s_prev_enforcement_ts;
 
         s_prev_enforcement_ts = ts;
@@ -175,7 +187,6 @@ void OnMarker(uint64_t frameID, int64_t now) {
         if (telemetry_ft > 0.0)
             g_actual_frame_time_us.store(telemetry_ft, std::memory_order_relaxed);
 
-        // Compute real FG divisor for passthrough telemetry (only used when cap=0)
         double output_fps = g_output_fps.load(std::memory_order_relaxed);
         double render_fps = (telemetry_ft > 0.0) ? 1000000.0 / telemetry_ft : 0.0;
         double real_fg_divisor = 1.0;
@@ -187,32 +198,25 @@ void OnMarker(uint64_t frameID, int64_t now) {
 
         int output_cap = g_dmfg_output_cap.load(std::memory_order_relaxed);
 
-        // ── Periodic uncap probe: remove cap for 1 frame every ~5s ──
-        // Acts as if the user set cap=0 then immediately restored it.
-        // Lets the driver see the real render speed and recalibrate.
+        // Periodic uncap probe: remove cap for 1 frame every ~10s
         if (output_cap > 0) {
             if (s_uncap_active) {
-                // This is the uncap frame — force passthrough
                 output_cap = 0;
                 s_uncap_active = false;
-                // Don't reset the counter — it was already reset when we triggered
             } else {
                 s_uncap_frame_counter++;
                 if (s_uncap_frame_counter >= UNCAP_INTERVAL_FRAMES) {
                     s_uncap_frame_counter = 0;
                     s_uncap_active = true;
-                    output_cap = 0;  // this frame is the uncap frame
+                    output_cap = 0;
                 }
             }
         } else {
-            // Cap is off — reset probe state
             s_uncap_frame_counter = 0;
             s_uncap_active = false;
         }
 
-        // Detect cap 0↔nonzero transitions — reset predictor state (Req 4.4)
-        // Skip transition detection during uncap probe frames to avoid
-        // resetting feedback state on the temporary 1-frame passthrough.
+        // Detect cap transitions
         int real_cap = g_dmfg_output_cap.load(std::memory_order_relaxed);
         if ((real_cap > 0) != (s_prev_output_cap > 0)) {
             s_ema_render_cost = 0.0;
@@ -227,83 +231,50 @@ void OnMarker(uint64_t frameID, int64_t now) {
         s_prev_output_cap = real_cap;
 
         if (output_cap > 0) {
-            // ── DMFG Output Cap v5: output-feedback only ──
-            // No probes, no render_fps estimation. Uses g_output_fps as the
-            // sole feedback signal.
-            //
-            // Multiplier: use g_fg_actual_multiplier (from GetState) as the
-            // primary source — it reflects the driver's ACTUAL dynamic
-            // multiplier (3x, 5x, 6x etc.), not just the game's request.
-            // Fall back to ComputeFGDivisorRaw() if GetState hasn't fired yet.
-            //
-            // NEVER use g_output_fps / render_fps for the multiplier —
-            // that's circular. See HANDOFF.md for the full failure history.
             int raw_mult = g_fg_actual_multiplier.load(std::memory_order_relaxed);
             if (raw_mult < 2)
-                raw_mult = ComputeFGDivisorRaw();  // fallback to Streamline hints
+                raw_mult = ComputeFGDivisorRaw();
             if (raw_mult < 2)
-                raw_mult = 2;  // absolute minimum for DMFG
+                raw_mult = 2;
             raw_mult = (std::min)(raw_mult, 6);
 
-            // EMA-smooth the multiplier to filter per-GetState-call noise.
-            // Alpha 0.15 = ~7 frame time constant. Tracks real transitions
-            // (3x→6x over seconds) but rejects single-call bouncing.
-            // Jump detection: if raw differs by >1 from EMA, snap halfway.
             if (s_ema_mult < 1.5)
-                s_ema_mult = static_cast<double>(raw_mult);  // seed
+                s_ema_mult = static_cast<double>(raw_mult);
             else {
                 double diff = static_cast<double>(raw_mult) - s_ema_mult;
-                if (std::abs(diff) > 1.0) {
-                    // Large jump — snap halfway to respond faster
+                if (std::abs(diff) > 1.0)
                     s_ema_mult += diff * 0.5;
-                } else {
+                else
                     s_ema_mult += 0.15 * diff;
-                }
             }
 
-            // Use the smoothed value for cadence, clamped to [2, 6]
             double mult_d = (std::max)(2.0, (std::min)(s_ema_mult, 6.0));
-
-            // Log transitions based on rounded smoothed value
             int mult = static_cast<int>(mult_d + 0.5);
             if (mult < 2) mult = 2;
 
-            // Log multiplier transitions (Req 6.5)
-            if (mult != s_prev_cap_mult && s_prev_cap_mult != 0) {
+            if (mult != s_prev_cap_mult && s_prev_cap_mult != 0)
                 LOG_INFO("DMFG cap multiplier transition: %d -> %d", s_prev_cap_mult, mult);
-            }
             s_prev_cap_mult = mult;
 
-            // Cadence computation (Req 5.1, 5.2) + output feedback correction
             double base_interval = (mult_d / static_cast<double>(output_cap)) * 1e6;
             double target_interval = base_interval + s_interval_correction_us;
             target_interval = (std::max)(2000.0, (std::min)(target_interval, 200000.0));
 
-            // ── Output feedback tick ──
-            // Three zones based on g_output_fps vs cap:
-            //   overshoot (> cap + 2): grow correction proportional to overshoot
-            //   undershoot (< cap - 3): fast decay (50%) — fixes the 140fps regression
-            //   near target (±3fps): slow decay (70%) toward zero
             s_feedback_frame_counter++;
             if (s_feedback_frame_counter >= FEEDBACK_TICK_FRAMES) {
                 s_feedback_frame_counter = 0;
                 double out_fps = g_output_fps.load(std::memory_order_relaxed);
-
                 if (out_fps > 0.0) {
                     double overshoot = out_fps - static_cast<double>(output_cap);
-
                     if (overshoot > 2.0) {
-                        // Overshooting: grow correction proportional to overshoot, capped
                         double step = (std::min)(overshoot * 80.0, 3000.0);
                         s_interval_correction_us += step;
                         s_interval_correction_us = (std::min)(s_interval_correction_us, FEEDBACK_MAX_CORRECTION);
                     } else if (overshoot < -3.0) {
-                        // Undershooting by >3fps: fast decay to recover quickly
                         s_interval_correction_us *= 0.50;
                         if (s_interval_correction_us < 50.0)
                             s_interval_correction_us = 0.0;
                     } else {
-                        // Within ±3fps of target: slow decay toward zero
                         s_interval_correction_us *= 0.70;
                         if (s_interval_correction_us < 50.0)
                             s_interval_correction_us = 0.0;
@@ -311,16 +282,11 @@ void OnMarker(uint64_t frameID, int64_t now) {
                 }
             }
 
-            // Wake target: prev_enforcement + target_interval.
-            // No JIT render cost subtraction — the frame already rendered.
             double own_sleep_us = 0.0;
             if (prev_enforcement > 0) {
                 int64_t wake_target = prev_enforcement + us_to_qpc(target_interval);
-
                 QueryPerformanceCounter(&qpc_now);
                 int64_t now_qpc = qpc_now.QuadPart;
-
-                // Sleep if wake target is >500µs in the future (Req 5.5)
                 if (wake_target > now_qpc + us_to_qpc(500.0)) {
                     LARGE_INTEGER qpc_before, qpc_after;
                     QueryPerformanceCounter(&qpc_before);
@@ -328,30 +294,26 @@ void OnMarker(uint64_t frameID, int64_t now) {
                     QueryPerformanceCounter(&qpc_after);
                     own_sleep_us = qpc_to_us(qpc_after.QuadPart - qpc_before.QuadPart);
                 }
-                // else: GPU-bound or frame took longer than interval, skip sleep (Req 5.6)
             }
 
             s_last_own_sleep_cap_us = own_sleep_us;
 
-            // Re-stamp timestamps after sleep (Req 5.7)
             QueryPerformanceCounter(&qpc_now);
             s_last_enforcement_ts = qpc_now.QuadPart;
             s_prev_enforcement_ts = qpc_now.QuadPart;
             g_predictor.OnEnforcement(frameID, qpc_now.QuadPart);
 
-            // Jitter
             double jitter = (telemetry_ft > 0.0 && s_prev_actual_ft > 0.0)
                 ? std::abs(telemetry_ft - s_prev_actual_ft) : 0.0;
             s_prev_actual_ft = telemetry_ft;
 
-            // Telemetry (Req 8.1, 8.2, 8.3, 8.4)
             FrameRow row = {};
             row.frame_id = frameID;
             row.timestamp_us = qpc_to_us(qpc_now.QuadPart);
             row.actual_frame_time_us = telemetry_ft;
             row.fg_divisor = mult_d;
             row.predicted_us = g_predictor.predicted_us;
-            row.sleep_duration_us = target_interval;  // target, not actual (Req 8.2)
+            row.sleep_duration_us = target_interval;
             row.overload = 0;
             row.tier = static_cast<int>(g_current_tier);
             row.mode = 0;
@@ -363,11 +325,10 @@ void OnMarker(uint64_t frameID, int64_t now) {
                     : (SwapMgr_GetActiveAPI() == ActiveAPI::DX11) ? 2
                     : (SwapMgr_GetActiveAPI() == ActiveAPI::OpenGL) ? 3 : 0;
             CSV_Push(row);
-
             return;
         }
 
-        // ── Cap=0: existing passthrough (unchanged) — Req 9.1 ──
+        // Cap=0: passthrough
         g_predictor.OnEnforcement(frameID, ts);
 
         double jitter = (telemetry_ft > 0.0 && s_prev_actual_ft > 0.0)
@@ -391,7 +352,6 @@ void OnMarker(uint64_t frameID, int64_t now) {
                 : (SwapMgr_GetActiveAPI() == ActiveAPI::DX11) ? 2
                 : (SwapMgr_GetActiveAPI() == ActiveAPI::OpenGL) ? 3 : 0;
         CSV_Push(row);
-
         return;
     }
 
@@ -487,34 +447,6 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
             LOG_WARN("Target FPS change: %d -> %d, flushing scheduler state",
                      s_last_target_fps, target_fps);
 
-        // ── Scheduler transition forwarding (Req 9.4, 9.5) ──
-        // When transitioning active→uncapped, forward the game's last-known
-        // Reflex params to the driver so JIT pacing is re-enabled.
-        // When transitioning uncapped→active, MaybeUpdateSleepMode will apply
-        // our overrides on the next enforcement frame (end of VRR loop).
-        if (fps_changed) {
-            bool was_active = s_last_target_fps > 0;
-            bool now_uncapped = target_fps == 0;
-            if (was_active && now_uncapped) {
-                // Active → uncapped: restore game's Reflex settings immediately
-                NV_SET_SLEEP_MODE_PARAMS* game_params = NvAPI_GetGameSleepParams();
-                if (g_dev && s_orig_sleep_mode && game_params) {
-                    LOG_INFO("Scheduler transition active->uncapped: forwarding game sleep params "
-                             "(lowLatency=%d, boost=%d, interval=%u)",
-                             game_params->bLowLatencyMode, game_params->bLowLatencyBoost,
-                             game_params->minimumIntervalUs);
-                    __try {
-                        InvokeSetSleepMode(g_dev, game_params);
-                    } __except(EXCEPTION_EXECUTE_HANDLER) {
-                        LOG_WARN("Scheduler transition forward failed (device transitional)");
-                    }
-                }
-            } else if (!was_active && target_fps > 0) {
-                // Uncapped → active: MaybeUpdateSleepMode handles this at end of VRR loop
-                LOG_INFO("Scheduler transition uncapped->active: MaybeUpdateSleepMode will apply overrides");
-            }
-        }
-
         g_predictor.RequestFlush();
         predictor_warm = false;
         s_last_present_deadline = now;
@@ -524,6 +456,8 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         ResetFeedbackAccumulators();
         s_miss_ratio = 0.0;
         s_ema_non_sleep_us = 0.0;
+        s_ema_present_latency_us = 0.0;
+        s_prev_frame_deviation_us = 0.0;
         s_last_own_sleep_us = 0.0;
         g_overload_active_flag.store(false, std::memory_order_relaxed);
     }
@@ -555,15 +489,7 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         g_skip_present_gate.store(true, std::memory_order_relaxed);
         LARGE_INTEGER qpc_now;
         QueryPerformanceCounter(&qpc_now);
-
-        // Track frame time so OSD render FPS works in no-limit mode
-        double ft_us = (s_prev_enforcement_ts > 0)
-            ? qpc_to_us(qpc_now.QuadPart - s_prev_enforcement_ts) : 0.0;
-        s_prev_enforcement_ts = qpc_now.QuadPart;
         s_last_enforcement_ts = qpc_now.QuadPart;
-        if (ft_us > 0.0)
-            g_actual_frame_time_us.store(ft_us, std::memory_order_relaxed);
-
         g_predictor.OnEnforcement(frameID, s_last_enforcement_ts);
         return;
     }
@@ -629,7 +555,19 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     int64_t this_frame_deadline;
     bool present_based = false;
     bool frame_missed = false;
-    bool overload_active = s_miss_ratio > 0.5;  // snapshot for this frame
+    double telemetry_gate_margin = 0.0;  // captured for CSV
+    // Overload hysteresis: enter at miss_ratio > 0.65, exit at < 0.30.
+    // Without hysteresis, the binary threshold at 0.5 causes rapid ON/OFF
+    // flipping when the game is borderline GPU-bound (CPU ≈ effective_interval).
+    // Each flip changes the gate and wake formula, adding discontinuities.
+    // Session 29 showed 44 transitions in 30s at the borderline.
+    // Simulator confirms hysteresis cuts flips from 26→12 with no impact
+    // on steady-state pacing (session 28: zero effect).
+    bool overload_active = g_overload_active_flag.load(std::memory_order_relaxed);
+    if (!overload_active && s_miss_ratio > 0.65)
+        overload_active = true;
+    else if (overload_active && s_miss_ratio < 0.30)
+        overload_active = false;
     if (!predictor_warm) {
         // Predictor cold: passthrough, don't advance deadline
         raw_wake = now;
@@ -639,16 +577,43 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         int64_t next_deadline = s_last_present_deadline +
             us_to_qpc(effective_interval);
 
+        // ── Deadline chain smoothing ──
+        // Blend the previous actual frame time into the deadline advance
+        // to absorb frame time variance. Without blending, the rigid
+        // advance creates a discrete integrator that oscillates (lag-1
+        // ACF ≈ -0.54). With blending, the deadline partially tracks
+        // reality, reducing the oscillation.
+        //
+        // The no-chain approach (deadline = now + eff) was tested in
+        // session 37 and caused regular stuttering because the deadline
+        // re-anchors to the enforcement timestamp every frame. Enforcement
+        // timing jitter (~216µs stdev) propagates directly into the sleep
+        // target, creating frame-to-frame instability. The chain's
+        // integrator property is essential: it smooths enforcement noise
+        // by accumulating from the previous deadline.
+        //
+        // blend=0.25 is the validated sweet spot (session 30: PI_sd=687,
+        // lag1=+0.13, gate=57%).
+        {
+            static constexpr double DEADLINE_BLEND = 0.25;
+            double prev_ft = g_actual_frame_time_us.load(std::memory_order_relaxed);
+            if (prev_ft > 0.0 &&
+                prev_ft < effective_interval * 2.0 &&
+                prev_ft > effective_interval * 0.5) {
+                double blended = effective_interval * (1.0 - DEADLINE_BLEND)
+                               + prev_ft * DEADLINE_BLEND;
+                next_deadline = s_last_present_deadline + us_to_qpc(blended);
+            }
+        }
+
         // Catch-up: if the deadline is in the past, re-anchor to now.
-        // This frame missed its target. The next frame will compute
-        // now + interval, giving a smooth ramp back to full sleep.
         if (next_deadline < now) {
             frame_missed = true;
             next_deadline = now;
         }
 
-        // Deadline drift clamp
-        int64_t max_deadline = now + us_to_qpc(effective_interval * 2.0);
+        // Forward drift clamp: keep deadline within 1.15× eff of now.
+        int64_t max_deadline = now + us_to_qpc(effective_interval * 1.15);
         if (next_deadline > max_deadline)
             next_deadline = max_deadline;
 
@@ -656,16 +621,15 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         s_last_present_deadline = next_deadline;
 
         // ── Update miss ratio EMA ──
-        // 1.0 = missed (deadline was in the past), 0.0 = on time.
-        // The EMA smooths this into a continuous 0.0–1.0 signal.
         double miss_sample = frame_missed ? 1.0 : 0.0;
         s_miss_ratio += MISS_EMA_ALPHA * (miss_sample - s_miss_ratio);
 
         // Publish for external consumers (OSD, predictor, stress detector).
-        // Threshold at 0.5 for the binary flag — equivalent to ~6 consecutive
-        // misses with alpha=0.08, similar to the old 10-frame hysteresis but
-        // with smooth ramp-in/ramp-out instead of a hard edge.
-        overload_active = s_miss_ratio > 0.5;
+        // Re-evaluate with hysteresis after miss ratio update.
+        if (!overload_active && s_miss_ratio > 0.65)
+            overload_active = true;
+        else if (overload_active && s_miss_ratio < 0.30)
+            overload_active = false;
         g_overload_active_flag.store(overload_active, std::memory_order_relaxed);
 
         double wake_guard = g_adaptive_wake_guard.Get();
@@ -675,41 +639,171 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         if (present_based) {
             raw_wake = this_frame_deadline - us_to_qpc(150.0);
         } else {
+            // frame_cost: how long from wake until the present call.
+            //
             // Use the larger of predicted render time and an EMA of observed
-            // non-sleep time from previous frames. The predictor only measures
-            // enforcement → PRESENT_START, but the game may have its own
-            // internal limiter that adds time the predictor doesn't see.
-            // The EMA smooths frame-to-frame variance so a single frame
-            // where the game skips its limiter doesn't cause overshoot.
+            // non-sleep time. The predictor measures enforcement → PRESENT_START
+            // but the game may have its own internal limiter that adds time
+            // the predictor doesn't see. The EMA catches this.
+            //
+            // When the gate is active, subtract gate hold from observed
+            // non-sleep so the gate's phase-stabilization time doesn't
+            // inflate frame_cost (which would erode gate margin).
+            //
+            // When GPU-bound (no sleep), fall back to predicted.
+            bool will_gate = !s_background_mode && !overload_active && predictor_warm;
+
             double actual_ft = g_actual_frame_time_us.load(std::memory_order_relaxed);
             double last_own_sleep = s_last_own_sleep_us;
-            double observed_non_sleep = (actual_ft > last_own_sleep && last_own_sleep > 0.0)
-                ? (actual_ft - last_own_sleep) : predicted;
+            double last_gate = g_last_gate_sleep_us.load(std::memory_order_relaxed);
+            double observed_non_sleep;
+            if (last_own_sleep > 100.0 && actual_ft > last_own_sleep) {
+                observed_non_sleep = actual_ft - last_own_sleep - last_gate;
+                // Sanity floor: reject nonsensically low values that indicate
+                // a measurement error (e.g., gate hold not subtracted).
+                // The original floor of predicted*0.5 was too aggressive —
+                // with the gate snapshot fix (S40), 83% of frames are gated
+                // and game_cpu legitimately drops to ~2500µs while predicted
+                // is ~5250µs. The 0.5 floor caught 14% of frames and inflated
+                // the EMA, causing overshoot clustering (lag1=+0.51).
+                // Lowered to 0.2 to only catch truly broken values.
+                if (observed_non_sleep < predicted * 0.2)
+                    observed_non_sleep = predicted;  // sanity floor
+            } else {
+                observed_non_sleep = predicted;
+            }
 
-            // Update EMA (alpha=0.15: responds in ~7 frames, stable otherwise)
+            // Clamp to effective interval — a single stall frame (scene
+            // transition, shader compile) shouldn't push the EMA to 200ms+
+            // which would take hundreds of frames to recover from.
+            observed_non_sleep = (std::min)(observed_non_sleep, effective_interval);
+
+            // Seed EMA from predicted on first sample for fast convergence
             if (s_ema_non_sleep_us == 0.0)
-                s_ema_non_sleep_us = observed_non_sleep;
-            else
-                s_ema_non_sleep_us += 0.15 * (observed_non_sleep - s_ema_non_sleep_us);
+                s_ema_non_sleep_us = predicted;
+            else {
+                // Symmetric alpha: track increases and decreases at the same
+                // rate. The original asymmetric alpha (0.15 up / 0.35 down)
+                // was designed to reduce overshoot clustering (session 27),
+                // but sessions 33-35 revealed it destroys gate headroom.
+                //
+                // The fast down-alpha (0.35) makes the EMA track game_cpu
+                // decreases in ~3 frames, so frame_cost ≈ game_cpu with
+                // ~0µs headroom. The gate only fires when frames arrive
+                // BEFORE the deadline, which requires frame_cost > game_cpu.
+                // With 0.35 down-alpha, headroom is -44µs (S35 analysis),
+                // yielding only 10% gating and PI_sd=1544.
+                //
+                // Symmetric 0.15 produces headroom of +104µs on low-variance
+                // scenes (S35) and +309µs on high-variance scenes (S30),
+                // yielding 56-57% gateable frames — matching S30's proven
+                // 57% gating and PI_sd=687.
+                //
+                // The overshoot clustering concern (session 27) is mitigated
+                // by the gate itself: gated frames have their present time
+                // locked to the deadline, so enforcement-level ++ clustering
+                // doesn't propagate to the display.
+                static constexpr double NS_EMA_ALPHA = 0.15;
+                s_ema_non_sleep_us += NS_EMA_ALPHA * (observed_non_sleep - s_ema_non_sleep_us);
+            }
 
-            double frame_cost = (std::max)(predicted, s_ema_non_sleep_us);
+            // frame_cost: use the non-sleep EMA directly.
+            //
+            // The EMA tracks game_cpu with ~0µs headroom. This means the
+            // gate only catches frames where game_cpu < ema (about 50%).
+            // Attempts to add headroom all destabilized the feedback loop:
+            // - S33 max(pred,ema): pred < ema in FG, reduced headroom
+            // - S38 ema+1000: caused overshoot clustering (lag1→+0.50)
+            //   because gate hold inflated, changing the EMA input
+            //
+            // The remaining PI variance (~1400-1500µs stdev) comes from
+            // the deadline chain oscillation propagating through the GPU
+            // pipeline. This is structural — the coupled feedback between
+            // frame_cost, sleep, gate_hold, and the EMA absorbs or
+            // amplifies any constant added to frame_cost within ~7 frames.
+            double frame_cost = s_ema_non_sleep_us;
 
-            double cadence_bias = g_cadence_meter.bias_ctrl.GetBias();
-            raw_wake = next_deadline - us_to_qpc(wake_guard)
-                     - us_to_qpc(wake_guard) - us_to_qpc(cadence_bias);
+            // Presentation-aware correction: use direct Reflex pipeline
+            // measurement when available (per-frame, ~2-3 frame report delay,
+            // sub-100µs precision). Falls back to the slow EMA for non-Reflex
+            // paths (DX11, non-Reflex DX12).
+            //
+            // The Reflex measurement is the DX12 equivalent of
+            // VK_EXT_present_timing's per-stage timestamps — it tells us
+            // exactly how long the frame sits in the driver/GPU pipeline
+            // after the present call. This replaces the 12-frame EMA
+            // response time with ~3-frame latency.
+            double present_latency_correction = 0.0;
+            double reflex_pipeline = g_reflex_pipeline_latency_us.load(
+                std::memory_order_relaxed);
+            if (reflex_pipeline > 0.0 && reflex_pipeline < 3000.0) {
+                present_latency_correction = reflex_pipeline;
+            } else {
+                present_latency_correction = s_ema_present_latency_us;
+            }
+
+            // Queue trend preemption: DISABLED.
+            // Session 37 data showed queue_trend has stdev=952µs with
+            // mean=-1µs — pure noise. Injecting 0.3× of this into the
+            // wake formula adds up to 539µs of random perturbation per
+            // frame, larger than the enforcement stdev (204µs). This
+            // directly degrades pacing consistency.
+            double queue_preempt_us = 0.0;
+
+            // Wake formula: deadline - frame_cost - wake_guard - corrections
+            //
+            // When the gate is active, it handles phase stabilization by
+            // holding the present to a fixed offset before the deadline.
+            // The cadence_bias and present_latency_correction are feedback
+            // loops that try to correct presentation drift by adjusting the
+            // wake time — but with the gate active, they fight the gate
+            // margin (the bias integrates the gate's earlier arrival as a
+            // systematic offset and tries to undo it). So when gating,
+            // only apply frame_cost + wake_guard + gate_margin.
+            //
+            // When the gate is inactive (overload, background, cold), the
+            // feedback corrections are the only mechanism for presentation
+            // drift correction, so they remain active.
+            //
+            // Gate margin: fixed at 1500µs.
+            // Session 33-34 testing showed that adaptive margin (cv-based)
+            // destabilizes the coupled feedback loop between margin, sleep
+            // duration, actual frame time, and deadline blend. The adaptive
+            // margin changes the sleep budget, which changes actual_ft,
+            // which changes the deadline blend's contribution to gate
+            // headroom, which changes the gated fraction — creating a
+            // second-order feedback loop the simulator doesn't model.
+            // The fixed 1500µs margin is the validated sweet spot from
+            // session 30 (PI_sd=687, gate=57%, PQI=97.7).
+            static constexpr double GATE_MARGIN_US = 1500.0;
+            telemetry_gate_margin = GATE_MARGIN_US;
+
+            if (will_gate) {
+                raw_wake = next_deadline - us_to_qpc(frame_cost)
+                         - us_to_qpc(wake_guard)
+                         - us_to_qpc(GATE_MARGIN_US)
+                         - us_to_qpc(queue_preempt_us);
+            } else {
+                double cadence_bias = g_cadence_meter.bias_ctrl.GetBias();
+                raw_wake = next_deadline - us_to_qpc(frame_cost)
+                         - us_to_qpc(wake_guard) - us_to_qpc(cadence_bias)
+                         - us_to_qpc(present_latency_correction)
+                         - us_to_qpc(queue_preempt_us);
+            }
         }
         raw_wake = (std::max)(raw_wake, now);
     }
 
-    // Damping (skip when predictor cold or present-based).
-    // Present-based targets a hard deadline — no prediction noise to smooth.
-    // Damping was tuned for the marker-based formula (deadline - predicted)
-    // and would overshoot when applied to the raw deadline target.
-    int64_t damped_wake;
-    if (predictor_warm && !present_based)
-        damped_wake = ApplyDamping(raw_wake, now, s_last_enforcement_ts);
-    else
-        damped_wake = raw_wake;
+    // Damping: DISABLED.
+    // The damping module smooths the wake target using an enforcement-interval
+    // EMA, but the deadline chain already smooths the deadline via the blend.
+    // Both filter the same enforcement noise through different mechanisms.
+    // The damping's steady_wake (last_enforcement + avg_interval) drifts
+    // independently of the deadline chain's reference, creating a second
+    // feedback loop that can diverge from and fight the chain.
+    // At cv=0.07, damping only suppresses 16% of noise — marginal benefit
+    // for the cost of a redundant feedback path.
+    int64_t damped_wake = raw_wake;
 
     // Safety clamp: never sleep more than 1.5× effective interval from now.
     // The old 2× clamp was too generous — combined with the PRESENT_START gate
@@ -748,8 +842,9 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         s_prev_overload = overload_active;
     }
 
-    if (predictor_warm)
-        UpdateDampingBaseline(s_last_enforcement_ts);
+    // Damping baseline update skipped (damping disabled).
+    // if (predictor_warm)
+    //     UpdateDampingBaseline(s_last_enforcement_ts);
 
     // Sleep when predictor is warm. During overload, the normal wake formula
     // naturally produces minimal/zero sleep (predicted ≈ effective_interval
@@ -789,9 +884,14 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     { LARGE_INTEGER tmp; QueryPerformanceCounter(&tmp); driver_sleep_end = tmp.QuadPart; }
     MaybeUpdateSleepMode(effective_interval, should_sleep);
 
-    // Feedback: drain correlator every frame, feed CadenceMeter
-    g_cadence_meter.SetSuppressed(overload_active || !predictor_warm ||
-                                   s_background_mode);
+    // Feedback: drain correlator every frame, feed CadenceMeter.
+    // Suppress bias accumulation when the gate is active — the gate handles
+    // phase correction directly, and the bias controller would integrate
+    // the gate's earlier arrival as a systematic offset, saturating at the
+    // clamp and fighting the gate margin.
+    bool suppress_bias = overload_active || !predictor_warm ||
+                         s_background_mode || gate_active;
+    g_cadence_meter.SetSuppressed(suppress_bias);
     DrainCorrelator(overload_active, effective_interval);
 
     // ── Telemetry ──
@@ -803,6 +903,16 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
 
     if (telemetry_ft > 0.0)
         g_actual_frame_time_us.store(telemetry_ft, std::memory_order_relaxed);
+
+    // Update deadline chain oscillation correction state.
+    // Only track when actively pacing — stalls and overload frames would
+    // produce huge deviations that contaminate the correction.
+    if (telemetry_ft > 0.0 && predictor_warm && !overload_active &&
+        telemetry_ft < effective_interval * 2.0) {
+        s_prev_frame_deviation_us = telemetry_ft - effective_interval;
+    } else {
+        s_prev_frame_deviation_us = 0.0;
+    }
 
     // Smoothness: EMA of |actual - target| deviation, skipping outliers.
     // When miss ratio is high, the target interval is unreachable. Measuring
@@ -843,6 +953,40 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
 
     PQI_Push(pqi_frame_time, effective_interval, 
              final_wake_error, g_adaptive_wake_guard.Get());
+
+    // ── Update presentation latency correction (EMA fallback) ──
+    // When Reflex pipeline timing is available, the scheduler uses the direct
+    // per-frame measurement (g_reflex_pipeline_latency_us) instead of this EMA.
+    // The EMA only updates when Reflex data is NOT available — DX11, non-Reflex
+    // DX12, or when the Reflex ring buffer hasn't produced data yet.
+    // Only update when the gate is NOT active — when the gate is holding
+    // frames to a fixed phase, the present timing reflects the gate's hold
+    // rather than pipeline latency, which would contaminate this EMA.
+    bool reflex_pipeline_available =
+        g_reflex_pipeline_latency_us.load(std::memory_order_relaxed) > 0.0;
+    if (predictor_warm && !overload_active && !present_based && !gate_active
+        && !reflex_pipeline_available) {
+        double pi = g_cadence_meter.present_interval_us.load(std::memory_order_relaxed);
+        if (pi > 0.0 && telemetry_ft > 0.0 &&
+            pi < effective_interval * 2.0 && telemetry_ft < effective_interval * 2.0) {
+            double latency_sample = pi - telemetry_ft;
+            // Only track positive latency (display slower than scheduler).
+            // Negative means display is ahead — no correction needed.
+            if (latency_sample < 0.0) latency_sample = 0.0;
+            // Clamp individual samples to avoid stall contamination
+            if (latency_sample > 2000.0) latency_sample = 2000.0;
+
+            constexpr double LATENCY_EMA_ALPHA = 0.08;
+            if (s_ema_present_latency_us == 0.0)
+                s_ema_present_latency_us = latency_sample;
+            else
+                s_ema_present_latency_us += LATENCY_EMA_ALPHA *
+                    (latency_sample - s_ema_present_latency_us);
+
+            // Clamp total correction to avoid runaway
+            s_ema_present_latency_us = std::clamp(s_ema_present_latency_us, 0.0, 1500.0);
+        }
+    }
 
     PQIScores pqi = PQI_GetRolling();
 
@@ -887,6 +1031,13 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     row.present_bias_us = g_cadence_meter.bias_ctrl.GetBias();
     row.feedback_rate = g_cadence_meter.bias_ctrl.GetWindowSize();
     row.feedback_alpha = g_cadence_meter.bias_ctrl.GetAlpha();
+    row.reflex_pipeline_latency_us = g_reflex_pipeline_latency_us.load(std::memory_order_relaxed);
+    row.reflex_queue_trend_us = g_reflex_queue_trend_us.load(std::memory_order_relaxed);
+    row.reflex_present_duration_us = g_reflex_present_duration_us.load(std::memory_order_relaxed);
+    row.reflex_gpu_active_us = g_reflex_gpu_active_us.load(std::memory_order_relaxed);
+    row.reflex_ai_frame_time_us = g_reflex_ai_frame_time_us.load(std::memory_order_relaxed);
+    row.reflex_cpu_latency_us = g_reflex_cpu_latency_us.load(std::memory_order_relaxed);
+    row.gate_margin_us = telemetry_gate_margin;
     s_prev_actual_ft = telemetry_ft;
 
     CSV_Push(row);
@@ -954,5 +1105,6 @@ static void FlushAll() {
     g_predictor.cv = 0.0;
     s_last_own_sleep_us = 0.0;
     s_ema_non_sleep_us = 0.0;
+    s_prev_frame_deviation_us = 0.0;
     g_cadence_meter.Reset();
 }
