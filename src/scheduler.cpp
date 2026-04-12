@@ -38,6 +38,7 @@ std::atomic<int>    g_background_fps{30};
 std::atomic<int>    g_dmfg_output_cap{0};
 std::atomic<bool>   g_overload_active_flag{false};
 std::atomic<double> g_actual_frame_time_us{0.0};
+std::atomic<double> g_effective_interval_us{0.0};
 std::atomic<double> g_smoothness_us{0.0};
 Tier g_current_tier = Tier0;
 std::atomic<int64_t> g_next_deadline{0};
@@ -521,6 +522,9 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         effective_interval = ceiling_us * lfc_mult;
     }
 
+    // Publish for presentation gate safety clamp
+    g_effective_interval_us.store(effective_interval, std::memory_order_relaxed);
+
     // ── Predictor warmup tracking ──
     // Must be before overload detection so the grace period is available.
     static bool s_predictor_was_cold = true;
@@ -574,27 +578,42 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         this_frame_deadline = now;
         s_last_present_deadline = now;
     } else {
-        int64_t next_deadline = s_last_present_deadline +
-            us_to_qpc(effective_interval);
+        bool will_gate = !s_background_mode && !overload_active && predictor_warm;
 
-        // ── Deadline chain smoothing ──
-        // Blend the previous actual frame time into the deadline advance
-        // to absorb frame time variance. Without blending, the rigid
-        // advance creates a discrete integrator that oscillates (lag-1
-        // ACF ≈ -0.54). With blending, the deadline partially tracks
-        // reality, reducing the oscillation.
-        //
-        // The no-chain approach (deadline = now + eff) was tested in
-        // session 37 and caused regular stuttering because the deadline
-        // re-anchors to the enforcement timestamp every frame. Enforcement
-        // timing jitter (~216µs stdev) propagates directly into the sleep
-        // target, creating frame-to-frame instability. The chain's
-        // integrator property is essential: it smooths enforcement noise
-        // by accumulating from the previous deadline.
-        //
-        // blend=0.25 is the validated sweet spot (session 30: PI_sd=687,
-        // lag1=+0.13, gate=57%).
-        {
+        int64_t next_deadline;
+
+        if (will_gate) {
+            // ── Gate-active deadline: chain without blend ──
+            // The chain advances by eff: next = prev + eff.
+            // The real SIM-to-SIM interval is eff + overhead (~700-800µs),
+            // so the deadline drifts backward by ~overhead per frame.
+            // This is correct — the chain naturally settles into a state
+            // where the deadline is slightly behind `now`, and the catch-up
+            // re-anchors it. The gate holds the present to the deadline,
+            // which is ~overhead before the next enforcement, producing
+            // telemetry_ft ≈ eff.
+            //
+            // The forward drift clamp is DISABLED when the gate is active.
+            // The clamp caused the deadline to get stuck at 1.15×eff when
+            // catch-up frames (short, ungated) pushed the drift up, creating
+            // regular short frames every 5-8 frames (session 51). The gate's
+            // own safety clamp (85% of effective interval) already prevents
+            // runaway holds from stale deadlines.
+            next_deadline = s_last_present_deadline +
+                us_to_qpc(effective_interval);
+
+            // Catch-up only (no forward clamp).
+            if (next_deadline < now) {
+                frame_missed = true;
+                next_deadline = now;
+            }
+        } else {
+            // ── No-gate deadline: chain with blend ──
+            // Without the gate, the chain's integrator smooths enforcement
+            // noise. The blend tracks reality to reduce lag-1 oscillation.
+            next_deadline = s_last_present_deadline +
+                us_to_qpc(effective_interval);
+
             static constexpr double DEADLINE_BLEND = 0.25;
             double prev_ft = g_actual_frame_time_us.load(std::memory_order_relaxed);
             if (prev_ft > 0.0 &&
@@ -606,16 +625,20 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
             }
         }
 
-        // Catch-up: if the deadline is in the past, re-anchor to now.
-        if (next_deadline < now) {
-            frame_missed = true;
-            next_deadline = now;
-        }
+        // Catch-up and forward drift clamp for the no-gate path only.
+        // The gate-active path handles its own catch-up above and doesn't
+        // need the forward clamp — the gate's safety clamp (85% of eff)
+        // prevents runaway holds.
+        if (!will_gate) {
+            if (next_deadline < now) {
+                frame_missed = true;
+                next_deadline = now;
+            }
 
-        // Forward drift clamp: keep deadline within 1.15× eff of now.
-        int64_t max_deadline = now + us_to_qpc(effective_interval * 1.15);
-        if (next_deadline > max_deadline)
-            next_deadline = max_deadline;
+            int64_t max_deadline = now + us_to_qpc(effective_interval * 1.15);
+            if (next_deadline > max_deadline)
+                next_deadline = max_deadline;
+        }
 
         this_frame_deadline = next_deadline;
         s_last_present_deadline = next_deadline;
@@ -651,36 +674,49 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
             // inflate frame_cost (which would erode gate margin).
             //
             // When GPU-bound (no sleep), fall back to predicted.
-            bool will_gate = !s_background_mode && !overload_active && predictor_warm;
+            // will_gate already computed above for deadline mode selection.
 
             double actual_ft = g_actual_frame_time_us.load(std::memory_order_relaxed);
             double last_own_sleep = s_last_own_sleep_us;
             double last_gate = g_last_gate_sleep_us.load(std::memory_order_relaxed);
             double observed_non_sleep;
             if (last_own_sleep > 100.0 && actual_ft > last_own_sleep) {
+                // Normal path: subtract our sleep and gate hold to isolate
+                // the game's CPU cost (render + submit + any internal limiter).
                 observed_non_sleep = actual_ft - last_own_sleep - last_gate;
-                // Sanity floor: reject nonsensically low values that indicate
-                // a measurement error (e.g., gate hold not subtracted).
-                // The original floor of predicted*0.5 was too aggressive —
-                // with the gate snapshot fix (S40), 83% of frames are gated
-                // and game_cpu legitimately drops to ~2500µs while predicted
-                // is ~5250µs. The 0.5 floor caught 14% of frames and inflated
-                // the EMA, causing overshoot clustering (lag1=+0.51).
-                // Lowered to 0.2 to only catch truly broken values.
-                if (observed_non_sleep < predicted * 0.2)
-                    observed_non_sleep = predicted;  // sanity floor
+            } else if (actual_ft > 0.0 && actual_ft < effective_interval * 2.0) {
+                // Zero-sleep path: when own_sleep is negligible, actual_ft
+                // IS the non-sleep time (game render + gate hold). Subtract
+                // gate hold to get game CPU cost, same as the normal path.
+                //
+                // The old code fell back to `predicted` here, which creates
+                // a death spiral at high FPS: predicted seeds the EMA →
+                // inflated frame_cost → zero sleep → fallback to predicted →
+                // EMA never recovers. Using actual_ft - gate breaks the
+                // cycle by giving the EMA real measurements to converge on.
+                observed_non_sleep = actual_ft - last_gate;
             } else {
+                // Stall or no data: fall back to predicted as last resort.
                 observed_non_sleep = predicted;
             }
+
+            // Sanity floor: reject nonsensically low or negative values.
+            // Can happen when gate hold exceeds actual_ft (measurement
+            // timing skew) or during scene transitions.
+            if (observed_non_sleep < 100.0)
+                observed_non_sleep = (std::min)(predicted, effective_interval);
 
             // Clamp to effective interval — a single stall frame (scene
             // transition, shader compile) shouldn't push the EMA to 200ms+
             // which would take hundreds of frames to recover from.
             observed_non_sleep = (std::min)(observed_non_sleep, effective_interval);
 
-            // Seed EMA from predicted on first sample for fast convergence
+            // Seed EMA from the first observed sample rather than predicted.
+            // Seeding from predicted locks in stale values after FPS changes
+            // (e.g., predicted=9ms at 157fps target=6.4ms), and the EMA
+            // can't recover when the zero-sleep fallback also feeds predicted.
             if (s_ema_non_sleep_us == 0.0)
-                s_ema_non_sleep_us = predicted;
+                s_ema_non_sleep_us = observed_non_sleep;
             else {
                 // Symmetric alpha: track increases and decreases at the same
                 // rate. The original asymmetric alpha (0.15 up / 0.35 down)

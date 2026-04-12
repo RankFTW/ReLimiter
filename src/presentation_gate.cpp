@@ -65,10 +65,17 @@ void PresentGate_Execute(int64_t timestamp_qpc, uint64_t frame_id,
 
     // Safety clamp: don't hold longer than 85% of the effective interval.
     // Protects against stale deadlines from FG intermediate presents or
-    // deadline chain anomalies. At 37 Hz (27ms interval), max hold is ~23ms.
-    // At 111 Hz (9ms interval), max hold is ~7.6ms.
-    double effective_us = g_ceiling_interval_us.load(std::memory_order_relaxed);
-    double max_gate_us = effective_us * 0.85;
+    // deadline chain anomalies.
+    //
+    // Use the effective interval (target interval × FG divisor), not the
+    // display ceiling. The ceiling (e.g., 6ms at 165Hz) is much shorter
+    // than the target (e.g., 18ms at 54fps), causing the gate to reject
+    // valid holds when the deadline drifts (session 51).
+    // The effective interval is published by the scheduler each frame.
+    double eff_us = g_effective_interval_us.load(std::memory_order_relaxed);
+    if (eff_us <= 0.0)
+        eff_us = g_ceiling_interval_us.load(std::memory_order_relaxed);
+    double max_gate_us = eff_us * 0.85;
 
     if (delta_us >= max_gate_us) {
         // Deadline is too far ahead — stale or FG intermediate. Don't hold.
@@ -86,7 +93,7 @@ void PresentGate_Execute(int64_t timestamp_qpc, uint64_t frame_id,
     double gate_us = qpc_to_us(after.QuadPart - timestamp_qpc);
     g_last_gate_sleep_us.store(gate_us, std::memory_order_relaxed);
 
-    if (gate_us > effective_us * 0.5) {
+    if (gate_us > eff_us * 0.5) {
         LOG_WARN("GATE_LONG: frame=%llu gate=%.0fus delta=%.0fus max=%.0fus",
                  frame_id, gate_us, delta_us, max_gate_us);
     }

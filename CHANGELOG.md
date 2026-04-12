@@ -1,6 +1,29 @@
 # Changelog
 
 
+## 3.1.5
+
+### Bug Fixes
+- Fixed frame delivery overshooting where frames were consistently landing late, causing micro-stutter — the presentation gate was reading the previous frame's deadline instead of the current frame's, so it almost never held frames back when it should have
+- Fixed a feedback loop at high FPS where the scheduler's render time estimate would inflate and never recover — when sleep time hit zero the estimator fell back to its own stale prediction instead of using real measurements, creating a cycle of overshoot
+- Fixed render time estimator seeding from a stale predicted value after FPS target changes — the initial estimate now uses the first real measurement so the scheduler converges immediately instead of fighting an outdated baseline
+
+## 3.1.4
+
+### Improvements
+- Reduced frame delivery stutter by stabilizing the phase of each present call relative to the display deadline — frames now land at a consistent point in the interval regardless of CPU timing variance
+- Fixed presentation gate reading the wrong deadline (next frame's instead of current frame's), which caused the gate to reject most frames and rarely activate
+- Improved deadline chain smoothing — blends actual frame time into the deadline advance to reduce the alternating overshoot/undershoot pattern in frame delivery
+- Added overload detection hysteresis to prevent rapid on/off flipping when the game is borderline GPU-bound
+- Faster cadence bias convergence — large presentation drift corrections now apply within 1-2 measurement windows instead of 5-10
+- Added Reflex pipeline timing extraction for more accurate presentation latency correction on DX12 Reflex games
+- Added 7 new CSV telemetry columns for pipeline analysis: reflex pipeline latency, queue trend, present duration, GPU active time, AI frame time, CPU latency, and gate margin
+
+## 3.1.3
+
+### Bug Fixes
+- Fixed crash when Frame Latency Controller modifies DX12 waitable swapchain queue depth (e.g. God of War Ragnarök) — disabled FLC for all DX12 swapchains. Some games expect a specific queue depth and corrupt state when `SetMaximumFrameLatency` changes it. DX11 FLC is unaffected.
+
 ## 3.1.2
 
 ### New Features

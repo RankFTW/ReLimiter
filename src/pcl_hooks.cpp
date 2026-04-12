@@ -84,13 +84,14 @@ static int32_t Hooked_slPCLSetMarker(uint32_t marker, const void* frame) {
                          g_overload_active_flag.load(std::memory_order_relaxed));
 
     // Enforcement at SIMULATION_START — same as DX12
-    // Snapshot deadline before enforcement advances it (same as nvapi_hooks).
-    static int64_t s_pre_enforcement_deadline = 0;
-    if (type == SIMULATION_START)
-        s_pre_enforcement_deadline = g_next_deadline.load(std::memory_order_relaxed);
+    // Snapshot deadline AFTER enforcement sets it for this frame (same fix as nvapi_hooks).
+    static int64_t s_post_enforcement_deadline = 0;
 
     if (type == SIMULATION_START)
         OnMarker(frameID, ts.QuadPart);
+
+    if (type == SIMULATION_START)
+        s_post_enforcement_deadline = g_next_deadline.load(std::memory_order_relaxed);
 
     // PRESENT_START: gate only for marker-based paths.
     // Correlator is disabled for marker paths — scanout estimation is too
@@ -98,7 +99,7 @@ static int32_t Hooked_slPCLSetMarker(uint32_t marker, const void* frame) {
     // Present-based paths feed the correlator from vk_enforce.cpp instead.
     if (type == PRESENT_START) {
         PresentGate_Execute(ts.QuadPart, frameID,
-                            s_pre_enforcement_deadline);
+                            s_post_enforcement_deadline);
     }
 
     // Forward to Streamline
