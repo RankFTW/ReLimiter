@@ -829,7 +829,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
     if (ft > 0.0) {
         double instant_fps = 1000000.0 / ft;
         if (s_real_fps > 0.0)
-            s_real_fps += 0.08 * (instant_fps - s_real_fps);
+            s_real_fps += 0.02 * (instant_fps - s_real_fps);
         else
             s_real_fps = instant_fps;
     }
