@@ -1028,7 +1028,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         // ═══════════════════════════════════
         // FRAMETIME GRAPH
         // ═══════════════════════════════════
-        if (g_config.osd_show_frametime_graph && !IsDmfgActive()) {
+        if (g_config.osd_show_frametime_graph) {
             float ordered[FT_HISTORY_SIZE];
             float data_max = 0.0f;
             float data_min = 1e9f;

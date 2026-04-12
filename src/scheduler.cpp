@@ -122,7 +122,9 @@ static constexpr double FEEDBACK_MAX_CORRECTION = 30000.0;
 // ── Periodic uncap probe ──
 static int  s_uncap_frame_counter = 0;
 static bool s_uncap_active = false;
-static constexpr int UNCAP_INTERVAL_FRAMES = 60; // ~1s at ~60fps render
+static int  s_probe_suppress_countdown = 0;  // frames remaining to suppress OSD updates
+static constexpr int UNCAP_INTERVAL_FRAMES = 300; // ~5s at ~60fps render
+static constexpr int PROBE_SUPPRESS_FRAMES = 6;  // suppress OSD for probe + reconvergence
 
 // ── Forward declarations ──
 static void OnMarker_VRR(uint64_t frameID, int64_t now);
@@ -185,8 +187,14 @@ void OnMarker(uint64_t frameID, int64_t now) {
 
         s_prev_enforcement_ts = ts;
         s_last_enforcement_ts = ts;
-        if (telemetry_ft > 0.0)
+
+        // Suppress g_actual_frame_time_us updates during probe + reconvergence
+        // so the OSD doesn't show the spike to the user.
+        if (s_probe_suppress_countdown > 0) {
+            s_probe_suppress_countdown--;
+        } else if (telemetry_ft > 0.0) {
             g_actual_frame_time_us.store(telemetry_ft, std::memory_order_relaxed);
+        }
 
         double output_fps = g_output_fps.load(std::memory_order_relaxed);
         double render_fps = (telemetry_ft > 0.0) ? 1000000.0 / telemetry_ft : 0.0;
@@ -199,17 +207,23 @@ void OnMarker(uint64_t frameID, int64_t now) {
 
         int output_cap = g_dmfg_output_cap.load(std::memory_order_relaxed);
 
-        // Periodic uncap probe: remove cap for 1 frame every ~10s
+        // Periodic uncap probe: remove cap for 1 frame every ~300 render frames (~5s).
+        // OSD suppression (s_probe_suppress_countdown) hides the spike from the user.
+        bool is_probe_frame = false;
         if (output_cap > 0) {
             if (s_uncap_active) {
                 output_cap = 0;
                 s_uncap_active = false;
+                is_probe_frame = true;
+                s_probe_suppress_countdown = PROBE_SUPPRESS_FRAMES;
             } else {
                 s_uncap_frame_counter++;
                 if (s_uncap_frame_counter >= UNCAP_INTERVAL_FRAMES) {
                     s_uncap_frame_counter = 0;
                     s_uncap_active = true;
                     output_cap = 0;
+                    is_probe_frame = true;
+                    s_probe_suppress_countdown = PROBE_SUPPRESS_FRAMES;
                 }
             }
         } else {

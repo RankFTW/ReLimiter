@@ -85,6 +85,9 @@ std::atomic<double> g_reflex_cpu_latency_us{0.0};
 // deadline computation.
 std::atomic<int64_t> g_reflex_present_end_qpc{0};
 
+// GPU frame time from Reflex ring — real render cadence, unaffected by caps.
+std::atomic<double> g_reflex_gpu_frame_time_us{0.0};
+
 // Previous frame's GPU render duration for queue trend detection
 static double s_prev_gpu_render_duration_us = 0.0;
 
@@ -213,6 +216,7 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
 
         double ft = static_cast<double>(r.gpuFrameTimeUs);
         g_cadence_meter.IngestReflex(ft, effective_interval_us);
+        g_reflex_gpu_frame_time_us.store(ft, std::memory_order_relaxed);
 
         // ── Pipeline latency: present call → GPU render end ──
         // This measures how long the frame sits in the driver/GPU pipeline
@@ -319,6 +323,35 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
 // Track previous PresentCount for queue depth estimation
 static uint32_t s_prev_present_count = 0;
 static uint32_t s_expected_present_count = 0;
+// ── DMFG-only: lightweight Reflex ring scan for gpuFrameTimeUs ──
+// Called from the DMFG scheduler path to populate g_reflex_gpu_frame_time_us
+// for multiplier detection. Does NOT feed cadence meter, pipeline timing,
+// or any other non-DMFG systems.
+void PollReflexGpuFrameTime() {
+    ResolveGetLatency();
+    if (!s_get_latency || !g_dev) return;
+
+    NV_LATENCY_RESULT_PARAMS_LOCAL params = {};
+    params.version = sizeof(NV_LATENCY_RESULT_PARAMS_LOCAL) | (1 << 16);
+
+    int status;
+    __try {
+        status = s_get_latency(g_dev, &params);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return;
+    }
+    if (status != 0) return;
+
+    // Scan for the newest frame with a valid gpuFrameTimeUs
+    for (int i = 63; i >= 0; i--) {
+        const auto& r = params.frameReport[i];
+        if (r.frameID == 0 || r.gpuFrameTimeUs == 0) continue;
+        g_reflex_gpu_frame_time_us.store(
+            static_cast<double>(r.gpuFrameTimeUs), std::memory_order_relaxed);
+        break;
+    }
+}
+
 static bool     s_has_prev_present = false;
 
 void DrainCorrelator(bool overload_active, double effective_interval_us) {
@@ -427,6 +460,7 @@ void ResetFeedbackAccumulators() {
     g_reflex_ai_frame_time_us.store(0.0, std::memory_order_relaxed);
     g_reflex_cpu_latency_us.store(0.0, std::memory_order_relaxed);
     g_reflex_present_end_qpc.store(0, std::memory_order_relaxed);
+    g_reflex_gpu_frame_time_us.store(0.0, std::memory_order_relaxed);
 }
 
 double GetLastScanoutErrorUs() {
