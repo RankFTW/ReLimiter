@@ -171,16 +171,18 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
             s_enforcement_marker = RENDERSUBMIT_START;
     }
 
-    // Snapshot the deadline BEFORE enforcement advances it.
-    // The scheduler's OnMarker advances g_next_deadline to the next frame's
-    // target. PRESENT_START needs the current frame's deadline for the
-    // correlator's scanout error calculation.
-    static int64_t s_pre_enforcement_deadline = 0;
-    if (params->markerType == s_enforcement_marker)
-        s_pre_enforcement_deadline = g_next_deadline.load(std::memory_order_relaxed);
-
+    // Snapshot the deadline AFTER enforcement sets it for this frame.
+    // OnMarker computes this_frame_deadline and publishes it to g_next_deadline.
+    // PRESENT_START needs THIS frame's deadline for the gate — not the previous
+    // frame's. The old pre-enforcement snapshot captured frame N-1's deadline,
+    // which is already in the past by the time PRESENT_START(N) fires, causing
+    // the gate to never hold (session 48: 0.1% gating, -5.3% undershoot).
+    static int64_t s_post_enforcement_deadline = 0;
     if (params->markerType == s_enforcement_marker && !PCL_MarkersFlowing())
         OnMarker(params->frameID, ts.QuadPart);
+
+    if (params->markerType == s_enforcement_marker)
+        s_post_enforcement_deadline = g_next_deadline.load(std::memory_order_relaxed);
 
     // Feed correlator at PRESENT_START — only for present-based enforcement.
     // Marker-based paths (NvAPI/PCL) have unreliable scanout estimation with
@@ -191,7 +193,7 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
     // PRESENT_START gate: delegated to shared Presentation_Gate module
     if (params->markerType == PRESENT_START) {
         PresentGate_Execute(ts.QuadPart, params->frameID,
-                            s_pre_enforcement_deadline);
+                            s_post_enforcement_deadline);
     }
 
     return result;
