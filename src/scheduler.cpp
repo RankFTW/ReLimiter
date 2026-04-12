@@ -467,29 +467,42 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
             double last_gate = g_last_gate_sleep_us.load(std::memory_order_relaxed);
             double observed_non_sleep;
             if (last_own_sleep > 100.0 && actual_ft > last_own_sleep) {
+                // Normal path: subtract our sleep and gate hold to isolate
+                // the game's CPU cost (render + submit + any internal limiter).
                 observed_non_sleep = actual_ft - last_own_sleep - last_gate;
-                // Sanity floor: reject nonsensically low values that indicate
-                // a measurement error (e.g., gate hold not subtracted).
-                // The original floor of predicted*0.5 was too aggressive —
-                // with the gate snapshot fix (S40), 83% of frames are gated
-                // and game_cpu legitimately drops to ~2500µs while predicted
-                // is ~5250µs. The 0.5 floor caught 14% of frames and inflated
-                // the EMA, causing overshoot clustering (lag1=+0.51).
-                // Lowered to 0.2 to only catch truly broken values.
-                if (observed_non_sleep < predicted * 0.2)
-                    observed_non_sleep = predicted;  // sanity floor
+            } else if (actual_ft > 0.0 && actual_ft < effective_interval * 2.0) {
+                // Zero-sleep path: when own_sleep is negligible, actual_ft
+                // IS the non-sleep time (game render + gate hold). Subtract
+                // gate hold to get game CPU cost, same as the normal path.
+                //
+                // The old code fell back to `predicted` here, which creates
+                // a death spiral at high FPS: predicted seeds the EMA →
+                // inflated frame_cost → zero sleep → fallback to predicted →
+                // EMA never recovers. Using actual_ft - gate breaks the
+                // cycle by giving the EMA real measurements to converge on.
+                observed_non_sleep = actual_ft - last_gate;
             } else {
+                // Stall or no data: fall back to predicted as last resort.
                 observed_non_sleep = predicted;
             }
+
+            // Sanity floor: reject nonsensically low or negative values.
+            // Can happen when gate hold exceeds actual_ft (measurement
+            // timing skew) or during scene transitions.
+            if (observed_non_sleep < 100.0)
+                observed_non_sleep = (std::min)(predicted, effective_interval);
 
             // Clamp to effective interval — a single stall frame (scene
             // transition, shader compile) shouldn't push the EMA to 200ms+
             // which would take hundreds of frames to recover from.
             observed_non_sleep = (std::min)(observed_non_sleep, effective_interval);
 
-            // Seed EMA from predicted on first sample for fast convergence
+            // Seed EMA from the first observed sample rather than predicted.
+            // Seeding from predicted locks in stale values after FPS changes
+            // (e.g., predicted=9ms at 157fps target=6.4ms), and the EMA
+            // can't recover when the zero-sleep fallback also feeds predicted.
             if (s_ema_non_sleep_us == 0.0)
-                s_ema_non_sleep_us = predicted;
+                s_ema_non_sleep_us = observed_non_sleep;
             else {
                 // Symmetric alpha: track increases and decreases at the same
                 // rate. The original asymmetric alpha (0.15 up / 0.35 down)
