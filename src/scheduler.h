@@ -18,6 +18,10 @@ extern std::atomic<bool> g_overload_active_flag;
 // Real enforcement-to-enforcement interval (readable by OSD)
 extern std::atomic<double> g_actual_frame_time_us;
 
+// Current effective interval in µs (target interval × FG divisor).
+// Published by the scheduler each frame for the presentation gate's safety clamp.
+extern std::atomic<double> g_effective_interval_us;
+
 // Smoothness: EMA of |actual_interval - target_interval| in μs (readable by OSD)
 extern std::atomic<double> g_smoothness_us;
 
