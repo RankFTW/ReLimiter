@@ -79,6 +79,9 @@ std::atomic<double> g_reflex_ai_frame_time_us{0.0};
 // the scheduler can't control but needs to predict.
 std::atomic<double> g_reflex_cpu_latency_us{0.0};
 
+// Total frame cost: simStart → gpuRenderEnd
+std::atomic<double> g_reflex_total_frame_cost_us{0.0};
+
 // Present-end timestamp (QPC): the moment the present call returned.
 // This is the closest available proxy for when the frame entered the
 // driver's flip queue. Used by the scheduler for scanout-anchored
@@ -300,6 +303,20 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
             }
         }
 
+        // ── Total frame cost: simStart → gpuRenderEnd ──
+        // The complete pipeline cost from game start to GPU finish.
+        // This is the true cost of producing a frame, independent of
+        // our sleep, gate hold, or present call overhead.
+        if (r.simStartTime > 0 && r.gpuRenderEndTime > 0 &&
+            r.gpuRenderEndTime > r.simStartTime) {
+            double total_us = qpc_to_us(
+                static_cast<int64_t>(r.gpuRenderEndTime - r.simStartTime));
+            if (total_us > 0.0 && total_us < effective_interval_us * 3.0) {
+                g_reflex_total_frame_cost_us.store(total_us,
+                    std::memory_order_relaxed);
+            }
+        }
+
         s_last_reflex_frame_id = r.frameID;
         s_reflex_found_count++;
         found = true;
@@ -426,6 +443,7 @@ void ResetFeedbackAccumulators() {
     g_reflex_gpu_active_us.store(0.0, std::memory_order_relaxed);
     g_reflex_ai_frame_time_us.store(0.0, std::memory_order_relaxed);
     g_reflex_cpu_latency_us.store(0.0, std::memory_order_relaxed);
+    g_reflex_total_frame_cost_us.store(0.0, std::memory_order_relaxed);
     g_reflex_present_end_qpc.store(0, std::memory_order_relaxed);
 }
 

@@ -23,6 +23,7 @@
 #include "reflex_inject.h"
 #include "presentation_gate.h"
 #include "flip_model.h"
+#include "adaptive_smoothing.h"
 #include <string>
 #include <atomic>
 #include <algorithm>
@@ -458,6 +459,68 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             config_dirty = true;
         }
         HelpTip("Enable per-frame CSV telemetry recording. Toggle in-game with the CSV hotkey (default F11).");
+
+        // Adaptive Smoothing
+        ImGui::Spacing();
+        bool adaptive = g_config.adaptive_smoothing;
+        if (ImGui::Checkbox("Adaptive Smoothing", &adaptive)) {
+            g_config.adaptive_smoothing = adaptive;
+            g_adaptive_smoothing.SetConfig(
+                g_config.smoothing_window == "dual",
+                g_config.smoothing_percentile,
+                adaptive);
+            config_dirty = true;
+        }
+        if (g_adaptive_smoothing.IsWarm() && g_config.adaptive_smoothing) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(+%.1f us)",
+                               g_smoothing_offset_us.load(std::memory_order_relaxed));
+        }
+        HelpTip("P99-based adaptive interval extension. Extends the target interval "
+                "so 99%% of frames complete within it, reducing micro-stutters from "
+                "render time variance. DX12+Reflex path only.");
+
+        if (g_config.adaptive_smoothing) {
+            ImGui::Indent();
+            if (ImGui::Checkbox("Show on OSD##adaptive", &g_config.osd_show_adaptive_smoothing))
+                config_dirty = true;
+            HelpTip("Show adaptive smoothing offset and P99 render time on the in-game overlay.");
+
+            // Percentile slider
+            float pct = static_cast<float>(g_config.smoothing_percentile * 100.0);
+            if (ImGui::SliderFloat("Percentile##adaptive", &pct, 50.0f, 99.9f, "P%.1f")) {
+                g_config.smoothing_percentile = static_cast<double>(pct) / 100.0;
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                g_adaptive_smoothing.SetConfig(
+                    g_config.smoothing_window == "dual",
+                    g_config.smoothing_percentile,
+                    g_config.adaptive_smoothing);
+                config_dirty = true;
+            }
+            HelpTip("Target percentile for the threshold. P99 = 99%% of frames fit within the interval. Lower = more headroom, higher = tighter.");
+
+            // Window mode combo
+            const char* win_labels[] = {"Medium (256)", "Dual (64+512)"};
+            int current_win = (g_config.smoothing_window == "dual") ? 1 : 0;
+            if (ImGui::BeginCombo("Window##adaptive", win_labels[current_win])) {
+                for (int i = 0; i < 2; i++) {
+                    bool selected = (current_win == i);
+                    if (ImGui::Selectable(win_labels[i], selected)) {
+                        g_config.smoothing_window = (i == 1) ? "dual" : "medium";
+                        g_adaptive_smoothing.SetConfig(
+                            i == 1,
+                            g_config.smoothing_percentile,
+                            g_config.adaptive_smoothing);
+                        config_dirty = true;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            HelpTip("Medium: single 256-frame window (~4s). Dual: short 64 + long 512 window, uses max of both P99s for robustness against scene changes.");
+
+            ImGui::Unindent();
+        }
     }
 
     // ════════════════════════════════════════════
@@ -877,6 +940,23 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                 if (smooth < 500.0)       col = ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f);
                 else if (smooth < 1500.0) col = ImVec4(0.9f*b, 0.9f*b, 0.2f*b, 1.0f);
                 else                      col = ImVec4(0.9f*b, 0.2f*b, 0.2f*b, 1.0f);
+                OSDTextColored(col, buf);
+            }
+        }
+
+        if (g_config.osd_show_adaptive_smoothing && g_config.adaptive_smoothing) {
+            double offset = g_smoothing_offset_us.load(std::memory_order_relaxed);
+            double p99 = g_smoothing_p99_us.load(std::memory_order_relaxed);
+            if (g_adaptive_smoothing.IsWarm()) {
+                const char* mode = g_adaptive_smoothing.dual_mode ? "Dual" : "Med";
+                double pct = g_adaptive_smoothing.target_percentile * 100.0;
+                char buf[64];
+                snprintf(buf, sizeof(buf), "Adaptive: +%.1f us (P%.0f: %.1f ms) [%s]",
+                         offset, pct, p99 / 1000.0, mode);
+                float b = g_config.osd_text_brightness;
+                ImVec4 col = (offset < 100.0)
+                    ? ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f)
+                    : ImVec4(0.9f*b, 0.9f*b, 0.2f*b, 1.0f);
                 OSDTextColored(col, buf);
             }
         }

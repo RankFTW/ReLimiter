@@ -62,6 +62,14 @@ struct Config {
 
     // Flip Model Override (DX11)
     bool flip_model_override = false;   // Force DXGI_SWAP_EFFECT_FLIP_DISCARD on DX11 bitblt swapchains
+
+    // Adaptive Smoothing
+    bool   adaptive_smoothing = true;           // Enable P99-based adaptive smoothing (DX12+Reflex only)
+    double smoothing_percentile = 0.99;         // Target percentile (0.90–0.999)
+    std::string smoothing_window = "medium";    // "medium" (256 frames) | "dual" (64+512)
+
+    // OSD: Adaptive Smoothing
+    bool osd_show_adaptive_smoothing = false;
 };
 
 extern Config g_config;
