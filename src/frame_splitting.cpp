@@ -43,8 +43,12 @@ static void EnsureResolved() {
 static int ComputeFGDivisorRaw() {
     bool presenting = g_fg_presenting.load(std::memory_order_relaxed);
     int mult = g_fg_multiplier.load(std::memory_order_relaxed);
-    if (presenting && mult > 0)
+    if (presenting && mult > 0) {
+        int actual = g_fg_actual_multiplier.load(std::memory_order_relaxed);
+        if (actual >= 2)
+            return actual;
         return mult + 1;
+    }
     return 1;
 }
 

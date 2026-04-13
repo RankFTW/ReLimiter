@@ -903,7 +903,10 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
     bool fg_presenting = g_fg_presenting.load(std::memory_order_relaxed);
     char fg_buf[32] = {};
     if (fg_presenting && fg_mult > 0) {
-        snprintf(fg_buf, sizeof(fg_buf), "FG %dx", fg_mult + 1);
+        // Use actual driver multiplier when available (handles control panel overrides)
+        int actual = g_fg_actual_multiplier.load(std::memory_order_relaxed);
+        int display_mult = (actual >= 2) ? actual : (fg_mult + 1);
+        snprintf(fg_buf, sizeof(fg_buf), "%dx", display_mult);
         fg_label = fg_buf;
     }
 

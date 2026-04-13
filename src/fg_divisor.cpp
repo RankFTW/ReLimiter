@@ -43,8 +43,18 @@ int ComputeFGDivisorRaw() {
 
     bool presenting = g_fg_presenting.load(std::memory_order_relaxed);
     int mult = g_fg_multiplier.load(std::memory_order_relaxed);
-    if (presenting && mult > 0)
-        return mult + 1; // 1→2×, 2→3×, 3→4×, ..., 5→6×
+    if (presenting && mult > 0) {
+        // Prefer the driver's actual multiplier from GetState when available.
+        // When FG is forced to a higher level via the NVIDIA control panel,
+        // the game's SetOptions numFrames (g_fg_multiplier) reports the
+        // game-requested value, but the driver actually presents more frames.
+        // g_fg_actual_multiplier is numFramesActuallyPresented from GetState
+        // — the ground truth for how many frames reach the display.
+        int actual = g_fg_actual_multiplier.load(std::memory_order_relaxed);
+        if (actual >= 2)
+            return actual; // already a divisor (e.g., 4 = 4x output)
+        return mult + 1;  // fallback: 1→2×, 2→3×, 3→4×
+    }
     return 1;
 }
 
