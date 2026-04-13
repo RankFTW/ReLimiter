@@ -12,6 +12,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 # Full source list with minimal dllmain to test static init freeze
 set(ADDON_SOURCES
     src/dllmain.cpp
+    src/adaptive_smoothing.cpp
     src/cadence_meter.cpp
     src/ceiling_margin.cpp
     src/config.cpp
@@ -94,6 +95,7 @@ endif()
 # ── DLL target ──
 add_library(relimiter SHARED
     ${ADDON_SOURCES}
+    src/version.rc
 )
 
 # ── Output as .addon ──
@@ -160,3 +162,6 @@ target_link_libraries(relimiter PRIVATE
 )
 
 # ── MinHook C files: handled by minhook_static target ──
+
+# ── Tests (standalone, no DLL dependency) ──
+add_subdirectory(tests)

@@ -1,6 +1,7 @@
 #include "enforcement_dispatcher.h"
 #include "vk_enforce.h"
 #include "pcl_hooks.h"
+#include "streamline_hooks.h"
 #include "health.h"
 #include "flush.h"
 #include "wake_guard.h"
@@ -116,6 +117,10 @@ void EnfDisp_OnPresent(int64_t now_qpc) {
         // Output FPS: simply the count of presents in the window
         g_output_fps.store(static_cast<double>(wcount), std::memory_order_relaxed);
     }
+
+    // DMFG passthrough: skip enforcement dispatch, FPS counter already updated
+    if (IsDmfgActive())
+        return;
 
     // If path was set to None by a full teardown, don't re-evaluate.
     // A late present callback after destroy_swapchain must not resurrect

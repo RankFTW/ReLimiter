@@ -18,19 +18,22 @@ ReLimiter intercepts frame delivery between the game and the display driver. For
 - FPS target with VRR-safe cap calculation
 - Background FPS cap when alt-tabbed
 - VSync override (Game / Off / On)
-- DLSS Frame Generation aware pacing
-- In-game OSD (FPS, frametime, PQI, latency, etc.)
+- DLSS Frame Generation aware pacing (static and Dynamic MFG)
+- Adaptive Smoothing — P99-based interval extension for micro-stutter reduction
+- DMFG Output Cap — limit display FPS while preserving the dynamic multiplier
+- NVIDIA Smooth Motion detection and pacing
+- In-game OSD (FPS, frametime, PQI, latency, FG status, adaptive smoothing, etc.)
 - ReShade settings panel with full configuration
 - Per-frame CSV telemetry recording
+- Advanced logging toggle for troubleshooting
 - Configurable via INI
 
 ## Known Limitations / WIP
 
-- **No DMFG support** — DLSS Dynamic Multi Frame Generation is not supported
-- **Smooth Motion** — Shows incorrect FPS. Cap to half of Reflex cap as a workaround
 - **Some Vulkan games** — Older Vulkan titles may not work. Newer ones should be fine
 - **Latency** — Not higher than native Reflex, but not actively optimized beyond that yet
 - **OpenGL** — VSync override may not work on all games depending on how they manage swap intervals
+- **Adaptive Smoothing** — DX12+Reflex only. Not available on DX11, Vulkan, or OpenGL paths
 
 ## Building From Source
 

@@ -1,6 +1,8 @@
 #include "config.h"
 #include "scheduler.h"
+#include "streamline_hooks.h"
 #include "wake_guard.h"
+#include "adaptive_smoothing.h"
 #include "logger.h"
 #include <Windows.h>
 #include <string>
@@ -107,6 +109,11 @@ void ValidateConfig() {
     // ── Logging ──
     static const char* log_levels[] = {"error", "warn", "info", "debug"};
     ValidateEnum(g_config.log_level, log_levels, 4, "info");
+
+    // ── Adaptive Smoothing ──
+    g_config.smoothing_percentile = Clamp(g_config.smoothing_percentile, 0.50, 0.999);
+    static const char* smoothing_windows[] = {"medium", "dual"};
+    ValidateEnum(g_config.smoothing_window, smoothing_windows, 2, "medium");
 }
 
 bool Config_IsFirstLaunch() { return s_first_launch; }
@@ -137,8 +144,8 @@ void LoadConfig(HMODULE hModule) {
     g_config.osd_x                   = static_cast<float>(ReadINIDouble(S, "osd_x", 0.005, P));
     g_config.osd_y                   = static_cast<float>(ReadINIDouble(S, "osd_y", 0.005, P));
     g_config.osd_opacity             = static_cast<float>(ReadINIDouble(S, "osd_opacity", 0.6, P));
-    g_config.osd_toggle_key          = ReadINIString(S, "osd_toggle_key", "F12", P);
-    g_config.osd_show_fps            = ReadINIBool(S, "osd_show_fps", false, P);
+    g_config.osd_toggle_key          = ReadINIString(S, "osd_toggle_key", "PageUp", P);
+    g_config.osd_show_fps            = ReadINIBool(S, "osd_show_fps", true, P);
     g_config.osd_show_frametime      = ReadINIBool(S, "osd_show_frametime", false, P);
     g_config.osd_show_frametime_graph = ReadINIBool(S, "osd_show_frametime_graph", false, P);
     g_config.osd_show_fg             = ReadINIBool(S, "osd_show_fg", false, P);
@@ -159,6 +166,12 @@ void LoadConfig(HMODULE hModule) {
     g_config.csv_enabled             = ReadINIBool(S, "csv_enabled", false, P);
     g_config.reflex_inject           = ReadINIBool(S, "reflex_inject", false, P);
     g_config.flip_model_override     = ReadINIBool(S, "flip_model_override", false, P);
+    g_config.dynamic_mfg_passthrough = ReadINIBool(S, "dynamic_mfg_passthrough", false, P);
+    g_config.dmfg_output_cap         = ReadINIInt(S, "dmfg_output_cap", 0, P);
+    g_config.adaptive_smoothing      = ReadINIBool(S, "adaptive_smoothing", false, P);
+    g_config.smoothing_percentile    = ReadINIDouble(S, "smoothing_percentile", 0.99, P);
+    g_config.smoothing_window        = ReadINIString(S, "smoothing_window", "medium", P);
+    g_config.osd_show_adaptive_smoothing = ReadINIBool(S, "osd_show_adaptive_smoothing", false, P);
 
     LOG_INFO("Config: values read, calling ApplyConfig...");
     ValidateConfig();
@@ -206,6 +219,12 @@ void SaveConfig() {
     WriteINIBool(S, "csv_enabled", g_config.csv_enabled, P);
     WriteINIBool(S, "reflex_inject", g_config.reflex_inject, P);
     WriteINIBool(S, "flip_model_override", g_config.flip_model_override, P);
+    WriteINIBool(S, "dynamic_mfg_passthrough", g_config.dynamic_mfg_passthrough, P);
+    WriteINIInt(S, "dmfg_output_cap", g_config.dmfg_output_cap, P);
+    WriteINIBool(S, "adaptive_smoothing", g_config.adaptive_smoothing, P);
+    WriteINIDouble(S, "smoothing_percentile", g_config.smoothing_percentile, P);
+    WriteINIString(S, "smoothing_window", g_config.smoothing_window.c_str(), P);
+    WriteINIBool(S, "osd_show_adaptive_smoothing", g_config.osd_show_adaptive_smoothing, P);
 }
 
 void ApplyConfig() {
@@ -214,4 +233,17 @@ void ApplyConfig() {
     g_background_fps.store(g_config.background_fps, std::memory_order_relaxed);
     g_adaptive_wake_guard.base = g_config.initial_wake_guard_us;
     Log_SetLevel(Log_ParseLevel(g_config.log_level.c_str()));
+
+    // Force DMFG passthrough mode when config toggle is enabled
+    if (g_config.dynamic_mfg_passthrough)
+        g_fg_mode.store(2, std::memory_order_relaxed);
+
+    // DMFG output cap
+    g_dmfg_output_cap.store(g_config.dmfg_output_cap, std::memory_order_relaxed);
+
+    // Adaptive smoothing
+    g_adaptive_smoothing.SetConfig(
+        g_config.smoothing_window == "dual",
+        g_config.smoothing_percentile,
+        g_config.adaptive_smoothing);
 }

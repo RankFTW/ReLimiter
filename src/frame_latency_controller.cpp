@@ -1,4 +1,5 @@
 #include "frame_latency_controller.h"
+#include "streamline_hooks.h"
 #include "logger.h"
 #include <Windows.h>
 #include <dxgi.h>
@@ -163,6 +164,14 @@ void FLC_OnSwapchainInit(uint64_t native_handle, ActiveAPI api) {
 
     if (!native_handle) {
         LOG_WARN("FLC: init called with null handle");
+        return;
+    }
+
+    // DMFG passthrough: preserve game's requested queue depth
+    if (IsDmfgActive()) {
+        uint32_t game_lat = g_game_requested_latency.load(std::memory_order_relaxed);
+        LOG_INFO("FLC: DMFG passthrough — preserving game latency %u (skipping override to 1)", game_lat);
+        s_applied = true;
         return;
     }
 

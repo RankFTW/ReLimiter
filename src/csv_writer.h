@@ -51,6 +51,10 @@ struct FrameRow {
     double   reflex_ai_frame_time_us;      // DLSS FG time (0 when FG inactive)
     double   reflex_cpu_latency_us;        // simStart→presentStart (full CPU latency)
     double   gate_margin_us;               // adaptive gate margin used this frame
+    // ── Adaptive smoothing ──
+    double   smoothing_offset_us;          // P99-based interval extension (0 when disabled)
+    double   p99_render_time_us;           // raw P99 of render time distribution
+    double   total_frame_cost_us;          // simStart → gpuRenderEnd (Reflex)
 };
 
 // Initialize CSV writer. Starts background thread.

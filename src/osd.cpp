@@ -23,6 +23,8 @@
 #include "reflex_inject.h"
 #include "presentation_gate.h"
 #include "flip_model.h"
+#include "adaptive_smoothing.h"
+#include "logger.h"
 #include <string>
 #include <atomic>
 #include <algorithm>
@@ -407,6 +409,143 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     }
 
     // ════════════════════════════════════════════
+    // SECTION: Adaptive Smoothing (collapsible)
+    // ════════════════════════════════════════════
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Adaptive Smoothing")) {
+        bool adaptive = g_config.adaptive_smoothing;
+        if (ImGui::Checkbox("Enable##adaptive", &adaptive)) {
+            g_config.adaptive_smoothing = adaptive;
+            g_adaptive_smoothing.SetConfig(
+                g_config.smoothing_window == "dual",
+                g_config.smoothing_percentile,
+                adaptive);
+            config_dirty = true;
+        }
+        if (g_adaptive_smoothing.IsWarm() && g_config.adaptive_smoothing) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(+%.1f us)",
+                               g_smoothing_offset_us.load(std::memory_order_relaxed));
+        }
+        HelpTip("P99-based adaptive interval extension. Extends the target interval "
+                "so 99%% of frames complete within it, reducing micro-stutters from "
+                "render time variance. DX12+Reflex path only.");
+
+        if (g_config.adaptive_smoothing) {
+            if (ImGui::Checkbox("Show on OSD##adaptive", &g_config.osd_show_adaptive_smoothing))
+                config_dirty = true;
+            HelpTip("Show adaptive smoothing offset and P99 render time on the in-game overlay.");
+
+            // Percentile slider
+            float pct = static_cast<float>(g_config.smoothing_percentile * 100.0);
+            if (ImGui::SliderFloat("Percentile##adaptive", &pct, 50.0f, 99.9f, "P%.1f")) {
+                g_config.smoothing_percentile = static_cast<double>(pct) / 100.0;
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                g_adaptive_smoothing.SetConfig(
+                    g_config.smoothing_window == "dual",
+                    g_config.smoothing_percentile,
+                    g_config.adaptive_smoothing);
+                config_dirty = true;
+            }
+            HelpTip("Target percentile for the threshold. P99 = 99%% of frames fit within the interval. Lower = more headroom, higher = tighter.");
+
+            // Window mode combo
+            const char* win_labels[] = {"Medium (256)", "Dual (64+512)"};
+            int current_win = (g_config.smoothing_window == "dual") ? 1 : 0;
+            if (ImGui::BeginCombo("Window##adaptive", win_labels[current_win])) {
+                for (int i = 0; i < 2; i++) {
+                    bool selected = (current_win == i);
+                    if (ImGui::Selectable(win_labels[i], selected)) {
+                        g_config.smoothing_window = (i == 1) ? "dual" : "medium";
+                        g_adaptive_smoothing.SetConfig(
+                            i == 1,
+                            g_config.smoothing_percentile,
+                            g_config.adaptive_smoothing);
+                        config_dirty = true;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            HelpTip("Medium: single 256-frame window (~4s). Dual: short 64 + long 512 window, uses max of both P99s for robustness against scene changes.");
+        }
+    }
+
+    // ════════════════════════════════════════════
+    // SECTION: Frame Generation (collapsible)
+    // ════════════════════════════════════════════
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Dynamic MFG")) {
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
+            "Ensure DMFG is enabled in the NVIDIA App or NVPI before activating.");
+        ImGui::Spacing();
+        // DMFG Compatibility toggle
+        bool dmfg_pass = g_config.dynamic_mfg_passthrough;
+        if (ImGui::Checkbox("DMFG Compatibility", &dmfg_pass)) {
+            g_config.dynamic_mfg_passthrough = dmfg_pass;
+            if (dmfg_pass)
+                g_fg_mode.store(2, std::memory_order_relaxed);
+            else
+                g_fg_mode.store(0, std::memory_order_relaxed);
+            config_dirty = true;
+        }
+        // Status indicator
+        if (IsDmfgActive()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(Active)");
+        } else if (g_config.dynamic_mfg_passthrough) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Forced)");
+        }
+        HelpTip("Required for DLSS Dynamic Multi Frame Generation (DMFG). "
+                "Hands frame pacing to the driver so it can freely adjust the FG multiplier. "
+                "Set the Output Cap below to cap output FPS (e.g. to your VRR ceiling) "
+                "while keeping the dynamic multiplier intact. "
+                "ReLimiter continues providing OSD, telemetry, and FG detection. "
+                "Auto-detected for most games; enable manually if detection misses.");
+
+        // DMFG Output Cap slider — always visible in this section
+        {
+            ImGui::Spacing();
+            static int s_cap_edit = g_config.dmfg_output_cap;
+            static bool s_cap_active = false;
+            if (!s_cap_active)
+                s_cap_edit = g_config.dmfg_output_cap;
+
+            char cap_fmt[32];
+            if (s_cap_edit == 0)
+                snprintf(cap_fmt, sizeof(cap_fmt), "Off");
+            else
+                snprintf(cap_fmt, sizeof(cap_fmt), "%%d");
+            ImGui::SliderInt("DMFG Output Cap", &s_cap_edit, 0, 360, cap_fmt);
+            s_cap_active = ImGui::IsItemActive();
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                if (s_cap_edit > 0 && s_cap_edit < 30) s_cap_edit = 30;
+                g_config.dmfg_output_cap = s_cap_edit;
+                g_dmfg_output_cap.store(s_cap_edit, std::memory_order_relaxed);
+                config_dirty = true;
+            }
+
+            // VRR quick-set button
+            if (reflex_cap > 0) {
+                ImGui::SameLine();
+                char vrr_label[32];
+                snprintf(vrr_label, sizeof(vrr_label), "VRR (%d)", reflex_cap);
+                if (ImGui::Button(vrr_label)) {
+                    s_cap_edit = reflex_cap;
+                    g_config.dmfg_output_cap = reflex_cap;
+                    g_dmfg_output_cap.store(reflex_cap, std::memory_order_relaxed);
+                    config_dirty = true;
+                }
+            }
+
+            HelpTip("Cap the output (display) FPS when DMFG is active. "
+                    "Set to your VRR ceiling (e.g. 157) to prevent tearing above the VRR window. "
+                    "0 = no cap (full passthrough).");
+        }
+    }
+
+    // ════════════════════════════════════════════
     // SECTION 4: Advanced (collapsible)
     // ════════════════════════════════════════════
     ImGui::Separator();
@@ -449,15 +588,26 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 "May break some games that use GDI interop or MSAA. "
                 "Requires game restart to take effect.");
 
-        // Advanced Logging toggle
+        // Telemetry Logging toggle
         ImGui::Spacing();
         bool csv = g_config.csv_enabled;
-        if (ImGui::Checkbox("Advanced Logging", &csv)) {
+        if (ImGui::Checkbox("Telemetry Logging", &csv)) {
             g_config.csv_enabled = csv;
             CSV_SetEnabled(csv);
             config_dirty = true;
         }
         HelpTip("Enable per-frame CSV telemetry recording. Toggle in-game with the CSV hotkey (default F11).");
+
+        // Advanced Logging toggle (log_level: warn <-> info)
+        bool info_logging = (g_config.log_level == "info");
+        if (ImGui::Checkbox("Advanced Logging", &info_logging)) {
+            g_config.log_level = info_logging ? "info" : "warn";
+            Log_SetLevel(Log_ParseLevel(g_config.log_level.c_str()));
+            config_dirty = true;
+        }
+        HelpTip("When enabled, the log file records detailed info-level messages. "
+                "When disabled, only warnings and errors are logged. "
+                "Enable this before reporting issues.");
     }
 
     // ════════════════════════════════════════════
@@ -753,16 +903,25 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
     if (!g_config.osd_enabled) return;
 
     // Real FPS from enforcement-to-enforcement interval (CPU frames only)
+    // EMA-smoothed so the OSD number is readable instead of flickering.
     double ft = g_actual_frame_time_us.load(std::memory_order_relaxed);
-    if (ft > 0.0)
-        s_real_fps = 1000000.0 / ft;
+    if (ft > 0.0) {
+        double instant_fps = 1000000.0 / ft;
+        if (s_real_fps > 0.0)
+            s_real_fps += 0.02 * (instant_fps - s_real_fps);
+        else
+            s_real_fps = instant_fps;
+    }
 
     const char* fg_label = "off";
     int fg_mult = g_fg_multiplier.load(std::memory_order_relaxed);
     bool fg_presenting = g_fg_presenting.load(std::memory_order_relaxed);
     char fg_buf[32] = {};
     if (fg_presenting && fg_mult > 0) {
-        snprintf(fg_buf, sizeof(fg_buf), "FG %dx", fg_mult + 1);
+        // Use actual driver multiplier when available (handles control panel overrides)
+        int actual = g_fg_actual_multiplier.load(std::memory_order_relaxed);
+        int display_mult = (actual >= 2) ? actual : (fg_mult + 1);
+        snprintf(fg_buf, sizeof(fg_buf), "%dx", display_mult);
         fg_label = fg_buf;
     }
 
@@ -795,7 +954,9 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         s_ft_history_idx = (s_ft_history_idx + 1) % FT_HISTORY_SIZE;
         if (ft > 0.0) {
             double display_ft = ft;
-            if (fg_presenting && fg_mult > 0)
+            if (IsNvSmoothMotionActive())
+                display_ft = ft / 2.0;  // SM always 2x
+            else if (fg_presenting && fg_mult > 0)
                 display_ft = ft / static_cast<double>(fg_mult + 1);
             s_low_history[s_low_history_idx] = display_ft;
             s_low_history_idx = (s_low_history_idx + 1) % LOW_HISTORY_SIZE;
@@ -808,7 +969,21 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         if (g_config.osd_show_fps) {
             double output = g_output_fps.load(std::memory_order_relaxed);
             char buf[64];
-            if (output > 0.0 && fg_presenting && fg_mult > 0)
+            if (IsNvSmoothMotionActive()) {
+                // Smooth Motion: s_real_fps is the render rate, SM doubles at driver level
+                snprintf(buf, sizeof(buf), "%.1f fps (%.1f render)", s_real_fps * 2.0, s_real_fps);
+            } else if (IsDmfgActive() && output > 0.0) {
+                // DMFG: derive render FPS from output / multiplier.
+                // s_real_fps is enforcement-to-enforcement which in passthrough
+                // mode measures CPU submission rate, not actual render rate.
+                int actual_mult = g_fg_actual_multiplier.load(std::memory_order_relaxed);
+                double render_fps;
+                if (actual_mult >= 2)
+                    render_fps = output / static_cast<double>(actual_mult);
+                else
+                    render_fps = s_real_fps;  // fallback if multiplier unknown
+                snprintf(buf, sizeof(buf), "%.1f fps (%.1f render)", output, render_fps);
+            } else if (output > 0.0 && fg_presenting && fg_mult > 0)
                 snprintf(buf, sizeof(buf), "%.1f fps (%.1f render)", output, s_real_fps);
             else
                 snprintf(buf, sizeof(buf), "%.1f fps", s_real_fps);
@@ -844,19 +1019,20 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
 
         // ═══════════════════════════════════
         // QUALITY (green/yellow/red)
+        // — hidden during DMFG passthrough (scheduler isn't pacing, scores are meaningless)
         // ═══════════════════════════════════
         PQIScores pqi = {};
-        if (g_config.osd_show_pqi || g_config.osd_show_pqi_breakdown)
+        if (!IsDmfgActive() && (g_config.osd_show_pqi || g_config.osd_show_pqi_breakdown))
             pqi = PQI_GetRolling();
 
-        if (g_config.osd_show_pqi) {
+        if (!IsDmfgActive() && g_config.osd_show_pqi) {
             ImVec4 pqi_color = PQIColor(pqi.pqi / 100.0);
             char buf[32];
             snprintf(buf, sizeof(buf), "PQI: %.0f%%", pqi.pqi);
             OSDTextColored(pqi_color, buf);
         }
 
-        if (g_config.osd_show_pqi && g_config.osd_show_pqi_breakdown) {
+        if (!IsDmfgActive() && g_config.osd_show_pqi && g_config.osd_show_pqi_breakdown) {
             char buf[64];
             snprintf(buf, sizeof(buf), " Cadence: %.0f%%", pqi.cadence * 100.0);
             OSDTextColored(PQIColor(pqi.cadence), buf);
@@ -885,17 +1061,62 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         // PIPELINE (light blue)
         // ═══════════════════════════════════
         if (g_config.osd_show_fg) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "FG: %s", fg_label);
+            char buf[48];
+            if (IsNvSmoothMotionActive()) {
+                snprintf(buf, sizeof(buf), "FG: Smooth Motion");
+            } else if (IsDmfgActive()) {
+                int actual_mult = g_fg_actual_multiplier.load(std::memory_order_relaxed);
+                int cap = g_dmfg_output_cap.load(std::memory_order_relaxed);
+                if (cap > 0) {
+                    if (actual_mult >= 2)
+                        snprintf(buf, sizeof(buf), "FG: Dynamic %dx [Cap: %d]", actual_mult, cap);
+                    else
+                        snprintf(buf, sizeof(buf), "FG: Dynamic [Cap: %d]", cap);
+                } else {
+                    if (actual_mult >= 2)
+                        snprintf(buf, sizeof(buf), "FG: Dynamic %dx", actual_mult);
+                    else {
+                        double output = g_output_fps.load(std::memory_order_relaxed);
+                        if (output > 0.0 && s_real_fps > 1.0) {
+                            int inferred = static_cast<int>(output / s_real_fps + 0.5);
+                            if (inferred >= 2 && inferred <= 8)
+                                snprintf(buf, sizeof(buf), "FG: Dynamic %dx", inferred);
+                            else
+                                snprintf(buf, sizeof(buf), "FG: Dynamic");
+                        } else {
+                            snprintf(buf, sizeof(buf), "FG: Dynamic");
+                        }
+                    }
+                }
+            } else {
+                snprintf(buf, sizeof(buf), "FG: %s", fg_label);
+            }
             OSDTextColored(ColPipeline(), buf);
         }
 
-        if (g_config.osd_show_limiter) {
+        if (g_config.osd_show_limiter && !IsDmfgActive()) {
             char buf[48];
             snprintf(buf, sizeof(buf), "Limiter: +%.1f ms  T%d", limiter_added_ms, tier);
             OSDTextColored(ColPipeline(), buf);
             if (overload)
                 OSDTextColored(ColStatus(), "OVERLOAD");
+        }
+
+        if (g_config.osd_show_adaptive_smoothing && g_config.adaptive_smoothing) {
+            double offset = g_smoothing_offset_us.load(std::memory_order_relaxed);
+            double p99 = g_smoothing_p99_us.load(std::memory_order_relaxed);
+            if (g_adaptive_smoothing.IsWarm()) {
+                const char* mode = g_adaptive_smoothing.dual_mode ? "Dual" : "Med";
+                double pct = g_adaptive_smoothing.target_percentile * 100.0;
+                char buf[64];
+                snprintf(buf, sizeof(buf), "Adaptive: +%.1f us (P%.0f: %.1f ms) [%s]",
+                         offset, pct, p99 / 1000.0, mode);
+                float b = g_config.osd_text_brightness;
+                ImVec4 col = (offset < 100.0)
+                    ? ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f)
+                    : ImVec4(0.9f*b, 0.9f*b, 0.2f*b, 1.0f);
+                OSDTextColored(col, buf);
+            }
         }
 
 

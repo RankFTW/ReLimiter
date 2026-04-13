@@ -1,5 +1,6 @@
 #include "streamline_hooks.h"
 #include "hooks.h"
+#include "config.h"
 #include "flush.h"
 #include "logger.h"
 #include <cstring>
@@ -8,6 +9,15 @@
 std::atomic<int>  g_fg_multiplier{0};
 std::atomic<bool> g_fg_active{false};
 std::atomic<bool> g_fg_presenting{false};
+
+// DMFG state — DLSSGMode: 0=eOff, 1=eOn (static FG), 2=eAuto (Dynamic MFG)
+std::atomic<int>  g_fg_mode{0};
+
+// Game's requested MaxFrameLatency, captured by FLC vtable hook
+std::atomic<uint32_t> g_game_requested_latency{0};
+
+// Driver-reported actual FG multiplier from GetState
+std::atomic<int> g_fg_actual_multiplier{0};
 
 // Track numFramesActuallyPresented to detect real FG frame production.
 // Per the Streamline SDK header (sl_dlss_g.h), this field reports the
@@ -63,6 +73,27 @@ static sl_Result __cdecl Detour_SetOptions(const void* vp, const void* opts) {
     }
     __try {
         if (result == sl_eOk && opts) {
+            // Read mode field at offset +32 (DLSSGMode: 0=eOff, 1=eOn, 2=eAuto)
+            uint32_t mode = *reinterpret_cast<const uint32_t*>(
+                reinterpret_cast<const uint8_t*>(opts) + 32);
+
+            // Only update g_fg_mode from Streamline if the user hasn't manually
+            // enabled Dynamic MFG passthrough. The user toggle takes priority.
+            if (!g_config.dynamic_mfg_passthrough) {
+                static uint32_t s_prev_mode = UINT32_MAX;
+                g_fg_mode.store(static_cast<int>(mode), std::memory_order_relaxed);
+                if (mode != s_prev_mode) {
+                    const char* mode_str = (mode == 0) ? "Off"
+                                         : (mode == 1) ? "On"
+                                         : (mode == 2) ? "Auto(Dynamic)"
+                                         : "Unknown";
+                    LOG_INFO("DLSSG mode changed: %u -> %u (%s)%s",
+                             s_prev_mode == UINT32_MAX ? 0 : s_prev_mode, mode, mode_str,
+                             mode == 2 ? " — Dynamic MFG active" : "");
+                    s_prev_mode = mode;
+                }
+            }
+
             int numFrames = *reinterpret_cast<const int*>(
                 reinterpret_cast<const uint8_t*>(opts) + 36);
             int prev = g_fg_multiplier.exchange(numFrames, std::memory_order_relaxed);
@@ -145,6 +176,15 @@ static sl_Result __cdecl Detour_GetState(const void* vp, void* state, const void
                 uint32_t frames_presented = *reinterpret_cast<const uint32_t*>(p + 48);
                 bool presenting = (frames_presented > 1);
                 bool prev_presenting = g_fg_presenting.exchange(presenting, std::memory_order_relaxed);
+
+                // Store actual runtime multiplier, clamped to [0, 6].
+                // This is the driver's real dynamic FG ratio — independent of render pacing.
+                int clamped_mult = static_cast<int>((std::min)(frames_presented, 6u));
+                int prev_mult = g_fg_actual_multiplier.exchange(clamped_mult, std::memory_order_relaxed);
+                if (clamped_mult != prev_mult) {
+                    LOG_INFO("FG actual multiplier changed: %d -> %d (raw numFramesActuallyPresented=%u)",
+                             prev_mult, clamped_mult, frames_presented);
+                }
 
                 // If GetState confirms FG is presenting, mark confirmed
                 // so the deferred inference from SetOptions is validated.
@@ -286,4 +326,28 @@ void HookStreamlinePCL(HMODULE hInterposer) {
             LOG_INFO("Streamline: proactively hooked slDLSSGGetState");
         }
     }
+}
+
+// ── DMFG detection functions ──
+
+bool IsFGDllLoaded() {
+    if (GetModuleHandleW(L"nvngx_dlssg.dll"))  return true;
+    if (GetModuleHandleW(L"_nvngx_dlssg.dll")) return true;
+    if (GetModuleHandleW(L"sl.dlss_g.dll"))    return true;
+    if (GetModuleHandleW(L"dlss-g.dll"))       return true;
+    return false;
+}
+
+bool IsDmfgSession() {
+    return g_game_requested_latency.load(std::memory_order_relaxed) >= 4
+        && !IsFGDllLoaded();
+}
+
+bool IsDmfgActive() {
+    return g_fg_mode.load(std::memory_order_relaxed) == 2
+        || IsDmfgSession();
+}
+
+bool IsNvSmoothMotionActive() {
+    return GetModuleHandleW(L"nvpresent64.dll") != nullptr;
 }

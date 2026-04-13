@@ -16,6 +16,12 @@ double GetLastScanoutErrorUs();
 // Returns true if Reflex GetLatency has successfully fed cadence data.
 bool IsReflexCadenceActive();
 
+// ── DMFG-only: Reflex GPU frame time scan ──
+// Lightweight Reflex ring scan that only extracts gpuFrameTimeUs for
+// DMFG multiplier detection. Does not feed cadence meter or pipeline
+// timing — safe to call from the DMFG path without affecting non-DMFG.
+void PollReflexGpuFrameTime();
+
 // ── Reflex pipeline timing (DX12 only) ──
 // Direct per-frame measurements from NvAPI GetLatency, replacing the
 // slow EMA-based presentation latency correction in the scheduler.
@@ -49,6 +55,17 @@ extern std::atomic<double> g_reflex_ai_frame_time_us;
 // Full CPU latency: simStart → presentStart. Total CPU-side frame time.
 extern std::atomic<double> g_reflex_cpu_latency_us;
 
+// Total frame cost: simStart → gpuRenderEnd.
+// Includes sim + render submit + driver + GPU execution. Excludes our sleep,
+// gate hold, and present call overhead. This is the ground truth for how
+// long a frame actually costs, used by adaptive smoothing.
+extern std::atomic<double> g_reflex_total_frame_cost_us;
+
 // Present-end QPC timestamp. Closest proxy for when the frame entered
 // the driver's flip queue. Used for scanout-anchored deadline.
 extern std::atomic<int64_t> g_reflex_present_end_qpc;
+
+// GPU frame time from Reflex ring buffer. Measures the real render cadence
+// (time between consecutive GPU frame completions) unaffected by output caps.
+// Used by DMFG to derive the true FG multiplier without uncap probes.
+extern std::atomic<double> g_reflex_gpu_frame_time_us;

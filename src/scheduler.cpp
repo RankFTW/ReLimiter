@@ -25,6 +25,9 @@
 #include "pqi.h"
 #include "baseline.h"
 #include "reflex_inject.h"
+#include "streamline_hooks.h"
+#include "adaptive_smoothing.h"
+#include "config.h"
 #include "logger.h"
 #include <Windows.h>
 #include <algorithm>
@@ -34,6 +37,7 @@
 // ── User config ──
 std::atomic<int>    g_user_target_fps{0};
 std::atomic<int>    g_background_fps{30};
+std::atomic<int>    g_dmfg_output_cap{0};
 std::atomic<bool>   g_overload_active_flag{false};
 std::atomic<double> g_actual_frame_time_us{0.0};
 std::atomic<double> g_effective_interval_us{0.0};
@@ -102,6 +106,28 @@ static int64_t s_last_scanout_anchor_qpc = 0;
 // the deadline advance) rather than patching the wake target.
 static double s_prev_frame_deviation_us = 0.0;
 
+// ── DMFG output cap JIT predictor state ──
+static double s_ema_render_cost = 0.0;         // EMA of native render cost (µs)
+static double s_last_own_sleep_cap_us = 0.0;   // sleep time from last cap frame
+static int    s_prev_cap_mult = 0;             // for logging multiplier transitions
+static int    s_prev_output_cap = 0;           // for detecting cap 0↔nonzero transitions
+
+// ── EMA-smoothed actual multiplier ──
+static double s_ema_mult = 0.0;
+
+// ── Output feedback controller (v5) ──
+static double s_interval_correction_us = 0.0;
+static int    s_feedback_frame_counter = 0;
+static constexpr int FEEDBACK_TICK_FRAMES = 15;
+static constexpr double FEEDBACK_MAX_CORRECTION = 30000.0;
+
+// ── Periodic uncap probe ──
+static int  s_uncap_frame_counter = 0;
+static bool s_uncap_active = false;
+static int  s_probe_suppress_countdown = 0;  // frames remaining to suppress OSD updates
+static constexpr int UNCAP_INTERVAL_FRAMES = 300; // ~5s at ~60fps render
+static constexpr int PROBE_SUPPRESS_FRAMES = 6;  // suppress OSD for probe + reconvergence
+
 // ── Forward declarations ──
 static void OnMarker_VRR(uint64_t frameID, int64_t now);
 static void OnMarker_Fixed(uint64_t frameID, int64_t now);
@@ -134,6 +160,215 @@ void OnMarker(uint64_t frameID, int64_t now) {
         LARGE_INTEGER qpc_now;
         QueryPerformanceCounter(&qpc_now);
         g_predictor.OnEnforcement(frameID, qpc_now.QuadPart);
+        return;
+    }
+
+    // ── DMFG: passthrough or output cap pacing ──
+    if (IsDmfgActive()) {
+        static bool s_dmfg_logged = false;
+        if (!s_dmfg_logged) {
+            LOG_WARN("DMFG active — passthrough/cap mode");
+            s_dmfg_logged = true;
+        }
+
+        // Disable the presentation gate — we're not pacing, stale deadlines
+        // from a previous non-DMFG session could cause spurious holds.
+        g_next_deadline.store(0, std::memory_order_relaxed);
+        g_skip_present_gate.store(true, std::memory_order_relaxed);
+
+        CheckDeferredFGInference();
+
+        LARGE_INTEGER qpc_now;
+        QueryPerformanceCounter(&qpc_now);
+        int64_t ts = qpc_now.QuadPart;
+
+        double telemetry_ft = (s_prev_enforcement_ts > 0)
+            ? qpc_to_us(ts - s_prev_enforcement_ts) : 0.0;
+
+        int64_t prev_enforcement = s_prev_enforcement_ts;
+
+        s_prev_enforcement_ts = ts;
+        s_last_enforcement_ts = ts;
+
+        // Suppress g_actual_frame_time_us updates during probe + reconvergence
+        // so the OSD doesn't show the spike to the user.
+        if (s_probe_suppress_countdown > 0) {
+            s_probe_suppress_countdown--;
+        } else if (telemetry_ft > 0.0) {
+            g_actual_frame_time_us.store(telemetry_ft, std::memory_order_relaxed);
+        }
+
+        double output_fps = g_output_fps.load(std::memory_order_relaxed);
+        double render_fps = (telemetry_ft > 0.0) ? 1000000.0 / telemetry_ft : 0.0;
+        double real_fg_divisor = 1.0;
+        if (output_fps > 1.0 && render_fps > 1.0) {
+            double ratio = output_fps / render_fps;
+            if (ratio >= 1.5)
+                real_fg_divisor = ratio;
+        }
+
+        int output_cap = g_dmfg_output_cap.load(std::memory_order_relaxed);
+
+        // Periodic uncap probe: remove cap for 1 frame every ~300 render frames (~5s).
+        // OSD suppression (s_probe_suppress_countdown) hides the spike from the user.
+        bool is_probe_frame = false;
+        if (output_cap > 0) {
+            if (s_uncap_active) {
+                output_cap = 0;
+                s_uncap_active = false;
+                is_probe_frame = true;
+                s_probe_suppress_countdown = PROBE_SUPPRESS_FRAMES;
+            } else {
+                s_uncap_frame_counter++;
+                if (s_uncap_frame_counter >= UNCAP_INTERVAL_FRAMES) {
+                    s_uncap_frame_counter = 0;
+                    s_uncap_active = true;
+                    output_cap = 0;
+                    is_probe_frame = true;
+                    s_probe_suppress_countdown = PROBE_SUPPRESS_FRAMES;
+                }
+            }
+        } else {
+            s_uncap_frame_counter = 0;
+            s_uncap_active = false;
+        }
+
+        // Detect cap transitions
+        int real_cap = g_dmfg_output_cap.load(std::memory_order_relaxed);
+        if ((real_cap > 0) != (s_prev_output_cap > 0)) {
+            s_ema_render_cost = 0.0;
+            s_last_own_sleep_cap_us = 0.0;
+            s_prev_cap_mult = 0;
+            s_interval_correction_us = 0.0;
+            s_feedback_frame_counter = 0;
+            s_ema_mult = 0.0;
+            LOG_INFO("DMFG cap transition: %d -> %d, resetting predictor state",
+                     s_prev_output_cap, real_cap);
+        }
+        s_prev_output_cap = real_cap;
+
+        if (output_cap > 0) {
+            int raw_mult = g_fg_actual_multiplier.load(std::memory_order_relaxed);
+            if (raw_mult < 2)
+                raw_mult = ComputeFGDivisorRaw();
+            if (raw_mult < 2)
+                raw_mult = 2;
+            raw_mult = (std::min)(raw_mult, 6);
+
+            if (s_ema_mult < 1.5)
+                s_ema_mult = static_cast<double>(raw_mult);
+            else {
+                double diff = static_cast<double>(raw_mult) - s_ema_mult;
+                if (std::abs(diff) > 1.0)
+                    s_ema_mult += diff * 0.5;
+                else
+                    s_ema_mult += 0.15 * diff;
+            }
+
+            double mult_d = (std::max)(2.0, (std::min)(s_ema_mult, 6.0));
+            int mult = static_cast<int>(mult_d + 0.5);
+            if (mult < 2) mult = 2;
+
+            if (mult != s_prev_cap_mult && s_prev_cap_mult != 0)
+                LOG_INFO("DMFG cap multiplier transition: %d -> %d", s_prev_cap_mult, mult);
+            s_prev_cap_mult = mult;
+
+            double base_interval = (mult_d / static_cast<double>(output_cap)) * 1e6;
+            double target_interval = base_interval + s_interval_correction_us;
+            target_interval = (std::max)(2000.0, (std::min)(target_interval, 200000.0));
+
+            s_feedback_frame_counter++;
+            if (s_feedback_frame_counter >= FEEDBACK_TICK_FRAMES) {
+                s_feedback_frame_counter = 0;
+                double out_fps = g_output_fps.load(std::memory_order_relaxed);
+                if (out_fps > 0.0) {
+                    double overshoot = out_fps - static_cast<double>(output_cap);
+                    if (overshoot > 2.0) {
+                        double step = (std::min)(overshoot * 80.0, 3000.0);
+                        s_interval_correction_us += step;
+                        s_interval_correction_us = (std::min)(s_interval_correction_us, FEEDBACK_MAX_CORRECTION);
+                    } else if (overshoot < -3.0) {
+                        s_interval_correction_us *= 0.50;
+                        if (s_interval_correction_us < 50.0)
+                            s_interval_correction_us = 0.0;
+                    } else {
+                        s_interval_correction_us *= 0.70;
+                        if (s_interval_correction_us < 50.0)
+                            s_interval_correction_us = 0.0;
+                    }
+                }
+            }
+
+            double own_sleep_us = 0.0;
+            if (prev_enforcement > 0) {
+                int64_t wake_target = prev_enforcement + us_to_qpc(target_interval);
+                QueryPerformanceCounter(&qpc_now);
+                int64_t now_qpc = qpc_now.QuadPart;
+                if (wake_target > now_qpc + us_to_qpc(500.0)) {
+                    LARGE_INTEGER qpc_before, qpc_after;
+                    QueryPerformanceCounter(&qpc_before);
+                    DoOwnSleep(wake_target);
+                    QueryPerformanceCounter(&qpc_after);
+                    own_sleep_us = qpc_to_us(qpc_after.QuadPart - qpc_before.QuadPart);
+                }
+            }
+
+            s_last_own_sleep_cap_us = own_sleep_us;
+
+            QueryPerformanceCounter(&qpc_now);
+            s_last_enforcement_ts = qpc_now.QuadPart;
+            s_prev_enforcement_ts = qpc_now.QuadPart;
+            g_predictor.OnEnforcement(frameID, qpc_now.QuadPart);
+
+            double jitter = (telemetry_ft > 0.0 && s_prev_actual_ft > 0.0)
+                ? std::abs(telemetry_ft - s_prev_actual_ft) : 0.0;
+            s_prev_actual_ft = telemetry_ft;
+
+            FrameRow row = {};
+            row.frame_id = frameID;
+            row.timestamp_us = qpc_to_us(qpc_now.QuadPart);
+            row.actual_frame_time_us = telemetry_ft;
+            row.fg_divisor = mult_d;
+            row.predicted_us = g_predictor.predicted_us;
+            row.sleep_duration_us = target_interval;
+            row.overload = 0;
+            row.tier = static_cast<int>(g_current_tier);
+            row.mode = 0;
+            row.jitter_us = jitter;
+            row.predictor_warm = (g_predictor.frame_times_us.Size() >= 8) ? 1 : 0;
+            row.smoothness_us = g_smoothness_us.load(std::memory_order_relaxed);
+            row.own_sleep_us = own_sleep_us;
+            row.api = (SwapMgr_GetActiveAPI() == ActiveAPI::Vulkan) ? 1
+                    : (SwapMgr_GetActiveAPI() == ActiveAPI::DX11) ? 2
+                    : (SwapMgr_GetActiveAPI() == ActiveAPI::OpenGL) ? 3 : 0;
+            CSV_Push(row);
+            return;
+        }
+
+        // Cap=0: passthrough
+        g_predictor.OnEnforcement(frameID, ts);
+
+        double jitter = (telemetry_ft > 0.0 && s_prev_actual_ft > 0.0)
+            ? std::abs(telemetry_ft - s_prev_actual_ft) : 0.0;
+        s_prev_actual_ft = telemetry_ft;
+
+        FrameRow row = {};
+        row.frame_id = frameID;
+        row.timestamp_us = qpc_to_us(ts);
+        row.actual_frame_time_us = telemetry_ft;
+        row.fg_divisor = real_fg_divisor;
+        row.predicted_us = g_predictor.predicted_us;
+        row.sleep_duration_us = 0.0;
+        row.overload = 0;
+        row.tier = static_cast<int>(g_current_tier);
+        row.mode = 0;
+        row.jitter_us = jitter;
+        row.predictor_warm = (g_predictor.frame_times_us.Size() >= 8) ? 1 : 0;
+        row.smoothness_us = g_smoothness_us.load(std::memory_order_relaxed);
+        row.api = (SwapMgr_GetActiveAPI() == ActiveAPI::Vulkan) ? 1
+                : (SwapMgr_GetActiveAPI() == ActiveAPI::DX11) ? 2
+                : (SwapMgr_GetActiveAPI() == ActiveAPI::OpenGL) ? 3 : 0;
+        CSV_Push(row);
         return;
     }
 
@@ -229,34 +464,6 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
             LOG_WARN("Target FPS change: %d -> %d, flushing scheduler state",
                      s_last_target_fps, target_fps);
 
-        // ── Scheduler transition forwarding (Req 9.4, 9.5) ──
-        // When transitioning active→uncapped, forward the game's last-known
-        // Reflex params to the driver so JIT pacing is re-enabled.
-        // When transitioning uncapped→active, MaybeUpdateSleepMode will apply
-        // our overrides on the next enforcement frame (end of VRR loop).
-        if (fps_changed) {
-            bool was_active = s_last_target_fps > 0;
-            bool now_uncapped = target_fps == 0;
-            if (was_active && now_uncapped) {
-                // Active → uncapped: restore game's Reflex settings immediately
-                NV_SET_SLEEP_MODE_PARAMS* game_params = NvAPI_GetGameSleepParams();
-                if (g_dev && s_orig_sleep_mode && game_params) {
-                    LOG_INFO("Scheduler transition active->uncapped: forwarding game sleep params "
-                             "(lowLatency=%d, boost=%d, interval=%u)",
-                             game_params->bLowLatencyMode, game_params->bLowLatencyBoost,
-                             game_params->minimumIntervalUs);
-                    __try {
-                        InvokeSetSleepMode(g_dev, game_params);
-                    } __except(EXCEPTION_EXECUTE_HANDLER) {
-                        LOG_WARN("Scheduler transition forward failed (device transitional)");
-                    }
-                }
-            } else if (!was_active && target_fps > 0) {
-                // Uncapped → active: MaybeUpdateSleepMode handles this at end of VRR loop
-                LOG_INFO("Scheduler transition uncapped->active: MaybeUpdateSleepMode will apply overrides");
-            }
-        }
-
         g_predictor.RequestFlush();
         predictor_warm = false;
         s_last_present_deadline = now;
@@ -264,6 +471,7 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         g_cadence_meter.Reset();
         g_ceiling_stress = CeilingStressDetector();
         ResetFeedbackAccumulators();
+        g_adaptive_smoothing.Reset();
         s_miss_ratio = 0.0;
         s_ema_non_sleep_us = 0.0;
         s_ema_present_latency_us = 0.0;
@@ -334,6 +542,25 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     // Publish for presentation gate safety clamp
     g_effective_interval_us.store(effective_interval, std::memory_order_relaxed);
 
+    // ── Adaptive smoothing: P99-based interval extension ──
+    // GPU active render time: the driver-measured shader execution time
+    // excluding idle bubbles between draw calls. This is the ground truth
+    // for how long the GPU actually needs to render the frame — independent
+    // of our sleep, the gate hold, CPU overhead, or pipeline latency.
+    double smoothing_offset = 0.0;
+    if (g_config.adaptive_smoothing &&
+        EnfDisp_GetActivePath() == EnforcementPath::NvAPIMarkers &&
+        predictor_warm) {
+        double gpu_active = g_reflex_gpu_active_us.load(std::memory_order_relaxed);
+        if (gpu_active > 0.0 && gpu_active < effective_interval * 3.0)
+            smoothing_offset = g_adaptive_smoothing.Update(gpu_active, effective_interval);
+        effective_interval += smoothing_offset;
+    }
+
+    // Re-publish with smoothing offset applied
+    if (smoothing_offset > 0.0)
+        g_effective_interval_us.store(effective_interval, std::memory_order_relaxed);
+
     // ── Predictor warmup tracking ──
     // Must be before overload detection so the grace period is available.
     static bool s_predictor_was_cold = true;
@@ -348,6 +575,14 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     }
     if (s_post_warmup_grace > 0)
         s_post_warmup_grace--;
+
+    // ── Regime break: soft reset adaptive smoothing ──
+    // The predictor sets g_regime_break when it detects a workload shift.
+    // Consume the flag and soft-reset the adaptive smoothing window so it
+    // converges on the new distribution without a full state flush.
+    if (g_regime_break.exchange(false, std::memory_order_relaxed)) {
+        g_adaptive_smoothing.SoftReset();
+    }
 
     // ── Deadline miss tracking ──
     // A frame "misses" when the deadline chain falls behind `now`.
@@ -883,6 +1118,9 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     row.reflex_ai_frame_time_us = g_reflex_ai_frame_time_us.load(std::memory_order_relaxed);
     row.reflex_cpu_latency_us = g_reflex_cpu_latency_us.load(std::memory_order_relaxed);
     row.gate_margin_us = telemetry_gate_margin;
+    row.smoothing_offset_us = smoothing_offset;
+    row.p99_render_time_us = g_adaptive_smoothing.GetP99();
+    row.total_frame_cost_us = g_reflex_total_frame_cost_us.load(std::memory_order_relaxed);
     s_prev_actual_ft = telemetry_ft;
 
     CSV_Push(row);
@@ -952,4 +1190,5 @@ static void FlushAll() {
     s_ema_non_sleep_us = 0.0;
     s_prev_frame_deviation_us = 0.0;
     g_cadence_meter.Reset();
+    g_adaptive_smoothing.SoftReset();
 }
