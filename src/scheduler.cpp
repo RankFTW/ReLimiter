@@ -26,6 +26,8 @@
 #include "baseline.h"
 #include "reflex_inject.h"
 #include "streamline_hooks.h"
+#include "adaptive_smoothing.h"
+#include "config.h"
 #include "logger.h"
 #include <Windows.h>
 #include <algorithm>
@@ -469,6 +471,7 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         g_cadence_meter.Reset();
         g_ceiling_stress = CeilingStressDetector();
         ResetFeedbackAccumulators();
+        g_adaptive_smoothing.Reset();
         s_miss_ratio = 0.0;
         s_ema_non_sleep_us = 0.0;
         s_ema_present_latency_us = 0.0;
@@ -539,6 +542,25 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     // Publish for presentation gate safety clamp
     g_effective_interval_us.store(effective_interval, std::memory_order_relaxed);
 
+    // ── Adaptive smoothing: P99-based interval extension ──
+    // GPU active render time: the driver-measured shader execution time
+    // excluding idle bubbles between draw calls. This is the ground truth
+    // for how long the GPU actually needs to render the frame — independent
+    // of our sleep, the gate hold, CPU overhead, or pipeline latency.
+    double smoothing_offset = 0.0;
+    if (g_config.adaptive_smoothing &&
+        EnfDisp_GetActivePath() == EnforcementPath::NvAPIMarkers &&
+        predictor_warm) {
+        double gpu_active = g_reflex_gpu_active_us.load(std::memory_order_relaxed);
+        if (gpu_active > 0.0 && gpu_active < effective_interval * 3.0)
+            smoothing_offset = g_adaptive_smoothing.Update(gpu_active, effective_interval);
+        effective_interval += smoothing_offset;
+    }
+
+    // Re-publish with smoothing offset applied
+    if (smoothing_offset > 0.0)
+        g_effective_interval_us.store(effective_interval, std::memory_order_relaxed);
+
     // ── Predictor warmup tracking ──
     // Must be before overload detection so the grace period is available.
     static bool s_predictor_was_cold = true;
@@ -553,6 +575,14 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     }
     if (s_post_warmup_grace > 0)
         s_post_warmup_grace--;
+
+    // ── Regime break: soft reset adaptive smoothing ──
+    // The predictor sets g_regime_break when it detects a workload shift.
+    // Consume the flag and soft-reset the adaptive smoothing window so it
+    // converges on the new distribution without a full state flush.
+    if (g_regime_break.exchange(false, std::memory_order_relaxed)) {
+        g_adaptive_smoothing.SoftReset();
+    }
 
     // ── Deadline miss tracking ──
     // A frame "misses" when the deadline chain falls behind `now`.
@@ -1088,6 +1118,9 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     row.reflex_ai_frame_time_us = g_reflex_ai_frame_time_us.load(std::memory_order_relaxed);
     row.reflex_cpu_latency_us = g_reflex_cpu_latency_us.load(std::memory_order_relaxed);
     row.gate_margin_us = telemetry_gate_margin;
+    row.smoothing_offset_us = smoothing_offset;
+    row.p99_render_time_us = g_adaptive_smoothing.GetP99();
+    row.total_frame_cost_us = g_reflex_total_frame_cost_us.load(std::memory_order_relaxed);
     s_prev_actual_ft = telemetry_ft;
 
     CSV_Push(row);
@@ -1157,4 +1190,5 @@ static void FlushAll() {
     s_ema_non_sleep_us = 0.0;
     s_prev_frame_deviation_us = 0.0;
     g_cadence_meter.Reset();
+    g_adaptive_smoothing.SoftReset();
 }
