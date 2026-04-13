@@ -95,6 +95,7 @@ endif()
 # ── DLL target ──
 add_library(relimiter SHARED
     ${ADDON_SOURCES}
+    src/version.rc
 )
 
 # ── Output as .addon ──
