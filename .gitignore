@@ -1,5 +1,6 @@
 build/
 .kiro/
+logs/
 ENFORCEMENT_FALLBACK_REPORT.md
 LOCAL_CHANGES_VS_OPTIMIZATION_PASS.md
 deferred-fixes-1-2.md

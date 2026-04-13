@@ -20,10 +20,10 @@ struct Config {
     float osd_x = 0.005f;              // 0.0–1.0 screen percentage
     float osd_y = 0.005f;              // 0.0–1.0 screen percentage
     float osd_opacity = 0.6f;
-    std::string osd_toggle_key = "F12";
+    std::string osd_toggle_key = "PageUp";
 
     // OSD element visibility
-    bool osd_show_fps = false;
+    bool osd_show_fps = true;
     bool osd_show_frametime = false;
     bool osd_show_frametime_graph = false;
     bool osd_show_fg = false;
@@ -70,7 +70,7 @@ struct Config {
     int dmfg_output_cap = 0;
 
     // Adaptive Smoothing
-    bool   adaptive_smoothing = true;           // Enable P99-based adaptive smoothing (DX12+Reflex only)
+    bool   adaptive_smoothing = false;           // Enable P99-based adaptive smoothing (DX12+Reflex only)
     double smoothing_percentile = 0.99;         // Target percentile (0.90–0.999)
     std::string smoothing_window = "medium";    // "medium" (256 frames) | "dual" (64+512)
 

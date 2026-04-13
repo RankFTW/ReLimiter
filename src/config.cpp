@@ -144,8 +144,8 @@ void LoadConfig(HMODULE hModule) {
     g_config.osd_x                   = static_cast<float>(ReadINIDouble(S, "osd_x", 0.005, P));
     g_config.osd_y                   = static_cast<float>(ReadINIDouble(S, "osd_y", 0.005, P));
     g_config.osd_opacity             = static_cast<float>(ReadINIDouble(S, "osd_opacity", 0.6, P));
-    g_config.osd_toggle_key          = ReadINIString(S, "osd_toggle_key", "F12", P);
-    g_config.osd_show_fps            = ReadINIBool(S, "osd_show_fps", false, P);
+    g_config.osd_toggle_key          = ReadINIString(S, "osd_toggle_key", "PageUp", P);
+    g_config.osd_show_fps            = ReadINIBool(S, "osd_show_fps", true, P);
     g_config.osd_show_frametime      = ReadINIBool(S, "osd_show_frametime", false, P);
     g_config.osd_show_frametime_graph = ReadINIBool(S, "osd_show_frametime_graph", false, P);
     g_config.osd_show_fg             = ReadINIBool(S, "osd_show_fg", false, P);
@@ -168,7 +168,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.flip_model_override     = ReadINIBool(S, "flip_model_override", false, P);
     g_config.dynamic_mfg_passthrough = ReadINIBool(S, "dynamic_mfg_passthrough", false, P);
     g_config.dmfg_output_cap         = ReadINIInt(S, "dmfg_output_cap", 0, P);
-    g_config.adaptive_smoothing      = ReadINIBool(S, "adaptive_smoothing", true, P);
+    g_config.adaptive_smoothing      = ReadINIBool(S, "adaptive_smoothing", false, P);
     g_config.smoothing_percentile    = ReadINIDouble(S, "smoothing_percentile", 0.99, P);
     g_config.smoothing_window        = ReadINIString(S, "smoothing_window", "medium", P);
     g_config.osd_show_adaptive_smoothing = ReadINIBool(S, "osd_show_adaptive_smoothing", false, P);

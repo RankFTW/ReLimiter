@@ -24,6 +24,7 @@
 #include "presentation_gate.h"
 #include "flip_model.h"
 #include "adaptive_smoothing.h"
+#include "logger.h"
 #include <string>
 #include <atomic>
 #include <algorithm>
@@ -475,6 +476,9 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     // ════════════════════════════════════════════
     ImGui::Separator();
     if (ImGui::CollapsingHeader("Dynamic MFG")) {
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
+            "Ensure DMFG is enabled in the NVIDIA App or NVPI before activating.");
+        ImGui::Spacing();
         // DMFG Compatibility toggle
         bool dmfg_pass = g_config.dynamic_mfg_passthrough;
         if (ImGui::Checkbox("DMFG Compatibility", &dmfg_pass)) {
@@ -496,7 +500,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         HelpTip("Required for DLSS Dynamic Multi Frame Generation (DMFG). "
                 "Hands frame pacing to the driver so it can freely adjust the FG multiplier. "
                 "Set the Output Cap below to cap output FPS (e.g. to your VRR ceiling) "
-                "while keeping the dynamic multiplier intact — something the game's own limiter can't do. "
+                "while keeping the dynamic multiplier intact. "
                 "ReLimiter continues providing OSD, telemetry, and FG detection. "
                 "Auto-detected for most games; enable manually if detection misses.");
 
@@ -584,15 +588,26 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 "May break some games that use GDI interop or MSAA. "
                 "Requires game restart to take effect.");
 
-        // Advanced Logging toggle
+        // Telemetry Logging toggle
         ImGui::Spacing();
         bool csv = g_config.csv_enabled;
-        if (ImGui::Checkbox("Advanced Logging", &csv)) {
+        if (ImGui::Checkbox("Telemetry Logging", &csv)) {
             g_config.csv_enabled = csv;
             CSV_SetEnabled(csv);
             config_dirty = true;
         }
         HelpTip("Enable per-frame CSV telemetry recording. Toggle in-game with the CSV hotkey (default F11).");
+
+        // Advanced Logging toggle (log_level: warn <-> info)
+        bool info_logging = (g_config.log_level == "info");
+        if (ImGui::Checkbox("Advanced Logging", &info_logging)) {
+            g_config.log_level = info_logging ? "info" : "warn";
+            Log_SetLevel(Log_ParseLevel(g_config.log_level.c_str()));
+            config_dirty = true;
+        }
+        HelpTip("When enabled, the log file records detailed info-level messages. "
+                "When disabled, only warnings and errors are logged. "
+                "Enable this before reporting issues.");
     }
 
     // ════════════════════════════════════════════
