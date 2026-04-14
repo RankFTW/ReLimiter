@@ -916,11 +916,12 @@ void NGXInterceptor_Init(double scale_factor) {
 
 void NGXInterceptor_ReleaseGPUResources() {
     ReleaseIntermediateBuffer();
-    g_device = nullptr;
+    // Do NOT null g_device here — the device outlives the swapchain.
+    // It's only destroyed on on_destroy_device, which calls Shutdown.
     // The game's output resource may become invalid on swapchain destroy.
     // It will be re-captured when the game calls slSetTag again.
     g_game_output_resource.store(nullptr, std::memory_order_relaxed);
-    LOG_INFO("NGXInterceptor: GPU resources released (hooks preserved)");
+    LOG_INFO("NGXInterceptor: GPU resources released (hooks + device preserved)");
 }
 
 void NGXInterceptor_Shutdown() {
