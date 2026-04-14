@@ -542,28 +542,59 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
     }
 
     // ── Read the original output resource from NGX params ──
-    void** param_vtable = *reinterpret_cast<void***>(params);
+    void** param_vtable = nullptr;
+    __try {
+        param_vtable = *reinterpret_cast<void***>(params);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("NGXInterceptor: SEH reading param vtable — passthrough");
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+    }
     if (!param_vtable) {
+        LOG_WARN("NGXInterceptor: null param vtable — passthrough");
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
 
+    // Log vtable on first interception attempt
+    static bool s_vtable_logged = false;
+    if (!s_vtable_logged) {
+        s_vtable_logged = true;
+        LOG_INFO("NGXInterceptor: param=%p vtable=%p [5]=%p [12]=%p",
+                 params, param_vtable, param_vtable[5], param_vtable[12]);
+    }
+
+    // Validate vtable pointers before dereferencing
     auto fnGetResource = reinterpret_cast<NGXParam_GetResource_t>(
         param_vtable[NGX_PARAM_VTABLE_GET_RESOURCE]);
     auto fnSetResource = reinterpret_cast<NGXParam_SetResource_t>(
         param_vtable[NGX_PARAM_VTABLE_SET_RESOURCE]);
 
     if (!fnGetResource || !fnSetResource) {
+        LOG_WARN("NGXInterceptor: null vtable entries Get[%d]=%p Set[%d]=%p — passthrough",
+                 NGX_PARAM_VTABLE_GET_RESOURCE, fnGetResource,
+                 NGX_PARAM_VTABLE_SET_RESOURCE, fnSetResource);
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
 
     ID3D12Resource* original_output = nullptr;
-    fnGetResource(params, "Output", &original_output);
+    __try {
+        fnGetResource(params, "Output", &original_output);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("NGXInterceptor: SEH in GetResource('Output') — passthrough");
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+    }
     if (!original_output) {
+        LOG_WARN("NGXInterceptor: Output resource is null — passthrough");
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
 
     // Get display dimensions from original output
-    D3D12_RESOURCE_DESC orig_desc = original_output->GetDesc();
+    D3D12_RESOURCE_DESC orig_desc{};
+    __try {
+        orig_desc = original_output->GetDesc();
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("NGXInterceptor: SEH in GetDesc() on output %p — passthrough", original_output);
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+    }
     uint32_t display_w = static_cast<uint32_t>(orig_desc.Width);
     uint32_t display_h = orig_desc.Height;
 
@@ -576,14 +607,23 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
     }
 
     // Swap output to intermediate buffer
-    fnSetResource(params, "Output", g_intermediate_buffer);
+    __try {
+        fnSetResource(params, "Output", g_intermediate_buffer);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("NGXInterceptor: SEH exception setting Output param — passthrough");
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+    }
 
     // Call original — DLSS upscales to k×D
     NVSDK_NGX_Result result = g_orig_EvaluateFeature_dlss(
         cmd_list, feature_handle, params, callback);
 
     // Restore original output
-    fnSetResource(params, "Output", original_output);
+    __try {
+        fnSetResource(params, "Output", original_output);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("NGXInterceptor: SEH exception restoring Output param");
+    }
 
     if (result != NVSDK_NGX_Result_Success) {
         return result;
