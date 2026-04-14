@@ -356,10 +356,6 @@ static DXGI_FORMAT g_output_format = DXGI_FORMAT_R10G10B10A2_UNORM;
 static void CaptureAndSwapOutputResource(void* tags_ptr, uint32_t numTags) {
     if (!tags_ptr || numTags == 0) return;
 
-    double k = g_current_k.load(std::memory_order_relaxed);
-    uint32_t game_w = g_game_output_w.load(std::memory_order_relaxed);
-    uint32_t game_h = g_game_output_h.load(std::memory_order_relaxed);
-
     __try {
         auto* bytes = reinterpret_cast<uint8_t*>(tags_ptr);
         constexpr size_t TAG_SIZE = 64;
@@ -377,11 +373,9 @@ static void CaptureAndSwapOutputResource(void* tags_ptr, uint32_t numTags) {
                 uintptr_t a = reinterpret_cast<uintptr_t>(native);
                 if (!native || a <= 0x10000 || a >= 0x00007FFFFFFFFFFF) break;
 
-                // Always update the game's output resource pointer
                 g_game_output_resource.store(native, std::memory_order_relaxed);
                 g_output_native_location = native_loc;
 
-                // First time: capture format, dump sl::Resource for diagnosis
                 if (!g_output_format_captured) {
                     g_output_format_captured = true;
                     auto* res = static_cast<ID3D12Resource*>(native);
@@ -390,67 +384,23 @@ static void CaptureAndSwapOutputResource(void* tags_ptr, uint32_t numTags) {
                     LOG_INFO("NGXInterceptor: captured output %p (%llux%u fmt=%d flags=0x%X)",
                              native, desc.Width, desc.Height,
                              static_cast<int>(desc.Format), static_cast<unsigned>(desc.Flags));
-
-                    // Dump sl::Resource bytes 40-96 to check for dimension fields
-                    LOG_INFO("NGXInterceptor: sl::Resource dump (offset 40-96):");
-                    for (int off = 40; off < 96; off += 8) {
-                        uint64_t val = *reinterpret_cast<const uint64_t*>(sl_resource + off);
-                        LOG_INFO("NGXInterceptor:   +%d: 0x%016llX (%llu)", off, val, val);
-                    }
-                    break; // First frame: passthrough, don't swap
                 }
-
-                // Subsequent frames: swap if k > 1.0 and buffer is ready
-                if (!g_active.load(std::memory_order_relaxed) || k <= 1.01 ||
-                    game_w == 0 || game_h == 0) break;
-
-                auto [fw, fh] = ComputeFakeResolution(k, game_w, game_h);
-                Lanczos_Resize(fw, fh, game_w, game_h);
-
-                if (!EnsureIntermediateBuffer(fw, fh, g_output_format)) break;
-
-                // SWAP: replace native pointer with our k×D buffer
-                *reinterpret_cast<void**>(native_loc) = static_cast<void*>(g_intermediate_buffer);
-
-                static int s_log = 0;
-                if (++s_log <= 5 || (s_log % 300) == 0) {
-                    LOG_INFO("NGXInterceptor: PRE-SWAP slSetTag: %p -> %p (k=%.2f %ux%u)",
-                             native, g_intermediate_buffer, k, fw, fh);
-                }
+                // Resource swap DISABLED — all approaches cause DEVICE_REMOVED.
+                // Streamline validates resource identity, not just dimensions.
                 break;
             }
         }
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        LOG_WARN("NGXInterceptor: SEH in CaptureAndSwapOutputResource");
-    }
-}
-
-static void RestoreOutputResource() {
-    // Restore the game's original native pointer after slSetTag returns
-    void* game_out = g_game_output_resource.load(std::memory_order_relaxed);
-    if (g_output_native_location && game_out) {
-        __try {
-            void* current = *reinterpret_cast<void**>(g_output_native_location);
-            // Only restore if we actually swapped (current != game's original)
-            if (current != game_out) {
-                *reinterpret_cast<void**>(g_output_native_location) = game_out;
-            }
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
-    }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 static sl_Result __cdecl Hooked_slSetTag(const void* viewport, const void* tags, uint32_t numTags, void* cmdBuffer) {
     CaptureAndSwapOutputResource(const_cast<void*>(tags), numTags);
-    sl_Result result = g_orig_slSetTag(viewport, tags, numTags, cmdBuffer);
-    RestoreOutputResource();
-    return result;
+    return g_orig_slSetTag(viewport, tags, numTags, cmdBuffer);
 }
 
 static sl_Result __cdecl Hooked_slSetTagForFrame(const void* frame, const void* viewport, const void* tags, uint32_t numTags, void* cmdBuffer) {
     CaptureAndSwapOutputResource(const_cast<void*>(tags), numTags);
-    sl_Result result = g_orig_slSetTagForFrame(frame, viewport, tags, numTags, cmdBuffer);
-    RestoreOutputResource();
-    return result;
+    return g_orig_slSetTagForFrame(frame, viewport, tags, numTags, cmdBuffer);
 }
 
 static sl_Result __cdecl Hooked_slDLSSSetOptions(const void* viewport, const void* options) {
@@ -458,48 +408,17 @@ static sl_Result __cdecl Hooked_slDLSSSetOptions(const void* viewport, const voi
         if (g_orig_slDLSSSetOptions) return g_orig_slDLSSSetOptions(viewport, options);
         return -1;
     }
-
-    auto* b = reinterpret_cast<const uint8_t*>(options);
-    uint32_t w = 0, h = 0;
     __try {
-        w = *reinterpret_cast<const uint32_t*>(b + SL_DLSS_OFFSET_OUTPUT_WIDTH);
-        h = *reinterpret_cast<const uint32_t*>(b + SL_DLSS_OFFSET_OUTPUT_HEIGHT);
+        auto* b = reinterpret_cast<const uint8_t*>(options);
+        uint32_t w = *reinterpret_cast<const uint32_t*>(b + SL_DLSS_OFFSET_OUTPUT_WIDTH);
+        uint32_t h = *reinterpret_cast<const uint32_t*>(b + SL_DLSS_OFFSET_OUTPUT_HEIGHT);
+        if (w > 0 && h > 0) {
+            uint32_t pw = g_game_output_w.exchange(w, std::memory_order_relaxed);
+            if (pw != w) LOG_INFO("NGXInterceptor: game DLSS output dims: %ux%u", w, h);
+            g_game_output_h.store(h, std::memory_order_relaxed);
+        }
     } __except(EXCEPTION_EXECUTE_HANDLER) {}
-
-    if (w > 0 && h > 0) {
-        uint32_t pw = g_game_output_w.exchange(w, std::memory_order_relaxed);
-        if (pw != w) LOG_INFO("NGXInterceptor: game DLSS output dims: %ux%u", w, h);
-        g_game_output_h.store(h, std::memory_order_relaxed);
-    }
-
-    double k = g_current_k.load(std::memory_order_relaxed);
-
-    // Override dimensions to k×D when swap is active
-    // This must match the resource swap in slSetTag
-    if (g_active.load(std::memory_order_relaxed) && k > 1.01 &&
-        g_output_format_captured && g_intermediate_buffer && w > 0 && h > 0) {
-        auto [fw, fh] = ComputeFakeResolution(k, w, h);
-        auto* bm = const_cast<uint8_t*>(b);
-        __try {
-            *reinterpret_cast<uint32_t*>(bm + SL_DLSS_OFFSET_OUTPUT_WIDTH) = fw;
-            *reinterpret_cast<uint32_t*>(bm + SL_DLSS_OFFSET_OUTPUT_HEIGHT) = fh;
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
-
-        static int s_log = 0;
-        if (++s_log <= 5 || (s_log % 300) == 0)
-            LOG_INFO("NGXInterceptor: slDLSSSetOptions override: %ux%u -> %ux%u (k=%.2f)", w, h, fw, fh, k);
-
-        sl_Result result = g_orig_slDLSSSetOptions(viewport, options);
-
-        // Restore original dimensions
-        __try {
-            *reinterpret_cast<uint32_t*>(bm + SL_DLSS_OFFSET_OUTPUT_WIDTH) = w;
-            *reinterpret_cast<uint32_t*>(bm + SL_DLSS_OFFSET_OUTPUT_HEIGHT) = h;
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
-
-        return result;
-    }
-
+    // Dimension override DISABLED — passthrough only.
     return g_orig_slDLSSSetOptions(viewport, options);
 }
 
@@ -568,55 +487,9 @@ static NVSDK_NGX_Result __cdecl Hooked_NGX_D3D12_EvaluateFeature(
                  s_n, k, cmd_list, params);
     }
 
-    // Passthrough when inactive, no params, or k ~ 1.0
-    if (!g_active.load(std::memory_order_relaxed) || !params || !cmd_list || k <= 1.01) {
-        return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
-    }
-
-    uint32_t game_w = g_game_output_w.load(std::memory_order_relaxed);
-    uint32_t game_h = g_game_output_h.load(std::memory_order_relaxed);
-    if (game_w == 0 || game_h == 0 || !g_output_format_captured || !g_intermediate_buffer) {
-        return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
-    }
-
-    // Override OutWidth/OutHeight to k×D to match the resource swap in slSetTag
-    auto [fw, fh] = ComputeFakeResolution(k, game_w, game_h);
-    void** vtable = nullptr;
-    __try { vtable = *reinterpret_cast<void** const*>(params); }
-    __except(EXCEPTION_EXECUTE_HANDLER) { vtable = nullptr; }
-
-    bool dims_overridden = false;
-    if (vtable) {
-        auto fnSetUI = reinterpret_cast<void (__thiscall*)(
-            const NVSDK_NGX_Parameter*, const char*, unsigned int)>(vtable[3]);
-        if (fnSetUI) {
-            __try {
-                fnSetUI(params, "OutWidth", fw);
-                fnSetUI(params, "OutHeight", fh);
-                dims_overridden = true;
-            } __except(EXCEPTION_EXECUTE_HANDLER) {}
-        }
-    }
-
-    if (s_n <= 5 || (s_n % 300) == 0)
-        LOG_INFO("NGXInterceptor: [NGX] override dims %ux%u -> %ux%u (ok=%d)", game_w, game_h, fw, fh, dims_overridden);
-
-    // Call original
-    NVSDK_NGX_Result result = g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
-
-    // Restore original dimensions
-    if (dims_overridden && vtable) {
-        auto fnSetUI = reinterpret_cast<void (__thiscall*)(
-            const NVSDK_NGX_Parameter*, const char*, unsigned int)>(vtable[3]);
-        if (fnSetUI) {
-            __try {
-                fnSetUI(params, "OutWidth", game_w);
-                fnSetUI(params, "OutHeight", game_h);
-            } __except(EXCEPTION_EXECUTE_HANDLER) {}
-        }
-    }
-
-    return result;
+    // Passthrough — all resource swap and dimension override approaches
+    // cause DEVICE_REMOVED with Streamline's _nvngx.dll proxy.
+    return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
 }
 
 // ══════════════════════════════════════════════════════════════════════
