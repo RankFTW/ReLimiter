@@ -541,6 +541,20 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
 
+    // ── k > 1.0: log and passthrough for now ──
+    // The vtable access on Streamline's _nvngx.dll parameter object crashes.
+    // Pure passthrough + log to confirm this path is entered safely.
+    static int s_intercept_count = 0;
+    s_intercept_count++;
+    if (s_intercept_count <= 5 || (s_intercept_count % 300) == 0) {
+        LOG_INFO("NGXInterceptor: [NGX] k>1 PASSTHROUGH #%d — k=%.2f params=%p",
+                 s_intercept_count, k, params);
+    }
+    return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+
+    // ── VTABLE INTERCEPTION DISABLED — crashes on Streamline's param object ──
+#if 0
+
     // ── Read the original output resource from NGX params ──
     void** param_vtable = nullptr;
     __try {
@@ -646,6 +660,7 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
     }
 
     return result;
+#endif  // VTABLE INTERCEPTION DISABLED
 }
 
 // ══════════════════════════════════════════════════════════════════════
