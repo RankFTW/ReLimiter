@@ -230,22 +230,9 @@ static void on_present(reshade::api::command_queue* queue,
             // before our LoadLibrary hooks were installed. Check all known
             // NGX DLL names — Streamline routes through _nvngx.dll or nvngx.dll,
             // not nvngx_dlss.dll (which is just the model weights).
-            if (g_config.adaptive_dlss_scaling) {
-                const wchar_t* ngx_dll_names[] = {
-                    L"nvngx_dlss.dll",
-                    L"nvngx_dlssd.dll",
-                    L"_nvngx.dll",
-                    L"nvngx.dll",
-                };
-                for (auto* name : ngx_dll_names) {
-                    HMODULE hDll = GetModuleHandleW(name);
-                    if (hDll) {
-                        LOG_INFO("DLSS Scaling: %ls already loaded (late detection), hooking now", name);
-                        NGXInterceptor_OnDLSSDllLoaded(static_cast<void*>(hDll));
-                        break;  // Only need to hook once
-                    }
-                }
-            }
+            // DIAGNOSTIC: Late detection disabled — NGXInterceptor is fully disabled
+            // to isolate the black screen cause.
+            // if (g_config.adaptive_dlss_scaling) { ... }
         }
     }
 
@@ -432,9 +419,13 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         // Intercepts DLSS at the EvaluateFeature level instead of faking
         // swapchain dimensions. The game never sees fake resolutions.
         // SwapProxy is NOT used — it crashed games that validate dimensions.
+        // DIAGNOSTIC: NGXInterceptor completely disabled to isolate black screen cause.
+        // The EvaluateFeature hook never fires (0 log entries), yet the screen goes black.
+        // This means the hook installation itself (MinHook on Streamline's _nvngx.dll proxy)
+        // is corrupting something. Disable entirely to confirm.
         if (g_config.adaptive_dlss_scaling) {
-            NGXInterceptor_Init(g_config.dlss_scale_factor);
-            LOG_INFO("DLSS Scaling: NGXInterceptor initialized (s=%.2f)", g_config.dlss_scale_factor);
+            // NGXInterceptor_Init(g_config.dlss_scale_factor);
+            LOG_WARN("DLSS Scaling: NGXInterceptor DISABLED for black screen diagnosis");
         }
 
     } __except(EXCEPTION_EXECUTE_HANDLER) {
