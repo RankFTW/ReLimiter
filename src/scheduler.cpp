@@ -205,43 +205,8 @@ void OnMarker(uint64_t frameID, int64_t now) {
         // ── Sub-task 8.6: Tier transition orchestration (NGX-only approach) ──
         if (tier_changed) {
             KControllerState state = KController_GetState();
-
-            // Use display dimensions from NGXInterceptor's cached values
-            // DO NOT call IDXGISwapChain::GetDesc here — we're on the scheduler
-            // thread and the Streamline swapchain proxy is not thread-safe.
-            // Calling GetDesc from a non-render thread corrupts Streamline's state.
-            uint32_t display_w = 0, display_h = 0;
-            NGXInterceptor_GetDisplayDims(&display_w, &display_h);
-
-            // If we don't have cached dimensions yet, try to get them from
-            // the swapchain manager's HWND (which is thread-safe)
-            if (display_w == 0 || display_h == 0) {
-                HWND hwnd = SwapMgr_GetHWND();
-                if (hwnd) {
-                    RECT rc;
-                    if (GetClientRect(hwnd, &rc)) {
-                        display_w = rc.right - rc.left;
-                        display_h = rc.bottom - rc.top;
-                    }
-                }
-            }
-
-            if (display_w > 0 && display_h > 0) {
-                auto [fake_w, fake_h] = ComputeFakeResolution(
-                    state.current_k, display_w, display_h);
-
-                // Lanczos_Resize deferred to EvaluateFeature hook (render thread)
-                // NGXInterceptor_UpdateOutputRes(fake_w, fake_h);
-                NGXInterceptor_SetScalingParams(state.current_k, display_w, display_h);
-
-                const char* reason = (state.current_tier < prev_tier)
-                    ? "FPS below threshold" : "FPS above threshold";
-                LOG_INFO("DLSS Scaling: tier transition T%d -> T%d (%s), k=%.2f, EMA FPS=%.1f, res=%ux%u",
-                         prev_tier, state.current_tier, reason,
-                         state.current_k, ema_fps, fake_w, fake_h);
-            } else {
-                LOG_WARN("DLSS Scaling: tier transition skipped — no display dimensions available");
-            }
+            LOG_INFO("DLSS Scaling: tier changed to T%d k=%.2f",
+                     state.current_tier, state.current_k);
         }
     }
 
