@@ -222,7 +222,8 @@ void OnMarker(uint64_t frameID, int64_t now) {
                 auto [fake_w, fake_h] = ComputeFakeResolution(
                     state.current_k, display_w, display_h);
 
-                Lanczos_Resize(fake_w, fake_h, display_w, display_h);
+                // DIAGNOSTIC: skip Lanczos_Resize to isolate crash
+                // Lanczos_Resize(fake_w, fake_h, display_w, display_h);
                 NGXInterceptor_UpdateOutputRes(fake_w, fake_h);
                 NGXInterceptor_SetScalingParams(state.current_k, display_w, display_h);
 
