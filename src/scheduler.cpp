@@ -206,6 +206,12 @@ void OnMarker(uint64_t frameID, int64_t now) {
         if (tier_changed) {
             KControllerState state = KController_GetState();
 
+            // DIAGNOSTIC: log transition but skip all GPU operations
+            LOG_INFO("DLSS Scaling: tier transition T%d -> k=%.2f (GPU ops DISABLED for diagnosis)",
+                     state.current_tier, state.current_k);
+
+#if 0  // ── GPU OPERATIONS DISABLED FOR CRASH DIAGNOSIS ──
+
             // Get display dimensions from the real swapchain
             uint32_t display_w = 0, display_h = 0;
             uint64_t sc_handle = SwapMgr_GetNativeHandle();
@@ -234,6 +240,7 @@ void OnMarker(uint64_t frameID, int64_t now) {
             } else {
                 LOG_WARN("DLSS Scaling: tier transition skipped — no display dimensions available");
             }
+#endif  // ── END GPU OPERATIONS DISABLED ──
         }
     }
 
