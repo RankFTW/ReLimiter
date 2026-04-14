@@ -39,6 +39,7 @@ static bool ContainsDlssDll(const char* path) {
     std::string s(path);
     std::transform(s.begin(), s.end(), s.begin(), ::tolower);
     return s.find("nvngx_dlss.dll") != std::string::npos ||
+           s.find("nvngx_dlssd.dll") != std::string::npos ||
            s.find("_nvngx.dll") != std::string::npos ||
            s.find("nvngx.dll") != std::string::npos;
 }
@@ -48,6 +49,7 @@ static bool ContainsDlssDllW(const wchar_t* path) {
     std::wstring s(path);
     std::transform(s.begin(), s.end(), s.begin(), ::towlower);
     return s.find(L"nvngx_dlss.dll") != std::wstring::npos ||
+           s.find(L"nvngx_dlssd.dll") != std::wstring::npos ||
            s.find(L"_nvngx.dll") != std::wstring::npos ||
            s.find(L"nvngx.dll") != std::wstring::npos;
 }
@@ -125,7 +127,7 @@ void InstallLoadLibraryHooks() {
 
     // Check if NGX DLLs are already loaded before we install hooks
     // Streamline games use _nvngx.dll or nvngx.dll, not nvngx_dlss.dll
-    const wchar_t* ngx_check_names[] = { L"nvngx_dlss.dll", L"_nvngx.dll", L"nvngx.dll" };
+    const wchar_t* ngx_check_names[] = { L"nvngx_dlss.dll", L"nvngx_dlssd.dll", L"_nvngx.dll", L"nvngx.dll" };
     for (auto* name : ngx_check_names) {
         HMODULE existingDlss = GetModuleHandleW(name);
         if (existingDlss) {

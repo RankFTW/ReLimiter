@@ -590,7 +590,7 @@ void NGXInterceptor_Init(double scale_factor) {
     LOG_INFO("NGXInterceptor: initialized with scale_factor=%.3f", scale_factor);
 
     // Check if any NGX DLL is already loaded (game loaded it before us)
-    const wchar_t* ngx_dll_names[] = { L"nvngx_dlss.dll", L"_nvngx.dll", L"nvngx.dll" };
+    const wchar_t* ngx_dll_names[] = { L"nvngx_dlss.dll", L"nvngx_dlssd.dll", L"_nvngx.dll", L"nvngx.dll" };
     for (auto* name : ngx_dll_names) {
         HMODULE existing = GetModuleHandleW(name);
         if (existing) {

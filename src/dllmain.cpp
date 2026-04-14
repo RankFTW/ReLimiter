@@ -233,6 +233,7 @@ static void on_present(reshade::api::command_queue* queue,
             if (g_config.adaptive_dlss_scaling) {
                 const wchar_t* ngx_dll_names[] = {
                     L"nvngx_dlss.dll",
+                    L"nvngx_dlssd.dll",
                     L"_nvngx.dll",
                     L"nvngx.dll",
                 };
