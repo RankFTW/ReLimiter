@@ -415,33 +415,76 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
     }
 
     ID3D12Resource* original_output = nullptr;
-    static const char* s_output_name_cache = "Output";
+    static const char* s_output_name_cache = nullptr;
     const char* found_name = nullptr;
-    __try {
-        fnGetResource(params, "Output", &original_output);
-        if (original_output) found_name = "Output";
-        if (!original_output) {
-            fnGetResource(params, "Color", &original_output);
-            if (original_output) found_name = "Color";
+
+    // If we already know the param name, use it directly
+    if (s_output_name_cache) {
+        __try {
+            fnGetResource(params, s_output_name_cache, &original_output);
+            if (original_output) found_name = s_output_name_cache;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    // First call or cached name failed: probe all known DLSS parameter names
+    if (!original_output) {
+        static const char* probe_names[] = {
+            "Output", "Color", "DLSS.Output.Color",
+            "DLSS.Output", "OutputColor", "ScalingOutputColor",
+            "DLSS.Color", "SuperSampling.Output", "SuperSampling.Color",
+            "DlssOutputColor", "OutputTex", "OutColor",
+            "DLSS_Output", "dlss.output", "output",
+            nullptr
+        };
+        __try {
+            for (int i = 0; probe_names[i]; i++) {
+                ID3D12Resource* res = nullptr;
+                fnGetResource(params, probe_names[i], &res);
+                if (res) {
+                    original_output = res;
+                    found_name = probe_names[i];
+                    s_output_name_cache = found_name;
+                    D3D12_RESOURCE_DESC desc = res->GetDesc();
+                    LOG_INFO("NGXInterceptor: FOUND param '%s' -> %p (%llux%u)",
+                             found_name, res, desc.Width, desc.Height);
+                    break;
+                }
+            }
+            // If none found, do a one-time dump of ALL probed names
+            if (!original_output) {
+                static bool s_dumped = false;
+                if (!s_dumped) {
+                    s_dumped = true;
+                    LOG_WARN("NGXInterceptor: no param name matched. Probed %d names.", 15);
+                    // Try reading uint params to verify vtable works
+                    auto fnGetUint = reinterpret_cast<NGXParam_GetUint_t>(
+                        param_vtable[NGX_PARAM_VTABLE_GET_UINT]);
+                    if (fnGetUint) {
+                        unsigned int w = 0, h = 0;
+                        fnGetUint(params, "Width", &w);
+                        fnGetUint(params, "Height", &h);
+                        unsigned int ow = 0, oh = 0;
+                        fnGetUint(params, "OutWidth", &ow);
+                        fnGetUint(params, "OutHeight", &oh);
+                        LOG_INFO("NGXInterceptor: uint params: Width=%u Height=%u OutWidth=%u OutHeight=%u",
+                                 w, h, ow, oh);
+                    }
+                }
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            static int s4 = 0; if (++s4 <= 3) LOG_WARN("NGXInterceptor: FAIL probe SEH");
         }
-        if (!original_output) {
-            fnGetResource(params, "DLSS.Output.Color", &original_output);
-            if (original_output) found_name = "DLSS.Output.Color";
-        }
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        static int s4 = 0; if (++s4 <= 3) LOG_WARN("NGXInterceptor: FAIL GetResource SEH");
-        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
     if (!original_output) {
-        static int s5 = 0; if (++s5 <= 3) LOG_WARN("NGXInterceptor: FAIL all param names null");
+        static int s5 = 0; if (++s5 <= 3) LOG_WARN("NGXInterceptor: FAIL no output resource found");
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
-    // Update the static name for Set calls
-    s_output_name_cache = found_name;
+    // Update cache
+    if (found_name) s_output_name_cache = found_name;
     static bool s_name_logged = false;
-    if (!s_name_logged) {
+    if (!s_name_logged && found_name) {
         s_name_logged = true;
-        LOG_INFO("NGXInterceptor: Output param name = '%s', resource=%p", found_name, original_output);
+        LOG_INFO("NGXInterceptor: using param name '%s'", found_name);
     }
 
     // ── Get display dimensions from the original output ──
