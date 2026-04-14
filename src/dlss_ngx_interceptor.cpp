@@ -324,28 +324,20 @@ static NVSDK_NGX_Result __cdecl Hooked_NGX_D3D12_CreateFeature(
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// STREAMLINE HOOKS — v4: atomic swap inside slEvaluateFeature
+// STREAMLINE HOOKS — v6: pre-call resource swap in slSetTag
 //
-// Previous approaches that FAILED:
-//   v1: Local tag injection in slEvaluateFeature → DEVICE_REMOVED
-//   v2: In-place resource swap in slSetTag → DEVICE_REMOVED
-//   v3: Dimension-only override in slDLSSSetOptions → missing geometry
+// Key insight: previous slSetTag swap (v2) swapped AFTER Streamline
+// cached the D-sized resource metadata, causing a mismatch at evaluate.
 //
-// v4: slSetTag and slDLSSSetOptions are pure capture (read-only).
-// ALL modifications happen atomically inside slEvaluateFeature:
-//   1. Swap the output resource native pointer
-//   2. Call original slEvaluateFeature — DLSS writes to intermediate
-//   3. Restore the output resource native pointer
-//   4. Lanczos downscale intermediate → game output
+// v6: swap the native pointer BEFORE calling original slSetTag.
+// Streamline caches metadata from our k×D buffer. No mismatch.
 //
-// Note: we do NOT override slDLSSSetOptions dimensions. Instead we
-// swap the output resource to a k*D buffer. DLSS will see the larger
-// resource and should upscale to fill it (the output dimensions in
-// DLSSOptions tell DLSS the TARGET, but the actual resource size
-// determines what DLSS writes to).
+// Flow:
+//   Frame 1: passthrough, capture output resource + format
+//   Frame 2+: swap native → call slSetTag (caches k×D) → restore native
+//   slEvaluateFeature: DLSS writes to k×D → Lanczos downscale to D
 // ══════════════════════════════════════════════════════════════════════
 
-// ── slSetTag types ──
 using PFN_slSetTag = sl_Result(__cdecl*)(const void* viewport, const void* tags, uint32_t numTags, void* cmdBuffer);
 using PFN_slSetTagForFrame = sl_Result(__cdecl*)(const void* frame, const void* viewport, const void* tags, uint32_t numTags, void* cmdBuffer);
 
@@ -354,46 +346,111 @@ static PFN_slSetTagForFrame g_orig_slSetTagForFrame = nullptr;
 static bool                 g_sl_settag_hooked       = false;
 static bool                 g_sl_settagframe_hooked  = false;
 
-// ── Saved native pointer location for eval-time swap ──
-static std::atomic<uint8_t*> g_output_native_location{nullptr};
+// Location of the native pointer inside the sl::Resource for the output tag
+static uint8_t* g_output_native_location = nullptr;
 
-static void CaptureOutputResource(const void* tags_ptr, uint32_t numTags) {
+// Whether we've captured the output resource format (first frame done)
+static bool g_output_format_captured = false;
+static DXGI_FORMAT g_output_format = DXGI_FORMAT_R10G10B10A2_UNORM;
+
+static void CaptureAndSwapOutputResource(void* tags_ptr, uint32_t numTags) {
     if (!tags_ptr || numTags == 0) return;
+
+    double k = g_current_k.load(std::memory_order_relaxed);
+    uint32_t game_w = g_game_output_w.load(std::memory_order_relaxed);
+    uint32_t game_h = g_game_output_h.load(std::memory_order_relaxed);
+
     __try {
-        auto* bytes = reinterpret_cast<const uint8_t*>(tags_ptr);
+        auto* bytes = reinterpret_cast<uint8_t*>(tags_ptr);
         constexpr size_t TAG_SIZE = 64;
+
         for (uint32_t i = 0; i < numTags; i++) {
-            const uint8_t* tag = bytes + i * TAG_SIZE;
+            uint8_t* tag = bytes + i * TAG_SIZE;
             uint32_t buf_type = *reinterpret_cast<const uint32_t*>(tag + SL_TAG_OFFSET_TYPE);
+
             if (buf_type == sl_kBufferTypeScalingOutputColor) {
-                auto* sl_resource = *reinterpret_cast<const uint8_t* const*>(tag + SL_TAG_OFFSET_RESOURCE);
-                if (sl_resource) {
-                    void* native = *reinterpret_cast<void* const*>(sl_resource + SL_RESOURCE_OFFSET_NATIVE);
-                    uintptr_t a = reinterpret_cast<uintptr_t>(native);
-                    if (native && a > 0x10000 && a < 0x00007FFFFFFFFFFF) {
-                        void* prev = g_game_output_resource.exchange(native, std::memory_order_relaxed);
-                        g_output_native_location.store(
-                            const_cast<uint8_t*>(sl_resource) + SL_RESOURCE_OFFSET_NATIVE,
-                            std::memory_order_relaxed);
-                        if (prev != native) {
-                            LOG_INFO("NGXInterceptor: captured output resource %p (tag[%u])", native, i);
-                        }
+                auto* sl_resource = *reinterpret_cast<uint8_t**>(tag + SL_TAG_OFFSET_RESOURCE);
+                if (!sl_resource) break;
+
+                uint8_t* native_loc = sl_resource + SL_RESOURCE_OFFSET_NATIVE;
+                void* native = *reinterpret_cast<void**>(native_loc);
+                uintptr_t a = reinterpret_cast<uintptr_t>(native);
+                if (!native || a <= 0x10000 || a >= 0x00007FFFFFFFFFFF) break;
+
+                // Always update the game's output resource pointer
+                g_game_output_resource.store(native, std::memory_order_relaxed);
+                g_output_native_location = native_loc;
+
+                // First time: capture format, dump sl::Resource for diagnosis
+                if (!g_output_format_captured) {
+                    g_output_format_captured = true;
+                    auto* res = static_cast<ID3D12Resource*>(native);
+                    D3D12_RESOURCE_DESC desc = res->GetDesc();
+                    g_output_format = desc.Format;
+                    LOG_INFO("NGXInterceptor: captured output %p (%llux%u fmt=%d flags=0x%X)",
+                             native, desc.Width, desc.Height,
+                             static_cast<int>(desc.Format), static_cast<unsigned>(desc.Flags));
+
+                    // Dump sl::Resource bytes 40-96 to check for dimension fields
+                    LOG_INFO("NGXInterceptor: sl::Resource dump (offset 40-96):");
+                    for (int off = 40; off < 96; off += 8) {
+                        uint64_t val = *reinterpret_cast<const uint64_t*>(sl_resource + off);
+                        LOG_INFO("NGXInterceptor:   +%d: 0x%016llX (%llu)", off, val, val);
                     }
+                    break; // First frame: passthrough, don't swap
+                }
+
+                // Subsequent frames: swap if k > 1.0 and buffer is ready
+                if (!g_active.load(std::memory_order_relaxed) || k <= 1.01 ||
+                    game_w == 0 || game_h == 0) break;
+
+                auto [fw, fh] = ComputeFakeResolution(k, game_w, game_h);
+                Lanczos_Resize(fw, fh, game_w, game_h);
+
+                if (!EnsureIntermediateBuffer(fw, fh, g_output_format)) break;
+
+                // SWAP: replace native pointer with our k×D buffer
+                *reinterpret_cast<void**>(native_loc) = static_cast<void*>(g_intermediate_buffer);
+
+                static int s_log = 0;
+                if (++s_log <= 5 || (s_log % 300) == 0) {
+                    LOG_INFO("NGXInterceptor: PRE-SWAP slSetTag: %p -> %p (k=%.2f %ux%u)",
+                             native, g_intermediate_buffer, k, fw, fh);
                 }
                 break;
             }
         }
-    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_WARN("NGXInterceptor: SEH in CaptureAndSwapOutputResource");
+    }
+}
+
+static void RestoreOutputResource() {
+    // Restore the game's original native pointer after slSetTag returns
+    void* game_out = g_game_output_resource.load(std::memory_order_relaxed);
+    if (g_output_native_location && game_out) {
+        __try {
+            void* current = *reinterpret_cast<void**>(g_output_native_location);
+            // Only restore if we actually swapped (current != game's original)
+            if (current != game_out) {
+                *reinterpret_cast<void**>(g_output_native_location) = game_out;
+            }
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    }
 }
 
 static sl_Result __cdecl Hooked_slSetTag(const void* viewport, const void* tags, uint32_t numTags, void* cmdBuffer) {
-    CaptureOutputResource(tags, numTags);
-    return g_orig_slSetTag(viewport, tags, numTags, cmdBuffer);
+    CaptureAndSwapOutputResource(const_cast<void*>(tags), numTags);
+    sl_Result result = g_orig_slSetTag(viewport, tags, numTags, cmdBuffer);
+    RestoreOutputResource();
+    return result;
 }
 
 static sl_Result __cdecl Hooked_slSetTagForFrame(const void* frame, const void* viewport, const void* tags, uint32_t numTags, void* cmdBuffer) {
-    CaptureOutputResource(tags, numTags);
-    return g_orig_slSetTagForFrame(frame, viewport, tags, numTags, cmdBuffer);
+    CaptureAndSwapOutputResource(const_cast<void*>(tags), numTags);
+    sl_Result result = g_orig_slSetTagForFrame(frame, viewport, tags, numTags, cmdBuffer);
+    RestoreOutputResource();
+    return result;
 }
 
 static sl_Result __cdecl Hooked_slDLSSSetOptions(const void* viewport, const void* options) {
@@ -420,14 +477,34 @@ static sl_Result __cdecl Hooked_slEvaluateFeature(
 {
     if (feature == sl_kFeatureDLSS || feature == sl_kFeatureDLSS_RR) {
         static int s_n = 0; s_n++;
-        if (s_n <= 5 || (s_n % 300) == 0) {
-            double k = g_current_k.load(std::memory_order_relaxed);
+        double k = g_current_k.load(std::memory_order_relaxed);
+
+        if (s_n <= 5 || (s_n % 300) == 0)
             LOG_INFO("NGXInterceptor: [SL] eval #%d k=%.2f", s_n, k);
+
+        // Call original — DLSS writes to whatever resource was tagged
+        // (our k×D intermediate if swap is active, or game's D buffer if not)
+        sl_Result result = g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
+
+        // If swap is active, Lanczos downscale from intermediate to game output
+        if (g_active.load(std::memory_order_relaxed) && k > 1.01 &&
+            g_intermediate_buffer && g_output_format_captured && cmdBuffer) {
+            void* game_out = g_game_output_resource.load(std::memory_order_relaxed);
+            uint32_t gw = g_game_output_w.load(std::memory_order_relaxed);
+            uint32_t gh = g_game_output_h.load(std::memory_order_relaxed);
+            if (game_out && gw > 0 && gh > 0) {
+                auto [fw, fh] = ComputeFakeResolution(k, gw, gh);
+                auto* cmd_list = static_cast<ID3D12GraphicsCommandList*>(cmdBuffer);
+                Lanczos_Dispatch(cmd_list,
+                                 g_intermediate_buffer,
+                                 static_cast<ID3D12Resource*>(game_out),
+                                 fw, fh, gw, gh);
+                if (s_n <= 5 || (s_n % 300) == 0)
+                    LOG_INFO("NGXInterceptor: [SL] DONE #%d %ux%u -> %ux%u", s_n, fw, fh, gw, gh);
+            }
         }
+        return result;
     }
-    // v4 resource swap caused DEVICE_REMOVED — Streamline caches resource
-    // metadata at slSetTag time and validates at evaluate. Swapping the
-    // native pointer creates a metadata mismatch. Pure passthrough for now.
     return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
 }
 
@@ -900,11 +977,9 @@ void NGXInterceptor_Init(double scale_factor) {
 
 void NGXInterceptor_ReleaseGPUResources() {
     ReleaseIntermediateBuffer();
-    // Do NOT null g_device here — the device outlives the swapchain.
-    // It's only destroyed on on_destroy_device, which calls Shutdown.
-    // The game's output resource may become invalid on swapchain destroy.
-    // It will be re-captured when the game calls slSetTag again.
     g_game_output_resource.store(nullptr, std::memory_order_relaxed);
+    g_output_native_location = nullptr;
+    g_output_format_captured = false;
     LOG_INFO("NGXInterceptor: GPU resources released (hooks + device preserved)");
 }
 
