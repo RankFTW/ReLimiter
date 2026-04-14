@@ -396,9 +396,11 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
     __try {
         param_vtable = *reinterpret_cast<void***>(params);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        static int s1 = 0; if (++s1 <= 3) LOG_WARN("NGXInterceptor: FAIL vtable read SEH");
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
     if (!param_vtable) {
+        static int s2 = 0; if (++s2 <= 3) LOG_WARN("NGXInterceptor: FAIL vtable null");
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
 
@@ -407,6 +409,8 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
     auto fnSetResource = reinterpret_cast<NGXParam_SetResource_t>(
         param_vtable[NGX_PARAM_VTABLE_SET_RESOURCE]);
     if (!fnGetResource || !fnSetResource) {
+        static int s3 = 0; if (++s3 <= 3) LOG_WARN("NGXInterceptor: FAIL Get=%p Set=%p (idx %d/%d)",
+            fnGetResource, fnSetResource, NGX_PARAM_VTABLE_GET_RESOURCE, NGX_PARAM_VTABLE_SET_RESOURCE);
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
 
@@ -414,10 +418,11 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
     __try {
         fnGetResource(params, "Output", &original_output);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
-        LOG_ERROR("NGXInterceptor: SEH in GetResource — passthrough");
+        static int s4 = 0; if (++s4 <= 3) LOG_WARN("NGXInterceptor: FAIL GetResource SEH");
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
     if (!original_output) {
+        static int s5 = 0; if (++s5 <= 3) LOG_WARN("NGXInterceptor: FAIL Output null");
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
 
@@ -426,11 +431,13 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
     __try {
         orig_desc = original_output->GetDesc();
     } __except(EXCEPTION_EXECUTE_HANDLER) {
+        static int s6 = 0; if (++s6 <= 3) LOG_WARN("NGXInterceptor: FAIL GetDesc SEH");
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
     uint32_t display_w = static_cast<uint32_t>(orig_desc.Width);
     uint32_t display_h = orig_desc.Height;
     if (display_w == 0 || display_h == 0) {
+        static int s7 = 0; if (++s7 <= 3) LOG_WARN("NGXInterceptor: FAIL dims %ux%u", display_w, display_h);
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
 
@@ -442,6 +449,8 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
 
     // ── Ensure intermediate buffer ──
     if (!EnsureIntermediateBuffer(fake_w, fake_h, orig_desc.Format)) {
+        static int s8 = 0; if (++s8 <= 3) LOG_WARN("NGXInterceptor: FAIL buffer alloc %ux%u fmt=%d",
+            fake_w, fake_h, static_cast<int>(orig_desc.Format));
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
 
