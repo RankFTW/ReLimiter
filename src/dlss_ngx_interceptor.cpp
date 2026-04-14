@@ -270,79 +270,58 @@ static NVSDK_NGX_Result EvaluateFeatureHooked(
     void* callback,
     NGX_D3D12_EvaluateFeature_t orig_fn)
 {
-    double k = g_current_k.load(std::memory_order_relaxed);
-    uint32_t disp_w = g_display_w.load(std::memory_order_relaxed);
-    uint32_t disp_h = g_display_h.load(std::memory_order_relaxed);
+    // ── DIAGNOSTIC MODE: log and passthrough only, no interception ──
+    static int s_eval_count = 0;
+    s_eval_count++;
 
-    // k==1.0 or not active: passthrough, no interception needed
-    if (k <= 1.0 + 1e-6 || !g_active.load(std::memory_order_relaxed) ||
-        !g_intermediate_buffer || !params || !cmd_list) {
-        return orig_fn(cmd_list, feature_handle, params, callback);
-    }
+    // Log first 5 calls, then every 300th
+    if (s_eval_count <= 5 || (s_eval_count % 300) == 0) {
+        double k = g_current_k.load(std::memory_order_relaxed);
+        bool active = g_active.load(std::memory_order_relaxed);
 
-    // Read the current output resource from NGX params via vtable
-    void** param_vtable = *reinterpret_cast<void***>(params);
-    if (!param_vtable) {
-        return orig_fn(cmd_list, feature_handle, params, callback);
-    }
+        // Try to read output resource info for diagnostics
+        ID3D12Resource* output = nullptr;
+        uint32_t out_w = 0, out_h = 0;
+        if (params) {
+            void** param_vtable = *reinterpret_cast<void***>(params);
+            if (param_vtable) {
+                auto fnGetResource = reinterpret_cast<NGXParam_GetResource_t>(
+                    param_vtable[NGX_PARAM_VTABLE_GET_RESOURCE]);
+                auto fnGetUint = reinterpret_cast<NGXParam_GetUint_t>(
+                    param_vtable[NGX_PARAM_VTABLE_GET_UINT]);
+                if (fnGetResource)
+                    fnGetResource(params, "Output", &output);
+                if (fnGetUint) {
+                    fnGetUint(params, "OutWidth", &out_w);
+                    fnGetUint(params, "OutHeight", &out_h);
+                }
+            }
+        }
 
-    auto fnGetResource = reinterpret_cast<NGXParam_GetResource_t>(
-        param_vtable[NGX_PARAM_VTABLE_GET_RESOURCE]);
-    auto fnSetResource = reinterpret_cast<NGXParam_SetResource_t>(
-        param_vtable[NGX_PARAM_VTABLE_SET_RESOURCE]);
-    auto fnSetUint = reinterpret_cast<NGXParam_SetUint_t>(
-        param_vtable[NGX_PARAM_VTABLE_SET_UINT]);
-
-    if (!fnGetResource || !fnSetResource || !fnSetUint) {
-        return orig_fn(cmd_list, feature_handle, params, callback);
-    }
-
-    // Get the original output resource
-    ID3D12Resource* original_output = nullptr;
-    NVSDK_NGX_Result get_result = fnGetResource(params, "Output", &original_output);
-    if (!original_output) {
-        // Can't read output — just passthrough
-        return orig_fn(cmd_list, feature_handle, params, callback);
-    }
-
-    // Compute k×D viewport dimensions within the pre-allocated buffer
-    uint32_t kd_w = static_cast<uint32_t>(std::floor(k * disp_w));
-    uint32_t kd_h = static_cast<uint32_t>(std::floor(k * disp_h));
-
-    // Ensure intermediate buffer is large enough (may need realloc on format change)
-    D3D12_RESOURCE_DESC out_desc = original_output->GetDesc();
-    if (!g_intermediate_buffer ||
-        g_intermediate_alloc_w < kd_w || g_intermediate_alloc_h < kd_h ||
-        g_intermediate_format != out_desc.Format) {
-        // Allocate at k_max size for pre-allocation strategy
-        // Use current kd as minimum — the SetDevice call pre-allocates at k_max
-        if (!AllocateIntermediateBuffer(kd_w, kd_h, out_desc.Format)) {
-            LOG_ERROR("NGXInterceptor: intermediate buffer alloc failed in EvaluateFeature, passthrough");
-            return orig_fn(cmd_list, feature_handle, params, callback);
+        if (output) {
+            D3D12_RESOURCE_DESC desc = output->GetDesc();
+            LOG_INFO("NGXInterceptor: EvaluateFeature #%d — k=%.2f active=%d "
+                     "output=%p (%llux%u fmt=%d) OutWidth=%u OutHeight=%u "
+                     "cmd_list=%p handle=%p",
+                     s_eval_count, k, active ? 1 : 0,
+                     output, desc.Width, desc.Height, static_cast<int>(desc.Format),
+                     out_w, out_h, cmd_list, feature_handle);
+        } else {
+            LOG_INFO("NGXInterceptor: EvaluateFeature #%d — k=%.2f active=%d "
+                     "output=NULL OutWidth=%u OutHeight=%u cmd_list=%p handle=%p",
+                     s_eval_count, k, active ? 1 : 0,
+                     out_w, out_h, cmd_list, feature_handle);
         }
     }
 
-    // Swap output to our intermediate buffer
-    fnSetResource(params, "Output", g_intermediate_buffer);
-    fnSetUint(params, "OutWidth", kd_w);
-    fnSetUint(params, "OutHeight", kd_h);
+    // Pure passthrough — no interception, just call original
+    return orig_fn(cmd_list, feature_handle, params, callback);
 
-    // Call original EvaluateFeature — DLSS upscales from s×D to k×D
-    NVSDK_NGX_Result eval_result = orig_fn(cmd_list, feature_handle, params, callback);
-
-    // Restore original output param
-    fnSetResource(params, "Output", original_output);
-    fnSetUint(params, "OutWidth", out_desc.Width > 0 ? static_cast<unsigned int>(out_desc.Width) : disp_w);
-    fnSetUint(params, "OutHeight", out_desc.Height > 0 ? out_desc.Height : disp_h);
-
-    // Lanczos downscale from k×D (intermediate) to D (original_output)
-    // The command list is the same one DLSS used, so we can dispatch immediately
-    Lanczos_Dispatch(cmd_list,
-                     g_intermediate_buffer, original_output,
-                     kd_w, kd_h,
-                     disp_w, disp_h);
-
-    return eval_result;
+    // ── INTERCEPTION LOGIC (disabled during diagnostic mode) ──
+    // TODO: Re-enable once passthrough diagnostics confirm the hook is stable.
+    // The code below swaps the DLSS output to an intermediate buffer at k×D,
+    // then Lanczos downscales back to D. Currently disabled because even
+    // pure passthrough needs validation first.
 }
 
 // Trampoline for nvngx_dlss.dll hook
@@ -513,15 +492,26 @@ void NGXInterceptor_OnDLSSDllLoaded(void* hModule) {
     // Install CreateFeature hook for Ray Reconstruction detection
     InstallCreateFeatureHook(hDlssDll);
 
-    // DISABLED: EvaluateFeature hook causes black screen in Crimson Desert.
-    // The hook fires but corrupts the DLSS output even in passthrough mode.
-    // Need to debug the intermediate buffer swap and resource state transitions.
-    // TODO: Fix the EvaluateFeature interception — likely resource barrier or
-    // format mismatch issue with the intermediate buffer.
-    //
-    // InstallEvaluateFeatureHook(hDlssDll, "nvngx_dlss.dll", ...);
-    // InstallEvaluateFeatureHook(hNgxDll, "nvngx.dll", ...);
-    LOG_INFO("NGXInterceptor: EvaluateFeature hook DISABLED (pending black screen fix)");
+    // Install EvaluateFeature hook in DIAGNOSTIC MODE (passthrough + logging only)
+    InstallEvaluateFeatureHook(hDlssDll, "nvngx_dlss.dll",
+                                reinterpret_cast<void*>(&Hooked_EvaluateFeature_DLSS),
+                                &g_orig_EvaluateFeature_dlss,
+                                &g_eval_hooked_dlss,
+                                &g_eval_target_dlss);
+
+    // Also try from nvngx.dll
+    HMODULE hNgxDll = GetModuleHandleW(L"nvngx.dll");
+    if (hNgxDll) {
+        InstallEvaluateFeatureHook(hNgxDll, "nvngx.dll",
+                                    reinterpret_cast<void*>(&Hooked_EvaluateFeature_NGX),
+                                    &g_orig_EvaluateFeature_ngx,
+                                    &g_eval_hooked_ngx,
+                                    &g_eval_target_ngx);
+    }
+
+    if (!g_eval_hooked_dlss && !g_eval_hooked_ngx) {
+        LOG_WARN("NGXInterceptor: EvaluateFeature hook not installed from any DLL");
+    }
 
     // Install parameter Get hook for render dimension override
     using GetParams_t = NVSDK_NGX_Result (__cdecl*)(NVSDK_NGX_Parameter**);
