@@ -183,6 +183,23 @@ void OnMarker(uint64_t frameID, int64_t now) {
         // (during loading screens, actual_frame_time is 0)
         if (ema_fps <= 0.0) goto skip_dlss_update;
         {
+        // Set initial display dimensions on first valid frame
+        static bool s_dlss_dims_set = false;
+        if (!s_dlss_dims_set) {
+            s_dlss_dims_set = true;
+            HWND hwnd = SwapMgr_GetHWND();
+            if (hwnd) {
+                RECT rc;
+                if (GetClientRect(hwnd, &rc)) {
+                    uint32_t dw = rc.right - rc.left;
+                    uint32_t dh = rc.bottom - rc.top;
+                    if (dw > 0 && dh > 0) {
+                        NGXInterceptor_SetScalingParams(1.0, dw, dh);
+                        LOG_INFO("DLSS Scaling: initial display dims set %ux%u", dw, dh);
+                    }
+                }
+            }
+        }
 
         int target_fps = g_user_target_fps.load(std::memory_order_relaxed);
         double target_fps_d = static_cast<double>(target_fps);
@@ -210,9 +227,22 @@ void OnMarker(uint64_t frameID, int64_t now) {
         // ── Sub-task 8.6: Tier transition orchestration (NGX-only approach) ──
         if (tier_changed) {
             KControllerState state = KController_GetState();
-            NGXInterceptor_SetScalingParams(state.current_k, 3440, 1440);
-            LOG_INFO("DLSS Scaling: tier changed to T%d k=%.2f",
-                     state.current_tier, state.current_k);
+
+            // Get display dimensions from HWND (thread-safe, no DXGI calls)
+            uint32_t dw = 0, dh = 0;
+            HWND hwnd = SwapMgr_GetHWND();
+            if (hwnd) {
+                RECT rc;
+                if (GetClientRect(hwnd, &rc)) {
+                    dw = rc.right - rc.left;
+                    dh = rc.bottom - rc.top;
+                }
+            }
+            if (dw > 0 && dh > 0) {
+                NGXInterceptor_SetScalingParams(state.current_k, dw, dh);
+            }
+            LOG_INFO("DLSS Scaling: tier changed to T%d k=%.2f display=%ux%u",
+                     state.current_tier, state.current_k, dw, dh);
         }
         } // end ema_fps > 0 guard
         skip_dlss_update:;
