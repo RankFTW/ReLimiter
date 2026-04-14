@@ -681,14 +681,17 @@ void NGXInterceptor_OnDLSSDllLoaded(void* hModule) {
     LOG_INFO("NGXInterceptor: NGX DLL loaded (%p), attempting EvaluateFeature hook", hModule);
 
     __try {
-        // DIAGNOSTIC: skip CreateFeature hook — it may be corrupting Streamline
+        // DIAGNOSTIC: skip EvaluateFeature hook to test if trampoline causes crash
         // InstallCreateFeatureHook(hDll);
 
         // Install EvaluateFeature hook — this is the core interception point
-        if (InstallDirectNGXHook(hDll, "_nvngx.dll")) {
-            g_active.store(true, std::memory_order_relaxed);
-            LOG_INFO("NGXInterceptor: EvaluateFeature hook active on _nvngx.dll");
-        }
+        // DIAGNOSTIC: DISABLED to test if MinHook trampoline is the crash cause
+        // if (InstallDirectNGXHook(hDll, "_nvngx.dll")) {
+        //     g_active.store(true, std::memory_order_relaxed);
+        //     LOG_INFO("NGXInterceptor: EvaluateFeature hook active on _nvngx.dll");
+        // }
+        LOG_INFO("NGXInterceptor: EvaluateFeature hook DISABLED for trampoline crash test");
+        g_active.store(true, std::memory_order_relaxed);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         LOG_ERROR("NGXInterceptor: SEH exception in OnDLSSDllLoaded (0x%08X) — hook installation failed",
                   GetExceptionCode());
