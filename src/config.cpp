@@ -152,6 +152,9 @@ void LoadConfig(HMODULE hModule) {
     g_config.osd_show_limiter        = ReadINIBool(S, "osd_show_limiter", false, P);
     g_config.osd_show_pqi            = ReadINIBool(S, "osd_show_pqi", false, P);
     g_config.osd_show_cpu_latency    = ReadINIBool(S, "osd_show_cpu_latency", false, P);
+    g_config.osd_show_gpu_render     = ReadINIBool(S, "osd_show_gpu_render", false, P);
+    g_config.osd_show_pipeline_latency = ReadINIBool(S, "osd_show_pipeline_latency", false, P);
+    g_config.osd_show_fg_time        = ReadINIBool(S, "osd_show_fg_time", false, P);
     g_config.osd_show_pqi_breakdown  = ReadINIBool(S, "osd_show_pqi_breakdown", false, P);
     g_config.osd_show_1pct_low       = ReadINIBool(S, "osd_show_1pct_low", false, P);
     g_config.osd_show_smoothness     = ReadINIBool(S, "osd_show_smoothness", false, P);
@@ -205,6 +208,9 @@ void SaveConfig() {
     WriteINIBool(S, "osd_show_limiter", g_config.osd_show_limiter, P);
     WriteINIBool(S, "osd_show_pqi", g_config.osd_show_pqi, P);
     WriteINIBool(S, "osd_show_cpu_latency", g_config.osd_show_cpu_latency, P);
+    WriteINIBool(S, "osd_show_gpu_render", g_config.osd_show_gpu_render, P);
+    WriteINIBool(S, "osd_show_pipeline_latency", g_config.osd_show_pipeline_latency, P);
+    WriteINIBool(S, "osd_show_fg_time", g_config.osd_show_fg_time, P);
     WriteINIBool(S, "osd_show_pqi_breakdown", g_config.osd_show_pqi_breakdown, P);
     WriteINIBool(S, "osd_show_1pct_low", g_config.osd_show_1pct_low, P);
     WriteINIBool(S, "osd_show_smoothness", g_config.osd_show_smoothness, P);

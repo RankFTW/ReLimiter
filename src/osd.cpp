@@ -24,6 +24,7 @@
 #include "presentation_gate.h"
 #include "flip_model.h"
 #include "adaptive_smoothing.h"
+#include "feedback.h"
 #include "logger.h"
 #include <string>
 #include <atomic>
@@ -287,7 +288,13 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Latency");
         if (ImGui::Checkbox("CPU Latency##osd_elem", &g_config.osd_show_cpu_latency)) config_dirty = true;
-        HelpTip("CPU pipeline time: SIM_START to RENDERSUBMIT_END. Measures how long the CPU spends on simulation + render submission.");
+        HelpTip("CPU pipeline time: SIM_START to PRESENT_START. Measures how long the CPU spends on simulation + render submission. DX12+Reflex only.");
+        if (ImGui::Checkbox("GPU Render##osd_elem", &g_config.osd_show_gpu_render)) config_dirty = true;
+        HelpTip("GPU active render time excluding idle bubbles between draw calls. Shows how long the GPU actually works per frame. DX12+Reflex only.");
+        if (ImGui::Checkbox("Pipeline Latency##osd_elem", &g_config.osd_show_pipeline_latency)) config_dirty = true;
+        HelpTip("Time from the present call to GPU render completion. Shows how long the frame sits in the driver and GPU pipeline after submission. DX12+Reflex only.");
+        if (ImGui::Checkbox("FG Time##osd_elem", &g_config.osd_show_fg_time)) config_dirty = true;
+        HelpTip("DLSS Frame Generation time per generated frame. Only visible when Frame Generation is active. DX12+Reflex only.");
 
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "Quality");
@@ -1013,6 +1020,33 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             if (cpu_us > 0.0) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "CPU: %.1f ms", cpu_us / 1000.0);
+                OSDTextColored(ColLatency(), buf);
+            }
+        }
+
+        if (g_config.osd_show_gpu_render) {
+            double gpu_us = g_reflex_gpu_active_us.load(std::memory_order_relaxed);
+            if (gpu_us > 0.0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "GPU: %.1f ms", gpu_us / 1000.0);
+                OSDTextColored(ColLatency(), buf);
+            }
+        }
+
+        if (g_config.osd_show_pipeline_latency) {
+            double pipe_us = g_reflex_pipeline_latency_us.load(std::memory_order_relaxed);
+            if (pipe_us > 0.0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "Pipeline: %.1f ms", pipe_us / 1000.0);
+                OSDTextColored(ColLatency(), buf);
+            }
+        }
+
+        if (g_config.osd_show_fg_time) {
+            double ai_us = g_reflex_ai_frame_time_us.load(std::memory_order_relaxed);
+            if (ai_us > 0.0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "FG: %.1f ms", ai_us / 1000.0);
                 OSDTextColored(ColLatency(), buf);
             }
         }

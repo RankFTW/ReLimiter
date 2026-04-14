@@ -30,6 +30,9 @@ struct Config {
     bool osd_show_limiter = false;
     bool osd_show_pqi = false;
     bool osd_show_cpu_latency = false;
+    bool osd_show_gpu_render = false;
+    bool osd_show_pipeline_latency = false;
+    bool osd_show_fg_time = false;
     bool osd_show_pqi_breakdown = false;
     bool osd_show_1pct_low = false;
     bool osd_show_smoothness = false;
