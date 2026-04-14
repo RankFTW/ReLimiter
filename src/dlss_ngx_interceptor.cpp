@@ -363,147 +363,10 @@ static sl_Result __cdecl Hooked_slEvaluateFeature(
     uint32_t numInputs,
     void* cmdBuffer)
 {
-    // Safety: if trampoline is null, we can't do anything
-    if (!g_orig_slEvaluateFeature) {
-        LOG_ERROR("NGXInterceptor: slEvaluateFeature trampoline is null — cannot forward");
-        return -1;
-    }
-
-    // Only intercept DLSS-SR and DLSS-RR
-    bool is_dlss = (feature == sl_kFeatureDLSS || feature == sl_kFeatureDLSS_RR);
-
-    if (!is_dlss || !g_active.load(std::memory_order_relaxed)) {
-        // Not DLSS or not active — pure passthrough
-        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
-    }
-
-    // Track Ray Reconstruction
-    if (feature == sl_kFeatureDLSS_RR) {
-        bool was_rr = g_ray_reconstruction.exchange(true, std::memory_order_relaxed);
-        if (!was_rr)
-            LOG_INFO("NGXInterceptor: DLSS-RR detected via slEvaluateFeature");
-    }
-
-    double k = g_current_k.load(std::memory_order_relaxed);
-
-    // k ≈ 1.0 means no scaling needed — passthrough
-    if (k <= 1.01) {
-        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
-    }
-
-    // ── Find the ScalingOutputColor tag in the inputs ──
-    // Inputs are a chain of sl::BaseStructure*. ResourceTags have structType == 5.
-    // We scan for a ResourceTag with type == kBufferTypeScalingOutputColor.
-    sl_ResourceTag* output_tag = nullptr;
-    sl_Resource*    original_resource = nullptr;
-    ID3D12Resource* original_d3d_resource = nullptr;
-    uint32_t        original_state = 0;
-
-    for (uint32_t i = 0; i < numInputs; i++) {
-        if (!inputs[i]) continue;
-        const sl_BaseStructure* s = inputs[i];
-        // Walk the chain (each struct can have a ->next chain)
-        while (s) {
-            if (s->structType == sl_StructType_ResourceTag) {
-                auto* tag = const_cast<sl_ResourceTag*>(
-                    reinterpret_cast<const sl_ResourceTag*>(s));
-                if (tag->type == sl_kBufferTypeScalingOutputColor && tag->resource) {
-                    output_tag = tag;
-                    original_resource = tag->resource;
-                    original_d3d_resource = static_cast<ID3D12Resource*>(tag->resource->native);
-                    original_state = tag->resource->state;
-                    break;
-                }
-            }
-            s = static_cast<const sl_BaseStructure*>(s->next);
-        }
-        if (output_tag) break;
-    }
-
-    // If we can't find the output tag, passthrough
-    if (!output_tag || !original_d3d_resource) {
-        static int s_miss_count = 0;
-        if (++s_miss_count <= 5)
-            LOG_WARN("NGXInterceptor: ScalingOutputColor tag not found in slEvaluateFeature inputs "
-                     "(call #%d, numInputs=%u) — passthrough", s_miss_count, numInputs);
-        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
-    }
-
-    // ── Get display dimensions from the original output ──
-    D3D12_RESOURCE_DESC orig_desc = original_d3d_resource->GetDesc();
-    uint32_t display_w = static_cast<uint32_t>(orig_desc.Width);
-    uint32_t display_h = orig_desc.Height;
-
-    // ── Compute intermediate buffer size (k × D) ──
-    auto [fake_w, fake_h] = ComputeFakeResolution(k, display_w, display_h);
-
-    // ── Ensure intermediate buffer is allocated ──
-    if (!EnsureIntermediateBuffer(fake_w, fake_h, orig_desc.Format)) {
-        LOG_ERROR("NGXInterceptor: intermediate buffer alloc failed for %ux%u — passthrough",
-                  fake_w, fake_h);
-        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
-    }
-
-    // ── Swap the output resource to our intermediate buffer ──
-    // Save original values
-    void*    saved_native = original_resource->native;
-    uint32_t saved_state  = original_resource->state;
-
-    // Point DLSS output at our intermediate buffer (k×D)
-    original_resource->native = static_cast<void*>(g_intermediate_buffer);
-    original_resource->state  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-
-    // Also update the extent if present to reflect the larger output
-    sl_Extent saved_extent = {};
-    bool had_extent = (output_tag->extent != nullptr);
-    if (had_extent) {
-        saved_extent = *output_tag->extent;
-        output_tag->extent->width  = fake_w;
-        output_tag->extent->height = fake_h;
-    }
-
-    // ── Call original slEvaluateFeature — DLSS upscales to k×D ──
-    sl_Result result = g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
-
-    // ── Restore original resource pointer ──
-    original_resource->native = saved_native;
-    original_resource->state  = saved_state;
-    if (had_extent) {
-        *output_tag->extent = saved_extent;
-    }
-
-    if (result != sl_eOk) {
-        static int s_err_count = 0;
-        if (++s_err_count <= 5)
-            LOG_ERROR("NGXInterceptor: slEvaluateFeature returned error %d — skipping Lanczos",
-                      result);
-        return result;
-    }
-
-    // ── Lanczos downscale: intermediate (k×D) → game output (D) ──
-    auto* cmd_list = static_cast<ID3D12GraphicsCommandList*>(cmdBuffer);
-    if (cmd_list) {
-        Lanczos_Dispatch(cmd_list,
-                         g_intermediate_buffer, original_d3d_resource,
-                         fake_w, fake_h,
-                         display_w, display_h);
-    }
-
-    // Periodic logging
-    static int s_eval_count = 0;
-    s_eval_count++;
-    if (s_eval_count <= 3 || (s_eval_count % 300) == 0) {
-        LOG_INFO("NGXInterceptor: [SL] eval #%d — k=%.2f, DLSS output=%ux%u, "
-                 "Lanczos %ux%u -> %ux%u, feature=%u",
-                 s_eval_count, k, fake_w, fake_h,
-                 fake_w, fake_h, display_w, display_h, feature);
-    }
-
-    return result;
+    // Minimal passthrough — interception disabled
+    return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
 }
 
-// ══════════════════════════════════════════════════════════════════════
-// DIRECT NGX PATH: EvaluateFeature hook
 // ======================================================================
 
 static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
@@ -681,17 +544,11 @@ void NGXInterceptor_OnDLSSDllLoaded(void* hModule) {
     LOG_INFO("NGXInterceptor: NGX DLL loaded (%p), attempting EvaluateFeature hook", hModule);
 
     __try {
-        // DIAGNOSTIC: skip EvaluateFeature hook to test if trampoline causes crash
-        // InstallCreateFeatureHook(hDll);
-
-        // Install EvaluateFeature hook — this is the core interception point
-        // DIAGNOSTIC: DISABLED to test if MinHook trampoline is the crash cause
-        // if (InstallDirectNGXHook(hDll, "_nvngx.dll")) {
-        //     g_active.store(true, std::memory_order_relaxed);
-        //     LOG_INFO("NGXInterceptor: EvaluateFeature hook active on _nvngx.dll");
-        // }
-        LOG_INFO("NGXInterceptor: EvaluateFeature hook DISABLED for trampoline crash test");
-        g_active.store(true, std::memory_order_relaxed);
+        // Install EvaluateFeature hook on _nvngx.dll
+        if (InstallDirectNGXHook(hDll, "_nvngx.dll")) {
+            g_active.store(true, std::memory_order_relaxed);
+            LOG_INFO("NGXInterceptor: EvaluateFeature hook active on _nvngx.dll");
+        }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         LOG_ERROR("NGXInterceptor: SEH exception in OnDLSSDllLoaded (0x%08X) — hook installation failed",
                   GetExceptionCode());
