@@ -313,8 +313,12 @@ void SwapMgr_OnInitDevice(reshade::api::device* device) {
             } else {
                 LOG_WARN("DLSS Scaling: Lanczos shader init failed (bilinear fallback)");
             }
-            MipCorrector_Init(d3d12_device);
-            LOG_INFO("DLSS Scaling: MipCorrector initialized");
+            // MipCorrector disabled — vtable indices need validation per D3D12 runtime.
+            // TODO: Derive correct CreateSampler/CreateRootSignature vtable offsets
+            // from the SDK headers or use MinHook instead of raw vtable patching.
+            // MipCorrector_Init(d3d12_device);
+            // LOG_INFO("DLSS Scaling: MipCorrector initialized");
+            LOG_INFO("DLSS Scaling: MipCorrector skipped (vtable hook disabled pending validation)");
         }
     }
 }
