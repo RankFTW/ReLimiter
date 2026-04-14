@@ -226,13 +226,23 @@ static void on_present(reshade::api::command_queue* queue,
             InstallNvAPIHooks();
             LOG_INFO("NvAPI hooks installed (deferred)");
 
-            // Late detection: nvngx_dlss.dll may already be loaded by Streamline
-            // before our LoadLibrary hooks were installed. Check now.
+            // Late detection: NGX DLLs may already be loaded by Streamline
+            // before our LoadLibrary hooks were installed. Check all known
+            // NGX DLL names — Streamline routes through _nvngx.dll or nvngx.dll,
+            // not nvngx_dlss.dll (which is just the model weights).
             if (g_config.adaptive_dlss_scaling) {
-                HMODULE hDlss = GetModuleHandleW(L"nvngx_dlss.dll");
-                if (hDlss) {
-                    LOG_INFO("DLSS Scaling: nvngx_dlss.dll already loaded (late detection), hooking now");
-                    NGXInterceptor_OnDLSSDllLoaded(static_cast<void*>(hDlss));
+                const wchar_t* ngx_dll_names[] = {
+                    L"nvngx_dlss.dll",
+                    L"_nvngx.dll",
+                    L"nvngx.dll",
+                };
+                for (auto* name : ngx_dll_names) {
+                    HMODULE hDll = GetModuleHandleW(name);
+                    if (hDll) {
+                        LOG_INFO("DLSS Scaling: %ls already loaded (late detection), hooking now", name);
+                        NGXInterceptor_OnDLSSDllLoaded(static_cast<void*>(hDll));
+                        break;  // Only need to hook once
+                    }
                 }
             }
         }
