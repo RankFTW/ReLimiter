@@ -173,6 +173,10 @@ bool KController_Update(double ema_fps, double target_fps,
     double gpu_active = g_reflex_gpu_active_us.load(std::memory_order_relaxed);
     if (gpu_active > 0.0) {
         gpu_time_ms = gpu_active / 1000.0;
+    } else {
+        // No Reflex data yet — skip this frame, don't reset counters
+        PublishState();
+        return false;
     }
 
     // Track consecutive frames below/above thresholds
