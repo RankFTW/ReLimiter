@@ -458,16 +458,48 @@ static sl_Result __cdecl Hooked_slDLSSSetOptions(const void* viewport, const voi
         if (g_orig_slDLSSSetOptions) return g_orig_slDLSSSetOptions(viewport, options);
         return -1;
     }
+
+    auto* b = reinterpret_cast<const uint8_t*>(options);
+    uint32_t w = 0, h = 0;
     __try {
-        auto* b = reinterpret_cast<const uint8_t*>(options);
-        uint32_t w = *reinterpret_cast<const uint32_t*>(b + SL_DLSS_OFFSET_OUTPUT_WIDTH);
-        uint32_t h = *reinterpret_cast<const uint32_t*>(b + SL_DLSS_OFFSET_OUTPUT_HEIGHT);
-        if (w > 0 && h > 0) {
-            uint32_t pw = g_game_output_w.exchange(w, std::memory_order_relaxed);
-            if (pw != w) LOG_INFO("NGXInterceptor: game DLSS output dims: %ux%u", w, h);
-            g_game_output_h.store(h, std::memory_order_relaxed);
-        }
+        w = *reinterpret_cast<const uint32_t*>(b + SL_DLSS_OFFSET_OUTPUT_WIDTH);
+        h = *reinterpret_cast<const uint32_t*>(b + SL_DLSS_OFFSET_OUTPUT_HEIGHT);
     } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+    if (w > 0 && h > 0) {
+        uint32_t pw = g_game_output_w.exchange(w, std::memory_order_relaxed);
+        if (pw != w) LOG_INFO("NGXInterceptor: game DLSS output dims: %ux%u", w, h);
+        g_game_output_h.store(h, std::memory_order_relaxed);
+    }
+
+    double k = g_current_k.load(std::memory_order_relaxed);
+
+    // Override dimensions to k×D when swap is active
+    // This must match the resource swap in slSetTag
+    if (g_active.load(std::memory_order_relaxed) && k > 1.01 &&
+        g_output_format_captured && g_intermediate_buffer && w > 0 && h > 0) {
+        auto [fw, fh] = ComputeFakeResolution(k, w, h);
+        auto* bm = const_cast<uint8_t*>(b);
+        __try {
+            *reinterpret_cast<uint32_t*>(bm + SL_DLSS_OFFSET_OUTPUT_WIDTH) = fw;
+            *reinterpret_cast<uint32_t*>(bm + SL_DLSS_OFFSET_OUTPUT_HEIGHT) = fh;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+        static int s_log = 0;
+        if (++s_log <= 5 || (s_log % 300) == 0)
+            LOG_INFO("NGXInterceptor: slDLSSSetOptions override: %ux%u -> %ux%u (k=%.2f)", w, h, fw, fh, k);
+
+        sl_Result result = g_orig_slDLSSSetOptions(viewport, options);
+
+        // Restore original dimensions
+        __try {
+            *reinterpret_cast<uint32_t*>(bm + SL_DLSS_OFFSET_OUTPUT_WIDTH) = w;
+            *reinterpret_cast<uint32_t*>(bm + SL_DLSS_OFFSET_OUTPUT_HEIGHT) = h;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+        return result;
+    }
+
     return g_orig_slDLSSSetOptions(viewport, options);
 }
 
