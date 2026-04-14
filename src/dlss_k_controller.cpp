@@ -158,24 +158,33 @@ bool KController_Update(double ema_fps, double target_fps,
         decision_fps = ema_fps / static_cast<double>(fg_multiplier);
     }
 
-    // Compute thresholds using frame time instead of FPS.
-    // The limiter caps output FPS at exactly the target, so FPS-based
-    // comparison never shows headroom. Instead, compare the actual
-    // frame time against the target interval:
-    //   - If frame_time > target_interval / down_threshold: GPU is struggling, drop tier
-    //   - If frame_time < target_interval / up_threshold: GPU has headroom, raise tier
+    // Compute thresholds using GPU active render time from Reflex.
+    // The scheduler's frame_time_ms includes limiter sleep and is always
+    // ~target_interval regardless of GPU load. The Reflex GPU active time
+    // is the actual GPU workload — the real signal for headroom.
     double target_interval_ms = (target_fps > 0.0) ? (1000.0 / target_fps) : 6.06;
     if (fg_active && fg_multiplier > 1) {
         target_interval_ms *= static_cast<double>(fg_multiplier);
     }
 
+    // Use GPU active render time if available, fall back to frame_time_ms
+    double gpu_time_ms = frame_time_ms;  // fallback
+    extern std::atomic<double> g_reflex_gpu_active_us;
+    double gpu_active = g_reflex_gpu_active_us.load(std::memory_order_relaxed);
+    if (gpu_active > 0.0) {
+        gpu_time_ms = gpu_active / 1000.0;
+    }
+
     // Track consecutive frames below/above thresholds
-    // "below" = GPU struggling (frame time too long)
-    // "above" = GPU has headroom (frame time short enough to raise quality)
-    if (frame_time_ms > target_interval_ms / g_kc.down_threshold) {
+    // "below" = GPU struggling (render time exceeds budget)
+    // "above" = GPU has headroom (render time well under budget)
+    double drop_budget = target_interval_ms / g_kc.down_threshold;
+    double raise_budget = target_interval_ms / g_kc.up_threshold;
+
+    if (gpu_time_ms > drop_budget) {
         g_kc.frames_below++;
         g_kc.frames_above = 0;
-    } else if (frame_time_ms < target_interval_ms / g_kc.up_threshold) {
+    } else if (gpu_time_ms < raise_budget) {
         g_kc.frames_above++;
         g_kc.frames_below = 0;
     } else {
