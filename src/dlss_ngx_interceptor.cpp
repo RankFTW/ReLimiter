@@ -415,15 +415,33 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
     }
 
     ID3D12Resource* original_output = nullptr;
+    static const char* s_output_name_cache = "Output";
+    const char* found_name = nullptr;
     __try {
         fnGetResource(params, "Output", &original_output);
+        if (original_output) found_name = "Output";
+        if (!original_output) {
+            fnGetResource(params, "Color", &original_output);
+            if (original_output) found_name = "Color";
+        }
+        if (!original_output) {
+            fnGetResource(params, "DLSS.Output.Color", &original_output);
+            if (original_output) found_name = "DLSS.Output.Color";
+        }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         static int s4 = 0; if (++s4 <= 3) LOG_WARN("NGXInterceptor: FAIL GetResource SEH");
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
     if (!original_output) {
-        static int s5 = 0; if (++s5 <= 3) LOG_WARN("NGXInterceptor: FAIL Output null");
+        static int s5 = 0; if (++s5 <= 3) LOG_WARN("NGXInterceptor: FAIL all param names null");
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+    }
+    // Update the static name for Set calls
+    s_output_name_cache = found_name;
+    static bool s_name_logged = false;
+    if (!s_name_logged) {
+        s_name_logged = true;
+        LOG_INFO("NGXInterceptor: Output param name = '%s', resource=%p", found_name, original_output);
     }
 
     // ── Get display dimensions from the original output ──
@@ -454,9 +472,10 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
 
-    // ── Swap output to intermediate buffer ──
+    // Track which param name worked for Get so we use the same for Set
+    static const char* s_output_name = "Output";
     __try {
-        fnSetResource(params, "Output", g_intermediate_buffer);
+        fnSetResource(params, s_output_name_cache, g_intermediate_buffer);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         LOG_ERROR("NGXInterceptor: SEH in SetResource — passthrough");
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
@@ -468,7 +487,7 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
 
     // ── Restore original output ──
     __try {
-        fnSetResource(params, "Output", original_output);
+        fnSetResource(params, s_output_name_cache, original_output);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         LOG_ERROR("NGXInterceptor: SEH restoring Output");
     }
