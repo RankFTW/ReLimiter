@@ -416,87 +416,34 @@ static void CaptureOutputResource(const void* tags_ptr, uint32_t numTags) {
     if (!tags_ptr || numTags == 0) return;
 
     __try {
-        // Walk the ResourceTag array. Each tag is a BaseStructure with a 'next'
-        // pointer at offset 0. But slSetTag takes a flat array, not a linked list.
-        //
-        // The struct size might not be 56 — try walking by reading the 'next'
-        // pointer chain if the first tag's 'next' points to the second tag.
-        // Otherwise, try common struct sizes.
-        
         auto* bytes = reinterpret_cast<const uint8_t*>(tags_ptr);
         
-        // First, check if tag[0].next points to what would be tag[1]
-        // If so, we can walk the chain. If next is null, it's a flat array.
-        void* first_next = *reinterpret_cast<void* const*>(bytes);  // offset 0 = next pointer
-        
-        if (first_next == nullptr) {
-            // next is null — this is a flat array. We need to find the stride.
-            // Try reading bufType at offset 40 for the first tag to verify layout.
-            uint32_t first_type = *reinterpret_cast<const uint32_t*>(bytes + SL_TAG_OFFSET_TYPE);
-            
-            // Try different strides to find where the second valid bufType is
-            // Common sizes: 56, 64, 72, 80, 88, 96
-            static bool s_stride_logged = false;
-            if (!s_stride_logged && numTags >= 2) {
-                s_stride_logged = true;
-                LOG_INFO("NGXInterceptor: probing tag stride — tag[0].bufType=%u at offset 40", first_type);
-                for (size_t stride = 48; stride <= 128; stride += 8) {
-                    uint32_t probe_type = *reinterpret_cast<const uint32_t*>(bytes + stride + 40);
-                    void* probe_res = *reinterpret_cast<void* const*>(bytes + stride + 32);
-                    // Valid bufType should be 0-20 range, resource should be a heap pointer or null
-                    bool type_valid = (probe_type <= 30);
-                    bool res_valid = (probe_res == nullptr) || 
-                                     (reinterpret_cast<uintptr_t>(probe_res) > 0x10000 &&
-                                      reinterpret_cast<uintptr_t>(probe_res) < 0x00007FFFFFFFFFFF);
-                    LOG_INFO("NGXInterceptor:   stride=%zu -> bufType=%u resource=%p valid=%d%d",
-                             stride, probe_type, probe_res, type_valid, res_valid);
-                }
-            }
-            
-            // For now, scan with stride 56 (our original assumption)
-            // and also try the first tag only (stride doesn't matter for tag[0])
-            constexpr size_t TAG_SIZE = 56;
-            for (uint32_t i = 0; i < numTags; i++) {
-                const uint8_t* tag = bytes + i * TAG_SIZE;
-                uint32_t buf_type = *reinterpret_cast<const uint32_t*>(tag + SL_TAG_OFFSET_TYPE);
-                
-                if (buf_type == sl_kBufferTypeScalingOutputColor) {
-                    auto* sl_resource = *reinterpret_cast<const uint8_t* const*>(tag + SL_TAG_OFFSET_RESOURCE);
-                    if (sl_resource) {
-                        void* native = *reinterpret_cast<void* const*>(sl_resource + SL_RESOURCE_OFFSET_NATIVE);
-                        if (native) {
-                            void* prev = g_game_output_resource.exchange(native, std::memory_order_relaxed);
-                            if (prev != native) {
-                                LOG_INFO("NGXInterceptor: captured game output resource %p (ScalingOutputColor, tag[%u])", native, i);
-                            }
+        // ResourceTag struct size is 64 bytes (not 56 as calculated from SDK headers).
+        // Confirmed by stride probing: stride=64 gives bufType=4 (kBufferTypeScalingOutputColor)
+        // with a valid resource pointer. The extra 8 bytes are likely alignment padding.
+        //
+        // Layout (64 bytes total):
+        //   BaseStructure: next(8) + structType(16) + structVersion(8) = 32
+        //   resource*(8) + type(4) + lifecycle(4) + extent*(8) + [8 padding] = 32
+        constexpr size_t TAG_SIZE = 64;
+
+        for (uint32_t i = 0; i < numTags; i++) {
+            const uint8_t* tag = bytes + i * TAG_SIZE;
+            uint32_t buf_type = *reinterpret_cast<const uint32_t*>(tag + SL_TAG_OFFSET_TYPE);
+
+            if (buf_type == sl_kBufferTypeScalingOutputColor) {
+                auto* sl_resource = *reinterpret_cast<const uint8_t* const*>(tag + SL_TAG_OFFSET_RESOURCE);
+                if (sl_resource) {
+                    void* native = *reinterpret_cast<void* const*>(sl_resource + SL_RESOURCE_OFFSET_NATIVE);
+                    if (native) {
+                        void* prev = g_game_output_resource.exchange(native, std::memory_order_relaxed);
+                        if (prev != native) {
+                            LOG_INFO("NGXInterceptor: captured game output resource %p "
+                                     "(ScalingOutputColor, tag[%u])", native, i);
                         }
                     }
-                    break;
                 }
-            }
-        } else {
-            // next is non-null — walk the linked list
-            const uint8_t* node = bytes;
-            uint32_t idx = 0;
-            while (node && idx < numTags) {
-                uint32_t buf_type = *reinterpret_cast<const uint32_t*>(node + SL_TAG_OFFSET_TYPE);
-                
-                if (buf_type == sl_kBufferTypeScalingOutputColor) {
-                    auto* sl_resource = *reinterpret_cast<const uint8_t* const*>(node + SL_TAG_OFFSET_RESOURCE);
-                    if (sl_resource) {
-                        void* native = *reinterpret_cast<void* const*>(sl_resource + SL_RESOURCE_OFFSET_NATIVE);
-                        if (native) {
-                            void* prev = g_game_output_resource.exchange(native, std::memory_order_relaxed);
-                            if (prev != native) {
-                                LOG_INFO("NGXInterceptor: captured game output resource %p (ScalingOutputColor, chain[%u])", native, idx);
-                            }
-                        }
-                    }
-                    break;
-                }
-                
-                node = *reinterpret_cast<const uint8_t* const*>(node);  // follow next
-                idx++;
+                break;
             }
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {
@@ -505,46 +452,18 @@ static void CaptureOutputResource(const void* tags_ptr, uint32_t numTags) {
 }
 
 static sl_Result __cdecl Hooked_slSetTag(const void* viewport, const void* tags, uint32_t numTags, void* cmdBuffer) {
-    // Diagnostic: log what tags are being set
     static int s_log = 0;
-    if (++s_log <= 20) {
-        LOG_INFO("NGXInterceptor: slSetTag called — numTags=%u tags=%p cmd=%p", numTags, tags, cmdBuffer);
-        if (tags && numTags > 0) {
-            // Dump the buffer type field at offset 40 for each tag
-            // Tag struct size = 56 bytes (BaseStructure 32 + resource* 8 + type 4 + lifecycle 4 + extent* 8)
-            auto* bytes = reinterpret_cast<const uint8_t*>(tags);
-            constexpr size_t TAG_SIZE = 56;
-            for (uint32_t i = 0; i < numTags && i < 8; i++) {
-                const uint8_t* tag = bytes + i * TAG_SIZE;
-                // Read buffer type at offset 40
-                uint32_t buf_type = *reinterpret_cast<const uint32_t*>(tag + 40);
-                // Read resource pointer at offset 32
-                void* res_ptr = *reinterpret_cast<void* const*>(tag + 32);
-                LOG_INFO("NGXInterceptor:   tag[%u] bufType=%u resource=%p (offset %zu)",
-                         i, buf_type, res_ptr, i * TAG_SIZE);
-            }
-        }
+    if (++s_log <= 3) {
+        LOG_INFO("NGXInterceptor: slSetTag called — numTags=%u tags=%p", numTags, tags);
     }
     CaptureOutputResource(tags, numTags);
     return g_orig_slSetTag(viewport, tags, numTags, cmdBuffer);
 }
 
 static sl_Result __cdecl Hooked_slSetTagForFrame(const void* frame, const void* viewport, const void* tags, uint32_t numTags, void* cmdBuffer) {
-    // Diagnostic: log what tags are being set
     static int s_log = 0;
-    if (++s_log <= 20) {
-        LOG_INFO("NGXInterceptor: slSetTagForFrame called — numTags=%u tags=%p cmd=%p", numTags, tags, cmdBuffer);
-        if (tags && numTags > 0) {
-            auto* bytes = reinterpret_cast<const uint8_t*>(tags);
-            constexpr size_t TAG_SIZE = 56;
-            for (uint32_t i = 0; i < numTags && i < 8; i++) {
-                const uint8_t* tag = bytes + i * TAG_SIZE;
-                uint32_t buf_type = *reinterpret_cast<const uint32_t*>(tag + 40);
-                void* res_ptr = *reinterpret_cast<void* const*>(tag + 32);
-                LOG_INFO("NGXInterceptor:   tag[%u] bufType=%u resource=%p (offset %zu)",
-                         i, buf_type, res_ptr, i * TAG_SIZE);
-            }
-        }
+    if (++s_log <= 3) {
+        LOG_INFO("NGXInterceptor: slSetTagForFrame called — numTags=%u tags=%p", numTags, tags);
     }
     CaptureOutputResource(tags, numTags);
     return g_orig_slSetTagForFrame(frame, viewport, tags, numTags, cmdBuffer);
@@ -564,7 +483,8 @@ struct SL_Resource_Wrapper {
 // ── ResourceTag wrapper for local tag injection ──
 // Layout must match sl::ResourceTag which inherits BaseStructure:
 //   BaseStructure: next(8) + structType(16) + structVersion(8) = 32 bytes
-//   resource(8) + type(4) + lifecycle(4) + extent(8)
+//   resource(8) + type(4) + lifecycle(4) + extent(8) + [8 padding] = 32 bytes
+//   Total: 64 bytes (confirmed by stride probing)
 struct SL_ResourceTag_Wrapper {
     // BaseStructure
     void*    next;
@@ -575,6 +495,7 @@ struct SL_ResourceTag_Wrapper {
     uint32_t type;            // buffer type ID
     uint32_t lifecycle;       // sl::ResourceLifecycle
     void*    extent;          // sl::Extent*
+    uint64_t _padding;        // alignment padding to match 64-byte stride
 };
 
 // ResourceTag GUID: {38785e2a-...} — we'll use a known value
