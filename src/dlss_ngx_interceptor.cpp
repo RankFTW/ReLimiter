@@ -512,6 +512,24 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
     NVSDK_NGX_Parameter* params,
     void* callback)
 {
+    // Safety: null trampoline check
+    if (!g_orig_EvaluateFeature_dlss) {
+        LOG_ERROR("NGXInterceptor: EvaluateFeature trampoline is null");
+        return 0;
+    }
+
+    // ── DIAGNOSTIC: log every call to verify the hook fires ──
+    static int s_eval_count = 0;
+    s_eval_count++;
+    if (s_eval_count <= 5 || (s_eval_count % 300) == 0) {
+        double k = g_current_k.load(std::memory_order_relaxed);
+        bool active = g_active.load(std::memory_order_relaxed);
+        LOG_INFO("NGXInterceptor: [NGX] EvaluateFeature #%d — k=%.2f active=%d "
+                 "cmd_list=%p handle=%p params=%p",
+                 s_eval_count, k, active ? 1 : 0,
+                 cmd_list, feature_handle, params);
+    }
+
     if (!g_active.load(std::memory_order_relaxed) || !params) {
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
@@ -580,10 +598,8 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
     }
 
     // Periodic logging
-    static int s_eval_count = 0;
-    s_eval_count++;
     if (s_eval_count <= 3 || (s_eval_count % 300) == 0) {
-        LOG_INFO("NGXInterceptor: [NGX] eval #%d — k=%.2f, DLSS output=%ux%u, "
+        LOG_INFO("NGXInterceptor: [NGX] intercepted #%d — k=%.2f, DLSS output=%ux%u, "
                  "Lanczos %ux%u -> %ux%u",
                  s_eval_count, k, fake_w, fake_h,
                  fake_w, fake_h, display_w, display_h);
@@ -721,7 +737,16 @@ void NGXInterceptor_OnStreamlineLoaded(void* hModule) {
 
 // ══════════════════════════════════════════════════════════════════════
 // Callback from loadlib_hooks.cpp when a proxy NGX DLL is loaded
-// (_nvngx.dll, nvngx.dll). Only installs CreateFeature for RR detection.
+// (_nvngx.dll, nvngx.dll). 
+//
+// In Streamline games, _nvngx.dll is the ONLY DLL that exports
+// NVSDK_NGX_D3D12_EvaluateFeature — there is no nvngx_dlss.dll.
+// Streamline routes: Game → _nvngx.dll → sl.dlss.dll → model .bin
+//
+// We install the EvaluateFeature hook here in DIAGNOSTIC MODE first
+// (pure passthrough + logging) to verify the hook fires without
+// causing black screen. The hook only does real interception when
+// g_active is true AND k > 1.0.
 // ══════════════════════════════════════════════════════════════════════
 
 void NGXInterceptor_OnDLSSDllLoaded(void* hModule) {
@@ -730,17 +755,30 @@ void NGXInterceptor_OnDLSSDllLoaded(void* hModule) {
         return;
     }
 
-    HMODULE hDlssDll = static_cast<HMODULE>(hModule);
-    if (!hDlssDll) return;
+    HMODULE hDll = static_cast<HMODULE>(hModule);
+    if (!hDll) return;
 
-    LOG_INFO("NGXInterceptor: proxy DLL loaded (%p), installing CreateFeature hook only", hModule);
-    InstallCreateFeatureHook(hDlssDll);
+    // Skip if we already have a working EvaluateFeature hook
+    if (g_eval_hooked_dlss) {
+        LOG_INFO("NGXInterceptor: EvaluateFeature hook already installed, skipping %p", hModule);
+        return;
+    }
+
+    LOG_INFO("NGXInterceptor: NGX DLL loaded (%p), attempting EvaluateFeature hook", hModule);
+
+    // Install CreateFeature hook for Ray Reconstruction detection
+    InstallCreateFeatureHook(hDll);
+
+    // Install EvaluateFeature hook — this is the core interception point
+    if (InstallDirectNGXHook(hDll, "_nvngx.dll")) {
+        g_active.store(true, std::memory_order_relaxed);
+        LOG_INFO("NGXInterceptor: EvaluateFeature hook active on _nvngx.dll");
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
 // Callback from loadlib_hooks.cpp when the actual DLSS model DLL is loaded
-// (nvngx_dlss.dll or nvngx_dlssd.dll). This is the real DLSS implementation,
-// NOT a Streamline proxy — safe to MinHook even with Streamline present.
+// (nvngx_dlss.dll or nvngx_dlssd.dll). Only exists in non-Streamline games.
 // ══════════════════════════════════════════════════════════════════════
 
 void NGXInterceptor_OnModelDllLoaded(void* hModule) {
@@ -752,47 +790,19 @@ void NGXInterceptor_OnModelDllLoaded(void* hModule) {
     HMODULE hModelDll = static_cast<HMODULE>(hModule);
     if (!hModelDll) return;
 
-    // If we already have a working hook (Streamline or direct), skip
+    // If we already have a working hook, skip
     if (g_eval_hooked_dlss) {
         LOG_INFO("NGXInterceptor: EvaluateFeature hook already installed, skipping model DLL %p", hModule);
         return;
     }
 
-    // Try to install EvaluateFeature hook on the model DLL
-    // This is safe even with Streamline — nvngx_dlss.dll is the actual DLSS
-    // implementation, not a Streamline proxy. The call chain is:
-    //   Game → _nvngx.dll (Streamline proxy) → nvngx_dlss.dll (model DLL)
-    // We hook at the model DLL level, which is the final destination.
     LOG_INFO("NGXInterceptor: model DLL loaded (%p), installing EvaluateFeature hook", hModule);
 
     InstallCreateFeatureHook(hModelDll);
 
-    if (InstallDirectNGXHook(hModelDll, "nvngx_dlss.dll (model)")) {
+    if (InstallDirectNGXHook(hModelDll, "nvngx_dlss.dll")) {
         g_active.store(true, std::memory_order_relaxed);
-        LOG_INFO("NGXInterceptor: direct hook on model DLL active — "
-                 "Streamline proxy untouched");
-    }
-
-    // Install parameter Get hook for render dimension override
-    using GetParams_t = NVSDK_NGX_Result (__cdecl*)(NVSDK_NGX_Parameter**);
-    auto getParams = reinterpret_cast<GetParams_t>(
-        GetProcAddress(hModelDll, "NVSDK_NGX_D3D12_GetParameters"));
-
-    if (!getParams) {
-        getParams = reinterpret_cast<GetParams_t>(
-            GetProcAddress(hModelDll, "NVSDK_NGX_D3D12_AllocateParameters"));
-    }
-
-    if (getParams) {
-        NVSDK_NGX_Parameter* params = nullptr;
-        NVSDK_NGX_Result ngx_result = getParams(&params);
-        if (params) {
-            std::lock_guard<std::mutex> lock(g_ngx_mutex);
-            InstallParamHook(params);
-        } else {
-            LOG_WARN("NGXInterceptor: GetParameters returned null from model DLL (result=0x%08X)",
-                     ngx_result);
-        }
+        LOG_INFO("NGXInterceptor: EvaluateFeature hook active on nvngx_dlss.dll");
     }
 }
 
@@ -825,25 +835,27 @@ void NGXInterceptor_Init(double scale_factor) {
 
     LOG_INFO("NGXInterceptor: initialized with scale_factor=%.3f", scale_factor);
 
-    // Check if Streamline interposer is already loaded — hook it for slEvaluateFeature
+    // Check if Streamline interposer is already loaded — hook slEvaluateFeature as secondary path
     HMODULE hInterposer = GetModuleHandleW(L"sl.interposer.dll");
     if (hInterposer) {
         LOG_INFO("NGXInterceptor: sl.interposer.dll already loaded — hooking slEvaluateFeature");
         NGXInterceptor_OnStreamlineLoaded(hInterposer);
     }
 
-    // Check if proxy NGX DLLs are already loaded (for CreateFeature hook)
+    // Check if _nvngx.dll is already loaded — this is the primary hook target
+    // In Streamline games, _nvngx.dll is the ONLY DLL that exports
+    // NVSDK_NGX_D3D12_EvaluateFeature (there is no nvngx_dlss.dll).
     const wchar_t* proxy_names[] = { L"_nvngx.dll", L"nvngx.dll" };
     for (auto* name : proxy_names) {
         HMODULE existing = GetModuleHandleW(name);
         if (existing) {
-            LOG_INFO("NGXInterceptor: %ls already loaded (proxy)", name);
+            LOG_INFO("NGXInterceptor: %ls already loaded", name);
             NGXInterceptor_OnDLSSDllLoaded(static_cast<void*>(existing));
             break;
         }
     }
 
-    // Check if model DLLs are already loaded (for EvaluateFeature hook)
+    // Check if model DLLs are already loaded (non-Streamline games only)
     const wchar_t* model_names[] = { L"nvngx_dlss.dll", L"nvngx_dlssd.dll" };
     for (auto* name : model_names) {
         HMODULE existing = GetModuleHandleW(name);
