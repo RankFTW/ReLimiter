@@ -128,11 +128,12 @@ static void on_init_swapchain(reshade::api::swapchain* sc, bool resize) {
     }
 }
 static void on_destroy_swapchain(reshade::api::swapchain* sc, bool resize) {
-    // ── Adaptive DLSS Scaling: shutdown on full swapchain teardown ──
+    // ── Adaptive DLSS Scaling: release GPU resources on full swapchain teardown ──
+    // Hooks must survive the destroy/recreate cycle — only release GPU resources.
     if (!resize && g_config.adaptive_dlss_scaling) {
-        NGXInterceptor_Shutdown();
+        NGXInterceptor_ReleaseGPUResources();
         KController_Shutdown();
-        LOG_INFO("DLSS Scaling: modules shut down (swapchain destroy)");
+        LOG_INFO("DLSS Scaling: GPU resources released (swapchain destroy)");
     }
     SwapMgr_OnDestroySwapchain(sc, resize);
 }

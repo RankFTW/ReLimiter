@@ -361,6 +361,12 @@ static sl_Result __cdecl Hooked_slEvaluateFeature(
     uint32_t numInputs,
     void* cmdBuffer)
 {
+    // Safety: if trampoline is null, we can't do anything
+    if (!g_orig_slEvaluateFeature) {
+        LOG_ERROR("NGXInterceptor: slEvaluateFeature trampoline is null — cannot forward");
+        return -1;
+    }
+
     // Only intercept DLSS-SR and DLSS-RR
     bool is_dlss = (feature == sl_kFeatureDLSS || feature == sl_kFeatureDLSS_RR);
 
@@ -828,6 +834,17 @@ void NGXInterceptor_Init(double scale_factor) {
     }
 }
 
+void NGXInterceptor_ReleaseGPUResources() {
+    // Release GPU resources only — hooks stay active.
+    // Called on swapchain destroy/recreate cycles.
+    // The hooks must survive because the game will call slEvaluateFeature
+    // again after the swapchain is recreated.
+    ReleaseIntermediateBuffer();
+    g_device = nullptr;
+
+    LOG_INFO("NGXInterceptor: GPU resources released (hooks preserved)");
+}
+
 void NGXInterceptor_Shutdown() {
     if (!g_initialized.load(std::memory_order_relaxed)) return;
 
@@ -854,10 +871,12 @@ void NGXInterceptor_Shutdown() {
         g_eval_target_dlss = nullptr;
     }
 
-    // Note: Streamline slEvaluateFeature hook is managed by MinHook globally
-    // and will be cleaned up by MH_Uninitialize. We just clear our state.
+    // Streamline slEvaluateFeature hook: managed by MinHook globally,
+    // cleaned up by MH_Uninitialize at addon unload. Clear our state
+    // but do NOT null the trampoline — MH_Uninitialize handles that.
     g_sl_eval_hooked = false;
-    g_orig_slEvaluateFeature = nullptr;
+    // g_orig_slEvaluateFeature is NOT cleared here — it's still needed
+    // if the hook fires between now and MH_Uninitialize.
 
     // Disable CreateFeature hook
     g_create_feature_hooked = false;

@@ -38,7 +38,13 @@ struct NGXInterceptorState {
 void NGXInterceptor_Init(double scale_factor);
 
 // Shutdown: remove hooks, release intermediate buffer.
+// Only call at addon unload — NOT on swapchain destroy/recreate.
 void NGXInterceptor_Shutdown();
+
+// Release GPU resources (intermediate buffer, device pointer) without
+// removing hooks. Call on swapchain destroy/recreate cycles.
+// Hooks must survive because the game will call slEvaluateFeature again.
+void NGXInterceptor_ReleaseGPUResources();
 
 // Called by K_Controller when fake output resolution changes.
 void NGXInterceptor_UpdateOutputRes(uint32_t fake_w, uint32_t fake_h);
