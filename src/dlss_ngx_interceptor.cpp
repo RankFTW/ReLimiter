@@ -408,6 +408,69 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
         param_vtable[NGX_PARAM_VTABLE_GET_RESOURCE]);
     auto fnSetResource = reinterpret_cast<NGXParam_SetResource_t>(
         param_vtable[NGX_PARAM_VTABLE_SET_RESOURCE]);
+
+    // One-time vtable probe: try multiple indices to find GetResource
+    static int s_get_idx = NGX_PARAM_VTABLE_GET_RESOURCE;
+    static int s_set_idx = NGX_PARAM_VTABLE_SET_RESOURCE;
+    static bool s_vtable_probed = false;
+    if (!s_vtable_probed) {
+        s_vtable_probed = true;
+        LOG_INFO("NGXInterceptor: probing vtable indices for GetResource...");
+        // Try indices 5-20 looking for one that returns a non-null resource for "Output"
+        for (int idx = 5; idx <= 20; idx++) {
+            auto fn = reinterpret_cast<NGXParam_GetResource_t>(param_vtable[idx]);
+            if (!fn) continue;
+            ID3D12Resource* res = nullptr;
+            __try {
+                fn(params, "Output", &res);
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                continue;
+            }
+            if (res) {
+                D3D12_RESOURCE_DESC desc{};
+                __try { desc = res->GetDesc(); } __except(EXCEPTION_EXECUTE_HANDLER) { continue; }
+                LOG_INFO("NGXInterceptor: vtable[%d] returned resource %p (%llux%u) for 'Output'",
+                         idx, res, desc.Width, desc.Height);
+                s_get_idx = idx;
+                // Assume Set is at idx - 7 (standard offset between Get and Set for resources)
+                s_set_idx = idx - 7;
+                fnGetResource = reinterpret_cast<NGXParam_GetResource_t>(param_vtable[s_get_idx]);
+                fnSetResource = reinterpret_cast<NGXParam_SetResource_t>(param_vtable[s_set_idx]);
+                break;
+            }
+        }
+        // Also try "Color" at each index
+        if (s_get_idx == NGX_PARAM_VTABLE_GET_RESOURCE) {
+            for (int idx = 5; idx <= 20; idx++) {
+                auto fn = reinterpret_cast<NGXParam_GetResource_t>(param_vtable[idx]);
+                if (!fn) continue;
+                ID3D12Resource* res = nullptr;
+                __try {
+                    fn(params, "Color", &res);
+                } __except(EXCEPTION_EXECUTE_HANDLER) {
+                    continue;
+                }
+                if (res) {
+                    D3D12_RESOURCE_DESC desc{};
+                    __try { desc = res->GetDesc(); } __except(EXCEPTION_EXECUTE_HANDLER) { continue; }
+                    LOG_INFO("NGXInterceptor: vtable[%d] returned resource %p (%llux%u) for 'Color'",
+                             idx, res, desc.Width, desc.Height);
+                    s_get_idx = idx;
+                    s_set_idx = idx - 7;
+                    fnGetResource = reinterpret_cast<NGXParam_GetResource_t>(param_vtable[s_get_idx]);
+                    fnSetResource = reinterpret_cast<NGXParam_SetResource_t>(param_vtable[s_set_idx]);
+                    break;
+                }
+            }
+        }
+        if (s_get_idx == NGX_PARAM_VTABLE_GET_RESOURCE) {
+            LOG_WARN("NGXInterceptor: vtable probe found nothing at indices 5-20");
+        }
+    } else {
+        fnGetResource = reinterpret_cast<NGXParam_GetResource_t>(param_vtable[s_get_idx]);
+        fnSetResource = reinterpret_cast<NGXParam_SetResource_t>(param_vtable[s_set_idx]);
+    }
+
     if (!fnGetResource || !fnSetResource) {
         static int s3 = 0; if (++s3 <= 3) LOG_WARN("NGXInterceptor: FAIL Get=%p Set=%p (idx %d/%d)",
             fnGetResource, fnSetResource, NGX_PARAM_VTABLE_GET_RESOURCE, NGX_PARAM_VTABLE_SET_RESOURCE);
