@@ -325,13 +325,15 @@ static sl_Result __cdecl Hooked_slDLSSSetOptions(const void* viewport, const voi
 
     // If k <= 1.0 or not active, pass through unmodified
     // CRITICAL: Also passthrough if we haven't captured the game's output
-    // resource yet. Overriding dimensions without swapping the output buffer
+    // resource yet, or if the intermediate buffer isn't allocated.
+    // Overriding dimensions without swapping the output buffer
     // causes DLSS to write k*D pixels into a D-sized buffer -> corruption.
     void* game_output = g_game_output_resource.load(std::memory_order_relaxed);
     uintptr_t game_output_addr = reinterpret_cast<uintptr_t>(game_output);
     bool game_output_valid = game_output && game_output_addr > 0x10000 && game_output_addr < 0x00007FFFFFFFFFFF;
     if (!g_active.load(std::memory_order_relaxed) || k <= 1.01 ||
-        game_out_w == 0 || game_out_h == 0 || !game_output_valid) {
+        game_out_w == 0 || game_out_h == 0 || !game_output_valid ||
+        !g_intermediate_buffer) {
         return g_orig_slDLSSSetOptions(viewport, options);
     }
 
@@ -470,7 +472,7 @@ static void SwapOutputResourceInPlace(void* tags_ptr, uint32_t numTags) {
     
     double k = g_current_k.load(std::memory_order_relaxed);
     if (!g_active.load(std::memory_order_relaxed) || k <= 1.01) return;
-    if (!tags_ptr || numTags == 0 || !g_intermediate_buffer) return;
+    if (!tags_ptr || numTags == 0) return;
     
     uint32_t game_w = g_game_output_w.load(std::memory_order_relaxed);
     uint32_t game_h = g_game_output_h.load(std::memory_order_relaxed);
@@ -489,7 +491,11 @@ static void SwapOutputResourceInPlace(void* tags_ptr, uint32_t numTags) {
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
     }
     
-    if (!EnsureIntermediateBuffer(fake_w, fake_h, fmt)) return;
+    if (!EnsureIntermediateBuffer(fake_w, fake_h, fmt)) {
+        static int s_fail = 0;
+        if (++s_fail <= 5) LOG_WARN("NGXInterceptor: SwapInPlace: buffer alloc failed %ux%u dev=%p", fake_w, fake_h, g_device);
+        return;
+    }
     
     __try {
         auto* bytes = reinterpret_cast<uint8_t*>(tags_ptr);
