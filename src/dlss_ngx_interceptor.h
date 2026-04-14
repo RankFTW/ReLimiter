@@ -1,25 +1,23 @@
 /**
- * NGX_Interceptor — Intercepts NVIDIA NGX at the EvaluateFeature level.
+ * NGX_Interceptor — Intercepts DLSS evaluation for Adaptive DLSS Scaling.
  *
- * Instead of faking swapchain dimensions (which crashes games that validate
- * them), we intercept DLSS at the NGX evaluation level:
+ * Two hooking strategies, selected automatically:
  *
- *   1. Game renders at s×D (normal DLSS internal resolution)
- *   2. We hook NVSDK_NGX_D3D12_EvaluateFeature — when DLSS runs, we swap
- *      its output target from the game's backbuffer (D) to our intermediate
- *      buffer (k×D)
- *   3. DLSS upscales from s×D to k×D (higher quality than normal)
- *   4. After DLSS completes, we Lanczos downscale from k×D back to the
- *      game's original output buffer (D)
- *   5. Game continues with its backbuffer at D, completely unaware
+ * 1. STREAMLINE MODE (preferred for Streamline games):
+ *    Hooks slEvaluateFeature from sl.interposer.dll. This is the game-facing
+ *    Streamline API — no internal proxy DLLs are touched. Avoids the black
+ *    screen caused by MinHook on _nvngx.dll corrupting Streamline's dispatch.
  *
- * The game never sees fake dimensions. No GetDesc lies. No GetBuffer lies.
+ * 2. DIRECT NGX MODE (fallback for non-Streamline games):
+ *    Hooks NVSDK_NGX_D3D12_EvaluateFeature from nvngx_dlss.dll directly.
+ *    Safe when there's no Streamline proxy in the way.
  *
- * Also hooks NVSDK_NGX_Parameter::Get for "OutRenderOptimalWidth" and
- * "OutRenderOptimalHeight" to override the values returned to the game,
- * enforcing s × k × D as the DLSS internal render size.
- *
- * Detected via loadlib_hooks.cpp when nvngx_dlss.dll is loaded.
+ * In both modes, the hook:
+ *   1. Swaps the DLSS output target from the game's backbuffer (D) to our
+ *      intermediate buffer (k×D)
+ *   2. Calls the original evaluate — DLSS upscales to k×D
+ *   3. Lanczos downscales from k×D back to the game's original output (D)
+ *   4. Game continues with its backbuffer at D, completely unaware
  *
  * Feature: adaptive-dlss-scaling
  */
@@ -43,7 +41,6 @@ void NGXInterceptor_Init(double scale_factor);
 void NGXInterceptor_Shutdown();
 
 // Called by K_Controller when fake output resolution changes.
-// Updates the optimal render dimensions returned to the game.
 void NGXInterceptor_UpdateOutputRes(uint32_t fake_w, uint32_t fake_h);
 
 // Get current state for OSD/telemetry.
@@ -53,11 +50,19 @@ NGXInterceptorState NGXInterceptor_GetState();
 bool NGXInterceptor_IsRayReconstructionActive();
 
 // Called by loadlib_hooks.cpp when nvngx_dlss.dll is loaded.
-// Installs the NGX parameter Get vtable hook and EvaluateFeature hook.
+// In Streamline mode, this only installs CreateFeature hook for RR detection.
+// In non-Streamline mode, this installs the direct EvaluateFeature hook.
 void NGXInterceptor_OnDLSSDllLoaded(void* hModule);
+
+// Called when sl.interposer.dll is loaded (from loadlib_hooks.cpp).
+// Installs the slEvaluateFeature hook — the preferred Streamline path.
+void NGXInterceptor_OnStreamlineLoaded(void* hModule);
 
 // Set the DX12 device for intermediate buffer allocation.
 void NGXInterceptor_SetDevice(ID3D12Device* device);
 
 // Set current k value and display dimensions for the EvaluateFeature hook.
 void NGXInterceptor_SetScalingParams(double k, uint32_t display_w, uint32_t display_h);
+
+// Returns the name of the active hook mode ("Streamline", "DirectNGX", or "None").
+const char* NGXInterceptor_GetHookModeName();

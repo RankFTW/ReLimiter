@@ -498,10 +498,11 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         } else if (g_config.adaptive_dlss_scaling && !g_dlss_scaling_active.load(std::memory_order_relaxed)) {
             // Feature enabled but NGX interception not yet active
             NGXInterceptorState ngx_state = NGXInterceptor_GetState();
+            const char* hook_mode = NGXInterceptor_GetHookModeName();
             if (ngx_state.active) {
                 // NGX hooks installed, waiting for DLSS evaluation
                 ImGui::SameLine();
-                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Waiting)");
+                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Waiting — %s)", hook_mode);
             } else {
                 // NGX hooks not installed — may need restart or DLSS not detected
                 ImGui::SameLine();

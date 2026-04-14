@@ -70,6 +70,10 @@ static void CheckAndHook(HMODULE hModule, bool matched) {
     if (!s_streamline_hooked.compare_exchange_strong(expected, true))
         return;
     HookStreamlinePCL(hModule);
+
+    // Also notify the NGX interceptor — it hooks slEvaluateFeature from
+    // the interposer for DLSS evaluation interception (Streamline mode).
+    NGXInterceptor_OnStreamlineLoaded(static_cast<void*>(hModule));
 }
 
 static HMODULE WINAPI Hook_LoadLibraryA(LPCSTR lpLibFileName) {

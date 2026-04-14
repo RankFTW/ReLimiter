@@ -227,12 +227,10 @@ static void on_present(reshade::api::command_queue* queue,
             LOG_INFO("NvAPI hooks installed (deferred)");
 
             // Late detection: NGX DLLs may already be loaded by Streamline
-            // before our LoadLibrary hooks were installed. Check all known
-            // NGX DLL names — Streamline routes through _nvngx.dll or nvngx.dll,
-            // not nvngx_dlss.dll (which is just the model weights).
-            // DIAGNOSTIC: Late detection disabled — NGXInterceptor is fully disabled
-            // to isolate the black screen cause.
-            // if (g_config.adaptive_dlss_scaling) { ... }
+            // before our LoadLibrary hooks were installed. The NGXInterceptor
+            // handles this internally — it checks for sl.interposer.dll first
+            // (Streamline mode) and falls back to direct NGX hooking.
+            // LoadLibrary hooks will catch any DLLs loaded after this point.
         }
     }
 
@@ -424,8 +422,8 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         // This means the hook installation itself (MinHook on Streamline's _nvngx.dll proxy)
         // is corrupting something. Disable entirely to confirm.
         if (g_config.adaptive_dlss_scaling) {
-            // NGXInterceptor_Init(g_config.dlss_scale_factor);
-            LOG_WARN("DLSS Scaling: NGXInterceptor DISABLED for black screen diagnosis");
+            NGXInterceptor_Init(g_config.dlss_scale_factor);
+            LOG_INFO("DLSS Scaling: NGXInterceptor initialized (s=%.2f)", g_config.dlss_scale_factor);
         }
 
     } __except(EXCEPTION_EXECUTE_HANDLER) {

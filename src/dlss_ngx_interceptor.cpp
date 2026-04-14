@@ -1,13 +1,23 @@
 /**
- * NGX_Interceptor implementation — EvaluateFeature hook + NGX parameter vtable hook.
+ * NGX_Interceptor — Intercepts DLSS at the Streamline interposer level.
  *
- * Core approach: intercept NVSDK_NGX_D3D12_EvaluateFeature to redirect DLSS
- * output from the game's backbuffer (D) to an intermediate buffer (k×D),
- * then Lanczos downscale back to D. The game never sees fake dimensions.
+ * Strategy: Hook slEvaluateFeature from sl.interposer.dll (the game-facing
+ * Streamline API) instead of MinHooking _nvngx.dll proxy exports.
  *
- * Also intercepts NVSDK_NGX_Parameter::Get to override OutRenderOptimalWidth
- * and OutRenderOptimalHeight, enforcing s × k × D as the DLSS internal
- * render dimensions.
+ * MinHook on Streamline's _nvngx.dll proxy corrupts Streamline's internal
+ * dispatch chain, causing black screen even in pure passthrough mode.
+ * By hooking at the interposer level — the same layer we already hook for
+ * DLSS-G SetOptions/GetState — we avoid touching any internal proxy DLLs.
+ *
+ * The hook intercepts slEvaluateFeature(kFeatureDLSS, ...) and:
+ *   1. Reads the game's DLSS output resource from the tagged inputs
+ *   2. Swaps it with our intermediate buffer at k×D resolution
+ *   3. Calls the original slEvaluateFeature — DLSS upscales to k×D
+ *   4. Lanczos downscales from k×D back to the game's original output (D)
+ *   5. Game continues with its backbuffer at D, completely unaware
+ *
+ * For non-Streamline games, falls back to direct nvngx_dlss.dll hooking
+ * (which works fine when there's no Streamline proxy in the way).
  *
  * Feature: adaptive-dlss-scaling
  */
@@ -15,6 +25,7 @@
 #include "dlss_ngx_interceptor.h"
 #include "dlss_lanczos_shader.h"
 #include "dlss_resolution_math.h"
+#include "hooks.h"
 #include "logger.h"
 
 #include <Windows.h>
@@ -25,7 +36,7 @@
 #include <cstring>
 #include <cmath>
 
-// ── NGX type definitions ──
+// ── NGX type definitions (for non-Streamline fallback) ──
 using NVSDK_NGX_Result = unsigned int;
 static constexpr NVSDK_NGX_Result NVSDK_NGX_Result_Success = 0x1;
 
@@ -33,29 +44,107 @@ static constexpr NVSDK_NGX_Result NVSDK_NGX_Result_Success = 0x1;
 static constexpr unsigned int NVSDK_NGX_Feature_SuperSampling      = 0;
 static constexpr unsigned int NVSDK_NGX_Feature_RayReconstruction  = 1000;
 
-// ── NGX Parameter interface vtable layout ──
-//   [0]  Set(const char*, double)
-//   [1]  Set(const char*, int)
-//   [2]  Set(const char*, unsigned int)
-//   [3]  Set(const char*, float)
-//   [4]  Set(const char*, void*)
-//   [5]  Set(const char*, ID3D12Resource*)
-//   [6]  Set(const char*, void*)          // D3D11 resource variant
-//   [7]  Get(const char*, double*)
-//   [8]  Get(const char*, int*)
-//   [9]  Get(const char*, unsigned int*)   ← we hook this one
-//   [10] Get(const char*, float*)
-//   [11] Get(const char*, void**)
-//   [12] Get(const char*, ID3D12Resource**)
+// ── Streamline type definitions ──
+// Minimal types from the Streamline SDK (public API, MIT licensed).
+// We only need enough to intercept slEvaluateFeature.
 
+using sl_Result = int;
+static constexpr sl_Result sl_eOk = 0;
+
+// Streamline feature IDs
+static constexpr uint32_t sl_kFeatureDLSS    = 0;   // DLSS Super Resolution
+static constexpr uint32_t sl_kFeatureDLSS_RR = 12;  // DLSS Ray Reconstruction
+
+// Streamline buffer type IDs (from sl_consts.h)
+static constexpr uint32_t sl_kBufferTypeScalingOutputColor = 4;
+
+// sl::BaseStructure — all Streamline structs start with this header.
+// The structType field identifies what kind of struct it is.
+struct sl_BaseStructure {
+    uint32_t structType;
+    void*    next;
+};
+
+// sl::FrameToken — opaque frame identifier
+struct sl_FrameToken;
+
+// sl::ViewportHandle — just a uint32_t wrapper
+struct sl_ViewportHandle {
+    uint32_t id;
+};
+
+// sl::ResourceType enum
+enum sl_ResourceType : uint32_t {
+    sl_ResourceType_Tex2d = 0,
+    sl_ResourceType_Buffer = 1,
+};
+
+// sl::Resource — wraps a native GPU resource with state info
+struct sl_Resource {
+    sl_ResourceType type;
+    void*           native;       // ID3D12Resource* for DX12
+    void*           mem;          // reserved
+    void*           view;         // reserved
+    uint32_t        state;        // D3D12_RESOURCE_STATES
+    // Additional fields for Vulkan (width, height, format, etc.) — not needed for DX12
+};
+
+// sl::Extent — region of interest
+struct sl_Extent {
+    uint32_t left;
+    uint32_t top;
+    uint32_t width;
+    uint32_t height;
+};
+
+// sl::ResourceLifecycle
+enum sl_ResourceLifecycle : uint32_t {
+    sl_eOnlyValidNow     = 0,
+    sl_eValidUntilPresent = 1,
+    sl_eValidUntilEvaluate = 2,
+};
+
+// sl::ResourceTag — tags a resource with a buffer type
+// structType for ResourceTag is 5 (from Streamline SDK)
+static constexpr uint32_t sl_StructType_ResourceTag = 5;
+
+struct sl_ResourceTag {
+    uint32_t            structType;   // = sl_StructType_ResourceTag
+    void*               next;
+    sl_Resource*        resource;
+    uint32_t            type;         // buffer type ID (e.g. kBufferTypeScalingOutputColor)
+    sl_ResourceLifecycle lifecycle;
+    sl_Extent*          extent;
+};
+
+// Function pointer types
+using PFN_slEvaluateFeature = sl_Result(__cdecl*)(
+    uint32_t feature,
+    const sl_FrameToken* frame,
+    const sl_BaseStructure** inputs,
+    uint32_t numInputs,
+    void* cmdBuffer);  // sl::CommandBuffer* = ID3D12GraphicsCommandList* for DX12
+
+using PFN_slGetFeatureFunction = sl_Result(__cdecl*)(
+    uint32_t feature, const char* name, void** outPtr);
+
+// ── NGX direct hook types (non-Streamline fallback) ──
+struct NVSDK_NGX_Parameter;
+struct NVSDK_NGX_Handle;
+
+using NGX_D3D12_EvaluateFeature_t = NVSDK_NGX_Result (__cdecl*)(
+    ID3D12GraphicsCommandList* cmd_list,
+    NVSDK_NGX_Handle* feature_handle,
+    NVSDK_NGX_Parameter* params,
+    void* callback);
+
+using NGX_D3D12_CreateFeature_t = NVSDK_NGX_Result (__cdecl*)(
+    void* cmd_list, unsigned int feature_id, void* params, void** handle);
+
+// NGX Parameter vtable indices
 static constexpr int NGX_PARAM_VTABLE_GET_UINT     = 9;
 static constexpr int NGX_PARAM_VTABLE_SET_RESOURCE  = 5;
 static constexpr int NGX_PARAM_VTABLE_GET_RESOURCE  = 12;
-static constexpr int NGX_PARAM_VTABLE_SET_UINT      = 2;
-
-// ── NGX Parameter typedefs ──
-struct NVSDK_NGX_Parameter;  // opaque forward decl
-struct NVSDK_NGX_Handle;     // opaque forward decl
 
 using NGXParam_GetUint_t = NVSDK_NGX_Result (__stdcall*)(
     NVSDK_NGX_Parameter* self, const char* name, unsigned int* value);
@@ -63,21 +152,10 @@ using NGXParam_SetResource_t = NVSDK_NGX_Result (__stdcall*)(
     NVSDK_NGX_Parameter* self, const char* name, ID3D12Resource* value);
 using NGXParam_GetResource_t = NVSDK_NGX_Result (__stdcall*)(
     NVSDK_NGX_Parameter* self, const char* name, ID3D12Resource** value);
-using NGXParam_SetUint_t = NVSDK_NGX_Result (__stdcall*)(
-    NVSDK_NGX_Parameter* self, const char* name, unsigned int value);
 
-// ── EvaluateFeature hook typedef ──
-using NGX_D3D12_EvaluateFeature_t = NVSDK_NGX_Result (__cdecl*)(
-    ID3D12GraphicsCommandList* cmd_list,
-    NVSDK_NGX_Handle* feature_handle,
-    NVSDK_NGX_Parameter* params,
-    void* callback);
-
-// ── CreateFeature hook typedef ──
-using NGX_D3D12_CreateFeature_t = NVSDK_NGX_Result (__cdecl*)(
-    void* cmd_list, unsigned int feature_id, void* params, void** handle);
-
-// ── Module state ──
+// ══════════════════════════════════════════════════════════════════════
+// Module state
+// ══════════════════════════════════════════════════════════════════════
 
 static std::mutex           g_ngx_mutex;
 static double               g_scale_factor          = 0.33;
@@ -99,22 +177,27 @@ static uint32_t              g_intermediate_alloc_w = 0;
 static uint32_t              g_intermediate_alloc_h = 0;
 static DXGI_FORMAT           g_intermediate_format = DXGI_FORMAT_R8G8B8A8_UNORM;
 
-// Hook state — parameter vtable
-static NGXParam_GetUint_t       g_orig_GetUint          = nullptr;
-static bool                     g_param_hooked           = false;
-static NVSDK_NGX_Parameter*     g_hooked_param_instance  = nullptr;
+// Hook mode
+enum class HookMode { None, Streamline, DirectNGX };
+static HookMode g_hook_mode = HookMode::None;
 
-// Hook state — CreateFeature (MinHook)
+// ── Streamline hook state ──
+static PFN_slEvaluateFeature g_orig_slEvaluateFeature = nullptr;
+static bool                  g_sl_eval_hooked = false;
+
+// ── Direct NGX hook state (non-Streamline fallback) ──
+static NGX_D3D12_EvaluateFeature_t g_orig_EvaluateFeature_dlss = nullptr;
+static bool                        g_eval_hooked_dlss          = false;
+static void*                       g_eval_target_dlss          = nullptr;
+
+// ── CreateFeature hook (Ray Reconstruction detection, both modes) ──
 static NGX_D3D12_CreateFeature_t g_orig_CreateFeature    = nullptr;
 static bool                     g_create_feature_hooked  = false;
 
-// Hook state — EvaluateFeature (MinHook)
-static NGX_D3D12_EvaluateFeature_t g_orig_EvaluateFeature_dlss = nullptr;
-static NGX_D3D12_EvaluateFeature_t g_orig_EvaluateFeature_ngx  = nullptr;
-static bool                        g_eval_hooked_dlss          = false;
-static bool                        g_eval_hooked_ngx           = false;
-static void*                       g_eval_target_dlss          = nullptr;
-static void*                       g_eval_target_ngx           = nullptr;
+// ── NGX Parameter vtable hook state ──
+static NGXParam_GetUint_t       g_orig_GetUint          = nullptr;
+static bool                     g_param_hooked           = false;
+static NVSDK_NGX_Parameter*     g_hooked_param_instance  = nullptr;
 
 // ── Vtable patching helpers ──
 
@@ -147,7 +230,7 @@ static void ReleaseIntermediateBuffer() {
     g_intermediate_alloc_h = 0;
 }
 
-static bool AllocateIntermediateBuffer(uint32_t width, uint32_t height, DXGI_FORMAT format) {
+static bool EnsureIntermediateBuffer(uint32_t width, uint32_t height, DXGI_FORMAT format) {
     if (!g_device || width == 0 || height == 0) return false;
 
     // Skip if already allocated at sufficient size
@@ -170,7 +253,6 @@ static bool AllocateIntermediateBuffer(uint32_t width, uint32_t height, DXGI_FOR
     tex_desc.SampleDesc.Count   = 1;
     tex_desc.SampleDesc.Quality = 0;
     tex_desc.Layout             = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    // ALLOW_UNORDERED_ACCESS for Lanczos UAV, ALLOW_RENDER_TARGET for DLSS output
     tex_desc.Flags              = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
                                   D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
@@ -199,6 +281,15 @@ static bool AllocateIntermediateBuffer(uint32_t width, uint32_t height, DXGI_FOR
     LOG_INFO("NGXInterceptor: intermediate buffer allocated %ux%u (format %d)",
              width, height, static_cast<int>(format));
     return true;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Error handling
+// ══════════════════════════════════════════════════════════════════════
+
+static void HandleInterceptionFailure(const char* reason) {
+    LOG_ERROR("NGXInterceptor: interception failed — %s", reason ? reason : "unknown");
+    g_active.store(false, std::memory_order_relaxed);
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -260,141 +351,241 @@ static NVSDK_NGX_Result __cdecl Hooked_NGX_D3D12_CreateFeature(
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// EvaluateFeature hook — the core of the NGX-only approach
+// STREAMLINE PATH: slEvaluateFeature hook
 // ══════════════════════════════════════════════════════════════════════
 
-static NVSDK_NGX_Result EvaluateFeatureHooked(
-    ID3D12GraphicsCommandList* cmd_list,
-    NVSDK_NGX_Handle* feature_handle,
-    NVSDK_NGX_Parameter* params,
-    void* callback,
-    NGX_D3D12_EvaluateFeature_t orig_fn)
+static sl_Result __cdecl Hooked_slEvaluateFeature(
+    uint32_t feature,
+    const sl_FrameToken* frame,
+    const sl_BaseStructure** inputs,
+    uint32_t numInputs,
+    void* cmdBuffer)
 {
-    // ── DIAGNOSTIC MODE: log and passthrough only, no interception ──
-    static int s_eval_count = 0;
-    s_eval_count++;
+    // Only intercept DLSS-SR and DLSS-RR
+    bool is_dlss = (feature == sl_kFeatureDLSS || feature == sl_kFeatureDLSS_RR);
 
-    // Log first 5 calls, then every 300th
-    if (s_eval_count <= 5 || (s_eval_count % 300) == 0) {
-        double k = g_current_k.load(std::memory_order_relaxed);
-        bool active = g_active.load(std::memory_order_relaxed);
-
-        // Try to read output resource info for diagnostics
-        ID3D12Resource* output = nullptr;
-        uint32_t out_w = 0, out_h = 0;
-        if (params) {
-            void** param_vtable = *reinterpret_cast<void***>(params);
-            if (param_vtable) {
-                auto fnGetResource = reinterpret_cast<NGXParam_GetResource_t>(
-                    param_vtable[NGX_PARAM_VTABLE_GET_RESOURCE]);
-                auto fnGetUint = reinterpret_cast<NGXParam_GetUint_t>(
-                    param_vtable[NGX_PARAM_VTABLE_GET_UINT]);
-                if (fnGetResource)
-                    fnGetResource(params, "Output", &output);
-                if (fnGetUint) {
-                    fnGetUint(params, "OutWidth", &out_w);
-                    fnGetUint(params, "OutHeight", &out_h);
-                }
-            }
-        }
-
-        if (output) {
-            D3D12_RESOURCE_DESC desc = output->GetDesc();
-            LOG_INFO("NGXInterceptor: EvaluateFeature #%d — k=%.2f active=%d "
-                     "output=%p (%llux%u fmt=%d) OutWidth=%u OutHeight=%u "
-                     "cmd_list=%p handle=%p",
-                     s_eval_count, k, active ? 1 : 0,
-                     output, desc.Width, desc.Height, static_cast<int>(desc.Format),
-                     out_w, out_h, cmd_list, feature_handle);
-        } else {
-            LOG_INFO("NGXInterceptor: EvaluateFeature #%d — k=%.2f active=%d "
-                     "output=NULL OutWidth=%u OutHeight=%u cmd_list=%p handle=%p",
-                     s_eval_count, k, active ? 1 : 0,
-                     out_w, out_h, cmd_list, feature_handle);
-        }
+    if (!is_dlss || !g_active.load(std::memory_order_relaxed)) {
+        // Not DLSS or not active — pure passthrough
+        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
     }
 
-    // Pure passthrough — no interception, just call original
-    return orig_fn(cmd_list, feature_handle, params, callback);
+    // Track Ray Reconstruction
+    if (feature == sl_kFeatureDLSS_RR) {
+        bool was_rr = g_ray_reconstruction.exchange(true, std::memory_order_relaxed);
+        if (!was_rr)
+            LOG_INFO("NGXInterceptor: DLSS-RR detected via slEvaluateFeature");
+    }
 
-    // ── INTERCEPTION LOGIC (disabled during diagnostic mode) ──
-    // TODO: Re-enable once passthrough diagnostics confirm the hook is stable.
-    // The code below swaps the DLSS output to an intermediate buffer at k×D,
-    // then Lanczos downscales back to D. Currently disabled because even
-    // pure passthrough needs validation first.
+    double k = g_current_k.load(std::memory_order_relaxed);
+
+    // k ≈ 1.0 means no scaling needed — passthrough
+    if (k <= 1.01) {
+        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
+    }
+
+    // ── Find the ScalingOutputColor tag in the inputs ──
+    // Inputs are a chain of sl::BaseStructure*. ResourceTags have structType == 5.
+    // We scan for a ResourceTag with type == kBufferTypeScalingOutputColor.
+    sl_ResourceTag* output_tag = nullptr;
+    sl_Resource*    original_resource = nullptr;
+    ID3D12Resource* original_d3d_resource = nullptr;
+    uint32_t        original_state = 0;
+
+    for (uint32_t i = 0; i < numInputs; i++) {
+        if (!inputs[i]) continue;
+        const sl_BaseStructure* s = inputs[i];
+        // Walk the chain (each struct can have a ->next chain)
+        while (s) {
+            if (s->structType == sl_StructType_ResourceTag) {
+                auto* tag = const_cast<sl_ResourceTag*>(
+                    reinterpret_cast<const sl_ResourceTag*>(s));
+                if (tag->type == sl_kBufferTypeScalingOutputColor && tag->resource) {
+                    output_tag = tag;
+                    original_resource = tag->resource;
+                    original_d3d_resource = static_cast<ID3D12Resource*>(tag->resource->native);
+                    original_state = tag->resource->state;
+                    break;
+                }
+            }
+            s = static_cast<const sl_BaseStructure*>(s->next);
+        }
+        if (output_tag) break;
+    }
+
+    // If we can't find the output tag, passthrough
+    if (!output_tag || !original_d3d_resource) {
+        static int s_miss_count = 0;
+        if (++s_miss_count <= 5)
+            LOG_WARN("NGXInterceptor: ScalingOutputColor tag not found in slEvaluateFeature inputs "
+                     "(call #%d, numInputs=%u) — passthrough", s_miss_count, numInputs);
+        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
+    }
+
+    // ── Get display dimensions from the original output ──
+    D3D12_RESOURCE_DESC orig_desc = original_d3d_resource->GetDesc();
+    uint32_t display_w = static_cast<uint32_t>(orig_desc.Width);
+    uint32_t display_h = orig_desc.Height;
+
+    // ── Compute intermediate buffer size (k × D) ──
+    auto [fake_w, fake_h] = ComputeFakeResolution(k, display_w, display_h);
+
+    // ── Ensure intermediate buffer is allocated ──
+    if (!EnsureIntermediateBuffer(fake_w, fake_h, orig_desc.Format)) {
+        LOG_ERROR("NGXInterceptor: intermediate buffer alloc failed for %ux%u — passthrough",
+                  fake_w, fake_h);
+        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
+    }
+
+    // ── Swap the output resource to our intermediate buffer ──
+    // Save original values
+    void*    saved_native = original_resource->native;
+    uint32_t saved_state  = original_resource->state;
+
+    // Point DLSS output at our intermediate buffer (k×D)
+    original_resource->native = static_cast<void*>(g_intermediate_buffer);
+    original_resource->state  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
+    // Also update the extent if present to reflect the larger output
+    sl_Extent saved_extent = {};
+    bool had_extent = (output_tag->extent != nullptr);
+    if (had_extent) {
+        saved_extent = *output_tag->extent;
+        output_tag->extent->width  = fake_w;
+        output_tag->extent->height = fake_h;
+    }
+
+    // ── Call original slEvaluateFeature — DLSS upscales to k×D ──
+    sl_Result result = g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
+
+    // ── Restore original resource pointer ──
+    original_resource->native = saved_native;
+    original_resource->state  = saved_state;
+    if (had_extent) {
+        *output_tag->extent = saved_extent;
+    }
+
+    if (result != sl_eOk) {
+        static int s_err_count = 0;
+        if (++s_err_count <= 5)
+            LOG_ERROR("NGXInterceptor: slEvaluateFeature returned error %d — skipping Lanczos",
+                      result);
+        return result;
+    }
+
+    // ── Lanczos downscale: intermediate (k×D) → game output (D) ──
+    auto* cmd_list = static_cast<ID3D12GraphicsCommandList*>(cmdBuffer);
+    if (cmd_list) {
+        Lanczos_Dispatch(cmd_list,
+                         g_intermediate_buffer, original_d3d_resource,
+                         fake_w, fake_h,
+                         display_w, display_h);
+    }
+
+    // Periodic logging
+    static int s_eval_count = 0;
+    s_eval_count++;
+    if (s_eval_count <= 3 || (s_eval_count % 300) == 0) {
+        LOG_INFO("NGXInterceptor: [SL] eval #%d — k=%.2f, DLSS output=%ux%u, "
+                 "Lanczos %ux%u -> %ux%u, feature=%u",
+                 s_eval_count, k, fake_w, fake_h,
+                 fake_w, fake_h, display_w, display_h, feature);
+    }
+
+    return result;
 }
 
-// Trampoline for nvngx_dlss.dll hook
+// ══════════════════════════════════════════════════════════════════════
+// DIRECT NGX PATH: EvaluateFeature hook (non-Streamline fallback)
+// ══════════════════════════════════════════════════════════════════════
+
 static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
     ID3D12GraphicsCommandList* cmd_list,
     NVSDK_NGX_Handle* feature_handle,
     NVSDK_NGX_Parameter* params,
     void* callback)
 {
-    return EvaluateFeatureHooked(cmd_list, feature_handle, params, callback,
-                                 g_orig_EvaluateFeature_dlss);
-}
-
-// Trampoline for nvngx.dll hook
-static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_NGX(
-    ID3D12GraphicsCommandList* cmd_list,
-    NVSDK_NGX_Handle* feature_handle,
-    NVSDK_NGX_Parameter* params,
-    void* callback)
-{
-    return EvaluateFeatureHooked(cmd_list, feature_handle, params, callback,
-                                 g_orig_EvaluateFeature_ngx);
-}
-
-// ══════════════════════════════════════════════════════════════════════
-// Error handling
-// ══════════════════════════════════════════════════════════════════════
-
-static void HandleInterceptionFailure(const char* reason) {
-    LOG_ERROR("NGXInterceptor: interception failed — %s", reason ? reason : "unknown");
-    g_active.store(false, std::memory_order_relaxed);
-}
-
-// ══════════════════════════════════════════════════════════════════════
-// Internal: hook installation on a live NGX parameter instance
-// ══════════════════════════════════════════════════════════════════════
-
-static bool InstallParamHook(NVSDK_NGX_Parameter* param) {
-    if (!param) {
-        HandleInterceptionFailure("null NGX parameter instance");
-        return false;
+    if (!g_active.load(std::memory_order_relaxed) || !params) {
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
 
-    if (g_param_hooked) {
-        LOG_DEBUG("NGXInterceptor: parameter hook already installed");
-        return true;
+    double k = g_current_k.load(std::memory_order_relaxed);
+
+    // k ≈ 1.0 means no scaling — passthrough
+    if (k <= 1.01) {
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
 
-    void** vtable = *reinterpret_cast<void***>(param);
-    if (!vtable) {
-        HandleInterceptionFailure("null NGX parameter vtable");
-        return false;
+    // ── Read the original output resource from NGX params ──
+    void** param_vtable = *reinterpret_cast<void***>(params);
+    if (!param_vtable) {
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
 
-    if (!vtable[NGX_PARAM_VTABLE_GET_UINT]) {
-        HandleInterceptionFailure("null Get(uint) vtable entry");
-        return false;
+    auto fnGetResource = reinterpret_cast<NGXParam_GetResource_t>(
+        param_vtable[NGX_PARAM_VTABLE_GET_RESOURCE]);
+    auto fnSetResource = reinterpret_cast<NGXParam_SetResource_t>(
+        param_vtable[NGX_PARAM_VTABLE_SET_RESOURCE]);
+
+    if (!fnGetResource || !fnSetResource) {
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
 
-    PatchVtable(vtable, NGX_PARAM_VTABLE_GET_UINT,
-                reinterpret_cast<void*>(&Hooked_NGXParam_GetUint),
-                reinterpret_cast<void**>(&g_orig_GetUint));
+    ID3D12Resource* original_output = nullptr;
+    fnGetResource(params, "Output", &original_output);
+    if (!original_output) {
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+    }
 
-    g_hooked_param_instance = param;
-    g_param_hooked = true;
-    g_active.store(true, std::memory_order_relaxed);
+    // Get display dimensions from original output
+    D3D12_RESOURCE_DESC orig_desc = original_output->GetDesc();
+    uint32_t display_w = static_cast<uint32_t>(orig_desc.Width);
+    uint32_t display_h = orig_desc.Height;
 
-    LOG_INFO("NGXInterceptor: parameter Get hook installed (vtable=%p)", vtable);
-    return true;
+    // Compute intermediate buffer size
+    auto [fake_w, fake_h] = ComputeFakeResolution(k, display_w, display_h);
+
+    // Ensure intermediate buffer
+    if (!EnsureIntermediateBuffer(fake_w, fake_h, orig_desc.Format)) {
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+    }
+
+    // Swap output to intermediate buffer
+    fnSetResource(params, "Output", g_intermediate_buffer);
+
+    // Call original — DLSS upscales to k×D
+    NVSDK_NGX_Result result = g_orig_EvaluateFeature_dlss(
+        cmd_list, feature_handle, params, callback);
+
+    // Restore original output
+    fnSetResource(params, "Output", original_output);
+
+    if (result != NVSDK_NGX_Result_Success) {
+        return result;
+    }
+
+    // Lanczos downscale: intermediate (k×D) → game output (D)
+    if (cmd_list) {
+        Lanczos_Dispatch(cmd_list,
+                         g_intermediate_buffer, original_output,
+                         fake_w, fake_h,
+                         display_w, display_h);
+    }
+
+    // Periodic logging
+    static int s_eval_count = 0;
+    s_eval_count++;
+    if (s_eval_count <= 3 || (s_eval_count % 300) == 0) {
+        LOG_INFO("NGXInterceptor: [NGX] eval #%d — k=%.2f, DLSS output=%ux%u, "
+                 "Lanczos %ux%u -> %ux%u",
+                 s_eval_count, k, fake_w, fake_h,
+                 fake_w, fake_h, display_w, display_h);
+    }
+
+    return result;
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Internal: hook CreateFeature export from nvngx_dlss.dll
+// Hook installation helpers
 // ══════════════════════════════════════════════════════════════════════
 
 static bool InstallCreateFeatureHook(HMODULE hDlssDll) {
@@ -402,8 +593,7 @@ static bool InstallCreateFeatureHook(HMODULE hDlssDll) {
 
     auto proc = GetProcAddress(hDlssDll, "NVSDK_NGX_D3D12_CreateFeature");
     if (!proc) {
-        LOG_WARN("NGXInterceptor: NVSDK_NGX_D3D12_CreateFeature not found in DLL, "
-                 "Ray Reconstruction detection may be unavailable");
+        LOG_WARN("NGXInterceptor: NVSDK_NGX_D3D12_CreateFeature not found in DLL");
         return false;
     }
 
@@ -430,16 +620,8 @@ static bool InstallCreateFeatureHook(HMODULE hDlssDll) {
     return true;
 }
 
-// ══════════════════════════════════════════════════════════════════════
-// Internal: hook EvaluateFeature from a given DLL
-// ══════════════════════════════════════════════════════════════════════
-
-static bool InstallEvaluateFeatureHook(HMODULE hDll, const char* dll_name,
-                                        void* detour,
-                                        NGX_D3D12_EvaluateFeature_t* orig_out,
-                                        bool* hooked_flag,
-                                        void** target_out) {
-    if (*hooked_flag) return true;
+static bool InstallDirectNGXHook(HMODULE hDll, const char* dll_name) {
+    if (g_eval_hooked_dlss) return true;
 
     auto proc = GetProcAddress(hDll, "NVSDK_NGX_D3D12_EvaluateFeature");
     if (!proc) {
@@ -449,8 +631,8 @@ static bool InstallEvaluateFeatureHook(HMODULE hDll, const char* dll_name,
 
     MH_STATUS status = MH_CreateHook(
         reinterpret_cast<void*>(proc),
-        detour,
-        reinterpret_cast<void**>(orig_out));
+        reinterpret_cast<void*>(&Hooked_EvaluateFeature_DLSS),
+        reinterpret_cast<void**>(&g_orig_EvaluateFeature_dlss));
 
     if (status != MH_OK) {
         LOG_WARN("NGXInterceptor: MH_CreateHook for EvaluateFeature (%s) failed (status=%d)",
@@ -465,14 +647,73 @@ static bool InstallEvaluateFeatureHook(HMODULE hDll, const char* dll_name,
         return false;
     }
 
-    *hooked_flag = true;
-    *target_out = reinterpret_cast<void*>(proc);
-    LOG_INFO("NGXInterceptor: EvaluateFeature hook installed from %s", dll_name);
+    g_eval_hooked_dlss = true;
+    g_eval_target_dlss = reinterpret_cast<void*>(proc);
+    g_hook_mode = HookMode::DirectNGX;
+    LOG_INFO("NGXInterceptor: EvaluateFeature hook installed from %s (direct NGX mode)", dll_name);
+    return true;
+}
+
+static bool InstallParamHook(NVSDK_NGX_Parameter* param) {
+    if (!param) return false;
+    if (g_param_hooked) return true;
+
+    void** vtable = *reinterpret_cast<void***>(param);
+    if (!vtable || !vtable[NGX_PARAM_VTABLE_GET_UINT]) {
+        HandleInterceptionFailure("null NGX parameter vtable");
+        return false;
+    }
+
+    PatchVtable(vtable, NGX_PARAM_VTABLE_GET_UINT,
+                reinterpret_cast<void*>(&Hooked_NGXParam_GetUint),
+                reinterpret_cast<void**>(&g_orig_GetUint));
+
+    g_hooked_param_instance = param;
+    g_param_hooked = true;
+    LOG_INFO("NGXInterceptor: parameter Get hook installed (vtable=%p)", vtable);
     return true;
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// Streamline hook installation (called from HookStreamlinePCL path)
+// ══════════════════════════════════════════════════════════════════════
+
+void NGXInterceptor_OnStreamlineLoaded(void* hModule) {
+    if (!g_initialized.load(std::memory_order_relaxed)) return;
+    if (g_sl_eval_hooked) return;
+
+    HMODULE hInterposer = static_cast<HMODULE>(hModule);
+
+    // Get slEvaluateFeature from the interposer
+    auto proc = GetProcAddress(hInterposer, "slEvaluateFeature");
+    if (!proc) {
+        LOG_WARN("NGXInterceptor: slEvaluateFeature not found in sl.interposer.dll");
+        return;
+    }
+
+    // Use InstallHook (same MinHook wrapper used for all other hooks)
+    MH_STATUS status = InstallHook(
+        reinterpret_cast<void*>(proc),
+        reinterpret_cast<void*>(&Hooked_slEvaluateFeature),
+        reinterpret_cast<void**>(&g_orig_slEvaluateFeature));
+
+    if (status != MH_OK) {
+        LOG_WARN("NGXInterceptor: InstallHook for slEvaluateFeature failed (status=%d)",
+                 static_cast<int>(status));
+        return;
+    }
+
+    g_sl_eval_hooked = true;
+    g_hook_mode = HookMode::Streamline;
+    g_active.store(true, std::memory_order_relaxed);
+
+    LOG_INFO("NGXInterceptor: slEvaluateFeature hook installed from sl.interposer.dll "
+             "(Streamline mode — no _nvngx.dll hooks needed)");
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // Callback from loadlib_hooks.cpp when nvngx_dlss.dll is loaded
+// (only used for non-Streamline games as fallback)
 // ══════════════════════════════════════════════════════════════════════
 
 void NGXInterceptor_OnDLSSDllLoaded(void* hModule) {
@@ -487,31 +728,33 @@ void NGXInterceptor_OnDLSSDllLoaded(void* hModule) {
         return;
     }
 
-    LOG_INFO("NGXInterceptor: nvngx_dlss.dll loaded, installing hooks");
+    // If Streamline hook is already installed, skip direct NGX hooking.
+    // The Streamline path handles everything at a higher level.
+    if (g_sl_eval_hooked) {
+        LOG_INFO("NGXInterceptor: Streamline hook active — skipping direct NGX hook on %p", hModule);
 
-    // Install CreateFeature hook for Ray Reconstruction detection
+        // Still install CreateFeature hook for Ray Reconstruction detection
+        InstallCreateFeatureHook(hDlssDll);
+        return;
+    }
+
+    // Check if Streamline is present but we haven't hooked it yet.
+    // If sl.interposer.dll is loaded, prefer the Streamline path.
+    HMODULE hInterposer = GetModuleHandleW(L"sl.interposer.dll");
+    if (hInterposer) {
+        LOG_INFO("NGXInterceptor: Streamline detected — using interposer hook instead of direct NGX");
+        NGXInterceptor_OnStreamlineLoaded(hInterposer);
+
+        // Still install CreateFeature hook for RR detection
+        InstallCreateFeatureHook(hDlssDll);
+        return;
+    }
+
+    // No Streamline — use direct NGX hooking (safe without Streamline proxy)
+    LOG_INFO("NGXInterceptor: no Streamline detected — using direct NGX hook on %p", hModule);
+
     InstallCreateFeatureHook(hDlssDll);
-
-    // Install EvaluateFeature hook in DIAGNOSTIC MODE (passthrough + logging only)
-    InstallEvaluateFeatureHook(hDlssDll, "nvngx_dlss.dll",
-                                reinterpret_cast<void*>(&Hooked_EvaluateFeature_DLSS),
-                                &g_orig_EvaluateFeature_dlss,
-                                &g_eval_hooked_dlss,
-                                &g_eval_target_dlss);
-
-    // Also try from nvngx.dll
-    HMODULE hNgxDll = GetModuleHandleW(L"nvngx.dll");
-    if (hNgxDll) {
-        InstallEvaluateFeatureHook(hNgxDll, "nvngx.dll",
-                                    reinterpret_cast<void*>(&Hooked_EvaluateFeature_NGX),
-                                    &g_orig_EvaluateFeature_ngx,
-                                    &g_eval_hooked_ngx,
-                                    &g_eval_target_ngx);
-    }
-
-    if (!g_eval_hooked_dlss && !g_eval_hooked_ngx) {
-        LOG_WARN("NGXInterceptor: EvaluateFeature hook not installed from any DLL");
-    }
+    InstallDirectNGXHook(hDlssDll, "nvngx_dlss.dll");
 
     // Install parameter Get hook for render dimension override
     using GetParams_t = NVSDK_NGX_Result (__cdecl*)(NVSDK_NGX_Parameter**);
@@ -529,13 +772,11 @@ void NGXInterceptor_OnDLSSDllLoaded(void* hModule) {
         if (params) {
             std::lock_guard<std::mutex> lock(g_ngx_mutex);
             InstallParamHook(params);
+            g_active.store(true, std::memory_order_relaxed);
         } else {
-            LOG_WARN("NGXInterceptor: GetParameters returned null (result=0x%08X), "
-                     "will retry on first DLSS query", ngx_result);
+            LOG_WARN("NGXInterceptor: GetParameters returned null (result=0x%08X)",
+                     ngx_result);
         }
-    } else {
-        LOG_WARN("NGXInterceptor: no GetParameters/AllocateParameters export found, "
-                 "parameter hook deferred");
     }
 }
 
@@ -563,16 +804,24 @@ void NGXInterceptor_Init(double scale_factor) {
     g_current_k.store(1.0, std::memory_order_relaxed);
     g_display_w.store(0, std::memory_order_relaxed);
     g_display_h.store(0, std::memory_order_relaxed);
+    g_hook_mode = HookMode::None;
     g_initialized.store(true, std::memory_order_relaxed);
 
     LOG_INFO("NGXInterceptor: initialized with scale_factor=%.3f", scale_factor);
 
-    // Check if any NGX DLL is already loaded (game loaded it before us)
+    // Check if Streamline interposer is already loaded — hook it immediately
+    HMODULE hInterposer = GetModuleHandleW(L"sl.interposer.dll");
+    if (hInterposer) {
+        LOG_INFO("NGXInterceptor: sl.interposer.dll already loaded — hooking slEvaluateFeature");
+        NGXInterceptor_OnStreamlineLoaded(hInterposer);
+    }
+
+    // Check if any NGX DLL is already loaded (for CreateFeature / direct fallback)
     const wchar_t* ngx_dll_names[] = { L"nvngx_dlss.dll", L"nvngx_dlssd.dll", L"_nvngx.dll", L"nvngx.dll" };
     for (auto* name : ngx_dll_names) {
         HMODULE existing = GetModuleHandleW(name);
         if (existing) {
-            LOG_INFO("NGXInterceptor: %ls already loaded, hooking now", name);
+            LOG_INFO("NGXInterceptor: %ls already loaded", name);
             NGXInterceptor_OnDLSSDllLoaded(static_cast<void*>(existing));
             break;
         }
@@ -597,25 +846,22 @@ void NGXInterceptor_Shutdown() {
         g_orig_GetUint = nullptr;
     }
 
-    // Disable EvaluateFeature hooks via MinHook
+    // Disable direct NGX EvaluateFeature hook
     if (g_eval_hooked_dlss && g_eval_target_dlss) {
         MH_DisableHook(g_eval_target_dlss);
         g_eval_hooked_dlss = false;
         g_orig_EvaluateFeature_dlss = nullptr;
         g_eval_target_dlss = nullptr;
     }
-    if (g_eval_hooked_ngx && g_eval_target_ngx) {
-        MH_DisableHook(g_eval_target_ngx);
-        g_eval_hooked_ngx = false;
-        g_orig_EvaluateFeature_ngx = nullptr;
-        g_eval_target_ngx = nullptr;
-    }
+
+    // Note: Streamline slEvaluateFeature hook is managed by MinHook globally
+    // and will be cleaned up by MH_Uninitialize. We just clear our state.
+    g_sl_eval_hooked = false;
+    g_orig_slEvaluateFeature = nullptr;
 
     // Disable CreateFeature hook
-    if (g_create_feature_hooked) {
-        g_create_feature_hooked = false;
-        g_orig_CreateFeature = nullptr;
-    }
+    g_create_feature_hooked = false;
+    g_orig_CreateFeature = nullptr;
 
     // Release intermediate buffer
     ReleaseIntermediateBuffer();
@@ -634,6 +880,7 @@ void NGXInterceptor_Shutdown() {
     g_current_k.store(1.0, std::memory_order_relaxed);
     g_display_w.store(0, std::memory_order_relaxed);
     g_display_h.store(0, std::memory_order_relaxed);
+    g_hook_mode = HookMode::None;
 
     LOG_INFO("NGXInterceptor: shutdown complete");
 }
@@ -679,11 +926,10 @@ void NGXInterceptor_SetDevice(ID3D12Device* device) {
     uint32_t dw = g_display_w.load(std::memory_order_relaxed);
     uint32_t dh = g_display_h.load(std::memory_order_relaxed);
     if (dw > 0 && dh > 0) {
-        // Use k_max from config for pre-allocation
-        double k_max = 2.0;  // Will be updated by SetScalingParams
+        double k_max = 2.0;
         uint32_t alloc_w = static_cast<uint32_t>(std::floor(k_max * dw));
         uint32_t alloc_h = static_cast<uint32_t>(std::floor(k_max * dh));
-        AllocateIntermediateBuffer(alloc_w, alloc_h, DXGI_FORMAT_R8G8B8A8_UNORM);
+        EnsureIntermediateBuffer(alloc_w, alloc_h, DXGI_FORMAT_R8G8B8A8_UNORM);
     }
 }
 
@@ -694,4 +940,12 @@ void NGXInterceptor_SetScalingParams(double k, uint32_t display_w, uint32_t disp
 
     LOG_DEBUG("NGXInterceptor: scaling params set — k=%.2f, display=%ux%u",
               k, display_w, display_h);
+}
+
+const char* NGXInterceptor_GetHookModeName() {
+    switch (g_hook_mode) {
+        case HookMode::Streamline: return "Streamline";
+        case HookMode::DirectNGX:  return "DirectNGX";
+        default:                   return "None";
+    }
 }
