@@ -513,27 +513,15 @@ void NGXInterceptor_OnDLSSDllLoaded(void* hModule) {
     // Install CreateFeature hook for Ray Reconstruction detection
     InstallCreateFeatureHook(hDlssDll);
 
-    // Install EvaluateFeature hook from nvngx_dlss.dll
-    InstallEvaluateFeatureHook(hDlssDll, "nvngx_dlss.dll",
-                                reinterpret_cast<void*>(&Hooked_EvaluateFeature_DLSS),
-                                &g_orig_EvaluateFeature_dlss,
-                                &g_eval_hooked_dlss,
-                                &g_eval_target_dlss);
-
-    // Also try hooking from the main nvngx.dll (some games route through it)
-    HMODULE hNgxDll = GetModuleHandleW(L"nvngx.dll");
-    if (hNgxDll) {
-        InstallEvaluateFeatureHook(hNgxDll, "nvngx.dll",
-                                    reinterpret_cast<void*>(&Hooked_EvaluateFeature_NGX),
-                                    &g_orig_EvaluateFeature_ngx,
-                                    &g_eval_hooked_ngx,
-                                    &g_eval_target_ngx);
-    }
-
-    if (!g_eval_hooked_dlss && !g_eval_hooked_ngx) {
-        LOG_WARN("NGXInterceptor: EvaluateFeature hook not installed from any DLL — "
-                 "DLSS output interception unavailable");
-    }
+    // DISABLED: EvaluateFeature hook causes black screen in Crimson Desert.
+    // The hook fires but corrupts the DLSS output even in passthrough mode.
+    // Need to debug the intermediate buffer swap and resource state transitions.
+    // TODO: Fix the EvaluateFeature interception — likely resource barrier or
+    // format mismatch issue with the intermediate buffer.
+    //
+    // InstallEvaluateFeatureHook(hDlssDll, "nvngx_dlss.dll", ...);
+    // InstallEvaluateFeatureHook(hNgxDll, "nvngx.dll", ...);
+    LOG_INFO("NGXInterceptor: EvaluateFeature hook DISABLED (pending black screen fix)");
 
     // Install parameter Get hook for render dimension override
     using GetParams_t = NVSDK_NGX_Result (__cdecl*)(NVSDK_NGX_Parameter**);
