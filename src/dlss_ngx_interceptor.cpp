@@ -324,16 +324,15 @@ static sl_Result __cdecl Hooked_slDLSSSetOptions(const void* viewport, const voi
     double k = g_current_k.load(std::memory_order_relaxed);
 
     // If k <= 1.0 or not active, pass through unmodified
-    // CRITICAL: Also passthrough if we haven't captured the game's output
-    // resource yet, or if the intermediate buffer isn't allocated.
-    // Overriding dimensions without swapping the output buffer
-    // causes DLSS to write k*D pixels into a D-sized buffer -> corruption.
+    // Dimension-only override: tell DLSS to upscale to k*D internally.
+    // The output resource stays at D — DLSS/Streamline should handle the
+    // copy/downscale internally. If this works, the image quality improves
+    // without needing any resource swap.
     void* game_output = g_game_output_resource.load(std::memory_order_relaxed);
     uintptr_t game_output_addr = reinterpret_cast<uintptr_t>(game_output);
     bool game_output_valid = game_output && game_output_addr > 0x10000 && game_output_addr < 0x00007FFFFFFFFFFF;
     if (!g_active.load(std::memory_order_relaxed) || k <= 1.01 ||
-        game_out_w == 0 || game_out_h == 0 || !game_output_valid ||
-        !g_intermediate_buffer) {
+        game_out_w == 0 || game_out_h == 0 || !game_output_valid) {
         return g_orig_slDLSSSetOptions(viewport, options);
     }
 
@@ -550,12 +549,9 @@ static sl_Result __cdecl Hooked_slSetTag(const void* viewport, const void* tags,
         LOG_INFO("NGXInterceptor: slSetTag called — numTags=%u tags=%p", numTags, tags);
     }
     CaptureOutputResource(tags, numTags);
-    
-    SwapOutputResourceInPlace(const_cast<void*>(tags), numTags);
-    sl_Result result = g_orig_slSetTag(viewport, tags, numTags, cmdBuffer);
-    RestoreOutputResourceInPlace(const_cast<void*>(tags), numTags);
-    
-    return result;
+    // Resource swap disabled — only dimension override via slDLSSSetOptions.
+    // In-place swap caused DXGI_ERROR_DEVICE_REMOVED.
+    return g_orig_slSetTag(viewport, tags, numTags, cmdBuffer);
 }
 
 static sl_Result __cdecl Hooked_slSetTagForFrame(const void* frame, const void* viewport, const void* tags, uint32_t numTags, void* cmdBuffer) {
@@ -564,12 +560,7 @@ static sl_Result __cdecl Hooked_slSetTagForFrame(const void* frame, const void* 
         LOG_INFO("NGXInterceptor: slSetTagForFrame called — numTags=%u tags=%p", numTags, tags);
     }
     CaptureOutputResource(tags, numTags);
-    
-    SwapOutputResourceInPlace(const_cast<void*>(tags), numTags);
-    sl_Result result = g_orig_slSetTagForFrame(frame, viewport, tags, numTags, cmdBuffer);
-    RestoreOutputResourceInPlace(const_cast<void*>(tags), numTags);
-    
-    return result;
+    return g_orig_slSetTagForFrame(frame, viewport, tags, numTags, cmdBuffer);
 }
 
 static sl_Result __cdecl Hooked_slEvaluateFeature(
@@ -579,69 +570,21 @@ static sl_Result __cdecl Hooked_slEvaluateFeature(
     uint32_t numInputs,
     void* cmdBuffer)
 {
-    // Only intercept DLSS-SR (feature 0) and DLSS-RR (feature 12)
-    if (feature != sl_kFeatureDLSS && feature != sl_kFeatureDLSS_RR) {
-        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
+    // Only log DLSS-SR (feature 0) and DLSS-RR (feature 12)
+    if (feature == sl_kFeatureDLSS || feature == sl_kFeatureDLSS_RR) {
+        static int s_eval_count = 0;
+        s_eval_count++;
+        if (s_eval_count <= 5 || (s_eval_count % 300) == 0) {
+            double k = g_current_k.load(std::memory_order_relaxed);
+            LOG_INFO("NGXInterceptor: [SL] eval #%d feature=%u k=%.2f cmd=%p",
+                     s_eval_count, feature, k, cmdBuffer);
+        }
     }
 
-    double k = g_current_k.load(std::memory_order_relaxed);
-
-    static int s_eval_count = 0;
-    s_eval_count++;
-
-    if (s_eval_count <= 5 || (s_eval_count % 300) == 0) {
-        LOG_INFO("NGXInterceptor: [SL] eval #%d feature=%u k=%.2f cmd=%p",
-                 s_eval_count, feature, k, cmdBuffer);
-    }
-
-    // Passthrough when inactive or k ~ 1.0
-    if (!g_active.load(std::memory_order_relaxed) || k <= 1.01 || !cmdBuffer) {
-        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
-    }
-
-    void* game_output = g_game_output_resource.load(std::memory_order_relaxed);
-    uintptr_t addr = reinterpret_cast<uintptr_t>(game_output);
-    if (!game_output || addr <= 0x10000 || addr >= 0x00007FFFFFFFFFFF) {
-        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
-    }
-
-    if (!g_intermediate_buffer) {
-        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
-    }
-
-    uint32_t game_w = g_game_output_w.load(std::memory_order_relaxed);
-    uint32_t game_h = g_game_output_h.load(std::memory_order_relaxed);
-    if (game_w == 0 || game_h == 0) {
-        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
-    }
-
-    auto [fake_w, fake_h] = ComputeFakeResolution(k, game_w, game_h);
-
-    // Call original — DLSS writes to our intermediate buffer
-    // (resource swap was done in slSetTag hook)
-    sl_Result result = g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
-
-    if (result != sl_eOk) {
-        static int s_err = 0;
-        if (++s_err <= 3) LOG_WARN("NGXInterceptor: slEvaluateFeature returned %d", result);
-        return result;
-    }
-
-    // Lanczos downscale: intermediate (k*D) -> game output (D)
-    auto* cmd_list = static_cast<ID3D12GraphicsCommandList*>(cmdBuffer);
-    auto* original_output = static_cast<ID3D12Resource*>(game_output);
-
-    Lanczos_Dispatch(cmd_list,
-                     g_intermediate_buffer, original_output,
-                     fake_w, fake_h,
-                     game_w, game_h);
-
-    if (s_eval_count <= 5 || (s_eval_count % 300) == 0) {
-        LOG_INFO("NGXInterceptor: [SL] INTERCEPTED #%d k=%.2f %ux%u -> %ux%u",
-                 s_eval_count, k, fake_w, fake_h, game_w, game_h);
-    }
-
-    return result;
+    // Pure passthrough — dimension override happens in slDLSSSetOptions.
+    // Resource swap disabled (caused DXGI_ERROR_DEVICE_REMOVED).
+    // Testing if DLSS handles dimension mismatch gracefully.
+    return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
 }
 
 // ══════════════════════════════════════════════════════════════════════
