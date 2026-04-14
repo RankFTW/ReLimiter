@@ -370,50 +370,17 @@ static sl_Result __cdecl Hooked_slEvaluateFeature(
     uint32_t feature, const sl_FrameToken* frame,
     const sl_BaseStructure** inputs, uint32_t numInputs, void* cmdBuffer)
 {
-    if (feature != sl_kFeatureDLSS && feature != sl_kFeatureDLSS_RR)
-        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
-    double k = g_current_k.load(std::memory_order_relaxed);
-    static int s_n = 0; s_n++;
-    if (s_n <= 5 || (s_n % 300) == 0)
-        LOG_INFO("NGXInterceptor: [SL] eval #%d k=%.2f", s_n, k);
-    if (!g_active.load(std::memory_order_relaxed) || k <= 1.01 || !cmdBuffer)
-        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
-    uint32_t gw = g_game_output_w.load(std::memory_order_relaxed);
-    uint32_t gh = g_game_output_h.load(std::memory_order_relaxed);
-    void* game_out = g_game_output_resource.load(std::memory_order_relaxed);
-    uint8_t* nat_loc = g_output_native_location.load(std::memory_order_relaxed);
-    if (gw == 0 || gh == 0 || !game_out || !nat_loc)
-        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
-    uintptr_t ga = reinterpret_cast<uintptr_t>(game_out);
-    if (ga <= 0x10000 || ga >= 0x00007FFFFFFFFFFF)
-        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
-    auto [fw, fh] = ComputeFakeResolution(k, gw, gh);
-    Lanczos_Resize(fw, fh, gw, gh);
-    DXGI_FORMAT fmt = DXGI_FORMAT_R10G10B10A2_UNORM;
-    __try { fmt = static_cast<ID3D12Resource*>(game_out)->GetDesc().Format; }
-    __except(EXCEPTION_EXECUTE_HANDLER) {}
-    if (!EnsureIntermediateBuffer(fw, fh, fmt))
-        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
-    // ATOMIC: swap resource → evaluate → restore → Lanczos
-    void* orig = nullptr;
-    __try {
-        orig = *reinterpret_cast<void**>(nat_loc);
-        *reinterpret_cast<void**>(nat_loc) = static_cast<void*>(g_intermediate_buffer);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
+    if (feature == sl_kFeatureDLSS || feature == sl_kFeatureDLSS_RR) {
+        static int s_n = 0; s_n++;
+        if (s_n <= 5 || (s_n % 300) == 0) {
+            double k = g_current_k.load(std::memory_order_relaxed);
+            LOG_INFO("NGXInterceptor: [SL] eval #%d k=%.2f", s_n, k);
+        }
     }
-    if (s_n <= 5 || (s_n % 300) == 0)
-        LOG_INFO("NGXInterceptor: INTERCEPT #%d: %p->%p k=%.2f %ux%u", s_n, orig, g_intermediate_buffer, k, fw, fh);
-    sl_Result result = g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
-    __try { *reinterpret_cast<void**>(nat_loc) = orig; }
-    __except(EXCEPTION_EXECUTE_HANDLER) {}
-    if (result != sl_eOk) return result;
-    Lanczos_Dispatch(static_cast<ID3D12GraphicsCommandList*>(cmdBuffer),
-                     g_intermediate_buffer, static_cast<ID3D12Resource*>(game_out),
-                     fw, fh, gw, gh);
-    if (s_n <= 5 || (s_n % 300) == 0)
-        LOG_INFO("NGXInterceptor: DONE #%d %ux%u -> %ux%u", s_n, fw, fh, gw, gh);
-    return result;
+    // v4 resource swap caused DEVICE_REMOVED — Streamline caches resource
+    // metadata at slSetTag time and validates at evaluate. Swapping the
+    // native pointer creates a metadata mismatch. Pure passthrough for now.
+    return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
 }
 
 // ══════════════════════════════════════════════════════════════════════
