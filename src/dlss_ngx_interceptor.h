@@ -81,3 +81,9 @@ void NGXInterceptor_SetScalingParams(double k, uint32_t display_w, uint32_t disp
 
 // Returns the name of the active hook mode ("Streamline", "DirectNGX", or "None").
 const char* NGXInterceptor_GetHookModeName();
+
+// Called by streamline_hooks.cpp when slDLSSSetOptions is resolved via
+// slGetFeatureFunction. Installs the MinHook detour on the resolved pointer.
+// This is the preferred path — it fires when the game first resolves the
+// function, guaranteeing the DLSS plugin is initialized.
+void NGXInterceptor_HookDLSSSetOptions(void* resolved_fn);

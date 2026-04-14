@@ -2,6 +2,7 @@
 #include "hooks.h"
 #include "config.h"
 #include "flush.h"
+#include "dlss_ngx_interceptor.h"
 #include "logger.h"
 #include <cstring>
 
@@ -251,6 +252,13 @@ static sl_Result __cdecl Detour_slGetFeatureFunction(uint32_t feature, const cha
                     reinterpret_cast<void**>(&s_orig_GetState));
     }
 
+    // ── Adaptive DLSS Scaling: hook slDLSSSetOptions for DLSS-SR ──
+    // When the game resolves slDLSSSetOptions, we hook it to override
+    // outputWidth/outputHeight for the k*D upscale.
+    if (name && strcmp(name, "slDLSSSetOptions") == 0) {
+        NGXInterceptor_HookDLSSSetOptions(*outPtr);
+    }
+
     return result;
 }
 
@@ -324,6 +332,15 @@ void HookStreamlinePCL(HMODULE hInterposer) {
             InstallHook(fn, reinterpret_cast<void*>(&Detour_GetState),
                         reinterpret_cast<void**>(&s_orig_GetState));
             LOG_INFO("Streamline: proactively hooked slDLSSGGetState");
+        }
+    }
+
+    // ── Adaptive DLSS Scaling: proactively resolve slDLSSSetOptions ──
+    if (s_orig_slGetFeatureFunction) {
+        void* fn = nullptr;
+        sl_Result r = s_orig_slGetFeatureFunction(0 /*kFeatureDLSS*/, "slDLSSSetOptions", &fn);
+        if (r == sl_eOk && fn) {
+            NGXInterceptor_HookDLSSSetOptions(fn);
         }
     }
 }
