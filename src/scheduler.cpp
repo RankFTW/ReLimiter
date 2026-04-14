@@ -206,15 +206,23 @@ void OnMarker(uint64_t frameID, int64_t now) {
         if (tier_changed) {
             KControllerState state = KController_GetState();
 
-            // Get display dimensions from the real swapchain
+            // Use display dimensions from NGXInterceptor's cached values
+            // DO NOT call IDXGISwapChain::GetDesc here — we're on the scheduler
+            // thread and the Streamline swapchain proxy is not thread-safe.
+            // Calling GetDesc from a non-render thread corrupts Streamline's state.
             uint32_t display_w = 0, display_h = 0;
-            uint64_t sc_handle = SwapMgr_GetNativeHandle();
-            if (sc_handle) {
-                auto* dxgi_sc = reinterpret_cast<IDXGISwapChain*>(sc_handle);
-                DXGI_SWAP_CHAIN_DESC desc = {};
-                if (SUCCEEDED(dxgi_sc->GetDesc(&desc))) {
-                    display_w = desc.BufferDesc.Width;
-                    display_h = desc.BufferDesc.Height;
+            NGXInterceptor_GetDisplayDims(&display_w, &display_h);
+
+            // If we don't have cached dimensions yet, try to get them from
+            // the swapchain manager's HWND (which is thread-safe)
+            if (display_w == 0 || display_h == 0) {
+                HWND hwnd = SwapMgr_GetHWND();
+                if (hwnd) {
+                    RECT rc;
+                    if (GetClientRect(hwnd, &rc)) {
+                        display_w = rc.right - rc.left;
+                        display_h = rc.bottom - rc.top;
+                    }
                 }
             }
 
@@ -222,7 +230,8 @@ void OnMarker(uint64_t frameID, int64_t now) {
                 auto [fake_w, fake_h] = ComputeFakeResolution(
                     state.current_k, display_w, display_h);
 
-                // DIAGNOSTIC: ONLY SetScalingParams — no Lanczos, no UpdateOutputRes
+                // Lanczos_Resize deferred to EvaluateFeature hook (render thread)
+                NGXInterceptor_UpdateOutputRes(fake_w, fake_h);
                 NGXInterceptor_SetScalingParams(state.current_k, display_w, display_h);
 
                 const char* reason = (state.current_tier < prev_tier)

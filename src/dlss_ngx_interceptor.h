@@ -73,6 +73,9 @@ void NGXInterceptor_OnStreamlineLoaded(void* hModule);
 // Set the DX12 device for intermediate buffer allocation.
 void NGXInterceptor_SetDevice(ID3D12Device* device);
 
+// Get cached display dimensions (thread-safe, no DXGI calls).
+void NGXInterceptor_GetDisplayDims(uint32_t* out_w, uint32_t* out_h);
+
 // Set current k value and display dimensions for the EvaluateFeature hook.
 void NGXInterceptor_SetScalingParams(double k, uint32_t display_w, uint32_t display_h);
 

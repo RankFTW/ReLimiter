@@ -1072,6 +1072,11 @@ void NGXInterceptor_SetScalingParams(double k, uint32_t display_w, uint32_t disp
               k, display_w, display_h);
 }
 
+void NGXInterceptor_GetDisplayDims(uint32_t* out_w, uint32_t* out_h) {
+    if (out_w) *out_w = g_display_w.load(std::memory_order_relaxed);
+    if (out_h) *out_h = g_display_h.load(std::memory_order_relaxed);
+}
+
 const char* NGXInterceptor_GetHookModeName() {
     switch (g_hook_mode) {
         case HookMode::Streamline: return "Streamline";
