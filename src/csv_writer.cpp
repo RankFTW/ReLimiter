@@ -32,7 +32,8 @@ static const char* CSV_HEADER =
     "reflex_pipeline_latency_us,reflex_queue_trend_us,"
     "reflex_present_duration_us,reflex_gpu_active_us,"
     "reflex_ai_frame_time_us,reflex_cpu_latency_us,gate_margin_us,"
-    "smoothing_offset_us,p99_render_time_us,total_frame_cost_us\n";
+    "smoothing_offset_us,p99_render_time_us,total_frame_cost_us,"
+    "dlss_tier,dlss_k,dlss_effective_quality,dlss_internal_w,dlss_internal_h\n";
 
 static void OpenNewFile() {
     if (s_file) { fclose(s_file); s_file = nullptr; }
@@ -58,7 +59,8 @@ static void WriteRow(const FrameRow& r) {
         "%.1f,%.1f,%.1f,%d,%.4f,"
         "%.1f,%.1f,"
         "%.1f,%.1f,%.1f,%.1f,%.1f,"
-        "%.1f,%.1f,%.1f\n",
+        "%.1f,%.1f,%.1f,"
+        "%d,%.4f,%.4f,%u,%u\n",
         r.frame_id, r.timestamp_us, r.predicted_us, r.effective_interval_us,
         r.actual_frame_time_us, r.sleep_duration_us, r.wake_error_us,
         r.ceiling_margin_us, r.stress_level, r.cv,
@@ -75,7 +77,9 @@ static void WriteRow(const FrameRow& r) {
         r.reflex_ai_frame_time_us, r.reflex_cpu_latency_us,
         r.gate_margin_us,
         r.smoothing_offset_us, r.p99_render_time_us,
-        r.total_frame_cost_us);
+        r.total_frame_cost_us,
+        r.dlss_tier, r.dlss_k, r.dlss_effective_quality,
+        r.dlss_internal_w, r.dlss_internal_h);
 }
 
 static void WriterThread() {

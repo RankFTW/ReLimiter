@@ -9,6 +9,9 @@
 #include "reflex_inject.h"
 #include "pcl_hooks.h"
 #include "streamline_hooks.h"
+#include "config.h"
+#include "dlss_lanczos_shader.h"
+#include "dlss_mip_corrector.h"
 #include "logger.h"
 #include <dxgi.h>
 #include <atomic>
@@ -299,6 +302,20 @@ void SwapMgr_OnInitDevice(reshade::api::device* device) {
         LOG_INFO("SwapMgr: init_device Vulkan (VkDevice=0x%llX)", device->get_native());
     } else {
         LOG_INFO("SwapMgr: init_device api=%d", static_cast<int>(api));
+    }
+
+    // ── Adaptive DLSS Scaling: init GPU-dependent modules on DX12 device ──
+    if (api == ActiveAPI::DX12 && g_config.adaptive_dlss_scaling) {
+        auto* d3d12_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+        if (d3d12_device) {
+            if (Lanczos_Init(d3d12_device, DXGI_FORMAT_R8G8B8A8_UNORM)) {
+                LOG_INFO("DLSS Scaling: Lanczos shader initialized");
+            } else {
+                LOG_WARN("DLSS Scaling: Lanczos shader init failed (bilinear fallback)");
+            }
+            MipCorrector_Init(d3d12_device);
+            LOG_INFO("DLSS Scaling: MipCorrector initialized");
+        }
     }
 }
 

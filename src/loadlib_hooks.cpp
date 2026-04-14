@@ -1,6 +1,7 @@
 #include "loadlib_hooks.h"
 #include "hooks.h"
 #include "streamline_hooks.h"
+#include "dlss_ngx_interceptor.h"
 #include <string>
 #include <algorithm>
 #include <atomic>
@@ -13,6 +14,9 @@ static decltype(&LoadLibraryExW) s_orig_LoadLibraryExW = nullptr;
 
 // ── Idempotency guard: HookStreamlinePCL called at most once ──
 static std::atomic<bool> s_streamline_hooked{false};
+
+// ── Idempotency guard: NGXInterceptor_OnDLSSDllLoaded called at most once ──
+static std::atomic<bool> s_ngx_dlss_hooked{false};
 
 static bool ContainsInterposer(const char* path) {
     if (!path) return false;
@@ -28,6 +32,31 @@ static bool ContainsInterposerW(const wchar_t* path) {
     return s.find(L"sl.interposer.dll") != std::wstring::npos;
 }
 
+// ── nvngx_dlss.dll detection (Task 7.6) ──
+
+static bool ContainsDlssDll(const char* path) {
+    if (!path) return false;
+    std::string s(path);
+    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    return s.find("nvngx_dlss.dll") != std::string::npos;
+}
+
+static bool ContainsDlssDllW(const wchar_t* path) {
+    if (!path) return false;
+    std::wstring s(path);
+    std::transform(s.begin(), s.end(), s.begin(), ::towlower);
+    return s.find(L"nvngx_dlss.dll") != std::wstring::npos;
+}
+
+static void CheckAndHookDlss(HMODULE hModule, bool matched) {
+    if (!matched || !hModule) return;
+    // Idempotency: only hook once even if LoadLibrary is called multiple times
+    bool expected = false;
+    if (!s_ngx_dlss_hooked.compare_exchange_strong(expected, true))
+        return;
+    NGXInterceptor_OnDLSSDllLoaded(static_cast<void*>(hModule));
+}
+
 static void CheckAndHook(HMODULE hModule, bool matched) {
     if (!matched || !hModule) return;
     // Idempotency: only hook once even if LoadLibrary is called multiple times
@@ -39,15 +68,19 @@ static void CheckAndHook(HMODULE hModule, bool matched) {
 
 static HMODULE WINAPI Hook_LoadLibraryA(LPCSTR lpLibFileName) {
     bool match = ContainsInterposer(lpLibFileName);
+    bool dlss_match = ContainsDlssDll(lpLibFileName);
     HMODULE h = s_orig_LoadLibraryA(lpLibFileName);
     CheckAndHook(h, match);
+    CheckAndHookDlss(h, dlss_match);
     return h;
 }
 
 static HMODULE WINAPI Hook_LoadLibraryW(LPCWSTR lpLibFileName) {
     bool match = ContainsInterposerW(lpLibFileName);
+    bool dlss_match = ContainsDlssDllW(lpLibFileName);
     HMODULE h = s_orig_LoadLibraryW(lpLibFileName);
     CheckAndHook(h, match);
+    CheckAndHookDlss(h, dlss_match);
     return h;
 }
 
@@ -58,8 +91,10 @@ static HMODULE WINAPI Hook_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DW
         return s_orig_LoadLibraryExA(lpLibFileName, hFile, dwFlags);
     }
     bool match = ContainsInterposer(lpLibFileName);
+    bool dlss_match = ContainsDlssDll(lpLibFileName);
     HMODULE h = s_orig_LoadLibraryExA(lpLibFileName, hFile, dwFlags);
     CheckAndHook(h, match);
+    CheckAndHookDlss(h, dlss_match);
     return h;
 }
 
@@ -70,8 +105,10 @@ static HMODULE WINAPI Hook_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, D
         return s_orig_LoadLibraryExW(lpLibFileName, hFile, dwFlags);
     }
     bool match = ContainsInterposerW(lpLibFileName);
+    bool dlss_match = ContainsDlssDllW(lpLibFileName);
     HMODULE h = s_orig_LoadLibraryExW(lpLibFileName, hFile, dwFlags);
     CheckAndHook(h, match);
+    CheckAndHookDlss(h, dlss_match);
     return h;
 }
 
@@ -80,6 +117,12 @@ void InstallLoadLibraryHooks() {
     HMODULE existing = GetModuleHandleW(L"sl.interposer.dll");
     if (existing) {
         CheckAndHook(existing, true);
+    }
+
+    // Check if nvngx_dlss.dll is already loaded before we install hooks (Task 7.6)
+    HMODULE existingDlss = GetModuleHandleW(L"nvngx_dlss.dll");
+    if (existingDlss) {
+        CheckAndHookDlss(existingDlss, true);
     }
 
     InstallHook((void*)&LoadLibraryA,   (void*)&Hook_LoadLibraryA,   (void**)&s_orig_LoadLibraryA);

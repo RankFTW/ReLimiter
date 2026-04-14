@@ -24,10 +24,13 @@
 #include "presentation_gate.h"
 #include "flip_model.h"
 #include "adaptive_smoothing.h"
+#include "dlss_k_controller.h"
+#include "dlss_swapchain_proxy.h"
 #include "logger.h"
 #include <string>
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 
 // ── OSD readout state ──
 static double s_real_fps = 0.0;
@@ -40,6 +43,12 @@ static int   s_ft_history_idx = 0;
 // ── Adaptive graph scale ──
 static float s_graph_scale_min = 0.0f;
 static float s_graph_scale_max = 33.0f;
+
+// ── DLSS tier transition flash state ──
+static int    s_dlss_prev_tier = -1;
+static bool   s_dlss_flash_active = false;
+static bool   s_dlss_flash_is_raise = false;
+static std::chrono::steady_clock::time_point s_dlss_flash_start;
 
 // Tooltip helper
 static void HelpTip(const char* text) {
@@ -468,6 +477,160 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 ImGui::EndCombo();
             }
             HelpTip("Medium: single 256-frame window (~4s). Dual: short 64 + long 512 window, uses max of both P99s for robustness against scene changes.");
+        }
+    }
+
+    // ════════════════════════════════════════════
+    // SECTION: Adaptive DLSS Scaling (collapsible)
+    // ════════════════════════════════════════════
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Adaptive DLSS Scaling")) {
+        // Task 9.2: Enable/disable checkbox with status indicators
+        bool dlss_scaling = g_config.adaptive_dlss_scaling;
+        if (ImGui::Checkbox("Enable##dlss_scaling", &dlss_scaling)) {
+            g_config.adaptive_dlss_scaling = dlss_scaling;
+            config_dirty = true;
+        }
+        // Status indicators
+        if (g_dlss_scaling_active.load(std::memory_order_relaxed) && g_config.adaptive_dlss_scaling) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(Active)");
+        } else if (g_config.adaptive_dlss_scaling && !SwapProxy_IsActive()) {
+            // Passthrough/error state
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.9f, 0.2f, 0.2f, 1.0f), "(Disabled - see log)");
+        } else if (g_config.adaptive_dlss_scaling) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Waiting)");
+        }
+        HelpTip("Dynamically adjusts DLSS render resolution based on FPS. "
+                "Keeps DLSS at a fixed low preset and varies the output resolution "
+                "to trade image quality for performance automatically. DX12+DLSS only.");
+
+        // Task 9.3: Sub-controls when enabled
+        if (g_config.adaptive_dlss_scaling) {
+            // DLSS Base Preset combo
+            const char* preset_labels[] = {
+                "Ultra Performance (0.33x)",
+                "Performance (0.5x)",
+                "Balanced (0.58x)",
+                "Quality (0.67x)"
+            };
+            const double preset_values[] = { 0.33, 0.5, 0.58, 0.667 };
+            int current_preset = 0;
+            for (int i = 0; i < 4; i++) {
+                if (std::abs(g_config.dlss_scale_factor - preset_values[i]) < 0.01) {
+                    current_preset = i;
+                    break;
+                }
+            }
+            if (ImGui::BeginCombo("DLSS Base Preset", preset_labels[current_preset])) {
+                for (int i = 0; i < 4; i++) {
+                    bool selected = (current_preset == i);
+                    if (ImGui::Selectable(preset_labels[i], selected)) {
+                        g_config.dlss_scale_factor = preset_values[i];
+                        config_dirty = true;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            HelpTip("The fixed DLSS quality preset. Lower = more headroom for the output "
+                    "multiplier to improve quality. Ultra Performance recommended for maximum dynamic range.");
+
+            // Max Output Multiplier slider
+            float k_max_f = static_cast<float>(g_config.dlss_k_max);
+            if (ImGui::SliderFloat("Max Output Multiplier", &k_max_f, 1.0f, 3.0f, "%.2fx")) {
+                g_config.dlss_k_max = static_cast<double>(k_max_f);
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) config_dirty = true;
+            // Max effective quality readout
+            ImGui::Text("Max effective quality: %.0f%%", g_config.dlss_scale_factor * g_config.dlss_k_max * 100.0);
+            HelpTip("Maximum output resolution multiplier. Higher = better peak image quality "
+                    "but more DLSS inference cost. 2.0x recommended for most setups. "
+                    "Above 2.0x has diminishing returns.");
+
+            // Starting Tier slider
+            int num_tiers = static_cast<int>(std::floor((g_config.dlss_k_max - 1.0) / 0.25)) + 1;
+            if (num_tiers < 1) num_tiers = 1;
+            int max_tier_idx = num_tiers - 1;
+            int start_tier = g_config.dlss_default_tier;
+            if (start_tier > max_tier_idx) start_tier = max_tier_idx;
+            char tier_fmt[64];
+            double tier_k = 1.0 + start_tier * 0.25;
+            if (tier_k > g_config.dlss_k_max) tier_k = g_config.dlss_k_max;
+            snprintf(tier_fmt, sizeof(tier_fmt), "Tier %d (k=%.2f)", start_tier, tier_k);
+            if (ImGui::SliderInt("Starting Tier", &start_tier, 0, max_tier_idx, tier_fmt)) {
+                g_config.dlss_default_tier = start_tier;
+                config_dirty = true;
+            }
+            HelpTip("Which quality tier to start at when the game launches. "
+                    "Tier 2 (k=1.5) is a good middle ground.");
+
+            // Show on OSD checkbox
+            if (ImGui::Checkbox("Show on OSD##dlss_scaling", &g_config.osd_show_dlss_scaling))
+                config_dirty = true;
+            HelpTip("Show current tier, output multiplier, and effective quality on the in-game overlay.");
+
+            // Task 9.4: Tuning sub-section
+            ImGui::Spacing();
+            ImGui::Text("Tuning");
+
+            // Drop Threshold slider (stored as 0.80-0.99, displayed as 80-99%)
+            float drop_pct = static_cast<float>(g_config.dlss_down_threshold * 100.0);
+            if (ImGui::SliderFloat("Drop Threshold", &drop_pct, 80.0f, 99.0f, "%.0f%%")) {
+                g_config.dlss_down_threshold = static_cast<double>(drop_pct) / 100.0;
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) config_dirty = true;
+            HelpTip("FPS must fall below this percentage of your target for the system to drop "
+                    "a quality tier. Lower = more tolerant of FPS dips before reacting.");
+
+            // Raise Threshold slider (stored as 1.01-1.20, displayed as 101-120%)
+            float raise_pct = static_cast<float>(g_config.dlss_up_threshold * 100.0);
+            if (ImGui::SliderFloat("Raise Threshold", &raise_pct, 101.0f, 120.0f, "%.0f%%")) {
+                g_config.dlss_up_threshold = static_cast<double>(raise_pct) / 100.0;
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) config_dirty = true;
+            HelpTip("FPS must exceed this percentage of your target for the system to raise "
+                    "a quality tier. Higher = more conservative about raising quality.");
+
+            // Drop Delay slider
+            if (ImGui::SliderInt("Drop Delay", &g_config.dlss_down_frames, 10, 300, "%d frames"))
+                config_dirty = true;
+            HelpTip("How many consecutive frames below the drop threshold before the system "
+                    "drops a tier. Lower = faster reaction to FPS drops.");
+
+            // Raise Delay slider
+            if (ImGui::SliderInt("Raise Delay", &g_config.dlss_up_frames, 10, 300, "%d frames"))
+                config_dirty = true;
+            HelpTip("How many consecutive frames above the raise threshold before the system "
+                    "raises a tier. Higher = more stable, less oscillation.");
+
+            // Task 9.5: Read-only status block
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Status");
+
+            KControllerState kstate = KController_GetState();
+            if (kstate.active) {
+                ImGui::Text("Tier %d / %d", kstate.current_tier, kstate.num_tiers - 1);
+                ImGui::Text("k = %.2f", kstate.current_k);
+
+                // Map effective quality to nearest DLSS preset name
+                const char* quality_name = "Custom";
+                double eq = kstate.effective_quality;
+                if (eq <= 0.38)      quality_name = "Ultra Performance";
+                else if (eq <= 0.46) quality_name = "Performance";
+                else if (eq <= 0.54) quality_name = "Balanced";
+                else if (eq <= 0.63) quality_name = "Quality";
+                else                 quality_name = "Quality+";
+                ImGui::Text("Quality: %.0f%% (%s)", eq * 100.0, quality_name);
+                ImGui::Text("%u x %u", kstate.internal_w, kstate.internal_h);
+
+                if (kstate.locked) {
+                    ImGui::TextColored(ImVec4(0.9f, 0.2f, 0.2f, 1.0f), "Tier locked (safety)");
+                }
+            } else {
+                ImGui::Text("Not active");
+            }
         }
     }
 
@@ -1116,6 +1279,48 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                     ? ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f)
                     : ImVec4(0.9f*b, 0.9f*b, 0.2f*b, 1.0f);
                 OSDTextColored(col, buf);
+            }
+        }
+
+        // Task 9.7 & 9.8: Adaptive DLSS Scaling OSD overlay
+        if (g_config.osd_show_dlss_scaling && g_config.adaptive_dlss_scaling) {
+            bool scaling_active = g_dlss_scaling_active.load(std::memory_order_relaxed);
+            if (scaling_active) {
+                int dlss_tier = g_dlss_current_tier.load(std::memory_order_relaxed);
+                double dlss_k = g_dlss_current_k.load(std::memory_order_relaxed);
+                double dlss_eq = g_dlss_effective_quality.load(std::memory_order_relaxed);
+
+                // Detect tier transitions for color flash
+                if (s_dlss_prev_tier >= 0 && dlss_tier != s_dlss_prev_tier) {
+                    s_dlss_flash_active = true;
+                    s_dlss_flash_is_raise = (dlss_tier > s_dlss_prev_tier);
+                    s_dlss_flash_start = std::chrono::steady_clock::now();
+                }
+                s_dlss_prev_tier = dlss_tier;
+
+                // Determine color: flash green (raise) or red (drop) for 2s, else pipeline blue
+                ImVec4 dlss_col = ColPipeline();
+                if (s_dlss_flash_active) {
+                    auto elapsed = std::chrono::steady_clock::now() - s_dlss_flash_start;
+                    double elapsed_s = std::chrono::duration<double>(elapsed).count();
+                    if (elapsed_s < 2.0) {
+                        float b = g_config.osd_text_brightness;
+                        if (s_dlss_flash_is_raise)
+                            dlss_col = ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f); // green
+                        else
+                            dlss_col = ImVec4(0.9f*b, 0.2f*b, 0.2f*b, 1.0f); // red
+                    } else {
+                        s_dlss_flash_active = false;
+                    }
+                }
+
+                char dlss_buf[64];
+                snprintf(dlss_buf, sizeof(dlss_buf), "DLSS: T%d k%.2f %d%%",
+                         dlss_tier, dlss_k, static_cast<int>(dlss_eq * 100.0));
+                OSDTextColored(dlss_col, dlss_buf);
+            } else {
+                // Task 9.8: Passthrough/error state
+                OSDText("DLSS Scaling: Off");
             }
         }
 

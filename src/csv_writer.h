@@ -55,6 +55,12 @@ struct FrameRow {
     double   smoothing_offset_us;          // P99-based interval extension (0 when disabled)
     double   p99_render_time_us;           // raw P99 of render time distribution
     double   total_frame_cost_us;          // simStart → gpuRenderEnd (Reflex)
+    // ── Adaptive DLSS Scaling ──
+    int      dlss_tier;                    // Current tier index
+    double   dlss_k;                       // Current output multiplier
+    double   dlss_effective_quality;       // s × k
+    uint32_t dlss_internal_w;              // DLSS internal render width
+    uint32_t dlss_internal_h;              // DLSS internal render height
 };
 
 // Initialize CSV writer. Starts background thread.

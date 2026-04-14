@@ -28,6 +28,12 @@
 #include "streamline_hooks.h"
 #include "adaptive_smoothing.h"
 #include "config.h"
+#include "dlss_k_controller.h"
+#include "dlss_swapchain_proxy.h"
+#include "dlss_lanczos_shader.h"
+#include "dlss_mip_corrector.h"
+#include "dlss_ngx_interceptor.h"
+#include "dlss_resolution_math.h"
 #include "logger.h"
 #include <Windows.h>
 #include <algorithm>
@@ -151,6 +157,60 @@ void OnMarker(uint64_t frameID, int64_t now) {
     RecordEnforcementMarker();
     TickHealthFrame();
     UpdateTier();
+
+    // ── Adaptive DLSS Scaling: per-frame K_Controller update ──
+    if (g_config.adaptive_dlss_scaling) {
+        double ema_fps = 0.0;
+        double actual_ft = g_actual_frame_time_us.load(std::memory_order_relaxed);
+        if (actual_ft > 0.0)
+            ema_fps = 1000000.0 / actual_ft;
+
+        int target_fps = g_user_target_fps.load(std::memory_order_relaxed);
+        double target_fps_d = static_cast<double>(target_fps);
+        if (target_fps == 0) {
+            // VRR ceiling cap mode: use ceiling Hz as target
+            double ceiling = g_ceiling_hz.load(std::memory_order_relaxed);
+            if (ceiling > 0.0)
+                target_fps_d = ceiling;
+        }
+
+        bool fg_active = g_fg_active.load(std::memory_order_relaxed);
+        int fg_mult = g_fg_multiplier.load(std::memory_order_relaxed);
+        if (fg_mult < 1) fg_mult = 1;
+        bool rr_active = NGXInterceptor_IsRayReconstructionActive();
+        double frame_time_ms = actual_ft / 1000.0;
+
+        // Capture previous tier before update for transition logging
+        int prev_tier = g_dlss_current_tier.load(std::memory_order_relaxed);
+
+        bool tier_changed = KController_Update(
+            ema_fps, target_fps_d,
+            fg_active, fg_mult,
+            rr_active, frame_time_ms);
+
+        // ── Sub-task 8.6: Tier transition orchestration ──
+        if (tier_changed) {
+            KControllerState state = KController_GetState();
+            auto [fake_w, fake_h] = ComputeFakeResolution(
+                state.current_k,
+                SwapProxy_GetState().display_width,
+                SwapProxy_GetState().display_height);
+
+            SwapProxy_Resize(fake_w, fake_h);
+            Lanczos_Resize(fake_w, fake_h,
+                           SwapProxy_GetState().display_width,
+                           SwapProxy_GetState().display_height);
+            MipCorrector_Update(ComputeMipBias(
+                g_config.dlss_scale_factor, state.current_k));
+            NGXInterceptor_UpdateOutputRes(fake_w, fake_h);
+
+            const char* reason = (state.current_tier < prev_tier)
+                ? "FPS below threshold" : "FPS above threshold";
+            LOG_INFO("DLSS Scaling: tier transition T%d -> T%d (%s), k=%.2f, EMA FPS=%.1f, res=%ux%u",
+                     prev_tier, state.current_tier, reason,
+                     state.current_k, ema_fps, fake_w, fake_h);
+        }
+    }
 
     // Tier 4: suspended — passthrough
     if (g_current_tier == Tier4) {
@@ -341,6 +401,19 @@ void OnMarker(uint64_t frameID, int64_t now) {
             row.api = (SwapMgr_GetActiveAPI() == ActiveAPI::Vulkan) ? 1
                     : (SwapMgr_GetActiveAPI() == ActiveAPI::DX11) ? 2
                     : (SwapMgr_GetActiveAPI() == ActiveAPI::OpenGL) ? 3 : 0;
+            // ── Adaptive DLSS Scaling telemetry ──
+            if (g_config.adaptive_dlss_scaling && g_dlss_scaling_active.load(std::memory_order_relaxed)) {
+                row.dlss_tier = g_dlss_current_tier.load(std::memory_order_relaxed);
+                row.dlss_k = g_dlss_current_k.load(std::memory_order_relaxed);
+                row.dlss_effective_quality = g_dlss_effective_quality.load(std::memory_order_relaxed);
+                auto [iw, ih] = ComputeInternalResolution(
+                    g_config.dlss_scale_factor,
+                    row.dlss_k,
+                    SwapProxy_GetState().display_width,
+                    SwapProxy_GetState().display_height);
+                row.dlss_internal_w = iw;
+                row.dlss_internal_h = ih;
+            }
             CSV_Push(row);
             return;
         }
@@ -368,6 +441,19 @@ void OnMarker(uint64_t frameID, int64_t now) {
         row.api = (SwapMgr_GetActiveAPI() == ActiveAPI::Vulkan) ? 1
                 : (SwapMgr_GetActiveAPI() == ActiveAPI::DX11) ? 2
                 : (SwapMgr_GetActiveAPI() == ActiveAPI::OpenGL) ? 3 : 0;
+        // ── Adaptive DLSS Scaling telemetry ──
+        if (g_config.adaptive_dlss_scaling && g_dlss_scaling_active.load(std::memory_order_relaxed)) {
+            row.dlss_tier = g_dlss_current_tier.load(std::memory_order_relaxed);
+            row.dlss_k = g_dlss_current_k.load(std::memory_order_relaxed);
+            row.dlss_effective_quality = g_dlss_effective_quality.load(std::memory_order_relaxed);
+            auto [iw, ih] = ComputeInternalResolution(
+                g_config.dlss_scale_factor,
+                row.dlss_k,
+                SwapProxy_GetState().display_width,
+                SwapProxy_GetState().display_height);
+            row.dlss_internal_w = iw;
+            row.dlss_internal_h = ih;
+        }
         CSV_Push(row);
         return;
     }
@@ -1121,6 +1207,19 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     row.smoothing_offset_us = smoothing_offset;
     row.p99_render_time_us = g_adaptive_smoothing.GetP99();
     row.total_frame_cost_us = g_reflex_total_frame_cost_us.load(std::memory_order_relaxed);
+    // ── Adaptive DLSS Scaling telemetry ──
+    if (g_config.adaptive_dlss_scaling && g_dlss_scaling_active.load(std::memory_order_relaxed)) {
+        row.dlss_tier = g_dlss_current_tier.load(std::memory_order_relaxed);
+        row.dlss_k = g_dlss_current_k.load(std::memory_order_relaxed);
+        row.dlss_effective_quality = g_dlss_effective_quality.load(std::memory_order_relaxed);
+        auto [iw, ih] = ComputeInternalResolution(
+            g_config.dlss_scale_factor,
+            row.dlss_k,
+            SwapProxy_GetState().display_width,
+            SwapProxy_GetState().display_height);
+        row.dlss_internal_w = iw;
+        row.dlss_internal_h = ih;
+    }
     s_prev_actual_ft = telemetry_ft;
 
     CSV_Push(row);

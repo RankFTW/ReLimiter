@@ -3,6 +3,7 @@
 #include "streamline_hooks.h"
 #include "wake_guard.h"
 #include "adaptive_smoothing.h"
+#include "dlss_k_controller.h"
 #include "logger.h"
 #include <Windows.h>
 #include <string>
@@ -114,6 +115,18 @@ void ValidateConfig() {
     g_config.smoothing_percentile = Clamp(g_config.smoothing_percentile, 0.50, 0.999);
     static const char* smoothing_windows[] = {"medium", "dual"};
     ValidateEnum(g_config.smoothing_window, smoothing_windows, 2, "medium");
+
+    // ── Adaptive DLSS Scaling ──
+    g_config.dlss_scale_factor   = Clamp(g_config.dlss_scale_factor, 0.33, 1.0);
+    g_config.dlss_k_max          = Clamp(g_config.dlss_k_max, 1.0, 3.0);
+    g_config.dlss_down_frames    = Clamp(g_config.dlss_down_frames, 10, 300);
+    g_config.dlss_up_frames      = Clamp(g_config.dlss_up_frames, 10, 300);
+    g_config.dlss_down_threshold = Clamp(g_config.dlss_down_threshold, 0.80, 0.99);
+    g_config.dlss_up_threshold   = Clamp(g_config.dlss_up_threshold, 1.01, 1.20);
+    // Clamp default tier to [0, num_tiers-1] where num_tiers = floor((k_max - 1.0) / 0.25) + 1
+    int num_tiers = static_cast<int>((g_config.dlss_k_max - 1.0) / 0.25) + 1;
+    if (num_tiers < 1) num_tiers = 1;
+    g_config.dlss_default_tier = Clamp(g_config.dlss_default_tier, 0, num_tiers - 1);
 }
 
 bool Config_IsFirstLaunch() { return s_first_launch; }
@@ -173,6 +186,17 @@ void LoadConfig(HMODULE hModule) {
     g_config.smoothing_window        = ReadINIString(S, "smoothing_window", "medium", P);
     g_config.osd_show_adaptive_smoothing = ReadINIBool(S, "osd_show_adaptive_smoothing", false, P);
 
+    // Adaptive DLSS Scaling
+    g_config.adaptive_dlss_scaling = ReadINIBool(S, "adaptive_dlss_scaling", false, P);
+    g_config.dlss_scale_factor     = ReadINIDouble(S, "dlss_scale_factor", 0.33, P);
+    g_config.dlss_k_max            = ReadINIDouble(S, "dlss_k_max", 2.0, P);
+    g_config.dlss_default_tier     = ReadINIInt(S, "dlss_default_tier", 2, P);
+    g_config.dlss_down_frames      = ReadINIInt(S, "dlss_down_frames", 30, P);
+    g_config.dlss_up_frames        = ReadINIInt(S, "dlss_up_frames", 60, P);
+    g_config.dlss_down_threshold   = ReadINIDouble(S, "dlss_down_threshold", 0.95, P);
+    g_config.dlss_up_threshold     = ReadINIDouble(S, "dlss_up_threshold", 1.05, P);
+    g_config.osd_show_dlss_scaling = ReadINIBool(S, "osd_show_dlss_scaling", false, P);
+
     LOG_INFO("Config: values read, calling ApplyConfig...");
     ValidateConfig();
     ApplyConfig();
@@ -225,6 +249,17 @@ void SaveConfig() {
     WriteINIDouble(S, "smoothing_percentile", g_config.smoothing_percentile, P);
     WriteINIString(S, "smoothing_window", g_config.smoothing_window.c_str(), P);
     WriteINIBool(S, "osd_show_adaptive_smoothing", g_config.osd_show_adaptive_smoothing, P);
+
+    // Adaptive DLSS Scaling
+    WriteINIBool(S, "adaptive_dlss_scaling", g_config.adaptive_dlss_scaling, P);
+    WriteINIDouble(S, "dlss_scale_factor", g_config.dlss_scale_factor, P);
+    WriteINIDouble(S, "dlss_k_max", g_config.dlss_k_max, P);
+    WriteINIInt(S, "dlss_default_tier", g_config.dlss_default_tier, P);
+    WriteINIInt(S, "dlss_down_frames", g_config.dlss_down_frames, P);
+    WriteINIInt(S, "dlss_up_frames", g_config.dlss_up_frames, P);
+    WriteINIDouble(S, "dlss_down_threshold", g_config.dlss_down_threshold, P);
+    WriteINIDouble(S, "dlss_up_threshold", g_config.dlss_up_threshold, P);
+    WriteINIBool(S, "osd_show_dlss_scaling", g_config.osd_show_dlss_scaling, P);
 }
 
 void ApplyConfig() {
@@ -246,4 +281,21 @@ void ApplyConfig() {
         g_config.smoothing_window == "dual",
         g_config.smoothing_percentile,
         g_config.adaptive_smoothing);
+
+    // Adaptive DLSS Scaling: initialize K_Controller with config values
+    if (g_config.adaptive_dlss_scaling) {
+        // Display resolution is not yet known at first ApplyConfig call;
+        // KController_Init handles 0×0 gracefully and will be updated
+        // when the swapchain is created.
+        KController_Init(
+            g_config.dlss_scale_factor,
+            g_config.dlss_k_max,
+            g_config.dlss_default_tier,
+            g_config.dlss_down_frames,
+            g_config.dlss_up_frames,
+            g_config.dlss_down_threshold,
+            g_config.dlss_up_threshold,
+            0, 0  // display dimensions filled later by swapchain init
+        );
+    }
 }

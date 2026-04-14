@@ -60,6 +60,11 @@ set(ADDON_SOURCES
     src/presentation_gate.cpp
     src/reflex_inject.cpp
     src/vsync_control.cpp
+    src/dlss_swapchain_proxy.cpp
+    src/dlss_ngx_interceptor.cpp
+    src/dlss_lanczos_shader.cpp
+    src/dlss_k_controller.cpp
+    src/dlss_mip_corrector.cpp
 )
 
 # ── MinHook (compiled as part of the addon) ──
@@ -92,9 +97,17 @@ if(MSVC)
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+# ── Shader files (reference only — compiled at runtime via D3DCompile) ──
+set(SHADER_FILES
+    shaders/lanczos3_horizontal.hlsl
+    shaders/lanczos3_vertical.hlsl
+)
+source_group("Shaders" FILES ${SHADER_FILES})
+
 # ── DLL target ──
 add_library(relimiter SHARED
     ${ADDON_SOURCES}
+    ${SHADER_FILES}
     src/version.rc
 )
 
@@ -157,6 +170,7 @@ target_link_libraries(relimiter PRIVATE
     minhook_static
     dxgi.lib
     d3d12.lib
+    d3dcompiler.lib
     gdi32.lib
     winmm.lib
 )

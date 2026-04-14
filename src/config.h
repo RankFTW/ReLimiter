@@ -76,6 +76,17 @@ struct Config {
 
     // OSD: Adaptive Smoothing
     bool osd_show_adaptive_smoothing = false;
+
+    // Adaptive DLSS Scaling
+    bool   adaptive_dlss_scaling = false;       // Master enable/disable
+    double dlss_scale_factor     = 0.33;        // Fixed DLSS ratio s
+    double dlss_k_max            = 2.0;         // Maximum output multiplier k
+    int    dlss_default_tier     = 2;           // Starting tier index (0-based)
+    int    dlss_down_frames      = 30;          // Frames below threshold before drop
+    int    dlss_up_frames        = 60;          // Frames above threshold before raise
+    double dlss_down_threshold   = 0.95;        // FPS fraction triggering downward
+    double dlss_up_threshold     = 1.05;        // FPS fraction triggering upward
+    bool   osd_show_dlss_scaling = false;       // Show on OSD
 };
 
 extern Config g_config;
