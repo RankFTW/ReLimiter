@@ -29,13 +29,12 @@
 #include "adaptive_smoothing.h"
 #include "config.h"
 #include "dlss_k_controller.h"
-#include "dlss_swapchain_proxy.h"
 #include "dlss_lanczos_shader.h"
-#include "dlss_mip_corrector.h"
 #include "dlss_ngx_interceptor.h"
 #include "dlss_resolution_math.h"
 #include "logger.h"
 #include <Windows.h>
+#include <dxgi.h>
 #include <algorithm>
 #include <cmath>
 #include <atomic>
@@ -140,6 +139,21 @@ static void OnMarker_Fixed(uint64_t frameID, int64_t now);
 static double ComputeEffectiveInterval_Fixed();
 static void FlushAll();
 
+// ── Helper: get display dimensions from real swapchain ──
+static void GetDisplayDimensions(uint32_t& out_w, uint32_t& out_h) {
+    out_w = 0;
+    out_h = 0;
+    uint64_t sc_handle = SwapMgr_GetNativeHandle();
+    if (sc_handle) {
+        auto* dxgi_sc = reinterpret_cast<IDXGISwapChain*>(sc_handle);
+        DXGI_SWAP_CHAIN_DESC desc = {};
+        if (SUCCEEDED(dxgi_sc->GetDesc(&desc))) {
+            out_w = desc.BufferDesc.Width;
+            out_h = desc.BufferDesc.Height;
+        }
+    }
+}
+
 // ── InvokeSleep wrapper ──
 // Now a no-op: the driver sleep is handled by Hook_Sleep which always
 // forwards to the driver. The scheduler no longer needs to call the
@@ -188,27 +202,38 @@ void OnMarker(uint64_t frameID, int64_t now) {
             fg_active, fg_mult,
             rr_active, frame_time_ms);
 
-        // ── Sub-task 8.6: Tier transition orchestration ──
+        // ── Sub-task 8.6: Tier transition orchestration (NGX-only approach) ──
         if (tier_changed) {
             KControllerState state = KController_GetState();
-            auto [fake_w, fake_h] = ComputeFakeResolution(
-                state.current_k,
-                SwapProxy_GetState().display_width,
-                SwapProxy_GetState().display_height);
 
-            SwapProxy_Resize(fake_w, fake_h);
-            Lanczos_Resize(fake_w, fake_h,
-                           SwapProxy_GetState().display_width,
-                           SwapProxy_GetState().display_height);
-            MipCorrector_Update(ComputeMipBias(
-                g_config.dlss_scale_factor, state.current_k));
-            NGXInterceptor_UpdateOutputRes(fake_w, fake_h);
+            // Get display dimensions from the real swapchain
+            uint32_t display_w = 0, display_h = 0;
+            uint64_t sc_handle = SwapMgr_GetNativeHandle();
+            if (sc_handle) {
+                auto* dxgi_sc = reinterpret_cast<IDXGISwapChain*>(sc_handle);
+                DXGI_SWAP_CHAIN_DESC desc = {};
+                if (SUCCEEDED(dxgi_sc->GetDesc(&desc))) {
+                    display_w = desc.BufferDesc.Width;
+                    display_h = desc.BufferDesc.Height;
+                }
+            }
 
-            const char* reason = (state.current_tier < prev_tier)
-                ? "FPS below threshold" : "FPS above threshold";
-            LOG_INFO("DLSS Scaling: tier transition T%d -> T%d (%s), k=%.2f, EMA FPS=%.1f, res=%ux%u",
-                     prev_tier, state.current_tier, reason,
-                     state.current_k, ema_fps, fake_w, fake_h);
+            if (display_w > 0 && display_h > 0) {
+                auto [fake_w, fake_h] = ComputeFakeResolution(
+                    state.current_k, display_w, display_h);
+
+                Lanczos_Resize(fake_w, fake_h, display_w, display_h);
+                NGXInterceptor_UpdateOutputRes(fake_w, fake_h);
+                NGXInterceptor_SetScalingParams(state.current_k, display_w, display_h);
+
+                const char* reason = (state.current_tier < prev_tier)
+                    ? "FPS below threshold" : "FPS above threshold";
+                LOG_INFO("DLSS Scaling: tier transition T%d -> T%d (%s), k=%.2f, EMA FPS=%.1f, res=%ux%u",
+                         prev_tier, state.current_tier, reason,
+                         state.current_k, ema_fps, fake_w, fake_h);
+            } else {
+                LOG_WARN("DLSS Scaling: tier transition skipped — no display dimensions available");
+            }
         }
     }
 
@@ -406,11 +431,11 @@ void OnMarker(uint64_t frameID, int64_t now) {
                 row.dlss_tier = g_dlss_current_tier.load(std::memory_order_relaxed);
                 row.dlss_k = g_dlss_current_k.load(std::memory_order_relaxed);
                 row.dlss_effective_quality = g_dlss_effective_quality.load(std::memory_order_relaxed);
+                uint32_t dw = 0, dh = 0;
+                GetDisplayDimensions(dw, dh);
                 auto [iw, ih] = ComputeInternalResolution(
                     g_config.dlss_scale_factor,
-                    row.dlss_k,
-                    SwapProxy_GetState().display_width,
-                    SwapProxy_GetState().display_height);
+                    row.dlss_k, dw, dh);
                 row.dlss_internal_w = iw;
                 row.dlss_internal_h = ih;
             }
@@ -446,11 +471,11 @@ void OnMarker(uint64_t frameID, int64_t now) {
             row.dlss_tier = g_dlss_current_tier.load(std::memory_order_relaxed);
             row.dlss_k = g_dlss_current_k.load(std::memory_order_relaxed);
             row.dlss_effective_quality = g_dlss_effective_quality.load(std::memory_order_relaxed);
+            uint32_t dw = 0, dh = 0;
+            GetDisplayDimensions(dw, dh);
             auto [iw, ih] = ComputeInternalResolution(
                 g_config.dlss_scale_factor,
-                row.dlss_k,
-                SwapProxy_GetState().display_width,
-                SwapProxy_GetState().display_height);
+                row.dlss_k, dw, dh);
             row.dlss_internal_w = iw;
             row.dlss_internal_h = ih;
         }
@@ -1212,11 +1237,11 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         row.dlss_tier = g_dlss_current_tier.load(std::memory_order_relaxed);
         row.dlss_k = g_dlss_current_k.load(std::memory_order_relaxed);
         row.dlss_effective_quality = g_dlss_effective_quality.load(std::memory_order_relaxed);
+        uint32_t dw = 0, dh = 0;
+        GetDisplayDimensions(dw, dh);
         auto [iw, ih] = ComputeInternalResolution(
             g_config.dlss_scale_factor,
-            row.dlss_k,
-            SwapProxy_GetState().display_width,
-            SwapProxy_GetState().display_height);
+            row.dlss_k, dw, dh);
         row.dlss_internal_w = iw;
         row.dlss_internal_h = ih;
     }

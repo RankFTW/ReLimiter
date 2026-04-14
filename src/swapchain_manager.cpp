@@ -12,6 +12,7 @@
 #include "config.h"
 #include "dlss_lanczos_shader.h"
 #include "dlss_mip_corrector.h"
+#include "dlss_ngx_interceptor.h"
 #include "logger.h"
 #include <dxgi.h>
 #include <atomic>
@@ -305,10 +306,30 @@ void SwapMgr_OnInitDevice(reshade::api::device* device) {
     }
 
     // ── Adaptive DLSS Scaling: init GPU-dependent modules on DX12 device ──
-    // DISABLED: Proxy hooks disabled, so Lanczos and MipCorrector have nothing to operate on.
-    // Re-enable when the swapchain proxy approach is replaced with a safe alternative.
     if (api == ActiveAPI::DX12 && g_config.adaptive_dlss_scaling) {
-        LOG_INFO("DLSS Scaling: GPU module init skipped (proxy hooks disabled)");
+        // Get the DX12 device from the ReShade device wrapper
+        auto* d3d12_device = reinterpret_cast<ID3D12Device*>(device->get_native());
+        if (d3d12_device) {
+            // Initialize Lanczos shader pipeline (needed for downscale in EvaluateFeature hook)
+            // Read format from the swapchain if available, default to R8G8B8A8_UNORM
+            DXGI_FORMAT sc_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            uint64_t sc_handle = s_native_handle.load(std::memory_order_relaxed);
+            if (sc_handle) {
+                auto* dxgi_sc = reinterpret_cast<IDXGISwapChain*>(sc_handle);
+                DXGI_SWAP_CHAIN_DESC desc = {};
+                if (SUCCEEDED(dxgi_sc->GetDesc(&desc))) {
+                    sc_format = desc.BufferDesc.Format;
+                }
+            }
+            Lanczos_Init(d3d12_device, sc_format);
+            LOG_INFO("DLSS Scaling: Lanczos shader initialized (format %d)", static_cast<int>(sc_format));
+
+            // Give the NGX interceptor the device for intermediate buffer allocation
+            NGXInterceptor_SetDevice(d3d12_device);
+            LOG_INFO("DLSS Scaling: NGXInterceptor device set");
+        } else {
+            LOG_WARN("DLSS Scaling: could not get ID3D12Device from ReShade device");
+        }
     }
 }
 

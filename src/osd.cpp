@@ -25,7 +25,7 @@
 #include "flip_model.h"
 #include "adaptive_smoothing.h"
 #include "dlss_k_controller.h"
-#include "dlss_swapchain_proxy.h"
+#include "dlss_ngx_interceptor.h"
 #include "logger.h"
 #include <string>
 #include <atomic>
@@ -495,18 +495,18 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         if (g_dlss_scaling_active.load(std::memory_order_relaxed) && g_config.adaptive_dlss_scaling) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(Active)");
-        } else if (g_config.adaptive_dlss_scaling && !SwapProxy_IsInitialized()) {
-            // Feature enabled but proxy hooks were never installed (enabled mid-session)
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Restart required)");
-        } else if (g_config.adaptive_dlss_scaling && SwapProxy_IsInitialized() && !SwapProxy_IsActive()) {
-            // Proxy was initialized but entered passthrough (error or unsupported game)
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.9f, 0.2f, 0.2f, 1.0f), "(Disabled - see log)");
-        } else if (g_config.adaptive_dlss_scaling) {
-            // Proxy hooks installed, waiting for swapchain interception or DLSS detection
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Waiting)");
+        } else if (g_config.adaptive_dlss_scaling && !g_dlss_scaling_active.load(std::memory_order_relaxed)) {
+            // Feature enabled but NGX interception not yet active
+            NGXInterceptorState ngx_state = NGXInterceptor_GetState();
+            if (ngx_state.active) {
+                // NGX hooks installed, waiting for DLSS evaluation
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Waiting)");
+            } else {
+                // NGX hooks not installed — may need restart or DLSS not detected
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Waiting for DLSS)");
+            }
         }
         HelpTip("Dynamically adjusts DLSS render resolution based on FPS. "
                 "Keeps DLSS at a fixed low preset and varies the output resolution "

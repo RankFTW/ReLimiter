@@ -109,7 +109,6 @@ static void on_destroy_device(reshade::api::device* device) {
     // ── Adaptive DLSS Scaling: shutdown GPU-dependent modules ──
     if (g_config.adaptive_dlss_scaling) {
         Lanczos_Shutdown();
-        MipCorrector_Shutdown();
         LOG_INFO("DLSS Scaling: GPU modules shut down (device destroy)");
     }
 
@@ -131,7 +130,6 @@ static void on_init_swapchain(reshade::api::swapchain* sc, bool resize) {
 static void on_destroy_swapchain(reshade::api::swapchain* sc, bool resize) {
     // ── Adaptive DLSS Scaling: shutdown on full swapchain teardown ──
     if (!resize && g_config.adaptive_dlss_scaling) {
-        SwapProxy_Shutdown();
         NGXInterceptor_Shutdown();
         KController_Shutdown();
         LOG_INFO("DLSS Scaling: modules shut down (swapchain destroy)");
@@ -294,27 +292,8 @@ static void on_present(reshade::api::command_queue* queue,
     // Check deferred FG inference (promotes or revokes after confirmation window)
     CheckDeferredFGInference();
 
-    // ── Adaptive DLSS Scaling: Lanczos downscale before real Present ──
-    if (g_config.adaptive_dlss_scaling && SwapProxy_IsActive()) {
-        ProxyState proxy = SwapProxy_GetState();
-        if (proxy.proxy_backbuffer && proxy.real_backbuffer &&
-            proxy.fake_width > 0 && proxy.fake_height > 0 &&
-            proxy.display_width > 0 && proxy.display_height > 0) {
-            // Get a command list from the present queue for the dispatch.
-            // The Lanczos dispatch handles k==1.0 as a no-op internally.
-            ActiveAPI api = SwapMgr_GetActiveAPI();
-            if (api == ActiveAPI::DX12 && queue) {
-                auto* cmd_list = reinterpret_cast<ID3D12GraphicsCommandList*>(
-                    queue->get_native());
-                if (cmd_list) {
-                    Lanczos_Dispatch(cmd_list,
-                                     proxy.proxy_backbuffer, proxy.real_backbuffer,
-                                     proxy.fake_width, proxy.fake_height,
-                                     proxy.display_width, proxy.display_height);
-                }
-            }
-        }
-    }
+    // ── Adaptive DLSS Scaling: Lanczos downscale now happens inside the
+    // EvaluateFeature hook (NGX-only approach), not here at present time.
 
     LARGE_INTEGER now_qpc;
     QueryPerformanceCounter(&now_qpc);
@@ -428,22 +407,13 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         LOG_INFO("ReShade events + OSD registered");
 
         // ── Adaptive DLSS Scaling: early init (hooks only, no device needed) ──
-        // DISABLED: The swapchain proxy approach (faking resolution via GetDesc)
-        // crashes games that validate swapchain dimensions against the window
-        // client area (e.g. Crimson Desert). The feature needs a redesigned
-        // approach — likely NGX-only interception without swapchain dimension
-        // lies. See design.md Requirement 1.5 for the anticipated failure mode.
-        //
-        // The config, OSD, K_Controller, and property tests remain functional
-        // for development iteration. Re-enable when the proxy approach is
-        // replaced with a safe alternative.
+        // ── Adaptive DLSS Scaling: NGX-only approach ──
+        // Intercepts DLSS at the EvaluateFeature level instead of faking
+        // swapchain dimensions. The game never sees fake resolutions.
+        // SwapProxy is NOT used — it crashed games that validate dimensions.
         if (g_config.adaptive_dlss_scaling) {
-            // SwapProxy_Init();
-            // LOG_INFO("DLSS Scaling: SwapProxy hooks installed");
-            // NGXInterceptor_Init(g_config.dlss_scale_factor);
-            // LOG_INFO("DLSS Scaling: NGXInterceptor initialized (s=%.2f)", g_config.dlss_scale_factor);
-            LOG_WARN("DLSS Scaling: proxy hooks DISABLED (pending safe implementation). "
-                     "Config/OSD/K_Controller infrastructure active for development.");
+            NGXInterceptor_Init(g_config.dlss_scale_factor);
+            LOG_INFO("DLSS Scaling: NGXInterceptor initialized (s=%.2f)", g_config.dlss_scale_factor);
         }
 
     } __except(EXCEPTION_EXECUTE_HANDLER) {
@@ -488,9 +458,7 @@ void WINAPI AddonUninit(HMODULE /*addon_module*/, HMODULE /*reshade_module*/) {
     if (g_config.adaptive_dlss_scaling) {
         KController_Shutdown();
         Lanczos_Shutdown();
-        MipCorrector_Shutdown();
         NGXInterceptor_Shutdown();
-        SwapProxy_Shutdown();
         LOG_INFO("DLSS Scaling: all modules shut down");
     }
 
@@ -531,9 +499,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             if (g_config.adaptive_dlss_scaling) {
                 KController_Shutdown();
                 Lanczos_Shutdown();
-                MipCorrector_Shutdown();
                 NGXInterceptor_Shutdown();
-                SwapProxy_Shutdown();
             }
             SaveConfig();
             SetUnhandledExceptionFilter(s_prev_filter);
