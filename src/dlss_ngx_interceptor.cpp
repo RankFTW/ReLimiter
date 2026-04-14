@@ -84,11 +84,12 @@ static constexpr uint32_t SL_STRUCT_TYPE_RESOURCE_TAG = 5;
 static constexpr size_t SL_TAG_OFFSET_RESOURCE  = 32;
 static constexpr size_t SL_TAG_OFFSET_TYPE      = 40;
 
-// sl::Resource layout:
-//   uint32_t type;             // offset 0, 4 bytes (ResourceType enum)
-//   [4 bytes padding on x64]
-//   void* native;              // offset 8, 8 bytes (ID3D12Resource*)
-static constexpr size_t SL_RESOURCE_OFFSET_NATIVE = 8;
+// sl::Resource layout (inherits BaseStructure!):
+//   BaseStructure: next(8) + structType(16) + structVersion(8) = 32 bytes
+//   uint32_t type;             // offset 32, 4 bytes (ResourceType enum)
+//   [4 bytes padding]
+//   void* native;              // offset 40, 8 bytes (ID3D12Resource*)
+static constexpr size_t SL_RESOURCE_OFFSET_NATIVE = 40;
 
 // sl::BaseStructure — for reading structType from inputs
 struct sl_BaseStructure {
@@ -436,17 +437,6 @@ static void CaptureOutputResource(const void* tags_ptr, uint32_t numTags) {
             if (buf_type == sl_kBufferTypeScalingOutputColor) {
                 auto* sl_resource = *reinterpret_cast<const uint8_t* const*>(tag + SL_TAG_OFFSET_RESOURCE);
                 if (sl_resource) {
-                    // Diagnostic: dump first 48 bytes of sl::Resource to find native pointer
-                    static bool s_res_dumped = false;
-                    if (!s_res_dumped) {
-                        s_res_dumped = true;
-                        LOG_INFO("NGXInterceptor: sl::Resource at %p, dumping first 48 bytes:", sl_resource);
-                        for (int off = 0; off < 48; off += 8) {
-                            void* val = *reinterpret_cast<void* const*>(sl_resource + off);
-                            LOG_INFO("NGXInterceptor:   +%d: %p", off, val);
-                        }
-                    }
-                    
                     void* native = *reinterpret_cast<void* const*>(sl_resource + SL_RESOURCE_OFFSET_NATIVE);
                     if (native) {
                         // Validate: native should be a reasonable heap pointer
@@ -456,13 +446,6 @@ static void CaptureOutputResource(const void* tags_ptr, uint32_t numTags) {
                             if (prev != native) {
                                 LOG_INFO("NGXInterceptor: captured game output resource %p "
                                          "(ScalingOutputColor, tag[%u])", native, i);
-                            }
-                        } else {
-                            static bool s_bad_logged = false;
-                            if (!s_bad_logged) {
-                                s_bad_logged = true;
-                                LOG_WARN("NGXInterceptor: sl::Resource.native looks invalid: %p "
-                                         "(not a heap pointer)", native);
                             }
                         }
                     }
@@ -494,14 +477,21 @@ static sl_Result __cdecl Hooked_slSetTagForFrame(const void* frame, const void* 
 }
 
 // ── sl::Resource wrapper for our intermediate buffer ──
-// Layout must match sl::Resource: type(4) + pad(4) + native(8) + ...
+// sl::Resource inherits BaseStructure (32 bytes), then adds its own fields.
+// Layout: BaseStructure(32) + type(4) + pad(4) + native(8) + mem(8) + view(8) + state(4) + pad(4)
 struct SL_Resource_Wrapper {
-    uint32_t type;       // sl::ResourceType::eTex2d = 0
-    uint32_t _pad;
-    void*    native;     // ID3D12Resource*
-    void*    mem;        // reserved
-    void*    view;       // reserved
-    uint32_t state;      // D3D12_RESOURCE_STATES
+    // BaseStructure header
+    void*    next;              // offset 0
+    uint8_t  structType[16];    // offset 8 (GUID)
+    size_t   structVersion;     // offset 24
+    // Resource fields
+    uint32_t type;              // offset 32 (ResourceType::eTex2d = 0)
+    uint32_t _pad1;             // offset 36
+    void*    native;            // offset 40 (ID3D12Resource*)
+    void*    mem;               // offset 48
+    void*    view;              // offset 56
+    uint32_t state;             // offset 64 (D3D12_RESOURCE_STATES)
+    uint32_t _pad2;             // offset 68
 };
 
 // ── ResourceTag wrapper for local tag injection ──
@@ -596,19 +586,18 @@ static sl_Result __cdecl Hooked_slEvaluateFeature(
 
     // ── Build local ResourceTag for our intermediate buffer ──
     SL_Resource_Wrapper local_resource{};
+    memset(&local_resource, 0, sizeof(local_resource));
+    local_resource.structVersion = 1;
     local_resource.type = 0;  // eTex2d
     local_resource.native = static_cast<void*>(g_intermediate_buffer);
     local_resource.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 
     SL_ResourceTag_Wrapper local_tag{};
-    local_tag.next = nullptr;
-    // Set structType to zeros — Streamline identifies tags by buffer type field
-    memset(local_tag.structType, 0, sizeof(local_tag.structType));
+    memset(&local_tag, 0, sizeof(local_tag));
     local_tag.structVersion = 1;
     local_tag.resource = &local_resource;
     local_tag.type = sl_kBufferTypeScalingOutputColor;
     local_tag.lifecycle = 0;  // eOnlyValidNow
-    local_tag.extent = nullptr;
 
     // ── Build extended inputs array with our local tag appended ──
     // Max 32 inputs should be more than enough
