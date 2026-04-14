@@ -375,18 +375,116 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
     NVSDK_NGX_Parameter* params,
     void* callback)
 {
-    // Minimal hook: log periodically, always passthrough
     static int s_eval_count = 0;
     s_eval_count++;
+
+    double k = g_current_k.load(std::memory_order_relaxed);
+
+    // Periodic logging
     if (s_eval_count <= 5 || (s_eval_count % 300) == 0) {
-        double k = g_current_k.load(std::memory_order_relaxed);
         LOG_INFO("NGXInterceptor: [NGX] eval #%d k=%.2f cmd=%p",
                  s_eval_count, k, cmd_list);
     }
-    return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+
+    // Passthrough when inactive, no params, or k ~ 1.0
+    if (!g_active.load(std::memory_order_relaxed) || !params || !cmd_list || k <= 1.01) {
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+    }
+
+    // ── Read the Output resource from NGX params via vtable ──
+    void** param_vtable = nullptr;
+    __try {
+        param_vtable = *reinterpret_cast<void***>(params);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+    }
+    if (!param_vtable) {
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+    }
+
+    auto fnGetResource = reinterpret_cast<NGXParam_GetResource_t>(
+        param_vtable[NGX_PARAM_VTABLE_GET_RESOURCE]);
+    auto fnSetResource = reinterpret_cast<NGXParam_SetResource_t>(
+        param_vtable[NGX_PARAM_VTABLE_SET_RESOURCE]);
+    if (!fnGetResource || !fnSetResource) {
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+    }
+
+    ID3D12Resource* original_output = nullptr;
+    __try {
+        fnGetResource(params, "Output", &original_output);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("NGXInterceptor: SEH in GetResource — passthrough");
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+    }
+    if (!original_output) {
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+    }
+
+    // ── Get display dimensions from the original output ──
+    D3D12_RESOURCE_DESC orig_desc{};
+    __try {
+        orig_desc = original_output->GetDesc();
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+    }
+    uint32_t display_w = static_cast<uint32_t>(orig_desc.Width);
+    uint32_t display_h = orig_desc.Height;
+    if (display_w == 0 || display_h == 0) {
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+    }
+
+    // ── Compute intermediate buffer size (k * D) ──
+    auto [fake_w, fake_h] = ComputeFakeResolution(k, display_w, display_h);
+
+    // ── Lazy Lanczos resize on the render thread (thread-safe) ──
+    Lanczos_Resize(fake_w, fake_h, display_w, display_h);
+
+    // ── Ensure intermediate buffer ──
+    if (!EnsureIntermediateBuffer(fake_w, fake_h, orig_desc.Format)) {
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+    }
+
+    // ── Swap output to intermediate buffer ──
+    __try {
+        fnSetResource(params, "Output", g_intermediate_buffer);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("NGXInterceptor: SEH in SetResource — passthrough");
+        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
+    }
+
+    // ── Call original — DLSS upscales to k*D ──
+    NVSDK_NGX_Result result = g_orig_EvaluateFeature_dlss(
+        cmd_list, feature_handle, params, callback);
+
+    // ── Restore original output ──
+    __try {
+        fnSetResource(params, "Output", original_output);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("NGXInterceptor: SEH restoring Output");
+    }
+
+    if (result != NVSDK_NGX_Result_Success) {
+        return result;
+    }
+
+    // ── Lanczos downscale: intermediate (k*D) -> game output (D) ──
+    Lanczos_Dispatch(cmd_list,
+                     g_intermediate_buffer, original_output,
+                     fake_w, fake_h,
+                     display_w, display_h);
+
+    // Log interception periodically
+    if (s_eval_count <= 3 || (s_eval_count % 300) == 0) {
+        LOG_INFO("NGXInterceptor: [NGX] INTERCEPTED #%d k=%.2f %ux%u -> %ux%u",
+                 s_eval_count, k, fake_w, fake_h, display_w, display_h);
+    }
+
+    return result;
 }
 
-// ======================================================================// Hook installation helpers
+// ======================================================================
+// Hook installation helpers
 // ══════════════════════════════════════════════════════════════════════
 
 static bool InstallCreateFeatureHook(HMODULE hDlssDll) {
