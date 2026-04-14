@@ -103,6 +103,9 @@ set(SHADER_FILES
     shaders/lanczos3_vertical.hlsl
 )
 source_group("Shaders" FILES ${SHADER_FILES})
+# Exclude from build — these are embedded as string literals in dlss_lanczos_shader.cpp
+# and compiled at runtime via D3DCompile, not by FXC at build time.
+set_source_files_properties(${SHADER_FILES} PROPERTIES HEADER_FILE_ONLY TRUE)
 
 # ── DLL target ──
 add_library(relimiter SHARED
