@@ -194,8 +194,11 @@ void OnMarker(uint64_t frameID, int64_t now) {
                     uint32_t dw = rc.right - rc.left;
                     uint32_t dh = rc.bottom - rc.top;
                     if (dw > 0 && dh > 0) {
-                        NGXInterceptor_SetScalingParams(1.0, dw, dh);
-                        LOG_INFO("DLSS Scaling: initial display dims set %ux%u", dw, dh);
+                        // Set initial scaling params with K_Controller's current k
+                        KControllerState init_state = KController_GetState();
+                        NGXInterceptor_SetScalingParams(init_state.current_k, dw, dh);
+                        LOG_INFO("DLSS Scaling: initial dims %ux%u k=%.2f (tier %d)",
+                                 dw, dh, init_state.current_k, init_state.current_tier);
                     }
                 }
             }
