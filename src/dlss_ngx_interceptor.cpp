@@ -503,8 +503,8 @@ static sl_Result __cdecl Hooked_slEvaluateFeature(
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// DIRECT NGX PATH: EvaluateFeature hook (non-Streamline fallback)
-// ══════════════════════════════════════════════════════════════════════
+// DIRECT NGX PATH: EvaluateFeature hook
+// ======================================================================
 
 static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
     ID3D12GraphicsCommandList* cmd_list,
@@ -512,151 +512,18 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
     NVSDK_NGX_Parameter* params,
     void* callback)
 {
-    // Safety: null trampoline check
-    if (!g_orig_EvaluateFeature_dlss) {
-        LOG_ERROR("NGXInterceptor: EvaluateFeature trampoline is null");
-        return 0;
-    }
-
-    // ── DIAGNOSTIC: log every call to verify the hook fires ──
+    // Minimal hook: log periodically, always passthrough
     static int s_eval_count = 0;
     s_eval_count++;
     if (s_eval_count <= 5 || (s_eval_count % 300) == 0) {
         double k = g_current_k.load(std::memory_order_relaxed);
-        bool active = g_active.load(std::memory_order_relaxed);
-        LOG_INFO("NGXInterceptor: [NGX] EvaluateFeature #%d — k=%.2f active=%d "
-                 "cmd_list=%p handle=%p params=%p",
-                 s_eval_count, k, active ? 1 : 0,
-                 cmd_list, feature_handle, params);
+        LOG_INFO("NGXInterceptor: [NGX] eval #%d k=%.2f cmd=%p",
+                 s_eval_count, k, cmd_list);
     }
-
-    if (!g_active.load(std::memory_order_relaxed) || !params) {
-        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
-    }
-
-    double k = g_current_k.load(std::memory_order_relaxed);
-
-    // k ≈ 1.0 means no scaling — passthrough
-    if (k <= 1.01) {
-        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
-    }
-
-    // k > 1.0: passthrough (no logging, no delay — identical to k<=1.01 path)
     return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
-
-    // ── VTABLE INTERCEPTION DISABLED — crashes on Streamline's param object ──
-#if 0
-
-    // ── Read the original output resource from NGX params ──
-    void** param_vtable = nullptr;
-    __try {
-        param_vtable = *reinterpret_cast<void***>(params);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        LOG_ERROR("NGXInterceptor: SEH reading param vtable — passthrough");
-        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
-    }
-    if (!param_vtable) {
-        LOG_WARN("NGXInterceptor: null param vtable — passthrough");
-        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
-    }
-
-    // Log vtable on first interception attempt
-    static bool s_vtable_logged = false;
-    if (!s_vtable_logged) {
-        s_vtable_logged = true;
-        LOG_INFO("NGXInterceptor: param=%p vtable=%p [5]=%p [12]=%p",
-                 params, param_vtable, param_vtable[5], param_vtable[12]);
-    }
-
-    // Validate vtable pointers before dereferencing
-    auto fnGetResource = reinterpret_cast<NGXParam_GetResource_t>(
-        param_vtable[NGX_PARAM_VTABLE_GET_RESOURCE]);
-    auto fnSetResource = reinterpret_cast<NGXParam_SetResource_t>(
-        param_vtable[NGX_PARAM_VTABLE_SET_RESOURCE]);
-
-    if (!fnGetResource || !fnSetResource) {
-        LOG_WARN("NGXInterceptor: null vtable entries Get[%d]=%p Set[%d]=%p — passthrough",
-                 NGX_PARAM_VTABLE_GET_RESOURCE, fnGetResource,
-                 NGX_PARAM_VTABLE_SET_RESOURCE, fnSetResource);
-        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
-    }
-
-    ID3D12Resource* original_output = nullptr;
-    __try {
-        fnGetResource(params, "Output", &original_output);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        LOG_ERROR("NGXInterceptor: SEH in GetResource('Output') — passthrough");
-        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
-    }
-    if (!original_output) {
-        LOG_WARN("NGXInterceptor: Output resource is null — passthrough");
-        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
-    }
-
-    // Get display dimensions from original output
-    D3D12_RESOURCE_DESC orig_desc{};
-    __try {
-        orig_desc = original_output->GetDesc();
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        LOG_ERROR("NGXInterceptor: SEH in GetDesc() on output %p — passthrough", original_output);
-        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
-    }
-    uint32_t display_w = static_cast<uint32_t>(orig_desc.Width);
-    uint32_t display_h = orig_desc.Height;
-
-    // Compute intermediate buffer size
-    auto [fake_w, fake_h] = ComputeFakeResolution(k, display_w, display_h);
-
-    // Ensure intermediate buffer
-    if (!EnsureIntermediateBuffer(fake_w, fake_h, orig_desc.Format)) {
-        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
-    }
-
-    // Swap output to intermediate buffer
-    __try {
-        fnSetResource(params, "Output", g_intermediate_buffer);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        LOG_ERROR("NGXInterceptor: SEH exception setting Output param — passthrough");
-        return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
-    }
-
-    // Call original — DLSS upscales to k×D
-    NVSDK_NGX_Result result = g_orig_EvaluateFeature_dlss(
-        cmd_list, feature_handle, params, callback);
-
-    // Restore original output
-    __try {
-        fnSetResource(params, "Output", original_output);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        LOG_ERROR("NGXInterceptor: SEH exception restoring Output param");
-    }
-
-    if (result != NVSDK_NGX_Result_Success) {
-        return result;
-    }
-
-    // Lanczos downscale: intermediate (k×D) → game output (D)
-    if (cmd_list) {
-        Lanczos_Dispatch(cmd_list,
-                         g_intermediate_buffer, original_output,
-                         fake_w, fake_h,
-                         display_w, display_h);
-    }
-
-    // Periodic logging
-    if (s_eval_count <= 3 || (s_eval_count % 300) == 0) {
-        LOG_INFO("NGXInterceptor: [NGX] intercepted #%d — k=%.2f, DLSS output=%ux%u, "
-                 "Lanczos %ux%u -> %ux%u",
-                 s_eval_count, k, fake_w, fake_h,
-                 fake_w, fake_h, display_w, display_h);
-    }
-
-    return result;
-#endif  // VTABLE INTERCEPTION DISABLED
 }
 
-// ══════════════════════════════════════════════════════════════════════
-// Hook installation helpers
+// ======================================================================// Hook installation helpers
 // ══════════════════════════════════════════════════════════════════════
 
 static bool InstallCreateFeatureHook(HMODULE hDlssDll) {
