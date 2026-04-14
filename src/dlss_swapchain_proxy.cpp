@@ -26,6 +26,9 @@
 
 // ── Supported format check (Task 6.8) ──
 
+// Forward declaration — defined later, used in ResizeBuffers and SwapProxy_Resize
+static void ForcePassthroughInternal(const char* reason);
+
 static bool IsSupportedFormat(DXGI_FORMAT fmt) {
     switch (fmt) {
         case DXGI_FORMAT_R8G8B8A8_UNORM:

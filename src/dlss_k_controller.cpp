@@ -211,7 +211,6 @@ bool KController_Update(double ema_fps, double target_fps,
     // by frame_time > 2× target
     if (transitioned) {
         double target_interval_ms = (target_fps > 0.0) ? (1000.0 / target_fps) : 16.667;
-        bool spike = (frame_time_ms > 2.0 * target_interval_ms);
 
         // Record this transition
         if (g_kc.num_recent_transitions < KControllerInternal::MAX_RECENT_TRANSITIONS) {
