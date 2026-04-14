@@ -495,11 +495,16 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         if (g_dlss_scaling_active.load(std::memory_order_relaxed) && g_config.adaptive_dlss_scaling) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(Active)");
-        } else if (g_config.adaptive_dlss_scaling && !SwapProxy_IsActive()) {
-            // Passthrough/error state
+        } else if (g_config.adaptive_dlss_scaling && !SwapProxy_IsInitialized()) {
+            // Feature enabled but proxy hooks were never installed (enabled mid-session)
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Restart required)");
+        } else if (g_config.adaptive_dlss_scaling && SwapProxy_IsInitialized() && !SwapProxy_IsActive()) {
+            // Proxy was initialized but entered passthrough (error or unsupported game)
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.9f, 0.2f, 0.2f, 1.0f), "(Disabled - see log)");
         } else if (g_config.adaptive_dlss_scaling) {
+            // Proxy hooks installed, waiting for swapchain interception or DLSS detection
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Waiting)");
         }

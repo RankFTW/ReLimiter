@@ -703,6 +703,10 @@ bool SwapProxy_IsActive() {
     return g_hooks_installed && g_swapchain_hooks_installed && !g_proxy_state.passthrough;
 }
 
+bool SwapProxy_IsInitialized() {
+    return g_hooks_installed;
+}
+
 // ── Internal passthrough (no lock — caller must hold g_proxy_mutex or be safe) ──
 
 static void ForcePassthroughInternal(const char* reason) {

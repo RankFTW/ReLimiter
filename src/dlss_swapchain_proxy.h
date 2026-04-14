@@ -53,5 +53,8 @@ ProxyState SwapProxy_GetState();
 // Returns true if the proxy is active (not passthrough).
 bool SwapProxy_IsActive();
 
+// Returns true if the proxy hooks were installed (Init was called).
+bool SwapProxy_IsInitialized();
+
 // Force passthrough mode (error recovery).
 void SwapProxy_ForcePassthrough(const char* reason);
