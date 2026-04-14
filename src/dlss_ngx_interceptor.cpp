@@ -156,6 +156,9 @@ static DXGI_FORMAT           g_intermediate_format = DXGI_FORMAT_R8G8B8A8_UNORM;
 static std::atomic<uint32_t> g_game_output_w{0};
 static std::atomic<uint32_t> g_game_output_h{0};
 
+// Game's output resource (captured from slSetTag/slSetTagForFrame)
+static std::atomic<void*>    g_game_output_resource{nullptr};  // ID3D12Resource*
+
 // Hook mode
 enum class HookMode { None, Streamline };
 static HookMode g_hook_mode = HookMode::None;
@@ -320,8 +323,12 @@ static sl_Result __cdecl Hooked_slDLSSSetOptions(const void* viewport, const voi
     double k = g_current_k.load(std::memory_order_relaxed);
 
     // If k <= 1.0 or not active, pass through unmodified
+    // CRITICAL: Also passthrough if we haven't captured the game's output
+    // resource yet. Overriding dimensions without swapping the output buffer
+    // causes DLSS to write k*D pixels into a D-sized buffer -> corruption.
+    void* game_output = g_game_output_resource.load(std::memory_order_relaxed);
     if (!g_active.load(std::memory_order_relaxed) || k <= 1.01 ||
-        game_out_w == 0 || game_out_h == 0) {
+        game_out_w == 0 || game_out_h == 0 || !game_output) {
         return g_orig_slDLSSSetOptions(viewport, options);
     }
 
@@ -391,9 +398,6 @@ static sl_Result __cdecl Hooked_slDLSSSetOptions(const void* viewport, const voi
 // downscaled result to. We capture it by hooking slSetTag/slSetTagForFrame.
 // ══════════════════════════════════════════════════════════════════════
 
-// ── Captured game output resource (from slSetTag) ──
-static std::atomic<void*> g_game_output_resource{nullptr};  // ID3D12Resource*
-
 // ── slSetTag hook to capture the game's output resource ──
 // Signature: sl::Result slSetTag(const sl::ViewportHandle& vp, const sl::ResourceTag* tags, uint32_t numTags, sl::CommandBuffer* cmd)
 using PFN_slSetTag = sl_Result(__cdecl*)(const void* viewport, const void* tags, uint32_t numTags, void* cmdBuffer);
@@ -448,11 +452,40 @@ static void CaptureOutputResource(const void* tags_ptr, uint32_t numTags) {
 }
 
 static sl_Result __cdecl Hooked_slSetTag(const void* viewport, const void* tags, uint32_t numTags, void* cmdBuffer) {
+    // Diagnostic: log what tags are being set
+    static int s_log = 0;
+    if (++s_log <= 10) {
+        LOG_INFO("NGXInterceptor: slSetTag called — numTags=%u tags=%p cmd=%p", numTags, tags, cmdBuffer);
+        if (tags && numTags > 0) {
+            // Dump the first few bytes of each tag to understand the layout
+            auto* bytes = reinterpret_cast<const uint8_t*>(tags);
+            for (uint32_t i = 0; i < numTags && i < 4; i++) {
+                // Try reading buffer type at various offsets to find the right one
+                // The tag might be passed as a pointer array, not a struct array
+                LOG_INFO("NGXInterceptor:   tag[%u] raw bytes: %02x %02x %02x %02x %02x %02x %02x %02x ...",
+                         i, bytes[0], bytes[1], bytes[2], bytes[3],
+                         bytes[4], bytes[5], bytes[6], bytes[7]);
+            }
+        }
+    }
     CaptureOutputResource(tags, numTags);
     return g_orig_slSetTag(viewport, tags, numTags, cmdBuffer);
 }
 
 static sl_Result __cdecl Hooked_slSetTagForFrame(const void* frame, const void* viewport, const void* tags, uint32_t numTags, void* cmdBuffer) {
+    // Diagnostic: log what tags are being set
+    static int s_log = 0;
+    if (++s_log <= 10) {
+        LOG_INFO("NGXInterceptor: slSetTagForFrame called — numTags=%u tags=%p cmd=%p", numTags, tags, cmdBuffer);
+        if (tags && numTags > 0) {
+            auto* bytes = reinterpret_cast<const uint8_t*>(tags);
+            for (uint32_t i = 0; i < numTags && i < 4; i++) {
+                LOG_INFO("NGXInterceptor:   tag[%u] raw bytes: %02x %02x %02x %02x %02x %02x %02x %02x ...",
+                         i, bytes[0], bytes[1], bytes[2], bytes[3],
+                         bytes[4], bytes[5], bytes[6], bytes[7]);
+            }
+        }
+    }
     CaptureOutputResource(tags, numTags);
     return g_orig_slSetTagForFrame(frame, viewport, tags, numTags, cmdBuffer);
 }
@@ -522,10 +555,9 @@ static sl_Result __cdecl Hooked_slEvaluateFeature(
     void* game_output = g_game_output_resource.load(std::memory_order_relaxed);
     if (!game_output) {
         // Haven't captured game output resource yet — passthrough
-        static bool s_warned = false;
-        if (!s_warned) {
-            s_warned = true;
-            LOG_WARN("NGXInterceptor: no game output resource captured yet — passthrough");
+        static int s_warn_count = 0;
+        if (++s_warn_count <= 5 || (s_warn_count % 300) == 0) {
+            LOG_WARN("NGXInterceptor: no game output resource captured yet — passthrough (eval #%d)", s_eval_count);
         }
         return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
     }
