@@ -458,13 +458,98 @@ static void CaptureOutputResource(const void* tags_ptr, uint32_t numTags) {
     }
 }
 
+// ── In-place resource swap for slSetTag ──
+// When k > 1.0, swap the ScalingOutputColor native pointer with our
+// intermediate buffer. The original pointer is saved for restoration.
+static void* g_saved_native_ptr = nullptr;
+static uint8_t* g_saved_native_location = nullptr;
+
+static void SwapOutputResourceInPlace(void* tags_ptr, uint32_t numTags) {
+    g_saved_native_ptr = nullptr;
+    g_saved_native_location = nullptr;
+    
+    double k = g_current_k.load(std::memory_order_relaxed);
+    if (!g_active.load(std::memory_order_relaxed) || k <= 1.01) return;
+    if (!tags_ptr || numTags == 0 || !g_intermediate_buffer) return;
+    
+    uint32_t game_w = g_game_output_w.load(std::memory_order_relaxed);
+    uint32_t game_h = g_game_output_h.load(std::memory_order_relaxed);
+    if (game_w == 0 || game_h == 0) return;
+    
+    auto [fake_w, fake_h] = ComputeFakeResolution(k, game_w, game_h);
+    Lanczos_Resize(fake_w, fake_h, game_w, game_h);
+    
+    DXGI_FORMAT fmt = DXGI_FORMAT_R10G10B10A2_UNORM;
+    void* game_output = g_game_output_resource.load(std::memory_order_relaxed);
+    if (game_output) {
+        __try {
+            auto* res = static_cast<ID3D12Resource*>(game_output);
+            D3D12_RESOURCE_DESC desc = res->GetDesc();
+            fmt = desc.Format;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    
+    if (!EnsureIntermediateBuffer(fake_w, fake_h, fmt)) return;
+    
+    __try {
+        auto* bytes = reinterpret_cast<uint8_t*>(tags_ptr);
+        constexpr size_t TAG_SIZE = 64;
+        
+        for (uint32_t i = 0; i < numTags; i++) {
+            uint8_t* tag = bytes + i * TAG_SIZE;
+            uint32_t buf_type = *reinterpret_cast<const uint32_t*>(tag + SL_TAG_OFFSET_TYPE);
+            
+            if (buf_type == sl_kBufferTypeScalingOutputColor) {
+                auto* sl_resource = *reinterpret_cast<uint8_t**>(tag + SL_TAG_OFFSET_RESOURCE);
+                if (sl_resource) {
+                    uint8_t* native_loc = sl_resource + SL_RESOURCE_OFFSET_NATIVE;
+                    void* original = *reinterpret_cast<void**>(native_loc);
+                    
+                    g_saved_native_ptr = original;
+                    g_saved_native_location = native_loc;
+                    
+                    *reinterpret_cast<void**>(native_loc) = static_cast<void*>(g_intermediate_buffer);
+                    
+                    static int s_swap_log = 0;
+                    if (++s_swap_log <= 5 || (s_swap_log % 300) == 0) {
+                        LOG_INFO("NGXInterceptor: slSetTag swap: native %p -> %p (k=%.2f)",
+                                 original, g_intermediate_buffer, k);
+                    }
+                }
+                break;
+            }
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_WARN("NGXInterceptor: SEH in SwapOutputResourceInPlace");
+        g_saved_native_ptr = nullptr;
+        g_saved_native_location = nullptr;
+    }
+}
+
+static void RestoreOutputResourceInPlace(void* /*tags_ptr*/, uint32_t /*numTags*/) {
+    if (g_saved_native_location && g_saved_native_ptr) {
+        __try {
+            *reinterpret_cast<void**>(g_saved_native_location) = g_saved_native_ptr;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            LOG_WARN("NGXInterceptor: SEH in RestoreOutputResourceInPlace");
+        }
+    }
+    g_saved_native_ptr = nullptr;
+    g_saved_native_location = nullptr;
+}
+
 static sl_Result __cdecl Hooked_slSetTag(const void* viewport, const void* tags, uint32_t numTags, void* cmdBuffer) {
     static int s_log = 0;
     if (++s_log <= 3) {
         LOG_INFO("NGXInterceptor: slSetTag called — numTags=%u tags=%p", numTags, tags);
     }
     CaptureOutputResource(tags, numTags);
-    return g_orig_slSetTag(viewport, tags, numTags, cmdBuffer);
+    
+    SwapOutputResourceInPlace(const_cast<void*>(tags), numTags);
+    sl_Result result = g_orig_slSetTag(viewport, tags, numTags, cmdBuffer);
+    RestoreOutputResourceInPlace(const_cast<void*>(tags), numTags);
+    
+    return result;
 }
 
 static sl_Result __cdecl Hooked_slSetTagForFrame(const void* frame, const void* viewport, const void* tags, uint32_t numTags, void* cmdBuffer) {
@@ -473,49 +558,13 @@ static sl_Result __cdecl Hooked_slSetTagForFrame(const void* frame, const void* 
         LOG_INFO("NGXInterceptor: slSetTagForFrame called — numTags=%u tags=%p", numTags, tags);
     }
     CaptureOutputResource(tags, numTags);
-    return g_orig_slSetTagForFrame(frame, viewport, tags, numTags, cmdBuffer);
+    
+    SwapOutputResourceInPlace(const_cast<void*>(tags), numTags);
+    sl_Result result = g_orig_slSetTagForFrame(frame, viewport, tags, numTags, cmdBuffer);
+    RestoreOutputResourceInPlace(const_cast<void*>(tags), numTags);
+    
+    return result;
 }
-
-// ── sl::Resource wrapper for our intermediate buffer ──
-// sl::Resource inherits BaseStructure (32 bytes), then adds its own fields.
-// Layout: BaseStructure(32) + type(4) + pad(4) + native(8) + mem(8) + view(8) + state(4) + pad(4)
-struct SL_Resource_Wrapper {
-    // BaseStructure header
-    void*    next;              // offset 0
-    uint8_t  structType[16];    // offset 8 (GUID)
-    size_t   structVersion;     // offset 24
-    // Resource fields
-    uint32_t type;              // offset 32 (ResourceType::eTex2d = 0)
-    uint32_t _pad1;             // offset 36
-    void*    native;            // offset 40 (ID3D12Resource*)
-    void*    mem;               // offset 48
-    void*    view;              // offset 56
-    uint32_t state;             // offset 64 (D3D12_RESOURCE_STATES)
-    uint32_t _pad2;             // offset 68
-};
-
-// ── ResourceTag wrapper for local tag injection ──
-// Layout must match sl::ResourceTag which inherits BaseStructure:
-//   BaseStructure: next(8) + structType(16) + structVersion(8) = 32 bytes
-//   resource(8) + type(4) + lifecycle(4) + extent(8) + [8 padding] = 32 bytes
-//   Total: 64 bytes (confirmed by stride probing)
-struct SL_ResourceTag_Wrapper {
-    // BaseStructure
-    void*    next;
-    uint8_t  structType[16];  // GUID for ResourceTag
-    size_t   structVersion;
-    // ResourceTag fields
-    SL_Resource_Wrapper* resource;
-    uint32_t type;            // buffer type ID
-    uint32_t lifecycle;       // sl::ResourceLifecycle
-    void*    extent;          // sl::Extent*
-    uint64_t _padding;        // alignment padding to match 64-byte stride
-};
-
-// ResourceTag GUID: {38785e2a-...} — we'll use a known value
-// Actually, the structType doesn't matter for local tags passed to
-// slEvaluateFeature — Streamline identifies them by the buffer type field.
-// But we should set it correctly for safety.
 
 static sl_Result __cdecl Hooked_slEvaluateFeature(
     uint32_t feature,
@@ -534,26 +583,23 @@ static sl_Result __cdecl Hooked_slEvaluateFeature(
     static int s_eval_count = 0;
     s_eval_count++;
 
-    // Periodic logging
     if (s_eval_count <= 5 || (s_eval_count % 300) == 0) {
-        LOG_INFO("NGXInterceptor: [SL] eval #%d feature=%u k=%.2f numInputs=%u cmd=%p",
-                 s_eval_count, feature, k, numInputs, cmdBuffer);
+        LOG_INFO("NGXInterceptor: [SL] eval #%d feature=%u k=%.2f cmd=%p",
+                 s_eval_count, feature, k, cmdBuffer);
     }
 
     // Passthrough when inactive or k ~ 1.0
-    if (!g_active.load(std::memory_order_relaxed) || k <= 1.01 ||
-        !cmdBuffer) {
+    if (!g_active.load(std::memory_order_relaxed) || k <= 1.01 || !cmdBuffer) {
         return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
     }
 
-    // Need the game's output resource to write the downscaled result to
     void* game_output = g_game_output_resource.load(std::memory_order_relaxed);
-    if (!game_output) {
-        // Haven't captured game output resource yet — passthrough
-        static int s_warn_count = 0;
-        if (++s_warn_count <= 5 || (s_warn_count % 300) == 0) {
-            LOG_WARN("NGXInterceptor: no game output resource captured yet — passthrough (eval #%d)", s_eval_count);
-        }
+    uintptr_t addr = reinterpret_cast<uintptr_t>(game_output);
+    if (!game_output || addr <= 0x10000 || addr >= 0x00007FFFFFFFFFFF) {
+        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
+    }
+
+    if (!g_intermediate_buffer) {
         return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
     }
 
@@ -563,69 +609,11 @@ static sl_Result __cdecl Hooked_slEvaluateFeature(
         return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
     }
 
-    // Compute intermediate buffer size
     auto [fake_w, fake_h] = ComputeFakeResolution(k, game_w, game_h);
 
-    // Lazy Lanczos resize on the render thread (thread-safe)
-    Lanczos_Resize(fake_w, fake_h, game_w, game_h);
-
-    // Ensure intermediate buffer is allocated
-    // Use the format from the game's output resource if possible
-    DXGI_FORMAT fmt = g_intermediate_format;
-    __try {
-        auto* res = static_cast<ID3D12Resource*>(game_output);
-        D3D12_RESOURCE_DESC desc = res->GetDesc();
-        fmt = desc.Format;
-    } __except(EXCEPTION_EXECUTE_HANDLER) {}
-
-    if (!EnsureIntermediateBuffer(fake_w, fake_h, fmt)) {
-        static int s_fail = 0;
-        if (++s_fail <= 3) LOG_WARN("NGXInterceptor: intermediate buffer alloc failed %ux%u", fake_w, fake_h);
-        return g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
-    }
-
-    // ── Build local ResourceTag for our intermediate buffer ──
-    SL_Resource_Wrapper local_resource{};
-    memset(&local_resource, 0, sizeof(local_resource));
-    local_resource.structVersion = 1;
-    local_resource.type = 0;  // eTex2d
-    local_resource.native = static_cast<void*>(g_intermediate_buffer);
-    local_resource.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-
-    SL_ResourceTag_Wrapper local_tag{};
-    memset(&local_tag, 0, sizeof(local_tag));
-    local_tag.structVersion = 1;
-    local_tag.resource = &local_resource;
-    local_tag.type = sl_kBufferTypeScalingOutputColor;
-    local_tag.lifecycle = 0;  // eOnlyValidNow
-
-    // ── Build extended inputs array with our local tag appended ──
-    // Max 32 inputs should be more than enough
-    constexpr uint32_t MAX_INPUTS = 32;
-    const sl_BaseStructure* extended_inputs[MAX_INPUTS];
-    uint32_t ext_count = 0;
-
-    // Copy existing inputs
-    if (inputs && numInputs > 0) {
-        uint32_t copy_count = (numInputs < MAX_INPUTS - 1) ? numInputs : (MAX_INPUTS - 1);
-        for (uint32_t i = 0; i < copy_count; i++) {
-            extended_inputs[ext_count++] = inputs[i];
-        }
-    }
-
-    // Append our local tag
-    extended_inputs[ext_count++] = reinterpret_cast<const sl_BaseStructure*>(&local_tag);
-
-    if (s_eval_count <= 5) {
-        LOG_INFO("NGXInterceptor: injecting local ScalingOutputColor tag "
-                 "(intermediate=%p %ux%u, game_output=%p %ux%u)",
-                 g_intermediate_buffer, fake_w, fake_h,
-                 game_output, game_w, game_h);
-    }
-
-    // ── Call original — DLSS upscales to k*D into our intermediate buffer ──
-    sl_Result result = g_orig_slEvaluateFeature(
-        feature, frame, extended_inputs, ext_count, cmdBuffer);
+    // Call original — DLSS writes to our intermediate buffer
+    // (resource swap was done in slSetTag hook)
+    sl_Result result = g_orig_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
 
     if (result != sl_eOk) {
         static int s_err = 0;
@@ -633,7 +621,7 @@ static sl_Result __cdecl Hooked_slEvaluateFeature(
         return result;
     }
 
-    // ── Lanczos downscale: intermediate (k*D) -> game output (D) ──
+    // Lanczos downscale: intermediate (k*D) -> game output (D)
     auto* cmd_list = static_cast<ID3D12GraphicsCommandList*>(cmdBuffer);
     auto* original_output = static_cast<ID3D12Resource*>(game_output);
 
@@ -642,8 +630,7 @@ static sl_Result __cdecl Hooked_slEvaluateFeature(
                      fake_w, fake_h,
                      game_w, game_h);
 
-    // Log interception periodically
-    if (s_eval_count <= 3 || (s_eval_count % 300) == 0) {
+    if (s_eval_count <= 5 || (s_eval_count % 300) == 0) {
         LOG_INFO("NGXInterceptor: [SL] INTERCEPTED #%d k=%.2f %ux%u -> %ux%u",
                  s_eval_count, k, fake_w, fake_h, game_w, game_h);
     }
