@@ -241,8 +241,9 @@ void OnMarker(uint64_t frameID, int64_t now) {
             if (dw > 0 && dh > 0) {
                 NGXInterceptor_SetScalingParams(state.current_k, dw, dh);
             }
-            LOG_INFO("DLSS Scaling: tier changed to T%d k=%.2f display=%ux%u",
-                     state.current_tier, state.current_k, dw, dh);
+            LOG_INFO("DLSS Scaling: tier changed to T%d k=%.2f display=%ux%u ft=%.1fms ema_fps=%.1f",
+                     state.current_tier, state.current_k, dw, dh,
+                     actual_ft / 1000.0, ema_fps);
         }
         } // end ema_fps > 0 guard
         skip_dlss_update:;

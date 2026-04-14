@@ -158,15 +158,24 @@ bool KController_Update(double ema_fps, double target_fps,
         decision_fps = ema_fps / static_cast<double>(fg_multiplier);
     }
 
-    // Compute thresholds
-    double low_threshold  = g_kc.down_threshold * target_fps;
-    double high_threshold = g_kc.up_threshold * target_fps;
+    // Compute thresholds using frame time instead of FPS.
+    // The limiter caps output FPS at exactly the target, so FPS-based
+    // comparison never shows headroom. Instead, compare the actual
+    // frame time against the target interval:
+    //   - If frame_time > target_interval / down_threshold: GPU is struggling, drop tier
+    //   - If frame_time < target_interval / up_threshold: GPU has headroom, raise tier
+    double target_interval_ms = (target_fps > 0.0) ? (1000.0 / target_fps) : 6.06;
+    if (fg_active && fg_multiplier > 1) {
+        target_interval_ms *= static_cast<double>(fg_multiplier);
+    }
 
     // Track consecutive frames below/above thresholds
-    if (decision_fps < low_threshold) {
+    // "below" = GPU struggling (frame time too long)
+    // "above" = GPU has headroom (frame time short enough to raise quality)
+    if (frame_time_ms > target_interval_ms / g_kc.down_threshold) {
         g_kc.frames_below++;
         g_kc.frames_above = 0;
-    } else if (decision_fps > high_threshold) {
+    } else if (frame_time_ms < target_interval_ms / g_kc.up_threshold) {
         g_kc.frames_above++;
         g_kc.frames_below = 0;
     } else {
