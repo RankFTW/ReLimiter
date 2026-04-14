@@ -29,10 +29,12 @@
 #include "logger.h"
 
 #include <Windows.h>
+#include <Psapi.h>
 #include <MinHook.h>
 #include <dxgi.h>
 #include <atomic>
 #include <mutex>
+#include <string>
 #include <cstring>
 #include <cmath>
 
@@ -849,6 +851,32 @@ void NGXInterceptor_Init(double scale_factor) {
             LOG_INFO("NGXInterceptor: %ls already loaded (model)", name);
             NGXInterceptor_OnModelDllLoaded(static_cast<void*>(existing));
             break;
+        }
+    }
+
+    // Diagnostic: enumerate all loaded modules containing "ngx" or "dlss"
+    // to understand what Streamline actually loads
+    {
+        HMODULE mods[512];
+        DWORD needed = 0;
+        HANDLE proc = GetCurrentProcess();
+        if (EnumProcessModules(proc, mods, sizeof(mods), &needed)) {
+            DWORD count = needed / sizeof(HMODULE);
+            for (DWORD i = 0; i < count; i++) {
+                wchar_t name[MAX_PATH] = {};
+                if (GetModuleFileNameW(mods[i], name, MAX_PATH)) {
+                    // Convert to lowercase for matching
+                    std::wstring lower(name);
+                    for (auto& c : lower) c = towlower(c);
+                    if (lower.find(L"ngx") != std::wstring::npos ||
+                        lower.find(L"dlss") != std::wstring::npos ||
+                        lower.find(L"streamline") != std::wstring::npos ||
+                        lower.find(L"sl.") != std::wstring::npos) {
+                        LOG_INFO("NGXInterceptor: [DIAG] loaded module: %ls (handle=%p)",
+                                 name, mods[i]);
+                    }
+                }
+            }
         }
     }
 }
