@@ -499,9 +499,51 @@ static NVSDK_NGX_Result __cdecl Hooked_NGX_D3D12_EvaluateFeature(
     }
 
     if (!original_output) {
-        static bool s_w = false;
-        if (!s_w) { s_w = true; LOG_WARN("NGXInterceptor: Get('Output') returned null"); }
-        return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
+        // Try alternate parameter names — Streamline's proxy might use different names
+        static const char* alt_names[] = {
+            "Output", "Color", "DLSS.Output", "DLSS.Output.Color",
+            "ScalingOutputColor", "OutputColor", "OutColor",
+            // Also try the EParameter enum-style names (single-byte keys)
+            "#\x22",  // NVSDK_NGX_EParameter_Output
+            "#\x1e",  // NVSDK_NGX_EParameter_Color
+            nullptr
+        };
+        static bool s_probed = false;
+        if (!s_probed) {
+            s_probed = true;
+            LOG_INFO("NGXInterceptor: 'Output' returned null, probing alternate names...");
+            for (int i = 0; alt_names[i]; i++) {
+                ID3D12Resource* res = nullptr;
+                NVSDK_NGX_Result r = 0;
+                __try {
+                    r = fnGet(params, alt_names[i], &res);
+                } __except(EXCEPTION_EXECUTE_HANDLER) { continue; }
+                if (res) {
+                    D3D12_RESOURCE_DESC desc = res->GetDesc();
+                    LOG_INFO("NGXInterceptor:   FOUND '%s' -> %p (%llux%u)", alt_names[i], res, desc.Width, desc.Height);
+                    original_output = res;
+                    break;
+                } else {
+                    LOG_INFO("NGXInterceptor:   '%s' -> null (result=0x%X)", alt_names[i], r);
+                }
+            }
+            // Also try GetUI for Width/Height to verify vtable works at all
+            auto fnGetUI = reinterpret_cast<NVSDK_NGX_Result (__thiscall*)(
+                const NVSDK_NGX_Parameter*, const char*, unsigned int*)>(vtable[11]);
+            if (fnGetUI) {
+                unsigned int w = 0, h = 0, ow = 0, oh = 0;
+                __try {
+                    fnGetUI(params, "Width", &w);
+                    fnGetUI(params, "Height", &h);
+                    fnGetUI(params, "OutWidth", &ow);
+                    fnGetUI(params, "OutHeight", &oh);
+                } __except(EXCEPTION_EXECUTE_HANDLER) {}
+                LOG_INFO("NGXInterceptor:   uint params: Width=%u Height=%u OutWidth=%u OutHeight=%u", w, h, ow, oh);
+            }
+        }
+        if (!original_output) {
+            return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
+        }
     }
 
     if (s_n <= 3) {
