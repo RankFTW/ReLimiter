@@ -454,17 +454,21 @@ static void CaptureOutputResource(const void* tags_ptr, uint32_t numTags) {
 static sl_Result __cdecl Hooked_slSetTag(const void* viewport, const void* tags, uint32_t numTags, void* cmdBuffer) {
     // Diagnostic: log what tags are being set
     static int s_log = 0;
-    if (++s_log <= 10) {
+    if (++s_log <= 20) {
         LOG_INFO("NGXInterceptor: slSetTag called — numTags=%u tags=%p cmd=%p", numTags, tags, cmdBuffer);
         if (tags && numTags > 0) {
-            // Dump the first few bytes of each tag to understand the layout
+            // Dump the buffer type field at offset 40 for each tag
+            // Tag struct size = 56 bytes (BaseStructure 32 + resource* 8 + type 4 + lifecycle 4 + extent* 8)
             auto* bytes = reinterpret_cast<const uint8_t*>(tags);
-            for (uint32_t i = 0; i < numTags && i < 4; i++) {
-                // Try reading buffer type at various offsets to find the right one
-                // The tag might be passed as a pointer array, not a struct array
-                LOG_INFO("NGXInterceptor:   tag[%u] raw bytes: %02x %02x %02x %02x %02x %02x %02x %02x ...",
-                         i, bytes[0], bytes[1], bytes[2], bytes[3],
-                         bytes[4], bytes[5], bytes[6], bytes[7]);
+            constexpr size_t TAG_SIZE = 56;
+            for (uint32_t i = 0; i < numTags && i < 8; i++) {
+                const uint8_t* tag = bytes + i * TAG_SIZE;
+                // Read buffer type at offset 40
+                uint32_t buf_type = *reinterpret_cast<const uint32_t*>(tag + 40);
+                // Read resource pointer at offset 32
+                void* res_ptr = *reinterpret_cast<void* const*>(tag + 32);
+                LOG_INFO("NGXInterceptor:   tag[%u] bufType=%u resource=%p (offset %zu)",
+                         i, buf_type, res_ptr, i * TAG_SIZE);
             }
         }
     }
@@ -475,14 +479,17 @@ static sl_Result __cdecl Hooked_slSetTag(const void* viewport, const void* tags,
 static sl_Result __cdecl Hooked_slSetTagForFrame(const void* frame, const void* viewport, const void* tags, uint32_t numTags, void* cmdBuffer) {
     // Diagnostic: log what tags are being set
     static int s_log = 0;
-    if (++s_log <= 10) {
+    if (++s_log <= 20) {
         LOG_INFO("NGXInterceptor: slSetTagForFrame called — numTags=%u tags=%p cmd=%p", numTags, tags, cmdBuffer);
         if (tags && numTags > 0) {
             auto* bytes = reinterpret_cast<const uint8_t*>(tags);
-            for (uint32_t i = 0; i < numTags && i < 4; i++) {
-                LOG_INFO("NGXInterceptor:   tag[%u] raw bytes: %02x %02x %02x %02x %02x %02x %02x %02x ...",
-                         i, bytes[0], bytes[1], bytes[2], bytes[3],
-                         bytes[4], bytes[5], bytes[6], bytes[7]);
+            constexpr size_t TAG_SIZE = 56;
+            for (uint32_t i = 0; i < numTags && i < 8; i++) {
+                const uint8_t* tag = bytes + i * TAG_SIZE;
+                uint32_t buf_type = *reinterpret_cast<const uint32_t*>(tag + 40);
+                void* res_ptr = *reinterpret_cast<void* const*>(tag + 32);
+                LOG_INFO("NGXInterceptor:   tag[%u] bufType=%u resource=%p (offset %zu)",
+                         i, buf_type, res_ptr, i * TAG_SIZE);
             }
         }
     }
