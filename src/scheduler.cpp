@@ -222,7 +222,10 @@ void OnMarker(uint64_t frameID, int64_t now) {
                 auto [fake_w, fake_h] = ComputeFakeResolution(
                     state.current_k, display_w, display_h);
 
-                Lanczos_Resize(fake_w, fake_h, display_w, display_h);
+                // DO NOT call Lanczos_Resize here — we're on the scheduler thread
+                // and the render thread may be using the D3D12 device concurrently.
+                // D3D12 resource creation is not thread-safe with command list recording.
+                // The EvaluateFeature hook will handle Lanczos resize lazily.
                 NGXInterceptor_UpdateOutputRes(fake_w, fake_h);
                 NGXInterceptor_SetScalingParams(state.current_k, display_w, display_h);
 
