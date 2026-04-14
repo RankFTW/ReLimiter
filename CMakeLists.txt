@@ -164,7 +164,7 @@ if(MSVC)
     )
 
     target_link_options(relimiter PRIVATE
-        $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF>
+        $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF /MAP>
     )
 endif()
 

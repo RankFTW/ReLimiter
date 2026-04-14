@@ -806,13 +806,18 @@ void NGXInterceptor_OnDLSSDllLoaded(void* hModule) {
 
     LOG_INFO("NGXInterceptor: NGX DLL loaded (%p), attempting EvaluateFeature hook", hModule);
 
-    // Install CreateFeature hook for Ray Reconstruction detection
-    InstallCreateFeatureHook(hDll);
+    __try {
+        // Install CreateFeature hook for Ray Reconstruction detection
+        InstallCreateFeatureHook(hDll);
 
-    // Install EvaluateFeature hook — this is the core interception point
-    if (InstallDirectNGXHook(hDll, "_nvngx.dll")) {
-        g_active.store(true, std::memory_order_relaxed);
-        LOG_INFO("NGXInterceptor: EvaluateFeature hook active on _nvngx.dll");
+        // Install EvaluateFeature hook — this is the core interception point
+        if (InstallDirectNGXHook(hDll, "_nvngx.dll")) {
+            g_active.store(true, std::memory_order_relaxed);
+            LOG_INFO("NGXInterceptor: EvaluateFeature hook active on _nvngx.dll");
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("NGXInterceptor: SEH exception in OnDLSSDllLoaded (0x%08X) — hook installation failed",
+                  GetExceptionCode());
     }
 }
 
