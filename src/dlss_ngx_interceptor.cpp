@@ -575,137 +575,45 @@ static NVSDK_NGX_Result __cdecl Hooked_NGX_D3D12_EvaluateFeature(
 
     uint32_t game_w = g_game_output_w.load(std::memory_order_relaxed);
     uint32_t game_h = g_game_output_h.load(std::memory_order_relaxed);
-    if (game_w == 0 || game_h == 0) {
+    if (game_w == 0 || game_h == 0 || !g_output_format_captured || !g_intermediate_buffer) {
         return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
     }
 
-    // ── Read the Output resource via vtable ──
+    // Override OutWidth/OutHeight to k×D to match the resource swap in slSetTag
+    auto [fw, fh] = ComputeFakeResolution(k, game_w, game_h);
     void** vtable = nullptr;
-    __try {
-        vtable = *reinterpret_cast<void** const*>(params);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
-    }
-    if (!vtable) {
-        return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
-    }
+    __try { vtable = *reinterpret_cast<void** const*>(params); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { vtable = nullptr; }
 
-    auto fnGet = reinterpret_cast<NGXParam_GetD3d12Resource_t>(vtable[VTABLE_GET_D3D12_RESOURCE]);
-    auto fnSet = reinterpret_cast<NGXParam_SetD3d12Resource_t>(vtable[VTABLE_SET_D3D12_RESOURCE]);
-    if (!fnGet || !fnSet) {
-        static bool s_w = false;
-        if (!s_w) { s_w = true; LOG_WARN("NGXInterceptor: vtable Get/Set null at [%d]/[%d]", VTABLE_GET_D3D12_RESOURCE, VTABLE_SET_D3D12_RESOURCE); }
-        return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
-    }
-
-    ID3D12Resource* original_output = nullptr;
-    __try {
-        fnGet(params, "Output", &original_output);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        static bool s_w = false;
-        if (!s_w) { s_w = true; LOG_WARN("NGXInterceptor: SEH in Get('Output')"); }
-        return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
-    }
-
-    if (!original_output) {
-        // Try alternate parameter names — Streamline's proxy might use different names
-        static const char* alt_names[] = {
-            "Output", "Color", "DLSS.Output", "DLSS.Output.Color",
-            "ScalingOutputColor", "OutputColor", "OutColor",
-            // Also try the EParameter enum-style names (single-byte keys)
-            "#\x22",  // NVSDK_NGX_EParameter_Output
-            "#\x1e",  // NVSDK_NGX_EParameter_Color
-            nullptr
-        };
-        static bool s_probed = false;
-        if (!s_probed) {
-            s_probed = true;
-            LOG_INFO("NGXInterceptor: 'Output' returned null, probing alternate names...");
-            for (int i = 0; alt_names[i]; i++) {
-                ID3D12Resource* res = nullptr;
-                NVSDK_NGX_Result r = 0;
-                __try {
-                    r = fnGet(params, alt_names[i], &res);
-                } __except(EXCEPTION_EXECUTE_HANDLER) { continue; }
-                if (res) {
-                    D3D12_RESOURCE_DESC desc = res->GetDesc();
-                    LOG_INFO("NGXInterceptor:   FOUND '%s' -> %p (%llux%u)", alt_names[i], res, desc.Width, desc.Height);
-                    original_output = res;
-                    break;
-                } else {
-                    LOG_INFO("NGXInterceptor:   '%s' -> null (result=0x%X)", alt_names[i], r);
-                }
-            }
-            // Also try GetUI for Width/Height to verify vtable works at all
-            auto fnGetUI = reinterpret_cast<NVSDK_NGX_Result (__thiscall*)(
-                const NVSDK_NGX_Parameter*, const char*, unsigned int*)>(vtable[11]);
-            if (fnGetUI) {
-                unsigned int w = 0, h = 0, ow = 0, oh = 0;
-                __try {
-                    fnGetUI(params, "Width", &w);
-                    fnGetUI(params, "Height", &h);
-                    fnGetUI(params, "OutWidth", &ow);
-                    fnGetUI(params, "OutHeight", &oh);
-                } __except(EXCEPTION_EXECUTE_HANDLER) {}
-                LOG_INFO("NGXInterceptor:   uint params: Width=%u Height=%u OutWidth=%u OutHeight=%u", w, h, ow, oh);
-            }
-        }
-        if (!original_output) {
-            return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
+    bool dims_overridden = false;
+    if (vtable) {
+        auto fnSetUI = reinterpret_cast<void (__thiscall*)(
+            const NVSDK_NGX_Parameter*, const char*, unsigned int)>(vtable[3]);
+        if (fnSetUI) {
+            __try {
+                fnSetUI(params, "OutWidth", fw);
+                fnSetUI(params, "OutHeight", fh);
+                dims_overridden = true;
+            } __except(EXCEPTION_EXECUTE_HANDLER) {}
         }
     }
 
-    if (s_n <= 3) {
-        D3D12_RESOURCE_DESC desc = original_output->GetDesc();
-        LOG_INFO("NGXInterceptor: Output resource %p (%llux%u fmt=%d)",
-                 original_output, desc.Width, desc.Height, static_cast<int>(desc.Format));
-    }
+    if (s_n <= 5 || (s_n % 300) == 0)
+        LOG_INFO("NGXInterceptor: [NGX] override dims %ux%u -> %ux%u (ok=%d)", game_w, game_h, fw, fh, dims_overridden);
 
-    // ── Compute intermediate size and ensure buffer ──
-    auto [fake_w, fake_h] = ComputeFakeResolution(k, game_w, game_h);
-    Lanczos_Resize(fake_w, fake_h, game_w, game_h);
-
-    D3D12_RESOURCE_DESC orig_desc = original_output->GetDesc();
-    if (!EnsureIntermediateBuffer(fake_w, fake_h, orig_desc.Format)) {
-        return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
-    }
-
-    // ── Swap Output to intermediate buffer ──
-    __try {
-        fnSet(params, "Output", g_intermediate_buffer);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        LOG_ERROR("NGXInterceptor: SEH in Set('Output') — passthrough");
-        return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
-    }
-
-    if (s_n <= 5 || (s_n % 300) == 0) {
-        LOG_INFO("NGXInterceptor: [NGX] INTERCEPT #%d: Output %p -> %p k=%.2f %ux%u",
-                 s_n, original_output, g_intermediate_buffer, k, fake_w, fake_h);
-    }
-
-    // ── Call original — DLSS writes to intermediate ──
+    // Call original
     NVSDK_NGX_Result result = g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
 
-    // ── Restore original Output ──
-    __try {
-        fnSet(params, "Output", original_output);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        LOG_ERROR("NGXInterceptor: SEH restoring Output");
-    }
-
-    if (result != 0x1) { // NVSDK_NGX_Result_Success = 0x1
-        static int s_e = 0;
-        if (++s_e <= 3) LOG_WARN("NGXInterceptor: NGX eval returned 0x%X", result);
-        return result;
-    }
-
-    // ── Lanczos downscale: intermediate (k*D) → original output (D) ──
-    Lanczos_Dispatch(cmd_list,
-                     g_intermediate_buffer, original_output,
-                     fake_w, fake_h, game_w, game_h);
-
-    if (s_n <= 5 || (s_n % 300) == 0) {
-        LOG_INFO("NGXInterceptor: [NGX] DONE #%d %ux%u -> %ux%u", s_n, fake_w, fake_h, game_w, game_h);
+    // Restore original dimensions
+    if (dims_overridden && vtable) {
+        auto fnSetUI = reinterpret_cast<void (__thiscall*)(
+            const NVSDK_NGX_Parameter*, const char*, unsigned int)>(vtable[3]);
+        if (fnSetUI) {
+            __try {
+                fnSetUI(params, "OutWidth", game_w);
+                fnSetUI(params, "OutHeight", game_h);
+            } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        }
     }
 
     return result;
