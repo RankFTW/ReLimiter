@@ -174,6 +174,54 @@ static bool                   g_sl_dlss_options_hooked   = false;
 static NGX_D3D12_CreateFeature_t g_orig_CreateFeature    = nullptr;
 static bool                     g_create_feature_hooked  = false;
 
+// ── Direct NGX EvaluateFeature hook on _nvngx.dll (v5 approach) ──
+// This hooks the REAL NGX evaluation inside _nvngx.dll, called by sl.dlss.dll.
+// At this level, the NVSDK_NGX_Parameter object has the standard C++ vtable
+// from the official NVIDIA DLSS SDK (nvsdk_ngx_params.h).
+//
+// Vtable layout (from NVIDIA/DLSS public SDK):
+//   [0]  Set(const char*, unsigned long long)
+//   [1]  Set(const char*, float)
+//   [2]  Set(const char*, double)
+//   [3]  Set(const char*, unsigned int)
+//   [4]  Set(const char*, int)
+//   [5]  Set(const char*, ID3D11Resource*)
+//   [6]  Set(const char*, ID3D12Resource*)     ← SetD3d12Resource
+//   [7]  Set(const char*, void*)
+//   [8]  Get(const char*, unsigned long long*)
+//   [9]  Get(const char*, float*)
+//   [10] Get(const char*, double*)
+//   [11] Get(const char*, unsigned int*)
+//   [12] Get(const char*, int*)
+//   [13] Get(const char*, ID3D11Resource**)
+//   [14] Get(const char*, ID3D12Resource**)    ← GetD3d12Resource
+//   [15] Get(const char*, void**)
+//   [16] Reset()
+
+struct NVSDK_NGX_Parameter;
+struct NVSDK_NGX_Handle;
+
+using NVSDK_NGX_Result = unsigned int;
+
+using NGX_D3D12_EvaluateFeature_t = NVSDK_NGX_Result (__cdecl*)(
+    ID3D12GraphicsCommandList* cmd_list,
+    const NVSDK_NGX_Handle* feature_handle,
+    const NVSDK_NGX_Parameter* params,
+    void* callback);
+
+// Vtable function pointer types (thiscall on MSVC x64 = first arg is 'this')
+using NGXParam_SetD3d12Resource_t = void (__thiscall*)(
+    const NVSDK_NGX_Parameter* self, const char* name, ID3D12Resource* value);
+using NGXParam_GetD3d12Resource_t = NVSDK_NGX_Result (__thiscall*)(
+    const NVSDK_NGX_Parameter* self, const char* name, ID3D12Resource** value);
+
+static constexpr int VTABLE_SET_D3D12_RESOURCE = 6;
+static constexpr int VTABLE_GET_D3D12_RESOURCE = 14;
+
+static NGX_D3D12_EvaluateFeature_t g_orig_NGX_EvaluateFeature = nullptr;
+static bool                        g_ngx_eval_hooked          = false;
+static void*                       g_ngx_eval_target          = nullptr;
+
 // ══════════════════════════════════════════════════════════════════════
 // Intermediate buffer management
 // ══════════════════════════════════════════════════════════════════════
@@ -384,8 +432,170 @@ static sl_Result __cdecl Hooked_slEvaluateFeature(
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// Direct NGX EvaluateFeature hook (v5) — hooks _nvngx.dll
+//
+// sl.dlss.dll calls NVSDK_NGX_D3D12_EvaluateFeature on _nvngx.dll with
+// a standard NVSDK_NGX_Parameter object. We intercept here to:
+//   1. Read the "Output" resource via vtable[14] (GetD3d12Resource)
+//   2. Swap it with our intermediate buffer via vtable[6] (SetD3d12Resource)
+//   3. Call original — DLSS writes to intermediate at k*D
+//   4. Restore original "Output" resource
+//   5. Lanczos downscale intermediate → original output
+// ══════════════════════════════════════════════════════════════════════
+
+static NVSDK_NGX_Result __cdecl Hooked_NGX_D3D12_EvaluateFeature(
+    ID3D12GraphicsCommandList* cmd_list,
+    const NVSDK_NGX_Handle* feature_handle,
+    const NVSDK_NGX_Parameter* params,
+    void* callback)
+{
+    static int s_n = 0;
+    s_n++;
+
+    double k = g_current_k.load(std::memory_order_relaxed);
+
+    if (s_n <= 5 || (s_n % 300) == 0) {
+        LOG_INFO("NGXInterceptor: [NGX] eval #%d k=%.2f cmd=%p params=%p",
+                 s_n, k, cmd_list, params);
+    }
+
+    // Passthrough when inactive, no params, or k ~ 1.0
+    if (!g_active.load(std::memory_order_relaxed) || !params || !cmd_list || k <= 1.01) {
+        return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
+    }
+
+    uint32_t game_w = g_game_output_w.load(std::memory_order_relaxed);
+    uint32_t game_h = g_game_output_h.load(std::memory_order_relaxed);
+    if (game_w == 0 || game_h == 0) {
+        return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
+    }
+
+    // ── Read the Output resource via vtable ──
+    void** vtable = nullptr;
+    __try {
+        vtable = *reinterpret_cast<void** const*>(params);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
+    }
+    if (!vtable) {
+        return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
+    }
+
+    auto fnGet = reinterpret_cast<NGXParam_GetD3d12Resource_t>(vtable[VTABLE_GET_D3D12_RESOURCE]);
+    auto fnSet = reinterpret_cast<NGXParam_SetD3d12Resource_t>(vtable[VTABLE_SET_D3D12_RESOURCE]);
+    if (!fnGet || !fnSet) {
+        static bool s_w = false;
+        if (!s_w) { s_w = true; LOG_WARN("NGXInterceptor: vtable Get/Set null at [%d]/[%d]", VTABLE_GET_D3D12_RESOURCE, VTABLE_SET_D3D12_RESOURCE); }
+        return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
+    }
+
+    ID3D12Resource* original_output = nullptr;
+    __try {
+        fnGet(params, "Output", &original_output);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        static bool s_w = false;
+        if (!s_w) { s_w = true; LOG_WARN("NGXInterceptor: SEH in Get('Output')"); }
+        return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
+    }
+
+    if (!original_output) {
+        static bool s_w = false;
+        if (!s_w) { s_w = true; LOG_WARN("NGXInterceptor: Get('Output') returned null"); }
+        return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
+    }
+
+    if (s_n <= 3) {
+        D3D12_RESOURCE_DESC desc = original_output->GetDesc();
+        LOG_INFO("NGXInterceptor: Output resource %p (%llux%u fmt=%d)",
+                 original_output, desc.Width, desc.Height, static_cast<int>(desc.Format));
+    }
+
+    // ── Compute intermediate size and ensure buffer ──
+    auto [fake_w, fake_h] = ComputeFakeResolution(k, game_w, game_h);
+    Lanczos_Resize(fake_w, fake_h, game_w, game_h);
+
+    D3D12_RESOURCE_DESC orig_desc = original_output->GetDesc();
+    if (!EnsureIntermediateBuffer(fake_w, fake_h, orig_desc.Format)) {
+        return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
+    }
+
+    // ── Swap Output to intermediate buffer ──
+    __try {
+        fnSet(params, "Output", g_intermediate_buffer);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("NGXInterceptor: SEH in Set('Output') — passthrough");
+        return g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
+    }
+
+    if (s_n <= 5 || (s_n % 300) == 0) {
+        LOG_INFO("NGXInterceptor: [NGX] INTERCEPT #%d: Output %p -> %p k=%.2f %ux%u",
+                 s_n, original_output, g_intermediate_buffer, k, fake_w, fake_h);
+    }
+
+    // ── Call original — DLSS writes to intermediate ──
+    NVSDK_NGX_Result result = g_orig_NGX_EvaluateFeature(cmd_list, feature_handle, params, callback);
+
+    // ── Restore original Output ──
+    __try {
+        fnSet(params, "Output", original_output);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("NGXInterceptor: SEH restoring Output");
+    }
+
+    if (result != 0x1) { // NVSDK_NGX_Result_Success = 0x1
+        static int s_e = 0;
+        if (++s_e <= 3) LOG_WARN("NGXInterceptor: NGX eval returned 0x%X", result);
+        return result;
+    }
+
+    // ── Lanczos downscale: intermediate (k*D) → original output (D) ──
+    Lanczos_Dispatch(cmd_list,
+                     g_intermediate_buffer, original_output,
+                     fake_w, fake_h, game_w, game_h);
+
+    if (s_n <= 5 || (s_n % 300) == 0) {
+        LOG_INFO("NGXInterceptor: [NGX] DONE #%d %ux%u -> %ux%u", s_n, fake_w, fake_h, game_w, game_h);
+    }
+
+    return result;
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // Hook installation helpers
 // ══════════════════════════════════════════════════════════════════════
+
+static bool InstallNGXEvaluateHook(HMODULE hDll) {
+    if (g_ngx_eval_hooked) return true;
+
+    auto proc = GetProcAddress(hDll, "NVSDK_NGX_D3D12_EvaluateFeature");
+    if (!proc) {
+        LOG_DEBUG("NGXInterceptor: NVSDK_NGX_D3D12_EvaluateFeature not found");
+        return false;
+    }
+
+    MH_STATUS status = MH_CreateHook(
+        reinterpret_cast<void*>(proc),
+        reinterpret_cast<void*>(&Hooked_NGX_D3D12_EvaluateFeature),
+        reinterpret_cast<void**>(&g_orig_NGX_EvaluateFeature));
+
+    if (status != MH_OK) {
+        LOG_WARN("NGXInterceptor: MH_CreateHook for NGX EvaluateFeature failed (status=%d)",
+                 static_cast<int>(status));
+        return false;
+    }
+
+    status = MH_EnableHook(reinterpret_cast<void*>(proc));
+    if (status != MH_OK) {
+        LOG_WARN("NGXInterceptor: MH_EnableHook for NGX EvaluateFeature failed (status=%d)",
+                 static_cast<int>(status));
+        return false;
+    }
+
+    g_ngx_eval_hooked = true;
+    g_ngx_eval_target = reinterpret_cast<void*>(proc);
+    LOG_INFO("NGXInterceptor: NGX EvaluateFeature hook installed on _nvngx.dll");
+    return true;
+}
 
 static bool InstallCreateFeatureHook(HMODULE hDlssDll) {
     if (g_create_feature_hooked) return true;
@@ -531,13 +741,13 @@ void NGXInterceptor_OnDLSSDllLoaded(void* hModule) {
     HMODULE hDll = static_cast<HMODULE>(hModule);
     if (!hDll) return;
 
-    // In Streamline mode, only install CreateFeature hook for RR detection.
-    // Do NOT hook EvaluateFeature on proxy DLLs.
-    if (g_sl_eval_hooked) {
-        LOG_INFO("NGXInterceptor: Streamline hook active — skipping direct NGX hook on %p", hModule);
-    }
+    LOG_INFO("NGXInterceptor: _nvngx.dll loaded (%p), installing hooks", hModule);
 
-    // Always try to install CreateFeature hook for RR detection
+    // Install EvaluateFeature hook — this is the v5 approach that hooks
+    // at the real NGX level where parameters have standard vtable layout.
+    InstallNGXEvaluateHook(hDll);
+
+    // Install CreateFeature hook for RR detection
     InstallCreateFeatureHook(hDll);
 }
 
@@ -670,6 +880,14 @@ void NGXInterceptor_Shutdown() {
     g_sl_dlss_options_hooked = false;
     g_sl_settag_hooked = false;
     g_sl_settagframe_hooked = false;
+
+    // Direct NGX hook
+    if (g_ngx_eval_hooked && g_ngx_eval_target) {
+        MH_DisableHook(g_ngx_eval_target);
+        g_ngx_eval_hooked = false;
+        g_orig_NGX_EvaluateFeature = nullptr;
+        g_ngx_eval_target = nullptr;
+    }
 
     // Disable CreateFeature hook
     g_create_feature_hooked = false;
