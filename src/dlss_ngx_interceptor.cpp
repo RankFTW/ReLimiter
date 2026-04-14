@@ -327,8 +327,10 @@ static sl_Result __cdecl Hooked_slDLSSSetOptions(const void* viewport, const voi
     // resource yet. Overriding dimensions without swapping the output buffer
     // causes DLSS to write k*D pixels into a D-sized buffer -> corruption.
     void* game_output = g_game_output_resource.load(std::memory_order_relaxed);
+    uintptr_t game_output_addr = reinterpret_cast<uintptr_t>(game_output);
+    bool game_output_valid = game_output && game_output_addr > 0x10000 && game_output_addr < 0x00007FFFFFFFFFFF;
     if (!g_active.load(std::memory_order_relaxed) || k <= 1.01 ||
-        game_out_w == 0 || game_out_h == 0 || !game_output) {
+        game_out_w == 0 || game_out_h == 0 || !game_output_valid) {
         return g_orig_slDLSSSetOptions(viewport, options);
     }
 
@@ -434,12 +436,34 @@ static void CaptureOutputResource(const void* tags_ptr, uint32_t numTags) {
             if (buf_type == sl_kBufferTypeScalingOutputColor) {
                 auto* sl_resource = *reinterpret_cast<const uint8_t* const*>(tag + SL_TAG_OFFSET_RESOURCE);
                 if (sl_resource) {
+                    // Diagnostic: dump first 48 bytes of sl::Resource to find native pointer
+                    static bool s_res_dumped = false;
+                    if (!s_res_dumped) {
+                        s_res_dumped = true;
+                        LOG_INFO("NGXInterceptor: sl::Resource at %p, dumping first 48 bytes:", sl_resource);
+                        for (int off = 0; off < 48; off += 8) {
+                            void* val = *reinterpret_cast<void* const*>(sl_resource + off);
+                            LOG_INFO("NGXInterceptor:   +%d: %p", off, val);
+                        }
+                    }
+                    
                     void* native = *reinterpret_cast<void* const*>(sl_resource + SL_RESOURCE_OFFSET_NATIVE);
                     if (native) {
-                        void* prev = g_game_output_resource.exchange(native, std::memory_order_relaxed);
-                        if (prev != native) {
-                            LOG_INFO("NGXInterceptor: captured game output resource %p "
-                                     "(ScalingOutputColor, tag[%u])", native, i);
+                        // Validate: native should be a reasonable heap pointer
+                        uintptr_t addr = reinterpret_cast<uintptr_t>(native);
+                        if (addr > 0x10000 && addr < 0x00007FFFFFFFFFFF) {
+                            void* prev = g_game_output_resource.exchange(native, std::memory_order_relaxed);
+                            if (prev != native) {
+                                LOG_INFO("NGXInterceptor: captured game output resource %p "
+                                         "(ScalingOutputColor, tag[%u])", native, i);
+                            }
+                        } else {
+                            static bool s_bad_logged = false;
+                            if (!s_bad_logged) {
+                                s_bad_logged = true;
+                                LOG_WARN("NGXInterceptor: sl::Resource.native looks invalid: %p "
+                                         "(not a heap pointer)", native);
+                            }
                         }
                     }
                 }
