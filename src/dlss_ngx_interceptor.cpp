@@ -541,17 +541,6 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
         return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
     }
 
-    // ── DIAGNOSTIC: k > 1.0 but just passthrough + log for now ──
-    // The actual interception (resource swap + Lanczos) is disabled until
-    // we confirm the passthrough at k > 1.0 doesn't crash.
-    if (s_eval_count <= 5 || (s_eval_count % 300) == 0) {
-        LOG_INFO("NGXInterceptor: [NGX] k>1 passthrough #%d — k=%.2f params=%p",
-                 s_eval_count, k, params);
-    }
-    return g_orig_EvaluateFeature_dlss(cmd_list, feature_handle, params, callback);
-
-#if 0  // ── INTERCEPTION DISABLED FOR DIAGNOSTIC ──
-
     // ── Read the original output resource from NGX params ──
     void** param_vtable = nullptr;
     __try {
@@ -657,7 +646,6 @@ static NVSDK_NGX_Result __cdecl Hooked_EvaluateFeature_DLSS(
     }
 
     return result;
-#endif  // ── END INTERCEPTION DISABLED FOR DIAGNOSTIC ──
 }
 
 // ══════════════════════════════════════════════════════════════════════

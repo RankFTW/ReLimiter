@@ -107,9 +107,16 @@ static void on_destroy_device(reshade::api::device* device) {
     }
 
     // ── Adaptive DLSS Scaling: shutdown GPU-dependent modules ──
-    if (g_config.adaptive_dlss_scaling) {
-        Lanczos_Shutdown();
-        LOG_INFO("DLSS Scaling: GPU modules shut down (device destroy)");
+    // Only shut down for DX12 device destroy — NOT for DX11 launcher device.
+    // The DX11 launcher device gets destroyed/recreated periodically during
+    // gameplay, and shutting down Lanczos for it nulls g_device, causing
+    // crashes when the scheduler's tier transition calls Lanczos_Resize.
+    if (g_config.adaptive_dlss_scaling && device) {
+        auto api = device->get_api();
+        if (api == reshade::api::device_api::d3d12) {
+            Lanczos_Shutdown();
+            LOG_INFO("DLSS Scaling: GPU modules shut down (DX12 device destroy)");
+        }
     }
 
     SwapMgr_OnDestroyDevice(device);
