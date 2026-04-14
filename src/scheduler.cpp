@@ -173,13 +173,16 @@ void OnMarker(uint64_t frameID, int64_t now) {
     UpdateTier();
 
     // ── Adaptive DLSS Scaling: per-frame K_Controller update ──
-    // DIAGNOSTIC: K_Controller disabled to test if crash is timing-related
-    // (game crashes at ~13.5s regardless of tier transitions)
-    if (false && g_config.adaptive_dlss_scaling) {
+    if (g_config.adaptive_dlss_scaling) {
         double ema_fps = 0.0;
         double actual_ft = g_actual_frame_time_us.load(std::memory_order_relaxed);
         if (actual_ft > 0.0)
             ema_fps = 1000000.0 / actual_ft;
+
+        // Skip K_Controller update if we don't have valid FPS data yet
+        // (during loading screens, actual_frame_time is 0)
+        if (ema_fps <= 0.0) goto skip_dlss_update;
+        {
 
         int target_fps = g_user_target_fps.load(std::memory_order_relaxed);
         double target_fps_d = static_cast<double>(target_fps);
@@ -207,10 +210,12 @@ void OnMarker(uint64_t frameID, int64_t now) {
         // ── Sub-task 8.6: Tier transition orchestration (NGX-only approach) ──
         if (tier_changed) {
             KControllerState state = KController_GetState();
-            // NGXInterceptor_SetScalingParams(state.current_k, 3440, 1440);
+            NGXInterceptor_SetScalingParams(state.current_k, 3440, 1440);
             LOG_INFO("DLSS Scaling: tier changed to T%d k=%.2f",
                      state.current_tier, state.current_k);
         }
+        } // end ema_fps > 0 guard
+        skip_dlss_update:;
     }
 
     // Tier 4: suspended — passthrough
