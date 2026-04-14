@@ -822,8 +822,8 @@ void NGXInterceptor_OnDLSSDllLoaded(void* hModule) {
     LOG_INFO("NGXInterceptor: NGX DLL loaded (%p), attempting EvaluateFeature hook", hModule);
 
     __try {
-        // Install CreateFeature hook for Ray Reconstruction detection
-        InstallCreateFeatureHook(hDll);
+        // DIAGNOSTIC: skip CreateFeature hook — it may be corrupting Streamline
+        // InstallCreateFeatureHook(hDll);
 
         // Install EvaluateFeature hook — this is the core interception point
         if (InstallDirectNGXHook(hDll, "_nvngx.dll")) {
