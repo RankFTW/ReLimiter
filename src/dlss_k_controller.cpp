@@ -4,6 +4,7 @@
  */
 
 #include "dlss_k_controller.h"
+#include "logger.h"
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -179,6 +180,8 @@ bool KController_Update(double ema_fps, double target_fps,
         return false;
     }
 
+    // Compute thresholds
+
     // Track consecutive frames below/above thresholds
     // "below" = GPU struggling (render time exceeds budget)
     // "above" = GPU has headroom (render time well under budget)
@@ -197,6 +200,14 @@ bool KController_Update(double ema_fps, double target_fps,
     }
 
     int prev_tier = g_kc.current_tier;
+
+    // Diagnostic log
+    static int s_kc_log = 0;
+    if (++s_kc_log <= 3 || (s_kc_log % 600) == 0) {
+        LOG_INFO("KController: gpu=%.1fms tier=%d k=%.2f above=%d below=%d",
+                 gpu_time_ms, g_kc.current_tier, g_kc.tiers[g_kc.current_tier].k,
+                 g_kc.frames_above, g_kc.frames_below);
+    }
     bool transitioned = false;
 
     // Downward transition: drop tier (lower k, less quality, better perf)
