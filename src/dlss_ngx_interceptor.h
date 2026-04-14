@@ -55,10 +55,16 @@ NGXInterceptorState NGXInterceptor_GetState();
 // Returns true if Ray Reconstruction is detected.
 bool NGXInterceptor_IsRayReconstructionActive();
 
-// Called by loadlib_hooks.cpp when nvngx_dlss.dll is loaded.
-// In Streamline mode, this only installs CreateFeature hook for RR detection.
-// In non-Streamline mode, this installs the direct EvaluateFeature hook.
+// Called by loadlib_hooks.cpp when a proxy NGX DLL is loaded (_nvngx.dll, nvngx.dll).
+// Only installs CreateFeature hook for RR detection — does NOT hook EvaluateFeature
+// on proxy DLLs (doing so corrupts Streamline's dispatch).
 void NGXInterceptor_OnDLSSDllLoaded(void* hModule);
+
+// Called by loadlib_hooks.cpp when the actual DLSS model DLL is loaded
+// (nvngx_dlss.dll or nvngx_dlssd.dll). Installs the direct EvaluateFeature
+// hook on the model DLL — safe even with Streamline present since this is
+// the actual DLSS implementation, not a Streamline proxy.
+void NGXInterceptor_OnModelDllLoaded(void* hModule);
 
 // Called when sl.interposer.dll is loaded (from loadlib_hooks.cpp).
 // Installs the slEvaluateFeature hook — the preferred Streamline path.
