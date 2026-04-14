@@ -428,11 +428,22 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         LOG_INFO("ReShade events + OSD registered");
 
         // ── Adaptive DLSS Scaling: early init (hooks only, no device needed) ──
+        // DISABLED: The swapchain proxy approach (faking resolution via GetDesc)
+        // crashes games that validate swapchain dimensions against the window
+        // client area (e.g. Crimson Desert). The feature needs a redesigned
+        // approach — likely NGX-only interception without swapchain dimension
+        // lies. See design.md Requirement 1.5 for the anticipated failure mode.
+        //
+        // The config, OSD, K_Controller, and property tests remain functional
+        // for development iteration. Re-enable when the proxy approach is
+        // replaced with a safe alternative.
         if (g_config.adaptive_dlss_scaling) {
-            SwapProxy_Init();
-            LOG_INFO("DLSS Scaling: SwapProxy hooks installed");
-            NGXInterceptor_Init(g_config.dlss_scale_factor);
-            LOG_INFO("DLSS Scaling: NGXInterceptor initialized (s=%.2f)", g_config.dlss_scale_factor);
+            // SwapProxy_Init();
+            // LOG_INFO("DLSS Scaling: SwapProxy hooks installed");
+            // NGXInterceptor_Init(g_config.dlss_scale_factor);
+            // LOG_INFO("DLSS Scaling: NGXInterceptor initialized (s=%.2f)", g_config.dlss_scale_factor);
+            LOG_WARN("DLSS Scaling: proxy hooks DISABLED (pending safe implementation). "
+                     "Config/OSD/K_Controller infrastructure active for development.");
         }
 
     } __except(EXCEPTION_EXECUTE_HANDLER) {

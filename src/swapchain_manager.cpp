@@ -305,21 +305,10 @@ void SwapMgr_OnInitDevice(reshade::api::device* device) {
     }
 
     // ── Adaptive DLSS Scaling: init GPU-dependent modules on DX12 device ──
+    // DISABLED: Proxy hooks disabled, so Lanczos and MipCorrector have nothing to operate on.
+    // Re-enable when the swapchain proxy approach is replaced with a safe alternative.
     if (api == ActiveAPI::DX12 && g_config.adaptive_dlss_scaling) {
-        auto* d3d12_device = reinterpret_cast<ID3D12Device*>(device->get_native());
-        if (d3d12_device) {
-            if (Lanczos_Init(d3d12_device, DXGI_FORMAT_R8G8B8A8_UNORM)) {
-                LOG_INFO("DLSS Scaling: Lanczos shader initialized");
-            } else {
-                LOG_WARN("DLSS Scaling: Lanczos shader init failed (bilinear fallback)");
-            }
-            // MipCorrector disabled — vtable indices need validation per D3D12 runtime.
-            // TODO: Derive correct CreateSampler/CreateRootSignature vtable offsets
-            // from the SDK headers or use MinHook instead of raw vtable patching.
-            // MipCorrector_Init(d3d12_device);
-            // LOG_INFO("DLSS Scaling: MipCorrector initialized");
-            LOG_INFO("DLSS Scaling: MipCorrector skipped (vtable hook disabled pending validation)");
-        }
+        LOG_INFO("DLSS Scaling: GPU module init skipped (proxy hooks disabled)");
     }
 }
 
