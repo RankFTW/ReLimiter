@@ -205,6 +205,7 @@ void OnMarker(uint64_t frameID, int64_t now) {
         // ── Sub-task 8.6: Tier transition orchestration (NGX-only approach) ──
         if (tier_changed) {
             KControllerState state = KController_GetState();
+            NGXInterceptor_SetScalingParams(state.current_k, 3440, 1440);
             LOG_INFO("DLSS Scaling: tier changed to T%d k=%.2f",
                      state.current_tier, state.current_k);
         }
