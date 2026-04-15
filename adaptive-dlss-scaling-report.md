@@ -1,5 +1,28 @@
 # Adaptive DLSS Scaling — Comprehensive Technical Report
 
+---
+
+## TL;DR FOR HUMANS
+
+**What we're trying to do**: Make DLSS upscale to a bigger resolution than the screen (e.g. 6020×2520 instead of 3440×1440), then shrink it back down with a high-quality Lanczos filter. This gives you a sharper image because DLSS is doing more work. The "adaptive" part means we automatically pick how much bigger based on how much GPU headroom you have — if your GPU is barely sweating, we crank it up; if it's struggling, we back off.
+
+**What game**: Crimson Desert. It uses NVIDIA's "Streamline" framework, which is a middleware layer that sits between the game and DLSS. The game never talks to DLSS directly — everything goes through Streamline.
+
+**What works**: Everything EXCEPT the actual interception. The brain that decides when to scale up/down (K_Controller) works perfectly. The shader that shrinks the image back down (Lanczos) works. The OSD, telemetry, tier system — all good. We can hook into every Streamline function, read the game's settings, see the output resource, read DLSS dimensions. The plumbing is all there.
+
+**What doesn't work**: Swapping the output texture. To make DLSS render bigger, we need to give it a bigger texture to write to. We tried 8 different ways to do this. Every single one either crashes the game (DEVICE_REMOVED) or produces a broken image (half the geometry missing).
+
+**Why it doesn't work**: Streamline is a control freak. When the game registers a texture with Streamline ("here's where DLSS should write"), Streamline memorizes everything about that texture — its size, format, and apparently the actual pointer address. If we swap in a different texture at ANY point — before registration, after registration, during evaluation, via local tags — Streamline detects the mismatch and kills the D3D12 device. We tried swapping before Streamline sees it, after, during, at the Streamline API level, at the NGX level inside the driver proxy — all crash.
+
+The one thing we CAN'T do is replace the DLSS DLL itself (like OptiScaler does), because we're a ReShade addon, not a DLL replacement. OptiScaler works because it IS the upscaler — it owns the output texture from the start. We're trying to modify someone else's texture from the outside, and Streamline won't let us.
+
+**What's next**: Three options:
+1. **OptiScaler integration** — Let OptiScaler handle the texture swap (it can), and we just tell it what multiplier to use via its config file. Requires user to install OptiScaler.
+2. **Post-DLSS sharpening** — Give up on making DLSS render bigger, and instead apply a sharpening/enhancement filter after DLSS finishes. Less impactful but actually works.
+3. **Non-Streamline games** — The feature would work as-is for games that use `nvngx_dlss.dll` directly (no Streamline). Those games expose the standard DLSS parameter interface where we CAN read and swap the output texture.
+
+---
+
 ## Executive Summary
 
 The goal is to intercept DLSS Super Resolution in Crimson Desert (DX12 + Streamline + DLSS-FG) to make DLSS upscale to a higher resolution (k×D) then Lanczos-3 downscale back to display resolution (D), dynamically adjusting k based on GPU headroom. After exhaustive testing of 8+ distinct approaches across ~20 builds, **we have not found a way to swap the DLSS output resource in a Streamline game without triggering DXGI_ERROR_DEVICE_REMOVED**. The supporting infrastructure (K_Controller, Lanczos shader, tier system, OSD, telemetry) all work correctly. The blocker is Streamline's resource management layer.
