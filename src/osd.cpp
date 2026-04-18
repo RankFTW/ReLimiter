@@ -285,7 +285,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             p.show_fps = true;
             p.show_frametime = true;
             p.show_gpu_temp = true;
-            OSDPreset_ApplyToConfig(p);
+            OSDPreset_ApplyTogglesOnly(p);
             config_dirty = true;
         }
         ImGui::SameLine();
@@ -303,7 +303,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             p.show_gpu_temp = true;
             p.show_gpu_usage = true;
             p.show_vram = true;
-            OSDPreset_ApplyToConfig(p);
+            OSDPreset_ApplyTogglesOnly(p);
             config_dirty = true;
         }
         ImGui::SameLine();
@@ -331,13 +331,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             p.show_vram = true;
             p.show_cpu_usage = true;
             p.show_ram = true;
-            OSDPreset_ApplyToConfig(p);
-            config_dirty = true;
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Off")) {
-            OSDPreset p = {};
-            OSDPreset_ApplyToConfig(p);
+            OSDPreset_ApplyTogglesOnly(p);
             config_dirty = true;
         }
 

@@ -145,11 +145,13 @@ void EnfDisp_OnPresent(int64_t now_qpc) {
 
         case EnforcementPath::NvAPIMarkers:
             // Marker-based: enforcement normally happens in Hook_SetLatencyMarker.
-            // Fallback to present-based when markers stop flowing (menus,
-            // loading screens, cutscenes). VkEnforce_OnPresent has its own
-            // AreNvAPIMarkersFlowing() guard that early-returns when markers
-            // resume, so the handoff back is automatic.
-            if (!AreNvAPIMarkersFlowing())
+            // Fallback to present-based when:
+            // 1. NvAPI markers stop flowing entirely (menus, loading, cutscenes)
+            // 2. NvAPI markers are flowing but the enforcement marker type never
+            //    fires (e.g., game sends RENDERSUBMIT_END but config expects
+            //    SIMULATION_START). Without this, the scheduler never runs,
+            //    deadlines go stale, and the presentation gate misbehaves.
+            if (!AreNvAPIMarkersFlowing() || !AreMarkersFlowing())
                 VkEnforce_OnPresent(now_qpc);
             break;
 

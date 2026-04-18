@@ -131,8 +131,11 @@ struct OSDPreset {
 // Snapshot current OSD toggles into a preset struct.
 OSDPreset OSDPreset_FromConfig();
 
-// Apply a preset struct to the live config.
+// Apply a preset struct to the live config (all fields including position).
 void OSDPreset_ApplyToConfig(const OSDPreset& p);
+
+// Apply only the element toggles from a preset (leaves position/scale/opacity unchanged).
+void OSDPreset_ApplyTogglesOnly(const OSDPreset& p);
 
 // Load/save user presets from/to INI.
 void OSDPreset_LoadAll();

@@ -341,6 +341,30 @@ void OSDPreset_ApplyToConfig(const OSDPreset& p) {
     g_config.osd_show_ram              = p.show_ram;
 }
 
+void OSDPreset_ApplyTogglesOnly(const OSDPreset& p) {
+    g_config.osd_show_fps              = p.show_fps;
+    g_config.osd_show_frametime        = p.show_frametime;
+    g_config.osd_show_frametime_graph  = p.show_frametime_graph;
+    g_config.osd_show_fg               = p.show_fg;
+    g_config.osd_show_limiter          = p.show_limiter;
+    g_config.osd_show_pqi              = p.show_pqi;
+    g_config.osd_show_cpu_latency      = p.show_cpu_latency;
+    g_config.osd_show_pqi_breakdown    = p.show_pqi_breakdown;
+    g_config.osd_show_1pct_low         = p.show_1pct_low;
+    g_config.osd_show_smoothness       = p.show_smoothness;
+    g_config.osd_show_adaptive_smoothing = p.show_adaptive_smoothing;
+    g_config.osd_show_0_1pct_low       = p.show_0_1pct_low;
+    g_config.osd_show_gpu_render_time  = p.show_gpu_render_time;
+    g_config.osd_show_total_frame_cost = p.show_total_frame_cost;
+    g_config.osd_show_fg_time          = p.show_fg_time;
+    g_config.osd_show_gpu_temp         = p.show_gpu_temp;
+    g_config.osd_show_gpu_clock        = p.show_gpu_clock;
+    g_config.osd_show_gpu_usage        = p.show_gpu_usage;
+    g_config.osd_show_vram             = p.show_vram;
+    g_config.osd_show_cpu_usage        = p.show_cpu_usage;
+    g_config.osd_show_ram              = p.show_ram;
+}
+
 int OSDPreset_GetCount() {
     return static_cast<int>(s_user_presets.size());
 }
