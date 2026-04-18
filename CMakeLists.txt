@@ -31,6 +31,7 @@ set(ADDON_SOURCES
     src/frame_splitting.cpp
     src/health.cpp
     src/hooks.cpp
+    src/hw_monitor.cpp
     src/hw_spin.cpp
     src/loadlib_hooks.cpp
     src/marker_log.cpp

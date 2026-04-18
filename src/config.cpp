@@ -172,11 +172,24 @@ void LoadConfig(HMODULE hModule) {
     g_config.smoothing_percentile    = ReadINIDouble(S, "smoothing_percentile", 0.99, P);
     g_config.smoothing_window        = ReadINIString(S, "smoothing_window", "medium", P);
     g_config.osd_show_adaptive_smoothing = ReadINIBool(S, "osd_show_adaptive_smoothing", false, P);
+    g_config.osd_show_0_1pct_low     = ReadINIBool(S, "osd_show_0_1pct_low", false, P);
+    g_config.osd_show_gpu_render_time = ReadINIBool(S, "osd_show_gpu_render_time", false, P);
+    g_config.osd_show_total_frame_cost = ReadINIBool(S, "osd_show_total_frame_cost", false, P);
+    g_config.osd_show_fg_time        = ReadINIBool(S, "osd_show_fg_time", false, P);
+    g_config.osd_show_gpu_temp       = ReadINIBool(S, "osd_show_gpu_temp", false, P);
+    g_config.osd_show_gpu_clock      = ReadINIBool(S, "osd_show_gpu_clock", false, P);
+    g_config.osd_show_gpu_usage      = ReadINIBool(S, "osd_show_gpu_usage", false, P);
+    g_config.osd_show_vram           = ReadINIBool(S, "osd_show_vram", false, P);
+    g_config.osd_show_cpu_usage      = ReadINIBool(S, "osd_show_cpu_usage", false, P);
+    g_config.osd_show_ram            = ReadINIBool(S, "osd_show_ram", false, P);
 
     LOG_INFO("Config: values read, calling ApplyConfig...");
     ValidateConfig();
     ApplyConfig();
     LOG_INFO("Config: ApplyConfig done");
+
+    // Load user OSD presets
+    OSDPreset_LoadAll();
 
     // Delete the entire section and rewrite it clean.
     // This purges stale keys left over from older versions.
@@ -225,6 +238,16 @@ void SaveConfig() {
     WriteINIDouble(S, "smoothing_percentile", g_config.smoothing_percentile, P);
     WriteINIString(S, "smoothing_window", g_config.smoothing_window.c_str(), P);
     WriteINIBool(S, "osd_show_adaptive_smoothing", g_config.osd_show_adaptive_smoothing, P);
+    WriteINIBool(S, "osd_show_0_1pct_low", g_config.osd_show_0_1pct_low, P);
+    WriteINIBool(S, "osd_show_gpu_render_time", g_config.osd_show_gpu_render_time, P);
+    WriteINIBool(S, "osd_show_total_frame_cost", g_config.osd_show_total_frame_cost, P);
+    WriteINIBool(S, "osd_show_fg_time", g_config.osd_show_fg_time, P);
+    WriteINIBool(S, "osd_show_gpu_temp", g_config.osd_show_gpu_temp, P);
+    WriteINIBool(S, "osd_show_gpu_clock", g_config.osd_show_gpu_clock, P);
+    WriteINIBool(S, "osd_show_gpu_usage", g_config.osd_show_gpu_usage, P);
+    WriteINIBool(S, "osd_show_vram", g_config.osd_show_vram, P);
+    WriteINIBool(S, "osd_show_cpu_usage", g_config.osd_show_cpu_usage, P);
+    WriteINIBool(S, "osd_show_ram", g_config.osd_show_ram, P);
 }
 
 void ApplyConfig() {
@@ -246,4 +269,225 @@ void ApplyConfig() {
         g_config.smoothing_window == "dual",
         g_config.smoothing_percentile,
         g_config.adaptive_smoothing);
+}
+
+
+// ── OSD Presets ──
+
+#include <vector>
+static std::vector<OSDPreset> s_user_presets;
+
+static void EnsureMinSlots() {
+    while (static_cast<int>(s_user_presets.size()) < OSD_INITIAL_PRESET_SLOTS)
+        s_user_presets.push_back({});
+}
+
+OSDPreset OSDPreset_FromConfig() {
+    OSDPreset p = {};
+    p.osd_x                 = g_config.osd_x;
+    p.osd_y                 = g_config.osd_y;
+    p.osd_scale             = g_config.osd_scale;
+    p.osd_opacity           = g_config.osd_opacity;
+    p.show_fps              = g_config.osd_show_fps;
+    p.show_frametime        = g_config.osd_show_frametime;
+    p.show_frametime_graph  = g_config.osd_show_frametime_graph;
+    p.show_fg               = g_config.osd_show_fg;
+    p.show_limiter          = g_config.osd_show_limiter;
+    p.show_pqi              = g_config.osd_show_pqi;
+    p.show_cpu_latency      = g_config.osd_show_cpu_latency;
+    p.show_pqi_breakdown    = g_config.osd_show_pqi_breakdown;
+    p.show_1pct_low         = g_config.osd_show_1pct_low;
+    p.show_smoothness       = g_config.osd_show_smoothness;
+    p.show_adaptive_smoothing = g_config.osd_show_adaptive_smoothing;
+    p.show_0_1pct_low       = g_config.osd_show_0_1pct_low;
+    p.show_gpu_render_time  = g_config.osd_show_gpu_render_time;
+    p.show_total_frame_cost = g_config.osd_show_total_frame_cost;
+    p.show_fg_time          = g_config.osd_show_fg_time;
+    p.show_gpu_temp         = g_config.osd_show_gpu_temp;
+    p.show_gpu_clock        = g_config.osd_show_gpu_clock;
+    p.show_gpu_usage        = g_config.osd_show_gpu_usage;
+    p.show_vram             = g_config.osd_show_vram;
+    p.show_cpu_usage        = g_config.osd_show_cpu_usage;
+    p.show_ram              = g_config.osd_show_ram;
+    p.occupied              = true;
+    return p;
+}
+
+void OSDPreset_ApplyToConfig(const OSDPreset& p) {
+    g_config.osd_x                     = p.osd_x;
+    g_config.osd_y                     = p.osd_y;
+    g_config.osd_scale                 = p.osd_scale;
+    g_config.osd_opacity               = p.osd_opacity;
+    g_config.osd_show_fps              = p.show_fps;
+    g_config.osd_show_frametime        = p.show_frametime;
+    g_config.osd_show_frametime_graph  = p.show_frametime_graph;
+    g_config.osd_show_fg               = p.show_fg;
+    g_config.osd_show_limiter          = p.show_limiter;
+    g_config.osd_show_pqi              = p.show_pqi;
+    g_config.osd_show_cpu_latency      = p.show_cpu_latency;
+    g_config.osd_show_pqi_breakdown    = p.show_pqi_breakdown;
+    g_config.osd_show_1pct_low         = p.show_1pct_low;
+    g_config.osd_show_smoothness       = p.show_smoothness;
+    g_config.osd_show_adaptive_smoothing = p.show_adaptive_smoothing;
+    g_config.osd_show_0_1pct_low       = p.show_0_1pct_low;
+    g_config.osd_show_gpu_render_time  = p.show_gpu_render_time;
+    g_config.osd_show_total_frame_cost = p.show_total_frame_cost;
+    g_config.osd_show_fg_time          = p.show_fg_time;
+    g_config.osd_show_gpu_temp         = p.show_gpu_temp;
+    g_config.osd_show_gpu_clock        = p.show_gpu_clock;
+    g_config.osd_show_gpu_usage        = p.show_gpu_usage;
+    g_config.osd_show_vram             = p.show_vram;
+    g_config.osd_show_cpu_usage        = p.show_cpu_usage;
+    g_config.osd_show_ram              = p.show_ram;
+}
+
+int OSDPreset_GetCount() {
+    return static_cast<int>(s_user_presets.size());
+}
+
+OSDPreset& OSDPreset_GetSlot(int slot) {
+    EnsureMinSlots();
+    if (slot < 0) slot = 0;
+    if (slot >= static_cast<int>(s_user_presets.size()))
+        slot = static_cast<int>(s_user_presets.size()) - 1;
+    return s_user_presets[slot];
+}
+
+int OSDPreset_AddSlot() {
+    if (static_cast<int>(s_user_presets.size()) >= OSD_MAX_PRESET_SLOTS)
+        return -1;
+    s_user_presets.push_back({});
+    return static_cast<int>(s_user_presets.size()) - 1;
+}
+
+static void ReadPresetFromINI(int i, const char* P) {
+    char section[32];
+    snprintf(section, sizeof(section), "OSD_Preset_%d", i + 1);
+    const char* S = section;
+
+    std::string name = ReadINIString(S, "name", "", P);
+    if (name.empty()) return;
+
+    // Ensure vector is large enough
+    while (static_cast<int>(s_user_presets.size()) <= i)
+        s_user_presets.push_back({});
+
+    OSDPreset& p = s_user_presets[i];
+    snprintf(p.name, sizeof(p.name), "%s", name.c_str());
+    p.occupied              = true;
+    p.osd_x                 = static_cast<float>(ReadINIDouble(S, "osd_x", 0.005, P));
+    p.osd_y                 = static_cast<float>(ReadINIDouble(S, "osd_y", 0.005, P));
+    p.osd_scale             = static_cast<float>(ReadINIDouble(S, "osd_scale", 1.0, P));
+    p.osd_opacity           = static_cast<float>(ReadINIDouble(S, "osd_opacity", 0.6, P));
+    p.show_fps              = ReadINIBool(S, "show_fps", false, P);
+    p.show_frametime        = ReadINIBool(S, "show_frametime", false, P);
+    p.show_frametime_graph  = ReadINIBool(S, "show_frametime_graph", false, P);
+    p.show_fg               = ReadINIBool(S, "show_fg", false, P);
+    p.show_limiter          = ReadINIBool(S, "show_limiter", false, P);
+    p.show_pqi              = ReadINIBool(S, "show_pqi", false, P);
+    p.show_cpu_latency      = ReadINIBool(S, "show_cpu_latency", false, P);
+    p.show_pqi_breakdown    = ReadINIBool(S, "show_pqi_breakdown", false, P);
+    p.show_1pct_low         = ReadINIBool(S, "show_1pct_low", false, P);
+    p.show_smoothness       = ReadINIBool(S, "show_smoothness", false, P);
+    p.show_adaptive_smoothing = ReadINIBool(S, "show_adaptive_smoothing", false, P);
+    p.show_0_1pct_low       = ReadINIBool(S, "show_0_1pct_low", false, P);
+    p.show_gpu_render_time  = ReadINIBool(S, "show_gpu_render_time", false, P);
+    p.show_total_frame_cost = ReadINIBool(S, "show_total_frame_cost", false, P);
+    p.show_fg_time          = ReadINIBool(S, "show_fg_time", false, P);
+    p.show_gpu_temp         = ReadINIBool(S, "show_gpu_temp", false, P);
+    p.show_gpu_clock        = ReadINIBool(S, "show_gpu_clock", false, P);
+    p.show_gpu_usage        = ReadINIBool(S, "show_gpu_usage", false, P);
+    p.show_vram             = ReadINIBool(S, "show_vram", false, P);
+    p.show_cpu_usage        = ReadINIBool(S, "show_cpu_usage", false, P);
+    p.show_ram              = ReadINIBool(S, "show_ram", false, P);
+}
+
+void OSDPreset_LoadAll() {
+    if (s_ini_path[0] == '\0') return;
+    const char* P = s_ini_path;
+
+    s_user_presets.clear();
+
+    // Scan up to OSD_MAX_PRESET_SLOTS sections
+    for (int i = 0; i < OSD_MAX_PRESET_SLOTS; i++) {
+        ReadPresetFromINI(i, P);
+    }
+
+    // Ensure at least the initial 3 slots exist
+    EnsureMinSlots();
+}
+
+void OSDPreset_SaveSlot(int slot) {
+    if (s_ini_path[0] == '\0') return;
+    if (slot < 0 || slot >= static_cast<int>(s_user_presets.size())) return;
+    const char* P = s_ini_path;
+
+    char section[32];
+    snprintf(section, sizeof(section), "OSD_Preset_%d", slot + 1);
+    const char* S = section;
+
+    // Clear the section first to remove stale keys
+    WritePrivateProfileStringA(S, nullptr, nullptr, P);
+
+    const OSDPreset& p = s_user_presets[slot];
+    if (!p.occupied) return;
+
+    WriteINIString(S, "name", p.name, P);
+    WriteINIDouble(S, "osd_x", p.osd_x, P);
+    WriteINIDouble(S, "osd_y", p.osd_y, P);
+    WriteINIDouble(S, "osd_scale", p.osd_scale, P);
+    WriteINIDouble(S, "osd_opacity", p.osd_opacity, P);
+    WriteINIBool(S, "show_fps", p.show_fps, P);
+    WriteINIBool(S, "show_frametime", p.show_frametime, P);
+    WriteINIBool(S, "show_frametime_graph", p.show_frametime_graph, P);
+    WriteINIBool(S, "show_fg", p.show_fg, P);
+    WriteINIBool(S, "show_limiter", p.show_limiter, P);
+    WriteINIBool(S, "show_pqi", p.show_pqi, P);
+    WriteINIBool(S, "show_cpu_latency", p.show_cpu_latency, P);
+    WriteINIBool(S, "show_pqi_breakdown", p.show_pqi_breakdown, P);
+    WriteINIBool(S, "show_1pct_low", p.show_1pct_low, P);
+    WriteINIBool(S, "show_smoothness", p.show_smoothness, P);
+    WriteINIBool(S, "show_adaptive_smoothing", p.show_adaptive_smoothing, P);
+    WriteINIBool(S, "show_0_1pct_low", p.show_0_1pct_low, P);
+    WriteINIBool(S, "show_gpu_render_time", p.show_gpu_render_time, P);
+    WriteINIBool(S, "show_total_frame_cost", p.show_total_frame_cost, P);
+    WriteINIBool(S, "show_fg_time", p.show_fg_time, P);
+    WriteINIBool(S, "show_gpu_temp", p.show_gpu_temp, P);
+    WriteINIBool(S, "show_gpu_clock", p.show_gpu_clock, P);
+    WriteINIBool(S, "show_gpu_usage", p.show_gpu_usage, P);
+    WriteINIBool(S, "show_vram", p.show_vram, P);
+    WriteINIBool(S, "show_cpu_usage", p.show_cpu_usage, P);
+    WriteINIBool(S, "show_ram", p.show_ram, P);
+}
+
+void OSDPreset_DeleteSlot(int slot) {
+    if (slot < 0 || slot >= static_cast<int>(s_user_presets.size())) return;
+
+    // Remove the INI section
+    if (s_ini_path[0] != '\0') {
+        char section[32];
+        snprintf(section, sizeof(section), "OSD_Preset_%d", slot + 1);
+        WritePrivateProfileStringA(section, nullptr, nullptr, s_ini_path);
+    }
+
+    // Remove from vector (shifts higher slots down)
+    s_user_presets.erase(s_user_presets.begin() + slot);
+
+    // Re-save all remaining slots so INI indices stay contiguous
+    // First clear all old sections up to max
+    if (s_ini_path[0] != '\0') {
+        for (int i = slot; i < OSD_MAX_PRESET_SLOTS; i++) {
+            char section[32];
+            snprintf(section, sizeof(section), "OSD_Preset_%d", i + 1);
+            WritePrivateProfileStringA(section, nullptr, nullptr, s_ini_path);
+        }
+        // Re-write remaining slots
+        for (int i = slot; i < static_cast<int>(s_user_presets.size()); i++) {
+            if (s_user_presets[i].occupied)
+                OSDPreset_SaveSlot(i);
+        }
+    }
+
+    // Ensure minimum slots
+    EnsureMinSlots();
 }

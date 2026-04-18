@@ -76,9 +76,79 @@ struct Config {
 
     // OSD: Adaptive Smoothing
     bool osd_show_adaptive_smoothing = false;
+
+    // OSD: Hardware monitoring
+    bool osd_show_0_1pct_low = false;
+    bool osd_show_gpu_render_time = false;
+    bool osd_show_total_frame_cost = false;
+    bool osd_show_fg_time = false;
+    bool osd_show_gpu_temp = false;
+    bool osd_show_gpu_clock = false;
+    bool osd_show_gpu_usage = false;
+    bool osd_show_vram = false;
+    bool osd_show_cpu_usage = false;
+    bool osd_show_ram = false;
 };
 
 extern Config g_config;
+
+// ── OSD Presets ──
+static constexpr int OSD_INITIAL_PRESET_SLOTS = 3;
+static constexpr int OSD_MAX_PRESET_SLOTS = 16;
+
+struct OSDPreset {
+    char name[32] = {};
+    // Position & appearance
+    float osd_x = 0.005f;
+    float osd_y = 0.005f;
+    float osd_scale = 1.0f;
+    float osd_opacity = 0.6f;
+    // Element toggles
+    bool show_fps = false;
+    bool show_frametime = false;
+    bool show_frametime_graph = false;
+    bool show_fg = false;
+    bool show_limiter = false;
+    bool show_pqi = false;
+    bool show_cpu_latency = false;
+    bool show_pqi_breakdown = false;
+    bool show_1pct_low = false;
+    bool show_smoothness = false;
+    bool show_adaptive_smoothing = false;
+    bool show_0_1pct_low = false;
+    bool show_gpu_render_time = false;
+    bool show_total_frame_cost = false;
+    bool show_fg_time = false;
+    bool show_gpu_temp = false;
+    bool show_gpu_clock = false;
+    bool show_gpu_usage = false;
+    bool show_vram = false;
+    bool show_cpu_usage = false;
+    bool show_ram = false;
+    bool occupied = false;  // true if this slot has been saved to
+};
+
+// Snapshot current OSD toggles into a preset struct.
+OSDPreset OSDPreset_FromConfig();
+
+// Apply a preset struct to the live config.
+void OSDPreset_ApplyToConfig(const OSDPreset& p);
+
+// Load/save user presets from/to INI.
+void OSDPreset_LoadAll();
+void OSDPreset_SaveSlot(int slot);
+
+// Access user preset slots (0-based index).
+OSDPreset& OSDPreset_GetSlot(int slot);
+
+// Delete a user preset slot (clears from memory and INI).
+void OSDPreset_DeleteSlot(int slot);
+
+// Get current number of preset slots.
+int OSDPreset_GetCount();
+
+// Add a new empty preset slot. Returns the new slot index, or -1 if at max.
+int OSDPreset_AddSlot();
 
 // Returns true if no INI file existed before LoadConfig ran (first launch).
 bool Config_IsFirstLaunch();
