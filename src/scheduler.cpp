@@ -604,13 +604,14 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     bool present_based = false;
     bool frame_missed = false;
     double telemetry_gate_margin = 0.0;  // captured for CSV
-    // Overload hysteresis: enter at miss_ratio > 0.65, exit at < 0.30.
-    // Without hysteresis, the binary threshold at 0.5 causes rapid ON/OFF
-    // flipping when the game is borderline GPU-bound (CPU ≈ effective_interval).
-    // Each flip changes the gate and wake formula, adding discontinuities.
-    // Session 29 showed 44 transitions in 30s at the borderline.
-    // Simulator confirms hysteresis cuts flips from 26→12 with no impact
-    // on steady-state pacing (session 28: zero effect).
+    // ── Overload: telemetry-only ──
+    // The miss ratio tracks how often the deadline chain falls behind.
+    // This is published for OSD/predictor/stress detector but does NOT
+    // change the deadline formula or gate behavior. The gate self-disables
+    // for late frames (timestamp >= gate_target → passthrough), so there's
+    // no need to explicitly disable it during overload. Switching between
+    // two deadline/wake formulas based on overload state was the root cause
+    // of systematic overshoot/undershoot at every transition boundary.
     bool overload_active = g_overload_active_flag.load(std::memory_order_relaxed);
     if (!overload_active && s_miss_ratio > 0.65)
         overload_active = true;
@@ -622,66 +623,26 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         this_frame_deadline = now;
         s_last_present_deadline = now;
     } else {
-        bool will_gate = !s_background_mode && !overload_active && predictor_warm;
+        // ── Unified deadline chain ──
+        // Single formula regardless of GPU load. The chain advances by
+        // effective_interval each frame. When the deadline falls behind
+        // (frame took longer than interval), skip forward by whole
+        // intervals until the deadline is ahead of `now`. This preserves
+        // the chain's phase rather than re-anchoring to `now`, which
+        // would give the next frame a full interval budget and produce
+        // the characteristic undershoot after an overshoot.
+        int64_t next_deadline = s_last_present_deadline +
+            us_to_qpc(effective_interval);
 
-        int64_t next_deadline;
-
-        if (will_gate) {
-            // ── Gate-active deadline: chain without blend ──
-            // The chain advances by eff: next = prev + eff.
-            // The real SIM-to-SIM interval is eff + overhead (~700-800µs),
-            // so the deadline drifts backward by ~overhead per frame.
-            // This is correct — the chain naturally settles into a state
-            // where the deadline is slightly behind `now`, and the catch-up
-            // re-anchors it. The gate holds the present to the deadline,
-            // which is ~overhead before the next enforcement, producing
-            // telemetry_ft ≈ eff.
-            //
-            // The forward drift clamp is DISABLED when the gate is active.
-            // The clamp caused the deadline to get stuck at 1.15×eff when
-            // catch-up frames (short, ungated) pushed the drift up, creating
-            // regular short frames every 5-8 frames (session 51). The gate's
-            // own safety clamp (85% of effective interval) already prevents
-            // runaway holds from stale deadlines.
-            next_deadline = s_last_present_deadline +
-                us_to_qpc(effective_interval);
-
-            // Catch-up only (no forward clamp).
-            if (next_deadline < now) {
-                frame_missed = true;
-                next_deadline = now;
+        // Phase-preserving catch-up: skip whole intervals.
+        if (next_deadline < now) {
+            frame_missed = true;
+            int64_t eff_qpc = us_to_qpc(effective_interval);
+            if (eff_qpc > 0) {
+                int64_t behind = now - next_deadline;
+                int64_t skip = (behind / eff_qpc) + 1;
+                next_deadline += skip * eff_qpc;
             }
-        } else {
-            // ── No-gate deadline: chain with blend ──
-            // Without the gate, the chain's integrator smooths enforcement
-            // noise. The blend tracks reality to reduce lag-1 oscillation.
-            next_deadline = s_last_present_deadline +
-                us_to_qpc(effective_interval);
-
-            static constexpr double DEADLINE_BLEND = 0.25;
-            double prev_ft = g_actual_frame_time_us.load(std::memory_order_relaxed);
-            if (prev_ft > 0.0 &&
-                prev_ft < effective_interval * 2.0 &&
-                prev_ft > effective_interval * 0.5) {
-                double blended = effective_interval * (1.0 - DEADLINE_BLEND)
-                               + prev_ft * DEADLINE_BLEND;
-                next_deadline = s_last_present_deadline + us_to_qpc(blended);
-            }
-        }
-
-        // Catch-up and forward drift clamp for the no-gate path only.
-        // The gate-active path handles its own catch-up above and doesn't
-        // need the forward clamp — the gate's safety clamp (85% of eff)
-        // prevents runaway holds.
-        if (!will_gate) {
-            if (next_deadline < now) {
-                frame_missed = true;
-                next_deadline = now;
-            }
-
-            int64_t max_deadline = now + us_to_qpc(effective_interval * 1.15);
-            if (next_deadline > max_deadline)
-                next_deadline = max_deadline;
         }
 
         this_frame_deadline = next_deadline;
@@ -692,7 +653,6 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         s_miss_ratio += MISS_EMA_ALPHA * (miss_sample - s_miss_ratio);
 
         // Publish for external consumers (OSD, predictor, stress detector).
-        // Re-evaluate with hysteresis after miss ratio update.
         if (!overload_active && s_miss_ratio > 0.65)
             overload_active = true;
         else if (overload_active && s_miss_ratio < 0.30)
@@ -803,73 +763,22 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
             // amplifies any constant added to frame_cost within ~7 frames.
             double frame_cost = s_ema_non_sleep_us;
 
-            // Presentation-aware correction: use direct Reflex pipeline
-            // measurement when available (per-frame, ~2-3 frame report delay,
-            // sub-100µs precision). Falls back to the slow EMA for non-Reflex
-            // paths (DX11, non-Reflex DX12).
+            // Wake formula: deadline - frame_cost - wake_guard - gate_margin
             //
-            // The Reflex measurement is the DX12 equivalent of
-            // VK_EXT_present_timing's per-stage timestamps — it tells us
-            // exactly how long the frame sits in the driver/GPU pipeline
-            // after the present call. This replaces the 12-frame EMA
-            // response time with ~3-frame latency.
-            double present_latency_correction = 0.0;
-            double reflex_pipeline = g_reflex_pipeline_latency_us.load(
-                std::memory_order_relaxed);
-            if (reflex_pipeline > 0.0 && reflex_pipeline < 3000.0) {
-                present_latency_correction = reflex_pipeline;
-            } else {
-                present_latency_correction = s_ema_present_latency_us;
-            }
-
-            // Queue trend preemption: DISABLED.
-            // Session 37 data showed queue_trend has stdev=952µs with
-            // mean=-1µs — pure noise. Injecting 0.3× of this into the
-            // wake formula adds up to 539µs of random perturbation per
-            // frame, larger than the enforcement stdev (204µs). This
-            // directly degrades pacing consistency.
-            double queue_preempt_us = 0.0;
-
-            // Wake formula: deadline - frame_cost - wake_guard - corrections
-            //
-            // When the gate is active, it handles phase stabilization by
-            // holding the present to a fixed offset before the deadline.
-            // The cadence_bias and present_latency_correction are feedback
-            // loops that try to correct presentation drift by adjusting the
-            // wake time — but with the gate active, they fight the gate
-            // margin (the bias integrates the gate's earlier arrival as a
-            // systematic offset and tries to undo it). So when gating,
-            // only apply frame_cost + wake_guard + gate_margin.
-            //
-            // When the gate is inactive (overload, background, cold), the
-            // feedback corrections are the only mechanism for presentation
-            // drift correction, so they remain active.
+            // Unified formula: always include the gate margin. The gate
+            // self-disables for late frames (timestamp >= gate_target →
+            // passthrough), so the margin is only "used" when the frame
+            // arrives early enough to be gated. When GPU-bound, frame_cost
+            // ≈ effective_interval, so raw_wake ≈ now and there's no sleep
+            // regardless — the margin doesn't cause extra latency.
             //
             // Gate margin: fixed at 1500µs.
-            // Session 33-34 testing showed that adaptive margin (cv-based)
-            // destabilizes the coupled feedback loop between margin, sleep
-            // duration, actual frame time, and deadline blend. The adaptive
-            // margin changes the sleep budget, which changes actual_ft,
-            // which changes the deadline blend's contribution to gate
-            // headroom, which changes the gated fraction — creating a
-            // second-order feedback loop the simulator doesn't model.
-            // The fixed 1500µs margin is the validated sweet spot from
-            // session 30 (PI_sd=687, gate=57%, PQI=97.7).
             static constexpr double GATE_MARGIN_US = 1500.0;
             telemetry_gate_margin = GATE_MARGIN_US;
 
-            if (will_gate) {
-                raw_wake = next_deadline - us_to_qpc(frame_cost)
-                         - us_to_qpc(wake_guard)
-                         - us_to_qpc(GATE_MARGIN_US)
-                         - us_to_qpc(queue_preempt_us);
-            } else {
-                double cadence_bias = g_cadence_meter.bias_ctrl.GetBias();
-                raw_wake = next_deadline - us_to_qpc(frame_cost)
-                         - us_to_qpc(wake_guard) - us_to_qpc(cadence_bias)
-                         - us_to_qpc(present_latency_correction)
-                         - us_to_qpc(queue_preempt_us);
-            }
+            raw_wake = next_deadline - us_to_qpc(frame_cost)
+                     - us_to_qpc(wake_guard)
+                     - us_to_qpc(GATE_MARGIN_US);
         }
         raw_wake = (std::max)(raw_wake, now);
     }
@@ -895,12 +804,10 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     }
 
     // Publish deadline for PRESENT_START gate.
-    // this_frame_deadline is the deadline for the CURRENT frame's present,
-    // not the next frame's. The gate holds early-finishing frames until
-    // this deadline to avoid presenting above the VRR ceiling.
-    // When miss ratio is high, the gate is disabled — frames are already
-    // arriving late, so gating would only add latency.
-    bool gate_active = !s_background_mode && !overload_active && predictor_warm;
+    // Always publish — the gate self-disables for late frames
+    // (timestamp >= gate_target → passthrough). No need to explicitly
+    // disable it during overload.
+    bool gate_active = !s_background_mode && predictor_warm;
     if (gate_active) {
         g_next_deadline.store(this_frame_deadline, std::memory_order_relaxed);
     } else {
@@ -965,12 +872,10 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     MaybeUpdateSleepMode(effective_interval, should_sleep);
 
     // Feedback: drain correlator every frame, feed CadenceMeter.
-    // Suppress bias accumulation when the gate is active — the gate handles
-    // phase correction directly, and the bias controller would integrate
-    // the gate's earlier arrival as a systematic offset, saturating at the
-    // clamp and fighting the gate margin.
-    bool suppress_bias = overload_active || !predictor_warm ||
-                         s_background_mode || gate_active;
+    // Suppress bias accumulation — the gate handles phase correction
+    // directly, and the bias controller would integrate the gate's earlier
+    // arrival as a systematic offset.
+    bool suppress_bias = !predictor_warm || s_background_mode || gate_active;
     g_cadence_meter.SetSuppressed(suppress_bias);
     DrainCorrelator(overload_active, effective_interval);
 
@@ -985,9 +890,7 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         g_actual_frame_time_us.store(telemetry_ft, std::memory_order_relaxed);
 
     // Update deadline chain oscillation correction state.
-    // Only track when actively pacing — stalls and overload frames would
-    // produce huge deviations that contaminate the correction.
-    if (telemetry_ft > 0.0 && predictor_warm && !overload_active &&
+    if (telemetry_ft > 0.0 && predictor_warm &&
         telemetry_ft < effective_interval * 2.0) {
         s_prev_frame_deviation_us = telemetry_ft - effective_interval;
     } else {
@@ -995,16 +898,8 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     }
 
     // Smoothness: EMA of |actual - target| deviation, skipping outliers.
-    // When miss ratio is high, the target interval is unreachable. Measuring
-    // against it would report large deviation even though frame-to-frame
-    // consistency may be good. Use frame-to-frame delta instead.
     if (telemetry_ft > 0.0 && telemetry_ft < effective_interval * 4.0) {
-        double deviation;
-        if (overload_active && s_prev_actual_ft > 0.0) {
-            deviation = std::abs(telemetry_ft - s_prev_actual_ft);
-        } else {
-            deviation = std::abs(telemetry_ft - effective_interval);
-        }
+        double deviation = std::abs(telemetry_ft - effective_interval);
         double prev_smooth = g_smoothness_us.load(std::memory_order_relaxed);
         double smoothed = (prev_smooth > 0.0)
             ? prev_smooth + 0.16 * (deviation - prev_smooth)
@@ -1044,7 +939,7 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     // rather than pipeline latency, which would contaminate this EMA.
     bool reflex_pipeline_available =
         g_reflex_pipeline_latency_us.load(std::memory_order_relaxed) > 0.0;
-    if (predictor_warm && !overload_active && !present_based && !gate_active
+    if (predictor_warm && !present_based
         && !reflex_pipeline_available) {
         double pi = g_cadence_meter.present_interval_us.load(std::memory_order_relaxed);
         if (pi > 0.0 && telemetry_ft > 0.0 &&

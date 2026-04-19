@@ -1,6 +1,31 @@
 # Changelog
 
 
+## 3.1.7
+
+### Scheduler
+- **Fixed transition stuttering** — The scheduler no longer switches between two different formulas when the GPU goes from keeping up to falling behind. One unified formula handles both cases, eliminating the stutter that happened at every transition. (lazorr410)
+- **Smoother catch-up after dropped frames** — When a frame takes too long, the deadline now skips forward in whole intervals instead of resetting. This keeps the pacing rhythm intact instead of producing the overshoot-then-undershoot pattern.
+
+### New OSD Elements
+- **Hardware monitoring** — GPU temp, GPU clock, GPU usage, VRAM, CPU usage, and RAM are now available on the OSD. GPU temp is color-coded (green/yellow/red).
+- **0.1% Low FPS** — Catches rare hitches that 1% low misses.
+- **GPU Render Time** — Shows how long the GPU actually spends rendering each frame. Great for spotting GPU bottlenecks. (DX12+Reflex)
+- **Total Frame Cost** — The real cost of a frame before the limiter adds sleep. (DX12+Reflex)
+- **FG Time** — Shows Frame Generation overhead. Only visible when FG is active. (DX12+Reflex)
+
+### OSD Presets
+- **Quick presets** — Min, Med, and Full buttons to instantly switch what's shown on the OSD. These don't move the overlay — your position, scale, and opacity stay where you set them.
+- **Custom presets** — Save your own OSD layouts with a name. Each custom preset remembers which elements are on, plus the overlay position, scale, and opacity. Click to load, right-click to delete.
+- **Expandable slots** — Starts with 3 custom slots. Once all 3 are used, a `+` button appears to add more (up to 16).
+
+### UI
+- OSD element checkboxes now sit side by side within each category, separated by dashes. They wrap to the next line if the panel is narrow.
+
+### Bug Fixes
+- **Fixed crash in Death Stranding 2** — The game sends Reflex markers but not the type ReLimiter listens for, which left the scheduler stuck with stale data. Now correctly falls back to present-based pacing. Also fixes any other game with the same marker pattern.
+
+
 ## 3.1.6
 
 ### Notable Additions

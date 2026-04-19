@@ -24,6 +24,8 @@
 #include "presentation_gate.h"
 #include "flip_model.h"
 #include "adaptive_smoothing.h"
+#include "hw_monitor.h"
+#include "feedback.h"
 #include "logger.h"
 #include <string>
 #include <atomic>
@@ -272,15 +274,210 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         if (ImGui::IsItemDeactivatedAfterEdit()) config_dirty = true;
         HelpTip("Brightness of the OSD text. 1.0 = full white, 0.0 = black.");
 
+        // ── Presets ──
+        ImGui::Spacing();
+        ImGui::Text("Presets");
+
+        // Built-in presets
+        if (ImGui::Button("Min")) {
+            // Minimal: FPS + Frametime + GPU Temp
+            OSDPreset p = {};
+            p.show_fps = true;
+            p.show_frametime = true;
+            p.show_gpu_temp = true;
+            OSDPreset_ApplyTogglesOnly(p);
+            config_dirty = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Med")) {
+            // Medium: core diagnostics
+            OSDPreset p = {};
+            p.show_fps = true;
+            p.show_1pct_low = true;
+            p.show_frametime = true;
+            p.show_frametime_graph = true;
+            p.show_gpu_render_time = true;
+            p.show_pqi = true;
+            p.show_smoothness = true;
+            p.show_fg = true;
+            p.show_gpu_temp = true;
+            p.show_gpu_usage = true;
+            p.show_vram = true;
+            OSDPreset_ApplyTogglesOnly(p);
+            config_dirty = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Full")) {
+            // Full: everything on
+            OSDPreset p = {};
+            p.show_fps = true;
+            p.show_1pct_low = true;
+            p.show_0_1pct_low = true;
+            p.show_frametime = true;
+            p.show_frametime_graph = true;
+            p.show_cpu_latency = true;
+            p.show_gpu_render_time = true;
+            p.show_total_frame_cost = true;
+            p.show_fg_time = true;
+            p.show_pqi = true;
+            p.show_pqi_breakdown = true;
+            p.show_smoothness = true;
+            p.show_fg = true;
+            p.show_limiter = true;
+            p.show_adaptive_smoothing = true;
+            p.show_gpu_temp = true;
+            p.show_gpu_clock = true;
+            p.show_gpu_usage = true;
+            p.show_vram = true;
+            p.show_cpu_usage = true;
+            p.show_ram = true;
+            OSDPreset_ApplyTogglesOnly(p);
+            config_dirty = true;
+        }
+
+        // User preset slots (left-click = load, right-click = delete)
+        ImGui::SameLine();
+        ImGui::TextDisabled("|");
+        int preset_count = OSDPreset_GetCount();
+        for (int i = 0; i < preset_count; i++) {
+            ImGui::SameLine();
+            OSDPreset& slot = OSDPreset_GetSlot(i);
+            char label[40];
+            if (slot.occupied)
+                snprintf(label, sizeof(label), "%s##upreset%d", slot.name, i);
+            else
+                snprintf(label, sizeof(label), "---##upreset%d", i);
+            if (ImGui::Button(label)) {
+                if (slot.occupied) {
+                    OSDPreset_ApplyToConfig(slot);
+                    config_dirty = true;
+                }
+            }
+            // Right-click context menu for delete
+            if (slot.occupied) {
+                char ctx_id[32];
+                snprintf(ctx_id, sizeof(ctx_id), "##preset_ctx_%d", i);
+                if (ImGui::BeginPopupContextItem(ctx_id)) {
+                    char del_label[48];
+                    snprintf(del_label, sizeof(del_label), "Delete \"%s\"", slot.name);
+                    if (ImGui::Selectable(del_label)) {
+                        OSDPreset_DeleteSlot(i);
+                        config_dirty = true;
+                    }
+                    ImGui::EndPopup();
+                }
+            }
+        }
+
+        // Show [+] button only when all initial slots are occupied
+        {
+            bool all_initial_used = true;
+            int count = OSDPreset_GetCount();
+            int check_up_to = (count < OSD_INITIAL_PRESET_SLOTS) ? count : OSD_INITIAL_PRESET_SLOTS;
+            for (int i = 0; i < check_up_to; i++) {
+                if (!OSDPreset_GetSlot(i).occupied) {
+                    all_initial_used = false;
+                    break;
+                }
+            }
+            if (all_initial_used && count < OSD_MAX_PRESET_SLOTS) {
+                ImGui::SameLine();
+                if (ImGui::Button("+##add_preset")) {
+                    OSDPreset_AddSlot();
+                }
+            }
+        }
+
+        // Save current config to a user slot
+        {
+            static int s_save_slot = 0;
+            static char s_save_name[32] = {};
+            static bool s_save_popup = false;
+
+            ImGui::SameLine();
+            if (ImGui::Button("Save")) {
+                s_save_popup = true;
+                s_save_slot = 0;
+                snprintf(s_save_name, sizeof(s_save_name), "Preset %d",
+                         s_save_slot + 1);
+            }
+            HelpTip("Save the current OSD element selection to a user preset slot.");
+
+            if (s_save_popup) {
+                ImGui::OpenPopup("Save OSD Preset");
+                s_save_popup = false;
+            }
+            if (ImGui::BeginPopup("Save OSD Preset")) {
+                ImGui::Text("Save current OSD layout:");
+                ImGui::InputText("Name", s_save_name, sizeof(s_save_name));
+                // Slot selector — dynamic count
+                int count = OSDPreset_GetCount();
+                if (s_save_slot >= count) s_save_slot = count - 1;
+                if (s_save_slot < 0) s_save_slot = 0;
+                if (ImGui::BeginCombo("Slot", s_save_slot < count ?
+                        (OSDPreset_GetSlot(s_save_slot).occupied ?
+                         OSDPreset_GetSlot(s_save_slot).name : "---") : "---")) {
+                    for (int i = 0; i < count; i++) {
+                        char slot_label[48];
+                        OSDPreset& s = OSDPreset_GetSlot(i);
+                        if (s.occupied)
+                            snprintf(slot_label, sizeof(slot_label), "Slot %d: %s", i + 1, s.name);
+                        else
+                            snprintf(slot_label, sizeof(slot_label), "Slot %d: ---", i + 1);
+                        if (ImGui::Selectable(slot_label, s_save_slot == i))
+                            s_save_slot = i;
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::Spacing();
+                if (ImGui::Button("Save##confirm", ImVec2(80, 0))) {
+                    OSDPreset& slot = OSDPreset_GetSlot(s_save_slot);
+                    slot = OSDPreset_FromConfig();
+                    snprintf(slot.name, sizeof(slot.name), "%s", s_save_name);
+                    slot.occupied = true;
+                    OSDPreset_SaveSlot(s_save_slot);
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel", ImVec2(80, 0))) {
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+            }
+        }
+
         // ── Elements by category ──
+        // Layout: checkboxes flow horizontally, separated by " - ", wrapping on overflow.
+        // HelpTip is attached to each checkbox via its (?) marker.
+
+        // Helper lambda: place next checkbox on same line with dash separator,
+        // or wrap to next line if not enough room.
+        auto FlowSeparator = [&]() {
+            float avail = ImGui::GetContentRegionAvail().x;
+            float cursor = ImGui::GetCursorPosX();
+            // Estimate: dash ~20px + next checkbox ~120px minimum
+            float needed = 140.0f;
+            if (avail - cursor > needed) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("-");
+                ImGui::SameLine();
+            }
+        };
+
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.9f, 1.0f), "Performance");
         if (ImGui::Checkbox("FPS##osd_elem", &g_config.osd_show_fps)) config_dirty = true;
         HelpTip("Show the current FPS. When Frame Generation is active, shows both output and render FPS.");
+        FlowSeparator();
         if (ImGui::Checkbox("1%% Low##osd_elem", &g_config.osd_show_1pct_low)) config_dirty = true;
         HelpTip("Show the 1%% low FPS over a rolling window. Uses display FPS when Frame Generation is active.");
+        FlowSeparator();
+        if (ImGui::Checkbox("0.1%% Low##osd_elem", &g_config.osd_show_0_1pct_low)) config_dirty = true;
+        HelpTip("Show the 0.1%% low FPS over a rolling window. Requires more samples than 1%% low to stabilize.");
+        FlowSeparator();
         if (ImGui::Checkbox("Frametime##osd_elem", &g_config.osd_show_frametime)) config_dirty = true;
         HelpTip("Show the current frame time in milliseconds.");
+        FlowSeparator();
         if (ImGui::Checkbox("Frametime Graph##osd_elem", &g_config.osd_show_frametime_graph)) config_dirty = true;
         HelpTip("Show a rolling graph of recent frame times.");
 
@@ -288,17 +485,28 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Latency");
         if (ImGui::Checkbox("CPU Latency##osd_elem", &g_config.osd_show_cpu_latency)) config_dirty = true;
         HelpTip("CPU pipeline time: SIM_START to RENDERSUBMIT_END. Measures how long the CPU spends on simulation + render submission.");
+        FlowSeparator();
+        if (ImGui::Checkbox("GPU Render##osd_elem", &g_config.osd_show_gpu_render_time)) config_dirty = true;
+        HelpTip("GPU active render time in ms. Shows actual GPU work excluding idle bubbles. DX12+Reflex only.");
+        FlowSeparator();
+        if (ImGui::Checkbox("Frame Cost##osd_elem", &g_config.osd_show_total_frame_cost)) config_dirty = true;
+        HelpTip("Total frame cost: sim + render + GPU. The real cost of a frame before limiter sleep. DX12+Reflex only.");
+        FlowSeparator();
+        if (ImGui::Checkbox("FG Time##osd_elem", &g_config.osd_show_fg_time)) config_dirty = true;
+        HelpTip("DLSS Frame Generation time. Only appears when FG is active. Shows the FG overhead per frame. DX12+Reflex only.");
 
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "Quality");
         if (ImGui::Checkbox("PQI##osd_elem", &g_config.osd_show_pqi)) config_dirty = true;
         HelpTip("Pacing Quality Index: a 0-100%% composite score. Green=great, yellow=ok, red=poor.");
         if (g_config.osd_show_pqi) {
-            ImGui::Indent();
-            if (ImGui::Checkbox("Show Breakdown##osd_elem", &g_config.osd_show_pqi_breakdown)) config_dirty = true;
+            ImGui::SameLine();
+            ImGui::TextDisabled("-");
+            ImGui::SameLine();
+            if (ImGui::Checkbox("Breakdown##osd_elem", &g_config.osd_show_pqi_breakdown)) config_dirty = true;
             HelpTip("Show individual PQI sub-scores: cadence, stutter, and deadline.");
-            ImGui::Unindent();
         }
+        FlowSeparator();
         if (ImGui::Checkbox("Smoothness##osd_elem", &g_config.osd_show_smoothness)) config_dirty = true;
         HelpTip("Frame interval deviation from target in milliseconds. Lower = smoother. Green < 0.5ms, yellow < 1.5ms, red above. EMA-smoothed, skips loading screen outliers.");
 
@@ -306,8 +514,29 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Pipeline");
         if (ImGui::Checkbox("Frame Generation##osd_elem", &g_config.osd_show_fg)) config_dirty = true;
         HelpTip("Show whether DLSS Frame Generation is active and its multiplier.");
+        FlowSeparator();
         if (ImGui::Checkbox("Limiter / Tier##osd_elem", &g_config.osd_show_limiter)) config_dirty = true;
         HelpTip("Show how much time the limiter added and the current degradation tier (T0=full, T4=suspended).");
+
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "System");
+        if (ImGui::Checkbox("GPU Temp##osd_elem", &g_config.osd_show_gpu_temp)) config_dirty = true;
+        HelpTip("GPU core temperature in Celsius. Color-coded: green < 70C, yellow < 85C, red above. NVIDIA only.");
+        FlowSeparator();
+        if (ImGui::Checkbox("GPU Clock##osd_elem", &g_config.osd_show_gpu_clock)) config_dirty = true;
+        HelpTip("GPU core and memory clock speeds in MHz. NVIDIA only.");
+        FlowSeparator();
+        if (ImGui::Checkbox("GPU Usage##osd_elem", &g_config.osd_show_gpu_usage)) config_dirty = true;
+        HelpTip("GPU graphics engine utilization percentage. NVIDIA only.");
+        FlowSeparator();
+        if (ImGui::Checkbox("VRAM##osd_elem", &g_config.osd_show_vram)) config_dirty = true;
+        HelpTip("Video memory usage (used / total). NVIDIA only.");
+        FlowSeparator();
+        if (ImGui::Checkbox("CPU Usage##osd_elem", &g_config.osd_show_cpu_usage)) config_dirty = true;
+        HelpTip("System-wide CPU utilization percentage.");
+        FlowSeparator();
+        if (ImGui::Checkbox("RAM##osd_elem", &g_config.osd_show_ram)) config_dirty = true;
+        HelpTip("System RAM usage (used / total) in GB.");
     }
 
     // ════════════════════════════════════════════
@@ -760,6 +989,26 @@ static double Compute1PctLowFPS() {
     return 0.0;
 }
 
+static double Compute0_1PctLowFPS() {
+    if (s_low_history_count < 100) return 0.0; // Need more samples for 0.1%
+    int n = s_low_history_count < LOW_HISTORY_SIZE ? s_low_history_count : LOW_HISTORY_SIZE;
+    static double sorted_01[LOW_HISTORY_SIZE];
+    for (int i = 0; i < n; i++)
+        sorted_01[i] = s_low_history[i];
+    std::sort(sorted_01, sorted_01 + n);
+    // 0.1% low: average the slowest 0.1% of frame times, convert to FPS
+    int tail_start = static_cast<int>(0.999 * (n - 1));
+    int tail_count = n - tail_start;
+    if (tail_count < 1) tail_count = 1;
+    double sum = 0.0;
+    for (int i = tail_start; i < n; i++)
+        sum += sorted_01[i];
+    double avg_worst = sum / tail_count;
+    if (avg_worst > 0.0)
+        return 1000000.0 / avg_worst;
+    return 0.0;
+}
+
 // ── Category colors ──
 static ImVec4 ColPerf()     { float b = g_config.osd_text_brightness; return ImVec4(0.4f*b, 0.9f*b, 0.9f*b, 1.0f); }
 static ImVec4 ColLatency()  { float b = g_config.osd_text_brightness; return ImVec4(1.0f*b, 0.7f*b, 0.3f*b, 1.0f); }
@@ -902,6 +1151,9 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
 
     if (!g_config.osd_enabled) return;
 
+    // Update hardware sensors (throttled internally to ~1Hz)
+    HWMonitor_Update();
+
     // Real FPS from enforcement-to-enforcement interval (CPU frames only)
     // EMA-smoothed so the OSD number is readable instead of flickering.
     double ft = g_actual_frame_time_us.load(std::memory_order_relaxed);
@@ -999,6 +1251,15 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             }
         }
 
+        if (g_config.osd_show_0_1pct_low) {
+            double low01 = Compute0_1PctLowFPS();
+            if (low01 > 0.0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "0.1%% Low: %.0f", low01);
+                OSDTextColored(ColPerf(), buf);
+            }
+        }
+
         if (g_config.osd_show_frametime) {
             char buf[32];
             snprintf(buf, sizeof(buf), "%.2f ms", ft_ms);
@@ -1013,6 +1274,33 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             if (cpu_us > 0.0) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "CPU: %.1f ms", cpu_us / 1000.0);
+                OSDTextColored(ColLatency(), buf);
+            }
+        }
+
+        if (g_config.osd_show_gpu_render_time) {
+            double gpu_us = g_reflex_gpu_active_us.load(std::memory_order_relaxed);
+            if (gpu_us > 0.0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "GPU: %.1f ms", gpu_us / 1000.0);
+                OSDTextColored(ColLatency(), buf);
+            }
+        }
+
+        if (g_config.osd_show_total_frame_cost) {
+            double cost_us = g_reflex_total_frame_cost_us.load(std::memory_order_relaxed);
+            if (cost_us > 0.0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "Frame: %.1f ms", cost_us / 1000.0);
+                OSDTextColored(ColLatency(), buf);
+            }
+        }
+
+        if (g_config.osd_show_fg_time) {
+            double fg_us = g_reflex_ai_frame_time_us.load(std::memory_order_relaxed);
+            if (fg_us > 0.0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "FG: %.1f ms", fg_us / 1000.0);
                 OSDTextColored(ColLatency(), buf);
             }
         }
@@ -1116,6 +1404,64 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                     ? ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f)
                     : ImVec4(0.9f*b, 0.9f*b, 0.2f*b, 1.0f);
                 OSDTextColored(col, buf);
+            }
+        }
+
+        // ═══════════════════════════════════
+        // SYSTEM (grey — hardware sensors)
+        // ═══════════════════════════════════
+        {
+            const HWMonitorData& hw = HWMonitor_GetData();
+
+            // GPU metrics
+            if (g_config.osd_show_gpu_temp && hw.gpu_temp_c >= 0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "GPU Temp: %d C", hw.gpu_temp_c);
+                // Color: green < 70, yellow < 85, red >= 85
+                ImVec4 col;
+                float b = g_config.osd_text_brightness;
+                if (hw.gpu_temp_c < 70)       col = ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f);
+                else if (hw.gpu_temp_c < 85)  col = ImVec4(0.9f*b, 0.9f*b, 0.2f*b, 1.0f);
+                else                          col = ImVec4(0.9f*b, 0.2f*b, 0.2f*b, 1.0f);
+                OSDTextColored(col, buf);
+            }
+
+            if (g_config.osd_show_gpu_clock && hw.gpu_clock_mhz >= 0) {
+                char buf[48];
+                if (hw.gpu_mem_clock_mhz >= 0)
+                    snprintf(buf, sizeof(buf), "GPU Clock: %d / %d MHz", hw.gpu_clock_mhz, hw.gpu_mem_clock_mhz);
+                else
+                    snprintf(buf, sizeof(buf), "GPU Clock: %d MHz", hw.gpu_clock_mhz);
+                OSDTextColored(ColSystem(), buf);
+            }
+
+            if (g_config.osd_show_gpu_usage && hw.gpu_usage_pct >= 0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "GPU Load: %d%%", hw.gpu_usage_pct);
+                OSDTextColored(ColSystem(), buf);
+            }
+
+            if (g_config.osd_show_vram && hw.vram_used_mb >= 0 && hw.vram_total_mb > 0) {
+                char buf[48];
+                snprintf(buf, sizeof(buf), "VRAM: %lld / %lld MB",
+                         (long long)hw.vram_used_mb, (long long)hw.vram_total_mb);
+                OSDTextColored(ColSystem(), buf);
+            }
+
+            // CPU metrics
+            if (g_config.osd_show_cpu_usage && hw.cpu_usage_pct >= 0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "CPU Load: %d%%", hw.cpu_usage_pct);
+                OSDTextColored(ColSystem(), buf);
+            }
+
+            // RAM
+            if (g_config.osd_show_ram && hw.ram_used_mb >= 0 && hw.ram_total_mb > 0) {
+                char buf[48];
+                // Show in GB for readability
+                snprintf(buf, sizeof(buf), "RAM: %.1f / %.1f GB",
+                         hw.ram_used_mb / 1024.0, hw.ram_total_mb / 1024.0);
+                OSDTextColored(ColSystem(), buf);
             }
         }
 
