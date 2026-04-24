@@ -35,6 +35,7 @@ set(ADDON_SOURCES
     src/hw_spin.cpp
     src/loadlib_hooks.cpp
     src/marker_log.cpp
+    src/ngx_hooks.cpp
     src/nvapi_hooks.cpp
     src/osd.cpp
     src/pll.cpp
@@ -54,6 +55,7 @@ set(ADDON_SOURCES
     src/wake_guard.cpp
     src/logger.cpp
     src/csv_writer.cpp
+    src/dlss_presets.cpp
     src/pqi.cpp
     src/baseline.cpp
     src/vk_enforce.cpp

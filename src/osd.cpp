@@ -26,6 +26,8 @@
 #include "adaptive_smoothing.h"
 #include "hw_monitor.h"
 #include "feedback.h"
+#include "ngx_hooks.h"
+#include "dlss_presets.h"
 #include "logger.h"
 #include <string>
 #include <atomic>
@@ -331,6 +333,9 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             p.show_vram = true;
             p.show_cpu_usage = true;
             p.show_ram = true;
+            p.show_dlss_quality = true;
+            p.show_dlss_resolution = true;
+            p.show_dlss_presets = true;
             OSDPreset_ApplyTogglesOnly(p);
             config_dirty = true;
         }
@@ -517,6 +522,17 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         FlowSeparator();
         if (ImGui::Checkbox("Limiter / Tier##osd_elem", &g_config.osd_show_limiter)) config_dirty = true;
         HelpTip("Show how much time the limiter added and the current degradation tier (T0=full, T4=suspended).");
+
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "DLSS");
+        if (ImGui::Checkbox("Quality Level##osd_elem", &g_config.osd_show_dlss_quality)) config_dirty = true;
+        HelpTip("DLSS quality mode (DLAA/Quality/Balanced/Performance/Ultra Perf) and active features (SR/RR/FG). Requires DLSS game.");
+        FlowSeparator();
+        if (ImGui::Checkbox("Resolution##osd_elem", &g_config.osd_show_dlss_resolution)) config_dirty = true;
+        HelpTip("DLSS render resolution and output resolution. Shows DRS resolution when active.");
+        FlowSeparator();
+        if (ImGui::Checkbox("Presets##osd_elem", &g_config.osd_show_dlss_presets)) config_dirty = true;
+        HelpTip("DLSS SR preset (game-set hint) and driver override presets for SR/RR/FG if active.");
 
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "System");
@@ -1014,6 +1030,7 @@ static ImVec4 ColPerf()     { float b = g_config.osd_text_brightness; return ImV
 static ImVec4 ColLatency()  { float b = g_config.osd_text_brightness; return ImVec4(1.0f*b, 0.7f*b, 0.3f*b, 1.0f); }
 static ImVec4 ColPipeline() { float b = g_config.osd_text_brightness; return ImVec4(0.6f*b, 0.8f*b, 1.0f*b, 1.0f); }
 static ImVec4 ColSystem()   { float b = g_config.osd_text_brightness; return ImVec4(0.7f*b, 0.7f*b, 0.7f*b, 1.0f); }
+static ImVec4 ColDLSS()     { float b = g_config.osd_text_brightness; return ImVec4(0.5f*b, 1.0f*b, 0.5f*b, 1.0f); }
 static ImVec4 ColStatus()   { float b = g_config.osd_text_brightness; return ImVec4(1.0f*b, 0.3f*b, 0.3f*b, 1.0f); }
 
 static ImVec4 PQIColor(double score) {
@@ -1404,6 +1421,85 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                     ? ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f)
                     : ImVec4(0.9f*b, 0.9f*b, 0.2f*b, 1.0f);
                 OSDTextColored(col, buf);
+            }
+        }
+
+        // ═══════════════════════════════════
+        // DLSS (green — NGX feature info)
+        // ═══════════════════════════════════
+        {
+            NGXDLSSInfo dlss = NGXHooks_GetInfo();
+            DLSSPresets_Poll();
+            DLSSPresets presets = DLSSPresets_Get();
+
+            if (g_config.osd_show_dlss_quality && dlss.available) {
+                const char* quality_name = "Unknown";
+                if (dlss.dlaa) {
+                    quality_name = "DLAA";
+                } else {
+                    switch (dlss.quality_level) {
+                        case 0: quality_name = "Performance"; break;
+                        case 1: quality_name = "Balanced"; break;
+                        case 2: quality_name = "Quality"; break;
+                        case 3: quality_name = "Ultra Perf"; break;
+                        case 4: quality_name = "Ultra Quality"; break;
+                        case 5: quality_name = "DLAA"; break;
+                    }
+                }
+                char buf[64];
+                snprintf(buf, sizeof(buf), "DLSS: %s", quality_name);
+                OSDTextColored(ColDLSS(), buf);
+
+                // Feature flags
+                char feat_buf[64] = {};
+                int pos = 0;
+                if (dlss.sr_active) pos += snprintf(feat_buf + pos, sizeof(feat_buf) - pos, "SR");
+                if (dlss.rr_active) pos += snprintf(feat_buf + pos, sizeof(feat_buf) - pos, "%sRR", pos > 0 ? "+" : "");
+                if (dlss.fg_active) pos += snprintf(feat_buf + pos, sizeof(feat_buf) - pos, "%sFG", pos > 0 ? "+" : "");
+                if (pos > 0) {
+                    char line[80];
+                    snprintf(line, sizeof(line), "Features: %s", feat_buf);
+                    OSDTextColored(ColDLSS(), line);
+                }
+            }
+
+            if (g_config.osd_show_dlss_resolution && dlss.available && dlss.render_width > 0) {
+                char buf[80];
+                snprintf(buf, sizeof(buf), "Render: %ux%u -> %ux%u",
+                         dlss.render_width, dlss.render_height,
+                         dlss.output_width, dlss.output_height);
+                OSDTextColored(ColDLSS(), buf);
+            }
+
+            if (g_config.osd_show_dlss_presets) {
+                // Helper to convert preset index to letter
+                auto preset_letter = [](int idx) -> const char* {
+                    static char buf[8];
+                    if (idx <= 0) return "-";
+                    if (idx >= 1 && idx <= 26) {
+                        buf[0] = 'A' + static_cast<char>(idx - 1);
+                        buf[1] = '\0';
+                        return buf;
+                    }
+                    return "?";
+                };
+
+                // Show game-set SR preset from NGX CreateFeature
+                if (dlss.available && dlss.sr_preset >= 0) {
+                    char buf[48];
+                    snprintf(buf, sizeof(buf), "SR Preset: %s",
+                             dlss.sr_preset == 0 ? "Default" : preset_letter(dlss.sr_preset));
+                    OSDTextColored(ColDLSS(), buf);
+                }
+
+                // Show driver override presets from NvAPI (when available)
+                if (presets.available &&
+                    (presets.sr[0] != '-' || presets.rr[0] != '-' || presets.fg[0] != '-')) {
+                    char ovr[80];
+                    snprintf(ovr, sizeof(ovr), "Presets: SR=%s  RR=%s  FG=%s",
+                             presets.sr, presets.rr, presets.fg);
+                    OSDTextColored(ColDLSS(), ovr);
+                }
             }
         }
 

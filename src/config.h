@@ -88,6 +88,11 @@ struct Config {
     bool osd_show_vram = false;
     bool osd_show_cpu_usage = false;
     bool osd_show_ram = false;
+
+    // OSD: DLSS info
+    bool osd_show_dlss_quality = false;
+    bool osd_show_dlss_resolution = false;
+    bool osd_show_dlss_presets = false;
 };
 
 extern Config g_config;
@@ -125,6 +130,9 @@ struct OSDPreset {
     bool show_vram = false;
     bool show_cpu_usage = false;
     bool show_ram = false;
+    bool show_dlss_quality = false;
+    bool show_dlss_resolution = false;
+    bool show_dlss_presets = false;
     bool occupied = false;  // true if this slot has been saved to
 };
 
