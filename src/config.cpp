@@ -183,6 +183,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.osd_show_cpu_usage      = ReadINIBool(S, "osd_show_cpu_usage", false, P);
     g_config.osd_show_ram            = ReadINIBool(S, "osd_show_ram", false, P);
     g_config.osd_show_dlss_quality   = ReadINIBool(S, "osd_show_dlss_quality", false, P);
+    g_config.osd_show_dlss_features  = ReadINIBool(S, "osd_show_dlss_features", false, P);
     g_config.osd_show_dlss_resolution = ReadINIBool(S, "osd_show_dlss_resolution", false, P);
     g_config.osd_show_dlss_presets   = ReadINIBool(S, "osd_show_dlss_presets", false, P);
 
@@ -252,6 +253,8 @@ void SaveConfig() {
     WriteINIBool(S, "osd_show_cpu_usage", g_config.osd_show_cpu_usage, P);
     WriteINIBool(S, "osd_show_ram", g_config.osd_show_ram, P);
     WriteINIBool(S, "osd_show_dlss_quality", g_config.osd_show_dlss_quality, P);
+    WriteINIBool(S, "osd_show_dlss_features", g_config.osd_show_dlss_features, P);
+    WriteINIBool(S, "osd_show_dlss_resolution", g_config.osd_show_dlss_resolution, P);
     WriteINIBool(S, "osd_show_dlss_resolution", g_config.osd_show_dlss_resolution, P);
     WriteINIBool(S, "osd_show_dlss_presets", g_config.osd_show_dlss_presets, P);
 }
@@ -316,6 +319,7 @@ OSDPreset OSDPreset_FromConfig() {
     p.show_cpu_usage        = g_config.osd_show_cpu_usage;
     p.show_ram              = g_config.osd_show_ram;
     p.show_dlss_quality     = g_config.osd_show_dlss_quality;
+    p.show_dlss_features    = g_config.osd_show_dlss_features;
     p.show_dlss_resolution  = g_config.osd_show_dlss_resolution;
     p.show_dlss_presets     = g_config.osd_show_dlss_presets;
     p.occupied              = true;
@@ -349,6 +353,7 @@ void OSDPreset_ApplyToConfig(const OSDPreset& p) {
     g_config.osd_show_cpu_usage        = p.show_cpu_usage;
     g_config.osd_show_ram              = p.show_ram;
     g_config.osd_show_dlss_quality     = p.show_dlss_quality;
+    g_config.osd_show_dlss_features    = p.show_dlss_features;
     g_config.osd_show_dlss_resolution  = p.show_dlss_resolution;
     g_config.osd_show_dlss_presets     = p.show_dlss_presets;
 }
@@ -376,6 +381,7 @@ void OSDPreset_ApplyTogglesOnly(const OSDPreset& p) {
     g_config.osd_show_cpu_usage        = p.show_cpu_usage;
     g_config.osd_show_ram              = p.show_ram;
     g_config.osd_show_dlss_quality     = p.show_dlss_quality;
+    g_config.osd_show_dlss_features    = p.show_dlss_features;
     g_config.osd_show_dlss_resolution  = p.show_dlss_resolution;
     g_config.osd_show_dlss_presets     = p.show_dlss_presets;
 }
@@ -440,6 +446,7 @@ static void ReadPresetFromINI(int i, const char* P) {
     p.show_cpu_usage        = ReadINIBool(S, "show_cpu_usage", false, P);
     p.show_ram              = ReadINIBool(S, "show_ram", false, P);
     p.show_dlss_quality     = ReadINIBool(S, "show_dlss_quality", false, P);
+    p.show_dlss_features    = ReadINIBool(S, "show_dlss_features", false, P);
     p.show_dlss_resolution  = ReadINIBool(S, "show_dlss_resolution", false, P);
     p.show_dlss_presets     = ReadINIBool(S, "show_dlss_presets", false, P);
 }
@@ -501,6 +508,7 @@ void OSDPreset_SaveSlot(int slot) {
     WriteINIBool(S, "show_cpu_usage", p.show_cpu_usage, P);
     WriteINIBool(S, "show_ram", p.show_ram, P);
     WriteINIBool(S, "show_dlss_quality", p.show_dlss_quality, P);
+    WriteINIBool(S, "show_dlss_features", p.show_dlss_features, P);
     WriteINIBool(S, "show_dlss_resolution", p.show_dlss_resolution, P);
     WriteINIBool(S, "show_dlss_presets", p.show_dlss_presets, P);
 }

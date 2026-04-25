@@ -334,6 +334,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             p.show_cpu_usage = true;
             p.show_ram = true;
             p.show_dlss_quality = true;
+            p.show_dlss_features = true;
             p.show_dlss_resolution = true;
             p.show_dlss_presets = true;
             OSDPreset_ApplyTogglesOnly(p);
@@ -517,16 +518,19 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
 
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Pipeline");
-        if (ImGui::Checkbox("Frame Generation##osd_elem", &g_config.osd_show_fg)) config_dirty = true;
-        HelpTip("Show whether DLSS Frame Generation is active and its multiplier.");
-        FlowSeparator();
         if (ImGui::Checkbox("Limiter / Tier##osd_elem", &g_config.osd_show_limiter)) config_dirty = true;
         HelpTip("Show how much time the limiter added and the current degradation tier (T0=full, T4=suspended).");
 
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "DLSS");
+        if (ImGui::Checkbox("Frame Generation##osd_elem", &g_config.osd_show_fg)) config_dirty = true;
+        HelpTip("Show FG mode and multiplier (DLSS FG, Dynamic MFG, Smooth Motion).");
+        FlowSeparator();
         if (ImGui::Checkbox("Quality Level##osd_elem", &g_config.osd_show_dlss_quality)) config_dirty = true;
-        HelpTip("DLSS quality mode (DLAA/Quality/Balanced/Performance/Ultra Perf) and active features (SR/RR/FG). Requires DLSS game.");
+        HelpTip("DLSS quality mode (DLAA/Quality/Balanced/Performance/Ultra Perf). Requires DLSS game.");
+        FlowSeparator();
+        if (ImGui::Checkbox("Features##osd_elem", &g_config.osd_show_dlss_features)) config_dirty = true;
+        HelpTip("Active DLSS features: SR or RR (mutually exclusive) plus FG if active.");
         FlowSeparator();
         if (ImGui::Checkbox("Resolution##osd_elem", &g_config.osd_show_dlss_resolution)) config_dirty = true;
         HelpTip("DLSS render resolution and output resolution. Shows DRS resolution when active.");
@@ -1365,40 +1369,6 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         // ═══════════════════════════════════
         // PIPELINE (light blue)
         // ═══════════════════════════════════
-        if (g_config.osd_show_fg) {
-            char buf[48];
-            if (IsNvSmoothMotionActive()) {
-                snprintf(buf, sizeof(buf), "FG: Smooth Motion");
-            } else if (IsDmfgActive()) {
-                int actual_mult = g_fg_actual_multiplier.load(std::memory_order_relaxed);
-                int cap = g_dmfg_output_cap.load(std::memory_order_relaxed);
-                if (cap > 0) {
-                    if (actual_mult >= 2)
-                        snprintf(buf, sizeof(buf), "FG: Dynamic %dx [Cap: %d]", actual_mult, cap);
-                    else
-                        snprintf(buf, sizeof(buf), "FG: Dynamic [Cap: %d]", cap);
-                } else {
-                    if (actual_mult >= 2)
-                        snprintf(buf, sizeof(buf), "FG: Dynamic %dx", actual_mult);
-                    else {
-                        double output = g_output_fps.load(std::memory_order_relaxed);
-                        if (output > 0.0 && s_real_fps > 1.0) {
-                            int inferred = static_cast<int>(output / s_real_fps + 0.5);
-                            if (inferred >= 2 && inferred <= 8)
-                                snprintf(buf, sizeof(buf), "FG: Dynamic %dx", inferred);
-                            else
-                                snprintf(buf, sizeof(buf), "FG: Dynamic");
-                        } else {
-                            snprintf(buf, sizeof(buf), "FG: Dynamic");
-                        }
-                    }
-                }
-            } else {
-                snprintf(buf, sizeof(buf), "FG: %s", fg_label);
-            }
-            OSDTextColored(ColPipeline(), buf);
-        }
-
         if (g_config.osd_show_limiter && !IsDmfgActive()) {
             char buf[48];
             snprintf(buf, sizeof(buf), "Limiter: +%.1f ms  T%d", limiter_added_ms, tier);
@@ -1425,13 +1395,49 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         }
 
         // ═══════════════════════════════════
-        // DLSS (green — NGX feature info)
+        // DLSS (green — NGX feature info + FG)
         // ═══════════════════════════════════
         {
             NGXDLSSInfo dlss = NGXHooks_GetInfo();
             DLSSPresets_Poll();
             DLSSPresets presets = DLSSPresets_Get();
 
+            // FG status (moved from Pipeline — belongs with DLSS info)
+            if (g_config.osd_show_fg) {
+                char buf[48];
+                if (IsNvSmoothMotionActive()) {
+                    snprintf(buf, sizeof(buf), "FG: Smooth Motion");
+                } else if (IsDmfgActive()) {
+                    int actual_mult = g_fg_actual_multiplier.load(std::memory_order_relaxed);
+                    int cap = g_dmfg_output_cap.load(std::memory_order_relaxed);
+                    if (cap > 0) {
+                        if (actual_mult >= 2)
+                            snprintf(buf, sizeof(buf), "FG: Dynamic %dx [Cap: %d]", actual_mult, cap);
+                        else
+                            snprintf(buf, sizeof(buf), "FG: Dynamic [Cap: %d]", cap);
+                    } else {
+                        if (actual_mult >= 2)
+                            snprintf(buf, sizeof(buf), "FG: Dynamic %dx", actual_mult);
+                        else {
+                            double output = g_output_fps.load(std::memory_order_relaxed);
+                            if (output > 0.0 && s_real_fps > 1.0) {
+                                int inferred = static_cast<int>(output / s_real_fps + 0.5);
+                                if (inferred >= 2 && inferred <= 8)
+                                    snprintf(buf, sizeof(buf), "FG: Dynamic %dx", inferred);
+                                else
+                                    snprintf(buf, sizeof(buf), "FG: Dynamic");
+                            } else {
+                                snprintf(buf, sizeof(buf), "FG: Dynamic");
+                            }
+                        }
+                    }
+                } else {
+                    snprintf(buf, sizeof(buf), "FG: %s", fg_label);
+                }
+                OSDTextColored(ColDLSS(), buf);
+            }
+
+            // Quality level
             if (g_config.osd_show_dlss_quality && dlss.available) {
                 const char* quality_name = "Unknown";
                 if (dlss.dlaa) {
@@ -1449,13 +1455,18 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                 char buf[64];
                 snprintf(buf, sizeof(buf), "DLSS: %s", quality_name);
                 OSDTextColored(ColDLSS(), buf);
+            }
 
-                // Feature flags
+            // Features — SR and RR are mutually exclusive (RR replaces SR's denoiser)
+            if (g_config.osd_show_dlss_features && dlss.available) {
                 char feat_buf[64] = {};
                 int pos = 0;
-                if (dlss.sr_active) pos += snprintf(feat_buf + pos, sizeof(feat_buf) - pos, "SR");
-                if (dlss.rr_active) pos += snprintf(feat_buf + pos, sizeof(feat_buf) - pos, "%sRR", pos > 0 ? "+" : "");
-                if (dlss.fg_active) pos += snprintf(feat_buf + pos, sizeof(feat_buf) - pos, "%sFG", pos > 0 ? "+" : "");
+                if (dlss.rr_active)
+                    pos += snprintf(feat_buf + pos, sizeof(feat_buf) - pos, "RR");
+                else if (dlss.sr_active)
+                    pos += snprintf(feat_buf + pos, sizeof(feat_buf) - pos, "SR");
+                if (dlss.fg_active)
+                    pos += snprintf(feat_buf + pos, sizeof(feat_buf) - pos, "%sFG", pos > 0 ? "+" : "");
                 if (pos > 0) {
                     char line[80];
                     snprintf(line, sizeof(line), "Features: %s", feat_buf);

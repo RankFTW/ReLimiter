@@ -176,6 +176,23 @@ static void ExtractDlssParams(void* params, unsigned int feature_id) {
                 preset = tmp;
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+    // If the game didn't set a preset hint, use the DLSS 4.x SDK defaults.
+    // These are the presets the DLL uses internally when no hint is provided.
+    // DLSS 4.x (SDK 310+) defaults:
+    //   DLAA/UltraQuality/Quality/Balanced: K (index 11)
+    //   Performance: M (index 13)
+    //   Ultra Performance: L (index 12)
+    if (preset <= 0) {
+        switch (quality) {
+            case 0: preset = 13; break;  // Performance -> M
+            case 1: preset = 11; break;  // Balanced -> K
+            case 2: preset = 11; break;  // Quality -> K
+            case 3: preset = 12; break;  // Ultra Performance -> L
+            case 4: preset = 11; break;  // Ultra Quality -> K
+            case 5: preset = 11; break;  // DLAA -> K
+        }
+    }
     s_sr_preset.store(preset, std::memory_order_relaxed);
 
     const char* mode = "Unknown";
@@ -276,6 +293,17 @@ static void UpdateDlssParamsFromEval(void* params, void* handle) {
                 preset = tmp;
         }
     } __except(EXCEPTION_EXECUTE_HANDLER) {}
+    // Default fallback for games that don't set preset hints
+    if (preset <= 0) {
+        switch (quality) {
+            case 0: preset = 13; break;  // Performance -> M
+            case 1: preset = 11; break;  // Balanced -> K
+            case 2: preset = 11; break;  // Quality -> K
+            case 3: preset = 12; break;  // Ultra Performance -> L
+            case 4: preset = 11; break;  // Ultra Quality -> K
+            case 5: preset = 11; break;  // DLAA -> K
+        }
+    }
     if (preset >= 0)
         s_sr_preset.store(preset, std::memory_order_relaxed);
 

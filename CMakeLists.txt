@@ -162,6 +162,7 @@ target_link_libraries(relimiter PRIVATE
     d3d12.lib
     gdi32.lib
     winmm.lib
+    ${CMAKE_SOURCE_DIR}/deps/nvapi/amd64/nvapi64.lib
 )
 
 # ── MinHook C files: handled by minhook_static target ──

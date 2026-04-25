@@ -91,6 +91,7 @@ struct Config {
 
     // OSD: DLSS info
     bool osd_show_dlss_quality = false;
+    bool osd_show_dlss_features = false;
     bool osd_show_dlss_resolution = false;
     bool osd_show_dlss_presets = false;
 };
@@ -131,6 +132,7 @@ struct OSDPreset {
     bool show_cpu_usage = false;
     bool show_ram = false;
     bool show_dlss_quality = false;
+    bool show_dlss_features = false;
     bool show_dlss_resolution = false;
     bool show_dlss_presets = false;
     bool occupied = false;  // true if this slot has been saved to
