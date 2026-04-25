@@ -66,13 +66,10 @@ static std::atomic<bool>     s_fg_created{false};
 
 // Preset hints
 static std::atomic<int>      s_sr_preset{-1};
+static std::atomic<int>      s_rr_preset{-1};
 
 // Handle tracking — only process EvaluateFeature for the SR handle
 static void* s_dlss_sr_handle = nullptr;
-
-// RR confirmation: after SR is (re)created, expect RR CreateFeature within
-// 30 frames if RR is active. If it doesn't fire, RR was turned off.
-static std::atomic<int> s_rr_confirm_countdown{0};
 
 // Hook tracking
 static constexpr int kMaxHookTargets = 16;
@@ -86,7 +83,11 @@ static void ExtractDlssParams(void* params, unsigned int feature_id) {
     // Ray Reconstruction
     if (feature_id == NGX_Feature_RayReconstruction) {
         s_ray_reconstruction.store(true, std::memory_order_relaxed);
-        s_rr_confirm_countdown.store(0, std::memory_order_relaxed);
+        s_rr_preset.store(5, std::memory_order_relaxed);
+        // Don't read resolution from RR params — they contain stale data.
+        // Resolution updates come from EvaluateFeature or SR CreateFeature.
+        // But do clear the SR handle so EvaluateFeature can re-adopt.
+        s_dlss_sr_handle = nullptr;
         LOG_INFO("NGX: DLSS Ray Reconstruction created (feature=%u)", feature_id);
         return;
     }
@@ -121,9 +122,10 @@ static void ExtractDlssParams(void* params, unsigned int feature_id) {
 
     if (!params) return;
 
-    // When SR is (re)created, start RR confirmation countdown
-    if (s_ray_reconstruction.load(std::memory_order_relaxed))
-        s_rr_confirm_countdown.store(30, std::memory_order_relaxed);
+    // When SR is (re)created, clear RR flag. If RR is still active,
+    // its CreateFeature will fire right after and re-set it.
+    s_ray_reconstruction.store(false, std::memory_order_relaxed);
+    s_rr_preset.store(-1, std::memory_order_relaxed);
 
     unsigned int w = 0, h = 0, ow = 0, oh = 0;
     int quality = -1;
@@ -211,17 +213,6 @@ static void ExtractDlssParams(void* params, unsigned int feature_id) {
 // ── EvaluateFeature parameter update ──
 
 static void UpdateDlssParamsFromEval(void* params, void* handle) {
-    // Tick RR confirmation countdown
-    int rr_cd = s_rr_confirm_countdown.load(std::memory_order_relaxed);
-    if (rr_cd > 0) {
-        rr_cd--;
-        s_rr_confirm_countdown.store(rr_cd, std::memory_order_relaxed);
-        if (rr_cd == 0) {
-            s_ray_reconstruction.store(false, std::memory_order_relaxed);
-            LOG_INFO("NGX: Ray Reconstruction not confirmed after SR recreate — cleared");
-        }
-    }
-
     if (!handle || !params) return;
 
     // If we have a known SR handle, only process calls for that handle.
@@ -253,11 +244,9 @@ static void UpdateDlssParamsFromEval(void* params, void* handle) {
         if (quality >= 0 && quality <= 5) {
             s_dlss_sr_handle = handle;
             LOG_INFO("NGX: DLSS SR handle adopted from EvaluateFeature (late hook)");
-            // Don't start RR confirmation countdown on late adoption —
-            // RR was already created before we got here.
-        } else {
-            return;
         }
+        // Even without valid quality (RR-only mode), update resolution
+        // The first EvaluateFeature after RR CreateFeature has the correct resolution
     }
 
     // Only update if something changed
@@ -265,13 +254,16 @@ static void UpdateDlssParamsFromEval(void* params, void* handle) {
     uint32_t prev_h = s_render_h.load(std::memory_order_relaxed);
     int prev_q = s_quality.load(std::memory_order_relaxed);
 
-    if (w == prev_w && h == prev_h && quality == prev_q) return;
+    bool res_changed = (w != prev_w || h != prev_h);
+    bool qual_changed = (quality >= 0 && quality != prev_q);
+
+    if (!res_changed && !qual_changed) return;
 
     s_render_w.store(w, std::memory_order_relaxed);
     s_render_h.store(h, std::memory_order_relaxed);
-    s_out_w.store(ow, std::memory_order_relaxed);
-    s_out_h.store(oh, std::memory_order_relaxed);
-    s_quality.store(quality, std::memory_order_relaxed);
+    if (ow > 0) s_out_w.store(ow, std::memory_order_relaxed);
+    if (oh > 0) s_out_h.store(oh, std::memory_order_relaxed);
+    if (quality >= 0) s_quality.store(quality, std::memory_order_relaxed);
     s_has_data.store(true, std::memory_order_relaxed);
 
     // Read preset hint
@@ -529,16 +521,17 @@ NGXDLSSInfo NGXHooks_GetInfo() {
     info.output_height = s_out_h.load(std::memory_order_relaxed);
     info.quality_level = s_quality.load(std::memory_order_relaxed);
     info.sr_preset     = s_sr_preset.load(std::memory_order_relaxed);
+    info.rr_preset     = s_rr_preset.load(std::memory_order_relaxed);
     info.sr_active     = s_has_data.load(std::memory_order_relaxed);
     info.rr_active     = s_ray_reconstruction.load(std::memory_order_relaxed);
     info.fg_active     = s_fg_created.load(std::memory_order_relaxed);
     info.available     = s_has_data.load(std::memory_order_relaxed);
 
-    // DLAA detection
+    // DLAA detection: quality==5 explicitly, OR render==output (regardless of quality value)
     int q = info.quality_level;
     if (q == 5) {
         info.dlaa = true;
-    } else if (q < 0 && info.render_width > 0 &&
+    } else if (info.render_width > 0 &&
                info.render_width == info.output_width &&
                info.render_height == info.output_height) {
         info.dlaa = true;

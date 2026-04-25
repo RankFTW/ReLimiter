@@ -1,6 +1,33 @@
 # Changelog
 
 
+## 3.1.8
+
+### DLSS Info on OSD
+- **Quality level, resolution, and active features** now shown on the OSD. See which DLSS mode you're running (Quality, Balanced, Performance, Ultra Perf, DLAA), the render and output resolution, and whether SR, RR, or FG is active.
+- **Preset letters** — Shows the active DLSS preset for SR, RR, and FG. Reads driver overrides from NVIDIA App in real time. When no override is set, shows the SDK default (e.g. K for Quality, M for Performance, E for Ray Reconstruction).
+- **Everything updates in real time** — Change quality mode, toggle RR on/off, switch presets in NVIDIA App mid-game — the OSD reflects it immediately.
+- **DLAA detection** — Automatically detected when render resolution matches output resolution, regardless of what the game reports.
+- SR and RR are shown as mutually exclusive (RR replaces SR when active). FG preset only shown when a preset is actually set.
+
+### Frame Generation Detection
+- **Improved FG detection for Streamline games** — Games like Horizon Remastered that never confirm FG through Streamline's GetState are now detected via NGX CreateFeature. Fixes FG not being recognized and the limiter fighting the FG system.
+- FG status moved back to the Pipeline section on the OSD where it belongs.
+
+### Performance Fixes
+- **Fixed periodic stutter on DX11 games** — Hardware monitoring was running NVAPI calls on the render thread every second. Now runs on a dedicated background thread with zero render thread impact.
+- **Fixed 2-second frametime spikes and VRR flicker** — G-Sync state and VRR ceiling were being polled every 2 seconds via NVAPI, causing driver lock contention. Now polled once at startup and on display changes only.
+- **Fixed 5-second stutter from preset reading** — DRS preset queries now run on a background thread, polling every 10 seconds with no render thread involvement.
+
+### Bug Fixes
+- **Fixed crash in Death Stranding 2** — Games that send Reflex markers but not the type ReLimiter listens for now correctly fall back to present-based pacing instead of freezing.
+- **Fixed NGX parameter reading** — Correct vtable calling convention and indices for reading DLSS parameters. Hooks multiple DLLs to catch Streamline games that call NGX through feature DLLs.
+- **Fixed ReShade UI checkbox wrapping** — Checkboxes now correctly wrap to the next line when the panel is narrow.
+
+### OSD Presets
+- Preset letters from NVIDIA App driver overrides are read via the stable DRS API (same database Profile Inspector uses). Updates every 10 seconds on a background thread so mid-session changes in NVIDIA App are picked up.
+
+
 ## 3.1.7
 
 ### Scheduler
