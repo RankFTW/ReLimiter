@@ -1437,10 +1437,43 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
 
             // Quality level
             if (g_config.osd_show_dlss_quality && dlss.available) {
-                const char* quality_name = "Unknown";
+                char buf[64];
+
                 if (dlss.dlaa) {
-                    quality_name = "DLAA";
+                    snprintf(buf, sizeof(buf), "DLSS: DLAA");
+                } else if (dlss.output_width > 0 && dlss.render_width > 0) {
+                    // Detect quality mode from render/output ratio with ±5px tolerance
+                    float ratio = static_cast<float>(dlss.render_width) /
+                                  static_cast<float>(dlss.output_width);
+                    int rw = static_cast<int>(dlss.render_width);
+                    int ow = static_cast<int>(dlss.output_width);
+
+                    // Check if render width is within ±15px of expected for each mode
+                    #define DLSS_NEAR(target) (rw >= (int)(ow * target + 0.5f) - 15 && rw <= (int)(ow * target + 0.5f) + 15)
+
+                    const char* mode = nullptr;
+                    if (DLSS_NEAR(0.99f))      mode = "DLAA";
+                    else if (DLSS_NEAR(0.88f)) mode = "DLAA Lite";
+                    else if (DLSS_NEAR(0.83f)) mode = "Ultra Quality+";
+                    else if (DLSS_NEAR(0.77f)) mode = "Ultra Quality";
+                    else if (DLSS_NEAR(0.72f)) mode = "High Quality";
+                    else if (DLSS_NEAR(0.67f)) mode = "Quality";
+                    else if (DLSS_NEAR(0.59f)) mode = "Balanced";
+                    else if (DLSS_NEAR(0.50f)) mode = "Performance";
+                    else if (DLSS_NEAR(0.33f)) mode = "Ultra Perf";
+
+                    #undef DLSS_NEAR
+
+                    if (mode) {
+                        int pct = static_cast<int>(ratio * 100.0f + 0.5f);
+                        snprintf(buf, sizeof(buf), "DLSS: %s (%d%%)", mode, pct);
+                    } else {
+                        int pct = static_cast<int>(ratio * 100.0f + 0.5f);
+                        snprintf(buf, sizeof(buf), "DLSS: Custom (%d%%)", pct);
+                    }
                 } else {
+                    // Fallback to PerfQualityValue when resolution not available
+                    const char* quality_name = "Unknown";
                     switch (dlss.quality_level) {
                         case 0: quality_name = "Performance"; break;
                         case 1: quality_name = "Balanced"; break;
@@ -1449,9 +1482,8 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                         case 4: quality_name = "Ultra Quality"; break;
                         case 5: quality_name = "DLAA"; break;
                     }
+                    snprintf(buf, sizeof(buf), "DLSS: %s", quality_name);
                 }
-                char buf[64];
-                snprintf(buf, sizeof(buf), "DLSS: %s", quality_name);
                 OSDTextColored(ColDLSS(), buf);
             }
 
