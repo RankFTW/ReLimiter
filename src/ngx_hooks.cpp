@@ -4,6 +4,8 @@
 
 #include "ngx_hooks.h"
 #include "hooks.h"
+#include "streamline_hooks.h"
+#include "flush.h"
 #include "logger.h"
 #include <Windows.h>
 #include <MinHook.h>
@@ -92,6 +94,16 @@ static void ExtractDlssParams(void* params, unsigned int feature_id) {
     // Frame Generation
     if (feature_id == NGX_Feature_FrameGeneration) {
         s_fg_created.store(true, std::memory_order_relaxed);
+        // Set fg_presenting directly — this is the most reliable FG signal.
+        // Games like Horizon Remastered never confirm FG through slDLSSGGetState,
+        // causing the Streamline deferred inference to fail. The NGX CreateFeature
+        // call is definitive: the game is creating the FG feature right now.
+        bool was_presenting = g_fg_presenting.load(std::memory_order_relaxed);
+        if (!was_presenting) {
+            g_fg_presenting.store(true, std::memory_order_relaxed);
+            OnFGStateChange();
+            LOG_INFO("NGX: FG presenting set from CreateFeature (Streamline bypass)");
+        }
         LOG_INFO("NGX: DLSS Frame Generation created (feature=%u)", feature_id);
         return;
     }
@@ -471,6 +483,14 @@ void NGXHooks_Shutdown() {
     s_orig_d3d11_eval = nullptr;
     s_dlss_sr_handle = nullptr;
     s_hooks_installed = false;
+}
+
+bool NGXHooks_IsFGCreated() {
+    return s_fg_created.load(std::memory_order_relaxed);
+}
+
+void NGXHooks_ClearFGCreated() {
+    s_fg_created.store(false, std::memory_order_relaxed);
 }
 
 NGXDLSSInfo NGXHooks_GetInfo() {

@@ -1,4 +1,5 @@
 #include "streamline_hooks.h"
+#include "ngx_hooks.h"
 #include "hooks.h"
 #include "config.h"
 #include "flush.h"
@@ -124,12 +125,19 @@ static sl_Result __cdecl Detour_SetOptions(const void* vp, const void* opts) {
                     s_fg_confirmed_by_getstate.store(false, std::memory_order_relaxed);
                     LOG_INFO("FG presenting deferred — waiting for GetState confirmation");
                 } else if (numFrames == 0) {
-                    // FG disabled — clear everything
+                    // FG disabled via SetOptions.
+                    // If NGX just created FG (within last 2 seconds), the game may be
+                    // sending contradictory signals — trust NGX and keep FG active.
+                    // Otherwise, honor the disable.
                     s_fg_inference_pending.store(false, std::memory_order_relaxed);
                     bool prev_presenting = g_fg_presenting.load(std::memory_order_relaxed);
                     if (prev_presenting) {
-                        g_fg_presenting.store(false, std::memory_order_relaxed);
-                        LOG_INFO("FG presenting (from SetOptions): yes -> no");
+                        if (NGXHooks_IsFGCreated()) {
+                            LOG_INFO("FG presenting: SetOptions says off but NGX FG active — keeping");
+                        } else {
+                            g_fg_presenting.store(false, std::memory_order_relaxed);
+                            LOG_INFO("FG presenting (from SetOptions): yes -> no");
+                        }
                     }
                 }
 

@@ -10,17 +10,28 @@ static std::atomic<bool> s_poll_running{false};
 static std::thread s_poll_thread;
 
 static void DisplayPollProc() {
-    while (s_poll_running.load(std::memory_order_relaxed)) {
-        // Skip polling when Display_Resolver hasn't resolved a display yet (Req 3.4)
-        if (DispRes_IsResolved()) {
-            PollGSyncState();
-            QueryVRRCeiling();
-            QueryVRRFloor();
-        }
-        ManageFrameSplitting();
+    // First poll: run immediately after display is resolved
+    bool first_poll_done = false;
 
-        // Sleep ~2 seconds between polls
-        Sleep(2000);
+    while (s_poll_running.load(std::memory_order_relaxed)) {
+        if (DispRes_IsResolved()) {
+            // Full poll on first run, then only frame splitting management
+            // on subsequent runs. G-Sync state and VRR ceiling don't change
+            // during gameplay — polling them every 2 seconds causes NVAPI
+            // driver lock contention that produces visible frametime spikes
+            // on DX11 games.
+            if (!first_poll_done) {
+                PollGSyncState();
+                QueryVRRCeiling();
+                QueryVRRFloor();
+                first_poll_done = true;
+            }
+            ManageFrameSplitting();
+        }
+
+        // Sleep ~2 seconds between polls (responsive shutdown via chunks)
+        for (int i = 0; i < 20 && s_poll_running.load(std::memory_order_relaxed); i++)
+            Sleep(100);
     }
 }
 

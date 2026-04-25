@@ -46,3 +46,11 @@ void NGXHooks_Shutdown();
 
 // Get the latest DLSS info. Lock-free, safe from any thread.
 NGXDLSSInfo NGXHooks_GetInfo();
+
+// Returns true if NGX CreateFeature has seen FG being created.
+// Used by Streamline hooks to avoid clearing fg_presenting when
+// the game sends contradictory SetOptions signals.
+bool NGXHooks_IsFGCreated();
+
+// Clear the FG created flag (called when FG is genuinely disabled by the user).
+void NGXHooks_ClearFGCreated();
