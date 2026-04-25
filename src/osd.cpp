@@ -1515,9 +1515,9 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                         up_val = idxToLetter(dlss.sr_preset);
                 }
 
-                // FG — override only (no SDK default for FG presets)
+                // FG — only show if FG is actually active in this game
                 const char* fg_val = nullptr;
-                if (presets.available && presets.fg[0] != '-')
+                if (dlss.fg_active && presets.available && presets.fg[0] != '-')
                     fg_val = presets.fg;
 
                 if (up_val || fg_val) {
