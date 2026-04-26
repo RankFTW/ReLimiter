@@ -460,13 +460,15 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         // Helper lambda: place next checkbox on same line with dash separator,
         // or wrap to next line if not enough room.
         auto FlowSeparator = [&]() {
+            ImGui::SameLine();
             float avail = ImGui::GetContentRegionAvail().x;
             // Estimate: dash ~20px + next checkbox ~120px minimum
             float needed = 140.0f;
             if (avail > needed) {
-                ImGui::SameLine();
                 ImGui::TextDisabled("-");
                 ImGui::SameLine();
+            } else {
+                ImGui::NewLine();
             }
         };
 
