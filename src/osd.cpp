@@ -337,6 +337,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             p.show_dlss_features = true;
             p.show_dlss_resolution = true;
             p.show_dlss_presets = true;
+            p.show_dlss_versions = true;
             OSDPreset_ApplyTogglesOnly(p);
             config_dirty = true;
         }
@@ -536,6 +537,9 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         FlowSeparator();
         if (ImGui::Checkbox("Presets##osd_elem", &g_config.osd_show_dlss_presets)) config_dirty = true;
         HelpTip("DLSS SR preset (game-set hint) and driver override presets for SR/RR/FG if active.");
+        FlowSeparator();
+        if (ImGui::Checkbox("Versions##osd_elem", &g_config.osd_show_dlss_versions)) config_dirty = true;
+        HelpTip("Show DLSS DLL versions (SR, RR, FG) and Streamline version if loaded.");
 
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "System");
@@ -976,6 +980,111 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         ImGui::Text("|");
         ImGui::SameLine();
         ImGui::TextColored(present_ok ? col_ok : col_bad, "PRESENT %s", present_ok ? "ok" : "X");
+    }
+
+    // DLSS / Streamline info — always visible in settings panel
+    {
+        NGXDLSSInfo dlss = NGXHooks_GetInfo();
+        if (dlss.available) {
+            DLSSPresets_Poll();
+            DLSSPresets presets = DLSSPresets_Get();
+
+            // Quality level
+            const char* quality_str = "Unknown";
+            char quality_buf[64] = {};
+            if (dlss.dlaa) {
+                quality_str = "DLAA";
+            } else if (dlss.output_width > 0 && dlss.render_width > 0) {
+                float ratio = static_cast<float>(dlss.render_width) /
+                              static_cast<float>(dlss.output_width);
+                int pct = static_cast<int>(ratio * 100.0f + 0.5f);
+                int rw = static_cast<int>(dlss.render_width);
+                int ow = static_cast<int>(dlss.output_width);
+                int tol = (std::max)(15, ow / 100);
+                #define DLSS_NEAR2(target) (rw >= (int)(ow * target + 0.5f) - tol && rw <= (int)(ow * target + 0.5f) + tol)
+                const char* mode = nullptr;
+                if (DLSS_NEAR2(0.99f))      mode = "DLAA";
+                else if (DLSS_NEAR2(0.88f)) mode = "DLAA Lite";
+                else if (DLSS_NEAR2(0.83f)) mode = "Ultra Quality+";
+                else if (DLSS_NEAR2(0.77f)) mode = "Ultra Quality";
+                else if (DLSS_NEAR2(0.72f)) mode = "High Quality";
+                else if (DLSS_NEAR2(0.67f)) mode = "Quality";
+                else if (DLSS_NEAR2(0.59f)) mode = "Balanced";
+                else if (DLSS_NEAR2(0.50f)) mode = "Performance";
+                else if (DLSS_NEAR2(0.33f)) mode = "Ultra Perf";
+                #undef DLSS_NEAR2
+                if (mode)
+                    snprintf(quality_buf, sizeof(quality_buf), "%s (%d%%)", mode, pct);
+                else
+                    snprintf(quality_buf, sizeof(quality_buf), "Custom (%d%%)", pct);
+                quality_str = quality_buf;
+            } else {
+                switch (dlss.quality_level) {
+                    case 0: quality_str = "Performance"; break;
+                    case 1: quality_str = "Balanced"; break;
+                    case 2: quality_str = "Quality"; break;
+                    case 3: quality_str = "Ultra Perf"; break;
+                    case 4: quality_str = "Ultra Quality"; break;
+                    case 5: quality_str = "DLAA"; break;
+                }
+            }
+
+            // Features
+            char feat_buf[32] = {};
+            int fp = 0;
+            if (dlss.rr_active)
+                fp += snprintf(feat_buf + fp, sizeof(feat_buf) - fp, "RR");
+            else if (dlss.sr_active)
+                fp += snprintf(feat_buf + fp, sizeof(feat_buf) - fp, "SR");
+            if (dlss.fg_active)
+                fp += snprintf(feat_buf + fp, sizeof(feat_buf) - fp, "%sFG", fp > 0 ? "+" : "");
+
+            ImGui::Text("DLSS: %s  |  %s  |  %ux%u -> %ux%u",
+                        quality_str, fp > 0 ? feat_buf : "None",
+                        dlss.render_width, dlss.render_height,
+                        dlss.output_width, dlss.output_height);
+
+            // Presets + versions on second line
+            {
+                auto idxToLetter = [](int idx) -> const char* {
+                    static char b[4];
+                    if (idx <= 0) return nullptr;
+                    if (idx >= 1 && idx <= 26) { b[0] = 'A' + (char)(idx - 1); b[1] = '\0'; return b; }
+                    return nullptr;
+                };
+
+                char line2[128];
+                int p2 = 0;
+
+                // Presets
+                const char* up_label = dlss.rr_active ? "RR" : "SR";
+                const char* up_val = nullptr;
+                if (dlss.rr_active) {
+                    if (presets.available && presets.rr[0] != '-') up_val = presets.rr;
+                    else up_val = idxToLetter(dlss.rr_preset);
+                } else {
+                    if (presets.available && presets.sr[0] != '-') up_val = presets.sr;
+                    else up_val = idxToLetter(dlss.sr_preset);
+                }
+                if (up_val)
+                    p2 += snprintf(line2 + p2, sizeof(line2) - p2, "%s=%s", up_label, up_val);
+                if (dlss.fg_active && presets.available && presets.fg[0] != '-')
+                    p2 += snprintf(line2 + p2, sizeof(line2) - p2, "%sFG=%s", p2 > 0 ? " " : "", presets.fg);
+
+                // Versions
+                if (dlss.sr_version[0])
+                    p2 += snprintf(line2 + p2, sizeof(line2) - p2, "%sSR v%s", p2 > 0 ? "  |  " : "", dlss.sr_version);
+                if (dlss.rr_version[0])
+                    p2 += snprintf(line2 + p2, sizeof(line2) - p2, "%sRR v%s", p2 > 0 ? "  |  " : "", dlss.rr_version);
+                if (dlss.fg_version[0])
+                    p2 += snprintf(line2 + p2, sizeof(line2) - p2, "%sFG v%s", p2 > 0 ? "  |  " : "", dlss.fg_version);
+                if (dlss.sl_version[0])
+                    p2 += snprintf(line2 + p2, sizeof(line2) - p2, "%sSL v%s", p2 > 0 ? "  |  " : "", dlss.sl_version);
+
+                if (p2 > 0)
+                    ImGui::Text("%s", line2);
+            }
+        }
     }
 
     // Save immediately when any setting was changed this frame
@@ -1448,8 +1557,11 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                     int rw = static_cast<int>(dlss.render_width);
                     int ow = static_cast<int>(dlss.output_width);
 
-                    // Check if render width is within ±15px of expected for each mode
-                    #define DLSS_NEAR(target) (rw >= (int)(ow * target + 0.5f) - 15 && rw <= (int)(ow * target + 0.5f) + 15)
+                    // Check if render width is within tolerance of expected for each mode.
+                    // Tolerance scales with output width (1%, min 15px) to handle
+                    // ultrawide resolutions where DLSS DLL rounding is larger.
+                    int tol = (std::max)(15, ow / 100);
+                    #define DLSS_NEAR(target) (rw >= (int)(ow * target + 0.5f) - tol && rw <= (int)(ow * target + 0.5f) + tol)
 
                     const char* mode = nullptr;
                     if (DLSS_NEAR(0.99f))      mode = "DLAA";
@@ -1561,6 +1673,23 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                         pos += snprintf(line + pos, sizeof(line) - pos, " FG=%s", fg_val);
                     OSDTextColored(ColDLSS(), line);
                 }
+            }
+
+            // Versions — show loaded DLSS/Streamline DLL versions
+            if (g_config.osd_show_dlss_versions && dlss.available) {
+                char line[128];
+                int pos = 0;
+                // Show SR or RR version (mutually exclusive display, like features)
+                if (dlss.rr_active && dlss.rr_version[0])
+                    pos += snprintf(line + pos, sizeof(line) - pos, "RR v%s", dlss.rr_version);
+                else if (dlss.sr_version[0])
+                    pos += snprintf(line + pos, sizeof(line) - pos, "SR v%s", dlss.sr_version);
+                if (dlss.fg_version[0])
+                    pos += snprintf(line + pos, sizeof(line) - pos, "%sFG v%s", pos > 0 ? " | " : "", dlss.fg_version);
+                if (dlss.sl_version[0])
+                    pos += snprintf(line + pos, sizeof(line) - pos, "%sSL v%s", pos > 0 ? " | " : "", dlss.sl_version);
+                if (pos > 0)
+                    OSDTextColored(ColDLSS(), line);
             }
         }
 

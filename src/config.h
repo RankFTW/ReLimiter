@@ -94,6 +94,7 @@ struct Config {
     bool osd_show_dlss_features = false;
     bool osd_show_dlss_resolution = false;
     bool osd_show_dlss_presets = false;
+    bool osd_show_dlss_versions = false;
 };
 
 extern Config g_config;
@@ -135,6 +136,7 @@ struct OSDPreset {
     bool show_dlss_features = false;
     bool show_dlss_resolution = false;
     bool show_dlss_presets = false;
+    bool show_dlss_versions = false;
     bool occupied = false;  // true if this slot has been saved to
 };
 

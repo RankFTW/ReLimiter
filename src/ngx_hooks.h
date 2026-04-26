@@ -31,6 +31,12 @@ struct NGXDLSSInfo {
     bool dlaa = false;             // True if quality_level == 5 or render == output
 
     bool available = false;        // True once any valid data has been captured
+
+    // DLL versions (populated once on first query)
+    char sr_version[24] = {};      // e.g. "4.1.2.0" from nvngx_dlss.dll
+    char rr_version[24] = {};      // from nvngx_dlssd.dll
+    char fg_version[24] = {};      // from nvngx_dlssg.dll
+    char sl_version[24] = {};      // from sl.common.dll
 };
 
 // Try to install NGX hooks. Scans multiple DLLs (_nvngx.dll, nvngx.dll,

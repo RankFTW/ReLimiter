@@ -186,6 +186,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.osd_show_dlss_features  = ReadINIBool(S, "osd_show_dlss_features", false, P);
     g_config.osd_show_dlss_resolution = ReadINIBool(S, "osd_show_dlss_resolution", false, P);
     g_config.osd_show_dlss_presets   = ReadINIBool(S, "osd_show_dlss_presets", false, P);
+    g_config.osd_show_dlss_versions  = ReadINIBool(S, "osd_show_dlss_versions", false, P);
 
     LOG_INFO("Config: values read, calling ApplyConfig...");
     ValidateConfig();
@@ -255,8 +256,8 @@ void SaveConfig() {
     WriteINIBool(S, "osd_show_dlss_quality", g_config.osd_show_dlss_quality, P);
     WriteINIBool(S, "osd_show_dlss_features", g_config.osd_show_dlss_features, P);
     WriteINIBool(S, "osd_show_dlss_resolution", g_config.osd_show_dlss_resolution, P);
-    WriteINIBool(S, "osd_show_dlss_resolution", g_config.osd_show_dlss_resolution, P);
     WriteINIBool(S, "osd_show_dlss_presets", g_config.osd_show_dlss_presets, P);
+    WriteINIBool(S, "osd_show_dlss_versions", g_config.osd_show_dlss_versions, P);
 }
 
 void ApplyConfig() {
@@ -322,6 +323,7 @@ OSDPreset OSDPreset_FromConfig() {
     p.show_dlss_features    = g_config.osd_show_dlss_features;
     p.show_dlss_resolution  = g_config.osd_show_dlss_resolution;
     p.show_dlss_presets     = g_config.osd_show_dlss_presets;
+    p.show_dlss_versions    = g_config.osd_show_dlss_versions;
     p.occupied              = true;
     return p;
 }
@@ -356,6 +358,7 @@ void OSDPreset_ApplyToConfig(const OSDPreset& p) {
     g_config.osd_show_dlss_features    = p.show_dlss_features;
     g_config.osd_show_dlss_resolution  = p.show_dlss_resolution;
     g_config.osd_show_dlss_presets     = p.show_dlss_presets;
+    g_config.osd_show_dlss_versions    = p.show_dlss_versions;
 }
 
 void OSDPreset_ApplyTogglesOnly(const OSDPreset& p) {
@@ -384,6 +387,7 @@ void OSDPreset_ApplyTogglesOnly(const OSDPreset& p) {
     g_config.osd_show_dlss_features    = p.show_dlss_features;
     g_config.osd_show_dlss_resolution  = p.show_dlss_resolution;
     g_config.osd_show_dlss_presets     = p.show_dlss_presets;
+    g_config.osd_show_dlss_versions    = p.show_dlss_versions;
 }
 
 int OSDPreset_GetCount() {
@@ -449,6 +453,7 @@ static void ReadPresetFromINI(int i, const char* P) {
     p.show_dlss_features    = ReadINIBool(S, "show_dlss_features", false, P);
     p.show_dlss_resolution  = ReadINIBool(S, "show_dlss_resolution", false, P);
     p.show_dlss_presets     = ReadINIBool(S, "show_dlss_presets", false, P);
+    p.show_dlss_versions    = ReadINIBool(S, "show_dlss_versions", false, P);
 }
 
 void OSDPreset_LoadAll() {
@@ -511,6 +516,7 @@ void OSDPreset_SaveSlot(int slot) {
     WriteINIBool(S, "show_dlss_features", p.show_dlss_features, P);
     WriteINIBool(S, "show_dlss_resolution", p.show_dlss_resolution, P);
     WriteINIBool(S, "show_dlss_presets", p.show_dlss_presets, P);
+    WriteINIBool(S, "show_dlss_versions", p.show_dlss_versions, P);
 }
 
 void OSDPreset_DeleteSlot(int slot) {
