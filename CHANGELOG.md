@@ -1,7 +1,7 @@
 # Changelog
 
 
-## 3.1.8
+## 3.1.8 (Beta)
 
 ### DLSS Info on OSD
 - **Quality level, resolution, and active features** now shown on the OSD. See which DLSS mode you're running (Quality, Balanced, Performance, Ultra Perf, DLAA), the render and output resolution, and whether SR, RR, or FG is active. Every mode shows its render percentage (e.g. "Quality (67%)", "Balanced (59%)").
@@ -34,6 +34,9 @@
 
 ### OSD Presets
 - Preset letters from NVIDIA App driver overrides are read via the stable DRS API (same database Profile Inspector uses). Updates every 10 seconds on a background thread so mid-session changes in NVIDIA App are picked up.
+
+### UI
+- **FG pacing info** — When Frame Generation is active, the ReShade settings panel shows the FG multiplier and the native frame budget ReLimiter is pacing to (e.g. "FG Pacing: 2x | Native: 60 fps (16.7 ms)").
 
 
 ## 3.1.7

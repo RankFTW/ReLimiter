@@ -637,17 +637,12 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         // to zero over N frames, the chain skips forward, and the gate
         // spikes on the first post-skip frame.
         //
-        // The old approach (skip forward by whole intervals) placed the
-        // deadline ~effective_interval ahead after a miss, causing a
-        // ~7000µs gate hold spike — a visible stutter every ~8 frames
-        // when marginally GPU-bound.
-        //
-        // Re-anchoring to `now` means the next deadline is `now +
-        // effective_interval`. If the game is still GPU-bound, it misses
-        // again and re-anchors again — every frame is a passthrough with
-        // zero gate hold. When the game becomes CPU-bound (frame finishes
-        // before the deadline), the chain naturally resumes normal pacing
-        // with the gate providing phase stabilization.
+        // The spike on the missed frame itself is unavoidable — the GPU
+        // genuinely took longer. The gate can only hold frames (delay
+        // delivery), not release them early, so it can't compress a
+        // frame that's already late. Adaptive smoothing is the correct
+        // tool for absorbing GPU render time variance: it widens the
+        // target interval so more frames complete within budget.
         if (next_deadline < now) {
             frame_missed = true;
             next_deadline = now;

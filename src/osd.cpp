@@ -963,6 +963,18 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                     gsync ? "Active" : "Off",
                     mode == PacingMode::VRR ? "VRR" : "Fixed");
 
+        // FG pacing status
+        bool fg_active = g_fg_presenting.load(std::memory_order_relaxed);
+        if (fg_active) {
+            int mult = g_fg_multiplier.load(std::memory_order_relaxed);
+            int actual = g_fg_actual_multiplier.load(std::memory_order_relaxed);
+            int display_mult = (actual >= 2) ? actual : (mult + 1);
+            double eff_us = g_effective_interval_us.load(std::memory_order_relaxed);
+            double native_fps = (eff_us > 0.0) ? 1000000.0 / eff_us : 0.0;
+            ImGui::Text("FG Pacing: %dx  |  Native: %.0f fps (%.1f ms)",
+                        display_mult, native_fps, eff_us / 1000.0);
+        }
+
         // Pipeline health — wired to real checks
         bool sim_ok = AreMarkersFlowing();
         bool render_ok = IsCorrelatorValid() && IsDXGIStatsFresh();
