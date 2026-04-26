@@ -12,7 +12,6 @@
 #include <atomic>
 #include <cstring>
 #include <cstdio>
-#include <TlHelp32.h>
 
 // ── NGX types ──
 
@@ -498,13 +497,17 @@ void NGXHooks_TryInstall() {
     bool ok = TryHookModule(L"_nvngx.dll");
     if (!ok) ok = TryHookModule(L"nvngx.dll");
 
-    // Streamline games call CreateFeature on the feature DLL directly
-    TryHookModule(L"nvngx_dlss.dll");
-    TryHookModule(L"_nvngx_dlss.dll");
+    // Streamline games call CreateFeature on the feature DLL directly.
+    // However, hooking both _nvngx.dll AND feature DLLs causes double-hooking
+    // (the _nvngx export internally calls the feature DLL export), which crashes
+    // some games (e.g. Crimson Desert). Only hook _nvngx.dll — it's the entry
+    // point for all NGX calls and catches everything.
+    // TryHookModule(L"nvngx_dlss.dll");
+    // TryHookModule(L"_nvngx_dlss.dll");
 
-    // Ray Reconstruction DLL
-    TryHookModule(L"nvngx_dlssd.dll");
-    TryHookModule(L"_nvngx_dlssd.dll");
+    // Ray Reconstruction DLL — same issue, skip
+    // TryHookModule(L"nvngx_dlssd.dll");
+    // TryHookModule(L"_nvngx_dlssd.dll");
 
     // Log which NGX DLLs are loaded
     static bool s_logged = false;
@@ -591,13 +594,14 @@ static bool ReadVersionFromPath(const wchar_t* path, char* out, size_t out_size)
     return ok;
 }
 
-// Extract just the filename from a full path and lowercase it
-static void GetLowerFilename(const wchar_t* path, wchar_t* out, size_t out_len) {
-    const wchar_t* name = wcsrchr(path, L'\\');
-    if (name) name++; else name = path;
-    wcsncpy(out, name, out_len - 1);
-    out[out_len - 1] = L'\0';
-    for (wchar_t* p = out; *p; p++) *p = towlower(*p);
+static bool ReadDllVersion(const wchar_t* dll_name, char* out, size_t out_size) {
+    HMODULE mod = GetModuleHandleW(dll_name);
+    if (!mod) return false;
+
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(mod, path, MAX_PATH)) return false;
+
+    return ReadVersionFromPath(path, out, out_size);
 }
 
 static void ReadAllVersions() {
@@ -611,52 +615,31 @@ static void ReadAllVersions() {
         }
     }
 
-    // Enumerate all loaded modules using Toolhelp32 snapshot.
-    // This finds modules loaded by any mechanism including NGX internal loading
-    // and DLSS GLOM overrides that EnumProcessModules may miss.
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
-                                           GetCurrentProcessId());
-    if (snap == INVALID_HANDLE_VALUE) return;
-
-    MODULEENTRY32W me = {};
-    me.dwSize = sizeof(me);
-
+    // Use GetModuleHandleW — safe, no deadlock risk, works for game-bundled DLLs.
+    // Note: sl.dlss.dll / sl.dlss_g.dll are Streamline wrappers with SL version
+    // numbers, NOT the actual DLSS DLL versions — don't use them for SR/FG.
     bool found_any = false;
-    if (Module32FirstW(snap, &me)) {
-        do {
-            wchar_t name[64] = {};
-            GetLowerFilename(me.szModule, name, 64);
 
-            // DLSS SR
-            if (!s_sr_ver[0] && (wcscmp(name, L"nvngx_dlss.dll") == 0 ||
-                                  wcscmp(name, L"_nvngx_dlss.dll") == 0 ||
-                                  wcscmp(name, L"sl.dlss.dll") == 0)) {
-                if (ReadVersionFromPath(me.szExePath, s_sr_ver, sizeof(s_sr_ver)))
-                    found_any = true;
-            }
-            // DLSS RR
-            if (!s_rr_ver[0] && (wcscmp(name, L"nvngx_dlssd.dll") == 0 ||
-                                  wcscmp(name, L"_nvngx_dlssd.dll") == 0 ||
-                                  wcscmp(name, L"sl.dlss_d.dll") == 0)) {
-                if (ReadVersionFromPath(me.szExePath, s_rr_ver, sizeof(s_rr_ver)))
-                    found_any = true;
-            }
-            // DLSS FG
-            if (!s_fg_ver[0] && (wcscmp(name, L"nvngx_dlssg.dll") == 0 ||
-                                  wcscmp(name, L"_nvngx_dlssg.dll") == 0 ||
-                                  wcscmp(name, L"sl.dlss_g.dll") == 0)) {
-                if (ReadVersionFromPath(me.szExePath, s_fg_ver, sizeof(s_fg_ver)))
-                    found_any = true;
-            }
-            // Streamline
-            if (!s_sl_ver[0] && (wcscmp(name, L"sl.interposer.dll") == 0 ||
-                                  wcscmp(name, L"sl.common.dll") == 0)) {
-                if (ReadVersionFromPath(me.szExePath, s_sl_ver, sizeof(s_sl_ver)))
-                    found_any = true;
-            }
-        } while (Module32NextW(snap, &me));
+    if (!s_sr_ver[0]) {
+        if (ReadDllVersion(L"nvngx_dlss.dll", s_sr_ver, sizeof(s_sr_ver)) ||
+            ReadDllVersion(L"_nvngx_dlss.dll", s_sr_ver, sizeof(s_sr_ver)))
+            found_any = true;
     }
-    CloseHandle(snap);
+    if (!s_rr_ver[0]) {
+        if (ReadDllVersion(L"nvngx_dlssd.dll", s_rr_ver, sizeof(s_rr_ver)) ||
+            ReadDllVersion(L"_nvngx_dlssd.dll", s_rr_ver, sizeof(s_rr_ver)))
+            found_any = true;
+    }
+    if (!s_fg_ver[0]) {
+        if (ReadDllVersion(L"nvngx_dlssg.dll", s_fg_ver, sizeof(s_fg_ver)) ||
+            ReadDllVersion(L"_nvngx_dlssg.dll", s_fg_ver, sizeof(s_fg_ver)))
+            found_any = true;
+    }
+    if (!s_sl_ver[0]) {
+        if (ReadDllVersion(L"sl.interposer.dll", s_sl_ver, sizeof(s_sl_ver)) ||
+            ReadDllVersion(L"sl.common.dll", s_sl_ver, sizeof(s_sl_ver)))
+            found_any = true;
+    }
 
     // Only mark as done if we found something, or we've been trying too long.
     static int s_attempts = 0;
