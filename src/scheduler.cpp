@@ -624,25 +624,33 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         s_last_present_deadline = now;
     } else {
         // ── Unified deadline chain ──
-        // Single formula regardless of GPU load. The chain advances by
-        // effective_interval each frame. When the deadline falls behind
-        // (frame took longer than interval), skip forward by whole
-        // intervals until the deadline is ahead of `now`. This preserves
-        // the chain's phase rather than re-anchoring to `now`, which
-        // would give the next frame a full interval budget and produce
-        // the characteristic undershoot after an overshoot.
+        // The chain advances by effective_interval each frame.
         int64_t next_deadline = s_last_present_deadline +
             us_to_qpc(effective_interval);
 
-        // Phase-preserving catch-up: skip whole intervals.
+        // Catch-up on miss: re-anchor the deadline to `now`.
+        //
+        // When the deadline falls behind (frame took longer than the
+        // interval), the game is GPU-bound for this frame. Re-anchoring
+        // to `now` sets drift to zero, so the gate passes through with
+        // no hold. This eliminates the stutter cycle where drift erodes
+        // to zero over N frames, the chain skips forward, and the gate
+        // spikes on the first post-skip frame.
+        //
+        // The old approach (skip forward by whole intervals) placed the
+        // deadline ~effective_interval ahead after a miss, causing a
+        // ~7000µs gate hold spike — a visible stutter every ~8 frames
+        // when marginally GPU-bound.
+        //
+        // Re-anchoring to `now` means the next deadline is `now +
+        // effective_interval`. If the game is still GPU-bound, it misses
+        // again and re-anchors again — every frame is a passthrough with
+        // zero gate hold. When the game becomes CPU-bound (frame finishes
+        // before the deadline), the chain naturally resumes normal pacing
+        // with the gate providing phase stabilization.
         if (next_deadline < now) {
             frame_missed = true;
-            int64_t eff_qpc = us_to_qpc(effective_interval);
-            if (eff_qpc > 0) {
-                int64_t behind = now - next_deadline;
-                int64_t skip = (behind / eff_qpc) + 1;
-                next_deadline += skip * eff_qpc;
-            }
+            next_deadline = now;
         }
 
         this_frame_deadline = next_deadline;
