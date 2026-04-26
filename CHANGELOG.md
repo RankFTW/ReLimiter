@@ -5,11 +5,16 @@
 
 ### DLSS Info on OSD
 - **Quality level, resolution, and active features** now shown on the OSD. See which DLSS mode you're running (Quality, Balanced, Performance, Ultra Perf, DLAA), the render and output resolution, and whether SR, RR, or FG is active. Every mode shows its render percentage (e.g. "Quality (67%)", "Balanced (59%)").
-- **Custom resolution detection** — Recognises NVIDIA App custom scales like DLAA Lite (88%), Ultra Quality+ (83%), and High Quality (72%). Non-standard ratios set via Profile Inspector or NVIDIA App show as "Custom (XX%)". Uses ±15px tolerance to handle DLSS DLL rounding differences.
+- **Custom resolution detection** — Recognises NVIDIA App custom scales like DLAA Lite (88%), Ultra Quality+ (83%), and High Quality (72%). Non-standard ratios set via Profile Inspector or NVIDIA App show as "Custom (XX%)". Tolerance scales with output resolution so ultrawide displays are detected correctly.
 - **Preset letters** — Shows the active DLSS preset for SR, RR, and FG. Reads driver overrides from NVIDIA App in real time. When no override is set, shows the SDK default (e.g. K for Quality, M for Performance, E for Ray Reconstruction).
+- **DLL versions** — Shows DLSS SR, RR, FG, and Streamline DLL versions on the OSD (toggleable) and always in the ReShade settings panel. Useful for verifying which DLSS version a game is running.
 - **Everything updates in real time** — Change quality mode, toggle RR on/off, switch presets in NVIDIA App mid-game — the OSD reflects it immediately.
 - **DLAA detection** — Automatically detected when render resolution matches output resolution, regardless of what the game reports.
+- **ReShade panel info** — Full DLSS status (quality, features, resolution, presets, versions) always visible at the bottom of the ReShade settings panel without needing the OSD enabled.
 - SR and RR are shown as mutually exclusive (RR replaces SR when active). FG preset only shown when a preset is actually set.
+
+### Scheduler
+- **Fixed stutter when marginally GPU-bound** — When the game is right at the FPS target and occasionally misses a deadline, the scheduler now re-anchors instead of skipping forward by whole intervals. Eliminates the ~7ms gate hold spike that caused a visible stutter every few frames in borderline GPU-bound scenarios. (lazorr410)
 
 ### Frame Generation Detection
 - **Improved FG detection for Streamline games** — Games like Horizon Remastered that never confirm FG through Streamline's GetState are now detected via NGX CreateFeature. Fixes FG not being recognized and the limiter fighting the FG system.
@@ -21,8 +26,10 @@
 - **Fixed 5-second stutter from preset reading** — DRS preset queries now run on a background thread, polling every 10 seconds with no render thread involvement.
 
 ### Bug Fixes
+- **Fixed crash in Crimson Desert** — NGX hooks were installed on both the runtime DLL and feature DLLs, creating a double-hook chain that crashed during FG initialization. Now only hooks the NGX runtime entry point.
 - **Fixed crash in Death Stranding 2** — Games that send Reflex markers but not the type ReLimiter listens for now correctly fall back to present-based pacing instead of freezing.
-- **Fixed NGX parameter reading** — Correct vtable calling convention and indices for reading DLSS parameters. Hooks multiple DLLs to catch Streamline games that call NGX through feature DLLs.
+- **Fixed wrong DLSS version on Streamline games** — Streamline wrapper DLLs (sl.dlss.dll) were being read instead of the actual DLSS DLLs, showing the Streamline version number as the SR version.
+- **Fixed "Custom" quality showing on ultrawide** — Quality detection tolerance was a fixed pixel count that didn't scale with resolution. Now uses a percentage-based tolerance so ultrawide displays match correctly.
 - **Fixed ReShade UI checkbox wrapping** — Checkboxes now correctly wrap to the next line when the panel is narrow.
 
 ### OSD Presets
