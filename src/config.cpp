@@ -112,6 +112,7 @@ void ValidateConfig() {
 
     // ── Adaptive Smoothing ──
     g_config.smoothing_percentile = Clamp(g_config.smoothing_percentile, 0.50, 0.999);
+    g_config.smoothing_bias_us = Clamp(g_config.smoothing_bias_us, 0.0, 1000.0);
     static const char* smoothing_windows[] = {"medium", "dual"};
     ValidateEnum(g_config.smoothing_window, smoothing_windows, 2, "medium");
 }
@@ -173,6 +174,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.adaptive_smoothing      = ReadINIBool(S, "adaptive_smoothing", false, P);
     g_config.smoothing_percentile    = ReadINIDouble(S, "smoothing_percentile", 0.99, P);
     g_config.smoothing_window        = ReadINIString(S, "smoothing_window", "medium", P);
+    g_config.smoothing_bias_us       = ReadINIDouble(S, "smoothing_bias_us", 0.0, P);
     g_config.osd_show_adaptive_smoothing = ReadINIBool(S, "osd_show_adaptive_smoothing", false, P);
     g_config.osd_show_0_1pct_low     = ReadINIBool(S, "osd_show_0_1pct_low", false, P);
     g_config.osd_show_gpu_render_time = ReadINIBool(S, "osd_show_gpu_render_time", false, P);
@@ -246,6 +248,7 @@ void SaveConfig() {
     WriteINIBool(S, "adaptive_smoothing", g_config.adaptive_smoothing, P);
     WriteINIDouble(S, "smoothing_percentile", g_config.smoothing_percentile, P);
     WriteINIString(S, "smoothing_window", g_config.smoothing_window.c_str(), P);
+    WriteINIDouble(S, "smoothing_bias_us", g_config.smoothing_bias_us, P);
     WriteINIBool(S, "osd_show_adaptive_smoothing", g_config.osd_show_adaptive_smoothing, P);
     WriteINIBool(S, "osd_show_0_1pct_low", g_config.osd_show_0_1pct_low, P);
     WriteINIBool(S, "osd_show_gpu_render_time", g_config.osd_show_gpu_render_time, P);

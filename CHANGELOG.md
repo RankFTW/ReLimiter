@@ -16,6 +16,9 @@
 ### Scheduler
 - **Fixed stutter when marginally GPU-bound** — When the game is right at the FPS target and occasionally misses a deadline, the scheduler now re-anchors instead of skipping forward by whole intervals. Eliminates the ~7ms gate hold spike that caused a visible stutter every few frames in borderline GPU-bound scenarios. (lazorr410)
 
+### Adaptive Smoothing
+- **Configurable bias offset** — New slider (0–1000µs) adds a constant offset on top of the computed P99 smoothing. Useful for games with spiky render times where the automatic offset isn't quite enough. Persisted to INI.
+
 ### Frame Generation Detection
 - **Improved FG detection for Streamline games** — Games like Horizon Remastered that never confirm FG through Streamline's GetState are now detected via NGX CreateFeature. Fixes FG not being recognized and the limiter fighting the FG system.
 - FG status moved back to the Pipeline section on the OSD where it belongs.
@@ -39,6 +42,7 @@
 ### UI
 - **FG pacing info** — When Frame Generation is active, the ReShade settings panel shows the FG multiplier and the native frame budget ReLimiter is pacing to (e.g. "FG Pacing: 2x | Native: 60 fps (16.7 ms)").
 - **Expanded keybind support** — Bracket keys, punctuation, arrow keys, and numpad keys now work for all keybind slots (OSD toggle, preset cycling).
+- Removed OVERLOAD indicator from the OSD.
 
 ### Performance
 - **DLL version reading moved to background thread** — Version queries no longer run on the render thread. Polls on a dedicated thread with zero render impact.

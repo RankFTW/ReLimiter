@@ -75,6 +75,7 @@ struct Config {
     bool   adaptive_smoothing = false;           // Enable P99-based adaptive smoothing (DX12+Reflex only)
     double smoothing_percentile = 0.99;         // Target percentile (0.90–0.999)
     std::string smoothing_window = "medium";    // "medium" (256 frames) | "dual" (64+512)
+    double smoothing_bias_us = 0.0;             // Constant bias added to computed offset (0–1000µs)
 
     // OSD: Adaptive Smoothing
     bool osd_show_adaptive_smoothing = false;

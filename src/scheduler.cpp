@@ -554,6 +554,10 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         double gpu_active = g_reflex_gpu_active_us.load(std::memory_order_relaxed);
         if (gpu_active > 0.0 && gpu_active < effective_interval * 3.0)
             smoothing_offset = g_adaptive_smoothing.Update(gpu_active, effective_interval);
+        // Add user-configured constant bias on top of the computed offset
+        smoothing_offset += g_config.smoothing_bias_us;
+        // Re-publish total offset (computed + bias) for OSD
+        g_smoothing_offset_us.store(smoothing_offset, std::memory_order_relaxed);
         effective_interval += smoothing_offset;
     }
 

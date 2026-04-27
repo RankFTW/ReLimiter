@@ -865,6 +865,18 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 ImGui::EndCombo();
             }
             HelpTip("Medium: single 256-frame window (~4s). Dual: short 64 + long 512 window, uses max of both P99s for robustness against scene changes.");
+
+            // Bias slider
+            float bias = static_cast<float>(g_config.smoothing_bias_us);
+            if (ImGui::SliderFloat("Bias##adaptive", &bias, 0.0f, 1000.0f, "%.0f us")) {
+                g_config.smoothing_bias_us = static_cast<double>(bias);
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                config_dirty = true;
+            }
+            HelpTip("Constant offset added on top of the computed P99 smoothing. "
+                     "Use this to add extra headroom if the automatic offset isn't enough. "
+                     "0 = no extra bias, 1000 = +1ms added to every frame interval.");
         }
     }
 
@@ -1578,7 +1590,6 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
     }
 
     int tier = static_cast<int>(g_current_tier);
-    bool overload = g_overload_active_flag.load(std::memory_order_relaxed);
 
     // Limiter-added latency: only the gate hold adds to input-to-photon latency.
     // own_sleep happens at SIMULATION_START (before input sampling with Reflex),
@@ -1786,8 +1797,6 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             char buf[48];
             snprintf(buf, sizeof(buf), "Limiter: +%.1f ms  T%d", limiter_added_ms, tier);
             OSDTextColored(ColPipeline(), buf);
-            if (overload)
-                OSDTextColored(ColStatus(), "OVERLOAD");
         }
 
         if (g_config.osd_show_adaptive_smoothing && g_config.adaptive_smoothing) {
@@ -1796,8 +1805,8 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             if (g_adaptive_smoothing.IsWarm()) {
                 const char* mode = g_adaptive_smoothing.dual_mode ? "Dual" : "Med";
                 double pct = g_adaptive_smoothing.target_percentile * 100.0;
-                char buf[64];
-                snprintf(buf, sizeof(buf), "Adaptive: +%.1f us (P%.0f: %.1f ms) [%s]",
+                char buf[96];
+                snprintf(buf, sizeof(buf), "Adaptive: +%.0f us (P%.0f: %.1f ms) [%s]",
                          offset, pct, p99 / 1000.0, mode);
                 float b = g_config.osd_text_brightness;
                 ImVec4 col = (offset < 100.0)
