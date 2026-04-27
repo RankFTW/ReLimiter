@@ -458,17 +458,20 @@ void NGXHooks_TryInstall() {
     bool ok = TryHookModule(L"_nvngx.dll");
     if (!ok) ok = TryHookModule(L"nvngx.dll");
 
-    // Streamline games call CreateFeature on the feature DLL directly.
-    // However, hooking both _nvngx.dll AND feature DLLs causes double-hooking
-    // (the _nvngx export internally calls the feature DLL export), which crashes
-    // some games (e.g. Crimson Desert). Only hook _nvngx.dll — it's the entry
-    // point for all NGX calls and catches everything.
-    // TryHookModule(L"nvngx_dlss.dll");
-    // TryHookModule(L"_nvngx_dlss.dll");
+    // Streamline games may call CreateFeature on the feature DLL directly.
+    // Only hook feature DLLs if we didn't already hook _nvngx.dll / nvngx.dll,
+    // to avoid the double-hook chain that crashed Crimson Desert.
+    if (!ok) {
+        ok = TryHookModule(L"nvngx_dlss.dll");
+        if (!ok) ok = TryHookModule(L"_nvngx_dlss.dll");
+    }
 
-    // Ray Reconstruction DLL — same issue, skip
-    // TryHookModule(L"nvngx_dlssd.dll");
-    // TryHookModule(L"_nvngx_dlssd.dll");
+    // Ray Reconstruction DLL — same fallback logic
+    if (!s_orig_d3d12_create && !s_orig_d3d11_create) {
+        TryHookModule(L"nvngx_dlssd.dll");
+        if (!s_orig_d3d12_create && !s_orig_d3d11_create)
+            TryHookModule(L"_nvngx_dlssd.dll");
+    }
 
     // Log which NGX DLLs are loaded
     static bool s_logged = false;
