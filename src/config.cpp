@@ -13,6 +13,9 @@ Config g_config;
 static char s_ini_path[MAX_PATH] = {};
 static bool s_first_launch = false;
 
+// Forward declaration — defined in OSD Presets section
+static const char* GetPresetsINIPath();
+
 // ── Simple INI helpers ──
 static std::string ReadINIString(const char* section, const char* key,
                                   const char* def, const char* path) {
@@ -169,6 +172,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.csv_enabled             = ReadINIBool(S, "csv_enabled", false, P);
     g_config.reflex_inject           = ReadINIBool(S, "reflex_inject", false, P);
     g_config.flip_model_override     = ReadINIBool(S, "flip_model_override", false, P);
+    g_config.shared_presets          = ReadINIBool(S, "shared_presets", false, P);
     g_config.dynamic_mfg_passthrough = ReadINIBool(S, "dynamic_mfg_passthrough", false, P);
     g_config.dmfg_output_cap         = ReadINIInt(S, "dmfg_output_cap", 0, P);
     g_config.adaptive_smoothing      = ReadINIBool(S, "adaptive_smoothing", false, P);
@@ -220,8 +224,17 @@ void SaveConfig() {
     WriteINIDouble(S, "osd_y", g_config.osd_y, P);
     WriteINIDouble(S, "osd_opacity", g_config.osd_opacity, P);
     WriteINIString(S, "osd_toggle_key", g_config.osd_toggle_key.c_str(), P);
-    WriteINIString(S, "osd_preset_prev_key", g_config.osd_preset_prev_key.c_str(), P);
-    WriteINIString(S, "osd_preset_next_key", g_config.osd_preset_next_key.c_str(), P);
+    // Preset cycling keybinds: write to shared file when shared_presets is on
+    if (g_config.shared_presets) {
+        const char* SP = GetPresetsINIPath();
+        if (SP[0] != '\0') {
+            WriteINIString("Presets", "prev_key", g_config.osd_preset_prev_key.c_str(), SP);
+            WriteINIString("Presets", "next_key", g_config.osd_preset_next_key.c_str(), SP);
+        }
+    } else {
+        WriteINIString(S, "osd_preset_prev_key", g_config.osd_preset_prev_key.c_str(), P);
+        WriteINIString(S, "osd_preset_next_key", g_config.osd_preset_next_key.c_str(), P);
+    }
     WriteINIBool(S, "osd_show_fps", g_config.osd_show_fps, P);
     WriteINIBool(S, "osd_show_frametime", g_config.osd_show_frametime, P);
     WriteINIBool(S, "osd_show_frametime_graph", g_config.osd_show_frametime_graph, P);
@@ -243,6 +256,7 @@ void SaveConfig() {
     WriteINIBool(S, "csv_enabled", g_config.csv_enabled, P);
     WriteINIBool(S, "reflex_inject", g_config.reflex_inject, P);
     WriteINIBool(S, "flip_model_override", g_config.flip_model_override, P);
+    WriteINIBool(S, "shared_presets", g_config.shared_presets, P);
     WriteINIBool(S, "dynamic_mfg_passthrough", g_config.dynamic_mfg_passthrough, P);
     WriteINIInt(S, "dmfg_output_cap", g_config.dmfg_output_cap, P);
     WriteINIBool(S, "adaptive_smoothing", g_config.adaptive_smoothing, P);
@@ -292,7 +306,32 @@ void ApplyConfig() {
 // ── OSD Presets ──
 
 #include <vector>
+#include <ShlObj.h>
 static std::vector<OSDPreset> s_user_presets;
+static char s_shared_presets_path[MAX_PATH] = {};
+
+// Returns the INI path for preset storage — shared or per-game depending on config.
+static const char* GetPresetsINIPath() {
+    if (g_config.shared_presets) {
+        if (s_shared_presets_path[0] == '\0') {
+            // Build %LOCALAPPDATA%/RHI/ReLimiter_Presets/presets.ini
+            char local[MAX_PATH] = {};
+            if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, local))) {
+                snprintf(s_shared_presets_path, MAX_PATH, "%s\\RHI\\ReLimiter_Presets\\presets.ini", local);
+                // Create directory if it doesn't exist
+                char dir[MAX_PATH];
+                snprintf(dir, MAX_PATH, "%s\\RHI", local);
+                CreateDirectoryA(dir, nullptr);
+                snprintf(dir, MAX_PATH, "%s\\RHI\\ReLimiter_Presets", local);
+                CreateDirectoryA(dir, nullptr);
+                LOG_INFO("Shared presets path: %s", s_shared_presets_path);
+            }
+        }
+        if (s_shared_presets_path[0] != '\0')
+            return s_shared_presets_path;
+    }
+    return s_ini_path;
+}
 
 static void EnsureMinSlots() {
     while (static_cast<int>(s_user_presets.size()) < OSD_INITIAL_PRESET_SLOTS)
@@ -465,13 +504,21 @@ static void ReadPresetFromINI(int i, const char* P) {
 
 void OSDPreset_LoadAll() {
     if (s_ini_path[0] == '\0') return;
-    const char* P = s_ini_path;
+    const char* P = GetPresetsINIPath();
 
     s_user_presets.clear();
 
     // Scan up to OSD_MAX_PRESET_SLOTS sections
     for (int i = 0; i < OSD_MAX_PRESET_SLOTS; i++) {
         ReadPresetFromINI(i, P);
+    }
+
+    // Load preset cycling keybinds from the presets file
+    if (g_config.shared_presets && P != s_ini_path) {
+        std::string prev = ReadINIString("Presets", "prev_key", "", P);
+        std::string next = ReadINIString("Presets", "next_key", "", P);
+        if (!prev.empty()) g_config.osd_preset_prev_key = prev;
+        if (!next.empty()) g_config.osd_preset_next_key = next;
     }
 
     // Ensure at least the initial 3 slots exist
@@ -481,7 +528,7 @@ void OSDPreset_LoadAll() {
 void OSDPreset_SaveSlot(int slot) {
     if (s_ini_path[0] == '\0') return;
     if (slot < 0 || slot >= static_cast<int>(s_user_presets.size())) return;
-    const char* P = s_ini_path;
+    const char* P = GetPresetsINIPath();
 
     char section[32];
     snprintf(section, sizeof(section), "OSD_Preset_%d", slot + 1);
@@ -529,25 +576,25 @@ void OSDPreset_SaveSlot(int slot) {
 void OSDPreset_DeleteSlot(int slot) {
     if (slot < 0 || slot >= static_cast<int>(s_user_presets.size())) return;
 
+    const char* P = GetPresetsINIPath();
+
     // Remove the INI section
-    if (s_ini_path[0] != '\0') {
+    if (P[0] != '\0') {
         char section[32];
         snprintf(section, sizeof(section), "OSD_Preset_%d", slot + 1);
-        WritePrivateProfileStringA(section, nullptr, nullptr, s_ini_path);
+        WritePrivateProfileStringA(section, nullptr, nullptr, P);
     }
 
     // Remove from vector (shifts higher slots down)
     s_user_presets.erase(s_user_presets.begin() + slot);
 
     // Re-save all remaining slots so INI indices stay contiguous
-    // First clear all old sections up to max
-    if (s_ini_path[0] != '\0') {
+    if (P[0] != '\0') {
         for (int i = slot; i < OSD_MAX_PRESET_SLOTS; i++) {
             char section[32];
             snprintf(section, sizeof(section), "OSD_Preset_%d", i + 1);
-            WritePrivateProfileStringA(section, nullptr, nullptr, s_ini_path);
+            WritePrivateProfileStringA(section, nullptr, nullptr, P);
         }
-        // Re-write remaining slots
         for (int i = slot; i < static_cast<int>(s_user_presets.size()); i++) {
             if (s_user_presets[i].occupied)
                 OSDPreset_SaveSlot(i);

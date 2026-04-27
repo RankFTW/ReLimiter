@@ -65,6 +65,9 @@ struct Config {
     // Flip Model Override (DX11)
     bool flip_model_override = false;   // Force DXGI_SWAP_EFFECT_FLIP_DISCARD on DX11 bitblt swapchains
 
+    // Shared OSD Presets — load presets from %LOCALAPPDATA%/RHI/ReLimiter_Presets/
+    bool shared_presets = false;
+
     // Dynamic MFG Passthrough — disable pacing when DLSS 4.5 Dynamic MFG is active
     bool dynamic_mfg_passthrough = false;
 

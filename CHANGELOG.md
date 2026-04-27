@@ -1,52 +1,47 @@
 # Changelog
 
 
-## 3.1.8 (Beta)
+## 3.1.8
 
 ### DLSS Info on OSD
 - **Quality level, resolution, and active features** now shown on the OSD. See which DLSS mode you're running (Quality, Balanced, Performance, Ultra Perf, DLAA), the render and output resolution, and whether SR, RR, or FG is active. Every mode shows its render percentage (e.g. "Quality (67%)", "Balanced (59%)").
-- **Custom resolution detection** — Recognises NVIDIA App custom scales like DLAA Lite (88%), Ultra Quality+ (83%), and High Quality (72%). Non-standard ratios set via Profile Inspector or NVIDIA App show as "Custom (XX%)". Tolerance scales with output resolution so ultrawide displays are detected correctly.
+- **Custom resolution detection** — Recognises NVIDIA App custom scales like DLAA Lite (88%), Ultra Quality+ (83%), and High Quality (72%). Non-standard ratios set via Profile Inspector or NVIDIA App show as "Custom (XX%)".
 - **Preset letters** — Shows the active DLSS preset for SR, RR, and FG. Reads driver overrides from NVIDIA App in real time. When no override is set, shows the SDK default (e.g. K for Quality, M for Performance, E for Ray Reconstruction).
 - **DLL versions** — Shows DLSS SR, RR, FG, and Streamline DLL versions on the OSD (toggleable) and always in the ReShade settings panel. Useful for verifying which DLSS version a game is running.
 - **Everything updates in real time** — Change quality mode, toggle RR on/off, switch presets in NVIDIA App mid-game — the OSD reflects it immediately.
 - **DLAA detection** — Automatically detected when render resolution matches output resolution, regardless of what the game reports.
-- **ReShade panel info** — Full DLSS status (quality, features, resolution, presets, versions) always visible at the bottom of the ReShade settings panel without needing the OSD enabled.
 - SR and RR are shown as mutually exclusive (RR replaces SR when active). FG preset only shown when a preset is actually set.
 
 ### Scheduler
-- **Fixed stutter when marginally GPU-bound** — When the game is right at the FPS target and occasionally misses a deadline, the scheduler now re-anchors instead of skipping forward by whole intervals. Eliminates the ~7ms gate hold spike that caused a visible stutter every few frames in borderline GPU-bound scenarios. (lazorr410)
+- **Fixed stutter when marginally GPU-bound** — When the game is right at the FPS target and occasionally misses a deadline, the scheduler now re-anchors cleanly. Eliminates the gate hold spike that caused a visible stutter every few frames in borderline GPU-bound scenarios. (lazorr410)
 
 ### Adaptive Smoothing
-- **Configurable bias offset** — New slider (0–1000µs) adds a constant offset on top of the computed P99 smoothing. Useful for games with spiky render times where the automatic offset isn't quite enough. Persisted to INI.
+- **Configurable bias offset** — New slider (0–1000µs) adds a constant offset on top of the computed P99 smoothing. Useful for games with spiky render times where the automatic offset isn't quite enough.
 
-### Frame Generation Detection
+### Frame Generation
 - **Improved FG detection for Streamline games** — Games like Horizon Remastered that never confirm FG through Streamline's GetState are now detected via NGX CreateFeature. Fixes FG not being recognized and the limiter fighting the FG system.
-- FG status moved back to the Pipeline section on the OSD where it belongs.
-
-### Performance Fixes
-- **Fixed periodic stutter on DX11 games** — Hardware monitoring was running NVAPI calls on the render thread every second. Now runs on a dedicated background thread with zero render thread impact.
-- **Fixed 2-second frametime spikes and VRR flicker** — G-Sync state and VRR ceiling were being polled every 2 seconds via NVAPI, causing driver lock contention. Now polled once at startup and on display changes only.
-- **Fixed 5-second stutter from preset reading** — DRS preset queries now run on a background thread, polling every 10 seconds with no render thread involvement.
-
-### Bug Fixes
-- **Fixed crash in Crimson Desert** — NGX hooks were installed on both the runtime DLL and feature DLLs, creating a double-hook chain that crashed during FG initialization. Now only hooks the NGX runtime entry point.
-- **Fixed crash in Death Stranding 2** — Games that send Reflex markers but not the type ReLimiter listens for now correctly fall back to present-based pacing instead of freezing.
-- **Fixed wrong DLSS version on Streamline games** — Streamline wrapper DLLs (sl.dlss.dll) were being read instead of the actual DLSS DLLs, showing the Streamline version number as the SR version.
-- **Fixed "Custom" quality showing on ultrawide** — Quality detection tolerance was a fixed pixel count that didn't scale with resolution. Now uses a percentage-based tolerance so ultrawide displays match correctly.
-- **Fixed ReShade UI checkbox wrapping** — Checkboxes now correctly wrap to the next line when the panel is narrow.
+- **FG pacing info** — When Frame Generation is active, the ReShade settings panel shows the FG multiplier and the native frame budget (e.g. "FG Pacing: 2x | Native: 60 fps").
 
 ### OSD Presets
-- **Preset cycling keybinds** — Bind keys to cycle through OSD presets (Min → Med → Full → user presets) without opening the ReShade UI. Prev/Next keybind slots in the OSD settings section. Works in-game with the overlay closed.
-- Preset letters from NVIDIA App driver overrides are read via the stable DRS API (same database Profile Inspector uses). Updates every 10 seconds on a background thread so mid-session changes in NVIDIA App are picked up.
-
-### UI
-- **FG pacing info** — When Frame Generation is active, the ReShade settings panel shows the FG multiplier and the native frame budget ReLimiter is pacing to (e.g. "FG Pacing: 2x | Native: 60 fps (16.7 ms)").
-- **Expanded keybind support** — Bracket keys, punctuation, arrow keys, and numpad keys now work for all keybind slots (OSD toggle, preset cycling).
-- Removed OVERLOAD indicator from the OSD.
+- **Preset cycling keybinds** — Bind keys to cycle through OSD presets (Min → Med → Full → user presets) without opening the ReShade UI. Works in-game with the overlay closed.
+- **Shared presets across games** — OSD presets and cycling keybinds can be shared across all games via a global presets file. Set up your presets once, use them everywhere. Enabled through RHI.
 
 ### Performance
-- **DLL version reading moved to background thread** — Version queries no longer run on the render thread. Polls on a dedicated thread with zero render impact.
-- **1% / 0.1% low FPS calculation throttled** — Sorting now runs every 30 frames (~5Hz) instead of every frame.
+- **Reduced render thread overhead** — DLL version reading, 1%/0.1% low FPS sorting, and hardware monitoring all moved to background threads. The render thread now only handles what it absolutely must: scheduling, gate, and OSD drawing.
+- **Fixed periodic stutter on DX11 games** — Hardware monitoring was running NVAPI calls on the render thread every second. Now runs on a dedicated background thread.
+- **Fixed 2-second frametime spikes and VRR flicker** — G-Sync state and VRR ceiling polling moved from every 2 seconds to once at startup and on display changes only.
+
+### Bug Fixes
+- **Fixed Vulkan games not working** — An extra DLL in the import table was preventing ReShade from detecting Vulkan swapchains. Version reading now uses fully dynamic loading with zero import table impact.
+- **Fixed crash in Crimson Desert** — NGX hooks were creating a double-hook chain that crashed during FG initialization. Now only hooks the NGX runtime entry point, with feature DLLs as a fallback.
+- **Fixed crash in Death Stranding 2** — Games that send Reflex markers but not the type ReLimiter listens for now correctly fall back to present-based pacing.
+- **Fixed wrong DLSS version on Streamline games** — Streamline wrapper DLLs were being read instead of the actual DLSS DLLs.
+- **Fixed "Custom" quality showing on ultrawide** — Quality detection now scales with output resolution so ultrawide displays match correctly.
+- **Fixed ReShade UI checkbox wrapping** — Checkboxes now correctly wrap to the next line when the panel is narrow.
+
+### UI
+- **ReShade panel info** — Full DLSS status (quality, features, resolution, presets, versions) always visible at the bottom of the settings panel.
+- **Expanded keybind support** — Bracket keys, punctuation, arrow keys, and numpad keys now work for all keybind slots.
 
 
 ## 3.1.7

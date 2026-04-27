@@ -525,8 +525,6 @@ void NGXHooks_ClearFGCreated() {
 // Reads file version from loaded DLLs on a background thread.
 // Zero render thread impact — versions appear on OSD once ready.
 
-#pragma comment(lib, "version.lib")
-
 static std::atomic<bool> s_versions_read{false};
 static char s_sr_ver[24] = {};
 static char s_rr_ver[24] = {};
@@ -534,7 +532,15 @@ static char s_fg_ver[24] = {};
 static char s_sl_ver[24] = {};
 static std::atomic<bool> s_version_thread_started{false};
 
-static bool ReadDllVersionBG(const wchar_t* dll_name, char* out, size_t out_size) {
+// Function pointer types for version.dll (loaded dynamically to avoid import table bloat)
+using pGetFileVersionInfoSizeW = DWORD(WINAPI*)(LPCWSTR, LPDWORD);
+using pGetFileVersionInfoW = BOOL(WINAPI*)(LPCWSTR, DWORD, DWORD, LPVOID);
+using pVerQueryValueW = BOOL(WINAPI*)(LPCVOID, LPCWSTR, LPVOID*, PUINT);
+
+static bool ReadDllVersionBG(pGetFileVersionInfoSizeW fnSize,
+                              pGetFileVersionInfoW fnInfo,
+                              pVerQueryValueW fnQuery,
+                              const wchar_t* dll_name, char* out, size_t out_size) {
     HMODULE mod = GetModuleHandleW(dll_name);
     if (!mod) return false;
 
@@ -542,17 +548,17 @@ static bool ReadDllVersionBG(const wchar_t* dll_name, char* out, size_t out_size
     if (!GetModuleFileNameW(mod, path, MAX_PATH)) return false;
 
     DWORD dummy = 0;
-    DWORD size = GetFileVersionInfoSizeW(path, &dummy);
+    DWORD size = fnSize(path, &dummy);
     if (size == 0) return false;
 
     auto* data = new (std::nothrow) BYTE[size];
     if (!data) return false;
 
     bool ok = false;
-    if (GetFileVersionInfoW(path, 0, size, data)) {
+    if (fnInfo(path, 0, size, data)) {
         VS_FIXEDFILEINFO* ffi = nullptr;
         UINT ffi_len = 0;
-        if (VerQueryValueW(data, L"\\", reinterpret_cast<void**>(&ffi), &ffi_len) && ffi) {
+        if (fnQuery(data, L"\\", reinterpret_cast<void**>(&ffi), &ffi_len) && ffi) {
             snprintf(out, out_size, "%u.%u.%u.%u",
                      HIWORD(ffi->dwFileVersionMS), LOWORD(ffi->dwFileVersionMS),
                      HIWORD(ffi->dwFileVersionLS), LOWORD(ffi->dwFileVersionLS));
@@ -564,28 +570,37 @@ static bool ReadDllVersionBG(const wchar_t* dll_name, char* out, size_t out_size
 }
 
 static DWORD WINAPI VersionPollThread(LPVOID) {
+    // Load version.dll dynamically — keeps it out of our import table
+    HMODULE hVer = LoadLibraryW(L"version.dll");
+    if (!hVer) { s_versions_read.store(true); return 0; }
+
+    auto fnSize = reinterpret_cast<pGetFileVersionInfoSizeW>(GetProcAddress(hVer, "GetFileVersionInfoSizeW"));
+    auto fnInfo = reinterpret_cast<pGetFileVersionInfoW>(GetProcAddress(hVer, "GetFileVersionInfoW"));
+    auto fnQuery = reinterpret_cast<pVerQueryValueW>(GetProcAddress(hVer, "VerQueryValueW"));
+    if (!fnSize || !fnInfo || !fnQuery) { s_versions_read.store(true); return 0; }
+
     // Poll every 500ms for up to 30 seconds waiting for DLLs to load
     for (int attempt = 0; attempt < 60; attempt++) {
         bool found_any = false;
 
         if (!s_sr_ver[0]) {
-            if (ReadDllVersionBG(L"nvngx_dlss.dll", s_sr_ver, sizeof(s_sr_ver)) ||
-                ReadDllVersionBG(L"_nvngx_dlss.dll", s_sr_ver, sizeof(s_sr_ver)))
+            if (ReadDllVersionBG(fnSize, fnInfo, fnQuery, L"nvngx_dlss.dll", s_sr_ver, sizeof(s_sr_ver)) ||
+                ReadDllVersionBG(fnSize, fnInfo, fnQuery, L"_nvngx_dlss.dll", s_sr_ver, sizeof(s_sr_ver)))
                 found_any = true;
         }
         if (!s_rr_ver[0]) {
-            if (ReadDllVersionBG(L"nvngx_dlssd.dll", s_rr_ver, sizeof(s_rr_ver)) ||
-                ReadDllVersionBG(L"_nvngx_dlssd.dll", s_rr_ver, sizeof(s_rr_ver)))
+            if (ReadDllVersionBG(fnSize, fnInfo, fnQuery, L"nvngx_dlssd.dll", s_rr_ver, sizeof(s_rr_ver)) ||
+                ReadDllVersionBG(fnSize, fnInfo, fnQuery, L"_nvngx_dlssd.dll", s_rr_ver, sizeof(s_rr_ver)))
                 found_any = true;
         }
         if (!s_fg_ver[0]) {
-            if (ReadDllVersionBG(L"nvngx_dlssg.dll", s_fg_ver, sizeof(s_fg_ver)) ||
-                ReadDllVersionBG(L"_nvngx_dlssg.dll", s_fg_ver, sizeof(s_fg_ver)))
+            if (ReadDllVersionBG(fnSize, fnInfo, fnQuery, L"nvngx_dlssg.dll", s_fg_ver, sizeof(s_fg_ver)) ||
+                ReadDllVersionBG(fnSize, fnInfo, fnQuery, L"_nvngx_dlssg.dll", s_fg_ver, sizeof(s_fg_ver)))
                 found_any = true;
         }
         if (!s_sl_ver[0]) {
-            if (ReadDllVersionBG(L"sl.interposer.dll", s_sl_ver, sizeof(s_sl_ver)) ||
-                ReadDllVersionBG(L"sl.common.dll", s_sl_ver, sizeof(s_sl_ver)))
+            if (ReadDllVersionBG(fnSize, fnInfo, fnQuery, L"sl.interposer.dll", s_sl_ver, sizeof(s_sl_ver)) ||
+                ReadDllVersionBG(fnSize, fnInfo, fnQuery, L"sl.common.dll", s_sl_ver, sizeof(s_sl_ver)))
                 found_any = true;
         }
 
@@ -596,7 +611,6 @@ static DWORD WINAPI VersionPollThread(LPVOID) {
                      s_rr_ver[0] ? s_rr_ver : "-",
                      s_fg_ver[0] ? s_fg_ver : "-",
                      s_sl_ver[0] ? s_sl_ver : "-");
-            // All found? Stop polling.
             if ((s_sr_ver[0] || s_rr_ver[0]) && s_sl_ver[0])
                 return 0;
         }
