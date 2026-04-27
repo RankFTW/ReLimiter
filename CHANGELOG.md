@@ -33,10 +33,16 @@
 - **Fixed ReShade UI checkbox wrapping** — Checkboxes now correctly wrap to the next line when the panel is narrow.
 
 ### OSD Presets
+- **Preset cycling keybinds** — Bind keys to cycle through OSD presets (Min → Med → Full → user presets) without opening the ReShade UI. Prev/Next keybind slots in the OSD settings section. Works in-game with the overlay closed.
 - Preset letters from NVIDIA App driver overrides are read via the stable DRS API (same database Profile Inspector uses). Updates every 10 seconds on a background thread so mid-session changes in NVIDIA App are picked up.
 
 ### UI
 - **FG pacing info** — When Frame Generation is active, the ReShade settings panel shows the FG multiplier and the native frame budget ReLimiter is pacing to (e.g. "FG Pacing: 2x | Native: 60 fps (16.7 ms)").
+- **Expanded keybind support** — Bracket keys, punctuation, arrow keys, and numpad keys now work for all keybind slots (OSD toggle, preset cycling).
+
+### Performance
+- **DLL version reading moved to background thread** — Version queries no longer run on the render thread. Polls on a dedicated thread with zero render impact.
+- **1% / 0.1% low FPS calculation throttled** — Sorting now runs every 30 frames (~5Hz) instead of every frame.
 
 
 ## 3.1.7
