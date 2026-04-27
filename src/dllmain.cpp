@@ -324,6 +324,10 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
     }
     s_hModule = hModule;
     LOG_INFO("Config loaded: target_fps=%d", g_config.target_fps);
+    LOG_INFO("Config keybinds: toggle=%s prev=%s next=%s",
+             g_config.osd_toggle_key.c_str(),
+             g_config.osd_preset_prev_key.empty() ? "(none)" : g_config.osd_preset_prev_key.c_str(),
+             g_config.osd_preset_next_key.empty() ? "(none)" : g_config.osd_preset_next_key.c_str());
 
     if (MH_Initialize() != MH_OK) {
         LOG_ERROR("MH_Initialize failed");

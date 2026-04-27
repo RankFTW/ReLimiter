@@ -78,48 +78,9 @@ static void* s_hook_targets[kMaxHookTargets] = {};
 static int s_hook_count = 0;
 static bool s_hooks_installed = false;
 
-// Version re-scan trigger — set by CreateFeature, consumed by ReadAllVersions
-static std::atomic<bool> s_version_rescan{false};
-
-// NGX parameter-based version strings (read from CreateFeature params)
-static char s_ngx_sr_ver[24] = {};
-static char s_ngx_rr_ver[24] = {};
-static char s_ngx_fg_ver[24] = {};
-
 // ── Common parameter extraction ──
 
 static void ExtractDlssParams(void* params, unsigned int feature_id) {
-    // Trigger a version re-scan — NGX just loaded a feature DLL
-    s_version_rescan.store(true, std::memory_order_relaxed);
-
-    // Try to read feature version from NGX parameters.
-    // Note: Version.Major/Minor/Patch keys are not set by all NGX versions.
-    // This is a best-effort fallback for when module enumeration can't find the DLLs
-    // (e.g. DLSS GLOM / NGX model override).
-    if (params) {
-        unsigned int ver_major = 0, ver_minor = 0, ver_patch = 0;
-        __try {
-            // Try multiple key patterns — different NGX versions use different keys
-            if (!NGX_SUCCEED(NGX_GetUI(params, "Version.Major", &ver_major)))
-                NGX_GetUI(params, "DLSS.Version.Major", &ver_major);
-            if (!NGX_SUCCEED(NGX_GetUI(params, "Version.Minor", &ver_minor)))
-                NGX_GetUI(params, "DLSS.Version.Minor", &ver_minor);
-            if (!NGX_SUCCEED(NGX_GetUI(params, "Version.Patch", &ver_patch)))
-                NGX_GetUI(params, "DLSS.Version.Patch", &ver_patch);
-        } __except(EXCEPTION_EXECUTE_HANDLER) {}
-
-        if (ver_major > 0) {
-            char* dest = nullptr;
-            if (feature_id == NGX_Feature_SuperSampling) dest = s_ngx_sr_ver;
-            else if (feature_id == NGX_Feature_RayReconstruction) dest = s_ngx_rr_ver;
-            else if (feature_id == NGX_Feature_FrameGeneration) dest = s_ngx_fg_ver;
-            if (dest) {
-                snprintf(dest, 24, "%u.%u.%u", ver_major, ver_minor, ver_patch);
-                LOG_INFO("NGX: feature %u version from params: %s", feature_id, dest);
-            }
-        }
-    }
-
     // Ray Reconstruction
     if (feature_id == NGX_Feature_RayReconstruction) {
         s_ray_reconstruction.store(true, std::memory_order_relaxed);
@@ -558,20 +519,25 @@ void NGXHooks_ClearFGCreated() {
 }
 
 // ── DLL version reading ──
-// Reads file version from loaded DLLs. Uses module enumeration to find DLLs
-// regardless of load path (handles DLSS GLOM / NGX override redirects where
-// DLLs are loaded from C:\ProgramData\NVIDIA\NGX\models\... instead of the
-// game directory).
+// Reads file version from loaded DLLs on a background thread.
+// Zero render thread impact — versions appear on OSD once ready.
 
 #pragma comment(lib, "version.lib")
 
-static bool s_versions_read = false;
+static std::atomic<bool> s_versions_read{false};
 static char s_sr_ver[24] = {};
 static char s_rr_ver[24] = {};
 static char s_fg_ver[24] = {};
 static char s_sl_ver[24] = {};
+static std::atomic<bool> s_version_thread_started{false};
 
-static bool ReadVersionFromPath(const wchar_t* path, char* out, size_t out_size) {
+static bool ReadDllVersionBG(const wchar_t* dll_name, char* out, size_t out_size) {
+    HMODULE mod = GetModuleHandleW(dll_name);
+    if (!mod) return false;
+
+    wchar_t path[MAX_PATH] = {};
+    if (!GetModuleFileNameW(mod, path, MAX_PATH)) return false;
+
     DWORD dummy = 0;
     DWORD size = GetFileVersionInfoSizeW(path, &dummy);
     if (size == 0) return false;
@@ -594,71 +560,61 @@ static bool ReadVersionFromPath(const wchar_t* path, char* out, size_t out_size)
     return ok;
 }
 
-static bool ReadDllVersion(const wchar_t* dll_name, char* out, size_t out_size) {
-    HMODULE mod = GetModuleHandleW(dll_name);
-    if (!mod) return false;
+static DWORD WINAPI VersionPollThread(LPVOID) {
+    // Poll every 500ms for up to 30 seconds waiting for DLLs to load
+    for (int attempt = 0; attempt < 60; attempt++) {
+        bool found_any = false;
 
-    wchar_t path[MAX_PATH] = {};
-    if (!GetModuleFileNameW(mod, path, MAX_PATH)) return false;
-
-    return ReadVersionFromPath(path, out, out_size);
-}
-
-static void ReadAllVersions() {
-    if (s_versions_read) {
-        // Re-scan if CreateFeature triggered it and we're still missing versions
-        if (s_version_rescan.exchange(false, std::memory_order_relaxed) &&
-            (!s_sr_ver[0] || !s_fg_ver[0])) {
-            s_versions_read = false;
-        } else {
-            return;
+        if (!s_sr_ver[0]) {
+            if (ReadDllVersionBG(L"nvngx_dlss.dll", s_sr_ver, sizeof(s_sr_ver)) ||
+                ReadDllVersionBG(L"_nvngx_dlss.dll", s_sr_ver, sizeof(s_sr_ver)))
+                found_any = true;
         }
-    }
+        if (!s_rr_ver[0]) {
+            if (ReadDllVersionBG(L"nvngx_dlssd.dll", s_rr_ver, sizeof(s_rr_ver)) ||
+                ReadDllVersionBG(L"_nvngx_dlssd.dll", s_rr_ver, sizeof(s_rr_ver)))
+                found_any = true;
+        }
+        if (!s_fg_ver[0]) {
+            if (ReadDllVersionBG(L"nvngx_dlssg.dll", s_fg_ver, sizeof(s_fg_ver)) ||
+                ReadDllVersionBG(L"_nvngx_dlssg.dll", s_fg_ver, sizeof(s_fg_ver)))
+                found_any = true;
+        }
+        if (!s_sl_ver[0]) {
+            if (ReadDllVersionBG(L"sl.interposer.dll", s_sl_ver, sizeof(s_sl_ver)) ||
+                ReadDllVersionBG(L"sl.common.dll", s_sl_ver, sizeof(s_sl_ver)))
+                found_any = true;
+        }
 
-    // Use GetModuleHandleW — safe, no deadlock risk, works for game-bundled DLLs.
-    // Note: sl.dlss.dll / sl.dlss_g.dll are Streamline wrappers with SL version
-    // numbers, NOT the actual DLSS DLL versions — don't use them for SR/FG.
-    bool found_any = false;
-
-    if (!s_sr_ver[0]) {
-        if (ReadDllVersion(L"nvngx_dlss.dll", s_sr_ver, sizeof(s_sr_ver)) ||
-            ReadDllVersion(L"_nvngx_dlss.dll", s_sr_ver, sizeof(s_sr_ver)))
-            found_any = true;
-    }
-    if (!s_rr_ver[0]) {
-        if (ReadDllVersion(L"nvngx_dlssd.dll", s_rr_ver, sizeof(s_rr_ver)) ||
-            ReadDllVersion(L"_nvngx_dlssd.dll", s_rr_ver, sizeof(s_rr_ver)))
-            found_any = true;
-    }
-    if (!s_fg_ver[0]) {
-        if (ReadDllVersion(L"nvngx_dlssg.dll", s_fg_ver, sizeof(s_fg_ver)) ||
-            ReadDllVersion(L"_nvngx_dlssg.dll", s_fg_ver, sizeof(s_fg_ver)))
-            found_any = true;
-    }
-    if (!s_sl_ver[0]) {
-        if (ReadDllVersion(L"sl.interposer.dll", s_sl_ver, sizeof(s_sl_ver)) ||
-            ReadDllVersion(L"sl.common.dll", s_sl_ver, sizeof(s_sl_ver)))
-            found_any = true;
-    }
-
-    // Only mark as done if we found something, or we've been trying too long.
-    static int s_attempts = 0;
-    s_attempts++;
-    if (found_any || s_attempts > 600) {
-        s_versions_read = true;
         if (found_any) {
+            s_versions_read.store(true, std::memory_order_release);
             LOG_INFO("NGX versions: SR=%s RR=%s FG=%s SL=%s",
                      s_sr_ver[0] ? s_sr_ver : "-",
                      s_rr_ver[0] ? s_rr_ver : "-",
                      s_fg_ver[0] ? s_fg_ver : "-",
                      s_sl_ver[0] ? s_sl_ver : "-");
+            // All found? Stop polling.
+            if ((s_sr_ver[0] || s_rr_ver[0]) && s_sl_ver[0])
+                return 0;
         }
+
+        Sleep(500);
     }
+
+    s_versions_read.store(true, std::memory_order_release);
+    return 0;
+}
+
+static void StartVersionThread() {
+    bool expected = false;
+    if (!s_version_thread_started.compare_exchange_strong(expected, true))
+        return;
+    CloseHandle(CreateThread(nullptr, 0, VersionPollThread, nullptr, 0, nullptr));
 }
 
 NGXDLSSInfo NGXHooks_GetInfo() {
-    // Read DLL versions once (deferred until first query so DLLs have time to load)
-    if (!s_versions_read) ReadAllVersions();
+    // Start version poll thread on first call (runs in background, zero render impact)
+    StartVersionThread();
 
     NGXDLSSInfo info = {};
     info.render_width  = s_render_w.load(std::memory_order_relaxed);
@@ -673,22 +629,10 @@ NGXDLSSInfo NGXHooks_GetInfo() {
     info.fg_active     = s_fg_created.load(std::memory_order_relaxed);
     info.available     = s_has_data.load(std::memory_order_relaxed);
 
-    // Copy version strings — prefer module-scan, fall back to NGX parameter versions
-    if (s_sr_ver[0])
-        memcpy(info.sr_version, s_sr_ver, sizeof(info.sr_version));
-    else if (s_ngx_sr_ver[0])
-        memcpy(info.sr_version, s_ngx_sr_ver, sizeof(info.sr_version));
-
-    if (s_rr_ver[0])
-        memcpy(info.rr_version, s_rr_ver, sizeof(info.rr_version));
-    else if (s_ngx_rr_ver[0])
-        memcpy(info.rr_version, s_ngx_rr_ver, sizeof(info.rr_version));
-
-    if (s_fg_ver[0])
-        memcpy(info.fg_version, s_fg_ver, sizeof(info.fg_version));
-    else if (s_ngx_fg_ver[0])
-        memcpy(info.fg_version, s_ngx_fg_ver, sizeof(info.fg_version));
-
+    // Copy version strings (populated by background thread)
+    memcpy(info.sr_version, s_sr_ver, sizeof(info.sr_version));
+    memcpy(info.rr_version, s_rr_ver, sizeof(info.rr_version));
+    memcpy(info.fg_version, s_fg_ver, sizeof(info.fg_version));
     memcpy(info.sl_version, s_sl_ver, sizeof(info.sl_version));
 
     // DLAA detection: quality==5 explicitly, OR render==output (regardless of quality value)

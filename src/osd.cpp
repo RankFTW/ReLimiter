@@ -453,6 +453,149 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             }
         }
 
+        // ── Preset cycling keybinds ──
+        {
+            // Built-in preset definitions for cycling
+            // Index: 0=Min, 1=Med, 2=Full, then 3..N = user presets (occupied only)
+            auto ApplyPresetByIndex = [&](int idx) {
+                if (idx == 0) {
+                    OSDPreset p = {};
+                    p.show_fps = true; p.show_frametime = true; p.show_gpu_temp = true;
+                    OSDPreset_ApplyTogglesOnly(p);
+                } else if (idx == 1) {
+                    OSDPreset p = {};
+                    p.show_fps = true; p.show_1pct_low = true; p.show_frametime = true;
+                    p.show_frametime_graph = true; p.show_gpu_render_time = true;
+                    p.show_pqi = true; p.show_smoothness = true; p.show_fg = true;
+                    p.show_gpu_temp = true; p.show_gpu_usage = true; p.show_vram = true;
+                    OSDPreset_ApplyTogglesOnly(p);
+                } else if (idx == 2) {
+                    OSDPreset p = {};
+                    p.show_fps = true; p.show_1pct_low = true; p.show_0_1pct_low = true;
+                    p.show_frametime = true; p.show_frametime_graph = true;
+                    p.show_cpu_latency = true; p.show_gpu_render_time = true;
+                    p.show_total_frame_cost = true; p.show_fg_time = true;
+                    p.show_pqi = true; p.show_pqi_breakdown = true;
+                    p.show_smoothness = true; p.show_fg = true; p.show_limiter = true;
+                    p.show_adaptive_smoothing = true; p.show_gpu_temp = true;
+                    p.show_gpu_clock = true; p.show_gpu_usage = true; p.show_vram = true;
+                    p.show_cpu_usage = true; p.show_ram = true;
+                    p.show_dlss_quality = true; p.show_dlss_features = true;
+                    p.show_dlss_resolution = true; p.show_dlss_presets = true;
+                    p.show_dlss_versions = true;
+                    OSDPreset_ApplyTogglesOnly(p);
+                } else {
+                    // User preset (idx - 3)
+                    int user_idx = idx - 3;
+                    if (user_idx >= 0 && user_idx < OSDPreset_GetCount()) {
+                        OSDPreset& slot = OSDPreset_GetSlot(user_idx);
+                        if (slot.occupied)
+                            OSDPreset_ApplyToConfig(slot);
+                    }
+                }
+                config_dirty = true;
+            };
+
+            // Count total presets: 3 built-in + occupied user presets
+            static int s_current_preset = 0;
+            int total_presets = 3;
+            for (int i = 0; i < OSDPreset_GetCount(); i++)
+                if (OSDPreset_GetSlot(i).occupied) total_presets++;
+
+            // Keybind UI
+            ImGui::Spacing();
+
+            // Prev Preset keybind
+            {
+                static bool s_capturing = false;
+                ImGui::Text("Prev Preset:");
+                ImGui::SameLine();
+                if (s_capturing) {
+                    ImGui::TextColored(ImVec4(1,1,0.3f,1), "Press key...");
+                    ImGui::SameLine();
+                    if (ImGui::Button("Cancel##prev")) s_capturing = false;
+                    for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k++) {
+                        ImGuiKey key = static_cast<ImGuiKey>(k);
+                        if (key == ImGuiKey_LeftCtrl || key == ImGuiKey_RightCtrl) continue;
+                        if (key == ImGuiKey_LeftShift || key == ImGuiKey_RightShift) continue;
+                        if (key == ImGuiKey_LeftAlt || key == ImGuiKey_RightAlt) continue;
+                        if (key == ImGuiKey_LeftSuper || key == ImGuiKey_RightSuper) continue;
+                        if (k == ImGuiMod_Ctrl || k == ImGuiMod_Shift || k == ImGuiMod_Alt || k == ImGuiMod_Super) continue;
+                        if (key >= ImGuiKey_MouseLeft && key <= ImGuiKey_MouseWheelY) continue;
+                        const char* kn = ImGui::GetKeyName(key);
+                        if (kn && kn[0] == 'M' && kn[1] == 'o' && kn[2] == 'd') continue;
+                        if (ImGui::IsKeyPressed(key, false)) {
+                            std::string name;
+                            if (ImGui::IsKeyDown(ImGuiMod_Ctrl)) name += "Ctrl+";
+                            if (ImGui::IsKeyDown(ImGuiMod_Alt)) name += "Alt+";
+                            if (ImGui::IsKeyDown(ImGuiMod_Shift)) name += "Shift+";
+                            name += ImGui::GetKeyName(key);
+                            g_config.osd_preset_prev_key = name;
+                            s_capturing = false;
+                            config_dirty = true;
+                            break;
+                        }
+                    }
+                } else {
+                    ImGui::Text("%s", g_config.osd_preset_prev_key.empty() ? "None" : g_config.osd_preset_prev_key.c_str());
+                    ImGui::SameLine();
+                    if (ImGui::Button("Bind##prev")) s_capturing = true;
+                    if (!g_config.osd_preset_prev_key.empty()) {
+                        ImGui::SameLine();
+                        if (ImGui::Button("Clear##prev")) {
+                            g_config.osd_preset_prev_key.clear();
+                            config_dirty = true;
+                        }
+                    }
+                }
+            }
+
+            // Next Preset keybind
+            {
+                static bool s_capturing = false;
+                ImGui::Text("Next Preset:");
+                ImGui::SameLine();
+                if (s_capturing) {
+                    ImGui::TextColored(ImVec4(1,1,0.3f,1), "Press key...");
+                    ImGui::SameLine();
+                    if (ImGui::Button("Cancel##next")) s_capturing = false;
+                    for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k++) {
+                        ImGuiKey key = static_cast<ImGuiKey>(k);
+                        if (key == ImGuiKey_LeftCtrl || key == ImGuiKey_RightCtrl) continue;
+                        if (key == ImGuiKey_LeftShift || key == ImGuiKey_RightShift) continue;
+                        if (key == ImGuiKey_LeftAlt || key == ImGuiKey_RightAlt) continue;
+                        if (key == ImGuiKey_LeftSuper || key == ImGuiKey_RightSuper) continue;
+                        if (k == ImGuiMod_Ctrl || k == ImGuiMod_Shift || k == ImGuiMod_Alt || k == ImGuiMod_Super) continue;
+                        if (key >= ImGuiKey_MouseLeft && key <= ImGuiKey_MouseWheelY) continue;
+                        const char* kn = ImGui::GetKeyName(key);
+                        if (kn && kn[0] == 'M' && kn[1] == 'o' && kn[2] == 'd') continue;
+                        if (ImGui::IsKeyPressed(key, false)) {
+                            std::string name;
+                            if (ImGui::IsKeyDown(ImGuiMod_Ctrl)) name += "Ctrl+";
+                            if (ImGui::IsKeyDown(ImGuiMod_Alt)) name += "Alt+";
+                            if (ImGui::IsKeyDown(ImGuiMod_Shift)) name += "Shift+";
+                            name += ImGui::GetKeyName(key);
+                            g_config.osd_preset_next_key = name;
+                            s_capturing = false;
+                            config_dirty = true;
+                            break;
+                        }
+                    }
+                } else {
+                    ImGui::Text("%s", g_config.osd_preset_next_key.empty() ? "None" : g_config.osd_preset_next_key.c_str());
+                    ImGui::SameLine();
+                    if (ImGui::Button("Bind##next")) s_capturing = true;
+                    if (!g_config.osd_preset_next_key.empty()) {
+                        ImGui::SameLine();
+                        if (ImGui::Button("Clear##next")) {
+                            g_config.osd_preset_next_key.clear();
+                            config_dirty = true;
+                        }
+                    }
+                }
+            }
+        }
+
         // ── Elements by category ──
         // Layout: checkboxes flow horizontally, separated by " - ", wrapping on overflow.
         // HelpTip is attached to each checkbox via its (?) marker.
@@ -1112,43 +1255,41 @@ static double s_low_history[LOW_HISTORY_SIZE] = {};
 static int    s_low_history_idx = 0;
 static int    s_low_history_count = 0;
 
-static double Compute1PctLowFPS() {
-    if (s_low_history_count < 30) return 0.0;
-    int n = s_low_history_count < LOW_HISTORY_SIZE ? s_low_history_count : LOW_HISTORY_SIZE;
-    static double sorted[LOW_HISTORY_SIZE];
-    for (int i = 0; i < n; i++)
-        sorted[i] = s_low_history[i];
-    std::sort(sorted, sorted + n);
-    // 1% low: average the slowest 1% of frame times, convert to FPS
-    int tail_start = static_cast<int>(0.99 * (n - 1));
-    int tail_count = n - tail_start;
-    double sum = 0.0;
-    for (int i = tail_start; i < n; i++)
-        sum += sorted[i];
-    double avg_worst = sum / tail_count;
-    if (avg_worst > 0.0)
-        return 1000000.0 / avg_worst;
-    return 0.0;
-}
+// Cached results — recomputed every 30 frames instead of every frame
+static double s_cached_1pct_low = 0.0;
+static double s_cached_01pct_low = 0.0;
+static int    s_low_recompute_counter = 0;
 
-static double Compute0_1PctLowFPS() {
-    if (s_low_history_count < 100) return 0.0; // Need more samples for 0.1%
+static void RecomputeLowFPS() {
     int n = s_low_history_count < LOW_HISTORY_SIZE ? s_low_history_count : LOW_HISTORY_SIZE;
-    static double sorted_01[LOW_HISTORY_SIZE];
-    for (int i = 0; i < n; i++)
-        sorted_01[i] = s_low_history[i];
-    std::sort(sorted_01, sorted_01 + n);
-    // 0.1% low: average the slowest 0.1% of frame times, convert to FPS
-    int tail_start = static_cast<int>(0.999 * (n - 1));
-    int tail_count = n - tail_start;
-    if (tail_count < 1) tail_count = 1;
-    double sum = 0.0;
-    for (int i = tail_start; i < n; i++)
-        sum += sorted_01[i];
-    double avg_worst = sum / tail_count;
-    if (avg_worst > 0.0)
-        return 1000000.0 / avg_worst;
-    return 0.0;
+
+    // 1% low
+    if (n >= 30) {
+        static double sorted[LOW_HISTORY_SIZE];
+        for (int i = 0; i < n; i++)
+            sorted[i] = s_low_history[i];
+        std::sort(sorted, sorted + n);
+
+        int tail_start = static_cast<int>(0.99 * (n - 1));
+        int tail_count = n - tail_start;
+        double sum = 0.0;
+        for (int i = tail_start; i < n; i++)
+            sum += sorted[i];
+        double avg_worst = sum / tail_count;
+        s_cached_1pct_low = (avg_worst > 0.0) ? 1000000.0 / avg_worst : 0.0;
+
+        // 0.1% low (reuse sorted array)
+        if (n >= 100) {
+            int tail_01 = static_cast<int>(0.999 * (n - 1));
+            int count_01 = n - tail_01;
+            if (count_01 < 1) count_01 = 1;
+            double sum_01 = 0.0;
+            for (int i = tail_01; i < n; i++)
+                sum_01 += sorted[i];
+            double avg_01 = sum_01 / count_01;
+            s_cached_01pct_low = (avg_01 > 0.0) ? 1000000.0 / avg_01 : 0.0;
+        }
+    }
 }
 
 // ── Category colors ──
@@ -1221,6 +1362,34 @@ static int KeyNameToVK(const std::string& name) {
     if (_stricmp(name.c_str(), "Pause") == 0)     return VK_PAUSE;
     if (_stricmp(name.c_str(), "ScrollLock") == 0) return VK_SCROLL;
     if (_stricmp(name.c_str(), "PrintScreen") == 0) return VK_SNAPSHOT;
+    if (_stricmp(name.c_str(), "LeftBracket") == 0)  return VK_OEM_4;    // [
+    if (_stricmp(name.c_str(), "RightBracket") == 0) return VK_OEM_6;    // ]
+    if (_stricmp(name.c_str(), "Backslash") == 0)    return VK_OEM_5;    // '\'
+    if (_stricmp(name.c_str(), "Semicolon") == 0)    return VK_OEM_1;    // ;
+    if (_stricmp(name.c_str(), "Apostrophe") == 0)   return VK_OEM_7;    // '
+    if (_stricmp(name.c_str(), "Comma") == 0)        return VK_OEM_COMMA;
+    if (_stricmp(name.c_str(), "Period") == 0)       return VK_OEM_PERIOD;
+    if (_stricmp(name.c_str(), "Slash") == 0)        return VK_OEM_2;    // /
+    if (_stricmp(name.c_str(), "GraveAccent") == 0)  return VK_OEM_3;   // `
+    if (_stricmp(name.c_str(), "Minus") == 0)        return VK_OEM_MINUS;
+    if (_stricmp(name.c_str(), "Equal") == 0)        return VK_OEM_PLUS; // = key (VK_OEM_PLUS is the =/+ key)
+    if (_stricmp(name.c_str(), "UpArrow") == 0)      return VK_UP;
+    if (_stricmp(name.c_str(), "DownArrow") == 0)    return VK_DOWN;
+    if (_stricmp(name.c_str(), "LeftArrow") == 0)    return VK_LEFT;
+    if (_stricmp(name.c_str(), "RightArrow") == 0)   return VK_RIGHT;
+    if (_stricmp(name.c_str(), "NumLock") == 0)      return VK_NUMLOCK;
+    if (_stricmp(name.c_str(), "CapsLock") == 0)     return VK_CAPITAL;
+    // Numpad
+    if (_stricmp(name.c_str(), "Keypad0") == 0)      return VK_NUMPAD0;
+    if (_stricmp(name.c_str(), "Keypad1") == 0)      return VK_NUMPAD1;
+    if (_stricmp(name.c_str(), "Keypad2") == 0)      return VK_NUMPAD2;
+    if (_stricmp(name.c_str(), "Keypad3") == 0)      return VK_NUMPAD3;
+    if (_stricmp(name.c_str(), "Keypad4") == 0)      return VK_NUMPAD4;
+    if (_stricmp(name.c_str(), "Keypad5") == 0)      return VK_NUMPAD5;
+    if (_stricmp(name.c_str(), "Keypad6") == 0)      return VK_NUMPAD6;
+    if (_stricmp(name.c_str(), "Keypad7") == 0)      return VK_NUMPAD7;
+    if (_stricmp(name.c_str(), "Keypad8") == 0)      return VK_NUMPAD8;
+    if (_stricmp(name.c_str(), "Keypad9") == 0)      return VK_NUMPAD9;
     // Hex fallback
     if (name.size() >= 3 && name[0] == '0' && (name[1] == 'x' || name[1] == 'X'))
         return static_cast<int>(strtol(name.c_str(), nullptr, 16));
@@ -1292,6 +1461,94 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         }
     }
 
+    // ── Preset cycling keybind polling ──
+    {
+        static bool s_prev_pressed = false;
+        static bool s_next_pressed = false;
+        static int s_active_preset = -1;  // -1 = no preset selected via keybind yet
+
+        // Count total presets: 3 built-in + occupied user presets
+        int total_presets = 3;
+        for (int i = 0; i < OSDPreset_GetCount(); i++)
+            if (OSDPreset_GetSlot(i).occupied) total_presets++;
+
+        auto PollPresetKey = [](const std::string& key_str, bool& was_pressed) -> bool {
+            if (key_str.empty()) return false;
+            ParsedKeybind kb = ParseKeybind(key_str);
+            if (kb.vk == 0) return false;
+
+            bool key_down = (GetAsyncKeyState(kb.vk) & 0x8000) != 0;
+            bool ctrl_held  = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) || (GetAsyncKeyState(VK_RCONTROL) & 0x8000);
+            bool alt_held   = (GetAsyncKeyState(VK_LMENU) & 0x8000) || (GetAsyncKeyState(VK_RMENU) & 0x8000);
+            bool shift_held = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) || (GetAsyncKeyState(VK_RSHIFT) & 0x8000);
+
+            bool mods_ok = true;
+            if (kb.ctrl && !ctrl_held) mods_ok = false;
+            if (kb.alt && !alt_held) mods_ok = false;
+            if (kb.shift && !shift_held) mods_ok = false;
+            if (!kb.ctrl && ctrl_held) mods_ok = false;
+            if (!kb.alt && alt_held) mods_ok = false;
+            if (!kb.shift && shift_held) mods_ok = false;
+
+            bool pressed = key_down && mods_ok;
+            bool triggered = pressed && !was_pressed;
+            was_pressed = pressed;
+            return triggered;
+        };
+
+        // Apply preset by index: 0=Min, 1=Med, 2=Full, 3+=user presets
+        auto ApplyCyclePreset = [](int idx) {
+            if (idx == 0) {
+                OSDPreset p = {};
+                p.show_fps = true; p.show_frametime = true; p.show_gpu_temp = true;
+                OSDPreset_ApplyTogglesOnly(p);
+            } else if (idx == 1) {
+                OSDPreset p = {};
+                p.show_fps = true; p.show_1pct_low = true; p.show_frametime = true;
+                p.show_frametime_graph = true; p.show_gpu_render_time = true;
+                p.show_pqi = true; p.show_smoothness = true; p.show_fg = true;
+                p.show_gpu_temp = true; p.show_gpu_usage = true; p.show_vram = true;
+                OSDPreset_ApplyTogglesOnly(p);
+            } else if (idx == 2) {
+                OSDPreset p = {};
+                p.show_fps = true; p.show_1pct_low = true; p.show_0_1pct_low = true;
+                p.show_frametime = true; p.show_frametime_graph = true;
+                p.show_cpu_latency = true; p.show_gpu_render_time = true;
+                p.show_total_frame_cost = true; p.show_fg_time = true;
+                p.show_pqi = true; p.show_pqi_breakdown = true;
+                p.show_smoothness = true; p.show_fg = true; p.show_limiter = true;
+                p.show_adaptive_smoothing = true; p.show_gpu_temp = true;
+                p.show_gpu_clock = true; p.show_gpu_usage = true; p.show_vram = true;
+                p.show_cpu_usage = true; p.show_ram = true;
+                p.show_dlss_quality = true; p.show_dlss_features = true;
+                p.show_dlss_resolution = true; p.show_dlss_presets = true;
+                p.show_dlss_versions = true;
+                OSDPreset_ApplyTogglesOnly(p);
+            } else {
+                int user_idx = idx - 3;
+                if (user_idx >= 0 && user_idx < OSDPreset_GetCount()) {
+                    OSDPreset& slot = OSDPreset_GetSlot(user_idx);
+                    if (slot.occupied)
+                        OSDPreset_ApplyToConfig(slot);
+                }
+            }
+            SaveConfig();
+        };
+
+        if (total_presets > 0) {
+            if (PollPresetKey(g_config.osd_preset_prev_key, s_prev_pressed)) {
+                s_active_preset = (s_active_preset <= 0) ? total_presets - 1 : s_active_preset - 1;
+                LOG_INFO("OSD: Preset cycle prev -> %d/%d", s_active_preset, total_presets);
+                ApplyCyclePreset(s_active_preset);
+            }
+            if (PollPresetKey(g_config.osd_preset_next_key, s_next_pressed)) {
+                s_active_preset = (s_active_preset >= total_presets - 1) ? 0 : s_active_preset + 1;
+                LOG_INFO("OSD: Preset cycle next -> %d/%d", s_active_preset, total_presets);
+                ApplyCyclePreset(s_active_preset);
+            }
+        }
+    }
+
     if (!g_config.osd_enabled) return;
 
     // Update hardware sensors (throttled internally to ~1Hz)
@@ -1358,6 +1615,12 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             if (s_low_history_count < LOW_HISTORY_SIZE) s_low_history_count++;
         }
 
+        // Recompute 1%/0.1% low every 30 frames (~5Hz) instead of every frame
+        if (++s_low_recompute_counter >= 30) {
+            s_low_recompute_counter = 0;
+            RecomputeLowFPS();
+        }
+
         // ═══════════════════════════════════
         // PERFORMANCE (cyan)
         // ═══════════════════════════════════
@@ -1365,18 +1628,14 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             double output = g_output_fps.load(std::memory_order_relaxed);
             char buf[64];
             if (IsNvSmoothMotionActive()) {
-                // Smooth Motion: s_real_fps is the render rate, SM doubles at driver level
                 snprintf(buf, sizeof(buf), "%.1f fps (%.1f render)", s_real_fps * 2.0, s_real_fps);
             } else if (IsDmfgActive() && output > 0.0) {
-                // DMFG: derive render FPS from output / multiplier.
-                // s_real_fps is enforcement-to-enforcement which in passthrough
-                // mode measures CPU submission rate, not actual render rate.
                 int actual_mult = g_fg_actual_multiplier.load(std::memory_order_relaxed);
                 double render_fps;
                 if (actual_mult >= 2)
                     render_fps = output / static_cast<double>(actual_mult);
                 else
-                    render_fps = s_real_fps;  // fallback if multiplier unknown
+                    render_fps = s_real_fps;
                 snprintf(buf, sizeof(buf), "%.1f fps (%.1f render)", output, render_fps);
             } else if (output > 0.0 && fg_presenting && fg_mult > 0)
                 snprintf(buf, sizeof(buf), "%.1f fps (%.1f render)", output, s_real_fps);
@@ -1386,19 +1645,17 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         }
 
         if (g_config.osd_show_1pct_low) {
-            double low = Compute1PctLowFPS();
-            if (low > 0.0) {
+            if (s_cached_1pct_low > 0.0) {
                 char buf[32];
-                snprintf(buf, sizeof(buf), "1%% Low: %.0f", low);
+                snprintf(buf, sizeof(buf), "1%% Low: %.0f", s_cached_1pct_low);
                 OSDTextColored(ColPerf(), buf);
             }
         }
 
         if (g_config.osd_show_0_1pct_low) {
-            double low01 = Compute0_1PctLowFPS();
-            if (low01 > 0.0) {
+            if (s_cached_01pct_low > 0.0) {
                 char buf[32];
-                snprintf(buf, sizeof(buf), "0.1%% Low: %.0f", low01);
+                snprintf(buf, sizeof(buf), "0.1%% Low: %.0f", s_cached_01pct_low);
                 OSDTextColored(ColPerf(), buf);
             }
         }

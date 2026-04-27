@@ -145,6 +145,8 @@ void LoadConfig(HMODULE hModule) {
     g_config.osd_y                   = static_cast<float>(ReadINIDouble(S, "osd_y", 0.005, P));
     g_config.osd_opacity             = static_cast<float>(ReadINIDouble(S, "osd_opacity", 0.6, P));
     g_config.osd_toggle_key          = ReadINIString(S, "osd_toggle_key", "PageUp", P);
+    g_config.osd_preset_prev_key     = ReadINIString(S, "osd_preset_prev_key", "", P);
+    g_config.osd_preset_next_key     = ReadINIString(S, "osd_preset_next_key", "", P);
     g_config.osd_show_fps            = ReadINIBool(S, "osd_show_fps", true, P);
     g_config.osd_show_frametime      = ReadINIBool(S, "osd_show_frametime", false, P);
     g_config.osd_show_frametime_graph = ReadINIBool(S, "osd_show_frametime_graph", false, P);
@@ -216,6 +218,8 @@ void SaveConfig() {
     WriteINIDouble(S, "osd_y", g_config.osd_y, P);
     WriteINIDouble(S, "osd_opacity", g_config.osd_opacity, P);
     WriteINIString(S, "osd_toggle_key", g_config.osd_toggle_key.c_str(), P);
+    WriteINIString(S, "osd_preset_prev_key", g_config.osd_preset_prev_key.c_str(), P);
+    WriteINIString(S, "osd_preset_next_key", g_config.osd_preset_next_key.c_str(), P);
     WriteINIBool(S, "osd_show_fps", g_config.osd_show_fps, P);
     WriteINIBool(S, "osd_show_frametime", g_config.osd_show_frametime, P);
     WriteINIBool(S, "osd_show_frametime_graph", g_config.osd_show_frametime_graph, P);
