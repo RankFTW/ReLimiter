@@ -17,6 +17,17 @@ double AdaptiveSmoothing::Update(double render_time_us, double effective_interva
     if (render_time_us > effective_interval_us * 3.0)
         return smoothed_offset_us;
 
+    // Median-based outlier rejection: reject samples beyond 3x the median render time.
+    // The median is robust to existing outliers (unlike the mean). This catches shader
+    // compilation spikes, streaming hitches, and driver stalls that would inflate the
+    // P99 for hundreds of frames. Normal render time variance passes through — that's
+    // the signal adaptive smoothing needs. Only activates after 32 samples.
+    if (primary.Size() >= 32) {
+        double median = primary.Percentile(0.5);
+        if (render_time_us > median * 3.0)
+            return smoothed_offset_us;
+    }
+
     // Push to windows
     primary.Push(render_time_us);
     if (dual_mode) {

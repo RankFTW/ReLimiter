@@ -1,6 +1,12 @@
 # Changelog
 
 
+## 3.1.9 (Beta)
+
+### Adaptive Smoothing
+- **Median-based outlier rejection** — Extreme render time spikes (shader compilation, streaming hitches, driver stalls) are now filtered before entering the P99 window. Samples beyond 3× the median render time are rejected, preventing a single spike from inflating the smoothing offset for hundreds of frames. Normal render time variance passes through untouched — only true outliers are filtered.
+
+
 ## 3.1.8
 
 ### DLSS Info on OSD
