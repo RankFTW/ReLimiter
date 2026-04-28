@@ -1,6 +1,7 @@
 #include "vk_enforce.h"
 #include "config.h"
 #include "scheduler.h"
+#include "streamline_hooks.h"
 #include "sleep.h"
 #include "hw_spin.h"
 #include "predictor.h"
@@ -95,28 +96,39 @@ void VkEnforce_OnPresent(int64_t now_qpc) {
     // ── Real render present ──
     uint64_t frameID = s_vk_frame_counter.fetch_add(1, std::memory_order_relaxed);
 
-    // ── DX11 Simple Limiter: bypass scheduler, just sleep to target ──
-    if (g_config.dx11_simple_limiter && SwapMgr_GetActiveAPI() == ActiveAPI::DX11) {
-        int target = g_user_target_fps.load(std::memory_order_relaxed);
-        if (target > 0 && s_post_sleep_qpc > 0) {
-            double target_interval_us = 1000000.0 / static_cast<double>(target);
-            double elapsed_us = qpc_to_us(now_qpc - s_post_sleep_qpc);
-            double sleep_us = target_interval_us - elapsed_us;
-            if (sleep_us > 200.0) {
-                int64_t wake_target = now_qpc + us_to_qpc(sleep_us);
-                double coarse_us = sleep_us - 1500.0;
-                if (coarse_us > 500.0)
-                    CoarseSleep(static_cast<int64_t>(coarse_us));
-                HWSpin(wake_target);
+    // ── Simple Limiter: default for non-DX12 APIs ──
+    // DX11/DX10/DX9/OpenGL/Vulkan(non-Reflex) don't benefit from the full
+    // scheduler (no Reflex markers, no reliable DXGI stats, no FG).
+    // Simple sleep-to-target gives cleaner frametimes with less overhead.
+    // Users can opt out via dx11_simple_limiter=false to force the full scheduler.
+    {
+        ActiveAPI api = SwapMgr_GetActiveAPI();
+        bool use_simple = (api != ActiveAPI::DX12) && !g_config.dx11_advanced_scheduler;
+        // Don't use simple limiter if FG is active — needs full scheduler for
+        // FG coalescing and divisor-based pacing
+        if (use_simple && g_fg_presenting.load(std::memory_order_relaxed))
+            use_simple = false;
+        if (use_simple) {
+            int target = g_user_target_fps.load(std::memory_order_relaxed);
+            if (target > 0 && s_post_sleep_qpc > 0) {
+                double target_interval_us = 1000000.0 / static_cast<double>(target);
+                double elapsed_us = qpc_to_us(now_qpc - s_post_sleep_qpc);
+                double sleep_us = target_interval_us - elapsed_us;
+                if (sleep_us > 200.0) {
+                    int64_t wake_target = now_qpc + us_to_qpc(sleep_us);
+                    double coarse_us = sleep_us - 1500.0;
+                    if (coarse_us > 500.0)
+                        CoarseSleep(static_cast<int64_t>(coarse_us));
+                    HWSpin(wake_target);
+                }
             }
+            LARGE_INTEGER post;
+            QueryPerformanceCounter(&post);
+            if (s_post_sleep_qpc > 0)
+                g_actual_frame_time_us.store(qpc_to_us(post.QuadPart - s_post_sleep_qpc), std::memory_order_relaxed);
+            s_post_sleep_qpc = post.QuadPart;
+            return;
         }
-        // Record post-sleep time for next frame's elapsed calculation
-        LARGE_INTEGER post;
-        QueryPerformanceCounter(&post);
-        if (s_post_sleep_qpc > 0)
-            g_actual_frame_time_us.store(qpc_to_us(post.QuadPart - s_post_sleep_qpc), std::memory_order_relaxed);
-        s_post_sleep_qpc = post.QuadPart;
-        return;
     }
 
     // ── Feed predictor directly ──

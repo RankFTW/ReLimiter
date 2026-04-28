@@ -4,15 +4,16 @@
 ## 3.1.9 (Beta)
 
 ### Adaptive Smoothing
-- **Median-based outlier rejection** — Extreme render time spikes (shader compilation, streaming hitches, driver stalls) are now filtered before entering the P99 window. Samples beyond 3× the median render time are rejected, preventing a single spike from inflating the smoothing offset for hundreds of frames. Normal render time variance passes through untouched — only true outliers are filtered.
+- **Median-based outlier rejection** — Extreme render time spikes (shader compilation, streaming hitches, driver stalls) are now filtered before entering the P99 window. Prevents a single spike from inflating the smoothing offset for hundreds of frames.
 
-### DX11
-- **Simple Limiter mode** — New toggle under Advanced → DX11. Bypasses the full scheduler, prediction, gate, and feedback systems. Just a clean sleep-to-target with minimal per-frame overhead. Use this if you see a periodic heartbeat pattern in DX11 frametime graphs that doesn't appear without ReLimiter. OSD still works.
+### Simple Limiter for Non-DX12 Games
+- **Automatic lightweight pacing** — DX11, DX10, DX9, OpenGL, and Vulkan games now use a clean sleep-to-target limiter by default. The full scheduler (prediction, gate, cadence metering, feedback scan) only runs on DX12 where it has real data to work with. This eliminates the periodic frametime heartbeat pattern that some users saw on DX11 games.
+- If FG is detected (e.g. Vulkan + FSR FG), the full scheduler activates automatically.
+- "Advanced Scheduler" toggle under Advanced → DX11 to opt back in if needed.
 
 ### Troubleshooting
-- **Disable Frame Latency Control** — Stops ReLimiter from forcing frame latency to 1 on DX11. Fixes periodic stalls and freezes in some DX11 games. Requires restart.
-- **Disable System Hardening** — Turns off GPU scheduling priority boost, MMCSS present thread registration, and power throttling bypass. Fixes priority inversion stalls on some systems. Requires restart.
-- **Disable Feedback Scan** — Skips the Reflex ring buffer scan that runs every frame. Takes effect immediately.
+- **Disable Frame Latency Control** — Stops ReLimiter from forcing frame latency to 1 on DX11. Fixes periodic stalls in some DX11 games. Requires restart.
+- **Disable System Hardening** — Turns off GPU scheduling priority boost, MMCSS, and power throttling bypass. Fixes priority inversion stalls on some systems. Requires restart.
 
 
 ## 3.1.8

@@ -1000,17 +1000,6 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 "May break some games that use GDI interop or MSAA. "
                 "Requires game restart to take effect.");
 
-        // Simple Limiter
-        bool simple = g_config.dx11_simple_limiter;
-        if (ImGui::Checkbox("Simple Limiter##dx11", &simple)) {
-            g_config.dx11_simple_limiter = simple;
-            config_dirty = true;
-        }
-        HelpTip("Bypasses the advanced scheduler, prediction, and gate systems. "
-                "Just a clean sleep-to-target with no per-frame overhead. "
-                "Use this if you see a periodic heartbeat pattern in DX11 games "
-                "that doesn't appear without ReLimiter. OSD still works.");
-
         // ── Logging ──
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Logging");
@@ -1056,15 +1045,6 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         HelpTip("Disables forcing frame latency to 1 on DX11 games. "
                 "Try this if you experience periodic stalls or freezes in DX11 games "
                 "that don't occur without ReLimiter. Requires game restart.");
-
-        bool no_feedback = g_config.disable_feedback_scan;
-        if (ImGui::Checkbox("Disable Feedback Scan", &no_feedback)) {
-            g_config.disable_feedback_scan = no_feedback;
-            config_dirty = true;
-        }
-        HelpTip("Disables the Reflex ring buffer scan that runs every frame. "
-                "Try this if you see a periodic heartbeat pattern in your frametime graph "
-                "that doesn't appear without ReLimiter. Takes effect immediately.");
     }
 
     // ════════════════════════════════════════════

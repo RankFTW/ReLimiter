@@ -173,9 +173,8 @@ void LoadConfig(HMODULE hModule) {
     g_config.reflex_inject           = ReadINIBool(S, "reflex_inject", false, P);
     g_config.flip_model_override     = ReadINIBool(S, "flip_model_override", false, P);
     g_config.disable_flc             = ReadINIBool(S, "disable_flc", false, P);
-    g_config.dx11_simple_limiter     = ReadINIBool(S, "dx11_simple_limiter", false, P);
+    g_config.dx11_advanced_scheduler  = ReadINIBool(S, "dx11_advanced_scheduler", false, P);
     g_config.disable_hardening       = ReadINIBool(S, "disable_hardening", false, P);
-    g_config.disable_feedback_scan   = ReadINIBool(S, "disable_feedback_scan", false, P);
     g_config.shared_presets          = ReadINIBool(S, "shared_presets", false, P);
     g_config.dynamic_mfg_passthrough = ReadINIBool(S, "dynamic_mfg_passthrough", false, P);
     g_config.dmfg_output_cap         = ReadINIInt(S, "dmfg_output_cap", 0, P);
@@ -261,9 +260,8 @@ void SaveConfig() {
     WriteINIBool(S, "reflex_inject", g_config.reflex_inject, P);
     WriteINIBool(S, "flip_model_override", g_config.flip_model_override, P);
     WriteINIBool(S, "disable_flc", g_config.disable_flc, P);
-    WriteINIBool(S, "dx11_simple_limiter", g_config.dx11_simple_limiter, P);
+    WriteINIBool(S, "dx11_advanced_scheduler", g_config.dx11_advanced_scheduler, P);
     WriteINIBool(S, "disable_hardening", g_config.disable_hardening, P);
-    WriteINIBool(S, "disable_feedback_scan", g_config.disable_feedback_scan, P);
     WriteINIBool(S, "shared_presets", g_config.shared_presets, P);
     WriteINIBool(S, "dynamic_mfg_passthrough", g_config.dynamic_mfg_passthrough, P);
     WriteINIInt(S, "dmfg_output_cap", g_config.dmfg_output_cap, P);

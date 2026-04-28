@@ -69,13 +69,10 @@ struct Config {
     bool disable_flc = false;           // Skip IDXGIDevice1::SetMaximumFrameLatency(1) on DX11
 
     // DX11 Simple Limiter — bypass scheduler/gate, just sleep to target
-    bool dx11_simple_limiter = false;
+    bool dx11_advanced_scheduler = false;  // When true, use full scheduler on non-DX12 APIs
 
     // System Hardening
     bool disable_hardening = false;     // Skip GPU priority, MMCSS, power throttling bypass
-
-    // Feedback scan
-    bool disable_feedback_scan = false; // Skip Reflex ring buffer scan (troubleshooting)
 
     // Shared OSD Presets — load presets from %LOCALAPPDATA%/RHI/ReLimiter_Presets/
     bool shared_presets = false;
