@@ -65,6 +65,18 @@ struct Config {
     // Flip Model Override (DX11)
     bool flip_model_override = false;   // Force DXGI_SWAP_EFFECT_FLIP_DISCARD on DX11 bitblt swapchains
 
+    // DX11 Frame Latency Controller
+    bool disable_flc = false;           // Skip IDXGIDevice1::SetMaximumFrameLatency(1) on DX11
+
+    // DX11 Simple Limiter — bypass scheduler/gate, just sleep to target
+    bool dx11_simple_limiter = false;
+
+    // System Hardening
+    bool disable_hardening = false;     // Skip GPU priority, MMCSS, power throttling bypass
+
+    // Feedback scan
+    bool disable_feedback_scan = false; // Skip Reflex ring buffer scan (troubleshooting)
+
     // Shared OSD Presets — load presets from %LOCALAPPDATA%/RHI/ReLimiter_Presets/
     bool shared_presets = false;
 

@@ -978,10 +978,13 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Waiting for device)");
         }
 
-        // Flip Model Override toggle (DX11 only)
+        // ── DX11 ──
         ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "DX11");
+
+        // Flip Model Override
         bool flip_override = g_config.flip_model_override;
-        if (ImGui::Checkbox("Flip Model Override", &flip_override)) {
+        if (ImGui::Checkbox("Flip Model Override##dx11", &flip_override)) {
             g_config.flip_model_override = flip_override;
             config_dirty = true;
         }
@@ -997,8 +1000,22 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 "May break some games that use GDI interop or MSAA. "
                 "Requires game restart to take effect.");
 
-        // Telemetry Logging toggle
+        // Simple Limiter
+        bool simple = g_config.dx11_simple_limiter;
+        if (ImGui::Checkbox("Simple Limiter##dx11", &simple)) {
+            g_config.dx11_simple_limiter = simple;
+            config_dirty = true;
+        }
+        HelpTip("Bypasses the advanced scheduler, prediction, and gate systems. "
+                "Just a clean sleep-to-target with no per-frame overhead. "
+                "Use this if you see a periodic heartbeat pattern in DX11 games "
+                "that doesn't appear without ReLimiter. OSD still works.");
+
+        // ── Logging ──
         ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Logging");
+
+        // Telemetry Logging toggle
         bool csv = g_config.csv_enabled;
         if (ImGui::Checkbox("Telemetry Logging", &csv)) {
             g_config.csv_enabled = csv;
@@ -1017,6 +1034,37 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         HelpTip("When enabled, the log file records detailed info-level messages. "
                 "When disabled, only warnings and errors are logged. "
                 "Enable this before reporting issues.");
+
+        // ── Troubleshooting ──
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Troubleshooting");
+
+        bool no_harden = g_config.disable_hardening;
+        if (ImGui::Checkbox("Disable System Hardening", &no_harden)) {
+            g_config.disable_hardening = no_harden;
+            config_dirty = true;
+        }
+        HelpTip("Disables GPU scheduling priority boost, MMCSS present thread registration, "
+                "and Windows power throttling bypass. Try this if you experience periodic "
+                "stalls or hitches that don't occur without ReLimiter. Requires game restart.");
+
+        bool no_flc = g_config.disable_flc;
+        if (ImGui::Checkbox("Disable Frame Latency Control", &no_flc)) {
+            g_config.disable_flc = no_flc;
+            config_dirty = true;
+        }
+        HelpTip("Disables forcing frame latency to 1 on DX11 games. "
+                "Try this if you experience periodic stalls or freezes in DX11 games "
+                "that don't occur without ReLimiter. Requires game restart.");
+
+        bool no_feedback = g_config.disable_feedback_scan;
+        if (ImGui::Checkbox("Disable Feedback Scan", &no_feedback)) {
+            g_config.disable_feedback_scan = no_feedback;
+            config_dirty = true;
+        }
+        HelpTip("Disables the Reflex ring buffer scan that runs every frame. "
+                "Try this if you see a periodic heartbeat pattern in your frametime graph "
+                "that doesn't appear without ReLimiter. Takes effect immediately.");
     }
 
     // ════════════════════════════════════════════

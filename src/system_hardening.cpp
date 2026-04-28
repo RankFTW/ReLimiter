@@ -1,4 +1,5 @@
 #include "system_hardening.h"
+#include "config.h"
 #include "hooks.h"
 #include "logger.h"
 #include <Windows.h>
@@ -291,17 +292,23 @@ static void UnregisterPresentThreadMMCSS() {
 
 void Hardening_Init() {
     InstallTimerPeriodHooks();
-    ApplyPowerThrottlingBypass();
-    ApplyDwmMMCSS();
-    ApplyGPUSchedulingPriority();
+    if (!g_config.disable_hardening) {
+        ApplyPowerThrottlingBypass();
+        ApplyDwmMMCSS();
+        ApplyGPUSchedulingPriority();
+    } else {
+        LOG_INFO("Hardening: GPU priority, MMCSS, power throttling disabled by config");
+    }
 }
 
 void Hardening_OnDevice(void* dxgi_swapchain) {
-    ApplyGPUThreadPriority(dxgi_swapchain);
+    if (!g_config.disable_hardening)
+        ApplyGPUThreadPriority(dxgi_swapchain);
 }
 
 void Hardening_OnFirstPresent() {
-    RegisterPresentThreadMMCSS();
+    if (!g_config.disable_hardening)
+        RegisterPresentThreadMMCSS();
 }
 
 void Hardening_Shutdown() {

@@ -884,7 +884,8 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     // arrival as a systematic offset.
     bool suppress_bias = !predictor_warm || s_background_mode || gate_active;
     g_cadence_meter.SetSuppressed(suppress_bias);
-    DrainCorrelator(overload_active, effective_interval);
+    if (!g_config.disable_feedback_scan)
+        DrainCorrelator(overload_active, effective_interval);
 
     // ── Telemetry ──
     Baseline_Tick();

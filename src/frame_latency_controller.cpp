@@ -1,4 +1,5 @@
 #include "frame_latency_controller.h"
+#include "config.h"
 #include "streamline_hooks.h"
 #include "logger.h"
 #include <Windows.h>
@@ -177,7 +178,10 @@ void FLC_OnSwapchainInit(uint64_t native_handle, ActiveAPI api) {
 
     switch (api) {
         case ActiveAPI::DX11:
-            ApplyDX11FrameLatency(native_handle);
+            if (g_config.disable_flc)
+                LOG_INFO("FLC: DX11 disabled by config");
+            else
+                ApplyDX11FrameLatency(native_handle);
             break;
 
         case ActiveAPI::DX12:
