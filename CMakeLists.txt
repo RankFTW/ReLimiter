@@ -115,6 +115,12 @@ add_library(relimiter SHARED
     src/version.rc
 )
 
+# 32-bit: use .def file to export undecorated function names
+# (MSVC __stdcall decorates as _Func@N on x86, ReShade expects plain names)
+if(RELIMITER_32BIT)
+    target_sources(relimiter PRIVATE src/relimiter.def)
+endif()
+
 # ── Output as .addon ──
 set_target_properties(relimiter PROPERTIES
     SUFFIX "${ADDON_SUFFIX}"
