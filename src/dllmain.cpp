@@ -336,6 +336,16 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
 
     LOG_INFO("ReShade addon registered (hModule=%p)", hModule);
 
+#ifdef RELIMITER_32BIT
+    // 32-bit: just register and return — no init, no hooks, no callbacks
+    // This is a test build to isolate the crash
+    s_hModule = hModule;
+    s_addon_initialised = true;
+    LOG_INFO("32-bit: bare registration only, no init");
+    Log_EndInitPhase();
+    return true;
+#endif
+
     __try { LoadConfig(hModule); }
     __except(EXCEPTION_EXECUTE_HANDLER) {
         LOG_ERROR("LoadConfig exception 0x%08X", GetExceptionCode());
