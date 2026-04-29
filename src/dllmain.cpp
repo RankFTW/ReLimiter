@@ -325,7 +325,7 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
     reshade::internal::get_current_module_handle(hModule);
     reshade::internal::get_reshade_module_handle(reshade_mod);
 
-#if defined(IMGUI_VERSION_NUM)
+#if defined(IMGUI_VERSION_NUM) && !defined(RELIMITER_32BIT)
     auto imgui_fn = reinterpret_cast<const imgui_function_table*(*)(uint32_t)>(
         GetProcAddress(reshade_mod, "ReShadeGetImGuiFunctionTable"));
     if (!imgui_fn || !(imgui_function_table_instance() = imgui_fn(IMGUI_VERSION_NUM))) {
@@ -335,16 +335,6 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
 #endif
 
     LOG_INFO("ReShade addon registered (hModule=%p)", hModule);
-
-#ifdef RELIMITER_32BIT
-    // 32-bit: just register and return — no init, no hooks, no callbacks
-    // This is a test build to isolate the crash
-    s_hModule = hModule;
-    s_addon_initialised = true;
-    LOG_INFO("32-bit: bare registration only, no init");
-    Log_EndInitPhase();
-    return true;
-#endif
 
     __try { LoadConfig(hModule); }
     __except(EXCEPTION_EXECUTE_HANDLER) {

@@ -323,7 +323,9 @@ void ApplyConfig() {
 // ── OSD Presets ──
 
 #include <vector>
+#ifndef RELIMITER_32BIT
 #include <ShlObj.h>
+#endif
 static std::vector<OSDPreset> s_user_presets;
 static char s_shared_presets_path[MAX_PATH] = {};
 
@@ -331,6 +333,7 @@ static char s_shared_presets_path[MAX_PATH] = {};
 static const char* GetPresetsINIPath() {
     if (g_config.shared_presets) {
         if (s_shared_presets_path[0] == '\0') {
+#ifndef RELIMITER_32BIT
             // Build %LOCALAPPDATA%/RHI/ReLimiter_Presets/presets.ini
             char local[MAX_PATH] = {};
             if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, local))) {
@@ -343,6 +346,7 @@ static const char* GetPresetsINIPath() {
                 CreateDirectoryA(dir, nullptr);
                 LOG_INFO("Shared presets path: %s", s_shared_presets_path);
             }
+#endif // !RELIMITER_32BIT
         }
         if (s_shared_presets_path[0] != '\0')
             return s_shared_presets_path;
