@@ -579,8 +579,9 @@ static DWORD WINAPI VersionPollThread(LPVOID) {
     auto fnQuery = reinterpret_cast<pVerQueryValueW>(GetProcAddress(hVer, "VerQueryValueW"));
     if (!fnSize || !fnInfo || !fnQuery) { s_versions_read.store(true); return 0; }
 
-    // Poll every 500ms for up to 30 seconds waiting for DLLs to load
-    for (int attempt = 0; attempt < 60; attempt++) {
+    // Poll every 2 seconds for up to 30 seconds waiting for DLLs to load.
+    for (int attempt = 0; attempt < 15; attempt++) {
+        Sleep(2000);
         bool found_any = false;
 
         if (!s_sr_ver[0]) {
@@ -614,8 +615,6 @@ static DWORD WINAPI VersionPollThread(LPVOID) {
             if ((s_sr_ver[0] || s_rr_ver[0]) && s_sl_ver[0])
                 return 0;
         }
-
-        Sleep(500);
     }
 
     s_versions_read.store(true, std::memory_order_release);

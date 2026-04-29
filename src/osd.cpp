@@ -1566,6 +1566,18 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
     // Update hardware sensors (throttled internally to ~1Hz)
     HWMonitor_Update();
 
+    // Retry NGX hook installation for games where DLLs load late.
+    // TryInstall is idempotent — no-ops once hooks are installed.
+    // Stops after ~30 seconds.
+    {
+        static int s_ngx_retry_counter = 0;
+        if (s_ngx_retry_counter < 5000) {  // ~30s at 165fps
+            s_ngx_retry_counter++;
+            if (s_ngx_retry_counter % 60 == 0)
+                NGXHooks_TryInstall();
+        }
+    }
+
     // Real FPS from enforcement-to-enforcement interval (CPU frames only)
     // EMA-smoothed so the OSD number is readable instead of flickering.
     double ft = g_actual_frame_time_us.load(std::memory_order_relaxed);

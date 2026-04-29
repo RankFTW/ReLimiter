@@ -198,6 +198,11 @@ void LoadConfig(HMODULE hModule) {
 
     LOG_INFO("Config: values read, calling ApplyConfig...");
     ValidateConfig();
+
+    // Force logging and telemetry off on each launch — must be manually enabled
+    g_config.log_level = "warn";
+    g_config.csv_enabled = false;
+
     ApplyConfig();
     LOG_INFO("Config: ApplyConfig done");
 

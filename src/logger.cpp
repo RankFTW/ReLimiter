@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <atomic>
 
 static HANDLE s_hfile = INVALID_HANDLE_VALUE;
 static LogLevel s_level = LogLevel::Info;
@@ -11,6 +12,60 @@ static LARGE_INTEGER s_start_qpc;
 static double s_qpc_freq_inv = 0.0;
 static bool s_init_phase = true;
 static char s_process_name[MAX_PATH] = "unknown";
+
+// ── Buffered logging ──
+// Log messages are appended to a ring buffer. A background thread flushes
+// to disk every 500ms. This keeps file I/O off the render thread entirely.
+// During init phase, writes are immediate (crash safety before game starts).
+static constexpr size_t LOG_BUF_SIZE = 64 * 1024;  // 64KB ring buffer
+static char s_log_buf[LOG_BUF_SIZE];
+static size_t s_log_buf_pos = 0;
+static std::mutex s_buf_mutex;
+static HANDLE s_flush_thread = nullptr;
+static std::atomic<bool> s_flush_running{false};
+
+static void FlushBuffer() {
+    std::lock_guard<std::mutex> lock(s_buf_mutex);
+    if (s_log_buf_pos > 0 && s_hfile != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(s_hfile, s_log_buf, static_cast<DWORD>(s_log_buf_pos), &written, nullptr);
+        FlushFileBuffers(s_hfile);
+        s_log_buf_pos = 0;
+    }
+}
+
+static DWORD WINAPI LogFlushThread(LPVOID) {
+    while (s_flush_running.load(std::memory_order_relaxed)) {
+        Sleep(500);
+        FlushBuffer();
+    }
+    FlushBuffer();  // final flush on shutdown
+    return 0;
+}
+
+static void StartFlushThread() {
+    if (s_flush_thread) return;
+    s_flush_running.store(true, std::memory_order_relaxed);
+    s_flush_thread = CreateThread(nullptr, 0, LogFlushThread, nullptr, 0, nullptr);
+}
+
+static void StopFlushThread() {
+    if (!s_flush_thread) return;
+    s_flush_running.store(false, std::memory_order_relaxed);
+    WaitForSingleObject(s_flush_thread, 2000);
+    CloseHandle(s_flush_thread);
+    s_flush_thread = nullptr;
+}
+
+static void BufferedWrite(const char* str, int len) {
+    std::lock_guard<std::mutex> lock(s_buf_mutex);
+    if (static_cast<size_t>(len) > LOG_BUF_SIZE) return;  // message too large
+    // If buffer would overflow, drop oldest content
+    if (s_log_buf_pos + static_cast<size_t>(len) > LOG_BUF_SIZE)
+        s_log_buf_pos = 0;
+    memcpy(s_log_buf + s_log_buf_pos, str, len);
+    s_log_buf_pos += len;
+}
 
 static const char* LevelTag(LogLevel lv) {
     switch (lv) {
@@ -116,6 +171,8 @@ opened:
 }
 
 void Log_Shutdown() {
+    StopFlushThread();
+    FlushBuffer();
     if (s_hfile != INVALID_HANDLE_VALUE) {
         char msg[] = "=== relimiter log closed ===\r\n";
         RawWrite(msg, static_cast<int>(strlen(msg)));
@@ -140,9 +197,17 @@ void Log_Write(LogLevel level, const char* fmt, ...) {
     char line[1200];
     int n = snprintf(line, sizeof(line), "[%10.3f] [%s] %s\r\n", ms, LevelTag(level), buf);
 
-    std::lock_guard<std::mutex> lock(s_mutex);
-    if (n > 0) RawWrite(line, n);
-    RawFlush(); // always flush for crash safety
+    if (n > 0) {
+        if (s_init_phase) {
+            // During init: write directly for crash safety
+            std::lock_guard<std::mutex> lock(s_mutex);
+            RawWrite(line, n);
+            RawFlush();
+        } else {
+            // After init: buffer for background flush
+            BufferedWrite(line, n);
+        }
+    }
 
     // Forward errors/warnings to ReShade log
     if (level <= LogLevel::Warn) {
@@ -168,6 +233,9 @@ LogLevel Log_ParseLevel(const char* str) {
 
 void Log_EndInitPhase() {
     s_init_phase = false;
+    // Flush any remaining init-phase messages, then start background flushing
+    FlushBuffer();
+    StartFlushThread();
 }
 
 const char* Log_GetProcessName() {
