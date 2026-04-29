@@ -1,9 +1,16 @@
 #include "frame_latency_controller.h"
+#ifndef RELIMITER_32BIT
 #include "streamline_hooks.h"
+#endif
 #include "logger.h"
 #include <Windows.h>
 #include <dxgi.h>
 #include <dxgi1_3.h>
+
+#ifdef RELIMITER_32BIT
+static inline bool IsDmfgActive() { return false; }
+static std::atomic<uint32_t> g_game_requested_latency{0};
+#endif
 
 // ── File-static state ──
 static bool s_applied = false;  // true after frame latency set for current swapchain

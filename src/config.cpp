@@ -1,12 +1,24 @@
 #include "config.h"
 #include "scheduler.h"
+#ifndef RELIMITER_32BIT
 #include "streamline_hooks.h"
+#endif
 #include "wake_guard.h"
+#ifndef RELIMITER_32BIT
 #include "adaptive_smoothing.h"
+#endif
 #include "logger.h"
 #include <Windows.h>
 #include <string>
 #include <cstdio>
+
+#ifdef RELIMITER_32BIT
+static std::atomic<int> g_fg_mode{0};
+struct AdaptiveSmoothing_Stub {
+    void SetConfig(bool, double, bool) {}
+};
+static AdaptiveSmoothing_Stub g_adaptive_smoothing;
+#endif
 
 Config g_config;
 

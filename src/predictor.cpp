@@ -3,12 +3,18 @@
 #include "wake_guard.h"
 #include "display_state.h"
 #include "regime_detector.h"
+#ifndef RELIMITER_32BIT
 #include "nvapi_hooks.h"
+#endif
 #include "stress_detector.h"
 #include "logger.h"
 #include <algorithm>
 #include <cmath>
 #include <vector>
+
+#ifdef RELIMITER_32BIT
+static std::atomic<uint32_t> g_game_requested_interval{0};
+#endif
 
 Predictor g_predictor;
 std::atomic<bool> g_regime_break{false};

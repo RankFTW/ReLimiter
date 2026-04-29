@@ -6,14 +6,25 @@
 #include "flush.h"
 #include "health.h"
 #include "vk_enforce.h"
+#ifndef RELIMITER_32BIT
 #include "reflex_inject.h"
 #include "pcl_hooks.h"
 #include "streamline_hooks.h"
+#endif
 #include "logger.h"
 #include <dxgi.h>
 #include <atomic>
 #include <cstdint>
 #include <tlhelp32.h>
+
+#ifdef RELIMITER_32BIT
+static inline void ReflexInject_Init() {}
+static inline void ReflexInject_Shutdown() {}
+static inline bool InstallPCLHooks() { return false; }
+static std::atomic<int>      g_fg_multiplier{0};
+static std::atomic<bool>     g_fg_active{false};
+static std::atomic<bool>     g_fg_presenting{false};
+#endif
 
 // ── File-static state (sole owner — no extern globals) ──
 

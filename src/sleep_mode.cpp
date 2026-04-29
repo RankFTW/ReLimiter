@@ -1,5 +1,7 @@
 #include "sleep_mode.h"
+#ifndef RELIMITER_32BIT
 #include "nvapi_hooks.h"
+#endif
 #include "nvapi_types.h"
 #include "scheduler.h"
 #include "logger.h"

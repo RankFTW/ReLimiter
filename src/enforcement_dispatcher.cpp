@@ -1,13 +1,20 @@
 #include "enforcement_dispatcher.h"
 #include "vk_enforce.h"
+#ifndef RELIMITER_32BIT
 #include "pcl_hooks.h"
 #include "streamline_hooks.h"
+#endif
 #include "health.h"
 #include "flush.h"
 #include "wake_guard.h"
 #include "logger.h"
 #include <atomic>
 #include <Windows.h>
+
+#ifdef RELIMITER_32BIT
+static inline bool PCL_MarkersFlowing()    { return false; }
+static inline bool IsDmfgActive()          { return false; }
+#endif
 
 // ── File-static state ──
 

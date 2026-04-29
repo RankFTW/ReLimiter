@@ -3,14 +3,20 @@
 #pragma comment(lib, "Psapi.lib")
 #include "osd.h"
 #include "hw_monitor.h"
+#ifndef RELIMITER_32BIT
 #include "ngx_hooks.h"
+#endif
 #include <MinHook.h>
 #include <atomic>
 
 #include "hooks.h"
+#ifndef RELIMITER_32BIT
 #include "nvapi_hooks.h"
+#endif
 #include "loadlib_hooks.h"
+#ifndef RELIMITER_32BIT
 #include "streamline_hooks.h"
+#endif
 #include "timer_hooks.h"
 #include "system_hardening.h"
 #include "marker_log.h"
@@ -22,7 +28,9 @@
 #include "vblank_thread.h"
 #include "display_poll_thread.h"
 #include "flush.h"
+#ifndef RELIMITER_32BIT
 #include "frame_splitting.h"
+#endif
 #include "config.h"
 #include "logger.h"
 #include "csv_writer.h"
@@ -98,10 +106,12 @@ static void on_init_device(reshade::api::device* device) {
 static void on_destroy_device(reshade::api::device* device) {
     // Clear g_dev if this is the device we captured for GetLatency.
     // Prevents stale pointer crashes during device transitions (alt-tab, resize).
+#ifndef RELIMITER_32BIT
     if (g_dev) {
         g_dev = nullptr;
         LOG_INFO("NvAPI: g_dev cleared on device destroy");
     }
+#endif
     SwapMgr_OnDestroyDevice(device);
 }
 static void on_init_swapchain(reshade::api::swapchain* sc, bool resize) {
@@ -207,8 +217,10 @@ static void on_present(reshade::api::command_queue* queue,
             s_hooks_installed = true;
             InstallLoadLibraryHooks();
             LOG_INFO("LoadLibrary hooks installed (deferred)");
+#ifndef RELIMITER_32BIT
             InstallNvAPIHooks();
             LOG_INFO("NvAPI hooks installed (deferred)");
+#endif
         }
     }
 
@@ -274,7 +286,9 @@ static void on_present(reshade::api::command_queue* queue,
     }
 
     // Check deferred FG inference (promotes or revokes after confirmation window)
+#ifndef RELIMITER_32BIT
     CheckDeferredFGInference();
+#endif
 
     LARGE_INTEGER now_qpc;
     QueryPerformanceCounter(&now_qpc);
@@ -390,7 +404,9 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(on_set_fullscreen_state);
         RegisterOSD();
         HWMonitor_Init();
+#ifndef RELIMITER_32BIT
         NGXHooks_Init();
+#endif
         LOG_INFO("ReShade events + OSD registered");
 
     } __except(EXCEPTION_EXECUTE_HANDLER) {
@@ -433,12 +449,18 @@ void WINAPI AddonUninit(HMODULE /*addon_module*/, HMODULE /*reshade_module*/) {
 
     SaveConfig();
     SetUnhandledExceptionFilter(s_prev_filter);
+#ifndef RELIMITER_32BIT
     RestoreGameSleepMode();  // restore game's original Reflex params
+#endif
     HWMonitor_Shutdown();
+#ifndef RELIMITER_32BIT
     NGXHooks_Shutdown();
+#endif
     StopVBlankThread();
     StopDisplayPollThread();
+#ifndef RELIMITER_32BIT
     RestoreFrameSplitting();
+#endif
     RemoveTimerHooks();
     Hardening_Shutdown();
     DisableAllHooks();
@@ -468,12 +490,18 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             LOG_WARN("AddonUninit was not called — cleaning up in DllMain");
             SaveConfig();
             SetUnhandledExceptionFilter(s_prev_filter);
+#ifndef RELIMITER_32BIT
             RestoreGameSleepMode();  // restore game's original Reflex params
+#endif
             HWMonitor_Shutdown();
+#ifndef RELIMITER_32BIT
             NGXHooks_Shutdown();
+#endif
             StopVBlankThread();
             StopDisplayPollThread();
+#ifndef RELIMITER_32BIT
             RestoreFrameSplitting();
+#endif
             RemoveTimerHooks();
             Hardening_Shutdown();
             DisableAllHooks();

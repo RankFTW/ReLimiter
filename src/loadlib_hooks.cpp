@@ -1,10 +1,17 @@
 #include "loadlib_hooks.h"
 #include "hooks.h"
+#ifndef RELIMITER_32BIT
 #include "streamline_hooks.h"
 #include "ngx_hooks.h"
+#endif
 #include <string>
 #include <algorithm>
 #include <atomic>
+
+#ifdef RELIMITER_32BIT
+static inline void HookStreamlinePCL(HMODULE) {}
+static inline void NGXHooks_TryInstall() {}
+#endif
 
 // ── Trampolines ──
 static decltype(&LoadLibraryA)   s_orig_LoadLibraryA   = nullptr;

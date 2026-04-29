@@ -2,15 +2,24 @@
 #include "correlator.h"
 #include "stress_detector.h"
 #include "predictor.h"
+#ifndef RELIMITER_32BIT
 #include "damping.h"
+#endif
 #include "pqi.h"
 #include "logger.h"
+#ifndef RELIMITER_32BIT
 #include "feedback.h"
+#endif
 #include "display_state.h"
 #include "swapchain_manager.h"
 #include "tier.h"
 #include "wake_guard.h"
 #include <dxgi.h>
+
+#ifdef RELIMITER_32BIT
+static inline void ResetDamping() {}
+static inline void ResetFeedbackAccumulators() {}
+#endif
 
 // g_swapchain: DX12 swapchain pointer, managed here by OnInitSwapchain/OnDestroySwapchain.
 // Transitional — new code should use SwapMgr_GetNativeHandle() instead.

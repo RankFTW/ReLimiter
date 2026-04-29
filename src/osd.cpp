@@ -2,13 +2,17 @@
 #include "config.h"
 #include "scheduler.h"
 #include "predictor.h"
+#ifndef RELIMITER_32BIT
 #include "fg_divisor.h"
+#endif
 #include "display_state.h"
 #include "marker_log.h"
 #include "nvapi_types.h"
 #include "correlator.h"
 #include "stress_detector.h"
+#ifndef RELIMITER_32BIT
 #include "streamline_hooks.h"
+#endif
 #include "wake_guard.h"
 #include "pqi.h"
 #include "csv_writer.h"
@@ -16,22 +20,71 @@
 #include "swapchain_manager.h"
 #include "enforcement_dispatcher.h"
 #include "loadlib_hooks.h"
+#ifndef RELIMITER_32BIT
 #include "pcl_hooks.h"
 #include "nvapi_hooks.h"
+#endif
 #include "vsync_control.h"
 #include "health.h"
+#ifndef RELIMITER_32BIT
 #include "reflex_inject.h"
+#endif
 #include "presentation_gate.h"
 #include "flip_model.h"
+#ifndef RELIMITER_32BIT
 #include "adaptive_smoothing.h"
+#endif
 #include "hw_monitor.h"
+#ifndef RELIMITER_32BIT
 #include "feedback.h"
 #include "ngx_hooks.h"
 #include "dlss_presets.h"
+#endif
 #include "logger.h"
 #include <string>
 #include <atomic>
 #include <algorithm>
+
+#ifdef RELIMITER_32BIT
+// ── 32-bit stubs for 64-bit-only modules ──
+static inline int    ComputeFGDivisorRaw()  { return 1; }
+static inline double ComputeFGDivisor()     { return 1.0; }
+static inline bool   IsDmfgActive()         { return false; }
+static inline bool   IsNvSmoothMotionActive() { return false; }
+static inline bool   ReflexInject_IsActive() { return false; }
+static inline bool   PCL_MarkersFlowing()    { return false; }
+static IUnknown*     g_dev = nullptr;
+static std::atomic<int>    g_fg_multiplier{0};
+static std::atomic<bool>   g_fg_presenting{false};
+static std::atomic<int>    g_fg_actual_multiplier{0};
+static std::atomic<int>    g_fg_mode{0};
+static std::atomic<double> g_reflex_gpu_active_us{0.0};
+static std::atomic<double> g_reflex_ai_frame_time_us{0.0};
+static std::atomic<double> g_reflex_total_frame_cost_us{0.0};
+static std::atomic<double> g_smoothing_offset_us{0.0};
+static std::atomic<double> g_smoothing_p99_us{0.0};
+struct NGXDLSSInfo {
+    unsigned int render_width = 0, render_height = 0;
+    unsigned int output_width = 0, output_height = 0;
+    int quality_level = -1;
+    int sr_preset = -1, rr_preset = -1, fg_preset = -1;
+    bool sr_active = false, rr_active = false, fg_active = false, dlaa = false;
+    bool available = false;
+    char sr_version[24] = {}, rr_version[24] = {}, fg_version[24] = {};
+    char sl_version[24] = {};
+};
+static inline NGXDLSSInfo NGXHooks_GetInfo() { return {}; }
+static inline void NGXHooks_TryInstall() {}
+struct DLSSPresets { char sr[4]; char rr[4]; char fg[4]; bool available; };
+static inline void DLSSPresets_Poll() {}
+static inline DLSSPresets DLSSPresets_Get() { return {{'-'},{'-'},{'-'},false}; }
+struct AdaptiveSmoothing_Stub {
+    void Reset() {} void SoftReset() {} void SetConfig(bool, double, bool) {}
+    double Update(double, double) { return 0.0; } double GetP99() { return 0.0; }
+    bool IsWarm() { return false; } bool dual_mode = false; double target_percentile = 0.99;
+};
+static AdaptiveSmoothing_Stub g_adaptive_smoothing;
+#endif
 
 // ── OSD readout state ──
 static double s_real_fps = 0.0;

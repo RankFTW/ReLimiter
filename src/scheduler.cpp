@@ -1,38 +1,107 @@
 #include "scheduler.h"
 #include "predictor.h"
+#ifndef RELIMITER_32BIT
 #include "fg_divisor.h"
+#endif
 #include "display_state.h"
+#ifndef RELIMITER_32BIT
 #include "damping.h"
+#endif
 #include "sleep.h"
 #include "hw_spin.h"
 #include "wake_guard.h"
 #include "sleep_mode.h"
+#ifndef RELIMITER_32BIT
 #include "feedback.h"
+#endif
 #include "correlator.h"
 #include "stress_detector.h"
+#ifndef RELIMITER_32BIT
 #include "cadence_meter.h"
 #include "feedback.h"
 #include "nvapi_hooks.h"
 #include "pll.h"
+#endif
 #include "presentation_gate.h"
 #include "enforcement_dispatcher.h"
 #include "tier.h"
 #include "health.h"
 #include "swapchain_manager.h"
+#ifndef RELIMITER_32BIT
 #include "pcl_hooks.h"
+#endif
 #include "flush.h"
 #include "csv_writer.h"
 #include "pqi.h"
 #include "baseline.h"
+#ifndef RELIMITER_32BIT
 #include "reflex_inject.h"
 #include "streamline_hooks.h"
 #include "adaptive_smoothing.h"
+#endif
 #include "config.h"
 #include "logger.h"
 #include <Windows.h>
 #include <algorithm>
 #include <cmath>
 #include <atomic>
+
+#ifdef RELIMITER_32BIT
+// ── 32-bit stubs for 64-bit-only modules ──
+static inline int    ComputeFGDivisorRaw()  { return 1; }
+static inline double ComputeFGDivisor()     { return 1.0; }
+static inline bool   IsDmfgActive()         { return false; }
+static inline bool   IsNvSmoothMotionActive() { return false; }
+static inline void   CheckDeferredFGInference() {}
+static inline bool   ReflexInject_IsActive() { return false; }
+static inline bool   PCL_MarkersFlowing()    { return false; }
+static inline bool   IsReflexCadenceActive() { return false; }
+static inline void   ResetDamping()          {}
+static inline void   ResetFeedbackAccumulators() {}
+static inline void   DrainCorrelator(bool, double) {}
+static inline double GetLastScanoutErrorUs() { return 0.0; }
+static inline void   MaybeUpdateSleepMode(double, bool) {}
+static std::atomic<int>    g_fg_multiplier{0};
+static std::atomic<bool>   g_fg_active{false};
+static std::atomic<bool>   g_fg_presenting{false};
+static std::atomic<int>    g_fg_mode{0};
+static std::atomic<int>    g_fg_actual_multiplier{0};
+static std::atomic<double> g_reflex_gpu_active_us{0.0};
+static std::atomic<double> g_reflex_pipeline_latency_us{0.0};
+static std::atomic<double> g_reflex_queue_trend_us{0.0};
+static std::atomic<double> g_reflex_present_duration_us{0.0};
+static std::atomic<double> g_reflex_ai_frame_time_us{0.0};
+static std::atomic<double> g_reflex_cpu_latency_us{0.0};
+static std::atomic<double> g_reflex_total_frame_cost_us{0.0};
+static std::atomic<double> g_smoothing_offset_us{0.0};
+static std::atomic<double> g_smoothing_p99_us{0.0};
+struct AdaptiveSmoothing_Stub {
+    void Reset() {}
+    void SoftReset() {}
+    void SetConfig(bool, double, bool) {}
+    double Update(double, double) { return 0.0; }
+    double GetP99() { return 0.0; }
+    bool IsWarm() { return false; }
+    bool dual_mode = false;
+    double target_percentile = 0.99;
+};
+static AdaptiveSmoothing_Stub g_adaptive_smoothing;
+struct CadenceMeter_Stub {
+    void Reset() {}
+    void SetSuppressed(bool) {}
+    bool IsWarm() { return false; }
+    std::atomic<double> present_interval_us{0.0};
+    std::atomic<double> cadence_smoothness_us{0.0};
+    struct { double GetBias() { return 0.0; } int GetWindowSize() { return 0; } double GetAlpha() { return 0.0; } } bias_ctrl;
+};
+static CadenceMeter_Stub g_cadence_meter;
+struct PLL_Stub {
+    void SetPeriodIfChanged(double) {}
+    int64_t NextGridEdge(int64_t now) { return now; }
+    void RecordWake(int64_t, uint64_t) {}
+};
+static PLL_Stub g_pll;
+#endif
 
 // ── User config ──
 std::atomic<int>    g_user_target_fps{0};

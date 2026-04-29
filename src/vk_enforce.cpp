@@ -1,18 +1,30 @@
 #include "vk_enforce.h"
 #include "scheduler.h"
 #include "predictor.h"
+#ifndef RELIMITER_32BIT
 #include "fg_divisor.h"
 #include "pcl_hooks.h"
+#endif
 #include "health.h"
 #include "correlator.h"
 #include "swapchain_manager.h"
 #include "presentation_gate.h"
 #include "wake_guard.h"
+#ifndef RELIMITER_32BIT
 #include "reflex_inject.h"
+#endif
 #include "vsync_control.h"
 #include "hooks.h"
 #include "logger.h"
 #include <atomic>
+
+#ifdef RELIMITER_32BIT
+static inline int  ComputeFGDivisorRaw() { return 1; }
+static inline bool PCL_MarkersFlowing()  { return false; }
+static inline void ReflexInject_OnPreSleep(uint64_t, int64_t) {}
+static inline void ReflexInject_OnPostSleep(uint64_t, int64_t) {}
+static inline bool ReflexInject_IsActive() { return false; }
+#endif
 
 // Vulkan doesn't have per-frame IDs from markers by default.
 // We use a monotonic counter as the frameID for the shared scheduler.
