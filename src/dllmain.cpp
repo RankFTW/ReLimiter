@@ -444,7 +444,9 @@ bool WINAPI AddonInit(HMODULE addon_module, HMODULE reshade_module) {
     Log_Init(addon_module, LogLevel::Info);
     LOG_INFO("AddonInit called (addon=%p, reshade=%p)", addon_module, reshade_module);
 
+#ifndef RELIMITER_32BIT
     s_prev_filter = SetUnhandledExceptionFilter(CrashHandler);
+#endif
 
     if (!DoInit(addon_module, reshade_module)) {
         SetUnhandledExceptionFilter(s_prev_filter);
