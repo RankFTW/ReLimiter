@@ -399,11 +399,11 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
                  g_gsync_active.load() ? "active" : "inactive",
                  g_pacing_mode.load() == PacingMode::VRR ? "VRR" : "Fixed");
 
+#ifndef RELIMITER_32BIT
         reshade::register_event<reshade::addon_event::init_device>(on_init_device);
         reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
         reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
         reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
-#ifndef RELIMITER_32BIT
         reshade::register_event<reshade::addon_event::present>(on_present);
         reshade::register_event<reshade::addon_event::create_swapchain>(on_create_swapchain);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(on_set_fullscreen_state);
