@@ -1,0 +1,16 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="C:\Users\Mark\OneDrive\Desktop\ReLimiter v3\tests\test_scheduler_passthrough.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\Mark\OneDrive\Desktop\ReLimiter v3\tests\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{0BF51D60-1F12-3FB1-A090-1C0C26EF2B9A}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

@@ -6,6 +6,7 @@
 #include <Windows.h>
 #include <dxgi.h>
 #include <dxgi1_3.h>
+#include <atomic>
 
 #ifdef RELIMITER_32BIT
 static inline bool IsDmfgActive() { return false; }

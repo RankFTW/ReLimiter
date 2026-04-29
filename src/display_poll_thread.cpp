@@ -1,10 +1,16 @@
 #include "display_poll_thread.h"
 #include "display_resolver.h"
 #include "display_state.h"
+#ifndef RELIMITER_32BIT
 #include "frame_splitting.h"
+#endif
 #include <Windows.h>
 #include <atomic>
 #include <thread>
+
+#ifdef RELIMITER_32BIT
+static inline void ManageFrameSplitting() {}
+#endif
 
 static std::atomic<bool> s_poll_running{false};
 static std::thread s_poll_thread;

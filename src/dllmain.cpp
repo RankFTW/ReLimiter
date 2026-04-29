@@ -68,6 +68,7 @@ static void LogCrashModule(DWORD64 addr) {
     }
 }
 
+#ifndef RELIMITER_32BIT
 static void LogStackTrace(EXCEPTION_POINTERS* ep) {
     CONTEXT ctx = *ep->ContextRecord;
     LOG_ERROR("STACK TRACE (RIP=0x%llX, RSP=0x%llX):", ctx.Rip, ctx.Rsp);
@@ -86,14 +87,17 @@ static void LogStackTrace(EXCEPTION_POINTERS* ep) {
         LogCrashModule(ctx.Rip);
     }
 }
+#endif // !RELIMITER_32BIT
 
 static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
     DWORD64 fault_addr = reinterpret_cast<DWORD64>(ep->ExceptionRecord->ExceptionAddress);
     LOG_ERROR("CRASH: exception 0x%08X at 0x%llX",
               ep->ExceptionRecord->ExceptionCode, fault_addr);
     LogCrashModule(fault_addr);
+#ifndef RELIMITER_32BIT
     __try { LogStackTrace(ep); }
     __except(EXCEPTION_EXECUTE_HANDLER) {}
+#endif
     Log_Shutdown();
     if (s_prev_filter) return s_prev_filter(ep);
     return EXCEPTION_CONTINUE_SEARCH;

@@ -1,0 +1,10 @@
+^C:\USERS\MARK\ONEDRIVE\DESKTOP\RELIMITER V3\BUILD32\CMAKEFILES\F90E7F51F69EAD3067917A69B4D10D2B\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" "-SC:/Users/Mark/OneDrive/Desktop/ReLimiter v3" "-BC:/Users/Mark/OneDrive/Desktop/ReLimiter v3/build32" --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file "C:/Users/Mark/OneDrive/Desktop/ReLimiter v3/build32/relimiter.slnx"
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

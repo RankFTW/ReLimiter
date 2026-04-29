@@ -2,7 +2,13 @@
 #include "display_state.h"
 #include "nvapi_types.h"
 #include "hooks.h"
+#ifndef RELIMITER_32BIT
 #include "streamline_hooks.h"
+#endif
+
+#ifdef RELIMITER_32BIT
+static inline bool IsNvSmoothMotionActive() { return false; }
+#endif
 
 // Flip metering config interface ID
 constexpr NvU32 FLIP_METERING_ID = 0xF3148C42;

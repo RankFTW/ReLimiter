@@ -2,8 +2,15 @@
 #include "display_state.h"
 #include "swapchain_manager.h"
 #include "wake_guard.h"
+#ifndef RELIMITER_32BIT
 #include "pll.h"
+#endif
 #include <thread>
+
+#ifdef RELIMITER_32BIT
+struct PLL_Stub { void IngestVBlank(int64_t) {} };
+static PLL_Stub g_pll;
+#endif
 
 // NTSTATUS not defined by default with WIN32_LEAN_AND_MEAN
 #ifndef _NTDEF_

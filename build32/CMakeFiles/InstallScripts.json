@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Users/Mark/OneDrive/Desktop/ReLimiter v3/build32/cmake_install.cmake",
+		"C:/Users/Mark/OneDrive/Desktop/ReLimiter v3/build32/tests/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
