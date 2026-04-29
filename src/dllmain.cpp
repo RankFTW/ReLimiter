@@ -403,8 +403,8 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
         reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
         reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
-        reshade::register_event<reshade::addon_event::present>(on_present);
 #ifndef RELIMITER_32BIT
+        reshade::register_event<reshade::addon_event::present>(on_present);
         reshade::register_event<reshade::addon_event::create_swapchain>(on_create_swapchain);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(on_set_fullscreen_state);
 #endif
