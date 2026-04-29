@@ -2185,5 +2185,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
 
 void RegisterOSD() {
     reshade::register_overlay("ReLimiter", DrawSettings);
+#ifndef RELIMITER_32BIT
     reshade::register_event<reshade::addon_event::reshade_overlay>(DrawOSD);
+#endif
 }
