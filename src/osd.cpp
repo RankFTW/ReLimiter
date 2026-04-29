@@ -669,6 +669,9 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         if (ImGui::Checkbox("Limiter / Tier##osd_elem", &g_config.osd_show_limiter)) config_dirty = true;
         HelpTip("Show how much time the limiter added and the current degradation tier (T0=full, T4=suspended).");
 
+        {
+        NGXDLSSInfo dlss_check = NGXHooks_GetInfo();
+        if (dlss_check.available) {
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "DLSS");
         if (ImGui::Checkbox("Quality Level##osd_elem", &g_config.osd_show_dlss_quality)) config_dirty = true;
@@ -685,6 +688,8 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         FlowSeparator();
         if (ImGui::Checkbox("Versions##osd_elem", &g_config.osd_show_dlss_versions)) config_dirty = true;
         HelpTip("Show DLSS DLL versions (SR, RR, FG) and Streamline version if loaded.");
+        }
+        }
 
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "System");
@@ -806,8 +811,9 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     }
 
     // ════════════════════════════════════════════
-    // SECTION: Adaptive Smoothing (collapsible)
+    // SECTION: Adaptive Smoothing (collapsible, DX12 only)
     // ════════════════════════════════════════════
+    if (SwapMgr_GetActiveAPI() == ActiveAPI::DX12) {
     ImGui::Separator();
     if (ImGui::CollapsingHeader("Adaptive Smoothing")) {
         bool adaptive = g_config.adaptive_smoothing;
@@ -879,10 +885,12 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                      "0 = no extra bias, 1000 = +1ms added to every frame interval.");
         }
     }
+    } // DX12 only (Adaptive Smoothing)
 
     // ════════════════════════════════════════════
-    // SECTION: Frame Generation (collapsible)
+    // SECTION: Frame Generation (collapsible, DMFG only)
     // ════════════════════════════════════════════
+    if (IsDmfgActive() || g_config.dynamic_mfg_passthrough) {
     ImGui::Separator();
     if (ImGui::CollapsingHeader("Dynamic MFG")) {
         ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
@@ -953,6 +961,8 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                     "0 = no cap (full passthrough).");
         }
     }
+
+    } // DMFG only
 
     // ════════════════════════════════════════════
     // SECTION 4: Advanced (collapsible)

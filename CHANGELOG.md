@@ -10,6 +10,9 @@
 - **Buffered logging** — Log writes are now collected in a ring buffer and flushed to disk every 500ms on a background thread. Eliminates the periodic frametime heartbeat pattern caused by synchronous file I/O on the render thread when advanced logging was enabled.
 - **Logging resets on launch** — Advanced logging and telemetry recording now default to off on every game launch. Must be manually enabled each session. Prevents users from accidentally leaving verbose logging on and impacting performance.
 
+### UI
+- **Context-aware settings** — Adaptive Smoothing section only shows on DX12 games. Dynamic MFG section only shows when DMFG is active. DLSS OSD checkboxes only show when DLSS is detected. Keeps the UI clean for games that don't use these features.
+
 
 ## 3.1.8
 
