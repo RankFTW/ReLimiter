@@ -1,7 +1,0 @@
-C:/Users/Mark/OneDrive/Desktop/ReLimiter v3/build32/CMakeFiles/minhook_static.dir
-C:/Users/Mark/OneDrive/Desktop/ReLimiter v3/build32/CMakeFiles/relimiter.dir
-C:/Users/Mark/OneDrive/Desktop/ReLimiter v3/build32/CMakeFiles/ALL_BUILD.dir
-C:/Users/Mark/OneDrive/Desktop/ReLimiter v3/build32/CMakeFiles/ZERO_CHECK.dir
-C:/Users/Mark/OneDrive/Desktop/ReLimiter v3/build32/tests/CMakeFiles/test_dmfg_detection.dir
-C:/Users/Mark/OneDrive/Desktop/ReLimiter v3/build32/tests/CMakeFiles/test_scheduler_passthrough.dir
-C:/Users/Mark/OneDrive/Desktop/ReLimiter v3/build32/tests/CMakeFiles/test_dmfg_output_cap.dir
