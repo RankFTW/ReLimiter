@@ -364,10 +364,14 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
     LOG_INFO("Waitable timer created");
 
     __try {
+#ifndef RELIMITER_32BIT
         InstallTimerHooks();
         LOG_INFO("Timer hooks installed");
 
         Hardening_Init();
+#else
+        LOG_INFO("32-bit: timer hooks and hardening skipped");
+#endif
 
         // NvAPI and Streamline hooks are deferred to the first on_present.
         // This lets the game's rendering pipeline fully initialize before
