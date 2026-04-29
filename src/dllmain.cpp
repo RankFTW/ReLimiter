@@ -364,6 +364,11 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
     LOG_INFO("Waitable timer created");
 
     __try {
+#ifdef RELIMITER_32BIT
+        // 32-bit: minimal init — skip hooks, hardening, background threads
+        // Just register OSD and return
+        LOG_INFO("32-bit mode: minimal init");
+#else
         InstallTimerHooks();
         LOG_INFO("Timer hooks installed");
 
@@ -414,6 +419,7 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         NGXHooks_Init();
 #endif
         LOG_INFO("ReShade events + OSD registered");
+#endif // !RELIMITER_32BIT (minimal init)
 
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         LOG_ERROR("Init exception 0x%08X", GetExceptionCode());
