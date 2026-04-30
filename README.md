@@ -77,10 +77,23 @@ Move the game window between monitors, switch between windowed/borderless/fullsc
 | Vulkan | Present-based or Streamline PCL | |
 | OpenGL | Present-based | VSync override may not work in all games |
 
+## DLSS Info on OSD
+
+ReLimiter reads DLSS quality mode, render resolution, active features (SR/RR/FG), preset letters, and DLL versions directly from the NGX runtime. This data is shown on the OSD and in the ReShade settings panel.
+
+Replacing the game's DLSS DLLs with newer versions (e.g. dropping an updated `nvngx_dlss.dll` into the game folder) is fine — ReLimiter reads whatever DLL the game loads.
+
+**What to avoid:**
+
+- **Do not override DLSS DLLs globally** via NVIDIA Control Panel or NVIDIA Profile Inspector. The global override replaces the DLL at the driver level, which means the game never loads the file from its own folder. ReLimiter reads versions from the loaded module, so it will show the overridden DLL's version and may not detect it at all if the driver handles loading internally.
+- **Do not set DLSS presets (SR, RR, FG) globally.** ReLimiter reads presets from the per-game driver profile. Global presets apply to all games but are not stored in individual game profiles, so ReLimiter won't see them. Set presets per-game in the NVIDIA App or per-game in Profile Inspector instead.
+
 ## Known Limitations
 
 - GPU hardware monitoring (temp, clock, usage, VRAM) is NVIDIA only
 - Adaptive Smoothing and Reflex timing metrics (GPU Render, Frame Cost, FG Time) require DX12 + Reflex
+- Global DLSS DLL overrides (via NVCP/NVPI) may not be read correctly — replace DLLs in the game folder instead
+- Global DLSS preset overrides won't appear on the OSD — set presets per-game in the NVIDIA App or Profile Inspector
 - Some older Vulkan titles may not work
 - OpenGL VSync override depends on how the game manages swap intervals
 
