@@ -1,6 +1,12 @@
 # Changelog
 
 
+## 3.2.0 (Beta)
+
+### Screen
+- **Monitor Blackout** — Black out all non-game monitors with a single keybind or checkbox. Covers secondary displays with topmost black windows that are click-through and hidden from Alt+Tab. Automatically hides when you alt-tab out and restores when you tab back in. Keybind shared across games when shared presets are enabled.
+
+
 ## 3.1.9
 
 ### Adaptive Smoothing

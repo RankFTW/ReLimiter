@@ -4,6 +4,7 @@
 #include "osd.h"
 #include "hw_monitor.h"
 #include "ngx_hooks.h"
+#include "blackout.h"
 #include <MinHook.h>
 #include <atomic>
 
@@ -391,6 +392,7 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         RegisterOSD();
         HWMonitor_Init();
         NGXHooks_Init();
+        Blackout_Init();
         LOG_INFO("ReShade events + OSD registered");
 
     } __except(EXCEPTION_EXECUTE_HANDLER) {
@@ -436,6 +438,7 @@ void WINAPI AddonUninit(HMODULE /*addon_module*/, HMODULE /*reshade_module*/) {
     RestoreGameSleepMode();  // restore game's original Reflex params
     HWMonitor_Shutdown();
     NGXHooks_Shutdown();
+    Blackout_Shutdown();
     StopVBlankThread();
     StopDisplayPollThread();
     RestoreFrameSplitting();
@@ -471,6 +474,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             RestoreGameSleepMode();  // restore game's original Reflex params
             HWMonitor_Shutdown();
             NGXHooks_Shutdown();
+            Blackout_Shutdown();
             StopVBlankThread();
             StopDisplayPollThread();
             RestoreFrameSplitting();

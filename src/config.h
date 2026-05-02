@@ -101,6 +101,9 @@ struct Config {
     bool osd_show_dlss_resolution = false;
     bool osd_show_dlss_presets = false;
     bool osd_show_dlss_versions = false;
+
+    // Monitor Blackout
+    std::string blackout_key = "";          // Keybind to toggle monitor blackout
 };
 
 extern Config g_config;

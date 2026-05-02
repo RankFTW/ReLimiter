@@ -196,6 +196,9 @@ void LoadConfig(HMODULE hModule) {
     g_config.osd_show_dlss_presets   = ReadINIBool(S, "osd_show_dlss_presets", false, P);
     g_config.osd_show_dlss_versions  = ReadINIBool(S, "osd_show_dlss_versions", false, P);
 
+    // Monitor Blackout — keybind loaded from shared file if shared_presets enabled
+    g_config.blackout_key            = ReadINIString(S, "blackout_key", "", P);
+
     LOG_INFO("Config: values read, calling ApplyConfig...");
     ValidateConfig();
 
@@ -284,6 +287,15 @@ void SaveConfig() {
     WriteINIBool(S, "osd_show_dlss_resolution", g_config.osd_show_dlss_resolution, P);
     WriteINIBool(S, "osd_show_dlss_presets", g_config.osd_show_dlss_presets, P);
     WriteINIBool(S, "osd_show_dlss_versions", g_config.osd_show_dlss_versions, P);
+
+    // Monitor Blackout keybind: write to shared file when shared_presets is on
+    if (g_config.shared_presets) {
+        const char* SP = GetPresetsINIPath();
+        if (SP[0] != '\0')
+            WriteINIString("Presets", "blackout_key", g_config.blackout_key.c_str(), SP);
+    } else {
+        WriteINIString(S, "blackout_key", g_config.blackout_key.c_str(), P);
+    }
 }
 
 void ApplyConfig() {
@@ -524,6 +536,8 @@ void OSDPreset_LoadAll() {
         std::string next = ReadINIString("Presets", "next_key", "", P);
         if (!prev.empty()) g_config.osd_preset_prev_key = prev;
         if (!next.empty()) g_config.osd_preset_next_key = next;
+        std::string blackout = ReadINIString("Presets", "blackout_key", "", P);
+        if (!blackout.empty()) g_config.blackout_key = blackout;
     }
 
     // Ensure at least the initial 3 slots exist
