@@ -63,6 +63,7 @@ set(ADDON_SOURCES
     src/presentation_gate.cpp
     src/reflex_inject.cpp
     src/vsync_control.cpp
+    src/blackout.cpp
 )
 
 # ── MinHook (compiled as part of the addon) ──
