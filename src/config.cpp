@@ -215,6 +215,7 @@ void LoadConfig(HMODULE hModule) {
         const char* proc = Log_GetProcessName();
         static const char* s_compat_games[] = {
             "HTGame",               // Neverness to Everness
+            "Returnal-Win64-Shipping",  // Returnal
         };
         for (const char* name : s_compat_games) {
             if (_stricmp(proc, name) == 0 && !g_config.streamline_compat) {
