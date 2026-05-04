@@ -1,6 +1,13 @@
 # Changelog
 
 
+## 3.2.1
+
+### Bug Fixes
+- **Fixed FG and RR not working in some Streamline games** — Proactive hooking of Streamline's SetOptions/GetState functions was disrupting the FG pipeline in games like Neverness to Everness. A new "Streamline Compatibility" toggle under Advanced disables the problematic hooks. Auto-enabled for known affected games, can be manually enabled for others. Existing games are unaffected — the toggle defaults to off.
+- **Fixed per-frame CreateFeature spam** — Games that call NGX CreateFeature(FG) every frame (instead of once at init) no longer cause constant FG state toggling, scheduler flushes, and log flooding. A cooldown prevents GetState from revoking FG state immediately after creation.
+
+
 ## 3.2.0
 
 ### Screen

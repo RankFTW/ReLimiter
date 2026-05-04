@@ -2,6 +2,7 @@
 #include "hooks.h"
 #include "streamline_hooks.h"
 #include "ngx_hooks.h"
+#include "config.h"
 #include <string>
 #include <algorithm>
 #include <atomic>
@@ -42,7 +43,7 @@ static HMODULE WINAPI Hook_LoadLibraryA(LPCSTR lpLibFileName) {
     bool match = ContainsInterposer(lpLibFileName);
     HMODULE h = s_orig_LoadLibraryA(lpLibFileName);
     CheckAndHook(h, match);
-    NGXHooks_TryInstall();
+    if (!g_config.streamline_compat) NGXHooks_TryInstall();
     return h;
 }
 
@@ -50,7 +51,7 @@ static HMODULE WINAPI Hook_LoadLibraryW(LPCWSTR lpLibFileName) {
     bool match = ContainsInterposerW(lpLibFileName);
     HMODULE h = s_orig_LoadLibraryW(lpLibFileName);
     CheckAndHook(h, match);
-    NGXHooks_TryInstall();
+    if (!g_config.streamline_compat) NGXHooks_TryInstall();
     return h;
 }
 
@@ -63,7 +64,7 @@ static HMODULE WINAPI Hook_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DW
     bool match = ContainsInterposer(lpLibFileName);
     HMODULE h = s_orig_LoadLibraryExA(lpLibFileName, hFile, dwFlags);
     CheckAndHook(h, match);
-    NGXHooks_TryInstall();
+    if (!g_config.streamline_compat) NGXHooks_TryInstall();
     return h;
 }
 
@@ -76,7 +77,7 @@ static HMODULE WINAPI Hook_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, D
     bool match = ContainsInterposerW(lpLibFileName);
     HMODULE h = s_orig_LoadLibraryExW(lpLibFileName, hFile, dwFlags);
     CheckAndHook(h, match);
-    NGXHooks_TryInstall();
+    if (!g_config.streamline_compat) NGXHooks_TryInstall();
     return h;
 }
 
