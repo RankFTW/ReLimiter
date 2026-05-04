@@ -199,12 +199,32 @@ void LoadConfig(HMODULE hModule) {
     // Monitor Blackout — keybind loaded from shared file if shared_presets enabled
     g_config.blackout_key            = ReadINIString(S, "blackout_key", "", P);
 
+    // Streamline Compatibility
+    g_config.streamline_compat       = ReadINIBool(S, "streamline_compat", false, P);
+
     LOG_INFO("Config: values read, calling ApplyConfig...");
     ValidateConfig();
 
     // Force logging and telemetry off on each launch — must be manually enabled
     g_config.log_level = "warn";
     g_config.csv_enabled = false;
+
+    // Auto-enable Streamline Compatibility for known problematic games.
+    // These games break FG/RR when proactive Streamline hooks are active.
+    {
+        const char* proc = Log_GetProcessName();
+        static const char* s_compat_games[] = {
+            "HTGame",               // Neverness to Everness
+            "Returnal-Win64-Shipping",  // Returnal
+        };
+        for (const char* name : s_compat_games) {
+            if (_stricmp(proc, name) == 0 && !g_config.streamline_compat) {
+                g_config.streamline_compat = true;
+                LOG_INFO("Config: Streamline Compatibility auto-enabled for %s", proc);
+                break;
+            }
+        }
+    }
 
     ApplyConfig();
     LOG_INFO("Config: ApplyConfig done");
@@ -296,6 +316,9 @@ void SaveConfig() {
     } else {
         WriteINIString(S, "blackout_key", g_config.blackout_key.c_str(), P);
     }
+
+    // Streamline Compatibility
+    WriteINIBool(S, "streamline_compat", g_config.streamline_compat, P);
 }
 
 void ApplyConfig() {

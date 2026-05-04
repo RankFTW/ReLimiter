@@ -104,6 +104,11 @@ struct Config {
 
     // Monitor Blackout
     std::string blackout_key = "";          // Keybind to toggle monitor blackout
+
+    // Streamline Compatibility — disables proactive Streamline FG hooks and
+    // NGX hook installation from inside LoadLibrary hooks. Required for games
+    // like Neverness to Everness where these hooks break FG/RR.
+    bool streamline_compat = false;
 };
 
 extern Config g_config;

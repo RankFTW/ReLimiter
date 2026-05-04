@@ -183,6 +183,18 @@ static sl_Result __cdecl Detour_GetState(const void* vp, void* state, const void
             if (version >= 1) {
                 uint32_t frames_presented = *reinterpret_cast<const uint32_t*>(p + 48);
                 bool presenting = (frames_presented > 1);
+
+                // During the FG CreateFeature cooldown, don't let GetState revoke
+                // g_fg_presenting. Some games (e.g. Neverness to Everness) call
+                // CreateFeature(FG) every frame, and GetState reports
+                // numFramesActuallyPresented=1 during the first frame after each
+                // creation. Without this guard, fg_presenting toggles on/off every
+                // frame, causing constant scheduler flushes and FG tier flipping.
+                if (!presenting && NGXHooks_InFGCreateCooldown()) {
+                    // Still update the multiplier for telemetry, but don't revoke presenting
+                    int clamped_mult = static_cast<int>((std::min)(frames_presented, 6u));
+                    g_fg_actual_multiplier.store(clamped_mult, std::memory_order_relaxed);
+                } else {
                 bool prev_presenting = g_fg_presenting.exchange(presenting, std::memory_order_relaxed);
 
                 // Store actual runtime multiplier, clamped to [0, 6].
@@ -223,6 +235,7 @@ static sl_Result __cdecl Detour_GetState(const void* vp, void* state, const void
                              frames_presented);
                     OnFGStateChange();
                 }
+                } // end else (not in cooldown)
             } else {
                 static bool s_version_warned = false;
                 if (!s_version_warned) {
@@ -250,13 +263,16 @@ static sl_Result __cdecl Detour_slGetFeatureFunction(uint32_t feature, const cha
     }
     if (result != sl_eOk || !outPtr || !*outPtr) return result;
 
-    if (name && strcmp(name, "slDLSSGSetOptions") == 0 && !s_orig_SetOptions) {
-        InstallHook(*outPtr, reinterpret_cast<void*>(&Detour_SetOptions),
-                    reinterpret_cast<void**>(&s_orig_SetOptions));
-    }
-    else if (name && strcmp(name, "slDLSSGGetState") == 0 && !s_orig_GetState) {
-        InstallHook(*outPtr, reinterpret_cast<void*>(&Detour_GetState),
-                    reinterpret_cast<void**>(&s_orig_GetState));
+    // Skip hooking SetOptions/GetState when Streamline Compatibility is on.
+    if (!g_config.streamline_compat) {
+        if (name && strcmp(name, "slDLSSGSetOptions") == 0 && !s_orig_SetOptions) {
+            InstallHook(*outPtr, reinterpret_cast<void*>(&Detour_SetOptions),
+                        reinterpret_cast<void**>(&s_orig_SetOptions));
+        }
+        else if (name && strcmp(name, "slDLSSGGetState") == 0 && !s_orig_GetState) {
+            InstallHook(*outPtr, reinterpret_cast<void*>(&Detour_GetState),
+                        reinterpret_cast<void**>(&s_orig_GetState));
+        }
     }
 
     return result;
@@ -314,8 +330,15 @@ void HookStreamlinePCL(HMODULE hInterposer) {
         reinterpret_cast<void**>(&s_orig_slGetFeatureFunction));
 
     // Proactively resolve SetOptions/GetState in case the game already
-    // called slGetFeatureFunction before we hooked it (deferred hook
-    // installation means Streamline is already fully initialized).
+    // called slGetFeatureFunction before we hooked it.
+    // Skip when Streamline Compatibility is enabled — proactive hooking
+    // breaks FG in some games (e.g. Neverness to Everness) by patching
+    // the Streamline function bytes before the FG pipeline is ready.
+    if (g_config.streamline_compat) {
+        LOG_INFO("Streamline: proactive hooks skipped (streamline_compat=true)");
+        return;
+    }
+
     if (s_orig_slGetFeatureFunction && !s_orig_SetOptions) {
         void* fn = nullptr;
         sl_Result r = s_orig_slGetFeatureFunction(1000 /*eDLSS_G*/, "slDLSSGSetOptions", &fn);

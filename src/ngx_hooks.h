@@ -60,3 +60,8 @@ bool NGXHooks_IsFGCreated();
 
 // Clear the FG created flag (called when FG is genuinely disabled by the user).
 void NGXHooks_ClearFGCreated();
+
+// Returns true if a FG CreateFeature was called recently (within cooldown).
+// Used by Streamline hooks to avoid revoking g_fg_presenting immediately
+// after CreateFeature sets it — some games call CreateFeature every frame.
+bool NGXHooks_InFGCreateCooldown();

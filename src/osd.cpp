@@ -1087,6 +1087,19 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         HelpTip("When enabled, the log file records detailed info-level messages. "
                 "When disabled, only warnings and errors are logged. "
                 "Enable this before reporting issues.");
+
+        // Streamline Compatibility toggle
+        ImGui::Spacing();
+        if (ImGui::Checkbox("Streamline Compatibility", &g_config.streamline_compat))
+            config_dirty = true;
+        HelpTip("Disables proactive Streamline FG hooks that break Frame Generation "
+                "in some games (e.g. Neverness to Everness). Auto-enabled for known "
+                "affected games. Enable manually if FG or RR stops working with "
+                "ReLimiter installed. Requires game restart.");
+        if (g_config.streamline_compat) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Restart required)");
+        }
     }
 
     // ════════════════════════════════════════════

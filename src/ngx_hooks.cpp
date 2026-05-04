@@ -69,6 +69,14 @@ static std::atomic<bool>     s_fg_created{false};
 static std::atomic<int>      s_sr_preset{-1};
 static std::atomic<int>      s_rr_preset{-1};
 
+// FG CreateFeature cooldown — some games (e.g. Neverness to Everness) call
+// CreateFeature(FG) every frame. Without a cooldown, GetState immediately
+// revokes g_fg_presenting (numFramesActuallyPresented=1 during the first
+// frame after creation), causing a toggle-on/toggle-off cycle every frame
+// that floods the log and prevents the scheduler from converging.
+static int64_t s_fg_create_qpc = 0;           // QPC timestamp of last FG CreateFeature
+static constexpr double FG_CREATE_COOLDOWN_US = 3000000.0;  // 3 seconds
+
 // Handle tracking — only process EvaluateFeature for the SR handle
 static void* s_dlss_sr_handle = nullptr;
 
@@ -96,17 +104,46 @@ static void ExtractDlssParams(void* params, unsigned int feature_id) {
     // Frame Generation
     if (feature_id == NGX_Feature_FrameGeneration) {
         s_fg_created.store(true, std::memory_order_relaxed);
+
+        // Record the timestamp for cooldown — prevents GetState from revoking
+        // g_fg_presenting immediately after CreateFeature sets it.
+        LARGE_INTEGER qpc_now;
+        QueryPerformanceCounter(&qpc_now);
+        s_fg_create_qpc = qpc_now.QuadPart;
+
         // Set fg_presenting directly — this is the most reliable FG signal.
         // Games like Horizon Remastered never confirm FG through slDLSSGGetState,
         // causing the Streamline deferred inference to fail. The NGX CreateFeature
         // call is definitive: the game is creating the FG feature right now.
-        bool was_presenting = g_fg_presenting.load(std::memory_order_relaxed);
-        if (!was_presenting) {
-            g_fg_presenting.store(true, std::memory_order_relaxed);
-            OnFGStateChange();
-            LOG_INFO("NGX: FG presenting set from CreateFeature (Streamline bypass)");
+        //
+        // Only set on the FIRST CreateFeature(FG) call. Some games (e.g. Neverness
+        // to Everness) call CreateFeature(FG) every frame. Repeated sets cause
+        // OnFGStateChange() to fire, which flushes the scheduler. After the first
+        // set, let GetState be the authority for state changes.
+        static bool s_fg_first_create = true;
+        if (s_fg_first_create) {
+            s_fg_first_create = false;
+            bool was_presenting = g_fg_presenting.load(std::memory_order_relaxed);
+            if (!was_presenting) {
+                g_fg_presenting.store(true, std::memory_order_relaxed);
+                OnFGStateChange();
+                LOG_INFO("NGX: FG presenting set from CreateFeature (Streamline bypass)");
+            }
         }
-        LOG_INFO("NGX: DLSS Frame Generation created (feature=%u)", feature_id);
+
+        // Only log once per second to avoid flooding in games that call
+        // CreateFeature(FG) every frame.
+        static int64_t s_last_fg_log_qpc = 0;
+        LARGE_INTEGER freq;
+        QueryPerformanceFrequency(&freq);
+        double since_last_log = (s_last_fg_log_qpc > 0)
+            ? static_cast<double>(qpc_now.QuadPart - s_last_fg_log_qpc) * 1000.0 /
+              static_cast<double>(freq.QuadPart)
+            : 999999.0;
+        if (since_last_log > 1000.0) {
+            LOG_INFO("NGX: DLSS Frame Generation created (feature=%u)", feature_id);
+            s_last_fg_log_qpc = qpc_now.QuadPart;
+        }
         return;
     }
 
@@ -519,6 +556,16 @@ bool NGXHooks_IsFGCreated() {
 
 void NGXHooks_ClearFGCreated() {
     s_fg_created.store(false, std::memory_order_relaxed);
+}
+
+bool NGXHooks_InFGCreateCooldown() {
+    if (s_fg_create_qpc == 0) return false;
+    LARGE_INTEGER now, freq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    double elapsed_us = static_cast<double>(now.QuadPart - s_fg_create_qpc) *
+                        1000000.0 / static_cast<double>(freq.QuadPart);
+    return elapsed_us < FG_CREATE_COOLDOWN_US;
 }
 
 // ── DLL version reading ──
