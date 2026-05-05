@@ -41,3 +41,7 @@ bool IsDmfgActive();
 // Returns true if NVIDIA Smooth Motion (nvpresent64.dll) is loaded.
 // SM is a driver-level 2x frame gen — always doubles output FPS.
 bool IsNvSmoothMotionActive();
+
+// Streamline Compatibility: poll GetState without hooking.
+// Call from the OSD draw loop. Throttled internally to every 500ms.
+void StreamlineCompat_Poll();

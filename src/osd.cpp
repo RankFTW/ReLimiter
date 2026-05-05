@@ -1676,6 +1676,9 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
     // Update hardware sensors (throttled internally to ~1Hz)
     HWMonitor_Update();
 
+    // Streamline Compatibility: poll GetState for FG state (throttled to every 500ms)
+    StreamlineCompat_Poll();
+
     // Retry NGX hook installation for games where DLLs load late.
     // TryInstall is idempotent — no-ops once hooks are installed.
     // Stops after ~30 seconds.

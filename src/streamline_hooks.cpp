@@ -252,7 +252,168 @@ static sl_Result __cdecl Detour_GetState(const void* vp, void* state, const void
 }
 
 // ── Detour: slGetFeatureFunction — use MinHook on resolved pointers ──
-// Guard against double-call: only hook each function once.
+// ── Streamline Compatibility: polling-based FG state reading ──
+// When streamline_compat is enabled, we don't hook slDLSSGGetState
+// (patching it breaks FG in some games). Instead, we hook only
+// slDLSSGSetOptions to capture the viewport pointer, then call
+// GetState ourselves with that viewport to read FG state.
+static PFN_slDLSSGGetState s_poll_GetState = nullptr;
+static const void* s_captured_viewport = nullptr;
+static bool s_poll_resolved = false;
+static int64_t s_poll_last_qpc = 0;
+static constexpr double POLL_INTERVAL_MS = 500.0;  // poll every 500ms
+
+// Compat-mode SetOptions detour — only captures viewport, forwards unmodified
+static sl_Result __cdecl Detour_SetOptions_Compat(const void* vp, const void* opts) {
+    // Capture the viewport pointer for polling GetState later
+    if (vp && !s_captured_viewport) {
+        s_captured_viewport = vp;
+        LOG_INFO("Streamline compat: viewport captured from SetOptions (%p)", vp);
+    }
+
+    // Forward unmodified — also read the opts for FG multiplier/mode
+    sl_Result result;
+    __try {
+        result = s_orig_SetOptions(vp, opts);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_WARN("Detour_SetOptions_Compat: SEH exception (0x%08X)", GetExceptionCode());
+        return -1;
+    }
+
+    // Read FG state from opts (same as normal Detour_SetOptions)
+    __try {
+        if (result == sl_eOk && opts) {
+            uint32_t mode = *reinterpret_cast<const uint32_t*>(
+                reinterpret_cast<const uint8_t*>(opts) + 32);
+            if (!g_config.dynamic_mfg_passthrough) {
+                static uint32_t s_prev_mode = UINT32_MAX;
+                g_fg_mode.store(static_cast<int>(mode), std::memory_order_relaxed);
+                if (mode != s_prev_mode) {
+                    const char* mode_str = (mode == 0) ? "Off"
+                                         : (mode == 1) ? "On"
+                                         : (mode == 2) ? "Auto(Dynamic)"
+                                         : "Unknown";
+                    LOG_INFO("DLSSG mode changed (compat): %u -> %u (%s)",
+                             s_prev_mode == UINT32_MAX ? 0 : s_prev_mode, mode, mode_str);
+                    s_prev_mode = mode;
+                }
+            }
+
+            int numFrames = *reinterpret_cast<const int*>(
+                reinterpret_cast<const uint8_t*>(opts) + 36);
+            int prev = g_fg_multiplier.exchange(numFrames, std::memory_order_relaxed);
+            s_setoptions_ever_called.store(true, std::memory_order_relaxed);
+            if (numFrames != prev) {
+                LOG_INFO("FG multiplier changed (compat): %d -> %d (divisor=%d)",
+                         prev, numFrames, numFrames + 1);
+                if (numFrames > 0 && !g_fg_presenting.load(std::memory_order_relaxed)) {
+                    LARGE_INTEGER now;
+                    QueryPerformanceCounter(&now);
+                    s_fg_inference_start_qpc.store(now.QuadPart, std::memory_order_relaxed);
+                    s_fg_inference_pending.store(true, std::memory_order_relaxed);
+                    s_fg_confirmed_by_getstate.store(false, std::memory_order_relaxed);
+                    LOG_INFO("FG presenting deferred (compat) — waiting for poll confirmation");
+                }
+                OnFGStateChange();
+            }
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+    return result;
+}
+
+static void PollStreamlineFGState() {
+    if (!s_poll_GetState || !s_captured_viewport) return;
+
+    // Only poll if SetOptions has configured FG
+    if (!s_setoptions_ever_called.load(std::memory_order_relaxed)) return;
+
+    uint8_t state_buf[256] = {};
+
+    sl_Result result;
+    __try {
+        result = s_poll_GetState(s_captured_viewport, state_buf, nullptr);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        static int s_exc_count = 0;
+        if (s_exc_count < 5) {
+            LOG_WARN("PollStreamlineFGState: SEH exception (0x%08X)", GetExceptionCode());
+            s_exc_count++;
+        }
+        return;
+    }
+
+    if (result != sl_eOk) {
+        static int s_fail_count = 0;
+        if (s_fail_count < 5) {
+            LOG_WARN("PollStreamlineFGState: GetState returned %d", static_cast<int>(result));
+            s_fail_count++;
+        }
+        return;
+    }
+
+    // Read the same fields as Detour_GetState
+    const uint8_t* p = state_buf;
+
+    int status = *reinterpret_cast<const int*>(p + 40);
+    bool active = (status == 0);
+    bool prev_active = g_fg_active.exchange(active, std::memory_order_relaxed);
+    if (active != prev_active) {
+        LOG_INFO("FG active (polled): %s -> %s", prev_active ? "yes" : "no", active ? "yes" : "no");
+        OnFGStateChange();
+    }
+
+    size_t version = *reinterpret_cast<const size_t*>(p + 24);
+    if (version >= 1) {
+        uint32_t frames_presented = *reinterpret_cast<const uint32_t*>(p + 48);
+        bool presenting = (frames_presented > 1);
+
+        if (!presenting && NGXHooks_InFGCreateCooldown()) {
+            int clamped_mult = static_cast<int>((std::min)(frames_presented, 6u));
+            g_fg_actual_multiplier.store(clamped_mult, std::memory_order_relaxed);
+            return;
+        }
+
+        bool prev_presenting = g_fg_presenting.exchange(presenting, std::memory_order_relaxed);
+
+        int clamped_mult = static_cast<int>((std::min)(frames_presented, 6u));
+        int prev_mult = g_fg_actual_multiplier.exchange(clamped_mult, std::memory_order_relaxed);
+        if (clamped_mult != prev_mult) {
+            LOG_INFO("FG actual multiplier (polled): %d -> %d (numFramesActuallyPresented=%u)",
+                     prev_mult, clamped_mult, frames_presented);
+        }
+
+        if (presenting && s_fg_inference_pending.load(std::memory_order_relaxed)) {
+            s_fg_confirmed_by_getstate.store(true, std::memory_order_relaxed);
+            s_fg_inference_pending.store(false, std::memory_order_relaxed);
+        }
+
+        if (presenting != prev_presenting) {
+            LOG_INFO("FG presenting (polled): %s -> %s (numFramesActuallyPresented=%u)",
+                     prev_presenting ? "yes" : "no", presenting ? "yes" : "no",
+                     frames_presented);
+            OnFGStateChange();
+        }
+    }
+}
+
+// Called from the OSD draw loop (every frame) — throttled internally
+void StreamlineCompat_Poll() {
+    if (!g_config.streamline_compat) return;
+    if (!s_poll_resolved) return;
+
+    LARGE_INTEGER now, freq;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+
+    if (s_poll_last_qpc > 0) {
+        double elapsed_ms = static_cast<double>(now.QuadPart - s_poll_last_qpc) * 1000.0 /
+                            static_cast<double>(freq.QuadPart);
+        if (elapsed_ms < POLL_INTERVAL_MS) return;
+    }
+    s_poll_last_qpc = now.QuadPart;
+
+    PollStreamlineFGState();
+}
 static sl_Result __cdecl Detour_slGetFeatureFunction(uint32_t feature, const char* name, void** outPtr) {
     sl_Result result;
     __try {
@@ -272,6 +433,18 @@ static sl_Result __cdecl Detour_slGetFeatureFunction(uint32_t feature, const cha
         else if (name && strcmp(name, "slDLSSGGetState") == 0 && !s_orig_GetState) {
             InstallHook(*outPtr, reinterpret_cast<void*>(&Detour_GetState),
                         reinterpret_cast<void**>(&s_orig_GetState));
+        }
+    } else {
+        // Compat mode: hook SetOptions for viewport capture, resolve GetState for polling
+        if (name && strcmp(name, "slDLSSGSetOptions") == 0 && !s_orig_SetOptions) {
+            InstallHook(*outPtr, reinterpret_cast<void*>(&Detour_SetOptions_Compat),
+                        reinterpret_cast<void**>(&s_orig_SetOptions));
+            LOG_INFO("Streamline: lazy-hooked slDLSSGSetOptions (compat)");
+        }
+        else if (name && strcmp(name, "slDLSSGGetState") == 0 && !s_poll_GetState) {
+            s_poll_GetState = reinterpret_cast<PFN_slDLSSGGetState>(*outPtr);
+            s_poll_resolved = true;
+            LOG_INFO("Streamline: lazy-resolved slDLSSGGetState for polling at %p", *outPtr);
         }
     }
 
@@ -335,7 +508,31 @@ void HookStreamlinePCL(HMODULE hInterposer) {
     // breaks FG in some games (e.g. Neverness to Everness) by patching
     // the Streamline function bytes before the FG pipeline is ready.
     if (g_config.streamline_compat) {
-        LOG_INFO("Streamline: proactive hooks skipped (streamline_compat=true)");
+        LOG_INFO("Streamline: compat mode — hooking SetOptions (viewport capture), resolving GetState for polling");
+        // Hook SetOptions to capture the viewport pointer and read FG config
+        if (s_orig_slGetFeatureFunction && !s_orig_SetOptions) {
+            void* fn = nullptr;
+            sl_Result r = s_orig_slGetFeatureFunction(1000 /*eDLSS_G*/, "slDLSSGSetOptions", &fn);
+            if (r == sl_eOk && fn) {
+                InstallHook(fn, reinterpret_cast<void*>(&Detour_SetOptions_Compat),
+                            reinterpret_cast<void**>(&s_orig_SetOptions));
+                LOG_INFO("Streamline: hooked slDLSSGSetOptions (compat — viewport capture)");
+            }
+        }
+        // Resolve GetState WITHOUT hooking — just store the pointer for polling
+        if (s_orig_slGetFeatureFunction && !s_poll_GetState) {
+            void* fn = nullptr;
+            sl_Result r = s_orig_slGetFeatureFunction(1000 /*eDLSS_G*/, "slDLSSGGetState", &fn);
+            if (r == sl_eOk && fn) {
+                s_poll_GetState = reinterpret_cast<PFN_slDLSSGGetState>(fn);
+                LOG_INFO("Streamline: resolved slDLSSGGetState for polling at %p (NOT hooked)", fn);
+            }
+        }
+        s_poll_resolved = (s_poll_GetState != nullptr);
+        if (s_poll_resolved)
+            LOG_INFO("Streamline: polling mode active — waiting for viewport from SetOptions");
+        else
+            LOG_WARN("Streamline: polling mode failed — GetState not resolved");
         return;
     }
 
