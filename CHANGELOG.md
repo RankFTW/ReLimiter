@@ -1,6 +1,12 @@
 # Changelog
 
 
+## 3.2.2
+
+### Streamline Compatibility
+- **Full FG support for affected games** — Games with Streamline Compatibility enabled (e.g. Neverness to Everness) now have full Frame Generation support including correct FG multiplier, output FPS display, and adaptive smoothing. Achieved by polling GetState with the game's viewport instead of hooking it.
+
+
 ## 3.2.1
 
 ### Bug Fixes
