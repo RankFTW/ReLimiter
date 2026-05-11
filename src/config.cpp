@@ -105,6 +105,10 @@ void ValidateConfig() {
     if (g_config.background_fps != 0)
         g_config.background_fps = Clamp(g_config.background_fps, 30, 60);
 
+    // ── FG-Off FPS ──
+    if (g_config.fg_off_fps != 0)
+        g_config.fg_off_fps = Clamp(g_config.fg_off_fps, 30, 360);
+
     // ── VSync ──
     static const char* vsync_modes[] = {"game", "off", "on"};
     ValidateEnum(g_config.vsync_mode, vsync_modes, 3, "game");
@@ -167,6 +171,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.window_mode             = ReadINIString(S, "window_mode", "default", P);
     g_config.fake_fullscreen         = ReadINIBool(S, "fake_fullscreen", false, P);
     g_config.background_fps          = ReadINIInt(S, "background_fps", 30, P);
+    g_config.fg_off_fps              = ReadINIInt(S, "fg_off_fps", 0, P);
     g_config.vsync_mode              = ReadINIString(S, "vsync_mode", "game", P);
     g_config.log_level               = ReadINIString(S, "log_level", "warn", P);
     g_config.csv_enabled             = ReadINIBool(S, "csv_enabled", false, P);
@@ -279,6 +284,7 @@ void SaveConfig() {
     WriteINIString(S, "window_mode", g_config.window_mode.c_str(), P);
     WriteINIBool(S, "fake_fullscreen", g_config.fake_fullscreen, P);
     WriteINIInt(S, "background_fps", g_config.background_fps, P);
+    WriteINIInt(S, "fg_off_fps", g_config.fg_off_fps, P);
     WriteINIString(S, "vsync_mode", g_config.vsync_mode.c_str(), P);
     WriteINIString(S, "log_level", g_config.log_level.c_str(), P);
     WriteINIBool(S, "csv_enabled", g_config.csv_enabled, P);
@@ -325,6 +331,7 @@ void ApplyConfig() {
     // Wire config values to module globals
     g_user_target_fps.store(g_config.target_fps, std::memory_order_relaxed);
     g_background_fps.store(g_config.background_fps, std::memory_order_relaxed);
+    g_fg_off_fps.store(g_config.fg_off_fps, std::memory_order_relaxed);
     g_adaptive_wake_guard.base = g_config.initial_wake_guard_us;
     Log_SetLevel(Log_ParseLevel(g_config.log_level.c_str()));
 

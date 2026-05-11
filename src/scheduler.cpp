@@ -26,6 +26,7 @@
 #include "baseline.h"
 #include "reflex_inject.h"
 #include "streamline_hooks.h"
+#include "ngx_hooks.h"
 #include "adaptive_smoothing.h"
 #include "config.h"
 #include "logger.h"
@@ -37,6 +38,7 @@
 // ── User config ──
 std::atomic<int>    g_user_target_fps{0};
 std::atomic<int>    g_background_fps{30};
+std::atomic<int>    g_fg_off_fps{0};
 std::atomic<int>    g_dmfg_output_cap{0};
 std::atomic<bool>   g_overload_active_flag{false};
 std::atomic<double> g_actual_frame_time_us{0.0};
@@ -429,6 +431,39 @@ void OnMarker(uint64_t frameID, int64_t now) {
         s_last_enforcement_ts = qpc_now.QuadPart;
         g_predictor.OnEnforcement(frameID, qpc_now.QuadPart);
         return;
+    }
+
+    // ── FG-Off FPS cap ──
+    // When Frame Generation disables (menus, pauses, cutscenes), apply a lower
+    // FPS cap to prevent the GPU from ramping up on uncapped non-FG frames.
+    // Uses the same simple sleep pattern as the background cap.
+    // Trigger: DLSSG mode == 0 (Off) while FG was previously created this session.
+    // We use g_fg_mode rather than g_fg_presenting because some games (e.g.
+    // Crimson Desert) set numFrames=1 when disabling FG, which doesn't clear
+    // g_fg_presenting — but g_fg_mode reliably goes to 0.
+    {
+        int fg_off_cap = g_fg_off_fps.load(std::memory_order_relaxed);
+        if (fg_off_cap > 0) {
+            int fg_mode = g_fg_mode.load(std::memory_order_relaxed);
+            if (fg_mode == 0 && NGXHooks_IsFGCreated()) {
+                double cap_interval_us = 1000000.0 / static_cast<double>(fg_off_cap);
+                LARGE_INTEGER qpc_now;
+                QueryPerformanceCounter(&qpc_now);
+                if (s_last_enforcement_ts > 0) {
+                    double elapsed = qpc_to_us(qpc_now.QuadPart - s_last_enforcement_ts);
+                    double remaining = cap_interval_us - elapsed;
+                    if (remaining > 500.0) {
+                        int64_t target_wake = qpc_now.QuadPart + us_to_qpc(remaining);
+                        DoOwnSleep(target_wake);
+                    }
+                }
+                InvokeSleep(/*passthrough=*/true);
+                QueryPerformanceCounter(&qpc_now);
+                s_last_enforcement_ts = qpc_now.QuadPart;
+                g_predictor.OnEnforcement(frameID, qpc_now.QuadPart);
+                return;
+            }
+        }
     }
 
     PacingMode mode = g_pacing_mode.load(std::memory_order_relaxed);

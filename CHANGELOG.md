@@ -7,6 +7,10 @@
 - **Fixed adaptive smoothing not activating in some games** — Games where the Reflex ring buffer reports garbage GPU render times during initialization (e.g. Greedfall 2) no longer poison the P99 window. Values below 50% of the target interval are rejected as initialization noise. Additionally, the enforcement path restriction is removed — adaptive smoothing now works with any enforcement path as long as GPU timing data is available, including games with native Reflex that only send RENDERSUBMIT_START markers.
 - **Fixed adaptive smoothing not receiving data on most frames** — The Feedback system only updates GPU render time periodically (~every 300 frames). The scheduler now reuses the last known plausible value on intermediate frames, allowing the P99 window to fill in seconds instead of minutes.
 
+### Frame Generation
+- **FG-Off FPS Cap** — New option to automatically cap FPS when Frame Generation disables (menus, pauses, cutscenes). Prevents the GPU from ramping up on uncapped non-FG frames. Configurable from 30–120 FPS in the OSD, or set `fg_off_fps` in the INI. Disabled by default (0).
+- **Fixed OSD showing wrong FG multiplier when FG is off** — Games like Crimson Desert that set `numFrames=1` (instead of 0) when disabling FG caused the OSD to keep displaying "4x" after FG was turned off. The OSD now checks the authoritative DLSSG mode field and correctly shows "off".
+
 
 ## 3.2.2
 
