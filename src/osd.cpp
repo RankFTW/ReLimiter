@@ -1727,7 +1727,13 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
     bool fg_presenting = g_fg_presenting.load(std::memory_order_relaxed);
     int fg_mode = g_fg_mode.load(std::memory_order_relaxed);
     char fg_buf[32] = {};
-    if (fg_mode > 0 && fg_presenting && fg_mult > 0) {
+    // Determine if FG is actively producing frames:
+    // - With Streamline mode data: mode > 0 AND presenting
+    // - Without mode data: just presenting (mode is always 0)
+    bool fg_display_active = fg_presenting && fg_mult > 0;
+    if (Streamline_HasModeData() && fg_mode == 0)
+        fg_display_active = false;
+    if (fg_display_active) {
         // Use actual driver multiplier when available (handles control panel overrides)
         int actual = g_fg_actual_multiplier.load(std::memory_order_relaxed);
         int display_mult = (actual >= 2) ? actual : (fg_mult + 1);

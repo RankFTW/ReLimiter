@@ -45,3 +45,8 @@ bool IsNvSmoothMotionActive();
 // Streamline Compatibility: poll GetState without hooking.
 // Call from the OSD draw loop. Throttled internally to every 500ms.
 void StreamlineCompat_Poll();
+
+// Returns true if Streamline SetOptions has ever provided FG mode data.
+// When false, g_fg_mode is unreliable (stays at 0) and g_fg_presenting
+// should be used as the FG state authority instead.
+bool Streamline_HasModeData();
