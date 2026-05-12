@@ -438,12 +438,16 @@ void OnMarker(uint64_t frameID, int64_t now) {
     // FPS cap to prevent the GPU from ramping up on uncapped non-FG frames.
     // Uses the same simple sleep pattern as the background cap.
     //
+    // Guard: IsFGDllLoaded() — true from startup if the game ships nvngx_dlssg.dll.
+    // This is more reliable than NGXHooks_IsFGCreated() which only becomes true
+    // after the game calls CreateFeature(FG) (often not until gameplay starts).
+    //
     // Detection strategy depends on whether Streamline provides mode data:
     // - With Streamline mode data: g_fg_mode == 0 is authoritative (Crimson Desert)
     // - Without mode data: fall back to !g_fg_presenting (RE9, Dying Light 2)
     {
         int fg_off_cap = g_fg_off_fps.load(std::memory_order_relaxed);
-        if (fg_off_cap > 0 && NGXHooks_IsFGCreated()) {
+        if (fg_off_cap > 0 && IsFGDllLoaded()) {
             bool fg_is_off;
             if (Streamline_HasModeData()) {
                 // Streamline provides DLSSG mode — use it as authority
