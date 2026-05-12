@@ -461,8 +461,11 @@ void OnMarker(uint64_t frameID, int64_t now) {
                 LARGE_INTEGER qpc_now;
                 QueryPerformanceCounter(&qpc_now);
                 if (s_last_enforcement_ts > 0) {
-                    double elapsed = qpc_to_us(qpc_now.QuadPart - s_last_enforcement_ts);
-                    double remaining = cap_interval_us - elapsed;
+                    // Publish frame time so OSD can show FPS during FG-off cap
+                    double ft = qpc_to_us(qpc_now.QuadPart - s_last_enforcement_ts);
+                    if (ft > 0.0)
+                        g_actual_frame_time_us.store(ft, std::memory_order_relaxed);
+                    double remaining = cap_interval_us - ft;
                     if (remaining > 500.0) {
                         int64_t target_wake = qpc_now.QuadPart + us_to_qpc(remaining);
                         DoOwnSleep(target_wake);
