@@ -9,7 +9,7 @@
 
 ### Frame Generation
 - **FG-Off FPS Cap** — New option to automatically cap FPS when Frame Generation disables (menus, pauses, cutscenes). Prevents the GPU from ramping up on uncapped non-FG frames. Configurable from 30–120 FPS in the OSD, or set `fg_off_fps` in the INI. Disabled by default (0).
-- **Fixed FG-Off cap not working in games without Streamline mode data** — Games like RE9 and Dying Light 2 (especially with swapped DLSS DLLs) don't provide DLSSG mode through Streamline SetOptions. The cap now falls back to `g_fg_presenting` state when Streamline mode data is unavailable, while still using the authoritative `g_fg_mode` for games that do provide it (e.g., Crimson Desert).
+- **Fixed FG-Off cap not working in games without Streamline mode data** — Games like RE9 and Dying Light 2 don't provide DLSSG mode through Streamline SetOptions. The cap now falls back to `g_fg_presenting` state when Streamline mode data is unavailable, while still using the authoritative `g_fg_mode` for games that do provide it (e.g., Crimson Desert). Additionally, the FG game guard now uses `IsFGDllLoaded()` instead of waiting for CreateFeature, so the cap works from the main menu on first launch.
 - **Fixed OSD showing wrong FG multiplier when FG is off** — Games like Crimson Desert that set `numFrames=1` (instead of 0) when disabling FG caused the OSD to keep displaying "4x" after FG was turned off. The OSD now checks the authoritative DLSSG mode field and correctly shows "off".
 
 
