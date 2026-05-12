@@ -26,7 +26,6 @@
 #include "baseline.h"
 #include "reflex_inject.h"
 #include "streamline_hooks.h"
-#include "ngx_hooks.h"
 #include "adaptive_smoothing.h"
 #include "config.h"
 #include "logger.h"
