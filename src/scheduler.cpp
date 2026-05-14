@@ -603,11 +603,15 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     if (g_config.adaptive_smoothing &&
         predictor_warm) {
         double gpu_active = g_reflex_gpu_active_us.load(std::memory_order_relaxed);
+        // Keep last known plausible value — Feedback only updates periodically.
         // Reject values below 50% of effective interval as garbage from early
         // initialization (DLSS not yet active, ring buffer contains stale data).
-        // Feed every frame — the 256-sample window naturally converges when
-        // Feedback updates the atomic with a new measurement.
+        static double s_last_gpu_active = 0.0;
         double min_plausible = effective_interval * 0.5;
+        if (gpu_active >= min_plausible)
+            s_last_gpu_active = gpu_active;
+        else
+            gpu_active = s_last_gpu_active;
         if (gpu_active >= min_plausible && gpu_active < effective_interval * 3.0)
             smoothing_offset = g_adaptive_smoothing.Update(gpu_active, effective_interval);
         // Add user-configured constant bias on top of the computed offset
