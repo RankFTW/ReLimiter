@@ -50,6 +50,9 @@ struct Config {
     // Background
     int background_fps = 30;
 
+    // FG-Off FPS Cap — cap applied when Frame Generation disables (menus, pauses)
+    int fg_off_fps = 0;                 // 0 = disabled, 30-360 = cap when FG not presenting
+
     // VSync Override
     std::string vsync_mode = "game";        // game | off | on
 

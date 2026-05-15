@@ -170,6 +170,24 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
             s_enforcement_marker = RENDERSUBMIT_START;
     }
 
+    // Auto-fallback: if we've received 200+ markers but never seen our
+    // enforcement marker type, switch to the most common marker type we DO see.
+    // This handles games like Greedfall 2 that send RENDERSUBMIT_START but
+    // never SIMULATION_START — without this, the scheduler never runs.
+    static int s_total_markers = 0;
+    static int s_enforcement_hits = 0;
+    static bool s_fallback_applied = false;
+    s_total_markers++;
+    if (params->markerType == s_enforcement_marker) s_enforcement_hits++;
+    if (!s_fallback_applied && s_total_markers >= 200 && s_enforcement_hits == 0) {
+        // Never seen our enforcement marker — fall back to RENDERSUBMIT_START
+        // which is the most common alternative marker games send.
+        s_enforcement_marker = RENDERSUBMIT_START;
+        s_fallback_applied = true;
+        LOG_WARN("NvAPI: enforcement marker fallback — SIMULATION_START never received, "
+                 "switching to RENDERSUBMIT_START (after %d markers)", s_total_markers);
+    }
+
     // Snapshot the deadline AFTER enforcement sets it for this frame.
     // OnMarker computes this_frame_deadline and publishes it to g_next_deadline.
     // PRESENT_START needs THIS frame's deadline for the gate — not the previous

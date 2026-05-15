@@ -12,6 +12,9 @@ extern std::atomic<int> g_user_target_fps;
 // Background FPS cap (default 15, 0 = no limit)
 extern std::atomic<int> g_background_fps;
 
+// FG-Off FPS cap (0 = disabled, 30-360 = cap when FG not presenting)
+extern std::atomic<int> g_fg_off_fps;
+
 // DMFG output cap (0 = disabled, 30-360 = target output FPS)
 extern std::atomic<int> g_dmfg_output_cap;
 

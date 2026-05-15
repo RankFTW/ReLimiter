@@ -4,10 +4,17 @@ A ReShade addon for frame pacing and FPS limiting on NVIDIA G-Sync / VRR display
 
 ## Installation
 
-1. Install [ReShade](https://reshade.me/) for your game with addon support enabled.
-2. Download `relimiter.addon64` from the [Releases](https://github.com/RankFTW/ReLimiter/releases) page.
-3. Drop it into your ReShade addon directory (same folder as the ReShade DLL).
-4. Launch the game. Open the ReShade overlay to access ReLimiter's settings panel.
+Install via [RHI (ReShade HDR Installer)](https://github.com/RankFTW/RHI) for the easiest setup — it handles ReShade, ReLimiter, and updates across your entire game library.
+
+1. Download and run [RHI](https://github.com/RankFTW/RHI/releases).
+2. Find your game in the library.
+3. Click the ReShade install button on the game card.
+4. Click the ReLimiter install button on the game card.
+5. Launch the game. Open the ReShade overlay to access ReLimiter's settings panel.
+
+**Manual install:** Download `relimiter.addon64` from the [Releases](https://github.com/RankFTW/ReLimiter/releases) page and drop it next to the ReShade DLL in your game folder.
+
+📖 **[Full User Guide](docs/USER_GUIDE.md)** — comprehensive documentation covering every feature, setting, and INI option.
 
 ## Adaptive Smoothing
 

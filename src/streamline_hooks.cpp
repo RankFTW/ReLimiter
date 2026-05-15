@@ -13,6 +13,7 @@ std::atomic<bool> g_fg_presenting{false};
 
 // DMFG state — DLSSGMode: 0=eOff, 1=eOn (static FG), 2=eAuto (Dynamic MFG)
 std::atomic<int>  g_fg_mode{0};
+static std::atomic<bool> s_fg_mode_ever_nonzero{false};
 
 // Game's requested MaxFrameLatency, captured by FLC vtable hook
 std::atomic<uint32_t> g_game_requested_latency{0};
@@ -83,6 +84,8 @@ static sl_Result __cdecl Detour_SetOptions(const void* vp, const void* opts) {
             if (!g_config.dynamic_mfg_passthrough) {
                 static uint32_t s_prev_mode = UINT32_MAX;
                 g_fg_mode.store(static_cast<int>(mode), std::memory_order_relaxed);
+                if (mode > 0)
+                    s_fg_mode_ever_nonzero.store(true, std::memory_order_relaxed);
                 if (mode != s_prev_mode) {
                     const char* mode_str = (mode == 0) ? "Off"
                                          : (mode == 1) ? "On"
@@ -288,6 +291,8 @@ static sl_Result __cdecl Detour_SetOptions_Compat(const void* vp, const void* op
             if (!g_config.dynamic_mfg_passthrough) {
                 static uint32_t s_prev_mode = UINT32_MAX;
                 g_fg_mode.store(static_cast<int>(mode), std::memory_order_relaxed);
+                if (mode > 0)
+                    s_fg_mode_ever_nonzero.store(true, std::memory_order_relaxed);
                 if (mode != s_prev_mode) {
                     const char* mode_str = (mode == 0) ? "Off"
                                          : (mode == 1) ? "On"
@@ -394,6 +399,10 @@ static void PollStreamlineFGState() {
             OnFGStateChange();
         }
     }
+}
+
+bool Streamline_HasModeData() {
+    return s_fg_mode_ever_nonzero.load(std::memory_order_relaxed);
 }
 
 // Called from the OSD draw loop (every frame) — throttled internally

@@ -126,6 +126,12 @@ static void UpdateActiveState() {
             s_inject_dev = AcquireDeviceFromSwapchain();
         if (!s_inject_dev) return;
         LOG_INFO("ReflexInject: device acquired (%p)", s_inject_dev);
+        // Set g_dev so the Feedback system can call GetLatency on the same device.
+        // Without this, the ring buffer is never read for injected Reflex games.
+        if (!g_dev) {
+            g_dev = s_inject_dev;
+            LOG_INFO("ReflexInject: g_dev set from injection device");
+        }
     }
 
     s_active = true;

@@ -37,6 +37,7 @@
 // ── User config ──
 std::atomic<int>    g_user_target_fps{0};
 std::atomic<int>    g_background_fps{30};
+std::atomic<int>    g_fg_off_fps{0};
 std::atomic<int>    g_dmfg_output_cap{0};
 std::atomic<bool>   g_overload_active_flag{false};
 std::atomic<double> g_actual_frame_time_us{0.0};
@@ -431,6 +432,57 @@ void OnMarker(uint64_t frameID, int64_t now) {
         return;
     }
 
+    // ── FG-Off FPS cap ──
+    // When Frame Generation disables (menus, pauses, cutscenes), apply a lower
+    // FPS cap to prevent the GPU from ramping up on uncapped non-FG frames.
+    // Uses the same simple sleep pattern as the background cap.
+    //
+    // Guard: IsFGDllLoaded() — true from startup if the game ships nvngx_dlssg.dll.
+    // This is more reliable than NGXHooks_IsFGCreated() which only becomes true
+    // after the game calls CreateFeature(FG) (often not until gameplay starts).
+    //
+    // Detection strategy depends on whether Streamline provides mode data:
+    // - With Streamline mode data: g_fg_mode == 0 is authoritative (Crimson Desert)
+    // - Without mode data: fall back to !g_fg_presenting (RE9, Dying Light 2)
+    {
+        int fg_off_cap = g_fg_off_fps.load(std::memory_order_relaxed);
+        if (fg_off_cap > 0 && IsFGDllLoaded()) {
+            bool fg_is_off;
+            if (Streamline_HasModeData()) {
+                // Streamline provides DLSSG mode — use it as authority
+                fg_is_off = (g_fg_mode.load(std::memory_order_relaxed) == 0);
+            } else {
+                // No Streamline mode data — fall back to presenting state
+                fg_is_off = !g_fg_presenting.load(std::memory_order_relaxed);
+            }
+
+            if (fg_is_off) {
+                double cap_interval_us = 1000000.0 / static_cast<double>(fg_off_cap);
+                LARGE_INTEGER qpc_now;
+                QueryPerformanceCounter(&qpc_now);
+                if (s_last_enforcement_ts > 0) {
+                    double elapsed = qpc_to_us(qpc_now.QuadPart - s_last_enforcement_ts);
+                    double remaining = cap_interval_us - elapsed;
+                    if (remaining > 500.0) {
+                        int64_t target_wake = qpc_now.QuadPart + us_to_qpc(remaining);
+                        DoOwnSleep(target_wake);
+                    }
+                }
+                InvokeSleep(/*passthrough=*/true);
+                QueryPerformanceCounter(&qpc_now);
+                // Publish frame time AFTER sleep so OSD shows capped FPS, not uncapped
+                if (s_last_enforcement_ts > 0) {
+                    double ft = qpc_to_us(qpc_now.QuadPart - s_last_enforcement_ts);
+                    if (ft > 0.0)
+                        g_actual_frame_time_us.store(ft, std::memory_order_relaxed);
+                }
+                s_last_enforcement_ts = qpc_now.QuadPart;
+                g_predictor.OnEnforcement(frameID, qpc_now.QuadPart);
+                return;
+            }
+        }
+    }
+
     PacingMode mode = g_pacing_mode.load(std::memory_order_relaxed);
     if (mode == PacingMode::VRR)
         OnMarker_VRR(frameID, now);
@@ -549,10 +601,18 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     // of our sleep, the gate hold, CPU overhead, or pipeline latency.
     double smoothing_offset = 0.0;
     if (g_config.adaptive_smoothing &&
-        EnfDisp_GetActivePath() == EnforcementPath::NvAPIMarkers &&
         predictor_warm) {
         double gpu_active = g_reflex_gpu_active_us.load(std::memory_order_relaxed);
-        if (gpu_active > 0.0 && gpu_active < effective_interval * 3.0)
+        // Keep last known plausible value — Feedback only updates periodically.
+        // Reject values below 50% of effective interval as garbage from early
+        // initialization (DLSS not yet active, ring buffer contains stale data).
+        static double s_last_gpu_active = 0.0;
+        double min_plausible = effective_interval * 0.5;
+        if (gpu_active >= min_plausible)
+            s_last_gpu_active = gpu_active;
+        else
+            gpu_active = s_last_gpu_active;
+        if (gpu_active >= min_plausible && gpu_active < effective_interval * 3.0)
             smoothing_offset = g_adaptive_smoothing.Update(gpu_active, effective_interval);
         // Add user-configured constant bias on top of the computed offset
         smoothing_offset += g_config.smoothing_bias_us;
