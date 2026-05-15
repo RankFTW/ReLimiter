@@ -154,19 +154,19 @@ Force VSync on or off regardless of the game's setting.
 | Mode | Description |
 |------|-------------|
 | **Game** | Use whatever the game sets (default) |
-| **Off** | Force VSync off. Recommended when using a frame limiter with G-Sync. |
-| **On** | Force VSync on. Rarely needed. |
+| **Off** | Force VSync off. |
+| **On** | Force VSync on. |
 
 Works on DX11, DX12, and OpenGL. Hooks the present call to override the sync interval per-frame.
 
 ### When to Use
 
-Set to **Off** if you're using G-Sync with a frame limiter. This eliminates the extra frame of latency that VSync adds while the limiter prevents tearing. Most games should have VSync off when using ReLimiter.
+Use **Off** if you want to eliminate the extra frame of latency that VSync adds. Use **On** if you experience tearing that the frame limiter alone doesn't resolve. **Game** leaves it to the game's own setting.
 
 ### INI Key
 
 ```ini
-vsync_mode = off    ; game | off | on
+vsync_mode = game    ; game | off | on
 ```
 
 ---
@@ -399,7 +399,7 @@ Instead of targeting exactly your set FPS, adaptive smoothing adds a small buffe
 
 ### When NOT to Use
 
-- If you're GPU-bound (at or above your target FPS already)
+- If you're already hitting your FPS cap consistently (no headroom issues to solve)
 - DX11 or OpenGL games (no GPU timing data available)
 - If you prefer the absolute lowest latency over smoothness
 
@@ -641,7 +641,7 @@ All settings are stored in `relimiter.ini` next to the addon DLL. The file uses 
 
 ### Stuttering or inconsistent frame pacing
 
-1. Ensure VSync is set to **Off** (both in ReLimiter and in-game).
+1. Check your VSync setting — try different modes (Off, Game, On) to see what works best for your setup.
 2. Set Target FPS to **VRR Cap** (not a manual value above your monitor's range).
 3. If marginally GPU-bound, try enabling **Adaptive Smoothing** or lowering your target FPS slightly.
 4. Check that no other frame limiter is active (in-game limiter, RTSS, NVIDIA driver limiter).
