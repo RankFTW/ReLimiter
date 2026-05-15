@@ -1,16 +1,14 @@
 # Changelog
 
 
-## 3.2.3-beta
+## 3.2.3
 
 ### Adaptive Smoothing
-- **Fixed adaptive smoothing not activating in some games** — Games where the Reflex ring buffer reports garbage GPU render times during initialization (e.g. Greedfall 2) no longer poison the P99 window. Values below 50% of the target interval are rejected as initialization noise. Additionally, the enforcement path restriction is removed — adaptive smoothing now works with any enforcement path as long as GPU timing data is available, including games with native Reflex that only send RENDERSUBMIT_START markers.
-- **Fixed adaptive smoothing not receiving data on most frames** — The Feedback system only updates GPU render time periodically (~every 300 frames). The scheduler now reuses the last known plausible value on intermediate frames, allowing the P99 window to fill in seconds instead of minutes.
+- **Fixed adaptive smoothing not activating in some games** — Games that only send RENDERSUBMIT_START markers (e.g. Greedfall 2) or report invalid GPU render times during initialization no longer prevent adaptive smoothing from working. The feature now activates on any enforcement path as long as GPU timing data is available.
 
 ### Frame Generation
-- **FG-Off FPS Cap** — New option to automatically cap FPS when Frame Generation disables (menus, pauses, cutscenes). Prevents the GPU from ramping up on uncapped non-FG frames. Configurable from 30–120 FPS in the OSD, or set `fg_off_fps` in the INI. Disabled by default (0).
-- **Fixed FG-Off cap not activating until gameplay** — The FG game detection now uses `IsFGDllLoaded()` (true from startup) instead of waiting for CreateFeature to fire during gameplay. The cap works from the first menu frame. Also added a fallback detection path using `g_fg_presenting` for any game where Streamline mode data isn't available.
-- **Fixed OSD showing wrong FG multiplier when FG is off** — Games like Crimson Desert that set `numFrames=1` (instead of 0) when disabling FG caused the OSD to keep displaying "4x" after FG was turned off. The OSD now checks the authoritative DLSSG mode field and correctly shows "off".
+- **FG-Off FPS Cap** — New option to automatically cap FPS when Frame Generation disables (menus, pauses, cutscenes). Prevents the GPU from ramping up and generating heat/noise on uncapped non-FG frames. Configurable from 30–120 FPS in the OSD, or set `fg_off_fps` in the INI. Disabled by default. (suggested by Recoincidence)
+- **Fixed OSD showing wrong FG multiplier when FG is off** — Some games caused the OSD to keep displaying "4x" after FG was turned off. The OSD now correctly shows "off" when Frame Generation is disabled.
 
 
 ## 3.2.2
