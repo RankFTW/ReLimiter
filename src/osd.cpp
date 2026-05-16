@@ -968,13 +968,17 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     } // DX12 only (Adaptive Smoothing)
 
     // ════════════════════════════════════════════
-    // SECTION: Frame Generation (collapsible, DMFG only)
+    // SECTION: Frame Generation (collapsible, DX12 only)
     // ════════════════════════════════════════════
-    if (IsDmfgActive() || g_config.dynamic_mfg_passthrough) {
+    if (SwapMgr_GetActiveAPI() == ActiveAPI::DX12) {
     ImGui::Separator();
     if (ImGui::CollapsingHeader("Dynamic MFG")) {
         ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
-            "Ensure DMFG is enabled in the NVIDIA App or NVPI before activating.");
+            "Only enable if DMFG is already active via NVIDIA App / NVPI / in-game.");
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+            "This toggle does NOT enable DMFG. Leave OFF for standard FG (2x/3x/4x).");
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+            "Games with native DMFG support may not require this to be enabled.");
         ImGui::Spacing();
         // DMFG Compatibility toggle
         bool dmfg_pass = g_config.dynamic_mfg_passthrough;
@@ -994,12 +998,13 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Forced)");
         }
-        HelpTip("Required for DLSS Dynamic Multi Frame Generation (DMFG). "
-                "Hands frame pacing to the driver so it can freely adjust the FG multiplier. "
-                "Set the Output Cap below to cap output FPS (e.g. to your VRR ceiling) "
-                "while keeping the dynamic multiplier intact. "
-                "ReLimiter continues providing OSD, telemetry, and FG detection. "
-                "Auto-detected for most games; enable manually if detection misses.");
+        HelpTip("For DLSS Dynamic Multi Frame Generation (DMFG) ONLY. "
+                "This does NOT enable DMFG — you must enable it separately in the NVIDIA App, "
+                "Profile Inspector, or in-game settings first. "
+                "Only tick this if DMFG is already active and you want ReLimiter to hand "
+                "frame pacing to the driver so it can freely adjust the FG multiplier. "
+                "Set the Output Cap below to cap output FPS to your VRR ceiling. "
+                "If you're using standard FG (2x/3x/4x), leave this OFF.");
 
         // DMFG Output Cap slider — always visible in this section
         {
@@ -1038,11 +1043,12 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
 
             HelpTip("Cap the output (display) FPS when DMFG is active. "
                     "Set to your VRR ceiling (e.g. 157) to prevent tearing above the VRR window. "
-                    "0 = no cap (full passthrough).");
+                    "0 = no cap (full passthrough). "
+                    "Note: the target is not guaranteed — output may overshoot or undershoot slightly. "
+                    "Setting this too low will force the driver to max out at 6x multiplier.");
         }
     }
-
-    } // DMFG only
+    } // DX12 only (Dynamic MFG)
 
     // ════════════════════════════════════════════
     // SECTION 4: Advanced (collapsible)
@@ -1793,13 +1799,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             if (IsNvSmoothMotionActive()) {
                 snprintf(buf, sizeof(buf), "%.1f fps (%.1f render)", s_real_fps * 2.0, s_real_fps);
             } else if (IsDmfgActive() && output > 0.0) {
-                int actual_mult = g_fg_actual_multiplier.load(std::memory_order_relaxed);
-                double render_fps;
-                if (actual_mult >= 2)
-                    render_fps = output / static_cast<double>(actual_mult);
-                else
-                    render_fps = s_real_fps;
-                snprintf(buf, sizeof(buf), "%.1f fps (%.1f render)", output, render_fps);
+                snprintf(buf, sizeof(buf), "%.1f fps", output);
             } else if (output > 0.0 && fg_presenting && fg_mult > 0)
                 snprintf(buf, sizeof(buf), "%.1f fps (%.1f render)", output, s_real_fps);
             else
