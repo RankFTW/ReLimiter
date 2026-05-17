@@ -2,10 +2,10 @@
 
 #define VER_MAJOR 3
 #define VER_MINOR 2
-#define VER_PATCH 3
+#define VER_PATCH 4
 #define VER_BUILD 0
 
-#define VER_STR "3.2.3.0"
+#define VER_STR "3.2.4.0"
 #define VER_PRODUCT "ReLimiter"
 #define VER_DESCRIPTION "G-Sync/VRR Frame Pacing Addon for ReShade"
 #define VER_COPYRIGHT "RankFTW, Lazorr, UltraMatt"

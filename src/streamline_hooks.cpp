@@ -581,8 +581,10 @@ bool IsDmfgSession() {
 }
 
 bool IsDmfgActive() {
-    return g_fg_mode.load(std::memory_order_relaxed) == 2
-        || IsDmfgSession();
+    // Only active when the user explicitly enables the DMFG Compatibility toggle.
+    // Auto-detection via g_fg_mode==2 or latency hints was causing false positives
+    // (e.g. Clair Obscur entering passthrough when users expected active pacing).
+    return g_config.dynamic_mfg_passthrough;
 }
 
 bool IsNvSmoothMotionActive() {

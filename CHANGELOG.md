@@ -1,6 +1,16 @@
 # Changelog
 
 
+## 3.2.4
+
+### Frame Generation
+- **Fixed games incorrectly entering DMFG passthrough** — Games like Clair Obscur that use DLSS FG in "Auto" mode were being auto-detected as Dynamic MFG, causing ReLimiter to disable pacing entirely. DMFG passthrough now only activates when the user explicitly enables the "DMFG Compatibility" toggle. If you're using DMFG and previously relied on auto-detection, re-enable the toggle manually.
+- **Removed render FPS display in DMFG mode** — The render FPS shown in parentheses was unreliable when DMFG is active (wrong multiplier data). The OSD now shows output FPS only in DMFG mode.
+
+### UI
+- **Dynamic MFG section always visible on DX12 games** — No longer hidden until DMFG is detected. The section is now accessible on any DX12 game so you can enable the toggle regardless of how DMFG is configured (in-game, NVIDIA App, or Profile Inspector). Clear warnings explain that the toggle does not enable DMFG — it only hands pacing to the driver when DMFG is already active.
+
+
 ## 3.2.3
 
 ### Adaptive Smoothing
