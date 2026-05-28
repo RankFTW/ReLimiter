@@ -111,24 +111,17 @@ static void ExtractDlssParams(void* params, unsigned int feature_id) {
         QueryPerformanceCounter(&qpc_now);
         s_fg_create_qpc = qpc_now.QuadPart;
 
-        // Set fg_presenting directly — this is the most reliable FG signal.
-        // Games like Horizon Remastered never confirm FG through slDLSSGGetState,
-        // causing the Streamline deferred inference to fail. The NGX CreateFeature
-        // call is definitive: the game is creating the FG feature right now.
-        //
-        // Only set on the FIRST CreateFeature(FG) call. Some games (e.g. Neverness
-        // to Everness) call CreateFeature(FG) every frame. Repeated sets cause
-        // OnFGStateChange() to fire, which flushes the scheduler. After the first
-        // set, let GetState be the authority for state changes.
+        // Don't set fg_presenting immediately from CreateFeature — doing so
+        // before the FG pipeline has initialized can interfere with pacing and
+        // prevent FG from ever starting (LEGO Batman, Clair Obscur Steam).
+        // Instead, let the deferred inference in streamline_hooks.cpp handle it
+        // (CheckDeferredFGInference promotes after a timeout if GetState never
+        // confirms). This preserves Horizon Remastered support (which never
+        // calls GetState) while not breaking games that need time to init FG.
         static bool s_fg_first_create = true;
         if (s_fg_first_create) {
             s_fg_first_create = false;
-            bool was_presenting = g_fg_presenting.load(std::memory_order_relaxed);
-            if (!was_presenting) {
-                g_fg_presenting.store(true, std::memory_order_relaxed);
-                OnFGStateChange();
-                LOG_INFO("NGX: FG presenting set from CreateFeature (Streamline bypass)");
-            }
+            LOG_INFO("NGX: DLSS Frame Generation created (feature=%u) — deferring presenting", feature_id);
         }
 
         // Only log once per second to avoid flooding in games that call

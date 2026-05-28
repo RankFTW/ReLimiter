@@ -1,6 +1,18 @@
 # Changelog
 
 
+## 3.2.5
+
+### Frame Generation
+- **Fixed FG not working in multiple games** — Proactive Streamline hooks were breaking Frame Generation in games like LEGO Batman, Clair Obscur, and Neverness to Everness. ReLimiter now uses passive GetState polling for all FG detection, which is compatible with all games. The Streamline Compatibility toggle has been removed from the UI — it's always on. No user action needed.
+
+### OSD
+- **VRAM color-coded by usage** — Green under 75%, yellow at 75–90%, red over 90%. Matches the existing GPU temp color coding.
+
+### Bug Fixes
+- **Fixed crash dumps being created on game exit** — Some games (Clair Obscur, Cronos) would create memory dump files when closing. This was a harmless post-unload crash caused by the game calling into freed memory after ReLimiter unloads. Crash dump creation is now suppressed during shutdown.
+
+
 ## 3.2.4
 
 ### Frame Generation

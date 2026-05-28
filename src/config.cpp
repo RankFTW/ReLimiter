@@ -214,6 +214,18 @@ void LoadConfig(HMODULE hModule) {
     g_config.log_level = "warn";
     g_config.csv_enabled = false;
 
+    // Force Streamline Compatibility on — proactive hooks break FG in multiple games.
+    // Users who previously had this off will get it forced on automatically.
+    // Power users can set streamline_compat = force_false in INI to override.
+    if (g_config.streamline_compat) {
+        // Already true (default or INI said true) — keep it
+    } else {
+        // INI said false — but we force true unless they explicitly said "force_false"
+        std::string raw = ReadINIString(S, "streamline_compat", "true", P);
+        if (raw != "force_false")
+            g_config.streamline_compat = true;
+    }
+
     // Auto-enable Streamline Compatibility for known problematic games.
     // These games break FG/RR when proactive Streamline hooks are active.
     {

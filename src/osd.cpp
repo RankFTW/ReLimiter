@@ -1114,18 +1114,6 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 "When disabled, only warnings and errors are logged. "
                 "Enable this before reporting issues.");
 
-        // Streamline Compatibility toggle
-        ImGui::Spacing();
-        if (ImGui::Checkbox("Streamline Compatibility", &g_config.streamline_compat))
-            config_dirty = true;
-        HelpTip("Disables proactive Streamline FG hooks that break Frame Generation "
-                "in some games (e.g. Neverness to Everness). Auto-enabled for known "
-                "affected games. Enable manually if FG or RR stops working with "
-                "ReLimiter installed. Requires game restart.");
-        if (g_config.streamline_compat) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Restart required)");
-        }
     }
 
     // ════════════════════════════════════════════
@@ -2163,7 +2151,17 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                 char buf[48];
                 snprintf(buf, sizeof(buf), "VRAM: %lld / %lld MB",
                          (long long)hw.vram_used_mb, (long long)hw.vram_total_mb);
-                OSDTextColored(ColSystem(), buf);
+                // Color-code by usage: green <75%, yellow 75-90%, red >90%
+                float usage = static_cast<float>(hw.vram_used_mb) / static_cast<float>(hw.vram_total_mb);
+                float b = g_config.osd_text_brightness;
+                ImVec4 col;
+                if (usage > 0.90f)
+                    col = ImVec4(1.0f*b, 0.3f*b, 0.3f*b, 1.0f);  // red
+                else if (usage > 0.75f)
+                    col = ImVec4(1.0f*b, 0.85f*b, 0.0f*b, 1.0f);  // yellow
+                else
+                    col = ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f);  // green
+                OSDTextColored(col, buf);
             }
 
             // CPU metrics

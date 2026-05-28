@@ -111,7 +111,7 @@ struct Config {
     // Streamline Compatibility — disables proactive Streamline FG hooks and
     // NGX hook installation from inside LoadLibrary hooks. Required for games
     // like Neverness to Everness where these hooks break FG/RR.
-    bool streamline_compat = false;
+    bool streamline_compat = true;
 };
 
 extern Config g_config;
