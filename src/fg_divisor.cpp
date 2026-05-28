@@ -1,6 +1,7 @@
 #include "fg_divisor.h"
 #include "streamline_hooks.h"
 #include "wake_guard.h"
+#include "logger.h"
 #include <Windows.h>
 #include <algorithm>
 #include <atomic>
@@ -37,28 +38,24 @@ static double SmoothTransition(double current, double target) {
 
 int ComputeFGDivisorRaw() {
     // NVIDIA Smooth Motion: always 2x (one generated frame per rendered frame).
-    // User sets target as desired output FPS, scheduler halves for render pacing.
     if (IsNvSmoothMotionActive())
         return 2;
 
     bool presenting = g_fg_presenting.load(std::memory_order_relaxed);
     int mult = g_fg_multiplier.load(std::memory_order_relaxed);
     int actual = g_fg_actual_multiplier.load(std::memory_order_relaxed);
+    int mode = g_fg_mode.load(std::memory_order_relaxed);
 
-    // Enter FG branch if either:
-    // - SetOptions provided multiplier (normal hook path): presenting && mult > 0
-    // - GetState reports actual frames (compat-only path): presenting && actual >= 2
-    if (presenting && (mult > 0 || actual >= 2)) {
-        // Prefer the driver's actual multiplier from GetState when available.
-        // When FG is forced to a higher level via the NVIDIA control panel,
-        // the game's SetOptions numFrames (g_fg_multiplier) reports the
-        // game-requested value, but the driver actually presents more frames.
-        // g_fg_actual_multiplier is numFramesActuallyPresented from GetState
-        // — the ground truth for how many frames reach the display.
-        if (actual >= 2)
-            return actual; // already a divisor (e.g., 4 = 4x output)
-        return mult + 1;  // fallback: 1→2×, 2→3×, 3→4×
-    }
+    // Best signal: GetState confirms frames are actually being produced.
+    if (presenting && actual >= 2)
+        return actual;
+
+    // Proactive hook path: SetOptions provided multiplier AND mode is On.
+    // Only trust mult when mode confirms FG is active (avoids false positive
+    // where mult=1 but FG is off — Forza reports FG configured even when off).
+    if (presenting && mult > 0 && mode > 0)
+        return mult + 1;
+
     return 1;
 }
 

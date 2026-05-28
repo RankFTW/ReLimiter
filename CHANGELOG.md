@@ -1,6 +1,12 @@
 # Changelog
 
 
+## 3.2.6
+
+### Frame Generation
+- **Fixed FG divisor stuck on when FG is disabled** — Some games (Forza Horizon 6, 007 First Light) reported FG as configured at the Streamline API level even when the user had it off in-game. The scheduler was applying a 2x divisor incorrectly, halving the effective FPS target. The FG divisor now requires the DLSSG mode to be explicitly On before applying, preventing false positives from stale configuration data.
+
+
 ## 3.2.5
 
 ### Frame Generation

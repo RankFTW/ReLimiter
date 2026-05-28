@@ -241,6 +241,20 @@ void LoadConfig(HMODULE hModule) {
                 break;
             }
         }
+
+        // These games need proactive hooks (compat poll GetState fails with error 20).
+        // Force compat OFF so the normal Streamline hook path provides FG data.
+        static const char* s_proactive_games[] = {
+            "forzahorizon6",            // Forza Horizon 6 (Game Pass)
+            "Avowed-WinGDK-Shipping",   // Avowed (Game Pass)
+        };
+        for (const char* name : s_proactive_games) {
+            if (_stricmp(proc, name) == 0 && g_config.streamline_compat) {
+                g_config.streamline_compat = false;
+                LOG_INFO("Config: Streamline Compatibility force-disabled for %s (proactive hooks required)", proc);
+                break;
+            }
+        }
     }
 
     ApplyConfig();
@@ -335,8 +349,8 @@ void SaveConfig() {
         WriteINIString(S, "blackout_key", g_config.blackout_key.c_str(), P);
     }
 
-    // Streamline Compatibility
-    WriteINIBool(S, "streamline_compat", g_config.streamline_compat, P);
+    // Streamline Compatibility — don't write, it's force-managed on launch.
+    // Preserves user's "force_false" override in INI.
 }
 
 void ApplyConfig() {
