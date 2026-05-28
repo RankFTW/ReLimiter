@@ -148,11 +148,11 @@ if(MSVC)
     # Per-configuration
     target_compile_options(relimiter PRIVATE
         $<$<CONFIG:Debug>:/Zi /Od /RTC1>
-        $<$<CONFIG:Release>:/O2 /GL /GS->
+        $<$<CONFIG:Release>:/O2 /GL /GS- /Zi>
     )
 
     target_link_options(relimiter PRIVATE
-        $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF>
+        $<$<CONFIG:Release>:/LTCG /OPT:REF /OPT:ICF /DEBUG>
     )
 endif()
 

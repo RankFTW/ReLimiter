@@ -92,6 +92,32 @@ static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// Silent handler installed during shutdown — swallows post-unload crashes
+// that occur when the game calls into our freed address space after exit.
+// These are harmless (process is terminating) but create annoying dump files.
+static LONG WINAPI ShutdownCrashHandler(EXCEPTION_POINTERS*) {
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// Suppress Windows Error Reporting during shutdown to prevent crash dump
+// creation from post-unload access violations. STATUS_STACK_BUFFER_OVERRUN
+// (0xc0000409 / __fastfail) bypasses SEH entirely, so the exception filter
+// alone isn't enough — we must disable WER at the process level.
+static void SuppressWEROnShutdown() {
+    // WerAddExcludedApplication is overkill — just set the error mode
+    // to suppress the crash dialog and dump creation for this process.
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    // Also disable WER for this specific process instance
+    typedef HRESULT (WINAPI *PFN_WerSetFlags)(DWORD);
+    HMODULE hKernel = GetModuleHandleW(L"kernel32.dll");
+    if (hKernel) {
+        auto pWerSetFlags = reinterpret_cast<PFN_WerSetFlags>(
+            GetProcAddress(hKernel, "WerSetFlags"));
+        if (pWerSetFlags)
+            pWerSetFlags(0x0010); // WER_FAULT_REPORTING_FLAG_NOHEAP (suppress dumps)
+    }
+}
+
 // ── ReShade callbacks ──
 static void on_init_device(reshade::api::device* device) {
     SwapMgr_OnInitDevice(device);
@@ -434,7 +460,8 @@ void WINAPI AddonUninit(HMODULE /*addon_module*/, HMODULE /*reshade_module*/) {
     LOG_INFO("AddonUninit called");
 
     SaveConfig();
-    SetUnhandledExceptionFilter(s_prev_filter);
+    SetUnhandledExceptionFilter(ShutdownCrashHandler);
+    SuppressWEROnShutdown();
     RestoreGameSleepMode();  // restore game's original Reflex params
     HWMonitor_Shutdown();
     NGXHooks_Shutdown();
@@ -445,6 +472,11 @@ void WINAPI AddonUninit(HMODULE /*addon_module*/, HMODULE /*reshade_module*/) {
     RemoveTimerHooks();
     Hardening_Shutdown();
     DisableAllHooks();
+    // Allow in-flight hook calls to return before freeing trampoline memory.
+    // Games like Clair Obscur call CreateFeature(FG) every second from a
+    // background thread — without this delay, MH_Uninitialize frees the
+    // trampoline while a call is mid-flight, causing STATUS_STACK_BUFFER_OVERRUN.
+    Sleep(100);
     MH_Uninitialize();
     CloseSleepTimer();
     CSV_Shutdown();
@@ -470,7 +502,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         if (s_addon_initialised) {
             LOG_WARN("AddonUninit was not called — cleaning up in DllMain");
             SaveConfig();
-            SetUnhandledExceptionFilter(s_prev_filter);
+            SetUnhandledExceptionFilter(ShutdownCrashHandler);
+            SuppressWEROnShutdown();
             RestoreGameSleepMode();  // restore game's original Reflex params
             HWMonitor_Shutdown();
             NGXHooks_Shutdown();
@@ -481,6 +514,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             RemoveTimerHooks();
             Hardening_Shutdown();
             DisableAllHooks();
+            Sleep(100);
             MH_Uninitialize();
             CloseSleepTimer();
             CSV_Shutdown();

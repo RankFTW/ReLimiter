@@ -532,25 +532,19 @@ flip_model_override = false
 
 ## Streamline Compatibility
 
-A compatibility toggle for games where ReLimiter's proactive Streamline hooks interfere with Frame Generation or Ray Reconstruction.
+ReLimiter uses passive GetState polling for Frame Generation detection. This is always enabled and requires no configuration — it works with all games automatically.
 
-### When to Use
+In previous versions, proactive Streamline hooks were used but caused FG to break in multiple games (LEGO Batman, Clair Obscur, Neverness to Everness, Returnal). The passive polling approach is now the only detection method.
 
-- FG or RR stops working when ReLimiter is installed
-- Auto-enabled for known affected games (Neverness to Everness, Returnal)
-- Enable manually for other games that exhibit the same issue
+### For Power Users
 
-### What It Does
-
-Disables proactive hooking of Streamline's SetOptions/GetState functions. Instead, ReLimiter polls GetState passively. This is less efficient but avoids disrupting the FG pipeline in sensitive games.
-
-Requires a game restart to take effect.
-
-### INI Key
+If you need to re-enable the old proactive hooks for testing or debugging, set this in the INI:
 
 ```ini
-streamline_compat = false
+streamline_compat = force_false
 ```
+
+This is not recommended and may break FG in some games. There is no UI toggle — this is INI-only.
 
 ---
 
@@ -608,7 +602,7 @@ All settings are stored in `relimiter.ini` next to the addon DLL. The file uses 
 | `smoothing_percentile` | float | 0.99 | 0.50–0.999 | Target percentile |
 | `smoothing_window` | string | medium | medium, dual | Smoothing window mode |
 | `smoothing_bias_us` | float | 0.0 | 0–1000 | Constant bias offset (µs) |
-| `streamline_compat` | bool | false | — | Streamline compatibility mode |
+| `streamline_compat` | string | true | true, force_false | FG detection mode (always on, force_false to disable) |
 | `blackout_key` | string | (empty) | — | Monitor blackout keybind |
 | `osd_enabled` | bool | false | — | Show OSD |
 | `osd_toggle_key` | string | PageUp | — | OSD toggle keybind |
