@@ -204,6 +204,9 @@ void LoadConfig(HMODULE hModule) {
     // Monitor Blackout — keybind loaded from shared file if shared_presets enabled
     g_config.blackout_key            = ReadINIString(S, "blackout_key", "", P);
 
+    // Focus Lock
+    g_config.focus_lock              = ReadINIBool(S, "focus_lock", false, P);
+
     // Streamline Compatibility
     g_config.streamline_compat       = ReadINIBool(S, "streamline_compat", false, P);
 
@@ -227,26 +230,13 @@ void LoadConfig(HMODULE hModule) {
     }
 
     // Auto-enable Streamline Compatibility for known problematic games.
-    // These games break FG/RR when proactive Streamline hooks are active.
+    // These games need proactive hooks (compat poll GetState fails with error 20).
+    // Force compat OFF so the normal Streamline hook path provides FG data.
     {
         const char* proc = Log_GetProcessName();
-        static const char* s_compat_games[] = {
-            "HTGame",               // Neverness to Everness
-            "Returnal-Win64-Shipping",  // Returnal
-        };
-        for (const char* name : s_compat_games) {
-            if (_stricmp(proc, name) == 0 && !g_config.streamline_compat) {
-                g_config.streamline_compat = true;
-                LOG_INFO("Config: Streamline Compatibility auto-enabled for %s", proc);
-                break;
-            }
-        }
-
-        // These games need proactive hooks (compat poll GetState fails with error 20).
-        // Force compat OFF so the normal Streamline hook path provides FG data.
         static const char* s_proactive_games[] = {
             "forzahorizon6",            // Forza Horizon 6 (Game Pass)
-            "Avowed-WinGDK-Shipping",   // Avowed (Game Pass)
+            "b1-Win64-Shipping",        // Black Myth: Wukong (Steam)
         };
         for (const char* name : s_proactive_games) {
             if (_stricmp(proc, name) == 0 && g_config.streamline_compat) {
@@ -351,6 +341,9 @@ void SaveConfig() {
 
     // Streamline Compatibility — don't write, it's force-managed on launch.
     // Preserves user's "force_false" override in INI.
+
+    // Focus Lock
+    WriteINIBool(S, "focus_lock", g_config.focus_lock, P);
 }
 
 void ApplyConfig() {

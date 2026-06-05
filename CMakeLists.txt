@@ -64,6 +64,7 @@ set(ADDON_SOURCES
     src/reflex_inject.cpp
     src/vsync_control.cpp
     src/blackout.cpp
+    src/focus_lock.cpp
 )
 
 # ── MinHook (compiled as part of the addon) ──

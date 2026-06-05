@@ -5,6 +5,7 @@
 #include "hw_monitor.h"
 #include "ngx_hooks.h"
 #include "blackout.h"
+#include "focus_lock.h"
 #include <MinHook.h>
 #include <atomic>
 
@@ -466,6 +467,7 @@ void WINAPI AddonUninit(HMODULE /*addon_module*/, HMODULE /*reshade_module*/) {
     HWMonitor_Shutdown();
     NGXHooks_Shutdown();
     Blackout_Shutdown();
+    FocusLock_Remove();
     StopVBlankThread();
     StopDisplayPollThread();
     RestoreFrameSplitting();
@@ -508,6 +510,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
             HWMonitor_Shutdown();
             NGXHooks_Shutdown();
             Blackout_Shutdown();
+            FocusLock_Remove();
             StopVBlankThread();
             StopDisplayPollThread();
             RestoreFrameSplitting();

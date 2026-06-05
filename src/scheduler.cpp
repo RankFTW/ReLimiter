@@ -26,6 +26,7 @@
 #include "baseline.h"
 #include "reflex_inject.h"
 #include "streamline_hooks.h"
+#include "focus_lock.h"
 #include "adaptive_smoothing.h"
 #include "config.h"
 #include "logger.h"
@@ -379,7 +380,7 @@ void OnMarker(uint64_t frameID, int64_t now) {
     bool focused = false;
     if (ref_hwnd) {
         // Compare foreground window's PID against our process
-        HWND fg = GetForegroundWindow();
+        HWND fg = FocusLock_RealGetForegroundWindow();
         DWORD fg_pid = 0;
         if (fg) GetWindowThreadProcessId(fg, &fg_pid);
         focused = (fg_pid == GetCurrentProcessId());
@@ -390,7 +391,7 @@ void OnMarker(uint64_t frameID, int64_t now) {
             LOG_WARN("SwapMgr_GetHWND() returned null — falling back to GetForegroundWindow for focus check");
             s_hwnd_fallback_warned = true;
         }
-        HWND fg = GetForegroundWindow();
+        HWND fg = FocusLock_RealGetForegroundWindow();
         DWORD fg_pid = 0;
         if (fg) GetWindowThreadProcessId(fg, &fg_pid);
         focused = (fg_pid == GetCurrentProcessId());
