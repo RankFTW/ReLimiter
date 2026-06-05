@@ -1,6 +1,15 @@
 # Changelog
 
 
+## 3.2.7
+
+### Screen
+- **Keep Game Focused** — New toggle that prevents the game from detecting focus loss when you alt-tab. Audio and game logic continue running in the background — handy for cutscenes. The background FPS cap still applies independently. Found in the Screen section. May not work with UWP/Game Pass titles.
+
+### Bug Fixes
+- **Fixed FG not working in Avowed** — Proactive Streamline hooks were incorrectly forced on for this game, preventing Frame Generation from producing frames. Now uses the default safe path.
+
+
 ## 3.2.6
 
 ### Frame Generation

@@ -29,6 +29,7 @@
 #include "ngx_hooks.h"
 #include "dlss_presets.h"
 #include "blackout.h"
+#include "focus_lock.h"
 #include "logger.h"
 #include <string>
 #include <atomic>
@@ -113,6 +114,12 @@ static void MoveWindowToMonitor(int idx) {
 void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     // Dirty flag — set by any config change, triggers SaveConfig at end of frame
     bool config_dirty = false;
+
+    // Lazy install focus lock if enabled in config but not yet installed
+    if (g_config.focus_lock && !FocusLock_IsActive()) {
+        HWND hwnd = SwapMgr_GetHWND();
+        if (hwnd) FocusLock_Install(hwnd);
+    }
 
     // ════════════════════════════════════════════
     // SECTION 1: FPS
@@ -888,6 +895,26 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 }
             }
         }
+
+        // ── Focus Lock ──
+        ImGui::Spacing();
+        if (ImGui::Checkbox("Keep Game Focused", &g_config.focus_lock)) {
+            config_dirty = true;
+            if (g_config.focus_lock) {
+                HWND hwnd = SwapMgr_GetHWND();
+                if (hwnd) FocusLock_Install(hwnd);
+            } else {
+                FocusLock_Remove();
+            }
+        }
+        if (FocusLock_IsActive()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(Active)");
+        }
+        HelpTip("Prevent the game from detecting focus loss when you alt-tab. "
+                "Audio and game logic continue running in the background. "
+                "The background FPS cap still applies independently. "
+                "May not work with all games (UWP/Game Pass titles use system-level notifications).");
     }
 
     // ════════════════════════════════════════════
