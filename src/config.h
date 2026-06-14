@@ -108,6 +108,9 @@ struct Config {
     // Monitor Blackout
     std::string blackout_key = "";          // Keybind to toggle monitor blackout
 
+    // Monitor Selection — persist user's chosen display across alt-tab
+    int selected_monitor = 0;               // 0 = default (no override), 1+ = monitor index
+
     // Focus Lock — prevent game from detecting focus loss (keeps audio playing)
     bool focus_lock = false;
 

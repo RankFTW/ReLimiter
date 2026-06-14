@@ -122,6 +122,9 @@ void ValidateConfig() {
     g_config.smoothing_bias_us = Clamp(g_config.smoothing_bias_us, 0.0, 1000.0);
     static const char* smoothing_windows[] = {"medium", "dual"};
     ValidateEnum(g_config.smoothing_window, smoothing_windows, 2, "medium");
+
+    // ── Monitor Selection ──
+    g_config.selected_monitor = Clamp(g_config.selected_monitor, 0, 8);
 }
 
 bool Config_IsFirstLaunch() { return s_first_launch; }
@@ -203,6 +206,9 @@ void LoadConfig(HMODULE hModule) {
 
     // Monitor Blackout — keybind loaded from shared file if shared_presets enabled
     g_config.blackout_key            = ReadINIString(S, "blackout_key", "", P);
+
+    // Monitor Selection
+    g_config.selected_monitor        = ReadINIInt(S, "selected_monitor", 0, P);
 
     // Focus Lock
     g_config.focus_lock              = ReadINIBool(S, "focus_lock", false, P);
@@ -339,11 +345,19 @@ void SaveConfig() {
         WriteINIString(S, "blackout_key", g_config.blackout_key.c_str(), P);
     }
 
-    // Streamline Compatibility — don't write, it's force-managed on launch.
-    // Preserves user's "force_false" override in INI.
+    // Streamline Compatibility — write "force_false" when proactive hooks enabled,
+    // write "true" when disabled. This persists the user's per-game choice across restarts.
+    if (!g_config.streamline_compat) {
+        WriteINIString(S, "streamline_compat", "force_false", P);
+    } else {
+        WriteINIString(S, "streamline_compat", "true", P);
+    }
 
     // Focus Lock
     WriteINIBool(S, "focus_lock", g_config.focus_lock, P);
+
+    // Monitor Selection
+    WriteINIInt(S, "selected_monitor", g_config.selected_monitor, P);
 }
 
 void ApplyConfig() {

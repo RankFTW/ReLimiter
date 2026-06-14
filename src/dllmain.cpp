@@ -192,6 +192,28 @@ static bool on_create_swapchain(reshade::api::device_api api, reshade::api::swap
 static bool on_set_fullscreen_state(reshade::api::swapchain*, bool fullscreen, void*) {
     if (g_config.fake_fullscreen && fullscreen) {
         LOG_INFO("Fake fullscreen: blocked SetFullscreenState(TRUE)");
+
+        // Apply borderless window resize — same as swapchain creation path.
+        // Games that create the swapchain windowed then call SetFullscreenState
+        // (e.g., RE Engine) need this to fill the monitor.
+        HWND target = SwapMgr_GetHWND();
+        if (target) {
+            CreateThread(nullptr, 0, [](LPVOID param) -> DWORD {
+                HWND h = static_cast<HWND>(param);
+                Sleep(100);
+                HMONITOR hmon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO mi = {}; mi.cbSize = sizeof(mi);
+                GetMonitorInfo(hmon, &mi);
+                RECT& rc = mi.rcMonitor;
+                LONG style = GetWindowLong(h, GWL_STYLE);
+                SetWindowLong(h, GWL_STYLE, style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER));
+                SetWindowPos(h, HWND_TOP, rc.left, rc.top,
+                             rc.right - rc.left, rc.bottom - rc.top,
+                             SWP_FRAMECHANGED | SWP_NOACTIVATE);
+                return 0;
+            }, target, 0, nullptr);
+        }
+
         return true; // block the call
     }
     return false;

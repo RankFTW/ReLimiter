@@ -111,6 +111,28 @@ static void MoveWindowToMonitor(int idx) {
     }, data, 0, nullptr);
 }
 
+// ── Sticky monitor: re-apply after alt-tab if window drifted ──
+static void EnforceStickyMonitor() {
+    if (s_selected_monitor == 0) return;
+    int idx = s_selected_monitor - 1;
+    if (idx < 0 || idx >= s_monitor_count) return;
+
+    HWND hwnd = SwapMgr_GetHWND();
+    if (!hwnd) return;
+
+    // Throttle to once per second
+    static ULONGLONG s_last_check = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now - s_last_check < 1000) return;
+    s_last_check = now;
+
+    HMONITOR current = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (current == s_monitors[idx].hmon) return;
+
+    LOG_INFO("Sticky monitor: window drifted, re-applying monitor %d", idx + 1);
+    MoveWindowToMonitor(idx);
+}
+
 void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     // Dirty flag — set by any config change, triggers SaveConfig at end of frame
     bool config_dirty = false;
@@ -744,27 +766,45 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     // SECTION 3: Screen (collapsible)
     // ════════════════════════════════════════════
     ImGui::Separator();
-    if (ImGui::CollapsingHeader("Screen")) {
-        static bool s_monitors_init = false;
-        if (!s_monitors_init) { RefreshMonitorList(); s_monitors_init = true; }
 
+    // Initialize monitor list and restore selection (runs once regardless of section state)
+    {
+        static bool s_monitors_init = false;
+        if (!s_monitors_init) {
+            RefreshMonitorList();
+            s_selected_monitor = g_config.selected_monitor;
+            if (s_selected_monitor > s_monitor_count)
+                s_selected_monitor = 0;
+            s_monitors_init = true;
+        }
+    }
+
+    // Sticky monitor enforcement — runs every frame, moves window back if it drifted
+    EnforceStickyMonitor();
+
+    if (ImGui::CollapsingHeader("Screen")) {
         if (ImGui::Button("Refresh##monitors")) RefreshMonitorList();
         ImGui::SameLine();
 
         if (ImGui::BeginCombo("Display", s_selected_monitor == 0 ? "Default"
                 : s_monitors[s_selected_monitor - 1].label)) {
-            if (ImGui::Selectable("Default", s_selected_monitor == 0))
+            if (ImGui::Selectable("Default", s_selected_monitor == 0)) {
                 s_selected_monitor = 0;
+                g_config.selected_monitor = 0;
+                config_dirty = true;
+            }
             for (int i = 0; i < s_monitor_count; i++) {
                 bool selected = (s_selected_monitor == i + 1);
                 if (ImGui::Selectable(s_monitors[i].label, selected)) {
                     s_selected_monitor = i + 1;
+                    g_config.selected_monitor = i + 1;
+                    config_dirty = true;
                     MoveWindowToMonitor(i);
                 }
             }
             ImGui::EndCombo();
         }
-        HelpTip("Move the game window to a different monitor. Re-queries VRR ceiling for the new display.");
+        HelpTip("Move the game window to a different monitor. Selection is saved and re-applied after alt-tab.");
 
         ImGui::Spacing();
 
@@ -1141,6 +1181,21 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 "When disabled, only warnings and errors are logged. "
                 "Enable this before reporting issues.");
 
+        // Proactive Streamline Hooks toggle
+        ImGui::Spacing();
+        bool proactive = !g_config.streamline_compat;
+        if (ImGui::Checkbox("Proactive Streamline Hooks", &proactive)) {
+            g_config.streamline_compat = !proactive;
+            config_dirty = true;
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Restart required)");
+        HelpTip("Enable per-game if Frame Generation detection is incorrect "
+                "(showing on when off, or not detecting when on). "
+                "Most games don't need this — only enable if FG pacing info is missing or wrong. "
+                "May break FG in some games if enabled unnecessarily. "
+                "Requires a game restart to take effect.");
+
     }
 
     // ════════════════════════════════════════════
@@ -1360,7 +1415,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 }
                 if (up_val)
                     p2 += snprintf(line2 + p2, sizeof(line2) - p2, "%s=%s", up_label, up_val);
-                if (dlss.fg_active && presets.available && presets.fg[0] != '-')
+                if (IsFGDllLoaded() && presets.available && presets.fg[0] != '-')
                     p2 += snprintf(line2 + p2, sizeof(line2) - p2, "%sFG=%s", p2 > 0 ? " " : "", presets.fg);
 
                 // Versions
@@ -1742,6 +1797,21 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             s_real_fps = instant_fps;
     }
 
+    // Throttle FPS display update to 2x per second for readability
+    static double s_display_fps = 0.0;
+    static double s_display_render_fps = 0.0;
+    static double s_display_output_fps = 0.0;
+    static ULONGLONG s_fps_display_tick = 0;
+    {
+        ULONGLONG now = GetTickCount64();
+        if (now - s_fps_display_tick >= 500) {
+            s_fps_display_tick = now;
+            s_display_fps = s_real_fps;
+            s_display_render_fps = s_real_fps;
+            s_display_output_fps = g_output_fps.load(std::memory_order_relaxed);
+        }
+    }
+
     const char* fg_label = "off";
     int fg_mult = g_fg_multiplier.load(std::memory_order_relaxed);
     bool fg_presenting = g_fg_presenting.load(std::memory_order_relaxed);
@@ -1753,6 +1823,15 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
     bool fg_display_active = fg_presenting && fg_mult > 0;
     if (Streamline_HasModeData() && fg_mode == 0)
         fg_display_active = false;
+    // Driver-authoritative FG confirmation: if the Reflex ring is reporting GPU data
+    // but aiFrameTimeUs is 0, FG isn't actually producing interpolated frames.
+    // Prevents false positives where compat poll reports FG active but it's off in-game.
+    if (fg_display_active) {
+        double ai_ft = g_reflex_ai_frame_time_us.load(std::memory_order_relaxed);
+        double gpu_active = g_reflex_gpu_active_us.load(std::memory_order_relaxed);
+        if (gpu_active > 0.0 && ai_ft == 0.0)
+            fg_display_active = false;
+    }
     if (fg_display_active) {
         // Use actual driver multiplier when available (handles control panel overrides)
         int actual = g_fg_actual_multiplier.load(std::memory_order_relaxed);
@@ -1808,16 +1887,16 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         // PERFORMANCE (cyan)
         // ═══════════════════════════════════
         if (g_config.osd_show_fps) {
-            double output = g_output_fps.load(std::memory_order_relaxed);
+            double output = s_display_output_fps;
             char buf[64];
             if (IsNvSmoothMotionActive()) {
-                snprintf(buf, sizeof(buf), "%.1f fps (%.1f render)", s_real_fps * 2.0, s_real_fps);
+                snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", s_display_fps * 2.0, s_display_fps);
             } else if (IsDmfgActive() && output > 0.0) {
-                snprintf(buf, sizeof(buf), "%.1f fps", output);
+                snprintf(buf, sizeof(buf), "%.0f fps", output);
             } else if (output > 0.0 && fg_presenting && fg_mult > 0)
-                snprintf(buf, sizeof(buf), "%.1f fps (%.1f render)", output, s_real_fps);
+                snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", output, s_display_fps);
             else
-                snprintf(buf, sizeof(buf), "%.1f fps", s_real_fps);
+                snprintf(buf, sizeof(buf), "%.1f fps", s_display_fps);
             OSDTextColored(ColPerf(), buf);
         }
 
@@ -2105,9 +2184,9 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                         up_val = idxToLetter(dlss.sr_preset);
                 }
 
-                // FG — only show if FG is actually active in this game
+                // FG — only show if FG DLL is loaded (game supports FG)
                 const char* fg_val = nullptr;
-                if (dlss.fg_active && presets.available && presets.fg[0] != '-')
+                if (IsFGDllLoaded() && presets.available && presets.fg[0] != '-')
                     fg_val = presets.fg;
 
                 if (up_val || fg_val) {

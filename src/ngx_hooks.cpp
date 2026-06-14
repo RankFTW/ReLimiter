@@ -5,6 +5,7 @@
 #include "ngx_hooks.h"
 #include "hooks.h"
 #include "streamline_hooks.h"
+#include "swapchain_manager.h"
 #include "flush.h"
 #include "logger.h"
 #include <Windows.h>
@@ -257,10 +258,10 @@ static void UpdateDlssParamsFromEval(void* params, void* handle) {
     __try {
         NGX_GetUI(params, "DLSS.Render.Subrect.Dimensions.Width", &w);
         NGX_GetUI(params, "DLSS.Render.Subrect.Dimensions.Height", &h);
-        if (w == 0 || h == 0) {
-            NGX_GetUI(params, "Width", &w);
-            NGX_GetUI(params, "Height", &h);
-        }
+        // Don't fall back to Width/Height — in Streamline games those are the
+        // OUTPUT resolution, not render. Accepting them causes render==output
+        // which triggers false DLAA detection. Only update render when the
+        // actual subrect dimensions are present.
         NGX_GetUI(params, "OutWidth", &ow);
         NGX_GetUI(params, "OutHeight", &oh);
         NGX_GetI(params, "PerfQualityValue", &quality);
@@ -268,7 +269,20 @@ static void UpdateDlssParamsFromEval(void* params, void* handle) {
         return;
     }
 
-    if (w == 0 || h == 0) return;
+    if (w == 0 || h == 0) {
+        // Subrect dimensions not available — still update quality/output if present,
+        // but don't touch render resolution.
+        if (ow > 0) s_out_w.store(ow, std::memory_order_relaxed);
+        if (oh > 0) s_out_h.store(oh, std::memory_order_relaxed);
+        if (quality >= 0) {
+            int prev_q = s_quality.load(std::memory_order_relaxed);
+            if (quality != prev_q) {
+                s_quality.store(quality, std::memory_order_relaxed);
+                LOG_INFO("NGX: DLSS quality updated (no render res) — quality=%d", quality);
+            }
+        }
+        return;
+    }
 
     // Late adoption: if we missed CreateFeature, adopt this handle
     if (!s_dlss_sr_handle) {
@@ -690,6 +704,21 @@ NGXDLSSInfo NGXHooks_GetInfo() {
     memcpy(info.rr_version, s_rr_ver, sizeof(info.rr_version));
     memcpy(info.fg_version, s_fg_ver, sizeof(info.fg_version));
     memcpy(info.sl_version, s_sl_ver, sizeof(info.sl_version));
+
+    // Output resolution fallback: if CreateFeature was missed (hooks installed
+    // late) and EvaluateFeature doesn't provide OutWidth/OutHeight, use the
+    // swapchain window's client rect as output resolution.
+    if (info.output_width == 0 && info.render_width > 0) {
+        HWND hwnd = SwapMgr_GetHWND();
+        if (hwnd) {
+            RECT rc = {};
+            GetClientRect(hwnd, &rc);
+            if (rc.right > 0 && rc.bottom > 0) {
+                info.output_width  = static_cast<unsigned int>(rc.right);
+                info.output_height = static_cast<unsigned int>(rc.bottom);
+            }
+        }
+    }
 
     // DLAA detection: quality==5 explicitly, OR render==output (regardless of quality value)
     int q = info.quality_level;
