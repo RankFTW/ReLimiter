@@ -103,7 +103,7 @@ void ValidateConfig() {
 
     // ── Background FPS ──
     if (g_config.background_fps != 0)
-        g_config.background_fps = Clamp(g_config.background_fps, 30, 60);
+        g_config.background_fps = Clamp(g_config.background_fps, 20, 60);
 
     // ── FG-Off FPS ──
     if (g_config.fg_off_fps != 0)

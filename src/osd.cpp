@@ -239,12 +239,12 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     ImGui::SliderInt("Background FPS", &s_bg_edit, 0, 60, bg_fmt);
     s_bg_active = ImGui::IsItemActive();
     if (ImGui::IsItemDeactivatedAfterEdit()) {
-        if (s_bg_edit > 0 && s_bg_edit < 30) s_bg_edit = 30;
+        if (s_bg_edit > 0 && s_bg_edit < 20) s_bg_edit = 20;
         g_background_fps.store(s_bg_edit, std::memory_order_relaxed);
         g_config.background_fps = s_bg_edit;
         config_dirty = true;
     }
-    HelpTip("FPS cap when the game window loses focus. 0 = uncapped. Minimum is 30.");
+    HelpTip("FPS cap when the game window loses focus. 0 = uncapped. Minimum is 20.");
 
     ImGui::Spacing();
     static int s_fgoff_edit = g_fg_off_fps.load(std::memory_order_relaxed);
@@ -1350,14 +1350,15 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 int tol = (std::max)(15, ow / 100);
                 #define DLSS_NEAR2(target) (rw >= (int)(ow * target + 0.5f) - tol && rw <= (int)(ow * target + 0.5f) + tol)
                 const char* mode = nullptr;
-                if (DLSS_NEAR2(0.99f))      mode = "DLAA";
+                if (DLSS_NEAR2(1.00f))      mode = "DLAA";
+                else if (DLSS_NEAR2(0.99f)) mode = "DLAA Alt";
                 else if (DLSS_NEAR2(0.88f)) mode = "DLAA Lite";
-                else if (DLSS_NEAR2(0.83f)) mode = "Ultra Quality+";
                 else if (DLSS_NEAR2(0.77f)) mode = "Ultra Quality";
-                else if (DLSS_NEAR2(0.72f)) mode = "High Quality";
+                else if (DLSS_NEAR2(0.75f)) mode = "Quality+";
                 else if (DLSS_NEAR2(0.67f)) mode = "Quality";
-                else if (DLSS_NEAR2(0.59f)) mode = "Balanced";
+                else if (DLSS_NEAR2(0.58f)) mode = "Balanced";
                 else if (DLSS_NEAR2(0.50f)) mode = "Performance";
+                else if (DLSS_NEAR2(0.45f)) mode = "Performance-";
                 else if (DLSS_NEAR2(0.33f)) mode = "Ultra Perf";
                 #undef DLSS_NEAR2
                 if (mode)
@@ -2089,14 +2090,15 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                     #define DLSS_NEAR(target) (rw >= (int)(ow * target + 0.5f) - tol && rw <= (int)(ow * target + 0.5f) + tol)
 
                     const char* mode = nullptr;
-                    if (DLSS_NEAR(0.99f))      mode = "DLAA";
+                    if (DLSS_NEAR(1.00f))      mode = "DLAA";
+                    else if (DLSS_NEAR(0.99f)) mode = "DLAA Alt";
                     else if (DLSS_NEAR(0.88f)) mode = "DLAA Lite";
-                    else if (DLSS_NEAR(0.83f)) mode = "Ultra Quality+";
                     else if (DLSS_NEAR(0.77f)) mode = "Ultra Quality";
-                    else if (DLSS_NEAR(0.72f)) mode = "High Quality";
+                    else if (DLSS_NEAR(0.75f)) mode = "Quality+";
                     else if (DLSS_NEAR(0.67f)) mode = "Quality";
-                    else if (DLSS_NEAR(0.59f)) mode = "Balanced";
+                    else if (DLSS_NEAR(0.58f)) mode = "Balanced";
                     else if (DLSS_NEAR(0.50f)) mode = "Performance";
+                    else if (DLSS_NEAR(0.45f)) mode = "Performance-";
                     else if (DLSS_NEAR(0.33f)) mode = "Ultra Perf";
 
                     #undef DLSS_NEAR

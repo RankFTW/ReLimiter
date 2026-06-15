@@ -5,6 +5,7 @@
 
 ### Screen
 - **Sticky monitor selection** — When you select a display in the Screen section, the choice is now saved and automatically re-applied after alt-tabbing. Previously the game would bounce back to its default monitor on focus regain.
+- **Background FPS minimum lowered to 20** — Previously snapped to 30 minimum.
 
 ### OSD
 - **Fixed OSD showing FG active when it's off** — Some games report FG as configured at the API level even when disabled in-game. The OSD now cross-checks with the driver's AI frame time — if the GPU is reporting data but no interpolated frames are being produced, shows "off" automatically. No manual toggle needed.
