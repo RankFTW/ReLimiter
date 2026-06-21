@@ -12,12 +12,14 @@
 - **Fixed DLSS showing incorrect quality on launch** — Some games reported the output resolution as render resolution during early frames, causing false "DLAA" detection and wrong quality display. Now only accepts actual render dimensions from the DLSS pipeline.
 - **FG preset always visible** — The FG preset letter (e.g., FG=B) now shows on the OSD as soon as the FG DLL is loaded, without needing to toggle DLSS off and on first.
 - **Smoother FPS counter** — FPS display now updates twice per second instead of every frame, eliminating the unreadable flickering at high frame rates. Output FPS shown as integer, render FPS with one decimal.
+- **DLSS quality names match RHI** — Custom resolution ratios now use the same names as RHI (DLAA Alt, Quality+, Performance-, etc.) instead of the old naming scheme.
 
 ### UI
 - **Proactive Streamline Hooks toggle** — New option in Advanced settings. Enable this per-game if Frame Generation detection is incorrect (showing on when off, or not detecting when on). Requires a game restart. Most games don't need this — only enable if FG pacing info is missing or wrong. May break FG in some games if enabled unnecessarily.
 
 ### Bug Fixes
 - **Fixed Fake Fullscreen leaving games in a small window** — Games that go fullscreen after swapchain creation (RE2, RE3, Village, and other RE Engine titles) were left in a tiny windowed state. The fullscreen block now correctly applies the borderless resize to fill the monitor.
+- **Flip Model Override now shows "(Not supported)" instead of stuck "(Restart required)"** — When the upgrade fails because the game is incompatible (MSAA, GDI interop, etc.), the label now correctly indicates the game doesn't support it rather than endlessly asking for a restart.
 
 
 ## 3.2.7
