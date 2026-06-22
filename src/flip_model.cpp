@@ -17,6 +17,7 @@
 #endif
 
 static std::atomic<bool> s_applied{false};
+static std::atomic<bool> s_native_flip{false};
 static std::atomic<bool> s_tearing_supported{false};
 static std::atomic<bool> s_tearing_checked{false};
 
@@ -87,6 +88,7 @@ bool FlipModel_TryUpgrade(uint32_t& swap_effect, uint32_t& flags,
     if (!IsBitbltSwapEffect(swap_effect)) {
         LOG_INFO("FlipModel: swapchain already uses %s (buffers=%u, flags=0x%X), no override needed",
                  SwapEffectName(swap_effect), buffer_count, flags);
+        s_native_flip.store(true, std::memory_order_relaxed);
 
         // Even if already flip model, ensure ALLOW_TEARING flag is present for VRR.
         // Some games create flip model swapchains without this flag, which prevents
@@ -141,4 +143,8 @@ bool FlipModel_TryUpgrade(uint32_t& swap_effect, uint32_t& flags,
 
 bool FlipModel_WasApplied() {
     return s_applied.load(std::memory_order_relaxed);
+}
+
+bool FlipModel_IsNativeFlip() {
+    return s_native_flip.load(std::memory_order_relaxed);
 }

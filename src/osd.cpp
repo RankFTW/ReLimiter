@@ -1149,9 +1149,16 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             g_config.flip_model_override = flip_override;
             config_dirty = true;
         }
+        HelpTip("Force DX11 games from bitblt to flip model presentation. "
+                "Enables true VRR/G-Sync operation and eliminates DWM composition stutter. "
+                "May break some games that use GDI interop or MSAA. "
+                "Requires game restart to take effect.");
         if (FlipModel_WasApplied()) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(Active)");
+        } else if (FlipModel_IsNativeFlip()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(Native)");
         } else if (g_config.flip_model_override && SwapMgr_GetActiveAPI() == ActiveAPI::DX11) {
             ImGui::SameLine();
             if (s_flip_model_at_launch && SwapMgr_IsValid())
@@ -1159,10 +1166,6 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             else
                 ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Restart required)");
         }
-        HelpTip("Force DX11 games from bitblt to flip model presentation. "
-                "Enables true VRR/G-Sync operation and eliminates DWM composition stutter. "
-                "May break some games that use GDI interop or MSAA. "
-                "Requires game restart to take effect.");
 
         // Telemetry Logging toggle
         ImGui::Spacing();

@@ -17,6 +17,10 @@ bool FlipModel_TryUpgrade(uint32_t& swap_effect, uint32_t& flags,
 // Returns true if the last swapchain creation was upgraded to flip model.
 bool FlipModel_WasApplied();
 
+// Returns true if the game's swapchain was already using flip model natively
+// (no upgrade was needed). Useful for status display.
+bool FlipModel_IsNativeFlip();
+
 // Check if the DXGI factory supports ALLOW_TEARING.
 // Must be called with a valid IDXGISwapChain* after swapchain creation.
 void FlipModel_CheckTearingSupport(void* native_swapchain);

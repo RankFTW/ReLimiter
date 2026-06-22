@@ -19,7 +19,7 @@
 
 ### Bug Fixes
 - **Fixed Fake Fullscreen leaving games in a small window** — Games that go fullscreen after swapchain creation (RE2, RE3, Village, and other RE Engine titles) were left in a tiny windowed state. The fullscreen block now correctly applies the borderless resize to fill the monitor.
-- **Flip Model Override now shows "(Not supported)" instead of stuck "(Restart required)"** — When the upgrade fails because the game is incompatible (MSAA, GDI interop, etc.), the label now correctly indicates the game doesn't support it rather than endlessly asking for a restart.
+- **Flip Model Override now shows "(Not supported)" instead of stuck "(Restart required)"** — When the upgrade fails because the game is incompatible (MSAA, GDI interop, etc.), the label now correctly indicates the game doesn't support it rather than endlessly asking for a restart. Shows "(Native)" when the game already uses flip model.
 
 
 ## 3.2.7
