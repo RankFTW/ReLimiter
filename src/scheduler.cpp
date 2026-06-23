@@ -123,13 +123,6 @@ static int    s_feedback_frame_counter = 0;
 static constexpr int FEEDBACK_TICK_FRAMES = 15;
 static constexpr double FEEDBACK_MAX_CORRECTION = 30000.0;
 
-// ── Periodic uncap probe ──
-static int  s_uncap_frame_counter = 0;
-static bool s_uncap_active = false;
-static int  s_probe_suppress_countdown = 0;  // frames remaining to suppress OSD updates
-static constexpr int UNCAP_INTERVAL_FRAMES = 300; // ~5s at ~60fps render
-static constexpr int PROBE_SUPPRESS_FRAMES = 6;  // suppress OSD for probe + reconvergence
-
 // ── Forward declarations ──
 static void OnMarker_VRR(uint64_t frameID, int64_t now);
 static void OnMarker_Fixed(uint64_t frameID, int64_t now);
@@ -192,11 +185,7 @@ void OnMarker(uint64_t frameID, int64_t now) {
         s_prev_enforcement_ts = ts;
         s_last_enforcement_ts = ts;
 
-        // Suppress g_actual_frame_time_us updates during probe + reconvergence
-        // so the OSD doesn't show the spike to the user.
-        if (s_probe_suppress_countdown > 0) {
-            s_probe_suppress_countdown--;
-        } else if (telemetry_ft > 0.0) {
+        if (telemetry_ft > 0.0) {
             g_actual_frame_time_us.store(telemetry_ft, std::memory_order_relaxed);
         }
 
@@ -209,145 +198,10 @@ void OnMarker(uint64_t frameID, int64_t now) {
                 real_fg_divisor = ratio;
         }
 
-        int output_cap = g_dmfg_output_cap.load(std::memory_order_relaxed);
+        int output_cap = 0;  // Dynamic DMFG: pure passthrough, no cap from ReLimiter.
+                              // User sets target via NVIDIA App / RHI / Profile Inspector.
 
-        // Periodic uncap probe: remove cap for 1 frame every ~300 render frames (~5s).
-        // OSD suppression (s_probe_suppress_countdown) hides the spike from the user.
-        bool is_probe_frame = false;
-        if (output_cap > 0) {
-            if (s_uncap_active) {
-                output_cap = 0;
-                s_uncap_active = false;
-                is_probe_frame = true;
-                s_probe_suppress_countdown = PROBE_SUPPRESS_FRAMES;
-            } else {
-                s_uncap_frame_counter++;
-                if (s_uncap_frame_counter >= UNCAP_INTERVAL_FRAMES) {
-                    s_uncap_frame_counter = 0;
-                    s_uncap_active = true;
-                    output_cap = 0;
-                    is_probe_frame = true;
-                    s_probe_suppress_countdown = PROBE_SUPPRESS_FRAMES;
-                }
-            }
-        } else {
-            s_uncap_frame_counter = 0;
-            s_uncap_active = false;
-        }
-
-        // Detect cap transitions
-        int real_cap = g_dmfg_output_cap.load(std::memory_order_relaxed);
-        if ((real_cap > 0) != (s_prev_output_cap > 0)) {
-            s_ema_render_cost = 0.0;
-            s_last_own_sleep_cap_us = 0.0;
-            s_prev_cap_mult = 0;
-            s_interval_correction_us = 0.0;
-            s_feedback_frame_counter = 0;
-            s_ema_mult = 0.0;
-            LOG_INFO("DMFG cap transition: %d -> %d, resetting predictor state",
-                     s_prev_output_cap, real_cap);
-        }
-        s_prev_output_cap = real_cap;
-
-        if (output_cap > 0) {
-            int raw_mult = g_fg_actual_multiplier.load(std::memory_order_relaxed);
-            if (raw_mult < 2)
-                raw_mult = ComputeFGDivisorRaw();
-            if (raw_mult < 2)
-                raw_mult = 2;
-            raw_mult = (std::min)(raw_mult, 6);
-
-            if (s_ema_mult < 1.5)
-                s_ema_mult = static_cast<double>(raw_mult);
-            else {
-                double diff = static_cast<double>(raw_mult) - s_ema_mult;
-                if (std::abs(diff) > 1.0)
-                    s_ema_mult += diff * 0.5;
-                else
-                    s_ema_mult += 0.15 * diff;
-            }
-
-            double mult_d = (std::max)(2.0, (std::min)(s_ema_mult, 6.0));
-            int mult = static_cast<int>(mult_d + 0.5);
-            if (mult < 2) mult = 2;
-
-            if (mult != s_prev_cap_mult && s_prev_cap_mult != 0)
-                LOG_INFO("DMFG cap multiplier transition: %d -> %d", s_prev_cap_mult, mult);
-            s_prev_cap_mult = mult;
-
-            double base_interval = (mult_d / static_cast<double>(output_cap)) * 1e6;
-            double target_interval = base_interval + s_interval_correction_us;
-            target_interval = (std::max)(2000.0, (std::min)(target_interval, 200000.0));
-
-            s_feedback_frame_counter++;
-            if (s_feedback_frame_counter >= FEEDBACK_TICK_FRAMES) {
-                s_feedback_frame_counter = 0;
-                double out_fps = g_output_fps.load(std::memory_order_relaxed);
-                if (out_fps > 0.0) {
-                    double overshoot = out_fps - static_cast<double>(output_cap);
-                    if (overshoot > 2.0) {
-                        double step = (std::min)(overshoot * 80.0, 3000.0);
-                        s_interval_correction_us += step;
-                        s_interval_correction_us = (std::min)(s_interval_correction_us, FEEDBACK_MAX_CORRECTION);
-                    } else if (overshoot < -3.0) {
-                        s_interval_correction_us *= 0.50;
-                        if (s_interval_correction_us < 50.0)
-                            s_interval_correction_us = 0.0;
-                    } else {
-                        s_interval_correction_us *= 0.70;
-                        if (s_interval_correction_us < 50.0)
-                            s_interval_correction_us = 0.0;
-                    }
-                }
-            }
-
-            double own_sleep_us = 0.0;
-            if (prev_enforcement > 0) {
-                int64_t wake_target = prev_enforcement + us_to_qpc(target_interval);
-                QueryPerformanceCounter(&qpc_now);
-                int64_t now_qpc = qpc_now.QuadPart;
-                if (wake_target > now_qpc + us_to_qpc(500.0)) {
-                    LARGE_INTEGER qpc_before, qpc_after;
-                    QueryPerformanceCounter(&qpc_before);
-                    DoOwnSleep(wake_target);
-                    QueryPerformanceCounter(&qpc_after);
-                    own_sleep_us = qpc_to_us(qpc_after.QuadPart - qpc_before.QuadPart);
-                }
-            }
-
-            s_last_own_sleep_cap_us = own_sleep_us;
-
-            QueryPerformanceCounter(&qpc_now);
-            s_last_enforcement_ts = qpc_now.QuadPart;
-            s_prev_enforcement_ts = qpc_now.QuadPart;
-            g_predictor.OnEnforcement(frameID, qpc_now.QuadPart);
-
-            double jitter = (telemetry_ft > 0.0 && s_prev_actual_ft > 0.0)
-                ? std::abs(telemetry_ft - s_prev_actual_ft) : 0.0;
-            s_prev_actual_ft = telemetry_ft;
-
-            FrameRow row = {};
-            row.frame_id = frameID;
-            row.timestamp_us = qpc_to_us(qpc_now.QuadPart);
-            row.actual_frame_time_us = telemetry_ft;
-            row.fg_divisor = mult_d;
-            row.predicted_us = g_predictor.predicted_us;
-            row.sleep_duration_us = target_interval;
-            row.overload = 0;
-            row.tier = static_cast<int>(g_current_tier);
-            row.mode = 0;
-            row.jitter_us = jitter;
-            row.predictor_warm = (g_predictor.frame_times_us.Size() >= 8) ? 1 : 0;
-            row.smoothness_us = g_smoothness_us.load(std::memory_order_relaxed);
-            row.own_sleep_us = own_sleep_us;
-            row.api = (SwapMgr_GetActiveAPI() == ActiveAPI::Vulkan) ? 1
-                    : (SwapMgr_GetActiveAPI() == ActiveAPI::DX11) ? 2
-                    : (SwapMgr_GetActiveAPI() == ActiveAPI::OpenGL) ? 3 : 0;
-            CSV_Push(row);
-            return;
-        }
-
-        // Cap=0: passthrough
+        // Pure passthrough — no pacing, just record telemetry.
         g_predictor.OnEnforcement(frameID, ts);
 
         double jitter = (telemetry_ft > 0.0 && s_prev_actual_ft > 0.0)

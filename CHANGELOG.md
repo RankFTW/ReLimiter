@@ -5,6 +5,7 @@
 
 ### Frame Generation
 - **Driver-forced MFG support** — When Multi-Frame Generation is forced via NVIDIA Profile Inspector or NVIDIA App (e.g., 5x or 6x), ReLimiter now detects the real multiplier from the driver profile and paces accordingly. FPS cap, adaptive smoothing, OSD multiplier display, and 1%/0.1% low calculations all use the correct driver-set value. Previously only the in-game multiplier was detected, causing the FPS cap to not work and the OSD to show the wrong multiplier.
+- **Dynamic MFG auto-detected** — When Dynamic MFG is configured in the driver profile, ReLimiter automatically enters passthrough mode. No manual toggle needed — the "Dynamic MFG" section has been removed entirely. The Target FPS slider is disabled and shows the driver-configured target. Set your FPS target via NVIDIA App, RHI, or Profile Inspector when using Dynamic MFG.
 
 ### OSD
 - **Fixed OSD showing FG active when it's off** — Some games report FG as configured at the API level even when disabled in-game. The OSD now cross-checks with the driver's AI frame time — if the GPU is reporting data but no interpolated frames are being produced, shows "off" automatically. No manual toggle needed.

@@ -198,19 +198,49 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     }
 
     char slider_fmt[32];
-    if (s_target_edit == 0)
-        snprintf(slider_fmt, sizeof(slider_fmt), "Off");
-    else if (s_target_edit == reflex_cap && reflex_cap > 0)
-        snprintf(slider_fmt, sizeof(slider_fmt), "%%d (VRR)");
-    else
-        snprintf(slider_fmt, sizeof(slider_fmt), "%%d");
-    ImGui::SliderInt("Target FPS", &s_target_edit, 0, 360, slider_fmt);
-    s_target_active = ImGui::IsItemActive();
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
-        if (s_target_edit > 0 && s_target_edit < 30) s_target_edit = 30;
-        g_user_target_fps.store(s_target_edit, std::memory_order_relaxed);
-        g_config.target_fps = s_target_edit;
-        config_dirty = true;
+    bool dmfg_dynamic_active = false;
+    {
+        DLSSPresets p_drs = DLSSPresets_Get();
+        if (p_drs.available && p_drs.mfg_mode_override == 4)
+            dmfg_dynamic_active = true;
+    }
+
+    if (dmfg_dynamic_active) {
+        // Dynamic DMFG: disable slider, force to 0
+        s_target_edit = 0;
+        g_user_target_fps.store(0, std::memory_order_relaxed);
+        ImGui::BeginDisabled();
+        ImGui::SliderInt("Target FPS", &s_target_edit, 0, 360, "Off (DMFG)");
+        ImGui::EndDisabled();
+        s_target_active = false;
+
+        // Show the driver-set target FPS from the profile
+        DLSSPresets p_drs_fps = DLSSPresets_Get();
+        int drs_target = p_drs_fps.mfg_dynamic_target_fps;
+        if (drs_target == 0x01000000)
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
+                "Dynamic MFG target: Max Refresh Rate (set via driver profile)");
+        else if (drs_target > 0)
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
+                "Dynamic MFG target: %d fps (set via driver profile)", drs_target);
+        else
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
+                "Dynamic MFG active. Set FPS target via NVIDIA App, RHI, or Profile Inspector.");
+    } else {
+        if (s_target_edit == 0)
+            snprintf(slider_fmt, sizeof(slider_fmt), "Off");
+        else if (s_target_edit == reflex_cap && reflex_cap > 0)
+            snprintf(slider_fmt, sizeof(slider_fmt), "%%d (VRR)");
+        else
+            snprintf(slider_fmt, sizeof(slider_fmt), "%%d");
+        ImGui::SliderInt("Target FPS", &s_target_edit, 0, 360, slider_fmt);
+        s_target_active = ImGui::IsItemActive();
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            if (s_target_edit > 0 && s_target_edit < 30) s_target_edit = 30;
+            g_user_target_fps.store(s_target_edit, std::memory_order_relaxed);
+            g_config.target_fps = s_target_edit;
+            config_dirty = true;
+        }
     }
     HelpTip("The FPS the limiter will target. 0 = no limiting. Minimum is 30.");
 
@@ -960,7 +990,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     // ════════════════════════════════════════════
     // SECTION: Adaptive Smoothing (collapsible, DX12 only)
     // ════════════════════════════════════════════
-    if (SwapMgr_GetActiveAPI() == ActiveAPI::DX12) {
+    if (SwapMgr_GetActiveAPI() == ActiveAPI::DX12 && !dmfg_dynamic_active) {
     ImGui::Separator();
     if (ImGui::CollapsingHeader("Adaptive Smoothing")) {
         bool adaptive = g_config.adaptive_smoothing;
@@ -1036,87 +1066,6 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
 
     // ════════════════════════════════════════════
     // SECTION: Frame Generation (collapsible, DX12 only)
-    // ════════════════════════════════════════════
-    if (SwapMgr_GetActiveAPI() == ActiveAPI::DX12) {
-    ImGui::Separator();
-    if (ImGui::CollapsingHeader("Dynamic MFG")) {
-        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
-            "Only enable if DMFG is already active via NVIDIA App / NVPI / in-game.");
-        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
-            "This toggle does NOT enable DMFG. Leave OFF for standard FG (2x/3x/4x).");
-        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
-            "Games with native DMFG support may not require this to be enabled.");
-        ImGui::Spacing();
-        // DMFG Compatibility toggle
-        bool dmfg_pass = g_config.dynamic_mfg_passthrough;
-        if (ImGui::Checkbox("DMFG Compatibility", &dmfg_pass)) {
-            g_config.dynamic_mfg_passthrough = dmfg_pass;
-            if (dmfg_pass)
-                g_fg_mode.store(2, std::memory_order_relaxed);
-            else
-                g_fg_mode.store(0, std::memory_order_relaxed);
-            config_dirty = true;
-        }
-        // Status indicator
-        if (IsDmfgActive()) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(Active)");
-        } else if (g_config.dynamic_mfg_passthrough) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Forced)");
-        }
-        HelpTip("For DLSS Dynamic Multi Frame Generation (DMFG) ONLY. "
-                "This does NOT enable DMFG — you must enable it separately in the NVIDIA App, "
-                "Profile Inspector, or in-game settings first. "
-                "Only tick this if DMFG is already active and you want ReLimiter to hand "
-                "frame pacing to the driver so it can freely adjust the FG multiplier. "
-                "Set the Output Cap below to cap output FPS to your VRR ceiling. "
-                "If you're using standard FG (2x/3x/4x), leave this OFF.");
-
-        // DMFG Output Cap slider — always visible in this section
-        {
-            ImGui::Spacing();
-            static int s_cap_edit = g_config.dmfg_output_cap;
-            static bool s_cap_active = false;
-            if (!s_cap_active)
-                s_cap_edit = g_config.dmfg_output_cap;
-
-            char cap_fmt[32];
-            if (s_cap_edit == 0)
-                snprintf(cap_fmt, sizeof(cap_fmt), "Off");
-            else
-                snprintf(cap_fmt, sizeof(cap_fmt), "%%d");
-            ImGui::SliderInt("DMFG Output Cap", &s_cap_edit, 0, 360, cap_fmt);
-            s_cap_active = ImGui::IsItemActive();
-            if (ImGui::IsItemDeactivatedAfterEdit()) {
-                if (s_cap_edit > 0 && s_cap_edit < 30) s_cap_edit = 30;
-                g_config.dmfg_output_cap = s_cap_edit;
-                g_dmfg_output_cap.store(s_cap_edit, std::memory_order_relaxed);
-                config_dirty = true;
-            }
-
-            // VRR quick-set button
-            if (reflex_cap > 0) {
-                ImGui::SameLine();
-                char vrr_label[32];
-                snprintf(vrr_label, sizeof(vrr_label), "VRR (%d)", reflex_cap);
-                if (ImGui::Button(vrr_label)) {
-                    s_cap_edit = reflex_cap;
-                    g_config.dmfg_output_cap = reflex_cap;
-                    g_dmfg_output_cap.store(reflex_cap, std::memory_order_relaxed);
-                    config_dirty = true;
-                }
-            }
-
-            HelpTip("Cap the output (display) FPS when DMFG is active. "
-                    "Set to your VRR ceiling (e.g. 157) to prevent tearing above the VRR window. "
-                    "0 = no cap (full passthrough). "
-                    "Note: the target is not guaranteed — output may overshoot or undershoot slightly. "
-                    "Setting this too low will force the driver to max out at 6x multiplier.");
-        }
-    }
-    } // DX12 only (Dynamic MFG)
-
     // ════════════════════════════════════════════
     // SECTION 4: Advanced (collapsible)
     // ════════════════════════════════════════════
@@ -1915,7 +1864,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             if (IsNvSmoothMotionActive()) {
                 snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", s_display_fps * 2.0, s_display_fps);
             } else if (IsDmfgActive() && output > 0.0) {
-                snprintf(buf, sizeof(buf), "%.0f fps", output);
+                snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", output, s_display_fps);
             } else if (output > 0.0 && fg_presenting && fg_mult > 0)
                 snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", output, s_display_fps);
             else
@@ -2032,29 +1981,30 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             if (IsNvSmoothMotionActive()) {
                 snprintf(buf, sizeof(buf), "FG: Smooth Motion");
             } else if (IsDmfgActive()) {
-                int actual_mult = g_fg_actual_multiplier.load(std::memory_order_relaxed);
-                int cap = g_dmfg_output_cap.load(std::memory_order_relaxed);
-                if (cap > 0) {
-                    if (actual_mult >= 2)
-                        snprintf(buf, sizeof(buf), "FG: Dynamic %dx [Cap: %d]", actual_mult, cap);
-                    else
-                        snprintf(buf, sizeof(buf), "FG: Dynamic [Cap: %d]", cap);
-                } else {
-                    if (actual_mult >= 2)
-                        snprintf(buf, sizeof(buf), "FG: Dynamic %dx", actual_mult);
-                    else {
-                        double output = g_output_fps.load(std::memory_order_relaxed);
-                        if (output > 0.0 && s_real_fps > 1.0) {
-                            int inferred = static_cast<int>(output / s_real_fps + 0.5);
-                            if (inferred >= 2 && inferred <= 8)
-                                snprintf(buf, sizeof(buf), "FG: Dynamic %dx", inferred);
-                            else
-                                snprintf(buf, sizeof(buf), "FG: Dynamic");
-                        } else {
-                            snprintf(buf, sizeof(buf), "FG: Dynamic");
-                        }
-                    }
+                // For DMFG, infer the real-time multiplier from output/render ratio.
+                // This shows what the driver is actually doing right now (fluctuates with load).
+                int display_mult = 0;
+                if (s_display_output_fps > 0.0 && s_display_fps > 1.0) {
+                    int inferred = static_cast<int>(s_display_output_fps / s_display_fps + 0.5);
+                    if (inferred >= 2 && inferred <= 8)
+                        display_mult = inferred;
                 }
+                // Fallback to DRS configured max if inference not ready
+                if (display_mult < 2) {
+                    DLSSPresets presets_dmfg = DLSSPresets_Get();
+                    if (presets_dmfg.available && presets_dmfg.mfg_generation_factor > 0)
+                        display_mult = presets_dmfg.mfg_generation_factor + 1;
+                }
+
+                int cap = g_user_target_fps.load(std::memory_order_relaxed);
+                if (cap > 0 && display_mult >= 2)
+                    snprintf(buf, sizeof(buf), "FG: Dynamic %dx [Cap: %d]", display_mult, cap);
+                else if (cap > 0)
+                    snprintf(buf, sizeof(buf), "FG: Dynamic [Cap: %d]", cap);
+                else if (display_mult >= 2)
+                    snprintf(buf, sizeof(buf), "FG: Dynamic %dx", display_mult);
+                else
+                    snprintf(buf, sizeof(buf), "FG: Dynamic");
             } else {
                 snprintf(buf, sizeof(buf), "FG: %s", fg_label);
             }

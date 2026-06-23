@@ -2,6 +2,7 @@
 #include "ngx_hooks.h"
 #include "hooks.h"
 #include "config.h"
+#include "dlss_presets.h"
 #include "flush.h"
 #include "logger.h"
 #include <cstring>
@@ -581,9 +582,12 @@ bool IsDmfgSession() {
 }
 
 bool IsDmfgActive() {
-    // Only active when the user explicitly enables the DMFG Compatibility toggle.
-    // Auto-detection via g_fg_mode==2 or latency hints was causing false positives
-    // (e.g. Clair Obscur entering passthrough when users expected active pacing).
+    // Auto-detect from DRS profile: Mode Override == 4 means Dynamic MFG is set.
+    // Falls back to manual toggle for backward compatibility with users who have
+    // dynamic_mfg_passthrough=true in their INI from older versions.
+    DLSSPresets p = DLSSPresets_Get();
+    if (p.available && p.mfg_mode_override == 4)
+        return true;
     return g_config.dynamic_mfg_passthrough;
 }
 
