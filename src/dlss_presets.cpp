@@ -15,6 +15,7 @@ static constexpr NvU32 DRS_ID_DLSS_FG_PRESET    = 0x10E41DF1;
 static constexpr NvU32 DRS_ID_ENABLE_SR_OVERRIDE = 0x10E41DF8;
 static constexpr NvU32 DRS_ID_ENABLE_RR_OVERRIDE = 0x10E41DF9;
 static constexpr NvU32 DRS_ID_ENABLE_FG_OVERRIDE = 0x10E41DFA;
+static constexpr NvU32 DRS_ID_MFG_GENERATION_FACTOR = 0x104D6667;
 
 static bool s_resolved = false;
 static bool s_available = false;
@@ -82,6 +83,14 @@ static void DoPoll() {
         NvU32 sr_preset = ReadDRSSetting(hSession, readProfile, DRS_ID_DLSS_SR_PRESET);
         NvU32 rr_preset = ReadDRSSetting(hSession, readProfile, DRS_ID_DLSS_RR_PRESET);
         NvU32 fg_preset = ReadDRSSetting(hSession, readProfile, DRS_ID_DLSS_FG_PRESET);
+        NvU32 mfg_factor = ReadDRSSetting(hSession, readProfile, DRS_ID_MFG_GENERATION_FACTOR);
+
+        // If MFG not in game profile, also check base profile (some settings inherit)
+        if (mfg_factor == 0 && hGameProfile) {
+            NvDRSProfileHandle hBase = nullptr;
+            if (NvAPI_DRS_GetBaseProfile(hSession, &hBase) == NVAPI_OK && hBase)
+                mfg_factor = ReadDRSSetting(hSession, hBase, DRS_ID_MFG_GENERATION_FACTOR);
+        }
 
         NvAPI_DRS_DestroySession(hSession);
         hSession = nullptr;
@@ -95,14 +104,16 @@ static void DoPoll() {
         if (fg_preset > 0) strncpy(s_presets.fg, PresetValueToLetter(fg_preset), 3);
         else strncpy(s_presets.fg, "-", 3);
 
+        s_presets.mfg_generation_factor = static_cast<int>(mfg_factor);
         s_presets.available = true;
 
         static bool s_logged = false;
         if (!s_logged) {
             s_logged = true;
-            LOG_INFO("DLSS DRS: profile=%s SR=%s(0x%X) RR=%s(0x%X) FG=%s(0x%X)",
+            LOG_WARN("DLSS DRS: profile=%s SR=%s(0x%X) RR=%s(0x%X) FG=%s(0x%X) MFG_Factor=%u",
                      hGameProfile ? "game" : "base",
-                     s_presets.sr, sr_preset, s_presets.rr, rr_preset, s_presets.fg, fg_preset);
+                     s_presets.sr, sr_preset, s_presets.rr, rr_preset, s_presets.fg, fg_preset,
+                     mfg_factor);
         }
 
     } __except(EXCEPTION_EXECUTE_HANDLER) {

@@ -1,5 +1,6 @@
 #include "fg_divisor.h"
 #include "streamline_hooks.h"
+#include "dlss_presets.h"
 #include "wake_guard.h"
 #include "logger.h"
 #include <Windows.h>
@@ -45,6 +46,17 @@ int ComputeFGDivisorRaw() {
     int mult = g_fg_multiplier.load(std::memory_order_relaxed);
     int actual = g_fg_actual_multiplier.load(std::memory_order_relaxed);
     int mode = g_fg_mode.load(std::memory_order_relaxed);
+
+    // Driver-forced MFG override (from NVIDIA Profile Inspector / NVIDIA App).
+    // DRS setting 0x104D6667: 0=app-controlled, 1=2x, 2=3x, 3=4x, 4=5x, 5=6x.
+    // When non-zero and FG is presenting, this overrides all other multiplier sources.
+    DLSSPresets presets = DLSSPresets_Get();
+    if (presets.available && presets.mfg_generation_factor > 0 && presenting) {
+        int drs_mult = presets.mfg_generation_factor + 1;  // 1→2x, 4→5x
+        // Use DRS value when it exceeds what the API reports (driver override active)
+        if (drs_mult > actual && drs_mult > (mult + 1))
+            return drs_mult;
+    }
 
     // Best signal: GetState confirms frames are actually being produced.
     if (presenting && actual >= 2)

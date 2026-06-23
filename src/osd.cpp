@@ -1844,6 +1844,15 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         // Use actual driver multiplier when available (handles control panel overrides)
         int actual = g_fg_actual_multiplier.load(std::memory_order_relaxed);
         int display_mult = (actual >= 2) ? actual : (fg_mult + 1);
+
+        // DRS MFG override: if Profile Inspector sets a higher generation factor, show that
+        DLSSPresets presets_fg = DLSSPresets_Get();
+        if (presets_fg.available && presets_fg.mfg_generation_factor > 0) {
+            int drs_mult = presets_fg.mfg_generation_factor + 1;
+            if (drs_mult > display_mult)
+                display_mult = drs_mult;
+        }
+
         snprintf(fg_buf, sizeof(fg_buf), "%dx", display_mult);
         fg_label = fg_buf;
     }
@@ -1878,8 +1887,14 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             double display_ft = ft;
             if (IsNvSmoothMotionActive())
                 display_ft = ft / 2.0;  // SM always 2x
-            else if (fg_presenting && fg_mult > 0)
-                display_ft = ft / static_cast<double>(fg_mult + 1);
+            else if (fg_presenting && fg_mult > 0) {
+                // Use the real divisor (accounts for DRS MFG override)
+                int divisor = ComputeFGDivisorRaw();
+                if (divisor >= 2)
+                    display_ft = ft / static_cast<double>(divisor);
+                else
+                    display_ft = ft / static_cast<double>(fg_mult + 1);
+            }
             s_low_history[s_low_history_idx] = display_ft;
             s_low_history_idx = (s_low_history_idx + 1) % LOW_HISTORY_SIZE;
             if (s_low_history_count < LOW_HISTORY_SIZE) s_low_history_count++;
