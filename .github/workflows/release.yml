@@ -43,7 +43,7 @@ jobs:
 
       - name: Configure CMake
         if: steps.check_tag.outputs.TAG_EXISTS == 'false'
-        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+        run: cmake -B build -A x64
 
       - name: Build Release
         if: steps.check_tag.outputs.TAG_EXISTS == 'false'
