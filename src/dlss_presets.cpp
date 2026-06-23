@@ -174,3 +174,68 @@ void DLSSPresets_Poll() {
 DLSSPresets DLSSPresets_Get() {
     return s_presets;
 }
+
+bool DLSSPresets_WriteDynamicTargetFPS(int fps) {
+    NvDRSSessionHandle hSession = nullptr;
+
+    __try {
+        NvAPI_Status st = NvAPI_DRS_CreateSession(&hSession);
+        if (st != NVAPI_OK || !hSession) return false;
+
+        st = NvAPI_DRS_LoadSettings(hSession);
+        if (st != NVAPI_OK) { NvAPI_DRS_DestroySession(hSession); return false; }
+
+        // Find game profile
+        NvDRSProfileHandle hGameProfile = nullptr;
+        {
+            wchar_t exePath[MAX_PATH] = {};
+            GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+            wchar_t* exeName = wcsrchr(exePath, L'\\');
+            if (exeName) exeName++; else exeName = exePath;
+
+            NVDRS_APPLICATION app = {};
+            app.version = NVDRS_APPLICATION_VER;
+            NvAPI_UnicodeString appName = {};
+            wcsncpy(reinterpret_cast<wchar_t*>(appName), exeName, NVAPI_UNICODE_STRING_MAX - 1);
+
+            st = NvAPI_DRS_FindApplicationByName(hSession, appName, &hGameProfile, &app);
+            if (st != NVAPI_OK || !hGameProfile) {
+                NvAPI_DRS_DestroySession(hSession);
+                LOG_WARN("DRS write: game profile not found");
+                return false;
+            }
+        }
+
+        // Write the setting
+        NVDRS_SETTING setting = {};
+        setting.version = NVDRS_SETTING_VER;
+        setting.settingId = DRS_ID_MFG_DYNAMIC_TARGET_FPS;
+        setting.settingType = NVDRS_DWORD_TYPE;
+        setting.u32CurrentValue = static_cast<NvU32>(fps);
+
+        st = NvAPI_DRS_SetSetting(hSession, hGameProfile, &setting);
+        if (st != NVAPI_OK) {
+            LOG_WARN("DRS write: SetSetting failed (st=%d)", st);
+            NvAPI_DRS_DestroySession(hSession);
+            return false;
+        }
+
+        st = NvAPI_DRS_SaveSettings(hSession);
+        NvAPI_DRS_DestroySession(hSession);
+
+        if (st != NVAPI_OK) {
+            LOG_WARN("DRS write: SaveSettings failed (st=%d)", st);
+            return false;
+        }
+
+        // Update cached value immediately
+        s_presets.mfg_dynamic_target_fps = fps;
+        LOG_INFO("DRS write: Dynamic Target FPS set to %d (0x%X)", fps, fps);
+        return true;
+
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        if (hSession) NvAPI_DRS_DestroySession(hSession);
+        LOG_WARN("DRS write: SEH exception");
+        return false;
+    }
+}

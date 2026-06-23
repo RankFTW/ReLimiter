@@ -16,3 +16,8 @@ struct DLSSPresets {
 void DLSSPresets_Init();
 void DLSSPresets_Poll();  // Call periodically (e.g. from OSD draw)
 DLSSPresets DLSSPresets_Get();
+
+// Write the Dynamic MFG Target FPS to the game's driver profile.
+// fps=0 means Off, fps>0 writes the raw FPS value to DRS 0x10CF4125.
+// Returns true on success.
+bool DLSSPresets_WriteDynamicTargetFPS(int fps);

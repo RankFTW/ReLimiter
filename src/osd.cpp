@@ -161,6 +161,15 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     if (ceiling_hz > 1.0)
         reflex_cap = static_cast<int>(ceiling_hz - (ceiling_hz * ceiling_hz / 3600.0));
 
+    // Check for Dynamic DMFG early — affects all FPS controls
+    bool dmfg_dynamic_active = false;
+    {
+        DLSSPresets p_drs = DLSSPresets_Get();
+        if (p_drs.available && p_drs.mfg_mode_override == 4)
+            dmfg_dynamic_active = true;
+    }
+
+    if (dmfg_dynamic_active) ImGui::BeginDisabled();
     if (ImGui::RadioButton("VRR Cap", reflex_cap > 0 && target == reflex_cap)) {
         if (reflex_cap > 0) {
             g_user_target_fps.store(reflex_cap, std::memory_order_relaxed);
@@ -186,6 +195,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         s_target_edit = 0;
         config_dirty = true;
     }
+    if (dmfg_dynamic_active) ImGui::EndDisabled();
     if (reflex_cap > 0) {
         char tip[128];
         snprintf(tip, sizeof(tip),
@@ -198,34 +208,40 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     }
 
     char slider_fmt[32];
-    bool dmfg_dynamic_active = false;
-    {
-        DLSSPresets p_drs = DLSSPresets_Get();
-        if (p_drs.available && p_drs.mfg_mode_override == 4)
-            dmfg_dynamic_active = true;
-    }
 
     if (dmfg_dynamic_active) {
-        // Dynamic DMFG: disable slider, force to 0
-        s_target_edit = 0;
+        // Dynamic DMFG: show driver target, slider disabled
+        DLSSPresets p_drs_fps = DLSSPresets_Get();
+        int drs_target = p_drs_fps.mfg_dynamic_target_fps;
+
+        // Resolve display value
+        int display_target = 0;
+        if (drs_target == 0x01000000)
+            display_target = reflex_cap > 0 ? reflex_cap : static_cast<int>(ceiling_hz);
+        else if (drs_target > 0)
+            display_target = drs_target;
+
+        s_target_edit = display_target;
         g_user_target_fps.store(0, std::memory_order_relaxed);
         ImGui::BeginDisabled();
-        ImGui::SliderInt("Target FPS", &s_target_edit, 0, 360, "Off (DMFG)");
+        char dmfg_fmt[32];
+        if (display_target == 0)
+            snprintf(dmfg_fmt, sizeof(dmfg_fmt), "Not set");
+        else
+            snprintf(dmfg_fmt, sizeof(dmfg_fmt), "%%d");
+        ImGui::SliderInt("Target FPS", &s_target_edit, 0, 500, dmfg_fmt);
         ImGui::EndDisabled();
         s_target_active = false;
 
-        // Show the driver-set target FPS from the profile
-        DLSSPresets p_drs_fps = DLSSPresets_Get();
-        int drs_target = p_drs_fps.mfg_dynamic_target_fps;
         if (drs_target == 0x01000000)
-            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
-                "Dynamic MFG target: Max Refresh Rate (set via driver profile)");
+            ImGui::TextColored(ImVec4(0.6f, 0.9f, 0.6f, 1.0f),
+                "Dynamic MFG target: Max Refresh Rate (%d fps)", display_target);
         else if (drs_target > 0)
-            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
-                "Dynamic MFG target: %d fps (set via driver profile)", drs_target);
+            ImGui::TextColored(ImVec4(0.6f, 0.9f, 0.6f, 1.0f),
+                "Dynamic MFG target: %d fps", drs_target);
         else
             ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 1.0f),
-                "Dynamic MFG active. Set FPS target via NVIDIA App, RHI, or Profile Inspector.");
+                "No target set. Set via RHI, NVIDIA App, or Profile Inspector.");
     } else {
         if (s_target_edit == 0)
             snprintf(slider_fmt, sizeof(slider_fmt), "Off");
@@ -242,17 +258,23 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             config_dirty = true;
         }
     }
-    HelpTip("The FPS the limiter will target. 0 = no limiting. Minimum is 30.");
+    if (dmfg_dynamic_active)
+        HelpTip("Dynamic MFG is active. The FPS target is controlled by the driver profile. "
+                "Set it via RHI, NVIDIA App, or Profile Inspector before launching the game.");
+    else
+        HelpTip("The FPS the limiter will target. 0 = no limiting. Minimum is 30.");
 
-    for (int p : {30, 60, 120, 240}) {
-        ImGui::SameLine();
-        char label[8];
-        snprintf(label, sizeof(label), "%d", p);
-        if (ImGui::Button(label)) {
-            g_user_target_fps.store(p, std::memory_order_relaxed);
-            g_config.target_fps = p;
-            s_target_edit = p;
-            config_dirty = true;
+    if (!dmfg_dynamic_active) {
+        for (int p : {30, 60, 120, 240}) {
+            ImGui::SameLine();
+            char label[8];
+            snprintf(label, sizeof(label), "%d", p);
+            if (ImGui::Button(label)) {
+                g_user_target_fps.store(p, std::memory_order_relaxed);
+                g_config.target_fps = p;
+                s_target_edit = p;
+                config_dirty = true;
+            }
         }
     }
 
@@ -1255,7 +1277,9 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
 
         // FG pacing status
         int fg_div_raw = ComputeFGDivisorRaw();
-        if (fg_div_raw > 1) {
+        if (IsDmfgActive()) {
+            ImGui::Text("FG Pacing: Dynamic (passthrough)");
+        } else if (fg_div_raw > 1) {
             double eff_us = g_effective_interval_us.load(std::memory_order_relaxed);
             double native_fps = (eff_us > 0.0) ? 1000000.0 / eff_us : 0.0;
             ImGui::Text("FG Pacing: %dx  |  Native: %.0f fps (%.1f ms)",
@@ -1271,6 +1295,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
 
         ImVec4 col_ok = ImVec4(0.2f, 0.9f, 0.2f, 1.0f);
         ImVec4 col_bad = ImVec4(0.9f, 0.2f, 0.2f, 1.0f);
+        ImVec4 col_na  = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
 
         ImGui::Text("Pipeline:");
         ImGui::SameLine();
@@ -1278,7 +1303,10 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         ImGui::SameLine();
         ImGui::Text("|");
         ImGui::SameLine();
-        ImGui::TextColored(render_ok ? col_ok : col_bad, "RENDER %s", render_ok ? "ok" : "X");
+        if (IsDmfgActive())
+            ImGui::TextColored(col_na, "RENDER n/a");
+        else
+            ImGui::TextColored(render_ok ? col_ok : col_bad, "RENDER %s", render_ok ? "ok" : "X");
         ImGui::SameLine();
         ImGui::Text("|");
         ImGui::SameLine();
@@ -2017,7 +2045,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             OSDTextColored(ColPipeline(), buf);
         }
 
-        if (g_config.osd_show_adaptive_smoothing && g_config.adaptive_smoothing) {
+        if (g_config.osd_show_adaptive_smoothing && g_config.adaptive_smoothing && !IsDmfgActive()) {
             double offset = g_smoothing_offset_us.load(std::memory_order_relaxed);
             double p99 = g_smoothing_p99_us.load(std::memory_order_relaxed);
             if (g_adaptive_smoothing.IsWarm()) {

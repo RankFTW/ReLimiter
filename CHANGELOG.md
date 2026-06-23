@@ -1,7 +1,7 @@
 # Changelog
 
 
-## 3.2.8-beta
+## 3.2.8
 
 ### Frame Generation
 - **Driver-forced MFG support** — When Multi-Frame Generation is forced via NVIDIA Profile Inspector or NVIDIA App (e.g., 5x or 6x), ReLimiter now detects the real multiplier from the driver profile and paces accordingly. FPS cap, adaptive smoothing, OSD multiplier display, and 1%/0.1% low calculations all use the correct driver-set value. Previously only the in-game multiplier was detected, causing the FPS cap to not work and the OSD to show the wrong multiplier.
