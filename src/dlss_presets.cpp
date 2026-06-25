@@ -28,7 +28,7 @@ static std::thread s_poll_thread;
 static const char* PresetValueToLetter(NvU32 val) {
     static char buf[16];
     if (val == 0) return "-";
-    if (val == 0x00FFFFFF) return "Latest";
+    if (val == 0x00FFFFFF || val == 0x00FFFFFE || val == 0xFFFFFFFF) return "Auto";
     if (val >= 1 && val <= 26) {
         buf[0] = 'A' + static_cast<char>(val - 1);
         buf[1] = '\0';
@@ -104,14 +104,14 @@ static void DoPoll() {
         NvAPI_DRS_DestroySession(hSession);
         hSession = nullptr;
 
-        if (sr_preset > 0) strncpy(s_presets.sr, PresetValueToLetter(sr_preset), 3);
-        else strncpy(s_presets.sr, "-", 3);
+        if (sr_preset > 0) { strncpy(s_presets.sr, PresetValueToLetter(sr_preset), 7); s_presets.sr[7] = '\0'; }
+        else { strncpy(s_presets.sr, "-", 7); s_presets.sr[7] = '\0'; }
 
-        if (rr_preset > 0) strncpy(s_presets.rr, PresetValueToLetter(rr_preset), 3);
-        else strncpy(s_presets.rr, "-", 3);
+        if (rr_preset > 0) { strncpy(s_presets.rr, PresetValueToLetter(rr_preset), 7); s_presets.rr[7] = '\0'; }
+        else { strncpy(s_presets.rr, "-", 7); s_presets.rr[7] = '\0'; }
 
-        if (fg_preset > 0) strncpy(s_presets.fg, PresetValueToLetter(fg_preset), 3);
-        else strncpy(s_presets.fg, "-", 3);
+        if (fg_preset > 0) { strncpy(s_presets.fg, PresetValueToLetter(fg_preset), 7); s_presets.fg[7] = '\0'; }
+        else { strncpy(s_presets.fg, "-", 7); s_presets.fg[7] = '\0'; }
 
         s_presets.mfg_generation_factor = static_cast<int>(mfg_factor);
         s_presets.mfg_mode_override = static_cast<int>(mfg_mode);

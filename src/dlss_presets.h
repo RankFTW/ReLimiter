@@ -4,9 +4,9 @@
 // Polls every 5 seconds. Returns preset letters for SR/RR/FG.
 
 struct DLSSPresets {
-    char sr[4];  // e.g. "M", "-", "A"
-    char rr[4];
-    char fg[4];
+    char sr[8];  // e.g. "M", "-", "A", "Auto"
+    char rr[8];
+    char fg[8];
     bool available;
     int mfg_generation_factor;  // DRS 0x104D6667: 0=app-controlled, 1=2x, 2=3x, 3=4x, 4=5x, 5=6x
     int mfg_mode_override;      // DRS 0x10308298: 0=Off, 2=Fixed, 4=Dynamic

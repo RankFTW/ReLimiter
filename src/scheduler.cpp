@@ -204,6 +204,9 @@ void OnMarker(uint64_t frameID, int64_t now) {
         // Pure passthrough — no pacing, just record telemetry.
         g_predictor.OnEnforcement(frameID, ts);
 
+        // Feed the Reflex ring scan so GPU timing atomics are populated for telemetry.
+        DrainCorrelator(false, 0.0);
+
         double jitter = (telemetry_ft > 0.0 && s_prev_actual_ft > 0.0)
             ? std::abs(telemetry_ft - s_prev_actual_ft) : 0.0;
         s_prev_actual_ft = telemetry_ft;
@@ -221,6 +224,10 @@ void OnMarker(uint64_t frameID, int64_t now) {
         row.jitter_us = jitter;
         row.predictor_warm = (g_predictor.frame_times_us.Size() >= 8) ? 1 : 0;
         row.smoothness_us = g_smoothness_us.load(std::memory_order_relaxed);
+        row.reflex_gpu_active_us = g_reflex_gpu_active_us.load(std::memory_order_relaxed);
+        row.reflex_ai_frame_time_us = g_reflex_ai_frame_time_us.load(std::memory_order_relaxed);
+        row.reflex_cpu_latency_us = g_reflex_cpu_latency_us.load(std::memory_order_relaxed);
+        row.reflex_present_duration_us = g_reflex_present_duration_us.load(std::memory_order_relaxed);
         row.api = (SwapMgr_GetActiveAPI() == ActiveAPI::Vulkan) ? 1
                 : (SwapMgr_GetActiveAPI() == ActiveAPI::DX11) ? 2
                 : (SwapMgr_GetActiveAPI() == ActiveAPI::OpenGL) ? 3 : 0;

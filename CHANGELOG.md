@@ -1,6 +1,14 @@
 # Changelog
 
 
+## 3.2.9
+
+### OSD
+- **Fixed DLSS preset showing gibberish for "Latest Recommended"** — Now correctly shows "Auto" for SR, RR, and FG when Latest Recommended is selected in the driver profile.
+- **Dynamic MFG shows target FPS on OSD** — The FG label now shows your configured target from the driver profile (e.g., "FG: Dynamic 6x [300]").
+- **Dynamic MFG telemetry improved** — CSV recording now includes GPU render time and FG overhead when in Dynamic MFG passthrough mode.
+
+
 ## 3.2.8
 
 ### Frame Generation

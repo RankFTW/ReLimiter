@@ -2024,13 +2024,23 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                         display_mult = presets_dmfg.mfg_generation_factor + 1;
                 }
 
-                int cap = g_user_target_fps.load(std::memory_order_relaxed);
-                if (cap > 0 && display_mult >= 2)
-                    snprintf(buf, sizeof(buf), "FG: Dynamic %dx [Cap: %d]", display_mult, cap);
-                else if (cap > 0)
-                    snprintf(buf, sizeof(buf), "FG: Dynamic [Cap: %d]", cap);
+                // Show DRS target FPS on OSD when set
+                DLSSPresets presets_osd = DLSSPresets_Get();
+                int drs_target = presets_osd.mfg_dynamic_target_fps;
+                int display_cap = 0;
+                if (drs_target == 0x01000000) {
+                    double ceil = g_ceiling_hz.load(std::memory_order_relaxed);
+                    display_cap = (ceil > 1.0) ? static_cast<int>(ceil - (ceil * ceil / 3600.0)) : 0;
+                } else if (drs_target > 0) {
+                    display_cap = drs_target;
+                }
+
+                if (display_cap > 0 && display_mult >= 2)
+                    snprintf(buf, sizeof(buf), "FG: Dynamic %dx [%d]", display_mult, display_cap);
                 else if (display_mult >= 2)
                     snprintf(buf, sizeof(buf), "FG: Dynamic %dx", display_mult);
+                else if (display_cap > 0)
+                    snprintf(buf, sizeof(buf), "FG: Dynamic [%d]", display_cap);
                 else
                     snprintf(buf, sizeof(buf), "FG: Dynamic");
             } else {
