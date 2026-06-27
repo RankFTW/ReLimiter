@@ -118,6 +118,11 @@ struct Config {
     // NGX hook installation from inside LoadLibrary hooks. Required for games
     // like Neverness to Everness where these hooks break FG/RR.
     bool streamline_compat = true;
+
+    // DLSS Info Hooks — enable NGX CreateFeature/EvaluateFeature interception
+    // for DLSS quality, resolution, and feature detection on the OSD.
+    // Disable if experiencing crashes related to DLSS pipeline.
+    bool dlss_info_hooks = true;
 };
 
 extern Config g_config;

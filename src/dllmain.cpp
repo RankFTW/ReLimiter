@@ -440,7 +440,8 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(on_set_fullscreen_state);
         RegisterOSD();
         HWMonitor_Init();
-        NGXHooks_Init();
+        if (g_config.dlss_info_hooks) NGXHooks_Init();
+        else LOG_WARN("DLSS info hooks disabled by user config");
         Blackout_Init();
         LOG_INFO("ReShade events + OSD registered");
 

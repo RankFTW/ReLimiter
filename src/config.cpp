@@ -216,6 +216,9 @@ void LoadConfig(HMODULE hModule) {
     // Streamline Compatibility
     g_config.streamline_compat       = ReadINIBool(S, "streamline_compat", false, P);
 
+    // DLSS Info Hooks
+    g_config.dlss_info_hooks         = ReadINIBool(S, "dlss_info_hooks", true, P);
+
     LOG_INFO("Config: values read, calling ApplyConfig...");
     ValidateConfig();
 
@@ -271,59 +274,46 @@ void SaveConfig() {
     const char* S = "FrameLimiter";
     const char* P = s_ini_path;
 
+    // ── Core ──
     WriteINIInt(S, "target_fps", g_config.target_fps, P);
+    WriteINIInt(S, "background_fps", g_config.background_fps, P);
+    WriteINIInt(S, "fg_off_fps", g_config.fg_off_fps, P);
+    WriteINIString(S, "vsync_mode", g_config.vsync_mode.c_str(), P);
     WriteINIString(S, "enforcement_marker", g_config.enforcement_marker.c_str(), P);
     WriteINIDouble(S, "initial_wake_guard_us", g_config.initial_wake_guard_us, P);
+
+    // ── Screen ──
+    WriteINIString(S, "window_mode", g_config.window_mode.c_str(), P);
+    WriteINIBool(S, "fake_fullscreen", g_config.fake_fullscreen, P);
+    WriteINIInt(S, "selected_monitor", g_config.selected_monitor, P);
+    WriteINIBool(S, "focus_lock", g_config.focus_lock, P);
+
+    // ── OSD ──
     WriteINIBool(S, "osd_enabled", g_config.osd_enabled, P);
     WriteINIDouble(S, "osd_x", g_config.osd_x, P);
     WriteINIDouble(S, "osd_y", g_config.osd_y, P);
     WriteINIDouble(S, "osd_opacity", g_config.osd_opacity, P);
-    WriteINIString(S, "osd_toggle_key", g_config.osd_toggle_key.c_str(), P);
-    // Preset cycling keybinds: write to shared file when shared_presets is on
-    if (g_config.shared_presets) {
-        const char* SP = GetPresetsINIPath();
-        if (SP[0] != '\0') {
-            WriteINIString("Presets", "prev_key", g_config.osd_preset_prev_key.c_str(), SP);
-            WriteINIString("Presets", "next_key", g_config.osd_preset_next_key.c_str(), SP);
-        }
-    } else {
-        WriteINIString(S, "osd_preset_prev_key", g_config.osd_preset_prev_key.c_str(), P);
-        WriteINIString(S, "osd_preset_next_key", g_config.osd_preset_next_key.c_str(), P);
-    }
-    WriteINIBool(S, "osd_show_fps", g_config.osd_show_fps, P);
-    WriteINIBool(S, "osd_show_frametime", g_config.osd_show_frametime, P);
-    WriteINIBool(S, "osd_show_frametime_graph", g_config.osd_show_frametime_graph, P);
-    WriteINIBool(S, "osd_show_fg", g_config.osd_show_fg, P);
-    WriteINIBool(S, "osd_show_limiter", g_config.osd_show_limiter, P);
-    WriteINIBool(S, "osd_show_pqi", g_config.osd_show_pqi, P);
-    WriteINIBool(S, "osd_show_cpu_latency", g_config.osd_show_cpu_latency, P);
-    WriteINIBool(S, "osd_show_pqi_breakdown", g_config.osd_show_pqi_breakdown, P);
-    WriteINIBool(S, "osd_show_1pct_low", g_config.osd_show_1pct_low, P);
-    WriteINIBool(S, "osd_show_smoothness", g_config.osd_show_smoothness, P);
     WriteINIDouble(S, "osd_scale", g_config.osd_scale, P);
     WriteINIBool(S, "osd_drop_shadow", g_config.osd_drop_shadow, P);
     WriteINIDouble(S, "osd_text_brightness", g_config.osd_text_brightness, P);
-    WriteINIString(S, "window_mode", g_config.window_mode.c_str(), P);
-    WriteINIBool(S, "fake_fullscreen", g_config.fake_fullscreen, P);
-    WriteINIInt(S, "background_fps", g_config.background_fps, P);
-    WriteINIInt(S, "fg_off_fps", g_config.fg_off_fps, P);
-    WriteINIString(S, "vsync_mode", g_config.vsync_mode.c_str(), P);
-    WriteINIString(S, "log_level", g_config.log_level.c_str(), P);
-    WriteINIBool(S, "csv_enabled", g_config.csv_enabled, P);
-    WriteINIBool(S, "reflex_inject", g_config.reflex_inject, P);
-    WriteINIBool(S, "flip_model_override", g_config.flip_model_override, P);
-    WriteINIBool(S, "shared_presets", g_config.shared_presets, P);
-    WriteINIBool(S, "dynamic_mfg_passthrough", g_config.dynamic_mfg_passthrough, P);
-    WriteINIInt(S, "dmfg_output_cap", g_config.dmfg_output_cap, P);
-    WriteINIBool(S, "adaptive_smoothing", g_config.adaptive_smoothing, P);
-    WriteINIDouble(S, "smoothing_percentile", g_config.smoothing_percentile, P);
-    WriteINIString(S, "smoothing_window", g_config.smoothing_window.c_str(), P);
-    WriteINIDouble(S, "smoothing_bias_us", g_config.smoothing_bias_us, P);
-    WriteINIBool(S, "osd_show_adaptive_smoothing", g_config.osd_show_adaptive_smoothing, P);
+    WriteINIString(S, "osd_toggle_key", g_config.osd_toggle_key.c_str(), P);
+
+    // ── OSD Elements ──
+    WriteINIBool(S, "osd_show_fps", g_config.osd_show_fps, P);
+    WriteINIBool(S, "osd_show_frametime", g_config.osd_show_frametime, P);
+    WriteINIBool(S, "osd_show_frametime_graph", g_config.osd_show_frametime_graph, P);
+    WriteINIBool(S, "osd_show_1pct_low", g_config.osd_show_1pct_low, P);
     WriteINIBool(S, "osd_show_0_1pct_low", g_config.osd_show_0_1pct_low, P);
+    WriteINIBool(S, "osd_show_cpu_latency", g_config.osd_show_cpu_latency, P);
     WriteINIBool(S, "osd_show_gpu_render_time", g_config.osd_show_gpu_render_time, P);
     WriteINIBool(S, "osd_show_total_frame_cost", g_config.osd_show_total_frame_cost, P);
     WriteINIBool(S, "osd_show_fg_time", g_config.osd_show_fg_time, P);
+    WriteINIBool(S, "osd_show_pqi", g_config.osd_show_pqi, P);
+    WriteINIBool(S, "osd_show_pqi_breakdown", g_config.osd_show_pqi_breakdown, P);
+    WriteINIBool(S, "osd_show_smoothness", g_config.osd_show_smoothness, P);
+    WriteINIBool(S, "osd_show_fg", g_config.osd_show_fg, P);
+    WriteINIBool(S, "osd_show_limiter", g_config.osd_show_limiter, P);
+    WriteINIBool(S, "osd_show_adaptive_smoothing", g_config.osd_show_adaptive_smoothing, P);
     WriteINIBool(S, "osd_show_gpu_temp", g_config.osd_show_gpu_temp, P);
     WriteINIBool(S, "osd_show_gpu_clock", g_config.osd_show_gpu_clock, P);
     WriteINIBool(S, "osd_show_gpu_usage", g_config.osd_show_gpu_usage, P);
@@ -336,28 +326,40 @@ void SaveConfig() {
     WriteINIBool(S, "osd_show_dlss_presets", g_config.osd_show_dlss_presets, P);
     WriteINIBool(S, "osd_show_dlss_versions", g_config.osd_show_dlss_versions, P);
 
-    // Monitor Blackout keybind: write to shared file when shared_presets is on
+    // ── OSD Presets & Keybinds ──
+    WriteINIBool(S, "shared_presets", g_config.shared_presets, P);
     if (g_config.shared_presets) {
         const char* SP = GetPresetsINIPath();
-        if (SP[0] != '\0')
+        if (SP[0] != '\0') {
+            WriteINIString("Presets", "prev_key", g_config.osd_preset_prev_key.c_str(), SP);
+            WriteINIString("Presets", "next_key", g_config.osd_preset_next_key.c_str(), SP);
             WriteINIString("Presets", "blackout_key", g_config.blackout_key.c_str(), SP);
+        }
     } else {
+        WriteINIString(S, "osd_preset_prev_key", g_config.osd_preset_prev_key.c_str(), P);
+        WriteINIString(S, "osd_preset_next_key", g_config.osd_preset_next_key.c_str(), P);
         WriteINIString(S, "blackout_key", g_config.blackout_key.c_str(), P);
     }
 
-    // Streamline Compatibility — write "force_false" when proactive hooks enabled,
-    // write "true" when disabled. This persists the user's per-game choice across restarts.
-    if (!g_config.streamline_compat) {
+    // ── Adaptive Smoothing ──
+    WriteINIBool(S, "adaptive_smoothing", g_config.adaptive_smoothing, P);
+    WriteINIDouble(S, "smoothing_percentile", g_config.smoothing_percentile, P);
+    WriteINIString(S, "smoothing_window", g_config.smoothing_window.c_str(), P);
+    WriteINIDouble(S, "smoothing_bias_us", g_config.smoothing_bias_us, P);
+
+    // ── Frame Generation ──
+    WriteINIBool(S, "dynamic_mfg_passthrough", g_config.dynamic_mfg_passthrough, P);
+
+    // ── Advanced ──
+    WriteINIBool(S, "reflex_inject", g_config.reflex_inject, P);
+    WriteINIBool(S, "flip_model_override", g_config.flip_model_override, P);
+    WriteINIString(S, "log_level", g_config.log_level.c_str(), P);
+    WriteINIBool(S, "csv_enabled", g_config.csv_enabled, P);
+    WriteINIBool(S, "dlss_info_hooks", g_config.dlss_info_hooks, P);
+    if (!g_config.streamline_compat)
         WriteINIString(S, "streamline_compat", "force_false", P);
-    } else {
+    else
         WriteINIString(S, "streamline_compat", "true", P);
-    }
-
-    // Focus Lock
-    WriteINIBool(S, "focus_lock", g_config.focus_lock, P);
-
-    // Monitor Selection
-    WriteINIInt(S, "selected_monitor", g_config.selected_monitor, P);
 }
 
 void ApplyConfig() {

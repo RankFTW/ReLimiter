@@ -1159,15 +1159,40 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 "When disabled, only warnings and errors are logged. "
                 "Enable this before reporting issues.");
 
+        // DLSS Info Hooks toggle
+        ImGui::Spacing();
+        static bool s_dlss_hooks_at_launch = g_config.dlss_info_hooks;
+        bool dlss_hooks = g_config.dlss_info_hooks;
+        if (ImGui::Checkbox("DLSS Info Hooks", &dlss_hooks)) {
+            g_config.dlss_info_hooks = dlss_hooks;
+            config_dirty = true;
+        }
+        ImGui::SameLine();
+        if (dlss_hooks != s_dlss_hooks_at_launch)
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Restart required)");
+        else if (dlss_hooks)
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(Enabled)");
+        else
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "(Disabled)");
+        HelpTip("Hooks into the DLSS pipeline to read quality mode, render resolution, "
+                "and feature info for the OSD. Disable if experiencing crashes with DLSS games. "
+                "FPS cap, FG detection, and pacing are unaffected.");
+
         // Proactive Streamline Hooks toggle
         ImGui::Spacing();
+        static bool s_proactive_at_launch = !g_config.streamline_compat;
         bool proactive = !g_config.streamline_compat;
         if (ImGui::Checkbox("Proactive Streamline Hooks", &proactive)) {
             g_config.streamline_compat = !proactive;
             config_dirty = true;
         }
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Restart required)");
+        if (proactive != s_proactive_at_launch)
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Restart required)");
+        else if (proactive)
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(Enabled)");
+        else
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "(Disabled)");
         HelpTip("Enable per-game if Frame Generation detection is incorrect "
                 "(showing on when off, or not detecting when on). "
                 "Most games don't need this — only enable if FG pacing info is missing or wrong. "
@@ -1766,7 +1791,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         static int s_ngx_retry_counter = 0;
         if (s_ngx_retry_counter < 5000) {  // ~30s at 165fps
             s_ngx_retry_counter++;
-            if (s_ngx_retry_counter % 60 == 0)
+            if (s_ngx_retry_counter % 60 == 0 && g_config.dlss_info_hooks)
                 NGXHooks_TryInstall();
         }
     }

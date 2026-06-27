@@ -1,6 +1,15 @@
 # Changelog
 
 
+## 3.3.0
+
+### UI
+- **DLSS Info Hooks toggle** — New option in Advanced to disable NGX pipeline hooks if they cause crashes in certain games. When off, DLSS quality/resolution/features are hidden from the OSD but FPS cap, FG detection, and pacing continue to work normally. On by default.
+- **Improved status labels** — "Proactive Streamline Hooks" and "DLSS Info Hooks" now show "(Enabled)", "(Disabled)", or "(Restart required)" based on actual state rather than always showing restart required.
+- **INI file reorganized** — Settings are now written in logical groups (Core, Screen, OSD, Adaptive Smoothing, Frame Generation, Advanced) for easier manual editing.
+- **Removed stale dmfg_output_cap from INI** — This unused setting is no longer written to the config file.
+
+
 ## 3.2.9
 
 ### OSD
