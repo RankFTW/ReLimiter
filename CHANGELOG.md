@@ -1,6 +1,13 @@
 # Changelog
 
 
+## 3.3.1
+
+### Bug Fixes
+- **Fixed Keep Game Focused not working until toggled off/on** — In DX11 games with splash screens or launchers, Focus Lock was installing on the wrong window. Now automatically re-installs when the game window changes.
+- **Fixed Background FPS and FG-Off caps not working in Dynamic MFG mode** — Both caps now correctly apply when using driver-level Dynamic MFG. Background cap activates when alt-tabbed, FG-Off cap activates when Frame Generation disables in menus.
+
+
 ## 3.3.0
 
 ### UI

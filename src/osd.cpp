@@ -137,10 +137,16 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     // Dirty flag — set by any config change, triggers SaveConfig at end of frame
     bool config_dirty = false;
 
-    // Lazy install focus lock if enabled in config but not yet installed
-    if (g_config.focus_lock && !FocusLock_IsActive()) {
+    // Lazy install focus lock if enabled in config but not yet installed,
+    // or re-install if the swapchain HWND has changed (DX11 launcher → game window).
+    if (g_config.focus_lock) {
         HWND hwnd = SwapMgr_GetHWND();
-        if (hwnd) FocusLock_Install(hwnd);
+        static HWND s_focus_lock_hwnd = nullptr;
+        if (hwnd && hwnd != s_focus_lock_hwnd) {
+            if (FocusLock_IsActive()) FocusLock_Remove();
+            FocusLock_Install(hwnd);
+            s_focus_lock_hwnd = hwnd;
+        }
     }
 
     // ════════════════════════════════════════════

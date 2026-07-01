@@ -173,6 +173,78 @@ void OnMarker(uint64_t frameID, int64_t now) {
 
         CheckDeferredFGInference();
 
+        // ── DMFG Background FPS cap ──
+        {
+            HWND ref_hwnd = SwapMgr_GetHWND();
+            bool focused = false;
+            if (ref_hwnd) {
+                HWND fg = FocusLock_RealGetForegroundWindow();
+                DWORD fg_pid = 0;
+                if (fg) GetWindowThreadProcessId(fg, &fg_pid);
+                focused = (fg_pid == GetCurrentProcessId());
+            } else {
+                HWND fg = FocusLock_RealGetForegroundWindow();
+                DWORD fg_pid = 0;
+                if (fg) GetWindowThreadProcessId(fg, &fg_pid);
+                focused = (fg_pid == GetCurrentProcessId());
+            }
+
+            if (!focused) {
+                int bg_fps = g_background_fps.load(std::memory_order_relaxed);
+                if (bg_fps > 0) {
+                    double bg_interval_us = 1000000.0 / static_cast<double>(bg_fps);
+                    LARGE_INTEGER qpc_now;
+                    QueryPerformanceCounter(&qpc_now);
+                    if (s_prev_enforcement_ts > 0) {
+                        double elapsed = qpc_to_us(qpc_now.QuadPart - s_prev_enforcement_ts);
+                        double remaining = bg_interval_us - elapsed;
+                        if (remaining > 500.0)
+                            DoOwnSleep(qpc_now.QuadPart + us_to_qpc(remaining));
+                    }
+                }
+                LARGE_INTEGER qpc_now;
+                QueryPerformanceCounter(&qpc_now);
+                s_prev_enforcement_ts = qpc_now.QuadPart;
+                s_last_enforcement_ts = qpc_now.QuadPart;
+                g_predictor.OnEnforcement(frameID, qpc_now.QuadPart);
+                return;
+            }
+        }
+
+        // ── DMFG FG-Off FPS cap ──
+        {
+            int fg_off_cap = g_fg_off_fps.load(std::memory_order_relaxed);
+            if (fg_off_cap > 0 && IsFGDllLoaded()) {
+                bool fg_is_off;
+                if (Streamline_HasModeData())
+                    fg_is_off = (g_fg_mode.load(std::memory_order_relaxed) == 0);
+                else
+                    fg_is_off = !g_fg_presenting.load(std::memory_order_relaxed);
+
+                if (fg_is_off) {
+                    double cap_interval_us = 1000000.0 / static_cast<double>(fg_off_cap);
+                    LARGE_INTEGER qpc_now;
+                    QueryPerformanceCounter(&qpc_now);
+                    if (s_prev_enforcement_ts > 0) {
+                        double elapsed = qpc_to_us(qpc_now.QuadPart - s_prev_enforcement_ts);
+                        double remaining = cap_interval_us - elapsed;
+                        if (remaining > 500.0)
+                            DoOwnSleep(qpc_now.QuadPart + us_to_qpc(remaining));
+                    }
+                    QueryPerformanceCounter(&qpc_now);
+                    if (s_prev_enforcement_ts > 0) {
+                        double ft = qpc_to_us(qpc_now.QuadPart - s_prev_enforcement_ts);
+                        if (ft > 0.0)
+                            g_actual_frame_time_us.store(ft, std::memory_order_relaxed);
+                    }
+                    s_prev_enforcement_ts = qpc_now.QuadPart;
+                    s_last_enforcement_ts = qpc_now.QuadPart;
+                    g_predictor.OnEnforcement(frameID, qpc_now.QuadPart);
+                    return;
+                }
+            }
+        }
+
         LARGE_INTEGER qpc_now;
         QueryPerformanceCounter(&qpc_now);
         int64_t ts = qpc_now.QuadPart;
