@@ -3,9 +3,19 @@
 
 ## 3.3.1
 
+### New Feature
+- **32-bit addon support (DX9/DX10)** — ReLimiter now builds `relimiter.addon32` for 32-bit games alongside the existing 64-bit addon. Supports DX9 (Source Engine, older UE3 games, emulators) and DX10 titles. Core frame limiting, VRR pacing, background FPS cap, OSD overlay, VSync override, GPU monitoring, G-Sync detection, and timer hardening all work on 32-bit. Build with `build.bat 32` or `build.bat all`.
+
 ### Bug Fixes
 - **Fixed Keep Game Focused not working until toggled off/on** — In DX11 games with splash screens or launchers, Focus Lock was installing on the wrong window. Now automatically re-installs when the game window changes.
 - **Fixed Background FPS and FG-Off caps not working in Dynamic MFG mode** — Both caps now correctly apply when using driver-level Dynamic MFG. Background cap activates when alt-tabbed, FG-Off cap activates when Frame Generation disables in menus.
+
+### 32-bit Notes
+- Features not available: DLSS info, Frame Generation detection, Reflex markers, Adaptive Smoothing, Streamline hooks
+- Focus Lock is not available on DX9 games
+- GPU monitoring (temp, clock, usage, VRAM) works via NvAPI 32-bit
+- G-Sync/VRR detection and pacing works normally
+- Place `relimiter.addon32` in the same folder as ReShade's `d3d9.dll`
 
 
 ## 3.3.0

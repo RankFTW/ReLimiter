@@ -139,6 +139,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
 
     // Lazy install focus lock if enabled in config but not yet installed,
     // or re-install if the swapchain HWND has changed (DX11 launcher → game window).
+#ifdef _WIN64
     if (g_config.focus_lock) {
         HWND hwnd = SwapMgr_GetHWND();
         static HWND s_focus_lock_hwnd = nullptr;
@@ -148,6 +149,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             s_focus_lock_hwnd = hwnd;
         }
     }
+#endif
 
     // ════════════════════════════════════════════
     // SECTION 1: FPS
@@ -1001,6 +1003,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         }
 
         // ── Focus Lock ──
+#ifdef _WIN64
         ImGui::Spacing();
         if (ImGui::Checkbox("Keep Game Focused", &g_config.focus_lock)) {
             config_dirty = true;
@@ -1019,6 +1022,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 "Audio and game logic continue running in the background. "
                 "The background FPS cap still applies independently. "
                 "May not work with all games (UWP/Game Pass titles use system-level notifications).");
+#endif
     }
 
     // ════════════════════════════════════════════
