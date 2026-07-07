@@ -37,12 +37,18 @@ static void ResolveNvAPI() {
     s_nvapi_resolved = true;
 
     // Try already-loaded first, then force-load. OpenGL games (e.g. OpenMW)
-    // don't load nvapi64.dll automatically — unlike DX11/DX12 where the
+    // don't load nvapi automatically — unlike DX11/DX12 where the
     // NVIDIA driver loads it. Without it, display resolution fails and
     // G-Sync state can't be queried.
+#ifdef _WIN64
     HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
     if (!nvapi)
         nvapi = LoadLibraryW(L"nvapi64.dll");
+#else
+    HMODULE nvapi = GetModuleHandleW(L"nvapi.dll");
+    if (!nvapi)
+        nvapi = LoadLibraryW(L"nvapi.dll");
+#endif
     if (!nvapi) return;
 
     s_NvAPI_QueryInterface = reinterpret_cast<void*(*)(NvU32)>(
@@ -184,7 +190,7 @@ void DispRes_OnSwapchainInit(uint64_t native_handle, ActiveAPI api, HWND hwnd) {
 
     if (api == ActiveAPI::DX11 || api == ActiveAPI::DX12) {
         new_id = ResolveDXPath(native_handle, hwnd);
-    } else if (api == ActiveAPI::Vulkan || api == ActiveAPI::OpenGL) {
+    } else if (api == ActiveAPI::DX9 || api == ActiveAPI::Vulkan || api == ActiveAPI::OpenGL) {
         new_id = ResolveVulkanPath(hwnd);
     }
 

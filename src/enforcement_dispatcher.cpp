@@ -47,6 +47,7 @@ static EnforcementPath SelectPath(ActiveAPI api) {
                 return EnforcementPath::PCLMarkers;
             return EnforcementPath::PresentBased;
 
+        case ActiveAPI::DX9:
         case ActiveAPI::DX11:
             return EnforcementPath::PresentBased;
 

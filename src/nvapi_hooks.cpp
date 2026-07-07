@@ -238,10 +238,14 @@ NV_SET_SLEEP_MODE_PARAMS* NvAPI_GetGameSleepParams() {
 // ── Installation ──
 // NvAPI functions are accessed via NvAPI_QueryInterface with known IDs.
 // The caller (dllmain) resolves the addresses and passes them here,
-// or we resolve them ourselves from nvapi64.dll.
+// or we resolve them ourselves from nvapi64.dll / nvapi.dll.
 
 void InstallNvAPIHooks() {
+#ifdef _WIN64
     HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
+#else
+    HMODULE nvapi = GetModuleHandleW(L"nvapi.dll");
+#endif
     if (!nvapi) return;
 
     // NvAPI_QueryInterface is the single export used to get all NvAPI functions

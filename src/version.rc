@@ -9,7 +9,11 @@
 #define VER_PRODUCT "ReLimiter"
 #define VER_DESCRIPTION "G-Sync/VRR Frame Pacing Addon for ReShade"
 #define VER_COPYRIGHT "RankFTW, Lazorr, UltraMatt"
+#ifdef _WIN64
 #define VER_FILENAME "relimiter.addon64"
+#else
+#define VER_FILENAME "relimiter.addon32"
+#endif
 
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION    VER_MAJOR, VER_MINOR, VER_PATCH, VER_BUILD

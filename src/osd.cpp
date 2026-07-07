@@ -305,6 +305,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     HelpTip("FPS cap when the game window loses focus. 0 = uncapped. Minimum is 20.");
 
     ImGui::Spacing();
+#ifdef _WIN64
     static int s_fgoff_edit = g_fg_off_fps.load(std::memory_order_relaxed);
     static bool s_fgoff_active = false;
     if (!s_fgoff_active)
@@ -323,6 +324,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         config_dirty = true;
     }
     HelpTip("FPS cap when Frame Generation is disabled (menus, pauses). 0 = off. Prevents GPU ramp-up on uncapped non-FG frames.");
+#endif
 
     ImGui::Spacing();
     {
@@ -741,6 +743,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         HelpTip("Show a rolling graph of recent frame times.");
 
         ImGui::Spacing();
+#ifdef _WIN64
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Latency");
         if (ImGui::Checkbox("CPU Latency##osd_elem", &g_config.osd_show_cpu_latency)) config_dirty = true;
         HelpTip("CPU pipeline time: SIM_START to RENDERSUBMIT_END. Measures how long the CPU spends on simulation + render submission.");
@@ -753,6 +756,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         FlowSeparator();
         if (ImGui::Checkbox("FG Time##osd_elem", &g_config.osd_show_fg_time)) config_dirty = true;
         HelpTip("DLSS Frame Generation time. Only appears when FG is active. Shows the FG overhead per frame. DX12+Reflex only.");
+#endif
 
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "Quality");
@@ -769,6 +773,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         if (ImGui::Checkbox("Smoothness##osd_elem", &g_config.osd_show_smoothness)) config_dirty = true;
         HelpTip("Frame interval deviation from target in milliseconds. Lower = smoother. Green < 0.5ms, yellow < 1.5ms, red above. EMA-smoothed, skips loading screen outliers.");
 
+#ifdef _WIN64
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Pipeline");
         if (ImGui::Checkbox("Frame Generation##osd_elem", &g_config.osd_show_fg)) config_dirty = true;
@@ -776,6 +781,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         FlowSeparator();
         if (ImGui::Checkbox("Limiter / Tier##osd_elem", &g_config.osd_show_limiter)) config_dirty = true;
         HelpTip("Show how much time the limiter added and the current degradation tier (T0=full, T4=suspended).");
+#endif
 
         {
         NGXDLSSInfo dlss_check = NGXHooks_GetInfo();
@@ -1099,6 +1105,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     // ════════════════════════════════════════════
     ImGui::Separator();
     if (ImGui::CollapsingHeader("Advanced")) {
+#ifdef _WIN64
         // Reflex Injection toggle
         bool inject = g_config.reflex_inject;
         if (ImGui::Checkbox("Inject Reflex Markers", &inject)) {
@@ -1146,6 +1153,8 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
 
         // Telemetry Logging toggle
         ImGui::Spacing();
+#endif // _WIN64
+
         bool csv = g_config.csv_enabled;
         if (ImGui::Checkbox("Telemetry Logging", &csv)) {
             g_config.csv_enabled = csv;
@@ -1165,6 +1174,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 "When disabled, only warnings and errors are logged. "
                 "Enable this before reporting issues.");
 
+#ifdef _WIN64
         // DLSS Info Hooks toggle
         ImGui::Spacing();
         static bool s_dlss_hooks_at_launch = g_config.dlss_info_hooks;
@@ -1204,6 +1214,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 "Most games don't need this — only enable if FG pacing info is missing or wrong. "
                 "May break FG in some games if enabled unnecessarily. "
                 "Requires a game restart to take effect.");
+#endif // _WIN64
 
     }
 
@@ -1279,9 +1290,11 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         const char* api_name = "None";
         if (api == ActiveAPI::DX12) api_name = "DX12";
         else if (api == ActiveAPI::DX11) api_name = "DX11";
+        else if (api == ActiveAPI::DX9) api_name = "DX9";
         else if (api == ActiveAPI::Vulkan) api_name = "Vulkan";
         else if (api == ActiveAPI::OpenGL) api_name = "OpenGL";
 
+#ifdef _WIN64
         bool native_reflex = (g_dev != nullptr) || AreNvAPIMarkersFlowing();
         bool pcl_markers = PCL_MarkersFlowing();
         const char* reflex_str = "None";
@@ -1293,12 +1306,15 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         if (native_reflex) enforce_mode = "Marker (SIM_START)";
         else if (pcl_markers) enforce_mode = "PCL (SIM_START)";
         else if (ReflexInject_IsActive()) enforce_mode = "Injected (Present)";
-        else if (api == ActiveAPI::DX11 || api == ActiveAPI::Vulkan || api == ActiveAPI::OpenGL) enforce_mode = "Present";
+        else if (api == ActiveAPI::DX9 || api == ActiveAPI::DX11 || api == ActiveAPI::Vulkan || api == ActiveAPI::OpenGL) enforce_mode = "Present";
 
-        ImGui::Text("API: %s  |  Reflex: %s  |  Streamline: %s",
+        ImGui::Text("API: %s (64-bit)  |  Reflex: %s  |  Streamline: %s",
                     api_name, reflex_str, IsStreamlinePresent() ? "Yes" : "No");
         ImGui::Text("Enforce: %s%s", enforce_mode,
                     FlipModel_WasApplied() ? "  |  Flip Model: Active" : "");
+#else
+        ImGui::Text("API: %s (32-bit)  |  Enforce: Present", api_name);
+#endif
 
         bool gsync = g_gsync_active.load(std::memory_order_relaxed);
         PacingMode mode = g_pacing_mode.load(std::memory_order_relaxed);
@@ -1306,6 +1322,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                     gsync ? "Active" : "Off",
                     mode == PacingMode::VRR ? "VRR" : "Fixed");
 
+#ifdef _WIN64
         // FG pacing status
         int fg_div_raw = ComputeFGDivisorRaw();
         if (IsDmfgActive()) {
@@ -1318,10 +1335,10 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             if (IsNvSmoothMotionActive())
                 ImGui::Text("  (NVIDIA Smooth Motion detected)");
         }
+#endif
 
         // Pipeline health — wired to real checks
         bool sim_ok = AreMarkersFlowing();
-        bool render_ok = IsCorrelatorValid() && IsDXGIStatsFresh();
         bool present_ok = IsSwapchainValid();
 
         ImVec4 col_ok = ImVec4(0.2f, 0.9f, 0.2f, 1.0f);
@@ -1334,10 +1351,16 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         ImGui::SameLine();
         ImGui::Text("|");
         ImGui::SameLine();
+#ifdef _WIN64
         if (IsDmfgActive())
             ImGui::TextColored(col_na, "RENDER n/a");
-        else
+        else {
+            bool render_ok = IsCorrelatorValid() && IsDXGIStatsFresh();
             ImGui::TextColored(render_ok ? col_ok : col_bad, "RENDER %s", render_ok ? "ok" : "X");
+        }
+#else
+        ImGui::TextColored(col_na, "RENDER n/a");
+#endif
         ImGui::SameLine();
         ImGui::Text("|");
         ImGui::SameLine();
@@ -2035,6 +2058,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         // ═══════════════════════════════════
         // PIPELINE (light blue)
         // ═══════════════════════════════════
+#ifdef _WIN64
         if (g_config.osd_show_fg) {
             char buf[48];
             if (IsNvSmoothMotionActive()) {
@@ -2102,6 +2126,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                 OSDTextColored(col, buf);
             }
         }
+#endif // _WIN64 (Pipeline section: FG, Limiter, Adaptive Smoothing)
 
         // ═══════════════════════════════════
         // DLSS (green — NGX feature info)

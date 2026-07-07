@@ -1,7 +1,10 @@
 #pragma once
 
-#include "rolling_window.h"
 #include <atomic>
+
+#ifdef _WIN64
+
+#include "rolling_window.h"
 
 // Adaptive smoothing: tracks render time distribution and computes a P99-based
 // offset to extend effective_interval, keeping 99% of frames slightly longer
@@ -57,8 +60,33 @@ struct AdaptiveSmoothing {
     void SetConfig(bool dual, double percentile, bool enable);
 };
 
+#else // 32-bit stub
+
+struct AdaptiveSmoothing {
+    double smoothed_offset_us = 0.0;
+    double raw_p99_us = 0.0;
+    bool   dual_mode = false;
+    double target_percentile = 0.99;
+    bool   enabled = false;
+
+    double Update(double, double) { return 0.0; }
+    void SoftReset() {}
+    void Reset() {}
+    double GetOffset() const { return 0.0; }
+    double GetP99()    const { return 0.0; }
+    bool   IsWarm()    const { return false; }
+    void SetConfig(bool, double, bool) {}
+};
+
+#endif // _WIN64
+
 // Published for OSD consumption (relaxed atomics, written from render thread)
+#ifdef _WIN64
 extern std::atomic<double> g_smoothing_offset_us;
 extern std::atomic<double> g_smoothing_p99_us;
-
 extern AdaptiveSmoothing g_adaptive_smoothing;
+#else
+inline std::atomic<double> g_smoothing_offset_us{0.0};
+inline std::atomic<double> g_smoothing_p99_us{0.0};
+inline AdaptiveSmoothing g_adaptive_smoothing{};
+#endif

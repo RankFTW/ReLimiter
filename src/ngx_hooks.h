@@ -39,6 +39,8 @@ struct NGXDLSSInfo {
     char sl_version[24] = {};      // from sl.common.dll
 };
 
+#ifdef _WIN64
+
 // Try to install NGX hooks. Scans multiple DLLs (_nvngx.dll, nvngx.dll,
 // nvngx_dlss.dll, etc.). Safe to call multiple times — no-ops after first success.
 void NGXHooks_Init();
@@ -65,3 +67,15 @@ void NGXHooks_ClearFGCreated();
 // Used by Streamline hooks to avoid revoking g_fg_presenting immediately
 // after CreateFeature sets it — some games call CreateFeature every frame.
 bool NGXHooks_InFGCreateCooldown();
+
+#else // 32-bit stubs — NGX/DLSS is 64-bit only
+
+inline void NGXHooks_Init() {}
+inline void NGXHooks_TryInstall() {}
+inline void NGXHooks_Shutdown() {}
+inline NGXDLSSInfo NGXHooks_GetInfo() { return {}; }
+inline bool NGXHooks_IsFGCreated() { return false; }
+inline void NGXHooks_ClearFGCreated() {}
+inline bool NGXHooks_InFGCreateCooldown() { return false; }
+
+#endif // _WIN64

@@ -8,7 +8,7 @@
 // Sole owner of swapchain state — all other modules query through these accessors.
 // No extern globals; all state is file-static in swapchain_manager.cpp.
 
-enum class ActiveAPI : uint8_t { None, DX11, DX12, Vulkan, OpenGL };
+enum class ActiveAPI : uint8_t { None, DX9, DX11, DX12, Vulkan, OpenGL };
 
 // ── Lifecycle — called from ReShade event callbacks in dllmain.cpp ──
 

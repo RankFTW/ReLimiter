@@ -7,6 +7,8 @@
 // Streamline/DLSS-G interception.
 // Hooks slGetFeatureFunction to intercept SetOptions and GetState.
 
+#ifdef _WIN64
+
 // FG state — read by scheduler
 extern std::atomic<int>  g_fg_multiplier;  // raw numFramesToGenerate
 extern std::atomic<bool> g_fg_active;
@@ -50,3 +52,24 @@ void StreamlineCompat_Poll();
 // When false, g_fg_mode is unreliable (stays at 0) and g_fg_presenting
 // should be used as the FG state authority instead.
 bool Streamline_HasModeData();
+
+#else // 32-bit stubs — FG/Streamline/DLSS are 64-bit only
+
+// Provide the same atomics as zero-initialized globals so shared code compiles
+inline std::atomic<int>      g_fg_multiplier{0};
+inline std::atomic<bool>     g_fg_active{false};
+inline std::atomic<bool>     g_fg_presenting{false};
+inline std::atomic<int>      g_fg_mode{0};
+inline std::atomic<uint32_t> g_game_requested_latency{0};
+inline std::atomic<int>      g_fg_actual_multiplier{0};
+
+inline void HookStreamlinePCL(HMODULE) {}
+inline void CheckDeferredFGInference() {}
+inline bool IsFGDllLoaded() { return false; }
+inline bool IsDmfgSession() { return false; }
+inline bool IsDmfgActive() { return false; }
+inline bool IsNvSmoothMotionActive() { return false; }
+inline void StreamlineCompat_Poll() {}
+inline bool Streamline_HasModeData() { return false; }
+
+#endif // _WIN64

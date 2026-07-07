@@ -217,7 +217,11 @@ void LoadConfig(HMODULE hModule) {
     g_config.streamline_compat       = ReadINIBool(S, "streamline_compat", false, P);
 
     // DLSS Info Hooks
+#ifdef _WIN64
     g_config.dlss_info_hooks         = ReadINIBool(S, "dlss_info_hooks", true, P);
+#else
+    g_config.dlss_info_hooks         = false;  // NGX/DLSS doesn't exist on 32-bit
+#endif
 
     LOG_INFO("Config: values read, calling ApplyConfig...");
     ValidateConfig();

@@ -45,6 +45,7 @@ static bool    s_addon_initialised = false;
 // ── Crash handler ──
 static LPTOP_LEVEL_EXCEPTION_FILTER s_prev_filter = nullptr;
 
+#ifdef _WIN64
 static void LogCrashModule(DWORD64 addr) {
     HMODULE hMod = nullptr;
     if (GetModuleHandleExA(
@@ -80,14 +81,21 @@ static void LogStackTrace(EXCEPTION_POINTERS* ep) {
         LogCrashModule(ctx.Rip);
     }
 }
+#endif // _WIN64
 
 static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
+#ifdef _WIN64
     DWORD64 fault_addr = reinterpret_cast<DWORD64>(ep->ExceptionRecord->ExceptionAddress);
     LOG_ERROR("CRASH: exception 0x%08X at 0x%llX",
               ep->ExceptionRecord->ExceptionCode, fault_addr);
     LogCrashModule(fault_addr);
     __try { LogStackTrace(ep); }
     __except(EXCEPTION_EXECUTE_HANDLER) {}
+#else
+    DWORD fault_addr = reinterpret_cast<DWORD>(ep->ExceptionRecord->ExceptionAddress);
+    LOG_ERROR("CRASH: exception 0x%08X at 0x%08X",
+              ep->ExceptionRecord->ExceptionCode, fault_addr);
+#endif
     Log_Shutdown();
     if (s_prev_filter) return s_prev_filter(ep);
     return EXCEPTION_CONTINUE_SEARCH;
@@ -278,6 +286,8 @@ static void on_present(reshade::api::command_queue* queue,
         reshade::api::device* present_dev = sc->get_device();
         if (present_dev) {
             switch (present_dev->get_api()) {
+                case reshade::api::device_api::d3d9:   api = ActiveAPI::DX9;   break;
+                case reshade::api::device_api::d3d10:  api = ActiveAPI::DX11;  break;  // DX10 uses DXGI
                 case reshade::api::device_api::d3d11:  api = ActiveAPI::DX11;  break;
                 case reshade::api::device_api::d3d12:  api = ActiveAPI::DX12;  break;
                 case reshade::api::device_api::vulkan: api = ActiveAPI::Vulkan; break;
@@ -288,13 +298,12 @@ static void on_present(reshade::api::command_queue* queue,
         if (api == ActiveAPI::None)
             api = SwapMgr_GetActiveAPI(); // fallback to cached if device unavailable
 
-        // Vulkan native handles are VkSwapchainKHR — NOT IDXGISwapChain*.
-        // Casting them to IDXGISwapChain* and storing in g_presenting_swapchain
-        // causes the correlator to call GetFrameStatistics on a Vulkan handle
-        // (instant failure), and ReflexInject to call GetDevice on garbage
-        // (crash or silent corruption). Skip DXGI swapchain capture entirely
-        // for Vulkan/OpenGL — the correlator and Reflex injection are not used.
-        if (api != ActiveAPI::Vulkan && api != ActiveAPI::OpenGL) {
+        // DX9/Vulkan/OpenGL native handles are NOT IDXGISwapChain*.
+        // DX9 uses IDirect3DSwapChain9, Vulkan uses VkSwapchainKHR.
+        // Casting them to IDXGISwapChain* causes crashes when the correlator
+        // calls GetFrameStatistics or VSync hooks dereference COM vtables.
+        // Skip DXGI swapchain capture entirely for non-DXGI APIs.
+        if (api != ActiveAPI::DX9 && api != ActiveAPI::Vulkan && api != ActiveAPI::OpenGL) {
             auto native = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
             static ActiveAPI s_last_notified_api = ActiveAPI::None;
 
@@ -516,9 +525,18 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     case DLL_PROCESS_ATTACH:
         Log_Init(hModule, LogLevel::Info);
         LOG_INFO("DllMain ATTACH (PID=%lu, TID=%lu)", GetCurrentProcessId(), GetCurrentThreadId());
-        // Do NOT register or initialise here.
-        // ReShade will call AddonInit after LoadLibraryEx returns.
-        // If AddonInit is not called (non-ReShade host), the DLL is inert.
+        // Attempt self-registration immediately. ReShade for DX9/DX11/DX12
+        // expects addons to register during DllMain (no AddonInit callback).
+        // For Vulkan (global layer), this will fail gracefully (no ReShade
+        // module yet) and AddonInit will handle it later.
+        s_prev_filter = SetUnhandledExceptionFilter(CrashHandler);
+        if (!DoInit(hModule, nullptr)) {
+            // Not fatal — either not a ReShade host, or ReShade will call
+            // AddonInit later (Vulkan path). Reset the exception filter
+            // since we haven't initialized.
+            SetUnhandledExceptionFilter(s_prev_filter);
+            LOG_INFO("DllMain: DoInit deferred (AddonInit will handle)");
+        }
         break;
 
     case DLL_PROCESS_DETACH:

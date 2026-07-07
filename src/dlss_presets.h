@@ -13,6 +13,7 @@ struct DLSSPresets {
     int mfg_dynamic_target_fps; // DRS 0x10CF4125: 0=Off, 0x01000000=Max Refresh, or raw FPS
 };
 
+#ifdef _WIN64
 void DLSSPresets_Init();
 void DLSSPresets_Poll();  // Call periodically (e.g. from OSD draw)
 DLSSPresets DLSSPresets_Get();
@@ -21,3 +22,9 @@ DLSSPresets DLSSPresets_Get();
 // fps=0 means Off, fps>0 writes the raw FPS value to DRS 0x10CF4125.
 // Returns true on success.
 bool DLSSPresets_WriteDynamicTargetFPS(int fps);
+#else
+inline void DLSSPresets_Init() {}
+inline void DLSSPresets_Poll() {}
+inline DLSSPresets DLSSPresets_Get() { return {"", "", "", false, 0, 0, 0}; }
+inline bool DLSSPresets_WriteDynamicTargetFPS(int) { return false; }
+#endif
