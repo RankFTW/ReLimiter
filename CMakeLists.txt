@@ -4,15 +4,24 @@ project(relimiter LANGUAGES CXX C)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# ── Architecture detection ──
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(RELIMITER_64BIT TRUE)
+    set(ADDON_SUFFIX ".addon64")
+    message(STATUS "ReLimiter: building 64-bit addon")
+else()
+    set(RELIMITER_64BIT FALSE)
+    set(ADDON_SUFFIX ".addon32")
+    message(STATUS "ReLimiter: building 32-bit addon")
+endif()
+
 # ── Output ──
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-# ── Sources ──
-# Full source list with minimal dllmain to test static init freeze
+# ── Sources (shared — builds for both 32 and 64-bit) ──
 set(ADDON_SOURCES
     src/dllmain.cpp
-    src/adaptive_smoothing.cpp
     src/cadence_meter.cpp
     src/ceiling_margin.cpp
     src/config.cpp
@@ -23,19 +32,16 @@ set(ADDON_SOURCES
     src/display_state.cpp
     src/enforcement_dispatcher.cpp
     src/feedback.cpp
-    src/fg_divisor.cpp
     src/flip_metering.cpp
     src/flip_model.cpp
     src/flush.cpp
     src/frame_latency_controller.cpp
-    src/frame_splitting.cpp
     src/health.cpp
     src/hooks.cpp
     src/hw_monitor.cpp
     src/hw_spin.cpp
     src/loadlib_hooks.cpp
     src/marker_log.cpp
-    src/ngx_hooks.cpp
     src/nvapi_hooks.cpp
     src/osd.cpp
     src/pll.cpp
@@ -44,7 +50,6 @@ set(ADDON_SOURCES
     src/scheduler.cpp
     src/sleep.cpp
     src/sleep_mode.cpp
-    src/streamline_hooks.cpp
     src/stress_detector.cpp
     src/swapchain_manager.cpp
     src/system_hardening.cpp
@@ -55,17 +60,28 @@ set(ADDON_SOURCES
     src/wake_guard.cpp
     src/logger.cpp
     src/csv_writer.cpp
-    src/dlss_presets.cpp
     src/pqi.cpp
     src/baseline.cpp
-    src/vk_enforce.cpp
-    src/pcl_hooks.cpp
     src/presentation_gate.cpp
-    src/reflex_inject.cpp
     src/vsync_control.cpp
+    src/vk_enforce.cpp
     src/blackout.cpp
     src/focus_lock.cpp
 )
+
+# ── 64-bit only sources ──
+if(RELIMITER_64BIT)
+    list(APPEND ADDON_SOURCES
+        src/adaptive_smoothing.cpp
+        src/fg_divisor.cpp
+        src/frame_splitting.cpp
+        src/ngx_hooks.cpp
+        src/streamline_hooks.cpp
+        src/pcl_hooks.cpp
+        src/reflex_inject.cpp
+        src/dlss_presets.cpp
+    )
+endif()
 
 # ── MinHook (compiled as part of the addon) ──
 set(MINHOOK_SOURCES
@@ -103,9 +119,9 @@ add_library(relimiter SHARED
     src/version.rc
 )
 
-# ── Output as .addon ──
+# ── Output as .addon32 or .addon64 ──
 set_target_properties(relimiter PROPERTIES
-    SUFFIX ".addon64"
+    SUFFIX "${ADDON_SUFFIX}"
     PREFIX ""
 )
 
@@ -126,6 +142,7 @@ target_compile_definitions(relimiter PRIVATE
     IMGUI_DISABLE_DEMO_WINDOWS
     _CRT_SECURE_NO_WARNINGS
     VK_NO_PROTOTYPES
+    $<$<NOT:$<BOOL:${RELIMITER_64BIT}>>:RELIMITER_32BIT>
 )
 
 # ImGui symbols resolved at runtime by ReShade — no force-include needed
@@ -158,14 +175,24 @@ if(MSVC)
 endif()
 
 # ── Link libraries ──
-target_link_libraries(relimiter PRIVATE
-    minhook_static
-    dxgi.lib
-    d3d12.lib
-    gdi32.lib
-    winmm.lib
-    ${CMAKE_SOURCE_DIR}/deps/nvapi/amd64/nvapi64.lib
-)
+if(RELIMITER_64BIT)
+    target_link_libraries(relimiter PRIVATE
+        minhook_static
+        dxgi.lib
+        d3d12.lib
+        gdi32.lib
+        winmm.lib
+        ${CMAKE_SOURCE_DIR}/deps/nvapi/amd64/nvapi64.lib
+    )
+else()
+    target_link_libraries(relimiter PRIVATE
+        minhook_static
+        dxgi.lib
+        gdi32.lib
+        winmm.lib
+        ${CMAKE_SOURCE_DIR}/deps/nvapi/x86/nvapi.lib
+    )
+endif()
 
 # ── MinHook C files: handled by minhook_static target ──
 

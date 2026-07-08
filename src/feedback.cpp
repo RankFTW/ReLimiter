@@ -98,7 +98,11 @@ static void ResolveGetLatency() {
     if (s_get_latency_resolved) return;
     s_get_latency_resolved = true;
 
+#ifdef _WIN64
     HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
+#else
+    HMODULE nvapi = GetModuleHandleW(L"nvapi.dll");
+#endif
     if (!nvapi) return;
 
     auto NvAPI_QI = reinterpret_cast<void*(__cdecl*)(uint32_t)>(

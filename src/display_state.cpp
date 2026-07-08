@@ -37,9 +37,15 @@ static void* (*s_NvAPI_QueryInterface)(NvU32) = nullptr;
 
 static void ResolveNvAPI() {
     if (s_NvAPI_QueryInterface) return;
+#ifdef _WIN64
     HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
     if (!nvapi)
         nvapi = LoadLibraryW(L"nvapi64.dll");
+#else
+    HMODULE nvapi = GetModuleHandleW(L"nvapi.dll");
+    if (!nvapi)
+        nvapi = LoadLibraryW(L"nvapi.dll");
+#endif
     if (!nvapi) return;
     s_NvAPI_QueryInterface = reinterpret_cast<void*(*)(NvU32)>(
         GetProcAddress(nvapi, "nvapi_QueryInterface"));

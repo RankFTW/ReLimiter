@@ -31,6 +31,8 @@ static ActiveAPI DetectAPI(reshade::api::device* dev) {
     if (!dev) return ActiveAPI::None;
     auto api = dev->get_api();
     switch (api) {
+        case reshade::api::device_api::d3d9:   return ActiveAPI::DX9;
+        case reshade::api::device_api::d3d10:  return ActiveAPI::DX11;  // DX10 uses DXGI, same path as DX11
         case reshade::api::device_api::d3d11:  return ActiveAPI::DX11;
         case reshade::api::device_api::d3d12:  return ActiveAPI::DX12;
         case reshade::api::device_api::vulkan: return ActiveAPI::Vulkan;
@@ -102,6 +104,12 @@ static void NotifySubsystemsInit(uint64_t native_handle, ActiveAPI api, HWND hwn
         OnInitSwapchain(reinterpret_cast<void*>(native_handle));
         VkEnforce_Init();  // present-based fallback for non-marker games
         ReflexInject_Init();
+    } else if (api == ActiveAPI::DX9) {
+        VkEnforce_Init();  // present-based enforcement (API-agnostic)
+
+        // DX9 has no DXGI — disable correlator to prevent crashes.
+        g_correlator.permanently_disabled.store(true, std::memory_order_relaxed);
+        LOG_INFO("Correlator disabled (DX9 — no DXGI stats)");
     } else if (api == ActiveAPI::Vulkan) {
         SetVkSwapchainValid(true);
         VkEnforce_Init();
@@ -135,17 +143,23 @@ static void NotifySubsystemsDestroy(bool full_teardown, ActiveAPI old_api) {
 
     // Reset FG state on full teardown so the Streamline hooks detect
     // a state change when FG is re-enabled after swapchain recreate.
+#ifdef _WIN64
     if (full_teardown) {
         g_fg_multiplier.store(0, std::memory_order_relaxed);
         g_fg_active.store(false, std::memory_order_relaxed);
         g_fg_presenting.store(false, std::memory_order_relaxed);
     }
+#endif
 
     // Legacy subsystem teardown (previously in VkBridge_OnDestroySwapchain)
     if (old_api == ActiveAPI::DX12 || old_api == ActiveAPI::DX11) {
         OnDestroySwapchain();
         if (full_teardown) {
             ReflexInject_Shutdown();
+            VkEnforce_Shutdown();
+        }
+    } else if (old_api == ActiveAPI::DX9) {
+        if (full_teardown) {
             VkEnforce_Shutdown();
         }
     } else if (old_api == ActiveAPI::Vulkan) {
@@ -226,8 +240,8 @@ void SwapMgr_OnInitSwapchain(reshade::api::swapchain* sc, bool resize) {
     if (!resolved_hwnd) {
         if (api == ActiveAPI::DX11 || api == ActiveAPI::DX12) {
             resolved_hwnd = ResolveDXHwnd(native);
-        } else if (api == ActiveAPI::Vulkan || api == ActiveAPI::OpenGL) {
-            resolved_hwnd = ResolveVulkanHwnd();
+        } else if (api == ActiveAPI::DX9 || api == ActiveAPI::Vulkan || api == ActiveAPI::OpenGL) {
+            resolved_hwnd = ResolveVulkanHwnd();  // window enumeration (works for DX9 too)
         }
     }
 

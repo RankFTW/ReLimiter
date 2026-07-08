@@ -24,7 +24,11 @@ static void* __cdecl Hook_NvAPI_QueryInterface(NvU32 id) {
 }
 
 void InstallFlipMeteringHook() {
+#ifdef _WIN64
     HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
+#else
+    HMODULE nvapi = GetModuleHandleW(L"nvapi.dll");
+#endif
     if (!nvapi) return;
 
     auto pQueryInterface = reinterpret_cast<void*>(

@@ -46,7 +46,11 @@ bool IsCorrelatorValid() {
 }
 
 bool IsNvAPIAvailable() {
+#ifdef _WIN64
     HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
+#else
+    HMODULE nvapi = GetModuleHandleW(L"nvapi.dll");
+#endif
     return nvapi != nullptr;
 }
 
@@ -56,8 +60,9 @@ bool IsSwapchainValid() {
     if (api == ActiveAPI::Vulkan)
         return s_vk_swapchain_valid.load(std::memory_order_relaxed);
 
-    // OpenGL: swapchain is valid as long as SwapMgr reports valid
-    if (api == ActiveAPI::OpenGL)
+    // OpenGL and DX9: swapchain is valid as long as SwapMgr reports valid
+    // (no DXGI swapchain pointer to check — these APIs don't use DXGI)
+    if (api == ActiveAPI::OpenGL || api == ActiveAPI::DX9)
         return SwapMgr_IsValid();
 
     // DX12 and DX11 both use g_swapchain (set by OnInitSwapchain)

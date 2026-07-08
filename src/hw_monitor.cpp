@@ -146,11 +146,23 @@ static constexpr NvU32 ID_NvAPI_GPU_GetMemoryInfoEx         = 0xC0599498;
 static constexpr NvU32 ID_NvAPI_GPU_GetCoolerSettings       = 0xDA141340;
 
 static bool InitNVAPI() {
+#ifdef _WIN64
     HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
     if (!nvapi) {
         LOG_INFO("HWMonitor: nvapi64.dll not loaded — GPU monitoring unavailable");
         return false;
     }
+#else
+    HMODULE nvapi = GetModuleHandleW(L"nvapi.dll");
+    if (!nvapi) {
+        // On 32-bit, nvapi.dll may not be loaded yet — try loading it
+        nvapi = LoadLibraryW(L"nvapi.dll");
+    }
+    if (!nvapi) {
+        LOG_INFO("HWMonitor: nvapi.dll not loaded — GPU monitoring unavailable");
+        return false;
+    }
+#endif
 
     auto QI = reinterpret_cast<PFN_NvAPI_QueryInterface>(
         GetProcAddress(nvapi, "nvapi_QueryInterface"));

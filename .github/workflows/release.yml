@@ -41,13 +41,21 @@ jobs:
         if: steps.check_tag.outputs.TAG_EXISTS == 'false'
         uses: microsoft/setup-msbuild@v2
 
-      - name: Configure CMake
+      - name: Configure CMake (64-bit)
         if: steps.check_tag.outputs.TAG_EXISTS == 'false'
         run: cmake -B build -A x64
 
-      - name: Build Release
+      - name: Build Release (64-bit)
         if: steps.check_tag.outputs.TAG_EXISTS == 'false'
         run: cmake --build build --config Release
+
+      - name: Configure CMake (32-bit)
+        if: steps.check_tag.outputs.TAG_EXISTS == 'false'
+        run: cmake -B build32 -A Win32
+
+      - name: Build Release (32-bit)
+        if: steps.check_tag.outputs.TAG_EXISTS == 'false'
+        run: cmake --build build32 --config Release
 
       - name: Extract changelog for this version
         if: steps.check_tag.outputs.TAG_EXISTS == 'false'
@@ -74,7 +82,9 @@ jobs:
           tag_name: v${{ steps.version.outputs.VERSION }}
           name: ReLimiter v${{ steps.version.outputs.VERSION }}
           body_path: release_notes.txt
-          files: build/bin/Release/relimiter.addon64
+          files: |
+            build/bin/Release/relimiter.addon64
+            build32/bin/Release/relimiter.addon32
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

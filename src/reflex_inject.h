@@ -6,6 +6,7 @@
 // Gives the NVIDIA driver JIT pacing and GPU clock boost (bLowLatencyBoost)
 // even when the game doesn't natively integrate Reflex/Streamline.
 
+#ifdef _WIN64
 void ReflexInject_Init();
 void ReflexInject_Shutdown();
 
@@ -17,3 +18,10 @@ void ReflexInject_OnPostSleep(uint64_t frameID, int64_t now_qpc);
 
 // True when injection is enabled + device acquired + trampolines valid.
 bool ReflexInject_IsActive();
+#else
+inline void ReflexInject_Init() {}
+inline void ReflexInject_Shutdown() {}
+inline void ReflexInject_OnPreSleep(uint64_t, int64_t) {}
+inline void ReflexInject_OnPostSleep(uint64_t, int64_t) {}
+inline bool ReflexInject_IsActive() { return false; }
+#endif

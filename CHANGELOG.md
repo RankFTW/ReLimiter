@@ -1,6 +1,48 @@
 # Changelog
 
 
+## 3.3.1
+
+### 64-bit
+
+#### Bug Fixes
+- **[WIP] Fixed Keep Game Focused not working until toggled off/on** — In DX11 games with splash screens or launchers, Focus Lock was installing on the wrong window. Now automatically re-installs when the game window changes.
+- **[WIP] Fixed Background FPS and FG-Off caps not working in Dynamic MFG mode** — Both caps now correctly apply when using driver-level Dynamic MFG. Background cap activates when alt-tabbed, FG-Off cap activates when Frame Generation disables in menus.
+
+### 32-bit (New)
+
+ReLimiter now supports 32-bit games with a dedicated `relimiter.addon32`. Place it in the game folder alongside ReShade's `d3d9.dll` (DX9) or `dxgi.dll` (DX10/DX11).
+
+#### Supported Games
+- DX9 32-bit — Source Engine (CS:S, HL2, L4D), older Unreal Engine 3 titles, emulators, any 32-bit DX9 game that ReShade supports
+- DX10/DX11 32-bit — Older titles using DXGI (rare but supported)
+
+#### What Works
+- Frame limiting with VRR-aware pacing (same precision sleep as 64-bit)
+- G-Sync/VRR detection and ceiling-margin targeting
+- Background FPS cap (alt-tab detection)
+- OSD overlay (FPS, 1%/0.1% Low, Frametime, Graph, PQI, GPU Temp/Clock/Usage, VRAM, CPU, RAM)
+- VSync override (DX9: applied at game start/resolution change. DX11: applied immediately)
+- GPU monitoring via NvAPI (temp, clock, usage, VRAM)
+- Fake Fullscreen, Blackout, Window Mode, Monitor Selector
+- Config persistence (shared INI format with 64-bit)
+- Shared OSD presets
+
+#### Not Available (64-bit only features)
+- DLSS quality/resolution info
+- Frame Generation detection and pacing
+- Reflex marker interception
+- Adaptive Smoothing
+- Streamline hooks
+- Focus Lock (causes DWM throttling issues on DX9)
+- Flip Model Override (DX9 doesn't use DXGI swap effects)
+
+#### Known Limitations
+- VSync override on DX9 requires a game restart or resolution change to take effect
+- Monitor selector doesn't work in DX9 exclusive fullscreen (use Fake Fullscreen first)
+- RENDER pipeline indicator shows "n/a" (no DXGI frame statistics on DX9)
+
+
 ## 3.3.0
 
 ### UI

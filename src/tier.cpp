@@ -25,13 +25,13 @@ Tier CheckTier() {
     // Recovered from T3 — reset diagnostic counter for next episode
     s_t3_diag_count = 0;
 
-    // Vulkan/DX11 path: no DXGI correlator or DXGI stats — skip T2b/T2a/T1 checks.
+    // Vulkan/DX9/DX11 path: no DXGI correlator or DXGI stats — skip T2b/T2a/T1 checks.
     // Marker-based enforcement (NvAPI/PCL) also skips the correlator — scanout
     // estimation is too noisy with FG. These paths get T2a (stale feedback)
     // which is correct: pacing works fine without correlator data, the tier
     // just reflects that scanout feedback isn't available.
     ActiveAPI active_api = SwapMgr_GetActiveAPI();
-    if (active_api == ActiveAPI::Vulkan || active_api == ActiveAPI::DX11 || active_api == ActiveAPI::OpenGL) {
+    if (active_api == ActiveAPI::DX9 || active_api == ActiveAPI::Vulkan || active_api == ActiveAPI::DX11 || active_api == ActiveAPI::OpenGL) {
         return Tier2a;
     }
 

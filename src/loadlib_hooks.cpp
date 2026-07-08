@@ -82,6 +82,11 @@ static HMODULE WINAPI Hook_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, D
 }
 
 void InstallLoadLibraryHooks() {
+#ifndef _WIN64
+    // Streamline and NGX are 64-bit only — skip LoadLibrary hooks on 32-bit
+    // to avoid per-DLL-load overhead scanning for DLLs that can't exist.
+    return;
+#else
     // Check if sl.interposer.dll is already loaded before we install hooks
     HMODULE existing = GetModuleHandleW(L"sl.interposer.dll");
     if (existing) {
@@ -92,6 +97,7 @@ void InstallLoadLibraryHooks() {
     InstallHook((void*)&LoadLibraryW,   (void*)&Hook_LoadLibraryW,   (void**)&s_orig_LoadLibraryW);
     InstallHook((void*)&LoadLibraryExA, (void*)&Hook_LoadLibraryExA, (void**)&s_orig_LoadLibraryExA);
     InstallHook((void*)&LoadLibraryExW, (void*)&Hook_LoadLibraryExW, (void**)&s_orig_LoadLibraryExW);
+#endif
 }
 
 bool IsStreamlinePresent() {
