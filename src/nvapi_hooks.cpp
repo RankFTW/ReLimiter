@@ -241,11 +241,13 @@ NV_SET_SLEEP_MODE_PARAMS* NvAPI_GetGameSleepParams() {
 // or we resolve them ourselves from nvapi64.dll / nvapi.dll.
 
 void InstallNvAPIHooks() {
-#ifdef _WIN64
-    HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
+#ifndef _WIN64
+    // NvAPI Reflex hooks are 64-bit only — Reflex/DLSS/FG don't exist on 32-bit.
+    // The 32-bit nvapi.dll may resolve the same function IDs to unrelated internal
+    // functions, producing garbage marker data that breaks enforcement path selection.
+    return;
 #else
-    HMODULE nvapi = GetModuleHandleW(L"nvapi.dll");
-#endif
+    HMODULE nvapi = GetModuleHandleW(L"nvapi64.dll");
     if (!nvapi) return;
 
     // NvAPI_QueryInterface is the single export used to get all NvAPI functions
@@ -268,4 +270,5 @@ void InstallNvAPIHooks() {
         InstallHook(pSleep, (void*)&Hook_Sleep, (void**)&s_orig_sleep);
     if (pSetLatencyMarker)
         InstallHook(pSetLatencyMarker, (void*)&Hook_SetLatencyMarker, (void**)&s_orig_set_latency_marker);
+#endif // _WIN64
 }

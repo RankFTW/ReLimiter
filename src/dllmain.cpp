@@ -159,8 +159,22 @@ static void on_destroy_swapchain(reshade::api::swapchain* sc, bool resize) {
 
 // ── Fake Fullscreen: intercept exclusive fullscreen → borderless window ──
 // ── Flip Model Override: upgrade bitblt → FLIP_DISCARD for DX11 VRR ──
+// ── DX9 VSync Override: modify sync_interval at swapchain creation/reset ──
 static bool on_create_swapchain(reshade::api::device_api api, reshade::api::swapchain_desc& desc, void* hwnd) {
     bool modified = false;
+
+    // DX9 VSync override via sync_interval (applied at CreateDevice and Reset)
+    if (api == reshade::api::device_api::d3d9) {
+        if (g_config.vsync_mode == "off" && desc.sync_interval != 0) {
+            desc.sync_interval = 0;
+            modified = true;
+            LOG_INFO("DX9 VSync override: forced IMMEDIATE (was %u)", desc.sync_interval);
+        } else if (g_config.vsync_mode == "on" && desc.sync_interval != 1) {
+            desc.sync_interval = 1;
+            modified = true;
+            LOG_INFO("DX9 VSync override: forced ONE");
+        }
+    }
 
     // Flip model override (DX11 only — DX12 games already use flip model)
     if (api == reshade::api::device_api::d3d11) {
