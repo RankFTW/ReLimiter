@@ -139,7 +139,6 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
 
     // Lazy install focus lock if enabled in config but not yet installed,
     // or re-install if the swapchain HWND has changed (DX11 launcher → game window).
-#ifdef _WIN64
     if (g_config.focus_lock) {
         HWND hwnd = SwapMgr_GetHWND();
         static HWND s_focus_lock_hwnd = nullptr;
@@ -149,7 +148,6 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             s_focus_lock_hwnd = hwnd;
         }
     }
-#endif
 
     // ════════════════════════════════════════════
     // SECTION 1: FPS
@@ -849,6 +847,13 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     EnforceStickyMonitor();
 
     if (ImGui::CollapsingHeader("Screen")) {
+#ifndef _WIN64
+        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+            "Note: Screen options are experimental on 32-bit and may cause");
+        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+            "adverse effects (minimize loops, DWM throttling) in some games.");
+        ImGui::Spacing();
+#endif
         if (ImGui::Button("Refresh##monitors")) RefreshMonitorList();
         ImGui::SameLine();
 
@@ -1003,7 +1008,6 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         }
 
         // ── Focus Lock ──
-#ifdef _WIN64
         ImGui::Spacing();
         if (ImGui::Checkbox("Keep Game Focused", &g_config.focus_lock)) {
             config_dirty = true;
@@ -1022,7 +1026,6 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 "Audio and game logic continue running in the background. "
                 "The background FPS cap still applies independently. "
                 "May not work with all games (UWP/Game Pass titles use system-level notifications).");
-#endif
     }
 
     // ════════════════════════════════════════════
