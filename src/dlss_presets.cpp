@@ -18,6 +18,9 @@ static constexpr NvU32 DRS_ID_ENABLE_FG_OVERRIDE = 0x10E41DFA;
 static constexpr NvU32 DRS_ID_MFG_GENERATION_FACTOR = 0x104D6667;
 static constexpr NvU32 DRS_ID_MFG_MODE_OVERRIDE     = 0x10308298;
 static constexpr NvU32 DRS_ID_MFG_DYNAMIC_TARGET_FPS = 0x10CF4125;
+static constexpr NvU32 DRS_ID_GSYNC_ENABLE_GLOBAL    = 0x1094F157;
+static constexpr NvU32 DRS_ID_GSYNC_REQUESTED_STATE  = 0x10A879AC;
+static constexpr NvU32 DRS_ID_GSYNC_STATE_APP        = 0x10A879CF;
 
 static bool s_resolved = false;
 static bool s_available = false;
@@ -89,6 +92,20 @@ static void DoPoll() {
         NvU32 mfg_mode = ReadDRSSetting(hSession, readProfile, DRS_ID_MFG_MODE_OVERRIDE);
         NvU32 mfg_target_fps = ReadDRSSetting(hSession, readProfile, DRS_ID_MFG_DYNAMIC_TARGET_FPS);
 
+        // G-Sync: read from game profile first, then check global
+        NvU32 gsync_requested = ReadDRSSetting(hSession, readProfile, DRS_ID_GSYNC_REQUESTED_STATE);
+        NvU32 gsync_state = ReadDRSSetting(hSession, readProfile, DRS_ID_GSYNC_STATE_APP);
+        // Global enable from base profile
+        NvU32 gsync_global = 1; // default: on
+        {
+            NvDRSProfileHandle hBase = nullptr;
+            if (NvAPI_DRS_GetBaseProfile(hSession, &hBase) == NVAPI_OK && hBase)
+                gsync_global = ReadDRSSetting(hSession, hBase, DRS_ID_GSYNC_ENABLE_GLOBAL);
+        }
+        // G-Sync is disabled only when ALL three indicators say off:
+        // global=0, requested>=1, state>=1
+        int gsync_off = (gsync_global == 0 && gsync_requested >= 1 && gsync_state >= 1) ? 1 : 0;
+
         // If MFG not in game profile, also check base profile (some settings inherit)
         if (mfg_factor == 0 && hGameProfile) {
             NvDRSProfileHandle hBase = nullptr;
@@ -116,15 +133,18 @@ static void DoPoll() {
         s_presets.mfg_generation_factor = static_cast<int>(mfg_factor);
         s_presets.mfg_mode_override = static_cast<int>(mfg_mode);
         s_presets.mfg_dynamic_target_fps = static_cast<int>(mfg_target_fps);
+        s_presets.gsync_requested_state = gsync_off;  // 1 = disabled, 0 = enabled
         s_presets.available = true;
 
         static bool s_logged = false;
         if (!s_logged) {
             s_logged = true;
-            LOG_WARN("DLSS DRS: profile=%s SR=%s(0x%X) RR=%s(0x%X) FG=%s(0x%X) MFG_Factor=%u MFG_Mode=%u MFG_TargetFPS=0x%X",
+            LOG_WARN("DLSS DRS: profile=%s SR=%s(0x%X) RR=%s(0x%X) FG=%s(0x%X) MFG_Factor=%u MFG_Mode=%u MFG_TargetFPS=0x%X GSync(global=%u req=%u state=%u -> %s)",
                      hGameProfile ? "game" : "base",
                      s_presets.sr, sr_preset, s_presets.rr, rr_preset, s_presets.fg, fg_preset,
-                     mfg_factor, mfg_mode, mfg_target_fps);
+                     mfg_factor, mfg_mode, mfg_target_fps,
+                     gsync_global, gsync_requested, gsync_state,
+                     gsync_off ? "Disabled" : "Active");
         }
 
     } __except(EXCEPTION_EXECUTE_HANDLER) {

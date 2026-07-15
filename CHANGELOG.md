@@ -1,6 +1,16 @@
 # Changelog
 
 
+## 3.3.2 (beta)
+
+### Bug Fixes
+- **Fixed scheduler suspending during swapchain recreation** — Games that rapidly create and destroy swapchains (AC Black Flag Resynced, other Streamline DX12 titles) would trigger T4-Suspended, disabling the FPS cap entirely. The scheduler now only suspends when both the swapchain is invalid AND no Reflex markers are flowing for an extended period. Swapchain cycling during FG initialization or settings changes no longer interrupts pacing.
+
+### UI
+- **G-Sync status now shows per-game profile state** — Reads the driver profile to show whether G-Sync is enabled or disabled for this specific game, not just the display hardware state. Shows "Disabled" when forced off via RHI, NVIDIA App, or Profile Inspector.
+- **VRR range displayed** — Mode line now shows the monitor's VRR range (e.g., "Mode: VRR (30-360Hz)") instead of just "VRR".
+
+
 ## 3.3.1
 
 ### 64-bit

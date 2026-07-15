@@ -35,6 +35,7 @@
 #include "display_resolver.h"
 #include "vsync_control.h"
 #include "flip_model.h"
+#include "dlss_presets.h"
 
 // g_swapchain moved to flush.cpp (managed by OnInitSwapchain/OnDestroySwapchain)
 // g_presenting_swapchain moved to correlator.cpp (read-only consumer)
@@ -463,6 +464,7 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(on_set_fullscreen_state);
         RegisterOSD();
         HWMonitor_Init();
+        DLSSPresets_Init();  // DRS profile reader (G-Sync state, MFG settings) — independent of NGX hooks
         if (g_config.dlss_info_hooks) NGXHooks_Init();
         else LOG_WARN("DLSS info hooks disabled by user config");
         Blackout_Init();

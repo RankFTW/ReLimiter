@@ -11,6 +11,7 @@ struct DLSSPresets {
     int mfg_generation_factor;  // DRS 0x104D6667: 0=app-controlled, 1=2x, 2=3x, 3=4x, 4=5x, 5=6x
     int mfg_mode_override;      // DRS 0x10308298: 0=Off, 2=Fixed, 4=Dynamic
     int mfg_dynamic_target_fps; // DRS 0x10CF4125: 0=Off, 0x01000000=Max Refresh, or raw FPS
+    int gsync_requested_state;  // DRS 0x10A879AC: 0=Allow, 1=Force Off, 2=Disallow, 3=ULMB, 4=Fixed Refresh
 };
 
 #ifdef _WIN64
@@ -25,6 +26,6 @@ bool DLSSPresets_WriteDynamicTargetFPS(int fps);
 #else
 inline void DLSSPresets_Init() {}
 inline void DLSSPresets_Poll() {}
-inline DLSSPresets DLSSPresets_Get() { return {"", "", "", false, 0, 0, 0}; }
+inline DLSSPresets DLSSPresets_Get() { return {"", "", "", false, 0, 0, 0, 0}; }
 inline bool DLSSPresets_WriteDynamicTargetFPS(int) { return false; }
 #endif

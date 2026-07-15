@@ -1,0 +1,30 @@
+﻿<?xml version="1.0" encoding="utf-16"?>
+<UserSettings>
+  <WindowTop>95</WindowTop>
+  <WindowLeft>787</WindowLeft>
+  <WindowWidth>1050</WindowWidth>
+  <WindowHeight>1392</WindowHeight>
+  <WindowState>Normal</WindowState>
+  <SettingsFilterMode>0</SettingsFilterMode>
+  <ShowScannedUnknownSettings>false</ShowScannedUnknownSettings>
+  <HiddenSettingGroups>
+    <string>7 - Stereo</string>
+    <string>6 - SLI</string>
+    <string>8.5 - Game Profiles</string>
+    <string>Unknown</string>
+    <string>8 - Extra</string>
+    <string>Other</string>
+    <string>01 - Compatibility</string>
+    <string>06 - Rendering Features</string>
+    <string>11 - Unknown Driver Settings</string>
+    <string>1 - Compatibility</string>
+  </HiddenSettingGroups>
+  <DisableUpdateCheck>false</DisableUpdateCheck>
+  <DisableSplashScreen>true</DisableSplashScreen>
+  <UpdateChannel>Release</UpdateChannel>
+  <FavoriteSettingIds />
+  <Theme>DarkTheme.xaml</Theme>
+  <DisplayDensity>Classic</DisplayDensity>
+  <TextRendering>Classic</TextRendering>
+  <Win11BackdropMode>Disabled</Win11BackdropMode>
+</UserSettings>

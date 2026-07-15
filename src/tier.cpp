@@ -9,10 +9,22 @@
 // after each transition, not just the first 3 ever.
 static int s_t3_diag_count = 0;
 
+// T4 counter: only suspend when BOTH swapchain invalid AND markers not flowing.
+static int s_t4_count = 0;
+
 Tier CheckTier() {
-    // Tier 4: Suspended
-    if (!IsSwapchainValid())
-        return Tier4;
+    // Tier 4: Suspended — only when both swapchain AND markers are gone.
+    // Games like AC Black Flag Resynced rapidly cycle swapchain create/destroy
+    // during FG init while markers continue flowing. Suspending the scheduler
+    // during these gaps breaks enforcement. Only suspend when there's truly
+    // nothing to pace (no swapchain AND no markers for an extended period).
+    if (!IsSwapchainValid() && !AreMarkersFlowing()) {
+        s_t4_count++;
+        if (s_t4_count >= 60)  // ~1s at 60fps with neither valid
+            return Tier4;
+    } else {
+        s_t4_count = 0;
+    }
 
     // Tier 3: Safety mode — no markers
     if (!AreMarkersFlowing()) {

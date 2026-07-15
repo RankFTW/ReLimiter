@@ -1325,9 +1325,22 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
 
         bool gsync = g_gsync_active.load(std::memory_order_relaxed);
         PacingMode mode = g_pacing_mode.load(std::memory_order_relaxed);
-        ImGui::Text("G-Sync: %s  |  Mode: %s",
-                    gsync ? "Active" : "Off",
-                    mode == PacingMode::VRR ? "VRR" : "Fixed");
+        {
+            // Per-game G-Sync state from DRS profile
+            DLSSPresets drs = DLSSPresets_Get();
+            const char* gsync_str = "Active";
+            if (drs.available && drs.gsync_requested_state == 1)
+                gsync_str = "Disabled";
+            else if (!gsync)
+                gsync_str = "Off";
+
+            double ceil = g_ceiling_hz.load(std::memory_order_relaxed);
+            double floor = g_floor_hz.load(std::memory_order_relaxed);
+            if (mode == PacingMode::VRR && ceil > 1.0 && floor > 0.0)
+                ImGui::Text("G-Sync: %s  |  Mode: VRR (%.0f-%.0fHz)", gsync_str, floor, ceil);
+            else
+                ImGui::Text("G-Sync: %s  |  Mode: %s", gsync_str, mode == PacingMode::VRR ? "VRR" : "Fixed");
+        }
 
 #ifdef _WIN64
         // FG pacing status
