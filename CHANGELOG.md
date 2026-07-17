@@ -9,6 +9,7 @@
 ### UI
 - **G-Sync status now shows per-game profile state** — Reads the driver profile to show whether G-Sync is enabled or disabled for this specific game, not just the display hardware state. Shows "Disabled" when forced off via RHI, NVIDIA App, or Profile Inspector.
 - **VRR range displayed** — Mode line now shows the monitor's VRR range (e.g., "Mode: VRR (30-360Hz)") instead of just "VRR".
+- **Inferred output FPS for third-party FG injectors** — When using DLSS Enabler, OptiScaler, or similar tools, the OSD now shows inferred output FPS (e.g., "~166 fps (83.0 render)") instead of incorrectly reporting render FPS as output. The `~` prefix indicates the value is calculated from render × FG multiplier rather than directly measured.
 
 
 ## 3.3.1

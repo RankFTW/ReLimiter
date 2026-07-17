@@ -1962,15 +1962,31 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         // ═══════════════════════════════════
         if (g_config.osd_show_fps) {
             double output = s_display_output_fps;
+            int fg_div_raw = ComputeFGDivisorRaw();
             char buf[64];
             if (IsNvSmoothMotionActive()) {
                 snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", s_display_fps * 2.0, s_display_fps);
             } else if (IsDmfgActive() && output > 0.0) {
                 snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", output, s_display_fps);
-            } else if (output > 0.0 && fg_presenting && fg_mult > 0)
-                snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", output, s_display_fps);
-            else
+            } else if (output > 0.0 && fg_presenting && fg_mult > 0) {
+                // Check if output counter is seeing FG presents.
+                // If output ≈ render (within 20%), the counter only sees native presents
+                // (third-party FG injector case). Infer output from render × divisor.
+                double ratio = (s_display_fps > 1.0) ? output / s_display_fps : 0.0;
+                if (fg_div_raw > 1 && ratio < 1.3) {
+                    // Output counter missed FG presents — infer
+                    double inferred = s_display_fps * static_cast<double>(fg_div_raw);
+                    snprintf(buf, sizeof(buf), "~%.0f fps (%.1f render)", inferred, s_display_fps);
+                } else {
+                    snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", output, s_display_fps);
+                }
+            } else if (fg_div_raw > 1 && s_display_fps > 1.0) {
+                // FG active but no output counter data — infer
+                double inferred = s_display_fps * static_cast<double>(fg_div_raw);
+                snprintf(buf, sizeof(buf), "~%.0f fps (%.1f render)", inferred, s_display_fps);
+            } else {
                 snprintf(buf, sizeof(buf), "%.1f fps", s_display_fps);
+            }
             OSDTextColored(ColPerf(), buf);
         }
 
