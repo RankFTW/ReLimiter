@@ -4,7 +4,7 @@
 ## 3.3.2 (beta)
 
 ### New Features
-- **OLED Care mode** — Bind a key to black out all monitors and drop FPS to 20 for screen protection while AFK. Deactivates automatically when you alt-tab. Found in the Screen section below the existing Blackout option.
+- **OLED Care mode** — Bind a key to black out all monitors and drop FPS to 20 for screen protection while AFK. Deactivates automatically when you alt-tab. Keybind is shared across all games via the RHI presets file. Found in the Screen section below the existing Blackout option.
 
 ### UI
 - **G-Sync status now shows per-game profile state** — Reads the driver profile to show whether G-Sync is enabled or disabled for this specific game, not just the display hardware state. Shows "Disabled" when forced off via RHI, NVIDIA App, or Profile Inspector.
