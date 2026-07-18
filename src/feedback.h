@@ -31,7 +31,7 @@ void PollReflexGpuFrameTime();
 // Present-to-GPU-render-end latency: how long after the present call
 // does the GPU finish rendering and the frame enter the flip queue.
 // Analogous to VK_PRESENT_STAGE_QUEUE_OPERATIONS_END → IMAGE_FIRST_PIXEL_OUT.
-extern std::atomic<double> g_reflex_pipeline_latency_us;
+extern std::atomic<double> g_reflex_present_to_gpu_end_us;
 
 // GPU queue depth trend: positive = queue growing (stutter imminent),
 // negative = queue draining, zero = stable. Measured from consecutive

@@ -31,9 +31,11 @@
 #include "blackout.h"
 #include "focus_lock.h"
 #include "logger.h"
+#include "native_pcl_measurement.h"
 #include <string>
 #include <atomic>
 #include <algorithm>
+#include <cmath>
 
 // ── OSD readout state ──
 static double s_real_fps = 0.0;
@@ -427,7 +429,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             p.show_0_1pct_low = true;
             p.show_frametime = true;
             p.show_frametime_graph = true;
-            p.show_cpu_latency = true;
+            p.show_cpu_latency = true; p.show_native_pcl = true; p.show_native_pcl_breakdown = true;
             p.show_gpu_render_time = true;
             p.show_total_frame_cost = true;
             p.show_fg_time = true;
@@ -583,7 +585,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                     OSDPreset p = {};
                     p.show_fps = true; p.show_1pct_low = true; p.show_0_1pct_low = true;
                     p.show_frametime = true; p.show_frametime_graph = true;
-                    p.show_cpu_latency = true; p.show_gpu_render_time = true;
+                    p.show_cpu_latency = true; p.show_native_pcl = true; p.show_native_pcl_breakdown = true; p.show_gpu_render_time = true;
                     p.show_total_frame_cost = true; p.show_fg_time = true;
                     p.show_pqi = true; p.show_pqi_breakdown = true;
                     p.show_smoothness = true; p.show_fg = true; p.show_limiter = true;
@@ -747,6 +749,16 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Latency");
         if (ImGui::Checkbox("CPU Latency##osd_elem", &g_config.osd_show_cpu_latency)) config_dirty = true;
         HelpTip("CPU pipeline time: SIM_START to RENDERSUBMIT_END. Measures how long the CPU spends on simulation + render submission.");
+        FlowSeparator();
+        if (ImGui::Checkbox("PC Latency##osd_elem", &g_config.osd_show_native_pcl)) config_dirty = true;
+        HelpTip("Show native NVIDIA PC Latency from PCLStats ETW correlated to the displayed application frame. Enable collection under Advanced.");
+        if (g_config.osd_show_native_pcl) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("-");
+            ImGui::SameLine();
+            if (ImGui::Checkbox("Breakdown##native_pcl_osd_elem", &g_config.osd_show_native_pcl_breakdown)) config_dirty = true;
+            HelpTip("Show input-to-frame-start (I2FS), frame-start-to-present (FS2P), and present-to-display (P2D).");
+        }
         FlowSeparator();
         if (ImGui::Checkbox("GPU Render##osd_elem", &g_config.osd_show_gpu_render_time)) config_dirty = true;
         HelpTip("GPU active render time in ms. Shows actual GPU work excluding idle bubbles. DX12+Reflex only.");
@@ -1131,6 +1143,35 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Waiting for device)");
         }
+
+        // Native NVIDIA PC Latency collection
+        ImGui::Spacing();
+        bool native_pcl_enabled = g_config.native_pcl_enabled;
+        if (ImGui::Checkbox("Native NVIDIA PC Latency", &native_pcl_enabled)) {
+            g_config.native_pcl_enabled = native_pcl_enabled;
+            NativePcl_SetEnabled(native_pcl_enabled);
+            config_dirty = true;
+        }
+        const NativePclSnapshot native_pcl_snapshot = NativePcl_GetSnapshot();
+        ImVec4 native_pcl_status_color(0.6f, 0.6f, 0.6f, 1.0f);
+        if (native_pcl_snapshot.reliable) {
+            native_pcl_status_color = ImVec4(0.2f, 0.9f, 0.2f, 1.0f);
+        }
+        else if (native_pcl_snapshot.status == NativePclStatus::Starting ||
+                 native_pcl_snapshot.status == NativePclStatus::Warming ||
+                 native_pcl_snapshot.status == NativePclStatus::LowFpsUnreliable) {
+            native_pcl_status_color = ImVec4(1.0f, 0.7f, 0.3f, 1.0f);
+        }
+        else if (native_pcl_snapshot.status != NativePclStatus::Disabled) {
+            native_pcl_status_color = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(
+            native_pcl_status_color,
+            "(%s)",
+            NativePcl_StatusText(native_pcl_snapshot.status));
+        HelpTip("Collect true NVIDIA PC Latency from PCLStats ETW and correlate it with the displayed application frame. "
+                "Requires a game that emits NVIDIA PCL markers; ETW starts lazily after the next present.");
 
         // Flip Model Override toggle (DX11 only)
         ImGui::Spacing();
@@ -1749,7 +1790,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                 OSDPreset p = {};
                 p.show_fps = true; p.show_1pct_low = true; p.show_0_1pct_low = true;
                 p.show_frametime = true; p.show_frametime_graph = true;
-                p.show_cpu_latency = true; p.show_gpu_render_time = true;
+                p.show_cpu_latency = true; p.show_native_pcl = true; p.show_native_pcl_breakdown = true; p.show_gpu_render_time = true;
                 p.show_total_frame_cost = true; p.show_fg_time = true;
                 p.show_pqi = true; p.show_pqi_breakdown = true;
                 p.show_smoothness = true; p.show_fg = true; p.show_limiter = true;
@@ -1992,6 +2033,77 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "CPU: %.1f ms", cpu_us / 1000.0);
                 OSDTextColored(ColLatency(), buf);
+            }
+        }
+
+        if (g_config.osd_show_native_pcl) {
+            const NativePclSnapshot native_pcl = NativePcl_GetSnapshot();
+            const bool total_available = native_pcl.available &&
+                std::isfinite(native_pcl.total_us);
+
+            ImVec4 native_pcl_color = ColLatency();
+            if (!native_pcl.reliable) {
+                const float brightness = g_config.osd_text_brightness;
+                if (total_available) {
+                    native_pcl_color = ImVec4(
+                        0.9f * brightness,
+                        0.7f * brightness,
+                        0.2f * brightness,
+                        1.0f);
+                }
+                else {
+                    const bool waiting =
+                        native_pcl.status == NativePclStatus::Disabled ||
+                        native_pcl.status == NativePclStatus::Starting ||
+                        native_pcl.status == NativePclStatus::Warming ||
+                        native_pcl.status == NativePclStatus::Stopped;
+                    native_pcl_color = waiting
+                        ? ImVec4(0.6f * brightness, 0.6f * brightness, 0.6f * brightness, 1.0f)
+                        : ImVec4(0.9f * brightness, 0.3f * brightness, 0.3f * brightness, 1.0f);
+                }
+            }
+
+            char native_pcl_text[96];
+            if (total_available) {
+                snprintf(
+                    native_pcl_text,
+                    sizeof(native_pcl_text),
+                    "PC Latency: %.1f ms (%s)",
+                    native_pcl.total_us / 1000.0,
+                    NativePcl_StatusText(native_pcl.status));
+            }
+            else {
+                snprintf(
+                    native_pcl_text,
+                    sizeof(native_pcl_text),
+                    "PC Latency: N/A (%s)",
+                    NativePcl_StatusText(native_pcl.status));
+            }
+            OSDTextColored(native_pcl_color, native_pcl_text);
+
+            if (g_config.osd_show_native_pcl_breakdown) {
+                const bool breakdown_available = total_available &&
+                    std::isfinite(native_pcl.input_to_frame_start_us) &&
+                    std::isfinite(native_pcl.frame_start_to_present_us) &&
+                    std::isfinite(native_pcl.present_to_display_us);
+                char breakdown_text[96];
+                if (breakdown_available) {
+                    snprintf(
+                        breakdown_text,
+                        sizeof(breakdown_text),
+                        " I2FS / FS2P / P2D: %.1f / %.1f / %.1f ms",
+                        native_pcl.input_to_frame_start_us / 1000.0,
+                        native_pcl.frame_start_to_present_us / 1000.0,
+                        native_pcl.present_to_display_us / 1000.0);
+                }
+                else {
+                    snprintf(
+                        breakdown_text,
+                        sizeof(breakdown_text),
+                        " I2FS / FS2P / P2D: N/A (%s)",
+                        NativePcl_StatusText(native_pcl.status));
+                }
+                OSDTextColored(native_pcl_color, breakdown_text);
             }
         }
 

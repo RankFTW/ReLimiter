@@ -54,7 +54,7 @@ static bool s_get_latency_resolved = false;
 static uint64_t s_last_reflex_frame_id = 0;
 
 // ── Reflex pipeline timing atomics ──
-std::atomic<double> g_reflex_pipeline_latency_us{0.0};
+std::atomic<double> g_reflex_present_to_gpu_end_us{0.0};
 std::atomic<double> g_reflex_queue_trend_us{0.0};
 
 // ── Extended Reflex timing atomics ──
@@ -235,7 +235,7 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
             double pipeline_us = qpc_to_us(
                 static_cast<int64_t>(r.gpuRenderEndTime - r.presentStartTime));
             if (pipeline_us > 0.0 && pipeline_us < effective_interval_us * 2.0) {
-                g_reflex_pipeline_latency_us.store(pipeline_us,
+                g_reflex_present_to_gpu_end_us.store(pipeline_us,
                     std::memory_order_relaxed);
             }
         }
@@ -471,7 +471,7 @@ void ResetFeedbackAccumulators() {
     s_has_prev_present = false;
     s_last_reflex_frame_id = 0;
     s_prev_gpu_render_duration_us = 0.0;
-    g_reflex_pipeline_latency_us.store(0.0, std::memory_order_relaxed);
+    g_reflex_present_to_gpu_end_us.store(0.0, std::memory_order_relaxed);
     g_reflex_queue_trend_us.store(0.0, std::memory_order_relaxed);
     g_reflex_present_duration_us.store(0.0, std::memory_order_relaxed);
     g_reflex_gpu_active_us.store(0.0, std::memory_order_relaxed);

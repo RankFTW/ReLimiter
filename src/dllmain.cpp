@@ -10,7 +10,9 @@
 #include <atomic>
 
 #include "hooks.h"
+#include "health.h"
 #include "nvapi_hooks.h"
+#include "pcl_hooks.h"
 #include "loadlib_hooks.h"
 #include "streamline_hooks.h"
 #include "timer_hooks.h"
@@ -35,6 +37,7 @@
 #include "display_resolver.h"
 #include "vsync_control.h"
 #include "flip_model.h"
+#include "native_pcl_measurement.h"
 
 // g_swapchain moved to flush.cpp (managed by OnInitSwapchain/OnDestroySwapchain)
 // g_presenting_swapchain moved to correlator.cpp (read-only consumer)
@@ -268,6 +271,12 @@ static void on_present(reshade::api::command_queue* queue,
     // Skip all present work if swapchain is not valid (between destroy and init)
     if (!SwapMgr_IsValid() || !sc) return;
 
+    // Native PCL waits for meaningful latency activity so the ETW session
+    // does not ingest the game's unrelated startup burst. Markerless games
+    // use a bounded fallback inside the measurement module.
+    NativePcl_StartIfReady(
+        AreNvAPIMarkersFlowing() || PCL_MarkersFlowing());
+
     // ── Deferred hook installation ──
     // NvAPI and Streamline hooks are installed on the first present after
     // the rendering pipeline is up, rather than during addon init. This
@@ -395,6 +404,9 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
     __except(EXCEPTION_EXECUTE_HANDLER) {
         LOG_ERROR("LoadConfig exception 0x%08X", GetExceptionCode());
     }
+    // Set desired state only. ETW starts lazily after the first valid present,
+    // so this remains safe when DoInit is reached from DLL_PROCESS_ATTACH.
+    NativePcl_SetEnabled(g_config.native_pcl_enabled);
     s_hModule = hModule;
     LOG_INFO("Config loaded: target_fps=%d", g_config.target_fps);
     LOG_INFO("Config keybinds: toggle=%s prev=%s next=%s",
@@ -506,6 +518,10 @@ void WINAPI AddonUninit(HMODULE /*addon_module*/, HMODULE /*reshade_module*/) {
     if (!s_addon_initialised) return;
     LOG_INFO("AddonUninit called");
 
+    // Stop ETW while hooks, telemetry, and logging are still alive. This
+    // blocks until ProcessTrace has drained and the collector thread exits.
+    NativePcl_Stop();
+
     SaveConfig();
     SetUnhandledExceptionFilter(ShutdownCrashHandler);
     SuppressWEROnShutdown();
@@ -555,6 +571,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
 
     case DLL_PROCESS_DETACH:
         LOG_INFO("DllMain DETACH");
+        // Never call ETW control APIs or join threads under the loader lock.
+        // Normal teardown happens in AddonUninit; this only reports a skipped
+        // shutdown for abnormal unload/process-termination paths.
+        NativePcl_NotifyProcessDetach();
         // If AddonUninit was not called (abnormal unload), clean up.
         if (s_addon_initialised) {
             LOG_WARN("AddonUninit was not called — cleaning up in DllMain");

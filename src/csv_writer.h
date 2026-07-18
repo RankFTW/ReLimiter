@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <atomic>
 
+#include "native_pcl_measurement.h"
+
 // Per-frame telemetry row. Pushed from scheduler hot path.
 struct FrameRow {
     uint64_t frame_id;
@@ -43,7 +45,7 @@ struct FrameRow {
     int      feedback_rate;                // adaptive window size (8 or 16)
     double   feedback_alpha;               // current α (0.05 or 0.10)
     // ── Reflex pipeline timing ──
-    double   reflex_pipeline_latency_us;   // present→gpuRenderEnd (DX12 Reflex only)
+    double   reflex_present_to_gpu_end_us;   // present→gpuRenderEnd (DX12 Reflex only)
     double   reflex_queue_trend_us;        // GPU render duration delta (stutter predictor)
     // ── Extended Reflex timing ──
     double   reflex_present_duration_us;   // presentStart→presentEnd (flip queue pressure)
@@ -57,12 +59,53 @@ struct FrameRow {
     double   total_frame_cost_us;          // simStart → gpuRenderEnd (Reflex)
 };
 
+// One row per displayed application frame from the native PCL ETW collector.
+// This stream is event-aligned and intentionally separate from scheduler rows.
+struct NativePclRow {
+    uint32_t pcl_frame_id = 0;
+    uint64_t present_start_qpc = 0;
+    uint64_t display_qpc = 0;
+    uint64_t sample_qpc = 0;
+    double sample_age_us = 0.0;
+    double input_to_frame_start_us = 0.0;
+    double frame_start_to_present_us = 0.0;
+    double present_to_display_us = 0.0;
+    double total_us = 0.0;
+    double dropped_accumulation_us = 0.0;
+    uint32_t dropped_frame_count = 0;
+    NativePclStatus status = NativePclStatus::Disabled;
+    uint32_t lost_present_count = 0;
+    uint32_t etw_events_lost = 0;
+    uint32_t etw_buffers_lost = 0;
+    uint32_t overflowed_present_count = 0;
+
+    // Appended association diagnostics; the established CSV prefix remains stable.
+    uint64_t qpc_frequency = 0;
+    uint64_t pcl_sim_start_qpc = 0;
+    uint64_t pcl_sim_end_qpc = 0;
+    uint64_t pcl_render_submit_start_qpc = 0;
+    uint64_t pcl_render_submit_end_qpc = 0;
+    uint64_t pcl_present_start_qpc = 0;
+    uint64_t pcl_present_end_qpc = 0;
+    uint64_t effective_sim_start_qpc = 0;
+    uint32_t previous_pcl_frame_id = 0;
+    int64_t pcl_frame_id_delta = 0;
+    uint64_t previous_pcl_sim_start_qpc = 0;
+    double pcl_sim_start_delta_us = 0.0;
+    double provider_present_to_dxgi_present_us = 0.0;
+    int32_t frame_type = 0;
+    bool used_simulation_fallback = false;
+};
+
 // Initialize CSV writer. Starts background thread.
 void CSV_Init(const char* output_dir);
 void CSV_Shutdown();
 
-// Push a frame row from the hot path. Lock-free, < 1μs.
+// Push a frame row from the scheduler hot path. Lock-free, < 1μs.
 void CSV_Push(const FrameRow& row);
+
+// Push a displayed-frame native PCL row from the ETW collector. Lock-free.
+void CSV_PushNativePcl(const NativePclRow& row);
 
 void CSV_SetEnabled(bool enabled);
 bool CSV_IsEnabled();

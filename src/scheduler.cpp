@@ -932,14 +932,14 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
 
     // ── Update presentation latency correction (EMA fallback) ──
     // When Reflex pipeline timing is available, the scheduler uses the direct
-    // per-frame measurement (g_reflex_pipeline_latency_us) instead of this EMA.
+    // per-frame measurement (g_reflex_present_to_gpu_end_us) instead of this EMA.
     // The EMA only updates when Reflex data is NOT available — DX11, non-Reflex
     // DX12, or when the Reflex ring buffer hasn't produced data yet.
     // Only update when the gate is NOT active — when the gate is holding
     // frames to a fixed phase, the present timing reflects the gate's hold
     // rather than pipeline latency, which would contaminate this EMA.
     bool reflex_pipeline_available =
-        g_reflex_pipeline_latency_us.load(std::memory_order_relaxed) > 0.0;
+        g_reflex_present_to_gpu_end_us.load(std::memory_order_relaxed) > 0.0;
     if (predictor_warm && !present_based
         && !reflex_pipeline_available) {
         double pi = g_cadence_meter.present_interval_us.load(std::memory_order_relaxed);
@@ -1007,7 +1007,7 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     row.present_bias_us = g_cadence_meter.bias_ctrl.GetBias();
     row.feedback_rate = g_cadence_meter.bias_ctrl.GetWindowSize();
     row.feedback_alpha = g_cadence_meter.bias_ctrl.GetAlpha();
-    row.reflex_pipeline_latency_us = g_reflex_pipeline_latency_us.load(std::memory_order_relaxed);
+    row.reflex_present_to_gpu_end_us = g_reflex_present_to_gpu_end_us.load(std::memory_order_relaxed);
     row.reflex_queue_trend_us = g_reflex_queue_trend_us.load(std::memory_order_relaxed);
     row.reflex_present_duration_us = g_reflex_present_duration_us.load(std::memory_order_relaxed);
     row.reflex_gpu_active_us = g_reflex_gpu_active_us.load(std::memory_order_relaxed);

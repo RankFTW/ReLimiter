@@ -32,6 +32,8 @@ struct Config {
     bool osd_show_limiter = false;
     bool osd_show_pqi = false;
     bool osd_show_cpu_latency = false;
+    bool osd_show_native_pcl = false;
+    bool osd_show_native_pcl_breakdown = false;
     bool osd_show_pqi_breakdown = false;
     bool osd_show_1pct_low = false;
     bool osd_show_smoothness = false;
@@ -61,6 +63,9 @@ struct Config {
 
     // CSV Telemetry
     bool csv_enabled = false;
+
+    // Native NVIDIA PC Latency collection
+    bool native_pcl_enabled = false;
 
     // Reflex Injection
     bool reflex_inject = false;         // Synthesize Reflex markers for non-Reflex games
@@ -146,6 +151,8 @@ struct OSDPreset {
     bool show_limiter = false;
     bool show_pqi = false;
     bool show_cpu_latency = false;
+    bool show_native_pcl = false;
+    bool show_native_pcl_breakdown = false;
     bool show_pqi_breakdown = false;
     bool show_1pct_low = false;
     bool show_smoothness = false;

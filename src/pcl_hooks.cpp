@@ -13,11 +13,19 @@
 #include <MinHook.h>
 #include <atomic>
 
-// ── Minimal Streamline types (from public sl_pcl.h / sl_core_api.h, MIT) ──
+// ── Minimal Streamline types (from public sl_pcl.h / sl_core_types.h, MIT) ──
 namespace sl {
     constexpr uint32_t kFeaturePCL = 4;
+
+    // The public FrameToken contract exposes the frame index through this
+    // virtual conversion. No object fields or opaque payload bytes are read.
+    class FrameToken {
+    public:
+        virtual operator uint32_t() const = 0;
+    };
+
     using PFun_slGetFeatureFunction = int32_t(uint32_t feature, const char* name, void*& fn);
-    using PFun_slPCLSetMarker      = int32_t(uint32_t marker, const void* frame);
+    using PFun_slPCLSetMarker = int32_t(uint32_t marker, const FrameToken& frame);
 }
 
 // ── Trampolines ──
@@ -26,42 +34,80 @@ static sl::PFun_slPCLSetMarker* s_orig_SetMarker = nullptr;
 // ── State ──
 static std::atomic<bool> s_installed{false};
 static std::atomic<bool> s_markers_flowing{false};
+static std::atomic<bool> s_seen_simulation_start{false};
 
 // ── Frame ID extraction from sl::FrameToken ──
-// FrameToken is an opaque Streamline type. Rather than risk crashing on
-// vtable layout changes, we derive frame IDs from the marker sequence.
-//
-// The predictor needs the SAME frameID for all markers within one frame
-// (SIMULATION_START, SIMULATION_END, PRESENT_START, etc.) so it can
-// measure the pipeline time between SIMULATION_START and PRESENT_START.
-// Incrementing per-call gave every marker a unique ID, which meant the
-// predictor's pending_frames lookup at PRESENT_START never found the
-// matching SIMULATION_START — frame_times_us never got populated and
-// the predictor stayed cold forever.
-//
-// Fix: increment only on SIMULATION_START (first marker of each frame).
-// All subsequent markers for that frame reuse the same ID.
-static std::atomic<uint64_t> s_pcl_frame_counter{0};
-static uint64_t s_current_frame_id = 0;
+// Prefer Streamline's public virtual conversion so every marker retains the
+// game's authoritative token ID. If the interface cannot be called safely
+// (for example, an incompatible interposer ABI), permanently fall back to a
+// guarded synthetic sequence rather than interpreting opaque object memory.
+static std::atomic<bool> s_use_fallback_frame_ids{false};
+static std::atomic<bool> s_logged_frame_token_failure{false};
+static std::atomic<uint64_t> s_fallback_frame_counter{0};
+static std::atomic<uint64_t> s_current_fallback_frame_id{0};
 
-static uint64_t GetFrameID(uint32_t marker_type) {
-    if (marker_type == SIMULATION_START) {
-        s_current_frame_id = s_pcl_frame_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+static bool TryGetFrameTokenID(
+    const sl::FrameToken& frame,
+    uint64_t& frame_id) noexcept
+{
+    __try {
+        frame_id = static_cast<uint32_t>(frame);
+        return true;
     }
-    return s_current_frame_id;
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static uint64_t GetFallbackFrameID(uint32_t marker_type) noexcept
+{
+    if (marker_type == SIMULATION_START) {
+        const uint64_t frame_id =
+            s_fallback_frame_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+        s_current_fallback_frame_id.store(frame_id, std::memory_order_relaxed);
+        return frame_id;
+    }
+    return s_current_fallback_frame_id.load(std::memory_order_relaxed);
+}
+
+static uint64_t GetFrameID(
+    uint32_t marker_type,
+    const sl::FrameToken& frame) noexcept
+{
+    if (!s_use_fallback_frame_ids.load(std::memory_order_acquire)) {
+        uint64_t frame_id = 0;
+        if (TryGetFrameTokenID(frame, frame_id)) {
+            return frame_id;
+        }
+
+        s_use_fallback_frame_ids.store(true, std::memory_order_release);
+        if (!s_logged_frame_token_failure.exchange(true, std::memory_order_relaxed)) {
+            LOG_WARN(
+                "PCL: Streamline FrameToken conversion failed; using synthetic frame IDs");
+        }
+    }
+
+    return GetFallbackFrameID(marker_type);
 }
 
 // ── slPCLSetMarker hook ──
 // Markers only — no sleep swallowing. The game's slReflexSleep runs
 // on its natural schedule. We use the markers for predictor feeding
 // and enforcement at SIMULATION_START, same as DX12.
-static int32_t Hooked_slPCLSetMarker(uint32_t marker, const void* frame) {
-    uint32_t type = marker;
-    uint64_t frameID = GetFrameID(type);
+static int32_t Hooked_slPCLSetMarker(
+    uint32_t marker,
+    const sl::FrameToken& frame)
+{
+    const uint32_t type = marker;
+    const uint64_t frameID = GetFrameID(type, frame);
 
-    // Drop markers before the first SIMULATION_START — we can't associate
-    // them with a frame, and the predictor would reject frameID=0 anyway.
-    if (frameID == 0) {
+    if (type == SIMULATION_START) {
+        s_seen_simulation_start.store(true, std::memory_order_release);
+    }
+
+    // Ignore a partial frame observed when the hook is installed, and frame
+    // token zero (the predictor reserves zero as its uninitialized sentinel).
+    if (!s_seen_simulation_start.load(std::memory_order_acquire) || frameID == 0) {
         if (s_orig_SetMarker)
             return s_orig_SetMarker(marker, frame);
         return 0;

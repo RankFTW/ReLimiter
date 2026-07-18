@@ -33,7 +33,9 @@ enum NV_LATENCY_MARKER_TYPE : uint32_t {
     RENDERSUBMIT_END       = 3,
     PRESENT_START          = 4,
     PRESENT_END            = 5,
-    // INPUT_SAMPLE etc. exist but we don't use them
+    INPUT_SAMPLE           = 6,
+    TRIGGER_FLASH          = 7,
+    PC_LATENCY_PING        = 8,
 };
 
 struct NV_LATENCY_MARKER_PARAMS {

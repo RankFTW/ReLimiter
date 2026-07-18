@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(relimiter LANGUAGES CXX C)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ── Architecture detection ──
@@ -42,6 +42,7 @@ set(ADDON_SOURCES
     src/hw_spin.cpp
     src/loadlib_hooks.cpp
     src/marker_log.cpp
+    src/native_pcl_measurement.cpp
     src/nvapi_hooks.cpp
     src/osd.cpp
     src/pll.cpp
@@ -91,6 +92,55 @@ set(MINHOOK_SOURCES
     deps/reshade/deps/minhook/src/hde/hde32.c
     deps/reshade/deps/minhook/src/hde/hde64.c
 )
+
+# ── PresentMon PresentData (native NVIDIA PCL + display correlation) ──
+set(PRESENTMON_PRESENTDATA_SOURCES
+    deps/presentmon/PresentData/Debug.cpp
+    deps/presentmon/PresentData/GpuTrace.cpp
+    deps/presentmon/PresentData/NvidiaTraceConsumer.cpp
+    deps/presentmon/PresentData/PresentMonTraceConsumer.cpp
+    deps/presentmon/PresentData/TraceConsumer.cpp
+    deps/presentmon/PresentData/PresentMonTraceSession.cpp
+    deps/presentmon/PresentData/TraceLogging.cpp
+    src/native_pcl_collector.cpp
+    src/native_pcl_etw_cleanup.cpp
+    src/native_pcl_etw_diagnostics.cpp
+    src/native_pcl_etw_provider_setup.cpp
+    src/native_pcl_etw_session.cpp
+    src/presentmon_runtime_compat.cpp
+)
+
+add_library(presentmon_presentdata STATIC ${PRESENTMON_PRESENTDATA_SOURCES})
+# PresentMon's disabled logging facade still declares std::stacktrace types.
+# Keep that upstream-only requirement isolated; ReLimiter itself remains C++20.
+target_compile_features(presentmon_presentdata PRIVATE cxx_std_23)
+target_include_directories(presentmon_presentdata PUBLIC
+    ${CMAKE_SOURCE_DIR}/deps/presentmon
+    ${CMAKE_SOURCE_DIR}/deps/presentmon/PresentData
+)
+target_compile_definitions(presentmon_presentdata PRIVATE
+    NOMINMAX
+    WIN32_LEAN_AND_MEAN
+    UNICODE
+    _UNICODE
+    _CRT_SECURE_NO_WARNINGS
+    _WIN32_WINNT=0x0601
+    NTDDI_VERSION=0x06010000
+    PMLOG_BUILD_LEVEL=None
+)
+if(MSVC)
+    set_property(TARGET presentmon_presentdata PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(presentmon_presentdata PRIVATE
+        /W4
+        /utf-8
+        /wd4100
+        /wd4201
+        /wd4244
+        $<$<CONFIG:Debug>:/Zi /Od /RTC1>
+        $<$<CONFIG:Release>:/O2 /GL /GS->
+    )
+endif()
 
 # ── ImGui: DO NOT compile — ReShade provides its own ImGui instance.
 # We only use the headers for function declarations. ReShade resolves
@@ -178,6 +228,9 @@ endif()
 if(RELIMITER_64BIT)
     target_link_libraries(relimiter PRIVATE
         minhook_static
+        presentmon_presentdata
+        advapi32.lib
+        tdh.lib
         dxgi.lib
         d3d12.lib
         gdi32.lib
@@ -187,6 +240,9 @@ if(RELIMITER_64BIT)
 else()
     target_link_libraries(relimiter PRIVATE
         minhook_static
+        presentmon_presentdata
+        advapi32.lib
+        tdh.lib
         dxgi.lib
         gdi32.lib
         winmm.lib

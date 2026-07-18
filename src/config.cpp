@@ -165,6 +165,8 @@ void LoadConfig(HMODULE hModule) {
     g_config.osd_show_limiter        = ReadINIBool(S, "osd_show_limiter", false, P);
     g_config.osd_show_pqi            = ReadINIBool(S, "osd_show_pqi", false, P);
     g_config.osd_show_cpu_latency    = ReadINIBool(S, "osd_show_cpu_latency", false, P);
+    g_config.osd_show_native_pcl     = ReadINIBool(S, "osd_show_native_pcl", false, P);
+    g_config.osd_show_native_pcl_breakdown = ReadINIBool(S, "osd_show_native_pcl_breakdown", false, P);
     g_config.osd_show_pqi_breakdown  = ReadINIBool(S, "osd_show_pqi_breakdown", false, P);
     g_config.osd_show_1pct_low       = ReadINIBool(S, "osd_show_1pct_low", false, P);
     g_config.osd_show_smoothness     = ReadINIBool(S, "osd_show_smoothness", false, P);
@@ -178,6 +180,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.vsync_mode              = ReadINIString(S, "vsync_mode", "game", P);
     g_config.log_level               = ReadINIString(S, "log_level", "warn", P);
     g_config.csv_enabled             = ReadINIBool(S, "csv_enabled", false, P);
+    g_config.native_pcl_enabled      = ReadINIBool(S, "native_pcl_enabled", false, P);
     g_config.reflex_inject           = ReadINIBool(S, "reflex_inject", false, P);
     g_config.flip_model_override     = ReadINIBool(S, "flip_model_override", false, P);
     g_config.shared_presets          = ReadINIBool(S, "shared_presets", false, P);
@@ -309,6 +312,8 @@ void SaveConfig() {
     WriteINIBool(S, "osd_show_1pct_low", g_config.osd_show_1pct_low, P);
     WriteINIBool(S, "osd_show_0_1pct_low", g_config.osd_show_0_1pct_low, P);
     WriteINIBool(S, "osd_show_cpu_latency", g_config.osd_show_cpu_latency, P);
+    WriteINIBool(S, "osd_show_native_pcl", g_config.osd_show_native_pcl, P);
+    WriteINIBool(S, "osd_show_native_pcl_breakdown", g_config.osd_show_native_pcl_breakdown, P);
     WriteINIBool(S, "osd_show_gpu_render_time", g_config.osd_show_gpu_render_time, P);
     WriteINIBool(S, "osd_show_total_frame_cost", g_config.osd_show_total_frame_cost, P);
     WriteINIBool(S, "osd_show_fg_time", g_config.osd_show_fg_time, P);
@@ -359,6 +364,7 @@ void SaveConfig() {
     WriteINIBool(S, "flip_model_override", g_config.flip_model_override, P);
     WriteINIString(S, "log_level", g_config.log_level.c_str(), P);
     WriteINIBool(S, "csv_enabled", g_config.csv_enabled, P);
+    WriteINIBool(S, "native_pcl_enabled", g_config.native_pcl_enabled, P);
     WriteINIBool(S, "dlss_info_hooks", g_config.dlss_info_hooks, P);
     if (!g_config.streamline_compat)
         WriteINIString(S, "streamline_compat", "force_false", P);
@@ -437,6 +443,8 @@ OSDPreset OSDPreset_FromConfig() {
     p.show_limiter          = g_config.osd_show_limiter;
     p.show_pqi              = g_config.osd_show_pqi;
     p.show_cpu_latency      = g_config.osd_show_cpu_latency;
+    p.show_native_pcl       = g_config.osd_show_native_pcl;
+    p.show_native_pcl_breakdown = g_config.osd_show_native_pcl_breakdown;
     p.show_pqi_breakdown    = g_config.osd_show_pqi_breakdown;
     p.show_1pct_low         = g_config.osd_show_1pct_low;
     p.show_smoothness       = g_config.osd_show_smoothness;
@@ -472,6 +480,8 @@ void OSDPreset_ApplyToConfig(const OSDPreset& p) {
     g_config.osd_show_limiter          = p.show_limiter;
     g_config.osd_show_pqi              = p.show_pqi;
     g_config.osd_show_cpu_latency      = p.show_cpu_latency;
+    g_config.osd_show_native_pcl       = p.show_native_pcl;
+    g_config.osd_show_native_pcl_breakdown = p.show_native_pcl_breakdown;
     g_config.osd_show_pqi_breakdown    = p.show_pqi_breakdown;
     g_config.osd_show_1pct_low         = p.show_1pct_low;
     g_config.osd_show_smoothness       = p.show_smoothness;
@@ -501,6 +511,8 @@ void OSDPreset_ApplyTogglesOnly(const OSDPreset& p) {
     g_config.osd_show_limiter          = p.show_limiter;
     g_config.osd_show_pqi              = p.show_pqi;
     g_config.osd_show_cpu_latency      = p.show_cpu_latency;
+    g_config.osd_show_native_pcl       = p.show_native_pcl;
+    g_config.osd_show_native_pcl_breakdown = p.show_native_pcl_breakdown;
     g_config.osd_show_pqi_breakdown    = p.show_pqi_breakdown;
     g_config.osd_show_1pct_low         = p.show_1pct_low;
     g_config.osd_show_smoothness       = p.show_smoothness;
@@ -567,6 +579,8 @@ static void ReadPresetFromINI(int i, const char* P) {
     p.show_limiter          = ReadINIBool(S, "show_limiter", false, P);
     p.show_pqi              = ReadINIBool(S, "show_pqi", false, P);
     p.show_cpu_latency      = ReadINIBool(S, "show_cpu_latency", false, P);
+    p.show_native_pcl       = ReadINIBool(S, "show_native_pcl", false, P);
+    p.show_native_pcl_breakdown = ReadINIBool(S, "show_native_pcl_breakdown", false, P);
     p.show_pqi_breakdown    = ReadINIBool(S, "show_pqi_breakdown", false, P);
     p.show_1pct_low         = ReadINIBool(S, "show_1pct_low", false, P);
     p.show_smoothness       = ReadINIBool(S, "show_smoothness", false, P);
@@ -640,6 +654,8 @@ void OSDPreset_SaveSlot(int slot) {
     WriteINIBool(S, "show_limiter", p.show_limiter, P);
     WriteINIBool(S, "show_pqi", p.show_pqi, P);
     WriteINIBool(S, "show_cpu_latency", p.show_cpu_latency, P);
+    WriteINIBool(S, "show_native_pcl", p.show_native_pcl, P);
+    WriteINIBool(S, "show_native_pcl_breakdown", p.show_native_pcl_breakdown, P);
     WriteINIBool(S, "show_pqi_breakdown", p.show_pqi_breakdown, P);
     WriteINIBool(S, "show_1pct_low", p.show_1pct_low, P);
     WriteINIBool(S, "show_smoothness", p.show_smoothness, P);
