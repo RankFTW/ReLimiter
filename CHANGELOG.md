@@ -10,7 +10,7 @@
 - **G-Sync status now shows per-game profile state** — Reads the driver profile to show whether G-Sync is enabled or disabled for this specific game, not just the display hardware state. Shows "Disabled" when forced off via RHI, NVIDIA App, or Profile Inspector.
 - **VRR range displayed** — Mode line now shows the monitor's VRR range (e.g., "Mode: VRR (30-360Hz)") instead of just "VRR".
 - **Inferred output FPS for third-party FG injectors** — When using DLSS Enabler, OptiScaler, or similar tools, the OSD now shows inferred output FPS (e.g., "~166 fps (83.0 render)") instead of incorrectly reporting render FPS as output. The `~` prefix indicates the value is calculated from render × FG multiplier rather than directly measured.
-- **GPU Power and Voltage on OSD** — New toggles in the System section to show GPU board power draw (watts). Voltage is not yet available on Blackwell GPUs. NVIDIA only.
+- **GPU Power on OSD** — New toggle in the System section to show GPU board power draw in watts. NVIDIA only.
 
 ### Bug Fixes
 - **Fixed scheduler suspending during swapchain recreation** — Games that rapidly create and destroy swapchains (AC Black Flag Resynced, other Streamline DX12 titles) would trigger T4-Suspended, disabling the FPS cap entirely. The scheduler now only suspends when both the swapchain is invalid AND no Reflex markers are flowing for an extended period.
