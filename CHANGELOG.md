@@ -1,15 +1,16 @@
 # Changelog
 
 
-## 3.3.2 (beta)
+## 3.3.2 (beta 2)
 
 ### New Features
-- **OLED Care mode** — Bind a key to black out all monitors and drop FPS to 20 for screen protection while AFK. Deactivates automatically when you alt-tab. Keybind is shared across all games via the RHI presets file. Found in the Screen section below the existing Blackout option.
+- **OLED Care mode** — Bind a key to black out your game monitor (or all monitors) and reduce FPS to your background cap for screen protection while AFK. Keybind is shared across all games via the RHI presets file. Found in the Screen section below the existing Blackout option.
 
 ### UI
 - **G-Sync status now shows per-game profile state** — Reads the driver profile to show whether G-Sync is enabled or disabled for this specific game, not just the display hardware state. Shows "Disabled" when forced off via RHI, NVIDIA App, or Profile Inspector.
 - **VRR range displayed** — Mode line now shows the monitor's VRR range (e.g., "Mode: VRR (30-360Hz)") instead of just "VRR".
 - **Inferred output FPS for third-party FG injectors** — When using DLSS Enabler, OptiScaler, or similar tools, the OSD now shows inferred output FPS (e.g., "~166 fps (83.0 render)") instead of incorrectly reporting render FPS as output. The `~` prefix indicates the value is calculated from render × FG multiplier rather than directly measured.
+- **GPU Power and Voltage on OSD** — New toggles in the System section to show GPU board power draw (watts). Voltage is not yet available on Blackwell GPUs. NVIDIA only.
 
 ### Bug Fixes
 - **Fixed scheduler suspending during swapchain recreation** — Games that rapidly create and destroy swapchains (AC Black Flag Resynced, other Streamline DX12 titles) would trigger T4-Suspended, disabling the FPS cap entirely. The scheduler now only suspends when both the swapchain is invalid AND no Reflex markers are flowing for an extended period.

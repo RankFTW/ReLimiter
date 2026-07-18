@@ -1,5 +1,6 @@
 #include "blackout.h"
 #include "swapchain_manager.h"
+#include "config.h"
 #include "logger.h"
 #include <Windows.h>
 #include <atomic>
@@ -128,12 +129,21 @@ static HWND s_oled_care_hwnds[MAX_BLACKOUT_WINDOWS] = {};
 static int  s_oled_care_count = 0;
 
 static void CreateOLEDCareWindows() {
+    // Find which monitor the game is on
+    HWND game_hwnd = SwapMgr_GetHWND();
+    s_game_monitor = game_hwnd
+        ? MonitorFromWindow(game_hwnd, MONITOR_DEFAULTTONEAREST)
+        : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+
     s_monitor_count = 0;
-    s_game_monitor = nullptr;  // include ALL monitors
     EnumDisplayMonitors(nullptr, nullptr, BlackoutEnumProc, 0);
 
     s_oled_care_count = 0;
     for (int i = 0; i < s_monitor_count && s_oled_care_count < MAX_BLACKOUT_WINDOWS; i++) {
+        // If not all-monitors mode, only black out the game's monitor
+        if (!g_config.oled_care_all_monitors && !s_monitors[i].is_game)
+            continue;
+
         RECT& rc = s_monitors[i].rc;
         int w = rc.right - rc.left;
         int h = rc.bottom - rc.top;
@@ -154,7 +164,8 @@ static void CreateOLEDCareWindows() {
     }
 
     if (s_oled_care_count > 0)
-        LOG_INFO("OLED Care: %d monitor(s) blacked out", s_oled_care_count);
+        LOG_INFO("OLED Care: %d monitor(s) blacked out (all=%d)",
+                 s_oled_care_count, g_config.oled_care_all_monitors ? 1 : 0);
 }
 
 static void DestroyOLEDCareWindows() {
@@ -233,38 +244,12 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
             s_oled_care_active.store(false, std::memory_order_relaxed);
         }
 
-        // OLED Care: auto-deactivate on focus loss
+        // OLED Care: re-raise windows periodically to stay above game
         if (s_oled_care_active.load(std::memory_order_relaxed)) {
-            HWND game_hwnd = SwapMgr_GetHWND();
-            HWND fg = GetForegroundWindow();
-            // Deactivate when the foreground window is NOT the game window
-            // and NOT one of our blackout windows. This handles borderless
-            // games where the process keeps foreground PID but the actual
-            // focused window changes.
-            bool game_focused = (fg == game_hwnd);
-            // Also allow if fg is one of our OLED care windows (they shouldn't
-            // get focus due to WS_EX_NOACTIVATE, but be safe)
-            for (int i = 0; i < s_oled_care_count && !game_focused; i++) {
-                if (fg == s_oled_care_hwnds[i]) game_focused = true;
-            }
-            // If game_hwnd is null, fall back to PID check
-            if (!game_hwnd) {
-                DWORD fg_pid = 0;
-                if (fg) GetWindowThreadProcessId(fg, &fg_pid);
-                game_focused = (fg_pid == GetCurrentProcessId());
-            }
-
-            if (!game_focused) {
-                DestroyOLEDCareWindows();
-                s_oled_care_active.store(false, std::memory_order_relaxed);
-                LOG_INFO("OLED Care: deactivated (focus lost)");
-            } else {
-                // Re-raise windows periodically to stay above game
-                for (int i = 0; i < s_oled_care_count; i++) {
-                    if (s_oled_care_hwnds[i])
-                        SetWindowPos(s_oled_care_hwnds[i], HWND_TOPMOST, 0, 0, 0, 0,
-                                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                }
+            for (int i = 0; i < s_oled_care_count; i++) {
+                if (s_oled_care_hwnds[i])
+                    SetWindowPos(s_oled_care_hwnds[i], HWND_TOPMOST, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
         }
 

@@ -816,6 +816,9 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         if (ImGui::Checkbox("GPU Usage##osd_elem", &g_config.osd_show_gpu_usage)) config_dirty = true;
         HelpTip("GPU graphics engine utilization percentage. NVIDIA only.");
         FlowSeparator();
+        if (ImGui::Checkbox("GPU Power##osd_elem", &g_config.osd_show_gpu_power)) config_dirty = true;
+        HelpTip("GPU board power draw in watts. NVIDIA only.");
+        FlowSeparator();
         if (ImGui::Checkbox("VRAM##osd_elem", &g_config.osd_show_vram)) config_dirty = true;
         HelpTip("Video memory usage (used / total). NVIDIA only.");
         FlowSeparator();
@@ -1011,11 +1014,10 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         ImGui::Spacing();
         {
             ImGui::Text("OLED Care");
-            HelpTip("Blacks out all monitors and reduces FPS to 20 for screen protection while AFK. "
-                     "Deactivates automatically when you alt-tab away. "
-                     "Bind a key below to toggle.");
+            HelpTip("Blacks out monitors and reduces FPS to background cap for screen protection while AFK. "
+                     "Toggle with the keybind below.");
 
-            // OLED Care keybind
+            // OLED Care keybind + All Monitors on same line
             static bool s_oled_care_capturing = false;
             ImGui::Text("OLED Care Key:");
             ImGui::SameLine();
@@ -1056,6 +1058,12 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                         config_dirty = true;
                     }
                 }
+                ImGui::SameLine();
+                ImGui::TextDisabled("|");
+                ImGui::SameLine();
+                if (ImGui::Checkbox("All Monitors##oled_care", &g_config.oled_care_all_monitors))
+                    config_dirty = true;
+                HelpTip("When ticked, all monitors are blacked out. When unticked, only the game's display is blacked out.");
             }
         }
 
@@ -2432,6 +2440,12 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             if (g_config.osd_show_gpu_usage && hw.gpu_usage_pct >= 0) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "GPU Load: %d%%", hw.gpu_usage_pct);
+                OSDTextColored(ColSystem(), buf);
+            }
+
+            if (g_config.osd_show_gpu_power && hw.gpu_power_w >= 0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "GPU Power: %dW", hw.gpu_power_w);
                 OSDTextColored(ColSystem(), buf);
             }
 

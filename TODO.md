@@ -22,3 +22,12 @@
 - [ ] **display_state.cpp:290** — `// TODO: pll.Reanchor(QPC())` — Function exists, never wired up.
 - [ ] **frame_latency_controller.cpp:105** — `// TODO: revisit with FG-aware deferred undo/reapply approach.`
 - [ ] **scheduler.cpp:981** — `row.damping_correction_us = 0.0; // TODO: expose from damping` — Field always zero in CSV.
+
+
+## GPU Power & Voltage
+- [x] **GPU Power draw** — Working via NVML (`nvml.dll`, `nvmlDeviceGetPowerUsage`). Documented, stable, works on all NVIDIA GPUs.
+- [ ] **GPU Voltage not working on Blackwell** — Tried:
+  - `NvAPI_GPU_GetVoltageDomainsStatus` (0xC16C7E2C): returns -9 (incompatible version) with v1 and v2
+  - `NvAPI_GPU_GetPstates20` (0x6FF81213): function resolves but returns -9 with known struct sizes (V1=0x730, V2=0xB88, V3=0xF40) on RTX 5090 / driver 610.62
+  - Both APIs appear deprecated on Blackwell. MSI Afterburner likely uses I2C/SMBus or a proprietary interface.
+  - Will need to revisit when NVIDIA publishes updated NvAPI SDK for Blackwell, or reverse-engineer AB's approach.

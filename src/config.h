@@ -94,6 +94,7 @@ struct Config {
     bool osd_show_gpu_temp = false;
     bool osd_show_gpu_clock = false;
     bool osd_show_gpu_usage = false;
+    bool osd_show_gpu_power = false;
     bool osd_show_vram = false;
     bool osd_show_cpu_usage = false;
     bool osd_show_ram = false;
@@ -108,6 +109,7 @@ struct Config {
     // Monitor Blackout
     std::string blackout_key = "";          // Keybind to toggle monitor blackout
     std::string oled_care_key = "";         // Keybind to toggle OLED Care (all-monitor blackout + 20fps)
+    bool oled_care_all_monitors = true;     // true = black all monitors, false = only game monitor
 
     // Monitor Selection — persist user's chosen display across alt-tab
     int selected_monitor = 0;               // 0 = default (no override), 1+ = monitor index

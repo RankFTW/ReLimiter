@@ -15,6 +15,7 @@ struct HWMonitorData {
     int   gpu_fan_rpm       = -1;   // RPM (from tachometer, may not be available)
     int   gpu_fan_pct       = -1;   // 0–100% (from cooler API, more reliable)
     int   gpu_power_pct     = -1;   // Power usage as % of TDP (undocumented NVAPI)
+    int   gpu_power_w       = -1;   // Power draw in watts
     int64_t vram_used_mb    = -1;   // MB
     int64_t vram_total_mb   = -1;   // MB
 

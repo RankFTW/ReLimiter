@@ -104,6 +104,22 @@ struct HW_NV_GPU_COOLER_SETTINGS {
 };
 using PFN_NvAPI_GPU_GetCoolerSettings = NvAPI_Status(__cdecl*)(NvPhysicalGpuHandle, NvU32, HW_NV_GPU_COOLER_SETTINGS*);
 
+// Power topology — returns power in milliwatts
+// Struct layout varies by driver version. Try a larger struct with more fields.
+struct HW_NV_GPU_POWER_TOPOLOGY_STATUS {
+    NvU32 version;
+    NvU32 count;
+    struct {
+        NvU32 domain;
+        NvU32 unknown1;
+        NvU32 unknown2;
+        NvU32 power_mw;  // milliwatts (offset may vary)
+        NvU32 unknown3;
+        NvU32 unknown4;
+    } entries[4];
+};
+using PFN_NvAPI_GPU_ClientPowerTopologyGetStatus = NvAPI_Status(__cdecl*)(NvPhysicalGpuHandle, HW_NV_GPU_POWER_TOPOLOGY_STATUS*);
+
 // ── Resolved function pointers ──
 static PFN_NvAPI_Initialize                  s_NvAPI_Initialize = nullptr;
 static PFN_NvAPI_EnumPhysicalGPUs            s_NvAPI_EnumPhysicalGPUs = nullptr;
@@ -261,6 +277,51 @@ static void PollGPU(HWMonitorData& d) {
             d.vram_total_mb = static_cast<int64_t>(memInfo.dedicatedVideoMemory / (1024 * 1024));
             int64_t used = static_cast<int64_t>(memInfo.dedicatedVideoMemory - memInfo.curAvailableDedicatedVideoMemory);
             d.vram_used_mb = used / (1024 * 1024);
+        }
+    }
+
+    // Power draw via NVML (documented, stable across all GPU generations)
+    // NVML provides nvmlDeviceGetPowerUsage which returns milliwatts.
+    {
+        static bool s_nvml_init = false;
+        static bool s_nvml_available = false;
+        static void* s_nvml_device = nullptr;
+
+        using PFN_nvmlInit = int(*)();
+        using PFN_nvmlDeviceGetHandleByIndex = int(*)(unsigned int, void**);
+        using PFN_nvmlDeviceGetPowerUsage = int(*)(void*, unsigned int*);
+
+        static PFN_nvmlInit s_nvmlInit = nullptr;
+        static PFN_nvmlDeviceGetHandleByIndex s_nvmlGetHandle = nullptr;
+        static PFN_nvmlDeviceGetPowerUsage s_nvmlGetPower = nullptr;
+
+        if (!s_nvml_init) {
+            s_nvml_init = true;
+            HMODULE nvml = LoadLibraryW(L"nvml.dll");
+            if (nvml) {
+                s_nvmlInit = reinterpret_cast<PFN_nvmlInit>(GetProcAddress(nvml, "nvmlInit_v2"));
+                if (!s_nvmlInit) s_nvmlInit = reinterpret_cast<PFN_nvmlInit>(GetProcAddress(nvml, "nvmlInit"));
+                s_nvmlGetHandle = reinterpret_cast<PFN_nvmlDeviceGetHandleByIndex>(GetProcAddress(nvml, "nvmlDeviceGetHandleByIndex_v2"));
+                if (!s_nvmlGetHandle) s_nvmlGetHandle = reinterpret_cast<PFN_nvmlDeviceGetHandleByIndex>(GetProcAddress(nvml, "nvmlDeviceGetHandleByIndex"));
+                s_nvmlGetPower = reinterpret_cast<PFN_nvmlDeviceGetPowerUsage>(GetProcAddress(nvml, "nvmlDeviceGetPowerUsage"));
+
+                if (s_nvmlInit && s_nvmlGetHandle && s_nvmlGetPower) {
+                    if (s_nvmlInit() == 0) {  // NVML_SUCCESS = 0
+                        if (s_nvmlGetHandle(0, &s_nvml_device) == 0) {
+                            s_nvml_available = true;
+                            LOG_INFO("HWMonitor: NVML initialized for power monitoring");
+                        }
+                    }
+                }
+                if (!s_nvml_available)
+                    LOG_INFO("HWMonitor: NVML not available for power monitoring");
+            }
+        }
+
+        if (s_nvml_available && s_nvmlGetPower && s_nvml_device) {
+            unsigned int power_mw = 0;
+            if (s_nvmlGetPower(s_nvml_device, &power_mw) == 0)
+                d.gpu_power_w = static_cast<int>(power_mw / 1000);
         }
     }
 }

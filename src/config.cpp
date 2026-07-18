@@ -195,6 +195,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.osd_show_gpu_temp       = ReadINIBool(S, "osd_show_gpu_temp", false, P);
     g_config.osd_show_gpu_clock      = ReadINIBool(S, "osd_show_gpu_clock", false, P);
     g_config.osd_show_gpu_usage      = ReadINIBool(S, "osd_show_gpu_usage", false, P);
+    g_config.osd_show_gpu_power      = ReadINIBool(S, "osd_show_gpu_power", false, P);
     g_config.osd_show_vram           = ReadINIBool(S, "osd_show_vram", false, P);
     g_config.osd_show_cpu_usage      = ReadINIBool(S, "osd_show_cpu_usage", false, P);
     g_config.osd_show_ram            = ReadINIBool(S, "osd_show_ram", false, P);
@@ -207,6 +208,7 @@ void LoadConfig(HMODULE hModule) {
     // Monitor Blackout — keybind loaded from shared file if shared_presets enabled
     g_config.blackout_key            = ReadINIString(S, "blackout_key", "", P);
     g_config.oled_care_key           = ReadINIString(S, "oled_care_key", "", P);
+    g_config.oled_care_all_monitors  = ReadINIBool(S, "oled_care_all_monitors", true, P);
 
     // Monitor Selection
     g_config.selected_monitor        = ReadINIInt(S, "selected_monitor", 0, P);
@@ -322,6 +324,7 @@ void SaveConfig() {
     WriteINIBool(S, "osd_show_gpu_temp", g_config.osd_show_gpu_temp, P);
     WriteINIBool(S, "osd_show_gpu_clock", g_config.osd_show_gpu_clock, P);
     WriteINIBool(S, "osd_show_gpu_usage", g_config.osd_show_gpu_usage, P);
+    WriteINIBool(S, "osd_show_gpu_power", g_config.osd_show_gpu_power, P);
     WriteINIBool(S, "osd_show_vram", g_config.osd_show_vram, P);
     WriteINIBool(S, "osd_show_cpu_usage", g_config.osd_show_cpu_usage, P);
     WriteINIBool(S, "osd_show_ram", g_config.osd_show_ram, P);
@@ -340,12 +343,14 @@ void SaveConfig() {
             WriteINIString("Presets", "next_key", g_config.osd_preset_next_key.c_str(), SP);
             WriteINIString("Presets", "blackout_key", g_config.blackout_key.c_str(), SP);
             WriteINIString("Presets", "oled_care_key", g_config.oled_care_key.c_str(), SP);
+            WriteINIBool("Presets", "oled_care_all_monitors", g_config.oled_care_all_monitors, SP);
         }
     } else {
         WriteINIString(S, "osd_preset_prev_key", g_config.osd_preset_prev_key.c_str(), P);
         WriteINIString(S, "osd_preset_next_key", g_config.osd_preset_next_key.c_str(), P);
         WriteINIString(S, "blackout_key", g_config.blackout_key.c_str(), P);
         WriteINIString(S, "oled_care_key", g_config.oled_care_key.c_str(), P);
+        WriteINIBool(S, "oled_care_all_monitors", g_config.oled_care_all_monitors, P);
     }
 
     // ── Adaptive Smoothing ──
@@ -612,6 +617,7 @@ void OSDPreset_LoadAll() {
         if (!blackout.empty()) g_config.blackout_key = blackout;
         std::string oled_care = ReadINIString("Presets", "oled_care_key", "", P);
         if (!oled_care.empty()) g_config.oled_care_key = oled_care;
+        g_config.oled_care_all_monitors = ReadINIBool("Presets", "oled_care_all_monitors", true, P);
     }
 
     // Ensure at least the initial 3 slots exist

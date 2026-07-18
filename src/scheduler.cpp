@@ -308,9 +308,11 @@ void OnMarker(uint64_t frameID, int64_t now) {
         return;
     }
 
-    // ── OLED Care FPS cap (20fps when active) ──
+    // ── OLED Care FPS cap (uses background FPS setting when active) ──
     if (OLEDCare_IsActive()) {
-        double oled_interval_us = 1000000.0 / 20.0;  // 20fps = 50ms
+        int oled_fps = g_background_fps.load(std::memory_order_relaxed);
+        if (oled_fps <= 0) oled_fps = 20;  // fallback if background is uncapped
+        double oled_interval_us = 1000000.0 / static_cast<double>(oled_fps);
         LARGE_INTEGER qpc_now;
         QueryPerformanceCounter(&qpc_now);
         if (s_last_enforcement_ts > 0) {
