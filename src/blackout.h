@@ -18,3 +18,16 @@ void Blackout_SetActive(bool active);
 
 // Returns true if blackout windows are currently showing.
 bool Blackout_IsActive();
+
+// ── OLED Care Mode ──
+// Blacks out ALL monitors (including game's primary) and reduces FPS to 20.
+// Auto-deactivates on focus loss. Never persists active state.
+
+// Toggle OLED Care on/off. Safe to call from any thread.
+void OLEDCare_Toggle();
+
+// Explicitly deactivate OLED Care. Safe to call from any thread.
+void OLEDCare_Deactivate();
+
+// Returns true if OLED Care is currently active.
+bool OLEDCare_IsActive();

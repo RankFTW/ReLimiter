@@ -3,13 +3,16 @@
 
 ## 3.3.2 (beta)
 
-### Bug Fixes
-- **Fixed scheduler suspending during swapchain recreation** — Games that rapidly create and destroy swapchains (AC Black Flag Resynced, other Streamline DX12 titles) would trigger T4-Suspended, disabling the FPS cap entirely. The scheduler now only suspends when both the swapchain is invalid AND no Reflex markers are flowing for an extended period. Swapchain cycling during FG initialization or settings changes no longer interrupts pacing.
+### New Features
+- **OLED Care mode** — Bind a key to black out all monitors and drop FPS to 20 for screen protection while AFK. Deactivates automatically when you alt-tab. Found in the Screen section below the existing Blackout option.
 
 ### UI
 - **G-Sync status now shows per-game profile state** — Reads the driver profile to show whether G-Sync is enabled or disabled for this specific game, not just the display hardware state. Shows "Disabled" when forced off via RHI, NVIDIA App, or Profile Inspector.
 - **VRR range displayed** — Mode line now shows the monitor's VRR range (e.g., "Mode: VRR (30-360Hz)") instead of just "VRR".
 - **Inferred output FPS for third-party FG injectors** — When using DLSS Enabler, OptiScaler, or similar tools, the OSD now shows inferred output FPS (e.g., "~166 fps (83.0 render)") instead of incorrectly reporting render FPS as output. The `~` prefix indicates the value is calculated from render × FG multiplier rather than directly measured.
+
+### Bug Fixes
+- **Fixed scheduler suspending during swapchain recreation** — Games that rapidly create and destroy swapchains (AC Black Flag Resynced, other Streamline DX12 titles) would trigger T4-Suspended, disabling the FPS cap entirely. The scheduler now only suspends when both the swapchain is invalid AND no Reflex markers are flowing for an extended period.
 
 
 ## 3.3.1

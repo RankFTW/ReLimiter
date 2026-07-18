@@ -116,6 +116,59 @@ static void DestroyBlackoutWindows() {
     s_blackout_count = 0;
 }
 
+// ═══════════════════════════════════════════════════════════════
+// OLED Care — state and helpers (must be before BlackoutThread)
+// ═══════════════════════════════════════════════════════════════
+
+static std::atomic<bool> s_oled_care_active{false};
+static std::atomic<bool> s_oled_care_request_show{false};
+static std::atomic<bool> s_oled_care_request_hide{false};
+
+static HWND s_oled_care_hwnds[MAX_BLACKOUT_WINDOWS] = {};
+static int  s_oled_care_count = 0;
+
+static void CreateOLEDCareWindows() {
+    s_monitor_count = 0;
+    s_game_monitor = nullptr;  // include ALL monitors
+    EnumDisplayMonitors(nullptr, nullptr, BlackoutEnumProc, 0);
+
+    s_oled_care_count = 0;
+    for (int i = 0; i < s_monitor_count && s_oled_care_count < MAX_BLACKOUT_WINDOWS; i++) {
+        RECT& rc = s_monitors[i].rc;
+        int w = rc.right - rc.left;
+        int h = rc.bottom - rc.top;
+
+        HWND hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            BLACKOUT_CLASS,
+            L"",
+            WS_POPUP | WS_VISIBLE,
+            rc.left, rc.top, w, h,
+            nullptr, nullptr, nullptr, nullptr);
+
+        if (hwnd) {
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            s_oled_care_hwnds[s_oled_care_count++] = hwnd;
+        }
+    }
+
+    if (s_oled_care_count > 0)
+        LOG_INFO("OLED Care: %d monitor(s) blacked out", s_oled_care_count);
+}
+
+static void DestroyOLEDCareWindows() {
+    for (int i = 0; i < s_oled_care_count; i++) {
+        if (s_oled_care_hwnds[i]) {
+            DestroyWindow(s_oled_care_hwnds[i]);
+            s_oled_care_hwnds[i] = nullptr;
+        }
+    }
+    if (s_oled_care_count > 0)
+        LOG_INFO("OLED Care: %d window(s) destroyed", s_oled_care_count);
+    s_oled_care_count = 0;
+}
+
 // ── Background thread ──
 // Blackout windows need a message pump. This thread creates/destroys
 // them and pumps messages while they're alive.
@@ -168,6 +221,53 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
             was_focused = focused;
         }
 
+        // ── OLED Care: show/hide requests ──
+        if (s_oled_care_request_show.exchange(false, std::memory_order_relaxed)) {
+            DestroyOLEDCareWindows();
+            CreateOLEDCareWindows();
+            s_oled_care_active.store(s_oled_care_count > 0, std::memory_order_relaxed);
+        }
+
+        if (s_oled_care_request_hide.exchange(false, std::memory_order_relaxed)) {
+            DestroyOLEDCareWindows();
+            s_oled_care_active.store(false, std::memory_order_relaxed);
+        }
+
+        // OLED Care: auto-deactivate on focus loss
+        if (s_oled_care_active.load(std::memory_order_relaxed)) {
+            HWND game_hwnd = SwapMgr_GetHWND();
+            HWND fg = GetForegroundWindow();
+            // Deactivate when the foreground window is NOT the game window
+            // and NOT one of our blackout windows. This handles borderless
+            // games where the process keeps foreground PID but the actual
+            // focused window changes.
+            bool game_focused = (fg == game_hwnd);
+            // Also allow if fg is one of our OLED care windows (they shouldn't
+            // get focus due to WS_EX_NOACTIVATE, but be safe)
+            for (int i = 0; i < s_oled_care_count && !game_focused; i++) {
+                if (fg == s_oled_care_hwnds[i]) game_focused = true;
+            }
+            // If game_hwnd is null, fall back to PID check
+            if (!game_hwnd) {
+                DWORD fg_pid = 0;
+                if (fg) GetWindowThreadProcessId(fg, &fg_pid);
+                game_focused = (fg_pid == GetCurrentProcessId());
+            }
+
+            if (!game_focused) {
+                DestroyOLEDCareWindows();
+                s_oled_care_active.store(false, std::memory_order_relaxed);
+                LOG_INFO("OLED Care: deactivated (focus lost)");
+            } else {
+                // Re-raise windows periodically to stay above game
+                for (int i = 0; i < s_oled_care_count; i++) {
+                    if (s_oled_care_hwnds[i])
+                        SetWindowPos(s_oled_care_hwnds[i], HWND_TOPMOST, 0, 0, 0, 0,
+                                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
+            }
+        }
+
         // Pump messages for the blackout windows
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -180,7 +280,9 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
 
     // Cleanup on thread exit
     DestroyBlackoutWindows();
+    DestroyOLEDCareWindows();
     s_active.store(false, std::memory_order_relaxed);
+    s_oled_care_active.store(false, std::memory_order_relaxed);
 
     if (s_class_registered) {
         UnregisterClassW(BLACKOUT_CLASS, nullptr);
@@ -225,4 +327,22 @@ void Blackout_SetActive(bool active) {
 
 bool Blackout_IsActive() {
     return s_active.load(std::memory_order_relaxed);
+}
+
+// ── OLED Care public API ──
+
+void OLEDCare_Toggle() {
+    if (s_oled_care_active.load(std::memory_order_relaxed))
+        s_oled_care_request_hide.store(true, std::memory_order_relaxed);
+    else
+        s_oled_care_request_show.store(true, std::memory_order_relaxed);
+}
+
+void OLEDCare_Deactivate() {
+    if (s_oled_care_active.load(std::memory_order_relaxed))
+        s_oled_care_request_hide.store(true, std::memory_order_relaxed);
+}
+
+bool OLEDCare_IsActive() {
+    return s_oled_care_active.load(std::memory_order_relaxed);
 }

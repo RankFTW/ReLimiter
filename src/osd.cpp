@@ -1007,6 +1007,58 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             }
         }
 
+        // ── OLED Care ──
+        ImGui::Spacing();
+        {
+            ImGui::Text("OLED Care");
+            HelpTip("Blacks out all monitors and reduces FPS to 20 for screen protection while AFK. "
+                     "Deactivates automatically when you alt-tab away. "
+                     "Bind a key below to toggle.");
+
+            // OLED Care keybind
+            static bool s_oled_care_capturing = false;
+            ImGui::Text("OLED Care Key:");
+            ImGui::SameLine();
+            if (s_oled_care_capturing) {
+                ImGui::TextColored(ImVec4(1,1,0.3f,1), "Press key...");
+                ImGui::SameLine();
+                if (ImGui::Button("Cancel##oled_care")) s_oled_care_capturing = false;
+                for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k++) {
+                    ImGuiKey key = static_cast<ImGuiKey>(k);
+                    if (key == ImGuiKey_LeftCtrl || key == ImGuiKey_RightCtrl) continue;
+                    if (key == ImGuiKey_LeftShift || key == ImGuiKey_RightShift) continue;
+                    if (key == ImGuiKey_LeftAlt || key == ImGuiKey_RightAlt) continue;
+                    if (key == ImGuiKey_LeftSuper || key == ImGuiKey_RightSuper) continue;
+                    if (k == ImGuiMod_Ctrl || k == ImGuiMod_Shift || k == ImGuiMod_Alt || k == ImGuiMod_Super) continue;
+                    if (key >= ImGuiKey_MouseLeft && key <= ImGuiKey_MouseWheelY) continue;
+                    const char* kn = ImGui::GetKeyName(key);
+                    if (kn && kn[0] == 'M' && kn[1] == 'o' && kn[2] == 'd') continue;
+                    if (ImGui::IsKeyPressed(key, false)) {
+                        std::string name;
+                        if (ImGui::IsKeyDown(ImGuiMod_Ctrl)) name += "Ctrl+";
+                        if (ImGui::IsKeyDown(ImGuiMod_Alt)) name += "Alt+";
+                        if (ImGui::IsKeyDown(ImGuiMod_Shift)) name += "Shift+";
+                        name += ImGui::GetKeyName(key);
+                        g_config.oled_care_key = name;
+                        s_oled_care_capturing = false;
+                        config_dirty = true;
+                        break;
+                    }
+                }
+            } else {
+                ImGui::Text("%s", g_config.oled_care_key.empty() ? "None" : g_config.oled_care_key.c_str());
+                ImGui::SameLine();
+                if (ImGui::Button("Bind##oled_care")) s_oled_care_capturing = true;
+                if (!g_config.oled_care_key.empty()) {
+                    ImGui::SameLine();
+                    if (ImGui::Button("Clear##oled_care")) {
+                        g_config.oled_care_key.clear();
+                        config_dirty = true;
+                    }
+                }
+            }
+        }
+
         // ── Focus Lock ──
         ImGui::Spacing();
         if (ImGui::Checkbox("Keep Game Focused", &g_config.focus_lock)) {
@@ -1821,6 +1873,33 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                 if (pressed && !s_blackout_pressed)
                     Blackout_Toggle();
                 s_blackout_pressed = pressed;
+            }
+        }
+    }
+
+    // ── OLED Care keybind polling ──
+    {
+        static bool s_oled_care_pressed = false;
+        if (!g_config.oled_care_key.empty()) {
+            ParsedKeybind kb = ParseKeybind(g_config.oled_care_key);
+            if (kb.vk != 0) {
+                bool key_down = (GetAsyncKeyState(kb.vk) & 0x8000) != 0;
+                bool ctrl_held  = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) || (GetAsyncKeyState(VK_RCONTROL) & 0x8000);
+                bool alt_held   = (GetAsyncKeyState(VK_LMENU) & 0x8000) || (GetAsyncKeyState(VK_RMENU) & 0x8000);
+                bool shift_held = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) || (GetAsyncKeyState(VK_RSHIFT) & 0x8000);
+
+                bool mods_ok = true;
+                if (kb.ctrl && !ctrl_held) mods_ok = false;
+                if (kb.alt && !alt_held) mods_ok = false;
+                if (kb.shift && !shift_held) mods_ok = false;
+                if (!kb.ctrl && ctrl_held) mods_ok = false;
+                if (!kb.alt && alt_held) mods_ok = false;
+                if (!kb.shift && shift_held) mods_ok = false;
+
+                bool pressed = key_down && mods_ok;
+                if (pressed && !s_oled_care_pressed)
+                    OLEDCare_Toggle();
+                s_oled_care_pressed = pressed;
             }
         }
     }

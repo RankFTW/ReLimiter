@@ -28,6 +28,7 @@
 #include "streamline_hooks.h"
 #include "focus_lock.h"
 #include "adaptive_smoothing.h"
+#include "blackout.h"
 #include "config.h"
 #include "logger.h"
 #include <Windows.h>
@@ -304,6 +305,26 @@ void OnMarker(uint64_t frameID, int64_t now) {
                 : (SwapMgr_GetActiveAPI() == ActiveAPI::DX11) ? 2
                 : (SwapMgr_GetActiveAPI() == ActiveAPI::OpenGL) ? 3 : 0;
         CSV_Push(row);
+        return;
+    }
+
+    // ── OLED Care FPS cap (20fps when active) ──
+    if (OLEDCare_IsActive()) {
+        double oled_interval_us = 1000000.0 / 20.0;  // 20fps = 50ms
+        LARGE_INTEGER qpc_now;
+        QueryPerformanceCounter(&qpc_now);
+        if (s_last_enforcement_ts > 0) {
+            double elapsed = qpc_to_us(qpc_now.QuadPart - s_last_enforcement_ts);
+            double remaining = oled_interval_us - elapsed;
+            if (remaining > 500.0) {
+                int64_t target_wake = qpc_now.QuadPart + us_to_qpc(remaining);
+                DoOwnSleep(target_wake);
+            }
+        }
+        InvokeSleep(/*passthrough=*/true);
+        QueryPerformanceCounter(&qpc_now);
+        s_last_enforcement_ts = qpc_now.QuadPart;
+        g_predictor.OnEnforcement(frameID, qpc_now.QuadPart);
         return;
     }
 

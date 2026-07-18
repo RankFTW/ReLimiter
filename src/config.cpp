@@ -206,6 +206,7 @@ void LoadConfig(HMODULE hModule) {
 
     // Monitor Blackout — keybind loaded from shared file if shared_presets enabled
     g_config.blackout_key            = ReadINIString(S, "blackout_key", "", P);
+    g_config.oled_care_key           = ReadINIString(S, "oled_care_key", "", P);
 
     // Monitor Selection
     g_config.selected_monitor        = ReadINIInt(S, "selected_monitor", 0, P);
@@ -338,11 +339,13 @@ void SaveConfig() {
             WriteINIString("Presets", "prev_key", g_config.osd_preset_prev_key.c_str(), SP);
             WriteINIString("Presets", "next_key", g_config.osd_preset_next_key.c_str(), SP);
             WriteINIString("Presets", "blackout_key", g_config.blackout_key.c_str(), SP);
+            WriteINIString("Presets", "oled_care_key", g_config.oled_care_key.c_str(), SP);
         }
     } else {
         WriteINIString(S, "osd_preset_prev_key", g_config.osd_preset_prev_key.c_str(), P);
         WriteINIString(S, "osd_preset_next_key", g_config.osd_preset_next_key.c_str(), P);
         WriteINIString(S, "blackout_key", g_config.blackout_key.c_str(), P);
+        WriteINIString(S, "oled_care_key", g_config.oled_care_key.c_str(), P);
     }
 
     // ── Adaptive Smoothing ──
@@ -607,6 +610,8 @@ void OSDPreset_LoadAll() {
         if (!next.empty()) g_config.osd_preset_next_key = next;
         std::string blackout = ReadINIString("Presets", "blackout_key", "", P);
         if (!blackout.empty()) g_config.blackout_key = blackout;
+        std::string oled_care = ReadINIString("Presets", "oled_care_key", "", P);
+        if (!oled_care.empty()) g_config.oled_care_key = oled_care;
     }
 
     // Ensure at least the initial 3 slots exist
