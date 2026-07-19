@@ -1,7 +1,7 @@
 # Changelog
 
 
-## 3.3.2 (beta 2)
+## 3.3.2
 
 ### New Features
 - **OLED Care mode** — Bind a key to black out your game monitor (or all monitors) and reduce FPS to your background cap for screen protection while AFK. Keybind is shared across all games via the RHI presets file. Found in the Screen section below the existing Blackout option.
