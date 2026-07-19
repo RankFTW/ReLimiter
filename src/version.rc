@@ -1,11 +1,12 @@
 #include <winresrc.h>
+#include "relimiter_version.h"
 
-#define VER_MAJOR 3
-#define VER_MINOR 3
-#define VER_PATCH 1
+#define VER_MAJOR RELIMITER_VERSION_MAJOR
+#define VER_MINOR RELIMITER_VERSION_MINOR
+#define VER_PATCH RELIMITER_VERSION_PATCH
 #define VER_BUILD 0
 
-#define VER_STR "3.3.1.0"
+#define VER_STR RELIMITER_VERSION_STRING_RC
 #define VER_PRODUCT "ReLimiter"
 #define VER_DESCRIPTION "G-Sync/VRR Frame Pacing Addon for ReShade"
 #define VER_COPYRIGHT "RankFTW, Lazorr, UltraMatt"

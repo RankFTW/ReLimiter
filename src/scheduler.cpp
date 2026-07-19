@@ -30,6 +30,9 @@
 #include "adaptive_smoothing.h"
 #include "config.h"
 #include "logger.h"
+#ifdef RELIMITER_ENABLE_MCP
+#include "live_debug.h"
+#endif
 #include <Windows.h>
 #include <algorithm>
 #include <cmath>
@@ -304,6 +307,9 @@ void OnMarker(uint64_t frameID, int64_t now) {
                 : (SwapMgr_GetActiveAPI() == ActiveAPI::DX11) ? 2
                 : (SwapMgr_GetActiveAPI() == ActiveAPI::OpenGL) ? 3 : 0;
         CSV_Push(row);
+    #ifdef RELIMITER_ENABLE_MCP
+        LiveDebug_PushScheduler(row);
+    #endif
         return;
     }
 
@@ -1020,6 +1026,9 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     s_prev_actual_ft = telemetry_ft;
 
     CSV_Push(row);
+#ifdef RELIMITER_ENABLE_MCP
+    LiveDebug_PushScheduler(row);
+#endif
 
     // ── Stall detection logging ──
     // Log any frame where driver sleep or total frame time exceeds 50ms.

@@ -38,6 +38,9 @@
 #include "vsync_control.h"
 #include "flip_model.h"
 #include "native_pcl_measurement.h"
+#ifdef RELIMITER_ENABLE_MCP
+#include "live_debug.h"
+#endif
 
 // g_swapchain moved to flush.cpp (managed by OnInitSwapchain/OnDestroySwapchain)
 // g_presenting_swapchain moved to correlator.cpp (read-only consumer)
@@ -270,6 +273,10 @@ static void on_present(reshade::api::command_queue* queue,
 
     // Skip all present work if swapchain is not valid (between destroy and init)
     if (!SwapMgr_IsValid() || !sc) return;
+
+#ifdef RELIMITER_ENABLE_MCP
+    LiveDebug_StartIfReady();
+#endif
 
     // Native PCL waits for meaningful latency activity so the ETW session
     // does not ingest the game's unrelated startup burst. Markerless games
@@ -521,6 +528,9 @@ void WINAPI AddonUninit(HMODULE /*addon_module*/, HMODULE /*reshade_module*/) {
     // Stop ETW while hooks, telemetry, and logging are still alive. This
     // blocks until ProcessTrace has drained and the collector thread exits.
     NativePcl_Stop();
+#ifdef RELIMITER_ENABLE_MCP
+    LiveDebug_Stop();
+#endif
 
     SaveConfig();
     SetUnhandledExceptionFilter(ShutdownCrashHandler);
@@ -575,6 +585,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         // Normal teardown happens in AddonUninit; this only reports a skipped
         // shutdown for abnormal unload/process-termination paths.
         NativePcl_NotifyProcessDetach();
+    #ifdef RELIMITER_ENABLE_MCP
+        LiveDebug_NotifyProcessDetach();
+    #endif
         // If AddonUninit was not called (abnormal unload), clean up.
         if (s_addon_initialised) {
             LOG_WARN("AddonUninit was not called — cleaning up in DllMain");

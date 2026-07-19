@@ -4,6 +4,25 @@ project(relimiter LANGUAGES CXX C)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(RELIMITER_ENABLE_MCP
+    "Build read-only live pacing telemetry and the MCP stdio bridge"
+    OFF)
+
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" RELIMITER_VERSION LIMIT_COUNT 1)
+string(STRIP "${RELIMITER_VERSION}" RELIMITER_VERSION)
+if(NOT RELIMITER_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
+    message(FATAL_ERROR "VERSION must contain a semantic version such as 3.3.1")
+endif()
+set(RELIMITER_VERSION_MAJOR "${CMAKE_MATCH_1}")
+set(RELIMITER_VERSION_MINOR "${CMAKE_MATCH_2}")
+set(RELIMITER_VERSION_PATCH "${CMAKE_MATCH_3}")
+set(RELIMITER_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+file(MAKE_DIRECTORY "${RELIMITER_GENERATED_INCLUDE_DIR}")
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/relimiter_version.h.in"
+    "${RELIMITER_GENERATED_INCLUDE_DIR}/relimiter_version.h"
+    @ONLY)
+
 # ── Architecture detection ──
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(RELIMITER_64BIT TRUE)
@@ -69,6 +88,10 @@ set(ADDON_SOURCES
     src/blackout.cpp
     src/focus_lock.cpp
 )
+
+if(RELIMITER_ENABLE_MCP)
+    list(APPEND ADDON_SOURCES src/live_debug.cpp)
+endif()
 
 # ── 64-bit only sources ──
 if(RELIMITER_64BIT)
@@ -178,6 +201,7 @@ set_target_properties(relimiter PROPERTIES
 # ── Include paths ──
 target_include_directories(relimiter PRIVATE
     ${CMAKE_SOURCE_DIR}/src
+    ${RELIMITER_GENERATED_INCLUDE_DIR}
     ${CMAKE_SOURCE_DIR}/deps/reshade/include
     ${CMAKE_SOURCE_DIR}/deps/reshade/deps/imgui
     ${CMAKE_SOURCE_DIR}/deps/reshade/deps/minhook/include
@@ -194,6 +218,10 @@ target_compile_definitions(relimiter PRIVATE
     VK_NO_PROTOTYPES
     $<$<NOT:$<BOOL:${RELIMITER_64BIT}>>:RELIMITER_32BIT>
 )
+
+if(RELIMITER_ENABLE_MCP)
+    target_compile_definitions(relimiter PRIVATE RELIMITER_ENABLE_MCP=1)
+endif()
 
 # ImGui symbols resolved at runtime by ReShade — no force-include needed
 
@@ -248,6 +276,34 @@ else()
         winmm.lib
         ${CMAKE_SOURCE_DIR}/deps/nvapi/x86/nvapi.lib
     )
+endif()
+
+# ── Optional read-only MCP stdio bridge ──
+if(RELIMITER_ENABLE_MCP)
+    add_executable(relimiter_mcp_bridge
+        tools/mcp_bridge/main.cpp
+        tools/mcp_bridge/json.cpp
+    )
+    target_compile_features(relimiter_mcp_bridge PRIVATE cxx_std_20)
+    target_compile_definitions(relimiter_mcp_bridge PRIVATE
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+        UNICODE
+        _UNICODE
+    )
+    target_include_directories(relimiter_mcp_bridge PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/tools/mcp_bridge
+        ${RELIMITER_GENERATED_INCLUDE_DIR}
+    )
+    set_target_properties(relimiter_mcp_bridge PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    if(MSVC)
+        set_property(TARGET relimiter_mcp_bridge PROPERTY
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        target_compile_options(relimiter_mcp_bridge PRIVATE /W4 /utf-8 /permissive-)
+    endif()
 endif()
 
 # ── MinHook C files: handled by minhook_static target ──

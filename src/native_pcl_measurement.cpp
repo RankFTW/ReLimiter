@@ -11,6 +11,9 @@
 
 #include "csv_writer.h"
 #include "logger.h"
+#ifdef RELIMITER_ENABLE_MCP
+#include "live_debug.h"
+#endif
 #include "native_pcl_measurement_internal.h"
 
 namespace
@@ -238,6 +241,9 @@ void NativePclInternal_PublishSample(
     telemetry_row.frame_type = sample.frame_type;
     telemetry_row.used_simulation_fallback = sample.used_simulation_fallback;
     CSV_PushNativePcl(telemetry_row);
+#ifdef RELIMITER_ENABLE_MCP
+    LiveDebug_PushNativePcl(telemetry_row);
+#endif
 }
 
 void NativePcl_SetEnabled(bool enabled) noexcept
