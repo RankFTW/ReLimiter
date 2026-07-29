@@ -1,6 +1,24 @@
 # Changelog
 
 
+## 3.3.3-beta
+
+### New Features
+- **Default OSD preset** — When using the shared presets file (RHI), you can now set a default OSD layout that applies automatically every time you launch any game. Set it once from any game's ReShade panel using the new "Set as Default" button in the OSD section. Individual games can still override it by saving their own preset.
+- **OLED Care idle timer** — Set a number of minutes of inactivity before OLED Care activates automatically. Any keyboard keypress, mouse click, or controller input will turn it back off. Configure it in the Screen section alongside the existing OLED Care keybind. Saved to the shared presets file.
+
+### Improvements
+- **OSD anchor point now adapts to screen position** — When the overlay is positioned on the right half of the screen it anchors to the right edge, and to the bottom edge when in the lower half. This lets you place the OSD flush against any corner or edge without it overflowing off-screen.
+- **VRR range now hidden when the floor frequency can't be determined accurately** — Previously ReLimiter would show a hardcoded 30Hz floor when the driver didn't report the correct value, giving misleading information. It now shows just "VRR" with no range in that case.
+
+### Bug Fixes
+- **OLED Care: mouse cursor is now hidden when blacked-out monitors are active** — Previously the cursor remained visible over the black overlay when moving the mouse. Also applies to the secondary monitor blackout feature.
+- **Reduced log file spam for games without DXGI frame statistics** — Affected Vulkan, DX9, and some DX12 games (e.g. Arknights: Endfield) where `relimiter.log` would grow very large over time.
+- **Reduced log file spam at high FPS targets** — Presentation gate warnings were logged every frame above 144fps, bloating log files.
+- **Fixed 1% low and FPS display showing incorrect values when Frame Generation isn't active** — The 1% low could show a value higher than max FPS, and the FPS display could incorrectly show a "(render)" suffix when FG wasn't running. This happened when FG state was stale (transitions, driver-reported defaults) or when loading screen frame times contaminated the rolling window. The 1% low window now also clears immediately when FG toggles on or off.
+- **Fixed GPU Power not included in the "Full" OSD preset** — The GPU Power toggle was added in 3.3.2 but wasn't included when clicking the Full preset button, so it had to be manually ticked each time.
+
+
 ## 3.3.2
 
 ### New Features

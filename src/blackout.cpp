@@ -41,6 +41,10 @@ static LRESULT CALLBACK BlackoutWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         return 0;
     case WM_NCHITTEST:
         return HTTRANSPARENT;  // click-through
+    case WM_SETCURSOR:
+        // Hide cursor over all blackout windows (including OLED Care)
+        SetCursor(nullptr);
+        return TRUE;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -163,9 +167,12 @@ static void CreateOLEDCareWindows() {
         }
     }
 
-    if (s_oled_care_count > 0)
+    if (s_oled_care_count > 0) {
         LOG_INFO("OLED Care: %d monitor(s) blacked out (all=%d)",
                  s_oled_care_count, g_config.oled_care_all_monitors ? 1 : 0);
+        // Hide cursor system-wide while OLED Care is active
+        while (ShowCursor(FALSE) >= 0) {}  // decrement until hidden (counter may be > 0)
+    }
 }
 
 static void DestroyOLEDCareWindows() {
@@ -175,14 +182,19 @@ static void DestroyOLEDCareWindows() {
             s_oled_care_hwnds[i] = nullptr;
         }
     }
-    if (s_oled_care_count > 0)
+    if (s_oled_care_count > 0) {
         LOG_INFO("OLED Care: %d window(s) destroyed", s_oled_care_count);
+        // Restore cursor visibility
+        while (ShowCursor(TRUE) < 0) {}  // increment until visible
+    }
     s_oled_care_count = 0;
 }
 
 // ── Background thread ──
 // Blackout windows need a message pump. This thread creates/destroys
 // them and pumps messages while they're alive.
+static DWORD s_last_raw_input_tick = 0;  // Updated on physical HID input via WM_INPUT
+
 static DWORD WINAPI BlackoutThread(LPVOID) {
     // Register window class on this thread
     if (!s_class_registered) {
@@ -190,10 +202,38 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
         wc.cbSize = sizeof(wc);
         wc.lpfnWndProc = BlackoutWndProc;
         wc.hInstance = nullptr;
-        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hCursor = nullptr;  // WM_SETCURSOR handler hides cursor over blackout windows
         wc.lpszClassName = BLACKOUT_CLASS;
         if (RegisterClassExW(&wc))
             s_class_registered = true;
+    }
+
+    // Create a hidden message-only window to receive Raw Input events.
+    // Raw Input comes from the kernel HID stack and reflects actual physical
+    // device activity — unlike GetLastInputInfo which counts synthetic events
+    // (e.g. SetCursorPos from games). We use this for the OLED Care idle timer.
+    HWND h_rawinput_wnd = CreateWindowExW(0, L"STATIC", nullptr, 0,
+        0, 0, 0, 0, HWND_MESSAGE, nullptr, nullptr, nullptr);
+
+    if (h_rawinput_wnd) {
+        RAWINPUTDEVICE rid[3] = {};
+        // Mouse
+        rid[0].usUsagePage = 0x01;
+        rid[0].usUsage     = 0x02;
+        rid[0].dwFlags     = RIDEV_INPUTSINK;
+        rid[0].hwndTarget  = h_rawinput_wnd;
+        // Keyboard
+        rid[1].usUsagePage = 0x01;
+        rid[1].usUsage     = 0x06;
+        rid[1].dwFlags     = RIDEV_INPUTSINK;
+        rid[1].hwndTarget  = h_rawinput_wnd;
+        // Gamepad / joystick (HID generic desktop: gamepad=0x05, joystick=0x04)
+        rid[2].usUsagePage = 0x01;
+        rid[2].usUsage     = 0x05;
+        rid[2].dwFlags     = RIDEV_INPUTSINK;
+        rid[2].hwndTarget  = h_rawinput_wnd;
+        RegisterRawInputDevices(rid, 3, sizeof(RAWINPUTDEVICE));
+        s_last_raw_input_tick = GetTickCount();
     }
 
     bool was_focused = true;
@@ -244,6 +284,38 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
             s_oled_care_active.store(false, std::memory_order_relaxed);
         }
 
+        // ── OLED Care: idle timer auto-activate / deactivate ──
+        {
+            static bool s_idle_activated = false;  // true if we auto-activated (not user keybind)
+            int idle_minutes = g_config.oled_care_idle_minutes;
+            if (idle_minutes > 0) {
+                // Use our own raw input timestamp — immune to synthetic SetCursorPos from games.
+                // s_last_raw_input_tick is updated by WM_INPUT (physical HID only).
+                DWORD idle_ms = GetTickCount() - s_last_raw_input_tick;
+                DWORD threshold_ms = static_cast<DWORD>(idle_minutes) * 60000;
+
+                bool oled_on = s_oled_care_active.load(std::memory_order_relaxed);
+
+                if (!oled_on && !s_idle_activated && idle_ms >= threshold_ms) {
+                    // Idle threshold reached — auto-activate
+                    DestroyOLEDCareWindows();
+                    CreateOLEDCareWindows();
+                    s_oled_care_active.store(s_oled_care_count > 0, std::memory_order_relaxed);
+                    s_idle_activated = true;
+                    LOG_INFO("OLED Care: auto-activated after %d min idle", idle_minutes);
+                } else if (oled_on && s_idle_activated && idle_ms < 1000) {
+                    // Input detected — auto-deactivate (only if we auto-activated)
+                    DestroyOLEDCareWindows();
+                    s_oled_care_active.store(false, std::memory_order_relaxed);
+                    s_idle_activated = false;
+                    LOG_INFO("OLED Care: auto-deactivated on input");
+                } else if (!oled_on) {
+                    // If user manually dismissed it, clear the flag so timer can fire again
+                    s_idle_activated = false;
+                }
+            }
+        }
+
         // OLED Care: re-raise windows periodically to stay above game
         if (s_oled_care_active.load(std::memory_order_relaxed)) {
             for (int i = 0; i < s_oled_care_count; i++) {
@@ -253,11 +325,31 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
             }
         }
 
-        // Pump messages for the blackout windows
+        // Pump messages for the blackout windows and raw input window
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_INPUT) {
+                // Physical input from kernel HID stack — update our own idle timestamp.
+                s_last_raw_input_tick = GetTickCount();
+                DefWindowProcW(msg.hwnd, msg.message, msg.wParam, msg.lParam);
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+
+        // Mouse button fallback: GetAsyncKeyState reflects real HID button state.
+        // Games in exclusive mouse mode block WM_INPUT for mouse movement but
+        // button presses still register in the virtual key table.
+        {
+            static SHORT s_prev_lb = 0, s_prev_rb = 0, s_prev_mb = 0;
+            SHORT lb = GetAsyncKeyState(VK_LBUTTON);
+            SHORT rb = GetAsyncKeyState(VK_RBUTTON);
+            SHORT mb = GetAsyncKeyState(VK_MBUTTON);
+            if ((lb & 0x8000) && !(s_prev_lb & 0x8000)) s_last_raw_input_tick = GetTickCount();
+            if ((rb & 0x8000) && !(s_prev_rb & 0x8000)) s_last_raw_input_tick = GetTickCount();
+            if ((mb & 0x8000) && !(s_prev_mb & 0x8000)) s_last_raw_input_tick = GetTickCount();
+            s_prev_lb = lb; s_prev_rb = rb; s_prev_mb = mb;
         }
 
         Sleep(16);  // ~60Hz message pump

@@ -190,8 +190,9 @@ void QueryVRRFloor() {
     NvU32 display_id = DispRes_GetDisplayID();
 
     if (!s_GetMonitorCapabilities || display_id == 0) {
-        // fallback: 30Hz
-        g_floor_hz.store(30.0, std::memory_order_relaxed);
+        // Display_ID not yet resolved — mark floor as unknown (0.0)
+        // g_floor_interval_us stays at 30Hz for pacing conservatism
+        g_floor_hz.store(0.0, std::memory_order_relaxed);
         g_floor_interval_us.store(33333.0, std::memory_order_relaxed);
         return;
     }
@@ -209,8 +210,8 @@ void QueryVRRFloor() {
         }
     }
 
-    // fallback: 30Hz (conservative)
-    g_floor_hz.store(30.0, std::memory_order_relaxed);
+    // NvAPI returned 0 or failed — floor unknown, don't show a made-up value
+    g_floor_hz.store(0.0, std::memory_order_relaxed);
     g_floor_interval_us.store(33333.0, std::memory_order_relaxed);
 }
 

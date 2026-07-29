@@ -110,6 +110,7 @@ struct Config {
     std::string blackout_key = "";          // Keybind to toggle monitor blackout
     std::string oled_care_key = "";         // Keybind to toggle OLED Care (all-monitor blackout + 20fps)
     bool oled_care_all_monitors = true;     // true = black all monitors, false = only game monitor
+    int oled_care_idle_minutes = 0;         // 0 = disabled, >0 = auto-activate after N minutes of no input
 
     // Monitor Selection — persist user's chosen display across alt-tab
     int selected_monitor = 0;               // 0 = default (no override), 1+ = monitor index
@@ -160,6 +161,7 @@ struct OSDPreset {
     bool show_gpu_temp = false;
     bool show_gpu_clock = false;
     bool show_gpu_usage = false;
+    bool show_gpu_power = false;
     bool show_vram = false;
     bool show_cpu_usage = false;
     bool show_ram = false;
@@ -192,6 +194,13 @@ void OSDPreset_DeleteSlot(int slot);
 
 // Get current number of preset slots.
 int OSDPreset_GetCount();
+
+// ── Default preset (shared mode only) ──
+// Applied automatically at startup for every game when shared_presets = true.
+bool OSDPreset_HasDefault();
+const OSDPreset& OSDPreset_GetDefault();
+void OSDPreset_SaveDefault(const OSDPreset& p);  // saves current config as default
+void OSDPreset_ClearDefault();
 
 // Add a new empty preset slot. Returns the new slot index, or -1 if at max.
 int OSDPreset_AddSlot();

@@ -440,6 +440,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             p.show_gpu_temp = true;
             p.show_gpu_clock = true;
             p.show_gpu_usage = true;
+            p.show_gpu_power = true;
             p.show_vram = true;
             p.show_cpu_usage = true;
             p.show_ram = true;
@@ -563,6 +564,38 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             }
         }
 
+        // ── Default preset (shared mode only) ──
+        // Applied automatically at game launch for every game.
+        if (g_config.shared_presets) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("|");
+            ImGui::SameLine();
+            if (OSDPreset_HasDefault()) {
+                char def_label[48];
+                snprintf(def_label, sizeof(def_label), "Default: %s", OSDPreset_GetDefault().name);
+                ImGui::TextDisabled("%s", def_label);
+                ImGui::SameLine();
+                if (ImGui::Button("Update##default_preset")) {
+                    OSDPreset p = OSDPreset_FromConfig();
+                    snprintf(p.name, sizeof(p.name), "%s", OSDPreset_GetDefault().name);
+                    OSDPreset_SaveDefault(p);
+                }
+                HelpTip("Update the default preset with the current OSD layout. Applied automatically on launch for every game.");
+                ImGui::SameLine();
+                if (ImGui::Button("Clear##default_preset")) {
+                    OSDPreset_ClearDefault();
+                }
+                HelpTip("Remove the default preset. Games will use their own saved OSD layout.");
+            } else {
+                if (ImGui::Button("Set as Default##default_preset")) {
+                    OSDPreset p = OSDPreset_FromConfig();
+                    snprintf(p.name, sizeof(p.name), "Default");
+                    OSDPreset_SaveDefault(p);
+                }
+                HelpTip("Save the current OSD layout as the default. It will be applied automatically on launch for every game using the shared presets file.");
+            }
+        }
+
         // ── Preset cycling keybinds ──
         {
             // Built-in preset definitions for cycling
@@ -588,7 +621,7 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                     p.show_pqi = true; p.show_pqi_breakdown = true;
                     p.show_smoothness = true; p.show_fg = true; p.show_limiter = true;
                     p.show_adaptive_smoothing = true; p.show_gpu_temp = true;
-                    p.show_gpu_clock = true; p.show_gpu_usage = true; p.show_vram = true;
+                    p.show_gpu_clock = true; p.show_gpu_usage = true; p.show_gpu_power = true; p.show_vram = true;
                     p.show_cpu_usage = true; p.show_ram = true;
                     p.show_dlss_quality = true; p.show_dlss_features = true;
                     p.show_dlss_resolution = true; p.show_dlss_presets = true;
@@ -1064,6 +1097,30 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 if (ImGui::Checkbox("All Monitors##oled_care", &g_config.oled_care_all_monitors))
                     config_dirty = true;
                 HelpTip("When ticked, all monitors are blacked out. When unticked, only the game's display is blacked out.");
+            }
+
+            // ── Idle timer ──
+            {
+                static int s_idle_edit = 0;
+                static bool s_idle_active = false;
+                if (!s_idle_active)
+                    s_idle_edit = g_config.oled_care_idle_minutes;
+
+                ImGui::Text("Auto after idle:");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(45.0f);
+                if (ImGui::InputInt("min##oled_care_idle_input", &s_idle_edit, 0, 0)) {
+                    if (s_idle_edit < 0) s_idle_edit = 0;
+                    if (s_idle_edit > 999) s_idle_edit = 999;
+                    g_config.oled_care_idle_minutes = s_idle_edit;
+                    config_dirty = true;
+                }
+                s_idle_active = ImGui::IsItemActive();
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    g_config.oled_care_idle_minutes = s_idle_edit;
+                    config_dirty = true;
+                }
+                HelpTip("Automatically activate OLED Care after this many minutes without any mouse, keyboard, or controller input. 0 = disabled. Pressing a key, clicking a mouse button, or using a controller will turn it back off. Note: mouse movement cannot be detected while a game has exclusive mouse control.");
             }
         }
 
@@ -1569,6 +1626,13 @@ static double s_cached_1pct_low = 0.0;
 static double s_cached_01pct_low = 0.0;
 static int    s_low_recompute_counter = 0;
 
+void OSD_ResetLowHistory() {
+    s_low_history_count = 0;
+    s_low_history_idx = 0;
+    s_cached_1pct_low = 0.0;
+    s_cached_01pct_low = 0.0;
+}
+
 static void RecomputeLowFPS() {
     int n = s_low_history_count < LOW_HISTORY_SIZE ? s_low_history_count : LOW_HISTORY_SIZE;
 
@@ -1827,7 +1891,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                 p.show_pqi = true; p.show_pqi_breakdown = true;
                 p.show_smoothness = true; p.show_fg = true; p.show_limiter = true;
                 p.show_adaptive_smoothing = true; p.show_gpu_temp = true;
-                p.show_gpu_clock = true; p.show_gpu_usage = true; p.show_vram = true;
+                p.show_gpu_clock = true; p.show_gpu_usage = true; p.show_gpu_power = true; p.show_vram = true;
                 p.show_cpu_usage = true; p.show_ram = true;
                 p.show_dlss_quality = true; p.show_dlss_features = true;
                 p.show_dlss_resolution = true; p.show_dlss_presets = true;
@@ -2007,7 +2071,11 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
     ImVec2 display = ImGui::GetIO().DisplaySize;
     float px_x = g_config.osd_x * display.x;
     float px_y = g_config.osd_y * display.y;
-    ImGui::SetNextWindowPos({px_x, px_y}, ImGuiCond_Always);
+    // Anchor point flips based on position quadrant so the OSD stays within
+    // screen bounds and sits flush against whichever edge it's near.
+    float pivot_x = (g_config.osd_x > 0.5f) ? 1.0f : 0.0f;
+    float pivot_y = (g_config.osd_y > 0.5f) ? 1.0f : 0.0f;
+    ImGui::SetNextWindowPos({px_x, px_y}, ImGuiCond_Always, {pivot_x, pivot_y});
     ImGui::SetNextWindowBgAlpha(g_config.osd_opacity);
 
     if (ImGui::Begin("##limiter_osd", nullptr,
@@ -2025,17 +2093,20 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
             double display_ft = ft;
             if (IsNvSmoothMotionActive())
                 display_ft = ft / 2.0;  // SM always 2x
-            else if (fg_presenting && fg_mult > 0) {
+            else if (fg_presenting && fg_mult > 0 && (IsFGDllLoaded() || IsDmfgActive())) {
                 // Use the real divisor (accounts for DRS MFG override)
                 int divisor = ComputeFGDivisorRaw();
                 if (divisor >= 2)
                     display_ft = ft / static_cast<double>(divisor);
-                else
-                    display_ft = ft / static_cast<double>(fg_mult + 1);
+                // else: divisor < 2 means FG not confirmed — don't divide, use ft as-is
             }
-            s_low_history[s_low_history_idx] = display_ft;
-            s_low_history_idx = (s_low_history_idx + 1) % LOW_HISTORY_SIZE;
-            if (s_low_history_count < LOW_HISTORY_SIZE) s_low_history_count++;
+            // Feed 1% low history when actively pacing (T0-T2a).
+            // T3/T4 are passthrough — unlocked frame times corrupt the window.
+            if (g_current_tier < Tier::Tier3) {
+                s_low_history[s_low_history_idx] = display_ft;
+                s_low_history_idx = (s_low_history_idx + 1) % LOW_HISTORY_SIZE;
+                if (s_low_history_count < LOW_HISTORY_SIZE) s_low_history_count++;
+            }
         }
 
         // Recompute 1%/0.1% low every 30 frames (~5Hz) instead of every frame
@@ -2055,7 +2126,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                 snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", s_display_fps * 2.0, s_display_fps);
             } else if (IsDmfgActive() && output > 0.0) {
                 snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", output, s_display_fps);
-            } else if (output > 0.0 && fg_presenting && fg_mult > 0) {
+            } else if (output > 0.0 && fg_presenting && fg_mult > 0 && fg_div_raw > 1 && (IsFGDllLoaded() || IsDmfgActive())) {
                 // Check if output counter is seeing FG presents.
                 // If output ≈ render (within 20%), the counter only sees native presents
                 // (third-party FG injector case). Infer output from render × divisor.
@@ -2067,7 +2138,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                 } else {
                     snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", output, s_display_fps);
                 }
-            } else if (fg_div_raw > 1 && s_display_fps > 1.0) {
+            } else if (fg_div_raw > 1 && s_display_fps > 1.0 && (IsFGDllLoaded() || IsDmfgActive())) {
                 // FG active but no output counter data — infer
                 double inferred = s_display_fps * static_cast<double>(fg_div_raw);
                 snprintf(buf, sizeof(buf), "~%.0f fps (%.1f render)", inferred, s_display_fps);
@@ -2182,7 +2253,7 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
         // PIPELINE (light blue)
         // ═══════════════════════════════════
 #ifdef _WIN64
-        if (g_config.osd_show_fg) {
+        if (g_config.osd_show_fg && (IsFGDllLoaded() || IsNvSmoothMotionActive())) {
             char buf[48];
             if (IsNvSmoothMotionActive()) {
                 snprintf(buf, sizeof(buf), "FG: Smooth Motion");

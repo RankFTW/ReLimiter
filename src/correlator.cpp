@@ -126,7 +126,12 @@ IDXGISwapChain* TryResolveStatsSwapchain() {
         }
     }
 
-    LOG_WARN("Stats resolution failed: no source responds to GetFrameStatistics");
+    static int s_stats_fail_log_count = 0;
+    if (s_stats_fail_log_count < 3)
+        LOG_WARN("Stats resolution failed: no source responds to GetFrameStatistics");
+    else if (s_stats_fail_log_count == 3)
+        LOG_WARN("Stats resolution failed: suppressing further warnings");
+    s_stats_fail_log_count++;
     // If we unwrapped but didn't store it, release the AddRef
     if (unwrapped && unwrapped != g_stats_swapchain) {
         unwrapped->Release();

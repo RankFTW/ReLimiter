@@ -10,6 +10,7 @@
 #include "swapchain_manager.h"
 #include "tier.h"
 #include "wake_guard.h"
+#include "osd.h"
 #include <dxgi.h>
 
 // g_swapchain: DX12 swapchain pointer, managed here by OnInitSwapchain/OnDestroySwapchain.
@@ -105,6 +106,7 @@ void OnFGStateChange() {
     }
     s_last_fg_flush_qpc = now.QuadPart;
     Flush(FLUSH_CORRELATOR);
+    OSD_ResetLowHistory();  // stale FG frame times corrupt the 1% low window
 }
 
 void OnCorrelatorOverflow() {

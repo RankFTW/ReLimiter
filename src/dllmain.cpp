@@ -443,8 +443,13 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         LOG_INFO("Telemetry initialized");
 
         InitDisplayState();
-        LOG_INFO("Display: ceiling=%.1fHz, floor=%.1fHz",
-                 g_ceiling_hz.load(), g_floor_hz.load());
+        {
+            double floor = g_floor_hz.load();
+            if (floor > 0.0)
+                LOG_INFO("Display: ceiling=%.1fHz, floor=%.1fHz", g_ceiling_hz.load(), floor);
+            else
+                LOG_INFO("Display: ceiling=%.1fHz, floor=unknown", g_ceiling_hz.load());
+        }
 
         StartDisplayPollThread();
         StartVBlankThread();

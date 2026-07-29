@@ -209,6 +209,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.blackout_key            = ReadINIString(S, "blackout_key", "", P);
     g_config.oled_care_key           = ReadINIString(S, "oled_care_key", "", P);
     g_config.oled_care_all_monitors  = ReadINIBool(S, "oled_care_all_monitors", true, P);
+    g_config.oled_care_idle_minutes  = ReadINIInt(S, "oled_care_idle_minutes", 0, P);
 
     // Monitor Selection
     g_config.selected_monitor        = ReadINIInt(S, "selected_monitor", 0, P);
@@ -344,6 +345,7 @@ void SaveConfig() {
             WriteINIString("Presets", "blackout_key", g_config.blackout_key.c_str(), SP);
             WriteINIString("Presets", "oled_care_key", g_config.oled_care_key.c_str(), SP);
             WriteINIBool("Presets", "oled_care_all_monitors", g_config.oled_care_all_monitors, SP);
+            WriteINIInt("Presets", "oled_care_idle_minutes", g_config.oled_care_idle_minutes, SP);
         }
     } else {
         WriteINIString(S, "osd_preset_prev_key", g_config.osd_preset_prev_key.c_str(), P);
@@ -351,6 +353,7 @@ void SaveConfig() {
         WriteINIString(S, "blackout_key", g_config.blackout_key.c_str(), P);
         WriteINIString(S, "oled_care_key", g_config.oled_care_key.c_str(), P);
         WriteINIBool(S, "oled_care_all_monitors", g_config.oled_care_all_monitors, P);
+        WriteINIInt(S, "oled_care_idle_minutes", g_config.oled_care_idle_minutes, P);
     }
 
     // ── Adaptive Smoothing ──
@@ -403,6 +406,7 @@ void ApplyConfig() {
 #include <ShlObj.h>
 static std::vector<OSDPreset> s_user_presets;
 static char s_shared_presets_path[MAX_PATH] = {};
+static OSDPreset s_default_preset = {};   // loaded from [OSD_Default_Preset] in shared presets
 
 // Returns the INI path for preset storage — shared or per-game depending on config.
 static const char* GetPresetsINIPath() {
@@ -456,6 +460,7 @@ OSDPreset OSDPreset_FromConfig() {
     p.show_gpu_temp         = g_config.osd_show_gpu_temp;
     p.show_gpu_clock        = g_config.osd_show_gpu_clock;
     p.show_gpu_usage        = g_config.osd_show_gpu_usage;
+    p.show_gpu_power        = g_config.osd_show_gpu_power;
     p.show_vram             = g_config.osd_show_vram;
     p.show_cpu_usage        = g_config.osd_show_cpu_usage;
     p.show_ram              = g_config.osd_show_ram;
@@ -491,6 +496,7 @@ void OSDPreset_ApplyToConfig(const OSDPreset& p) {
     g_config.osd_show_gpu_temp         = p.show_gpu_temp;
     g_config.osd_show_gpu_clock        = p.show_gpu_clock;
     g_config.osd_show_gpu_usage        = p.show_gpu_usage;
+    g_config.osd_show_gpu_power        = p.show_gpu_power;
     g_config.osd_show_vram             = p.show_vram;
     g_config.osd_show_cpu_usage        = p.show_cpu_usage;
     g_config.osd_show_ram              = p.show_ram;
@@ -520,6 +526,7 @@ void OSDPreset_ApplyTogglesOnly(const OSDPreset& p) {
     g_config.osd_show_gpu_temp         = p.show_gpu_temp;
     g_config.osd_show_gpu_clock        = p.show_gpu_clock;
     g_config.osd_show_gpu_usage        = p.show_gpu_usage;
+    g_config.osd_show_gpu_power        = p.show_gpu_power;
     g_config.osd_show_vram             = p.show_vram;
     g_config.osd_show_cpu_usage        = p.show_cpu_usage;
     g_config.osd_show_ram              = p.show_ram;
@@ -586,6 +593,7 @@ static void ReadPresetFromINI(int i, const char* P) {
     p.show_gpu_temp         = ReadINIBool(S, "show_gpu_temp", false, P);
     p.show_gpu_clock        = ReadINIBool(S, "show_gpu_clock", false, P);
     p.show_gpu_usage        = ReadINIBool(S, "show_gpu_usage", false, P);
+    p.show_gpu_power        = ReadINIBool(S, "show_gpu_power", false, P);
     p.show_vram             = ReadINIBool(S, "show_vram", false, P);
     p.show_cpu_usage        = ReadINIBool(S, "show_cpu_usage", false, P);
     p.show_ram              = ReadINIBool(S, "show_ram", false, P);
@@ -594,6 +602,49 @@ static void ReadPresetFromINI(int i, const char* P) {
     p.show_dlss_resolution  = ReadINIBool(S, "show_dlss_resolution", false, P);
     p.show_dlss_presets     = ReadINIBool(S, "show_dlss_presets", false, P);
     p.show_dlss_versions    = ReadINIBool(S, "show_dlss_versions", false, P);
+}
+
+static void ReadDefaultPresetFromINI(const char* P) {
+    static constexpr const char* S = "OSD_Default_Preset";
+    std::string name = ReadINIString(S, "name", "", P);
+    if (name.empty()) {
+        s_default_preset = {};  // no default preset defined
+        return;
+    }
+    s_default_preset = {};
+    snprintf(s_default_preset.name, sizeof(s_default_preset.name), "%s", name.c_str());
+    s_default_preset.occupied           = true;
+    s_default_preset.osd_x              = static_cast<float>(ReadINIDouble(S, "osd_x", 0.005, P));
+    s_default_preset.osd_y              = static_cast<float>(ReadINIDouble(S, "osd_y", 0.005, P));
+    s_default_preset.osd_scale          = static_cast<float>(ReadINIDouble(S, "osd_scale", 1.0, P));
+    s_default_preset.osd_opacity        = static_cast<float>(ReadINIDouble(S, "osd_opacity", 0.6, P));
+    s_default_preset.show_fps           = ReadINIBool(S, "show_fps", false, P);
+    s_default_preset.show_frametime     = ReadINIBool(S, "show_frametime", false, P);
+    s_default_preset.show_frametime_graph = ReadINIBool(S, "show_frametime_graph", false, P);
+    s_default_preset.show_fg            = ReadINIBool(S, "show_fg", false, P);
+    s_default_preset.show_limiter       = ReadINIBool(S, "show_limiter", false, P);
+    s_default_preset.show_pqi           = ReadINIBool(S, "show_pqi", false, P);
+    s_default_preset.show_cpu_latency   = ReadINIBool(S, "show_cpu_latency", false, P);
+    s_default_preset.show_pqi_breakdown = ReadINIBool(S, "show_pqi_breakdown", false, P);
+    s_default_preset.show_1pct_low      = ReadINIBool(S, "show_1pct_low", false, P);
+    s_default_preset.show_smoothness    = ReadINIBool(S, "show_smoothness", false, P);
+    s_default_preset.show_adaptive_smoothing = ReadINIBool(S, "show_adaptive_smoothing", false, P);
+    s_default_preset.show_0_1pct_low    = ReadINIBool(S, "show_0_1pct_low", false, P);
+    s_default_preset.show_gpu_render_time = ReadINIBool(S, "show_gpu_render_time", false, P);
+    s_default_preset.show_total_frame_cost = ReadINIBool(S, "show_total_frame_cost", false, P);
+    s_default_preset.show_fg_time       = ReadINIBool(S, "show_fg_time", false, P);
+    s_default_preset.show_gpu_temp      = ReadINIBool(S, "show_gpu_temp", false, P);
+    s_default_preset.show_gpu_clock     = ReadINIBool(S, "show_gpu_clock", false, P);
+    s_default_preset.show_gpu_usage     = ReadINIBool(S, "show_gpu_usage", false, P);
+    s_default_preset.show_gpu_power     = ReadINIBool(S, "show_gpu_power", false, P);
+    s_default_preset.show_vram          = ReadINIBool(S, "show_vram", false, P);
+    s_default_preset.show_cpu_usage     = ReadINIBool(S, "show_cpu_usage", false, P);
+    s_default_preset.show_ram           = ReadINIBool(S, "show_ram", false, P);
+    s_default_preset.show_dlss_quality  = ReadINIBool(S, "show_dlss_quality", false, P);
+    s_default_preset.show_dlss_features = ReadINIBool(S, "show_dlss_features", false, P);
+    s_default_preset.show_dlss_resolution = ReadINIBool(S, "show_dlss_resolution", false, P);
+    s_default_preset.show_dlss_presets  = ReadINIBool(S, "show_dlss_presets", false, P);
+    s_default_preset.show_dlss_versions = ReadINIBool(S, "show_dlss_versions", false, P);
 }
 
 void OSDPreset_LoadAll() {
@@ -618,6 +669,14 @@ void OSDPreset_LoadAll() {
         std::string oled_care = ReadINIString("Presets", "oled_care_key", "", P);
         if (!oled_care.empty()) g_config.oled_care_key = oled_care;
         g_config.oled_care_all_monitors = ReadINIBool("Presets", "oled_care_all_monitors", true, P);
+        g_config.oled_care_idle_minutes = ReadINIInt("Presets", "oled_care_idle_minutes", 0, P);
+
+        // Load and apply default preset (shared mode only)
+        ReadDefaultPresetFromINI(P);
+        if (s_default_preset.occupied) {
+            OSDPreset_ApplyToConfig(s_default_preset);
+            LOG_INFO("OSD default preset applied: \"%s\"", s_default_preset.name);
+        }
     }
 
     // Ensure at least the initial 3 slots exist
@@ -662,6 +721,7 @@ void OSDPreset_SaveSlot(int slot) {
     WriteINIBool(S, "show_gpu_temp", p.show_gpu_temp, P);
     WriteINIBool(S, "show_gpu_clock", p.show_gpu_clock, P);
     WriteINIBool(S, "show_gpu_usage", p.show_gpu_usage, P);
+    WriteINIBool(S, "show_gpu_power", p.show_gpu_power, P);
     WriteINIBool(S, "show_vram", p.show_vram, P);
     WriteINIBool(S, "show_cpu_usage", p.show_cpu_usage, P);
     WriteINIBool(S, "show_ram", p.show_ram, P);
@@ -702,4 +762,66 @@ void OSDPreset_DeleteSlot(int slot) {
 
     // Ensure minimum slots
     EnsureMinSlots();
+}
+
+bool OSDPreset_HasDefault() {
+    return s_default_preset.occupied;
+}
+
+const OSDPreset& OSDPreset_GetDefault() {
+    return s_default_preset;
+}
+
+void OSDPreset_SaveDefault(const OSDPreset& p) {
+    const char* P = GetPresetsINIPath();
+    if (P[0] == '\0') return;
+
+    static constexpr const char* S = "OSD_Default_Preset";
+    WritePrivateProfileStringA(S, nullptr, nullptr, P);  // clear section first
+
+    s_default_preset = p;
+    s_default_preset.occupied = true;
+
+    WriteINIString(S, "name", p.name, P);
+    WriteINIDouble(S, "osd_x", p.osd_x, P);
+    WriteINIDouble(S, "osd_y", p.osd_y, P);
+    WriteINIDouble(S, "osd_scale", p.osd_scale, P);
+    WriteINIDouble(S, "osd_opacity", p.osd_opacity, P);
+    WriteINIBool(S, "show_fps", p.show_fps, P);
+    WriteINIBool(S, "show_frametime", p.show_frametime, P);
+    WriteINIBool(S, "show_frametime_graph", p.show_frametime_graph, P);
+    WriteINIBool(S, "show_fg", p.show_fg, P);
+    WriteINIBool(S, "show_limiter", p.show_limiter, P);
+    WriteINIBool(S, "show_pqi", p.show_pqi, P);
+    WriteINIBool(S, "show_cpu_latency", p.show_cpu_latency, P);
+    WriteINIBool(S, "show_pqi_breakdown", p.show_pqi_breakdown, P);
+    WriteINIBool(S, "show_1pct_low", p.show_1pct_low, P);
+    WriteINIBool(S, "show_smoothness", p.show_smoothness, P);
+    WriteINIBool(S, "show_adaptive_smoothing", p.show_adaptive_smoothing, P);
+    WriteINIBool(S, "show_0_1pct_low", p.show_0_1pct_low, P);
+    WriteINIBool(S, "show_gpu_render_time", p.show_gpu_render_time, P);
+    WriteINIBool(S, "show_total_frame_cost", p.show_total_frame_cost, P);
+    WriteINIBool(S, "show_fg_time", p.show_fg_time, P);
+    WriteINIBool(S, "show_gpu_temp", p.show_gpu_temp, P);
+    WriteINIBool(S, "show_gpu_clock", p.show_gpu_clock, P);
+    WriteINIBool(S, "show_gpu_usage", p.show_gpu_usage, P);
+    WriteINIBool(S, "show_gpu_power", p.show_gpu_power, P);
+    WriteINIBool(S, "show_vram", p.show_vram, P);
+    WriteINIBool(S, "show_cpu_usage", p.show_cpu_usage, P);
+    WriteINIBool(S, "show_ram", p.show_ram, P);
+    WriteINIBool(S, "show_dlss_quality", p.show_dlss_quality, P);
+    WriteINIBool(S, "show_dlss_features", p.show_dlss_features, P);
+    WriteINIBool(S, "show_dlss_resolution", p.show_dlss_resolution, P);
+    WriteINIBool(S, "show_dlss_presets", p.show_dlss_presets, P);
+    WriteINIBool(S, "show_dlss_versions", p.show_dlss_versions, P);
+
+    LOG_INFO("OSD default preset saved: \"%s\"", p.name);
+}
+
+void OSDPreset_ClearDefault() {
+    const char* P = GetPresetsINIPath();
+    if (P[0] != '\0')
+        WritePrivateProfileStringA("OSD_Default_Preset", nullptr, nullptr, P);
+    s_default_preset = {};
+    LOG_INFO("OSD default preset cleared");
 }

@@ -10,3 +10,6 @@
 void DrawSettings(reshade::api::effect_runtime* rt);
 void DrawOSD(reshade::api::effect_runtime* rt);
 void RegisterOSD();
+
+// Reset the 1%/0.1% low rolling history (call on FG state changes, tier transitions).
+void OSD_ResetLowHistory();

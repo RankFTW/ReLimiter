@@ -94,7 +94,10 @@ void PresentGate_Execute(int64_t timestamp_qpc, uint64_t frame_id,
     g_last_gate_sleep_us.store(gate_us, std::memory_order_relaxed);
 
     if (gate_us > eff_us * 0.5) {
-        LOG_WARN("GATE_LONG: frame=%llu gate=%.0fus delta=%.0fus max=%.0fus",
-                 frame_id, gate_us, delta_us, max_gate_us);
+        static int s_gate_long_count = 0;
+        s_gate_long_count++;
+        if (s_gate_long_count <= 10 || (s_gate_long_count % 100 == 0))
+            LOG_WARN("GATE_LONG: frame=%llu gate=%.0fus delta=%.0fus max=%.0fus (count=%d)",
+                     frame_id, gate_us, delta_us, max_gate_us, s_gate_long_count);
     }
 }
