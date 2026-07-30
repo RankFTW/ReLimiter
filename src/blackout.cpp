@@ -216,23 +216,16 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
         0, 0, 0, 0, HWND_MESSAGE, nullptr, nullptr, nullptr);
 
     if (h_rawinput_wnd) {
-        RAWINPUTDEVICE rid[3] = {};
-        // Mouse
+        // Register gamepad only — keyboard and mouse are handled via
+        // GetAsyncKeyState and GetCursorPos which don't interfere with games.
+        // Registering keyboard/mouse with RIDEV_INPUTSINK can break games that
+        // use RIDEV_NOLEGACY raw input (e.g. Halo Infinite).
+        RAWINPUTDEVICE rid[1] = {};
         rid[0].usUsagePage = 0x01;
-        rid[0].usUsage     = 0x02;
+        rid[0].usUsage     = 0x05;  // Gamepad
         rid[0].dwFlags     = RIDEV_INPUTSINK;
         rid[0].hwndTarget  = h_rawinput_wnd;
-        // Keyboard
-        rid[1].usUsagePage = 0x01;
-        rid[1].usUsage     = 0x06;
-        rid[1].dwFlags     = RIDEV_INPUTSINK;
-        rid[1].hwndTarget  = h_rawinput_wnd;
-        // Gamepad / joystick (HID generic desktop: gamepad=0x05, joystick=0x04)
-        rid[2].usUsagePage = 0x01;
-        rid[2].usUsage     = 0x05;
-        rid[2].dwFlags     = RIDEV_INPUTSINK;
-        rid[2].hwndTarget  = h_rawinput_wnd;
-        RegisterRawInputDevices(rid, 3, sizeof(RAWINPUTDEVICE));
+        RegisterRawInputDevices(rid, 1, sizeof(RAWINPUTDEVICE));
         s_last_raw_input_tick = GetTickCount();
     }
 
@@ -338,10 +331,12 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
             DispatchMessageW(&msg);
         }
 
-        // Mouse button fallback: GetAsyncKeyState reflects real HID button state.
-        // Games in exclusive mouse mode block WM_INPUT for mouse movement but
-        // button presses still register in the virtual key table.
+        // Mouse and keyboard idle detection via polling — doesn't interfere with games.
+        // GetCursorPos: works for mouse movement even with exclusive capture.
+        // GetAsyncKeyState: scan common keys for any press transition.
+        // WM_INPUT (gamepad only): handles controller input.
         {
+            // Mouse buttons
             static SHORT s_prev_lb = 0, s_prev_rb = 0, s_prev_mb = 0;
             SHORT lb = GetAsyncKeyState(VK_LBUTTON);
             SHORT rb = GetAsyncKeyState(VK_RBUTTON);
@@ -350,6 +345,40 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
             if ((rb & 0x8000) && !(s_prev_rb & 0x8000)) s_last_raw_input_tick = GetTickCount();
             if ((mb & 0x8000) && !(s_prev_mb & 0x8000)) s_last_raw_input_tick = GetTickCount();
             s_prev_lb = lb; s_prev_rb = rb; s_prev_mb = mb;
+
+            // Common keys: all letters, digits, function keys, navigation, modifiers
+            static const BYTE s_watch_keys[] = {
+                // Letters A-Z
+                'A','B','C','D','E','F','G','H','I','J','K','L','M',
+                'N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
+                // Digits 0-9
+                '0','1','2','3','4','5','6','7','8','9',
+                // Common function/nav keys
+                VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB, VK_BACK,
+                VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN,
+                VK_F1, VK_F2, VK_F3, VK_F4, VK_F5,
+                VK_SHIFT, VK_CONTROL, VK_MENU,
+                VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5,
+                VK_OEM_6, VK_OEM_7, VK_OEM_PERIOD, VK_OEM_COMMA
+            };
+            static constexpr int k_num_keys = sizeof(s_watch_keys);
+            static SHORT s_prev_keys[k_num_keys] = {};
+            for (int i = 0; i < k_num_keys; i++) {
+                SHORT k = GetAsyncKeyState(s_watch_keys[i]);
+                if ((k & 0x8000) && !(s_prev_keys[i] & 0x8000))
+                    s_last_raw_input_tick = GetTickCount();
+                s_prev_keys[i] = k;
+            }
+
+            // Mouse movement via cursor position delta
+            static POINT s_prev_cursor = { -1, -1 };
+            POINT cur = {};
+            if (GetCursorPos(&cur)) {
+                if (s_prev_cursor.x != -1 &&
+                    (cur.x != s_prev_cursor.x || cur.y != s_prev_cursor.y))
+                    s_last_raw_input_tick = GetTickCount();
+                s_prev_cursor = cur;
+            }
         }
 
         Sleep(16);  // ~60Hz message pump
