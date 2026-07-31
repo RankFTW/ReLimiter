@@ -984,6 +984,26 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                 "The game still thinks it's in exclusive fullscreen. "
                 "Takes effect on next fullscreen transition or game restart.");
 
+        // ── Focus Lock ──
+        ImGui::Spacing();
+        if (ImGui::Checkbox("Keep Game Focused", &g_config.focus_lock)) {
+            config_dirty = true;
+            if (g_config.focus_lock) {
+                HWND hwnd = SwapMgr_GetHWND();
+                if (hwnd) FocusLock_Install(hwnd);
+            } else {
+                FocusLock_Remove();
+            }
+        }
+        if (FocusLock_IsActive()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(Active)");
+        }
+        HelpTip("Prevent the game from detecting focus loss when you alt-tab. "
+                "Audio and game logic continue running in the background. "
+                "The background FPS cap still applies independently. "
+                "May not work with all games (UWP/Game Pass titles use system-level notifications).");
+
         // ── Monitor Blackout ──
         ImGui::Spacing();
         {
@@ -1043,7 +1063,9 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
             }
         }
 
-        // ── OLED Care ──
+        // ── OLED Care (sectioned off) ──
+        ImGui::Spacing();
+        ImGui::Separator();
         ImGui::Spacing();
         {
             ImGui::Text("OLED Care");
@@ -1120,29 +1142,9 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                     g_config.oled_care_idle_minutes = s_idle_edit;
                     config_dirty = true;
                 }
-                HelpTip("Automatically activate OLED Care after this many minutes without any mouse, keyboard, or controller input. 0 = disabled. Pressing a key, clicking a mouse button, or using a controller will turn it back off. Note: mouse movement cannot be detected while a game has exclusive mouse control.");
+                HelpTip("Automatically activate OLED Care after this many minutes without any mouse, keyboard, or controller input. 0 = disabled. Any input (moving the mouse, pressing a key, clicking, or using a controller) will turn it back off.");
             }
         }
-
-        // ── Focus Lock ──
-        ImGui::Spacing();
-        if (ImGui::Checkbox("Keep Game Focused", &g_config.focus_lock)) {
-            config_dirty = true;
-            if (g_config.focus_lock) {
-                HWND hwnd = SwapMgr_GetHWND();
-                if (hwnd) FocusLock_Install(hwnd);
-            } else {
-                FocusLock_Remove();
-            }
-        }
-        if (FocusLock_IsActive()) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(Active)");
-        }
-        HelpTip("Prevent the game from detecting focus loss when you alt-tab. "
-                "Audio and game logic continue running in the background. "
-                "The background FPS cap still applies independently. "
-                "May not work with all games (UWP/Game Pass titles use system-level notifications).");
     }
 
     // ════════════════════════════════════════════
