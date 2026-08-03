@@ -13,3 +13,6 @@ void RegisterOSD();
 
 // Reset the 1%/0.1% low rolling history (call on FG state changes, tier transitions).
 void OSD_ResetLowHistory();
+
+// Cycle OSD position through corners (clockwise: top-right → bottom-right → bottom-left → top-left).
+void OSD_CyclePosition();

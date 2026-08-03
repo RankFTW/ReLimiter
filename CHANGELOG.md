@@ -1,6 +1,12 @@
 # Changelog
 
 
+## 3.3.4
+
+### New Features
+- **Move OSD keybind** — Bind a key to cycle the OSD position through each corner of the screen (clockwise). Also available as a button in the OSD section. Keybind saved to the shared presets file.
+
+
 ## 3.3.3
 
 ### New Features

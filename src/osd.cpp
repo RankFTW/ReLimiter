@@ -737,6 +737,58 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
                     }
                 }
             }
+
+            // Move OSD (corner cycling) keybind + button
+            {
+                static bool s_capturing = false;
+                ImGui::Text("Move OSD:");
+                ImGui::SameLine();
+                if (s_capturing) {
+                    ImGui::TextColored(ImVec4(1,1,0.3f,1), "Press key...");
+                    ImGui::SameLine();
+                    if (ImGui::Button("Cancel##pos")) s_capturing = false;
+                    for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k++) {
+                        ImGuiKey key = static_cast<ImGuiKey>(k);
+                        if (key == ImGuiKey_LeftCtrl || key == ImGuiKey_RightCtrl) continue;
+                        if (key == ImGuiKey_LeftShift || key == ImGuiKey_RightShift) continue;
+                        if (key == ImGuiKey_LeftAlt || key == ImGuiKey_RightAlt) continue;
+                        if (key == ImGuiKey_LeftSuper || key == ImGuiKey_RightSuper) continue;
+                        if (k == ImGuiMod_Ctrl || k == ImGuiMod_Shift || k == ImGuiMod_Alt || k == ImGuiMod_Super) continue;
+                        if (key >= ImGuiKey_MouseLeft && key <= ImGuiKey_MouseWheelY) continue;
+                        const char* kn = ImGui::GetKeyName(key);
+                        if (kn && kn[0] == 'M' && kn[1] == 'o' && kn[2] == 'd') continue;
+                        if (ImGui::IsKeyPressed(key, false)) {
+                            std::string name;
+                            if (ImGui::IsKeyDown(ImGuiMod_Ctrl)) name += "Ctrl+";
+                            if (ImGui::IsKeyDown(ImGuiMod_Alt)) name += "Alt+";
+                            if (ImGui::IsKeyDown(ImGuiMod_Shift)) name += "Shift+";
+                            name += ImGui::GetKeyName(key);
+                            g_config.osd_position_cycle_key = name;
+                            s_capturing = false;
+                            config_dirty = true;
+                            break;
+                        }
+                    }
+                } else {
+                    ImGui::Text("%s", g_config.osd_position_cycle_key.empty() ? "None" : g_config.osd_position_cycle_key.c_str());
+                    ImGui::SameLine();
+                    if (ImGui::Button("Bind##pos")) s_capturing = true;
+                    if (!g_config.osd_position_cycle_key.empty()) {
+                        ImGui::SameLine();
+                        if (ImGui::Button("Clear##pos")) {
+                            g_config.osd_position_cycle_key.clear();
+                            config_dirty = true;
+                        }
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Move##pos_now")) {
+                        // Cycle through corners: top-right → bottom-right → bottom-left → top-left → top-right
+                        OSD_CyclePosition();
+                        config_dirty = true;
+                    }
+                    HelpTip("Cycle the OSD position through each corner of the screen (clockwise).");
+                }
+            }
         }
 
         // ── Elements by category ──
@@ -1635,6 +1687,46 @@ void OSD_ResetLowHistory() {
     s_cached_01pct_low = 0.0;
 }
 
+void OSD_CyclePosition() {
+    // Corner positions (clockwise): top-left, top-right, bottom-right, bottom-left
+    // Determine current corner based on osd_x and osd_y
+    // x < 0.5 = left, x >= 0.5 = right
+    // y < 0.5 = top, y >= 0.5 = bottom
+    
+    bool is_right = g_config.osd_x >= 0.5f;
+    bool is_bottom = g_config.osd_y >= 0.5f;
+    
+    // Current corner: 0=top-left, 1=top-right, 2=bottom-right, 3=bottom-left
+    int corner = 0;
+    if (!is_right && !is_bottom) corner = 0;      // top-left
+    else if (is_right && !is_bottom) corner = 1;  // top-right
+    else if (is_right && is_bottom) corner = 2;   // bottom-right
+    else corner = 3;                               // bottom-left
+    
+    // Cycle clockwise: top-left → top-right → bottom-right → bottom-left → top-left
+    corner = (corner + 1) % 4;
+    
+    // Set new position - exact corners, no margin
+    switch (corner) {
+        case 0:  // top-left
+            g_config.osd_x = 0.0f;
+            g_config.osd_y = 0.0f;
+            break;
+        case 1:  // top-right
+            g_config.osd_x = 1.0f;
+            g_config.osd_y = 0.0f;
+            break;
+        case 2:  // bottom-right
+            g_config.osd_x = 1.0f;
+            g_config.osd_y = 1.0f;
+            break;
+        case 3:  // bottom-left
+            g_config.osd_x = 0.0f;
+            g_config.osd_y = 1.0f;
+            break;
+    }
+}
+
 static void RecomputeLowFPS() {
     int n = s_low_history_count < LOW_HISTORY_SIZE ? s_low_history_count : LOW_HISTORY_SIZE;
 
@@ -1920,6 +2012,36 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                 s_active_preset = (s_active_preset >= total_presets - 1) ? 0 : s_active_preset + 1;
                 LOG_INFO("OSD: Preset cycle next -> %d/%d", s_active_preset, total_presets);
                 ApplyCyclePreset(s_active_preset);
+            }
+        }
+    }
+
+    // ── Position cycle keybind polling ──
+    {
+        static bool s_pos_pressed = false;
+        if (!g_config.osd_position_cycle_key.empty()) {
+            ParsedKeybind kb = ParseKeybind(g_config.osd_position_cycle_key);
+            if (kb.vk != 0) {
+                bool key_down = (GetAsyncKeyState(kb.vk) & 0x8000) != 0;
+                bool ctrl_held  = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) || (GetAsyncKeyState(VK_RCONTROL) & 0x8000);
+                bool alt_held   = (GetAsyncKeyState(VK_LMENU) & 0x8000) || (GetAsyncKeyState(VK_RMENU) & 0x8000);
+                bool shift_held = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) || (GetAsyncKeyState(VK_RSHIFT) & 0x8000);
+
+                bool mods_ok = true;
+                if (kb.ctrl && !ctrl_held) mods_ok = false;
+                if (kb.alt && !alt_held) mods_ok = false;
+                if (kb.shift && !shift_held) mods_ok = false;
+                if (!kb.ctrl && ctrl_held) mods_ok = false;
+                if (!kb.alt && alt_held) mods_ok = false;
+                if (!kb.shift && shift_held) mods_ok = false;
+
+                bool pressed = key_down && mods_ok;
+                if (pressed && !s_pos_pressed) {
+                    OSD_CyclePosition();
+                    SaveConfig();
+                    LOG_INFO("OSD: Position cycled to (%.3f, %.3f)", g_config.osd_x, g_config.osd_y);
+                }
+                s_pos_pressed = pressed;
             }
         }
     }

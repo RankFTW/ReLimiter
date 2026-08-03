@@ -23,6 +23,7 @@ struct Config {
     std::string osd_toggle_key = "PageUp";
     std::string osd_preset_prev_key = "";
     std::string osd_preset_next_key = "";
+    std::string osd_position_cycle_key = "";  // Cycle OSD through corners
 
     // OSD element visibility
     bool osd_show_fps = true;

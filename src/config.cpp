@@ -158,6 +158,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.osd_toggle_key          = ReadINIString(S, "osd_toggle_key", "PageUp", P);
     g_config.osd_preset_prev_key     = ReadINIString(S, "osd_preset_prev_key", "", P);
     g_config.osd_preset_next_key     = ReadINIString(S, "osd_preset_next_key", "", P);
+    g_config.osd_position_cycle_key  = ReadINIString(S, "osd_position_cycle_key", "", P);
     g_config.osd_show_fps            = ReadINIBool(S, "osd_show_fps", true, P);
     g_config.osd_show_frametime      = ReadINIBool(S, "osd_show_frametime", false, P);
     g_config.osd_show_frametime_graph = ReadINIBool(S, "osd_show_frametime_graph", false, P);
@@ -342,6 +343,7 @@ void SaveConfig() {
         if (SP[0] != '\0') {
             WriteINIString("Presets", "prev_key", g_config.osd_preset_prev_key.c_str(), SP);
             WriteINIString("Presets", "next_key", g_config.osd_preset_next_key.c_str(), SP);
+            WriteINIString("Presets", "position_cycle_key", g_config.osd_position_cycle_key.c_str(), SP);
             WriteINIString("Presets", "blackout_key", g_config.blackout_key.c_str(), SP);
             WriteINIString("Presets", "oled_care_key", g_config.oled_care_key.c_str(), SP);
             WriteINIBool("Presets", "oled_care_all_monitors", g_config.oled_care_all_monitors, SP);
@@ -350,6 +352,7 @@ void SaveConfig() {
     } else {
         WriteINIString(S, "osd_preset_prev_key", g_config.osd_preset_prev_key.c_str(), P);
         WriteINIString(S, "osd_preset_next_key", g_config.osd_preset_next_key.c_str(), P);
+        WriteINIString(S, "osd_position_cycle_key", g_config.osd_position_cycle_key.c_str(), P);
         WriteINIString(S, "blackout_key", g_config.blackout_key.c_str(), P);
         WriteINIString(S, "oled_care_key", g_config.oled_care_key.c_str(), P);
         WriteINIBool(S, "oled_care_all_monitors", g_config.oled_care_all_monitors, P);
@@ -662,8 +665,10 @@ void OSDPreset_LoadAll() {
     if (g_config.shared_presets && P != s_ini_path) {
         std::string prev = ReadINIString("Presets", "prev_key", "", P);
         std::string next = ReadINIString("Presets", "next_key", "", P);
+        std::string pos_cycle = ReadINIString("Presets", "position_cycle_key", "", P);
         if (!prev.empty()) g_config.osd_preset_prev_key = prev;
         if (!next.empty()) g_config.osd_preset_next_key = next;
+        if (!pos_cycle.empty()) g_config.osd_position_cycle_key = pos_cycle;
         std::string blackout = ReadINIString("Presets", "blackout_key", "", P);
         if (!blackout.empty()) g_config.blackout_key = blackout;
         std::string oled_care = ReadINIString("Presets", "oled_care_key", "", P);
