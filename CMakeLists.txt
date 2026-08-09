@@ -182,6 +182,7 @@ if(RELIMITER_64BIT)
         d3d12.lib
         gdi32.lib
         winmm.lib
+        xinput.lib
         ${CMAKE_SOURCE_DIR}/deps/nvapi/amd64/nvapi64.lib
     )
 else()
@@ -190,6 +191,7 @@ else()
         dxgi.lib
         gdi32.lib
         winmm.lib
+        xinput.lib
         ${CMAKE_SOURCE_DIR}/deps/nvapi/x86/nvapi.lib
     )
 endif()

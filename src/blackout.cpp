@@ -3,6 +3,7 @@
 #include "config.h"
 #include "logger.h"
 #include <Windows.h>
+#include <Xinput.h>
 #include <atomic>
 
 // ── State ──
@@ -216,16 +217,8 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
         0, 0, 0, 0, HWND_MESSAGE, nullptr, nullptr, nullptr);
 
     if (h_rawinput_wnd) {
-        // Register gamepad only — keyboard and mouse are handled via
-        // GetAsyncKeyState and GetCursorPos which don't interfere with games.
-        // Registering keyboard/mouse with RIDEV_INPUTSINK can break games that
-        // use RIDEV_NOLEGACY raw input (e.g. Halo Infinite).
-        RAWINPUTDEVICE rid[1] = {};
-        rid[0].usUsagePage = 0x01;
-        rid[0].usUsage     = 0x05;  // Gamepad
-        rid[0].dwFlags     = RIDEV_INPUTSINK;
-        rid[0].hwndTarget  = h_rawinput_wnd;
-        RegisterRawInputDevices(rid, 1, sizeof(RAWINPUTDEVICE));
+        // Gamepad raw input registration removed for diagnostic testing.
+        // Keyboard and mouse idle detection still works via GetAsyncKeyState and GetCursorPos.
         s_last_raw_input_tick = GetTickCount();
     }
 
@@ -378,6 +371,22 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
                     (cur.x != s_prev_cursor.x || cur.y != s_prev_cursor.y))
                     s_last_raw_input_tick = GetTickCount();
                 s_prev_cursor = cur;
+            }
+
+            // Gamepad via XInput — doesn't register a raw input device so can't
+            // conflict with games that use exclusive raw input (e.g. Thumper).
+            // Poll all 4 slots; any button/trigger/stick activity resets the timer.
+            {
+                static DWORD s_prev_packet[4] = {};
+                for (DWORD i = 0; i < 4; i++) {
+                    XINPUT_STATE xs = {};
+                    if (XInputGetState(i, &xs) == ERROR_SUCCESS) {
+                        if (xs.dwPacketNumber != s_prev_packet[i]) {
+                            s_last_raw_input_tick = GetTickCount();
+                            s_prev_packet[i] = xs.dwPacketNumber;
+                        }
+                    }
+                }
             }
         }
 
