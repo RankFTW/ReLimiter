@@ -1,7 +1,7 @@
 # Changelog
 
 
-## 3.3.5-beta
+## 3.3.5
 
 ### Bug Fixes
 - **Fixed OLED Care idle timer not detecting controller input in some games** — The previous gamepad detection method conflicted with games that use exclusive raw input for controllers (e.g. Thumper), breaking in-game controller input entirely. Replaced with XInput polling which has no compatibility issues.
