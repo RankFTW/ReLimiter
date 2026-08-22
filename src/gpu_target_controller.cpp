@@ -89,12 +89,54 @@ static bool InitNvAPI() {
     return true;
 }
 
-// ── Control step ──
-// Two-phase:
+// ── Calibration burst state ──
+// On first start and after any loading screen, burst at VRR ceiling and
+// collect readings until GPU usage stabilises (stddev < 5% over 3 consecutive
+// windows). Then compute: cap = ceiling × (target% / stable_gpu%).
+// Falls back to using the average after 8 windows if it never stabilises.
+enum class CalibState { Burst, Observe, Done };
+static CalibState s_calib_state    = CalibState::Burst;
+static int        s_calib_windows  = 0;
+static constexpr int BURST_WINDOWS    = 1;   // 1 window at ceiling before observing
+static constexpr int MAX_OBS_WINDOWS  = 8;   // give up after 8s, use average
+static constexpr double OBS_STABLE_STDEV = 5.0;  // %GPU stddev threshold
+
+// Observation ring for stability detection (last 3 readings)
+static constexpr int OBS_RING = 3;
+static double s_obs_readings[OBS_RING] = {};
+static int    s_obs_idx   = 0;
+static int    s_obs_count = 0;
+
+static double ObsStdDev() {
+    if (s_obs_count < 2) return 100.0;
+    double sum = 0.0;
+    for (int i = 0; i < s_obs_count; i++) sum += s_obs_readings[i];
+    double mean = sum / s_obs_count;
+    double sq = 0.0;
+    for (int i = 0; i < s_obs_count; i++) { double d = s_obs_readings[i] - mean; sq += d*d; }
+    return std::sqrt(sq / s_obs_count);
+}
+
+static double ObsMean() {
+    if (s_obs_count == 0) return 0.0;
+    double sum = 0.0;
+    for (int i = 0; i < s_obs_count; i++) sum += s_obs_readings[i];
+    return sum / s_obs_count;
+}
+
 // 1. Convergence phase: if cap hasn't been near target yet, jump directly
 //    using cap × (target/gpu) ratio. Gets from ceiling to target in 1-2 steps.
 // 2. Fine control: once within 5% of a stable point, use small 1-3fps steps.
 static bool s_converged = false;
+
+static void ResetCalibration() {
+    s_calib_state   = CalibState::Burst;
+    s_calib_windows = 0;
+    s_obs_idx       = 0;
+    s_obs_count     = 0;
+    s_converged     = false;
+    LOG_INFO("GpuTarget: calibration reset — will burst at ceiling then stabilise");
+}
 
 // ── Rolling error average for dampened step sizing ──
 // Smooths out single-window spikes from causing large drops.
@@ -126,6 +168,63 @@ static void RunControlStep(double avg_usage) {
     }
     int max_fps = (max_fps_cfg > 0) ? std::min(max_fps_cfg, ceiling_fps) : ceiling_fps;
     if (min_fps >= max_fps) min_fps = 10;
+
+    // ── Calibration burst ──
+    // Burst: set cap to ceiling and wait 1 window.
+    // Observe: read actual uncapped GPU usage and compute optimal cap directly.
+    // Formula: cap = ceiling × (target% / uncapped_gpu%)
+    if (s_calib_state == CalibState::Burst) {
+        // Set cap to ceiling and wait
+        s_calib_windows++;
+        if (current_cap != max_fps) {
+            g_gpu_ctrl_override_fps.store(max_fps, std::memory_order_relaxed);
+            g_gpu_ctrl_current_cap.store(max_fps, std::memory_order_relaxed);
+            LOG_INFO("GpuTarget: CALIB burst — cap set to ceiling %d fps, sampling GPU...", max_fps);
+        }
+        if (s_calib_windows >= BURST_WINDOWS) {
+            s_calib_state   = CalibState::Observe;
+            s_calib_windows = 0;
+        }
+        return;
+    }
+
+    if (s_calib_state == CalibState::Observe) {
+        // Collect reading into observation ring
+        s_obs_readings[s_obs_idx] = avg_usage;
+        s_obs_idx = (s_obs_idx + 1) % OBS_RING;
+        if (s_obs_count < OBS_RING) s_obs_count++;
+        s_calib_windows++;
+
+        double stdev = ObsStdDev();
+        double mean  = ObsMean();
+
+        bool stable   = (s_obs_count >= OBS_RING && stdev <= OBS_STABLE_STDEV);
+        bool timedout = (s_calib_windows >= MAX_OBS_WINDOWS);
+
+        LOG_INFO("GpuTarget: CALIB observe window %d — gpu=%.1f%% mean=%.1f%% stdev=%.1f%% %s",
+                 s_calib_windows, avg_usage, mean, stdev,
+                 stable ? "(STABLE)" : timedout ? "(TIMEOUT)" : "...");
+
+        if ((stable || timedout) && mean >= 10.0) {
+            double ratio = static_cast<double>(target_pct) / mean;
+            int optimal_cap = static_cast<int>(static_cast<double>(max_fps) * ratio);
+            optimal_cap = std::max(min_fps, std::min(optimal_cap, max_fps));
+            LOG_WARN("GpuTarget: CALIB done — uncapped GPU=%.1f%% ±%.1f%% target=%d%% -> cap=%d fps",
+                     mean, stdev, target_pct, optimal_cap);
+            g_gpu_ctrl_override_fps.store(optimal_cap, std::memory_order_relaxed);
+            g_gpu_ctrl_current_cap.store(optimal_cap, std::memory_order_relaxed);
+            g_gpu_ctrl_last_direction.store(-1, std::memory_order_relaxed);
+            s_calib_state = CalibState::Done;
+        } else if (mean < 10.0) {
+            // Still getting loading-screen readings — retry burst
+            LOG_INFO("GpuTarget: CALIB observe got low reading %.1f%% — retrying burst", mean);
+            s_calib_state   = CalibState::Burst;
+            s_calib_windows = 0;
+            s_obs_idx = s_obs_count = 0;
+        }
+        return;
+    }
+    // CalibState::Done — proceed with normal control loop below
 
     // ── FPS snap: if actual output FPS is way below the cap, snap the cap
     // down to actual FPS + small headroom immediately.
@@ -169,6 +268,11 @@ static void RunControlStep(double avg_usage) {
     // Use smoothed error for step sizing, raw error for direction
     double step_error = s_error_ema;
 
+    // If GPU is significantly below target (>10% error going up), we're not converged
+    // — reset so the faster convergence path fires instead of slow fine-control steps
+    if (std::fabs(error) > 10.0 && direction > 0)
+        s_converged = false;
+
     // Post-change hold: only after dropping by a small step when close to target.
     // Large errors (>3%) never hold — keep dropping until we get there.
     // Small errors near target hold briefly to avoid noise-driven oscillation.
@@ -181,22 +285,21 @@ static void RunControlStep(double avg_usage) {
     s_hold_windows = 0;
     int new_cap;
 
-    if (!s_converged && std::fabs(error) > 3.0 && direction < 0) {
-        // Convergence phase: aggressive drop based on error magnitude.
-        // The ratio formula (cap × target/gpu) is too gentle — at 94% GPU
-        // it only moves 4% per step, taking 15 steps to converge.
-        // Instead: drop by (error% × cap × 0.5) — this scales the jump
-        // to the size of the problem. At 4% error on 324fps: 4 × 324 × 0.5 = 64fps drop.
-        // At 8% error: 8 × 324 × 0.5 = 130fps drop (lands near target in 1-2 steps).
-        double abs_err = std::fabs(error);
-        int jump = static_cast<int>(abs_err * static_cast<double>(current_cap) * 0.5);
-        jump = std::max(10, std::min(jump, 200));
-        new_cap = std::max(current_cap - jump, min_fps);
+    // Two modes based on how far off we are:
+    // >15% error: ratio jump regardless of converged state — no crawling from 37% to 90%
+    // ≤15% error: fine control — small steps to avoid overshoot
+    bool use_ratio = (std::fabs(error) > 15.0) || (!s_converged && std::fabs(error) > 3.0);
 
-        LOG_INFO("GpuTarget: CONVERGE avg=%.1f%% err=%.1f%% -> jump -%d fps: cap %d->%d",
-                 avg_usage, abs_err, jump, current_cap, new_cap);
+    if (use_ratio) {
+        // Ratio jump: cap × (target / current_gpu) — one-shot estimate
+        double ratio = static_cast<double>(target_pct) / avg_usage;
+        int jump_cap = static_cast<int>(static_cast<double>(current_cap) * ratio);
+        jump_cap = std::max(min_fps, std::min(jump_cap, max_fps));
+        new_cap = jump_cap;
+
+        LOG_INFO("GpuTarget: CONVERGE avg=%.1f%% target=%d%% ratio=%.2f -> cap %d->%d",
+                 avg_usage, target_pct, ratio, current_cap, new_cap);
     } else {
-        // Fine control: asymmetric step sizes using smoothed error.
         // Down: error × 1.5, max 8 — but dampened by EMA so one spike ≠ large drop.
         // Up: error × 0.5, max 3 — cautious to avoid overshoot.
         s_converged = true;
@@ -260,6 +363,10 @@ static void ControllerThreadProc() {
     s_converged   = false;
     s_hold_windows = 0;
     s_error_ema   = 0.0;
+    s_calib_state   = CalibState::Burst;
+    s_calib_windows = 0;
+    s_obs_idx       = 0;
+    s_obs_count     = 0;
 
     while (s_running.load(std::memory_order_relaxed)) {
         double raw_usage = -1.0;
@@ -274,8 +381,15 @@ static void ControllerThreadProc() {
 
         if (raw_usage >= 0.0) {
             // Ignore loading screens / cutscenes (GPU < 10%)
+            // But when we transition OUT of a loading screen (first active sample),
+            // trigger a calibration burst to re-converge instantly.
             if (raw_usage < 10.0) {
                 LOG_INFO("GpuTarget: raw=%.0f%% ignored (loading/cutscene)", raw_usage);
+                // If we were previously active (not already in calib), reset calibration
+                // so the next active scene gets an instant burst calibration
+                if (s_calib_state == CalibState::Done) {
+                    ResetCalibration();
+                }
                 for (int i = 0; i < 10 && s_running.load(std::memory_order_relaxed); i++)
                     Sleep(5);
                 continue;
