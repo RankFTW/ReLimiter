@@ -30,6 +30,7 @@
 #include "adaptive_smoothing.h"
 #include "blackout.h"
 #include "config.h"
+#include "gpu_target_controller.h"
 #include "logger.h"
 #include <Windows.h>
 #include <algorithm>
@@ -585,6 +586,25 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         // Re-publish total offset (computed + bias) for OSD
         g_smoothing_offset_us.store(smoothing_offset, std::memory_order_relaxed);
         effective_interval += smoothing_offset;
+    }
+
+    // ── GPU Target pressure offset ──
+    // When GPU Target is active, add a small interval extension proportional
+    // to how much GPU usage exceeds the target. This reduces deadline overruns
+    // by giving the GPU extra breathing room when it's running hot.
+    // Works on all APIs (no Reflex dependency) — uses the fast-poll GPU% from
+    // the controller thread.
+    // Formula: each 1% over target adds 50µs. At 93% vs 90% target → +150µs.
+    // Capped at 500µs to prevent visible frametime impact.
+    if (g_config.gpu_target_enabled && GpuTargetCtrl_IsRunning()) {
+        double gpu_usage = g_gpu_ctrl_usage_pct.load(std::memory_order_relaxed);
+        double target_pct = static_cast<double>(g_config.gpu_target_pct);
+        if (gpu_usage > 0.0 && gpu_usage > target_pct) {
+            double over_target = gpu_usage - target_pct;
+            double gpu_target_offset = std::min(over_target * 50.0, 500.0);
+            smoothing_offset += gpu_target_offset;
+            effective_interval += gpu_target_offset;
+        }
     }
 
     // Re-publish with smoothing offset applied
