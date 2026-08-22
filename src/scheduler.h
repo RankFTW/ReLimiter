@@ -35,6 +35,12 @@ extern std::atomic<double> g_smoothness_us;
 enum Tier { Tier0, Tier1, Tier2a, Tier2b, Tier3, Tier4 };
 extern Tier g_current_tier;
 
+// GPU Target Controller override FPS — set by gpu_target_controller when active.
+// The scheduler reads this in place of g_user_target_fps when non-zero.
+// Unlike g_user_target_fps, changes to this atomic do NOT trigger a scheduler flush,
+// so the controller can adjust smoothly every second without resetting predictor state.
+extern std::atomic<int> g_gpu_ctrl_override_fps;
+
 // Main enforcement entry point — called from marker hook.
 void OnMarker(uint64_t frameID, int64_t now);
 

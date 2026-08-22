@@ -67,6 +67,7 @@ set(ADDON_SOURCES
     src/vk_enforce.cpp
     src/blackout.cpp
     src/focus_lock.cpp
+    src/gpu_target_controller.cpp
 )
 
 # ── 64-bit only sources ──

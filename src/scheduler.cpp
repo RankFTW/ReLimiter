@@ -41,6 +41,7 @@ std::atomic<int>    g_user_target_fps{0};
 std::atomic<int>    g_background_fps{30};
 std::atomic<int>    g_fg_off_fps{0};
 std::atomic<int>    g_dmfg_output_cap{0};
+std::atomic<int>    g_gpu_ctrl_override_fps{0};  // GPU target controller; no flush on change
 std::atomic<bool>   g_overload_active_flag{false};
 std::atomic<double> g_actual_frame_time_us{0.0};
 std::atomic<double> g_effective_interval_us{0.0};
@@ -460,10 +461,18 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
     static int s_last_fg_divisor_raw = 0;
     static int s_last_target_fps = -1;
     int fg_divisor_raw = ComputeFGDivisorRaw();
-    int target_fps = g_user_target_fps.load(std::memory_order_relaxed);
+    // When the GPU target controller is active, use its override.
+    // Crucially, we do NOT include the override in fps_changed detection —
+    // controller changes are smooth ±1fps steps that don't need a full flush.
+    int ctrl_override = g_gpu_ctrl_override_fps.load(std::memory_order_relaxed);
+    int target_fps = (ctrl_override > 0)
+        ? ctrl_override
+        : g_user_target_fps.load(std::memory_order_relaxed);
+    // Track only user-set target for flush detection (not controller adjustments)
+    int user_target_fps = g_user_target_fps.load(std::memory_order_relaxed);
 
-    bool fg_changed = (s_last_fg_divisor_raw != 0 && fg_divisor_raw != s_last_fg_divisor_raw);
-    bool fps_changed = (s_last_target_fps >= 0 && target_fps != s_last_target_fps);
+    bool fg_changed  = (s_last_fg_divisor_raw != 0 && fg_divisor_raw != s_last_fg_divisor_raw);
+    bool fps_changed = (s_last_target_fps >= 0 && user_target_fps != s_last_target_fps);
 
     if (fg_changed || fps_changed) {
         if (fg_changed)
@@ -489,7 +498,7 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
         g_overload_active_flag.store(false, std::memory_order_relaxed);
     }
     s_last_fg_divisor_raw = fg_divisor_raw;
-    s_last_target_fps = target_fps;
+    s_last_target_fps = user_target_fps;
 
     // One-time diagnostic dump
     static int s_diag_count = 0;

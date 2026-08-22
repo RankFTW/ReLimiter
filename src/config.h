@@ -119,6 +119,15 @@ struct Config {
     // Focus Lock — prevent game from detecting focus loss (keeps audio playing)
     bool focus_lock = false;
 
+    // GPU Usage Target Controller — adjusts FPS cap to maintain a target GPU utilization
+    bool gpu_target_enabled  = false;   // Enable adaptive GPU-usage-driven FPS cap
+    int  gpu_target_pct      = 90;      // Target GPU utilization (10–99%)
+    int  gpu_target_min_fps  = 30;      // Minimum FPS floor (10–360)
+    int  gpu_target_max_fps  = 0;       // Maximum FPS ceiling (0 = use VRR ceiling)
+
+    // OSD: GPU Target status line
+    bool osd_show_gpu_target_line = false;  // Show "fps | cap | GPU%" line on overlay
+
     // Streamline Compatibility — disables proactive Streamline FG hooks and
     // NGX hook installation from inside LoadLibrary hooks. Required for games
     // like Neverness to Everness where these hooks break FG/RR.
@@ -171,6 +180,7 @@ struct OSDPreset {
     bool show_dlss_resolution = false;
     bool show_dlss_presets = false;
     bool show_dlss_versions = false;
+    bool show_gpu_target_line = false;
     bool occupied = false;  // true if this slot has been saved to
 };
 

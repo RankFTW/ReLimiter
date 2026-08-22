@@ -30,10 +30,12 @@
 #include "dlss_presets.h"
 #include "blackout.h"
 #include "focus_lock.h"
+#include "gpu_target_controller.h"
 #include "logger.h"
 #include <string>
 #include <atomic>
 #include <algorithm>
+#include <cmath>
 
 // ── OSD readout state ──
 static double s_real_fps = 0.0;
@@ -912,6 +914,9 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         FlowSeparator();
         if (ImGui::Checkbox("RAM##osd_elem", &g_config.osd_show_ram)) config_dirty = true;
         HelpTip("System RAM usage (used / total) in GB.");
+        FlowSeparator();
+        if (ImGui::Checkbox("GPU Target Line##osd_elem", &g_config.osd_show_gpu_target_line)) config_dirty = true;
+        HelpTip("Show a live status line: current FPS, active cap, and GPU usage with direction arrow. Only visible when GPU Target is enabled.");
     }
 
     // ════════════════════════════════════════════
@@ -1275,6 +1280,127 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
         }
     }
     } // DX12 only (Adaptive Smoothing)
+
+    // ════════════════════════════════════════════
+    // SECTION: GPU Target (collapsible, always visible)
+    // ════════════════════════════════════════════
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("GPU Target [Experimental]")) {
+        // Enable toggle
+        bool gpu_target = g_config.gpu_target_enabled;
+        if (ImGui::Checkbox("Enable##gpu_target", &gpu_target)) {
+            g_config.gpu_target_enabled = gpu_target;
+            GpuTargetCtrl_ApplySettings(
+                g_config.gpu_target_pct,
+                g_config.gpu_target_min_fps,
+                g_config.gpu_target_max_fps);
+            if (gpu_target)
+                GpuTargetCtrl_Start();
+            else
+                GpuTargetCtrl_Stop();
+            config_dirty = true;
+        }
+        HelpTip("Automatically adjusts the FPS cap to keep GPU usage at the target percentage. "
+                "Starts at the VRR ceiling and converges toward the target load. "
+                "The main FPS slider is overridden while this is active.");
+
+        // Live status line (always shown when enabled)
+        if (g_config.gpu_target_enabled) {
+            double ctrl_usage = g_gpu_ctrl_usage_pct.load(std::memory_order_relaxed);
+            int    ctrl_cap   = g_gpu_ctrl_current_cap.load(std::memory_order_relaxed);
+            int    ctrl_dir   = g_gpu_ctrl_last_direction.load(std::memory_order_relaxed);
+            const char* dir_str = (ctrl_dir > 0) ? " \xe2\x86\x91" : (ctrl_dir < 0) ? " \xe2\x86\x93" : "";
+            if (ctrl_usage >= 0.0) {
+                char status[64];
+                snprintf(status, sizeof(status), "GPU %.0f%%  cap %d fps%s  target %d%%",
+                         ctrl_usage, ctrl_cap, dir_str, g_config.gpu_target_pct);
+                // Color: green if within deadband, yellow if adjusting, red if unavailable
+                double err = std::fabs(ctrl_usage - static_cast<double>(g_config.gpu_target_pct));
+                ImVec4 col;
+                if (err <= 1.5)
+                    col = ImVec4(0.2f, 0.9f, 0.2f, 1.0f);   // green — on target
+                else if (err <= 5.0)
+                    col = ImVec4(1.0f, 0.85f, 0.0f, 1.0f);  // yellow — converging
+                else
+                    col = ImVec4(1.0f, 0.4f, 0.2f, 1.0f);   // orange — far off
+                ImGui::TextColored(col, "%s", status);
+            } else {
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "GPU usage unavailable (NVAPI)");
+            }
+        }
+
+        if (g_config.gpu_target_enabled) {
+            ImGui::Spacing();
+
+            // GPU Usage Target slider
+            {
+                static int s_edit = 90;
+                static bool s_active = false;
+                if (!s_active) s_edit = g_config.gpu_target_pct;
+                ImGui::SliderInt("GPU Target %%##gpu_target", &s_edit, 10, 99, "%d%%");
+                s_active = ImGui::IsItemActive();
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    g_config.gpu_target_pct = s_edit;
+                    GpuTargetCtrl_ApplySettings(
+                        g_config.gpu_target_pct,
+                        g_config.gpu_target_min_fps,
+                        g_config.gpu_target_max_fps);
+                    config_dirty = true;
+                }
+                HelpTip("Target GPU utilization. The FPS cap will be raised or lowered "
+                        "until GPU usage converges to this value. "
+                        "90% is a good starting point — leaves headroom for scene changes.");
+            }
+
+            // Min FPS slider
+            {
+                static int s_edit_min = 30;
+                static bool s_active_min = false;
+                if (!s_active_min) s_edit_min = g_config.gpu_target_min_fps;
+                ImGui::SliderInt("Min FPS##gpu_target", &s_edit_min, 10, 360, "%d fps");
+                s_active_min = ImGui::IsItemActive();
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    g_config.gpu_target_min_fps = s_edit_min;
+                    GpuTargetCtrl_ApplySettings(
+                        g_config.gpu_target_pct,
+                        g_config.gpu_target_min_fps,
+                        g_config.gpu_target_max_fps);
+                    config_dirty = true;
+                }
+                HelpTip("The FPS cap will never be lowered below this value, "
+                        "even if GPU usage is above target. Prevents the game from becoming unplayable.");
+            }
+
+            // Max FPS slider (0 = VRR ceiling)
+            {
+                static int s_edit_max = 0;
+                static bool s_active_max = false;
+                if (!s_active_max) s_edit_max = g_config.gpu_target_max_fps;
+                char fmt_max[32];
+                if (s_edit_max == 0) snprintf(fmt_max, sizeof(fmt_max), "VRR ceiling");
+                else                 snprintf(fmt_max, sizeof(fmt_max), "%%d fps");
+                ImGui::SliderInt("Max FPS##gpu_target", &s_edit_max, 0, 360, fmt_max);
+                s_active_max = ImGui::IsItemActive();
+                if (ImGui::IsItemDeactivatedAfterEdit()) {
+                    g_config.gpu_target_max_fps = s_edit_max;
+                    GpuTargetCtrl_ApplySettings(
+                        g_config.gpu_target_pct,
+                        g_config.gpu_target_min_fps,
+                        g_config.gpu_target_max_fps);
+                    config_dirty = true;
+                }
+                HelpTip("The FPS cap will never be raised above this value. "
+                        "0 = use the VRR ceiling of your monitor (recommended). "
+                        "Set a lower value to prevent tearing or if you have a specific FPS budget.");
+            }
+
+            // OSD status line toggle
+            if (ImGui::Checkbox("Show on OSD##gpu_target", &g_config.osd_show_gpu_target_line))
+                config_dirty = true;
+            HelpTip("Show a live GPU Target status line on the in-game overlay: "
+                    "current FPS, active cap, and GPU usage with direction indicator.");
+        }
+    }
 
     // ════════════════════════════════════════════
     // SECTION: Frame Generation (collapsible, DX12 only)
@@ -2675,6 +2801,33 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
                 snprintf(buf, sizeof(buf), "RAM: %.1f / %.1f GB",
                          hw.ram_used_mb / 1024.0, hw.ram_total_mb / 1024.0);
                 OSDTextColored(ColSystem(), buf);
+            }
+
+            // GPU Target status line
+            if (g_config.osd_show_gpu_target_line && g_config.gpu_target_enabled) {
+                double ctrl_usage = g_gpu_ctrl_usage_pct.load(std::memory_order_relaxed);
+                int    ctrl_cap   = g_gpu_ctrl_current_cap.load(std::memory_order_relaxed);
+                int    ctrl_dir   = g_gpu_ctrl_last_direction.load(std::memory_order_relaxed);
+                if (ctrl_usage >= 0.0) {
+                    // Arrow: ^ up (raising cap), v down (lowering cap)
+                    const char* arrow = (ctrl_dir > 0) ? "^" : (ctrl_dir < 0) ? "v" : "-";
+                    // ctrl_cap is the render cap — show it directly (output FPS already accounts for FG)
+                    int    out_cap = ctrl_cap;
+                    double out_fps = g_output_fps.load(std::memory_order_relaxed);
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "%.0f fps | cap %d%s | GPU %.0f%%",
+                             out_fps, out_cap, arrow, ctrl_usage);
+                    float b = g_config.osd_text_brightness;
+                    double err = std::fabs(ctrl_usage - static_cast<double>(g_config.gpu_target_pct));
+                    ImVec4 col;
+                    if (err <= 1.5)
+                        col = ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f);   // green
+                    else if (err <= 5.0)
+                        col = ImVec4(1.0f*b, 0.85f*b, 0.0f*b, 1.0f);  // yellow
+                    else
+                        col = ImVec4(1.0f*b, 0.45f*b, 0.1f*b, 1.0f);  // orange
+                    OSDTextColored(col, buf);
+                }
             }
         }
 

@@ -3,6 +3,7 @@
 #include "streamline_hooks.h"
 #include "wake_guard.h"
 #include "adaptive_smoothing.h"
+#include "gpu_target_controller.h"
 #include "logger.h"
 #include <Windows.h>
 #include <string>
@@ -125,6 +126,12 @@ void ValidateConfig() {
 
     // ── Monitor Selection ──
     g_config.selected_monitor = Clamp(g_config.selected_monitor, 0, 8);
+
+    // ── GPU Usage Target Controller ──
+    g_config.gpu_target_pct     = Clamp(g_config.gpu_target_pct, 10, 99);
+    g_config.gpu_target_min_fps = Clamp(g_config.gpu_target_min_fps, 10, 360);
+    if (g_config.gpu_target_max_fps != 0)
+        g_config.gpu_target_max_fps = Clamp(g_config.gpu_target_max_fps, 10, 1000);
 }
 
 bool Config_IsFirstLaunch() { return s_first_launch; }
@@ -227,6 +234,13 @@ void LoadConfig(HMODULE hModule) {
 #else
     g_config.dlss_info_hooks         = false;  // NGX/DLSS doesn't exist on 32-bit
 #endif
+
+    // GPU Usage Target Controller
+    g_config.gpu_target_enabled      = ReadINIBool(S, "gpu_target_enabled", false, P);
+    g_config.gpu_target_pct          = ReadINIInt(S, "gpu_target_pct", 90, P);
+    g_config.gpu_target_min_fps      = ReadINIInt(S, "gpu_target_min_fps", 30, P);
+    g_config.gpu_target_max_fps      = ReadINIInt(S, "gpu_target_max_fps", 0, P);
+    g_config.osd_show_gpu_target_line = ReadINIBool(S, "osd_show_gpu_target_line", false, P);
 
     LOG_INFO("Config: values read, calling ApplyConfig...");
     ValidateConfig();
@@ -378,6 +392,13 @@ void SaveConfig() {
         WriteINIString(S, "streamline_compat", "force_false", P);
     else
         WriteINIString(S, "streamline_compat", "true", P);
+
+    // ── GPU Usage Target Controller ──
+    WriteINIBool(S, "gpu_target_enabled", g_config.gpu_target_enabled, P);
+    WriteINIInt(S, "gpu_target_pct", g_config.gpu_target_pct, P);
+    WriteINIInt(S, "gpu_target_min_fps", g_config.gpu_target_min_fps, P);
+    WriteINIInt(S, "gpu_target_max_fps", g_config.gpu_target_max_fps, P);
+    WriteINIBool(S, "osd_show_gpu_target_line", g_config.osd_show_gpu_target_line, P);
 }
 
 void ApplyConfig() {
@@ -400,6 +421,24 @@ void ApplyConfig() {
         g_config.smoothing_window == "dual",
         g_config.smoothing_percentile,
         g_config.adaptive_smoothing);
+
+    // GPU Usage Target Controller — start/stop/update based on config
+    GpuTargetCtrl_ApplySettings(
+        g_config.gpu_target_pct,
+        g_config.gpu_target_min_fps,
+        g_config.gpu_target_max_fps);
+    if (g_config.gpu_target_enabled) {
+        if (!GpuTargetCtrl_IsRunning())
+            GpuTargetCtrl_Start();
+    } else {
+        if (GpuTargetCtrl_IsRunning())
+            GpuTargetCtrl_Stop();
+    }
+
+    // Force info-level logging when GPU target is active so the controller
+    // trace is always visible without the user manually enabling advanced logging
+    if (g_config.gpu_target_enabled)
+        Log_SetLevel(LogLevel::Info);
 }
 
 
@@ -472,6 +511,7 @@ OSDPreset OSDPreset_FromConfig() {
     p.show_dlss_resolution  = g_config.osd_show_dlss_resolution;
     p.show_dlss_presets     = g_config.osd_show_dlss_presets;
     p.show_dlss_versions    = g_config.osd_show_dlss_versions;
+    p.show_gpu_target_line  = g_config.osd_show_gpu_target_line;
     p.occupied              = true;
     return p;
 }
@@ -508,6 +548,7 @@ void OSDPreset_ApplyToConfig(const OSDPreset& p) {
     g_config.osd_show_dlss_resolution  = p.show_dlss_resolution;
     g_config.osd_show_dlss_presets     = p.show_dlss_presets;
     g_config.osd_show_dlss_versions    = p.show_dlss_versions;
+    g_config.osd_show_gpu_target_line  = p.show_gpu_target_line;
 }
 
 void OSDPreset_ApplyTogglesOnly(const OSDPreset& p) {
@@ -538,6 +579,7 @@ void OSDPreset_ApplyTogglesOnly(const OSDPreset& p) {
     g_config.osd_show_dlss_resolution  = p.show_dlss_resolution;
     g_config.osd_show_dlss_presets     = p.show_dlss_presets;
     g_config.osd_show_dlss_versions    = p.show_dlss_versions;
+    g_config.osd_show_gpu_target_line  = p.show_gpu_target_line;
 }
 
 int OSDPreset_GetCount() {
@@ -605,6 +647,7 @@ static void ReadPresetFromINI(int i, const char* P) {
     p.show_dlss_resolution  = ReadINIBool(S, "show_dlss_resolution", false, P);
     p.show_dlss_presets     = ReadINIBool(S, "show_dlss_presets", false, P);
     p.show_dlss_versions    = ReadINIBool(S, "show_dlss_versions", false, P);
+    p.show_gpu_target_line  = ReadINIBool(S, "show_gpu_target_line", false, P);
 }
 
 static void ReadDefaultPresetFromINI(const char* P) {
@@ -648,6 +691,7 @@ static void ReadDefaultPresetFromINI(const char* P) {
     s_default_preset.show_dlss_resolution = ReadINIBool(S, "show_dlss_resolution", false, P);
     s_default_preset.show_dlss_presets  = ReadINIBool(S, "show_dlss_presets", false, P);
     s_default_preset.show_dlss_versions = ReadINIBool(S, "show_dlss_versions", false, P);
+    s_default_preset.show_gpu_target_line = ReadINIBool(S, "show_gpu_target_line", false, P);
 }
 
 void OSDPreset_LoadAll() {
@@ -735,6 +779,7 @@ void OSDPreset_SaveSlot(int slot) {
     WriteINIBool(S, "show_dlss_resolution", p.show_dlss_resolution, P);
     WriteINIBool(S, "show_dlss_presets", p.show_dlss_presets, P);
     WriteINIBool(S, "show_dlss_versions", p.show_dlss_versions, P);
+    WriteINIBool(S, "show_gpu_target_line", p.show_gpu_target_line, P);
 }
 
 void OSDPreset_DeleteSlot(int slot) {
@@ -819,6 +864,7 @@ void OSDPreset_SaveDefault(const OSDPreset& p) {
     WriteINIBool(S, "show_dlss_resolution", p.show_dlss_resolution, P);
     WriteINIBool(S, "show_dlss_presets", p.show_dlss_presets, P);
     WriteINIBool(S, "show_dlss_versions", p.show_dlss_versions, P);
+    WriteINIBool(S, "show_gpu_target_line", p.show_gpu_target_line, P);
 
     LOG_INFO("OSD default preset saved: \"%s\"", p.name);
 }
