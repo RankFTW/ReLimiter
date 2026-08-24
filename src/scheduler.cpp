@@ -1087,6 +1087,14 @@ static void OnMarker_VRR(uint64_t frameID, int64_t now) {
                  "own_sleep=%.0fus deadline_drift=%.0fus",
                  frameID, telemetry_ft, row.driver_sleep_us,
                  row.own_sleep_us, row.deadline_drift_us);
+        // If this was a massive stall (level load, alt-tab), re-anchor the
+        // deadline chain to now so the next frame doesn't sleep through a
+        // deadline that's already been blown past by seconds.
+        if (telemetry_ft > effective_interval * 10.0) {
+            s_last_present_deadline = now;
+            LOG_INFO("STALL: deadline re-anchored to now (stall=%.0fms, threshold=%.0fms)",
+                     telemetry_ft / 1000.0, effective_interval * 10.0 / 1000.0);
+        }
     }
 }
 
