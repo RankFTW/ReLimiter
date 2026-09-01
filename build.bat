@@ -20,7 +20,7 @@ goto build64
 
 :build64
 if not exist build (
-    echo Configuring CMake (64-bit)...
+    echo Configuring CMake 64-bit...
     %CMAKE% -B build -G "%GENERATOR%" -A x64
     if errorlevel 1 (
         echo CMake configure failed.
@@ -42,7 +42,7 @@ exit /b 0
 
 :build32
 if not exist build32 (
-    echo Configuring CMake (32-bit)...
+    echo Configuring CMake 32-bit...
     %CMAKE% -B build32 -G "%GENERATOR%" -A Win32
     if errorlevel 1 (
         echo CMake configure failed (32-bit).

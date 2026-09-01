@@ -180,6 +180,7 @@ A customizable overlay showing real-time performance metrics. Toggle visibility 
 #### Performance
 | Element | Description |
 |---------|-------------|
+| **Clock** | 24-hour HH:MM clock. |
 | **FPS** | Current output FPS. When FG is active, shows both output and render FPS. |
 | **1% Low** | Rolling 1% low FPS — catches recurring dips. |
 | **0.1% Low** | Rolling 0.1% low FPS — catches rare hitches. |
@@ -248,6 +249,7 @@ osd_scale = 1.000000
 osd_opacity = 0.600000
 osd_drop_shadow = true
 osd_text_brightness = 1.000000
+osd_show_clock = false
 osd_show_fps = true
 osd_show_frametime = false
 osd_show_frametime_graph = false
