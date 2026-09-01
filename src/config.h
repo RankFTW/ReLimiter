@@ -26,6 +26,7 @@ struct Config {
     std::string osd_position_cycle_key = "";  // Cycle OSD through corners
 
     // OSD element visibility
+    bool osd_show_clock = false;       // 24h HH:MM clock, always drawn above other OSD text
     bool osd_show_fps = true;
     bool osd_show_frametime = false;
     bool osd_show_frametime_graph = false;
@@ -144,6 +145,7 @@ struct OSDPreset {
     float osd_scale = 1.0f;
     float osd_opacity = 0.6f;
     // Element toggles
+    bool show_clock = false;
     bool show_fps = false;
     bool show_frametime = false;
     bool show_frametime_graph = false;

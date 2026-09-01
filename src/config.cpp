@@ -159,6 +159,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.osd_preset_prev_key     = ReadINIString(S, "osd_preset_prev_key", "", P);
     g_config.osd_preset_next_key     = ReadINIString(S, "osd_preset_next_key", "", P);
     g_config.osd_position_cycle_key  = ReadINIString(S, "osd_position_cycle_key", "", P);
+    g_config.osd_show_clock          = ReadINIBool(S, "osd_show_clock", false, P);
     g_config.osd_show_fps            = ReadINIBool(S, "osd_show_fps", true, P);
     g_config.osd_show_frametime      = ReadINIBool(S, "osd_show_frametime", false, P);
     g_config.osd_show_frametime_graph = ReadINIBool(S, "osd_show_frametime_graph", false, P);
@@ -308,6 +309,7 @@ void SaveConfig() {
     WriteINIString(S, "osd_toggle_key", g_config.osd_toggle_key.c_str(), P);
 
     // ── OSD Elements ──
+    WriteINIBool(S, "osd_show_clock", g_config.osd_show_clock, P);
     WriteINIBool(S, "osd_show_fps", g_config.osd_show_fps, P);
     WriteINIBool(S, "osd_show_frametime", g_config.osd_show_frametime, P);
     WriteINIBool(S, "osd_show_frametime_graph", g_config.osd_show_frametime_graph, P);
@@ -445,6 +447,7 @@ OSDPreset OSDPreset_FromConfig() {
     p.osd_y                 = g_config.osd_y;
     p.osd_scale             = g_config.osd_scale;
     p.osd_opacity           = g_config.osd_opacity;
+    p.show_clock            = g_config.osd_show_clock;
     p.show_fps              = g_config.osd_show_fps;
     p.show_frametime        = g_config.osd_show_frametime;
     p.show_frametime_graph  = g_config.osd_show_frametime_graph;
@@ -481,6 +484,7 @@ void OSDPreset_ApplyToConfig(const OSDPreset& p) {
     g_config.osd_y                     = p.osd_y;
     g_config.osd_scale                 = p.osd_scale;
     g_config.osd_opacity               = p.osd_opacity;
+    g_config.osd_show_clock            = p.show_clock;
     g_config.osd_show_fps              = p.show_fps;
     g_config.osd_show_frametime        = p.show_frametime;
     g_config.osd_show_frametime_graph  = p.show_frametime_graph;
@@ -511,6 +515,7 @@ void OSDPreset_ApplyToConfig(const OSDPreset& p) {
 }
 
 void OSDPreset_ApplyTogglesOnly(const OSDPreset& p) {
+    g_config.osd_show_clock            = p.show_clock;
     g_config.osd_show_fps              = p.show_fps;
     g_config.osd_show_frametime        = p.show_frametime;
     g_config.osd_show_frametime_graph  = p.show_frametime_graph;

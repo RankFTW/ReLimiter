@@ -358,6 +358,8 @@ void DrawSettings(reshade::api::effect_runtime* /*rt*/) {
     if (ImGui::CollapsingHeader("OSD")) {
         if (ImGui::Checkbox("Show OSD", &g_config.osd_enabled)) config_dirty = true;
         HelpTip("Toggle the in-game overlay on or off.");
+        if (ImGui::Checkbox("Show Clock", &g_config.osd_show_clock)) config_dirty = true;
+        HelpTip("Show a 24-hour HH:MM clock above all other OSD text.");
         float osd_x_pct = g_config.osd_x * 100.0f;
         float osd_y_pct = g_config.osd_y * 100.0f;
         if (ImGui::SliderFloat("OSD X", &osd_x_pct, 0.0f, 100.0f, "%.1f%%"))
@@ -2208,6 +2210,17 @@ void DrawOSD(reshade::api::effect_runtime* /*rt*/) {
 
         float scale = g_config.osd_scale;
         ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * scale);
+
+        // ═══════════════════════════════════
+        // CLOCK — drawn first so it always sits above every other OSD line
+        // ═══════════════════════════════════
+        if (g_config.osd_show_clock) {
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            char buf[8];
+            snprintf(buf, sizeof(buf), "%02d:%02d", st.wHour, st.wMinute);
+            OSDText(buf);
+        }
 
         // Always update frame time history for graph and 1% low
         double ft_ms = ft / 1000.0;
