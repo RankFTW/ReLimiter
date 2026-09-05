@@ -2,6 +2,7 @@
 #include "display_state.h"
 #include "nvapi_types.h"
 #include "hooks.h"
+#include "runtime_lifecycle.h"
 #include "streamline_hooks.h"
 
 // Flip metering config interface ID
@@ -16,6 +17,9 @@ static NvAPI_Status __cdecl Stub_SetFlipConfig() {
 }
 
 static void* __cdecl Hook_NvAPI_QueryInterface(NvU32 id) {
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping())
+        return s_orig_QueryInterface ? s_orig_QueryInterface(id) : nullptr;
     // Smooth Motion: don't block flip metering — SM needs it for presentation
     if (id == FLIP_METERING_ID && !IsBlackwellOrNewer() && !IsNvSmoothMotionActive()) {
         return reinterpret_cast<void*>(&Stub_SetFlipConfig);

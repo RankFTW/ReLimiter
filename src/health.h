@@ -7,6 +7,8 @@
 // markers_flowing: enforcement marker within 500ms.
 // correlator_valid: !needs_recalibration and pending < capacity.
 
+inline constexpr double MARKER_FLOW_TIMEOUT_US = 500000.0;
+
 bool IsDXGIStatsFresh();
 bool AreMarkersFlowing();
 bool IsCorrelatorValid();

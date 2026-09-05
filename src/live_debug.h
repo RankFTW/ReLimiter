@@ -7,7 +7,7 @@
 void LiveDebug_StartIfReady() noexcept;
 
 // Orderly shutdown for AddonUninit. Disables producers before joining.
-void LiveDebug_Stop() noexcept;
+bool LiveDebug_Stop() noexcept;
 
 // Loader-lock-safe notification only; never joins or closes worker handles.
 void LiveDebug_NotifyProcessDetach() noexcept;

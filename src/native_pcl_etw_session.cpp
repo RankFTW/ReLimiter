@@ -2,6 +2,7 @@
 
 #include <evntrace.h>
 
+#include <atomic>
 #include <cwchar>
 
 #include "Debug.hpp"
@@ -17,6 +18,7 @@
 #include "ETW/Nvidia_PCL.h"
 #include "PresentMonTraceConsumer.hpp"
 #include "PresentMonTraceSession.hpp"
+#include "native_pcl_measurement_internal.h"
 #include "logger.h"
 
 namespace
@@ -35,69 +37,105 @@ namespace
         return IsEqualGUID(candidate, expected) != FALSE;
     }
 
-    void CALLBACK NativePclEventRecordCallback(EVENT_RECORD* event_record)
-    {
-        if (event_record == nullptr || event_record->UserContext == nullptr) {
-            return;
-        }
+    std::atomic<bool> s_callback_poisoned{false};
 
+    bool DispatchOpaquePresentMonHandlerCpp(
+        PMTraceConsumer* consumer,
+        EVENT_RECORD* event_record)
+    {
+        const GUID& provider_guid = event_record->EventHeader.ProviderId;
+        if (IsProvider(provider_guid, Microsoft_Windows_DxgKrnl::GUID))
+            consumer->HandleDXGKEvent(event_record);
+        else if (IsProvider(provider_guid, Microsoft_Windows_DXGI::GUID))
+            consumer->HandleDXGIEvent(event_record);
+        else if (IsProvider(provider_guid, Microsoft_Windows_Win32k::GUID))
+            consumer->HandleWin32kEvent(event_record);
+        else if (IsProvider(provider_guid, Microsoft_Windows_Dwm_Core::GUID))
+            consumer->HandleDWMEvent(event_record);
+        else if (IsProvider(provider_guid, Microsoft_Windows_D3D9::GUID))
+            consumer->HandleD3D9Event(event_record);
+        else if (IsProvider(provider_guid, Microsoft_Windows_Kernel_Process::GUID))
+            consumer->HandleProcessEvent(event_record);
+        else if (IsProvider(provider_guid, Microsoft_Windows_EventMetadata::GUID))
+            consumer->HandleMetadataEvent(event_record);
+        else if (IsProvider(provider_guid, NvidiaDisplayDriver_Events::GUID))
+            consumer->HandleNvidiaDisplayDriverEvent(event_record);
+        else if (IsProvider(provider_guid, Intel_PresentMon::GUID))
+            consumer->HandleIntelPresentMonEvent(event_record);
+        else if (IsProvider(provider_guid, Nvidia_PCL::GUID))
+            consumer->HandlePclEvent(event_record);
+        return true;
+    }
+
+    bool DispatchOpaquePresentMonHandlerCppNoexcept(
+        PMTraceConsumer* consumer,
+        EVENT_RECORD* event_record) noexcept
+    {
+        try {
+            return DispatchOpaquePresentMonHandlerCpp(consumer, event_record);
+        }
+        catch (...) {
+            return false;
+        }
+    }
+
+    bool DispatchOpaquePresentMonHandler(
+        PMTraceConsumer* consumer,
+        EVENT_RECORD* event_record) noexcept
+    {
+        __try {
+            return DispatchOpaquePresentMonHandlerCppNoexcept(
+                consumer, event_record);
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            return false;
+        }
+    }
+
+    bool DispatchNativePclEventRecord(EVENT_RECORD* event_record)
+    {
+        if (!event_record || !event_record->UserContext) return true;
         auto* session = static_cast<PMTraceSession*>(event_record->UserContext);
         PMTraceConsumer* consumer = session->mPMConsumer;
-        if (consumer == nullptr) {
-            return;
-        }
+        if (!consumer) return true;
 
         PMTraceConsumer::EventProcessingScope processing_scope(*consumer);
-        if (!processing_scope) {
-            return;
-        }
+        if (!processing_scope) return true;
+        // Opaque SEH is converted to a normal false return while the scope is
+        // still alive, so its destructor always runs on this ordinary path.
+        return DispatchOpaquePresentMonHandler(consumer, event_record);
+    }
 
-        // The PresentMon debug-latency and verbose-trace paths are disabled in
-        // ReLimiter. Omit their per-event checks from this high-rate callback.
-        const GUID& provider_guid = event_record->EventHeader.ProviderId;
-        if (IsProvider(provider_guid, Microsoft_Windows_DxgKrnl::GUID)) {
-            consumer->HandleDXGKEvent(event_record);
-            return;
+    bool DispatchNativePclEventRecordNoexcept(EVENT_RECORD* event_record) noexcept
+    {
+        try {
+            return DispatchNativePclEventRecord(event_record);
         }
-        if (IsProvider(provider_guid, Microsoft_Windows_DXGI::GUID)) {
-            consumer->HandleDXGIEvent(event_record);
-            return;
+        catch (...) {
+            return false;
         }
-        if (IsProvider(provider_guid, Microsoft_Windows_Win32k::GUID)) {
-            consumer->HandleWin32kEvent(event_record);
-            return;
+    }
+
+    void PoisonNativePclCallback() noexcept
+    {
+        if (!s_callback_poisoned.exchange(true, std::memory_order_acq_rel)) {
+            OutputDebugStringA(
+                "ReLimiter: native PCL callback poisoned; stopping ETW session.\n");
+            NativePclInternal_RequestStopFromCallback();
         }
-        if (IsProvider(provider_guid, Microsoft_Windows_Dwm_Core::GUID)) {
-            consumer->HandleDWMEvent(event_record);
-            return;
+    }
+
+    void CALLBACK NativePclEventRecordCallback(EVENT_RECORD* event_record)
+    {
+        if (s_callback_poisoned.load(std::memory_order_acquire)) return;
+        bool processed = false;
+        __try {
+            processed = DispatchNativePclEventRecordNoexcept(event_record);
         }
-        if (IsProvider(provider_guid, Microsoft_Windows_D3D9::GUID)) {
-            consumer->HandleD3D9Event(event_record);
-            return;
+        __except(EXCEPTION_EXECUTE_HANDLER) {
+            processed = false;
         }
-        if (IsProvider(
-                provider_guid,
-                Microsoft_Windows_Kernel_Process::GUID)) {
-            consumer->HandleProcessEvent(event_record);
-            return;
-        }
-        if (IsProvider(
-                provider_guid,
-                Microsoft_Windows_EventMetadata::GUID)) {
-            consumer->HandleMetadataEvent(event_record);
-            return;
-        }
-        if (IsProvider(provider_guid, NvidiaDisplayDriver_Events::GUID)) {
-            consumer->HandleNvidiaDisplayDriverEvent(event_record);
-            return;
-        }
-        if (IsProvider(provider_guid, Intel_PresentMon::GUID)) {
-            consumer->HandleIntelPresentMonEvent(event_record);
-            return;
-        }
-        if (IsProvider(provider_guid, Nvidia_PCL::GUID)) {
-            consumer->HandlePclEvent(event_record);
-        }
+        if (!processed) PoisonNativePclCallback();
     }
 
     void InitializeRealtimeTimestampState(
@@ -147,6 +185,7 @@ ULONG NativePclEtw_StartSession(
     PMTraceSession& session,
     const wchar_t* session_name) noexcept
 {
+    s_callback_poisoned.store(false, std::memory_order_release);
     if (session.mPMConsumer == nullptr || session_name == nullptr ||
         session_name[0] == L'\0' ||
         std::wcslen(session_name) >= MAX_PATH ||

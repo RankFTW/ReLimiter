@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "run_id": "2026-07-18-example-a1",
+  "pair_id": "example-a",
+  "variant": "baseline",
+  "captured_at_utc": null,
+  "archived_at_utc": null,
+  "scenario": {
+    "application": null,
+    "executable": null,
+    "game_version": null,
+    "description": null,
+    "route_or_scene": null,
+    "warmup_seconds": null,
+    "capture_seconds": null,
+    "run_order": null,
+    "annotations": []
+  },
+  "software": {
+    "relimiter_version": null,
+    "relimiter_build": null,
+    "relimiter_architecture": "x64",
+    "relimiter_artifact_sha256": null,
+    "reshade_version": null,
+    "os_version": null,
+    "gpu": null,
+    "gpu_driver": null,
+    "cpu": null,
+    "frameview_version": null
+  },
+  "display": {
+    "model": null,
+    "resolution": null,
+    "refresh_hz": null,
+    "vrr_enabled": null,
+    "vrr_floor_hz": null,
+    "vrr_ceiling_hz": null,
+    "window_mode": null,
+    "present_mode": null,
+    "vsync_mode": null,
+    "tearing_allowed": null
+  },
+  "runtime": {
+    "configured_values_source": null,
+    "api": null,
+    "enforcement_path": null,
+    "marker_source": null,
+    "reflex_state": null,
+    "target_fps": null,
+    "pacing_mode": null,
+    "wake_guard_us": null,
+    "background_fps": null,
+    "fg_off_fps": null,
+    "fg_type": null,
+    "fg_configured_multiplier": null,
+    "fg_detected_multiplier": null,
+    "dmfg_mode": null,
+    "dmfg_driver_target_fps": null,
+    "adaptive_enabled": null,
+    "adaptive_percentile": null,
+    "adaptive_window": null,
+    "adaptive_release_speed": null,
+    "adaptive_bias_us": null,
+    "adaptive_deadline_reserve_mode": null,
+    "estimator_a_mode": null,
+    "estimator_a_fixed_reserve_us": null,
+    "native_pcl_enabled": null,
+    "native_pcl_status": null
+  },
+  "files": [
+    {
+      "kind": "relimiter_scheduler",
+      "present": null,
+      "path": null,
+      "size_bytes": null,
+      "sha256": null,
+      "ordered_header_sha256": null,
+      "row_count": null
+    }
+  ]
+}

@@ -84,9 +84,9 @@ void OnTierChange(Tier old_tier, Tier new_tier) {
 
 void UpdateTier() {
     Tier new_tier = CheckTier();
-    if (new_tier != g_current_tier) {
-        Tier old_tier = g_current_tier;
-        g_current_tier = new_tier;
+    Tier old_tier = g_current_tier.load(std::memory_order_acquire);
+    if (new_tier != old_tier) {
+        g_current_tier.store(new_tier, std::memory_order_release);
         OnTierChange(old_tier, new_tier);
     }
 }

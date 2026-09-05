@@ -10,3 +10,6 @@
 void DrawSettings(reshade::api::effect_runtime* rt);
 void DrawOSD(reshade::api::effect_runtime* rt);
 void RegisterOSD();
+
+// Move clockwise to the next exact screen corner and persist the position.
+void OSD_CyclePosition();

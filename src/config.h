@@ -21,6 +21,7 @@ struct Config {
     float osd_y = 0.005f;              // 0.0–1.0 screen percentage
     float osd_opacity = 0.6f;
     std::string osd_toggle_key = "PageUp";
+    std::string osd_position_cycle_key = "";
     std::string osd_preset_prev_key = "";
     std::string osd_preset_next_key = "";
 
@@ -82,13 +83,19 @@ struct Config {
     // DMFG Output Cap — target output FPS when DMFG is active (0 = no cap)
     int dmfg_output_cap = 0;
 
-    // Adaptive Smoothing
-    bool   adaptive_smoothing = false;           // Enable P99-based adaptive smoothing (DX12+Reflex only)
+    // Frame-Time Adaptation (legacy INI key names)
+    bool   adaptive_smoothing = false;           // Adapt interval from unique keyed CPU/GPU service reports
     double smoothing_percentile = 0.99;         // Target percentile (0.90–0.999)
     std::string smoothing_window = "medium";    // "medium" (256 frames) | "dual" (64+512)
+    double smoothing_release_speed = 1.0;       // Downward release-rate multiplier (0.25–4.0)
     double smoothing_bias_us = 0.0;             // Constant bias added to computed offset (0–1000µs)
+    std::string adaptive_deadline_reserve_mode = "shadow"; // shadow | active
 
-    // OSD: Adaptive Smoothing
+    // Experimental arrival-lead predictor (Estimator A)
+    std::string estimator_a_mode = "off";       // off | shadow | active
+    double estimator_a_fixed_reserve_us = 1800.0;
+
+    // OSD: Frame-Time Adaptation
     bool osd_show_adaptive_smoothing = false;
 
     // OSD: Hardware monitoring
@@ -112,6 +119,11 @@ struct Config {
 
     // Monitor Blackout
     std::string blackout_key = "";          // Keybind to toggle monitor blackout
+
+    // OLED Care (runtime activation is not persisted)
+    std::string oled_care_key = "";
+    bool oled_care_all_monitors = true;
+    int oled_care_idle_minutes = 0;          // 0 = manual only, otherwise 1–120
 
     // Monitor Selection — persist user's chosen display across alt-tab
     int selected_monitor = 0;               // 0 = default (no override), 1+ = monitor index

@@ -1,81 +1,12 @@
 #include "system_hardening.h"
-#include "hooks.h"
 #include "logger.h"
 #include <Windows.h>
 #include <dxgi.h>
-#include <MinHook.h>
 #include <atomic>
 
-// MMRESULT / TIMERR_NOERROR not available with WIN32_LEAN_AND_MEAN
-#ifndef TIMERR_NOERROR
-typedef UINT MMRESULT;
-#define TIMERR_NOERROR 0
-#endif
-
-using timeBeginPeriod_fn = MMRESULT(WINAPI*)(UINT);
-using timeEndPeriod_fn   = MMRESULT(WINAPI*)(UINT);
-
-static timeBeginPeriod_fn s_orig_timeBeginPeriod = nullptr;
-static timeEndPeriod_fn   s_orig_timeEndPeriod   = nullptr;
-
-// Our target resolution in ms (0.5ms = the max from ZwSetTimerResolution)
-static constexpr UINT TARGET_TIMER_RES_MS = 1;
-
-static MMRESULT WINAPI Hook_timeBeginPeriod(UINT uPeriod) {
-    // If caller wants a worse (higher) resolution than ours, block it.
-    if (uPeriod > TARGET_TIMER_RES_MS)
-        return TIMERR_NOERROR;
-    // Equal or better — pass through.
-    return s_orig_timeBeginPeriod ? s_orig_timeBeginPeriod(uPeriod) : TIMERR_NOERROR;
-}
-
-static MMRESULT WINAPI Hook_timeEndPeriod(UINT uPeriod) {
-    // Don't let anyone end a period that would degrade our resolution.
-    if (uPeriod > TARGET_TIMER_RES_MS)
-        return TIMERR_NOERROR;
-    return s_orig_timeEndPeriod ? s_orig_timeEndPeriod(uPeriod) : TIMERR_NOERROR;
-}
-
-static bool s_timer_period_hooked = false;
-
-static void InstallTimerPeriodHooks() {
-    HMODULE winmm = GetModuleHandleA("winmm.dll");
-    if (!winmm) winmm = LoadLibraryA("winmm.dll");
-    if (!winmm) return;
-
-    void* pBegin = reinterpret_cast<void*>(GetProcAddress(winmm, "timeBeginPeriod"));
-    void* pEnd   = reinterpret_cast<void*>(GetProcAddress(winmm, "timeEndPeriod"));
-    if (!pBegin || !pEnd) return;
-
-    MH_STATUS st = MH_CreateHook(pBegin, reinterpret_cast<void*>(Hook_timeBeginPeriod),
-                                  reinterpret_cast<void**>(&s_orig_timeBeginPeriod));
-    if (st != MH_OK) return;
-    if (MH_EnableHook(pBegin) != MH_OK) { MH_RemoveHook(pBegin); return; }
-
-    st = MH_CreateHook(pEnd, reinterpret_cast<void*>(Hook_timeEndPeriod),
-                        reinterpret_cast<void**>(&s_orig_timeEndPeriod));
-    if (st != MH_OK) { MH_DisableHook(pBegin); MH_RemoveHook(pBegin); return; }
-    if (MH_EnableHook(pEnd) != MH_OK) {
-        MH_RemoveHook(pEnd);
-        MH_DisableHook(pBegin); MH_RemoveHook(pBegin);
-        return;
-    }
-
-    s_timer_period_hooked = true;
-    LOG_INFO("Hardening: timeBeginPeriod/timeEndPeriod hooks installed");
-}
-
-static void RemoveTimerPeriodHooks() {
-    if (!s_timer_period_hooked) return;
-    HMODULE winmm = GetModuleHandleA("winmm.dll");
-    if (winmm) {
-        void* pBegin = reinterpret_cast<void*>(GetProcAddress(winmm, "timeBeginPeriod"));
-        void* pEnd   = reinterpret_cast<void*>(GetProcAddress(winmm, "timeEndPeriod"));
-        if (pBegin) { MH_DisableHook(pBegin); MH_RemoveHook(pBegin); }
-        if (pEnd)   { MH_DisableHook(pEnd);   MH_RemoveHook(pEnd); }
-    }
-    s_timer_period_hooked = false;
-}
+// ReLimiter uses its own high-resolution waitable timer. Do not intercept
+// process-wide timeBeginPeriod/timeEndPeriod calls: games and middleware own
+// those balancing semantics, and faking success is a compatibility hazard.
 
 // ══════════════════════════════════════════════════════════════
 // 2. Win11 power throttling bypass
@@ -290,14 +221,16 @@ static void UnregisterPresentThreadMMCSS() {
 // ══════════════════════════════════════════════════════════════
 
 void Hardening_Init() {
-    InstallTimerPeriodHooks();
     ApplyPowerThrottlingBypass();
     ApplyDwmMMCSS();
     ApplyGPUSchedulingPriority();
 }
 
 void Hardening_OnDevice(void* dxgi_swapchain) {
-    ApplyGPUThreadPriority(dxgi_swapchain);
+    __try { ApplyGPUThreadPriority(dxgi_swapchain); }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_WARN("Hardening: GPU thread-priority path rejected a COM/driver fault");
+    }
 }
 
 void Hardening_OnFirstPresent() {
@@ -305,7 +238,6 @@ void Hardening_OnFirstPresent() {
 }
 
 void Hardening_Shutdown() {
-    RemoveTimerPeriodHooks();
     RestoreGPUSchedulingPriority();
     UnregisterPresentThreadMMCSS();
     // GPU thread priority: restore if we still have a swapchain

@@ -5,6 +5,7 @@
 #include <cstdint>
 
 #include "native_pcl_measurement.h"
+#include "present_association.h"
 
 struct NativePclInternalSample {
     uint32_t pcl_frame_id = 0;
@@ -46,6 +47,7 @@ struct NativePclInternalLossCounters {
 
 bool NativePclInternal_IsEnabled() noexcept;
 bool NativePclInternal_StopRequested() noexcept;
+void NativePclInternal_RequestStopFromCallback() noexcept;
 void NativePclInternal_SetRunning(bool running) noexcept;
 void NativePclInternal_SetDrainEvent(HANDLE event_handle) noexcept;
 
@@ -60,6 +62,9 @@ void NativePclInternal_PublishSample(
     const NativePclInternalSample& sample,
     NativePclStatus status,
     const NativePclInternalLossCounters& counters) noexcept;
+uint32_t NativePclInternal_BeginObserverEpoch() noexcept;
+void NativePclInternal_PublishPresentObservation(
+    const PresentTimelineObservation& observation) noexcept;
 
 // Implemented by the upstream-facing PresentData collector translation unit.
 void NativePclCollector_Run() noexcept;

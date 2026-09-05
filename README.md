@@ -16,17 +16,21 @@ Install via [RHI (ReShade HDR Installer)](https://github.com/RankFTW/RHI) for th
 
 📖 **[Full User Guide](docs/USER_GUIDE.md)** — comprehensive documentation covering every feature, setting, and INI option.
 
-## Adaptive Smoothing
+## Frame-Time Adaptation
 
-Most frame limiters set a fixed target and hope every frame hits it. In practice, render times vary — a complex scene might take 9ms while a simple one takes 7ms. When a frame occasionally exceeds the target interval, you get a stutter.
+Most frame limiters set a fixed target and hope every frame hits it. In practice, CPU and GPU workload varies—a complex scene might take 9ms while a simple one takes 7ms. When sustained demand exceeds the target interval, deadlines are missed and pacing degrades.
 
-Adaptive Smoothing watches your actual render times and adjusts the FPS cap to a level your GPU can consistently maintain. For example, if your GPU can average 130 FPS but the slowest 1% of frames only manage 121, it sets the cap at 121 so every frame lands on time. When you move to an easier scene, it adapts back up. The result is fewer micro-stutters at the cost of a small FPS reduction you won't notice.
+Frame-Time Adaptation consumes each unique NVIDIA Reflex report once and drains short report bursts in source order. It keys the exact active enforcement marker, complete local controller residence, and presentation-gate hold to the same NvAPI producer lifetime and source-frame ID. Instead of treating end-to-end latency as one workload, it compares paired SimulationStart-to-SimulationEnd and RenderSubmit service stages with GPU service. The earliest valid RenderSubmitEnd or PresentStart boundary excludes inter-stage residence, while total ReLimiter residence is removed once from only the CPU stage containing the limiter. GPU-active execution is authoritative when available; elapsed GPU time is fallback-only because it includes idle bubbles. This identifies the bottleneck without adding overlapping stages or feeding paced cadence back into authority. Limiter-influenced `gpuFrameTimeUs` remains diagnostic. Exact gate hold is removed from same-report Present pressure before downward release is evaluated.
+
+The controller acquires newly sustained bottlenecks promptly but releases interval extension only after a lower target persists, then at a bounded rate. Release speed is tunable from 0.25× to 4×; the default 1× preserves the conservative 0.05%-of-effective-interval cap per accepted report. Confirmation and pressure guards remain unchanged. It never repeats stale Reflex reports into the percentile window, accepts a sustained workload step after bounded outlier confirmation, and resets authority with pacing and producer lifecycles.
 
 The percentile slider controls the tradeoff between smoothness and FPS. Higher values like P99 accommodate more of your worst-case frames, giving the smoothest result but a lower cap. Lower values like P50 set the cap closer to your average, keeping FPS higher but allowing more frames to miss their deadline. P99 is the default and recommended for most users.
 
-**Dual window mode** uses both a short (64-frame) and long (512-frame) sample window, taking the more conservative of the two. This means it reacts quickly to sudden performance drops (the short window catches them fast) but is slower to raise the cap back up (the long window holds the lower value until it's confident the improvement is sustained). Prevents the cap from bouncing up and down during scene transitions.
+**Dual window mode** uses both a short (64-report) and long (512-report) sample window, taking the more conservative of the two. Each unique Reflex report is consumed once; stale timing values are never inserted repeatedly.
 
-DX12+Reflex only. Enable it in the Adaptive Smoothing section of the settings panel.
+Enable it in the **Frame-Time Adaptation** section. The legacy `adaptive_smoothing` INI key is retained for configuration compatibility.
+
+An experimental **Active Deadline Reserve** canary is also available in that section. Shadow remains the default. The exact-frame online-p99 estimator remains diagnostic: it learns by up to 24.75µs on an exceedance and releases by 0.25µs on a covered observation. After a 32-sample warm-up, Active initializes a separate learned reserve floor from that diagnostic. It waits for 128 covered observations before probing 5µs lower, validates a successful probe for 64 observations, and immediately restores the last validated floor if the probe misses. Requirements beyond that floor raise it with a 25µs guard. The configured Bias remains the warm-up/reset fallback, and Active is capped at 300µs.
 
 ## FPS Limiting
 
@@ -53,7 +57,7 @@ The OSD shows real-time stats organized by category:
 - **Performance** — FPS, 1% Low, 0.1% Low, Frametime, Frametime Graph
 - **Latency** — CPU Latency, GPU Render Time, Total Frame Cost, FG Time
 - **Quality** — PQI (Pacing Quality Index) with optional breakdown, Smoothness
-- **Pipeline** — Frame Generation status, Limiter tier, Adaptive Smoothing
+- **Pipeline** — Frame Generation status, Limiter tier, Frame-Time Adaptation
 - **System** — GPU Temp, GPU Clock, GPU Usage, VRAM, CPU Usage, RAM
 
 Toggle the OSD on/off with the keybind (default: PageUp). Every element can be individually enabled or disabled in the settings panel.
@@ -79,7 +83,7 @@ Move the game window between monitors, switch between windowed/borderless/fullsc
 
 | API | Enforcement | Notes |
 |---|---|---|
-| DX12 | Reflex markers | Full feature set including Adaptive Smoothing and Reflex timing |
+| DX12 | Reflex markers | Full feature set including Frame-Time Adaptation and Reflex diagnostics |
 | DX11 | Present-based | Flip Model Override available |
 | Vulkan | Present-based or Streamline PCL | |
 | OpenGL | Present-based | VSync override may not work in all games |
@@ -98,7 +102,7 @@ Replacing the game's DLSS DLLs with newer versions (e.g. dropping an updated `nv
 ## Known Limitations
 
 - GPU hardware monitoring (temp, clock, usage, VRAM) is NVIDIA only
-- Adaptive Smoothing and Reflex timing metrics (GPU Render, Frame Cost, FG Time) require DX12 + Reflex
+- Frame-Time Adaptation currently requires DX12 Reflex reports with valid CPU or GPU workload timestamps
 - Global DLSS DLL overrides (via NVCP/NVPI) may not be read correctly — replace DLLs in the game folder instead
 - Global DLSS preset overrides won't appear on the OSD — set presets per-game in the NVIDIA App or Profile Inspector
 - Some older Vulkan titles may not work
@@ -114,6 +118,12 @@ build.bat
 ```
 
 Output: `build/bin/Release/relimiter.addon64`
+
+### Optional live MCP diagnostics
+
+Developers can compile a read-only live pacing telemetry producer and external MCP stdio bridge with `-DRELIMITER_ENABLE_MCP=ON`. The option defaults to `OFF`, so normal builds contain no MCP producer path or runtime overhead.
+
+See **[Live pacing debugging with MCP](docs/LIVE_MCP_DEBUGGING.md)** for build commands, VS Code configuration, tools, security, continuity semantics, and timing-domain limitations.
 
 ## License
 

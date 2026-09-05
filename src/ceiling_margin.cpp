@@ -36,10 +36,11 @@ double ComputeCeilingMargin() {
     margin = (std::min)(margin, max_margin);
 
     // Tier-aware behavior
-    if (g_current_tier == Tier2a) {
+    const Tier current_tier = g_current_tier.load(std::memory_order_acquire);
+    if (current_tier == Tier2a) {
         s_last_good_margin += 0.02 * (base * 3.0 - s_last_good_margin);
         margin = s_last_good_margin;
-    } else if (g_current_tier >= Tier2b) {
+    } else if (current_tier >= Tier2b) {
         margin = base * 3.0;
     }
 

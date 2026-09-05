@@ -1,10 +1,10 @@
 #include "reflex_inject.h"
 #include "nvapi_hooks.h"
 #include "nvapi_types.h"
-#include "config.h"
 #include "health.h"
 #include "correlator.h"
 #include "swapchain_manager.h" // SwapMgr_GetActiveAPI, ActiveAPI
+#include "scheduler.h"
 #include "logger.h"
 #include <Windows.h>
 #include <dxgi.h>
@@ -24,8 +24,12 @@ static const IID IID_ID3D11Device = {
 
 // ── Internal state ──
 static IUnknown*  s_inject_dev   = nullptr;
-static bool       s_active       = false;
+static NvAPIFeedbackDevice s_inject_published_device = {};
+static std::atomic<bool> s_active{false};
 static bool       s_sleep_mode_set = false;
+static std::atomic<bool> s_requested{false};
+static std::atomic<bool> s_reset_requested{false};
+static std::atomic<bool> s_shutdown_requested{false};
 static std::atomic<uint64_t> s_inject_count{0};
 
 // ── Staggered frame tracking ──
@@ -37,22 +41,48 @@ static bool s_has_prev_frame = false;
 
 // ── Device acquisition ──
 static IUnknown* AcquireDeviceFromSwapchain() {
-    IDXGISwapChain* sc = g_presenting_swapchain;
-    if (!sc) sc = g_swapchain;
+    IDXGISwapChain* sc = Correlator_AcquireSwapchain();
     if (!sc) return nullptr;
 
     IUnknown* dev = nullptr;
-    if (SUCCEEDED(sc->GetDevice(IID_ID3D12Device, reinterpret_cast<void**>(&dev)))) {
-        dev->Release();
-        LOG_INFO("ReflexInject: acquired ID3D12Device from swapchain");
-        return dev;
+    bool d3d12 = false;
+    __try {
+        if (SUCCEEDED(sc->GetDevice(
+                IID_ID3D12Device,
+                reinterpret_cast<void**>(&dev)))) {
+            d3d12 = true;
+        }
+        else {
+            sc->GetDevice(
+                IID_ID3D11Device,
+                reinterpret_cast<void**>(&dev));
+        }
     }
-    if (SUCCEEDED(sc->GetDevice(IID_ID3D11Device, reinterpret_cast<void**>(&dev)))) {
-        dev->Release();
-        LOG_INFO("ReflexInject: acquired ID3D11Device from swapchain");
-        return dev;
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        // The acquired AddRef protects normal lifetime changes; retain the
+        // narrow guard for opaque proxy/driver implementations.
+        NvAPI_ReleaseFeedbackDevice(dev);
+        NvAPI_ReleaseFeedbackDevice(sc);
+        return nullptr;
     }
-    return nullptr;
+    NvAPI_ReleaseFeedbackDevice(sc);
+
+    if (dev) {
+        LOG_INFO(
+            "ReflexInject: acquired %s device from swapchain",
+            d3d12 ? "ID3D12" : "ID3D11");
+    }
+    return dev;
+}
+
+static void ReleaseInjectionDevice() noexcept {
+    if (!s_inject_dev) return;
+    if (s_inject_published_device.device) {
+        NvAPI_ClearFeedbackDevice(s_inject_published_device);
+    }
+    NvAPI_ReleaseFeedbackDevice(s_inject_dev);
+    s_inject_dev = nullptr;
+    s_inject_published_device = {};
 }
 
 // ── Sleep mode configuration ──
@@ -79,11 +109,11 @@ static void ConfigureSleepMode(bool enable) {
 
 // ── Activation check ──
 static void UpdateActiveState() {
-    if (!g_config.reflex_inject) {
-        if (s_active) {
+    if (!s_requested.load(std::memory_order_acquire)) {
+        if (s_active.load(std::memory_order_acquire)) {
             ConfigureSleepMode(false);
             s_sleep_mode_set = false;
-            s_active = false;
+            s_active.store(false, std::memory_order_release);
             LOG_INFO("ReflexInject: deactivated (user toggle off)");
         }
         return;
@@ -94,9 +124,9 @@ static void UpdateActiveState() {
     // there is no D3D device — AcquireDeviceFromSwapchain would crash.
     ActiveAPI inject_api = SwapMgr_GetActiveAPI();
     if (inject_api == ActiveAPI::Vulkan || inject_api == ActiveAPI::OpenGL) {
-        if (s_active) {
-            s_active = false;
-            s_inject_dev = nullptr;
+        if (s_active.load(std::memory_order_acquire)) {
+            s_active.store(false, std::memory_order_release);
+            ReleaseInjectionDevice();
             s_sleep_mode_set = false;
             LOG_INFO("ReflexInject: deactivated (%s — no D3D device)",
                      inject_api == ActiveAPI::Vulkan ? "Vulkan" : "OpenGL");
@@ -105,36 +135,40 @@ static void UpdateActiveState() {
     }
 
     if (AreNvAPIMarkersFlowing()) {
-        if (s_active) {
+        if (s_active.load(std::memory_order_acquire)) {
             ConfigureSleepMode(false);
             s_sleep_mode_set = false;
-            s_active = false;
+            s_active.store(false, std::memory_order_release);
             LOG_INFO("ReflexInject: deactivated (native Reflex markers detected)");
         }
         return;
     }
 
-    if (s_active && s_inject_dev) return;
+    if (s_active.load(std::memory_order_acquire) && s_inject_dev) return;
 
     if (!s_orig_set_latency_marker || !s_orig_sleep_mode || !s_orig_sleep)
         return;
 
     if (!s_inject_dev) {
-        if (g_dev)
-            s_inject_dev = g_dev;
-        else
+        const NvAPIFeedbackDevice feedback_device =
+            NvAPI_AcquireFeedbackDevice();
+        s_inject_dev = feedback_device.device;
+        if (!s_inject_dev) {
             s_inject_dev = AcquireDeviceFromSwapchain();
+            if (s_inject_dev) {
+                NvAPI_CaptureFeedbackDevice(
+                    s_inject_dev,
+                    &s_inject_published_device);
+            }
+        }
         if (!s_inject_dev) return;
         LOG_INFO("ReflexInject: device acquired (%p)", s_inject_dev);
-        // Set g_dev so the Feedback system can call GetLatency on the same device.
-        // Without this, the ring buffer is never read for injected Reflex games.
-        if (!g_dev) {
-            g_dev = s_inject_dev;
-            LOG_INFO("ReflexInject: g_dev set from injection device");
+        if (s_inject_published_device.device) {
+            LOG_INFO("ReflexInject: feedback device set from injection device");
         }
     }
 
-    s_active = true;
+    s_active.store(true, std::memory_order_release);
     LOG_INFO("ReflexInject: activated");
 }
 
@@ -148,41 +182,48 @@ static NvAPI_Status InjectMarker(NV_LATENCY_MARKER_TYPE type, uint64_t frameID) 
     __try {
         return s_orig_set_latency_marker(s_inject_dev, &marker);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
-        s_active = false;
-        s_inject_dev = nullptr;
+        s_active.store(false, std::memory_order_release);
+        ReleaseInjectionDevice();
         return static_cast<NvAPI_Status>(-1);
     }
 }
 
 // ── Public API ──
 
-void ReflexInject_Init() {
-    s_inject_dev = nullptr;
-    s_active = false;
+static void ReflexInject_InitImpl() {
+    ReleaseInjectionDevice();
+    s_active.store(false, std::memory_order_release);
     s_sleep_mode_set = false;
     s_has_prev_frame = false;
     s_inject_count.store(0, std::memory_order_relaxed);
     LOG_INFO("ReflexInject: initialized");
 }
 
-void ReflexInject_Shutdown() {
-    if (s_active)
+static void ReflexInject_ShutdownImpl() {
+    if (s_active.load(std::memory_order_acquire))
         ConfigureSleepMode(false);
-    s_active = false;
-    s_inject_dev = nullptr;
+    s_active.store(false, std::memory_order_release);
+    ReleaseInjectionDevice();
     s_sleep_mode_set = false;
     s_has_prev_frame = false;
     LOG_INFO("ReflexInject: shutdown (injected %llu frames)",
              s_inject_count.load(std::memory_order_relaxed));
 }
 
-bool ReflexInject_IsActive() {
-    return s_active;
+static void ApplyLifecycleRequestsOnSchedulerOwner() {
+    if (s_shutdown_requested.exchange(false, std::memory_order_acq_rel)) {
+        s_reset_requested.store(false, std::memory_order_release);
+        ReflexInject_ShutdownImpl();
+        return;
+    }
+    if (s_reset_requested.exchange(false, std::memory_order_acq_rel))
+        ReflexInject_InitImpl();
 }
 
-void ReflexInject_OnPreSleep(uint64_t frameID, int64_t now_qpc) {
+static void ReflexInject_OnPreSleepImpl(uint64_t frameID, int64_t now_qpc) {
+    ApplyLifecycleRequestsOnSchedulerOwner();
     UpdateActiveState();
-    if (!s_active || !s_inject_dev) return;
+    if (!s_active.load(std::memory_order_acquire) || !s_inject_dev) return;
 
     if (!s_sleep_mode_set) {
         ConfigureSleepMode(true);
@@ -200,8 +241,9 @@ void ReflexInject_OnPreSleep(uint64_t frameID, int64_t now_qpc) {
     }
 }
 
-void ReflexInject_OnPostSleep(uint64_t frameID, int64_t now_qpc) {
-    if (!s_active || !s_inject_dev) return;
+static void ReflexInject_OnPostSleepImpl(uint64_t frameID, int64_t now_qpc) {
+    ApplyLifecycleRequestsOnSchedulerOwner();
+    if (!s_active.load(std::memory_order_acquire) || !s_inject_dev) return;
 
     // Open the next frame's pipeline.
     uint64_t next_frame = frameID + 1;
@@ -216,4 +258,35 @@ void ReflexInject_OnPostSleep(uint64_t frameID, int64_t now_qpc) {
 
     s_inject_count.fetch_add(1, std::memory_order_relaxed);
     s_has_prev_frame = true;
+}
+
+void ReflexInject_Init() {
+    s_shutdown_requested.store(false, std::memory_order_release);
+    s_reset_requested.store(true, std::memory_order_release);
+    SchedulerOwnerGuard owner;
+    if (owner) ApplyLifecycleRequestsOnSchedulerOwner();
+}
+
+void ReflexInject_Shutdown() {
+    s_shutdown_requested.store(true, std::memory_order_release);
+    SchedulerOwnerGuard owner;
+    if (owner) ApplyLifecycleRequestsOnSchedulerOwner();
+}
+
+bool ReflexInject_IsActive() {
+    return s_active.load(std::memory_order_acquire);
+}
+
+void ReflexInject_SetEnabled(bool enabled) noexcept {
+    s_requested.store(enabled, std::memory_order_release);
+}
+
+void ReflexInject_OnPreSleep(uint64_t frameID, int64_t now_qpc) {
+    // VkEnforce owns SchedulerOwnerGuard across this call.
+    ReflexInject_OnPreSleepImpl(frameID, now_qpc);
+}
+
+void ReflexInject_OnPostSleep(uint64_t frameID, int64_t now_qpc) {
+    // VkEnforce owns SchedulerOwnerGuard across this call.
+    ReflexInject_OnPostSleepImpl(frameID, now_qpc);
 }

@@ -1,10 +1,17 @@
 #include "config.h"
+#include "osd_position_policy.h"
+#include "blackout.h"
 #include "scheduler.h"
 #include "streamline_hooks.h"
 #include "wake_guard.h"
-#include "adaptive_smoothing.h"
+#include "vsync_control.h"
+#include "frame_time_adaptation.h"
+#include "arrival_lead_estimator.h"
+#include "adaptive_deadline_reserve.h"
+#include "reflex_inject.h"
 #include "logger.h"
 #include <Windows.h>
+#include <cmath>
 #include <string>
 #include <cstdio>
 
@@ -88,14 +95,23 @@ void ValidateConfig() {
     ValidateEnum(g_config.enforcement_marker, enforce_markers, 3, "SimulationStart");
 
     // ── Wake Guard ──
-    g_config.initial_wake_guard_us = Clamp(g_config.initial_wake_guard_us, 0.0, 10000.0);
+    if (!std::isfinite(g_config.initial_wake_guard_us)) {
+        LOG_WARN("Config: non-finite initial_wake_guard_us, resetting to 800");
+        g_config.initial_wake_guard_us = 800.0;
+    }
+    g_config.initial_wake_guard_us = Clamp(
+        g_config.initial_wake_guard_us, 0.0, 10000.0);
 
     // ── OSD ──
-    g_config.osd_x               = Clamp(g_config.osd_x, 0.0f, 1.0f);
-    g_config.osd_y               = Clamp(g_config.osd_y, 0.0f, 1.0f);
+    if (!std::isfinite(g_config.osd_x) || !std::isfinite(g_config.osd_y))
+        LOG_WARN("Config: non-finite OSD position, resetting affected coordinates to 0.005");
+    g_config.osd_x               = osd_position_policy::ClampCoordinate(g_config.osd_x);
+    g_config.osd_y               = osd_position_policy::ClampCoordinate(g_config.osd_y);
     g_config.osd_opacity          = Clamp(g_config.osd_opacity, 0.0f, 1.0f);
     g_config.osd_scale            = Clamp(g_config.osd_scale, 0.5f, 2.0f);
     g_config.osd_text_brightness  = Clamp(g_config.osd_text_brightness, 0.0f, 1.0f);
+
+    g_config.oled_care_idle_minutes = Clamp(g_config.oled_care_idle_minutes, 0, 120);
 
     // ── Window mode ──
     static const char* window_modes[] = {"default", "borderless", "fullscreen"};
@@ -117,11 +133,48 @@ void ValidateConfig() {
     static const char* log_levels[] = {"error", "warn", "info", "debug"};
     ValidateEnum(g_config.log_level, log_levels, 4, "info");
 
-    // ── Adaptive Smoothing ──
-    g_config.smoothing_percentile = Clamp(g_config.smoothing_percentile, 0.50, 0.999);
-    g_config.smoothing_bias_us = Clamp(g_config.smoothing_bias_us, 0.0, 1000.0);
+    // ── Frame-Time Adaptation ──
+    if (!std::isfinite(g_config.smoothing_percentile)) {
+        LOG_WARN("Config: non-finite smoothing_percentile, resetting to 0.99");
+        g_config.smoothing_percentile = 0.99;
+    }
+    g_config.smoothing_percentile = Clamp(
+        g_config.smoothing_percentile, 0.50, 0.999);
+    if (!std::isfinite(g_config.smoothing_release_speed)) {
+        LOG_WARN(
+            "Config: non-finite smoothing_release_speed, resetting to 1.0");
+        g_config.smoothing_release_speed = 1.0;
+    }
+    g_config.smoothing_release_speed = Clamp(
+        g_config.smoothing_release_speed, 0.25, 4.0);
+    if (!std::isfinite(g_config.smoothing_bias_us)) {
+        LOG_WARN("Config: non-finite smoothing_bias_us, resetting to 0");
+        g_config.smoothing_bias_us = 0.0;
+    }
+    g_config.smoothing_bias_us = Clamp(
+        g_config.smoothing_bias_us, 0.0, 1000.0);
     static const char* smoothing_windows[] = {"medium", "dual"};
     ValidateEnum(g_config.smoothing_window, smoothing_windows, 2, "medium");
+    static const char* adaptive_reserve_modes[] = {"shadow", "active"};
+    ValidateEnum(
+        g_config.adaptive_deadline_reserve_mode,
+        adaptive_reserve_modes,
+        2,
+        "shadow");
+#ifndef _WIN64
+    g_config.adaptive_deadline_reserve_mode = "shadow";
+#endif
+
+    // ── Experimental arrival-lead predictor ──
+    static const char* estimator_a_modes[] = {"off", "shadow", "active"};
+    ValidateEnum(g_config.estimator_a_mode, estimator_a_modes, 3, "off");
+    if (!std::isfinite(g_config.estimator_a_fixed_reserve_us)) {
+        LOG_WARN(
+            "Config: non-finite estimator_a_fixed_reserve_us, resetting to 1800");
+        g_config.estimator_a_fixed_reserve_us = 1800.0;
+    }
+    g_config.estimator_a_fixed_reserve_us = Clamp(
+        g_config.estimator_a_fixed_reserve_us, 0.0, 5000.0);
 
     // ── Monitor Selection ──
     g_config.selected_monitor = Clamp(g_config.selected_monitor, 0, 8);
@@ -156,6 +209,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.osd_y                   = static_cast<float>(ReadINIDouble(S, "osd_y", 0.005, P));
     g_config.osd_opacity             = static_cast<float>(ReadINIDouble(S, "osd_opacity", 0.6, P));
     g_config.osd_toggle_key          = ReadINIString(S, "osd_toggle_key", "PageUp", P);
+    g_config.osd_position_cycle_key = ReadINIString(S, "osd_position_cycle_key", "", P);
     g_config.osd_preset_prev_key     = ReadINIString(S, "osd_preset_prev_key", "", P);
     g_config.osd_preset_next_key     = ReadINIString(S, "osd_preset_next_key", "", P);
     g_config.osd_show_fps            = ReadINIBool(S, "osd_show_fps", true, P);
@@ -189,7 +243,13 @@ void LoadConfig(HMODULE hModule) {
     g_config.adaptive_smoothing      = ReadINIBool(S, "adaptive_smoothing", false, P);
     g_config.smoothing_percentile    = ReadINIDouble(S, "smoothing_percentile", 0.99, P);
     g_config.smoothing_window        = ReadINIString(S, "smoothing_window", "medium", P);
+    g_config.smoothing_release_speed = ReadINIDouble(S, "smoothing_release_speed", 1.0, P);
     g_config.smoothing_bias_us       = ReadINIDouble(S, "smoothing_bias_us", 0.0, P);
+    g_config.adaptive_deadline_reserve_mode = ReadINIString(
+        S, "adaptive_deadline_reserve_mode", "shadow", P);
+    g_config.estimator_a_mode        = ReadINIString(S, "estimator_a_mode", "off", P);
+    g_config.estimator_a_fixed_reserve_us = ReadINIDouble(
+        S, "estimator_a_fixed_reserve_us", 1800.0, P);
     g_config.osd_show_adaptive_smoothing = ReadINIBool(S, "osd_show_adaptive_smoothing", false, P);
     g_config.osd_show_0_1pct_low     = ReadINIBool(S, "osd_show_0_1pct_low", false, P);
     g_config.osd_show_gpu_render_time = ReadINIBool(S, "osd_show_gpu_render_time", false, P);
@@ -209,6 +269,11 @@ void LoadConfig(HMODULE hModule) {
 
     // Monitor Blackout — keybind loaded from shared file if shared_presets enabled
     g_config.blackout_key            = ReadINIString(S, "blackout_key", "", P);
+
+    // OLED Care — per-game settings, independent of shared OSD presets
+    g_config.oled_care_key           = ReadINIString(S, "oled_care_key", "", P);
+    g_config.oled_care_all_monitors  = ReadINIBool(S, "oled_care_all_monitors", true, P);
+    g_config.oled_care_idle_minutes  = ReadINIInt(S, "oled_care_idle_minutes", 0, P);
 
     // Monitor Selection
     g_config.selected_monitor        = ReadINIInt(S, "selected_monitor", 0, P);
@@ -295,6 +360,10 @@ void SaveConfig() {
     WriteINIInt(S, "selected_monitor", g_config.selected_monitor, P);
     WriteINIBool(S, "focus_lock", g_config.focus_lock, P);
 
+    WriteINIString(S, "oled_care_key", g_config.oled_care_key.c_str(), P);
+    WriteINIBool(S, "oled_care_all_monitors", g_config.oled_care_all_monitors, P);
+    WriteINIInt(S, "oled_care_idle_minutes", g_config.oled_care_idle_minutes, P);
+
     // ── OSD ──
     WriteINIBool(S, "osd_enabled", g_config.osd_enabled, P);
     WriteINIDouble(S, "osd_x", g_config.osd_x, P);
@@ -304,6 +373,7 @@ void SaveConfig() {
     WriteINIBool(S, "osd_drop_shadow", g_config.osd_drop_shadow, P);
     WriteINIDouble(S, "osd_text_brightness", g_config.osd_text_brightness, P);
     WriteINIString(S, "osd_toggle_key", g_config.osd_toggle_key.c_str(), P);
+    WriteINIString(S, "osd_position_cycle_key", g_config.osd_position_cycle_key.c_str(), P);
 
     // ── OSD Elements ──
     WriteINIBool(S, "osd_show_fps", g_config.osd_show_fps, P);
@@ -350,11 +420,22 @@ void SaveConfig() {
         WriteINIString(S, "blackout_key", g_config.blackout_key.c_str(), P);
     }
 
-    // ── Adaptive Smoothing ──
+    // ── Frame-Time Adaptation ──
     WriteINIBool(S, "adaptive_smoothing", g_config.adaptive_smoothing, P);
     WriteINIDouble(S, "smoothing_percentile", g_config.smoothing_percentile, P);
     WriteINIString(S, "smoothing_window", g_config.smoothing_window.c_str(), P);
+    WriteINIDouble(S, "smoothing_release_speed", g_config.smoothing_release_speed, P);
     WriteINIDouble(S, "smoothing_bias_us", g_config.smoothing_bias_us, P);
+    WriteINIString(
+        S,
+        "adaptive_deadline_reserve_mode",
+        g_config.adaptive_deadline_reserve_mode.c_str(),
+        P);
+
+    // ── Experimental arrival-lead predictor ──
+    WriteINIString(S, "estimator_a_mode", g_config.estimator_a_mode.c_str(), P);
+    WriteINIDouble(S, "estimator_a_fixed_reserve_us",
+                   g_config.estimator_a_fixed_reserve_us, P);
 
     // ── Frame Generation ──
     WriteINIBool(S, "dynamic_mfg_passthrough", g_config.dynamic_mfg_passthrough, P);
@@ -374,10 +455,13 @@ void SaveConfig() {
 
 void ApplyConfig() {
     // Wire config values to module globals
+    OLEDCare_SetConfig(g_config.oled_care_all_monitors, g_config.oled_care_idle_minutes);
     g_user_target_fps.store(g_config.target_fps, std::memory_order_relaxed);
     g_background_fps.store(g_config.background_fps, std::memory_order_relaxed);
     g_fg_off_fps.store(g_config.fg_off_fps, std::memory_order_relaxed);
     g_adaptive_wake_guard.base = g_config.initial_wake_guard_us;
+    VSync_ApplyOpenGL();
+    ReflexInject_SetEnabled(g_config.reflex_inject);
     Log_SetLevel(Log_ParseLevel(g_config.log_level.c_str()));
 
     // Force DMFG passthrough mode when config toggle is enabled
@@ -387,11 +471,22 @@ void ApplyConfig() {
     // DMFG output cap
     g_dmfg_output_cap.store(g_config.dmfg_output_cap, std::memory_order_relaxed);
 
-    // Adaptive smoothing
-    g_adaptive_smoothing.SetConfig(
+    // Frame-time adaptation; legacy INI key names remain stable.
+    g_frame_time_adaptation.SetConfig(
         g_config.smoothing_window == "dual",
         g_config.smoothing_percentile,
-        g_config.adaptive_smoothing);
+        g_config.adaptive_smoothing,
+        g_config.smoothing_release_speed);
+
+    AdaptiveDeadlineReserve_SetRuntimeConfig(
+        AdaptiveDeadlineReserve_ModeFromText(
+            g_config.adaptive_deadline_reserve_mode.c_str()),
+        g_config.adaptive_smoothing,
+        g_config.smoothing_bias_us);
+
+    ArrivalLead_SetRuntimeConfig(
+        ArrivalLead_ModeFromText(g_config.estimator_a_mode.c_str()),
+        g_config.estimator_a_fixed_reserve_us);
 }
 
 
@@ -469,8 +564,8 @@ OSDPreset OSDPreset_FromConfig() {
 }
 
 void OSDPreset_ApplyToConfig(const OSDPreset& p) {
-    g_config.osd_x                     = p.osd_x;
-    g_config.osd_y                     = p.osd_y;
+    g_config.osd_x                     = osd_position_policy::ClampCoordinate(p.osd_x);
+    g_config.osd_y                     = osd_position_policy::ClampCoordinate(p.osd_y);
     g_config.osd_scale                 = p.osd_scale;
     g_config.osd_opacity               = p.osd_opacity;
     g_config.osd_show_fps              = p.show_fps;

@@ -7,47 +7,93 @@
 #include "stress_detector.h"
 #include "logger.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
-#include <vector>
 
 Predictor g_predictor;
 std::atomic<bool> g_regime_break{false};
 std::atomic<double> g_cpu_latency_us{0.0};
 std::atomic<double> g_pacer_latency_us{0.0};
 
-void Predictor::OnMarker(uint32_t type, int64_t ts, uint64_t frameID, bool overload_active) {
-    // ── Deferred flush: consume flag set by Flush(FLUSH_PREDICTOR) ──
-    // pending_frames is not thread-safe — only touch it on the render thread.
-    if (flush_pending.exchange(false, std::memory_order_acquire)) {
-        pending_frames.clear();
-        last_sim_start_frameID = 0;
+static PendingFrame* FindPendingFrame(Predictor* predictor, uint64_t frame_id) noexcept {
+    if (!predictor || frame_id == 0) return nullptr;
+    const size_t first =
+        PredictorPendingFrameSetIndex(frame_id) * Predictor::kPendingFrameWayCount;
+    for (size_t way = 0; way < Predictor::kPendingFrameWayCount; ++way) {
+        PendingFrame& pending = predictor->pending_frames[first + way];
+        if (pending.occupied && pending.frame_id == frame_id) return &pending;
     }
+    return nullptr;
+}
+
+static void RemovePendingFrame(Predictor* predictor, uint64_t frame_id) noexcept {
+    if (PendingFrame* pending = FindPendingFrame(predictor, frame_id))
+        *pending = {};
+}
+
+static PendingFrame* StorePendingFrame(
+    Predictor* predictor,
+    uint64_t frame_id,
+    int64_t enforcement_ts) noexcept
+{
+    if (!predictor || frame_id == 0) return nullptr;
+    const size_t first =
+        PredictorPendingFrameSetIndex(frame_id) * Predictor::kPendingFrameWayCount;
+    PendingFrame* destination = nullptr;
+    for (size_t way = 0; way < Predictor::kPendingFrameWayCount; ++way) {
+        PendingFrame& pending = predictor->pending_frames[first + way];
+        if (pending.occupied && pending.frame_id == frame_id) {
+            pending = { frame_id, enforcement_ts, true };
+            return &pending;
+        }
+        if (!pending.occupied) {
+            destination = &pending;
+            break;
+        }
+        if (!destination ||
+            pending.enforcement_ts < destination->enforcement_ts) {
+            destination = &pending;
+        }
+    }
+    *destination = { frame_id, enforcement_ts, true };
+    return destination;
+}
+
+void Predictor::OnMarker(
+    uint32_t type,
+    int64_t ts,
+    uint64_t frameID,
+    bool overload_active,
+    uint32_t enforcement_marker_type) {
+    // Consume reset requests only on the admitted predictor owner.
+    ApplyPendingFlush();
 
     // ── Reject bad markers ──
 
-    // Duplicate frameID that's already pending — drop stale, accept new
-    if (type == SIMULATION_START && pending_frames.count(frameID)) {
-        pending_frames.erase(frameID);
-    }
+    // Duplicate frameID that's already pending — drop stale, accept the
+    // selected enforcement marker again.
+    if (type == enforcement_marker_type)
+        RemovePendingFrame(this, frameID);
 
-    // Out-of-order: frameID should be monotonically increasing for SIM_START
-    if (type == SIMULATION_START && frameID <= last_sim_start_frameID) {
+    // Source frame IDs must increase monotonically at the active release point.
+    if (type == enforcement_marker_type &&
+        frameID <= last_enforcement_frameID) {
         return; // drop
     }
 
     // ── Timeout stale pending frames ──
     double timeout = (std::max)(predicted_us * 2.0, 50000.0); // at least 50ms
-    for (auto it = pending_frames.begin(); it != pending_frames.end(); ) {
-        if (qpc_to_us(ts - it->second.enforcement_ts) > timeout)
-            it = pending_frames.erase(it);
-        else
-            ++it;
+    for (PendingFrame& pending : pending_frames) {
+        if (pending.occupied &&
+            qpc_to_us(ts - pending.enforcement_ts) > timeout) {
+            pending = {};
+        }
     }
 
     // ── Normal processing ──
-    if (type == SIMULATION_START) {
-        pending_frames[frameID].enforcement_ts = ts;
-        last_sim_start_frameID = frameID;
+    if (type == enforcement_marker_type) {
+        StorePendingFrame(this, frameID, ts);
+        last_enforcement_frameID = frameID;
     }
     else if (type == PRESENT_START) {
         // Measure enforcement → PRESENT_START = game thread busy time
@@ -55,12 +101,11 @@ void Predictor::OnMarker(uint32_t type, int64_t ts, uint64_t frameID, bool overl
         // predict: how long from releasing the game thread until it calls
         // Present. The old PRESENT_END endpoint included present-to-scanout
         // and FG pipeline overhead, inflating predictions by ~56%.
-        auto it = pending_frames.find(frameID);
-        if (it == pending_frames.end())
-            return;
+        PendingFrame* pending = FindPendingFrame(this, frameID);
+        if (!pending) return;
 
-        if (it->second.enforcement_ts != 0) {
-            double total = qpc_to_us(ts - it->second.enforcement_ts);
+        if (pending->enforcement_ts != 0) {
+            double total = qpc_to_us(ts - pending->enforcement_ts);
             if (total > 0.0 && total < 200000.0) {
                 frame_times_us.Push(total);
                 g_regime_detector.OnFrameTime(total);
@@ -68,7 +113,7 @@ void Predictor::OnMarker(uint32_t type, int64_t ts, uint64_t frameID, bool overl
             }
         }
 
-        pending_frames.erase(it);
+        *pending = {};
     }
     else if (type == PRESENT_END) {
         // Present-block detection only — no longer used for prediction.
@@ -78,7 +123,7 @@ void Predictor::OnMarker(uint32_t type, int64_t ts, uint64_t frameID, bool overl
         }
 
         // Clean up any pending frame that wasn't caught by PRESENT_START
-        pending_frames.erase(frameID);
+        RemovePendingFrame(this, frameID);
     }
     else if (type == RENDERSUBMIT_END) {
         // CPU latency: SIM_START → RENDERSUBMIT_END
@@ -95,6 +140,7 @@ void Predictor::OnMarker(uint32_t type, int64_t ts, uint64_t frameID, bool overl
 }
 
 double Predictor::Predict() {
+    ApplyPendingFlush();
     if (frame_times_us.Size() < 8) {
         uint32_t game_interval = g_game_requested_interval.load(std::memory_order_relaxed);
         if (game_interval > 0 && game_interval < 100000)
@@ -138,23 +184,29 @@ double Predictor::Predict() {
 }
 
 void Predictor::OnEnforcement(uint64_t frameID, int64_t enforcement_ts) {
+    ApplyPendingFlush();
     // Update the pending frame's start timestamp to post-sleep time.
     // This ensures the predictor measures actual render pipeline time
     // (post-sleep SIM_START → PRESENT_END) rather than including our sleep.
-    auto it = pending_frames.find(frameID);
-    if (it != pending_frames.end()) {
-        it->second.enforcement_ts = enforcement_ts;
-    }
+    if (PendingFrame* pending = FindPendingFrame(this, frameID))
+        pending->enforcement_ts = enforcement_ts;
 }
 
-void Predictor::RequestFlush() {
-    // Thread-safe: clear the RollingWindow (fixed-size array, no heap) and
-    // scalar fields immediately. Defer pending_frames.clear() to the next
-    // OnMarker call on the render thread via the atomic flag.
+void Predictor::RequestFlush() noexcept {
+    flush_pending.store(true, std::memory_order_release);
+}
+
+bool Predictor::ApplyPendingFlush() noexcept {
+    if (!flush_pending.exchange(false, std::memory_order_acq_rel))
+        return false;
+
     frame_times_us.Clear();
+    predicted_us = 0.0;
     cv = 0.15;
     ema_us = 0.0;
-    flush_pending.store(true, std::memory_order_release);
+    for (PendingFrame& pending : pending_frames) pending = {};
+    last_enforcement_frameID = 0;
+    return true;
 }
 
 // ── CheckRegimeBreak: called after each frame_time push ──
@@ -162,11 +214,18 @@ void CheckRegimeBreak() {
     if (!g_regime_detector.RegimeBreak(g_predictor.frame_times_us))
         return;
 
-    // Partial reset: keep last 16 frames, discard older history
-    auto recent = g_predictor.frame_times_us.TakeLast(16);
+    // Partial reset: keep last 16 frames, discard older history without
+    // allocating from the foreign marker callback.
+    const size_t keep = (std::min)(
+        g_predictor.frame_times_us.Size(), size_t{16});
+    std::array<double, 16> recent{};
+    for (size_t index = 0; index < keep; ++index) {
+        recent[index] =
+            g_predictor.frame_times_us.Recent(keep - 1 - index);
+    }
     g_predictor.frame_times_us.Clear();
-    for (double f : recent)
-        g_predictor.frame_times_us.Push(f);
+    for (size_t index = 0; index < keep; ++index)
+        g_predictor.frame_times_us.Push(recent[index]);
 
     // Set shared flag — damping reads this instead of detecting independently
     g_regime_break.store(true, std::memory_order_relaxed);

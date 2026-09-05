@@ -46,6 +46,13 @@ public:
         return data_[idx];
     }
 
+    // Return an element relative to the newest sample without allocating.
+    // back=0 is Latest(), back=1 is the preceding sample. Caller must ensure
+    // back < Size().
+    const T& Recent(size_t back) const {
+        return data_[(head_ + N - 1 - back) % N];
+    }
+
     // Return the last `n` elements (oldest first)
     std::vector<T> TakeLast(size_t n) const {
         if (n > count_) n = count_;

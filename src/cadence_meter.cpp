@@ -151,8 +151,11 @@ void CadenceMeter::Ingest(uint32_t present_count, int64_t sync_qpc,
         cadence_smoothness_us.store(smoothed, std::memory_order_relaxed);
 
         if (present_intervals_us.Size() >= 2) {
-            auto last_two = present_intervals_us.TakeLast(2);
-            cadence_jitter_us.store(std::abs(last_two[1] - last_two[0]), std::memory_order_relaxed);
+            cadence_jitter_us.store(
+                std::abs(
+                    present_intervals_us.Recent(0) -
+                    present_intervals_us.Recent(1)),
+                std::memory_order_relaxed);
         }
 
         if (per_present_target > 0.0) {
@@ -211,8 +214,11 @@ void CadenceMeter::IngestReflex(double gpu_frame_time_us, double target_interval
 
     // Jitter
     if (present_intervals_us.Size() >= 2) {
-        auto last_two = present_intervals_us.TakeLast(2);
-        cadence_jitter_us.store(std::abs(last_two[1] - last_two[0]), std::memory_order_relaxed);
+        cadence_jitter_us.store(
+            std::abs(
+                present_intervals_us.Recent(0) -
+                present_intervals_us.Recent(1)),
+            std::memory_order_relaxed);
     }
 
     // Dropped/held

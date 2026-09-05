@@ -4,6 +4,7 @@
 #include "wake_guard.h"
 #include "config.h"
 #include "scheduler.h"
+#include "vblank_thread.h"
 #include "logger.h"
 #include <cmath>
 #include <cstring>
@@ -34,6 +35,12 @@ constexpr NvU32 NVAPI_ID_EnumPhysicalGPUs             = 0xE5AC921F;
 
 // NvAPI QueryInterface resolver
 static void* (*s_NvAPI_QueryInterface)(NvU32) = nullptr;
+
+static void* SafeNvAPIQueryInterface(NvU32 id) noexcept {
+    if (!s_NvAPI_QueryInterface) return nullptr;
+    __try { return s_NvAPI_QueryInterface(id); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
 
 static void ResolveNvAPI() {
     if (s_NvAPI_QueryInterface) return;
@@ -105,18 +112,41 @@ static PFN_GetMonitorCapabilities s_GetMonitorCapabilities = nullptr;
 static PFN_GPU_GetArchInfo        s_GPU_GetArchInfo        = nullptr;
 static PFN_EnumPhysicalGPUs       s_EnumPhysicalGPUs       = nullptr;
 
+static NvAPI_Status SafeGetVRRInfo(NvU32 display_id, NV_VRR_INFO* info) noexcept {
+    __try { return s_GetVRRInfo(display_id, info); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+static NvAPI_Status SafeGetMonitorCapabilities(
+    NvU32 display_id,
+    NV_MONITOR_CAPABILITIES* capabilities) noexcept
+{
+    __try { return s_GetMonitorCapabilities(display_id, capabilities); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+static NvAPI_Status SafeEnumPhysicalGPUs(void* gpus[64], NvU32* count) noexcept {
+    __try { return s_EnumPhysicalGPUs(gpus, count); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+static NvAPI_Status SafeGetArchInfo(void* gpu, NV_GPU_ARCH_INFO* info) noexcept {
+    __try { return s_GPU_GetArchInfo(gpu, info); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
 static void ResolveFunctions() {
     ResolveNvAPI();
     if (!s_NvAPI_QueryInterface) return;
 
     s_GetVRRInfo = reinterpret_cast<PFN_GetVRRInfo>(
-        s_NvAPI_QueryInterface(NVAPI_ID_Disp_GetVRRInfo));
+        SafeNvAPIQueryInterface(NVAPI_ID_Disp_GetVRRInfo));
     s_GetMonitorCapabilities = reinterpret_cast<PFN_GetMonitorCapabilities>(
-        s_NvAPI_QueryInterface(NVAPI_ID_Disp_GetMonitorCapabilities));
+        SafeNvAPIQueryInterface(NVAPI_ID_Disp_GetMonitorCapabilities));
     s_GPU_GetArchInfo = reinterpret_cast<PFN_GPU_GetArchInfo>(
-        s_NvAPI_QueryInterface(NVAPI_ID_GPU_GetArchInfo));
+        SafeNvAPIQueryInterface(NVAPI_ID_GPU_GetArchInfo));
     s_EnumPhysicalGPUs = reinterpret_cast<PFN_EnumPhysicalGPUs>(
-        s_NvAPI_QueryInterface(NVAPI_ID_EnumPhysicalGPUs));
+        SafeNvAPIQueryInterface(NVAPI_ID_EnumPhysicalGPUs));
 }
 
 // ── Public API ──
@@ -199,7 +229,7 @@ void QueryVRRFloor() {
     NV_MONITOR_CAPABILITIES caps = {};
     caps.version = NV_MONITOR_CAPABILITIES_VER;
 
-    if (s_GetMonitorCapabilities(display_id, &caps) == NVAPI_OK) {
+    if (SafeGetMonitorCapabilities(display_id, &caps) == NVAPI_OK) {
         NvU32 minHz = caps.data.vsyncData.minRefreshRate;
         if (minHz > 0) {
             g_floor_hz.store(static_cast<double>(minHz), std::memory_order_relaxed);
@@ -236,7 +266,7 @@ void PollGSyncState() {
     NV_VRR_INFO vrr_info = {};
     vrr_info.version = NV_VRR_INFO_VER;
 
-    NvAPI_Status st = s_GetVRRInfo(display_id, &vrr_info);
+    NvAPI_Status st = SafeGetVRRInfo(display_id, &vrr_info);
     if (st != NVAPI_OK) {
         static bool s_warned = false;
         if (!s_warned) {
@@ -249,9 +279,8 @@ void PollGSyncState() {
     bool new_state = vrr_info.bIsVRREnabled || vrr_info.bIsDisplayInVRRMode;
     bool old_state = g_gsync_active.exchange(new_state, std::memory_order_relaxed);
 
-    static bool s_first_poll = true;
-    if (s_first_poll) {
-        s_first_poll = false;
+    static std::atomic<bool> s_first_poll{true};
+    if (s_first_poll.exchange(false, std::memory_order_acq_rel)) {
         LOG_WARN("VRR poll: enabled=%d possible=%d requested=%d displayInVRR=%d -> gsync=%s (displayId=%u)",
                  vrr_info.bIsVRREnabled, vrr_info.bIsVRRPossible,
                  vrr_info.bIsVRRRequested, vrr_info.bIsDisplayInVRRMode,
@@ -280,14 +309,18 @@ void OnGSyncStateChange(bool new_gsync_active) {
     LOG_WARN("G-Sync state changed: %s", new_gsync_active ? "active" : "inactive");
     PacingMode current = g_pacing_mode.load(std::memory_order_relaxed);
 
+    PacingMode next = current;
     if (new_gsync_active && current == PacingMode::Fixed) {
-        g_pacing_mode.store(PacingMode::VRR, std::memory_order_relaxed);
+        next = PacingMode::VRR;
+        g_pacing_mode.store(next, std::memory_order_release);
         // TODO: predictor.SeedFromMarkerLog(last_120_frames)
         // TODO: ceiling_margin.Reset()
     } else if (!new_gsync_active && current == PacingMode::VRR) {
-        g_pacing_mode.store(PacingMode::Fixed, std::memory_order_relaxed);
+        next = PacingMode::Fixed;
+        g_pacing_mode.store(next, std::memory_order_release);
         // TODO: pll.Reanchor(QPC())
     }
+    UpdateVBlankThreadForMode(next);
 }
 
 void DetectGPUArchitecture() {
@@ -296,12 +329,12 @@ void DetectGPUArchitecture() {
 
     void* gpus[64] = {};
     NvU32 count = 0;
-    if (s_EnumPhysicalGPUs(gpus, &count) != NVAPI_OK || count == 0)
+    if (SafeEnumPhysicalGPUs(gpus, &count) != NVAPI_OK || count == 0)
         return;
 
     NV_GPU_ARCH_INFO arch = {};
     arch.version = NV_GPU_ARCH_INFO_VER;
-    if (s_GPU_GetArchInfo(gpus[0], &arch) == NVAPI_OK) {
+    if (SafeGetArchInfo(gpus[0], &arch) == NVAPI_OK) {
         g_is_blackwell = (arch.architecture_id >= NV_GPU_ARCHITECTURE_GB100);
     }
 }

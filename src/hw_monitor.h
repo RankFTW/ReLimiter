@@ -31,11 +31,11 @@ struct HWMonitorData {
 void HWMonitor_Init();
 
 // Shutdown and release resources.
-void HWMonitor_Shutdown();
+bool HWMonitor_Shutdown();
 
 // Poll sensors if enough time has elapsed since last poll.
 // Call this every frame from the OSD render path.
 void HWMonitor_Update();
 
-// Get the latest cached sensor data.
-const HWMonitorData& HWMonitor_GetData();
+// Get one coherent copy of the latest cached sensor data.
+HWMonitorData HWMonitor_GetData();

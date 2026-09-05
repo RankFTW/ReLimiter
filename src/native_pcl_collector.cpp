@@ -97,9 +97,13 @@ namespace
     class MeasurementAccumulator
     {
     public:
-        MeasurementAccumulator(uint32_t process_id, uint64_t qpc_frequency) noexcept
+        MeasurementAccumulator(
+            uint32_t process_id,
+            uint64_t qpc_frequency,
+            uint32_t observer_epoch) noexcept
             : process_id_(process_id)
             , qpc_frequency_(qpc_frequency)
+            , observer_epoch_(observer_epoch)
             , collection_start_qpc_(QueryQpc())
         {
         }
@@ -141,6 +145,7 @@ namespace
             SwapchainPclState& chain = swapchain_states_[present->SwapChainAddress];
             if (present->FinalState == PresentResult::Discarded) {
                 ProcessNotDisplayedPresent(*present, chain);
+                PublishPresentObservation(*present, nullptr, chain);
                 UpdateLastSimulationStart(*present, chain);
                 return;
             }
@@ -167,6 +172,7 @@ namespace
             if (!has_valid_display_timestamp) {
                 ProcessNotDisplayedPresent(*present, chain);
             }
+            PublishPresentObservation(*present, &displayed_entries, chain);
             UpdateLastSimulationStart(*present, chain);
         }
 
@@ -282,6 +288,119 @@ namespace
         static bool HasInputPing(const PresentEvent& present) noexcept
         {
             return present.PclInputPingTime != 0;
+        }
+
+        static PresentObservationRuntime NormalizeRuntime(
+            Runtime runtime) noexcept
+        {
+            switch (runtime) {
+                case Runtime::DXGI: return PresentObservationRuntime::Dxgi;
+                case Runtime::D3D9: return PresentObservationRuntime::D3D9;
+                case Runtime::Other: return PresentObservationRuntime::Other;
+                default: return PresentObservationRuntime::Other;
+            }
+        }
+
+        static PresentObservationFinalState NormalizeFinalState(
+            PresentResult final_state) noexcept
+        {
+            switch (final_state) {
+                case PresentResult::Presented:
+                    return PresentObservationFinalState::Presented;
+                case PresentResult::Discarded:
+                    return PresentObservationFinalState::Discarded;
+                case PresentResult::Unknown:
+                    return PresentObservationFinalState::Unknown;
+                default:
+                    return PresentObservationFinalState::Unknown;
+            }
+        }
+
+        void PublishPresentObservation(
+            const PresentEvent& present,
+            const std::vector<DisplayEntry>* displayed_entries,
+            const SwapchainPclState& chain) const noexcept
+        {
+            PresentTimelineObservation observation{};
+            observation.observer_epoch = observer_epoch_;
+            observation.runtime = NormalizeRuntime(present.Runtime);
+            observation.final_state = NormalizeFinalState(present.FinalState);
+            observation.native_swapchain = present.SwapChainAddress;
+            observation.thread_id = present.ThreadId;
+            observation.present_start_qpc = present.PresentStartTime;
+            observation.present_end_qpc =
+                present.TimeInPresent <=
+                    (std::numeric_limits<uint64_t>::max)() -
+                        present.PresentStartTime
+                ? present.PresentStartTime + present.TimeInPresent
+                : 0;
+            observation.report_qpc = QueryQpc();
+            observation.qpc_frequency = qpc_frequency_;
+            observation.pcl_frame_id = present.PclFrameId;
+            observation.pcl_sim_start_qpc = present.PclSimStartTime;
+            observation.gpu_start_qpc = present.GPUStartTime;
+            observation.gpu_ready_qpc = present.ReadyTime;
+            observation.gpu_duration_qpc = present.GPUDuration;
+
+            uint32_t evidence = PRESENT_CLASSIFICATION_EVIDENCE_NONE;
+            if (present.PclSimStartTime != 0) {
+                evidence |=
+                    PRESENT_CLASSIFICATION_EVIDENCE_PCL_SIMULATION_MARKER;
+            }
+
+            bool has_reported_frame_type = false;
+            int32_t reported_frame_type = 0;
+            if (displayed_entries != nullptr) {
+                for (const DisplayEntry& displayed : *displayed_entries) {
+                    if (displayed.second == 0) continue;
+
+                    ++observation.displayed_instance_count;
+                    const int32_t frame_type =
+                        static_cast<int32_t>(displayed.first);
+                    if (!has_reported_frame_type) {
+                        reported_frame_type = frame_type;
+                        has_reported_frame_type = true;
+                    }
+                    else if (reported_frame_type != frame_type) {
+                        reported_frame_type = -1;
+                        evidence |=
+                            PRESENT_CLASSIFICATION_EVIDENCE_MIXED_FRAME_TYPES;
+                    }
+
+                    switch (displayed.first) {
+                        case FrameType::Application:
+                            evidence |=
+                                PRESENT_CLASSIFICATION_EVIDENCE_PRESENTMON_APPLICATION;
+                            break;
+                        case FrameType::Repeated:
+                            evidence |=
+                                PRESENT_CLASSIFICATION_EVIDENCE_PRESENTMON_REPEATED;
+                            break;
+                        case FrameType::Intel_XEFG:
+                        case FrameType::AMD_AFMF:
+                            evidence |=
+                                PRESENT_CLASSIFICATION_EVIDENCE_PRESENTMON_GENERATED;
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            }
+            observation.reported_frame_type = reported_frame_type;
+
+            observation.used_simulation_fallback =
+                observation.final_state == PresentObservationFinalState::Presented &&
+                observation.displayed_instance_count != 0 &&
+                present.PclSimStartTime == 0 &&
+                chain.last_simulation_qpc != 0;
+            if (observation.used_simulation_fallback) {
+                evidence |=
+                    PRESENT_CLASSIFICATION_EVIDENCE_SIMULATION_FALLBACK;
+            }
+            observation.classification_evidence = evidence;
+            observation.frame_classification =
+                PresentAssociation_ClassifyFrame(evidence);
+            NativePclInternal_PublishPresentObservation(observation);
         }
 
         static void UpdateInputToFrameStartEma(
@@ -511,6 +630,7 @@ namespace
 
         uint32_t process_id_ = 0;
         uint64_t qpc_frequency_ = 0;
+        uint32_t observer_epoch_ = 0;
         uint64_t collection_start_qpc_ = 0;
         std::unordered_map<uint64_t, SwapchainPclState> swapchain_states_;
 
@@ -747,7 +867,10 @@ void NativePclCollector_Run() noexcept
         const uint64_t qpc_frequency = session.mTimestampFrequency.QuadPart > 0
             ? static_cast<uint64_t>(session.mTimestampFrequency.QuadPart)
             : QueryQpcFrequency();
-        MeasurementAccumulator accumulator(process_id, qpc_frequency);
+        MeasurementAccumulator accumulator(
+            process_id,
+            qpc_frequency,
+            NativePclInternal_BeginObserverEpoch());
         std::vector<std::shared_ptr<PresentEvent>> presents;
         constexpr uint32_t kMaximumEtwStatusQueryFailures = 3;
         uint32_t consecutive_status_query_failures = 0;

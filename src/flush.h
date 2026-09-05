@@ -15,7 +15,13 @@ constexpr uint32_t FLUSH_ALL        = FLUSH_CORRELATOR | FLUSH_STRESS |
                                       FLUSH_PREDICTOR | FLUSH_DAMPING |
                                       FLUSH_PQI;
 
+// Thread-safe request publication. Scheduler-owned plain state is reset later
+// by Flush_ApplyPendingOnSchedulerOwner.
 void Flush(uint32_t modules);
+
+// Called by OnMarker after scheduler-owner admission. Applies all coalesced
+// scheduler-owned resets without blocking or allocating.
+void Flush_ApplyPendingOnSchedulerOwner() noexcept;
 
 // Swapchain lifecycle handlers (registered as ReShade events).
 void OnInitSwapchain(void* native_swapchain);

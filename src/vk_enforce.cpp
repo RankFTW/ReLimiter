@@ -17,7 +17,7 @@
 // Vulkan doesn't have per-frame IDs from markers by default.
 // We use a monotonic counter as the frameID for the shared scheduler.
 static std::atomic<uint64_t> s_vk_frame_counter{1};
-static bool s_initialized = false;
+static std::atomic<bool> s_initialized{false};
 
 // ── FG present coalescing ──
 // With 3x FG, ReShade fires the present event 3 times per render frame:
@@ -40,18 +40,22 @@ void VkEnforce_Init() {
     // Do NOT reset s_vk_frame_counter — must be monotonically increasing.
     s_last_present_qpc = 0;
     s_post_sleep_qpc = 0;
-    s_initialized = true;
+    s_initialized.store(true, std::memory_order_release);
     LOG_INFO("VkEnforce: initialized (frame_counter=%llu)",
              s_vk_frame_counter.load(std::memory_order_relaxed));
 }
 
 void VkEnforce_Shutdown() {
-    s_initialized = false;
+    s_initialized.store(false, std::memory_order_release);
     LOG_INFO("VkEnforce: shutdown");
 }
 
-void VkEnforce_OnPresent(int64_t now_qpc) {
-    if (!s_initialized) return;
+void VkEnforce_OnPresent(
+    int64_t now_qpc,
+    bool force_marker_fallback) {
+    if (!s_initialized.load(std::memory_order_acquire)) return;
+    SchedulerOwnerGuard scheduler_owner;
+    if (!scheduler_owner) return;
 
     // ── Deferred OpenGL VSync hook installation ──
     // wglGetProcAddress requires an active GL context on the calling thread.
@@ -71,10 +75,10 @@ void VkEnforce_OnPresent(int64_t now_qpc) {
     // via pcl_hooks.cpp — skip present-based enforcement entirely.
     // Same for NvAPI markers (DX12 Reflex games) — enforcement is in
     // Hook_SetLatencyMarker. Present-based is only a fallback.
-    if (PCL_MarkersFlowing())
-        return;
-    if (AreNvAPIMarkersFlowing())
-        return;
+    if (!force_marker_fallback) {
+        if (PCL_MarkersFlowing()) return;
+        if (AreNvAPIMarkersFlowing()) return;
+    }
 
     int fg_raw = ComputeFGDivisorRaw();
 
@@ -126,7 +130,10 @@ void VkEnforce_OnPresent(int64_t now_qpc) {
         ReflexInject_OnPreSleep(frameID, scheduler_now);
     }
 
-    OnMarker(frameID, scheduler_now);
+    OnMarker(
+        frameID,
+        scheduler_now,
+        SchedulerTrigger::PresentFallback);
 
     if (api_for_reflex != ActiveAPI::Vulkan && api_for_reflex != ActiveAPI::OpenGL && ReflexInject_IsActive()) {
         LARGE_INTEGER post_inject;

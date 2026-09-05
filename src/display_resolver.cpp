@@ -4,13 +4,14 @@
 #include "nvapi_types.h"
 #include "logger.h"
 #include <dxgi.h>
+#include <atomic>
 #include <cstring>
 
 // ── File-static state (no extern globals) ──
 
-static uint32_t s_display_id    = 0;        // NvU32, cached per swapchain init
-static HWND     s_monitor_hwnd  = nullptr;  // HWND used for MonitorFromWindow
-static bool     s_resolved      = false;    // true after successful resolution
+static std::atomic<uint32_t> s_display_id{0};
+static std::atomic<HWND> s_monitor_hwnd{nullptr};
+static std::atomic<bool> s_resolved{false};
 
 // ── NvAPI function pointer types (resolved via QueryInterface) ──
 
@@ -27,6 +28,27 @@ static void* (*s_NvAPI_QueryInterface)(NvU32) = nullptr;
 static PFN_GetDisplayIdByDisplayName s_GetDisplayIdByDisplayName = nullptr;
 static PFN_EnumNvidiaDisplayHandle   s_EnumDisplayHandle         = nullptr;
 static PFN_GetAssociatedDisplayName  s_GetDisplayName            = nullptr;
+
+static void* SafeQueryInterface(NvU32 id) noexcept {
+    if (!s_NvAPI_QueryInterface) return nullptr;
+    __try { return s_NvAPI_QueryInterface(id); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
+static NvAPI_Status SafeEnumDisplay(NvU32 index, void** display) noexcept {
+    __try { return s_EnumDisplayHandle(index, display); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+static NvAPI_Status SafeGetDisplayName(void* display, char name[64]) noexcept {
+    __try { return s_GetDisplayName(display, name); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+static NvAPI_Status SafeGetDisplayId(const char* name, NvU32* id) noexcept {
+    __try { return s_GetDisplayIdByDisplayName(name, id); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
 
 static bool s_nvapi_resolved = false;
 
@@ -56,11 +78,11 @@ static void ResolveNvAPI() {
     if (!s_NvAPI_QueryInterface) return;
 
     s_GetDisplayIdByDisplayName = reinterpret_cast<PFN_GetDisplayIdByDisplayName>(
-        s_NvAPI_QueryInterface(NVAPI_ID_DISP_GetDisplayIdByDisplayName));
+        SafeQueryInterface(NVAPI_ID_DISP_GetDisplayIdByDisplayName));
     s_EnumDisplayHandle = reinterpret_cast<PFN_EnumNvidiaDisplayHandle>(
-        s_NvAPI_QueryInterface(NVAPI_ID_EnumNvidiaDisplayHandle));
+        SafeQueryInterface(NVAPI_ID_EnumNvidiaDisplayHandle));
     s_GetDisplayName = reinterpret_cast<PFN_GetAssociatedDisplayName>(
-        s_NvAPI_QueryInterface(NVAPI_ID_GetAssociatedNvidiaDisplayName));
+        SafeQueryInterface(NVAPI_ID_GetAssociatedNvidiaDisplayName));
 }
 
 // ── Internal: match a GDI device name to NvAPI display enumeration ──
@@ -83,17 +105,17 @@ static NvU32 MatchGdiNameToNvAPI(const char* gdi_device_name) {
 
     for (NvU32 i = 0; i < 16; i++) {
         void* hDisp = nullptr;
-        if (s_EnumDisplayHandle(i, &hDisp) != NVAPI_OK)
+        if (SafeEnumDisplay(i, &hDisp) != NVAPI_OK)
             break;
 
         char nvName[64] = {};
-        if (s_GetDisplayName(hDisp, nvName) != NVAPI_OK)
+        if (SafeGetDisplayName(hDisp, nvName) != NVAPI_OK)
             continue;
 
         // NvAPI returns "\\.\DISPLAY1", GDI also returns "\\.\DISPLAY1" — direct match
         if (strcmp(nvName, gdi_device_name) == 0) {
             NvU32 displayId = 0;
-            NvAPI_Status st = s_GetDisplayIdByDisplayName(nvName, &displayId);
+            NvAPI_Status st = SafeGetDisplayId(nvName, &displayId);
             if (st != NVAPI_OK) {
                 LOG_WARN("DispRes: GetDisplayIdByDisplayName('%s') failed status=%d",
                          nvName, st);
@@ -184,7 +206,7 @@ static NvU32 ResolveVulkanPath(HWND hwnd) {
 void DispRes_OnSwapchainInit(uint64_t native_handle, ActiveAPI api, HWND hwnd) {
     ResolveNvAPI();
 
-    s_monitor_hwnd = hwnd;
+    s_monitor_hwnd.store(hwnd, std::memory_order_release);
 
     NvU32 new_id = 0;
 
@@ -196,15 +218,17 @@ void DispRes_OnSwapchainInit(uint64_t native_handle, ActiveAPI api, HWND hwnd) {
 
     if (new_id != 0) {
         // Successful resolution (Req 2.4 — resolve once per init, cache)
-        if (s_display_id == 0) {
+        const uint32_t previous_id =
+            s_display_id.load(std::memory_order_acquire);
+        if (previous_id == 0) {
             LOG_INFO("DispRes: Display ID resolved: %u (api=%d, hwnd=%p)",
                      new_id, static_cast<int>(api), hwnd);
-        } else if (new_id != s_display_id) {
+        } else if (new_id != previous_id) {
             LOG_INFO("DispRes: Display ID changed: %u -> %u (api=%d)",
-                     s_display_id, new_id, static_cast<int>(api));
+                     previous_id, new_id, static_cast<int>(api));
         }
-        s_display_id = new_id;
-        s_resolved = true;
+        s_display_id.store(new_id, std::memory_order_release);
+        s_resolved.store(true, std::memory_order_release);
 
         // Trigger VRR state refresh on successful resolution (Req 2.5)
         LOG_WARN("DispRes: resolved Display_ID=%u, triggering VRR refresh + G-Sync poll", new_id);
@@ -213,13 +237,15 @@ void DispRes_OnSwapchainInit(uint64_t native_handle, ActiveAPI api, HWND hwnd) {
         PollGSyncState();
     } else {
         // Both methods failed — retain previous Display_ID (Req 2.3)
-        if (s_display_id != 0) {
-            LOG_WARN("DispRes: resolution failed, retaining previous Display_ID=%u", s_display_id);
+        const uint32_t previous_id =
+            s_display_id.load(std::memory_order_acquire);
+        if (previous_id != 0) {
+            LOG_WARN("DispRes: resolution failed, retaining previous Display_ID=%u", previous_id);
             // s_resolved stays true — we still have a valid cached ID
         } else {
             LOG_WARN("DispRes: resolution failed, no previous Display_ID to retain (api=%d, hwnd=%p)",
                      static_cast<int>(api), hwnd);
-            s_resolved = false;
+            s_resolved.store(false, std::memory_order_release);
         }
     }
 }
@@ -227,22 +253,22 @@ void DispRes_OnSwapchainInit(uint64_t native_handle, ActiveAPI api, HWND hwnd) {
 void DispRes_OnSwapchainDestroy() {
     // On full teardown, clear resolved state but keep display_id for potential
     // re-resolution on next init. The ID itself is not zeroed (Req 2.3).
-    s_resolved = false;
-    s_monitor_hwnd = nullptr;
-    LOG_INFO("DispRes: swapchain destroyed, resolved=%d display_id=%u",
-             s_resolved, s_display_id);
+    s_resolved.store(false, std::memory_order_release);
+    s_monitor_hwnd.store(nullptr, std::memory_order_release);
+    LOG_INFO("DispRes: swapchain destroyed, resolved=0 display_id=%u",
+             s_display_id.load(std::memory_order_acquire));
 }
 
 // ── Query interface ──
 
 uint32_t DispRes_GetDisplayID() {
-    return s_display_id;
+    return s_display_id.load(std::memory_order_acquire);
 }
 
 HWND DispRes_GetMonitorHWND() {
-    return s_monitor_hwnd;
+    return s_monitor_hwnd.load(std::memory_order_acquire);
 }
 
 bool DispRes_IsResolved() {
-    return s_resolved;
+    return s_resolved.load(std::memory_order_acquire);
 }

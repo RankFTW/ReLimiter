@@ -10,10 +10,9 @@ static int s_frames_since_dxgi_update = 0;
 static bool s_dxgi_updated_this_frame = false;
 
 // ── Marker flow ──
-static int64_t s_last_enforcement_marker_qpc = 0;
+static std::atomic<int64_t> s_last_enforcement_marker_qpc{0};
 
 // ── Swapchain validity ──
-extern IDXGISwapChain* g_swapchain;
 static std::atomic<bool> s_swapchain_invalid{false};
 static std::atomic<bool> s_device_lost{false};
 static std::atomic<bool> s_occluded{false};
@@ -30,10 +29,13 @@ bool IsDXGIStatsFresh() {
 }
 
 bool AreMarkersFlowing() {
-    if (s_last_enforcement_marker_qpc == 0) return false;
+    const int64_t last_marker_qpc =
+        s_last_enforcement_marker_qpc.load(std::memory_order_relaxed);
+    if (last_marker_qpc == 0) return false;
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    return qpc_to_us(now.QuadPart - s_last_enforcement_marker_qpc) < 500000.0;
+    return qpc_to_us(now.QuadPart - last_marker_qpc) <
+        MARKER_FLOW_TIMEOUT_US;
 }
 
 bool IsCorrelatorValid() {
@@ -65,8 +67,9 @@ bool IsSwapchainValid() {
     if (api == ActiveAPI::OpenGL || api == ActiveAPI::DX9)
         return SwapMgr_IsValid();
 
-    // DX12 and DX11 both use g_swapchain (set by OnInitSwapchain)
-    return g_swapchain != nullptr &&
+    // DX12 and DX11 use the SwapMgr lifetime flag; raw COM pointers are owned
+    // behind the correlator's synchronized snapshot API.
+    return SwapMgr_IsValid() &&
            !s_swapchain_invalid.load(std::memory_order_relaxed) &&
            !s_device_lost.load(std::memory_order_relaxed) &&
            !s_occluded.load(std::memory_order_relaxed);
@@ -77,25 +80,30 @@ void SetVkSwapchainValid(bool v) {
 }
 
 // ── NvAPI marker flow (game-originated markers only) ──
-static int64_t s_last_nvapi_marker_qpc = 0;
+static std::atomic<int64_t> s_last_nvapi_marker_qpc{0};
 
 void RecordEnforcementMarker() {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    s_last_enforcement_marker_qpc = now.QuadPart;
+    s_last_enforcement_marker_qpc.store(
+        now.QuadPart,
+        std::memory_order_relaxed);
 }
 
 void RecordNvAPIMarker() {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    s_last_nvapi_marker_qpc = now.QuadPart;
+    s_last_nvapi_marker_qpc.store(now.QuadPart, std::memory_order_relaxed);
 }
 
 bool AreNvAPIMarkersFlowing() {
-    if (s_last_nvapi_marker_qpc == 0) return false;
+    const int64_t last_marker_qpc =
+        s_last_nvapi_marker_qpc.load(std::memory_order_relaxed);
+    if (last_marker_qpc == 0) return false;
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    return qpc_to_us(now.QuadPart - s_last_nvapi_marker_qpc) < 500000.0;
+    return qpc_to_us(now.QuadPart - last_marker_qpc) <
+        MARKER_FLOW_TIMEOUT_US;
 }
 
 void TickHealthFrame() {

@@ -7,6 +7,10 @@
 #include "nvapi_hooks.h"
 #include "nvapi_types.h"
 #include "presentation_gate.h"
+#include "runtime_lifecycle.h"
+#include "frame_timeline.h"
+#include "health.h"
+#include "wake_guard.h"
 #include "logger.h"
 
 #include <Windows.h>
@@ -33,7 +37,14 @@ static sl::PFun_slPCLSetMarker* s_orig_SetMarker = nullptr;
 
 // ── State ──
 static std::atomic<bool> s_installed{false};
-static std::atomic<bool> s_markers_flowing{false};
+static SRWLOCK s_install_lock = SRWLOCK_INIT;
+static std::atomic<int64_t> s_latest_marker_qpc{0};
+
+class PclInstallLock {
+public:
+    PclInstallLock() noexcept { AcquireSRWLockExclusive(&s_install_lock); }
+    ~PclInstallLock() { ReleaseSRWLockExclusive(&s_install_lock); }
+};
 static std::atomic<bool> s_seen_simulation_start{false};
 
 // ── Frame ID extraction from sl::FrameToken ──
@@ -59,6 +70,26 @@ static bool TryGetFrameTokenID(
     }
 }
 
+static int32_t InvokeGetFeatureFunction(
+    sl::PFun_slGetFeatureFunction* function,
+    uint32_t feature,
+    const char* name,
+    void*& result) noexcept
+{
+    if (!function) return -1;
+    __try { return function(feature, name, result); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
+static int32_t InvokeOriginalMarker(
+    uint32_t marker,
+    const sl::FrameToken& frame) noexcept
+{
+    if (!s_orig_SetMarker) return 0;
+    __try { return s_orig_SetMarker(marker, frame); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
 static uint64_t GetFallbackFrameID(uint32_t marker_type) noexcept
 {
     if (marker_type == SIMULATION_START) {
@@ -81,6 +112,7 @@ static uint64_t GetFrameID(
         }
 
         s_use_fallback_frame_ids.store(true, std::memory_order_release);
+        FrameTimeline_BeginProducerEpoch(FrameIdentityDomain::PclFrame);
         if (!s_logged_frame_token_failure.exchange(true, std::memory_order_relaxed)) {
             LOG_WARN(
                 "PCL: Streamline FrameToken conversion failed; using synthetic frame IDs");
@@ -98,7 +130,28 @@ static int32_t Hooked_slPCLSetMarker(
     uint32_t marker,
     const sl::FrameToken& frame)
 {
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) {
+        return InvokeOriginalMarker(marker, frame);
+    }
+
     const uint32_t type = marker;
+    LARGE_INTEGER ts{};
+    QueryPerformanceCounter(&ts);
+    const int64_t previous_marker_qpc =
+        s_latest_marker_qpc.load(std::memory_order_acquire);
+    if (type == SIMULATION_START && previous_marker_qpc > 0 &&
+        ts.QuadPart > previous_marker_qpc &&
+        qpc_to_us(ts.QuadPart - previous_marker_qpc) >=
+            MARKER_FLOW_TIMEOUT_US) {
+        // A slow frame's late RenderSubmit/Present markers still belong to the
+        // admitted frame. Rotate only when a new SimulationStart establishes
+        // the producer's resumed lifetime.
+        s_seen_simulation_start.store(false, std::memory_order_relaxed);
+        FrameTimeline_BeginProducerEpoch(FrameIdentityDomain::PclFrame);
+        g_predictor.RequestFlush();
+    }
+
     const uint64_t frameID = GetFrameID(type, frame);
 
     if (type == SIMULATION_START) {
@@ -108,54 +161,63 @@ static int32_t Hooked_slPCLSetMarker(
     // Ignore a partial frame observed when the hook is installed, and frame
     // token zero (the predictor reserves zero as its uninitialized sentinel).
     if (!s_seen_simulation_start.load(std::memory_order_acquire) || frameID == 0) {
-        if (s_orig_SetMarker)
-            return s_orig_SetMarker(marker, frame);
-        return 0;
+        return InvokeOriginalMarker(marker, frame);
     }
 
-    s_markers_flowing.store(true, std::memory_order_relaxed);
+    s_latest_marker_qpc.store(ts.QuadPart, std::memory_order_release);
+
+    g_marker_log.Record(type, ts.QuadPart, frameID);
+
+    SchedulerOwnerGuard scheduler_owner;
+    if (!scheduler_owner)
+        return InvokeOriginalMarker(marker, frame);
 
     static uint64_t s_count = 0;
     s_count++;
     if (s_count <= 10 || (s_count % 500) == 0)
         LOG_INFO("PCL: marker #%llu type=%u frameID=%llu", s_count, type, frameID);
 
-    LARGE_INTEGER ts;
-    QueryPerformanceCounter(&ts);
-
-    g_marker_log.Record(type, ts.QuadPart, frameID);
-
     // Feed predictor
     g_predictor.OnMarker(type, ts.QuadPart, frameID,
                          g_overload_active_flag.load(std::memory_order_relaxed));
 
     // Enforcement at SIMULATION_START — same as DX12
-    // Snapshot deadline AFTER enforcement sets it for this frame (same fix as nvapi_hooks).
-    static int64_t s_post_enforcement_deadline = 0;
-
     if (type == SIMULATION_START)
-        OnMarker(frameID, ts.QuadPart);
-
-    if (type == SIMULATION_START)
-        s_post_enforcement_deadline = g_next_deadline.load(std::memory_order_relaxed);
+        OnMarker(
+            frameID,
+            ts.QuadPart,
+            SchedulerTrigger::PclMarker,
+            ArrivalLeadMarker::SimulationStart);
 
     // PRESENT_START: gate only for marker-based paths.
     // Correlator is disabled for marker paths — scanout estimation is too
     // noisy with FG (gap varies by 1-3 refresh periods per frame).
     // Present-based paths feed the correlator from vk_enforce.cpp instead.
     if (type == PRESENT_START) {
-        PresentGate_Execute(ts.QuadPart, frameID,
-                            s_post_enforcement_deadline);
+        const SchedulerFrameDeadline deadline =
+            Scheduler_TakeFrameDeadline(
+                frameID,
+                SchedulerTrigger::PclMarker);
+        PresentGate_Execute(
+            ts.QuadPart,
+            frameID,
+            deadline.deadline_qpc,
+            deadline.producer_epoch,
+            deadline.controller_generation);
     }
 
     // Forward to Streamline
-    if (s_orig_SetMarker)
-        return s_orig_SetMarker(marker, frame);
-    return 0;
+    return InvokeOriginalMarker(marker, frame);
 }
 
 bool PCL_MarkersFlowing() {
-    return s_markers_flowing.load(std::memory_order_relaxed);
+    const int64_t latest_qpc =
+        s_latest_marker_qpc.load(std::memory_order_acquire);
+    if (latest_qpc <= 0) return false;
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    return now.QuadPart >= latest_qpc &&
+        qpc_to_us(now.QuadPart - latest_qpc) < MARKER_FLOW_TIMEOUT_US;
 }
 
 // No-ops — we don't swallow or replay the Streamline sleep.
@@ -163,7 +225,7 @@ void PCL_InvokeSleep() {}
 void PCL_UpdateSleepMode(double) {}
 
 bool InstallPCLHooks() {
-    if (s_installed.load(std::memory_order_relaxed)) return true;
+    if (s_installed.load(std::memory_order_acquire)) return true;
 
     HMODULE sl_dll = GetModuleHandleW(L"sl.interposer.dll");
     if (!sl_dll) {
@@ -179,13 +241,18 @@ bool InstallPCLHooks() {
     }
 
     void* pcl_func = nullptr;
-    int32_t res = slGetFeatureFunction(sl::kFeaturePCL, "slPCLSetMarker", pcl_func);
+    int32_t res = InvokeGetFeatureFunction(
+        slGetFeatureFunction, sl::kFeaturePCL, "slPCLSetMarker", pcl_func);
     if (res != 0 || !pcl_func) {
         LOG_WARN("PCL: slPCLSetMarker not found (res=%d)", res);
         return false;
     }
     LOG_INFO("PCL: slPCLSetMarker at %p", pcl_func);
 
+    PclInstallLock install_lock;
+    if (s_installed.load(std::memory_order_acquire)) return true;
+    HookInstallGuard hook_install;
+    if (!hook_install || !Hooks_PinTargetModule(pcl_func)) return false;
     MH_STATUS st = MH_CreateHook(pcl_func,
         reinterpret_cast<void*>(&Hooked_slPCLSetMarker),
         reinterpret_cast<void**>(&s_orig_SetMarker));
@@ -200,6 +267,7 @@ bool InstallPCLHooks() {
     }
 
     LOG_INFO("PCL: slPCLSetMarker hooked (markers only, sleep untouched)");
-    s_installed.store(true, std::memory_order_relaxed);
+    FrameTimeline_BeginProducerEpoch(FrameIdentityDomain::PclFrame);
+    s_installed.store(true, std::memory_order_release);
     return true;
 }

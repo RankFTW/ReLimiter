@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "csv_writer.h"
+#include "runtime_lifecycle.h"
 #include "logger.h"
 #ifdef RELIMITER_ENABLE_MCP
 #include "live_debug.h"
@@ -69,7 +70,9 @@ namespace
     std::atomic<ULONGLONG> g_first_eligible_present_ms{ 0 };
     std::atomic<bool> g_stop_requested{ false };
     std::atomic<bool> g_running{ false };
-    std::atomic<HANDLE> g_drain_event{ nullptr };
+    std::atomic<uint32_t> g_next_observer_epoch{ 1 };
+    HANDLE g_drain_event = nullptr; // owned duplicate of the consumer event
+    SRWLOCK g_drain_event_lock = SRWLOCK_INIT;
     std::atomic<std::thread*> g_worker_thread{ nullptr };
     SRWLOCK g_worker_lock = SRWLOCK_INIT;
 
@@ -125,6 +128,14 @@ bool NativePclInternal_StopRequested() noexcept
     return g_stop_requested.load(std::memory_order_acquire);
 }
 
+void NativePclInternal_RequestStopFromCallback() noexcept
+{
+    g_stop_requested.store(true, std::memory_order_release);
+    AcquireSRWLockShared(&g_drain_event_lock);
+    if (g_drain_event) SetEvent(g_drain_event);
+    ReleaseSRWLockShared(&g_drain_event_lock);
+}
+
 void NativePclInternal_SetRunning(bool running) noexcept
 {
     g_running.store(running, std::memory_order_release);
@@ -132,7 +143,23 @@ void NativePclInternal_SetRunning(bool running) noexcept
 
 void NativePclInternal_SetDrainEvent(HANDLE event_handle) noexcept
 {
-    g_drain_event.store(event_handle, std::memory_order_release);
+    HANDLE duplicate = nullptr;
+    if (event_handle) {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            event_handle,
+            GetCurrentProcess(),
+            &duplicate,
+            EVENT_MODIFY_STATE | SYNCHRONIZE,
+            FALSE,
+            0);
+    }
+
+    AcquireSRWLockExclusive(&g_drain_event_lock);
+    HANDLE previous = g_drain_event;
+    g_drain_event = duplicate;
+    ReleaseSRWLockExclusive(&g_drain_event_lock);
+    if (previous) CloseHandle(previous);
 }
 
 void NativePclInternal_PublishStatus(
@@ -163,6 +190,22 @@ void NativePclInternal_PublishLossStatus(
     g_snapshot.etw_buffers_lost.store(counters.etw_buffers_lost, std::memory_order_relaxed);
     g_snapshot.overflowed_present_count.store(
         counters.overflowed_present_count, std::memory_order_relaxed);
+}
+
+uint32_t NativePclInternal_BeginObserverEpoch() noexcept
+{
+    uint32_t epoch = g_next_observer_epoch.fetch_add(
+        1, std::memory_order_relaxed);
+    if (epoch == 0) {
+        epoch = g_next_observer_epoch.fetch_add(1, std::memory_order_relaxed);
+    }
+    return epoch;
+}
+
+void NativePclInternal_PublishPresentObservation(
+    const PresentTimelineObservation& observation) noexcept
+{
+    CSV_PushPresentObservation(observation);
 }
 
 void NativePclInternal_PublishSample(
@@ -248,9 +291,14 @@ void NativePclInternal_PublishSample(
 
 void NativePcl_SetEnabled(bool enabled) noexcept
 {
+    if (enabled && (RuntimeLifecycle_IsStopping() ||
+                    g_worker_thread.load(std::memory_order_acquire) != nullptr)) {
+        return;
+    }
     const bool was_enabled = g_enabled.exchange(enabled, std::memory_order_acq_rel);
     if (enabled) {
-        if (!was_enabled) {
+        if (!was_enabled ||
+            g_stop_requested.load(std::memory_order_acquire)) {
             g_stop_requested.store(false, std::memory_order_release);
             g_start_attempted.store(false, std::memory_order_release);
             g_first_eligible_present_ms.store(0, std::memory_order_release);
@@ -260,7 +308,7 @@ void NativePcl_SetEnabled(bool enabled) noexcept
         return;
     }
 
-    NativePcl_Stop();
+    if (!NativePcl_Stop()) return;
     g_start_attempted.store(false, std::memory_order_release);
     g_first_eligible_present_ms.store(0, std::memory_order_release);
     NativePclInternal_PublishStatus(
@@ -269,6 +317,7 @@ void NativePcl_SetEnabled(bool enabled) noexcept
 
 void NativePcl_StartIfReady(bool latency_markers_observed) noexcept
 {
+    if (RuntimeLifecycle_IsStopping()) return;
     if (!g_enabled.load(std::memory_order_acquire)) {
         return;
     }
@@ -317,7 +366,8 @@ void NativePcl_StartIfReady(bool latency_markers_observed) noexcept
         NativePclStatus::Starting, false, false, false);
 
     AcquireSRWLockExclusive(&g_worker_lock);
-    if (g_stop_requested.load(std::memory_order_acquire) ||
+    if (RuntimeLifecycle_IsStopping() ||
+        g_stop_requested.load(std::memory_order_acquire) ||
         !g_enabled.load(std::memory_order_acquire)) {
         ReleaseSRWLockExclusive(&g_worker_lock);
         NativePclInternal_PublishStatus(
@@ -342,28 +392,41 @@ void NativePcl_StartIfReady(bool latency_markers_observed) noexcept
     ReleaseSRWLockExclusive(&g_worker_lock);
 }
 
-void NativePcl_Stop() noexcept
+bool NativePcl_Stop() noexcept
 {
     g_stop_requested.store(true, std::memory_order_release);
-    if (const HANDLE drain_event = g_drain_event.load(std::memory_order_acquire)) {
-        SetEvent(drain_event);
-    }
+    AcquireSRWLockShared(&g_drain_event_lock);
+    if (g_drain_event) SetEvent(g_drain_event);
+    ReleaseSRWLockShared(&g_drain_event_lock);
 
     AcquireSRWLockExclusive(&g_worker_lock);
     std::thread* worker = g_worker_thread.exchange(nullptr, std::memory_order_acq_rel);
     ReleaseSRWLockExclusive(&g_worker_lock);
 
-    if (worker != nullptr) {
+    if (worker != nullptr && worker->joinable()) {
+        const HANDLE worker_handle =
+            reinterpret_cast<HANDLE>(worker->native_handle());
+        if (WaitForSingleObject(worker_handle, 5000) != WAIT_OBJECT_0) {
+            AcquireSRWLockExclusive(&g_worker_lock);
+            g_worker_thread.store(worker, std::memory_order_release);
+            ReleaseSRWLockExclusive(&g_worker_lock);
+            OutputDebugStringA(
+                "ReLimiter: native PCL worker did not stop; state retained.\n");
+            return false;
+        }
         try {
-            if (worker->joinable()) {
-                worker->join();
-            }
+            worker->join();
         }
         catch (...) {
+            AcquireSRWLockExclusive(&g_worker_lock);
+            g_worker_thread.store(worker, std::memory_order_release);
+            ReleaseSRWLockExclusive(&g_worker_lock);
             LOG_ERROR("Native PCL: failed while joining collector thread");
+            return false;
         }
-        delete worker;
     }
+    delete worker;
+    NativePclInternal_SetDrainEvent(nullptr);
 
     g_running.store(false, std::memory_order_release);
     NativePclInternal_PublishStatus(
@@ -373,6 +436,7 @@ void NativePcl_Stop() noexcept
         false,
         false,
         false);
+    return true;
 }
 
 bool NativePcl_IsRunning() noexcept

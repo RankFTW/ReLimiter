@@ -7,7 +7,6 @@
 #include <cstdint>
 #include <cstring>
 #include <atomic>
-#include <thread>
 
 // ── NVAPI types needed for GPU queries ──
 // We resolve all functions at runtime via nvapi_QueryInterface, same pattern
@@ -118,16 +117,49 @@ static PFN_NvAPI_GPU_GetCoolerSettings       s_GetCoolerSettings = nullptr;
 static bool s_nvapi_available = false;
 static NvPhysicalGpuHandle s_gpu_handle = nullptr;
 
-// Double-buffered data: poll thread writes to s_write_data, then atomically
-// swaps the pointer. OSD reads from s_read_data. No locks, no stalls.
-static HWMonitorData s_buf_a = {};
-static HWMonitorData s_buf_b = {};
-static std::atomic<HWMonitorData*> s_read_data{&s_buf_a};
-static HWMonitorData* s_write_data = &s_buf_b;
+// Atomic field snapshot. The sequence gives readers a coherent generation,
+// while atomic payload fields avoid the formal data race of the old reusable
+// double-buffer reference.
+struct AtomicHWMonitorData {
+    std::atomic<uint64_t> sequence{0};
+    std::atomic<int> gpu_temp_c{-1};
+    std::atomic<int> gpu_clock_mhz{-1};
+    std::atomic<int> gpu_mem_clock_mhz{-1};
+    std::atomic<int> gpu_usage_pct{-1};
+    std::atomic<int> gpu_fan_rpm{-1};
+    std::atomic<int> gpu_fan_pct{-1};
+    std::atomic<int> gpu_power_pct{-1};
+    std::atomic<int64_t> vram_used_mb{-1};
+    std::atomic<int64_t> vram_total_mb{-1};
+    std::atomic<int> cpu_usage_pct{-1};
+    std::atomic<int> cpu_clock_mhz{-1};
+    std::atomic<int64_t> ram_used_mb{-1};
+    std::atomic<int64_t> ram_total_mb{-1};
+};
+static AtomicHWMonitorData s_snapshot;
+
+static void PublishSnapshot(const HWMonitorData& data) noexcept {
+    const uint64_t write_sequence =
+        s_snapshot.sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
+    s_snapshot.gpu_temp_c.store(data.gpu_temp_c, std::memory_order_relaxed);
+    s_snapshot.gpu_clock_mhz.store(data.gpu_clock_mhz, std::memory_order_relaxed);
+    s_snapshot.gpu_mem_clock_mhz.store(data.gpu_mem_clock_mhz, std::memory_order_relaxed);
+    s_snapshot.gpu_usage_pct.store(data.gpu_usage_pct, std::memory_order_relaxed);
+    s_snapshot.gpu_fan_rpm.store(data.gpu_fan_rpm, std::memory_order_relaxed);
+    s_snapshot.gpu_fan_pct.store(data.gpu_fan_pct, std::memory_order_relaxed);
+    s_snapshot.gpu_power_pct.store(data.gpu_power_pct, std::memory_order_relaxed);
+    s_snapshot.vram_used_mb.store(data.vram_used_mb, std::memory_order_relaxed);
+    s_snapshot.vram_total_mb.store(data.vram_total_mb, std::memory_order_relaxed);
+    s_snapshot.cpu_usage_pct.store(data.cpu_usage_pct, std::memory_order_relaxed);
+    s_snapshot.cpu_clock_mhz.store(data.cpu_clock_mhz, std::memory_order_relaxed);
+    s_snapshot.ram_used_mb.store(data.ram_used_mb, std::memory_order_relaxed);
+    s_snapshot.ram_total_mb.store(data.ram_total_mb, std::memory_order_relaxed);
+    s_snapshot.sequence.store(write_sequence + 1, std::memory_order_release);
+}
 
 // Background poll thread
 static std::atomic<bool> s_running{false};
-static std::thread s_poll_thread;
+static HANDLE s_poll_thread = nullptr;
 
 // ── CPU usage tracking (thread-local to poll thread) ──
 static ULARGE_INTEGER s_prev_idle = {};
@@ -331,59 +363,89 @@ static void PollRAM(HWMonitorData& d) {
     }
 }
 
+static bool PollSensors(HWMonitorData* data) noexcept {
+    if (!data) return false;
+    __try {
+        PollGPU(*data);
+        PollCPU(*data);
+        PollRAM(*data);
+        return true;
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // ── Background poll thread ──
 // All sensor queries run here, never on the render/present thread.
 // Results are written to s_write_data, then atomically published via
 // pointer swap. The OSD reads s_read_data which is always a complete,
 // consistent snapshot — no partial updates, no locks, no stalls.
-static void PollThreadProc() {
-    while (s_running.load(std::memory_order_relaxed)) {
-        // Start from a clean slate each poll
+static DWORD WINAPI PollThreadProc(LPVOID) noexcept {
+    while (s_running.load(std::memory_order_acquire)) {
+        // Start from a clean slate each poll. Opaque driver faults are contained
+        // at PollSensors and never escape the worker entry point.
         HWMonitorData fresh = {};
-        PollGPU(fresh);
-        PollCPU(fresh);
-        PollRAM(fresh);
+        if (!PollSensors(&fresh)) {
+            OutputDebugStringA("ReLimiter: hardware monitor poll rejected a driver fault.\n");
+            s_running.store(false, std::memory_order_release);
+            break;
+        }
 
-        // Write to the back buffer, then swap
-        *s_write_data = fresh;
-        HWMonitorData* old_read = s_read_data.exchange(s_write_data, std::memory_order_release);
-        s_write_data = old_read;
+        PublishSnapshot(fresh);
 
         // Sleep 1 second between polls
         for (int i = 0; i < 100 && s_running.load(std::memory_order_relaxed); i++)
             Sleep(10);  // 10ms chunks so shutdown is responsive
     }
+    return 0;
+}
+
+static bool SafeInitNVAPI() noexcept {
+    __try { return InitNVAPI(); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 // ── Public API ──
 
 void HWMonitor_Init() {
-    s_nvapi_available = InitNVAPI();
+    s_nvapi_available = SafeInitNVAPI();
 
     // Do one synchronous poll so data is available immediately
     HWMonitorData initial = {};
-    PollGPU(initial);
-    PollCPU(initial);
-    PollRAM(initial);
-    s_buf_a = initial;
-    s_buf_b = initial;
-    s_read_data.store(&s_buf_a, std::memory_order_relaxed);
-    s_write_data = &s_buf_b;
+    PollSensors(&initial);
+    PublishSnapshot(initial);
 
     // Start background poll thread
-    s_running.store(true, std::memory_order_relaxed);
-    s_poll_thread = std::thread(PollThreadProc);
+    bool expected = false;
+    if (!s_running.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) return;
+    s_poll_thread = CreateThread(
+        nullptr, 0, PollThreadProc, nullptr, 0, nullptr);
+    if (!s_poll_thread) {
+        s_running.store(false, std::memory_order_release);
+        LOG_WARN("HWMonitor: failed to start poll thread (%lu)", GetLastError());
+        return;
+    }
 
     LOG_INFO("HWMonitor: initialized (NVAPI=%s), poll thread started", s_nvapi_available ? "yes" : "no");
 }
 
-void HWMonitor_Shutdown() {
-    s_running.store(false, std::memory_order_relaxed);
-    if (s_poll_thread.joinable())
-        s_poll_thread.join();
+bool HWMonitor_Shutdown() {
+    s_running.store(false, std::memory_order_release);
+    if (s_poll_thread) {
+        if (WaitForSingleObject(s_poll_thread, 2500) != WAIT_OBJECT_0) {
+            OutputDebugStringA(
+                "ReLimiter: hardware monitor worker did not stop; state retained.\n");
+            return false;
+        }
+        CloseHandle(s_poll_thread);
+        s_poll_thread = nullptr;
+    }
     s_nvapi_available = false;
     s_gpu_handle = nullptr;
     LOG_INFO("HWMonitor: shutdown");
+    return true;
 }
 
 void HWMonitor_Update() {
@@ -391,6 +453,29 @@ void HWMonitor_Update() {
     // Kept for API compatibility — callers don't need to change.
 }
 
-const HWMonitorData& HWMonitor_GetData() {
-    return *s_read_data.load(std::memory_order_acquire);
+HWMonitorData HWMonitor_GetData() {
+    for (;;) {
+        const uint64_t before =
+            s_snapshot.sequence.load(std::memory_order_acquire);
+        if ((before & 1u) != 0) continue;
+
+        HWMonitorData data{};
+        data.gpu_temp_c = s_snapshot.gpu_temp_c.load(std::memory_order_relaxed);
+        data.gpu_clock_mhz = s_snapshot.gpu_clock_mhz.load(std::memory_order_relaxed);
+        data.gpu_mem_clock_mhz = s_snapshot.gpu_mem_clock_mhz.load(std::memory_order_relaxed);
+        data.gpu_usage_pct = s_snapshot.gpu_usage_pct.load(std::memory_order_relaxed);
+        data.gpu_fan_rpm = s_snapshot.gpu_fan_rpm.load(std::memory_order_relaxed);
+        data.gpu_fan_pct = s_snapshot.gpu_fan_pct.load(std::memory_order_relaxed);
+        data.gpu_power_pct = s_snapshot.gpu_power_pct.load(std::memory_order_relaxed);
+        data.vram_used_mb = s_snapshot.vram_used_mb.load(std::memory_order_relaxed);
+        data.vram_total_mb = s_snapshot.vram_total_mb.load(std::memory_order_relaxed);
+        data.cpu_usage_pct = s_snapshot.cpu_usage_pct.load(std::memory_order_relaxed);
+        data.cpu_clock_mhz = s_snapshot.cpu_clock_mhz.load(std::memory_order_relaxed);
+        data.ram_used_mb = s_snapshot.ram_used_mb.load(std::memory_order_relaxed);
+        data.ram_total_mb = s_snapshot.ram_total_mb.load(std::memory_order_relaxed);
+
+        const uint64_t after =
+            s_snapshot.sequence.load(std::memory_order_acquire);
+        if (before == after && (after & 1u) == 0) return data;
+    }
 }

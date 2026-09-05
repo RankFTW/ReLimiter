@@ -1,52 +1,55 @@
 #pragma once
 
-#include <Windows.h>
-#include <cstdint>
-#include <unordered_map>
+#include <array>
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 
-// Per-frameID map of marker type → QPC timestamp.
-// Lazy prune on access: drop entries older than 2 seconds.
-// Thread-safe: NvAPI and PCL hooks may fire from different threads
-// in Streamline games (NvAPI hook records unconditionally, PCL hook
-// records with synthetic frame IDs).
-
-struct MarkerKey {
-    uint64_t frameID;
-    uint32_t markerType;
-
-    bool operator==(const MarkerKey& o) const {
-        return frameID == o.frameID && markerType == o.markerType;
-    }
-};
-
-struct MarkerKeyHash {
-    size_t operator()(const MarkerKey& k) const {
-        return std::hash<uint64_t>()(k.frameID) ^ (std::hash<uint32_t>()(k.markerType) << 16);
-    }
-};
-
-struct MarkerEntry {
-    int64_t qpc;
-};
-
+// Fixed-capacity per-frame marker timestamp table.
+//
+// NvAPI and PCL hooks may publish from different threads. A tiny spinlock keeps
+// each four-way set coherent; storage is static, bounded, and allocation-free so
+// Record/Get cannot throw while the lock is held. Entries older than two seconds
+// are rejected. Collisions replace the oldest entry in the selected set and
+// therefore fail as a missing sample, never as a mismatched timestamp.
 class MarkerLog {
 public:
-    void Record(uint32_t markerType, int64_t qpc, uint64_t frameID);
-    int64_t Get(uint64_t frameID, uint32_t markerType);
+    static constexpr size_t kWayCount = 4;
+    static constexpr size_t kSetCount = 2048;
+    static constexpr size_t kCapacity = kWayCount * kSetCount;
+
+    void Record(uint32_t markerType, int64_t qpc, uint64_t frameID) noexcept;
+    int64_t Get(uint64_t frameID, uint32_t markerType) noexcept;
 
 private:
-    void LazyPrune(int64_t now_qpc);
+    struct Entry {
+        uint64_t frame_id = 0;
+        int64_t qpc = 0;
+        uint32_t marker_type = 0;
+        bool occupied = false;
+    };
 
-    // Lightweight spinlock — contention is rare (same thread 99% of the time)
-    // but prevents heap corruption when it does happen.
-    void Lock()   { while (lock_.exchange(true, std::memory_order_acquire)) { _mm_pause(); } }
-    void Unlock() { lock_.store(false, std::memory_order_release); }
+    class ScopedLock final {
+    public:
+        explicit ScopedLock(MarkerLog* owner) noexcept : owner_(owner) {
+            owner_->Lock();
+        }
+        ~ScopedLock() noexcept { owner_->Unlock(); }
 
-    std::unordered_map<MarkerKey, MarkerEntry, MarkerKeyHash> entries_;
-    std::atomic<bool> lock_{false};
-    int64_t last_prune_qpc_ = 0;
-    int64_t qpc_freq_ = 0;
+        ScopedLock(const ScopedLock&) = delete;
+        ScopedLock& operator=(const ScopedLock&) = delete;
+
+    private:
+        MarkerLog* owner_;
+    };
+
+    static size_t SetIndex(uint64_t frame_id, uint32_t marker_type) noexcept;
+    void Lock() noexcept;
+    void Unlock() noexcept;
+
+    std::array<Entry, kCapacity> entries_{};
+    std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
+    int64_t qpc_frequency_ = 0;
 };
 
 extern MarkerLog g_marker_log;

@@ -23,7 +23,8 @@ extern std::atomic<uint32_t> g_game_requested_latency;
 // Driver-reported actual FG multiplier from GetState
 extern std::atomic<int> g_fg_actual_multiplier;
 
-// Called from LoadLibrary hook when sl.interposer.dll is detected.
+// Owned loader-install worker only, with a referenced interposer module and
+// no loader lock held. Lazy game callbacks only request deferred retries.
 void HookStreamlinePCL(HMODULE hInterposer);
 
 // Called each frame from the scheduler to check if deferred FG inference
@@ -33,25 +34,28 @@ void CheckDeferredFGInference();
 // Returns true if the FG runtime DLL is loaded (nvngx_dlssg.dll etc.)
 bool IsFGDllLoaded();
 
-// Returns true if DMFG is inferred from latency hint (latency >= 4, no FG DLL)
+// Historical static helper for the latency/no-FG-DLL heuristic.
 bool IsDmfgSession();
 
-// Returns true if g_fg_mode == 2 OR IsDmfgSession() returns true.
-// Single authoritative DMFG check for all subsystems.
+// Returns true for the NVIDIA DRS Dynamic-MFG override or the legacy manual
+// passthrough setting. Single authoritative DMFG check for all subsystems.
 bool IsDmfgActive();
 
 // Returns true if NVIDIA Smooth Motion (nvpresent64.dll) is loaded.
 // SM is a driver-level 2x frame gen — always doubles output FPS.
 bool IsNvSmoothMotionActive();
 
-// Streamline Compatibility: poll GetState without hooking.
-// Call from the OSD draw loop. Throttled internally to every 500ms.
+// Compatibility entry retained for call-site stability. It intentionally does
+// not issue non-thread-safe GetState calls outside the game's own boundary.
 void StreamlineCompat_Poll();
 
 // Returns true if Streamline SetOptions has ever provided FG mode data.
 // When false, g_fg_mode is unreliable (stays at 0) and g_fg_presenting
 // should be used as the FG state authority instead.
 bool Streamline_HasModeData();
+
+// Clear all frame-generation authority on a full swapchain lifetime teardown.
+void Streamline_ResetLifetime();
 
 #else // 32-bit stubs — FG/Streamline/DLSS are 64-bit only
 
@@ -71,5 +75,6 @@ inline bool IsDmfgActive() { return false; }
 inline bool IsNvSmoothMotionActive() { return false; }
 inline void StreamlineCompat_Poll() {}
 inline bool Streamline_HasModeData() { return false; }
+inline void Streamline_ResetLifetime() {}
 
 #endif // _WIN64

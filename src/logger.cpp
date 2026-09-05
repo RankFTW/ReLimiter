@@ -1,4 +1,5 @@
 #include "logger.h"
+#include "shutdown_admission.h"
 #include <reshade.hpp>
 #include <cstdio>
 #include <cstring>
@@ -6,11 +7,26 @@
 #include <atomic>
 
 static HANDLE s_hfile = INVALID_HANDLE_VALUE;
-static LogLevel s_level = LogLevel::Info;
+static std::atomic<LogLevel> s_level{LogLevel::Info};
+// Lifecycle operations never run on logging producers or under loader lock.
+static std::mutex s_lifecycle_mutex;
 static std::mutex s_mutex;
+static ShutdownAdmission s_write_admission;
+
+class LogWriteGuard {
+public:
+    LogWriteGuard() noexcept : admitted_(s_write_admission.TryEnter()) {}
+    ~LogWriteGuard() {
+        if (admitted_) s_write_admission.Leave();
+    }
+    bool IsAdmitted() const noexcept { return admitted_; }
+private:
+    bool admitted_;
+};
+
 static LARGE_INTEGER s_start_qpc;
 static double s_qpc_freq_inv = 0.0;
-static bool s_init_phase = true;
+static std::atomic<bool> s_init_phase{true};
 static char s_process_name[MAX_PATH] = "unknown";
 
 // ── Buffered logging ──
@@ -19,18 +35,37 @@ static char s_process_name[MAX_PATH] = "unknown";
 // During init phase, writes are immediate (crash safety before game starts).
 static constexpr size_t LOG_BUF_SIZE = 64 * 1024;  // 64KB ring buffer
 static char s_log_buf[LOG_BUF_SIZE];
+static char s_flush_buf[LOG_BUF_SIZE];
 static size_t s_log_buf_pos = 0;
 static std::mutex s_buf_mutex;
 static HANDLE s_flush_thread = nullptr;
 static std::atomic<bool> s_flush_running{false};
 
 static void FlushBuffer() {
-    std::lock_guard<std::mutex> lock(s_buf_mutex);
-    if (s_log_buf_pos > 0 && s_hfile != INVALID_HANDLE_VALUE) {
+    // Serialize file access and the shared flush scratch buffer with init-phase
+    // synchronous writers and final close, but never with buffered producers.
+    std::lock_guard<std::mutex> file_lock(s_mutex);
+    size_t flush_size = 0;
+    {
+        std::lock_guard<std::mutex> lock(s_buf_mutex);
+        flush_size = s_log_buf_pos;
+        if (flush_size > 0) {
+            memcpy(s_flush_buf, s_log_buf, flush_size);
+            s_log_buf_pos = 0;
+        }
+    }
+
+    // Never hold the producer mutex across filesystem I/O. A slow disk must
+    // not block a marker, Present, or driver hook attempting to log.
+    if (flush_size > 0 && s_hfile != INVALID_HANDLE_VALUE) {
         DWORD written = 0;
-        WriteFile(s_hfile, s_log_buf, static_cast<DWORD>(s_log_buf_pos), &written, nullptr);
+        WriteFile(
+            s_hfile,
+            s_flush_buf,
+            static_cast<DWORD>(flush_size),
+            &written,
+            nullptr);
         FlushFileBuffers(s_hfile);
-        s_log_buf_pos = 0;
     }
 }
 
@@ -47,14 +82,22 @@ static void StartFlushThread() {
     if (s_flush_thread) return;
     s_flush_running.store(true, std::memory_order_relaxed);
     s_flush_thread = CreateThread(nullptr, 0, LogFlushThread, nullptr, 0, nullptr);
+    if (!s_flush_thread)
+        s_flush_running.store(false, std::memory_order_relaxed);
 }
 
-static void StopFlushThread() {
-    if (!s_flush_thread) return;
-    s_flush_running.store(false, std::memory_order_relaxed);
-    WaitForSingleObject(s_flush_thread, 2000);
+static bool StopFlushThread() {
+    if (!s_flush_thread) return true;
+    s_flush_running.store(false, std::memory_order_release);
+    DWORD wait_status = WaitForSingleObject(s_flush_thread, 2000);
+    if (wait_status != WAIT_OBJECT_0) {
+        CancelSynchronousIo(s_flush_thread);
+        wait_status = WaitForSingleObject(s_flush_thread, 500);
+    }
+    if (wait_status != WAIT_OBJECT_0) return false;
     CloseHandle(s_flush_thread);
     s_flush_thread = nullptr;
+    return true;
 }
 
 static void BufferedWrite(const char* str, int len) {
@@ -104,10 +147,13 @@ static bool TryOpen(const char* path) {
 }
 
 void Log_Init(HMODULE hModule, LogLevel level) {
+    std::lock_guard<std::mutex> lifecycle_lock(s_lifecycle_mutex);
+    if (s_flush_thread || !s_write_admission.IsDrained()) return;
+    std::lock_guard<std::mutex> file_lock(s_mutex);
     if (s_hfile != INVALID_HANDLE_VALUE) return; // already initialized
 
-    s_level = level;
-    s_init_phase = true;
+    s_level.store(level, std::memory_order_release);
+    s_init_phase.store(true, std::memory_order_release);
 
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
@@ -157,6 +203,7 @@ void Log_Init(HMODULE hModule, LogLevel level) {
     }
 
     OutputDebugStringA("[relimiter] LOG INIT FAILED — could not open any log file\n");
+    s_write_admission.Open(); // still allow ReShade warning/error forwarding
     return;
 
 opened:
@@ -168,11 +215,28 @@ opened:
         if (n > 0) RawWrite(header, n);
         RawFlush();
     }
+    s_write_admission.Open();
 }
 
-void Log_Shutdown() {
-    StopFlushThread();
+bool Log_Shutdown() {
+    std::lock_guard<std::mutex> lifecycle_lock(s_lifecycle_mutex);
+    s_write_admission.Close();
+    if (!StopFlushThread()) {
+        OutputDebugStringA(
+            "ReLimiter: logger worker did not stop; file state retained.\n");
+        return false;
+    }
+    const ULONGLONG start = GetTickCount64();
+    while (!s_write_admission.IsDrained()) {
+        if (GetTickCount64() - start >= 2500) {
+            OutputDebugStringA(
+                "ReLimiter: logger producers did not drain; file state retained.\n");
+            return false;
+        }
+        Sleep(1);
+    }
     FlushBuffer();
+    std::lock_guard<std::mutex> file_lock(s_mutex);
     if (s_hfile != INVALID_HANDLE_VALUE) {
         char msg[] = "=== relimiter log closed ===\r\n";
         RawWrite(msg, static_cast<int>(strlen(msg)));
@@ -180,10 +244,13 @@ void Log_Shutdown() {
         CloseHandle(s_hfile);
         s_hfile = INVALID_HANDLE_VALUE;
     }
+    return true;
 }
 
 void Log_Write(LogLevel level, const char* fmt, ...) {
-    if (level > s_level) return;
+    if (level > s_level.load(std::memory_order_acquire)) return;
+    LogWriteGuard writer;
+    if (!writer.IsAdmitted()) return;
 
     char buf[1024];
     va_list args;
@@ -198,7 +265,7 @@ void Log_Write(LogLevel level, const char* fmt, ...) {
     int n = snprintf(line, sizeof(line), "[%10.3f] [%s] %s\r\n", ms, LevelTag(level), buf);
 
     if (n > 0) {
-        if (s_init_phase) {
+        if (s_init_phase.load(std::memory_order_acquire)) {
             // During init: write directly for crash safety
             std::lock_guard<std::mutex> lock(s_mutex);
             RawWrite(line, n);
@@ -218,8 +285,9 @@ void Log_Write(LogLevel level, const char* fmt, ...) {
 }
 
 void Log_SetLevel(LogLevel level) {
-    if (s_init_phase && level < s_level) return;
-    s_level = level;
+    if (s_init_phase.load(std::memory_order_acquire) &&
+        level < s_level.load(std::memory_order_acquire)) return;
+    s_level.store(level, std::memory_order_release);
 }
 
 LogLevel Log_ParseLevel(const char* str) {
@@ -232,7 +300,10 @@ LogLevel Log_ParseLevel(const char* str) {
 }
 
 void Log_EndInitPhase() {
-    s_init_phase = false;
+    std::lock_guard<std::mutex> lifecycle_lock(s_lifecycle_mutex);
+    if (s_write_admission.IsClosed() ||
+        !s_init_phase.load(std::memory_order_acquire)) return;
+    s_init_phase.store(false, std::memory_order_release);
     // Flush any remaining init-phase messages, then start background flushing
     FlushBuffer();
     StartFlushThread();

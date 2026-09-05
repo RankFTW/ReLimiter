@@ -40,6 +40,17 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # ── Sources (shared — builds for both 32 and 64-bit) ──
 set(ADDON_SOURCES
+    src/oled_care_policy.h
+    src/osd_position_policy.h
+    src/capture_lifecycle.h
+    src/shutdown_admission.h
+    src/reflex_adaptation_queue.h
+    src/pacing_sleep.h
+    src/swapchain_selection_policy.h
+    src/adaptive_deadline_reserve.cpp
+    src/arrival_lead_estimator.cpp
+    src/background_tasks.cpp
+    src/frame_time_adaptation.cpp
     src/dllmain.cpp
     src/cadence_meter.cpp
     src/ceiling_margin.cpp
@@ -55,6 +66,7 @@ set(ADDON_SOURCES
     src/flip_model.cpp
     src/flush.cpp
     src/frame_latency_controller.cpp
+    src/frame_timeline.cpp
     src/health.cpp
     src/hooks.cpp
     src/hw_monitor.cpp
@@ -67,6 +79,7 @@ set(ADDON_SOURCES
     src/pll.cpp
     src/predictor.cpp
     src/regime_detector.cpp
+    src/runtime_lifecycle.cpp
     src/scheduler.cpp
     src/sleep.cpp
     src/sleep_mode.cpp
@@ -83,6 +96,7 @@ set(ADDON_SOURCES
     src/pqi.cpp
     src/baseline.cpp
     src/presentation_gate.cpp
+    src/present_association.cpp
     src/vsync_control.cpp
     src/vk_enforce.cpp
     src/blackout.cpp
@@ -96,7 +110,6 @@ endif()
 # ── 64-bit only sources ──
 if(RELIMITER_64BIT)
     list(APPEND ADDON_SOURCES
-        src/adaptive_smoothing.cpp
         src/fg_divisor.cpp
         src/frame_splitting.cpp
         src/ngx_hooks.cpp
@@ -161,7 +174,7 @@ if(MSVC)
         /wd4201
         /wd4244
         $<$<CONFIG:Debug>:/Zi /Od /RTC1>
-        $<$<CONFIG:Release>:/O2 /GL /GS->
+        $<$<CONFIG:Release>:/O2 /GL /GS>
     )
 endif()
 
@@ -244,7 +257,7 @@ if(MSVC)
     # Per-configuration
     target_compile_options(relimiter PRIVATE
         $<$<CONFIG:Debug>:/Zi /Od /RTC1>
-        $<$<CONFIG:Release>:/O2 /GL /GS- /Zi>
+        $<$<CONFIG:Release>:/O2 /GL /GS /Zi>
     )
 
     target_link_options(relimiter PRIVATE

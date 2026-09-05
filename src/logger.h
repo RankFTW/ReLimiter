@@ -10,7 +10,10 @@ enum class LogLevel { Error = 0, Warn = 1, Info = 2, Debug = 3 };
 
 // Initialize logger. Opens log file next to hModule DLL.
 void Log_Init(HMODULE hModule, LogLevel level);
-void Log_Shutdown();
+// Outside loader lock only. Closes admission, drains synchronous/buffered
+// producers, joins the flush worker, then closes the file. False retains state;
+// the caller must retain the module and must not reinitialize the logger.
+bool Log_Shutdown();
 
 // Core write function.
 void Log_Write(LogLevel level, const char* fmt, ...);

@@ -1,4 +1,5 @@
 #include "live_debug.h"
+#include "runtime_lifecycle.h"
 
 #include <Windows.h>
 #include <sddl.h>
@@ -553,7 +554,7 @@ namespace
 void LiveDebug_StartIfReady() noexcept
 {
     if (g_enabled.load(std::memory_order_acquire) ||
-        g_stopping.load(std::memory_order_acquire)) {
+        RuntimeLifecycle_IsStopping()) {
         return;
     }
 
@@ -565,6 +566,8 @@ void LiveDebug_StartIfReady() noexcept
         g_worker_thread = nullptr;
         g_stop_event = nullptr;
     }
+    if (!g_worker_thread && !RuntimeLifecycle_IsStopping())
+        g_stopping.store(false, std::memory_order_release);
     if (!g_worker_thread && !g_stopping.load(std::memory_order_relaxed)) {
         if (!g_module_pin && !GetModuleHandleExW(
                 GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
@@ -601,14 +604,19 @@ void LiveDebug_StartIfReady() noexcept
     ReleaseSRWLockExclusive(&g_lifecycle_lock);
 }
 
-void LiveDebug_Stop() noexcept
+bool LiveDebug_Stop() noexcept
 {
     g_stopping.store(true, std::memory_order_release);
     g_enabled.store(false, std::memory_order_release);
     AcquireSRWLockExclusive(&g_lifecycle_lock);
     if (g_worker_thread) {
         SetEvent(g_stop_event);
-        WaitForSingleObject(g_worker_thread, INFINITE);
+        if (WaitForSingleObject(g_worker_thread, 2500) != WAIT_OBJECT_0) {
+            OutputDebugStringA(
+                "ReLimiter: live-debug worker did not stop; state retained.\n");
+            ReleaseSRWLockExclusive(&g_lifecycle_lock);
+            return false;
+        }
         CloseHandle(g_worker_thread);
         CloseHandle(g_stop_event);
         g_worker_thread = nullptr;
@@ -620,6 +628,7 @@ void LiveDebug_Stop() noexcept
         FreeLibrary(module_pin);
     }
     ReleaseSRWLockExclusive(&g_lifecycle_lock);
+    return true;
 }
 
 void LiveDebug_NotifyProcessDetach() noexcept

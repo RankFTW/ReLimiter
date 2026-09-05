@@ -4,6 +4,7 @@
 #include <atomic>
 
 #include "native_pcl_measurement.h"
+#include "present_association.h"
 
 // Per-frame telemetry row. Pushed from scheduler hot path.
 struct FrameRow {
@@ -46,17 +47,25 @@ struct FrameRow {
     double   feedback_alpha;               // current α (0.05 or 0.10)
     // ── Reflex pipeline timing ──
     double   reflex_present_to_gpu_end_us;   // present→gpuRenderEnd (DX12 Reflex only)
-    double   reflex_queue_trend_us;        // GPU render duration delta (stutter predictor)
+    double   reflex_queue_trend_us;        // corrected workload-demand delta
     // ── Extended Reflex timing ──
     double   reflex_present_duration_us;   // presentStart→presentEnd (flip queue pressure)
     double   reflex_gpu_active_us;         // GPU active render time (excludes idle bubbles)
     double   reflex_ai_frame_time_us;      // DLSS FG time (0 when FG inactive)
-    double   reflex_cpu_latency_us;        // simStart→presentStart (full CPU latency)
+    double   reflex_cpu_latency_us;        // marker-aware stage-local CPU bottleneck
     double   gate_margin_us;               // adaptive gate margin used this frame
-    // ── Adaptive smoothing ──
-    double   smoothing_offset_us;          // P99-based interval extension (0 when disabled)
-    double   p99_render_time_us;           // raw P99 of render time distribution
+    // ── Completed frame-time adaptation (legacy column names) ──
+    double   smoothing_offset_us;          // configured-percentile interval extension
+    double   p99_render_time_us;           // configured percentile (historical name)
     double   total_frame_cost_us;          // simStart → gpuRenderEnd (Reflex)
+    uint64_t adaptation_sample_sequence;   // unique completed source-cycle observation
+    double   adaptation_frame_time_us;     // max stage-local CPU/GPU workload demand
+    uint32_t adaptation_producer_epoch;    // exact NvAPI report producer lifetime
+    uint64_t adaptation_nvapi_frame_id;    // exact delayed source report identity
+    double   adaptation_cpu_active_us;     // corrected paired CPU-stage authority
+    double   adaptation_gpu_service_us;    // active GPU execution, elapsed fallback
+    double   adaptation_owned_cpu_stage_us; // total exact controller residence removed
+    double   adaptation_owned_gate_hold_us; // exact gate hold removed from pressure
 };
 
 // One row per displayed application frame from the native PCL ETW collector.
@@ -97,15 +106,53 @@ struct NativePclRow {
     bool used_simulation_fallback = false;
 };
 
+// One keyed GPU pipeline observation per newly arrived NvAPI latency report.
+// report_qpc is local QPC. The remaining timestamp fields retain NvAPI's
+// driver-domain microsecond units despite their historical `_qpc` names.
+// gpu_active_render_time_us/gpu_frame_time_us/ai_frame_time_us are
+// driver-reported microseconds; keep those semantics distinct from the raw
+// QPC spans. Shadow telemetry only: no controller consumes this stream.
+struct GpuObservationRow {
+    uint64_t sequence = 0;
+    uint32_t capture_epoch = 0;
+    uint32_t producer_epoch = 0;
+    uint64_t nvapi_frame_id = 0;
+    uint64_t report_qpc = 0;
+    uint64_t sim_start_qpc = 0;
+    uint64_t sim_end_qpc = 0;
+    uint64_t render_submit_start_qpc = 0;
+    uint64_t render_submit_end_qpc = 0;
+    uint64_t present_start_qpc = 0;
+    uint64_t present_end_qpc = 0;
+    uint64_t driver_start_qpc = 0;
+    uint64_t driver_end_qpc = 0;
+    uint64_t os_render_queue_start_qpc = 0;
+    uint64_t os_render_queue_end_qpc = 0;
+    uint64_t gpu_render_start_qpc = 0;
+    uint64_t gpu_render_end_qpc = 0;
+    uint32_t gpu_active_render_time_us = 0;
+    uint32_t gpu_frame_time_us = 0;
+    uint32_t ai_frame_time_us = 0;
+};
+
 // Initialize CSV writer. Starts background thread.
 void CSV_Init(const char* output_dir);
-void CSV_Shutdown();
+bool CSV_Shutdown();
 
 // Push a frame row from the scheduler hot path. Lock-free, < 1μs.
 void CSV_Push(const FrameRow& row);
 
 // Push a displayed-frame native PCL row from the ETW collector. Lock-free.
 void CSV_PushNativePcl(const NativePclRow& row);
+
+// Push one delayed PresentMon observation per PresentEvent. Association with
+// retained local P/E spans is performed only by the CSV writer thread.
+void CSV_PushPresentObservation(
+    const PresentTimelineObservation& observation);
+
+// Push one keyed NvAPI GPU observation from the feedback ingestion path.
+// Nonblocking; drops and counts rows when the ring is full.
+void CSV_PushGpuObservation(const GpuObservationRow& row);
 
 void CSV_SetEnabled(bool enabled);
 bool CSV_IsEnabled();

@@ -50,7 +50,7 @@ struct NativePclSnapshot {
 // Disabling performs an orderly stop.
 void NativePcl_SetEnabled(bool enabled) noexcept;
 void NativePcl_StartIfReady(bool latency_markers_observed) noexcept;
-void NativePcl_Stop() noexcept;
+bool NativePcl_Stop() noexcept;
 
 bool NativePcl_IsRunning() noexcept;
 NativePclSnapshot NativePcl_GetSnapshot() noexcept;

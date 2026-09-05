@@ -22,6 +22,7 @@ static constexpr int MAX_PRESENT_TIMESTAMPS = 512; // enough for 500+ FPS
 static int64_t s_present_ts[MAX_PRESENT_TIMESTAMPS] = {};
 static int     s_present_head = 0;
 static int     s_present_count = 0;
+static std::atomic_flag s_present_telemetry_owner = ATOMIC_FLAG_INIT;
 
 // ── Path selection logic ──
 
@@ -34,10 +35,10 @@ static EnforcementPath SelectPath(ActiveAPI api) {
             // loading screens). Falling back to present-based during gaps
             // causes double enforcement and FG coalescing issues on refocus.
             {
-                static bool s_ever_seen_nvapi = false;
+                static std::atomic<bool> s_ever_seen_nvapi{false};
                 if (AreNvAPIMarkersFlowing())
-                    s_ever_seen_nvapi = true;
-                if (s_ever_seen_nvapi)
+                    s_ever_seen_nvapi.store(true, std::memory_order_release);
+                if (s_ever_seen_nvapi.load(std::memory_order_acquire))
                     return EnforcementPath::NvAPIMarkers;
                 return EnforcementPath::PresentBased;
             }
@@ -95,7 +96,7 @@ void EnfDisp_OnSwapchainDestroy(bool full_teardown) {
 
 void EnfDisp_OnPresent(int64_t now_qpc) {
     // ── Output FPS + 1% low: rolling 1-second window of present timestamps ──
-    {
+    if (!s_present_telemetry_owner.test_and_set(std::memory_order_acquire)) {
         // Record this present
         s_present_ts[s_present_head] = now_qpc;
         s_present_head = (s_present_head + 1) % MAX_PRESENT_TIMESTAMPS;
@@ -117,6 +118,7 @@ void EnfDisp_OnPresent(int64_t now_qpc) {
 
         // Output FPS: simply the count of presents in the window
         g_output_fps.store(static_cast<double>(wcount), std::memory_order_relaxed);
+        s_present_telemetry_owner.clear(std::memory_order_release);
     }
 
     // DMFG passthrough: skip enforcement dispatch, FPS counter already updated
@@ -153,13 +155,13 @@ void EnfDisp_OnPresent(int64_t now_qpc) {
             //    SIMULATION_START). Without this, the scheduler never runs,
             //    deadlines go stale, and the presentation gate misbehaves.
             if (!AreNvAPIMarkersFlowing() || !AreMarkersFlowing())
-                VkEnforce_OnPresent(now_qpc);
+                VkEnforce_OnPresent(now_qpc, true);
             break;
 
         case EnforcementPath::PCLMarkers:
             // Same fallback logic for Vulkan+Streamline PCL marker path.
             if (!PCL_MarkersFlowing())
-                VkEnforce_OnPresent(now_qpc);
+                VkEnforce_OnPresent(now_qpc, true);
             break;
 
         case EnforcementPath::None:

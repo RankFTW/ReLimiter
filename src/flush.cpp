@@ -10,11 +10,18 @@
 #include "swapchain_manager.h"
 #include "tier.h"
 #include "wake_guard.h"
+#include "frame_timeline.h"
+#include "arrival_lead_estimator.h"
+#include "adaptive_deadline_reserve.h"
+#include "frame_time_adaptation.h"
+#include "scheduler.h"
+#include "nvapi_hooks.h"
+#include <atomic>
 #include <dxgi.h>
 
-// g_swapchain: DX12 swapchain pointer, managed here by OnInitSwapchain/OnDestroySwapchain.
-// Transitional — new code should use SwapMgr_GetNativeHandle() instead.
-IDXGISwapChain* g_swapchain = nullptr;
+namespace {
+std::atomic<uint32_t> s_pending_scheduler_flush_modules{0};
+}
 
 // Extern from health.cpp
 extern void SetSwapchainInvalid(bool v);
@@ -22,47 +29,60 @@ extern void SetDeviceLost(bool v);
 extern void SetOccluded(bool v);
 
 void Flush(uint32_t modules) {
+    if (modules == 0) return;
+
     LOG_INFO("Flush: modules=0x%X", modules);
-    if (modules & FLUSH_CORRELATOR) {
-        // Reset CadenceMeter and feedback state
-        ResetFeedbackAccumulators();
-    }
+    s_pending_scheduler_flush_modules.fetch_or(
+        modules,
+        std::memory_order_release);
 
-    if (modules & FLUSH_STRESS) {
-        g_ceiling_stress = CeilingStressDetector();
-    }
-
+    // These APIs only publish atomic invalidation/reset requests. Keep them
+    // immediate so stale gate and feedback identities fail open before the
+    // admitted scheduler owner reaches the next frame.
+    Scheduler_ResetSmoothness();
+    g_frame_time_adaptation.RequestReset();
     if (modules & FLUSH_PREDICTOR) {
         g_predictor.RequestFlush();
+        g_arrival_lead_estimator.RequestReset();
+        FrameTimeline_BeginControllerGeneration();
+        g_adaptive_deadline_reserve.RequestReset();
     }
 
-    if (modules & FLUSH_DAMPING) {
-        ResetDamping();
-    }
-
-    if (modules & FLUSH_PQI) {
-        PQI_Reset();
-    }
-
+    // Feedback reset publication is thread-safe and immediately invalidates
+    // exported atomics; its plain writer state is consumed by OnMarker.
     ResetFeedbackAccumulators();
+}
 
-    // Re-check tier after flush
+void Flush_ApplyPendingOnSchedulerOwner() noexcept {
+    const uint32_t modules = s_pending_scheduler_flush_modules.exchange(
+        0,
+        std::memory_order_acq_rel);
+    const bool predictor_reset = g_predictor.ApplyPendingFlush();
+    if (modules == 0 && !predictor_reset) return;
+
+    if (modules & FLUSH_STRESS)
+        g_ceiling_stress = CeilingStressDetector();
+    if (modules & FLUSH_DAMPING)
+        ResetDamping();
+    if (modules & FLUSH_PQI)
+        PQI_Reset();
+
+    // g_current_tier is scheduler-owned; never write it from lifecycle hooks.
     UpdateTier();
 }
 
 void OnInitSwapchain(void* native_swapchain) {
-    g_swapchain = reinterpret_cast<IDXGISwapChain*>(native_swapchain);
+    Correlator_SetLegacySwapchain(
+        reinterpret_cast<IDXGISwapChain*>(native_swapchain));
     SetSwapchainInvalid(false);
+    SetDeviceLost(false);
 }
 
 void OnDestroySwapchain() {
-    // Mark swapchain invalid BEFORE flushing so that UpdateTier() inside
-    // Flush() sees Tier4 (suspended) instead of falsely evaluating marker
-    // flow and correlator state against a swapchain that's about to die.
-    g_swapchain = nullptr;
+    // Mark swapchain invalid before publishing the flush so the next admitted
+    // scheduler owner evaluates Tier4 instead of touching a dead swapchain.
     SetSwapchainInvalid(true);
 
-    // Now flush — UpdateTier() will correctly report Tier4
     Flush(FLUSH_CORRELATOR | FLUSH_STRESS);
 
     // Null all DXGI pointers the correlator might dereference.
@@ -75,6 +95,7 @@ void OnPresentFailure() {
 }
 
 void OnDeviceLost() {
+    NvAPI_ClearFeedbackDevice();
     SetDeviceLost(true);
     Flush(FLUSH_ALL);
 }
@@ -96,14 +117,25 @@ void OnFGStateChange() {
     // in rapid succession (multiplier, active, presenting), each calling
     // this function. Coalesce into a single flush by skipping if we already
     // flushed within the last 50ms.
-    static int64_t s_last_fg_flush_qpc = 0;
+    static std::atomic<int64_t> s_last_fg_flush_qpc{0};
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    if (s_last_fg_flush_qpc != 0) {
-        double elapsed_us = qpc_to_us(now.QuadPart - s_last_fg_flush_qpc);
-        if (elapsed_us < 50000.0) return; // 50ms debounce
+    int64_t previous_flush_qpc =
+        s_last_fg_flush_qpc.load(std::memory_order_relaxed);
+    for (;;) {
+        if (previous_flush_qpc != 0) {
+            const double elapsed_us =
+                qpc_to_us(now.QuadPart - previous_flush_qpc);
+            if (elapsed_us < 50000.0) return; // 50ms debounce
+        }
+        if (s_last_fg_flush_qpc.compare_exchange_weak(
+                previous_flush_qpc,
+                now.QuadPart,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            break;
+        }
     }
-    s_last_fg_flush_qpc = now.QuadPart;
     Flush(FLUSH_CORRELATOR);
 }
 

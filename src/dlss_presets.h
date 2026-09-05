@@ -1,7 +1,7 @@
 #pragma once
 
 // DLSS preset override query via NvAPI_NGX_GetNGXOverrideState.
-// Polls every 5 seconds. Returns preset letters for SR/RR/FG.
+// Polls every 10 seconds. Returns preset letters for SR/RR/FG.
 
 struct DLSSPresets {
     char sr[8];  // e.g. "M", "-", "A", "Auto"
@@ -16,6 +16,12 @@ struct DLSSPresets {
 #ifdef _WIN64
 void DLSSPresets_Init();
 void DLSSPresets_Poll();  // Call periodically (e.g. from OSD draw)
+
+// Stop, wake, and join the poll worker. Safe to call repeatedly. A later
+// DLSSPresets_Init/Poll call starts a fresh worker lifetime.
+bool DLSSPresets_Shutdown();
+
+// Returns one coherent lock-free snapshot.
 DLSSPresets DLSSPresets_Get();
 
 // Write the Dynamic MFG Target FPS to the game's driver profile.
@@ -25,6 +31,7 @@ bool DLSSPresets_WriteDynamicTargetFPS(int fps);
 #else
 inline void DLSSPresets_Init() {}
 inline void DLSSPresets_Poll() {}
+inline bool DLSSPresets_Shutdown() { return true; }
 inline DLSSPresets DLSSPresets_Get() { return {"", "", "", false, 0, 0, 0}; }
 inline bool DLSSPresets_WriteDynamicTargetFPS(int) { return false; }
 #endif

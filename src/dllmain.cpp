@@ -1,17 +1,19 @@
 #include <Windows.h>
-#include <Psapi.h>
-#pragma comment(lib, "Psapi.lib")
 #include "osd.h"
 #include "hw_monitor.h"
 #include "ngx_hooks.h"
+#include "dlss_presets.h"
 #include "blackout.h"
+#include "background_tasks.h"
 #include "focus_lock.h"
 #include <MinHook.h>
 #include <atomic>
+#include <exception>
 
 #include "hooks.h"
 #include "health.h"
 #include "nvapi_hooks.h"
+#include "reflex_inject.h"
 #include "pcl_hooks.h"
 #include "loadlib_hooks.h"
 #include "streamline_hooks.h"
@@ -38,144 +40,154 @@
 #include "vsync_control.h"
 #include "flip_model.h"
 #include "native_pcl_measurement.h"
+#include "runtime_lifecycle.h"
 #ifdef RELIMITER_ENABLE_MCP
 #include "live_debug.h"
 #endif
 
-// g_swapchain moved to flush.cpp (managed by OnInitSwapchain/OnDestroySwapchain)
-// g_presenting_swapchain moved to correlator.cpp (read-only consumer)
-// Both absorbed into Swapchain_Manager.
-static HMODULE s_hModule = nullptr;
 static bool    s_addon_initialised = false;
+static bool    s_addon_registered = false;
+static bool    s_minhook_initialised = false;
+static bool    s_sleep_timer_initialised = false;
+static bool    s_csv_initialised = false;
+static bool    s_display_poll_started = false;
+static bool    s_hw_monitor_started = false;
+static bool    s_blackout_started = false;
+static bool    s_imgui_available = false;
+static bool    s_fail_inert = false;
+static std::atomic<bool> s_present_seen{false};
 
-// ── Crash handler ──
-static LPTOP_LEVEL_EXCEPTION_FILTER s_prev_filter = nullptr;
+// Keep one private reference while runtime callbacks and workers exist. Normal
+// AddonUninit releases it after a complete rundown. If a host incorrectly calls
+// FreeLibrary without AddonUninit, the reference prevents execute-after-unmap;
+// the module is then reclaimed only at process termination.
+static HMODULE s_runtime_reference = nullptr;
 
-#ifdef _WIN64
-static void LogCrashModule(DWORD64 addr) {
-    HMODULE hMod = nullptr;
-    if (GetModuleHandleExA(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCSTR>(addr), &hMod) && hMod) {
-        char full[MAX_PATH];
-        if (GetModuleFileNameA(hMod, full, MAX_PATH)) {
-            const char* slash = strrchr(full, '\\');
-            const char* name = slash ? slash + 1 : full;
-            DWORD64 base = reinterpret_cast<DWORD64>(hMod);
-            LOG_ERROR("  module: %s (base=0x%llX, RVA=0x%llX)", name, base, addr - base);
-        }
-    } else {
-        LOG_ERROR("  module: <unknown> (addr=0x%llX)", addr);
-    }
+static bool AcquireRuntimeReference() noexcept {
+    if (s_runtime_reference) return true;
+    return GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        reinterpret_cast<LPCWSTR>(
+            reinterpret_cast<uintptr_t>(&AcquireRuntimeReference)),
+        &s_runtime_reference) != FALSE;
 }
 
-static void LogStackTrace(EXCEPTION_POINTERS* ep) {
-    CONTEXT ctx = *ep->ContextRecord;
-    LOG_ERROR("STACK TRACE (RIP=0x%llX, RSP=0x%llX):", ctx.Rip, ctx.Rsp);
-    LogCrashModule(ctx.Rip);
-
-    for (int i = 0; i < 32; i++) {
-        DWORD64 image_base = 0;
-        PRUNTIME_FUNCTION func = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
-        if (!func) break;
-        PVOID handler_data = nullptr;
-        DWORD64 establisher_frame = 0;
-        RtlVirtualUnwind(0, image_base, ctx.Rip,
-                         func, &ctx, &handler_data, &establisher_frame, nullptr);
-        if (ctx.Rip == 0) break;
-        LOG_ERROR("  [%2d] 0x%llX", i, ctx.Rip);
-        LogCrashModule(ctx.Rip);
-    }
-}
-#endif // _WIN64
-
-static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* ep) {
-#ifdef _WIN64
-    DWORD64 fault_addr = reinterpret_cast<DWORD64>(ep->ExceptionRecord->ExceptionAddress);
-    LOG_ERROR("CRASH: exception 0x%08X at 0x%llX",
-              ep->ExceptionRecord->ExceptionCode, fault_addr);
-    LogCrashModule(fault_addr);
-    __try { LogStackTrace(ep); }
-    __except(EXCEPTION_EXECUTE_HANDLER) {}
-#else
-    DWORD fault_addr = reinterpret_cast<DWORD>(ep->ExceptionRecord->ExceptionAddress);
-    LOG_ERROR("CRASH: exception 0x%08X at 0x%08X",
-              ep->ExceptionRecord->ExceptionCode, fault_addr);
-#endif
-    Log_Shutdown();
-    if (s_prev_filter) return s_prev_filter(ep);
-    return EXCEPTION_CONTINUE_SEARCH;
+static void ReleaseRuntimeReference() noexcept {
+    HMODULE reference = s_runtime_reference;
+    s_runtime_reference = nullptr;
+    if (reference) FreeLibrary(reference);
 }
 
-// Silent handler installed during shutdown — swallows post-unload crashes
-// that occur when the game calls into our freed address space after exit.
-// These are harmless (process is terminating) but create annoying dump files.
-static LONG WINAPI ShutdownCrashHandler(EXCEPTION_POINTERS*) {
-    return EXCEPTION_EXECUTE_HANDLER;
-}
+static DWORD WINAPI ApplyBorderlessTask(LPVOID context) {
+    HWND hwnd = static_cast<HWND>(context);
+    Sleep(100); // let swapchain creation/fullscreen transition finish
+    if (RuntimeLifecycle_IsStopping() || !IsWindow(hwnd)) return 0;
 
-// Suppress Windows Error Reporting during shutdown to prevent crash dump
-// creation from post-unload access violations. STATUS_STACK_BUFFER_OVERRUN
-// (0xc0000409 / __fastfail) bypasses SEH entirely, so the exception filter
-// alone isn't enough — we must disable WER at the process level.
-static void SuppressWEROnShutdown() {
-    // WerAddExcludedApplication is overkill — just set the error mode
-    // to suppress the crash dialog and dump creation for this process.
-    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
-    // Also disable WER for this specific process instance
-    typedef HRESULT (WINAPI *PFN_WerSetFlags)(DWORD);
-    HMODULE hKernel = GetModuleHandleW(L"kernel32.dll");
-    if (hKernel) {
-        auto pWerSetFlags = reinterpret_cast<PFN_WerSetFlags>(
-            GetProcAddress(hKernel, "WerSetFlags"));
-        if (pWerSetFlags)
-            pWerSetFlags(0x0010); // WER_FAULT_REPORTING_FLAG_NOHEAP (suppress dumps)
-    }
+    HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfo(monitor, &info)) return 0;
+    const RECT& area = info.rcMonitor;
+    const LONG style = GetWindowLong(hwnd, GWL_STYLE);
+    SetWindowLong(
+        hwnd,
+        GWL_STYLE,
+        style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER));
+    SetWindowPos(
+        hwnd,
+        HWND_TOP,
+        area.left,
+        area.top,
+        area.right - area.left,
+        area.bottom - area.top,
+        SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+    return 0;
 }
 
 // ── ReShade callbacks ──
 static void on_init_device(reshade::api::device* device) {
-    SwapMgr_OnInitDevice(device);
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) return;
+    try { SwapMgr_OnInitDevice(device); }
+    catch (...) {
+        OutputDebugStringA("ReLimiter: init_device callback rejected an exception.\n");
+    }
 }
 static void on_destroy_device(reshade::api::device* device) {
-    // Clear g_dev if this is the device we captured for GetLatency.
-    // Prevents stale pointer crashes during device transitions (alt-tab, resize).
-    if (g_dev) {
-        g_dev = nullptr;
-        LOG_INFO("NvAPI: g_dev cleared on device destroy");
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) return;
+    try {
+    // Clear only the exact D3D device being destroyed. Launcher or auxiliary
+    // device teardown must not invalidate a newer game's feedback producer.
+    const bool is_dxgi = device != nullptr &&
+        (device->get_api() == reshade::api::device_api::d3d11 ||
+         device->get_api() == reshade::api::device_api::d3d12);
+    IUnknown* expected_device = is_dxgi
+        ? reinterpret_cast<IUnknown*>(device->get_native())
+        : nullptr;
+    if (expected_device != nullptr) {
+        const NvAPIFeedbackDevice feedback_device =
+            NvAPI_AcquireFeedbackDevice();
+        // Match the acquired publication to the destroyed COM device, not a
+        // separately sampled presenter. A concurrent A -> B publication makes
+        // this exact-token clear a no-op, even if COM pointer values recur.
+        if (NvAPI_IsSameDevice(feedback_device.device, expected_device)) {
+            NvAPI_ClearFeedbackDevice(feedback_device);
+        }
+        NvAPI_ReleaseFeedbackDevice(feedback_device.device);
     }
     SwapMgr_OnDestroyDevice(device);
+    }
+    catch (...) {
+        OutputDebugStringA("ReLimiter: destroy_device callback rejected an exception.\n");
+    }
 }
 static void on_init_swapchain(reshade::api::swapchain* sc, bool resize) {
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) return;
+    try {
     SwapMgr_OnInitSwapchain(sc, resize);
     // Apply GPU thread priority on first swapchain init (DXGI only — Vulkan
     // native handles are VkSwapchainKHR, not IDXGISwapChain*)
-    if (!resize) {
-        ActiveAPI api = SwapMgr_GetActiveAPI();
-        if (api == ActiveAPI::DX12 || api == ActiveAPI::DX11) {
+    if (!resize && sc && sc->get_device()) {
+        const auto api = sc->get_device()->get_api();
+        if (api == reshade::api::device_api::d3d12 ||
+            api == reshade::api::device_api::d3d11) {
             uint64_t native = sc->get_native();
             if (native)
                 Hardening_OnDevice(reinterpret_cast<void*>(native));
         }
     }
+    }
+    catch (...) {
+        OutputDebugStringA("ReLimiter: init_swapchain callback rejected an exception.\n");
+    }
 }
 static void on_destroy_swapchain(reshade::api::swapchain* sc, bool resize) {
-    SwapMgr_OnDestroySwapchain(sc, resize);
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) return;
+    try { SwapMgr_OnDestroySwapchain(sc, resize); }
+    catch (...) {
+        OutputDebugStringA("ReLimiter: destroy_swapchain callback rejected an exception.\n");
+    }
 }
 
 // ── Fake Fullscreen: intercept exclusive fullscreen → borderless window ──
 // ── Flip Model Override: upgrade bitblt → FLIP_DISCARD for DX11 VRR ──
 // ── DX9 VSync Override: modify sync_interval at swapchain creation/reset ──
 static bool on_create_swapchain(reshade::api::device_api api, reshade::api::swapchain_desc& desc, void* hwnd) {
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) return false;
     bool modified = false;
 
     // DX9 VSync override via sync_interval (applied at CreateDevice and Reset)
     if (api == reshade::api::device_api::d3d9) {
-        if (g_config.vsync_mode == "off" && desc.sync_interval != 0) {
+        const int vsync_mode = VSync_GetDXGISyncInterval();
+        if (vsync_mode == 0 && desc.sync_interval != 0) {
             desc.sync_interval = 0;
             modified = true;
             LOG_INFO("DX9 VSync override: forced IMMEDIATE (was %u)", desc.sync_interval);
-        } else if (g_config.vsync_mode == "on" && desc.sync_interval != 1) {
+        } else if (vsync_mode == 1 && desc.sync_interval != 1) {
             desc.sync_interval = 1;
             modified = true;
             LOG_INFO("DX9 VSync override: forced ONE");
@@ -196,28 +208,16 @@ static bool on_create_swapchain(reshade::api::device_api api, reshade::api::swap
 
         // Apply borderless window style on a background thread (can't block here)
         HWND target = static_cast<HWND>(hwnd);
-        if (target) {
-            CreateThread(nullptr, 0, [](LPVOID param) -> DWORD {
-                HWND h = static_cast<HWND>(param);
-                Sleep(100); // let swapchain finish creating
-                HMONITOR hmon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
-                MONITORINFO mi = {}; mi.cbSize = sizeof(mi);
-                GetMonitorInfo(hmon, &mi);
-                RECT& rc = mi.rcMonitor;
-                LONG style = GetWindowLong(h, GWL_STYLE);
-                SetWindowLong(h, GWL_STYLE, style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER));
-                SetWindowPos(h, HWND_TOP, rc.left, rc.top,
-                             rc.right - rc.left, rc.bottom - rc.top,
-                             SWP_FRAMECHANGED | SWP_NOACTIVATE);
-                return 0;
-            }, target, 0, nullptr);
-        }
+        if (target)
+            BackgroundTasks_Start(ApplyBorderlessTask, target);
         return true; // modified
     }
     return modified;
 }
 
 static bool on_set_fullscreen_state(reshade::api::swapchain*, bool fullscreen, void*) {
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) return false;
     if (g_config.fake_fullscreen && fullscreen) {
         LOG_INFO("Fake fullscreen: blocked SetFullscreenState(TRUE)");
 
@@ -225,54 +225,28 @@ static bool on_set_fullscreen_state(reshade::api::swapchain*, bool fullscreen, v
         // Games that create the swapchain windowed then call SetFullscreenState
         // (e.g., RE Engine) need this to fill the monitor.
         HWND target = SwapMgr_GetHWND();
-        if (target) {
-            CreateThread(nullptr, 0, [](LPVOID param) -> DWORD {
-                HWND h = static_cast<HWND>(param);
-                Sleep(100);
-                HMONITOR hmon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
-                MONITORINFO mi = {}; mi.cbSize = sizeof(mi);
-                GetMonitorInfo(hmon, &mi);
-                RECT& rc = mi.rcMonitor;
-                LONG style = GetWindowLong(h, GWL_STYLE);
-                SetWindowLong(h, GWL_STYLE, style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER));
-                SetWindowPos(h, HWND_TOP, rc.left, rc.top,
-                             rc.right - rc.left, rc.bottom - rc.top,
-                             SWP_FRAMECHANGED | SWP_NOACTIVATE);
-                return 0;
-            }, target, 0, nullptr);
-        }
+        if (target)
+            BackgroundTasks_Start(ApplyBorderlessTask, target);
 
         return true; // block the call
     }
     return false;
 }
 
-static void on_present(reshade::api::command_queue* queue,
-                       reshade::api::swapchain* sc,
-                       const reshade::api::rect* source_rect,
-                       const reshade::api::rect* dest_rect,
-                       uint32_t dirty_rect_count,
-                       const reshade::api::rect* dirty_rects) {
+static void on_present_impl(reshade::api::command_queue* queue,
+                            reshade::api::swapchain* sc,
+                            const reshade::api::rect* source_rect,
+                            const reshade::api::rect* dest_rect,
+                            uint32_t dirty_rect_count,
+                            const reshade::api::rect* dirty_rects) {
+    // Init is provisional; only the selected presenter may recapture global
+    // state or pace. The try-only guard also handles late load and subsequent
+    // destroy/recreate lifetimes without a permanent late-init barrier.
+    SwapchainPresentGuard presenter(sc);
+    if (!presenter) return;
+
     // MMCSS registration for the present thread (once)
     Hardening_OnFirstPresent();
-
-    // ── Late init: detect device/swapchain that were created before addon loaded ──
-    if (sc && !SwapMgr_IsValid()) {
-        reshade::api::device* dev = sc->get_device();
-        if (dev) {
-            static bool s_late_init_attempted = false;
-            if (!s_late_init_attempted) {
-                s_late_init_attempted = true;
-                LOG_WARN("Late init: device/swapchain missed init callbacks, "
-                         "running retroactive init from present");
-                SwapMgr_OnInitDevice(dev);
-                SwapMgr_OnInitSwapchain(sc, /*resize=*/false);
-            }
-        }
-    }
-
-    // Skip all present work if swapchain is not valid (between destroy and init)
-    if (!SwapMgr_IsValid() || !sc) return;
 
 #ifdef RELIMITER_ENABLE_MCP
     LiveDebug_StartIfReady();
@@ -290,9 +264,10 @@ static void on_present(reshade::api::command_queue* queue,
     // avoids hooking driver functions before the game has finished setting
     // up its D3D12/Vulkan device and swapchain.
     {
-        static bool s_hooks_installed = false;
-        if (!s_hooks_installed) {
-            s_hooks_installed = true;
+        static std::atomic<bool> s_hooks_installed{false};
+        bool expected = false;
+        if (s_hooks_installed.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
             InstallLoadLibraryHooks();
             LOG_INFO("LoadLibrary hooks installed (deferred)");
             InstallNvAPIHooks();
@@ -301,17 +276,11 @@ static void on_present(reshade::api::command_queue* queue,
     }
 
     // Capture the presenting swapchain for the correlator and display resolver.
-    // Re-capture when: pointer changes, or the detected API changes since
-    // last capture (handles DX11 launcher → DX12 gameplay transition where
-    // Streamline reuses the same proxy pointer for both).
+    // Re-capture on pointer/API changes or a new selected lifetime, including
+    // native pointer reuse after resize and same-API launcher handoff.
     if (sc) {
-        // Derive API from the swapchain's own device rather than the cached
-        // global state. SwapMgr_GetActiveAPI() can be stale during API
-        // transitions (e.g. DX12 launcher → Vulkan gameplay) because
-        // on_present may fire before SwapMgr_OnInitDevice updates the API.
-        // Using the wrong API here causes a VkSwapchainKHR to be cast as
-        // IDXGISwapChain*, leading to a crash when VSync_InstallDXGIHooks
-        // dereferences the Vulkan handle as a COM vtable.
+        // Keep native-handle interpretation tied to the presenting device,
+        // not API ranking or a cached fallback on an unknown device API.
         ActiveAPI api = ActiveAPI::None;
         reshade::api::device* present_dev = sc->get_device();
         if (present_dev) {
@@ -325,33 +294,33 @@ static void on_present(reshade::api::command_queue* queue,
                 default: break;
             }
         }
-        if (api == ActiveAPI::None)
-            api = SwapMgr_GetActiveAPI(); // fallback to cached if device unavailable
-
         // DX9/Vulkan/OpenGL native handles are NOT IDXGISwapChain*.
         // DX9 uses IDirect3DSwapChain9, Vulkan uses VkSwapchainKHR.
         // Casting them to IDXGISwapChain* causes crashes when the correlator
         // calls GetFrameStatistics or VSync hooks dereference COM vtables.
         // Skip DXGI swapchain capture entirely for non-DXGI APIs.
-        if (api != ActiveAPI::DX9 && api != ActiveAPI::Vulkan && api != ActiveAPI::OpenGL) {
+        const bool recapture = SwapMgr_ConsumeRecaptureFlag();
+        if (api == ActiveAPI::DX11 || api == ActiveAPI::DX12) {
             auto native = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
-            static ActiveAPI s_last_notified_api = ActiveAPI::None;
+            static std::atomic<ActiveAPI> s_last_notified_api{ActiveAPI::None};
 
-            bool pointer_changed = (native && native != g_presenting_swapchain);
-            bool api_changed = (api != ActiveAPI::None && api != s_last_notified_api);
+            const bool pointer_changed = native &&
+                Correlator_SetPresentingSwapchain(native);
+            const ActiveAPI last_notified_api =
+                s_last_notified_api.load(std::memory_order_acquire);
+            bool api_changed =
+                api != ActiveAPI::None && api != last_notified_api;
 
-            if (native && (pointer_changed || api_changed)) {
-                g_presenting_swapchain = native;
-                s_last_notified_api = api;
-                g_correlator.OnPresentingSwapchainChanged();
+            if (native && (pointer_changed || api_changed || recapture)) {
+                s_last_notified_api.store(api, std::memory_order_release);
                 if (api == ActiveAPI::DX12 || api == ActiveAPI::DX11) {
                     DispRes_OnSwapchainInit(reinterpret_cast<uint64_t>(native),
                                             api, SwapMgr_GetHWND());
                 }
                 LOG_WARN("on_present: captured presenting swapchain %p (hwnd=%p, api=%d, "
-                         "ptr_changed=%d, api_changed=%d)",
+                         "ptr_changed=%d, api_changed=%d, recapture=%d)",
                          native, SwapMgr_GetHWND(), static_cast<int>(api),
-                         pointer_changed, api_changed);
+                         pointer_changed, api_changed, recapture);
 
                 // Install DXGI VSync hook on first swapchain capture
                 VSync_InstallDXGIHooks(native);
@@ -370,13 +339,35 @@ static void on_present(reshade::api::command_queue* queue,
     EnfDisp_OnPresent(now_qpc.QuadPart);
 }
 
-// ── Core initialisation (shared by DllMain and AddonInit paths) ──
+static void on_present(reshade::api::command_queue* queue,
+                       reshade::api::swapchain* sc,
+                       const reshade::api::rect* source_rect,
+                       const reshade::api::rect* dest_rect,
+                       uint32_t dirty_rect_count,
+                       const reshade::api::rect* dirty_rects) {
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) return;
+    s_present_seen.store(true, std::memory_order_release);
+    try {
+        on_present_impl(
+            queue,
+            sc,
+            source_rect,
+            dest_rect,
+            dirty_rect_count,
+            dirty_rects);
+    }
+    catch (...) {
+        OutputDebugStringA("ReLimiter: Present callback rejected an exception.\n");
+    }
+}
+
+// ── Core initialization (always outside the loader lock) ──
 static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
     if (s_addon_initialised) return true;   // already done
 
-    // Register with ReShade using the handle ReShade knows about.
-    // When called from AddonInit, reshade_module is provided directly.
-    // When called from DllMain (DX path), we discover it at runtime.
+    // Register with ReShade using the handle supplied by its post-load entry
+    // point. Full initialization is never attempted from DllMain.
     HMODULE reshade_mod = reshade_module;
     if (!reshade_mod)
         reshade_mod = reshade::internal::get_reshade_module_handle();
@@ -391,6 +382,7 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         LOG_INFO("ReShadeRegisterAddon failed, skipping");
         return false;
     }
+    s_addon_registered = true;
 
     // Seed the inline handle caches so register_event / unregister_addon work.
     reshade::internal::get_current_module_handle(hModule);
@@ -403,30 +395,35 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         LOG_WARN("ImGui function table init failed (ver=%d) — OSD disabled",
                  IMGUI_VERSION_NUM);
     }
+    else {
+        s_imgui_available = true;
+    }
 #endif
 
     LOG_INFO("ReShade addon registered (hModule=%p)", hModule);
 
-    __try { LoadConfig(hModule); }
-    __except(EXCEPTION_EXECUTE_HANDLER) {
-        LOG_ERROR("LoadConfig exception 0x%08X", GetExceptionCode());
-    }
-    // Set desired state only. ETW starts lazily after the first valid present,
-    // so this remains safe when DoInit is reached from DLL_PROCESS_ATTACH.
+    LoadConfig(hModule);
+    // Set desired state only. ETW starts lazily after the first valid present.
     NativePcl_SetEnabled(g_config.native_pcl_enabled);
-    s_hModule = hModule;
     LOG_INFO("Config loaded: target_fps=%d", g_config.target_fps);
     LOG_INFO("Config keybinds: toggle=%s prev=%s next=%s",
              g_config.osd_toggle_key.c_str(),
              g_config.osd_preset_prev_key.empty() ? "(none)" : g_config.osd_preset_prev_key.c_str(),
              g_config.osd_preset_next_key.empty() ? "(none)" : g_config.osd_preset_next_key.c_str());
 
-    if (MH_Initialize() != MH_OK) {
-        LOG_ERROR("MH_Initialize failed");
-        reshade::unregister_addon(hModule);
+    const MH_STATUS minhook_status = MH_Initialize();
+    const bool reactivating_retained_hooks =
+        minhook_status == MH_ERROR_ALREADY_INITIALIZED;
+    if (minhook_status != MH_OK && !reactivating_retained_hooks) {
+        LOG_ERROR("MH_Initialize failed (%d)", minhook_status);
         return false;
     }
-    LOG_INFO("MinHook initialized");
+    s_minhook_initialised = true;
+    Hooks_ResetInstallAdmission();
+    LOG_INFO(
+        reactivating_retained_hooks
+            ? "MinHook retained lifetime reactivated"
+            : "MinHook initialized");
 
     g_tsc_cal.Calibrate();
     LOG_INFO("TSC calibrated: tsc_per_qpc=%.4f", g_tsc_cal.tsc_per_qpc);
@@ -435,13 +432,12 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
     LOG_INFO("Spin method: %s", GetSpinMethodName());
 
     InitSleepTimer();
-    LOG_INFO("Waitable timer created");
+    s_sleep_timer_initialised = true;
+    LOG_INFO("Waitable timer initialized");
 
-    __try {
-        InstallTimerHooks();
-        LOG_INFO("Timer hooks installed");
-
-        Hardening_Init();
+    // ReLimiter's own timer is already high-resolution. Do not interpose on
+    // every waitable timer created by the game or its middleware.
+    Hardening_Init();
 
         // NvAPI and Streamline hooks are deferred to the first on_present.
         // This lets the game's rendering pipeline fully initialize before
@@ -455,6 +451,7 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
             char* slash = strrchr(csv_dir, '\\');
             if (slash) *slash = '\0';
             CSV_Init(csv_dir);
+            s_csv_initialised = true;
             if (g_config.csv_enabled) CSV_SetEnabled(true);
         }
         PQI_Reset();
@@ -465,7 +462,10 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
                  g_ceiling_hz.load(), g_floor_hz.load());
 
         StartDisplayPollThread();
-        StartVBlankThread();
+        s_display_poll_started = true;
+        // The vblank worker is started only after an owning HWND exists and the
+        // fixed-mode PLL has an explicit handoff. Starting it here races loader
+        // initialization and leaves a false running state when no HWND exists.
         LOG_INFO("Background threads started");
 
         PollGSyncState();
@@ -473,6 +473,15 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
                  g_gsync_active.load() ? "active" : "inactive",
                  g_pacing_mode.load() == PacingMode::VRR ? "VRR" : "Fixed");
 
+        HWMonitor_Init();
+        s_hw_monitor_started = true;
+        if (g_config.dlss_info_hooks) NGXHooks_Init();
+        else LOG_WARN("DLSS info hooks disabled by user config");
+        Blackout_Init();
+        s_blackout_started = true;
+
+        // Publish callbacks only after every fallible worker/subsystem has been
+        // created, minimizing partial-initialization rollback exposure.
         reshade::register_event<reshade::addon_event::init_device>(on_init_device);
         reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
         reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
@@ -480,18 +489,15 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         reshade::register_event<reshade::addon_event::present>(on_present);
         reshade::register_event<reshade::addon_event::create_swapchain>(on_create_swapchain);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(on_set_fullscreen_state);
-        RegisterOSD();
-        HWMonitor_Init();
-        if (g_config.dlss_info_hooks) NGXHooks_Init();
-        else LOG_WARN("DLSS info hooks disabled by user config");
-        Blackout_Init();
+        if (s_imgui_available) RegisterOSD();
         LOG_INFO("ReShade events + OSD registered");
 
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        LOG_ERROR("Init exception 0x%08X", GetExceptionCode());
-        MH_Uninitialize();
-        reshade::unregister_addon(hModule);
-        return false;
+    if (reactivating_retained_hooks) {
+        const MH_STATUS enable_status = EnableAllHooks();
+        if (enable_status != MH_OK && enable_status != MH_ERROR_ENABLED) {
+            LOG_ERROR("Failed to reactivate retained hooks (%d)", enable_status);
+            return false;
+        }
     }
 
     LOG_INFO("Initialization complete");
@@ -501,120 +507,252 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
     return true;
 }
 
-// ── AddonInit: called by ReShade AFTER LoadLibraryEx returns ──
-// This is the preferred entry point for Vulkan (global layer) where DllMain
-// may run before ReShade's addon manager is ready.
-extern "C" __declspec(dllexport)
-bool WINAPI AddonInit(HMODULE addon_module, HMODULE reshade_module) {
-    // Logging may already be up from DllMain, but ensure it is.
-    Log_Init(addon_module, LogLevel::Info);
-    LOG_INFO("AddonInit called (addon=%p, reshade=%p)", addon_module, reshade_module);
+static void ResetInitializationMilestones() noexcept {
+    s_imgui_available = false;
+    s_blackout_started = false;
+    s_hw_monitor_started = false;
+    s_display_poll_started = false;
+    s_csv_initialised = false;
+    s_sleep_timer_initialised = false;
+    s_minhook_initialised = false;
+    s_addon_registered = false;
+}
 
-    s_prev_filter = SetUnhandledExceptionFilter(CrashHandler);
+// Both rollback and normal teardown must attempt every producer stop. Keep each
+// call on the left of && so a prior failure cannot skip another stop request.
+static bool StopOwnedProducers() {
+    bool native_pcl_stopped = NativePcl_Stop();
+    bool live_debug_stopped = true;
+#ifdef RELIMITER_ENABLE_MCP
+    live_debug_stopped = LiveDebug_Stop();
+#endif
+    bool auxiliary_workers_stopped =
+        DLSSPresets_Shutdown() && native_pcl_stopped && live_debug_stopped;
+    auxiliary_workers_stopped =
+        NGXHooks_BeginShutdown() && auxiliary_workers_stopped;
+    auxiliary_workers_stopped =
+        BackgroundTasks_Shutdown() && auxiliary_workers_stopped;
+    if (s_blackout_started)
+        auxiliary_workers_stopped =
+            Blackout_Shutdown() && auxiliary_workers_stopped;
+    if (s_hw_monitor_started)
+        auxiliary_workers_stopped =
+            HWMonitor_Shutdown() && auxiliary_workers_stopped;
+    auxiliary_workers_stopped =
+        StopVBlankThread() && auxiliary_workers_stopped;
+    if (s_display_poll_started)
+        auxiliary_workers_stopped =
+            StopDisplayPollThread() && auxiliary_workers_stopped;
+    return auxiliary_workers_stopped;
+}
 
-    if (!DoInit(addon_module, reshade_module)) {
-        SetUnhandledExceptionFilter(s_prev_filter);
+static bool RollbackInitialization(HMODULE addon_module) {
+    RuntimeLifecycle_BeginShutdown();
+    if (s_addon_registered) {
+        reshade::unregister_addon(addon_module);
+        s_addon_registered = false;
+    }
+    bool auxiliary_workers_stopped = StopOwnedProducers();
+    const MH_STATUS disable_status = s_minhook_initialised
+        ? DisableAllHooks()
+        : MH_OK;
+    FocusLock_Remove();
+    const bool callbacks_drained = RuntimeLifecycle_WaitForCallbacks(5000);
+    // A callback admitted before BeginShutdown may have started native PCL.
+    auxiliary_workers_stopped = NativePcl_Stop() && auxiliary_workers_stopped;
+    if (disable_status != MH_OK || !callbacks_drained ||
+        !auxiliary_workers_stopped) {
+        LOG_ERROR(
+            "Initialization rollback incomplete (disable=%d, callbacks=%d, workers=%d); retaining resources",
+            disable_status, callbacks_drained, auxiliary_workers_stopped);
+        s_fail_inert = true;
+        s_addon_initialised = false;
         return false;
     }
+
+    if (s_minhook_initialised) {
+        ReflexInject_Shutdown();
+        RestoreGameSleepMode();
+        NvAPI_ClearFeedbackDevice();
+        SwapMgr_ReleaseRuntimeReferences();
+        Streamline_ResetLifetime();
+        Hardening_Shutdown();
+    }
+    if (s_sleep_timer_initialised) CloseSleepTimer();
+    if (s_csv_initialised)
+        auxiliary_workers_stopped =
+            CSV_Shutdown() && auxiliary_workers_stopped;
+
+    s_addon_initialised = false;
+    if (auxiliary_workers_stopped)
+        auxiliary_workers_stopped = Log_Shutdown();
+    if (auxiliary_workers_stopped) RuntimeLifecycle_Shutdown();
+    if (s_minhook_initialised || !auxiliary_workers_stopped) {
+        // Keep disabled hook records, typed trampolines, and addon text mapped
+        // until process exit. This closes the unavoidable detour-prologue race
+        // that an in-flight counter alone cannot observe.
+        s_fail_inert = true;
+        return false;
+    }
+    ResetInitializationMilestones();
     return true;
 }
 
-// ── AddonUninit: called by ReShade during unload_addons ──
+// ── AddonInit: called by ReShade after LoadLibraryEx returns ──
+// This is the preferred entry point for Vulkan (global layer) where DllMain
+// may run before ReShade's addon manager is ready.
 extern "C" __declspec(dllexport)
-void WINAPI AddonUninit(HMODULE /*addon_module*/, HMODULE /*reshade_module*/) {
+bool AddonInit(HMODULE addon_module, HMODULE reshade_module) {
+    if (s_addon_initialised) return true;
+    if (s_fail_inert) {
+        OutputDebugStringA(
+            "ReLimiter: reload rejected because a prior unsafe shutdown retained the module.\n");
+        return false;
+    }
+    const bool acquired_new_reference = s_runtime_reference == nullptr;
+    if (!AcquireRuntimeReference()) return false;
+    ResetInitializationMilestones();
+
+    Log_Init(addon_module, LogLevel::Info);
+    LOG_INFO("AddonInit called (addon=%p, reshade=%p)", addon_module, reshade_module);
+    // Reset before reopening callback admission, never after a newly admitted
+    // Present may already have published its observation.
+    s_present_seen.store(false, std::memory_order_release);
+    if (!RuntimeLifecycle_Initialize()) {
+        LOG_ERROR("Runtime lifecycle initialization failed");
+        const bool logger_stopped = Log_Shutdown();
+        if (acquired_new_reference && logger_stopped)
+            ReleaseRuntimeReference();
+        else
+            s_fail_inert = true;
+        return false;
+    }
+
+    try {
+        if (DoInit(addon_module, reshade_module)) return true;
+        LOG_ERROR("Addon initialization failed");
+    }
+    catch (const std::exception& error) {
+        LOG_ERROR("Addon initialization raised a C++ exception: %s", error.what());
+    }
+    catch (...) {
+        LOG_ERROR("Addon initialization raised an unknown C++ exception");
+    }
+
+    try {
+        if (RollbackInitialization(addon_module) && acquired_new_reference)
+            ReleaseRuntimeReference();
+    }
+    catch (...) {
+        RuntimeLifecycle_BeginShutdown();
+        s_fail_inert = true;
+        OutputDebugStringA(
+            "ReLimiter: initialization rollback rejected an exception; module retained.\n");
+    }
+    return false;
+}
+
+// ── AddonUninit: called by ReShade during unload_addons ──
+static void AddonUninitImpl(HMODULE addon_module) {
     if (!s_addon_initialised) return;
     LOG_INFO("AddonUninit called");
 
-    // Stop ETW while hooks, telemetry, and logging are still alive. This
-    // blocks until ProcessTrace has drained and the collector thread exits.
-    NativePcl_Stop();
-#ifdef RELIMITER_ENABLE_MCP
-    LiveDebug_Stop();
-#endif
+    RuntimeLifecycle_BeginShutdown();
+    if (s_addon_registered) {
+        reshade::unregister_addon(addon_module);
+        s_addon_registered = false;
+    }
 
-    SaveConfig();
-    SetUnhandledExceptionFilter(ShutdownCrashHandler);
-    SuppressWEROnShutdown();
-    RestoreGameSleepMode();  // restore game's original Reflex params
-    HWMonitor_Shutdown();
-    NGXHooks_Shutdown();
-    Blackout_Shutdown();
+    // Stop every owned producer before disabling hooks and draining callbacks.
+    bool auxiliary_workers_stopped = StopOwnedProducers();
+
+    const MH_STATUS disable_status = s_minhook_initialised
+        ? DisableAllHooks()
+        : MH_OK;
     FocusLock_Remove();
-    StopVBlankThread();
-    StopDisplayPollThread();
-    RestoreFrameSplitting();
-    RemoveTimerHooks();
+    const bool callbacks_drained = RuntimeLifecycle_WaitForCallbacks(5000);
+    auxiliary_workers_stopped = NativePcl_Stop() && auxiliary_workers_stopped;
+    if (disable_status != MH_OK || !callbacks_drained ||
+        !auxiliary_workers_stopped) {
+        // Retain the private module reference. Returning to ReShade is safe:
+        // its FreeLibrary releases only its own reference, leaving inert addon
+        // code mapped rather than unloading beneath a live callback.
+        LOG_ERROR(
+            "Shutdown incomplete (disable=%d, callbacks=%d, workers=%d); retaining resources for process lifetime",
+            disable_status, callbacks_drained, auxiliary_workers_stopped);
+        s_fail_inert = true;
+        s_addon_initialised = false;
+        return;
+    }
+
+    // Every admitted Present marks s_present_seen before on_present_impl,
+    // including late-init attempts and invalid/auxiliary swapchains. Reading it
+    // only after rundown prevents a first-Present race from allowing reload with
+    // retained function-local late-init state. Allowed reloads never reached it.
+    const bool startup_reload_allowed =
+        !s_present_seen.load(std::memory_order_acquire);
+
+    // Typed trampolines remain valid after disable. Restore game/driver state
+    // only after every admitted detour has drained.
+    ReflexInject_Shutdown();
+    RestoreGameSleepMode();
+    NvAPI_ClearFeedbackDevice();
+    SwapMgr_ReleaseRuntimeReferences();
+    Streamline_ResetLifetime();
     Hardening_Shutdown();
-    DisableAllHooks();
-    // Allow in-flight hook calls to return before freeing trampoline memory.
-    // Games like Clair Obscur call CreateFeature(FG) every second from a
-    // background thread — without this delay, MH_Uninitialize frees the
-    // trampoline while a call is mid-flight, causing STATUS_STACK_BUFFER_OVERRUN.
-    Sleep(100);
-    MH_Uninitialize();
-    CloseSleepTimer();
-    CSV_Shutdown();
-    if (s_hModule) reshade::unregister_addon(s_hModule);
-    LOG_INFO("Shutdown complete");
+    SaveConfig();
+    if (s_sleep_timer_initialised) CloseSleepTimer();
+    if (s_csv_initialised)
+        auxiliary_workers_stopped =
+            CSV_Shutdown() && auxiliary_workers_stopped;
+
+    LOG_INFO(
+        !auxiliary_workers_stopped
+            ? "Shutdown incomplete; module retained fail-inert until process exit"
+            : startup_reload_allowed
+                ? "Startup shutdown complete; retained hooks ready for ReShade reload"
+                : "Gameplay shutdown complete; restart required before reloading ReLimiter");
     s_addon_initialised = false;
-    s_hModule = nullptr;
+    if (auxiliary_workers_stopped)
+        auxiliary_workers_stopped = Log_Shutdown();
+    if (auxiliary_workers_stopped) RuntimeLifecycle_Shutdown();
+    s_fail_inert =
+        !auxiliary_workers_stopped || !startup_reload_allowed;
+    // Deliberately keep s_runtime_reference and MinHook storage. A thread can
+    // already be in a detour prologue before its RuntimeCallbackGuard increments;
+    // a clean reload reuses these disabled records, while unsafe rundown remains
+    // permanently fail-inert.
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
-    switch (reason) {
-    case DLL_PROCESS_ATTACH:
-        Log_Init(hModule, LogLevel::Info);
-        LOG_INFO("DllMain ATTACH (PID=%lu, TID=%lu)", GetCurrentProcessId(), GetCurrentThreadId());
-        // Attempt self-registration immediately. ReShade for DX9/DX11/DX12
-        // expects addons to register during DllMain (no AddonInit callback).
-        // For Vulkan (global layer), this will fail gracefully (no ReShade
-        // module yet) and AddonInit will handle it later.
-        s_prev_filter = SetUnhandledExceptionFilter(CrashHandler);
-        if (!DoInit(hModule, nullptr)) {
-            // Not fatal — either not a ReShade host, or ReShade will call
-            // AddonInit later (Vulkan path). Reset the exception filter
-            // since we haven't initialized.
-            SetUnhandledExceptionFilter(s_prev_filter);
-            LOG_INFO("DllMain: DoInit deferred (AddonInit will handle)");
-        }
-        break;
+extern "C" __declspec(dllexport)
+void AddonUninit(HMODULE addon_module, HMODULE) {
+    try {
+        AddonUninitImpl(addon_module);
+    }
+    catch (...) {
+        // Keep the private runtime reference and fail inert rather than let an
+        // exception cross ReShade's C ABI and unload beneath live state.
+        RuntimeLifecycle_BeginShutdown();
+        s_fail_inert = true;
+        s_addon_initialised = false;
+        OutputDebugStringA("ReLimiter: AddonUninit rejected an exception; module retained.\n");
+    }
+}
 
-    case DLL_PROCESS_DETACH:
-        LOG_INFO("DllMain DETACH");
-        // Never call ETW control APIs or join threads under the loader lock.
-        // Normal teardown happens in AddonUninit; this only reports a skipped
-        // shutdown for abnormal unload/process-termination paths.
+BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID reserved) {
+    if (reason == DLL_PROCESS_DETACH && reserved == nullptr &&
+             (s_addon_initialised || s_runtime_reference != nullptr)) {
+        // A dynamic unload should be impossible while the private runtime
+        // reference is held. If a host violates the AddonUninit contract, only
+        // publish nonblocking stop notifications under the loader lock.
+        RuntimeLifecycle_BeginShutdown();
         NativePcl_NotifyProcessDetach();
-    #ifdef RELIMITER_ENABLE_MCP
+#ifdef RELIMITER_ENABLE_MCP
         LiveDebug_NotifyProcessDetach();
-    #endif
-        // If AddonUninit was not called (abnormal unload), clean up.
-        if (s_addon_initialised) {
-            LOG_WARN("AddonUninit was not called — cleaning up in DllMain");
-            SaveConfig();
-            SetUnhandledExceptionFilter(ShutdownCrashHandler);
-            SuppressWEROnShutdown();
-            RestoreGameSleepMode();  // restore game's original Reflex params
-            HWMonitor_Shutdown();
-            NGXHooks_Shutdown();
-            Blackout_Shutdown();
-            FocusLock_Remove();
-            StopVBlankThread();
-            StopDisplayPollThread();
-            RestoreFrameSplitting();
-            RemoveTimerHooks();
-            Hardening_Shutdown();
-            DisableAllHooks();
-            Sleep(100);
-            MH_Uninitialize();
-            CloseSleepTimer();
-            CSV_Shutdown();
-            if (s_hModule) reshade::unregister_addon(s_hModule);
-            s_addon_initialised = false;
-        }
-        LOG_INFO("DllMain DETACH complete");
-        Log_Shutdown();
-        break;
+#endif
+        OutputDebugStringA(
+            "ReLimiter: dynamic detach reached without completed AddonUninit; "
+            "loader-lock cleanup intentionally skipped.\n");
     }
     return TRUE;
 }

@@ -1,5 +1,6 @@
 #include "timer_hooks.h"
 #include "hooks.h"
+#include "runtime_lifecycle.h"
 #include "logger.h"
 #include <Windows.h>
 #include <MinHook.h>
@@ -23,6 +24,12 @@ static bool s_timer_hooks_installed = false;
 
 static HANDLE WINAPI Hook_CreateWaitableTimerW(
     LPSECURITY_ATTRIBUTES lpAttrs, BOOL bManualReset, LPCWSTR lpName) {
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) {
+        return s_orig_create_timer_w
+            ? s_orig_create_timer_w(lpAttrs, bManualReset, lpName)
+            : nullptr;
+    }
     DWORD flags = CREATE_WAITABLE_TIMER_HIGH_RESOLUTION;
     if (bManualReset) flags |= CREATE_WAITABLE_TIMER_MANUAL_RESET;
 
@@ -36,6 +43,12 @@ static HANDLE WINAPI Hook_CreateWaitableTimerW(
 
 static HANDLE WINAPI Hook_CreateWaitableTimerExW(
     LPSECURITY_ATTRIBUTES lpAttrs, LPCWSTR lpName, DWORD dwFlags, DWORD dwAccess) {
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) {
+        return s_orig_create_timer_ex_w
+            ? s_orig_create_timer_ex_w(lpAttrs, lpName, dwFlags, dwAccess)
+            : nullptr;
+    }
     dwFlags |= CREATE_WAITABLE_TIMER_HIGH_RESOLUTION;
     return s_orig_create_timer_ex_w
         ? s_orig_create_timer_ex_w(lpAttrs, lpName, dwFlags, dwAccess)
@@ -43,6 +56,8 @@ static HANDLE WINAPI Hook_CreateWaitableTimerExW(
 }
 
 void InstallTimerHooks() {
+    HookInstallGuard hook_install;
+    if (!hook_install) return;
     // 1. Request maximum kernel timer resolution via ntdll
     HMODULE ntdll = GetModuleHandleA("ntdll.dll");
     if (ntdll) {
@@ -69,6 +84,8 @@ void InstallTimerHooks() {
     void* pCreateW = reinterpret_cast<void*>(GetProcAddress(k32, "CreateWaitableTimerW"));
     void* pCreateExW = reinterpret_cast<void*>(GetProcAddress(k32, "CreateWaitableTimerExW"));
     if (!pCreateW || !pCreateExW) return;
+    if (!Hooks_PinTargetModule(pCreateW) ||
+        !Hooks_PinTargetModule(pCreateExW)) return;
 
     // Hook ExW first (needed by the W hook's promotion path)
     MH_STATUS st = MH_CreateHook(pCreateExW, reinterpret_cast<void*>(Hook_CreateWaitableTimerExW),
