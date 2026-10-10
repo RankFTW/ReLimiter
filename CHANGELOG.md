@@ -65,6 +65,7 @@ See [Removed and migrated keys](docs/USER_GUIDE.md#removed-and-migrated-keys) fo
 - **With the GPU wait output** it also keeps just enough frame interval for the GPU wait to hold frames in GPU-heavy scenes.
 - **With frame generation** it counts the GPU time frame generation needs for each rendered frame, so it does not shorten the interval below what the GPU can render and generate.
 - **Fewer trial shortenings.** It no longer tries a shorter interval while the GPU is the bottleneck, where the GPU's measured work already shows what the game needs, and it waits a calm second after each shortening before trying another. Each failed try made a short burst of late frames.
+- **Shortenings that stick.** When the load drops it shortens the interval only to what the most recent frames still need, the same level a lengthening would choose, so a shortening is rarely undone a moment later.
 - **No runaway in lockstep games.** ReLimiter's own waits are no longer counted as the game's lateness or workload, so the interval no longer climbs to its maximum in games that finish a frame only after the next one is released.
 - **Controls.** The main view shows `(at the cap)` or `(N% below the cap)` beside the checkbox. **Adaptive cap fit** (`adaptive_cap_percentile`, 50–99, default 75) is under **Advanced** and sets the share of recent frames the lengthened interval plans for. **Show on OSD** adds an `Adaptive cap: +x.x% (x.xx ms)` line.
 

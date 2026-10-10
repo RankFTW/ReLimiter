@@ -261,6 +261,29 @@ namespace
         CHECK(harness.governor.Statistics().rises == 1);
     }
 
+    // A release falls to the need a rise would use: with a quarter of the
+    // reports high, Q75 of the newest second stays low but Q90 of the newest
+    // 12 is high, so the fall stops one margin above the high reports, not
+    // at the cap the Q75 alone would allow.
+    void TestReleaseFallsToRiseNeed()
+    {
+        Harness harness;
+        harness.Run(30, 12'000.0);
+        for (int frame = 0; frame < 200 && harness.Target() < 12'000.0; ++frame) {
+            harness.Demand(12'000.0);
+            harness.Frame(false, true);
+        }
+        const double risen = harness.Target();
+        CHECK_NEAR(risen, 12'000.0 + 0.03 * 11'600.0, 1e-6);
+        int frames = 1;
+        for (; frames <= 1000; ++frames) {
+            harness.Demand(frames % 4 == 0 ? 11'000.0 : 9'000.0);
+            if (harness.Frame().cause == GovernorCause::Release) break;
+        }
+        CHECK(frames < 1000);
+        CHECK_NEAR(harness.Target(), 11'000.0 + 0.03 * risen, 1e-6);
+    }
+
     // A demand that grows with the interval never shows headroom: probes
     // bring the interval back, 3% of I_0 first, 1.5x further per held probe.
     void TestProbesBelowCoupledDemand()
@@ -651,6 +674,7 @@ int main()
     TestDemandRiseWithEvidence();
     TestMissRateRise();
     TestDemandFall();
+    TestReleaseFallsToRiseNeed();
     TestProbesBelowCoupledDemand();
     TestFailedProbeBacksOff();
     TestNoProbeWhileGpuBinds();

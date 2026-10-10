@@ -346,7 +346,9 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
     if (window_.Closed(qpc, frequency)) window_.Restart();
 
     // 4. Fall to the demand after 0.5 s of headroom; never while a recurring
-    // load is held after its newest rise.
+    // load is held after its newest rise. The fall goes to the need a rise
+    // would size from the same reports (the newest 12 included), so it never
+    // lands where the next rise would put it back up.
     const bool holding = since(last_rise_qpc_) < HoldS(qpc, frequency);
     {
         const double target_us = base_us * target_stretch_;
@@ -356,7 +358,8 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
             if (headroom_since_qpc_ == 0) {
                 headroom_since_qpc_ = qpc;
             } else if (since(headroom_since_qpc_) >= GOVERNOR_FALL_HOLD_S) {
-                const double next_us = std::max(base_us, slow_us + margin_us);
+                const double need_us = fast_known ? std::max(fast_us, slow_us) : slow_us;
+                const double next_us = std::max(base_us, need_us + margin_us);
                 if (next_us < target_us - kStretchEpsilon * base_us) {
                     target_stretch_ = next_us / base_us;
                     probing_from_stretch_ = 0.0;

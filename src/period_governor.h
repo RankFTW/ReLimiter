@@ -9,7 +9,9 @@
 // m, at most +8% of I_0 per 0.25 s; +5% when misses are high and demand does
 // not explain them), so a measurement that grows with the interval (Rogue
 // Core's render-submit stage) cannot lengthen it on its own.
-// Falls: to Q_p + m after 0.5 s of demand headroom, otherwise probes below
+// Falls: after 0.5 s of demand headroom (Q_p + 2 m below the interval), to
+// the need a rise would use (max(Q90 of the newest 12, Q_p)) + m, so a fall
+// never lands where the next rise would put it back; otherwise probes below
 // the demand after 1 s without evidence (3% of I_0, 1.5x further per held
 // probe, up to 12%); a probe that brings evidence back returns and doubles
 // the calm time the next needs (up to 8 s). A probe needs a calm second
