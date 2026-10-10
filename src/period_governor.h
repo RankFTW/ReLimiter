@@ -12,7 +12,11 @@
 // Falls: to Q_p + m after 0.5 s of demand headroom, otherwise probes below
 // the demand after 1 s without evidence (3% of I_0, 1.5x further per held
 // probe, up to 12%); a probe that brings evidence back returns and doubles
-// the calm time the next needs (up to 8 s). After a rise no fall happens for
+// the calm time the next needs (up to 8 s). A probe needs a calm second
+// after any fall, release included, and none starts while most reports of
+// the newest second are bound by GPU work: GPU active time is execution
+// only and does not grow with the interval, so a probe below it can only
+// fail. After a rise no fall happens for
 // 1.5 s per overload episode of the last 20 s (up to 8 s), so a recurring
 // load is held. The realized interval moves at most +3% / -1% per frame. The
 // hold room is a floor beside this target: while the Auto GPU
@@ -231,11 +235,13 @@ public:
     // frame when stretched. While enabled, settles for 32 frames, so frames
     // planned at the old period are not evidence. Statistics stay cumulative.
     void Reset() noexcept;
-    // One stage-demand report. Ignored when its sequence is not newer than
-    // the last accepted one, when non-finite, non-positive or above 3 I,
-    // before the first frame, and while settling; counted as a hitch and not
-    // kept when above 1.5x the median of the newest second.
-    void OnDemand(uint64_t sequence, double demand_us) noexcept;
+    // One stage-demand report; gpu_bound: its GPU execution time (the
+    // driver's active time, plus frame generation) is its largest stage.
+    // Ignored when its sequence is not newer than the last accepted one,
+    // when non-finite, non-positive or above 3 I, before the first frame,
+    // and while settling; counted as a hitch and not kept when above 1.5x
+    // the median of the newest second.
+    void OnDemand(uint64_t sequence, double demand_us, bool gpu_bound) noexcept;
     // Once per planned real frame.
     GovernorDecision OnFrame(const GovernorFrame& frame) noexcept;
 
@@ -251,6 +257,9 @@ private:
     // false with fewer than min_reports or when the demand is stale.
     bool DemandQuantile(double quantile, uint32_t newest, uint32_t min_reports,
         double* demand_us) const noexcept;
+    // More than half of the kept reports of the newest second are GPU-bound
+    // (at least GOVERNOR_DEMAND_SLOW_MIN_REPORTS of them); false when stale.
+    bool GpuBindsDemand() const noexcept;
     double HoldS(int64_t qpc, int64_t frequency) noexcept;
     void Track(const GovernorFrame& frame, GovernorDecision* decision) noexcept;
     static double MarginUs(double interval_us) noexcept;
@@ -259,6 +268,7 @@ private:
     // the next frame stamps them).
     std::array<double, GOVERNOR_DEMAND_CAPACITY> demand_us_{};
     std::array<int64_t, GOVERNOR_DEMAND_CAPACITY> demand_qpc_{};
+    std::array<uint8_t, GOVERNOR_DEMAND_CAPACITY> demand_gpu_{}; // 1 = GPU-bound report
     uint32_t demand_head_ = 0;
     uint32_t demand_count_ = 0;
     uint64_t last_sequence_ = 0;
@@ -278,6 +288,7 @@ private:
     int64_t last_rise_qpc_ = 0;
     int64_t headroom_since_qpc_ = 0;  // 0 = no demand headroom
     int64_t last_probe_qpc_ = 0;
+    int64_t last_fall_qpc_ = 0;       // newest release or probe fall; 0 = none
     double probe_backoff_ = 1.0;
     double probe_step_ = GOVERNOR_PROBE_STEP;
     double probing_from_stretch_ = 0.0; // target before the newest probe; 0 = none

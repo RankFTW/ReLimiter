@@ -748,8 +748,10 @@ static const PacingEventColumn PACING_EVENT_COLUMNS[] = {
         UnsignedIf(line, PacingEventIsJoinStatistics(event), event.join.display_samples); } },
     { "join_rule_present_attribution", [](CsvLine* line, const PacingCsvEvent& event) {
         UnsignedIf(line, PacingEventIsJoinStatistics(event), event.join.rule_present_attribution); } },
+    // PCL joins: rule 2 (frame ID) and rule 3 (simulation start); rows tell them apart.
     { "join_rule_pcl_frame_id", [](CsvLine* line, const PacingCsvEvent& event) {
-        UnsignedIf(line, PacingEventIsJoinStatistics(event), event.join.rule_pcl_frame_id); } },
+        UnsignedIf(line, PacingEventIsJoinStatistics(event),
+            event.join.rule_pcl_frame_id + event.join.rule_pcl_simulation_start); } },
     { "join_rule_none", [](CsvLine* line, const PacingCsvEvent& event) {
         UnsignedIf(line, PacingEventIsJoinStatistics(event), event.join.rule_none); } },
     { "present_unique", [](CsvLine* line, const PacingCsvEvent& event) {

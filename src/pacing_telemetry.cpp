@@ -779,10 +779,11 @@ namespace
         }
         s_state.logged_display_samples = join.display_samples;
         s_state.logged_unjoined_presents = join.unjoined_presents;
-        LOG_INFO("Pacing telemetry: joins display=%llu attribution=%llu pcl_frame_id=%llu none=%llu "
-            "present_unique=%llu ambiguous=%llu not_found=%llu unjoined_presents=%llu late=%llu "
+        LOG_INFO("Pacing telemetry: joins display=%llu attribution=%llu pcl_frame_id=%llu pcl_sim_start=%llu "
+            "none=%llu present_unique=%llu ambiguous=%llu not_found=%llu unjoined_presents=%llu late=%llu "
             "source_missing=%llu evictions=%llu forced=%llu window_evictions=%llu",
-            join.display_samples, join.rule_present_attribution, join.rule_pcl_frame_id, join.rule_none,
+            join.display_samples, join.rule_present_attribution, join.rule_pcl_frame_id,
+            join.rule_pcl_simulation_start, join.rule_none,
             join.present_unique, join.present_ambiguous, join.present_not_found, join.unjoined_presents,
             join.late_display_joins, join.source_missing,
             join.present_capacity_evictions + join.source_capacity_evictions + join.gate_capacity_evictions +

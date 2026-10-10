@@ -3,6 +3,7 @@
 
 #include <iostream>
 
+#include "pacing_core_types.h"
 #include "pacing_join.h"
 
 namespace
@@ -159,6 +160,58 @@ namespace
         g_joiner.AddDisplay(Display(Ms(100), Ms(110), 5), Ms(110));
         return Check(TakeRows(Ms(300), false, rows, 4) == 1 && rows[0].key.frame_id == 0x2'0000'0005,
             "rule 2 takes the most recent Source with the same low 32 bits") && ok;
+    }
+
+    // PresentMon drops the PCL frame ID of a frame whose first PCL marker is
+    // the latency ping; its display still carries the PCL simulation start,
+    // emitted just after ReLimiter released the frame at SIMULATION_START.
+    bool TestRuleThreeSimulationStart()
+    {
+        g_joiner.Reset(kFrequency);
+        const auto simulation_source = [](uint64_t frame_id, int64_t release_qpc) {
+            PacingSourceRecord record = Source(Key(frame_id), release_qpc);
+            record.marker = static_cast<uint8_t>(PacingSourceMarker::SimulationStart);
+            return record;
+        };
+        const auto ping_display = [](int64_t present_start_qpc, int64_t display_qpc, int64_t simulation_qpc) {
+            PacingDisplaySample sample = Display(present_start_qpc, display_qpc);
+            sample.pcl_sim_start_qpc = static_cast<uint64_t>(simulation_qpc);
+            return sample;
+        };
+        g_joiner.AddSource(simulation_source(20, Ms(100)), Ms(100));
+        g_joiner.AddSource(simulation_source(21, Ms(115)), Ms(115));
+        g_joiner.AddSource(simulation_source(22, Ms(130)), Ms(130));
+        PacingSourceRecord submit = Source(Key(24), Ms(146));
+        submit.marker = static_cast<uint8_t>(PacingSourceMarker::RenderSubmitStart);
+        g_joiner.AddSource(submit, Ms(146));
+        g_joiner.AddDisplay(Display(Ms(110), Ms(125), 20), Ms(126));
+        // Frame 21 lost its ID: both display instances of its present join.
+        g_joiner.AddDisplay(ping_display(Ms(125), Ms(140), Ms(115) + 200), Ms(141));
+        g_joiner.AddDisplay(ping_display(Ms(125), Ms(141), Ms(115) + 200), Ms(142));
+        g_joiner.AddDisplay(Display(Ms(140), Ms(155), 22), Ms(156));
+        // Frame 23 has no SIMULATION_START Source (frame 24's release is at
+        // RENDERSUBMIT_START): frame 22's Source belongs to another present.
+        g_joiner.AddDisplay(ping_display(Ms(155), Ms(170), Ms(147)), Ms(171));
+        // A generated frame has no PCL simulation start.
+        g_joiner.AddDisplay(Display(Ms(162), Ms(178)), Ms(179));
+        PacingJoinedRow rows[8];
+        bool ok = Check(TakeRows(Ms(500), false, rows, 8) == 6, "six display rows");
+        ok = Check(rows[0].join_rule == PacingJoinRule::PclFrameId && rows[0].key == Key(20),
+            "frame IDs still join by rule 2") && ok;
+        ok = Check(rows[1].join_rule == PacingJoinRule::PclSimulationStart && rows[1].key == Key(21) &&
+            rows[1].has_source && rows[1].source.release_qpc == Ms(115),
+            "a display without its frame ID joins the newest SIMULATION_START Source before its simulation start") && ok;
+        ok = Check(rows[2].join_rule == PacingJoinRule::PclSimulationStart && rows[2].key == Key(21),
+            "every display instance of that present joins the same Source") && ok;
+        ok = Check(rows[3].join_rule == PacingJoinRule::PclFrameId && rows[3].key == Key(22),
+            "the next frame joins by its ID") && ok;
+        ok = Check(rows[4].join_rule == PacingJoinRule::None && !rows[4].has_source,
+            "a Source joined by another present is never taken") && ok;
+        ok = Check(rows[5].join_rule == PacingJoinRule::None, "generated frames stay unjoined") && ok;
+        const PacingJoinStatistics statistics = g_joiner.Statistics();
+        return Check(statistics.rule_pcl_simulation_start == 2 && statistics.rule_pcl_frame_id == 2 &&
+                statistics.rule_none == 2,
+                "rule 3 joins counted apart from rule 2") && ok;
     }
 
     bool TestNoArrivalOrderGuessing()
@@ -651,6 +704,7 @@ int main()
     bool ok = TestRuleOneUniqueMatch();
     ok = TestRuleOneAmbiguity() && ok;
     ok = TestRuleTwoFallback() && ok;
+    ok = TestRuleThreeSimulationStart() && ok;
     ok = TestNoArrivalOrderGuessing() && ok;
     ok = TestUnjoinedPresentRows() && ok;
     ok = TestGateReadyReflexJoins() && ok;

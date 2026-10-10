@@ -80,9 +80,10 @@ namespace
             return governor.OnFrame(frame);
         }
 
-        void Demand(double demand_us, int count = 1)
+        // gpu_bound: the reports' GPU execution time is their largest stage.
+        void Demand(double demand_us, int count = 1, bool gpu_bound = false)
         {
-            for (int report = 0; report < count; ++report) governor.OnDemand(++sequence, demand_us);
+            for (int report = 0; report < count; ++report) governor.OnDemand(++sequence, demand_us, gpu_bound);
         }
 
         // Frames with one demand report each (none for 0); returns the last decision.
@@ -166,11 +167,11 @@ namespace
         // above 3 I are ignored.
         harness.Demand(9'000.0);
         harness.Run(1);
-        harness.governor.OnDemand(harness.sequence + 1, kNaN);
-        harness.governor.OnDemand(harness.sequence + 2, -1.0);
-        harness.governor.OnDemand(harness.sequence + 3, 9'000.0);
-        harness.governor.OnDemand(harness.sequence + 3, 9'000.0);
-        harness.governor.OnDemand(harness.sequence + 4, 31'000.0);
+        harness.governor.OnDemand(harness.sequence + 1, kNaN, false);
+        harness.governor.OnDemand(harness.sequence + 2, -1.0, false);
+        harness.governor.OnDemand(harness.sequence + 3, 9'000.0, false);
+        harness.governor.OnDemand(harness.sequence + 3, 9'000.0, false);
+        harness.governor.OnDemand(harness.sequence + 4, 31'000.0, false);
         CHECK(harness.governor.Statistics().ignored_demand == 5);
     }
 
@@ -335,6 +336,53 @@ namespace
             if (harness.Frame().cause == GovernorCause::Probe) break;
         }
         CHECK(frames >= 246 && frames <= 249);
+    }
+
+    // GPU execution time does not grow with the interval: while it binds most
+    // reports of the newest second no probe starts. Once a CPU stage binds
+    // the majority, the probe follows.
+    void TestNoProbeWhileGpuBinds()
+    {
+        Harness harness;
+        harness.Run(30, 12'000.0);
+        harness.Overload(12'000.0);
+        const double risen = harness.governor.TargetStretch();
+        CHECK_NEAR(risen, 1.08, 1e-9);
+        for (int frame = 0; frame < 1000; ++frame) {
+            harness.Demand(12'000.0, 1, true);
+            CHECK(harness.Frame().cause == GovernorCause::None);
+        }
+        CHECK(harness.governor.Statistics().probes == 0);
+        CHECK_NEAR(harness.governor.TargetStretch(), risen, 1e-9);
+        int frames = 1;
+        for (; frames <= 200; ++frames) {
+            harness.Demand(12'000.0);
+            if (harness.Frame().cause == GovernorCause::Probe) break;
+        }
+        CHECK(frames >= 50 && frames <= 52);
+        CHECK_NEAR(harness.governor.TargetStretch(), risen - 0.03, 1e-9);
+    }
+
+    // A release fall is judged for a calm second before a probe adds to it.
+    void TestProbeWaitsAfterRelease()
+    {
+        Harness harness;
+        harness.Run(30, 12'000.0);
+        for (int frame = 0; frame < 200 && harness.Target() < 12'000.0; ++frame) {
+            harness.Demand(12'000.0);
+            harness.Frame(false, true);
+        }
+        const double risen = harness.Target();
+        CHECK_NEAR(risen, 12'000.0 + 0.03 * 11'600.0, 1e-6);
+        // Demand drops: headroom, then a fall to Q + m that leaves no headroom.
+        CHECK(harness.RunUntil(GovernorCause::Release, 1000, 11'000.0) > 0);
+        CHECK_NEAR(harness.Target(), 11'000.0 + 0.03 * risen, 1e-6);
+        int frames = 1;
+        for (; frames <= 300; ++frames) {
+            harness.Demand(11'000.0);
+            if (harness.Frame().cause == GovernorCause::Probe) break;
+        }
+        CHECK(frames >= 100 && frames <= 101);
     }
 
     // Recurring loads: each episode of the last 20 s holds a rise 1.5 s
@@ -605,6 +653,8 @@ int main()
     TestDemandFall();
     TestProbesBelowCoupledDemand();
     TestFailedProbeBacksOff();
+    TestNoProbeWhileGpuBinds();
+    TestProbeWaitsAfterRelease();
     TestRecurringLoadHolds();
     TestHitchReports();
     TestMaximumStretch();

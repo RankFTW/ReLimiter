@@ -64,7 +64,7 @@ CLASSIFICATION_GENERATED = 2
 CPU_HOLD_OUTPUT_KINDS = frozenset({2, 3, 5})  # MarkerCpuHold, NativeCpuHold, GpuCpuPresent
 
 ROW_KIND_NAMES = {1: "display_sample", 2: "unjoined_present"}
-JOIN_RULE_NAMES = {0: "none", 1: "present_attribution", 2: "pcl_frame_id"}
+JOIN_RULE_NAMES = {0: "none", 1: "present_attribution", 2: "pcl_frame_id", 3: "pcl_simulation_start"}
 OUTPUT_KIND_NAMES = {0: "unknown", 1: "none", 2: "marker_cpu_hold", 3: "native_cpu_hold",
                      4: "gpu_queue_wait", 5: "gpu_cpu_present", 6: "fg_input_wait"}
 CLOCK_MAP_STATUS_NAMES = {0: "unknown", 1: "warming", 2: "stable", 3: "unstable"}

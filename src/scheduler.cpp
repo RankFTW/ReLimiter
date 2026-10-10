@@ -1195,7 +1195,11 @@ static GovernorDecision UpdatePeriodGovernor(
         // that idle residence back as workload demand; skip the report when
         // execution-only evidence is unavailable.
         if (gpu_hold && !sample.gpu_execution_available) continue;
-        s_period_governor.OnDemand(sample.sequence, sample.workload_demand_us);
+        // GPU-bound: the report's GPU execution time (frame generation
+        // included) is its largest stage; it does not grow with the interval,
+        // so no probe can shorten it (period_governor.h).
+        s_period_governor.OnDemand(sample.sequence, sample.workload_demand_us,
+            sample.gpu_execution_available && sample.gpu_service_us >= sample.workload_demand_us);
     }
 
     frame.qpc = QpcNow();

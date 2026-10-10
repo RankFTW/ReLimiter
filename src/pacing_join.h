@@ -22,7 +22,11 @@ constexpr uint64_t PACING_JOIN_DISPLAY_GRACE_MS = 100;     // late Present publi
 enum class PacingJoinRule : uint8_t {
     None = 0,
     PresentAttribution = 1,
-    PclFrameId = 2
+    PclFrameId = 2,
+    // A display whose PCL record has a simulation start but no frame ID: the
+    // newest SIMULATION_START Source released at or before that simulation
+    // start (PacingJoiner, rule 3).
+    PclSimulationStart = 3
 };
 
 // Worker-side facts about a display sample that PacingDisplaySample does not carry.
@@ -94,6 +98,7 @@ struct PacingJoinStatistics {
     uint64_t display_samples = 0;
     uint64_t rule_present_attribution = 0;
     uint64_t rule_pcl_frame_id = 0;
+    uint64_t rule_pcl_simulation_start = 0; // rule 3; the events CSV counts it with rule 2
     uint64_t rule_none = 0;
     uint64_t present_unique = 0;
     uint64_t present_ambiguous = 0;
@@ -199,7 +204,15 @@ private:
         uint64_t last_use = 0;
     };
 
-    using RetainedSource = Retained<PacingSourceRecord>;
+    // A Source, and the present start of the display samples that joined it
+    // (a Present's display instances share one), so rule 3 never gives a
+    // Source to the display of another present.
+    struct RetainedSource {
+        PacingSourceRecord record{};
+        int64_t received_qpc = 0;
+        bool display_joined = false;
+        uint64_t joined_present_start_qpc = 0;
+    };
     using RetainedGate = Retained<PacingGateJoin>;
     using RetainedReady = Retained<PacingReadyRecord>;
     using RetainedReflex = Retained<PacingReflexRecord>;
@@ -211,7 +224,9 @@ private:
     void BuildUnjoinedRow(RetainedPresent* entry, PacingJoinedRow* row) noexcept;
     RetainedPresent* FindPresentForDisplay(
         const PacingDisplaySample& sample, uint32_t* candidates) noexcept;
-    const RetainedSource* FindSourceByPclFrameId(uint32_t pcl_frame_id) const noexcept;
+    RetainedSource* FindSourceByPclFrameId(uint32_t pcl_frame_id) noexcept;
+    RetainedSource* FindSourceByPclSimulationStart(const PacingDisplaySample& sample) noexcept;
+    void JoinDisplaySource(PacingJoinedRow* row, RetainedSource* source) noexcept;
     void AttachSourceByKey(PacingJoinedRow* row) noexcept;
     void AttachWorkerRecords(PacingJoinedRow* row) noexcept;
     bool DisplayNoLongerExpected(const PacingPresentRecord& record) const noexcept;
@@ -233,7 +248,7 @@ private:
     uint64_t swapchain_use_clock_ = 0;
     uint64_t unjoined_cursor_ = 0; // first Present sequence that may still need a decision
 
-    // Rule 2 considers only the (domain, producer epoch) of the newest
+    // Rules 2 and 3 consider only the (domain, producer epoch) of the newest
     // NvAPI or PCL marker Source record; synthetic IDs never match PCL IDs.
     bool marker_epoch_valid_ = false;
     PacingIdentityDomain marker_domain_ = PacingIdentityDomain::Unknown;

@@ -119,6 +119,7 @@ void PeriodGovernor::ResetState(bool settle) noexcept
     last_rise_qpc_ = 0;
     headroom_since_qpc_ = 0;
     last_probe_qpc_ = 0;
+    last_fall_qpc_ = 0;
     probe_backoff_ = 1.0;
     probe_step_ = GOVERNOR_PROBE_STEP;
     probing_from_stretch_ = 0.0;
@@ -129,7 +130,7 @@ void PeriodGovernor::ResetState(bool settle) noexcept
 
 // ── Inputs ──
 
-void PeriodGovernor::OnDemand(uint64_t sequence, double demand_us) noexcept
+void PeriodGovernor::OnDemand(uint64_t sequence, double demand_us, bool gpu_bound) noexcept
 {
     if ((has_sequence_ && sequence <= last_sequence_) || !IsPositiveFinite(demand_us)) {
         ++statistics_.ignored_demand;
@@ -151,6 +152,7 @@ void PeriodGovernor::OnDemand(uint64_t sequence, double demand_us) noexcept
     }
     demand_us_[demand_head_] = demand_us;
     demand_qpc_[demand_head_] = 0;
+    demand_gpu_[demand_head_] = gpu_bound ? 1 : 0;
     demand_head_ = (demand_head_ + 1) % static_cast<uint32_t>(GOVERNOR_DEMAND_CAPACITY);
     if (demand_count_ < GOVERNOR_DEMAND_CAPACITY) ++demand_count_;
 }
@@ -358,6 +360,7 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
                 if (next_us < target_us - kStretchEpsilon * base_us) {
                     target_stretch_ = next_us / base_us;
                     probing_from_stretch_ = 0.0;
+                    last_fall_qpc_ = qpc;
                     ++statistics_.falls;
                     reported = GovernorCause::Release;
                 }
@@ -370,7 +373,9 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
 
     // 5. Probe below the demand after a calm stretch: a measurement that
     // grows with the interval cannot hold the interval up. A probe that
-    // stayed calm for a second held.
+    // stayed calm for a second held. A probe waits a calm second after any
+    // fall, so a release is judged before a probe adds to it, and never
+    // starts while GPU work binds the demand (period_governor.h).
     const double calm_s = since(last_evidence_qpc_);
     if (probing_from_stretch_ > 0.0 && calm_s >= GOVERNOR_PROBE_CALM_S &&
         since(last_probe_qpc_) >= GOVERNOR_PROBE_CALM_S) {
@@ -380,10 +385,12 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
     }
     // Demand headroom being timed falls to the demand instead.
     if (target_stretch_ > 1.0 + kStretchEpsilon && !holding && headroom_since_qpc_ == 0 &&
-        calm_s >= GOVERNOR_PROBE_CALM_S * probe_backoff_ && since(last_probe_qpc_) >= GOVERNOR_PROBE_CALM_S) {
+        calm_s >= GOVERNOR_PROBE_CALM_S * probe_backoff_ && since(last_fall_qpc_) >= GOVERNOR_PROBE_CALM_S &&
+        !GpuBindsDemand()) {
         probing_from_stretch_ = target_stretch_;
         target_stretch_ = std::max(1.0, target_stretch_ - probe_step_);
         last_probe_qpc_ = qpc;
+        last_fall_qpc_ = qpc;
         ++statistics_.falls;
         ++statistics_.probes;
         reported = GovernorCause::Probe;
@@ -478,6 +485,28 @@ bool PeriodGovernor::DemandQuantile(double quantile, uint32_t newest, uint32_t m
     std::sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(count));
     *demand_us = PacingMetrics_QuantileOfSorted(sorted.data(), count, quantile);
     return true;
+}
+
+bool PeriodGovernor::GpuBindsDemand() const noexcept
+{
+    if (last_demand_qpc_ == 0 || frame_qpc_ == 0 ||
+        PacingQpc_ElapsedSeconds(last_demand_qpc_, frame_qpc_, frame_frequency_) >= GOVERNOR_DEMAND_STALE_S) {
+        return false;
+    }
+    uint32_t count = 0;
+    uint32_t gpu_bound = 0;
+    for (uint32_t index = 0; index < demand_count_; ++index) {
+        const uint32_t slot = (demand_head_ + static_cast<uint32_t>(GOVERNOR_DEMAND_CAPACITY) - 1u - index) %
+            static_cast<uint32_t>(GOVERNOR_DEMAND_CAPACITY);
+        const int64_t stamped = demand_qpc_[slot];
+        if (stamped != 0 &&
+            PacingQpc_ElapsedSeconds(stamped, frame_qpc_, frame_frequency_) >= GOVERNOR_DEMAND_SLOW_S) {
+            break;
+        }
+        ++count;
+        gpu_bound += demand_gpu_[slot];
+    }
+    return count >= GOVERNOR_DEMAND_SLOW_MIN_REPORTS && 2u * gpu_bound > count;
 }
 
 double PeriodGovernor::MarginUs(double interval_us) noexcept

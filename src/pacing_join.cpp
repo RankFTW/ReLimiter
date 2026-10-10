@@ -1,5 +1,7 @@
 #include "pacing_join.h"
 
+#include "pacing_core_types.h"
+
 namespace
 {
     int64_t MillisecondsToTicks(uint64_t milliseconds, uint64_t qpc_frequency) noexcept
@@ -35,6 +37,17 @@ namespace
     // Newest-first scan; returns the most recent entry accepted by the predicate.
     template <typename Ring, typename Predicate>
     auto FindNewest(const Ring& ring, Predicate predicate) noexcept -> decltype(&ring.Oldest())
+    {
+        for (uint64_t sequence = ring.TailSequence(); sequence > ring.HeadSequence();) {
+            --sequence;
+            if (predicate(ring.At(sequence).record)) return &ring.At(sequence);
+        }
+        return nullptr;
+    }
+
+    // FindNewest for a ring the caller may modify.
+    template <typename Ring, typename Predicate>
+    auto FindNewestMutable(Ring& ring, Predicate predicate) noexcept -> decltype(&ring.Oldest())
     {
         for (uint64_t sequence = ring.TailSequence(); sequence > ring.HeadSequence();) {
             --sequence;
@@ -293,19 +306,22 @@ void PacingJoiner::BuildDisplayRow(const PacingDisplaySample& sample, PacingJoin
         state->joined_present_start_qpc = sample.present_start_qpc;
     }
 
-    // Rule 2 applies only when the Present attribution is unavailable.
+    // Rules 2 and 3 apply only when the Present attribution is unavailable.
     if (row->has_present && PacingFrameKey_IsValid(row->present.key)) {
         row->key = row->present.key;
         row->join_rule = PacingJoinRule::PresentAttribution;
         ++statistics_.rule_present_attribution;
         AttachSourceByKey(row);
     }
-    else if (const RetainedSource* source = FindSourceByPclFrameId(sample.pcl_frame_id)) {
-        row->key = source->record.key;
+    else if (RetainedSource* source = FindSourceByPclFrameId(sample.pcl_frame_id)) {
         row->join_rule = PacingJoinRule::PclFrameId;
-        row->has_source = true;
-        row->source = source->record;
         ++statistics_.rule_pcl_frame_id;
+        JoinDisplaySource(row, source);
+    }
+    else if (RetainedSource* simulation_source = FindSourceByPclSimulationStart(sample)) {
+        row->join_rule = PacingJoinRule::PclSimulationStart;
+        ++statistics_.rule_pcl_simulation_start;
+        JoinDisplaySource(row, simulation_source);
     }
     else {
         ++statistics_.rule_none;
@@ -353,28 +369,69 @@ PacingJoiner::RetainedPresent* PacingJoiner::FindPresentForDisplay(
     return *candidates == 1 ? match : nullptr;
 }
 
-const PacingJoiner::RetainedSource* PacingJoiner::FindSourceByPclFrameId(
-    uint32_t pcl_frame_id) const noexcept
+PacingJoiner::RetainedSource* PacingJoiner::FindSourceByPclFrameId(uint32_t pcl_frame_id) noexcept
 {
     if (pcl_frame_id == 0 || !marker_epoch_valid_) return nullptr;
-    return FindNewest(sources_, [this, pcl_frame_id](const PacingSourceRecord& record) {
+    return FindNewestMutable(sources_, [this, pcl_frame_id](const PacingSourceRecord& record) {
         return record.key.domain == marker_domain_ &&
             record.key.producer_epoch == marker_epoch_ &&
             static_cast<uint32_t>(record.key.frame_id) == pcl_frame_id;
     });
 }
 
+// Rule 3. PresentMon creates a frame's PCL timing record without its frame ID
+// when the PC latency ping is the frame's first PCL marker, so that display
+// carries the frame's PCL simulation start but frame ID 0. The game emits the
+// SIMULATION_START event inside the marker call ReLimiter forwards at the
+// frame's release, after this frame's release and before the next frame's:
+// the frame is the newest SIMULATION_START Source of the current marker epoch
+// released at or before that simulation start. A Source that a display of
+// another present already joined means this frame has no Source record (not
+// released at SIMULATION_START), and the row stays unjoined.
+PacingJoiner::RetainedSource* PacingJoiner::FindSourceByPclSimulationStart(
+    const PacingDisplaySample& sample) noexcept
+{
+    if (sample.pcl_frame_id != 0 || sample.pcl_sim_start_qpc == 0 || sample.present_start_qpc == 0 ||
+        !marker_epoch_valid_) {
+        return nullptr;
+    }
+    const int64_t simulation_start_qpc = static_cast<int64_t>(sample.pcl_sim_start_qpc);
+    RetainedSource* source = FindNewestMutable(sources_,
+        [this, simulation_start_qpc](const PacingSourceRecord& record) {
+            return record.key.domain == marker_domain_ &&
+                record.key.producer_epoch == marker_epoch_ &&
+                record.marker == static_cast<uint8_t>(PacingSourceMarker::SimulationStart) &&
+                record.release_qpc > 0 && record.release_qpc <= simulation_start_qpc;
+        });
+    if (source == nullptr ||
+        (source->display_joined && source->joined_present_start_qpc != sample.present_start_qpc)) {
+        return nullptr;
+    }
+    return source;
+}
+
+// A display row takes the Source and claims it for its present.
+void PacingJoiner::JoinDisplaySource(PacingJoinedRow* row, RetainedSource* source) noexcept
+{
+    row->key = source->record.key;
+    row->has_source = true;
+    row->source = source->record;
+    if (row->has_display && !source->display_joined) {
+        source->display_joined = true;
+        source->joined_present_start_qpc = row->display.present_start_qpc;
+    }
+}
+
 void PacingJoiner::AttachSourceByKey(PacingJoinedRow* row) noexcept
 {
     const PacingFrameKey key = row->key;
-    const RetainedSource* source = FindNewest(sources_,
+    RetainedSource* source = FindNewestMutable(sources_,
         [&key](const PacingSourceRecord& record) { return record.key == key; });
     if (source == nullptr) {
         ++statistics_.source_missing;
         return;
     }
-    row->has_source = true;
-    row->source = source->record;
+    JoinDisplaySource(row, source);
 }
 
 void PacingJoiner::AttachWorkerRecords(PacingJoinedRow* row) noexcept
