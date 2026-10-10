@@ -608,7 +608,7 @@ static void ApplyHoldTransition(const HoldFeasibilityTransition& transition) noe
     if (!transition.changed) return;
     s_feasibility_cause = transition.cause;
     if (transition.cause == FeasibilityCause::Overload) {
-        LOG_WARN("Hold feasibility: overload, %u of %u frames restarted the cadence in %.1f s; holds off until %.0f s pass without restarts",
+        LOG_INFO("Hold feasibility: overload, %u of %u frames restarted the cadence in %.1f s; holds off until %.0f s pass without restarts",
                  transition.misses, transition.frames, transition.elapsed_s, MISS_WINDOW_S);
         return;
     }
@@ -1887,7 +1887,7 @@ void OnMarker(
     const bool suspended = !IsSwapchainValid();
     if (suspended != s_suspended) {
         s_suspended = suspended;
-        if (suspended) LOG_WARN("Scheduler: swapchain invalid, pacing suspended");
+        if (suspended) LOG_INFO("Scheduler: swapchain invalid, pacing suspended");
         else LOG_INFO("Scheduler: swapchain valid, pacing resumed");
     }
     if (suspended) {
@@ -1909,7 +1909,7 @@ void OnMarker(
         NativeGate_PublishNoFrameGeneration(false, 0);
         static bool s_dmfg_logged = false;
         if (!s_dmfg_logged) {
-            LOG_WARN("DMFG active — passthrough/cap mode");
+            LOG_INFO("DMFG active — passthrough/cap mode");
             s_dmfg_logged = true;
         }
         runtime.dmfg_passthrough = true;

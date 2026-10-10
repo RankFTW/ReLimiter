@@ -243,7 +243,7 @@ ULONG NativePclEtw_StartSession(
     }
 
     InitializeRealtimeTimestampState(session, trace_properties);
-    LOG_WARN(
+    LOG_INFO(
         "Native PCL: source-owned ETW session active "
         "(buffer_kb=%lu, minimum_buffers=%lu, maximum_buffers=%lu, "
         "initial_pool_mib=%lu, maximum_pool_mib=%lu, "

@@ -295,7 +295,7 @@ struct NativePclDxgkrnlEventIsolation::Implementation
         restore_attempted = false;
         restore_succeeded = false;
         observation_baseline_established = false;
-        LOG_WARN(
+        LOG_INFO(
             "Native PCL: DxgKrnl admission filter active "
             "(excluded=queue_packet_start_2, retained_events=%lu, "
             "event_isolation=armed)",
@@ -329,7 +329,7 @@ struct NativePclDxgkrnlEventIsolation::Implementation
                 baseline_events_per_second = EventsPerSecond(
                     event_delta,
                     duration_ms);
-                LOG_WARN(
+                LOG_INFO(
                     "Native PCL: DxgKrnl event isolation started "
                     "(baseline_rate=%.1f events/s, lost=%lu, "
                     "candidates=%lu)",
@@ -350,7 +350,7 @@ struct NativePclDxgkrnlEventIsolation::Implementation
                 measurement_started_events_lost = status.mEtwEventsLost;
                 phase = Phase::Measuring;
                 if (control_stage) {
-                    LOG_WARN(
+                    LOG_INFO(
                         "Native PCL: DxgKrnl event isolation measuring "
                         "(stage=dxgkrnl_off, starting_lost=%lu)",
                         measurement_started_events_lost);
@@ -358,7 +358,7 @@ struct NativePclDxgkrnlEventIsolation::Implementation
                 else {
                     const auto& definition =
                         kDxgkrnlEventDefinitions[current_exclusion_index];
-                    LOG_WARN(
+                    LOG_INFO(
                         "Native PCL: DxgKrnl event isolation measuring "
                         "(excluded=%s, event_id=%u, starting_lost=%lu)",
                         definition.event_name,
@@ -378,7 +378,7 @@ struct NativePclDxgkrnlEventIsolation::Implementation
                     return false;
                 }
                 phase = Phase::Complete;
-                LOG_WARN(
+                LOG_INFO(
                     "Native PCL: DxgKrnl event isolation complete "
                     "(baseline_rate=%.1f events/s, lowest_excluded=%s, "
                     "lowest_rate=%.1f events/s, dxgkrnl_off_rate=%.1f "
@@ -433,7 +433,7 @@ struct NativePclDxgkrnlEventIsolation::Implementation
         control_stage = false;
         phase = Phase::Settling;
         phase_started_ms = GetTickCount64();
-        LOG_WARN(
+        LOG_INFO(
             "Native PCL: DxgKrnl event isolation stage started "
             "(excluded=%s, event_id=%u)",
             kDxgkrnlEventDefinitions[exclusion_index].event_name,
@@ -465,7 +465,7 @@ struct NativePclDxgkrnlEventIsolation::Implementation
         control_stage = true;
         phase = Phase::Settling;
         phase_started_ms = GetTickCount64();
-        LOG_WARN(
+        LOG_INFO(
             "Native PCL: DxgKrnl event isolation stage started "
             "(stage=dxgkrnl_off)");
         return true;
@@ -615,7 +615,7 @@ struct NativePclDxgkrnlEventIsolation::Implementation
 
         if (control_stage) {
             control_events_per_second = events_per_second;
-            LOG_WARN(
+            LOG_INFO(
                 "Native PCL: DxgKrnl event isolation result "
                 "(stage=dxgkrnl_off, lost_delta=%llu, duration_ms=%llu, "
                 "rate=%.1f events/s, buffers=%lu/%lu, fill=%.1f%%)",
@@ -634,7 +634,7 @@ struct NativePclDxgkrnlEventIsolation::Implementation
         }
         const auto& definition =
             kDxgkrnlEventDefinitions[current_exclusion_index];
-        LOG_WARN(
+        LOG_INFO(
             "Native PCL: DxgKrnl event isolation result "
             "(excluded=%s, event_id=%u, lost_delta=%llu, "
             "duration_ms=%llu, rate=%.1f events/s, buffers=%lu/%lu, "

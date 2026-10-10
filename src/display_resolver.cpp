@@ -231,7 +231,7 @@ void DispRes_OnSwapchainInit(uint64_t native_handle, ActiveAPI api, HWND hwnd) {
         s_resolved.store(true, std::memory_order_release);
 
         // Trigger VRR state refresh on successful resolution (Req 2.5)
-        LOG_WARN("DispRes: resolved Display_ID=%u, triggering VRR refresh + G-Sync poll", new_id);
+        LOG_INFO("DispRes: resolved Display_ID=%u, triggering VRR refresh + G-Sync poll", new_id);
         QueryVRRCeiling();
         QueryVRRFloor();
         PollGSyncState();

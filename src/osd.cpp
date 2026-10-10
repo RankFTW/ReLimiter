@@ -554,7 +554,7 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
             IM_ARRAYSIZE(kMarkerForwardOrderLabels))) {
         g_config.marker_forward_order = static_cast<PacingMarkerForwardOrder>(forward_order);
         Config_ApplyPacingPipeline();
-        LOG_WARN("OSD: NvAPI marker forward order -> %s",
+        LOG_INFO("OSD: NvAPI marker forward order -> %s",
             PacingMarkerForwardOrder_Text(g_config.marker_forward_order));
         *config_dirty = true;
     }
@@ -569,7 +569,7 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
             IM_ARRAYSIZE(kRenderQueueLabels))) {
         g_config.gpu_queue_wait_render_queue = static_cast<PacingRenderQueue>(render_queue);
         Config_ApplyPacingPipeline();
-        LOG_WARN("OSD: GPU queue wait render queue -> %s",
+        LOG_INFO("OSD: GPU queue wait render queue -> %s",
             PacingRenderQueue_Text(g_config.gpu_queue_wait_render_queue));
         *config_dirty = true;
     }
@@ -587,7 +587,7 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
             IM_ARRAYSIZE(kSourcePlacementLabels))) {
         g_config.source_placement = static_cast<PacingPlacementOverride>(placement);
         Config_ApplyPacingPipeline();
-        LOG_WARN("OSD: source placement -> %s",
+        LOG_INFO("OSD: source placement -> %s",
             PacingPlacementOverride_Text(g_config.source_placement));
         *config_dirty = true;
     }

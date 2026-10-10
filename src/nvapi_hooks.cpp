@@ -98,7 +98,7 @@ static void LogMarkerRejection(
     g_nvapi_marker_census.Record(static_cast<uint32_t>(marker->markerType),MarkerCensusStage::Rejected,
         {marker->frameID,reinterpret_cast<uint64_t>(incoming),0,census_now.QuadPart,
         GetCurrentThreadId(),0,static_cast<uint32_t>(reason),0});
-    // One warning per fixed reason for the process lifetime, not per device,
+    // One line per fixed reason for the process lifetime, not per device,
     // frame, epoch or caller. No dynamic reason table on the marker path.
     static std::atomic<uint32_t> s_logged_reasons{ 0 };
     const uint32_t bit = 1u << static_cast<uint32_t>(reason);
@@ -111,7 +111,7 @@ static void LogMarkerRejection(
         "post_forward_stale_token", "scheduler_owner_busy_or_reentrant",
         "post_owner_stale_token", "enforcement_stale_token", "gate_stale_token"
     };
-    LOG_WARN("NvAPI: marker local rejection reason=%s incoming=%p selected=%p "
+    LOG_INFO("NvAPI: marker local rejection reason=%s incoming=%p selected=%p "
              "api=%u type=%u frameID=%llu (forwarding unchanged)",
              names[static_cast<uint32_t>(reason)], static_cast<void*>(incoming),
              static_cast<void*>(selected), static_cast<unsigned>(SwapMgr_GetActiveAPI()),
@@ -582,7 +582,7 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
     if (NvAPI_CaptureFeedbackDevice(pDev)) {
         static std::atomic<bool> s_logged_device_capture{ false };
         if (!s_logged_device_capture.exchange(true, std::memory_order_relaxed)) {
-            LOG_WARN(
+            LOG_INFO(
                 "NvAPI: SetSleepMode first call — device captured, interval=%u us",
                 params_valid ? params_snapshot.minimumIntervalUs : 0);
         }
@@ -753,7 +753,7 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
     const bool from_rtss = CallerIsRTSS(return_address);
     static std::atomic<bool> s_first_marker{ true };
     if (s_first_marker.exchange(false, std::memory_order_relaxed)) {
-        LOG_WARN("NvAPI: First marker received — type=%u, frameID=%llu, source=%s",
+        LOG_INFO("NvAPI: First marker received — type=%u, frameID=%llu, source=%s",
                  marker_params.markerType, marker_params.frameID,
                  from_rtss ? "RTSS" : "direct");
     }
@@ -762,7 +762,7 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
     // Some games (Streamline/DLSS-G) never call SetSleepMode through NvAPI,
     // so g_dev stays null. The marker hook always receives the device.
     if (NvAPI_CaptureFeedbackDevice(dev)) {
-        LOG_WARN("NvAPI: presenting device captured/replaced from SetLatencyMarker");
+        LOG_INFO("NvAPI: presenting device captured/replaced from SetLatencyMarker");
     }
     const FeedbackDeviceGuard marker_device(dev, &marker_params);
 
@@ -814,7 +814,7 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
             frame_key.producer_epoch, frame_key.controller_generation, marker_params.markerType})) {
             static std::atomic<bool> logged_overflow{false};
             if (!logged_overflow.exchange(true, std::memory_order_relaxed)) {
-                LOG_WARN("NvAPI: deferred diagnostic marker queue full; diagnostics dropped, enforcement unaffected");
+                LOG_INFO("NvAPI: deferred diagnostic marker queue full; diagnostics dropped, enforcement unaffected");
             }
         }
         // SIMULATION_END and PRESENT_END of a planned frame reach the lead
@@ -943,7 +943,7 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
         if (!s_logged_rtss_simulation_start.exchange(
                 true,
                 std::memory_order_relaxed)) {
-            LOG_WARN(
+            LOG_INFO(
                 "NvAPI: accepting RTSS SIMULATION_START to complete direct game marker stream "
                 "(direct_markers=%llu, rtss_sim_starts=%llu)",
                 s_marker_policy.DirectMarkerCount(),
@@ -990,7 +990,7 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
         // which is the most common alternative marker games send.
         s_enforcement_marker.store(RENDERSUBMIT_START, std::memory_order_relaxed);
         enforcement_marker = RENDERSUBMIT_START;
-        LOG_WARN("NvAPI: enforcement marker fallback — no admitted SIMULATION_START before threshold, "
+        LOG_INFO("NvAPI: enforcement marker fallback — no admitted SIMULATION_START before threshold, "
                  "switching to RENDERSUBMIT_START (direct_markers=%llu, "
                  "rtss_sim_starts=%llu)",
                  s_marker_policy.DirectMarkerCount(),
@@ -1003,7 +1003,7 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
         s_marker_promotion.Observe(marker_params.frameID,ts.QuadPart,GetQPCFrequency())) {
         s_enforcement_marker.store(SIMULATION_START,std::memory_order_relaxed);
         enforcement_marker=SIMULATION_START;
-        LOG_WARN("NvAPI: restoring configured SIMULATION_START after 8 consecutive direct markers "
+        LOG_INFO("NvAPI: restoring configured SIMULATION_START after 8 consecutive direct markers "
             "frameID=%llu producer=%u thread=%u (RenderSubmit fallback retired)",
             marker_params.frameID,marker_policy_epoch,GetCurrentThreadId());
     }
@@ -1057,7 +1057,7 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
         if (!s_logged_native_enforcement.exchange(true, std::memory_order_relaxed)) {
             // OnMarker has no result: this proves dispatch/completion, not that
             // a sleep occurred or a frame plan was published on this frame.
-            LOG_WARN("NvAPI: first native marker enforcement scheduler call completed "
+            LOG_INFO("NvAPI: first native marker enforcement scheduler call completed "
                      "source=%s type=%u frameID=%llu incoming=%p published=%p "
                      "epoch=%u publication=%llu",
                      from_rtss ? "RTSS" : "direct",

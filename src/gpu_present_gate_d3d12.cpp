@@ -1024,14 +1024,14 @@ void GpuPresent_DrainDiagnostics() noexcept {
     // Called under the existing FG diagnostic worker's single-consumer lock.
     IdentityDiagnostic record;
     for(unsigned index=0;index<4 && identity_diagnostics.Pop(&record);++index) {
-        LOG_WARN("GPU identity: stage=%s qpc=%lld frequency=%lld thread=%u source=%llu queue=%llu ticket=%llu mask=0x%llx checked=0x%llx",
+        LOG_INFO("GPU identity: stage=%s qpc=%lld frequency=%lld thread=%u source=%llu queue=%llu ticket=%llu mask=0x%llx checked=0x%llx",
             record.stage,record.qpc,frequency,record.thread,record.source,record.queue,record.ticket,record.mask,record.checked);
         for(size_t field=0;field<record.expected.size();++field) {
             if(!(record.mask&(1ull<<field)))continue;
-            LOG_WARN("GPU identity mismatch: qpc=%lld field=%s expected=%llu actual=%llu",
+            LOG_INFO("GPU identity mismatch: qpc=%lld field=%s expected=%llu actual=%llu",
                 record.qpc,identity_fields[field],record.expected[field],record.actual[field]);
         }
-        LOG_WARN("GPU identity context: qpc=%lld native=%llu/%llu swapchain=%llu/%llu controller=%llu/%llu producer=%llu/%llu observer=%llu/%llu prediction=%llu/%llu settings=%llu/%llu h3_rung=%llu/%llu multiplier=%llu/%llu fg_epoch=%llu/%llu binding=%llu/%llu retired=%llu",
+        LOG_INFO("GPU identity context: qpc=%lld native=%llu/%llu swapchain=%llu/%llu controller=%llu/%llu producer=%llu/%llu observer=%llu/%llu prediction=%llu/%llu settings=%llu/%llu h3_rung=%llu/%llu multiplier=%llu/%llu fg_epoch=%llu/%llu binding=%llu/%llu retired=%llu",
             record.qpc,record.expected[7],record.actual[7],record.expected[15],record.actual[15],
             record.expected[13],record.actual[13],record.expected[14],record.actual[14],
             record.expected[11],record.actual[11],record.expected[12],record.actual[12],
@@ -1042,7 +1042,7 @@ void GpuPresent_DrainDiagnostics() noexcept {
     static uint64_t last_dropped=0,last_suppressed=0;
     const auto dropped=identity_diagnostics.DroppedValues(),suppressed=identity_suppressed.load(std::memory_order_relaxed);
     if(dropped!=last_dropped || suppressed!=last_suppressed) {
-        LOG_WARN("GPU identity diagnostic totals: dropped=%llu suppressed=%llu",dropped,suppressed);
+        LOG_INFO("GPU identity diagnostic totals: dropped=%llu suppressed=%llu",dropped,suppressed);
         last_dropped=dropped;last_suppressed=suppressed;
     }
 }

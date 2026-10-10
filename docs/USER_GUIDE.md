@@ -700,7 +700,7 @@ If scripts are blocked on a managed computer, follow your organization's policy.
 
 ### Advanced Logging
 
-Enable **Advanced Logging** before reproducing a problem to include more detail in `relimiter_<GameName>.log` in the game directory. Logging preferences are saved; turn detailed logging off when it is no longer needed.
+At the default level (`log_level=warn`) `relimiter_<GameName>.log` in the game directory records only warnings and errors: something failed, data was lost, an INI value was invalid, or a developer diagnostic is on. Enable **Advanced Logging** (`info`) before reproducing a problem to also record what ReLimiter decided along the way: device and swapchain changes, the pacing route, pauses of the hold for overload and the render handoff limit. Logging preferences are saved; turn detailed logging off when it is no longer needed.
 
 ---
 

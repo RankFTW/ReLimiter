@@ -362,7 +362,7 @@ static void on_present_impl(reshade::api::command_queue* queue,
                     DispRes_OnSwapchainInit(reinterpret_cast<uint64_t>(native),
                                             api, SwapMgr_GetHWND());
                 }
-                LOG_WARN("on_present: captured presenting swapchain %p (hwnd=%p, api=%d, "
+                LOG_INFO("on_present: captured presenting swapchain %p (hwnd=%p, api=%d, "
                          "ptr_changed=%d, api_changed=%d, recapture=%d)",
                          native, SwapMgr_GetHWND(), static_cast<int>(api),
                          pointer_changed, api_changed, recapture);
@@ -567,7 +567,7 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         HWMonitor_Init();
         s_hw_monitor_started = true;
         if (g_config.dlss_info_hooks) NGXHooks_Init();
-        else LOG_WARN("DLSS info hooks disabled by user config");
+        else LOG_INFO("DLSS info hooks disabled by user config");
         Blackout_Init();
         s_blackout_started = true;
 

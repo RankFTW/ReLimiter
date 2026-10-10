@@ -992,7 +992,8 @@ static void FlushFiles()
     if (s_pacing_events_file) fflush(s_pacing_events_file);
 }
 
-// Process-lifetime NvAPI marker census, logged at most every 5 s when a count changed.
+// Process-lifetime NvAPI marker census, logged (debug level) at most every 5 s
+// when a count changed.
 using MarkerCensusCounts = std::array<uint64_t, NvApiMarkerCensus::Types * 4>;
 
 static void LogNvApiMarkerCensus(int64_t now_qpc, int64_t* last_qpc, MarkerCensusCounts* counts)
@@ -1010,7 +1011,7 @@ static void LogNvApiMarkerCensus(int64_t now_qpc, int64_t* last_qpc, MarkerCensu
             logged_count = snapshot.count;
             const auto& first = snapshot.first;
             const auto& last = snapshot.last;
-            LOG_WARN("NvAPI census type=%u stage=%u count=%llu sample_misses=%llu "
+            LOG_DEBUG("NvAPI census type=%u stage=%u count=%llu sample_misses=%llu "
                 "first_frame=%llu first_qpc=%lld first_caller=0x%llx first_device=0x%llx "
                 "last_frame=%llu last_qpc=%lld caller=0x%llx device=0x%llx thread=%u producer=%u reason=%u selected=%u frequency=%llu",
                 type, stage, snapshot.count, snapshot.misses, first.frame, first.qpc, first.caller, first.device,

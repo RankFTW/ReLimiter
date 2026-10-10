@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed (quieter default log, 2026-10-10)
+
+- **The default log (`log_level=warn`) records only warnings and errors.** 43 messages that report normal events moved from warning to info level: the first Reflex marker, device and swapchain capture, display and VRR detection, G-Sync changes, DLSS profile presets, Reflex marker route changes, overload pauses, pacing suspended on an invalid swapchain, Dynamic MFG passthrough, developer-setting changes in the OSD, GPU identity diagnostics and the PC latency collector's session lines. The NvAPI marker census moved to debug level; it was 8,514 of 19,104 lines in a Rogue Core log. "Display_Resolver has no Display_ID" is a warning only when it persists to the fifth poll. In the latest CONTROL Resonant and Rogue Core logs every warning line was one of these. **Advanced Logging** (`info`) still records all of them except the census.
+
 ### Changed (one pacer through the overload pause: render handoff limit, 2026-10-10)
 
 - **The Reflex Sleep stays bypassed while the holds are paused.** Builds of 2026-10-09 sent it to the driver whenever nothing was held. The overload guard then judged its resume on the driver's pacing, which in CONTROL Resonant with FG 2× at 130 FPS started 59–69% of frames after ReLimiter's release and ran the game 2.4% below the cap: the holds never came back (63 s, 29088_1), although held pacing kept that cap with 1.3% restarts (31400_3). The bypass now applies whenever ReLimiter's own wait paces the game, held or not, so the guard's unchanged rule (the first whole 2 s without restarts) judges the pacing it resumes into. Dynamic MFG passthrough and the Reflex driver limiter still send the Sleep to the driver. Observed live: after a 4.1 s overload pause at 130 FPS with FG 2×, the holds resumed at the first clean 2 s window (38644_1).

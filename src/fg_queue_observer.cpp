@@ -142,7 +142,7 @@ void FgQueue_InstallAndDrain() noexcept {
             Hooks_PinTargetModule(base+0x794d0) && Hooks_PinTargetModule(base+0x79590);
         if (valid) { module=candidate; reviewed_vtable.store(reinterpret_cast<uintptr_t>(base+0xa9a30),std::memory_order_release); }
         FreeLibrary(candidate);
-        if (!valid) { fg_queue::rejected=true; LOG_WARN("FG queue: unreviewed sl.common image; queue observation unavailable"); return; }
+        if (!valid) { fg_queue::rejected=true; LOG_INFO("FG queue: unreviewed sl.common image; queue observation unavailable"); return; }
         LOG_INFO("FG queue: reviewed sl.common base=%llu; scalar fence edges only, no added GPU waits",
             reinterpret_cast<uint64_t>(module));
     }

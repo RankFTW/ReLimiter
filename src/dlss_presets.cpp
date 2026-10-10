@@ -182,7 +182,7 @@ static void DoPollUnlocked() {
         static bool s_logged = false;
         if (!s_logged) {
             s_logged = true;
-            LOG_WARN("DLSS DRS: profile=%s SR=%s(0x%X) RR=%s(0x%X) FG=%s(0x%X) MFG_Factor=%u MFG_Mode=%u MFG_TargetFPS=0x%X",
+            LOG_INFO("DLSS DRS: profile=%s SR=%s(0x%X) RR=%s(0x%X) FG=%s(0x%X) MFG_Factor=%u MFG_Mode=%u MFG_TargetFPS=0x%X",
                      hGameProfile ? "game" : "base",
                      next.sr, sr_preset, next.rr, rr_preset, next.fg, fg_preset,
                      mfg_factor, mfg_mode, mfg_target_fps);

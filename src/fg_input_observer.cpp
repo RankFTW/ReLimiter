@@ -377,7 +377,7 @@ void FgInput_InstallAndDrain() noexcept {
         FreeLibrary(module);
         if (!valid) {
             rejected = true;
-            LOG_WARN("FG input: unavailable; DLSS-G SHA256/loaded image/resolver not reviewed (restart required)");
+            LOG_INFO("FG input: unavailable; DLSS-G SHA256/loaded image/resolver not reviewed (restart required)");
             return;
         }
         LOG_INFO("FG input: reviewed DLSS-G 2.14.1 build accepted; GPU gate opt-in available; base=%llu",

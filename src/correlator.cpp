@@ -134,7 +134,7 @@ bool Correlator_SetPresentingSwapchain(IDXGISwapChain* swapchain) noexcept
     if (swapchain)
         g_correlator.permanently_disabled.store(false, std::memory_order_release);
     if (changed) {
-        LOG_WARN(
+        LOG_INFO(
             "DXGIStatsSource: presenting swapchain changed to %p (stats local)",
             swapchain);
     }

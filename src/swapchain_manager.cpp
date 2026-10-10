@@ -317,7 +317,7 @@ static void ActivateSwapchain(reshade::api::swapchain* sc, bool resize) {
     // DX12 first detection: flush stale scheduler state from launcher phase
     ActiveAPI prev_api = s_active_api.load(std::memory_order_relaxed);
     if (api == ActiveAPI::DX12 && prev_api != ActiveAPI::DX12) {
-        LOG_WARN("SwapMgr: DX12 first detection, flushing stale scheduler state");
+        LOG_INFO("SwapMgr: DX12 first detection, flushing stale scheduler state");
         Flush(FLUSH_ALL);
     }
 

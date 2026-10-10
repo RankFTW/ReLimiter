@@ -287,7 +287,7 @@ ULONG NativePclEtw_StartModernFilteredProviders(
                 IsProvider(
                     captured_configuration.provider_guid,
                     Microsoft_Windows_Kernel_Process::GUID)) {
-                LOG_WARN(
+                LOG_INFO(
                     "Native PCL: kernel process provider access denied; "
                     "continuing without process lifecycle events");
                 continue;
@@ -320,7 +320,7 @@ ULONG NativePclEtw_StartModernFilteredProviders(
             return ERROR_INVALID_DATA;
         }
 
-        LOG_WARN(
+        LOG_INFO(
             "Native PCL: modern filtered provider admission active "
             "(providers=%lu, events=%lu, legacy_dxgkrnl=excluded, "
             "legacy_dwm=excluded, unscoped_pcl=excluded)",

@@ -212,8 +212,13 @@ void PollGSyncState() {
     if (display_id == 0) {
         static int s_fail_count = 0;
         s_fail_count++;
-        if (s_fail_count <= 3 || s_fail_count == 5)
+        // The first polls can come before the display is resolved; none by
+        // the fifth is a warning.
+        if (s_fail_count == 5)
             LOG_WARN("PollGSyncState: Display_Resolver has no Display_ID "
+                     "(DispRes_IsResolved=%d, count=%d)", DispRes_IsResolved(), s_fail_count);
+        else if (s_fail_count <= 3)
+            LOG_INFO("PollGSyncState: Display_Resolver has no Display_ID "
                      "(DispRes_IsResolved=%d, count=%d)", DispRes_IsResolved(), s_fail_count);
         return;
     }
@@ -245,7 +250,7 @@ void PollGSyncState() {
     static std::atomic<bool> s_first_poll{true};
     const bool first_poll = s_first_poll.exchange(false, std::memory_order_acq_rel);
     if (first_poll) {
-        LOG_WARN("VRR poll: enabled=%d possible=%d requested=%d displayInVRR=%d -> gsync=%s (displayId=%u)",
+        LOG_INFO("VRR poll: enabled=%d possible=%d requested=%d displayInVRR=%d -> gsync=%s (displayId=%u)",
                  vrr_info.bIsVRREnabled, vrr_info.bIsVRRPossible,
                  vrr_info.bIsVRRRequested, vrr_info.bIsDisplayInVRRMode,
                  new_state ? "active" : "inactive", display_id);
@@ -274,7 +279,7 @@ void PollGSyncState() {
 }
 
 void OnGSyncStateChange(bool new_gsync_active) {
-    LOG_WARN("G-Sync state changed: %s", new_gsync_active ? "active" : "inactive");
+    LOG_INFO("G-Sync state changed: %s", new_gsync_active ? "active" : "inactive");
     PacingMode current = g_pacing_mode.load(std::memory_order_relaxed);
 
     PacingMode next = current;

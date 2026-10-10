@@ -299,7 +299,7 @@ void NativePclEtw_ReclaimStaleSessions() noexcept
             if (stop_status == ERROR_SUCCESS ||
                 stop_status == ERROR_WMI_INSTANCE_NOT_FOUND) {
                 ++reclaimed_session_count;
-                LOG_WARN(
+                LOG_INFO(
                     "Native PCL: reclaimed stale ETW session "
                     "(session=%ls, owner_pid=%lu, status=%lu)",
                     session_name.c_str(),

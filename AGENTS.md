@@ -69,7 +69,7 @@ Remove the `__pycache__` folders the run leaves under `tools/`, `tests/` and `.a
 
 `build.bat` is a convenience wrapper with a machine-specific Visual Studio path and generator; do not rewrite it merely to make it work on another machine. Timing, hook, swapchain, driver, ETW, and frame-generation changes require relevant live-game verification in addition to compilation. Report exactly which builds, tests, capture comparisons, and runtime scenarios were or were not performed.
 
-Before a beta or release build reaches users, work through `project-docs/beta_checklist_4.0.md`. A push to `main` with a new `VERSION` publishes a GitHub release automatically (`.github/workflows/release.yml`).
+Before `pcl` is merged to `main` as 4.0.0, work through `project-docs/release_checklist_4.0.0.md`. A push to `main` with a new `VERSION` publishes a GitHub release automatically (`.github/workflows/release.yml`); test builds before that are posted by hand and recorded in the project changelog.
 
 ## Workflow skills
 
