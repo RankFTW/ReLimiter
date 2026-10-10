@@ -2313,6 +2313,40 @@ void TestReleaseHeadroomBounds()
     CHECK_NEAR(low.MarginUs(), 1000.0);
 }
 
+// A widening stands while its late resumes do and fades with them. The guard
+// keeps resumes about a cushion above the edge, so the bin just below it never
+// collects the 512 resumes the clean rule needs (a Rogue Core session: at most
+// 199 weighted in 15 minutes at H = 2.25 ms). Here late resumes at 1.6 ms
+// widen the headroom to 2.25 ms, then every resume lands clean at 2.4 or 6 ms:
+// it holds for 30,000 (the bin still has at least 4 weighted late resumes),
+// is back at the 1.0 ms start by 60,000, goes no lower without resumes
+// measured there, and late resumes at 1.1 ms widen it again at once.
+void TestReleaseHeadroomWideningFades()
+{
+    ReleaseMarginLearner headroom{ LEAD_HEADROOM_LIMITS };
+    for (int resume = 0; resume < 400; ++resume) headroom.Add(6000.0, false);
+    int step = 0;
+    for (int resume = 0; resume < 200 && step == 0; ++resume) {
+        step = headroom.Add(1600.0, resume % 2 == 0);
+        headroom.Add(6000.0, false);
+    }
+    CHECK(step == 1);
+    CHECK_NEAR(headroom.MarginUs(), 2250.0);
+    for (int resume = 0; resume < 30000; ++resume) CHECK(headroom.Add(resume % 2 == 0 ? 2400.0 : 6000.0, false) == 0);
+    CHECK_NEAR(headroom.MarginUs(), 2250.0);
+    for (int resume = 0; resume < 30000; ++resume) CHECK(headroom.Add(resume % 2 == 0 ? 2400.0 : 6000.0, false) <= 0);
+    CHECK_NEAR(headroom.MarginUs(), 1000.0);
+    for (int resume = 0; resume < 100000; ++resume) CHECK(headroom.Add(resume % 2 == 0 ? 2400.0 : 6000.0, false) == 0);
+    CHECK_NEAR(headroom.MarginUs(), 1000.0);
+    step = 0;
+    for (int resume = 0; resume < 200 && step == 0; ++resume) {
+        step = headroom.Add(1100.0, resume % 2 == 0);
+        headroom.Add(6000.0, false);
+    }
+    CHECK(step == 1);
+    CHECK_NEAR(headroom.MarginUs(), 1750.0);
+}
+
 // Render handoff offset: each frame released
 // at or after the previous frame's RENDERSUBMIT_START adds h = (b − w) of the
 // previous frame minus its own simulation (e − s); d = Q5(h) − allowance at
@@ -2423,6 +2457,7 @@ int main()
     TestReleaseHeadroomObservations();
     TestCollisionGuardQueueOrder();
     TestReleaseHeadroomBounds();
+    TestReleaseHeadroomWideningFades();
     TestRenderHandoffOffset();
 
     if (s_failures != 0) {

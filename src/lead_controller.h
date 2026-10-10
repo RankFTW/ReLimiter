@@ -85,8 +85,12 @@ constexpr double LEAD_MARGIN_EXCESS_SHARE = 0.025;
 constexpr double LEAD_MARGIN_EXCESS_Z = 2.5;
 // The bin just below the edge is clean with at least 512 weighted resumes and
 // a late share at most 0.5 points above the background. The edge narrows one
-// bin after 1,024 consecutive waited resumes with it clean; widening needs no
-// wait.
+// bin after 1,024 consecutive waited resumes with it clean or, above the
+// start, with fewer than LEAD_MARGIN_MIN_LATE weighted late resumes left
+// there; widening needs no wait. The guard keeps releases about a cushion
+// above the edge, so the bin below it seldom collects 512 resumes (Rogue Core
+// at H = 2.25 ms: at most 199 weighted in 15 minutes, none late at any
+// distance); without the second test a widening never faded.
 constexpr double LEAD_MARGIN_CLEAN_SAMPLES = 512.0;
 constexpr double LEAD_MARGIN_CLEAN_SHARE = 0.005;
 constexpr uint32_t LEAD_MARGIN_NARROW_SAMPLES = 1024;
@@ -382,10 +386,11 @@ struct LeadStatistics {
 // to the next Present call (p_{n+1} − o_n), and the release headroom H,
 // measured to the next frame's heavy GPU work (r_{n+1} − A_{n+1} − o_n).
 // Decayed per-bin counts of waited resumes; colliding bins reached upward
-// from the edge widen it at once, the bin just below the edge must stay
-// clean for LEAD_MARGIN_NARROW_SAMPLES resumes per narrowing step: widening
-// is quick, narrowing needs minutes of clean evidence. Without evidence (no
-// probes) the distance stays at its start.
+// from the edge widen it at once. Each narrowing step needs the bin just
+// below the edge to stay, for LEAD_MARGIN_NARROW_SAMPLES resumes, either clean
+// or (above the start) with fewer than LEAD_MARGIN_MIN_LATE weighted late
+// resumes: widening is quick, a widening fades over minutes with its late
+// resumes. Without evidence (no probes) the distance stays at its start.
 class ReleaseMarginLearner {
 public:
     explicit ReleaseMarginLearner(CollisionDistanceLimits limits = LEAD_MARGIN_LIMITS) noexcept

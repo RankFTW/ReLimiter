@@ -723,7 +723,7 @@ static void ObserveReleaseMargin() noexcept
     if (margin_us != s_logged_release_margin_us) {
         LOG_INFO("Release margin: %.2f -> %.2f ms (%s; %llu of %llu waited resumes late; GPU queue wait leads guarded %llu of %llu)",
                  s_logged_release_margin_us / 1000.0, margin_us / 1000.0,
-                 margin_us > s_logged_release_margin_us ? "late resumes closer to the release" : "clean resumes below the edge",
+                 margin_us > s_logged_release_margin_us ? "late resumes closer to the release" : "below the edge clean or its late resumes faded",
                  static_cast<unsigned long long>(statistics.margin_late_samples),
                  static_cast<unsigned long long>(statistics.margin_samples),
                  static_cast<unsigned long long>(statistics.collision_guarded_frames),
@@ -734,7 +734,7 @@ static void ObserveReleaseMargin() noexcept
     if (headroom_us != s_logged_release_headroom_us) {
         LOG_INFO("Release headroom: %.2f -> %.2f ms (%s; %llu of %llu waited resumes late; GPU queue wait leads guarded %llu of %llu)",
                  s_logged_release_headroom_us / 1000.0, headroom_us / 1000.0,
-                 headroom_us > s_logged_release_headroom_us ? "late resumes closer to the next frame's GPU work" : "clean resumes below the edge",
+                 headroom_us > s_logged_release_headroom_us ? "late resumes closer to the next frame's GPU work" : "below the edge clean or its late resumes faded",
                  static_cast<unsigned long long>(statistics.headroom_late_samples),
                  static_cast<unsigned long long>(statistics.headroom_samples),
                  static_cast<unsigned long long>(statistics.collision_guarded_frames),

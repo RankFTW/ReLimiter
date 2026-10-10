@@ -167,12 +167,19 @@ int ReleaseMarginLearner::Add(double margin_us, bool late) noexcept
         edge_us = static_cast<double>(bin + 1) * LEAD_MARGIN_BIN_US;
         narrow_run_ = 0;
     }
-    // Narrow one bin after the bin just below the edge stayed clean: well
-    // measured, and late at most LEAD_MARGIN_CLEAN_SHARE above the background.
+    // Narrow one bin after the bin just below the edge stayed clean (well
+    // measured, and late at most LEAD_MARGIN_CLEAN_SHARE above the background)
+    // or, above the start, held fewer late resumes than a collision needs.
+    // The guard keeps releases about a cushion above the edge, so few resumes
+    // land below it to measure it clean; without the second test a widening
+    // would stand until the game closes instead of fading with its evidence.
     const double below = std::floor(edge_us / LEAD_MARGIN_BIN_US + 0.5) - 1.0;
     const size_t below_bin = below >= 0.0 ? static_cast<size_t>(below) : LEAD_MARGIN_BINS;
-    if (below_bin < LEAD_MARGIN_BINS && resumes_[below_bin] >= LEAD_MARGIN_CLEAN_SAMPLES &&
-        late_[below_bin] <= resumes_[below_bin] * (background + LEAD_MARGIN_CLEAN_SHARE)) {
+    const bool clean = below_bin < LEAD_MARGIN_BINS && resumes_[below_bin] >= LEAD_MARGIN_CLEAN_SAMPLES &&
+        late_[below_bin] <= resumes_[below_bin] * (background + LEAD_MARGIN_CLEAN_SHARE);
+    const bool faded = below_bin < LEAD_MARGIN_BINS && edge_us > limits_.start_us - LEAD_MARGIN_CUSHION_US &&
+        late_[below_bin] < LEAD_MARGIN_MIN_LATE;
+    if (clean || faded) {
         if (++narrow_run_ >= LEAD_MARGIN_NARROW_SAMPLES) {
             edge_us -= LEAD_MARGIN_BIN_US;
             narrow_run_ = 0;
