@@ -4,7 +4,7 @@ This document explains how ReLimiter's frame pacing works, with diagrams. It is 
 
 Nobody is expected to tune any of this. ReLimiter ships the recommended defaults: Smoothing on, Output override Auto, Reflex Sleep bypass on, pre-Sleep placement and Adaptive cap off. Every number below is a built-in value, not a setting.
 
-Each section ends with the source files it describes. Where a reason is given for a rule, the evidence behind it is in [`project-docs/002_unified_pacing_timing/`](../project-docs/002_unified_pacing_timing/summary.md), mainly [`phase4_design.md`](../project-docs/002_unified_pacing_timing/phase4_design.md) sections 3, 18, 20, 22 and 23. Diagrams that use numbers say so; those numbers only illustrate the shape of the timing.
+Each section ends with the source files it describes. Diagrams that use numbers say so; those numbers only illustrate the shape of the timing.
 
 ---
 
@@ -55,7 +55,7 @@ Three rules hold everywhere:
 
 - **Late frames are never held.** A frame that misses its target passes on at once; the cadence is restarted when it is clearly late.
 - **No catch-up burst.** After a late frame the next targets are not squeezed together to make up the time.
-- **No mode switching on thresholds.** ReLimiter picks the best output point the game supports and keeps it. Output override forces one; the overload guard only steps aside temporarily (design section 22).
+- **No mode switching on thresholds.** ReLimiter picks the best output point the game supports and keeps it. Output override forces one; the overload guard only steps aside temporarily.
 
 The pieces that decide the details:
 
@@ -272,7 +272,7 @@ A frame gets no pre-wait when the grid cannot predict its release, when the newe
 
 ### Reflex Sleep bypass
 
-By default ReLimiter's own wait replaces the driver's Sleep. After the pre-wait (or at once, when there is none) the Sleep hook returns without calling the driver; Reflex markers and the game's Reflex mode still reach the driver. The reason is a single pacer: the driver's Sleep otherwise adds a wait of its own after ReLimiter's, and the two would then pace the game independently (design section 23).
+By default ReLimiter's own wait replaces the driver's Sleep. After the pre-wait (or at once, when there is none) the Sleep hook returns without calling the driver; Reflex markers and the game's Reflex mode still reach the driver. The reason is a single pacer: the driver's Sleep otherwise adds a wait of its own after ReLimiter's, and the two would then pace the game independently.
 
 The driver's Sleep still runs when ReLimiter is not pacing the source: with no FPS cap, in Dynamic MFG passthrough, without a presenting swapchain, or with the developer `source_placement=driver` (the Reflex driver limiter then paces the game and ReLimiter plans nothing), or when the developer bypass setting is turned off. NVIDIA Smooth Motion skips the Reflex Sleep entirely.
 
@@ -557,7 +557,7 @@ flowchart LR
 
 **What you see.** The OSD's **Display Pacing** shows, over the last 5 seconds, refreshed four times per second: the display interval, jitter (the change from one display interval to the next), long and short frame counts, animation error (the difference between how far apart ReLimiter released two rendered frames and how far apart they were displayed), release to display, GPU residence and CPU hold. Display times come from PC latency collection (ETW) when it is collecting, otherwise from DXGI frame statistics. A capture (Telemetry Logging) records one joined row per displayed frame plus an events file with pipeline changes, cadence restarts and controller transitions; see [Capture Files](DEVELOPER_REFERENCE.md#capture-files).
 
-**Analysis tooling.** Offline comparison of captures, release-rule replays and the capture protocol are in the capture-analysis skill ([`.agents/skills/pacing-capture-analysis/`](../.agents/skills/pacing-capture-analysis/SKILL.md)), which explains which timing domain each field belongs to and which comparisons are fair.
+**Analysis.** A capture's rows hold each frame's plan, release, output and display times, so pacing can be compared offline; the [Developer Reference](DEVELOPER_REFERENCE.md#capture-files) lists the columns and events.
 
 Source: `src/feedback.cpp`, `src/feedback.h`, `src/reflex_clock_map.h`, `src/pacing_telemetry.h`, `src/pacing_telemetry.cpp`, `src/pacing_join.h`.
 

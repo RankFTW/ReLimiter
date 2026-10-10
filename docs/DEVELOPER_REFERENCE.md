@@ -2,7 +2,7 @@
 
 This document covers the settings, status lines and log lines that exist for A/B testing and capture analysis. Normal users never need it: ReLimiter ships the recommended defaults and the [User Guide](USER_GUIDE.md) covers everything a player has to know.
 
-It describes current behavior only. Measurements, capture evidence and the history of how each rule came about are in [`CHANGELOG.md`](../CHANGELOG.md) and [`project-docs/002_unified_pacing_timing/`](../project-docs/002_unified_pacing_timing/); earlier GPU Deadline models are in the [GPU Deadline model history](gpu-deadline-model-history.md).
+It describes current behavior only. Release notes are in [`CHANGELOG.md`](../CHANGELOG.md).
 
 [Frame Pacing](FRAME_PACING.md) explains the mechanisms these settings and lines refer to (cadence grid, lead, output points, protections), with diagrams.
 
@@ -369,4 +369,4 @@ Turn on **Telemetry Logging** (Advanced) to record a capture; the User Guide des
 - GPU wait cap changes (`gpu_wait_cap`): the level 0..3 as value, a higher level being a lower cap, and 255 for no cap (the open top); cause `late_resumes`, `trial_failed`, `calm`, `reset`, `opened` or `closed`.
 - Injected stalls (`stall_injected`), measurement loss (dropped records and lost ETW events), PC latency status changes and every Display Pacing snapshot.
 
-Release and Present times describe ReLimiter's pacing, not what reached the display, especially with frame generation. Captures made by older builds can have fewer columns and event causes; analysis tooling and the capture protocol are in `.agents/skills/pacing-capture-analysis/`.
+Release and Present times describe ReLimiter's pacing, not what reached the display, especially with frame generation. Captures made by older builds can have fewer columns and event causes.
