@@ -27,6 +27,7 @@ This file is the root, always-on guidance for AI coding agents. Keep shared poli
 - Do not edit generated CMake/MSBuild output under `build/` or `build32/`.
 - Treat `debug_data/`, `frameview/`, and `logs/` as captures, diagnostics, or research inputs rather than production source.
 - Do not change external submodules in `deps/`, release automation, or global build policy unless the task explicitly requires it.
+- **Public repository: commit product files and agent guidance only.** Commit `src/`, the C++ tests and their data, CMake, `README.md`, `CHANGELOG.md`, `VERSION`, user-facing docs (`docs/USER_GUIDE.md`, `docs/DEVELOPER_REFERENCE.md`, `docs/FRAME_PACING.md`), the PCL permissions tool, every `AGENTS.md`, and `.agents/` with the Python tests of its scripts. Internal engineering material stays local and untracked: `project-docs/`, `.github/copilot-instructions.md`, `.vscode/`, plan and working-note docs, simulators and traces under `tools/`, and session captures. They are listed in `.git/info/exclude` (local, not in `.gitignore`); add new internal files there, never to a commit. Public docs and source comments must not link to them or cite capture IDs. Commit messages describe the product change, not test sessions.
 
 ## Global implementation rules
 
