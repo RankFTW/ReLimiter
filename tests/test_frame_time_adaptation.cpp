@@ -1,6 +1,6 @@
 // Stage-demand computation (src/frame_time_adaptation.cpp), Reflex report
 // admission policy and the delayed-report queue. The Frame-Time Adaptation
-// controller is retired (phase3_controllers_design.md P3-5); the period
+// controller is retired; the period
 // governor that consumes this demand has its own test (test_period_governor).
 // Production wiring (feedback.cpp producer, scheduler consumer) is not covered.
 
@@ -57,7 +57,7 @@ namespace
         CHECK(demand.workload_us == 7000.0);
     }
 
-    // R10: a serial engine starts frame n + 1's simulation at or after frame
+    // A serial engine starts frame n + 1's simulation at or after frame
     // n's Present end; 124 of the newest 128 consecutive pairs make it serial.
     void TestSerialFrameDetector()
     {
@@ -73,7 +73,7 @@ namespace
         CHECK(detector.Serial());
         // Overlapping (pipelined) frames: simulation starts 2 ms before the
         // previous Present ends (the first overlapping report still pairs
-        // serially with the frame before it). Hysteresis (R12): serial stays
+        // serially with the frame before it). Hysteresis: serial stays
         // on down to 116 of 128 and turns off below.
         for (int i = 0; i < 13; ++i) {
             detector.Push(frame++, t, t + 6000);
@@ -113,7 +113,7 @@ namespace
         CHECK(!detector.Serial());
     }
 
-    // R10: with serial frames the demand is the larger of the stage maximum
+    // With serial frames the demand is the larger of the stage maximum
     // and the frame span minus ReLimiter's holds inside it.
     void TestFrameSpanDemand()
     {

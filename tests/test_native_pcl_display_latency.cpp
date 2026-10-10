@@ -1,7 +1,7 @@
 // Directly tests the production copy of collector PC Latency into pacing
-// display samples (NativePclInternal_AttachDisplayLatency,
-// phase1_purge_design.md section 3) and the cross-session accumulation of the
-// published loss counters (NativePclInternal_AccumulateLossCounters, F4). Does
+// display samples (NativePclInternal_AttachDisplayLatency)
+// and the cross-session accumulation of the
+// published loss counters (NativePclInternal_AccumulateLossCounters). Does
 // not run PresentMon or ETW: which display instances publish a latency sample
 // and when a collector session ends are decided by the collector and still
 // need a live capture.

@@ -694,7 +694,7 @@ void TestResumeHistoryThroughStage()
     CHECK(g_stage.Lead().Statistics().resume_not_waited == 0);
 
     // A backlogged frame (the GPU reached the Wait after the Signal) is kept
-    // out by the M2 filter.
+    // out by the backlog filter.
     frame = g_stage.RunPlannedFrame(Request(Key(frame_id++), gpu), &clock);
     CHECK(frame.planned);
     const int64_t output = frame.plan.output_target_qpc;
@@ -710,8 +710,8 @@ void TestResumeHistoryThroughStage()
 
 // The overload guard demotes the GPU queue wait (rung source only, reason
 // infeasible): its frames keep the GPU queue wait's lead for the release
-// phase (capture 49596_1) but never plan below the warm source-only lead,
-// the window they feed (capture 26752_1: an 8.05 ms lead learned while
+// phase but never plan below the warm source-only lead,
+// the window they feed (an 8.05 ms lead learned while
 // loading, PRESENT_START 12.5 ms after the release in play).
 void TestDemotedGpuQueueWaitLead()
 {
@@ -850,7 +850,7 @@ void TestResetClearsPlans()
 
 } // namespace
 
-// Render handoff limit (phase4_design.md section 23), frame not held: the
+// Render handoff limit, frame not held: the
 // earliest release is a floor on the wait and the frame's arrival for the
 // grid. Before S it changes nothing; past S within the late tolerance (a
 // quarter interval) the grid stays and the wait runs to it; beyond, the

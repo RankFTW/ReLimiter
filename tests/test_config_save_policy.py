@@ -22,14 +22,14 @@ SOURCE = (ROOT / "src/config.cpp").read_text(encoding="utf-8-sig")
 HEADER = (ROOT / "src/config.h").read_text(encoding="utf-8-sig")
 OSD = (ROOT / "src/osd.cpp").read_text(encoding="utf-8-sig")
 
-# Keys retired by the Phase 1 purge (project-docs/002_unified_pacing_timing/
-# phase1_purge_design.md). Stale copies in an existing INI must be ignored.
+# Keys retired by the pacing purge. Stale copies in an existing INI must be
+# ignored.
 RETIRED_KEYS = (
     "ready_present_mode", "ready_present_slack_us", "ready_present_max_hold_us",
     "readiness_phase_mode", "readiness_phase_max_advance_us", "adaptive_cycle_trial",
     "gpu_present_gate_hold", "gpu_present_gate_phase_controller", "reflex_gpu_combined",
     "reflex_pre_sleep_pacing", "marker_gate_bypass",
-    # Phase 2 (phase2_timing_core_design.md section 4).
+    # Retired by the timing-core rework.
     "estimator_a_mode", "estimator_a_fixed_reserve_us", "native_arrival_predictor_mode",
     "presentation_gate_location", "gpu_present_gate_mode", "gpu_present_gate_slack_us",
     "gpu_present_gate_max_delay_us", "adaptive_deadline_reserve_mode", "smoothing_window",
@@ -37,7 +37,7 @@ RETIRED_KEYS = (
     "gpu_readiness_observer",
 )
 
-# Phase 2 keys read once for migration (P2-4, adaptive_cap) and never saved.
+# Keys read once for migration (pacing_method, adaptive_smoothing) and never saved.
 MIGRATED_KEYS = ("pacing_method", "adaptive_smoothing")
 
 # Setters of retired pacing features. Most are deleted; NativeGate_SetMode and
@@ -190,7 +190,7 @@ class ConfigSavePolicyTests(unittest.TestCase):
         self.assertIn("Config_ApplyPacingPipeline();", body("ApplyConfig"))
         pipeline = body("Config_ApplyPacingPipeline")
         self.assertIn("PacingPipeline_SetConfig(PacingPipelineConfigFrom(g_config))", pipeline)
-        # P3-5: adaptive_cap (Q1 a, the only switch) reaches the period
+        # adaptive_cap (the only switch) reaches the period
         # governor through the published pipeline configuration; the retired
         # Frame-Time Adaptation setter is gone.
         self.assertEqual(call_arguments(pipeline, "PacingPipeline_SetConfig"),
@@ -241,13 +241,13 @@ class ConfigSavePolicyTests(unittest.TestCase):
         self.assertIn('"smoothing", PacingSmoothing_Text(config.smoothing)', writer)
         self.assertIn('"output_rung", PacingRungOverride_Text(config.output_rung)', writer)
         self.assertIn('"adaptive_cap", config.adaptive_cap', writer)
-        # R11: the Adaptive cap percentile is loaded, clamped to [50, 99] in
+        # The Adaptive cap percentile is loaded, clamped to [50, 99] in
         # validation (and again by the resolver) and saved as an integer.
         self.assertRegex(loader, r'ReadINIInt\(\s*S, "adaptive_cap_percentile", kAdaptiveCapPercentileDefault')
         self.assertRegex(validate, r"g_config\.adaptive_cap_percentile,\s*kAdaptiveCapPercentileMin,"
                                    r"\s*kAdaptiveCapPercentileMax")
         self.assertIn('WriteINIInt(S, "adaptive_cap_percentile", config.adaptive_cap_percentile, P)', writer)
-        # Q11 (a): the forward order is validated text, saved canonically and
+        # The forward order is validated text, saved canonically and
         # applied to the marker hook with the rest of the pipeline.
         self.assertIn("PacingMarkerForwardOrder_FromText(forward_order.c_str(), "
                       "&g_config.marker_forward_order)", loader)

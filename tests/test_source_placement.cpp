@@ -1,6 +1,6 @@
-// Pre-Sleep source placement (src/source_placement.*, phase4_design.md P4-8
-// to P4-10): pre-wait target, guards, residual pairing by grid index, the
-// measured margin, (R15) no self-disengagement, the window restart when the
+// Pre-Sleep source placement (src/source_placement.*):
+// pre-wait target, guards, residual pairing by grid index, the
+// measured margin, no self-disengagement, the window restart when the
 // driver's Sleep starts or stops running after the hook, and residuals from
 // too-close Sleeps. The Reflex Sleep hook, the scheduler owner guard and the
 // driver's Sleep need live verification.
@@ -160,7 +160,7 @@ namespace
         CHECK(statistics.waits == 0);
     }
 
-    // P4-10: margin = Q99(residual) + 150 µs, at least 150 µs; 500 µs until
+    // margin = Q99(residual) + 150 µs, at least 150 µs; 500 µs until
     // 16 residuals.
     void TestMeasuredMargin()
     {
@@ -181,7 +181,7 @@ namespace
         CHECK(instant.placement.Statistics().late_arrivals == 0);
     }
 
-    // R15: pre-Sleep is the user's choice and never disengages itself. A
+    // Pre-Sleep is the user's choice and never disengages itself. A
     // residual far above half the interval only widens the margin; the
     // placement keeps planning pre-waits while the target is far enough ahead.
     void TestNeverDisengages()
@@ -214,7 +214,7 @@ namespace
         const PreSleepStatus status = loop.placement.Status();
         CHECK(status.samples == PRE_SLEEP_RESIDUAL_CAPACITY);
         CHECK(status.residual_p99_us == 5'000.0);
-        CHECK(loop.placement.MarginUs() == 5'150.0); // no upper limit (R15)
+        CHECK(loop.placement.MarginUs() == 5'150.0); // no upper limit
     }
 
     // A margin wider than the room skips every pre-wait (TooClose). The
@@ -269,7 +269,7 @@ namespace
         CHECK(mixed.placement.MarginUs() == PRE_SLEEP_MARGIN_INITIAL_US);
     }
 
-    // R2 (capture D): the residual runs from the pre-wait's target, not its
+    // The residual runs from the pre-wait's target, not its
     // end, so a late timer wake-up widens the margin; an early ready point
     // counts as 0.
     void TestResidualFromTarget()

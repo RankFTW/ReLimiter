@@ -228,15 +228,15 @@ void LeadController::ClearSlackEvidence() noexcept
 }
 
 // The rung resumes holding after the overload guard demoted it: its
-// window describes frames from before the demotion (capture 6560_1: retries
-// started 1.5-3 ms above the frames' current Q95, waited 2-3 ms and failed
-// again within 2-5 s). The window restarts; until it is warm again the lead
+// window describes frames from before the demotion (retries started above
+// the frames' current Q95, waited and failed again within seconds). The
+// window restarts; until it is warm again the lead
 // is the old window's median plus the allowance, not the long-interval seed.
 // A GPU wait's base is at least the warm source-only Q_q of the same FG
 // divisor: the demoted frames fed that window, and a GPU wait frame is ready
 // no earlier than its PRESENT_START. Without it a load rise during the
-// demotion resumed the wait from a window learned before it (CONTROL
-// 26752_1: an 8.05 ms lead learned while loading, X about 20 ms in play).
+// demotion resumed the wait from a window learned before it (a lead learned
+// while loading was far below the X seen in play).
 void LeadController::RestartRung(PacingRung rung) noexcept
 {
     size_t first = 0;
@@ -305,7 +305,7 @@ double LeadController::NextLeadUs(const LeadRequest& request, bool* budget_limit
             ++statistics_.gpu_wait_capped_frames;
         }
     }
-    // Past 3 I only the Adaptive cap (C2), if the user enabled it, can help.
+    // Past 3 I only the Adaptive cap, if the user enabled it, can help.
     bucket.budget_limited = bucket.target_us > max_lead_us;
     if (bucket.budget_limited) ++statistics_.budget_limited_frames;
     if (budget_limited != nullptr) *budget_limited = bucket.budget_limited;
@@ -771,7 +771,7 @@ void LeadController::RecordResumeDelay(PendingFrame* frame) noexcept
     // u − o is the Signal→resume latency only when the GPU was already
     // waiting at the Signal. A GPU that reached the Wait later resumed on its
     // own backlog, which would bias the decontamination median and the GPU
-    // wait cap's late-resume evidence (M2).
+    // wait cap's late-resume evidence.
     if (frame->gpu_wait_qpc <= 0 || frame->gpu_wait_qpc > frame->qpc[FieldOutputRelease]) {
         ++statistics_.resume_not_waited;
         return;
@@ -1035,7 +1035,7 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
         ++statistics_.gated_hold_samples;
         statistics_.last_gated_hold_us = gated_us;
     }
-    // P3-3: a long sample is excluded from the lead but is a missed target.
+    // A long sample is excluded from the lead but is a missed target.
     // A frame the collision guard made late on purpose is judged against its
     // unguarded lead, and every frame without its gated hold.
     const double slack_us = frame->lead_us + frame->guard_reduction_us - std::max(0.0, sample_us - gated_us);
@@ -1073,7 +1073,7 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
 // X relative to the frame's source release s:
 //   H0: a − s.   H1/H2: (a − s) − overlap([s, a], previous CPU hold), with the
 //   native arrival for H2.
-//   H3 and FG input wait (R13): max(p, r − c) − s. The frame's GPU work can
+//   H3 and FG input wait: max(p, r − c) − s. The frame's GPU work can
 //   start at w but not before the GPU is free of frame n − 1: at f =
 //   max(r_{n−1}, u_{n−1}) as run, at f' = r'_{n−1} (that frame's own
 //   readiness, below) without ReLimiter's holds. c = max(0, max(w, f) −
@@ -1085,12 +1085,12 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
 //   GPU queue wait: Rogue Core's X does not depend on the previous frame's
 //   hold (slope about 0 in the archived light captures), and with an early w
 //   the chained f' turned the GPU's ordinary overlap of consecutive frames
-//   into a fictitious carried delay that kept the lead below X (capture
-//   7944_5, 2026-10-03: lead 9.63 ms, X p50 9.93 ms, 92% of frames late).
+//   into a fictitious carried delay that kept the lead just below X, so most
+//   frames were late.
 //   Only a previous frame whose GPU actually waited at its gate
 //   (PreviousGpuHeld) can carry a delay; an unheld frame ends the chain, so an
 //   underestimated f' cannot sustain itself. Unknown r_{n−1} leaves f' at the
-//   start of the frame, which reduces c to max(0, u_{n−1} − w): the Phase 2
+//   start of the frame, which reduces c to max(0, u_{n−1} − w): the earlier
 //   formula (p − s) + max(0, r − max(p, u_{n−1})) when w = p. The floor holds
 //   because a frame is never ready before its present call.
 double LeadController::SampleUs(const PendingFrame& frame, const PendingFrame* previous,

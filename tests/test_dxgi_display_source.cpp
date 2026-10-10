@@ -1,5 +1,5 @@
-// DXGI frame-statistics display source (phase2_timing_core_design.md section
-// 6). Links the real src/dxgi_display_source.cpp, pacing_join.cpp and
+// DXGI frame-statistics display source. Links the real
+// src/dxgi_display_source.cpp, pacing_join.cpp and
 // pacing_metrics.cpp; C++17, no platform libraries. Timelines use a 10 MHz
 // clock. This covers the pure matcher and its join and chain contract, not the
 // Present hook, the correlator swapchain or live DXGI statistics.

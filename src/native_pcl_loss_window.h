@@ -1,7 +1,6 @@
 #pragma once
 
-// Windowed ETW capture-integrity loss for the native PCL collector
-// (project-docs/002_unified_pacing_timing/phase0_measurement_design.md).
+// Windowed ETW capture-integrity loss for the native PCL collector.
 // Pure C++17 without Windows headers so standalone tests include it directly.
 //
 // Callers pass cumulative loss counters with the local QPC time of the query.

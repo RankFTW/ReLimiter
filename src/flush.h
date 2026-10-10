@@ -9,7 +9,7 @@
 // old cadence PQI, replaced by PQI_FromSnapshot) are retired with their
 // modules. FLUSH_PREDICTOR keeps its historical name: it now starts a new
 // controller lifecycle (generation), which resets the scheduler's cadence
-// grid, frame plans and lead controller (P2-10).
+// grid, frame plans and lead controller.
 constexpr uint32_t FLUSH_CORRELATOR = 1 << 0;
 constexpr uint32_t FLUSH_PREDICTOR  = 1 << 2;
 constexpr uint32_t FLUSH_ALL        = FLUSH_CORRELATOR | FLUSH_PREDICTOR;

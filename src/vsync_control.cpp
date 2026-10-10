@@ -270,7 +270,7 @@ static NativeGateContext GetNativeCallContext(uint64_t native_swapchain) noexcep
     return context;
 }
 
-// ── Phase 0 pacing telemetry (phase0_measurement_design.md §2) ──
+// ── Pacing telemetry ──
 
 // Final native attempt of one selected-swapchain Present call. P/E bracket
 // only that trampoline call; span is its Present span when one was allocated.

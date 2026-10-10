@@ -1,5 +1,4 @@
-// Pacing record joins (project-docs/002_unified_pacing_timing/
-// phase0_measurement_design.md section 3). Timelines use a 10 MHz clock and
+// Pacing record joins. Timelines use a 10 MHz clock and
 // explicit worker times, so every grace, threshold and retention is exact.
 
 #include <iostream>
@@ -560,7 +559,7 @@ namespace
                 "metric input takes only defined values from the joined row");
     }
 
-    // Phase 2 fields (phase2_timing_core_design.md section 5): the Source
+    // Plan fields: the Source
     // record's plan fields and the Present record's plan_status travel with
     // the existing join rules; the display source follows the observer epoch.
     bool TestPlanFieldsAndDisplaySource()
@@ -616,7 +615,7 @@ namespace
     }
 }
 
-// R8: a Present that carries a cross-thread key is compared with the
+// A Present that carries a cross-thread key is compared with the
 // display's ETW frame ID; the key never replaces the PCL join.
 bool TestCrossThreadEvidence()
 {

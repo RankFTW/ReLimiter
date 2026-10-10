@@ -109,7 +109,7 @@ void PacingChain::StartEpoch(uint32_t observer_epoch) noexcept
     observer_epoch_ = observer_epoch;
 }
 
-// Break reasons in design order. Out-of-order and gap compare against the
+// Break reasons are checked in the order below. Out-of-order and gap compare against the
 // previous display change of the chain, whether or not it was anchoring. A
 // source-reported continuity break is a gap of unobserved presents: the
 // display change still anchors the next interval.

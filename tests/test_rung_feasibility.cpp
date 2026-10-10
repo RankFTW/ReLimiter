@@ -1,6 +1,5 @@
 // Feasibility evidence, the overload guard, the A/B interleave and the GPU
-// queue wait cap (src/rung_feasibility.*; design review 2026-10-03, hold
-// strategy simulation 2026-10-04, interleaved capture 45760_1): the
+// queue wait cap (src/rung_feasibility.*): the
 // lead-infeasible predicate (an Adaptive cap miss), the overload demotion and
 // its 2 s recovery, the A/B blocks, and the GPU wait cap ladder: step down on
 // late resumes, the check that keeps or undoes a step down, the backoff, the
@@ -90,7 +89,7 @@ void TestLeadInfeasiblePredicate()
     lead.negative_count = FEASIBILITY_NEGATIVE_SLACK_MIN;
     lead.budget_limited = true;
     CHECK(Feasibility_LeadInfeasible(lead));
-    // Budget-limited alone is not infeasible (M1).
+    // Budget-limited alone is not infeasible.
     lead.negative_count = 0;
     CHECK(!Feasibility_LeadInfeasible(lead));
     lead.negative_count = FEASIBILITY_NEGATIVE_SLACK_MIN;

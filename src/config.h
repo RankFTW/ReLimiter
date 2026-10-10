@@ -10,7 +10,7 @@
 // Loaded in AddonInit outside loader lock, exposed as a global struct.
 
 struct Config {
-    // Pacing pipeline (phase2_timing_core_design.md section 4)
+    // Pacing pipeline
     PacingSmoothing smoothing = PacingSmoothing::On;              // developer: on | off (always on for users)
     PacingRungOverride output_rung = PacingRungOverride::Auto;    // developer: auto | source | marker | native | gpu
     double stall_inject_ms = 0.0;                                 // developer: 0 = off, 0–200
@@ -84,12 +84,12 @@ struct Config {
     double gpu_wait_budget_us = kPacingGpuWaitBudgetDefaultUs; // developer: GPU wait cap ladder top level, 500–5000 µs
     double gpu_wait_interleave_s = 0.0; // developer: held / not-held A/B blocks of the Auto GPU queue wait; 0 = off, 1–10 s
     // Skip the driver's Reflex Sleep while a cap is set; ReLimiter's own
-    // pre-Sleep wait paces instead (default on since 2026-10-09: CONTROL FG
-    // 2× 10× fewer long frames at the same PC latency, Rogue Core neutral).
+    // pre-Sleep wait paces instead (default on: far fewer long frames at the
+    // same PC latency in testing).
     bool reflex_sleep_bypass = true; // developer
     PacingMarkerForwardOrder marker_forward_order = PacingMarkerForwardOrder::BeforeWait; // developer: before_wait | after_wait
     PacingRenderQueue gpu_queue_wait_render_queue = PacingRenderQueue::Keep; // developer A/B: keep | remove | remove_held
-    PacingPlacementOverride source_placement = PacingPlacementOverride::PreSleep; // developer: marker | pre_sleep | driver (P4-11, R15; pre_sleep default since 2026-10-09)
+    PacingPlacementOverride source_placement = PacingPlacementOverride::PreSleep; // developer: marker | pre_sleep | driver (pre_sleep is the default)
 
     // Reflex Injection
     bool reflex_inject = false;         // Synthesize Reflex markers for non-Reflex games
@@ -103,13 +103,13 @@ struct Config {
     // Dynamic MFG Passthrough — disable pacing when DLSS 4.5 Dynamic MFG is active
     bool dynamic_mfg_passthrough = false;
 
-    // Adaptive cap: the period governor (C2) stretches the cap interval
+    // Adaptive cap: the period governor stretches the cap interval
     // continuously (VRR) or in whole refreshes (fixed refresh) when stage
-    // demand or missed frames show the cap cannot be held (P4-1). Migrates
+    // demand or missed frames show the cap cannot be held. Migrates
     // the legacy Frame-Time Adaptation switch.
     bool adaptive_cap = false;
     // Adaptive cap percentile [50, 99]: the share of recent frames the
-    // lengthened interval must fit (R11). Separate from Smoothing.
+    // lengthened interval must fit. Separate from Smoothing.
     int adaptive_cap_percentile = kAdaptiveCapPercentileDefault;
 
     // OSD: Adaptive cap HUD line (historical key name)

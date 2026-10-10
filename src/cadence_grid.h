@@ -1,14 +1,13 @@
 #pragma once
 
-// Cadence grid (project-docs/002_unified_pacing_timing/
-// phase2_timing_core_design.md, section 2.1). One grid per scheduler owner:
+// Cadence grid. One grid per scheduler owner:
 // PlanNext, ObserveOutput, Suspend and Reset run on the owner only. Output
 // executors on any thread resolve targets from a published snapshot with
 // CadenceGrid_ResolveOutputTarget and record their outputs in
 // g_cadence_output_tracker; readers never block and writers never wait for
 // readers. Pure C++17: no Windows, logger or config dependencies.
 //
-// Rules beyond design 2.1 (tol = CadenceGrid_LateToleranceTicks):
+// Rules beyond the basic grid (tol = CadenceGrid_LateToleranceTicks):
 // - Segment history. A snapshot keeps the newest kCadenceGridSegmentHistory
 //   segments. Index n resolves through the newest segment with
 //   base_index <= n; an index older than the oldest retained segment is
@@ -91,7 +90,7 @@ bool CadenceGrid_TargetOf(
     uint64_t grid_index,
     int64_t* target_qpc) noexcept;
 
-// Fixed-refresh snap rule (P2-3), shared by PlanNext and the period
+// Fixed-refresh snap rule, shared by PlanNext and the period
 // governor's ladder: true when `fixed` is usable and interval_ticks is within
 // 2% of k >= 1 whole refreshes. *snapped_interval_ticks (optional) receives
 // k × refresh when true.
@@ -177,13 +176,13 @@ struct CadenceGridPlanInput {
     int64_t qpc_frequency = 0;
     double interval_us = 0.0;   // grid interval: source interval, FG divisor applied
     bool period_change = false; // cap, VRR ceiling, LFC or FG divisor changed I
-    // The period governor (C2) changed its step. With an interval change and
+    // The period governor changed its step. With an interval change and
     // no period_change it starts a GovernorStep epoch instead of a silent
     // rebase; Lifecycle, ModeChange and PeriodChange take priority.
     bool governor_step = false;
     double lead_us = 0.0;       // L; may exceed the interval. Negative clamps to 0
     // How much later than S a source can arrive and still make T: L minus
-    // the median measured X of its rung (R12). A source later than S by the
+    // the median measured X of its rung. A source later than S by the
     // late tolerance plus this restarts the cadence (SourceLate); up to it
     // the frame is released immediately on the same grid, and an output that
     // still misses T starts an OutputLate epoch. 0 (unknown) keeps the
@@ -238,7 +237,7 @@ public:
     // epoch. The caller publishes Snapshot() afterwards.
     void Suspend() noexcept;
 
-    // Plans the next grid index (design 2.1 steps 1-3). Invalid input returns
+    // Plans the next grid index (steps 1-3 of PlanNext). Invalid input returns
     // an invalid plan and leaves the grid unchanged. The caller publishes
     // Snapshot() afterwards.
     CadenceGridPlan PlanNext(const CadenceGridPlanInput& input) noexcept;

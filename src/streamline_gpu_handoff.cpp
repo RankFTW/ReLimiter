@@ -65,7 +65,7 @@ struct Route {
 struct Marker { GpuPresentFgInput input{}; int64_t release = 0; };
 thread_local Marker marker;
 thread_local GpuPresentFgInput last_marker;
-// Cross-thread hand-off (R8, cross_thread_slot.h): the newest marker (empty
+// Cross-thread hand-off (cross_thread_slot.h): the newest marker (empty
 // when rejected) for a proxy Present on another thread. Taken only by the
 // game's own outermost proxy Present, which frame generation never calls,
 // so a generated-frame Present cannot take a real frame's marker, and only
@@ -123,7 +123,7 @@ const char* InputRejection(const GpuPresentFgInput& input) noexcept {
 bool Current(const GpuPresentFgInput& input) noexcept { return !InputRejection(input); }
 void ReportAdmission(bool final) noexcept {
     const auto context = NativeGate_GetContext(Now());
-    // R12b: also report while the binding is current but the FG input route
+    // Also report while the binding is current but the FG input route
     // capability is missing (it stayed fg_unqualified after FG was re-enabled
     // in Gears of War: E-Day, and nothing was logged).
     if (!final && StreamlineHandoff_IsCurrent(epoch.load(std::memory_order_acquire)) &&
@@ -539,7 +539,7 @@ void StreamlineHandoff_Service(bool final) noexcept {
         completed_source_transaction.store(0, std::memory_order_relaxed);
         forward_filter.store(nullptr, std::memory_order_release); back_filter.store(nullptr, std::memory_order_release);
         lock.Unlock();
-        // R14: the source queue outlives the binding, so the gate keeps it
+        // The source queue outlives the binding, so the gate keeps it
         // registered and only re-reads the FG swapchain identity. Destroying a
         // queue is reported by ReShade (GpuPresent_OnQueueDestroy). No
         // plugin-owned fence is destroyed or signalled here.

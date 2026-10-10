@@ -272,8 +272,8 @@ void PollGSyncState() {
 
     // The first poll applies its result even when it matches the initial
     // g_gsync_active (false): the pacing mode starts as VRR, so a display
-    // without VRR at startup would otherwise stay paced as VRR (capture
-    // 44496_1: 130 FPS on a fixed 165 Hz panel, 1-1-2 refresh judder).
+    // without VRR at startup would otherwise stay paced as VRR (130 FPS on a
+    // fixed 165 Hz panel shows 1-1-2 refresh judder).
     if (first_poll || new_state != old_state)
         OnGSyncStateChange(new_state);
 }

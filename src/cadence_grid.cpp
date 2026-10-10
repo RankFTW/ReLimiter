@@ -24,7 +24,7 @@ namespace
     // Intervals closer than this are the same interval (no rebase). Legitimate
     // changes, including one adaptation step, are many orders larger.
     constexpr double kIntervalChangeToleranceTicks = 1e-6;
-    // P2-3: snap only when I is within 2% of k whole refreshes.
+    // Snap only when I is within 2% of k whole refreshes.
     constexpr double kFixedSnapTolerance = 0.02;
     constexpr int kEdgeSearchSteps = 4;
 
@@ -489,7 +489,7 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
 
     // Step 3: source lateness against S = T - L.
     int64_t wake_qpc = target_qpc - timing.lead_ticks;
-    // Late tolerance plus the source slack (R12): a source that still makes
+    // Late tolerance plus the source slack: a source that still makes
     // T keeps the cadence. Gears of War: E-Day with FG restarted it on 953
     // frames in 80 s, 65% of them ready before the old target, and each
     // restart moved the grid about 4.8 ms later (6% of the frame rate).

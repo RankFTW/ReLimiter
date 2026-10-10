@@ -243,13 +243,13 @@ add_executable(test_rung_feasibility
     ${CMAKE_SOURCE_DIR}/src/lead_controller.cpp
     ${CMAKE_SOURCE_DIR}/src/pacing_metrics.cpp
 )
-# Governor-step and rung-feasibility event derivation of the telemetry worker
-# (P3-14). The worker thread and CSV rows need live capture validation.
+# Governor-step and rung-feasibility event derivation of the telemetry worker.
+# The worker thread and CSV rows need live capture validation.
 add_executable(test_pacing_controller_events
     test_pacing_controller_events.cpp
     ${CMAKE_SOURCE_DIR}/src/pacing_controller_events.cpp
 )
-# Pre-Sleep placement (phase4_design.md P4-8 to P4-10): margin, measured
+# Pre-Sleep placement: margin, measured
 # selection and guards. The Sleep hook, the owner guard and the driver's Sleep
 # behavior need live validation.
 add_executable(test_source_placement
@@ -414,7 +414,7 @@ add_executable(test_pacing_sleep
     ${CMAKE_SOURCE_DIR}/src/wake_guard.cpp)
 target_compile_definitions(test_pacing_sleep PRIVATE
     NOMINMAX WIN32_LEAN_AND_MEAN)
-# Pacing telemetry (project-docs/002_unified_pacing_timing/phase0_measurement_design.md)
+# Pacing telemetry
 add_executable(test_pacing_metrics test_pacing_metrics.cpp
     ${CMAKE_SOURCE_DIR}/src/pacing_metrics.cpp)
 add_executable(test_pacing_join test_pacing_join.cpp

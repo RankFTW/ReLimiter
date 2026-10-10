@@ -182,7 +182,7 @@ void TestCaptureAndThreadIsolation() {
     CHECK(NativeGate_HasNoFrameGeneration(3) && !NativeGate_HasNoFrameGeneration(4));
     const auto context = Context(1);
     CHECK(!NativeGate_OnMarker(context, Key(1)));
-    // R8: a Present on another thread takes the newest marker (hand-off),
+    // A Present on another thread takes the newest marker (hand-off),
     // observed only (Shadow) until telemetry verifies the mapping...
     std::thread other([&] {
         NativeGate_BeginScope(context.native_swapchain, context.swapchain_generation);
@@ -206,7 +206,7 @@ void TestCaptureAndThreadIsolation() {
     NativeGate_SetMode(NativeGateMode::Marker);
     CHECK(!NativeGate_HasNoFrameGeneration(3));
 }
-// R8 (Gears of War: E-Day): PRESENT_START on one thread, Present on another,
+// Cross-thread hand-off (Gears of War: E-Day): PRESENT_START on one thread, Present on another,
 // strictly alternating. The Present thread's route qualifies after 32
 // hand-offs and then selects native carriage; a Present without a new marker
 // or a skipped frame resets qualification.
@@ -289,7 +289,7 @@ void TestCrossThreadHandoff() {
     stop.store(true);
     present.join();
 }
-// R8 review M1/M2: a thread that presents its own markers offers nothing to
+// A thread that presents its own markers offers nothing to
 // other Present threads (DLSS-G's present thread, a loading thread), and a
 // frame with frame generation is never offered.
 void TestSameThreadOwnerKeepsMarker() {

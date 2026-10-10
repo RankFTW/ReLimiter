@@ -5,8 +5,7 @@
 #include <cstdint>
 #include <atomic>
 
-// CPU output executors (project-docs/002_unified_pacing_timing/
-// phase2_timing_core_design.md 2.6): H1 (MarkerHold) at PRESENT_START, H2
+// CPU output executors: H1 (MarkerHold) at PRESENT_START, H2
 // (NativeHold) at the native Present, and the H0 (SourceOnly) release at
 // PRESENT_START. Every call reads only the exact-key plan, the published
 // cadence grid and the output tracker; it never needs the scheduler owner
@@ -16,12 +15,12 @@
 // Duplicate report the status without a hold or an output. A claimed plan
 // resolves its target through CadenceGrid_ResolveOutputTarget (fail: Stale),
 // then: now >= T is Late, T - now > kPresentationGateMaximumHoldIntervals * I
-// is Undeliverable (P2-9), otherwise the thread spins to T (Held). Every
+// is Undeliverable, otherwise the thread spins to T (Held). Every
 // claimed outcome records its effective output (release or decision time) in
 // g_cadence_output_tracker and pushes one OutputRelease stage event before
 // the call returns, so both happen before the caller forwards the Present.
 
-// CPU holds longer than this many grid intervals are not performed (P2-9).
+// CPU holds longer than this many grid intervals are not performed.
 constexpr double kPresentationGateMaximumHoldIntervals = 1.5;
 
 // Synchronous hold cancellation (H2 route/lifetime revalidation). The caller
@@ -52,7 +51,7 @@ void PresentGate_Execute(const PacingPlanKey& key, PacingRung rung,
                          const PresentationGateOptions* options,
                          PresentationGateResult* result);
 
-// H0 at PRESENT_START (P2-8): claims a SourceOnly plan and releases it at
+// H0 at PRESENT_START: claims a SourceOnly plan and releases it at
 // arrival_qpc with status SourceOnly (tracker record and OutputRelease).
 void PresentGate_ReleaseSourceOnly(const PacingPlanKey& key, int64_t arrival_qpc,
                                    PresentationGateResult* result);
@@ -78,7 +77,7 @@ void PresentGate_OnPresentStart(const PacingPlanKey& key, int64_t arrival_qpc,
 // NvAPI and PCL hooks: for a planned frame of any rung, pushes the
 // RenderSubmitStart, SimulationEnd or PresentEnd event. The lead controller
 // uses RENDERSUBMIT_START on the FG input wait to remove the delay its hold
-// carried into the frame through a busy GPU (R13), all three to remove the
+// carried into the frame through a busy GPU, all three to remove the
 // time a finished frame waited for the game's render thread to leave the
 // previous Present (FG input wait; GPU queue wait under the A/B key), and all
 // three on every rung for the render handoff offset (lead_controller.h).

@@ -337,7 +337,7 @@ void TestGpuResumeWithoutHistory()
     CHECK(controller->BucketStatus(PacingRung::GpuQueueWait, 2.0).samples == 0);
 }
 
-// R13 on the FG input wait: holds carried through a busy GPU. Frame n's GPU
+// Carried hold on the FG input wait: holds carried through a busy GPU. Frame n's GPU
 // work waits behind frame n − 1's release; with the RENDERSUBMIT_START time w
 // the sample is the frame's own readiness, w + G, not the chained r − s.
 void TestGpuCarriedHold()
@@ -374,7 +374,7 @@ void TestGpuCarriedHold()
     CHECK(controller->Statistics().carried_hold_samples == 2);
     controller->OnStageEvent(Event(3, Kind::OutputRelease, 48000.0));
 
-    // Without the marker w = p = u_3 hides the carried delay (the Phase 2
+    // Without the marker w = p = u_3 hides the carried delay (the chained
     // formula): X = p + (r − max(p, u)) = 8000 + 9000.
     controller->OnSourceRelease(Start(4, fg, 40000.0));
     controller->OnStageEvent(Event(4, Kind::PresentCall, 48000.0));
@@ -445,12 +445,12 @@ void TestCarriedHoldNeedsAHeldPreviousFrame()
     CHECK_NEAR(queue->Statistics().last_carried_hold_us, 2000.0);
 }
 
-// The game's simulation → render queue (CONTROL 31724_1): an FG input wait
+// The game's simulation → render queue: an FG input wait
 // lead sample drops the time a finished frame waited for the render thread to
 // leave the previous frame's Present, q = max(0, min(w_n, b_{n−1}) −
 // max(s_n, e_n)); the slack keeps X. Other rungs keep X with the same stage
-// times (CONTROL 15312_1: on source only q was the game's own pipeline depth).
-// No GPU frame is held, so R13 adds nothing.
+// times (on source only q was the game's own pipeline depth).
+// No GPU frame is held, so the carried hold adds nothing.
 void TestSimulationRenderQueue()
 {
     auto controller = MakeController();
@@ -576,7 +576,7 @@ void TestGpuQueueWaitRenderQueue()
     CHECK(queued == 0);
 }
 
-// R13 closed loop on the FG input wait: a GPU at 95% of the interval behind
+// Closed loop of the carried hold on the FG input wait: a GPU at 95% of the interval behind
 // ReLimiter's own holds. The chained sample made X follow L up to the
 // budget; the carried-hold sample keeps the lead near the frame's own w + G.
 double RunGpuChainLoop(bool render_submit_marker, uint32_t* negative)
@@ -623,10 +623,10 @@ void TestGpuChainLeadStaysOwn()
     uint32_t chained_negative = 0;
     const double chained = RunGpuChainLoop(false, &chained_negative);
     std::printf("chain loop: lead without marker %.0f us, negative %u/120\n", chained, chained_negative);
-    CHECK(chained > own + 4000.0); // the Phase 2 sample climbs toward 2 I
+    CHECK(chained > own + 4000.0); // the chained sample climbs toward 2 I
 }
 
-// Rogue Core capture 7944_5 (2026-10-03): the game's release-to-ready time X
+// Rogue Core capture: the game's release-to-ready time X
 // does not depend on the previous frame's GPU hold (archived light captures:
 // slope dX_n/dhold_{n-1} about 0), RENDERSUBMIT_START comes early (s + 500)
 // and the GPU is still busy with frame n - 1 then. Probed GPU queue wait,
@@ -1202,7 +1202,7 @@ void TestDeepPipelineFits()
     CHECK_NEAR(status.budget_us, 3.0 * interval);
 }
 
-// ── Phase 3: budget, slack and resume history ──
+// ── Budget, slack and resume history ──
 
 namespace
 {
@@ -1253,7 +1253,7 @@ void TestBudgetClamp()
     auto controller = MakeController();
     WarmBucket(controller.get(), 1, PacingRung::MarkerHold, 2000.0); // Q = 2010
 
-    // R15: the limit is the outlier bound, 3 I = 2400 at I = 800. Target
+    // The limit is the outlier bound, 3 I = 2400 at I = 800. Target
     // 2510: the first warm jump is clamped and flagged.
     bool budget_limited = false;
     CHECK_NEAR(controller->NextLeadUs(Request(PacingRung::MarkerHold, 500.0, 800.0), &budget_limited), 2400.0);
@@ -1298,7 +1298,7 @@ void TestBudgetClamp()
     CHECK(!controller->Feasibility(PacingRung::MarkerHold, 1.0).budget_limited);
 }
 
-// Holds resume after a hold feasibility demotion (capture 6560_1): the rung's
+// Holds resume after a hold feasibility demotion: the rung's
 // window restarts; until it is warm again the lead is the old median plus the
 // allowance, then the first warm target applies at once.
 void TestRestartRung()
@@ -1346,7 +1346,7 @@ void TestRestartRung()
 }
 
 // A GPU wait resumes from at least the warm source-only Q_q of its FG divisor,
-// which the demoted frames fed (capture 26752_1: the GPU queue wait's window
+// which the demoted frames fed (seen in a capture: the GPU queue wait's window
 // was learned while loading, X was about 20 ms in play). A lower source-only
 // Q_q, a cold source-only window and the CPU holds keep the old median.
 void TestRestartRungSourceFloor()
@@ -1536,7 +1536,7 @@ void TestResumeDelayRequiresWait()
     CHECK(controller->Statistics().resume_not_waited == 0);
 
     // GPU backlog: it reached the Wait after the Signal, so u − o is its own
-    // earlier work, not Signal→resume latency (M2); none of it enters the
+    // earlier work, not Signal→resume latency; none of it enters the
     // history or the GPU wait cap's resume counters.
     for (uint64_t index = 35; index <= 66; ++index) FeedProbedGpuFrame(controller.get(), index, 2000.0, 1.0);
     CHECK_NEAR(FallbackMedianUs(controller.get(), 67), 300.0);
@@ -2208,7 +2208,7 @@ void TestReleaseHeadroomObservations()
     CHECK(learning->Statistics().headroom_samples == 0);
 }
 
-// Queue order (CONTROL 7636, Rogue Core): the collision guard stands aside
+// Queue order (Rogue Core): the collision guard stands aside
 // once 32 waited releases found the next frame's GPU work, submitting before
 // the release, starting only after it, and comes back at the first pair
 // whose next frame started more than 100 µs before the release, until that
@@ -2313,7 +2313,7 @@ void TestReleaseHeadroomBounds()
     CHECK_NEAR(low.MarginUs(), 1000.0);
 }
 
-// Render handoff offset (phase4_design.md section 23): each frame released
+// Render handoff offset: each frame released
 // at or after the previous frame's RENDERSUBMIT_START adds h = (b − w) of the
 // previous frame minus its own simulation (e − s); d = Q5(h) − allowance at
 // Smoothing's q = 0.95, never below 0, 0 until 16 samples.

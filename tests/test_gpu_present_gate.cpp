@@ -1,4 +1,4 @@
-// H3 GPU output executor (phase2_timing_core_design.md 2.6). Links the real
+// H3 GPU output executor. Links the real
 // frame-plan registry, cadence grid publication/tracker and pipeline resolver;
 // the x64 part includes the D3D12 executor with fake fences and queues. Driver
 // fakes prove ownership, ordering and bookkeeping, not displayed pacing.
@@ -30,7 +30,7 @@ void PublishRung(PacingRung rung,PacingFallbackReason reason=PacingFallbackReaso
 void SetProbes(bool probes) {
     auto config=PacingPipeline_GetConfig();config.gpu_probes=probes;PacingPipeline_SetConfig(config);
 }
-// clamp(3 I, 2 ms, 100 ms) in ticks (GPU_PRESENT_HORIZON_INTERVALS, R15).
+// clamp(3 I, 2 ms, 100 ms) in ticks (GPU_PRESENT_HORIZON_INTERVALS).
 void TestHorizon() {
     CHECK(GpuPresent_HorizonTicks(500,1000000)==2000);    // floor 2 ms
     CHECK(GpuPresent_HorizonTicks(11111,1000000)==33333); // 3 I
@@ -306,7 +306,7 @@ void TestStartupReload() {
         }
     }
 }
-// D12 item 5: the live worker requests MMCSS only while an H3 rung is resolved
+// The live worker requests MMCSS only while an H3 rung is resolved
 // (or obligations exist), follows rung changes on its own thread, and without
 // demand waits for work_event instead of polling every 50 ms. FG route
 // qualification alone never registers MMCSS.
@@ -399,7 +399,7 @@ void TestStatusWindow() {
     status={};status_position=0;
 }
 
-// ── Executor contract (design 2.6) ──
+// ── Executor contract ──
 namespace {
 constexpr double kInterval=11111; // us == ticks at 1 MHz
 int64_t grid_origin=0;
@@ -575,7 +575,7 @@ void TestExecutor() {
     }
     for(const auto& ticket:queue.tickets)CHECK(ticket.state.load()==TicketState::Free);
 
-    // Q15 (the P3-4 release advance is withdrawn): with probes on, the Signal
+    // The Signal release is not advanced: with probes on, the Signal
     // and OutputRelease o of a GPU queue wait happen at T itself, never
     // before; the worker's next wake is T.
     {
@@ -625,7 +625,7 @@ void TestExecutor() {
         ExpectNoStage();
     }
     // With a valid pre-Wait probe, GpuResume carries its time so the lead
-    // controller can tell a GPU waiting at the Signal from GPU backlog (M2).
+    // controller can tell a GPU waiting at the Signal from GPU backlog.
     {
         auto& ticket=queue.tickets[3];
         GpuTimestampSlot pre;pre.ownership=GpuTimestampOwnership::CpuOwned;
@@ -700,7 +700,7 @@ void TestExecutor() {
     // The route lapses 250 ms after the last input.
     fake_clock+=300000;heartbeat=fake_clock;Service();
     CHECK(!GpuPresent_IsFgSupported(generation));
-    // R14: a Streamline binding retirement keeps the queue registered (no
+    // A Streamline binding retirement keeps the queue registered (no
     // teardown); the worker re-reads a changed FG swapchain identity once no
     // FG measurement or wait is outstanding.
     GpuPresent_OnFgBindingRetired(address);

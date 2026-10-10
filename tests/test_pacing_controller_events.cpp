@@ -1,5 +1,5 @@
-// Controller events of the pacing telemetry worker (src/pacing_controller_events.*,
-// phase3_controllers_design.md P3-14, phase4_design.md P4-6): governor_step
+// Controller events of the pacing telemetry worker (src/pacing_controller_events.*):
+// governor_step
 // (cause-only, one event per phase transition), rung_feasibility and
 // gpu_wait_cap
 // derivation from Source records and the capture-start snapshot. Directly
@@ -76,7 +76,7 @@ namespace
         // A rise transition carries its cause and the previous record's step.
         CHECK(SameEvent(PacingControllerEvents_Observe(&state, Governed(2, kCauseMisses)).governor,
             true, 0, 2, kCauseMisses));
-        // The continuous ramp after the transition (P4-6): no event per percent.
+        // The continuous ramp after the transition: no event per percent.
         for (uint8_t step = 4; step <= 20; step += 2) {
             CHECK(!PacingControllerEvents_Observe(&state, Governed(step)).governor.emit);
         }

@@ -1,11 +1,10 @@
-// Pacing metric definitions (project-docs/002_unified_pacing_timing/
-// phase0_measurement_design.md section 4): unit cases plus golden vectors.
+// Pacing metric definitions: unit cases plus golden vectors.
 //
 // Golden vectors, shared with the offline analyzer (analyze_pacing.py). Both
 // files are plain CSV with one header line; empty cells are unknown values.
 //
 // data/pacing_metrics_rows.csv: input rows in processing order, using the
-// fixed relimiter_pacing column names (design section 5) without the derived
+// fixed relimiter_pacing column names without the derived
 // columns. qpc_frequency is 10 MHz. A Source record is joined exactly when
 // source_release_qpc is non-empty. row_kind 2 rows (unjoined Present records)
 // leave the display columns empty.
@@ -25,7 +24,7 @@
 //                 metrics (display_change, chain_break, long_frame,
 //                 short_frame, real_frame) leave p50_us and p99_us empty.
 //
-// Rules the files encode (design section 4 plus these conventions):
+// Rules the files encode:
 // - us(ticks) = ticks * 1e6 / qpc_frequency. Intervals, jitter, animation
 //   error, latency, residence and hold are differences of integer ticks
 //   converted once. T_out = interval_us / fg_divisor.

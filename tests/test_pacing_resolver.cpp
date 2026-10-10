@@ -1,4 +1,4 @@
-// Directly tests the production pacing pipeline resolver (design section 2.4):
+// Directly tests the production pacing pipeline resolver:
 // every rule and fallback reason with its precedence, the override step-downs,
 // the smoothing table, generation publication, capability generation tags,
 // configuration clamping and text, and untorn reads under a concurrent writer.
@@ -665,7 +665,7 @@ namespace
 
     // ── Configuration ──
 
-    // ── Source placement (phase4_design.md P4-8, P4-11) ──
+    // ── Source placement ──
 
     void TestSourcePlacement()
     {
@@ -673,7 +673,7 @@ namespace
         sleeping.pre_sleep_available = true;
         PacingPipelineConfig config{};
 
-        // Default (2026-10-09): pre-Sleep while the game calls the Reflex
+        // Default: pre-Sleep while the game calls the Reflex
         // Sleep, marker without it; the rung is unchanged.
         CHECK(config.placement_override == PacingPlacementOverride::PreSleep);
         CHECK_RESULT(Resolve(config, QualifiedDx12(), sleeping), Vrr, PreSleep, GpuQueueWait, None);
@@ -713,7 +713,7 @@ namespace
         CHECK(PacingPipeline_ClampConfig(invalid).placement_override == PacingPlacementOverride::PreSleep);
         invalid.gpu_queue_wait_render_queue = static_cast<PacingRenderQueue>(9);
         CHECK(PacingPipeline_ClampConfig(invalid).gpu_queue_wait_render_queue == PacingRenderQueue::Keep);
-        // Legacy `auto` (self-disengaging pre-Sleep, before R15) reads as marker.
+        // Legacy `auto` (the former self-disengaging pre-Sleep) reads as marker.
         PacingPlacementOverride legacy = PacingPlacementOverride::Driver;
         CHECK(PacingPlacementOverride_FromText("AUTO", &legacy) && legacy == PacingPlacementOverride::Marker);
         for (uint32_t index = 0; index < static_cast<uint32_t>(PacingPlacementOverride::Count); ++index) {
@@ -808,7 +808,7 @@ namespace
         CHECK(SameConfig(PacingPipeline_GetConfig(), config));
         CHECK(PacingPipeline_GetConfig().adaptive_cap);
         CHECK(PacingPipeline_GetConfig().adaptive_cap_percentile == 90);
-        // R11: the Adaptive cap percentile is clamped to [50, 99].
+        // The Adaptive cap percentile is clamped to [50, 99].
         CHECK(PacingPipelineConfig{}.adaptive_cap_percentile == kAdaptiveCapPercentileDefault);
         config.adaptive_cap_percentile = 10;
         CHECK(PacingPipeline_ClampConfig(config).adaptive_cap_percentile == kAdaptiveCapPercentileMin);
@@ -817,7 +817,7 @@ namespace
         CHECK(PacingPipeline_GetConfig().adaptive_cap_percentile == kAdaptiveCapPercentileMax);
 
         // gpu_wait_budget_us: [500, 5000] µs, default 1500; non-positive or
-        // non-finite values (0 was "off" before 2026-10-04) are the default.
+        // non-finite values (0 used to mean "off") are the default.
         struct BudgetCase { double input; double expected; };
         const BudgetCase budget_cases[] = {
             { -5.0, 1500.0 }, { nan, 1500.0 }, { 0.0, 1500.0 }, { 200.0, 500.0 },
@@ -873,7 +873,7 @@ namespace
             CHECK(parsed == value);
         }
 
-        // The earlier levels load as On (design review 2026-10-03).
+        // The earlier levels load as On.
         PacingSmoothing parsed = PacingSmoothing::Off;
         CHECK(PacingSmoothing_FromText("MEDIUM", &parsed) && parsed == PacingSmoothing::On);
         parsed = PacingSmoothing::Off;
@@ -966,8 +966,8 @@ namespace
         CHECK(PacingPipeline_SameResult(read, overridden));
     }
 
-    // Overload guard and the not-held A/B interleave block (design review
-    // 2026-10-03, 2026-10-05): Auto rules 6–8 only.
+    // Overload guard and the not-held A/B interleave block:
+    // Auto rules 6–8 only.
     void TestHoldFeasibility()
     {
         const PacingPipelineConfig config{};

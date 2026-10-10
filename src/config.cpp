@@ -26,7 +26,7 @@ Config g_config;
 // Recommended defaults, for the developer diagnostics count and reset.
 static const Config s_default_config{};
 
-// INI layout version. 2 (2026-10-09): the Reflex Sleep bypass and pre-Sleep
+// INI layout version. 2: the Reflex Sleep bypass and pre-Sleep
 // placement became the defaults. Earlier builds saved every key, so an INI
 // without this version carries the old defaults of those two keys.
 static constexpr int kConfigVersion = 2;
@@ -235,8 +235,8 @@ void ValidateConfig() {
         g_config.stall_inject_period_s,
         kPacingStallInjectMinPeriodS,
         kPacingStallInjectMaxPeriodS);
-    // gpu_wait_budget_us: the GPU wait cap ladder's top level. Builds before
-    // 2026-10-04 saved 0 for "off"; 0 or less now loads as the default.
+    // gpu_wait_budget_us: the GPU wait cap ladder's top level. Older builds
+    // saved 0 for "off"; 0 or less now loads as the default.
     if (!std::isfinite(g_config.gpu_wait_budget_us) || g_config.gpu_wait_budget_us <= 0.0) {
         g_config.gpu_wait_budget_us = kPacingGpuWaitBudgetDefaultUs;
     } else {
@@ -263,7 +263,7 @@ void ValidateConfig() {
     g_config.selected_monitor = Clamp(g_config.selected_monitor, 0, 8);
 }
 
-// ── Pacing pipeline keys (phase2_timing_core_design.md section 4, P2-4) ──
+// ── Pacing pipeline keys ──
 // Retired pacing keys (Estimator A, native predictor, gate location, GPU gate
 // mode/slack/max delay, adaptive reserve, smoothing tuning, readiness observer)
 // are never read; pacing_method and adaptive_smoothing are read only to migrate
@@ -275,7 +275,7 @@ static void LoadPacingPipelineKeys(const char* S, const char* P) {
         g_config.smoothing = PacingSmoothing::On;
     }
 
-    // P2-4: marker pacing becomes the marker rung override; automatic, native
+    // Marker pacing becomes the marker rung override; automatic, native
     // and invalid methods resolve automatically.
     const std::string output_rung = ReadINIString(S, "output_rung", "", P);
     if (output_rung.empty()) {
@@ -831,7 +831,7 @@ void SaveConfig() {
     }
 }
 
-// Pipeline configuration of the resolver and the source stage (design 2.4, 2.8).
+// Pipeline configuration of the resolver and the source stage.
 static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
     PacingPipelineConfig pipeline;
     pipeline.smoothing = config.smoothing;
@@ -849,7 +849,7 @@ static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
 }
 
 void Config_ApplyPacingPipeline() {
-    // adaptive_cap (Q1 a, P3-5) reaches the period governor through the
+    // adaptive_cap reaches the period governor through the
     // pipeline configuration; the scheduler owner applies it each frame.
     PacingPipeline_SetConfig(PacingPipelineConfigFrom(g_config));
     g_marker_forward_after_wait.store(

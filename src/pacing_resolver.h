@@ -1,7 +1,6 @@
 #pragma once
 
-// Pacing pipeline resolver (project-docs/002_unified_pacing_timing/
-// phase2_timing_core_design.md, sections 2.4, 2.8 and 4). Resolves the timing
+// Pacing pipeline resolver. Resolves the timing
 // mode, source placement, output rung, fallback reason and lead parameters
 // from the pipeline configuration, the executors' capabilities and the runtime
 // state, and publishes the result for any thread. Pure C++17: no Windows,
@@ -21,9 +20,9 @@
 
 // ── Configuration ──
 
-// User setting `smoothing` (Q1 a): lead headroom of the output rungs.
-// INI text: off | on; the earlier levels low | medium | high load as on (design
-// review 2026-10-03: the levels changed latency, not display jitter).
+// User setting `smoothing`: lead headroom of the output rungs.
+// INI text: off | on; the earlier levels low | medium | high load as on (the
+// levels changed latency, not display jitter).
 enum class PacingSmoothing : uint8_t {
     Off = 0, // no output hold (H0)
     On = 1,  // default
@@ -40,7 +39,7 @@ enum class PacingRungOverride : uint8_t {
     Count
 };
 
-// Developer key `marker_forward_order` (Q11 a; x64 NvAPI marker path only):
+// Developer key `marker_forward_order` (x64 NvAPI marker path only):
 // when the enforcement marker reaches the driver relative to the source wait.
 // INI text: before_wait | after_wait. The PCL path always forwards after it.
 enum class PacingMarkerForwardOrder : uint8_t {
@@ -49,7 +48,7 @@ enum class PacingMarkerForwardOrder : uint8_t {
     Count
 };
 
-// Key `source_placement` (phase4_design.md P4-11, R15): where the source
+// Key `source_placement`: where the source
 // stage waits on marker routes. The user's choice; ReLimiter never switches
 // it. INI text: marker | pre_sleep | driver (legacy `auto` reads as marker).
 enum class PacingPlacementOverride : uint8_t {
@@ -59,7 +58,7 @@ enum class PacingPlacementOverride : uint8_t {
     Count
 };
 
-// Stall injector ranges (design 2.8).
+// Stall injector ranges.
 constexpr double kPacingStallInjectMaxMs = 200.0;
 constexpr double kPacingStallInjectMinPeriodS = 1.0;
 constexpr double kPacingStallInjectMaxPeriodS = 60.0;
@@ -71,14 +70,14 @@ constexpr double kPacingStallInjectDefaultPeriodS = 5.0;
 constexpr double kPacingGpuWaitBudgetMinUs = 500.0;
 constexpr double kPacingGpuWaitBudgetMaxUs = 5000.0;
 constexpr double kPacingGpuWaitBudgetDefaultUs = 1500.0;
-// Developer key gpu_wait_interleave_s (2026-10-05): with Output override Auto,
+// Developer key gpu_wait_interleave_s: with Output override Auto,
 // the GPU queue wait alternates held and not held in blocks of about this many
 // seconds for unbiased A/B captures (rung_feasibility.h HoldInterleave). 0 is
 // off; other values are clamped to [1, 10] s; negative or non-finite is off.
 constexpr double kPacingGpuWaitInterleaveMinS = 1.0;
 constexpr double kPacingGpuWaitInterleaveMaxS = 10.0;
 
-// Adaptive cap percentile (phase4_design.md section 18, R11): the share of
+// Adaptive cap percentile: the share of
 // recent frames whose measured need the governed interval must fit. Higher
 // is more even pacing at a lower frame rate; lower keeps more frame rate and
 // lets the slowest frames run late. Separate from the Smoothing lead quantile.
@@ -89,9 +88,9 @@ constexpr int kAdaptiveCapPercentileDefault = 75;
 struct PacingPipelineConfig {
     PacingSmoothing smoothing = PacingSmoothing::On;
     PacingRungOverride rung_override = PacingRungOverride::Auto;
-    bool adaptive_cap = false;    // user key adaptive_cap: the period governor (C2, P3-5, P4-1)
-    int adaptive_cap_percentile = kAdaptiveCapPercentileDefault; // user key; [50, 99] (R11)
-    PacingPlacementOverride placement_override = PacingPlacementOverride::PreSleep; // key source_placement (default since 2026-10-09)
+    bool adaptive_cap = false;    // user key adaptive_cap: the period governor
+    int adaptive_cap_percentile = kAdaptiveCapPercentileDefault; // user key; [50, 99]
+    PacingPlacementOverride placement_override = PacingPlacementOverride::PreSleep; // key source_placement
     bool gpu_probes = true;       // developer key gpu_present_gate_probes
     double gpu_wait_budget_us = kPacingGpuWaitBudgetDefaultUs; // developer key gpu_wait_budget_us: [500, 5000]
     double gpu_wait_interleave_s = 0.0; // developer key gpu_wait_interleave_s: 0 = off, else [1, 10]
@@ -145,7 +144,7 @@ struct PacingPipelineSnapshot {
     PacingRoute route = PacingRoute::None;
     PacingSourcePlacement placement = PacingSourcePlacement::None;
     PacingRung rung = PacingRung::SourceOnly;
-    // The rung from rules 3-8 before the overload guard (the override or
+    // The resolved rung before the overload guard (the override or
     // fallback rung when not Auto). Differs from `rung` only while the guard
     // demotes an Auto hold (reason Infeasible); the FG route qualification
     // check, the guard's judged frames and telemetry read it.
@@ -162,10 +161,10 @@ struct PacingPipelineSnapshot {
 // Infeasible, auto_rung GpuQueueWait), else the rung. The not-held frames then keep the
 // held frames' release phase: the source-only lead targets the Present call
 // and is about 4.5 ms shorter, and switching between them moved the release
-// by that much in one frame (capture 49596_1: 11.8-13.2 ms display intervals
+// by that much in one frame (11.8-13.2 ms display intervals
 // at every held -> not-held switch). The source stage plans such a frame with
 // at least the warm lead of the rung that outputs it, the only one of the two
-// windows still learning (source_stage.cpp, capture 26752_1).
+// windows still learning (source_stage.cpp).
 constexpr PacingRung PacingPipeline_LeadRung(const PacingPipelineSnapshot& pipeline) noexcept
 {
     return pipeline.rung == PacingRung::SourceOnly &&
@@ -177,7 +176,7 @@ constexpr PacingRung PacingPipeline_LeadRung(const PacingPipelineSnapshot& pipel
 
 // ── Resolution (pure) ──
 
-// First matching rule of design 2.4. Clamps the configuration first; unknown
+// First matching rule of the resolution order. Clamps the configuration first; unknown
 // route values resolve as passthrough. Returns generation 0.
 PacingPipelineSnapshot PacingPipeline_Resolve(
     const PacingPipelineConfig& config,

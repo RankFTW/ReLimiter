@@ -3,7 +3,7 @@
 #include <atomic>
 #include <cstdint>
 
-// One resolved FG state per frame (phase4_design.md P4-13; plan 6.7, D9):
+// One resolved FG state per frame:
 // the raw divisor the scheduler resolved for its newest frame (1 without
 // FG). The OSD and frame splitting read it instead of recomputing. Written
 // by the scheduler owner; any thread reads.

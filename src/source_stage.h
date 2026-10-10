@@ -1,7 +1,6 @@
 #pragma once
 
-// Source stage (project-docs/002_unified_pacing_timing/
-// phase2_timing_core_design.md sections 2.5, 2.7 and 2.8). The scheduler
+// Source stage. The scheduler
 // owner's planning core: drains stage events into the lead controller and the
 // cadence grid, plans one grid index per real frame, publishes the frame plan
 // before the source wait, waits until S_n, runs the developer stall injector,
@@ -39,7 +38,7 @@ protected:
 
 // ── Lifecycle and period tracking ──
 
-// Identity of the controller lifecycle (P2-10). A change of any field bumps
+// Identity of the controller lifecycle. A change of any field bumps
 // the controller generation; cap, FG divisor and LFC changes never do.
 struct SourceStageLifecycle {
     PacingApi api = PacingApi::None;
@@ -62,7 +61,7 @@ private:
 // period_change for CadenceGrid::PlanNext: true when the period identity (cap,
 // VRR ceiling, LFC multiple, raw FG divisor or idle cap) changed since the
 // previous plan. Ramped-divisor frames and period governor steps alone never
-// set it (P2-6, P3-10).
+// set it.
 class SourceStagePeriodTracker {
 public:
     bool Observe(PacingTimingMode mode, double base_interval_us) noexcept;
@@ -74,13 +73,13 @@ private:
     bool initialized_ = false;
 };
 
-// ── Stall injector (design 2.8) ──
+// ── Stall injector ──
 
 class SourceStallInjector {
 public:
     // Stall length in QPC ticks due now (0 = none). The first stall comes one
     // period after the injector is enabled, then once per period. Disabling
-    // (stall_ms <= 0) re-arms it. Configuration is clamped to the design
+    // (stall_ms <= 0) re-arms it. Configuration is clamped to the supported
     // ranges.
     int64_t Next(
         int64_t now_qpc,
@@ -108,7 +107,7 @@ struct SourceStageRequest {
     double interval_us = 0.0;          // grid interval: FG divisor, governor step and LFC applied
     double fg_divisor = 1.0;
     bool period_change = false;
-    bool governor_step = false;        // the period governor (C2) stepped on this frame
+    bool governor_step = false;        // the period governor stepped on this frame
 
     CadenceGridFixedReference fixed{}; // Fixed mode only
     double max_wait_intervals = 2.0;   // safety clamp of the source wait, in grid intervals
@@ -130,13 +129,12 @@ struct SourceStageRequest {
     uint64_t pre_wait_index = 0;
     int64_t pre_wait_start_qpc = 0;
     int64_t pre_wait_end_qpc = 0;
-    // Render handoff limit (phase4_design.md section 23): the frame is
+    // Render handoff limit: the frame is
     // released no earlier than this QPC; 0 = no limit. The grid judges the
     // frame as arriving at max(now, earliest), so a limit beyond S_n restarts
     // the cadence like any late source, and the wait runs to max(S_n,
     // earliest). Frames not held only: on held frames the limit moved the
-    // game's simulation into its render thread's submission (2026-10-10,
-    // 38644_1, phase4_design.md section 23, Decision 3).
+    // game's simulation into its render thread's submission.
     int64_t earliest_release_qpc = 0;
 };
 
@@ -154,7 +152,7 @@ struct SourceStageFrame {
     int64_t pre_wait_start_qpc = 0; // the request's pre-Sleep wait when the plan took its index; 0 none
     int64_t pre_wait_end_qpc = 0;
     uint32_t stall_injected_us = 0;
-    bool lead_budget_limited = false; // C1 clamped the lead to its 2 I budget (P3-2)
+    bool lead_budget_limited = false; // the lead was clamped to its 3 I limit
     bool handoff_limited = false;     // the render handoff limit moved the release past S_n
 };
 
@@ -178,7 +176,7 @@ public:
     void Reset(int64_t qpc_frequency) noexcept;
     // Enforcement-marker change: lead buckets only.
     void ResetBuckets() noexcept { lead_.ResetBuckets(); }
-    // C3 evidence restart (governor step or reset, lifecycle, cap, FG divisor
+    // Overload-guard evidence restart (governor step or reset, lifecycle, cap, FG divisor
     // or route change) or an infeasible-lead governor miss: the lead slack
     // windows only (LeadController::ClearSlackEvidence).
     void ClearSlackEvidence() noexcept { lead_.ClearSlackEvidence(); }

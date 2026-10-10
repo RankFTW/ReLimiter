@@ -1,6 +1,6 @@
 #pragma once
 
-// Reflex latency-report clock mapping (phase0_measurement_design.md, task D).
+// Reflex latency-report clock mapping.
 // The NvAPI PRESENT_START hook records ReLimiter's QPC per frame; report
 // ingestion takes it back to compare against the driver's presentStartTime.
 // Pure C++17: no Windows headers, so the standalone test compiles it alone.

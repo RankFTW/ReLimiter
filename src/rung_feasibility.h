@@ -1,11 +1,8 @@
 #pragma once
 
-// Feasibility evidence, the overload guard and the GPU queue wait cap
-// (project-docs/002_unified_pacing_timing/phase3_controllers_design.md,
-// P3-7 and P3-11; design review 2026-10-03; hold strategy simulation
-// 2026-10-04, tools/hold_sim and tools/adaptive_cap_sim; interleaved capture
-// 45760_1, 2026-10-05). R15 (phase4_design.md section 22) removed the C3 rung
-// reduction; C3 returns as measured guards:
+// Feasibility evidence, the overload guard and the GPU queue wait cap.
+// The earlier rung reduction was removed; the overload guard returns as
+// measured guards:
 // - HoldFeasibility: every Auto hold rung, FG input wait included, resolves
 //   source only under overload (more than 10% of frames restart the cadence
 //   within a window of at least 1 s while the Adaptive cap cannot lengthen
@@ -14,12 +11,12 @@
 // - HoldInterleave: the developer A/B blocks of the Auto GPU queue wait.
 // - GpuWaitCap: the GPU queue wait stays on; late GPU resumes lower the cap
 //   on its lead (median X + cap), a calm stretch raises it again.
-// - Feasibility_LeadInfeasible, still a missed frame for the Adaptive cap (C2);
+// - Feasibility_LeadInfeasible, still a missed frame for the Adaptive cap;
 // - FeasibilityCause and GpuWaitCapCause, the telemetry event reasons.
-// The saturation fallback (2026-10-05 to 2026-10-06 builds: the Auto GPU
+// An earlier saturation fallback (the Auto GPU
 // queue wait off after more than 32 of 128 waited resumes late, back on by
-// GPU load) was replaced by the collision-aware release (lead_controller.h,
-// 2026-10-07): late resumes came from the next Present call landing within
+// GPU load) was replaced by the collision-aware release (lead_controller.h):
+// late resumes came from the next Present call landing within
 // about 2.5 ms of the release Signal, which GPU load only correlated with.
 // Pure C++17 without Windows, logger or config dependencies.
 
@@ -34,7 +31,7 @@
 
 constexpr uint32_t FEASIBILITY_NEGATIVE_SLACK_MIN = 24;   // of the last 120 slack samples
 
-// GPU wait cap ladder (2026-10-04). The levels are fractions of the developer
+// GPU wait cap ladder. The levels are fractions of the developer
 // key gpu_wait_budget_us (default 1.5 ms: 1.5 / 1.25 / 1.0 / 0.75 ms).
 constexpr uint32_t GPU_WAIT_CAP_LEVELS = 4;
 constexpr std::array<double, GPU_WAIT_CAP_LEVELS> GPU_WAIT_CAP_FRACTIONS = { 1.0, 5.0 / 6.0, 2.0 / 3.0, 0.5 };
@@ -48,18 +45,18 @@ constexpr double GPU_WAIT_CAP_BACKOFF_S = 30.0;        // no step down this long
 constexpr double GPU_WAIT_CAP_UP_CALM_S = 30.0;        // step up after this long ...
 constexpr double GPU_WAIT_CAP_UP_SHARE = 0.01;         // ... with at most 1% late
 constexpr uint32_t GPU_WAIT_CAP_UP_MIN_SAMPLES = 20;   // the calm share is judged from this many on
-// Open top (2026-10-09): the level value (telemetry gpu_wait_cap_level) of
+// Open top: the level value (telemetry gpu_wait_cap_level) of
 // "no cap", above level 0. The scheduler allows it with Output override
 // Auto, GPU Wait Probes and the queue-order verdict that the next frame's GPU
 // work runs behind the wait (lead_controller.h): late resumes cannot come
-// from the wait there. CONTROL Resonant 34308_1 (budget 4000, effectively no
-// cap): adjacent jitter p50 0.10 ms against 1.04 ms at 1500, no late resume.
+// from the wait there. In CONTROL Resonant a budget of 4000 (effectively no
+// cap) gave adjacent jitter p50 0.10 ms against 1.04 ms at 1500, no late resume.
 constexpr uint32_t GPU_WAIT_CAP_OPEN = 255;
 
-// Lead infeasible (P3-7): a full window of slack samples with at least 24
-// negative while the bucket's lead is budget-limited. The Adaptive cap (C2)
+// Lead infeasible: a full window of slack samples with at least 24
+// negative while the bucket's lead is budget-limited. The Adaptive cap
 // counts it as a miss (budget-limited alone is not one). The slack window is
-// cleared on every fixed-refresh governor step or governor reset, after C2
+// cleared on every fixed-refresh governor step or governor reset, after the Adaptive cap
 // consumes an infeasible window as a miss, and on lifecycle, cap, FG divisor
 // or route changes, so a full window is fresh.
 constexpr bool Feasibility_LeadInfeasible(const LeadFeasibility& lead) noexcept
@@ -74,20 +71,20 @@ constexpr bool Feasibility_LeadInfeasible(const LeadFeasibility& lead) noexcept
 // builds carry the retired ones.
 enum class FeasibilityCause : uint8_t {
     None = 0,
-    LeadInfeasible = 1, // builds before R15 only
-    ResumeSpread = 2,   // builds before 2026-10-04 only: the GPU queue wait switch-off
-    Retry = 3,          // an overload ended (also a slow-resume pause, 2026-10-04 to 2026-10-05 builds)
+    LeadInfeasible = 1, // retired; older builds only
+    ResumeSpread = 2,   // retired; older builds only: the GPU queue wait switch-off
+    Retry = 3,          // an overload ended (older builds: also a slow-resume pause)
     Overload = 4,       // every Auto hold off: more than 10% restarts, Adaptive cap at its limit
-    SlowResumes = 5,    // 2026-10-04/05 builds only: the 2 s slow-resume pause of the GPU queue wait
-    ScoreNotHeld = 6,   // 2026-10-05 builds only: hold scorecard, not held had less jitter
-    ScoreHeld = 7,      // 2026-10-05 builds only: hold scorecard, held had less jitter
-    ProbeNotHeld = 8,   // 2026-10-05 builds only: hold scorecard probe, not held
-    ProbeHeld = 9,      // 2026-10-05 builds only: hold scorecard probe, held
+    SlowResumes = 5,    // retired; older builds only: the 2 s slow-resume pause of the GPU queue wait
+    ScoreNotHeld = 6,   // retired; older builds only: hold scorecard, not held had less jitter
+    ScoreHeld = 7,      // retired; older builds only: hold scorecard, held had less jitter
+    ProbeNotHeld = 8,   // retired; older builds only: hold scorecard probe, not held
+    ProbeHeld = 9,      // retired; older builds only: hold scorecard probe, held
     AbHeld = 10,        // developer A/B interleave (gpu_wait_interleave_s): a held block began
     AbNotHeld = 11,     // developer A/B interleave: a not-held block began
-    Saturated = 12,     // 2026-10-05/06 builds only: saturation fallback, the Auto GPU queue wait off
-    LoadDropped = 13,   // 2026-10-06 builds only: saturation fallback back on, the GPU load fell
-    Recheck = 14        // 2026-10-05/06 builds only: saturation fallback back on after 60 s
+    Saturated = 12,     // retired; older builds only: saturation fallback, the Auto GPU queue wait off
+    LoadDropped = 13,   // retired; older builds only: saturation fallback back on, the GPU load fell
+    Recheck = 14        // retired; older builds only: saturation fallback back on after 60 s
 };
 
 const char* FeasibilityCause_Text(FeasibilityCause cause) noexcept;
@@ -156,7 +153,7 @@ struct HoldInterleaveTransition {
     bool hold = true;     // the output of the block now running
 };
 
-// Unbiased held / not-held comparison for captures (2026-10-05): with the
+// Unbiased held / not-held comparison for captures: with the
 // key set, the Auto GPU queue wait alternates held and not-held blocks at
 // the same loads; the first block after a reset is held. Lengths come from a fixed
 // pseudo-random sequence restarted by Reset, so a run is reproducible. A
@@ -198,9 +195,7 @@ struct GpuWaitCapTransition {
     uint32_t samples = 0;
 };
 
-// The cap ladder of the GPU queue wait (hold strategy simulation 2026-10-04;
-// tools/hold_sim/wait_cap.py WaitCapLadder is the reference). Captures
-// 6560_1 and 13476_1: GPU resumes more than 1 ms after the Signal come in
+// The cap ladder of the GPU queue wait. GPU resumes more than 1 ms after the Signal come in
 // slow states lasting about a second, more likely the longer the GPU has
 // recently waited. The ladder steps down one level when more than 5% of the
 // newest 64 waited resumes were late (at least 0.5 s after any change; the

@@ -1,7 +1,6 @@
 #pragma once
 
-// Fixed-refresh vblank phase tracker (project-docs/002_unified_pacing_timing/
-// phase2_timing_core_design.md sections 2.1 and 2.7, P2-3). Follows real
+// Fixed-refresh vblank phase tracker. Follows real
 // vblank edges with a PI-smoothed phase and supplies the cadence grid's fixed
 // reference. It never re-anchors on CPU wakes. Pure C++17; owned and called
 // only by the scheduler owner.

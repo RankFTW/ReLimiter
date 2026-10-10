@@ -18,7 +18,7 @@ inline std::atomic<bool> g_marker_forward_after_wait{false};
 
 // OSD readouts, EMA-smoothed (µs). CPU latency: SIM_START → RENDERSUBMIT_END
 // of the same frame, written by the marker hooks. Pacer latency: time spent in
-// NvAPI_D3D_Sleep, written by Hook_Sleep. Moved from predictor.h (Phase 2).
+// NvAPI_D3D_Sleep, written by Hook_Sleep. Moved from predictor.h.
 inline std::atomic<double> g_cpu_latency_us{0.0};
 inline std::atomic<double> g_pacer_latency_us{0.0};
 // Updates g_cpu_latency_us (EMA alpha 0.16) from frame_id's RENDERSUBMIT_END
@@ -27,8 +27,8 @@ inline std::atomic<double> g_pacer_latency_us{0.0};
 void NvAPI_RecordCpuLatency(uint64_t frame_id, int64_t render_submit_end_qpc) noexcept;
 // Reflex Sleep bypass: skip the driver's Sleep while a cap is set and
 // ReLimiter's own wait paces the game (Scheduler_PacesSource), held or not,
-// so one pacer runs through the overload pause (phase4_design.md section
-// 23). In passthrough (Dynamic MFG, uncapped, no presenting swapchain) and
+// so one pacer runs through the overload pause. In passthrough (Dynamic MFG,
+// uncapped, no presenting swapchain) and
 // for the Reflex driver limiter the driver paces the game, so its Sleep runs.
 inline bool NvAPI_ShouldBypassSleep(bool enabled,int target_fps,bool source_paced) noexcept {
 	return enabled && target_fps>0 && source_paced;
@@ -92,7 +92,7 @@ NvAPI_Status InvokeSetSleepMode(IUnknown* dev, NV_SET_SLEEP_MODE_PARAMS* params)
 // Restore the game's original sleep mode params (call on shutdown)
 void RestoreGameSleepMode();
 
-// Reflex driver limiter (phase4_design.md P4-11, P4-12). While nonzero,
+// Reflex driver limiter. While nonzero,
 // Hook_SetSleepMode forwards game calls with this minimumIntervalUs. Written
 // by the scheduler owner (sleep_mode.cpp).
 inline std::atomic<uint32_t> g_driver_limiter_interval_us{0};

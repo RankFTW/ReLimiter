@@ -6,8 +6,8 @@
 #include <iostream>
 #include <limits>
 
-// Golden vectors for the display-metric PQI (phase2_timing_core_design.md
-// section 6). Links the real src/pqi.cpp; C++17, src include directory, no
+// Golden vectors for the display-metric PQI.
+// Links the real src/pqi.cpp; C++17, src include directory, no
 // platform libraries. The snapshot values are hand-picked, not captured.
 namespace {
 

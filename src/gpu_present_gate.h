@@ -1,5 +1,5 @@
 #pragma once
-// H3 output executor (phase2_timing_core_design.md 2.6): GPU time-fence waits
+// H3 output executor: GPU time-fence waits
 // on the present queue (GpuQueueWait) or before the frame-generation input
 // fence (FgInputWait), to the output target the cadence grid resolves for the
 // frame's exact plan. Registry, tickets, fences, the deadline worker and its
@@ -44,12 +44,12 @@ struct GpuPresentTrace {
 // is Undeliverable. A planned frame's target is at most its lead (at most
 // 3 I, lead_controller.h) after its source release, plus the spacing floor,
 // and the executor runs at the Present call or FG input, after the source,
-// so the horizon only rejects implausible targets (phase4_design.md R2) up
+// so the horizon only rejects implausible targets up
 // to a real-frame interval of 33 ms. The 100 ms ceiling bounds one GPU wait
 // (the worker's 50 ms poll keeps its heartbeat inside it); above 33 ms
 // (for example 4× MFG at 60 presented FPS) a lead beyond 100 ms is
 // Undeliverable and the frame is presented unheld.
-constexpr double GPU_PRESENT_HORIZON_INTERVALS = 3.0; // R15: the lead's own limit
+constexpr double GPU_PRESENT_HORIZON_INTERVALS = 3.0; // the lead's own limit
 int64_t GpuPresent_HorizonTicks(double interval_us,int64_t frequency) noexcept;
 // Settings word: probes bit and generation only. mode is derived: Active
 // while an H3 rung is resolved or H3 obligations exist, otherwise Off; slack
@@ -105,7 +105,7 @@ void GpuPresent_DrainDiagnostics() noexcept;
 // its D3D12 queue so the GpuQueue capability can be published before any H3
 // plan exists. Nonblocking; the worker creates the fences.
 void GpuPresent_ObservePresentQueue(uint64_t native_queue,uint64_t native_swapchain) noexcept;
-// R14: a Streamline FG binding on native_queue retired. The queue stays
+// A Streamline FG binding on native_queue retired. The queue stays
 // registered; the worker re-reads the FG swapchain identity when it is idle.
 // Nonblocking (shared registration lock only).
 void GpuPresent_OnFgBindingRetired(uint64_t native_queue) noexcept;
@@ -117,7 +117,7 @@ struct GpuPresentFgInput {
     uint64_t binding=0;
 };
 bool GpuPresent_BeginFgInput(uint64_t queue,const GpuPresentFgInput& input) noexcept;
-// FG input route diagnostics (R12b, cumulative): why FG inputs did not mark
+// FG input route diagnostics (cumulative): why FG inputs did not mark
 // the route seen. Reported with the Streamline admission counters.
 struct GpuPresentFgRouteDiagnostics {
     uint64_t pending=0;        // a measurement of this thread was still pending

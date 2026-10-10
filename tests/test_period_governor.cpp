@@ -1,10 +1,10 @@
-// Period governor C2 (src/period_governor.*): the evidence-gated Adaptive cap
-// (2026-10-04, tools/adaptive_cap_sim `Pressure`): rises need evidence
+// Period governor C2 (src/period_governor.*): the evidence-gated Adaptive cap:
+// rises need evidence
 // (restarts, outputs ready after their target, a high miss rate) and are
 // sized by demand in bounded steps, demand-headroom falls, probes with growth
 // and backoff, recurring-load holds, hitch reports, maximum stretch,
 // LFC-paced judging, fixed-refresh quantization and epochs, resets, invalid
-// inputs and the hold room floor (2026-10-08). Directly tests the production
+// inputs and the hold room floor. Directly tests the production
 // logic; the scheduler wiring (demand drain, miss, output and hold-room feed,
 // LFC after the governor) needs live verification.
 
@@ -174,7 +174,7 @@ namespace
         CHECK(harness.governor.Statistics().ignored_demand == 5);
     }
 
-    // Capture 33256 (2026-10-04): a demand above the interval while every
+    // A demand above the interval while every
     // frame is on time is not evidence; the interval stays at the cap.
     void TestDemandAloneNeverRises()
     {
@@ -536,7 +536,7 @@ namespace
 
         // A return to the cap with the room still within the margin ends the
         // report too: when the room sets the interval again it is reported
-        // again (capture 42520_1 logged a +12% room stretch as `release`).
+        // again (an earlier version logged a +12% room stretch as `release`).
         Harness again;
         again.room_us = 10'300.0;
         CHECK(again.Frame().cause == GovernorCause::Room);

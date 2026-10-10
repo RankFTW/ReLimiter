@@ -132,7 +132,7 @@ static void OpenNewFiles(uint32_t capture_epoch)
     s_open_capture_epoch = capture_epoch;
 }
 
-// ── Pacing families (phase0_measurement_design.md section 5) ──
+// ── Pacing families ──
 // Header and rows come from one column table per family, so they cannot
 // diverge. Raw QPC values are integers (0 = unknown = empty cell), derived
 // values are microseconds with three decimals and enums are integers. The
@@ -276,7 +276,7 @@ struct PacingRowColumn {
     PacingRowColumnWriter write;
 };
 
-// Fixed column names (design section 5) first, appended diagnostics after.
+// Fixed column names first, appended diagnostics after.
 static const PacingRowColumn PACING_ROW_COLUMNS[] = {
     // Identity
     { "row_kind", [](CsvLine* line, const PacingCsvRow& row) { line->Unsigned(row.joined.row_kind); } },
@@ -512,9 +512,9 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
         DecimalIf(line, row.joined.has_reflex &&
             row.joined.reflex.clock_map_status != PacingClockMapStatus::Unknown,
             row.joined.reflex.clock_map_offset_us); } },
-    // Appended (phase1_purge_design.md section 3): the retired predictor's
-    // release to PRESENT_START estimate. The source stage records 0 since
-    // Phase 2, so the cell stays empty; the column keeps its position.
+    // Appended: the retired predictor's release to PRESENT_START estimate.
+    // The source stage records 0, so the cell stays empty; the column keeps
+    // its position.
     { "predicted_render_us", [](CsvLine* line, const PacingCsvRow& row) {
         DecimalIf(line, row.joined.has_source && row.joined.source.predicted_render_us != 0.0,
             row.joined.source.predicted_render_us); } },
@@ -539,7 +539,7 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
         UnsignedIf(line, PacingRowHasPcl(row), row.joined.display.pcl_dropped_frame_count); } },
     { "pcl_simulation_fallback", [](CsvLine* line, const PacingCsvRow& row) {
         UnsignedIf(line, PacingRowHasPcl(row), row.joined.display.pcl_simulation_fallback); } },
-    // Appended (phase2_timing_core_design.md section 5): frame plan of the
+    // Appended: frame plan of the
     // joined Source record (empty without a plan, grid_index 0), the output
     // executor's plan status and the display source of the display sample
     { "grid_epoch", [](CsvLine* line, const PacingCsvRow& row) {
@@ -556,7 +556,7 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
         NonZeroIf(line, row.joined.has_present, row.joined.present.plan_status); } },
     { "display_source", [](CsvLine* line, const PacingCsvRow& row) {
         NonZeroIf(line, row.joined.has_display, row.joined.display_source); } },
-    // Appended (phase3_controllers_design.md P3-14): period governor C2 of the
+    // Appended: period governor of the
     // joined Source record (empty when the governor did not run: idle cap,
     // uncapped, passthrough, DMFG) and a reserved plan cell (empty without a
     // plan, like the other plan cells)
@@ -564,14 +564,14 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
         UnsignedIf(line, PacingRowIsGoverned(row), row.joined.source.governor_step); } },
     { "governor_interval_us", [](CsvLine* line, const PacingCsvRow& row) {
         DecimalIf(line, PacingRowIsGoverned(row), row.joined.source.governor_interval_us); } },
-    // reserved since Q15: the GPU release advance was withdrawn; always 0
+    // reserved: the GPU release advance was withdrawn; always 0
     { "plan_signal_advance_us", [](CsvLine* line, const PacingCsvRow& row) {
         DecimalIf(line, PacingRowHasPlan(row), 0.0); } },
-    // Appended (Q16): the pre-Wait GPU timestamp of the GPU queue wait mapped
+    // Appended: the pre-Wait GPU timestamp of the GPU queue wait mapped
     // to QPC (the GpuResume stage event's gpu_wait_qpc); empty when unknown
     { "gate_pre_wait_qpc", [](CsvLine* line, const PacingCsvRow& row) {
         QpcIf(line, row.joined.has_gate && row.joined.gate.post_wait, row.joined.gate.pre_wait_qpc); } },
-    // Appended (phase4_design.md P4-15): source placement of the joined Source
+    // Appended: source placement of the joined Source
     // record (PacingSourcePlacement) and its pre-Sleep wait (empty when none)
     { "source_placement", [](CsvLine* line, const PacingCsvRow& row) {
         UnsignedIf(line, row.joined.has_source, row.joined.source.source_placement); } },
@@ -580,7 +580,7 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
     { "pre_sleep_margin_us", [](CsvLine* line, const PacingCsvRow& row) {
         DecimalIf(line, row.joined.has_source && row.joined.source.pre_sleep_margin_us != 0.0,
             row.joined.source.pre_sleep_margin_us); } },
-    // Appended (2026-10-08, gated holds in lockstep engines): the starts of
+    // Appended (gated holds in lockstep engines): the starts of
     // ReLimiter's source wait (ends at source_release_qpc, less any injected
     // stall) and of its pre-Sleep wait (ends at pre_sleep_end_qpc); empty
     // when there was none
@@ -868,7 +868,7 @@ static const PacingEventColumn PACING_EVENT_COLUMNS[] = {
         UnsignedIf(line, PacingEventIsSnapshot(event), event.snapshot.summary.short_frames); } },
     { "snapshot_dropped_records", [](CsvLine* line, const PacingCsvEvent& event) {
         UnsignedIf(line, PacingEventIsSnapshot(event), event.snapshot.dropped_records); } },
-    // Appended (phase1_purge_design.md section 3): native PCL ETW and present
+    // Appended: native PCL ETW and present
     // loss (cumulative), on the rows that carry CSV drops
     { "etw_events_lost", [](CsvLine* line, const PacingCsvEvent& event) {
         UnsignedIf(line, PacingEventHasLossCounters(event), event.pcl_loss.etw_events_lost); } },
@@ -878,7 +878,7 @@ static const PacingEventColumn PACING_EVENT_COLUMNS[] = {
         UnsignedIf(line, PacingEventHasLossCounters(event), event.pcl_loss.lost_present_count); } },
     { "overflowed_present_count", [](CsvLine* line, const PacingCsvEvent& event) {
         UnsignedIf(line, PacingEventHasLossCounters(event), event.pcl_loss.overflowed_present_count); } },
-    // Appended (phase2_timing_core_design.md section 5)
+    // Appended: the epoch or pipeline-change reason
     { "reason", [](CsvLine* line, const PacingCsvEvent& event) {
         UnsignedIf(line, PacingEventHasReason(event), event.reason); } },
 };

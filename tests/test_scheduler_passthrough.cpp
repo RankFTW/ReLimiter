@@ -34,7 +34,7 @@
  * See tests/test_scheduler_passthrough.md for manual verification procedures.
  *
  * The OnMarker branch model below is a COPIED CONTROL-FLOW MODEL of
- * scheduler.cpp after Phase 2 (design section 2.5 and 2.7), not a direct test.
+ * scheduler.cpp, not a direct test.
  * Idle-cap timing (grid in Idle mode, L = 0), plan publication before the wait
  * and Suspend -> ModeChange are tested directly in test_source_stage.cpp; the
  * old OLED relative-sleep timing model was removed with that sleep.

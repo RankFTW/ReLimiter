@@ -1,7 +1,6 @@
 #pragma once
 
-// Exact-key frame-plan registry and stage-event queue
-// (project-docs/002_unified_pacing_timing/phase2_timing_core_design.md 2.2).
+// Exact-key frame-plan registry and stage-event queue.
 // Pure C++17: no Windows, logger or config dependencies. Fixed storage only;
 // no operation allocates, blocks or waits for another thread.
 

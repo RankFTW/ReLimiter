@@ -76,14 +76,14 @@ struct Queue {
     GpuReadinessQueue fg_queue;
     std::array<FgMeasurement,kTicketsPerQueue> fg_measurements;
     // Worker-written; fg_native/fg_swapchain are published before fg_ready
-    // and refreshed by the worker for a new FG swapchain (R14).
+    // and refreshed by the worker for a new FG swapchain.
     std::atomic<bool> fg_ready{false};
     std::atomic<bool> fg_requested{false}; // an FG input asks the worker for the FG prefix queue
-    std::atomic<bool> fg_refresh{false};   // R14: re-read the FG swapchain identity (worker)
+    std::atomic<bool> fg_refresh{false};   // re-read the FG swapchain identity (worker)
     std::atomic<uint64_t> fg_native{0},fg_swapchain{0};
     uint64_t fg_sequence=0;
     std::atomic<uint32_t> fg_thread{0};
-    // Worker-only (R14): when the worker first saw this entry retired, and
+    // Worker-only: when the worker first saw this entry retired, and
     // whether its unreclaimed state was already logged.
     int64_t retired_seen_qpc=0;
     bool reclaim_stall_logged=false;
@@ -119,7 +119,7 @@ thread_local uint64_t fg_pending_transaction=0;
 thread_local int fg_last_multiplier=0;
 thread_local uint64_t fg_last_binding=0;
 int64_t Qpc() noexcept {LARGE_INTEGER q{};QueryPerformanceCounter(&q);return q.QuadPart;}
-// ── Stage events (design 2.2): every event carries the plan's key and grid index ──
+// ── Stage events: every event carries the plan's key and grid index ──
 void PushStage(const PacingPlanKey& key,uint64_t grid_index,PacingStageEventKind kind,PacingRung rung,
     int64_t qpc,PacingPlanStatus plan_status=PacingPlanStatus::Unknown,int64_t gpu_wait_qpc=0) noexcept {
     if(qpc<=0 || !grid_index || !PacingPlanKey_IsValid(key))return;
@@ -129,7 +129,7 @@ void PushStage(const PacingPlanKey& key,uint64_t grid_index,PacingStageEventKind
     FramePlan_PushStageEvent(event);
 }
 PacingRung TicketRung(const Ticket& ticket) noexcept {return ticket.fg?PacingRung::FgInputWait:PacingRung::GpuQueueWait;}
-// Pacing telemetry (phase0_measurement_design.md), never gate authority. Every
+// Pacing telemetry, never gate authority. Every
 // ticket source is an NvAPI frame: the native gate trace or the FG marker handoff.
 PacingGateRecord GateRecord(const Ticket& ticket,PacingGateEvent event) noexcept {
     PacingGateRecord record;
@@ -285,7 +285,7 @@ void InitializeFg(Queue* queue) noexcept {
     LOG_INFO("FG GPU: queue=%llu selected=%llu generation=%llu device_match=%u ready=%u",
         queue->identity.load(),context.native_swapchain,context.swapchain_generation,unsigned(matches),unsigned(queue->fg_ready.load()));
 }
-// R14: a new FG swapchain on a live queue (a Streamline binding change no
+// A new FG swapchain on a live queue (a Streamline binding change no
 // longer retires the queue). Applied only while no FG prefix measurement or
 // FG wait of the old identity is outstanding; otherwise retried next pass.
 void RefreshFgIdentity(Queue* queue) noexcept {
@@ -353,7 +353,7 @@ Queue* FindOrRequest(uint64_t native,GpuPresentTrace* trace,uint64_t source=0) n
     trace->status=GpuPresentStatus::QueuePending;
     SetEvent(work_event);return nullptr;
 }
-// ── Capabilities (design 2.4): the resolver's generation-tagged set ──
+// ── Capabilities: the resolver's generation-tagged set ──
 // Any thread; each call publishes for the current controller generation.
 // The worker republishes every service pass.
 // The worker runs and `native` is registered Ready and not retired; with fg,
@@ -425,7 +425,7 @@ void FinishPostWait(Queue* queue,Ticket* ticket) noexcept {
     // The pre-Wait probe keeps its submission and readback (the readback also
     // refreshes the queue clock calibration). Its time rides on GpuResume so
     // the lead controller keeps u − o only when the GPU was already waiting
-    // at the Signal (M2); the PostWait gate record carries both times
+    // at the Signal; the PostWait gate record carries both times
     // (CSV gate_pre_wait_qpc, gate_post_wait_qpc).
     int64_t pre_wait_qpc=0;
     if(ticket->pre_slot) {
@@ -458,10 +458,10 @@ void FinishPostWait(Queue* queue,Ticket* ticket) noexcept {
     if(queue->post_queue.fence)
         GpuReadinessQueue_Reclaim(&queue->post_queue,GpuReadinessQueue_Completed(&queue->post_queue));
 }
-// R14: a retired entry that is still not reclaimed 2 s later is logged once
+// A retired entry that is still not reclaimed 2 s later is logged once
 // with what holds it. Until it is reclaimed, its queue cannot be registered
 // again: FG inputs on it count as queue_unready and the FG route never
-// qualifies (Gears of War: E-Day folders 4 and 6).
+// qualifies (Gears of War: E-Day).
 void LogReclaimStall(Queue& queue,const char* stage) noexcept {
     const auto now=Qpc();
     if(!queue.retired_seen_qpc)queue.retired_seen_qpc=now;
@@ -654,7 +654,7 @@ bool Idle() noexcept {
     }
     return true;
 }
-// Worker wait policy (002 phase1_purge_design.md, D12 item 5). A stop drains
+// Worker wait policy. A stop drains
 // at 1ms. With no H3 rung resolved and nothing outstanding, the worker sleeps
 // until work_event or the bounded idle timeout; otherwise 50ms polling keeps
 // the heartbeat, GPU retirement and queue reclamation current. An admission
@@ -911,7 +911,7 @@ bool Enqueue(const EnqueueRequest& request,GpuPresentTrace* trace) noexcept {
     queue->admission.clear(std::memory_order_release);Leave();SetEvent(work_event);
     return true; // obligation committed: never stack the native CPU hold
 }
-// ── Executor contract (design 2.6) ──
+// ── Executor contract ──
 struct OutputDecision {
     PacingPlanStatus status=PacingPlanStatus::Unknown;
     GpuPresentStatus gate=GpuPresentStatus::Off;
@@ -1050,7 +1050,7 @@ void GpuPresent_DrainDiagnostics() noexcept {
 void GpuPresent_OnFgBindingRetired(uint64_t native_queue) noexcept {
     using namespace gpu_present;
     if(!native_queue)return;
-    // R14: the queue outlives the binding. Retiring its registry entry (the
+    // The queue outlives the binding. Retiring its registry entry (the
     // previous behaviour) tore down and re-created every fence and timestamp
     // queue on each binding change, and an entry that never reclaimed kept
     // the FG route at queue_unready for the rest of the session. Only the FG

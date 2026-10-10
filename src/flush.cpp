@@ -20,11 +20,11 @@ void Flush(uint32_t modules) {
     // These APIs only publish atomic invalidation/reset requests. Keep them
     // immediate so stale gate and feedback identities fail open before the
     // admitted scheduler owner reaches the next frame. The period governor
-    // resets on the scheduler owner only (P3-10): lifecycle (below), cap, raw
+    // resets on the scheduler owner only: lifecycle (below), cap, raw
     // FG divisor, DMFG, OLED Care and focus; a correlator-only flush keeps it.
     Scheduler_ResetSmoothness();
     if (modules & FLUSH_PREDICTOR) {
-        // Lifecycle (P2-10): every FLUSH_ALL caller is an API change, a full
+        // Lifecycle: every FLUSH_ALL caller is an API change, a full
         // swapchain teardown or device loss. The scheduler
         // owner sees the new generation and resets the grid, the frame plans
         // and the lead controller; exact keys of the old generation fail.
@@ -72,7 +72,7 @@ void OnOccluded(bool occluded) {
         // Swapchain invalid: the scheduler suspends pacing (passthrough)
     } else {
         // Recovery from the suspended passthrough. Same swapchain and device:
-        // not a lifecycle change (P2-10), so no FLUSH_PREDICTOR generation
+        // not a lifecycle change, so no FLUSH_PREDICTOR generation
         // bump. The suspended grid resumes with a ModeChange epoch and the
         // lead buckets stay warm.
         SetOccluded(false);

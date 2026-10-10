@@ -28,7 +28,7 @@
 #include <type_traits>
 #include <utility>
 
-// Pacing telemetry worker (phase0_measurement_design.md sections 1-5).
+// Pacing telemetry worker.
 // Producers push into bounded MPSC queues; one worker owns joins, metrics,
 // the OSD snapshot and CSV rows. Nothing here feeds pacing.
 
@@ -76,7 +76,7 @@ namespace
         queue->Push(record); // a full queue drops and counts
     }
 
-    // ── DXGI display source: Present hook → worker (decision Q4) ──
+    // ── DXGI display source: Present hook → worker ──
     // Separate from PacingQueueDrops (the CSV queue-drop schema); its drops
     // are logged when the source turns inactive.
     DxgiPresentQueue s_dxgi_present_queue;
@@ -148,7 +148,7 @@ namespace
         KnownValue pipeline_generation;   // Source records with pipeline_generation != 0
         uint32_t pipeline_rung = 0;       // plan_rung of the record that showed pipeline_generation
         uint8_t pipeline_reason = 0;      // PacingFallbackReason of pipeline_generation
-        PacingControllerEventState controllers{}; // governor_step, rung_feasibility and gpu_wait_cap (P3-14)
+        PacingControllerEventState controllers{}; // governor_step, rung_feasibility and gpu_wait_cap
         bool loss_window_active = false;
         uint64_t loss_window_swapchain = 0;
         PacingClockMapStatus clock_map_status = PacingClockMapStatus::Unknown;
@@ -266,7 +266,7 @@ namespace
         PushEvent(type, event_qpc, event);
     }
 
-    // governor_step, rung_feasibility and gpu_wait_cap rows (P3-14), from the pure derivation.
+    // governor_step, rung_feasibility and gpu_wait_cap rows, from the pure derivation.
     void PushControllerEvents(const PacingControllerEvents& events, int64_t event_qpc) noexcept
     {
         const std::pair<PacingCsvEventType, const PacingControllerEvent*> rows[] = {
@@ -368,8 +368,8 @@ namespace
         known = { true, status };
     }
 
-    // Grid-epoch, pipeline-change and stall events (P2-7) and the governor-step,
-    // rung-feasibility and gpu-wait-cap events (P3-14, pacing_controller_events.h), derived
+    // Grid-epoch, pipeline-change and stall events and the governor-step,
+    // rung-feasibility and gpu-wait-cap events (pacing_controller_events.h), derived
     // from Source record fields like the producer-epoch and controller-generation events.
     // A pipeline generation is reported by the first record that shows its
     // rung: a planned record (grid_index != 0) or a passthrough pipeline,
@@ -660,7 +660,7 @@ namespace
         // records, so the statistics' present count advances by the FG
         // multiplier between records: almost every observation breaks the
         // chain, and the few intervals that survive span a generated frame
-        // (Gears of War: E-Day, 2026-10-02: 16.5 ms intervals at 120 FPS
+        // (Gears of War: E-Day: 16.5 ms intervals at 120 FPS
         // output, about 1% of frames). Only ETW can time generated frames.
         const bool frame_generation = g_resolved_fg_divisor.load(std::memory_order_relaxed) > 1;
         const char* reason = stopping ? "stopping"
@@ -790,7 +790,7 @@ namespace
             join.pending_display_forced, Window().CapacityEvictions());
     }
 
-    // The joiner's cross-thread evidence since the last report (R8): ETW
+    // The joiner's cross-thread evidence since the last report: ETW
     // frame IDs that agreed or disagreed with the native route's taken keys.
     void ReportCrossThreadEvidence() noexcept
     {

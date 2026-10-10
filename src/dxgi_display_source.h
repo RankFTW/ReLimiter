@@ -1,8 +1,7 @@
 #pragma once
 
-// DXGI frame-statistics display source for the pacing telemetry (decision Q4;
-// project-docs/002_unified_pacing_timing/phase2_timing_core_design.md section
-// 6). Pure C++17 without Windows, logger or other src dependencies: the
+// DXGI frame-statistics display source for the pacing telemetry. Pure C++17
+// without Windows, logger or other src dependencies: the
 // telemetry worker and the standalone tests share this code. Nothing here
 // feeds pacing.
 //

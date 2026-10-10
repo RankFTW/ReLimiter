@@ -113,7 +113,7 @@ QueueSlot* FindOrRequest(ID3D12CommandQueue* queue, uint64_t expected_device=0) 
     WakeWorker();
     return nullptr; // worker creates fence; never wait for it here
 }
-// Pacing telemetry (phase0_measurement_design.md): one record per published
+// Pacing telemetry: one record per published
 // sample. ready_qpc is the mapped GPU completion query, 0 when not valid.
 void PushPacingReady(const SampleSlot& slot) noexcept {
     const auto& sample = slot.sample;
@@ -129,7 +129,7 @@ void PushPacingReady(const SampleSlot& slot) noexcept {
     record.before_gate = static_cast<uint8_t>(sample.before_gate ? 1 : 0);
     PacingTelemetry_PushReady(record);
 }
-// GpuReady r of an H3 Present (design 2.2): the valid pre-gate readiness query
+// GpuReady r of an H3 Present: the valid pre-gate readiness query
 // of a runtime Present whose exact plan is still registered on GpuQueueWait.
 // Find is non-consuming, so the output claim stays with the executor.
 void PushGpuReady(const SampleSlot& slot) noexcept {

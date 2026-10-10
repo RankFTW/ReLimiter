@@ -1,8 +1,6 @@
 #pragma once
 
-// CSV capture writer for the two pacing telemetry families (project-docs/
-// 002_unified_pacing_timing/phase0_measurement_design.md section 5 and
-// phase1_purge_design.md section 3):
+// CSV capture writer for the two pacing telemetry families:
 //   relimiter_pacing_<process>_<pid>_<session>_capture_<epoch>.csv
 //   relimiter_pacing_events_<same suffix>.csv
 // One writer thread owns every file. Producers never block: rows are accepted
@@ -40,13 +38,13 @@ enum class PacingCsvEventType : uint8_t {
     ClockMapStatus = 10,
     Snapshot = 11,    // one per OSD snapshot publication
     PclStatus = 12,   // native PCL snapshot status change; value is NativePclStatus
-    // Derived from Source records (phase2_timing_core_design.md P2-7)
+    // Derived from Source records
     GridEpoch = 13,      // value epoch, previous_value previous epoch, reason PacingEpochReason
     PipelineChange = 14, // pipeline_generation changed: value plan_rung, previous_value previous rung,
                          // reason PacingFallbackReason
     StallInjected = 15,  // value stall_injected_us
-    // Derived from Source records (phase3_controllers_design.md P3-14)
-    GovernorStep = 16,   // governor phase transition (P4-6): value governor step, previous_value the
+    // Derived from Source records
+    GovernorStep = 16,   // governor phase transition: value governor step, previous_value the
                          // previous governed record's step, reason GovernorCause
     RungFeasibility = 17, // value 1 demoted / 0 not, previous_value previous state, reason FeasibilityCause
     GpuWaitCap = 18      // GPU wait cap ladder level change: value new level (0..3), previous_value previous

@@ -283,7 +283,7 @@ namespace
         CHECK(next.epoch_reason == PacingEpochReason::None);
     }
 
-    // P3-10: a governor step with an interval change is a GovernorStep epoch
+    // A governor step with an interval change is a GovernorStep epoch
     // with PeriodChange continuity; PeriodChange, ModeChange, Lifecycle and
     // SourceLate take priority, and a step without an interval change is none.
     void TestGovernorStepEpoch()
@@ -402,7 +402,7 @@ namespace
             static_cast<size_t>(PacingEpochReason::SourceLate)] == 1);
     }
 
-    // R12: a source slack extends the late tolerance. L = 6 ms with 4 ms of
+    // A source slack extends the late tolerance. L = 6 ms with 4 ms of
     // slack: a source 2.5 ms + 3.9 ms late keeps the cadence (released
     // immediately on the same grid); one beyond tolerance + slack restarts.
     // The slack never exceeds the lead, and non-finite or negative slack is 0.

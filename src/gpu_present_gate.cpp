@@ -15,7 +15,7 @@ bool H3RungResolved() noexcept {
 // FG input observers must then deliver inputs, so the gate can publish
 // PacingCapability::FgInputRoute; without this the capability and the rung
 // would each wait for the other.
-// R12b: a C3-demoted FG input wait (auto rung FgInputWait, resolved rung
+// A demoted FG input wait (auto rung FgInputWait, resolved rung
 // lower) keeps its route qualified through the dwell: the observers keep
 // delivering inputs (their claims find another rung and hold nothing), so
 // the retry finds the route still qualified. Without this the demotion
@@ -82,7 +82,7 @@ bool GpuPresent_ProbesFromSettings(uint64_t word) noexcept {return (word&kProbes
 int64_t GpuPresent_HorizonTicks(double interval_us,int64_t frequency) noexcept {
     if(frequency<=0 || frequency>1000000000)return 0;
     const double interval=std::isfinite(interval_us)?interval_us:0.0;
-    // Phase 4 (capture E/F): T − now reaches the lead (up to 3 I) in
+    // T − now reaches the lead (up to 3 I) in
     // pipelined engines under load, so a one-interval horizon rejected about
     // 22% of heavy-scene frames as Undeliverable and left them unpaced.
     return static_cast<int64_t>(std::llround(

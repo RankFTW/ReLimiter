@@ -239,11 +239,10 @@ GovernorDecision PeriodGovernor::OnFrame(const GovernorFrame& frame) noexcept
     return decision;
 }
 
-// One frame outside the settle (2026-10-04, tools/adaptive_cap_sim
-// `Pressure`): evidence gates every rise, demand sizes it; falls follow the
-// demand's headroom or probe below it after a calm stretch. Demand is judged
-// against the paced interval: LFC-applied on VRR, whole refreshes when
-// snapped.
+// One frame outside the settle: evidence gates every rise, demand sizes it;
+// falls follow the demand's headroom or probe below it after a calm stretch.
+// Demand is judged against the paced interval: LFC-applied on VRR, whole
+// refreshes when snapped.
 void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decision) noexcept
 {
     const int64_t qpc = frame.qpc;
@@ -420,7 +419,7 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
     // the target, and when it falls one margin below the target. Any other
     // transition of this frame (the return to the cap included) is the
     // newest cause, so a room that sets the interval again afterwards is
-    // reported again (capture 42520_1 logged a +12% room stretch as `release`).
+    // reported again (a +12% room stretch was once logged as `release`).
     const double margin_stretch = MarginUs(paced(base_us * target_stretch_)) / base_us;
     if (reported != GovernorCause::None) {
         room_setting_ = false;

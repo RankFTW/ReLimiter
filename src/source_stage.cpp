@@ -136,7 +136,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     // Only that rung's window learns while the GPU queue wait is demoted: a
     // load rise during the demotion otherwise left every frame planned with
     // the stale lead and late against it, so the overload guard never saw the
-    // restart-free 2 s it needs to resume holds (CONTROL 26752_1: an 8.05 ms
+    // restart-free 2 s it needs to resume holds (CONTROL: an 8.05 ms
     // lead learned while loading, PRESENT_START 12.5 ms after the release in
     // play, 447 restarts in 1,123 frames, stuck on source only).
     const PacingRung lead_rung = PacingPipeline_LeadRung(pipeline);
@@ -181,7 +181,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     input.period_change = request.period_change;
     input.governor_step = request.governor_step;
     input.lead_us = lead_us;
-    // R12: the slack between the lead and the median X of the rung whose lead
+    // The slack between the lead and the median X of the rung whose lead
     // planned the frame.
     const double median_x_us = lead_.MedianSampleUs(slack_rung, request.fg_divisor);
     input.source_slack_us = median_x_us > 0.0 ? (std::max)(0.0, lead_us - median_x_us) : 0.0;

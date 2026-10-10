@@ -338,7 +338,7 @@ namespace
         //    frame-type placeholders, not display instances.
         // Remaining screen times are forwarded unchanged and in order. Equal or
         // non-monotonic times are not dropped here; pacing telemetry counts
-        // them as out-of-order chain breaks (phase0_measurement_design.md 4).
+        // them as out-of-order chain breaks.
         static std::vector<DisplayEntry> CopyAndSanitizeDisplayedEntries(
             const PresentEvent& present)
         {

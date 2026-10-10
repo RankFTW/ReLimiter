@@ -3,8 +3,7 @@
 #include "pacing_core_types.h"
 #include <cstdint>
 
-// Native Present route (project-docs/002_unified_pacing_timing/
-// phase2_timing_core_design.md 2.6): PRESENT_START -> native Present
+// Native Present route: PRESENT_START -> native Present
 // attribution and qualification for every NvAPI frame, carrying the exact
 // plan key to the native Present for H2 (NativeHold, developer override) and
 // H3 (GPU queue wait). Qualification is published as
@@ -66,7 +65,7 @@ struct NativeGateTrace {
 // One instance per Present thread. A token must pass through the selected
 // ReShade present/finish_present scope and its exact native swapchain. The
 // marker may come from another thread through the cross-thread hand-off
-// (native_present_gate.cpp, R8); nesting, retries, missing scopes and a
+// (native_present_gate.cpp); nesting, retries, missing scopes and a
 // Present without a newly published marker reset qualification. History
 // never proves FG real/generated identity, so FG can only be observed in shadow.
 class NativePresentGateRoute {

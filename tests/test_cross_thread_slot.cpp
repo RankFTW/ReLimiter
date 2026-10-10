@@ -1,4 +1,4 @@
-// Cross-thread PRESENT_START hand-off slot (src/cross_thread_slot.h, R8):
+// Cross-thread PRESENT_START hand-off slot (src/cross_thread_slot.h):
 // publish/claim/take semantics, withdrawal by an empty publication, and a
 // two-thread alternation without data races (run under ThreadSanitizer when
 // available).

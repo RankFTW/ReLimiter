@@ -1,7 +1,6 @@
 #pragma once
 
-// Pacing Quality Index (0-100%) from displayed-frame metrics
-// (phase2_timing_core_design.md section 6, decision Q1 a).
+// Pacing Quality Index (0-100%) from displayed-frame metrics.
 // Pure function of one pacing telemetry snapshot; callable from any thread.
 // T_out = snapshot.target_output_interval_us:
 //   consistency = 1 - clamp(adjacent_jitter_p99 / (T_out / 2), 0, 1)

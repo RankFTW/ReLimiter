@@ -152,7 +152,7 @@ void PresentGate_Execute(const PacingPlanKey& key, PacingRung rung,
         FinishClaim(plan, rung, PacingPlanStatus::Late, decision_qpc, outcome);
         return;
     }
-    // P2-9: a hold longer than 1.5 I is a fault signal, never performed.
+    // A hold longer than 1.5 I is a fault signal, never performed.
     const double hold_us = TicksToUs(target_qpc - decision_qpc, snapshot.qpc_frequency);
     const double limit_us = kPresentationGateMaximumHoldIntervals * plan.interval_us;
     if (!std::isfinite(limit_us) || limit_us <= 0.0 || !(hold_us > 0.0) || hold_us > limit_us) {
@@ -209,7 +209,7 @@ void PresentGate_OnFrameMarker(const PacingPlanKey& key, PacingStageEventKind ki
         default: return;
     }
     if (arrival_qpc <= 0) return;
-    // The render handoff limit (phase4_design.md section 23) waits for the
+    // The render handoff limit waits for the
     // presenting device's newest RENDERSUBMIT_START, planned or not.
     if (kind == PacingStageEventKind::RenderSubmitStart) {
         RenderHandoff_Publish(static_cast<uint8_t>(key.identity_domain), key.producer_epoch,
@@ -217,7 +217,7 @@ void PresentGate_OnFrameMarker(const PacingPlanKey& key, PacingStageEventKind ki
     }
     PacingFramePlan plan{};
     if (!g_frame_plans.Find(key, &plan)) return;
-    // Every planned frame: the GPU waits use them for R13 and the simulation
+    // Every planned frame: the GPU waits use them for the carried delay and the simulation
     // → render queue (the FG input wait always, the GPU queue wait under the
     // developer A/B key), every rung for the render handoff offset
     // (lead_controller.h).

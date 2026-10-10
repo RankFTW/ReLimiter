@@ -1,7 +1,7 @@
 #pragma once
 
 // Stage-demand computation for delayed NvAPI Reflex reports (feedback.cpp).
-// The period governor (period_governor.h, phase3_controllers_design.md P3-5)
+// The period governor (period_governor.h)
 // consumes the resulting workload demand; the Frame-Time Adaptation
 // controller that once lived here is retired. The historical file and
 // function names are kept.
@@ -11,12 +11,11 @@
 // when available; elapsed GPU span is retained only as a fallback when active
 // time is absent. Overlapping pipeline stages are never added.
 //
-// Serial frames (phase4_design.md section 17, R10): some engines start the
-// next frame's simulation only after the previous frame's Present returned
-// (Unreal in Rogue Core: 0 of 5,966 frames overlapped). Their stages overlap
-// inside a frame, so the largest stage (7.5-7.9 ms p95) stays below the
-// period they sustain; the frame span, simulation start to Present end
-// (10.0-10.7 ms p95), is that period. While SerialFrameDetector shows a
+// Serial frames: some engines start the next frame's simulation only after
+// the previous frame's Present returned (Unreal in Rogue Core). Their stages
+// overlap inside a frame, so the largest stage stays below the period they
+// sustain; the frame span, simulation start to Present end, is that period.
+// While SerialFrameDetector shows a
 // serial engine, the demand is the larger of the stage maximum and the span
 // with ReLimiter's own holds removed, and it is marked as covering the period.
 //
@@ -33,7 +32,7 @@
 
 constexpr uint32_t SERIAL_FRAME_WINDOW = 128;      // consecutive report pairs judged
 constexpr uint32_t SERIAL_FRAME_MIN_SERIAL = 124;  // about 97% serial pairs: on
-// Off only below this (R12): Gears of War: E-Day sat at 123-124 of 128 and
+// Off only below this (hysteresis): Gears of War: E-Day sat at 123-124 of 128 and
 // toggled the frame span demand every few seconds.
 constexpr uint32_t SERIAL_FRAME_OFF_BELOW = 116;   // about 91%
 constexpr double FRAME_SPAN_PRESENT_CAP_US = 2000.0; // Present call share: max(2 ms, I/4)
@@ -85,7 +84,7 @@ struct FrameTimeAdaptationWorkloadStages {
     // to the separately exported sleep diagnostic.
     double owned_cpu_stage_us = 0.0;
     PacingSourceMarker enforcement_marker = PacingSourceMarker::Unknown;
-    // Serial frames (R10): simulation start to Present end, the Present call
+    // Serial frames: simulation start to Present end, the Present call
     // (Present start to end), ReLimiter's present gate hold inside that call,
     // the paced interval and whether SerialFrameDetector shows a serial engine.
     double frame_span_us = 0.0;
@@ -103,7 +102,7 @@ struct FrameTimeAdaptationDemand {
     double workload_us = 0.0;
     double cpu_active_us = 0.0;
     double gpu_render_us = 0.0;
-    double frame_span_us = 0.0;   // corrected span (R10); 0 when not used
+    double frame_span_us = 0.0;   // corrected span; 0 when not used
 };
 
 double FrameTimeAdaptation_RenderSubmissionDurationUs(

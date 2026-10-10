@@ -313,7 +313,7 @@ void TestPacingPipelineDefaults() {
     CHECK(!g_config.adaptive_cap && g_config.gpu_present_gate_probes && !g_config.advanced_settings);
     CHECK(!g_config.developer_settings && Config_DeveloperOverrides() == 0);
     CHECK(g_config.stall_inject_ms == 0.0 && g_config.stall_inject_period_s == 5.0);
-    // Recommended defaults since 2026-10-09: the Reflex Sleep bypass and pre-Sleep placement.
+    // Recommended defaults: the Reflex Sleep bypass and pre-Sleep placement.
     CHECK(g_config.reflex_sleep_bypass && g_reflex_sleep_bypass.load());
     CHECK(g_config.marker_forward_order == PacingMarkerForwardOrder::BeforeWait);
     CHECK(g_config.gpu_queue_wait_render_queue == PacingRenderQueue::Keep);
@@ -410,7 +410,7 @@ void TestSmoothingParsing() {
     CHECK(Value(local_path, "FrameLimiter", "adaptive_cap") == "true");
 }
 
-// P4-11, R15: source_placement parses case-insensitively, reads the legacy
+// source_placement parses case-insensitively, reads the legacy
 // `auto` as marker, falls back to the pre_sleep default, saves canonical
 // text and reaches the resolver configuration (version-2 INIs: no migration).
 void TestSourcePlacementParsing() {
@@ -441,7 +441,7 @@ void TestSourcePlacementParsing() {
     CHECK(Value(local_path, "FrameLimiter", "source_placement") == "marker");
 }
 
-// Q11 (a): marker_forward_order parses case-insensitively, falls back to
+// marker_forward_order parses case-insensitively, falls back to
 // before_wait, saves canonical text and reaches the marker hook's switch.
 void TestMarkerForwardOrderParsing() {
     struct Case { const char* text; PacingMarkerForwardOrder expected; };
@@ -503,7 +503,7 @@ void TestRenderQueueParsing() {
     CHECK(Value(local_path, "FrameLimiter", "gpu_queue_wait_render_queue") == "remove_held");
 }
 
-// P2-4: pacing_method=marker becomes output_rung=marker; automatic, native and
+// pacing_method=marker becomes output_rung=marker; automatic, native and
 // invalid methods become auto. A present output_rung always wins.
 void TestPacingMethodMigration() {
     struct Case { const char* method; const char* rung; PacingRungOverride expected; };
@@ -546,7 +546,7 @@ void TestAdaptiveCapMigration() {
     }
 }
 
-// R11: adaptive_cap_percentile defaults to 75, is clamped to [50, 99] and
+// adaptive_cap_percentile defaults to 75, is clamped to [50, 99] and
 // saved as an integer.
 void TestAdaptiveCapPercentile() {
     struct Case { const char* value; int expected; };
@@ -601,8 +601,7 @@ void TestGpuWaitInterleaveKey() {
     }
 }
 
-// Keys retired by the Phase 1 purge (002 phase1_purge_design.md) and by Phase 2
-// (phase2_timing_core_design.md section 4; pacing_method and adaptive_smoothing
+// Keys retired by the timing-core rework (pacing_method and adaptive_smoothing
 // migrate first). An existing INI may still carry them: loading ignores them and
 // LoadConfig's clean rewrite drops them, so the pipeline matches a fresh INI.
 constexpr const char* retired_keys[] = {

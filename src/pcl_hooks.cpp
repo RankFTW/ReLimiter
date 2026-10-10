@@ -122,7 +122,7 @@ static uint64_t GetFrameID(
     return GetFallbackFrameID(marker_type);
 }
 
-// Phase 0 same-thread attribution for the native Present after PRESENT_START.
+// Same-thread attribution for the native Present after PRESENT_START.
 // marker_qpc is the hook arrival, before any presentation-gate hold.
 static void SetPresentAttribution(
     const PacingPlanKey& key,

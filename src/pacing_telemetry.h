@@ -1,6 +1,6 @@
 #pragma once
 
-// Pacing telemetry worker API (phase0_measurement_design.md). Producers are
+// Pacing telemetry worker API. Producers are
 // nonblocking: no locks, allocation or I/O; full queues drop and count. The
 // worker joins records, computes runtime metrics, publishes a snapshot for the
 // OSD and writes CSV rows while capture is enabled. Nothing here feeds pacing.

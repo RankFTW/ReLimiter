@@ -1,7 +1,6 @@
 #pragma once
 
-// Pacing record joins (project-docs/002_unified_pacing_timing/
-// phase0_measurement_design.md section 3). Pure C++17 without Windows, logger
+// Pacing record joins. Pure C++17 without Windows, logger
 // or other src dependencies. Owned by the telemetry worker; every call takes
 // the caller's QPC so tests replay deterministic timelines. Joins never guess
 // from arrival order: ambiguity and misses leave fields empty and are counted.
@@ -115,7 +114,7 @@ struct PacingJoinStatistics {
     uint64_t gate_capacity_evictions = 0;
     uint64_t ready_capacity_evictions = 0;
     uint64_t reflex_capacity_evictions = 0;
-    // Cross-thread hand-off evidence (R8): displays with an ETW frame ID whose
+    // Cross-thread hand-off evidence: displays with an ETW frame ID whose
     // Present carried a cross-thread key that matched it, or did not.
     uint64_t cross_thread_agreements = 0;
     uint64_t cross_thread_disagreements = 0;

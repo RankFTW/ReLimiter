@@ -16,12 +16,12 @@ namespace
         double allowance_us;
     };
 
-    // Lead parameters of every rung, indexed by PacingSmoothing (design 2.4,
-    // Q1 a; design review 2026-10-03). H0 uses the same table: its lead only
+    // Lead parameters of every rung, indexed by PacingSmoothing. H0 uses
+    // the same table: its lead only
     // places the virtual output target, and a median lead would make half of
     // all frames late against it and start OutputLate epochs. Smoothing Off
-    // (always H0, rule 4) has no allowance; its quantile is the design's
-    // unspecified entry. On is the former Medium.
+    // (always H0) has no allowance; its quantile is an unused
+    // placeholder. On is the former Medium.
     constexpr LeadParameters kLead[] = {
         { 0.95, 0.0 },   // Off
         { 0.95, 500.0 }, // On: the former Medium
@@ -43,7 +43,7 @@ namespace
     bool IsFgInputQualified(const PacingCapabilities& capabilities) noexcept
     {
         // The GPU gate keys FG inputs to NvAPI frames; no executor claims an
-        // FgInputWait plan on another route (R1 L1).
+        // FgInputWait plan on another route.
         return capabilities.x64 && capabilities.api == PacingApi::DX12 &&
             capabilities.route == PacingRoute::NvApiMarkers &&
             capabilities.fg_input_route_ready;
@@ -57,7 +57,7 @@ namespace
             capabilities.native_route_qualified;
     }
 
-    // Rule 7: the first failing GPU queue wait requirement; None when all hold.
+    // The first failing GPU queue wait requirement; None when all hold.
     PacingFallbackReason GpuQueueBlocker(
         const PacingCapabilities& capabilities,
         const PacingRuntimeState& runtime) noexcept
@@ -70,9 +70,9 @@ namespace
         return PacingFallbackReason::None;
     }
 
-    // Rule 5: the requested rung when its requirements hold, else the next
+    // The requested rung when its requirements hold, else the next
     // rung down (H3 → H1, H2 → H1, H1 → H0). An unqualified FG input wait
-    // falls back to H0, not H1: FG without its input route holds nothing (P2-2).
+    // falls back to H0, not H1: FG without its input route holds nothing.
     PacingRung OverrideRung(
         PacingRungOverride rung_override,
         const PacingCapabilities& capabilities,
@@ -100,7 +100,7 @@ namespace
         }
     }
 
-    // Rules 6–8: the Auto rung.
+    // The Auto rung.
     RungDecision AutoRung(
         const PacingCapabilities& capabilities,
         const PacingRuntimeState& runtime) noexcept
@@ -111,7 +111,7 @@ namespace
             }
             return { PacingRung::SourceOnly, PacingFallbackReason::FgUnqualified };
         }
-        // Rule 8 (H1 on marker routes) is the blocked case of rule 7: every
+        // H1 on marker routes is the blocked case of the GPU queue wait: every
         // marker route either qualifies for H3 or fails one requirement.
         const PacingFallbackReason blocker = GpuQueueBlocker(capabilities, runtime);
         if (blocker == PacingFallbackReason::None) {
@@ -120,8 +120,8 @@ namespace
         return { PacingRung::MarkerHold, blocker };
     }
 
-    // Rules 3–8 for a routed, capped pipeline outside the idle caps. *is_auto
-    // is true when Auto rules 6–8 chose the rung.
+    // The rung for a routed, capped pipeline outside the idle caps. *is_auto
+    // is true when the Auto rule chose the rung.
     RungDecision ResolveRung(
         const PacingPipelineConfig& config,
         const PacingCapabilities& capabilities,
@@ -145,8 +145,8 @@ namespace
         return AutoRung(capabilities, runtime);
     }
 
-    // Overload guard and GPU queue wait demotion (design review 2026-10-03,
-    // 2026-10-05), Auto rules 6–8 only: overload demotes every hold rung, a
+    // Overload guard and GPU queue wait demotion, Auto rung only:
+    // overload demotes every hold rung, a
     // not-held A/B block demotes the GPU queue wait, both to source only with
     // reason Infeasible.
     RungDecision ApplyHoldFeasibility(RungDecision decision, const PacingRuntimeState& runtime) noexcept
@@ -158,7 +158,7 @@ namespace
         return decision;
     }
 
-    // Marker-route placement (P4-11). The driver limiter needs the NvAPI
+    // Marker-route placement. The driver limiter needs the NvAPI
     // route (x64) and a game that calls the Reflex Sleep; pre-Sleep needs the
     // Sleep. Otherwise the source waits at the marker.
     PacingSourcePlacement MarkerRoutePlacement(
@@ -485,7 +485,7 @@ PacingPipelineConfig PacingPipeline_ClampConfig(PacingPipelineConfig config) noe
         kDefaultConfig.stall_inject_period_s,
         kPacingStallInjectMinPeriodS, kPacingStallInjectMaxPeriodS);
     // Developer key gpu_wait_budget_us: [500, 5000] µs; non-positive or
-    // non-finite (builds before 2026-10-04 saved 0 for "off") is the default.
+    // non-finite (older builds saved 0 for "off") is the default.
     config.gpu_wait_budget_us = !std::isfinite(config.gpu_wait_budget_us) ||
             config.gpu_wait_budget_us <= 0.0
         ? kPacingGpuWaitBudgetDefaultUs
@@ -652,7 +652,7 @@ const char* PacingPlacementOverride_Text(PacingPlacementOverride placement) noex
 
 bool PacingPlacementOverride_FromText(const char* text, PacingPlacementOverride* placement) noexcept
 {
-    // R15: `auto` (pre-Sleep that disengaged itself) is gone; it reads as the
+    // `auto` (pre-Sleep that disengaged itself) is gone; it reads as the
     // new default, marker.
     if (text != nullptr && placement != nullptr && EqualsIgnoreCase(text, "auto")) {
         *placement = PacingPlacementOverride::Marker;

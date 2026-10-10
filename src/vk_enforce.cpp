@@ -116,7 +116,7 @@ void VkEnforce_OnPresent(
         ReflexInject_OnPostSleep(frameID, post_inject.QuadPart);
     }
 
-    // Phase 0: the ReShade present event precedes the native Present on this
+    // The ReShade present event precedes the native Present on this
     // thread, so the DXGI Present hook (DX11/DX12 present-based path) can
     // attribute it to this source frame. No presentation gate runs here.
     PacingPresentAttribution attribution{};

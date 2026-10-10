@@ -1,8 +1,6 @@
 #pragma once
 
-// Period governor C2 (project-docs/002_unified_pacing_timing/
-// phase4_design.md, decisions P4-1 to P4-7; design review 2026-10-03;
-// evidence-gated controller 2026-10-04, tools/adaptive_cap_sim `Pressure`).
+// Period governor (evidence-gated).
 // The Adaptive cap lengthens the interval I only while the frames themselves
 // show it is too short: two cadence restarts within 0.5 s, a quarter of the
 // newest 24 measured frames ready after their target, or more than 10% of the
@@ -10,14 +8,14 @@
 // sizes a rise (max(Q90 of the newest 12 reports, Q_p of the newest second) +
 // m, at most +8% of I_0 per 0.25 s; +5% when misses are high and demand does
 // not explain them), so a measurement that grows with the interval (Rogue
-// Core's render-submit stage, capture 33256) cannot lengthen it on its own.
+// Core's render-submit stage) cannot lengthen it on its own.
 // Falls: to Q_p + m after 0.5 s of demand headroom, otherwise probes below
 // the demand after 1 s without evidence (3% of I_0, 1.5x further per held
 // probe, up to 12%); a probe that brings evidence back returns and doubles
 // the calm time the next needs (up to 8 s). After a rise no fall happens for
 // 1.5 s per overload episode of the last 20 s (up to 8 s), so a recurring
 // load is held. The realized interval moves at most +3% / -1% per frame. The
-// hold room (2026-10-08) is a floor beside this target: while the Auto GPU
+// hold room is a floor beside this target: while the Auto GPU
 // queue wait reports one, the realized interval is at least the Adaptive cap
 // percentile of the intervals at which its frames reach the GPU wait before
 // their collision-guarded release (lead_controller.h), the smallest interval
@@ -79,7 +77,7 @@ constexpr uint32_t GOVERNOR_SETTLE_FRAMES = 32;         // after a reset or a fi
 
 // ── Windowed miss rate ──
 
-// Windowed miss rate (design review 2026-10-03; Android Swappy's 2 s window).
+// Windowed miss rate (Android Swappy's 2 s window).
 constexpr double MISS_WINDOW_S = 2.0;      // a window closes after 2 s
 constexpr double MISS_WINDOW_MIN_S = 1.0;  // High needs at least 1 s of frames
 constexpr double MISS_RATE_HIGH = 0.10;    // High: misses > 10% of the window's frames
@@ -151,7 +149,7 @@ struct GovernorFrame {
     int64_t qpc = 0;
     int64_t qpc_frequency = 0;
     double base_interval_us = 0.0; // I_0 = cap × FG divisor, before LFC
-    double quantile = 0.75;        // slow demand quantile: the Adaptive cap percentile (R11)
+    double quantile = 0.75;        // slow demand quantile: the Adaptive cap percentile
     GovernorFixedRefresh fixed{};
     // VRR ceiling interval while LFC is active (the previous frame's LFC
     // state), else 0. Demand is judged against the paced interval
@@ -177,7 +175,7 @@ struct GovernorDecision {
     bool valid = false;        // false: invalid frame; use the base interval
     double interval_us = 0.0;  // governed interval before LFC (snapped fixed: whole refreshes)
     double stretch = 1.0;      // interval / I_0
-    // Telemetry value (P4-6): VRR and unsnapped fixed refresh, the stretch in
+    // Telemetry value: VRR and unsnapped fixed refresh, the stretch in
     // whole percent of I_0; snapped fixed refresh, whole refreshes above the
     // base refresh count.
     uint8_t step = 0;

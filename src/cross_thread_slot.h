@@ -1,7 +1,6 @@
 #pragma once
 
-// Cross-thread PRESENT_START hand-off (project-docs/002_unified_pacing_timing/
-// phase4_design.md section 15, R8). Some engines send PRESENT_START on one
+// Cross-thread PRESENT_START hand-off. Some engines send PRESENT_START on one
 // thread and call Present on another (Gears of War: E-Day: strict
 // alternation, Present 0.8-5 ms after its own marker and never after the
 // next one). The marker thread publishes its newest marker; a Present on a

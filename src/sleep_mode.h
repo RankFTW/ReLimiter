@@ -2,12 +2,11 @@
 
 #include <cstdint>
 
-// Reflex driver limiter (project-docs/002_unified_pacing_timing/
-// phase4_design.md P4-11, P4-12): developer placement `source_placement=driver`
+// Reflex driver limiter: developer placement `source_placement=driver`
 // hands the source cadence to the driver's Reflex limiter by setting
 // minimumIntervalUs through NvAPI_D3D_SetSleepMode with the game's other
 // sleep-mode parameters. Under frame generation the driver applies it to
-// presented frames (capture C), so the caller passes the output interval.
+// presented frames (generated ones included), so the caller passes the output interval.
 //
 // Scheduler owner only, once per OnMarker. active with a positive interval
 // applies (or keeps) the limit, rounded to whole µs, and re-applies only when

@@ -11,7 +11,7 @@ thread_local NativePresentGateRoute s_route;
 thread_local uint32_t s_previous_qualified = 0;
 thread_local uint64_t s_marker_prediction_epoch = 0;
 
-// Cross-thread hand-off (phase4_design.md section 15, R8; cross_thread_slot.h).
+// Cross-thread hand-off (cross_thread_slot.h).
 // The marker thread publishes its frame; the next native Present scope on a
 // thread without its own pending frame takes it exactly once and runs the
 // unchanged per-thread route with it, so every route check (swapchain,
@@ -241,7 +241,7 @@ void NativeGate_PublishNoFrameGeneration(bool no_fg, uint32_t controller_generat
     s_no_fg_controller.store(no_fg ? controller_generation : 0, std::memory_order_release);
 }
 namespace {
-// Automatic route mode, as the default pacing method selected before Phase 2:
+// Automatic route mode, as the legacy default pacing method selected:
 // while FG presents, Shadow observes the FG input route (the observers,
 // Streamline admission and FgInputRoute need it) and never selects native
 // carriage; without FG, Native qualifies the route for H2/H3. The resolver

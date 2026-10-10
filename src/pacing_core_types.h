@@ -1,7 +1,6 @@
 #pragma once
 
-// Timing-core contract types (project-docs/002_unified_pacing_timing/
-// phase2_timing_core_design.md). Plain data shared by the cadence grid, the
+// Timing-core contract types. Plain data shared by the cadence grid, the
 // frame-plan registry, the pipeline resolver, the lead controller, the source
 // stage and the output executors. Pure C++17: no Windows, logger or config
 // dependencies. Enums marked "CSV" appear in telemetry; retired values stay
@@ -82,7 +81,7 @@ enum class PacingRung : uint8_t {
     Count
 };
 
-// Where the source stage waits (phase4_design.md P4-8, P4-11). CSV:
+// Where the source stage waits. CSV:
 // source_placement.
 enum class PacingSourcePlacement : uint8_t {
     None = 0,
@@ -133,7 +132,7 @@ enum class PacingEpochReason : uint8_t {
     PeriodChange = 3, // cap, VRR ceiling, LFC or FG divisor changed the interval
     SourceLate = 4,   // source arrived later than S_n + tolerance
     OutputLate = 5,   // output released later than T_n + tolerance
-    GovernorStep = 6  // the period governor (C2) changed its ladder step (P3-10)
+    GovernorStep = 6  // the period governor changed its ladder step
 };
 
 // Output-stage outcome for one frame. CSV: plan_status.
@@ -163,7 +162,7 @@ enum class PacingFallbackReason : uint8_t {
     NoNativeRoute = 9, // native Present attribution not qualified
     NoGpuQueue = 10,   // GPU queue not ready
     FgUnqualified = 11, // FG presenting without a qualified FG input route
-    Infeasible = 12     // the overload guard demoted the Auto rung (the resume spread switch-off before 2026-10-04)
+    Infeasible = 12     // the overload guard demoted the Auto rung (older builds: the resume spread switch-off)
 };
 
 // ── Plans and stage events ──
@@ -194,14 +193,14 @@ enum class PacingStageEventKind : uint8_t {
     GpuReady = 5,      // r: GPU completion before any hold, mapped to QPC
     GpuResume = 6,     // u: GPU resume after the hold (post-wait probe), mapped to QPC
     // Marker arrivals (lead_controller.h): w RENDERSUBMIT_START on the GPU
-    // waits (the frame's GPU work can start; R13), and e SIMULATION_END and b
+    // waits (the frame's GPU work can start), and e SIMULATION_END and b
     // PRESENT_END on the GPU waits (the simulation → render queue).
     RenderSubmitStart = 7, // w
     SimulationEnd = 8,     // e
     PresentEnd = 9         // b
 };
 
-// Developer key `gpu_queue_wait_render_queue` (2026-10-09, A/B): whether the
+// Developer key `gpu_queue_wait_render_queue` (A/B): whether the
 // GPU queue wait's lead sample leaves out the game's simulation → render queue
 // (lead_controller.h). The FG input wait always does. INI text: keep | remove |
 // remove_held.

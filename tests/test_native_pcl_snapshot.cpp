@@ -100,7 +100,7 @@ void TestUnavailableAndInvalidStates() {
 }
 
 std::vector<std::string> Split(const std::string& line) {
-    // Historical relimiter_pcl captures (the family was removed in Phase 1)
+    // Historical relimiter_pcl captures (the family has been removed)
     // contain numeric and fixed status fields, no quoted commas.
     std::vector<std::string> values;
     std::istringstream stream(line);

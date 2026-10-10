@@ -588,7 +588,7 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
         }
     }
 
-    // R13: the game's Reflex mode decides whether its Sleep absorbs a GPU
+    // The game's Reflex mode decides whether its Sleep absorbs a GPU
     // backlog. Logged on change only (some games call this every frame).
     if (params_valid) {
         static std::atomic<uint64_t> s_logged_sleep_mode{ UINT64_MAX };
@@ -619,7 +619,7 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
                 s_game_params_identity = params_device.identity;
                 s_game_params_captured = false;
             }
-            // The newest game parameters: the driver limiter (P4-12) applies
+            // The newest game parameters: the driver limiter applies
             // its interval on top of them and restores them.
             s_game_original_params = params_snapshot;
             s_game_params_captured = true;
@@ -629,7 +629,7 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
         }
     }
 
-    // While the Reflex driver limiter is applied (P4-12), the game's own call
+    // While the Reflex driver limiter is applied, the game's own call
     // would clear it: forward a copy with ReLimiter's interval instead. The
     // game's parameters above stay captured for the restore.
     const uint32_t limiter_us = g_driver_limiter_interval_us.load(std::memory_order_relaxed);
@@ -662,7 +662,7 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
         // driver's Sleep after the hook.
         const bool bypass = NvAPI_ShouldBypassSleep(g_reflex_sleep_bypass.load(std::memory_order_relaxed),
             g_user_target_fps.load(std::memory_order_relaxed), Scheduler_PacesSource());
-        // Pre-Sleep placement (P4-8): record the Sleep on the presenting
+        // Pre-Sleep placement: record the Sleep on the presenting
         // device, then wait toward the next source target before the driver
         // Sleep. The owner is held only to plan and to record the wait end,
         // not during the waits. A busy owner skips the wait; the
@@ -672,7 +672,7 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
             QueryPerformanceCounter(&sleep_entry);
             Scheduler_RecordReflexSleep(sleep_entry.QuadPart);
             if (Scheduler_PreSleepPlacementActive()) {
-                // Render handoff limit (phase4_design.md section 23): with
+                // Render handoff limit: with
                 // the Sleep bypassed, a frame that is not held waits here,
                 // before the game reads input, until the render thread has
                 // taken the newest released frame.
@@ -766,7 +766,7 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
     }
     const FeedbackDeviceGuard marker_device(dev, &marker_params);
 
-    // Phase 0 clock map: the local QPC closest to the driver's presentStartTime
+    // Clock map: the local QPC closest to the driver's presentStartTime
     // is read immediately before forwarding; it is recorded only after the
     // marker passes validation below.
     LARGE_INTEGER present_start_forward_qpc{};
@@ -775,7 +775,7 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
     // Forward to driver FIRST — Reflex's JIT pacing depends on accurate
     // marker timing. Any work we do before forwarding shifts the driver's
     // perception of pipeline stage boundaries and degrades latency.
-    // marker_forward_order=after_wait (Q11 a) instead forwards direct
+    // marker_forward_order=after_wait instead forwards direct
     // immediate markers on exit, after any source wait, as the PCL path does:
     // the driver (and frame generation) then sees the paced release.
     const bool forward_after_wait = !from_rtss &&
@@ -864,7 +864,7 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
         return forward();
     }
     // RENDERSUBMIT_START of a planned frame is a stage event for the lead
-    // (R13, the simulation → render queue and the render handoff offset)
+    // (the simulation → render queue and the render handoff offset)
     // and is published as the render handoff (render_handoff.h), before
     // the scheduler-owner guard: it runs on the render thread, often while
     // the next SIMULATION_START owns the scheduler (or waits for this
@@ -1083,7 +1083,7 @@ NvAPI_Status InvokeSetSleepMode(IUnknown* dev, NV_SET_SLEEP_MODE_PARAMS* params)
 void RestoreGameSleepMode() {
     if (!s_orig_sleep_mode) return;
     // Copy under the lock: Hook_SetSleepMode updates the parameters at runtime
-    // and the driver limiter (P4-11) restores them outside shutdown.
+    // and the driver limiter restores them outside shutdown.
     NV_SET_SLEEP_MODE_PARAMS params{};
     NvAPIFeedbackDevice params_identity{};
     {

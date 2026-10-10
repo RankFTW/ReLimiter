@@ -1,11 +1,9 @@
 #pragma once
 
-// Lead controller C1 (project-docs/002_unified_pacing_timing/
-// phase2_timing_core_design.md section 2.3; docs/pacing-timing-redesign-plan.md
-// section 6.5). Learns the lead L from the source release to the output target
-// per (rung, FG divisor) bucket, from per-frame samples X that exclude
-// ReLimiter's own holds, including GPU holds carried through a busy GPU
-// (phase4_design.md section 20). Pure C++17 without Windows, logger or config
+// Lead controller. Learns the lead L from the source release to the output
+// target per (rung, FG divisor) bucket, from per-frame samples X that exclude
+// ReLimiter's own holds, including GPU holds carried through a busy GPU.
+// Pure C++17 without Windows, logger or config
 // dependencies. Owned and called only by the scheduler owner; not thread-safe.
 //
 // Storage is fixed and nothing allocates. sizeof(LeadController) is about
@@ -36,22 +34,22 @@ constexpr size_t LEAD_RESUME_MEDIAN_SAMPLES = 32;  // newest u − o in the medi
 // A waited u − o above this is a late GPU resume: the GPU wait cap ladder's
 // evidence (rung_feasibility.h GpuWaitCap).
 constexpr double LEAD_RESUME_LATE_US = 1000.0;
-constexpr size_t LEAD_SLACK_CAPACITY = 120;        // newest slack samples per bucket (P3-3)
+constexpr size_t LEAD_SLACK_CAPACITY = 120;        // newest slack samples per bucket
 constexpr double LEAD_PRESENT_PLACEMENT_US = 150.0;
 constexpr double LEAD_SEED_MIN_US = 1000.0;
 constexpr double LEAD_SEED_MAX_US = 8000.0;
 constexpr double LEAD_SLEW_MAX_US = 100.0;         // per planned frame; also at most I/64
 constexpr double LEAD_LONG_SAMPLE_INTERVALS = 3.0; // samples above 3 I are excluded
-// Lead limit (R15): the outlier bound itself. Samples above 3 I never enter
+// Lead limit: the outlier bound itself. Samples above 3 I never enter
 // the window, so a warm lead never needs more; there is no separate latency
-// budget that would judge the game's own pipeline (P3-2 and R14 removed).
+// budget that would judge the game's own pipeline.
 constexpr double LEAD_BUDGET_INTERVALS = LEAD_LONG_SAMPLE_INTERVALS;
 
-// Collision-aware release (GPU queue wait, 2026-10-07). Frame n + 1's native
+// Collision-aware release (GPU queue wait). Frame n + 1's native
 // Present call lands I − L + C after frame n's release Signal o, C being the
 // source release → Present call time. A Present call within about 2-2.5 ms
 // after the Signal collides with the GPU's resume: in eleven sessions
-// (captures 45760_1, 51232_1, 54788_3 and older) 92-100% of late resumes and
+// 92-100% of late resumes and
 // 95-100% of the 5-8 ms GPU stalls fell inside that window, and the late
 // share was 0.00-0.27% at margins of 2.5 ms or more. The GPU queue wait lead
 // is therefore at most I + Q10(C) − M: a frame that needs a longer lead
@@ -65,12 +63,11 @@ constexpr double LEAD_MARGIN_CUSHION_US = 500.0;   // margin = collision edge + 
 constexpr double LEAD_MARGIN_BIN_US = 250.0;       // edge resolution and step
 constexpr size_t LEAD_MARGIN_BINS = 32;            // 0..8 ms; the last bin also holds larger margins
 // Evidence decays by 1/32768 per waited resume (half-life about 22,700, a
-// few minutes of play): collisions come in heavy stretches (54788_3: 0.5-5%
-// late at 1.75-2 ms in its first two minutes, 45-97% in its heaviest 30 s
+// few minutes of play): collisions come in heavy stretches (0.5-5% late at
+// 1.75-2 ms in a session's first two minutes, 45-97% in its heaviest 30 s
 // stretches), so the margin keeps the edge of the recurring heavy stretches
 // instead of the calm one in between. A 4,096-resume memory narrowed to
-// 2.0-2.25 ms in calm stretches of 54788_3 and 51232_1 (C++ replay,
-// 2026-10-07).
+// 2.0-2.25 ms in calm stretches (offline replay).
 constexpr double LEAD_MARGIN_DECAY_SAMPLES = 32768.0;
 constexpr double LEAD_MARGIN_MIN_SAMPLES = 32.0;   // weighted resumes for a bin to count
 constexpr double LEAD_MARGIN_MIN_LATE = 4.0;       // weighted late resumes for a bin to collide
@@ -78,11 +75,11 @@ constexpr double LEAD_MARGIN_MIN_LATE = 4.0;       // weighted late resumes for 
 // learner judges nothing before 256 weighted resumes measure it. A bin
 // collides when its late share exceeds the background by more than 2.5
 // points, at z > 2.5. Widening scans upward from the edge below the
-// background and stops at the first measured bin that does not collide: in
-// session 48860 the first build jumped 2.5 -> 4.0 ms on 15 late resumes of
+// background and stops at the first measured bin that does not collide: an
+// earlier build jumped 2.5 -> 4.0 ms on 15 late resumes of
 // 960 shortly after a focus change (lateness well above the collision
 // window), and with M = 4.0 ms 98.8% of frames reached the GPU wait after
-// their release (display jitter p50 438 us against 82 in 54788_3).
+// their release (display jitter p50 438 us against 82 at the normal margin).
 constexpr double LEAD_MARGIN_BACKGROUND_SAMPLES = 256.0;
 constexpr double LEAD_MARGIN_EXCESS_SHARE = 0.025;
 constexpr double LEAD_MARGIN_EXCESS_Z = 2.5;
@@ -94,9 +91,9 @@ constexpr double LEAD_MARGIN_CLEAN_SAMPLES = 512.0;
 constexpr double LEAD_MARGIN_CLEAN_SHARE = 0.005;
 constexpr uint32_t LEAD_MARGIN_NARROW_SAMPLES = 1024;
 
-// Release headroom (2026-10-08). A late resume is the work after the GPU
+// Release headroom. A late resume is the work after the GPU
 // wait queued behind one of the next frame's long command buffers on the same
-// GPU engine: the GPU does not preempt them (GPU trace of session 31224: none
+// GPU engine: the GPU does not preempt them (a GPU trace showed none
 // of 1.07 million packets preempted; a waited resume ran 96 µs after the
 // running packet completed). The next frame's heavy GPU work starts at
 // r − A, its GPU readiness minus its Reflex GPU active render time (within
@@ -117,10 +114,10 @@ constexpr double LEAD_WORK_QUANTILE = 0.10;        // low quantile of D
 // frames is stale (Reflex reports stopped): the Present-call guard applies.
 constexpr uint32_t LEAD_WORK_STALE_FRAMES = 64;
 
-// Queue order (2026-10-09). Both guards assume the next frame's GPU work can
+// Queue order. Both guards assume the next frame's GPU work can
 // run while frame n's GPU waits at its gate, so it can occupy the engine when
 // the Signal comes. Some games run it behind the wait instead (one queue, in
-// order): then it cannot delay the resume, and the hold delays it (R13's
+// order): then it cannot delay the resume, and the hold delays it (the
 // carried delay). The test: frame n's GPU waited at the Signal o_n (probe),
 // frame n + 1 had begun submitting (RENDERSUBMIT_START <= o_n), and frame n +
 // 1's GPU work started at g_{n+1} (its Reflex gpuRenderStartTime through the
@@ -129,7 +126,7 @@ constexpr uint32_t LEAD_WORK_STALE_FRAMES = 64;
 // guarded or not, from the first or second pair. CONTROL Resonant: none of
 // 3,661 pairs in three captures (g − o at least 38 µs), and with the guard
 // off (Output override GPU wait) 2,309 waited frames above its limit had no
-// late resume while jitter fell from 1.91 to 1.04 ms (7636_3 / 7636_5). The
+// late resume while jitter fell from 1.91 to 1.04 ms. The
 // guards therefore stand aside only once LEAD_WARM_SAMPLES of the newest
 // LEAD_CONCURRENCY_SAMPLES pairs exist and none was concurrent; one
 // concurrent pair restores them at once. Without probes or Reflex reports no
@@ -155,7 +152,7 @@ constexpr CollisionDistanceLimits LEAD_MARGIN_LIMITS{ LEAD_MARGIN_START_US, LEAD
 // resumes as the 2.5 ms release margin.
 constexpr CollisionDistanceLimits LEAD_HEADROOM_LIMITS{ 1000.0, 750.0, 3000.0 };
 
-// Hold room (2026-10-08, Adaptive cap): a GPU queue wait frame the guard
+// Hold room (Adaptive cap): a GPU queue wait frame the guard
 // judged reaches its gate before its guarded release once the interval is at
 // least R = X − (limit − I), X minus Q10(D) − H (or Q10(C) − M). The period
 // governor keeps the interval at least at the Adaptive cap percentile of R
@@ -163,12 +160,11 @@ constexpr CollisionDistanceLimits LEAD_HEADROOM_LIMITS{ 1000.0, 750.0, 3000.0 };
 // the gate to the next frame's heavy GPU work moved 0.93 µs per µs of
 // interval while A and D moved −0.01 and +0.06: R does not grow with the
 // interval it buys. A frame late even against its unguarded lead is the
-// overload's evidence (C2), not the hold's, and adds no R.
+// overload's evidence, not the hold's, and adds no R.
 
-// Lockstep engines (2026-10-08, CONTROL Resonant 29380_3): the game finishes
+// Lockstep engines (CONTROL Resonant): the game finishes
 // frame n's render submission and Present only after ReLimiter releases
-// frame n + 1 (Present(n) − s_{n+1} p50 +3,075 µs over frames whose next
-// wait exceeded 2 ms; −3,292 µs with the Adaptive cap off, 29380_1), so
+// frame n + 1 (the next release gates the previous frame's Present), so
 // frame n's Present follows ReLimiter's waits for later frames. Those waits
 // are not the game's time. A later frame k gated frame n when it was
 // released no later than frame n's Present-side time (PRESENT_START, the
@@ -177,11 +173,10 @@ constexpr CollisionDistanceLimits LEAD_HEADROOM_LIMITS{ 1000.0, 750.0, 3000.0 };
 // late-output check (source_stage.cpp) and the Adaptive cap's slack evidence
 // judge frame n without it; the lead keeps the measured X, because a lockstep
 // frame cannot be ready before the release it waits for. In a serial engine
-// (Rogue Core) the next wait starts after Present(n): no frame was gated in
-// 42520_1 or 10476_1.
+// (Rogue Core) the next wait starts after Present(n): no frame is gated.
 
-// The game's simulation → render queue (2026-10-09, CONTROL Resonant 31724_1,
-// FG 2× with the driver's Reflex Sleep bypassed). A pipelined engine's
+// The game's simulation → render queue (CONTROL Resonant, FG 2× with the
+// driver's Reflex Sleep bypassed). A pipelined engine's
 // simulation thread can finish frame n (SIMULATION_END e_n) while its render
 // thread is still inside frame n − 1's Present (PRESENT_END b_{n−1}: 9.5 ms
 // of Present back-pressure, p50); the render thread took the frame at
@@ -192,32 +187,32 @@ constexpr CollisionDistanceLimits LEAD_HEADROOM_LIMITS{ 1000.0, 750.0, 3000.0 };
 // learned a one-frame-deep queue and kept it, because a release one frame
 // earlier leaves the frame waiting just as long: X 40.2 ms with q p50
 // 15.6 ms on 90% of frames and 18 ms more PC latency than with the driver's
-// Sleep. Without q (33216_1) the lead fell to 26.2 ms with the source still
+// Sleep. Without q the lead fell to 26.2 ms with the source still
 // on the grid. Time after b_{n−1} stays in X (a lockstep frame waits there
-// for a later release, above), and R13's carried delay starts at w or later.
+// for a later release, above), and the carried delay starts at w or later.
 // The slack keeps X: q does not change when the frame was ready.
 // FG input wait only. The FG input wait's back-pressure comes from its own
 // GPU gate, and its output point lies a GPU frame after the Present call.
 // Other rungs keep X:
-// - On source only (15312_1, FG unqualified) q was the game's own pipeline
+// - On source only (FG unqualified) q was the game's own pipeline
 //   depth (p50 16 ms on half the frames), and the PRESENT_START output point
 //   sits right after it. With q removed, the late-output check's gated-hold
 //   forgiveness shrank (p50 29.1 / 19.6 → 7.3 ms) and the grid restarted 292
-//   times per 1,000 frames, against 0 on c19b9686.
+//   times per 1,000 frames, against none with q kept in X.
 // - H1 and H2 already remove ReLimiter's own CPU hold (the overlap rule), so
 //   the queue left over is the game's as well.
 // - On the GPU queue wait (CONTROL with FG off), late resumes concentrated on
 //   queued frames (38.5% against 4.8%); that output keeps X unless the
 //   developer A/B key gpu_queue_wait_render_queue says otherwise (Remove, or
-//   RemoveHeld: only after a frame whose GPU waited at its gate, the R13
+//   RemoveHeld: only after a frame whose GPU waited at its gate, the
 //   condition for a delay ReLimiter's own hold caused). Rogue Core never
 //   queues (w before e): q was 0 on every frame of five captures.
 
-// Render handoff offset (phase4_design.md section 23, 2026-10-10). A frame
+// Render handoff offset. A frame
 // that is not held is released no earlier than A_n = w_{n−1} + d, where
 // w_{n−1} is RENDERSUBMIT_START of the newest released frame: a pipelined
 // game then cannot simulate frames that only wait for its render thread
-// (CONTROL Resonant FG 2× with the Reflex Sleep bypassed, 45272_1: the
+// (CONTROL Resonant FG 2× with the Reflex Sleep bypassed: the
 // release of frame n came 28.6 ms before PRESENT_END(n−1)). Each frame n
 // released at or after w_{n−1} adds h = (b_{n−1} − w_{n−1}) − (e_n − s_n): how
 // much later it could have been released and still ended its simulation
@@ -245,7 +240,7 @@ struct LeadFrameStart {
     double fg_divisor = 1.0;
     double interval_us = 0.0;      // the plan's grid interval I
     int64_t source_release_qpc = 0; // s
-    double lead_us = 0.0;          // the plan's lead L; slack = L − X (P3-3). Finite, >= 0
+    double lead_us = 0.0;          // the plan's lead L; slack = L − X. Finite, >= 0
     // Frames outside Vrr and Fixed are tracked for matching but never sampled.
     PacingTimingMode mode = PacingTimingMode::Vrr;
     // H3: the plan's GPU hold reports a post-wait resume probe (u), so the
@@ -299,7 +294,7 @@ struct LeadBucketStatus {
     bool budget_limited = false; // last warm target exceeded the budget
 };
 
-// Per-bucket feasibility evidence for C3 (P3-11).
+// Per-bucket feasibility evidence for the overload guard.
 struct LeadFeasibility {
     uint32_t samples = 0;        // slack samples in the window (at most LEAD_SLACK_CAPACITY)
     uint32_t negative_count = 0; // of those, frames with X > L
@@ -358,7 +353,7 @@ struct LeadStatistics {
     uint64_t resume_waited_samples = 0;
     uint64_t resume_late_samples = 0;
     uint64_t invalid_inputs = 0;     // rejected frequency, requests, releases and events
-    // R13: GPU-rung samples shortened by the delay earlier GPU holds carried
+    // GPU-rung samples shortened by the delay earlier GPU holds carried
     // through a busy GPU, and the newest such delay.
     uint64_t carried_hold_samples = 0;
     double last_carried_hold_us = 0.0;
@@ -371,7 +366,7 @@ struct LeadStatistics {
     uint64_t handoff_samples = 0;
     double last_handoff_us = 0.0;
     double last_sample_us = 0.0;     // newest sample added to a bucket
-    double last_slack_us = 0.0;      // newest slack L − X (P3-3), long samples included
+    double last_slack_us = 0.0;      // newest slack L − X, long samples included
     // Slack samples (one per frame whose readiness was measured, long ones
     // included) and of those, frames ready after their target (L − X < 0):
     // the Adaptive cap's output evidence.
@@ -454,10 +449,10 @@ public:
     // Enforcement marker change: buckets cleared. Frames already released
     // produce no sample but still decontaminate the next frame.
     void ResetBuckets() noexcept;
-    // Every bucket's slack window: a C3 evidence restart (a governor step or
-    // reset, or a lifecycle, cap, FG divisor or route change), or an
-    // infeasible-lead miss consumed by the Adaptive cap (C2). Lead windows,
-    // budget flags and the resume history (C1) stay.
+    // Every bucket's slack window: an overload-guard evidence restart (a
+    // governor step or reset, or a lifecycle, cap, FG divisor or route
+    // change), or an infeasible-lead miss consumed by the Adaptive cap. Lead
+    // windows, budget flags and the resume history stay.
     void ClearSlackEvidence() noexcept;
     // The rung resumes holding after an overload demotion: each of its
     // sampled buckets restarts its window, and until 32 new samples arrive
@@ -467,10 +462,10 @@ public:
     // frames kept current. Other rungs, the resume history and statistics stay.
     void RestartRung(PacingRung rung) noexcept;
     // One call per planned frame; applies at most one slew step to the
-    // selected bucket and clamps L to [0, 3 I] (R15). Present placement returns
+    // selected bucket and clamps L to [0, 3 I]. Present placement returns
     // 150 µs; None placement and Off or Idle mode return 0 without touching a
     // bucket. *budget_limited (optional) is true when the warm target
-    // Q_q + allowance exceeded the budget (P3-2); cold, seed and non-bucket
+    // Q_q + allowance exceeded the budget; cold, seed and non-bucket
     // leads are never budget-limited. With request.collision_guard, a GPU
     // queue wait lead is at most I + Q10(D) − H once 32 current D samples
     // exist, else I + Q10(C) − M once 32 C samples exist, unless the queue
@@ -494,7 +489,7 @@ public:
     LeadBucketStatus BucketStatus(PacingRung rung, double fg_divisor) const noexcept;
     // Median sample X of a warm bucket (release to output point); 0 when the
     // bucket is cold or unknown. The source slack of a plan is L minus this
-    // (R12).
+    // value.
     double MedianSampleUs(PacingRung rung, double fg_divisor) const noexcept;
     // Hold room: Q_q of R over the newest 256 hold-room samples of the FG
     // divisor, the interval at which a share q of the judged GPU queue wait
@@ -555,7 +550,7 @@ private:
         uint64_t grid_index = 0;
         std::array<int64_t, FieldCount> qpc{};
         int64_t gpu_wait_qpc = 0;  // pre-Wait GPU time of the GpuResume event; 0 unknown
-        // R13, GPU rungs: s + X, the readiness without the delay earlier GPU
+        // GPU rungs: s + X, the readiness without the delay earlier GPU
         // holds carried into this frame; 0 until the sample is emitted.
         int64_t own_ready_qpc = 0;
         double interval_us = 0.0;

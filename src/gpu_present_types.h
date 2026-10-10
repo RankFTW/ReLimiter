@@ -1,6 +1,6 @@
 #pragma once
 
-// GPU output transport types (phase2_timing_core_design.md 2.6). Identity and
+// GPU output transport types. Identity and
 // readiness snapshots carried between the Present hook, the readiness sampler
 // and the GPU deadline worker. The types keep their historical ReadyPresent*
 // names. Definitions: gpu_present_types.cpp.

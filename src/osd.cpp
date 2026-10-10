@@ -168,7 +168,7 @@ static void EnforceStickyMonitor() {
     MoveWindowToMonitor(idx);
 }
 
-// ── Pacing pipeline controls (phase2_timing_core_design.md section 4) ──
+// ── Pacing pipeline controls ──
 
 // Combo labels in enum order.
 static const char* const kRungOverrideLabels[] = {
@@ -213,7 +213,7 @@ static void DrawPacingPipelineStatus() {
     if (has_status && status.hold_interleave != 0)
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "A/B interleave: %s block (%.1f s left)",
             status.hold_interleave == 1 ? "held" : "not-held", status.hold_interleave_remaining_s);
-    // Source placement (P4-8 to P4-11).
+    // Source placement.
     if (pipeline.placement == PacingSourcePlacement::PreSleep && has_status) {
         if (status.pre_sleep_samples > 0)
             ImGui::TextDisabled("Placement: pre-Sleep | margin %.2f ms | residual p50 %.2f / p99 %.2f ms",
@@ -231,7 +231,7 @@ static void DrawPacingPipelineStatus() {
     } else {
         ImGui::TextDisabled("Placement: %s", PacingSourcePlacement_Text(pipeline.placement));
     }
-    // Render handoff limit (phase4_design.md section 23): frames not held
+    // Render handoff limit: frames not held
     // with the Reflex Sleep bypassed.
     if (has_status && status.render_handoff == 1)
         ImGui::TextDisabled("Render handoff limit: +%.2f ms after the render thread takes the previous frame | %u frames delayed | %u stalls",
@@ -246,8 +246,8 @@ static void DrawPacingPipelineStatus() {
     else
         ImGui::TextDisabled("Lead: - | Grid epoch: -");
     const bool gpu_rung = pipeline.rung == PacingRung::GpuQueueWait || pipeline.rung == PacingRung::FgInputWait;
-    // GPU wait cap ladder (2026-10-04): shown on the GPU queue wait; orange
-    // below the budget; off at the open top (2026-10-09).
+    // GPU wait cap ladder: shown on the GPU queue wait; orange
+    // below the budget; off at the open top.
     if (has_status && status.valid && pipeline.rung == PacingRung::GpuQueueWait) {
         const char* checking = status.gpu_wait_cap_checking ? ", checking" : "";
         if (status.gpu_wait_cap_open)
@@ -285,7 +285,7 @@ static void DrawPacingPipelineStatus() {
                 status.release_margin_us / 1000.0, status.release_margin_late, status.release_margin_samples);
         }
     }
-    // P3-13: driver Sleep time while the GPU wait holds (measured, not acted on).
+    // Driver Sleep time while the GPU wait holds (measured, not acted on).
     if (gpu_rung)
         ImGui::TextDisabled("Driver Sleep: %.2f ms",
             g_pacer_latency_us.load(std::memory_order_relaxed) / 1000.0);
@@ -398,7 +398,7 @@ static void DrawPacingSummary(bool* config_dirty) {
     }
 }
 
-// Adaptive cap: the period governor (C2) stretches the cap interval (P4-1).
+// Adaptive cap: the period governor stretches the cap interval.
 static void DrawAdaptiveCapControl(bool* config_dirty) {
     if (ImGui::Checkbox("Adaptive cap", &g_config.adaptive_cap)) {
         Config_ApplyPacingPipeline();
@@ -425,7 +425,7 @@ static void DrawAdaptiveCapControl(bool* config_dirty) {
     HelpTip("Show the Adaptive cap on the OSD.");
 }
 
-// Advanced: how much of the recent load the Adaptive cap plans for (R11).
+// Advanced: how much of the recent load the Adaptive cap plans for.
 static void DrawAdaptiveCapTuning(bool* config_dirty) {
     if (!g_config.adaptive_cap) return;
     int percentile = g_config.adaptive_cap_percentile;
@@ -824,7 +824,7 @@ static void DrawSettingsImpl() {
     DrawPacingSummary(&config_dirty);
     if (dmfg_dynamic_active) ImGui::TextDisabled("Dynamic frame generation: pacing passthrough");
     // The period governor runs on every route: missed frames everywhere,
-    // Reflex workload reports where NvAPI provides them (P3-7).
+    // Reflex workload reports where NvAPI provides them.
     if (!dmfg_dynamic_active)
         DrawAdaptiveCapControl(&config_dirty);
     if (ImGui::Checkbox("Enable advanced settings", &g_config.advanced_settings)) config_dirty = true;
@@ -2116,7 +2116,7 @@ static const PacingTelemetrySnapshot* ReadFreshPacingSnapshot() {
     return fresh ? &s_snapshot : nullptr;
 }
 
-// Display-metric PQI (phase2_timing_core_design.md section 6); '-' when invalid.
+// Display-metric PQI; '-' when invalid.
 static void DrawPQI(const PacingTelemetrySnapshot* snapshot, bool breakdown) {
     const PQIDisplayScores scores = snapshot ? PQI_FromSnapshot(*snapshot) : PQIDisplayScores{};
     const float b = g_config.osd_text_brightness;
@@ -2865,7 +2865,7 @@ static void DrawOSDImpl() {
 
 #endif // _WIN64 (Pipeline section: FG, Limiter)
 
-        // Adaptive cap (period governor C2): stretch and governed interval (before LFC).
+        // Adaptive cap (period governor): stretch and governed interval (before LFC).
         if (g_config.osd_show_adaptive_smoothing && g_config.adaptive_cap && !IsDmfgActive()) {
             SchedulerPacingStatus governor_status;
             if (Scheduler_ReadPacingStatus(&governor_status) && governor_status.governor_enabled) {

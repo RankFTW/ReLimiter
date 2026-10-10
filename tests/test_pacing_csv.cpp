@@ -1,12 +1,11 @@
 // Directly tests the production CSV writer (src/csv_writer.cpp) for the two
-// pacing families: header names and order of the Phase 1 appended columns
-// (phase1_purge_design.md section 3), PC Latency and predicted-render cells,
+// pacing families: header names and order of the appended columns,
+// PC Latency and predicted-render cells,
 // native PCL loss counters on capture and queue-drop rows, the pcl_status
-// event, and the Phase 2 frame-plan columns, display source, reason column and
-// grid_epoch / pipeline_change / stall_injected events
-// (phase2_timing_core_design.md section 5), and the Phase 3 controller
-// columns and governor_step / rung_feasibility / gpu_wait_cap events (phase3_controllers_design.md
-// P3-14), and the Phase 4 source-placement columns (phase4_design.md P4-15).
+// event, the frame-plan columns, display source, reason column and
+// grid_epoch / pipeline_change / stall_injected events,
+// the controller columns and governor_step / rung_feasibility / gpu_wait_cap
+// events, and the source-placement columns.
 // The logger and the native PCL snapshot are stubs; the telemetry
 // worker that produces these records is not exercised here (its controller
 // event derivation is tested by test_pacing_controller_events).
@@ -138,30 +137,30 @@ PacingJoinedRow DisplayRow(bool with_latency)
         row.source.release_qpc = 800;
         row.source.interval_us = 10000.0;
         row.source.predicted_render_us = 4321.5;
-        // Frame plan (phase2_timing_core_design.md section 5)
+        // Frame plan
         row.source.grid_epoch = 3;
         row.source.grid_index = 42;
         row.source.plan_output_target_qpc = 1900;
         row.source.plan_lead_us = 1234.5;
         row.source.plan_rung = 3; // PacingRung::GpuQueueWait
-        // Controllers (phase3_controllers_design.md P3-14)
+        // Controllers
         row.source.governor_step = 2;
         row.source.governor_interval_us = 11025.0;
         row.source.governor_cause = 2;      // events only: never a row cell
         row.source.feasibility_demoted = 1; // events only: never a row cell
         row.source.gpu_wait_cap_level = 2;  // events only: never a row cell
         row.source.gpu_wait_cap_cause = 1;  // events only: never a row cell
-        // Pre-Sleep placement (phase4_design.md P4-15)
+        // Pre-Sleep placement
         row.source.flags = PACING_SOURCE_PRE_SLEEP;
         row.source.source_placement = 3; // PacingSourcePlacement::PreSleep
         row.source.pre_sleep_end_qpc = 780;
         row.source.pre_sleep_margin_us = 450.25;
-        // Gated holds (2026-10-08): where the waits started.
+        // Gated holds: where the waits started.
         row.source.pre_sleep_start_qpc = 610;
         row.source.source_wait_start_qpc = 800;
         row.has_present = true;
         row.present.plan_status = 2; // PacingPlanStatus::Held
-        // GPU queue wait with both probes (Q16 gate_pre_wait_qpc).
+        // GPU queue wait with both probes (gate_pre_wait_qpc).
         row.has_gate = true;
         row.gate.post_wait = true;
         row.gate.pre_wait_qpc = 1850;
@@ -210,8 +209,8 @@ void CheckRowsFile(const CsvFile& rows)
         "pcl_simulation_fallback" };
     const Cells plan_columns{ "grid_epoch", "grid_index", "plan_output_target_qpc", "plan_lead_us",
         "plan_rung", "plan_status", "display_source" };
-    // Controller columns (P3-14), the Q16 gate pre-Wait column, the P4-15
-    // placement columns and the wait starts (2026-10-08) after them.
+    // Controller columns, the gate pre-Wait column, the
+    // placement columns and the wait starts after them.
     const Cells controller_columns{ "governor_step", "governor_interval_us", "plan_signal_advance_us",
         "gate_pre_wait_qpc", "source_placement", "pre_sleep_end_qpc", "pre_sleep_margin_us",
         "source_wait_start_qpc", "pre_sleep_start_qpc" };
@@ -233,7 +232,7 @@ void CheckRowsFile(const CsvFile& rows)
         { "grid_epoch", "3" }, { "grid_index", "42" }, { "plan_output_target_qpc", "1900" },
         { "plan_lead_us", "1234.500" }, { "plan_rung", "3" }, { "plan_status", "2" },
         { "display_source", "1" }, { "governor_step", "2" }, { "governor_interval_us", "11025.000" },
-        { "plan_signal_advance_us", "0.000" }, // reserved since Q15: always 0 on planned rows
+        { "plan_signal_advance_us", "0.000" }, // reserved: always 0 on planned rows
         { "gate_post_wait_qpc", "1960" }, { "gate_pre_wait_qpc", "1850" }, { "source_flags", "2" },
         { "source_placement", "3" }, { "pre_sleep_end_qpc", "780" }, { "pre_sleep_margin_us", "450.250" },
         { "source_wait_start_qpc", "800" }, { "pre_sleep_start_qpc", "610" } };
@@ -332,7 +331,7 @@ void CheckEventsFile(const CsvFile& events)
     Check(found_initial, "second pcl_status event is written");
     Check(events.Cell(status, "reason").empty(), "pcl_status rows leave reason empty");
 
-    // Source-record events (phase2_timing_core_design.md P2-7)
+    // Source-record events
     const size_t epoch = RowOfEvent(events, "grid_epoch");
     const size_t pipeline = RowOfEvent(events, "pipeline_change");
     const size_t stall = RowOfEvent(events, "stall_injected");
@@ -349,7 +348,7 @@ void CheckEventsFile(const CsvFile& events)
               events.Cell(stall, "reason").empty() && events.Cell(stall, "event_qpc") == "10000",
           "stall_injected carries the stall length in microseconds");
 
-    // Controller events (phase3_controllers_design.md P3-14)
+    // Controller events
     const size_t governor = RowOfEvent(events, "governor_step");
     const size_t feasibility = RowOfEvent(events, "rung_feasibility");
     Check(governor < events.rows.size() && feasibility < events.rows.size(),

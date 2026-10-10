@@ -106,7 +106,7 @@ FrameTimeAdaptationDemand FrameTimeAdaptation_ComputeDemand(
         demand.cpu_active_us,
         demand.gpu_render_us);
 
-    // Serial frames (R10): the span covers the whole frame. Remove
+    // Serial frames: the span covers the whole frame. Remove
     // ReLimiter's holds inside it: the controller residence when the
     // enforcement marker's stage lies inside the span, the present gate hold
     // inside the Present call, and any Present call beyond max(2 ms, I/4),

@@ -49,12 +49,12 @@ bool PreSleepWaitUntil(int64_t target_qpc) {
     const double remaining_us = qpc_to_us(target_qpc - now.QuadPart);
     if (!std::isfinite(remaining_us) || remaining_us <= 0.0 || remaining_us > 500'000.0) return false;
 
-    // Timer only, no spin (R7). The exact release is the marker trim at
+    // Timer only, no spin. The exact release is the marker trim at
     // SIMULATION_START; this wait only has to end before the margin, and the
-    // margin learns the timer's lateness from the aim (P4-10, R2). A spin
-    // here sized to that lateness (R6) burned up to 2 ms of the game thread
-    // per frame and, under load, fed its own lateness (capture E7: CPU
-    // stages 1.5x slower at the same scene and interval as E4).
+    // margin learns the timer's lateness from the aim. A spin
+    // here sized to that lateness burned up to 2 ms of the game thread
+    // per frame and, under load, fed its own lateness (CPU
+    // stages ran 1.5x slower at the same scene and interval).
     const HANDLE timer = s_pre_sleep_timer.load(std::memory_order_acquire);
     if (!timer) return false;
     LARGE_INTEGER due;
@@ -138,7 +138,7 @@ bool TryOwnSleep(int64_t target_qpc) {
 
     double wake_guard = g_adaptive_wake_guard.Get();
     if (!std::isfinite(wake_guard) || wake_guard < 0.0) wake_guard = 0.0;
-    // At most 2 ms of spin, like the GPU worker (R7): a guard learned from
+    // At most 2 ms of spin, like the GPU worker: a guard learned from
     // wakes delayed by CPU load must not turn into a longer spin that adds
     // to that load.
     wake_guard = (std::min)(wake_guard, 2000.0);

@@ -1,7 +1,6 @@
 #pragma once
 
-// Pacing telemetry records (project-docs/002_unified_pacing_timing/
-// phase0_measurement_design.md). Plain data shared by producers, the telemetry
+// Pacing telemetry records. Plain data shared by producers, the telemetry
 // worker, CSV output and tests. Every *_qpc field holds local QPC ticks and 0
 // means unknown. *_us fields in PacingReflexRecord hold NVIDIA driver
 // microseconds, not QPC, unless a name says otherwise.
@@ -51,15 +50,15 @@ enum class PacingOutputKind : uint8_t {
 
 enum PacingSourceFlags : uint8_t {
     PACING_SOURCE_SLEPT = 1u << 0,
-    // A pre-Sleep wait (phase4_design.md P4-8) ran before this frame's
-    // marker. Reuses the bit of the retired pre-Reflex pacing (Phase 0), which
+    // A pre-Sleep wait ran before this frame's
+    // marker. Reuses the bit of the retired pre-Reflex pacing, which
     // had the same meaning.
     PACING_SOURCE_PRE_SLEEP = 1u << 1,
     PACING_SOURCE_PREDICTOR_WARM = 1u << 2,   // retired predictor; reserved, never set
     PACING_SOURCE_FIXED_REFRESH = 1u << 3,
     PACING_SOURCE_BACKGROUND = 1u << 4,
     PACING_SOURCE_PASSTHROUGH = 1u << 5, // no pacing decision for this frame
-    PACING_SOURCE_OVERLOAD = 1u << 6,    // period governor (C2) stretches the cap interval (P3-14, P4-6)
+    PACING_SOURCE_OVERLOAD = 1u << 6,    // period governor stretches the cap interval
     PACING_SOURCE_STALL_INJECTED = 1u << 7 // developer stall injector delayed this release
 };
 
@@ -77,9 +76,9 @@ struct PacingSourceRecord {
     double interval_us = 0.0;    // effective source interval: governor step and LFC applied
     double fg_divisor = 1.0;
     int32_t target_fps = 0;
-    double predicted_render_us = 0.0; // retired legacy predictor; always 0 from Phase 2
+    double predicted_render_us = 0.0; // retired legacy predictor; always 0
 
-    // Frame plan (phase2_timing_core_design.md sections 2 and 5). Meaningful
+    // Frame plan. Meaningful
     // only when grid_index != 0; passthrough frames have no plan.
     uint32_t grid_epoch = 0;             // grid epoch after planning
     uint64_t grid_index = 0;             // 0 = no plan
@@ -91,11 +90,11 @@ struct PacingSourceRecord {
     uint8_t fallback_reason = 0;         // PacingFallbackReason of the resolved pipeline
     uint32_t stall_injected_us = 0;      // developer stall injector; 0 = none
 
-    // Phase 3 controllers (phase3_controllers_design.md P3-14). The first
+    // Controller fields. The first
     // two are CSV row columns (the third controller column,
-    // plan_signal_advance_us, is a constant since Q15); the causes and the C3
-    // state feed the governor_step, rung_feasibility and gpu_wait_cap events.
-    // governor_step (P4-6): VRR, the stretch in whole percent of I_0; snapped
+    // plan_signal_advance_us, is a constant); the causes and the overload
+    // guard state feed the governor_step, rung_feasibility and gpu_wait_cap events.
+    // governor_step: VRR, the stretch in whole percent of I_0; snapped
     // fixed refresh, whole refreshes above the base; 0 when not governed.
     uint8_t governor_step = 0;
     double governor_interval_us = 0.0;   // governed interval before LFC; 0 when the governor did not run
@@ -103,16 +102,15 @@ struct PacingSourceRecord {
     uint8_t feasibility_demoted = 0;     // 1 while the overload guard or a not-held A/B interleave block
                                          // keeps an Auto hold off
     uint8_t feasibility_cause = 0;       // FeasibilityCause of the newest transition (4 = overload, 3 = retry,
-                                         // 10/11 = A/B interleave; 12..14 from 2026-10-05/06 builds,
-                                         // 1/2 and 5..9 only from older builds)
+                                         // 10/11 = A/B interleave; 1/2, 5..9 and 12..14 only from older builds)
     uint8_t gpu_wait_cap_level = 0;      // GPU queue wait cap ladder level 0..3 (0 = gpu_wait_budget_us), 255 = open top (no cap); every record
     uint8_t gpu_wait_cap_cause = 0;      // GpuWaitCapCause of a level change on this frame; 0 otherwise
 
-    // Phase 4 source placement (phase4_design.md P4-15). CSV row columns.
+    // Source placement. CSV row columns.
     uint8_t source_placement = 0;        // PacingSourcePlacement of the resolved pipeline
     int64_t pre_sleep_end_qpc = 0;       // end of this frame's pre-Sleep wait; 0 = none
     double pre_sleep_margin_us = 0.0;    // margin of that pre-wait; 0 = none
-    // Gated holds (lead_controller.h, 2026-10-08): where ReLimiter's waits for
+    // Gated holds (lead_controller.h): where ReLimiter's waits for
     // this frame started, so analysis can rebuild the gated hold of earlier
     // frames. CSV row columns.
     int64_t source_wait_start_qpc = 0;   // source wait [start, release]; 0 = no wait
@@ -140,7 +138,7 @@ struct PacingPresentRecord {
     uint64_t gpu_ticket = 0;        // joins PacingGateRecord::ticket; 0 without a GPU gate output
     uint8_t plan_status = 0;        // PacingPlanStatus reported by the plan's output executor; 0 = none
     // Key the native route took from another thread's PRESENT_START
-    // (cross-thread hand-off, R8). Never used to join: the joiner compares it
+    // (cross-thread hand-off). Never used to join: the joiner compares it
     // with the display's ETW frame ID to verify the mapping.
     PacingFrameKey cross_thread_key{};
 };

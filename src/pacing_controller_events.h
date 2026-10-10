@@ -1,8 +1,7 @@
 #pragma once
 
-// Controller events of the pacing telemetry worker (project-docs/
-// 002_unified_pacing_timing/phase3_controllers_design.md P3-14,
-// phase4_design.md P4-6): governor_step, rung_feasibility and gpu_wait_cap,
+// Controller events of the pacing telemetry worker: governor_step,
+// rung_feasibility and gpu_wait_cap,
 // derived from Source record fields like the grid-epoch and pipeline-change
 // events. Pure C++17 without Windows, logger or CSV
 // dependencies so the derivation is testable; the worker owns the single
@@ -13,7 +12,7 @@
 #include <cstdint>
 
 // One derived event. value and previous_value are the governor step
-// (governor_step; P4-6: on VRR the stretch in whole percent of I_0, on a
+// (governor_step: on VRR the stretch in whole percent of I_0, on a
 // snapped fixed refresh whole refreshes above the base), the demoted flag
 // 0/1 (rung_feasibility) or the GPU wait cap ladder level 0..3 (gpu_wait_cap);
 // reason is the GovernorCause, FeasibilityCause or GpuWaitCapCause of the
@@ -56,7 +55,7 @@ inline bool PacingControllerEvents_IsGoverned(const PacingSourceRecord& record) 
 
 // governor_step: exactly the governed records whose governor_cause is set.
 // The governor sets the cause on phase transitions only (rise, fall, probe,
-// probe failure, base, reset, fixed-refresh step; P4-6), so a continuous ramp
+// probe failure, base, reset, fixed-refresh step), so a continuous ramp
 // is one event at its start, not one per percent. previous_value is the step
 // of the previous governed record (none for the first); step changes without
 // a cause are not events (a transition whose record was dropped is lost).
@@ -65,11 +64,10 @@ inline bool PacingControllerEvents_IsGoverned(const PacingSourceRecord& record) 
 // demoted. reason is the record's feasibility_cause: overload for a
 // demotion, retry (overload over) for its end, ab_not_held or ab_held for a
 // block of the developer A/B interleave, or none for a demotion cleared by a
-// reset or a dropped transition record. Captures of 2026-10-05/06 builds
-// carry the saturation fallback's saturated, load_dropped and recheck; of
-// 2026-10-04/05 builds slow_resumes and the hold scorecard's score_not_held,
-// score_held, probe_not_held and probe_held; older ones resume_spread and
-// lead_infeasible.
+// reset or a dropped transition record. Captures of older builds carry the
+// saturation fallback's saturated, load_dropped and recheck; slow_resumes and
+// the hold scorecard's score_not_held, score_held, probe_not_held and
+// probe_held; resume_spread and lead_infeasible.
 // gpu_wait_cap: gpu_wait_cap_level differs from the previous record (every
 // record carries the ladder level, 255 for the open top), or a first record
 // is not level 0. reason is the record's gpu_wait_cap_cause (late_resumes,

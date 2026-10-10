@@ -1,7 +1,6 @@
 #pragma once
 
-// Pacing metric definitions (project-docs/002_unified_pacing_timing/
-// phase0_measurement_design.md section 4). Pure C++17 without Windows, logger
+// Pacing metric definitions. Pure C++17 without Windows, logger
 // or other src dependencies: the telemetry worker, the CSV derived columns and
 // the golden-vector tests share this code. Inputs are QPC ticks with their
 // frequency; outputs are microseconds. Only the quantile helpers are shared

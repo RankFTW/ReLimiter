@@ -335,7 +335,7 @@ std::atomic<int64_t> g_reflex_present_end_qpc{0};
 // Previous exact report's selected workload demand for pressure trend.
 static double s_prev_workload_demand_us = 0.0;
 
-// Serial-frame evidence for the frame-span demand (R10). Owned like the
+// Serial-frame evidence for the frame-span demand. Owned like the
 // report watermark: the Reflex poll and ApplyFeedbackResetRequests.
 static SerialFrameDetector s_serial_frames;
 static bool s_serial_frames_logged = false;
@@ -503,8 +503,8 @@ static void LogReflexClockMapStatus(
 }
 
 // Frames after a report's frame whose waits can gate it (lockstep engines,
-// lead_controller.h): the offline check of CONTROL Resonant 29380_3 looked
-// up to four frames ahead.
+// lead_controller.h): the offline analysis of a lockstep game looked up to
+// four frames ahead.
 static constexpr uint64_t REFLEX_GATED_FRAMES_AHEAD = 4;
 
 // ReLimiter's waits for the frames after frame_id, relative to the report's
@@ -888,7 +888,7 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
                         begin_us, begin_us + workload_stages.render_submission_us);
                 }
             }
-            // Serial frames (R10): simulation start to Present end.
+            // Serial frames: simulation start to Present end.
             if (serial_frames && r.simStartTime > 0 &&
                 r.presentEndTime > r.simStartTime &&
                 r.presentStartTime >= r.simStartTime &&
@@ -1089,7 +1089,7 @@ void ResetFeedbackProducerLifecycle() noexcept {
         1,
         std::memory_order_acq_rel);
     // The producer-epoch change is a controller lifecycle change: the
-    // scheduler owner resets the period governor there (P3-10).
+    // scheduler owner resets the period governor there.
 
     // Epoch changes already make retained AI authority ineligible. Clear the
     // exported identity immediately as well so hook-thread readers cannot

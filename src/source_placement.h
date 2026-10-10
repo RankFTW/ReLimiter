@@ -1,12 +1,11 @@
 #pragma once
 
-// Pre-Sleep source placement (project-docs/002_unified_pacing_timing/
-// phase4_design.md, decisions P4-8 to P4-10; plan 6.4, D4 c). The Reflex
+// Pre-Sleep source placement. The Reflex
 // Sleep hook waits until S_next − margin before the driver's Sleep, and the
 // source stage still trims to the exact S_n at the enforcement marker. The
 // margin is learned from the residual between the pre-wait end and the
 // marker arrival of the same grid index. Pre-Sleep is the user's choice
-// (source_placement = pre_sleep): it never disengages itself (R15). The
+// (source_placement = pre_sleep): it never disengages itself. The
 // residual differs by whether the driver's Sleep runs after the pre-wait
 // (Reflex Sleep bypass while holding, forwarded otherwise), so the window
 // restarts when that changes; a Sleep too close to its target still
@@ -58,7 +57,7 @@ struct PreSleepDecision {
 // Why a Sleep produced no pre-wait (statistics).
 enum class PreSleepSkip : uint8_t {
     None = 0,
-    Disengaged, // unused since R15 (pre-Sleep never disengages); kept for the value order
+    Disengaged, // unused (pre-Sleep never disengages); kept for the value order
     NoTarget,    // the grid does not resolve the next index, or no plan yet
     StalePlan,   // the newest plan is older than 2 I
     TooClose,    // less than 200 µs ahead
@@ -106,7 +105,7 @@ public:
     // residual ready − pre-wait target when a pre-wait for exactly this index
     // is pending, so the margin covers the timer's overshoot, the driver's
     // Sleep, the game's work up to the marker and the marker hook's own
-    // processing (phase4_design.md R2), or ready − Sleep entry for a probe.
+    // processing, or ready − Sleep entry for a probe.
     // Residuals measured under the other driver_sleep are dropped. Returns
     // true when this frame had a pre-wait (its end in *wait_end_qpc); a probe
     // returns false.
