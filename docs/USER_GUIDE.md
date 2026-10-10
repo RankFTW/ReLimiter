@@ -135,6 +135,8 @@ Smoothing is always on. There is no pacing-method setting and nothing to choose 
 - **Late frames.** A frame that misses its target is never held. If it is clearly late, the cadence restarts from that frame instead of catching up with a burst of short frames.
 - **Markers.** *Markers* are timing signals supplied by the game (NVIDIA Reflex or Streamline PCL). *Present-based pacing* works at the point where the game submits a frame for presentation, so it also works in games without Reflex or Streamline.
 
+For how the cadence, the lead and the output points work, with diagrams, see [Frame Pacing](FRAME_PACING.md).
+
 ### Output Points
 
 | Output (Details) | Where the frame is held | When ReLimiter uses it |

@@ -4,6 +4,8 @@ This document covers the settings, status lines and log lines that exist for A/B
 
 It describes current behavior only. Measurements, capture evidence and the history of how each rule came about are in [`CHANGELOG.md`](../CHANGELOG.md) and [`project-docs/002_unified_pacing_timing/`](../project-docs/002_unified_pacing_timing/); earlier GPU Deadline models are in the [GPU Deadline model history](gpu-deadline-model-history.md).
 
+[Frame Pacing](FRAME_PACING.md) explains the mechanisms these settings and lines refer to (cadence grid, lead, output points, protections), with diagrams.
+
 ---
 
 ## Table of Contents
