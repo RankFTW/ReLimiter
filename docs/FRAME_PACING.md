@@ -93,7 +93,7 @@ A new segment starts whenever the interval changes or the cadence restarts. The 
 | FPS cap | `1 / cap`. This is the interval before anything else. |
 | Frame generation | Multiplied by the FG divisor (2× FG: `I` is two output intervals, because the cap is the *output* frame rate and the grid paces *real* frames). |
 | Adaptive cap | Stretches `I` by 1.0 to 1.6 (see [Adaptive Cap](#adaptive-cap)). Off by default. |
-| LFC | While the frame rate stays below the display's VRR range, `I` is rounded up to a whole multiple of the VRR ceiling interval. LFC turns on after 10 consecutive frames below the range and off after 10 consecutive frames above it. |
+| LFC | While the display gets fewer frames per second than its VRR range, `I` is rounded up so that each displayed frame lasts a whole number of VRR ceiling intervals: a whole multiple of `D` ceiling intervals, `D` the FG divisor. It is judged on the displayed interval `I / D`, so frame generation's real-frame rate below the range does not count. LFC turns on after 10 consecutive frames below the range and off after 10 consecutive frames at or above it. |
 | Fixed refresh | On a fixed-refresh display the grid snaps `I` to `k` whole refreshes when it is within 2% of that, and snaps targets to vblank edges. |
 | Idle caps | Background FPS, FG-Off Cap and OLED Care run the grid in *idle* mode: lead 0 and no output hold. |
 
@@ -179,7 +179,7 @@ flowchart TD
     N -->|no| P["Wait until S = T(n) − L"]
 ```
 
-Source: `src/cadence_grid.h`, `src/cadence_grid.cpp` (`PlanNext`, `CadenceGrid_LateToleranceTicks`, `CadenceGrid_ResolveOutputTarget`), `src/pacing_core_types.h` (`PacingEpochReason`), `src/scheduler.cpp` (`VrrCapIntervalUs`, `ApplyLfc`), `src/period_governor.cpp` (`PeriodGovernor_LfcIntervalUs`), `src/fg_divisor.cpp` (50 ms ramp), `src/source_stage.cpp` (slack).
+Source: `src/cadence_grid.h`, `src/cadence_grid.cpp` (`PlanNext`, `CadenceGrid_LateToleranceTicks`, `CadenceGrid_ResolveOutputTarget`), `src/pacing_core_types.h` (`PacingEpochReason`), `src/scheduler.cpp` (`VrrCapIntervalUs`, `ApplyLfc`), `src/period_governor.cpp` (`PeriodGovernor_LfcIntervalUs`, `LfcHysteresis`), `src/fg_divisor.cpp` (50 ms ramp), `src/source_stage.cpp` (slack).
 
 ---
 

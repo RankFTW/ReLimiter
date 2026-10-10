@@ -497,21 +497,12 @@ std::atomic<uint64_t> s_handoff_hook_frame{0};
 std::atomic<uint32_t> s_handoff_hook_stream{0};
 std::atomic<uint32_t> s_handoff_hook_stalls{0};
 
-// LFC hysteresis
-int  s_lfc_below_count = 0;
-int  s_lfc_above_count = 0;
-bool s_lfc_active = false;
+// LFC on the output interval (period_governor.h)
+LfcHysteresis s_lfc{};
 
 // DMFG pacing-control input/timestamps (the DMFG caps keep their relative sleeps).
 int64_t s_prev_enforcement_ts = 0;
 double  s_control_actual_frame_time_us = 0.0;
-}
-
-static void ResetLfc() noexcept
-{
-    s_lfc_active = false;
-    s_lfc_below_count = 0;
-    s_lfc_above_count = 0;
 }
 
 static PacingApi ToPacingApi(ActiveAPI api) noexcept
@@ -576,7 +567,7 @@ static void ResetAdaptationRegime(const char* reason) noexcept
     TakeLeadOutputs(&discarded, &discarded);
     DiscardReflexFrameTimeSamples();
     Scheduler_ResetSmoothness();
-    ResetLfc();
+    s_lfc.Reset();
     LOG_INFO("Scheduler: period governor and cadence readout reset (%s)", reason);
 }
 
@@ -1241,12 +1232,12 @@ static GovernorDecision UpdatePeriodGovernor(
 static GovernorFrame GovernorLadder(
     double base_interval_us,
     const GovernorFixedRefresh& fixed,
-    double lfc_ceiling_us) noexcept
+    double lfc_quantum_us) noexcept
 {
     GovernorFrame frame{};
     frame.base_interval_us = base_interval_us;
     frame.fixed = fixed;
-    frame.lfc_ceiling_us = lfc_ceiling_us;
+    frame.lfc_quantum_us = lfc_quantum_us;
     return frame;
 }
 
@@ -1276,30 +1267,21 @@ static double VrrCapIntervalUs(int target_fps, double fg_divisor) noexcept
     return (1000000.0 / static_cast<double>(target_fps)) * fg_divisor;
 }
 
-// LFC hysteresis on the governed interval I_k (LFC runs after the governor).
-static double ApplyLfc(double interval) noexcept
+// LFC hysteresis on the governed interval I_k (LFC runs after the governor),
+// judged on the output interval I_k / D.
+static double ApplyLfc(double interval, double fg_divisor) noexcept
 {
-    const double ceiling_us = g_ceiling_interval_us.load(std::memory_order_relaxed);
-    const double floor_us = g_floor_interval_us.load(std::memory_order_relaxed);
-    // "below" = frame rate below the floor (interval > floor_us) → LFC activates.
-    if (interval > floor_us) {
-        s_lfc_below_count++;
-        s_lfc_above_count = 0;
-    } else {
-        s_lfc_above_count++;
-        s_lfc_below_count = 0;
-    }
-    if (!s_lfc_active && s_lfc_below_count >= 10) s_lfc_active = true;
-    else if (s_lfc_active && s_lfc_above_count >= 10) s_lfc_active = false;
-    return PeriodGovernor_LfcIntervalUs(interval, s_lfc_active ? ceiling_us : 0.0);
+    return s_lfc.Apply(interval, fg_divisor,
+        g_floor_interval_us.load(std::memory_order_relaxed),
+        g_ceiling_interval_us.load(std::memory_order_relaxed));
 }
 
-// The VRR ceiling interval while LFC is active, else 0. Read before ApplyLfc,
-// this is the previous frame's LFC state, which the 10-frame hysteresis
-// almost always keeps for this frame (governor input).
-static double LfcCeilingUs() noexcept
+// The LFC quantum (D VRR ceiling intervals) while LFC is active, else 0. Read
+// before ApplyLfc, this is the previous frame's LFC state, which the 10-frame
+// hysteresis almost always keeps for this frame (governor input).
+static double LfcQuantumUs(double fg_divisor) noexcept
 {
-    return s_lfc_active ? g_ceiling_interval_us.load(std::memory_order_relaxed) : 0.0;
+    return s_lfc.QuantumUs(fg_divisor, g_ceiling_interval_us.load(std::memory_order_relaxed));
 }
 
 // Period identity for PeriodChange epochs: the VRR cap interval
@@ -1312,9 +1294,9 @@ static double LfcCeilingUs() noexcept
 // is current.
 static double VrrPeriodIdentityUs(int target_fps, int fg_divisor_raw) noexcept
 {
-    const double interval = (1000000.0 / static_cast<double>(target_fps)) *
-        static_cast<double>(fg_divisor_raw > 0 ? fg_divisor_raw : 1);
-    return PeriodGovernor_LfcIntervalUs(interval, LfcCeilingUs());
+    const double divisor = static_cast<double>(fg_divisor_raw > 0 ? fg_divisor_raw : 1);
+    const double interval = (1000000.0 / static_cast<double>(target_fps)) * divisor;
+    return PeriodGovernor_LfcIntervalUs(interval, LfcQuantumUs(divisor));
 }
 
 static double ComputeFixedInterval(double fg_divisor) noexcept
@@ -2127,9 +2109,9 @@ void OnMarker(
     // The governor judges demand against the LFC-paced interval, from the
     // previous frame's LFC state (ApplyLfc runs after it).
     input.governor = UpdatePeriodGovernor(
-        GovernorLadder(input.base_interval_us, GovernorFixedRefresh{}, LfcCeilingUs()),
+        GovernorLadder(input.base_interval_us, GovernorFixedRefresh{}, LfcQuantumUs(input.fg_divisor)),
         pipeline, config, input.fg_divisor);
-    input.interval_us = ApplyLfc(GovernedIntervalUs(input.governor, input.base_interval_us));
+    input.interval_us = ApplyLfc(GovernedIntervalUs(input.governor, input.base_interval_us), input.fg_divisor);
     input.period_identity_us = VrrPeriodIdentityUs(target_fps, fg_divisor_raw);
     // The governor consumed this frame's reports before the end-of-frame
     // poll; keep that poll's samples for the next frame.

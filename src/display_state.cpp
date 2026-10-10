@@ -13,7 +13,7 @@
 // ── Atomic display state ──
 std::atomic<double>  g_ceiling_interval_us{6944.0};  // ~144Hz default
 std::atomic<double>  g_ceiling_hz{144.0};
-std::atomic<double>  g_floor_interval_us{33333.0};   // 30Hz fallback
+std::atomic<double>  g_floor_interval_us{1000000.0 / 30.0};   // 30Hz fallback
 std::atomic<double>  g_floor_hz{30.0};
 std::atomic<bool>    g_gsync_active{false};
 std::atomic<double>  g_estimated_refresh_us{6944.0};
@@ -183,9 +183,9 @@ void QueryVRRFloor() {
     NvU32 display_id = DispRes_GetDisplayID();
 
     if (!s_GetMonitorCapabilities || display_id == 0) {
-        // fallback: 30Hz
+        // fallback: 30Hz (exact, so a cap at 30 FPS is not below the floor)
         g_floor_hz.store(30.0, std::memory_order_relaxed);
-        g_floor_interval_us.store(33333.0, std::memory_order_relaxed);
+        g_floor_interval_us.store(1000000.0 / 30.0, std::memory_order_relaxed);
         return;
     }
 
@@ -202,9 +202,9 @@ void QueryVRRFloor() {
         }
     }
 
-    // fallback: 30Hz (conservative)
+    // fallback: 30Hz (conservative; exact, as above)
     g_floor_hz.store(30.0, std::memory_order_relaxed);
-    g_floor_interval_us.store(33333.0, std::memory_order_relaxed);
+    g_floor_interval_us.store(1000000.0 / 30.0, std::memory_order_relaxed);
 }
 
 void PollGSyncState() {

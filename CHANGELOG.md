@@ -80,6 +80,7 @@ See [Removed and migrated keys](docs/USER_GUIDE.md#removed-and-migrated-keys) fo
 
 - **The FG input wait can qualify when other add-ons hook** the DXGI factory or Streamline's swap chain.
 - **Frame generation input wait keeps its route** after a Streamline binding change instead of rejecting every input for the rest of the session.
+- **Frame generation caps no longer run below the cap on VRR.** Low framerate compensation was judged on the rendered frame rate instead of the frame rate the display receives. With a 30 Hz VRR floor, a cap of 30 rendered frames per second or fewer (60 FPS with 2×, 90 with 3×, 120 with 4× frame generation, or less) could be rounded up to whole refreshes: a 60 FPS cap with 2× ran at 55 FPS on a 165 Hz display. It is now judged on the displayed frame rate. A cap of exactly 30 FPS is no longer treated as below a 30 Hz floor either.
 - Hook and device lifetime fixes and shutdown safeguards.
 
 ### Removed

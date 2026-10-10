@@ -55,7 +55,7 @@ namespace
         PeriodGovernor governor;
         int64_t qpc = kBaseQpc;
         double base = kBase;
-        double lfc_ceiling_us = 0.0;
+        double lfc_quantum_us = 0.0;
         uint64_t sequence = 0;
         GovernorFixedRefresh fixed{};
         double room_us = 0.0; // hold room input of every frame
@@ -72,7 +72,7 @@ namespace
             frame.base_interval_us = base;
             frame.quantile = 0.75;
             frame.fixed = fixed;
-            frame.lfc_ceiling_us = lfc_ceiling_us;
+            frame.lfc_quantum_us = lfc_quantum_us;
             frame.missed = missed;
             frame.outputs = 1;
             frame.late_outputs = late_output ? 1 : 0;
@@ -460,7 +460,7 @@ namespace
     void TestLfcPacedDemand()
     {
         Harness harness;
-        harness.lfc_ceiling_us = 6'000.0; // paced(10,000) = 12,000
+        harness.lfc_quantum_us = 6'000.0; // paced(10,000) = 12,000
         harness.Run(30, 11'000.0, true);
         CHECK(harness.governor.TargetStretch() == 1.0);
         harness.Run(40, 11'900.0, true);
@@ -641,7 +641,7 @@ namespace
 
         // Under LFC, on snapped fixed refresh and disabled: no room.
         Harness lfc;
-        lfc.lfc_ceiling_us = 6'000.0;
+        lfc.lfc_quantum_us = 6'000.0;
         lfc.room_us = 10'600.0;
         CHECK(lfc.Run(20).stretch == 1.0);
         Harness fixed;
@@ -663,6 +663,55 @@ namespace
         CHECK(std::string_view(GovernorPhase_Text(GovernorPhase::Falling)) == "falling");
         CHECK(PeriodGovernor_LfcIntervalUs(10'000.0, 6'000.0) == 12'000.0);
         CHECK(PeriodGovernor_LfcIntervalUs(10'000.0, 0.0) == 10'000.0);
+    }
+
+    // LFC is judged on the output interval I / D. With FG the display gets D
+    // frames per source interval: FG 2× at a 50 FPS cap (I = 40,000 µs,
+    // output 20,000 µs) and FG 3× at 60 (I = 50,000 µs, output 16,667 µs) are
+    // inside a 30 Hz floor and never turn it on. Judged on I, a 60 FPS cap
+    // with FG 2× (I just above a 33,333 µs floor) paced 6 × 6,061 µs, 55 FPS
+    // on 165 Hz. An output interval exactly at the floor is not below it. Ten
+    // frames below turn it on, ten at or above turn it off; while on, I is a
+    // whole multiple of D ceiling intervals, so each output interval is whole
+    // refreshes.
+    void TestLfcOnOutputInterval()
+    {
+        constexpr double kFloor = 1'000'000.0 / 30.0;
+        constexpr double kCeiling = 6'000.0;
+        LfcHysteresis fg2;
+        LfcHysteresis fg3;
+        for (int frame = 0; frame < 40; ++frame) {
+            CHECK(fg2.Apply(40'000.0, 2.0, kFloor, kCeiling) == 40'000.0);
+            CHECK(fg3.Apply(50'000.0, 3.0, kFloor, kCeiling) == 50'000.0);
+        }
+        CHECK(!fg2.Active() && !fg3.Active());
+        CHECK(fg2.QuantumUs(2.0, kCeiling) == 0.0);
+        LfcHysteresis at_floor;
+        for (int frame = 0; frame < 40; ++frame) at_floor.Apply(kFloor, 1.0, kFloor, kCeiling);
+        CHECK(!at_floor.Active());
+
+        // 20 FPS without FG: the tenth frame below the floor turns it on.
+        LfcHysteresis slow;
+        for (int frame = 1; frame <= 9; ++frame) CHECK(slow.Apply(50'000.0, 1.0, kFloor, kCeiling) == 50'000.0);
+        CHECK_NEAR(slow.Apply(50'000.0, 1.0, kFloor, kCeiling), 54'000.0, 1e-6); // 9 refreshes
+        CHECK(slow.Active());
+        // Back inside the range: still LFC for nine frames, off at the tenth.
+        for (int frame = 1; frame <= 9; ++frame) CHECK_NEAR(slow.Apply(31'000.0, 1.0, kFloor, kCeiling), 36'000.0, 1e-6);
+        CHECK(slow.Apply(31'000.0, 1.0, kFloor, kCeiling) == 31'000.0);
+        CHECK(!slow.Active());
+
+        // FG 2× at a 20 FPS output cap (I = 100,000 µs, output 50,000 µs):
+        // the quantum is two ceiling intervals and each output interval is
+        // 9 refreshes.
+        LfcHysteresis fg_slow;
+        double paced = 0.0;
+        for (int frame = 0; frame < 10; ++frame) paced = fg_slow.Apply(100'000.0, 2.0, kFloor, kCeiling);
+        CHECK(fg_slow.Active());
+        CHECK_NEAR(fg_slow.QuantumUs(2.0, kCeiling), 12'000.0, 1e-9);
+        CHECK_NEAR(paced, 108'000.0, 1e-6);
+        fg_slow.Reset();
+        CHECK(!fg_slow.Active());
+        CHECK(fg_slow.Apply(100'000.0, 2.0, kFloor, kCeiling) == 100'000.0);
     }
 }
 
@@ -687,6 +736,7 @@ int main()
     TestReset();
     TestHoldRoom();
     TestText();
+    TestLfcOnOutputInterval();
     if (s_failures != 0) {
         std::fprintf(stderr, "%d period governor check(s) failed\n", s_failures);
         return 1;

@@ -24,10 +24,33 @@ namespace
 
 // ── Helpers ──
 
-double PeriodGovernor_LfcIntervalUs(double interval_us, double lfc_ceiling_us) noexcept
+double PeriodGovernor_LfcIntervalUs(double interval_us, double lfc_quantum_us) noexcept
 {
-    if (!IsPositiveFinite(lfc_ceiling_us)) return interval_us;
-    return lfc_ceiling_us * std::ceil(interval_us / lfc_ceiling_us);
+    if (!IsPositiveFinite(lfc_quantum_us)) return interval_us;
+    return lfc_quantum_us * std::ceil(interval_us / lfc_quantum_us);
+}
+
+double LfcHysteresis::Apply(double interval_us, double fg_divisor, double floor_us, double ceiling_us) noexcept
+{
+    const double divisor = IsPositiveFinite(fg_divisor) && fg_divisor > 1.0 ? fg_divisor : 1.0;
+    const bool below = IsPositiveFinite(floor_us) && interval_us / divisor > floor_us;
+    if (below) {
+        if (below_ < LFC_HYSTERESIS_FRAMES) ++below_;
+        above_ = 0;
+    } else {
+        if (above_ < LFC_HYSTERESIS_FRAMES) ++above_;
+        below_ = 0;
+    }
+    if (!active_ && below_ >= LFC_HYSTERESIS_FRAMES) active_ = true;
+    else if (active_ && above_ >= LFC_HYSTERESIS_FRAMES) active_ = false;
+    return PeriodGovernor_LfcIntervalUs(interval_us, QuantumUs(fg_divisor, ceiling_us));
+}
+
+double LfcHysteresis::QuantumUs(double fg_divisor, double ceiling_us) const noexcept
+{
+    if (!active_ || !IsPositiveFinite(ceiling_us)) return 0.0;
+    const double divisor = IsPositiveFinite(fg_divisor) && fg_divisor > 1.0 ? fg_divisor : 1.0;
+    return ceiling_us * divisor;
 }
 
 double PeriodGovernor_FixedIntervalUs(
@@ -258,7 +281,7 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
     const auto paced = [&](double interval_us) noexcept {
         return snapped
             ? PeriodGovernor_FixedIntervalUs(base_us, interval_us, frame.fixed.refresh_us)
-            : PeriodGovernor_LfcIntervalUs(interval_us, frame.lfc_ceiling_us);
+            : PeriodGovernor_LfcIntervalUs(interval_us, frame.lfc_quantum_us);
     };
     const double quantile = ValidQuantile(frame.quantile);
     GovernorCause reported = GovernorCause::None;
@@ -402,7 +425,7 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
     // 6. Hold room: a floor of the realized interval within the maximum
     // stretch (period_governor.h).
     double room_raw = 0.0;
-    if (IsPositiveFinite(frame.room_us) && !snapped && !IsPositiveFinite(frame.lfc_ceiling_us)) {
+    if (IsPositiveFinite(frame.room_us) && !snapped && !IsPositiveFinite(frame.lfc_quantum_us)) {
         room_raw = frame.room_us / base_us;
         if (room_raw > GOVERNOR_MAX_STRETCH + kStretchEpsilon) {
             ++statistics_.room_infeasible;

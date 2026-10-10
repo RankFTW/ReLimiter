@@ -157,10 +157,10 @@ struct GovernorFrame {
     double base_interval_us = 0.0; // I_0 = cap × FG divisor, before LFC
     double quantile = 0.75;        // slow demand quantile: the Adaptive cap percentile
     GovernorFixedRefresh fixed{};
-    // VRR ceiling interval while LFC is active (the previous frame's LFC
-    // state), else 0. Demand is judged against the paced interval
-    // PeriodGovernor_LfcIntervalUs(I, lfc_ceiling_us).
-    double lfc_ceiling_us = 0.0;
+    // LFC quantum while LFC is active (LfcHysteresis::QuantumUs, the previous
+    // frame's LFC state), else 0. Demand is judged against the paced interval
+    // PeriodGovernor_LfcIntervalUs(I, lfc_quantum_us).
+    double lfc_quantum_us = 0.0;
     // SourceLate or OutputLate epoch, or an infeasible lead
     // (Feasibility_LeadInfeasible), since the previous governed frame.
     bool missed = false;
@@ -211,9 +211,37 @@ struct GovernorStatistics {
     double max_stretch = 1.0;     // largest stretch since the last reset of the statistics (never reset)
 };
 
-// The interval paced for I under LFC: the smallest whole multiple of the VRR
-// ceiling interval at or above I when lfc_ceiling_us > 0, else I.
-double PeriodGovernor_LfcIntervalUs(double interval_us, double lfc_ceiling_us) noexcept;
+// The interval paced for I under LFC: the smallest whole multiple of the LFC
+// quantum at or above I when lfc_quantum_us > 0, else I.
+double PeriodGovernor_LfcIntervalUs(double interval_us, double lfc_quantum_us) noexcept;
+
+// LFC (low framerate compensation) on VRR: while the display gets fewer
+// frames per second than its VRR range, the driver repeats frames, and
+// ReLimiter paces each displayed frame a whole number of refreshes. It is
+// judged on the output interval I / D, D the FG divisor (the display gets D
+// frames per source interval): LFC_HYSTERESIS_FRAMES consecutive frames above
+// the floor interval turn it on, as many at or below it turn it off. While on,
+// the quantum is D VRR ceiling intervals, so I paces every output interval as
+// whole refreshes. Judging I itself turned LFC on at a 60 FPS cap with FG 2×
+// (I = 33.3 ms, output 16.7 ms) and paced 55 FPS on a 165 Hz display.
+constexpr int LFC_HYSTERESIS_FRAMES = 10;
+
+class LfcHysteresis {
+public:
+    void Reset() noexcept { *this = LfcHysteresis{}; }
+    // One governed frame: the paced source interval for the source interval
+    // I with FG divisor D, the VRR floor and ceiling intervals of the display.
+    double Apply(double interval_us, double fg_divisor, double floor_us, double ceiling_us) noexcept;
+    // The source-interval quantum D × ceiling while LFC is on, else 0 (the
+    // governor's GovernorFrame::lfc_quantum_us).
+    double QuantumUs(double fg_divisor, double ceiling_us) const noexcept;
+    bool Active() const noexcept { return active_; }
+
+private:
+    int below_ = 0;
+    int above_ = 0;
+    bool active_ = false;
+};
 
 // Snapped fixed refresh: the whole-refresh interval for a tracked interval,
 // never below round(I_0 / R) refreshes (at least one). 0 for invalid input.
