@@ -1,21 +1,17 @@
 #include "feedback.h"
-#include "cadence_meter.h"
-#include "correlator.h"
-#include "stress_detector.h"
 #include "health.h"
-#include "swapchain_manager.h"
 #include "wake_guard.h"
-#include "display_state.h"
 #include "nvapi_hooks.h"
-#include "fg_divisor.h"
 #include "frame_time_adaptation.h"
 #include "frame_timeline.h"
 #include "reflex_report_policy.h"
 #include "reflex_adaptation_queue.h"
-#include "csv_writer.h"
 #include "logger.h"
+#include "pacing_telemetry.h"
+#include "reflex_clock_map.h"
 #include <Windows.h>
-#include <dxgi.h>
+#include <unknwn.h>
+#include <algorithm>
 #include <cmath>
 
 // ── NvAPI GetLatency ──
@@ -54,6 +50,12 @@ static double ReflexTimestampDeltaUs(uint64_t start_us, uint64_t end_us) noexcep
         : 0.0;
 }
 
+// Signed end − start of two driver timestamps.
+static double ReflexSignedDeltaUs(uint64_t start_us, uint64_t end_us) noexcept
+{
+    return static_cast<double>(static_cast<int64_t>(end_us - start_us));
+}
+
 struct NV_LATENCY_RESULT_PARAMS_LOCAL {
     uint32_t version;
     NV_LATENCY_FRAME_REPORT frameReport[64];
@@ -81,48 +83,19 @@ static std::atomic<uint32_t> s_feedback_hard_reset_request_sequence{ 0 };
 static std::atomic<uint32_t> s_feedback_hard_reset_applied_sequence{ 0 };
 static std::atomic_flag s_reflex_poll_active = ATOMIC_FLAG_INIT;
 static ReflexAdaptationQueue s_pending_adaptation_samples;
-static std::atomic<uint64_t> s_reflex_sample_sequence{ 0 }; // odd/even publication version
 static std::atomic<uint64_t> s_reflex_observation_sequence{ 0 };
-static std::atomic<uint64_t> s_reflex_sample_observation_sequence{ 0 };
-static std::atomic<uint32_t> s_reflex_sample_feedback_generation{ 0 };
-static std::atomic<uint32_t> s_reflex_sample_producer_epoch{ 0 };
-static std::atomic<uint64_t> s_reflex_sample_frame_id{ 0 };
-static std::atomic<double> s_reflex_sample_workload_demand_us{ 0.0 };
-static std::atomic<double> s_reflex_sample_cpu_active_us{ 0.0 };
-static std::atomic<double> s_reflex_sample_gpu_render_duration_us{ 0.0 };
-static std::atomic<double> s_reflex_sample_gpu_service_us{ 0.0 };
-static std::atomic<double> s_reflex_sample_owned_cpu_stage_us{ 0.0 };
-static std::atomic<double> s_reflex_sample_gpu_frame_time_us{ 0.0 };
-static std::atomic<double> s_reflex_sample_present_duration_us{ 0.0 };
-static std::atomic<double> s_reflex_sample_present_to_gpu_end_us{ 0.0 };
-static std::atomic<double> s_reflex_sample_owned_gate_hold_us{ 0.0 };
-static std::atomic<double> s_reflex_sample_queue_trend_us{ 0.0 };
-
-static uint64_t BeginReflexSampleWrite() noexcept
-{
-    return s_reflex_sample_sequence.fetch_add(
-        1,
-        std::memory_order_acq_rel) + 1;
-}
-
-static void EndReflexSampleWrite(uint64_t write_sequence) noexcept
-{
-    s_reflex_sample_sequence.store(
-        write_sequence + 1,
-        std::memory_order_release);
-}
 
 struct ReflexOwnedSleepSlot {
     std::atomic<double> owned_sleep_us{ 0.0 };
     std::atomic<uint8_t> marker{
-        static_cast<uint8_t>(ArrivalLeadMarker::Unknown) };
+        static_cast<uint8_t>(PacingSourceMarker::Unknown) };
     std::atomic<uint32_t> producer_epoch{ 0 };
     std::atomic<uint64_t> frame_id{ 0 };
 };
 
 struct ReflexOwnedSleepSample {
     double owned_sleep_us = 0.0;
-    ArrivalLeadMarker marker = ArrivalLeadMarker::Unknown;
+    PacingSourceMarker marker = PacingSourceMarker::Unknown;
     bool matched = false;
 };
 
@@ -191,11 +164,11 @@ static ReflexOwnedDurationSample ConsumeReflexOwnedDuration(
 void PublishReflexOwnedSleep(
     uint64_t frame_id,
     uint32_t producer_epoch,
-    ArrivalLeadMarker marker,
+    PacingSourceMarker marker,
     double owned_sleep_us) noexcept
 {
     if (frame_id == 0 || producer_epoch == 0 ||
-        marker == ArrivalLeadMarker::Unknown) {
+        marker == PacingSourceMarker::Unknown) {
         return;
     }
     s_latest_reflex_release_producer_epoch.store(
@@ -264,16 +237,67 @@ static ReflexOwnedSleepSample ConsumeReflexOwnedSleep(
     }
     sample.owned_sleep_us =
         slot.owned_sleep_us.load(std::memory_order_relaxed);
-    sample.marker = static_cast<ArrivalLeadMarker>(
+    sample.marker = static_cast<PacingSourceMarker>(
         slot.marker.load(std::memory_order_relaxed));
     sample.matched =
         slot.producer_epoch.load(std::memory_order_acquire) == producer_epoch &&
         slot.frame_id.load(std::memory_order_acquire) == frame_id;
     if (!sample.matched) {
         sample.owned_sleep_us = 0.0;
-        sample.marker = ArrivalLeadMarker::Unknown;
+        sample.marker = PacingSourceMarker::Unknown;
     }
     return sample;
+}
+
+struct ReflexOwnedWaitsSlot {
+    std::atomic<int64_t> release_qpc{ 0 };
+    std::atomic<int64_t> wait_start_qpc{ 0 };
+    std::atomic<int64_t> wait_end_qpc{ 0 };
+    std::atomic<int64_t> pre_wait_start_qpc{ 0 };
+    std::atomic<int64_t> pre_wait_end_qpc{ 0 };
+    std::atomic<uint32_t> producer_epoch{ 0 };
+    std::atomic<uint64_t> frame_id{ 0 };
+};
+
+static ReflexOwnedWaitsSlot
+    s_reflex_owned_waits[REFLEX_OWNED_SLEEP_SLOT_COUNT];
+
+void PublishReflexOwnedWaits(
+    uint64_t frame_id,
+    uint32_t producer_epoch,
+    const ReflexOwnedWaits& waits) noexcept
+{
+    if (frame_id == 0 || producer_epoch == 0) return;
+    ReflexOwnedWaitsSlot& slot =
+        s_reflex_owned_waits[frame_id % REFLEX_OWNED_SLEEP_SLOT_COUNT];
+    slot.frame_id.store(0, std::memory_order_release);
+    slot.release_qpc.store(waits.release_qpc, std::memory_order_relaxed);
+    slot.wait_start_qpc.store(waits.wait_start_qpc, std::memory_order_relaxed);
+    slot.wait_end_qpc.store(waits.wait_end_qpc, std::memory_order_relaxed);
+    slot.pre_wait_start_qpc.store(waits.pre_wait_start_qpc, std::memory_order_relaxed);
+    slot.pre_wait_end_qpc.store(waits.pre_wait_end_qpc, std::memory_order_relaxed);
+    slot.producer_epoch.store(producer_epoch, std::memory_order_release);
+    slot.frame_id.store(frame_id, std::memory_order_release);
+}
+
+static bool PeekReflexOwnedWaits(
+    uint64_t frame_id,
+    uint32_t producer_epoch,
+    ReflexOwnedWaits* waits) noexcept
+{
+    ReflexOwnedWaitsSlot& slot =
+        s_reflex_owned_waits[frame_id % REFLEX_OWNED_SLEEP_SLOT_COUNT];
+    if (slot.frame_id.load(std::memory_order_acquire) != frame_id ||
+        slot.producer_epoch.load(std::memory_order_acquire) != producer_epoch) {
+        return false;
+    }
+    waits->release_qpc = slot.release_qpc.load(std::memory_order_relaxed);
+    waits->wait_start_qpc = slot.wait_start_qpc.load(std::memory_order_relaxed);
+    waits->wait_end_qpc = slot.wait_end_qpc.load(std::memory_order_relaxed);
+    waits->pre_wait_start_qpc = slot.pre_wait_start_qpc.load(std::memory_order_relaxed);
+    waits->pre_wait_end_qpc = slot.pre_wait_end_qpc.load(std::memory_order_relaxed);
+    return slot.producer_epoch.load(std::memory_order_acquire) == producer_epoch &&
+        slot.frame_id.load(std::memory_order_acquire) == frame_id;
 }
 
 // ── Reflex pipeline timing atomics ──
@@ -308,12 +332,21 @@ std::atomic<double> g_reflex_total_frame_cost_us{0.0};
 // symbol name is retained; never convert it with local QPC frequency.
 std::atomic<int64_t> g_reflex_present_end_qpc{0};
 
-// GPU frame time from the Reflex ring. This is cadence telemetry and may be
-// influenced by active pacing, so Frame-Time Adaptation does not consume it.
-std::atomic<double> g_reflex_gpu_frame_time_us{0.0};
-
 // Previous exact report's selected workload demand for pressure trend.
 static double s_prev_workload_demand_us = 0.0;
+
+// Serial-frame evidence for the frame-span demand (R10). Owned like the
+// report watermark: the Reflex poll and ApplyFeedbackResetRequests.
+static SerialFrameDetector s_serial_frames;
+static bool s_serial_frames_logged = false;
+
+static void LogSerialFramesChange(bool serial) noexcept
+{
+    if (serial == s_serial_frames_logged) return;
+    s_serial_frames_logged = serial;
+    LOG_INFO("Feedback: frame span demand %s (next simulation start after the previous Present end in %u of %u report pairs)",
+             serial ? "on" : "off", s_serial_frames.SerialPairs(), s_serial_frames.Pairs());
+}
 
 static void ResolveGetLatency() {
     if (s_get_latency.load(std::memory_order_acquire) != nullptr) return;
@@ -349,11 +382,6 @@ static int s_reflex_found_count = 0;
 static int s_reflex_empty_ring = 0;
 static int s_reflex_all_zero_gpu = 0;
 static int s_reflex_all_stale = 0;
-static std::atomic<bool> s_reflex_cadence_current{ false };
-static std::atomic<int64_t> s_reflex_cadence_report_qpc{ 0 };
-static uint32_t s_prev_present_count = 0;
-static uint32_t s_expected_present_count = 0;
-static bool s_has_prev_present = false;
 
 static bool IsFeedbackResetPending() noexcept
 {
@@ -390,16 +418,13 @@ void ApplyFeedbackResetRequests() noexcept
         s_reflex_ai_frame_id.store(0, std::memory_order_release);
         s_reflex_ai_producer_epoch.store(0, std::memory_order_relaxed);
         g_reflex_ai_frame_time_us.store(0.0, std::memory_order_relaxed);
-        // Keep publication and observation sequences monotonic across producer
-        // lifetimes. Feedback generation and producer epoch reject stale
-        // payloads without creating a low-sequence ABA at the adaptation reader.
-        s_reflex_cadence_report_qpc.store(0, std::memory_order_relaxed);
+        // Keep the observation sequence monotonic across producer lifetimes.
+        // Feedback generation and producer epoch reject stale payloads
+        // without creating a low-sequence ABA at the adaptation reader.
     }
-    g_cadence_meter.Reset();
-    s_prev_present_count = 0;
-    s_expected_present_count = 0;
-    s_has_prev_present = false;
     s_prev_workload_demand_us = 0.0;
+    s_serial_frames.Reset();
+    LogSerialFramesChange(false);
     g_reflex_present_to_gpu_end_us.store(0.0, std::memory_order_relaxed);
     g_reflex_queue_trend_us.store(0.0, std::memory_order_relaxed);
     g_reflex_present_duration_us.store(0.0, std::memory_order_relaxed);
@@ -407,13 +432,11 @@ void ApplyFeedbackResetRequests() noexcept
     g_reflex_cpu_latency_us.store(0.0, std::memory_order_relaxed);
     g_reflex_total_frame_cost_us.store(0.0, std::memory_order_relaxed);
     g_reflex_present_end_qpc.store(0, std::memory_order_relaxed);
-    g_reflex_gpu_frame_time_us.store(0.0, std::memory_order_relaxed);
-    s_reflex_cadence_current.store(false, std::memory_order_relaxed);
     for (ReflexOwnedSleepSlot& slot : s_reflex_owned_sleep) {
         slot.frame_id.store(0, std::memory_order_release);
         slot.owned_sleep_us.store(0.0, std::memory_order_relaxed);
         slot.marker.store(
-            static_cast<uint8_t>(ArrivalLeadMarker::Unknown),
+            static_cast<uint8_t>(PacingSourceMarker::Unknown),
             std::memory_order_relaxed);
         slot.producer_epoch.store(0, std::memory_order_relaxed);
     }
@@ -436,6 +459,160 @@ void ApplyFeedbackResetRequests() noexcept
     s_feedback_reset_applied_sequence.store(
         requested_sequence,
         std::memory_order_release);
+}
+
+// ── Pacing telemetry: Reflex report and clock map ──
+// Report timestamps stay in driver microseconds. The clock map pairs each
+// admitted report with ReLimiter's PRESENT_START QPC for the same frame and
+// estimates local_us - driver_us. Pacing uses it only to place ReLimiter's
+// waits for later frames inside a report's CPU stages (lockstep engines,
+// CollectLaterOwnedWaits), and only while it is stable.
+static ReflexClockMapEstimator s_reflex_clock_map; // scheduler owner only
+static PacingClockMapStatus s_reflex_clock_map_logged_status =
+    PacingClockMapStatus::Unknown;
+static uint32_t s_reflex_clock_map_logged_epoch = 0;
+static int64_t s_reflex_clock_map_log_qpc = 0;
+
+// Status changes per producer epoch, at most one line per five seconds, so
+// the settled verdict is logged once it holds past the rate limit.
+static void LogReflexClockMapStatus(
+    uint32_t producer_epoch,
+    int64_t now_qpc,
+    int64_t qpc_frequency) noexcept
+{
+    const PacingClockMapStatus status = s_reflex_clock_map.Status();
+    if (qpc_frequency <= 0 ||
+        (status == s_reflex_clock_map_logged_status &&
+         producer_epoch == s_reflex_clock_map_logged_epoch)) {
+        return;
+    }
+    if (s_reflex_clock_map_log_qpc != 0 &&
+        now_qpc - s_reflex_clock_map_log_qpc < qpc_frequency * 5) {
+        return;
+    }
+    s_reflex_clock_map_logged_status = status;
+    s_reflex_clock_map_logged_epoch = producer_epoch;
+    s_reflex_clock_map_log_qpc = now_qpc;
+    LOG_INFO("Feedback: Reflex clock map %s (epoch=%u, samples=%zu, "
+             "offset=%.1fus, spread=%.1fus)",
+             ReflexClockMap_StatusText(status),
+             producer_epoch,
+             s_reflex_clock_map.SampleCount(),
+             s_reflex_clock_map.OffsetUs(),
+             s_reflex_clock_map.SpreadUs());
+}
+
+// Frames after a report's frame whose waits can gate it (lockstep engines,
+// lead_controller.h): the offline check of CONTROL Resonant 29380_3 looked
+// up to four frames ahead.
+static constexpr uint64_t REFLEX_GATED_FRAMES_AHEAD = 4;
+
+// ReLimiter's waits for the frames after frame_id, relative to the report's
+// Present start in microseconds through the stable clock map. Returns the
+// number of later frames found; 0 while the map is not stable.
+static size_t CollectLaterOwnedWaits(
+    uint64_t frame_id,
+    uint32_t producer_epoch,
+    uint64_t present_start_us,
+    FrameTimeAdaptationLaterWaits* waits) noexcept
+{
+    const int64_t qpc_frequency = GetQPCFrequency();
+    if (frame_id == 0 || producer_epoch == 0 || present_start_us == 0 || qpc_frequency <= 0 ||
+        s_reflex_clock_map.Status() != PacingClockMapStatus::Stable) {
+        return 0;
+    }
+    // local_us(PRESENT_START) = driver_us + offset; the waits are local QPC.
+    const double present_local_us =
+        static_cast<double>(present_start_us) + s_reflex_clock_map.OffsetUs();
+    const auto relative_us = [&](int64_t qpc) noexcept {
+        const int64_t seconds = qpc / qpc_frequency;
+        const int64_t remainder = qpc % qpc_frequency;
+        const double local_us = static_cast<double>(seconds) * 1'000'000.0 +
+            static_cast<double>(remainder) * 1'000'000.0 / static_cast<double>(qpc_frequency);
+        return local_us - present_local_us;
+    };
+    size_t count = 0;
+    for (uint64_t ahead = 1; ahead <= REFLEX_GATED_FRAMES_AHEAD; ++ahead) {
+        ReflexOwnedWaits owned{};
+        if (!PeekReflexOwnedWaits(frame_id + ahead, producer_epoch, &owned) || owned.release_qpc <= 0) continue;
+        FrameTimeAdaptationLaterWaits& later = waits[count++];
+        later = {};
+        later.release_us = relative_us(owned.release_qpc);
+        if (owned.wait_start_qpc > 0 && owned.wait_end_qpc > owned.wait_start_qpc) {
+            later.wait_begin_us = relative_us(owned.wait_start_qpc);
+            later.wait_end_us = relative_us(owned.wait_end_qpc);
+        }
+        if (owned.pre_wait_start_qpc > 0 && owned.pre_wait_end_qpc > owned.pre_wait_start_qpc) {
+            later.pre_wait_begin_us = relative_us(owned.pre_wait_start_qpc);
+            later.pre_wait_end_us = relative_us(owned.pre_wait_end_qpc);
+        }
+    }
+    return count;
+}
+
+// A driver timestamp as local QPC through the stable clock map (local_us =
+// driver_us + offset); 0 while the map is not stable or for no timestamp.
+static int64_t ReflexTimestampToQpc(uint64_t driver_us) noexcept
+{
+    const int64_t qpc_frequency = GetQPCFrequency();
+    if (driver_us == 0 || qpc_frequency <= 0 ||
+        s_reflex_clock_map.Status() != PacingClockMapStatus::Stable) {
+        return 0;
+    }
+    const double local_us = static_cast<double>(driver_us) + s_reflex_clock_map.OffsetUs();
+    if (!(local_us > 0.0)) return 0;
+    // Whole seconds first, so the product stays exact.
+    const double seconds = std::floor(local_us / 1'000'000.0);
+    const double remainder_us = local_us - seconds * 1'000'000.0;
+    return static_cast<int64_t>(seconds) * qpc_frequency +
+        static_cast<int64_t>(std::llround(remainder_us * static_cast<double>(qpc_frequency) / 1'000'000.0));
+}
+
+// Once per admitted report, after it is committed to the adaptation queue,
+// so a deferred report never consumes its PRESENT_START entry early.
+static void PushReflexPacingRecord(
+    const NV_LATENCY_FRAME_REPORT& report,
+    uint32_t producer_epoch,
+    int64_t report_qpc) noexcept
+{
+    int64_t local_present_start_qpc = 0;
+    ReflexClockMap_TakePresentStart(
+        producer_epoch,
+        report.frameID,
+        &local_present_start_qpc);
+    const int64_t qpc_frequency = GetQPCFrequency();
+    s_reflex_clock_map.Update(
+        producer_epoch,
+        qpc_frequency,
+        local_present_start_qpc,
+        report.presentStartTime);
+
+    PacingReflexRecord record{};
+    record.key = {
+        PacingIdentityDomain::NvApiFrame,
+        producer_epoch,
+        report.frameID};
+    record.report_qpc = report_qpc;
+    record.sim_start_us = report.simStartTime;
+    record.sim_end_us = report.simEndTime;
+    record.render_submit_start_us = report.renderSubmitStartTime;
+    record.render_submit_end_us = report.renderSubmitEndTime;
+    record.present_start_us = report.presentStartTime;
+    record.present_end_us = report.presentEndTime;
+    record.driver_start_us = report.driverStartTime;
+    record.driver_end_us = report.driverEndTime;
+    record.os_render_queue_start_us = report.osRenderQueueStartTime;
+    record.os_render_queue_end_us = report.osRenderQueueEndTime;
+    record.gpu_render_start_us = report.gpuRenderStartTime;
+    record.gpu_render_end_us = report.gpuRenderEndTime;
+    record.gpu_active_render_us = report.gpuActiveRenderTimeUs;
+    record.gpu_frame_time_us = report.gpuFrameTimeUs;
+    record.ai_frame_time_us = report.aiFrameTimeUs;
+    record.local_present_start_qpc = local_present_start_qpc;
+    record.clock_map_status = s_reflex_clock_map.Status();
+    record.clock_map_offset_us = s_reflex_clock_map.OffsetUs();
+    PacingTelemetry_PushReflex(record);
+    LogReflexClockMapStatus(producer_epoch, report_qpc, qpc_frequency);
 }
 
 static bool TryIngestReflexLatency(double effective_interval_us) {
@@ -477,7 +654,7 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
     if (status != 0) {
         static bool s_warned_status = false;
         if (!s_warned_status) {
-            LOG_WARN("Feedback: NvAPI_D3D_GetLatency returned status %d — falling back to DXGI", status);
+            LOG_WARN("Feedback: NvAPI_D3D_GetLatency returned status %d; no Reflex reports", status);
             s_warned_status = true;
         }
         return false;
@@ -550,6 +727,8 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
         s_pending_adaptation_samples.Clear();
         s_last_reflex_frame_id = 0;
         s_last_reflex_producer_epoch = sample_producer_epoch;
+        s_serial_frames.Reset();
+        LogSerialFramesChange(false);
     }
 
     // Keep every accepted observation until consumption. Backpressure defers
@@ -576,6 +755,9 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
          i += report_index_step) {
         const auto& r = params.frameReport[i];
         if (r.frameID == 0 || r.frameID <= s_last_reflex_frame_id) continue;
+        const bool serial_frames =
+            s_serial_frames.Push(r.frameID, r.simStartTime, r.presentEndTime);
+        LogSerialFramesChange(serial_frames);
 
         double sample_present_to_gpu_end_us = 0.0;
         double sample_present_duration_us = 0.0;
@@ -597,11 +779,13 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
                 sample_producer_epoch);
         const double sample_owned_sleep_us =
             owned_sleep_sample.owned_sleep_us;
+        // The residence supersedes the sleep: it spans the sleep when the
+        // marker is forwarded before the wait, and is zero when the marker is
+        // forwarded after it (marker_forward_order=after_wait), because the
+        // driver's source stage then starts at the paced release.
         const double sample_owned_cpu_stage_us =
             controller_residence_sample.matched
-                ? (std::max)(
-                    sample_owned_sleep_us,
-                    controller_residence_sample.duration_us)
+                ? controller_residence_sample.duration_us
                 : sample_owned_sleep_us;
         const double sample_owned_gate_hold_us = gate_hold_sample.matched
             ? gate_hold_sample.duration_us
@@ -684,6 +868,45 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
             workload_stages.owned_cpu_stage_us =
                 sample_owned_cpu_stage_us;
             workload_stages.enforcement_marker = owned_sleep_sample.marker;
+            // Lockstep engines: ReLimiter's waits for later frames released
+            // before this frame's Present start (lead_controller.h).
+            FrameTimeAdaptationLaterWaits later_waits[REFLEX_GATED_FRAMES_AHEAD];
+            const size_t later_count = CollectLaterOwnedWaits(
+                r.frameID, sample_producer_epoch, r.presentStartTime, later_waits);
+            if (later_count > 0) {
+                if (workload_stages.simulation_us > 0.0) {
+                    workload_stages.gated_simulation_us = FrameTimeAdaptation_GatedHoldUs(
+                        later_waits, later_count, 0.0,
+                        ReflexSignedDeltaUs(r.presentStartTime, r.simStartTime),
+                        ReflexSignedDeltaUs(r.presentStartTime, r.simEndTime));
+                }
+                if (workload_stages.render_submission_us > 0.0) {
+                    const double begin_us =
+                        ReflexSignedDeltaUs(r.presentStartTime, r.renderSubmitStartTime);
+                    workload_stages.gated_render_submission_us = FrameTimeAdaptation_GatedHoldUs(
+                        later_waits, later_count, 0.0,
+                        begin_us, begin_us + workload_stages.render_submission_us);
+                }
+            }
+            // Serial frames (R10): simulation start to Present end.
+            if (serial_frames && r.simStartTime > 0 &&
+                r.presentEndTime > r.simStartTime &&
+                r.presentStartTime >= r.simStartTime &&
+                r.presentEndTime >= r.presentStartTime) {
+                const double span_us = ReflexTimestampDeltaUs(
+                    r.simStartTime,
+                    r.presentEndTime);
+                if (span_us < effective_interval_us * 3.0) {
+                    workload_stages.frame_span_us = span_us;
+                    workload_stages.present_call_us = ReflexTimestampDeltaUs(
+                        r.presentStartTime,
+                        r.presentEndTime);
+                    workload_stages.owned_gate_hold_us =
+                        sample_owned_gate_hold_us;
+                    workload_stages.interval_us = effective_interval_us;
+                    workload_stages.serial_frames = true;
+                }
+            }
         }
         const FrameTimeAdaptationDemand adaptation_demand =
             FrameTimeAdaptation_ComputeDemand(workload_stages);
@@ -717,21 +940,7 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
         }
 
         const double ft = static_cast<double>(r.gpuFrameTimeUs);
-        if (admission.cadence_available) {
-            g_cadence_meter.IngestReflex(ft, effective_interval_us);
-            g_reflex_gpu_frame_time_us.store(ft, std::memory_order_relaxed);
-            LARGE_INTEGER cadence_qpc{};
-            QueryPerformanceCounter(&cadence_qpc);
-            s_reflex_cadence_report_qpc.store(
-                cadence_qpc.QuadPart,
-                std::memory_order_relaxed);
-            cadence_fed = true;
-        } else {
-            g_reflex_gpu_frame_time_us.store(0.0, std::memory_order_relaxed);
-        }
-        s_reflex_cadence_current.store(
-            admission.cadence_available,
-            std::memory_order_relaxed);
+        if (admission.cadence_available) cadence_fed = true;
         g_reflex_present_to_gpu_end_us.store(
             sample_present_to_gpu_end_us,
             std::memory_order_relaxed);
@@ -786,14 +995,15 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
         ReflexFrameTimeSample pending_sample{};
         pending_sample.sequence = observation_sequence;
         pending_sample.feedback_generation = feedback_generation;
-        pending_sample.adaptation_generation =
-            g_frame_time_adaptation.GetGenerationOnOwner();
         pending_sample.producer_epoch = sample_producer_epoch;
         pending_sample.frame_id = r.frameID;
         pending_sample.workload_demand_us = sample_workload_demand_us;
         pending_sample.cpu_active_us = sample_cpu_active_us;
         pending_sample.gpu_render_duration_us = sample_gpu_render_duration_us;
         pending_sample.gpu_service_us = sample_gpu_service_us;
+        pending_sample.gpu_execution_available = r.gpuActiveRenderTimeUs > 0;
+        pending_sample.gpu_active_us = static_cast<double>(r.gpuActiveRenderTimeUs);
+        pending_sample.gpu_start_qpc = ReflexTimestampToQpc(r.gpuRenderStartTime);
         pending_sample.owned_cpu_stage_us = sample_owned_cpu_stage_us;
         pending_sample.gpu_frame_time_us = ft;
         pending_sample.present_duration_us = sample_present_duration_us;
@@ -803,71 +1013,14 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
         // Capacity was checked before admission; the scheduler owner excludes
         // another writer between that check and this commit.
         if (!s_pending_adaptation_samples.Push(pending_sample)) return false;
-
-        const uint64_t sample_write_sequence = BeginReflexSampleWrite();
         s_last_reflex_frame_id = r.frameID;
-        s_reflex_sample_observation_sequence.store(
-            observation_sequence,
-            std::memory_order_relaxed);
-        s_reflex_sample_feedback_generation.store(
-            feedback_generation,
-            std::memory_order_relaxed);
-        s_reflex_sample_producer_epoch.store(
-            sample_producer_epoch,
-            std::memory_order_relaxed);
-        s_reflex_sample_frame_id.store(r.frameID, std::memory_order_relaxed);
-        s_reflex_sample_workload_demand_us.store(
-            sample_workload_demand_us,
-            std::memory_order_relaxed);
-        s_reflex_sample_cpu_active_us.store(
-            sample_cpu_active_us,
-            std::memory_order_relaxed);
-        s_reflex_sample_gpu_render_duration_us.store(
-            sample_gpu_render_duration_us,
-            std::memory_order_relaxed);
-        s_reflex_sample_gpu_service_us.store(
-            sample_gpu_service_us,
-            std::memory_order_relaxed);
-        s_reflex_sample_owned_cpu_stage_us.store(
-            sample_owned_cpu_stage_us,
-            std::memory_order_relaxed);
-        s_reflex_sample_gpu_frame_time_us.store(ft, std::memory_order_relaxed);
-        s_reflex_sample_present_duration_us.store(
-            sample_present_duration_us,
-            std::memory_order_relaxed);
-        s_reflex_sample_present_to_gpu_end_us.store(
-            sample_present_to_gpu_end_us,
-            std::memory_order_relaxed);
-        s_reflex_sample_owned_gate_hold_us.store(
-            sample_owned_gate_hold_us,
-            std::memory_order_relaxed);
-        s_reflex_sample_queue_trend_us.store(
-            sample_queue_trend_us,
-            std::memory_order_relaxed);
-        EndReflexSampleWrite(sample_write_sequence);
 
         LARGE_INTEGER report_qpc{};
         QueryPerformanceCounter(&report_qpc);
-        GpuObservationRow observation{};
-        observation.producer_epoch = sample_producer_epoch;
-        observation.nvapi_frame_id = r.frameID;
-        observation.report_qpc = static_cast<uint64_t>(report_qpc.QuadPart);
-        observation.sim_start_qpc = r.simStartTime;
-        observation.sim_end_qpc = r.simEndTime;
-        observation.render_submit_start_qpc = r.renderSubmitStartTime;
-        observation.render_submit_end_qpc = r.renderSubmitEndTime;
-        observation.present_start_qpc = r.presentStartTime;
-        observation.present_end_qpc = r.presentEndTime;
-        observation.driver_start_qpc = r.driverStartTime;
-        observation.driver_end_qpc = r.driverEndTime;
-        observation.os_render_queue_start_qpc = r.osRenderQueueStartTime;
-        observation.os_render_queue_end_qpc = r.osRenderQueueEndTime;
-        observation.gpu_render_start_qpc = r.gpuRenderStartTime;
-        observation.gpu_render_end_qpc = r.gpuRenderEndTime;
-        observation.gpu_active_render_time_us = r.gpuActiveRenderTimeUs;
-        observation.gpu_frame_time_us = r.gpuFrameTimeUs;
-        observation.ai_frame_time_us = r.aiFrameTimeUs;
-        CSV_PushGpuObservation(observation);
+        PushReflexPacingRecord(
+            r,
+            sample_producer_epoch,
+            report_qpc.QuadPart);
 
         s_reflex_found_count++;
         report_ingested = true;
@@ -884,43 +1037,6 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
     return cadence_fed;
 }
 
-// ── DMFG-only: lightweight Reflex ring scan for gpuFrameTimeUs ──
-// Called from the DMFG scheduler path to populate g_reflex_gpu_frame_time_us
-// for multiplier detection. Does NOT feed cadence meter, pipeline timing,
-// or any other non-DMFG systems.
-void PollReflexGpuFrameTime() {
-    ResolveGetLatency();
-    const PFN_NvAPI_D3D_GetLatency get_latency =
-        s_get_latency.load(std::memory_order_acquire);
-    if (!get_latency) return;
-    const NvAPIFeedbackDevice feedback_device =
-        NvAPI_AcquireFeedbackDevice();
-    if (!feedback_device.device) return;
-
-    NV_LATENCY_RESULT_PARAMS_LOCAL params = {};
-    params.version = sizeof(NV_LATENCY_RESULT_PARAMS_LOCAL) | (1 << 16);
-
-    int status;
-    __try {
-        status = get_latency(feedback_device.device, &params);
-    } __except(EXCEPTION_EXECUTE_HANDLER) {
-        NvAPI_ClearFeedbackDevice(feedback_device);
-        NvAPI_ReleaseFeedbackDevice(feedback_device.device);
-        return;
-    }
-    NvAPI_ReleaseFeedbackDevice(feedback_device.device);
-    if (status != 0 || !NvAPI_IsFeedbackDeviceCurrent(feedback_device)) return;
-
-    // Scan for the newest frame with a valid gpuFrameTimeUs
-    for (int i = 63; i >= 0; i--) {
-        const auto& r = params.frameReport[i];
-        if (r.frameID == 0 || r.gpuFrameTimeUs == 0) continue;
-        g_reflex_gpu_frame_time_us.store(
-            static_cast<double>(r.gpuFrameTimeUs), std::memory_order_relaxed);
-        break;
-    }
-}
-
 bool PollReflexLatencyReport(double effective_interval_us) {
     if (s_reflex_poll_active.test_and_set(std::memory_order_acquire)) {
         return false;
@@ -932,95 +1048,19 @@ bool PollReflexLatencyReport(double effective_interval_us) {
     return cadence_fed;
 }
 
-void DrainCorrelator(bool overload_active, double effective_interval_us) {
-    // ── Try Reflex GetLatency first (driver-precision, DX12 only) ──
-    const bool reflex_fed =
-        PollReflexLatencyReport(effective_interval_us);
+// Reflex latency-report ingestion only. The DXGI frame-statistics bias path
+// (CadenceMeter, VRR refresh estimation from SyncQPCTime) is retired: in VRR
+// g_estimated_refresh_us keeps the display-state ceiling seed, in fixed
+// refresh the vblank thread owns it, and the DXGI display source polls frame
+// statistics on the telemetry worker.
+void DrainCorrelator(double effective_interval_us) {
+    PollReflexLatencyReport(effective_interval_us);
 
-    static bool s_logged_source = false;
     static int s_drain_count = 0;
-    s_drain_count++;
-    if (!s_logged_source && g_cadence_meter.present_intervals_us.Size() >= 8) {
-        LOG_INFO("Feedback: initial cadence bias source = %s", reflex_fed ? "Reflex" : "DXGI");
-        s_logged_source = true;
-    }
-    if (s_drain_count % 300 == 0) {
-        LOG_INFO("Feedback: cadence bias source = %s, bias=%.1fus, reflex_found=%d/%d",
-                 reflex_fed ? "Reflex" : "DXGI",
-                 g_cadence_meter.bias_ctrl.GetBias(),
+    if (++s_drain_count % 300 == 0) {
+        LOG_INFO("Feedback: Reflex reports found=%d/%d",
                  s_reflex_found_count, s_reflex_call_count);
     }
-
-    // ── DXGI stats path (DX11, or DX12 fallback when Reflex unavailable) ──
-    ActiveAPI api = SwapMgr_GetActiveAPI();
-    if (api == ActiveAPI::Vulkan || api == ActiveAPI::OpenGL)
-        return;
-
-    if (!SwapMgr_IsValid()) return;
-
-    DXGI_FRAME_STATISTICS stats = {};
-    if (FAILED(g_correlator.QueryFrameStatistics(stats)))
-        return;
-
-    RecordDXGIStatsUpdate();
-
-    // Feed CadenceMeter from DXGI only if Reflex didn't provide data
-    // AND Frame Generation is not active. With FG, DXGI sees both real and
-    // generated presents but SyncQPCTime is vblank-quantized, producing
-    // alternating short/long intervals that don't reflect actual cadence.
-    //
-    // DX11 present-based: also suppress bias/smoothness from DXGI stats.
-    //
-    // When suppressed, only update refresh estimation — don't push intervals.
-    bool fg_active = ComputeFGDivisorRaw() > 1;
-    bool suppress_dxgi_bias = reflex_fed || fg_active || (api == ActiveAPI::DX11);
-    if (!suppress_dxgi_bias) {
-        g_cadence_meter.Ingest(
-            stats.PresentCount,
-            stats.SyncQPCTime.QuadPart,
-            stats.SyncRefreshCount,
-            effective_interval_us);
-    } else {
-        // Only update refresh estimation from DXGI — don't push intervals
-        // or smoothness/bias. With FG or DX11, DXGI intervals are unreliable.
-        uint32_t refresh_delta = stats.SyncRefreshCount - g_cadence_meter.prev_sync_refresh;
-        if (refresh_delta > 0 && stats.SyncQPCTime.QuadPart > g_cadence_meter.prev_sync_qpc) {
-            int64_t qpc_delta = stats.SyncQPCTime.QuadPart - g_cadence_meter.prev_sync_qpc;
-            double refresh_per_vblank = qpc_to_us(qpc_delta) /
-                                        static_cast<double>(refresh_delta);
-            if (refresh_per_vblank > CadenceMeter::MIN_REFRESH_US &&
-                refresh_per_vblank < CadenceMeter::MAX_REFRESH_US) {
-                g_cadence_meter.dxgi_refresh_us.store(refresh_per_vblank, std::memory_order_relaxed);
-            }
-        }
-        g_cadence_meter.prev_sync_qpc = stats.SyncQPCTime.QuadPart;
-        g_cadence_meter.prev_present_count = stats.PresentCount;
-        g_cadence_meter.prev_sync_refresh = stats.SyncRefreshCount;
-        g_cadence_meter.has_prev = true;
-    }
-
-    // ── Update g_estimated_refresh_us from CadenceMeter in VRR mode ──
-    if (g_pacing_mode.load(std::memory_order_relaxed) == PacingMode::VRR) {
-        double dxgi_refresh = g_cadence_meter.dxgi_refresh_us.load(std::memory_order_relaxed);
-        if (dxgi_refresh > 0.0)
-            g_estimated_refresh_us.store(dxgi_refresh, std::memory_order_relaxed);
-    }
-
-    // ── Feed stress detector with queue depth estimate ──
-    // Queue depth = how many presents are "in flight" between our submission
-    // and the display. Estimated from PresentCount advancement rate.
-    if (s_has_prev_present) {
-        uint32_t delta = stats.PresentCount - s_prev_present_count;
-        // Simple estimate: if PresentCount advanced by more than 1 per read,
-        // the queue is deeper. Clamp to reasonable range.
-        double depth = (delta > 0) ? static_cast<double>(delta) : 1.0;
-        if (depth > 8.0) depth = 8.0;
-        g_ceiling_stress.OnPresentStats(depth, overload_active);
-    }
-    s_prev_present_count = stats.PresentCount;
-    s_has_prev_present = true;
-
-    g_ceiling_stress.UpdateCompositorSuspicion();
 }
 
 void ResetFeedbackAccumulators() {
@@ -1039,8 +1079,6 @@ void ResetFeedbackAccumulators() {
     g_reflex_cpu_latency_us.store(0.0, std::memory_order_relaxed);
     g_reflex_total_frame_cost_us.store(0.0, std::memory_order_relaxed);
     g_reflex_present_end_qpc.store(0, std::memory_order_relaxed);
-    g_reflex_gpu_frame_time_us.store(0.0, std::memory_order_relaxed);
-    s_reflex_cadence_current.store(false, std::memory_order_relaxed);
 }
 
 void ResetFeedbackProducerLifecycle() noexcept {
@@ -1050,7 +1088,8 @@ void ResetFeedbackProducerLifecycle() noexcept {
     s_feedback_reset_request_sequence.fetch_add(
         1,
         std::memory_order_acq_rel);
-    g_frame_time_adaptation.RequestReset();
+    // The producer-epoch change is a controller lifecycle change: the
+    // scheduler owner resets the period governor there (P3-10).
 
     // Epoch changes already make retained AI authority ineligible. Clear the
     // exported identity immediately as well so hook-thread readers cannot
@@ -1058,25 +1097,6 @@ void ResetFeedbackProducerLifecycle() noexcept {
     s_latest_reflex_release_frame_id.store(0, std::memory_order_release);
     s_reflex_ai_frame_id.store(0, std::memory_order_release);
     g_reflex_ai_frame_time_us.store(0.0, std::memory_order_relaxed);
-    g_reflex_gpu_frame_time_us.store(0.0, std::memory_order_relaxed);
-    s_reflex_cadence_current.store(false, std::memory_order_relaxed);
-}
-
-double GetLastScanoutErrorUs() {
-    return g_cadence_meter.present_bias_us.load(std::memory_order_relaxed);
-}
-
-bool IsReflexCadenceActive() {
-    if (IsFeedbackResetPending() ||
-        !s_reflex_cadence_current.load(std::memory_order_relaxed)) {
-        return false;
-    }
-    const int64_t report_qpc =
-        s_reflex_cadence_report_qpc.load(std::memory_order_relaxed);
-    LARGE_INTEGER now{};
-    QueryPerformanceCounter(&now);
-    return report_qpc > 0 && now.QuadPart >= report_qpc &&
-        qpc_to_us(now.QuadPart - report_qpc) < MARKER_FLOW_TIMEOUT_US;
 }
 
 void ResetReflexAiEvidence() noexcept {
@@ -1131,71 +1151,4 @@ bool ConsumeReflexFrameTimeSample(ReflexFrameTimeSample* sample) noexcept {
     return !IsFeedbackResetPending() &&
         generation == s_reflex_feedback_generation.load(std::memory_order_acquire) &&
         epoch == FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::NvApiFrame);
-}
-
-bool GetReflexFrameTimeSample(ReflexFrameTimeSample* sample) noexcept {
-    if (!sample) return false;
-    if (IsFeedbackResetPending()) return false;
-
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        const uint32_t feedback_generation =
-            s_reflex_feedback_generation.load(std::memory_order_acquire);
-        const uint64_t before =
-            s_reflex_sample_sequence.load(std::memory_order_acquire);
-        if (before == 0) return false;
-        if ((before & 1u) != 0) continue;
-
-        ReflexFrameTimeSample snapshot{};
-        snapshot.sequence =
-            s_reflex_sample_observation_sequence.load(
-                std::memory_order_relaxed);
-        const uint32_t sample_feedback_generation =
-            s_reflex_sample_feedback_generation.load(
-                std::memory_order_relaxed);
-        snapshot.feedback_generation = sample_feedback_generation;
-        const uint32_t sample_producer_epoch =
-            s_reflex_sample_producer_epoch.load(
-                std::memory_order_relaxed);
-        snapshot.producer_epoch = sample_producer_epoch;
-        snapshot.frame_id =
-            s_reflex_sample_frame_id.load(std::memory_order_relaxed);
-        snapshot.workload_demand_us =
-            s_reflex_sample_workload_demand_us.load(std::memory_order_relaxed);
-        snapshot.cpu_active_us =
-            s_reflex_sample_cpu_active_us.load(std::memory_order_relaxed);
-        snapshot.gpu_render_duration_us =
-            s_reflex_sample_gpu_render_duration_us.load(
-                std::memory_order_relaxed);
-        snapshot.gpu_service_us =
-            s_reflex_sample_gpu_service_us.load(std::memory_order_relaxed);
-        snapshot.owned_cpu_stage_us =
-            s_reflex_sample_owned_cpu_stage_us.load(
-                std::memory_order_relaxed);
-        snapshot.gpu_frame_time_us =
-            s_reflex_sample_gpu_frame_time_us.load(std::memory_order_relaxed);
-        snapshot.present_duration_us =
-            s_reflex_sample_present_duration_us.load(std::memory_order_relaxed);
-        snapshot.present_to_gpu_end_us =
-            s_reflex_sample_present_to_gpu_end_us.load(std::memory_order_relaxed);
-        snapshot.owned_gate_hold_us =
-            s_reflex_sample_owned_gate_hold_us.load(
-                std::memory_order_relaxed);
-        snapshot.queue_trend_us =
-            s_reflex_sample_queue_trend_us.load(std::memory_order_relaxed);
-
-        if (s_reflex_sample_sequence.load(std::memory_order_acquire) == before &&
-            !IsFeedbackResetPending() &&
-            s_reflex_feedback_generation.load(std::memory_order_acquire) ==
-                feedback_generation) {
-            *sample = snapshot;
-            return sample_feedback_generation == feedback_generation &&
-                sample_producer_epoch ==
-                    FrameTimeline_CurrentProducerEpoch(
-                        FrameIdentityDomain::NvApiFrame) &&
-                snapshot.sequence != 0 &&
-                snapshot.frame_id != 0 &&
-                snapshot.workload_demand_us > 0.0;
-        }
-    }
-    return false;
 }

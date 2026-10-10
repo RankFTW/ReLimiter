@@ -2,16 +2,19 @@
 
 <#
 .SYNOPSIS
-Archives stopped ReLimiter CSV captures without renaming or combining streams.
+Archives stopped ReLimiter pacing captures without renaming or combining streams.
 .DESCRIPTION
-Newest (default) selects the greatest numeric session FILETIME, then epoch,
-across suffixed groups. Legacy fixed names are used only if no suffixed group
-exists. Modification times do not determine capture order. All selects every
-group, including legacy. CaptureId selects one exact PID_session_capture_epoch
-suffix, or 'legacy'; it cannot be combined with All.
-Every selected group requires its own scheduler CSV. Strict additionally
-requires all six streams per group, both INIs, both logs, and the chosen addon.
-Shared support files are archival-time snapshots, not proven epoch metadata.
+Archives the joined pacing families relimiter_pacing_<process>_<id>.csv and
+relimiter_pacing_events_<process>_<id>.csv, where <id> is
+PID_session_capture_epoch. Files of the legacy families removed in Phase 1 are
+never archived. Newest (default) selects the greatest numeric session FILETIME,
+then epoch; modification times do not determine capture order. All selects
+every group. CaptureId selects one exact PID_session_capture_epoch suffix; it
+cannot be combined with All.
+Every selected group requires its own pacing rows CSV. Strict additionally
+requires the pacing events CSV of every group, both INIs, both logs, and the
+chosen addon. Shared support files are archival-time snapshots, not proven
+epoch metadata.
 #>
 [CmdletBinding()]
 param(
@@ -40,7 +43,7 @@ param(
     [string]$DestinationRoot,
     [ValidateSet('Newest', 'All')]
     [string]$CaptureSelection = 'Newest',
-    [ValidatePattern('^(legacy|[1-9][0-9]*_[1-9][0-9]*_capture_[1-9][0-9]*)$')]
+    [ValidatePattern('^[1-9][0-9]*_[1-9][0-9]*_capture_[1-9][0-9]*$')]
     [string]$CaptureId,
     [switch]$Strict
 )
@@ -207,38 +210,31 @@ if ((Test-Path -LiteralPath $destination) -or (Test-Path -LiteralPath $partial))
     throw "Capture destination already exists: $destination"
 }
 
+# Archived streams. Every group needs its rows file; strict mode also needs its
+# events file. Exact expected names keep the two prefixes distinct.
 $streamSpecs = @(
-    @{ Prefix = 'frames'; Kind = 'relimiter_scheduler' },
-    @{ Prefix = 'timeline'; Kind = 'relimiter_frame_timeline' },
-    @{ Prefix = 'gpu_observations'; Kind = 'relimiter_gpu_observation' },
-    @{ Prefix = 'presents'; Kind = 'relimiter_present_timeline' },
-    @{ Prefix = 'present_associations'; Kind = 'relimiter_present_association' },
-    @{ Prefix = 'pcl'; Kind = 'relimiter_native_pcl' }
+    @{ Prefix = 'pacing'; Kind = 'relimiter_pacing' },
+    @{ Prefix = 'pacing_events'; Kind = 'relimiter_pacing_events' }
 )
+$primaryStreamKind = 'relimiter_pacing'
 $captureGroups = @{}
 $capturePattern = '^relimiter_(?:' + (($streamSpecs | ForEach-Object { $_.Prefix }) -join '|') +
     ')_' + [regex]::Escape($ProcessName) +
-    '(?:_(?<id>(?<pid>[1-9][0-9]*)_(?<session>[1-9][0-9]*)_capture_(?<epoch>[1-9][0-9]*)))?\.csv$'
-# Discover from every stream: an incomplete newer epoch must not silently fall
-# back to an older scheduler file or borrow that older epoch's companion files.
+    '_(?<id>(?<pid>[1-9][0-9]*)_(?<session>[1-9][0-9]*)_capture_(?<epoch>[1-9][0-9]*))\.csv$'
+# Discover from both streams: an incomplete newer epoch must not silently fall
+# back to an older rows file or borrow that older epoch's events file.
 foreach ($file in Get-ChildItem -LiteralPath $source -File) {
     if ($file.Name -notmatch $capturePattern) { continue }
-    $id = 'legacy'
-    $processId = $null
-    $session = $null
-    $epoch = $null
-    if ($Matches['id']) {
-        $id = $Matches['id']
-        $processId = [uint32]::Parse($Matches['pid'])
-        $session = [uint64]::Parse($Matches['session'])
-        $epoch = [uint32]::Parse($Matches['epoch'])
-    }
+    $id = $Matches['id']
     $captureGroups[$id] = [pscustomobject]@{
-        Id = $id; ProcessId = $processId; Session = $session; Epoch = $epoch
+        Id = $id
+        ProcessId = [uint32]::Parse($Matches['pid'])
+        Session = [uint64]::Parse($Matches['session'])
+        Epoch = [uint32]::Parse($Matches['epoch'])
     }
 }
 if ($captureGroups.Count -eq 0) {
-    throw "No recognized ReLimiter captures for process '$ProcessName' in $source"
+    throw "No ReLimiter pacing captures for process '$ProcessName' in $source"
 }
 $orderedGroups = @($captureGroups.Values | Sort-Object Session, Epoch, ProcessId)
 if (-not [string]::IsNullOrWhiteSpace($CaptureId)) {
@@ -260,10 +256,9 @@ else {
 }
 $fileSpecs = @()
 foreach ($group in $selectedGroups) {
-    $suffix = if ($group.Id -eq 'legacy') { $ProcessName } else { "${ProcessName}_$($group.Id)" }
     foreach ($stream in $streamSpecs) {
         $fileSpecs += @{
-            Name = "relimiter_$($stream.Prefix)_$suffix.csv"
+            Name = "relimiter_$($stream.Prefix)_${ProcessName}_$($group.Id).csv"
             Kind = $stream.Kind
             CaptureId = $group.Id
         }
@@ -285,9 +280,9 @@ else {
 }
 $fileSpecs += @{ Name = $addonName; Kind = $addonKind; CaptureId = $null }
 
-foreach ($spec in $fileSpecs | Where-Object { $_.Kind -eq 'relimiter_scheduler' }) {
+foreach ($spec in $fileSpecs | Where-Object { $_.Kind -eq $primaryStreamKind }) {
     if (-not (Test-Path -LiteralPath (Join-Path $source $spec.Name) -PathType Leaf)) {
-        throw "Required scheduler capture is unavailable for '$($spec.CaptureId)': $($spec.Name)"
+        throw "Required pacing capture is unavailable for '$($spec.CaptureId)': $($spec.Name)"
     }
 }
 if (-not (Test-Path -LiteralPath (Join-Path $source $addonName) -PathType Leaf)) {
@@ -379,13 +374,13 @@ try {
     $manifestArchitecture = $Architecture
     $manifestAddonHash = if ($null -ne $addon) { $addon.sha256 } else { $null }
     $manifest = [ordered]@{
-        schema_version = 2
+        schema_version = 3
         run_id = $runId
         pair_id = $manifestPairId
         variant = $Variant
         capture_selection = [ordered]@{
             mode = if ($CaptureId) { 'Exact' } else { $CaptureSelection }
-            newest_order = 'numeric session FILETIME, then epoch; suffixed preferred over legacy; never file mtime'
+            newest_order = 'numeric session FILETIME, then epoch; never file mtime'
             discovered_ids = @($orderedGroups | ForEach-Object { $_.Id })
             excluded_ids = @($orderedGroups | Where-Object { $_.Id -notin $selectedGroups.Id } |
                 ForEach-Object { $_.Id })
@@ -393,9 +388,8 @@ try {
         capture_groups = @($selectedGroups | ForEach-Object {
             [ordered]@{
                 capture_id = $_.Id
-                naming = if ($_.Id -eq 'legacy') { 'legacy' } else { 'session_epoch' }
                 process_id = $_.ProcessId
-                session_filetime = if ($null -eq $_.Session) { $null } else { $_.Session.ToString() }
+                session_filetime = $_.Session.ToString()
                 capture_epoch = $_.Epoch
             }
         })
@@ -460,6 +454,12 @@ try {
             adaptive_deadline_reserve_mode = Ini-String $ini 'adaptive_deadline_reserve_mode'
             estimator_a_mode = Ini-String $ini 'estimator_a_mode'
             estimator_a_fixed_reserve_us = Ini-Number $ini 'estimator_a_fixed_reserve_us'
+            presentation_gate_location = Ini-String $ini 'presentation_gate_location'
+            native_arrival_predictor_mode = Ini-String $ini 'native_arrival_predictor_mode'
+            gpu_readiness_observer = Ini-Boolean $ini 'gpu_readiness_observer'
+            gpu_present_gate_mode = Ini-String $ini 'gpu_present_gate_mode'
+            gpu_present_gate_slack_us = Ini-Number $ini 'gpu_present_gate_slack_us'
+            gpu_present_gate_max_delay_us = Ini-Number $ini 'gpu_present_gate_max_delay_us'
             native_pcl_enabled = Ini-Boolean $ini 'native_pcl_enabled'
             native_pcl_status = $null
         }
@@ -468,7 +468,7 @@ try {
             'Raw inputs were copied only after the named process was absent.',
             'Every source was stable across pre/post hashing and matched its archived copy.',
             'Streams are associated only by exact filename capture_id; never pool different groups as one run.',
-            'Legacy filenames cannot prove a common session or epoch; their identity remains unknown.',
+            'Only the joined pacing families were archived; legacy family files in the source directory were not copied.',
             'Shared addon/config/log files are archival-time snapshots, not verified metadata for any selected epoch.',
             'Values parsed from relimiter.ini are configured values, not proof of active runtime authority.',
             'captured_at_utc and unavailable environment metadata remain null rather than inferred.'

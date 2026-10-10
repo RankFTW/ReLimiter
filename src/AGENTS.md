@@ -10,6 +10,20 @@ This file adds production-code rules under `src/`. Follow the root `AGENTS.md` a
 - Do not simplify or retune scheduler formulas, constants, state transitions, feedback, or call ordering without reading the surrounding rationale and producing capture-backed before/after evidence.
 - Check all affected modes: VRR and fixed refresh, foreground and background, marker and Present fallback, and applicable FG/DMFG states.
 
+## Pacing design constraints (user decisions, binding until the user changes them)
+
+Rationale and evidence: `project-docs/002_unified_pacing_timing/summary.md` and `phase4_design.md`.
+
+- Mechanisms must be general across games and systems. Do not tune a hold, release or fallback around a threshold or operating point found in one capture (a GPU load level, a budget value); a result that improves only at one point means a part of the problem is missing.
+- Previously settled pacing must survive architectural changes: compare against the regression capture set in `.agents/skills/pacing-capture-analysis/references/capture-protocol.md` before and after any change to release timing, holds or the Reflex Sleep path. A change that trades long frames or cadence restarts for a few ms of latency is rejected by default; the user prefers smooth pacing and accepts about 4 ms of latency for it.
+- No native Present hold as a pacing mechanism (it measured much worse frame-time jitter). Everything must work with hardware-accelerated GPU scheduling (HAGS) on.
+- Output override **GPU wait** (`output_rung=gpu`) keeps its earlier behavior; new hold or release rules apply under Auto or to frames that are not held. GPU wait releases are timed against the game's next Present with a lead margin, never gated on GPU load or hold length; the GPU wait budget's open top is decided by the queue-order check, not by scaling a number.
+- Prefer deterministic mechanisms over retries and backoff. Late-frame catch-up keeps the render queue (keep), it does not restart after a late frame.
+- One pacer: with the default **Bypass Reflex Sleep** the game's NvAPI Sleep returns without the driver whenever ReLimiter paces a positive cap, held or not (`Scheduler_PacesSource`, `NvAPI_ShouldBypassSleep`); only Dynamic MFG passthrough and the Reflex driver limiter use the driver's Sleep.
+- Render handoff limit (`render_handoff.*`, `HandoffLimitApplies`): frames that are **not held** only. On held frames it moved CONTROL's simulation into its render thread's command submission and regressed pacing (38644_1); the queue in front of the render thread absorbs simulation variance for held frames.
+- Users do not tune: ship the recommended defaults (`config_version` migration), keep developer keys behind `developer_settings`, and keep user-facing text plain. The FPS cap exists to prevent the latency ReLimiter would otherwise add; never treat it as a latency source or lower it to hide a pacing defect.
+- Latency conclusions need Reflex active (FG forces it on). An offline replay that keeps the game's render-thread timing as captured can reject a release rule but never approve one; approval needs a live capture.
+
 ## Hooks and external APIs
 
 - Derive the active graphics API from the current presenting device during launcher, game, and swapchain transitions. Never reinterpret DX9, Vulkan, or OpenGL native handles as DXGI swapchains.

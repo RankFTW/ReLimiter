@@ -1,12 +1,12 @@
 #include "pcl_hooks.h"
 #include "hooks.h"
-#include "predictor.h"
 #include "scheduler.h"
 #include "correlator.h"
 #include "marker_log.h"
 #include "nvapi_hooks.h"
 #include "nvapi_types.h"
 #include "presentation_gate.h"
+#include "pacing_telemetry.h"
 #include "runtime_lifecycle.h"
 #include "frame_timeline.h"
 #include "health.h"
@@ -122,10 +122,21 @@ static uint64_t GetFrameID(
     return GetFallbackFrameID(marker_type);
 }
 
+// Phase 0 same-thread attribution for the native Present after PRESENT_START.
+// marker_qpc is the hook arrival, before any presentation-gate hold.
+static void SetPresentAttribution(
+    const PacingPlanKey& key,
+    int64_t marker_qpc,
+    const PresentationGateResult& gate) noexcept
+{
+    PacingTelemetry_SetPresentAttribution(
+        PresentGate_MakeAttribution(PacingPlanKey_Frame(key), marker_qpc, gate));
+}
+
 // ── slPCLSetMarker hook ──
 // Markers only — no sleep swallowing. The game's slReflexSleep runs
-// on its natural schedule. We use the markers for predictor feeding
-// and enforcement at SIMULATION_START, same as DX12.
+// on its natural schedule. We use the markers for the source stage at
+// SIMULATION_START (same as DX12) and the H0/H1 output at PRESENT_START.
 static int32_t Hooked_slPCLSetMarker(
     uint32_t marker,
     const sl::FrameToken& frame)
@@ -149,7 +160,6 @@ static int32_t Hooked_slPCLSetMarker(
         // the producer's resumed lifetime.
         s_seen_simulation_start.store(false, std::memory_order_relaxed);
         FrameTimeline_BeginProducerEpoch(FrameIdentityDomain::PclFrame);
-        g_predictor.RequestFlush();
     }
 
     const uint64_t frameID = GetFrameID(type, frame);
@@ -159,7 +169,7 @@ static int32_t Hooked_slPCLSetMarker(
     }
 
     // Ignore a partial frame observed when the hook is installed, and frame
-    // token zero (the predictor reserves zero as its uninitialized sentinel).
+    // token zero (reserved as the uninitialized sentinel).
     if (!s_seen_simulation_start.load(std::memory_order_acquire) || frameID == 0) {
         return InvokeOriginalMarker(marker, frame);
     }
@@ -168,18 +178,46 @@ static int32_t Hooked_slPCLSetMarker(
 
     g_marker_log.Record(type, ts.QuadPart, frameID);
 
+    // PRESENT_START: H0 release or H1 hold on the exact PCL plan key (built
+    // as the scheduler builds it), then forward. The executor reads only the
+    // plan, the grid and the output tracker, so it never needs the scheduler
+    // owner. Correlator is disabled for marker paths — scanout estimation is
+    // too noisy with FG; present-based paths feed it from vk_enforce.cpp.
+    if (type == PRESENT_START) {
+        const PacingPlanKey key{PacingIdentityDomain::PclFrame,
+            FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::PclFrame),
+            FrameTimeline_CurrentControllerGeneration(), frameID};
+        PresentationGateResult gate_result{};
+        PresentGate_OnPresentStart(key, ts.QuadPart, &gate_result);
+        // Forward to Streamline after the hold, as before.
+        const int32_t result = InvokeOriginalMarker(marker, frame);
+        // Attribution after forwarding: the provider sees no added delay.
+        SetPresentAttribution(key, ts.QuadPart, gate_result);
+        return result;
+    }
+
+    // RENDERSUBMIT_START, SIMULATION_END and PRESENT_END of a GPU wait frame
+    // reach the lead (never blocks; pushed before the scheduler-owner guard,
+    // as for NvAPI markers).
+    if (type == RENDERSUBMIT_START || type == SIMULATION_END || type == PRESENT_END) {
+        PresentGate_OnFrameMarker(PacingPlanKey{PacingIdentityDomain::PclFrame,
+            FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::PclFrame),
+            FrameTimeline_CurrentControllerGeneration(), frameID},
+            type == RENDERSUBMIT_START ? PacingStageEventKind::RenderSubmitStart
+                : type == SIMULATION_END ? PacingStageEventKind::SimulationEnd
+                : PacingStageEventKind::PresentEnd,
+            ts.QuadPart);
+    }
+
     SchedulerOwnerGuard scheduler_owner;
-    if (!scheduler_owner)
-        return InvokeOriginalMarker(marker, frame);
+    if (!scheduler_owner) return InvokeOriginalMarker(marker, frame);
 
     static uint64_t s_count = 0;
     s_count++;
     if (s_count <= 10 || (s_count % 500) == 0)
         LOG_INFO("PCL: marker #%llu type=%u frameID=%llu", s_count, type, frameID);
 
-    // Feed predictor
-    g_predictor.OnMarker(type, ts.QuadPart, frameID,
-                         g_overload_active_flag.load(std::memory_order_relaxed));
+    if (type == RENDERSUBMIT_END) NvAPI_RecordCpuLatency(frameID, ts.QuadPart);
 
     // Enforcement at SIMULATION_START — same as DX12
     if (type == SIMULATION_START)
@@ -187,24 +225,7 @@ static int32_t Hooked_slPCLSetMarker(
             frameID,
             ts.QuadPart,
             SchedulerTrigger::PclMarker,
-            ArrivalLeadMarker::SimulationStart);
-
-    // PRESENT_START: gate only for marker-based paths.
-    // Correlator is disabled for marker paths — scanout estimation is too
-    // noisy with FG (gap varies by 1-3 refresh periods per frame).
-    // Present-based paths feed the correlator from vk_enforce.cpp instead.
-    if (type == PRESENT_START) {
-        const SchedulerFrameDeadline deadline =
-            Scheduler_TakeFrameDeadline(
-                frameID,
-                SchedulerTrigger::PclMarker);
-        PresentGate_Execute(
-            ts.QuadPart,
-            frameID,
-            deadline.deadline_qpc,
-            deadline.producer_epoch,
-            deadline.controller_generation);
-    }
+            PacingSourceMarker::SimulationStart);
 
     // Forward to Streamline
     return InvokeOriginalMarker(marker, frame);
@@ -219,10 +240,6 @@ bool PCL_MarkersFlowing() {
     return now.QuadPart >= latest_qpc &&
         qpc_to_us(now.QuadPart - latest_qpc) < MARKER_FLOW_TIMEOUT_US;
 }
-
-// No-ops — we don't swallow or replay the Streamline sleep.
-void PCL_InvokeSleep() {}
-void PCL_UpdateSleepMode(double) {}
 
 bool InstallPCLHooks() {
     if (s_installed.load(std::memory_order_acquire)) return true;

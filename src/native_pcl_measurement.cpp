@@ -1,4 +1,5 @@
 #include "native_pcl_measurement.h"
+#include "native_pcl_snapshot_policy.h"
 
 #include <Windows.h>
 
@@ -9,17 +10,13 @@
 #include <new>
 #include <thread>
 
-#include "csv_writer.h"
+#include "pacing_telemetry.h"
 #include "runtime_lifecycle.h"
 #include "logger.h"
-#ifdef RELIMITER_ENABLE_MCP
-#include "live_debug.h"
-#endif
 #include "native_pcl_measurement_internal.h"
 
 namespace
 {
-    constexpr double kStaleSampleMilliseconds = 2000.0;
     constexpr ULONGLONG kMarkerlessStartDelayMilliseconds = 3000;
 
     constexpr uint64_t EncodeDouble(double value) noexcept
@@ -64,6 +61,9 @@ namespace
 
     AtomicSnapshot g_snapshot;
     std::atomic_flag g_snapshot_writer = ATOMIC_FLAG_INIT;
+    // Final loss totals of ended collector sessions. Guarded by
+    // g_snapshot_writer (SnapshotWriteGuard); sessions never overlap.
+    NativePclInternalLossCounters g_previous_sessions_loss{};
 
     std::atomic<bool> g_enabled{ false };
     std::atomic<bool> g_start_attempted{ false };
@@ -105,16 +105,18 @@ namespace
             : 0;
     }
 
-    double QpcDeltaToMicroseconds(
-        uint64_t start,
-        uint64_t end,
-        uint64_t frequency) noexcept
+    // Publishes the process totals for the current session's counters.
+    // Caller holds SnapshotWriteGuard.
+    void StoreLossCounters(const NativePclInternalLossCounters& session) noexcept
     {
-        if (start == 0 || end < start || frequency == 0) {
-            return std::numeric_limits<double>::quiet_NaN();
-        }
-        return static_cast<double>(end - start) * 1'000'000.0 /
-            static_cast<double>(frequency);
+        const NativePclInternalLossCounters total =
+            NativePclInternal_AccumulateLossCounters(g_previous_sessions_loss, session);
+        g_snapshot.lost_present_count.store(
+            total.lost_present_count, std::memory_order_relaxed);
+        g_snapshot.etw_events_lost.store(total.etw_events_lost, std::memory_order_relaxed);
+        g_snapshot.etw_buffers_lost.store(total.etw_buffers_lost, std::memory_order_relaxed);
+        g_snapshot.overflowed_present_count.store(
+            total.overflowed_present_count, std::memory_order_relaxed);
     }
 }
 
@@ -184,12 +186,16 @@ void NativePclInternal_PublishLossStatus(
     g_snapshot.running.store(true, std::memory_order_relaxed);
     g_snapshot.available.store(false, std::memory_order_relaxed);
     g_snapshot.reliable.store(false, std::memory_order_relaxed);
-    g_snapshot.lost_present_count.store(
-        counters.lost_present_count, std::memory_order_relaxed);
-    g_snapshot.etw_events_lost.store(counters.etw_events_lost, std::memory_order_relaxed);
-    g_snapshot.etw_buffers_lost.store(counters.etw_buffers_lost, std::memory_order_relaxed);
-    g_snapshot.overflowed_present_count.store(
-        counters.overflowed_present_count, std::memory_order_relaxed);
+    StoreLossCounters(counters);
+}
+
+void NativePclInternal_EndLossSession(
+    const NativePclInternalLossCounters& final_counters) noexcept
+{
+    SnapshotWriteGuard guard;
+    g_previous_sessions_loss = NativePclInternal_AccumulateLossCounters(
+        g_previous_sessions_loss, final_counters);
+    StoreLossCounters({});
 }
 
 uint32_t NativePclInternal_BeginObserverEpoch() noexcept
@@ -202,10 +208,10 @@ uint32_t NativePclInternal_BeginObserverEpoch() noexcept
     return epoch;
 }
 
-void NativePclInternal_PublishPresentObservation(
-    const PresentTimelineObservation& observation) noexcept
+void NativePclInternal_PublishDisplaySample(
+    const PacingDisplaySample& sample) noexcept
 {
-    CSV_PushPresentObservation(observation);
+    PacingTelemetry_PushDisplay(sample);
 }
 
 void NativePclInternal_PublishSample(
@@ -241,52 +247,8 @@ void NativePclInternal_PublishSample(
 
         g_snapshot.dropped_frame_count.store(
             sample.dropped_frame_count, std::memory_order_relaxed);
-        g_snapshot.lost_present_count.store(
-            counters.lost_present_count, std::memory_order_relaxed);
-        g_snapshot.etw_events_lost.store(counters.etw_events_lost, std::memory_order_relaxed);
-        g_snapshot.etw_buffers_lost.store(counters.etw_buffers_lost, std::memory_order_relaxed);
-        g_snapshot.overflowed_present_count.store(
-            counters.overflowed_present_count, std::memory_order_relaxed);
+        StoreLossCounters(counters);
     }
-
-    NativePclRow telemetry_row;
-    telemetry_row.pcl_frame_id = sample.pcl_frame_id;
-    telemetry_row.present_start_qpc = sample.present_start_qpc;
-    telemetry_row.display_qpc = sample.display_qpc;
-    telemetry_row.sample_qpc = sample.sample_qpc;
-    telemetry_row.sample_age_us = QpcDeltaToMicroseconds(
-        sample.display_qpc, sample.sample_qpc, sample.qpc_frequency);
-    telemetry_row.input_to_frame_start_us = sample.input_to_frame_start_us;
-    telemetry_row.frame_start_to_present_us = sample.frame_start_to_present_us;
-    telemetry_row.present_to_display_us = sample.present_to_display_us;
-    telemetry_row.total_us = sample.total_us;
-    telemetry_row.dropped_accumulation_us = sample.dropped_accumulation_us;
-    telemetry_row.dropped_frame_count = sample.dropped_frame_count;
-    telemetry_row.status = status;
-    telemetry_row.lost_present_count = counters.lost_present_count;
-    telemetry_row.etw_events_lost = counters.etw_events_lost;
-    telemetry_row.etw_buffers_lost = counters.etw_buffers_lost;
-    telemetry_row.overflowed_present_count = counters.overflowed_present_count;
-    telemetry_row.qpc_frequency = sample.qpc_frequency;
-    telemetry_row.pcl_sim_start_qpc = sample.pcl_sim_start_qpc;
-    telemetry_row.pcl_sim_end_qpc = sample.pcl_sim_end_qpc;
-    telemetry_row.pcl_render_submit_start_qpc = sample.pcl_render_submit_start_qpc;
-    telemetry_row.pcl_render_submit_end_qpc = sample.pcl_render_submit_end_qpc;
-    telemetry_row.pcl_present_start_qpc = sample.pcl_present_start_qpc;
-    telemetry_row.pcl_present_end_qpc = sample.pcl_present_end_qpc;
-    telemetry_row.effective_sim_start_qpc = sample.effective_sim_start_qpc;
-    telemetry_row.previous_pcl_frame_id = sample.previous_pcl_frame_id;
-    telemetry_row.pcl_frame_id_delta = sample.pcl_frame_id_delta;
-    telemetry_row.previous_pcl_sim_start_qpc = sample.previous_pcl_sim_start_qpc;
-    telemetry_row.pcl_sim_start_delta_us = sample.pcl_sim_start_delta_us;
-    telemetry_row.provider_present_to_dxgi_present_us =
-        sample.provider_present_to_dxgi_present_us;
-    telemetry_row.frame_type = sample.frame_type;
-    telemetry_row.used_simulation_fallback = sample.used_simulation_fallback;
-    CSV_PushNativePcl(telemetry_row);
-#ifdef RELIMITER_ENABLE_MCP
-    LiveDebug_PushNativePcl(telemetry_row);
-#endif
 }
 
 void NativePcl_SetEnabled(bool enabled) noexcept
@@ -497,34 +459,8 @@ NativePclSnapshot NativePcl_GetSnapshot() noexcept
         }
     }
 
-    if (snapshot.display_qpc != 0 && qpc_frequency != 0) {
-        snapshot.sample_age_us = QpcDeltaToMicroseconds(
-            snapshot.display_qpc, QueryQpc(), qpc_frequency);
-    }
-
-    if (!g_enabled.load(std::memory_order_acquire)) {
-        snapshot.status = NativePclStatus::Disabled;
-        snapshot.running = false;
-        snapshot.available = false;
-        snapshot.reliable = false;
-    }
-    else if ((snapshot.status == NativePclStatus::Native ||
-              snapshot.status == NativePclStatus::LowFpsUnreliable) &&
-             std::isfinite(snapshot.sample_age_us) &&
-             snapshot.sample_age_us > kStaleSampleMilliseconds * 1000.0) {
-        snapshot.status = NativePclStatus::Stale;
-        snapshot.available = false;
-        snapshot.reliable = false;
-    }
-
-    if (!snapshot.available) {
-        const double unavailable = std::numeric_limits<double>::quiet_NaN();
-        snapshot.input_to_frame_start_us = unavailable;
-        snapshot.frame_start_to_present_us = unavailable;
-        snapshot.present_to_display_us = unavailable;
-        snapshot.total_us = unavailable;
-        snapshot.dropped_accumulation_us = unavailable;
-    }
+    NativePcl_ApplySnapshotFreshness(&snapshot,
+        g_enabled.load(std::memory_order_acquire), QueryQpc(), qpc_frequency);
 
     return snapshot;
 }

@@ -1,74 +1,39 @@
 #include "flush.h"
 #include "correlator.h"
-#include "stress_detector.h"
-#include "predictor.h"
-#include "damping.h"
-#include "pqi.h"
 #include "logger.h"
 #include "feedback.h"
 #include "display_state.h"
 #include "swapchain_manager.h"
-#include "tier.h"
+#include "health.h"
 #include "wake_guard.h"
 #include "frame_timeline.h"
-#include "arrival_lead_estimator.h"
-#include "adaptive_deadline_reserve.h"
-#include "frame_time_adaptation.h"
 #include "scheduler.h"
 #include "nvapi_hooks.h"
 #include <atomic>
 #include <dxgi.h>
 
-namespace {
-std::atomic<uint32_t> s_pending_scheduler_flush_modules{0};
-}
-
-// Extern from health.cpp
-extern void SetSwapchainInvalid(bool v);
-extern void SetDeviceLost(bool v);
-extern void SetOccluded(bool v);
-
 void Flush(uint32_t modules) {
     if (modules == 0) return;
 
     LOG_INFO("Flush: modules=0x%X", modules);
-    s_pending_scheduler_flush_modules.fetch_or(
-        modules,
-        std::memory_order_release);
 
     // These APIs only publish atomic invalidation/reset requests. Keep them
     // immediate so stale gate and feedback identities fail open before the
-    // admitted scheduler owner reaches the next frame.
+    // admitted scheduler owner reaches the next frame. The period governor
+    // resets on the scheduler owner only (P3-10): lifecycle (below), cap, raw
+    // FG divisor, DMFG, OLED Care and focus; a correlator-only flush keeps it.
     Scheduler_ResetSmoothness();
-    g_frame_time_adaptation.RequestReset();
     if (modules & FLUSH_PREDICTOR) {
-        g_predictor.RequestFlush();
-        g_arrival_lead_estimator.RequestReset();
+        // Lifecycle (P2-10): every FLUSH_ALL caller is an API change, a full
+        // swapchain teardown or device loss. The scheduler
+        // owner sees the new generation and resets the grid, the frame plans
+        // and the lead controller; exact keys of the old generation fail.
         FrameTimeline_BeginControllerGeneration();
-        g_adaptive_deadline_reserve.RequestReset();
     }
 
     // Feedback reset publication is thread-safe and immediately invalidates
     // exported atomics; its plain writer state is consumed by OnMarker.
     ResetFeedbackAccumulators();
-}
-
-void Flush_ApplyPendingOnSchedulerOwner() noexcept {
-    const uint32_t modules = s_pending_scheduler_flush_modules.exchange(
-        0,
-        std::memory_order_acq_rel);
-    const bool predictor_reset = g_predictor.ApplyPendingFlush();
-    if (modules == 0 && !predictor_reset) return;
-
-    if (modules & FLUSH_STRESS)
-        g_ceiling_stress = CeilingStressDetector();
-    if (modules & FLUSH_DAMPING)
-        ResetDamping();
-    if (modules & FLUSH_PQI)
-        PQI_Reset();
-
-    // g_current_tier is scheduler-owned; never write it from lifecycle hooks.
-    UpdateTier();
 }
 
 void OnInitSwapchain(void* native_swapchain) {
@@ -80,18 +45,19 @@ void OnInitSwapchain(void* native_swapchain) {
 
 void OnDestroySwapchain() {
     // Mark swapchain invalid before publishing the flush so the next admitted
-    // scheduler owner evaluates Tier4 instead of touching a dead swapchain.
+    // scheduler owner takes the suspended passthrough instead of touching a
+    // dead swapchain.
     SetSwapchainInvalid(true);
 
-    Flush(FLUSH_CORRELATOR | FLUSH_STRESS);
+    Flush(FLUSH_CORRELATOR);
 
     // Null all DXGI pointers the correlator might dereference.
     g_correlator.OnSwapchainDestroyed();
 }
 
 void OnPresentFailure() {
-    // Present failure: flush correlator + stress (not predictor/damping)
-    Flush(FLUSH_CORRELATOR | FLUSH_STRESS);
+    // Present failure: flush correlator; not a lifecycle change (no generation bump)
+    Flush(FLUSH_CORRELATOR);
 }
 
 void OnDeviceLost() {
@@ -103,11 +69,14 @@ void OnDeviceLost() {
 void OnOccluded(bool occluded) {
     SetOccluded(occluded);
     if (occluded) {
-        // Tier 4 — limiter suspended
+        // Swapchain invalid: the scheduler suspends pacing (passthrough)
     } else {
-        // Recovery from Tier 4: flush everything
+        // Recovery from the suspended passthrough. Same swapchain and device:
+        // not a lifecycle change (P2-10), so no FLUSH_PREDICTOR generation
+        // bump. The suspended grid resumes with a ModeChange epoch and the
+        // lead buckets stay warm.
         SetOccluded(false);
-        Flush(FLUSH_ALL);
+        Flush(FLUSH_CORRELATOR);
     }
 }
 
@@ -140,5 +109,5 @@ void OnFGStateChange() {
 }
 
 void OnCorrelatorOverflow() {
-    Flush(FLUSH_CORRELATOR | FLUSH_STRESS);
+    Flush(FLUSH_CORRELATOR);
 }

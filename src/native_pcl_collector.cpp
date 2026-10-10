@@ -22,6 +22,8 @@
 #include "native_pcl_etw_diagnostics.h"
 #include "native_pcl_etw_provider_setup.h"
 #include "native_pcl_etw_session.h"
+#include "native_pcl_loss_window.h"
+#include "present_association.h"
 
 namespace
 {
@@ -34,6 +36,11 @@ namespace
     constexpr ULONGLONG kEtwStatusQueryMilliseconds = 1000;
 
     std::atomic<uint32_t> g_session_nonce{ 0 };
+
+    // Raw EtwStatus counters, in order: ETW events lost, ETW buffers lost,
+    // PresentMon completed-ring overflow. Per-present lost records stay
+    // recoverable and never open a window.
+    using CaptureIntegrityLossWindow = NativePclLossWindow<3>;
 
     uint64_t QueryQpcFrequency() noexcept
     {
@@ -82,8 +89,6 @@ namespace
     {
         uint64_t last_display_qpc = 0;
         uint64_t last_simulation_qpc = 0;
-        uint64_t last_pcl_simulation_qpc = 0;
-        uint32_t last_pcl_frame_id = 0;
         double input_to_frame_start_ema_us = 0.0;
         bool input_to_frame_start_initialized = false;
         bool logged_simulation_fallback = false;
@@ -108,6 +113,17 @@ namespace
         {
         }
 
+        // One accumulator is one collector session. Its final loss counters
+        // join the process totals on every exit path, after the final ETW
+        // status and drain have updated them.
+        ~MeasurementAccumulator()
+        {
+            NativePclInternal_EndLossSession(loss_counters_);
+        }
+
+        MeasurementAccumulator(const MeasurementAccumulator&) = delete;
+        MeasurementAccumulator& operator=(const MeasurementAccumulator&) = delete;
+
         void ProcessPresent(const std::shared_ptr<PresentEvent>& present)
         {
             if (!present || present->ProcessId != process_id_) {
@@ -119,7 +135,7 @@ namespace
             if (present->IsLost) {
                 if (tracking_synchronized_) {
                     ++loss_counters_.lost_present_count;
-                    if (ShouldLogRecoverableLoss(loss_counters_.lost_present_count)) {
+                    if (ShouldLogOccurrence(loss_counters_.lost_present_count)) {
                         LOG_WARN(
                             "Native PCL: skipped incomplete PresentEvent "
                             "(count=%u, present_qpc=%llu, swapchain=%llu)",
@@ -143,9 +159,10 @@ namespace
             }
 
             SwapchainPclState& chain = swapchain_states_[present->SwapChainAddress];
+            display_latencies_.clear();
             if (present->FinalState == PresentResult::Discarded) {
                 ProcessNotDisplayedPresent(*present, chain);
-                PublishPresentObservation(*present, nullptr, chain);
+                PublishPresentRecords(*present, nullptr, chain);
                 UpdateLastSimulationStart(*present, chain);
                 return;
             }
@@ -162,17 +179,21 @@ namespace
                 }
 
                 has_valid_display_timestamp = true;
-                ProcessDisplayedPresent(
-                    *present,
-                    displayed.second,
-                    displayed.first,
-                    chain);
+                NativePclDisplayLatency latency;
+                if (ProcessDisplayedPresent(
+                        *present,
+                        displayed.second,
+                        displayed.first,
+                        chain,
+                        &latency)) {
+                    display_latencies_.push_back(latency);
+                }
             }
 
             if (!has_valid_display_timestamp) {
                 ProcessNotDisplayedPresent(*present, chain);
             }
-            PublishPresentObservation(*present, &displayed_entries, chain);
+            PublishPresentRecords(*present, &displayed_entries, chain);
             UpdateLastSimulationStart(*present, chain);
         }
 
@@ -183,6 +204,8 @@ namespace
             const uint32_t previous_overflowed_present_count =
                 loss_counters_.overflowed_present_count;
 
+            // Session maxima; the published snapshot adds the totals of
+            // earlier sessions (NativePclInternal_AccumulateLossCounters).
             loss_counters_.etw_events_lost = std::max(
                 loss_counters_.etw_events_lost,
                 static_cast<uint32_t>(status.mEtwEventsLost));
@@ -192,14 +215,6 @@ namespace
             loss_counters_.overflowed_present_count = std::max(
                 loss_counters_.overflowed_present_count,
                 static_cast<uint32_t>(status.mNumOverflowedPresents));
-
-            const bool capture_integrity_lost =
-                loss_counters_.etw_events_lost != 0 ||
-                loss_counters_.etw_buffers_lost != 0 ||
-                loss_counters_.overflowed_present_count != 0;
-            if (!capture_integrity_lost) {
-                return;
-            }
 
             const bool counters_changed =
                 loss_counters_.etw_events_lost != previous_etw_events_lost ||
@@ -222,13 +237,34 @@ namespace
                     status.mEtwBufferFillPct);
             }
 
-            event_loss_detected_ = true;
-            NativePclInternal_PublishLossStatus(loss_counters_);
+            // The window sees raw counters: a PresentMon tracking reset lowers
+            // the overflow count, and later loss below the session maximum
+            // must still open a window.
+            const CaptureIntegrityLossWindow::Counters raw_counters{
+                status.mEtwEventsLost,
+                status.mEtwBuffersLost,
+                status.mNumOverflowedPresents };
+            const uint64_t now_qpc = QueryQpc();
+            ReportLossWindowUpdate(
+                loss_window_.Update(raw_counters, now_qpc, qpc_frequency_),
+                now_qpc);
+            if (loss_window_.IsActive()) {
+                NativePclInternal_PublishLossStatus(loss_counters_);
+            }
+        }
+
+        // Closes an elapsed loss window before a drained batch is published,
+        // so samples recover without waiting for the next ETW status query.
+        void AdvanceLossWindow(uint64_t now_qpc) noexcept
+        {
+            ReportLossWindowUpdate(
+                loss_window_.Advance(now_qpc, qpc_frequency_),
+                now_qpc);
         }
 
         void EvaluateAvailability(uint64_t now_qpc) noexcept
         {
-            if (event_loss_detected_) {
+            if (loss_window_.IsActive()) {
                 NativePclInternal_PublishLossStatus(loss_counters_);
                 return;
             }
@@ -253,11 +289,56 @@ namespace
     private:
         using DisplayEntry = std::pair<FrameType, uint64_t>;
 
-        static bool ShouldLogRecoverableLoss(uint32_t count) noexcept
+        // Logs occurrences 1, 2, 4, 8, ... so repeated conditions stay sparse.
+        static bool ShouldLogOccurrence(uint64_t count) noexcept
         {
             return count == 1 || (count & (count - 1)) == 0;
         }
 
+        void ReportLossWindowUpdate(
+            const NativePclLossWindowUpdate& update,
+            uint64_t now_qpc) noexcept
+        {
+            if (update.ended) {
+                const uint64_t ended_window =
+                    loss_window_.WindowCount() - (update.began ? 1 : 0);
+                if (ShouldLogOccurrence(ended_window)) {
+                    LOG_INFO(
+                        "Native PCL: ETW loss window %llu closed after %llu ms "
+                        "without new loss; latency samples recover with the "
+                        "next displayed frame",
+                        static_cast<unsigned long long>(ended_window),
+                        static_cast<unsigned long long>(
+                            NATIVE_PCL_LOSS_WINDOW_QUIET_PERIOD_MILLISECONDS));
+                }
+                // Availability is re-established only by a sample published
+                // after the window, never by values from inside it.
+                has_published_sample_ = false;
+            }
+            if (update.began &&
+                ShouldLogOccurrence(loss_window_.WindowCount())) {
+                LOG_WARN(
+                    "Native PCL: ETW loss window %llu opened; latency and "
+                    "display samples are flagged until %llu ms pass without "
+                    "new loss",
+                    static_cast<unsigned long long>(loss_window_.WindowCount()),
+                    static_cast<unsigned long long>(
+                        NATIVE_PCL_LOSS_WINDOW_QUIET_PERIOD_MILLISECONDS));
+            }
+            if (update.ended && !update.active) {
+                EvaluateAvailability(now_qpc);
+            }
+        }
+
+        // Display-instance sanitization shared by latency samples, present
+        // observations and pacing display samples:
+        // 1. Adjacent Application/Repeated pairs collapse to the Application
+        //    entry (below, PresentMon V2 duplicate sanitization).
+        // 2. Callers then skip entries with a zero screen time: they are
+        //    frame-type placeholders, not display instances.
+        // Remaining screen times are forwarded unchanged and in order. Equal or
+        // non-monotonic times are not dropped here; pacing telemetry counts
+        // them as out-of-order chain breaks (phase0_measurement_design.md 4).
         static std::vector<DisplayEntry> CopyAndSanitizeDisplayedEntries(
             const PresentEvent& present)
         {
@@ -290,17 +371,6 @@ namespace
             return present.PclInputPingTime != 0;
         }
 
-        static PresentObservationRuntime NormalizeRuntime(
-            Runtime runtime) noexcept
-        {
-            switch (runtime) {
-                case Runtime::DXGI: return PresentObservationRuntime::Dxgi;
-                case Runtime::D3D9: return PresentObservationRuntime::D3D9;
-                case Runtime::Other: return PresentObservationRuntime::Other;
-                default: return PresentObservationRuntime::Other;
-            }
-        }
-
         static PresentObservationFinalState NormalizeFinalState(
             PresentResult final_state) noexcept
         {
@@ -316,14 +386,123 @@ namespace
             }
         }
 
-        void PublishPresentObservation(
+        static PacingDisplayFrameType NormalizeDisplayFrameType(
+            FrameType frame_type) noexcept
+        {
+            switch (frame_type) {
+                case FrameType::Application:
+                    return PacingDisplayFrameType::Application;
+                case FrameType::Repeated:
+                    return PacingDisplayFrameType::Repeated;
+                case FrameType::Intel_XEFG:
+                case FrameType::AMD_AFMF:
+                    return PacingDisplayFrameType::VendorGenerated;
+                case FrameType::NotSet:
+                case FrameType::Unspecified:
+                    return PacingDisplayFrameType::Unknown;
+                default:
+                    return PacingDisplayFrameType::Unknown;
+            }
+        }
+
+        static PacingFrameClassification NormalizeFrameClassification(
+            PresentFrameClassification classification) noexcept
+        {
+            switch (classification) {
+                case PresentFrameClassification::Real:
+                    return PacingFrameClassification::Real;
+                case PresentFrameClassification::Generated:
+                    return PacingFrameClassification::Generated;
+                case PresentFrameClassification::Conflicting:
+                    return PacingFrameClassification::Conflicting;
+                case PresentFrameClassification::Unknown:
+                    return PacingFrameClassification::Unknown;
+                default:
+                    return PacingFrameClassification::Unknown;
+            }
+        }
+
+        // One observation per present feeds its pacing display samples: they
+        // share its present-level fields and sanitized entries.
+        void PublishPresentRecords(
+            const PresentEvent& present,
+            const std::vector<DisplayEntry>* displayed_entries,
+            const SwapchainPclState& chain) noexcept
+        {
+            const PresentTimelineObservation observation =
+                BuildPresentObservation(present, displayed_entries, chain);
+            PublishDisplaySamples(present, displayed_entries, observation);
+        }
+
+        // One sample per sanitized display instance (non-zero screen time after
+        // CopyAndSanitizeDisplayedEntries), in list order, carrying the PC
+        // Latency this present published for that display time. A discarded
+        // present, or one without such an instance, yields one sample with
+        // display_qpc = 0, display_count = 0, frame_type Unknown and no PC
+        // Latency.
+        void PublishDisplaySamples(
+            const PresentEvent& present,
+            const std::vector<DisplayEntry>* displayed_entries,
+            const PresentTimelineObservation& observation) noexcept
+        {
+            PacingDisplaySample sample{};
+            sample.observer_epoch = observation.observer_epoch;
+            sample.thread_id = observation.thread_id;
+            sample.native_swapchain = observation.native_swapchain;
+            sample.present_start_qpc = observation.present_start_qpc;
+            sample.present_end_qpc = observation.present_end_qpc;
+            sample.ready_qpc = observation.gpu_ready_qpc;
+            sample.pcl_frame_id = observation.pcl_frame_id;
+            sample.pcl_sim_start_qpc = observation.pcl_sim_start_qpc;
+            sample.pcl_present_start_qpc = present.PclPresentStartTime;
+            sample.final_state = static_cast<uint8_t>(observation.final_state);
+            sample.presentation_mode =
+                static_cast<uint8_t>(observation.presentation_mode);
+            sample.frame_classification =
+                NormalizeFrameClassification(observation.frame_classification);
+            sample.supports_tearing =
+                static_cast<uint8_t>(observation.supports_tearing ? 1 : 0);
+            sample.loss_window =
+                static_cast<uint8_t>(loss_window_.IsActive() ? 1 : 0);
+            sample.sync_interval = observation.observed_sync_interval;
+            sample.present_flags = observation.observed_present_flags;
+            sample.flip_delay_qpc = observation.nvidia_flip_delay_qpc;
+            sample.report_qpc = observation.report_qpc;
+            sample.qpc_frequency = observation.qpc_frequency;
+
+            constexpr uint32_t kMaximumDisplayInstances =
+                (std::numeric_limits<uint16_t>::max)();
+            const uint32_t display_count = std::min(
+                observation.displayed_instance_count, kMaximumDisplayInstances);
+            if (displayed_entries == nullptr || display_count == 0) {
+                NativePclInternal_PublishDisplaySample(sample);
+                return;
+            }
+
+            sample.display_count = static_cast<uint16_t>(display_count);
+            uint32_t display_index = 0;
+            for (const DisplayEntry& displayed : *displayed_entries) {
+                if (displayed.second == 0) continue;
+                if (display_index == display_count) break;
+
+                PacingDisplaySample instance = sample;
+                instance.display_qpc = displayed.second;
+                instance.display_index = static_cast<uint16_t>(display_index);
+                instance.frame_type = NormalizeDisplayFrameType(displayed.first);
+                NativePclInternal_AttachDisplayLatency(
+                    display_latencies_.data(), display_latencies_.size(), &instance);
+                NativePclInternal_PublishDisplaySample(instance);
+                ++display_index;
+            }
+        }
+
+        PresentTimelineObservation BuildPresentObservation(
             const PresentEvent& present,
             const std::vector<DisplayEntry>* displayed_entries,
             const SwapchainPclState& chain) const noexcept
         {
             PresentTimelineObservation observation{};
             observation.observer_epoch = observer_epoch_;
-            observation.runtime = NormalizeRuntime(present.Runtime);
             observation.final_state = NormalizeFinalState(present.FinalState);
             observation.native_swapchain = present.SwapChainAddress;
             observation.thread_id = present.ThreadId;
@@ -338,9 +517,21 @@ namespace
             observation.qpc_frequency = qpc_frequency_;
             observation.pcl_frame_id = present.PclFrameId;
             observation.pcl_sim_start_qpc = present.PclSimStartTime;
-            observation.gpu_start_qpc = present.GPUStartTime;
             observation.gpu_ready_qpc = present.ReadyTime;
-            observation.gpu_duration_qpc = present.GPUDuration;
+            switch (present.PresentMode) {
+            case PresentMode::Hardware_Legacy_Flip: observation.presentation_mode = PresentObservationMode::HardwareLegacyFlip; break;
+            case PresentMode::Hardware_Legacy_Copy_To_Front_Buffer: observation.presentation_mode = PresentObservationMode::HardwareLegacyCopy; break;
+            case PresentMode::Hardware_Independent_Flip: observation.presentation_mode = PresentObservationMode::HardwareIndependentFlip; break;
+            case PresentMode::Composed_Flip: observation.presentation_mode = PresentObservationMode::ComposedFlip; break;
+            case PresentMode::Composed_Copy_GPU_GDI: observation.presentation_mode = PresentObservationMode::ComposedCopyGpuGdi; break;
+            case PresentMode::Composed_Copy_CPU_GDI: observation.presentation_mode = PresentObservationMode::ComposedCopyCpuGdi; break;
+            case PresentMode::Hardware_Composed_Independent_Flip: observation.presentation_mode = PresentObservationMode::HardwareComposedIndependentFlip; break;
+            default: break;
+            }
+            observation.observed_sync_interval = present.SyncInterval;
+            observation.observed_present_flags = present.PresentFlags;
+            observation.supports_tearing = present.SupportsTearing;
+            observation.nvidia_flip_delay_qpc = present.FlipDelay;
 
             uint32_t evidence = PRESENT_CLASSIFICATION_EVIDENCE_NONE;
             if (present.PclSimStartTime != 0) {
@@ -386,21 +577,19 @@ namespace
                     }
                 }
             }
-            observation.reported_frame_type = reported_frame_type;
 
-            observation.used_simulation_fallback =
+            const bool used_simulation_fallback =
                 observation.final_state == PresentObservationFinalState::Presented &&
                 observation.displayed_instance_count != 0 &&
                 present.PclSimStartTime == 0 &&
                 chain.last_simulation_qpc != 0;
-            if (observation.used_simulation_fallback) {
+            if (used_simulation_fallback) {
                 evidence |=
                     PRESENT_CLASSIFICATION_EVIDENCE_SIMULATION_FALLBACK;
             }
-            observation.classification_evidence = evidence;
             observation.frame_classification =
                 PresentAssociation_ClassifyFrame(evidence);
-            NativePclInternal_PublishPresentObservation(observation);
+            return observation;
         }
 
         static void UpdateInputToFrameStartEma(
@@ -433,8 +622,6 @@ namespace
         {
             if (present.PclSimStartTime != 0) {
                 chain.last_simulation_qpc = present.PclSimStartTime;
-                chain.last_pcl_simulation_qpc = present.PclSimStartTime;
-                chain.last_pcl_frame_id = present.PclFrameId;
             }
             else if (present.AppSimStartTime != 0) {
                 chain.last_simulation_qpc = present.AppSimStartTime;
@@ -444,7 +631,7 @@ namespace
         void FlagMalformedDroppedChain(SwapchainPclState& chain) noexcept
         {
             ++loss_counters_.lost_present_count;
-            if (ShouldLogRecoverableLoss(loss_counters_.lost_present_count)) {
+            if (ShouldLogOccurrence(loss_counters_.lost_present_count)) {
                 LOG_WARN(
                     "Native PCL: reset out-of-order dropped-present chain "
                     "(recoverable_count=%u, last_sim_qpc=%llu)",
@@ -495,11 +682,15 @@ namespace
             chain.last_dropped_simulation_qpc = present.PclSimStartTime;
         }
 
-        void ProcessDisplayedPresent(
+        // Returns true when a latency sample was published for this display
+        // instance; *latency then holds that sample and status for the
+        // instance's pacing display sample.
+        bool ProcessDisplayedPresent(
             const PresentEvent& present,
             uint64_t display_qpc,
             FrameType frame_type,
-            SwapchainPclState& chain) noexcept
+            SwapchainPclState& chain,
+            NativePclDisplayLatency* latency) noexcept
         {
             uint32_t accumulated_dropped_frames = 0;
             double dropped_accumulation_us = 0.0;
@@ -524,7 +715,7 @@ namespace
                         qpc_frequency_);
                     if (!std::isfinite(final_simulation_delta_us)) {
                         FlagMalformedDroppedChain(chain);
-                        return;
+                        return false;
                     }
 
                     chain.dropped_input_to_frame_start_us += final_simulation_delta_us;
@@ -547,7 +738,7 @@ namespace
                 : chain.last_simulation_qpc;
             if (!chain.input_to_frame_start_initialized ||
                 simulation_start_qpc == 0) {
-                return;
+                return false;
             }
 
             const double frame_start_to_present_us = QpcSignedDeltaToMicroseconds(
@@ -560,7 +751,7 @@ namespace
                 qpc_frequency_);
             if (!std::isfinite(frame_start_to_present_us) ||
                 !std::isfinite(present_to_display_us)) {
-                return;
+                return false;
             }
 
             if (present.PclSimStartTime == 0 &&
@@ -586,37 +777,12 @@ namespace
                 frame_start_to_present_us + present_to_display_us;
             sample.dropped_accumulation_us = dropped_accumulation_us;
             sample.dropped_frame_count = accumulated_dropped_frames;
-
-            sample.pcl_sim_start_qpc = present.PclSimStartTime;
-            sample.pcl_sim_end_qpc = present.PclSimEndTime;
-            sample.pcl_render_submit_start_qpc = present.PclRenderSubmitStartTime;
-            sample.pcl_render_submit_end_qpc = present.PclRenderSubmitEndTime;
-            sample.pcl_present_start_qpc = present.PclPresentStartTime;
-            sample.pcl_present_end_qpc = present.PclPresentEndTime;
             sample.effective_sim_start_qpc = simulation_start_qpc;
-            sample.previous_pcl_frame_id = chain.last_pcl_frame_id;
-            sample.pcl_frame_id_delta =
-                present.PclSimStartTime != 0 &&
-                    chain.last_pcl_simulation_qpc != 0
-                ? static_cast<int64_t>(present.PclFrameId) -
-                    static_cast<int64_t>(chain.last_pcl_frame_id)
-                : 0;
-            sample.previous_pcl_sim_start_qpc =
-                chain.last_pcl_simulation_qpc;
-            sample.pcl_sim_start_delta_us = QpcSignedDeltaToMicroseconds(
-                chain.last_pcl_simulation_qpc,
-                present.PclSimStartTime,
-                qpc_frequency_);
-            sample.provider_present_to_dxgi_present_us =
-                QpcSignedDeltaToMicroseconds(
-                    present.PclPresentStartTime,
-                    present.PresentStartTime,
-                    qpc_frequency_);
-            sample.frame_type = static_cast<int32_t>(frame_type);
+            sample.pcl_input_ping_qpc = present.PclInputPingTime;
             sample.used_simulation_fallback = present.PclSimStartTime == 0;
 
             NativePclStatus status = NativePclStatus::Native;
-            if (event_loss_detected_) {
+            if (loss_window_.IsActive()) {
                 status = NativePclStatus::EventLoss;
             }
             else if (std::isfinite(displayed_interval_ms) &&
@@ -626,6 +792,10 @@ namespace
 
             NativePclInternal_PublishSample(sample, status, loss_counters_);
             has_published_sample_ = true;
+            latency->sample = sample;
+            latency->status = status;
+            latency->claimed = false;
+            return true;
         }
 
         uint32_t process_id_ = 0;
@@ -637,9 +807,15 @@ namespace
         bool tracking_synchronized_ = false;
         bool saw_process_present_ = false;
         bool saw_pcl_timing_ = false;
+        // Cleared when a loss window closes: the next sample must re-establish
+        // availability before EvaluateAvailability stops publishing warm-up.
         bool has_published_sample_ = false;
-        bool event_loss_detected_ = false;
+        CaptureIntegrityLossWindow loss_window_{};
         NativePclInternalLossCounters loss_counters_{};
+        // Latency samples of the present being processed, one per display
+        // instance that published one. Cleared per present; the capacity is
+        // reused, so steady state does not allocate.
+        std::vector<NativePclDisplayLatency> display_latencies_;
     };
 
     std::wstring MakeSessionName()
@@ -663,6 +839,7 @@ namespace
     {
         try {
             consumer.DequeuePresentEvents(presents);
+            accumulator.AdvanceLossWindow(QueryQpc());
             for (const auto& present : presents) {
                 accumulator.ProcessPresent(present);
             }
@@ -751,18 +928,21 @@ void NativePclCollector_Run() noexcept
         std::thread process_trace_thread;
         try {
             process_trace_thread = std::thread([&]() noexcept {
+                // Diagnostic collection must yield to game work. Missing ETW
+                // events is preferable to delaying a paced frame; existing loss
+                // and continuity reporting remains authoritative.
                 if (!SetThreadPriority(
-                        GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL)) {
+                        GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL)) {
                     const DWORD priority_error = GetLastError();
                     LOG_WARN(
-                        "Native PCL: failed to raise ProcessTrace thread priority "
+                        "Native PCL: failed to lower ProcessTrace thread priority "
                         "(error=%lu)",
                         priority_error);
                 }
 
-                // At time-critical priority, signal immediately before entering
-                // ProcessTrace. The controller waits for this handoff before it
-                // enables any provider.
+                // Signal immediately before entering ProcessTrace. The controller
+                // waits for this handoff before it enables any provider; this is
+                // a startup handshake, not a scheduling-priority requirement.
                 SetEvent(process_trace_ready_event);
                 TRACEHANDLE trace_handle = session.mTraceHandle;
                 trace_result.store(

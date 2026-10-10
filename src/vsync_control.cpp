@@ -1,8 +1,14 @@
 #include "vsync_control.h"
+#include "swapchain_manager.h"
 #include "config.h"
 #include "hooks.h"
 #include "frame_timeline.h"
+#include "native_present_gate.h"
+#include "gpu_present_gate.h"
+#include "gpu_readiness.h"
+#include "pacing_telemetry.h"
 #include "runtime_lifecycle.h"
+#include "wake_guard.h"
 #include "logger.h"
 #include <dxgi1_2.h>
 #include <array>
@@ -245,7 +251,7 @@ static bool PreparePresentAttempt(
     UINT present_flags,
     PresentTimelineSpan* span)
 {
-    if (!FrameTimeline_BeginPresentAttempt(call, attempt_index, span)) {
+    if (!FrameTimeline_BeginPresentAttempt(call, attempt_index, span, GpuPresent_RequiresReadiness())) {
         return false;
     }
 
@@ -255,6 +261,106 @@ static bool PreparePresentAttempt(
     return true;
 }
 
+static NativeGateContext GetNativeCallContext(uint64_t native_swapchain) noexcept {
+    NativeGateContext context = NativeGate_GetContext(CapturePresentQpc());
+    context.supported = context.supported && context.native_swapchain == native_swapchain;
+    context.native_swapchain = native_swapchain;
+    context.swapchain_generation = FrameTimeline_GetPresentSwapchainGeneration(native_swapchain);
+    context.now_qpc = CapturePresentQpc();
+    return context;
+}
+
+// ── Phase 0 pacing telemetry (phase0_measurement_design.md §2) ──
+
+// Final native attempt of one selected-swapchain Present call. P/E bracket
+// only that trampoline call; span is its Present span when one was allocated.
+struct PacingPresentAttempt {
+    UINT sync_interval = 0;
+    UINT present_flags = 0;
+    const PresentTimelineSpan* span = nullptr;
+    int64_t p_qpc = 0;
+    int64_t e_qpc = 0;
+    HRESULT result = S_OK;
+};
+
+// NativeGate_Execute (H2) holds a NativeHold plan from native_arrival_qpc
+// toward its grid target and stamps target_qpc and native_release_qpc only
+// for a hold that ran; Late, Stale, Undeliverable and non-H2 calls leave
+// target_qpc at 0. A completed hold may still be marked Cancelled when its
+// route was invalidated before the call returned.
+static bool NativeGateHeld(const NativeGateTrace& trace) noexcept {
+    return (trace.status == NativeGateStatus::Native ||
+            trace.status == NativeGateStatus::Cancelled) &&
+        trace.native_arrival_qpc > 0 &&
+        trace.native_arrival_qpc < trace.target_qpc &&
+        trace.native_release_qpc >= trace.target_qpc;
+}
+
+// replaced: GpuPresent_Execute owned this call, so NativeGate_Execute did
+// not run and the native trace times are its own.
+// Output precedence: GPU gate attribution, native CPU hold, marker CPU hold,
+// an uninstrumented replacement (Unknown), else no ReLimiter hold.
+// plan_status precedence: the GPU gate's, then H2's when it ran for this
+// call, then the PRESENT_START executor's.
+static void PushPacingPresent(uint64_t native_swapchain, const PacingPresentAttempt& attempt,
+    const NativeGateTrace& native_trace, bool replaced) noexcept {
+    PacingPresentRecord record{};
+    record.native_swapchain = native_swapchain;
+    record.thread_id = GetCurrentThreadId();
+    record.sync_interval = attempt.sync_interval;
+    record.present_flags = attempt.present_flags;
+    record.result = static_cast<uint32_t>(attempt.result);
+    const PacingPresentAttribution attribution =
+        PacingTelemetry_TakePresentAttribution(attempt.p_qpc, GetQPCFrequency() / 10);
+    record.key = attribution.key;
+    record.present_marker_qpc = attribution.marker_qpc;
+    if (native_trace.cross_thread) {
+        record.cross_thread_key = {PacingIdentityDomain::NvApiFrame, native_trace.producer_epoch,
+            native_trace.source_frame_id};
+    }
+    if (attempt.span) {
+        record.swapchain_generation = attempt.span->key.swapchain_generation;
+        record.present_sequence = attempt.span->key.present_sequence;
+    }
+    record.p_qpc = attempt.p_qpc;
+    record.e_qpc = attempt.e_qpc;
+    const PacingGpuOutputAttribution gpu = PacingTelemetry_TakeGpuOutputAttribution();
+    if (gpu.kind != PacingOutputKind::Unknown) {
+        record.output_kind = gpu.kind;
+        record.gate_status = gpu.gate_status;
+        record.output_target_qpc = gpu.target_qpc;
+        record.output_arrival_qpc = gpu.arrival_qpc;
+        record.output_release_qpc = gpu.release_qpc;
+        record.gpu_ticket = gpu.ticket;
+        if (gpu.swapchain_generation != 0 || gpu.present_sequence != 0) {
+            record.swapchain_generation = gpu.swapchain_generation;
+            record.present_sequence = gpu.present_sequence;
+        }
+    }
+    else if (!replaced && NativeGateHeld(native_trace)) {
+        record.output_kind = PacingOutputKind::NativeCpuHold;
+        record.gate_status = static_cast<uint8_t>(native_trace.status);
+        record.output_target_qpc = native_trace.target_qpc;
+        record.output_arrival_qpc = native_trace.native_arrival_qpc;
+        record.output_release_qpc = native_trace.native_release_qpc;
+    }
+    else if (attribution.marker_output == PacingOutputKind::MarkerCpuHold) {
+        record.output_kind = PacingOutputKind::MarkerCpuHold;
+        record.output_target_qpc = attribution.marker_hold_target_qpc;
+        record.output_arrival_qpc = attribution.marker_qpc;
+        record.output_release_qpc = attribution.marker_hold_release_qpc;
+    }
+    else {
+        record.output_kind = replaced ? PacingOutputKind::Unknown : PacingOutputKind::None;
+    }
+    if (gpu.plan_status != 0) record.plan_status = gpu.plan_status;
+    else if (!replaced && native_trace.plan_status != 0) record.plan_status = native_trace.plan_status;
+    else record.plan_status = attribution.plan_status;
+    PacingTelemetry_PushPresent(record);
+    PacingTelemetry_RecordDxgiPresent(
+        reinterpret_cast<IDXGISwapChain*>(static_cast<uintptr_t>(native_swapchain)), record);
+}
+
 template <size_t Slot>
 static HRESULT STDMETHODCALLTYPE Hooked_Present(IDXGISwapChain* self, UINT SyncInterval, UINT Flags) {
     RuntimeCallbackGuard callback;
@@ -262,6 +368,11 @@ static HRESULT STDMETHODCALLTYPE Hooked_Present(IDXGISwapChain* self, UINT SyncI
         s_present_targets[Slot].original.load(std::memory_order_acquire);
     if (!original) return DXGI_ERROR_INVALID_CALL;
     if (callback.IsStopping()) return InvokePresent(original, self, SyncInterval, Flags);
+
+    // One implementation target can serve native, proxy and auxiliary objects.
+    // Discovery of a target is not selection/ownership of every instance.
+    if (reinterpret_cast<uint64_t>(self) != SwapMgr_GetNativeHandle())
+        return InvokePresent(original, self, SyncInterval, Flags);
 
     s_game_sync_interval.store(SyncInterval, std::memory_order_relaxed);
 
@@ -289,28 +400,50 @@ static HRESULT STDMETHODCALLTYPE Hooked_Present(IDXGISwapChain* self, UINT SyncI
     const bool capture_call = FrameTimeline_BeginPresentCall(
         reinterpret_cast<uint64_t>(self),
         PresentTimelineEntryPoint::DxgiPresent,
-        &timeline_call);
+        &timeline_call, GpuPresent_RequiresReadiness());
     PresentTimelineSpan first_attempt{};
     const bool capture_first_attempt = capture_call && PreparePresentAttempt(
         timeline_call, 0, override_interval, override_flags, &first_attempt);
 
+    PacingTelemetry_ResetGpuOutputAttribution();
+    NativeGateCall native_gate(GetNativeCallContext(reinterpret_cast<uint64_t>(self)), override_flags);
+    const bool early_readiness=GpuPresent_GetConfig().mode!=ReadyPresentMode::Off &&
+        native_gate.trace.status==NativeGateStatus::Native;
+    if(!early_readiness)NativeGate_Execute(&native_gate, reinterpret_cast<uint64_t>(self));
+    first_attempt.native_gate = native_gate.trace;
+    GpuReadinessCall readiness(capture_first_attempt ? &first_attempt : nullptr,early_readiness);
+    bool replaced=false;
+    if(early_readiness) {
+        replaced=GpuPresent_Execute(&native_gate,&readiness,capture_first_attempt?&first_attempt:nullptr)!=
+            GpuPresentExecution::Fallback;
+        if(!replaced)
+            NativeGate_Execute(&native_gate,reinterpret_cast<uint64_t>(self));
+        first_attempt.native_gate=native_gate.trace;
+    }
+    // Pacing telemetry always brackets the native call; the Present span
+    // shares the same two reads when one was allocated.
+    PacingPresentAttempt pacing_attempt{override_interval, override_flags,
+        capture_first_attempt ? &first_attempt : nullptr};
     HRESULT hr;
     if (capture_first_attempt) {
-        first_attempt.p_qpc = CapturePresentQpc();
+        first_attempt.p_qpc = pacing_attempt.p_qpc = CapturePresentQpc();
         hr = InvokePresent(original, self, override_interval, override_flags);
-        first_attempt.e_qpc = CapturePresentQpc();
-        first_attempt.result_code = static_cast<uint32_t>(hr);
+        first_attempt.e_qpc = pacing_attempt.e_qpc = CapturePresentQpc();
     }
     else {
+        pacing_attempt.p_qpc = CapturePresentQpc();
         hr = InvokePresent(original, self, override_interval, override_flags);
+        pacing_attempt.e_qpc = CapturePresentQpc();
     }
 
     PresentTimelineSpan retry_attempt{};
     bool capture_retry_attempt = false;
+    bool retried = false;
 
     // If ALLOW_TEARING failed (swapchain doesn't support it), retry without
     if (hr == DXGI_ERROR_INVALID_CALL && mode == 1 &&
         (override_flags & DXGI_PRESENT_ALLOW_TEARING)) {
+        retried = true;
         static bool s_tearing_fail_logged = false;
         if (!s_tearing_fail_logged) {
             s_tearing_fail_logged = true;
@@ -326,24 +459,24 @@ static HRESULT STDMETHODCALLTYPE Hooked_Present(IDXGISwapChain* self, UINT SyncI
         }
         capture_retry_attempt = capture_call && PreparePresentAttempt(
             timeline_call, 1, 0, Flags, &retry_attempt);
+        // The retry is the final attempt: its P/E and span replace the first.
+        pacing_attempt = {0, Flags, capture_retry_attempt ? &retry_attempt : nullptr};
         if (capture_retry_attempt) {
-            retry_attempt.p_qpc = CapturePresentQpc();
+            retry_attempt.p_qpc = pacing_attempt.p_qpc = CapturePresentQpc();
             hr = InvokePresent(original, self, 0, Flags);
-            retry_attempt.e_qpc = CapturePresentQpc();
-            retry_attempt.result_code = static_cast<uint32_t>(hr);
+            retry_attempt.e_qpc = pacing_attempt.e_qpc = CapturePresentQpc();
         }
         else {
+            pacing_attempt.p_qpc = CapturePresentQpc();
             hr = InvokePresent(original, self, 0, Flags);
+            pacing_attempt.e_qpc = CapturePresentQpc();
         }
     }
+    pacing_attempt.result = hr;
 
-    if (capture_first_attempt) {
-        FrameTimeline_PublishPresentSpan(first_attempt);
-    }
-    if (capture_retry_attempt) {
-        FrameTimeline_PublishPresentSpan(retry_attempt);
-    }
-
+    native_gate.Complete(hr == S_OK, retried);
+    readiness.Complete(hr == S_OK, retried);
+    PushPacingPresent(reinterpret_cast<uint64_t>(self), pacing_attempt, native_gate.trace, replaced);
     return hr;
 }
 
@@ -362,28 +495,54 @@ static HRESULT STDMETHODCALLTYPE Hooked_Present1(
         return InvokePresent1(
             original, self, SyncInterval, PresentFlags, PresentParameters);
 
+    if (reinterpret_cast<uint64_t>(self) != SwapMgr_GetNativeHandle())
+        return InvokePresent1(original, self, SyncInterval, PresentFlags, PresentParameters);
+
     PresentTimelineCall timeline_call{};
     const bool capture_call = FrameTimeline_BeginPresentCall(
         reinterpret_cast<uint64_t>(self),
         PresentTimelineEntryPoint::DxgiPresent1,
-        &timeline_call);
+        &timeline_call, GpuPresent_RequiresReadiness());
     PresentTimelineSpan attempt{};
     const bool capture_attempt = capture_call && PreparePresentAttempt(
         timeline_call, 0, SyncInterval, PresentFlags, &attempt);
 
+    PacingTelemetry_ResetGpuOutputAttribution();
+    NativeGateCall native_gate(GetNativeCallContext(reinterpret_cast<uint64_t>(self)), PresentFlags);
+    const bool early_readiness=GpuPresent_GetConfig().mode!=ReadyPresentMode::Off &&
+        native_gate.trace.status==NativeGateStatus::Native;
+    if(!early_readiness)NativeGate_Execute(&native_gate, reinterpret_cast<uint64_t>(self));
+    attempt.native_gate = native_gate.trace;
+    GpuReadinessCall readiness(capture_attempt ? &attempt : nullptr,early_readiness);
+    bool replaced=false;
+    if(early_readiness) {
+        replaced=GpuPresent_Execute(&native_gate,&readiness,capture_attempt?&attempt:nullptr)!=
+            GpuPresentExecution::Fallback;
+        if(!replaced)
+            NativeGate_Execute(&native_gate,reinterpret_cast<uint64_t>(self));
+        attempt.native_gate=native_gate.trace;
+    }
+    // Pacing telemetry always brackets the native call; the Present span
+    // shares the same two reads when one was allocated.
+    PacingPresentAttempt pacing_attempt{SyncInterval, PresentFlags,
+        capture_attempt ? &attempt : nullptr};
     HRESULT result;
     if (capture_attempt) {
-        attempt.p_qpc = CapturePresentQpc();
+        attempt.p_qpc = pacing_attempt.p_qpc = CapturePresentQpc();
         result = InvokePresent1(
             original, self, SyncInterval, PresentFlags, PresentParameters);
-        attempt.e_qpc = CapturePresentQpc();
-        attempt.result_code = static_cast<uint32_t>(result);
-        FrameTimeline_PublishPresentSpan(attempt);
+        attempt.e_qpc = pacing_attempt.e_qpc = CapturePresentQpc();
     }
     else {
+        pacing_attempt.p_qpc = CapturePresentQpc();
         result = InvokePresent1(
             original, self, SyncInterval, PresentFlags, PresentParameters);
+        pacing_attempt.e_qpc = CapturePresentQpc();
     }
+    pacing_attempt.result = result;
+    native_gate.Complete(result == S_OK, false);
+    readiness.Complete(result == S_OK, false);
+    PushPacingPresent(reinterpret_cast<uint64_t>(self), pacing_attempt, native_gate.trace, replaced);
     return result;
 }
 
@@ -402,6 +561,28 @@ static constexpr auto s_present_thunks =
 static constexpr auto s_present1_thunks =
     Present1Thunks(std::make_index_sequence<DXGI_HOOK_TARGET_CAPACITY>{});
 
+static void TracePresentImplementation(const char* method, void* object, void* target,
+    MH_STATUS status, bool already_installed) {
+    if (NativeGate_GetMode() != NativeGateMode::Shadow) return;
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    // Successful installation pins the target module for the hook lifetime.
+    // Do not inspect an unpinned failed target or dereference a logged object.
+    MEMORY_BASIC_INFORMATION memory{};
+    char module[MAX_PATH]{};
+    bool resolved = false;
+    if (status == MH_OK && VirtualQuery(target, &memory, sizeof(memory)) && memory.Type == MEM_IMAGE) {
+        const DWORD length = GetModuleFileNameA(static_cast<HMODULE>(memory.AllocationBase), module, MAX_PATH);
+        resolved = length != 0 && length < MAX_PATH;
+    }
+    LOG_INFO("FG Present implementation: qpc=%lld thread=%lu method=%s object=%p selected=%llu "
+             "target=%p status=%d already=%d module=%s base=%p offset=%llu",
+             now.QuadPart, GetCurrentThreadId(), method, object, SwapMgr_GetNativeHandle(),
+             target, status, already_installed, resolved ? module : "unavailable",
+             resolved ? memory.AllocationBase : nullptr,
+             resolved ? reinterpret_cast<uintptr_t>(target) - reinterpret_cast<uintptr_t>(memory.AllocationBase) : 0ull);
+}
+
 static void VSync_InstallDXGIHooksImpl(void* native_swapchain) {
     auto* sc = static_cast<IDXGISwapChain*>(native_swapchain);
 
@@ -415,6 +596,7 @@ static void VSync_InstallDXGIHooksImpl(void* native_swapchain) {
         present_addr,
         s_present_thunks,
         &already_installed);
+    TracePresentImplementation("Present", sc, present_addr, present_status, already_installed);
     if (present_status == MH_OK && !already_installed) {
         LOG_INFO("VSync: hooked IDXGISwapChain::Present at %p", present_addr);
     } else if (present_status != MH_OK) {
@@ -433,6 +615,7 @@ static void VSync_InstallDXGIHooksImpl(void* native_swapchain) {
             present1_addr,
             s_present1_thunks,
             &already_installed);
+        TracePresentImplementation("Present1", sc1, present1_addr, present1_status, already_installed);
         if (present1_status == MH_OK && !already_installed) {
             LOG_INFO("VSync: hooked IDXGISwapChain1::Present1 at %p", present1_addr);
         } else if (present1_status != MH_OK) {
@@ -457,3 +640,4 @@ int VSync_GetDXGISyncInterval() {
     if (mode == 2) return 1;
     return -1;
 }
+

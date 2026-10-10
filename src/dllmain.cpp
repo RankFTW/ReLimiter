@@ -1,3 +1,4 @@
+#include "fg_input_observer.h"
 #include <Windows.h>
 #include "osd.h"
 #include "hw_monitor.h"
@@ -17,14 +18,16 @@
 #include "pcl_hooks.h"
 #include "loadlib_hooks.h"
 #include "streamline_hooks.h"
-#include "timer_hooks.h"
+#include "streamline_discovery.h"
+#include "streamline_factory_probe.h"
+#include "streamline_proxy_probe.h"
+#include "streamline_gpu_handoff.h"
 #include "system_hardening.h"
 #include "marker_log.h"
 #include "tsc_cal.h"
 #include "hw_spin.h"
 #include "sleep.h"
 #include "display_state.h"
-#include "flip_metering.h"
 #include "vblank_thread.h"
 #include "display_poll_thread.h"
 #include "flush.h"
@@ -32,7 +35,7 @@
 #include "config.h"
 #include "logger.h"
 #include "csv_writer.h"
-#include "pqi.h"
+#include "pacing_telemetry.h"
 #include "swapchain_manager.h"
 #include "enforcement_dispatcher.h"
 #include "correlator.h"
@@ -41,9 +44,10 @@
 #include "flip_model.h"
 #include "native_pcl_measurement.h"
 #include "runtime_lifecycle.h"
-#ifdef RELIMITER_ENABLE_MCP
-#include "live_debug.h"
-#endif
+#include "frame_timeline.h"
+#include "native_present_gate.h"
+#include "gpu_present_gate.h"
+#include "gpu_readiness.h"
 
 static bool    s_addon_initialised = false;
 static bool    s_addon_registered = false;
@@ -105,10 +109,31 @@ static DWORD WINAPI ApplyBorderlessTask(LPVOID context) {
 }
 
 // ── ReShade callbacks ──
+// Sparse lifecycle records survive captures started after initial creation.
+// An interface address is an observation, not a real/generated-frame identity.
+static void TraceSwapchainLifecycle(const char* stage, reshade::api::device_api api,
+    reshade::api::swapchain* swapchain, uint64_t native, bool resize, void* window) {
+    if (NativeGate_GetMode() != NativeGateMode::Shadow || !GpuReadiness_IsEnabled()) return;
+    LARGE_INTEGER now{}, frequency{};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&frequency);
+    LOG_INFO("FG lifecycle: stage=%s qpc=%lld frequency=%lld thread=%lu api=%u "
+             "reshade=%p native=%llu generation=%llu selected=%llu resize=%d hwnd=%p",
+             stage, now.QuadPart, frequency.QuadPart, GetCurrentThreadId(),
+             static_cast<unsigned>(api), static_cast<void*>(swapchain), native,
+             native ? FrameTimeline_GetPresentSwapchainGeneration(native) : 0ull,
+             SwapMgr_GetNativeHandle(), resize, window);
+}
+
 static void on_init_device(reshade::api::device* device) {
     RuntimeCallbackGuard callback;
     if (callback.IsStopping()) return;
-    try { SwapMgr_OnInitDevice(device); }
+    try {
+        SwapMgr_OnInitDevice(device);
+        if (device && device->get_api() == reshade::api::device_api::d3d12)
+            StreamlineFactoryProbe_TryEarly();
+        if (device) TraceSwapchainLifecycle("init_device", device->get_api(), nullptr, 0, false, nullptr);
+    }
     catch (...) {
         OutputDebugStringA("ReLimiter: init_device callback rejected an exception.\n");
     }
@@ -147,6 +172,14 @@ static void on_init_swapchain(reshade::api::swapchain* sc, bool resize) {
     if (callback.IsStopping()) return;
     try {
     SwapMgr_OnInitSwapchain(sc, resize);
+    if (sc && sc->get_device() && sc->get_device()->get_api() == reshade::api::device_api::d3d12) {
+        StreamlineDiscovery_RecordBoundary({StreamlineBoundaryStage::InitSwapchain,
+            sc->get_native(), 0, sc->get_device()->get_native(),
+            FrameTimeline_GetPresentSwapchainGeneration(sc->get_native()), 0, resize});
+    }
+    if (sc && sc->get_device())
+        TraceSwapchainLifecycle("init_swapchain", sc->get_device()->get_api(), sc,
+                               sc->get_native(), resize, nullptr);
     // Apply GPU thread priority on first swapchain init (DXGI only — Vulkan
     // native handles are VkSwapchainKHR, not IDXGISwapChain*)
     if (!resize && sc && sc->get_device()) {
@@ -166,7 +199,17 @@ static void on_init_swapchain(reshade::api::swapchain* sc, bool resize) {
 static void on_destroy_swapchain(reshade::api::swapchain* sc, bool resize) {
     RuntimeCallbackGuard callback;
     if (callback.IsStopping()) return;
-    try { SwapMgr_OnDestroySwapchain(sc, resize); }
+    try {
+        if (sc && sc->get_device() && sc->get_device()->get_api() == reshade::api::device_api::d3d12) {
+            StreamlineDiscovery_RecordBoundary({StreamlineBoundaryStage::DestroySwapchain,
+                sc->get_native(), 0, sc->get_device()->get_native(),
+                FrameTimeline_GetPresentSwapchainGeneration(sc->get_native()), 0, resize});
+        }
+        if (sc && sc->get_device())
+            TraceSwapchainLifecycle("destroy_swapchain", sc->get_device()->get_api(), sc,
+                                   sc->get_native(), resize, nullptr);
+        SwapMgr_OnDestroySwapchain(sc, resize);
+    }
     catch (...) {
         OutputDebugStringA("ReLimiter: destroy_swapchain callback rejected an exception.\n");
     }
@@ -178,6 +221,12 @@ static void on_destroy_swapchain(reshade::api::swapchain* sc, bool resize) {
 static bool on_create_swapchain(reshade::api::device_api api, reshade::api::swapchain_desc& desc, void* hwnd) {
     RuntimeCallbackGuard callback;
     if (callback.IsStopping()) return false;
+    TraceSwapchainLifecycle("create_swapchain", api, nullptr, 0, false, hwnd);
+    if (api == reshade::api::device_api::d3d12) {
+        // ReShade's create callback has no returned interface or creation queue.
+        StreamlineDiscovery_RecordBoundary({StreamlineBoundaryStage::CreateSwapchain,
+            0, 0, 0, 0, reinterpret_cast<uint64_t>(hwnd)});
+    }
     bool modified = false;
 
     // DX9 VSync override via sync_interval (applied at CreateDevice and Reset)
@@ -247,10 +296,6 @@ static void on_present_impl(reshade::api::command_queue* queue,
 
     // MMCSS registration for the present thread (once)
     Hardening_OnFirstPresent();
-
-#ifdef RELIMITER_ENABLE_MCP
-    LiveDebug_StartIfReady();
-#endif
 
     // Native PCL waits for meaningful latency activity so the ETW session
     // does not ingest the game's unrelated startup burst. Markerless games
@@ -323,7 +368,11 @@ static void on_present_impl(reshade::api::command_queue* queue,
                          pointer_changed, api_changed, recapture);
 
                 // Install DXGI VSync hook on first swapchain capture
+                TraceSwapchainLifecycle("selected_before_install", present_dev->get_api(), sc,
+                                       sc->get_native(), false, SwapMgr_GetHWND());
                 VSync_InstallDXGIHooks(native);
+                TraceSwapchainLifecycle("selected_after_install", present_dev->get_api(), sc,
+                                       sc->get_native(), false, SwapMgr_GetHWND());
 
                 // Check factory tearing support for flip model override
                 FlipModel_CheckTearingSupport(native);
@@ -337,6 +386,32 @@ static void on_present_impl(reshade::api::command_queue* queue,
     LARGE_INTEGER now_qpc;
     QueryPerformanceCounter(&now_qpc);
     EnfDisp_OnPresent(now_qpc.QuadPart);
+    GpuReadiness_OnPresent(queue, sc);
+    // The native route runs for every mode: it carries plan keys to the
+    // native Present for H2 and H3 and qualifies PacingCapability::NativeRoute.
+    if (SwapMgr_GetActiveAPI() == ActiveAPI::DX11 || SwapMgr_GetActiveAPI() == ActiveAPI::DX12) {
+        const uint64_t native = sc->get_native();
+        NativeGate_BeginScope(native, FrameTimeline_GetPresentSwapchainGeneration(native));
+    }
+}
+
+static void on_finish_present(reshade::api::command_queue*, reshade::api::swapchain* sc) {
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping() || !sc) return;
+    GpuReadiness_OnFinishPresent(sc);
+    const uint64_t native = sc->get_native();
+    NativeGate_EndScope(native, FrameTimeline_GetPresentSwapchainGeneration(native));
+    NativeGate_PublishRouteCapability(FrameTimeline_CurrentControllerGeneration());
+}
+
+static void on_destroy_command_queue(reshade::api::command_queue* queue) {
+    RuntimeCallbackGuard callback;
+    if (!callback.IsStopping() && queue && queue->get_device() &&
+        queue->get_device()->get_api() == reshade::api::device_api::d3d12) {
+        StreamlineDiscovery_RecordBoundary({StreamlineBoundaryStage::DestroyQueue,
+            0, queue->get_native(), queue->get_device()->get_native()});
+    }
+    if (!callback.IsStopping()) GpuReadiness_OnQueueDestroy(queue);
 }
 
 static void on_present(reshade::api::command_queue* queue,
@@ -349,6 +424,19 @@ static void on_present(reshade::api::command_queue* queue,
     if (callback.IsStopping()) return;
     s_present_seen.store(true, std::memory_order_release);
     try {
+        // Observe before selected-presenter filtering, including auxiliary pairs.
+        // This queue is ReShade-observed, not a proven game creation/input queue.
+        if (sc && sc->get_device() && sc->get_device()->get_api() == reshade::api::device_api::d3d12) {
+            const bool d3d12_queue = queue && queue->get_device() &&
+                queue->get_device()->get_api() == reshade::api::device_api::d3d12;
+            StreamlineProxy_RecordInner(sc->get_native(), d3d12_queue ? queue->get_native() : 0,
+                sc->get_device()->get_native());
+            StreamlineDiscovery_RecordBoundary({StreamlineBoundaryStage::Present,
+                sc->get_native(), d3d12_queue ? queue->get_native() : 0,
+                sc->get_device()->get_native(),
+                FrameTimeline_GetPresentSwapchainGeneration(sc->get_native()), 0, false,
+                d3d12_queue ? queue->get_device()->get_native() : 0});
+        }
         on_present_impl(
             queue,
             sc,
@@ -454,7 +542,10 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
             s_csv_initialised = true;
             if (g_config.csv_enabled) CSV_SetEnabled(true);
         }
-        PQI_Reset();
+        // Measurement only: without the worker, producers drop and count records.
+        if (!PacingTelemetry_Start()) {
+            LOG_WARN("Pacing telemetry worker failed to start; runtime pacing metrics unavailable, pacing unchanged");
+        }
         LOG_INFO("Telemetry initialized");
 
         InitDisplayState();
@@ -480,6 +571,10 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         Blackout_Init();
         s_blackout_started = true;
 
+        if (!GpuReadiness_Start()) {
+            LOG_WARN("GPU readiness observer worker failed to start; observer unavailable, pacing unchanged");
+        }
+        if(!GpuPresent_Start())LOG_WARN("GPU Present deadline worker unavailable; experimental gate disabled");
         // Publish callbacks only after every fallible worker/subsystem has been
         // created, minimizing partial-initialization rollback exposure.
         reshade::register_event<reshade::addon_event::init_device>(on_init_device);
@@ -487,6 +582,8 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
         reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
         reshade::register_event<reshade::addon_event::present>(on_present);
+        reshade::register_event<reshade::addon_event::finish_present>(on_finish_present);
+        reshade::register_event<reshade::addon_event::destroy_command_queue>(on_destroy_command_queue);
         reshade::register_event<reshade::addon_event::create_swapchain>(on_create_swapchain);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(on_set_fullscreen_state);
         if (s_imgui_available) RegisterOSD();
@@ -521,13 +618,13 @@ static void ResetInitializationMilestones() noexcept {
 // Both rollback and normal teardown must attempt every producer stop. Keep each
 // call on the left of && so a prior failure cannot skip another stop request.
 static bool StopOwnedProducers() {
+    // Discharge committed GPU time waits BEFORE stopping observers or waiting
+    // for callbacks. A native Present may be blocked behind those time gates.
+    const bool gpu_present_stopped=GpuPresent_Stop();
     bool native_pcl_stopped = NativePcl_Stop();
-    bool live_debug_stopped = true;
-#ifdef RELIMITER_ENABLE_MCP
-    live_debug_stopped = LiveDebug_Stop();
-#endif
     bool auxiliary_workers_stopped =
-        DLSSPresets_Shutdown() && native_pcl_stopped && live_debug_stopped;
+        DLSSPresets_Shutdown() && native_pcl_stopped && gpu_present_stopped;
+    auxiliary_workers_stopped = GpuReadiness_Stop() && auxiliary_workers_stopped;
     auxiliary_workers_stopped =
         NGXHooks_BeginShutdown() && auxiliary_workers_stopped;
     auxiliary_workers_stopped =
@@ -558,6 +655,12 @@ static bool RollbackInitialization(HMODULE addon_module) {
         : MH_OK;
     FocusLock_Remove();
     const bool callbacks_drained = RuntimeLifecycle_WaitForCallbacks(5000);
+    if (callbacks_drained) {
+        if (auxiliary_workers_stopped) FgInput_Drain();
+        if (auxiliary_workers_stopped) auxiliary_workers_stopped = StreamlineHandoff_ReleaseAfterRundown();
+        auxiliary_workers_stopped = GpuPresent_ReleaseAfterRundown() && auxiliary_workers_stopped;
+        auxiliary_workers_stopped = GpuReadiness_ReleaseAfterRundown() && auxiliary_workers_stopped;
+    }
     // A callback admitted before BeginShutdown may have started native PCL.
     auxiliary_workers_stopped = NativePcl_Stop() && auxiliary_workers_stopped;
     if (disable_status != MH_OK || !callbacks_drained ||
@@ -579,11 +682,15 @@ static bool RollbackInitialization(HMODULE addon_module) {
         Hardening_Shutdown();
     }
     if (s_sleep_timer_initialised) CloseSleepTimer();
+    // Producers have drained; the worker's final rows still reach the CSV writer.
+    auxiliary_workers_stopped =
+        PacingTelemetry_Stop() && auxiliary_workers_stopped;
     if (s_csv_initialised)
         auxiliary_workers_stopped =
             CSV_Shutdown() && auxiliary_workers_stopped;
 
     s_addon_initialised = false;
+    auxiliary_workers_stopped = Config_Shutdown() && auxiliary_workers_stopped;
     if (auxiliary_workers_stopped)
         auxiliary_workers_stopped = Log_Shutdown();
     if (auxiliary_workers_stopped) RuntimeLifecycle_Shutdown();
@@ -671,6 +778,12 @@ static void AddonUninitImpl(HMODULE addon_module) {
         : MH_OK;
     FocusLock_Remove();
     const bool callbacks_drained = RuntimeLifecycle_WaitForCallbacks(5000);
+    if (callbacks_drained) {
+        if (auxiliary_workers_stopped) FgInput_Drain();
+        if (auxiliary_workers_stopped) auxiliary_workers_stopped = StreamlineHandoff_ReleaseAfterRundown();
+        auxiliary_workers_stopped = GpuPresent_ReleaseAfterRundown() && auxiliary_workers_stopped;
+        auxiliary_workers_stopped = GpuReadiness_ReleaseAfterRundown() && auxiliary_workers_stopped;
+    }
     auxiliary_workers_stopped = NativePcl_Stop() && auxiliary_workers_stopped;
     if (disable_status != MH_OK || !callbacks_drained ||
         !auxiliary_workers_stopped) {
@@ -700,8 +813,12 @@ static void AddonUninitImpl(HMODULE addon_module) {
     SwapMgr_ReleaseRuntimeReferences();
     Streamline_ResetLifetime();
     Hardening_Shutdown();
-    SaveConfig();
+    RequestSaveConfig();
+    auxiliary_workers_stopped = Config_Shutdown() && auxiliary_workers_stopped;
     if (s_sleep_timer_initialised) CloseSleepTimer();
+    // Producers have drained; the worker's final rows still reach the CSV writer.
+    auxiliary_workers_stopped =
+        PacingTelemetry_Stop() && auxiliary_workers_stopped;
     if (s_csv_initialised)
         auxiliary_workers_stopped =
             CSV_Shutdown() && auxiliary_workers_stopped;
@@ -747,9 +864,6 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID reserved) {
         // publish nonblocking stop notifications under the loader lock.
         RuntimeLifecycle_BeginShutdown();
         NativePcl_NotifyProcessDetach();
-#ifdef RELIMITER_ENABLE_MCP
-        LiveDebug_NotifyProcessDetach();
-#endif
         OutputDebugStringA(
             "ReLimiter: dynamic detach reached without completed AddonUninit; "
             "loader-lock cleanup intentionally skipped.\n");

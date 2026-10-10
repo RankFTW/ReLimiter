@@ -3,6 +3,27 @@
 #include <atomic>
 #include <cstdint>
 
+// Used only under SchedulerOwnerGuard. Source IDs are monotonic within the
+// feedback producer lifetime; reset together with that producer's policy.
+class NvApiMarkerPromotion {
+public:
+    void Reset() noexcept { *this={}; }
+    bool Observe(uint64_t frame,int64_t now,int64_t frequency) noexcept {
+        if(!frame || now<=0 || frequency<=0) {last_=0;count_=0;return false;}
+        if(frame==last_)return false;
+        count_=(last_ && frame==last_+1 && now>time_ && now-time_<=frequency/4)?count_+1:1;
+        last_=frame;time_=now;
+        if(count_>8)count_=8;
+        return count_==8 && frame>enforced_;
+    }
+    bool CanEnforce(uint64_t frame) const noexcept { return frame && frame>enforced_; }
+    void Enforced(uint64_t frame) noexcept { if(frame>enforced_)enforced_=frame; }
+private:
+    uint64_t last_=0,enforced_=0;
+    int64_t time_=0;
+    uint32_t count_=0;
+};
+
 // RTSS can supplement a game's partial native marker stream with
 // SIMULATION_START. Do not trust RTSS alone: only admit its nonzero-frame
 // SimulationStart after a bounded direct-marker warm-up proves that the game

@@ -4,10 +4,8 @@ project(relimiter LANGUAGES CXX C)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-option(RELIMITER_ENABLE_MCP
-    "Build read-only live pacing telemetry and the MCP stdio bridge"
-    OFF)
-
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" RELIMITER_VERSION LIMIT_COUNT 1)
 string(STRIP "${RELIMITER_VERSION}" RELIMITER_VERSION)
 if(NOT RELIMITER_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
@@ -40,6 +38,9 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # ── Sources (shared — builds for both 32 and 64-bit) ──
 set(ADDON_SOURCES
+    src/native_pcl_snapshot_policy.h
+    src/scheduler_cadence.h
+    src/osd_cadence_policy.h
     src/oled_care_policy.h
     src/osd_position_policy.h
     src/capture_lifecycle.h
@@ -47,22 +48,17 @@ set(ADDON_SOURCES
     src/reflex_adaptation_queue.h
     src/pacing_sleep.h
     src/swapchain_selection_policy.h
-    src/adaptive_deadline_reserve.cpp
-    src/arrival_lead_estimator.cpp
     src/background_tasks.cpp
     src/frame_time_adaptation.cpp
     src/dllmain.cpp
-    src/cadence_meter.cpp
-    src/ceiling_margin.cpp
     src/config.cpp
     src/correlator.cpp
-    src/damping.cpp
     src/display_poll_thread.cpp
     src/display_resolver.cpp
     src/display_state.cpp
     src/enforcement_dispatcher.cpp
     src/feedback.cpp
-    src/flip_metering.cpp
+    src/feedback_device_identity.cpp
     src/flip_model.cpp
     src/flush.cpp
     src/frame_latency_controller.cpp
@@ -77,35 +73,65 @@ set(ADDON_SOURCES
     src/nvapi_hooks.cpp
     src/osd.cpp
     src/pll.cpp
-    src/predictor.cpp
-    src/regime_detector.cpp
     src/runtime_lifecycle.cpp
     src/scheduler.cpp
     src/sleep.cpp
     src/sleep_mode.cpp
-    src/stress_detector.cpp
     src/swapchain_manager.cpp
     src/system_hardening.cpp
-    src/tier.cpp
-    src/timer_hooks.cpp
     src/tsc_cal.cpp
     src/vblank_thread.cpp
     src/wake_guard.cpp
     src/logger.cpp
     src/csv_writer.cpp
     src/pqi.cpp
-    src/baseline.cpp
     src/presentation_gate.cpp
+    src/native_present_gate.cpp
+    src/native_present_gate_runtime.cpp
+    src/gpu_readiness.cpp
+    src/gpu_present_types.cpp
+    src/gpu_present_gate.cpp
+    src/nvapi_marker_census.h
     src/present_association.cpp
     src/vsync_control.cpp
     src/vk_enforce.cpp
     src/blackout.cpp
     src/focus_lock.cpp
+    src/pacing_telemetry_types.h
+    src/pacing_core_types.h
+    src/cadence_grid.h
+    src/cadence_grid.cpp
+    src/cadence_grid_publication.cpp
+    src/lead_controller.h
+    src/lead_controller.cpp
+    src/period_governor.h
+    src/period_governor.cpp
+    src/source_placement.h
+    src/source_placement.cpp
+    src/render_handoff.h
+    src/render_handoff.cpp
+    src/rung_feasibility.h
+    src/rung_feasibility.cpp
+    src/pacing_resolver.h
+    src/pacing_resolver.cpp
+    src/frame_plan.h
+    src/frame_plan.cpp
+    src/source_stage.h
+    src/source_stage.cpp
+    src/pacing_telemetry.h
+    src/pacing_telemetry.cpp
+    src/pacing_controller_events.h
+    src/pacing_controller_events.cpp
+    src/pacing_metrics.h
+    src/pacing_metrics.cpp
+    src/pacing_join.h
+    src/pacing_join.cpp
+    src/dxgi_display_source.h
+    src/dxgi_display_source.cpp
+    src/reflex_clock_map.h
+    src/reflex_clock_map.cpp
+    src/native_pcl_loss_window.h
 )
-
-if(RELIMITER_ENABLE_MCP)
-    list(APPEND ADDON_SOURCES src/live_debug.cpp)
-endif()
 
 # ── 64-bit only sources ──
 if(RELIMITER_64BIT)
@@ -114,9 +140,27 @@ if(RELIMITER_64BIT)
         src/frame_splitting.cpp
         src/ngx_hooks.cpp
         src/streamline_hooks.cpp
+        src/streamline_discovery.cpp
+        src/streamline_discovery.h
+        src/streamline_com_evidence.h
+        src/streamline_factory_probe.cpp
+        src/streamline_factory_probe.h
+        src/streamline_proxy_search.cpp
+        src/streamline_proxy_search.h
+        src/streamline_proxy_probe.cpp
+        src/streamline_proxy_probe.h
+        src/streamline_queue_hooks.cpp
+        src/streamline_queue_hooks.h
+        src/streamline_gpu_handoff.cpp
+        src/streamline_gpu_handoff.h
+        src/fg_input_observer.cpp
+        src/fg_queue_observer.cpp
         src/pcl_hooks.cpp
         src/reflex_inject.cpp
         src/dlss_presets.cpp
+        src/gpu_readiness_d3d12.cpp
+        src/gpu_readiness_d3d12_queue.cpp
+        src/gpu_present_gate_d3d12.cpp
     )
 endif()
 
@@ -201,6 +245,7 @@ endif()
 
 # ── DLL target ──
 add_library(relimiter SHARED
+    src/fg_state_policy.h
     ${ADDON_SOURCES}
     src/version.rc
 )
@@ -231,10 +276,6 @@ target_compile_definitions(relimiter PRIVATE
     VK_NO_PROTOTYPES
     $<$<NOT:$<BOOL:${RELIMITER_64BIT}>>:RELIMITER_32BIT>
 )
-
-if(RELIMITER_ENABLE_MCP)
-    target_compile_definitions(relimiter PRIVATE RELIMITER_ENABLE_MCP=1)
-endif()
 
 # ImGui symbols resolved at runtime by ReShade — no force-include needed
 
@@ -276,6 +317,7 @@ if(RELIMITER_64BIT)
         d3d12.lib
         gdi32.lib
         winmm.lib
+        Synchronization.lib
         ${CMAKE_SOURCE_DIR}/deps/nvapi/amd64/nvapi64.lib
     )
 else()
@@ -287,36 +329,9 @@ else()
         dxgi.lib
         gdi32.lib
         winmm.lib
+        Synchronization.lib
         ${CMAKE_SOURCE_DIR}/deps/nvapi/x86/nvapi.lib
     )
-endif()
-
-# ── Optional read-only MCP stdio bridge ──
-if(RELIMITER_ENABLE_MCP)
-    add_executable(relimiter_mcp_bridge
-        tools/mcp_bridge/main.cpp
-        tools/mcp_bridge/json.cpp
-    )
-    target_compile_features(relimiter_mcp_bridge PRIVATE cxx_std_20)
-    target_compile_definitions(relimiter_mcp_bridge PRIVATE
-        NOMINMAX
-        WIN32_LEAN_AND_MEAN
-        UNICODE
-        _UNICODE
-    )
-    target_include_directories(relimiter_mcp_bridge PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/tools/mcp_bridge
-        ${RELIMITER_GENERATED_INCLUDE_DIR}
-    )
-    set_target_properties(relimiter_mcp_bridge PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-    )
-    if(MSVC)
-        set_property(TARGET relimiter_mcp_bridge PROPERTY
-            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-        target_compile_options(relimiter_mcp_bridge PRIVATE /W4 /utf-8 /permissive-)
-    endif()
 endif()
 
 # ── MinHook C files: handled by minhook_static target ──

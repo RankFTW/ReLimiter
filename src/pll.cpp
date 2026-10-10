@@ -1,65 +1,79 @@
 #include "pll.h"
-#include "wake_guard.h"
+
 #include <cmath>
-#include <algorithm>
 
-PLL g_pll;
+VBlankPhaseTracker g_vblank_phase;
 
-void PLL::SetPeriodIfChanged(double new_period_us) {
-    if (std::abs(new_period_us - period_us) > 0.1) {
-        period_us = new_period_us;
-        // Don't reset phase — let PI controller adapt
-    }
+namespace {
+// Adjacent vblank deltas outside [2 ms, 50 ms] are not a refresh period.
+constexpr double kMinRefreshUs = 2'000.0;
+constexpr double kMaxRefreshUs = 50'000.0;
+constexpr double kRefreshDeltaAlpha = 0.05;
 }
 
-void PLL::IngestVBlank(int64_t vblank_qpc) {
-    if (last_grid_qpc == 0 || period_us <= 0.0) {
-        last_vblank_qpc = vblank_qpc;
+void VBlankPhaseTracker::Reset() noexcept
+{
+    *this = VBlankPhaseTracker{};
+}
+
+void VBlankPhaseTracker::IngestVBlank(
+    int64_t vblank_qpc,
+    int64_t qpc_frequency,
+    double estimated_refresh_us) noexcept
+{
+    if (vblank_qpc <= 0 || qpc_frequency <= 0 || vblank_qpc <= last_vblank_qpc_) return;
+    const double ticks_per_us = static_cast<double>(qpc_frequency) / 1'000'000.0;
+
+    // ── Refresh period ──
+    if (std::isfinite(estimated_refresh_us) &&
+        estimated_refresh_us >= kMinRefreshUs && estimated_refresh_us <= kMaxRefreshUs) {
+        refresh_ticks_ = estimated_refresh_us * ticks_per_us;
+    } else if (last_vblank_qpc_ != 0) {
+        double delta_ticks = static_cast<double>(vblank_qpc - last_vblank_qpc_);
+        if (refresh_ticks_ > 0.0) {
+            const double periods = std::round(delta_ticks / refresh_ticks_);
+            if (periods >= 1.0) delta_ticks /= periods;
+        }
+        const double delta_us = delta_ticks / ticks_per_us;
+        if (delta_us >= kMinRefreshUs && delta_us <= kMaxRefreshUs) {
+            refresh_ticks_ = refresh_ticks_ > 0.0
+                ? refresh_ticks_ + kRefreshDeltaAlpha * (delta_ticks - refresh_ticks_)
+                : delta_ticks;
+        }
+    }
+    last_vblank_qpc_ = vblank_qpc;
+    ++observations_;
+
+    // ── Phase ──
+    if (edge_qpc_ == 0 || !(refresh_ticks_ > 0.0)) {
+        edge_qpc_ = vblank_qpc;
+        edge_fraction_ = 0.0;
+        integral_ticks_ = 0.0;
         return;
     }
-
-    // Phase error: how far the vblank is from our expected grid edge
-    double error_us = qpc_to_us(vblank_qpc - last_grid_qpc);
-    // Wrap to [-period/2, period/2]
-    double half = period_us * 0.5;
-    while (error_us > half) error_us -= period_us;
-    while (error_us < -half) error_us += period_us;
-
-    // PI correction
-    phase_error_accum += error_us;
-    double correction_us = Kp * error_us + Ki * phase_error_accum;
-
-    // Apply correction to grid anchor
-    last_grid_qpc += us_to_qpc(correction_us);
-    last_vblank_qpc = vblank_qpc;
+    const double since_edge = static_cast<double>(vblank_qpc - edge_qpc_) - edge_fraction_;
+    const double periods = std::round(since_edge / refresh_ticks_);
+    const double error_ticks = since_edge - periods * refresh_ticks_;
+    double next_edge = static_cast<double>(edge_qpc_ - vblank_qpc) + edge_fraction_ +
+        periods * refresh_ticks_; // predicted edge relative to vblank_qpc
+    if (std::abs(error_ticks) > kRelockFraction * refresh_ticks_) {
+        ++relocks_;
+        integral_ticks_ = 0.0;
+        next_edge = 0.0;
+    } else {
+        integral_ticks_ += kIntegralGain * error_ticks;
+        next_edge += kPhaseGain * error_ticks + integral_ticks_;
+    }
+    const double whole = std::floor(next_edge);
+    edge_qpc_ = vblank_qpc + static_cast<int64_t>(whole);
+    edge_fraction_ = next_edge - whole;
 }
 
-int64_t PLL::NextGridEdge(int64_t now_qpc) const {
-    if (last_grid_qpc == 0 || period_us <= 0.0)
-        return now_qpc;
-
-    int64_t period_qpc = us_to_qpc(period_us);
-    if (period_qpc <= 0) return now_qpc;
-
-    // Find the next grid edge after now
-    int64_t elapsed = now_qpc - last_grid_qpc;
-    int64_t periods_passed = elapsed / period_qpc;
-    int64_t next = last_grid_qpc + (periods_passed + 1) * period_qpc;
-
-    // If we're very close to a grid edge, take the next one
-    if (next - now_qpc < us_to_qpc(100.0))
-        next += period_qpc;
-
-    return next;
-}
-
-void PLL::RecordWake(int64_t actual_qpc, uint64_t /*frameID*/) {
-    // Update grid anchor to actual wake point for next cycle
-    if (period_us > 0.0)
-        last_grid_qpc = actual_qpc;
-}
-
-void PLL::Reanchor(int64_t now_qpc) {
-    last_grid_qpc = now_qpc;
-    phase_error_accum = 0.0;
+CadenceGridFixedReference VBlankPhaseTracker::Reference() const noexcept
+{
+    CadenceGridFixedReference reference{};
+    if (observations_ < 2 || edge_qpc_ == 0 || !(refresh_ticks_ > 0.0)) return reference;
+    reference.edge_qpc = edge_qpc_;
+    reference.refresh_ticks = refresh_ticks_;
+    return reference;
 }

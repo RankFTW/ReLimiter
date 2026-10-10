@@ -1,6 +1,11 @@
 #include "loadlib_hooks.h"
+#include "fg_input_observer.h"
 #include "hooks.h"
 #include "streamline_hooks.h"
+#include "streamline_discovery.h"
+#include "streamline_factory_probe.h"
+#include "streamline_proxy_probe.h"
+#include "streamline_queue_hooks.h"
 #include "ngx_hooks.h"
 #include "config.h"
 #include "runtime_lifecycle.h"
@@ -33,16 +38,22 @@ static DWORD WINAPI InstallWorker(void* context) {
     HANDLE stop_event = RuntimeLifecycle_GetStopEvent();
     const HANDLE waits[] = { event, stop_event };
     s_on_install_worker = true;
+    FgInput_BeginWorkerLifetime();
     while (!RuntimeLifecycle_IsStopping()) {
         // An auto-reset event retains notifications arriving during this scan.
         // The timeout retries failed installs and discovers non-LoadLibrary loads.
         HMODULE interposer = nullptr;
         if (GetModuleHandleExW(0, L"sl.interposer.dll", &interposer)) {
             s_streamline_present.store(true, std::memory_order_release);
-            HookStreamlinePCL(interposer);
+            const bool streamline_ready = HookStreamlinePCL(interposer);
+            StreamlineFactoryProbe_TryWorker(interposer, streamline_ready);
             FreeLibrary(interposer);
         }
         if (!g_config.streamline_compat) NGXHooks_TryInstall();
+        FgInput_InstallAndDrain();
+        StreamlineFactoryProbe_Drain();
+        StreamlineProxy_Drain();
+        StreamlineQueue_Drain();
         if (RuntimeLifecycle_IsStopping()) break;
         // Loads on this worker do not self-notify. Other notifications coalesce;
         // shutdown wakes this wait immediately, with a finite fallback timeout.
@@ -50,6 +61,10 @@ static DWORD WINAPI InstallWorker(void* context) {
         else WaitForSingleObject(event, 250);
     }
     // Retain the event for late stopping loader callbacks. BackgroundTasks owns
+    FgInput_Drain();
+    StreamlineFactoryProbe_Drain(true);
+    StreamlineProxy_Drain(true);
+    StreamlineQueue_Drain(true);
     // the thread/join; the event shares the retained hook/module lifetime.
     AcquireSRWLockExclusive(&s_worker_start_lock);
     s_worker_started = false;

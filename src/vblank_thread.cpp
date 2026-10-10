@@ -215,7 +215,8 @@ void UpdateVBlankThreadForMode(PacingMode mode) {
         if (!IsVBlankThreadRunning())
             StartVBlankThread();
     } else {
-        // VRR mode: CadenceMeter handles refresh estimation from DXGI stats.
+        // VRR mode: the grid needs no vblank reference and
+        // g_estimated_refresh_us keeps the display-state ceiling seed.
         // Stop the vblank thread to avoid redundant kernel-mode waits.
         if (IsVBlankThreadRunning())
             StopVBlankThread();

@@ -4,7 +4,11 @@
 #include <limits>
 
 // Native NVIDIA PC Latency state derived from PCLStats ETW markers and
-// PresentMon's displayed/dropped-present correlation.
+// PresentMon's displayed/dropped-present correlation. EventLoss is windowed
+// (native_pcl_loss_window.h): it lasts while ETW capture-integrity loss is
+// inside the current loss window, then availability returns with the first
+// sample published after the quiet period. Loss counters stay cumulative for
+// the process, across collector restarts.
 enum class NativePclStatus : uint8_t {
     Disabled,
     Starting,
@@ -30,6 +34,8 @@ struct NativePclSnapshot {
     uint64_t display_qpc = 0;
     uint64_t sample_qpc = 0;
 
+    // Display-to-query observation age, including ETW delivery latency.
+    // Staleness is based separately on sample_qpc (collector publication).
     double sample_age_us = std::numeric_limits<double>::quiet_NaN();
     double input_to_frame_start_us = std::numeric_limits<double>::quiet_NaN();
     double frame_start_to_present_us = std::numeric_limits<double>::quiet_NaN();

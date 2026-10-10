@@ -8,19 +8,28 @@
 // based on Active_API and marker availability.
 //
 // Path selection:
-//   DX12 + NvAPI markers flowing  → NvAPIMarkers (handled by Hook_SetLatencyMarker)
-//   Vulkan + PCL markers flowing  → PCLMarkers   (handled by Hooked_slPCLSetMarker)
-//   Vulkan without PCL            → PresentBased  (VkEnforce_OnPresent)
-//   DX11                          → PresentBased  (VkEnforce_OnPresent)
-//   None                          → None
+//   DX12/DX11 + NvAPI markers seen → NvAPIMarkers (handled by Hook_SetLatencyMarker;
+//                                    sticky until API change or full teardown)
+//   DX12/DX11 without NvAPI markers → PresentBased (VkEnforce_OnPresent)
+//   Vulkan + PCL markers flowing    → PCLMarkers   (handled by Hooked_slPCLSetMarker)
+//   Vulkan without PCL              → PresentBased (VkEnforce_OnPresent)
+//   DX9, OpenGL                     → PresentBased (VkEnforce_OnPresent)
+//   None                            → None
 //
+// NvAPIMarkers falls back to present-based enforcement while NvAPI markers or
+// marker-triggered enforcement stop flowing; PCLMarkers while PCL markers stop.
 // On API change: Flush(FLUSH_ALL) before re-evaluating path.
+//
+// This module selects only the source route. The scheduler maps it to
+// PacingRoute and PacingPipeline_Resolve (pacing_resolver.h) derives the
+// source placement (marker or Present) and the output rung from it; the
+// PresentBased route resolves to Present placement with H0.
 
 enum class EnforcementPath : uint8_t {
     None,
-    NvAPIMarkers,    // DX12 + NvAPI latency markers
+    NvAPIMarkers,    // DX12/DX11 + NvAPI latency markers
     PCLMarkers,      // Vulkan + Streamline PCL markers
-    PresentBased     // Vulkan fallback, DX11
+    PresentBased     // DX9, DX11/DX12 without Reflex, Vulkan without PCL, OpenGL
 };
 
 // Called by Swapchain_Manager when API or marker state changes.

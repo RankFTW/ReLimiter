@@ -2,6 +2,7 @@
 #include "display_state.h"
 #include "display_resolver.h"
 #include "streamline_hooks.h"
+#include "fg_divisor.h"
 #include <atomic>
 
 static SRWLOCK s_control_lock = SRWLOCK_INIT;
@@ -67,19 +68,6 @@ static bool SetAdaptiveSyncData(
     __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-// ComputeFGDivisorRaw from streamline_hooks state
-static int ComputeFGDivisorRaw() {
-    bool presenting = g_fg_presenting.load(std::memory_order_relaxed);
-    int mult = g_fg_multiplier.load(std::memory_order_relaxed);
-    if (presenting && mult > 0) {
-        int actual = g_fg_actual_multiplier.load(std::memory_order_relaxed);
-        if (actual >= 2)
-            return actual;
-        return mult + 1;
-    }
-    return 1;
-}
-
 // Caller holds s_control_lock. Failure retains the target for final cleanup.
 static bool RestoreOverride() noexcept {
     if (s_override_display_id == 0) return true;
@@ -111,7 +99,8 @@ bool ManageFrameSplitting() {
     EnsureResolved();
     const NvU32 display_id = DispRes_GetDisplayID();
     const bool disable = display_id != 0 &&
-        g_gsync_active.load(std::memory_order_relaxed) && ComputeFGDivisorRaw() > 1;
+        g_gsync_active.load(std::memory_order_relaxed) &&
+        g_resolved_fg_divisor.load(std::memory_order_relaxed) > 1;
 
     if (s_override_display_id != 0 &&
         (!disable || s_override_display_id != display_id)) {

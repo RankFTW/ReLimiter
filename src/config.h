@@ -1,13 +1,24 @@
 #pragma once
 
+#include "pacing_resolver.h"
+
 #include <Windows.h>
 #include <cstdint>
 #include <string>
 
 // INI configuration — live fields only.
-// Loaded in DllMain, exposed as a global struct.
+// Loaded in AddonInit outside loader lock, exposed as a global struct.
 
 struct Config {
+    // Pacing pipeline (phase2_timing_core_design.md section 4)
+    PacingSmoothing smoothing = PacingSmoothing::On;              // developer: on | off (always on for users)
+    PacingRungOverride output_rung = PacingRungOverride::Auto;    // developer: auto | source | marker | native | gpu
+    double stall_inject_ms = 0.0;                                 // developer: 0 = off, 0–200
+    double stall_inject_period_s = kPacingStallInjectDefaultPeriodS; // developer: 1–60
+    bool advanced_settings = false;
+    // INI-only: shows Advanced → Developer diagnostics (the A/B and test keys
+    // below marked developer). Normal users never need them.
+    bool developer_settings = false;
     // Core
     int target_fps = 0;                     // 0 = stay below VRR ceiling
     std::string enforcement_marker = "SimulationStart";
@@ -38,6 +49,7 @@ struct Config {
     bool osd_show_pqi_breakdown = false;
     bool osd_show_1pct_low = false;
     bool osd_show_smoothness = false;
+    bool osd_show_pacing_quality = false; // measured display pacing (ETW or DXGI display timing)
 
     // OSD appearance
     float osd_scale = 1.0f;                // 0.5 – 2.0 (50% – 200%)
@@ -67,6 +79,17 @@ struct Config {
 
     // Native NVIDIA PC Latency collection
     bool native_pcl_enabled = false;
+    // Pacing diagnostics (x64). Change one at a time for A/B captures.
+    bool gpu_present_gate_probes = true;              // developer: GPU queue-wait pre/post timestamp bracket
+    double gpu_wait_budget_us = kPacingGpuWaitBudgetDefaultUs; // developer: GPU wait cap ladder top level, 500–5000 µs
+    double gpu_wait_interleave_s = 0.0; // developer: held / not-held A/B blocks of the Auto GPU queue wait; 0 = off, 1–10 s
+    // Skip the driver's Reflex Sleep while a cap is set; ReLimiter's own
+    // pre-Sleep wait paces instead (default on since 2026-10-09: CONTROL FG
+    // 2× 10× fewer long frames at the same PC latency, Rogue Core neutral).
+    bool reflex_sleep_bypass = true; // developer
+    PacingMarkerForwardOrder marker_forward_order = PacingMarkerForwardOrder::BeforeWait; // developer: before_wait | after_wait
+    PacingRenderQueue gpu_queue_wait_render_queue = PacingRenderQueue::Keep; // developer A/B: keep | remove | remove_held
+    PacingPlacementOverride source_placement = PacingPlacementOverride::PreSleep; // developer: marker | pre_sleep | driver (P4-11, R15; pre_sleep default since 2026-10-09)
 
     // Reflex Injection
     bool reflex_inject = false;         // Synthesize Reflex markers for non-Reflex games
@@ -80,22 +103,16 @@ struct Config {
     // Dynamic MFG Passthrough — disable pacing when DLSS 4.5 Dynamic MFG is active
     bool dynamic_mfg_passthrough = false;
 
-    // DMFG Output Cap — target output FPS when DMFG is active (0 = no cap)
-    int dmfg_output_cap = 0;
+    // Adaptive cap: the period governor (C2) stretches the cap interval
+    // continuously (VRR) or in whole refreshes (fixed refresh) when stage
+    // demand or missed frames show the cap cannot be held (P4-1). Migrates
+    // the legacy Frame-Time Adaptation switch.
+    bool adaptive_cap = false;
+    // Adaptive cap percentile [50, 99]: the share of recent frames the
+    // lengthened interval must fit (R11). Separate from Smoothing.
+    int adaptive_cap_percentile = kAdaptiveCapPercentileDefault;
 
-    // Frame-Time Adaptation (legacy INI key names)
-    bool   adaptive_smoothing = false;           // Adapt interval from unique keyed CPU/GPU service reports
-    double smoothing_percentile = 0.99;         // Target percentile (0.90–0.999)
-    std::string smoothing_window = "medium";    // "medium" (256 frames) | "dual" (64+512)
-    double smoothing_release_speed = 1.0;       // Downward release-rate multiplier (0.25–4.0)
-    double smoothing_bias_us = 0.0;             // Constant bias added to computed offset (0–1000µs)
-    std::string adaptive_deadline_reserve_mode = "shadow"; // shadow | active
-
-    // Experimental arrival-lead predictor (Estimator A)
-    std::string estimator_a_mode = "off";       // off | shadow | active
-    double estimator_a_fixed_reserve_us = 1800.0;
-
-    // OSD: Frame-Time Adaptation
+    // OSD: Adaptive cap HUD line (historical key name)
     bool osd_show_adaptive_smoothing = false;
 
     // OSD: Hardware monitoring
@@ -168,6 +185,7 @@ struct OSDPreset {
     bool show_pqi_breakdown = false;
     bool show_1pct_low = false;
     bool show_smoothness = false;
+    bool show_pacing_quality = false;
     bool show_adaptive_smoothing = false;
     bool show_0_1pct_low = false;
     bool show_gpu_render_time = false;
@@ -196,14 +214,16 @@ void OSDPreset_ApplyToConfig(const OSDPreset& p);
 // Apply only the element toggles from a preset (leaves position/scale/opacity unchanged).
 void OSDPreset_ApplyTogglesOnly(const OSDPreset& p);
 
-// Load/save user presets from/to INI.
+// Load is synchronous (init/explicit reload only, drains queued writes).
+// Save snapshots all slots on the UI thread and queues disk persistence.
 void OSDPreset_LoadAll();
 void OSDPreset_SaveSlot(int slot);
 
 // Access user preset slots (0-based index).
 OSDPreset& OSDPreset_GetSlot(int slot);
 
-// Delete a user preset slot (clears from memory and INI).
+// Delete/compact a slot immediately in UI-owned memory; queue the complete
+// preset image including empty trailing sections for asynchronous persistence.
 void OSDPreset_DeleteSlot(int slot);
 
 // Get current number of preset slots.
@@ -215,14 +235,51 @@ int OSDPreset_AddSlot();
 // Returns true if no INI file existed before LoadConfig ran (first launch).
 bool Config_IsFirstLaunch();
 
-// Load config from INI file next to the DLL.
+// Load/apply config, resolve storage paths and start the dedicated save worker.
+// AddonInit only, outside loader lock and before publishing callbacks.
 void LoadConfig(HMODULE hModule);
 
 // Validate and clamp all config values to safe ranges.
 void ValidateConfig();
 
-// Save config back to INI.
+// Synchronous save for initialization/explicit quiescent callers only. Drains
+// older requests first; never call from render callbacks. No-op after stopping.
 void SaveConfig();
+
+// UI-thread snapshot of live Config; bounded latest-value mailbox, no disk I/O
+// or thread creation. Caller must own live config/slots (not concurrent mutation).
+// Also use for OSD setting changes unrelated to overlay appearance (e.g. CSV).
+void RequestSaveConfig();
+
+// Lifecycle/explicit reload only: wait for queued settings and presets.
+// Requires serialized lifecycle calls and quiesced config/slot producers.
+// Before stopping this may synchronously retry I/O, without a timeout. After
+// stopping it only reports whether the mailboxes are drained; never performs I/O.
+bool Config_FlushPending();
+
+// After callback AND background-producer rundown, before Log_Shutdown, in BOTH
+// AddonUninit and initialization rollback. For the final settings save use
+// RequestSaveConfig(); Config_Shutdown() rather than blocking SaveConfig().
+// Signals stop, drains the latest mailbox on the worker with at most one final
+// failed-only retry, and joins. Never call from DllMain/loader lock.
+// False means retain module/logger and do not restart config initialization.
+// Safe to retry a timed-out join. Persistent failures remain retained (false),
+// including pending requests after worker-creation failure. There is NO caller
+// disk I/O fallback; timeout_ms bounds waiting for worker I/O and final retries.
+bool Config_Shutdown(DWORD timeout_ms = 5000);
 
 // Apply loaded config values to module globals.
 void ApplyConfig();
+
+// Apply only the pacing pipeline fields (smoothing, adaptive_cap, output_rung,
+// source_placement, gpu_present_gate_probes, stall injector,
+// marker_forward_order, reflex_sleep_bypass) to the resolver (which carries
+// adaptive_cap to the period governor) and the NvAPI hooks. Part of
+// ApplyConfig; the OSD calls it after editing those fields.
+void Config_ApplyPacingPipeline();
+
+// Developer diagnostics (developer_settings): how many of their keys differ
+// from the recommended defaults (the OSD warns while any does), and a reset
+// of all of them to those defaults, applied at once. The caller saves.
+int Config_DeveloperOverrides();
+void Config_ResetDeveloperSettings();

@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Inspect pacing-capture format, schema, continuity, and column availability."""
+"""Inspect joined pacing and FrameView captures: format, schema, continuity and availability.
+
+Recognized streams: joined pacing rows (relimiter_pacing_*), pacing events
+(relimiter_pacing_events_*) and NVIDIA FrameView CSV. Files of the seven legacy
+ReLimiter families removed in Phase 1 are reported as legacy and their rows are
+not parsed; the analysis scripts for those families remain in version control.
+Inspection identifies formats and integrity risks; it does not prove semantic
+comparability.
+"""
 
 from __future__ import annotations
 
@@ -11,127 +19,170 @@ import math
 import statistics
 from collections import Counter
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 
-CURRENT_SCHEDULER_HEADER = [
-    "frame_id", "timestamp_us", "predicted_us", "effective_interval_us",
-    "actual_frame_time_us", "sleep_duration_us", "wake_error_us",
-    "ceiling_margin_us", "stress_level", "cv", "damping_correction_us",
-    "tier", "overload", "fg_divisor", "mode", "scanout_error_us",
-    "queue_depth", "api", "pqi", "cadence_score", "stutter_score",
-    "deadline_score", "jitter_us", "own_sleep_us", "driver_sleep_us",
-    "gate_sleep_us", "deadline_drift_us", "predictor_warm", "smoothness_us",
-    "reflex_injected", "present_interval_us", "present_cadence_smoothness_us",
-    "present_bias_us", "feedback_rate", "feedback_alpha",
-    "reflex_present_to_gpu_end_us", "reflex_queue_trend_us",
-    "reflex_present_duration_us", "reflex_gpu_active_us",
-    "reflex_ai_frame_time_us", "reflex_cpu_latency_us", "gate_margin_us",
-    "smoothing_offset_us", "p99_render_time_us", "total_frame_cost_us",
-    "adaptation_sample_sequence", "adaptation_frame_time_us",
-    "adaptation_producer_epoch", "adaptation_nvapi_frame_id",
-    "adaptation_cpu_active_us", "adaptation_gpu_service_us",
-    "adaptation_owned_cpu_stage_us", "adaptation_owned_gate_hold_us",
+# ── Pacing schema (PACING_ROW_COLUMNS and PACING_EVENT_COLUMNS in src/csv_writer.cpp) ──
+
+# The first 47 row names (36 raw, 11 derived) are fixed by project-docs/
+# 002_unified_pacing_timing/phase0_measurement_design.md section 5. Both
+# families are append-only after them.
+PACING_FIXED_RAW_HEADER = [
+    "row_kind", "sequence", "capture_epoch", "qpc_frequency",
+    "observer_epoch", "native_swapchain", "thread_id", "present_start_qpc",
+    "display_qpc", "display_index", "display_count", "frame_type",
+    "frame_classification", "final_state", "loss_window", "pcl_frame_id",
+    "join_rule", "late_display",
+    "identity_domain", "producer_epoch", "frame_id", "source_flags",
+    "source_release_qpc", "interval_us", "fg_divisor",
+    "p_qpc", "e_qpc", "output_kind", "output_target_qpc", "output_arrival_qpc",
+    "output_release_qpc", "gpu_ticket",
+    "gate_signal_before_qpc", "gate_fg", "ready_gpu_qpc", "ready_before_gate",
 ]
-HISTORICAL_SCHEDULER_HEADER_47 = CURRENT_SCHEDULER_HEADER[:47]
-
-CURRENT_NATIVE_PCL_HEADER = [
-    "pcl_frame_id", "present_start_qpc", "display_qpc", "sample_qpc",
-    "sample_age_us", "i2fs_us", "fs2p_us", "p2d_us", "total_us",
-    "dropped_accumulation_us", "dropped_frame_count", "status",
-    "lost_present_count", "etw_events_lost", "etw_buffers_lost",
-    "overflowed_present_count", "qpc_frequency", "pcl_sim_start_qpc", "pcl_sim_end_qpc",
-    "pcl_render_submit_start_qpc", "pcl_render_submit_end_qpc",
-    "pcl_present_start_qpc", "pcl_present_end_qpc", "effective_sim_start_qpc",
-    "previous_pcl_frame_id", "pcl_frame_id_delta", "previous_pcl_sim_start_qpc",
-    "pcl_sim_start_delta_us", "provider_present_to_dxgi_present_us",
-    "frame_type", "used_simulation_fallback",
+PACING_FIXED_DERIVED_HEADER = [
+    "target_output_interval_us", "display_change", "chain_break",
+    "display_interval_us", "adjacent_jitter_us", "deviation_us", "real_frame",
+    "animation_error_us", "latency_us", "gpu_residence_us", "cpu_hold_us",
 ]
-
-CURRENT_FRAME_TIMELINE_HEADER = [
-    "sequence", "capture_epoch", "event_type", "path", "identity_domain",
-    "producer_epoch", "controller_generation", "frame_id", "clock_domain",
-    "qpc_frequency", "event_qpc", "capture_qpc", "target_qpc",
-    "forwarding_order", "flags", "legacy_target_qpc", "estimator_target_qpc",
-    "estimator_predicted_a_us", "estimator_reserve_us",
-    "estimator_sample_count", "estimator_stable_frame_count",
-    "estimator_regime", "estimator_marker", "estimator_fallback_reason",
-    "estimator_mode", "estimator_active", "adaptation_workload_offset_us",
-    "adaptation_configured_reserve_us", "adaptive_reserve_proposed_us",
-    "adaptive_reserve_slack_us", "adaptive_reserve_required_us",
-    "adaptive_reserve_miss_ema",
-    "adaptive_reserve_applied_us", "adaptive_reserve_mode",
-    "adaptive_reserve_authority", "adaptive_reserve_fallback_reason",
-    "adaptive_reserve_sample_count", "adaptive_reserve_active_capped",
-]
-HISTORICAL_FRAME_TIMELINE_HEADER_26 = CURRENT_FRAME_TIMELINE_HEADER[:26]
-HISTORICAL_FRAME_TIMELINE_HEADER_32 = CURRENT_FRAME_TIMELINE_HEADER[:32]
-
-CURRENT_PRESENT_TIMELINE_HEADER = [
-    "span_sequence", "event_type", "capture_epoch", "swapchain_generation",
-    "present_sequence", "api_call_sequence", "attempt_index", "api",
-    "entry_point", "native_swapchain", "thread_id", "sync_interval",
-    "present_flags", "event_qpc", "p_qpc", "e_qpc", "duration_qpc",
-    "result_domain", "result_code", "qpc_frequency", "dropped_span_count",
-    "stale_span_count", "invalid_span_count", "unregistered_call_count",
-    "identity_failure_count", "registry_overflow_count",
-]
-
-CURRENT_PRESENT_ASSOCIATION_HEADER = [
-    "observation_sequence", "event_type", "capture_epoch", "observer_epoch",
-    "runtime", "native_swapchain", "thread_id", "present_start_qpc",
-    "present_end_qpc", "report_qpc", "qpc_frequency", "final_state",
-    "displayed_instance_count", "reported_frame_type", "frame_classification",
-    "classification_evidence", "pcl_frame_id", "pcl_sim_start_qpc",
-    "used_simulation_fallback", "match_status", "candidate_count",
-    "matched_capture_epoch", "matched_span_sequence",
-    "matched_swapchain_generation", "matched_present_sequence",
-    "matched_api_call_sequence", "matched_attempt_index", "matched_api",
-    "matched_entry_point", "matched_p_qpc", "matched_e_qpc", "report_age_us",
-    "dropped_observation_count", "retention_age_evictions",
-    "retention_capacity_evictions", "unique_association_count",
-    "not_found_association_count", "ambiguous_association_count",
-    "incompatible_observation_count",
-    "gpu_start_qpc", "gpu_ready_qpc", "gpu_duration_qpc",
+CURRENT_PACING_HEADER = PACING_FIXED_RAW_HEADER + PACING_FIXED_DERIVED_HEADER + [
+    "long_frame", "short_frame", "chain_break_reason", "present_candidates",
+    "present_end_qpc", "etw_ready_qpc", "pcl_sim_start_qpc", "pcl_present_start_qpc",
+    "presentation_mode", "supports_tearing", "display_sync_interval",
+    "display_present_flags", "flip_delay_qpc", "display_report_qpc",
+    "controller_generation", "trigger", "marker", "regime", "source_marker_qpc",
+    "wake_target_qpc", "target_fps",
+    "present_native_swapchain", "present_thread_id", "sync_interval", "present_flags",
+    "present_result", "present_identity_domain", "present_producer_epoch",
+    "present_frame_id", "present_marker_qpc", "swapchain_generation",
+    "present_sequence", "present_gate_status",
+    "gate_ticket", "gate_status", "gate_native_queue", "gate_target_qpc",
+    "gate_signal_after_qpc", "gate_post_wait_qpc", "gate_swapchain_generation",
+    "gate_present_sequence",
+    "ready_valid", "ready_submit_qpc", "ready_swapchain_generation", "ready_present_sequence",
+    "reflex_report_qpc", "reflex_sim_start_us", "reflex_sim_end_us",
+    "reflex_render_submit_start_us", "reflex_render_submit_end_us",
+    "reflex_present_start_us", "reflex_present_end_us", "reflex_driver_start_us",
+    "reflex_driver_end_us", "reflex_os_render_queue_start_us",
+    "reflex_os_render_queue_end_us", "reflex_gpu_render_start_us",
+    "reflex_gpu_render_end_us", "reflex_gpu_active_render_us",
+    "reflex_gpu_frame_time_us", "reflex_ai_frame_time_us",
+    "reflex_local_present_start_qpc", "clock_map_status", "clock_map_offset_us",
+    # Phase 1: Source prediction and the display instance's PC Latency
+    "predicted_render_us", "pcl_status", "pcl_input_ping_qpc", "pcl_effective_sim_start_qpc",
+    "pcl_i2fs_us", "pcl_fs2p_us", "pcl_p2d_us", "pcl_total_us",
+    "pcl_dropped_accumulation_us", "pcl_dropped_frame_count", "pcl_simulation_fallback",
+    # Phase 2: frame plan of the joined Source record, the output executor's
+    # plan status and the display source (1 ETW, 2 DXGI)
+    "grid_epoch", "grid_index", "plan_output_target_qpc", "plan_lead_us", "plan_rung",
+    "plan_status", "display_source",
+    # Phase 3: period governor step and I_k (empty when the governor did not
+    # run) and plan_signal_advance_us, reserved since Q15 (always 0)
+    "governor_step", "governor_interval_us", "plan_signal_advance_us",
+    # Q16: pre-Wait GPU time of the GPU queue wait mapped to QPC (empty when unknown)
+    "gate_pre_wait_qpc",
+    # Phase 4: source placement of the joined Source record (PacingSourcePlacement)
+    # and its pre-Sleep wait end and margin (empty when none)
+    "source_placement", "pre_sleep_end_qpc", "pre_sleep_margin_us",
+    # 2026-10-08: starts of the source wait (ends at source_release_qpc, less any
+    # injected stall) and of the pre-Sleep wait (ends at pre_sleep_end_qpc), empty
+    # when none: they rebuild the gated holds of lockstep engines
+    "source_wait_start_qpc", "pre_sleep_start_qpc",
 ]
 
-CURRENT_GPU_OBSERVATION_HEADER = [
-    "observation_sequence", "capture_epoch", "producer_epoch",
-    "nvapi_frame_id", "report_qpc", "qpc_frequency", "sim_start_qpc",
-    "sim_end_qpc", "render_submit_start_qpc", "render_submit_end_qpc",
-    "present_start_qpc", "present_end_qpc", "driver_start_qpc",
-    "driver_end_qpc", "os_render_queue_start_qpc", "os_render_queue_end_qpc",
-    "gpu_render_start_qpc", "gpu_render_end_qpc",
-    "gpu_active_render_time_us", "gpu_frame_time_us", "ai_frame_time_us",
-    "dropped_observation_count",
+CURRENT_PACING_EVENTS_HEADER = [
+    "sequence", "capture_epoch", "event_type", "event_qpc", "qpc_frequency",
+    "identity_domain", "previous_value", "value", "native_swapchain",
+    "clock_map_offset_us",
+    "source_drops", "present_drops", "gate_drops", "ready_drops", "reflex_drops",
+    "display_drops", "csv_row_drops", "csv_event_drops",
+    "display_samples", "join_rule_present_attribution", "join_rule_pcl_frame_id",
+    "join_rule_none", "present_unique", "present_ambiguous", "present_not_found",
+    "clock_mismatches", "source_missing", "gate_joined", "ready_joined",
+    "reflex_joined", "unjoined_presents", "late_display_joins",
+    "unjoined_present_drops", "pending_display_forced", "pending_display_drops",
+    "invalid_records", "present_capacity_evictions", "source_capacity_evictions",
+    "gate_capacity_evictions", "ready_capacity_evictions", "reflex_capacity_evictions",
+    "display_changes", "display_intervals", "observer_epoch_breaks",
+    "loss_window_breaks", "out_of_order_breaks", "gap_breaks", "real_frames",
+    "animation_samples", "chain_replacements",
+    # Snapshot rows (one per OSD snapshot publication)
+    "snapshot_sequence", "window_first_row_sequence", "window_last_row_sequence",
+    "snapshot_display_source", "snapshot_loss_window", "snapshot_target_output_interval_us",
+    "window_display_changes",
+    "window_display_interval_count", "window_display_interval_p50_us", "window_display_interval_p99_us",
+    "window_adjacent_jitter_count", "window_adjacent_jitter_p50_us", "window_adjacent_jitter_p99_us",
+    "window_abs_deviation_count", "window_abs_deviation_p50_us", "window_abs_deviation_p99_us",
+    "window_abs_animation_error_count", "window_abs_animation_error_p50_us",
+    "window_abs_animation_error_p99_us",
+    "window_latency_count", "window_latency_p50_us", "window_latency_p99_us",
+    "window_gpu_residence_count", "window_gpu_residence_p50_us", "window_gpu_residence_p99_us",
+    "window_cpu_hold_count", "window_cpu_hold_p50_us", "window_cpu_hold_p99_us",
+    "window_long_frames", "window_short_frames", "snapshot_dropped_records",
+    # Phase 1: cumulative ETW loss counters (capture_start, capture_end and queue_drops rows)
+    "etw_events_lost", "etw_buffers_lost", "lost_present_count", "overflowed_present_count",
+    # Phase 2: grid_epoch (PacingEpochReason) and pipeline_change (PacingFallbackReason) rows;
+    # Phase 3: governor_step (GovernorCause), rung_feasibility (FeasibilityCause) and gpu_wait_cap
+    # (GpuWaitCapCause) rows
+    "reason",
 ]
 
-MISSING_VALUES = {"", "na", "n/a", "nan", "null", "none"}
+# Earlier files carry a prefix of the current header of these lengths. The
+# events header did not change in Phase 3 or 4 (new event kinds only), so a
+# Phase 2 events file is current-source-86.
+HISTORICAL_PACING_HEADER_LENGTHS = (136, 133, 132, 129, 122, 111)  # Phase 4 before the wait starts;
+                                                                   # Phase 3 (Q16); Phase 3 before Q16;
+                                                                   # Phase 2; Phase 1; Phase 0
+HISTORICAL_PACING_EVENTS_HEADER_LENGTHS = (85, 81, 50)  # Phase 1; Phase 0; before snapshot rows
+
+
+# ── Stream recognition ──
+
+# File-name prefixes. The events prefix also starts with the rows prefix, so
+# it must be tested first.
+PACING_EVENTS_FILE_PREFIX = "relimiter_pacing_events_"
+PACING_FILE_PREFIX = "relimiter_pacing_"
+PACING_KINDS = frozenset({"relimiter_pacing", "relimiter_pacing_events"})
+
+# Header columns that identify each recognized stream; neither pacing set
+# occurs in the other family.
+PACING_EVENTS_SIGNATURE = frozenset({"event_type", "event_qpc", "join_rule_present_attribution",
+                                     "chain_replacements"})
+PACING_ROWS_SIGNATURE = frozenset({"row_kind", "join_rule", "display_qpc", "source_release_qpc",
+                                   "output_kind"})
+FRAMEVIEW_SIGNATURE = frozenset({"Application", "TimeInSeconds", "MsBetweenPresents",
+                                 "MsBetweenDisplayChange"})
+
+# Families removed in Phase 1, identified by their original file names (the
+# archiver never renames). Their rows are never parsed.
+LEGACY_FILE_PREFIXES = (
+    "relimiter_frames_", "relimiter_pcl_", "relimiter_timeline_", "relimiter_presents_",
+    "relimiter_present_associations_", "relimiter_provenance_", "relimiter_gpu_observations_",
+)
+
+
+# ── Inspection policy per stream ──
+
+# Pacing sequences are contiguous within a file except CSV ring drops;
+# FrameView identities are checked for duplicates and order only.
+IDENTITY_COLUMNS = {
+    "relimiter_pacing": "sequence",
+    "relimiter_pacing_events": "sequence",
+    "frameview": "FlipToken",
+}
+CONTIGUOUS_IDENTITY_KINDS = PACING_KINDS
+# Rows the CSV writer adds to the events file carry no event sequence.
+UNSEQUENCED_EVENT_TYPES = frozenset({"capture_start", "capture_end"})
+# Pacing files are in telemetry-worker processing order, not time order
+# (unjoined Present rows are emitted later), so only FrameView time is checked.
+TIMESTAMP_COLUMNS = {"frameview": "TimeInSeconds"}
 
 METRIC_COLUMNS = {
-    "relimiter_scheduler": [
-        "actual_frame_time_us", "effective_interval_us", "present_interval_us",
-        "own_sleep_us", "gate_sleep_us", "wake_error_us", "deadline_drift_us",
-        "pqi", "reflex_gpu_active_us", "reflex_ai_frame_time_us",
-        "smoothing_offset_us", "p99_render_time_us", "total_frame_cost_us",
-        "adaptation_sample_sequence", "adaptation_frame_time_us",
-        "adaptation_cpu_active_us", "adaptation_gpu_service_us",
-        "adaptation_owned_cpu_stage_us", "adaptation_owned_gate_hold_us",
-    ],
-    "relimiter_native_pcl": [
-        "sample_age_us", "i2fs_us", "fs2p_us", "p2d_us", "total_us",
-        "dropped_accumulation_us", "provider_present_to_dxgi_present_us",
-    ],
-    "relimiter_present_timeline": ["duration_qpc"],
-    "relimiter_present_association": ["report_age_us"],
-    "relimiter_gpu_observation": [
-        "gpu_active_render_time_us", "gpu_frame_time_us", "ai_frame_time_us",
-    ],
-    "relimiter_frame_timeline": [
-        "adaptation_workload_offset_us", "adaptation_configured_reserve_us",
-        "adaptive_reserve_proposed_us", "adaptive_reserve_slack_us",
-        "adaptive_reserve_required_us", "adaptive_reserve_miss_ema",
-        "adaptive_reserve_applied_us", "adaptive_reserve_sample_count",
+    "relimiter_pacing": [
+        "target_output_interval_us", "display_interval_us", "adjacent_jitter_us",
+        "deviation_us", "animation_error_us", "latency_us", "gpu_residence_us",
+        "cpu_hold_us", "predicted_render_us", "pcl_i2fs_us", "pcl_fs2p_us",
+        "pcl_p2d_us", "pcl_total_us", "pcl_dropped_accumulation_us", "plan_lead_us",
+        "governor_interval_us", "plan_signal_advance_us", "pre_sleep_margin_us",
     ],
     "frameview": [
         "MsBetweenSimulationStart", "MsBetweenPresents", "MsBetweenDisplayChange",
@@ -141,41 +192,22 @@ METRIC_COLUMNS = {
 }
 
 TRANSITION_COLUMNS = {
-    "relimiter_scheduler": [
-        "effective_interval_us", "fg_divisor", "api", "mode", "tier",
-        "overload", "predictor_warm", "reflex_injected",
-    ],
-    "relimiter_native_pcl": [
-        "status", "frame_type", "used_simulation_fallback",
-        "lost_present_count", "etw_events_lost", "etw_buffers_lost",
-        "overflowed_present_count",
-    ],
-    "relimiter_gpu_observation": [
-        "capture_epoch", "producer_epoch", "dropped_observation_count",
-    ],
-    "relimiter_frame_timeline": [
-        "capture_epoch", "event_type", "path", "identity_domain", "producer_epoch",
-        "controller_generation", "forwarding_order", "estimator_regime",
-        "estimator_marker", "estimator_fallback_reason", "estimator_mode",
-        "estimator_active", "adaptive_reserve_mode",
-        "adaptive_reserve_authority", "adaptive_reserve_fallback_reason",
-        "adaptive_reserve_active_capped",
-    ],
-    "relimiter_present_timeline": [
-        "event_type", "capture_epoch", "swapchain_generation", "api",
-        "entry_point", "thread_id", "attempt_index",
-    ],
-    "relimiter_present_association": [
-        "event_type", "capture_epoch", "observer_epoch", "runtime",
-        "native_swapchain", "thread_id", "final_state", "reported_frame_type",
-        "frame_classification", "classification_evidence", "match_status",
-    ],
     "frameview": [
         "Application", "ProcessID", "SwapChainAddress", "Runtime", "PresentMode",
         "Dropped", "Frame Gen Multiplier",
     ],
 }
 
+GAP_WARNINGS = {
+    "relimiter_pacing": "{count} row-sequence gaps (CSV ring drops) were observed; do not bridge them "
+                        "for adjacency metrics.",
+    "relimiter_pacing_events": "{count} event-sequence gaps (event ring drops) were observed.",
+}
+
+MISSING_VALUES = {"", "na", "n/a", "nan", "null", "none"}
+
+
+# ── Cell parsing ──
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -217,672 +249,308 @@ def parse_int(value: Any) -> int | None:
     return int(number)
 
 
-def detect_kind(header: list[str]) -> str:
-    columns = set(header)
-    if {"frame_id", "timestamp_us", "actual_frame_time_us"} <= columns:
-        return "relimiter_scheduler"
-    if {"pcl_frame_id", "present_start_qpc", "display_qpc", "status"} <= columns:
-        return "relimiter_native_pcl"
-    if {"sequence", "event_type", "identity_domain", "producer_epoch", "event_qpc"} <= columns:
-        return "relimiter_frame_timeline"
-    if {"observation_sequence", "nvapi_frame_id", "report_qpc",
-        "gpu_render_start_qpc", "gpu_active_render_time_us"} <= columns:
-        return "relimiter_gpu_observation"
-    if {"observation_sequence", "observer_epoch", "match_status", "candidate_count", "matched_present_sequence"} <= columns:
-        return "relimiter_present_association"
-    if {"span_sequence", "event_type", "swapchain_generation", "present_sequence", "p_qpc", "e_qpc"} <= columns:
-        return "relimiter_present_timeline"
-    if {"Application", "TimeInSeconds", "MsBetweenPresents", "MsBetweenDisplayChange"} <= columns:
-        return "frameview"
-    return "unknown"
-
-
-def schema_profile(kind: str, header: list[str]) -> str:
-    if kind == "relimiter_scheduler":
-        if header == CURRENT_SCHEDULER_HEADER:
-            return "current-source-53"
-        if header == HISTORICAL_SCHEDULER_HEADER_47:
-            return "historical-source-47"
-        return "historical-or-unknown"
-    if kind == "relimiter_native_pcl":
-        return "current-source-31" if header == CURRENT_NATIVE_PCL_HEADER else "historical-or-unknown"
-    if kind == "relimiter_frame_timeline":
-        if header == CURRENT_FRAME_TIMELINE_HEADER:
-            return "current-source-38"
-        if header == HISTORICAL_FRAME_TIMELINE_HEADER_32:
-            return "historical-source-32"
-        if header == HISTORICAL_FRAME_TIMELINE_HEADER_26:
-            return "historical-source-26"
-        return "historical-or-unknown"
-    if kind == "relimiter_present_timeline":
-        return "current-source-26" if header == CURRENT_PRESENT_TIMELINE_HEADER else "historical-or-unknown"
-    if kind == "relimiter_present_association":
-        return "current-source-42" if header == CURRENT_PRESENT_ASSOCIATION_HEADER else "historical-or-unknown"
-    if kind == "relimiter_gpu_observation":
-        return "current-source-22" if header == CURRENT_GPU_OBSERVATION_HEADER else "historical-or-unknown"
-    if kind == "frameview":
-        return "frameview-flexible"
-    return "unknown"
-
-
-def normalized_transition_value(column: str, value: Any) -> str:
+def normalized_transition_value(value: Any) -> str:
     number = parse_float(value)
     if number is None:
         return "<missing>" if is_missing(value) else str(value).strip()
-    if column == "fg_divisor":
-        return f"{number:.2f}"
-    if column == "effective_interval_us":
-        return f"{number:.1f}"
     if number.is_integer():
         return str(int(number))
     return f"{number:.6g}"
 
 
-def summarize_capture(path: Path) -> dict[str, Any]:
-    result: dict[str, Any] = {
-        "path": str(path.resolve()),
-        "size_bytes": path.stat().st_size,
-        "sha256": sha256_file(path),
-        "warnings": [],
+# ── Family detection ──
+
+def pacing_family_from_filename(name: str) -> str | None:
+    """Pacing family named by a file-name prefix; None for other files.
+
+    The events prefix is tested before the rows prefix it extends. A process
+    whose name starts with "events_" makes the two prefixes ambiguous, so the
+    header (detect_kind) stays authoritative.
+    """
+    base = Path(name).name
+    if base.startswith(PACING_EVENTS_FILE_PREFIX):
+        return "relimiter_pacing_events"
+    if base.startswith(PACING_FILE_PREFIX):
+        return "relimiter_pacing"
+    return None
+
+
+def legacy_family_from_filename(name: str) -> str | None:
+    """Legacy family (file-name prefix without its trailing underscore); None otherwise."""
+    base = Path(name).name
+    for prefix in LEGACY_FILE_PREFIXES:
+        if base.startswith(prefix):
+            return prefix[:-1]
+    return None
+
+
+def detect_kind(header: list[str]) -> str:
+    columns = set(header)
+    # Pacing events before joined pacing rows, matching the file-name rule.
+    if PACING_EVENTS_SIGNATURE <= columns:
+        return "relimiter_pacing_events"
+    if PACING_ROWS_SIGNATURE <= columns:
+        return "relimiter_pacing"
+    if FRAMEVIEW_SIGNATURE <= columns:
+        return "frameview"
+    return "unknown"
+
+
+def schema_profile(kind: str, header: list[str]) -> str:
+    profiles = {
+        "relimiter_pacing": (CURRENT_PACING_HEADER, HISTORICAL_PACING_HEADER_LENGTHS),
+        "relimiter_pacing_events": (CURRENT_PACING_EVENTS_HEADER, HISTORICAL_PACING_EVENTS_HEADER_LENGTHS),
+    }
+    if kind in profiles:
+        current, historical_lengths = profiles[kind]
+        if header == current:
+            return f"current-source-{len(current)}"
+        for length in historical_lengths:
+            if header == current[:length]:
+                return f"historical-source-{length}"
+        return "historical-or-unknown"
+    if kind == "frameview":
+        return "frameview-flexible"
+    if kind == "legacy":
+        return "legacy"
+    return "unknown"
+
+
+# ── Row scan ──
+
+class _IdentityContinuity:
+    """Missing, duplicate, backward and (for contiguous sequences) gap counts in file order."""
+
+    def __init__(self, count_gaps: bool) -> None:
+        self.count_gaps = count_gaps
+        self.seen: set[int] = set()
+        self.previous: int | None = None
+        self.missing = 0
+        self.duplicates = 0
+        self.backwards = 0
+        self.gaps = 0
+
+    def add(self, identity: int | None) -> None:
+        if identity is None:
+            self.missing += 1
+            return
+        if identity in self.seen:
+            self.duplicates += 1
+        self.seen.add(identity)
+        if self.previous is not None:
+            if identity < self.previous:
+                self.backwards += 1
+            elif self.count_gaps and identity > self.previous + 1:
+                self.gaps += 1
+        self.previous = identity
+
+
+def _cell(record: list[str], position: int | None) -> str | None:
+    if position is None or position >= len(record):
+        return None
+    return record[position]
+
+
+def _timestamp_continuity(column: str | None, timestamps: list[float]) -> dict[str, Any]:
+    nonmonotonic = 0
+    positive_deltas = []
+    for previous, current in zip(timestamps, timestamps[1:]):
+        delta = current - previous
+        if delta < 0:
+            nonmonotonic += 1
+        elif delta > 0:
+            positive_deltas.append(delta)
+    median = statistics.median(positive_deltas) if positive_deltas else None
+    large_gaps = sum(delta > median * 10.0 for delta in positive_deltas) if median else 0
+    return {
+        "timestamp_column": column,
+        "timestamp_valid_count": len(timestamps),
+        "timestamp_nonmonotonic_count": nonmonotonic,
+        "timestamp_median_positive_delta": median,
+        "timestamp_gap_over_10x_median_count": large_gaps,
     }
 
-    with path.open("r", encoding="utf-8-sig", newline="") as stream:
-        reader = csv.DictReader(stream)
-        header = list(reader.fieldnames or [])
-        kind = detect_kind(header)
-        profile = schema_profile(kind, header)
-        result.update({
-            "kind": kind,
-            "schema_profile": profile,
-            "column_count": len(header),
-            "ordered_header_sha256": header_sha256(header),
-            "header": header,
-        })
 
-        metrics = {
-            column: {"valid": 0, "nonzero": 0, "missing_or_invalid": 0}
-            for column in METRIC_COLUMNS.get(kind, []) if column in header
-        }
-        transition_counts = Counter()
-        transition_values = {
-            column: Counter() for column in TRANSITION_COLUMNS.get(kind, []) if column in header
-        }
-        previous_transition_values: dict[str, str] = {}
+def _scan_rows(records: Iterator[list[str]], kind: str, header: list[str]) -> dict[str, Any]:
+    positions = {name: index for index, name in enumerate(header)}
+    id_column = IDENTITY_COLUMNS.get(kind)
+    id_position = positions.get(id_column) if id_column else None
+    timestamp_column = TIMESTAMP_COLUMNS.get(kind)
+    timestamp_position = positions.get(timestamp_column) if timestamp_column else None
+    event_type_position = positions.get("event_type") if kind == "relimiter_pacing_events" else None
+    metrics = {
+        column: {"valid": 0, "nonzero": 0, "missing_or_invalid": 0}
+        for column in METRIC_COLUMNS.get(kind, []) if column in positions
+    }
+    transition_values = {column: Counter() for column in TRANSITION_COLUMNS.get(kind, []) if column in positions}
+    transition_counts: Counter = Counter()
+    previous_values: dict[str, str] = {}
+    identities = _IdentityContinuity(count_gaps=kind in CONTIGUOUS_IDENTITY_KINDS)
+    timestamps: list[float] = []
+    row_count = 0
+    malformed_rows = 0
 
-        if kind == "relimiter_scheduler":
-            timestamp_column, id_column = "timestamp_us", "frame_id"
-        elif kind == "relimiter_native_pcl":
-            timestamp_column, id_column = "sample_qpc", "pcl_frame_id"
-        elif kind == "relimiter_frame_timeline":
-            timestamp_column, id_column = "event_qpc", "sequence"
-        elif kind == "relimiter_present_timeline":
-            timestamp_column, id_column = "event_qpc", None
-        elif kind == "relimiter_present_association":
-            timestamp_column, id_column = "report_qpc", "observation_sequence"
-        elif kind == "relimiter_gpu_observation":
-            timestamp_column, id_column = "report_qpc", "observation_sequence"
-        elif kind == "frameview":
-            timestamp_column, id_column = "TimeInSeconds", "FlipToken"
-        else:
-            timestamp_column = id_column = None
+    for record in records:
+        if not record:
+            continue  # blank line, as csv.DictReader skips it
+        row_count += 1
+        if len(record) != len(header):
+            malformed_rows += 1
+        if timestamp_position is not None:
+            timestamp = parse_float(_cell(record, timestamp_position))
+            if timestamp is not None:
+                timestamps.append(timestamp)
+        if id_position is not None and _cell(record, event_type_position) not in UNSEQUENCED_EVENT_TYPES:
+            identities.add(parse_int(_cell(record, id_position)))
+        for column, counts in metrics.items():
+            value = parse_float(_cell(record, positions[column]))
+            if value is None:
+                counts["missing_or_invalid"] += 1
+            else:
+                counts["valid"] += 1
+                if value != 0.0:
+                    counts["nonzero"] += 1
+        for column, values in transition_values.items():
+            value = normalized_transition_value(_cell(record, positions[column]))
+            values[value] += 1
+            if column in previous_values and previous_values[column] != value:
+                transition_counts[column] += 1
+            previous_values[column] = value
 
-        row_count = 0
-        malformed_rows = 0
-        timestamps: list[float] = []
-        duplicate_ids = 0
-        out_of_order_ids = 0
-        id_gap_events = 0
-        missing_id_count = 0
-        unavailable_fallback_id_count = 0
-        seen_ids: set[int] = set()
-        previous_id: int | None = None
-        present_spans: dict[int, dict[str, Any]] = {}
-        present_keys: dict[tuple[int, int], int] = {}
-        duplicate_present_keys: set[tuple[int, int]] = set()
-        invalid_present_event_timestamps = 0
-        invalid_present_result_rows = 0
-        missing_present_identity_rows = 0
-        api_call_attempts: dict[tuple[int, int, int], set[int]] = {}
-        duplicate_attempt_indices = 0
-        capture_diagnostics: dict[str, list[dict[str, int | None]]] = {
-            "capture_start": [],
-            "capture_end": [],
-        }
-        association_capture_diagnostics: dict[str, list[dict[str, int | None]]] = {
-            "capture_start": [],
-            "capture_end": [],
-        }
-        association_aliases: set[tuple[Any, ...]] = set()
-        duplicate_association_aliases = 0
-        invalid_association_rows = 0
-        invalid_classification_rows = 0
-        association_status_counts = Counter()
+    result = {
+        "row_count": row_count,
+        "malformed_row_count": malformed_rows,
+        "id_column": id_column if id_position is not None else None,
+        "missing_or_invalid_id_count": identities.missing,
+        "duplicate_id_count": identities.duplicates,
+        "out_of_order_id_count": identities.backwards,
+        "id_gap_event_count": identities.gaps,
+        "metric_availability": metrics,
+        "transition_counts": dict(transition_counts),
+        "top_transition_values": {column: values.most_common(8) for column, values in transition_values.items()},
+    }
+    result.update(_timestamp_continuity(timestamp_column if timestamp_position is not None else None,
+                                        timestamps))
+    return result
 
-        for row in reader:
-            row_count += 1
-            if None in row or any(value is None for key, value in row.items() if key is not None):
-                malformed_rows += 1
 
-            if timestamp_column:
-                timestamp = parse_float(row.get(timestamp_column))
-                if timestamp is not None:
-                    timestamps.append(timestamp)
+# ── Warnings ──
 
-            if id_column:
-                identity = parse_int(row.get(id_column))
-                association_diagnostic = (
-                    kind == "relimiter_present_association" and
-                    str(row.get("event_type") or "") in association_capture_diagnostics
-                )
-                unavailable_fallback_identity = (
-                    kind == "relimiter_native_pcl" and
-                    identity == 0 and
-                    parse_int(row.get("used_simulation_fallback")) == 1
-                )
-                if association_diagnostic:
-                    pass
-                elif unavailable_fallback_identity:
-                    unavailable_fallback_id_count += 1
-                elif identity is None:
-                    missing_id_count += 1
-                else:
-                    if identity in seen_ids:
-                        duplicate_ids += 1
-                    seen_ids.add(identity)
-                    if previous_id is not None:
-                        if identity < previous_id:
-                            out_of_order_ids += 1
-                        elif kind != "frameview" and identity > previous_id + 1:
-                            id_gap_events += 1
-                    previous_id = identity
+def _family_warnings(result: dict[str, Any], file_name: str) -> list[str]:
+    kind = result["kind"]
+    warnings = []
+    if kind == "unknown":
+        warnings.append("The header does not match a joined pacing, pacing events or FrameView stream.")
+    named = pacing_family_from_filename(file_name) or legacy_family_from_filename(file_name)
+    if named is not None and named != kind:
+        reason = (" (a process name starting with 'events_' makes the prefixes ambiguous)"
+                  if named in PACING_KINDS and kind in PACING_KINDS else "")
+        warnings.append(f"The file name indicates {named} but the header is {kind}; "
+                        f"the header is authoritative{reason}.")
+    profile = result["schema_profile"]
+    if profile == "historical-or-unknown":
+        warnings.append("The ordered header differs from the bundled current-source profile; "
+                        "verify every field against its producing source revision.")
+    elif profile.startswith("historical-source-"):
+        warnings.append("The header is an earlier append-only schema: columns appended since are absent, "
+                        "not zero.")
+    return warnings
 
-            if kind == "relimiter_present_timeline":
-                span_sequence = parse_int(row.get("span_sequence"))
-                capture_epoch = parse_int(row.get("capture_epoch"))
-                swapchain_generation = parse_int(row.get("swapchain_generation"))
-                present_sequence = parse_int(row.get("present_sequence"))
-                p_qpc = parse_int(row.get("p_qpc"))
-                e_qpc = parse_int(row.get("e_qpc"))
-                duration_qpc = parse_int(row.get("duration_qpc"))
-                event_qpc = parse_int(row.get("event_qpc"))
-                event_type = str(row.get("event_type") or "")
-                if event_type in capture_diagnostics:
-                    capture_diagnostics[event_type].append({
-                        column: parse_int(row.get(column))
-                        for column in (
-                            "capture_epoch", "dropped_span_count", "stale_span_count",
-                            "invalid_span_count", "unregistered_call_count",
-                            "identity_failure_count", "registry_overflow_count",
-                        )
-                    })
-                elif event_type not in {"api_present_start", "api_present_end"}:
-                    invalid_present_event_timestamps += 1
-                elif None in (
-                    span_sequence, capture_epoch, swapchain_generation,
-                    present_sequence, parse_int(row.get("api_call_sequence")),
-                    parse_int(row.get("attempt_index")),
-                    parse_int(row.get("thread_id")),
-                ):
-                    missing_present_identity_rows += 1
 
-                if event_type in {"api_present_start", "api_present_end"} and span_sequence is not None:
-                    span = present_spans.setdefault(
-                        span_sequence,
-                        {"events": Counter(), "metadata": None, "metadata_mismatch": False},
-                    )
-                    span["events"][event_type] += 1
-                    metadata = (
-                        capture_epoch, swapchain_generation, present_sequence,
-                        row.get("api_call_sequence"), row.get("attempt_index"),
-                        row.get("api"), row.get("entry_point"), row.get("native_swapchain"),
-                        row.get("thread_id"), row.get("sync_interval"),
-                        row.get("present_flags"), p_qpc, e_qpc, duration_qpc,
-                    )
-                    if span["metadata"] is None:
-                        span["metadata"] = metadata
-                    elif span["metadata"] != metadata:
-                        span["metadata_mismatch"] = True
-
-                if (
-                    event_type in {"api_present_start", "api_present_end"} and
-                    None not in (swapchain_generation, present_sequence, span_sequence)
-                ):
-                    present_key = (swapchain_generation, present_sequence)
-                    prior_span_sequence = present_keys.setdefault(present_key, span_sequence)
-                    if prior_span_sequence != span_sequence:
-                        duplicate_present_keys.add(present_key)
-
-                if event_type in {"api_present_start", "api_present_end"}:
-                    expected_event_qpc = (
-                        p_qpc if event_type == "api_present_start" else e_qpc
-                    )
-                    if (
-                        p_qpc is None or e_qpc is None or duration_qpc is None or
-                        p_qpc <= 0 or e_qpc < p_qpc or
-                        duration_qpc != e_qpc - p_qpc or
-                        event_qpc != expected_event_qpc
-                    ):
-                        invalid_present_event_timestamps += 1
-
-                    result_domain = str(row.get("result_domain") or "")
-                    result_code = parse_int(row.get("result_code"))
-                    if (
-                        event_type == "api_present_start" and
-                        (result_domain or result_code is not None)
-                    ) or (
-                        event_type == "api_present_end" and
-                        (result_domain != "hresult" or result_code is None or
-                         result_code < 0 or result_code > 0xFFFFFFFF)
-                    ):
-                        invalid_present_result_rows += 1
-
-                    api_call_sequence = parse_int(row.get("api_call_sequence"))
-                    attempt_index = parse_int(row.get("attempt_index"))
-                    if None not in (
-                        swapchain_generation, capture_epoch,
-                        api_call_sequence, attempt_index,
-                    ):
-                        call_key = (
-                            capture_epoch, swapchain_generation, api_call_sequence,
-                        )
-                        attempts = api_call_attempts.setdefault(call_key, set())
-                        if (
-                            event_type == "api_present_start" and
-                            attempt_index in attempts
-                        ):
-                            duplicate_attempt_indices += 1
-                        attempts.add(attempt_index)
-
-            if kind == "relimiter_present_association":
-                event_type = str(row.get("event_type") or "")
-                if event_type in association_capture_diagnostics:
-                    association_capture_diagnostics[event_type].append({
-                        column: parse_int(row.get(column))
-                        for column in (
-                            "capture_epoch", "dropped_observation_count",
-                            "retention_age_evictions",
-                            "retention_capacity_evictions",
-                            "unique_association_count",
-                            "not_found_association_count",
-                            "ambiguous_association_count",
-                            "incompatible_observation_count",
-                        )
-                    })
-                elif event_type != "present_observation":
-                    invalid_association_rows += 1
-                else:
-                    capture_epoch = parse_int(row.get("capture_epoch"))
-                    observer_epoch = parse_int(row.get("observer_epoch"))
-                    native_swapchain = parse_int(row.get("native_swapchain"))
-                    thread_id = parse_int(row.get("thread_id"))
-                    present_start_qpc = parse_int(row.get("present_start_qpc"))
-                    present_end_qpc = parse_int(row.get("present_end_qpc"))
-                    report_qpc = parse_int(row.get("report_qpc"))
-                    qpc_frequency = parse_int(row.get("qpc_frequency"))
-                    candidate_count = parse_int(row.get("candidate_count"))
-                    runtime = str(row.get("runtime") or "")
-                    match_status = str(row.get("match_status") or "")
-                    association_status_counts[match_status] += 1
-
-                    required_values = (
-                        parse_int(row.get("observation_sequence")), capture_epoch,
-                        observer_epoch, native_swapchain, thread_id,
-                        present_start_qpc, present_end_qpc, report_qpc,
-                        qpc_frequency, candidate_count,
-                    )
-                    if (
-                        None in required_values or not runtime or
-                        capture_epoch == 0 or observer_epoch == 0 or
-                        (runtime == "dxgi" and
-                         (native_swapchain == 0 or thread_id == 0)) or
-                        present_start_qpc == 0 or
-                        present_end_qpc is None or
-                        present_end_qpc < present_start_qpc or
-                        report_qpc < present_end_qpc or qpc_frequency == 0
-                    ):
-                        invalid_association_rows += 1
-
-                    alias = (
-                        observer_epoch, runtime, native_swapchain, thread_id,
-                        present_start_qpc, present_end_qpc,
-                    )
-                    if alias in association_aliases:
-                        duplicate_association_aliases += 1
-                    association_aliases.add(alias)
-
-                    evidence = parse_int(row.get("classification_evidence"))
-                    classification = str(row.get("frame_classification") or "")
-                    if evidence is None:
-                        invalid_classification_rows += 1
-                    else:
-                        real_evidence = bool(evidence & ((1 << 0) | (1 << 2)))
-                        generated_evidence = bool(
-                            evidence & ((1 << 1) | (1 << 3) | (1 << 4))
-                        )
-                        expected_classification = (
-                            "conflicting" if real_evidence and generated_evidence else
-                            "real" if real_evidence else
-                            "generated" if generated_evidence else
-                            "unknown"
-                        )
-                        if classification != expected_classification:
-                            invalid_classification_rows += 1
-                        if (
-                            parse_int(row.get("used_simulation_fallback")) == 1 and
-                            not evidence & (1 << 1)
-                        ):
-                            invalid_classification_rows += 1
-
-                    matched_columns = (
-                        "matched_capture_epoch", "matched_span_sequence",
-                        "matched_swapchain_generation", "matched_present_sequence",
-                        "matched_api_call_sequence", "matched_attempt_index",
-                        "matched_p_qpc", "matched_e_qpc",
-                    )
-                    matched_values = {
-                        column: parse_int(row.get(column))
-                        for column in matched_columns
-                    }
-                    if match_status == "unique":
-                        matched_p_qpc = matched_values["matched_p_qpc"]
-                        matched_e_qpc = matched_values["matched_e_qpc"]
-                        report_age_us = parse_float(row.get("report_age_us"))
-                        chronology_values = (
-                            matched_p_qpc, present_start_qpc, present_end_qpc,
-                            matched_e_qpc, report_qpc, qpc_frequency,
-                        )
-                        if (
-                            candidate_count != 1 or
-                            runtime != "dxgi" or
-                            any(value is None for value in matched_values.values()) or
-                            any(value is None for value in chronology_values) or
-                            matched_values["matched_capture_epoch"] != capture_epoch or
-                            not str(row.get("matched_api") or "") or
-                            not str(row.get("matched_entry_point") or "") or
-                            not (
-                                matched_p_qpc <= present_start_qpc <=
-                                present_end_qpc <= matched_e_qpc <= report_qpc
-                            ) or
-                            report_age_us is None or
-                            abs(
-                                report_age_us -
-                                (report_qpc - matched_e_qpc) * 1_000_000.0 /
-                                qpc_frequency
-                            ) > 0.2
-                        ):
-                            invalid_association_rows += 1
-                    else:
-                        allowed_candidate_count = (
-                            candidate_count == 0 if match_status in {
-                                "not_found", "unsupported_runtime",
-                                "clock_mismatch", "invalid_observation",
-                            } else
-                            candidate_count is not None and candidate_count > 1
-                            if match_status == "ambiguous" else False
-                        )
-                        if (
-                            not allowed_candidate_count or
-                            (match_status == "unsupported_runtime" and
-                             runtime == "dxgi") or
-                            any(value is not None for value in matched_values.values()) or
-                            not is_missing(row.get("matched_api")) or
-                            not is_missing(row.get("matched_entry_point")) or
-                            not is_missing(row.get("report_age_us"))
-                        ):
-                            invalid_association_rows += 1
-
-            for column, counts in metrics.items():
-                value = parse_float(row.get(column))
-                if value is None:
-                    counts["missing_or_invalid"] += 1
-                else:
-                    counts["valid"] += 1
-                    if value != 0.0:
-                        counts["nonzero"] += 1
-
-            for column, values in transition_values.items():
-                value = normalized_transition_value(column, row.get(column))
-                values[value] += 1
-                if column in previous_transition_values and previous_transition_values[column] != value:
-                    transition_counts[column] += 1
-                previous_transition_values[column] = value
-
-        nonmonotonic_timestamps = 0
-        large_timestamp_gaps = 0
-        median_timestamp_delta = None
-        positive_deltas = []
-        for previous, current in zip(timestamps, timestamps[1:]):
-            delta = current - previous
-            if delta < 0:
-                nonmonotonic_timestamps += 1
-            elif delta > 0:
-                positive_deltas.append(delta)
-        if positive_deltas:
-            median_timestamp_delta = statistics.median(positive_deltas)
-            if median_timestamp_delta > 0:
-                large_timestamp_gaps = sum(
-                    delta > median_timestamp_delta * 10.0 for delta in positive_deltas
-                )
-
-        result.update({
-            "row_count": row_count,
-            "malformed_row_count": malformed_rows,
-            "timestamp_column": timestamp_column,
-            "timestamp_valid_count": len(timestamps),
-            "timestamp_nonmonotonic_count": nonmonotonic_timestamps,
-            "timestamp_median_positive_delta": median_timestamp_delta,
-            "timestamp_gap_over_10x_median_count": large_timestamp_gaps,
-            "id_column": id_column,
-            "missing_or_invalid_id_count": missing_id_count,
-            "unavailable_fallback_id_count": unavailable_fallback_id_count,
-            "duplicate_id_count": duplicate_ids,
-            "out_of_order_id_count": out_of_order_ids,
-            "id_gap_event_count": id_gap_events,
-            "metric_availability": metrics,
-            "transition_counts": dict(transition_counts),
-            "top_transition_values": {
-                column: values.most_common(8) for column, values in transition_values.items()
-            },
-        })
-
-        if kind == "relimiter_present_timeline":
-            invalid_present_pairs = sum(
-                span["events"] != Counter({
-                    "api_present_start": 1,
-                    "api_present_end": 1,
-                }) or span["metadata_mismatch"]
-                for span in present_spans.values()
-            )
-            distinct_span_sequences = sorted(present_spans)
-            span_sequence_gap_count = sum(
-                current > previous + 1
-                for previous, current in zip(
-                    distinct_span_sequences, distinct_span_sequences[1:]
-                )
-            )
-            start_diagnostics = capture_diagnostics["capture_start"]
-            end_diagnostics = capture_diagnostics["capture_end"]
-            dropped_span_delta = None
-            if start_diagnostics and end_diagnostics:
-                start_dropped = start_diagnostics[0]["dropped_span_count"]
-                end_dropped = end_diagnostics[-1]["dropped_span_count"]
-                if start_dropped is not None and end_dropped is not None:
-                    dropped_span_delta = end_dropped - start_dropped
-            result.update({
-                "present_span_count": len(present_spans),
-                "invalid_present_pair_count": invalid_present_pairs,
-                "duplicate_present_key_count": len(duplicate_present_keys),
-                "invalid_present_event_timestamp_count": invalid_present_event_timestamps,
-                "invalid_present_result_row_count": invalid_present_result_rows,
-                "missing_present_identity_row_count": missing_present_identity_rows,
-                "duplicate_attempt_index_count": duplicate_attempt_indices,
-                "span_sequence_gap_count": span_sequence_gap_count,
-                "capture_start_diagnostic_count": len(start_diagnostics),
-                "capture_end_diagnostic_count": len(end_diagnostics),
-                "capture_reported_dropped_span_delta": dropped_span_delta,
-            })
-        elif kind == "relimiter_present_association":
-            start_diagnostics = association_capture_diagnostics["capture_start"]
-            end_diagnostics = association_capture_diagnostics["capture_end"]
-            dropped_observation_delta = None
-            if start_diagnostics and end_diagnostics:
-                start_dropped = start_diagnostics[0]["dropped_observation_count"]
-                end_dropped = end_diagnostics[-1]["dropped_observation_count"]
-                if start_dropped is not None and end_dropped is not None:
-                    dropped_observation_delta = end_dropped - start_dropped
-            result.update({
-                "present_observation_count": sum(association_status_counts.values()),
-                "association_status_counts": dict(association_status_counts),
-                "duplicate_observation_alias_count": duplicate_association_aliases,
-                "invalid_association_row_count": invalid_association_rows,
-                "invalid_classification_row_count": invalid_classification_rows,
-                "capture_start_diagnostic_count": len(start_diagnostics),
-                "capture_end_diagnostic_count": len(end_diagnostics),
-                "capture_reported_dropped_observation_delta": dropped_observation_delta,
-            })
-
-    warnings: list[str] = result["warnings"]
-    if not result["header"]:
-        warnings.append("No CSV header was detected.")
-    if result["row_count"] == 0:
-        warnings.append("The file is header-only; no telemetry samples are available.")
-    if result["kind"] == "unknown":
-        warnings.append("The header does not match a recognized ReLimiter or FrameView stream.")
-    if result["schema_profile"] == "historical-or-unknown":
-        warnings.append(
-            "The ordered header differs from the bundled current-source profile; verify every field against its producing source revision."
-        )
+def _continuity_warnings(result: dict[str, Any]) -> list[str]:
+    warnings = []
     if result["malformed_row_count"]:
         warnings.append(f"{result['malformed_row_count']} rows have missing or extra CSV fields.")
     if result["timestamp_nonmonotonic_count"]:
-        if result["kind"] == "relimiter_present_timeline":
-            warnings.append(
-                f"{result['timestamp_nonmonotonic_count']} output-order timestamp transitions are non-monotonic; concurrent completed spans may publish out of QPC order."
-            )
-        else:
-            warnings.append(f"{result['timestamp_nonmonotonic_count']} timestamp transitions are non-monotonic.")
+        warnings.append(f"{result['timestamp_nonmonotonic_count']} timestamp transitions are non-monotonic.")
+    if result["timestamp_gap_over_10x_median_count"]:
+        warnings.append(
+            f"{result['timestamp_gap_over_10x_median_count']} timestamp gaps exceed 10x the median positive "
+            "delta; segment before analysis."
+        )
+    if result["missing_or_invalid_id_count"]:
+        warnings.append(f"{result['missing_or_invalid_id_count']} rows lack a valid {result['id_column']}.")
     if result["duplicate_id_count"]:
         warnings.append(f"{result['duplicate_id_count']} duplicate identities were observed.")
     if result["out_of_order_id_count"]:
         warnings.append(f"{result['out_of_order_id_count']} identities moved backwards.")
     if result["id_gap_event_count"]:
-        warnings.append(
-            f"{result['id_gap_event_count']} identity gaps were observed; do not bridge them for adjacency metrics."
-        )
-    if result["unavailable_fallback_id_count"]:
-        warnings.append(
-            f"{result['unavailable_fallback_id_count']} native-PCL rows use simulation fallback without a PCL frame identity; segment them from exact-ID analysis."
-        )
-    if result["timestamp_gap_over_10x_median_count"]:
-        warnings.append(
-            f"{result['timestamp_gap_over_10x_median_count']} timestamp gaps exceed 10x the median positive delta; segment before analysis."
-        )
-    if result["kind"] == "relimiter_scheduler":
-        warnings.append("Scheduler ring loss is not exported and therefore cannot be proven absent.")
-    if result["kind"] == "relimiter_present_timeline":
-        if result["invalid_present_pair_count"]:
-            warnings.append(
-                f"{result['invalid_present_pair_count']} Present spans lack one exact start/end pair or have mismatched immutable metadata."
-            )
-        if result["duplicate_present_key_count"]:
-            warnings.append(
-                f"{result['duplicate_present_key_count']} Present keys map to multiple compact span sequences."
-            )
-        if result["invalid_present_event_timestamp_count"]:
-            warnings.append(
-                f"{result['invalid_present_event_timestamp_count']} Present event rows have invalid P/E chronology, duration, type, or event timestamp."
-            )
-        if result["invalid_present_result_row_count"]:
-            warnings.append(
-                f"{result['invalid_present_result_row_count']} Present rows violate start/end HRESULT field semantics."
-            )
-        if result["missing_present_identity_row_count"]:
-            warnings.append(
-                f"{result['missing_present_identity_row_count']} API Present rows lack required identity fields."
-            )
-        if result["duplicate_attempt_index_count"]:
-            warnings.append(
-                f"{result['duplicate_attempt_index_count']} API-call groups reuse an attempt index."
-            )
-        if result["span_sequence_gap_count"]:
-            warnings.append(
-                f"{result['span_sequence_gap_count']} interior compact-span sequence gaps were observed."
-            )
-        if result["capture_start_diagnostic_count"] != 1 or result["capture_end_diagnostic_count"] != 1:
-            warnings.append(
-                "The Present capture lacks exactly one start and one end diagnostic snapshot; whole-span loss cannot be proven absent."
-            )
-        elif result["capture_reported_dropped_span_delta"]:
-            warnings.append(
-                f"The producer reported {result['capture_reported_dropped_span_delta']} dropped Present spans during this capture."
-            )
-    if result["kind"] == "relimiter_present_association":
-        if result["duplicate_observation_alias_count"]:
-            warnings.append(
-                f"{result['duplicate_observation_alias_count']} delayed Present aliases were duplicated; verify one observation per PresentEvent."
-            )
-        if result["invalid_association_row_count"]:
-            warnings.append(
-                f"{result['invalid_association_row_count']} delayed association rows violate identity, match-status, containment, or age semantics."
-            )
-        if result["invalid_classification_row_count"]:
-            warnings.append(
-                f"{result['invalid_classification_row_count']} delayed observations have inconsistent real/generated classification evidence."
-            )
-        if result["capture_start_diagnostic_count"] != 1 or result["capture_end_diagnostic_count"] != 1:
-            warnings.append(
-                "The association capture lacks exactly one start and one end diagnostic snapshot; observation loss cannot be proven absent."
-            )
-        elif result["capture_reported_dropped_observation_delta"]:
-            warnings.append(
-                f"The producer reported {result['capture_reported_dropped_observation_delta']} dropped delayed Present observations during this capture."
-            )
+        template = GAP_WARNINGS.get(result["kind"], "{count} identity gaps were observed.")
+        warnings.append(template.format(count=result["id_gap_event_count"]))
+    return warnings
 
+
+# ── Inspection ──
+
+def summarize_capture(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        records = csv.reader(stream)
+        header = next(records, [])
+        kind = detect_kind(header)
+        result: dict[str, Any] = {
+            "path": str(path.resolve()),
+            "size_bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+            "column_count": len(header),
+            "ordered_header_sha256": header_sha256(header),
+            "header": header,
+            "warnings": [],
+        }
+        legacy_family = legacy_family_from_filename(path.name)
+        if kind == "unknown" and legacy_family is not None:
+            result.update({"kind": "legacy", "schema_profile": schema_profile("legacy", header),
+                           "legacy_family": legacy_family, "parsed": False})
+            result["warnings"].append(
+                f"{legacy_family} is a legacy ReLimiter family removed in Phase 1; its rows were not parsed. "
+                "Re-analyse old archives with the analysis scripts from version control."
+            )
+            return result
+        result.update({"kind": kind, "schema_profile": schema_profile(kind, header), "parsed": True})
+        result.update(_scan_rows(records, kind, header))
+
+    warnings: list[str] = result["warnings"]
+    if not header:
+        warnings.append("No CSV header was detected.")
+    elif result["row_count"] == 0:
+        warnings.append("The file is header-only; no telemetry samples are available.")
+    warnings.extend(_family_warnings(result, path.name))
+    warnings.extend(_continuity_warnings(result))
     return result
+
+
+# ── Output ──
+
+def _continuity_text(result: dict[str, Any]) -> str:
+    parts = []
+    if result["timestamp_column"]:
+        parts.append(f"{result['timestamp_column']} nonmonotonic={result['timestamp_nonmonotonic_count']}, "
+                     f"gaps_10x={result['timestamp_gap_over_10x_median_count']}")
+    if result["id_column"]:
+        parts.append(f"{result['id_column']} duplicates={result['duplicate_id_count']}, "
+                     f"backward={result['out_of_order_id_count']}, gaps={result['id_gap_event_count']}")
+    return "; ".join(parts) if parts else "not checked"
 
 
 def print_summary(result: dict[str, Any]) -> None:
     print(result["path"])
-    print(f"  kind: {result['kind']}")
-    print(f"  schema: {result['schema_profile']} ({result['column_count']} columns)")
-    print(f"  rows: {result['row_count']}")
+    if result["parsed"]:
+        print(f"  kind: {result['kind']}")
+        print(f"  schema: {result['schema_profile']} ({result['column_count']} columns)")
+        print(f"  rows: {result['row_count']}")
+    else:
+        print(f"  kind: legacy ({result['legacy_family']}), not parsed")
     print(f"  sha256: {result['sha256']}")
     print(f"  ordered header sha256: {result['ordered_header_sha256']}")
-    print(
-        "  continuity: "
-        f"timestamp_nonmonotonic={result['timestamp_nonmonotonic_count']}, "
-        f"timestamp_gaps_10x={result['timestamp_gap_over_10x_median_count']}, "
-        f"duplicate_ids={result['duplicate_id_count']}, "
-        f"backward_ids={result['out_of_order_id_count']}, "
-        f"id_gaps={result['id_gap_event_count']}"
-    )
-    if result["kind"] == "relimiter_present_timeline":
-        print(
-            "  Present spans: "
-            f"count={result['present_span_count']}, "
-            f"invalid_pairs={result['invalid_present_pair_count']}, "
-            f"duplicate_keys={result['duplicate_present_key_count']}, "
-            f"invalid_timestamps={result['invalid_present_event_timestamp_count']}, "
-            f"span_sequence_gaps={result['span_sequence_gap_count']}, "
-            f"reported_drops={result['capture_reported_dropped_span_delta']}"
-        )
-    if result["kind"] == "relimiter_present_association":
-        print(
-            "  Present associations: "
-            f"observations={result['present_observation_count']}, "
-            f"statuses={result['association_status_counts']}, "
-            f"invalid_rows={result['invalid_association_row_count']}, "
-            f"invalid_classifications={result['invalid_classification_row_count']}, "
-            f"reported_drops={result['capture_reported_dropped_observation_delta']}"
-        )
-    if result["metric_availability"]:
-        print("  metric availability (valid/nonzero):")
-        for column, counts in result["metric_availability"].items():
-            print(f"    {column}: {counts['valid']}/{counts['nonzero']}")
-    if result["transition_counts"]:
-        print("  transitions:")
-        for column, count in result["transition_counts"].items():
-            print(f"    {column}: {count}")
+    if result["parsed"]:
+        print(f"  continuity: {_continuity_text(result)}")
+        if result["metric_availability"]:
+            print("  metric availability (valid/nonzero):")
+            for column, counts in result["metric_availability"].items():
+                print(f"    {column}: {counts['valid']}/{counts['nonzero']}")
+        if result["transition_counts"]:
+            print("  transitions:")
+            for column, count in result["transition_counts"].items():
+                print(f"    {column}: {count}")
     if result["warnings"]:
         print("  warnings:")
         for warning in result["warnings"]:

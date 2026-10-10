@@ -1,0 +1,345 @@
+{
+  "schema": "relimiter-pacing-evaluation/1",
+  "question": "Does holding each frame to the cap cadence (the output hold) reduce display jitter compared with releasing the game on the cadence alone, and where does it stop helping?",
+  "notes": [
+    "Copy this file next to the archived captures, fill build, scenes and each run's capture path (relative to this file), then run compare_pacing.py on it.",
+    "Choose thresholds before capturing; do not tune them after seeing results.",
+    "Every arm is captured twice per scene; the spread between its two runs is that arm's A/A noise floor."
+  ],
+  "build": {
+    "relimiter_build": null,
+    "relimiter_artifact_sha256": null,
+    "architecture": "x64",
+    "gpu": null,
+    "gpu_driver": null,
+    "display": null,
+    "refresh_hz": null,
+    "vrr": null
+  },
+  "common_settings": {
+    "config_version": "2",
+    "developer_settings": "true",
+    "native_pcl_enabled": "true",
+    "adaptive_cap": "false",
+    "gpu_present_gate_probes": "true",
+    "gpu_wait_budget_us": "1500",
+    "marker_forward_order": "before_wait",
+    "stall_inject_ms": "0",
+    "reflex_sleep_bypass": "false",
+    "log_level": "info"
+  },
+  "arms": {
+    "A": {
+      "label": "release only",
+      "settings": {
+        "smoothing": "off",
+        "output_rung": "auto",
+        "source_placement": "marker"
+      },
+      "osd": "Smoothing off, Output override Auto, Source placement Marker",
+      "expect": {
+        "reasons": [
+          "smoothing_off"
+        ],
+        "rungs": [
+          "source_only"
+        ],
+        "placement": "marker"
+      }
+    },
+    "B": {
+      "label": "hold, Auto (shipping)",
+      "settings": {
+        "smoothing": "on",
+        "output_rung": "auto",
+        "source_placement": "marker"
+      },
+      "osd": "Smoothing on, Output override Auto, Source placement Marker",
+      "expect": {
+        "reasons": [
+          "none",
+          "infeasible"
+        ],
+        "placement": "marker"
+      }
+    },
+    "Bp": {
+      "label": "hold without overload fallback or collision-aware release",
+      "settings": {
+        "smoothing": "on",
+        "output_rung": "gpu",
+        "source_placement": "marker"
+      },
+      "osd": "Smoothing on, Output override GPU wait, Source placement Marker",
+      "expect": {
+        "reasons": [
+          "override"
+        ],
+        "rungs": [
+          "gpu_queue_wait",
+          "fg_input_wait"
+        ],
+        "placement": "marker"
+      }
+    },
+    "C": {
+      "label": "Reflex driver limiter",
+      "settings": {
+        "smoothing": "on",
+        "output_rung": "auto",
+        "source_placement": "driver"
+      },
+      "osd": "Smoothing on, Output override Auto, Source placement Reflex driver limiter",
+      "expect": {
+        "reasons": [
+          "override"
+        ],
+        "placement": "driver_limiter"
+      }
+    }
+  },
+  "scenes": [
+    {
+      "id": "rogue_core_light",
+      "class": "light",
+      "application": "Rogue Core",
+      "target_fps": 130,
+      "frame_generation": "off",
+      "description": "Light, steady scene at a 130 FPS cap without FG (the D2 archive conditions)."
+    },
+    {
+      "id": "rogue_core_heavy",
+      "class": "heavy",
+      "application": "Rogue Core",
+      "target_fps": 130,
+      "frame_generation": "off",
+      "description": "GPU-heavy area at the same cap (the R9/E3 archive conditions)."
+    },
+    {
+      "id": "gears_eday_fg2x",
+      "class": "heavy",
+      "application": "Gears of War: E-Day",
+      "target_fps": null,
+      "frame_generation": "2x",
+      "description": "Sustained heavy stretch with DLSS frame generation 2x."
+    }
+  ],
+  "protocol": {
+    "run_order": [
+      "A",
+      "B",
+      "Bp",
+      "C",
+      "A",
+      "B",
+      "Bp",
+      "C"
+    ],
+    "settle_seconds": 15,
+    "capture_seconds": 180,
+    "warmup_seconds": 5,
+    "min_display_intervals": 10000
+  },
+  "analysis": {
+    "block_seconds": 5.0,
+    "bootstrap_iterations": 1000,
+    "seed": 20261003,
+    "confidence": 0.95,
+    "deviation_thresholds_us": [
+      1000,
+      2000
+    ],
+    "min_effect": {
+      "jitter_p50_us": 10,
+      "jitter_p90_us": 25,
+      "jitter_p99_us": 50,
+      "dev_share_over_1000us": 0.002,
+      "dev_share_over_2000us": 0.002,
+      "long_frame_share": 0.001,
+      "abs_animation_error_p99_us": 50,
+      "pc_latency_p50_us": 250
+    }
+  },
+  "comparisons": [
+    {
+      "id": "hold_vs_release",
+      "candidate": "B",
+      "baseline": "A",
+      "question": "Does the shipping hold (Auto, with its overload fallback and collision-aware release) beat releasing on the cadence alone?"
+    },
+    {
+      "id": "raw_hold_vs_release",
+      "candidate": "Bp",
+      "baseline": "A",
+      "question": "Does the hold without its overload fallback and collision-aware release beat releasing on the cadence alone?"
+    },
+    {
+      "id": "fallback_vs_raw_hold",
+      "candidate": "B",
+      "baseline": "Bp",
+      "question": "Do the overload fallback and the collision-aware release improve on the hold without them?"
+    },
+    {
+      "id": "release_vs_driver_limiter",
+      "candidate": "A",
+      "baseline": "C",
+      "question": "Is ReLimiter's release cadence better than NVIDIA's Reflex driver limiter?"
+    }
+  ],
+  "decision": {
+    "hold": "hold_vs_release",
+    "raw_hold": "raw_hold_vs_release",
+    "primary_metrics": [
+      "jitter_p99_us",
+      "dev_share_over_2000us"
+    ],
+    "latency_metric": "pc_latency_p50_us",
+    "latency_budget_us": 2000
+  },
+  "runs": [
+    {
+      "scene": "rogue_core_light",
+      "arm": "A",
+      "order": 1,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_light",
+      "arm": "B",
+      "order": 2,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_light",
+      "arm": "Bp",
+      "order": 3,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_light",
+      "arm": "C",
+      "order": 4,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_light",
+      "arm": "A",
+      "order": 5,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_light",
+      "arm": "B",
+      "order": 6,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_light",
+      "arm": "Bp",
+      "order": 7,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_light",
+      "arm": "C",
+      "order": 8,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_heavy",
+      "arm": "A",
+      "order": 1,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_heavy",
+      "arm": "B",
+      "order": 2,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_heavy",
+      "arm": "Bp",
+      "order": 3,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_heavy",
+      "arm": "C",
+      "order": 4,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_heavy",
+      "arm": "A",
+      "order": 5,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_heavy",
+      "arm": "B",
+      "order": 6,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_heavy",
+      "arm": "Bp",
+      "order": 7,
+      "capture": null
+    },
+    {
+      "scene": "rogue_core_heavy",
+      "arm": "C",
+      "order": 8,
+      "capture": null
+    },
+    {
+      "scene": "gears_eday_fg2x",
+      "arm": "A",
+      "order": 1,
+      "capture": null
+    },
+    {
+      "scene": "gears_eday_fg2x",
+      "arm": "B",
+      "order": 2,
+      "capture": null
+    },
+    {
+      "scene": "gears_eday_fg2x",
+      "arm": "Bp",
+      "order": 3,
+      "capture": null
+    },
+    {
+      "scene": "gears_eday_fg2x",
+      "arm": "C",
+      "order": 4,
+      "capture": null
+    },
+    {
+      "scene": "gears_eday_fg2x",
+      "arm": "A",
+      "order": 5,
+      "capture": null
+    },
+    {
+      "scene": "gears_eday_fg2x",
+      "arm": "B",
+      "order": 6,
+      "capture": null
+    },
+    {
+      "scene": "gears_eday_fg2x",
+      "arm": "Bp",
+      "order": 7,
+      "capture": null
+    },
+    {
+      "scene": "gears_eday_fg2x",
+      "arm": "C",
+      "order": 8,
+      "capture": null
+    }
+  ]
+}

@@ -1,24 +1,74 @@
 #include "config.h"
+#include "nvapi_hooks.h"
 #include "osd_position_policy.h"
 #include "blackout.h"
 #include "scheduler.h"
 #include "streamline_hooks.h"
 #include "wake_guard.h"
 #include "vsync_control.h"
-#include "frame_time_adaptation.h"
-#include "arrival_lead_estimator.h"
-#include "adaptive_deadline_reserve.h"
+#include "pacing_resolver.h"
 #include "reflex_inject.h"
 #include "logger.h"
 #include <Windows.h>
 #include <cmath>
 #include <string>
 #include <cstdio>
+#include <array>
+#include <condition_variable>
+#include <mutex>
+#include <optional>
+#include <utility>
+#include <vector>
+#include <ShlObj.h>
 
 Config g_config;
 
+// Recommended defaults, for the developer diagnostics count and reset.
+static const Config s_default_config{};
+
+// INI layout version. 2 (2026-10-09): the Reflex Sleep bypass and pre-Sleep
+// placement became the defaults. Earlier builds saved every key, so an INI
+// without this version carries the old defaults of those two keys.
+static constexpr int kConfigVersion = 2;
+
 static char s_ini_path[MAX_PATH] = {};
 static bool s_first_launch = false;
+static std::vector<OSDPreset> s_user_presets;
+static char s_shared_presets_path[MAX_PATH] = {};
+
+// Live settings/slots belong to the caller (UI, or quiesced init/shutdown).
+// Only these value-owned snapshots cross to the writer; never slot references.
+struct ConfigSaveSnapshot {
+    Config settings;
+    std::array<char, MAX_PATH> ini_path{};
+    std::array<char, MAX_PATH> presets_path{};
+};
+
+struct PresetSaveSnapshot {
+    std::array<OSDPreset, OSD_MAX_PRESET_SLOTS> slots{};
+    std::array<char, MAX_PATH> path{};
+};
+
+struct ConfigSaveBatch {
+    std::optional<ConfigSaveSnapshot> config;
+    // Separate mailboxes preserve edits to BOTH destinations during toggles.
+    std::array<std::optional<PresetSaveSnapshot>, 2> presets;
+    bool Empty() const { return !config && !presets[0] && !presets[1]; }
+};
+
+static std::mutex s_save_mutex;
+static std::condition_variable s_save_wakeup;
+static std::mutex s_ini_mutex;
+static ConfigSaveBatch s_pending_save;
+static ConfigSaveBatch s_failed_save;
+static HANDLE s_config_writer = nullptr;
+static bool s_save_stopping = false;
+static bool s_save_busy = false;
+static thread_local DWORD s_ini_write_error = ERROR_SUCCESS;
+
+static void Config_StartWriter();
+static void RequestPresetSave();
+static void WritePresetToINI(int slot, const OSDPreset& p, const char* P);
 
 // Forward declaration — defined in OSD Presets section
 static const char* GetPresetsINIPath();
@@ -52,7 +102,10 @@ static bool ReadINIBool(const char* section, const char* key, bool def,
 
 static void WriteINIString(const char* section, const char* key,
                             const char* val, const char* path) {
-    WritePrivateProfileStringA(section, key, val, path);
+    if (!WritePrivateProfileStringA(section, key, val, path)) {
+        const DWORD error = GetLastError();
+        s_ini_write_error = error ? error : ERROR_WRITE_FAULT;
+    }
 }
 
 static void WriteINIDouble(const char* section, const char* key,
@@ -133,56 +186,157 @@ void ValidateConfig() {
     static const char* log_levels[] = {"error", "warn", "info", "debug"};
     ValidateEnum(g_config.log_level, log_levels, 4, "info");
 
-    // ── Frame-Time Adaptation ──
-    if (!std::isfinite(g_config.smoothing_percentile)) {
-        LOG_WARN("Config: non-finite smoothing_percentile, resetting to 0.99");
-        g_config.smoothing_percentile = 0.99;
+    // ── Pacing pipeline ──
+    if (static_cast<unsigned>(g_config.smoothing) >=
+        static_cast<unsigned>(PacingSmoothing::Count)) {
+        LOG_WARN("Config: invalid smoothing, resetting to 'on'");
+        g_config.smoothing = PacingSmoothing::On;
     }
-    g_config.smoothing_percentile = Clamp(
-        g_config.smoothing_percentile, 0.50, 0.999);
-    if (!std::isfinite(g_config.smoothing_release_speed)) {
-        LOG_WARN(
-            "Config: non-finite smoothing_release_speed, resetting to 1.0");
-        g_config.smoothing_release_speed = 1.0;
+    if (static_cast<unsigned>(g_config.output_rung) >=
+        static_cast<unsigned>(PacingRungOverride::Count)) {
+        LOG_WARN("Config: invalid output_rung, resetting to 'auto'");
+        g_config.output_rung = PacingRungOverride::Auto;
     }
-    g_config.smoothing_release_speed = Clamp(
-        g_config.smoothing_release_speed, 0.25, 4.0);
-    if (!std::isfinite(g_config.smoothing_bias_us)) {
-        LOG_WARN("Config: non-finite smoothing_bias_us, resetting to 0");
-        g_config.smoothing_bias_us = 0.0;
+    if (static_cast<unsigned>(g_config.marker_forward_order) >=
+        static_cast<unsigned>(PacingMarkerForwardOrder::Count)) {
+        LOG_WARN("Config: invalid marker_forward_order, resetting to 'before_wait'");
+        g_config.marker_forward_order = PacingMarkerForwardOrder::BeforeWait;
     }
-    g_config.smoothing_bias_us = Clamp(
-        g_config.smoothing_bias_us, 0.0, 1000.0);
-    static const char* smoothing_windows[] = {"medium", "dual"};
-    ValidateEnum(g_config.smoothing_window, smoothing_windows, 2, "medium");
-    static const char* adaptive_reserve_modes[] = {"shadow", "active"};
-    ValidateEnum(
-        g_config.adaptive_deadline_reserve_mode,
-        adaptive_reserve_modes,
-        2,
-        "shadow");
-#ifndef _WIN64
-    g_config.adaptive_deadline_reserve_mode = "shadow";
-#endif
-
-    // ── Experimental arrival-lead predictor ──
-    static const char* estimator_a_modes[] = {"off", "shadow", "active"};
-    ValidateEnum(g_config.estimator_a_mode, estimator_a_modes, 3, "off");
-    if (!std::isfinite(g_config.estimator_a_fixed_reserve_us)) {
-        LOG_WARN(
-            "Config: non-finite estimator_a_fixed_reserve_us, resetting to 1800");
-        g_config.estimator_a_fixed_reserve_us = 1800.0;
+    if (static_cast<unsigned>(g_config.gpu_queue_wait_render_queue) >=
+        static_cast<unsigned>(PacingRenderQueue::Count)) {
+        LOG_WARN("Config: invalid gpu_queue_wait_render_queue, resetting to 'keep'");
+        g_config.gpu_queue_wait_render_queue = PacingRenderQueue::Keep;
     }
-    g_config.estimator_a_fixed_reserve_us = Clamp(
-        g_config.estimator_a_fixed_reserve_us, 0.0, 5000.0);
+    if (static_cast<unsigned>(g_config.source_placement) >=
+        static_cast<unsigned>(PacingPlacementOverride::Count)) {
+        LOG_WARN("Config: invalid source_placement, resetting to 'pre_sleep'");
+        g_config.source_placement = PacingPlacementOverride::PreSleep;
+    }
+    if (!std::isfinite(g_config.stall_inject_ms)) {
+        LOG_WARN("Config: non-finite stall_inject_ms, resetting to 0 (off)");
+        g_config.stall_inject_ms = 0.0;
+    }
+    g_config.stall_inject_ms = Clamp(
+        g_config.stall_inject_ms, 0.0, kPacingStallInjectMaxMs);
+    if (g_config.adaptive_cap_percentile < kAdaptiveCapPercentileMin ||
+        g_config.adaptive_cap_percentile > kAdaptiveCapPercentileMax) {
+        LOG_WARN("Config: adaptive_cap_percentile %d outside [%d, %d], clamped",
+                 g_config.adaptive_cap_percentile, kAdaptiveCapPercentileMin,
+                 kAdaptiveCapPercentileMax);
+    }
+    g_config.adaptive_cap_percentile = Clamp(
+        g_config.adaptive_cap_percentile, kAdaptiveCapPercentileMin, kAdaptiveCapPercentileMax);
+    if (!std::isfinite(g_config.stall_inject_period_s)) {
+        LOG_WARN("Config: non-finite stall_inject_period_s, resetting to %.0f",
+                 kPacingStallInjectDefaultPeriodS);
+        g_config.stall_inject_period_s = kPacingStallInjectDefaultPeriodS;
+    }
+    g_config.stall_inject_period_s = Clamp(
+        g_config.stall_inject_period_s,
+        kPacingStallInjectMinPeriodS,
+        kPacingStallInjectMaxPeriodS);
+    // gpu_wait_budget_us: the GPU wait cap ladder's top level. Builds before
+    // 2026-10-04 saved 0 for "off"; 0 or less now loads as the default.
+    if (!std::isfinite(g_config.gpu_wait_budget_us) || g_config.gpu_wait_budget_us <= 0.0) {
+        g_config.gpu_wait_budget_us = kPacingGpuWaitBudgetDefaultUs;
+    } else {
+        const double budget_us = Clamp(
+            g_config.gpu_wait_budget_us, kPacingGpuWaitBudgetMinUs, kPacingGpuWaitBudgetMaxUs);
+        if (budget_us != g_config.gpu_wait_budget_us)
+            LOG_WARN("Config: gpu_wait_budget_us %.0f outside [500, 5000], clamped",
+                     g_config.gpu_wait_budget_us);
+        g_config.gpu_wait_budget_us = budget_us;
+    }
+    // gpu_wait_interleave_s: 0 (or less, or non-finite) is off; else [1, 10] s.
+    if (!std::isfinite(g_config.gpu_wait_interleave_s) || g_config.gpu_wait_interleave_s <= 0.0) {
+        g_config.gpu_wait_interleave_s = 0.0;
+    } else {
+        const double block_s = Clamp(g_config.gpu_wait_interleave_s,
+            kPacingGpuWaitInterleaveMinS, kPacingGpuWaitInterleaveMaxS);
+        if (block_s != g_config.gpu_wait_interleave_s)
+            LOG_WARN("Config: gpu_wait_interleave_s %.2f outside [1, 10], clamped",
+                     g_config.gpu_wait_interleave_s);
+        g_config.gpu_wait_interleave_s = block_s;
+    }
 
     // ── Monitor Selection ──
     g_config.selected_monitor = Clamp(g_config.selected_monitor, 0, 8);
 }
 
+// ── Pacing pipeline keys (phase2_timing_core_design.md section 4, P2-4) ──
+// Retired pacing keys (Estimator A, native predictor, gate location, GPU gate
+// mode/slack/max delay, adaptive reserve, smoothing tuning, readiness observer)
+// are never read; pacing_method and adaptive_smoothing are read only to migrate
+// an INI without the replacement key. The startup rewrite drops all of them.
+static void LoadPacingPipelineKeys(const char* S, const char* P) {
+    const std::string smoothing = ReadINIString(S, "smoothing", "on", P);
+    if (!PacingSmoothing_FromText(smoothing.c_str(), &g_config.smoothing)) {
+        LOG_WARN("Config: invalid smoothing '%s', resetting to 'on'", smoothing.c_str());
+        g_config.smoothing = PacingSmoothing::On;
+    }
+
+    // P2-4: marker pacing becomes the marker rung override; automatic, native
+    // and invalid methods resolve automatically.
+    const std::string output_rung = ReadINIString(S, "output_rung", "", P);
+    if (output_rung.empty()) {
+        const std::string legacy_method = ReadINIString(S, "pacing_method", "", P);
+        g_config.output_rung = legacy_method == "marker"
+            ? PacingRungOverride::Marker : PacingRungOverride::Auto;
+        if (!legacy_method.empty())
+            LOG_INFO("Config: migrated pacing_method=%s to output_rung=%s",
+                     legacy_method.c_str(), PacingRungOverride_Text(g_config.output_rung));
+    } else if (!PacingRungOverride_FromText(output_rung.c_str(), &g_config.output_rung)) {
+        LOG_WARN("Config: invalid output_rung '%s', resetting to 'auto'", output_rung.c_str());
+        g_config.output_rung = PacingRungOverride::Auto;
+    }
+
+    const std::string forward_order = ReadINIString(S, "marker_forward_order", "before_wait", P);
+    if (!PacingMarkerForwardOrder_FromText(forward_order.c_str(), &g_config.marker_forward_order)) {
+        LOG_WARN("Config: invalid marker_forward_order '%s', resetting to 'before_wait'",
+                 forward_order.c_str());
+        g_config.marker_forward_order = PacingMarkerForwardOrder::BeforeWait;
+    }
+
+    const std::string render_queue = ReadINIString(S, "gpu_queue_wait_render_queue", "keep", P);
+    if (!PacingRenderQueue_FromText(render_queue.c_str(), &g_config.gpu_queue_wait_render_queue)) {
+        LOG_WARN("Config: invalid gpu_queue_wait_render_queue '%s', resetting to 'keep'",
+                 render_queue.c_str());
+        g_config.gpu_queue_wait_render_queue = PacingRenderQueue::Keep;
+    }
+
+    const std::string placement = ReadINIString(S, "source_placement", "pre_sleep", P);
+    if (!PacingPlacementOverride_FromText(placement.c_str(), &g_config.source_placement)) {
+        LOG_WARN("Config: invalid source_placement '%s', resetting to 'pre_sleep'", placement.c_str());
+        g_config.source_placement = PacingPlacementOverride::PreSleep;
+    }
+
+    g_config.stall_inject_ms = ReadINIDouble(S, "stall_inject_ms", 0.0, P);
+    g_config.stall_inject_period_s = ReadINIDouble(
+        S, "stall_inject_period_s", kPacingStallInjectDefaultPeriodS, P);
+    g_config.gpu_wait_budget_us = ReadINIDouble(S, "gpu_wait_budget_us", kPacingGpuWaitBudgetDefaultUs, P);
+    g_config.gpu_wait_interleave_s = ReadINIDouble(S, "gpu_wait_interleave_s", 0.0, P);
+
+    // adaptive_cap replaces adaptive_smoothing; the legacy value is its default.
+    g_config.adaptive_cap = ReadINIBool(
+        S, "adaptive_cap", ReadINIBool(S, "adaptive_smoothing", false, P), P);
+    g_config.adaptive_cap_percentile = ReadINIInt(
+        S, "adaptive_cap_percentile", kAdaptiveCapPercentileDefault, P);
+}
+
 bool Config_IsFirstLaunch() { return s_first_launch; }
 
 void LoadConfig(HMODULE hModule) {
+    {
+        std::lock_guard<std::mutex> lock(s_save_mutex);
+        // A failed/unfinished shutdown owns these snapshots and may still log.
+        // Only a clean lifecycle may reopen synchronous initialization I/O.
+        if (s_config_writer || s_save_busy || !s_pending_save.Empty() ||
+            !s_failed_save.Empty()) {
+            LOG_ERROR("Config: initialization rejected while writer state is retained");
+            return;
+        }
+        s_save_stopping = false;
+    }
     // Build INI path next to the DLL
     GetModuleFileNameA(hModule, s_ini_path, MAX_PATH);
     LOG_INFO("Config: DLL path = %s", s_ini_path);
@@ -193,6 +347,15 @@ void LoadConfig(HMODULE hModule) {
     else strcat(s_ini_path, ".ini");
 
     LOG_INFO("Config: INI path = %s", s_ini_path);
+
+    // Resolve once during initialization; UI saves never call shell/filesystem APIs.
+    char local[MAX_PATH] = {};
+    s_shared_presets_path[0] = '\0';
+    if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, local))) {
+        const int length = snprintf(s_shared_presets_path, MAX_PATH,
+            "%s\\RHI\\ReLimiter_Presets\\presets.ini", local);
+        if (length < 0 || length >= MAX_PATH) s_shared_presets_path[0] = '\0';
+    }
 
     // Detect first launch: INI file does not yet exist
     s_first_launch = (GetFileAttributesA(s_ini_path) == INVALID_FILE_ATTRIBUTES);
@@ -224,6 +387,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.osd_show_pqi_breakdown  = ReadINIBool(S, "osd_show_pqi_breakdown", false, P);
     g_config.osd_show_1pct_low       = ReadINIBool(S, "osd_show_1pct_low", false, P);
     g_config.osd_show_smoothness     = ReadINIBool(S, "osd_show_smoothness", false, P);
+    g_config.osd_show_pacing_quality = ReadINIBool(S, "osd_show_pacing_quality", false, P);
     g_config.osd_scale               = static_cast<float>(ReadINIDouble(S, "osd_scale", 1.0, P));
     g_config.osd_drop_shadow         = ReadINIBool(S, "osd_drop_shadow", true, P);
     g_config.osd_text_brightness     = static_cast<float>(ReadINIDouble(S, "osd_text_brightness", 1.0, P));
@@ -235,21 +399,26 @@ void LoadConfig(HMODULE hModule) {
     g_config.log_level               = ReadINIString(S, "log_level", "warn", P);
     g_config.csv_enabled             = ReadINIBool(S, "csv_enabled", false, P);
     g_config.native_pcl_enabled      = ReadINIBool(S, "native_pcl_enabled", false, P);
+    g_config.gpu_present_gate_probes=ReadINIBool(S,"gpu_present_gate_probes",true,P);
+    g_config.reflex_sleep_bypass=ReadINIBool(S,"reflex_sleep_bypass",true,P);
     g_config.reflex_inject           = ReadINIBool(S, "reflex_inject", false, P);
     g_config.flip_model_override     = ReadINIBool(S, "flip_model_override", false, P);
     g_config.shared_presets          = ReadINIBool(S, "shared_presets", false, P);
     g_config.dynamic_mfg_passthrough = ReadINIBool(S, "dynamic_mfg_passthrough", false, P);
-    g_config.dmfg_output_cap         = ReadINIInt(S, "dmfg_output_cap", 0, P);
-    g_config.adaptive_smoothing      = ReadINIBool(S, "adaptive_smoothing", false, P);
-    g_config.smoothing_percentile    = ReadINIDouble(S, "smoothing_percentile", 0.99, P);
-    g_config.smoothing_window        = ReadINIString(S, "smoothing_window", "medium", P);
-    g_config.smoothing_release_speed = ReadINIDouble(S, "smoothing_release_speed", 1.0, P);
-    g_config.smoothing_bias_us       = ReadINIDouble(S, "smoothing_bias_us", 0.0, P);
-    g_config.adaptive_deadline_reserve_mode = ReadINIString(
-        S, "adaptive_deadline_reserve_mode", "shadow", P);
-    g_config.estimator_a_mode        = ReadINIString(S, "estimator_a_mode", "off", P);
-    g_config.estimator_a_fixed_reserve_us = ReadINIDouble(
-        S, "estimator_a_fixed_reserve_us", 1800.0, P);
+    LoadPacingPipelineKeys(S, P);
+    g_config.advanced_settings = ReadINIBool(S, "advanced_settings", false, P);
+    g_config.developer_settings = ReadINIBool(S, "developer_settings", false, P);
+    // Version 2 defaults (kConfigVersion): an existing INI written before
+    // them moves to the Reflex Sleep bypass and pre-Sleep placement once;
+    // its other values stay.
+    if (!s_first_launch && ReadINIInt(S, "config_version", 1, P) < kConfigVersion &&
+        (!g_config.reflex_sleep_bypass || g_config.source_placement != PacingPlacementOverride::PreSleep)) {
+        LOG_INFO("Config: moved to the recommended defaults reflex_sleep_bypass=true source_placement=pre_sleep "
+                 "(was %s, %s)", g_config.reflex_sleep_bypass ? "true" : "false",
+                 PacingPlacementOverride_Text(g_config.source_placement));
+        g_config.reflex_sleep_bypass = true;
+        g_config.source_placement = PacingPlacementOverride::PreSleep;
+    }
     g_config.osd_show_adaptive_smoothing = ReadINIBool(S, "osd_show_adaptive_smoothing", false, P);
     g_config.osd_show_0_1pct_low     = ReadINIBool(S, "osd_show_0_1pct_low", false, P);
     g_config.osd_show_gpu_render_time = ReadINIBool(S, "osd_show_gpu_render_time", false, P);
@@ -294,8 +463,8 @@ void LoadConfig(HMODULE hModule) {
     LOG_INFO("Config: values read, calling ApplyConfig...");
     ValidateConfig();
 
-    // Force logging and telemetry off on each launch — must be manually enabled
-    g_config.log_level = "warn";
+    // Keep the validated INI logging level so startup diagnostics can be captured.
+    // CSV telemetry still requires explicit activation each launch.
     g_config.csv_enabled = false;
 
     // Force Streamline Compatibility on — proactive hooks break FG in multiple games.
@@ -338,119 +507,386 @@ void LoadConfig(HMODULE hModule) {
     // This purges stale keys left over from older versions.
     WritePrivateProfileStringA(S, nullptr, nullptr, P);
     SaveConfig();
+    // LoadConfig runs in AddonInit, outside loader lock and before callbacks.
+    Config_StartWriter();
+}
+
+static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
+    const Config& config = snapshot.settings;
+    const char* S = "FrameLimiter";
+    const char* P = snapshot.ini_path.data();
+
+    // ── Core ──
+    WriteINIInt(S, "target_fps", config.target_fps, P);
+    WriteINIInt(S, "background_fps", config.background_fps, P);
+    WriteINIInt(S, "fg_off_fps", config.fg_off_fps, P);
+    WriteINIString(S, "vsync_mode", config.vsync_mode.c_str(), P);
+    WriteINIString(S, "enforcement_marker", config.enforcement_marker.c_str(), P);
+    WriteINIDouble(S, "initial_wake_guard_us", config.initial_wake_guard_us, P);
+
+    // ── Screen ──
+    WriteINIString(S, "window_mode", config.window_mode.c_str(), P);
+    WriteINIBool(S, "fake_fullscreen", config.fake_fullscreen, P);
+    WriteINIInt(S, "selected_monitor", config.selected_monitor, P);
+    WriteINIBool(S, "focus_lock", config.focus_lock, P);
+
+    WriteINIString(S, "oled_care_key", config.oled_care_key.c_str(), P);
+    WriteINIBool(S, "oled_care_all_monitors", config.oled_care_all_monitors, P);
+    WriteINIInt(S, "oled_care_idle_minutes", config.oled_care_idle_minutes, P);
+
+    // ── OSD ──
+    WriteINIBool(S, "osd_enabled", config.osd_enabled, P);
+    WriteINIDouble(S, "osd_x", config.osd_x, P);
+    WriteINIDouble(S, "osd_y", config.osd_y, P);
+    WriteINIDouble(S, "osd_opacity", config.osd_opacity, P);
+    WriteINIDouble(S, "osd_scale", config.osd_scale, P);
+    WriteINIBool(S, "osd_drop_shadow", config.osd_drop_shadow, P);
+    WriteINIDouble(S, "osd_text_brightness", config.osd_text_brightness, P);
+    WriteINIString(S, "osd_toggle_key", config.osd_toggle_key.c_str(), P);
+    WriteINIString(S, "osd_position_cycle_key", config.osd_position_cycle_key.c_str(), P);
+
+    // ── OSD Elements ──
+    WriteINIBool(S, "osd_show_fps", config.osd_show_fps, P);
+    WriteINIBool(S, "osd_show_frametime", config.osd_show_frametime, P);
+    WriteINIBool(S, "osd_show_frametime_graph", config.osd_show_frametime_graph, P);
+    WriteINIBool(S, "osd_show_1pct_low", config.osd_show_1pct_low, P);
+    WriteINIBool(S, "osd_show_0_1pct_low", config.osd_show_0_1pct_low, P);
+    WriteINIBool(S, "osd_show_cpu_latency", config.osd_show_cpu_latency, P);
+    WriteINIBool(S, "osd_show_native_pcl", config.osd_show_native_pcl, P);
+    WriteINIBool(S, "osd_show_native_pcl_breakdown", config.osd_show_native_pcl_breakdown, P);
+    WriteINIBool(S, "osd_show_gpu_render_time", config.osd_show_gpu_render_time, P);
+    WriteINIBool(S, "osd_show_total_frame_cost", config.osd_show_total_frame_cost, P);
+    WriteINIBool(S, "osd_show_fg_time", config.osd_show_fg_time, P);
+    WriteINIBool(S, "osd_show_pqi", config.osd_show_pqi, P);
+    WriteINIBool(S, "osd_show_pqi_breakdown", config.osd_show_pqi_breakdown, P);
+    WriteINIBool(S, "osd_show_smoothness", config.osd_show_smoothness, P);
+    WriteINIBool(S, "osd_show_pacing_quality", config.osd_show_pacing_quality, P);
+    WriteINIBool(S, "osd_show_fg", config.osd_show_fg, P);
+    WriteINIBool(S, "osd_show_limiter", config.osd_show_limiter, P);
+    WriteINIBool(S, "osd_show_adaptive_smoothing", config.osd_show_adaptive_smoothing, P);
+    WriteINIBool(S, "osd_show_gpu_temp", config.osd_show_gpu_temp, P);
+    WriteINIBool(S, "osd_show_gpu_clock", config.osd_show_gpu_clock, P);
+    WriteINIBool(S, "osd_show_gpu_usage", config.osd_show_gpu_usage, P);
+    WriteINIBool(S, "osd_show_vram", config.osd_show_vram, P);
+    WriteINIBool(S, "osd_show_cpu_usage", config.osd_show_cpu_usage, P);
+    WriteINIBool(S, "osd_show_ram", config.osd_show_ram, P);
+    WriteINIBool(S, "osd_show_dlss_quality", config.osd_show_dlss_quality, P);
+    WriteINIBool(S, "osd_show_dlss_features", config.osd_show_dlss_features, P);
+    WriteINIBool(S, "osd_show_dlss_resolution", config.osd_show_dlss_resolution, P);
+    WriteINIBool(S, "osd_show_dlss_presets", config.osd_show_dlss_presets, P);
+    WriteINIBool(S, "osd_show_dlss_versions", config.osd_show_dlss_versions, P);
+
+    // ── OSD Presets & Keybinds ──
+    WriteINIBool(S, "shared_presets", config.shared_presets, P);
+    if (config.shared_presets) {
+        const char* SP = snapshot.presets_path.data();
+        if (SP[0] != '\0') {
+            WriteINIString("Presets", "prev_key", config.osd_preset_prev_key.c_str(), SP);
+            WriteINIString("Presets", "next_key", config.osd_preset_next_key.c_str(), SP);
+            WriteINIString("Presets", "blackout_key", config.blackout_key.c_str(), SP);
+        }
+    } else {
+        WriteINIString(S, "osd_preset_prev_key", config.osd_preset_prev_key.c_str(), P);
+        WriteINIString(S, "osd_preset_next_key", config.osd_preset_next_key.c_str(), P);
+        WriteINIString(S, "blackout_key", config.blackout_key.c_str(), P);
+    }
+
+    // ── Pacing pipeline ──
+    WriteINIString(S, "smoothing", PacingSmoothing_Text(config.smoothing), P);
+    WriteINIBool(S, "adaptive_cap", config.adaptive_cap, P);
+    WriteINIInt(S, "adaptive_cap_percentile", config.adaptive_cap_percentile, P);
+    WriteINIBool(S, "advanced_settings", config.advanced_settings, P);
+    WriteINIBool(S, "developer_settings", config.developer_settings, P);
+    WriteINIInt(S, "config_version", kConfigVersion, P);
+
+    // ── Pacing pipeline (developer) ──
+    WriteINIString(S, "output_rung", PacingRungOverride_Text(config.output_rung), P);
+    WriteINIString(S, "marker_forward_order",
+        PacingMarkerForwardOrder_Text(config.marker_forward_order), P);
+    WriteINIString(S, "gpu_queue_wait_render_queue",
+        PacingRenderQueue_Text(config.gpu_queue_wait_render_queue), P);
+    WriteINIString(S, "source_placement",
+        PacingPlacementOverride_Text(config.source_placement), P);
+    WriteINIDouble(S, "stall_inject_ms", config.stall_inject_ms, P);
+    WriteINIDouble(S, "stall_inject_period_s", config.stall_inject_period_s, P);
+    WriteINIDouble(S, "gpu_wait_budget_us", config.gpu_wait_budget_us, P);
+    WriteINIDouble(S, "gpu_wait_interleave_s", config.gpu_wait_interleave_s, P);
+
+    // ── Frame Generation ──
+    WriteINIBool(S, "dynamic_mfg_passthrough", config.dynamic_mfg_passthrough, P);
+
+    // ── Advanced ──
+    WriteINIBool(S, "reflex_inject", config.reflex_inject, P);
+    WriteINIBool(S, "flip_model_override", config.flip_model_override, P);
+    WriteINIString(S, "log_level", config.log_level.c_str(), P);
+    WriteINIBool(S, "csv_enabled", config.csv_enabled, P);
+    WriteINIBool(S, "native_pcl_enabled", config.native_pcl_enabled, P);
+    WriteINIBool(S,"gpu_present_gate_probes",config.gpu_present_gate_probes,P);
+    WriteINIBool(S,"reflex_sleep_bypass",config.reflex_sleep_bypass,P);
+    WriteINIBool(S, "dlss_info_hooks", config.dlss_info_hooks, P);
+    if (!config.streamline_compat)
+        WriteINIString(S, "streamline_compat", "force_false", P);
+    else
+        WriteINIString(S, "streamline_compat", "true", P);
+}
+
+static ConfigSaveSnapshot CaptureConfigSave() {
+    ConfigSaveSnapshot snapshot;
+    snapshot.settings = g_config;
+    snprintf(snapshot.ini_path.data(), snapshot.ini_path.size(), "%s", s_ini_path);
+    snprintf(snapshot.presets_path.data(), snapshot.presets_path.size(), "%s",
+             GetPresetsINIPath());
+    return snapshot;
+}
+
+// Called only with s_ini_mutex held, never with s_save_mutex held.
+static bool WriteSaveBatch(const ConfigSaveBatch& batch) {
+    s_ini_write_error = ERROR_SUCCESS;
+    // Directory creation is also writer-side. Paths are already snapshotted.
+    const auto ensure_directory = [](const char* path) {
+        char directory[MAX_PATH] = {};
+        snprintf(directory, MAX_PATH, "%s", path);
+        if (char* slash = strrchr(directory, '\\')) {
+            *slash = '\0';
+            const int error = SHCreateDirectoryExA(nullptr, directory, nullptr);
+            if (error != ERROR_SUCCESS && error != ERROR_ALREADY_EXISTS &&
+                error != ERROR_FILE_EXISTS)
+                s_ini_write_error = static_cast<DWORD>(error);
+        }
+    };
+    if (batch.config) {
+        if (batch.config->settings.shared_presets)
+            ensure_directory(batch.config->presets_path.data());
+        WriteConfigSnapshot(*batch.config);
+    }
+    for (const auto& presets : batch.presets) {
+        if (!presets) continue;
+        ensure_directory(presets->path.data());
+        for (int slot = 0; slot < OSD_MAX_PRESET_SLOTS; ++slot)
+            WritePresetToINI(slot, presets->slots[slot], presets->path.data());
+    }
+    if (s_ini_write_error != ERROR_SUCCESS) {
+        LOG_ERROR("Config: INI persistence failed (error=%lu)", s_ini_write_error);
+        return false;
+    }
+    return true;
+}
+
+// Newer values supersede failures only for the same destination. Bounded even
+// when a file stays unwritable; no retries/spin until a request or explicit drain.
+static void MergeSaveBatch(ConfigSaveBatch* batch, ConfigSaveBatch&& newer) {
+    if (newer.config) batch->config = std::move(newer.config);
+    for (size_t i = 0; i < batch->presets.size(); ++i)
+        if (newer.presets[i]) batch->presets[i] = std::move(newer.presets[i]);
+}
+
+static DWORD WINAPI ConfigWriterMain(void*) {
+    bool final_retry_attempted = false;
+    for (;;) {
+        ConfigSaveBatch batch;
+        {
+            std::unique_lock<std::mutex> lock(s_save_mutex);
+            s_save_wakeup.wait(lock, [] {
+                return s_save_stopping || !s_pending_save.Empty();
+            });
+            if (s_pending_save.Empty() && s_save_stopping) {
+                // Retry a retained failure once, including a write that failed
+                // while stop was arriving. Never spin on an unwritable file.
+                if (s_failed_save.Empty() || final_retry_attempted) break;
+                final_retry_attempted = true;
+            }
+            batch = std::move(s_failed_save);
+            s_failed_save = {};
+            MergeSaveBatch(&batch, std::move(s_pending_save));
+            s_pending_save = {};
+            s_save_busy = true;
+        }
+        bool saved = false;
+        try {
+            std::lock_guard<std::mutex> io_lock(s_ini_mutex);
+            saved = WriteSaveBatch(batch);
+        } catch (...) {
+            LOG_ERROR("Config: writer rejected an exception while saving settings");
+        }
+        {
+            std::lock_guard<std::mutex> lock(s_save_mutex);
+            if (!saved) s_failed_save = std::move(batch);
+            s_save_busy = false;
+        }
+        s_save_wakeup.notify_all();
+    }
+    return 0;
+}
+
+static void Config_StartWriter() {
+    std::lock_guard<std::mutex> lock(s_save_mutex);
+    if (s_config_writer || s_save_stopping) return;
+    s_config_writer = CreateThread(nullptr, 0, ConfigWriterMain, nullptr, 0, nullptr);
+    if (!s_config_writer)
+        LOG_ERROR("Config: writer creation failed (%lu); queued settings retained, no shutdown I/O fallback",
+                  GetLastError());
+}
+
+void RequestSaveConfig() {
+    if (s_ini_path[0] == '\0') return;
+    auto snapshot = CaptureConfigSave();
+    {
+        std::lock_guard<std::mutex> lock(s_save_mutex);
+        s_pending_save.config = std::move(snapshot);
+    }
+    s_save_wakeup.notify_one();
+}
+
+static void RequestPresetSave() {
+    if (s_ini_path[0] == '\0') return;
+    PresetSaveSnapshot snapshot;
+    snprintf(snapshot.path.data(), snapshot.path.size(), "%s", GetPresetsINIPath());
+    for (size_t i = 0; i < s_user_presets.size() && i < snapshot.slots.size(); ++i)
+        snapshot.slots[i] = s_user_presets[i];
+    const size_t destination = g_config.shared_presets && s_shared_presets_path[0] ? 1 : 0;
+    {
+        std::lock_guard<std::mutex> lock(s_save_mutex);
+        s_pending_save.presets[destination] = std::move(snapshot);
+    }
+    s_save_wakeup.notify_one();
+}
+
+bool Config_FlushPending() {
+    // Lifecycle/explicit reload only: producer callers must be quiesced.
+    std::unique_lock<std::mutex> lock(s_save_mutex);
+    // Shutdown owns the final worker drain. This API must not bypass its join
+    // timeout, or wait forever on a worker that has already exited with failures.
+    if (s_save_stopping)
+        return s_pending_save.Empty() && s_failed_save.Empty() && !s_save_busy;
+    if (s_config_writer) {
+        s_save_wakeup.wait(lock, [] { return s_pending_save.Empty() && !s_save_busy; });
+    }
+    // Retry failed writes, or drain without a worker (CreateThread failure).
+    // Never invoked as a fallback by RequestSaveConfig/RequestPresetSave.
+    auto batch = std::move(s_failed_save);
+    s_failed_save = {};
+    MergeSaveBatch(&batch, std::move(s_pending_save));
+    s_pending_save = {};
+    s_save_busy = true;
+    lock.unlock();
+    bool saved = true;
+    if (!batch.Empty()) {
+        std::lock_guard<std::mutex> io_lock(s_ini_mutex);
+        saved = WriteSaveBatch(batch);
+    }
+    lock.lock();
+    if (!saved) s_failed_save = std::move(batch);
+    s_save_busy = false;
+    lock.unlock();
+    s_save_wakeup.notify_all();
+    return saved;
+}
+
+bool Config_Shutdown(DWORD timeout_ms) {
+    // Owner calls after callback/producer rundown, never under loader lock.
+    {
+        std::lock_guard<std::mutex> lock(s_save_mutex);
+        s_save_stopping = true;
+    }
+    s_save_wakeup.notify_all();
+    if (s_config_writer) {
+        if (WaitForSingleObject(s_config_writer, timeout_ms) != WAIT_OBJECT_0) {
+            LOG_ERROR("Config: writer shutdown timed out; retain module and logger");
+            return false;
+        }
+        CloseHandle(s_config_writer);
+        s_config_writer = nullptr;
+    }
+    // No synchronous retry: even a single profile API can block indefinitely.
+    // A missing worker with pending data is a safe failure, not a UI I/O fallback.
+    std::lock_guard<std::mutex> lock(s_save_mutex);
+    return s_pending_save.Empty() && s_failed_save.Empty() && !s_save_busy;
 }
 
 void SaveConfig() {
     if (s_ini_path[0] == '\0') return;
-
-    const char* S = "FrameLimiter";
-    const char* P = s_ini_path;
-
-    // ── Core ──
-    WriteINIInt(S, "target_fps", g_config.target_fps, P);
-    WriteINIInt(S, "background_fps", g_config.background_fps, P);
-    WriteINIInt(S, "fg_off_fps", g_config.fg_off_fps, P);
-    WriteINIString(S, "vsync_mode", g_config.vsync_mode.c_str(), P);
-    WriteINIString(S, "enforcement_marker", g_config.enforcement_marker.c_str(), P);
-    WriteINIDouble(S, "initial_wake_guard_us", g_config.initial_wake_guard_us, P);
-
-    // ── Screen ──
-    WriteINIString(S, "window_mode", g_config.window_mode.c_str(), P);
-    WriteINIBool(S, "fake_fullscreen", g_config.fake_fullscreen, P);
-    WriteINIInt(S, "selected_monitor", g_config.selected_monitor, P);
-    WriteINIBool(S, "focus_lock", g_config.focus_lock, P);
-
-    WriteINIString(S, "oled_care_key", g_config.oled_care_key.c_str(), P);
-    WriteINIBool(S, "oled_care_all_monitors", g_config.oled_care_all_monitors, P);
-    WriteINIInt(S, "oled_care_idle_minutes", g_config.oled_care_idle_minutes, P);
-
-    // ── OSD ──
-    WriteINIBool(S, "osd_enabled", g_config.osd_enabled, P);
-    WriteINIDouble(S, "osd_x", g_config.osd_x, P);
-    WriteINIDouble(S, "osd_y", g_config.osd_y, P);
-    WriteINIDouble(S, "osd_opacity", g_config.osd_opacity, P);
-    WriteINIDouble(S, "osd_scale", g_config.osd_scale, P);
-    WriteINIBool(S, "osd_drop_shadow", g_config.osd_drop_shadow, P);
-    WriteINIDouble(S, "osd_text_brightness", g_config.osd_text_brightness, P);
-    WriteINIString(S, "osd_toggle_key", g_config.osd_toggle_key.c_str(), P);
-    WriteINIString(S, "osd_position_cycle_key", g_config.osd_position_cycle_key.c_str(), P);
-
-    // ── OSD Elements ──
-    WriteINIBool(S, "osd_show_fps", g_config.osd_show_fps, P);
-    WriteINIBool(S, "osd_show_frametime", g_config.osd_show_frametime, P);
-    WriteINIBool(S, "osd_show_frametime_graph", g_config.osd_show_frametime_graph, P);
-    WriteINIBool(S, "osd_show_1pct_low", g_config.osd_show_1pct_low, P);
-    WriteINIBool(S, "osd_show_0_1pct_low", g_config.osd_show_0_1pct_low, P);
-    WriteINIBool(S, "osd_show_cpu_latency", g_config.osd_show_cpu_latency, P);
-    WriteINIBool(S, "osd_show_native_pcl", g_config.osd_show_native_pcl, P);
-    WriteINIBool(S, "osd_show_native_pcl_breakdown", g_config.osd_show_native_pcl_breakdown, P);
-    WriteINIBool(S, "osd_show_gpu_render_time", g_config.osd_show_gpu_render_time, P);
-    WriteINIBool(S, "osd_show_total_frame_cost", g_config.osd_show_total_frame_cost, P);
-    WriteINIBool(S, "osd_show_fg_time", g_config.osd_show_fg_time, P);
-    WriteINIBool(S, "osd_show_pqi", g_config.osd_show_pqi, P);
-    WriteINIBool(S, "osd_show_pqi_breakdown", g_config.osd_show_pqi_breakdown, P);
-    WriteINIBool(S, "osd_show_smoothness", g_config.osd_show_smoothness, P);
-    WriteINIBool(S, "osd_show_fg", g_config.osd_show_fg, P);
-    WriteINIBool(S, "osd_show_limiter", g_config.osd_show_limiter, P);
-    WriteINIBool(S, "osd_show_adaptive_smoothing", g_config.osd_show_adaptive_smoothing, P);
-    WriteINIBool(S, "osd_show_gpu_temp", g_config.osd_show_gpu_temp, P);
-    WriteINIBool(S, "osd_show_gpu_clock", g_config.osd_show_gpu_clock, P);
-    WriteINIBool(S, "osd_show_gpu_usage", g_config.osd_show_gpu_usage, P);
-    WriteINIBool(S, "osd_show_vram", g_config.osd_show_vram, P);
-    WriteINIBool(S, "osd_show_cpu_usage", g_config.osd_show_cpu_usage, P);
-    WriteINIBool(S, "osd_show_ram", g_config.osd_show_ram, P);
-    WriteINIBool(S, "osd_show_dlss_quality", g_config.osd_show_dlss_quality, P);
-    WriteINIBool(S, "osd_show_dlss_features", g_config.osd_show_dlss_features, P);
-    WriteINIBool(S, "osd_show_dlss_resolution", g_config.osd_show_dlss_resolution, P);
-    WriteINIBool(S, "osd_show_dlss_presets", g_config.osd_show_dlss_presets, P);
-    WriteINIBool(S, "osd_show_dlss_versions", g_config.osd_show_dlss_versions, P);
-
-    // ── OSD Presets & Keybinds ──
-    WriteINIBool(S, "shared_presets", g_config.shared_presets, P);
-    if (g_config.shared_presets) {
-        const char* SP = GetPresetsINIPath();
-        if (SP[0] != '\0') {
-            WriteINIString("Presets", "prev_key", g_config.osd_preset_prev_key.c_str(), SP);
-            WriteINIString("Presets", "next_key", g_config.osd_preset_next_key.c_str(), SP);
-            WriteINIString("Presets", "blackout_key", g_config.blackout_key.c_str(), SP);
-        }
-    } else {
-        WriteINIString(S, "osd_preset_prev_key", g_config.osd_preset_prev_key.c_str(), P);
-        WriteINIString(S, "osd_preset_next_key", g_config.osd_preset_next_key.c_str(), P);
-        WriteINIString(S, "blackout_key", g_config.blackout_key.c_str(), P);
+    {
+        std::lock_guard<std::mutex> lock(s_save_mutex);
+        if (s_save_stopping) return;
     }
+    // Preserve synchronous semantics for init/quiescent non-UI callers, while
+    // preventing an older queued snapshot from overwriting this save.
+    if (!Config_FlushPending())
+        LOG_ERROR("Config: prior queued persistence failed before synchronous save");
+    ConfigSaveBatch batch;
+    {
+        std::lock_guard<std::mutex> lock(s_save_mutex);
+        batch = std::move(s_failed_save);
+        s_failed_save = {};
+    }
+    batch.config = CaptureConfigSave();
+    bool saved;
+    {
+        std::lock_guard<std::mutex> io_lock(s_ini_mutex);
+        saved = WriteSaveBatch(batch);
+    }
+    if (!saved) {
+        std::lock_guard<std::mutex> lock(s_save_mutex);
+        s_failed_save = std::move(batch);
+    }
+}
 
-    // ── Frame-Time Adaptation ──
-    WriteINIBool(S, "adaptive_smoothing", g_config.adaptive_smoothing, P);
-    WriteINIDouble(S, "smoothing_percentile", g_config.smoothing_percentile, P);
-    WriteINIString(S, "smoothing_window", g_config.smoothing_window.c_str(), P);
-    WriteINIDouble(S, "smoothing_release_speed", g_config.smoothing_release_speed, P);
-    WriteINIDouble(S, "smoothing_bias_us", g_config.smoothing_bias_us, P);
-    WriteINIString(
-        S,
-        "adaptive_deadline_reserve_mode",
-        g_config.adaptive_deadline_reserve_mode.c_str(),
-        P);
+// Pipeline configuration of the resolver and the source stage (design 2.4, 2.8).
+static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
+    PacingPipelineConfig pipeline;
+    pipeline.smoothing = config.smoothing;
+    pipeline.rung_override = config.output_rung;
+    pipeline.adaptive_cap = config.adaptive_cap;
+    pipeline.adaptive_cap_percentile = config.adaptive_cap_percentile;
+    pipeline.placement_override = config.source_placement;
+    pipeline.gpu_probes = config.gpu_present_gate_probes;
+    pipeline.stall_inject_ms = config.stall_inject_ms;
+    pipeline.stall_inject_period_s = config.stall_inject_period_s;
+    pipeline.gpu_wait_budget_us = config.gpu_wait_budget_us;
+    pipeline.gpu_wait_interleave_s = config.gpu_wait_interleave_s;
+    pipeline.gpu_queue_wait_render_queue = config.gpu_queue_wait_render_queue;
+    return pipeline;
+}
 
-    // ── Experimental arrival-lead predictor ──
-    WriteINIString(S, "estimator_a_mode", g_config.estimator_a_mode.c_str(), P);
-    WriteINIDouble(S, "estimator_a_fixed_reserve_us",
-                   g_config.estimator_a_fixed_reserve_us, P);
+void Config_ApplyPacingPipeline() {
+    // adaptive_cap (Q1 a, P3-5) reaches the period governor through the
+    // pipeline configuration; the scheduler owner applies it each frame.
+    PacingPipeline_SetConfig(PacingPipelineConfigFrom(g_config));
+    g_marker_forward_after_wait.store(
+        g_config.marker_forward_order == PacingMarkerForwardOrder::AfterWait,
+        std::memory_order_relaxed);
+    g_reflex_sleep_bypass.store(g_config.reflex_sleep_bypass, std::memory_order_relaxed);
+}
 
-    // ── Frame Generation ──
-    WriteINIBool(S, "dynamic_mfg_passthrough", g_config.dynamic_mfg_passthrough, P);
+int Config_DeveloperOverrides() {
+    const Config& d = s_default_config;
+    return (g_config.smoothing != d.smoothing) + (g_config.output_rung != d.output_rung) +
+        (g_config.gpu_present_gate_probes != d.gpu_present_gate_probes) +
+        (g_config.gpu_wait_budget_us != d.gpu_wait_budget_us) +
+        (g_config.gpu_wait_interleave_s != d.gpu_wait_interleave_s) +
+        (g_config.stall_inject_ms != d.stall_inject_ms) +
+        (g_config.stall_inject_period_s != d.stall_inject_period_s) +
+        (g_config.reflex_sleep_bypass != d.reflex_sleep_bypass) +
+        (g_config.marker_forward_order != d.marker_forward_order) +
+        (g_config.gpu_queue_wait_render_queue != d.gpu_queue_wait_render_queue) +
+        (g_config.source_placement != d.source_placement);
+}
 
-    // ── Advanced ──
-    WriteINIBool(S, "reflex_inject", g_config.reflex_inject, P);
-    WriteINIBool(S, "flip_model_override", g_config.flip_model_override, P);
-    WriteINIString(S, "log_level", g_config.log_level.c_str(), P);
-    WriteINIBool(S, "csv_enabled", g_config.csv_enabled, P);
-    WriteINIBool(S, "native_pcl_enabled", g_config.native_pcl_enabled, P);
-    WriteINIBool(S, "dlss_info_hooks", g_config.dlss_info_hooks, P);
-    if (!g_config.streamline_compat)
-        WriteINIString(S, "streamline_compat", "force_false", P);
-    else
-        WriteINIString(S, "streamline_compat", "true", P);
+void Config_ResetDeveloperSettings() {
+    const Config& d = s_default_config;
+    g_config.smoothing = d.smoothing;
+    g_config.output_rung = d.output_rung;
+    g_config.gpu_present_gate_probes = d.gpu_present_gate_probes;
+    g_config.gpu_wait_budget_us = d.gpu_wait_budget_us;
+    g_config.gpu_wait_interleave_s = d.gpu_wait_interleave_s;
+    g_config.stall_inject_ms = d.stall_inject_ms;
+    g_config.stall_inject_period_s = d.stall_inject_period_s;
+    g_config.reflex_sleep_bypass = d.reflex_sleep_bypass;
+    g_config.marker_forward_order = d.marker_forward_order;
+    g_config.gpu_queue_wait_render_queue = d.gpu_queue_wait_render_queue;
+    g_config.source_placement = d.source_placement;
+    Config_ApplyPacingPipeline();
+    LOG_INFO("Config: developer diagnostics reset to the recommended defaults");
 }
 
 void ApplyConfig() {
@@ -468,55 +904,38 @@ void ApplyConfig() {
     if (g_config.dynamic_mfg_passthrough)
         g_fg_mode.store(2, std::memory_order_relaxed);
 
-    // DMFG output cap
-    g_dmfg_output_cap.store(g_config.dmfg_output_cap, std::memory_order_relaxed);
-
-    // Frame-time adaptation; legacy INI key names remain stable.
-    g_frame_time_adaptation.SetConfig(
-        g_config.smoothing_window == "dual",
-        g_config.smoothing_percentile,
-        g_config.adaptive_smoothing,
-        g_config.smoothing_release_speed);
-
-    AdaptiveDeadlineReserve_SetRuntimeConfig(
-        AdaptiveDeadlineReserve_ModeFromText(
-            g_config.adaptive_deadline_reserve_mode.c_str()),
-        g_config.adaptive_smoothing,
-        g_config.smoothing_bias_us);
-
-    ArrivalLead_SetRuntimeConfig(
-        ArrivalLead_ModeFromText(g_config.estimator_a_mode.c_str()),
-        g_config.estimator_a_fixed_reserve_us);
+    Config_ApplyPacingPipeline();
+    LOG_INFO("Reflex Sleep bypass: %s (applies while ReLimiter paces a positive cap; render handoff limit for frames not held)",
+        g_config.reflex_sleep_bypass?"on":"off");
+    if (g_config.marker_forward_order != PacingMarkerForwardOrder::BeforeWait)
+        LOG_WARN("Diagnostic NvAPI marker forward order: %s (driver sees the paced release)",
+            PacingMarkerForwardOrder_Text(g_config.marker_forward_order));
+    LOG_INFO("Pacing pipeline: smoothing=%s adaptive_cap=%u adaptive_cap_percentile=%d output_rung=%s source_placement=%s probes=%u gpu_wait_budget_us=%.0f",
+        PacingSmoothing_Text(g_config.smoothing), g_config.adaptive_cap ? 1u : 0u,
+        g_config.adaptive_cap_percentile,
+        PacingRungOverride_Text(g_config.output_rung),
+        PacingPlacementOverride_Text(g_config.source_placement),
+        g_config.gpu_present_gate_probes ? 1u : 0u, g_config.gpu_wait_budget_us);
+    if (g_config.stall_inject_ms > 0.0)
+        LOG_WARN("Pacing pipeline: diagnostic stall injector %.1f ms every %.1f s",
+            g_config.stall_inject_ms, g_config.stall_inject_period_s);
+    if (g_config.gpu_wait_interleave_s > 0.0)
+        LOG_WARN("Pacing pipeline: diagnostic GPU wait A/B interleave, held / not-held blocks of about %.1f s",
+                 g_config.gpu_wait_interleave_s);
+    if (g_config.gpu_queue_wait_render_queue != PacingRenderQueue::Keep)
+        LOG_WARN("Pacing pipeline: diagnostic GPU queue wait render queue: %s (the lead leaves out the "
+                 "simulation -> render queue%s)", PacingRenderQueue_Text(g_config.gpu_queue_wait_render_queue),
+                 g_config.gpu_queue_wait_render_queue == PacingRenderQueue::RemoveHeld
+                     ? " after frames whose GPU waited at the gate" : "");
 }
 
 
 // ── OSD Presets ──
 
-#include <vector>
-#include <ShlObj.h>
-static std::vector<OSDPreset> s_user_presets;
-static char s_shared_presets_path[MAX_PATH] = {};
-
 // Returns the INI path for preset storage — shared or per-game depending on config.
 static const char* GetPresetsINIPath() {
-    if (g_config.shared_presets) {
-        if (s_shared_presets_path[0] == '\0') {
-            // Build %LOCALAPPDATA%/RHI/ReLimiter_Presets/presets.ini
-            char local[MAX_PATH] = {};
-            if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, local))) {
-                snprintf(s_shared_presets_path, MAX_PATH, "%s\\RHI\\ReLimiter_Presets\\presets.ini", local);
-                // Create directory if it doesn't exist
-                char dir[MAX_PATH];
-                snprintf(dir, MAX_PATH, "%s\\RHI", local);
-                CreateDirectoryA(dir, nullptr);
-                snprintf(dir, MAX_PATH, "%s\\RHI\\ReLimiter_Presets", local);
-                CreateDirectoryA(dir, nullptr);
-                LOG_INFO("Shared presets path: %s", s_shared_presets_path);
-            }
-        }
-        if (s_shared_presets_path[0] != '\0')
-            return s_shared_presets_path;
-    }
+    if (g_config.shared_presets && s_shared_presets_path[0] != '\0')
+        return s_shared_presets_path;
     return s_ini_path;
 }
 
@@ -543,6 +962,7 @@ OSDPreset OSDPreset_FromConfig() {
     p.show_pqi_breakdown    = g_config.osd_show_pqi_breakdown;
     p.show_1pct_low         = g_config.osd_show_1pct_low;
     p.show_smoothness       = g_config.osd_show_smoothness;
+    p.show_pacing_quality   = g_config.osd_show_pacing_quality;
     p.show_adaptive_smoothing = g_config.osd_show_adaptive_smoothing;
     p.show_0_1pct_low       = g_config.osd_show_0_1pct_low;
     p.show_gpu_render_time  = g_config.osd_show_gpu_render_time;
@@ -580,6 +1000,7 @@ void OSDPreset_ApplyToConfig(const OSDPreset& p) {
     g_config.osd_show_pqi_breakdown    = p.show_pqi_breakdown;
     g_config.osd_show_1pct_low         = p.show_1pct_low;
     g_config.osd_show_smoothness       = p.show_smoothness;
+    g_config.osd_show_pacing_quality   = p.show_pacing_quality;
     g_config.osd_show_adaptive_smoothing = p.show_adaptive_smoothing;
     g_config.osd_show_0_1pct_low       = p.show_0_1pct_low;
     g_config.osd_show_gpu_render_time  = p.show_gpu_render_time;
@@ -611,6 +1032,7 @@ void OSDPreset_ApplyTogglesOnly(const OSDPreset& p) {
     g_config.osd_show_pqi_breakdown    = p.show_pqi_breakdown;
     g_config.osd_show_1pct_low         = p.show_1pct_low;
     g_config.osd_show_smoothness       = p.show_smoothness;
+    g_config.osd_show_pacing_quality   = p.show_pacing_quality;
     g_config.osd_show_adaptive_smoothing = p.show_adaptive_smoothing;
     g_config.osd_show_0_1pct_low       = p.show_0_1pct_low;
     g_config.osd_show_gpu_render_time  = p.show_gpu_render_time;
@@ -679,6 +1101,7 @@ static void ReadPresetFromINI(int i, const char* P) {
     p.show_pqi_breakdown    = ReadINIBool(S, "show_pqi_breakdown", false, P);
     p.show_1pct_low         = ReadINIBool(S, "show_1pct_low", false, P);
     p.show_smoothness       = ReadINIBool(S, "show_smoothness", false, P);
+    p.show_pacing_quality   = ReadINIBool(S, "show_pacing_quality", false, P);
     p.show_adaptive_smoothing = ReadINIBool(S, "show_adaptive_smoothing", false, P);
     p.show_0_1pct_low       = ReadINIBool(S, "show_0_1pct_low", false, P);
     p.show_gpu_render_time  = ReadINIBool(S, "show_gpu_render_time", false, P);
@@ -699,6 +1122,14 @@ static void ReadPresetFromINI(int i, const char* P) {
 
 void OSDPreset_LoadAll() {
     if (s_ini_path[0] == '\0') return;
+    {
+        std::lock_guard<std::mutex> lock(s_save_mutex);
+        if (s_save_stopping) return;
+    }
+    // Explicit reload/init only, not a render-thread API. Do not reload stale
+    // disk contents over queued manual preset saves/deletes.
+    if (!Config_FlushPending()) return;
+    std::lock_guard<std::mutex> io_lock(s_ini_mutex);
     const char* P = GetPresetsINIPath();
 
     s_user_presets.clear();
@@ -725,16 +1156,17 @@ void OSDPreset_LoadAll() {
 void OSDPreset_SaveSlot(int slot) {
     if (s_ini_path[0] == '\0') return;
     if (slot < 0 || slot >= static_cast<int>(s_user_presets.size())) return;
-    const char* P = GetPresetsINIPath();
+    RequestPresetSave();
+}
 
+static void WritePresetToINI(int slot, const OSDPreset& p, const char* P) {
     char section[32];
     snprintf(section, sizeof(section), "OSD_Preset_%d", slot + 1);
     const char* S = section;
 
     // Clear the section first to remove stale keys
-    WritePrivateProfileStringA(S, nullptr, nullptr, P);
+    WriteINIString(S, nullptr, nullptr, P);
 
-    const OSDPreset& p = s_user_presets[slot];
     if (!p.occupied) return;
 
     WriteINIString(S, "name", p.name, P);
@@ -754,6 +1186,7 @@ void OSDPreset_SaveSlot(int slot) {
     WriteINIBool(S, "show_pqi_breakdown", p.show_pqi_breakdown, P);
     WriteINIBool(S, "show_1pct_low", p.show_1pct_low, P);
     WriteINIBool(S, "show_smoothness", p.show_smoothness, P);
+    WriteINIBool(S, "show_pacing_quality", p.show_pacing_quality, P);
     WriteINIBool(S, "show_adaptive_smoothing", p.show_adaptive_smoothing, P);
     WriteINIBool(S, "show_0_1pct_low", p.show_0_1pct_low, P);
     WriteINIBool(S, "show_gpu_render_time", p.show_gpu_render_time, P);
@@ -775,31 +1208,11 @@ void OSDPreset_SaveSlot(int slot) {
 void OSDPreset_DeleteSlot(int slot) {
     if (slot < 0 || slot >= static_cast<int>(s_user_presets.size())) return;
 
-    const char* P = GetPresetsINIPath();
-
-    // Remove the INI section
-    if (P[0] != '\0') {
-        char section[32];
-        snprintf(section, sizeof(section), "OSD_Preset_%d", slot + 1);
-        WritePrivateProfileStringA(section, nullptr, nullptr, P);
-    }
-
     // Remove from vector (shifts higher slots down)
     s_user_presets.erase(s_user_presets.begin() + slot);
 
-    // Re-save all remaining slots so INI indices stay contiguous
-    if (P[0] != '\0') {
-        for (int i = slot; i < OSD_MAX_PRESET_SLOTS; i++) {
-            char section[32];
-            snprintf(section, sizeof(section), "OSD_Preset_%d", i + 1);
-            WritePrivateProfileStringA(section, nullptr, nullptr, P);
-        }
-        for (int i = slot; i < static_cast<int>(s_user_presets.size()); i++) {
-            if (s_user_presets[i].occupied)
-                OSDPreset_SaveSlot(i);
-        }
-    }
-
     // Ensure minimum slots
     EnsureMinSlots();
+    // Includes empty trailing slots, so deletion cannot resurrect stale INI sections.
+    RequestPresetSave();
 }

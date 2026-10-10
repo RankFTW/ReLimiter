@@ -14,14 +14,16 @@ This file is the root, always-on guidance for AI coding agents. Keep shared poli
 
 - `.agents/skills/AGENTS.md` - authoring and maintenance rules for project workflow skills.
 - `src/AGENTS.md` - production C++ code, hooks, timing, concurrency, telemetry, and runtime verification.
-- `tests/AGENTS.md` - standalone model tests and their coverage limitations.
+- `tests/AGENTS.md` - C++ tests (production units with stubs, some copied models), Python tool tests, and their coverage limitations.
 - `docs/AGENTS.md` - user-facing documentation and historical technical reports.
 - `deps/AGENTS.md` - external submodules and dependency boundaries.
+- `project-docs/AGENTS.md` - work-item records (design, changelog, acceptance, summary), how to resume work, and the live verification loop.
 
 ## Repository boundaries and sources of truth
 
 - ReLimiter is a Windows ReShade addon built with CMake and MSVC. Current `CMakeLists.txt` and current source code are authoritative for implemented behavior.
 - Use `README.md` and `docs/USER_GUIDE.md` for the current user-facing contract. Use `CHANGELOG.md` for historical context. Treat `TODO.md`, `.kiro/`, `frameview/`, reports, plans, captures, and analysis scripts as potentially historical evidence, not specifications.
+- `project-docs/<NNN_work_item>/` holds the engineering record of each work item. The active one is `002_unified_pacing_timing`: its `summary.md` (current state and open items) is the entry point, `changelog.md` (append-only, newest at the end) the full evidence trail, and `phase4_design.md` the design with numbered, dated sections. Read them before changing pacing behavior; current source still wins on what is implemented.
 - Do not edit generated CMake/MSBuild output under `build/` or `build32/`.
 - Treat `debug_data/`, `frameview/`, and `logs/` as captures, diagnostics, or research inputs rather than production source.
 - Do not change external submodules in `deps/`, release automation, or global build policy unless the task explicitly requires it.
@@ -57,13 +59,22 @@ cmake --build build32 --config Release --parallel
 ctest --test-dir build32/tests -C Release --output-on-failure
 ```
 
+Python tooling (capture analysis scripts under `.agents/skills/`, simulators under `tools/`) has standard-library tests under `tests/`:
+
+```powershell
+python -m unittest discover -s tests
+```
+
+Remove the `__pycache__` folders the run leaves under `tools/`, `tests/` and `.agents/`.
+
 `build.bat` is a convenience wrapper with a machine-specific Visual Studio path and generator; do not rewrite it merely to make it work on another machine. Timing, hook, swapchain, driver, ETW, and frame-generation changes require relevant live-game verification in addition to compilation. Report exactly which builds, tests, capture comparisons, and runtime scenarios were or were not performed.
+
+Before a beta or release build reaches users, work through `project-docs/beta_checklist_4.0.md`. A push to `main` with a new `VERSION` publishes a GitHub release automatically (`.github/workflows/release.yml`).
 
 ## Workflow skills
 
 Project workflow skills live under `.agents/skills/<name>/SKILL.md`. When a request matches a listed domain, read the matching skill before planning, analyzing captures, or editing production code:
 
-- `live-mcp-pacing-debugging` - read-only discovery and live pacing diagnostics through the MCP-enabled ReLimiter addon and bridge.
-- `pacing-capture-analysis` - offline ReLimiter scheduler CSV, native PCL ETW CSV, and FrameView capture inspection, filtering, comparison, and reporting.
+- `pacing-capture-analysis` - offline ReLimiter joined pacing and pacing-event CSV and FrameView capture inspection, filtering, comparison, and reporting.
 
 Use `.agents/skills/README.md` for skill discovery and handoff boundaries. Add a skill only for a repeatable, task-specific procedure that would make always-on guidance too large.

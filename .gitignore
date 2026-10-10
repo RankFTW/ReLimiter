@@ -27,5 +27,16 @@ adaptive-smoothing-fix.md
 kiro-auto-knowledge-guide.md
 
 debug_data/
-build-mcp/
-build-mcp32/
+build-release/
+build-release32/
+
+# Raw captures and research inputs (archive under debug_data/sessions/)
+frameview/
+gears_of_war_eday/
+rogue_core_captures/
+
+# Machine-specific editor tasks (Visual Studio generator and paths)
+.vscode/tasks.json
+
+# Python caches left by the tool tests
+__pycache__/

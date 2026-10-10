@@ -14,6 +14,10 @@ The standalone test (`test_scheduler_passthrough.cpp`) validates the **logic** o
 the passthrough gating decision by modeling the control flow as pure functions.
 The procedures below verify the **actual runtime behavior** in a live game session.
 
+Telemetry below refers to the pacing capture (`relimiter_pacing_*.csv`,
+Telemetry Logging). `source_flags` bits: 1 slept, 8 fixed refresh,
+16 background, 32 passthrough, 128 stall injected (2, 4 and 64 are retired).
+
 ---
 
 ## Test 1: OnMarker Early-Returns During DMFG (Req 4.1)
@@ -24,40 +28,41 @@ The procedures below verify the **actual runtime behavior** in a live game sessi
 
 **Steps**:
 1. Launch a DLSS 4.5 game with Dynamic MFG enabled (or enable `dynamic_mfg_passthrough=true` in INI)
-2. Enable ReLimiter CSV telemetry logging
+2. Enable Telemetry Logging
 3. Play for 30+ seconds with the frame limiter target set to a value below native FPS
 
 **Expected**:
-- CSV `sleep_duration_us` column shows 0 or near-0 for all frames during DMFG
+- Rows during Dynamic MFG carry `source_flags` with the passthrough bit (32)
+  and without the slept bit (1)
 - Frame times are NOT clamped to the limiter target — they follow the game/driver cadence
-- Log file contains "DMFG passthrough active — skipping frame pacing" (first occurrence only)
+- Log file contains "DMFG active — passthrough/cap mode" (first occurrence only)
 
 **Verify non-regression**: Disable DMFG (set `dynamic_mfg_passthrough=false`, restart game).
 Confirm frame times ARE clamped to the limiter target as before.
 
 ---
 
-## Test 2: OnMarker Still Calls Health/Tier/Predictor During DMFG (Req 4.2, 4.3)
+## Test 2: OnMarker Still Runs Health and Records Every Release During DMFG (Req 4.2, 4.3)
 
 **Preconditions**: Same as Test 1
 
 **Steps**:
-1. With DMFG active, observe the OSD tier indicator
-2. Check CSV telemetry for predictor columns (enforcement timestamps)
+1. With DMFG active, keep Telemetry Logging on
+2. Enter and leave a loading screen or menu
 
 **Expected**:
-- Tier display continues updating (health system is running)
-- Predictor enforcement timestamps are present in CSV rows during DMFG
-  (the `enforcement_ts` or equivalent column is non-zero)
-- If the game enters a loading screen or menu, tier may change — this confirms
-  health/tier logic is still executing
+- Pacing rows keep a `source_release_qpc` for every real frame during DMFG
+  (the scheduler still runs and records each release)
+- If the swapchain becomes invalid (device loss, occlusion), the log shows
+  "Scheduler: swapchain invalid, pacing suspended" and later "resumed"; this
+  confirms the health check still executes
 
 ---
 
 ## Test 3: EnfDisp_OnPresent Skips Enforcement During DMFG (Req 5.1)
 
 **Preconditions**: Same as Test 1, using a present-based enforcement path
-(DX11 game, or DX12 game without NvAPI markers)
+(DX11 game without Reflex, or DX12 game without NvAPI markers)
 
 **Steps**:
 1. With DMFG active, observe frame pacing behavior
@@ -80,7 +85,6 @@ Confirm frame times ARE clamped to the limiter target as before.
 **Expected**:
 - OSD FPS counter displays the actual output frame rate (including FG frames)
 - FPS counter does NOT freeze or show 0 during DMFG passthrough
-- The `g_output_fps` value in CSV telemetry is non-zero and tracks actual present rate
 
 ---
 
@@ -98,27 +102,28 @@ Confirm frame times ARE clamped to the limiter target as before.
 **Expected**:
 - Transition is seamless within 1-2 frames
 - No crashes, hangs, or visual artifacts during transition
-- Predictor warms up quickly after DMFG deactivation (kept fresh during passthrough)
+- Pacing resumes after DMFG deactivation: the grid starts a ModeChange epoch
+  (`grid_epoch` event) and the lead buckets stay warm
 
 ---
 
-## Test 6: CSV Telemetry Continues During DMFG Passthrough (Req 10.1)
+## Test 6: Telemetry Continues During DMFG Passthrough (Req 10.1)
 
 **Preconditions**: Same as Test 1
 
 **Steps**:
-1. Enable CSV telemetry (`csv_enabled=true` or toggle in settings)
+1. Enable Telemetry Logging
 2. Enable DMFG passthrough
 3. Play for 30+ seconds
-4. Open the CSV file
+4. Open the `relimiter_pacing_*.csv` file
 
 **Expected**:
-- CSV file contains one row per frame during DMFG passthrough (no gaps)
-- `frame_id` column increments monotonically
-- `timestamp_us` column has valid, increasing timestamps
-- `fg_divisor` column reflects the DMFG multiplier (3–6)
-- `sleep_duration_us` is 0 for all DMFG passthrough frames
-- `overload` is 0 for all DMFG passthrough frames
+- Rows continue during DMFG passthrough; `sequence` has no gaps
+- `frame_id` increases monotonically within a `producer_epoch`
+- `source_release_qpc` values are valid and increasing
+- `fg_divisor` reflects the DMFG multiplier (3–6)
+- `source_flags` carries the passthrough bit (32) and never the slept (1)
+  or overload (64) bits for DMFG passthrough frames
 
 ---
 

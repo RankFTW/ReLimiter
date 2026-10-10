@@ -1,45 +1,29 @@
 #include "scheduler.h"
-#include "predictor.h"
+#include "source_stage.h"
+#include "pacing_resolver.h"
 #include "fg_divisor.h"
 #include "display_state.h"
 #include "vblank_thread.h"
-#include "damping.h"
-#include "sleep.h"
-#include "hw_spin.h"
 #include "wake_guard.h"
 #include "sleep_mode.h"
 #include "feedback.h"
-#include "correlator.h"
-#include "stress_detector.h"
-#include "cadence_meter.h"
-#include "feedback.h"
 #include "nvapi_hooks.h"
 #include "pll.h"
-#include "presentation_gate.h"
 #include "enforcement_dispatcher.h"
-#include "tier.h"
 #include "health.h"
 #include "swapchain_manager.h"
-#include "pcl_hooks.h"
-#include "flush.h"
-#include "csv_writer.h"
-#include "pqi.h"
-#include "baseline.h"
-#include "reflex_inject.h"
+#include "native_present_gate.h"
 #include "streamline_hooks.h"
 #include "focus_lock.h"
 #include "blackout.h"
-#include "frame_time_adaptation.h"
+#include "period_governor.h"
+#include "rung_feasibility.h"
+#include "source_placement.h"
 #include "pacing_sleep.h"
-#include "fractional_qpc_interval.h"
+#include "render_handoff.h"
 #include "frame_timeline.h"
-#include "arrival_lead_estimator.h"
-#include "adaptive_deadline_reserve.h"
-#include "config.h"
+#include "pacing_telemetry.h"
 #include "logger.h"
-#ifdef RELIMITER_ENABLE_MCP
-#include "live_debug.h"
-#endif
 #include <Windows.h>
 #include <algorithm>
 #include <cmath>
@@ -49,171 +33,28 @@
 std::atomic<int>    g_user_target_fps{0};
 std::atomic<int>    g_background_fps{30};
 std::atomic<int>    g_fg_off_fps{0};
-std::atomic<int>    g_dmfg_output_cap{0};
-std::atomic<bool>   g_overload_active_flag{false};
 std::atomic<double> g_actual_frame_time_us{0.0};
+std::atomic<uint64_t> g_actual_frame_sample_sequence{0};
 std::atomic<double> g_effective_interval_us{0.0};
-std::atomic<double> g_smoothness_us{0.0};
-static std::atomic<uint64_t> s_smoothness_generation{0};
+
+// ── OSD cadence and Smoothness publication ──
+// Changes only on lifecycle invalidation. Plain cadence state remains
+// scheduler-owned.
+static std::atomic<uint64_t> s_cadence_bypass_generation{0};
+static std::atomic<uint64_t> s_published_cadence_generation{0};
+static std::atomic<uint32_t> s_published_cadence_epoch{0};
+static std::atomic<uint32_t> s_published_cadence_controller_generation{0};
+static std::atomic<SchedulerTrigger> s_published_cadence_trigger{
+    SchedulerTrigger::NvApiMarker};
+static SchedulerCadenceVariation s_cadence_variation; // scheduler owner only
+static std::atomic<double> s_published_cadence_variation_us{-1.0}; // -1 = unavailable
+static SchedulerCadenceTracker s_telemetry_cadence;
 
 void Scheduler_ResetSmoothness() noexcept {
-    uint64_t generation =
-        s_smoothness_generation.load(std::memory_order_acquire);
-    for (;;) {
-        if ((generation & 1u) != 0) {
-            SwitchToThread();
-            generation = s_smoothness_generation.load(
-                std::memory_order_acquire);
-            continue;
-        }
-        if (s_smoothness_generation.compare_exchange_weak(
-                generation,
-                generation + 1,
-                std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
-            break;
-        }
-    }
-    g_smoothness_us.store(0.0, std::memory_order_release);
-    s_smoothness_generation.store(
-        generation + 2,
-        std::memory_order_release);
+    s_cadence_bypass_generation.fetch_add(1, std::memory_order_seq_cst);
 }
 
-static void Scheduler_UpdateSmoothness(
-    uint64_t expected_generation,
-    bool predictor_warm,
-    double telemetry_frame_time_us,
-    double effective_interval_us) noexcept
-{
-    const bool valid_sample = predictor_warm &&
-        telemetry_frame_time_us > 0.0 &&
-        telemetry_frame_time_us < effective_interval_us * 4.0;
-    if (predictor_warm && !valid_sample) return;
-
-    // Reset and update are both writers. Claim the odd generation before
-    // touching the value so an old-regime frame can neither republish stale
-    // Smoothness nor erase a newer frame after an asynchronous reset.
-    uint64_t generation = expected_generation;
-    if ((generation & 1u) != 0 ||
-        !s_smoothness_generation.compare_exchange_strong(
-            generation,
-            generation + 1,
-            std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
-        return;
-    }
-
-    if (!valid_sample) {
-        g_smoothness_us.store(0.0, std::memory_order_relaxed);
-    }
-    else {
-        const double deviation = std::abs(
-            telemetry_frame_time_us - effective_interval_us);
-        const double previous =
-            g_smoothness_us.load(std::memory_order_relaxed);
-        const double smoothed = previous > 0.0
-            ? previous + 0.16 * (deviation - previous)
-            : deviation;
-        g_smoothness_us.store(smoothed, std::memory_order_relaxed);
-    }
-    s_smoothness_generation.store(
-        expected_generation + 2,
-        std::memory_order_release);
-}
-std::atomic<Tier> g_current_tier{Tier0};
-std::atomic<bool>    g_skip_present_gate{false};
-
-// ── VRR scheduler state ──
-static int64_t s_last_present_deadline = 0;
-static int64_t s_last_enforcement_ts = 0;
-static FractionalQpcInterval s_interval_qpc_accumulator;
-static ArrivalLeadDeadlinePhase s_arrival_lead_deadline_phase{};
-
-// LFC hysteresis
-static int  s_lfc_below_count = 0;
-static int  s_lfc_above_count = 0;
-static bool s_lfc_active = false;
-
-// Deadline miss tracking (replaces binary overload hysteresis).
-// A frame "misses" when the deadline chain falls behind `now`, i.e. the game
-// couldn't finish within the target interval. The miss ratio is an EMA of
-// per-frame miss events (1.0 = missed, 0.0 = on time). Downstream consumers
-// use the continuous ratio instead of a binary flag, giving smooth transitions
-// between GPU-bound and sleep-capable states.
-static double s_miss_ratio = 0.0;
-static constexpr double MISS_EMA_ALPHA = 0.08;  // ~12-frame response time
-
-// Background FPS cap
-static bool s_was_focused = true;
-static bool s_background_mode = false;
-
-// Telemetry tracking
-static int64_t s_prev_enforcement_ts = 0;
-static double  s_prev_actual_ft = 0.0;
-static double  s_last_own_sleep_us = 0.0;
-static double  s_ema_non_sleep_us = 0.0;  // EMA of observed non-sleep time
-
-// Presentation-aware latency correction: EMA of the gap between the
-// scheduler's actual_frame_time and the measured present_interval.
-// When the display consistently shows frames later than the scheduler
-// expects, this captures the pipeline latency offset.
-static double  s_ema_present_latency_us = 0.0;
-
-// ── Scanout-anchored deadline state ──
-// Tracks the last known presentation interval from Reflex gpuFrameTimeUs
-// (or CadenceMeter as fallback). Used to anchor the deadline chain to
-// actual display events rather than the enforcement timestamp, eliminating
-// the integrator dynamics that cause lag-1 oscillation.
-// See: VK_EXT_present_timing research — the deadline tracks reality
-// rather than an idealized clock.
-static int64_t s_last_scanout_anchor_qpc = 0;
-
-// ── Deadline chain oscillation tracking ──
-// The deadline chain acts as a discrete integrator: when frame N overshoots
-// by X µs, drift decreases by X µs, causing frame N+1 to sleep X µs less
-// and undershoot by ~X µs. This produces a lag-1 autocorrelation of ~-0.54
-// in frame time deviations — a systematic alternating overshoot/undershoot.
-//
-// We track the previous frame's deviation for diagnostics. Direct correction
-// (adding alpha * prev_deviation to the wake target) was attempted but creates
-// a resonant feedback loop — the correction changes the actual frame time,
-// which changes the deviation, which amplifies the next correction. The
-// session 26 data showed this escalating from ±235µs to ±1500µs.
-//
-// The oscillation is inherent to the deadline chain's integrator dynamics.
-// The correct fix must operate on the deadline chain itself (e.g., filtering
-// the deadline advance) rather than patching the wake target.
-static double s_prev_frame_deviation_us = 0.0;
-
-// ── DMFG output cap JIT predictor state ──
-static double s_ema_render_cost = 0.0;         // EMA of native render cost (µs)
-static double s_last_own_sleep_cap_us = 0.0;   // sleep time from last cap frame
-static int    s_prev_cap_mult = 0;             // for logging multiplier transitions
-static int    s_prev_output_cap = 0;           // for detecting cap 0↔nonzero transitions
-
-// ── EMA-smoothed actual multiplier ──
-static double s_ema_mult = 0.0;
-
-// ── Output feedback controller (v5) ──
-static double s_interval_correction_us = 0.0;
-static int    s_feedback_frame_counter = 0;
-static constexpr int FEEDBACK_TICK_FRAMES = 15;
-static constexpr double FEEDBACK_MAX_CORRECTION = 30000.0;
-
-// ── Forward declarations ──
-static void OnMarker_VRR(
-    uint64_t frameID,
-    int64_t now,
-    SchedulerTrigger trigger,
-    ArrivalLeadMarker marker);
-static void OnMarker_Fixed(
-    uint64_t frameID,
-    int64_t now,
-    SchedulerTrigger trigger,
-    ArrivalLeadMarker marker);
-static double ComputeEffectiveInterval_Fixed();
-static void FlushAll();
+// ── Frame identity ──
 
 static bool GetMarkerTimelineContext(
     SchedulerTrigger trigger,
@@ -238,554 +79,1851 @@ static bool GetMarkerTimelineContext(
     }
 }
 
-static ArrivalLeadKey GetArrivalLeadKey(
-    uint64_t frame_id,
-    SchedulerTrigger trigger) noexcept
+static PacingIdentityDomain ToPacingIdentityDomain(FrameIdentityDomain domain) noexcept
+{
+    switch (domain) {
+        case FrameIdentityDomain::NvApiFrame: return PacingIdentityDomain::NvApiFrame;
+        case FrameIdentityDomain::PclFrame: return PacingIdentityDomain::PclFrame;
+        case FrameIdentityDomain::SyntheticPresentFrame:
+            return PacingIdentityDomain::SyntheticPresentFrame;
+        default: return PacingIdentityDomain::Unknown;
+    }
+}
+
+PacingPlanKey Scheduler_MakePlanKey(uint64_t frame_id, SchedulerTrigger trigger) noexcept
 {
     FrameTimelinePath timeline_path{};
     FrameIdentityDomain identity_domain{};
-    if (!GetMarkerTimelineContext(trigger, &timeline_path, &identity_domain)) {
-        return {};
-    }
-
-    ArrivalLeadKey key{};
-    switch (identity_domain) {
-        case FrameIdentityDomain::NvApiFrame:
-            key.identity_domain = ArrivalLeadIdentityDomain::NvApiFrame;
-            break;
-        case FrameIdentityDomain::PclFrame:
-            key.identity_domain = ArrivalLeadIdentityDomain::PclFrame;
-            break;
-        case FrameIdentityDomain::SyntheticPresentFrame:
-            key.identity_domain =
-                ArrivalLeadIdentityDomain::SyntheticPresentFrame;
-            break;
-        default:
-            return {};
-    }
+    if (!GetMarkerTimelineContext(trigger, &timeline_path, &identity_domain)) return {};
+    PacingPlanKey key{};
+    key.identity_domain = ToPacingIdentityDomain(identity_domain);
+    if (key.identity_domain == PacingIdentityDomain::Unknown) return {};
     key.producer_epoch = FrameTimeline_CurrentProducerEpoch(identity_domain);
     key.controller_generation = FrameTimeline_CurrentControllerGeneration();
     key.frame_id = frame_id;
     return key;
 }
 
-SchedulerFrameDeadline Scheduler_TakeFrameDeadline(
-    uint64_t frame_id,
-    SchedulerTrigger trigger) noexcept
-{
-    SchedulerFrameDeadline result{};
-    const ArrivalLeadKey frame_key = GetArrivalLeadKey(frame_id, trigger);
-    ArrivalLeadKey published_key{};
-    int64_t deadline_qpc = 0;
-    if (!g_arrival_lead_estimator.TryTakeFrameDeadline(
-            frame_key,
-            &published_key,
-            &deadline_qpc) ||
-        published_key.identity_domain != frame_key.identity_domain ||
-        published_key.producer_epoch != frame_key.producer_epoch ||
-        published_key.controller_generation !=
-            frame_key.controller_generation ||
-        published_key.frame_id != frame_key.frame_id) {
-        return result;
-    }
-    if (frame_key.controller_generation !=
-        FrameTimeline_CurrentControllerGeneration()) {
-        return result;
-    }
-    result.deadline_qpc = deadline_qpc;
-    result.producer_epoch = frame_key.producer_epoch;
-    result.controller_generation = frame_key.controller_generation;
-    return result;
-}
-
-void Scheduler_PublishMarkerArrival(
-    uint64_t frame_id,
-    int64_t arrival_qpc,
-    SchedulerTrigger trigger) noexcept
-{
-    if (trigger != SchedulerTrigger::NvApiMarker) return;
-    g_arrival_lead_estimator.PublishMarkerArrival(
-        GetArrivalLeadKey(frame_id, trigger),
-        arrival_qpc);
-}
-
-static void PublishArrivalLeadFallbackStatus(
-    uint64_t frame_id,
+static SchedulerCadenceContext GetCadenceContext(
+    const PacingPlanKey& key,
     SchedulerTrigger trigger,
-    ArrivalLeadMarker marker,
-    ArrivalLeadFallbackReason reason) noexcept
+    PacingSourceMarker marker,
+    SchedulerCadenceRegime regime,
+    int target_fps = 0) noexcept
 {
-    // Every top-level scheduler fallback ends the continuous Estimator A
-    // presentation phase. The legacy deadline chain remains independently
-    // owned by the active pacing path.
-    s_arrival_lead_deadline_phase = {};
-    const ArrivalLeadRuntimeConfig config = ArrivalLead_GetRuntimeConfig();
-    ArrivalLeadDecision decision{};
-    decision.key = GetArrivalLeadKey(frame_id, trigger);
-    decision.mode = config.mode;
-    decision.marker = marker;
-    decision.fallback_reason = config.mode == ArrivalLeadMode::Off
-        ? ArrivalLeadFallbackReason::Disabled
-        : reason;
-    decision.reserve_us = config.fixed_reserve_us;
-    ArrivalLead_PublishRuntimeStatus(decision);
+    SchedulerCadenceContext context{};
+    context.frame_id = key.frame_id;
+    context.producer_epoch = key.producer_epoch;
+    context.controller_generation = key.controller_generation;
+    context.bypass_generation =
+        s_cadence_bypass_generation.load(std::memory_order_seq_cst);
+    context.trigger = trigger;
+    context.marker = static_cast<uint8_t>(marker);
+    context.regime = regime;
+    context.target_fps = target_fps;
+    return context;
 }
 
-static void PublishReleaseTimelineEvent(
-    FrameTimelineEventType type,
-    uint64_t frame_id,
-    int64_t event_qpc,
-    int64_t target_qpc,
-    uint32_t flags,
-    SchedulerTrigger trigger,
-    const ArrivalLeadDecision* arrival_lead_decision = nullptr,
-    const AdaptiveDeadlineReserveDecision* adaptive_reserve_decision = nullptr,
-    int64_t legacy_target_qpc = 0,
-    int64_t estimator_target_qpc = 0)
+static SchedulerCadenceObservation PublishCadence(
+    const SchedulerCadenceContext& context,
+    int64_t timestamp_qpc) noexcept
 {
-    if (!FrameTimeline_IsEnabled()) return;
+    const PacingPlanKey current = Scheduler_MakePlanKey(
+        context.frame_id, context.trigger);
+    const bool generation_current =
+        context.producer_epoch == current.producer_epoch &&
+        context.controller_generation == current.controller_generation &&
+        context.bypass_generation ==
+            s_cadence_bypass_generation.load(std::memory_order_seq_cst);
+    const SchedulerCadenceObservation observation = s_telemetry_cadence.Observe(
+        context, timestamp_qpc, generation_current);
+    s_cadence_variation.Observe(observation);
 
-    FrameTimelinePath timeline_path;
-    FrameIdentityDomain identity_domain;
-    if (!GetMarkerTimelineContext(
-        trigger, &timeline_path, &identity_domain)) return;
-
-    FrameTimelineEvent event;
-    event.key.identity_domain = identity_domain;
-    event.key.normalized_frame_id = frame_id;
-    event.type = type;
-    event.path = timeline_path;
-    event.flags = flags;
-    event.event_qpc = event_qpc;
-    event.capture_qpc = event_qpc;
-    event.target_qpc = target_qpc;
-    event.legacy_target_qpc = legacy_target_qpc;
-    event.estimator_target_qpc = estimator_target_qpc;
-    if (arrival_lead_decision != nullptr) {
-        FrameTimeline_AttachArrivalLeadDecision(
-            &event,
-            *arrival_lead_decision);
-    }
-    if (adaptive_reserve_decision != nullptr) {
-        event.adaptation_configured_reserve_us =
-            adaptive_reserve_decision->configured_reserve_us;
-        event.adaptive_reserve_proposed_us =
-            adaptive_reserve_decision->proposed_reserve_us;
-        event.adaptive_reserve_applied_us =
-            adaptive_reserve_decision->applied_reserve_us;
-        event.adaptive_reserve_mode = adaptive_reserve_decision->mode;
-        event.adaptive_reserve_authority =
-            adaptive_reserve_decision->authority;
-        event.adaptive_reserve_fallback_reason =
-            adaptive_reserve_decision->fallback_reason;
-        event.adaptive_reserve_sample_count =
-            adaptive_reserve_decision->sample_count;
-        event.adaptive_reserve_active_capped =
-            adaptive_reserve_decision->active_capped;
-    }
-    FrameTimeline_Publish(event);
+    // Atomic payload plus a bounded sequence read: no reader/writer spinning,
+    // no extra owner acquisition, and no torn double on Win32. Sequentially
+    // consistent accesses keep the whole publication in one total order.
+    g_actual_frame_sample_sequence.fetch_add(1, std::memory_order_seq_cst);
+    g_actual_frame_time_us.store(
+        observation.valid ? qpc_to_us(observation.interval_qpc) : 0.0,
+        std::memory_order_seq_cst);
+    s_published_cadence_variation_us.store(s_cadence_variation.IsValid()
+        ? s_cadence_variation.ValueQpc() * 1'000'000.0 /
+            static_cast<double>(GetQPCFrequency())
+        : -1.0, std::memory_order_seq_cst);
+    s_published_cadence_generation.store(
+        context.bypass_generation, std::memory_order_seq_cst);
+    s_published_cadence_epoch.store(
+        context.producer_epoch, std::memory_order_seq_cst);
+    s_published_cadence_controller_generation.store(
+        context.controller_generation, std::memory_order_seq_cst);
+    s_published_cadence_trigger.store(context.trigger, std::memory_order_seq_cst);
+    g_actual_frame_sample_sequence.fetch_add(1, std::memory_order_seq_cst);
+    return observation;
 }
 
-static void DrainAdaptiveReserveObservations() noexcept
+bool Scheduler_ReadActualFrameSample(SchedulerActualFrameSample* sample) noexcept
 {
-    AdaptiveDeadlineReserveSample sample{};
-    const uint32_t generation =
-        FrameTimeline_CurrentControllerGeneration();
-    while (g_adaptive_deadline_reserve.ProcessNext(generation, &sample)) {
-        if (!sample.valid || !FrameTimeline_IsEnabled()) continue;
+    if (sample == nullptr) return false;
+    *sample = {};
+    const uint64_t sequence =
+        g_actual_frame_sample_sequence.load(std::memory_order_seq_cst);
+    if ((sequence & 1u) != 0) return false;
+    const double frame_time_us =
+        g_actual_frame_time_us.load(std::memory_order_seq_cst);
+    const double variation_us =
+        s_published_cadence_variation_us.load(std::memory_order_seq_cst);
+    const uint64_t generation =
+        s_published_cadence_generation.load(std::memory_order_seq_cst);
+    const uint32_t epoch =
+        s_published_cadence_epoch.load(std::memory_order_seq_cst);
+    const uint32_t controller_generation =
+        s_published_cadence_controller_generation.load(std::memory_order_seq_cst);
+    const PacingPlanKey current = Scheduler_MakePlanKey(
+        0, s_published_cadence_trigger.load(std::memory_order_seq_cst));
+    const bool generation_current = generation ==
+        s_cadence_bypass_generation.load(std::memory_order_seq_cst) &&
+        epoch == current.producer_epoch &&
+        controller_generation == current.controller_generation;
+    if (sequence !=
+        g_actual_frame_sample_sequence.load(std::memory_order_seq_cst)) {
+        return false;
+    }
+    sample->sequence = sequence;
+    sample->valid = sequence != 0 && generation_current && frame_time_us > 0.0;
+    sample->frame_time_us = sample->valid ? frame_time_us : 0.0;
+    sample->variation_valid = sample->valid && std::isfinite(variation_us) &&
+        variation_us >= 0.0;
+    sample->variation_us = sample->variation_valid ? variation_us : 0.0;
+    return true;
+}
 
-        FrameTimelineEvent event{};
-        event.key = sample.key.frame;
-        event.controller_generation = sample.key.controller_generation;
-        event.type = FrameTimelineEventType::AdaptiveReserveObservation;
-        event.path = sample.path;
-        event.event_qpc = sample.gate_observation_qpc;
-        event.capture_qpc = sample.gate_observation_qpc;
-        event.adaptation_workload_offset_us = sample.workload_offset_us;
-        event.adaptation_configured_reserve_us = sample.configured_reserve_us;
-        event.adaptive_reserve_applied_us = sample.applied_reserve_us;
-        event.adaptive_reserve_proposed_us = sample.proposed_reserve_us;
-        event.adaptive_reserve_slack_us = sample.slack_us;
-        event.adaptive_reserve_required_us = sample.required_reserve_us;
-        event.adaptive_reserve_miss_ema = sample.miss_ema;
-        event.adaptive_reserve_mode = sample.mode;
-        event.adaptive_reserve_authority = sample.authority;
-        event.adaptive_reserve_fallback_reason = sample.fallback_reason;
-        event.adaptive_reserve_sample_count = sample.sample_count;
-        event.adaptive_reserve_active_capped = sample.active_capped;
-        FrameTimeline_Publish(event);
+// ── Source-stage status (OSD pacing panel): seqlock over atomics ──
+
+namespace {
+std::atomic<uint64_t> s_status_sequence{0}; // odd while publishing
+std::atomic<bool> s_status_valid{false};
+std::atomic<double> s_status_lead_us{0.0};
+std::atomic<bool> s_status_lead_warm{false};
+std::atomic<uint32_t> s_status_lead_samples{0};
+std::atomic<uint32_t> s_status_grid_epoch{0};
+std::atomic<uint64_t> s_status_grid_index{0};
+std::atomic<uint8_t> s_status_epoch_reason{0};
+std::atomic<uint64_t> s_status_stage_events_dropped{0};
+std::atomic<uint32_t> s_status_stalls_injected{0};
+std::atomic<bool> s_status_lead_budget_limited{false};
+std::atomic<bool> s_status_hold_overloaded{false};
+std::atomic<double> s_status_release_margin_us{0.0};
+std::atomic<double> s_status_release_headroom_us{0.0};
+std::atomic<bool> s_status_collision_headroom{false};
+std::atomic<double> s_status_collision_limit_us{0.0};
+std::atomic<uint32_t> s_status_collision_checked{0};
+std::atomic<uint32_t> s_status_collision_guarded{0};
+std::atomic<bool> s_status_collision_behind_wait{false};
+std::atomic<uint32_t> s_status_queue_order_pairs{0};
+std::atomic<uint32_t> s_status_release_margin_samples{0};
+std::atomic<uint32_t> s_status_release_margin_late{0};
+std::atomic<uint32_t> s_status_release_headroom_samples{0};
+std::atomic<uint32_t> s_status_release_headroom_late{0};
+std::atomic<uint8_t> s_status_hold_interleave{0};
+std::atomic<double> s_status_hold_interleave_remaining_s{0.0};
+std::atomic<double> s_status_gpu_wait_cap_us{0.0};
+std::atomic<uint8_t> s_status_gpu_wait_cap_level{0};
+std::atomic<uint32_t> s_status_gpu_wait_cap_late{0};
+std::atomic<uint32_t> s_status_gpu_wait_cap_samples{0};
+std::atomic<bool> s_status_gpu_wait_cap_checking{false};
+std::atomic<bool> s_status_gpu_wait_cap_open{false};
+std::atomic<bool> s_status_governor_enabled{false};
+std::atomic<uint8_t> s_status_governor_step{0};
+std::atomic<double> s_status_governor_stretch{1.0};
+std::atomic<uint8_t> s_status_governor_phase{0};
+std::atomic<double> s_status_governor_interval_us{0.0};
+std::atomic<double> s_status_governor_base_interval_us{0.0};
+std::atomic<uint8_t> s_status_governor_last_cause{0};
+std::atomic<uint32_t> s_status_governor_rises{0};
+std::atomic<uint32_t> s_status_governor_falls{0};
+std::atomic<uint8_t> s_status_source_placement{0};
+std::atomic<double> s_status_pre_sleep_margin_us{0.0};
+std::atomic<uint32_t> s_status_pre_sleep_samples{0};
+std::atomic<double> s_status_pre_sleep_residual_p50_us{0.0};
+std::atomic<double> s_status_pre_sleep_residual_p99_us{0.0};
+std::atomic<uint32_t> s_status_driver_limiter_interval_us{0};
+std::atomic<uint8_t> s_status_render_handoff{0};
+std::atomic<double> s_status_render_handoff_offset_us{0.0};
+std::atomic<uint32_t> s_status_render_handoff_limited{0};
+std::atomic<uint32_t> s_status_render_handoff_stalls{0};
+}
+
+static void PublishPacingStatus(const SchedulerPacingStatus& status) noexcept
+{
+    const uint64_t sequence = s_status_sequence.load(std::memory_order_relaxed);
+    s_status_sequence.store(sequence + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    s_status_valid.store(status.valid, std::memory_order_relaxed);
+    s_status_lead_us.store(status.lead_us, std::memory_order_relaxed);
+    s_status_lead_warm.store(status.lead_warm, std::memory_order_relaxed);
+    s_status_lead_samples.store(status.lead_samples, std::memory_order_relaxed);
+    s_status_grid_epoch.store(status.grid_epoch, std::memory_order_relaxed);
+    s_status_grid_index.store(status.grid_index, std::memory_order_relaxed);
+    s_status_epoch_reason.store(status.epoch_reason, std::memory_order_relaxed);
+    s_status_stage_events_dropped.store(status.stage_events_dropped, std::memory_order_relaxed);
+    s_status_stalls_injected.store(status.stalls_injected, std::memory_order_relaxed);
+    s_status_lead_budget_limited.store(status.lead_budget_limited, std::memory_order_relaxed);
+    s_status_hold_overloaded.store(status.hold_overloaded, std::memory_order_relaxed);
+    s_status_release_margin_us.store(status.release_margin_us, std::memory_order_relaxed);
+    s_status_release_headroom_us.store(status.release_headroom_us, std::memory_order_relaxed);
+    s_status_collision_headroom.store(status.collision_headroom, std::memory_order_relaxed);
+    s_status_collision_limit_us.store(status.collision_limit_us, std::memory_order_relaxed);
+    s_status_collision_checked.store(status.collision_checked, std::memory_order_relaxed);
+    s_status_collision_guarded.store(status.collision_guarded, std::memory_order_relaxed);
+    s_status_collision_behind_wait.store(status.collision_behind_wait, std::memory_order_relaxed);
+    s_status_queue_order_pairs.store(status.queue_order_pairs, std::memory_order_relaxed);
+    s_status_release_margin_samples.store(status.release_margin_samples, std::memory_order_relaxed);
+    s_status_release_margin_late.store(status.release_margin_late, std::memory_order_relaxed);
+    s_status_release_headroom_samples.store(status.release_headroom_samples, std::memory_order_relaxed);
+    s_status_release_headroom_late.store(status.release_headroom_late, std::memory_order_relaxed);
+    s_status_hold_interleave.store(status.hold_interleave, std::memory_order_relaxed);
+    s_status_hold_interleave_remaining_s.store(status.hold_interleave_remaining_s, std::memory_order_relaxed);
+    s_status_gpu_wait_cap_us.store(status.gpu_wait_cap_us, std::memory_order_relaxed);
+    s_status_gpu_wait_cap_level.store(status.gpu_wait_cap_level, std::memory_order_relaxed);
+    s_status_gpu_wait_cap_late.store(status.gpu_wait_cap_late, std::memory_order_relaxed);
+    s_status_gpu_wait_cap_samples.store(status.gpu_wait_cap_samples, std::memory_order_relaxed);
+    s_status_gpu_wait_cap_checking.store(status.gpu_wait_cap_checking, std::memory_order_relaxed);
+    s_status_gpu_wait_cap_open.store(status.gpu_wait_cap_open, std::memory_order_relaxed);
+    s_status_governor_enabled.store(status.governor_enabled, std::memory_order_relaxed);
+    s_status_governor_step.store(status.governor_step, std::memory_order_relaxed);
+    s_status_governor_stretch.store(status.governor_stretch, std::memory_order_relaxed);
+    s_status_governor_phase.store(status.governor_phase, std::memory_order_relaxed);
+    s_status_governor_interval_us.store(status.governor_interval_us, std::memory_order_relaxed);
+    s_status_governor_base_interval_us.store(status.governor_base_interval_us, std::memory_order_relaxed);
+    s_status_governor_last_cause.store(status.governor_last_cause, std::memory_order_relaxed);
+    s_status_governor_rises.store(status.governor_rises, std::memory_order_relaxed);
+    s_status_governor_falls.store(status.governor_falls, std::memory_order_relaxed);
+    s_status_source_placement.store(status.source_placement, std::memory_order_relaxed);
+    s_status_pre_sleep_margin_us.store(status.pre_sleep_margin_us, std::memory_order_relaxed);
+    s_status_pre_sleep_samples.store(status.pre_sleep_samples, std::memory_order_relaxed);
+    s_status_pre_sleep_residual_p50_us.store(status.pre_sleep_residual_p50_us, std::memory_order_relaxed);
+    s_status_pre_sleep_residual_p99_us.store(status.pre_sleep_residual_p99_us, std::memory_order_relaxed);
+    s_status_driver_limiter_interval_us.store(status.driver_limiter_interval_us, std::memory_order_relaxed);
+    s_status_render_handoff.store(status.render_handoff, std::memory_order_relaxed);
+    s_status_render_handoff_offset_us.store(status.render_handoff_offset_us, std::memory_order_relaxed);
+    s_status_render_handoff_limited.store(status.render_handoff_limited, std::memory_order_relaxed);
+    s_status_render_handoff_stalls.store(status.render_handoff_stalls, std::memory_order_relaxed);
+    s_status_sequence.store(sequence + 2, std::memory_order_release);
+}
+
+bool Scheduler_ReadPacingStatus(SchedulerPacingStatus* status) noexcept
+{
+    if (status == nullptr) return false;
+    *status = {};
+    constexpr int kAttempts = 4;
+    for (int attempt = 0; attempt < kAttempts; ++attempt) {
+        const uint64_t begin = s_status_sequence.load(std::memory_order_acquire);
+        if (begin == 0) return false; // never published
+        if ((begin & 1u) != 0) continue;
+        SchedulerPacingStatus copy{};
+        copy.valid = s_status_valid.load(std::memory_order_relaxed);
+        copy.lead_us = s_status_lead_us.load(std::memory_order_relaxed);
+        copy.lead_warm = s_status_lead_warm.load(std::memory_order_relaxed);
+        copy.lead_samples = s_status_lead_samples.load(std::memory_order_relaxed);
+        copy.grid_epoch = s_status_grid_epoch.load(std::memory_order_relaxed);
+        copy.grid_index = s_status_grid_index.load(std::memory_order_relaxed);
+        copy.epoch_reason = s_status_epoch_reason.load(std::memory_order_relaxed);
+        copy.stage_events_dropped = s_status_stage_events_dropped.load(std::memory_order_relaxed);
+        copy.stalls_injected = s_status_stalls_injected.load(std::memory_order_relaxed);
+        copy.lead_budget_limited = s_status_lead_budget_limited.load(std::memory_order_relaxed);
+        copy.hold_overloaded = s_status_hold_overloaded.load(std::memory_order_relaxed);
+        copy.release_margin_us = s_status_release_margin_us.load(std::memory_order_relaxed);
+        copy.release_headroom_us = s_status_release_headroom_us.load(std::memory_order_relaxed);
+        copy.collision_headroom = s_status_collision_headroom.load(std::memory_order_relaxed);
+        copy.collision_limit_us = s_status_collision_limit_us.load(std::memory_order_relaxed);
+        copy.collision_checked = s_status_collision_checked.load(std::memory_order_relaxed);
+        copy.collision_guarded = s_status_collision_guarded.load(std::memory_order_relaxed);
+        copy.collision_behind_wait = s_status_collision_behind_wait.load(std::memory_order_relaxed);
+        copy.queue_order_pairs = s_status_queue_order_pairs.load(std::memory_order_relaxed);
+        copy.release_margin_samples = s_status_release_margin_samples.load(std::memory_order_relaxed);
+        copy.release_margin_late = s_status_release_margin_late.load(std::memory_order_relaxed);
+        copy.release_headroom_samples = s_status_release_headroom_samples.load(std::memory_order_relaxed);
+        copy.release_headroom_late = s_status_release_headroom_late.load(std::memory_order_relaxed);
+        copy.hold_interleave = s_status_hold_interleave.load(std::memory_order_relaxed);
+        copy.hold_interleave_remaining_s =
+            s_status_hold_interleave_remaining_s.load(std::memory_order_relaxed);
+        copy.gpu_wait_cap_us = s_status_gpu_wait_cap_us.load(std::memory_order_relaxed);
+        copy.gpu_wait_cap_level = s_status_gpu_wait_cap_level.load(std::memory_order_relaxed);
+        copy.gpu_wait_cap_late = s_status_gpu_wait_cap_late.load(std::memory_order_relaxed);
+        copy.gpu_wait_cap_samples = s_status_gpu_wait_cap_samples.load(std::memory_order_relaxed);
+        copy.gpu_wait_cap_checking = s_status_gpu_wait_cap_checking.load(std::memory_order_relaxed);
+        copy.gpu_wait_cap_open = s_status_gpu_wait_cap_open.load(std::memory_order_relaxed);
+        copy.governor_enabled = s_status_governor_enabled.load(std::memory_order_relaxed);
+        copy.governor_step = s_status_governor_step.load(std::memory_order_relaxed);
+        copy.governor_stretch = s_status_governor_stretch.load(std::memory_order_relaxed);
+        copy.governor_phase = s_status_governor_phase.load(std::memory_order_relaxed);
+        copy.governor_interval_us = s_status_governor_interval_us.load(std::memory_order_relaxed);
+        copy.governor_base_interval_us = s_status_governor_base_interval_us.load(std::memory_order_relaxed);
+        copy.governor_last_cause = s_status_governor_last_cause.load(std::memory_order_relaxed);
+        copy.governor_rises = s_status_governor_rises.load(std::memory_order_relaxed);
+        copy.governor_falls = s_status_governor_falls.load(std::memory_order_relaxed);
+        copy.source_placement = s_status_source_placement.load(std::memory_order_relaxed);
+        copy.pre_sleep_margin_us = s_status_pre_sleep_margin_us.load(std::memory_order_relaxed);
+        copy.pre_sleep_samples = s_status_pre_sleep_samples.load(std::memory_order_relaxed);
+        copy.pre_sleep_residual_p50_us = s_status_pre_sleep_residual_p50_us.load(std::memory_order_relaxed);
+        copy.pre_sleep_residual_p99_us = s_status_pre_sleep_residual_p99_us.load(std::memory_order_relaxed);
+        copy.driver_limiter_interval_us = s_status_driver_limiter_interval_us.load(std::memory_order_relaxed);
+        copy.render_handoff = s_status_render_handoff.load(std::memory_order_relaxed);
+        copy.render_handoff_offset_us = s_status_render_handoff_offset_us.load(std::memory_order_relaxed);
+        copy.render_handoff_limited = s_status_render_handoff_limited.load(std::memory_order_relaxed);
+        copy.render_handoff_stalls = s_status_render_handoff_stalls.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (s_status_sequence.load(std::memory_order_relaxed) != begin) continue;
+        *status = copy;
+        return true;
+    }
+    return false;
+}
+
+// ── Scheduler owner state ──
+
+namespace {
+// Production clock of the source stage: QPC and the existing two-phase sleep
+// (waitable timer + hardware spin, adaptive wake guard).
+class QpcSourceClock final : public SourceStageClock {
+public:
+    int64_t Now() noexcept override {
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        return now.QuadPart;
+    }
+    bool WaitUntil(int64_t target_qpc) noexcept override { return TryOwnSleep(target_qpc); }
+    void Stall(int64_t until_qpc) noexcept override { TryOwnSleep(until_qpc); }
+};
+
+QpcSourceClock s_clock;
+SourceStage s_source_stage; // ~125 KB: static storage only
+SourceStageLifecycleTracker s_lifecycle_tracker;
+SourceStagePeriodTracker s_period_tracker;
+uint32_t s_stage_generation = 0;
+bool s_stage_initialized = false;
+PacingSourceMarker s_last_marker = PacingSourceMarker::Unknown;
+bool s_marker_known = false;
+
+// Scheduler owner: the timestamp argument of the OnMarker call in progress.
+int64_t s_source_marker_qpc = 0;
+
+bool s_suspended = false;
+bool s_was_focused = true;
+bool s_background_mode = false;
+bool s_was_oled_care_active = false;
+bool s_dmfg_state_initialized = false;
+bool s_last_dmfg_active = false;
+
+// Period regime (cap and raw FG divisor): the governor step and the rung
+// feasibility evidence belong to the interval they were observed on.
+int s_last_target_fps = -1;
+int s_last_fg_divisor_raw = 0;
+
+// Period governor C2 (phase3_controllers_design.md 2.2, 2.5). Owner only.
+PeriodGovernor s_period_governor;
+GovernorDecision s_governor_decision{}; // newest governed frame's decision (status)
+double s_governor_base_interval_us = 0.0; // that frame's I_0 (status)
+// A governor miss seen since the previous governed plan: that plan started a
+// SourceLate epoch or its lead was infeasible, or a drain started an
+// OutputLate epoch. Consumed by the next governed frame.
+bool s_governor_miss_pending = false;
+// Lead slack samples already given to the governor (output evidence).
+uint64_t s_governor_outputs_seen = 0;
+uint64_t s_governor_late_outputs_seen = 0;
+// Overload guard (C3, design review 2026-10-03). Owner only. Overload
+// demotes every Auto hold rung to source only. Output overrides are never
+// changed.
+HoldFeasibility s_hold_feasibility;
+bool s_restart_pending = false; // SourceLate (not pre-Sleep-late) or OutputLate since the previous governed frame
+// Developer A/B interleave (gpu_wait_interleave_s, 2026-10-05). Owner only.
+HoldInterleave s_hold_interleave;
+bool s_interleave_active = false;
+// FeasibilityCause of the newest guard or interleave transition (Source records).
+FeasibilityCause s_feasibility_cause = FeasibilityCause::None;
+// GPU queue wait cap ladder (2026-10-04). Owner only. The lead's waited and
+// late resume counters already given to it, and the cause of a level change
+// not yet on a Source record (gpu_wait_cap events).
+GpuWaitCap s_gpu_wait_cap;
+uint64_t s_gpu_wait_resumes_seen = 0;
+uint64_t s_gpu_wait_late_resumes_seen = 0;
+GpuWaitCapCause s_gpu_wait_cap_cause_pending = GpuWaitCapCause::None;
+// Collision-aware release: the release margin and headroom last logged, and
+// the guard of the newest judged lead last logged (-1 none, 0 margin, 1 headroom).
+double s_logged_release_margin_us = LEAD_MARGIN_START_US;
+double s_logged_release_headroom_us = LEAD_HEADROOM_LIMITS.start_us;
+int s_logged_collision_guard = -1;
+// The first lead sample that left out the game's simulation → render queue
+// (lead_controller.h) has been logged. Once per process.
+bool s_logged_lead_queue = false;
+// The queue-order verdict last logged (lead_controller.h): the next frame's
+// GPU work runs behind the wait, so the collision guard stands aside.
+bool s_logged_behind_wait = false;
+PacingRoute s_last_route = PacingRoute::None;
+bool s_route_known = false;
+
+// Pre-Sleep placement (phase4_design.md P4-8 to P4-10). Owner only.
+PreSleepPlacement s_pre_sleep;
+// Newest planned frame: the pre-wait predicts the next index from it.
+uint64_t s_last_plan_index = 0;
+uint32_t s_last_plan_generation = 0;
+double s_last_plan_lead_us = 0.0;
+double s_last_plan_interval_us = 0.0;
+int64_t s_last_plan_release_qpc = 0;
+// Margin of the newest pre-wait and the index it was made for (telemetry).
+uint64_t s_pre_sleep_wait_index = 0;
+double s_pre_sleep_wait_margin_us = 0.0;
+// Reflex Sleep on the presenting device: written by the Sleep hook (any
+// thread), read by the owner for placement availability.
+std::atomic<int64_t> s_last_reflex_sleep_qpc{0};
+// Render handoff limit (phase4_design.md section 23). Owner: the newest
+// released planned frame; whether the limit is blocked (a wait stalled
+// before any handoff sample showed the render thread taking a frame ahead of
+// the next release: a render thread that may wait for that release); waits
+// that stalled; frames the limit delayed past S; whether the first of each
+// was logged.
+PacingPlanKey s_handoff_released{};
+bool s_handoff_blocked = false;
+uint64_t s_handoff_stalls = 0;
+uint64_t s_handoff_limited_frames = 0;
+bool s_handoff_logged = false;
+bool s_handoff_stall_logged = false;
+// For the Reflex Sleep hook (any thread): the newest released frame whose
+// handoff the next frame waits for (0 = the next frame is not limited), its
+// stream (identity domain << 24 | producer epoch), and hook waits that
+// stalled (consumed by the owner).
+std::atomic<uint64_t> s_handoff_hook_frame{0};
+std::atomic<uint32_t> s_handoff_hook_stream{0};
+std::atomic<uint32_t> s_handoff_hook_stalls{0};
+
+// LFC hysteresis
+int  s_lfc_below_count = 0;
+int  s_lfc_above_count = 0;
+bool s_lfc_active = false;
+
+// DMFG pacing-control input/timestamps (the DMFG caps keep their relative sleeps).
+int64_t s_prev_enforcement_ts = 0;
+double  s_control_actual_frame_time_us = 0.0;
+}
+
+static void ResetLfc() noexcept
+{
+    s_lfc_active = false;
+    s_lfc_below_count = 0;
+    s_lfc_above_count = 0;
+}
+
+static PacingApi ToPacingApi(ActiveAPI api) noexcept
+{
+    switch (api) {
+        case ActiveAPI::DX9: return PacingApi::DX9;
+        case ActiveAPI::DX11: return PacingApi::DX11;
+        case ActiveAPI::DX12: return PacingApi::DX12;
+        case ActiveAPI::Vulkan: return PacingApi::Vulkan;
+        case ActiveAPI::OpenGL: return PacingApi::OpenGL;
+        default: return PacingApi::None;
     }
 }
 
-static bool s_pacing_regime_changed_this_frame = false;
-
-static void HandlePacingRegimeChange(
-    int64_t now,
-    int fg_divisor_raw,
-    int target_fps,
-    bool bypass_path_changed,
-    SchedulerTrigger trigger) noexcept
+static PacingRoute ToPacingRoute(EnforcementPath path) noexcept
 {
-    static int s_last_fg_divisor_raw = 0;
-    static int s_last_target_fps = -1;
-    static bool s_path_state_initialized = false;
-    static PacingMode s_last_pacing_mode = PacingMode::VRR;
-    static EnforcementPath s_last_enforcement_path = EnforcementPath::None;
-    static SchedulerTrigger s_last_trigger = SchedulerTrigger::PresentFallback;
-    const PacingMode pacing_mode =
-        g_pacing_mode.load(std::memory_order_relaxed);
-    const EnforcementPath enforcement_path = EnfDisp_GetActivePath();
-    const bool fg_changed = s_last_fg_divisor_raw != 0 &&
-        fg_divisor_raw != s_last_fg_divisor_raw;
-    const bool fps_changed = s_last_target_fps >= 0 &&
-        target_fps != s_last_target_fps;
-    const bool pacing_mode_changed = s_path_state_initialized &&
-        pacing_mode != s_last_pacing_mode;
-    const bool enforcement_path_changed = s_path_state_initialized &&
-        enforcement_path != s_last_enforcement_path;
-    const bool trigger_changed = s_path_state_initialized &&
-        trigger != s_last_trigger;
-    const bool pacing_path_changed = bypass_path_changed ||
-        pacing_mode_changed || enforcement_path_changed || trigger_changed;
-    s_pacing_regime_changed_this_frame =
-        fg_changed || fps_changed || pacing_path_changed;
-
-    if (s_pacing_regime_changed_this_frame) {
-        if (fg_changed) {
-            LOG_WARN("FG tier change: %d -> %d, flushing scheduler state",
-                     s_last_fg_divisor_raw, fg_divisor_raw);
-        }
-        if (fps_changed) {
-            LOG_WARN("Target FPS change: %d -> %d, flushing scheduler state",
-                     s_last_target_fps, target_fps);
-        }
-        if (pacing_path_changed) {
-            LOG_WARN(
-                "Pacing path changed (bypass=%d, mode=%d->%d, enforcement=%d->%d, "
-                "trigger=%d->%d), "
-                "flushing scheduler state",
-                bypass_path_changed ? 1 : 0,
-                static_cast<int>(s_last_pacing_mode),
-                static_cast<int>(pacing_mode),
-                static_cast<int>(s_last_enforcement_path),
-                static_cast<int>(enforcement_path),
-                static_cast<int>(s_last_trigger),
-                static_cast<int>(trigger));
-        }
-
-        g_predictor.RequestFlush();
-        g_arrival_lead_estimator.RequestReset();
-        FrameTimeline_BeginControllerGeneration();
-        g_adaptive_deadline_reserve.Reset();
-        s_last_present_deadline = now;
-        s_interval_qpc_accumulator.Reset();
-        ResetDamping();
-        g_ceiling_stress = CeilingStressDetector();
-        ResetFeedbackAccumulators();
-        ApplyFeedbackResetRequests();
-        g_frame_time_adaptation.Reset();
-        s_miss_ratio = 0.0;
-        s_ema_non_sleep_us = 0.0;
-        s_ema_present_latency_us = 0.0;
-        s_prev_frame_deviation_us = 0.0;
-        s_last_own_sleep_us = 0.0;
-        s_lfc_active = false;
-        s_lfc_below_count = 0;
-        s_lfc_above_count = 0;
-        s_arrival_lead_deadline_phase = {};
-        g_pll.Reanchor(now);
-        g_overload_active_flag.store(false, std::memory_order_relaxed);
-        Scheduler_ResetSmoothness();
+    switch (path) {
+        case EnforcementPath::NvAPIMarkers: return PacingRoute::NvApiMarkers;
+        case EnforcementPath::PCLMarkers: return PacingRoute::PclMarkers;
+        case EnforcementPath::PresentBased: return PacingRoute::PresentBased;
+        default: return PacingRoute::None;
     }
-
-    s_last_fg_divisor_raw = fg_divisor_raw;
-    s_last_target_fps = target_fps;
-    s_last_pacing_mode = pacing_mode;
-    s_last_enforcement_path = enforcement_path;
-    s_last_trigger = trigger;
-    s_path_state_initialized = true;
 }
 
-static void PublishReflexCapRelease(
-    uint64_t frame_id,
-    uint32_t producer_epoch,
-    ArrivalLeadMarker marker,
-    int64_t sleep_start_qpc,
-    int64_t sleep_end_qpc) noexcept
+// A cumulative lead counter's growth since the previous call; a lead reset
+// restarts the counters.
+static uint32_t TakeCounterDelta(uint64_t current, uint64_t* seen) noexcept
 {
-    if (producer_epoch == 0 ||
-        producer_epoch != FrameTimeline_CurrentProducerEpoch(
-            FrameIdentityDomain::NvApiFrame)) {
+    const uint64_t delta = current >= *seen ? current - *seen : current;
+    *seen = current;
+    return static_cast<uint32_t>(std::min<uint64_t>(delta, UINT32_MAX));
+}
+
+// Lead slack samples since the previous call: frames whose readiness was
+// measured, and of those, ready after their target.
+static void TakeLeadOutputs(uint32_t* outputs, uint32_t* late_outputs) noexcept
+{
+    const LeadStatistics lead = s_source_stage.Lead().Statistics();
+    *outputs = TakeCounterDelta(lead.slack_samples, &s_governor_outputs_seen);
+    *late_outputs = TakeCounterDelta(lead.negative_slack_samples, &s_governor_late_outputs_seen);
+}
+
+// Waited GPU queue wait resumes recorded since the previous call, and of
+// those, resumes later than LEAD_RESUME_LATE_US.
+static void TakeLeadResumes(uint32_t* waited, uint32_t* late) noexcept
+{
+    const LeadStatistics lead = s_source_stage.Lead().Statistics();
+    *waited = TakeCounterDelta(lead.resume_waited_samples, &s_gpu_wait_resumes_seen);
+    *late = TakeCounterDelta(lead.resume_late_samples, &s_gpu_wait_late_resumes_seen);
+}
+
+// Starts a fresh period-governor and cadence-readout history (P3-10). The
+// governor step belongs to one interval and one workload regime. Demand
+// reports and output evidence admitted before the reset describe the old
+// regime: discard them.
+static void ResetAdaptationRegime(const char* reason) noexcept
+{
+    s_period_governor.Reset();
+    s_governor_miss_pending = false;
+    s_restart_pending = false;
+    uint32_t discarded = 0;
+    TakeLeadOutputs(&discarded, &discarded);
+    DiscardReflexFrameTimeSamples();
+    Scheduler_ResetSmoothness();
+    ResetLfc();
+    LOG_INFO("Scheduler: period governor and cadence readout reset (%s)", reason);
+}
+
+// Holds resume after an overload: the resuming rungs' lead windows describe
+// frames from before it (capture 6560_1), so they restart from their old
+// median (LeadController::RestartRung).
+static void RestartResumingLeads() noexcept
+{
+    s_source_stage.RestartLead(PacingRung::GpuQueueWait);
+    s_source_stage.RestartLead(PacingRung::MarkerHold);
+    s_source_stage.RestartLead(PacingRung::NativeHold);
+    s_source_stage.RestartLead(PacingRung::FgInputWait);
+}
+
+// Ends any overload demotion; holds resume on the next resolve.
+static void ResetHoldFeasibility(const char* reason) noexcept
+{
+    if (s_hold_feasibility.Overloaded()) {
+        LOG_INFO("Hold feasibility reset (%s): holds resume (leads restarted)", reason);
+        RestartResumingLeads();
+    }
+    s_hold_feasibility.Reset();
+    s_feasibility_cause = FeasibilityCause::None;
+}
+
+// Logs a guard transition; the end of an overload restarts the resuming
+// rungs' leads.
+static void ApplyHoldTransition(const HoldFeasibilityTransition& transition) noexcept
+{
+    if (!transition.changed) return;
+    s_feasibility_cause = transition.cause;
+    if (transition.cause == FeasibilityCause::Overload) {
+        LOG_WARN("Hold feasibility: overload, %u of %u frames restarted the cadence in %.1f s; holds off until %.0f s pass without restarts",
+                 transition.misses, transition.frames, transition.elapsed_s, MISS_WINDOW_S);
         return;
     }
-    const double owned_sleep_us = sleep_end_qpc > sleep_start_qpc
-        ? qpc_to_us(sleep_end_qpc - sleep_start_qpc)
-        : 0.0;
-    PublishReflexOwnedSleep(
-        frame_id,
-        producer_epoch,
-        marker,
-        owned_sleep_us);
+    RestartResumingLeads();
+    LOG_INFO("Hold feasibility: overload over after %.0f s without restarts; holds resume (leads restarted)",
+             MISS_WINDOW_S);
 }
 
-// ── InvokeSleep wrapper ──
-// Now a no-op: the driver sleep is handled by Hook_Sleep which always
-// forwards to the driver. The scheduler no longer needs to call the
-// driver sleep separately — doing so would cause double sleep calls.
-// Kept as a function for telemetry timing brackets in the VRR loop.
-static void InvokeSleep(bool /*passthrough*/) {
-    // No-op: driver sleep happens in Hook_Sleep on every frame.
-    // When actively pacing, minimumIntervalUs=0 so driver sleep is instant.
-    // During overload, minimumIntervalUs is also 0 (no double-sleep).
+// The developer A/B interleave runs with Output override Auto and the key set.
+static bool InterleaveActive(const PacingPipelineConfig& config) noexcept
+{
+    return config.rung_override == PacingRungOverride::Auto && config.gpu_wait_interleave_s > 0.0;
+}
+
+// A new A/B block: its cause goes on the following Source records, so the
+// rung_feasibility events mark every block. Not logged per block. No lead
+// restart: the blocks are short, and the not-held frames keep the GPU queue
+// wait's lead (PacingPipeline_LeadRung).
+static void ApplyInterleaveTransition(const HoldInterleaveTransition& transition) noexcept
+{
+    if (!transition.changed) return;
+    s_feasibility_cause = transition.hold ? FeasibilityCause::AbHeld : FeasibilityCause::AbNotHeld;
+}
+
+// The GPU queue wait cap of the next plan: the ladder's level of the budget
+// while the GPU queue wait's lead plans the frame (also while it is demoted,
+// PacingPipeline_LeadRung); 0 (uncapped) otherwise.
+static double GpuWaitCapUs(const PacingPipelineSnapshot& pipeline) noexcept
+{
+    return PacingPipeline_LeadRung(pipeline) == PacingRung::GpuQueueWait
+        ? s_gpu_wait_cap.CapUs(pipeline.gpu_wait_budget_us)
+        : 0.0;
+}
+
+// A ladder level as log text: "off" for the open top, else its cap.
+static void GpuWaitCapText(uint32_t level, double budget_us, char* text, size_t size) noexcept
+{
+    if (level == GPU_WAIT_CAP_OPEN || level >= GPU_WAIT_CAP_LEVELS) {
+        std::snprintf(text, size, "off");
+        return;
+    }
+    std::snprintf(text, size, "%.0f us", budget_us * GPU_WAIT_CAP_FRACTIONS[level]);
+}
+
+static void LogGpuWaitCapTransition(const GpuWaitCapTransition& transition, double budget_us) noexcept
+{
+    if (!transition.changed) return;
+    s_gpu_wait_cap_cause_pending = transition.cause;
+    char from[32];
+    char to[32];
+    GpuWaitCapText(transition.previous_level, budget_us, from, sizeof(from));
+    GpuWaitCapText(transition.level, budget_us, to, sizeof(to));
+    switch (transition.cause) {
+    case GpuWaitCapCause::LateResumes:
+        LOG_INFO("GPU wait cap: %s -> %s (%u of %u waited resumes later than %.0f us; checked %.0f-%.0f s from now)",
+                 from, to, transition.late, transition.samples, LEAD_RESUME_LATE_US,
+                 GPU_WAIT_CAP_TRIAL_FROM_S, GPU_WAIT_CAP_TRIAL_UNTIL_S);
+        break;
+    case GpuWaitCapCause::TrialFailed:
+        LOG_INFO("GPU wait cap: %s -> %s (still %u of %u resumes late after the step down; no step down for %.0f s)",
+                 from, to, transition.late, transition.samples, GPU_WAIT_CAP_BACKOFF_S);
+        break;
+    case GpuWaitCapCause::Opened:
+        LOG_INFO("GPU wait cap: %s -> off (the next frame's GPU work runs behind the wait; "
+                 "late resumes bring the cap back)", from);
+        break;
+    case GpuWaitCapCause::Closed:
+        LOG_INFO("GPU wait cap: off -> %s (no longer Auto with probes and the next frame's GPU work behind the wait)", to);
+        break;
+    default:
+        LOG_INFO("GPU wait cap: %s -> %s (%u of %u resumes late in %.0f s)",
+                 from, to, transition.late, transition.samples, GPU_WAIT_CAP_UP_CALM_S);
+        break;
+    }
+}
+
+// The cap's open top (rung_feasibility.h GPU_WAIT_CAP_OPEN): allowed with
+// Output override Auto, GPU Wait Probes (the ladder's late-resume evidence)
+// and the queue-order verdict that the next frame's GPU work runs behind the
+// wait (lead_controller.h). Output override GPU wait keeps the budget.
+static void UpdateGpuWaitCapTop(const PacingPipelineSnapshot& pipeline, const PacingPipelineConfig& config,
+    int64_t qpc) noexcept
+{
+    const bool allowed = config.rung_override == PacingRungOverride::Auto && pipeline.gpu_probes &&
+        s_source_stage.Lead().NextGpuWorkBehindWait();
+    LogGpuWaitCapTransition(s_gpu_wait_cap.SetTopAllowed(allowed, qpc), pipeline.gpu_wait_budget_us);
+}
+
+// Feeds the cap ladder the probed GPU queue wait's newly waited resumes.
+// Resumes recorded while another rung or no probe is resolved are discarded,
+// so the ladder never judges them later.
+static void ObserveGpuWaitResumes(const PacingPipelineSnapshot& pipeline, int64_t qpc) noexcept
+{
+    uint32_t waited = 0;
+    uint32_t late = 0;
+    TakeLeadResumes(&waited, &late);
+    if (pipeline.rung != PacingRung::GpuQueueWait || !pipeline.gpu_probes || waited == 0) return;
+    LogGpuWaitCapTransition(s_gpu_wait_cap.OnResumes(qpc, GetQPCFrequency(), waited, late),
+        pipeline.gpu_wait_budget_us);
+}
+
+// Logs each step of the learned release margin and headroom, each switch
+// between the headroom guard and the Present-call margin (collision-aware
+// release), each change of the queue-order verdict, and the first lead
+// sample that left out the game's simulation → render queue.
+static void ObserveReleaseMargin() noexcept
+{
+    const LeadController& lead = s_source_stage.Lead();
+    const LeadStatistics statistics = lead.Statistics();
+    const double margin_us = lead.ReleaseMarginUs();
+    if (margin_us != s_logged_release_margin_us) {
+        LOG_INFO("Release margin: %.2f -> %.2f ms (%s; %llu of %llu waited resumes late; GPU queue wait leads guarded %llu of %llu)",
+                 s_logged_release_margin_us / 1000.0, margin_us / 1000.0,
+                 margin_us > s_logged_release_margin_us ? "late resumes closer to the release" : "clean resumes below the edge",
+                 static_cast<unsigned long long>(statistics.margin_late_samples),
+                 static_cast<unsigned long long>(statistics.margin_samples),
+                 static_cast<unsigned long long>(statistics.collision_guarded_frames),
+                 static_cast<unsigned long long>(statistics.collision_checked_frames));
+        s_logged_release_margin_us = margin_us;
+    }
+    const double headroom_us = lead.ReleaseHeadroomUs();
+    if (headroom_us != s_logged_release_headroom_us) {
+        LOG_INFO("Release headroom: %.2f -> %.2f ms (%s; %llu of %llu waited resumes late; GPU queue wait leads guarded %llu of %llu)",
+                 s_logged_release_headroom_us / 1000.0, headroom_us / 1000.0,
+                 headroom_us > s_logged_release_headroom_us ? "late resumes closer to the next frame's GPU work" : "clean resumes below the edge",
+                 static_cast<unsigned long long>(statistics.headroom_late_samples),
+                 static_cast<unsigned long long>(statistics.headroom_samples),
+                 static_cast<unsigned long long>(statistics.collision_guarded_frames),
+                 static_cast<unsigned long long>(statistics.collision_checked_frames));
+        s_logged_release_headroom_us = headroom_us;
+    }
+    if (!s_logged_lead_queue && statistics.queued_samples > 0) {
+        LOG_INFO("Lead: a sample left out %.0f us of the game's simulation -> render queue "
+                 "(sample %.0f us; the render thread was still inside the previous Present)",
+                 statistics.last_queue_us, statistics.last_sample_us);
+        s_logged_lead_queue = true;
+    }
+    const bool behind_wait = lead.NextGpuWorkBehindWait();
+    if (behind_wait != s_logged_behind_wait) {
+        if (behind_wait) {
+            LOG_INFO("Collision guard: stands aside (in the newest %zu waited releases the next frame's GPU work, "
+                     "submitting before the release, started only after it: it runs behind the wait; newest %+.0f us)",
+                     lead.ConcurrencyPairs(), statistics.last_concurrency_us);
+        } else {
+            LOG_INFO("Collision guard: back (the next frame's GPU work started %.0f us before a waited release: "
+                     "it runs beside the wait)", -statistics.last_concurrency_us);
+        }
+        s_logged_behind_wait = behind_wait;
+    }
+    if (statistics.collision_checked_frames == 0) return;
+    const int guard = statistics.last_guard_headroom ? 1 : 0;
+    if (guard == s_logged_collision_guard) return;
+    LOG_INFO("Collision guard: %s",
+             guard == 1 ? "release headroom to the next frame's heavy GPU work (Reflex GPU active time)"
+                        : "release margin to the next Present call (no current Reflex GPU active time)");
+    s_logged_collision_guard = guard;
+}
+
+// Back to the budget; resumes recorded before the reset are discarded.
+static void ResetGpuWaitCap(const char* reason) noexcept
+{
+    if (s_gpu_wait_cap.Level() != 0 || s_gpu_wait_cap.Open()) {
+        LOG_INFO("GPU wait cap reset (%s): back to the budget", reason);
+        s_gpu_wait_cap_cause_pending = GpuWaitCapCause::Reset;
+    }
+    s_gpu_wait_cap.Reset();
+    uint32_t discarded = 0;
+    TakeLeadResumes(&discarded, &discarded);
+}
+
+// Lifecycle, cap, raw FG divisor or route change: the C1 slack windows
+// restart, so the Adaptive cap's infeasible-lead misses hold only evidence
+// observed after the change; the overload guard ends any demotion and the
+// GPU wait cap returns to the budget.
+static void ResetFeasibility(const char* reason) noexcept
+{
+    s_source_stage.ClearSlackEvidence();
+    ResetHoldFeasibility(reason);
+    ResetGpuWaitCap(reason);
+    if (s_handoff_blocked) {
+        LOG_INFO("Render handoff limit: back on (%s)", reason);
+        s_handoff_blocked = false;
+    }
+}
+
+// Controller lifecycle (P2-10). The generation bumps only on API change,
+// identity-domain (trigger/route) change and producer-epoch change here;
+// Flush(FLUSH_ALL) bumps it for API change, full swapchain teardown and
+// device loss. On a new generation the grid, the frame plans and the
+// lead controller reset. An enforcement-marker change resets lead buckets only.
+static void ApplyLifecycle(SchedulerTrigger trigger, PacingSourceMarker marker) noexcept
+{
+    SourceStageLifecycle lifecycle{};
+    lifecycle.api = ToPacingApi(SwapMgr_GetActiveAPI());
+    FrameTimelinePath timeline_path{};
+    FrameIdentityDomain identity_domain{};
+    if (GetMarkerTimelineContext(trigger, &timeline_path, &identity_domain)) {
+        lifecycle.identity_domain = ToPacingIdentityDomain(identity_domain);
+        lifecycle.producer_epoch = FrameTimeline_CurrentProducerEpoch(identity_domain);
+    }
+    if (s_lifecycle_tracker.Observe(lifecycle)) {
+        const uint32_t generation = FrameTimeline_BeginControllerGeneration();
+        LOG_INFO("Scheduler: lifecycle change (api=%d, domain=%d, producer_epoch=%u) -> "
+                 "controller generation %u",
+                 static_cast<int>(lifecycle.api),
+                 static_cast<int>(lifecycle.identity_domain),
+                 lifecycle.producer_epoch, generation);
+    }
+
+    const uint32_t generation = FrameTimeline_CurrentControllerGeneration();
+    if (!s_stage_initialized || generation != s_stage_generation) {
+        s_source_stage.Reset(GetQPCFrequency());
+        s_period_tracker.Forget();
+        s_pre_sleep.Reset();
+        s_last_plan_index = 0;
+        ResetFeedbackAccumulators();
+        ApplyFeedbackResetRequests();
+        if (s_stage_initialized) {
+            ResetAdaptationRegime("controller lifecycle");
+            ResetFeasibility("controller lifecycle");
+        }
+        s_stage_generation = generation;
+        s_stage_initialized = true;
+        LOG_INFO("Scheduler: controller generation %u, cadence grid, frame plans and lead reset",
+                 generation);
+    }
+
+    if (s_marker_known && marker != s_last_marker) {
+        s_source_stage.ResetBuckets();
+        LOG_INFO("Scheduler: enforcement marker %d -> %d, lead buckets reset",
+                 static_cast<int>(s_last_marker), static_cast<int>(marker));
+    }
+    s_last_marker = marker;
+    s_marker_known = true;
+}
+
+// Resolves the pacing pipeline for this OnMarker and publishes it; logs once
+// per change. A route change restarts the feasibility evidence first.
+// Returns the published snapshot
+// (generation assigned).
+static PacingPipelineSnapshot ResolvePipeline(
+    SchedulerTrigger trigger,
+    const PacingPipelineConfig& config,
+    PacingRuntimeState runtime) noexcept
+{
+    const uint32_t generation = FrameTimeline_CurrentControllerGeneration();
+    PacingCapabilities capabilities{};
+#ifdef _WIN64
+    capabilities.x64 = true;
+#endif
+    capabilities.api = ToPacingApi(SwapMgr_GetActiveAPI());
+    // The route follows the trigger that produced this frame's plan key: the
+    // Present fallback is present-based even while the dispatcher still
+    // reports its marker path, and PCL markers on a DXGI API are the PCL
+    // route (PclFrame keys), not the NvAPI one the dispatcher reports.
+    if (trigger == SchedulerTrigger::PresentFallback) capabilities.route = PacingRoute::PresentBased;
+    else if (trigger == SchedulerTrigger::PclMarker) capabilities.route = PacingRoute::PclMarkers;
+    else capabilities.route = ToPacingRoute(EnfDisp_GetActivePath());
+    capabilities.native_route_qualified =
+        PacingPipeline_HasCapability(PacingCapability::NativeRoute, generation);
+    capabilities.gpu_queue_ready =
+        PacingPipeline_HasCapability(PacingCapability::GpuQueue, generation);
+    capabilities.fg_input_route_ready =
+        PacingPipeline_HasCapability(PacingCapability::FgInputRoute, generation);
+
+    // A Present fallback frame is a marker-flow excursion, not a route change
+    // for the evidence: it neither resets it nor becomes the tracked route.
+    if (trigger != SchedulerTrigger::PresentFallback) {
+        if (s_route_known && capabilities.route != s_last_route) ResetFeasibility("route change");
+        s_last_route = capabilities.route;
+        s_route_known = true;
+    }
+
+    // Overload guard: Auto only. The developer A/B interleave turns the Auto
+    // GPU queue wait off in its not-held blocks.
+    const bool interleave = InterleaveActive(config);
+    if (interleave != s_interleave_active) {
+        ResetHoldFeasibility(interleave ? "A/B interleave on" : "A/B interleave off");
+        s_hold_interleave.Reset();
+        s_interleave_active = interleave;
+        if (interleave) {
+            LOG_INFO("GPU wait A/B interleave on: held and not-held blocks of about %.1f s alternate",
+                     config.gpu_wait_interleave_s);
+        } else {
+            LOG_INFO("GPU wait A/B interleave off");
+        }
+    }
+    if (config.rung_override != PacingRungOverride::Auto) ResetHoldFeasibility("output override");
+    if (interleave) {
+        ApplyInterleaveTransition(
+            s_hold_interleave.Decide(s_clock.Now(), GetQPCFrequency(), config.gpu_wait_interleave_s));
+    }
+    runtime.hold_overloaded = s_hold_feasibility.Overloaded();
+    runtime.gpu_queue_wait_off = interleave && !s_hold_interleave.Holding();
+
+    const PacingPipelineSnapshot resolved =
+        PacingPipeline_Resolve(config, capabilities, runtime);
+    if (PacingPipeline_Publish(resolved)) {
+        const PacingPipelineSnapshot published = PacingPipeline_Read();
+        LOG_INFO("Pacing pipeline %u: mode=%s placement=%s rung=%s reason=%s",
+                 published.generation,
+                 PacingTimingMode_Text(published.mode),
+                 PacingSourcePlacement_Text(published.placement),
+                 PacingRung_Text(published.rung),
+                 PacingFallbackReason_Text(published.reason));
+        return published;
+    }
+    return PacingPipeline_Read();
+}
+
+// Exactly one source record per OnMarker call, pushed after its release, just
+// before it returns toward the game. The frame identity is read here.
+static void PushSourceRelease(
+    const SchedulerCadenceContext& context,
+    PacingSourceRecord* record) noexcept
+{
+    const PacingPlanKey key = Scheduler_MakePlanKey(context.frame_id, context.trigger);
+    record->key = PacingPlanKey_Frame(key);
+    record->controller_generation = key.controller_generation;
+    record->trigger = static_cast<uint8_t>(context.trigger);
+    record->marker = context.marker;
+    record->regime = static_cast<uint8_t>(context.regime);
+    record->marker_qpc = s_source_marker_qpc;
+    record->target_fps = context.target_fps;
+    // Guard and A/B interleave state (rung_feasibility events) and the GPU wait cap
+    // level, with the cause of a change not yet recorded (gpu_wait_cap events).
+    const bool interleave_off = s_interleave_active && !s_hold_interleave.Holding();
+    record->feasibility_demoted = s_hold_feasibility.Overloaded() || interleave_off ? 1 : 0;
+    record->feasibility_cause = static_cast<uint8_t>(s_feasibility_cause);
+    record->gpu_wait_cap_level = static_cast<uint8_t>(s_gpu_wait_cap.TelemetryLevel());
+    record->gpu_wait_cap_cause = static_cast<uint8_t>(s_gpu_wait_cap_cause_pending);
+    s_gpu_wait_cap_cause_pending = GpuWaitCapCause::None;
+    PacingTelemetry_PushSource(*record);
+}
+
+static int64_t QpcNow() noexcept
+{
+    return s_clock.Now();
+}
+
+// Governor, overload guard, collision guard and GPU wait cap fields of the OSD status (P3-15).
+static void FillControllerStatus(SchedulerPacingStatus* status) noexcept
+{
+    const GovernorStatistics governor = s_period_governor.Statistics();
+    status->governor_enabled = s_period_governor.Enabled();
+    // Step, stretch and interval from the same decision (the newest governed frame).
+    status->governor_step = s_governor_decision.valid ? s_governor_decision.step : 0;
+    status->governor_stretch = s_governor_decision.valid ? s_governor_decision.stretch : 1.0;
+    status->governor_phase = static_cast<uint8_t>(s_governor_decision.phase);
+    status->governor_interval_us = s_governor_decision.valid ? s_governor_decision.interval_us : 0.0;
+    status->governor_base_interval_us = s_governor_decision.valid ? s_governor_base_interval_us : 0.0;
+    status->governor_last_cause = static_cast<uint8_t>(governor.last_cause);
+    status->governor_rises = static_cast<uint32_t>(governor.rises);
+    status->governor_falls = static_cast<uint32_t>(governor.falls);
+    const PacingPipelineSnapshot pipeline = PacingPipeline_Read();
+    status->source_placement = static_cast<uint8_t>(pipeline.placement);
+    const PreSleepStatus pre_sleep = s_pre_sleep.Status();
+    status->pre_sleep_margin_us = pre_sleep.margin_us;
+    status->pre_sleep_samples = pre_sleep.samples;
+    status->pre_sleep_residual_p50_us = pre_sleep.residual_p50_us;
+    status->pre_sleep_residual_p99_us = pre_sleep.residual_p99_us;
+    status->driver_limiter_interval_us = ReflexDriverLimiter_AppliedUs();
+    status->render_handoff = s_handoff_blocked ? 2
+        : s_handoff_hook_frame.load(std::memory_order_relaxed) != 0 ? 1 : 0;
+    status->render_handoff_offset_us = s_source_stage.Lead().HandoffOffsetUs(
+        pipeline.lead_quantile, pipeline.allowance_us);
+    status->render_handoff_limited = static_cast<uint32_t>(s_handoff_limited_frames);
+    status->render_handoff_stalls = static_cast<uint32_t>(s_handoff_stalls);
+    status->hold_overloaded = s_hold_feasibility.Overloaded();
+    const LeadController& lead = s_source_stage.Lead();
+    const LeadStatistics lead_statistics = lead.Statistics();
+    const auto clip = [](uint64_t value) { return static_cast<uint32_t>(std::min<uint64_t>(value, UINT32_MAX)); };
+    status->release_margin_us = lead.ReleaseMarginUs();
+    status->release_headroom_us = lead.ReleaseHeadroomUs();
+    status->collision_headroom = lead_statistics.collision_checked_frames != 0 && lead_statistics.last_guard_headroom;
+    status->collision_limit_us =
+        lead_statistics.collision_checked_frames != 0 ? lead_statistics.last_collision_limit_us : 0.0;
+    status->collision_checked = clip(lead_statistics.collision_checked_frames);
+    status->collision_guarded = clip(lead_statistics.collision_guarded_frames);
+    status->collision_behind_wait = lead.NextGpuWorkBehindWait();
+    status->queue_order_pairs = static_cast<uint32_t>(lead.ConcurrencyPairs());
+    status->release_margin_samples = clip(lead_statistics.margin_samples);
+    status->release_margin_late = clip(lead_statistics.margin_late_samples);
+    status->release_headroom_samples = clip(lead_statistics.headroom_samples);
+    status->release_headroom_late = clip(lead_statistics.headroom_late_samples);
+    status->hold_interleave = !s_interleave_active ? 0 : (s_hold_interleave.Holding() ? 1 : 2);
+    status->hold_interleave_remaining_s =
+        s_interleave_active ? s_hold_interleave.RemainingS(QpcNow(), GetQPCFrequency()) : 0.0;
+    status->gpu_wait_cap_us = s_gpu_wait_cap.CapUs(pipeline.gpu_wait_budget_us);
+    status->gpu_wait_cap_level = static_cast<uint8_t>(s_gpu_wait_cap.Level());
+    status->gpu_wait_cap_open = s_gpu_wait_cap.Open();
+    status->gpu_wait_cap_late = s_gpu_wait_cap.WindowLate();
+    status->gpu_wait_cap_samples = s_gpu_wait_cap.WindowSamples();
+    status->gpu_wait_cap_checking = s_gpu_wait_cap.Checking();
+}
+
+static bool IsProcessFocused() noexcept
+{
+    HWND fg = FocusLock_RealGetForegroundWindow();
+    DWORD fg_pid = 0;
+    if (fg) GetWindowThreadProcessId(fg, &fg_pid);
+    return fg_pid == GetCurrentProcessId();
+}
+
+// Mode Off: the grid is suspended (in-flight plans resolve Stale) and the
+// source releases immediately. One passthrough source record.
+static void RunPassthrough(
+    const SchedulerCadenceContext& context,
+    const PacingPipelineSnapshot& pipeline,
+    uint8_t extra_flags,
+    double fg_divisor) noexcept
+{
+    s_source_stage.Suspend();
+    const int64_t release = QpcNow();
+    s_prev_enforcement_ts = release;
+    PublishCadence(context, release);
+    PacingSourceRecord source{};
+    source.flags = static_cast<uint8_t>(PACING_SOURCE_PASSTHROUGH | extra_flags);
+    source.release_qpc = release;
+    source.fg_divisor = fg_divisor;
+    SourceStage::FillSourceRecord({}, pipeline, &source);
+    PushSourceRelease(context, &source);
+
+    SchedulerPacingStatus status{};
+    status.stage_events_dropped = FramePlan_DroppedStageEvents();
+    status.stalls_injected = s_source_stage.StallInjector().Count();
+    FillControllerStatus(&status);
+    PublishPacingStatus(status);
+}
+
+// ── DMFG (mode Off): passthrough or its internal caps, unchanged ──
+static void RunDmfg(
+    uint64_t frameID,
+    SchedulerTrigger trigger,
+    PacingSourceMarker marker,
+    uint32_t nvapi_producer_epoch,
+    const PacingPipelineSnapshot& pipeline) noexcept
+{
+    s_source_stage.Suspend();
+    const PacingPlanKey key = Scheduler_MakePlanKey(frameID, trigger);
+
+    double dmfg_feedback_interval_us = s_control_actual_frame_time_us;
+    if (!(dmfg_feedback_interval_us > 0.0)) {
+        const int target_fps = g_user_target_fps.load(std::memory_order_relaxed);
+        dmfg_feedback_interval_us = target_fps > 0
+            ? 1000000.0 / static_cast<double>(target_fps)
+            : 16666.667;
+    }
+    PollReflexLatencyReport(dmfg_feedback_interval_us);
+
+    // ── DMFG Background FPS cap ──
+    if (!IsProcessFocused()) {
+        const int bg_fps = g_background_fps.load(std::memory_order_relaxed);
+        const SchedulerCadenceContext cadence_context = GetCadenceContext(
+            key, trigger, marker, SchedulerCadenceRegime::DmfgBackground, bg_fps);
+        PacingSourceRecord source{};
+        if (bg_fps > 0) {
+            const double bg_interval_us = 1000000.0 / static_cast<double>(bg_fps);
+            source.interval_us = bg_interval_us;
+            const int64_t now_qpc = QpcNow();
+            if (s_prev_enforcement_ts > 0) {
+                const double remaining = bg_interval_us - qpc_to_us(now_qpc - s_prev_enforcement_ts);
+                if (remaining > 500.0) {
+                    source.wake_target_qpc = now_qpc + us_to_qpc(remaining);
+                    if (TryOwnSleep(source.wake_target_qpc)) source.flags |= PACING_SOURCE_SLEPT;
+                }
+            }
+        }
+        const int64_t release = QpcNow();
+        s_prev_enforcement_ts = release;
+        PublishCadence(cadence_context, release);
+        source.flags |= PACING_SOURCE_BACKGROUND;
+        if (bg_fps <= 0) source.flags |= PACING_SOURCE_PASSTHROUGH;
+        source.release_qpc = release;
+        SourceStage::FillSourceRecord({}, pipeline, &source);
+        PushSourceRelease(cadence_context, &source);
+        return;
+    }
+
+    // ── DMFG FG-Off FPS cap ──
+    const int fg_off_cap = g_fg_off_fps.load(std::memory_order_relaxed);
+    if (fg_off_cap > 0 && IsFGDllLoaded() && ComputeFGDivisorRaw() == 1) {
+        const SchedulerCadenceContext cadence_context = GetCadenceContext(
+            key, trigger, marker, SchedulerCadenceRegime::DmfgFgOffCap, fg_off_cap);
+        const double cap_interval_us = 1000000.0 / static_cast<double>(fg_off_cap);
+        PacingSourceRecord source{};
+        source.interval_us = cap_interval_us;
+        const int64_t now_qpc = QpcNow();
+        int64_t own_sleep_start = 0;
+        if (s_prev_enforcement_ts > 0) {
+            const double remaining = cap_interval_us - qpc_to_us(now_qpc - s_prev_enforcement_ts);
+            if (remaining > 500.0) {
+                own_sleep_start = now_qpc;
+                source.wake_target_qpc = now_qpc + us_to_qpc(remaining);
+                if (TryOwnSleep(source.wake_target_qpc)) source.flags |= PACING_SOURCE_SLEPT;
+            }
+        }
+        const int64_t release = QpcNow();
+        if (own_sleep_start != 0 && nvapi_producer_epoch != 0 &&
+            nvapi_producer_epoch == FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::NvApiFrame)) {
+            PublishReflexOwnedSleep(frameID, nvapi_producer_epoch, marker,
+                qpc_to_us(release - own_sleep_start));
+        }
+        if (s_prev_enforcement_ts > 0) {
+            const double frame_time_us = qpc_to_us(release - s_prev_enforcement_ts);
+            if (frame_time_us > 0.0) s_control_actual_frame_time_us = frame_time_us;
+        }
+        s_prev_enforcement_ts = release;
+        PublishCadence(cadence_context, release);
+        source.release_qpc = release;
+        SourceStage::FillSourceRecord({}, pipeline, &source);
+        PushSourceRelease(cadence_context, &source);
+        return;
+    }
+
+    // Dynamic DMFG: pure passthrough, no cap from ReLimiter. The user sets
+    // the target via NVIDIA App / RHI / Profile Inspector.
+    const SchedulerCadenceContext cadence_context = GetCadenceContext(
+        key, trigger, marker, SchedulerCadenceRegime::Dmfg);
+    const int64_t release = QpcNow();
+    const double control_ft = s_prev_enforcement_ts > 0
+        ? qpc_to_us(release - s_prev_enforcement_ts) : 0.0;
+    s_prev_enforcement_ts = release;
+    if (control_ft > 0.0) s_control_actual_frame_time_us = control_ft;
+    const SchedulerCadenceObservation cadence = PublishCadence(cadence_context, release);
+    const double telemetry_ft = qpc_to_us(cadence.interval_qpc);
+    const double output_fps = g_output_fps.load(std::memory_order_relaxed);
+    const double render_fps = cadence.valid ? 1000000.0 / telemetry_ft : 0.0;
+    double real_fg_divisor = 1.0;
+    if (output_fps > 1.0 && render_fps > 1.0) {
+        const double ratio = output_fps / render_fps;
+        if (ratio >= 1.5) real_fg_divisor = ratio;
+    }
+    PacingSourceRecord source{};
+    source.flags = PACING_SOURCE_PASSTHROUGH;
+    source.release_qpc = release;
+    source.fg_divisor = real_fg_divisor;
+    SourceStage::FillSourceRecord({}, pipeline, &source);
+    PushSourceRelease(cadence_context, &source);
+}
+
+// ── Period governor C2 (VRR and fixed refresh) ──
+
+static bool IsGpuRung(PacingRung rung) noexcept
+{
+    return rung == PacingRung::GpuQueueWait || rung == PacingRung::FgInputWait;
+}
+
+// adaptive_cap is the only switch (Q1 a). Configure resets on a toggle.
+static void ConfigurePeriodGovernor(bool enabled) noexcept
+{
+    if (enabled == s_period_governor.Enabled()) return;
+    s_period_governor.Configure(enabled);
+    LOG_INFO("Period governor %s (adaptive_cap)", enabled ? "enabled" : "disabled");
+}
+
+// Consumes each delayed NvAPI demand report once, then decides this frame's
+// ladder step from the ladder (I_0 = cap × FG divisor before LFC, the
+// fixed-refresh shape and the LFC ceiling) and the miss pending since the
+// previous governed plan. Called once per governed frame, before its plan.
+// Every step (Reset included) clears the C1 slack: slack judged by C2 misses
+// then belongs to the new period. The hold room comes from the GPU queue
+// wait's collision-guarded frames (Auto only, also while the not-held A/B
+// blocks or the overload guard demote it: PacingPipeline_LeadRung).
+static GovernorDecision UpdatePeriodGovernor(
+    GovernorFrame frame,
+    const PacingPipelineSnapshot& pipeline,
+    const PacingPipelineConfig& config,
+    double fg_divisor) noexcept
+{
+    ConfigurePeriodGovernor(config.adaptive_cap);
+    const bool gpu_hold = IsGpuRung(pipeline.rung);
+    ReflexFrameTimeSample sample{};
+    while (ConsumeReflexFrameTimeSample(&sample)) {
+        // The release headroom's heavy-work start r − A and the queue-order
+        // test's GPU start (lead_controller.h).
+        if (sample.gpu_active_us > 0.0) {
+            s_source_stage.OnGpuActiveTime(sample.producer_epoch, sample.frame_id, sample.gpu_active_us,
+                sample.gpu_start_qpc);
+        }
+        // An elapsed GPU span can contain our time-fence wait. Never feed
+        // that idle residence back as workload demand; skip the report when
+        // execution-only evidence is unavailable.
+        if (gpu_hold && !sample.gpu_execution_available) continue;
+        s_period_governor.OnDemand(sample.sequence, sample.workload_demand_us);
+    }
+
+    frame.qpc = QpcNow();
+    frame.qpc_frequency = GetQPCFrequency();
+    // The Adaptive cap percentile (R11), not the Smoothing lead quantile.
+    frame.quantile = static_cast<double>(config.adaptive_cap_percentile) / 100.0;
+    frame.missed = s_governor_miss_pending;
+    s_governor_miss_pending = false;
+    TakeLeadOutputs(&frame.outputs, &frame.late_outputs);
+    if (config.rung_override == PacingRungOverride::Auto &&
+        PacingPipeline_LeadRung(pipeline) == PacingRung::GpuQueueWait) {
+        frame.room_us = s_source_stage.Lead().HoldRoomUs(fg_divisor, frame.quantile);
+    }
+    const GovernorDecision decision = s_period_governor.OnFrame(frame);
+    // P4-7: the evidence restarts on a fixed-refresh step or a reset, not on
+    // continuous VRR changes.
+    if (decision.valid && (decision.epoch || decision.cause == GovernorCause::Reset)) {
+        s_source_stage.ClearSlackEvidence();
+    }
+    // Transitions only (rise, fall, probe, back at the cap, reset, fixed
+    // step, hold room); a hold-room transition names the room it saw.
+    if (decision.valid && decision.cause != GovernorCause::None) {
+        char room[64] = "";
+        if (decision.cause == GovernorCause::Room) {
+            snprintf(room, sizeof(room), ", hold room %.1f us", frame.room_us);
+        }
+        LOG_INFO("Period governor: %s (%s), interval %.1f us (base %.1f us, +%.1f%%)%s%s",
+                 GovernorPhase_Text(decision.phase), GovernorCause_Text(decision.cause),
+                 decision.interval_us, frame.base_interval_us, (decision.stretch - 1.0) * 100.0,
+                 room, decision.epoch ? ", fixed-refresh step" : "");
+    }
+    s_governor_decision = decision;
+    s_governor_base_interval_us = frame.base_interval_us;
+    return decision;
+}
+
+// Ladder input of a governed frame; qpc, quantile and miss are filled by
+// UpdatePeriodGovernor.
+static GovernorFrame GovernorLadder(
+    double base_interval_us,
+    const GovernorFixedRefresh& fixed,
+    double lfc_ceiling_us) noexcept
+{
+    GovernorFrame frame{};
+    frame.base_interval_us = base_interval_us;
+    frame.fixed = fixed;
+    frame.lfc_ceiling_us = lfc_ceiling_us;
+    return frame;
+}
+
+// Grid interval of a governed frame: I_k, or I_0 for an invalid decision.
+static double GovernedIntervalUs(const GovernorDecision& decision, double base_interval_us) noexcept
+{
+    return decision.valid && decision.interval_us > 0.0 ? decision.interval_us : base_interval_us;
+}
+
+// Fixed-refresh ladder input (P3-6): the grid's 2% snap rule on I_0 and the
+// vblank reference refresh.
+static GovernorFixedRefresh FixedRefreshLadder(
+    double base_interval_us,
+    const CadenceGridFixedReference& reference) noexcept
+{
+    GovernorFixedRefresh fixed{};
+    const double ticks_per_us = static_cast<double>(GetQPCFrequency()) / 1'000'000.0;
+    if (!(ticks_per_us > 0.0)) return fixed;
+    fixed.snapped = CadenceGrid_SnapsToFixed(base_interval_us * ticks_per_us, reference, nullptr);
+    fixed.refresh_us = reference.refresh_ticks / ticks_per_us;
+    return fixed;
+}
+
+// VRR cap interval before the governor and LFC (I_0 = cap × FG divisor).
+static double VrrCapIntervalUs(int target_fps, double fg_divisor) noexcept
+{
+    return (1000000.0 / static_cast<double>(target_fps)) * fg_divisor;
+}
+
+// LFC hysteresis on the governed interval I_k (P3-6: LFC after the governor).
+static double ApplyLfc(double interval) noexcept
+{
+    const double ceiling_us = g_ceiling_interval_us.load(std::memory_order_relaxed);
+    const double floor_us = g_floor_interval_us.load(std::memory_order_relaxed);
+    // "below" = frame rate below the floor (interval > floor_us) → LFC activates.
+    if (interval > floor_us) {
+        s_lfc_below_count++;
+        s_lfc_above_count = 0;
+    } else {
+        s_lfc_above_count++;
+        s_lfc_below_count = 0;
+    }
+    if (!s_lfc_active && s_lfc_below_count >= 10) s_lfc_active = true;
+    else if (s_lfc_active && s_lfc_above_count >= 10) s_lfc_active = false;
+    return PeriodGovernor_LfcIntervalUs(interval, s_lfc_active ? ceiling_us : 0.0);
+}
+
+// The VRR ceiling interval while LFC is active, else 0. Read before ApplyLfc,
+// this is the previous frame's LFC state, which the 10-frame hysteresis
+// almost always keeps for this frame (governor input, P3-6).
+static double LfcCeilingUs() noexcept
+{
+    return s_lfc_active ? g_ceiling_interval_us.load(std::memory_order_relaxed) : 0.0;
+}
+
+// Period identity for PeriodChange epochs (P2-6, P3-10): the VRR cap interval
+// from the raw FG divisor with the LFC state of the governed interval. The
+// ramped divisor moves the grid interval for 50 ms after a toggle; those
+// frames are silent rebases. The governor step is not part of the identity:
+// any identity change is a PeriodChange, which outranks GovernorStep, so a
+// step would never be reported as one. Only a change of cap, raw divisor or
+// LFC state/multiple is a period change. Call after ApplyLfc so the LFC state
+// is current.
+static double VrrPeriodIdentityUs(int target_fps, int fg_divisor_raw) noexcept
+{
+    const double interval = (1000000.0 / static_cast<double>(target_fps)) *
+        static_cast<double>(fg_divisor_raw > 0 ? fg_divisor_raw : 1);
+    return PeriodGovernor_LfcIntervalUs(interval, LfcCeilingUs());
+}
+
+static double ComputeFixedInterval(double fg_divisor) noexcept
+{
+    const int target_fps = g_user_target_fps.load(std::memory_order_relaxed);
+    if (target_fps > 0) return (1000000.0 / static_cast<double>(target_fps)) * fg_divisor;
+    // target_fps=0: pace at the refresh interval (Fixed mode shouldn't be
+    // active without a limit, but handle it gracefully).
+    return g_ceiling_interval_us.load(std::memory_order_relaxed) * fg_divisor;
+}
+
+struct PlannedFrameInput {
+    uint64_t frame_id = 0;
+    SchedulerTrigger trigger = SchedulerTrigger::NvApiMarker;
+    PacingSourceMarker marker = PacingSourceMarker::Unknown;
+    SchedulerCadenceRegime regime = SchedulerCadenceRegime::Vrr;
+    int target_fps = 0;
+    double base_interval_us = 0.0; // I_0: cap × FG divisor, before the governor and LFC
+    double period_identity_us = 0.0; // raw cap, divisor and LFC; 0 = base_interval_us
+    double interval_us = 0.0;      // grid interval
+    double fg_divisor = 1.0;
+    uint8_t extra_flags = 0;
+    CadenceGridFixedReference fixed{}; // Fixed mode: the vblank reference
+    bool governed = false;         // VRR and fixed refresh: the period governor ran
+    GovernorDecision governor{};   // valid only when governed
+};
+
+// Governor miss inputs of a planned governed frame (P3-7): its plan started a
+// SourceLate epoch, or its rung's lead is infeasible (budget-limited with a
+// full, mostly negative slack window). Budget-limited alone is not a miss.
+// While C2 can still stretch, an infeasible window is consumed by the miss
+// (the slack restarts), so the governor counts it once per fresh window
+// instead of every frame. Seen by the next governed frame.
+// A frame whose pre-Sleep wait made it late (the margin is still being
+// learned or the driver's Sleep ran long) is the placement's miss, not
+// overload: not a governor miss.
+static void RecordGovernorMiss(const SourceStageFrame& frame, const GovernorDecision& governor,
+    bool pre_sleep_late) noexcept
+{
+    if (!frame.planned) return;
+    if (frame.epoch_started == PacingEpochReason::SourceLate) {
+        if (!pre_sleep_late) {
+            s_governor_miss_pending = true;
+            s_restart_pending = true;
+        }
+        return;
+    }
+    if (Feasibility_LeadInfeasible(
+            s_source_stage.Lead().Feasibility(frame.plan.rung, frame.plan.fg_divisor))) {
+        s_governor_miss_pending = true;
+        if (governor.valid && governor.can_stretch) s_source_stage.ClearSlackEvidence();
+    }
+}
+
+static bool PreSleepAvailable() noexcept;
+
+// The driver's Reflex Sleep runs for this frame: the game called it within
+// the last second and the bypass does not apply. Planned frames are paced by
+// ReLimiter, so with a cap the bypass applies whenever it is on.
+static bool DriverSleepRuns(int target_fps) noexcept
+{
+    return PreSleepAvailable() &&
+        !NvAPI_ShouldBypassSleep(g_reflex_sleep_bypass.load(std::memory_order_relaxed), target_fps, true);
+}
+
+// Render handoff limit (phase4_design.md section 23): a frame that is not
+// held, released at SIMULATION_START by the marker or pre-Sleep placement,
+// while the driver's Sleep does not run. Held frames are not limited
+// (Decision 3: it moved CONTROL's simulation into its render submission).
+static bool HandoffLimitApplies(const PlannedFrameInput& input, const PacingPipelineSnapshot& pipeline) noexcept
+{
+    // A block ends once handoff samples show the render thread taking frames
+    // ahead of the next release.
+    if (s_handoff_blocked && s_source_stage.Lead().HandoffSamples() >= LEAD_HANDOFF_MIN_SAMPLES) {
+        s_handoff_blocked = false;
+        LOG_INFO("Render handoff limit: back on (the render thread takes frames ahead of the next release)");
+    }
+    return !s_handoff_blocked &&
+        pipeline.rung == PacingRung::SourceOnly &&
+        (pipeline.mode == PacingTimingMode::Vrr || pipeline.mode == PacingTimingMode::Fixed) &&
+        PacingSourcePlacement_WaitsAtMarker(pipeline.placement) &&
+        (input.trigger == SchedulerTrigger::NvApiMarker || input.trigger == SchedulerTrigger::PclMarker) &&
+        input.marker == PacingSourceMarker::SimulationStart &&
+        !DriverSleepRuns(input.target_fps);
+}
+
+// A handoff wait stalled: the render thread took no frame for 3 I, and the
+// frame was released. With a warm handoff window the game has shown that its
+// render thread does not wait for the next release, so a stall is a hitch and
+// the limit stays on. Without one the render thread may be waiting for that
+// release (lockstep): the limit stays off until handoff samples appear or the
+// next lifecycle, cap, FG divisor or route change.
+static void RenderHandoffStalled(uint64_t frame_id) noexcept
+{
+    ++s_handoff_stalls;
+    if (s_source_stage.Lead().HandoffSamples() < LEAD_HANDOFF_MIN_SAMPLES) {
+        if (s_handoff_blocked) return;
+        s_handoff_blocked = true;
+        LOG_WARN("Render handoff limit: off (the render thread took no frame for %.0f intervals before "
+                 "frame %llu was taken, and no handoff has been measured yet)",
+                 RENDER_HANDOFF_STALL_INTERVALS, static_cast<unsigned long long>(frame_id));
+        return;
+    }
+    if (s_handoff_stall_logged) return;
+    s_handoff_stall_logged = true;
+    LOG_INFO("Render handoff limit: frame %llu released after the render thread took no frame for %.0f "
+             "intervals (a stall; the limit stays on)", static_cast<unsigned long long>(frame_id),
+             RENDER_HANDOFF_STALL_INTERVALS);
+}
+
+// A_n = w_{n−1} + d: the newest released frame's render handoff plus the
+// learned offset (lead_controller.h). 0 when the limit cannot apply: another
+// stream, no handoff of this producer within the last second, or a wait that
+// stalled (RenderHandoffStalled). With the marker placement the wait runs
+// here, with the owner held, like the source wait.
+static int64_t HandoffEarliestRelease(const PacingPlanKey& key, double interval_us,
+    const PacingPipelineSnapshot& pipeline) noexcept
+{
+    const PacingPlanKey released = s_handoff_released;
+    if (released.frame_id == 0 || released.identity_domain != key.identity_domain ||
+        released.producer_epoch != key.producer_epoch || released.frame_id >= key.frame_id) {
+        return 0;
+    }
+    const uint8_t domain = static_cast<uint8_t>(key.identity_domain);
+    uint64_t newest_frame = 0;
+    int64_t handoff_qpc = 0;
+    const int64_t now = QpcNow();
+    if (!RenderHandoff_Latest(domain, key.producer_epoch, &newest_frame, &handoff_qpc) ||
+        PacingQpc_ElapsedSeconds(handoff_qpc, now, GetQPCFrequency()) >= RENDER_HANDOFF_ACTIVITY_S) {
+        return 0;
+    }
+    if (newest_frame < released.frame_id) {
+        const RenderHandoffWait result = RenderHandoff_WaitFor(domain, key.producer_epoch, released.frame_id,
+            us_to_qpc(RENDER_HANDOFF_STALL_INTERVALS * interval_us), &handoff_qpc);
+        if (result == RenderHandoffWait::Deadline) RenderHandoffStalled(released.frame_id);
+        if (result != RenderHandoffWait::Ready) return 0;
+    }
+    return handoff_qpc + us_to_qpc(s_source_stage.Lead().HandoffOffsetUs(
+        pipeline.lead_quantile, pipeline.allowance_us));
+}
+
+// After a planned frame: it is the newest released frame, and the Reflex
+// Sleep hook learns whether the next frame waits for its handoff.
+static void PublishRenderHandoff(const PacingPlanKey& key, const SourceStageFrame& frame,
+    bool limited) noexcept
+{
+    if (!frame.planned) {
+        s_handoff_hook_frame.store(0, std::memory_order_release);
+        return;
+    }
+    s_handoff_released = key;
+    s_handoff_hook_stream.store((static_cast<uint32_t>(key.identity_domain) << 24) |
+        (key.producer_epoch & 0x00FFFFFFu), std::memory_order_relaxed);
+    s_handoff_hook_frame.store(limited && !s_handoff_blocked ? key.frame_id : 0,
+        std::memory_order_release);
+    if (!frame.handoff_limited) return;
+    ++s_handoff_limited_frames;
+    if (!s_handoff_logged) {
+        s_handoff_logged = true;
+        LOG_INFO("Render handoff limit: frame %llu released after the render thread took the previous "
+                 "frame (S + %.2f ms)", static_cast<unsigned long long>(key.frame_id),
+                 qpc_to_us(frame.wait_target_qpc - (frame.plan.output_target_qpc - us_to_qpc(frame.plan.lead_us))) / 1000.0);
+    }
+}
+
+// Plans, publishes, waits, records. Exactly one source record.
+static SourceStageFrame RunPlanned(
+    const PlannedFrameInput& input,
+    const PacingPipelineSnapshot& pipeline,
+    const PacingPipelineConfig& config) noexcept
+{
+    const PacingPlanKey key = Scheduler_MakePlanKey(input.frame_id, input.trigger);
+    const SchedulerCadenceContext cadence_context = GetCadenceContext(
+        key, input.trigger, input.marker, input.regime, input.target_fps);
+
+    SourceStageRequest request{};
+    request.key = key;
+    request.marker = input.marker;
+    request.pipeline = pipeline;
+    request.qpc_frequency = GetQPCFrequency();
+    request.interval_us = input.interval_us;
+    request.fg_divisor = input.fg_divisor;
+    request.period_change = s_period_tracker.Observe(pipeline.mode,
+        input.period_identity_us > 0.0 ? input.period_identity_us : input.base_interval_us);
+    request.governor_step = input.governed && input.governor.valid && input.governor.epoch;
+    if (pipeline.mode == PacingTimingMode::Fixed) request.fixed = input.fixed;
+    request.stall_inject_ms = config.stall_inject_ms;
+    request.stall_inject_period_s = config.stall_inject_period_s;
+    UpdateGpuWaitCapTop(pipeline, config, QpcNow());
+    request.gpu_wait_cap_us = GpuWaitCapUs(pipeline);
+    // Collision-aware release: Auto only, so the GPU wait output override
+    // keeps its earlier behavior.
+    request.collision_guard = config.rung_override == PacingRungOverride::Auto;
+    request.gpu_queue_wait_render_queue = config.gpu_queue_wait_render_queue;
+    // An ended pre-Sleep wait gates earlier frames of a lockstep engine like
+    // the source wait (lead_controller.h).
+    s_pre_sleep.EndedWait(&request.pre_wait_index, &request.pre_wait_start_qpc, &request.pre_wait_end_qpc);
+    // Render handoff limit (phase4_design.md section 23). Sleep-hook waits
+    // that stalled first.
+    for (uint32_t stalls = s_handoff_hook_stalls.exchange(0, std::memory_order_relaxed); stalls > 0; --stalls) {
+        RenderHandoffStalled(s_handoff_released.frame_id);
+    }
+    const bool handoff_limit = HandoffLimitApplies(input, pipeline);
+    if (handoff_limit) {
+        request.earliest_release_qpc = HandoffEarliestRelease(key, input.interval_us, pipeline);
+    }
+
+    g_effective_interval_us.store(input.interval_us, std::memory_order_relaxed);
+    const SourceStageFrame frame = s_source_stage.RunPlannedFrame(request, &s_clock);
+    PublishRenderHandoff(key, frame, handoff_limit);
+    if (s_source_stage.StallInjector().TakeEnabledNotice()) {
+        LOG_INFO("Stall injector enabled: %.1f ms every %.1f s",
+                 config.stall_inject_ms, config.stall_inject_period_s);
+    }
+    const int64_t release = frame.planned ? frame.release_qpc : QpcNow();
+
+    // Pre-Sleep residual of this index (P4-10, R2) and the newest plan for
+    // the next pre-wait. The residual ends where the source stage was ready
+    // to wait (or released, with nothing left to wait), so the margin also
+    // covers the marker hook's processing. The lateness check uses the
+    // unclamped S = T − L, or the render handoff limit's earliest release
+    // when later: lateness the limit chose is not the placement's miss.
+    int64_t pre_sleep_end_qpc = 0;
+    bool pre_slept = false;
+    bool pre_sleep_late = false;
+    if (frame.planned) {
+        const int64_t source_wake_qpc = frame.plan.output_target_qpc - us_to_qpc(frame.plan.lead_us);
+        const int64_t ready_qpc = frame.wait_start_qpc != 0 ? frame.wait_start_qpc : frame.release_qpc;
+        pre_slept = s_pre_sleep.OnPlannedArrival(frame.plan.grid_index, ready_qpc,
+            source_wake_qpc, GetQPCFrequency(), &pre_sleep_end_qpc);
+        pre_sleep_late = pre_slept &&
+            ready_qpc > (std::max)(source_wake_qpc, request.earliest_release_qpc);
+        s_last_plan_index = frame.plan.grid_index;
+        s_last_plan_generation = frame.plan.key.controller_generation;
+        s_last_plan_lead_us = frame.plan.lead_us;
+        s_last_plan_interval_us = frame.plan.interval_us;
+        s_last_plan_release_qpc = frame.release_qpc;
+    }
+
+    // Owned source wait for Reflex feedback (NvAPI source frames only).
+    if (input.trigger == SchedulerTrigger::NvApiMarker && key.producer_epoch != 0 &&
+        key.producer_epoch == FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::NvApiFrame)) {
+        const double own_sleep_us = frame.slept && frame.wait_end_qpc > frame.wait_start_qpc
+            ? qpc_to_us(frame.wait_end_qpc - frame.wait_start_qpc) : 0.0;
+        PublishReflexOwnedSleep(input.frame_id, key.producer_epoch, input.marker, own_sleep_us);
+        if (frame.planned) {
+            ReflexOwnedWaits waits{};
+            waits.release_qpc = frame.release_qpc;
+            waits.wait_start_qpc = frame.wait_start_qpc;
+            waits.wait_end_qpc = frame.wait_end_qpc;
+            waits.pre_wait_start_qpc = frame.pre_wait_start_qpc;
+            waits.pre_wait_end_qpc = frame.pre_wait_end_qpc;
+            PublishReflexOwnedWaits(input.frame_id, key.producer_epoch, waits);
+        }
+    }
+
+    if (s_prev_enforcement_ts > 0) {
+        const double control_ft = qpc_to_us(release - s_prev_enforcement_ts);
+        if (control_ft > 0.0) s_control_actual_frame_time_us = control_ft;
+    }
+    s_prev_enforcement_ts = release;
+    PublishCadence(cadence_context, release);
+
+    ObserveGpuWaitResumes(pipeline, release);
+    ObserveReleaseMargin();
+    if (input.governed) {
+        RecordGovernorMiss(frame, input.governor, pre_sleep_late);
+        // Overload guard: judged while the pre-guard Auto rung holds.
+        HoldFeasibilityFrame hold{};
+        hold.qpc = release;
+        hold.qpc_frequency = GetQPCFrequency();
+        hold.judged = frame.planned &&
+            (pipeline.mode == PacingTimingMode::Vrr || pipeline.mode == PacingTimingMode::Fixed) &&
+            config.rung_override == PacingRungOverride::Auto &&
+            pipeline.auto_rung != PacingRung::SourceOnly;
+        hold.restarted = s_restart_pending;
+        s_restart_pending = false;
+        hold.can_stretch = input.governor.valid && input.governor.can_stretch;
+        ApplyHoldTransition(s_hold_feasibility.OnFrame(hold));
+    }
+
+    PacingSourceRecord source{};
+    source.flags = input.extra_flags;
+    if (!frame.planned) source.flags |= PACING_SOURCE_PASSTHROUGH;
+    source.release_qpc = release;
+    source.interval_us = input.interval_us;
+    source.fg_divisor = input.fg_divisor;
+    if (input.governed && input.governor.valid) {
+        source.governor_step = input.governor.step;
+        source.governor_interval_us = input.governor.interval_us;
+        source.governor_cause = static_cast<uint8_t>(input.governor.cause);
+        if (input.governor.stretch > 1.0) source.flags |= PACING_SOURCE_OVERLOAD;
+    }
+    if (pre_slept) {
+        source.flags |= PACING_SOURCE_PRE_SLEEP;
+        source.pre_sleep_end_qpc = pre_sleep_end_qpc;
+        if (s_pre_sleep_wait_index == frame.plan.grid_index) {
+            source.pre_sleep_margin_us = s_pre_sleep_wait_margin_us;
+        }
+    }
+    SourceStage::FillSourceRecord(frame, pipeline, &source);
+    PushSourceRelease(cadence_context, &source);
+
+    SchedulerPacingStatus status{};
+    status.valid = frame.planned;
+    status.lead_budget_limited = frame.lead_budget_limited;
+    status.lead_us = frame.plan.lead_us;
+    const LeadBucketStatus bucket =
+        s_source_stage.Lead().BucketStatus(frame.plan.rung, frame.plan.fg_divisor);
+    status.lead_warm = bucket.warm;
+    status.lead_samples = bucket.samples;
+    status.grid_epoch = frame.plan.grid_epoch;
+    status.grid_index = frame.plan.grid_index;
+    status.epoch_reason = static_cast<uint8_t>(frame.grid_epoch_reason);
+    status.stage_events_dropped = FramePlan_DroppedStageEvents();
+    status.stalls_injected = s_source_stage.StallInjector().Count();
+    FillControllerStatus(&status);
+    PublishPacingStatus(status);
+    return frame;
+}
+
+// Driver-limiter frame (P4-11): the Reflex driver limiter paces the source,
+// so ReLimiter plans nothing (grid suspended, no wait, no hold). The governor
+// still ran; its interval is what the limiter applies. One source record.
+static void RunDriverLimited(
+    const PlannedFrameInput& input,
+    const PacingPipelineSnapshot& pipeline) noexcept
+{
+    s_source_stage.Suspend();
+    const PacingPlanKey key = Scheduler_MakePlanKey(input.frame_id, input.trigger);
+    const SchedulerCadenceContext context = GetCadenceContext(
+        key, input.trigger, input.marker, input.regime, input.target_fps);
+    const int64_t release = QpcNow();
+    if (s_prev_enforcement_ts > 0) {
+        const double control_ft = qpc_to_us(release - s_prev_enforcement_ts);
+        if (control_ft > 0.0) s_control_actual_frame_time_us = control_ft;
+    }
+    s_prev_enforcement_ts = release;
+    g_effective_interval_us.store(input.interval_us, std::memory_order_relaxed);
+    // No owned wait: the Reflex workload demand keeps its CPU stages.
+    if (input.trigger == SchedulerTrigger::NvApiMarker && key.producer_epoch != 0 &&
+        key.producer_epoch == FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::NvApiFrame)) {
+        PublishReflexOwnedSleep(input.frame_id, key.producer_epoch, input.marker, 0.0);
+    }
+    PublishCadence(context, release);
+    PacingSourceRecord source{};
+    source.flags = static_cast<uint8_t>(PACING_SOURCE_PASSTHROUGH | input.extra_flags);
+    source.release_qpc = release;
+    source.interval_us = input.interval_us;
+    source.fg_divisor = input.fg_divisor;
+    if (input.governed && input.governor.valid) {
+        source.governor_step = input.governor.step;
+        source.governor_interval_us = input.governor.interval_us;
+        source.governor_cause = static_cast<uint8_t>(input.governor.cause);
+        if (input.governor.stretch > 1.0) source.flags |= PACING_SOURCE_OVERLOAD;
+    }
+    SourceStage::FillSourceRecord({}, pipeline, &source);
+    PushSourceRelease(context, &source);
+
+    SchedulerPacingStatus status{};
+    status.stage_events_dropped = FramePlan_DroppedStageEvents();
+    status.stalls_injected = s_source_stage.StallInjector().Count();
+    FillControllerStatus(&status);
+    PublishPacingStatus(status);
+}
+
+// P4-11: the driver limiter is applied before the frame runs; when it cannot
+// be applied (no game parameters, device mismatch, driver failure, Sleep
+// bypass) the frame is planned at the marker instead, so a failed limiter
+// never leaves the game unpaced.
+// Capture C (FG 2×, 2026-09-30): the driver applies minimumIntervalUs to
+// presented frames, generated ones included, so the limit is the governed
+// real-frame interval divided by the FG divisor.
+static double DriverLimiterIntervalUs(const PlannedFrameInput& input) noexcept
+{
+    return input.fg_divisor > 1.0 ? input.interval_us / input.fg_divisor : input.interval_us;
+}
+
+static bool ApplyDriverLimiter(double interval_us) noexcept
+{
+    ReflexDriverLimiter_Update(interval_us, true);
+    return ReflexDriverLimiter_AppliedUs() != 0;
+}
+
+// ── Pre-Sleep placement (phase4_design.md P4-8 to P4-10) ──
+
+void Scheduler_RecordReflexSleep(int64_t now_qpc) noexcept
+{
+    s_last_reflex_sleep_qpc.store(now_qpc, std::memory_order_relaxed);
+}
+
+// Owner: the game called the Reflex Sleep within the last second. Pre-Sleep
+// is the user's choice and never disengages itself (R15).
+static bool PreSleepAvailable() noexcept
+{
+    const int64_t last_sleep = s_last_reflex_sleep_qpc.load(std::memory_order_relaxed);
+    return last_sleep > 0 &&
+        PacingQpc_ElapsedSeconds(last_sleep, QpcNow(), GetQPCFrequency()) < PRE_SLEEP_ACTIVITY_S;
+}
+
+bool Scheduler_PreSleepPlacementActive() noexcept
+{
+    const PacingPipelineSnapshot pipeline = PacingPipeline_Read();
+    return pipeline.placement == PacingSourcePlacement::PreSleep &&
+        (pipeline.mode == PacingTimingMode::Vrr || pipeline.mode == PacingTimingMode::Fixed);
+}
+
+bool Scheduler_PacesSource() noexcept
+{
+    const PacingSourcePlacement placement = PacingPipeline_Read().placement;
+    return placement == PacingSourcePlacement::Marker ||
+        placement == PacingSourcePlacement::PreSleep ||
+        placement == PacingSourcePlacement::Present;
+}
+
+bool Scheduler_RenderHandoffFrame(uint8_t* identity_domain, uint32_t* producer_epoch,
+    uint64_t* frame_id) noexcept
+{
+    if (identity_domain == nullptr || producer_epoch == nullptr || frame_id == nullptr) return false;
+    const uint64_t frame = s_handoff_hook_frame.load(std::memory_order_acquire);
+    if (frame == 0) return false;
+    const uint32_t stream = s_handoff_hook_stream.load(std::memory_order_relaxed);
+    *identity_domain = static_cast<uint8_t>(stream >> 24);
+    *producer_epoch = stream & 0x00FFFFFFu;
+    *frame_id = frame;
+    return true;
+}
+
+void Scheduler_RenderHandoffStalled() noexcept
+{
+    s_handoff_hook_stalls.fetch_add(1, std::memory_order_relaxed);
+}
+
+// The interval the next plan can have at most: the newest plan's, or less
+// when the cap, the FG divisor or the governor's stretch shrank since it was
+// planned (the plan resolves only at the next marker). A shorter prediction
+// only moves more of the wait to the marker trim; a longer one would release
+// the next frame late (P4-9).
+static double PreSleepPredictedIntervalUs() noexcept
+{
+    double interval_us = s_last_plan_interval_us;
+    const int target_fps = g_user_target_fps.load(std::memory_order_relaxed);
+    if (target_fps > 0) {
+        const int divisor = g_resolved_fg_divisor.load(std::memory_order_relaxed);
+        const double stretch = s_period_governor.Enabled() ? s_period_governor.Stretch() : 1.0;
+        const double expected_us = (1000000.0 / static_cast<double>(target_fps)) *
+            static_cast<double>(divisor > 0 ? divisor : 1) * stretch;
+        if (expected_us > 0.0 && expected_us < interval_us) interval_us = expected_us;
+    }
+    return interval_us;
+}
+
+bool Scheduler_PlanReflexSleep(int64_t now_qpc, bool driver_sleep, int64_t handoff_qpc,
+    int64_t* target_qpc, uint64_t* grid_index) noexcept
+{
+    if (target_qpc == nullptr || grid_index == nullptr || !Scheduler_PreSleepPlacementActive()) {
+        return false;
+    }
+    const CadenceGridSnapshot& grid = s_source_stage.Grid().Snapshot();
+    PreSleepRequest request{};
+    request.now_qpc = now_qpc;
+    request.qpc_frequency = GetQPCFrequency();
+    request.next_index = grid.last_planned_index + 1;
+    // The prediction holds only while the newest plan is the grid's newest index.
+    int64_t last_target_qpc = 0;
+    request.next_target_valid = s_last_plan_index != 0 &&
+        s_last_plan_index == grid.last_planned_index &&
+        CadenceGrid_TargetOf(grid, s_last_plan_generation, s_last_plan_index, &last_target_qpc);
+    if (request.next_target_valid) {
+        request.next_target_qpc = last_target_qpc + us_to_qpc(PreSleepPredictedIntervalUs());
+        // Render handoff limit (phase4_design.md section 23): the next frame
+        // is released no earlier than A = w + d, so the pre-wait aims for
+        // max(S_next, A) − margin.
+        if (handoff_qpc > 0) {
+            const PacingPipelineSnapshot pipeline = PacingPipeline_Read();
+            const int64_t earliest_qpc = handoff_qpc + us_to_qpc(s_source_stage.Lead().HandoffOffsetUs(
+                pipeline.lead_quantile, pipeline.allowance_us));
+            request.next_target_qpc = (std::max)(request.next_target_qpc,
+                earliest_qpc + us_to_qpc(s_last_plan_lead_us));
+        }
+    }
+    request.lead_us = s_last_plan_lead_us;
+    request.interval_us = s_last_plan_interval_us;
+    request.last_release_qpc = s_last_plan_release_qpc;
+    request.driver_sleep = driver_sleep;
+    const PreSleepDecision decision = s_pre_sleep.Decide(request);
+    if (!decision.wait) return false;
+    s_pre_sleep_wait_index = request.next_index;
+    s_pre_sleep_wait_margin_us = decision.margin_us;
+    *target_qpc = decision.wait_target_qpc;
+    *grid_index = request.next_index;
+    return true;
+}
+
+void Scheduler_EndReflexSleep(uint64_t grid_index, int64_t end_qpc) noexcept
+{
+    s_pre_sleep.OnWaitEnd(grid_index, end_qpc);
 }
 
 // ── Main entry point ──
+// Order (design 2.5, phase 3 2.5): owner prologue → stage events → pipeline
+// → interval (VRR: I_0 → governor → LFC; fixed: I_0 → governor) → plan
+// (published before the wait) → wait → stall injector → release → C2 miss
+// and GPU wait cap readout → one source record.
 void OnMarker(
     uint64_t frameID,
     int64_t now,
     SchedulerTrigger trigger,
-    ArrivalLeadMarker marker) {
-    // Callers hold SchedulerOwnerGuard. Apply coalesced lifecycle resets before
-    // any scheduler-owned model is read or mutated for this frame.
-    Flush_ApplyPendingOnSchedulerOwner();
-    DrainAdaptiveReserveObservations();
+    PacingSourceMarker marker) {
+    // Source telemetry reports the argument, not a later re-read of `now`.
+    s_source_marker_qpc = now;
+    // Callers hold SchedulerOwnerGuard. Apply coalesced feedback resets before
+    // any scheduler-owned model is read or mutated for this frame (Flush
+    // requests).
     ApplyFeedbackResetRequests();
+    // Demand reports not consumed by the period governor this frame are
+    // discarded at exit, except on VRR frames whose end-of-frame poll feeds
+    // the next frame's governor.
     struct PendingFeedbackScope {
-        bool retain_for_adaptation = false;
+        bool retain_for_governor = false;
         ~PendingFeedbackScope() noexcept {
-            if (!retain_for_adaptation) DiscardReflexFrameTimeSamples();
+            if (!retain_for_governor) DiscardReflexFrameTimeSamples();
         }
     } pending_feedback;
+    // P4-11: the Reflex driver limiter is applied only while this frame
+    // resolves to it; every other exit releases it (restores the game's
+    // Sleep parameters once).
+    struct DriverLimiterScope {
+        bool active = false;
+        double interval_us = 0.0;
+        ~DriverLimiterScope() noexcept { ReflexDriverLimiter_Update(interval_us, active); }
+    } driver_limiter;
     const uint32_t nvapi_producer_epoch =
         trigger == SchedulerTrigger::NvApiMarker
-            ? FrameTimeline_CurrentProducerEpoch(
-                FrameIdentityDomain::NvApiFrame)
+            ? FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::NvApiFrame)
             : 0;
 
-    // Health + tier check every frame
+    // Marker flow health every frame. Only real marker triggers keep the
+    // dispatcher's marker-path Present fallback suppressed; the fallback's own
+    // enforcement calls must not.
     RecordEnforcementMarker();
-    TickHealthFrame();
-    UpdateTier();
+    if (trigger == SchedulerTrigger::NvApiMarker ||
+        trigger == SchedulerTrigger::PclMarker) {
+        RecordMarkerTrigger();
+    }
 
-    // Tier 4: suspended — passthrough
-    if (g_current_tier.load(std::memory_order_acquire) == Tier4) {
-        InvokeSleep(/*passthrough=*/true);
-        // Re-stamp enforcement_ts AFTER driver sleep so the predictor
-        // doesn't measure driver sleep as render time.
-        LARGE_INTEGER qpc_now;
-        QueryPerformanceCounter(&qpc_now);
-        g_predictor.OnEnforcement(frameID, qpc_now.QuadPart);
-        PublishArrivalLeadFallbackStatus(
-            frameID,
-            trigger,
-            marker,
-            ArrivalLeadFallbackReason::Suspended);
+    ApplyLifecycle(trigger, marker);
+    s_source_stage.DrainStageEvents();
+    // An OutputLate epoch is a governor miss for the next governed frame
+    // (P3-7) and a cadence restart for the hold feasibility guard.
+    if (s_source_stage.DrainStartedOutputLate()) {
+        s_governor_miss_pending = true;
+        s_restart_pending = true;
+    }
+    // One configuration snapshot for this frame's resolve, governor and plan.
+    const PacingPipelineConfig config = PacingPipeline_GetConfig();
+    // Vblank edges feed the fixed-refresh phase tracker on the owner only.
+    int64_t latest_vblank_qpc = 0;
+    if (VBlank_ConsumeLatest(&latest_vblank_qpc)) {
+        g_vblank_phase.IngestVBlank(latest_vblank_qpc, GetQPCFrequency(),
+            g_estimated_refresh_us.load(std::memory_order_relaxed));
+    }
+
+    PacingRuntimeState runtime{};
+    runtime.swapchain_valid = true;
+    runtime.vrr = g_pacing_mode.load(std::memory_order_relaxed) == PacingMode::VRR;
+    // Pre-Sleep needs SIMULATION_START as the enforcement marker: with a
+    // later marker the Sleep precedes the simulation, and the prediction and
+    // the residual would include it.
+    runtime.pre_sleep_available =
+        (trigger == SchedulerTrigger::NvApiMarker || trigger == SchedulerTrigger::PclMarker) &&
+        marker == PacingSourceMarker::SimulationStart && PreSleepAvailable();
+    runtime.driver_limiter_unavailable = ReflexDriverLimiter_Unavailable();
+
+    // Suspended (swapchain invalid, device lost or occluded): passthrough.
+    const bool suspended = !IsSwapchainValid();
+    if (suspended != s_suspended) {
+        s_suspended = suspended;
+        if (suspended) LOG_WARN("Scheduler: swapchain invalid, pacing suspended");
+        else LOG_INFO("Scheduler: swapchain valid, pacing resumed");
+    }
+    if (suspended) {
+        runtime.swapchain_valid = false;
+        const PacingPipelineSnapshot pipeline = ResolvePipeline(trigger, config, runtime);
+        RunPassthrough(GetCadenceContext(Scheduler_MakePlanKey(frameID, trigger),
+            trigger, marker, SchedulerCadenceRegime::Suspended), pipeline, 0, 1.0);
         return;
     }
 
+    // Priority: Suspended > DMFG > OLED cap > background > FG-Off > VRR/Fixed.
+    // DMFG and its internal caps are intentionally unaffected by OLED Care.
     const bool dmfg_active = IsDmfgActive();
-    static bool s_dmfg_state_initialized = false;
-    static bool s_last_dmfg_active = false;
-    const bool dmfg_path_changed = s_dmfg_state_initialized &&
-        dmfg_active != s_last_dmfg_active;
+    const bool dmfg_changed = s_dmfg_state_initialized && dmfg_active != s_last_dmfg_active;
     s_dmfg_state_initialized = true;
     s_last_dmfg_active = dmfg_active;
-
-    // Priority: Tier4 > DMFG branch > OLED cap > background > FG-Off > VRR/Fixed.
-    // DMFG and its existing internal caps are intentionally unaffected by OLED Care.
-    // ── DMFG: passthrough or output cap pacing ──
+    if (dmfg_changed) ResetAdaptationRegime(dmfg_active ? "DMFG entered" : "DMFG exited");
     if (dmfg_active) {
-        HandlePacingRegimeChange(
-            now,
-            ComputeFGDivisorRaw(),
-            g_user_target_fps.load(std::memory_order_relaxed),
-            dmfg_path_changed,
-            trigger);
+        NativeGate_PublishNoFrameGeneration(false, 0);
         static bool s_dmfg_logged = false;
         if (!s_dmfg_logged) {
             LOG_WARN("DMFG active — passthrough/cap mode");
             s_dmfg_logged = true;
         }
-
-        // Disable the presentation gate — we're not pacing, stale deadlines
-        // from a previous non-DMFG session could cause spurious holds.
-        g_skip_present_gate.store(true, std::memory_order_relaxed);
-        PublishArrivalLeadFallbackStatus(
-            frameID,
-            trigger,
-            marker,
-            ArrivalLeadFallbackReason::DynamicFrameGeneration);
-
-        double dmfg_feedback_interval_us =
-            g_actual_frame_time_us.load(std::memory_order_relaxed);
-        if (!(dmfg_feedback_interval_us > 0.0)) {
-            const int target_fps =
-                g_user_target_fps.load(std::memory_order_relaxed);
-            dmfg_feedback_interval_us = target_fps > 0
-                ? 1000000.0 / static_cast<double>(target_fps)
-                : 16666.667;
-        }
-        DrainCorrelator(false, dmfg_feedback_interval_us);
-
-        // ── DMFG Background FPS cap ──
-        {
-            HWND ref_hwnd = SwapMgr_GetHWND();
-            bool focused = false;
-            if (ref_hwnd) {
-                HWND fg = FocusLock_RealGetForegroundWindow();
-                DWORD fg_pid = 0;
-                if (fg) GetWindowThreadProcessId(fg, &fg_pid);
-                focused = (fg_pid == GetCurrentProcessId());
-            } else {
-                HWND fg = FocusLock_RealGetForegroundWindow();
-                DWORD fg_pid = 0;
-                if (fg) GetWindowThreadProcessId(fg, &fg_pid);
-                focused = (fg_pid == GetCurrentProcessId());
-            }
-
-            if (!focused) {
-                int bg_fps = g_background_fps.load(std::memory_order_relaxed);
-                if (bg_fps > 0) {
-                    double bg_interval_us = 1000000.0 / static_cast<double>(bg_fps);
-                    LARGE_INTEGER qpc_now;
-                    QueryPerformanceCounter(&qpc_now);
-                    if (s_prev_enforcement_ts > 0) {
-                        double elapsed = qpc_to_us(qpc_now.QuadPart - s_prev_enforcement_ts);
-                        double remaining = bg_interval_us - elapsed;
-                        if (remaining > 500.0)
-                            DoOwnSleep(qpc_now.QuadPart + us_to_qpc(remaining));
-                    }
-                }
-                LARGE_INTEGER qpc_now;
-                QueryPerformanceCounter(&qpc_now);
-                s_prev_enforcement_ts = qpc_now.QuadPart;
-                s_last_enforcement_ts = qpc_now.QuadPart;
-                g_predictor.OnEnforcement(frameID, qpc_now.QuadPart);
-                PublishArrivalLeadFallbackStatus(
-                    frameID,
-                    trigger,
-                    marker,
-                    ArrivalLeadFallbackReason::Background);
-                return;
-            }
-        }
-
-        // ── DMFG FG-Off FPS cap ──
-        {
-            int fg_off_cap = g_fg_off_fps.load(std::memory_order_relaxed);
-            if (fg_off_cap > 0 && IsFGDllLoaded()) {
-                const bool fg_is_off = ComputeFGDivisorRaw() == 1;
-
-                if (fg_is_off) {
-                    double cap_interval_us = 1000000.0 / static_cast<double>(fg_off_cap);
-                    LARGE_INTEGER qpc_now;
-                    QueryPerformanceCounter(&qpc_now);
-                    int64_t own_sleep_start = 0;
-                    if (s_prev_enforcement_ts > 0) {
-                        double elapsed = qpc_to_us(qpc_now.QuadPart - s_prev_enforcement_ts);
-                        double remaining = cap_interval_us - elapsed;
-                        if (remaining > 500.0) {
-                            own_sleep_start = qpc_now.QuadPart;
-                            DoOwnSleep(qpc_now.QuadPart + us_to_qpc(remaining));
-                        }
-                    }
-                    QueryPerformanceCounter(&qpc_now);
-                    PublishReflexCapRelease(
-                        frameID,
-                        nvapi_producer_epoch,
-                        marker,
-                        own_sleep_start,
-                        qpc_now.QuadPart);
-                    if (s_prev_enforcement_ts > 0) {
-                        double ft = qpc_to_us(qpc_now.QuadPart - s_prev_enforcement_ts);
-                        if (ft > 0.0)
-                            g_actual_frame_time_us.store(ft, std::memory_order_relaxed);
-                    }
-                    s_prev_enforcement_ts = qpc_now.QuadPart;
-                    s_last_enforcement_ts = qpc_now.QuadPart;
-                    g_predictor.OnEnforcement(frameID, qpc_now.QuadPart);
-                    PublishArrivalLeadFallbackStatus(
-                        frameID,
-                        trigger,
-                        marker,
-                        ArrivalLeadFallbackReason::FgOffCap);
-                    return;
-                }
-            }
-        }
-
-        LARGE_INTEGER qpc_now;
-        QueryPerformanceCounter(&qpc_now);
-        int64_t ts = qpc_now.QuadPart;
-
-        double telemetry_ft = (s_prev_enforcement_ts > 0)
-            ? qpc_to_us(ts - s_prev_enforcement_ts) : 0.0;
-
-        int64_t prev_enforcement = s_prev_enforcement_ts;
-
-        s_prev_enforcement_ts = ts;
-        s_last_enforcement_ts = ts;
-
-        if (telemetry_ft > 0.0) {
-            g_actual_frame_time_us.store(telemetry_ft, std::memory_order_relaxed);
-        }
-
-        double output_fps = g_output_fps.load(std::memory_order_relaxed);
-        double render_fps = (telemetry_ft > 0.0) ? 1000000.0 / telemetry_ft : 0.0;
-        double real_fg_divisor = 1.0;
-        if (output_fps > 1.0 && render_fps > 1.0) {
-            double ratio = output_fps / render_fps;
-            if (ratio >= 1.5)
-                real_fg_divisor = ratio;
-        }
-
-        int output_cap = 0;  // Dynamic DMFG: pure passthrough, no cap from ReLimiter.
-                              // User sets target via NVIDIA App / RHI / Profile Inspector.
-
-        // Pure passthrough — no pacing, just record telemetry.
-        g_predictor.OnEnforcement(frameID, ts);
-
-        double jitter = (telemetry_ft > 0.0 && s_prev_actual_ft > 0.0)
-            ? std::abs(telemetry_ft - s_prev_actual_ft) : 0.0;
-        s_prev_actual_ft = telemetry_ft;
-
-        FrameRow row = {};
-        row.frame_id = frameID;
-        row.timestamp_us = qpc_to_us(ts);
-        row.actual_frame_time_us = telemetry_ft;
-        row.fg_divisor = real_fg_divisor;
-        row.predicted_us = g_predictor.predicted_us;
-        row.sleep_duration_us = 0.0;
-        row.overload = 0;
-        row.tier = static_cast<int>(g_current_tier.load(std::memory_order_relaxed));
-        row.mode = 0;
-        row.jitter_us = jitter;
-        row.predictor_warm = (g_predictor.frame_times_us.Size() >= 8) ? 1 : 0;
-        row.smoothness_us = g_smoothness_us.load(std::memory_order_relaxed);
-        row.reflex_gpu_active_us = g_reflex_gpu_active_us.load(std::memory_order_relaxed);
-        row.reflex_ai_frame_time_us = g_reflex_ai_frame_time_us.load(std::memory_order_relaxed);
-        row.reflex_cpu_latency_us = g_reflex_cpu_latency_us.load(std::memory_order_relaxed);
-        row.reflex_present_duration_us = g_reflex_present_duration_us.load(std::memory_order_relaxed);
-        row.api = (SwapMgr_GetActiveAPI() == ActiveAPI::Vulkan) ? 1
-                : (SwapMgr_GetActiveAPI() == ActiveAPI::DX11) ? 2
-                : (SwapMgr_GetActiveAPI() == ActiveAPI::OpenGL) ? 3 : 0;
-        CSV_Push(row);
-    #ifdef RELIMITER_ENABLE_MCP
-        LiveDebug_PushScheduler(row);
-    #endif
+        runtime.dmfg_passthrough = true;
+        g_resolved_fg_divisor.store(ComputeFGDivisorRaw(), std::memory_order_relaxed);
+        RunDmfg(frameID, trigger, marker, nvapi_producer_epoch,
+            ResolvePipeline(trigger, config, runtime));
         return;
     }
 
     int fg_divisor_raw = ComputeFGDivisorRaw();
-    const PacingMode current_pacing_mode =
-        g_pacing_mode.load(std::memory_order_relaxed);
-    if (IsFGDllLoaded() &&
-        (fg_divisor_raw == 1 || current_pacing_mode == PacingMode::Fixed)) {
-        double feedback_interval_us =
-            g_effective_interval_us.load(std::memory_order_relaxed);
+    if (IsFGDllLoaded() && (fg_divisor_raw == 1 || !runtime.vrr)) {
+        double feedback_interval_us = g_effective_interval_us.load(std::memory_order_relaxed);
         if (!(feedback_interval_us > 0.0)) {
-            const int target_fps =
-                g_user_target_fps.load(std::memory_order_relaxed);
+            const int target_fps = g_user_target_fps.load(std::memory_order_relaxed);
             feedback_interval_us = target_fps > 0
                 ? 1000000.0 / static_cast<double>(target_fps)
                 : 16666.667;
@@ -793,1211 +1931,174 @@ void OnMarker(
         PollReflexLatencyReport(feedback_interval_us);
         fg_divisor_raw = ComputeFGDivisorRaw();
     }
-    const bool oled_care_active = OLEDCare_IsActive();
-    // Track only ordinary-path observations: DMFG owns its own regime changes
-    // and must not react to OLED toggles while it is the selected branch.
-    static bool s_was_oled_care_active = false;
-    const bool oled_care_changed = oled_care_active != s_was_oled_care_active;
-    s_was_oled_care_active = oled_care_active;
-    HandlePacingRegimeChange(
-        now,
-        fg_divisor_raw,
-        g_user_target_fps.load(std::memory_order_relaxed),
-        dmfg_path_changed || oled_care_changed,
-        trigger);
+    g_resolved_fg_divisor.store(fg_divisor_raw, std::memory_order_relaxed);
+    // This is a resolved scheduler observation, not native-gate actuation;
+    // the native gate and GPU readiness read it.
+    NativeGate_ObserveFrameGeneration(fg_divisor_raw, FrameTimeline_CurrentControllerGeneration());
+    runtime.fg_presenting = fg_divisor_raw > 1;
 
-    if (oled_care_changed) {
-        // The regime reset above invalidates exact deadlines (controller
-        // generation), predictor history and both adaptation controllers.
-        // Do not bridge idle cadence into the next ordinary pacing sample.
-        g_skip_present_gate.store(true, std::memory_order_relaxed);
-        g_last_gate_sleep_us.store(0.0, std::memory_order_relaxed);
-        s_last_present_deadline = 0;
-        s_last_enforcement_ts = 0;
-        s_prev_enforcement_ts = 0;
-        s_prev_actual_ft = 0.0;
-        g_cadence_meter.Reset();
-        g_actual_frame_time_us.store(0.0, std::memory_order_relaxed);
-        g_effective_interval_us.store(0.0, std::memory_order_relaxed);
-        LARGE_INTEGER qpc_now;
-        QueryPerformanceCounter(&qpc_now);
-        now = qpc_now.QuadPart;
-        g_pll.Reanchor(now);
+    const int target_fps = g_user_target_fps.load(std::memory_order_relaxed);
+    if (target_fps != s_last_target_fps || fg_divisor_raw != s_last_fg_divisor_raw) {
+        if (s_last_target_fps >= 0) {
+            LOG_INFO("Scheduler: cap/FG change (fps %d -> %d, FG %d -> %d): grid period change",
+                     s_last_target_fps, target_fps, s_last_fg_divisor_raw, fg_divisor_raw);
+            ResetAdaptationRegime("cap or FG divisor change");
+            ResetFeasibility("cap or FG divisor change");
+            s_pre_sleep.Reset();
+        }
+        s_last_target_fps = target_fps;
+        s_last_fg_divisor_raw = fg_divisor_raw;
+    }
+
+    const bool oled_care_active = OLEDCare_IsActive();
+    if (oled_care_active != s_was_oled_care_active) {
+        s_was_oled_care_active = oled_care_active;
+        ResetAdaptationRegime(oled_care_active ? "OLED Care entered" : "OLED Care exited");
         LOG_INFO("OLED Care scheduler cap %s", oled_care_active ? "entered" : "exited");
     }
 
-    // Foreground-independent, including target_fps=0 and Win32. No FG divisor
-    // or normal VRR/Fixed policy applies to this idle cap. A disabled background
-    // cap still means 20 FPS here, not uncapped OLED Care.
-    if (oled_care_active) {
-        const int background_fps = g_background_fps.load(std::memory_order_relaxed);
-        const double cap_interval_us = 1000000.0 /
-            static_cast<double>(background_fps > 0 ? background_fps : 20);
-        g_skip_present_gate.store(true, std::memory_order_relaxed);
-        g_last_gate_sleep_us.store(0.0, std::memory_order_relaxed);
-        g_effective_interval_us.store(cap_interval_us, std::memory_order_relaxed);
-        LARGE_INTEGER qpc_now;
-        QueryPerformanceCounter(&qpc_now);
-        if (s_last_enforcement_ts > 0) {
-            const double elapsed_us = qpc_to_us(qpc_now.QuadPart - s_last_enforcement_ts);
-            const double remaining_us = cap_interval_us - elapsed_us;
-            if (remaining_us > 500.0)
-                DoOwnSleep(qpc_now.QuadPart + us_to_qpc(remaining_us));
-        }
-        InvokeSleep(/*passthrough=*/true);
-        QueryPerformanceCounter(&qpc_now);
-        if (s_last_enforcement_ts > 0) {
-            const double frame_time_us = qpc_to_us(qpc_now.QuadPart - s_last_enforcement_ts);
-            if (frame_time_us > 0.0)
-                g_actual_frame_time_us.store(frame_time_us, std::memory_order_relaxed);
-        }
-        s_last_enforcement_ts = qpc_now.QuadPart;
-        s_prev_enforcement_ts = qpc_now.QuadPart;
-        g_predictor.OnEnforcement(frameID, qpc_now.QuadPart);
-        // Reuse the idle/background fallback; no new telemetry schema. The
-        // pending-feedback scope discards samples instead of adapting to idle.
-        PublishArrivalLeadFallbackStatus(
-            frameID,
-            trigger,
-            marker,
-            ArrivalLeadFallbackReason::Background);
-        return;
-    }
-
-    // Background FPS cap check (§III.4)
-    // Use swapchain-derived HWND for focus comparison (Req 8.1, 8.4)
-    HWND ref_hwnd = SwapMgr_GetHWND();
-    bool focused = false;
-    if (ref_hwnd) {
-        // Compare foreground window's PID against our process
-        HWND fg = FocusLock_RealGetForegroundWindow();
-        DWORD fg_pid = 0;
-        if (fg) GetWindowThreadProcessId(fg, &fg_pid);
-        focused = (fg_pid == GetCurrentProcessId());
-    } else {
-        // Fallback: no swapchain-derived HWND yet (Req 8.4)
+    // Background FPS cap check (§III.4). The grid's ModeChange epoch replaces
+    // the old full flush on focus regain.
+    if (!SwapMgr_GetHWND()) {
         static bool s_hwnd_fallback_warned = false;
         if (!s_hwnd_fallback_warned) {
             LOG_WARN("SwapMgr_GetHWND() returned null — falling back to GetForegroundWindow for focus check");
             s_hwnd_fallback_warned = true;
         }
-        HWND fg = FocusLock_RealGetForegroundWindow();
-        DWORD fg_pid = 0;
-        if (fg) GetWindowThreadProcessId(fg, &fg_pid);
-        focused = (fg_pid == GetCurrentProcessId());
     }
-
+    const bool focused = IsProcessFocused();
     if (!focused && s_was_focused) {
         s_background_mode = true;
     } else if (focused && !s_was_focused) {
         s_background_mode = false;
-        LOG_INFO("Focus regained — FlushAll (miss_ratio=%.2f, predicted=%.1f)",
-                 s_miss_ratio, g_predictor.predicted_us);
-        FlushAll();
-        // OLED exit can also reveal a focus regain. Do not pass a timestamp
-        // from before that final reset into the resumed VRR/Fixed scheduler.
-        LARGE_INTEGER qpc_now;
-        QueryPerformanceCounter(&qpc_now);
-        now = qpc_now.QuadPart;
+        ResetAdaptationRegime("focus regained");
     }
     s_was_focused = focused;
 
-    if (s_background_mode) {
-        int bg_fps = g_background_fps.load(std::memory_order_relaxed);
-        if (bg_fps > 0) {
-            // Enforce background FPS cap with a simple sleep
-            double bg_interval_us = 1000000.0 / static_cast<double>(bg_fps);
-            LARGE_INTEGER qpc_now;
-            QueryPerformanceCounter(&qpc_now);
-            int64_t target_wake = qpc_now.QuadPart + us_to_qpc(bg_interval_us);
-            // Subtract time already spent this frame
-            if (s_last_enforcement_ts > 0) {
-                double elapsed = qpc_to_us(qpc_now.QuadPart - s_last_enforcement_ts);
-                double remaining = bg_interval_us - elapsed;
-                if (remaining > 500.0) {
-                    target_wake = qpc_now.QuadPart + us_to_qpc(remaining);
-                    DoOwnSleep(target_wake);
-                }
-            }
-        }
-        InvokeSleep(/*passthrough=*/true);
-        LARGE_INTEGER qpc_now;
-        QueryPerformanceCounter(&qpc_now);
-        s_last_enforcement_ts = qpc_now.QuadPart;
-        g_predictor.OnEnforcement(frameID, qpc_now.QuadPart);
-        PublishArrivalLeadFallbackStatus(
-            frameID,
-            trigger,
-            marker,
-            ArrivalLeadFallbackReason::Background);
+    PlannedFrameInput input{};
+    input.frame_id = frameID;
+    input.trigger = trigger;
+    input.marker = marker;
+    input.fg_divisor = static_cast<double>(fg_divisor_raw);
+
+    // ── Idle caps: OLED Care, background, FG-off (grid in Idle mode, L = 0) ──
+    const int background_fps = g_background_fps.load(std::memory_order_relaxed);
+    const int fg_off_cap = g_fg_off_fps.load(std::memory_order_relaxed);
+    double idle_interval_us = 0.0;
+    if (oled_care_active) {
+        // Foreground-independent, including target_fps=0 and Win32. A disabled
+        // background cap still means 20 FPS here, not uncapped OLED Care.
+        input.regime = SchedulerCadenceRegime::OledCare;
+        input.target_fps = background_fps;
+        idle_interval_us = 1000000.0 / static_cast<double>(background_fps > 0 ? background_fps : 20);
+    } else if (s_background_mode) {
+        input.regime = SchedulerCadenceRegime::Background;
+        input.target_fps = background_fps;
+        input.extra_flags = PACING_SOURCE_BACKGROUND;
+        if (background_fps > 0) idle_interval_us = 1000000.0 / static_cast<double>(background_fps);
+        else runtime.uncapped = true; // disabled background cap: passthrough
+    } else if (fg_off_cap > 0 && IsFGDllLoaded() && fg_divisor_raw == 1) {
+        // Frame Generation off (menus, pauses, cutscenes): lower cap so the
+        // GPU does not ramp up on uncapped non-FG frames.
+        input.regime = SchedulerCadenceRegime::FgOffCap;
+        input.target_fps = fg_off_cap;
+        input.fg_divisor = 1.0;
+        idle_interval_us = 1000000.0 / static_cast<double>(fg_off_cap);
+    }
+    if (idle_interval_us > 0.0) {
+        runtime.idle_cap = true;
+        const PacingPipelineSnapshot pipeline = ResolvePipeline(trigger, config, runtime);
+        input.base_interval_us = idle_interval_us;
+        input.interval_us = idle_interval_us;
+        RunPlanned(input, pipeline, config);
+        return;
+    }
+    if (runtime.uncapped) {
+        RunPassthrough(GetCadenceContext(Scheduler_MakePlanKey(frameID, trigger), trigger,
+            marker, input.regime, input.target_fps), ResolvePipeline(trigger, config, runtime),
+            input.extra_flags, input.fg_divisor);
         return;
     }
 
-    // ── FG-Off FPS cap ──
-    // When Frame Generation disables (menus, pauses, cutscenes), apply a lower
-    // FPS cap to prevent the GPU from ramping up on uncapped non-FG frames.
-    // Uses the same simple sleep pattern as the background cap.
-    //
-    // Guard: IsFGDllLoaded() — true from startup if the game ships nvngx_dlssg.dll.
-    // This is more reliable than NGXHooks_IsFGCreated() which only becomes true
-    // after the game calls CreateFeature(FG) (often not until gameplay starts).
-    //
-    // Use the same multi-source policy as normal pacing so a current Reflex AI
-    // report can recover missed Streamline state, while explicit Streamline
-    // Off remains authoritative.
-    {
-        int fg_off_cap = g_fg_off_fps.load(std::memory_order_relaxed);
-        if (fg_off_cap > 0 && IsFGDllLoaded()) {
-            const bool fg_is_off = ComputeFGDivisorRaw() == 1;
-
-            if (fg_is_off) {
-                double cap_interval_us = 1000000.0 / static_cast<double>(fg_off_cap);
-                LARGE_INTEGER qpc_now;
-                QueryPerformanceCounter(&qpc_now);
-                int64_t own_sleep_start = 0;
-                if (s_last_enforcement_ts > 0) {
-                    double elapsed = qpc_to_us(qpc_now.QuadPart - s_last_enforcement_ts);
-                    double remaining = cap_interval_us - elapsed;
-                    if (remaining > 500.0) {
-                        own_sleep_start = qpc_now.QuadPart;
-                        int64_t target_wake = qpc_now.QuadPart + us_to_qpc(remaining);
-                        DoOwnSleep(target_wake);
-                    }
-                }
-                InvokeSleep(/*passthrough=*/true);
-                QueryPerformanceCounter(&qpc_now);
-                PublishReflexCapRelease(
-                    frameID,
-                    nvapi_producer_epoch,
-                    marker,
-                    own_sleep_start,
-                    qpc_now.QuadPart);
-                // Publish frame time AFTER sleep so OSD shows capped FPS, not uncapped
-                if (s_last_enforcement_ts > 0) {
-                    double ft = qpc_to_us(qpc_now.QuadPart - s_last_enforcement_ts);
-                    if (ft > 0.0)
-                        g_actual_frame_time_us.store(ft, std::memory_order_relaxed);
-                }
-                s_last_enforcement_ts = qpc_now.QuadPart;
-                g_predictor.OnEnforcement(frameID, qpc_now.QuadPart);
-                PublishArrivalLeadFallbackStatus(
-                    frameID,
-                    trigger,
-                    marker,
-                    ArrivalLeadFallbackReason::FgOffCap);
+    // ── Fixed refresh: vblank-snapped grid (P2-3) ──
+    if (!runtime.vrr) {
+        input.regime = SchedulerCadenceRegime::Fixed;
+        input.target_fps = target_fps;
+        input.fg_divisor = ComputeFGDivisor(); // one call per frame: it advances a ramp
+        input.extra_flags = PACING_SOURCE_FIXED_REFRESH;
+        const double interval_us = ComputeFixedInterval(input.fg_divisor);
+        if (!std::isfinite(interval_us) || interval_us <= 0.0 || interval_us > 500'000.0) {
+            runtime.uncapped = true;
+            SchedulerCadenceContext context = GetCadenceContext(
+                Scheduler_MakePlanKey(frameID, trigger), trigger, marker,
+                SchedulerCadenceRegime::Suspended);
+            RunPassthrough(context, ResolvePipeline(trigger, config, runtime),
+                PACING_SOURCE_FIXED_REFRESH, input.fg_divisor);
+            return;
+        }
+        PacingPipelineSnapshot pipeline = ResolvePipeline(trigger, config, runtime);
+        // I_0 → governor (whole-refresh ladder when the grid snaps I_0) → grid.
+        input.fixed = g_vblank_phase.Reference();
+        input.base_interval_us = interval_us;
+        input.period_identity_us = ComputeFixedInterval(static_cast<double>(fg_divisor_raw));
+        input.governed = true;
+        input.governor = UpdatePeriodGovernor(
+            GovernorLadder(interval_us, FixedRefreshLadder(interval_us, input.fixed), 0.0),
+            pipeline, config, input.fg_divisor);
+        input.interval_us = GovernedIntervalUs(input.governor, interval_us);
+        if (pipeline.placement == PacingSourcePlacement::DriverLimiter) {
+            if (ApplyDriverLimiter(DriverLimiterIntervalUs(input))) {
+                driver_limiter.active = true;
+                driver_limiter.interval_us = DriverLimiterIntervalUs(input);
+                RunDriverLimited(input, pipeline);
                 return;
             }
+            runtime.driver_limiter_unavailable = true;
+            pipeline = ResolvePipeline(trigger, config, runtime);
         }
-    }
-
-    PacingMode mode = g_pacing_mode.load(std::memory_order_relaxed);
-    if (mode == PacingMode::VRR) {
-        // The VRR consumer runs before its end-of-frame feedback poll. Retain
-        // that poll for the next frame; all bypass paths discard at scope exit.
-        pending_feedback.retain_for_adaptation =
-            g_user_target_fps.load(std::memory_order_relaxed) > 0;
-        OnMarker_VRR(frameID, now, trigger, marker);
-    }
-    else {
-        PublishArrivalLeadFallbackStatus(
-            frameID,
-            trigger,
-            marker,
-            ArrivalLeadFallbackReason::FixedMode);
-        OnMarker_Fixed(frameID, now, trigger, marker);
-    }
-}
-
-// ── VRR scheduler: full §4.1 loop ──
-static void OnMarker_VRR(
-    uint64_t frameID,
-    int64_t now,
-    SchedulerTrigger trigger,
-    ArrivalLeadMarker marker) {
-    double predicted = g_predictor.Predict();
-    double fg_divisor = ComputeFGDivisor();
-    bool predictor_warm =
-        g_predictor.frame_times_us.Size() >= 8 &&
-        !s_pacing_regime_changed_this_frame;
-    const uint64_t smoothness_generation =
-        s_smoothness_generation.load(std::memory_order_acquire);
-
-    // ── Interval-change detection ──
-    // When the FG divisor or target FPS changes, the effective interval shifts
-    // significantly. All adaptive state (predictor, deadline, damping, margin,
-    // overload) is calibrated for the old interval and must be flushed.
-    int fg_divisor_raw = ComputeFGDivisorRaw();
-    int target_fps = g_user_target_fps.load(std::memory_order_relaxed);
-    const AdaptiveDeadlineReserveRuntimeConfig reserve_runtime_config =
-        AdaptiveDeadlineReserve_GetRuntimeConfig();
-
-    static bool s_last_adaptation_enabled = false;
-    const bool adaptation_enabled_changed =
-        s_last_adaptation_enabled !=
-            reserve_runtime_config.adaptation_enabled;
-
-    if (adaptation_enabled_changed) {
-        g_adaptive_deadline_reserve.Reset();
-        s_last_adaptation_enabled =
-            reserve_runtime_config.adaptation_enabled;
-    }
-    // One-time diagnostic dump
-    static int s_diag_count = 0;
-    if (s_diag_count < 5) {
-        s_diag_count++;
-        double ceiling = g_ceiling_interval_us.load(std::memory_order_relaxed);
-        LOG_WARN("DIAG[%d]: predicted=%.1f, fg_div=%.1f, ceiling=%.1f, deadline=%lld, now=%lld",
-                 s_diag_count, predicted, fg_divisor, ceiling,
-                 s_last_present_deadline, now);
-    }
-
-    // First-frame initialization
-    if (s_last_present_deadline == 0)
-        s_last_present_deadline = now;
-
-    // Interval
-    double target_interval;
-    if (target_fps > 0) {
-        target_interval = (1000000.0 / static_cast<double>(target_fps)) * fg_divisor;
-    } else {
-        // target_fps=0: no limiting — skip sleep entirely for minimum latency
-        // Clear deadline and disable gate so PRESENT_START doesn't see stale values
-        g_skip_present_gate.store(true, std::memory_order_relaxed);
-        LARGE_INTEGER qpc_now;
-        QueryPerformanceCounter(&qpc_now);
-        s_last_enforcement_ts = qpc_now.QuadPart;
-        g_predictor.OnEnforcement(frameID, s_last_enforcement_ts);
-        PublishArrivalLeadFallbackStatus(
-            frameID,
-            trigger,
-            marker,
-            ArrivalLeadFallbackReason::Uncapped);
+        RunPlanned(input, pipeline, config);
         return;
     }
 
-    double ceiling_us = g_ceiling_interval_us.load(std::memory_order_relaxed);
-
-    // LFC guard with hysteresis
-    double effective_interval = target_interval;
-    double floor_us = g_floor_interval_us.load(std::memory_order_relaxed);
-
-    // LFC guard with hysteresis.
-    // "below" = frame rate below the floor (interval > floor_us) → LFC should activate.
-    // "above" = frame rate above the floor (interval <= floor_us) → LFC should deactivate.
-    if (effective_interval > floor_us) {
-        s_lfc_below_count++;
-        s_lfc_above_count = 0;
-    } else {
-        s_lfc_above_count++;
-        s_lfc_below_count = 0;
-    }
-
-    if (!s_lfc_active && s_lfc_below_count >= 10)
-        s_lfc_active = true;
-    else if (s_lfc_active && s_lfc_above_count >= 10)
-        s_lfc_active = false;
-
-    if (s_lfc_active) {
-        double lfc_mult = std::ceil(effective_interval / ceiling_us);
-        effective_interval = ceiling_us * lfc_mult;
-    }
-
-    // Publish for presentation gate safety clamp
-    g_effective_interval_us.store(effective_interval, std::memory_order_relaxed);
-
-    // ── Reflex workload-demand adaptation ──
-    // Consume each delayed NvAPI report once. The maximum of CPU active time
-    // and GPU render duration selects the bottleneck without adding overlapping
-    // stages. Same-report Present and queue metrics guard downward release.
-    double smoothing_offset = 0.0;
-    double computed_workload_offset_us = 0.0;
-    double applied_deadline_reserve_us = 0.0;
-    const AdaptiveDeadlineReserveDecision adaptive_reserve_decision =
-        g_adaptive_deadline_reserve.SelectReserve(
-            reserve_runtime_config.mode,
-            reserve_runtime_config.adaptation_enabled,
-            predictor_warm,
-            FrameTimeline_CurrentControllerGeneration(),
-            reserve_runtime_config.configured_reserve_us);
-    AdaptiveDeadlineReserve_PublishRuntimeStatus(
-        adaptive_reserve_decision);
-    ReflexFrameTimeSample adaptation_sample{};
-    const bool have_adaptation_sample =
-        GetReflexFrameTimeSample(&adaptation_sample);
-    const uint64_t adaptation_sample_sequence = have_adaptation_sample
-        ? adaptation_sample.sequence : 0;
-    const double adaptation_frame_time_us = have_adaptation_sample
-        ? adaptation_sample.workload_demand_us : 0.0;
-    if (reserve_runtime_config.adaptation_enabled) {
-        // Pressure thresholds describe the interval currently enforced, not
-        // the unadapted base interval. Using the base interval here can make
-        // ordinary Present/GPU latency permanently block downward recovery.
-        if (predictor_warm) {
-            // Apply pending control changes even if no fresh report arrived.
-            computed_workload_offset_us = g_frame_time_adaptation.Update(
-                0, 0.0, effective_interval, false);
-        }
-    }
-    const double current_policy_interval_us =
-        g_frame_time_adaptation.GetPolicyIntervalOnOwner(
-            effective_interval,
-            adaptive_reserve_decision.applied_reserve_us);
-    ReflexFrameTimeSample pending_sample{};
-    // The single-owner FIFO contains at most 128 entries. Disabled/cold frames
-    // consume without training, preserving the existing warm-up policy rather
-    // than replaying an inactive regime later. Telemetry above remains latest-only.
-    while (ConsumeReflexFrameTimeSample(&pending_sample)) {
-        if (reserve_runtime_config.adaptation_enabled && predictor_warm) {
-            const bool allow_release =
-                FrameTimeAdaptation_AllowRelease(
-                    pending_sample.present_duration_us,
-                    pending_sample.present_to_gpu_end_us,
-                    pending_sample.owned_gate_hold_us,
-                    current_policy_interval_us);
-            computed_workload_offset_us = g_frame_time_adaptation.Update(
-                pending_sample.sequence,
-                pending_sample.workload_demand_us,
-                effective_interval,
-                allow_release,
-                pending_sample.adaptation_generation);
-        }
-    }
-    if (reserve_runtime_config.adaptation_enabled) {
-        applied_deadline_reserve_us =
-            adaptive_reserve_decision.applied_reserve_us;
-        smoothing_offset = computed_workload_offset_us +
-            applied_deadline_reserve_us;
-        // Re-publish total offset (computed + bias) for OSD
-        g_smoothing_offset_us.store(smoothing_offset, std::memory_order_relaxed);
-        effective_interval += smoothing_offset;
-    }
-
-    // Re-publish with smoothing offset applied
-    if (smoothing_offset > 0.0)
-        g_effective_interval_us.store(effective_interval, std::memory_order_relaxed);
-
-    // ── Predictor warmup tracking ──
-    // Must be before overload detection so the grace period is available.
-    static bool s_predictor_was_cold = true;
-    static int s_post_warmup_grace = 0;
-    if (predictor_warm && s_predictor_was_cold) {
-        s_last_present_deadline = now;
-        s_interval_qpc_accumulator.Reset();
-        s_predictor_was_cold = false;
-        s_post_warmup_grace = 32;
-        LOG_INFO("Predictor warm — deadline anchor reset, grace=%d", s_post_warmup_grace);
-    } else if (!predictor_warm) {
-        s_predictor_was_cold = true;
-    }
-    if (s_post_warmup_grace > 0)
-        s_post_warmup_grace--;
-
-    // The legacy release-to-Present predictor owns its regime detection and
-    // partial reset. Completed-cycle adaptation deliberately remains
-    // independent: quartering its percentile window here caused abrupt target
-    // collapse and visible settle jitter during ordinary workload transitions.
-    g_regime_break.store(false, std::memory_order_relaxed);
-
-    // ── Deadline miss tracking ──
-    // A frame "misses" when the deadline chain falls behind `now`.
-    // The miss ratio is a continuous EMA — no binary state, no hysteresis
-    // counters, no state flushing on transitions. The deadline catch-up
-    // logic (below) handles recovery naturally: a missed frame re-anchors
-    // to `now`, producing minimal sleep on the next frame, then the chain
-    // gradually resumes full sleep as frames land on time.
-    // We defer the actual miss ratio update until after the deadline is
-    // computed (below), since that's where we know if the frame missed.
-
-    // Deadline + wake computation.
-    // The deadline chain maintains cadence by advancing one interval per frame.
-    // When the deadline falls behind (frame took longer than interval), we
-    // re-anchor to `now` so the next sleep resumes smoothly. This IS the
-    // miss recovery — no separate overload state needed.
-    int64_t raw_wake;
-    int64_t this_frame_deadline;
-    bool present_based = false;
-    bool frame_missed = false;
-    double telemetry_gate_margin = 0.0;  // captured for CSV
-    // ── Overload: telemetry-only ──
-    // The miss ratio tracks how often the deadline chain falls behind.
-    // This is published for OSD/predictor/stress detector but does NOT
-    // change the deadline formula or gate behavior. The gate self-disables
-    // for late frames (timestamp >= gate_target → passthrough), so there's
-    // no need to explicitly disable it during overload. Switching between
-    // two deadline/wake formulas based on overload state was the root cause
-    // of systematic overshoot/undershoot at every transition boundary.
-    bool overload_active = g_overload_active_flag.load(std::memory_order_relaxed);
-    int64_t interval_step_qpc = us_to_qpc(effective_interval);
-    if (!overload_active && s_miss_ratio > 0.65)
-        overload_active = true;
-    else if (overload_active && s_miss_ratio < 0.30)
-        overload_active = false;
-    if (!predictor_warm) {
-        // Predictor cold: passthrough, don't advance deadline
-        raw_wake = now;
-        this_frame_deadline = now;
-        s_last_present_deadline = now;
-        s_interval_qpc_accumulator.Reset();
-    } else {
-        // ── Unified deadline chain ──
-        // Carry fractional QPC ticks so repeated interval accumulation has no
-        // systematic truncation drift over long stationary runs.
-        interval_step_qpc = s_interval_qpc_accumulator.Next(
-            effective_interval,
-            GetQPCFrequency());
-        int64_t next_deadline = s_last_present_deadline + interval_step_qpc;
-
-        // Catch-up on miss: re-anchor the deadline to `now`.
-        //
-        // When the deadline falls behind (frame took longer than the
-        // interval), the game is GPU-bound for this frame. Re-anchoring
-        // to `now` sets drift to zero, so the gate passes through with
-        // no hold. This eliminates the stutter cycle where drift erodes
-        // to zero over N frames, the chain skips forward, and the gate
-        // spikes on the first post-skip frame.
-        //
-        // The spike on the missed frame itself is unavoidable — the GPU
-        // genuinely took longer. The gate can only hold frames (delay
-        // delivery), not release them early, so it can't compress a
-        // frame that's already late. Frame-time adaptation can absorb a
-        // sustained CPU, GPU-backpressure, or submission bottleneck by
-        // widening later target intervals from exact completed observations.
-        if (next_deadline < now) {
-            frame_missed = true;
-            next_deadline = now;
-            s_interval_qpc_accumulator.Reset();
-        }
-
-        this_frame_deadline = next_deadline;
-        s_last_present_deadline = next_deadline;
-
-        // ── Update miss ratio EMA ──
-        double miss_sample = frame_missed ? 1.0 : 0.0;
-        s_miss_ratio += MISS_EMA_ALPHA * (miss_sample - s_miss_ratio);
-
-        // Publish for external consumers (OSD, predictor, stress detector).
-        if (!overload_active && s_miss_ratio > 0.65)
-            overload_active = true;
-        else if (overload_active && s_miss_ratio < 0.30)
-            overload_active = false;
-        g_overload_active_flag.store(overload_active, std::memory_order_relaxed);
-
-        double wake_guard = g_adaptive_wake_guard.Get();
-
-        present_based = (EnfDisp_GetActivePath() == EnforcementPath::PresentBased);
-
-        if (present_based) {
-            raw_wake = this_frame_deadline - us_to_qpc(150.0);
-        } else {
-            // frame_cost: how long from wake until the present call.
-            //
-            // Use the larger of predicted render time and an EMA of observed
-            // non-sleep time. The predictor measures enforcement → PRESENT_START
-            // but the game may have its own internal limiter that adds time
-            // the predictor doesn't see. The EMA catches this.
-            //
-            // When the gate is active, subtract gate hold from observed
-            // non-sleep so the gate's phase-stabilization time doesn't
-            // inflate frame_cost (which would erode gate margin).
-            //
-            // When GPU-bound (no sleep), fall back to predicted.
-            // will_gate already computed above for deadline mode selection.
-
-            double actual_ft = g_actual_frame_time_us.load(std::memory_order_relaxed);
-            double last_own_sleep = s_last_own_sleep_us;
-            double last_gate = g_last_gate_sleep_us.load(std::memory_order_relaxed);
-            double observed_non_sleep;
-            if (last_own_sleep > 100.0 && actual_ft > last_own_sleep) {
-                // Normal path: subtract our sleep and gate hold to isolate
-                // the game's CPU cost (render + submit + any internal limiter).
-                observed_non_sleep = actual_ft - last_own_sleep - last_gate;
-            } else if (actual_ft > 0.0 && actual_ft < effective_interval * 2.0) {
-                // Zero-sleep path: when own_sleep is negligible, actual_ft
-                // IS the non-sleep time (game render + gate hold). Subtract
-                // gate hold to get game CPU cost, same as the normal path.
-                //
-                // The old code fell back to `predicted` here, which creates
-                // a death spiral at high FPS: predicted seeds the EMA →
-                // inflated frame_cost → zero sleep → fallback to predicted →
-                // EMA never recovers. Using actual_ft - gate breaks the
-                // cycle by giving the EMA real measurements to converge on.
-                observed_non_sleep = actual_ft - last_gate;
-            } else {
-                // Stall or no data: fall back to predicted as last resort.
-                observed_non_sleep = predicted;
-            }
-
-            // Sanity floor: reject nonsensically low or negative values.
-            // Can happen when gate hold exceeds actual_ft (measurement
-            // timing skew) or during scene transitions.
-            if (observed_non_sleep < 100.0)
-                observed_non_sleep = (std::min)(predicted, effective_interval);
-
-            // Clamp to effective interval — a single stall frame (scene
-            // transition, shader compile) shouldn't push the EMA to 200ms+
-            // which would take hundreds of frames to recover from.
-            observed_non_sleep = (std::min)(observed_non_sleep, effective_interval);
-
-            // Seed EMA from the first observed sample rather than predicted.
-            // Seeding from predicted locks in stale values after FPS changes
-            // (e.g., predicted=9ms at 157fps target=6.4ms), and the EMA
-            // can't recover when the zero-sleep fallback also feeds predicted.
-            if (s_ema_non_sleep_us == 0.0)
-                s_ema_non_sleep_us = observed_non_sleep;
-            else {
-                // Symmetric alpha: track increases and decreases at the same
-                // rate. The original asymmetric alpha (0.15 up / 0.35 down)
-                // was designed to reduce overshoot clustering (session 27),
-                // but sessions 33-35 revealed it destroys gate headroom.
-                //
-                // The fast down-alpha (0.35) makes the EMA track game_cpu
-                // decreases in ~3 frames, so frame_cost ≈ game_cpu with
-                // ~0µs headroom. The gate only fires when frames arrive
-                // BEFORE the deadline, which requires frame_cost > game_cpu.
-                // With 0.35 down-alpha, headroom is -44µs (S35 analysis),
-                // yielding only 10% gating and PI_sd=1544.
-                //
-                // Symmetric 0.15 produces headroom of +104µs on low-variance
-                // scenes (S35) and +309µs on high-variance scenes (S30),
-                // yielding 56-57% gateable frames — matching S30's proven
-                // 57% gating and PI_sd=687.
-                //
-                // The overshoot clustering concern (session 27) is mitigated
-                // by the gate itself: gated frames have their present time
-                // locked to the deadline, so enforcement-level ++ clustering
-                // doesn't propagate to the display.
-                static constexpr double NS_EMA_ALPHA = 0.15;
-                s_ema_non_sleep_us += NS_EMA_ALPHA * (observed_non_sleep - s_ema_non_sleep_us);
-            }
-
-            // frame_cost: use the non-sleep EMA directly.
-            //
-            // The EMA tracks game_cpu with ~0µs headroom. This means the
-            // gate only catches frames where game_cpu < ema (about 50%).
-            // Attempts to add headroom all destabilized the feedback loop:
-            // - S33 max(pred,ema): pred < ema in FG, reduced headroom
-            // - S38 ema+1000: caused overshoot clustering (lag1→+0.50)
-            //   because gate hold inflated, changing the EMA input
-            //
-            // The remaining PI variance (~1400-1500µs stdev) comes from
-            // the deadline chain oscillation propagating through the GPU
-            // pipeline. This is structural — the coupled feedback between
-            // frame_cost, sleep, gate_hold, and the EMA absorbs or
-            // amplifies any constant added to frame_cost within ~7 frames.
-            double frame_cost = s_ema_non_sleep_us;
-
-            // Wake formula: deadline - frame_cost - wake_guard - gate_margin
-            //
-            // Unified formula: always include the gate margin. The gate
-            // self-disables for late frames (timestamp >= gate_target →
-            // passthrough), so the margin is only "used" when the frame
-            // arrives early enough to be gated. When GPU-bound, frame_cost
-            // ≈ effective_interval, so raw_wake ≈ now and there's no sleep
-            // regardless — the margin doesn't cause extra latency.
-            //
-            // Gate margin: fixed at 1500µs.
-            static constexpr double GATE_MARGIN_US = 1500.0;
-            telemetry_gate_margin = GATE_MARGIN_US;
-
-            raw_wake = next_deadline - us_to_qpc(frame_cost)
-                     - us_to_qpc(wake_guard)
-                     - us_to_qpc(GATE_MARGIN_US);
-        }
-        raw_wake = (std::max)(raw_wake, now);
-    }
-
-    int64_t legacy_wake = raw_wake;
-    const int64_t maximum_sleep_qpc = us_to_qpc(effective_interval * 1.5);
-    if (legacy_wake > now + maximum_sleep_qpc) {
-        legacy_wake = now + maximum_sleep_qpc;
-    }
-    int64_t estimator_wake = 0;
-    ArrivalLeadFrameContext arrival_lead_context{};
-    const ArrivalLeadRuntimeConfig arrival_lead_config =
-        ArrivalLead_GetRuntimeConfig();
-    arrival_lead_context.key = GetArrivalLeadKey(frameID, trigger);
-    arrival_lead_context.mode = arrival_lead_config.mode;
-    arrival_lead_context.marker = marker;
-    arrival_lead_context.qpc_frequency = GetQPCFrequency();
-    arrival_lead_context.fixed_reserve_us =
-        arrival_lead_config.fixed_reserve_us;
-    arrival_lead_context.effective_interval_us = effective_interval;
-    arrival_lead_context.support_reason = ArrivalLeadFallbackReason::None;
-
-    if (arrival_lead_config.mode == ArrivalLeadMode::Off) {
-        arrival_lead_context.support_reason = ArrivalLeadFallbackReason::Disabled;
-    }
-#ifndef _WIN64
-    else {
-        arrival_lead_context.support_reason =
-            ArrivalLeadFallbackReason::UnsupportedArchitecture;
-    }
-#else
-    else if (PCL_MarkersFlowing()) {
-        arrival_lead_context.support_reason =
-            ArrivalLeadFallbackReason::PclMarkersActive;
-    }
-    else if (ReflexInject_IsActive()) {
-        arrival_lead_context.support_reason =
-            ArrivalLeadFallbackReason::InjectedReflex;
-    }
-    else if (trigger != SchedulerTrigger::NvApiMarker) {
-        arrival_lead_context.support_reason = ArrivalLeadFallbackReason::WrongTrigger;
-    }
-    else if (SwapMgr_GetActiveAPI() != ActiveAPI::DX12) {
-        arrival_lead_context.support_reason = ArrivalLeadFallbackReason::WrongApi;
-    }
-    else if (EnfDisp_GetActivePath() != EnforcementPath::NvAPIMarkers) {
-        arrival_lead_context.support_reason = ArrivalLeadFallbackReason::WrongPath;
-    }
-    else if (marker != ArrivalLeadMarker::SimulationStart &&
-             marker != ArrivalLeadMarker::RenderSubmitStart) {
-        arrival_lead_context.support_reason = ArrivalLeadFallbackReason::WrongMarker;
-    }
-    else if (s_background_mode) {
-        arrival_lead_context.support_reason = ArrivalLeadFallbackReason::Background;
-    }
-    else if (s_lfc_active) {
-        arrival_lead_context.support_reason =
-            ArrivalLeadFallbackReason::LowFramerateCompensation;
-    }
-    else if (!predictor_warm) {
-        arrival_lead_context.support_reason =
-            ArrivalLeadFallbackReason::LegacyPredictorCold;
-    }
-    else {
-        arrival_lead_context.regime = fg_divisor_raw > 1
-            ? ArrivalLeadRegime::FrameGeneration
-            : ArrivalLeadRegime::NoFrameGeneration;
-    }
-#endif
-
-    ArrivalLeadDecision arrival_lead_decision =
-        g_arrival_lead_estimator.BeginFrame(arrival_lead_context);
-    int64_t estimator_deadline = this_frame_deadline;
-    LARGE_INTEGER arrival_lead_now;
-    QueryPerformanceCounter(&arrival_lead_now);
-    if (arrival_lead_decision.mode == ArrivalLeadMode::Active &&
-        arrival_lead_decision.authority_ready) {
-        // A valid release-to-Present lead may span multiple source intervals
-        // in a threaded or frame-generated pipeline. Track that presentation
-        // phase separately from the legacy deadline/miss chain, and compensate
-        // prediction changes so they cannot modulate source release cadence.
-        ArrivalLeadDeadlineContext deadline_context{};
-        deadline_context.legacy_wake_qpc = legacy_wake;
-        deadline_context.now_qpc = arrival_lead_now.QuadPart;
-        deadline_context.interval_qpc = interval_step_qpc;
-        deadline_context.qpc_frequency =
-            arrival_lead_context.qpc_frequency;
-        estimator_deadline = ArrivalLead_ComputePhaseDeadline(
-            s_arrival_lead_deadline_phase,
-            deadline_context,
-            arrival_lead_decision);
-    }
-    if (arrival_lead_decision.authority_ready) {
-        estimator_wake = ArrivalLead_ComputeWakeTarget(
-            estimator_deadline,
-            arrival_lead_now.QuadPart,
-            arrival_lead_context.qpc_frequency,
-            arrival_lead_decision);
-    }
-
-    // Publish deadline for PRESENT_START gate.
-    // Always publish — the gate self-disables for late frames
-    // (timestamp >= gate_target → passthrough). No need to explicitly
-    // disable it during overload.
-    bool gate_active = !s_background_mode && predictor_warm;
-    bool gate_deadline_published = false;
-    const bool controller_generation_current =
-        arrival_lead_decision.key.controller_generation != 0 &&
-        arrival_lead_decision.key.controller_generation ==
-            FrameTimeline_CurrentControllerGeneration();
-    if (gate_active && controller_generation_current) {
-        gate_deadline_published = g_arrival_lead_estimator.PublishDeadline(
-            arrival_lead_context.key,
-            estimator_deadline);
-    }
-    g_skip_present_gate.store(!gate_active, std::memory_order_relaxed);
-
-    const bool controller_generation_still_current =
-        controller_generation_current &&
-        arrival_lead_decision.key.controller_generation ==
-            FrameTimeline_CurrentControllerGeneration();
-    if (arrival_lead_decision.authority_ready &&
-        !controller_generation_still_current) {
-        arrival_lead_decision.authority_ready = false;
-        arrival_lead_decision.fallback_reason =
-            ArrivalLeadFallbackReason::Discontinuity;
-    }
-    ArrivalLead_FinalizeAuthority(
-        &arrival_lead_decision,
-        gate_deadline_published && controller_generation_still_current);
-    if (arrival_lead_decision.active) {
-        raw_wake = estimator_wake;
-        s_arrival_lead_deadline_phase.deadline_qpc = estimator_deadline;
-        s_arrival_lead_deadline_phase.advance_qpc =
-            estimator_deadline - estimator_wake;
-        s_arrival_lead_deadline_phase.controller_generation =
-            arrival_lead_decision.key.controller_generation;
-        s_arrival_lead_deadline_phase.active = true;
-    } else {
-        // Never carry Estimator A's multi-interval presentation phase into a
-        // legacy fallback. The legacy deadline and miss chain stayed separate.
-        s_arrival_lead_deadline_phase = {};
-    }
-    ArrivalLead_PublishRuntimeStatus(arrival_lead_decision);
-
-    // Damping: DISABLED.
-    // The damping module smooths the wake target using an enforcement-interval
-    // EMA, but the deadline chain already smooths the deadline via the blend.
-    // Both filter the same enforcement noise through different mechanisms.
-    // The damping's steady_wake (last_enforcement + avg_interval) drifts
-    // independently of the deadline chain's reference, creating a second
-    // feedback loop that can diverge from and fight the chain.
-    // At cv=0.07, damping only suppresses 16% of noise — marginal benefit
-    // for the cost of a redundant feedback path.
-    int64_t damped_wake = raw_wake;
-
-    // Safety clamp: never sleep more than 1.5× effective interval from now.
-    // The old 2× clamp was too generous — combined with the PRESENT_START gate
-    // (which had its own 2× clamp), total sleep could reach ~4× interval.
-    if (damped_wake > now + maximum_sleep_qpc) {
-        damped_wake = now + maximum_sleep_qpc;
-    }
-
-    // Record
-    LARGE_INTEGER qpc_now;
-    QueryPerformanceCounter(&qpc_now);
-    s_last_enforcement_ts = qpc_now.QuadPart;
-
-    bool should_sleep = predictor_warm;
-    uint32_t release_request_flags = FRAME_TIMELINE_FLAG_NONE;
-    if (predictor_warm) {
-        release_request_flags |= FRAME_TIMELINE_FLAG_PREDICTOR_WARM;
-    }
-    if (should_sleep) {
-        release_request_flags |= FRAME_TIMELINE_FLAG_SLEEP_ELIGIBLE;
-    }
-    PublishReleaseTimelineEvent(
-        FrameTimelineEventType::ReleaseRequest,
-        frameID,
-        qpc_now.QuadPart,
-        damped_wake,
-        release_request_flags,
-        trigger,
-        &arrival_lead_decision,
-        &adaptive_reserve_decision,
-        legacy_wake,
-        estimator_wake);
-    FrameTimelinePath reserve_path{};
-    FrameIdentityDomain reserve_domain{};
-    const uint32_t release_producer_epoch =
-        arrival_lead_decision.key.producer_epoch;
-    const uint32_t release_controller_generation =
-        arrival_lead_decision.key.controller_generation;
-    if (reserve_runtime_config.adaptation_enabled && predictor_warm &&
-        GetMarkerTimelineContext(trigger, &reserve_path, &reserve_domain) &&
-        release_producer_epoch != 0 &&
-        release_controller_generation != 0 &&
-        release_producer_epoch ==
-            FrameTimeline_CurrentProducerEpoch(reserve_domain) &&
-        release_controller_generation ==
-            FrameTimeline_CurrentControllerGeneration()) {
-        AdaptiveDeadlineReserveRelease release{};
-        release.key.frame.identity_domain = reserve_domain;
-        release.key.frame.producer_epoch = release_producer_epoch;
-        release.key.frame.normalized_frame_id = frameID;
-        release.key.controller_generation =
-            release_controller_generation;
-        release.path = reserve_path;
-        release.release_request_qpc = qpc_now.QuadPart;
-        release.qpc_frequency = GetQPCFrequency();
-        release.workload_offset_us = computed_workload_offset_us;
-        release.configured_reserve_us =
-            adaptive_reserve_decision.configured_reserve_us;
-        release.applied_reserve_us =
-            adaptive_reserve_decision.applied_reserve_us;
-        release.mode = adaptive_reserve_decision.mode;
-        release.authority = adaptive_reserve_decision.authority;
-        release.fallback_reason = adaptive_reserve_decision.fallback_reason;
-        release.active_capped = adaptive_reserve_decision.active_capped;
-        g_adaptive_deadline_reserve.RecordRelease(release);
-    }
-
-    // Log significant miss ratio changes
-    static bool s_prev_overload = false;
-    if (overload_active != s_prev_overload) {
-        // Keep this below the default warning threshold. In the 2026-07-19
-        // shadow-timeline capture, all 66 no-sleep release delays above
-        // 100us matched this transition message. Warning-level messages are
-        // forwarded to ReShade from the scheduler thread; overload state is
-        // already available in per-frame telemetry.
-        LOG_INFO("Miss ratio %s (%.2f): predicted=%.1f, effective=%.1f",
-                 overload_active ? "HIGH" : "LOW",
-                 s_miss_ratio, predicted, effective_interval);
-        s_prev_overload = overload_active;
-    }
-
-    // Damping baseline update skipped (damping disabled).
-    // if (predictor_warm)
-    //     UpdateDampingBaseline(s_last_enforcement_ts);
-
-    // Sleep when predictor is warm. During overload, the normal wake formula
-    // naturally produces minimal/zero sleep (predicted ≈ effective_interval
-    // after clamping), so there's no hard cliff from sleeping to not-sleeping.
-    // The deadline catch-up logic handles frames that exceed the interval.
-    int64_t own_sleep_start = 0, own_sleep_end = 0;
-    bool did_sleep = false;
-    double final_wake_error = 0.0;
-    if (should_sleep && damped_wake > now) {
-        QueryPerformanceCounter(&qpc_now);
-        own_sleep_start = qpc_now.QuadPart;
-        did_sleep = TryOwnSleep(damped_wake);
-        if (did_sleep)
-            final_wake_error = g_adaptive_wake_guard.LastFinalError();
-        QueryPerformanceCounter(&qpc_now);
-        own_sleep_end = qpc_now.QuadPart;
-    }
-
-    // Track own sleep duration for next frame's non-sleep time calculation
-    s_last_own_sleep_us = (did_sleep && own_sleep_end > own_sleep_start)
-        ? qpc_to_us(own_sleep_end - own_sleep_start) : 0.0;
-    if (trigger == SchedulerTrigger::NvApiMarker) {
-        const uint32_t owned_sleep_producer_epoch =
-            arrival_lead_decision.key.producer_epoch;
-        if (owned_sleep_producer_epoch != 0 &&
-            owned_sleep_producer_epoch ==
-                FrameTimeline_CurrentProducerEpoch(
-                    FrameIdentityDomain::NvApiFrame)) {
-            PublishReflexOwnedSleep(
-                frameID,
-                owned_sleep_producer_epoch,
-                marker,
-                s_last_own_sleep_us);
-        }
-    }
-
-    // Record enforcement timestamp BEFORE driver sleep.
-    // Only re-stamp the predictor's pending frame when we actually slept.
-    QueryPerformanceCounter(&qpc_now);
-    s_last_enforcement_ts = qpc_now.QuadPart;
-
-    uint32_t release_flags = release_request_flags;
-    if (did_sleep) {
-        release_flags |= FRAME_TIMELINE_FLAG_SLEPT;
-    }
-    PublishReleaseTimelineEvent(
-        FrameTimelineEventType::Release,
-        frameID,
-        s_last_enforcement_ts,
-        damped_wake,
-        release_flags,
-        trigger,
-        &arrival_lead_decision,
-        nullptr,
-        legacy_wake,
-        estimator_wake);
-    g_arrival_lead_estimator.RecordRelease(
-        arrival_lead_decision,
-        s_last_enforcement_ts);
-    if (did_sleep) {
-        g_predictor.OnEnforcement(frameID, s_last_enforcement_ts);
-    }
-
-    int64_t driver_sleep_start = qpc_now.QuadPart;
-    // When actively pacing, call the driver sleep for Reflex integration.
-    // During overload, the game's own NvAPI_D3D_Sleep call passes through
-    // to the driver (Hook_Sleep doesn't swallow it), so we skip ours.
-    if (should_sleep)
-        InvokeSleep(/*passthrough=*/false);
-    int64_t driver_sleep_end;
-    { LARGE_INTEGER tmp; QueryPerformanceCounter(&tmp); driver_sleep_end = tmp.QuadPart; }
-    MaybeUpdateSleepMode(effective_interval, should_sleep);
-
-    // Feedback: drain correlator every frame, feed CadenceMeter.
-    // Suppress bias accumulation — the gate handles phase correction
-    // directly, and the bias controller would integrate the gate's earlier
-    // arrival as a systematic offset.
-    bool suppress_bias = !predictor_warm || s_background_mode || gate_active;
-    g_cadence_meter.SetSuppressed(suppress_bias);
-    DrainCorrelator(overload_active, effective_interval);
-
-    // ── Telemetry ──
-    Baseline_Tick();
-
-    double telemetry_ft = (s_prev_enforcement_ts > 0)
-        ? qpc_to_us(s_last_enforcement_ts - s_prev_enforcement_ts) : 0.0;
-    s_prev_enforcement_ts = s_last_enforcement_ts;
-
-    const double completed_gate_hold_us =
-        g_last_gate_sleep_us.load(std::memory_order_relaxed);
-    if (telemetry_ft > 0.0)
-        g_actual_frame_time_us.store(telemetry_ft, std::memory_order_relaxed);
-
-    // Update deadline chain oscillation correction state.
-    if (telemetry_ft > 0.0 && predictor_warm &&
-        telemetry_ft < effective_interval * 2.0) {
-        s_prev_frame_deviation_us = telemetry_ft - effective_interval;
-    } else {
-        s_prev_frame_deviation_us = 0.0;
-    }
-
-    // Smoothness: EMA of |actual - target| deviation, skipping outliers.
-    Scheduler_UpdateSmoothness(
-        smoothness_generation,
-        predictor_warm,
-        telemetry_ft,
-        effective_interval);
-
-    // Wake accuracy was captured immediately after our completed wait, before
-    // calling the driver or draining feedback. Rejected waits contribute zero.
-
-    // PQI: use actual presentation interval when CadenceMeter has reliable data.
-    // With FG active, DXGI intervals are polluted (alternating short/long).
-    // Reflex provides clean per-real-frame timing even with FG.
-    // Use CadenceMeter when: no FG (DXGI is fine), or Reflex is feeding.
-    double pqi_frame_time = telemetry_ft;
-    bool fg_active = ComputeFGDivisorRaw() > 1;
-    bool reflex_feeding = IsReflexCadenceActive();
-    if (!present_based && g_cadence_meter.IsWarm() && (!fg_active || reflex_feeding)) {
-        double pi = g_cadence_meter.present_interval_us.load(std::memory_order_relaxed);
-        if (pi > 0.0) pqi_frame_time = pi;
-    }
-
-    PQI_Push(pqi_frame_time, effective_interval,
-             final_wake_error, g_adaptive_wake_guard.Get());
-
-    // ── Update presentation latency correction (EMA fallback) ──
-    // When Reflex pipeline timing is available, the scheduler uses the direct
-    // per-frame measurement (g_reflex_present_to_gpu_end_us) instead of this EMA.
-    // The EMA only updates when Reflex data is NOT available — DX11, non-Reflex
-    // DX12, or when the Reflex ring buffer hasn't produced data yet.
-    // Only update when the gate is NOT active — when the gate is holding
-    // frames to a fixed phase, the present timing reflects the gate's hold
-    // rather than pipeline latency, which would contaminate this EMA.
-    bool reflex_pipeline_available =
-        g_reflex_present_to_gpu_end_us.load(std::memory_order_relaxed) > 0.0;
-    if (predictor_warm && !present_based
-        && !reflex_pipeline_available) {
-        double pi = g_cadence_meter.present_interval_us.load(std::memory_order_relaxed);
-        if (pi > 0.0 && telemetry_ft > 0.0 &&
-            pi < effective_interval * 2.0 && telemetry_ft < effective_interval * 2.0) {
-            double latency_sample = pi - telemetry_ft;
-            // Only track positive latency (display slower than scheduler).
-            // Negative means display is ahead — no correction needed.
-            if (latency_sample < 0.0) latency_sample = 0.0;
-            // Clamp individual samples to avoid stall contamination
-            if (latency_sample > 2000.0) latency_sample = 2000.0;
-
-            constexpr double LATENCY_EMA_ALPHA = 0.08;
-            if (s_ema_present_latency_us == 0.0)
-                s_ema_present_latency_us = latency_sample;
-            else
-                s_ema_present_latency_us += LATENCY_EMA_ALPHA *
-                    (latency_sample - s_ema_present_latency_us);
-
-            // Clamp total correction to avoid runaway
-            s_ema_present_latency_us = std::clamp(s_ema_present_latency_us, 0.0, 1500.0);
-        }
-    }
-
-    PQIScores pqi = PQI_GetRolling();
-
-    FrameRow row = {};
-    row.frame_id = frameID;
-    row.timestamp_us = qpc_to_us(s_last_enforcement_ts);
-    row.predicted_us = predicted;
-    row.effective_interval_us = effective_interval;
-    row.actual_frame_time_us = telemetry_ft;
-    row.sleep_duration_us = (damped_wake > now) ? qpc_to_us(damped_wake - now) : 0.0;
-    row.wake_error_us = final_wake_error;
-    row.ceiling_margin_us = 0.0;
-    row.stress_level = g_ceiling_stress.StressLevel();
-    row.cv = g_predictor.cv;
-    row.damping_correction_us = 0.0; // TODO: expose from damping
-    row.tier = static_cast<int>(g_current_tier.load(std::memory_order_relaxed));
-    row.overload = overload_active ? 1 : 0;
-    row.fg_divisor = ComputeFGDivisor();
-    row.mode = 0; // VRR
-    row.scanout_error_us = GetLastScanoutErrorUs();
-    row.queue_depth = 0; // retired with correlator gutting
-    row.api = (SwapMgr_GetActiveAPI() == ActiveAPI::Vulkan) ? 1
-            : (SwapMgr_GetActiveAPI() == ActiveAPI::DX11) ? 2
-            : (SwapMgr_GetActiveAPI() == ActiveAPI::OpenGL) ? 3 : 0;
-    row.pqi = pqi.pqi;
-    row.cadence_score = pqi.cadence;
-    row.stutter_score = pqi.stutter;
-    row.deadline_score = pqi.deadline;
-    row.jitter_us = (telemetry_ft > 0.0 && s_prev_actual_ft > 0.0)
-        ? std::abs(telemetry_ft - s_prev_actual_ft) : 0.0;
-    row.own_sleep_us = s_last_own_sleep_us;
-    row.driver_sleep_us = qpc_to_us(driver_sleep_end - driver_sleep_start);
-    row.gate_sleep_us = completed_gate_hold_us;
-    row.deadline_drift_us = (s_last_present_deadline > 0)
-        ? qpc_to_us(s_last_present_deadline - now) : 0.0;
-    row.predictor_warm = predictor_warm ? 1 : 0;
-    row.smoothness_us = g_smoothness_us.load(std::memory_order_relaxed);
-    row.reflex_injected = ReflexInject_IsActive() ? 1 : 0;
-    row.present_interval_us = g_cadence_meter.present_interval_us.load(std::memory_order_relaxed);
-    row.present_cadence_smoothness_us = g_cadence_meter.cadence_smoothness_us.load(std::memory_order_relaxed);
-    row.present_bias_us = g_cadence_meter.bias_ctrl.GetBias();
-    row.feedback_rate = g_cadence_meter.bias_ctrl.GetWindowSize();
-    row.feedback_alpha = g_cadence_meter.bias_ctrl.GetAlpha();
-    row.reflex_present_to_gpu_end_us = g_reflex_present_to_gpu_end_us.load(std::memory_order_relaxed);
-    row.reflex_queue_trend_us = g_reflex_queue_trend_us.load(std::memory_order_relaxed);
-    row.reflex_present_duration_us = g_reflex_present_duration_us.load(std::memory_order_relaxed);
-    row.reflex_gpu_active_us = g_reflex_gpu_active_us.load(std::memory_order_relaxed);
-    row.reflex_ai_frame_time_us = g_reflex_ai_frame_time_us.load(std::memory_order_relaxed);
-    row.reflex_cpu_latency_us = g_reflex_cpu_latency_us.load(std::memory_order_relaxed);
-    row.gate_margin_us = telemetry_gate_margin;
-    row.smoothing_offset_us = smoothing_offset;
-    row.p99_render_time_us = g_frame_time_adaptation.GetPercentile();
-    row.total_frame_cost_us = g_reflex_total_frame_cost_us.load(std::memory_order_relaxed);
-    row.adaptation_sample_sequence = adaptation_sample_sequence;
-    row.adaptation_frame_time_us = adaptation_frame_time_us;
-    if (have_adaptation_sample) {
-        row.adaptation_producer_epoch = adaptation_sample.producer_epoch;
-        row.adaptation_nvapi_frame_id = adaptation_sample.frame_id;
-        row.adaptation_cpu_active_us = adaptation_sample.cpu_active_us;
-        row.adaptation_gpu_service_us = adaptation_sample.gpu_service_us;
-        row.adaptation_owned_cpu_stage_us =
-            adaptation_sample.owned_cpu_stage_us;
-        row.adaptation_owned_gate_hold_us =
-            adaptation_sample.owned_gate_hold_us;
-    }
-    s_prev_actual_ft = telemetry_ft;
-
-    CSV_Push(row);
-#ifdef RELIMITER_ENABLE_MCP
-    LiveDebug_PushScheduler(row);
-#endif
-
-    // ── Stall detection logging ──
-    // Log any frame where driver sleep or total frame time exceeds 50ms.
-    // This fires immediately in the log file for real-time diagnosis.
-    if (row.driver_sleep_us > 50000.0) {
-        LOG_WARN("STALL: frame=%llu driver_sleep=%.0fus own_sleep=%.0fus "
-                 "predicted=%.0f effective=%.0f tier=%d overload=%d warm=%d",
-                 frameID, row.driver_sleep_us, row.own_sleep_us,
-                 predicted, effective_interval, static_cast<int>(g_current_tier.load(std::memory_order_relaxed)),
-                 overload_active ? 1 : 0, predictor_warm ? 1 : 0);
-    } else if (telemetry_ft > 50000.0) {
-        LOG_WARN("STALL: frame=%llu actual_ft=%.0fus driver_sleep=%.0fus "
-                 "own_sleep=%.0fus deadline_drift=%.0fus",
-                 frameID, telemetry_ft, row.driver_sleep_us,
-                 row.own_sleep_us, row.deadline_drift_us);
-    }
-}
-
-// ── Fixed mode: §II.5 ──
-static void OnMarker_Fixed(
-    uint64_t frameID,
-    int64_t now,
-    SchedulerTrigger trigger,
-    ArrivalLeadMarker marker) {
-    int64_t latest_vblank_qpc = 0;
-    if (VBlank_ConsumeLatest(&latest_vblank_qpc))
-        g_pll.IngestVBlank(latest_vblank_qpc);
-
-    double effective_interval = ComputeEffectiveInterval_Fixed();
-    if (!std::isfinite(effective_interval) ||
-        effective_interval <= 0.0 || effective_interval > 500'000.0) {
-        InvokeSleep(/*passthrough=*/false);
+    // ── VRR ──
+    input.target_fps = target_fps;
+    if (target_fps <= 0) {
+        // No limit: pass through for minimum latency.
+        input.regime = SchedulerCadenceRegime::Uncapped;
+        input.fg_divisor = ComputeFGDivisor();
+        runtime.uncapped = true;
+        RunPassthrough(GetCadenceContext(Scheduler_MakePlanKey(frameID, trigger), trigger,
+            marker, input.regime, target_fps), ResolvePipeline(trigger, config, runtime),
+            0, input.fg_divisor);
         return;
     }
-    g_pll.SetPeriodIfChanged(effective_interval);
-    int64_t target = g_pll.NextGridEdge(now);
-
-    LARGE_INTEGER request_qpc;
-    request_qpc.QuadPart = now;
-    if (FrameTimeline_IsEnabled()) {
-        QueryPerformanceCounter(&request_qpc);
+    input.regime = SchedulerCadenceRegime::Vrr;
+    PacingPipelineSnapshot pipeline = ResolvePipeline(trigger, config, runtime);
+    input.fg_divisor = ComputeFGDivisor(); // one call per frame: it advances a ramp
+    // I_0 (no LFC) → governor I_k → LFC hysteresis on I_k → grid interval.
+    input.base_interval_us = VrrCapIntervalUs(target_fps, input.fg_divisor);
+    input.governed = true;
+    // The governor judges demand against the LFC-paced interval, from the
+    // previous frame's LFC state (ApplyLfc runs after it).
+    input.governor = UpdatePeriodGovernor(
+        GovernorLadder(input.base_interval_us, GovernorFixedRefresh{}, LfcCeilingUs()),
+        pipeline, config, input.fg_divisor);
+    input.interval_us = ApplyLfc(GovernedIntervalUs(input.governor, input.base_interval_us));
+    input.period_identity_us = VrrPeriodIdentityUs(target_fps, fg_divisor_raw);
+    // The governor consumed this frame's reports before the end-of-frame
+    // poll; keep that poll's samples for the next frame.
+    pending_feedback.retain_for_governor = true;
+    if (pipeline.placement == PacingSourcePlacement::DriverLimiter) {
+        if (ApplyDriverLimiter(DriverLimiterIntervalUs(input))) {
+            driver_limiter.active = true;
+            driver_limiter.interval_us = DriverLimiterIntervalUs(input);
+            RunDriverLimited(input, pipeline);
+            PollReflexLatencyReport(input.interval_us);
+            return;
+        }
+        runtime.driver_limiter_unavailable = true;
+        pipeline = ResolvePipeline(trigger, config, runtime);
     }
-    uint32_t release_flags = FRAME_TIMELINE_FLAG_NONE;
-    if (target > request_qpc.QuadPart) {
-        release_flags |= FRAME_TIMELINE_FLAG_SLEEP_ELIGIBLE;
-    }
-    PublishReleaseTimelineEvent(
-        FrameTimelineEventType::ReleaseRequest,
-        frameID,
-        request_qpc.QuadPart,
-        target,
-        release_flags,
-        trigger);
-
-    double wake_guard = g_adaptive_wake_guard.Get();
-    bool valid_target = target > now;
-    double target_delta_us = 0.0;
-    if (valid_target) {
-        target_delta_us = qpc_to_us(target - now);
-        const double maximum_horizon_us = (std::min)(
-            500'000.0, (std::max)(1000.0, effective_interval * 2.0));
-        valid_target = std::isfinite(target_delta_us) &&
-            target_delta_us <= maximum_horizon_us;
-    }
-    if (valid_target) {
-        if (target_delta_us > wake_guard + 500.0)
-            CoarseSleep(target - us_to_qpc(wake_guard));
-        HWSpin(target);
-    }
-    else {
-        target = now;
-    }
-
-    InvokeSleep(/*passthrough=*/false);
-
-    LARGE_INTEGER qpc_now;
-    QueryPerformanceCounter(&qpc_now);
-    if (target > request_qpc.QuadPart) {
-        release_flags |= FRAME_TIMELINE_FLAG_SLEPT;
-    }
-    PublishReleaseTimelineEvent(
-        FrameTimelineEventType::Release,
-        frameID,
-        qpc_now.QuadPart,
-        target,
-        release_flags,
-        trigger);
-    if (trigger == SchedulerTrigger::NvApiMarker) {
-        PublishReflexOwnedSleep(
-            frameID,
-            FrameTimeline_CurrentProducerEpoch(
-                FrameIdentityDomain::NvApiFrame),
-            marker,
-            qpc_to_us(qpc_now.QuadPart - request_qpc.QuadPart));
-    }
-    g_pll.RecordWake(qpc_now.QuadPart, frameID);
-    MaybeUpdateSleepMode(effective_interval, true);
-}
-
-static double ComputeEffectiveInterval_Fixed() {
-    double fg_divisor = ComputeFGDivisor();
-    int target_fps = g_user_target_fps.load(std::memory_order_relaxed);
-    if (target_fps > 0)
-        return (1000000.0 / static_cast<double>(target_fps)) * fg_divisor;
-    // target_fps=0: no limiting — return ceiling interval as a safe default
-    // (Fixed mode shouldn't be active with no limit, but handle gracefully)
-    return g_ceiling_interval_us.load(std::memory_order_relaxed) * fg_divisor;
-}
-
-// ── Full flush on refocus ──
-static void FlushAll() {
-    Flush(FLUSH_ALL);
-    Flush_ApplyPendingOnSchedulerOwner();
-    s_last_present_deadline = 0;
-    s_interval_qpc_accumulator.Reset();
-    s_miss_ratio = 0.0;
-    s_lfc_active = false;
-    s_lfc_below_count = 0;
-    s_lfc_above_count = 0;
-    g_overload_active_flag.store(false, std::memory_order_relaxed);
-
-    s_last_own_sleep_us = 0.0;
-    s_ema_non_sleep_us = 0.0;
-    s_prev_frame_deviation_us = 0.0;
-    s_arrival_lead_deadline_phase = {};
-    g_cadence_meter.Reset();
-    g_frame_time_adaptation.Reset();
-    g_adaptive_deadline_reserve.Reset();
-    Scheduler_ResetSmoothness();
+    RunPlanned(input, pipeline, config);
+    PollReflexLatencyReport(input.interval_us);
 }

@@ -1,8 +1,22 @@
 {
-  "schema_version": 1,
+  "schema_version": 3,
   "run_id": "2026-07-18-example-a1",
   "pair_id": "example-a",
   "variant": "baseline",
+  "capture_selection": {
+    "mode": "Newest",
+    "newest_order": "numeric session FILETIME, then epoch; never file mtime",
+    "discovered_ids": [],
+    "excluded_ids": []
+  },
+  "capture_groups": [
+    {
+      "capture_id": null,
+      "process_id": null,
+      "session_filetime": null,
+      "capture_epoch": null
+    }
+  ],
   "captured_at_utc": null,
   "archived_at_utc": null,
   "scenario": {
@@ -64,12 +78,31 @@
     "adaptive_deadline_reserve_mode": null,
     "estimator_a_mode": null,
     "estimator_a_fixed_reserve_us": null,
+    "presentation_gate_location": null,
+    "native_arrival_predictor_mode": null,
+    "gpu_readiness_observer": null,
+    "gpu_present_gate_mode": null,
+    "gpu_present_gate_slack_us": null,
+    "gpu_present_gate_max_delay_us": null,
     "native_pcl_enabled": null,
     "native_pcl_status": null
   },
   "files": [
     {
-      "kind": "relimiter_scheduler",
+      "kind": "relimiter_pacing",
+      "capture_id": null,
+      "expected_name": null,
+      "present": null,
+      "path": null,
+      "size_bytes": null,
+      "sha256": null,
+      "ordered_header_sha256": null,
+      "row_count": null
+    },
+    {
+      "kind": "relimiter_pacing_events",
+      "capture_id": null,
+      "expected_name": null,
       "present": null,
       "path": null,
       "size_bytes": null,
@@ -77,5 +110,6 @@
       "ordered_header_sha256": null,
       "row_count": null
     }
-  ]
+  ],
+  "integrity_notes": []
 }

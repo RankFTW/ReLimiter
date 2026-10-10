@@ -6,10 +6,11 @@
 #include "display_state.h"
 
 // VBlank thread: D3DKMTWaitForVerticalBlankEvent loop.
-// In Fixed mode: publishes real vblank edges for scheduler-owned PLL updates
-// and updates g_estimated_refresh_us.
-// In VRR mode: stopped — CadenceMeter handles refresh estimation from DXGI stats.
-// Falls back to running if DXGI stats are unavailable (Vulkan/OpenGL).
+// In Fixed mode: publishes real vblank edges for the scheduler-owned vblank
+// phase tracker (the grid's fixed reference) and updates
+// g_estimated_refresh_us.
+// In VRR mode: stopped. The grid needs no vblank reference, and
+// g_estimated_refresh_us keeps the display-state ceiling seed.
 
 void StartVBlankThread();
 bool StopVBlankThread();

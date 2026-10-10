@@ -1,6 +1,13 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+
+// One resolved FG state per frame (phase4_design.md P4-13; plan 6.7, D9):
+// the raw divisor the scheduler resolved for its newest frame (1 without
+// FG). The OSD and frame splitting read it instead of recomputing. Written
+// by the scheduler owner; any thread reads.
+inline std::atomic<int> g_resolved_fg_divisor{1};
 
 // FG divisor computation with smooth transition.
 // ComputeFGDivisorRaw: returns the effective FG multiplier (1 when inactive,

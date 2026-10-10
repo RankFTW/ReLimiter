@@ -6,18 +6,11 @@
 #include <functional>
 #include <vector>
 
-// ── TaggedSample: used by stress detector only ──
-struct TaggedSample {
-    double value;
-    bool   during_overload;
-};
-
 // ── RollingWindow<T, N> ──
 // Fixed-capacity circular buffer with statistics.
 //
 // For T = double: Push, Mean, StdDev, Percentile (insertion-sort shadow copy),
 //                 Size, Clear, TakeLast, Latest, JustWrapped.
-// For T = TaggedSample: additionally MeanWhere, Where, MeanAll, PercentileAll, LatestValue.
 
 template<typename T, size_t N>
 class RollingWindow {
@@ -106,47 +99,6 @@ public:
         return sorted[idx];
     }
 
-    // ── TaggedSample-specific methods ──
-
-    // Mean of samples matching predicate
-    template<typename Pred>
-    double MeanWhere(Pred pred) const {
-        double sum = 0.0;
-        size_t n = 0;
-        for (size_t i = 0; i < count_; i++) {
-            const auto& s = data_[Index(i)];
-            if (pred(s)) {
-                sum += ValueOf(s);
-                n++;
-            }
-        }
-        return n > 0 ? sum / static_cast<double>(n) : 0.0;
-    }
-
-    // Return filtered subset as a new RollingWindow
-    template<typename Pred>
-    RollingWindow<T, N> Where(Pred pred) const {
-        RollingWindow<T, N> result;
-        for (size_t i = 0; i < count_; i++) {
-            const auto& s = data_[Index(i)];
-            if (pred(s))
-                result.Push(s);
-        }
-        return result;
-    }
-
-    // Mean of all samples (ignoring tags)
-    double MeanAll() const { return Mean(); }
-
-    // Percentile of all samples (ignoring tags)
-    double PercentileAll(double p) const { return Percentile(p); }
-
-    // Latest value (double extraction from T)
-    double LatestValue() const {
-        if (count_ == 0) return 0.0;
-        return ValueOf(Latest());
-    }
-
 private:
     T data_[N]{};
     size_t head_ = 0;
@@ -162,7 +114,6 @@ private:
 
     // Extract double value from T
     static double ValueOf(const double& v) { return v; }
-    static double ValueOf(const TaggedSample& v) { return v.value; }
 };
 
 // ── RingBuffer<T, N> ──

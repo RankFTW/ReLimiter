@@ -1,12 +1,15 @@
+// Stage-demand computation (src/frame_time_adaptation.cpp), Reflex report
+// admission policy and the delayed-report queue. The Frame-Time Adaptation
+// controller is retired (phase3_controllers_design.md P3-5); the period
+// governor that consumes this demand has its own test (test_period_governor).
+// Production wiring (feedback.cpp producer, scheduler consumer) is not covered.
+
 #include "frame_time_adaptation.h"
 #include "reflex_report_policy.h"
 #include "reflex_adaptation_queue.h"
-#include "scheduler.h"
 
-#include <atomic>
 #include <cmath>
 #include <cstdio>
-#include <thread>
 
 namespace
 {
@@ -19,45 +22,6 @@ namespace
             ++g_failures;                                                       \
         }                                                                       \
     } while (false)
-
-    void TestDisabledControllerPublishesZero()
-    {
-        FrameTimeAdaptation adaptation;
-        CHECK(adaptation.Update(1, 12000.0, 10000.0) == 0.0);
-        CHECK(adaptation.primary.Size() == 0);
-        CHECK(!adaptation.IsWarm());
-    }
-
-    void TestPresentPressureGuardsRelease()
-    {
-        CHECK(FrameTimeAdaptation_AllowRelease(
-            500.0, 5000.0, 0.0, 10000.0));
-        CHECK(!FrameTimeAdaptation_AllowRelease(
-            3600.0, 5000.0, 0.0, 10000.0));
-        CHECK(!FrameTimeAdaptation_AllowRelease(
-            500.0, 11000.0, 0.0, 10000.0));
-        CHECK(!FrameTimeAdaptation_AllowRelease(
-            -1.0, 5000.0, 0.0, 10000.0));
-        CHECK(!FrameTimeAdaptation_AllowRelease(
-            500.0, 5000.0, -1.0, 10000.0));
-        // Exact ReLimiter gate hold is controller-owned. Removing it from both
-        // spans exposes healthy downstream pressure and permits recovery.
-        CHECK(FrameTimeAdaptation_AllowRelease(
-            5000.0, 11000.0, 4000.0, 10000.0));
-        // Capture-like pressure is invalid against the 157 FPS base interval
-        // but healthy relative to the interval currently being enforced.
-        CHECK(!FrameTimeAdaptation_AllowRelease(
-            2500.0, 6800.0, 0.0, 6369.4));
-        CHECK(FrameTimeAdaptation_AllowRelease(
-            2500.0, 6800.0, 0.0, 10350.0));
-        // The validated Rogue Core recovery tail has ordinary Present spans
-        // near 2.4-2.7ms while the active interval falls toward 7.8ms.
-        CHECK(FrameTimeAdaptation_AllowRelease(
-            2700.0, 6800.0, 0.0, 7800.0));
-        CHECK(!FrameTimeAdaptation_AllowRelease(
-            2800.0, 6800.0, 0.0, 7800.0));
-    }
-
     void TestWorkloadDemandSelectsBottleneckWithoutAddingStages()
     {
         FrameTimeAdaptationWorkloadStages stages{};
@@ -91,6 +55,116 @@ namespace
         CHECK(demand.cpu_active_us == 0.0);
         CHECK(demand.gpu_render_us == 7000.0);
         CHECK(demand.workload_us == 7000.0);
+    }
+
+    // R10: a serial engine starts frame n + 1's simulation at or after frame
+    // n's Present end; 124 of the newest 128 consecutive pairs make it serial.
+    void TestSerialFrameDetector()
+    {
+        SerialFrameDetector detector;
+        uint64_t frame = 100, t = 1'000'000;
+        // Serial frames: span 6 ms, next simulation 0.2 ms after Present end.
+        for (int i = 0; i < 129; ++i) { // 129 reports make 128 pairs
+            CHECK(!detector.Serial());
+            detector.Push(frame++, t, t + 6000);
+            t += 6200;
+        }
+        CHECK(detector.Pairs() == 128 && detector.SerialPairs() == 128);
+        CHECK(detector.Serial());
+        // Overlapping (pipelined) frames: simulation starts 2 ms before the
+        // previous Present ends (the first overlapping report still pairs
+        // serially with the frame before it). Hysteresis (R12): serial stays
+        // on down to 116 of 128 and turns off below.
+        for (int i = 0; i < 13; ++i) {
+            detector.Push(frame++, t, t + 6000);
+            t += 4000;
+        }
+        CHECK(detector.SerialPairs() == 116);
+        CHECK(detector.Serial());
+        detector.Push(frame++, t, t + 6000);
+        t += 4000;
+        CHECK(detector.SerialPairs() == 115);
+        CHECK(!detector.Serial());
+        // Serial frames again: on only once 124 of 128 are serial, after the
+        // overlapping pairs have aged out of the window.
+        int pushes = 0;
+        for (; pushes < 300 && !detector.Serial(); ++pushes) {
+            CHECK(detector.SerialPairs() < 124 || detector.Pairs() < 128);
+            detector.Push(frame++, t, t + 6000);
+            t += 6200;
+        }
+        CHECK(detector.Serial() && detector.SerialPairs() == 124);
+        CHECK(pushes > 100);
+        // A frame ID gap or an invalid report judges no pair.
+        const uint32_t pairs = detector.Pairs(), serial = detector.SerialPairs();
+        detector.Push(frame + 5, t + 10'000, t + 16'000);
+        CHECK(detector.Pairs() == pairs && detector.SerialPairs() == serial);
+        detector.Push(frame + 6, 0, t);
+        detector.Push(frame + 7, t + 40'000, t + 46'000);
+        CHECK(detector.SerialPairs() == serial);
+        detector.Reset();
+        CHECK(!detector.Serial() && detector.Pairs() == 0);
+
+        // A fully pipelined stream never turns serial.
+        for (int i = 0; i < 300; ++i) {
+            detector.Push(frame++, t, t + 9000);
+            t += 7000;
+        }
+        CHECK(!detector.Serial());
+    }
+
+    // R10: with serial frames the demand is the larger of the stage maximum
+    // and the frame span minus ReLimiter's holds inside it.
+    void TestFrameSpanDemand()
+    {
+        FrameTimeAdaptationWorkloadStages stages{};
+        stages.simulation_us = 2800.0;
+        stages.render_submission_us = 6500.0;
+        stages.gpu_active_us = 7400.0;
+        stages.frame_span_us = 9100.0;
+        stages.present_call_us = 1400.0;
+        stages.interval_us = 7692.0;
+        FrameTimeAdaptationDemand demand = FrameTimeAdaptation_ComputeDemand(stages);
+        CHECK(demand.workload_us == 7400.0 && demand.frame_span_us == 0.0); // not serial
+
+        stages.serial_frames = true;
+        demand = FrameTimeAdaptation_ComputeDemand(stages);
+        CHECK(demand.frame_span_us > 0.0);
+        CHECK(demand.frame_span_us == 9100.0 && demand.workload_us == 9100.0);
+        CHECK(demand.cpu_active_us == 6500.0 && demand.gpu_render_us == 7400.0);
+
+        // The controller residence lies inside the span for a
+        // SimulationStart or RenderSubmitStart enforcement marker only.
+        stages.owned_cpu_stage_us = 500.0;
+        stages.enforcement_marker = PacingSourceMarker::SimulationStart;
+        demand = FrameTimeAdaptation_ComputeDemand(stages);
+        CHECK(demand.frame_span_us == 8600.0);
+        stages.enforcement_marker = PacingSourceMarker::RenderSubmitStart;
+        demand = FrameTimeAdaptation_ComputeDemand(stages);
+        CHECK(demand.frame_span_us == 8600.0);
+        stages.enforcement_marker = PacingSourceMarker::Unknown;
+        demand = FrameTimeAdaptation_ComputeDemand(stages);
+        CHECK(demand.frame_span_us == 9100.0);
+
+        // The present gate hold is removed once; the rest of the Present
+        // call counts up to max(2 ms, I/4).
+        stages.owned_gate_hold_us = 1000.0;
+        stages.present_call_us = 2400.0;
+        demand = FrameTimeAdaptation_ComputeDemand(stages);
+        CHECK(demand.frame_span_us == 8100.0);
+        stages.owned_gate_hold_us = 0.0;
+        stages.present_call_us = 5000.0; // 3 ms beyond the 2 ms cap
+        demand = FrameTimeAdaptation_ComputeDemand(stages);
+        CHECK(demand.frame_span_us == 6100.0);
+        CHECK(demand.workload_us == 7400.0 && demand.frame_span_us > 0.0);
+        stages.interval_us = 16'000.0; // cap I/4 = 4 ms
+        demand = FrameTimeAdaptation_ComputeDemand(stages);
+        CHECK(demand.frame_span_us == 8100.0);
+
+        // An invalid span leaves the stage demand.
+        stages.frame_span_us = NAN;
+        demand = FrameTimeAdaptation_ComputeDemand(stages);
+        CHECK(demand.frame_span_us == 0.0 && demand.workload_us == 7400.0);
     }
 
     void TestReflexReportBurstSelectionPreservesOrder()
@@ -139,56 +213,6 @@ namespace
         CHECK(!ReflexReport_SelectAdmission(105, 104, 0, NAN, 0).ingest);
     }
 
-    void TestWorkloadOnlyReportsWarmAdaptation()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.95, true);
-        uint64_t last_frame_id = 0;
-        for (uint64_t frame_id = 1; frame_id <= 64; ++frame_id) {
-            const ReflexReportAdmission admission =
-                ReflexReport_SelectAdmission(
-                    frame_id,
-                    last_frame_id,
-                    0,
-                    12000.0,
-                    0);
-            CHECK(admission.ingest);
-            CHECK(!admission.cadence_available);
-            adaptation.Update(frame_id, 12000.0, 10000.0);
-            last_frame_id = frame_id;
-        }
-        CHECK(adaptation.IsWarm());
-        CHECK(adaptation.GetPercentile() == 12000.0);
-        CHECK(adaptation.GetOffset() > 1900.0);
-    }
-
-    void TestCadenceTelemetryCannotSelfRatchetHeadroom()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.95, true);
-        uint64_t last_frame_id = 0;
-        for (uint64_t frame_id = 1; frame_id <= 10000; ++frame_id) {
-            // Diagnostic completion cadence can move with active pacing. It is
-            // admitted separately, but only independent workload demand reaches
-            // the interval controller.
-            const uint32_t paced_cadence_us = static_cast<uint32_t>(
-                10000 + (frame_id % 5000));
-            const ReflexReportAdmission admission =
-                ReflexReport_SelectAdmission(
-                    frame_id,
-                    last_frame_id,
-                    paced_cadence_us,
-                    8000.0,
-                    0);
-            CHECK(admission.ingest);
-            CHECK(admission.cadence_available);
-            CHECK(adaptation.Update(frame_id, 8000.0, 10000.0) == 0.0);
-            last_frame_id = frame_id;
-        }
-        CHECK(adaptation.primary.Size() == 256);
-        CHECK(adaptation.GetPercentile() == 8000.0);
-        CHECK(adaptation.GetOffset() == 0.0);
-    }
 
     void TestRenderSubmissionUsesEarliestPairedBoundary()
     {
@@ -213,7 +237,7 @@ namespace
         stages.gpu_active_us = 5000.0;
         // 6ms game work + 3ms scheduler sleep + 0.8ms local processing.
         stages.owned_cpu_stage_us = 3800.0;
-        stages.enforcement_marker = ArrivalLeadMarker::SimulationStart;
+        stages.enforcement_marker = PacingSourceMarker::SimulationStart;
 
         const FrameTimeAdaptationDemand demand =
             FrameTimeAdaptation_ComputeDemand(stages);
@@ -230,7 +254,7 @@ namespace
         stages.gpu_render_us = 15552.0;
         stages.gpu_active_us = 13033.0;
         stages.owned_cpu_stage_us = 18317.0;
-        stages.enforcement_marker = ArrivalLeadMarker::SimulationStart;
+        stages.enforcement_marker = PacingSourceMarker::SimulationStart;
 
         const FrameTimeAdaptationDemand demand =
             FrameTimeAdaptation_ComputeDemand(stages);
@@ -247,7 +271,7 @@ namespace
         stages.gpu_render_us = 4568.0;
         stages.gpu_active_us = 3859.0;
         stages.owned_cpu_stage_us = 6606.0;
-        stages.enforcement_marker = ArrivalLeadMarker::RenderSubmitStart;
+        stages.enforcement_marker = PacingSourceMarker::RenderSubmitStart;
 
         const FrameTimeAdaptationDemand demand =
             FrameTimeAdaptation_ComputeDemand(stages);
@@ -264,7 +288,7 @@ namespace
         stages.gpu_render_us = 8554.0;
         stages.gpu_active_us = 7454.0;
         stages.owned_cpu_stage_us = 1100.0;
-        stages.enforcement_marker = ArrivalLeadMarker::Unknown;
+        stages.enforcement_marker = PacingSourceMarker::Unknown;
 
         const FrameTimeAdaptationDemand demand =
             FrameTimeAdaptation_ComputeDemand(stages);
@@ -281,7 +305,7 @@ namespace
         stages.gpu_render_us = 3000.0;
         stages.gpu_active_us = 2500.0;
         stages.owned_cpu_stage_us = 6000.0;
-        stages.enforcement_marker = ArrivalLeadMarker::SimulationStart;
+        stages.enforcement_marker = PacingSourceMarker::SimulationStart;
 
         const FrameTimeAdaptationDemand demand =
             FrameTimeAdaptation_ComputeDemand(stages);
@@ -290,388 +314,15 @@ namespace
         CHECK(demand.workload_us == 4000.0);
     }
 
-    void TestHealthyFramesDoNotExtendInterval()
+
+    // The previous frame's end-of-frame poll and the current frame's pre-poll
+    // both reach the governor, in source order.
+    void TestPendingReportsSurviveTwoPollsInOrder()
     {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.99, true);
-        for (uint64_t sequence = 1; sequence <= 64; ++sequence) {
-            CHECK(adaptation.Update(sequence, 9000.0, 10000.0) == 0.0);
-        }
-        CHECK(adaptation.IsWarm());
-        CHECK(adaptation.primary.Size() == 64);
-        CHECK(adaptation.GetPercentile() == 9000.0);
-    }
-
-    void TestEachCompletedFrameIsConsumedOnce()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.99, true);
-        for (uint64_t sequence = 1; sequence <= 31; ++sequence) {
-            adaptation.Update(sequence, 12000.0, 10000.0);
-        }
-        CHECK(adaptation.primary.Size() == 31);
-
-        adaptation.Update(31, 20000.0, 10000.0);
-        adaptation.Update(30, 20000.0, 10000.0);
-        CHECK(adaptation.primary.Size() == 31);
-
-        const double first_offset = adaptation.Update(32, 12000.0, 10000.0);
-        CHECK(adaptation.primary.Size() == 32);
-        CHECK(std::abs(first_offset - 300.0) < 0.001);
-
-        const double duplicate_offset =
-            adaptation.Update(32, 18000.0, 10000.0);
-        CHECK(adaptation.primary.Size() == 32);
-        CHECK(duplicate_offset == first_offset);
-    }
-
-    void TestSustainedBottleneckExtendsGradually()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.99, true);
-        double previous = 0.0;
-        for (uint64_t sequence = 1; sequence <= 96; ++sequence) {
-            const double current =
-                adaptation.Update(sequence, 12000.0, 10000.0);
-            CHECK(current >= previous);
-            CHECK(current <= 2000.0);
-            previous = current;
-        }
-        CHECK(previous > 1990.0);
-        CHECK(adaptation.GetPercentile() == 12000.0);
-    }
-
-    void TestBottleneckReleaseIsGradual()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.99, true);
-        for (uint64_t sequence = 1; sequence <= 300; ++sequence) {
-            adaptation.Update(sequence, 12000.0, 10000.0);
-        }
-        const double previous = adaptation.GetOffset();
-        CHECK(previous > 1990.0);
-
-        double current = previous;
-        for (uint64_t sequence = 301; sequence <= 610; ++sequence) {
-            current = adaptation.Update(sequence, 9000.0, 10000.0);
-        }
-        CHECK(current < previous);
-        CHECK(current > 1500.0);
-    }
-
-    void TestReleaseSpeedScalesBoundedDecrease()
-    {
-        FrameTimeAdaptation default_speed;
-        FrameTimeAdaptation fast_speed;
-        default_speed.SetConfig(false, 0.99, true);
-        fast_speed.SetConfig(false, 0.99, true, 4.0);
-
-        for (uint64_t sequence = 1; sequence <= 300; ++sequence) {
-            default_speed.Update(sequence, 12000.0, 10000.0);
-            fast_speed.Update(sequence, 12000.0, 10000.0);
-        }
-        const double default_previous = default_speed.GetOffset();
-        const double fast_previous = fast_speed.GetOffset();
-        CHECK(std::abs(default_previous - fast_previous) < 0.001);
-        CHECK(default_previous > 1990.0);
-
-        // Establish the lower target while pressure pauses release so the next
-        // accepted report exercises only the configured per-report bound.
-        for (uint64_t sequence = 301; sequence <= 600; ++sequence) {
-            default_speed.Update(sequence, 9000.0, 10000.0, false);
-            fast_speed.Update(sequence, 9000.0, 10000.0, false);
-        }
-        CHECK(default_speed.release_confirmation_frames > 32);
-        CHECK(fast_speed.release_confirmation_frames > 32);
-
-        const double default_current =
-            default_speed.Update(601, 9000.0, 10000.0, true);
-        const double fast_current =
-            fast_speed.Update(601, 9000.0, 10000.0, true);
-        const double default_release = default_previous - default_current;
-        const double fast_release = fast_previous - fast_current;
-
-        CHECK(std::abs(default_release - 5.0) < 0.001);
-        CHECK(std::abs(fast_release - 20.0) < 0.001);
-        CHECK(std::abs(fast_release - default_release * 4.0) < 0.001);
-    }
-
-    void TestReleaseSpeedValidationAndLiveChangePreserveState()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.99, true, 0.0);
-        CHECK(adaptation.release_speed == 0.25);
-        adaptation.SetConfig(false, 0.99, true, 10.0);
-        CHECK(adaptation.release_speed == 4.0);
-        adaptation.SetConfig(false, 0.99, true, NAN);
-        CHECK(adaptation.release_speed == 1.0);
-
-        for (uint64_t sequence = 1; sequence <= 64; ++sequence) {
-            adaptation.Update(sequence, 12000.0, 10000.0);
-        }
-        const size_t previous_size = adaptation.primary.Size();
-        const double previous_offset = adaptation.GetOffset();
-        const uint64_t previous_sequence = adaptation.last_sample_sequence;
-
-        adaptation.SetConfig(false, 0.99, true, 4.0);
-        CHECK(adaptation.release_speed == 4.0);
-        CHECK(adaptation.primary.Size() == previous_size);
-        CHECK(adaptation.GetOffset() == previous_offset);
-        CHECK(adaptation.last_sample_sequence == previous_sequence);
-    }
-
-    void TestPressurePausesWithoutErasingLowerTargetConfirmation()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.99, true);
-        for (uint64_t sequence = 1; sequence <= 300; ++sequence) {
-            adaptation.Update(sequence, 12000.0, 10000.0);
-        }
-        const double previous = adaptation.GetOffset();
-        CHECK(previous > 1990.0);
-
-        // Let the rolling percentile establish a sustained lower target while
-        // downstream pressure blocks the actual release.
-        for (uint64_t sequence = 301; sequence <= 600; ++sequence) {
-            adaptation.Update(sequence, 9000.0, 10000.0, false);
-        }
-        CHECK(adaptation.GetOffset() == previous);
-        CHECK(adaptation.release_confirmation_frames > 32);
-
-        // The first pressure-free report may resume the bounded release; it
-        // must not require a fresh run of 32 consecutive pressure-free frames.
-        const double current = adaptation.Update(601, 9000.0, 10000.0, true);
-        CHECK(current < previous);
-        CHECK(current > previous - 6.0);
-    }
-
-    void TestBriefPercentileTroughDoesNotRelease()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.99, true);
-        for (uint64_t sequence = 1; sequence <= 300; ++sequence) {
-            adaptation.Update(sequence, 12000.0, 10000.0);
-        }
-        const double previous = adaptation.GetOffset();
-
-        for (uint64_t sequence = 301; sequence <= 570; ++sequence) {
-            adaptation.Update(sequence, 9000.0, 10000.0);
-        }
-        for (uint64_t sequence = 571; sequence <= 574; ++sequence) {
-            adaptation.Update(sequence, 12000.0, 10000.0);
-        }
-        CHECK(adaptation.GetOffset() == previous);
-        CHECK(adaptation.release_confirmation_frames == 0);
-    }
-
-    void TestRepeatedReportHoldsCurrentAuthority()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.99, true);
-        for (uint64_t sequence = 1; sequence <= 64; ++sequence) {
-            adaptation.Update(sequence, 12000.0, 10000.0);
-        }
-        const double previous = adaptation.GetOffset();
-        CHECK(previous > 1900.0);
-
-        for (int frame = 0; frame < 1100; ++frame) {
-            adaptation.Update(64, 12000.0, 10000.0);
-        }
-        CHECK(adaptation.primary.Size() == 64);
-        CHECK(adaptation.GetPercentile() == 12000.0);
-        CHECK(adaptation.GetOffset() == previous);
-    }
-
-    void TestSoftResetDoesNotDropAppliedOffset()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.99, true);
-        for (uint64_t sequence = 1; sequence <= 64; ++sequence) {
-            adaptation.Update(sequence, 12000.0, 10000.0);
-        }
-        const double previous = adaptation.GetOffset();
-        CHECK(previous > 1900.0);
-
-        adaptation.SoftReset();
-        CHECK(!adaptation.IsWarm());
-        const double current = adaptation.Update(65, 9000.0, 10000.0);
-        CHECK(current == previous);
-        CHECK(adaptation.GetOffset() == previous);
-    }
-
-    void TestIsolatedStallIsRejected()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.99, true);
-        for (uint64_t sequence = 1; sequence <= 40; ++sequence) {
-            adaptation.Update(sequence, 9000.0, 10000.0);
-        }
-        const size_t before = adaptation.primary.Size();
-        const double offset = adaptation.Update(41, 40000.0, 10000.0);
-        CHECK(adaptation.primary.Size() == before);
-        CHECK(offset == 0.0);
-        CHECK(adaptation.GetPercentile() == 9000.0);
-    }
-
-    void TestSustainedHighWorkloadRewarmsAfterOutlierGuard()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.95, true);
-        for (uint64_t sequence = 1; sequence <= 64; ++sequence) {
-            adaptation.Update(sequence, 3000.0, 10000.0);
-        }
-        CHECK(adaptation.GetOffset() == 0.0);
-
-        for (uint64_t sequence = 65; sequence <= 180; ++sequence) {
-            adaptation.Update(sequence, 12000.0, 10000.0);
-        }
-        CHECK(adaptation.IsWarm());
-        CHECK(adaptation.GetPercentile() == 12000.0);
-        CHECK(adaptation.GetOffset() > 1900.0);
-    }
-
-    void TestDeferredLifecycleResetClearsAuthority()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.95, true);
-        for (uint64_t sequence = 1; sequence <= 64; ++sequence) {
-            adaptation.Update(sequence, 12000.0, 10000.0);
-        }
-        CHECK(adaptation.GetOffset() > 1900.0);
-
-        adaptation.RequestReset();
-        CHECK(adaptation.Update(65, 8000.0, 10000.0) == 0.0);
-        CHECK(adaptation.primary.Size() == 1);
-        CHECK(adaptation.last_sample_sequence == 65);
-    }
-
-    void TestDualWindowModeChangesDiscardStaleHistory()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(true, 0.95, true);
-        for (uint64_t sequence = 1; sequence <= 64; ++sequence) {
-            adaptation.Update(sequence, 9000.0, 10000.0);
-        }
-        CHECK(adaptation.short_win.Size() == 64);
-        CHECK(adaptation.long_win.Size() == 64);
-
-        adaptation.SetConfig(false, 0.95, true);
-        CHECK(adaptation.short_win.Size() == 0);
-        CHECK(adaptation.long_win.Size() == 0);
-        adaptation.SetConfig(true, 0.95, true);
-        CHECK(adaptation.short_win.Size() == 0);
-        CHECK(adaptation.long_win.Size() == 0);
-    }
-
-    void TestDeferredConfigCannotOverwriteLaterImmediateConfig()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.95, true);
-        {
-            SchedulerOwnerGuard owner;
-            CHECK(static_cast<bool>(owner));
-            adaptation.SetConfig(true, 0.90, false, 0.5); // deferred A
-        }
-        adaptation.SetConfig(false, 0.98, true, 3.0); // immediate B
-        SchedulerOwnerGuard owner;
-        CHECK(static_cast<bool>(owner));
-        adaptation.Update(1, 9000.0, 10000.0);
-        CHECK(adaptation.enabled);
-        CHECK(!adaptation.dual_mode);
-        CHECK(adaptation.target_percentile == 0.98);
-        CHECK(adaptation.release_speed == 3.0);
-        CHECK(adaptation.primary.Size() == 1);
-    }
-
-    void TestDeferredDisableEnableStartsFreshLifetime()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.95, true);
-        for (uint64_t sequence = 1; sequence <= 64; ++sequence)
-            adaptation.Update(sequence, 12000.0, 10000.0);
-        CHECK(adaptation.IsWarm());
-        SchedulerOwnerGuard owner;
-        CHECK(static_cast<bool>(owner));
-        adaptation.SetConfig(false, 0.95, false);
-        adaptation.SetConfig(false, 0.95, true);
-        CHECK(adaptation.Update(65, 9000.0, 10000.0) == 0.0);
-        CHECK(adaptation.enabled);
-        CHECK(adaptation.primary.Size() == 1);
-        CHECK(!adaptation.IsWarm());
-    }
-
-    void TestConfigPublicationRacesOwnerWithoutTornTuples()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.98, true, 3.0);
-        std::atomic<bool> start{ false };
-        auto publish = [&](bool dual, double percentile, double speed) {
-            while (!start.load(std::memory_order_acquire))
-                std::this_thread::yield();
-            for (int iteration = 0; iteration < 2000; ++iteration)
-                adaptation.SetConfig(dual, percentile, true, speed);
-        };
-        std::thread first(publish, true, 0.90, 0.5);
-        std::thread second(publish, false, 0.98, 3.0);
-        start.store(true, std::memory_order_release);
-        for (int iteration = 0; iteration < 4000; ++iteration) {
-            SchedulerOwnerGuard owner;
-            if (!owner) continue;
-            adaptation.Update(0, 0.0, 10000.0);
-            CHECK(adaptation.enabled);
-            CHECK((adaptation.dual_mode &&
-                   adaptation.target_percentile == 0.90 &&
-                   adaptation.release_speed == 0.5) ||
-                  (!adaptation.dual_mode &&
-                   adaptation.target_percentile == 0.98 &&
-                   adaptation.release_speed == 3.0));
-        }
-        first.join();
-        second.join();
-        // A final ordered request must survive every earlier deferred request.
-        adaptation.SetConfig(true, 0.97, true, 2.0);
-        SchedulerOwnerGuard owner;
-        CHECK(static_cast<bool>(owner));
-        adaptation.Update(0, 0.0, 10000.0);
-        CHECK(adaptation.dual_mode);
-        CHECK(adaptation.target_percentile == 0.97);
-        CHECK(adaptation.release_speed == 2.0);
-    }
-
-    void TestWorkloadOffsetExcludesPublishedReserve()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.95, true);
-        SchedulerOwnerGuard owner;
-        CHECK(static_cast<bool>(owner));
-        for (uint64_t sequence = 1; sequence <= 64; ++sequence)
-            adaptation.Update(sequence, 12000.0, 10000.0);
-        const double workload = adaptation.GetWorkloadOffsetOnOwner();
-        CHECK(workload > 1900.0);
-        for (const double reserve : { 700.0, 300.0, 0.0, 1200.0 }) {
-            g_smoothing_offset_us.store(workload + reserve);
-            CHECK(adaptation.GetOffset() == workload + reserve);
-            CHECK(adaptation.GetWorkloadOffsetOnOwner() == workload);
-            // Exercise the same composition used by the scheduler. The old
-            // reserve in the OSD snapshot must not join the newly selected one.
-            const double policy = adaptation.GetPolicyIntervalOnOwner(10000.0, 700.0);
-            CHECK(policy == 10000.0 + workload + 700.0);
-            CHECK(!FrameTimeAdaptation_AllowRelease(4500.0, 5000.0, 0.0, policy));
-        }
-        adaptation.Reset();
-        g_smoothing_offset_us.store(99999.0);
-        CHECK(adaptation.GetPolicyIntervalOnOwner(10000.0, 300.0) == 10300.0);
-    }
-
-    void TestPendingReportsSurviveTwoPollsAndReachAdaptation()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.95, true);
         ReflexAdaptationQueue pending;
         ReflexFrameTimeSample sample{};
         sample.feedback_generation = 7;
         sample.producer_epoch = 3;
-        sample.adaptation_generation = adaptation.GetGenerationOnOwner();
         sample.sequence = 1;
         sample.frame_id = 101;
         sample.workload_demand_us = 11000.0;
@@ -687,16 +338,10 @@ namespace
             CHECK(sample.sequence == expected);
             CHECK(sample.frame_id == 100 + expected);
             CHECK(sample.owned_gate_hold_us == 100.0 + expected);
-            adaptation.Update(
-                sample.sequence, sample.workload_demand_us, 10000.0,
-                true, sample.adaptation_generation);
+            CHECK(sample.workload_demand_us == 10000.0 + 1000.0 * static_cast<double>(expected));
         }
         CHECK(!pending.Pop(7, 3, &sample));
-        CHECK(adaptation.primary.Size() == 2);
-        CHECK(adaptation.primary.Recent(1) == 11000.0);
-        CHECK(adaptation.primary.Recent(0) == 12000.0);
     }
-
     void TestPendingReportsBoundCapacityAndRejectOldLifetimes()
     {
         ReflexAdaptationQueue pending;
@@ -731,59 +376,6 @@ namespace
         CHECK(sample.frame_id == 1);
     }
 
-    void TestQueuedReportsRejectAdaptationOnlyResets()
-    {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, 0.95, true);
-        SchedulerOwnerGuard owner;
-        CHECK(static_cast<bool>(owner));
-        ReflexAdaptationQueue pending;
-        ReflexFrameTimeSample sample{};
-        sample.feedback_generation = 7;
-        sample.producer_epoch = 3;
-        sample.workload_demand_us = 12000.0;
-
-        for (int reset_kind = 0; reset_kind < 3; ++reset_kind) {
-            sample.sequence += 1;
-            sample.frame_id = sample.sequence;
-            sample.adaptation_generation = adaptation.GetGenerationOnOwner();
-            CHECK(pending.Push(sample));
-            if (reset_kind == 0) {
-                adaptation.Reset();
-            }
-            else if (reset_kind == 1) {
-                adaptation.RequestReset();
-            }
-            else {
-                // Both config changes defer because this test holds the owner.
-                // Update applies the coalesced transition after queue Pop.
-                adaptation.SetConfig(false, 0.95, false);
-                adaptation.SetConfig(false, 0.95, true);
-            }
-            CHECK(pending.Pop(7, 3, &sample));
-            CHECK(adaptation.Update(
-                sample.sequence, sample.workload_demand_us, 10000.0,
-                true, sample.adaptation_generation) == 0.0);
-            CHECK(adaptation.primary.Size() == 0);
-            CHECK(adaptation.last_sample_sequence == 0);
-            CHECK(!pending.Pop(7, 3, &sample));
-
-            sample.sequence += 1;
-            sample.frame_id = sample.sequence;
-            sample.adaptation_generation = adaptation.GetGenerationOnOwner();
-            CHECK(pending.Push(sample));
-            CHECK(pending.Pop(7, 3, &sample));
-            adaptation.Update(
-                sample.sequence, sample.workload_demand_us, 10000.0,
-                true, sample.adaptation_generation);
-            CHECK(adaptation.primary.Size() == 1);
-            // Duplicate delivery must not train twice even after reset.
-            adaptation.Update(
-                sample.sequence, sample.workload_demand_us, 10000.0,
-                true, sample.adaptation_generation);
-            CHECK(adaptation.primary.Size() == 1);
-        }
-    }
 
     void TestPendingReportsWrapAndSkipStaleEntries()
     {
@@ -825,73 +417,77 @@ namespace
         CHECK(!pending.Pop(8, 4, &sample));
     }
 
-    void TestResetAndConfigurationChanges()
+    // Lockstep engines: the waits of later frames released no later than
+    // the Present start (gate) inside a stage are removed from it, never
+    // more than the stage; a frame released after the gate removes nothing.
+    void TestGatedHoldOfLaterFrames()
     {
-        FrameTimeAdaptation adaptation;
-        adaptation.SetConfig(false, NAN, true);
-        CHECK(adaptation.target_percentile == 0.99);
-        adaptation.SetConfig(false, 2.0, true);
-        CHECK(adaptation.target_percentile == 0.999);
-        for (uint64_t sequence = 1; sequence <= 40; ++sequence) {
-            adaptation.Update(sequence, 12000.0, 10000.0);
-        }
-        CHECK(adaptation.GetOffset() > 0.0);
+        FrameTimeAdaptationLaterWaits waits[4]{};
+        waits[0].release_us = -4000.0; // source and pre-Sleep waits
+        waits[0].wait_begin_us = -8000.0;
+        waits[0].wait_end_us = -4000.0;
+        waits[0].pre_wait_begin_us = -12000.0;
+        waits[0].pre_wait_end_us = -11000.0;
+        waits[1].release_us = 0.0;     // at the gate: counts
+        waits[1].wait_begin_us = -1000.0;
+        waits[1].wait_end_us = 0.0;
+        waits[2].release_us = 500.0;   // after the gate
+        waits[2].wait_begin_us = -500.0;
+        waits[2].wait_end_us = 500.0;
+        CHECK(FrameTimeAdaptation_GatedHoldUs(waits, 3, 0.0, -15000.0, 0.0) == 6000.0);
+        CHECK(FrameTimeAdaptation_GatedHoldUs(waits, 3, 0.0, -20000.0, -11500.0) == 500.0);
+        CHECK(FrameTimeAdaptation_GatedHoldUs(waits, 3, -4000.0, -15000.0, 0.0) == 5000.0);
+        waits[3] = waits[1];           // overlapping waits never exceed the stage
+        CHECK(FrameTimeAdaptation_GatedHoldUs(waits, 4, 0.0, -1000.0, 0.0) == 1000.0);
+        CHECK(FrameTimeAdaptation_GatedHoldUs(waits, 3, 0.0, 0.0, -1000.0) == 0.0);
+        CHECK(FrameTimeAdaptation_GatedHoldUs(nullptr, 3, 0.0, -15000.0, 0.0) == 0.0);
+        CHECK(FrameTimeAdaptation_GatedHoldUs(waits, 3, NAN, -15000.0, 0.0) == 0.0);
 
-        adaptation.SetConfig(false, 0.99, false);
-        CHECK(adaptation.primary.Size() == 0);
-        CHECK(adaptation.GetOffset() == 0.0);
-        CHECK(adaptation.GetPercentile() == 0.0);
-
-        adaptation.SetConfig(true, 0.1, true);
-        CHECK(adaptation.dual_mode);
-        CHECK(adaptation.target_percentile == 0.50);
-        CHECK(adaptation.last_sample_sequence == 0);
+        // The demand removes the gated hold after the own residence.
+        FrameTimeAdaptationWorkloadStages stages{};
+        stages.simulation_us = 8500.0;
+        stages.render_submission_us = 15000.0;
+        stages.owned_cpu_stage_us = 2000.0;
+        stages.enforcement_marker = PacingSourceMarker::RenderSubmitStart;
+        stages.gpu_active_us = 6500.0;
+        stages.gated_simulation_us = 500.0;
+        stages.gated_render_submission_us = 6000.0;
+        FrameTimeAdaptationDemand demand = FrameTimeAdaptation_ComputeDemand(stages);
+        CHECK(demand.cpu_active_us == 8000.0);
+        CHECK(demand.workload_us == 8000.0);
+        stages.simulation_us = 0.0;
+        demand = FrameTimeAdaptation_ComputeDemand(stages);
+        CHECK(demand.cpu_active_us == 7000.0);
+        stages.gated_render_submission_us = 20000.0;
+        demand = FrameTimeAdaptation_ComputeDemand(stages);
+        CHECK(demand.cpu_active_us == 0.0);
+        CHECK(demand.workload_us == 6500.0);
     }
+
 }
 
 int main()
 {
-    TestDisabledControllerPublishesZero();
-    TestPresentPressureGuardsRelease();
     TestWorkloadDemandSelectsBottleneckWithoutAddingStages();
+    TestSerialFrameDetector();
+    TestFrameSpanDemand();
     TestReflexReportBurstSelectionPreservesOrder();
     TestReflexReportAdmissionDoesNotRequireCadence();
-    TestWorkloadOnlyReportsWarmAdaptation();
-    TestCadenceTelemetryCannotSelfRatchetHeadroom();
     TestRenderSubmissionUsesEarliestPairedBoundary();
     TestControllerResidenceIsSubtractedOnce();
     TestSimulationStartCorrectsOnlySimulationStage();
     TestRenderSubmitStartCorrectsOnlySubmissionStage();
     TestUnknownMarkerDoesNotGuessSleepContainment();
     TestOwnedControllerResidenceCannotMakeAStageNegative();
-    TestHealthyFramesDoNotExtendInterval();
-    TestEachCompletedFrameIsConsumedOnce();
-    TestSustainedBottleneckExtendsGradually();
-    TestBottleneckReleaseIsGradual();
-    TestReleaseSpeedScalesBoundedDecrease();
-    TestReleaseSpeedValidationAndLiveChangePreserveState();
-    TestPressurePausesWithoutErasingLowerTargetConfirmation();
-    TestBriefPercentileTroughDoesNotRelease();
-    TestRepeatedReportHoldsCurrentAuthority();
-    TestSoftResetDoesNotDropAppliedOffset();
-    TestIsolatedStallIsRejected();
-    TestSustainedHighWorkloadRewarmsAfterOutlierGuard();
-    TestDeferredLifecycleResetClearsAuthority();
-    TestDualWindowModeChangesDiscardStaleHistory();
-    TestDeferredConfigCannotOverwriteLaterImmediateConfig();
-    TestDeferredDisableEnableStartsFreshLifetime();
-    TestConfigPublicationRacesOwnerWithoutTornTuples();
-    TestWorkloadOffsetExcludesPublishedReserve();
-    TestPendingReportsSurviveTwoPollsAndReachAdaptation();
+    TestPendingReportsSurviveTwoPollsInOrder();
     TestPendingReportsBoundCapacityAndRejectOldLifetimes();
-    TestQueuedReportsRejectAdaptationOnlyResets();
     TestPendingReportsWrapAndSkipStaleEntries();
-    TestResetAndConfigurationChanges();
+    TestGatedHoldOfLaterFrames();
 
     if (g_failures != 0) {
-        std::printf("frame-time adaptation: %d failure(s)\n", g_failures);
+        std::printf("stage demand: %d failure(s)\n", g_failures);
         return 1;
     }
-    std::puts("frame-time adaptation: all checks passed");
+    std::puts("stage demand: all checks passed");
     return 0;
 }

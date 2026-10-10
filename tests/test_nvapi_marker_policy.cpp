@@ -1,4 +1,5 @@
 #include "nvapi_marker_policy.h"
+#include "nvapi_marker_census.h"
 #include "nvapi_hooks.h"
 
 #include <cstdlib>
@@ -174,7 +175,7 @@ void TestForwardingCannotRelabelOldMarkerOrWarmNewPolicy()
     NvApiMarkerPolicy policy;
 
     // Replacement during the native call: post-forward validation must reject
-    // A before policy counters, marker health, predictor, or scheduling work.
+    // A before policy counters, marker health, or scheduling work.
     current = { reinterpret_cast<IUnknown*>(&device_b), 12, 24 };
     if (NvAPI_IsSameFeedbackPublication(marker_token, current)) {
         policy.ShouldProcess(false, RENDER_SUBMIT_START, 100);
@@ -193,6 +194,37 @@ void TestForwardingCannotRelabelOldMarkerOrWarmNewPolicy()
 
 int main()
 {
+    CHECK(!NvAPI_ShouldBypassSleep(false,157,true));
+    CHECK(!NvAPI_ShouldBypassSleep(true,0,true));
+    CHECK(!NvAPI_ShouldBypassSleep(true,-1,true));
+    CHECK(!NvAPI_ShouldBypassSleep(true,157,false));
+    CHECK(NvAPI_ShouldBypassSleep(true,157,true));
+    NvApiMarkerPromotion promotion;
+    promotion.Enforced(80);
+    for(uint64_t frame=77;frame<84;++frame)
+        CHECK(!promotion.Observe(frame,1000000+frame*12000,1000000));
+    CHECK(promotion.Observe(84,2008000,1000000));
+    promotion.Enforced(84);
+    CHECK(!promotion.CanEnforce(84) && !promotion.CanEnforce(83) && promotion.CanEnforce(85));
+    CHECK(!promotion.Observe(84,2008001,1000000));
+    CHECK(!promotion.Observe(86,2032000,1000000)); // gap restarts qualification
+    CHECK(!promotion.Observe(87,3032000,1000000)); // stale sequence
+    promotion.Reset();
+    CHECK(promotion.CanEnforce(1) && !promotion.CanEnforce(0));
+    CHECK(!promotion.Observe(0,100,1000000));
+    promotion.Enforced(100);
+    for(uint64_t frame=1;frame<=8;++frame)CHECK(!promotion.Observe(frame,1000+frame*1000,1000000));
+    NvApiMarkerCensus census;
+    MarkerCensusSample first{10,20,30,40,50,60,70,2};
+    auto last=first;last.frame=11;last.qpc=80;
+    census.Record(0,MarkerCensusStage::Entry,first);
+    census.Record(0,MarkerCensusStage::Entry,last);
+    census.Record(99,MarkerCensusStage::Rejected,last);
+    NvApiMarkerCensus::Snapshot snapshot;
+    CHECK(census.Read(0,MarkerCensusStage::Entry,&snapshot));
+    CHECK(snapshot.count==2 && snapshot.first.frame==10 && snapshot.last.frame==11 && snapshot.misses==0);
+    CHECK(census.Read(2,MarkerCensusStage::Entry,&snapshot) && snapshot.count==0);
+    CHECK(census.Read(6,MarkerCensusStage::Rejected,&snapshot) && snapshot.count==1 && snapshot.last.reason==70);
     TestRtssCannotCreateMarkerPath();
     TestRtssCompletesPartialDirectStream();
     TestDirectSimulationStartAlwaysWins();

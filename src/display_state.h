@@ -25,7 +25,3 @@ void QueryVRRCeiling();
 void QueryVRRFloor();
 void PollGSyncState();
 void OnGSyncStateChange(bool new_gsync_active);
-
-// Blackwell detection
-bool IsBlackwellOrNewer();
-void DetectGPUArchitecture();

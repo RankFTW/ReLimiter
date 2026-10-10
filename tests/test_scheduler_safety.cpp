@@ -1,5 +1,4 @@
 #include "marker_log.h"
-#include "predictor.h"
 #include "scheduler.h"
 
 #include <Windows.h>
@@ -95,22 +94,6 @@ void TestMarkerLogExactLookupAndExpiry()
     ASSERT_TRUE(log.Get(99, 7) == 0, "markers older than two seconds expire");
 }
 
-void TestPendingFrameHashRejectsStrideAlias()
-{
-    std::printf("Test: pending-frame hash disperses 256-stride frame IDs\n");
-    bool seen[kPredictorPendingFrameSetCount]{};
-    size_t distinct_sets = 0;
-    for (uint64_t index = 0; index < 32; ++index) {
-        const size_t set = PredictorPendingFrameSetIndex(1 + index * 256);
-        if (!seen[set]) {
-            seen[set] = true;
-            ++distinct_sets;
-        }
-    }
-    ASSERT_TRUE(distinct_sets >= 16,
-                "stride-256 identities do not collapse into one pending slot");
-}
-
 void TestMarkerLogConcurrentAccess()
 {
     std::printf("Test: fixed MarkerLog supports concurrent producers/readers\n");
@@ -150,7 +133,6 @@ int main()
     TestOwnerGuardSequentialAndNested();
     TestOwnerGuardContention();
     TestMarkerLogExactLookupAndExpiry();
-    TestPendingFrameHashRejectsStrideAlias();
     TestMarkerLogConcurrentAccess();
 
     std::printf("\n=== Summary: %d tests, %d failures ===\n",

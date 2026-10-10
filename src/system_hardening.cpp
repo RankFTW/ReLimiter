@@ -4,9 +4,68 @@
 #include <dxgi.h>
 #include <atomic>
 
-// ReLimiter uses its own high-resolution waitable timer. Do not intercept
+// ReLimiter uses its own high-resolution waitable timers. Do not intercept
 // process-wide timeBeginPeriod/timeEndPeriod calls: games and middleware own
 // those balancing semantics, and faking success is a compatibility hazard.
+// ReLimiter makes its own balanced request instead (section 1).
+
+// ══════════════════════════════════════════════════════════════
+// 1. Timer resolution
+//    Request the finest kernel timer resolution (usually 0.5 ms) for the
+//    process lifetime, so ReLimiter's waitable timers (owner, pre-Sleep, GPU
+//    wait worker) expire on a 0.5 ms tick whatever the game requested. The
+//    request is ReLimiter's own (NtSetTimerResolution keeps a per-requester
+//    reference); it is released at shutdown and never touches the game's
+//    timeBeginPeriod calls. Since Windows 10 2004 it applies to this process
+//    only; section 2 keeps it while the window is minimized or occluded.
+// ══════════════════════════════════════════════════════════════
+
+using NtQueryTimerResolution_fn = LONG(NTAPI*)(PULONG, PULONG, PULONG);
+using NtSetTimerResolution_fn = LONG(NTAPI*)(ULONG, BOOLEAN, PULONG);
+
+static std::atomic<bool> s_timer_resolution_requested{false};
+static ULONG s_timer_resolution_requested_100ns = 0;
+
+static void RequestTimerResolution() {
+    if (s_timer_resolution_requested.load(std::memory_order_acquire)) return;
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return;
+    const auto query = reinterpret_cast<NtQueryTimerResolution_fn>(
+        GetProcAddress(ntdll, "NtQueryTimerResolution"));
+    const auto set = reinterpret_cast<NtSetTimerResolution_fn>(
+        GetProcAddress(ntdll, "NtSetTimerResolution"));
+    if (!query || !set) {
+        LOG_WARN("Hardening: timer resolution API unavailable");
+        return;
+    }
+    // Coarsest, finest and current period in 100 ns units (e.g. 156250, 5000).
+    ULONG coarsest = 0, finest = 0, current = 0;
+    if (query(&coarsest, &finest, &current) < 0 || finest == 0) {
+        LOG_WARN("Hardening: NtQueryTimerResolution failed");
+        return;
+    }
+    ULONG applied = 0;
+    const LONG status = set(finest, TRUE, &applied);
+    if (status < 0) {
+        LOG_WARN("Hardening: NtSetTimerResolution(%lu) failed status=0x%08lX (current %lu)",
+            finest, static_cast<unsigned long>(status), current);
+        return;
+    }
+    s_timer_resolution_requested_100ns = finest;
+    s_timer_resolution_requested.store(true, std::memory_order_release);
+    LOG_INFO("Hardening: timer resolution requested %.3f ms (was %.3f ms, now %.3f ms, range %.3f-%.3f ms)",
+        finest / 10000.0, current / 10000.0, applied / 10000.0, finest / 10000.0, coarsest / 10000.0);
+}
+
+static void ReleaseTimerResolution() {
+    if (!s_timer_resolution_requested.exchange(false, std::memory_order_acq_rel)) return;
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return;
+    const auto set = reinterpret_cast<NtSetTimerResolution_fn>(
+        GetProcAddress(ntdll, "NtSetTimerResolution"));
+    ULONG applied = 0;
+    if (set) set(s_timer_resolution_requested_100ns, FALSE, &applied);
+}
 
 // ══════════════════════════════════════════════════════════════
 // 2. Win11 power throttling bypass
@@ -221,6 +280,7 @@ static void UnregisterPresentThreadMMCSS() {
 // ══════════════════════════════════════════════════════════════
 
 void Hardening_Init() {
+    RequestTimerResolution();
     ApplyPowerThrottlingBypass();
     ApplyDwmMMCSS();
     ApplyGPUSchedulingPriority();
@@ -238,6 +298,7 @@ void Hardening_OnFirstPresent() {
 }
 
 void Hardening_Shutdown() {
+    ReleaseTimerResolution();
     RestoreGPUSchedulingPriority();
     UnregisterPresentThreadMMCSS();
     // GPU thread priority: restore if we still have a swapchain

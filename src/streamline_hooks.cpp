@@ -1,4 +1,8 @@
 #include "streamline_hooks.h"
+#include "streamline_discovery.h"
+#include "streamline_gpu_handoff.h"
+#include "streamline_queue_hooks.h"
+#include "fg_state_policy.h"
 #include "ngx_hooks.h"
 #include "hooks.h"
 #include "loadlib_hooks.h"
@@ -17,7 +21,7 @@ std::atomic<int>  g_fg_multiplier{0};
 std::atomic<bool> g_fg_active{false};
 std::atomic<bool> g_fg_presenting{false};
 
-// DMFG state — DLSSGMode: 0=eOff, 1=eOn (static FG), 2=eAuto (Dynamic MFG)
+// Public DLSSGMode: 0=eOff, 1=eOn, 2=eAuto, 3=eDynamic.
 std::atomic<int>  g_fg_mode{0};
 static std::atomic<bool> s_fg_mode_observed{false};
 
@@ -140,7 +144,7 @@ static void BeginDeferredFGInference(
     s_fg_inference_pending.store(true, std::memory_order_release);
     LOG_INFO(
         compatibility_mode
-            ? "FG presenting deferred (compat) — waiting for poll confirmation"
+            ? "FG presenting deferred (compat) — waiting for passive runtime evidence"
             : "FG presenting deferred — waiting for GetState confirmation");
 }
 
@@ -158,6 +162,15 @@ static void ApplyExplicitFGModeTransition(
     g_fg_active.store(false, std::memory_order_relaxed);
     g_fg_presenting.store(false, std::memory_order_relaxed);
     g_fg_actual_multiplier.store(0, std::memory_order_relaxed);
+}
+
+static void UpdateConfiguredFGActivity(bool configuration_changed, uint32_t mode, int generated_frames) noexcept {
+    if (!configuration_changed) return;
+    const bool active = FrameGeneration_ConfiguredActivity(false, true, mode, generated_frames);
+    if (g_fg_active.exchange(active, std::memory_order_relaxed) != active) {
+        LOG_INFO("FG active (inferred from SetOptions): %s", active ? "yes" : "no");
+        OnFGStateChange();
+    }
 }
 
 static sl_Result __cdecl Detour_SetOptions(const void* vp, const void* opts) {
@@ -201,19 +214,20 @@ static sl_Result __cdecl Detour_SetOptions(const void* vp, const void* opts) {
             // Only update g_fg_mode from Streamline if the user hasn't manually
             // enabled Dynamic MFG passthrough. The user toggle takes priority.
             if (!g_config.dynamic_mfg_passthrough) {
-                static uint32_t s_prev_mode = UINT32_MAX;
+                const uint32_t s_prev_mode = s_fg_mode_observed.load(std::memory_order_relaxed)
+                    ? static_cast<uint32_t>(g_fg_mode.load(std::memory_order_relaxed)) : UINT32_MAX;
                 mode_changed = mode != s_prev_mode;
                 g_fg_mode.store(static_cast<int>(mode), std::memory_order_relaxed);
                 s_fg_mode_observed.store(true, std::memory_order_release);
                 if (mode_changed) {
                     const char* mode_str = (mode == 0) ? "Off"
                                          : (mode == 1) ? "On"
-                                         : (mode == 2) ? "Auto(Dynamic)"
+                                         : (mode == 2) ? "Auto"
+                                         : (mode == 3) ? "Dynamic"
                                          : "Unknown";
                     LOG_INFO("DLSSG mode changed: %u -> %u (%s)%s",
                              s_prev_mode == UINT32_MAX ? 0 : s_prev_mode, mode, mode_str,
                              mode == 2 ? " — Dynamic MFG active" : "");
-                    s_prev_mode = mode;
                     OnFGStateChange();
                 }
             }
@@ -227,18 +241,11 @@ static sl_Result __cdecl Detour_SetOptions(const void* vp, const void* opts) {
             int prev = g_fg_multiplier.exchange(numFrames, std::memory_order_relaxed);
             s_setoptions_ever_called.store(true, std::memory_order_relaxed);
             const bool multiplier_changed = numFrames != prev;
+            if (mode_changed || multiplier_changed || viewport_changed)
+                StreamlineHandoff_Invalidate(mode_changed ? "fg_mode_changed" : multiplier_changed ? "fg_multiplier_changed" : "fg_viewport_changed");
+            UpdateConfiguredFGActivity(mode_changed || multiplier_changed || viewport_changed, mode, numFrames);
             if (multiplier_changed) {
                 LOG_INFO("FG multiplier changed: %d -> %d (divisor=%d)", prev, numFrames, numFrames + 1);
-
-                // Set active state from SetOptions — the game configured FG.
-                bool inferred_active = (mode != 0 && numFrames > 0);
-                bool prev_active = g_fg_active.load(std::memory_order_relaxed);
-                if (inferred_active != prev_active) {
-                    g_fg_active.store(inferred_active, std::memory_order_relaxed);
-                    LOG_INFO("FG active (inferred from SetOptions): %s -> %s",
-                             prev_active ? "yes" : "no",
-                             inferred_active ? "yes" : "no");
-                }
 
                 if (numFrames == 0) {
                     // FG disabled via SetOptions.
@@ -494,18 +501,19 @@ static sl_Result __cdecl Detour_SetOptions_Compat(const void* vp, const void* op
                 3u);
             bool mode_changed = false;
             if (!g_config.dynamic_mfg_passthrough) {
-                static uint32_t s_prev_mode = UINT32_MAX;
+                const uint32_t s_prev_mode = s_fg_mode_observed.load(std::memory_order_relaxed)
+                    ? static_cast<uint32_t>(g_fg_mode.load(std::memory_order_relaxed)) : UINT32_MAX;
                 mode_changed = mode != s_prev_mode;
                 g_fg_mode.store(static_cast<int>(mode), std::memory_order_relaxed);
                 s_fg_mode_observed.store(true, std::memory_order_release);
                 if (mode_changed) {
                     const char* mode_str = (mode == 0) ? "Off"
                                          : (mode == 1) ? "On"
-                                         : (mode == 2) ? "Auto(Dynamic)"
+                                         : (mode == 2) ? "Auto"
+                                         : (mode == 3) ? "Dynamic"
                                          : "Unknown";
                     LOG_INFO("DLSSG mode changed (compat): %u -> %u (%s)",
                              s_prev_mode == UINT32_MAX ? 0 : s_prev_mode, mode, mode_str);
-                    s_prev_mode = mode;
                     OnFGStateChange();
                 }
             }
@@ -519,6 +527,9 @@ static sl_Result __cdecl Detour_SetOptions_Compat(const void* vp, const void* op
             int prev = g_fg_multiplier.exchange(numFrames, std::memory_order_relaxed);
             s_setoptions_ever_called.store(true, std::memory_order_relaxed);
             const bool multiplier_changed = numFrames != prev;
+            if (mode_changed || multiplier_changed || viewport_changed)
+                StreamlineHandoff_Invalidate(mode_changed ? "fg_mode_changed" : multiplier_changed ? "fg_multiplier_changed" : "fg_viewport_changed");
+            UpdateConfiguredFGActivity(mode_changed || multiplier_changed || viewport_changed, mode, numFrames);
             if (multiplier_changed) {
                 LOG_INFO("FG multiplier changed (compat): %d -> %d (divisor=%d)",
                          prev, numFrames, numFrames + 1);
@@ -557,6 +568,7 @@ bool Streamline_HasModeData() {
 }
 
 void Streamline_ResetLifetime() {
+    StreamlineHandoff_Invalidate("streamline_lifetime_reset");
     s_streamline_lifetime_generation.fetch_add(1, std::memory_order_acq_rel);
     const uint64_t write_sequence = BeginOptionsStateWrite();
     s_setoptions_ever_called.store(false, std::memory_order_relaxed);
@@ -673,8 +685,10 @@ void CheckDeferredFGInference() {
     EndOptionsStateWrite(write_sequence);
 
     if (promoted) {
-        LOG_INFO("FG presenting promoted (GetState never called, %.1fs elapsed)",
-                 elapsed_us / 1000000.0);
+        LOG_INFO(g_config.streamline_compat
+            ? "FG presenting promoted (passive runtime evidence; GetState not observed in compatibility mode, %.1fs elapsed)"
+            : "FG presenting promoted (no GetState calls observed in confirmation window, %.1fs elapsed)",
+            elapsed_us / 1000000.0);
         OnFGStateChange();
     } else if (window_getstate_calls > 0) {
         LOG_INFO("FG presenting NOT promoted — GetState called %u times but never confirmed (%.1fs)",
@@ -682,58 +696,75 @@ void CheckDeferredFGInference() {
     }
 }
 
-static sl_Result ResolveDLSSGFeatureFunction(
-    PFN_slGetFeatureFunction resolve, const char* name, void** function) noexcept {
-    __try { return resolve(1000 /*eDLSS_G*/, name, function); }
-    __except(EXCEPTION_EXECUTE_HANDLER) { return -1; }
-}
-
 // ── Entry point: owned installer worker only, never under loader lock ──
-void HookStreamlinePCL(HMODULE hInterposer) {
+bool HookStreamlinePCL(HMODULE hInterposer) {
     // Only the loader-install worker writes these. Original slots are atomic
     // because game detours read them immediately after each target is enabled.
     static bool feature_installed = false;
     static bool options_installed = false;
     static bool state_installed = false;
-    if (RuntimeLifecycle_IsStopping()) return;
-    if (feature_installed && options_installed &&
-        (g_config.streamline_compat || state_installed)) return;
+    static void* bound_options = nullptr;
+    static void* bound_state = nullptr;
+    static bool replacement_reported = false;
+    if (RuntimeLifecycle_IsStopping()) return false;
 
     auto pGetFeatureFunction = reinterpret_cast<PFN_slGetFeatureFunction>(
         GetProcAddress(hInterposer, "slGetFeatureFunction"));
-    if (!pGetFeatureFunction) return;
+    if (!pGetFeatureFunction) return false;
 
     if (!feature_installed) {
         feature_installed = InstallHook(
             reinterpret_cast<void*>(pGetFeatureFunction),
             reinterpret_cast<void*>(&Detour_slGetFeatureFunction),
             &s_orig_slGetFeatureFunction) == MH_OK;
-        if (!feature_installed) return;
+        if (!feature_installed) return false;
     }
 
     const auto resolve = s_orig_slGetFeatureFunction.load(std::memory_order_acquire);
+    // Keep observing the selected implementation after initial installation.
+    // Resolving GetState is safe in compatibility mode; invoking/hooking it is
+    // still prohibited there. Discovery does not authorize private GPU hooks.
+    const auto functions = StreamlineDiscovery_Resolve(hInterposer, resolve);
+    // DLSS-G resolves only after slInit loaded its plugin.
+    const bool ready = functions.options_result == sl_eOk && functions.set_options != nullptr;
+    if (!replacement_reported &&
+        ((bound_options && functions.set_options && bound_options != functions.set_options) ||
+         (bound_state && functions.get_state && bound_state != functions.get_state))) {
+        replacement_reported = true;
+        StreamlineQueue_BlockFeature();
+        LOG_WARN("Streamline: selected feature implementation changed; existing public hooks retained, "
+            "not rebound; generic GPU binding disabled until restart.");
+    }
+    if (options_installed && (g_config.streamline_compat || state_installed)) return ready;
     if (!options_installed) {
-        void* fn = nullptr;
-        sl_Result r = ResolveDLSSGFeatureFunction(resolve, "slDLSSGSetOptions", &fn);
+        void* fn = functions.set_options;
+        sl_Result r = functions.options_result;
         if (r == sl_eOk && fn) {
             options_installed = InstallHook(fn,
                 g_config.streamline_compat
                     ? reinterpret_cast<void*>(&Detour_SetOptions_Compat)
                     : reinterpret_cast<void*>(&Detour_SetOptions),
                 &s_orig_SetOptions) == MH_OK;
-            if (options_installed) LOG_INFO("Streamline: hooked slDLSSGSetOptions");
+            if (options_installed) {
+                bound_options = fn;
+                LOG_INFO("Streamline: hooked slDLSSGSetOptions");
+            }
         }
     }
     // Compatibility mode must not invoke GetState independently or hook it.
     if (!g_config.streamline_compat && !state_installed) {
-        void* fn = nullptr;
-        sl_Result r = ResolveDLSSGFeatureFunction(resolve, "slDLSSGGetState", &fn);
+        void* fn = functions.get_state;
+        sl_Result r = functions.state_result;
         if (r == sl_eOk && fn) {
             state_installed = InstallHook(fn, reinterpret_cast<void*>(&Detour_GetState),
                 &s_orig_GetState) == MH_OK;
-            if (state_installed) LOG_INFO("Streamline: hooked slDLSSGGetState");
+            if (state_installed) {
+                bound_state = fn;
+                LOG_INFO("Streamline: hooked slDLSSGGetState");
+            }
         }
     }
+    return ready;
 }
 
 // ── DMFG detection functions ──

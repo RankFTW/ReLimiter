@@ -119,24 +119,6 @@ namespace
         __try { return swapchain->GetFrameStatistics(stats); }
         __except(EXCEPTION_EXECUTE_HANDLER) { return E_FAIL; }
     }
-
-    HRESULT SafeQueryOutputFrameStatistics(
-        IDXGISwapChain* swapchain,
-        DXGI_FRAME_STATISTICS* stats) noexcept
-    {
-        if (!swapchain || !stats) return E_INVALIDARG;
-        IDXGIOutput* output = nullptr;
-        HRESULT result = E_FAIL;
-        __try {
-            if (SUCCEEDED(swapchain->GetContainingOutput(&output)) && output)
-                result = output->GetFrameStatistics(stats);
-        }
-        __except(EXCEPTION_EXECUTE_HANDLER) {
-            result = E_FAIL;
-        }
-        SafeRelease(output);
-        return result;
-    }
 }
 
 void Correlator_SetLegacySwapchain(IDXGISwapChain* swapchain) noexcept
@@ -191,27 +173,23 @@ IDXGISwapChain* Correlator_AcquireSwapchain() noexcept
     return nullptr;
 }
 
-HRESULT DXGIStatsSource::QueryFrameStatistics(DXGI_FRAME_STATISTICS& stats)
+HRESULT Correlator_QuerySwapchainFrameStatistics(
+    DXGI_FRAME_STATISTICS* stats, uint64_t* native_swapchain) noexcept
 {
-    if (permanently_disabled.load(std::memory_order_acquire) ||
-        !SwapMgr_IsValid()) {
+    if (!stats || !native_swapchain) return E_INVALIDARG;
+    *native_swapchain = 0;
+    const ActiveAPI api = SwapMgr_GetActiveAPI();
+    if (g_correlator.permanently_disabled.load(std::memory_order_acquire) ||
+        !SwapMgr_IsValid() || (api != ActiveAPI::DX11 && api != ActiveAPI::DX12)) {
         return E_FAIL;
     }
 
     IDXGISwapChain* swapchain = Correlator_AcquireSwapchain();
     if (!swapchain) return E_FAIL;
-
-    HRESULT result = SafeQueryFrameStatistics(swapchain, &stats);
-    if (FAILED(result))
-        result = SafeQueryOutputFrameStatistics(swapchain, &stats);
+    *native_swapchain = reinterpret_cast<uint64_t>(swapchain);
+    const HRESULT result = SafeQueryFrameStatistics(swapchain, stats);
     SafeRelease(swapchain);
     return result;
-}
-
-bool DXGIStatsSource::IsStatsAvailable()
-{
-    DXGI_FRAME_STATISTICS test{};
-    return SUCCEEDED(QueryFrameStatistics(test));
 }
 
 void DXGIStatsSource::OnSwapchainDestroyed()

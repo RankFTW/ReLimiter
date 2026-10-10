@@ -11,6 +11,31 @@
 #include <random>
 
 #include "fg_divisor_policy.h"
+#include "fg_state_policy.h"
+
+static bool run_fg_state_tests() {
+    for (uint32_t mode = 0; mode <= 3; ++mode) {
+        for (int frames = 0; frames <= 5; ++frames) {
+            for (bool previous : {false, true}) {
+                if (FrameGeneration_ConfiguredActivity(previous, false, mode, frames) != previous)
+                    return false; // unchanged SetOptions preserves later GetState status
+                if (FrameGeneration_ConfiguredActivity(previous, true, mode, frames) !=
+                    ((mode == 1 || mode == 2) && frames > 0)) return false;
+            }
+        }
+    }
+    // Off -> On with the same multiplier, first report after lifetime reset,
+    // and compatibility configuration all use this same transition policy.
+    bool active = FrameGeneration_ConfiguredActivity(true, true, 0, 1);
+    if (active) return false;
+    active = FrameGeneration_ConfiguredActivity(active, true, 1, 1);
+    if (!active) return false;
+    for (uint32_t flags = 0; flags < 16; ++flags) {
+        const bool expected = (flags & 1) && (flags & 2) && (flags & 8);
+        if (FrameGeneration_CanObserveStatic(flags) != expected) return false;
+    }
+    return true;
+}
 
 // ── Testable pure-logic version (no Windows API calls) ──
 
@@ -188,6 +213,10 @@ int main() {
         ++failures;
     }
 
-    std::printf("=== Summary: %d/3 test groups passed ===\n", 3 - failures);
+    if (!run_fg_state_tests()) {
+        std::printf("FAILED: configured activity or shadow observation policy\n");
+        ++failures;
+    }
+    std::printf("=== Summary: %d/4 test groups passed ===\n", 4 - failures);
     return failures > 0 ? 1 : 0;
 }

@@ -1,15 +1,16 @@
 #pragma once
 
-#include "arrival_lead_estimator.h"
+#include "pacing_core_types.h"
 
 #include <cstdint>
 #include <atomic>
 
-// DrainCorrelator: every frame. Queries DXGI stats, feeds CadenceMeter
-// and stress detector. Replaces the old retirement-based feedback loop.
-void DrainCorrelator(bool overload_active, double effective_interval_us);
+// DrainCorrelator: every frame on the scheduler owner. Reflex latency-report
+// ingestion only (period governor demand, PacingReflexRecord, clock map);
+// the historical name is kept. The DXGI bias path is retired.
+void DrainCorrelator(double effective_interval_us);
 
-// Reset CadenceMeter and feedback state (called on flush).
+// Reset feedback state (called on flush).
 void ResetFeedbackAccumulators();
 
 // Invalidate the NvAPI report producer lifetime after a device replacement or
@@ -26,13 +27,6 @@ void ApplyFeedbackResetRequests() noexcept;
 // only when the newly accepted report contained cadence data.
 bool PollReflexLatencyReport(double effective_interval_us);
 
-// Last presentation bias (for telemetry). Returns 0 if no samples.
-double GetLastScanoutErrorUs();
-
-// Returns true only when the newest accepted Reflex report in the current
-// feedback lifecycle contained usable cadence data.
-bool IsReflexCadenceActive();
-
 // Returns positive AI frame time only while its accepted report remains in the
 // exact current NvAPI producer epoch and bounded report-association horizon.
 double GetCurrentReflexAiFrameTimeUs() noexcept;
@@ -40,8 +34,6 @@ void ResetReflexAiEvidence() noexcept;
 
 struct ReflexFrameTimeSample {
 	uint64_t sequence = 0;
-	// Delivery-only token; telemetry snapshots survive adaptation resets.
-	uint64_t adaptation_generation = 0;
 	uint32_t producer_epoch = 0;
 	uint64_t frame_id = 0;
 	double workload_demand_us = 0.0;
@@ -55,15 +47,16 @@ struct ReflexFrameTimeSample {
 	double owned_gate_hold_us = 0.0;
 	double queue_trend_us = 0.0;
 	uint32_t feedback_generation = 0;
+	bool gpu_execution_available = false; // FIFO-only authority: service came from driver active time, not elapsed fallback
+	double gpu_active_us = 0.0; // the report's gpuActiveRenderTimeUs; the lead controller's release headroom
+	// The report's gpuRenderStartTime as local QPC through the stable Reflex
+	// clock map (the lead controller's queue-order test); 0 otherwise.
+	int64_t gpu_start_qpc = 0;
 };
 
-// Returns the latest uniquely identified NvAPI latency report. Workload demand
-// is the maximum stage-local CPU/GPU candidate, never paced GPU cadence. The
-// sequence is published after all same-report fields and rejects repeats.
-bool GetReflexFrameTimeSample(ReflexFrameTimeSample* sample) noexcept;
-
-// Scheduler owner only: consume accepted observations in source order, not the
-// overwriteable telemetry snapshot. Resets/epoch changes invalidate old entries.
+// Scheduler owner only: consume accepted NvAPI latency reports in source
+// order. Workload demand is the maximum stage-local CPU/GPU candidate, never
+// paced GPU cadence. Resets/epoch changes invalidate old entries.
 bool ConsumeReflexFrameTimeSample(ReflexFrameTimeSample* sample) noexcept;
 // Non-adapting scheduler paths explicitly discard observations at frame exit.
 void DiscardReflexFrameTimeSamples() noexcept;
@@ -71,12 +64,13 @@ void DiscardReflexFrameTimeSamples() noexcept;
 // Publish measured ReLimiter scheduler sleep and active enforcement marker
 // under the exact NvAPI producer lifetime and source-frame ID. The complete
 // marker-hook residence is published after OnMarker returns and supersedes the
-// sleep-only fallback for workload correction. Exact gate hold is kept
+// sleep-only fallback for workload correction (zero when the marker reaches
+// the driver after the wait, marker_forward_order=after_wait). Exact gate hold is kept
 // separately so same-report release pressure can exclude controller-owned time.
 void PublishReflexOwnedSleep(
 	uint64_t frame_id,
 	uint32_t producer_epoch,
-	ArrivalLeadMarker marker,
+	PacingSourceMarker marker,
 	double owned_sleep_us) noexcept;
 void PublishReflexControllerResidence(
 	uint64_t frame_id,
@@ -87,11 +81,22 @@ void PublishReflexGateHold(
 	uint32_t producer_epoch,
 	double gate_hold_us) noexcept;
 
-// ── DMFG-only: Reflex GPU frame time scan ──
-// Lightweight Reflex ring scan that only extracts gpuFrameTimeUs for
-// DMFG multiplier detection. Does not feed cadence meter or pipeline
-// timing — safe to call from the DMFG path without affecting non-DMFG.
-void PollReflexGpuFrameTime();
+// ReLimiter's waits for one planned source frame in local QPC: its release,
+// the source wait and the pre-Sleep wait; 0 when there was none. A later
+// frame's waits inside a report's CPU stage are removed from its workload
+// demand when that frame was released before the report's Present start
+// (lockstep engines, lead_controller.h).
+struct ReflexOwnedWaits {
+	int64_t release_qpc = 0;
+	int64_t wait_start_qpc = 0;
+	int64_t wait_end_qpc = 0;
+	int64_t pre_wait_start_qpc = 0;
+	int64_t pre_wait_end_qpc = 0;
+};
+void PublishReflexOwnedWaits(
+	uint64_t frame_id,
+	uint32_t producer_epoch,
+	const ReflexOwnedWaits& waits) noexcept;
 
 // ── Reflex pipeline timing (DX12 only) ──
 // Direct per-frame measurements from NvAPI GetLatency, replacing the
@@ -128,15 +133,10 @@ extern std::atomic<double> g_reflex_ai_frame_time_us;
 extern std::atomic<double> g_reflex_cpu_latency_us;
 
 // Total Reflex frame cost: simStart → gpuRenderEnd.
-// Diagnostic only. Frame-time adaptation uses the paired stage-local workload
+// Diagnostic only. The period governor uses the paired stage-local workload
 // from delayed Reflex reports, not this overlapping end-to-end span.
 extern std::atomic<double> g_reflex_total_frame_cost_us;
 
 // Present-end driver-domain microsecond timestamp. The historical `_qpc`
 // symbol name is retained; do not convert this value with local QPC frequency.
 extern std::atomic<int64_t> g_reflex_present_end_qpc;
-
-// GPU frame time from the Reflex ring buffer. Measures completion cadence and
-// may be influenced by active pacing. Used by DMFG multiplier detection, but
-// not as Frame-Time Adaptation workload authority.
-extern std::atomic<double> g_reflex_gpu_frame_time_us;

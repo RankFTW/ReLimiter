@@ -14,7 +14,7 @@ extern std::atomic<int>  g_fg_multiplier;  // raw numFramesToGenerate
 extern std::atomic<bool> g_fg_active;
 extern std::atomic<bool> g_fg_presenting;  // true when FG is actually producing frames
 
-// DMFG state — DLSSGMode: 0=eOff, 1=eOn (static FG), 2=eAuto (Dynamic MFG)
+// Public DLSSGMode: 0=eOff, 1=eOn, 2=eAuto, 3=eDynamic.
 extern std::atomic<int>  g_fg_mode;
 
 // Game's requested MaxFrameLatency, captured by FLC vtable hook
@@ -25,7 +25,8 @@ extern std::atomic<int> g_fg_actual_multiplier;
 
 // Owned loader-install worker only, with a referenced interposer module and
 // no loader lock held. Lazy game callbacks only request deferred retries.
-void HookStreamlinePCL(HMODULE hInterposer);
+// True once Streamline resolves slDLSSGSetOptions: slInit has loaded DLSS-G.
+bool HookStreamlinePCL(HMODULE hInterposer);
 
 // Called each frame from the scheduler to check if deferred FG inference
 // should be promoted (for games that never call GetState, e.g. HFW).
@@ -67,7 +68,7 @@ inline std::atomic<int>      g_fg_mode{0};
 inline std::atomic<uint32_t> g_game_requested_latency{0};
 inline std::atomic<int>      g_fg_actual_multiplier{0};
 
-inline void HookStreamlinePCL(HMODULE) {}
+inline bool HookStreamlinePCL(HMODULE) { return false; }
 inline void CheckDeferredFGInference() {}
 inline bool IsFGDllLoaded() { return false; }
 inline bool IsDmfgSession() { return false; }

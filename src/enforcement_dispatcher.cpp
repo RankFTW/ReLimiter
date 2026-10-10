@@ -14,6 +14,14 @@
 static std::atomic<EnforcementPath> s_active_path{EnforcementPath::None};
 static std::atomic<ActiveAPI>       s_prev_api{ActiveAPI::None};
 
+// Set once NvAPI markers flow on a DX11/DX12 swapchain: this is a Reflex game,
+// so stay on the marker path even during temporary marker gaps (alt-tab,
+// loading screens). Falling back to present-based during gaps causes double
+// enforcement and FG coalescing issues on refocus. Cleared on API change and
+// full teardown so an earlier swapchain lifetime (a launcher, a previous
+// device) cannot pin a non-Reflex swapchain to the marker path.
+static std::atomic<bool> s_ever_seen_nvapi{false};
+
 // ── Output FPS (all presents including FG) ──
 // Rolling 1-second window of present timestamps. FPS = count of presents
 // in the window. Simple, accurate, no smoothing artifacts.
@@ -29,19 +37,14 @@ static std::atomic_flag s_present_telemetry_owner = ATOMIC_FLAG_INIT;
 static EnforcementPath SelectPath(ActiveAPI api) {
     switch (api) {
         case ActiveAPI::DX12:
-            // DX12 prefers NvAPI marker hooks for enforcement (Reflex games).
-            // Once we've seen NvAPI markers, this is a Reflex game — stay on
-            // the marker path even during temporary marker gaps (alt-tab,
-            // loading screens). Falling back to present-based during gaps
-            // causes double enforcement and FG coalescing issues on refocus.
-            {
-                static std::atomic<bool> s_ever_seen_nvapi{false};
-                if (AreNvAPIMarkersFlowing())
-                    s_ever_seen_nvapi.store(true, std::memory_order_release);
-                if (s_ever_seen_nvapi.load(std::memory_order_acquire))
-                    return EnforcementPath::NvAPIMarkers;
-                return EnforcementPath::PresentBased;
-            }
+        case ActiveAPI::DX11:
+            // DXGI APIs prefer NvAPI marker hooks for enforcement (Reflex
+            // games); the marker path is sticky (see s_ever_seen_nvapi).
+            if (AreNvAPIMarkersFlowing())
+                s_ever_seen_nvapi.store(true, std::memory_order_release);
+            if (s_ever_seen_nvapi.load(std::memory_order_acquire))
+                return EnforcementPath::NvAPIMarkers;
+            return EnforcementPath::PresentBased;
 
         case ActiveAPI::Vulkan:
             if (PCL_MarkersFlowing())
@@ -49,7 +52,6 @@ static EnforcementPath SelectPath(ActiveAPI api) {
             return EnforcementPath::PresentBased;
 
         case ActiveAPI::DX9:
-        case ActiveAPI::DX11:
             return EnforcementPath::PresentBased;
 
         case ActiveAPI::OpenGL:
@@ -66,10 +68,12 @@ static EnforcementPath SelectPath(ActiveAPI api) {
 void EnfDisp_OnSwapchainInit(ActiveAPI api) {
     ActiveAPI prev = s_prev_api.load(std::memory_order_relaxed);
 
-    // On API change: flush all scheduler state before re-evaluating path (Req 6.5)
+    // On API change: flush all scheduler state and clear the sticky marker
+    // path before re-evaluating path (Req 6.5)
     if (prev != ActiveAPI::None && prev != api) {
         LOG_INFO("EnfDisp: API changed %d -> %d, flushing scheduler state",
                  static_cast<int>(prev), static_cast<int>(api));
+        s_ever_seen_nvapi.store(false, std::memory_order_release);
         Flush(FLUSH_ALL);
     }
 
@@ -84,8 +88,10 @@ void EnfDisp_OnSwapchainInit(ActiveAPI api) {
 void EnfDisp_OnSwapchainDestroy(bool full_teardown) {
     if (full_teardown) {
         s_active_path.store(EnforcementPath::None, std::memory_order_relaxed);
+        // The next swapchain must requalify for the marker path.
+        s_ever_seen_nvapi.store(false, std::memory_order_release);
         // Don't clear s_prev_api — we need it to detect API changes on next init
-        LOG_INFO("EnfDisp: full teardown, path=None");
+        LOG_INFO("EnfDisp: full teardown, path=None, sticky marker path cleared");
     } else {
         LOG_INFO("EnfDisp: resize teardown, path preserved=%d",
                  static_cast<int>(s_active_path.load(std::memory_order_relaxed)));
@@ -141,8 +147,9 @@ void EnfDisp_OnPresent(int64_t now_qpc) {
 
     switch (path) {
         case EnforcementPath::PresentBased:
-            // Delegate to VkEnforce_OnPresent which handles FG coalescing
-            // and predictor feeding for present-based enforcement.
+            // Delegate to VkEnforce_OnPresent, which coalesces FG presents
+            // and runs the source stage at the Present hook (the resolver's
+            // Present placement).
             VkEnforce_OnPresent(now_qpc);
             break;
 
@@ -150,11 +157,13 @@ void EnfDisp_OnPresent(int64_t now_qpc) {
             // Marker-based: enforcement normally happens in Hook_SetLatencyMarker.
             // Fallback to present-based when:
             // 1. NvAPI markers stop flowing entirely (menus, loading, cutscenes)
-            // 2. NvAPI markers are flowing but the enforcement marker type never
-            //    fires (e.g., game sends RENDERSUBMIT_END but config expects
-            //    SIMULATION_START). Without this, the scheduler never runs,
-            //    deadlines go stale, and the presentation gate misbehaves.
-            if (!AreNvAPIMarkersFlowing() || !AreMarkersFlowing())
+            // 2. NvAPI markers are flowing but no marker trigger reaches the
+            //    scheduler (e.g., game sends RENDERSUBMIT_END but config expects
+            //    SIMULATION_START). Without this, the source stage never runs
+            //    and no frame plans are published.
+            //    Only marker triggers count, so the fallback's own enforcement
+            //    cannot suppress the fallback on the next present.
+            if (!AreNvAPIMarkersFlowing() || !AreMarkerTriggersFlowing())
                 VkEnforce_OnPresent(now_qpc, true);
             break;
 

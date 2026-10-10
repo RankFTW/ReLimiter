@@ -8,10 +8,15 @@
 #include <Windows.h>
 #include <intrin.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
 
 static HANDLE g_timer = nullptr;
+// Pre-Sleep wait timer (PreSleepWaitUntil): separate from the owner's timer.
+static std::atomic<HANDLE> s_pre_sleep_timer{nullptr};
+static std::atomic_flag s_pre_sleep_busy = ATOMIC_FLAG_INIT;
+static HANDLE CreateHighResolutionTimer() noexcept;
 
 void InitSleepTimer() {
     g_timer = CreateWaitableTimerExW(
@@ -22,6 +27,49 @@ void InitSleepTimer() {
         // the scheduler hot path.
         g_timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
     }
+    if (!s_pre_sleep_timer.load(std::memory_order_acquire))
+        s_pre_sleep_timer.store(CreateHighResolutionTimer(), std::memory_order_release);
+}
+
+static HANDLE CreateHighResolutionTimer() noexcept {
+    HANDLE timer = CreateWaitableTimerExW(
+        nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    return timer ? timer : CreateWaitableTimerW(nullptr, FALSE, nullptr);
+}
+
+bool PreSleepWaitUntil(int64_t target_qpc) {
+    if (RuntimeLifecycle_IsStopping()) return false;
+    if (s_pre_sleep_busy.test_and_set(std::memory_order_acquire)) return false;
+    struct BusyScope {
+        ~BusyScope() { s_pre_sleep_busy.clear(std::memory_order_release); }
+    } busy;
+
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    const double remaining_us = qpc_to_us(target_qpc - now.QuadPart);
+    if (!std::isfinite(remaining_us) || remaining_us <= 0.0 || remaining_us > 500'000.0) return false;
+
+    // Timer only, no spin (R7). The exact release is the marker trim at
+    // SIMULATION_START; this wait only has to end before the margin, and the
+    // margin learns the timer's lateness from the aim (P4-10, R2). A spin
+    // here sized to that lateness (R6) burned up to 2 ms of the game thread
+    // per frame and, under load, fed its own lateness (capture E7: CPU
+    // stages 1.5x slower at the same scene and interval as E4).
+    const HANDLE timer = s_pre_sleep_timer.load(std::memory_order_acquire);
+    if (!timer) return false;
+    LARGE_INTEGER due;
+    due.QuadPart = -static_cast<int64_t>(remaining_us * 10.0); // 100 ns units
+    if (!SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) return false;
+    const HANDLE stop_event = RuntimeLifecycle_GetStopEvent();
+    const DWORD timeout_ms = static_cast<DWORD>(remaining_us / 1000.0) + 100;
+    DWORD result = WAIT_FAILED;
+    if (stop_event) {
+        const HANDLE waits[] = { timer, stop_event };
+        result = WaitForMultipleObjects(2, waits, FALSE, timeout_ms);
+    } else {
+        result = WaitForSingleObject(timer, timeout_ms);
+    }
+    return result == WAIT_OBJECT_0 && !RuntimeLifecycle_IsStopping();
 }
 
 void CloseSleepTimer() {
@@ -29,6 +77,8 @@ void CloseSleepTimer() {
         CloseHandle(g_timer);
         g_timer = nullptr;
     }
+    if (HANDLE timer = s_pre_sleep_timer.exchange(nullptr, std::memory_order_acq_rel))
+        CloseHandle(timer);
 }
 
 void CoarseSleep(int64_t wake_qpc) {
@@ -88,6 +138,10 @@ bool TryOwnSleep(int64_t target_qpc) {
 
     double wake_guard = g_adaptive_wake_guard.Get();
     if (!std::isfinite(wake_guard) || wake_guard < 0.0) wake_guard = 0.0;
+    // At most 2 ms of spin, like the GPU worker (R7): a guard learned from
+    // wakes delayed by CPU load must not turn into a longer spin that adds
+    // to that load.
+    wake_guard = (std::min)(wake_guard, 2000.0);
     if (target_qpc <= now.QuadPart) return false;
     const int64_t remaining_qpc = target_qpc - now.QuadPart;
     const double remaining_us = qpc_to_us(remaining_qpc);

@@ -1,0 +1,671 @@
+// Production qualifier, queue hooks, proxy wrapper and bootstrap. Fake COM and
+// hook installation boundaries; not evidence of driver/MinHook/display pacing.
+#include "../src/streamline_gpu_handoff.cpp"
+static USHORT WINAPI TestStack(ULONG, ULONG, PVOID*, PULONG);
+static DWORD WINAPI TestModuleName(HMODULE, LPWSTR, DWORD);
+#undef CaptureStackBackTrace
+#define CaptureStackBackTrace TestStack
+#define GetModuleFileNameW TestModuleName
+#include "../src/streamline_queue_hooks.cpp"
+#undef GetModuleFileNameW
+#undef CaptureStackBackTrace
+#include "../src/streamline_proxy_probe.cpp"
+#include "../src/streamline_factory_probe.cpp"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <future>
+#include <thread>
+#include <vector>
+#include <stdexcept>
+#define CHECK(x) do { if (!(x)) { std::fprintf(stderr,"line %d: %s\n",__LINE__,#x); std::abort(); } } while (0)
+namespace h = streamline_handoff;
+namespace q = streamline_queue;
+namespace p = streamline_proxy_probe;
+namespace f = streamline_factory_probe;
+static bool stopping = false, enabled = true, device_matches = true, pin_ok = true, accept_gpu = true;
+static bool context_observable = true, scheduler_supported = true;
+static bool check_log_unlocked = false, hold_device_publication = false;
+static thread_local bool pause_service_context = false;
+static std::promise<void>* context_entered = nullptr;
+static std::shared_future<void> context_resume;
+static unsigned log_writes = 0;
+static uint64_t settings = 1, config = 7, frame = 0;
+static UINT source_sync = 0;
+static unsigned begins = 0, finishes = 0, invalid_finishes = 0, retires = 0, installs = 0, fail_install = 0, signals = 0, waits = 0;
+static HRESULT host_result = S_OK;
+static thread_local uint64_t stack_site = 0x110;
+static std::vector<char> order;
+std::atomic<int> g_fg_mode{1}, g_fg_multiplier{1};
+std::atomic<bool> g_fg_presenting{true};
+static int64_t Frequency() { LARGE_INTEGER value{}; QueryPerformanceFrequency(&value); return value.QuadPart; }
+bool RuntimeLifecycle_IsStopping() noexcept { return stopping; }
+RuntimeCallbackGuard::RuntimeCallbackGuard() noexcept { stopping_ = stopping; }
+RuntimeCallbackGuard::~RuntimeCallbackGuard() {}
+HookInstallGuard::HookInstallGuard() noexcept { admitted_ = !stopping; }
+HookInstallGuard::~HookInstallGuard() {}
+bool Hooks_PinTargetModule(void*) noexcept { return pin_ok; }
+void Log_Write(LogLevel, const char*, ...) {
+    if (check_log_unlocked) {
+        CHECK(TryAcquireSRWLockExclusive(&h::mutex));
+        ReleaseSRWLockExclusive(&h::mutex);
+    }
+    ++log_writes;
+}
+MH_STATUS InstallHookPublished(void* target, void*, void* slot, HookOriginalPublisher publish) {
+    ++installs; if (installs == fail_install) return MH_ERROR_MEMORY_ALLOC;
+    publish(slot,target); return MH_OK;
+}
+bool GpuPresent_RequiresReadiness() noexcept { return enabled; }
+bool GpuPresent_IsFgSupported(uint32_t controller) noexcept { return scheduler_supported && controller == 3; }
+ReadyPresentConfig GpuPresent_GetConfig() noexcept { return {ReadyPresentMode::Active,500,8000,config}; }
+uint64_t GpuReadiness_Settings() noexcept { return settings; }
+uint64_t NativeGate_PredictionEpoch() noexcept { return 1; }
+NativeGateMode NativeGate_GetMode() noexcept { return NativeGateMode::Shadow; }
+NativeGateContext NativeGate_GetContext(int64_t now) noexcept {
+    if (pause_service_context && context_entered) {
+        auto* entered = context_entered;
+        context_entered = nullptr;
+        entered->set_value();
+        context_resume.wait();
+    }
+    return {0x1000,1,2,3,now,Frequency(),true,false,context_observable,15};
+}
+void GpuPresent_OnQueueDestroy(uint64_t) noexcept {}
+void GpuPresent_OnFgBindingRetired(uint64_t) noexcept { ++retires; }
+bool GpuPresent_BeginFgInput(uint64_t, const GpuPresentFgInput& input) noexcept;
+void GpuPresent_FinishFgInput(uint64_t, bool valid) noexcept { ++finishes; if (!valid) ++invalid_finishes; }
+GpuPresentFgRouteDiagnostics GpuPresent_FgRouteDiagnostics() noexcept { return {}; }
+bool NativeGate_CrossThreadVerified() noexcept { return false; }
+
+struct Object { void** table; std::atomic<unsigned> refs{1}; };
+static std::array<void*,41> device_table{}, queue_table{}, fence_table{}, proxy_table{};
+static Object device{device_table.data()}, a{queue_table.data()}, b{queue_table.data()}, forward_fence{fence_table.data()},
+    back_fence{fence_table.data()}, own_fence{fence_table.data()}, proxy{proxy_table.data()};
+template<class T> static T* As(Object* object) { return reinterpret_cast<T*>(object); }
+static ULONG STDMETHODCALLTYPE AddRef(IUnknown* object) { return ++reinterpret_cast<Object*>(object)->refs; }
+static ULONG STDMETHODCALLTYPE Release(IUnknown* object) { CHECK(reinterpret_cast<Object*>(object)->refs > 1); return --reinterpret_cast<Object*>(object)->refs; }
+static HRESULT STDMETHODCALLTYPE GetDevice(IUnknown*, REFIID, void** result) { AddRef(As<IUnknown>(&device)); *result = &device; return S_OK; }
+// MSVC puts the hidden struct-return pointer after `this` for COM members,
+// unlike a free function. Use a real virtual member thunk for this one slot.
+struct DescThunk {
+    virtual D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE Desc() { D3D12_COMMAND_QUEUE_DESC desc{}; desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT; return desc; }
+};
+IUnknown* SwapMgr_AcquirePresentingDevice() noexcept { AddRef(As<IUnknown>(&device)); return As<IUnknown>(&device); }
+bool FeedbackDeviceIdentity_IsSame(IUnknown* lhs, IUnknown* rhs) noexcept {
+    if (hold_device_publication) {
+        hold_device_publication = false;
+        AcquireSRWLockExclusive(&h::mutex); // fixture forces maintenance publication to defer
+    }
+    return device_matches && lhs == rhs;
+}
+static void STDMETHODCALLTYPE Execute(ID3D12CommandQueue*, UINT count, ID3D12CommandList* const* lists) {
+    CHECK(count == 7 && lists == reinterpret_cast<ID3D12CommandList* const*>(1)); SetLastError(77);
+}
+static HRESULT STDMETHODCALLTYPE Signal(ID3D12CommandQueue*, ID3D12Fence*, UINT64) {
+    CHECK(GetLastError() == 42); ++signals; order.push_back('S'); SetLastError(77); return host_result;
+}
+static HRESULT STDMETHODCALLTYPE Wait(ID3D12CommandQueue*, ID3D12Fence*, UINT64) {
+    CHECK(GetLastError() == 42); ++waits; order.push_back('W'); SetLastError(77); return host_result;
+}
+static HRESULT Fence(Object* queue, Object* fence, uint64_t value, uint64_t site, bool signal) {
+    stack_site = site; SetLastError(42);
+    const auto result = signal ? q::ObserveSignal(As<ID3D12CommandQueue>(queue), As<ID3D12Fence>(fence),value) :
+        q::ObserveWait(As<ID3D12CommandQueue>(queue), As<ID3D12Fence>(fence),value);
+    CHECK(GetLastError() == 77); return result;
+}
+bool GpuPresent_BeginFgInput(uint64_t, const GpuPresentFgInput& input) noexcept {
+    CHECK(StreamlineHandoff_IsCurrent(input.binding)); ++begins; order.push_back('G');
+    // This is deliberately another standard queue call. The actual gate emits
+    // timestamp/Wait/retirement calls; depth masking must prevent self-learning.
+    CHECK(Fence(&a,&own_fence,1,0,true) == S_OK);
+    return accept_gpu;
+}
+static USHORT WINAPI TestStack(ULONG, ULONG capacity, PVOID* output, PULONG) {
+    CHECK(capacity >= 1); output[0] = reinterpret_cast<void*>(stack_site); return stack_site ? 1 : 0;
+}
+static DWORD WINAPI TestModuleName(HMODULE, LPWSTR path, DWORD size) {
+    const wchar_t* name = L"C:\\Windows\\System32\\D3D12Core.dll";
+    CHECK(size > std::wcslen(name)); std::wcscpy(path,name); return static_cast<DWORD>(std::wcslen(name));
+}
+static void Marker() { StreamlineHandoff_RecordMarker(++frame,2,3,h::Now()); }
+static uint64_t Source(bool complete = true) {
+    Marker(); const auto value = frame;
+    StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+    CHECK(scope.input.source == value);
+    CHECK(Fence(&a,&forward_fence,value,0x110,true) == S_OK);
+    CHECK(Fence(&a,&back_fence,value+10000,0x120,false) == S_OK);
+    if (complete) scope.Complete(S_OK);
+    return value;
+}
+static void Worker(uint64_t value, bool callback = true, bool failed = false) {
+    // No source marker or proxy TLS on this thread. Exact fence keys establish
+    // the relationship, even though outer Present has already returned.
+    CHECK(!StreamlineInputScope::Current());
+    CHECK(Fence(&b,&forward_fence,value,0x130,false) == S_OK);
+    q::ObserveExecute(As<ID3D12CommandQueue>(&b),7,reinterpret_cast<ID3D12CommandList* const*>(1));
+    if (callback) StreamlineHandoff_Boundary({StreamlineBoundaryStage::Present,0x1000,reinterpret_cast<uint64_t>(&b),0,1});
+    if (failed) host_result = E_FAIL;
+    CHECK(Fence(&b,&back_fence,value+10000,0x140,true) == host_result);
+    host_result = S_OK;
+}
+static void Cycle() {
+    const auto value = Source();
+    std::thread worker([=]{Worker(value);}); worker.join();
+    if (!h::route.cycle.complete) std::fprintf(stderr,"cycle: epoch=%llu route=%llu bits=%u/%u outer=%d sites=%llu,%llu,%llu,%llu\n",
+        h::epoch.load(),h::route.epoch,h::route.cycle.begun,h::route.cycle.finished,h::route.cycle.outer_done,
+        h::route.cycle.sites[0],h::route.cycle.sites[1],h::route.cycle.sites[2],h::route.cycle.sites[3]);
+    StreamlineHandoff_Service();
+}
+static void Reset() {
+    CHECK(StreamlineHandoff_ReleaseAfterRundown());
+    CHECK(a.refs == 1 && b.refs == 1 && proxy.refs == 1 && forward_fence.refs == 1 && back_fence.refs == 1 && device.refs == 1);
+    CHECK(!h::authorized && !h::tracking && !h::pins && !h::completed_source_transaction);
+    h::worker_scope = {}; enabled = true; device_matches = true; accept_gpu = true; stopping = false;
+    g_fg_mode = 1; g_fg_multiplier = 1; host_result = S_OK; order.clear();
+    source_sync = 0;
+}
+static void Warm() {
+    for (unsigned i=0;i<4;++i) Cycle();
+    if (!StreamlineHandoff_IsCurrent(h::epoch)) std::fprintf(stderr,
+        "qualification: epoch=%llu route=%llu successes=%u checked=%d begun=%u finished=%u outer=%d complete=%d exec=%u callbacks=%u begins=%u\n",
+        h::epoch.load(),h::route.epoch,h::route.successes,h::route.device_checked,h::route.cycle.begun,h::route.cycle.finished,
+        h::route.cycle.outer_done,h::route.cycle.complete,h::route.cycle.executions,h::route.cycle.callbacks,begins);
+    CHECK(StreamlineHandoff_IsCurrent(h::epoch));
+}
+
+static void TestCompletionContention() {
+    enum class Case { SourceFirst, WorkerFirstService, WorkerFirstNextSource, FailedPresent, MissingWait, Invalidated };
+    for (const auto scenario : {Case::SourceFirst, Case::WorkerFirstService, Case::WorkerFirstNextSource,
+                               Case::FailedPresent, Case::MissingWait, Case::Invalidated}) {
+        Warm();
+        const auto binding = h::epoch.load(), contentions = h::callback_contentions.load();
+        const auto prior_finishes = finishes, prior_invalid = invalid_finishes, prior_logs = log_writes;
+        const bool valid = scenario == Case::SourceFirst || scenario == Case::WorkerFirstService || scenario == Case::WorkerFirstNextSource;
+        const bool worker_first = scenario == Case::WorkerFirstService || scenario == Case::WorkerFirstNextSource;
+        std::promise<void> acquired, release;
+        auto acquired_future = acquired.get_future(), release_future = release.get_future();
+        std::thread locker;
+        Marker(); const auto value = frame; uint64_t transaction = 0;
+        {
+            StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0);
+            transaction = scope.input.transaction;
+            CHECK(Fence(&a,&forward_fence,value,0x110,true) == S_OK);
+            if (scenario != Case::MissingWait) CHECK(Fence(&a,&back_fence,value+10000,0x120,false) == S_OK);
+            CHECK(scope.successful_source_fences == (scenario == Case::MissingWait ? 1u : 3u));
+            if (worker_first) {
+                std::thread worker([=]{Worker(value);}); worker.join();
+                CHECK(h::route.cycle.finished == 15 && !h::route.cycle.complete);
+            }
+            locker = std::thread([&] {
+                AcquireSRWLockExclusive(&h::mutex);
+                acquired.set_value();
+                // Watchdog only: the source must RETURN while we still own mutex.
+                CHECK(release_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+                ReleaseSRWLockExclusive(&h::mutex);
+            });
+            acquired_future.get();
+            if (scenario == Case::Invalidated) StreamlineHandoff_Invalidate("test_lifecycle_during_completion");
+            scope.Complete(scenario == Case::FailedPresent ? E_FAIL : S_OK);
+            SetLastError(77);
+        }
+        CHECK(GetLastError() == 77 && !h::pins && a.refs == 2);
+        CHECK(h::completed_source_transaction == (valid ? transaction : 0));
+        CHECK(finishes == prior_finishes + 1 && invalid_finishes == prior_invalid + (valid ? 0 : 1));
+        CHECK(h::callback_contentions == contentions && log_writes == prior_logs);
+        CHECK(StreamlineHandoff_IsCurrent(binding) == valid);
+        CHECK(!h::route.cycle.complete); // publication alone is never cycle authority
+        release.set_value(); locker.join();
+        if (scenario == Case::WorkerFirstService) {
+            StreamlineHandoff_Service();
+            CHECK(h::route.cycle.complete && h::route.previous_frame == value);
+        } else if (scenario == Case::WorkerFirstNextSource) {
+            const auto next = Source(); // no worker/maintenance callback between scopes
+            CHECK(h::route.previous_frame == value && !h::route.cycle.complete);
+            CHECK(h::completed_source_transaction != transaction);
+            std::thread worker([=]{Worker(next);}); worker.join();
+            CHECK(h::route.cycle.complete && StreamlineHandoff_IsCurrent(binding));
+        } else if (scenario == Case::SourceFirst) {
+            std::thread worker([=]{Worker(value);}); worker.join();
+            CHECK(h::route.cycle.complete && StreamlineHandoff_IsCurrent(binding));
+        } else {
+            StreamlineHandoff_Service(); CHECK(!h::route.epoch && !h::completed_source_transaction);
+        }
+        Reset();
+    }
+
+    // Four complete rounds and the retained device check remain mandatory when
+    // every worker return happens before the corresponding outer Present return.
+    for (const auto service_each_cycle : {false,true}) {
+        const auto prior_begins = begins;
+        for (unsigned cycle = 0; cycle < 4; ++cycle) {
+            Marker(); const auto value = frame;
+            {
+                StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0);
+                Fence(&a,&forward_fence,value,0x110,true); Fence(&a,&back_fence,value+10000,0x120,false);
+                std::thread worker([=]{Worker(value);}); worker.join();
+                CHECK(!h::route.cycle.complete && !h::authorized);
+                scope.Complete(S_OK);
+            }
+            CHECK(!h::route.cycle.complete && !h::authorized && begins == prior_begins);
+            if (!cycle || service_each_cycle) {
+                StreamlineHandoff_Service();
+                CHECK(h::route.cycle.complete && h::route.successes == cycle + 1 && h::route.device_checked);
+            }
+            CHECK(StreamlineHandoff_IsCurrent(h::epoch) == (service_each_cycle && cycle == 3));
+        }
+        const auto next = Source();
+        CHECK(begins == prior_begins + 1 && StreamlineHandoff_IsCurrent(h::epoch));
+        std::thread worker([=]{Worker(next);}); worker.join();
+        CHECK(h::route.cycle.complete); Reset();
+    }
+
+    // A failed source result is not converted into a completion publication even
+    // when the outer call itself reports success. No qualified gate in this round.
+    Marker(); {
+        StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0);
+        const auto binding = h::epoch.load(); host_result = E_FAIL;
+        CHECK(Fence(&a,&forward_fence,frame,0x110,true) == E_FAIL);
+        host_result = S_OK;
+        CHECK(!scope.successful_source_fences && h::epoch != binding);
+        scope.Complete(S_OK);
+    }
+    CHECK(!h::completed_source_transaction && !h::pins); Reset();
+
+    // An old published source transaction cannot complete a replacement route,
+    // even if every new worker edge matches. Cleanup normally clears this slot;
+    // inject a stale value to independently test the exact-key consumer guard.
+    Source(); const auto stale_transaction = h::completed_source_transaction.load();
+    Reset(); const auto next = Source(), current_transaction = h::completed_source_transaction.load();
+    CHECK(current_transaction && current_transaction != stale_transaction);
+    h::completed_source_transaction.store(stale_transaction,std::memory_order_release);
+    std::thread worker([=]{Worker(next);}); worker.join();
+    StreamlineHandoff_Service();
+    CHECK(!h::route.cycle.complete && !h::authorized && h::route.successes == 0);
+    h::completed_source_transaction.store(current_transaction,std::memory_order_release);
+    StreamlineHandoff_Service();
+    CHECK(h::route.cycle.complete && h::route.successes == 1 && !h::authorized);
+    Reset();
+}
+
+static void TestMaintenanceFenceOverlap() {
+    Warm();
+    const auto binding = h::epoch.load(), contentions = h::callback_contentions.load();
+    Marker();
+    const auto value = frame;
+    {
+        StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0);
+        std::promise<void> entered, resume;
+        auto entered_future = entered.get_future();
+        context_entered = &entered;
+        context_resume = resume.get_future().share();
+        std::thread maintenance([] {
+            pause_service_context = true;
+            StreamlineHandoff_Service();
+            pause_service_context = false;
+        });
+        CHECK(entered_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+        CHECK(Fence(&a,&forward_fence,value,0x110,true) == S_OK);
+        CHECK(Fence(&a,&back_fence,value+10000,0x120,false) == S_OK);
+        scope.Complete(S_OK);
+        resume.set_value();
+        maintenance.join();
+        context_entered = nullptr;
+    }
+    CHECK(StreamlineHandoff_IsCurrent(binding));
+    CHECK(h::callback_contentions == contentions);
+    std::thread worker([=]{Worker(value);}); worker.join();
+    CHECK(h::route.cycle.complete);
+    Reset();
+}
+
+static void TestMaintenanceWorkerOverlap() {
+    Warm();
+    const auto binding = h::epoch.load(), contentions = h::callback_contentions.load();
+    const auto value = Source();
+    std::promise<void> entered, resume;
+    auto entered_future = entered.get_future();
+    context_entered = &entered;
+    context_resume = resume.get_future().share();
+    std::thread maintenance([] {
+        pause_service_context = true;
+        StreamlineHandoff_Service();
+        pause_service_context = false;
+    });
+    CHECK(entered_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    std::thread worker([=]{Worker(value);}); worker.join();
+    resume.set_value();
+    maintenance.join();
+    context_entered = nullptr;
+    CHECK(StreamlineHandoff_IsCurrent(binding) && h::route.cycle.complete);
+    CHECK(h::callback_contentions == contentions);
+    Reset();
+}
+
+static void TestMaintenanceInvalidationInFlight() {
+    Warm();
+    Source();
+    std::promise<void> entered, resume;
+    auto entered_future = entered.get_future();
+    context_entered = &entered;
+    context_resume = resume.get_future().share();
+    std::thread maintenance([] {
+        pause_service_context = true;
+        StreamlineHandoff_Service();
+        pause_service_context = false;
+    });
+    CHECK(entered_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    StreamlineHandoff_Invalidate("test_while_validating");
+    resume.set_value();
+    maintenance.join();
+    context_entered = nullptr;
+    CHECK(!h::route.epoch && !h::authorized && !h::pins);
+    Reset();
+}
+
+static unsigned presents = 0;
+static UINT expected_sync = 2, expected_flags = 4;
+static bool submit_from_present = false;
+static HRESULT present_result = DXGI_STATUS_OCCLUDED;
+static HRESULT STDMETHODCALLTYPE Present(IDXGISwapChain* object, UINT sync, UINT flags) {
+    CHECK(object == As<IDXGISwapChain>(&proxy) && sync == expected_sync && flags == expected_flags && GetLastError() == 42);
+    ++presents;
+    if (submit_from_present) {
+        const auto* scope = StreamlineInputScope::Current();
+        CHECK(scope && scope->input.source == frame && scope->sync_interval == sync);
+        CHECK(Fence(&a,&forward_fence,frame,0x110,true) == S_OK);
+        CHECK(Fence(&a,&back_fence,frame+10000,0x120,false) == S_OK);
+    }
+    SetLastError(77); return present_result;
+}
+static HRESULT STDMETHODCALLTYPE Present1(IDXGISwapChain1* object, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* parameters) {
+    CHECK(parameters == reinterpret_cast<const DXGI_PRESENT_PARAMETERS*>(1));
+    return Present(reinterpret_cast<IDXGISwapChain*>(object),sync,flags);
+}
+static void ProxyCycle(bool present1) {
+    Marker(); const auto value = frame; const auto previous_presents = presents;
+    SetLastError(42);
+    const auto result = present1 ? p::ObservePresent1(As<IDXGISwapChain1>(&proxy),expected_sync,expected_flags,
+        reinterpret_cast<const DXGI_PRESENT_PARAMETERS*>(1)) : p::ObservePresent(As<IDXGISwapChain>(&proxy),expected_sync,expected_flags);
+    CHECK(result == S_OK && GetLastError() == 77 && presents == previous_presents + 1);
+    std::thread worker([=]{Worker(value);}); worker.join();
+    CHECK(h::route.cycle.complete); StreamlineHandoff_Service();
+}
+static int factory_calls = 0;
+static HRESULT WINAPI Factory(REFIID id, void** output) { CHECK(id == __uuidof(IDXGIFactory2)); ++factory_calls; AddRef(As<IUnknown>(&proxy)); *output = &proxy; return S_OK; }
+static HRESULT STDMETHODCALLTYPE FactoryA() { return E_FAIL; }
+static HRESULT STDMETHODCALLTYPE FactoryB() { return E_NOTIMPL; }
+static HRESULT STDMETHODCALLTYPE FactoryC() { return E_INVALIDARG; }
+int main() {
+    for (auto* table : {&device_table,&queue_table,&fence_table,&proxy_table}) {
+        (*table)[1] = reinterpret_cast<void*>(&AddRef); (*table)[2] = reinterpret_cast<void*>(&Release); (*table)[7] = reinterpret_cast<void*>(&GetDevice);
+    }
+    queue_table[10] = reinterpret_cast<void*>(&Execute); queue_table[14] = reinterpret_cast<void*>(&Signal);
+    DescThunk desc_thunk;
+    queue_table[15] = reinterpret_cast<void*>(&Wait); queue_table[18] = (*reinterpret_cast<void***>(&desc_thunk))[0];
+    q::targets = {reinterpret_cast<uint64_t>(&Execute),reinterpret_cast<uint64_t>(&Signal),reinterpret_cast<uint64_t>(&Wait)};
+    CHECK(q::RuntimeMethods(q::targets));
+    CHECK(!q::RuntimeMethods({1,2,3})); CHECK(!q::RuntimeMethods({q::targets[0],q::targets[0],q::targets[2]}));
+    q::original_execute = &Execute; q::original_signal = &Signal; q::original_wait = &Wait;
+    q::ready = true; q::plugin_begin = 0x100; q::plugin_end = 0x200;
+        // Rejections before the first retained route must remain observable. No
+        // marker/proxy/queue callback writes a log or relaxes admission to diagnose it.
+        const auto quiet_logs = log_writes;
+        // FgInputRoute is this route's output, never its admission input.
+        scheduler_supported = false; context_observable = false; Marker();
+        CHECK(!h::marker.input.source && std::strcmp(h::marker_admission.last_failure.load(),"fg_context_not_observable") == 0);
+        scheduler_supported = true; context_observable = true;
+        { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0);
+            CHECK(!scope.input.transaction && std::strcmp(h::present_admission.last_failure.load(),"missing_same_thread_marker") == 0);
+            Marker(); CHECK(!h::marker.input.source && std::strcmp(h::marker_admission.last_failure.load(),"marker_inside_proxy_scope") == 0); }
+        Marker(); { StreamlineInputScope scope(0,0,0); CHECK(!scope.input.transaction && std::strcmp(h::present_admission.last_failure.load(),"proxy_vtable_mismatch") == 0); }
+        Marker(); { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),5,0); CHECK(!scope.input.transaction && std::strcmp(h::present_admission.last_failure.load(),"invalid_sync_interval") == 0); }
+        Marker(); { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0);
+            Fence(&a,&forward_fence,frame,0,true); scope.Complete(S_OK);
+            CHECK(!h::route.epoch && std::strcmp(h::fence_admission.last_failure.load(),"selected_plugin_site_missing") == 0); }
+        Marker(); { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0);
+            queue_table[15] = reinterpret_cast<void*>(&Signal);
+            Fence(&a,&forward_fence,frame,0x110,true); scope.Complete(S_OK);
+            CHECK(!h::route.epoch && std::strcmp(h::fence_admission.last_failure.load(),"queue_vtable_methods_mismatch") == 0);
+            queue_table[15] = reinterpret_cast<void*>(&Wait); }
+        CHECK(log_writes == quiet_logs && begins == 0 && !h::authorized);
+        h::last_admission_report = h::Now() - Frequency()*6;
+        StreamlineHandoff_Service(); CHECK(log_writes > quiet_logs);
+        const auto reported_logs = log_writes;
+        StreamlineHandoff_Service(); CHECK(log_writes == reported_logs); // throttled, even without a route
+    Warm(); CHECK(begins == 0); // four proven round trips + retained-device check
+    order.clear(); Cycle(); CHECK(begins == 1 && finishes == 1 && invalid_finishes == 0);
+    CHECK(order.size() >= 3 && order[0] == 'G' && order[1] == 'S' && order[2] == 'S'); // owned GPU work before host input Signal
+    CHECK(h::route.successes == 4 && a.refs == 2 && b.refs == 2 && forward_fence.refs == 2 && back_fence.refs == 2);
+    Reset();
+    TestCompletionContention();
+    TestMaintenanceFenceOverlap();
+    TestMaintenanceWorkerOverlap();
+    TestMaintenanceInvalidationInFlight();
+    // Diagnostic snapshots and opportunistic maintenance never revoke a healthy
+    // binding merely because they cannot acquire its observation lock.
+    Warm(); const auto stable_binding = h::epoch.load();
+    const auto maintenance_before = h::maintenance_deferrals.load();
+    AcquireSRWLockExclusive(&h::mutex);
+    StreamlineHandoff_Service();
+    const auto snapshot = StreamlineHandoff_ReadStatus();
+    CHECK(snapshot.qualified && snapshot.epoch == stable_binding);
+    CHECK(snapshot.maintenance_deferrals == maintenance_before + 1);
+    ReleaseSRWLockExclusive(&h::mutex);
+    CHECK(StreamlineHandoff_IsCurrent(stable_binding)); Cycle(); Reset();
+    // Failed device-check publication is retried, with no leaked pin or reset.
+    const auto publication_binding = h::epoch.load();
+    hold_device_publication = true; Cycle();
+    CHECK(h::epoch == publication_binding && !h::route.device_checked && !h::pins);
+    ReleaseSRWLockExclusive(&h::mutex);
+    StreamlineHandoff_Service(); CHECK(h::route.device_checked);
+    check_log_unlocked = true; Warm(); StreamlineHandoff_Service(); check_log_unlocked = false;
+    Reset();
+    // Only a known non-role queue is ignored; source, worker, unknown identity
+    // and partial discovery still invalidate. No COM calls on the evidence.
+    Warm(); const auto unrelated_binding = h::epoch.load();
+    StreamlineHandoff_Boundary({StreamlineBoundaryStage::DestroyQueue,0,0x9999});
+    CHECK(StreamlineHandoff_IsCurrent(unrelated_binding));
+    for (const auto queue : {reinterpret_cast<uint64_t>(&a),reinterpret_cast<uint64_t>(&b),uint64_t{0}}) {
+        h::Invalidation old_record; while (h::invalidations.Pop(&old_record)) {}
+        const auto revoked = h::epoch.load(); const auto callback_logs = log_writes;
+        StreamlineHandoff_Boundary({StreamlineBoundaryStage::DestroyQueue,0,queue});
+        CHECK(!StreamlineHandoff_IsCurrent(revoked) && log_writes == callback_logs);
+        // Later failures must not overwrite the first retained-binding cause.
+        StreamlineHandoff_Invalidate("later_failure");
+        h::Invalidation record; CHECK(h::invalidations.Pop(&record));
+        CHECK(record.epoch == revoked && std::strcmp(record.reason,"queue_destroyed") == 0);
+        CHECK(record.object == queue);
+        CHECK(record.qpc > 0 && record.thread == GetCurrentThreadId() && !h::invalidations.Pop(&record));
+        Reset(); Warm();
+    }
+    Reset(); Source();
+    StreamlineHandoff_Boundary({StreamlineBoundaryStage::DestroyQueue,0,0x9999});
+    CHECK(!StreamlineHandoff_IsCurrent(h::route.epoch) && h::epoch != h::route.epoch); Reset();
+    // Explicit policy/shutdown changes revoke even if maintenance must defer.
+    for (const auto final : {false,true}) {
+        Warm(); const auto revoked = h::epoch.load();
+        AcquireSRWLockExclusive(&h::mutex); enabled = final;
+        StreamlineHandoff_Service(final); CHECK(!StreamlineHandoff_IsCurrent(revoked));
+        ReleaseSRWLockExclusive(&h::mutex); enabled = true; Reset();
+    }
+    for (const auto multiplier : {2,3}) {
+        g_fg_multiplier = multiplier; const auto previous_begins = begins;
+        Warm(); CHECK(begins == previous_begins); Cycle(); CHECK(begins == previous_begins + 1); Reset();
+    }
+    // Actual shared Present/Present1 wrappers, not just directly constructed
+    // scopes: all documented intervals 0..4 preserve arguments and qualify only
+    // after the same four source/worker rounds. GPU Begin precedes host Signal.
+    p::original_present = &Present; p::original_present1 = &Present1;
+    p::expected_vtable = reinterpret_cast<uint64_t>(proxy.table);
+    submit_from_present = true; present_result = S_OK; expected_flags = 0;
+    for (UINT sync = 0; sync <= 4; ++sync) {
+        for (const auto present1 : {false,true}) {
+            expected_sync = sync; const auto previous_begins = begins, previous_finishes = finishes;
+            for (unsigned cycle = 0; cycle < 4; ++cycle) {
+                ProxyCycle(present1); CHECK(begins == previous_begins);
+                CHECK(bool(h::authorized) == (cycle == 3));
+            }
+            CHECK(h::route.sync_interval == sync);
+            order.clear(); ProxyCycle(present1);
+            CHECK(begins == previous_begins + 1 && finishes == previous_finishes + 1);
+            CHECK(order.size() >= 3 && order[0] == 'G' && order[1] == 'S' && order[2] == 'S');
+            Reset();
+        }
+    }
+    submit_from_present = false; present_result = E_INVALIDARG;
+    for (const auto invalid_sync : {5u,UINT_MAX}) {
+        expected_sync = invalid_sync; const auto previous_presents = presents, previous_begins = begins;
+        Marker(); SetLastError(42);
+        CHECK(p::ObservePresent(As<IDXGISwapChain>(&proxy),invalid_sync,0) == E_INVALIDARG && GetLastError() == 77);
+        Marker(); SetLastError(42);
+        CHECK(p::ObservePresent1(As<IDXGISwapChain1>(&proxy),invalid_sync,0,reinterpret_cast<const DXGI_PRESENT_PARAMETERS*>(1)) == E_INVALIDARG && GetLastError() == 77);
+        CHECK(presents == previous_presents + 2 && begins == previous_begins && !h::authorized);
+        CHECK(std::strcmp(h::present_admission.last_failure.load(),"invalid_sync_interval") == 0);
+    }
+    expected_sync = 2; expected_flags = 4; present_result = DXGI_STATUS_OCCLUDED;
+    // Revoke at entry, before either a Signal or the host Present return. Old
+    // tickets use this binding epoch, and the new interval must relearn four rounds.
+    for (const auto old_sync : {0u,1u,4u}) {
+        source_sync = old_sync; Warm(); const auto old_binding = h::epoch.load();
+        const auto previous_begins = begins; const UINT next_sync = (old_sync + 1) % 5;
+        Marker(); { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),next_sync,0);
+            CHECK(!scope.input.transaction && !StreamlineHandoff_IsCurrent(old_binding));
+            CHECK(std::strcmp(h::present_admission.last_failure.load(),"sync_interval_changed") == 0);
+            CHECK(!StreamlineHandoff_ClaimsInput()); scope.Complete(S_OK); }
+        CHECK(begins == previous_begins); StreamlineHandoff_Service(); CHECK(!h::route.epoch);
+        source_sync = next_sync; Warm(); CHECK(begins == previous_begins);
+        Cycle(); CHECK(begins == previous_begins + 1); Reset();
+    }
+    // Interval changes also reset partial qualification and revoke an incomplete
+    // worker cycle without pretending its Wait/Signal already retired on the GPU.
+    for (const auto incomplete : {false,true}) {
+        Cycle(); if (incomplete) Source(); else Cycle();
+        const auto old_binding = h::epoch.load();
+        Marker(); { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),1,0);
+            CHECK(!scope.input.transaction && h::epoch != old_binding); scope.Complete(S_OK); }
+        StreamlineHandoff_Service(); CHECK(!h::route.epoch);
+        source_sync = 1; Warm(); Reset();
+    }
+    for (const auto flags : {DXGI_PRESENT_TEST,DXGI_PRESENT_DO_NOT_WAIT}) {
+        source_sync = 1; Warm(); const auto previous_begins = begins;
+        Marker(); { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),1,flags);
+            CHECK(!scope.input.transaction && !h::authorized); scope.Complete(S_OK); }
+        CHECK(begins == previous_begins); Reset();
+    }
+    // Module/telemetry alone, missing/stale/foreign marker, Auto, nested/special
+    // Present, and wrong source site never authorize an insertion.
+    g_fg_mode = 2; Marker(); { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0); CHECK(!scope.input.transaction); }
+    g_fg_mode = 1;
+    Marker(); { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,DXGI_PRESENT_TEST); CHECK(!scope.input.transaction); }
+    Marker(); { StreamlineInputScope outer(reinterpret_cast<uint64_t>(&proxy),0,0); StreamlineInputScope inner(reinterpret_cast<uint64_t>(&proxy),0,0); CHECK(outer.invalid && !inner.input.transaction); }
+    Reset(); Warm(); const auto before = begins;
+    Marker(); { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0); Fence(&a,&forward_fence,frame,0x150,true); scope.Complete(S_OK); }
+    CHECK(begins == before && !StreamlineHandoff_IsCurrent(h::epoch)); Reset();
+    // Epoch/config/multiplier changes and missing marker reject BEFORE Begin.
+    Warm(); const auto policy_begins = begins;
+    ++config; Source(); CHECK(begins == policy_begins && !h::authorized); Reset();
+    Warm(); const auto mode_begins = begins;
+    g_fg_multiplier = 2; Source(); CHECK(begins == mode_begins && !h::authorized); Reset();
+    Warm(); const auto marker_begins = begins;
+    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0); Fence(&a,&forward_fence,++frame,0x110,true); scope.Complete(S_OK); }
+    CHECK(begins == marker_begins && !h::authorized); Reset();
+    Warm(); Marker(); { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,DXGI_PRESENT_DO_NOT_WAIT); CHECK(!scope.input.transaction && !h::authorized); }
+    Reset();
+    Marker(); h::marker.release -= Frequency();
+    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0); CHECK(!scope.input.transaction); }
+    // Duplicate candidate signals, value regression and overlapping inputs fail
+    // closed; no first-signal or ordinal-only qualification.
+    Marker(); {
+        StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0);
+        Fence(&a,&forward_fence,frame,0x110,true); Fence(&a,&forward_fence,frame+1,0x110,true);
+        scope.Complete(S_OK); CHECK(scope.invalid);
+    } Reset();
+    Warm(); const auto regression_begins = begins;
+    Marker(); { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0); Fence(&a,&forward_fence,h::route.previous_forward,0x110,true); scope.Complete(S_OK); }
+    CHECK(begins == regression_begins && !h::authorized); Reset();
+    Source(); Source(); CHECK(!h::authorized); Reset();
+    // Abandoned worker work times out without dereferencing borrowed objects.
+    Source(); h::route.cycle.begin -= Frequency(); StreamlineHandoff_Service(); CHECK(!h::route.epoch); Reset();
+    // Failed worker return / missing selected callback / device mismatch cannot train.
+    auto value = Source(); std::thread bad([=]{Worker(value,true,true);}); bad.join(); CHECK(!h::authorized); Reset();
+    value = Source(); std::thread absent([=]{Worker(value,false);}); absent.join(); CHECK(!h::authorized); Reset();
+    device_matches = false; Cycle(); CHECK(!h::authorized); Reset();
+    // Scope failure, lifecycle changes, contention and host exceptions revoke
+    // authorization; retained references survive until the outstanding pin ends.
+    Warm(); Marker(); {
+        StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0);
+        Fence(&a,&forward_fence,frame,0x110,true);
+        StreamlineHandoff_Boundary({StreamlineBoundaryStage::DestroyQueue,0,reinterpret_cast<uint64_t>(&a)});
+        StreamlineHandoff_Service(); CHECK(a.refs == 2 && h::pins == 1);
+        scope.Complete(S_OK);
+    }
+    CHECK(invalid_finishes > 0); Reset();
+    Warm(); AcquireSRWLockExclusive(&h::mutex);
+    std::thread contender([]{ Fence(&b,&forward_fence,999,0x130,false); }); contender.join();
+    ReleaseSRWLockExclusive(&h::mutex); CHECK(!StreamlineHandoff_IsCurrent(h::epoch));
+    CHECK(h::callback_contentions > 0 && std::strcmp(h::rejection.load(),"fence_before_lock_busy") == 0); Reset();
+    Warm(); try { Marker(); StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0); Fence(&a,&forward_fence,frame,0x110,true); throw std::runtime_error("host"); } catch (...) {}
+    CHECK(!h::pins && !h::authorized); Reset();
+    // Another owner declined our Begin: no matching Finish may be fabricated.
+    Warm(); accept_gpu = false; const auto prior_finishes = finishes; Cycle(); CHECK(finishes == prior_finishes); Reset();
+    // Exact forwarding when inactive/stopping, partial installs and no retries.
+    stopping = true; const auto prior_signals = signals;
+    CHECK(Fence(&a,&forward_fence,1,0,true) == S_OK && signals == prior_signals + 1); stopping = false;
+    StreamlineComEvidence methods; for (unsigned i=0;i<3;++i) methods.entries[6+i] = q::targets[i];
+    fail_install = 2; StreamlineQueue_Offer(methods); CHECK(installs == 3 && !q::ready);
+    StreamlineQueue_Offer(methods); CHECK(installs == 3);
+    // Shared proxy wrapper forwards exactly, preserves LastError and never QIs
+    // the original parameter array. Acquisition copies only standard methods.
+    p::original_present = &Present; p::original_present1 = &Present1; p::expected_vtable = reinterpret_cast<uint64_t>(proxy.table);
+    const auto previous_presents = presents;
+    SetLastError(42); CHECK(p::ObservePresent(As<IDXGISwapChain>(&proxy),2,4) == DXGI_STATUS_OCCLUDED && GetLastError() == 77);
+    SetLastError(42); CHECK(p::ObservePresent1(As<IDXGISwapChain1>(&proxy),2,4,reinterpret_cast<const DXGI_PRESENT_PARAMETERS*>(1)) == DXGI_STATUS_OCCLUDED && GetLastError() == 77);
+    CHECK(presents == previous_presents + 2); StreamlineProxy_RecordInner(1,reinterpret_cast<uint64_t>(&a),2);
+    CHECK(p::queue_offer_state == 2 && p::queue_methods.entries[7] == reinterpret_cast<uint64_t>(&Signal));
+    StreamlineProxy_Drain(); CHECK(p::queue_offer_state == 3);
+    // Factory anchor has no creation observers and releases its temporary ref.
+    proxy_table[10] = reinterpret_cast<void*>(&FactoryA); proxy_table[15] = reinterpret_cast<void*>(&FactoryB); proxy_table[16] = reinterpret_cast<void*>(&FactoryC);
+    auto anchor = f::Bootstrap(GetModuleHandleW(nullptr),&Factory,false); CHECK(anchor.valid && proxy.refs == 1);
+    CHECK(!anchor.streamline_initialized && std::strcmp(anchor.outcome,"anchor_ready") == 0);
+    proxy_table[16] = proxy_table[15]; anchor = f::Bootstrap(GetModuleHandleW(nullptr),&Factory,false); CHECK(!anchor.valid && proxy.refs == 1);
+    pin_ok = false; anchor = f::Bootstrap(GetModuleHandleW(nullptr),&Factory,true); CHECK(!anchor.valid && proxy.refs == 1);
+    // A slot another module owns names that slot and module (CONTROL Resonant:
+    // RenoDX DLSS, then the SCSKiller d3d12.dll proxy, hooked them after
+    // Streamline). Before Streamline is ready that rejects the anchor.
+    pin_ok = true; proxy_table[16] = reinterpret_cast<void*>(&FactoryC);
+    proxy_table[15] = reinterpret_cast<void*>(&GetTickCount64);
+    anchor = f::Bootstrap(GetModuleHandleW(nullptr),&Factory,false);
+    CHECK(!anchor.valid && !anchor.streamline_initialized && proxy.refs == 1 &&
+        std::strcmp(anchor.outcome,"methods_not_interposer") == 0 &&
+        anchor.foreign_slot == 15 && anchor.foreign_owner[0] && std::strcmp(anchor.foreign_owner,"unknown") != 0);
+    // Once Streamline is ready, its initialization selects the image instead.
+    auto initialized = f::Bootstrap(GetModuleHandleW(nullptr),&Factory,true);
+    CHECK(initialized.valid && initialized.streamline_initialized && initialized.foreign_slot == 15 &&
+        std::strcmp(initialized.outcome,"streamline_initialized") == 0 && proxy.refs == 1);
+    // The early rejection is retried once, and only once Streamline is ready.
+    f::early = anchor; f::finished = true; f::ready_attempted = false; f::attempted_ready = false;
+    const int calls = factory_calls;
+    f::TryWorker(GetModuleHandleW(nullptr),&Factory,false); CHECK(factory_calls == calls && !f::ready_attempted);
+    f::TryWorker(GetModuleHandleW(nullptr),&Factory,true);
+    CHECK(factory_calls == calls + 1 && f::ready_attempted && f::ready.valid && f::ready.streamline_initialized &&
+        f::Current().valid && proxy.refs == 1);
+    f::TryWorker(GetModuleHandleW(nullptr),&Factory,true); CHECK(factory_calls == calls + 1);
+    // A worker attempt made while Streamline is ready is not repeated.
+    f::early = {}; f::early.absent = true; f::fallback_attempted = false; f::ready_attempted = false;
+    f::TryWorker(GetModuleHandleW(nullptr),&Factory,true);
+    f::TryWorker(GetModuleHandleW(nullptr),&Factory,true);
+    CHECK(factory_calls == calls + 2 && f::fallback_attempted && f::fallback.streamline_initialized && !f::ready_attempted);
+    f::early = {}; f::early.absent = true; f::fallback_attempted = false; f::ready_attempted = false;
+    proxy_table[15] = reinterpret_cast<void*>(&FactoryB); proxy_table[16] = proxy_table[15];
+    f::TryWorker(GetModuleHandleW(nullptr),&Factory,true);
+    f::TryWorker(GetModuleHandleW(nullptr),&Factory,true);
+    CHECK(factory_calls == calls + 3 && !f::fallback.valid && !f::ready_attempted);
+    proxy_table[16] = reinterpret_cast<void*>(&FactoryC);
+    // Once a selected feature changes away from the publicly hooked functions,
+    // later resolver success must not revive authority from stale mode telemetry.
+    StreamlineQueue_BlockFeature();
+    StreamlineQueue_SetFeatureModule(reinterpret_cast<void*>(&Factory),reinterpret_cast<void*>(&FactoryA));
+    CHECK(!q::plugin_begin);
+    std::puts("Streamline retained handoff, forwarding and acquisition tests passed");
+}

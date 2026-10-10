@@ -1,19 +1,19 @@
 #include "osd.h"
 #include "osd_position_policy.h"
+#include "osd_cadence_policy.h"
 #include "config.h"
 #include "scheduler.h"
-#include "predictor.h"
+#include "pacing_resolver.h"
 #include "fg_divisor.h"
 #include "display_state.h"
 #include "marker_log.h"
 #include "nvapi_types.h"
 #include "correlator.h"
-#include "stress_detector.h"
 #include "streamline_hooks.h"
+#include "streamline_gpu_handoff.h"
 #include "wake_guard.h"
 #include "pqi.h"
 #include "csv_writer.h"
-#include "baseline.h"
 #include "swapchain_manager.h"
 #include "enforcement_dispatcher.h"
 #include "loadlib_hooks.h"
@@ -24,9 +24,8 @@
 #include "reflex_inject.h"
 #include "presentation_gate.h"
 #include "flip_model.h"
-#include "frame_time_adaptation.h"
-#include "arrival_lead_estimator.h"
-#include "adaptive_deadline_reserve.h"
+#include "period_governor.h"
+#include "rung_feasibility.h"
 #include "hw_monitor.h"
 #include "feedback.h"
 #include "ngx_hooks.h"
@@ -36,6 +35,7 @@
 #include "focus_lock.h"
 #include "logger.h"
 #include "native_pcl_measurement.h"
+#include "pacing_telemetry.h"
 #include "runtime_lifecycle.h"
 #include <string>
 #include <atomic>
@@ -45,11 +45,13 @@
 
 // ── OSD readout state ──
 static double s_real_fps = 0.0;
+static osd_cadence_policy::Consumer s_cadence_consumer;
 
 // ── Frametime history for graph ──
 static constexpr int FT_HISTORY_SIZE = 200;
 static float s_ft_history[FT_HISTORY_SIZE] = {};
 static int   s_ft_history_idx = 0;
+static int   s_ft_history_count = 0;
 
 // ── Adaptive graph scale ──
 static float s_graph_scale_min = 0.0f;
@@ -71,7 +73,7 @@ void OSD_CyclePosition() {
     g_config.osd_x = next.x;
     g_config.osd_y = next.y;
     LOG_INFO("OSD: position cycle -> %.0f, %.0f", next.x, next.y);
-    SaveConfig();
+    RequestSaveConfig();
 }
 
 // Tooltip helper
@@ -166,8 +168,440 @@ static void EnforceStickyMonitor() {
     MoveWindowToMonitor(idx);
 }
 
+// ── Pacing pipeline controls (phase2_timing_core_design.md section 4) ──
+
+// Combo labels in enum order.
+static const char* const kRungOverrideLabels[] = {
+    "Auto", "Source only (no hold)", "Marker hold", "Native Present hold", "GPU wait"};
+static_assert(IM_ARRAYSIZE(kRungOverrideLabels) == static_cast<int>(PacingRungOverride::Count));
+
+static const char* PacingRouteLabel() {
+    const auto path = EnfDisp_GetActivePath();
+    if (path == EnforcementPath::NvAPIMarkers || path == EnforcementPath::PCLMarkers) return "Reflex markers";
+    if (path == EnforcementPath::PresentBased) return "Present-based";
+    return "waiting for a presenting swapchain";
+}
+
+// Developer diagnostics only: users always pace with Smoothing on.
+static void DrawSmoothingControl(bool* config_dirty) {
+    bool smoothing = g_config.smoothing == PacingSmoothing::On;
+    if (ImGui::Checkbox("Smoothing", &smoothing)) {
+        g_config.smoothing = smoothing ? PacingSmoothing::On : PacingSmoothing::Off;
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: smoothing -> %s", PacingSmoothing_Text(g_config.smoothing));
+        *config_dirty = true;
+    }
+    HelpTip("Developer. On (default) holds each frame's output to the cap cadence at the best available "
+        "output point (GPU wait, marker hold) and releases the game early enough for 95% of recent frames "
+        "plus 0.5 ms. Off holds nothing after the source wait.");
+}
+
+// Resolved pipeline (resolver publication) and the source stage's lead and grid.
+static void DrawPacingPipelineStatus() {
+    const PacingPipelineSnapshot pipeline = PacingPipeline_Read();
+    ImGui::TextDisabled("Route: %s", PacingRouteLabel());
+    ImGui::TextDisabled("Mode: %s | Output: %s | Reason: %s",
+        PacingTimingMode_Text(pipeline.mode), PacingRung_Text(pipeline.rung),
+        PacingFallbackReason_Text(pipeline.reason));
+    SchedulerPacingStatus status;
+    const bool has_status = Scheduler_ReadPacingStatus(&status);
+    // Overload guard: the hold stepped aside.
+    if (has_status && status.hold_overloaded)
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Hold off: overload (needs %.0f s without restarts)",
+            MISS_WINDOW_S);
+    // Developer A/B interleave (gpu_wait_interleave_s): the running block.
+    if (has_status && status.hold_interleave != 0)
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "A/B interleave: %s block (%.1f s left)",
+            status.hold_interleave == 1 ? "held" : "not-held", status.hold_interleave_remaining_s);
+    // Source placement (P4-8 to P4-11).
+    if (pipeline.placement == PacingSourcePlacement::PreSleep && has_status) {
+        if (status.pre_sleep_samples > 0)
+            ImGui::TextDisabled("Placement: pre-Sleep | margin %.2f ms | residual p50 %.2f / p99 %.2f ms",
+                status.pre_sleep_margin_us / 1000.0, status.pre_sleep_residual_p50_us / 1000.0,
+                status.pre_sleep_residual_p99_us / 1000.0);
+        else
+            ImGui::TextDisabled("Placement: pre-Sleep | margin %.2f ms (measuring)",
+                status.pre_sleep_margin_us / 1000.0);
+    } else if (pipeline.placement == PacingSourcePlacement::DriverLimiter) {
+        if (has_status && status.driver_limiter_interval_us > 0)
+            ImGui::TextDisabled("Placement: Reflex driver limiter (%.2f ms)",
+                status.driver_limiter_interval_us / 1000.0);
+        else
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Placement: Reflex driver limiter (not applied)");
+    } else {
+        ImGui::TextDisabled("Placement: %s", PacingSourcePlacement_Text(pipeline.placement));
+    }
+    // Render handoff limit (phase4_design.md section 23): frames not held
+    // with the Reflex Sleep bypassed.
+    if (has_status && status.render_handoff == 1)
+        ImGui::TextDisabled("Render handoff limit: +%.2f ms after the render thread takes the previous frame | %u frames delayed | %u stalls",
+            status.render_handoff_offset_us / 1000.0, status.render_handoff_limited, status.render_handoff_stalls);
+    else if (has_status && status.render_handoff == 2)
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
+            "Render handoff limit: off (the render thread may wait for the next release; waiting for evidence)");
+    if (has_status && status.valid)
+        ImGui::TextDisabled("Lead: %.2f ms (%s, %u samples%s) | Grid epoch: %u",
+            status.lead_us / 1000.0, status.lead_warm ? "warm" : "warming",
+            status.lead_samples, status.lead_budget_limited ? ", at budget" : "", status.grid_epoch);
+    else
+        ImGui::TextDisabled("Lead: - | Grid epoch: -");
+    const bool gpu_rung = pipeline.rung == PacingRung::GpuQueueWait || pipeline.rung == PacingRung::FgInputWait;
+    // GPU wait cap ladder (2026-10-04): shown on the GPU queue wait; orange
+    // below the budget; off at the open top (2026-10-09).
+    if (has_status && status.valid && pipeline.rung == PacingRung::GpuQueueWait) {
+        const char* checking = status.gpu_wait_cap_checking ? ", checking" : "";
+        if (status.gpu_wait_cap_open)
+            ImGui::TextDisabled("GPU wait cap off (next frame's GPU work waits behind the gate) | late resumes %u/%u",
+                status.gpu_wait_cap_late, status.gpu_wait_cap_samples);
+        else if (status.gpu_wait_cap_level > 0)
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "GPU wait cap %.0f us (level %u/%u%s) | late resumes %u/%u",
+                status.gpu_wait_cap_us, static_cast<unsigned>(status.gpu_wait_cap_level),
+                GPU_WAIT_CAP_LEVELS - 1u, checking, status.gpu_wait_cap_late, status.gpu_wait_cap_samples);
+        else
+            ImGui::TextDisabled("GPU wait cap %.0f us%s | late resumes %u/%u", status.gpu_wait_cap_us, checking,
+                status.gpu_wait_cap_late, status.gpu_wait_cap_samples);
+        // Collision-aware release: the learned headroom (to the next frame's
+        // heavy GPU work) or, without current Reflex GPU active times, the
+        // learned margin (to the next Present call); the newest limit and
+        // the share of leads it lowered (Output override Auto only).
+        if (pipeline.reason == PacingFallbackReason::Override) {
+            ImGui::TextDisabled("Release headroom %.2f ms, margin %.2f ms | guard off (output override)",
+                status.release_headroom_us / 1000.0, status.release_margin_us / 1000.0);
+        } else if (status.collision_behind_wait) {
+            ImGui::TextDisabled("Release headroom %.2f ms | guard off (next frame's GPU work waits behind the gate, %u pairs)",
+                status.release_headroom_us / 1000.0, status.queue_order_pairs);
+        } else if (status.collision_checked > 0 && status.collision_headroom) {
+            ImGui::TextDisabled("Release headroom %.2f ms | limit %.2f ms | guarded %.0f%% | late %u/%u",
+                status.release_headroom_us / 1000.0, status.collision_limit_us / 1000.0,
+                100.0 * status.collision_guarded / status.collision_checked,
+                status.release_headroom_late, status.release_headroom_samples);
+        } else if (status.collision_checked > 0) {
+            ImGui::TextDisabled("Release margin %.2f ms | limit %.2f ms | guarded %.0f%% | late %u/%u",
+                status.release_margin_us / 1000.0, status.collision_limit_us / 1000.0,
+                100.0 * status.collision_guarded / status.collision_checked,
+                status.release_margin_late, status.release_margin_samples);
+        } else {
+            ImGui::TextDisabled("Release margin %.2f ms | limit - (measuring) | late %u/%u",
+                status.release_margin_us / 1000.0, status.release_margin_late, status.release_margin_samples);
+        }
+    }
+    // P3-13: driver Sleep time while the GPU wait holds (measured, not acted on).
+    if (gpu_rung)
+        ImGui::TextDisabled("Driver Sleep: %.2f ms",
+            g_pacer_latency_us.load(std::memory_order_relaxed) / 1000.0);
+    HelpTip("Mode, output point and fallback reason resolved from Smoothing, the pacing route and the display. "
+        "Lead is how far ahead of each output target the game is released; 'at budget' means it is clamped "
+        "to three frame intervals. A grid epoch starts on a cap, LFC or FG divisor change, a fixed-refresh "
+        "Adaptive cap step, or after a late frame; the cadence never catches up. 'GPU wait cap' limits how "
+        "long a typical frame waits on the GPU before its target (lead <= median release-to-ready time + cap). "
+        "'Late resumes' counts GPU resumes more than 1 ms after the release among the last 64 that waited. "
+        "When more than 5% are late, the cap steps down (1.5, 1.25, 1.0, 0.75 ms by default); 'checking' "
+        "means a step down is judged 2-3 s later and undone if resumes are still late. After 30 s with at "
+        "most 1% late it steps back up. 'Release headroom' keeps the release at least this long before the "
+        "next frame's heavy GPU work starts (its GPU ready time minus its Reflex GPU active time): the GPU "
+        "does not interrupt that work for the frame being released, so the lead is limited to one interval "
+        "plus the game's short release-to-GPU-work time minus the headroom ('limit'); a frame that would need "
+        "more arrives a little late and is shown when ready. The headroom starts at 1 ms and is learned from "
+        "late resumes (0.75-3 ms). Without Reflex GPU times, 'Release margin' does the same against the next "
+        "frame's Present call instead (2.5 ms to start, 1-4 ms). 'guarded' is the share of leads the limit "
+        "lowered, 'late' the late resumes among those measured. 'Hold off' "
+        "means ReLimiter stopped holding frames on its own (reason 'infeasible'): under overload, when more "
+        "than 10% of frames restarted the cadence within 2 s and the Adaptive cap could not lengthen the "
+        "interval; holds resume after 2 s without restarts. "
+        "Output override is never changed. Placement pre-Sleep means most of the source wait happens before "
+        "the driver's Reflex Sleep "
+        "and the game is released exactly at SIMULATION_START; the margin covers the wait's late wake-up, the "
+        "driver Sleep and the game's work up to the marker.");
+}
+
+// Interval lengthening of the governed interval, in percent of I_0 (the
+// paced interval: whole refreshes in snapped fixed refresh).
+static double GovernorStretchPercent(const SchedulerPacingStatus& status) {
+    if (!(status.governor_base_interval_us > 0.0) || !(status.governor_interval_us > 0.0)) return 0.0;
+    return (status.governor_interval_us / status.governor_base_interval_us - 1.0) * 100.0;
+}
+
+// Plain-language pacing state for the main view; the technical lines are in
+// Details (DrawPacingPipelineStatus).
+static void DrawPacingSummaryLine(const PacingPipelineSnapshot& pipeline, bool has_status,
+    const SchedulerPacingStatus& status) {
+    const ImVec4 green(0.2f, 0.9f, 0.2f, 1.0f);
+    const ImVec4 gray(0.6f, 0.6f, 0.6f, 1.0f);
+    const ImVec4 amber(1.0f, 0.7f, 0.3f, 1.0f);
+    const bool holding = pipeline.rung != PacingRung::SourceOnly;
+    const bool gpu = pipeline.rung == PacingRung::GpuQueueWait || pipeline.rung == PacingRung::FgInputWait;
+    if (has_status && status.hold_overloaded) {
+        ImGui::TextColored(amber, g_config.adaptive_cap
+            ? "Paused: the game can't reach the cap right now (resumes on its own)"
+            : "Paused: the game can't reach the cap right now (Adaptive cap can help)");
+        return;
+    }
+    switch (pipeline.reason) {
+    case PacingFallbackReason::Passthrough:
+        ImGui::TextColored(gray, g_config.target_fps > 0 ? "Not pacing right now" : "No FPS cap set");
+        return;
+    case PacingFallbackReason::IdleCap:
+        ImGui::TextColored(gray, "Idle cap active (background, FG-Off Cap or OLED Care)");
+        return;
+    case PacingFallbackReason::PresentRoute:
+        ImGui::TextColored(gray, "Capped: smooth pacing needs NVIDIA Reflex in the game");
+        return;
+    case PacingFallbackReason::NoNativeRoute:
+    case PacingFallbackReason::NoGpuQueue:
+    case PacingFallbackReason::FgUnqualified:
+        if (!holding) {
+            ImGui::TextColored(amber, "Getting ready...");
+            return;
+        }
+        break;
+    default:
+        break;
+    }
+    if (holding && has_status && status.valid && !status.lead_warm)
+        ImGui::TextColored(amber, "Learning the game's frame timing...");
+    else if (gpu)
+        ImGui::TextColored(green, "Smooth: frames are held on the GPU to an even cadence");
+    else if (holding)
+        ImGui::TextColored(green, "Smooth: frames are held to an even cadence");
+    else
+        ImGui::TextColored(gray, "Capped (frames are not held)");
+}
+
+// Main view: the plain state, a warning while developer diagnostics differ
+// from the recommended defaults, and the technical lines under Details.
+static void DrawPacingSummary(bool* config_dirty) {
+    const PacingPipelineSnapshot pipeline = PacingPipeline_Read();
+    SchedulerPacingStatus status;
+    const bool has_status = Scheduler_ReadPacingStatus(&status);
+    DrawPacingSummaryLine(pipeline, has_status, status);
+    const int overrides = Config_DeveloperOverrides();
+    if (overrides > 0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "%d developer setting%s changed from the defaults",
+            overrides, overrides == 1 ? "" : "s");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Reset##developer")) {
+            Config_ResetDeveloperSettings();
+            *config_dirty = true;
+        }
+        HelpTip("Developer diagnostics (developer_settings=true in relimiter.ini) are set away from the "
+            "recommended defaults, which can make pacing worse. Reset returns all of them to the defaults.");
+    }
+    if (ImGui::TreeNode("Details##pacing")) {
+        DrawPacingPipelineStatus();
+        if (g_config.adaptive_cap && has_status && status.governor_enabled) {
+            const GovernorCause cause = static_cast<GovernorCause>(status.governor_last_cause);
+            ImGui::TextDisabled("Adaptive cap: interval +%.1f%% | %s | last: %s", GovernorStretchPercent(status),
+                GovernorPhase_Text(static_cast<GovernorPhase>(status.governor_phase)),
+                cause == GovernorCause::None ? "-" : GovernorCause_Text(cause));
+        }
+        ImGui::TreePop();
+    }
+}
+
+// Adaptive cap: the period governor (C2) stretches the cap interval (P4-1).
+static void DrawAdaptiveCapControl(bool* config_dirty) {
+    if (ImGui::Checkbox("Adaptive cap", &g_config.adaptive_cap)) {
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: adaptive cap -> %s", g_config.adaptive_cap ? "on" : "off");
+        *config_dirty = true;
+    }
+    SchedulerPacingStatus status;
+    if (g_config.adaptive_cap && Scheduler_ReadPacingStatus(&status) && status.governor_enabled) {
+        // The interval is (1 + p) times the cap's: the frame rate is p / (1 + p) below it.
+        const double percent = GovernorStretchPercent(status);
+        const double below = 100.0 * percent / (100.0 + percent);
+        ImGui::SameLine();
+        if (below < 0.5)
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(at the cap)");
+        else
+            ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.2f, 1.0f), "(%.0f%% below the cap)", below);
+    }
+    HelpTip("When the game can't keep up with your cap, lowers the frame rate a little (at most about "
+        "38% below it) so frames stay evenly spaced, and returns to the cap once the game can hold it "
+        "again. Off keeps the cap and lets heavy moments run unevenly.");
+    if (!g_config.adaptive_cap) return;
+    if (ImGui::Checkbox("Show on OSD##adaptive", &g_config.osd_show_adaptive_smoothing))
+        *config_dirty = true;
+    HelpTip("Show the Adaptive cap on the OSD.");
+}
+
+// Advanced: how much of the recent load the Adaptive cap plans for (R11).
+static void DrawAdaptiveCapTuning(bool* config_dirty) {
+    if (!g_config.adaptive_cap) return;
+    int percentile = g_config.adaptive_cap_percentile;
+    ImGui::SliderInt("Adaptive cap fit##adaptive", &percentile, kAdaptiveCapPercentileMin,
+        kAdaptiveCapPercentileMax, "%d%%", ImGuiSliderFlags_AlwaysClamp);
+    if (ImGui::IsItemEdited()) g_config.adaptive_cap_percentile = percentile;
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: adaptive cap percentile -> %d", g_config.adaptive_cap_percentile);
+        *config_dirty = true;
+    }
+    HelpTip("The share of recent frames the Adaptive cap plans for (default 75%). Higher keeps heavy "
+        "moments evenest at a lower frame rate; lower keeps more frame rate and lets the slowest frames "
+        "arrive a little late.");
+}
+
+// Advanced → Developer diagnostics (developer_settings=true in the INI):
+// Smoothing, rung override, GPU wait probes and budget, stall injector, the
+// Reflex Sleep bypass, marker forward order, render queue and source
+// placement. For A/B captures; each control can make pacing worse on purpose.
+static void DrawPacingDiagnostics(bool* config_dirty) {
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Developer diagnostics");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Reset to defaults##developer")) {
+        Config_ResetDeveloperSettings();
+        *config_dirty = true;
+    }
+    HelpTip("Shown because developer_settings=true in relimiter.ini. For comparison captures; each "
+        "control can make pacing worse on purpose. Reset returns all of them to the recommended defaults.");
+    DrawSmoothingControl(config_dirty);
+    int rung = static_cast<int>(g_config.output_rung);
+    if (ImGui::Combo("Output override", &rung, kRungOverrideLabels, IM_ARRAYSIZE(kRungOverrideLabels))) {
+        g_config.output_rung = static_cast<PacingRungOverride>(rung);
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: output rung override -> %s", PacingRungOverride_Text(g_config.output_rung));
+        *config_dirty = true;
+    }
+    HelpTip("Diagnostic. Auto uses the resolved output point. An override whose requirements are not met "
+        "falls back one step (GPU wait or native hold to marker hold, marker hold to source only) with "
+        "reason 'override'. Smoothing Off, idle caps and Present-based routes still take precedence.");
+#ifdef _WIN64
+    if (ImGui::Checkbox("GPU Wait Probes", &g_config.gpu_present_gate_probes)) {
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: GPU wait probes -> %s", g_config.gpu_present_gate_probes ? "on" : "off");
+        *config_dirty = true;
+    }
+    HelpTip("GPU wait output only: GPU timestamp queries immediately before and after the queue Wait. "
+        "The times are exported as gate_pre_wait_qpc and gate_post_wait_qpc in the pacing CSV, refine "
+        "the lead and measure the late GPU resumes that move the GPU wait cap. Off keeps the cap at the "
+        "budget and removes two command lists and two fence signals per frame from the game's queue.");
+    float budget = static_cast<float>(g_config.gpu_wait_budget_us);
+    ImGui::SliderFloat("GPU wait budget", &budget, static_cast<float>(kPacingGpuWaitBudgetMinUs),
+        static_cast<float>(kPacingGpuWaitBudgetMaxUs), "%.0f us", ImGuiSliderFlags_AlwaysClamp);
+    if (ImGui::IsItemEdited())
+        g_config.gpu_wait_budget_us = static_cast<double>(budget);
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: GPU wait budget -> %.0f us", g_config.gpu_wait_budget_us);
+        *config_dirty = true;
+    }
+    HelpTip("GPU wait output only: the highest GPU wait cap (default 1500 us). A typical frame waits on "
+        "the GPU at most the cap before its target (lead <= median release-to-ready time + cap); late GPU "
+        "resumes step the cap down to 5/6, 2/3 and 1/2 of this budget. Longer waits smooth more frames but "
+        "make late GPU resumes more likely; shorter ones leave more frames ready after their target.");
+    float interleave_s = static_cast<float>(g_config.gpu_wait_interleave_s);
+    ImGui::SliderFloat("GPU wait A/B blocks", &interleave_s, 0.0f,
+        static_cast<float>(kPacingGpuWaitInterleaveMaxS), interleave_s > 0.0f ? "%.1f s" : "Off",
+        ImGuiSliderFlags_AlwaysClamp);
+    if (ImGui::IsItemEdited())
+        g_config.gpu_wait_interleave_s = interleave_s < 0.5f ? 0.0
+            : (std::max)(static_cast<double>(interleave_s), kPacingGpuWaitInterleaveMinS);
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: GPU wait A/B blocks -> %.1f s (0 = off)", g_config.gpu_wait_interleave_s);
+        *config_dirty = true;
+    }
+    HelpTip("Diagnostic for A/B captures, Output override Auto only. The GPU queue wait alternates held "
+        "and not-held blocks of 0.75-1.25 x this length, so both outputs are measured at the same loads. "
+        "Pacing switches every block on purpose. Off for normal "
+        "play.");
+#endif
+
+    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Diagnostic only: the stall injector hitches the game on purpose.");
+    float stall_ms = static_cast<float>(g_config.stall_inject_ms);
+    ImGui::SliderFloat("Stall injector", &stall_ms, 0.0f, static_cast<float>(kPacingStallInjectMaxMs),
+        stall_ms > 0.0f ? "%.1f ms" : "Off", ImGuiSliderFlags_AlwaysClamp);
+    if (ImGui::IsItemEdited()) g_config.stall_inject_ms = static_cast<double>(stall_ms);
+    const bool stall_edited = ImGui::IsItemDeactivatedAfterEdit();
+    HelpTip("Diagnostic. Sleeps this long after the source wait once per period to test stall recovery "
+        "(stall_injected in the pacing CSV). 0 = off. Leave off for normal play.");
+    float period_s = static_cast<float>(g_config.stall_inject_period_s);
+    ImGui::SliderFloat("Stall period", &period_s, static_cast<float>(kPacingStallInjectMinPeriodS),
+        static_cast<float>(kPacingStallInjectMaxPeriodS), "%.0f s", ImGuiSliderFlags_AlwaysClamp);
+    if (ImGui::IsItemEdited()) g_config.stall_inject_period_s = static_cast<double>(period_s);
+    const bool period_edited = ImGui::IsItemDeactivatedAfterEdit();
+    if (stall_edited || period_edited) {
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: stall injector -> %.1f ms every %.0f s",
+                 g_config.stall_inject_ms, g_config.stall_inject_period_s);
+        *config_dirty = true;
+    }
+    SchedulerPacingStatus status;
+    if (g_config.stall_inject_ms > 0.0 && Scheduler_ReadPacingStatus(&status) && status.valid)
+        ImGui::TextDisabled("Stalls injected: %u", status.stalls_injected);
+
+#ifdef _WIN64
+    if (ImGui::Checkbox("Bypass Reflex Sleep", &g_config.reflex_sleep_bypass)) {
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: Reflex Sleep bypass -> %s (applies while ReLimiter paces a positive cap)",
+            g_config.reflex_sleep_bypass ? "on" : "off");
+        *config_dirty = true;
+    }
+    HelpTip("On (default) skips the driver's NvAPI Sleep while ReLimiter paces a cap, holding frames or "
+        "not; ReLimiter's pre-Sleep wait paces the game instead (CONTROL with FG 2x: 10x fewer long frames "
+        "at the same PC latency; Rogue Core unchanged). Frames that are not held wait until the game's "
+        "render thread has taken the previous frame (render handoff limit), so the game cannot run ahead. "
+        "Leaves markers and the game's SleepMode parameters unchanged. Off returns to the driver's Sleep. "
+        "With the cap off or in passthrough (Dynamic MFG) the Sleep always reaches the driver.");
+
+    static const char* const kMarkerForwardOrderLabels[] = {"Before wait", "After wait"};
+    static_assert(IM_ARRAYSIZE(kMarkerForwardOrderLabels) ==
+        static_cast<int>(PacingMarkerForwardOrder::Count));
+    int forward_order = static_cast<int>(g_config.marker_forward_order);
+    if (ImGui::Combo("Marker forward order", &forward_order, kMarkerForwardOrderLabels,
+            IM_ARRAYSIZE(kMarkerForwardOrderLabels))) {
+        g_config.marker_forward_order = static_cast<PacingMarkerForwardOrder>(forward_order);
+        Config_ApplyPacingPipeline();
+        LOG_WARN("OSD: NvAPI marker forward order -> %s",
+            PacingMarkerForwardOrder_Text(g_config.marker_forward_order));
+        *config_dirty = true;
+    }
+    HelpTip("Diagnostic, NvAPI marker games only. Before wait (default) passes SIMULATION_START to the "
+        "driver when the game sends it, then waits. After wait passes it after ReLimiter's source wait, "
+        "so the driver, Frame Generation and PC Latency see the paced frame start. Compare both in one session.");
+
+    static const char* const kRenderQueueLabels[] = {"Keep", "Remove", "Remove after held"};
+    static_assert(IM_ARRAYSIZE(kRenderQueueLabels) == static_cast<int>(PacingRenderQueue::Count));
+    int render_queue = static_cast<int>(g_config.gpu_queue_wait_render_queue);
+    if (ImGui::Combo("GPU queue wait render queue", &render_queue, kRenderQueueLabels,
+            IM_ARRAYSIZE(kRenderQueueLabels))) {
+        g_config.gpu_queue_wait_render_queue = static_cast<PacingRenderQueue>(render_queue);
+        Config_ApplyPacingPipeline();
+        LOG_WARN("OSD: GPU queue wait render queue -> %s",
+            PacingRenderQueue_Text(g_config.gpu_queue_wait_render_queue));
+        *config_dirty = true;
+    }
+    HelpTip("Diagnostic A/B, GPU queue wait only. Keep (default) learns the lead with the time a finished "
+        "frame waits for the game's render thread to leave the previous Present. Remove leaves that queue "
+        "out, as the FG input wait does, so the lead and latency can shrink; Remove after held does so only "
+        "after a frame whose GPU waited at ReLimiter's gate. Watch late GPU resumes, grid restarts and "
+        "PC Latency; one setting per capture.");
+
+    static const char* const kSourcePlacementLabels[] = {"Marker", "Pre-Sleep", "Reflex driver limiter"};
+    static_assert(IM_ARRAYSIZE(kSourcePlacementLabels) ==
+        static_cast<int>(PacingPlacementOverride::Count));
+    int placement = static_cast<int>(g_config.source_placement);
+    if (ImGui::Combo("Source placement", &placement, kSourcePlacementLabels,
+            IM_ARRAYSIZE(kSourcePlacementLabels))) {
+        g_config.source_placement = static_cast<PacingPlacementOverride>(placement);
+        Config_ApplyPacingPipeline();
+        LOG_WARN("OSD: source placement -> %s",
+            PacingPlacementOverride_Text(g_config.source_placement));
+        *config_dirty = true;
+    }
+    HelpTip("Reflex games. Pre-Sleep (default) waits before the driver's Reflex Sleep (where the game "
+        "has not read input yet) and releases the game exactly at SIMULATION_START; it uses Marker while "
+        "the game does not call the Reflex Sleep. Marker waits at SIMULATION_START. Reflex driver limiter "
+        "hands the frame cap to the driver's own limiter (NvAPI minimumIntervalUs, needs the Reflex Sleep "
+        "bypass off) and ReLimiter holds nothing. ReLimiter never changes this setting itself.");
+#endif
+    ImGui::Spacing();
+}
+
 static void DrawSettingsImpl() {
-    // Dirty flag — set by any config change, triggers SaveConfig at end of frame
+    // Dirty flag — enqueue an immutable save snapshot at end of frame.
     bool config_dirty = false;
 
     // Lazy install focus lock if enabled in config but not yet installed,
@@ -381,10 +815,20 @@ static void DrawSettingsImpl() {
             }
             ImGui::EndCombo();
         }
-        HelpTip("Game = use the game's VSync setting. Off = force VSync off (recommended with frame limiter). On = force VSync on.");
+        HelpTip("Game (default) keeps the game's own VSync setting. Off or On forces it.");
     }
 
     // ════════════════════════════════════════════
+    // Primary pacing controls belong with the FPS controls, before display/OSD customization.
+    ImGui::Separator();
+    DrawPacingSummary(&config_dirty);
+    if (dmfg_dynamic_active) ImGui::TextDisabled("Dynamic frame generation: pacing passthrough");
+    // The period governor runs on every route: missed frames everywhere,
+    // Reflex workload reports where NvAPI provides them (P3-7).
+    if (!dmfg_dynamic_active)
+        DrawAdaptiveCapControl(&config_dirty);
+    if (ImGui::Checkbox("Enable advanced settings", &g_config.advanced_settings)) config_dirty = true;
+
     // SECTION 2: OSD (collapsible)
     // ════════════════════════════════════════════
     ImGui::Separator();
@@ -471,6 +915,7 @@ static void DrawSettingsImpl() {
             p.show_pqi = true;
             p.show_pqi_breakdown = true;
             p.show_smoothness = true;
+            p.show_pacing_quality = true;
             p.show_fg = true;
             p.show_limiter = true;
             p.show_adaptive_smoothing = true;
@@ -623,7 +1068,7 @@ static void DrawSettingsImpl() {
                     p.show_cpu_latency = true; p.show_native_pcl = true; p.show_native_pcl_breakdown = true; p.show_gpu_render_time = true;
                     p.show_total_frame_cost = true; p.show_fg_time = true;
                     p.show_pqi = true; p.show_pqi_breakdown = true;
-                    p.show_smoothness = true; p.show_fg = true; p.show_limiter = true;
+                    p.show_smoothness = true; p.show_pacing_quality = true; p.show_fg = true; p.show_limiter = true;
                     p.show_adaptive_smoothing = true; p.show_gpu_temp = true;
                     p.show_gpu_clock = true; p.show_gpu_usage = true; p.show_vram = true;
                     p.show_cpu_usage = true; p.show_ram = true;
@@ -784,15 +1229,17 @@ static void DrawSettingsImpl() {
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Latency");
         if (ImGui::Checkbox("CPU Latency##osd_elem", &g_config.osd_show_cpu_latency)) config_dirty = true;
         HelpTip("CPU pipeline time: SIM_START to RENDERSUBMIT_END. Measures how long the CPU spends on simulation + render submission.");
-        FlowSeparator();
-        if (ImGui::Checkbox("PC Latency##osd_elem", &g_config.osd_show_native_pcl)) config_dirty = true;
-        HelpTip("Show native NVIDIA PC Latency from PCLStats ETW correlated to the displayed application frame. Enable collection under Advanced.");
-        if (g_config.osd_show_native_pcl) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("-");
-            ImGui::SameLine();
-            if (ImGui::Checkbox("Breakdown##native_pcl_osd_elem", &g_config.osd_show_native_pcl_breakdown)) config_dirty = true;
-            HelpTip("Show input-to-frame-start (I2FS), frame-start-to-present (FS2P), and present-to-display (P2D).");
+        if (g_config.native_pcl_enabled) {
+            FlowSeparator();
+            if (ImGui::Checkbox("PC Latency##osd_elem", &g_config.osd_show_native_pcl)) config_dirty = true;
+            HelpTip("Show native NVIDIA PC Latency correlated to the displayed application frame.");
+            if (g_config.osd_show_native_pcl) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("-");
+                ImGui::SameLine();
+                if (ImGui::Checkbox("Breakdown##native_pcl_osd_elem", &g_config.osd_show_native_pcl_breakdown)) config_dirty = true;
+                HelpTip("Show input-to-frame-start (I2FS), frame-start-to-present (FS2P), and present-to-display (P2D).");
+            }
         }
         FlowSeparator();
         if (ImGui::Checkbox("GPU Render##osd_elem", &g_config.osd_show_gpu_render_time)) config_dirty = true;
@@ -808,17 +1255,25 @@ static void DrawSettingsImpl() {
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "Quality");
         if (ImGui::Checkbox("PQI##osd_elem", &g_config.osd_show_pqi)) config_dirty = true;
-        HelpTip("Pacing Quality Index: a 0-100%% composite score. Green=great, yellow=ok, red=poor.");
+        HelpTip("Pacing Quality Index: a 0-100% score of the displayed frames over the display pacing window, "
+            "from ETW or DXGI display timing. Green=great, yellow=ok, red=poor; '-' until display timing "
+            "and an output target are available.");
         if (g_config.osd_show_pqi) {
             ImGui::SameLine();
             ImGui::TextDisabled("-");
             ImGui::SameLine();
             if (ImGui::Checkbox("Breakdown##osd_elem", &g_config.osd_show_pqi_breakdown)) config_dirty = true;
-            HelpTip("Show individual PQI sub-scores: cadence, stutter, and deadline.");
+            HelpTip("PQI sub-scores. Consistency (40%): p99 adjacent display jitter against half the output interval. "
+                "Stutter (30%): long and short displayed frames, 10% per 1% of intervals. Animation (30%): p99 "
+                "animation error against half the output interval; '-' without animation data, and PQI then "
+                "weights Consistency and Stutter only.");
         }
         FlowSeparator();
         if (ImGui::Checkbox("Smoothness##osd_elem", &g_config.osd_show_smoothness)) config_dirty = true;
-        HelpTip("Frame interval deviation from target in milliseconds. Lower = smoother. Green < 0.5ms, yellow < 1.5ms, red above. EMA-smoothed, skips loading screen outliers.");
+        HelpTip("Smoothed absolute difference between consecutive valid scheduler frame intervals. A steady rate is smooth even below the FPS cap. Lower means less frame-to-frame variation, not closer to the target. Resets on cadence gaps; real long frames are included. Not a displayed-frame measurement. Green < 0.5ms, yellow < 1.5ms, red above.");
+        FlowSeparator();
+        if (ImGui::Checkbox("Display Pacing##osd_elem", &g_config.osd_show_pacing_quality)) config_dirty = true;
+        HelpTip("Measured displayed-frame pacing as p50 / p99 over a 5 s window: display interval and target, adjacent jitter, deviation and long/short frames, animation error, release-to-display latency, GPU residence and CPU hold. Display times come from ETW (native PC Latency measurement) when it is collecting, otherwise from DXGI frame statistics; the label shows the source. Measures pacing without changing it.");
 
 #ifdef _WIN64
         ImGui::Spacing();
@@ -826,8 +1281,8 @@ static void DrawSettingsImpl() {
         if (ImGui::Checkbox("Frame Generation##osd_elem", &g_config.osd_show_fg)) config_dirty = true;
         HelpTip("Show FG mode and multiplier (DLSS FG, Dynamic MFG, Smooth Motion).");
         FlowSeparator();
-        if (ImGui::Checkbox("Limiter / Tier##osd_elem", &g_config.osd_show_limiter)) config_dirty = true;
-        HelpTip("Show how much time the limiter added and the current degradation tier (T0=full, T4=suspended).");
+        if (ImGui::Checkbox("Limiter##osd_elem", &g_config.osd_show_limiter)) config_dirty = true;
+        HelpTip("Show how much time the limiter added.");
 #endif
 
         {
@@ -1101,185 +1556,12 @@ static void DrawSettingsImpl() {
     }
 
     // ════════════════════════════════════════════
-    // SECTION: Frame-Time Adaptation (collapsible, DX12 only)
-    // ════════════════════════════════════════════
-    if (SwapMgr_GetActiveAPI() == ActiveAPI::DX12 && !dmfg_dynamic_active) {
-    ImGui::Separator();
-    if (ImGui::CollapsingHeader("Frame-Time Adaptation")) {
-        bool adaptive = g_config.adaptive_smoothing;
-        if (ImGui::Checkbox("Enable##adaptive", &adaptive)) {
-            g_config.adaptive_smoothing = adaptive;
-            g_frame_time_adaptation.SetConfig(
-                g_config.smoothing_window == "dual",
-                g_config.smoothing_percentile,
-                adaptive,
-                g_config.smoothing_release_speed);
-            AdaptiveDeadlineReserve_SetRuntimeConfig(
-                AdaptiveDeadlineReserve_ModeFromText(
-                    g_config.adaptive_deadline_reserve_mode.c_str()),
-                adaptive,
-                g_config.smoothing_bias_us);
-            config_dirty = true;
-        }
-        if (g_frame_time_adaptation.IsWarm() && g_config.adaptive_smoothing) {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(+%.1f us)",
-                               g_smoothing_offset_us.load(std::memory_order_relaxed));
-        }
-        HelpTip("Extends the target interval from unique Reflex workload "
-            "reports. It compares stage-local CPU and GPU durations, removes "
-            "ReLimiter sleep only from the stage containing the limiter, and "
-            "never adds overlapping pipeline stages.");
-
-        if (g_config.adaptive_smoothing) {
-            if (ImGui::Checkbox("Show on OSD##adaptive", &g_config.osd_show_adaptive_smoothing))
-                config_dirty = true;
-            HelpTip("Show the applied interval extension and selected completed-frame percentile.");
-
-            // Percentile slider
-            float pct = static_cast<float>(g_config.smoothing_percentile * 100.0);
-            if (ImGui::SliderFloat("Percentile##adaptive", &pct, 50.0f, 99.9f, "P%.1f")) {
-                g_config.smoothing_percentile = static_cast<double>(pct) / 100.0;
-            }
-            if (ImGui::IsItemDeactivatedAfterEdit()) {
-                g_frame_time_adaptation.SetConfig(
-                    g_config.smoothing_window == "dual",
-                    g_config.smoothing_percentile,
-                    g_config.adaptive_smoothing,
-                    g_config.smoothing_release_speed);
-                config_dirty = true;
-            }
-            HelpTip("Target percentile for the threshold. P99 = 99%% of frames fit within the interval. Lower = more headroom, higher = tighter.");
-
-            // Window mode combo
-            const char* win_labels[] = {"Medium (256)", "Dual (64+512)"};
-            int current_win = (g_config.smoothing_window == "dual") ? 1 : 0;
-            if (ImGui::BeginCombo("Window##adaptive", win_labels[current_win])) {
-                for (int i = 0; i < 2; i++) {
-                    bool selected = (current_win == i);
-                    if (ImGui::Selectable(win_labels[i], selected)) {
-                        g_config.smoothing_window = (i == 1) ? "dual" : "medium";
-                        g_frame_time_adaptation.SetConfig(
-                            i == 1,
-                            g_config.smoothing_percentile,
-                            g_config.adaptive_smoothing,
-                            g_config.smoothing_release_speed);
-                        config_dirty = true;
-                    }
-                }
-                ImGui::EndCombo();
-            }
-            HelpTip("Medium: single 256-frame window (~4s). Dual: short 64 + long 512 window, uses max of both P99s for robustness against scene changes.");
-
-            // Downward release-rate multiplier
-            float release_speed = static_cast<float>(
-                g_config.smoothing_release_speed);
-            if (ImGui::SliderFloat(
-                    "Release speed##adaptive",
-                    &release_speed,
-                    0.25f,
-                    4.0f,
-                    "%.2fx")) {
-                g_config.smoothing_release_speed =
-                    static_cast<double>(release_speed);
-                g_frame_time_adaptation.SetConfig(
-                    g_config.smoothing_window == "dual",
-                    g_config.smoothing_percentile,
-                    g_config.adaptive_smoothing,
-                    g_config.smoothing_release_speed);
-            }
-            if (ImGui::IsItemDeactivatedAfterEdit()) {
-                config_dirty = true;
-            }
-            HelpTip("Controls only downward release after 32 lower-target "
-                "confirmations. 1x preserves the current cap of 0.05%% of "
-                "the effective interval per accepted report; 4x permits up "
-                "to 0.20%%. Present and queue pressure still pause release. "
-                "Higher values recover FPS faster after sustained workload "
-                "drops, but can increase target movement or misses if load "
-                "returns.");
-
-            // Bias slider
-            float bias = static_cast<float>(g_config.smoothing_bias_us);
-            if (ImGui::SliderFloat("Bias##adaptive", &bias, 0.0f, 1000.0f, "%.0f us")) {
-                g_config.smoothing_bias_us = static_cast<double>(bias);
-                AdaptiveDeadlineReserve_SetRuntimeConfig(
-                    AdaptiveDeadlineReserve_ModeFromText(
-                        g_config.adaptive_deadline_reserve_mode.c_str()),
-                    g_config.adaptive_smoothing,
-                    g_config.smoothing_bias_us);
-            }
-            if (ImGui::IsItemDeactivatedAfterEdit()) {
-                config_dirty = true;
-            }
-            HelpTip("Constant offset added on top of the computed P99 smoothing. "
-                     "In Shadow mode this is the applied deadline reserve. In Active mode "
-                     "it is the fallback while the adaptive reserve warms after resets.");
-
-            const char* reserve_mode_labels[] = {
-                "Shadow",
-                "Active (Experimental)"
-            };
-            int reserve_mode =
-                g_config.adaptive_deadline_reserve_mode == "active" ? 1 : 0;
-            if (ImGui::BeginCombo(
-                    "Deadline reserve##adaptive",
-                    reserve_mode_labels[reserve_mode])) {
-                for (int index = 0; index < 2; ++index) {
-                    const bool selected = reserve_mode == index;
-                    if (ImGui::Selectable(
-                            reserve_mode_labels[index], selected)) {
-                        g_config.adaptive_deadline_reserve_mode =
-                            index == 1 ? "active" : "shadow";
-                        AdaptiveDeadlineReserve_SetRuntimeConfig(
-                            index == 1
-                            ? AdaptiveDeadlineReserveMode::Active
-                            : AdaptiveDeadlineReserveMode::Shadow,
-                            g_config.adaptive_smoothing,
-                            g_config.smoothing_bias_us);
-                        config_dirty = true;
-                    }
-                }
-                ImGui::EndCombo();
-            }
-                HelpTip("Shadow records the online-P99 diagnostic but applies Bias. "
-                    "After 32 exact samples, Active initializes a learned reserve floor. "
-                        "After 128 covered samples it probes 5 us lower and validates for "
-                        "64 samples. A failed probe restores the last safe floor; larger "
-                        "misses raise it. Bias remains the reset/warm-up fallback and "
-                        "Active is capped at 300 us.");
-
-            const AdaptiveDeadlineReserveDecision reserve_status =
-                AdaptiveDeadlineReserve_GetRuntimeStatus();
-            if (reserve_status.mode == AdaptiveDeadlineReserveMode::Active &&
-                reserve_status.authority ==
-                    AdaptiveDeadlineReserveAuthority::Adaptive) {
-                ImGui::TextDisabled(
-                    "Applied %.0f us, diagnostic %.0f us%s",
-                    reserve_status.applied_reserve_us,
-                    reserve_status.proposed_reserve_us,
-                    reserve_status.active_capped ? " (capped)" : "");
-            }
-            else {
-                ImGui::TextDisabled(
-                    "%s: %.0f us, proposal %.0f us, %u/32 samples",
-                    AdaptiveDeadlineReserve_FallbackReasonText(
-                        reserve_status.fallback_reason),
-                    reserve_status.applied_reserve_us,
-                    reserve_status.proposed_reserve_us,
-                    (std::min)(reserve_status.sample_count, 32u));
-            }
-        }
-    }
-    } // DX12 only (Frame-Time Adaptation)
-
-    // ════════════════════════════════════════════
     // SECTION: Frame Generation (collapsible, DX12 only)
     // ════════════════════════════════════════════
     // SECTION 4: Advanced (collapsible)
     // ════════════════════════════════════════════
     ImGui::Separator();
-    if (ImGui::CollapsingHeader("Advanced")) {
+    if (g_config.advanced_settings && ImGui::CollapsingHeader("Advanced")) {
 #ifdef _WIN64
         // Reflex Injection toggle
         bool inject = g_config.reflex_inject;
@@ -1301,69 +1583,7 @@ static void DrawSettingsImpl() {
             ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Waiting for device)");
         }
 
-        // Experimental arrival-lead predictor. Disabled by default and
-        // restricted by the scheduler to native DX12 NvAPI marker paths.
-        ImGui::Spacing();
-        const char* estimator_mode_labels[] = {"Off", "Shadow", "Active"};
-        int estimator_mode = 0;
-        if (g_config.estimator_a_mode == "shadow") estimator_mode = 1;
-        else if (g_config.estimator_a_mode == "active") estimator_mode = 2;
-        if (ImGui::BeginCombo(
-                "Estimator A (Experimental)",
-                estimator_mode_labels[estimator_mode])) {
-            for (int index = 0; index < 3; ++index) {
-                const bool selected = estimator_mode == index;
-                if (ImGui::Selectable(estimator_mode_labels[index], selected)) {
-                    estimator_mode = index;
-                    g_config.estimator_a_mode =
-                        index == 2 ? "active" : (index == 1 ? "shadow" : "off");
-                    ArrivalLead_SetRuntimeConfig(
-                        ArrivalLead_ModeFromText(g_config.estimator_a_mode.c_str()),
-                        g_config.estimator_a_fixed_reserve_us);
-                    config_dirty = true;
-                }
-            }
-            ImGui::EndCombo();
-        }
-        HelpTip("Predicts release-to-PRESENT_START lead with exact source-frame keys. "
-                "Shadow records counterfactual targets without changing pacing. "
-                "Active is an experimental opt-in with immediate legacy fallback.");
-
-        if (estimator_mode != 0) {
-            float reserve_us = static_cast<float>(
-                g_config.estimator_a_fixed_reserve_us);
-            if (ImGui::SliderFloat(
-                    "Fixed reserve##estimator_a",
-                    &reserve_us,
-                    0.0f,
-                    5000.0f,
-                    "%.0f us")) {
-                g_config.estimator_a_fixed_reserve_us = reserve_us;
-                ArrivalLead_SetRuntimeConfig(
-                    ArrivalLead_ModeFromText(g_config.estimator_a_mode.c_str()),
-                    g_config.estimator_a_fixed_reserve_us);
-            }
-            if (ImGui::IsItemDeactivatedAfterEdit()) config_dirty = true;
-            HelpTip("One-sided protection added to predicted arrival lead. "
-                    "The 1800 us default is the rounded p99 causal error from "
-                    "the validated Rogue Core no-FG capture. No-FG and FG use "
-                    "separate estimator buckets.");
-
-            const ArrivalLeadDecision estimator_status =
-                ArrivalLead_GetRuntimeStatus();
-            ImGui::TextDisabled(
-                "Status: %s / %s / %s, %u samples, %u stable",
-                estimator_status.active
-                    ? "active"
-                    : (estimator_status.authority_ready ? "shadow-ready" :
-                       ArrivalLead_FallbackReasonText(
-                           estimator_status.fallback_reason)),
-                ArrivalLead_RegimeText(estimator_status.regime),
-                ArrivalLead_MarkerText(estimator_status.marker),
-                estimator_status.sample_count,
-                estimator_status.stable_frame_count);
-        }
-
+    #ifdef RELIMITER_DEVELOPER_SETTINGS
         // Native NVIDIA PC Latency collection
         ImGui::Spacing();
         bool native_pcl_enabled = g_config.native_pcl_enabled;
@@ -1391,7 +1611,9 @@ static void DrawSettingsImpl() {
             "(%s)",
             NativePcl_StatusText(native_pcl_snapshot.status));
         HelpTip("Collect true NVIDIA PC Latency from PCLStats ETW and correlate it with the displayed application frame. "
-                "Requires a game that emits NVIDIA PCL markers; ETW starts lazily after the next present.");
+            "Requires a game that emits NVIDIA PCL markers; ETW starts lazily after the next present. "
+            "Results arrive in delayed batches. Stale means no new latency sample was collected for two seconds, not two seconds since its display event.");
+    #endif
 
         // Flip Model Override toggle (DX11 only)
         ImGui::Spacing();
@@ -1419,10 +1641,15 @@ static void DrawSettingsImpl() {
                 ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(Restart required)");
         }
 
-        // Telemetry Logging toggle
         ImGui::Spacing();
 #endif // _WIN64
 
+        // Adaptive cap tuning (only while it is on), then the developer
+        // diagnostics, shown only with developer_settings=true in the INI.
+        DrawAdaptiveCapTuning(&config_dirty);
+        if (g_config.developer_settings) DrawPacingDiagnostics(&config_dirty);
+
+        // Telemetry Logging toggle
         bool csv = g_config.csv_enabled;
         if (ImGui::Checkbox("Telemetry Logging", &csv)) {
             g_config.csv_enabled = csv;
@@ -1594,7 +1821,7 @@ static void DrawSettingsImpl() {
 
 #ifdef _WIN64
         // FG pacing status
-        int fg_div_raw = ComputeFGDivisorRaw();
+        const int fg_div_raw = g_resolved_fg_divisor.load(std::memory_order_relaxed);
         if (IsDmfgActive()) {
             ImGui::Text("FG Pacing: Dynamic (passthrough)");
         } else if (fg_div_raw > 1) {
@@ -1613,24 +1840,10 @@ static void DrawSettingsImpl() {
 
         ImVec4 col_ok = ImVec4(0.2f, 0.9f, 0.2f, 1.0f);
         ImVec4 col_bad = ImVec4(0.9f, 0.2f, 0.2f, 1.0f);
-        ImVec4 col_na  = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
 
         ImGui::Text("Pipeline:");
         ImGui::SameLine();
         ImGui::TextColored(sim_ok ? col_ok : col_bad, "SIM %s", sim_ok ? "ok" : "X");
-        ImGui::SameLine();
-        ImGui::Text("|");
-        ImGui::SameLine();
-#ifdef _WIN64
-        if (IsDmfgActive())
-            ImGui::TextColored(col_na, "RENDER n/a");
-        else {
-            bool render_ok = IsCorrelatorValid() && IsDXGIStatsFresh();
-            ImGui::TextColored(render_ok ? col_ok : col_bad, "RENDER %s", render_ok ? "ok" : "X");
-        }
-#else
-        ImGui::TextColored(col_na, "RENDER n/a");
-#endif
         ImGui::SameLine();
         ImGui::Text("|");
         ImGui::SameLine();
@@ -1743,9 +1956,9 @@ static void DrawSettingsImpl() {
         }
     }
 
-    // Save immediately when any setting was changed this frame
+    // Snapshot changed settings now; persistence runs on the save worker.
     if (config_dirty)
-        SaveConfig();
+        RequestSaveConfig();
 }
 
 void DrawSettings(reshade::api::effect_runtime*) {
@@ -1765,10 +1978,23 @@ static double s_low_history[LOW_HISTORY_SIZE] = {};
 static int    s_low_history_idx = 0;
 static int    s_low_history_count = 0;
 
-// Cached results — recomputed every 30 frames instead of every frame
+// Cached results — recomputed every 30 accepted scheduler samples.
 static double s_cached_1pct_low = 0.0;
 static double s_cached_01pct_low = 0.0;
 static int    s_low_recompute_counter = 0;
+
+static void ResetCadenceHistory() {
+    s_real_fps = 0.0;
+    s_ft_history_idx = 0;
+    s_ft_history_count = 0;
+    s_graph_scale_min = 0.0f;
+    s_graph_scale_max = 33.0f;
+    s_low_history_idx = 0;
+    s_low_history_count = 0;
+    s_cached_1pct_low = 0.0;
+    s_cached_01pct_low = 0.0;
+    s_low_recompute_counter = 0;
+}
 
 static void RecomputeLowFPS() {
     int n = s_low_history_count < LOW_HISTORY_SIZE ? s_low_history_count : LOW_HISTORY_SIZE;
@@ -1805,27 +2031,19 @@ static void RecomputeLowFPS() {
 // ── Category colors ──
 static ImVec4 ColPerf()     { float b = g_config.osd_text_brightness; return ImVec4(0.4f*b, 0.9f*b, 0.9f*b, 1.0f); }
 static ImVec4 ColLatency()  { float b = g_config.osd_text_brightness; return ImVec4(1.0f*b, 0.7f*b, 0.3f*b, 1.0f); }
+#ifdef _WIN64 // the Pipeline section is x64-only
 static ImVec4 ColPipeline() { float b = g_config.osd_text_brightness; return ImVec4(0.6f*b, 0.8f*b, 1.0f*b, 1.0f); }
+#endif
 static ImVec4 ColSystem()   { float b = g_config.osd_text_brightness; return ImVec4(0.7f*b, 0.7f*b, 0.7f*b, 1.0f); }
 static ImVec4 ColDLSS()     { float b = g_config.osd_text_brightness; return ImVec4(0.5f*b, 1.0f*b, 0.5f*b, 1.0f); }
 static ImVec4 ColStatus()   { float b = g_config.osd_text_brightness; return ImVec4(1.0f*b, 0.3f*b, 0.3f*b, 1.0f); }
+static ImVec4 ColWarning()  { float b = g_config.osd_text_brightness; return ImVec4(0.9f*b, 0.7f*b, 0.2f*b, 1.0f); }
 
 static ImVec4 PQIColor(double score) {
     float b = g_config.osd_text_brightness;
     if (score >= 0.9) return ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f);
     if (score >= 0.7) return ImVec4(0.9f*b, 0.9f*b, 0.2f*b, 1.0f);
     return ImVec4(0.9f*b, 0.2f*b, 0.2f*b, 1.0f);
-}
-
-static void OSDText(const char* text) {
-    float b = g_config.osd_text_brightness;
-    if (g_config.osd_drop_shadow) {
-        ImVec2 pos = ImGui::GetCursorScreenPos();
-        float offset = (std::max)(1.0f, g_config.osd_scale);
-        ImU32 shadow = ImGui::ColorConvertFloat4ToU32(ImVec4(0, 0, 0, 0.8f));
-        ImGui::GetWindowDrawList()->AddText(ImVec2(pos.x + offset, pos.y + offset), shadow, text);
-    }
-    ImGui::TextColored(ImVec4(b, b, b, 1.0f), "%s", text);
 }
 
 static void OSDTextColored(ImVec4 col, const char* text) {
@@ -1836,6 +2054,161 @@ static void OSDTextColored(ImVec4 col, const char* text) {
         ImGui::GetWindowDrawList()->AddText(ImVec2(pos.x + offset, pos.y + offset), shadow, text);
     }
     ImGui::TextColored(col, "%s", text);
+}
+
+// ── Display Pacing (pacing telemetry snapshot) ──
+
+static const char* DisplaySourceLabel(PacingDisplaySource source) {
+    if (source == PacingDisplaySource::Etw) return "ETW";
+    if (source == PacingDisplaySource::Dxgi) return "DXGI";
+    return "none";
+}
+
+// Single unavailable-state line; snapshot is null without a fresh publication.
+static void DrawDisplayPacingUnavailable(const PacingTelemetrySnapshot* snapshot) {
+    const float brightness = g_config.osd_text_brightness;
+    const PacingDisplaySource source = snapshot ? snapshot->display_source : PacingDisplaySource::None;
+    const bool loss_window = snapshot && snapshot->loss_window;
+    const ImVec4 color = loss_window ? ColWarning()
+        : ImVec4(0.6f * brightness, 0.6f * brightness, 0.6f * brightness, 1.0f);
+    char buf[128];
+    if (source == PacingDisplaySource::None) {
+        // DXGI frame statistics stand in for ETW, so a failed ETW collector is
+        // reported as context, not as the reason display timing is missing.
+        const NativePclStatus status = NativePcl_GetSnapshot().status;
+        if (g_resolved_fg_divisor.load(std::memory_order_relaxed) > 1)
+            // DXGI statistics cannot time generated frames (pacing_telemetry.cpp).
+            snprintf(buf, sizeof(buf), "Display Pacing: needs PC latency collection with frame generation (ETW: %s)",
+                     NativePcl_StatusText(status));
+        else if (status == NativePclStatus::EtwAccessDenied || status == NativePclStatus::StartFailed)
+            snprintf(buf, sizeof(buf), "Display Pacing: waiting for DXGI display timing (ETW: %s)",
+                     NativePcl_StatusText(status));
+        else
+            snprintf(buf, sizeof(buf), "Display Pacing: waiting for display timing");
+        OSDTextColored(color, buf);
+        return;
+    }
+    snprintf(buf, sizeof(buf), "Display Pacing (%s): waiting for display timing%s",
+             DisplaySourceLabel(source), loss_window ? ", event loss" : "");
+    OSDTextColored(color, buf);
+}
+
+// The worker republishes every 250 ms. A read that fails on writer contention
+// reuses the previous publication instead of flickering and resizing the OSD;
+// a stalled or restarted worker must not leave old values on screen.
+static constexpr double PACING_SNAPSHOT_MAX_AGE_US = 1000000.0;
+
+// One snapshot read per OSD frame; no allocation, locks, I/O or logging.
+// Returns the latest publication, or null when none is fresh.
+static const PacingTelemetrySnapshot* ReadFreshPacingSnapshot() {
+    static PacingTelemetrySnapshot s_snapshot{};
+    static bool s_snapshot_read = false;
+    PacingTelemetrySnapshot latest;
+    if (PacingTelemetry_ReadSnapshot(&latest)) {
+        s_snapshot = latest;
+        s_snapshot_read = true;
+    }
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    const bool fresh = s_snapshot_read &&
+        qpc_to_us(now.QuadPart - s_snapshot.publication_qpc) <= PACING_SNAPSHOT_MAX_AGE_US;
+    return fresh ? &s_snapshot : nullptr;
+}
+
+// Display-metric PQI (phase2_timing_core_design.md section 6); '-' when invalid.
+static void DrawPQI(const PacingTelemetrySnapshot* snapshot, bool breakdown) {
+    const PQIDisplayScores scores = snapshot ? PQI_FromSnapshot(*snapshot) : PQIDisplayScores{};
+    const float b = g_config.osd_text_brightness;
+    const ImVec4 unavailable(0.6f * b, 0.6f * b, 0.6f * b, 1.0f);
+    char buf[48];
+    if (scores.valid) {
+        snprintf(buf, sizeof(buf), "PQI (%s): %.0f%%", DisplaySourceLabel(snapshot->display_source), scores.pqi);
+        OSDTextColored(PQIColor(scores.pqi / 100.0), buf);
+    } else {
+        OSDTextColored(unavailable, "PQI: -");
+    }
+    if (!breakdown) return;
+    if (!scores.valid) {
+        OSDTextColored(unavailable, " Consistency: -");
+        OSDTextColored(unavailable, " Stutter: -");
+        OSDTextColored(unavailable, " Animation: -");
+        return;
+    }
+    snprintf(buf, sizeof(buf), " Consistency: %.0f%%", scores.consistency * 100.0);
+    OSDTextColored(PQIColor(scores.consistency), buf);
+    snprintf(buf, sizeof(buf), " Stutter: %.0f%%", scores.stutter * 100.0);
+    OSDTextColored(PQIColor(scores.stutter), buf);
+    if (scores.animation_valid) {
+        snprintf(buf, sizeof(buf), " Animation: %.0f%%", scores.animation * 100.0);
+        OSDTextColored(PQIColor(scores.animation), buf);
+    } else {
+        OSDTextColored(unavailable, " Animation: -");
+    }
+}
+
+// Measured displayed-frame pacing, p50 / p99 over the telemetry window.
+static void DrawDisplayPacing(const PacingTelemetrySnapshot* snapshot) {
+    if (!snapshot || !snapshot->display_valid) {
+        DrawDisplayPacingUnavailable(snapshot);
+        return;
+    }
+
+    const PacingTelemetrySnapshot& pacing = *snapshot;
+    const ImVec4 color = ColPerf();
+    char buf[96];
+    snprintf(buf, sizeof(buf), "Display Pacing (%s): p50 / p99 over %u s",
+             DisplaySourceLabel(pacing.display_source),
+             pacing.window_ms / 1000u);
+    OSDTextColored(color, buf);
+    if (pacing.loss_window)
+        OSDTextColored(ColWarning(), " ETW event loss: some intervals excluded");
+
+    // Deviation and long/short frames exist only against a known target.
+    const bool target_known = pacing.target_output_interval_us > 0.0;
+    if (target_known) {
+        snprintf(buf, sizeof(buf), " Interval: %.2f / %.2f ms (target %.2f ms)",
+                 pacing.display_interval_p50_us / 1000.0, pacing.display_interval_p99_us / 1000.0,
+                 pacing.target_output_interval_us / 1000.0);
+    } else {
+        snprintf(buf, sizeof(buf), " Interval: %.2f / %.2f ms (target N/A)",
+                 pacing.display_interval_p50_us / 1000.0, pacing.display_interval_p99_us / 1000.0);
+    }
+    OSDTextColored(color, buf);
+
+    snprintf(buf, sizeof(buf), " Jitter: %.0f / %.0f us",
+             pacing.adjacent_jitter_p50_us, pacing.adjacent_jitter_p99_us);
+    OSDTextColored(color, buf);
+
+    if (target_known) {
+        snprintf(buf, sizeof(buf), " Deviation p99: %.0f us, Long / Short: %u / %u",
+                 pacing.abs_deviation_p99_us, pacing.long_frames, pacing.short_frames);
+        OSDTextColored(color, buf);
+    }
+    if (pacing.animation_valid) {
+        snprintf(buf, sizeof(buf), " Animation Error: %.0f / %.0f us",
+                 pacing.animation_error_p50_us, pacing.animation_error_p99_us);
+        OSDTextColored(color, buf);
+    }
+    if (pacing.latency_valid) {
+        snprintf(buf, sizeof(buf), " Release to Display: %.1f / %.1f ms",
+                 pacing.latency_p50_us / 1000.0, pacing.latency_p99_us / 1000.0);
+        OSDTextColored(color, buf);
+    }
+    if (pacing.residence_valid) {
+        snprintf(buf, sizeof(buf), " GPU Residence: %.2f / %.2f ms",
+                 pacing.residence_p50_us / 1000.0, pacing.residence_p99_us / 1000.0);
+        OSDTextColored(color, buf);
+    }
+    if (pacing.cpu_hold_valid) {
+        snprintf(buf, sizeof(buf), " CPU Hold: %.2f / %.2f ms",
+                 pacing.cpu_hold_p50_us / 1000.0, pacing.cpu_hold_p99_us / 1000.0);
+        OSDTextColored(color, buf);
+    }
+    if (pacing.dropped_records != 0) {
+        snprintf(buf, sizeof(buf), " Dropped Records: %llu",
+                 static_cast<unsigned long long>(pacing.dropped_records));
+        OSDTextColored(color, buf);
+    }
 }
 
 // ── Parse keybind string into VK code + modifier flags ──
@@ -2066,7 +2439,7 @@ static void DrawOSDImpl() {
                 p.show_cpu_latency = true; p.show_native_pcl = true; p.show_native_pcl_breakdown = true; p.show_gpu_render_time = true;
                 p.show_total_frame_cost = true; p.show_fg_time = true;
                 p.show_pqi = true; p.show_pqi_breakdown = true;
-                p.show_smoothness = true; p.show_fg = true; p.show_limiter = true;
+                p.show_smoothness = true; p.show_pacing_quality = true; p.show_fg = true; p.show_limiter = true;
                 p.show_adaptive_smoothing = true; p.show_gpu_temp = true;
                 p.show_gpu_clock = true; p.show_gpu_usage = true; p.show_vram = true;
                 p.show_cpu_usage = true; p.show_ram = true;
@@ -2082,7 +2455,7 @@ static void DrawOSDImpl() {
                         OSDPreset_ApplyToConfig(slot);
                 }
             }
-            SaveConfig();
+            RequestSaveConfig();
         };
 
         if (total_presets > 0) {
@@ -2111,6 +2484,28 @@ static void DrawOSDImpl() {
     if (PollHotkey(g_config.oled_care_key, &s_oled_care_hotkey, suppress_hotkeys))
         OLEDCare_Toggle();
 
+    // Read even while hidden, consuming tokens without training histories so
+    // reopening cannot replay a cached pre-toggle sample.
+    SchedulerActualFrameSample scheduler_sample;
+    const bool coherent_sample = Scheduler_ReadActualFrameSample(&scheduler_sample);
+    const osd_cadence_policy::Sample sample{
+        scheduler_sample.sequence, scheduler_sample.frame_time_us, scheduler_sample.valid};
+    const ULONGLONG cadence_now = GetTickCount64();
+    const auto cadence = s_cadence_consumer.Observe(
+        coherent_sample ? &sample : nullptr, cadence_now, g_config.osd_enabled);
+    if (cadence.reset_history)
+        ResetCadenceHistory();
+
+    // Invalidation bypasses the display throttle, including lifecycle changes
+    // which leave the scheduler's publication sequence unchanged.
+    static double s_display_fps = 0.0;
+    static double s_display_output_fps = 0.0;
+    static ULONGLONG s_fps_display_tick = 0;
+    if (cadence.reset_history || cadence.frame_time_us <= 0.0) {
+        s_real_fps = 0.0;
+        s_display_fps = 0.0;
+        s_display_output_fps = 0.0;
+    }
     if (!g_config.osd_enabled) return;
 
     // Update hardware sensors (throttled internally to ~1Hz)
@@ -2129,9 +2524,10 @@ static void DrawOSDImpl() {
     }
 
     // Real FPS from enforcement-to-enforcement interval (CPU frames only)
-    // EMA-smoothed so the OSD number is readable instead of flickering.
-    double ft = g_actual_frame_time_us.load(std::memory_order_relaxed);
-    if (ft > 0.0) {
+    // EMA advances only once per new valid coherent scheduler observation.
+    const double ft = cadence.frame_time_us;
+    const double ft_ms = ft / 1000.0;
+    if (cadence.new_sample) {
         double instant_fps = 1000000.0 / ft;
         if (s_real_fps > 0.0)
             s_real_fps += 0.02 * (instant_fps - s_real_fps);
@@ -2140,18 +2536,10 @@ static void DrawOSDImpl() {
     }
 
     // Throttle FPS display update to 2x per second for readability
-    static double s_display_fps = 0.0;
-    static double s_display_render_fps = 0.0;
-    static double s_display_output_fps = 0.0;
-    static ULONGLONG s_fps_display_tick = 0;
-    {
-        ULONGLONG now = GetTickCount64();
-        if (now - s_fps_display_tick >= 500) {
-            s_fps_display_tick = now;
-            s_display_fps = s_real_fps;
-            s_display_render_fps = s_real_fps;
-            s_display_output_fps = g_output_fps.load(std::memory_order_relaxed);
-        }
+    if (ft > 0.0 && (s_display_fps == 0.0 || cadence_now - s_fps_display_tick >= 500)) {
+        s_fps_display_tick = cadence_now;
+        s_display_fps = s_real_fps;
+        s_display_output_fps = g_output_fps.load(std::memory_order_relaxed);
     }
 
     const char* fg_label = "off";
@@ -2165,6 +2553,33 @@ static void DrawOSDImpl() {
     bool fg_display_active = fg_presenting && fg_mult > 0;
     if (Streamline_HasModeData() && fg_mode == 0)
         fg_display_active = false;
+    // Histories are independent of ImGui window visibility/collapse and never
+    // train on overlay repeats, invalid zeros, or publication overlap.
+    if (cadence.new_sample) {
+        s_ft_history[s_ft_history_idx] = static_cast<float>(ft_ms);
+        s_ft_history_idx = (s_ft_history_idx + 1) % FT_HISTORY_SIZE;
+        if (s_ft_history_count < FT_HISTORY_SIZE) s_ft_history_count++;
+
+        double display_ft = ft;
+        if (IsNvSmoothMotionActive())
+            display_ft = ft / 2.0;  // SM always 2x
+        else if (fg_presenting && fg_mult > 0) {
+            // Preserve the existing low-FPS divisor/label semantics.
+            const int divisor = g_resolved_fg_divisor.load(std::memory_order_relaxed);
+            if (divisor >= 2)
+                display_ft = ft / static_cast<double>(divisor);
+            else
+                display_ft = ft / static_cast<double>(fg_mult + 1);
+        }
+        s_low_history[s_low_history_idx] = display_ft;
+        s_low_history_idx = (s_low_history_idx + 1) % LOW_HISTORY_SIZE;
+        if (s_low_history_count < LOW_HISTORY_SIZE) s_low_history_count++;
+        if (++s_low_recompute_counter >= 30) {
+            s_low_recompute_counter = 0;
+            RecomputeLowFPS();
+        }
+    }
+
     // Driver-authoritative FG confirmation: if the Reflex ring is reporting GPU data
     // but aiFrameTimeUs is 0, FG isn't actually producing interpolated frames.
     // Prevents false positives where compat poll reports FG active but it's off in-game.
@@ -2191,15 +2606,6 @@ static void DrawOSDImpl() {
         fg_label = fg_buf;
     }
 
-    int tier = static_cast<int>(
-        g_current_tier.load(std::memory_order_acquire));
-
-    // Limiter-added latency: only the gate hold adds to input-to-photon latency.
-    // own_sleep happens at SIMULATION_START (before input sampling with Reflex),
-    // so it's frame pacing, not added latency. gate_sleep holds the present
-    // after rendering, which genuinely delays display.
-    double limiter_added_ms = g_last_gate_sleep_us.load(std::memory_order_relaxed) / 1000.0;
-
     // Compute pixel position from screen percentage
     ImVec2 display = ImGui::GetIO().DisplaySize;
     float px_x = g_config.osd_x * display.x;
@@ -2216,37 +2622,10 @@ static void DrawOSDImpl() {
         float scale = g_config.osd_scale;
         ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * scale);
 
-        // Always update frame time history for graph and 1% low
-        double ft_ms = ft / 1000.0;
-        s_ft_history[s_ft_history_idx] = static_cast<float>(ft_ms);
-        s_ft_history_idx = (s_ft_history_idx + 1) % FT_HISTORY_SIZE;
-        if (ft > 0.0) {
-            double display_ft = ft;
-            if (IsNvSmoothMotionActive())
-                display_ft = ft / 2.0;  // SM always 2x
-            else if (fg_presenting && fg_mult > 0) {
-                // Use the real divisor (accounts for DRS MFG override)
-                int divisor = ComputeFGDivisorRaw();
-                if (divisor >= 2)
-                    display_ft = ft / static_cast<double>(divisor);
-                else
-                    display_ft = ft / static_cast<double>(fg_mult + 1);
-            }
-            s_low_history[s_low_history_idx] = display_ft;
-            s_low_history_idx = (s_low_history_idx + 1) % LOW_HISTORY_SIZE;
-            if (s_low_history_count < LOW_HISTORY_SIZE) s_low_history_count++;
-        }
-
-        // Recompute 1%/0.1% low every 30 frames (~5Hz) instead of every frame
-        if (++s_low_recompute_counter >= 30) {
-            s_low_recompute_counter = 0;
-            RecomputeLowFPS();
-        }
-
         // ═══════════════════════════════════
         // PERFORMANCE (cyan)
         // ═══════════════════════════════════
-        if (g_config.osd_show_fps) {
+        if (g_config.osd_show_fps && ft > 0.0) {
             double output = s_display_output_fps;
             char buf[64];
             if (IsNvSmoothMotionActive()) {
@@ -2260,7 +2639,7 @@ static void DrawOSDImpl() {
             OSDTextColored(ColPerf(), buf);
         }
 
-        if (g_config.osd_show_1pct_low) {
+        if (g_config.osd_show_1pct_low && ft > 0.0) {
             if (s_cached_1pct_low > 0.0) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "1%% Low: %.0f", s_cached_1pct_low);
@@ -2268,7 +2647,7 @@ static void DrawOSDImpl() {
             }
         }
 
-        if (g_config.osd_show_0_1pct_low) {
+        if (g_config.osd_show_0_1pct_low && ft > 0.0) {
             if (s_cached_01pct_low > 0.0) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "0.1%% Low: %.0f", s_cached_01pct_low);
@@ -2276,7 +2655,7 @@ static void DrawOSDImpl() {
             }
         }
 
-        if (g_config.osd_show_frametime) {
+        if (g_config.osd_show_frametime && ft > 0.0) {
             char buf[32];
             snprintf(buf, sizeof(buf), "%.2f ms", ft_ms);
             OSDTextColored(ColPerf(), buf);
@@ -2294,7 +2673,7 @@ static void DrawOSDImpl() {
             }
         }
 
-        if (g_config.osd_show_native_pcl) {
+        if (g_config.native_pcl_enabled && g_config.osd_show_native_pcl) {
             const NativePclSnapshot native_pcl = NativePcl_GetSnapshot();
             const bool total_available = native_pcl.available &&
                 std::isfinite(native_pcl.total_us);
@@ -2396,30 +2775,15 @@ static void DrawOSDImpl() {
         // QUALITY (green/yellow/red)
         // — hidden during DMFG passthrough (scheduler isn't pacing, scores are meaningless)
         // ═══════════════════════════════════
-        PQIScores pqi = {};
-        if (!IsDmfgActive() && (g_config.osd_show_pqi || g_config.osd_show_pqi_breakdown))
-            pqi = PQI_GetRolling();
+        const bool show_pqi = !IsDmfgActive() && g_config.osd_show_pqi;
+        const PacingTelemetrySnapshot* pacing_snapshot =
+            show_pqi || g_config.osd_show_pacing_quality ? ReadFreshPacingSnapshot() : nullptr;
+        if (show_pqi)
+            DrawPQI(pacing_snapshot, g_config.osd_show_pqi_breakdown);
 
-        if (!IsDmfgActive() && g_config.osd_show_pqi) {
-            ImVec4 pqi_color = PQIColor(pqi.pqi / 100.0);
-            char buf[32];
-            snprintf(buf, sizeof(buf), "PQI: %.0f%%", pqi.pqi);
-            OSDTextColored(pqi_color, buf);
-        }
-
-        if (!IsDmfgActive() && g_config.osd_show_pqi && g_config.osd_show_pqi_breakdown) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), " Cadence: %.0f%%", pqi.cadence * 100.0);
-            OSDTextColored(PQIColor(pqi.cadence), buf);
-            snprintf(buf, sizeof(buf), " Stutter: %.0f%%", pqi.stutter * 100.0);
-            OSDTextColored(PQIColor(pqi.stutter), buf);
-            snprintf(buf, sizeof(buf), " Deadline: %.0f%%", pqi.deadline * 100.0);
-            OSDTextColored(PQIColor(pqi.deadline), buf);
-        }
-
-        if (g_config.osd_show_smoothness) {
-            double smooth = g_smoothness_us.load(std::memory_order_relaxed);
-            if (smooth > 0.0) {
+        if (g_config.osd_show_smoothness && coherent_sample && ft > 0.0) {
+            const double smooth = scheduler_sample.variation_us;
+            if (scheduler_sample.variation_valid) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "Smoothness: %.2f ms", smooth / 1000.0);
                 // Color: green < 0.5ms, yellow < 1.5ms, red >= 1.5ms
@@ -2431,6 +2795,10 @@ static void DrawOSDImpl() {
                 OSDTextColored(col, buf);
             }
         }
+
+        // Measured displayed-frame pacing from ETW or DXGI display timing.
+        if (g_config.osd_show_pacing_quality)
+            DrawDisplayPacing(pacing_snapshot);
 
         // ═══════════════════════════════════
         // PIPELINE (light blue)
@@ -2482,62 +2850,39 @@ static void DrawOSDImpl() {
         }
 
         if (g_config.osd_show_limiter && !IsDmfgActive()) {
+            // Limiter-added latency: only the gate hold adds to input-to-photon
+            // latency. own_sleep happens at SIMULATION_START (before input
+            // sampling with Reflex), so it's frame pacing, not added latency.
+            // gate_sleep holds the present after rendering, which genuinely
+            // delays display.
+            const double limiter_added_ms =
+                g_last_gate_sleep_us.load(std::memory_order_relaxed) / 1000.0;
             char buf[48];
-            snprintf(buf, sizeof(buf), "Limiter: +%.1f ms  T%d", limiter_added_ms, tier);
+            snprintf(buf, sizeof(buf), "Limiter: +%.1f ms", limiter_added_ms);
             OSDTextColored(ColPipeline(), buf);
-
-            const ArrivalLeadDecision estimator_status =
-                ArrivalLead_GetRuntimeStatus();
-            if (estimator_status.mode != ArrivalLeadMode::Off) {
-                char estimator_buf[128];
-                snprintf(
-                    estimator_buf,
-                    sizeof(estimator_buf),
-                    "Estimator A: %s  %.0f+%.0f us  [%s/%s]",
-                    estimator_status.active
-                        ? "Active"
-                        : (estimator_status.authority_ready ? "Shadow" :
-                           ArrivalLead_FallbackReasonText(
-                               estimator_status.fallback_reason)),
-                    estimator_status.predicted_arrival_lead_us,
-                    estimator_status.reserve_us,
-                    ArrivalLead_RegimeText(estimator_status.regime),
-                    ArrivalLead_MarkerText(estimator_status.marker));
-                OSDTextColored(ColPipeline(), estimator_buf);
-            }
         }
 
-        if (g_config.osd_show_adaptive_smoothing && g_config.adaptive_smoothing && !IsDmfgActive()) {
-            double offset = g_smoothing_offset_us.load(std::memory_order_relaxed);
-            double p99 = g_smoothing_p99_us.load(std::memory_order_relaxed);
-            if (g_frame_time_adaptation.IsWarm()) {
-                const char* mode = g_frame_time_adaptation.IsDualMode() ? "Dual" : "Med";
-                double pct = g_frame_time_adaptation.GetTargetPercentile() * 100.0;
+#endif // _WIN64 (Pipeline section: FG, Limiter)
+
+        // Adaptive cap (period governor C2): stretch and governed interval (before LFC).
+        if (g_config.osd_show_adaptive_smoothing && g_config.adaptive_cap && !IsDmfgActive()) {
+            SchedulerPacingStatus governor_status;
+            if (Scheduler_ReadPacingStatus(&governor_status) && governor_status.governor_enabled) {
                 char buf[96];
-                snprintf(buf, sizeof(buf), "Frame Adapt: +%.0f us (P%.0f: %.1f ms) [%s]",
-                         offset, pct, p99 / 1000.0, mode);
+                const double percent = GovernorStretchPercent(governor_status);
+                if (governor_status.governor_interval_us > 0.0) {
+                    snprintf(buf, sizeof(buf), "Adaptive cap: +%.1f%% (%.2f ms)", percent,
+                             governor_status.governor_interval_us / 1000.0);
+                } else {
+                    snprintf(buf, sizeof(buf), "Adaptive cap: +%.1f%%", percent);
+                }
                 float b = g_config.osd_text_brightness;
-                ImVec4 col = (offset < 100.0)
+                ImVec4 col = percent < 0.05
                     ? ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f)
                     : ImVec4(0.9f*b, 0.9f*b, 0.2f*b, 1.0f);
                 OSDTextColored(col, buf);
-
-                const AdaptiveDeadlineReserveDecision reserve_status =
-                    AdaptiveDeadlineReserve_GetRuntimeStatus();
-                char reserve_buf[128];
-                snprintf(
-                    reserve_buf,
-                    sizeof(reserve_buf),
-                    "Deadline Reserve: %.0f us [%s/%s%s]",
-                    reserve_status.applied_reserve_us,
-                    AdaptiveDeadlineReserve_ModeText(reserve_status.mode),
-                    AdaptiveDeadlineReserve_AuthorityText(
-                        reserve_status.authority),
-                    reserve_status.active_capped ? "/capped" : "");
-                OSDTextColored(col, reserve_buf);
             }
         }
-#endif // _WIN64 (Pipeline section: FG, Limiter, Frame-Time Adaptation)
 
         // ═══════════════════════════════════
         // DLSS (green — NGX feature info)
@@ -2773,25 +3118,16 @@ static void DrawOSDImpl() {
         if (CSV_IsEnabled())
             OSDTextColored(ColStatus(), "REC");
 
-        if (Baseline_IsCapturing()) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "Baseline: %.0f%%", Baseline_GetProgress() * 100.0);
-            OSDTextColored(ColStatus(), buf);
-        } else if (Baseline_IsComparison()) {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "Compare: %.0f%%", Baseline_GetProgress() * 100.0);
-            OSDTextColored(ColStatus(), buf);
-        }
-
         // ═══════════════════════════════════
         // FRAMETIME GRAPH
         // ═══════════════════════════════════
-        if (g_config.osd_show_frametime_graph) {
+        if (g_config.osd_show_frametime_graph && s_ft_history_count > 0) {
             float ordered[FT_HISTORY_SIZE];
             float data_max = 0.0f;
             float data_min = 1e9f;
-            for (int i = 0; i < FT_HISTORY_SIZE; i++) {
-                float v = s_ft_history[(s_ft_history_idx + i) % FT_HISTORY_SIZE];
+            const int first = (s_ft_history_idx + FT_HISTORY_SIZE - s_ft_history_count) % FT_HISTORY_SIZE;
+            for (int i = 0; i < s_ft_history_count; i++) {
+                float v = s_ft_history[(first + i) % FT_HISTORY_SIZE];
                 ordered[i] = v;
                 if (v > 0.0f) {
                     if (v > data_max) data_max = v;
@@ -2807,14 +3143,16 @@ static void DrawOSDImpl() {
             float needed_max = (std::max)(ideal_max, data_max + 1.0f);
             needed_min = (std::max)(0.0f, needed_min);
 
-            if (needed_min < s_graph_scale_min) s_graph_scale_min = needed_min;
-            if (needed_max > s_graph_scale_max) s_graph_scale_max = needed_max;
+            if (cadence.new_sample) {
+                if (needed_min < s_graph_scale_min) s_graph_scale_min = needed_min;
+                if (needed_max > s_graph_scale_max) s_graph_scale_max = needed_max;
 
-            s_graph_scale_min += (ideal_min - s_graph_scale_min) * 0.02f;
-            s_graph_scale_max += (ideal_max - s_graph_scale_max) * 0.02f;
-            s_graph_scale_min = (std::max)(0.0f, s_graph_scale_min);
-            if (s_graph_scale_max < s_graph_scale_min + 2.0f)
-                s_graph_scale_max = s_graph_scale_min + 2.0f;
+                s_graph_scale_min += (ideal_min - s_graph_scale_min) * 0.02f;
+                s_graph_scale_max += (ideal_max - s_graph_scale_max) * 0.02f;
+                s_graph_scale_min = (std::max)(0.0f, s_graph_scale_min);
+                if (s_graph_scale_max < s_graph_scale_min + 2.0f)
+                    s_graph_scale_max = s_graph_scale_min + 2.0f;
+            }
 
             float scale_min = s_graph_scale_min;
             float scale_max = s_graph_scale_max;
@@ -2839,7 +3177,7 @@ static void DrawOSDImpl() {
                 {cursor.x, cursor.y + GRAPH_H - 12.0f}, 0xFFCCCCCC, bot_label);
 
             ImGui::SetCursorScreenPos({cursor.x + LABEL_W, cursor.y});
-            ImGui::PlotLines("##ft_graph", ordered, FT_HISTORY_SIZE,
+            ImGui::PlotLines("##ft_graph", ordered, s_ft_history_count,
                              0, nullptr, scale_min, scale_max,
                              ImVec2(GRAPH_W, GRAPH_H));
 

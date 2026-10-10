@@ -11,20 +11,24 @@ void Correlator_SetLegacySwapchain(IDXGISwapChain* swapchain) noexcept;
 bool Correlator_SetPresentingSwapchain(IDXGISwapChain* swapchain) noexcept;
 IDXGISwapChain* Correlator_AcquireSwapchain() noexcept;
 
+// Swapchain frame statistics for the pacing telemetry DXGI display source
+// (telemetry worker only, never the scheduler or Present thread). There is no
+// IDXGIOutput fallback: output statistics do not number presents like
+// GetLastPresentCount. Fails
+// while the correlator is disabled (DX9, Vulkan, OpenGL, torn down) or the
+// active API is not DXGI. *native_swapchain receives the queried swapchain
+// identity (0 when none was acquired).
+HRESULT Correlator_QuerySwapchainFrameStatistics(
+    DXGI_FRAME_STATISTICS* stats, uint64_t* native_swapchain) noexcept;
+
 // ── DXGIStatsSource ──
-// Thin wrapper around DXGI frame statistics resolution.
-// Handles Streamline proxy unwrap, IDXGIOutput fallback, and lifecycle.
-// The old PresentCorrelator's retirement/calibration pipeline has been
-// removed — CadenceMeter handles cadence measurement via deltas.
+// DXGI statistics lifecycle: the disable flag for non-DXGI APIs and teardown
+// of the swapchain publication. The scheduler's DXGI cadence-bias path is
+// retired; frame statistics are read only by the telemetry worker's DXGI
+// display source (Correlator_QuerySwapchainFrameStatistics).
 
 struct DXGIStatsSource {
     std::atomic<bool> permanently_disabled{false};
-
-    // Query DXGI frame statistics from an AddRef-owned local swapchain/output.
-    HRESULT QueryFrameStatistics(DXGI_FRAME_STATISTICS& stats);
-
-    // Check if DXGI stats are currently available (non-blocking).
-    bool IsStatsAvailable();
 
     // Called on full swapchain teardown. Nulls all DXGI pointers.
     void OnSwapchainDestroyed();
