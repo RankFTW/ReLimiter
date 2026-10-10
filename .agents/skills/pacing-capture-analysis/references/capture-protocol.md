@@ -38,6 +38,8 @@ Since 2026-10-10 these captures are the reference for changes to the release poi
 | CONTROL Resonant FG 2×, 130 FPS | Output override **Source only** | `control-fg2x-handoff-v2-130-source-only-*` (35924_3) | the limit rarely binds at a reachable cap |
 | CONTROL Resonant FG 2×, 130 FPS | Auto (held, `fg_input_wait`) | `control-fg2x-handoff-v2-130-auto-*` (35924_5): long frames 1.8 per 1,000, jitter > 4 ms 8.9, real-frame PCL 40.7 ms, OutputLate about 12 per minute | the regression bar for held pacing |
 | Rogue Core, held | Auto | none on the handoff-limit builds yet | a serial engine: no frame delayed by the limit, pacing as before |
+| CONTROL Resonant FG 2×, 157 FPS, Adaptive cap on (fit 75) | Auto | none yet | the interval settles where holds stay on; no climb to +60% after FG or cap changes (15312_1 climbed to +58–60% after each FG change at fit 99) |
+| Rogue Core, Adaptive cap on (fit 75), light and heavy areas | Auto (`gpu_queue_wait`) | 28744_1 (stretched on 31.5% of frames, at most +16%); 42520_1 heavy section (hold room +10.6%) | rises only with late frames or the hold room; returns to the cap when the load drops |
 
 Analyze each with `analyze_pacing.py` and `render_pipeline.py` (see the analysis policy, Render pipeline), and compare against the reference in the same scene. Name archives `<game>-<feature>-<version>-<variant>` as above so a set stays together.
 
