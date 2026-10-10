@@ -14,7 +14,7 @@ Install via [RHI (ReShade HDR Installer)](https://github.com/RankFTW/RHI) for th
 
 **Manual install:** Download `relimiter.addon64` from the [Releases](https://github.com/RankFTW/ReLimiter/releases) page and drop it next to the ReShade DLL in your game folder.
 
-📖 **[Full User Guide](docs/USER_GUIDE.md)** — comprehensive documentation covering every feature, setting, and INI option.
+📖 **[Full User Guide](docs/USER_GUIDE.md)** — documentation for every user-facing feature, setting, and INI key. Developer-only settings and diagnostics are in the [Developer Reference](docs/DEVELOPER_REFERENCE.md).
 
 ## Frame Pacing
 

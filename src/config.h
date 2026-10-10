@@ -72,7 +72,7 @@ struct Config {
     std::string vsync_mode = "game";        // game | off | on
 
     // Logging
-    std::string log_level = "info";
+    std::string log_level = "warn";
 
     // CSV Telemetry
     bool csv_enabled = false;

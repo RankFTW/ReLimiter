@@ -1656,7 +1656,8 @@ static void DrawSettingsImpl() {
             CSV_SetEnabled(csv);
             config_dirty = true;
         }
-        HelpTip("Enable per-frame CSV telemetry recording. Toggle in-game with the CSV hotkey (default F11).");
+        HelpTip("Records per-frame pacing CSV files next to the game, for problem reports. Each time it is "
+                "turned on a new capture starts; it is off at every launch.");
 
         // Advanced Logging toggle (log_level: warn <-> info)
         bool info_logging = (g_config.log_level == "info");

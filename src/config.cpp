@@ -184,7 +184,7 @@ void ValidateConfig() {
 
     // ── Logging ──
     static const char* log_levels[] = {"error", "warn", "info", "debug"};
-    ValidateEnum(g_config.log_level, log_levels, 4, "info");
+    ValidateEnum(g_config.log_level, log_levels, 4, "warn");
 
     // ── Pacing pipeline ──
     if (static_cast<unsigned>(g_config.smoothing) >=
