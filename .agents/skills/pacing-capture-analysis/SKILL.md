@@ -185,7 +185,7 @@ Use interval-domain statistics as primary evidence: count, duration, median, MAD
 
 - Display pacing: `display_interval_us`, `adjacent_jitter_us`, `deviation_us` and long/short frames relative to each row's T_out, per chain; FrameView `MsBetweenDisplayChange` as the independent reference.
 - Animation error and latency: `animation_error_us` and `latency_us` on real frames only; they need consecutive frame IDs and joined Source records.
-- Holds: `cpu_hold_us` and `gpu_residence_us`, each counted once, stratified by `output_kind`; GPU residence only where `ready_before_gate = 1`.
+- Holds: `cpu_hold_us` and `gpu_residence_us`, each counted once, stratified by `output_kind`; GPU residence only where `ready_before_gate = 1`. `ready_before_gate` says the readiness query preceded every hold (the timestamp is valid), not that the frame was ready in time: a GPU wait frame was held only when `ready_gpu_qpc` <= `gate_signal_before_qpc`. On `fg_input_wait`, spikes sit on real frames ready after the signal (not held) and the 1-3 cycles after them; count that share, the spike rate on late against held frames, and, with Reflex markers, how many late frames are late only by the render-thread wait q the FG input lead leaves out (X − q <= L).
 - Source cadence: `source_release_qpc` differences within one producer epoch describe the limiter, not the display.
 - Overload: fraction of rows with the overload flag, run lengths, transition windows, and recovery duration. Never exclude overload from an overload analysis.
 - FG/DMFG: separate real-frame metrics from displayed-output cadence (every display change, generated ones included).
