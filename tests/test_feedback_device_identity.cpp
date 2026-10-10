@@ -222,7 +222,7 @@ void TestReflexCallForwarding() {
     CHECK(Hook_Sleep(&device)==-7 && s_sleep_calls==bypass_calls+2);
     g_reflex_sleep_bypass=false;
 
-    // Render handoff limit (phase4_design.md section 23): a bypassed Sleep
+    // Render handoff limit: a bypassed Sleep
     // waits until the render thread has taken the newest released frame, then
     // plans the pre-wait with that handoff, before the game reads input.
     g_reflex_sleep_bypass=true;g_user_target_fps=157;
@@ -270,6 +270,42 @@ void TestReflexCallForwarding() {
     // Another producer's handoff ends the wait at once without a stall.
     RenderHandoff_Publish(1, 8, 1, RealQpc());
     CHECK(Hook_Sleep(&device)==NVAPI_OK && s_handoff_stalls==1 && s_planned_handoff_qpc==0);
+    // The stall span follows the render thread's own frame time: 17
+    // consecutive handoffs 30 ms apart set it to 30 ms, so a wait with a 1 ms
+    // floor ends only after three of those frame times. A frame gap is not an
+    // interval, and another stream has no frame time.
+    {
+        const int64_t now = RealQpc();
+        for (uint64_t frame = 1; frame <= 17; ++frame) {
+            RenderHandoff_Publish(1, 9, frame, now - us_to_qpc(30000.0 * static_cast<double>(17 - frame)));
+        }
+        const int64_t cycle = RenderHandoff_CycleTicks(1, 9);
+        CHECK(cycle >= us_to_qpc(30000.0) - 1 && cycle <= us_to_qpc(30000.0) + 1);
+        CHECK(RenderHandoff_CycleTicks(1, 7) == 0);
+        RenderHandoff_Publish(1, 9, 19, now + us_to_qpc(1000.0));
+        CHECK(RenderHandoff_CycleTicks(1, 9) == cycle);
+        int64_t handoff_qpc = 0;
+        const int64_t start = RealQpc();
+        CHECK(RenderHandoff_WaitFor(1, 9, 20, us_to_qpc(1000.0), &handoff_qpc) == RenderHandoffWait::Deadline);
+        CHECK(RealQpc() - start >= us_to_qpc(85000.0));
+        // A render thread that takes each frame only after its wait stalled
+        // (200 ms apart here) leaves the frame time unchanged, so its stall
+        // span does not grow with its own stalls.
+        for (uint64_t frame = 20; frame <= 40; ++frame) {
+            if (frame > 20) {
+                CHECK(RenderHandoff_WaitFor(1, 9, frame, 0, &handoff_qpc) == RenderHandoffWait::Deadline);
+            }
+            RenderHandoff_Publish(1, 9, frame, now + us_to_qpc(1000.0 + 200000.0 * static_cast<double>(frame - 19)));
+        }
+        CHECK(RenderHandoff_CycleTicks(1, 9) == cycle);
+        // Frames no wait stalled for count again: 20 intervals of 200 ms are
+        // most of the window.
+        for (uint64_t frame = 41; frame <= 60; ++frame) {
+            RenderHandoff_Publish(1, 9, frame, now + us_to_qpc(1000.0 + 200000.0 * static_cast<double>(frame - 19)));
+        }
+        const int64_t slow_cycle = RenderHandoff_CycleTicks(1, 9);
+        CHECK(slow_cycle >= us_to_qpc(200000.0) - 1 && slow_cycle <= us_to_qpc(200000.0) + 1);
+    }
     // The driver's Sleep runs (bypass off): no handoff wait.
     g_reflex_sleep_bypass=false;
     s_planned_handoff_qpc=-1;
@@ -579,7 +615,7 @@ void TestCpuLatency() {
     NvAPI_ClearFeedbackDevice();
 }
 
-// Q11 (a) marker_forward_order. before_wait forwards the enforcement marker on
+// marker_forward_order. before_wait forwards the enforcement marker on
 // entry and publishes the wait as controller residence; after_wait forwards it
 // after OnMarker (the source wait) with zero residence. Every marker, enforced
 // or not, reaches the driver exactly once and returns the driver's status.
@@ -620,7 +656,7 @@ void TestMarkerForwardOrder() {
 }
 
 void TestSourceAdmissionWithBusyTail() {
-    // Immutable source-ID pattern from capture 32056/134331024459559677/1:
+    // Immutable source-ID pattern from a captured trace:
     // 8768..13418 with 40 SimStart calls that collided with a busy owner.
     // Replays admission only, not frame pacing.
     constexpr uint64_t first = 8768, last = 13418;
@@ -818,7 +854,7 @@ void TestPresentStartExecutors() {
     CHECK(TrackedOutput(late_plan) == events.release.qpc &&
         events.release.qpc >= late_plan.output_target_qpc);
 
-    // Undeliverable: T - now > 1.5 I is never held (P2-9).
+    // Undeliverable: T - now > 1.5 I is never held.
     const auto far_plan = PublishPlan(Key(805), PacingRung::MarkerHold, 40'000.0, 10'000.0);
     attribution = SendPresentStart(&device, 805);
     events = DrainStageEvents();
@@ -988,7 +1024,7 @@ void TestNativeRouteFromEveryMarker() {
 }
 
 // RENDERSUBMIT_START, SIMULATION_END and PRESENT_END of a planned GPU wait
-// frame are one stage event each at the plan's grid index (R13 and the
+// frame are one stage event each at the plan's grid index (the carried GPU hold and the
 // simulation → render queue; the lead decides per rung whether to use them).
 // CPU rungs and unplanned frames push nothing; every marker is forwarded once.
 void TestFrameMarkerStageEvents() {

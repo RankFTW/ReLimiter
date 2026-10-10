@@ -420,7 +420,7 @@ bool s_last_dmfg_active = false;
 int s_last_target_fps = -1;
 int s_last_fg_divisor_raw = 0;
 
-// Period governor C2 (phase3_controllers_design.md 2.2, 2.5). Owner only.
+// Period governor. Owner only.
 PeriodGovernor s_period_governor;
 GovernorDecision s_governor_decision{}; // newest governed frame's decision (status)
 double s_governor_base_interval_us = 0.0; // that frame's I_0 (status)
@@ -431,17 +431,17 @@ bool s_governor_miss_pending = false;
 // Lead slack samples already given to the governor (output evidence).
 uint64_t s_governor_outputs_seen = 0;
 uint64_t s_governor_late_outputs_seen = 0;
-// Overload guard (C3, design review 2026-10-03). Owner only. Overload
+// Overload guard. Owner only. Overload
 // demotes every Auto hold rung to source only. Output overrides are never
 // changed.
 HoldFeasibility s_hold_feasibility;
 bool s_restart_pending = false; // SourceLate (not pre-Sleep-late) or OutputLate since the previous governed frame
-// Developer A/B interleave (gpu_wait_interleave_s, 2026-10-05). Owner only.
+// Developer A/B interleave (gpu_wait_interleave_s). Owner only.
 HoldInterleave s_hold_interleave;
 bool s_interleave_active = false;
 // FeasibilityCause of the newest guard or interleave transition (Source records).
 FeasibilityCause s_feasibility_cause = FeasibilityCause::None;
-// GPU queue wait cap ladder (2026-10-04). Owner only. The lead's waited and
+// GPU queue wait cap ladder. Owner only. The lead's waited and
 // late resume counters already given to it, and the cause of a level change
 // not yet on a Source record (gpu_wait_cap events).
 GpuWaitCap s_gpu_wait_cap;
@@ -462,7 +462,7 @@ bool s_logged_behind_wait = false;
 PacingRoute s_last_route = PacingRoute::None;
 bool s_route_known = false;
 
-// Pre-Sleep placement (phase4_design.md P4-8 to P4-10). Owner only.
+// Pre-Sleep placement. Owner only.
 PreSleepPlacement s_pre_sleep;
 // Newest planned frame: the pre-wait predicts the next index from it.
 uint64_t s_last_plan_index = 0;
@@ -476,15 +476,16 @@ double s_pre_sleep_wait_margin_us = 0.0;
 // Reflex Sleep on the presenting device: written by the Sleep hook (any
 // thread), read by the owner for placement availability.
 std::atomic<int64_t> s_last_reflex_sleep_qpc{0};
-// Render handoff limit (phase4_design.md section 23). Owner: the newest
-// released planned frame; whether the limit is blocked (a wait stalled
-// before any handoff sample showed the render thread taking a frame ahead of
-// the next release: a render thread that may wait for that release); waits
-// that stalled; frames the limit delayed past S; whether the first of each
-// was logged.
+// Render handoff limit. Owner: the newest released planned frame; whether
+// the limit is blocked (RenderHandoffStalled); waits that stalled; stalled
+// waits since the last wait that saw its handoff; the stream whose render
+// thread was seen taking a frame before the next release (0 none); frames
+// the limit delayed past S; whether the first of each was logged.
 PacingPlanKey s_handoff_released{};
 bool s_handoff_blocked = false;
 uint64_t s_handoff_stalls = 0;
+uint32_t s_handoff_stall_run = 0;
+uint32_t s_handoff_proven_stream = 0;
 uint64_t s_handoff_limited_frames = 0;
 bool s_handoff_logged = false;
 bool s_handoff_stall_logged = false;
@@ -562,7 +563,7 @@ static void TakeLeadResumes(uint32_t* waited, uint32_t* late) noexcept
     *late = TakeCounterDelta(lead.resume_late_samples, &s_gpu_wait_late_resumes_seen);
 }
 
-// Starts a fresh period-governor and cadence-readout history (P3-10). The
+// Starts a fresh period-governor and cadence-readout history. The
 // governor step belongs to one interval and one workload regime. Demand
 // reports and output evidence admitted before the reset describe the old
 // regime: discard them.
@@ -580,7 +581,7 @@ static void ResetAdaptationRegime(const char* reason) noexcept
 }
 
 // Holds resume after an overload: the resuming rungs' lead windows describe
-// frames from before it (capture 6560_1), so they restart from their old
+// frames from before it, so they restart from their old
 // median (LeadController::RestartRung).
 static void RestartResumingLeads() noexcept
 {
@@ -779,7 +780,7 @@ static void ResetGpuWaitCap(const char* reason) noexcept
     TakeLeadResumes(&discarded, &discarded);
 }
 
-// Lifecycle, cap, raw FG divisor or route change: the C1 slack windows
+// Lifecycle, cap, raw FG divisor or route change: the lead slack windows
 // restart, so the Adaptive cap's infeasible-lead misses hold only evidence
 // observed after the change; the overload guard ends any demotion and the
 // GPU wait cap returns to the budget.
@@ -788,13 +789,14 @@ static void ResetFeasibility(const char* reason) noexcept
     s_source_stage.ClearSlackEvidence();
     ResetHoldFeasibility(reason);
     ResetGpuWaitCap(reason);
+    s_handoff_stall_run = 0;
     if (s_handoff_blocked) {
         LOG_INFO("Render handoff limit: back on (%s)", reason);
         s_handoff_blocked = false;
     }
 }
 
-// Controller lifecycle (P2-10). The generation bumps only on API change,
+// Controller lifecycle. The generation bumps only on API change,
 // identity-domain (trigger/route) change and producer-epoch change here;
 // Flush(FLUSH_ALL) bumps it for API change, full swapchain teardown and
 // device loss. On a new generation the grid, the frame plans and the
@@ -949,7 +951,7 @@ static int64_t QpcNow() noexcept
     return s_clock.Now();
 }
 
-// Governor, overload guard, collision guard and GPU wait cap fields of the OSD status (P3-15).
+// Governor, overload guard, collision guard and GPU wait cap fields of the OSD status.
 static void FillControllerStatus(SchedulerPacingStatus* status) noexcept
 {
     const GovernorStatistics governor = s_period_governor.Statistics();
@@ -1150,14 +1152,14 @@ static void RunDmfg(
     PushSourceRelease(cadence_context, &source);
 }
 
-// ── Period governor C2 (VRR and fixed refresh) ──
+// ── Period governor (VRR and fixed refresh) ──
 
 static bool IsGpuRung(PacingRung rung) noexcept
 {
     return rung == PacingRung::GpuQueueWait || rung == PacingRung::FgInputWait;
 }
 
-// adaptive_cap is the only switch (Q1 a). Configure resets on a toggle.
+// adaptive_cap is the only switch. Configure resets on a toggle.
 static void ConfigurePeriodGovernor(bool enabled) noexcept
 {
     if (enabled == s_period_governor.Enabled()) return;
@@ -1169,7 +1171,7 @@ static void ConfigurePeriodGovernor(bool enabled) noexcept
 // ladder step from the ladder (I_0 = cap × FG divisor before LFC, the
 // fixed-refresh shape and the LFC ceiling) and the miss pending since the
 // previous governed plan. Called once per governed frame, before its plan.
-// Every step (Reset included) clears the C1 slack: slack judged by C2 misses
+// Every step (Reset included) clears the lead slack: slack judged by governor misses
 // then belongs to the new period. The hold room comes from the GPU queue
 // wait's collision-guarded frames (Auto only, also while the not-held A/B
 // blocks or the overload guard demote it: PacingPipeline_LeadRung).
@@ -1198,7 +1200,7 @@ static GovernorDecision UpdatePeriodGovernor(
 
     frame.qpc = QpcNow();
     frame.qpc_frequency = GetQPCFrequency();
-    // The Adaptive cap percentile (R11), not the Smoothing lead quantile.
+    // The Adaptive cap percentile, not the Smoothing lead quantile.
     frame.quantile = static_cast<double>(config.adaptive_cap_percentile) / 100.0;
     frame.missed = s_governor_miss_pending;
     s_governor_miss_pending = false;
@@ -1208,7 +1210,7 @@ static GovernorDecision UpdatePeriodGovernor(
         frame.room_us = s_source_stage.Lead().HoldRoomUs(fg_divisor, frame.quantile);
     }
     const GovernorDecision decision = s_period_governor.OnFrame(frame);
-    // P4-7: the evidence restarts on a fixed-refresh step or a reset, not on
+    // The evidence restarts on a fixed-refresh step or a reset, not on
     // continuous VRR changes.
     if (decision.valid && (decision.epoch || decision.cause == GovernorCause::Reset)) {
         s_source_stage.ClearSlackEvidence();
@@ -1250,7 +1252,7 @@ static double GovernedIntervalUs(const GovernorDecision& decision, double base_i
     return decision.valid && decision.interval_us > 0.0 ? decision.interval_us : base_interval_us;
 }
 
-// Fixed-refresh ladder input (P3-6): the grid's 2% snap rule on I_0 and the
+// Fixed-refresh ladder input: the grid's 2% snap rule on I_0 and the
 // vblank reference refresh.
 static GovernorFixedRefresh FixedRefreshLadder(
     double base_interval_us,
@@ -1270,7 +1272,7 @@ static double VrrCapIntervalUs(int target_fps, double fg_divisor) noexcept
     return (1000000.0 / static_cast<double>(target_fps)) * fg_divisor;
 }
 
-// LFC hysteresis on the governed interval I_k (P3-6: LFC after the governor).
+// LFC hysteresis on the governed interval I_k (LFC runs after the governor).
 static double ApplyLfc(double interval) noexcept
 {
     const double ceiling_us = g_ceiling_interval_us.load(std::memory_order_relaxed);
@@ -1290,13 +1292,13 @@ static double ApplyLfc(double interval) noexcept
 
 // The VRR ceiling interval while LFC is active, else 0. Read before ApplyLfc,
 // this is the previous frame's LFC state, which the 10-frame hysteresis
-// almost always keeps for this frame (governor input, P3-6).
+// almost always keeps for this frame (governor input).
 static double LfcCeilingUs() noexcept
 {
     return s_lfc_active ? g_ceiling_interval_us.load(std::memory_order_relaxed) : 0.0;
 }
 
-// Period identity for PeriodChange epochs (P2-6, P3-10): the VRR cap interval
+// Period identity for PeriodChange epochs: the VRR cap interval
 // from the raw FG divisor with the LFC state of the governed interval. The
 // ramped divisor moves the grid interval for 50 ms after a toggle; those
 // frames are silent rebases. The governor step is not part of the identity:
@@ -1336,10 +1338,10 @@ struct PlannedFrameInput {
     GovernorDecision governor{};   // valid only when governed
 };
 
-// Governor miss inputs of a planned governed frame (P3-7): its plan started a
+// Governor miss inputs of a planned governed frame: its plan started a
 // SourceLate epoch, or its rung's lead is infeasible (budget-limited with a
 // full, mostly negative slack window). Budget-limited alone is not a miss.
-// While C2 can still stretch, an infeasible window is consumed by the miss
+// While the governor can still stretch, an infeasible window is consumed by the miss
 // (the slack restarts), so the governor counts it once per fresh window
 // instead of every frame. Seen by the next governed frame.
 // A frame whose pre-Sleep wait made it late (the margin is still being
@@ -1374,16 +1376,24 @@ static bool DriverSleepRuns(int target_fps) noexcept
         !NvAPI_ShouldBypassSleep(g_reflex_sleep_bypass.load(std::memory_order_relaxed), target_fps, true);
 }
 
-// Render handoff limit (phase4_design.md section 23): a frame that is not
-// held, released at SIMULATION_START by the marker or pre-Sleep placement,
-// while the driver's Sleep does not run. Held frames are not limited
-// (Decision 3: it moved CONTROL's simulation into its render submission).
-static bool HandoffLimitApplies(const PlannedFrameInput& input, const PacingPipelineSnapshot& pipeline) noexcept
+static uint32_t HandoffStreamOf(const PacingPlanKey& key) noexcept
 {
-    // A block ends once handoff samples show the render thread taking frames
-    // ahead of the next release.
-    if (s_handoff_blocked && s_source_stage.Lead().HandoffSamples() >= LEAD_HANDOFF_MIN_SAMPLES) {
+    return (static_cast<uint32_t>(key.identity_domain) << 24) | (key.producer_epoch & 0x00FFFFFFu);
+}
+
+// Render handoff limit: a frame that is not held, released at
+// SIMULATION_START by the marker or pre-Sleep placement, while the driver's
+// Sleep does not run. Held frames are not limited (it moved CONTROL's
+// simulation into its render submission).
+static bool HandoffLimitApplies(const PacingPlanKey& key, const PlannedFrameInput& input,
+    const PacingPipelineSnapshot& pipeline) noexcept
+{
+    // A block ends once the game has shown its render thread taking a frame
+    // before the next release, which a render thread that waits for that
+    // release never does.
+    if (s_handoff_blocked && s_handoff_proven_stream == HandoffStreamOf(key)) {
         s_handoff_blocked = false;
+        s_handoff_stall_run = 0;
         LOG_INFO("Render handoff limit: back on (the render thread takes frames ahead of the next release)");
     }
     return !s_handoff_blocked &&
@@ -1395,28 +1405,45 @@ static bool HandoffLimitApplies(const PlannedFrameInput& input, const PacingPipe
         !DriverSleepRuns(input.target_fps);
 }
 
-// A handoff wait stalled: the render thread took no frame for 3 I, and the
-// frame was released. With a warm handoff window the game has shown that its
-// render thread does not wait for the next release, so a stall is a hitch and
-// the limit stays on. Without one the render thread may be waiting for that
-// release (lockstep): the limit stays off until handoff samples appear or the
-// next lifecycle, cap, FG divisor or route change.
+// A handoff wait stalled: the render thread took no frame for three of its
+// frame times (at least 3 I), and the frame was released. Once the game has
+// shown its render thread taking a frame before the next release (a handoff
+// seen before a release, or a handoff sample, in this producer epoch) a stall
+// is a hitch and the limit stays on. Before that, RENDER_HANDOFF_BLOCK_STALLS
+// stalls in a row turn the limit off: a render thread that waits for the
+// next release stalls every wait. The block ends with that proof or the next
+// lifecycle, cap, FG divisor or route change.
 static void RenderHandoffStalled(uint64_t frame_id) noexcept
 {
     ++s_handoff_stalls;
-    if (s_source_stage.Lead().HandoffSamples() < LEAD_HANDOFF_MIN_SAMPLES) {
-        if (s_handoff_blocked) return;
-        s_handoff_blocked = true;
-        LOG_WARN("Render handoff limit: off (the render thread took no frame for %.0f intervals before "
-                 "frame %llu was taken, and no handoff has been measured yet)",
-                 RENDER_HANDOFF_STALL_INTERVALS, static_cast<unsigned long long>(frame_id));
+    if (s_handoff_proven_stream == HandoffStreamOf(s_handoff_released)) {
+        if (s_handoff_stall_logged) return;
+        s_handoff_stall_logged = true;
+        LOG_INFO("Render handoff limit: frame %llu released after the render thread took no frame for %.0f "
+                 "of its frame times (a stall; the limit stays on)", static_cast<unsigned long long>(frame_id),
+                 RENDER_HANDOFF_STALL_INTERVALS);
         return;
     }
-    if (s_handoff_stall_logged) return;
-    s_handoff_stall_logged = true;
-    LOG_INFO("Render handoff limit: frame %llu released after the render thread took no frame for %.0f "
-             "intervals (a stall; the limit stays on)", static_cast<unsigned long long>(frame_id),
-             RENDER_HANDOFF_STALL_INTERVALS);
+    if (s_handoff_blocked || ++s_handoff_stall_run < RENDER_HANDOFF_BLOCK_STALLS) return;
+    s_handoff_blocked = true;
+    LOG_WARN("Render handoff limit: off (the render thread took no frame for %.0f of its frame times in %u "
+             "waits in a row up to frame %llu, and has not yet taken a frame before the next release)",
+             RENDER_HANDOFF_STALL_INTERVALS, s_handoff_stall_run, static_cast<unsigned long long>(frame_id));
+}
+
+// The render thread took the newest released frame, this frame's
+// predecessor, before this frame's release: it takes frames ahead of the next
+// release, which a render thread that waits for that release never does.
+// Checked at every planned frame, limited or not, so a block also ends while
+// the limit is off once the render thread catches up.
+static void NoteHandoffBeforeRelease(const PacingPlanKey& key, uint64_t handoff_frame) noexcept
+{
+    const PacingPlanKey& released = s_handoff_released;
+    if (released.frame_id == 0 || released.frame_id + 1 != key.frame_id ||
+        HandoffStreamOf(released) != HandoffStreamOf(key) || handoff_frame < released.frame_id) {
+        return;
+    }
+    s_handoff_proven_stream = HandoffStreamOf(key);
 }
 
 // A_n = w_{n−1} + d: the newest released frame's render handoff plus the
@@ -1446,6 +1473,8 @@ static int64_t HandoffEarliestRelease(const PacingPlanKey& key, double interval_
         if (result == RenderHandoffWait::Deadline) RenderHandoffStalled(released.frame_id);
         if (result != RenderHandoffWait::Ready) return 0;
     }
+    s_handoff_stall_run = 0;
+    NoteHandoffBeforeRelease(key, released.frame_id);
     return handoff_qpc + us_to_qpc(s_source_stage.Lead().HandoffOffsetUs(
         pipeline.lead_quantile, pipeline.allowance_us));
 }
@@ -1460,8 +1489,11 @@ static void PublishRenderHandoff(const PacingPlanKey& key, const SourceStageFram
         return;
     }
     s_handoff_released = key;
-    s_handoff_hook_stream.store((static_cast<uint32_t>(key.identity_domain) << 24) |
-        (key.producer_epoch & 0x00FFFFFFu), std::memory_order_relaxed);
+    // A handoff sample (lead_controller.h) is the same proof, measured
+    // after the release; the window restarts on cap and FG changes, the
+    // proof only with the producer epoch.
+    if (s_source_stage.Lead().HandoffSamples() > 0) s_handoff_proven_stream = HandoffStreamOf(key);
+    s_handoff_hook_stream.store(HandoffStreamOf(key), std::memory_order_relaxed);
     s_handoff_hook_frame.store(limited && !s_handoff_blocked ? key.frame_id : 0,
         std::memory_order_release);
     if (!frame.handoff_limited) return;
@@ -1506,12 +1538,16 @@ static SourceStageFrame RunPlanned(
     // An ended pre-Sleep wait gates earlier frames of a lockstep engine like
     // the source wait (lead_controller.h).
     s_pre_sleep.EndedWait(&request.pre_wait_index, &request.pre_wait_start_qpc, &request.pre_wait_end_qpc);
-    // Render handoff limit (phase4_design.md section 23). Sleep-hook waits
-    // that stalled first.
+    // Render handoff limit: Sleep-hook waits that stalled first, then
+    // whether the render thread already took this frame's predecessor.
     for (uint32_t stalls = s_handoff_hook_stalls.exchange(0, std::memory_order_relaxed); stalls > 0; --stalls) {
         RenderHandoffStalled(s_handoff_released.frame_id);
     }
-    const bool handoff_limit = HandoffLimitApplies(input, pipeline);
+    uint64_t handoff_frame = 0;
+    if (RenderHandoff_Latest(static_cast<uint8_t>(key.identity_domain), key.producer_epoch, &handoff_frame, nullptr)) {
+        NoteHandoffBeforeRelease(key, handoff_frame);
+    }
+    const bool handoff_limit = HandoffLimitApplies(key, input, pipeline);
     if (handoff_limit) {
         request.earliest_release_qpc = HandoffEarliestRelease(key, input.interval_us, pipeline);
     }
@@ -1525,7 +1561,7 @@ static SourceStageFrame RunPlanned(
     }
     const int64_t release = frame.planned ? frame.release_qpc : QpcNow();
 
-    // Pre-Sleep residual of this index (P4-10, R2) and the newest plan for
+    // Pre-Sleep residual of this index and the newest plan for
     // the next pre-wait. The residual ends where the source stage was ready
     // to wait (or released, with nothing left to wait), so the margin also
     // covers the marker hook's processing. The lateness check uses the
@@ -1630,7 +1666,7 @@ static SourceStageFrame RunPlanned(
     return frame;
 }
 
-// Driver-limiter frame (P4-11): the Reflex driver limiter paces the source,
+// Driver-limiter frame: the Reflex driver limiter paces the source,
 // so ReLimiter plans nothing (grid suspended, no wait, no hold). The governor
 // still ran; its interval is what the limiter applies. One source record.
 static void RunDriverLimited(
@@ -1675,11 +1711,11 @@ static void RunDriverLimited(
     PublishPacingStatus(status);
 }
 
-// P4-11: the driver limiter is applied before the frame runs; when it cannot
+// The driver limiter is applied before the frame runs; when it cannot
 // be applied (no game parameters, device mismatch, driver failure, Sleep
 // bypass) the frame is planned at the marker instead, so a failed limiter
 // never leaves the game unpaced.
-// Capture C (FG 2×, 2026-09-30): the driver applies minimumIntervalUs to
+// Under FG 2× the driver applies minimumIntervalUs to
 // presented frames, generated ones included, so the limit is the governed
 // real-frame interval divided by the FG divisor.
 static double DriverLimiterIntervalUs(const PlannedFrameInput& input) noexcept
@@ -1693,7 +1729,7 @@ static bool ApplyDriverLimiter(double interval_us) noexcept
     return ReflexDriverLimiter_AppliedUs() != 0;
 }
 
-// ── Pre-Sleep placement (phase4_design.md P4-8 to P4-10) ──
+// ── Pre-Sleep placement ──
 
 void Scheduler_RecordReflexSleep(int64_t now_qpc) noexcept
 {
@@ -1701,7 +1737,7 @@ void Scheduler_RecordReflexSleep(int64_t now_qpc) noexcept
 }
 
 // Owner: the game called the Reflex Sleep within the last second. Pre-Sleep
-// is the user's choice and never disengages itself (R15).
+// is the user's choice and never disengages itself.
 static bool PreSleepAvailable() noexcept
 {
     const int64_t last_sleep = s_last_reflex_sleep_qpc.load(std::memory_order_relaxed);
@@ -1746,7 +1782,7 @@ void Scheduler_RenderHandoffStalled() noexcept
 // when the cap, the FG divisor or the governor's stretch shrank since it was
 // planned (the plan resolves only at the next marker). A shorter prediction
 // only moves more of the wait to the marker trim; a longer one would release
-// the next frame late (P4-9).
+// the next frame late.
 static double PreSleepPredictedIntervalUs() noexcept
 {
     double interval_us = s_last_plan_interval_us;
@@ -1767,6 +1803,12 @@ bool Scheduler_PlanReflexSleep(int64_t now_qpc, bool driver_sleep, int64_t hando
     if (target_qpc == nullptr || grid_index == nullptr || !Scheduler_PreSleepPlacementActive()) {
         return false;
     }
+    // The hook's wait saw the newest released frame's handoff before this
+    // release (render handoff limit).
+    if (handoff_qpc > 0) {
+        s_handoff_stall_run = 0;
+        s_handoff_proven_stream = HandoffStreamOf(s_handoff_released);
+    }
     const CadenceGridSnapshot& grid = s_source_stage.Grid().Snapshot();
     PreSleepRequest request{};
     request.now_qpc = now_qpc;
@@ -1779,7 +1821,7 @@ bool Scheduler_PlanReflexSleep(int64_t now_qpc, bool driver_sleep, int64_t hando
         CadenceGrid_TargetOf(grid, s_last_plan_generation, s_last_plan_index, &last_target_qpc);
     if (request.next_target_valid) {
         request.next_target_qpc = last_target_qpc + us_to_qpc(PreSleepPredictedIntervalUs());
-        // Render handoff limit (phase4_design.md section 23): the next frame
+        // Render handoff limit: the next frame
         // is released no earlier than A = w + d, so the pre-wait aims for
         // max(S_next, A) − margin.
         if (handoff_qpc > 0) {
@@ -1809,9 +1851,9 @@ void Scheduler_EndReflexSleep(uint64_t grid_index, int64_t end_qpc) noexcept
 }
 
 // ── Main entry point ──
-// Order (design 2.5, phase 3 2.5): owner prologue → stage events → pipeline
+// Order: owner prologue → stage events → pipeline
 // → interval (VRR: I_0 → governor → LFC; fixed: I_0 → governor) → plan
-// (published before the wait) → wait → stall injector → release → C2 miss
+// (published before the wait) → wait → stall injector → release → governor miss
 // and GPU wait cap readout → one source record.
 void OnMarker(
     uint64_t frameID,
@@ -1833,7 +1875,7 @@ void OnMarker(
             if (!retain_for_governor) DiscardReflexFrameTimeSamples();
         }
     } pending_feedback;
-    // P4-11: the Reflex driver limiter is applied only while this frame
+    // The Reflex driver limiter is applied only while this frame
     // resolves to it; every other exit releases it (restores the game's
     // Sleep parameters once).
     struct DriverLimiterScope {
@@ -1858,7 +1900,7 @@ void OnMarker(
     ApplyLifecycle(trigger, marker);
     s_source_stage.DrainStageEvents();
     // An OutputLate epoch is a governor miss for the next governed frame
-    // (P3-7) and a cadence restart for the hold feasibility guard.
+    // and a cadence restart for the hold feasibility guard.
     if (s_source_stage.DrainStartedOutputLate()) {
         s_governor_miss_pending = true;
         s_restart_pending = true;
@@ -2020,7 +2062,7 @@ void OnMarker(
         return;
     }
 
-    // ── Fixed refresh: vblank-snapped grid (P2-3) ──
+    // ── Fixed refresh: vblank-snapped grid ──
     if (!runtime.vrr) {
         input.regime = SchedulerCadenceRegime::Fixed;
         input.target_fps = target_fps;

@@ -1,6 +1,6 @@
 #pragma once
 
-// Render handoff (phase4_design.md section 23): the newest RENDERSUBMIT_START
+// Render handoff: the newest RENDERSUBMIT_START
 // of the presenting device, the moment the game's render thread took a frame.
 // The render handoff limit releases a frame that is not held no earlier than
 // the handoff of the newest released frame plus a learned offset, so the game
@@ -10,10 +10,22 @@
 #include <cstdint>
 
 constexpr double RENDER_HANDOFF_ACTIVITY_S = 1.0;      // a handoff this recent: the stream is live
-// A wait ends when the render thread took no frame for this many grid
-// intervals (the 3 I outlier bound of the lead): a stall, or a render thread
-// that waits for the next release.
+// A wait ends when the render thread took no frame for this many of its own
+// frame times (the median interval between its newest handoffs), and never
+// sooner than this many grid intervals: a hitch, or a render thread that
+// waits for the next release. Below the cap the render thread's frame time
+// is longer than the grid interval, so grid intervals alone would call its
+// ordinary frames stalls.
 constexpr double RENDER_HANDOFF_STALL_INTERVALS = 3.0;
+// Handoff intervals of consecutive frames that set the render thread's frame
+// time, and the fewest that give one.
+constexpr uint32_t RENDER_HANDOFF_CYCLE_WINDOW = 32;
+constexpr uint32_t RENDER_HANDOFF_CYCLE_MIN = 8;
+// Stalled waits in a row that turn the limit off while the game has not yet
+// shown its render thread taking a frame before the next release. A render
+// thread that waits for the next release stalls every wait; a hitch rarely
+// spans two waits.
+constexpr uint32_t RENDER_HANDOFF_BLOCK_STALLS = 2;
 
 enum class RenderHandoffWait : uint8_t {
     Ready = 0,       // the handoff of the frame (or a later one) is published
@@ -30,9 +42,18 @@ void RenderHandoff_Publish(uint8_t domain, uint32_t producer_epoch, uint64_t fra
 // published for it.
 bool RenderHandoff_Latest(uint8_t domain, uint32_t producer_epoch, uint64_t* frame_id, int64_t* qpc) noexcept;
 
+// The render thread's frame time for (domain, producer epoch): the median of
+// the newest RENDER_HANDOFF_CYCLE_WINDOW intervals between handoffs of
+// consecutive frames, in QPC ticks, without the handoffs that came after a
+// stalled wait for them; 0 before RENDER_HANDOFF_CYCLE_MIN of them or for
+// another stream.
+int64_t RenderHandoff_CycleTicks(uint8_t domain, uint32_t producer_epoch) noexcept;
+
 // Waits, without spinning, until the handoff of frame_id or a later frame of
 // (domain, producer epoch) is published, or until the render thread took no
-// frame for stall_ticks (from the start of the wait or its newest handoff,
-// whichever is later). *handoff_qpc receives the handoff's QPC when Ready.
+// frame for the stall span (from the start of the wait or its newest handoff,
+// whichever is later). The span is RENDER_HANDOFF_STALL_INTERVALS render
+// thread frame times, at least min_stall_ticks. *handoff_qpc receives the
+// handoff's QPC when Ready.
 RenderHandoffWait RenderHandoff_WaitFor(uint8_t domain, uint32_t producer_epoch, uint64_t frame_id,
-    int64_t stall_ticks, int64_t* handoff_qpc) noexcept;
+    int64_t min_stall_ticks, int64_t* handoff_qpc) noexcept;

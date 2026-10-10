@@ -441,7 +441,7 @@ where `w(n−1)` is RENDERSUBMIT_START of the newest released frame, the moment 
 
 - **Applies to** frames that are not held (`source_only`), in VRR or fixed mode, released at SIMULATION_START by marker or pre-Sleep placement, while the driver's Sleep does not run. Held frames are not limited.
 - **Where the wait runs.** With pre-Sleep placement inside the Reflex Sleep hook, before the game reads input; with marker placement in the marker hook. The grid sees `A` as the frame's arrival, so a limit beyond `S` restarts the cadence like any late source, and the overload guard still sees the overload.
-- **The stall rule.** A wait ends when the render thread took no frame for 3 intervals; the frame is then released. With at least 16 handoff samples the game has shown that its render thread does not wait for the next release, so a stall is a hitch and the limit stays on. Without them the render thread may be waiting for that release, and the limit stays off until handoff samples appear or the next lifecycle, cap, FG multiplier or route change. A handoff older than 1 s counts as no stream and no limit applies.
+- **The stall rule.** A wait ends when the render thread took no frame for 3 of its own frame times (the median of the newest 32 intervals between its handoffs of consecutive frames, without handoffs that came after a stalled wait for them; at least 3 intervals); the frame is then released. Seeing the render thread take a frame before the next frame's release (checked at every frame, limited or not, and by every handoff sample) shows that it does not wait for that release; from then on, within the producer epoch, a stall is a hitch and the limit stays on. Before that, 2 stalled waits in a row turn the limit off: a render thread that waits for the next release stalls every wait. It stays off until the render thread is seen taking a frame before the next release or the next lifecycle, cap, FG multiplier or route change. A handoff older than 1 s counts as no stream and no limit applies.
 
 ```mermaid
 sequenceDiagram
@@ -452,14 +452,14 @@ sequenceDiagram
     Note over RL: A = w plus d, d from the 5th percentile of h minus 0.5 ms
     Sim->>RL: frame n reaches its release
     alt handoff of frame n−1 not yet seen
-        RL->>RL: wait for the handoff, up to 3 intervals
+        RL->>RL: wait for the handoff, up to 3 render-thread frame times
     end
     alt S is at or after A
         RL-->>Sim: release at S
     else S is before A
         RL-->>Sim: release at A, the grid sees a late source
     end
-    Note over RL,Sim: after 3 intervals without a handoff the frame is released anyway
+    Note over RL,Sim: after 3 render-thread frame times without a handoff the frame is released anyway
 ```
 
 ### Adaptive cap

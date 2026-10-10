@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <atomic>
 
-// Scheduler source stage (phase2_timing_core_design.md section 2.5): OnMarker
+// Scheduler source stage: OnMarker
 // resolves the pacing pipeline, plans one cadence-grid index per real frame,
 // publishes the frame plan and waits until the source wake S_n. VRR, fixed
 // refresh (vblank-snapped grid) and idle caps share the grid; passthrough
@@ -90,7 +90,7 @@ extern std::atomic<double> g_effective_interval_us;
 // previous-interval state; old-regime in-flight samples are rejected.
 void Scheduler_ResetSmoothness() noexcept;
 
-// Reflex Sleep hook (phase4_design.md P4-8, P4-9): records Sleep activity on
+// Reflex Sleep hook: records Sleep activity on
 // the presenting device. Any thread; never blocks.
 void Scheduler_RecordReflexSleep(int64_t now_qpc) noexcept;
 // Pre-Sleep wait before the driver's Sleep, in steps so the scheduler owner
@@ -98,12 +98,13 @@ void Scheduler_RecordReflexSleep(int64_t now_qpc) noexcept;
 // admission):
 //   1. Scheduler_PreSleepPlacementActive (any thread): cheap check of the
 //      published pipeline; false = forward the Sleep unchanged.
-//   2. Render handoff limit (phase4_design.md section 23), only when the
+//   2. Render handoff limit, only when the
 //      Sleep is bypassed: Scheduler_RenderHandoffFrame (any thread) names the
 //      newest released frame whose handoff the next frame waits for;
 //      without the owner, RenderHandoff_WaitFor (render_handoff.h) waits for
 //      it, and a wait that stalled (the render thread took no frame for
-//      3 I) calls Scheduler_RenderHandoffStalled.
+//      three of its frame times, at least 3 I) calls
+//      Scheduler_RenderHandoffStalled.
 //   3. Scheduler_PlanReflexSleep (caller holds SchedulerOwnerGuard): decides
 //      the pre-wait; true fills *target_qpc and *grid_index. driver_sleep:
 //      the driver's Sleep runs after the hook (not bypassed); the margin is
@@ -127,7 +128,7 @@ void Scheduler_EndReflexSleep(uint64_t grid_index, int64_t end_qpc) noexcept;
 // passthrough (Dynamic MFG, uncapped, no presenting swapchain) and for the
 // Reflex driver limiter, where the driver's Sleep paces the game. The Reflex
 // Sleep bypass applies only while true, so the overload guard judges the
-// same pacing it resumes into (phase4_design.md section 23). Any thread.
+// same pacing it resumes into. Any thread.
 bool Scheduler_PacesSource() noexcept;
 
 // Main enforcement entry point — called from marker hook.
@@ -142,8 +143,7 @@ void OnMarker(
 // Invalid (default) for an unknown trigger.
 PacingPlanKey Scheduler_MakePlanKey(uint64_t frame_id, SchedulerTrigger trigger) noexcept;
 
-// Source-stage status for the OSD pacing panel (phase2_timing_core_design.md
-// section 4). Published by the scheduler owner once per planned frame.
+// Source-stage status for the OSD pacing panel. Published by the scheduler owner once per planned frame.
 struct SchedulerPacingStatus {
 	bool valid = false;
 	double lead_us = 0.0;         // L of the newest plan
@@ -154,9 +154,9 @@ struct SchedulerPacingStatus {
 	uint8_t epoch_reason = 0;     // PacingEpochReason that started grid_epoch
 	uint64_t stage_events_dropped = 0;
 	uint32_t stalls_injected = 0; // developer stall injector, cumulative
-	bool lead_budget_limited = false; // the newest lead was clamped to 3 I (R15)
+	bool lead_budget_limited = false; // the newest lead was clamped to 3 I
 
-	// Overload guard (design review 2026-10-03). Current on every publication.
+	// Overload guard. Current on every publication.
 	bool hold_overloaded = false;          // every Auto hold resolves source only
 	// Collision-aware release (lead_controller.h). Current on every publication;
 	// counters since the lead controller's last lifecycle reset.
@@ -186,7 +186,7 @@ struct SchedulerPacingStatus {
 	bool gpu_wait_cap_checking = false; // the newest step down is being checked
 	bool gpu_wait_cap_open = false;     // the open top: no cap (Auto, next frame's GPU work behind the wait)
 
-	// Period governor C2 (P3-15, P4-1 to P4-6). Current on every publication.
+	// Period governor. Current on every publication.
 	bool governor_enabled = false;     // adaptive_cap
 	uint8_t governor_step = 0;         // telemetry step: stretch in whole percent (VRR) or refreshes (snapped fixed)
 	double governor_stretch = 1.0;     // governed interval / I_0 of the newest governed frame
@@ -197,14 +197,14 @@ struct SchedulerPacingStatus {
 	uint32_t governor_rises = 0;       // cumulative
 	uint32_t governor_falls = 0;       // cumulative (releases and probes)
 
-	// Source placement (P4-8 to P4-11). Current on every publication.
+	// Source placement. Current on every publication.
 	uint8_t source_placement = 0;      // PacingSourcePlacement of the newest resolved pipeline
 	double pre_sleep_margin_us = 0.0;  // margin of the next pre-wait
 	uint32_t pre_sleep_samples = 0;    // residuals in the margin window
 	double pre_sleep_residual_p50_us = 0.0;
 	double pre_sleep_residual_p99_us = 0.0;
 	uint32_t driver_limiter_interval_us = 0; // applied Reflex minimumIntervalUs; 0 = none
-	// Render handoff limit (phase4_design.md section 23). Current on every publication.
+	// Render handoff limit. Current on every publication.
 	uint8_t render_handoff = 0;            // 0 off, 1 limits the newest frame, 2 blocked
 	double render_handoff_offset_us = 0.0; // d
 	uint32_t render_handoff_limited = 0;   // frames the limit released after S, cumulative
