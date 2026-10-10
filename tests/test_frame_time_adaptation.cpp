@@ -57,6 +57,37 @@ namespace
         CHECK(demand.workload_us == 7000.0);
     }
 
+    // Frame generation runs on the same GPU inside the real frame's
+    // interval: its AI frame time adds to the GPU demand, with active time or
+    // the elapsed fallback, and is no demand of its own without GPU time
+    // (CONTROL Resonant FG 2×: 13.8 ms active, 1.4 ms frame generation).
+    void TestWorkloadDemandCountsFrameGeneration()
+    {
+        FrameTimeAdaptationWorkloadStages stages{};
+        stages.simulation_us = 6000.0;
+        stages.render_submission_us = 8000.0;
+        stages.gpu_render_us = 14600.0;
+        stages.gpu_active_us = 13800.0;
+        stages.ai_frame_us = 1400.0;
+        FrameTimeAdaptationDemand demand = FrameTimeAdaptation_ComputeDemand(stages);
+        CHECK(demand.gpu_render_us == 15200.0);
+        CHECK(demand.workload_us == 15200.0);
+
+        stages.gpu_active_us = 0.0;
+        demand = FrameTimeAdaptation_ComputeDemand(stages);
+        CHECK(demand.gpu_render_us == 16000.0);
+
+        stages.gpu_render_us = 0.0;
+        demand = FrameTimeAdaptation_ComputeDemand(stages);
+        CHECK(demand.gpu_render_us == 0.0);
+        CHECK(demand.workload_us == 8000.0);
+
+        stages.gpu_active_us = 13800.0;
+        stages.ai_frame_us = NAN;
+        demand = FrameTimeAdaptation_ComputeDemand(stages);
+        CHECK(demand.gpu_render_us == 13800.0);
+    }
+
     // A serial engine starts frame n + 1's simulation at or after frame
     // n's Present end; 124 of the newest 128 consecutive pairs make it serial.
     void TestSerialFrameDetector()
@@ -469,6 +500,7 @@ namespace
 int main()
 {
     TestWorkloadDemandSelectsBottleneckWithoutAddingStages();
+    TestWorkloadDemandCountsFrameGeneration();
     TestSerialFrameDetector();
     TestFrameSpanDemand();
     TestReflexReportBurstSelectionPreservesOrder();

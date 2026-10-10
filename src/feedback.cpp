@@ -847,6 +847,7 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
         workload_stages.gpu_render_us = sample_gpu_render_duration_us;
         workload_stages.gpu_active_us =
             static_cast<double>(r.gpuActiveRenderTimeUs);
+        workload_stages.ai_frame_us = static_cast<double>(r.aiFrameTimeUs);
         if (owned_sleep_sample.matched) {
             if (r.simStartTime > 0 && r.simEndTime > r.simStartTime) {
                 const double simulation_us = ReflexTimestampDeltaUs(

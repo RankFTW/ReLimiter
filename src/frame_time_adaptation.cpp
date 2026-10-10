@@ -98,10 +98,15 @@ FrameTimeAdaptationDemand FrameTimeAdaptation_ComputeDemand(
     // driver's execution-only value whenever it is available so paced queue
     // starvation cannot ratchet interval authority. Retain elapsed time as a
     // conservative fallback for reports that do not expose active time.
+    // Frame generation runs on the same GPU within the real frame's interval
+    // and neither value contains it, so its AI frame time is added.
     const double gpu_active_us = ValidDuration(stages.gpu_active_us);
-    demand.gpu_render_us = gpu_active_us > 0.0
+    const double gpu_own_us = gpu_active_us > 0.0
         ? gpu_active_us
         : ValidDuration(stages.gpu_render_us);
+    demand.gpu_render_us = gpu_own_us > 0.0
+        ? gpu_own_us + ValidDuration(stages.ai_frame_us)
+        : 0.0;
     demand.workload_us = (std::max)(
         demand.cpu_active_us,
         demand.gpu_render_us);

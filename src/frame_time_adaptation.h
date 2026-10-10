@@ -79,6 +79,10 @@ struct FrameTimeAdaptationWorkloadStages {
     double render_submission_us = 0.0;
     double gpu_render_us = 0.0;
     double gpu_active_us = 0.0;
+    // The report's AI frame time: frame generation work for this real frame
+    // (0 without frame generation). It runs on the same GPU inside the real
+    // frame's interval, so it is part of the GPU demand.
+    double ai_frame_us = 0.0;
     // Total ReLimiter residence inside the active CPU marker stage. This
     // already contains scheduler sleep and must be subtracted once, not added
     // to the separately exported sleep diagnostic.
