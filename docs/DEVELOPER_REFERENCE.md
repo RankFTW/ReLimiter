@@ -106,6 +106,15 @@ Turning it off removes two command lists and two fence signals per frame from th
 - **Remove after held** leaves it out only when the previous frame's GPU waited at ReLimiter's gate, the case in which ReLimiter's own wait can cause the queue.
 - Removing it can come with late GPU resumes, so compare late GPU resumes, grid restarts, long frames and PC Latency at a cap the game can reach, one setting per capture in the same scene. The log warns while it is not **Keep**.
 
+### Lead coverage
+
+`lead_coverage` (default **95%**, all holds). The share of frames the lead releases early enough to reach their hold in time: the lead is that percentile of the measured release-to-ready times plus the allowance.
+
+- **95%** leaves about 1 frame in 20 ready after its target. Such frames are shown when ready; with frame generation each one moves two or more displayed frames.
+- **99%** leaves about 1 in 100, for a longer lead and more latency: in CONTROL Resonant captures about 2–2.6 ms more lead at the median.
+- Frames late because the GPU or the game's render thread was still busy with the previous frame are not helped; the extra lead only adds latency there.
+- The render handoff limit keeps 95% with either setting. Compare long frames, jitter, frames ready after their target and PC Latency, one setting per capture in the same scene. The log warns while it is not **95%**.
+
 ### Source placement
 
 `source_placement` (default **Pre-Sleep**, 64-bit, Reflex marker games) sets where the source wait happens. ReLimiter never changes it on its own. The Details lines show the result as **Placement**. State the placement with every latency comparison.
@@ -146,6 +155,7 @@ Settings belong under `[FrameLimiter]`. Leave these at their defaults for normal
 | `reflex_sleep_bypass` | true | 64-bit. `true` skips the driver's Reflex Sleep while an FPS cap is set and ReLimiter paces the game, held or not; frames not held use the render handoff limit. The Sleep reaches the driver in Dynamic MFG passthrough and with the Reflex driver limiter. `false` always returns to the driver's Sleep, which the **Reflex driver limiter** placement needs. |
 | `marker_forward_order` | before_wait | 64-bit, NvAPI markers. `before_wait` or `after_wait`: when SIMULATION_START reaches the driver relative to ReLimiter's wait (**Marker forward order**). Invalid values reset to `before_wait`. |
 | `gpu_queue_wait_render_queue` | keep | 64-bit, `gpu_queue_wait` only. `keep`, `remove` or `remove_held` (**GPU queue wait render queue**). Invalid values reset to `keep`. |
+| `lead_coverage` | 95 | All holds. `95` or `99`: the share of frames the lead covers (**Lead coverage**). Invalid values reset to `95`. |
 | `source_placement` | pre_sleep | 64-bit, Reflex markers. `marker`, `pre_sleep` or `driver` (**Source placement**). `auto` from earlier versions loads as `marker`; invalid values reset to `pre_sleep`. |
 
 ---

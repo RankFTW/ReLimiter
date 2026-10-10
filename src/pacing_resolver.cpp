@@ -29,6 +29,9 @@ namespace
     static_assert(sizeof(kLead) / sizeof(kLead[0]) ==
             static_cast<size_t>(PacingSmoothing::Count),
         "one lead entry per smoothing level");
+    // Developer A/B lead_coverage: Q99 replaces the table's quantile for the
+    // lead only; the render handoff offset keeps the table's.
+    constexpr double kLeadCoverageQ99 = 0.99;
 
     struct RungDecision {
         PacingRung rung;
@@ -260,6 +263,7 @@ namespace
         std::atomic<PacingFallbackReason> reason{ kInitialSnapshot.reason };
         std::atomic<double> lead_quantile{ kInitialSnapshot.lead_quantile };
         std::atomic<double> allowance_us{ kInitialSnapshot.allowance_us };
+        std::atomic<double> handoff_quantile{ kInitialSnapshot.handoff_quantile };
         std::atomic<bool> gpu_probes{ kInitialSnapshot.gpu_probes };
         std::atomic<double> gpu_wait_budget_us{ kInitialSnapshot.gpu_wait_budget_us };
     };
@@ -277,6 +281,7 @@ namespace
         snapshot.reason = s_pipeline.reason.load(std::memory_order_relaxed);
         snapshot.lead_quantile = s_pipeline.lead_quantile.load(std::memory_order_relaxed);
         snapshot.allowance_us = s_pipeline.allowance_us.load(std::memory_order_relaxed);
+        snapshot.handoff_quantile = s_pipeline.handoff_quantile.load(std::memory_order_relaxed);
         snapshot.gpu_probes = s_pipeline.gpu_probes.load(std::memory_order_relaxed);
         snapshot.gpu_wait_budget_us = s_pipeline.gpu_wait_budget_us.load(std::memory_order_relaxed);
         return snapshot;
@@ -293,6 +298,7 @@ namespace
         s_pipeline.reason.store(snapshot.reason, std::memory_order_relaxed);
         s_pipeline.lead_quantile.store(snapshot.lead_quantile, std::memory_order_relaxed);
         s_pipeline.allowance_us.store(snapshot.allowance_us, std::memory_order_relaxed);
+        s_pipeline.handoff_quantile.store(snapshot.handoff_quantile, std::memory_order_relaxed);
         s_pipeline.gpu_probes.store(snapshot.gpu_probes, std::memory_order_relaxed);
         s_pipeline.gpu_wait_budget_us.store(snapshot.gpu_wait_budget_us, std::memory_order_relaxed);
     }
@@ -312,6 +318,7 @@ namespace
         std::atomic<double> gpu_wait_budget_us{ kDefaultConfig.gpu_wait_budget_us };
         std::atomic<double> gpu_wait_interleave_s{ kDefaultConfig.gpu_wait_interleave_s };
         std::atomic<PacingRenderQueue> gpu_queue_wait_render_queue{ kDefaultConfig.gpu_queue_wait_render_queue };
+        std::atomic<PacingLeadCoverage> lead_coverage{ kDefaultConfig.lead_coverage };
         std::atomic<double> stall_inject_ms{ kDefaultConfig.stall_inject_ms };
         std::atomic<double> stall_inject_period_s{ kDefaultConfig.stall_inject_period_s };
     };
@@ -331,6 +338,7 @@ namespace
         config.gpu_wait_interleave_s = s_config.gpu_wait_interleave_s.load(std::memory_order_relaxed);
         config.gpu_queue_wait_render_queue =
             s_config.gpu_queue_wait_render_queue.load(std::memory_order_relaxed);
+        config.lead_coverage = s_config.lead_coverage.load(std::memory_order_relaxed);
         config.stall_inject_ms = s_config.stall_inject_ms.load(std::memory_order_relaxed);
         config.stall_inject_period_s =
             s_config.stall_inject_period_s.load(std::memory_order_relaxed);
@@ -437,8 +445,9 @@ PacingPipelineSnapshot PacingPipeline_Resolve(
     result.rung = decision.rung;
     result.reason = decision.reason;
     const LeadParameters lead = kLead[static_cast<size_t>(safe_config.smoothing)];
-    result.lead_quantile = lead.quantile;
+    result.lead_quantile = safe_config.lead_coverage == PacingLeadCoverage::Q99 ? kLeadCoverageQ99 : lead.quantile;
     result.allowance_us = lead.allowance_us;
+    result.handoff_quantile = lead.quantile;
     result.gpu_wait_budget_us = safe_config.gpu_wait_budget_us;
     return result;
 }
@@ -455,6 +464,7 @@ bool PacingPipeline_SameResult(
         left.reason == right.reason &&
         left.lead_quantile == right.lead_quantile &&
         left.allowance_us == right.allowance_us &&
+        left.handoff_quantile == right.handoff_quantile &&
         left.gpu_probes == right.gpu_probes &&
         left.gpu_wait_budget_us == right.gpu_wait_budget_us;
 }
@@ -476,6 +486,10 @@ PacingPipelineConfig PacingPipeline_ClampConfig(PacingPipelineConfig config) noe
     if (static_cast<uint32_t>(config.gpu_queue_wait_render_queue) >=
         static_cast<uint32_t>(PacingRenderQueue::Count)) {
         config.gpu_queue_wait_render_queue = kDefaultConfig.gpu_queue_wait_render_queue;
+    }
+    if (static_cast<uint32_t>(config.lead_coverage) >=
+        static_cast<uint32_t>(PacingLeadCoverage::Count)) {
+        config.lead_coverage = kDefaultConfig.lead_coverage;
     }
     config.adaptive_cap_percentile = (std::clamp)(config.adaptive_cap_percentile,
         kAdaptiveCapPercentileMin, kAdaptiveCapPercentileMax);
@@ -518,6 +532,7 @@ void PacingPipeline_SetConfig(const PacingPipelineConfig& config) noexcept
     s_config.gpu_wait_interleave_s.store(safe_config.gpu_wait_interleave_s, std::memory_order_relaxed);
     s_config.gpu_queue_wait_render_queue.store(
         safe_config.gpu_queue_wait_render_queue, std::memory_order_relaxed);
+    s_config.lead_coverage.store(safe_config.lead_coverage, std::memory_order_relaxed);
     s_config.stall_inject_ms.store(safe_config.stall_inject_ms, std::memory_order_relaxed);
     s_config.stall_inject_period_s.store(
         safe_config.stall_inject_period_s, std::memory_order_relaxed);
@@ -638,6 +653,20 @@ const char* PacingRenderQueue_Text(PacingRenderQueue render_queue) noexcept
 bool PacingRenderQueue_FromText(const char* text, PacingRenderQueue* render_queue) noexcept
 {
     return EnumFromText(text, render_queue, PacingRenderQueue_Text);
+}
+
+const char* PacingLeadCoverage_Text(PacingLeadCoverage coverage) noexcept
+{
+    switch (coverage) {
+        case PacingLeadCoverage::Q95: return "95";
+        case PacingLeadCoverage::Q99: return "99";
+        default: return "unknown";
+    }
+}
+
+bool PacingLeadCoverage_FromText(const char* text, PacingLeadCoverage* coverage) noexcept
+{
+    return EnumFromText(text, coverage, PacingLeadCoverage_Text);
 }
 
 const char* PacingPlacementOverride_Text(PacingPlacementOverride placement) noexcept

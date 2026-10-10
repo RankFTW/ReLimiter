@@ -131,12 +131,12 @@ class ConfigSavePolicyTests(unittest.TestCase):
         config = HEADER.split("struct Config {", 1)[1].split("};", 1)[0]
         fields = set(re.findall(
             r"\b(?:bool|int|double|float|std::string|PacingSmoothing|PacingRungOverride|"
-            r"PacingMarkerForwardOrder|PacingRenderQueue|PacingPlacementOverride)\s+(\w+)\s*=",
+            r"PacingMarkerForwardOrder|PacingRenderQueue|PacingLeadCoverage|PacingPlacementOverride)\s+(\w+)\s*=",
             config))
         self.assertTrue({"smoothing", "adaptive_cap", "output_rung", "stall_inject_ms",
                          "stall_inject_period_s", "gpu_present_gate_probes",
                          "gpu_wait_budget_us", "marker_forward_order",
-                         "gpu_queue_wait_render_queue", "source_placement"} <= fields)
+                         "gpu_queue_wait_render_queue", "lead_coverage", "source_placement"} <= fields)
         saved = set(re.findall(r"\bconfig\.(\w+)", body("WriteConfigSnapshot")))
         # Every Config field is saved: the section clear before the startup
         # rewrite erases any key the writer omits.
@@ -202,7 +202,7 @@ class ConfigSavePolicyTests(unittest.TestCase):
         self.assertEqual(fields, {"smoothing", "rung_override", "adaptive_cap",
                                   "adaptive_cap_percentile", "gpu_probes", "gpu_wait_budget_us",
                                   "gpu_wait_interleave_s", "gpu_queue_wait_render_queue",
-                                  "placement_override", "stall_inject_ms",
+                                  "lead_coverage", "placement_override", "stall_inject_ms",
                                   "stall_inject_period_s"})
         mapping = dict(re.findall(r"\bpipeline\.(\w+)\s*=\s*config\.(\w+);",
                                   body("PacingPipelineConfigFrom")))
@@ -215,7 +215,8 @@ class ConfigSavePolicyTests(unittest.TestCase):
                                    "stall_inject_period_s": "stall_inject_period_s",
                                    "gpu_wait_budget_us": "gpu_wait_budget_us",
                                    "gpu_wait_interleave_s": "gpu_wait_interleave_s",
-                                   "gpu_queue_wait_render_queue": "gpu_queue_wait_render_queue"})
+                                   "gpu_queue_wait_render_queue": "gpu_queue_wait_render_queue",
+                                   "lead_coverage": "lead_coverage"})
         # The OSD applies pipeline edits through the same function.
         for name, text in (("config.cpp", SOURCE), ("osd.cpp", OSD)):
             self.assertNotRegex(text, r"\bg_frame_time_adaptation\b", name)

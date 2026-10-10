@@ -207,6 +207,11 @@ void ValidateConfig() {
         LOG_WARN("Config: invalid gpu_queue_wait_render_queue, resetting to 'keep'");
         g_config.gpu_queue_wait_render_queue = PacingRenderQueue::Keep;
     }
+    if (static_cast<unsigned>(g_config.lead_coverage) >=
+        static_cast<unsigned>(PacingLeadCoverage::Count)) {
+        LOG_WARN("Config: invalid lead_coverage, resetting to '95'");
+        g_config.lead_coverage = PacingLeadCoverage::Q95;
+    }
     if (static_cast<unsigned>(g_config.source_placement) >=
         static_cast<unsigned>(PacingPlacementOverride::Count)) {
         LOG_WARN("Config: invalid source_placement, resetting to 'pre_sleep'");
@@ -302,6 +307,12 @@ static void LoadPacingPipelineKeys(const char* S, const char* P) {
         LOG_WARN("Config: invalid gpu_queue_wait_render_queue '%s', resetting to 'keep'",
                  render_queue.c_str());
         g_config.gpu_queue_wait_render_queue = PacingRenderQueue::Keep;
+    }
+
+    const std::string lead_coverage = ReadINIString(S, "lead_coverage", "95", P);
+    if (!PacingLeadCoverage_FromText(lead_coverage.c_str(), &g_config.lead_coverage)) {
+        LOG_WARN("Config: invalid lead_coverage '%s', resetting to '95'", lead_coverage.c_str());
+        g_config.lead_coverage = PacingLeadCoverage::Q95;
     }
 
     const std::string placement = ReadINIString(S, "source_placement", "pre_sleep", P);
@@ -605,6 +616,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
         PacingMarkerForwardOrder_Text(config.marker_forward_order), P);
     WriteINIString(S, "gpu_queue_wait_render_queue",
         PacingRenderQueue_Text(config.gpu_queue_wait_render_queue), P);
+    WriteINIString(S, "lead_coverage", PacingLeadCoverage_Text(config.lead_coverage), P);
     WriteINIString(S, "source_placement",
         PacingPlacementOverride_Text(config.source_placement), P);
     WriteINIDouble(S, "stall_inject_ms", config.stall_inject_ms, P);
@@ -845,6 +857,7 @@ static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
     pipeline.gpu_wait_budget_us = config.gpu_wait_budget_us;
     pipeline.gpu_wait_interleave_s = config.gpu_wait_interleave_s;
     pipeline.gpu_queue_wait_render_queue = config.gpu_queue_wait_render_queue;
+    pipeline.lead_coverage = config.lead_coverage;
     return pipeline;
 }
 
@@ -869,6 +882,7 @@ int Config_DeveloperOverrides() {
         (g_config.reflex_sleep_bypass != d.reflex_sleep_bypass) +
         (g_config.marker_forward_order != d.marker_forward_order) +
         (g_config.gpu_queue_wait_render_queue != d.gpu_queue_wait_render_queue) +
+        (g_config.lead_coverage != d.lead_coverage) +
         (g_config.source_placement != d.source_placement);
 }
 
@@ -884,6 +898,7 @@ void Config_ResetDeveloperSettings() {
     g_config.reflex_sleep_bypass = d.reflex_sleep_bypass;
     g_config.marker_forward_order = d.marker_forward_order;
     g_config.gpu_queue_wait_render_queue = d.gpu_queue_wait_render_queue;
+    g_config.lead_coverage = d.lead_coverage;
     g_config.source_placement = d.source_placement;
     Config_ApplyPacingPipeline();
     LOG_INFO("Config: developer diagnostics reset to the recommended defaults");
@@ -927,6 +942,9 @@ void ApplyConfig() {
                  "simulation -> render queue%s)", PacingRenderQueue_Text(g_config.gpu_queue_wait_render_queue),
                  g_config.gpu_queue_wait_render_queue == PacingRenderQueue::RemoveHeld
                      ? " after frames whose GPU waited at the gate" : "");
+    if (g_config.lead_coverage != PacingLeadCoverage::Q95)
+        LOG_WARN("Pacing pipeline: diagnostic lead coverage %s%% (the lead covers that share of frames; "
+                 "the render handoff limit keeps 95%%)", PacingLeadCoverage_Text(g_config.lead_coverage));
 }
 
 

@@ -143,6 +143,7 @@ namespace
             left.gpu_wait_budget_us == right.gpu_wait_budget_us &&
             left.gpu_wait_interleave_s == right.gpu_wait_interleave_s &&
             left.gpu_queue_wait_render_queue == right.gpu_queue_wait_render_queue &&
+            left.lead_coverage == right.lead_coverage &&
             left.stall_inject_ms == right.stall_inject_ms &&
             left.stall_inject_period_s == right.stall_inject_period_s;
     }
@@ -519,6 +520,38 @@ namespace
         CHECK_LEAD(unknown, 0.95, 500.0);
     }
 
+    // Developer A/B lead_coverage: Q99 raises only the lead's quantile, on every
+    // rung and smoothing level; the allowance and the render handoff quantile
+    // stay the Smoothing table's.
+    void TestLeadCoverage()
+    {
+        PacingPipelineConfig config{};
+        PacingPipelineSnapshot result = Resolve(config, QualifiedDx12(), ActiveFg());
+        CHECK_LEAD(result, 0.95, 500.0);
+        CHECK(result.handoff_quantile == 0.95);
+        config.lead_coverage = PacingLeadCoverage::Q99;
+        result = Resolve(config, QualifiedDx12(), ActiveFg());
+        CHECK(result.rung == PacingRung::FgInputWait);
+        CHECK_LEAD(result, 0.99, 500.0);
+        CHECK(result.handoff_quantile == 0.95);
+        result = Resolve(config, QualifiedDx12(), ActiveVrr());
+        CHECK(result.rung == PacingRung::GpuQueueWait);
+        CHECK_LEAD(result, 0.99, 500.0);
+        CHECK(result.handoff_quantile == 0.95);
+        config.smoothing = PacingSmoothing::Off;
+        result = Resolve(config, QualifiedDx12(), ActiveVrr());
+        CHECK_LEAD(result, 0.99, 0.0);
+        CHECK(result.handoff_quantile == 0.95);
+
+        PacingPipelineConfig invalid{};
+        invalid.lead_coverage = static_cast<PacingLeadCoverage>(9);
+        CHECK(PacingPipeline_ClampConfig(invalid).lead_coverage == PacingLeadCoverage::Q95);
+        CHECK_LEAD(Resolve(invalid, QualifiedDx12(), ActiveVrr()), 0.95, 500.0);
+        PacingLeadCoverage parsed = PacingLeadCoverage::Q95;
+        CHECK(PacingLeadCoverage_FromText("99", &parsed) && parsed == PacingLeadCoverage::Q99);
+        CHECK(!PacingLeadCoverage_FromText("97", &parsed) && parsed == PacingLeadCoverage::Q99);
+    }
+
     void TestProbesCopied()
     {
         PacingPipelineConfig config{};
@@ -567,6 +600,9 @@ namespace
         CHECK(!PacingPipeline_SameResult(base, other));
         other = base;
         other.allowance_us = 1000.0;
+        CHECK(!PacingPipeline_SameResult(base, other));
+        other = base;
+        other.handoff_quantile = 0.99;
         CHECK(!PacingPipeline_SameResult(base, other));
         other = base;
         other.gpu_probes = !base.gpu_probes;
@@ -804,6 +840,7 @@ namespace
         config.stall_inject_ms = 50.0;
         config.stall_inject_period_s = 10.0;
         config.gpu_queue_wait_render_queue = PacingRenderQueue::RemoveHeld;
+        config.lead_coverage = PacingLeadCoverage::Q99;
         PacingPipeline_SetConfig(config);
         CHECK(SameConfig(PacingPipeline_GetConfig(), config));
         CHECK(PacingPipeline_GetConfig().adaptive_cap);
@@ -1184,6 +1221,7 @@ int main()
     TestAutoRung();
     TestHoldFeasibility();
     TestSmoothingTable();
+    TestLeadCoverage();
     TestProbesCopied();
     TestSameResult();
     TestPublishGeneration();

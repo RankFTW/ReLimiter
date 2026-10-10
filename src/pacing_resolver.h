@@ -95,6 +95,7 @@ struct PacingPipelineConfig {
     double gpu_wait_budget_us = kPacingGpuWaitBudgetDefaultUs; // developer key gpu_wait_budget_us: [500, 5000]
     double gpu_wait_interleave_s = 0.0; // developer key gpu_wait_interleave_s: 0 = off, else [1, 10]
     PacingRenderQueue gpu_queue_wait_render_queue = PacingRenderQueue::Keep; // developer key (A/B)
+    PacingLeadCoverage lead_coverage = PacingLeadCoverage::Q95; // developer key lead_coverage (A/B)
     double stall_inject_ms = 0.0; // 0 = off; [0, kPacingStallInjectMaxMs]
     double stall_inject_period_s = kPacingStallInjectDefaultPeriodS; // [1, 60]
 };
@@ -150,8 +151,11 @@ struct PacingPipelineSnapshot {
     // check, the guard's judged frames and telemetry read it.
     PacingRung auto_rung = PacingRung::SourceOnly;
     PacingFallbackReason reason = PacingFallbackReason::Passthrough;
-    double lead_quantile = 0.95; // q of the lead controller: L = Q_q(X) + allowance
+    double lead_quantile = 0.95; // q of the lead controller: L = Q_q(X) + allowance (lead_coverage)
     double allowance_us = 500.0; // defaults: On, so the initial snapshot equals default passthrough
+    // q of the render handoff offset, d = Q_{1−q}(h) − allowance: the Smoothing
+    // quantile, whatever lead_coverage says.
+    double handoff_quantile = 0.95;
     bool gpu_probes = true;
     double gpu_wait_budget_us = kPacingGpuWaitBudgetDefaultUs; // the GPU wait cap ladder's top level
 };
@@ -230,6 +234,8 @@ const char* PacingMarkerForwardOrder_Text(PacingMarkerForwardOrder order) noexce
 bool PacingMarkerForwardOrder_FromText(const char* text, PacingMarkerForwardOrder* order) noexcept;
 const char* PacingRenderQueue_Text(PacingRenderQueue render_queue) noexcept;
 bool PacingRenderQueue_FromText(const char* text, PacingRenderQueue* render_queue) noexcept;
+const char* PacingLeadCoverage_Text(PacingLeadCoverage coverage) noexcept;
+bool PacingLeadCoverage_FromText(const char* text, PacingLeadCoverage* coverage) noexcept;
 const char* PacingPlacementOverride_Text(PacingPlacementOverride placement) noexcept;
 bool PacingPlacementOverride_FromText(const char* text, PacingPlacementOverride* placement) noexcept;
 

@@ -210,7 +210,7 @@ The lead for the next frame comes from the bucket's samples:
 
 - **Window.** The newest 256 samples. A sample longer than 3 `I` is left out of the lead (it still counts as a missed target).
 - **Warm and warming.** With fewer than 32 samples the bucket is *warming* and the lead is a starting estimate: `I / 2` limited to 1–8 ms. After a hold resumes from an overload pause it is the old median plus the allowance until 32 new samples arrive. From 32 samples the bucket is *warm*.
-- **Quantile plus allowance.** The warm target is the 95th percentile of the window plus an allowance of 0.5 ms (Smoothing off: 95th percentile, no allowance). About 19 of 20 frames are then finished before their target, and the rest are late and never held.
+- **Quantile plus allowance.** The warm target is the 95th percentile of the window plus an allowance of 0.5 ms (Smoothing off: 95th percentile, no allowance). About 19 of 20 frames are then finished before their target, and the rest are late and never held. The developer A/B **Lead coverage** (`lead_coverage=99`) uses the 99th percentile instead; the render handoff offset keeps the 95th.
 - **Slew.** After the first warm lead, the lead moves toward its target by at most `min(100 µs, I / 64)` per planned frame.
 - **Budget.** The lead is limited to `[0, 3 I]`. Details marks `, at budget` when the wanted lead was longer, so those frames are likely to miss their targets.
 - **Output-specific limits.** On `gpu_queue_wait` the GPU wait cap and the collision-aware release can lower the lead further (see [Protecting Pacing Under Load](#protecting-pacing-under-load)).

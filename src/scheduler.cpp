@@ -967,7 +967,7 @@ static void FillControllerStatus(SchedulerPacingStatus* status) noexcept
     status->render_handoff = s_handoff_blocked ? 2
         : s_handoff_hook_frame.load(std::memory_order_relaxed) != 0 ? 1 : 0;
     status->render_handoff_offset_us = s_source_stage.Lead().HandoffOffsetUs(
-        pipeline.lead_quantile, pipeline.allowance_us);
+        pipeline.handoff_quantile, pipeline.allowance_us);
     status->render_handoff_limited = static_cast<uint32_t>(s_handoff_limited_frames);
     status->render_handoff_stalls = static_cast<uint32_t>(s_handoff_stalls);
     status->hold_overloaded = s_hold_feasibility.Overloaded();
@@ -1462,7 +1462,7 @@ static int64_t HandoffEarliestRelease(const PacingPlanKey& key, double interval_
     s_handoff_stall_run = 0;
     NoteHandoffBeforeRelease(key, released.frame_id);
     return handoff_qpc + us_to_qpc(s_source_stage.Lead().HandoffOffsetUs(
-        pipeline.lead_quantile, pipeline.allowance_us));
+        pipeline.handoff_quantile, pipeline.allowance_us));
 }
 
 // After a planned frame: it is the newest released frame, and the Reflex
@@ -1813,7 +1813,7 @@ bool Scheduler_PlanReflexSleep(int64_t now_qpc, bool driver_sleep, int64_t hando
         if (handoff_qpc > 0) {
             const PacingPipelineSnapshot pipeline = PacingPipeline_Read();
             const int64_t earliest_qpc = handoff_qpc + us_to_qpc(s_source_stage.Lead().HandoffOffsetUs(
-                pipeline.lead_quantile, pipeline.allowance_us));
+                pipeline.handoff_quantile, pipeline.allowance_us));
             request.next_target_qpc = (std::max)(request.next_target_qpc,
                 earliest_qpc + us_to_qpc(s_last_plan_lead_us));
         }

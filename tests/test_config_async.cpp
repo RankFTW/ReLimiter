@@ -302,6 +302,7 @@ void CheckPipelineMatchesConfig() {
     CHECK(pipeline.stall_inject_period_s == g_config.stall_inject_period_s);
     CHECK(pipeline.gpu_wait_interleave_s == g_config.gpu_wait_interleave_s);
     CHECK(pipeline.gpu_queue_wait_render_queue == g_config.gpu_queue_wait_render_queue);
+    CHECK(pipeline.lead_coverage == g_config.lead_coverage);
     CHECK(g_marker_forward_after_wait.load() ==
         (g_config.marker_forward_order == PacingMarkerForwardOrder::AfterWait));
 }
@@ -317,11 +318,13 @@ void TestPacingPipelineDefaults() {
     CHECK(g_config.reflex_sleep_bypass && g_reflex_sleep_bypass.load());
     CHECK(g_config.marker_forward_order == PacingMarkerForwardOrder::BeforeWait);
     CHECK(g_config.gpu_queue_wait_render_queue == PacingRenderQueue::Keep);
+    CHECK(g_config.lead_coverage == PacingLeadCoverage::Q95);
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
     CheckPipelineMatchesConfig();
     // The startup rewrite saves every new key, including the developer keys.
     CHECK(Value(local_path, "FrameLimiter", "marker_forward_order") == "before_wait");
     CHECK(Value(local_path, "FrameLimiter", "gpu_queue_wait_render_queue") == "keep");
+    CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "95");
     CHECK(Value(local_path, "FrameLimiter", "source_placement") == "pre_sleep");
     CHECK(Value(local_path, "FrameLimiter", "reflex_sleep_bypass") == "true");
     CHECK(Value(local_path, "FrameLimiter", "developer_settings") == "false");
@@ -501,6 +504,24 @@ void TestRenderQueueParsing() {
     ReleaseStart();CHECK(OwnerShutdown());
     CheckWorkerWrites();
     CHECK(Value(local_path, "FrameLimiter", "gpu_queue_wait_render_queue") == "remove_held");
+}
+
+// Developer A/B lead_coverage: 99 loads, reaches the pipeline, counts as a
+// developer override and resets to 95; other text falls back to 95.
+void TestLeadCoverageKey() {
+    Reset(false, false, {{"lead_coverage", "99"}});
+    CHECK(g_config.lead_coverage == PacingLeadCoverage::Q99);
+    CheckPipelineMatchesConfig();
+    CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "99");
+    CHECK(Config_DeveloperOverrides() == 1);
+    Config_ResetDeveloperSettings();
+    CHECK(g_config.lead_coverage == PacingLeadCoverage::Q95);
+    CHECK(PacingPipeline_GetConfig().lead_coverage == PacingLeadCoverage::Q95);
+    ReleaseStart();CHECK(OwnerShutdown());
+    Reset(false, false, {{"lead_coverage", "97"}});
+    CHECK(g_config.lead_coverage == PacingLeadCoverage::Q95);
+    CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "95");
+    ReleaseStart();CHECK(OwnerShutdown());
 }
 
 // pacing_method=marker becomes output_rung=marker; automatic, native and
@@ -879,6 +900,7 @@ int main() {
     TestSmoothingParsing();
     TestMarkerForwardOrderParsing();
     TestRenderQueueParsing();
+    TestLeadCoverageKey();
     TestSourcePlacementParsing();
     TestPacingMethodMigration();
     TestAdaptiveCapMigration();
