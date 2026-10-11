@@ -102,7 +102,7 @@ void Scheduler_RecordReflexSleep(int64_t now_qpc) noexcept;
 //      Sleep is bypassed: Scheduler_RenderHandoffFrame (any thread) names the
 //      newest released frame whose handoff the next frame waits for;
 //      without the owner, RenderHandoff_WaitFor (render_handoff.h) waits for
-//      it, and a wait that stalled (the render thread finished no frame for
+//      it, and a wait that stalled (the render thread took no frame for
 //      three of its frame times, at least 3 I) calls
 //      Scheduler_RenderHandoffStalled.
 //   3. Scheduler_PlanReflexSleep (caller holds SchedulerOwnerGuard): decides
@@ -206,7 +206,8 @@ struct SchedulerPacingStatus {
 	uint32_t driver_limiter_interval_us = 0; // applied Reflex minimumIntervalUs; 0 = none
 	// Render handoff limit. Current on every publication.
 	uint8_t render_handoff = 0;            // 0 off, 1 limits the newest frame, 2 blocked
-	double render_handoff_offset_us = 0.0; // d
+	double render_handoff_offset_us = 0.0; // d + c
+	double render_handoff_queue_us = 0.0;  // c, the GPU queue term
 	uint32_t render_handoff_limited = 0;   // frames the limit released after S, cumulative
 	uint32_t render_handoff_stalls = 0;    // waits that ended without the handoff, cumulative
 };

@@ -25,6 +25,10 @@ constexpr size_t LEAD_HISTOGRAM_BINS = 2048;       // the last bin also holds la
 constexpr double LEAD_HISTOGRAM_BIN_US = 20.0;
 constexpr uint32_t LEAD_WARM_SAMPLES = 32;
 constexpr uint32_t LEAD_HANDOFF_MIN_SAMPLES = 16;  // the render handoff offset is 0 until this many samples
+// Render handoff GPU queue term (below): learning step per report, a share of
+// the frame's interval, and its upper bound in intervals.
+constexpr double LEAD_HANDOFF_QUEUE_STEP_FRACTION = 0.01;
+constexpr double LEAD_HANDOFF_QUEUE_MAX_INTERVALS = 1.0;
 constexpr size_t LEAD_DIVISOR_BUCKETS = 4;         // FG divisor 1..4
 constexpr size_t LEAD_PENDING_CAPACITY = 32;       // frames being assembled, by grid index
 constexpr uint64_t LEAD_PENDING_EXPIRY_FRAMES = 8; // frames this far behind the newest release close
@@ -213,24 +217,41 @@ constexpr CollisionDistanceLimits LEAD_HEADROOM_LIMITS{ 1000.0, 750.0, 3000.0 };
 //   queues (w before e): q was 0 on every frame of five captures.
 
 // Render handoff offset. A frame
-// that is not held is released no earlier than A_n = v_{n−1} + d, where
-// v_{n−1} is RENDERSUBMIT_END of the newest released frame, the moment the
-// render thread finished submitting it: a pipelined game then cannot
-// simulate frames that only wait for its render thread (CONTROL Resonant FG
-// 2× with the Reflex Sleep bypassed: the release of frame n came 28.6 ms
-// before PRESENT_END(n−1)), and its simulation does not run inside that
-// submission. Anchored at RENDERSUBMIT_START instead, the simulation of n
-// started inside the submission of n − 1 on every frame and slowed it
-// (Gears of War: E-Day 11.7 → 17.2 ms, CONTROL Resonant 5.8 → 7.8 ms p50);
-// the driver's Sleep starts it after the submission in both. Each frame n
-// released at or after v_{n−1} adds h = (b_{n−1} − v_{n−1}) − (e_n − s_n):
-// how much later it could have been released and still ended its
-// simulation before the render thread left frame n−1's Present. d =
-// max(0, Q_{1−q}(h) − allowance) with the Smoothing lead's q and allowance,
-// 0 until LEAD_HANDOFF_MIN_SAMPLES. Every rung samples, so d is warm when
-// holds pause. A frame released before v_{n−1} is skipped: its simulation
-// may have waited at the handoff. Serial engines (Rogue Core, v before e)
-// give h < 0 and d = 0, so the limit never binds there.
+// that is not held is released no earlier than A_n = w_{n−1} + d, where
+// w_{n−1} is RENDERSUBMIT_START of the newest released frame: a pipelined
+// game then cannot simulate frames that only wait for its render thread
+// (CONTROL Resonant FG 2× with the Reflex Sleep bypassed: the
+// release of frame n came 28.6 ms before PRESENT_END(n−1)). Each frame n
+// released at or after w_{n−1} adds h = (b_{n−1} − w_{n−1}) − (e_n − s_n): how
+// much later it could have been released and still ended its simulation
+// before the render thread left frame n−1's Present. d = max(0, Q_{1−q}(h) −
+// allowance) with the Smoothing lead's q and allowance, 0 until
+// LEAD_HANDOFF_MIN_SAMPLES. Every rung samples, so d is warm when holds
+// pause. A frame released before w_{n−1} is skipped: its simulation may have
+// waited at the handoff. Serial engines (Rogue Core, w before e) give h < 0
+// and d = 0, so the limit never binds there.
+
+// Render handoff GPU queue term. The offset d keeps the simulation from
+// waiting for the render thread, but a render thread can also wait for the
+// GPU inside its submission. Gears of War: E-Day FG 2× in the overload
+// pause (the GPU the bottleneck): the render thread started each frame as
+// soon as it finished the previous one and finished it only once the GPU
+// was nearly done with the previous frame; 72% of frames finished their
+// submission (RENDERSUBMIT_END v_n) before the GPU finished frame n − 1
+// (Reflex gpuRenderEndTime g_{n−1}), v_n − g_{n−1} p50 −1.36 ms, and the
+// simulation started 29.8 ms before the frame's GPU work against 15.2 ms
+// with the driver's Sleep (12% of frames; PC latency 56 against 40 ms).
+// CONTROL Resonant paused: 3–5% (p50 +3.7 ms). The limit adds a learned
+// delay c: A_n = w_{n−1} + d + c. Each Reflex report of a frame released
+// under the limit raises c by q·η when v_n < g_{n−1} and lowers it by
+// (1 − q)·η otherwise, η = LEAD_HANDOFF_QUEUE_STEP_FRACTION of the frame's
+// interval and q the Smoothing quantile, so c settles where a share 1 − q
+// of frames still finish their submission while the GPU is busy; c stays
+// within [0, LEAD_HANDOFF_QUEUE_MAX_INTERVALS × I]. Held frames neither feed
+// nor use it. A game whose frames reach the GPU after it is free (a render
+// thread that is the bottleneck, CONTROL) keeps c = 0, so the release keeps
+// overlapping the render thread's work. Both timestamps come from the
+// driver's clock; c clears with the handoff window.
 
 // ── Inputs and status ──
 
@@ -272,6 +293,9 @@ struct LeadFrameStart {
     int64_t wait_end_qpc = 0;
     int64_t pre_wait_start_qpc = 0;
     int64_t pre_wait_end_qpc = 0;
+    // The render handoff limit set this frame's earliest release (scheduler):
+    // its Reflex report feeds the GPU queue term (above).
+    bool handoff_release = false;
 };
 
 // Everything NextLeadUs needs from the plan being made and the resolved pipeline.
@@ -374,6 +398,12 @@ struct LeadStatistics {
     // Render handoff samples h (above) and the newest one.
     uint64_t handoff_samples = 0;
     double last_handoff_us = 0.0;
+    // GPU queue term (above): reports of frames released under the limit,
+    // of those frames that finished their submission while the GPU was still
+    // busy, and reports without a pending frame.
+    uint64_t handoff_queue_samples = 0;
+    uint64_t handoff_queue_waited = 0;
+    uint64_t unmatched_handoff_queue = 0;
     double last_sample_us = 0.0;     // newest sample added to a bucket
     double last_slack_us = 0.0;      // newest slack L − X, long samples included
     // Slack samples (one per frame whose readiness was measured, long ones
@@ -495,6 +525,13 @@ public:
     // dropped.
     void OnGpuActiveTime(uint32_t producer_epoch, uint64_t frame_id, double gpu_active_us,
         int64_t gpu_start_qpc = 0) noexcept;
+    // The Reflex report of NvAPI frame (producer_epoch, frame_id): its
+    // RENDERSUBMIT_END minus the previous frame's GPU render end, in µs on the
+    // driver's clock (the GPU queue term, above), with the Smoothing quantile
+    // q. Used once per frame released under the render handoff limit; other
+    // frames are ignored, and a report without a pending frame is counted.
+    void OnHandoffQueue(uint32_t producer_epoch, uint64_t frame_id, double submit_after_gpu_free_us,
+        double quantile) noexcept;
 
     LeadBucketStatus BucketStatus(PacingRung rung, double fg_divisor) const noexcept;
     // Median sample X of a warm bucket (release to output point); 0 when the
@@ -507,13 +544,15 @@ public:
     // 0 until 32 samples, for a non-finite q, after a reset, and while the
     // queue order shows the next frame's GPU work behind the wait.
     double HoldRoomUs(double fg_divisor, double quantile) const noexcept;
-    // Render handoff offset d (above): max(0, Q_{1−q}(h) − allowance_us) over
-    // the newest 256 samples; 0 before LEAD_HANDOFF_MIN_SAMPLES or for a
-    // non-finite q or allowance.
+    // Render handoff offset d + c (above): d = max(0, Q_{1−q}(h) − allowance_us)
+    // over the newest 256 samples, 0 before LEAD_HANDOFF_MIN_SAMPLES or for a
+    // non-finite q or allowance; c the GPU queue term.
     double HandoffOffsetUs(double quantile, double allowance_us) const noexcept;
+    // The GPU queue term c alone.
+    double HandoffQueueUs() const noexcept { return handoff_queue_us_; }
     // Handoff samples in the window. At LEAD_HANDOFF_MIN_SAMPLES the game has
-    // shown its render thread finishing a frame before the next release,
-    // which a render thread that waits for the next release never does.
+    // shown its render thread taking a frame before the next release, which
+    // a render thread that waits for the next release never does.
     uint32_t HandoffSamples() const noexcept { return handoff_window_.Count(); }
     // Frame (key, grid_index)'s gated hold in QPC ticks (lockstep engines,
     // above): the waits of later pending frames of its lifecycle released no
@@ -540,7 +579,7 @@ private:
     static constexpr size_t kBucketCount =
         static_cast<size_t>(PacingRung::Count) * LEAD_DIVISOR_BUCKETS;
 
-    // Stage times of a pending frame; 1..10 match PacingStageEventKind.
+    // Stage times of a pending frame; 1..9 match PacingStageEventKind.
     enum Field : uint8_t {
         FieldSource = 0,
         FieldMarkerArrival,
@@ -552,7 +591,6 @@ private:
         FieldRenderSubmit,
         FieldSimulationEnd, // e: GPU waits
         FieldPresentEnd,    // b: GPU waits
-        FieldRenderSubmitEnd, // v: the render handoff
         FieldCount
     };
 
@@ -595,6 +633,8 @@ private:
         bool headroom_recorded = false; // r_{n+1} − A_{n+1} − o_n entered the headroom learner
         int64_t gpu_start_qpc = 0;      // Reflex gpuRenderStartTime as QPC; 0 unknown
         bool concurrency_recorded = false; // (o_n, g_{n+1}) entered the queue-order window
+        bool handoff_release = false;        // released under the render handoff limit
+        bool handoff_queue_recorded = false; // its report entered the GPU queue term
     };
 
     // The newest LEAD_SLACK_CAPACITY slack signs of one bucket.
@@ -658,8 +698,8 @@ private:
     // e, w, p and the previous frame's b.
     double QueueUs(const PendingFrame& frame, const PendingFrame* previous) const noexcept;
     // Render handoff sample h of frame n (above), when frame n and its
-    // previous frame carry s, e and v, b, and frame n was released at or after
-    // v_{n−1}.
+    // previous frame carry s, e and w, b, and frame n was released at or after
+    // w_{n−1}.
     void RecordHandoff(const PendingFrame& frame, const PendingFrame* previous) noexcept;
     // Lockstep engines: waits of later frames that gated this one, in ticks.
     int64_t GatedHoldTicks(const PendingFrame& frame) const noexcept;
@@ -694,6 +734,8 @@ private:
     std::array<LeadSampleWindow, LEAD_DIVISOR_BUCKETS> room_windows_{};
     // Render handoff samples h (above), all rungs and FG divisors.
     LeadSampleWindow handoff_window_{};
+    // The render handoff GPU queue term c (above), in µs.
+    double handoff_queue_us_ = 0.0;
     ReleaseMarginLearner margin_{};
     ReleaseMarginLearner headroom_{ LEAD_HEADROOM_LIMITS };
     // Queue order: the newest LEAD_CONCURRENCY_SAMPLES pairs, 1 = concurrent.

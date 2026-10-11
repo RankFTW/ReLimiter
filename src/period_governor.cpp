@@ -78,6 +78,7 @@ const char* GovernorCause_Text(GovernorCause cause) noexcept
         case GovernorCause::Release: return "release";
         case GovernorCause::Probe: return "probe";
         case GovernorCause::ProbeFailed: return "probe_failed";
+        case GovernorCause::ReleaseFailed: return "release_failed";
         case GovernorCause::Reset: return "reset";
         case GovernorCause::Base: return "base";
         case GovernorCause::Room: return "room";
@@ -146,6 +147,9 @@ void PeriodGovernor::ResetState(bool settle) noexcept
     probe_backoff_ = 1.0;
     probe_step_ = GOVERNOR_PROBE_STEP;
     probing_from_stretch_ = 0.0;
+    releasing_from_stretch_ = 0.0;
+    release_need_us_ = 0.0;
+    demand_scale_ = 1.0;
     episodes_.fill(0);
     episode_head_ = 0;
     episode_count_ = 0;
@@ -312,6 +316,11 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
         GOVERNOR_DEMAND_FAST_MIN_REPORTS, &fast_us);
     const bool slow_known = DemandQuantile(quantile, static_cast<uint32_t>(GOVERNOR_DEMAND_CAPACITY),
         GOVERNOR_DEMAND_SLOW_MIN_REPORTS, &slow_us);
+    // The need as measured, before the demand scale.
+    const double measured_need_us = fast_known && slow_known ? std::max(fast_us, slow_us)
+        : fast_known ? fast_us : slow_us;
+    fast_us *= demand_scale_;
+    slow_us *= demand_scale_;
 
     // 2. A probe that brought evidence back failed: return, wait longer next time.
     if (probing_from_stretch_ > 0.0 && evidence) {
@@ -322,6 +331,20 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
         last_rise_qpc_ = qpc;
         ++statistics_.probe_failures;
         reported = GovernorCause::ProbeFailed;
+    }
+    // A release fall that brought evidence back failed: return, and scale
+    // the demand so later falls stop above the interval that failed.
+    if (releasing_from_stretch_ > 0.0 && evidence) {
+        target_stretch_ = std::max(target_stretch_, releasing_from_stretch_);
+        if (IsPositiveFinite(release_need_us_)) {
+            demand_scale_ = std::max(demand_scale_, paced(base_us * stretch_) / release_need_us_);
+        }
+        releasing_from_stretch_ = 0.0;
+        release_need_us_ = 0.0;
+        probing_from_stretch_ = 0.0;
+        last_rise_qpc_ = qpc;
+        ++statistics_.release_failures;
+        reported = GovernorCause::ReleaseFailed;
     }
 
     // 3. Rise: evidence, sized by demand and bounded per step; a high miss
@@ -360,6 +383,8 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
             headroom_since_qpc_ = 0;
             probe_step_ = GOVERNOR_PROBE_STEP;
             probing_from_stretch_ = 0.0;
+            releasing_from_stretch_ = 0.0;
+            release_need_us_ = 0.0;
             window_.Restart();
             ++statistics_.rises;
             if (cause == GovernorCause::Misses) ++statistics_.misses_used;
@@ -384,6 +409,8 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
                 const double need_us = fast_known ? std::max(fast_us, slow_us) : slow_us;
                 const double next_us = std::max(base_us, need_us + margin_us);
                 if (next_us < target_us - kStretchEpsilon * base_us) {
+                    releasing_from_stretch_ = std::max(releasing_from_stretch_, target_stretch_);
+                    release_need_us_ = measured_need_us;
                     target_stretch_ = next_us / base_us;
                     probing_from_stretch_ = 0.0;
                     last_fall_qpc_ = qpc;
@@ -409,10 +436,19 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
         probe_backoff_ = 1.0;
         probe_step_ = std::min(probe_step_ * GOVERNOR_PROBE_STEP_GROWTH, GOVERNOR_PROBE_STEP_MAX);
     }
-    // Demand headroom being timed falls to the demand instead.
+    // A release fall held once the realized interval reached it (or the
+    // hold room that keeps it above) and stayed calm for a second.
+    if (releasing_from_stretch_ > 0.0 &&
+        stretch_ <= std::max(target_stretch_, room_stretch_) + kStretchEpsilon &&
+        calm_s >= GOVERNOR_PROBE_CALM_S && since(last_fall_qpc_) >= GOVERNOR_PROBE_CALM_S) {
+        releasing_from_stretch_ = 0.0;
+        release_need_us_ = 0.0;
+    }
+    // Demand headroom being timed falls to the demand instead. A scaled
+    // demand already measures below what the frames need: no probe.
     if (target_stretch_ > 1.0 + kStretchEpsilon && !holding && headroom_since_qpc_ == 0 &&
         calm_s >= GOVERNOR_PROBE_CALM_S * probe_backoff_ && since(last_fall_qpc_) >= GOVERNOR_PROBE_CALM_S &&
-        !GpuBindsDemand()) {
+        demand_scale_ <= 1.0 && !GpuBindsDemand()) {
         probing_from_stretch_ = target_stretch_;
         target_stretch_ = std::max(1.0, target_stretch_ - probe_step_);
         last_probe_qpc_ = qpc;

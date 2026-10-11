@@ -223,8 +223,8 @@ void TestReflexCallForwarding() {
     g_reflex_sleep_bypass=false;
 
     // Render handoff limit: a bypassed Sleep
-    // waits until the render thread has finished submitting the newest
-    // released frame, then plans the pre-wait with that handoff, before the game reads input.
+    // waits until the render thread has taken the newest released frame, then
+    // plans the pre-wait with that handoff, before the game reads input.
     g_reflex_sleep_bypass=true;g_user_target_fps=157;
     s_pre_sleep_active=true;
     // Stall span 3 I = 60 ms: each Sleep below can overrun by a whole 15.6 ms
@@ -1023,11 +1023,10 @@ void TestNativeRouteFromEveryMarker() {
     NvAPI_ClearFeedbackDevice();
 }
 
-// RENDERSUBMIT_START, SIMULATION_END, PRESENT_END and RENDERSUBMIT_END of a
-// planned GPU wait frame are one stage event each at the plan's grid index
-// (the carried GPU hold, the simulation → render queue and the render handoff
-// offset; the lead decides per rung whether to use them). Unplanned frames
-// push nothing; every marker is forwarded once.
+// RENDERSUBMIT_START, SIMULATION_END and PRESENT_END of a planned GPU wait
+// frame are one stage event each at the plan's grid index (the carried GPU hold and the
+// simulation → render queue; the lead decides per rung whether to use them).
+// CPU rungs and unplanned frames push nothing; every marker is forwarded once.
 void TestFrameMarkerStageEvents() {
     FakeDevice device;
     CHECK(NvAPI_CaptureFeedbackDevice(&device));
@@ -1057,9 +1056,6 @@ void TestFrameMarkerStageEvents() {
     SendMarker(&device, 2100, PRESENT_END);
     CHECK(drain(&event) == 1 && event.kind == PacingStageEventKind::PresentEnd &&
         event.key.frame_id == 2100 && event.grid_index == h3.grid_index && event.qpc > 0);
-    SendMarker(&device, 2100, RENDERSUBMIT_END);
-    CHECK(drain(&event) == 1 && event.kind == PacingStageEventKind::RenderSubmitEnd &&
-        event.key.frame_id == 2100 && event.grid_index == h3.grid_index && event.qpc > 0);
     const PacingFramePlan fg = PublishPlan(Key(2101), PacingRung::FgInputWait, 2'000.0);
     SendMarker(&device, 2101, RENDERSUBMIT_START);
     CHECK(drain(&event) == 1 && event.kind == PacingStageEventKind::RenderSubmitStart &&
@@ -1071,30 +1067,24 @@ void TestFrameMarkerStageEvents() {
     CHECK(drain(&event) == 1 && event.kind == PacingStageEventKind::PresentEnd &&
         event.key.frame_id == 2101 && event.grid_index == fg.grid_index && event.qpc > 0);
     // A marker hold (the render handoff offset samples every rung), then a
-    // frame without a plan: no event, but its RENDERSUBMIT_END is still the
-    // newest render handoff. Its RENDERSUBMIT_START is not: the render thread
-    // has only started submitting it.
+    // frame without a plan: no event, but its RENDERSUBMIT_START is still the
+    // newest render handoff.
     PublishPlan(Key(2102), PacingRung::MarkerHold, 2'000.0);
     SendMarker(&device, 2102, RENDERSUBMIT_START);
     SendMarker(&device, 2102, SIMULATION_END);
     SendMarker(&device, 2102, PRESENT_END);
-    SendMarker(&device, 2102, RENDERSUBMIT_END);
-    CHECK(drain(&event) == 4 && event.kind == PacingStageEventKind::RenderSubmitEnd &&
+    CHECK(drain(&event) == 3 && event.kind == PacingStageEventKind::PresentEnd &&
         event.key.frame_id == 2102 && event.rung == PacingRung::MarkerHold);
-    uint64_t handoff_frame = 0;
-    int64_t handoff_qpc = 0;
     SendMarker(&device, 2103, RENDERSUBMIT_START);
     SendMarker(&device, 2103, SIMULATION_END);
-    CHECK(RenderHandoff_Latest(static_cast<uint8_t>(PacingIdentityDomain::NvApiFrame),
-        Key(2103).producer_epoch, &handoff_frame, &handoff_qpc));
-    CHECK(handoff_frame == 2102 && handoff_qpc > 0);
-    SendMarker(&device, 2103, RENDERSUBMIT_END);
     SendMarker(&device, 2103, PRESENT_END);
     CHECK(drain(&event) == 0);
+    uint64_t handoff_frame = 0;
+    int64_t handoff_qpc = 0;
     CHECK(RenderHandoff_Latest(static_cast<uint8_t>(PacingIdentityDomain::NvApiFrame),
         Key(2103).producer_epoch, &handoff_frame, &handoff_qpc));
     CHECK(handoff_frame == 2103 && handoff_qpc > 0);
-    CHECK(s_forwarded_markers - forwarded_before == 15);
+    CHECK(s_forwarded_markers - forwarded_before == 12);
     NvAPI_ClearFeedbackDevice();
 }
 

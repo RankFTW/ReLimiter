@@ -20,7 +20,15 @@
 // only and does not grow with the interval, so a probe below it can only
 // fail. After a rise no fall happens for
 // 1.5 s per overload episode of the last 20 s (up to 8 s), so a recurring
-// load is held. The realized interval moves at most +3% / -1% per frame. The
+// load is held. A release fall that brings evidence back before it has held
+// for a calm second failed: the target returns to the level before it, and
+// the demand scale k (1 after a reset) becomes at least the realized interval
+// at the evidence over the need the fall used, so every later need, rise
+// and fall is k times the measured one and no probe runs. Gears of War:
+// E-Day held FG 2× fell to the GPU work's +10% every 5–10 s and climbed back to
+// +28%: at the same interval its render thread either kept up or ran a frame
+// behind, and only the latter showed in the stage times. The realized
+// interval moves at most +3% / -1% per frame. The
 // hold room is a floor beside this target: while the Auto GPU
 // queue wait reports one, the realized interval is at least the Adaptive cap
 // percentile of the intervals at which its frames reach the GPU wait before
@@ -134,7 +142,8 @@ enum class GovernorCause : uint8_t {
     ProbeFailed = 5, // evidence after a probe: back to the level before it
     Reset = 6,       // cap, divisor, DMFG, OLED Care, focus, lifecycle or disable returned I to I_0
     Base = 7,        // the realized interval reached I_0
-    Room = 8         // the hold room started (above the governor's target) or stopped setting the interval
+    Room = 8,        // the hold room started (above the governor's target) or stopped setting the interval
+    ReleaseFailed = 9 // evidence after a release fall: back to the level before it, demand scale raised
 };
 
 enum class GovernorPhase : uint8_t {
@@ -199,6 +208,7 @@ struct GovernorStatistics {
     uint64_t falls = 0;           // fall decisions (release or probe)
     uint64_t probes = 0;          // probe falls
     uint64_t probe_failures = 0;  // probes returned by evidence
+    uint64_t release_failures = 0; // release falls returned by evidence
     uint64_t misses_used = 0;     // miss-rate rises
     uint64_t fixed_steps = 0;     // quantized fixed-refresh changes
     uint64_t resets = 0;          // resets while stretched
@@ -261,7 +271,7 @@ public:
     // Reset on the next frame. Enabling starts from a reset state.
     void Configure(bool enabled) noexcept;
     // Cap, raw FG divisor, DMFG, OLED Care, focus or lifecycle change: I = I_0,
-    // windows, episodes and probe backoff cleared. Reports a Reset on the next
+    // windows, episodes, probe backoff and the demand scale cleared. Reports a Reset on the next
     // frame when stretched. While enabled, settles for 32 frames, so frames
     // planned at the old period are not evidence. Statistics stay cumulative.
     void Reset() noexcept;
@@ -278,6 +288,7 @@ public:
     bool Enabled() const noexcept { return enabled_; }
     double Stretch() const noexcept { return stretch_; }             // realized I / I_0
     double TargetStretch() const noexcept { return target_stretch_; } // target I / I_0
+    double DemandScale() const noexcept { return demand_scale_; }     // k, 1 until a release fall failed
     GovernorPhase Phase() const noexcept { return phase_; }
     GovernorStatistics Statistics() const noexcept { return statistics_; }
 
@@ -322,6 +333,11 @@ private:
     double probe_backoff_ = 1.0;
     double probe_step_ = GOVERNOR_PROBE_STEP;
     double probing_from_stretch_ = 0.0; // target before the newest probe; 0 = none
+    // Release falls being judged: the highest target before them, and the
+    // measured need of the newest; 0 = none. The demand scale k (>= 1).
+    double releasing_from_stretch_ = 0.0;
+    double release_need_us_ = 0.0;
+    double demand_scale_ = 1.0;
     std::array<int64_t, GOVERNOR_EPISODE_CAPACITY> episodes_{}; // start times, oldest first from episode_head_
     uint32_t episode_head_ = 0;
     uint32_t episode_count_ = 0;

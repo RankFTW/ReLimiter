@@ -1126,7 +1126,7 @@ void TestInvalidInputs()
     PacingStageEvent event = Event(1, Kind::MarkerArrival, 11000.0);
     event.kind = Kind::None;
     controller->OnStageEvent(event);
-    event.kind = static_cast<Kind>(11); // past RenderSubmitEnd
+    event.kind = static_cast<Kind>(10); // past PresentEnd
     controller->OnStageEvent(event);
     event = Event(1, Kind::MarkerArrival, 11000.0);
     event.qpc = 0;
@@ -2348,27 +2348,25 @@ void TestReleaseHeadroomWideningFades()
 }
 
 // Render handoff offset: each frame released
-// at or after the previous frame's RENDERSUBMIT_END adds h = (b − v) of the
+// at or after the previous frame's RENDERSUBMIT_START adds h = (b − w) of the
 // previous frame minus its own simulation (e − s); d = Q5(h) − allowance at
 // Smoothing's q = 0.95, never below 0, 0 until 16 samples.
 void TestRenderHandoffOffset()
 {
-    // Frame n: s = n·I, e = s + simulation, the render thread starts
-    // submitting it at w = e + 50 and finishes at v = e + 100, and leaves its
-    // Present at b = v + render. A frame starts (marker arrival) at v + 1000,
-    // before b.
+    // Frame n: s = n·I, e = s + simulation, the render thread takes it at
+    // w = e + 100 and leaves its Present at b = w + render. A frame starts
+    // (marker arrival) at w + 1000, before b.
     const auto feed = [](LeadController* controller, uint64_t n, double simulation_us, double render_us,
         double source_offset_us = 0.0) {
         const double s = static_cast<double>(n) * kInterval + source_offset_us;
         const double e = s + simulation_us;
-        const double v = e + 100.0;
+        const double w = e + 100.0;
         controller->OnSourceRelease(Start(n, PacingRung::SourceOnly, s));
         controller->OnStageEvent(Event(n, Kind::SimulationEnd, e));
-        controller->OnStageEvent(Event(n, Kind::RenderSubmitStart, e + 50.0));
-        controller->OnStageEvent(Event(n, Kind::RenderSubmitEnd, v));
-        controller->OnStageEvent(Event(n, Kind::MarkerArrival, v + 1000.0));
-        controller->OnStageEvent(Event(n, Kind::OutputRelease, v + 1000.0, PacingPlanStatus::SourceOnly));
-        controller->OnStageEvent(Event(n, Kind::PresentEnd, v + render_us));
+        controller->OnStageEvent(Event(n, Kind::RenderSubmitStart, w));
+        controller->OnStageEvent(Event(n, Kind::MarkerArrival, w + 1000.0));
+        controller->OnStageEvent(Event(n, Kind::OutputRelease, w + 1000.0, PacingPlanStatus::SourceOnly));
+        controller->OnStageEvent(Event(n, Kind::PresentEnd, w + render_us));
     };
 
     // Render 9,000 µs; simulation 3,000 µs, every tenth frame 7,000 µs: h is
@@ -2393,15 +2391,8 @@ void TestRenderHandoffOffset()
     // A frame released before the previous frame's handoff is not sampled:
     // its simulation may have waited for the render thread.
     const uint64_t before = pipelined->Statistics().handoff_samples;
-    feed(pipelined.get(), 42, 3000.0, 9000.0, -7000.0); // s_42 = 413,000 < v_41 = 413,100
+    feed(pipelined.get(), 42, 3000.0, 9000.0, -7000.0); // s_42 = 413,000 < w_41 = 417,100
     CHECK(pipelined->Statistics().handoff_samples == before);
-    // The handoff is the end of the submission: a frame released after the
-    // previous RENDERSUBMIT_START but before its RENDERSUBMIT_END is not
-    // sampled either. w_42 = 416,050, v_42 = 416,100.
-    feed(pipelined.get(), 43, 3000.0, 9000.0, -13925.0); // s_43 = 416,075: after w_42, before v_42
-    CHECK(pipelined->Statistics().handoff_samples == before);
-    feed(pipelined.get(), 44, 3000.0, 9000.0, -14000.0); // s_44 = 426,000, after v_43 = 419,175
-    CHECK(pipelined->Statistics().handoff_samples == before + 1);
 
     // Serial engine: the render thread is done long before the next release
     // (render 2,000 µs, simulation 4,000 µs): h < 0 and d = 0.
@@ -2413,6 +2404,65 @@ void TestRenderHandoffOffset()
     // A lifecycle reset clears the window.
     pipelined->Reset(kFrequency);
     CHECK_NEAR(pipelined->HandoffOffsetUs(0.95, 0.0), 0.0);
+}
+
+// Render handoff GPU queue term: a report of a frame released under the
+// limit whose submission ended while the GPU still worked on the previous
+// frame raises c by q·η (η = 1% of I), any other lowers it by (1 − q)·η, so
+// c holds where a share 1 − q of frames waited; c stays within [0, I] and
+// adds to d. Frames without the limit and second reports change nothing.
+void TestRenderHandoffGpuQueue()
+{
+    auto controller = MakeController();
+    uint64_t n = 0;
+    const auto frame = [&](bool limited, double submit_after_gpu_free_us) {
+        ++n;
+        LeadFrameStart start = Start(n, limited ? PacingRung::SourceOnly : PacingRung::FgInputWait,
+            static_cast<double>(n) * kInterval);
+        start.handoff_release = limited;
+        controller->OnSourceRelease(start);
+        controller->OnHandoffQueue(Key(n).producer_epoch, Key(n).frame_id, submit_after_gpu_free_us, 0.95);
+    };
+
+    // Ten frames that finished submitting 1.3 ms before the GPU was free:
+    // c = 10 × 0.95 × 100 = 950 µs, all of the offset while d is cold.
+    for (int i = 0; i < 10; ++i) frame(true, -1300.0);
+    CHECK(controller->Statistics().handoff_queue_samples == 10);
+    CHECK(controller->Statistics().handoff_queue_waited == 10);
+    CHECK_NEAR(controller->HandoffQueueUs(), 950.0);
+    CHECK_NEAR(controller->HandoffOffsetUs(0.95, 500.0), 950.0);
+    // A second report of the same frame is ignored.
+    controller->OnHandoffQueue(Key(n).producer_epoch, Key(n).frame_id, -1300.0, 0.95);
+    CHECK(controller->Statistics().handoff_queue_samples == 10);
+    // A frame that reached the GPU after it was free lowers c by 5 µs; a held
+    // frame (no limit) moves nothing.
+    frame(true, 1400.0);
+    CHECK_NEAR(controller->HandoffQueueUs(), 945.0);
+    frame(false, -1300.0);
+    CHECK_NEAR(controller->HandoffQueueUs(), 945.0);
+    CHECK(controller->Statistics().handoff_queue_samples == 11);
+    // One waited frame in twenty is the 1 − q share: c holds.
+    for (int i = 0; i < 20; ++i) frame(true, i == 0 ? -500.0 : 2000.0);
+    CHECK_NEAR(controller->HandoffQueueUs(), 945.0);
+    // Frames that reach the GPU after it is free bring c to 0, never below.
+    for (int i = 0; i < 200; ++i) frame(true, 1400.0);
+    CHECK_NEAR(controller->HandoffQueueUs(), 0.0);
+    // Frames that keep waiting raise it to one interval at most.
+    for (int i = 0; i < 120; ++i) frame(true, -1300.0);
+    CHECK_NEAR(controller->HandoffQueueUs(), kInterval);
+
+    // A report without a pending frame is counted; invalid input is rejected.
+    controller->OnHandoffQueue(7, 123456789, -1300.0, 0.95);
+    CHECK(controller->Statistics().unmatched_handoff_queue == 1);
+    const uint64_t invalid = controller->Statistics().invalid_inputs;
+    controller->OnHandoffQueue(0, Key(n).frame_id, -1300.0, 0.95);
+    controller->OnHandoffQueue(7, Key(n).frame_id, kNaN, 0.95);
+    CHECK(controller->Statistics().invalid_inputs == invalid + 2);
+    CHECK_NEAR(controller->HandoffQueueUs(), kInterval);
+
+    // Cleared with the handoff window.
+    controller->ResetBuckets();
+    CHECK_NEAR(controller->HandoffQueueUs(), 0.0);
 }
 
 int main()
@@ -2468,6 +2518,7 @@ int main()
     TestReleaseHeadroomBounds();
     TestReleaseHeadroomWideningFades();
     TestRenderHandoffOffset();
+    TestRenderHandoffGpuQueue();
 
     if (s_failures != 0) {
         std::fprintf(stderr, "%d lead controller checks failed\n", s_failures);

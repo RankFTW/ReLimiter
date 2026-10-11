@@ -16,10 +16,15 @@ from both. Per segment it reports:
   display - T and release - S;
 - the render handoff limit reconstructed (phase4_design.md section 23): the
   share of frames released at or after the previous frame's
-  RENDERSUBMIT_END v(n-1) (the anchor since 2026-10-11; RENDERSUBMIT_START
-  w(n-1) before) and the offset d = max(0, Q_q(h) - allowance) over
-  h = (PRESENT_END(n-1) - v(n-1)) - simulation(n) of those frames, with the
-  RENDERSUBMIT_START figures for captures of earlier builds;
+  RENDERSUBMIT_START w(n-1) and the offset d = max(0, Q_q(h) - allowance) over
+  h = (PRESENT_END(n-1) - w(n-1)) - simulation(n) of those frames;
+- the GPU queue (the render handoff limit's GPU queue term, 2026-10-11): the
+  share of frames that finished their submission while the GPU still worked on
+  frame n - 1 (RENDERSUBMIT_END(n) < GPU render end(n-1)), the distribution
+  of RENDERSUBMIT_END(n) - GPU end(n-1), simulation start - GPU start of the
+  same frame, and the share of frames whose render thread started right after
+  finishing the previous one (RENDERSUBMIT_START(n) - RENDERSUBMIT_END(n-1)
+  < 0.3 ms: no idle time, the simulation waited for it);
 - where the simulation of n starts relative to the render thread's work on
   n - 1 (before its submission, first or second half of it, or in its Present
   wait), with the submission time of n - 1 and the share of frames whose
@@ -74,6 +79,7 @@ CPU_MARKERS = ("sim_start", "sim_end", "rs_start", "rs_end", "present_start", "p
 TAKE_GAP_MS = 0.1         # replay: the render thread takes a frame this long after it is free
 MIN_PRESENT_CALL_MS = 0.3  # replay: shortest Present call once the render thread arrives late
 LONG_FRAME_MULTIPLE = 1.5
+RENDER_THREAD_IDLE_MS = 0.3  # the render thread started frame n less than this after finishing n - 1
 GAP_SECONDS = 1.0          # display intervals and durations never bridge a gap longer than this
 
 
@@ -253,28 +259,28 @@ def segment_report(capture: Capture, segmenter: Segmenter, segment: str,
             stages["release_to_display"].append(f.display - f.s)
             stages["display_minus_T"].append(f.display - f.T)
         stages["release_minus_S"].append(f.s - f.S)
-    after_w, after_v, since_w, since_v, h_w, h_v = 0, 0, [], [], [], []
+    after, since_w, h = 0, [], []
+    submit_after_gpu_free, sim_before_gpu, contiguous = [], [], 0
     by_position: dict[str, dict[str, list[float]]] = {p: {"submission": [], "outlasted": []} for p in POSITIONS}
+    for f in frames:
+        if "gpu_start" in f.m:
+            sim_before_gpu.append(f.m["gpu_start"] - f.m["sim_start"])
     for prev, f in chain:
         w1 = prev.m["rs_start"]
-        v1 = prev.m["rs_end"]
         since_w.append(f.s - w1)
-        since_v.append(f.s - v1)
         sim = f.m["sim_end"] - f.m["sim_start"]
         if f.s >= w1:
-            after_w += 1
-            h_w.append((prev.m["present_end"] - w1) - sim)
-        if f.s >= v1:
-            after_v += 1
-            h_v.append((prev.m["present_end"] - v1) - sim)
+            after += 1
+            h.append((prev.m["present_end"] - w1) - sim)
+        if "gpu_end" in prev.m:
+            submit_after_gpu_free.append(f.m["rs_end"] - prev.m["gpu_end"])
+        if f.m["rs_start"] - prev.m["rs_end"] < RENDER_THREAD_IDLE_MS:
+            contiguous += 1
         bucket = by_position[_position(f.s, prev.m)]
         bucket["submission"].append(prev.m["rs_end"] - prev.m["rs_start"])
         bucket["outlasted"].append(1.0 if f.m["sim_end"] > prev.m["present_end"] else 0.0)
-
-    def offset(samples: list[float]) -> float | None:
-        samples.sort()
-        q = lower_quantile(samples, 1.0 - quantile) if len(samples) >= 16 else None
-        return None if q is None else max(0.0, q - allowance_ms)
+    h.sort()
+    q = lower_quantile(h, 1.0 - quantile) if len(h) >= 16 else None
     positions = {}
     for name, bucket in by_position.items():
         n = len(bucket["submission"])
@@ -294,13 +300,17 @@ def segment_report(capture: Capture, segmenter: Segmenter, segment: str,
         "stages_ms": {name: _q(values) for name, values in stages.items()},
         "released_after_S_over_0_5ms": sum(1 for v in stages["release_minus_S"] if v > 0.5) / len(frames),
         "handoff": {
-            "released_at_or_after_prev_rs_end": after_v / len(chain) if chain else None,
-            "release_minus_prev_rs_end_ms": _q(since_v),
-            "offset_d_ms": offset(h_v),
-            "h_samples": len(h_v),
-            "released_at_or_after_prev_rs_start": after_w / len(chain) if chain else None,
+            "released_at_or_after_prev_rs_start": after / len(chain) if chain else None,
             "release_minus_prev_rs_start_ms": _q(since_w),
-            "offset_d_rs_start_ms": offset(h_w),
+            "offset_d_ms": None if q is None else max(0.0, q - allowance_ms),
+            "h_samples": len(h),
+        },
+        "gpu_queue": {
+            "submitted_while_gpu_busy": (sum(1 for v in submit_after_gpu_free if v < 0.0) / len(submit_after_gpu_free)
+                                         if submit_after_gpu_free else None),
+            "rs_end_minus_prev_gpu_end_ms": _q(submit_after_gpu_free),
+            "sim_start_to_gpu_start_ms": _q(sim_before_gpu),
+            "render_thread_without_idle": contiguous / len(chain) if chain else None,
         },
         "simulation_start_position": positions,
         "simulation_outlasted_render_thread": (sum(1 for prev, f in chain if f.m["sim_end"] > prev.m["present_end"])
@@ -455,15 +465,17 @@ def format_report(report: dict[str, Any]) -> str:
             lines.append(f"      {stage:28s} {_qtext(entry)}")
         lines.append(f"    released > 0.5 ms after S: {100 * seg['released_after_S_over_0_5ms']:.1f}%")
         handoff = seg["handoff"]
-        share_v = handoff["released_at_or_after_prev_rs_end"]
-        share_w = handoff["released_at_or_after_prev_rs_start"]
-        lines.append(f"    handoff: released at/after RENDERSUBMIT_END(n-1) {_fmt(None if share_v is None else 100 * share_v, 1)}%"
-                     f", release - RS_END(n-1) {_qtext(handoff['release_minus_prev_rs_end_ms'])} ms"
-                     f", d {_fmt(handoff['offset_d_ms'])} ms ({handoff['h_samples']} h samples)")
-        lines.append(f"    handoff (RENDERSUBMIT_START anchor, builds before 2026-10-11): at/after "
-                     f"{_fmt(None if share_w is None else 100 * share_w, 1)}%"
+        share = handoff["released_at_or_after_prev_rs_start"]
+        lines.append(f"    handoff: released at/after RENDERSUBMIT_START(n-1) {_fmt(None if share is None else 100 * share, 1)}%"
                      f", release - RS_START(n-1) {_qtext(handoff['release_minus_prev_rs_start_ms'])} ms"
-                     f", d {_fmt(handoff['offset_d_rs_start_ms'])} ms")
+                     f", d {_fmt(handoff['offset_d_ms'])} ms ({handoff['h_samples']} h samples)")
+        gpu = seg["gpu_queue"]
+        busy = gpu["submitted_while_gpu_busy"]
+        idle = gpu["render_thread_without_idle"]
+        lines.append(f"    GPU queue: submitted while the GPU was busy {_fmt(None if busy is None else 100 * busy, 1)}%, "
+                     f"RS_END(n) - GPU end(n-1) {_qtext(gpu['rs_end_minus_prev_gpu_end_ms'])} ms, simulation start -> "
+                     f"GPU start {_qtext(gpu['sim_start_to_gpu_start_ms'])} ms, render thread without idle "
+                     f"{_fmt(None if idle is None else 100 * idle, 1)}%")
         lines.append("    simulation start vs the render thread's frame n-1 (share, submission p50/p90 ms, "
                      "simulation outlasted the render thread):")
         for position, entry in seg["simulation_start_position"].items():

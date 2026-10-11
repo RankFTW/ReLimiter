@@ -167,8 +167,9 @@ SIGNAL_CLEARANCE_WINDOW_US = 1000.0
 # GovernorCause (GovernorCause_Text): governor_step event reasons. base (7)
 # since Phase 4 (phase4_design.md P4-6): the fall reached the cap interval.
 # room (8) from 2026-10-08: the hold room started or stopped setting the interval.
+# release_failed (9) from 2026-10-11: evidence after a release fall; the demand scale rose.
 GOVERNOR_CAUSE_NAMES = {0: "none", 1: "demand", 2: "misses", 3: "release", 4: "probe", 5: "probe_failed",
-                        6: "reset", 7: "base", 8: "room"}
+                        6: "reset", 7: "base", 8: "room", 9: "release_failed"}
 # FeasibilityCause (FeasibilityCause_Text): rung_feasibility event reasons.
 # overload (4) since the design review 2026-10-03 (hold feasibility guard).
 # resume_spread (2) only from builds before 2026-10-04 (the GPU wait cap ladder

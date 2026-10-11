@@ -208,6 +208,7 @@ void LeadController::Reset(int64_t qpc_frequency) noexcept
     work_age_frames_.fill(0);
     for (LeadSampleWindow& room : room_windows_) room.Reset();
     handoff_window_.Reset();
+    handoff_queue_us_ = 0.0;
     lifecycle_known_ = false;
     lifecycle_ = PacingPlanKey{};
     newest_index_ = 0;
@@ -224,6 +225,7 @@ void LeadController::ResetBuckets() noexcept
     work_age_frames_.fill(0);
     for (LeadSampleWindow& room : room_windows_) room.Reset();
     handoff_window_.Reset();
+    handoff_queue_us_ = 0.0;
     for (PendingFrame& frame : pending_) {
         if (frame.occupied && frame.started) frame.finalized = true;
     }
@@ -388,13 +390,13 @@ double LeadController::HoldRoomUs(double fg_divisor, double quantile) const noex
 
 double LeadController::HandoffOffsetUs(double quantile, double allowance_us) const noexcept
 {
-    if (!std::isfinite(quantile) || !std::isfinite(allowance_us) ||
-        handoff_window_.Count() < LEAD_HANDOFF_MIN_SAMPLES) {
-        return 0.0;
+    double offset_us = 0.0;
+    if (std::isfinite(quantile) && std::isfinite(allowance_us) &&
+        handoff_window_.Count() >= LEAD_HANDOFF_MIN_SAMPLES) {
+        offset_us = std::max(0.0, handoff_window_.Quantile(1.0 - std::clamp(quantile, 0.0, 1.0)) -
+            std::max(allowance_us, 0.0));
     }
-    const double offset_us = handoff_window_.Quantile(1.0 - std::clamp(quantile, 0.0, 1.0)) -
-        std::max(allowance_us, 0.0);
-    return offset_us > 0.0 ? offset_us : 0.0;
+    return offset_us + handoff_queue_us_;
 }
 
 LeadBucketStatus LeadController::BucketStatus(PacingRung rung, double fg_divisor) const noexcept
@@ -500,6 +502,7 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
     }
     slot.gpu_resume_probe = frame.gpu_resume_probe;
     slot.render_queue = frame.render_queue;
+    slot.handoff_release = frame.handoff_release;
     SetField(&slot, FieldSource, frame.source_release_qpc);
     if (slot.sampled && slot.rung == PacingRung::GpuQueueWait) {
         uint32_t& age = work_age_frames_[slot.bucket % LEAD_DIVISOR_BUCKETS];
@@ -522,8 +525,7 @@ void LeadController::OnStageEvent(const PacingStageEvent& event) noexcept
         static_cast<int>(PacingStageEventKind::GpuResume) == FieldGpuResume &&
         static_cast<int>(PacingStageEventKind::RenderSubmitStart) == FieldRenderSubmit &&
         static_cast<int>(PacingStageEventKind::SimulationEnd) == FieldSimulationEnd &&
-        static_cast<int>(PacingStageEventKind::PresentEnd) == FieldPresentEnd &&
-        static_cast<int>(PacingStageEventKind::RenderSubmitEnd) == FieldRenderSubmitEnd,
+        static_cast<int>(PacingStageEventKind::PresentEnd) == FieldPresentEnd,
         "Field values must match PacingStageEventKind");
     static_assert(FieldCount <= 16, "field_mask holds one bit per Field");
 
@@ -602,6 +604,35 @@ void LeadController::OnGpuActiveTime(uint32_t producer_epoch, uint64_t frame_id,
         return;
     }
     ++statistics_.unmatched_gpu_active;
+}
+
+// GPU queue term (lead_controller.h): a quantile tracker on the sign of
+// v_n − g_{n−1}, one step per frame released under the limit.
+void LeadController::OnHandoffQueue(uint32_t producer_epoch, uint64_t frame_id,
+    double submit_after_gpu_free_us, double quantile) noexcept
+{
+    if (producer_epoch == 0 || !std::isfinite(submit_after_gpu_free_us) || !std::isfinite(quantile)) {
+        ++statistics_.invalid_inputs;
+        return;
+    }
+    for (PendingFrame& frame : pending_) {
+        if (!frame.occupied || !frame.started || frame.key.identity_domain != PacingIdentityDomain::NvApiFrame ||
+            frame.key.producer_epoch != producer_epoch || frame.key.frame_id != frame_id) {
+            continue;
+        }
+        if (!frame.handoff_release || frame.handoff_queue_recorded || !IsPositiveFinite(frame.interval_us)) return;
+        frame.handoff_queue_recorded = true;
+        const double q = std::clamp(quantile, 0.0, 1.0);
+        const double step_us = LEAD_HANDOFF_QUEUE_STEP_FRACTION * frame.interval_us;
+        const bool waited = submit_after_gpu_free_us < 0.0;
+        handoff_queue_us_ += waited ? q * step_us : -(1.0 - q) * step_us;
+        handoff_queue_us_ = std::clamp(handoff_queue_us_, 0.0,
+            LEAD_HANDOFF_QUEUE_MAX_INTERVALS * frame.interval_us);
+        ++statistics_.handoff_queue_samples;
+        if (waited) ++statistics_.handoff_queue_waited;
+        return;
+    }
+    ++statistics_.unmatched_handoff_queue;
 }
 
 // ── Buckets ──
@@ -1197,18 +1228,18 @@ double LeadController::QueueUs(const PendingFrame& frame, const PendingFrame* pr
     return queue_us > 0.0 ? queue_us : 0.0;
 }
 
-// Render handoff (lead_controller.h): h = (b_{n−1} − v_{n−1}) − (e_n − s_n)
-// for a frame released at or after v_{n−1}. Bounded by 3 I like the lead
+// Render handoff (lead_controller.h): h = (b_{n−1} − w_{n−1}) − (e_n − s_n)
+// for a frame released at or after w_{n−1}. Bounded by 3 I like the lead
 // samples; negative values count in the window's first bin.
 void LeadController::RecordHandoff(const PendingFrame& frame, const PendingFrame* previous) noexcept
 {
     if (previous == nullptr || !previous->started || !SameLifecycle(previous->key, frame.key) ||
-        !HasField(frame, FieldSimulationEnd) || !HasField(*previous, FieldRenderSubmitEnd) ||
+        !HasField(frame, FieldSimulationEnd) || !HasField(*previous, FieldRenderSubmit) ||
         !HasField(*previous, FieldPresentEnd)) {
         return;
     }
     const int64_t source = frame.qpc[FieldSource];
-    const int64_t handoff = previous->qpc[FieldRenderSubmitEnd];
+    const int64_t handoff = previous->qpc[FieldRenderSubmit];
     if (source < handoff) return;
     const double render_us = MicrosecondsBetween(handoff, previous->qpc[FieldPresentEnd]);
     const double simulation_us = MicrosecondsBetween(source, frame.qpc[FieldSimulationEnd]);

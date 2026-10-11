@@ -118,9 +118,11 @@ It rebuilds each real frame's Reflex markers in local QPC, splits held
 and reports per segment the stages (simulation, the queue in front of the render
 thread, render submission, Present call, GPU render, release → display, display
 − T, release − S), the reconstructed render handoff limit (share released at or
-after the previous RENDERSUBMIT_END, the anchor since 2026-10-11, and the
-offset d for `--quantile` and `--allowance-us`; the RENDERSUBMIT_START figures
-of earlier builds on a second line), where the simulation starts against the previous frame's
+after the previous RENDERSUBMIT_START and the offset d for `--quantile` and
+`--allowance-us`), the GPU queue (share of frames whose RENDERSUBMIT_END came
+before the previous frame's GPU render end, the render handoff limit's GPU
+queue term since 2026-10-11; simulation start → GPU start; share of frames
+whose render thread started without idle time), where the simulation starts against the previous frame's
 render-thread work with that submission's time, segment display pacing,
 real-frame and all-row PC Latency, and grid epochs per minute.
 `--replay-floor ANCHOR[+-MS]` (repeatable; `rs_start`, `rs_end`, `present_start`,

@@ -249,6 +249,7 @@ std::atomic<double> s_status_pre_sleep_residual_p99_us{0.0};
 std::atomic<uint32_t> s_status_driver_limiter_interval_us{0};
 std::atomic<uint8_t> s_status_render_handoff{0};
 std::atomic<double> s_status_render_handoff_offset_us{0.0};
+std::atomic<double> s_status_render_handoff_queue_us{0.0};
 std::atomic<uint32_t> s_status_render_handoff_limited{0};
 std::atomic<uint32_t> s_status_render_handoff_stalls{0};
 }
@@ -306,6 +307,7 @@ static void PublishPacingStatus(const SchedulerPacingStatus& status) noexcept
     s_status_driver_limiter_interval_us.store(status.driver_limiter_interval_us, std::memory_order_relaxed);
     s_status_render_handoff.store(status.render_handoff, std::memory_order_relaxed);
     s_status_render_handoff_offset_us.store(status.render_handoff_offset_us, std::memory_order_relaxed);
+    s_status_render_handoff_queue_us.store(status.render_handoff_queue_us, std::memory_order_relaxed);
     s_status_render_handoff_limited.store(status.render_handoff_limited, std::memory_order_relaxed);
     s_status_render_handoff_stalls.store(status.render_handoff_stalls, std::memory_order_relaxed);
     s_status_sequence.store(sequence + 2, std::memory_order_release);
@@ -370,6 +372,7 @@ bool Scheduler_ReadPacingStatus(SchedulerPacingStatus* status) noexcept
         copy.driver_limiter_interval_us = s_status_driver_limiter_interval_us.load(std::memory_order_relaxed);
         copy.render_handoff = s_status_render_handoff.load(std::memory_order_relaxed);
         copy.render_handoff_offset_us = s_status_render_handoff_offset_us.load(std::memory_order_relaxed);
+        copy.render_handoff_queue_us = s_status_render_handoff_queue_us.load(std::memory_order_relaxed);
         copy.render_handoff_limited = s_status_render_handoff_limited.load(std::memory_order_relaxed);
         copy.render_handoff_stalls = s_status_render_handoff_stalls.load(std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_acquire);
@@ -479,7 +482,7 @@ std::atomic<int64_t> s_last_reflex_sleep_qpc{0};
 // Render handoff limit. Owner: the newest released planned frame; whether
 // the limit is blocked (RenderHandoffStalled); waits that stalled; stalled
 // waits since the last wait that saw its handoff; the stream whose render
-// thread was seen finishing a frame before the next release (0 none); frames
+// thread was seen taking a frame before the next release (0 none); frames
 // the limit delayed past S; whether the first of each was logged.
 PacingPlanKey s_handoff_released{};
 bool s_handoff_blocked = false;
@@ -968,6 +971,7 @@ static void FillControllerStatus(SchedulerPacingStatus* status) noexcept
         : s_handoff_hook_frame.load(std::memory_order_relaxed) != 0 ? 1 : 0;
     status->render_handoff_offset_us = s_source_stage.Lead().HandoffOffsetUs(
         pipeline.handoff_quantile, pipeline.allowance_us);
+    status->render_handoff_queue_us = s_source_stage.Lead().HandoffQueueUs();
     status->render_handoff_limited = static_cast<uint32_t>(s_handoff_limited_frames);
     status->render_handoff_stalls = static_cast<uint32_t>(s_handoff_stalls);
     status->hold_overloaded = s_hold_feasibility.Overloaded();
@@ -1182,6 +1186,12 @@ static GovernorDecision UpdatePeriodGovernor(
             s_source_stage.OnGpuActiveTime(sample.producer_epoch, sample.frame_id, sample.gpu_active_us,
                 sample.gpu_start_qpc);
         }
+        // Render handoff GPU queue term (lead_controller.h); only frames
+        // released under the limit use it.
+        if (sample.submit_after_gpu_free_known) {
+            s_source_stage.OnHandoffQueue(sample.producer_epoch, sample.frame_id,
+                sample.submit_after_gpu_free_us, pipeline.handoff_quantile);
+        }
         // An elapsed GPU span can contain our time-fence wait. Never feed
         // that idle residence back as workload demand; skip the report when
         // execution-only evidence is unavailable.
@@ -1211,11 +1221,14 @@ static GovernorDecision UpdatePeriodGovernor(
         s_source_stage.ClearSlackEvidence();
     }
     // Transitions only (rise, fall, probe, back at the cap, reset, fixed
-    // step, hold room); a hold-room transition names the room it saw.
+    // step, hold room); a hold-room transition names the room it saw, a
+    // failed release the demand scale it set.
     if (decision.valid && decision.cause != GovernorCause::None) {
         char room[64] = "";
         if (decision.cause == GovernorCause::Room) {
             snprintf(room, sizeof(room), ", hold room %.1f us", frame.room_us);
+        } else if (decision.cause == GovernorCause::ReleaseFailed) {
+            snprintf(room, sizeof(room), ", demand scale %.3f", s_period_governor.DemandScale());
         }
         LOG_INFO("Period governor: %s (%s), interval %.1f us (base %.1f us, +%.1f%%)%s%s",
                  GovernorPhase_Text(decision.phase), GovernorCause_Text(decision.cause),
@@ -1374,13 +1387,13 @@ static uint32_t HandoffStreamOf(const PacingPlanKey& key) noexcept
 static bool HandoffLimitApplies(const PacingPlanKey& key, const PlannedFrameInput& input,
     const PacingPipelineSnapshot& pipeline) noexcept
 {
-    // A block ends once the game has shown its render thread finishing a
-    // frame before the next release, which a render thread that waits for
-    // that release never does.
+    // A block ends once the game has shown its render thread taking a frame
+    // before the next release, which a render thread that waits for that
+    // release never does.
     if (s_handoff_blocked && s_handoff_proven_stream == HandoffStreamOf(key)) {
         s_handoff_blocked = false;
         s_handoff_stall_run = 0;
-        LOG_INFO("Render handoff limit: back on (the render thread finishes frames ahead of the next release)");
+        LOG_INFO("Render handoff limit: back on (the render thread takes frames ahead of the next release)");
     }
     return !s_handoff_blocked &&
         pipeline.rung == PacingRung::SourceOnly &&
@@ -1391,9 +1404,9 @@ static bool HandoffLimitApplies(const PacingPlanKey& key, const PlannedFrameInpu
         !DriverSleepRuns(input.target_fps);
 }
 
-// A handoff wait stalled: the render thread finished no frame for three of
-// its frame times (at least 3 I), and the frame was released. Once the game
-// has shown its render thread finishing a frame before the next release (a handoff
+// A handoff wait stalled: the render thread took no frame for three of its
+// frame times (at least 3 I), and the frame was released. Once the game has
+// shown its render thread taking a frame before the next release (a handoff
 // seen before a release, or a handoff sample, in this producer epoch) a stall
 // is a hitch and the limit stays on. Before that, RENDER_HANDOFF_BLOCK_STALLS
 // stalls in a row turn the limit off: a render thread that waits for the
@@ -1405,20 +1418,20 @@ static void RenderHandoffStalled(uint64_t frame_id) noexcept
     if (s_handoff_proven_stream == HandoffStreamOf(s_handoff_released)) {
         if (s_handoff_stall_logged) return;
         s_handoff_stall_logged = true;
-        LOG_INFO("Render handoff limit: frame %llu released after the render thread finished no frame for %.0f "
+        LOG_INFO("Render handoff limit: frame %llu released after the render thread took no frame for %.0f "
                  "of its frame times (a stall; the limit stays on)", static_cast<unsigned long long>(frame_id),
                  RENDER_HANDOFF_STALL_INTERVALS);
         return;
     }
     if (s_handoff_blocked || ++s_handoff_stall_run < RENDER_HANDOFF_BLOCK_STALLS) return;
     s_handoff_blocked = true;
-    LOG_WARN("Render handoff limit: off (the render thread finished no frame for %.0f of its frame times in %u "
-             "waits in a row up to frame %llu, and has not yet finished a frame before the next release)",
+    LOG_WARN("Render handoff limit: off (the render thread took no frame for %.0f of its frame times in %u "
+             "waits in a row up to frame %llu, and has not yet taken a frame before the next release)",
              RENDER_HANDOFF_STALL_INTERVALS, s_handoff_stall_run, static_cast<unsigned long long>(frame_id));
 }
 
-// The render thread finished submitting the newest released frame, this
-// frame's predecessor, before this frame's release: it finishes frames ahead of the next
+// The render thread took the newest released frame, this frame's
+// predecessor, before this frame's release: it takes frames ahead of the next
 // release, which a render thread that waits for that release never does.
 // Checked at every planned frame, limited or not, so a block also ends while
 // the limit is off once the render thread catches up.
@@ -1432,8 +1445,8 @@ static void NoteHandoffBeforeRelease(const PacingPlanKey& key, uint64_t handoff_
     s_handoff_proven_stream = HandoffStreamOf(key);
 }
 
-// A_n = v_{n−1} + d: the newest released frame's render handoff plus the
-// learned offset (lead_controller.h). 0 when the limit cannot apply: another
+// A_n = w_{n−1} + d + c: the newest released frame's render handoff plus the
+// learned offset and GPU queue term (lead_controller.h). 0 when the limit cannot apply: another
 // stream, no handoff of this producer within the last second, or a wait that
 // stalled (RenderHandoffStalled). With the marker placement the wait runs
 // here, with the owner held, like the source wait.
@@ -1486,7 +1499,7 @@ static void PublishRenderHandoff(const PacingPlanKey& key, const SourceStageFram
     ++s_handoff_limited_frames;
     if (!s_handoff_logged) {
         s_handoff_logged = true;
-        LOG_INFO("Render handoff limit: frame %llu released after the render thread finished the previous "
+        LOG_INFO("Render handoff limit: frame %llu released after the render thread took the previous "
                  "frame (S + %.2f ms)", static_cast<unsigned long long>(key.frame_id),
                  qpc_to_us(frame.wait_target_qpc - (frame.plan.output_target_qpc - us_to_qpc(frame.plan.lead_us))) / 1000.0);
     }
@@ -1525,7 +1538,7 @@ static SourceStageFrame RunPlanned(
     // the source wait (lead_controller.h).
     s_pre_sleep.EndedWait(&request.pre_wait_index, &request.pre_wait_start_qpc, &request.pre_wait_end_qpc);
     // Render handoff limit: Sleep-hook waits that stalled first, then
-    // whether the render thread already finished this frame's predecessor.
+    // whether the render thread already took this frame's predecessor.
     for (uint32_t stalls = s_handoff_hook_stalls.exchange(0, std::memory_order_relaxed); stalls > 0; --stalls) {
         RenderHandoffStalled(s_handoff_released.frame_id);
     }
@@ -1808,7 +1821,7 @@ bool Scheduler_PlanReflexSleep(int64_t now_qpc, bool driver_sleep, int64_t hando
     if (request.next_target_valid) {
         request.next_target_qpc = last_target_qpc + us_to_qpc(PreSleepPredictedIntervalUs());
         // Render handoff limit: the next frame
-        // is released no earlier than A = v + d, so the pre-wait aims for
+        // is released no earlier than A = w + d + c, so the pre-wait aims for
         // max(S_next, A) − margin.
         if (handoff_qpc > 0) {
             const PacingPipelineSnapshot pipeline = PacingPipeline_Read();

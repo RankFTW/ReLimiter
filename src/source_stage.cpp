@@ -276,6 +276,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     // only the GPU queue wait may wait for a GpuResume event.
     start.gpu_resume_probe = pipeline.gpu_probes && plan.rung == PacingRung::GpuQueueWait;
     start.render_queue = request.gpu_queue_wait_render_queue;
+    start.handoff_release = request.earliest_release_qpc > 0;
     lead_.OnSourceRelease(start);
     return frame;
 }

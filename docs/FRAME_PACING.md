@@ -290,7 +290,7 @@ sequenceDiagram
     Game->>Hook: Sleep for frame n
     Hook->>Sched: record the Sleep and plan the pre-wait
     opt render handoff limit applies, frame not held, bypass on
-        Hook->>Hook: wait until the render thread finished the previous frame
+        Hook->>Hook: wait until the render thread took the previous frame
     end
     opt pre-wait planned
         Hook->>Hook: wait until S_next minus margin
@@ -438,22 +438,24 @@ stateDiagram-v2
 During an overload pause (and anywhere a frame is not held), nothing else stops a game that simulates ahead of its render thread from queueing finished frames when the cap cannot be held. The render handoff limit releases such a frame no earlier than
 
 ```
-A(n) = v(n−1) + d
+A(n) = w(n−1) + d + c
 ```
 
-where `v(n−1)` is RENDERSUBMIT_END of the newest released frame, the moment the render thread finished submitting it, and `d` is a learned offset. `d` comes from samples `h = (b(n−1) − v(n−1)) − (e(n) − s(n))`: how much later frame `n` could have been released and still have ended its simulation (`e`, SIMULATION_END) before the render thread left the previous frame's Present (`b`, PRESENT_END). It is the 5th percentile of the newest 256 samples (`1 − 0.95`) minus the 0.5 ms allowance, never below 0, and 0 until 16 samples exist. A serial engine (render after simulation) gives `h < 0` and `d = 0`, so the limit never binds there. The anchor is the end of the submission, not its start: a simulation started while the render thread is still submitting runs beside that submission and slows it, which the driver's Reflex Sleep avoids by starting the simulation after it.
+where `w(n−1)` is RENDERSUBMIT_START of the newest released frame, the moment the render thread took it, and `d` and `c` are learned. `d` comes from samples `h = (b(n−1) − w(n−1)) − (e(n) − s(n))`: how much later frame `n` could have been released and still have ended its simulation (`e`, SIMULATION_END) before the render thread left the previous frame's Present (`b`, PRESENT_END). It is the 5th percentile of the newest 256 samples (`1 − 0.95`) minus the 0.5 ms allowance, never below 0, and 0 until 16 samples exist. A serial engine (render after simulation) gives `h < 0` and `d = 0`, so the limit never binds there.
+
+`c`, the **GPU queue term**, covers a render thread that waits for the GPU inside its own submission, where `h` cannot see it. Each NVIDIA Reflex report of a frame released under the limit says whether the frame finished its render submission (RENDERSUBMIT_END) while the GPU was still working on the previous frame: such a frame reached the GPU before it could start, so the release could have come later. Each such frame raises `c` by 0.95 × 1% of `I`, every other frame lowers it by 0.05 × 1% of `I`, so `c` settles where 5% of frames still reach a busy GPU (the Smoothing quantile again). `c` stays between 0 and `I` and restarts with `d`. Where frames reach the GPU after it is free, as when the render thread is the bottleneck, `c` stays at 0 and the simulation keeps overlapping the render thread's work. In Gears of War: E-Day at 120 FPS with FG 2× in the overload pause, 72% of frames reached the busy GPU and the simulation started 30 ms before the frame's GPU work, against 12% and 15 ms with the driver's Reflex Sleep; in CONTROL Resonant 3–5%.
 
 - **Applies to** frames that are not held (`source_only`), in VRR or fixed mode, released at SIMULATION_START by marker or pre-Sleep placement, while the driver's Sleep does not run. Held frames are not limited.
 - **Where the wait runs.** With pre-Sleep placement inside the Reflex Sleep hook, before the game reads input; with marker placement in the marker hook. The grid sees `A` as the frame's arrival, so a limit beyond `S` restarts the cadence like any late source, and the overload guard still sees the overload.
-- **The stall rule.** A wait ends when the render thread finished no frame for 3 of its own frame times (the median of the newest 32 intervals between its handoffs of consecutive frames, without handoffs that came after a stalled wait for them; at least 3 intervals); the frame is then released. Seeing the render thread finish a frame before the next frame's release (checked at every frame, limited or not, and by every handoff sample) shows that it does not wait for that release; from then on, within the producer epoch, a stall is a hitch and the limit stays on. Before that, 2 stalled waits in a row turn the limit off: a render thread that waits for the next release stalls every wait. It stays off until the render thread is seen finishing a frame before the next release or the next lifecycle, cap, FG multiplier or route change. A handoff older than 1 s counts as no stream and no limit applies.
+- **The stall rule.** A wait ends when the render thread took no frame for 3 of its own frame times (the median of the newest 32 intervals between its handoffs of consecutive frames, without handoffs that came after a stalled wait for them; at least 3 intervals); the frame is then released. Seeing the render thread take a frame before the next frame's release (checked at every frame, limited or not, and by every handoff sample) shows that it does not wait for that release; from then on, within the producer epoch, a stall is a hitch and the limit stays on. Before that, 2 stalled waits in a row turn the limit off: a render thread that waits for the next release stalls every wait. It stays off until the render thread is seen taking a frame before the next release or the next lifecycle, cap, FG multiplier or route change. A handoff older than 1 s counts as no stream and no limit applies.
 
 ```mermaid
 sequenceDiagram
     participant Sim as Game simulation thread
     participant RL as ReLimiter
     participant Render as Game render thread
-    Render->>RL: RENDERSUBMIT_END of frame n−1, the handoff v
-    Note over RL: A = v plus d, d from the 5th percentile of h minus 0.5 ms
+    Render->>RL: RENDERSUBMIT_START of frame n−1, the handoff w
+    Note over RL: A = w plus d plus c (d from h, c from Reflex reports)
     Sim->>RL: frame n reaches its release
     alt handoff of frame n−1 not yet seen
         RL->>RL: wait for the handoff, up to 3 render-thread frame times
@@ -473,6 +475,7 @@ sequenceDiagram
 - **Evidence gates every rise.** Two restarts within 0.5 s, or 6 of the newest 24 measured frames ready after their target (the lead expects about 1 in 100), or more than 10% of the frames of a window of at least 1 s restarting the cadence (a window closes after 2 s and restarts after every rise). Reflex workload reports alone never lengthen `I`.
 - **Demand sizes a rise.** What recent frames need is the larger of the 90th percentile of the newest 12 Reflex workload reports (at least 4) and the Adaptive cap fit percentile (75, 90 or 99; default 75) of the newest second of reports (at least 16). A report's workload is its longest stage: simulation, render submission or GPU work, where GPU work is the GPU active render time plus, with frame generation, the AI frame time (the generated frames run on the same GPU within the real frame's interval). A rise goes to need plus a margin `m = max(250 µs, 3% of I)`, by at most 8% of `I_0` per 0.25 s. Reports above 1.5 times the median count as hitches and are ignored; reports above 3 `I` are ignored. When more than 10% of a window's frames restarted and demand does not explain it, the rise is 5%.
 - **Falls.** After 0.5 s of headroom (the Adaptive cap fit value of the newest second plus two margins fits inside the interval actually paced), `I` falls to need (as defined above, the same as a rise uses) plus one margin, never below `I_0`, so a fall never lands where the next rise would put it back. Without that headroom, after 1 s without evidence it *probes* below the demand: 3% of `I_0`, 1.5 times further for each probe that stayed calm, up to 12%. Evidence after a probe returns it to the level before it and doubles the calm time the next probe needs (1, 2, 4, up to 8 s). A probe waits a calm second after any fall, and none starts while GPU execution time (plus AI frame time) is the largest stage in most reports of the newest second: it does not grow with `I`, so a probe below it can only fail.
+- **Failed falls.** A fall to the need that brings evidence back before it has held for a calm second failed: `I` returns to the level before it, and the *demand scale* `k` becomes at least the interval actually paced at the evidence divided by the need that fall used. From then on every need (rises, falls and the headroom test) is `k` times the measured one, so a later fall stops one margin above the interval that failed and still follows the demand when it changes, and no probe runs. `k` is 1 again after a reset. The workload reports can miss part of what a frame needs: in Gears of War: E-Day held with FG 2×, the render thread either kept up or fell a frame behind at the same interval, and only the second showed in its stage times; the cap fell to the GPU work's +10% every 5 to 10 s and climbed back to +28%.
 - **Recurring loads.** After a rise `I` does not fall for 1.5 s per overload episode of the last 20 s, up to 8 s.
 - **Realized interval.** The interval actually paced follows the target at +3% per frame up and −1% per frame down.
 - **Hold room.** With the Auto GPU queue wait, the interval is also kept at least as long as the GPU wait needs: the Adaptive cap fit percentile of the intervals at which recent frames would have reached the wait before their guarded release. It needs no evidence, and it is skipped when it would exceed +60%.
@@ -487,7 +490,7 @@ stateDiagram-v2
     Holding --> Rising : more evidence or a longer hold room
     Holding --> Falling : target lowered after 0.5 s of headroom or after a calm probe
     Falling --> Holding : realized interval reaches the lowered target
-    Falling --> Rising : evidence after a probe, probe failed
+    Falling --> Rising : evidence after a probe or a fall to the need, the fall failed
     Falling --> Idle : interval is back at the cap
     Rising --> Idle : reset
     Holding --> Idle : reset
@@ -590,10 +593,12 @@ Source: `src/feedback.cpp`, `src/feedback.h`, `src/reflex_clock_map.h`, `src/pac
 | `C`, `D` | Release-to-Present-call time and release-to-heavy-GPU-work time of a GPU wait frame. |
 | `H` | Release headroom: how long before the next frame's heavy GPU work the GPU wait is released (learned, start 1.0 ms). |
 | `M` | Release margin: the same distance to the next Present call (learned, start 2.5 ms). Used without Reflex GPU times. |
-| `v` | RENDERSUBMIT_END: the moment the game's render thread finished submitting a frame, the render handoff. `w` (RENDERSUBMIT_START, when it starts) is used only for `q`. |
+| `w` | RENDERSUBMIT_START: the moment the game's render thread takes a frame. |
 | `e`, `b` | SIMULATION_END and PRESENT_END markers of a frame. |
 | `q` | The time a finished frame waited for the render thread to leave the previous Present; left out of the `fg_input_wait` lead. |
-| `h` | One render handoff sample: `(b(n−1) − v(n−1)) − (e(n) − s(n))`. |
+| `h` | One render handoff sample: `(b(n−1) − w(n−1)) − (e(n) − s(n))`. |
 | `d` | The render handoff offset: the 5th percentile of `h` minus the allowance, at least 0. |
-| `A` | The earliest release of the render handoff limit: `A(n) = v(n−1) + d`. |
+| `c` | The render handoff GPU queue term: learned from Reflex reports so that 5% of frames released under the limit finish their submission while the GPU is still busy; between 0 and `I`. |
+| `A` | The earliest release of the render handoff limit: `A(n) = w(n−1) + d + c`. |
+| `k` | The Adaptive cap's demand scale: 1, or after a failed fall the paced interval at the evidence over the need that fall used. |
 | Adaptive cap stretch | `I / I_0`, between 1.0 and 1.6. |

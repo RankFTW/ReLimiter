@@ -62,6 +62,22 @@ struct NV_LATENCY_RESULT_PARAMS_LOCAL {
     uint8_t rsvd[32];
 };
 
+// The report of the frame before frameReport[index] among the driver's 64
+// (normally the one just before it), or nullptr.
+static const NV_LATENCY_FRAME_REPORT* PreviousFrameReport(
+    const NV_LATENCY_RESULT_PARAMS_LOCAL& params, int index) noexcept
+{
+    const uint64_t frame_id = params.frameReport[index].frameID;
+    if (frame_id <= 1) return nullptr;
+    if (index > 0 && params.frameReport[index - 1].frameID == frame_id - 1) {
+        return &params.frameReport[index - 1];
+    }
+    for (const NV_LATENCY_FRAME_REPORT& report : params.frameReport) {
+        if (report.frameID == frame_id - 1) return &report;
+    }
+    return nullptr;
+}
+
 static_assert(sizeof(NV_LATENCY_FRAME_REPORT) == 240,
               "NV_LATENCY_FRAME_REPORT size mismatch with NVAPI SDK");
 
@@ -1011,6 +1027,17 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
         pending_sample.present_to_gpu_end_us = sample_present_to_gpu_end_us;
         pending_sample.owned_gate_hold_us = sample_owned_gate_hold_us;
         pending_sample.queue_trend_us = sample_queue_trend_us;
+        // Render handoff GPU queue term: did this frame finish its submission
+        // while the GPU still worked on the previous frame?
+        if (const NV_LATENCY_FRAME_REPORT* previous = PreviousFrameReport(params, i);
+            previous != nullptr && r.renderSubmitEndTime > 0 && previous->gpuRenderEndTime > 0) {
+            const double submit_after_gpu_free_us =
+                ReflexSignedDeltaUs(previous->gpuRenderEndTime, r.renderSubmitEndTime);
+            if (std::abs(submit_after_gpu_free_us) < effective_interval_us * 3.0) {
+                pending_sample.submit_after_gpu_free_us = submit_after_gpu_free_us;
+                pending_sample.submit_after_gpu_free_known = true;
+            }
+        }
         // Capacity was checked before admission; the scheduler owner excludes
         // another writer between that check and this commit.
         if (!s_pending_adaptation_samples.Push(pending_sample)) return false;

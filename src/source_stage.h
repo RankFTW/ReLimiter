@@ -189,6 +189,13 @@ public:
     {
         lead_.OnGpuActiveTime(producer_epoch, frame_id, gpu_active_us, gpu_start_qpc);
     }
+    // A Reflex report's submission end against the previous frame's GPU end
+    // (LeadController::OnHandoffQueue).
+    void OnHandoffQueue(uint32_t producer_epoch, uint64_t frame_id, double submit_after_gpu_free_us,
+        double quantile) noexcept
+    {
+        lead_.OnHandoffQueue(producer_epoch, frame_id, submit_after_gpu_free_us, quantile);
+    }
     // Timing mode Off: grid suspended and published; the next plan starts a
     // ModeChange epoch.
     void Suspend() noexcept;

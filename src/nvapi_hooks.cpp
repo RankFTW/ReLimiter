@@ -675,7 +675,7 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
                 // Render handoff limit: with
                 // the Sleep bypassed, a frame that is not held waits here,
                 // before the game reads input, until the render thread has
-                // finished submitting the newest released frame.
+                // taken the newest released frame.
                 int64_t handoff_qpc = 0;
                 int64_t plan_qpc = sleep_entry.QuadPart;
                 uint8_t handoff_domain = 0;
@@ -817,16 +817,13 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
                 LOG_INFO("NvAPI: deferred diagnostic marker queue full; diagnostics dropped, enforcement unaffected");
             }
         }
-        // SIMULATION_END, PRESENT_END and RENDERSUBMIT_END of a planned frame
-        // reach the lead (the game's simulation → render queue and the render
-        // handoff offset, lead_controller.h); RENDERSUBMIT_END of any frame is
-        // the render handoff (render_handoff.h). The push never blocks.
-        if ((marker_params.markerType == SIMULATION_END || marker_params.markerType == PRESENT_END ||
-             marker_params.markerType == RENDERSUBMIT_END) && !PCL_MarkersFlowing()) {
-            PresentGate_OnFrameMarker(frame_key,
-                marker_params.markerType == SIMULATION_END ? PacingStageEventKind::SimulationEnd
-                : marker_params.markerType == PRESENT_END ? PacingStageEventKind::PresentEnd
-                : PacingStageEventKind::RenderSubmitEnd,
+        // SIMULATION_END and PRESENT_END of a planned frame reach the lead
+        // (the game's simulation → render queue and the render handoff
+        // offset, lead_controller.h); the push never blocks.
+        if ((marker_params.markerType == SIMULATION_END || marker_params.markerType == PRESENT_END) &&
+            !PCL_MarkersFlowing()) {
+            PresentGate_OnFrameMarker(frame_key, marker_params.markerType == SIMULATION_END
+                ? PacingStageEventKind::SimulationEnd : PacingStageEventKind::PresentEnd,
                 captured_qpc.QuadPart);
         }
         if (marker_params.markerType == PRESENT_START && !PCL_MarkersFlowing()) {
@@ -867,9 +864,11 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
         return forward();
     }
     // RENDERSUBMIT_START of a planned frame is a stage event for the lead
-    // (the simulation → render queue), pushed before the scheduler-owner
-    // guard: it runs on the render thread, often while the next
-    // SIMULATION_START owns the scheduler, and the push never blocks.
+    // (the simulation → render queue and the render handoff offset)
+    // and is published as the render handoff (render_handoff.h), before
+    // the scheduler-owner guard: it runs on the render thread, often while
+    // the next SIMULATION_START owns the scheduler (or waits for this
+    // handoff), and neither step blocks.
     if (marker_params.markerType == RENDERSUBMIT_START && !from_rtss && !PCL_MarkersFlowing()) {
         LARGE_INTEGER submit_qpc{};
         QueryPerformanceCounter(&submit_qpc);

@@ -206,15 +206,14 @@ void PresentGate_OnFrameMarker(const PacingPlanKey& key, PacingStageEventKind ki
         case PacingStageEventKind::RenderSubmitStart: slot = 0; name = "RENDERSUBMIT_START"; break;
         case PacingStageEventKind::SimulationEnd: slot = 1; name = "SIMULATION_END"; break;
         case PacingStageEventKind::PresentEnd: slot = 2; name = "PRESENT_END"; break;
-        case PacingStageEventKind::RenderSubmitEnd: slot = 3; name = "RENDERSUBMIT_END"; break;
         default: return;
     }
     if (arrival_qpc <= 0) return;
     // The render handoff limit waits for the
-    // presenting device's newest RENDERSUBMIT_END, planned or not; the FG
+    // presenting device's newest RENDERSUBMIT_START, planned or not; the FG
     // input wait's late-frame spacing asks whether the render thread has left
     // a frame's Present (PRESENT_END, render_handoff.h).
-    if (kind == PacingStageEventKind::RenderSubmitEnd) {
+    if (kind == PacingStageEventKind::RenderSubmitStart) {
         RenderHandoff_Publish(static_cast<uint8_t>(key.identity_domain), key.producer_epoch,
             key.frame_id, arrival_qpc);
     } else if (kind == PacingStageEventKind::PresentEnd) {
@@ -228,7 +227,7 @@ void PresentGate_OnFrameMarker(const PacingPlanKey& key, PacingStageEventKind ki
     // developer A/B key), every rung for the render handoff offset
     // (lead_controller.h).
     PushStageEvent(plan, kind, plan.rung, PacingPlanStatus::Unknown, arrival_qpc);
-    static std::atomic<bool> s_logged[4]{};
+    static std::atomic<bool> s_logged[3]{};
     if (!s_logged[slot].exchange(true, std::memory_order_relaxed))
         LOG_INFO("Pacing: %s reaches the lead (frame %llu)", name,
                  static_cast<unsigned long long>(key.frame_id));
