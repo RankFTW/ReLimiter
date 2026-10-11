@@ -35,6 +35,13 @@ namespace
     std::atomic<uint32_t> s_stalled_stream{0};
     std::atomic<uint64_t> s_stalled_frame{0};
 
+    // Newest PRESENT_END: its own seqlock, so a reader never pairs one
+    // stream with another stream's frame.
+    std::atomic<uint64_t> s_present_sequence{0};
+    std::atomic<uint32_t> s_present_stream{0};
+    std::atomic<uint64_t> s_present_frame_id{0};
+    std::atomic_flag s_present_writing = ATOMIC_FLAG_INIT;
+
     uint32_t StreamOf(uint8_t domain, uint32_t producer_epoch) noexcept
     {
         return (static_cast<uint32_t>(domain) << 24) | (producer_epoch & 0x00FFFFFFu);
@@ -143,6 +150,35 @@ int64_t RenderHandoff_CycleTicks(uint8_t domain, uint32_t producer_epoch) noexce
 {
     if (s_cycle_stream.load(std::memory_order_relaxed) != StreamOf(domain, producer_epoch)) return 0;
     return s_cycle_ticks.load(std::memory_order_relaxed);
+}
+
+void RenderHandoff_PublishPresentEnd(uint8_t domain, uint32_t producer_epoch, uint64_t frame_id) noexcept
+{
+    if (s_present_writing.test_and_set(std::memory_order_acquire)) return;
+    const uint64_t sequence = s_present_sequence.load(std::memory_order_relaxed);
+    s_present_sequence.store(sequence + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    s_present_stream.store(StreamOf(domain, producer_epoch), std::memory_order_relaxed);
+    s_present_frame_id.store(frame_id, std::memory_order_relaxed);
+    s_present_sequence.store(sequence + 2, std::memory_order_release);
+    s_present_writing.clear(std::memory_order_release);
+}
+
+bool RenderHandoff_LeftPresent(uint8_t domain, uint32_t producer_epoch, uint64_t frame_id) noexcept
+{
+    for (;;) {
+        const uint64_t before = s_present_sequence.load(std::memory_order_acquire);
+        if (before == 0) return false;
+        if (before & 1u) {
+            YieldProcessor();
+            continue;
+        }
+        const uint32_t stream = s_present_stream.load(std::memory_order_relaxed);
+        const uint64_t newest = s_present_frame_id.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (s_present_sequence.load(std::memory_order_relaxed) == before)
+            return stream == StreamOf(domain, producer_epoch) && newest >= frame_id;
+    }
 }
 
 RenderHandoffWait RenderHandoff_WaitFor(uint8_t domain, uint32_t producer_epoch, uint64_t frame_id,

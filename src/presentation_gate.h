@@ -81,9 +81,10 @@ void PresentGate_OnPresentStart(const PacingPlanKey& key, int64_t arrival_qpc,
 // time a finished frame waited for the game's render thread to leave the
 // previous Present (FG input wait; GPU queue wait under the A/B key), and all
 // three on every rung for the render handoff offset (lead_controller.h).
-// RENDERSUBMIT_START is also published as the render handoff
-// (render_handoff.h), planned or not. Never blocks; no event for another
-// kind or an unplanned frame.
+// RENDERSUBMIT_START is also published as the render handoff and PRESENT_END
+// as the render thread leaving the frame's Present (render_handoff.h),
+// planned or not. Never blocks; no event for another kind or an unplanned
+// frame.
 void PresentGate_OnFrameMarker(const PacingPlanKey& key, PacingStageEventKind kind,
                                int64_t arrival_qpc) noexcept;
 

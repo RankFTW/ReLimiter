@@ -16,6 +16,7 @@
 #include "feedback_device_identity.h"
 #include "bounded_mpsc_queue.h"
 #include "pacing_telemetry.h"
+#include "render_handoff.h"
 #include <d3d12.h>
 #include <avrt.h>
 #include <array>
@@ -46,6 +47,12 @@ struct Ticket {
     bool fg=false;
     int fg_multiplier=0;
     double fg_divisor=1.0; // the plan's: displayed frames per grid frame
+    // fg_late_spacing: T(n) without the spacing floor at the decision (0 =
+    // switch off). At T(n) the worker checks once whether the game's render
+    // thread has left this frame's Present; while it has not, no floor holds
+    // the frame past T(n) (floor_blocked).
+    int64_t floor_base_qpc=0;
+    bool floor_checked=false,floor_blocked=false;
     uint64_t fg_epoch=0,fg_binding=0;
     GpuTimestampSlot* post_slot=nullptr;
     GpuReadinessSample post_sample{};
@@ -602,6 +609,28 @@ void FloorAfterLatePass(Queue& queue,Ticket& ticket,int64_t* next) noexcept {
     ticket.trace.target_qpc=target;
     g_cadence_output_tracker.RecordLater(generation,index,target);
 }
+// fg_late_spacing, once at the frame's grid target T(n): in Streamline's
+// cycle a hold past T(n) while the game's render thread is still inside this
+// frame's Present also holds the render thread, and the next frame waits for
+// it (CONTROL Resonant at 157 FPS with 2x: the next frame late after 42% of
+// such holds against 3% once the render thread had left). While no PRESENT_END
+// of this frame has arrived (none of the stream counts as not yet), the frame
+// is released at T(n): a floor move from the decision is undone, the record
+// becomes the actual release and FloorAfterLatePass does not move it.
+bool fg_floor_blocked_logged=false;
+void CheckRenderThread(Ticket& ticket,int64_t now) noexcept {
+    ticket.floor_checked=true;
+    ticket.floor_blocked=!RenderHandoff_LeftPresent(static_cast<uint8_t>(ticket.key.identity_domain),
+        ticket.key.producer_epoch,ticket.key.frame_id);
+    if(!ticket.floor_blocked || ticket.trace.target_qpc<=now)return;
+    if(!fg_floor_blocked_logged) {
+        fg_floor_blocked_logged=true;
+        LOG_INFO("GPU Present gate: FG late-frame spacing kept a Signal at its target (the render thread was still in the frame's Present)");
+    }
+    ticket.trace.phase_adjust_qpc-=ticket.trace.target_qpc-now;
+    ticket.trace.target_qpc=now;
+    g_cadence_output_tracker.Record(ticket.key.controller_generation,ticket.trace.grid_index,now);
+}
 int64_t Service() noexcept {
     int64_t next=0;
     for(auto& queue:queues) {
@@ -618,8 +647,12 @@ int64_t Service() noexcept {
             const auto state=ticket.state.load(std::memory_order_acquire);
             if(state==TicketState::Armed || state==TicketState::Submitted) {
                 const auto now=Qpc();const bool current=Current(ticket) && !queue.retired.load(std::memory_order_acquire) && !failed.load();
-                if(!ticket.signalled && current && ticket.fg && now>=ticket.trace.target_qpc &&
-                    PacingPipeline_GetConfig().fg_late_spacing)FloorAfterLatePass(queue,ticket,&next);
+                // fg_late_spacing: the render-thread check at T(n), then the
+                // late-pass floor when the (possibly moved) Signal is due.
+                const bool spacing=!ticket.signalled && current && ticket.fg && ticket.floor_base_qpc>0 &&
+                    PacingPipeline_GetConfig().fg_late_spacing;
+                if(spacing && !ticket.floor_checked && now>=ticket.floor_base_qpc)CheckRenderThread(ticket,now);
+                if(spacing && !ticket.floor_blocked && now>=ticket.trace.target_qpc)FloorAfterLatePass(queue,ticket,&next);
                 if(!ticket.signalled && (!current || now>=ticket.trace.target_qpc)) {
                     ticket.trace.worker_wake_qpc=worker_wake_qpc;
                     ticket.trace.worker_service_qpc=now;
@@ -639,7 +672,9 @@ int64_t Service() noexcept {
                         ticket.trace.signal_before_qpc,PacingPlanStatus::Held);
                 }
                 if(!ticket.signalled) {
-                    const auto due=ticket.trace.signal_before_qpc>0?now+frequency/1000:ticket.trace.target_qpc;
+                    auto due=ticket.trace.signal_before_qpc>0?now+frequency/1000:ticket.trace.target_qpc;
+                    if(ticket.fg && !ticket.floor_checked && ticket.floor_base_qpc>now && ticket.floor_base_qpc<due)
+                        due=ticket.floor_base_qpc; // wake at T(n) for the render-thread check
                     if(!next || due<next)next=due;
                     continue; // even failed signals retain service obligation
                 }
@@ -824,6 +859,7 @@ struct EnqueueRequest {
     bool fg=false;
     int fg_multiplier=0;
     double fg_divisor=1.0; // the plan's
+    int64_t floor_base_qpc=0; // fg_late_spacing: T(n) without the floor (Ticket)
     uint64_t fg_binding=0;
 };
 // trace->target_qpc is the resolved output target; trace->grid_index the plan's
@@ -887,6 +923,7 @@ bool Enqueue(const EnqueueRequest& request,GpuPresentTrace* trace) noexcept {
     ticket.native_swapchain=span->native_swapchain;ticket.source=context.source_frame;
     ticket.key=request.key;
     ticket.fg=request.fg;ticket.fg_multiplier=request.fg_multiplier;ticket.fg_divisor=request.fg_divisor;
+    ticket.floor_base_qpc=request.floor_base_qpc;ticket.floor_checked=ticket.floor_blocked=false;
     ticket.fg_binding=request.fg_binding;
     ticket.fg_epoch=fg_epoch.load(std::memory_order_acquire);
     const auto abandon_prepared=[&] {
@@ -964,6 +1001,7 @@ struct OutputDecision {
     PacingPlanStatus status=PacingPlanStatus::Unknown;
     GpuPresentStatus gate=GpuPresentStatus::Off;
     int64_t target=0; // 0 when Stale
+    int64_t grid_target=0; // T(n) without the spacing floor; 0 when Stale
 };
 // Grid snapshot + spacing floor -> T. Stale, Late (now >= T), Undeliverable
 // beyond the horizon clamp(3 I, 2 ms, 100 ms), otherwise Held (queue the wait).
@@ -980,6 +1018,8 @@ OutputDecision Decide(const PacingFramePlan& plan,int64_t now,bool displayed_sla
         decision.status=PacingPlanStatus::Stale;decision.gate=GpuPresentStatus::PlanStale;decision.target=0;
         return decision;
     }
+    // Resolved, so TargetOf resolves the same index.
+    CadenceGrid_TargetOf(snapshot,plan.key.controller_generation,plan.grid_index,&decision.grid_target);
     if(now>=decision.target) {decision.status=PacingPlanStatus::Late;decision.gate=GpuPresentStatus::Late;return decision;}
     if(decision.target-now>GpuPresent_HorizonTicks(plan.interval_us,frequency)) {
         decision.status=PacingPlanStatus::Undeliverable;decision.gate=GpuPresentStatus::Budget;return decision;
@@ -1357,7 +1397,8 @@ bool GpuPresent_BeginFgInput(uint64_t native,const GpuPresentFgInput& input) noe
     }
     fg_pending_queue=queue;fg_pending_measurement=measurement;fg_pending_transaction=input.transaction;
     Leave(); // pin remains held through the original input callback
-    const auto decision=Decide(plan,Qpc(),PacingPipeline_GetConfig().fg_late_spacing);
+    const bool late_spacing=PacingPipeline_GetConfig().fg_late_spacing;
+    const auto decision=Decide(plan,Qpc(),late_spacing);
     ApplyDecision(decision,&trace);
     auto outcome=decision.status;
     if(outcome==PacingPlanStatus::Held) {
@@ -1366,6 +1407,7 @@ bool GpuPresent_BeginFgInput(uint64_t native,const GpuPresentFgInput& input) noe
         span.native_swapchain=input.native;span.key.swapchain_generation=input.swapchain;
         EnqueueRequest request;request.native=native;request.context=context;request.span=&span;request.key=plan.key;
         request.fg=true;request.fg_multiplier=multiplier;request.fg_divisor=plan.fg_divisor;request.fg_binding=input.binding;
+        request.floor_base_qpc=late_spacing?decision.grid_target:0;
         if(!Enqueue(request,&trace))outcome=AdmissionOutcome(trace);
     }
     trace.queue=native;trace.swapchain=input.swapchain;trace.present_sequence=0;

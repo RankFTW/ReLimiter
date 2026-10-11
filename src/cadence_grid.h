@@ -119,7 +119,9 @@ int64_t CadenceGrid_LateToleranceTicks(
 // wait later raises a frame's record to its readiness when the frame reached
 // its wait after the Signal (RecordLater), resolves the next frame's floor
 // again just before its Signal, and takes the floor's slack from the
-// displayed interval I / D (CadenceGrid_ResolveOutputTarget).
+// displayed interval I / D (CadenceGrid_ResolveOutputTarget); while the
+// game's render thread is still inside the frame's Present at T(n), it
+// releases at T(n) instead and records that.
 //
 // 16 slots indexed by grid_index & 15, each a seqlock over atomic fields.
 // Writers for indices less than 16 apart never share a slot; the rare

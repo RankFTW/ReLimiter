@@ -724,6 +724,57 @@ void TestExecutor() {
         CHECK(decision.status==PacingPlanStatus::Held && decision.target==GridTarget(41)+3000-1388);
         decision=Decide(plan,now,true);
         CHECK(decision.status==PacingPlanStatus::Held && decision.target==GridTarget(41)+3000-694);
+        CHECK(decision.grid_target==GridTarget(41));
+    }
+    // fg_late_spacing, worker: an FG input wait whose floor moved its Signal
+    // 3,000 ticks past T(n) wakes at T(n). While the game's render thread is
+    // still inside the frame's Present (no PRESENT_END of it published) it is
+    // released at T(n) and recorded there; once the render thread has left,
+    // the move stays. (The ticket is admitted on the GPU queue wait, then
+    // given the FG input's identity.)
+    {
+        auto pipeline=PacingPipeline_GetConfig();pipeline.fg_late_spacing=true;PacingPipeline_SetConfig(pipeline);
+        const auto domain=static_cast<uint8_t>(PacingIdentityDomain::NvApiFrame);
+        const auto generation_now=FrameTimeline_CurrentControllerGeneration();
+        for(const bool left:{false,true}) {
+            const uint64_t index=left?52:50;
+            PublishRung(PacingRung::GpuQueueWait);
+            fake_clock=GridTarget(index)-5000;heartbeat=fake_clock;
+            PublishPlan(index,index,PacingRung::GpuQueueWait);
+            outcome=ExecuteFrame(index);
+            CHECK(outcome.execution==GpuPresentExecution::WaitCommitted);
+            ExpectStage(index,index,PacingStageEventKind::PresentCall,fake_clock);
+            Ticket* held=nullptr;
+            for(auto& ticket:queue.tickets)if(ticket.trace.ticket==outcome.trace.ticket)held=&ticket;
+            CHECK(held!=nullptr);
+            fg_context=true;PublishRung(PacingRung::FgInputWait);
+            held->fg=true;held->fg_multiplier=g_fg_multiplier.load();held->fg_epoch=fg_epoch.load();held->fg_binding=0;
+            held->fg_divisor=2.0;held->floor_base_qpc=GridTarget(index);held->floor_checked=held->floor_blocked=false;
+            held->trace.target_qpc=GridTarget(index)+3000;
+            CHECK(g_cadence_output_tracker.Record(generation_now,index,GridTarget(index)+3000));
+            if(left)RenderHandoff_PublishPresentEnd(domain,PlanKey(index).producer_epoch,index);
+            CHECK(Service()==GridTarget(index) && !held->signalled); // wakes at T(n) for the check
+            fake_clock=GridTarget(index);heartbeat=fake_clock;
+            const auto next=Service();
+            const auto released=left?GridTarget(index)+3000:GridTarget(index);
+            if(left) {
+                CHECK(!held->signalled && next==released);
+                fake_clock=released;heartbeat=fake_clock;Service();
+            }
+            CHECK(held->signalled);
+            PacingGateRecord gate;
+            CHECK(NextSignalled(GpuPresentStatus::Released,&gate) && gate.signal_before_qpc==released);
+            ExpectRecorded(index,released);
+            ExpectStage(index,index,PacingStageEventKind::OutputRelease,released,PacingPlanStatus::Held,PacingRung::FgInputWait);
+            ExpectNoStage();
+            fg_context=false;
+        }
+        // Newest PRESENT_END 52: frames up to 52 have left, 53 has not, and
+        // another producer epoch's frames are never matched.
+        const auto epoch=PlanKey(52).producer_epoch;
+        CHECK(RenderHandoff_LeftPresent(domain,epoch,51) && RenderHandoff_LeftPresent(domain,epoch,52));
+        CHECK(!RenderHandoff_LeftPresent(domain,epoch,53) && !RenderHandoff_LeftPresent(domain,epoch+1,52));
+        pipeline.fg_late_spacing=false;PacingPipeline_SetConfig(pipeline);
     }
 
     // UINT64_MAX on the done fence is device removal, never retirement.

@@ -210,10 +210,15 @@ void PresentGate_OnFrameMarker(const PacingPlanKey& key, PacingStageEventKind ki
     }
     if (arrival_qpc <= 0) return;
     // The render handoff limit waits for the
-    // presenting device's newest RENDERSUBMIT_START, planned or not.
+    // presenting device's newest RENDERSUBMIT_START, planned or not; the FG
+    // input wait's late-frame spacing asks whether the render thread has left
+    // a frame's Present (PRESENT_END, render_handoff.h).
     if (kind == PacingStageEventKind::RenderSubmitStart) {
         RenderHandoff_Publish(static_cast<uint8_t>(key.identity_domain), key.producer_epoch,
             key.frame_id, arrival_qpc);
+    } else if (kind == PacingStageEventKind::PresentEnd) {
+        RenderHandoff_PublishPresentEnd(static_cast<uint8_t>(key.identity_domain), key.producer_epoch,
+            key.frame_id);
     }
     PacingFramePlan plan{};
     if (!g_frame_plans.Find(key, &plan)) return;

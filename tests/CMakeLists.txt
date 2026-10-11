@@ -363,7 +363,8 @@ target_include_directories(test_gpu_present_gate PRIVATE ${CMAKE_SOURCE_DIR}/dep
 target_compile_definitions(test_gpu_present_gate PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     target_sources(test_gpu_present_gate PRIVATE ${CMAKE_SOURCE_DIR}/src/gpu_readiness_d3d12_queue.cpp
-        ${CMAKE_SOURCE_DIR}/src/feedback_device_identity.cpp)
+        ${CMAKE_SOURCE_DIR}/src/feedback_device_identity.cpp ${CMAKE_SOURCE_DIR}/src/render_handoff.cpp)
+    target_link_libraries(test_gpu_present_gate PRIVATE Synchronization)
 endif()
 add_executable(test_gpu_readiness test_gpu_readiness.cpp
     ${CMAKE_SOURCE_DIR}/src/gpu_present_types.cpp
