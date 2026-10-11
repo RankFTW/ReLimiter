@@ -529,8 +529,8 @@ bool Idle() noexcept;
 // FG input prefix readback (GpuReady r), oldest first. Samples remain owned
 // until both the input callback and the GPU have finished, so it stops at an
 // unfinished callback or GPU query; outside a Signal (before_signal false) it
-// also yields when a time-fence Signal is due within 2 ms. With the
-// developer A/B fg_late_spacing, an input that reached its wait after its
+// also yields when a time-fence Signal is due within 2 ms. With
+// fg_late_spacing (on by default), an input that reached its wait after its
 // recorded output (the Signal, or the Late decision) raises that record to
 // its readiness, where it actually passed (cadence_grid.h, output tracker).
 void DrainFgReadback(Queue& queue,int64_t* next,bool before_signal) noexcept {

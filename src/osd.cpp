@@ -603,12 +603,13 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         LOG_INFO("OSD: FG late-frame spacing -> %s", g_config.fg_late_spacing ? "on" : "off");
         *config_dirty = true;
     }
-    HelpTip("Diagnostic A/B, FG input wait only. When a real frame reaches the wait after its release time, "
-        "it enters frame generation when it is ready. On, the next real frame is then released no sooner "
-        "than about one frame interval after that, as after a late frame on the other outputs, instead of on "
-        "its original time, which shortened the displayed interval after it. A frame is never held past its "
-        "original time while the game's render thread is still inside that frame's Present, because the next "
-        "frame would wait too. Watch jitter and long frames; one setting per capture.");
+    HelpTip("Diagnostic A/B, FG input wait only; on by default. When a real frame reaches the wait after its "
+        "release time, it enters frame generation when it is ready. On, the next real frame is then released "
+        "no sooner than about one frame interval after that, as after a late frame on the other outputs; off, "
+        "it is released on its original time, which shortens the displayed interval after the late one. A "
+        "frame is never held past its original time while the game's render thread is still inside that "
+        "frame's Present, because the next frame would wait too. Watch jitter and long frames; one setting "
+        "per capture.");
 
     static const char* const kSourcePlacementLabels[] = {"Marker", "Pre-Sleep", "Reflex driver limiter"};
     static_assert(IM_ARRAYSIZE(kSourcePlacementLabels) ==

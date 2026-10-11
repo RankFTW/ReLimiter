@@ -847,7 +847,7 @@ namespace
         config.stall_inject_period_s = 10.0;
         config.gpu_queue_wait_render_queue = PacingRenderQueue::RemoveHeld;
         config.lead_coverage = PacingLeadCoverage::Q95;
-        config.fg_late_spacing = true;
+        config.fg_late_spacing = false;
         PacingPipeline_SetConfig(config);
         CHECK(SameConfig(PacingPipeline_GetConfig(), config));
         CHECK(PacingPipeline_GetConfig().adaptive_cap);

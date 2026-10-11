@@ -320,18 +320,18 @@ void TestPacingPipelineDefaults() {
     CHECK(g_config.marker_forward_order == PacingMarkerForwardOrder::BeforeWait);
     CHECK(g_config.gpu_queue_wait_render_queue == PacingRenderQueue::Keep);
     CHECK(g_config.lead_coverage == PacingLeadCoverage::Q99);
-    CHECK(!g_config.fg_late_spacing);
+    CHECK(g_config.fg_late_spacing);
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
     CheckPipelineMatchesConfig();
     // The startup rewrite saves every new key, including the developer keys.
     CHECK(Value(local_path, "FrameLimiter", "marker_forward_order") == "before_wait");
     CHECK(Value(local_path, "FrameLimiter", "gpu_queue_wait_render_queue") == "keep");
     CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "99");
-    CHECK(Value(local_path, "FrameLimiter", "fg_late_spacing") == "false");
+    CHECK(Value(local_path, "FrameLimiter", "fg_late_spacing") == "true");
     CHECK(Value(local_path, "FrameLimiter", "source_placement") == "pre_sleep");
     CHECK(Value(local_path, "FrameLimiter", "reflex_sleep_bypass") == "true");
     CHECK(Value(local_path, "FrameLimiter", "developer_settings") == "false");
-    CHECK(Value(local_path, "FrameLimiter", "config_version") == "3");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "4");
     CHECK(Value(local_path, "FrameLimiter", "smoothing") == "on");
     CHECK(Value(local_path, "FrameLimiter", "adaptive_cap") == "false");
     CHECK(Value(local_path, "FrameLimiter", "output_rung") == "auto");
@@ -345,7 +345,8 @@ void TestPacingPipelineDefaults() {
 // Sleep bypass (off) and source placement (marker): it moves to the new
 // defaults once and keeps every other value; a version-2 INI keeps its choice.
 // A version-2 INI (test builds) saved lead_coverage=95: it moves to 99 once;
-// a version-3 INI keeps 95 as the developer A/B.
+// a version-3 INI keeps 95 as the developer A/B. A version-3 INI saved
+// fg_late_spacing=false: it moves to true once; a version-4 INI keeps false.
 void TestRecommendedDefaultsMigration() {
     Reset(false, false, {{"reflex_sleep_bypass", "false"}, {"source_placement", "marker"},
         {"gpu_wait_budget_us", "4000"}, {"adaptive_cap", "true"}});
@@ -353,7 +354,7 @@ void TestRecommendedDefaultsMigration() {
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
     CHECK(g_config.gpu_wait_budget_us == 4000.0 && g_config.adaptive_cap);
     CheckPipelineMatchesConfig();
-    CHECK(Value(local_path, "FrameLimiter", "config_version") == "3");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "4");
     CHECK(Value(local_path, "FrameLimiter", "reflex_sleep_bypass") == "true");
     CHECK(Value(local_path, "FrameLimiter", "source_placement") == "pre_sleep");
     ReleaseStart();CHECK(OwnerShutdown());
@@ -365,12 +366,19 @@ void TestRecommendedDefaultsMigration() {
     CHECK(g_config.lead_coverage == PacingLeadCoverage::Q99);
     CheckPipelineMatchesConfig();
     CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "99");
-    CHECK(Value(local_path, "FrameLimiter", "config_version") == "3");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "4");
     ReleaseStart();CHECK(OwnerShutdown());
 
-    Reset(false, false, {{"config_version", "3"}, {"lead_coverage", "95"}});
-    CHECK(g_config.lead_coverage == PacingLeadCoverage::Q95);
+    Reset(false, false, {{"config_version", "3"}, {"lead_coverage", "95"}, {"fg_late_spacing", "false"}});
+    CHECK(g_config.lead_coverage == PacingLeadCoverage::Q95 && g_config.fg_late_spacing);
+    CheckPipelineMatchesConfig();
     CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "95");
+    CHECK(Value(local_path, "FrameLimiter", "fg_late_spacing") == "true");
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    Reset(false, false, {{"config_version", "4"}, {"fg_late_spacing", "false"}});
+    CHECK(!g_config.fg_late_spacing);
+    CHECK(Value(local_path, "FrameLimiter", "fg_late_spacing") == "false");
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
@@ -538,16 +546,16 @@ void TestLeadCoverageKey() {
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
-// Developer A/B fg_late_spacing: true loads, reaches the pipeline, counts as a
-// developer override and resets to false.
+// Developer A/B fg_late_spacing: false loads (in a version-4 INI), reaches the
+// pipeline, counts as a developer override and resets to true.
 void TestFgLateSpacingKey() {
-    Reset(false, false, {{"fg_late_spacing", "true"}});
-    CHECK(g_config.fg_late_spacing);
+    Reset(false, false, {{"config_version", "4"}, {"fg_late_spacing", "false"}});
+    CHECK(!g_config.fg_late_spacing);
     CheckPipelineMatchesConfig();
-    CHECK(Value(local_path, "FrameLimiter", "fg_late_spacing") == "true");
+    CHECK(Value(local_path, "FrameLimiter", "fg_late_spacing") == "false");
     CHECK(Config_DeveloperOverrides() == 1);
     Config_ResetDeveloperSettings();
-    CHECK(!g_config.fg_late_spacing && !PacingPipeline_GetConfig().fg_late_spacing);
+    CHECK(g_config.fg_late_spacing && PacingPipeline_GetConfig().fg_late_spacing);
     ReleaseStart();CHECK(OwnerShutdown());
 }
 

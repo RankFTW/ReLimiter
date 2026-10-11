@@ -30,8 +30,9 @@ static const Config s_default_config{};
 // placement became the defaults. Earlier builds saved every key, so an INI
 // without this version carries the old defaults of those two keys. 3: lead
 // coverage 99 became the default; test builds since the key existed saved
-// lead_coverage=95.
-static constexpr int kConfigVersion = 3;
+// lead_coverage=95. 4: FG late-frame spacing became the default; test builds
+// since the key existed saved fg_late_spacing=false.
+static constexpr int kConfigVersion = 4;
 
 static char s_ini_path[MAX_PATH] = {};
 static bool s_first_launch = false;
@@ -411,7 +412,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.csv_enabled             = ReadINIBool(S, "csv_enabled", false, P);
     g_config.native_pcl_enabled      = ReadINIBool(S, "native_pcl_enabled", false, P);
     g_config.gpu_present_gate_probes=ReadINIBool(S,"gpu_present_gate_probes",true,P);
-    g_config.fg_late_spacing=ReadINIBool(S,"fg_late_spacing",false,P);
+    g_config.fg_late_spacing=ReadINIBool(S,"fg_late_spacing",true,P);
     g_config.reflex_sleep_bypass=ReadINIBool(S,"reflex_sleep_bypass",true,P);
     g_config.reflex_inject           = ReadINIBool(S, "reflex_inject", false, P);
     g_config.flip_model_override     = ReadINIBool(S, "flip_model_override", false, P);
@@ -434,6 +435,10 @@ void LoadConfig(HMODULE hModule) {
     if (!s_first_launch && saved_version < 3 && g_config.lead_coverage == PacingLeadCoverage::Q95) {
         LOG_INFO("Config: moved to the recommended default lead_coverage=99 (was 95)");
         g_config.lead_coverage = PacingLeadCoverage::Q99;
+    }
+    if (!s_first_launch && saved_version < 4 && !g_config.fg_late_spacing) {
+        LOG_INFO("Config: moved to the recommended default fg_late_spacing=true (was false)");
+        g_config.fg_late_spacing = true;
     }
     g_config.osd_show_adaptive_smoothing = ReadINIBool(S, "osd_show_adaptive_smoothing", false, P);
     g_config.osd_show_0_1pct_low     = ReadINIBool(S, "osd_show_0_1pct_low", false, P);
@@ -954,9 +959,9 @@ void ApplyConfig() {
     if (g_config.lead_coverage != PacingLeadCoverage::Q99)
         LOG_WARN("Pacing pipeline: diagnostic lead coverage %s%% (the lead covers that share of frames, default 99%%; "
                  "the render handoff limit keeps 95%%)", PacingLeadCoverage_Text(g_config.lead_coverage));
-    if (g_config.fg_late_spacing)
-        LOG_WARN("Pacing pipeline: diagnostic FG late-frame spacing on (an FG input that reached its wait after "
-                 "the Signal floors the next real frame at its readiness)");
+    if (!g_config.fg_late_spacing)
+        LOG_WARN("Pacing pipeline: diagnostic FG late-frame spacing off (the next real frame after one that "
+                 "reached its FG input late is released on its original target)");
 }
 
 

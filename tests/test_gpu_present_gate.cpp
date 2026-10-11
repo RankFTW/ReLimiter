@@ -733,7 +733,8 @@ void TestExecutor() {
     // the move stays. (The ticket is admitted on the GPU queue wait, then
     // given the FG input's identity.)
     {
-        auto pipeline=PacingPipeline_GetConfig();pipeline.fg_late_spacing=true;PacingPipeline_SetConfig(pipeline);
+        const auto saved_pipeline=PacingPipeline_GetConfig();
+        auto pipeline=saved_pipeline;pipeline.fg_late_spacing=true;PacingPipeline_SetConfig(pipeline);
         const auto domain=static_cast<uint8_t>(PacingIdentityDomain::NvApiFrame);
         const auto generation_now=FrameTimeline_CurrentControllerGeneration();
         for(const bool left:{false,true}) {
@@ -774,7 +775,7 @@ void TestExecutor() {
         const auto epoch=PlanKey(52).producer_epoch;
         CHECK(RenderHandoff_LeftPresent(domain,epoch,51) && RenderHandoff_LeftPresent(domain,epoch,52));
         CHECK(!RenderHandoff_LeftPresent(domain,epoch,53) && !RenderHandoff_LeftPresent(domain,epoch+1,52));
-        pipeline.fg_late_spacing=false;PacingPipeline_SetConfig(pipeline);
+        PacingPipeline_SetConfig(saved_pipeline);
     }
 
     // UINT64_MAX on the done fence is device removal, never retirement.

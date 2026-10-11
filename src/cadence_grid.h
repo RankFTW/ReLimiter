@@ -115,7 +115,7 @@ int64_t CadenceGrid_LateToleranceTicks(
 //   - GPU queue wait (H3, FG input): max(target, now) at enqueue.
 // Record before the next frame's executor can resolve (for a CPU hold,
 // before Present is forwarded); a frame whose predecessor is not recorded
-// yet gets no floor. With the developer A/B fg_late_spacing the FG input
+// yet gets no floor. With fg_late_spacing (on by default) the FG input
 // wait later raises a frame's record to its readiness when the frame reached
 // its wait after the Signal (RecordLater), resolves the next frame's floor
 // again just before its Signal, and takes the floor's slack from the

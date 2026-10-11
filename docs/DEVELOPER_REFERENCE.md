@@ -117,13 +117,13 @@ Turning it off removes two command lists and two fence signals per frame from th
 
 ### FG late-frame spacing
 
-`fg_late_spacing` (default **off**, 64-bit, `fg_input_wait` only). When a real frame reaches the FG input wait after its release time, it enters frame generation when its GPU work finishes, and frame generation shows most of that delay on one displayed interval. Off, the next real frame is released on its original target, so the displayed interval after the late one is short by most of the same amount. On, ReLimiter records the late frame where it actually passed and holds the next real frame at least one frame interval minus an eighth of the displayed interval after it, so each displayed interval is shortened by at most about an eighth, the same share the outputs without frame generation allow ([No catch-up burst](FRAME_PACING.md#no-catch-up-burst)).
+`fg_late_spacing` (default **on**, 64-bit, `fg_input_wait` only). When a real frame reaches the FG input wait after its release time, it enters frame generation when its GPU work finishes, and frame generation shows most of that delay on one displayed interval. On, ReLimiter records the late frame where it actually passed and holds the next real frame at least one frame interval minus an eighth of the displayed interval after it, so each displayed interval is shortened by at most about an eighth, the same share the outputs without frame generation allow ([No catch-up burst](FRAME_PACING.md#no-catch-up-burst)). Off (developer A/B), the next real frame is released on its original target, so the displayed interval after the late one is short by most of the same amount: in CONTROL Resonant at 60 FPS with 2×, the worst displayed error after a game hitch was 5.6 ms off against 1.7 ms on (median).
 
 - Only releases after a late frame move, and only later; the late frame itself is unchanged. Recovering from a long hitch takes a few more frames, each held a little later.
 - **Never while the game's render thread waits.** If the game's render thread is still inside a frame's Present when the frame's original target arrives (its PRESENT_END marker has not come), holding the frame longer would also hold the render thread, and the next frame would wait behind it. That frame is then released at its original target. This is what happens when the GPU is the limit (CONTROL Resonant at 157 FPS with 2×: the next frame was late after 42% of such holds against 3% of the others); with headroom (60 FPS with 2×) the render thread had always left. Without PRESENT_END markers nothing is moved.
 - A release moved more than the late tolerance (a quarter of the real-frame interval) restarts the cadence, as a late release does on the other outputs; such restarts count for the overload pause and the Adaptive cap.
 - A frame that reaches the FG input after its original target can be held to the moved target instead of passing late.
-- Compare jitter above 2 and 4 ms, long frames and PC Latency, one setting per capture in the same scene. The log warns while it is on and logs at INFO the first moved release and the first release kept at its target because the render thread was still in the Present.
+- Compare jitter above 2 and 4 ms, long frames and PC Latency, one setting per capture in the same scene. The log warns while it is off and logs at INFO the first moved release and the first release kept at its target because the render thread was still in the Present.
 
 ### Source placement
 
@@ -166,7 +166,7 @@ Settings belong under `[FrameLimiter]`. Leave these at their defaults for normal
 | `marker_forward_order` | before_wait | 64-bit, NvAPI markers. `before_wait` or `after_wait`: when SIMULATION_START reaches the driver relative to ReLimiter's wait (**Marker forward order**). Invalid values reset to `before_wait`. |
 | `gpu_queue_wait_render_queue` | keep | 64-bit, `gpu_queue_wait` only. `keep`, `remove` or `remove_held` (**GPU queue wait render queue**). Invalid values reset to `keep`. |
 | `lead_coverage` | 99 | All holds. `99` or `95`: the share of frames the lead covers (**Lead coverage**). Invalid values reset to `99`. An INI saved with `config_version=2` (4.0 test builds) moves from `95` to `99` once. |
-| `fg_late_spacing` | false | 64-bit, `fg_input_wait` only. `true` or `false` (**FG late-frame spacing**). |
+| `fg_late_spacing` | true | 64-bit, `fg_input_wait` only. `true` or `false` (**FG late-frame spacing**). An INI saved with `config_version=3` or earlier (4.0 test builds) moves from `false` to `true` once. |
 | `source_placement` | pre_sleep | 64-bit, Reflex markers. `marker`, `pre_sleep` or `driver` (**Source placement**). `auto` from earlier versions loads as `marker`; invalid values reset to `pre_sleep`. |
 
 ---
