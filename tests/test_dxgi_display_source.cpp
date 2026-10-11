@@ -178,6 +178,31 @@ namespace
         CHECK(g_matcher.Statistics().continuity_breaks == 3);
     }
 
+    // Composed presentation: a SyncQPCTime before the present's own Present
+    // call, or no later than the previous display, is not its display time.
+    void TestStaleSyncTimesAreUnobserved()
+    {
+        g_matcher.Reset(kFrequency);
+        AddRecords(100, 106, 0);
+        DxgiDisplayEmission emission{};
+        Observe(Shown(100, 0), &emission);
+        CHECK(Observe(Shown(101, 1), &emission) == DxgiObservation::Displayed);
+
+        // The previous present's display time again, at the next present's refresh.
+        CHECK(Observe(Statistics(102, DisplayQpc(1), Refresh(2), Refresh(2)), &emission) ==
+            DxgiObservation::Unobserved);
+        // A time after the previous display but before this present's Present call.
+        CHECK(Observe(Statistics(103, PresentQpc(3) - kMillisecond, Refresh(3), Refresh(3)), &emission) ==
+            DxgiObservation::Unobserved);
+        CHECK(g_matcher.Statistics().stale_observations == 2);
+
+        CHECK(Observe(Shown(104, 4), &emission) == DxgiObservation::Displayed);
+        CHECK(emission.continuity_break); // no interval spans the stale presents
+        CHECK(Observe(Shown(105, 5), &emission) == DxgiObservation::Displayed);
+        CHECK(!emission.continuity_break);
+        CHECK(g_matcher.Statistics().emitted == 3);
+    }
+
     void TestRejectedStatisticsBreakContinuity()
     {
         g_matcher.Reset(kFrequency);
@@ -451,6 +476,7 @@ int main()
     TestInOrderMatching();
     TestRepeatedPresentCountEmitsNothing();
     TestUnobservedPresentsBreakContinuity();
+    TestStaleSyncTimesAreUnobserved();
     TestRejectedStatisticsBreakContinuity();
     TestPresentCountWrap();
     TestSwapchainChangeResetsMatcher();

@@ -595,11 +595,11 @@ namespace
         if (s_dxgi_poll_timer != nullptr) CancelWaitableTimer(s_dxgi_poll_timer);
         const DxgiDisplayMatcherStatistics statistics = s_dxgi.matcher.Statistics();
         LOG_INFO("Pacing telemetry: DXGI display source inactive (%s; emitted=%llu breaks=%llu "
-            "unobserved=%llu late=%llu unmatched=%llu repeats=%llu rejected=%llu duplicates=%llu "
+            "unobserved=%llu late=%llu stale=%llu unmatched=%llu repeats=%llu rejected=%llu duplicates=%llu "
             "evictions=%llu record_drops=%llu count_failures=%llu)",
             reason, statistics.emitted, statistics.continuity_breaks, statistics.unobserved_presents,
-            statistics.late_observations, statistics.unmatched_displays, statistics.repeats,
-            statistics.rejected_statistics, statistics.duplicate_records, statistics.record_evictions,
+            statistics.late_observations, statistics.stale_observations, statistics.unmatched_displays,
+            statistics.repeats, statistics.rejected_statistics, statistics.duplicate_records, statistics.record_evictions,
             s_dxgi_present_queue.DroppedValues() + s_dxgi_inactive_drops.load(std::memory_order_relaxed),
             s_dxgi_present_count_failures.load(std::memory_order_relaxed));
     }

@@ -12,12 +12,15 @@
 // ID of the newest present shown on screen, PresentRefreshCount the refresh it
 // was first shown at, SyncRefreshCount and SyncQPCTime the refresh the
 // statistics were sampled at. A poll yields a display time only for a present
-// first seen at its own refresh (SyncRefreshCount == PresentRefreshCount):
-// display_qpc = SyncQPCTime. Every other present is unobserved.
+// first seen at its own refresh (SyncRefreshCount == PresentRefreshCount)
+// whose SyncQPCTime is after its Present call and after the previous emitted
+// display time: display_qpc = SyncQPCTime. Composed presentation reports
+// earlier times for most presents. Every other present is unobserved.
 //
 // Continuity: when presents between two emitted samples were not observed as
 // displayed (skipped present IDs, a present first seen after its refresh, a
-// displayed present without a record, rejected statistics, a source restart),
+// stale SyncQPCTime, a displayed present without a record, rejected
+// statistics, a source restart),
 // the next emission carries continuity_break. The worker passes it to
 // PacingJoiner::AddDisplay (PacingDisplayContext), and PacingChain breaks the
 // chain with PacingChainBreakReason::Gap, so no display interval spans them.
@@ -83,6 +86,7 @@ struct DxgiDisplayMatcherStatistics {
     uint64_t continuity_breaks = 0;   // emissions with continuity_break
     uint64_t unobserved_presents = 0; // present IDs skipped between two observations
     uint64_t late_observations = 0;   // new present first seen after its display refresh
+    uint64_t stale_observations = 0;  // SyncQPCTime not after the present's Present call or the previous display
     uint64_t unmatched_displays = 0;  // displayed present without a retained record
     uint64_t rejected_statistics = 0; // Rejected observations and RejectStatistics calls
 };
@@ -127,5 +131,6 @@ private:
     bool has_count_ = false;        // last_count_ holds an observed present ID
     uint32_t last_count_ = 0;       // newest present ID observed as displayed
     bool continuity_broken_ = true; // the next emission must not end an interval
+    int64_t last_display_qpc_ = 0;  // display_qpc of the newest emission; 0 after a restart
     DxgiDisplayMatcherStatistics statistics_{};
 };

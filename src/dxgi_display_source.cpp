@@ -29,6 +29,7 @@ void DxgiDisplayMatcher::Reset(uint64_t qpc_frequency) noexcept
     has_count_ = false;
     last_count_ = 0;
     continuity_broken_ = true;
+    last_display_qpc_ = 0;
     statistics_ = {};
 }
 
@@ -69,6 +70,7 @@ void DxgiDisplayMatcher::RestartNumbering() noexcept
     count_ = 0;
     has_count_ = false;
     continuity_broken_ = true;
+    last_display_qpc_ = 0;
 }
 
 const DxgiPresentRecord* DxgiDisplayMatcher::FindRecord(uint32_t present_count) const noexcept
@@ -146,6 +148,13 @@ DxgiObservation DxgiDisplayMatcher::Observe(
     else if (record == nullptr) {
         ++statistics_.unmatched_displays;
     }
+    else if ((record->p_qpc > 0 && statistics.sync_qpc <= record->p_qpc) ||
+             (last_display_qpc_ > 0 && statistics.sync_qpc <= last_display_qpc_)) {
+        // A present is not shown before its Present call, nor at or before the
+        // previous present's display. Composed presentation reports such
+        // SyncQPCTime values for most presents: they are not this present's.
+        ++statistics_.stale_observations;
+    }
     else {
         PacingDisplaySample& sample = emission->sample;
         sample = PacingDisplaySample{};
@@ -164,6 +173,7 @@ DxgiObservation DxgiDisplayMatcher::Observe(
         if (continuity_broken_) ++statistics_.continuity_breaks;
         ++statistics_.emitted;
         observation = DxgiObservation::Displayed;
+        last_display_qpc_ = statistics.sync_qpc;
     }
     continuity_broken_ = observation != DxgiObservation::Displayed;
     DiscardThrough(present_count);

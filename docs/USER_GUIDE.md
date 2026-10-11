@@ -309,6 +309,8 @@ PQI is hidden during Dynamic MFG passthrough. Use it alongside the graph and how
 
 **Display Pacing** measures when frames actually reach the display. Display times come from PC latency collection (Windows ETW tracing) while it is collecting; otherwise, on DX11 and DX12, from DXGI frame statistics. The heading names the source: `Display Pacing (ETW)` or `Display Pacing (DXGI)`. Display Pacing does not need `native_pcl_enabled`; without it, DX11 and DX12 games use DXGI. It observes pacing only; enabling it does not change the cap or how frames are paced.
 
+A DXGI display time that cannot belong to the frame, earlier than the frame's Present call or not after the previous frame's display, leaves that frame unmeasured. This is common when Windows composes the game window, for example a game scaled by Windows display scaling: such games show fewer DXGI samples, or **waiting for display timing**, instead of invented long frames. PC latency collection measures them.
+
 Values cover the last 5 seconds and refresh four times per second. Pairs are shown as p50 / p99: the median and the 99th percentile, which reflects the worst 1% of the window.
 
 | Reading | Meaning |
