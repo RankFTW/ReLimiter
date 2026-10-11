@@ -213,19 +213,24 @@ constexpr CollisionDistanceLimits LEAD_HEADROOM_LIMITS{ 1000.0, 750.0, 3000.0 };
 //   queues (w before e): q was 0 on every frame of five captures.
 
 // Render handoff offset. A frame
-// that is not held is released no earlier than A_n = w_{n−1} + d, where
-// w_{n−1} is RENDERSUBMIT_START of the newest released frame: a pipelined
-// game then cannot simulate frames that only wait for its render thread
-// (CONTROL Resonant FG 2× with the Reflex Sleep bypassed: the
-// release of frame n came 28.6 ms before PRESENT_END(n−1)). Each frame n
-// released at or after w_{n−1} adds h = (b_{n−1} − w_{n−1}) − (e_n − s_n): how
-// much later it could have been released and still ended its simulation
-// before the render thread left frame n−1's Present. d = max(0, Q_{1−q}(h) −
-// allowance) with the Smoothing lead's q and allowance, 0 until
-// LEAD_HANDOFF_MIN_SAMPLES. Every rung samples, so d is warm when holds
-// pause. A frame released before w_{n−1} is skipped: its simulation may have
-// waited at the handoff. Serial engines (Rogue Core, w before e) give h < 0
-// and d = 0, so the limit never binds there.
+// that is not held is released no earlier than A_n = v_{n−1} + d, where
+// v_{n−1} is RENDERSUBMIT_END of the newest released frame, the moment the
+// render thread finished submitting it: a pipelined game then cannot
+// simulate frames that only wait for its render thread (CONTROL Resonant FG
+// 2× with the Reflex Sleep bypassed: the release of frame n came 28.6 ms
+// before PRESENT_END(n−1)), and its simulation does not run inside that
+// submission. Anchored at RENDERSUBMIT_START instead, the simulation of n
+// started inside the submission of n − 1 on every frame and slowed it
+// (Gears of War: E-Day 11.7 → 17.2 ms, CONTROL Resonant 5.8 → 7.8 ms p50);
+// the driver's Sleep starts it after the submission in both. Each frame n
+// released at or after v_{n−1} adds h = (b_{n−1} − v_{n−1}) − (e_n − s_n):
+// how much later it could have been released and still ended its
+// simulation before the render thread left frame n−1's Present. d =
+// max(0, Q_{1−q}(h) − allowance) with the Smoothing lead's q and allowance,
+// 0 until LEAD_HANDOFF_MIN_SAMPLES. Every rung samples, so d is warm when
+// holds pause. A frame released before v_{n−1} is skipped: its simulation
+// may have waited at the handoff. Serial engines (Rogue Core, v before e)
+// give h < 0 and d = 0, so the limit never binds there.
 
 // ── Inputs and status ──
 
@@ -507,8 +512,8 @@ public:
     // non-finite q or allowance.
     double HandoffOffsetUs(double quantile, double allowance_us) const noexcept;
     // Handoff samples in the window. At LEAD_HANDOFF_MIN_SAMPLES the game has
-    // shown its render thread taking a frame before the next release, which
-    // a render thread that waits for the next release never does.
+    // shown its render thread finishing a frame before the next release,
+    // which a render thread that waits for the next release never does.
     uint32_t HandoffSamples() const noexcept { return handoff_window_.Count(); }
     // Frame (key, grid_index)'s gated hold in QPC ticks (lockstep engines,
     // above): the waits of later pending frames of its lifecycle released no
@@ -535,7 +540,7 @@ private:
     static constexpr size_t kBucketCount =
         static_cast<size_t>(PacingRung::Count) * LEAD_DIVISOR_BUCKETS;
 
-    // Stage times of a pending frame; 1..9 match PacingStageEventKind.
+    // Stage times of a pending frame; 1..10 match PacingStageEventKind.
     enum Field : uint8_t {
         FieldSource = 0,
         FieldMarkerArrival,
@@ -547,6 +552,7 @@ private:
         FieldRenderSubmit,
         FieldSimulationEnd, // e: GPU waits
         FieldPresentEnd,    // b: GPU waits
+        FieldRenderSubmitEnd, // v: the render handoff
         FieldCount
     };
 
@@ -652,8 +658,8 @@ private:
     // e, w, p and the previous frame's b.
     double QueueUs(const PendingFrame& frame, const PendingFrame* previous) const noexcept;
     // Render handoff sample h of frame n (above), when frame n and its
-    // previous frame carry s, e and w, b, and frame n was released at or after
-    // w_{n−1}.
+    // previous frame carry s, e and v, b, and frame n was released at or after
+    // v_{n−1}.
     void RecordHandoff(const PendingFrame& frame, const PendingFrame* previous) noexcept;
     // Lockstep engines: waits of later frames that gated this one, in ticks.
     int64_t GatedHoldTicks(const PendingFrame& frame) const noexcept;

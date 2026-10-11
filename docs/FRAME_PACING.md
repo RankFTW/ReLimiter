@@ -290,7 +290,7 @@ sequenceDiagram
     Game->>Hook: Sleep for frame n
     Hook->>Sched: record the Sleep and plan the pre-wait
     opt render handoff limit applies, frame not held, bypass on
-        Hook->>Hook: wait until the render thread took the previous frame
+        Hook->>Hook: wait until the render thread finished the previous frame
     end
     opt pre-wait planned
         Hook->>Hook: wait until S_next minus margin
@@ -438,22 +438,22 @@ stateDiagram-v2
 During an overload pause (and anywhere a frame is not held), nothing else stops a game that simulates ahead of its render thread from queueing finished frames when the cap cannot be held. The render handoff limit releases such a frame no earlier than
 
 ```
-A(n) = w(n−1) + d
+A(n) = v(n−1) + d
 ```
 
-where `w(n−1)` is RENDERSUBMIT_START of the newest released frame, the moment the render thread took it, and `d` is a learned offset. `d` comes from samples `h = (b(n−1) − w(n−1)) − (e(n) − s(n))`: how much later frame `n` could have been released and still have ended its simulation (`e`, SIMULATION_END) before the render thread left the previous frame's Present (`b`, PRESENT_END). It is the 5th percentile of the newest 256 samples (`1 − 0.95`) minus the 0.5 ms allowance, never below 0, and 0 until 16 samples exist. A serial engine (render after simulation) gives `h < 0` and `d = 0`, so the limit never binds there.
+where `v(n−1)` is RENDERSUBMIT_END of the newest released frame, the moment the render thread finished submitting it, and `d` is a learned offset. `d` comes from samples `h = (b(n−1) − v(n−1)) − (e(n) − s(n))`: how much later frame `n` could have been released and still have ended its simulation (`e`, SIMULATION_END) before the render thread left the previous frame's Present (`b`, PRESENT_END). It is the 5th percentile of the newest 256 samples (`1 − 0.95`) minus the 0.5 ms allowance, never below 0, and 0 until 16 samples exist. A serial engine (render after simulation) gives `h < 0` and `d = 0`, so the limit never binds there. The anchor is the end of the submission, not its start: a simulation started while the render thread is still submitting runs beside that submission and slows it, which the driver's Reflex Sleep avoids by starting the simulation after it.
 
 - **Applies to** frames that are not held (`source_only`), in VRR or fixed mode, released at SIMULATION_START by marker or pre-Sleep placement, while the driver's Sleep does not run. Held frames are not limited.
 - **Where the wait runs.** With pre-Sleep placement inside the Reflex Sleep hook, before the game reads input; with marker placement in the marker hook. The grid sees `A` as the frame's arrival, so a limit beyond `S` restarts the cadence like any late source, and the overload guard still sees the overload.
-- **The stall rule.** A wait ends when the render thread took no frame for 3 of its own frame times (the median of the newest 32 intervals between its handoffs of consecutive frames, without handoffs that came after a stalled wait for them; at least 3 intervals); the frame is then released. Seeing the render thread take a frame before the next frame's release (checked at every frame, limited or not, and by every handoff sample) shows that it does not wait for that release; from then on, within the producer epoch, a stall is a hitch and the limit stays on. Before that, 2 stalled waits in a row turn the limit off: a render thread that waits for the next release stalls every wait. It stays off until the render thread is seen taking a frame before the next release or the next lifecycle, cap, FG multiplier or route change. A handoff older than 1 s counts as no stream and no limit applies.
+- **The stall rule.** A wait ends when the render thread finished no frame for 3 of its own frame times (the median of the newest 32 intervals between its handoffs of consecutive frames, without handoffs that came after a stalled wait for them; at least 3 intervals); the frame is then released. Seeing the render thread finish a frame before the next frame's release (checked at every frame, limited or not, and by every handoff sample) shows that it does not wait for that release; from then on, within the producer epoch, a stall is a hitch and the limit stays on. Before that, 2 stalled waits in a row turn the limit off: a render thread that waits for the next release stalls every wait. It stays off until the render thread is seen finishing a frame before the next release or the next lifecycle, cap, FG multiplier or route change. A handoff older than 1 s counts as no stream and no limit applies.
 
 ```mermaid
 sequenceDiagram
     participant Sim as Game simulation thread
     participant RL as ReLimiter
     participant Render as Game render thread
-    Render->>RL: RENDERSUBMIT_START of frame n−1, the handoff w
-    Note over RL: A = w plus d, d from the 5th percentile of h minus 0.5 ms
+    Render->>RL: RENDERSUBMIT_END of frame n−1, the handoff v
+    Note over RL: A = v plus d, d from the 5th percentile of h minus 0.5 ms
     Sim->>RL: frame n reaches its release
     alt handoff of frame n−1 not yet seen
         RL->>RL: wait for the handoff, up to 3 render-thread frame times
@@ -590,10 +590,10 @@ Source: `src/feedback.cpp`, `src/feedback.h`, `src/reflex_clock_map.h`, `src/pac
 | `C`, `D` | Release-to-Present-call time and release-to-heavy-GPU-work time of a GPU wait frame. |
 | `H` | Release headroom: how long before the next frame's heavy GPU work the GPU wait is released (learned, start 1.0 ms). |
 | `M` | Release margin: the same distance to the next Present call (learned, start 2.5 ms). Used without Reflex GPU times. |
-| `w` | RENDERSUBMIT_START: the moment the game's render thread takes a frame. |
+| `v` | RENDERSUBMIT_END: the moment the game's render thread finished submitting a frame, the render handoff. `w` (RENDERSUBMIT_START, when it starts) is used only for `q`. |
 | `e`, `b` | SIMULATION_END and PRESENT_END markers of a frame. |
 | `q` | The time a finished frame waited for the render thread to leave the previous Present; left out of the `fg_input_wait` lead. |
-| `h` | One render handoff sample: `(b(n−1) − w(n−1)) − (e(n) − s(n))`. |
+| `h` | One render handoff sample: `(b(n−1) − v(n−1)) − (e(n) − s(n))`. |
 | `d` | The render handoff offset: the 5th percentile of `h` minus the allowance, at least 0. |
-| `A` | The earliest release of the render handoff limit: `A(n) = w(n−1) + d`. |
+| `A` | The earliest release of the render handoff limit: `A(n) = v(n−1) + d`. |
 | Adaptive cap stretch | `I / I_0`, between 1.0 and 1.6. |

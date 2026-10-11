@@ -234,7 +234,7 @@ static void DrawPacingPipelineStatus() {
     // Render handoff limit: frames not held
     // with the Reflex Sleep bypassed.
     if (has_status && status.render_handoff == 1)
-        ImGui::TextDisabled("Render handoff limit: +%.2f ms after the render thread takes the previous frame | %u frames delayed | %u stalls",
+        ImGui::TextDisabled("Render handoff limit: +%.2f ms after the render thread finishes the previous frame | %u frames delayed | %u stalls",
             status.render_handoff_offset_us / 1000.0, status.render_handoff_limited, status.render_handoff_stalls);
     else if (has_status && status.render_handoff == 2)
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
@@ -546,7 +546,7 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
     HelpTip("On (default) skips the driver's NvAPI Sleep while ReLimiter paces a cap, holding frames or "
         "not; ReLimiter's pre-Sleep wait paces the game instead (CONTROL with FG 2x: 10x fewer long frames "
         "at the same PC latency; Rogue Core unchanged). Frames that are not held wait until the game's "
-        "render thread has taken the previous frame (render handoff limit), so the game cannot run ahead. "
+        "render thread has finished submitting the previous frame (render handoff limit), so the game cannot run ahead. "
         "Leaves markers and the game's SleepMode parameters unchanged. Off returns to the driver's Sleep. "
         "With the cap off or in passthrough (Dynamic MFG) the Sleep always reaches the driver.");
 

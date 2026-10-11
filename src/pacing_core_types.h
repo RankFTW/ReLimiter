@@ -193,11 +193,13 @@ enum class PacingStageEventKind : uint8_t {
     GpuReady = 5,      // r: GPU completion before any hold, mapped to QPC
     GpuResume = 6,     // u: GPU resume after the hold (post-wait probe), mapped to QPC
     // Marker arrivals (lead_controller.h): w RENDERSUBMIT_START on the GPU
-    // waits (the frame's GPU work can start), and e SIMULATION_END and b
-    // PRESENT_END on the GPU waits (the simulation → render queue).
+    // waits (the frame's GPU work can start), e SIMULATION_END and b
+    // PRESENT_END on the GPU waits (the simulation → render queue), and v
+    // RENDERSUBMIT_END, the render handoff (render_handoff.h).
     RenderSubmitStart = 7, // w
     SimulationEnd = 8,     // e
-    PresentEnd = 9         // b
+    PresentEnd = 9,        // b
+    RenderSubmitEnd = 10   // v
 };
 
 // Developer key `gpu_queue_wait_render_queue` (A/B): whether the

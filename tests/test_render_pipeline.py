@@ -78,8 +78,10 @@ class TimelineTests(unittest.TestCase):
         self.assertAlmostEqual(stages["queue_sim_end_to_rs_start"]["p50"], 2.2, places=3)
         self.assertAlmostEqual(stages["release_minus_S"]["p50"], 0.0, places=3)
         # RENDERSUBMIT_START(n - 1) is t - 10.8 ms and its 4 ms submission ends at t - 6.8 ms:
-        # the release at t - 8 ms is 2.8 ms in, in the second half.
+        # the release at t - 8 ms is 2.8 ms in, in the second half, before RENDERSUBMIT_END(n - 1).
         self.assertEqual(held["handoff"]["released_at_or_after_prev_rs_start"], 1.0)
+        self.assertEqual(held["handoff"]["released_at_or_after_prev_rs_end"], 0.0)
+        self.assertAlmostEqual(held["handoff"]["release_minus_prev_rs_end_ms"]["p50"], -1.2, places=3)
         self.assertEqual(held["simulation_start_position"]["submit_second_half"]["share"], 1.0)
         self.assertEqual(held["simulation_outlasted_render_thread"], 0.0)
 

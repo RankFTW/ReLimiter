@@ -522,7 +522,8 @@ void LeadController::OnStageEvent(const PacingStageEvent& event) noexcept
         static_cast<int>(PacingStageEventKind::GpuResume) == FieldGpuResume &&
         static_cast<int>(PacingStageEventKind::RenderSubmitStart) == FieldRenderSubmit &&
         static_cast<int>(PacingStageEventKind::SimulationEnd) == FieldSimulationEnd &&
-        static_cast<int>(PacingStageEventKind::PresentEnd) == FieldPresentEnd,
+        static_cast<int>(PacingStageEventKind::PresentEnd) == FieldPresentEnd &&
+        static_cast<int>(PacingStageEventKind::RenderSubmitEnd) == FieldRenderSubmitEnd,
         "Field values must match PacingStageEventKind");
     static_assert(FieldCount <= 16, "field_mask holds one bit per Field");
 
@@ -1196,18 +1197,18 @@ double LeadController::QueueUs(const PendingFrame& frame, const PendingFrame* pr
     return queue_us > 0.0 ? queue_us : 0.0;
 }
 
-// Render handoff (lead_controller.h): h = (b_{n−1} − w_{n−1}) − (e_n − s_n)
-// for a frame released at or after w_{n−1}. Bounded by 3 I like the lead
+// Render handoff (lead_controller.h): h = (b_{n−1} − v_{n−1}) − (e_n − s_n)
+// for a frame released at or after v_{n−1}. Bounded by 3 I like the lead
 // samples; negative values count in the window's first bin.
 void LeadController::RecordHandoff(const PendingFrame& frame, const PendingFrame* previous) noexcept
 {
     if (previous == nullptr || !previous->started || !SameLifecycle(previous->key, frame.key) ||
-        !HasField(frame, FieldSimulationEnd) || !HasField(*previous, FieldRenderSubmit) ||
+        !HasField(frame, FieldSimulationEnd) || !HasField(*previous, FieldRenderSubmitEnd) ||
         !HasField(*previous, FieldPresentEnd)) {
         return;
     }
     const int64_t source = frame.qpc[FieldSource];
-    const int64_t handoff = previous->qpc[FieldRenderSubmit];
+    const int64_t handoff = previous->qpc[FieldRenderSubmitEnd];
     if (source < handoff) return;
     const double render_us = MicrosecondsBetween(handoff, previous->qpc[FieldPresentEnd]);
     const double simulation_us = MicrosecondsBetween(source, frame.qpc[FieldSimulationEnd]);

@@ -102,7 +102,7 @@ void Scheduler_RecordReflexSleep(int64_t now_qpc) noexcept;
 //      Sleep is bypassed: Scheduler_RenderHandoffFrame (any thread) names the
 //      newest released frame whose handoff the next frame waits for;
 //      without the owner, RenderHandoff_WaitFor (render_handoff.h) waits for
-//      it, and a wait that stalled (the render thread took no frame for
+//      it, and a wait that stalled (the render thread finished no frame for
 //      three of its frame times, at least 3 I) calls
 //      Scheduler_RenderHandoffStalled.
 //   3. Scheduler_PlanReflexSleep (caller holds SchedulerOwnerGuard): decides

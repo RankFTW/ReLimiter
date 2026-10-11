@@ -196,16 +196,19 @@ static int32_t Hooked_slPCLSetMarker(
         return result;
     }
 
-    // RENDERSUBMIT_START, SIMULATION_END and PRESENT_END of a GPU wait frame
-    // reach the lead (never blocks; pushed before the scheduler-owner guard,
+    // RENDERSUBMIT_START, SIMULATION_END, PRESENT_END and RENDERSUBMIT_END of
+    // a planned frame reach the lead, and RENDERSUBMIT_END of any frame is the
+    // render handoff (never blocks; pushed before the scheduler-owner guard,
     // as for NvAPI markers).
-    if (type == RENDERSUBMIT_START || type == SIMULATION_END || type == PRESENT_END) {
+    if (type == RENDERSUBMIT_START || type == SIMULATION_END || type == PRESENT_END ||
+        type == RENDERSUBMIT_END) {
         PresentGate_OnFrameMarker(PacingPlanKey{PacingIdentityDomain::PclFrame,
             FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::PclFrame),
             FrameTimeline_CurrentControllerGeneration(), frameID},
             type == RENDERSUBMIT_START ? PacingStageEventKind::RenderSubmitStart
                 : type == SIMULATION_END ? PacingStageEventKind::SimulationEnd
-                : PacingStageEventKind::PresentEnd,
+                : type == PRESENT_END ? PacingStageEventKind::PresentEnd
+                : PacingStageEventKind::RenderSubmitEnd,
             ts.QuadPart);
     }
 
