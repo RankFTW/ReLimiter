@@ -67,6 +67,10 @@ namespace
         CHECK((result).allowance_us == (allowance));                             \
     } while (false)
 
+    // The default lead coverage (99) replaces the Smoothing table's lead
+    // quantile (0.95); the allowance stays the table's.
+    constexpr double kDefaultLeadQuantile = 0.99;
+
     PacingCapabilities QualifiedDx12()
     {
         PacingCapabilities capabilities{};
@@ -173,7 +177,7 @@ namespace
         runtime.swapchain_valid = false;
         PacingPipelineSnapshot result = Resolve(config, QualifiedDx12(), runtime);
         CHECK_RESULT(result, Off, None, SourceOnly, Passthrough);
-        CHECK_LEAD(result, 0.95, 500.0);
+        CHECK_LEAD(result, kDefaultLeadQuantile, 500.0);
         CHECK(result.route == PacingRoute::NvApiMarkers);
 
         runtime = ActiveVrr();
@@ -222,7 +226,7 @@ namespace
         runtime.idle_cap = true;
         PacingPipelineSnapshot result = Resolve(PacingPipelineConfig{}, QualifiedDx12(), runtime);
         CHECK_RESULT(result, Idle, Marker, SourceOnly, IdleCap);
-        CHECK_LEAD(result, 0.95, 500.0);
+        CHECK_LEAD(result, kDefaultLeadQuantile, 500.0);
         CHECK_RESULT(Resolve(PacingPipelineConfig{}, VulkanPcl(), runtime), Idle, Marker, SourceOnly, IdleCap);
         result = Resolve(PacingPipelineConfig{}, PresentBased(), runtime);
         CHECK_RESULT(result, Idle, Present, SourceOnly, IdleCap);
@@ -246,7 +250,7 @@ namespace
     {
         PacingPipelineSnapshot result = Resolve(PacingPipelineConfig{}, PresentBased(), ActiveVrr());
         CHECK_RESULT(result, Vrr, Present, SourceOnly, PresentRoute);
-        CHECK_LEAD(result, 0.95, 500.0);
+        CHECK_LEAD(result, kDefaultLeadQuantile, 500.0);
         CHECK(result.route == PacingRoute::PresentBased);
 
         PacingRuntimeState runtime = ActiveVrr();
@@ -269,7 +273,7 @@ namespace
         const PacingPipelineConfig off = WithSmoothing(PacingSmoothing::Off);
         PacingPipelineSnapshot result = Resolve(off, QualifiedDx12(), ActiveVrr());
         CHECK_RESULT(result, Vrr, Marker, SourceOnly, SmoothingOff);
-        CHECK_LEAD(result, 0.95, 0.0);
+        CHECK_LEAD(result, kDefaultLeadQuantile, 0.0);
         CHECK_RESULT(Resolve(off, VulkanPcl(), ActiveVrr()), Vrr, Marker, SourceOnly, SmoothingOff);
 
         PacingRuntimeState runtime = ActiveVrr();
@@ -294,7 +298,7 @@ namespace
         const PacingPipelineConfig source = WithOverride(PacingRungOverride::SourceOnly);
         PacingPipelineSnapshot result = Resolve(source, QualifiedDx12(), ActiveVrr());
         CHECK_RESULT(result, Vrr, Marker, SourceOnly, Override);
-        CHECK_LEAD(result, 0.95, 500.0);
+        CHECK_LEAD(result, kDefaultLeadQuantile, 500.0);
         CHECK_RESULT(Resolve(source, QualifiedDx12(), ActiveFg()), Vrr, Marker, SourceOnly, Override);
 
         const PacingPipelineConfig marker = WithOverride(PacingRungOverride::Marker);
@@ -387,7 +391,7 @@ namespace
         const PacingPipelineConfig config{};
         PacingPipelineSnapshot result = Resolve(config, QualifiedDx12(), ActiveFg());
         CHECK_RESULT(result, Vrr, Marker, FgInputWait, None);
-        CHECK_LEAD(result, 0.95, 500.0);
+        CHECK_LEAD(result, kDefaultLeadQuantile, 500.0);
 
         PacingRuntimeState runtime = ActiveFg();
         runtime.vrr = false;
@@ -397,7 +401,7 @@ namespace
         capabilities.x64 = false;
         result = Resolve(config, capabilities, ActiveFg());
         CHECK_RESULT(result, Vrr, Marker, SourceOnly, FgUnqualified);
-        CHECK_LEAD(result, 0.95, 500.0);
+        CHECK_LEAD(result, kDefaultLeadQuantile, 500.0);
         capabilities = QualifiedDx12();
         capabilities.api = PacingApi::DX11;
         CHECK_RESULT(Resolve(config, capabilities, ActiveFg()), Vrr, Marker, SourceOnly, FgUnqualified);
@@ -440,7 +444,7 @@ namespace
         capabilities.x64 = false;
         result = Resolve(config, capabilities, ActiveVrr());
         CHECK_RESULT(result, Vrr, Marker, MarkerHold, Architecture);
-        CHECK_LEAD(result, 0.95, 500.0);
+        CHECK_LEAD(result, kDefaultLeadQuantile, 500.0);
 
         // Vulkan PCL markers.
         result = Resolve(config, VulkanPcl(), ActiveVrr());
@@ -471,7 +475,7 @@ namespace
             double allowance_us;
         };
         const Row rows[] = {
-            { PacingSmoothing::On, 0.95, 500.0 },
+            { PacingSmoothing::On, kDefaultLeadQuantile, 500.0 },
         };
         for (const Row& row : rows) {
             PacingPipelineConfig config = WithSmoothing(row.smoothing);
@@ -512,45 +516,46 @@ namespace
             CHECK_LEAD(Resolve(config, QualifiedDx12(), runtime), row.quantile, row.allowance_us);
         }
 
-        CHECK_LEAD(Resolve(WithSmoothing(PacingSmoothing::Off), QualifiedDx12(), ActiveVrr()), 0.95, 0.0);
+        CHECK_LEAD(Resolve(WithSmoothing(PacingSmoothing::Off), QualifiedDx12(), ActiveVrr()), kDefaultLeadQuantile, 0.0);
         // Default and unknown smoothing are On.
-        CHECK_LEAD(Resolve(PacingPipelineConfig{}, QualifiedDx12(), ActiveVrr()), 0.95, 500.0);
+        CHECK_LEAD(Resolve(PacingPipelineConfig{}, QualifiedDx12(), ActiveVrr()), kDefaultLeadQuantile, 500.0);
         const PacingPipelineSnapshot unknown =
             Resolve(WithSmoothing(static_cast<PacingSmoothing>(9)), QualifiedDx12(), ActiveVrr());
         CHECK(unknown.rung == PacingRung::GpuQueueWait);
-        CHECK_LEAD(unknown, 0.95, 500.0);
+        CHECK_LEAD(unknown, kDefaultLeadQuantile, 500.0);
     }
 
-    // Developer A/B lead_coverage: Q99 raises only the lead's quantile, on every
-    // rung and smoothing level; the allowance and the render handoff quantile
-    // stay the Smoothing table's.
+    // lead_coverage: Q99 (the default) raises only the lead's quantile, on
+    // every rung and smoothing level; the allowance and the render handoff
+    // quantile stay the Smoothing table's. Q95 (developer A/B) keeps the
+    // table's quantile.
     void TestLeadCoverage()
     {
         PacingPipelineConfig config{};
+        CHECK(config.lead_coverage == PacingLeadCoverage::Q99);
         PacingPipelineSnapshot result = Resolve(config, QualifiedDx12(), ActiveFg());
-        CHECK_LEAD(result, 0.95, 500.0);
-        CHECK(result.handoff_quantile == 0.95);
-        config.lead_coverage = PacingLeadCoverage::Q99;
-        result = Resolve(config, QualifiedDx12(), ActiveFg());
         CHECK(result.rung == PacingRung::FgInputWait);
         CHECK_LEAD(result, 0.99, 500.0);
         CHECK(result.handoff_quantile == 0.95);
+        config.lead_coverage = PacingLeadCoverage::Q95;
+        result = Resolve(config, QualifiedDx12(), ActiveFg());
+        CHECK_LEAD(result, 0.95, 500.0);
+        CHECK(result.handoff_quantile == 0.95);
         result = Resolve(config, QualifiedDx12(), ActiveVrr());
         CHECK(result.rung == PacingRung::GpuQueueWait);
-        CHECK_LEAD(result, 0.99, 500.0);
-        CHECK(result.handoff_quantile == 0.95);
+        CHECK_LEAD(result, 0.95, 500.0);
         config.smoothing = PacingSmoothing::Off;
         result = Resolve(config, QualifiedDx12(), ActiveVrr());
-        CHECK_LEAD(result, 0.99, 0.0);
+        CHECK_LEAD(result, 0.95, 0.0);
         CHECK(result.handoff_quantile == 0.95);
 
         PacingPipelineConfig invalid{};
         invalid.lead_coverage = static_cast<PacingLeadCoverage>(9);
-        CHECK(PacingPipeline_ClampConfig(invalid).lead_coverage == PacingLeadCoverage::Q95);
-        CHECK_LEAD(Resolve(invalid, QualifiedDx12(), ActiveVrr()), 0.95, 500.0);
-        PacingLeadCoverage parsed = PacingLeadCoverage::Q95;
-        CHECK(PacingLeadCoverage_FromText("99", &parsed) && parsed == PacingLeadCoverage::Q99);
-        CHECK(!PacingLeadCoverage_FromText("97", &parsed) && parsed == PacingLeadCoverage::Q99);
+        CHECK(PacingPipeline_ClampConfig(invalid).lead_coverage == PacingLeadCoverage::Q99);
+        CHECK_LEAD(Resolve(invalid, QualifiedDx12(), ActiveVrr()), 0.99, 500.0);
+        PacingLeadCoverage parsed = PacingLeadCoverage::Q99;
+        CHECK(PacingLeadCoverage_FromText("95", &parsed) && parsed == PacingLeadCoverage::Q95);
+        CHECK(!PacingLeadCoverage_FromText("97", &parsed) && parsed == PacingLeadCoverage::Q95);
     }
 
     void TestProbesCopied()
@@ -597,7 +602,7 @@ namespace
         other.reason = PacingFallbackReason::Override;
         CHECK(!PacingPipeline_SameResult(base, other));
         other = base;
-        other.lead_quantile = 0.99;
+        other.lead_quantile = 0.95;
         CHECK(!PacingPipeline_SameResult(base, other));
         other = base;
         other.allowance_us = 1000.0;
@@ -841,7 +846,7 @@ namespace
         config.stall_inject_ms = 50.0;
         config.stall_inject_period_s = 10.0;
         config.gpu_queue_wait_render_queue = PacingRenderQueue::RemoveHeld;
-        config.lead_coverage = PacingLeadCoverage::Q99;
+        config.lead_coverage = PacingLeadCoverage::Q95;
         config.fg_late_spacing = true;
         PacingPipeline_SetConfig(config);
         CHECK(SameConfig(PacingPipeline_GetConfig(), config));
@@ -1018,7 +1023,7 @@ namespace
         PacingPipelineSnapshot result = Resolve(config, QualifiedDx12(), overloaded);
         CHECK_RESULT(result, Vrr, Marker, SourceOnly, Infeasible);
         CHECK(result.auto_rung == PacingRung::GpuQueueWait);
-        CHECK_LEAD(result, 0.95, 500.0);
+        CHECK_LEAD(result, kDefaultLeadQuantile, 500.0);
         overloaded = ActiveFg();
         overloaded.hold_overloaded = true;
         result = Resolve(config, QualifiedDx12(), overloaded);

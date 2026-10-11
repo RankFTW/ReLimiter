@@ -583,7 +583,7 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "after a frame whose GPU waited at ReLimiter's gate. Watch late GPU resumes, grid restarts and "
         "PC Latency; one setting per capture.");
 
-    static const char* const kLeadCoverageLabels[] = {"95% (default)", "99%"};
+    static const char* const kLeadCoverageLabels[] = {"95%", "99% (default)"};
     static_assert(IM_ARRAYSIZE(kLeadCoverageLabels) == static_cast<int>(PacingLeadCoverage::Count));
     int lead_coverage = static_cast<int>(g_config.lead_coverage);
     if (ImGui::Combo("Lead coverage", &lead_coverage, kLeadCoverageLabels, IM_ARRAYSIZE(kLeadCoverageLabels))) {
@@ -592,10 +592,10 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         LOG_INFO("OSD: lead coverage -> %s%%", PacingLeadCoverage_Text(g_config.lead_coverage));
         *config_dirty = true;
     }
-    HelpTip("Diagnostic A/B. The share of frames the lead releases early enough to be held. 95% (default) "
-        "leaves about 1 frame in 20 ready after its target; 99% about 1 in 100, for a longer lead and more "
-        "latency. Late frames are shown when ready, and with frame generation each moves two or more "
-        "displayed frames. Frames late because the GPU or the game's render thread was still busy with "
+    HelpTip("Diagnostic A/B. The share of frames the lead releases early enough to be held. 99% (default) "
+        "leaves about 1 frame in 100 ready after its target; 95% about 1 in 20, for a shorter lead and a "
+        "little less latency. Late frames are shown when ready, and with frame generation each moves two or "
+        "more displayed frames. Frames late because the GPU or the game's render thread was still busy with "
         "the previous frame are not helped. Watch long frames, jitter and PC Latency; one setting per capture.");
 
     if (ImGui::Checkbox("FG late-frame spacing", &g_config.fg_late_spacing)) {

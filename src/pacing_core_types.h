@@ -211,12 +211,12 @@ enum class PacingRenderQueue : uint8_t {
     Count
 };
 
-// Developer key `lead_coverage` (A/B): the share of frames the lead covers,
-// L = Q_q(X) + allowance (lead_controller.h). Q95 (default) leaves about 1
-// frame in 20 ready after its target, Q99 about 1 in 100 for a longer lead.
-// Late frames are not held, and with frame generation each one moves two or
-// more displayed frames. The render handoff limit keeps q = 0.95 either way.
-// INI text: 95 | 99.
+// Key `lead_coverage`: the share of frames the lead covers, L = Q_q(X) +
+// allowance (lead_controller.h). Q99 (default) leaves about 1 frame in 100
+// ready after its target; Q95 (developer A/B) about 1 in 20 for a shorter
+// lead. Late frames are not held, and with frame generation each one moves
+// two or more displayed frames. The render handoff limit keeps q = 0.95
+// either way. INI text: 95 | 99.
 enum class PacingLeadCoverage : uint8_t {
     Q95 = 0,
     Q99 = 1,

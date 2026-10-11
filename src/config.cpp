@@ -28,8 +28,10 @@ static const Config s_default_config{};
 
 // INI layout version. 2: the Reflex Sleep bypass and pre-Sleep
 // placement became the defaults. Earlier builds saved every key, so an INI
-// without this version carries the old defaults of those two keys.
-static constexpr int kConfigVersion = 2;
+// without this version carries the old defaults of those two keys. 3: lead
+// coverage 99 became the default; test builds since the key existed saved
+// lead_coverage=95.
+static constexpr int kConfigVersion = 3;
 
 static char s_ini_path[MAX_PATH] = {};
 static bool s_first_launch = false;
@@ -209,8 +211,8 @@ void ValidateConfig() {
     }
     if (static_cast<unsigned>(g_config.lead_coverage) >=
         static_cast<unsigned>(PacingLeadCoverage::Count)) {
-        LOG_WARN("Config: invalid lead_coverage, resetting to '95'");
-        g_config.lead_coverage = PacingLeadCoverage::Q95;
+        LOG_WARN("Config: invalid lead_coverage, resetting to '99'");
+        g_config.lead_coverage = PacingLeadCoverage::Q99;
     }
     if (static_cast<unsigned>(g_config.source_placement) >=
         static_cast<unsigned>(PacingPlacementOverride::Count)) {
@@ -307,10 +309,10 @@ static void LoadPacingPipelineKeys(const char* S, const char* P) {
         g_config.gpu_queue_wait_render_queue = PacingRenderQueue::Keep;
     }
 
-    const std::string lead_coverage = ReadINIString(S, "lead_coverage", "95", P);
+    const std::string lead_coverage = ReadINIString(S, "lead_coverage", "99", P);
     if (!PacingLeadCoverage_FromText(lead_coverage.c_str(), &g_config.lead_coverage)) {
-        LOG_WARN("Config: invalid lead_coverage '%s', resetting to '95'", lead_coverage.c_str());
-        g_config.lead_coverage = PacingLeadCoverage::Q95;
+        LOG_WARN("Config: invalid lead_coverage '%s', resetting to '99'", lead_coverage.c_str());
+        g_config.lead_coverage = PacingLeadCoverage::Q99;
     }
 
     const std::string placement = ReadINIString(S, "source_placement", "pre_sleep", P);
@@ -418,16 +420,20 @@ void LoadConfig(HMODULE hModule) {
     LoadPacingPipelineKeys(S, P);
     g_config.advanced_settings = ReadINIBool(S, "advanced_settings", false, P);
     g_config.developer_settings = ReadINIBool(S, "developer_settings", false, P);
-    // Version 2 defaults (kConfigVersion): an existing INI written before
-    // them moves to the Reflex Sleep bypass and pre-Sleep placement once;
-    // its other values stay.
-    if (!s_first_launch && ReadINIInt(S, "config_version", 1, P) < kConfigVersion &&
+    // Defaults changed by kConfigVersion: an existing INI written before them
+    // moves to them once; its other values stay.
+    const int saved_version = ReadINIInt(S, "config_version", 1, P);
+    if (!s_first_launch && saved_version < 2 &&
         (!g_config.reflex_sleep_bypass || g_config.source_placement != PacingPlacementOverride::PreSleep)) {
         LOG_INFO("Config: moved to the recommended defaults reflex_sleep_bypass=true source_placement=pre_sleep "
                  "(was %s, %s)", g_config.reflex_sleep_bypass ? "true" : "false",
                  PacingPlacementOverride_Text(g_config.source_placement));
         g_config.reflex_sleep_bypass = true;
         g_config.source_placement = PacingPlacementOverride::PreSleep;
+    }
+    if (!s_first_launch && saved_version < 3 && g_config.lead_coverage == PacingLeadCoverage::Q95) {
+        LOG_INFO("Config: moved to the recommended default lead_coverage=99 (was 95)");
+        g_config.lead_coverage = PacingLeadCoverage::Q99;
     }
     g_config.osd_show_adaptive_smoothing = ReadINIBool(S, "osd_show_adaptive_smoothing", false, P);
     g_config.osd_show_0_1pct_low     = ReadINIBool(S, "osd_show_0_1pct_low", false, P);
@@ -945,8 +951,8 @@ void ApplyConfig() {
                  "simulation -> render queue%s)", PacingRenderQueue_Text(g_config.gpu_queue_wait_render_queue),
                  g_config.gpu_queue_wait_render_queue == PacingRenderQueue::RemoveHeld
                      ? " after frames whose GPU waited at the gate" : "");
-    if (g_config.lead_coverage != PacingLeadCoverage::Q95)
-        LOG_WARN("Pacing pipeline: diagnostic lead coverage %s%% (the lead covers that share of frames; "
+    if (g_config.lead_coverage != PacingLeadCoverage::Q99)
+        LOG_WARN("Pacing pipeline: diagnostic lead coverage %s%% (the lead covers that share of frames, default 99%%; "
                  "the render handoff limit keeps 95%%)", PacingLeadCoverage_Text(g_config.lead_coverage));
     if (g_config.fg_late_spacing)
         LOG_WARN("Pacing pipeline: diagnostic FG late-frame spacing on (an FG input that reached its wait after "

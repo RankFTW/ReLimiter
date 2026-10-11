@@ -29,8 +29,9 @@ namespace
     static_assert(sizeof(kLead) / sizeof(kLead[0]) ==
             static_cast<size_t>(PacingSmoothing::Count),
         "one lead entry per smoothing level");
-    // Developer A/B lead_coverage: Q99 replaces the table's quantile for the
-    // lead only; the render handoff offset keeps the table's.
+    // lead_coverage Q99 (the default) replaces the table's quantile for the
+    // lead only; the render handoff offset keeps the table's. Q95 (developer
+    // A/B) keeps the table's for both.
     constexpr double kLeadCoverageQ99 = 0.99;
 
     struct RungDecision {

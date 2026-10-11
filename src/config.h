@@ -89,7 +89,7 @@ struct Config {
     bool reflex_sleep_bypass = true; // developer
     PacingMarkerForwardOrder marker_forward_order = PacingMarkerForwardOrder::BeforeWait; // developer: before_wait | after_wait
     PacingRenderQueue gpu_queue_wait_render_queue = PacingRenderQueue::Keep; // developer A/B: keep | remove | remove_held
-    PacingLeadCoverage lead_coverage = PacingLeadCoverage::Q95; // developer A/B: 95 | 99 (share of frames the lead covers)
+    PacingLeadCoverage lead_coverage = PacingLeadCoverage::Q99; // developer A/B: 95 | 99 (default; share of frames the lead covers)
     bool fg_late_spacing = false; // developer A/B: FG input wait floors the next real frame on a late frame's readiness
     PacingPlacementOverride source_placement = PacingPlacementOverride::PreSleep; // developer: marker | pre_sleep | driver (pre_sleep is the default)
 

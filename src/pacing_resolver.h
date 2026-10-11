@@ -109,7 +109,7 @@ struct PacingPipelineConfig {
     double gpu_wait_budget_us = kPacingGpuWaitBudgetDefaultUs; // developer key gpu_wait_budget_us: [500, 5000]
     double gpu_wait_interleave_s = 0.0; // developer key gpu_wait_interleave_s: 0 = off, else [1, 10]
     PacingRenderQueue gpu_queue_wait_render_queue = PacingRenderQueue::Keep; // developer key (A/B)
-    PacingLeadCoverage lead_coverage = PacingLeadCoverage::Q95; // developer key lead_coverage (A/B)
+    PacingLeadCoverage lead_coverage = PacingLeadCoverage::Q99; // key lead_coverage; 95 is the developer A/B
     // Developer key fg_late_spacing (A/B): the FG input wait records a frame
     // that reached its wait after the Signal at its readiness and floors the
     // next frame's Signal on it (cadence_grid.h, output tracker).
@@ -169,7 +169,7 @@ struct PacingPipelineSnapshot {
     // check, the guard's judged frames and telemetry read it.
     PacingRung auto_rung = PacingRung::SourceOnly;
     PacingFallbackReason reason = PacingFallbackReason::Passthrough;
-    double lead_quantile = 0.95; // q of the lead controller: L = Q_q(X) + allowance (lead_coverage)
+    double lead_quantile = 0.99; // q of the lead controller: L = Q_q(X) + allowance (lead_coverage, default 99)
     double allowance_us = 500.0; // defaults: On, so the initial snapshot equals default passthrough
     // q of the render handoff offset, d = Q_{1−q}(h) − allowance: the Smoothing
     // quantile, whatever lead_coverage says.

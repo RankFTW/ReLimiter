@@ -42,7 +42,7 @@ Defaults are the shipped values. Settings marked 64-bit are not available in the
 
 ### Smoothing
 
-`smoothing` (`on` or `off`, default **On**). On holds each frame's output to the cap cadence at the best available output point and releases the game early enough for 95% of recent frames plus 0.5 ms. Off holds nothing after the source wait (output `source_only`, reason `smoothing_off`) and only places the shared target; the lead still covers 95% of recent frames, with no extra allowance. It is the only way to turn smoothing off.
+`smoothing` (`on` or `off`, default **On**). On holds each frame's output to the cap cadence at the best available output point and releases the game early enough for 99% of recent frames plus 0.5 ms. Off holds nothing after the source wait (output `source_only`, reason `smoothing_off`) and only places the shared target; the lead still covers 99% of recent frames, with no extra allowance. It is the only way to turn smoothing off.
 
 ### Output override
 
@@ -108,12 +108,12 @@ Turning it off removes two command lists and two fence signals per frame from th
 
 ### Lead coverage
 
-`lead_coverage` (default **95%**, all holds). The share of frames the lead releases early enough to reach their hold in time: the lead is that percentile of the measured release-to-ready times plus the allowance.
+`lead_coverage` (default **99%**, all holds). The share of frames the lead releases early enough to reach their hold in time: the lead is that percentile of the measured release-to-ready times plus the allowance.
 
-- **95%** leaves about 1 frame in 20 ready after its target. Such frames are shown when ready; with frame generation each one moves two or more displayed frames.
-- **99%** leaves about 1 in 100, for a longer lead and more latency: in CONTROL Resonant captures about 2–2.6 ms more lead at the median.
+- **99%** (default) leaves about 1 frame in 100 ready after its target. Such frames are shown when ready; with frame generation each one moves two or more displayed frames.
+- **95%** leaves about 1 in 20, for a shorter lead and a little less latency: in CONTROL Resonant captures about 2–2.6 ms less lead at the median with frame generation, about 0.5 ms in Rogue Core.
 - Frames late because the GPU or the game's render thread was still busy with the previous frame are not helped; the extra lead only adds latency there.
-- The render handoff limit keeps 95% with either setting. Compare long frames, jitter, frames ready after their target and PC Latency, one setting per capture in the same scene. The log warns while it is not **95%**.
+- The render handoff limit keeps 95% with either setting. Compare long frames, jitter, frames ready after their target and PC Latency, one setting per capture in the same scene. The log warns while it is not **99%**.
 
 ### FG late-frame spacing
 
@@ -165,7 +165,7 @@ Settings belong under `[FrameLimiter]`. Leave these at their defaults for normal
 | `reflex_sleep_bypass` | true | 64-bit. `true` skips the driver's Reflex Sleep while an FPS cap is set and ReLimiter paces the game, held or not; frames not held use the render handoff limit. The Sleep reaches the driver in Dynamic MFG passthrough and with the Reflex driver limiter. `false` always returns to the driver's Sleep, which the **Reflex driver limiter** placement needs. |
 | `marker_forward_order` | before_wait | 64-bit, NvAPI markers. `before_wait` or `after_wait`: when SIMULATION_START reaches the driver relative to ReLimiter's wait (**Marker forward order**). Invalid values reset to `before_wait`. |
 | `gpu_queue_wait_render_queue` | keep | 64-bit, `gpu_queue_wait` only. `keep`, `remove` or `remove_held` (**GPU queue wait render queue**). Invalid values reset to `keep`. |
-| `lead_coverage` | 95 | All holds. `95` or `99`: the share of frames the lead covers (**Lead coverage**). Invalid values reset to `95`. |
+| `lead_coverage` | 99 | All holds. `99` or `95`: the share of frames the lead covers (**Lead coverage**). Invalid values reset to `99`. An INI saved with `config_version=2` (4.0 test builds) moves from `95` to `99` once. |
 | `fg_late_spacing` | false | 64-bit, `fg_input_wait` only. `true` or `false` (**FG late-frame spacing**). |
 | `source_placement` | pre_sleep | 64-bit, Reflex markers. `marker`, `pre_sleep` or `driver` (**Source placement**). `auto` from earlier versions loads as `marker`; invalid values reset to `pre_sleep`. |
 
@@ -243,7 +243,7 @@ The output point stays the best one the game supports (the GPU waits where avail
 
 ### Lead and late frames
 
-For each frame ReLimiter plans a *source wait* (when the game is released) and an *output point* (the target at which the finished frame should pass on). The lead covers 95% of recent frames, plus 0.5 ms with smoothing on, and is limited to three frame intervals.
+For each frame ReLimiter plans a *source wait* (when the game is released) and an *output point* (the target at which the finished frame should pass on). The lead covers 99% of recent frames, plus 0.5 ms with smoothing on, and is limited to three frame intervals.
 
 - **Late frames.** A frame that reaches its output point after its target is never held. If it is late by more than a quarter interval (at least 0.5 ms), the cadence restarts from that late frame and the grid epoch increases. The same applies when the game itself arrives late for its source wait, but only if it is late by more than a quarter interval plus the frame's *slack*: the lead minus the median time from release to the output point. A frame within the slack is released at once and keeps the cadence.
 - **Skipped holds.** Holds that would be unusually long, such as a marker hold of more than 1.5 intervals, are skipped rather than performed.

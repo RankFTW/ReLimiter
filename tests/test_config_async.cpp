@@ -319,19 +319,19 @@ void TestPacingPipelineDefaults() {
     CHECK(g_config.reflex_sleep_bypass && g_reflex_sleep_bypass.load());
     CHECK(g_config.marker_forward_order == PacingMarkerForwardOrder::BeforeWait);
     CHECK(g_config.gpu_queue_wait_render_queue == PacingRenderQueue::Keep);
-    CHECK(g_config.lead_coverage == PacingLeadCoverage::Q95);
+    CHECK(g_config.lead_coverage == PacingLeadCoverage::Q99);
     CHECK(!g_config.fg_late_spacing);
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
     CheckPipelineMatchesConfig();
     // The startup rewrite saves every new key, including the developer keys.
     CHECK(Value(local_path, "FrameLimiter", "marker_forward_order") == "before_wait");
     CHECK(Value(local_path, "FrameLimiter", "gpu_queue_wait_render_queue") == "keep");
-    CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "95");
+    CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "99");
     CHECK(Value(local_path, "FrameLimiter", "fg_late_spacing") == "false");
     CHECK(Value(local_path, "FrameLimiter", "source_placement") == "pre_sleep");
     CHECK(Value(local_path, "FrameLimiter", "reflex_sleep_bypass") == "true");
     CHECK(Value(local_path, "FrameLimiter", "developer_settings") == "false");
-    CHECK(Value(local_path, "FrameLimiter", "config_version") == "2");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "3");
     CHECK(Value(local_path, "FrameLimiter", "smoothing") == "on");
     CHECK(Value(local_path, "FrameLimiter", "adaptive_cap") == "false");
     CHECK(Value(local_path, "FrameLimiter", "output_rung") == "auto");
@@ -344,6 +344,8 @@ void TestPacingPipelineDefaults() {
 // An INI from before config_version 2 saved the old defaults of the Reflex
 // Sleep bypass (off) and source placement (marker): it moves to the new
 // defaults once and keeps every other value; a version-2 INI keeps its choice.
+// A version-2 INI (test builds) saved lead_coverage=95: it moves to 99 once;
+// a version-3 INI keeps 95 as the developer A/B.
 void TestRecommendedDefaultsMigration() {
     Reset(false, false, {{"reflex_sleep_bypass", "false"}, {"source_placement", "marker"},
         {"gpu_wait_budget_us", "4000"}, {"adaptive_cap", "true"}});
@@ -351,16 +353,24 @@ void TestRecommendedDefaultsMigration() {
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
     CHECK(g_config.gpu_wait_budget_us == 4000.0 && g_config.adaptive_cap);
     CheckPipelineMatchesConfig();
-    CHECK(Value(local_path, "FrameLimiter", "config_version") == "2");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "3");
     CHECK(Value(local_path, "FrameLimiter", "reflex_sleep_bypass") == "true");
     CHECK(Value(local_path, "FrameLimiter", "source_placement") == "pre_sleep");
     ReleaseStart();CHECK(OwnerShutdown());
 
     Reset(false, false, {{"config_version", "2"}, {"reflex_sleep_bypass", "false"},
-        {"source_placement", "marker"}});
+        {"source_placement", "marker"}, {"lead_coverage", "95"}});
     CHECK(!g_config.reflex_sleep_bypass && !g_reflex_sleep_bypass.load());
     CHECK(g_config.source_placement == PacingPlacementOverride::Marker);
+    CHECK(g_config.lead_coverage == PacingLeadCoverage::Q99);
     CheckPipelineMatchesConfig();
+    CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "99");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "3");
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    Reset(false, false, {{"config_version", "3"}, {"lead_coverage", "95"}});
+    CHECK(g_config.lead_coverage == PacingLeadCoverage::Q95);
+    CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "95");
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
@@ -509,21 +519,22 @@ void TestRenderQueueParsing() {
     CHECK(Value(local_path, "FrameLimiter", "gpu_queue_wait_render_queue") == "remove_held");
 }
 
-// Developer A/B lead_coverage: 99 loads, reaches the pipeline, counts as a
-// developer override and resets to 95; other text falls back to 95.
+// Developer A/B lead_coverage: 95 loads (in a version-3 INI), reaches the
+// pipeline, counts as a developer override and resets to 99; other text
+// falls back to 99.
 void TestLeadCoverageKey() {
-    Reset(false, false, {{"lead_coverage", "99"}});
-    CHECK(g_config.lead_coverage == PacingLeadCoverage::Q99);
+    Reset(false, false, {{"config_version", "3"}, {"lead_coverage", "95"}});
+    CHECK(g_config.lead_coverage == PacingLeadCoverage::Q95);
     CheckPipelineMatchesConfig();
-    CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "99");
+    CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "95");
     CHECK(Config_DeveloperOverrides() == 1);
     Config_ResetDeveloperSettings();
-    CHECK(g_config.lead_coverage == PacingLeadCoverage::Q95);
-    CHECK(PacingPipeline_GetConfig().lead_coverage == PacingLeadCoverage::Q95);
+    CHECK(g_config.lead_coverage == PacingLeadCoverage::Q99);
+    CHECK(PacingPipeline_GetConfig().lead_coverage == PacingLeadCoverage::Q99);
     ReleaseStart();CHECK(OwnerShutdown());
-    Reset(false, false, {{"lead_coverage", "97"}});
-    CHECK(g_config.lead_coverage == PacingLeadCoverage::Q95);
-    CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "95");
+    Reset(false, false, {{"config_version", "3"}, {"lead_coverage", "97"}});
+    CHECK(g_config.lead_coverage == PacingLeadCoverage::Q99);
+    CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "99");
     ReleaseStart();CHECK(OwnerShutdown());
 }
 

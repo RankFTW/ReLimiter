@@ -9,6 +9,7 @@ See the [User Guide](docs/USER_GUIDE.md) for how to use it, [Frame Pacing](docs/
 ### New pacing core
 
 - **One cadence for every output.** Each frame gets a planned release time and an output target on a shared cadence. Late frames are never held; after a stall or a clearly late frame the cadence restarts from that frame instead of catching up with a burst of short frames.
+- **The lead covers 99% of frames.** Each frame is released early enough for 99% of recent frames (plus 0.5 ms) to reach their hold on time, so far fewer frames arrive late and are shown unevenly. In CONTROL Resonant with frame generation this about halved stutter for about 3.5 ms more PC latency; in Deep Rock Galactic: Rogue Core it cut late frames from about 8% to 4% and jitter several times over for about 0.5 ms more. The developer **Lead coverage** setting keeps 95% for comparisons.
 - **The output point is chosen automatically** from the game, graphics API, display mode, frame-generation state and what qualifies at runtime:
   - **GPU queue wait** (64-bit, DX12, native Reflex markers, VRR, no frame generation): the GPU waits for the target before the frame is presented.
   - **FG input wait** (64-bit, DX12, native Reflex markers, static frame generation): the GPU waits before each real frame enters frame generation.
@@ -41,7 +42,7 @@ See the [User Guide](docs/USER_GUIDE.md) for how to use it, [Frame Pacing](docs/
 
 Older configurations are updated once at the first launch, when ReLimiter rewrites `relimiter.ini`:
 
-- An INI without `config_version`, written by an older version that saved every key including the old defaults, moves once to `reflex_sleep_bypass=true` and `source_placement=pre_sleep`. Every other value is kept, and ReLimiter writes `config_version=2`. An INI that already has `config_version=2` keeps whatever it says: set `reflex_sleep_bypass=false` or `source_placement=marker` there to stay on the older behavior. A new INI starts with the recommended defaults.
+- An INI without `config_version`, written by an older version that saved every key including the old defaults, moves once to `reflex_sleep_bypass=true` and `source_placement=pre_sleep`. Every other value is kept, and ReLimiter writes `config_version=3`. An INI that already has `config_version=2` or later keeps those two settings: set `reflex_sleep_bypass=false` or `source_placement=marker` there to stay on the older behavior. An INI saved by a 4.0 test build (`config_version=2`) also moves from `lead_coverage=95` to the new default 99 once. A new INI starts with the recommended defaults.
 - `adaptive_smoothing` becomes `adaptive_cap` if `adaptive_cap` is not set.
 - `smoothing=low`, `medium` and `high` become `smoothing=on`.
 - `pacing_method=marker` becomes the developer override `output_rung=marker`; other values become `auto`. A migrated marker preference stays a developer override until **Output override** is set back to **Auto** (shown with `developer_settings=true`) so that ReLimiter chooses again.
