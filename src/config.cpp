@@ -411,6 +411,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.csv_enabled             = ReadINIBool(S, "csv_enabled", false, P);
     g_config.native_pcl_enabled      = ReadINIBool(S, "native_pcl_enabled", false, P);
     g_config.gpu_present_gate_probes=ReadINIBool(S,"gpu_present_gate_probes",true,P);
+    g_config.fg_late_spacing=ReadINIBool(S,"fg_late_spacing",false,P);
     g_config.reflex_sleep_bypass=ReadINIBool(S,"reflex_sleep_bypass",true,P);
     g_config.reflex_inject           = ReadINIBool(S, "reflex_inject", false, P);
     g_config.flip_model_override     = ReadINIBool(S, "flip_model_override", false, P);
@@ -617,6 +618,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIString(S, "gpu_queue_wait_render_queue",
         PacingRenderQueue_Text(config.gpu_queue_wait_render_queue), P);
     WriteINIString(S, "lead_coverage", PacingLeadCoverage_Text(config.lead_coverage), P);
+    WriteINIBool(S, "fg_late_spacing", config.fg_late_spacing, P);
     WriteINIString(S, "source_placement",
         PacingPlacementOverride_Text(config.source_placement), P);
     WriteINIDouble(S, "stall_inject_ms", config.stall_inject_ms, P);
@@ -858,6 +860,7 @@ static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
     pipeline.gpu_wait_interleave_s = config.gpu_wait_interleave_s;
     pipeline.gpu_queue_wait_render_queue = config.gpu_queue_wait_render_queue;
     pipeline.lead_coverage = config.lead_coverage;
+    pipeline.fg_late_spacing = config.fg_late_spacing;
     return pipeline;
 }
 
@@ -883,6 +886,7 @@ int Config_DeveloperOverrides() {
         (g_config.marker_forward_order != d.marker_forward_order) +
         (g_config.gpu_queue_wait_render_queue != d.gpu_queue_wait_render_queue) +
         (g_config.lead_coverage != d.lead_coverage) +
+        (g_config.fg_late_spacing != d.fg_late_spacing) +
         (g_config.source_placement != d.source_placement);
 }
 
@@ -899,6 +903,7 @@ void Config_ResetDeveloperSettings() {
     g_config.marker_forward_order = d.marker_forward_order;
     g_config.gpu_queue_wait_render_queue = d.gpu_queue_wait_render_queue;
     g_config.lead_coverage = d.lead_coverage;
+    g_config.fg_late_spacing = d.fg_late_spacing;
     g_config.source_placement = d.source_placement;
     Config_ApplyPacingPipeline();
     LOG_INFO("Config: developer diagnostics reset to the recommended defaults");
@@ -945,6 +950,9 @@ void ApplyConfig() {
     if (g_config.lead_coverage != PacingLeadCoverage::Q95)
         LOG_WARN("Pacing pipeline: diagnostic lead coverage %s%% (the lead covers that share of frames; "
                  "the render handoff limit keeps 95%%)", PacingLeadCoverage_Text(g_config.lead_coverage));
+    if (g_config.fg_late_spacing)
+        LOG_WARN("Pacing pipeline: diagnostic FG late-frame spacing on (an FG input that reached its wait after "
+                 "the Signal floors the next real frame at its readiness)");
 }
 
 

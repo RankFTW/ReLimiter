@@ -518,6 +518,87 @@ void ReclaimRetiredQueues() noexcept {
     }
 }
 bool Idle() noexcept;
+// FG input prefix readback (GpuReady r), oldest first. Samples remain owned
+// until both the input callback and the GPU have finished, so it stops at an
+// unfinished callback or GPU query; outside a Signal (before_signal false) it
+// also yields when a time-fence Signal is due within 2 ms. With the
+// developer A/B fg_late_spacing, an input that reached its wait after its
+// recorded output (the Signal, or the Late decision) raises that record to
+// its readiness, where it actually passed (cadence_grid.h, output tracker).
+void DrainFgReadback(Queue& queue,int64_t* next,bool before_signal) noexcept {
+    if(!queue.fg_ready.load(std::memory_order_acquire))return;
+    const bool late_spacing=PacingPipeline_GetConfig().fg_late_spacing;
+    for(size_t pass=0;pass<kTicketsPerQueue;++pass) {
+        FgMeasurement* oldest=nullptr;
+        bool preparing=false;
+        for(auto& candidate:queue.fg_measurements) {
+            const auto state=candidate.state.load(std::memory_order_acquire);
+            if(state==TicketState::Preparing)preparing=true;
+            if(state==TicketState::Submitted && (!oldest || candidate.sample.fence_value<oldest->sample.fence_value))oldest=&candidate;
+        }
+        // Never overtake an unfinished callback or an older GPU query.
+        if(preparing || !oldest)break;
+        auto& measurement=*oldest;
+        const auto now=Qpc();
+        if(!before_signal && *next && *next-now<=frequency/500)break;
+        const auto completed=GpuReadinessQueue_Completed(&queue.fg_queue);
+        if(completed==UINT64_MAX) {Fail("FG device removed",DXGI_ERROR_DEVICE_REMOVED);continue;}
+        if(completed<measurement.sample.fence_value) {
+            const auto poll=now+frequency/200;
+            if(!*next || poll<*next)*next=poll;
+            break;
+        }
+        auto& sample=measurement.sample;
+        sample.completion_upper_qpc=now;
+        sample.status=measurement.valid?GpuReadinessStatus::Completed:GpuReadinessStatus::InvalidScope;
+        GpuReadinessQueue_ReadTimestamp(&queue.fg_queue,measurement.slot,&sample,frequency);
+        const auto ready=PrefixReadyRecord(measurement);
+        PacingTelemetry_PushReady(ready);
+        // GpuReady r of an FG input: its pre-hold prefix, only when the
+        // input and its FG route stayed valid through the callback.
+        if(ready.valid && (!measurement.binding || StreamlineHandoff_IsCurrent(measurement.binding)) &&
+            measurement.multiplier==g_fg_multiplier.load(std::memory_order_acquire)) {
+            PushStage(measurement.key,measurement.grid_index,PacingStageEventKind::GpuReady,PacingRung::FgInputWait,ready.ready_qpc);
+            if(late_spacing)g_cadence_output_tracker.RecordLater(measurement.key.controller_generation,measurement.grid_index,ready.ready_qpc);
+        }
+        measurement.slot->ownership.store(GpuTimestampOwnership::Retired,std::memory_order_release);
+        GpuReadinessQueue_Reclaim(&queue.fg_queue,completed);
+        measurement.slot=nullptr;
+        measurement.state.store(TicketState::Free,std::memory_order_release);
+    }
+}
+// fg_late_spacing, when an FG input's Signal is due: read back the FG inputs
+// whose GPU work has finished, so a previous frame that reached its wait
+// after its Signal is recorded where it passed, and resolve the output
+// spacing floor again. A frame after a late one then enters frame generation
+// no sooner than I − slack after it instead of on its original target. The
+// target only moves later, never past the H3 horizon from now, and only once
+// the input callback has recorded this frame's output (it arms the wait
+// first), so the raised record is the one the next frame's floor reads.
+bool fg_late_floor_logged=false;
+void FloorAfterLatePass(Queue& queue,Ticket& ticket,int64_t* next) noexcept {
+    const auto generation=ticket.key.controller_generation;
+    const auto index=ticket.trace.grid_index;
+    int64_t recorded=0;
+    if(!g_cadence_output_tracker.Find(generation,index,&recorded))return;
+    DrainFgReadback(queue,next,true);
+    CadenceGridSnapshot snapshot;
+    int64_t target=0;
+    if(!g_cadence_grid_publication.Read(&snapshot) ||
+        !CadenceGrid_ResolveOutputTarget(snapshot,generation,index,g_cadence_output_tracker,&target,nullptr) ||
+        target<=ticket.trace.target_qpc)return;
+    const double interval_us=ticket.trace.interval_qpc>0
+        ?static_cast<double>(ticket.trace.interval_qpc)*1e6/static_cast<double>(frequency):0.0;
+    if(target-Qpc()>GpuPresent_HorizonTicks(interval_us,frequency))return;
+    if(!fg_late_floor_logged) {
+        fg_late_floor_logged=true;
+        LOG_INFO("GPU Present gate: FG late-frame spacing moved a Signal %.2f ms later (the previous real frame passed its wait late)",
+            static_cast<double>(target-ticket.trace.target_qpc)*1e3/static_cast<double>(frequency));
+    }
+    ticket.trace.phase_adjust_qpc+=target-ticket.trace.target_qpc;
+    ticket.trace.target_qpc=target;
+    g_cadence_output_tracker.RecordLater(generation,index,target);
+}
 int64_t Service() noexcept {
     int64_t next=0;
     for(auto& queue:queues) {
@@ -534,6 +615,8 @@ int64_t Service() noexcept {
             const auto state=ticket.state.load(std::memory_order_acquire);
             if(state==TicketState::Armed || state==TicketState::Submitted) {
                 const auto now=Qpc();const bool current=Current(ticket) && !queue.retired.load(std::memory_order_acquire) && !failed.load();
+                if(!ticket.signalled && current && ticket.fg && now>=ticket.trace.target_qpc &&
+                    PacingPipeline_GetConfig().fg_late_spacing)FloorAfterLatePass(queue,ticket,&next);
                 if(!ticket.signalled && (!current || now>=ticket.trace.target_qpc)) {
                     ticket.trace.worker_wake_qpc=worker_wake_qpc;
                     ticket.trace.worker_service_qpc=now;
@@ -588,46 +671,7 @@ int64_t Service() noexcept {
         ticket.state.store(TicketState::Free,std::memory_order_release);
     }
     // All due time-fence obligations above take priority over FG readback.
-    // Samples remain owned until both the input callback and GPU have finished.
-    for(auto& queue:queues) {
-        if(!queue.fg_ready.load(std::memory_order_acquire))continue;
-        for(size_t pass=0;pass<kTicketsPerQueue;++pass) {
-            FgMeasurement* oldest=nullptr;
-            bool preparing=false;
-            for(auto& candidate:queue.fg_measurements) {
-                const auto state=candidate.state.load(std::memory_order_acquire);
-                if(state==TicketState::Preparing)preparing=true;
-                if(state==TicketState::Submitted && (!oldest || candidate.sample.fence_value<oldest->sample.fence_value))oldest=&candidate;
-            }
-            // Never overtake an unfinished callback or an older GPU query.
-            if(preparing || !oldest)break;
-            auto& measurement=*oldest;
-            const auto now=Qpc();
-            if(next && next-now<=frequency/500)break;
-            const auto completed=GpuReadinessQueue_Completed(&queue.fg_queue);
-            if(completed==UINT64_MAX) {Fail("FG device removed",DXGI_ERROR_DEVICE_REMOVED);continue;}
-            if(completed<measurement.sample.fence_value) {
-                const auto poll=now+frequency/200;
-                if(!next || poll<next)next=poll;
-                break;
-            }
-            auto& sample=measurement.sample;
-            sample.completion_upper_qpc=now;
-            sample.status=measurement.valid?GpuReadinessStatus::Completed:GpuReadinessStatus::InvalidScope;
-            GpuReadinessQueue_ReadTimestamp(&queue.fg_queue,measurement.slot,&sample,frequency);
-            const auto ready=PrefixReadyRecord(measurement);
-            PacingTelemetry_PushReady(ready);
-            // GpuReady r of an FG input: its pre-hold prefix, only when the
-            // input and its FG route stayed valid through the callback.
-            if(ready.valid && (!measurement.binding || StreamlineHandoff_IsCurrent(measurement.binding)) &&
-                measurement.multiplier==g_fg_multiplier.load(std::memory_order_acquire))
-                PushStage(measurement.key,measurement.grid_index,PacingStageEventKind::GpuReady,PacingRung::FgInputWait,ready.ready_qpc);
-            measurement.slot->ownership.store(GpuTimestampOwnership::Retired,std::memory_order_release);
-            GpuReadinessQueue_Reclaim(&queue.fg_queue,completed);
-            measurement.slot=nullptr;
-            measurement.state.store(TicketState::Free,std::memory_order_release);
-        }
-    }
+    for(auto& queue:queues)DrainFgReadback(queue,&next,false);
     ReclaimRetiredQueues();
     gpu_present_shared::outstanding.store(!Idle(),std::memory_order_release);
     heartbeat.store(Qpc(),std::memory_order_release);

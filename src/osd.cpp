@@ -594,6 +594,17 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "displayed frames. Frames late because the GPU or the game's render thread was still busy with "
         "the previous frame are not helped. Watch long frames, jitter and PC Latency; one setting per capture.");
 
+    if (ImGui::Checkbox("FG late-frame spacing", &g_config.fg_late_spacing)) {
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: FG late-frame spacing -> %s", g_config.fg_late_spacing ? "on" : "off");
+        *config_dirty = true;
+    }
+    HelpTip("Diagnostic A/B, FG input wait only. When a real frame reaches the wait after its release time, "
+        "it enters frame generation when it is ready. On, the next real frame is then released no sooner "
+        "than about one frame interval after that, as after a late frame on the other outputs, instead of on "
+        "its original time, which shortened the displayed interval after it. Watch jitter and long frames; "
+        "one setting per capture.");
+
     static const char* const kSourcePlacementLabels[] = {"Marker", "Pre-Sleep", "Reflex driver limiter"};
     static_assert(IM_ARRAYSIZE(kSourcePlacementLabels) ==
         static_cast<int>(PacingPlacementOverride::Count));

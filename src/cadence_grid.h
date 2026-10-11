@@ -115,7 +115,10 @@ int64_t CadenceGrid_LateToleranceTicks(
 //   - GPU queue wait (H3, FG input): max(target, now) at enqueue.
 // Record before the next frame's executor can resolve (for a CPU hold,
 // before Present is forwarded); a frame whose predecessor is not recorded
-// yet gets no floor.
+// yet gets no floor. With the developer A/B fg_late_spacing the FG input
+// wait later raises a frame's record to its readiness when the frame reached
+// its wait after the Signal (RecordLater), and resolves the next frame's
+// floor again just before its Signal.
 //
 // 16 slots indexed by grid_index & 15, each a seqlock over atomic fields.
 // Writers for indices less than 16 apart never share a slot; the rare
@@ -139,6 +142,15 @@ public:
         uint32_t controller_generation,
         uint64_t grid_index,
         int64_t* output_qpc) const noexcept;
+
+    // Raises the output recorded for exactly (controller_generation,
+    // grid_index) to output_qpc when that is later. False when the slot holds
+    // another index or lifecycle, holds nothing, the output is not later, or
+    // the write is dropped.
+    bool RecordLater(
+        uint32_t controller_generation,
+        uint64_t grid_index,
+        int64_t output_qpc) noexcept;
 
 private:
     struct Slot {

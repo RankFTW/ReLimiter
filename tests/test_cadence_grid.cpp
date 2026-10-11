@@ -1193,6 +1193,36 @@ namespace
             snapshot, kGeneration, grid_index, tracker, target_qpc, floored);
     }
 
+    // RecordLater (FG input wait, fg_late_spacing): frame 4 recorded at its
+    // target, then read back ready 20 ms later (it reached its wait after the
+    // Signal). Only a later output of exactly that frame and lifecycle raises
+    // the record, and frame 5's floor then follows it: I = 10 ms, slack 12.5 ms.
+    void TestOutputTrackerRecordLater()
+    {
+        CadenceGrid grid;
+        int64_t now_qpc = kStartQpc;
+        PlanSteady(&grid, 12, 10000.0, 2000.0, &now_qpc);
+        const int64_t t4 = TargetOf(grid, 4);
+        const int64_t t5 = TargetOf(grid, 5);
+        CadenceGridOutputTracker tracker;
+        int64_t output = 0;
+        int64_t target = 0;
+        bool floored = true;
+        CHECK(!tracker.RecordLater(kGeneration, 4, t4 + 20000)); // nothing recorded yet
+        CHECK(tracker.Record(kGeneration, 4, t4));
+        CHECK(!tracker.RecordLater(kGeneration, 4, t4 - 1));
+        CHECK(!tracker.RecordLater(kGeneration, 4, t4));
+        CHECK(!tracker.RecordLater(kGeneration + 1, 4, t4 + 20000)); // other lifecycle
+        CHECK(!tracker.RecordLater(kGeneration, 20, t4 + 20000));    // the slot holds 4, not 20
+        CHECK(tracker.Find(kGeneration, 4, &output) && output == t4);
+        CHECK(ResolveFloored(grid.Snapshot(), tracker, 5, &target, &floored));
+        CHECK(target == t5 && !floored);
+        CHECK(tracker.RecordLater(kGeneration, 4, t4 + 20000));
+        CHECK(tracker.Find(kGeneration, 4, &output) && output == t4 + 20000);
+        CHECK(ResolveFloored(grid.Snapshot(), tracker, 5, &target, &floored));
+        CHECK(target == t5 + 7500 && floored);
+    }
+
     // I = 10 ms: tol = 25,000 ticks, slack = 12,500.
     void TestOutputSpacingFloor()
     {
@@ -1706,6 +1736,7 @@ int main()
     TestStallRecoveryPipelined();
     TestLeadLongerThanInterval();
     TestOutputTrackerBasics();
+    TestOutputTrackerRecordLater();
     TestOutputSpacingFloor();
     TestOutputTrackerConcurrency();
     TestStallRecoveryWithExecutors();

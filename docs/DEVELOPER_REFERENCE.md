@@ -115,6 +115,14 @@ Turning it off removes two command lists and two fence signals per frame from th
 - Frames late because the GPU or the game's render thread was still busy with the previous frame are not helped; the extra lead only adds latency there.
 - The render handoff limit keeps 95% with either setting. Compare long frames, jitter, frames ready after their target and PC Latency, one setting per capture in the same scene. The log warns while it is not **95%**.
 
+### FG late-frame spacing
+
+`fg_late_spacing` (default **off**, 64-bit, `fg_input_wait` only). When a real frame reaches the FG input wait after its release time, it enters frame generation when its GPU work finishes. Off, the next real frame is released on its original target, so the displayed frame after the late one can follow the generated frame by only a few milliseconds. On, ReLimiter records the late frame where it actually passed and holds the next real frame at least one frame interval minus half the late tolerance after it, the same spacing rule the other outputs use ([No catch-up burst](FRAME_PACING.md#no-catch-up-burst)).
+
+- Only the release of the frame after a late one moves, and only later; the late frame itself is unchanged.
+- The grid's late-output evidence, the overload pause and the Adaptive cap see the same frames as with it off.
+- Compare jitter above 2 and 4 ms, long frames and PC Latency, one setting per capture in the same scene. The log warns while it is on and logs the first moved release at INFO.
+
 ### Source placement
 
 `source_placement` (default **Pre-Sleep**, 64-bit, Reflex marker games) sets where the source wait happens. ReLimiter never changes it on its own. The Details lines show the result as **Placement**. State the placement with every latency comparison.
@@ -156,6 +164,7 @@ Settings belong under `[FrameLimiter]`. Leave these at their defaults for normal
 | `marker_forward_order` | before_wait | 64-bit, NvAPI markers. `before_wait` or `after_wait`: when SIMULATION_START reaches the driver relative to ReLimiter's wait (**Marker forward order**). Invalid values reset to `before_wait`. |
 | `gpu_queue_wait_render_queue` | keep | 64-bit, `gpu_queue_wait` only. `keep`, `remove` or `remove_held` (**GPU queue wait render queue**). Invalid values reset to `keep`. |
 | `lead_coverage` | 95 | All holds. `95` or `99`: the share of frames the lead covers (**Lead coverage**). Invalid values reset to `95`. |
+| `fg_late_spacing` | false | 64-bit, `fg_input_wait` only. `true` or `false` (**FG late-frame spacing**). |
 | `source_placement` | pre_sleep | 64-bit, Reflex markers. `marker`, `pre_sleep` or `driver` (**Source placement**). `auto` from earlier versions loads as `marker`; invalid values reset to `pre_sleep`. |
 
 ---

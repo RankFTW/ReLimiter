@@ -303,6 +303,7 @@ void CheckPipelineMatchesConfig() {
     CHECK(pipeline.gpu_wait_interleave_s == g_config.gpu_wait_interleave_s);
     CHECK(pipeline.gpu_queue_wait_render_queue == g_config.gpu_queue_wait_render_queue);
     CHECK(pipeline.lead_coverage == g_config.lead_coverage);
+    CHECK(pipeline.fg_late_spacing == g_config.fg_late_spacing);
     CHECK(g_marker_forward_after_wait.load() ==
         (g_config.marker_forward_order == PacingMarkerForwardOrder::AfterWait));
 }
@@ -319,12 +320,14 @@ void TestPacingPipelineDefaults() {
     CHECK(g_config.marker_forward_order == PacingMarkerForwardOrder::BeforeWait);
     CHECK(g_config.gpu_queue_wait_render_queue == PacingRenderQueue::Keep);
     CHECK(g_config.lead_coverage == PacingLeadCoverage::Q95);
+    CHECK(!g_config.fg_late_spacing);
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
     CheckPipelineMatchesConfig();
     // The startup rewrite saves every new key, including the developer keys.
     CHECK(Value(local_path, "FrameLimiter", "marker_forward_order") == "before_wait");
     CHECK(Value(local_path, "FrameLimiter", "gpu_queue_wait_render_queue") == "keep");
     CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "95");
+    CHECK(Value(local_path, "FrameLimiter", "fg_late_spacing") == "false");
     CHECK(Value(local_path, "FrameLimiter", "source_placement") == "pre_sleep");
     CHECK(Value(local_path, "FrameLimiter", "reflex_sleep_bypass") == "true");
     CHECK(Value(local_path, "FrameLimiter", "developer_settings") == "false");
@@ -521,6 +524,19 @@ void TestLeadCoverageKey() {
     Reset(false, false, {{"lead_coverage", "97"}});
     CHECK(g_config.lead_coverage == PacingLeadCoverage::Q95);
     CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "95");
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// Developer A/B fg_late_spacing: true loads, reaches the pipeline, counts as a
+// developer override and resets to false.
+void TestFgLateSpacingKey() {
+    Reset(false, false, {{"fg_late_spacing", "true"}});
+    CHECK(g_config.fg_late_spacing);
+    CheckPipelineMatchesConfig();
+    CHECK(Value(local_path, "FrameLimiter", "fg_late_spacing") == "true");
+    CHECK(Config_DeveloperOverrides() == 1);
+    Config_ResetDeveloperSettings();
+    CHECK(!g_config.fg_late_spacing && !PacingPipeline_GetConfig().fg_late_spacing);
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
@@ -901,6 +917,7 @@ int main() {
     TestMarkerForwardOrderParsing();
     TestRenderQueueParsing();
     TestLeadCoverageKey();
+    TestFgLateSpacingKey();
     TestSourcePlacementParsing();
     TestPacingMethodMigration();
     TestAdaptiveCapMigration();

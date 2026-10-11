@@ -144,6 +144,7 @@ namespace
             left.gpu_wait_interleave_s == right.gpu_wait_interleave_s &&
             left.gpu_queue_wait_render_queue == right.gpu_queue_wait_render_queue &&
             left.lead_coverage == right.lead_coverage &&
+            left.fg_late_spacing == right.fg_late_spacing &&
             left.stall_inject_ms == right.stall_inject_ms &&
             left.stall_inject_period_s == right.stall_inject_period_s;
     }
@@ -841,6 +842,7 @@ namespace
         config.stall_inject_period_s = 10.0;
         config.gpu_queue_wait_render_queue = PacingRenderQueue::RemoveHeld;
         config.lead_coverage = PacingLeadCoverage::Q99;
+        config.fg_late_spacing = true;
         PacingPipeline_SetConfig(config);
         CHECK(SameConfig(PacingPipeline_GetConfig(), config));
         CHECK(PacingPipeline_GetConfig().adaptive_cap);

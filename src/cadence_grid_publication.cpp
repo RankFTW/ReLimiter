@@ -163,3 +163,34 @@ bool CadenceGridOutputTracker::Find(
     }
     return false;
 }
+
+bool CadenceGridOutputTracker::RecordLater(
+    uint32_t controller_generation,
+    uint64_t grid_index,
+    int64_t output_qpc) noexcept
+{
+    if (output_qpc <= 0) return false;
+    Slot& slot = slots_[static_cast<size_t>(grid_index & (kSlotCount - 1))];
+    uint64_t claimed = slot.sequence.load(std::memory_order_relaxed);
+    for (int attempt = 0; attempt < kMaximumClaimAttempts; ++attempt) {
+        if ((claimed & 1u) == 0 &&
+            slot.sequence.compare_exchange_weak(claimed, claimed + 1,
+                std::memory_order_acquire, std::memory_order_relaxed)) {
+            // The claim excludes other writers, so a frame 16 indices later
+            // cannot replace the slot between the check and the store.
+            const int64_t recorded = slot.output_qpc.load(std::memory_order_relaxed);
+            const bool later =
+                slot.controller_generation.load(std::memory_order_relaxed) == controller_generation &&
+                slot.grid_index.load(std::memory_order_relaxed) == grid_index &&
+                recorded > 0 && output_qpc > recorded;
+            if (later) {
+                std::atomic_thread_fence(std::memory_order_release);
+                slot.output_qpc.store(output_qpc, std::memory_order_relaxed);
+            }
+            slot.sequence.store(claimed + 2, std::memory_order_release);
+            return later;
+        }
+        claimed = slot.sequence.load(std::memory_order_relaxed);
+    }
+    return false;
+}
