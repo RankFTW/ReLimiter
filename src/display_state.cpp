@@ -209,19 +209,9 @@ void QueryVRRFloor() {
 
 void PollGSyncState() {
     NvU32 display_id = DispRes_GetDisplayID();
-    if (display_id == 0) {
-        static int s_fail_count = 0;
-        s_fail_count++;
-        // The first polls can come before the display is resolved; none by
-        // the fifth is a warning.
-        if (s_fail_count == 5)
-            LOG_WARN("PollGSyncState: Display_Resolver has no Display_ID "
-                     "(DispRes_IsResolved=%d, count=%d)", DispRes_IsResolved(), s_fail_count);
-        else if (s_fail_count <= 3)
-            LOG_INFO("PollGSyncState: Display_Resolver has no Display_ID "
-                     "(DispRes_IsResolved=%d, count=%d)", DispRes_IsResolved(), s_fail_count);
-        return;
-    }
+    // No display before the first swapchain is expected: the resolver polls
+    // again once it resolves one and reports its own failures.
+    if (display_id == 0) return;
     if (!s_GetVRRInfo) {
         static bool s_warned = false;
         if (!s_warned) {
