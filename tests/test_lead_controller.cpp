@@ -50,7 +50,7 @@ namespace
         return kBaseQpc + static_cast<int64_t>(std::llround(us * 10.0));
     }
 
-    // The controller is about 160 KB: tests keep it on the heap.
+    // The controller is about 185 KB: tests keep it on the heap.
     std::unique_ptr<LeadController> MakeController()
     {
         auto controller = std::make_unique<LeadController>();
@@ -735,8 +735,10 @@ void TestHistogramQuantile()
     CHECK(LeadSampleWindow::BinOf(20.0) == 1);
     CHECK(LeadSampleWindow::BinOf(1000.0) == 50);
     CHECK(LeadSampleWindow::BinOf(40959.0) == LEAD_HISTOGRAM_BINS - 1);
-    CHECK(LeadSampleWindow::BinOf(1e9) == LEAD_HISTOGRAM_BINS - 1);
-    CHECK(LeadSampleWindow::BinOf(std::numeric_limits<double>::infinity()) == LEAD_HISTOGRAM_BINS - 1);
+    CHECK(LeadSampleWindow::BinOf(40960.0) == LEAD_HISTOGRAM_BINS);
+    CHECK(LeadSampleWindow::BinOf(1e9) == 50'000'000u);
+    CHECK(LeadSampleWindow::BinOf(std::numeric_limits<double>::infinity()) ==
+        std::numeric_limits<uint32_t>::max());
     CHECK_NEAR(LeadSampleWindow::BinCenterUs(50), 1010.0);
 
     auto window = std::make_unique<LeadSampleWindow>();
@@ -752,9 +754,10 @@ void TestHistogramQuantile()
     const double probabilities[] = { 0.0, 0.1, 0.5, 0.9, 0.95, 0.99, 1.0 };
     std::vector<double> recent;
     for (int sample_index = 0; sample_index < 1000; ++sample_index) {
-        // Every fifth sample repeats one value so the window has ties.
+        // Every fifth sample repeats one value so the window has ties; about
+        // three in five lie beyond the histogram (40.96 ms).
         const double value = sample_index % 5 == 0 ?
-            2000.0 : static_cast<double>(next_random() % 4'000'000u) / 100.0;
+            2000.0 : static_cast<double>(next_random() % 10'000'000u) / 100.0;
         window->Add(value);
         recent.push_back(value);
         if (recent.size() > LEAD_WINDOW_CAPACITY) recent.erase(recent.begin());
@@ -772,13 +775,41 @@ void TestHistogramQuantile()
     }
     CHECK(window->Count() == LEAD_WINDOW_CAPACITY);
 
-    // Out-of-range samples land in the edge bins.
+    // Negative samples land in the first bin; a long one keeps its own bin.
     window->Reset();
     window->Add(-500.0);
     window->Add(1e7);
     CHECK(window->Count() == 2);
     CHECK_NEAR(window->Quantile(0.0), 10.0);
-    CHECK_NEAR(window->Quantile(1.0), LeadSampleWindow::BinCenterUs(LEAD_HISTOGRAM_BINS - 1));
+    CHECK_NEAR(window->Quantile(1.0), 10'000'010.0);
+
+    // Long samples leave the window like any other: once evicted, the
+    // quantile is back inside the histogram.
+    window->Reset();
+    for (size_t i = 0; i < LEAD_WINDOW_CAPACITY; ++i) window->Add(45000.0);
+    CHECK_NEAR(window->Quantile(0.99), 45010.0);
+    for (size_t i = 0; i < LEAD_WINDOW_CAPACITY; ++i) window->Add(30000.0);
+    CHECK_NEAR(window->Quantile(0.99), 30010.0);
+    CHECK_NEAR(window->Quantile(1.0), 30010.0);
+}
+
+// The lead follows samples beyond the histogram up to its 3 I bound: at I =
+// 20 ms, X = 50 ms gives L = 50.51 ms (it stopped at 41.45 ms when the last
+// histogram bin held every longer sample).
+void TestLeadBeyondHistogram()
+{
+    auto controller = MakeController();
+    constexpr double kLongInterval = 20000.0;
+    for (uint64_t index = 1; index <= LEAD_WARM_SAMPLES; ++index) {
+        const double source_us = static_cast<double>(index) * kLongInterval;
+        controller->OnSourceRelease(Start(index, PacingRung::MarkerHold, source_us, kLongInterval));
+        controller->OnStageEvent(Event(index, Kind::MarkerArrival, source_us + 50000.0));
+        controller->OnStageEvent(Event(index, Kind::OutputRelease, source_us + 50000.0));
+    }
+    bool budget_limited = true;
+    CHECK_NEAR(controller->NextLeadUs(Request(PacingRung::MarkerHold, 500.0, kLongInterval), &budget_limited),
+        50510.0);
+    CHECK(!budget_limited);
 }
 
 // ── Lead control ──
@@ -2547,7 +2578,8 @@ void TestRenderHandoffBackPressure()
 int main()
 {
     std::printf("sizeof(LeadController) = %zu bytes\n", sizeof(LeadController));
-    CHECK(sizeof(LeadController) < 176u * 1024u);
+    // Each window's ring holds 32-bit bins (samples beyond 40.96 ms keep theirs).
+    CHECK(sizeof(LeadController) < 192u * 1024u);
 
     TestSourceOnlySample();
     TestMarkerHoldOverlap();
@@ -2563,6 +2595,7 @@ int main()
     TestRungTransitions();
     TestLongSampleExclusion();
     TestHistogramQuantile();
+    TestLeadBeyondHistogram();
     TestWarmupSeedAndFirstJump();
     TestSlewLimit();
     TestBucketSwitching();

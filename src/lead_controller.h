@@ -21,7 +21,13 @@
 // ── Limits ──
 
 constexpr size_t LEAD_WINDOW_CAPACITY = 256;       // newest samples kept per bucket
-constexpr size_t LEAD_HISTOGRAM_BINS = 2048;       // the last bin also holds larger samples
+// Samples are ranked in 20 µs bins. Bins below LEAD_HISTOGRAM_BINS (40.96 ms)
+// are counted in a histogram; a longer sample keeps its own 20 µs bin in the
+// ring and is ranked among the other long ones, so the window has no
+// ceiling below the 3 I bound. A histogram whose last bin also held every
+// longer sample pinned Gears of War: E-Day's held FG 2× lead at 41.45 ms
+// (Q99 of the last bin + 0.5 ms) while its true Q99 was 44–58 ms.
+constexpr size_t LEAD_HISTOGRAM_BINS = 2048;
 constexpr double LEAD_HISTOGRAM_BIN_US = 20.0;
 constexpr uint32_t LEAD_WARM_SAMPLES = 32;
 constexpr uint32_t LEAD_HANDOFF_MIN_SAMPLES = 16;  // the render handoff offset is 0 until this many samples
@@ -489,29 +495,33 @@ private:
 
 // ── Sample window ──
 
-// The newest LEAD_WINDOW_CAPACITY samples of one bucket as a ring of bin
-// indices plus a two-level fixed-bin histogram of the same samples.
+// The newest LEAD_WINDOW_CAPACITY samples of one bucket as a ring of 20 µs
+// bin indices, plus a two-level histogram of those below LEAD_HISTOGRAM_BINS
+// and a count of the longer ones.
 class LeadSampleWindow {
 public:
     void Reset() noexcept;
-    // Negative samples count in the first bin, samples beyond the last bin in the last.
+    // Negative samples count in the first bin; no upper bin limit.
     void Add(double sample_us) noexcept;
     uint32_t Count() const noexcept { return count_; }
     // Lower-index empirical quantile sorted[floor(p * (n - 1))] (pacing_metrics.h)
-    // resolved to the center of the bin that holds it, so in-range results are
-    // within half a bin of the exact value. 0 when empty.
+    // resolved to the center of the bin that holds it, so results are within
+    // half a bin of the exact value. 0 when empty. A rank among the samples
+    // beyond the histogram is found from the ring.
     double Quantile(double probability) const noexcept;
 
-    static size_t BinOf(double sample_us) noexcept;
-    static double BinCenterUs(size_t bin) noexcept;
+    // The 20 µs bin of a sample: 0 for non-positive or NaN, at most UINT32_MAX.
+    static uint32_t BinOf(double sample_us) noexcept;
+    static double BinCenterUs(uint32_t bin) noexcept;
 
 private:
     static constexpr size_t kBlockBins = 32;
     static constexpr size_t kBlockCount = LEAD_HISTOGRAM_BINS / kBlockBins;
 
-    std::array<uint16_t, LEAD_WINDOW_CAPACITY> ring_bins_{};
+    std::array<uint32_t, LEAD_WINDOW_CAPACITY> ring_bins_{};
     std::array<uint16_t, LEAD_HISTOGRAM_BINS> bin_counts_{};
     std::array<uint16_t, kBlockCount> block_counts_{};
+    uint32_t beyond_count_ = 0; // ring samples at or beyond LEAD_HISTOGRAM_BINS
     uint32_t head_ = 0; // next write position; the oldest sample once full
     uint32_t count_ = 0;
 };

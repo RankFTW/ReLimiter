@@ -48,36 +48,45 @@ void LeadSampleWindow::Reset() noexcept
     ring_bins_.fill(0);
     bin_counts_.fill(0);
     block_counts_.fill(0);
+    beyond_count_ = 0;
     head_ = 0;
     count_ = 0;
 }
 
-size_t LeadSampleWindow::BinOf(double sample_us) noexcept
+uint32_t LeadSampleWindow::BinOf(double sample_us) noexcept
 {
     if (!(sample_us > 0.0)) return 0;
     const double bin = std::floor(sample_us / LEAD_HISTOGRAM_BIN_US);
-    return bin < static_cast<double>(LEAD_HISTOGRAM_BINS - 1) ?
-        static_cast<size_t>(bin) : LEAD_HISTOGRAM_BINS - 1;
+    constexpr double kMaxBin = static_cast<double>(std::numeric_limits<uint32_t>::max());
+    return bin < kMaxBin ? static_cast<uint32_t>(bin) : std::numeric_limits<uint32_t>::max();
 }
 
-double LeadSampleWindow::BinCenterUs(size_t bin) noexcept
+double LeadSampleWindow::BinCenterUs(uint32_t bin) noexcept
 {
     return (static_cast<double>(bin) + 0.5) * LEAD_HISTOGRAM_BIN_US;
 }
 
 void LeadSampleWindow::Add(double sample_us) noexcept
 {
-    const size_t bin = BinOf(sample_us);
+    const uint32_t bin = BinOf(sample_us);
     if (count_ == LEAD_WINDOW_CAPACITY) {
-        const size_t evicted = ring_bins_[head_];
-        --bin_counts_[evicted];
-        --block_counts_[evicted / kBlockBins];
+        const uint32_t evicted = ring_bins_[head_];
+        if (evicted < LEAD_HISTOGRAM_BINS) {
+            --bin_counts_[evicted];
+            --block_counts_[evicted / kBlockBins];
+        } else {
+            --beyond_count_;
+        }
     } else {
         ++count_;
     }
-    ring_bins_[head_] = static_cast<uint16_t>(bin);
-    ++bin_counts_[bin];
-    ++block_counts_[bin / kBlockBins];
+    ring_bins_[head_] = bin;
+    if (bin < LEAD_HISTOGRAM_BINS) {
+        ++bin_counts_[bin];
+        ++block_counts_[bin / kBlockBins];
+    } else {
+        ++beyond_count_;
+    }
     head_ = (head_ + 1) % static_cast<uint32_t>(LEAD_WINDOW_CAPACITY);
 }
 
@@ -87,6 +96,20 @@ double LeadSampleWindow::Quantile(double probability) const noexcept
     const double clamped = probability > 0.0 ? (probability < 1.0 ? probability : 1.0) : 0.0;
     size_t rank = static_cast<size_t>(std::floor(clamped * static_cast<double>(count_ - 1)));
     if (rank >= count_) rank = count_ - 1;
+    const size_t in_histogram = count_ - beyond_count_;
+    if (rank >= in_histogram) {
+        // Among the samples beyond the histogram: rank their bins from the
+        // ring (positions below count_ hold the newest count_ samples).
+        std::array<uint32_t, LEAD_WINDOW_CAPACITY> beyond{};
+        size_t found = 0;
+        for (size_t index = 0; index < count_; ++index) {
+            if (ring_bins_[index] >= LEAD_HISTOGRAM_BINS) beyond[found++] = ring_bins_[index];
+        }
+        const size_t nth = rank - in_histogram;
+        std::nth_element(beyond.begin(), beyond.begin() + static_cast<std::ptrdiff_t>(nth),
+            beyond.begin() + static_cast<std::ptrdiff_t>(found));
+        return BinCenterUs(beyond[nth]);
+    }
     // Samples before the current block/bin; the ranked sample is the first
     // position where the running count passes its rank.
     size_t before = 0;
@@ -100,7 +123,7 @@ double LeadSampleWindow::Quantile(double probability) const noexcept
         before += bin_counts_[bin];
         ++bin;
     }
-    return BinCenterUs(bin);
+    return BinCenterUs(static_cast<uint32_t>(bin));
 }
 
 // ── Release margin and headroom ──
