@@ -2406,63 +2406,142 @@ void TestRenderHandoffOffset()
     CHECK_NEAR(pipelined->HandoffOffsetUs(0.95, 0.0), 0.0);
 }
 
-// Render handoff GPU queue term: a report of a frame released under the
-// limit whose submission ended while the GPU still worked on the previous
-// frame raises c by q·η (η = 1% of I), any other lowers it by (1 − q)·η, so
-// c holds where a share 1 − q of frames waited; c stays within [0, I] and
-// adds to d. Frames without the limit and second reports change nothing.
-void TestRenderHandoffGpuQueue()
+// Report pairs (µs from frame n's RENDERSUBMIT_START), modelled on Gears of
+// War: E-Day FG 2× (GPU-bound, render thread held back), its driver's Sleep
+// and a release that came too late.
+HandoffBackPressureSample HeldBackPair()
+{
+    HandoffBackPressureSample pair{};
+    pair.simulation_end_us = -4750.0;     // the simulation waited for the render thread
+    pair.render_start_us = 0.0;
+    pair.render_end_us = 17150.0;
+    pair.first_submission_us = 17370.0;   // the first work after the window
+    pair.gpu_start_us = 18350.0;
+    pair.previous_render_free_us = -90.0; // straight from frame n − 1
+    pair.previous_gpu_end_us = 18100.0;   // GPU idle 250 µs
+    return pair;
+}
+
+HandoffBackPressureSample StreamingPair()
+{
+    HandoffBackPressureSample pair{};
+    pair.simulation_end_us = -750.0;       // the render thread waited for the simulation
+    pair.render_start_us = 0.0;
+    pair.render_end_us = 11650.0;
+    pair.first_submission_us = 820.0;      // work streams from the start
+    pair.gpu_start_us = 10100.0;
+    pair.previous_render_free_us = -5400.0;
+    pair.previous_gpu_end_us = 9850.0;
+    return pair;
+}
+
+HandoffBackPressureSample ReleasedLatePair()
+{
+    HandoffBackPressureSample pair = StreamingPair();
+    pair.gpu_start_us = 13000.0;          // the GPU waited 3.15 ms
+    return pair;
+}
+
+// Held back: the GPU did not wait, the render thread came straight from the
+// previous frame and the frame's first work reached the driver in the second
+// half of its window. Released late: the GPU waited more than 1 ms while the
+// render thread waited for the simulation. A GPU that waits behind a busy
+// render thread (a hitch) is neither, and so is a render thread that streams.
+void TestHandoffBackPressureClassify()
+{
+    CHECK(HandoffBackPressure_Classify(HeldBackPair()) == HandoffBackPressure::HeldBack);
+    CHECK(HandoffBackPressure_Classify(StreamingPair()) == HandoffBackPressure::None);
+    CHECK(HandoffBackPressure_Classify(ReleasedLatePair()) == HandoffBackPressure::ReleasedLate);
+
+    // The first work in the first half of the window (streaming): not held.
+    HandoffBackPressureSample early = HeldBackPair();
+    early.first_submission_us = 8000.0;
+    CHECK(HandoffBackPressure_Classify(early) == HandoffBackPressure::None);
+    // At the middle of the window: held.
+    early.first_submission_us = 8575.0;
+    CHECK(HandoffBackPressure_Classify(early) == HandoffBackPressure::HeldBack);
+    // The GPU waited more than 1 ms behind a busy render thread: a hitch.
+    HandoffBackPressureSample hitch = HeldBackPair();
+    hitch.gpu_start_us = hitch.previous_gpu_end_us + 1001.0;
+    CHECK(HandoffBackPressure_Classify(hitch) == HandoffBackPressure::None);
+    // A render thread that waited for the simulation is never held back,
+    // even when it submits at the end of its window.
+    HandoffBackPressureSample waited = HeldBackPair();
+    waited.simulation_end_us = waited.previous_render_free_us;
+    CHECK(HandoffBackPressure_Classify(waited) == HandoffBackPressure::None);
+    // Exactly 1 ms of GPU idle is not waiting.
+    HandoffBackPressureSample edge = ReleasedLatePair();
+    edge.gpu_start_us = edge.previous_gpu_end_us + 1000.0;
+    CHECK(HandoffBackPressure_Classify(edge) == HandoffBackPressure::None);
+
+    HandoffBackPressureSample invalid = HeldBackPair();
+    invalid.gpu_start_us = kNaN;
+    CHECK(HandoffBackPressure_Classify(invalid) == HandoffBackPressure::None);
+    invalid = HeldBackPair();
+    invalid.render_end_us = invalid.render_start_us;
+    CHECK(HandoffBackPressure_Classify(invalid) == HandoffBackPressure::None);
+}
+
+// Render handoff back-pressure term: a report of a frame released under the
+// limit raises c by q·η when held back and lowers it by q·η when released
+// late and by (1 − q)·η otherwise (η = 1% of I), so c holds where a share
+// 1 − q of frames is held back; c stays within [0, I] and adds to d. Frames
+// without the limit and second reports change nothing.
+void TestRenderHandoffBackPressure()
 {
     auto controller = MakeController();
     uint64_t n = 0;
-    const auto frame = [&](bool limited, double submit_after_gpu_free_us) {
+    const auto frame = [&](bool limited, const HandoffBackPressureSample& pair) {
         ++n;
         LeadFrameStart start = Start(n, limited ? PacingRung::SourceOnly : PacingRung::FgInputWait,
             static_cast<double>(n) * kInterval);
         start.handoff_release = limited;
         controller->OnSourceRelease(start);
-        controller->OnHandoffQueue(Key(n).producer_epoch, Key(n).frame_id, submit_after_gpu_free_us, 0.95);
+        controller->OnHandoffBackPressure(Key(n).producer_epoch, Key(n).frame_id, pair, 0.95);
     };
 
-    // Ten frames that finished submitting 1.3 ms before the GPU was free:
-    // c = 10 × 0.95 × 100 = 950 µs, all of the offset while d is cold.
-    for (int i = 0; i < 10; ++i) frame(true, -1300.0);
-    CHECK(controller->Statistics().handoff_queue_samples == 10);
-    CHECK(controller->Statistics().handoff_queue_waited == 10);
-    CHECK_NEAR(controller->HandoffQueueUs(), 950.0);
+    // Ten held-back frames: c = 10 × 0.95 × 100 = 950 µs, all of the offset
+    // while d is cold.
+    for (int i = 0; i < 10; ++i) frame(true, HeldBackPair());
+    CHECK(controller->Statistics().handoff_back_pressure_samples == 10);
+    CHECK(controller->Statistics().handoff_held_back == 10);
+    CHECK_NEAR(controller->HandoffBackPressureUs(), 950.0);
     CHECK_NEAR(controller->HandoffOffsetUs(0.95, 500.0), 950.0);
     // A second report of the same frame is ignored.
-    controller->OnHandoffQueue(Key(n).producer_epoch, Key(n).frame_id, -1300.0, 0.95);
-    CHECK(controller->Statistics().handoff_queue_samples == 10);
-    // A frame that reached the GPU after it was free lowers c by 5 µs; a held
-    // frame (no limit) moves nothing.
-    frame(true, 1400.0);
-    CHECK_NEAR(controller->HandoffQueueUs(), 945.0);
-    frame(false, -1300.0);
-    CHECK_NEAR(controller->HandoffQueueUs(), 945.0);
-    CHECK(controller->Statistics().handoff_queue_samples == 11);
-    // One waited frame in twenty is the 1 − q share: c holds.
-    for (int i = 0; i < 20; ++i) frame(true, i == 0 ? -500.0 : 2000.0);
-    CHECK_NEAR(controller->HandoffQueueUs(), 945.0);
-    // Frames that reach the GPU after it is free bring c to 0, never below.
-    for (int i = 0; i < 200; ++i) frame(true, 1400.0);
-    CHECK_NEAR(controller->HandoffQueueUs(), 0.0);
-    // Frames that keep waiting raise it to one interval at most.
-    for (int i = 0; i < 120; ++i) frame(true, -1300.0);
-    CHECK_NEAR(controller->HandoffQueueUs(), kInterval);
+    controller->OnHandoffBackPressure(Key(n).producer_epoch, Key(n).frame_id, HeldBackPair(), 0.95);
+    CHECK(controller->Statistics().handoff_back_pressure_samples == 10);
+    // A streaming frame lowers c by 5 µs, a late one by 95 µs; a held frame
+    // (no limit) moves nothing.
+    frame(true, StreamingPair());
+    CHECK_NEAR(controller->HandoffBackPressureUs(), 945.0);
+    frame(true, ReleasedLatePair());
+    CHECK(controller->Statistics().handoff_released_late == 1);
+    CHECK_NEAR(controller->HandoffBackPressureUs(), 850.0);
+    frame(false, HeldBackPair());
+    CHECK_NEAR(controller->HandoffBackPressureUs(), 850.0);
+    CHECK(controller->Statistics().handoff_back_pressure_samples == 12);
+    // One held-back frame in twenty is the 1 − q share: c holds.
+    for (int i = 0; i < 20; ++i) frame(true, i == 0 ? HeldBackPair() : StreamingPair());
+    CHECK_NEAR(controller->HandoffBackPressureUs(), 850.0);
+    // Streaming frames bring c to 0, never below.
+    for (int i = 0; i < 200; ++i) frame(true, StreamingPair());
+    CHECK_NEAR(controller->HandoffBackPressureUs(), 0.0);
+    // Frames that stay held back raise it to one interval at most.
+    for (int i = 0; i < 120; ++i) frame(true, HeldBackPair());
+    CHECK_NEAR(controller->HandoffBackPressureUs(), kInterval);
 
     // A report without a pending frame is counted; invalid input is rejected.
-    controller->OnHandoffQueue(7, 123456789, -1300.0, 0.95);
-    CHECK(controller->Statistics().unmatched_handoff_queue == 1);
+    controller->OnHandoffBackPressure(7, 123456789, HeldBackPair(), 0.95);
+    CHECK(controller->Statistics().unmatched_handoff_back_pressure == 1);
     const uint64_t invalid = controller->Statistics().invalid_inputs;
-    controller->OnHandoffQueue(0, Key(n).frame_id, -1300.0, 0.95);
-    controller->OnHandoffQueue(7, Key(n).frame_id, kNaN, 0.95);
+    controller->OnHandoffBackPressure(0, Key(n).frame_id, HeldBackPair(), 0.95);
+    controller->OnHandoffBackPressure(7, Key(n).frame_id, HeldBackPair(), kNaN);
     CHECK(controller->Statistics().invalid_inputs == invalid + 2);
-    CHECK_NEAR(controller->HandoffQueueUs(), kInterval);
+    CHECK_NEAR(controller->HandoffBackPressureUs(), kInterval);
 
     // Cleared with the handoff window.
     controller->ResetBuckets();
-    CHECK_NEAR(controller->HandoffQueueUs(), 0.0);
+    CHECK_NEAR(controller->HandoffBackPressureUs(), 0.0);
 }
 
 int main()
@@ -2518,7 +2597,8 @@ int main()
     TestReleaseHeadroomBounds();
     TestReleaseHeadroomWideningFades();
     TestRenderHandoffOffset();
-    TestRenderHandoffGpuQueue();
+    TestHandoffBackPressureClassify();
+    TestRenderHandoffBackPressure();
 
     if (s_failures != 0) {
         std::fprintf(stderr, "%d lead controller checks failed\n", s_failures);

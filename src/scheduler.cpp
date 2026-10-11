@@ -249,7 +249,7 @@ std::atomic<double> s_status_pre_sleep_residual_p99_us{0.0};
 std::atomic<uint32_t> s_status_driver_limiter_interval_us{0};
 std::atomic<uint8_t> s_status_render_handoff{0};
 std::atomic<double> s_status_render_handoff_offset_us{0.0};
-std::atomic<double> s_status_render_handoff_queue_us{0.0};
+std::atomic<double> s_status_render_handoff_back_pressure_us{0.0};
 std::atomic<uint32_t> s_status_render_handoff_limited{0};
 std::atomic<uint32_t> s_status_render_handoff_stalls{0};
 }
@@ -307,7 +307,7 @@ static void PublishPacingStatus(const SchedulerPacingStatus& status) noexcept
     s_status_driver_limiter_interval_us.store(status.driver_limiter_interval_us, std::memory_order_relaxed);
     s_status_render_handoff.store(status.render_handoff, std::memory_order_relaxed);
     s_status_render_handoff_offset_us.store(status.render_handoff_offset_us, std::memory_order_relaxed);
-    s_status_render_handoff_queue_us.store(status.render_handoff_queue_us, std::memory_order_relaxed);
+    s_status_render_handoff_back_pressure_us.store(status.render_handoff_back_pressure_us, std::memory_order_relaxed);
     s_status_render_handoff_limited.store(status.render_handoff_limited, std::memory_order_relaxed);
     s_status_render_handoff_stalls.store(status.render_handoff_stalls, std::memory_order_relaxed);
     s_status_sequence.store(sequence + 2, std::memory_order_release);
@@ -372,7 +372,8 @@ bool Scheduler_ReadPacingStatus(SchedulerPacingStatus* status) noexcept
         copy.driver_limiter_interval_us = s_status_driver_limiter_interval_us.load(std::memory_order_relaxed);
         copy.render_handoff = s_status_render_handoff.load(std::memory_order_relaxed);
         copy.render_handoff_offset_us = s_status_render_handoff_offset_us.load(std::memory_order_relaxed);
-        copy.render_handoff_queue_us = s_status_render_handoff_queue_us.load(std::memory_order_relaxed);
+        copy.render_handoff_back_pressure_us =
+            s_status_render_handoff_back_pressure_us.load(std::memory_order_relaxed);
         copy.render_handoff_limited = s_status_render_handoff_limited.load(std::memory_order_relaxed);
         copy.render_handoff_stalls = s_status_render_handoff_stalls.load(std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_acquire);
@@ -971,7 +972,7 @@ static void FillControllerStatus(SchedulerPacingStatus* status) noexcept
         : s_handoff_hook_frame.load(std::memory_order_relaxed) != 0 ? 1 : 0;
     status->render_handoff_offset_us = s_source_stage.Lead().HandoffOffsetUs(
         pipeline.handoff_quantile, pipeline.allowance_us);
-    status->render_handoff_queue_us = s_source_stage.Lead().HandoffQueueUs();
+    status->render_handoff_back_pressure_us = s_source_stage.Lead().HandoffBackPressureUs();
     status->render_handoff_limited = static_cast<uint32_t>(s_handoff_limited_frames);
     status->render_handoff_stalls = static_cast<uint32_t>(s_handoff_stalls);
     status->hold_overloaded = s_hold_feasibility.Overloaded();
@@ -1186,11 +1187,11 @@ static GovernorDecision UpdatePeriodGovernor(
             s_source_stage.OnGpuActiveTime(sample.producer_epoch, sample.frame_id, sample.gpu_active_us,
                 sample.gpu_start_qpc);
         }
-        // Render handoff GPU queue term (lead_controller.h); only frames
+        // Render handoff back-pressure term (lead_controller.h); only frames
         // released under the limit use it.
-        if (sample.submit_after_gpu_free_known) {
-            s_source_stage.OnHandoffQueue(sample.producer_epoch, sample.frame_id,
-                sample.submit_after_gpu_free_us, pipeline.handoff_quantile);
+        if (sample.back_pressure_known) {
+            s_source_stage.OnHandoffBackPressure(sample.producer_epoch, sample.frame_id,
+                sample.back_pressure, pipeline.handoff_quantile);
         }
         // An elapsed GPU span can contain our time-fence wait. Never feed
         // that idle residence back as workload demand; skip the report when
@@ -1446,7 +1447,7 @@ static void NoteHandoffBeforeRelease(const PacingPlanKey& key, uint64_t handoff_
 }
 
 // A_n = w_{n−1} + d + c: the newest released frame's render handoff plus the
-// learned offset and GPU queue term (lead_controller.h). 0 when the limit cannot apply: another
+// learned offset and back-pressure term (lead_controller.h). 0 when the limit cannot apply: another
 // stream, no handoff of this producer within the last second, or a wait that
 // stalled (RenderHandoffStalled). With the marker placement the wait runs
 // here, with the owner held, like the source wait.

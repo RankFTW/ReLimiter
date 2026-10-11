@@ -1027,15 +1027,30 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
         pending_sample.present_to_gpu_end_us = sample_present_to_gpu_end_us;
         pending_sample.owned_gate_hold_us = sample_owned_gate_hold_us;
         pending_sample.queue_trend_us = sample_queue_trend_us;
-        // Render handoff GPU queue term: did this frame finish its submission
-        // while the GPU still worked on the previous frame?
-        if (const NV_LATENCY_FRAME_REPORT* previous = PreviousFrameReport(params, i);
-            previous != nullptr && r.renderSubmitEndTime > 0 && previous->gpuRenderEndTime > 0) {
-            const double submit_after_gpu_free_us =
-                ReflexSignedDeltaUs(previous->gpuRenderEndTime, r.renderSubmitEndTime);
-            if (std::abs(submit_after_gpu_free_us) < effective_interval_us * 3.0) {
-                pending_sample.submit_after_gpu_free_us = submit_after_gpu_free_us;
-                pending_sample.submit_after_gpu_free_known = true;
+        // Render handoff back-pressure term: this frame's report and the
+        // previous frame's, from this frame's RENDERSUBMIT_START.
+        if (const NV_LATENCY_FRAME_REPORT* previous = PreviousFrameReport(params, i); previous != nullptr) {
+            const uint64_t origin = r.renderSubmitStartTime;
+            const uint64_t times[] = { r.simEndTime, r.renderSubmitStartTime, r.renderSubmitEndTime,
+                r.driverStartTime, r.gpuRenderStartTime, previous->renderSubmitEndTime,
+                previous->presentEndTime, previous->gpuRenderEndTime };
+            bool known = true;
+            for (const uint64_t time : times) {
+                known = known && time > 0 &&
+                    std::abs(ReflexSignedDeltaUs(origin, time)) < effective_interval_us * 3.0;
+            }
+            if (known) {
+                HandoffBackPressureSample& pair = pending_sample.back_pressure;
+                pair.simulation_end_us = ReflexSignedDeltaUs(origin, r.simEndTime);
+                pair.render_start_us = 0.0;
+                pair.render_end_us = ReflexSignedDeltaUs(origin, r.renderSubmitEndTime);
+                pair.first_submission_us = ReflexSignedDeltaUs(origin, r.driverStartTime);
+                pair.gpu_start_us = ReflexSignedDeltaUs(origin, r.gpuRenderStartTime);
+                pair.previous_render_free_us = (std::max)(
+                    ReflexSignedDeltaUs(origin, previous->renderSubmitEndTime),
+                    ReflexSignedDeltaUs(origin, previous->presentEndTime));
+                pair.previous_gpu_end_us = ReflexSignedDeltaUs(origin, previous->gpuRenderEndTime);
+                pending_sample.back_pressure_known = true;
             }
         }
         // Capacity was checked before admission; the scheduler owner excludes

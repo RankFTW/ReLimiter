@@ -1,5 +1,6 @@
 #pragma once
 
+#include "lead_controller.h"
 #include "pacing_core_types.h"
 
 #include <cstdint>
@@ -52,13 +53,12 @@ struct ReflexFrameTimeSample {
 	// The report's gpuRenderStartTime as local QPC through the stable Reflex
 	// clock map (the lead controller's queue-order test); 0 otherwise.
 	int64_t gpu_start_qpc = 0;
-	// Render handoff GPU queue term (lead_controller.h): RENDERSUBMIT_END of
-	// this frame minus the GPU render end of the previous frame, on the
-	// driver's clock. Negative: the frame finished its submission while the
-	// GPU still worked on the previous frame. Known only when both reports
-	// carry the timestamps and |value| < 3 I.
-	double submit_after_gpu_free_us = 0.0;
-	bool submit_after_gpu_free_known = false;
+	// Render handoff back-pressure term (lead_controller.h): this frame's and
+	// the previous frame's report times, in µs on the driver's clock from this
+	// frame's RENDERSUBMIT_START. Known only when both reports carry every
+	// timestamp and each lies within 3 I of that origin.
+	HandoffBackPressureSample back_pressure{};
+	bool back_pressure_known = false;
 };
 
 // Scheduler owner only: consume accepted NvAPI latency reports in source

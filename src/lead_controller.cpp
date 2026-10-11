@@ -208,7 +208,7 @@ void LeadController::Reset(int64_t qpc_frequency) noexcept
     work_age_frames_.fill(0);
     for (LeadSampleWindow& room : room_windows_) room.Reset();
     handoff_window_.Reset();
-    handoff_queue_us_ = 0.0;
+    handoff_back_pressure_us_ = 0.0;
     lifecycle_known_ = false;
     lifecycle_ = PacingPlanKey{};
     newest_index_ = 0;
@@ -225,7 +225,7 @@ void LeadController::ResetBuckets() noexcept
     work_age_frames_.fill(0);
     for (LeadSampleWindow& room : room_windows_) room.Reset();
     handoff_window_.Reset();
-    handoff_queue_us_ = 0.0;
+    handoff_back_pressure_us_ = 0.0;
     for (PendingFrame& frame : pending_) {
         if (frame.occupied && frame.started) frame.finalized = true;
     }
@@ -396,7 +396,7 @@ double LeadController::HandoffOffsetUs(double quantile, double allowance_us) con
         offset_us = std::max(0.0, handoff_window_.Quantile(1.0 - std::clamp(quantile, 0.0, 1.0)) -
             std::max(allowance_us, 0.0));
     }
-    return offset_us + handoff_queue_us_;
+    return offset_us + handoff_back_pressure_us_;
 }
 
 LeadBucketStatus LeadController::BucketStatus(PacingRung rung, double fg_divisor) const noexcept
@@ -606,12 +606,33 @@ void LeadController::OnGpuActiveTime(uint32_t producer_epoch, uint64_t frame_id,
     ++statistics_.unmatched_gpu_active;
 }
 
-// GPU queue term (lead_controller.h): a quantile tracker on the sign of
-// v_n − g_{n−1}, one step per frame released under the limit.
-void LeadController::OnHandoffQueue(uint32_t producer_epoch, uint64_t frame_id,
-    double submit_after_gpu_free_us, double quantile) noexcept
+// Back-pressure term (lead_controller.h).
+HandoffBackPressure HandoffBackPressure_Classify(const HandoffBackPressureSample& sample) noexcept
 {
-    if (producer_epoch == 0 || !std::isfinite(submit_after_gpu_free_us) || !std::isfinite(quantile)) {
+    const double values[] = { sample.simulation_end_us, sample.render_start_us, sample.render_end_us,
+        sample.first_submission_us, sample.gpu_start_us, sample.previous_render_free_us,
+        sample.previous_gpu_end_us };
+    for (const double value : values) {
+        if (!std::isfinite(value)) return HandoffBackPressure::None;
+    }
+    if (!(sample.render_end_us > sample.render_start_us)) return HandoffBackPressure::None;
+    const bool gpu_waited = sample.gpu_start_us - sample.previous_gpu_end_us > LEAD_HANDOFF_GPU_IDLE_US;
+    // The render thread went straight from frame n − 1 into frame n: the
+    // simulation had ended before it was free.
+    const bool render_busy = sample.simulation_end_us < sample.previous_render_free_us;
+    const bool late_in_window =
+        sample.first_submission_us >= (sample.render_start_us + sample.render_end_us) / 2.0;
+    if (!gpu_waited && render_busy && late_in_window) return HandoffBackPressure::HeldBack;
+    if (gpu_waited && !render_busy) return HandoffBackPressure::ReleasedLate;
+    return HandoffBackPressure::None;
+}
+
+// One step per frame released under the limit: +q·η held back, −q·η released
+// late, −(1 − q)·η otherwise.
+void LeadController::OnHandoffBackPressure(uint32_t producer_epoch, uint64_t frame_id,
+    const HandoffBackPressureSample& sample, double quantile) noexcept
+{
+    if (producer_epoch == 0 || !std::isfinite(quantile)) {
         ++statistics_.invalid_inputs;
         return;
     }
@@ -620,19 +641,32 @@ void LeadController::OnHandoffQueue(uint32_t producer_epoch, uint64_t frame_id,
             frame.key.producer_epoch != producer_epoch || frame.key.frame_id != frame_id) {
             continue;
         }
-        if (!frame.handoff_release || frame.handoff_queue_recorded || !IsPositiveFinite(frame.interval_us)) return;
-        frame.handoff_queue_recorded = true;
+        if (!frame.handoff_release || frame.handoff_back_pressure_recorded ||
+            !IsPositiveFinite(frame.interval_us)) {
+            return;
+        }
+        frame.handoff_back_pressure_recorded = true;
         const double q = std::clamp(quantile, 0.0, 1.0);
-        const double step_us = LEAD_HANDOFF_QUEUE_STEP_FRACTION * frame.interval_us;
-        const bool waited = submit_after_gpu_free_us < 0.0;
-        handoff_queue_us_ += waited ? q * step_us : -(1.0 - q) * step_us;
-        handoff_queue_us_ = std::clamp(handoff_queue_us_, 0.0,
-            LEAD_HANDOFF_QUEUE_MAX_INTERVALS * frame.interval_us);
-        ++statistics_.handoff_queue_samples;
-        if (waited) ++statistics_.handoff_queue_waited;
+        const double step_us = LEAD_HANDOFF_BACK_PRESSURE_STEP_FRACTION * frame.interval_us;
+        switch (HandoffBackPressure_Classify(sample)) {
+        case HandoffBackPressure::HeldBack:
+            handoff_back_pressure_us_ += q * step_us;
+            ++statistics_.handoff_held_back;
+            break;
+        case HandoffBackPressure::ReleasedLate:
+            handoff_back_pressure_us_ -= q * step_us;
+            ++statistics_.handoff_released_late;
+            break;
+        case HandoffBackPressure::None:
+            handoff_back_pressure_us_ -= (1.0 - q) * step_us;
+            break;
+        }
+        handoff_back_pressure_us_ = std::clamp(handoff_back_pressure_us_, 0.0,
+            LEAD_HANDOFF_BACK_PRESSURE_MAX_INTERVALS * frame.interval_us);
+        ++statistics_.handoff_back_pressure_samples;
         return;
     }
-    ++statistics_.unmatched_handoff_queue;
+    ++statistics_.unmatched_handoff_back_pressure;
 }
 
 // ── Buckets ──
