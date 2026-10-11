@@ -2,9 +2,9 @@
 
 ## 4.0.0
 
-ReLimiter 4.0.0 replaces the pacing core. Every capped frame is now paced against one shared cadence, and ReLimiter chooses by itself where each frame is held: on the GPU where the game supports it, at the game's Present marker or Present call elsewhere. Smoothing is always on, frame generation needs no separate setup, and the settings panel shrinks to the few options most people use. Defaults are the recommended ones, so you should not need to tune anything. The default log is much quieter. Existing settings are migrated once at the first launch; see [Settings migration](#settings-migration).
+ReLimiter 4.0.0 replaces the pacing core. Every capped frame is now paced against one shared cadence, and ReLimiter chooses by itself where each frame is held: on the GPU where the game supports it, at the game's Present marker or Present call elsewhere. Smoothing is always on, frame generation needs no separate setup, and the settings panel shrinks to the few options most people use. Defaults are the recommended ones, so you should not need to tune anything. The default log is much quieter. Existing settings are migrated once at the first launch; see [Settings migration](https://github.com/RankFTW/ReLimiter/blob/main/CHANGELOG.md#settings-migration). To go back to 3.3.5, see [Rolling back to 3.3.5](https://github.com/RankFTW/ReLimiter/blob/main/CHANGELOG.md#rolling-back-to-335).
 
-See the [User Guide](docs/USER_GUIDE.md) for how to use it, [Frame Pacing](docs/FRAME_PACING.md) for how the cadence, lead and output points work, and the [Developer Reference](docs/DEVELOPER_REFERENCE.md) for diagnostics, developer settings and capture files.
+See the [User Guide](https://github.com/RankFTW/ReLimiter/blob/main/docs/USER_GUIDE.md) for how to use it, [Frame Pacing](https://github.com/RankFTW/ReLimiter/blob/main/docs/FRAME_PACING.md) for how the cadence, lead and output points work, and the [Developer Reference](https://github.com/RankFTW/ReLimiter/blob/main/docs/DEVELOPER_REFERENCE.md) for diagnostics, developer settings and capture files.
 
 ### New pacing core
 
@@ -34,7 +34,7 @@ See the [User Guide](docs/USER_GUIDE.md) for how to use it, [Frame Pacing](docs/
   - Reflex Sleep bypass: **on**. ReLimiter's own wait paces the game in place of the driver's Reflex Sleep, which reduces long frames and jitter in some games and is timing-neutral in others.
   - Source placement: **pre-Sleep** (it uses the frame-start marker while a game does not call the Reflex Sleep). With the bypass on, the Reflex driver limiter placement cannot apply.
   - Adaptive cap: **off**.
-- **Developer settings are hidden** unless `developer_settings=true` is set under `[FrameLimiter]` in `relimiter.ini` (default `false`). They cover Smoothing, Output override, GPU Wait Probes, the GPU wait budget, GPU wait A/B blocks, the stall injector, Bypass Reflex Sleep, Marker forward order, the GPU queue wait render queue, Lead coverage, FG late-frame spacing and Source placement. They sit under **Advanced** with a **Reset to defaults** button. While any of them differs from its default, the main view shows `N developer setting(s) changed from the defaults` with a **Reset** button, even when the settings are hidden. Details are in the [Developer Reference](docs/DEVELOPER_REFERENCE.md#developer-diagnostics).
+- **Developer settings are hidden** unless `developer_settings=true` is set under `[FrameLimiter]` in `relimiter.ini` (default `false`). They cover Smoothing, Output override, GPU Wait Probes, the GPU wait budget, GPU wait A/B blocks, the stall injector, Bypass Reflex Sleep, Marker forward order, the GPU queue wait render queue, Lead coverage, FG late-frame spacing and Source placement. They sit under **Advanced** with a **Reset to defaults** button. While any of them differs from its default, the main view shows `N developer setting(s) changed from the defaults` with a **Reset** button, even when the settings are hidden. Details are in the [Developer Reference](https://github.com/RankFTW/ReLimiter/blob/main/docs/DEVELOPER_REFERENCE.md#developer-diagnostics).
 - **VSync override:** **Game** (default) keeps the game's own setting; **Off** or **On** forces it.
 - Settings save automatically, and existing caps and compatible preferences are carried forward.
 
@@ -48,7 +48,7 @@ Older configurations are updated once at the first launch, when ReLimiter rewrit
 - `pacing_method=marker` becomes the developer override `output_rung=marker`; other values become `auto`. A migrated marker preference stays a developer override until **Output override** is set back to **Auto** (shown with `developer_settings=true`) so that ReLimiter chooses again.
 - Removed keys are ignored and dropped when the INI is rewritten (see **Removed**). `dmfg_output_cap` is dropped too.
 
-See [Removed and migrated keys](docs/USER_GUIDE.md#removed-and-migrated-keys) for the full list.
+See [Removed and migrated keys](https://github.com/RankFTW/ReLimiter/blob/main/docs/USER_GUIDE.md#removed-and-migrated-keys) for the full list.
 
 ### Frame generation
 
@@ -76,7 +76,7 @@ See [Removed and migrated keys](docs/USER_GUIDE.md#removed-and-migrated-keys) fo
 - **Display Pacing and PQI** score the frames that actually reached the display: Consistency 40%, Stutter 30% and Animation 30% (Consistency and Stutter only when there is no animation data). They need display timing and show `-` until it is available. They no longer need `native_pcl_enabled`: without ETW display times, DX11 and DX12 games use DXGI frame statistics, and the OSD labels the source. While frame generation is presenting, DXGI statistics are not used and PC latency collection is needed for display times. A DXGI display time earlier than the frame's Present call, or not after the previous frame's display, leaves the frame unmeasured; Windows reports such times for most frames when it composes the game window (for example a game scaled by display scaling), and they used to show as long frames.
 - **OSD anchors and OLED Care.** The OSD has inward-facing anchors and clockwise corner cycling. OLED Care offers manual and idle activation, with keyboard, mouse and XInput activity detection.
 - **Quieter default log.** At the default `log_level=warn`, `relimiter_<GameName>.log` records only warnings and errors: something failed, data was lost, an INI value was invalid, or a developer setting is on. Messages that report normal events (device and swapchain capture, display and VRR detection, the first Reflex marker, route changes, overload pauses, Dynamic MFG passthrough, PC latency session lines and similar) are recorded at `info` level, and the NvAPI marker census at `debug`. Turn on **Advanced Logging** (`info`) before reproducing a problem.
-- **Telemetry Logging** writes two capture families, `relimiter_pacing_*` and `relimiter_pacing_events_*`; see [Telemetry & Logging](docs/USER_GUIDE.md#telemetry--logging). The offline `analyze_pacing.py` analyzer reads them. Native PC latency event loss now marks a 2 s window instead of disabling measurement for the rest of the session.
+- **Telemetry Logging** writes two capture families, `relimiter_pacing_*` and `relimiter_pacing_events_*`; see [Telemetry & Logging](https://github.com/RankFTW/ReLimiter/blob/main/docs/USER_GUIDE.md#telemetry--logging). The offline `analyze_pacing.py` analyzer reads them. Native PC latency event loss now marks a 2 s window instead of disabling measurement for the rest of the session.
 
 ### Fixes
 
@@ -95,12 +95,19 @@ See [Removed and migrated keys](docs/USER_GUIDE.md#removed-and-migrated-keys) fo
 ### Known limitations
 
 - The GPU waits (GPU queue wait and FG input wait) need the 64-bit addon, DX12 and native Reflex markers. The GPU queue wait without frame generation also needs a VRR display.
-- **DX11, OpenGL and the 32-bit addon were not tested live with the new pacing core, and Vulkan only in one game.** They use marker holds or Present-based pacing. Compatibility can vary between games, particularly older Vulkan titles.
+- **Not tested live with the new pacing core:** OpenGL, the 32-bit addon, DX11 games with Reflex, fixed-refresh (non-VRR) displays and Dynamic MFG. DX11 without Reflex and Vulkan were tested in one game each. These paths use marker holds or Present-based pacing; compatibility can vary between games, particularly older Vulkan titles.
 - **Frame generation on Vulkan is not held after the source wait** (`source_only`, reason `api`). The cap and the frame generation multiplier apply, but the FG input wait needs DX12, so real frames reach frame generation with the game's own frame-time variation. This can look uneven when the game is close to its GPU limit.
 - **Telemetry Logging records frame rows only in DXGI games** (DX10, DX11, DX12). In Vulkan, OpenGL and DX9 games the `relimiter_pacing_` file has only its header; the events file is still written.
 - Adaptive cap and the overload pause cannot remove shader-compilation, loading or other isolated game stalls, and no setting guarantees that every displayed frame meets its target.
-- Cross-thread games (frame-start marker and Present on different threads) need PC latency collection to use the GPU waits; see [Optional PC Latency Measurement](docs/USER_GUIDE.md#optional-pc-latency-measurement).
+- Cross-thread games (frame-start marker and Present on different threads) need PC latency collection to use the GPU waits; see [Optional PC Latency Measurement](https://github.com/RankFTW/ReLimiter/blob/main/docs/USER_GUIDE.md#optional-pc-latency-measurement).
 - Frame generation switched on in the game takes a few moments to qualify; until then nothing is held (`fg_unqualified`).
+
+### Rolling back to 3.3.5
+
+1. Close the game.
+2. Download `relimiter.addon64` (and `relimiter.addon32` for 32-bit games) from the [3.3.5 release](https://github.com/RankFTW/ReLimiter/releases/tag/v3.3.5) and replace the 4.0.0 files next to the ReShade DLL.
+3. Keep `relimiter.ini`. 3.3.5 reads the settings it knows, such as the cap, the background and FG-off caps, the OSD layout and keybinds, uses its own defaults for the rest and leaves the 4.0.0 keys in the file. To start 3.3.5 from its defaults instead, delete `relimiter.ini` before launching the game.
+4. Updating to 4.0.0 again later keeps the file: it still records `config_version=4`, so the one-time migration does not run again, and keys 4.0.0 no longer uses are dropped.
 
 ## 3.3.1
 
