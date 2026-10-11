@@ -117,8 +117,9 @@ int64_t CadenceGrid_LateToleranceTicks(
 // before Present is forwarded); a frame whose predecessor is not recorded
 // yet gets no floor. With the developer A/B fg_late_spacing the FG input
 // wait later raises a frame's record to its readiness when the frame reached
-// its wait after the Signal (RecordLater), and resolves the next frame's
-// floor again just before its Signal.
+// its wait after the Signal (RecordLater), resolves the next frame's floor
+// again just before its Signal, and takes the floor's slack from the
+// displayed interval I / D (CadenceGrid_ResolveOutputTarget).
 //
 // 16 slots indexed by grid_index & 15, each a seqlock over atomic fields.
 // Writers for indices less than 16 apart never share a slot; the rare
@@ -167,9 +168,13 @@ private:
 extern CadenceGridOutputTracker g_cadence_output_tracker;
 
 // Output target of grid index n with the spacing floor:
-//   max(T(n), o(n - 1) + I - slack), slack = CadenceGrid_LateToleranceTicks(I) / 2,
-// where I is the interval of the segment resolving n and o(n - 1) the output
-// `tracker` holds for (controller_generation, n - 1); no floor when unknown.
+//   max(T(n), o(n - 1) + I - slack), slack = CadenceGrid_LateToleranceTicks(I / D) / 2,
+// where I is the interval of the segment resolving n, D = display_divisor
+// (displayed frames per grid frame; 0 and 1 both mean I itself) and
+// o(n - 1) the output `tracker` holds for (controller_generation, n - 1); no
+// floor when unknown. D > 1 serves frame generation, where a real frame's
+// error lands undivided on one displayed interval of I / D, so the floor
+// allows the same share of the displayed interval as without it.
 // When snapped, a floored target moves to the first edge at or after the
 // floor. *floored (optional) is true when the floor won. False (Stale)
 // exactly when CadenceGrid_TargetOf is false.
@@ -179,7 +184,8 @@ bool CadenceGrid_ResolveOutputTarget(
     uint64_t grid_index,
     const CadenceGridOutputTracker& tracker,
     int64_t* target_qpc,
-    bool* floored) noexcept;
+    bool* floored,
+    uint32_t display_divisor = 1) noexcept;
 
 // ── Owner ──
 

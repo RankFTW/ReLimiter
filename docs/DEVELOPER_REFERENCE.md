@@ -117,10 +117,11 @@ Turning it off removes two command lists and two fence signals per frame from th
 
 ### FG late-frame spacing
 
-`fg_late_spacing` (default **off**, 64-bit, `fg_input_wait` only). When a real frame reaches the FG input wait after its release time, it enters frame generation when its GPU work finishes. Off, the next real frame is released on its original target, so the displayed frame after the late one can follow the generated frame by only a few milliseconds. On, ReLimiter records the late frame where it actually passed and holds the next real frame at least one frame interval minus half the late tolerance after it, the same spacing rule the other outputs use ([No catch-up burst](FRAME_PACING.md#no-catch-up-burst)).
+`fg_late_spacing` (default **off**, 64-bit, `fg_input_wait` only). When a real frame reaches the FG input wait after its release time, it enters frame generation when its GPU work finishes, and frame generation shows that whole delay on one displayed interval. Off, the next real frame is released on its original target, so the displayed interval after the late one is short by the same amount. On, ReLimiter records the late frame where it actually passed and holds the next real frame at least one frame interval minus an eighth of the displayed interval after it, so each displayed interval is shortened by at most about an eighth, the same share the outputs without frame generation allow ([No catch-up burst](FRAME_PACING.md#no-catch-up-burst)).
 
-- Only the release of the frame after a late one moves, and only later; the late frame itself is unchanged.
-- The grid's late-output evidence, the overload pause and the Adaptive cap see the same frames as with it off.
+- Only releases after a late frame move, and only later; the late frame itself is unchanged. Recovering from a long hitch takes a few more frames, each held a little later.
+- A release moved more than the late tolerance (a quarter of the real-frame interval) restarts the cadence, as a late release does on the other outputs; such restarts count for the overload pause and the Adaptive cap.
+- A frame that reaches the FG input after its original target can be held to the moved target instead of passing late.
 - Compare jitter above 2 and 4 ms, long frames and PC Latency, one setting per capture in the same scene. The log warns while it is on and logs the first moved release at INFO.
 
 ### Source placement

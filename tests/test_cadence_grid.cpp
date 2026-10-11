@@ -1274,6 +1274,25 @@ namespace
             CHECK(TargetOf(grid, 5) == t5); // the grid itself does not move
         }
         {
+            // Frame generation, D displayed frames per grid frame: the slack
+            // comes from I / D. D = 2: tol = max(50,000 / 4, 5,000) = 12,500
+            // ticks, slack 6,250 instead of 12,500; D = 0 and 1 keep I.
+            CadenceGridOutputTracker tracker;
+            const auto resolve = [&](uint32_t divisor) {
+                return CadenceGrid_ResolveOutputTarget(
+                    snapshot, kGeneration, 5, tracker, &target, &floored, divisor);
+            };
+            CHECK(tracker.Record(kGeneration, 4, t4 + 20000));
+            CHECK(resolve(0) && target == t5 + 7500 && floored);
+            CHECK(resolve(1) && target == t5 + 7500 && floored);
+            CHECK(resolve(2) && target == t4 + 20000 + 100000 - 6250 && floored);
+            CHECK(target == t5 + 13750);
+            CHECK(tracker.Record(kGeneration, 4, t4 + 6250)); // lateness exactly the slack
+            CHECK(resolve(2) && target == t5 && !floored);
+            CHECK(tracker.Record(kGeneration, 4, t4 + 6251));
+            CHECK(resolve(2) && target == t5 + 1 && floored);
+        }
+        {
             // Executors hold to the floored target and record it: lateness
             // decays by slack per frame and never ratchets later.
             CadenceGridOutputTracker tracker;

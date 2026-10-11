@@ -570,8 +570,9 @@ void DrainFgReadback(Queue& queue,int64_t* next,bool before_signal) noexcept {
 // fg_late_spacing, when an FG input's Signal is due: read back the FG inputs
 // whose GPU work has finished, so a previous frame that reached its wait
 // after its Signal is recorded where it passed, and resolve the output
-// spacing floor again. A frame after a late one then enters frame generation
-// no sooner than I − slack after it instead of on its original target. The
+// spacing floor again with its slack from the displayed interval I / D. A
+// frame after a late one then enters frame generation no sooner than
+// I − slack after it instead of on its original target. The
 // target only moves later, never past the H3 horizon from now, and only once
 // the input callback has recorded this frame's output (it arms the wait
 // first), so the raised record is the one the next frame's floor reads.
@@ -585,7 +586,8 @@ void FloorAfterLatePass(Queue& queue,Ticket& ticket,int64_t* next) noexcept {
     CadenceGridSnapshot snapshot;
     int64_t target=0;
     if(!g_cadence_grid_publication.Read(&snapshot) ||
-        !CadenceGrid_ResolveOutputTarget(snapshot,generation,index,g_cadence_output_tracker,&target,nullptr) ||
+        !CadenceGrid_ResolveOutputTarget(snapshot,generation,index,g_cadence_output_tracker,&target,nullptr,
+            static_cast<uint32_t>(ticket.fg_multiplier>1?ticket.fg_multiplier:1)) ||
         target<=ticket.trace.target_qpc)return;
     const double interval_us=ticket.trace.interval_qpc>0
         ?static_cast<double>(ticket.trace.interval_qpc)*1e6/static_cast<double>(frequency):0.0;
@@ -963,13 +965,15 @@ struct OutputDecision {
 };
 // Grid snapshot + spacing floor -> T. Stale, Late (now >= T), Undeliverable
 // beyond the horizon clamp(3 I, 2 ms, 100 ms), otherwise Held (queue the wait).
-OutputDecision Decide(const PacingFramePlan& plan,int64_t now) noexcept {
+// display_divisor: the floor's slack from I / D (FG input with fg_late_spacing),
+// 1 for I itself.
+OutputDecision Decide(const PacingFramePlan& plan,int64_t now,uint32_t display_divisor) noexcept {
     OutputDecision decision;
     CadenceGridSnapshot snapshot;
     bool floored=false;
     if(!g_cadence_grid_publication.Read(&snapshot) ||
         !CadenceGrid_ResolveOutputTarget(snapshot,plan.key.controller_generation,plan.grid_index,
-            g_cadence_output_tracker,&decision.target,&floored)) {
+            g_cadence_output_tracker,&decision.target,&floored,display_divisor)) {
         decision.status=PacingPlanStatus::Stale;decision.gate=GpuPresentStatus::PlanStale;decision.target=0;
         return decision;
     }
@@ -1223,7 +1227,7 @@ GpuPresentExecution GpuPresent_Execute(NativeGateCall* native,GpuReadinessCall* 
     ApplyPlan(plan,&trace);
     PushStage(plan.key,plan.grid_index,PacingStageEventKind::PresentCall,PacingRung::GpuQueueWait,
         native->trace.native_arrival_qpc>0?native->trace.native_arrival_qpc:begin);
-    const auto decision=Decide(plan,Qpc());
+    const auto decision=Decide(plan,Qpc(),1);
     ApplyDecision(decision,&trace);
     auto outcome=decision.status;
     auto execution=GpuPresentExecution::Handled;
@@ -1350,7 +1354,9 @@ bool GpuPresent_BeginFgInput(uint64_t native,const GpuPresentFgInput& input) noe
     }
     fg_pending_queue=queue;fg_pending_measurement=measurement;fg_pending_transaction=input.transaction;
     Leave(); // pin remains held through the original input callback
-    const auto decision=Decide(plan,Qpc());
+    // fg_late_spacing: the floor's slack from the displayed interval I / D,
+    // since DLSS-G shows a real frame's error undivided on one of them.
+    const auto decision=Decide(plan,Qpc(),PacingPipeline_GetConfig().fg_late_spacing?static_cast<uint32_t>(multiplier):1u);
     ApplyDecision(decision,&trace);
     auto outcome=decision.status;
     if(outcome==PacingPlanStatus::Held) {
