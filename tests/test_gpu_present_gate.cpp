@@ -709,6 +709,22 @@ void TestExecutor() {
     fake_clock+=1000;heartbeat=fake_clock;Service();
     CHECK(!queue.fg_refresh.load() && queue.fg_native.load()==0x1000 && queue.fg_ready.load());
     fg_context=false;g_fg_multiplier=1;queue.fg_ready=false;queue.fg_native=queue.fg_swapchain=0;queue.fg_thread=0;
+    // FG input decision with fg_late_spacing (displayed_slack): the floor's
+    // slack comes from the plan's displayed interval I / fg_divisor. Frame 40
+    // came out 3,000 ticks late; I = 11,111 ticks. From I: tol 2,777, slack
+    // 1,388. From I / 2 (2x frame generation): tol max(1,388.875, 500) =
+    // 1,388, slack 694.
+    {
+        PacingFramePlan plan;
+        plan.key=PlanKey(41);plan.grid_index=41;plan.interval_us=kInterval;plan.rung=PacingRung::FgInputWait;
+        plan.mode=PacingTimingMode::Vrr;plan.output_target_qpc=GridTarget(41);plan.fg_divisor=2.0;
+        CHECK(g_cadence_output_tracker.Record(FrameTimeline_CurrentControllerGeneration(),40,GridTarget(40)+3000));
+        const auto now=GridTarget(41)-5000;
+        auto decision=Decide(plan,now,false);
+        CHECK(decision.status==PacingPlanStatus::Held && decision.target==GridTarget(41)+3000-1388);
+        decision=Decide(plan,now,true);
+        CHECK(decision.status==PacingPlanStatus::Held && decision.target==GridTarget(41)+3000-694);
+    }
 
     // UINT64_MAX on the done fence is device removal, never retirement.
     PublishRung(PacingRung::GpuQueueWait);

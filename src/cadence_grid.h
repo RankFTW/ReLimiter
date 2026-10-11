@@ -170,10 +170,11 @@ extern CadenceGridOutputTracker g_cadence_output_tracker;
 // Output target of grid index n with the spacing floor:
 //   max(T(n), o(n - 1) + I - slack), slack = CadenceGrid_LateToleranceTicks(I / D) / 2,
 // where I is the interval of the segment resolving n, D = display_divisor
-// (displayed frames per grid frame; 0 and 1 both mean I itself) and
+// (displayed frames per grid frame: the plan's fg_divisor, fractional while
+// it ramps; values at or below 1 and non-finite ones mean I itself) and
 // o(n - 1) the output `tracker` holds for (controller_generation, n - 1); no
 // floor when unknown. D > 1 serves frame generation, where a real frame's
-// error lands undivided on one displayed interval of I / D, so the floor
+// error lands mostly on one displayed interval of I / D, so the floor
 // allows the same share of the displayed interval as without it.
 // When snapped, a floored target moves to the first edge at or after the
 // floor. *floored (optional) is true when the floor won. False (Stale)
@@ -185,7 +186,7 @@ bool CadenceGrid_ResolveOutputTarget(
     const CadenceGridOutputTracker& tracker,
     int64_t* target_qpc,
     bool* floored,
-    uint32_t display_divisor = 1) noexcept;
+    double display_divisor = 1.0) noexcept;
 
 // ── Owner ──
 

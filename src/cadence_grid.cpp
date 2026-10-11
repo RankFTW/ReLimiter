@@ -356,7 +356,7 @@ bool CadenceGrid_ResolveOutputTarget(
     const CadenceGridOutputTracker& tracker,
     int64_t* target_qpc,
     bool* floored,
-    uint32_t display_divisor) noexcept
+    double display_divisor) noexcept
 {
     if (floored != nullptr) *floored = false;
     int64_t target = 0;
@@ -373,8 +373,9 @@ bool CadenceGrid_ResolveOutputTarget(
     }
     // TargetOf succeeded, so a segment resolves grid_index.
     const double interval_ticks = SegmentFor(snapshot, grid_index)->interval_ticks;
-    const double displayed_ticks =
-        display_divisor > 1 ? interval_ticks / static_cast<double>(display_divisor) : interval_ticks;
+    const double displayed_ticks = std::isfinite(display_divisor) && display_divisor > 1.0
+        ? interval_ticks / display_divisor
+        : interval_ticks;
     const int64_t slack_ticks =
         CadenceGrid_LateToleranceTicks(displayed_ticks, snapshot.qpc_frequency) / 2;
     ExactQpc floor_exact{};

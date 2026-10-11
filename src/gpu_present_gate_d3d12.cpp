@@ -45,6 +45,7 @@ struct Ticket {
     bool signalled=false;
     bool fg=false;
     int fg_multiplier=0;
+    double fg_divisor=1.0; // the plan's: displayed frames per grid frame
     uint64_t fg_epoch=0,fg_binding=0;
     GpuTimestampSlot* post_slot=nullptr;
     GpuReadinessSample post_sample{};
@@ -587,7 +588,7 @@ void FloorAfterLatePass(Queue& queue,Ticket& ticket,int64_t* next) noexcept {
     int64_t target=0;
     if(!g_cadence_grid_publication.Read(&snapshot) ||
         !CadenceGrid_ResolveOutputTarget(snapshot,generation,index,g_cadence_output_tracker,&target,nullptr,
-            static_cast<uint32_t>(ticket.fg_multiplier>1?ticket.fg_multiplier:1)) ||
+            ticket.fg_divisor) ||
         target<=ticket.trace.target_qpc)return;
     const double interval_us=ticket.trace.interval_qpc>0
         ?static_cast<double>(ticket.trace.interval_qpc)*1e6/static_cast<double>(frequency):0.0;
@@ -822,6 +823,7 @@ struct EnqueueRequest {
     PacingPlanKey key{};
     bool fg=false;
     int fg_multiplier=0;
+    double fg_divisor=1.0; // the plan's
     uint64_t fg_binding=0;
 };
 // trace->target_qpc is the resolved output target; trace->grid_index the plan's
@@ -884,7 +886,7 @@ bool Enqueue(const EnqueueRequest& request,GpuPresentTrace* trace) noexcept {
     ticket.observer=context.identity.observer;ticket.prediction=context.identity.prediction;
     ticket.native_swapchain=span->native_swapchain;ticket.source=context.source_frame;
     ticket.key=request.key;
-    ticket.fg=request.fg;ticket.fg_multiplier=request.fg_multiplier;
+    ticket.fg=request.fg;ticket.fg_multiplier=request.fg_multiplier;ticket.fg_divisor=request.fg_divisor;
     ticket.fg_binding=request.fg_binding;
     ticket.fg_epoch=fg_epoch.load(std::memory_order_acquire);
     const auto abandon_prepared=[&] {
@@ -965,15 +967,16 @@ struct OutputDecision {
 };
 // Grid snapshot + spacing floor -> T. Stale, Late (now >= T), Undeliverable
 // beyond the horizon clamp(3 I, 2 ms, 100 ms), otherwise Held (queue the wait).
-// display_divisor: the floor's slack from I / D (FG input with fg_late_spacing),
-// 1 for I itself.
-OutputDecision Decide(const PacingFramePlan& plan,int64_t now,uint32_t display_divisor) noexcept {
+// displayed_slack (FG input with fg_late_spacing): the floor's slack from the
+// displayed interval I / plan.fg_divisor, since DLSS-G shows a real frame's
+// error mostly on one displayed interval; otherwise from I.
+OutputDecision Decide(const PacingFramePlan& plan,int64_t now,bool displayed_slack) noexcept {
     OutputDecision decision;
     CadenceGridSnapshot snapshot;
     bool floored=false;
     if(!g_cadence_grid_publication.Read(&snapshot) ||
         !CadenceGrid_ResolveOutputTarget(snapshot,plan.key.controller_generation,plan.grid_index,
-            g_cadence_output_tracker,&decision.target,&floored,display_divisor)) {
+            g_cadence_output_tracker,&decision.target,&floored,displayed_slack?plan.fg_divisor:1.0)) {
         decision.status=PacingPlanStatus::Stale;decision.gate=GpuPresentStatus::PlanStale;decision.target=0;
         return decision;
     }
@@ -1227,7 +1230,7 @@ GpuPresentExecution GpuPresent_Execute(NativeGateCall* native,GpuReadinessCall* 
     ApplyPlan(plan,&trace);
     PushStage(plan.key,plan.grid_index,PacingStageEventKind::PresentCall,PacingRung::GpuQueueWait,
         native->trace.native_arrival_qpc>0?native->trace.native_arrival_qpc:begin);
-    const auto decision=Decide(plan,Qpc(),1);
+    const auto decision=Decide(plan,Qpc(),false);
     ApplyDecision(decision,&trace);
     auto outcome=decision.status;
     auto execution=GpuPresentExecution::Handled;
@@ -1354,9 +1357,7 @@ bool GpuPresent_BeginFgInput(uint64_t native,const GpuPresentFgInput& input) noe
     }
     fg_pending_queue=queue;fg_pending_measurement=measurement;fg_pending_transaction=input.transaction;
     Leave(); // pin remains held through the original input callback
-    // fg_late_spacing: the floor's slack from the displayed interval I / D,
-    // since DLSS-G shows a real frame's error undivided on one of them.
-    const auto decision=Decide(plan,Qpc(),PacingPipeline_GetConfig().fg_late_spacing?static_cast<uint32_t>(multiplier):1u);
+    const auto decision=Decide(plan,Qpc(),PacingPipeline_GetConfig().fg_late_spacing);
     ApplyDecision(decision,&trace);
     auto outcome=decision.status;
     if(outcome==PacingPlanStatus::Held) {
@@ -1364,7 +1365,7 @@ bool GpuPresent_BeginFgInput(uint64_t native,const GpuPresentFgInput& input) noe
         PresentTimelineSpan span{};
         span.native_swapchain=input.native;span.key.swapchain_generation=input.swapchain;
         EnqueueRequest request;request.native=native;request.context=context;request.span=&span;request.key=plan.key;
-        request.fg=true;request.fg_multiplier=multiplier;request.fg_binding=input.binding;
+        request.fg=true;request.fg_multiplier=multiplier;request.fg_divisor=plan.fg_divisor;request.fg_binding=input.binding;
         if(!Enqueue(request,&trace))outcome=AdmissionOutcome(trace);
     }
     trace.queue=native;trace.swapchain=input.swapchain;trace.present_sequence=0;
