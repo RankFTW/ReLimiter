@@ -19,7 +19,3 @@
 ## 32-bit
 - [ ] **DX9 VSync override requires restart** — Currently modifies `sync_interval` at swapchain creation (`on_create_swapchain`). Could potentially force a `Reset` call to apply immediately, but this is risky for game stability.
 - [ ] **Monitor selector doesn't work with DX9 exclusive fullscreen** — `SetWindowPos` forces loss of exclusive mode → minimize loop. Works fine with Fake Fullscreen enabled. Low priority — document as known limitation.
-
-## Code Cleanup
-- [ ] **hw_monitor.cpp** — `HWMonitor_Update()` is an empty no-op still called every frame from `osd.cpp`. Remove the call and the function.
-- [ ] **display_state.cpp** — `OnGSyncStateChange` has `// TODO: pll.Reanchor(QPC())` on the VRR → fixed switch, but no `Reanchor` function exists. Check whether that switch needs anything beyond `UpdateVBlankThreadForMode`, then remove the comment.

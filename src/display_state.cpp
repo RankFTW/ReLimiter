@@ -279,7 +279,6 @@ void OnGSyncStateChange(bool new_gsync_active) {
     } else if (!new_gsync_active && current == PacingMode::VRR) {
         next = PacingMode::Fixed;
         g_pacing_mode.store(next, std::memory_order_release);
-        // TODO: pll.Reanchor(QPC())
     }
     UpdateVBlankThreadForMode(next);
 }

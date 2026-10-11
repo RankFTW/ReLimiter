@@ -1894,6 +1894,13 @@ void OnMarker(
     // One configuration snapshot for this frame's resolve, governor and plan.
     const PacingPipelineConfig config = PacingPipeline_GetConfig();
     // Vblank edges feed the fixed-refresh phase tracker on the owner only.
+    // Entering fixed refresh starts it over, as at startup: a phase kept from
+    // an earlier fixed period is stale, and the grid's ModeChange epoch would
+    // snap to it until new edges corrected it.
+    const bool vrr = g_pacing_mode.load(std::memory_order_relaxed) == PacingMode::VRR;
+    static bool s_tracking_fixed_refresh = false;
+    if (!vrr && !s_tracking_fixed_refresh) g_vblank_phase.Reset();
+    s_tracking_fixed_refresh = !vrr;
     int64_t latest_vblank_qpc = 0;
     if (VBlank_ConsumeLatest(&latest_vblank_qpc)) {
         g_vblank_phase.IngestVBlank(latest_vblank_qpc, GetQPCFrequency(),
@@ -1902,7 +1909,7 @@ void OnMarker(
 
     PacingRuntimeState runtime{};
     runtime.swapchain_valid = true;
-    runtime.vrr = g_pacing_mode.load(std::memory_order_relaxed) == PacingMode::VRR;
+    runtime.vrr = vrr;
     // Pre-Sleep needs SIMULATION_START as the enforcement marker: with a
     // later marker the Sleep precedes the simulation, and the prediction and
     // the residual would include it.

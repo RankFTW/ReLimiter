@@ -448,11 +448,6 @@ bool HWMonitor_Shutdown() {
     return true;
 }
 
-void HWMonitor_Update() {
-    // No-op. Polling runs on the background thread.
-    // Kept for API compatibility — callers don't need to change.
-}
-
 HWMonitorData HWMonitor_GetData() {
     for (;;) {
         const uint64_t before =

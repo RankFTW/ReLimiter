@@ -2541,9 +2541,6 @@ static void DrawOSDImpl() {
     }
     if (!g_config.osd_enabled) return;
 
-    // Update hardware sensors (throttled internally to ~1Hz)
-    HWMonitor_Update();
-
     // Retry NGX hook installation for games where DLLs load late.
     // TryInstall is idempotent — no-ops once hooks are installed.
     // Stops after ~30 seconds.
