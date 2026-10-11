@@ -400,16 +400,20 @@ namespace
         PacingCapabilities capabilities = QualifiedDx12();
         capabilities.x64 = false;
         result = Resolve(config, capabilities, ActiveFg());
-        CHECK_RESULT(result, Vrr, Marker, SourceOnly, FgUnqualified);
+        CHECK_RESULT(result, Vrr, Marker, SourceOnly, Architecture);
         CHECK_LEAD(result, kDefaultLeadQuantile, 500.0);
         capabilities = QualifiedDx12();
         capabilities.api = PacingApi::DX11;
-        CHECK_RESULT(Resolve(config, capabilities, ActiveFg()), Vrr, Marker, SourceOnly, FgUnqualified);
+        CHECK_RESULT(Resolve(config, capabilities, ActiveFg()), Vrr, Marker, SourceOnly, Api);
+        // Vulkan can never qualify: the reason names the API, not a pending route.
+        CHECK_RESULT(Resolve(config, VulkanPcl(), ActiveFg()), Vrr, Marker, SourceOnly, Api);
+        capabilities = QualifiedDx12();
+        capabilities.route = PacingRoute::PclMarkers;
+        CHECK_RESULT(Resolve(config, capabilities, ActiveFg()), Vrr, Marker, SourceOnly, NoNativeRoute);
         // A ready GPU queue never substitutes for the FG input route.
         capabilities = QualifiedDx12();
         capabilities.fg_input_route_ready = false;
         CHECK_RESULT(Resolve(config, capabilities, ActiveFg()), Vrr, Marker, SourceOnly, FgUnqualified);
-        CHECK_RESULT(Resolve(config, VulkanPcl(), ActiveFg()), Vrr, Marker, SourceOnly, FgUnqualified);
     }
 
     // ── Rules 7 and 8: GPU queue wait, else marker hold ──

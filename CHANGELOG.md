@@ -95,7 +95,9 @@ See [Removed and migrated keys](docs/USER_GUIDE.md#removed-and-migrated-keys) fo
 ### Known limitations
 
 - The GPU waits (GPU queue wait and FG input wait) need the 64-bit addon, DX12 and native Reflex markers. The GPU queue wait without frame generation also needs a VRR display.
-- **DX11, Vulkan, OpenGL and the 32-bit addon were not tested live with the new pacing core.** They use marker holds or Present-based pacing. Compatibility can vary between games, particularly older Vulkan titles.
+- **DX11, OpenGL and the 32-bit addon were not tested live with the new pacing core, and Vulkan only in one game.** They use marker holds or Present-based pacing. Compatibility can vary between games, particularly older Vulkan titles.
+- **Frame generation on Vulkan is not held after the source wait** (`source_only`, reason `api`). The cap and the frame generation multiplier apply, but the FG input wait needs DX12, so real frames reach frame generation with the game's own frame-time variation. This can look uneven when the game is close to its GPU limit.
+- **Telemetry Logging records frame rows only in DXGI games** (DX10, DX11, DX12). In Vulkan, OpenGL and DX9 games the `relimiter_pacing_` file has only its header; the events file is still written.
 - Adaptive cap and the overload pause cannot remove shader-compilation, loading or other isolated game stalls, and no setting guarantees that every displayed frame meets its target.
 - Cross-thread games (frame-start marker and Present on different threads) need PC latency collection to use the GPU waits; see [Optional PC Latency Measurement](docs/USER_GUIDE.md#optional-pc-latency-measurement).
 - Frame generation switched on in the game takes a few moments to qualify; until then nothing is held (`fg_unqualified`).

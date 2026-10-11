@@ -212,11 +212,11 @@ Below the status line itself (not under **Details**), `Dynamic frame generation:
 | `idle_cap` | Background FPS, FG-Off Cap or OLED Care is active. |
 | `present_route` | The game is paced at Present calls (no markers); nothing is held after the source wait. |
 | `architecture` | The GPU wait needs the 64-bit addon. |
-| `api` | The GPU wait needs DX12, for example on DX11 or Vulkan with markers. |
+| `api` | The GPU wait needs DX12, for example on DX11 or Vulkan with markers. With frame generation on Vulkan, nothing is held after the source wait. |
 | `fixed_refresh` | The GPU queue wait needs VRR. |
 | `no_native_route` | The GPU wait route has not qualified yet, or the markers come from Streamline PCL rather than native Reflex. |
 | `no_gpu_queue` | The GPU queue wait is not ready yet. |
-| `fg_unqualified` | Frame generation is presenting but its FG input route has not qualified; nothing is held. |
+| `fg_unqualified` | Frame generation is presenting on DX12 with native Reflex markers, but its FG input route has not qualified yet; nothing is held. |
 | `infeasible` | The [overload pause](#overload-pause) stopped holding frames. |
 | `smoothing_off`, `override` | A developer setting changed the output; see [Developer Settings](#developer-settings). |
 
@@ -433,7 +433,7 @@ The panel and OSD can show the detected multiplier and the corresponding render 
 | **Dynamic MFG** | Leaves pacing to the driver; see the next section. |
 | **NVIDIA Smooth Motion** | Supports detection and the normal cap, without an FG input wait. |
 
-Detection and the FG input wait are separate. Until the FG input route qualifies, frame generation runs with `source_only` and the reason `fg_unqualified`: the cap cadence still applies, but nothing is held after the source wait.
+Detection and the FG input wait are separate. Until the FG input route qualifies, frame generation runs with `source_only` and the reason `fg_unqualified`: the cap cadence still applies, but nothing is held after the source wait. Where the FG input wait cannot run at all, the reason names the missing requirement instead, for example `api` on Vulkan.
 
 ### FG Input Wait Requirements
 
@@ -516,7 +516,7 @@ Recording starts off on every game launch. Each time it is turned on, a new capt
 
 | File prefix | Contents |
 |-------------|----------|
-| `relimiter_pacing_` | One row per displayed frame, or per Present call when no display time is available: ReLimiter's release and frame plan, the game's Present call, GPU wait and readiness timing, Reflex timing, the display time and its source (ETW or DXGI), Display Pacing measurements, the Adaptive cap value and PC Latency when PC latency collection is on |
+| `relimiter_pacing_` | One row per displayed frame, or per Present call when no display time is available: ReLimiter's release and frame plan, the game's Present call, GPU wait and readiness timing, Reflex timing, the display time and its source (ETW or DXGI), Display Pacing measurements, the Adaptive cap value and PC Latency when PC latency collection is on. Rows are written only for DXGI games (DX10, DX11, DX12); in Vulkan, OpenGL and DX9 games the file has only its header |
 | `relimiter_pacing_events_` | Capture start and end, pipeline changes, cadence restarts, Adaptive cap and hold changes, injected stalls, measurement loss, PC latency status changes and Display Pacing snapshots |
 
 Display times come from [PC latency collection](#optional-pc-latency-measurement) or, on DX11 and DX12 without it, from DXGI frame statistics. PC Latency needs PC latency collection. Without display times, rows still record releases, Present calls and the available GPU and Reflex timing, but the display columns stay empty. An empty cell means the value was unavailable, not zero. Not every game supplies every measurement. Release and Present times describe ReLimiter's pacing, not what reached the display, especially with frame generation. Column-level detail is in the [Developer Reference](DEVELOPER_REFERENCE.md#capture-files).

@@ -12,6 +12,7 @@
 #include "feedback.h"
 #include "runtime_lifecycle.h"
 #include "logger.h"
+#include "swapchain_manager.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -663,6 +664,8 @@ void CheckDeferredFGInference() {
     const uint64_t write_sequence = BeginOptionsStateWrite();
     bool promoted = false;
     uint32_t window_getstate_calls = 0;
+    bool vulkan_without_evidence_source = false;
+    bool compat_without_evidence = false;
     if (s_fg_inference_pending.load(std::memory_order_relaxed) &&
         s_fg_inference_start_qpc.load(std::memory_order_relaxed) ==
             expected_start &&
@@ -674,22 +677,37 @@ void CheckDeferredFGInference() {
             s_fg_confirmed_by_getstate.load(std::memory_order_relaxed);
         const bool passive_runtime_evidence =
             NGXHooks_IsFGCreated() || GetCurrentReflexAiFrameTimeUs() > 0.0;
+        // NGX FG creation and the Reflex AI frame time are observed only
+        // through D3D. On Vulkan neither can arrive, so their absence is no
+        // evidence against frame generation: trust SetOptions after the window.
+        vulkan_without_evidence_source = SwapMgr_GetActiveAPI() == ActiveAPI::Vulkan;
         s_fg_inference_pending.store(false, std::memory_order_relaxed);
         s_fg_inference_viewport.store(0, std::memory_order_relaxed);
-        if (!confirmed && window_getstate_calls == 0 &&
-            (!g_config.streamline_compat || passive_runtime_evidence)) {
-            g_fg_presenting.store(true, std::memory_order_relaxed);
-            promoted = true;
+        if (!confirmed && window_getstate_calls == 0) {
+            if (!g_config.streamline_compat || passive_runtime_evidence ||
+                vulkan_without_evidence_source) {
+                g_fg_presenting.store(true, std::memory_order_relaxed);
+                promoted = true;
+            } else {
+                compat_without_evidence = true;
+            }
         }
     }
     EndOptionsStateWrite(write_sequence);
 
     if (promoted) {
-        LOG_INFO(g_config.streamline_compat
-            ? "FG presenting promoted (passive runtime evidence; GetState not observed in compatibility mode, %.1fs elapsed)"
-            : "FG presenting promoted (no GetState calls observed in confirmation window, %.1fs elapsed)",
+        LOG_INFO(!g_config.streamline_compat
+            ? "FG presenting promoted (no GetState calls observed in confirmation window, %.1fs elapsed)"
+            : vulkan_without_evidence_source
+                ? "FG presenting promoted (compatibility mode on Vulkan, which has no NGX or Reflex AI evidence; "
+                  "SetOptions trusted, %.1fs elapsed)"
+                : "FG presenting promoted (passive runtime evidence; GetState not observed in compatibility mode, "
+                  "%.1fs elapsed)",
             elapsed_us / 1000000.0);
         OnFGStateChange();
+    } else if (compat_without_evidence) {
+        LOG_INFO("FG presenting NOT promoted (compatibility mode) — no NGX FG creation or Reflex AI frame time "
+                 "within %.1fs", elapsed_us / 1000000.0);
     } else if (window_getstate_calls > 0) {
         LOG_INFO("FG presenting NOT promoted — GetState called %u times but never confirmed (%.1fs)",
                  window_getstate_calls, elapsed_us / 1000000.0);
@@ -706,6 +724,8 @@ bool HookStreamlinePCL(HMODULE hInterposer) {
     static void* bound_options = nullptr;
     static void* bound_state = nullptr;
     static bool replacement_reported = false;
+    static bool options_failure_logged = false;
+    static bool state_failure_logged = false;
     if (RuntimeLifecycle_IsStopping()) return false;
 
     auto pGetFeatureFunction = reinterpret_cast<PFN_slGetFeatureFunction>(
@@ -740,14 +760,19 @@ bool HookStreamlinePCL(HMODULE hInterposer) {
         void* fn = functions.set_options;
         sl_Result r = functions.options_result;
         if (r == sl_eOk && fn) {
-            options_installed = InstallHook(fn,
+            const MH_STATUS status = InstallHook(fn,
                 g_config.streamline_compat
                     ? reinterpret_cast<void*>(&Detour_SetOptions_Compat)
                     : reinterpret_cast<void*>(&Detour_SetOptions),
-                &s_orig_SetOptions) == MH_OK;
+                &s_orig_SetOptions);
+            options_installed = status == MH_OK;
             if (options_installed) {
                 bound_options = fn;
                 LOG_INFO("Streamline: hooked slDLSSGSetOptions");
+            } else if (!options_failure_logged) {
+                options_failure_logged = true;
+                LOG_WARN("Streamline: slDLSSGSetOptions at %p could not be hooked (%s); frame generation "
+                    "is not detected through Streamline. Retrying.", fn, MH_StatusToString(status));
             }
         }
     }
@@ -756,11 +781,16 @@ bool HookStreamlinePCL(HMODULE hInterposer) {
         void* fn = functions.get_state;
         sl_Result r = functions.state_result;
         if (r == sl_eOk && fn) {
-            state_installed = InstallHook(fn, reinterpret_cast<void*>(&Detour_GetState),
-                &s_orig_GetState) == MH_OK;
+            const MH_STATUS status = InstallHook(fn, reinterpret_cast<void*>(&Detour_GetState),
+                &s_orig_GetState);
+            state_installed = status == MH_OK;
             if (state_installed) {
                 bound_state = fn;
                 LOG_INFO("Streamline: hooked slDLSSGGetState");
+            } else if (!state_failure_logged) {
+                state_failure_logged = true;
+                LOG_WARN("Streamline: slDLSSGGetState at %p could not be hooked (%s). Retrying.",
+                    fn, MH_StatusToString(status));
             }
         }
     }

@@ -82,7 +82,7 @@ Move the game window between monitors, switch between windowed/borderless/fullsc
 |---|---|---|---|
 | DX12 | Reflex markers, or Present-based without markers | GPU queue wait (64-bit, VRR, no FG) or FG input wait (64-bit, FG) once qualified; otherwise marker hold (no FG) or none (FG) | Full feature set including Adaptive cap workload reports and Reflex diagnostics |
 | DX11 | Reflex markers (Reflex games, 64-bit) or Present-based | Marker hold, or none on Present-based | Flip Model Override available |
-| Vulkan | Streamline PCL markers or Present-based | Marker hold, or none on Present-based | |
+| Vulkan | Streamline PCL markers or Present-based | Marker hold; none with frame generation or on Present-based | |
 | OpenGL | Present-based | None | VSync override may not work in all games |
 
 ## DLSS Info on OSD
@@ -104,6 +104,7 @@ Replacing the game's DLSS DLLs with newer versions (e.g. dropping an updated `nv
 - Global DLSS DLL overrides (via NVCP/NVPI) may not be read correctly — replace DLLs in the game folder instead
 - Global DLSS preset overrides won't appear on the OSD — set presets per-game in the NVIDIA App or Profile Inspector
 - Some older Vulkan titles may not work
+- Telemetry Logging writes frame rows only in DXGI games (DX10, DX11, DX12)
 - OpenGL VSync override depends on how the game manages swap intervals
 
 ## Building From Source

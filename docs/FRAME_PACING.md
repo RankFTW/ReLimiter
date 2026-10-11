@@ -345,9 +345,9 @@ flowchart TD
     F -->|no| G{"Output override set?"}
     G -->|yes| O2["Forced output or the next one down, reason override"]
     G -->|no| H{"Frame generation presenting?"}
-    H -->|yes| H1{"FG input route qualified?"}
-    H1 -->|yes| FG["fg_input_wait, reason none"]
-    H1 -->|no| FU["source_only, reason fg_unqualified"]
+    H -->|yes| H1{"First unmet FG input wait requirement"}
+    H1 -->|none| FG["fg_input_wait, reason none"]
+    H1 -->|one unmet| FU["source_only, reason architecture, api, no_native_route or fg_unqualified"]
     H -->|no| J{"First unmet GPU queue wait requirement"}
     J -->|none| GQ["gpu_queue_wait, reason none"]
     J -->|one unmet| MH["marker_hold, reason architecture, api, fixed_refresh, no_native_route or no_gpu_queue"]
@@ -513,7 +513,7 @@ At a 120 FPS cap with 2× FG, real frames are `I = 16.7 ms` apart and the displa
 
 **The FG divisor.** The divisor is 1 without FG and 2 or more once FG is confirmed active, taken from the sources in this order: NVIDIA Smooth Motion, the driver profile override, the actual multiplier from the FG state, the configured Streamline state, and finally positive Reflex AI frame evidence when Streamline has not reported FG off. The scheduler resolves it once per frame and the OSD and frame splitting read that same value. A change of the raw divisor is a `PeriodChange` epoch and resets the Adaptive cap, the overload guard, the pre-Sleep margin window and the GPU wait cap. The grid interval follows a linear ramp over 50 ms after a toggle; those frames are silent rebases.
 
-**Pacing real frames.** With FG presenting, Auto uses `fg_input_wait` once its route has qualified: the GPU waits in front of each real frame's entry to frame generation, so real frames enter FG on the cadence. Until it qualifies, nothing is held (`source_only`, reason `fg_unqualified`); FG without its route is not held at a marker. The lead of `fg_input_wait` leaves out the game's simulation to render queue time `q`, because a pipelined game's finished frame otherwise waits there and the lead would learn that wait as part of its pipeline.
+**Pacing real frames.** With FG presenting, Auto uses `fg_input_wait` once its route has qualified: the GPU waits in front of each real frame's entry to frame generation, so real frames enter FG on the cadence. Until it qualifies, nothing is held (`source_only`, reason `fg_unqualified`); FG without its route is not held at a marker. Where the FG input wait cannot run (the 32-bit addon, an API other than DX12, or markers from Streamline PCL), the reason names that requirement instead (`architecture`, `api`, `no_native_route`). The lead of `fg_input_wait` leaves out the game's simulation to render queue time `q`, because a pipelined game's finished frame otherwise waits there and the lead would learn that wait as part of its pipeline.
 
 ReLimiter does not time the generated frames: where the driver puts them between two real frames is outside its control.
 

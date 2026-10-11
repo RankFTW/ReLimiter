@@ -230,10 +230,10 @@ The main view shows one plain status line; the technical lines are under **Detai
 | `fixed_refresh` | The GPU queue wait needs VRR. |
 | `no_native_route` | The native Present route has not qualified yet, or the markers come from Streamline PCL rather than native Reflex. |
 | `no_gpu_queue` | The GPU queue wait is not ready yet. |
-| `fg_unqualified` | Frame generation is presenting but its FG input route has not qualified; nothing is held. |
+| `fg_unqualified` | Frame generation is presenting on DX12 with native Reflex markers, but its FG input route has not qualified yet; nothing is held. |
 | `infeasible` | With **Output override** on **Auto**, the overload guard stopped holding frames: every hold steps aside until 2 s pass without restarts. **GPU wait A/B blocks** also use this reason in their not-held blocks. |
 
-Reasons from `architecture` to `no_gpu_queue` come with `marker_hold`: they name the first requirement of the GPU queue wait that is not met. They do not mean pacing has failed.
+Without frame generation, reasons from `architecture` to `no_gpu_queue` come with `marker_hold`: they name the first requirement of the GPU queue wait that is not met. They do not mean pacing has failed. With frame generation presenting they come with `source_only` and name the first unmet FG input wait requirement (64-bit addon, DX12, native Reflex markers); `fg_unqualified` follows when only the route itself is still pending.
 
 ---
 
@@ -370,7 +370,7 @@ The pacing events file records cap changes as `gpu_wait_cap` events and overload
 
 Turn on **Telemetry Logging** (Advanced) to record a capture; the User Guide describes the steps. Files are written next to the addon and named with the game's process name, process ID, a session number and the capture number.
 
-**`relimiter_pacing_`** has one row per displayed frame, or per Present call when no display time is available, with 138 columns (column names are in the header row; empty cells mean the value was unavailable, not zero). Groups:
+**`relimiter_pacing_`** has one row per displayed frame, or per Present call when no display time is available, with 138 columns (column names are in the header row; empty cells mean the value was unavailable, not zero). Present records come only from the DXGI `Present` and `Present1` hooks, so Vulkan, OpenGL and DX9 captures have the header and no rows. Groups:
 
 - ReLimiter's release and frame plan: cadence epoch and index, output target, lead, output point and its outcome.
 - The game's Present call, GPU wait and readiness timing, Reflex timing.

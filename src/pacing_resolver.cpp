@@ -44,13 +44,17 @@ namespace
         return route == PacingRoute::NvApiMarkers || route == PacingRoute::PclMarkers;
     }
 
-    bool IsFgInputQualified(const PacingCapabilities& capabilities) noexcept
+    // The first failing FG input wait requirement; None when all hold. The
+    // GPU gate keys FG inputs to NvAPI frames on DX12; no executor claims an
+    // FgInputWait plan elsewhere, so only a ready route on DX12 NvAPI markers
+    // can still qualify (FgUnqualified).
+    PacingFallbackReason FgInputBlocker(const PacingCapabilities& capabilities) noexcept
     {
-        // The GPU gate keys FG inputs to NvAPI frames; no executor claims an
-        // FgInputWait plan on another route.
-        return capabilities.x64 && capabilities.api == PacingApi::DX12 &&
-            capabilities.route == PacingRoute::NvApiMarkers &&
-            capabilities.fg_input_route_ready;
+        if (!capabilities.x64) return PacingFallbackReason::Architecture;
+        if (capabilities.api != PacingApi::DX12) return PacingFallbackReason::Api;
+        if (capabilities.route != PacingRoute::NvApiMarkers) return PacingFallbackReason::NoNativeRoute;
+        if (!capabilities.fg_input_route_ready) return PacingFallbackReason::FgUnqualified;
+        return PacingFallbackReason::None;
     }
 
     // The native route is PRESENT_START → native Present attribution, which
@@ -92,7 +96,7 @@ namespace
                 return IsNativeRouteQualified(capabilities) ? PacingRung::NativeHold : marker_rung;
             case PacingRungOverride::Gpu:
                 if (runtime.fg_presenting) {
-                    return IsFgInputQualified(capabilities)
+                    return FgInputBlocker(capabilities) == PacingFallbackReason::None
                         ? PacingRung::FgInputWait
                         : PacingRung::SourceOnly;
                 }
@@ -110,10 +114,11 @@ namespace
         const PacingRuntimeState& runtime) noexcept
     {
         if (runtime.fg_presenting) {
-            if (IsFgInputQualified(capabilities)) {
+            const PacingFallbackReason fg_blocker = FgInputBlocker(capabilities);
+            if (fg_blocker == PacingFallbackReason::None) {
                 return { PacingRung::FgInputWait, PacingFallbackReason::None };
             }
-            return { PacingRung::SourceOnly, PacingFallbackReason::FgUnqualified };
+            return { PacingRung::SourceOnly, fg_blocker };
         }
         // H1 on marker routes is the blocked case of the GPU queue wait: every
         // marker route either qualifies for H3 or fails one requirement.
