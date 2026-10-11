@@ -189,12 +189,18 @@ public:
     {
         lead_.OnGpuActiveTime(producer_epoch, frame_id, gpu_active_us, gpu_start_qpc);
     }
-    // A Reflex report pair for the render handoff back-pressure term
+    // A Reflex report pair for the render handoff GPU floor's term
     // (LeadController::OnHandoffBackPressure).
     void OnHandoffBackPressure(uint32_t producer_epoch, uint64_t frame_id,
         const HandoffBackPressureSample& sample, double quantile) noexcept
     {
         lead_.OnHandoffBackPressure(producer_epoch, frame_id, sample, quantile);
+    }
+    // A Reflex report's GPU end, the GPU floor's anchor
+    // (LeadController::OnGpuRenderEnd).
+    void OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, int64_t gpu_end_qpc) noexcept
+    {
+        lead_.OnGpuRenderEnd(producer_epoch, frame_id, gpu_end_qpc);
     }
     // Timing mode Off: grid suspended and published; the next plan starts a
     // ModeChange epoch.

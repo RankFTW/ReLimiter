@@ -84,7 +84,8 @@ TAKE_GAP_MS = 0.1         # replay: the render thread takes a frame this long af
 MIN_PRESENT_CALL_MS = 0.3  # replay: shortest Present call once the render thread arrives late
 LONG_FRAME_MULTIPLE = 1.5
 RENDER_THREAD_IDLE_MS = 0.3  # the render thread started frame n less than this after finishing n - 1
-GPU_IDLE_MS = 1.0            # the back-pressure term's GPU wait (LEAD_HANDOFF_GPU_IDLE_US)
+GPU_IDLE_MS = 1.0            # the GPU floor term's GPU wait (LEAD_HANDOFF_GPU_IDLE_US)
+STREAM_PROOF = 32            # pairs with the first work in the first half of the window (LEAD_HANDOFF_STREAM_PROOF)
 GAP_SECONDS = 1.0          # display intervals and durations never bridge a gap longer than this
 
 
@@ -243,6 +244,27 @@ def pairs(capture: Capture, segmenter: Segmenter, segment: str) -> list[tuple[Fr
     return out
 
 
+def _late_in_window(f: Frame) -> bool:
+    return f.m["driver_start"] >= (f.m["rs_start"] + f.m["rs_end"]) / 2
+
+
+def _classifiable(prev: Frame, f: Frame) -> bool:
+    return ("gpu_end" in prev.m and "gpu_start" in f.m and "driver_start" in f.m
+            and f.m["rs_end"] > f.m["rs_start"])
+
+
+def _streams(capture: Capture) -> set[int]:
+    """Frame IDs at which the game had shown STREAM_PROOF pairs with streaming submission (any segment)."""
+    proven, count = set(), 0
+    for prev, f in zip(capture.frames, capture.frames[1:]):
+        if f.frame_id != prev.frame_id + 1 or not _classifiable(prev, f):
+            continue
+        if count < STREAM_PROOF and not _late_in_window(f):
+            count += 1
+        if count >= STREAM_PROOF:
+            proven.add(f.frame_id)
+    return proven
+
 def segment_report(capture: Capture, segmenter: Segmenter, segment: str,
                    quantile: float, allowance_ms: float) -> dict[str, Any]:
     chain = pairs(capture, segmenter, segment)
@@ -266,6 +288,8 @@ def segment_report(capture: Capture, segmenter: Segmenter, segment: str,
         stages["release_minus_S"].append(f.s - f.S)
     after, since_w, h = 0, [], []
     held_back, released_late, classified, first_submission, sim_before_gpu, contiguous = 0, 0, 0, [], [], 0
+    start_minus_gpu_end = []
+    streams = _streams(capture)
     by_position: dict[str, dict[str, list[float]]] = {p: {"submission": [], "outlasted": []} for p in POSITIONS}
     for f in frames:
         if "gpu_start" in f.m:
@@ -279,12 +303,12 @@ def segment_report(capture: Capture, segmenter: Segmenter, segment: str,
         if f.s >= w1:
             after += 1
             h.append((prev.m["present_end"] - w1) - sim)
-        if "gpu_end" in prev.m and "gpu_start" in f.m and "driver_start" in f.m and f.m["rs_end"] > f.m["rs_start"]:
+        if _classifiable(prev, f):
             classified += 1
+            start_minus_gpu_end.append(f.m["rs_start"] - prev.m["gpu_end"])
             gpu_waited = f.m["gpu_start"] - prev.m["gpu_end"] > GPU_IDLE_MS
             render_busy = f.m["sim_end"] < max(prev.m["rs_end"], prev.m["present_end"])
-            late_in_window = f.m["driver_start"] >= (f.m["rs_start"] + f.m["rs_end"]) / 2
-            if not gpu_waited and render_busy and late_in_window:
+            if not gpu_waited and _late_in_window(f) and (render_busy or f.frame_id in streams):
                 held_back += 1
             elif gpu_waited and not render_busy:
                 released_late += 1
@@ -324,6 +348,7 @@ def segment_report(capture: Capture, segmenter: Segmenter, segment: str,
             "released_late": released_late / classified if classified else None,
             "first_submission_after_rs_start_ms": _q(first_submission),
             "sim_start_to_gpu_start_ms": _q(sim_before_gpu),
+            "rs_start_minus_prev_gpu_end_ms": _q(start_minus_gpu_end),
             "render_thread_without_idle": contiguous / len(chain) if chain else None,
         },
         "simulation_start_position": positions,
@@ -488,7 +513,8 @@ def format_report(report: dict[str, Any]) -> str:
         lines.append(f"    back-pressure: held back {_fmt(None if held is None else 100 * held, 1)}%, released late "
                      f"{_fmt(None if late is None else 100 * late, 1)}%, first driver submission - RS_START "
                      f"{_qtext(bp['first_submission_after_rs_start_ms'])} ms, simulation start -> GPU start "
-                     f"{_qtext(bp['sim_start_to_gpu_start_ms'])} ms, render thread without idle "
+                     f"{_qtext(bp['sim_start_to_gpu_start_ms'])} ms, RS_START - GPU end(n-1) "
+                     f"{_qtext(bp['rs_start_minus_prev_gpu_end_ms'])} ms, render thread without idle "
                      f"{_fmt(None if idle is None else 100 * idle, 1)}%")
         lines.append("    simulation start vs the render thread's frame n-1 (share, submission p50/p90 ms, "
                      "simulation outlasted the render thread):")

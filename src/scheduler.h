@@ -206,8 +206,12 @@ struct SchedulerPacingStatus {
 	uint32_t driver_limiter_interval_us = 0; // applied Reflex minimumIntervalUs; 0 = none
 	// Render handoff limit. Current on every publication.
 	uint8_t render_handoff = 0;            // 0 off, 1 limits the newest frame, 2 blocked
-	double render_handoff_offset_us = 0.0;        // d + c
-	double render_handoff_back_pressure_us = 0.0; // c, the back-pressure term
+	double render_handoff_offset_us = 0.0; // d
+	// The GPU floor (lead_controller.h): engaged once its term c > 0, then
+	// releasing no earlier than this long before the previous frame's GPU end
+	// (span × I − c).
+	bool render_handoff_gpu_floor = false;
+	double render_handoff_gpu_lead_us = 0.0;
 	uint32_t render_handoff_limited = 0;   // frames the limit released after S, cumulative
 	uint32_t render_handoff_stalls = 0;    // waits that ended without the handoff, cumulative
 };

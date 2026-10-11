@@ -50,7 +50,7 @@ namespace
         return kBaseQpc + static_cast<int64_t>(std::llround(us * 10.0));
     }
 
-    // The controller is about 185 KB: tests keep it on the heap.
+    // The controller is about 190 KB: tests keep it on the heap.
     std::unique_ptr<LeadController> MakeController()
     {
         auto controller = std::make_unique<LeadController>();
@@ -2473,51 +2473,64 @@ HandoffBackPressureSample ReleasedLatePair()
     return pair;
 }
 
-// Held back: the GPU did not wait, the render thread came straight from the
-// previous frame and the frame's first work reached the driver in the second
-// half of its window. Released late: the GPU waited more than 1 ms while the
-// render thread waited for the simulation. A GPU that waits behind a busy
-// render thread (a hitch) is neither, and so is a render thread that streams.
+// Held back: the GPU did not wait and the frame's first work reached the
+// driver in the second half of its window, while the render thread came
+// straight from the previous frame or the game has shown that it streams.
+// Released late: the GPU waited more than 1 ms while the render thread
+// waited for the simulation. A GPU that waits behind a busy render thread (a
+// hitch) is neither, and so is a render thread that streams.
 void TestHandoffBackPressureClassify()
 {
-    CHECK(HandoffBackPressure_Classify(HeldBackPair()) == HandoffBackPressure::HeldBack);
-    CHECK(HandoffBackPressure_Classify(StreamingPair()) == HandoffBackPressure::None);
-    CHECK(HandoffBackPressure_Classify(ReleasedLatePair()) == HandoffBackPressure::ReleasedLate);
+    for (const bool streams : { false, true }) {
+        CHECK(HandoffBackPressure_Classify(HeldBackPair(), streams) == HandoffBackPressure::HeldBack);
+        CHECK(HandoffBackPressure_Classify(StreamingPair(), streams) == HandoffBackPressure::None);
+        CHECK(HandoffBackPressure_Classify(ReleasedLatePair(), streams) == HandoffBackPressure::ReleasedLate);
+    }
 
     // The first work in the first half of the window (streaming): not held.
     HandoffBackPressureSample early = HeldBackPair();
     early.first_submission_us = 8000.0;
-    CHECK(HandoffBackPressure_Classify(early) == HandoffBackPressure::None);
+    CHECK(HandoffBackPressure_Classify(early, true) == HandoffBackPressure::None);
     // At the middle of the window: held.
     early.first_submission_us = 8575.0;
-    CHECK(HandoffBackPressure_Classify(early) == HandoffBackPressure::HeldBack);
+    CHECK(HandoffBackPressure_Classify(early, true) == HandoffBackPressure::HeldBack);
     // The GPU waited more than 1 ms behind a busy render thread: a hitch.
     HandoffBackPressureSample hitch = HeldBackPair();
     hitch.gpu_start_us = hitch.previous_gpu_end_us + 1001.0;
-    CHECK(HandoffBackPressure_Classify(hitch) == HandoffBackPressure::None);
-    // A render thread that waited for the simulation is never held back,
-    // even when it submits at the end of its window.
+    CHECK(HandoffBackPressure_Classify(hitch, true) == HandoffBackPressure::None);
+    // A render thread that waited for the simulation and then got its first
+    // work out only at the end of the window: held back once the game has
+    // shown that it streams (Gears' render thread released too early), never
+    // before (a game that submits everything at the end of its window).
     HandoffBackPressureSample waited = HeldBackPair();
     waited.simulation_end_us = waited.previous_render_free_us;
-    CHECK(HandoffBackPressure_Classify(waited) == HandoffBackPressure::None);
+    CHECK(HandoffBackPressure_Classify(waited, false) == HandoffBackPressure::None);
+    CHECK(HandoffBackPressure_Classify(waited, true) == HandoffBackPressure::HeldBack);
     // Exactly 1 ms of GPU idle is not waiting.
     HandoffBackPressureSample edge = ReleasedLatePair();
     edge.gpu_start_us = edge.previous_gpu_end_us + 1000.0;
-    CHECK(HandoffBackPressure_Classify(edge) == HandoffBackPressure::None);
+    CHECK(HandoffBackPressure_Classify(edge, true) == HandoffBackPressure::None);
 
     HandoffBackPressureSample invalid = HeldBackPair();
     invalid.gpu_start_us = kNaN;
-    CHECK(HandoffBackPressure_Classify(invalid) == HandoffBackPressure::None);
+    CHECK(HandoffBackPressure_Classify(invalid, true) == HandoffBackPressure::None);
     invalid = HeldBackPair();
     invalid.render_end_us = invalid.render_start_us;
-    CHECK(HandoffBackPressure_Classify(invalid) == HandoffBackPressure::None);
+    CHECK(HandoffBackPressure_Classify(invalid, true) == HandoffBackPressure::None);
+
+    // Streaming evidence: the first work in the first half of a valid window.
+    CHECK(HandoffBackPressure_Streams(StreamingPair()));
+    CHECK(HandoffBackPressure_Streams(ReleasedLatePair()));
+    CHECK(!HandoffBackPressure_Streams(HeldBackPair()));
+    CHECK(!HandoffBackPressure_Streams(invalid));
 }
 
-// Render handoff back-pressure term: a report of a frame released under the
-// limit raises c by q·η when held back and lowers it by q·η when released
-// late and by (1 − q)·η otherwise (η = 1% of I), so c holds where a share
-// 1 − q of frames is held back; c stays within [0, I] and adds to d. Frames
-// without the limit and second reports change nothing.
+// The GPU floor's term c: a report of a frame released under the limit
+// raises c by q·η when held back and lowers it by q·η when released late and
+// by (1 − q)·η otherwise (η = 1% of I), so c holds where a share 1 − q of
+// frames is held back; c stays within [0, 2 I] and never adds to d. Frames
+// without the limit and second reports change c by nothing; every pair
+// counts toward the stream proof.
 void TestRenderHandoffBackPressure()
 {
     auto controller = MakeController();
@@ -2531,13 +2544,12 @@ void TestRenderHandoffBackPressure()
         controller->OnHandoffBackPressure(Key(n).producer_epoch, Key(n).frame_id, pair, 0.95);
     };
 
-    // Ten held-back frames: c = 10 × 0.95 × 100 = 950 µs, all of the offset
-    // while d is cold.
+    // Ten held-back frames: c = 10 × 0.95 × 100 = 950 µs; d stays cold.
     for (int i = 0; i < 10; ++i) frame(true, HeldBackPair());
     CHECK(controller->Statistics().handoff_back_pressure_samples == 10);
     CHECK(controller->Statistics().handoff_held_back == 10);
     CHECK_NEAR(controller->HandoffBackPressureUs(), 950.0);
-    CHECK_NEAR(controller->HandoffOffsetUs(0.95, 500.0), 950.0);
+    CHECK_NEAR(controller->HandoffOffsetUs(0.95, 500.0), 0.0);
     // A second report of the same frame is ignored.
     controller->OnHandoffBackPressure(Key(n).producer_epoch, Key(n).frame_id, HeldBackPair(), 0.95);
     CHECK(controller->Statistics().handoff_back_pressure_samples == 10);
@@ -2557,9 +2569,9 @@ void TestRenderHandoffBackPressure()
     // Streaming frames bring c to 0, never below.
     for (int i = 0; i < 200; ++i) frame(true, StreamingPair());
     CHECK_NEAR(controller->HandoffBackPressureUs(), 0.0);
-    // Frames that stay held back raise it to one interval at most.
-    for (int i = 0; i < 120; ++i) frame(true, HeldBackPair());
-    CHECK_NEAR(controller->HandoffBackPressureUs(), kInterval);
+    // Frames that stay held back raise it to two intervals at most.
+    for (int i = 0; i < 220; ++i) frame(true, HeldBackPair());
+    CHECK_NEAR(controller->HandoffBackPressureUs(), 2.0 * kInterval);
 
     // A report without a pending frame is counted; invalid input is rejected.
     controller->OnHandoffBackPressure(7, 123456789, HeldBackPair(), 0.95);
@@ -2568,11 +2580,108 @@ void TestRenderHandoffBackPressure()
     controller->OnHandoffBackPressure(0, Key(n).frame_id, HeldBackPair(), 0.95);
     controller->OnHandoffBackPressure(7, Key(n).frame_id, HeldBackPair(), kNaN);
     CHECK(controller->Statistics().invalid_inputs == invalid + 2);
-    CHECK_NEAR(controller->HandoffBackPressureUs(), kInterval);
+    CHECK_NEAR(controller->HandoffBackPressureUs(), 2.0 * kInterval);
 
-    // Cleared with the handoff window.
+    // Cleared with the handoff window; the stream proof stays.
+    CHECK(controller->HandoffStreams());
     controller->ResetBuckets();
     CHECK_NEAR(controller->HandoffBackPressureUs(), 0.0);
+    CHECK(controller->HandoffStreams());
+    controller->Reset(kFrequency);
+    CHECK(!controller->HandoffStreams());
+
+    // Before the proof a render thread that waited for the simulation and
+    // submitted at the end of its window is not held back; 32 streaming
+    // pairs, also of frames without the limit, complete the proof.
+    HandoffBackPressureSample waited = HeldBackPair();
+    waited.simulation_end_us = waited.previous_render_free_us;
+    n = 0;
+    frame(true, waited);
+    CHECK(controller->Statistics().handoff_held_back == 0);
+    for (uint32_t i = 0; i < LEAD_HANDOFF_STREAM_PROOF - 1; ++i) frame(false, StreamingPair());
+    CHECK(!controller->HandoffStreams());
+    frame(false, StreamingPair());
+    CHECK(controller->HandoffStreams());
+    frame(true, waited);
+    CHECK(controller->Statistics().handoff_held_back == 1);
+}
+
+// The GPU floor of frame n: Ĝ(n − 1) − 2 I + c, Ĝ extrapolated from the
+// newest GPU end by the median GPU frame period of consecutive frames. It
+// applies only while c > 0, within the horizon, for the GPU end's producer
+// epoch and NvAPI frames, once the period window is warm.
+void TestRenderHandoffGpuFloor()
+{
+    constexpr uint32_t kEpoch = 7;
+    constexpr double kGpuPeriod = 17000.0; // bin center 17,010 µs
+    const auto key_of = [](uint64_t frame_id, uint32_t epoch = 7) {
+        PacingPlanKey key{};
+        key.identity_domain = PacingIdentityDomain::NvApiFrame;
+        key.producer_epoch = epoch;
+        key.controller_generation = 1;
+        key.frame_id = frame_id;
+        return key;
+    };
+    auto controller = MakeController();
+    // c = 950 µs from ten held-back frames released under the limit.
+    for (uint64_t n = 1; n <= 10; ++n) {
+        LeadFrameStart start = Start(n, PacingRung::SourceOnly, static_cast<double>(n) * kInterval);
+        start.handoff_release = true;
+        controller->OnSourceRelease(start);
+        controller->OnHandoffBackPressure(Key(n).producer_epoch, Key(n).frame_id, HeldBackPair(), 0.95);
+    }
+    CHECK_NEAR(controller->HandoffBackPressureUs(), 950.0);
+
+    // 32 GPU ends are 31 intervals: cold.
+    const auto gpu_end_us = [&](uint64_t frame_id) { return 100000.0 + kGpuPeriod * static_cast<double>(frame_id - 2000); };
+    for (uint64_t frame_id = 2000; frame_id < 2032; ++frame_id) {
+        controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us(frame_id)));
+    }
+    CHECK(controller->GpuFloorQpc(key_of(2033), kInterval) == 0);
+    // A gap adds no interval; the next consecutive frame does.
+    controller->OnGpuRenderEnd(kEpoch, 2033, Qpc(gpu_end_us(2033)));
+    CHECK(controller->GpuFloorQpc(key_of(2035), kInterval) == 0);
+    controller->OnGpuRenderEnd(kEpoch, 2034, Qpc(gpu_end_us(2034)));
+    // Frame 2036: Ĝ(2035) = G(2034) + 17,010, floor = Ĝ − 20,000 + 950.
+    CHECK(controller->GpuFloorQpc(key_of(2036), kInterval) == Qpc(gpu_end_us(2034) + 17010.0 - 20000.0 + 950.0));
+    // Frame 2035: its predecessor's GPU end is known.
+    CHECK(controller->GpuFloorQpc(key_of(2035), kInterval) == Qpc(gpu_end_us(2034) - 20000.0 + 950.0));
+    // One stretched GPU frame does not move the median period.
+    controller->OnGpuRenderEnd(kEpoch, 2035, Qpc(gpu_end_us(2034) + 25000.0));
+    CHECK(controller->GpuFloorQpc(key_of(2037), kInterval) ==
+        Qpc(gpu_end_us(2034) + 25000.0 + 17010.0 - 20000.0 + 950.0));
+    // An older report is ignored.
+    controller->OnGpuRenderEnd(kEpoch, 2030, Qpc(gpu_end_us(2030)));
+    CHECK(controller->GpuFloorQpc(key_of(2036), kInterval) == Qpc(gpu_end_us(2034) + 25000.0 - 20000.0 + 950.0));
+
+    // Horizon: at most 8 frames between the newest GPU end and frame n − 1.
+    CHECK(controller->GpuFloorQpc(key_of(2044), kInterval) != 0);
+    CHECK(controller->GpuFloorQpc(key_of(2045), kInterval) == 0);
+    // Not before the newest GPU end's frame, nor for another producer epoch,
+    // identity domain or a non-positive interval.
+    CHECK(controller->GpuFloorQpc(key_of(2035), kInterval) == 0);
+    CHECK(controller->GpuFloorQpc(key_of(2036, kEpoch + 1), kInterval) == 0);
+    PacingPlanKey pcl = key_of(2036);
+    pcl.identity_domain = PacingIdentityDomain::PclFrame;
+    CHECK(controller->GpuFloorQpc(pcl, kInterval) == 0);
+    CHECK(controller->GpuFloorQpc(key_of(2036), 0.0) == 0);
+    // Unknown GPU end QPC is ignored.
+    controller->OnGpuRenderEnd(kEpoch, 2036, 0);
+    CHECK(controller->GpuFloorQpc(key_of(2037), kInterval) != 0);
+
+    // A new producer epoch restarts the anchor and the period window.
+    controller->OnGpuRenderEnd(kEpoch + 1, 5000, Qpc(900000.0));
+    CHECK(controller->GpuFloorQpc(key_of(2037), kInterval) == 0);
+    CHECK(controller->GpuFloorQpc(key_of(5002, kEpoch + 1), kInterval) == 0);
+
+    // c = 0: no floor; a warm window again with c cleared (handoff window
+    // reset) gives none either.
+    for (uint64_t frame_id = 5001; frame_id <= 5040; ++frame_id) {
+        controller->OnGpuRenderEnd(kEpoch + 1, frame_id, Qpc(900000.0 + kGpuPeriod * static_cast<double>(frame_id - 5000)));
+    }
+    CHECK(controller->GpuFloorQpc(key_of(5042, kEpoch + 1), kInterval) != 0);
+    controller->ResetBuckets();
+    CHECK(controller->GpuFloorQpc(key_of(5042, kEpoch + 1), kInterval) == 0);
 }
 
 int main()
@@ -2632,6 +2741,7 @@ int main()
     TestRenderHandoffOffset();
     TestHandoffBackPressureClassify();
     TestRenderHandoffBackPressure();
+    TestRenderHandoffGpuFloor();
 
     if (s_failures != 0) {
         std::fprintf(stderr, "%d lead controller checks failed\n", s_failures);

@@ -233,10 +233,14 @@ static void DrawPacingPipelineStatus() {
     }
     // Render handoff limit: frames not held
     // with the Reflex Sleep bypassed.
-    if (has_status && status.render_handoff == 1)
-        ImGui::TextDisabled("Render handoff limit: +%.2f ms after the render thread takes the previous frame (held back +%.2f ms) | %u frames delayed | %u stalls",
-            status.render_handoff_offset_us / 1000.0, status.render_handoff_back_pressure_us / 1000.0,
+    if (has_status && status.render_handoff == 1 && status.render_handoff_gpu_floor)
+        ImGui::TextDisabled("Render handoff limit: +%.2f ms after the render thread takes the previous frame, "
+            "no earlier than %.2f ms before the GPU finishes it | %u frames delayed | %u stalls",
+            status.render_handoff_offset_us / 1000.0, status.render_handoff_gpu_lead_us / 1000.0,
             status.render_handoff_limited, status.render_handoff_stalls);
+    else if (has_status && status.render_handoff == 1)
+        ImGui::TextDisabled("Render handoff limit: +%.2f ms after the render thread takes the previous frame | %u frames delayed | %u stalls",
+            status.render_handoff_offset_us / 1000.0, status.render_handoff_limited, status.render_handoff_stalls);
     else if (has_status && status.render_handoff == 2)
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
             "Render handoff limit: off (the render thread may wait for the next release; waiting for evidence)");

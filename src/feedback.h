@@ -50,11 +50,13 @@ struct ReflexFrameTimeSample {
 	uint32_t feedback_generation = 0;
 	bool gpu_execution_available = false; // FIFO-only authority: service came from driver active time, not elapsed fallback
 	double gpu_active_us = 0.0; // the report's gpuActiveRenderTimeUs; the lead controller's release headroom
-	// The report's gpuRenderStartTime as local QPC through the stable Reflex
-	// clock map (the lead controller's queue-order test); 0 otherwise.
+	// The report's gpuRenderStartTime and gpuRenderEndTime as local QPC
+	// through the stable Reflex clock map (the lead controller's queue-order
+	// test and the render handoff GPU floor); 0 otherwise.
 	int64_t gpu_start_qpc = 0;
-	// Render handoff back-pressure term (lead_controller.h): this frame's and
-	// the previous frame's report times, in µs on the driver's clock from this
+	int64_t gpu_end_qpc = 0;
+	// Render handoff GPU floor term (lead_controller.h): this frame's and the
+	// previous frame's report times, in µs on the driver's clock from this
 	// frame's RENDERSUBMIT_START. Known only when both reports carry every
 	// timestamp and each lies within 3 I of that origin.
 	HandoffBackPressureSample back_pressure{};

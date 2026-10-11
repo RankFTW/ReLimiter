@@ -120,10 +120,13 @@ thread, render submission, Present call, GPU render, release → display, displa
 − T, release − S), the reconstructed render handoff limit (share released at or
 after the previous RENDERSUBMIT_START and the offset d for `--quantile` and
 `--allowance-us`), the back-pressure (shares of frames held back by the GPU
-inside the render thread's window and released late, the render handoff
-limit's back-pressure term since 2026-10-11; the driver's first submission −
-RENDERSUBMIT_START; simulation start → GPU start; share of frames whose render
-thread started without idle time), where the simulation starts against the previous frame's
+inside the render thread's window and released late, the classes of the render
+handoff limit's back-pressure term since 2026-10-11, its GPU floor term with
+the stream proof later that day; the driver's first submission −
+RENDERSUBMIT_START; simulation
+start → GPU start; RENDERSUBMIT_START − the previous frame's GPU end, the
+position the GPU floor sets; share of frames whose render thread started
+without idle time), where the simulation starts against the previous frame's
 render-thread work with that submission's time, segment display pacing,
 real-frame and all-row PC Latency, and grid epochs per minute.
 `--replay-floor ANCHOR[+-MS]` (repeatable; `rs_start`, `rs_end`, `present_start`,

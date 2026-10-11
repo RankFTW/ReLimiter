@@ -31,13 +31,18 @@ constexpr size_t LEAD_HISTOGRAM_BINS = 2048;
 constexpr double LEAD_HISTOGRAM_BIN_US = 20.0;
 constexpr uint32_t LEAD_WARM_SAMPLES = 32;
 constexpr uint32_t LEAD_HANDOFF_MIN_SAMPLES = 16;  // the render handoff offset is 0 until this many samples
-// Render handoff back-pressure term (below): learning step per report, a
-// share of the frame's interval; its upper bound in intervals; and the GPU
-// idle before a frame that counts as the GPU waiting for it (the late-resume
-// unit).
+// Render handoff GPU floor (below): learning step of its term c per report,
+// a share of the frame's interval; its span in intervals (c moves the floor
+// within [Ĝ − span × I, Ĝ]); the GPU idle before a frame that counts as the
+// GPU waiting for it (the late-resume unit); report pairs whose first work
+// reached the driver in the first half of the render thread's window that
+// prove the game streams its submission; and how many frames past the newest
+// GPU end the floor extrapolates.
 constexpr double LEAD_HANDOFF_BACK_PRESSURE_STEP_FRACTION = 0.01;
-constexpr double LEAD_HANDOFF_BACK_PRESSURE_MAX_INTERVALS = 1.0;
+constexpr double LEAD_HANDOFF_GPU_SPAN_INTERVALS = 2.0;
 constexpr double LEAD_HANDOFF_GPU_IDLE_US = 1000.0;
+constexpr uint32_t LEAD_HANDOFF_STREAM_PROOF = 32;
+constexpr uint64_t LEAD_HANDOFF_GPU_HORIZON_FRAMES = 8;
 constexpr size_t LEAD_DIVISOR_BUCKETS = 4;         // FG divisor 1..4
 constexpr size_t LEAD_PENDING_CAPACITY = 32;       // frames being assembled, by grid index
 constexpr uint64_t LEAD_PENDING_EXPIRY_FRAMES = 8; // frames this far behind the newest release close
@@ -240,42 +245,51 @@ constexpr CollisionDistanceLimits LEAD_HEADROOM_LIMITS{ 1000.0, 750.0, 3000.0 };
 // waited at the handoff. Serial engines (Rogue Core, w before e) give h < 0
 // and d = 0, so the limit never binds there.
 
-// Render handoff back-pressure term. The offset d keeps the simulation from
-// waiting for the render thread, but the render thread can itself be held
-// back by the GPU inside its window, where d cannot see it. Gears of War:
-// E-Day FG 2× in the overload pause (GPU-bound): the render thread started
-// frame n as soon as it finished frame n − 1 and the driver received the
-// first of frame n's work only at the end of the window (driverStartTime −
-// RENDERSUBMIT_START p50 17.6 ms, 0.8 ms with the driver's Sleep, 1.9 ms in
-// CONTROL Resonant): the engine releases it when the GPU nears the end of
-// frame n − 1, and the frame's work then goes out from another thread. The
-// simulation started 29.8 ms before the frame's GPU work against 15.2 ms with
-// the driver's Sleep (PC latency 56 against 40 ms). From frame n's Reflex
-// report and n − 1's (driver clock):
+// Render handoff GPU floor. The offset d keeps the simulation from waiting
+// for the render thread, but the render thread can itself be held back by
+// the GPU inside its window, where d cannot see it. Gears of War: E-Day FG
+// 2× in the overload pause (GPU-bound): when the render thread started frame
+// n more than about 11 ms before the GPU finished frame n − 1, the driver
+// received the first of frame n's work only near the end of frame n − 1 on
+// the GPU (blocked on 70–96% of such frames, 1–5% when it started later),
+// and 3–9% of those GPU frames stretched while the GPU waited for that work
+// (0–0.6% when it started later). The driver's Sleep starts it 9.4 ms before
+// (p50; never blocked, no long frame). An offset from the render thread's
+// handoff only sets how fast that start drifts against the GPU, so a
+// release that ran ahead stayed blocked on every frame. The floor is
+// anchored to the GPU instead: frame n is released no earlier than
+//   Ĝ(n − 1) − LEAD_HANDOFF_GPU_SPAN_INTERVALS × I + c,
+// Ĝ(n − 1) the GPU end of frame n − 1 extrapolated from the newest Reflex
+// report's gpuRenderEndTime by the median GPU frame period, so c sets where
+// the frame starts against the GPU. From frame n's report and n − 1's
+// (driver clock):
 // - held back: the GPU waited at most LEAD_HANDOFF_GPU_IDLE_US before frame
-//   n, the render thread went straight from n − 1 into n (frame n's
-//   SIMULATION_END before n − 1's later of RENDERSUBMIT_END and PRESENT_END),
-//   and the driver received frame n's first work only in the second half of
-//   the render thread's window or later. The frame could have started later
-//   without the GPU waiting. A game that submits all of a frame at the end of
-//   the window reads held back too while the GPU is busy; the next rule bounds
-//   it.
+//   n and the driver received frame n's first work only in the second half
+//   of the render thread's window or later, while the render thread went
+//   straight from n − 1 into n (frame n's SIMULATION_END before n − 1's later
+//   of RENDERSUBMIT_END and PRESENT_END) or the game has shown that it
+//   streams its submission (LEAD_HANDOFF_STREAM_PROOF pairs with the first
+//   work in the first half of the window). A game that submits all of a
+//   frame at the end of its window is never held back while its render
+//   thread waits for the simulation.
 // - released late: the GPU waited more than LEAD_HANDOFF_GPU_IDLE_US for
 //   frame n while the render thread was waiting for frame n's simulation:
 //   the release, not the render thread, kept the GPU waiting.
-// Gears paused 86–87% held back and 0% late (driver's Sleep 1.5% and 0%);
-// CONTROL never held back (0% paused, held and without the limit), late
-// 0–2.7% (22% with the driver's Sleep). The limit adds a learned delay c:
-// A_n = w_{n−1} + d + c. Each report of a frame released under the limit
-// raises c by q·η when held back, lowers it by q·η when released late and by
-// (1 − q)·η otherwise (η = LEAD_HANDOFF_BACK_PRESSURE_STEP_FRACTION of the
-// frame's interval, q the Smoothing quantile), so without late frames c
-// settles where a share of about 1 − q of frames is still held back; c stays
-// within [0, LEAD_HANDOFF_BACK_PRESSURE_MAX_INTERVALS × I]. Held frames
-// neither feed nor use it: there ReLimiter's own GPU wait holds the render
-// thread back on purpose. A render thread that is never held back (CONTROL,
-// or one that is the bottleneck: the GPU waits for it) keeps c = 0, so the
-// release keeps overlapping its work. c clears with the handoff window.
+// Gears paused with the limit 80–93% held back (driver's Sleep 0–3%);
+// CONTROL Resonant and Rogue Core never held back. Each report of a frame
+// released under the limit raises c by q·η when held back, lowers it by q·η
+// when released late and by (1 − q)·η otherwise (η =
+// LEAD_HANDOFF_BACK_PRESSURE_STEP_FRACTION of the frame's interval, q the
+// Smoothing quantile), so c settles where a share of about 1 − q of frames
+// is still held back; c stays within [0, span × I]. The floor applies only
+// while c > 0, the newest report is of the same producer epoch and at most
+// LEAD_HANDOFF_GPU_HORIZON_FRAMES before frame n − 1, and the period window
+// has LEAD_WARM_SAMPLES intervals of consecutive frames. Held frames neither
+// feed nor use it: there ReLimiter's own GPU wait holds the render thread
+// back on purpose. A render thread that is never held back (CONTROL, or one
+// that is the bottleneck: the GPU waits for it) keeps c = 0. c and the
+// period window clear with the handoff window; the stream proof and the
+// newest GPU end stay until a lifecycle reset.
 struct HandoffBackPressureSample {
     // Frame n, µs on the driver's clock from any common origin.
     double simulation_end_us = 0.0;   // SIMULATION_END
@@ -292,9 +306,14 @@ enum class HandoffBackPressure : uint8_t {
     HeldBack = 1,
     ReleasedLate = 2
 };
-// The class of one report pair (above); None for non-finite input or a
-// render window that does not move forward.
-HandoffBackPressure HandoffBackPressure_Classify(const HandoffBackPressureSample& sample) noexcept;
+// The class of one report pair (above), with whether the game has shown
+// that it streams its submission; None for non-finite input or a render
+// window that does not move forward.
+HandoffBackPressure HandoffBackPressure_Classify(const HandoffBackPressureSample& sample,
+    bool streams) noexcept;
+// The pair's first work reached the driver in the first half of the render
+// thread's window (valid input only): evidence that the game streams.
+bool HandoffBackPressure_Streams(const HandoffBackPressureSample& sample) noexcept;
 
 // ── Inputs and status ──
 
@@ -337,7 +356,7 @@ struct LeadFrameStart {
     int64_t pre_wait_start_qpc = 0;
     int64_t pre_wait_end_qpc = 0;
     // The render handoff limit set this frame's earliest release (scheduler):
-    // its Reflex report feeds the back-pressure term (above).
+    // its Reflex report moves the GPU floor's term (above).
     bool handoff_release = false;
 };
 
@@ -441,7 +460,7 @@ struct LeadStatistics {
     // Render handoff samples h (above) and the newest one.
     uint64_t handoff_samples = 0;
     double last_handoff_us = 0.0;
-    // Back-pressure term (above): reports of frames released under the
+    // GPU floor term (above): reports of frames released under the
     // limit, of those held back and released late, and reports without a
     // pending frame.
     uint64_t handoff_back_pressure_samples = 0;
@@ -574,12 +593,17 @@ public:
     void OnGpuActiveTime(uint32_t producer_epoch, uint64_t frame_id, double gpu_active_us,
         int64_t gpu_start_qpc = 0) noexcept;
     // The Reflex report pair of NvAPI frame (producer_epoch, frame_id) and
-    // its previous frame (the back-pressure term, above), with the Smoothing
-    // quantile q. Used once per frame released under the render handoff
-    // limit; other frames are ignored, and a report without a pending frame
-    // is counted.
+    // its previous frame (the GPU floor's term c, above), with the Smoothing
+    // quantile q. Every pair counts toward the stream proof; c moves once per
+    // frame released under the render handoff limit, other frames are
+    // ignored, and a report without a pending frame is counted.
     void OnHandoffBackPressure(uint32_t producer_epoch, uint64_t frame_id,
         const HandoffBackPressureSample& sample, double quantile) noexcept;
+    // The QPC of NvAPI frame (producer_epoch, frame_id)'s gpuRenderEndTime
+    // through the stable Reflex clock map (0 unknown: ignored). The GPU
+    // floor's anchor; consecutive frames add their interval to the period
+    // window. A new producer epoch restarts both; older frames are ignored.
+    void OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, int64_t gpu_end_qpc) noexcept;
 
     LeadBucketStatus BucketStatus(PacingRung rung, double fg_divisor) const noexcept;
     // Median sample X of a warm bucket (release to output point); 0 when the
@@ -592,12 +616,18 @@ public:
     // 0 until 32 samples, for a non-finite q, after a reset, and while the
     // queue order shows the next frame's GPU work behind the wait.
     double HoldRoomUs(double fg_divisor, double quantile) const noexcept;
-    // Render handoff offset d + c (above): d = max(0, Q_{1−q}(h) − allowance_us)
-    // over the newest 256 samples, 0 before LEAD_HANDOFF_MIN_SAMPLES or for a
-    // non-finite q or allowance; c the back-pressure term.
+    // Render handoff offset d (above): max(0, Q_{1−q}(h) − allowance_us) over
+    // the newest 256 samples, 0 before LEAD_HANDOFF_MIN_SAMPLES or for a
+    // non-finite q or allowance.
     double HandoffOffsetUs(double quantile, double allowance_us) const noexcept;
-    // The back-pressure term c alone.
+    // The GPU floor's term c (above).
     double HandoffBackPressureUs() const noexcept { return handoff_back_pressure_us_; }
+    // The GPU floor of the frame key (above) at interval I, in QPC ticks; 0
+    // when it does not apply (c = 0, another identity domain or producer
+    // epoch, no GPU end within the horizon, a cold period window).
+    int64_t GpuFloorQpc(const PacingPlanKey& key, double interval_us) const noexcept;
+    // The stream proof is complete (above).
+    bool HandoffStreams() const noexcept { return handoff_stream_frames_ >= LEAD_HANDOFF_STREAM_PROOF; }
     // Handoff samples in the window. At LEAD_HANDOFF_MIN_SAMPLES the game has
     // shown its render thread taking a frame before the next release, which
     // a render thread that waits for the next release never does.
@@ -682,7 +712,7 @@ private:
         int64_t gpu_start_qpc = 0;      // Reflex gpuRenderStartTime as QPC; 0 unknown
         bool concurrency_recorded = false; // (o_n, g_{n+1}) entered the queue-order window
         bool handoff_release = false;        // released under the render handoff limit
-        bool handoff_back_pressure_recorded = false; // its report entered the back-pressure term
+        bool handoff_back_pressure_recorded = false; // its report moved the GPU floor's term
     };
 
     // The newest LEAD_SLACK_CAPACITY slack signs of one bucket.
@@ -782,8 +812,16 @@ private:
     std::array<LeadSampleWindow, LEAD_DIVISOR_BUCKETS> room_windows_{};
     // Render handoff samples h (above), all rungs and FG divisors.
     LeadSampleWindow handoff_window_{};
-    // The render handoff back-pressure term c (above), in µs.
+    // The render handoff GPU floor (above): its term c in µs; pairs that
+    // showed streaming submission (saturates at LEAD_HANDOFF_STREAM_PROOF);
+    // the newest GPU end (producer epoch, NvAPI frame, QPC) and the GPU frame
+    // periods between consecutive frames' GPU ends, in µs.
     double handoff_back_pressure_us_ = 0.0;
+    uint32_t handoff_stream_frames_ = 0;
+    uint32_t gpu_end_epoch_ = 0;
+    uint64_t gpu_end_frame_ = 0;
+    int64_t gpu_end_qpc_ = 0;
+    LeadSampleWindow gpu_period_window_{};
     ReleaseMarginLearner margin_{};
     ReleaseMarginLearner headroom_{ LEAD_HEADROOM_LIMITS };
     // Queue order: the newest LEAD_CONCURRENCY_SAMPLES pairs, 1 = concurrent.

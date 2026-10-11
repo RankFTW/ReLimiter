@@ -753,9 +753,10 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
     if (s_pending_adaptation_samples.Full()) return false;
 
     // Bootstrap from the newest retained report so a newly attached producer
-    // does not replay the driver's full historical ring. After that, select the
-    // oldest unseen report on each poll. A burst is therefore drained in source
-    // order instead of advancing the watermark past intermediate observations.
+    // does not replay the driver's full historical ring. After that, take
+    // every unseen report, oldest first, so a burst is drained in source
+    // order within one poll instead of advancing the watermark past
+    // intermediate observations or leaving them for later polls.
     // Cadence can be absent while CPU/GPU workload timestamps remain valid.
     bool report_ingested = false;
     bool cadence_fed = false;
@@ -1021,13 +1022,14 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
         pending_sample.gpu_execution_available = r.gpuActiveRenderTimeUs > 0;
         pending_sample.gpu_active_us = static_cast<double>(r.gpuActiveRenderTimeUs);
         pending_sample.gpu_start_qpc = ReflexTimestampToQpc(r.gpuRenderStartTime);
+        pending_sample.gpu_end_qpc = ReflexTimestampToQpc(r.gpuRenderEndTime);
         pending_sample.owned_cpu_stage_us = sample_owned_cpu_stage_us;
         pending_sample.gpu_frame_time_us = ft;
         pending_sample.present_duration_us = sample_present_duration_us;
         pending_sample.present_to_gpu_end_us = sample_present_to_gpu_end_us;
         pending_sample.owned_gate_hold_us = sample_owned_gate_hold_us;
         pending_sample.queue_trend_us = sample_queue_trend_us;
-        // Render handoff back-pressure term: this frame's report and the
+        // Render handoff GPU floor term: this frame's report and the
         // previous frame's, from this frame's RENDERSUBMIT_START.
         if (const NV_LATENCY_FRAME_REPORT* previous = PreviousFrameReport(params, i); previous != nullptr) {
             const uint64_t origin = r.renderSubmitStartTime;
@@ -1055,7 +1057,7 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
         }
         // Capacity was checked before admission; the scheduler owner excludes
         // another writer between that check and this commit.
-        if (!s_pending_adaptation_samples.Push(pending_sample)) return false;
+        if (!s_pending_adaptation_samples.Push(pending_sample)) break;
         s_last_reflex_frame_id = r.frameID;
 
         LARGE_INTEGER report_qpc{};
@@ -1067,7 +1069,11 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
 
         s_reflex_found_count++;
         report_ingested = true;
-        break;
+        // Bootstrap takes the newest report only. After that every unseen
+        // report is taken, oldest first, while the queue has room: one report
+        // per poll kept any backlog for good (polls run once per frame), and
+        // Gears of War: E-Day's reports then arrived 14 frames (250 ms) late.
+        if (bootstrap_report || s_pending_adaptation_samples.Full()) break;
     }
 
     if (!report_ingested) {
