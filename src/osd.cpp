@@ -425,21 +425,25 @@ static void DrawAdaptiveCapControl(bool* config_dirty) {
     HelpTip("Show the Adaptive cap on the OSD.");
 }
 
-// Advanced: how much of the recent load the Adaptive cap plans for.
+// Advanced: how much of the recent load the Adaptive cap plans for, one of
+// three tiers.
 static void DrawAdaptiveCapTuning(bool* config_dirty) {
     if (!g_config.adaptive_cap) return;
-    int percentile = g_config.adaptive_cap_percentile;
-    ImGui::SliderInt("Adaptive cap fit##adaptive", &percentile, kAdaptiveCapPercentileMin,
-        kAdaptiveCapPercentileMax, "%d%%", ImGuiSliderFlags_AlwaysClamp);
-    if (ImGui::IsItemEdited()) g_config.adaptive_cap_percentile = percentile;
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
+    static const char* const kFitLabels[] = {"75% (most frame rate)", "90%", "99% (smoothest)"};
+    static_assert(IM_ARRAYSIZE(kFitLabels) == IM_ARRAYSIZE(kAdaptiveCapFitTiers), "one label per tier");
+    int selected = 0;
+    for (int i = 0; i < IM_ARRAYSIZE(kAdaptiveCapFitTiers); ++i)
+        if (kAdaptiveCapFitTiers[i] == g_config.adaptive_cap_percentile) selected = i;
+    if (ImGui::Combo("Adaptive cap fit##adaptive", &selected, kFitLabels, IM_ARRAYSIZE(kFitLabels))) {
+        g_config.adaptive_cap_percentile = kAdaptiveCapFitTiers[selected];
         Config_ApplyPacingPipeline();
         LOG_INFO("OSD: adaptive cap percentile -> %d", g_config.adaptive_cap_percentile);
         *config_dirty = true;
     }
     HelpTip("The share of recent frames the Adaptive cap plans for (default 75%). Higher keeps heavy "
         "moments evenest at a lower frame rate; lower keeps more frame rate and lets the slowest frames "
-        "arrive a little late.");
+        "arrive a little late. In a test with frame generation near the GPU's limit, 99% removed most "
+        "stutter for about 5% less frame rate.");
 }
 
 // Advanced → Developer diagnostics (developer_settings=true in the INI):

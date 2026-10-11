@@ -110,8 +110,9 @@ struct Config {
     // demand or missed frames show the cap cannot be held. Migrates
     // the legacy Frame-Time Adaptation switch.
     bool adaptive_cap = false;
-    // Adaptive cap percentile [50, 99]: the share of recent frames the
-    // lengthened interval must fit. Separate from Smoothing.
+    // Adaptive cap fit, one of the tiers 75, 90, 99 (kAdaptiveCapFitTiers):
+    // the share of recent frames the lengthened interval must fit. Separate
+    // from Smoothing.
     int adaptive_cap_percentile = kAdaptiveCapPercentileDefault;
 
     // OSD: Adaptive cap HUD line (historical key name)

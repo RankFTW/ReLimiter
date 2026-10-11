@@ -847,13 +847,16 @@ namespace
         CHECK(SameConfig(PacingPipeline_GetConfig(), config));
         CHECK(PacingPipeline_GetConfig().adaptive_cap);
         CHECK(PacingPipeline_GetConfig().adaptive_cap_percentile == 90);
-        // The Adaptive cap percentile is clamped to [50, 99].
+        // The Adaptive cap fit is one of the tiers 75, 90 and 99; other
+        // values snap to the nearest.
         CHECK(PacingPipelineConfig{}.adaptive_cap_percentile == kAdaptiveCapPercentileDefault);
         config.adaptive_cap_percentile = 10;
-        CHECK(PacingPipeline_ClampConfig(config).adaptive_cap_percentile == kAdaptiveCapPercentileMin);
+        CHECK(PacingPipeline_ClampConfig(config).adaptive_cap_percentile == 75);
+        config.adaptive_cap_percentile = 85;
+        CHECK(PacingPipeline_ClampConfig(config).adaptive_cap_percentile == 90);
         config.adaptive_cap_percentile = 120;
         PacingPipeline_SetConfig(config);
-        CHECK(PacingPipeline_GetConfig().adaptive_cap_percentile == kAdaptiveCapPercentileMax);
+        CHECK(PacingPipeline_GetConfig().adaptive_cap_percentile == 99);
 
         // gpu_wait_budget_us: [500, 5000] µs, default 1500; non-positive or
         // non-finite values (0 used to mean "off") are the default.

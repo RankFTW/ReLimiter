@@ -583,12 +583,14 @@ void TestAdaptiveCapMigration() {
     }
 }
 
-// adaptive_cap_percentile defaults to 75, is clamped to [50, 99] and
-// saved as an integer.
+// adaptive_cap_percentile defaults to 75, keeps the tiers 75, 90 and 99,
+// snaps any other value to the nearest tier (up to 82 → 75, 83–94 → 90,
+// 95 and above → 99) and saves the tier.
 void TestAdaptiveCapPercentile() {
     struct Case { const char* value; int expected; };
-    for (const Case& test : {Case{nullptr, 75}, Case{"90", 90}, Case{"50", 50}, Case{"99", 99},
-            Case{"10", 50}, Case{"150", 99}}) {
+    for (const Case& test : {Case{nullptr, 75}, Case{"75", 75}, Case{"90", 90}, Case{"99", 99},
+            Case{"50", 75}, Case{"82", 75}, Case{"83", 90}, Case{"94", 90}, Case{"95", 99},
+            Case{"10", 75}, Case{"150", 99}}) {
         std::vector<IniEntry> ini;
         if (test.value) ini.push_back({"adaptive_cap_percentile", test.value});
         Reset(false, false, ini);

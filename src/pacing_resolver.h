@@ -77,19 +77,33 @@ constexpr double kPacingGpuWaitBudgetDefaultUs = 1500.0;
 constexpr double kPacingGpuWaitInterleaveMinS = 1.0;
 constexpr double kPacingGpuWaitInterleaveMaxS = 10.0;
 
-// Adaptive cap percentile: the share of
-// recent frames whose measured need the governed interval must fit. Higher
-// is more even pacing at a lower frame rate; lower keeps more frame rate and
-// lets the slowest frames run late. Separate from the Smoothing lead quantile.
-constexpr int kAdaptiveCapPercentileMin = 50;
-constexpr int kAdaptiveCapPercentileMax = 99;
+// Adaptive cap fit (user key adaptive_cap_percentile): the share of recent
+// frames whose measured need the governed interval must fit. Three tiers:
+// 75 (default, the most frame rate), 90 and 99 (the most even pacing at the
+// lowest frame rate; with frame generation near the GPU's limit it removed
+// most display spikes for about 5% less frame rate). Separate from the
+// Smoothing lead quantile.
+constexpr int kAdaptiveCapFitTiers[] = {75, 90, 99};
 constexpr int kAdaptiveCapPercentileDefault = 75;
+
+// The tier nearest to percentile (other values from older versions and hand
+// edits): up to 82 is 75, 83 to 94 is 90, 95 and above is 99.
+constexpr int PacingPipeline_AdaptiveCapFitTier(int percentile) noexcept
+{
+    int best = kAdaptiveCapFitTiers[0];
+    for (const int tier : kAdaptiveCapFitTiers) {
+        const int distance = tier > percentile ? tier - percentile : percentile - tier;
+        const int best_distance = best > percentile ? best - percentile : percentile - best;
+        if (distance < best_distance) best = tier;
+    }
+    return best;
+}
 
 struct PacingPipelineConfig {
     PacingSmoothing smoothing = PacingSmoothing::On;
     PacingRungOverride rung_override = PacingRungOverride::Auto;
     bool adaptive_cap = false;    // user key adaptive_cap: the period governor
-    int adaptive_cap_percentile = kAdaptiveCapPercentileDefault; // user key; [50, 99]
+    int adaptive_cap_percentile = kAdaptiveCapPercentileDefault; // user key; a tier of kAdaptiveCapFitTiers
     PacingPlacementOverride placement_override = PacingPlacementOverride::PreSleep; // key source_placement
     bool gpu_probes = true;       // developer key gpu_present_gate_probes
     double gpu_wait_budget_us = kPacingGpuWaitBudgetDefaultUs; // developer key gpu_wait_budget_us: [500, 5000]

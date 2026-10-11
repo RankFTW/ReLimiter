@@ -223,14 +223,12 @@ void ValidateConfig() {
     }
     g_config.stall_inject_ms = Clamp(
         g_config.stall_inject_ms, 0.0, kPacingStallInjectMaxMs);
-    if (g_config.adaptive_cap_percentile < kAdaptiveCapPercentileMin ||
-        g_config.adaptive_cap_percentile > kAdaptiveCapPercentileMax) {
-        LOG_WARN("Config: adaptive_cap_percentile %d outside [%d, %d], clamped",
-                 g_config.adaptive_cap_percentile, kAdaptiveCapPercentileMin,
-                 kAdaptiveCapPercentileMax);
+    const int fit_tier = PacingPipeline_AdaptiveCapFitTier(g_config.adaptive_cap_percentile);
+    if (fit_tier != g_config.adaptive_cap_percentile) {
+        LOG_WARN("Config: adaptive_cap_percentile %d is not a tier (75, 90 or 99), using %d",
+                 g_config.adaptive_cap_percentile, fit_tier);
+        g_config.adaptive_cap_percentile = fit_tier;
     }
-    g_config.adaptive_cap_percentile = Clamp(
-        g_config.adaptive_cap_percentile, kAdaptiveCapPercentileMin, kAdaptiveCapPercentileMax);
     if (!std::isfinite(g_config.stall_inject_period_s)) {
         LOG_WARN("Config: non-finite stall_inject_period_s, resetting to %.0f",
                  kPacingStallInjectDefaultPeriodS);

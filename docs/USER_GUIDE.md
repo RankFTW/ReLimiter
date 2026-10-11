@@ -65,7 +65,7 @@ Open the ReShade overlay, normally with **Home**, and find ReLimiter's settings 
 3. Leave **Adaptive cap** off initially. Try it if heavy scenes or areas drop the frame rate below the cap.
 4. Open **OSD** and enable the readings you want to see.
 
-The FPS controls are at the top, followed by the pacing status (with its **Details**) and **Adaptive cap**. **OSD** and **Screen** follow. **Enable advanced settings** reveals compatibility options and the **Adaptive cap fit** slider; most users can leave it unchecked.
+The FPS controls are at the top, followed by the pacing status (with its **Details**) and **Adaptive cap**. **OSD** and **Screen** follow. **Enable advanced settings** reveals compatibility options and the **Adaptive cap fit** choice; most users can leave it unchecked.
 
 ReLimiter ships the recommended defaults and you are not expected to tune pacing: smoothing is always on, the output point is chosen automatically, and there is no separate setup for frame generation. Settings save automatically. Existing caps and compatible preferences are carried forward when upgrading; see [Removed and migrated keys](#removed-and-migrated-keys).
 
@@ -247,7 +247,7 @@ It is **disabled by default**. The checkbox appears on every API and pacing rout
 | Setting | Default | What it does |
 |---------|---------|--------------|
 | **Adaptive cap** | Off | Main view. Turns the adaptive interval on or off. Turning it off returns to the cap immediately. Next to the checkbox, `(at the cap)` (green) or `(N% below the cap)` (yellow) shows how far the frame rate is below the cap. |
-| **Adaptive cap fit** | 75% | Under **Advanced** (**Enable advanced settings**), shown only while Adaptive cap is on (50–99%). The share of recent frames the lengthened interval plans for. Higher gives the most even pacing at the lowest frame rate. Lower keeps more frame rate: the slowest frames of heavy moments then arrive late, which VRR shows as longer frames. |
+| **Adaptive cap fit** | 75% | Under **Advanced** (**Enable advanced settings**), shown only while Adaptive cap is on. The share of recent frames the lengthened interval plans for: **75%** (the most frame rate), **90%** or **99%** (the smoothest). Higher gives more even pacing at a lower frame rate. Lower keeps more frame rate: the slowest frames of heavy moments then arrive late, which VRR shows as longer frames. In a test with frame generation near the GPU's limit, 99% removed most stutter for about 5% less frame rate. |
 | **Show on OSD** | Off | Main view, under the checkbox, shown once Adaptive cap is on. Adds the **Adaptive cap** line to the OSD. |
 
 What to expect:
@@ -467,7 +467,7 @@ There is no separate Dynamic MFG output-cap slider in ReLimiter's panel, and the
 
 Check **Enable advanced settings** below the pacing controls to reveal additional options. Start with the defaults and change one setting at a time.
 
-Advanced includes the **Adaptive cap fit** slider (while Adaptive cap is on), Reflex injection, flip-model compatibility, telemetry and logging, DLSS information controls and Streamline compatibility. Some controls are only available in the 64-bit addon. The output points and supported frame generation do not require separate tuning controls.
+Advanced includes the **Adaptive cap fit** choice (while Adaptive cap is on), Reflex injection, flip-model compatibility, telemetry and logging, DLSS information controls and Streamline compatibility. Some controls are only available in the 64-bit addon. The output points and supported frame generation do not require separate tuning controls.
 
 ### Developer Settings
 
@@ -570,7 +570,7 @@ Most settings can be changed through the overlay. For manual changes, close the 
 |-----|---------|------------------|
 | `target_fps` | 0 | 0 disables the normal cap; 30–1000 FPS via INI. Use the overlay to choose VRR Cap or a custom target. |
 | `adaptive_cap` | false | Enable **Adaptive cap**: lengthens the cap interval, up to +60%, while frames are late and the cap can't be held, and shortens it again when they are not. See [Adaptive cap](#adaptive-cap). |
-| `adaptive_cap_percentile` | 75 | **Adaptive cap fit** (Advanced), 50–99 (values outside are clamped): the share of recent frames the lengthened interval plans for. |
+| `adaptive_cap_percentile` | 75 | **Adaptive cap fit** (Advanced): `75`, `90` or `99`, the share of recent frames the lengthened interval plans for. Other values move to the nearest of the three (up to 82 → 75, 83–94 → 90, 95 and above → 99). |
 | `advanced_settings` | false | Show advanced user controls |
 | `developer_settings` | false | INI-only. Shows the developer settings in the Advanced section; see [Developer Settings](#developer-settings). |
 | `config_version` | 2 | Written by ReLimiter; do not edit. Records which defaults the file was written with; see [Removed and migrated keys](#removed-and-migrated-keys). |

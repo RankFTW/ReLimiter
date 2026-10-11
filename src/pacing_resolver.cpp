@@ -493,8 +493,7 @@ PacingPipelineConfig PacingPipeline_ClampConfig(PacingPipelineConfig config) noe
         static_cast<uint32_t>(PacingLeadCoverage::Count)) {
         config.lead_coverage = kDefaultConfig.lead_coverage;
     }
-    config.adaptive_cap_percentile = (std::clamp)(config.adaptive_cap_percentile,
-        kAdaptiveCapPercentileMin, kAdaptiveCapPercentileMax);
+    config.adaptive_cap_percentile = PacingPipeline_AdaptiveCapFitTier(config.adaptive_cap_percentile);
     config.stall_inject_ms = ClampFinite(config.stall_inject_ms,
         kDefaultConfig.stall_inject_ms, 0.0, kPacingStallInjectMaxMs);
     config.stall_inject_period_s = ClampFinite(config.stall_inject_period_s,

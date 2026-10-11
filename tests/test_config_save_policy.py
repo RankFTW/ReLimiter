@@ -243,12 +243,6 @@ class ConfigSavePolicyTests(unittest.TestCase):
         self.assertIn('"smoothing", PacingSmoothing_Text(config.smoothing)', writer)
         self.assertIn('"output_rung", PacingRungOverride_Text(config.output_rung)', writer)
         self.assertIn('"adaptive_cap", config.adaptive_cap', writer)
-        # The Adaptive cap percentile is loaded, clamped to [50, 99] in
-        # validation (and again by the resolver) and saved as an integer.
-        self.assertRegex(loader, r'ReadINIInt\(\s*S, "adaptive_cap_percentile", kAdaptiveCapPercentileDefault')
-        self.assertRegex(validate, r"g_config\.adaptive_cap_percentile,\s*kAdaptiveCapPercentileMin,"
-                                   r"\s*kAdaptiveCapPercentileMax")
-        self.assertIn('WriteINIInt(S, "adaptive_cap_percentile", config.adaptive_cap_percentile, P)', writer)
         # The forward order is validated text, saved canonically and
         # applied to the marker hook with the rest of the pipeline.
         self.assertIn("PacingMarkerForwardOrder_FromText(forward_order.c_str(), "
