@@ -582,6 +582,7 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
     }
     slot.gpu_resume_probe = frame.gpu_resume_probe;
     slot.render_queue = frame.render_queue;
+    slot.driver_hold_exclusion = frame.driver_hold_exclusion;
     SetField(&slot, FieldSource, frame.source_release_qpc);
     RecordReleaseToRender(&slot);
     if (slot.sampled && slot.rung == PacingRung::GpuQueueWait) {
@@ -609,7 +610,8 @@ void LeadController::OnStageEvent(const PacingStageEvent& event) noexcept
         "Field values must match PacingStageEventKind");
     static_assert(FieldCount <= 16, "field_mask holds one bit per Field");
 
-    const bool hold_event = event.kind == PacingStageEventKind::RenderStartHold;
+    const bool start_hold_event = event.kind == PacingStageEventKind::RenderStartHold;
+    const bool hold_event = start_hold_event || event.kind == PacingStageEventKind::DriverPresentHold;
     const uint8_t kind = static_cast<uint8_t>(event.kind);
     if (qpc_frequency_ <= 0 || event.qpc <= 0 || !PacingPlanKey_IsValid(event.key) ||
         (hold_event ? event.hold_ticks <= 0 : (kind == FieldSource || kind >= FieldCount))) {
@@ -639,10 +641,16 @@ void LeadController::OnStageEvent(const PacingStageEvent& event) noexcept
     }
 
     if (hold_event) {
-        // Not a stage time: the hold leaves X and σ (RenderStartHoldUs). The
-        // push precedes the frame's RENDERSUBMIT_START event, so it is known
-        // before σ and any sample are taken; the first value wins.
-        if (frame->render_start_hold_ticks == 0) frame->render_start_hold_ticks = event.hold_ticks;
+        // Not a stage time. The render-thread start hold leaves this frame's
+        // X and σ (RenderStartHoldUs): the push precedes the frame's
+        // RENDERSUBMIT_START event, so it is known before σ and any sample
+        // are taken; the first value wins. The driver's Present hold is kept
+        // for the next frame's sample (DriverHoldUs); the longest call wins.
+        if (start_hold_event) {
+            if (frame->render_start_hold_ticks == 0) frame->render_start_hold_ticks = event.hold_ticks;
+        } else if (event.hold_ticks > frame->driver_hold_ticks) {
+            frame->driver_hold_ticks = event.hold_ticks;
+        }
         return;
     }
     const Field field = static_cast<Field>(kind);
@@ -814,6 +822,12 @@ double LeadController::RenderStartHoldUs(const PendingFrame& frame) const noexce
 {
     if (frame.render_start_hold_ticks <= 0 || qpc_frequency_ <= 0) return 0.0;
     return MicrosecondsBetween(0, frame.render_start_hold_ticks);
+}
+
+double LeadController::DriverHoldUs(const PendingFrame& frame) const noexcept
+{
+    if (frame.driver_hold_ticks <= 0 || qpc_frequency_ <= 0) return 0.0;
+    return MicrosecondsBetween(0, frame.driver_hold_ticks);
 }
 
 // ── Buckets ──
@@ -1286,6 +1300,20 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
     // frame waited for the render thread to leave the previous Present; the
     // slack above keeps it.
     const double queue_us = QueueUs(*frame, Previous(*frame));
+    frame->queue_removed_us = queue_us > 0.0 ? queue_us : 0.0;
+    // The driver's Present hold under the previous NvAPI frame ID delays this
+    // frame's first submission (lead_controller.h); CommitLeadSample takes
+    // what q and W did not already remove.
+    frame->previous_driver_hold_us = 0.0;
+    if (frame->driver_hold_exclusion && IsGpuRung(frame->rung)) {
+        const PendingFrame* previous = Previous(*frame);
+        if (previous != nullptr && previous->key.identity_domain == PacingIdentityDomain::NvApiFrame &&
+            frame->key.identity_domain == PacingIdentityDomain::NvApiFrame &&
+            previous->key.producer_epoch == frame->key.producer_epoch &&
+            previous->key.frame_id + 1 == frame->key.frame_id) {
+            frame->previous_driver_hold_us = DriverHoldUs(*previous);
+        }
+    }
     if (queue_us > 0.0) {
         ++statistics_.queued_samples;
         statistics_.last_queue_us = queue_us;
@@ -1316,6 +1344,15 @@ void LeadController::CommitLeadSample(PendingFrame* frame, double lead_sample_us
         lead_sample_us = std::max(0.0, lead_sample_us - held_back_us);
         ++statistics_.held_back_corrected_samples;
         statistics_.last_held_back_wait_us = held_back_us;
+    }
+    // The driver's Present hold of the previous frame adds only what q and W
+    // did not already remove: max(q + W, H) in all.
+    const double driver_extra_us =
+        std::max(0.0, frame->previous_driver_hold_us - (frame->queue_removed_us + held_back_us));
+    if (driver_extra_us > 0.0) {
+        lead_sample_us = std::max(0.0, lead_sample_us - driver_extra_us);
+        ++statistics_.driver_hold_corrected_samples;
+        statistics_.last_driver_hold_us = frame->previous_driver_hold_us;
     }
     if (lead_sample_us > LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us) {
         ++bucket.excluded_long;

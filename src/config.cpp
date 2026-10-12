@@ -426,6 +426,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.gpu_present_gate_probes=ReadINIBool(S,"gpu_present_gate_probes",true,P);
     g_config.fg_late_spacing=ReadINIBool(S,"fg_late_spacing",true,P);
     g_config.render_start_hold=ReadINIBool(S,"render_start_hold",false,P);
+    g_config.held_gpu_floor=ReadINIBool(S,"held_gpu_floor",false,P);
     g_config.reflex_sleep_bypass=ReadINIBool(S,"reflex_sleep_bypass",true,P);
     g_config.reflex_inject           = ReadINIBool(S, "reflex_inject", false, P);
     g_config.flip_model_override     = ReadINIBool(S, "flip_model_override", false, P);
@@ -644,6 +645,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIString(S, "lead_coverage", PacingLeadCoverage_Text(config.lead_coverage), P);
     WriteINIBool(S, "fg_late_spacing", config.fg_late_spacing, P);
     WriteINIBool(S, "render_start_hold", config.render_start_hold, P);
+    WriteINIBool(S, "held_gpu_floor", config.held_gpu_floor, P);
     WriteINIString(S, "source_placement",
         PacingPlacementOverride_Text(config.source_placement), P);
     WriteINIDouble(S, "stall_inject_ms", config.stall_inject_ms, P);
@@ -887,6 +889,7 @@ static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
     pipeline.lead_coverage = config.lead_coverage;
     pipeline.fg_late_spacing = config.fg_late_spacing;
     pipeline.render_start_hold = config.render_start_hold;
+    pipeline.held_gpu_floor = config.held_gpu_floor;
     return pipeline;
 }
 
@@ -918,6 +921,7 @@ int Config_DeveloperOverrides() {
         (g_config.lead_coverage != d.lead_coverage) +
         (g_config.fg_late_spacing != d.fg_late_spacing) +
         (g_config.render_start_hold != d.render_start_hold) +
+        (g_config.held_gpu_floor != d.held_gpu_floor) +
         (g_config.source_placement != d.source_placement);
 }
 
@@ -937,6 +941,7 @@ void Config_ResetDeveloperSettings() {
     g_config.lead_coverage = d.lead_coverage;
     g_config.fg_late_spacing = d.fg_late_spacing;
     g_config.render_start_hold = d.render_start_hold;
+    g_config.held_gpu_floor = d.held_gpu_floor;
     g_config.source_placement = d.source_placement;
     Config_ApplyPacingPipeline();
     LOG_INFO("Config: developer diagnostics reset to the recommended defaults");
@@ -994,6 +999,10 @@ void ApplyConfig() {
         LOG_WARN("Pacing pipeline: diagnostic render-thread start hold on (RENDERSUBMIT_START of a direct "
                  "NvAPI frame waits until the GPU-anchored target while ReLimiter paces the source and the "
                  "Reflex Sleep is bypassed)");
+    if (g_config.held_gpu_floor)
+        LOG_WARN("Pacing pipeline: diagnostic held-frame GPU floor on (frames held by the lead are released no "
+                 "earlier than the render handoff GPU floor, and their lead samples leave out the driver's "
+                 "Present hold measured in NvAPI_D3D12_SetAsyncFrameMarker)");
 }
 
 

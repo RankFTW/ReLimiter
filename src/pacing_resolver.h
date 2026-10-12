@@ -129,6 +129,12 @@ struct PacingPipelineConfig {
     // thread waits at its RENDERSUBMIT_START until the GPU-anchored target
     // (render_handoff.h, Hook_SetLatencyMarker).
     bool render_start_hold = false;
+    // Key held_gpu_floor (default off; developer A/B): frames held by the lead
+    // (plan rung > 0) are released no earlier than the render handoff GPU
+    // floor (RunPlanned, Scheduler_PlanReflexSleep) and the lead
+    // removes the driver's Present hold of the previous frame from their
+    // samples (lead_controller.h, DriverPresentHold).
+    bool held_gpu_floor = false;
     double stall_inject_ms = 0.0; // 0 = off; [0, kPacingStallInjectMaxMs]
     double stall_inject_period_s = kPacingStallInjectDefaultPeriodS; // [1, 60]
 };

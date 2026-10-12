@@ -202,7 +202,14 @@ enum class PacingStageEventKind : uint8_t {
     // render_start_hold): ReLimiter's wait at RENDERSUBMIT_START, not a stage
     // time. qpc is the hold's end, hold_ticks its duration (> 0). It leaves the
     // lead sample X and σ (lead_controller.h).
-    RenderStartHold = 10
+    RenderStartHold = 10,
+    // The NVIDIA driver's hold inside one NvAPI_D3D12_SetAsyncFrameMarker call
+    // (Hook_SetAsyncFrameMarker), keyed by the async marker's NvAPI frame ID:
+    // not a stage time. qpc is the call's end, hold_ticks its duration (> 0).
+    // It delays the next frame's first driver submission; with the developer
+    // A/B key held_gpu_floor the lead leaves it out of that frame's sample
+    // (lead_controller.h).
+    DriverPresentHold = 11
 };
 
 // Developer key `gpu_queue_wait_render_queue` (A/B): whether the
@@ -239,6 +246,6 @@ struct PacingStageEvent {
     // GpuResume only: the pre-Wait GPU timestamp mapped to QPC (the GPU
     // reached the fence Wait); 0 when unknown.
     int64_t gpu_wait_qpc = 0;
-    // RenderStartHold only: the waited duration in QPC ticks.
+    // RenderStartHold and DriverPresentHold: the waited duration in QPC ticks.
     int64_t hold_ticks = 0;
 };

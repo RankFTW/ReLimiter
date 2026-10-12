@@ -301,6 +301,24 @@ constexpr CollisionDistanceLimits LEAD_HEADROOM_LIMITS{ 1000.0, 750.0, 3000.0 };
 // the lead and σ keep describing the game and the floor above stays the
 // release that precedes the hold.
 //
+// Driver Present hold (developer A/B key held_gpu_floor,
+// Hook_SetAsyncFrameMarker): under the Reflex Sleep bypass with DLSS-G the
+// NVIDIA driver holds the thread that calls the game's Present inside
+// NvAPI_D3D12_SetAsyncFrameMarker. The hook delivers each call's duration as a
+// stage event (PacingStageEventKind::DriverPresentHold, keyed by the async
+// marker's NvAPI frame ID; the longest call of a frame wins). The hold
+// recorded under frame n delays frame n + 1's first driver submission
+// (Gears: correlation with F(n + 1) 0.80–0.82, with F(n) 0.48–0.49), so it is
+// frame n + 1's sample it inflates. With the key on, the lead sample of a
+// frame on a GPU wait whose predecessor n has a hold H leaves out
+// max(q + W, H) instead of q + W alone, i.e. it adds only max(0, H − (q + W)):
+// where q (FG input wait) or W (held-back correction) already removed the
+// same hold (CONTROL Resonant: the hold ends before PRESENT_END and is inside
+// q; Gears: it follows PRESENT_END and only W sees it) nothing is taken twice.
+// c and the render-thread start hold stay as they are. Without a hold of
+// frame n (unknown or 0), a predecessor that is not frame n − 1 of the same
+// NvAPI stream, or with the key off, the sample is unchanged.
+//
 // Held frames: the lead (Q_q(X) + allowance) learns its own early release
 // when the render thread is held back, because X then contains the wait. In
 // Gears held at FG 2× with the Adaptive cap, a lead of 42–47 ms started the
@@ -370,6 +388,9 @@ struct LeadFrameStart {
     // frame's lead sample leaves out the simulation → render queue (above).
     // The FG input wait always does; other rungs never.
     PacingRenderQueue render_queue = PacingRenderQueue::Keep;
+    // Developer A/B (held_gpu_floor): the lead sample of a GPU-rung frame
+    // leaves out the driver's Present hold of the previous frame (above).
+    bool driver_hold_exclusion = false;
     // The collision guard's verdict on L (NextLeadUs). The Adaptive cap's
     // slack is judged against L + guard.reduction_us, so lateness the guard
     // accepts on purpose is not a missed target; a judged frame adds its
@@ -489,6 +510,10 @@ struct LeadStatistics {
     // lead sample, σ sample and slack, and the newest such hold.
     uint64_t render_start_hold_samples = 0;
     double last_render_start_hold_us = 0.0;
+    // Samples shortened by the previous frame's driver Present hold beyond
+    // what q and W removed (above), and the newest such hold.
+    uint64_t driver_hold_corrected_samples = 0;
+    double last_driver_hold_us = 0.0;
     // Report pairs (above): pairs of pending frames, of those held back, the
     // lead samples that waited for their pair and lost a held-back wait,
     // samples committed without their pair (expired), and pairs without a
@@ -615,9 +640,11 @@ public:
     double NextLeadUs(const LeadRequest& request, bool* budget_limited = nullptr,
         LeadGuardOutcome* guard = nullptr) noexcept;
     void OnSourceRelease(const LeadFrameStart& frame) noexcept;
-    // A stage event of kind RenderStartHold carries the frame's own hold in
-    // PacingStageEvent::hold_ticks; it is not a stage time and is taken out
-    // of the frame's lead sample X (every rung) and σ.
+    // A stage event of kind RenderStartHold or DriverPresentHold carries a
+    // duration in PacingStageEvent::hold_ticks; neither is a stage time. The
+    // render-thread start hold is taken out of the frame's own lead sample X
+    // (every rung) and σ; the driver's Present hold, kept longest per frame,
+    // out of the next GPU-rung frame's sample under the held_gpu_floor key.
     void OnStageEvent(const PacingStageEvent& event) noexcept;
     // The Reflex latency report of NvAPI frame (producer_epoch, frame_id):
     // its GPU active render time A and, through the stable clock map, the
@@ -773,6 +800,13 @@ private:
         // ReLimiter's own render-thread start hold of this frame (the
         // RenderStartHold event), QPC ticks; 0 none. Left out of X and σ.
         int64_t render_start_hold_ticks = 0;
+        // The driver's longest Present hold recorded under this frame's NvAPI
+        // frame ID (the DriverPresentHold event), QPC ticks; 0 none. It
+        // affects the next frame's sample, never this one's.
+        int64_t driver_hold_ticks = 0;
+        bool driver_hold_exclusion = false;  // the key held_gpu_floor at this frame's release
+        double queue_removed_us = 0.0;       // q already out of waiting_lead_sample_us
+        double previous_driver_hold_us = 0.0; // the previous frame's hold, taken when the sample is emitted
     };
 
     // The newest LEAD_SLACK_CAPACITY slack signs of one bucket.
@@ -824,6 +858,8 @@ private:
     void RecordReleaseToRender(PendingFrame* frame) noexcept;
     // The frame's own render-thread start hold in µs (0 none).
     double RenderStartHoldUs(const PendingFrame& frame) const noexcept;
+    // The longest driver Present hold of a frame in µs (0 none).
+    double DriverHoldUs(const PendingFrame& frame) const noexcept;
     void RecordConcurrency(PendingFrame* frame) noexcept;
     double CollisionGuardedLeadUs(const LeadRequest& request, size_t bucket_index, double lead_us,
         LeadGuardOutcome* guard) noexcept;

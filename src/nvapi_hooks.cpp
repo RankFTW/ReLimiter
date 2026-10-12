@@ -1229,6 +1229,15 @@ static NvAPI_Status __cdecl Hook_SetAsyncFrameMarker(IUnknown* queue, NV_ASYNC_F
     record.entry_qpc = call_entry.QuadPart;
     record.exit_qpc = call_exit.QuadPart;
     PacingTelemetry_PushWait(record);
+    // Developer A/B held_gpu_floor: the call's duration also reaches the lead
+    // as a stage event of this async marker's frame ID (nonblocking); the lead
+    // keeps the longest call per frame and leaves it out of the next frame's
+    // lead sample. Nothing is pushed with the key off.
+    if (call_exit.QuadPart > call_entry.QuadPart && PacingPipeline_GetConfig().held_gpu_floor) {
+        const PacingPlanKey hold_key{PacingIdentityDomain::NvApiFrame,
+            record.key.producer_epoch, FrameTimeline_CurrentControllerGeneration(), frame_id};
+        PresentGate_OnDriverPresentHold(hold_key, call_exit.QuadPart, call_exit.QuadPart - call_entry.QuadPart);
+    }
     return result;
 }
 

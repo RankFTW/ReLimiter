@@ -306,6 +306,7 @@ void CheckPipelineMatchesConfig() {
     CHECK(pipeline.lead_coverage == g_config.lead_coverage);
     CHECK(pipeline.fg_late_spacing == g_config.fg_late_spacing);
     CHECK(pipeline.render_start_hold == g_config.render_start_hold);
+    CHECK(pipeline.held_gpu_floor == g_config.held_gpu_floor);
     CHECK(g_marker_forward_after_wait.load() ==
         (g_config.marker_forward_order == PacingMarkerForwardOrder::AfterWait));
     CHECK(g_reflex_markers_optimize_off.load() ==
@@ -327,6 +328,7 @@ void TestPacingPipelineDefaults() {
     CHECK(g_config.lead_coverage == PacingLeadCoverage::Q99);
     CHECK(g_config.fg_late_spacing);
     CHECK(!g_config.render_start_hold);
+    CHECK(!g_config.held_gpu_floor);
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
     CheckPipelineMatchesConfig();
     // The startup rewrite saves every new key, including the developer keys.
@@ -336,6 +338,7 @@ void TestPacingPipelineDefaults() {
     CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "99");
     CHECK(Value(local_path, "FrameLimiter", "fg_late_spacing") == "true");
     CHECK(Value(local_path, "FrameLimiter", "render_start_hold") == "false");
+    CHECK(Value(local_path, "FrameLimiter", "held_gpu_floor") == "false");
     CHECK(Value(local_path, "FrameLimiter", "source_placement") == "pre_sleep");
     CHECK(Value(local_path, "FrameLimiter", "reflex_sleep_bypass") == "true");
     CHECK(Value(local_path, "FrameLimiter", "developer_settings") == "false");
@@ -622,6 +625,20 @@ void TestRenderStartHoldKey() {
     CHECK(Config_DeveloperOverrides() == 1);
     Config_ResetDeveloperSettings();
     CHECK(!g_config.render_start_hold && !PacingPipeline_GetConfig().render_start_hold);
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// Developer A/B held_gpu_floor: true loads, reaches the pipeline, counts as a
+// developer override and resets to false.
+void TestHeldGpuFloorKey() {
+    Reset(false, false, {{"config_version", "4"}, {"held_gpu_floor", "true"}});
+    CHECK(g_config.held_gpu_floor);
+    CheckPipelineMatchesConfig();
+    CHECK(PacingPipeline_GetConfig().held_gpu_floor);
+    CHECK(Value(local_path, "FrameLimiter", "held_gpu_floor") == "true");
+    CHECK(Config_DeveloperOverrides() == 1);
+    Config_ResetDeveloperSettings();
+    CHECK(!g_config.held_gpu_floor && !PacingPipeline_GetConfig().held_gpu_floor);
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
@@ -1007,6 +1024,7 @@ int main() {
     TestLeadCoverageKey();
     TestFgLateSpacingKey();
     TestRenderStartHoldKey();
+    TestHeldGpuFloorKey();
     TestSourcePlacementParsing();
     TestPacingMethodMigration();
     TestAdaptiveCapMigration();

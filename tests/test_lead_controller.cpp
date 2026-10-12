@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -2873,6 +2874,160 @@ void TestHeldBackLeadCorrection()
     CHECK(controller->Statistics().samples == before);
 }
 
+// Developer A/B held_gpu_floor: the NVIDIA driver's hold inside the Present
+// call recorded under frame n (DriverPresentHold events; the longest call of
+// the frame wins) delays frame n + 1's first submission, so frame n + 1's lead
+// sample on a GPU wait leaves it out: max(q + W, H) in all, adding only
+// max(0, H − (q + W)). Nothing changes with the key off, without a hold of
+// frame n, or when frame n is not frame n + 1's predecessor; frame n's own
+// sample never changes. These frames use consecutive NvAPI frame IDs (Key()
+// skips).
+void TestDriverPresentHoldExclusion()
+{
+    const auto key_at = [](uint64_t index, uint64_t id_gap) {
+        PacingPlanKey key = Key(index);
+        key.frame_id = 9000 + index + id_gap;
+        return key;
+    };
+    const auto event_at = [&](uint64_t index, uint64_t id_gap, Kind kind, double at_us,
+        PacingPlanStatus status = PacingPlanStatus::Held) {
+        PacingStageEvent event = Event(index, kind, at_us, status);
+        event.key = key_at(index, id_gap);
+        return event;
+    };
+    const auto release = [&](LeadController* controller, uint64_t index, uint64_t id_gap, PacingRung rung,
+        double source_us, bool key_on) {
+        LeadFrameStart start = Start(index, rung, source_us);
+        start.key = key_at(index, id_gap);
+        start.lead_us = 20000.0;
+        start.driver_hold_exclusion = key_on;
+        controller->OnSourceRelease(start);
+    };
+    const auto hold = [&](LeadController* controller, uint64_t index, uint64_t id_gap, double hold_us) {
+        PacingStageEvent event = event_at(index, id_gap, Kind::DriverPresentHold, 30000.0);
+        event.hold_ticks = static_cast<int64_t>(std::llround(hold_us * 10.0));
+        controller->OnStageEvent(event);
+    };
+    // A GPU-wait frame with sample x_us (p halfway, r and the output at x_us).
+    const auto gpu_frame = [&](LeadController* controller, uint64_t index, uint64_t id_gap, bool key_on,
+        double x_us, std::initializer_list<double> own_holds = {}) {
+        const double source_us = static_cast<double>(index) * kInterval;
+        release(controller, index, id_gap, PacingRung::GpuQueueWait, source_us, key_on);
+        for (const double own_hold_us : own_holds) hold(controller, index, id_gap, own_hold_us);
+        controller->OnStageEvent(event_at(index, id_gap, Kind::PresentCall, source_us + x_us / 2.0));
+        controller->OnStageEvent(event_at(index, id_gap, Kind::GpuReady, source_us + x_us));
+        controller->OnStageEvent(event_at(index, id_gap, Kind::OutputRelease, source_us + x_us));
+    };
+
+    // Nothing else removed (GPU queue wait, no q, no pairs): the whole hold.
+    // Frame 1's own hold leaves its sample as it is and frame 2's by 3,000;
+    // frame 2's calls of 2,000, 4,000 and 1,000 µs keep the longest (4,000)
+    // for frame 3; frame 4 follows frame 3, which had none.
+    for (const bool key_on : { true, false }) {
+        auto controller = MakeController();
+        gpu_frame(controller.get(), 1, 0, key_on, 12000.0, { 3000.0 });
+        CHECK_NEAR(controller->Statistics().last_sample_us, 12000.0);
+        gpu_frame(controller.get(), 2, 0, key_on, 12000.0, { 2000.0, 4000.0, 1000.0 });
+        CHECK_NEAR(controller->Statistics().last_sample_us, key_on ? 9000.0 : 12000.0);
+        CHECK(controller->Statistics().driver_hold_corrected_samples == (key_on ? 1u : 0u));
+        CHECK_NEAR(controller->Statistics().last_driver_hold_us, key_on ? 3000.0 : 0.0);
+        gpu_frame(controller.get(), 3, 0, key_on, 12000.0);
+        CHECK_NEAR(controller->Statistics().last_sample_us, key_on ? 8000.0 : 12000.0);
+        gpu_frame(controller.get(), 4, 0, key_on, 12000.0);
+        CHECK_NEAR(controller->Statistics().last_sample_us, 12000.0);
+        CHECK(controller->Statistics().samples == 4);
+        CHECK(controller->Statistics().driver_hold_corrected_samples == (key_on ? 2u : 0u));
+        CHECK_NEAR(controller->Statistics().last_driver_hold_us, key_on ? 4000.0 : 0.0);
+        CHECK(controller->Statistics().invalid_inputs == 0);
+    }
+
+    // A hold that arrives before its frame's release counts the same, and a
+    // hold longer than the sample leaves 0.
+    auto early = MakeController();
+    hold(early.get(), 1, 0, 20000.0);
+    gpu_frame(early.get(), 1, 0, true, 12000.0);
+    gpu_frame(early.get(), 2, 0, true, 12000.0);
+    CHECK_NEAR(early->Statistics().last_sample_us, 0.0);
+    CHECK(early->Statistics().driver_hold_corrected_samples == 1);
+
+    // The hold must be the immediate predecessor's: a gap in the NvAPI frame
+    // IDs (frame 2 is not frame 1 + 1) leaves the sample whole.
+    auto gap = MakeController();
+    gpu_frame(gap.get(), 1, 0, true, 12000.0, { 3000.0 });
+    gpu_frame(gap.get(), 2, 1, true, 12000.0);
+    CHECK_NEAR(gap->Statistics().last_sample_us, 12000.0);
+    CHECK(gap->Statistics().driver_hold_corrected_samples == 0);
+
+    // Source-only frames keep their sample: only GPU waits take the hold out.
+    auto source_only = MakeController();
+    release(source_only.get(), 1, 0, PacingRung::SourceOnly, 10000.0, true);
+    hold(source_only.get(), 1, 0, 3000.0);
+    source_only->OnStageEvent(event_at(1, 0, Kind::MarkerArrival, 15000.0));
+    release(source_only.get(), 2, 0, PacingRung::SourceOnly, 20000.0, true);
+    source_only->OnStageEvent(event_at(2, 0, Kind::MarkerArrival, 25000.0));
+    CHECK_NEAR(source_only->Statistics().last_sample_us, 5000.0);
+    CHECK(source_only->Statistics().driver_hold_corrected_samples == 0);
+
+    // A non-positive hold is an invalid input.
+    auto invalid = MakeController();
+    hold(invalid.get(), 1, 0, 0.0);
+    CHECK(invalid->Statistics().invalid_inputs == 1);
+
+    // FG input wait with q (TestSimulationRenderQueue's frame 2: X = 17,000,
+    // q = 4,000): a hold up to q adds nothing, a longer one only the excess,
+    // so the sample is X − max(q, H).
+    for (const double hold_us : { 0.0, 3000.0, 4000.0, 5000.0, 6500.0 }) {
+        for (const bool key_on : { true, false }) {
+            auto controller = MakeController();
+            const auto fg_frame = [&](uint64_t index, double source, double simulation_end, double submit,
+                double present, double ready) {
+                release(controller.get(), index, 0, PacingRung::FgInputWait, source, key_on);
+                if (index == 1 && hold_us > 0.0) hold(controller.get(), 1, 0, hold_us);
+                controller->OnStageEvent(event_at(index, 0, Kind::SimulationEnd, simulation_end));
+                controller->OnStageEvent(event_at(index, 0, Kind::RenderSubmitStart, submit));
+                controller->OnStageEvent(event_at(index, 0, Kind::PresentCall, present));
+                controller->OnStageEvent(event_at(index, 0, Kind::GpuReady, ready));
+                controller->OnStageEvent(event_at(index, 0, Kind::OutputRelease, ready, PacingPlanStatus::Late));
+            };
+            fg_frame(1, 10000.0, 12000.0, 12100.0, 18000.0, 21000.0);
+            controller->OnStageEvent(event_at(1, 0, Kind::PresentEnd, 26000.0));
+            fg_frame(2, 20000.0, 22000.0, 26500.0, 32000.0, 37000.0);
+            const LeadStatistics statistics = controller->Statistics();
+            CHECK_NEAR(statistics.last_queue_us, 4000.0);
+            CHECK_NEAR(statistics.last_sample_us, key_on ? 17000.0 - std::max(4000.0, hold_us) : 13000.0);
+            const bool corrected = key_on && hold_us > 4000.0;
+            CHECK(statistics.driver_hold_corrected_samples == (corrected ? 1u : 0u));
+            CHECK_NEAR(statistics.last_driver_hold_us, corrected ? hold_us : 0.0);
+        }
+    }
+
+    // Held-back frame (TestHeldBackLeadCorrection's W = 16,540 µs of a
+    // 30,000 µs sample): a hold up to W adds nothing, a longer one only the
+    // excess, so the sample is X − max(W, H).
+    for (const double hold_us : { 0.0, 10000.0, 20000.0 }) {
+        for (const bool key_on : { true, false }) {
+            auto controller = MakeController();
+            for (uint64_t index = 0; index < 32; ++index) controller->OnReportPair(7, 8000 + index, StreamingPair());
+            controller->OnReportPair(7, 9000, StreamingPair());
+            gpu_frame(controller.get(), 1, 0, key_on, 30000.0);
+            controller->OnReportPair(7, key_at(1, 0).frame_id, StreamingPair());
+            CHECK_NEAR(controller->Statistics().last_sample_us, 30000.0);
+            if (hold_us > 0.0) hold(controller.get(), 1, 0, hold_us);
+            gpu_frame(controller.get(), 2, 0, key_on, 30000.0);
+            CHECK(controller->Statistics().samples == 1); // waits for its pair
+            controller->OnReportPair(7, key_at(2, 0).frame_id, HeldBackPair());
+            const LeadStatistics statistics = controller->Statistics();
+            CHECK(statistics.samples == 2);
+            CHECK(statistics.held_back_corrected_samples == 1);
+            CHECK_NEAR(statistics.last_held_back_wait_us, 16540.0);
+            CHECK_NEAR(statistics.last_sample_us, key_on ? 30000.0 - std::max(16540.0, hold_us) : 30000.0 - 16540.0);
+            const bool corrected = key_on && hold_us > 16540.0;
+            CHECK(statistics.driver_hold_corrected_samples == (corrected ? 1u : 0u));
+            CHECK_NEAR(statistics.last_driver_hold_us, corrected ? hold_us : 0.0);
+        }
+    }
+}
+
 int main()
 {
     std::printf("sizeof(LeadController) = %zu bytes\n", sizeof(LeadController));
@@ -2933,6 +3088,7 @@ int main()
     TestGpuFloorAnchorAndRenderStartTarget();
     TestRenderStartHoldExclusion();
     TestHeldBackLeadCorrection();
+    TestDriverPresentHoldExclusion();
 
     if (s_failures != 0) {
         std::fprintf(stderr, "%d lead controller checks failed\n", s_failures);

@@ -1275,6 +1275,54 @@ void TestRenderStartHold() {
     NvAPI_ClearFeedbackDevice();
 }
 
+NvAPI_Status __cdecl AsyncMarkerSleeps(IUnknown*, NV_ASYNC_FRAME_MARKER_PARAMS*) {
+    Sleep(3);
+    return NVAPI_OK;
+}
+
+// Driver Present hold: with the developer A/B held_gpu_floor each
+// SetAsyncFrameMarker call of a planned frame is also a DriverPresentHold
+// stage event keyed by the async marker's frame ID, with the call's end and
+// duration (the telemetry wait record is the same call). The key off and an
+// unplanned frame push nothing; the call's result passes through.
+void TestAsyncMarkerDriverHold() {
+    s_orig_set_async_frame_marker = AsyncMarkerSleeps;
+    const auto saved_pipeline = PacingPipeline_GetConfig();
+    auto pipeline = saved_pipeline;
+    const auto call = [](uint64_t frame, uint32_t type) {
+        NV_ASYNC_FRAME_MARKER_PARAMS params{};
+        params.frameID = frame;
+        params.markerType = type;
+        s_wait_records.clear();
+        CHECK(Hook_SetAsyncFrameMarker(nullptr, &params) == NVAPI_OK);
+    };
+    PublishPlan(Key(4000), PacingRung::GpuQueueWait, 2'000.0);
+    DrainStageEvents();
+
+    pipeline.held_gpu_floor = false;
+    PacingPipeline_SetConfig(pipeline);
+    call(4000, 12);
+    CHECK(s_wait_records.size() == 1 && s_wait_records[0].kind == PacingWaitKind::AsyncFrameMarker);
+    PacingStageEvent event{};
+    CHECK(!FramePlan_PopStageEvent(&event));
+
+    pipeline.held_gpu_floor = true;
+    PacingPipeline_SetConfig(pipeline);
+    call(4000, 12);
+    CHECK(s_wait_records.size() == 1 && s_wait_records[0].exit_qpc > s_wait_records[0].entry_qpc);
+    CHECK(FramePlan_PopStageEvent(&event) && event.kind == PacingStageEventKind::DriverPresentHold &&
+        event.key == Key(4000) && event.rung == PacingRung::GpuQueueWait &&
+        event.qpc == s_wait_records[0].exit_qpc &&
+        event.hold_ticks == s_wait_records[0].exit_qpc - s_wait_records[0].entry_qpc);
+    CHECK(!FramePlan_PopStageEvent(&event));
+
+    call(4001, 12); // no plan for this frame ID
+    CHECK(s_wait_records.size() == 1 && !FramePlan_PopStageEvent(&event));
+
+    PacingPipeline_SetConfig(saved_pipeline);
+    s_orig_set_async_frame_marker = nullptr;
+}
+
 void TestNativeEndpointCancellation() {
     // H2 core with route revalidation: the hold never needs the owner and a
     // revoked route cancels it (Stale) with its partial residence retained.
@@ -1465,6 +1513,7 @@ int main(int argc, char** argv) {
     TestNativeRouteFromEveryMarker();
     TestFrameMarkerStageEvents();
     TestRenderStartHold();
+    TestAsyncMarkerDriverHold();
     TestNativeEndpointCancellation();
     TestReflexCallForwarding();
     TestMarkersOptimizeOverride();

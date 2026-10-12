@@ -243,6 +243,11 @@ static void DrawPacingPipelineStatus() {
     else if (has_status && status.render_handoff == 2)
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
             "Render handoff limit: off (the render thread may wait for the next release; waiting for evidence)");
+    // The GPU floor on held frames (developer A/B held_gpu_floor).
+    if (has_status && status.render_handoff_held_floor)
+        ImGui::TextDisabled("Render handoff GPU floor (held): render thread no earlier than %.2f ms before the GPU "
+            "finishes the previous frame | %u frames delayed",
+            status.render_handoff_gpu_lead_us / 1000.0, status.render_handoff_held_delayed);
     if (has_status && status.valid)
         ImGui::TextDisabled("Lead: %.2f ms (%s, %u samples%s) | Grid epoch: %u",
             status.lead_us / 1000.0, status.lead_warm ? "warm" : "warming",
@@ -646,6 +651,19 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "the previous frame, so the frame reaches Present no earlier than the driver would have held it. "
         "A wait further away than one frame interval is not made. Watch long frames, GPU idle gaps and PC "
         "Latency; one setting per capture.");
+
+    if (ImGui::Checkbox("Held-frame GPU floor", &g_config.held_gpu_floor)) {
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: held-frame GPU floor -> %s", g_config.held_gpu_floor ? "on" : "off");
+        *config_dirty = true;
+    }
+    HelpTip("Diagnostic A/B, Reflex games with the Reflex Sleep bypass on. A frame released by the lead "
+        "(held) is, with this on, released no earlier than the render handoff GPU floor, the same bound "
+        "frames that are not held already use: about half a GPU frame plus the submission delay before the "
+        "GPU finishes the previous frame. Frames released from the lead alone reach the driver close to "
+        "the previous GPU end, where its own pacing inside Present holds the game and stalls the GPU. "
+        "The lead samples of such frames also leave out the hold the driver measurably spent in that "
+        "call on the frame before. Watch long frames, GPU idle gaps and PC Latency; one setting per capture.");
 
     static const char* const kSourcePlacementLabels[] = {"Marker", "Pre-Sleep", "Reflex driver limiter"};
     static_assert(IM_ARRAYSIZE(kSourcePlacementLabels) ==

@@ -894,6 +894,55 @@ void TestEarliestReleaseLimitsWait()
     CHECK(fourth.plan.output_target_qpc == request.earliest_release_qpc + Ticks(fourth.plan.lead_us));
 }
 
+// Developer A/B held_gpu_floor on a held frame (GPU queue wait): the GPU floor
+// is the same earliest release as the render handoff limit's (a release
+// beyond S is a late source), and the request's held_gpu_floor reaches the
+// lead, which leaves the driver's Present hold recorded under the previous
+// frame (DriverPresentHold) out of the frame's sample. The key off keeps X.
+void TestHeldFrameGpuFloorAndDriverHold()
+{
+    std::printf("Test: a held frame's GPU floor delays it and the driver hold leaves its sample\n");
+    const PacingPipelineSnapshot pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
+    for (const bool key_on : { true, false }) {
+        ResetStage();
+        ScriptedClock clock;
+        SourceStageRequest request = Request(Key(800), pipeline);
+        const SourceStageFrame first = g_stage.RunPlannedFrame(request, &clock);
+        CHECK(first.planned);
+
+        request = Request(Key(801), pipeline);
+        request.held_gpu_floor = key_on;
+        request.earliest_release_qpc = first.plan.output_target_qpc + Ticks(kIntervalUs) -
+            Ticks(first.plan.lead_us) + Ticks(2'000.0);
+        const SourceStageFrame second = g_stage.RunPlannedFrame(request, &clock);
+        CHECK(second.planned && second.plan.rung == PacingRung::GpuQueueWait);
+        CHECK(second.handoff_limited && second.epoch_started == PacingEpochReason::None);
+        CHECK(second.wait_target_qpc == request.earliest_release_qpc &&
+            second.release_qpc == request.earliest_release_qpc);
+
+        // Frame 1: X = 8,000 and a 3,000 µs driver hold; frame 2: X = 8,000.
+        PacingStageEvent hold = Event(first, PacingStageEventKind::DriverPresentHold,
+            first.release_qpc + Ticks(9'000.0));
+        hold.hold_ticks = Ticks(3'000.0);
+        CHECK(FramePlan_PushStageEvent(hold));
+        for (const SourceStageFrame* frame : { &first, &second }) {
+            CHECK(FramePlan_PushStageEvent(Event(*frame, PacingStageEventKind::PresentCall,
+                frame->release_qpc + Ticks(2'000.0))));
+            CHECK(FramePlan_PushStageEvent(Event(*frame, PacingStageEventKind::GpuReady,
+                frame->release_qpc + Ticks(8'000.0))));
+            CHECK(FramePlan_PushStageEvent(Event(*frame, PacingStageEventKind::OutputRelease,
+                frame->release_qpc + Ticks(8'000.0), PacingPlanStatus::Late)));
+        }
+        CHECK(g_stage.DrainStageEvents() == 7);
+        const LeadStatistics lead = g_stage.Lead().Statistics();
+        CHECK(lead.samples == 2);
+        CHECK(lead.driver_hold_corrected_samples == (key_on ? 1u : 0u));
+        CHECK(key_on ? (lead.last_sample_us > 4'999.0 && lead.last_sample_us < 5'001.0)
+                     : (lead.last_sample_us > 7'999.0 && lead.last_sample_us < 8'001.0));
+        CHECK(lead.invalid_inputs == 0 && lead.unmatched_events == 0);
+    }
+}
+
 int main()
 {
     std::printf("=== Source stage tests ===\n");
@@ -915,6 +964,7 @@ int main()
     TestDemotedGpuQueueWaitLead();
     TestVBlankPhaseTrackerFeedsFixedGrid();
     TestEarliestReleaseLimitsWait();
+    TestHeldFrameGpuFloorAndDriverHold();
     TestResetClearsPlans();
     std::printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

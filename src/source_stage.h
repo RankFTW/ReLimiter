@@ -129,13 +129,18 @@ struct SourceStageRequest {
     uint64_t pre_wait_index = 0;
     int64_t pre_wait_start_qpc = 0;
     int64_t pre_wait_end_qpc = 0;
-    // Render handoff limit: the frame is
-    // released no earlier than this QPC; 0 = no limit. The grid judges the
-    // frame as arriving at max(now, earliest), so a limit beyond S_n restarts
-    // the cadence like any late source, and the wait runs to max(S_n,
-    // earliest). Frames not held only: on held frames the render-thread
-    // offset moved the game's simulation into its render thread's submission.
+    // Render handoff limit and GPU floor: the frame is released no earlier
+    // than this QPC; 0 = none. The grid judges the frame as arriving at
+    // max(now, earliest), so a bound beyond S_n restarts the cadence like any
+    // late source, and the wait runs to max(S_n, earliest). The render-thread
+    // offset (w + d) applies to frames not held only (on held frames it moved
+    // the game's simulation into its render thread's submission); the GPU
+    // floor alone applies to held frames under the developer A/B key
+    // held_gpu_floor.
     int64_t earliest_release_qpc = 0;
+    // Developer A/B (held_gpu_floor): the lead leaves the previous frame's
+    // driver Present hold out of a GPU-rung frame's sample (lead_controller.h).
+    bool held_gpu_floor = false;
 };
 
 struct SourceStageFrame {

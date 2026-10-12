@@ -327,6 +327,7 @@ namespace
         std::atomic<PacingLeadCoverage> lead_coverage{ kDefaultConfig.lead_coverage };
         std::atomic<bool> fg_late_spacing{ kDefaultConfig.fg_late_spacing };
         std::atomic<bool> render_start_hold{ kDefaultConfig.render_start_hold };
+        std::atomic<bool> held_gpu_floor{ kDefaultConfig.held_gpu_floor };
         std::atomic<double> stall_inject_ms{ kDefaultConfig.stall_inject_ms };
         std::atomic<double> stall_inject_period_s{ kDefaultConfig.stall_inject_period_s };
     };
@@ -349,6 +350,7 @@ namespace
         config.lead_coverage = s_config.lead_coverage.load(std::memory_order_relaxed);
         config.fg_late_spacing = s_config.fg_late_spacing.load(std::memory_order_relaxed);
         config.render_start_hold = s_config.render_start_hold.load(std::memory_order_relaxed);
+        config.held_gpu_floor = s_config.held_gpu_floor.load(std::memory_order_relaxed);
         config.stall_inject_ms = s_config.stall_inject_ms.load(std::memory_order_relaxed);
         config.stall_inject_period_s =
             s_config.stall_inject_period_s.load(std::memory_order_relaxed);
@@ -544,6 +546,7 @@ void PacingPipeline_SetConfig(const PacingPipelineConfig& config) noexcept
     s_config.lead_coverage.store(safe_config.lead_coverage, std::memory_order_relaxed);
     s_config.fg_late_spacing.store(safe_config.fg_late_spacing, std::memory_order_relaxed);
     s_config.render_start_hold.store(safe_config.render_start_hold, std::memory_order_relaxed);
+    s_config.held_gpu_floor.store(safe_config.held_gpu_floor, std::memory_order_relaxed);
     s_config.stall_inject_ms.store(safe_config.stall_inject_ms, std::memory_order_relaxed);
     s_config.stall_inject_period_s.store(
         safe_config.stall_inject_period_s, std::memory_order_relaxed);

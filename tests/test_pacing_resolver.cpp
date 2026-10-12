@@ -150,6 +150,7 @@ namespace
             left.lead_coverage == right.lead_coverage &&
             left.fg_late_spacing == right.fg_late_spacing &&
             left.render_start_hold == right.render_start_hold &&
+            left.held_gpu_floor == right.held_gpu_floor &&
             left.stall_inject_ms == right.stall_inject_ms &&
             left.stall_inject_period_s == right.stall_inject_period_s;
     }
@@ -854,6 +855,7 @@ namespace
         config.lead_coverage = PacingLeadCoverage::Q95;
         config.fg_late_spacing = false;
         config.render_start_hold = true;
+        config.held_gpu_floor = true;
         PacingPipeline_SetConfig(config);
         CHECK(SameConfig(PacingPipeline_GetConfig(), config));
         CHECK(PacingPipeline_GetConfig().adaptive_cap);
