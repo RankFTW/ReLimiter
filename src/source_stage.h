@@ -133,14 +133,9 @@ struct SourceStageRequest {
     // released no earlier than this QPC; 0 = no limit. The grid judges the
     // frame as arriving at max(now, earliest), so a limit beyond S_n restarts
     // the cadence like any late source, and the wait runs to max(S_n,
-    // earliest). The render-thread offset applies to frames not held only (on
-    // held frames it moved the game's simulation into its render thread's
-    // submission); the GPU floor applies to every frame while the Sleep is
-    // bypassed (lead_controller.h).
+    // earliest). Frames not held only: on held frames the render-thread
+    // offset moved the game's simulation into its render thread's submission.
     int64_t earliest_release_qpc = 0;
-    // The GPU floor applied to this frame's release, even when it was off (c
-    // = 0): the frame's Reflex report moves its term.
-    bool gpu_floor = false;
 };
 
 struct SourceStageFrame {
@@ -194,19 +189,19 @@ public:
     {
         lead_.OnGpuActiveTime(producer_epoch, frame_id, gpu_active_us, gpu_start_qpc);
     }
-    // A Reflex report pair for the render handoff GPU floor's term
-    // (LeadController::OnHandoffBackPressure).
-    void OnHandoffBackPressure(uint32_t producer_epoch, uint64_t frame_id,
+    // A Reflex report pair (LeadController::OnReportPair): the held-back wait
+    // and the GPU floor's F.
+    void OnReportPair(uint32_t producer_epoch, uint64_t frame_id,
         const HandoffBackPressureSample& sample) noexcept
     {
-        lead_.OnHandoffBackPressure(producer_epoch, frame_id, sample);
+        lead_.OnReportPair(producer_epoch, frame_id, sample);
     }
-    // A Reflex report's GPU end and PRESENT_END → GPU end gap, the GPU
-    // floor's anchor (LeadController::OnGpuRenderEnd).
-    void OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, int64_t gpu_end_qpc,
-        double present_to_gpu_end_us) noexcept
+    // A Reflex report's GPU start and end and PRESENT_END → GPU end gap, the
+    // GPU floor's anchor (LeadController::OnGpuRenderEnd).
+    void OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, int64_t gpu_start_qpc,
+        int64_t gpu_end_qpc, double present_to_gpu_end_us) noexcept
     {
-        lead_.OnGpuRenderEnd(producer_epoch, frame_id, gpu_end_qpc, present_to_gpu_end_us);
+        lead_.OnGpuRenderEnd(producer_epoch, frame_id, gpu_start_qpc, gpu_end_qpc, present_to_gpu_end_us);
     }
     // Timing mode Off: grid suspended and published; the next plan starts a
     // ModeChange epoch.

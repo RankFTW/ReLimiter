@@ -59,7 +59,7 @@ struct ReflexFrameTimeSample {
 	// floor's live bound); 0 when either is missing, the GPU end comes first,
 	// or it exceeds 3 I.
 	double present_end_to_gpu_end_us = 0.0;
-	// Render handoff GPU floor term (lead_controller.h): this frame's and the
+	// Render handoff report pair (lead_controller.h): this frame's and the
 	// previous frame's report times, in µs on the driver's clock from this
 	// frame's RENDERSUBMIT_START. Known only when both reports carry every
 	// timestamp and each lies within 3 I of that origin.

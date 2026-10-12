@@ -50,7 +50,7 @@ namespace
         return kBaseQpc + static_cast<int64_t>(std::llround(us * 10.0));
     }
 
-    // The controller is about 190 KB: tests keep it on the heap.
+    // The controller is about 205 KB: tests keep it on the heap.
     std::unique_ptr<LeadController> MakeController()
     {
         auto controller = std::make_unique<LeadController>();
@@ -2438,8 +2438,8 @@ void TestRenderHandoffOffset()
 }
 
 // Report pairs (µs from frame n's RENDERSUBMIT_START), modelled on Gears of
-// War: E-Day FG 2× (GPU-bound, render thread held back), its driver's Sleep
-// and a release that came too late.
+// War: E-Day FG 2× (GPU-bound, render thread held back) and its driver's
+// Sleep.
 HandoffBackPressureSample HeldBackPair()
 {
     HandoffBackPressureSample pair{};
@@ -2459,159 +2459,66 @@ HandoffBackPressureSample StreamingPair()
     pair.simulation_end_us = -750.0;       // the render thread waited for the simulation
     pair.render_start_us = 0.0;
     pair.render_end_us = 11650.0;
-    pair.first_submission_us = 820.0;      // work streams from the start
+    pair.first_submission_us = 820.0;      // work streams from the start (bin center 830)
     pair.gpu_start_us = 10100.0;
     pair.previous_render_free_us = -5400.0;
     pair.previous_gpu_end_us = 9850.0;
     return pair;
 }
 
-HandoffBackPressureSample ReleasedLatePair()
-{
-    HandoffBackPressureSample pair = StreamingPair();
-    pair.gpu_start_us = 13000.0;          // the GPU waited 3.15 ms
-    return pair;
-}
-
-// Held back: the GPU did not wait and the frame's first work reached the
-// driver in the second half of its window, while the render thread came
-// straight from the previous frame or the game has shown that it streams.
-// Released late: the GPU waited more than 1 ms while the render thread
-// waited for the simulation. A GPU that waits behind a busy render thread (a
-// hitch) is neither, and so is a render thread that streams.
-void TestHandoffBackPressureClassify()
+// Held back: the GPU waited at most 1 ms and the frame's first work reached
+// the driver in the second half of its window, while the render thread came
+// straight from the previous frame or the game has shown that it streams. A
+// GPU that waited more than 1 ms (a hitch, or a late release) is not, and
+// neither is a render thread that streams.
+void TestHandoffHeldBack()
 {
     for (const bool streams : { false, true }) {
-        CHECK(HandoffBackPressure_Classify(HeldBackPair(), streams) == HandoffBackPressure::HeldBack);
-        CHECK(HandoffBackPressure_Classify(StreamingPair(), streams) == HandoffBackPressure::None);
-        CHECK(HandoffBackPressure_Classify(ReleasedLatePair(), streams) == HandoffBackPressure::ReleasedLate);
+        CHECK(HandoffBackPressure_HeldBack(HeldBackPair(), streams));
+        CHECK(!HandoffBackPressure_HeldBack(StreamingPair(), streams));
     }
-
     // The first work in the first half of the window (streaming): not held.
     HandoffBackPressureSample early = HeldBackPair();
     early.first_submission_us = 8000.0;
-    CHECK(HandoffBackPressure_Classify(early, true) == HandoffBackPressure::None);
+    CHECK(!HandoffBackPressure_HeldBack(early, true));
     // At the middle of the window: held.
     early.first_submission_us = 8575.0;
-    CHECK(HandoffBackPressure_Classify(early, true) == HandoffBackPressure::HeldBack);
-    // The GPU waited more than 1 ms behind a busy render thread: a hitch.
-    HandoffBackPressureSample hitch = HeldBackPair();
-    hitch.gpu_start_us = hitch.previous_gpu_end_us + 1001.0;
-    CHECK(HandoffBackPressure_Classify(hitch, true) == HandoffBackPressure::None);
+    CHECK(HandoffBackPressure_HeldBack(early, true));
+    // The GPU waited more than 1 ms; exactly 1 ms is not waiting.
+    HandoffBackPressureSample idle = HeldBackPair();
+    idle.gpu_start_us = idle.previous_gpu_end_us + 1001.0;
+    CHECK(!HandoffBackPressure_HeldBack(idle, true));
+    idle.gpu_start_us = idle.previous_gpu_end_us + 1000.0;
+    CHECK(HandoffBackPressure_HeldBack(idle, true));
     // A render thread that waited for the simulation and then got its first
     // work out only at the end of the window: held back once the game has
-    // shown that it streams (Gears' render thread released too early), never
-    // before (a game that submits everything at the end of its window).
+    // shown that it streams, never before (a game that submits everything
+    // at the end of its window).
     HandoffBackPressureSample waited = HeldBackPair();
     waited.simulation_end_us = waited.previous_render_free_us;
-    CHECK(HandoffBackPressure_Classify(waited, false) == HandoffBackPressure::None);
-    CHECK(HandoffBackPressure_Classify(waited, true) == HandoffBackPressure::HeldBack);
-    // Exactly 1 ms of GPU idle is not waiting.
-    HandoffBackPressureSample edge = ReleasedLatePair();
-    edge.gpu_start_us = edge.previous_gpu_end_us + 1000.0;
-    CHECK(HandoffBackPressure_Classify(edge, true) == HandoffBackPressure::None);
+    CHECK(!HandoffBackPressure_HeldBack(waited, false));
+    CHECK(HandoffBackPressure_HeldBack(waited, true));
 
     HandoffBackPressureSample invalid = HeldBackPair();
     invalid.gpu_start_us = kNaN;
-    CHECK(HandoffBackPressure_Classify(invalid, true) == HandoffBackPressure::None);
+    CHECK(!HandoffBackPressure_HeldBack(invalid, true));
     invalid = HeldBackPair();
     invalid.render_end_us = invalid.render_start_us;
-    CHECK(HandoffBackPressure_Classify(invalid, true) == HandoffBackPressure::None);
+    CHECK(!HandoffBackPressure_HeldBack(invalid, true));
 
     // Streaming evidence: the first work in the first half of a valid window.
     CHECK(HandoffBackPressure_Streams(StreamingPair()));
-    CHECK(HandoffBackPressure_Streams(ReleasedLatePair()));
     CHECK(!HandoffBackPressure_Streams(HeldBackPair()));
     CHECK(!HandoffBackPressure_Streams(invalid));
 }
 
-// The GPU floor's term c: a report of a frame released under the floor
-// raises c by η when held back and lowers it by η when released late and by
-// η / 1,024 otherwise (η = 1% of I), so it widens at once and narrows one
-// step per 1,024 clean frames; c stays within [0, 2 I] and never adds to d.
-// Frames released without the floor and second reports change c by nothing;
-// every pair counts toward the stream proof.
-void TestRenderHandoffBackPressure()
-{
-    auto controller = MakeController();
-    uint64_t n = 0;
-    const auto frame = [&](bool limited, const HandoffBackPressureSample& pair) {
-        ++n;
-        LeadFrameStart start = Start(n, limited ? PacingRung::SourceOnly : PacingRung::FgInputWait,
-            static_cast<double>(n) * kInterval);
-        start.gpu_floor = limited;
-        controller->OnSourceRelease(start);
-        controller->OnHandoffBackPressure(Key(n).producer_epoch, Key(n).frame_id, pair);
-    };
-
-    // Ten held-back frames: c = 10 × 100 = 1,000 µs; d stays cold.
-    for (int i = 0; i < 10; ++i) frame(true, HeldBackPair());
-    CHECK(controller->Statistics().handoff_back_pressure_samples == 10);
-    CHECK(controller->Statistics().handoff_held_back == 10);
-    CHECK_NEAR(controller->HandoffBackPressureUs(), 1000.0);
-    CHECK_NEAR(controller->HandoffOffsetUs(0.95, 500.0), 0.0);
-    // A second report of the same frame is ignored.
-    controller->OnHandoffBackPressure(Key(n).producer_epoch, Key(n).frame_id, HeldBackPair());
-    CHECK(controller->Statistics().handoff_back_pressure_samples == 10);
-    // A streaming frame lowers c by 100 / 1,024 µs, a late one by 100 µs; a
-    // frame released without the floor moves nothing.
-    frame(true, StreamingPair());
-    CHECK_NEAR(controller->HandoffBackPressureUs(), 1000.0 - 100.0 / 1024.0);
-    frame(true, ReleasedLatePair());
-    CHECK(controller->Statistics().handoff_released_late == 1);
-    CHECK_NEAR(controller->HandoffBackPressureUs(), 900.0 - 100.0 / 1024.0);
-    frame(false, HeldBackPair());
-    CHECK_NEAR(controller->HandoffBackPressureUs(), 900.0 - 100.0 / 1024.0);
-    CHECK(controller->Statistics().handoff_back_pressure_samples == 12);
-    // One held-back frame per 1,024 clean ones: c holds.
-    frame(true, HeldBackPair());
-    for (int i = 0; i < 1024; ++i) frame(true, StreamingPair());
-    CHECK_NEAR(controller->HandoffBackPressureUs(), 900.0 - 100.0 / 1024.0);
-    // Late frames bring c to 0, never below.
-    for (int i = 0; i < 10; ++i) frame(true, ReleasedLatePair());
-    CHECK_NEAR(controller->HandoffBackPressureUs(), 0.0);
-    // Frames that stay held back raise it to two intervals at most.
-    for (int i = 0; i < 220; ++i) frame(true, HeldBackPair());
-    CHECK_NEAR(controller->HandoffBackPressureUs(), 2.0 * kInterval);
-
-    // A report without a pending frame is counted; invalid input is rejected.
-    controller->OnHandoffBackPressure(7, 123456789, HeldBackPair());
-    CHECK(controller->Statistics().unmatched_handoff_back_pressure == 1);
-    const uint64_t invalid = controller->Statistics().invalid_inputs;
-    controller->OnHandoffBackPressure(0, Key(n).frame_id, HeldBackPair());
-    CHECK(controller->Statistics().invalid_inputs == invalid + 1);
-    CHECK_NEAR(controller->HandoffBackPressureUs(), 2.0 * kInterval);
-
-    // Cleared with the handoff window; the stream proof stays.
-    CHECK(controller->HandoffStreams());
-    controller->ResetBuckets();
-    CHECK_NEAR(controller->HandoffBackPressureUs(), 0.0);
-    CHECK(controller->HandoffStreams());
-    controller->Reset(kFrequency);
-    CHECK(!controller->HandoffStreams());
-
-    // Before the proof a render thread that waited for the simulation and
-    // submitted at the end of its window is not held back; 32 streaming
-    // pairs, also of frames without the limit, complete the proof.
-    HandoffBackPressureSample waited = HeldBackPair();
-    waited.simulation_end_us = waited.previous_render_free_us;
-    n = 0;
-    frame(true, waited);
-    CHECK(controller->Statistics().handoff_held_back == 0);
-    for (uint32_t i = 0; i < LEAD_HANDOFF_STREAM_PROOF - 1; ++i) frame(false, StreamingPair());
-    CHECK(!controller->HandoffStreams());
-    frame(false, StreamingPair());
-    CHECK(controller->HandoffStreams());
-    frame(true, waited);
-    CHECK(controller->Statistics().handoff_held_back == 1);
-}
-
-// The GPU floor of frame n: Ĝ(n − 1) − 2 I + c, Ĝ the newest GPU end
-// extrapolated by the median GPU frame period of consecutive frames, at
-// least a newer frame's PRESENT_END plus the 5th percentile of the reports'
-// PRESENT_END → GPU end gaps, extrapolated the same way. It applies only
-// while c > 0, within the horizon, for the GPU end's producer epoch and
-// NvAPI frames, once the period window is warm.
+// The GPU floor of frame n: Ĝ(n − 1) − (P/2 + F + σ). P: the median GPU
+// period of consecutive frames the GPU did not wait for; F: the median
+// first-submission delay of streaming pairs; σ: the median release →
+// RENDERSUBMIT_START of frames not held. Ĝ: the newest GPU end extrapolated
+// by P, at least a newer frame's PRESENT_END plus the 5th percentile of the
+// reports' PRESENT_END → GPU end gaps. It applies within the horizon, for the
+// GPU end's producer epoch and NvAPI frames, once the windows are warm.
 void TestRenderHandoffGpuFloor()
 {
     constexpr uint32_t kEpoch = 7;
@@ -2624,90 +2531,155 @@ void TestRenderHandoffGpuFloor()
         key.frame_id = frame_id;
         return key;
     };
-    auto controller = MakeController();
-    // c = 1,000 µs from ten held-back frames released under the limit.
-    for (uint64_t n = 1; n <= 10; ++n) {
-        LeadFrameStart start = Start(n, PacingRung::SourceOnly, static_cast<double>(n) * kInterval);
-        start.gpu_floor = true;
-        controller->OnSourceRelease(start);
-        controller->OnHandoffBackPressure(Key(n).producer_epoch, Key(n).frame_id, HeldBackPair());
-    }
-    CHECK_NEAR(controller->HandoffBackPressureUs(), 1000.0);
-
-    // 32 GPU ends are 31 intervals: cold. Gaps of 14,000 µs (bin center
-    // 14,010) from frame 2001 on; frame 2000 has none.
     const auto gpu_end_us = [&](uint64_t frame_id) { return 100000.0 + kGpuPeriod * static_cast<double>(frame_id - 2000); };
-    for (uint64_t frame_id = 2000; frame_id < 2032; ++frame_id) {
-        controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us(frame_id)), frame_id == 2000 ? 0.0 : 14000.0);
-    }
-    CHECK(controller->GpuFloorQpc(key_of(2033), kInterval) == 0);
-    // A gap adds no interval; the next consecutive frame does.
-    controller->OnGpuRenderEnd(kEpoch, 2033, Qpc(gpu_end_us(2033)), 14000.0);
-    CHECK(controller->GpuFloorQpc(key_of(2035), kInterval) == 0);
-    controller->OnGpuRenderEnd(kEpoch, 2034, Qpc(gpu_end_us(2034)), 14000.0);
-    // Frame 2036: Ĝ(2035) = G(2034) + 17,010, floor = Ĝ − 20,000 + 1,000.
-    CHECK(controller->GpuFloorQpc(key_of(2036), kInterval) == Qpc(gpu_end_us(2034) + 17010.0 - 19000.0));
-    // Frame 2035: its predecessor's GPU end is known.
-    CHECK(controller->GpuFloorQpc(key_of(2035), kInterval) == Qpc(gpu_end_us(2034) - 19000.0));
+    // GPU ends whose frames the GPU did not wait for (250 µs idle), gap 14,000 µs.
+    const auto feed_gpu = [&](LeadController* controller, uint64_t first, uint64_t last) {
+        for (uint64_t frame_id = first; frame_id <= last; ++frame_id) {
+            controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us(frame_id) - kGpuPeriod + 250.0),
+                Qpc(gpu_end_us(frame_id)), 14000.0);
+        }
+    };
+    // σ = 5,000 µs (bin center 5,010) from frames not held.
+    const auto feed_sigma = [&](LeadController* controller, uint64_t count) {
+        for (uint64_t index = 1; index <= count; ++index) {
+            const double source_us = static_cast<double>(index) * kInterval;
+            controller->OnSourceRelease(Start(index, PacingRung::SourceOnly, source_us));
+            controller->OnStageEvent(Event(index, Kind::RenderSubmitStart, source_us + 5000.0));
+        }
+    };
+    // F = 820 µs (bin center 830) from streaming pairs of no pending frame.
+    const auto feed_first_submission = [&](LeadController* controller, uint64_t count) {
+        for (uint64_t index = 0; index < count; ++index) controller->OnReportPair(kEpoch, 500 + index, StreamingPair());
+    };
 
-    // Live bound: frame 2035 left its Present 2,000 µs late against its
-    // usual place (G − 14,000). For frame 2037, Ĝ(2036) is at least
-    // PRESENT_END(2035) + 14,010 + 17,010 instead of G(2034) + 2 × 17,010.
-    const double usual_present_end_us = gpu_end_us(2035) - 14000.0;
-    CHECK(controller->GpuFloorQpc(key_of(2037), kInterval, 2035, Qpc(usual_present_end_us)) ==
-        Qpc(usual_present_end_us + 14010.0 + 17010.0 - 19000.0));
-    CHECK(controller->GpuFloorQpc(key_of(2037), kInterval, 2035, Qpc(usual_present_end_us + 2000.0)) ==
-        Qpc(usual_present_end_us + 2000.0 + 14010.0 + 17010.0 - 19000.0));
-    // An early PRESENT_END never lowers the report's prediction.
-    CHECK(controller->GpuFloorQpc(key_of(2037), kInterval, 2035, Qpc(usual_present_end_us - 5000.0)) ==
-        Qpc(gpu_end_us(2034) + 2.0 * 17010.0 - 19000.0));
-    // A PRESENT_END not newer than the newest GPU end, or of frame n itself,
-    // is not a bound.
-    CHECK(controller->GpuFloorQpc(key_of(2037), kInterval, 2034, Qpc(usual_present_end_us + 9000.0)) ==
-        Qpc(gpu_end_us(2034) + 2.0 * 17010.0 - 19000.0));
-    CHECK(controller->GpuFloorQpc(key_of(2037), kInterval, 2037, Qpc(usual_present_end_us + 9000.0)) ==
-        Qpc(gpu_end_us(2034) + 2.0 * 17010.0 - 19000.0));
+    auto controller = MakeController();
+    feed_gpu(controller.get(), 2000, 2032); // 32 periods
+    feed_sigma(controller.get(), 31);
+    feed_first_submission(controller.get(), 32);
+    // σ is cold (31 samples): no floor; P/2 + F is known.
+    CHECK(controller->GpuFloorQpc(key_of(2034)) == 0);
+    CHECK_NEAR(controller->GpuFloorStartUs(), 17010.0 / 2.0 + 830.0);
+    feed_sigma(controller.get(), 32);
+    // Frame 2034: Ĝ(2033) = G(2032) + 17,010; floor = Ĝ − (8,505 + 830 + 5,010).
+    CHECK(controller->GpuFloorQpc(key_of(2034)) == Qpc(gpu_end_us(2032) + 17010.0 - 14345.0));
+    // Frame 2033: its predecessor's GPU end is known.
+    CHECK(controller->GpuFloorQpc(key_of(2033)) == Qpc(gpu_end_us(2032) - 14345.0));
 
-    // One stretched GPU frame does not move the median period.
-    controller->OnGpuRenderEnd(kEpoch, 2035, Qpc(gpu_end_us(2034) + 25000.0), 14000.0);
-    CHECK(controller->GpuFloorQpc(key_of(2037), kInterval) ==
-        Qpc(gpu_end_us(2034) + 25000.0 + 17010.0 - 19000.0));
+    // Live bound: frame 2033 left its Present 2,000 µs later than its usual
+    // place (G − 14,000). For frame 2035, Ĝ(2034) is at least PRESENT_END(2033)
+    // + 14,010 + 17,010 instead of G(2032) + 2 × 17,010.
+    const double usual_present_end_us = gpu_end_us(2033) - 14000.0;
+    CHECK(controller->GpuFloorQpc(key_of(2035), 2033, Qpc(usual_present_end_us + 2000.0)) ==
+        Qpc(usual_present_end_us + 2000.0 + 14010.0 + 17010.0 - 14345.0));
+    // An early PRESENT_END never lowers the report's prediction; a PRESENT_END
+    // not newer than the newest GPU end, or of frame n itself, is no bound.
+    const int64_t reported = Qpc(gpu_end_us(2032) + 2.0 * 17010.0 - 14345.0);
+    CHECK(controller->GpuFloorQpc(key_of(2035), 2033, Qpc(usual_present_end_us - 5000.0)) == reported);
+    CHECK(controller->GpuFloorQpc(key_of(2035), 2032, Qpc(usual_present_end_us + 9000.0)) == reported);
+    CHECK(controller->GpuFloorQpc(key_of(2035), 2035, Qpc(usual_present_end_us + 9000.0)) == reported);
+
+    // A GPU frame the GPU waited 2 ms for adds no period: the median stays.
+    controller->OnGpuRenderEnd(kEpoch, 2033, Qpc(gpu_end_us(2032) + 2000.0),
+        Qpc(gpu_end_us(2032) + 2000.0 + 30000.0), 14000.0);
+    CHECK(controller->GpuFloorQpc(key_of(2035)) == Qpc(gpu_end_us(2032) + 32000.0 + 17010.0 - 14345.0));
     // An older report is ignored.
-    controller->OnGpuRenderEnd(kEpoch, 2030, Qpc(gpu_end_us(2030)), 14000.0);
-    CHECK(controller->GpuFloorQpc(key_of(2036), kInterval) == Qpc(gpu_end_us(2034) + 25000.0 - 19000.0));
+    controller->OnGpuRenderEnd(kEpoch, 2030, Qpc(gpu_end_us(2030) - 16000.0), Qpc(gpu_end_us(2030)), 14000.0);
+    CHECK(controller->GpuFloorQpc(key_of(2034)) == Qpc(gpu_end_us(2032) + 32000.0 - 14345.0));
 
     // Horizon: at most 8 frames between the newest GPU end and frame n − 1.
-    CHECK(controller->GpuFloorQpc(key_of(2044), kInterval) != 0);
-    CHECK(controller->GpuFloorQpc(key_of(2045), kInterval) == 0);
-    // Not before the newest GPU end's frame, nor for another producer epoch,
-    // identity domain or a non-positive interval.
-    CHECK(controller->GpuFloorQpc(key_of(2035), kInterval) == 0);
-    CHECK(controller->GpuFloorQpc(key_of(2036, kEpoch + 1), kInterval) == 0);
-    PacingPlanKey pcl = key_of(2036);
+    CHECK(controller->GpuFloorQpc(key_of(2042)) != 0);
+    CHECK(controller->GpuFloorQpc(key_of(2043)) == 0);
+    // Not before the newest GPU end's frame, nor for another producer epoch or
+    // identity domain.
+    CHECK(controller->GpuFloorQpc(key_of(2033)) == 0);
+    CHECK(controller->GpuFloorQpc(key_of(2034, kEpoch + 1)) == 0);
+    PacingPlanKey pcl = key_of(2034);
     pcl.identity_domain = PacingIdentityDomain::PclFrame;
-    CHECK(controller->GpuFloorQpc(pcl, kInterval) == 0);
-    CHECK(controller->GpuFloorQpc(key_of(2036), 0.0) == 0);
-    // Unknown GPU end QPC is ignored.
-    controller->OnGpuRenderEnd(kEpoch, 2036, 0, 14000.0);
-    CHECK(controller->GpuFloorQpc(key_of(2037), kInterval) != 0);
-
-    // A new producer epoch restarts the anchor and both windows.
-    controller->OnGpuRenderEnd(kEpoch + 1, 5000, Qpc(900000.0), 14000.0);
-    CHECK(controller->GpuFloorQpc(key_of(2037), kInterval) == 0);
-    CHECK(controller->GpuFloorQpc(key_of(5002, kEpoch + 1), kInterval) == 0);
-
-    // Gaps that are missing do not warm the gap window: the bound waits for
-    // 32 of them while the report's prediction applies.
-    for (uint64_t frame_id = 5001; frame_id <= 5040; ++frame_id) {
-        controller->OnGpuRenderEnd(kEpoch + 1, frame_id, Qpc(900000.0 + kGpuPeriod * static_cast<double>(frame_id - 5000)),
-            frame_id <= 5010 ? 14000.0 : 0.0);
-    }
-    const double end_5040_us = 900000.0 + kGpuPeriod * 40.0;
-    CHECK(controller->GpuFloorQpc(key_of(5043, kEpoch + 1), kInterval, 5041, Qpc(end_5040_us + 30000.0)) ==
-        Qpc(end_5040_us + 2.0 * 17010.0 - 19000.0));
-    // c = 0 after a handoff window reset: no floor.
+    CHECK(controller->GpuFloorQpc(pcl) == 0);
+    // A new producer epoch restarts the anchor and the period window.
+    controller->OnGpuRenderEnd(kEpoch + 1, 5000, Qpc(899000.0), Qpc(900000.0), 14000.0);
+    CHECK(controller->GpuFloorQpc(key_of(2034)) == 0);
+    CHECK(controller->GpuFloorQpc(key_of(5002, kEpoch + 1)) == 0);
+    CHECK_NEAR(controller->GpuFloorStartUs(), 0.0);
+    // The handoff window reset clears P, F and σ.
+    feed_gpu(controller.get(), 2000, 2032);
     controller->ResetBuckets();
-    CHECK(controller->GpuFloorQpc(key_of(5042, kEpoch + 1), kInterval) == 0);
+    CHECK_NEAR(controller->GpuFloorStartUs(), 0.0);
+
+    // A GPU that waits for every frame (the game is not GPU-bound) gives no
+    // period and no floor.
+    auto waiting = MakeController();
+    for (uint64_t frame_id = 2000; frame_id <= 2040; ++frame_id) {
+        waiting->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us(frame_id) - kGpuPeriod + 2000.0),
+            Qpc(gpu_end_us(frame_id)), 14000.0);
+    }
+    feed_sigma(waiting.get(), 32);
+    feed_first_submission(waiting.get(), 32);
+    CHECK_NEAR(waiting->GpuFloorStartUs(), 0.0);
+    CHECK(waiting->GpuFloorQpc(key_of(2042)) == 0);
+}
+
+// While Reflex report pairs flow, a GPU-wait frame's lead sample waits for
+// its own pair; a held-back frame's sample then leaves out W = first
+// submission − RENDERSUBMIT_START − F. A pair that never comes lets the
+// sample count as measured when the frame closes. Frames not on a GPU wait,
+// and GPU-wait frames while no pairs flow, count at once.
+void TestHeldBackLeadCorrection()
+{
+    auto controller = MakeController();
+    // F = 830 µs and the stream proof from 32 streaming pairs of no pending
+    // frame; the newest pair is NvAPI frame 9000, so pairs flow up to 9016.
+    for (uint64_t index = 0; index < 32; ++index) controller->OnReportPair(7, 8000 + index, StreamingPair());
+    controller->OnReportPair(7, 9000, StreamingPair());
+    CHECK(controller->HandoffStreams());
+    CHECK(controller->Statistics().unmatched_report_pairs == 33);
+
+    // Frame 1 (NvAPI 9003): X = 30,000 µs waits for its pair, which shows it
+    // held back: W = 17,370 − 830 = 16,540 µs.
+    FeedGpuFrame(controller.get(), 1, PacingRung::FgInputWait, 30000.0, 1.0);
+    CHECK(controller->Statistics().samples == 0);
+    controller->OnReportPair(7, Key(1).frame_id, HeldBackPair());
+    CHECK(controller->Statistics().report_pairs == 1);
+    CHECK(controller->Statistics().held_back_frames == 1);
+    CHECK(controller->Statistics().samples == 1);
+    CHECK(controller->Statistics().held_back_corrected_samples == 1);
+    CHECK_NEAR(controller->Statistics().last_held_back_wait_us, 16540.0);
+    CHECK_NEAR(controller->Statistics().last_sample_us, 30000.0 - 16540.0);
+    // A second pair of the same frame changes nothing.
+    controller->OnReportPair(7, Key(1).frame_id, HeldBackPair());
+    CHECK(controller->Statistics().samples == 1);
+
+    // Frame 2: a streaming pair, the sample unchanged.
+    FeedGpuFrame(controller.get(), 2, PacingRung::FgInputWait, 30000.0, 1.0);
+    CHECK(controller->Statistics().samples == 1);
+    controller->OnReportPair(7, Key(2).frame_id, StreamingPair());
+    CHECK(controller->Statistics().samples == 2);
+    CHECK_NEAR(controller->Statistics().last_sample_us, 30000.0);
+
+    // Frame 3 gets no pair: its sample counts when it closes, 8 releases on.
+    FeedGpuFrame(controller.get(), 3, PacingRung::FgInputWait, 29000.0, 1.0);
+    CHECK(controller->Statistics().samples == 2);
+    for (uint64_t index = 4; index < 11; ++index) FeedMarkerFrame(controller.get(), index, PacingRung::SourceOnly, 5000.0);
+    CHECK(controller->Statistics().samples == 9); // frames 4–10 count at once (not a GPU wait)
+    CHECK(controller->Statistics().unpaired_lead_samples == 0);
+    FeedMarkerFrame(controller.get(), 11, PacingRung::SourceOnly, 5000.0);
+    CHECK(controller->Statistics().unpaired_lead_samples == 1);
+    CHECK(controller->Statistics().samples == 11);
+    CHECK_NEAR(controller->Statistics().last_sample_us, 5000.0);
+
+    // Beyond the pair horizon (NvAPI 9036 > 9006 + 16) pairs no longer flow:
+    // a GPU-wait frame counts at once.
+    FeedGpuFrame(controller.get(), 12, PacingRung::FgInputWait, 28000.0, 1.0);
+    CHECK(controller->Statistics().samples == 12);
+    CHECK_NEAR(controller->Statistics().last_sample_us, 28000.0);
+
+    // A handoff window reset drops a waiting sample.
+    controller->OnReportPair(7, Key(12).frame_id, StreamingPair());
+    FeedGpuFrame(controller.get(), 13, PacingRung::FgInputWait, 30000.0, 1.0);
+    const uint64_t before = controller->Statistics().samples;
+    controller->ResetBuckets();
+    controller->OnReportPair(7, Key(13).frame_id, HeldBackPair());
+    CHECK(controller->Statistics().samples == before);
 }
 
 int main()
@@ -2765,9 +2737,9 @@ int main()
     TestReleaseHeadroomBounds();
     TestReleaseHeadroomWideningFades();
     TestRenderHandoffOffset();
-    TestHandoffBackPressureClassify();
-    TestRenderHandoffBackPressure();
+    TestHandoffHeldBack();
     TestRenderHandoffGpuFloor();
+    TestHeldBackLeadCorrection();
 
     if (s_failures != 0) {
         std::fprintf(stderr, "%d lead controller checks failed\n", s_failures);

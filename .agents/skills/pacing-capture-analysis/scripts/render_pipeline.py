@@ -18,16 +18,18 @@ from both. Per segment it reports:
   share of frames released at or after the previous frame's
   RENDERSUBMIT_START w(n-1) and the offset d = max(0, Q_q(h) - allowance) over
   h = (PRESENT_END(n-1) - w(n-1)) - simulation(n) of those frames;
-- back-pressure (the render handoff limit's back-pressure term, 2026-10-11):
-  the shares of frames held back (the GPU waited at most 1 ms before frame n,
-  the render thread went straight from n - 1 into n, and the driver received
-  frame n's first work only in the second half of the render thread's window
-  or later) and released late (the GPU waited more than 1 ms for frame n
-  while the render thread waited for its simulation), the driver's first
-  submission - RENDERSUBMIT_START, simulation start - GPU start of the same
-  frame, and the share of frames whose render thread started right after
-  finishing the previous one (RENDERSUBMIT_START(n) - RENDERSUBMIT_END(n-1)
-  < 0.3 ms);
+- back-pressure (the render handoff limit's GPU floor, 2026-10-11): the
+  shares of frames held back (the GPU waited at most 1 ms before frame n,
+  the render thread went straight from n - 1 into n or the game had shown
+  that it streams, and the driver received frame n's first work only in the
+  second half of the render thread's window or later) and released late (the
+  GPU waited more than 1 ms for frame n while the render thread waited for
+  its simulation), held-back run starts per second (only a run's first frame
+  stutters), the driver's first submission - RENDERSUBMIT_START, simulation
+  start - GPU start of the same frame, RENDERSUBMIT_START - the previous GPU
+  end beside the GPU floor's -(P/2 + F) from the segment's own frames, and
+  the share of frames whose render thread started right after finishing the
+  previous one (RENDERSUBMIT_START(n) - RENDERSUBMIT_END(n-1) < 0.3 ms);
 - where the simulation of n starts relative to the render thread's work on
   n - 1 (before its submission, first or second half of it, or in its Present
   wait), with the submission time of n - 1 and the share of frames whose
@@ -58,6 +60,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import statistics
 from bisect import bisect_right
 from collections import Counter
 from dataclasses import dataclass, field
@@ -84,7 +87,7 @@ TAKE_GAP_MS = 0.1         # replay: the render thread takes a frame this long af
 MIN_PRESENT_CALL_MS = 0.3  # replay: shortest Present call once the render thread arrives late
 LONG_FRAME_MULTIPLE = 1.5
 RENDER_THREAD_IDLE_MS = 0.3  # the render thread started frame n less than this after finishing n - 1
-GPU_IDLE_MS = 1.0            # the GPU floor term's GPU wait (LEAD_HANDOFF_GPU_IDLE_US)
+GPU_IDLE_MS = 1.0            # the GPU waited for the frame beyond this (LEAD_HANDOFF_GPU_IDLE_US)
 STREAM_PROOF = 32            # pairs with the first work in the first half of the window (LEAD_HANDOFF_STREAM_PROOF)
 GAP_SECONDS = 1.0          # display intervals and durations never bridge a gap longer than this
 
@@ -288,7 +291,8 @@ def segment_report(capture: Capture, segmenter: Segmenter, segment: str,
         stages["release_minus_S"].append(f.s - f.S)
     after, since_w, h = 0, [], []
     held_back, released_late, classified, first_submission, sim_before_gpu, contiguous = 0, 0, 0, [], [], 0
-    start_minus_gpu_end = []
+    start_minus_gpu_end, gpu_period, streaming_first_submission = [], [], []
+    held_ids, run_starts = set(), 0
     streams = _streams(capture)
     by_position: dict[str, dict[str, list[float]]] = {p: {"submission": [], "outlasted": []} for p in POSITIONS}
     for f in frames:
@@ -308,8 +312,15 @@ def segment_report(capture: Capture, segmenter: Segmenter, segment: str,
             start_minus_gpu_end.append(f.m["rs_start"] - prev.m["gpu_end"])
             gpu_waited = f.m["gpu_start"] - prev.m["gpu_end"] > GPU_IDLE_MS
             render_busy = f.m["sim_end"] < max(prev.m["rs_end"], prev.m["present_end"])
+            if not gpu_waited and "gpu_end" in f.m:
+                gpu_period.append(f.m["gpu_end"] - prev.m["gpu_end"])
+            if not _late_in_window(f):
+                streaming_first_submission.append(f.m["driver_start"] - f.m["rs_start"])
             if not gpu_waited and _late_in_window(f) and (render_busy or f.frame_id in streams):
                 held_back += 1
+                held_ids.add(f.frame_id)
+                if prev.frame_id not in held_ids:
+                    run_starts += 1
             elif gpu_waited and not render_busy:
                 released_late += 1
         if f.m["rs_start"] - prev.m["rs_end"] < RENDER_THREAD_IDLE_MS:
@@ -346,9 +357,13 @@ def segment_report(capture: Capture, segmenter: Segmenter, segment: str,
         "back_pressure": {
             "held_back": held_back / classified if classified else None,
             "released_late": released_late / classified if classified else None,
+            "held_back_run_starts_per_s": run_starts / (duration_ms / 1000.0) if duration_ms > 0 else None,
             "first_submission_after_rs_start_ms": _q(first_submission),
             "sim_start_to_gpu_start_ms": _q(sim_before_gpu),
             "rs_start_minus_prev_gpu_end_ms": _q(start_minus_gpu_end),
+            # The GPU floor's render-thread start, -(P/2 + F) (LeadController::GpuFloorStartUs).
+            "gpu_floor_rs_start_ms": (None if len(gpu_period) < 32 or len(streaming_first_submission) < 32 else
+                                      -(statistics.median(gpu_period) / 2.0 + statistics.median(streaming_first_submission))),
             "render_thread_without_idle": contiguous / len(chain) if chain else None,
         },
         "simulation_start_position": positions,
@@ -510,11 +525,13 @@ def format_report(report: dict[str, Any]) -> str:
                      f", d {_fmt(handoff['offset_d_ms'])} ms ({handoff['h_samples']} h samples)")
         bp = seg["back_pressure"]
         held, late, idle = bp["held_back"], bp["released_late"], bp["render_thread_without_idle"]
-        lines.append(f"    back-pressure: held back {_fmt(None if held is None else 100 * held, 1)}%, released late "
+        lines.append(f"    back-pressure: held back {_fmt(None if held is None else 100 * held, 1)}% "
+                     f"({_fmt(bp['held_back_run_starts_per_s'], 2)} run starts/s), released late "
                      f"{_fmt(None if late is None else 100 * late, 1)}%, first driver submission - RS_START "
                      f"{_qtext(bp['first_submission_after_rs_start_ms'])} ms, simulation start -> GPU start "
                      f"{_qtext(bp['sim_start_to_gpu_start_ms'])} ms, RS_START - GPU end(n-1) "
-                     f"{_qtext(bp['rs_start_minus_prev_gpu_end_ms'])} ms, render thread without idle "
+                     f"{_qtext(bp['rs_start_minus_prev_gpu_end_ms'])} ms (GPU floor -(P/2 + F) "
+                     f"{_fmt(bp['gpu_floor_rs_start_ms'], 2)} ms), render thread without idle "
                      f"{_fmt(None if idle is None else 100 * idle, 1)}%")
         lines.append("    simulation start vs the render thread's frame n-1 (share, submission p50/p90 ms, "
                      "simulation outlasted the render thread):")

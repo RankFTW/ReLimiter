@@ -1033,7 +1033,7 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
         pending_sample.present_to_gpu_end_us = sample_present_to_gpu_end_us;
         pending_sample.owned_gate_hold_us = sample_owned_gate_hold_us;
         pending_sample.queue_trend_us = sample_queue_trend_us;
-        // Render handoff GPU floor term: this frame's report and the
+        // Render handoff report pair (held back, F): this frame's report and the
         // previous frame's, from this frame's RENDERSUBMIT_START.
         if (const NV_LATENCY_FRAME_REPORT* previous = PreviousFrameReport(params, i); previous != nullptr) {
             const uint64_t origin = r.renderSubmitStartTime;

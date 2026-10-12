@@ -207,9 +207,9 @@ struct SchedulerPacingStatus {
 	// Render handoff limit. Current on every publication.
 	uint8_t render_handoff = 0;            // 0 off, 1 limits the newest frame, 2 blocked
 	double render_handoff_offset_us = 0.0; // d
-	// The GPU floor (lead_controller.h): engaged once its term c > 0, then
-	// releasing no earlier than this long before the previous frame's GPU end
-	// (span × I − c).
+	// The GPU floor (lead_controller.h): known once its windows are warm, the
+	// render thread then starting no earlier than this long before the
+	// previous frame's GPU end (P/2 + F).
 	bool render_handoff_gpu_floor = false;
 	double render_handoff_gpu_lead_us = 0.0;
 	uint32_t render_handoff_limited = 0;   // frames the limit released after S, cumulative

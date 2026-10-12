@@ -231,11 +231,10 @@ static void DrawPacingPipelineStatus() {
     } else {
         ImGui::TextDisabled("Placement: %s", PacingSourcePlacement_Text(pipeline.placement));
     }
-    // Render handoff limit: frames not held with the Reflex Sleep bypassed;
-    // its GPU floor also on held frames.
+    // Render handoff limit: frames not held with the Reflex Sleep bypassed.
     if (has_status && status.render_handoff == 1 && status.render_handoff_gpu_floor)
         ImGui::TextDisabled("Render handoff limit: +%.2f ms after the render thread takes the previous frame, "
-            "no earlier than %.2f ms before the GPU finishes it | %u frames delayed | %u stalls",
+            "render thread no earlier than %.2f ms before the GPU finishes it | %u frames delayed | %u stalls",
             status.render_handoff_offset_us / 1000.0, status.render_handoff_gpu_lead_us / 1000.0,
             status.render_handoff_limited, status.render_handoff_stalls);
     else if (has_status && status.render_handoff == 1)
@@ -244,9 +243,6 @@ static void DrawPacingPipelineStatus() {
     else if (has_status && status.render_handoff == 2)
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
             "Render handoff limit: off (the render thread may wait for the next release; waiting for evidence)");
-    if (has_status && status.render_handoff != 1 && status.render_handoff_gpu_floor)
-        ImGui::TextDisabled("Render handoff GPU floor: no earlier than %.2f ms before the GPU finishes the previous frame | %u frames delayed",
-            status.render_handoff_gpu_lead_us / 1000.0, status.render_handoff_limited);
     if (has_status && status.valid)
         ImGui::TextDisabled("Lead: %.2f ms (%s, %u samples%s) | Grid epoch: %u",
             status.lead_us / 1000.0, status.lead_warm ? "warm" : "warming",
