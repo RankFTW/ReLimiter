@@ -17,3 +17,12 @@ bool TryOwnSleep(int64_t target_qpc);
 // passed, is further than 500 ms away, another pre-Sleep wait is in progress,
 // or the runtime is stopping.
 bool PreSleepWaitUntil(int64_t target_qpc);
+
+// Render-thread start hold (developer A/B key render_start_hold): waits on the
+// calling thread, WITHOUT the scheduler owner, until target_qpc with a
+// dedicated high-resolution waitable timer, no spin. Its timer and busy flag
+// are its own: PreSleepWaitUntil's are used by the game's Sleep thread at the
+// same time. Returns true when the target was reached; false when it has
+// passed, is further than 500 ms away, another render-start wait is in
+// progress, or the runtime is stopping.
+bool RenderStartWaitUntil(int64_t target_qpc);

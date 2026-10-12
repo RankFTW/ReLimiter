@@ -6,6 +6,7 @@
 #include "lead_controller.h"
 #include "pacing_metrics.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -2619,6 +2620,196 @@ void TestRenderHandoffGpuFloor()
     CHECK(waiting->GpuFloorQpc(key_of(2042)) == 0);
 }
 
+// The anchor snapshot and the render-thread start target Ĝ(n − 1) − (P/2 + F):
+// the GPU floor without σ (it exists while σ is cold), with the same live
+// PRESENT_END bound, horizon, producer epoch and identity domain rules. The
+// pure function on the snapshot gives the controller's time.
+void TestGpuFloorAnchorAndRenderStartTarget()
+{
+    constexpr uint32_t kEpoch = 7;
+    constexpr double kGpuPeriod = 17000.0; // bin center 17,010 µs
+    constexpr double kStartUs = 17010.0 / 2.0 + 830.0; // P/2 + F
+    const auto key_of = [](uint64_t frame_id, uint32_t epoch = 7) {
+        PacingPlanKey key{};
+        key.identity_domain = PacingIdentityDomain::NvApiFrame;
+        key.producer_epoch = epoch;
+        key.controller_generation = 1;
+        key.frame_id = frame_id;
+        return key;
+    };
+    const auto gpu_end_us = [&](uint64_t frame_id) { return 100000.0 + kGpuPeriod * static_cast<double>(frame_id - 2000); };
+    const auto domain = static_cast<uint8_t>(PacingIdentityDomain::NvApiFrame);
+
+    auto controller = MakeController();
+    CHECK(!controller->GpuFloorAnchorSnapshot().valid);
+    for (uint64_t frame_id = 2000; frame_id <= 2032; ++frame_id) {
+        controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us(frame_id) - kGpuPeriod + 250.0),
+            Qpc(gpu_end_us(frame_id)), 14000.0);
+    }
+    // P is warm, F is not: no anchor and no target.
+    CHECK(!controller->GpuFloorAnchorSnapshot().valid);
+    CHECK(controller->GpuRenderStartQpc(key_of(2034)) == 0);
+    for (uint64_t index = 0; index < 32; ++index) controller->OnReportPair(kEpoch, 500 + index, StreamingPair());
+
+    GpuFloorAnchor anchor = controller->GpuFloorAnchorSnapshot();
+    CHECK(anchor.valid && anchor.identity_domain == domain && anchor.producer_epoch == kEpoch);
+    CHECK(anchor.gpu_end_frame == 2032 && anchor.gpu_end_qpc == Qpc(gpu_end_us(2032)));
+    CHECK(anchor.qpc_frequency == kFrequency);
+    CHECK_NEAR(anchor.period_us, 17010.0);
+    CHECK(anchor.present_gap_warm);
+    CHECK_NEAR(anchor.present_to_gpu_end_us, 14010.0);
+    CHECK_NEAR(anchor.start_us, kStartUs);
+    CHECK(!anchor.release_to_render_warm); // σ is cold: no GPU floor, but a target
+
+    // Frame 2034: Ĝ(2033) = G(2032) + 17,010; target = Ĝ − (P/2 + F).
+    const int64_t target = Qpc(gpu_end_us(2032) + 17010.0 - kStartUs);
+    CHECK(controller->GpuRenderStartQpc(key_of(2034)) == target);
+    CHECK(controller->GpuFloorQpc(key_of(2034)) == 0);
+    CHECK(gpu_floor::RenderStartQpc(anchor, domain, kEpoch, 2034, 0, 0) == target);
+    CHECK(gpu_floor::FloorQpc(anchor, domain, kEpoch, 2034, 0, 0) == 0);
+    // Frame 2033: the newest GPU end is its predecessor's.
+    CHECK(controller->GpuRenderStartQpc(key_of(2033)) == Qpc(gpu_end_us(2032) - kStartUs));
+
+    // Live bound: frame 2033 left its Present 2,000 µs later than usual
+    // (G − 14,000); Ĝ(2034) is at least that PRESENT_END + Q5 gap + P.
+    const double usual_present_end_us = gpu_end_us(2033) - 14000.0;
+    const int64_t bounded = Qpc(usual_present_end_us + 2000.0 + 14010.0 + 17010.0 - kStartUs);
+    CHECK(controller->GpuRenderStartQpc(key_of(2035), 2033, Qpc(usual_present_end_us + 2000.0)) == bounded);
+    CHECK(gpu_floor::RenderStartQpc(anchor, domain, kEpoch, 2035, 2033, Qpc(usual_present_end_us + 2000.0)) == bounded);
+    // An early PRESENT_END never lowers the report's prediction; one not newer
+    // than the newest GPU end, or of frame n itself, is no bound.
+    const int64_t reported = Qpc(gpu_end_us(2032) + 2.0 * 17010.0 - kStartUs);
+    CHECK(controller->GpuRenderStartQpc(key_of(2035), 2033, Qpc(usual_present_end_us - 5000.0)) == reported);
+    CHECK(controller->GpuRenderStartQpc(key_of(2035), 2032, Qpc(usual_present_end_us + 9000.0)) == reported);
+    CHECK(controller->GpuRenderStartQpc(key_of(2035), 2035, Qpc(usual_present_end_us + 9000.0)) == reported);
+
+    // Horizon: at most 8 frames between the newest GPU end and frame n − 1.
+    CHECK(controller->GpuRenderStartQpc(key_of(2041)) != 0);
+    CHECK(controller->GpuRenderStartQpc(key_of(2042)) == 0);
+    int64_t unused_prediction = 0;
+    CHECK(!gpu_floor::PredictGpuEnd(anchor, domain, kEpoch, 2043, 0, 0, &unused_prediction));
+    // Not for a frame at or before the newest GPU end, another producer epoch
+    // or identity domain.
+    CHECK(controller->GpuRenderStartQpc(key_of(2032)) == 0);
+    CHECK(controller->GpuRenderStartQpc(key_of(2034, kEpoch + 1)) == 0);
+    CHECK(gpu_floor::RenderStartQpc(anchor, domain, kEpoch + 1, 2034, 0, 0) == 0);
+    PacingPlanKey pcl = key_of(2034);
+    pcl.identity_domain = PacingIdentityDomain::PclFrame;
+    CHECK(controller->GpuRenderStartQpc(pcl) == 0);
+    CHECK(gpu_floor::RenderStartQpc(anchor, static_cast<uint8_t>(PacingIdentityDomain::PclFrame), kEpoch,
+        2034, 0, 0) == 0);
+    // An invalid snapshot predicts nothing.
+    GpuFloorAnchor invalid = anchor;
+    invalid.valid = false;
+    CHECK(gpu_floor::RenderStartQpc(invalid, domain, kEpoch, 2034, 0, 0) == 0);
+
+    // σ warm: the floor is the target less σ; both come from one snapshot.
+    for (uint64_t index = 1; index <= 32; ++index) {
+        const double source_us = static_cast<double>(index) * kInterval;
+        controller->OnSourceRelease(Start(index, PacingRung::SourceOnly, source_us));
+        controller->OnStageEvent(Event(index, Kind::RenderSubmitStart, source_us + 5000.0));
+    }
+    anchor = controller->GpuFloorAnchorSnapshot();
+    CHECK(anchor.release_to_render_warm);
+    CHECK_NEAR(anchor.release_to_render_us, 5010.0);
+    CHECK(controller->GpuRenderStartQpc(key_of(2034)) == target);
+    CHECK(controller->GpuFloorQpc(key_of(2034)) == Qpc(gpu_end_us(2032) + 17010.0 - kStartUs - 5010.0));
+
+    // A new producer epoch restarts the anchor; a lifecycle reset clears it.
+    controller->OnGpuRenderEnd(kEpoch + 1, 5000, Qpc(899000.0), Qpc(900000.0), 14000.0);
+    CHECK(!controller->GpuFloorAnchorSnapshot().valid);
+    CHECK(controller->GpuRenderStartQpc(key_of(5002, kEpoch + 1)) == 0);
+    controller->Reset(kFrequency);
+    CHECK(!controller->GpuFloorAnchorSnapshot().valid);
+}
+
+// A frame's own render-thread start hold (the RenderStartHold event) is
+// ReLimiter's wait: it leaves the frame's lead sample X once on every rung (no
+// sample below 0), its slack and σ; the first value of a frame wins.
+void TestRenderStartHoldExclusion()
+{
+    const auto hold_event = [](uint64_t grid_index, double at_us, double hold_us) {
+        PacingStageEvent event = Event(grid_index, Kind::RenderStartHold, at_us);
+        event.hold_ticks = static_cast<int64_t>(std::llround(hold_us * 10.0));
+        return event;
+    };
+
+    // Source only: X = a − s = 7,000, less the 3,000 hold; a hold longer than
+    // X leaves 0.
+    for (const double hold_us : { 0.0, 3000.0, 9000.0 }) {
+        auto controller = MakeController();
+        controller->OnSourceRelease(Start(1, PacingRung::SourceOnly, 10000.0));
+        if (hold_us > 0.0) {
+            controller->OnStageEvent(hold_event(1, 15000.0, hold_us));
+            if (hold_us == 3000.0) controller->OnStageEvent(hold_event(1, 15000.0, 1000.0)); // first wins
+        }
+        controller->OnStageEvent(Event(1, Kind::RenderSubmitStart, 15000.0));
+        controller->OnStageEvent(Event(1, Kind::MarkerArrival, 17000.0));
+        const LeadStatistics statistics = controller->Statistics();
+        CHECK_NEAR(statistics.last_sample_us, std::max(0.0, 7000.0 - hold_us));
+        CHECK(statistics.render_start_hold_samples == (hold_us > 0.0 ? 1u : 0u));
+        CHECK_NEAR(statistics.last_render_start_hold_us, hold_us);
+        CHECK(statistics.invalid_inputs == 0);
+    }
+
+    // Marker hold: X = a − s less the hold.
+    auto marker = MakeController();
+    marker->OnSourceRelease(Start(1, PacingRung::MarkerHold, 10000.0));
+    marker->OnStageEvent(hold_event(1, 15000.0, 3000.0));
+    marker->OnStageEvent(Event(1, Kind::MarkerArrival, 17000.0));
+    CHECK_NEAR(marker->Statistics().last_sample_us, 4000.0);
+
+    // GPU rungs: X = max(p, r − c) − s = 12,000, less the hold, and the slack
+    // (L = 0) judges the frame without it.
+    for (const PacingRung rung : { PacingRung::GpuQueueWait, PacingRung::FgInputWait }) {
+        auto controller = MakeController();
+        controller->OnSourceRelease(Start(1, rung, 10000.0));
+        controller->OnStageEvent(hold_event(1, 15000.0, 3000.0));
+        controller->OnStageEvent(Event(1, Kind::RenderSubmitStart, 15000.0));
+        controller->OnStageEvent(Event(1, Kind::PresentCall, 16000.0));
+        controller->OnStageEvent(Event(1, Kind::GpuReady, 22000.0));
+        controller->OnStageEvent(Event(1, Kind::OutputRelease, 22000.0));
+        const LeadStatistics statistics = controller->Statistics();
+        CHECK_NEAR(statistics.last_sample_us, 9000.0);
+        CHECK_NEAR(statistics.last_slack_us, -9000.0);
+        CHECK(statistics.render_start_hold_samples == 1);
+        CHECK(statistics.invalid_inputs == 0);
+    }
+
+    // The hold event may open a frame before its release; a non-positive hold
+    // is invalid.
+    auto early = MakeController();
+    early->OnStageEvent(hold_event(1, 15000.0, 3000.0));
+    early->OnSourceRelease(Start(1, PacingRung::SourceOnly, 10000.0));
+    early->OnStageEvent(Event(1, Kind::MarkerArrival, 17000.0));
+    CHECK_NEAR(early->Statistics().last_sample_us, 4000.0);
+    PacingStageEvent none = hold_event(2, 25000.0, 0.0);
+    early->OnStageEvent(none);
+    CHECK(early->Statistics().invalid_inputs == 1);
+
+    // σ: release → RENDERSUBMIT_START of frames not held, less their own
+    // hold (5,000 − 2,000 = 3,000 µs, bin center 3,010; 5,010 without holds).
+    constexpr uint32_t kEpoch = 7;
+    const auto sigma_us = [&](bool with_hold) {
+        auto controller = MakeController();
+        for (uint64_t frame_id = 2000; frame_id <= 2032; ++frame_id) {
+            const double end_us = 100000.0 + 17000.0 * static_cast<double>(frame_id - 2000);
+            controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(end_us - 17000.0 + 250.0), Qpc(end_us), 14000.0);
+        }
+        for (uint64_t index = 0; index < 32; ++index) controller->OnReportPair(kEpoch, 500 + index, StreamingPair());
+        for (uint64_t index = 1; index <= 32; ++index) {
+            const double source_us = static_cast<double>(index) * kInterval;
+            controller->OnSourceRelease(Start(index, PacingRung::SourceOnly, source_us));
+            if (with_hold) controller->OnStageEvent(hold_event(index, source_us + 5000.0, 2000.0));
+            controller->OnStageEvent(Event(index, Kind::RenderSubmitStart, source_us + 5000.0));
+        }
+        const GpuFloorAnchor anchor = controller->GpuFloorAnchorSnapshot();
+        return anchor.release_to_render_warm ? anchor.release_to_render_us : -1.0;
+    };
+    CHECK_NEAR(sigma_us(false), 5010.0);
+    CHECK_NEAR(sigma_us(true), 3010.0);
+}
+
 // While Reflex report pairs flow, a GPU-wait frame's lead sample waits for
 // its own pair; a held-back frame's sample then leaves out W = first
 // submission − RENDERSUBMIT_START − F. A pair that never comes lets the
@@ -2739,6 +2930,8 @@ int main()
     TestRenderHandoffOffset();
     TestHandoffHeldBack();
     TestRenderHandoffGpuFloor();
+    TestGpuFloorAnchorAndRenderStartTarget();
+    TestRenderStartHoldExclusion();
     TestHeldBackLeadCorrection();
 
     if (s_failures != 0) {

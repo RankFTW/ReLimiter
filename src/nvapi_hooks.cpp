@@ -20,6 +20,7 @@
 #include "native_present_gate.h"
 #include "presentation_gate.h"
 #include "pacing_telemetry.h"
+#include "pacing_resolver.h"
 #include "reflex_clock_map.h"
 #include "runtime_lifecycle.h"
 #include "wake_guard.h"
@@ -33,6 +34,8 @@
 PFN_NvAPI_D3D_SetSleepMode     s_orig_sleep_mode      = nullptr;
 PFN_NvAPI_D3D_Sleep            s_orig_sleep            = nullptr;
 PFN_NvAPI_D3D_SetLatencyMarker s_orig_set_latency_marker = nullptr;
+// NvAPI_D3D12_SetAsyncFrameMarker: pass-through timing only (Hook_SetAsyncFrameMarker).
+static PFN_NvAPI_D3D12_SetAsyncFrameMarker s_orig_set_async_frame_marker = nullptr;
 
 // ── Shared state ──
 std::atomic<IUnknown*> g_dev{ nullptr };
@@ -508,6 +511,42 @@ static bool SafeCopyLatencyMarkerParams(
     __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+static NvAPI_Status SafeInvokeAsyncFrameMarker(
+    IUnknown* queue,
+    NV_ASYNC_FRAME_MARKER_PARAMS* params) noexcept
+{
+    if (!s_orig_set_async_frame_marker) return NVAPI_OK;
+    __try { return s_orig_set_async_frame_marker(queue, params); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return NVAPI_OK; }
+}
+
+static bool SafeReadAsyncFrameMarker(
+    const NV_ASYNC_FRAME_MARKER_PARAMS* params,
+    uint64_t* frame_id,
+    uint32_t* marker_type,
+    uint64_t* present_frame_id) noexcept
+{
+    __try {
+        *frame_id = params->frameID;
+        *marker_type = params->markerType;
+        *present_frame_id = params->presentFrameID;
+        return true;
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Reflex Sleep bypass of this call: Hook_Sleep skips the driver's Sleep, and
+// the render-thread start hold applies, only while it holds.
+static bool ReflexSleepBypassed() noexcept {
+    return NvAPI_ShouldBypassSleep(g_reflex_sleep_bypass.load(std::memory_order_relaxed),
+        g_user_target_fps.load(std::memory_order_relaxed), Scheduler_PacesSource());
+}
+
+// The newest NvAPI_D3D_SetLatencyMarker frame ID of the game itself (not
+// RTSS); the first SetAsyncFrameMarker call logs it to show that both use
+// one frame-ID domain.
+static std::atomic<uint64_t> s_newest_app_marker_frame{0};
+
 // RenderSubmitEnd(N) and SimulationStart(N+1) can be emitted concurrently.
 // Tail diagnostics must not take the single scheduler owner and make the
 // actual enforcement marker fail admission. Only the two possible release
@@ -660,8 +699,7 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
         // The bypass is decided once per call, before the pre-wait: the
         // pre-Sleep margin is learned separately with and without the
         // driver's Sleep after the hook.
-        const bool bypass = NvAPI_ShouldBypassSleep(g_reflex_sleep_bypass.load(std::memory_order_relaxed),
-            g_user_target_fps.load(std::memory_order_relaxed), Scheduler_PacesSource());
+        const bool bypass = ReflexSleepBypassed();
         // Pre-Sleep placement: record the Sleep on the presenting
         // device, then wait toward the next source target before the driver
         // Sleep. The owner is held only to plan and to record the wait end,
@@ -751,6 +789,7 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
 
     void* return_address = _ReturnAddress();
     const bool from_rtss = CallerIsRTSS(return_address);
+    if (!from_rtss) s_newest_app_marker_frame.store(marker_params.frameID, std::memory_order_relaxed);
     static std::atomic<bool> s_first_marker{ true };
     if (s_first_marker.exchange(false, std::memory_order_relaxed)) {
         LOG_INFO("NvAPI: First marker received — type=%u, frameID=%llu, source=%s",
@@ -772,15 +811,34 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
     LARGE_INTEGER present_start_forward_qpc{};
     if (marker_params.markerType == PRESENT_START && !from_rtss)
         QueryPerformanceCounter(&present_start_forward_qpc);
+    // Render-thread start hold (developer A/B key render_start_hold): a direct
+    // RENDERSUBMIT_START waits for the GPU-anchored target while ReLimiter
+    // paces the source and the Reflex Sleep is bypassed, when the frame's
+    // producer epoch and identity domain match the published anchor and its
+    // target exists (render_handoff.h). Decided before the first forward: the
+    // marker then reaches the driver after the hold, so the driver and the
+    // Reflex reports see the real start.
+    const bool order_after_wait = g_marker_forward_after_wait.load(std::memory_order_relaxed);
+    int64_t start_hold_target_qpc = 0;
+    bool start_hold = false;
+    if (marker_params.markerType == RENDERSUBMIT_START && !from_rtss && marker_device.identity.device &&
+        PacingPipeline_GetConfig().render_start_hold && !PCL_MarkersFlowing() && ReflexSleepBypassed() &&
+        !IsNvSmoothMotionActive() && NvAPI_IsFeedbackDeviceCurrent(marker_device.identity)) {
+        LARGE_INTEGER hold_now{};
+        QueryPerformanceCounter(&hold_now);
+        start_hold = RenderHandoff_RenderStartTarget(static_cast<uint8_t>(PacingIdentityDomain::NvApiFrame),
+            marker_device.identity.producer_epoch, marker_params.frameID, hold_now.QuadPart,
+            &start_hold_target_qpc);
+    }
     // Forward to driver FIRST — Reflex's JIT pacing depends on accurate
     // marker timing. Any work we do before forwarding shifts the driver's
     // perception of pipeline stage boundaries and degrades latency.
     // marker_forward_order=after_wait instead forwards direct
     // immediate markers on exit, after any source wait, as the PCL path does:
-    // the driver (and frame generation) then sees the paced release.
-    const bool forward_after_wait = !from_rtss &&
-        IsImmediateTimingMarker(marker_params.markerType) &&
-        g_marker_forward_after_wait.load(std::memory_order_relaxed);
+    // the driver (and frame generation) then sees the paced release. A
+    // RENDERSUBMIT_START the start hold applies to is forwarded after the hold.
+    const bool forward_after_wait = start_hold || (!from_rtss &&
+        IsImmediateTimingMarker(marker_params.markerType) && order_after_wait);
     NvAPI_Status result = NVAPI_OK;
     bool forwarded = false;
     // Every path returns through forward(): exactly one driver call per marker.
@@ -870,12 +928,49 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
     // the next SIMULATION_START owns the scheduler (or waits for this
     // handoff), and neither step blocks.
     if (marker_params.markerType == RENDERSUBMIT_START && !from_rtss && !PCL_MarkersFlowing()) {
+        const PacingPlanKey submit_key{PacingIdentityDomain::NvApiFrame,
+            marker_device.identity.producer_epoch,
+            FrameTimeline_CurrentControllerGeneration(), marker_params.frameID};
+        int64_t hold_ticks = 0;
+        int64_t hold_end_qpc = 0;
+        if (start_hold) {
+            // Wait only for a target that lies ahead by at most the real
+            // frame interval I; a target further away is a misprediction.
+            LARGE_INTEGER hold_begin{};
+            QueryPerformanceCounter(&hold_begin);
+            hold_end_qpc = hold_begin.QuadPart; // applied without waiting: a hold of 0
+            const int64_t interval_ticks = us_to_qpc(g_effective_interval_us.load(std::memory_order_relaxed));
+            if (start_hold_target_qpc > hold_begin.QuadPart &&
+                start_hold_target_qpc - hold_begin.QuadPart <= interval_ticks) {
+                RenderStartWaitUntil(start_hold_target_qpc);
+                LARGE_INTEGER hold_end{};
+                QueryPerformanceCounter(&hold_end);
+                hold_end_qpc = hold_end.QuadPart;
+            }
+            hold_ticks = hold_end_qpc > hold_begin.QuadPart ? hold_end_qpc - hold_begin.QuadPart : 0;
+            // Exactly one driver call per marker: here after the hold, or at
+            // the end of the hook with the marker_forward_order after_wait.
+            if (!order_after_wait) forward();
+            PacingWaitRecord record{};
+            record.key = PacingPlanKey_Frame(submit_key);
+            record.kind = PacingWaitKind::RenderStartHold;
+            record.thread_id = GetCurrentThreadId();
+            record.entry_qpc = hold_begin.QuadPart;
+            record.exit_qpc = hold_end_qpc;
+            PacingTelemetry_PushWait(record);
+            static std::atomic<uint32_t> s_logged_hold_epoch{ 0 };
+            if (s_logged_hold_epoch.exchange(submit_key.producer_epoch, std::memory_order_relaxed) !=
+                submit_key.producer_epoch) {
+                LOG_INFO("NvAPI: render-thread start hold active (producer %u, frame %llu): waited %.2f ms "
+                         "for the GPU-anchored target (interval %.2f ms)",
+                         submit_key.producer_epoch, marker_params.frameID, qpc_to_us(hold_ticks) / 1000.0,
+                         g_effective_interval_us.load(std::memory_order_relaxed) / 1000.0);
+            }
+        }
         LARGE_INTEGER submit_qpc{};
         QueryPerformanceCounter(&submit_qpc);
-        PresentGate_OnFrameMarker(PacingPlanKey{PacingIdentityDomain::NvApiFrame,
-            marker_device.identity.producer_epoch,
-            FrameTimeline_CurrentControllerGeneration(), marker_params.frameID},
-            PacingStageEventKind::RenderSubmitStart, submit_qpc.QuadPart);
+        if (hold_ticks > 0) PresentGate_OnRenderStartHold(submit_key, hold_end_qpc, hold_ticks);
+        PresentGate_OnFrameMarker(submit_key, PacingStageEventKind::RenderSubmitStart, submit_qpc.QuadPart);
     }
     SchedulerOwnerGuard scheduler_owner;
     if (!scheduler_owner) {
@@ -1071,6 +1166,48 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
     return forward();
 }
 
+// ── Hook: SetAsyncFrameMarker — pass-through timing ──
+// With the Reflex Sleep bypassed and DLSS frame generation, the NVIDIA driver
+// still paces: it sleeps the thread that calls the game's Present inside this
+// call (Streamline's sl.dlss_g, through sl.common). The hook only times the
+// call for telemetry; it never modifies the parameters or the result, and
+// never suppresses or delays the marker.
+static NvAPI_Status __cdecl Hook_SetAsyncFrameMarker(IUnknown* queue, NV_ASYNC_FRAME_MARKER_PARAMS* params) {
+    RuntimeCallbackGuard callback;
+    if (!s_orig_set_async_frame_marker) return NVAPI_OK;
+    if (callback.IsStopping() || !params) return SafeInvokeAsyncFrameMarker(queue, params);
+
+    uint64_t frame_id = 0;
+    uint64_t present_frame_id = 0;
+    uint32_t marker_type = 0;
+    const bool known = SafeReadAsyncFrameMarker(params, &frame_id, &marker_type, &present_frame_id);
+    LARGE_INTEGER call_entry{};
+    QueryPerformanceCounter(&call_entry);
+    const NvAPI_Status result = SafeInvokeAsyncFrameMarker(queue, params);
+    LARGE_INTEGER call_exit{};
+    QueryPerformanceCounter(&call_exit);
+    if (!known) return result;
+
+    static std::atomic<bool> s_first_call{ true };
+    if (s_first_call.exchange(false, std::memory_order_relaxed)) {
+        LOG_INFO("NvAPI: first SetAsyncFrameMarker call - type=%u, frameID=%llu, presentFrameID=%llu, "
+                 "newest app NvAPI marker frameID=%llu, thread=%u, %.1f us",
+                 marker_type, frame_id, present_frame_id,
+                 s_newest_app_marker_frame.load(std::memory_order_relaxed), GetCurrentThreadId(),
+                 qpc_to_us(call_exit.QuadPart - call_entry.QuadPart));
+    }
+    PacingWaitRecord record{};
+    record.key = PacingFrameKey{PacingIdentityDomain::NvApiFrame,
+        FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::NvApiFrame), frame_id};
+    record.kind = PacingWaitKind::AsyncFrameMarker;
+    record.thread_id = GetCurrentThreadId();
+    record.marker_type = marker_type;
+    record.entry_qpc = call_entry.QuadPart;
+    record.exit_qpc = call_exit.QuadPart;
+    PacingTelemetry_PushWait(record);
+    return result;
+}
+
 // ── Public API ──
 NvAPI_Status InvokeSetLatencyMarker(IUnknown* dev, NV_LATENCY_MARKER_PARAMS* params) {
     return s_orig_set_latency_marker(dev, params);
@@ -1163,6 +1300,8 @@ void InstallNvAPIHooks() {
     void* pSetSleepMode     = NvAPI_QI(ID_SetSleepMode);
     void* pSleep            = NvAPI_QI(ID_Sleep);
     void* pSetLatencyMarker = NvAPI_QI(ID_SetLatencyMarker);
+    constexpr NvU32 ID_SetAsyncFrameMarker = 0x13C98F73;
+    void* pSetAsyncFrameMarker = NvAPI_QI(ID_SetAsyncFrameMarker);
 
     if (pSetSleepMode)
         InstallHook(pSetSleepMode, (void*)&Hook_SetSleepMode, (void**)&s_orig_sleep_mode);
@@ -1176,6 +1315,14 @@ void InstallNvAPIHooks() {
         if (status == MH_OK) {
             FrameTimeline_BeginProducerEpoch(FrameIdentityDomain::NvApiFrame);
         }
+    }
+    if (pSetAsyncFrameMarker) {
+        const MH_STATUS status = InstallHook(
+            pSetAsyncFrameMarker,
+            (void*)&Hook_SetAsyncFrameMarker,
+            (void**)&s_orig_set_async_frame_marker);
+        LOG_INFO("NvAPI: SetAsyncFrameMarker timing hook %s",
+                 status == MH_OK ? "installed" : "not installed");
     }
 #endif // _WIN64
 }

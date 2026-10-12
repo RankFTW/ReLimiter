@@ -1,6 +1,6 @@
 // Link production sleep.cpp and wake_guard.cpp. Only unrelated lifecycle,
 // logging, TSC conversion and hardware-spin integration are stubbed here.
-// These tests never wait; real timer/spin/shutdown timing needs live validation.
+// These tests never wait (but one 5 ms RenderStartWaitUntil timer wait); real timer/spin/shutdown timing needs live validation.
 #include "pacing_sleep.h"
 #include "sleep.h"
 #include "wake_guard.h"
@@ -70,6 +70,24 @@ int main()
     CHECK(spin_calls == 1);
     CHECK(g_adaptive_wake_guard.LastFinalError() == 0.0);
     CHECK(g_adaptive_wake_guard.wake_errors.Size() == 0);
+
+    // RenderStartWaitUntil (render-thread start hold): its own timer. It
+    // never waits for a target that has passed, one beyond 500 ms, or a
+    // stopping runtime, and has no timer before InitSleepTimer.
+    stopping = false;
+    QueryPerformanceCounter(&now);
+    CHECK(!RenderStartWaitUntil(now.QuadPart - 1));
+    CHECK(!RenderStartWaitUntil(now.QuadPart + GetQPCFrequency() * 60));
+    CHECK(!RenderStartWaitUntil(now.QuadPart + GetQPCFrequency() / 100));
+    InitSleepTimer();
+    QueryPerformanceCounter(&now);
+    CHECK(RenderStartWaitUntil(now.QuadPart + GetQPCFrequency() / 200)); // 5 ms
+    stopping = true;
+    CHECK(!RenderStartWaitUntil(now.QuadPart + GetQPCFrequency() / 100));
+    stopping = false;
+    CloseSleepTimer();
+    QueryPerformanceCounter(&now);
+    CHECK(!RenderStartWaitUntil(now.QuadPart + GetQPCFrequency() / 100));
 
     std::printf("pacing sleep: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;

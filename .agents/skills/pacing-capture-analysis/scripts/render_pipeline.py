@@ -38,7 +38,15 @@ from both. Per segment it reports:
   intervals only between adjacent rows of the same segment, no loss-window
   rows; analyze_pacing.py stays authoritative for whole-capture metrics) and
   PC Latency;
-- grid epochs per minute by reason.
+- grid epochs per minute by reason;
+- when the file has them (2026-10-12 and later), the waits of the render
+  thread and the driver: quantiles over the segment's frames of
+  render_start_hold_us (ReLimiter's own hold at RENDERSUBMIT_START, the
+  render_start_hold A/B; 0 when it applied without waiting) and
+  async_marker_wait_us (the longest NvAPI_D3D12_SetAsyncFrameMarker call of the
+  frame, inside which the driver paces with DLSS-G under the Reflex Sleep
+  bypass), each with the number of frames that have it, and the async marker
+  type of the frames' longest calls.
 
 --replay-floor ANCHOR[+-MS] replays a release floor at a marker of frame n - 1
 (rs_start, rs_end, present_start or present_end) sequentially: a frame whose
@@ -85,6 +93,8 @@ ANCHORS = ("rs_start", "rs_end", "present_start", "present_end")
 CPU_MARKERS = ("sim_start", "sim_end", "rs_start", "rs_end", "present_start", "present_end")
 TAKE_GAP_MS = 0.1         # replay: the render thread takes a frame this long after it is free
 MIN_PRESENT_CALL_MS = 0.3  # replay: shortest Present call once the render thread arrives late
+ASYNC_MARKER_TYPES = {9: "out_of_band_render_submit_start", 10: "out_of_band_render_submit_end",
+                      11: "out_of_band_present_start", 12: "out_of_band_present_end"}
 LONG_FRAME_MULTIPLE = 1.5
 RENDER_THREAD_IDLE_MS = 0.3  # the render thread started frame n less than this after finishing n - 1
 GPU_IDLE_MS = 1.0            # the GPU waited for the frame beyond this (LEAD_HANDOFF_GPU_IDLE_US)
@@ -114,6 +124,8 @@ class Frame:
     display: float | None
     pcl_ms: float | None
     m: dict[str, float]
+    waits: dict[str, float] = field(default_factory=dict)  # ms: render_start_hold, async_marker_wait
+    async_type: int | None = None                          # marker type of the longest async marker call
 
 
 @dataclass
@@ -161,9 +173,17 @@ def load(path: Path, events_path: Path | None = None) -> Capture:
                     markers[name] = (anchor + (value - anchor_us) * freq / 1e6) / per_ms
             if any(name not in markers for name in CPU_MARKERS):  # GPU markers may be absent
                 continue
+            waits = {}
+            for name, column in (("render_start_hold", "render_start_hold_us"),
+                                 ("async_marker_wait", "async_marker_wait_us")):
+                value = _float(row, column)
+                if value is not None and value >= 0:
+                    waits[name] = value / 1000.0
+            async_type = _float(row, "async_marker_wait_type") if "async_marker_wait" in waits else None
             frames.append(Frame(int(fid), int(rung), s / per_ms, target / per_ms - lead / 1000.0, target / per_ms,
                                 (_float(row, "interval_us") or 0.0) / 1000.0,
-                                None if display is None or display <= 0 else display / per_ms, pcl_ms, markers))
+                                None if display is None or display <= 0 else display / per_ms, pcl_ms, markers,
+                                waits, None if async_type is None else int(async_type)))
     unique: dict[int, Frame] = {}
     for frame in frames:
         unique.setdefault(frame.frame_id, frame)  # FG outputs repeat a real frame's row
@@ -372,8 +392,26 @@ def segment_report(capture: Capture, segmenter: Segmenter, segment: str,
         "real_frame_pcl_ms": _q([f.pcl_ms for f in frames if f.pcl_ms is not None]),
         "display": _display(capture, segmenter, segment),
         "grid_epochs_per_minute": {k: v / (duration_ms / 60000.0) for k, v in epochs.items()} if duration_ms else {},
+        "waits_ms": _waits(frames),
     }
     return report
+
+
+def _waits(frames: list[Frame]) -> dict[str, dict[str, Any]]:
+    """Quantiles (ms) of the wait columns over the frames that have them: render_start_hold_us (0 = the hold
+    applied without waiting) and async_marker_wait_us with the marker types of the longest calls. Empty for a
+    file without the columns or frames without a record."""
+    waits: dict[str, dict[str, Any]] = {}
+    for name in ("render_start_hold", "async_marker_wait"):
+        values = [f.waits[name] for f in frames if name in f.waits]
+        if not values:
+            continue
+        waits[name] = _q(values)
+        if name == "async_marker_wait":
+            counts = Counter(ASYNC_MARKER_TYPES.get(f.async_type, str(f.async_type))
+                             for f in frames if "async_marker_wait" in f.waits and f.async_type is not None)
+            waits[name]["types"] = dict(counts)
+    return waits
 
 
 def _duration(capture: Capture, segmenter: Segmenter, segment: str) -> float:
@@ -547,6 +585,10 @@ def format_report(report: dict[str, Any]) -> str:
                          f"PCL (all rows) {_qtext(display['pcl_ms'])} ms")
         lines.append(f"    real-frame PCL ms {_qtext(seg['real_frame_pcl_ms'])}; grid epochs/min "
                      + (", ".join(f"{k} {v:.1f}" for k, v in sorted(seg["grid_epochs_per_minute"].items())) or "none"))
+        for wait_name, entry in seg.get("waits_ms", {}).items():
+            types = entry.get("types")
+            lines.append(f"    {wait_name} ms (p50 / p90 / p99) {_qtext(entry)} over {entry['count']} frames"
+                         + (f"; marker types {types}" if types else ""))
     for r in report.get("replays", []):
         if not r.get("frames"):
             lines.append("  replay: no frames")

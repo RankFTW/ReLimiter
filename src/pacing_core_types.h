@@ -197,7 +197,12 @@ enum class PacingStageEventKind : uint8_t {
     // PRESENT_END on the GPU waits (the simulation → render queue).
     RenderSubmitStart = 7, // w
     SimulationEnd = 8,     // e
-    PresentEnd = 9         // b
+    PresentEnd = 9,        // b
+    // The frame's own render-thread start hold (developer A/B key
+    // render_start_hold): ReLimiter's wait at RENDERSUBMIT_START, not a stage
+    // time. qpc is the hold's end, hold_ticks its duration (> 0). It leaves the
+    // lead sample X and σ (lead_controller.h).
+    RenderStartHold = 10
 };
 
 // Developer key `gpu_queue_wait_render_queue` (A/B): whether the
@@ -234,4 +239,6 @@ struct PacingStageEvent {
     // GpuResume only: the pre-Wait GPU timestamp mapped to QPC (the GPU
     // reached the fence Wait); 0 when unknown.
     int64_t gpu_wait_qpc = 0;
+    // RenderStartHold only: the waited duration in QPC ticks.
+    int64_t hold_ticks = 0;
 };

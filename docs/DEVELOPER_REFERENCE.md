@@ -92,6 +92,19 @@ Turning it off removes two command lists and two fence signals per frame from th
 - The **Reflex driver limiter** placement needs the driver's Sleep, so with the bypass on that placement cannot apply.
 - The log records each change. The 32-bit addon has no Reflex hooks, so the setting has no effect there.
 - Turning the bypass off returns to the driver's Sleep, which can favor latency over smooth pacing near the GPU's limit.
+- With DLSS Frame Generation the driver still paces inside `NvAPI_D3D12_SetAsyncFrameMarker`, which Streamline's `sl.dlss_g` calls through `sl.common`: it can sleep the thread that calls the game's Present although the Sleep is bypassed. ReLimiter only times that call (the `async_marker_wait_us` column) and never suppresses, delays or alters it. The developer [Render-thread start hold](#render-thread-start-hold) is the A/B for that.
+
+### Render-thread start hold
+
+`render_start_hold` (default **off**, 64-bit, direct NvAPI Reflex markers, with the Sleep bypass on). With DLSS Frame Generation and the Sleep bypassed, the NVIDIA driver still paces the game inside `NvAPI_D3D12_SetAsyncFrameMarker`. Which thread it sleeps decides the result: in CONTROL Resonant it is the render thread that starts the next frame (pacing is good), in Gears of War: E-Day it is the engine's RHI submission thread, which the driver holds a little after the render thread has already started the next frame, so that frame's GPU work is submitted late in one burst and the GPU idles. Going back to the driver's Sleep fixes the second and makes the first much worse.
+
+On, ReLimiter holds the game's render thread itself at its RENDERSUBMIT_START until a target taken from the GPU, in every game, so the render thread never starts a frame earlier than about half a GPU frame plus the submission delay before the GPU finishes the previous one and nothing is left for the driver to hold. This is a developer A/B; its effect is not established.
+
+- **Target.** Ĝ(n−1) − (P/2 + F), the same measured quantities as the render handoff GPU floor ([Render handoff limit](FRAME_PACING.md#render-handoff-limit)) without its σ: Ĝ(n−1) is when the GPU finishes the previous frame (the newer of the newest Reflex report's GPU end and the render thread's live PRESENT_END, each extrapolated by the GPU period P), and F is the median delay from RENDERSUBMIT_START to the frame's first driver submission. It needs the same warm windows (32 samples each) and the report's producer epoch.
+- **Applies** to a direct (not RTSS) RENDERSUBMIT_START while ReLimiter paces the source and the Reflex Sleep is bypassed, when the frame's producer epoch matches the measured anchor. ReLimiter then waits for the target if it lies in the future by at most one real frame interval, with its own high-resolution timer, no spin; a target further away is a misprediction and the frame is not held. The marker reaches the driver once, after the hold, so the driver and the Reflex reports see the real start.
+- **The wait is ReLimiter's own.** It leaves the lead samples of every output and the release → RENDERSUBMIT_START time the GPU floor learns, so the lead and the floor keep describing the game.
+- The log warns while it is on (`Pacing pipeline: diagnostic render-thread start hold on`), logs `OSD: render-thread start hold -> on|off` for a change and at INFO the first hold of each producer epoch (`NvAPI: render-thread start hold active`). There is no per-frame log: read the hold per frame from the `render_start_hold_us` column.
+- Compare long frames, jitter, GPU idle gaps and PC Latency, one setting per capture in the same scene, with Reflex active (frame generation forces it on). Pacing wins over latency: a hold that trades long frames for latency is rejected.
 
 ### Marker forward order
 
@@ -167,6 +180,7 @@ Settings belong under `[FrameLimiter]`. Leave these at their defaults for normal
 | `gpu_queue_wait_render_queue` | keep | 64-bit, `gpu_queue_wait` only. `keep`, `remove` or `remove_held` (**GPU queue wait render queue**). Invalid values reset to `keep`. |
 | `lead_coverage` | 99 | All holds. `99` or `95`: the share of frames the lead covers (**Lead coverage**). Invalid values reset to `99`. An INI saved with `config_version=2` (4.0 test builds) moves from `95` to `99` once. |
 | `fg_late_spacing` | true | 64-bit, `fg_input_wait` only. `true` or `false` (**FG late-frame spacing**). An INI saved with `config_version=3` or earlier (4.0 test builds) moves from `false` to `true` once. |
+| `render_start_hold` | false | 64-bit, direct NvAPI Reflex markers, with the Sleep bypass on. `true` or `false` (**Render-thread start hold**): holds the game's render thread at RENDERSUBMIT_START until a GPU-anchored target. Developer A/B, off by default. |
 | `source_placement` | pre_sleep | 64-bit, Reflex markers. `marker`, `pre_sleep` or `driver` (**Source placement**). `auto` from earlier versions loads as `marker`; invalid values reset to `pre_sleep`. |
 
 ---
@@ -374,7 +388,7 @@ The pacing events file records cap changes as `gpu_wait_cap` events and overload
 
 Turn on **Telemetry Logging** (Advanced) to record a capture; the User Guide describes the steps. Files are written next to the addon and named with the game's process name, process ID, a session number and the capture number.
 
-**`relimiter_pacing_`** has one row per displayed frame, or per Present call when no display time is available, with 138 columns (column names are in the header row; empty cells mean the value was unavailable, not zero). Present records come only from the DXGI `Present` and `Present1` hooks, so Vulkan, OpenGL and DX9 captures have the header and no rows. Groups:
+**`relimiter_pacing_`** has one row per displayed frame, or per Present call when no display time is available, with 141 columns (column names are in the header row; empty cells mean the value was unavailable, not zero). Present records come only from the DXGI `Present` and `Present1` hooks, so Vulkan, OpenGL and DX9 captures have the header and no rows. Groups:
 
 - ReLimiter's release and frame plan: cadence epoch and index, output target, lead, output point and its outcome.
 - The game's Present call, GPU wait and readiness timing, Reflex timing.
@@ -384,6 +398,7 @@ Turn on **Telemetry Logging** (Advanced) to record a capture; the User Guide des
 - `gate_pre_wait_qpc` and `gate_post_wait_qpc`, the GPU queue wait's GPU time before and after the wait (with **GPU Wait Probes**; empty when unknown).
 - PC Latency (with PC latency collection).
 - `source_placement`, with `pre_sleep_end_qpc` and `pre_sleep_margin_us` (the end and margin of the frame's pre-Sleep wait; empty without one), and `source_wait_start_qpc` and `pre_sleep_start_qpc` (where the source wait and pre-Sleep wait started; empty without that wait).
+- `render_start_hold_us` (this real frame's render-thread start hold in µs: 0 when it applied without waiting, empty when it did not apply), `async_marker_wait_us` (the longest `NvAPI_D3D12_SetAsyncFrameMarker` call carrying the frame's NvAPI frame ID, where the driver paces with frame generation under the Sleep bypass; empty when none) and `async_marker_wait_type` (that call's marker type: 9–12, the out-of-band render submit and Present markers). Both are joined by NvAPI frame ID within the producer epoch, like the Reflex columns, and a full wait queue drops records, so empty is not zero.
 
 **`relimiter_pacing_events_`** has one row per event:
 

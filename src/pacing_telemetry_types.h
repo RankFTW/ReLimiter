@@ -208,6 +208,24 @@ struct PacingReflexRecord {
     double clock_map_offset_us = 0.0;    // estimate of local_us - driver_us at publication
 };
 
+enum class PacingWaitKind : uint8_t {
+    RenderStartHold = 1,  // ReLimiter's hold of the render thread at RENDERSUBMIT_START
+    AsyncFrameMarker = 2  // one NvAPI_D3D12_SetAsyncFrameMarker call (the driver may pace inside it)
+};
+
+// Any game or render thread, once per render-thread start hold of a direct
+// NvAPI frame and once per NvAPI_D3D12_SetAsyncFrameMarker call; joined by
+// frame key like PacingReflexRecord. A hold that applied without waiting has
+// exit_qpc == entry_qpc.
+struct PacingWaitRecord {
+    PacingFrameKey key{};          // NvAPI frame ID within the producer epoch
+    PacingWaitKind kind = PacingWaitKind::RenderStartHold;
+    uint32_t thread_id = 0;
+    uint32_t marker_type = 0;      // AsyncFrameMarker: the call's marker type (NV_LATENCY_MARKER_TYPE, 9..12 out of band)
+    int64_t entry_qpc = 0;
+    int64_t exit_qpc = 0;
+};
+
 // Real/generated evidence for the Present that owns a display sample. Values
 // equal PresentFrameClassification; the collector maps them explicitly.
 enum class PacingFrameClassification : uint8_t {

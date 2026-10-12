@@ -92,6 +92,7 @@ void PacingJoiner::Reset(uint64_t qpc_frequency) noexcept
     gates_.Clear();
     readies_.Clear();
     reflexes_.Clear();
+    waits_.Clear();
     pending_displays_.Clear();
     swapchains_ = {};
     swapchain_use_clock_ = 0;
@@ -174,6 +175,38 @@ void PacingJoiner::AddReflex(const PacingReflexRecord& record, int64_t now_qpc) 
     Retain(&reflexes_, RetainedReflex{ record, now_qpc }, &statistics_.reflex_capacity_evictions);
 }
 
+// Merges the record into its frame's entry (the newest one of the key), or
+// opens one: a start hold sets the frame's hold, an async marker call keeps
+// the longest call of the frame.
+void PacingJoiner::AddWait(const PacingWaitRecord& record, int64_t now_qpc) noexcept
+{
+    if (!PacingFrameKey_IsValid(record.key) || record.entry_qpc <= 0 || qpc_frequency_ == 0) {
+        ++statistics_.invalid_records;
+        return;
+    }
+    EvictOlderThan(&waits_, now_qpc, retention_ticks_);
+    const int64_t ticks = record.exit_qpc > record.entry_qpc ? record.exit_qpc - record.entry_qpc : 0;
+    const double wait_us = static_cast<double>(ticks) * 1'000'000.0 / static_cast<double>(qpc_frequency_);
+    RetainedWait* entry = FindNewestMutable(waits_,
+        [&record](const PacingWaitJoin& candidate) { return candidate.key == record.key; });
+    if (entry == nullptr) {
+        RetainedWait fresh{};
+        fresh.record.key = record.key;
+        fresh.received_qpc = now_qpc;
+        if (waits_.Full()) waits_.PopFront();
+        waits_.PushBack(fresh);
+        entry = &waits_.At(waits_.TailSequence() - 1);
+    }
+    if (record.kind == PacingWaitKind::RenderStartHold) {
+        entry->record.has_hold = true;
+        entry->record.hold_us = wait_us;
+    } else if (!entry->record.has_async || wait_us > entry->record.async_us) {
+        entry->record.has_async = true;
+        entry->record.async_us = wait_us;
+        entry->record.async_type = record.marker_type;
+    }
+}
+
 bool PacingJoiner::AddDisplay(const PacingDisplaySample& sample, int64_t now_qpc) noexcept
 {
     return AddDisplay(sample, now_qpc, PacingDisplayContext{});
@@ -215,6 +248,7 @@ void PacingJoiner::EvictAgedRecords(int64_t now_qpc) noexcept
     EvictOlderThan(&gates_, now_qpc, retention_ticks_);
     EvictOlderThan(&readies_, now_qpc, retention_ticks_);
     EvictOlderThan(&reflexes_, now_qpc, retention_ticks_);
+    EvictOlderThan(&waits_, now_qpc, retention_ticks_);
 }
 
 bool PacingJoiner::TakeDisplayRow(int64_t now_qpc, bool final_drain, PacingJoinedRow* row) noexcept
@@ -485,6 +519,13 @@ void PacingJoiner::AttachWorkerRecords(PacingJoinedRow* row) noexcept
             row->has_reflex = true;
             row->reflex = reflex->record;
             ++statistics_.reflex_joined;
+        }
+
+        const RetainedWait* wait = FindNewest(waits_,
+            [&key](const PacingWaitJoin& candidate) { return candidate.key == key; });
+        if (wait != nullptr) {
+            row->has_wait = true;
+            row->wait = wait->record;
         }
     }
 }

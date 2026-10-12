@@ -119,6 +119,7 @@ Record a GPUView trace alongside a ReLimiter CSV capture when the question is on
 - **Stop:** takes a final SchedulingLog rundown, stops the sessions in `log.cmd`'s order and merges them into `merged.etl` in that folder. The session files are deleted only after a non-empty merge.
 - **Folder contents:** `tracestats.txt`, and `trace_info.txt` with the QPC just before the first session, after the last one and at the stop.
 - **Safety:** the stop script also ends sessions left running by an earlier attempt, and the start script refuses to run while they exist. `GPU_TRACE_DRY_RUN=1` prints the xperf commands without running them.
+- **Call stacks (opt-in):** `start_gpu_trace.cmd 10 stacks` adds a stack walk on every context switch to the kernel session, so each switch-in carries the stack where the thread waited (for example which module put a game thread to sleep). It is heavy: record 5–10 s and use the trace to name callers, not to measure pacing. The console and `trace_info.txt` print the profile; check it reads `context-switch stacks`.
 
 Procedure:
 

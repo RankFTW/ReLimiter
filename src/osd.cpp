@@ -615,6 +615,19 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "frame's Present, because the next frame would wait too. Watch jitter and long frames; one setting "
         "per capture.");
 
+    if (ImGui::Checkbox("Render-thread start hold", &g_config.render_start_hold)) {
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: render-thread start hold -> %s", g_config.render_start_hold ? "on" : "off");
+        *config_dirty = true;
+    }
+    HelpTip("Diagnostic A/B, direct NVIDIA Reflex markers with the Reflex Sleep bypass on. The driver paces "
+        "frame generation inside the call that presents the frame, and that can hold a game thread that "
+        "has already started the next frame. On, ReLimiter instead holds the game's render thread at the "
+        "start of its frame until about half a GPU frame plus the submission delay before the GPU finishes "
+        "the previous frame, so the frame reaches Present no earlier than the driver would have held it. "
+        "A wait further away than one frame interval is not made. Watch long frames, GPU idle gaps and PC "
+        "Latency; one setting per capture.");
+
     static const char* const kSourcePlacementLabels[] = {"Marker", "Pre-Sleep", "Reflex driver limiter"};
     static_assert(IM_ARRAYSIZE(kSourcePlacementLabels) ==
         static_cast<int>(PacingPlacementOverride::Count));

@@ -442,31 +442,41 @@ double LeadController::GpuFloorStartUs() const noexcept
     return gpu_period_window_.Quantile(0.5) / 2.0 + first_submission_window_.Quantile(0.5);
 }
 
+GpuFloorAnchor LeadController::GpuFloorAnchorSnapshot() const noexcept
+{
+    GpuFloorAnchor anchor;
+    const double start_us = GpuFloorStartUs();
+    if (!(start_us > 0.0) || qpc_frequency_ <= 0 || gpu_end_epoch_ == 0 || gpu_end_qpc_ <= 0) return anchor;
+    anchor.valid = true;
+    anchor.identity_domain = static_cast<uint8_t>(PacingIdentityDomain::NvApiFrame);
+    anchor.producer_epoch = gpu_end_epoch_;
+    anchor.gpu_end_frame = gpu_end_frame_;
+    anchor.gpu_end_qpc = gpu_end_qpc_;
+    anchor.qpc_frequency = qpc_frequency_;
+    anchor.period_us = gpu_period_window_.Quantile(0.5);
+    anchor.present_gap_warm = gpu_after_present_window_.Count() >= LEAD_WARM_SAMPLES;
+    anchor.present_to_gpu_end_us = anchor.present_gap_warm
+        ? gpu_after_present_window_.Quantile(LEAD_HANDOFF_GPU_BOUND_QUANTILE) : 0.0;
+    anchor.start_us = start_us;
+    anchor.release_to_render_warm = release_to_render_window_.Count() >= LEAD_WARM_SAMPLES;
+    anchor.release_to_render_us = anchor.release_to_render_warm ? release_to_render_window_.Quantile(0.5) : 0.0;
+    return anchor;
+}
+
 int64_t LeadController::GpuFloorQpc(const PacingPlanKey& key, uint64_t present_end_frame,
     int64_t present_end_qpc) const noexcept
 {
-    const double start_us = GpuFloorStartUs();
-    if (!(start_us > 0.0) || qpc_frequency_ <= 0 || release_to_render_window_.Count() < LEAD_WARM_SAMPLES ||
-        key.identity_domain != PacingIdentityDomain::NvApiFrame || key.producer_epoch == 0 ||
-        key.producer_epoch != gpu_end_epoch_ || gpu_end_qpc_ <= 0 || key.frame_id <= gpu_end_frame_ ||
-        key.frame_id - 1 - gpu_end_frame_ > LEAD_HANDOFF_GPU_HORIZON_FRAMES) {
-        return 0;
-    }
-    const auto ticks = [this](double us) {
-        return static_cast<int64_t>(std::llround(us * static_cast<double>(qpc_frequency_) / kMicrosecondsPerSecond));
-    };
-    const double period_us = gpu_period_window_.Quantile(0.5);
-    // Ĝ(n − 1): the newest report extrapolated, at least the live bound from
-    // a newer frame's PRESENT_END.
-    int64_t predicted_qpc = gpu_end_qpc_ + ticks(static_cast<double>(key.frame_id - 1 - gpu_end_frame_) * period_us);
-    if (present_end_qpc > 0 && present_end_frame > gpu_end_frame_ && present_end_frame < key.frame_id &&
-        gpu_after_present_window_.Count() >= LEAD_WARM_SAMPLES) {
-        const double bound_us = gpu_after_present_window_.Quantile(LEAD_HANDOFF_GPU_BOUND_QUANTILE) +
-            static_cast<double>(key.frame_id - 1 - present_end_frame) * period_us;
-        predicted_qpc = (std::max)(predicted_qpc, present_end_qpc + ticks(bound_us));
-    }
     // Ĝ(n − 1) − (P/2 + F + σ).
-    return predicted_qpc - ticks(start_us + release_to_render_window_.Quantile(0.5));
+    return gpu_floor::FloorQpc(GpuFloorAnchorSnapshot(), static_cast<uint8_t>(key.identity_domain),
+        key.producer_epoch, key.frame_id, present_end_frame, present_end_qpc);
+}
+
+int64_t LeadController::GpuRenderStartQpc(const PacingPlanKey& key, uint64_t present_end_frame,
+    int64_t present_end_qpc) const noexcept
+{
+    // Ĝ(n − 1) − (P/2 + F).
+    return gpu_floor::RenderStartQpc(GpuFloorAnchorSnapshot(), static_cast<uint8_t>(key.identity_domain),
+        key.producer_epoch, key.frame_id, present_end_frame, present_end_qpc);
 }
 
 LeadBucketStatus LeadController::BucketStatus(PacingRung rung, double fg_divisor) const noexcept
@@ -599,9 +609,10 @@ void LeadController::OnStageEvent(const PacingStageEvent& event) noexcept
         "Field values must match PacingStageEventKind");
     static_assert(FieldCount <= 16, "field_mask holds one bit per Field");
 
+    const bool hold_event = event.kind == PacingStageEventKind::RenderStartHold;
     const uint8_t kind = static_cast<uint8_t>(event.kind);
-    if (qpc_frequency_ <= 0 || kind == FieldSource || kind >= FieldCount || event.qpc <= 0 ||
-        !PacingPlanKey_IsValid(event.key)) {
+    if (qpc_frequency_ <= 0 || event.qpc <= 0 || !PacingPlanKey_IsValid(event.key) ||
+        (hold_event ? event.hold_ticks <= 0 : (kind == FieldSource || kind >= FieldCount))) {
         ++statistics_.invalid_inputs;
         return;
     }
@@ -627,6 +638,13 @@ void LeadController::OnStageEvent(const PacingStageEvent& event) noexcept
         return;
     }
 
+    if (hold_event) {
+        // Not a stage time: the hold leaves X and σ (RenderStartHoldUs). The
+        // push precedes the frame's RENDERSUBMIT_START event, so it is known
+        // before σ and any sample are taken; the first value wins.
+        if (frame->render_start_hold_ticks == 0) frame->render_start_hold_ticks = event.hold_ticks;
+        return;
+    }
     const Field field = static_cast<Field>(kind);
     if (HasField(*frame, field)) return; // the first value of each kind wins
     SetField(frame, field, event.qpc);
@@ -787,8 +805,15 @@ void LeadController::RecordReleaseToRender(PendingFrame* frame) noexcept
     const double release_to_render_us =
         MicrosecondsBetween(frame->qpc[FieldSource], frame->qpc[FieldRenderSubmit]);
     if (release_to_render_us >= 0.0 && release_to_render_us <= LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us) {
-        release_to_render_window_.Add(release_to_render_us);
+        // Without the frame's own start hold, which comes after the release.
+        release_to_render_window_.Add(std::max(0.0, release_to_render_us - RenderStartHoldUs(*frame)));
     }
+}
+
+double LeadController::RenderStartHoldUs(const PendingFrame& frame) const noexcept
+{
+    if (frame.render_start_hold_ticks <= 0 || qpc_frequency_ <= 0) return 0.0;
+    return MicrosecondsBetween(0, frame.render_start_hold_ticks);
 }
 
 // ── Buckets ──
@@ -1227,6 +1252,11 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
         ++statistics_.carried_hold_samples;
         statistics_.last_carried_hold_us = carried_us;
     }
+    const double render_start_hold_us = RenderStartHoldUs(*frame);
+    if (render_start_hold_us > 0.0) {
+        ++statistics_.render_start_hold_samples;
+        statistics_.last_render_start_hold_us = render_start_hold_us;
+    }
     Bucket& bucket = buckets_[frame->bucket];
     // Lockstep engines (lead_controller.h): ReLimiter's waits for later frames
     // that this frame's Present followed are not the game's lateness.
@@ -1326,17 +1356,24 @@ double LeadController::SampleUs(const PendingFrame& frame, const PendingFrame* p
     if (own_ready_qpc != nullptr) *own_ready_qpc = 0;
     if (carried_us != nullptr) *carried_us = 0.0;
     const int64_t source = frame.qpc[FieldSource];
+    // The frame's own render-thread start hold (lead_controller.h) is
+    // ReLimiter's wait between the release and the arrival, ready and Present
+    // times below, so X leaves it out on every rung; no sample goes below 0.
+    const double hold_us = RenderStartHoldUs(frame);
+    const auto without_hold = [hold_us](double x_us) noexcept {
+        return hold_us > 0.0 && std::isfinite(x_us) ? std::max(0.0, x_us - hold_us) : x_us;
+    };
     switch (frame.rung) {
     case PacingRung::SourceOnly:
-        return MicrosecondsBetween(source, frame.qpc[FieldMarkerArrival]);
+        return without_hold(MicrosecondsBetween(source, frame.qpc[FieldMarkerArrival]));
     case PacingRung::MarkerHold:
     case PacingRung::NativeHold: {
         const Field arrival = frame.rung == PacingRung::MarkerHold ? FieldMarkerArrival : FieldNativeArrival;
         const double arrival_us = MicrosecondsBetween(source, frame.qpc[arrival]);
         double hold_begin_us = 0.0;
         double hold_end_us = 0.0;
-        if (!PreviousCpuHold(previous, source, &hold_begin_us, &hold_end_us)) return arrival_us;
-        return arrival_us - Overlap(0.0, arrival_us, hold_begin_us, hold_end_us);
+        if (!PreviousCpuHold(previous, source, &hold_begin_us, &hold_end_us)) return without_hold(arrival_us);
+        return without_hold(arrival_us - Overlap(0.0, arrival_us, hold_begin_us, hold_end_us));
     }
     case PacingRung::GpuQueueWait:
     case PacingRung::FgInputWait: {
@@ -1371,13 +1408,17 @@ double LeadController::SampleUs(const PendingFrame& frame, const PendingFrame* p
                 if (!(carried > 0.0)) carried = 0.0;
             }
         }
+        // c above is the delay of earlier holds; the frame's own start hold
+        // comes off the readiness it is stored with, so the next frame's c
+        // takes the delay this hold carried through a busy GPU.
         const double own_ready_us = std::max(present_us, ready_us - carried);
         if (carried_us != nullptr) *carried_us = (ready_us - own_ready_us) > 0.0 ? ready_us - own_ready_us : 0.0;
+        const double x_us = without_hold(own_ready_us);
         if (own_ready_qpc != nullptr) {
             *own_ready_qpc = source + static_cast<int64_t>(std::llround(
-                own_ready_us * static_cast<double>(qpc_frequency_) / kMicrosecondsPerSecond));
+                x_us * static_cast<double>(qpc_frequency_) / kMicrosecondsPerSecond));
         }
-        return own_ready_us;
+        return x_us;
     }
     case PacingRung::Count:
         break;

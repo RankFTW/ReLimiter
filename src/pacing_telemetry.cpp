@@ -44,6 +44,7 @@ namespace
     // ── Producer queues ──
     constexpr size_t kRecordQueueCapacity = 4096; // bursts of > 2 s at 1000 records/s
     constexpr size_t kReflexQueueCapacity = 2048; // at most one report per frame
+    constexpr size_t kWaitQueueCapacity = 2048;   // a hold and a few async marker calls per frame
 
     enum PacingQueue : size_t {
         QueueSource,
@@ -51,6 +52,7 @@ namespace
         QueueGate,
         QueueReady,
         QueueReflex,
+        QueueWait,
         QueueDisplay,
         QueueCount
     };
@@ -60,6 +62,7 @@ namespace
     relimiter::BoundedMpscQueue<PacingGateRecord, kRecordQueueCapacity> s_gate_queue;
     relimiter::BoundedMpscQueue<PacingReadyRecord, kRecordQueueCapacity> s_ready_queue;
     relimiter::BoundedMpscQueue<PacingReflexRecord, kReflexQueueCapacity> s_reflex_queue;
+    relimiter::BoundedMpscQueue<PacingWaitRecord, kWaitQueueCapacity> s_wait_queue;
     relimiter::BoundedMpscQueue<PacingDisplaySample, kRecordQueueCapacity> s_display_queue;
 
     // Pushes before Start and after Stop are dropped and counted here.
@@ -518,6 +521,8 @@ namespace
                 TrackClockMap(record, now_qpc);
                 Joiner().AddReflex(record, now_qpc);
             });
+        DrainQueue<decltype(s_wait_queue), PacingWaitRecord>(&s_wait_queue, kWaitQueueCapacity,
+            [now_qpc](const PacingWaitRecord& record) { Joiner().AddWait(record, now_qpc); });
         DrainQueue<decltype(s_display_queue), PacingDisplaySample>(&s_display_queue, kRecordQueueCapacity,
             [now_qpc](const PacingDisplaySample& sample) {
                 TrackDisplay(sample, now_qpc);
@@ -883,6 +888,7 @@ namespace
         DrainQueue<decltype(s_gate_queue), PacingGateRecord>(&s_gate_queue, kRecordQueueCapacity, discard);
         DrainQueue<decltype(s_ready_queue), PacingReadyRecord>(&s_ready_queue, kRecordQueueCapacity, discard);
         DrainQueue<decltype(s_reflex_queue), PacingReflexRecord>(&s_reflex_queue, kReflexQueueCapacity, discard);
+        DrainQueue<decltype(s_wait_queue), PacingWaitRecord>(&s_wait_queue, kWaitQueueCapacity, discard);
         DrainQueue<decltype(s_display_queue), PacingDisplaySample>(&s_display_queue, kRecordQueueCapacity, discard);
         DrainQueue<decltype(s_dxgi_present_queue), DxgiPresentRecord>(
             &s_dxgi_present_queue, DXGI_DISPLAY_QUEUE_CAPACITY, discard);
@@ -914,6 +920,11 @@ void PacingTelemetry_PushReady(const PacingReadyRecord& record) noexcept
 void PacingTelemetry_PushReflex(const PacingReflexRecord& record) noexcept
 {
     PushRecord(&s_reflex_queue, QueueReflex, record);
+}
+
+void PacingTelemetry_PushWait(const PacingWaitRecord& record) noexcept
+{
+    PushRecord(&s_wait_queue, QueueWait, record);
 }
 
 void PacingTelemetry_PushDisplay(const PacingDisplaySample& sample) noexcept

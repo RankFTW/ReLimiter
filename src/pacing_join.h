@@ -55,6 +55,18 @@ struct PacingGateJoin {
     int64_t pre_wait_qpc = 0; // PostWait event's pre-Wait GPU time; 0 unknown
 };
 
+// A frame's waits (PacingWaitRecord) merged by frame key: ReLimiter's
+// render-thread start hold and the longest SetAsyncFrameMarker call of the
+// frame, in µs.
+struct PacingWaitJoin {
+    PacingFrameKey key{};
+    bool has_hold = false;   // the hold applied (a hold without a wait is 0 µs)
+    double hold_us = 0.0;
+    bool has_async = false;  // at least one SetAsyncFrameMarker call carried this frame ID
+    double async_us = 0.0;   // the longest such call
+    uint32_t async_type = 0; // that call's marker type
+};
+
 // Display source of a row's display sample (CSV display_source). Values equal
 // PacingDisplaySource in pacing_telemetry.h, which static_asserts them.
 constexpr uint8_t PACING_ROW_DISPLAY_SOURCE_NONE = 0; // no display sample
@@ -85,12 +97,14 @@ struct PacingJoinedRow {
     bool has_gate = false;
     bool has_ready = false;
     bool has_reflex = false;
+    bool has_wait = false;
     PacingDisplaySample display{};
     PacingPresentRecord present{};
     PacingSourceRecord source{};
     PacingGateJoin gate{};
     PacingReadyRecord ready{};
     PacingReflexRecord reflex{};
+    PacingWaitJoin wait{};
 };
 
 // Cumulative counters since Reset. Rule and Present counters cover display rows.
@@ -159,6 +173,7 @@ public:
     void AddGate(const PacingGateRecord& record, int64_t now_qpc) noexcept;
     void AddReady(const PacingReadyRecord& record, int64_t now_qpc) noexcept;
     void AddReflex(const PacingReflexRecord& record, int64_t now_qpc) noexcept;
+    void AddWait(const PacingWaitRecord& record, int64_t now_qpc) noexcept;
     // Queues a display sample for joining after the grace. Returns false and
     // counts a drop when the FIFO is full; TryTakeRow frees the oldest entry.
     bool AddDisplay(const PacingDisplaySample& sample, int64_t now_qpc) noexcept;
@@ -216,6 +231,7 @@ private:
     using RetainedGate = Retained<PacingGateJoin>;
     using RetainedReady = Retained<PacingReadyRecord>;
     using RetainedReflex = Retained<PacingReflexRecord>;
+    using RetainedWait = Retained<PacingWaitJoin>;
 
     void EvictAgedRecords(int64_t now_qpc) noexcept;
     bool TakeDisplayRow(int64_t now_qpc, bool final_drain, PacingJoinedRow* row) noexcept;
@@ -243,6 +259,7 @@ private:
     PacingJoinRing<RetainedGate, PACING_JOIN_RETENTION_CAPACITY> gates_{};
     PacingJoinRing<RetainedReady, PACING_JOIN_RETENTION_CAPACITY> readies_{};
     PacingJoinRing<RetainedReflex, PACING_JOIN_RETENTION_CAPACITY> reflexes_{};
+    PacingJoinRing<RetainedWait, PACING_JOIN_RETENTION_CAPACITY> waits_{};
     PacingJoinRing<PendingDisplay, PACING_JOIN_PENDING_DISPLAY_CAPACITY> pending_displays_{};
     std::array<SwapchainDisplayState, PACING_JOIN_SWAPCHAIN_CAPACITY> swapchains_{};
     uint64_t swapchain_use_clock_ = 0;

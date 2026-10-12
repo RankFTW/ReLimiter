@@ -115,6 +115,10 @@ struct PacingPipelineConfig {
     // readiness and floors the next frame's Signal on it (cadence_grid.h,
     // output tracker).
     bool fg_late_spacing = true;
+    // Key render_start_hold (default off; developer A/B): the game's render
+    // thread waits at its RENDERSUBMIT_START until the GPU-anchored target
+    // (render_handoff.h, Hook_SetLatencyMarker).
+    bool render_start_hold = false;
     double stall_inject_ms = 0.0; // 0 = off; [0, kPacingStallInjectMaxMs]
     double stall_inject_period_s = kPacingStallInjectDefaultPeriodS; // [1, 60]
 };

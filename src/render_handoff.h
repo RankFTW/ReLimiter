@@ -7,6 +7,8 @@
 // cannot simulate frames that only wait for its render thread.
 // Lock-free; the publisher never blocks.
 
+#include "gpu_floor_anchor.h"
+
 #include <cstdint>
 
 constexpr double RENDER_HANDOFF_ACTIVITY_S = 1.0;      // a handoff this recent: the stream is live
@@ -75,3 +77,27 @@ bool RenderHandoff_LeftPresent(uint8_t domain, uint32_t producer_epoch, uint64_t
 // for it.
 bool RenderHandoff_LatestPresentEnd(uint8_t domain, uint32_t producer_epoch, uint64_t* frame_id,
     int64_t* qpc) noexcept;
+
+// GPU floor anchor (gpu_floor_anchor.h): the scheduler owner (the single
+// writer) publishes it after each Reflex report batch, and as invalid on a
+// reset, so the render thread can time its start against the GPU. Seqlock
+// with acquire/release; the writer never blocks.
+void RenderHandoff_PublishGpuFloor(const GpuFloorAnchor& anchor) noexcept;
+
+// The newest published anchor. A reader retries a bounded number of times
+// (RENDER_HANDOFF_GPU_FLOOR_READ_ATTEMPTS) while the writer is mid-publication
+// and then reports none (false); also false when none was published or the
+// newest is invalid.
+bool RenderHandoff_ReadGpuFloor(GpuFloorAnchor* anchor) noexcept;
+
+// Where the render thread of NvAPI frame frame_id of (domain, producer epoch)
+// should start its frame: the published anchor's Ĝ(n − 1) − (P/2 + F) with
+// the render thread's newest PRESENT_END (RenderHandoff_LatestPresentEnd) as
+// the live bound, in QPC ticks (gpu_floor::RenderStartQpc). A PRESENT_END
+// later than now_qpc is not a live observation and gives no bound. False when
+// there is no target: no valid anchor, another stream, no GPU end within the
+// horizon, or the seqlock read did not settle.
+bool RenderHandoff_RenderStartTarget(uint8_t domain, uint32_t producer_epoch, uint64_t frame_id,
+    int64_t now_qpc, int64_t* target_qpc) noexcept;
+
+constexpr uint32_t RENDER_HANDOFF_GPU_FLOOR_READ_ATTEMPTS = 4;

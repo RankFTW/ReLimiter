@@ -87,6 +87,11 @@ CURRENT_PACING_HEADER = PACING_FIXED_RAW_HEADER + PACING_FIXED_DERIVED_HEADER + 
     # injected stall) and of the pre-Sleep wait (ends at pre_sleep_end_qpc), empty
     # when none: they rebuild the gated holds of lockstep engines
     "source_wait_start_qpc", "pre_sleep_start_qpc",
+    # Render-thread start hold A/B and the driver's in-Present pacing: this real
+    # frame's own start hold in µs (0 = applied without waiting, empty = not
+    # applied), and the longest NvAPI_D3D12_SetAsyncFrameMarker call carrying the
+    # frame's NvAPI frame ID in µs with its marker type (empty when none)
+    "render_start_hold_us", "async_marker_wait_us", "async_marker_wait_type",
 ]
 
 CURRENT_PACING_EVENTS_HEADER = [
@@ -129,9 +134,10 @@ CURRENT_PACING_EVENTS_HEADER = [
 # Earlier files carry a prefix of the current header of these lengths. The
 # events header did not change in Phase 3 or 4 (new event kinds only), so a
 # Phase 2 events file is current-source-86.
-HISTORICAL_PACING_HEADER_LENGTHS = (136, 133, 132, 129, 122, 111)  # Phase 4 before the wait starts;
-                                                                   # Phase 3 (Q16); Phase 3 before Q16;
-                                                                   # Phase 2; Phase 1; Phase 0
+HISTORICAL_PACING_HEADER_LENGTHS = (138, 136, 133, 132, 129, 122, 111)  # before the wait columns;
+                                                                       # Phase 4 before the wait starts;
+                                                                       # Phase 3 (Q16); Phase 3 before Q16;
+                                                                       # Phase 2; Phase 1; Phase 0
 HISTORICAL_PACING_EVENTS_HEADER_LENGTHS = (85, 81, 50)  # Phase 1; Phase 0; before snapshot rows
 
 

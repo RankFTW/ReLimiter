@@ -699,6 +699,61 @@ bool TestCrossThreadEvidence()
     return ok;
 }
 
+// Waits (render-thread start hold, SetAsyncFrameMarker calls) join by the
+// exact frame key, producer epoch included: a hold without a wait is 0, the
+// longest async call of the frame wins with its marker type, and a frame
+// without records has no wait.
+bool TestWaitJoins()
+{
+    g_joiner.Reset(kFrequency);
+    const PacingFrameKey key = Key(40);
+    g_joiner.AddSource(Source(key, Ms(90)), Ms(90));
+    g_joiner.AddPresent(Present(Ms(100), Ms(101), key), Ms(101));
+    const auto wait = [](const PacingFrameKey& frame, PacingWaitKind kind, int64_t entry_qpc,
+        int64_t exit_qpc, uint32_t type) {
+        PacingWaitRecord record{};
+        record.key = frame;
+        record.kind = kind;
+        record.thread_id = kThread;
+        record.marker_type = type;
+        record.entry_qpc = entry_qpc;
+        record.exit_qpc = exit_qpc;
+        return record;
+    };
+    g_joiner.AddWait(wait(key, PacingWaitKind::RenderStartHold, Ms(91), Ms(91), 0), Ms(91));
+    g_joiner.AddWait(wait(key, PacingWaitKind::AsyncFrameMarker, Ms(95), Ms(95) + 2'500, 11), Ms(96));
+    g_joiner.AddWait(wait(key, PacingWaitKind::AsyncFrameMarker, Ms(97), Ms(97) + 55'000, 12), Ms(98));
+    g_joiner.AddWait(wait(key, PacingWaitKind::AsyncFrameMarker, Ms(99), Ms(99) + 100, 11), Ms(99));
+    g_joiner.AddWait(wait(Key(40, 4), PacingWaitKind::AsyncFrameMarker, Ms(97), Ms(97) + 90'000, 9), Ms(98));
+    g_joiner.AddWait(wait({}, PacingWaitKind::AsyncFrameMarker, Ms(97), Ms(98), 9), Ms(98));
+    g_joiner.AddDisplay(Display(Ms(100) + kMillisecond / 2, Ms(116)), Ms(150));
+    PacingJoinedRow rows[4];
+    bool ok = Check(TakeRows(Ms(300), false, rows, 4) == 1, "display row with waits emitted");
+    ok = Check(rows[0].has_wait && rows[0].wait.key == key && rows[0].wait.has_hold &&
+        rows[0].wait.hold_us == 0.0, "a hold that applied without waiting is 0 us, not absent") && ok;
+    ok = Check(rows[0].wait.has_async && rows[0].wait.async_us == 5'500.0 && rows[0].wait.async_type == 12,
+        "the longest async marker call of the frame wins with its type, in us") && ok;
+    ok = Check(g_joiner.Statistics().invalid_records == 1,
+        "a wait record without a valid frame key is counted") && ok;
+
+    // A hold alone: no async call; a frame without records: no wait.
+    g_joiner.Reset(kFrequency);
+    const PacingFrameKey held = Key(41);
+    g_joiner.AddSource(Source(held, Ms(90)), Ms(90));
+    g_joiner.AddPresent(Present(Ms(100), Ms(101), held), Ms(101));
+    g_joiner.AddWait(wait(held, PacingWaitKind::RenderStartHold, Ms(91), Ms(91) + 31'000, 0), Ms(92));
+    g_joiner.AddDisplay(Display(Ms(100) + kMillisecond / 2, Ms(116)), Ms(150));
+    ok = Check(TakeRows(Ms(300), false, rows, 4) == 1 && rows[0].has_wait && rows[0].wait.has_hold &&
+        rows[0].wait.hold_us == 3'100.0 && !rows[0].wait.has_async, "a hold alone has no async fields") && ok;
+    g_joiner.Reset(kFrequency);
+    g_joiner.AddSource(Source(held, Ms(90)), Ms(90));
+    g_joiner.AddPresent(Present(Ms(100), Ms(101), held), Ms(101));
+    g_joiner.AddDisplay(Display(Ms(100) + kMillisecond / 2, Ms(116)), Ms(150));
+    ok = Check(TakeRows(Ms(300), false, rows, 4) == 1 && !rows[0].has_wait,
+        "a frame without wait records has no wait") && ok;
+    return ok;
+}
+
 int main()
 {
     bool ok = TestRuleOneUniqueMatch();
@@ -715,6 +770,7 @@ int main()
     ok = TestMetricInput() && ok;
     ok = TestPlanFieldsAndDisplaySource() && ok;
     ok = TestCrossThreadEvidence() && ok;
+    ok = TestWaitJoins() && ok;
     if (!ok) return 1;
     std::cout << "Pacing join tests passed\n";
     return 0;

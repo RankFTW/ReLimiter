@@ -22,6 +22,7 @@ ROW_COLUMNS = [
     "reflex_render_submit_end_us", "reflex_present_start_us", "reflex_present_end_us",
 ]
 EVENT_COLUMNS = ["event_type", "event_qpc", "value", "previous_value", "reason"]
+WAIT_COLUMNS = ["render_start_hold_us", "async_marker_wait_us", "async_marker_wait_type"]
 
 
 def ticks(ms):
@@ -51,10 +52,10 @@ def frame_row(k, sim_ms, rung=4, release_lead_ms=8.0):
     }
 
 
-def write(directory, rows, events=()):
+def write(directory, rows, events=(), columns=ROW_COLUMNS):
     rows_path = Path(directory) / "relimiter_pacing_Test_1_2_capture_1.csv"
     with rows_path.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=ROW_COLUMNS, lineterminator="\n")
+        writer = csv.DictWriter(stream, fieldnames=columns, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
     with (Path(directory) / "relimiter_pacing_events_Test_1_2_capture_1.csv").open(
@@ -82,6 +83,51 @@ class TimelineTests(unittest.TestCase):
         self.assertEqual(held["handoff"]["released_at_or_after_prev_rs_start"], 1.0)
         self.assertEqual(held["simulation_start_position"]["submit_second_half"]["share"], 1.0)
         self.assertEqual(held["simulation_outlasted_render_thread"], 0.0)
+
+    def test_files_without_the_wait_columns_report_no_waits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = write(directory, [frame_row(k, sim_ms=5.0) for k in range(1, 41)])
+            report = pipeline.analyze(path)
+        self.assertEqual(report["segments"]["held"]["waits_ms"], {})
+        self.assertNotIn("render_start_hold", pipeline.format_report(report))
+
+    def test_wait_columns_give_per_segment_quantiles(self):
+        # Held frames: a start hold of 1 + k % 4 ms (0 on every fifth frame: applied without waiting) and
+        # an async marker call of 8 ms on frames below 31 (type 12), 2 ms above (type 11); not held
+        # frames have a hold only, empty async cells.
+        rows = []
+        for k in range(1, 61):
+            row = frame_row(k, sim_ms=5.0, rung=0 if 21 <= k <= 30 else 4)
+            row["render_start_hold_us"] = 0.0 if k % 5 == 0 else (1 + k % 4) * 1000.0
+            if not 21 <= k <= 30:
+                row["async_marker_wait_us"] = 8000.0 if k < 31 else 2000.0
+                row["async_marker_wait_type"] = 12 if k < 31 else 11
+            rows.append(row)
+        pause_start = ticks(1_000.0 + 21 * INTERVAL_MS - 8.5)
+        pause_end = ticks(1_000.0 + 31 * INTERVAL_MS - 8.5)
+        events = [
+            {"event_type": "rung_feasibility", "event_qpc": ticks(900.0), "value": 0, "previous_value": "", "reason": 0},
+            {"event_type": "rung_feasibility", "event_qpc": pause_start, "value": 1, "previous_value": 0, "reason": 4},
+            {"event_type": "rung_feasibility", "event_qpc": pause_end, "value": 0, "previous_value": 1, "reason": 3},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = write(directory, rows, events, columns=ROW_COLUMNS + WAIT_COLUMNS)
+            report = pipeline.analyze(path, settle_s=0.05)
+        held = report["segments"]["held"]["waits_ms"]
+        not_held = report["segments"]["not_held"]["waits_ms"]
+        self.assertEqual(held["render_start_hold"]["count"], report["segments"]["held"]["frames"])
+        self.assertEqual(held["render_start_hold"]["p50"], 2.0)
+        self.assertEqual(held["async_marker_wait"]["count"], report["segments"]["held"]["frames"])
+        self.assertEqual(held["async_marker_wait"]["p99"], 8.0)
+        self.assertEqual(sum(held["async_marker_wait"]["types"].values()), held["async_marker_wait"]["count"])
+        self.assertEqual(set(held["async_marker_wait"]["types"]),
+                         {"out_of_band_present_end", "out_of_band_present_start"})
+        # Not held frames: a hold (0 included) and no async cell.
+        self.assertIn("render_start_hold", not_held)
+        self.assertNotIn("async_marker_wait", not_held)
+        text = pipeline.format_report(report)
+        self.assertIn("render_start_hold ms (p50 / p90 / p99)", text)
+        self.assertIn("async_marker_wait ms (p50 / p90 / p99)", text)
 
 
 class SegmentationTests(unittest.TestCase):

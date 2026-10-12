@@ -173,6 +173,10 @@ uint64_t s_handoff_frame = 0;      // Scheduler_RenderHandoffFrame; 0 = not limi
 unsigned s_handoff_stalls = 0;     // Scheduler_RenderHandoffStalled calls
 int64_t s_planned_handoff_qpc = -1; // handoff_qpc of the newest Scheduler_PlanReflexSleep
 int64_t RealQpc();
+// Render-thread start hold (stubs below: sleep.cpp and the telemetry worker are not linked).
+unsigned s_render_start_waits = 0;
+int64_t s_render_start_wait_target = 0;
+std::vector<PacingWaitRecord> s_wait_records;
 unsigned s_mode_calls = 0;
 int s_sleep_action = 0;
 NV_SET_SLEEP_MODE_PARAMS* s_expected_mode_params = nullptr;
@@ -1088,6 +1092,107 @@ void TestFrameMarkerStageEvents() {
     NvAPI_ClearFeedbackDevice();
 }
 
+// Render-thread start hold: a direct RENDERSUBMIT_START waits for the anchor's
+// Ĝ(n − 1) − (P/2 + F) when it lies ahead by at most the real frame interval,
+// then reaches the driver once, after the hold; the hold is a stage event
+// before RenderSubmitStart and a telemetry wait record. A target further away
+// or already past is applied without waiting (0 hold); another producer
+// epoch, the key off and the bypass off do not apply it at all.
+void TestRenderStartHold() {
+    FakeDevice device;
+    CHECK(NvAPI_CaptureFeedbackDevice(&device));
+    s_orig_set_latency_marker = ForwardMarker;
+    const auto saved_pipeline = PacingPipeline_GetConfig();
+    auto pipeline = saved_pipeline;
+    pipeline.render_start_hold = true;
+    PacingPipeline_SetConfig(pipeline);
+    g_reflex_sleep_bypass = true;
+    g_user_target_fps = 157;
+    s_paces_source = true;
+    g_effective_interval_us = 50'000.0; // I = 500,000 ticks
+    const uint32_t epoch = Key(1).producer_epoch;
+    constexpr int64_t kStart = 90'000; // P/2 + F = 9 ms
+    const auto publish_anchor = [&](uint64_t gpu_end_frame, int64_t gpu_end_qpc, uint32_t anchor_epoch) {
+        GpuFloorAnchor anchor;
+        anchor.valid = true;
+        anchor.identity_domain = static_cast<uint8_t>(PacingIdentityDomain::NvApiFrame);
+        anchor.producer_epoch = anchor_epoch;
+        anchor.gpu_end_frame = gpu_end_frame;
+        anchor.gpu_end_qpc = gpu_end_qpc;
+        anchor.qpc_frequency = 10'000'000;
+        anchor.period_us = 10'000.0;
+        anchor.start_us = 9'000.0;
+        RenderHandoff_PublishGpuFloor(anchor);
+    };
+    const auto send = [&](uint64_t frame) {
+        PublishPlan(Key(frame), PacingRung::SourceOnly, 2'000.0);
+        DrainStageEvents();
+        s_wait_records.clear();
+        s_call_order.clear();
+        s_record_call_order = true;
+        s_render_start_waits = 0;
+        SendMarker(&device, frame, RENDERSUBMIT_START);
+        s_record_call_order = false;
+    };
+    using Order = std::vector<std::pair<char, uint64_t>>;
+    const unsigned forwarded_before = s_forwarded_markers;
+
+    // Target 31 ms ahead (within I): waited, then forwarded once; hold event first.
+    const int64_t expected_target = RealQpc() + 400'000;
+    publish_anchor(2999, expected_target, epoch);
+    send(3000);
+    CHECK(s_render_start_waits == 1 && s_render_start_wait_target == expected_target - kStart);
+    CHECK(s_call_order == (Order{{'W', 0}, {'F', 3000}}));
+    CHECK(s_wait_records.size() == 1 && s_wait_records[0].kind == PacingWaitKind::RenderStartHold &&
+        s_wait_records[0].key.frame_id == 3000 && s_wait_records[0].key.producer_epoch == epoch &&
+        s_wait_records[0].exit_qpc > s_wait_records[0].entry_qpc);
+    const int64_t hold_ticks = s_wait_records[0].exit_qpc - s_wait_records[0].entry_qpc;
+    PacingStageEvent event{};
+    CHECK(FramePlan_PopStageEvent(&event) && event.kind == PacingStageEventKind::RenderStartHold &&
+        event.key.frame_id == 3000 && event.hold_ticks == hold_ticks && event.qpc == s_wait_records[0].exit_qpc);
+    PacingStageEvent submit{};
+    CHECK(FramePlan_PopStageEvent(&submit) && submit.kind == PacingStageEventKind::RenderSubmitStart &&
+        submit.qpc >= event.qpc && submit.grid_index == event.grid_index);
+    CHECK(!FramePlan_PopStageEvent(&submit));
+
+    // Target further ahead than I: a misprediction, applied without waiting.
+    publish_anchor(3000, RealQpc() + 1'500'000, epoch);
+    send(3001);
+    CHECK(s_render_start_waits == 0 && s_call_order == (Order{{'F', 3001}}));
+    CHECK(s_wait_records.size() == 1 && s_wait_records[0].exit_qpc == s_wait_records[0].entry_qpc);
+    CHECK(DrainStageEvents().other == 1); // RenderSubmitStart only; no hold event
+
+    // Target already past: applied without waiting.
+    publish_anchor(3001, RealQpc(), epoch);
+    send(3002);
+    CHECK(s_render_start_waits == 0 && s_wait_records.size() == 1 &&
+        s_wait_records[0].exit_qpc == s_wait_records[0].entry_qpc);
+
+    // Not applied: another producer epoch, the bypass off, the key off.
+    publish_anchor(3002, RealQpc() + 120'000, epoch + 1);
+    send(3003);
+    CHECK(s_render_start_waits == 0 && s_wait_records.empty() && s_call_order == (Order{{'F', 3003}}));
+    publish_anchor(3003, RealQpc() + 120'000, epoch);
+    g_reflex_sleep_bypass = false;
+    send(3004);
+    CHECK(s_render_start_waits == 0 && s_wait_records.empty() && s_call_order == (Order{{'F', 3004}}));
+    g_reflex_sleep_bypass = true;
+    pipeline.render_start_hold = false;
+    PacingPipeline_SetConfig(pipeline);
+    publish_anchor(3004, RealQpc() + 120'000, epoch);
+    send(3005);
+    CHECK(s_render_start_waits == 0 && s_wait_records.empty() && s_call_order == (Order{{'F', 3005}}));
+
+    // Exactly one driver call per marker, held or not.
+    CHECK(s_forwarded_markers - forwarded_before == 6);
+    GpuFloorAnchor none;
+    RenderHandoff_PublishGpuFloor(none);
+    PacingPipeline_SetConfig(saved_pipeline);
+    g_user_target_fps = 0;
+    g_effective_interval_us = 0.0;
+    NvAPI_ClearFeedbackDevice();
+}
+
 void TestNativeEndpointCancellation() {
     // H2 core with route revalidation: the hold never needs the owner and a
     // revoked route cancels it (Stale) with its partial residence retained.
@@ -1218,6 +1323,14 @@ bool Scheduler_PlanReflexSleep(int64_t, bool, int64_t handoff_qpc, int64_t*, uin
 std::atomic<double> g_effective_interval_us{0.0};
 void Scheduler_EndReflexSleep(uint64_t, int64_t) noexcept {}
 bool PreSleepWaitUntil(int64_t) { return false; }
+bool RenderStartWaitUntil(int64_t target_qpc) {
+    ++s_render_start_waits;
+    s_render_start_wait_target = target_qpc;
+    if (s_record_call_order) s_call_order.push_back({'W', 0});
+    while (RealQpc() < target_qpc) Sleep(0);
+    return true;
+}
+void PacingTelemetry_PushWait(const PacingWaitRecord& record) noexcept { s_wait_records.push_back(record); }
 void PublishReflexControllerResidence(uint64_t, uint32_t, double residence_us) noexcept {
     ++s_residence_publications;
     s_last_residence_us = residence_us;
@@ -1269,6 +1382,7 @@ int main(int argc, char** argv) {
     TestEnforcementDuringGateAndCancellation();
     TestNativeRouteFromEveryMarker();
     TestFrameMarkerStageEvents();
+    TestRenderStartHold();
     TestNativeEndpointCancellation();
     TestReflexCallForwarding();
     // No-FG token: native mode transitions clear it; the scheduler-side

@@ -102,6 +102,7 @@ set(ADDON_SOURCES
     src/cadence_grid.h
     src/cadence_grid.cpp
     src/cadence_grid_publication.cpp
+    src/gpu_floor_anchor.h
     src/lead_controller.h
     src/lead_controller.cpp
     src/period_governor.h

@@ -91,6 +91,7 @@ struct Config {
     PacingRenderQueue gpu_queue_wait_render_queue = PacingRenderQueue::Keep; // developer A/B: keep | remove | remove_held
     PacingLeadCoverage lead_coverage = PacingLeadCoverage::Q99; // developer A/B: 95 | 99 (default; share of frames the lead covers)
     bool fg_late_spacing = true; // developer A/B: on (default) | off; FG input wait floors the next real frame on a late frame's readiness
+    bool render_start_hold = false; // developer A/B: off (default) | on; hold the render thread's RENDERSUBMIT_START until the GPU-anchored target
     PacingPlacementOverride source_placement = PacingPlacementOverride::PreSleep; // developer: marker | pre_sleep | driver (pre_sleep is the default)
 
     // Reflex Injection

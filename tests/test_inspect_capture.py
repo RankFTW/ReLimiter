@@ -26,7 +26,8 @@ PHASE2_ROW_COLUMNS = 129
 PHASE3_ROW_COLUMNS = 132   # Phase 3 before Q16
 Q16_ROW_COLUMNS = 133      # + gate_pre_wait_qpc
 PHASE4_ROW_COLUMNS = 136   # + source_placement, pre_sleep_end_qpc, pre_sleep_margin_us
-WAIT_START_ROW_COLUMNS = 138  # + source_wait_start_qpc, pre_sleep_start_qpc (current, 2026-10-08)
+WAIT_START_ROW_COLUMNS = 138  # + source_wait_start_qpc, pre_sleep_start_qpc (2026-10-08)
+WAIT_ROW_COLUMNS = 141        # + render_start_hold_us, async_marker_wait_us, async_marker_wait_type (current)
 PHASE3_EVENT_COLUMNS = 86  # unchanged since Phase 2: new event kinds only
 LEGACY_SCHEDULER_HEADER = ["frame_id", "timestamp_us", "actual_frame_time_us"]
 FRAMEVIEW_HEADER = [
@@ -77,10 +78,10 @@ class ProfileTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 self.assertEqual(inspector.detect_kind(header), kind)
                 self.assertEqual(inspector.schema_profile(kind, header), f"current-source-{len(header)}")
-        self.assertEqual(len(inspector.CURRENT_PACING_HEADER), WAIT_START_ROW_COLUMNS)
+        self.assertEqual(len(inspector.CURRENT_PACING_HEADER), WAIT_ROW_COLUMNS)
         self.assertEqual(len(inspector.CURRENT_PACING_EVENTS_HEADER), PHASE3_EVENT_COLUMNS)
         self.assertEqual(inspector.schema_profile("relimiter_pacing", inspector.CURRENT_PACING_HEADER),
-                         "current-source-138")
+                         "current-source-141")
         self.assertEqual(inspector.schema_profile("relimiter_pacing_events",
                                                   inspector.CURRENT_PACING_EVENTS_HEADER), "current-source-86")
 
@@ -97,6 +98,9 @@ class ProfileTests(unittest.TestCase):
             ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:PHASE3_ROW_COLUMNS], "historical-source-132"),
             ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:Q16_ROW_COLUMNS], "historical-source-133"),
             ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:PHASE4_ROW_COLUMNS], "historical-source-136"),
+            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:WAIT_START_ROW_COLUMNS], "historical-source-138"),
+            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:WAIT_START_ROW_COLUMNS + 1],
+             "historical-or-unknown"),
             ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:Q16_ROW_COLUMNS + 1], "historical-or-unknown"),
             ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:PHASE4_ROW_COLUMNS + 1], "historical-or-unknown"),
             ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:PHASE3_ROW_COLUMNS - 1],
@@ -128,8 +132,11 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(inspector.CURRENT_PACING_HEADER[Q16_ROW_COLUMNS:PHASE4_ROW_COLUMNS],
                          ["source_placement", "pre_sleep_end_qpc", "pre_sleep_margin_us"])
         # The wait starts (gated holds, 2026-10-08) are appended after them.
-        self.assertEqual(inspector.CURRENT_PACING_HEADER[PHASE4_ROW_COLUMNS:],
+        self.assertEqual(inspector.CURRENT_PACING_HEADER[PHASE4_ROW_COLUMNS:WAIT_START_ROW_COLUMNS],
                          ["source_wait_start_qpc", "pre_sleep_start_qpc"])
+        # The render-thread start hold and async marker waits are appended after them.
+        self.assertEqual(inspector.CURRENT_PACING_HEADER[WAIT_START_ROW_COLUMNS:],
+                         ["render_start_hold_us", "async_marker_wait_us", "async_marker_wait_type"])
         self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER[PHASE1_EVENT_COLUMNS - 1],
                          "overflowed_present_count")
         self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER[PHASE1_EVENT_COLUMNS:], ["reason"])

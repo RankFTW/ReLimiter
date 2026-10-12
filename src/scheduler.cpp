@@ -793,6 +793,14 @@ static void ResetFeasibility(const char* reason) noexcept
     }
 }
 
+// The GPU floor anchor for the game's render thread (lead_controller.h,
+// render_handoff.h): published after each Reflex report batch and, invalid,
+// after a reset. Owner only (the single writer).
+static void PublishGpuFloorAnchor() noexcept
+{
+    RenderHandoff_PublishGpuFloor(s_source_stage.Lead().GpuFloorAnchorSnapshot());
+}
+
 // Controller lifecycle. The generation bumps only on API change,
 // identity-domain (trigger/route) change and producer-epoch change here;
 // Flush(FLUSH_ALL) bumps it for API change, full swapchain teardown and
@@ -820,6 +828,7 @@ static void ApplyLifecycle(SchedulerTrigger trigger, PacingSourceMarker marker) 
     const uint32_t generation = FrameTimeline_CurrentControllerGeneration();
     if (!s_stage_initialized || generation != s_stage_generation) {
         s_source_stage.Reset(GetQPCFrequency());
+        PublishGpuFloorAnchor();
         s_period_tracker.Forget();
         s_pre_sleep.Reset();
         s_last_plan_index = 0;
@@ -837,6 +846,7 @@ static void ApplyLifecycle(SchedulerTrigger trigger, PacingSourceMarker marker) 
 
     if (s_marker_known && marker != s_last_marker) {
         s_source_stage.ResetBuckets();
+        PublishGpuFloorAnchor();
         LOG_INFO("Scheduler: enforcement marker %d -> %d, lead buckets reset",
                  static_cast<int>(s_last_marker), static_cast<int>(marker));
     }
@@ -1185,7 +1195,9 @@ static GovernorDecision UpdatePeriodGovernor(
     ConfigurePeriodGovernor(config.adaptive_cap);
     const bool gpu_hold = IsGpuRung(pipeline.rung);
     ReflexFrameTimeSample sample{};
+    bool reports_fed = false;
     while (ConsumeReflexFrameTimeSample(&sample)) {
+        reports_fed = true;
         // The release headroom's heavy-work start r − A and the queue-order
         // test's GPU start (lead_controller.h).
         if (sample.gpu_active_us > 0.0) {
@@ -1211,6 +1223,7 @@ static GovernorDecision UpdatePeriodGovernor(
         s_period_governor.OnDemand(sample.sequence, sample.workload_demand_us,
             sample.gpu_execution_available && sample.gpu_service_us >= sample.workload_demand_us);
     }
+    if (reports_fed) PublishGpuFloorAnchor();
 
     frame.qpc = QpcNow();
     frame.qpc_frequency = GetQPCFrequency();

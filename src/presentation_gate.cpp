@@ -233,6 +233,20 @@ void PresentGate_OnFrameMarker(const PacingPlanKey& key, PacingStageEventKind ki
                  static_cast<unsigned long long>(key.frame_id));
 }
 
+void PresentGate_OnRenderStartHold(const PacingPlanKey& key, int64_t end_qpc, int64_t hold_ticks) noexcept {
+    if (end_qpc <= 0 || hold_ticks <= 0) return;
+    PacingFramePlan plan{};
+    if (!g_frame_plans.Find(key, &plan)) return;
+    PacingStageEvent event{};
+    event.key = plan.key;
+    event.grid_index = plan.grid_index;
+    event.qpc = end_qpc;
+    event.kind = PacingStageEventKind::RenderStartHold;
+    event.rung = plan.rung;
+    event.hold_ticks = hold_ticks;
+    FramePlan_PushStageEvent(event);
+}
+
 void PresentGate_OnPresentStart(const PacingPlanKey& key, int64_t arrival_qpc,
                                 PresentationGateResult* result,
                                 bool* planned, PacingRung* plan_rung) {
