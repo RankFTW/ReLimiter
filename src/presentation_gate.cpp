@@ -218,7 +218,7 @@ void PresentGate_OnFrameMarker(const PacingPlanKey& key, PacingStageEventKind ki
             key.frame_id, arrival_qpc);
     } else if (kind == PacingStageEventKind::PresentEnd) {
         RenderHandoff_PublishPresentEnd(static_cast<uint8_t>(key.identity_domain), key.producer_epoch,
-            key.frame_id);
+            key.frame_id, arrival_qpc);
     }
     PacingFramePlan plan{};
     if (!g_frame_plans.Find(key, &plan)) return;

@@ -1023,6 +1023,10 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
         pending_sample.gpu_active_us = static_cast<double>(r.gpuActiveRenderTimeUs);
         pending_sample.gpu_start_qpc = ReflexTimestampToQpc(r.gpuRenderStartTime);
         pending_sample.gpu_end_qpc = ReflexTimestampToQpc(r.gpuRenderEndTime);
+        if (r.presentEndTime > 0 && r.gpuRenderEndTime > r.presentEndTime) {
+            const double gap_us = ReflexTimestampDeltaUs(r.presentEndTime, r.gpuRenderEndTime);
+            if (gap_us < effective_interval_us * 3.0) pending_sample.present_end_to_gpu_end_us = gap_us;
+        }
         pending_sample.owned_cpu_stage_us = sample_owned_cpu_stage_us;
         pending_sample.gpu_frame_time_us = ft;
         pending_sample.present_duration_us = sample_present_duration_us;

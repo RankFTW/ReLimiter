@@ -2525,12 +2525,12 @@ void TestHandoffBackPressureClassify()
     CHECK(!HandoffBackPressure_Streams(invalid));
 }
 
-// The GPU floor's term c: a report of a frame released under the limit
-// raises c by q·η when held back and lowers it by q·η when released late and
-// by (1 − q)·η otherwise (η = 1% of I), so c holds where a share 1 − q of
-// frames is held back; c stays within [0, 2 I] and never adds to d. Frames
-// without the limit and second reports change c by nothing; every pair
-// counts toward the stream proof.
+// The GPU floor's term c: a report of a frame released under the floor
+// raises c by η when held back and lowers it by η when released late and by
+// η / 1,024 otherwise (η = 1% of I), so it widens at once and narrows one
+// step per 1,024 clean frames; c stays within [0, 2 I] and never adds to d.
+// Frames released without the floor and second reports change c by nothing;
+// every pair counts toward the stream proof.
 void TestRenderHandoffBackPressure()
 {
     auto controller = MakeController();
@@ -2539,47 +2539,47 @@ void TestRenderHandoffBackPressure()
         ++n;
         LeadFrameStart start = Start(n, limited ? PacingRung::SourceOnly : PacingRung::FgInputWait,
             static_cast<double>(n) * kInterval);
-        start.handoff_release = limited;
+        start.gpu_floor = limited;
         controller->OnSourceRelease(start);
-        controller->OnHandoffBackPressure(Key(n).producer_epoch, Key(n).frame_id, pair, 0.95);
+        controller->OnHandoffBackPressure(Key(n).producer_epoch, Key(n).frame_id, pair);
     };
 
-    // Ten held-back frames: c = 10 × 0.95 × 100 = 950 µs; d stays cold.
+    // Ten held-back frames: c = 10 × 100 = 1,000 µs; d stays cold.
     for (int i = 0; i < 10; ++i) frame(true, HeldBackPair());
     CHECK(controller->Statistics().handoff_back_pressure_samples == 10);
     CHECK(controller->Statistics().handoff_held_back == 10);
-    CHECK_NEAR(controller->HandoffBackPressureUs(), 950.0);
+    CHECK_NEAR(controller->HandoffBackPressureUs(), 1000.0);
     CHECK_NEAR(controller->HandoffOffsetUs(0.95, 500.0), 0.0);
     // A second report of the same frame is ignored.
-    controller->OnHandoffBackPressure(Key(n).producer_epoch, Key(n).frame_id, HeldBackPair(), 0.95);
+    controller->OnHandoffBackPressure(Key(n).producer_epoch, Key(n).frame_id, HeldBackPair());
     CHECK(controller->Statistics().handoff_back_pressure_samples == 10);
-    // A streaming frame lowers c by 5 µs, a late one by 95 µs; a held frame
-    // (no limit) moves nothing.
+    // A streaming frame lowers c by 100 / 1,024 µs, a late one by 100 µs; a
+    // frame released without the floor moves nothing.
     frame(true, StreamingPair());
-    CHECK_NEAR(controller->HandoffBackPressureUs(), 945.0);
+    CHECK_NEAR(controller->HandoffBackPressureUs(), 1000.0 - 100.0 / 1024.0);
     frame(true, ReleasedLatePair());
     CHECK(controller->Statistics().handoff_released_late == 1);
-    CHECK_NEAR(controller->HandoffBackPressureUs(), 850.0);
+    CHECK_NEAR(controller->HandoffBackPressureUs(), 900.0 - 100.0 / 1024.0);
     frame(false, HeldBackPair());
-    CHECK_NEAR(controller->HandoffBackPressureUs(), 850.0);
+    CHECK_NEAR(controller->HandoffBackPressureUs(), 900.0 - 100.0 / 1024.0);
     CHECK(controller->Statistics().handoff_back_pressure_samples == 12);
-    // One held-back frame in twenty is the 1 − q share: c holds.
-    for (int i = 0; i < 20; ++i) frame(true, i == 0 ? HeldBackPair() : StreamingPair());
-    CHECK_NEAR(controller->HandoffBackPressureUs(), 850.0);
-    // Streaming frames bring c to 0, never below.
-    for (int i = 0; i < 200; ++i) frame(true, StreamingPair());
+    // One held-back frame per 1,024 clean ones: c holds.
+    frame(true, HeldBackPair());
+    for (int i = 0; i < 1024; ++i) frame(true, StreamingPair());
+    CHECK_NEAR(controller->HandoffBackPressureUs(), 900.0 - 100.0 / 1024.0);
+    // Late frames bring c to 0, never below.
+    for (int i = 0; i < 10; ++i) frame(true, ReleasedLatePair());
     CHECK_NEAR(controller->HandoffBackPressureUs(), 0.0);
     // Frames that stay held back raise it to two intervals at most.
     for (int i = 0; i < 220; ++i) frame(true, HeldBackPair());
     CHECK_NEAR(controller->HandoffBackPressureUs(), 2.0 * kInterval);
 
     // A report without a pending frame is counted; invalid input is rejected.
-    controller->OnHandoffBackPressure(7, 123456789, HeldBackPair(), 0.95);
+    controller->OnHandoffBackPressure(7, 123456789, HeldBackPair());
     CHECK(controller->Statistics().unmatched_handoff_back_pressure == 1);
     const uint64_t invalid = controller->Statistics().invalid_inputs;
-    controller->OnHandoffBackPressure(0, Key(n).frame_id, HeldBackPair(), 0.95);
-    controller->OnHandoffBackPressure(7, Key(n).frame_id, HeldBackPair(), kNaN);
-    CHECK(controller->Statistics().invalid_inputs == invalid + 2);
+    controller->OnHandoffBackPressure(0, Key(n).frame_id, HeldBackPair());
+    CHECK(controller->Statistics().invalid_inputs == invalid + 1);
     CHECK_NEAR(controller->HandoffBackPressureUs(), 2.0 * kInterval);
 
     // Cleared with the handoff window; the stream proof stays.
@@ -2606,10 +2606,12 @@ void TestRenderHandoffBackPressure()
     CHECK(controller->Statistics().handoff_held_back == 1);
 }
 
-// The GPU floor of frame n: Ĝ(n − 1) − 2 I + c, Ĝ extrapolated from the
-// newest GPU end by the median GPU frame period of consecutive frames. It
-// applies only while c > 0, within the horizon, for the GPU end's producer
-// epoch and NvAPI frames, once the period window is warm.
+// The GPU floor of frame n: Ĝ(n − 1) − 2 I + c, Ĝ the newest GPU end
+// extrapolated by the median GPU frame period of consecutive frames, at
+// least a newer frame's PRESENT_END plus the 5th percentile of the reports'
+// PRESENT_END → GPU end gaps, extrapolated the same way. It applies only
+// while c > 0, within the horizon, for the GPU end's producer epoch and
+// NvAPI frames, once the period window is warm.
 void TestRenderHandoffGpuFloor()
 {
     constexpr uint32_t kEpoch = 7;
@@ -2623,36 +2625,56 @@ void TestRenderHandoffGpuFloor()
         return key;
     };
     auto controller = MakeController();
-    // c = 950 µs from ten held-back frames released under the limit.
+    // c = 1,000 µs from ten held-back frames released under the limit.
     for (uint64_t n = 1; n <= 10; ++n) {
         LeadFrameStart start = Start(n, PacingRung::SourceOnly, static_cast<double>(n) * kInterval);
-        start.handoff_release = true;
+        start.gpu_floor = true;
         controller->OnSourceRelease(start);
-        controller->OnHandoffBackPressure(Key(n).producer_epoch, Key(n).frame_id, HeldBackPair(), 0.95);
+        controller->OnHandoffBackPressure(Key(n).producer_epoch, Key(n).frame_id, HeldBackPair());
     }
-    CHECK_NEAR(controller->HandoffBackPressureUs(), 950.0);
+    CHECK_NEAR(controller->HandoffBackPressureUs(), 1000.0);
 
-    // 32 GPU ends are 31 intervals: cold.
+    // 32 GPU ends are 31 intervals: cold. Gaps of 14,000 µs (bin center
+    // 14,010) from frame 2001 on; frame 2000 has none.
     const auto gpu_end_us = [&](uint64_t frame_id) { return 100000.0 + kGpuPeriod * static_cast<double>(frame_id - 2000); };
     for (uint64_t frame_id = 2000; frame_id < 2032; ++frame_id) {
-        controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us(frame_id)));
+        controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us(frame_id)), frame_id == 2000 ? 0.0 : 14000.0);
     }
     CHECK(controller->GpuFloorQpc(key_of(2033), kInterval) == 0);
     // A gap adds no interval; the next consecutive frame does.
-    controller->OnGpuRenderEnd(kEpoch, 2033, Qpc(gpu_end_us(2033)));
+    controller->OnGpuRenderEnd(kEpoch, 2033, Qpc(gpu_end_us(2033)), 14000.0);
     CHECK(controller->GpuFloorQpc(key_of(2035), kInterval) == 0);
-    controller->OnGpuRenderEnd(kEpoch, 2034, Qpc(gpu_end_us(2034)));
-    // Frame 2036: Ĝ(2035) = G(2034) + 17,010, floor = Ĝ − 20,000 + 950.
-    CHECK(controller->GpuFloorQpc(key_of(2036), kInterval) == Qpc(gpu_end_us(2034) + 17010.0 - 20000.0 + 950.0));
+    controller->OnGpuRenderEnd(kEpoch, 2034, Qpc(gpu_end_us(2034)), 14000.0);
+    // Frame 2036: Ĝ(2035) = G(2034) + 17,010, floor = Ĝ − 20,000 + 1,000.
+    CHECK(controller->GpuFloorQpc(key_of(2036), kInterval) == Qpc(gpu_end_us(2034) + 17010.0 - 19000.0));
     // Frame 2035: its predecessor's GPU end is known.
-    CHECK(controller->GpuFloorQpc(key_of(2035), kInterval) == Qpc(gpu_end_us(2034) - 20000.0 + 950.0));
+    CHECK(controller->GpuFloorQpc(key_of(2035), kInterval) == Qpc(gpu_end_us(2034) - 19000.0));
+
+    // Live bound: frame 2035 left its Present 2,000 µs late against its
+    // usual place (G − 14,000). For frame 2037, Ĝ(2036) is at least
+    // PRESENT_END(2035) + 14,010 + 17,010 instead of G(2034) + 2 × 17,010.
+    const double usual_present_end_us = gpu_end_us(2035) - 14000.0;
+    CHECK(controller->GpuFloorQpc(key_of(2037), kInterval, 2035, Qpc(usual_present_end_us)) ==
+        Qpc(usual_present_end_us + 14010.0 + 17010.0 - 19000.0));
+    CHECK(controller->GpuFloorQpc(key_of(2037), kInterval, 2035, Qpc(usual_present_end_us + 2000.0)) ==
+        Qpc(usual_present_end_us + 2000.0 + 14010.0 + 17010.0 - 19000.0));
+    // An early PRESENT_END never lowers the report's prediction.
+    CHECK(controller->GpuFloorQpc(key_of(2037), kInterval, 2035, Qpc(usual_present_end_us - 5000.0)) ==
+        Qpc(gpu_end_us(2034) + 2.0 * 17010.0 - 19000.0));
+    // A PRESENT_END not newer than the newest GPU end, or of frame n itself,
+    // is not a bound.
+    CHECK(controller->GpuFloorQpc(key_of(2037), kInterval, 2034, Qpc(usual_present_end_us + 9000.0)) ==
+        Qpc(gpu_end_us(2034) + 2.0 * 17010.0 - 19000.0));
+    CHECK(controller->GpuFloorQpc(key_of(2037), kInterval, 2037, Qpc(usual_present_end_us + 9000.0)) ==
+        Qpc(gpu_end_us(2034) + 2.0 * 17010.0 - 19000.0));
+
     // One stretched GPU frame does not move the median period.
-    controller->OnGpuRenderEnd(kEpoch, 2035, Qpc(gpu_end_us(2034) + 25000.0));
+    controller->OnGpuRenderEnd(kEpoch, 2035, Qpc(gpu_end_us(2034) + 25000.0), 14000.0);
     CHECK(controller->GpuFloorQpc(key_of(2037), kInterval) ==
-        Qpc(gpu_end_us(2034) + 25000.0 + 17010.0 - 20000.0 + 950.0));
+        Qpc(gpu_end_us(2034) + 25000.0 + 17010.0 - 19000.0));
     // An older report is ignored.
-    controller->OnGpuRenderEnd(kEpoch, 2030, Qpc(gpu_end_us(2030)));
-    CHECK(controller->GpuFloorQpc(key_of(2036), kInterval) == Qpc(gpu_end_us(2034) + 25000.0 - 20000.0 + 950.0));
+    controller->OnGpuRenderEnd(kEpoch, 2030, Qpc(gpu_end_us(2030)), 14000.0);
+    CHECK(controller->GpuFloorQpc(key_of(2036), kInterval) == Qpc(gpu_end_us(2034) + 25000.0 - 19000.0));
 
     // Horizon: at most 8 frames between the newest GPU end and frame n − 1.
     CHECK(controller->GpuFloorQpc(key_of(2044), kInterval) != 0);
@@ -2666,20 +2688,24 @@ void TestRenderHandoffGpuFloor()
     CHECK(controller->GpuFloorQpc(pcl, kInterval) == 0);
     CHECK(controller->GpuFloorQpc(key_of(2036), 0.0) == 0);
     // Unknown GPU end QPC is ignored.
-    controller->OnGpuRenderEnd(kEpoch, 2036, 0);
+    controller->OnGpuRenderEnd(kEpoch, 2036, 0, 14000.0);
     CHECK(controller->GpuFloorQpc(key_of(2037), kInterval) != 0);
 
-    // A new producer epoch restarts the anchor and the period window.
-    controller->OnGpuRenderEnd(kEpoch + 1, 5000, Qpc(900000.0));
+    // A new producer epoch restarts the anchor and both windows.
+    controller->OnGpuRenderEnd(kEpoch + 1, 5000, Qpc(900000.0), 14000.0);
     CHECK(controller->GpuFloorQpc(key_of(2037), kInterval) == 0);
     CHECK(controller->GpuFloorQpc(key_of(5002, kEpoch + 1), kInterval) == 0);
 
-    // c = 0: no floor; a warm window again with c cleared (handoff window
-    // reset) gives none either.
+    // Gaps that are missing do not warm the gap window: the bound waits for
+    // 32 of them while the report's prediction applies.
     for (uint64_t frame_id = 5001; frame_id <= 5040; ++frame_id) {
-        controller->OnGpuRenderEnd(kEpoch + 1, frame_id, Qpc(900000.0 + kGpuPeriod * static_cast<double>(frame_id - 5000)));
+        controller->OnGpuRenderEnd(kEpoch + 1, frame_id, Qpc(900000.0 + kGpuPeriod * static_cast<double>(frame_id - 5000)),
+            frame_id <= 5010 ? 14000.0 : 0.0);
     }
-    CHECK(controller->GpuFloorQpc(key_of(5042, kEpoch + 1), kInterval) != 0);
+    const double end_5040_us = 900000.0 + kGpuPeriod * 40.0;
+    CHECK(controller->GpuFloorQpc(key_of(5043, kEpoch + 1), kInterval, 5041, Qpc(end_5040_us + 30000.0)) ==
+        Qpc(end_5040_us + 2.0 * 17010.0 - 19000.0));
+    // c = 0 after a handoff window reset: no floor.
     controller->ResetBuckets();
     CHECK(controller->GpuFloorQpc(key_of(5042, kEpoch + 1), kInterval) == 0);
 }
@@ -2688,7 +2714,7 @@ int main()
 {
     std::printf("sizeof(LeadController) = %zu bytes\n", sizeof(LeadController));
     // Each window's ring holds 32-bit bins (samples beyond 40.96 ms keep theirs).
-    CHECK(sizeof(LeadController) < 192u * 1024u);
+    CHECK(sizeof(LeadController) < 208u * 1024u);
 
     TestSourceOnlySample();
     TestMarkerHoldOverlap();

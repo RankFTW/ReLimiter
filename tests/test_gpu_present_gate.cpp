@@ -753,7 +753,7 @@ void TestExecutor() {
             held->fg_divisor=2.0;held->floor_base_qpc=GridTarget(index);held->floor_checked=held->floor_blocked=false;
             held->trace.target_qpc=GridTarget(index)+3000;
             CHECK(g_cadence_output_tracker.Record(generation_now,index,GridTarget(index)+3000));
-            if(left)RenderHandoff_PublishPresentEnd(domain,PlanKey(index).producer_epoch,index);
+            if(left)RenderHandoff_PublishPresentEnd(domain,PlanKey(index).producer_epoch,index,GridTarget(index));
             CHECK(Service()==GridTarget(index) && !held->signalled); // wakes at T(n) for the check
             fake_clock=GridTarget(index);heartbeat=fake_clock;
             const auto next=Service();
