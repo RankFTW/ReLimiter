@@ -88,6 +88,7 @@ struct Config {
     // same PC latency in testing).
     bool reflex_sleep_bypass = true; // developer
     PacingMarkerForwardOrder marker_forward_order = PacingMarkerForwardOrder::BeforeWait; // developer: before_wait | after_wait
+    ReflexMarkersOptimize reflex_markers_optimize = ReflexMarkersOptimize::Game; // developer A/B: game (default) | off; forces bUseMarkersToOptimize off in forwarded NvAPI SetSleepMode calls
     PacingRenderQueue gpu_queue_wait_render_queue = PacingRenderQueue::Keep; // developer A/B: keep | remove | remove_held
     PacingLeadCoverage lead_coverage = PacingLeadCoverage::Q99; // developer A/B: 95 | 99 (default; share of frames the lead covers)
     bool fg_late_spacing = true; // developer A/B: on (default) | off; FG input wait floors the next real frame on a late frame's readiness
@@ -277,7 +278,7 @@ void ApplyConfig();
 
 // Apply only the pacing pipeline fields (smoothing, adaptive_cap, output_rung,
 // source_placement, gpu_present_gate_probes, stall injector,
-// marker_forward_order, reflex_sleep_bypass) to the resolver (which carries
+// marker_forward_order, reflex_markers_optimize, reflex_sleep_bypass) to the resolver (which carries
 // adaptive_cap to the period governor) and the NvAPI hooks. Part of
 // ApplyConfig; the OSD calls it after editing those fields.
 void Config_ApplyPacingPipeline();

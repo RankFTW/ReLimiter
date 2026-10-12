@@ -48,6 +48,16 @@ enum class PacingMarkerForwardOrder : uint8_t {
     Count
 };
 
+// Developer key `reflex_markers_optimize` (x64 NvAPI only): whether ReLimiter
+// forces NvAPI_D3D_SetSleepMode's bUseMarkersToOptimize off in the calls it
+// forwards or makes. An A/B for the driver's in-Present pacing; the game's own
+// captured parameters are never changed. INI text: game | off.
+enum class ReflexMarkersOptimize : uint8_t {
+    Game = 0, // default: forward what the game or Streamline asks
+    Off = 1,  // force bUseMarkersToOptimize = false
+    Count
+};
+
 // Key `source_placement`: where the source
 // stage waits on marker routes. The user's choice; ReLimiter never switches
 // it. INI text: marker | pre_sleep | driver (legacy `auto` reads as marker).
@@ -255,6 +265,8 @@ const char* PacingRungOverride_Text(PacingRungOverride rung_override) noexcept;
 bool PacingRungOverride_FromText(const char* text, PacingRungOverride* rung_override) noexcept;
 const char* PacingMarkerForwardOrder_Text(PacingMarkerForwardOrder order) noexcept;
 bool PacingMarkerForwardOrder_FromText(const char* text, PacingMarkerForwardOrder* order) noexcept;
+const char* ReflexMarkersOptimize_Text(ReflexMarkersOptimize mode) noexcept;
+bool ReflexMarkersOptimize_FromText(const char* text, ReflexMarkersOptimize* mode) noexcept;
 const char* PacingRenderQueue_Text(PacingRenderQueue render_queue) noexcept;
 bool PacingRenderQueue_FromText(const char* text, PacingRenderQueue* render_queue) noexcept;
 const char* PacingLeadCoverage_Text(PacingLeadCoverage coverage) noexcept;

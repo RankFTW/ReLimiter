@@ -110,6 +110,14 @@ On, ReLimiter holds the game's render thread itself at its RENDERSUBMIT_START un
 
 `marker_forward_order` (default **Before wait**, 64-bit, NvAPI marker games only) sets when the game's SIMULATION_START reaches the driver. **Before wait** passes it on as soon as the game sends it, then ReLimiter waits. **After wait** passes it on after ReLimiter's wait, as the Streamline PCL path already does, so the driver, DLSS Frame Generation and PC Latency see the paced frame start. PC Latency then counts from the paced start, so compare it with care. The Adaptive cap's workload measurement stops removing ReLimiter's wait from the simulation stage, because that stage no longer contains it.
 
+### Reflex markers optimization
+
+`reflex_markers_optimize` (default **Game**, 64-bit, NvAPI Reflex games) sets whether ReLimiter forces the Reflex setting `bUseMarkersToOptimize` ("allow latency markers to be used for runtime optimizations") off. **Game** forwards what the game or Streamline asks. **Off** clears it in every `NvAPI_D3D_SetSleepMode` call ReLimiter forwards or makes, combined with the Reflex driver limiter's interval when that is applied, and re-applies the game's last parameters at once when it is changed in the OSD.
+
+It is an A/B for the driver's pacing inside Present. With the Reflex Sleep bypassed and frame generation on, the NVIDIA driver still paces the game by sleeping the thread that calls Present inside `NvAPI_D3D12_SetAsyncFrameMarker` (telemetry `async_marker_wait_us`); NVIDIA documents that low latency mode works without `NvAPI_D3D_Sleep()`, with the sleep at a less optimal point. Games ask for the flag differently (some request it, some do not), and whether it drives that hold is the question the A/B answers: compare `async_marker_wait_us`, long frames, jitter and PC Latency, one setting per capture in the same scene, with Reflex active.
+
+Only the forwarded copy changes. The game's own parameters stay captured unchanged, and ReLimiter restores them exactly on shutdown. The log warns while the key is not **Game** and writes one INFO line for each change of the effective value: `NvAPI: Reflex markers optimization forced off (game requested N)` and `NvAPI: Reflex markers optimization back to the game's value`.
+
 ### GPU queue wait render queue
 
 `gpu_queue_wait_render_queue` (default **Keep**, 64-bit, `gpu_queue_wait` only). Controls whether the lead includes the time a finished frame waited for the game's render thread to leave the previous frame's Present.
@@ -177,6 +185,7 @@ Settings belong under `[FrameLimiter]`. Leave these at their defaults for normal
 | `gpu_wait_interleave_s` | 0 | 64-bit, Output override **Auto** only. 0 is off; otherwise 1–10 s (values outside are clamped with a log warning; negative or non-finite values load as 0). Alternates held and not-held blocks of the `gpu_queue_wait` output (**GPU wait A/B blocks**). |
 | `reflex_sleep_bypass` | true | 64-bit. `true` skips the driver's Reflex Sleep while an FPS cap is set and ReLimiter paces the game, held or not; frames not held use the render handoff limit. The Sleep reaches the driver in Dynamic MFG passthrough and with the Reflex driver limiter. `false` always returns to the driver's Sleep, which the **Reflex driver limiter** placement needs. |
 | `marker_forward_order` | before_wait | 64-bit, NvAPI markers. `before_wait` or `after_wait`: when SIMULATION_START reaches the driver relative to ReLimiter's wait (**Marker forward order**). Invalid values reset to `before_wait`. |
+| `reflex_markers_optimize` | game | 64-bit, NvAPI Reflex games. `game` or `off`: `off` forces `bUseMarkersToOptimize` off in every `NvAPI_D3D_SetSleepMode` call ReLimiter forwards or makes, an A/B for the driver's pacing inside Present (**Reflex markers optimization**). Invalid values reset to `game`. |
 | `gpu_queue_wait_render_queue` | keep | 64-bit, `gpu_queue_wait` only. `keep`, `remove` or `remove_held` (**GPU queue wait render queue**). Invalid values reset to `keep`. |
 | `lead_coverage` | 99 | All holds. `99` or `95`: the share of frames the lead covers (**Lead coverage**). Invalid values reset to `99`. An INI saved with `config_version=2` (4.0 test builds) moves from `95` to `99` once. |
 | `fg_late_spacing` | true | 64-bit, `fg_input_wait` only. `true` or `false` (**FG late-frame spacing**). An INI saved with `config_version=3` or earlier (4.0 test builds) moves from `false` to `true` once. |

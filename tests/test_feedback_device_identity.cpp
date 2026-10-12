@@ -350,6 +350,88 @@ void TestReflexCallForwarding() {
     NvAPI_ClearFeedbackDevice();
 }
 
+NV_SET_SLEEP_MODE_PARAMS s_recorded_mode{};
+const NV_SET_SLEEP_MODE_PARAMS* s_recorded_pointer = nullptr;
+unsigned s_recorded_calls = 0;
+NvAPI_Status __cdecl RecordingSleepMode(IUnknown*, NV_SET_SLEEP_MODE_PARAMS* params) {
+    s_recorded_mode = *params;
+    s_recorded_pointer = params;
+    ++s_recorded_calls;
+    return NVAPI_OK;
+}
+
+// reflex_markers_optimize: with game the detour forwards the game's own
+// pointer; with off every SetSleepMode ReLimiter forwards or applies carries
+// bUseMarkersToOptimize = 0 (one call, combined with the driver limiter's
+// interval) while the captured game parameters keep 1. Restore forwards the
+// game's original parameters exactly.
+void TestMarkersOptimizeOverride() {
+    FakeDevice device;
+    CHECK(NvAPI_CaptureFeedbackDevice(&device));
+    const auto old_mode = s_orig_sleep_mode;
+    s_orig_sleep_mode = RecordingSleepMode;
+    NV_SET_SLEEP_MODE_PARAMS params{};
+    params.version = NV_SLEEP_PARAMS_VER;
+    params.minimumIntervalUs = 1234;
+    params.bLowLatencyMode = params.bLowLatencyBoost = params.bUseMarkersToOptimize = params.bUseMinQueueTime = 1;
+    g_driver_limiter_interval_us.store(0);
+
+    g_reflex_markers_optimize_off.store(false);
+    CHECK(Hook_SetSleepMode(&device, &params) == NVAPI_OK);
+    CHECK(s_recorded_pointer == &params && s_recorded_mode.bUseMarkersToOptimize == 1);
+
+    // off: a forwarded copy; the game's structure and the captured copy keep 1.
+    g_reflex_markers_optimize_off.store(true);
+    unsigned calls = s_recorded_calls;
+    CHECK(Hook_SetSleepMode(&device, &params) == NVAPI_OK);
+    CHECK(s_recorded_calls == calls + 1);
+    CHECK(s_recorded_pointer != &params);
+    CHECK(s_recorded_mode.bUseMarkersToOptimize == 0 && s_recorded_mode.minimumIntervalUs == 1234);
+    CHECK(s_recorded_mode.bLowLatencyMode && s_recorded_mode.bLowLatencyBoost && s_recorded_mode.bUseMinQueueTime);
+    CHECK(params.bUseMarkersToOptimize == 1);
+    {
+        GameParamsGuard lock;
+        CHECK(s_game_params_captured && s_game_original_params.bUseMarkersToOptimize == 1);
+    }
+
+    // off with the driver limiter: still one call carrying both changes.
+    g_driver_limiter_interval_us.store(16667);
+    calls = s_recorded_calls;
+    CHECK(Hook_SetSleepMode(&device, &params) == NVAPI_OK);
+    CHECK(s_recorded_calls == calls + 1);
+    CHECK(s_recorded_mode.bUseMarkersToOptimize == 0 && s_recorded_mode.minimumIntervalUs == 16667);
+    CHECK(params.minimumIntervalUs == 1234 && g_game_requested_interval.load() == 1234);
+    g_driver_limiter_interval_us.store(0);
+
+    // The limiter's own application and the immediate reapply carry the override.
+    CHECK(NvAPI_ApplyDriverLimiter(8333) == DriverLimiterApply::Applied);
+    CHECK(s_recorded_mode.bUseMarkersToOptimize == 0 && s_recorded_mode.minimumIntervalUs == 8333);
+    CHECK(NvAPI_ReapplyGameSleepMode() == DriverLimiterApply::Applied);
+    CHECK(s_recorded_mode.bUseMarkersToOptimize == 0 && s_recorded_mode.minimumIntervalUs == 1234);
+    g_driver_limiter_interval_us.store(9000);
+    CHECK(NvAPI_ReapplyGameSleepMode() == DriverLimiterApply::Applied);
+    CHECK(s_recorded_mode.bUseMarkersToOptimize == 0 && s_recorded_mode.minimumIntervalUs == 9000);
+    g_driver_limiter_interval_us.store(0);
+
+    // The shutdown restore is the game's original, without the override.
+    calls = s_recorded_calls;
+    RestoreGameSleepMode();
+    CHECK(s_recorded_calls == calls + 1);
+    CHECK(s_recorded_mode.bUseMarkersToOptimize == 1 && s_recorded_mode.minimumIntervalUs == 1234);
+    CHECK(s_recorded_mode.bLowLatencyMode && s_recorded_mode.bLowLatencyBoost && s_recorded_mode.bUseMinQueueTime);
+
+    // Back to game: the reapply returns the game's value at once.
+    g_reflex_markers_optimize_off.store(false);
+    CHECK(NvAPI_ReapplyGameSleepMode() == DriverLimiterApply::Applied);
+    CHECK(s_recorded_mode.bUseMarkersToOptimize == 1 && s_recorded_mode.minimumIntervalUs == 1234);
+    CHECK(Hook_SetSleepMode(&device, &params) == NVAPI_OK && s_recorded_pointer == &params);
+
+    // Without a captured game call there is nothing to reapply.
+    NvAPI_ClearFeedbackDevice();
+    CHECK(NvAPI_ReapplyGameSleepMode() == DriverLimiterApply::NoGameParams);
+    s_orig_sleep_mode = old_mode;
+}
+
 void RepublishDuringQuery() {
     NvAPI_ClearFeedbackDevice(s_reentrant_expected);
     CHECK(NvAPI_CaptureFeedbackDevice(s_reentrant_device, &s_reentrant_publication));
@@ -1385,6 +1467,7 @@ int main(int argc, char** argv) {
     TestRenderStartHold();
     TestNativeEndpointCancellation();
     TestReflexCallForwarding();
+    TestMarkersOptimizeOverride();
     // No-FG token: native mode transitions clear it; the scheduler-side
     // observation entry point republishes it (not a fixture-only publication).
     NativeGate_SetMode(NativeGateMode::Marker);

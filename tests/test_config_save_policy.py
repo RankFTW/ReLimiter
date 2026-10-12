@@ -131,11 +131,11 @@ class ConfigSavePolicyTests(unittest.TestCase):
         config = HEADER.split("struct Config {", 1)[1].split("};", 1)[0]
         fields = set(re.findall(
             r"\b(?:bool|int|double|float|std::string|PacingSmoothing|PacingRungOverride|"
-            r"PacingMarkerForwardOrder|PacingRenderQueue|PacingLeadCoverage|PacingPlacementOverride)\s+(\w+)\s*=",
+            r"PacingMarkerForwardOrder|ReflexMarkersOptimize|PacingRenderQueue|PacingLeadCoverage|PacingPlacementOverride)\s+(\w+)\s*=",
             config))
         self.assertTrue({"smoothing", "adaptive_cap", "output_rung", "stall_inject_ms",
                          "stall_inject_period_s", "gpu_present_gate_probes",
-                         "gpu_wait_budget_us", "marker_forward_order",
+                         "gpu_wait_budget_us", "marker_forward_order", "reflex_markers_optimize",
                          "gpu_queue_wait_render_queue", "lead_coverage", "source_placement"} <= fields)
         saved = set(re.findall(r"\bconfig\.(\w+)", body("WriteConfigSnapshot")))
         # Every Config field is saved: the section clear before the startup
@@ -255,6 +255,15 @@ class ConfigSavePolicyTests(unittest.TestCase):
         self.assertRegex(body("Config_ApplyPacingPipeline"),
                          r"g_marker_forward_after_wait\.store\(\s*g_config\.marker_forward_order"
                          r" == PacingMarkerForwardOrder::AfterWait")
+        # reflex_markers_optimize follows the same path to the NvAPI hooks.
+        self.assertIn("ReflexMarkersOptimize_FromText(markers_optimize.c_str(), "
+                      "&g_config.reflex_markers_optimize)", loader)
+        self.assertIn("ReflexMarkersOptimize::Count", validate)
+        self.assertRegex(writer, r'"reflex_markers_optimize",\s*'
+                                 r'ReflexMarkersOptimize_Text\(config\.reflex_markers_optimize\)')
+        self.assertRegex(body("Config_ApplyPacingPipeline"),
+                         r"g_reflex_markers_optimize_off\.store\(\s*g_config\.reflex_markers_optimize"
+                         r" == ReflexMarkersOptimize::Off")
 
     def test_mailboxes_are_bounded_and_destination_specific(self):
         self.assertIn("std::optional<ConfigSaveSnapshot> config", SOURCE)

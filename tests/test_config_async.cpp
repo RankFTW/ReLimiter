@@ -239,6 +239,7 @@ void Reset(bool creation_failure = false, bool initial_write_failure = false,
     PacingPipeline_SetConfig(stale);
     g_reflex_sleep_bypass.store(false);
     g_marker_forward_after_wait.store(true); // LoadConfig must apply the loaded order
+    g_reflex_markers_optimize_off.store(true); // LoadConfig must apply the loaded key
     LoadConfig(nullptr);
     CHECK(creates == 1);
     CHECK((s_config_writer == nullptr) == creation_failure);
@@ -307,6 +308,8 @@ void CheckPipelineMatchesConfig() {
     CHECK(pipeline.render_start_hold == g_config.render_start_hold);
     CHECK(g_marker_forward_after_wait.load() ==
         (g_config.marker_forward_order == PacingMarkerForwardOrder::AfterWait));
+    CHECK(g_reflex_markers_optimize_off.load() ==
+        (g_config.reflex_markers_optimize == ReflexMarkersOptimize::Off));
 }
 
 void TestPacingPipelineDefaults() {
@@ -319,6 +322,7 @@ void TestPacingPipelineDefaults() {
     // Recommended defaults: the Reflex Sleep bypass and pre-Sleep placement.
     CHECK(g_config.reflex_sleep_bypass && g_reflex_sleep_bypass.load());
     CHECK(g_config.marker_forward_order == PacingMarkerForwardOrder::BeforeWait);
+    CHECK(g_config.reflex_markers_optimize == ReflexMarkersOptimize::Game);
     CHECK(g_config.gpu_queue_wait_render_queue == PacingRenderQueue::Keep);
     CHECK(g_config.lead_coverage == PacingLeadCoverage::Q99);
     CHECK(g_config.fg_late_spacing);
@@ -327,6 +331,7 @@ void TestPacingPipelineDefaults() {
     CheckPipelineMatchesConfig();
     // The startup rewrite saves every new key, including the developer keys.
     CHECK(Value(local_path, "FrameLimiter", "marker_forward_order") == "before_wait");
+    CHECK(Value(local_path, "FrameLimiter", "reflex_markers_optimize") == "game");
     CHECK(Value(local_path, "FrameLimiter", "gpu_queue_wait_render_queue") == "keep");
     CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "99");
     CHECK(Value(local_path, "FrameLimiter", "fg_late_spacing") == "true");
@@ -497,6 +502,50 @@ void TestMarkerForwardOrderParsing() {
     ReleaseStart();CHECK(OwnerShutdown());
     CheckWorkerWrites();
     CHECK(Value(local_path, "FrameLimiter", "marker_forward_order") == "after_wait");
+}
+
+// Developer A/B reflex_markers_optimize: parses case-insensitively, falls back
+// to game, publishes the NvAPI hooks' atomic, counts as a developer override,
+// resets to game and saves canonical text.
+void TestReflexMarkersOptimizeKey() {
+    struct Case { const char* text; ReflexMarkersOptimize expected; };
+    for (const Case& test : {Case{"off", ReflexMarkersOptimize::Off},
+            Case{"OFF", ReflexMarkersOptimize::Off},
+            Case{"game", ReflexMarkersOptimize::Game},
+            Case{"on", ReflexMarkersOptimize::Game},
+            Case{"", ReflexMarkersOptimize::Game}}) {
+        Reset(false, false, {{"reflex_markers_optimize", test.text}});
+        CHECK(g_config.reflex_markers_optimize == test.expected);
+        CheckPipelineMatchesConfig();
+        CHECK(Value(local_path, "FrameLimiter", "reflex_markers_optimize") ==
+            ReflexMarkersOptimize_Text(test.expected));
+        ReleaseStart();CHECK(OwnerShutdown());
+    }
+    Reset(false, false, {{"reflex_markers_optimize", "off"}});
+    CHECK(g_config.reflex_markers_optimize == ReflexMarkersOptimize::Off);
+    CHECK(g_reflex_markers_optimize_off.load());
+    CHECK(Config_DeveloperOverrides() == 1);
+    Config_ResetDeveloperSettings();
+    CHECK(g_config.reflex_markers_optimize == ReflexMarkersOptimize::Game);
+    CHECK(!g_reflex_markers_optimize_off.load());
+    CHECK(Config_DeveloperOverrides() == 0);
+    RequestSaveConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+    CheckWorkerWrites();
+    CHECK(Value(local_path, "FrameLimiter", "reflex_markers_optimize") == "game");
+    // Runtime edits: out-of-range values validate to game; the OSD path
+    // (Config_ApplyPacingPipeline) publishes the key and saves the text.
+    Reset();
+    g_config.reflex_markers_optimize = static_cast<ReflexMarkersOptimize>(7);
+    ValidateConfig();
+    CHECK(g_config.reflex_markers_optimize == ReflexMarkersOptimize::Game);
+    g_config.reflex_markers_optimize = ReflexMarkersOptimize::Off;
+    Config_ApplyPacingPipeline();
+    CHECK(g_reflex_markers_optimize_off.load());
+    RequestSaveConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+    CheckWorkerWrites();
+    CHECK(Value(local_path, "FrameLimiter", "reflex_markers_optimize") == "off");
 }
 
 // Developer A/B gpu_queue_wait_render_queue: parses case-insensitively, falls
@@ -953,6 +1002,7 @@ int main() {
     TestDeveloperSettingsReset();
     TestSmoothingParsing();
     TestMarkerForwardOrderParsing();
+    TestReflexMarkersOptimizeKey();
     TestRenderQueueParsing();
     TestLeadCoverageKey();
     TestFgLateSpacingKey();

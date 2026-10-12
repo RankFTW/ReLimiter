@@ -483,6 +483,24 @@ static bool SafeCopySleepModeParams(
     __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// The reflex_markers_optimize override. True when bUseMarkersToOptimize is to
+// be forwarded as false. Logs once per change of the effective value; the
+// callers pass the game's requested value for the log line.
+static bool MarkersOptimizeForcedOff(uint8_t game_requested) noexcept {
+    static std::atomic<bool> s_forced{false};
+    const bool off = g_reflex_markers_optimize_off.load(std::memory_order_relaxed);
+    if (off != s_forced.load(std::memory_order_relaxed) &&
+        s_forced.exchange(off, std::memory_order_relaxed) != off) {
+        if (off) {
+            LOG_INFO("NvAPI: Reflex markers optimization forced off (game requested %u)",
+                game_requested ? 1u : 0u);
+        } else {
+            LOG_INFO("NvAPI: Reflex markers optimization back to the game's value");
+        }
+    }
+    return off;
+}
+
 static NvAPI_Status SafeInvokeSleep(IUnknown* device) noexcept
 {
     if (!s_orig_sleep) return NVAPI_OK;
@@ -606,7 +624,7 @@ static void DrainDeferredMarkers(
     }
 }
 
-// ── Hook: SetSleepMode — capture game params, forward unmodified ──
+// ── Hook: SetSleepMode — capture game params, forward them (limiter interval and markers override on a copy) ──
 static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_PARAMS* params) {
     RuntimeCallbackGuard callback;
     if (callback.IsStopping())
@@ -669,13 +687,19 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
     }
 
     // While the Reflex driver limiter is applied, the game's own call
-    // would clear it: forward a copy with ReLimiter's interval instead. The
-    // game's parameters above stay captured for the restore.
-    const uint32_t limiter_us = g_driver_limiter_interval_us.load(std::memory_order_relaxed);
-    if (limiter_us != 0 && params_valid && params_device.identity.device) {
-        NV_SET_SLEEP_MODE_PARAMS limited = params_snapshot;
-        limited.minimumIntervalUs = limiter_us;
-        return SafeInvokeSetSleepMode(pDev, &limited);
+    // would clear it: forward a copy with ReLimiter's interval instead.
+    // reflex_markers_optimize=off forwards a copy with bUseMarkersToOptimize
+    // cleared, in the same single driver call. The game's parameters above
+    // stay captured, unchanged, for the restore.
+    if (params_valid && params_device.identity.device) {
+        const uint32_t limiter_us = g_driver_limiter_interval_us.load(std::memory_order_relaxed);
+        const bool markers_off = MarkersOptimizeForcedOff(params_snapshot.bUseMarkersToOptimize);
+        if (limiter_us != 0 || markers_off) {
+            NV_SET_SLEEP_MODE_PARAMS forwarded = params_snapshot;
+            if (limiter_us != 0) forwarded.minimumIntervalUs = limiter_us;
+            if (markers_off) forwarded.bUseMarkersToOptimize = 0;
+            return SafeInvokeSetSleepMode(pDev, &forwarded);
+        }
     }
     // Forward game's params unmodified.
     return SafeInvokeSetSleepMode(pDev, params);
@@ -1244,7 +1268,11 @@ void RestoreGameSleepMode() {
     NvAPI_ReleaseFeedbackDevice(feedback_device.device);
 }
 
-DriverLimiterApply NvAPI_ApplyDriverLimiter(uint32_t minimum_interval_us) noexcept {
+// SetSleepMode on the presenting device with the game's captured parameters:
+// minimumIntervalUs replaced when `interval_us` is given, and
+// bUseMarkersToOptimize forced off by the reflex_markers_optimize override.
+// Only this copy changes; the captured parameters stay the game's.
+static DriverLimiterApply ApplyCapturedSleepMode(const uint32_t* interval_us) noexcept {
     if (!s_orig_sleep_mode) return DriverLimiterApply::Failed;
     NV_SET_SLEEP_MODE_PARAMS params{};
     NvAPIFeedbackDevice params_identity{};
@@ -1254,7 +1282,8 @@ DriverLimiterApply NvAPI_ApplyDriverLimiter(uint32_t minimum_interval_us) noexce
         params = s_game_original_params;
         params_identity = s_game_params_identity;
     }
-    params.minimumIntervalUs = minimum_interval_us;
+    if (interval_us) params.minimumIntervalUs = *interval_us;
+    if (MarkersOptimizeForcedOff(params.bUseMarkersToOptimize)) params.bUseMarkersToOptimize = 0;
     const NvAPIFeedbackDevice feedback_device = NvAPI_AcquireFeedbackDevice();
     if (!feedback_device.device) return DriverLimiterApply::NoDevice;
     DriverLimiterApply result = DriverLimiterApply::NoDevice;
@@ -1268,8 +1297,20 @@ DriverLimiterApply NvAPI_ApplyDriverLimiter(uint32_t minimum_interval_us) noexce
     return result;
 }
 
+DriverLimiterApply NvAPI_ApplyDriverLimiter(uint32_t minimum_interval_us) noexcept {
+    return ApplyCapturedSleepMode(&minimum_interval_us);
+}
+
+DriverLimiterApply NvAPI_ReapplyGameSleepMode() noexcept {
+    const uint32_t limiter_us = g_driver_limiter_interval_us.load(std::memory_order_relaxed);
+    return ApplyCapturedSleepMode(limiter_us != 0 ? &limiter_us : nullptr);
+}
+
 void NvAPI_ReleaseDriverLimiter() noexcept {
-    RestoreGameSleepMode();
+    // The limiter's interval is gone (sleep_mode.cpp cleared it first): the
+    // game's parameters again, with the markers override while it is set.
+    // Shutdown restores them exactly through RestoreGameSleepMode.
+    NvAPI_ReapplyGameSleepMode();
 }
 
 // ── Installation ──

@@ -570,6 +570,25 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "driver when the game sends it, then waits. After wait passes it after ReLimiter's source wait, "
         "so the driver, Frame Generation and PC Latency see the paced frame start. Compare both in one session.");
 
+    static const char* const kMarkersOptimizeLabels[] = {"Game", "Off"};
+    static_assert(IM_ARRAYSIZE(kMarkersOptimizeLabels) ==
+        static_cast<int>(ReflexMarkersOptimize::Count));
+    int markers_optimize = static_cast<int>(g_config.reflex_markers_optimize);
+    if (ImGui::Combo("Reflex markers optimization", &markers_optimize, kMarkersOptimizeLabels,
+            IM_ARRAYSIZE(kMarkersOptimizeLabels))) {
+        g_config.reflex_markers_optimize = static_cast<ReflexMarkersOptimize>(markers_optimize);
+        Config_ApplyPacingPipeline();
+        // Takes effect now, not at the game's next SetSleepMode call.
+        NvAPI_ReapplyGameSleepMode();
+        LOG_INFO("OSD: Reflex markers optimization -> %s",
+            ReflexMarkersOptimize_Text(g_config.reflex_markers_optimize));
+        *config_dirty = true;
+    }
+    HelpTip("Diagnostic A/B, NvAPI games only. Game (default) forwards what the game or Streamline asks. "
+        "Off clears 'use markers to optimize' in every SetSleepMode call ReLimiter forwards, so the "
+        "driver's pacing inside Present can be compared with and without it. The game's own parameters "
+        "stay captured and are restored unchanged on exit. One setting per capture.");
+
     static const char* const kRenderQueueLabels[] = {"Keep", "Remove", "Remove after held"};
     static_assert(IM_ARRAYSIZE(kRenderQueueLabels) == static_cast<int>(PacingRenderQueue::Count));
     int render_queue = static_cast<int>(g_config.gpu_queue_wait_render_queue);

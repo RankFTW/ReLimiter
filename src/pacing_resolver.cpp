@@ -651,6 +651,20 @@ bool PacingMarkerForwardOrder_FromText(const char* text, PacingMarkerForwardOrde
     return EnumFromText(text, order, PacingMarkerForwardOrder_Text);
 }
 
+const char* ReflexMarkersOptimize_Text(ReflexMarkersOptimize mode) noexcept
+{
+    switch (mode) {
+        case ReflexMarkersOptimize::Game: return "game";
+        case ReflexMarkersOptimize::Off: return "off";
+        default: return "unknown";
+    }
+}
+
+bool ReflexMarkersOptimize_FromText(const char* text, ReflexMarkersOptimize* mode) noexcept
+{
+    return EnumFromText(text, mode, ReflexMarkersOptimize_Text);
+}
+
 const char* PacingRenderQueue_Text(PacingRenderQueue render_queue) noexcept
 {
     switch (render_queue) {
