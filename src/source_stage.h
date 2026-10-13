@@ -139,7 +139,10 @@ struct SourceStageRequest {
     // held_gpu_floor.
     int64_t earliest_release_qpc = 0;
     // Developer A/B (held_gpu_floor): the lead leaves the previous frame's
-    // driver Present hold out of a GPU-rung frame's sample (lead_controller.h).
+    // driver Present hold out of a GPU-rung frame's sample (lead_controller.h),
+    // and a held frame whose arrival is this earliest release restarts a late
+    // cadence on its bucket's early lead (LeadController::EarlyLeadUs) instead
+    // of L.
     bool held_gpu_floor = false;
 };
 
@@ -159,6 +162,9 @@ struct SourceStageFrame {
     uint32_t stall_injected_us = 0;
     bool lead_budget_limited = false; // the lead was clamped to its 3 I limit
     bool handoff_limited = false;     // the render handoff limit moved the release past S_n
+    // held_gpu_floor: the GPU floor made this held frame late and the
+    // cadence restarted on the bucket's early lead (cadence_grid.h).
+    bool gpu_floor_restart = false;
 };
 
 // Owner-local counters, cumulative.
@@ -170,6 +176,7 @@ struct SourceStageStatistics {
     uint64_t plan_publish_failures = 0;
     uint64_t duplicate_keys = 0; // same key planned again: not republished (one claim per plan)
     uint64_t clamped_waits = 0;
+    uint64_t gpu_floor_restarts = 0; // SourceStageFrame::gpu_floor_restart
 };
 
 class SourceStage {

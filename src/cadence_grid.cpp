@@ -258,6 +258,8 @@ namespace
     struct PlanTiming {
         double interval_ticks = 0.0; // effective: k * refresh when snapped
         int64_t lead_ticks = 0;
+        // SourceLate restart lead: floor_restart_lead_us when usable, at most L.
+        int64_t restart_lead_ticks = 0;
         bool snapped = false;
     };
 
@@ -282,6 +284,13 @@ namespace
         }
         timing->interval_ticks = interval_ticks;
         timing->lead_ticks = static_cast<int64_t>(std::floor(lead_ticks + 0.5));
+        timing->restart_lead_ticks = timing->lead_ticks;
+        if (std::isfinite(input.floor_restart_lead_us) && input.floor_restart_lead_us > 0.0) {
+            const double floor_lead_ticks = input.floor_restart_lead_us * ticks_per_us;
+            if (floor_lead_ticks < lead_ticks) {
+                timing->restart_lead_ticks = static_cast<int64_t>(std::floor(floor_lead_ticks + 0.5));
+            }
+        }
         timing->snapped = false;
 
         double snapped_interval = 0.0;
@@ -505,9 +514,17 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
         tolerance_ticks += static_cast<int64_t>(slack_ticks);
     }
     bool released_immediately = false;
+    bool floor_restart = false;
     if (input.now_qpc > wake_qpc + tolerance_ticks) {
+        // A held frame its GPU floor made late restarts where the GPU
+        // finishes it, not a full lead later: L is the late quantile of
+        // all its rung's frames, and on a GPU at its limit the output
+        // hold's wait for the difference is GPU time lost (Gears of War:
+        // E-Day, FG 2× at 120: 30 of 33 such restarts stretched their GPU
+        // frame by the 4.6 ms wait).
+        floor_restart = timing.restart_lead_ticks < timing.lead_ticks;
         ExactQpc origin{};
-        if (!OriginAtOrAfter(next, earliest_target, &origin)) {
+        if (!OriginAtOrAfter(next, WholeQpc(input.now_qpc + timing.restart_lead_ticks), &origin)) {
             ++statistics_.invalid_inputs;
             return plan;
         }
@@ -549,6 +566,7 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
     plan.epoch = next.epoch;
     plan.epoch_reason = reason;
     plan.released_immediately = released_immediately;
+    plan.floor_restart = floor_restart;
     return plan;
 }
 

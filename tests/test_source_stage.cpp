@@ -943,6 +943,68 @@ void TestHeldFrameGpuFloorAndDriverHold()
     }
 }
 
+// Developer A/B held_gpu_floor: a held frame whose arrival is its GPU floor,
+// late beyond the tolerance, restarts the cadence at the floor plus its
+// bucket's early lead Q_{1−q}(X) − allowance instead of L. A cold bucket, the
+// key off, and a source that arrives after its floor (late on its own)
+// restart on L.
+void TestHeldFloorRestartOnEarlyLead()
+{
+    std::printf("Test: a restart the held frame's GPU floor causes uses the early lead\n");
+    const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
+    const auto near = [](int64_t value, int64_t expected) {
+        return value > expected - 10 && value < expected + 10;
+    };
+    {
+        ResetStage();
+        ScriptedClock clock;
+        const SourceStageFrame first = g_stage.RunPlannedFrame(Request(Key(999), held), &clock);
+        SourceStageRequest request = Request(Key(1000), held);
+        request.held_gpu_floor = true;
+        request.earliest_release_qpc = first.plan.output_target_qpc + Ticks(kIntervalUs) -
+            Ticks(first.plan.lead_us) + Ticks(6'000.0);
+        const SourceStageFrame cold = g_stage.RunPlannedFrame(request, &clock);
+        CHECK(cold.epoch_started == PacingEpochReason::SourceLate && !cold.gpu_floor_restart);
+        CHECK(near(cold.plan.output_target_qpc, request.earliest_release_qpc + Ticks(cold.plan.lead_us)));
+    }
+    struct Case { bool key_on; bool floor_is_arrival; };
+    for (const Case c : { Case{ true, true }, Case{ false, true }, Case{ true, false } }) {
+        ResetStage();
+        ScriptedClock clock;
+        uint64_t frame_id = 1000;
+        SourceStageFrame frame{};
+        // Every frame ready 3,000 µs after its release: L = Q95 3,010 + 500,
+        // early lead Q5 3,010 − 500 = 2,510 µs.
+        for (int i = 0; i < 40; ++i) {
+            frame = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
+            CHECK(frame.planned);
+            const int64_t done = frame.release_qpc + Ticks(3'000.0);
+            CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::PresentCall,
+                frame.release_qpc + Ticks(1'000.0))));
+            CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady, done)));
+            CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease, done,
+                PacingPlanStatus::Late)));
+            g_stage.DrainStageEvents();
+            clock.now = done;
+        }
+        const int64_t late = frame.plan.output_target_qpc + Ticks(kIntervalUs) -
+            Ticks(frame.plan.lead_us) + Ticks(6'000.0);
+        SourceStageRequest request = Request(Key(frame_id), held);
+        request.held_gpu_floor = c.key_on;
+        request.earliest_release_qpc = c.floor_is_arrival ? late : late - Ticks(1'000.0);
+        if (!c.floor_is_arrival) clock.now = late;
+        const uint64_t restarts_before = g_stage.Statistics().gpu_floor_restarts;
+        const SourceStageFrame restart = g_stage.RunPlannedFrame(request, &clock);
+        const bool early = c.key_on && c.floor_is_arrival;
+        CHECK(restart.planned && restart.epoch_started == PacingEpochReason::SourceLate);
+        CHECK(restart.release_qpc == late && restart.plan.source_wake_qpc == late);
+        CHECK(restart.plan.lead_us > 3'509.0 && restart.plan.lead_us < 3'511.0);
+        CHECK(restart.gpu_floor_restart == early);
+        CHECK(g_stage.Statistics().gpu_floor_restarts - restarts_before == (early ? 1u : 0u));
+        CHECK(near(restart.plan.output_target_qpc, late + Ticks(early ? 2'510.0 : restart.plan.lead_us)));
+    }
+}
+
 int main()
 {
     std::printf("=== Source stage tests ===\n");
@@ -965,6 +1027,7 @@ int main()
     TestVBlankPhaseTrackerFeedsFixedGrid();
     TestEarliestReleaseLimitsWait();
     TestHeldFrameGpuFloorAndDriverHold();
+    TestHeldFloorRestartOnEarlyLead();
     TestResetClearsPlans();
     std::printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

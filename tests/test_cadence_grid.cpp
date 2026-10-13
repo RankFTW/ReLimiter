@@ -444,6 +444,47 @@ namespace
         CHECK(beyond.epoch_reason == PacingEpochReason::SourceLate);
     }
 
+    // A SourceLate restart on the GPU floor's early lead (held_gpu_floor):
+    // T = now + that lead, S = now, and the cadence continues from it. The
+    // lead affects only SourceLate restarts; a lead at or above L, zero,
+    // negative or non-finite restarts on L. I = 10 ms, L = 6 ms, tol = 2.5 ms.
+    void TestFloorRestartLead()
+    {
+        const int64_t lead_ticks = 60000;
+        const int64_t tolerance = 25000;
+        auto input = [&](int64_t now, double floor_lead_us) {
+            CadenceGridPlanInput in = Input(now, 10000.0, 6000.0);
+            in.floor_restart_lead_us = floor_lead_us;
+            return in;
+        };
+        CadenceGrid grid;
+        const CadenceGridPlan first = grid.PlanNext(input(kStartQpc, 2500.0));
+        CHECK(first.epoch_reason == PacingEpochReason::Lifecycle && !first.floor_restart);
+        CHECK(first.output_target_qpc == kStartQpc + lead_ticks);
+        const int64_t t1 = first.output_target_qpc;
+        const CadenceGridPlan kept = grid.PlanNext(input(t1 + 100000 - lead_ticks + tolerance, 2500.0));
+        CHECK(kept.released_immediately && !kept.floor_restart);
+        CHECK(kept.output_target_qpc == t1 + 100000);
+
+        const int64_t late_now = t1 + 200000 - lead_ticks + tolerance + 1;
+        const CadenceGridPlan late = grid.PlanNext(input(late_now, 2500.0));
+        CHECK(late.epoch_reason == PacingEpochReason::SourceLate && late.floor_restart);
+        CHECK(late.output_target_qpc == late_now + 25000);
+        CHECK(late.source_wake_qpc == late_now);
+        const CadenceGridPlan after = grid.PlanNext(input(late.output_target_qpc, 2500.0));
+        CHECK(after.epoch_reason == PacingEpochReason::None && !after.floor_restart);
+        CHECK(after.output_target_qpc == late.output_target_qpc + 100000);
+
+        for (const double lead : { 6000.0, 9000.0, 0.0, -1000.0, static_cast<double>(NAN) }) {
+            CadenceGrid plain;
+            const int64_t t = plain.PlanNext(input(kStartQpc, lead)).output_target_qpc;
+            const int64_t now = t + 100000 - lead_ticks + tolerance + 1;
+            const CadenceGridPlan restart = plain.PlanNext(input(now, lead));
+            CHECK(restart.epoch_reason == PacingEpochReason::SourceLate && !restart.floor_restart);
+            CHECK(restart.output_target_qpc == now + lead_ticks);
+        }
+    }
+
     void TestOutputLateThreshold()
     {
         CadenceGrid grid;
@@ -1747,6 +1788,7 @@ int main()
     TestLateTolerance();
     TestSourceLateThreshold();
     TestSourceSlackExtendsTolerance();
+    TestFloorRestartLead();
     TestOutputLateThreshold();
     TestOldEvidenceIgnored();
     TestOlderOutputEvidence();

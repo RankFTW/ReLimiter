@@ -678,6 +678,12 @@ public:
     // bucket is cold or unknown. The source slack of a plan is L minus this
     // value.
     double MedianSampleUs(PacingRung rung, double fg_divisor) const noexcept;
+    // The early side of a warm bucket's lead, max(0, Q_{1−q}(X) − allowance_us),
+    // the mirror of L = Q_q + allowance: how soon after its release a frame of
+    // the bucket is ready at the least. 0 when the bucket is cold or unknown,
+    // or for a non-finite q or allowance. A held frame its GPU floor made
+    // late restarts the cadence on it (cadence_grid.h, floor_restart_lead_us).
+    double EarlyLeadUs(PacingRung rung, double fg_divisor, double quantile, double allowance_us) const noexcept;
     // Hold room: Q_q of R over the newest 256 hold-room samples of the FG
     // divisor, the interval at which a share q of the judged GPU queue wait
     // frames would have reached the GPU wait before their guarded release;

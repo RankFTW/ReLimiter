@@ -246,8 +246,9 @@ static void DrawPacingPipelineStatus() {
     // The GPU floor on held frames (developer A/B held_gpu_floor).
     if (has_status && status.render_handoff_held_floor)
         ImGui::TextDisabled("Render handoff GPU floor (held): render thread no earlier than %.2f ms before the GPU "
-            "finishes the previous frame | %u frames delayed",
-            status.render_handoff_gpu_lead_us / 1000.0, status.render_handoff_held_delayed);
+            "finishes the previous frame | %u frames delayed | %u restarts at the GPU's pace",
+            status.render_handoff_gpu_lead_us / 1000.0, status.render_handoff_held_delayed,
+            status.render_handoff_held_restarts);
     if (has_status && status.valid)
         ImGui::TextDisabled("Lead: %.2f ms (%s, %u samples%s) | Grid epoch: %u",
             status.lead_us / 1000.0, status.lead_warm ? "warm" : "warming",
@@ -663,7 +664,9 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "GPU finishes the previous frame. Frames released from the lead alone reach the driver close to "
         "the previous GPU end, where its own pacing inside Present holds the game and stalls the GPU. "
         "The lead samples of such frames also leave out the hold the driver measurably spent in that "
-        "call on the frame before. Watch long frames, GPU idle gaps and PC Latency; one setting per capture.");
+        "call on the frame before, and when the floor makes a frame late enough to restart the cadence, "
+        "the new output target is where such a frame is ready, not a full lead later, so the GPU is not "
+        "made to wait. Watch long frames, GPU idle gaps and PC Latency; one setting per capture.");
 
     static const char* const kSourcePlacementLabels[] = {"Marker", "Pre-Sleep", "Reflex driver limiter"};
     static_assert(IM_ARRAYSIZE(kSourcePlacementLabels) ==

@@ -255,6 +255,7 @@ std::atomic<uint32_t> s_status_render_handoff_limited{0};
 std::atomic<uint32_t> s_status_render_handoff_stalls{0};
 std::atomic<bool> s_status_render_handoff_held_floor{false};
 std::atomic<uint32_t> s_status_render_handoff_held_delayed{0};
+std::atomic<uint32_t> s_status_render_handoff_held_restarts{0};
 }
 
 static void PublishPacingStatus(const SchedulerPacingStatus& status) noexcept
@@ -316,6 +317,7 @@ static void PublishPacingStatus(const SchedulerPacingStatus& status) noexcept
     s_status_render_handoff_stalls.store(status.render_handoff_stalls, std::memory_order_relaxed);
     s_status_render_handoff_held_floor.store(status.render_handoff_held_floor, std::memory_order_relaxed);
     s_status_render_handoff_held_delayed.store(status.render_handoff_held_delayed, std::memory_order_relaxed);
+    s_status_render_handoff_held_restarts.store(status.render_handoff_held_restarts, std::memory_order_relaxed);
     s_status_sequence.store(sequence + 2, std::memory_order_release);
 }
 
@@ -384,6 +386,7 @@ bool Scheduler_ReadPacingStatus(SchedulerPacingStatus* status) noexcept
         copy.render_handoff_stalls = s_status_render_handoff_stalls.load(std::memory_order_relaxed);
         copy.render_handoff_held_floor = s_status_render_handoff_held_floor.load(std::memory_order_relaxed);
         copy.render_handoff_held_delayed = s_status_render_handoff_held_delayed.load(std::memory_order_relaxed);
+        copy.render_handoff_held_restarts = s_status_render_handoff_held_restarts.load(std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_acquire);
         if (s_status_sequence.load(std::memory_order_relaxed) != begin) continue;
         *status = copy;
@@ -1004,6 +1007,8 @@ static void FillControllerStatus(SchedulerPacingStatus* status) noexcept
     // planned frame is held, the key is on and the floor is known.
     status->render_handoff_held_floor = s_held_gpu_floor_applies && status->render_handoff_gpu_floor;
     status->render_handoff_held_delayed = static_cast<uint32_t>(s_held_floor_delayed_frames);
+    status->render_handoff_held_restarts =
+        static_cast<uint32_t>(s_source_stage.Statistics().gpu_floor_restarts);
     status->hold_overloaded = s_hold_feasibility.Overloaded();
     const LeadController& lead = s_source_stage.Lead();
     const LeadStatistics lead_statistics = lead.Statistics();

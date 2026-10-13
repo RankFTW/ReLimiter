@@ -185,6 +185,17 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     // planned the frame.
     const double median_x_us = lead_.MedianSampleUs(slack_rung, request.fg_divisor);
     input.source_slack_us = median_x_us > 0.0 ? (std::max)(0.0, lead_us - median_x_us) : 0.0;
+    // Developer A/B held_gpu_floor: a held frame whose arrival is its GPU
+    // floor is released where the GPU finishes the previous frame, so a
+    // restart the floor causes puts T where such a frame is ready at the
+    // least, not a full lead later (cadence_grid.h). Frames not held are never
+    // held at the output, and a source that arrives after its floor is late
+    // on its own: both restart on L.
+    if (request.held_gpu_floor && pipeline.rung != PacingRung::SourceOnly &&
+        request.earliest_release_qpc > arrival_qpc) {
+        input.floor_restart_lead_us = lead_.EarlyLeadUs(slack_rung, request.fg_divisor,
+            pipeline.lead_quantile, pipeline.allowance_us);
+    }
     input.mode = pipeline.mode;
     input.controller_generation = request.key.controller_generation;
     if (pipeline.mode == PacingTimingMode::Fixed) input.fixed = request.fixed;
@@ -210,6 +221,8 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     frame.lead_budget_limited = budget_limited;
     frame.epoch_started = grid_plan.epoch_reason;
     frame.grid_epoch_reason = snapshot.epoch_reason;
+    frame.gpu_floor_restart = grid_plan.floor_restart;
+    if (grid_plan.floor_restart) ++statistics_.gpu_floor_restarts;
 
     // Publish before the wait: PRESENT_START and the output executors never
     // wait for the owner.
