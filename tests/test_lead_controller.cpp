@@ -10,7 +10,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -2442,7 +2441,7 @@ void TestRenderHandoffOffset()
 // Report pairs (µs from frame n's RENDERSUBMIT_START), modelled on Gears of
 // War: E-Day FG 2× (GPU-bound, render thread held back) and its driver's
 // Sleep.
-HandoffBackPressureSample HeldBackPair()
+HandoffBackPressureSample LateSubmissionPair()
 {
     HandoffBackPressureSample pair{};
     pair.simulation_end_us = -4750.0;     // the simulation waited for the render thread
@@ -2468,50 +2467,38 @@ HandoffBackPressureSample StreamingPair()
     return pair;
 }
 
-// Held back: the GPU waited at most 1 ms and the frame's first work reached
-// the driver in the second half of its window, while the render thread came
-// straight from the previous frame or the game has shown that it streams. A
-// GPU that waited more than 1 ms (a hitch, or a late release) is not, and
-// neither is a render thread that streams.
-void TestHandoffHeldBack()
+// A pair streams when the frame's first work reached the driver in the first
+// half of its render thread's window (valid input only): a game that
+// submits its work as it renders. LEAD_HANDOFF_STREAM_PROOF such pairs
+// complete the stream proof.
+void TestHandoffStreams()
 {
-    for (const bool streams : { false, true }) {
-        CHECK(HandoffBackPressure_HeldBack(HeldBackPair(), streams));
-        CHECK(!HandoffBackPressure_HeldBack(StreamingPair(), streams));
-    }
-    // The first work in the first half of the window (streaming): not held.
-    HandoffBackPressureSample early = HeldBackPair();
-    early.first_submission_us = 8000.0;
-    CHECK(!HandoffBackPressure_HeldBack(early, true));
-    // At the middle of the window: held.
-    early.first_submission_us = 8575.0;
-    CHECK(HandoffBackPressure_HeldBack(early, true));
-    // The GPU waited more than 1 ms; exactly 1 ms is not waiting.
-    HandoffBackPressureSample idle = HeldBackPair();
-    idle.gpu_start_us = idle.previous_gpu_end_us + 1001.0;
-    CHECK(!HandoffBackPressure_HeldBack(idle, true));
-    idle.gpu_start_us = idle.previous_gpu_end_us + 1000.0;
-    CHECK(HandoffBackPressure_HeldBack(idle, true));
-    // A render thread that waited for the simulation and then got its first
-    // work out only at the end of the window: held back once the game has
-    // shown that it streams, never before (a game that submits everything
-    // at the end of its window).
-    HandoffBackPressureSample waited = HeldBackPair();
-    waited.simulation_end_us = waited.previous_render_free_us;
-    CHECK(!HandoffBackPressure_HeldBack(waited, false));
-    CHECK(HandoffBackPressure_HeldBack(waited, true));
-
-    HandoffBackPressureSample invalid = HeldBackPair();
-    invalid.gpu_start_us = kNaN;
-    CHECK(!HandoffBackPressure_HeldBack(invalid, true));
-    invalid = HeldBackPair();
-    invalid.render_end_us = invalid.render_start_us;
-    CHECK(!HandoffBackPressure_HeldBack(invalid, true));
-
-    // Streaming evidence: the first work in the first half of a valid window.
     CHECK(HandoffBackPressure_Streams(StreamingPair()));
-    CHECK(!HandoffBackPressure_Streams(HeldBackPair()));
+    CHECK(!HandoffBackPressure_Streams(LateSubmissionPair()));
+    // Before the middle of the window (8,575 µs): streaming; at it: not.
+    HandoffBackPressureSample early = LateSubmissionPair();
+    early.first_submission_us = 8000.0;
+    CHECK(HandoffBackPressure_Streams(early));
+    early.first_submission_us = 8575.0;
+    CHECK(!HandoffBackPressure_Streams(early));
+
+    HandoffBackPressureSample invalid = StreamingPair();
+    invalid.gpu_start_us = kNaN;
     CHECK(!HandoffBackPressure_Streams(invalid));
+    invalid = StreamingPair();
+    invalid.render_end_us = invalid.render_start_us;
+    CHECK(!HandoffBackPressure_Streams(invalid));
+
+    // The proof needs 32 streaming pairs; late pairs do not count.
+    auto controller = MakeController();
+    for (uint64_t index = 0; index < 40; ++index) controller->OnReportPair(7, 500 + index, LateSubmissionPair());
+    CHECK(!controller->HandoffStreams());
+    for (uint64_t index = 0; index < 31; ++index) controller->OnReportPair(7, 600 + index, StreamingPair());
+    CHECK(!controller->HandoffStreams());
+    controller->OnReportPair(7, 700, StreamingPair());
+    CHECK(controller->HandoffStreams());
+    controller->OnReportPair(0, 701, StreamingPair());
+    CHECK(controller->Statistics().invalid_inputs == 1);
 }
 
 // The GPU floor of frame n: Ĝ(n − 1) − (P/2 + F + σ). P: the median GPU
@@ -2621,413 +2608,6 @@ void TestRenderHandoffGpuFloor()
     CHECK(waiting->GpuFloorQpc(key_of(2042)) == 0);
 }
 
-// The anchor snapshot and the render-thread start target Ĝ(n − 1) − (P/2 + F):
-// the GPU floor without σ (it exists while σ is cold), with the same live
-// PRESENT_END bound, horizon, producer epoch and identity domain rules. The
-// pure function on the snapshot gives the controller's time.
-void TestGpuFloorAnchorAndRenderStartTarget()
-{
-    constexpr uint32_t kEpoch = 7;
-    constexpr double kGpuPeriod = 17000.0; // bin center 17,010 µs
-    constexpr double kStartUs = 17010.0 / 2.0 + 830.0; // P/2 + F
-    const auto key_of = [](uint64_t frame_id, uint32_t epoch = 7) {
-        PacingPlanKey key{};
-        key.identity_domain = PacingIdentityDomain::NvApiFrame;
-        key.producer_epoch = epoch;
-        key.controller_generation = 1;
-        key.frame_id = frame_id;
-        return key;
-    };
-    const auto gpu_end_us = [&](uint64_t frame_id) { return 100000.0 + kGpuPeriod * static_cast<double>(frame_id - 2000); };
-    const auto domain = static_cast<uint8_t>(PacingIdentityDomain::NvApiFrame);
-
-    auto controller = MakeController();
-    CHECK(!controller->GpuFloorAnchorSnapshot().valid);
-    for (uint64_t frame_id = 2000; frame_id <= 2032; ++frame_id) {
-        controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us(frame_id) - kGpuPeriod + 250.0),
-            Qpc(gpu_end_us(frame_id)), 14000.0);
-    }
-    // P is warm, F is not: no anchor and no target.
-    CHECK(!controller->GpuFloorAnchorSnapshot().valid);
-    CHECK(controller->GpuRenderStartQpc(key_of(2034)) == 0);
-    for (uint64_t index = 0; index < 32; ++index) controller->OnReportPair(kEpoch, 500 + index, StreamingPair());
-
-    GpuFloorAnchor anchor = controller->GpuFloorAnchorSnapshot();
-    CHECK(anchor.valid && anchor.identity_domain == domain && anchor.producer_epoch == kEpoch);
-    CHECK(anchor.gpu_end_frame == 2032 && anchor.gpu_end_qpc == Qpc(gpu_end_us(2032)));
-    CHECK(anchor.qpc_frequency == kFrequency);
-    CHECK_NEAR(anchor.period_us, 17010.0);
-    CHECK(anchor.present_gap_warm);
-    CHECK_NEAR(anchor.present_to_gpu_end_us, 14010.0);
-    CHECK_NEAR(anchor.start_us, kStartUs);
-    CHECK(!anchor.release_to_render_warm); // σ is cold: no GPU floor, but a target
-
-    // Frame 2034: Ĝ(2033) = G(2032) + 17,010; target = Ĝ − (P/2 + F).
-    const int64_t target = Qpc(gpu_end_us(2032) + 17010.0 - kStartUs);
-    CHECK(controller->GpuRenderStartQpc(key_of(2034)) == target);
-    CHECK(controller->GpuFloorQpc(key_of(2034)) == 0);
-    CHECK(gpu_floor::RenderStartQpc(anchor, domain, kEpoch, 2034, 0, 0) == target);
-    CHECK(gpu_floor::FloorQpc(anchor, domain, kEpoch, 2034, 0, 0) == 0);
-    // Frame 2033: the newest GPU end is its predecessor's.
-    CHECK(controller->GpuRenderStartQpc(key_of(2033)) == Qpc(gpu_end_us(2032) - kStartUs));
-
-    // Live bound: frame 2033 left its Present 2,000 µs later than usual
-    // (G − 14,000); Ĝ(2034) is at least that PRESENT_END + Q5 gap + P.
-    const double usual_present_end_us = gpu_end_us(2033) - 14000.0;
-    const int64_t bounded = Qpc(usual_present_end_us + 2000.0 + 14010.0 + 17010.0 - kStartUs);
-    CHECK(controller->GpuRenderStartQpc(key_of(2035), 2033, Qpc(usual_present_end_us + 2000.0)) == bounded);
-    CHECK(gpu_floor::RenderStartQpc(anchor, domain, kEpoch, 2035, 2033, Qpc(usual_present_end_us + 2000.0)) == bounded);
-    // An early PRESENT_END never lowers the report's prediction; one not newer
-    // than the newest GPU end, or of frame n itself, is no bound.
-    const int64_t reported = Qpc(gpu_end_us(2032) + 2.0 * 17010.0 - kStartUs);
-    CHECK(controller->GpuRenderStartQpc(key_of(2035), 2033, Qpc(usual_present_end_us - 5000.0)) == reported);
-    CHECK(controller->GpuRenderStartQpc(key_of(2035), 2032, Qpc(usual_present_end_us + 9000.0)) == reported);
-    CHECK(controller->GpuRenderStartQpc(key_of(2035), 2035, Qpc(usual_present_end_us + 9000.0)) == reported);
-
-    // Horizon: at most 8 frames between the newest GPU end and frame n − 1.
-    CHECK(controller->GpuRenderStartQpc(key_of(2041)) != 0);
-    CHECK(controller->GpuRenderStartQpc(key_of(2042)) == 0);
-    int64_t unused_prediction = 0;
-    CHECK(!gpu_floor::PredictGpuEnd(anchor, domain, kEpoch, 2043, 0, 0, &unused_prediction));
-    // Not for a frame at or before the newest GPU end, another producer epoch
-    // or identity domain.
-    CHECK(controller->GpuRenderStartQpc(key_of(2032)) == 0);
-    CHECK(controller->GpuRenderStartQpc(key_of(2034, kEpoch + 1)) == 0);
-    CHECK(gpu_floor::RenderStartQpc(anchor, domain, kEpoch + 1, 2034, 0, 0) == 0);
-    PacingPlanKey pcl = key_of(2034);
-    pcl.identity_domain = PacingIdentityDomain::PclFrame;
-    CHECK(controller->GpuRenderStartQpc(pcl) == 0);
-    CHECK(gpu_floor::RenderStartQpc(anchor, static_cast<uint8_t>(PacingIdentityDomain::PclFrame), kEpoch,
-        2034, 0, 0) == 0);
-    // An invalid snapshot predicts nothing.
-    GpuFloorAnchor invalid = anchor;
-    invalid.valid = false;
-    CHECK(gpu_floor::RenderStartQpc(invalid, domain, kEpoch, 2034, 0, 0) == 0);
-
-    // σ warm: the floor is the target less σ; both come from one snapshot.
-    for (uint64_t index = 1; index <= 32; ++index) {
-        const double source_us = static_cast<double>(index) * kInterval;
-        controller->OnSourceRelease(Start(index, PacingRung::SourceOnly, source_us));
-        controller->OnStageEvent(Event(index, Kind::RenderSubmitStart, source_us + 5000.0));
-    }
-    anchor = controller->GpuFloorAnchorSnapshot();
-    CHECK(anchor.release_to_render_warm);
-    CHECK_NEAR(anchor.release_to_render_us, 5010.0);
-    CHECK(controller->GpuRenderStartQpc(key_of(2034)) == target);
-    CHECK(controller->GpuFloorQpc(key_of(2034)) == Qpc(gpu_end_us(2032) + 17010.0 - kStartUs - 5010.0));
-
-    // A new producer epoch restarts the anchor; a lifecycle reset clears it.
-    controller->OnGpuRenderEnd(kEpoch + 1, 5000, Qpc(899000.0), Qpc(900000.0), 14000.0);
-    CHECK(!controller->GpuFloorAnchorSnapshot().valid);
-    CHECK(controller->GpuRenderStartQpc(key_of(5002, kEpoch + 1)) == 0);
-    controller->Reset(kFrequency);
-    CHECK(!controller->GpuFloorAnchorSnapshot().valid);
-}
-
-// A frame's own render-thread start hold (the RenderStartHold event) is
-// ReLimiter's wait: it leaves the frame's lead sample X once on every rung (no
-// sample below 0), its slack and σ; the first value of a frame wins.
-void TestRenderStartHoldExclusion()
-{
-    const auto hold_event = [](uint64_t grid_index, double at_us, double hold_us) {
-        PacingStageEvent event = Event(grid_index, Kind::RenderStartHold, at_us);
-        event.hold_ticks = static_cast<int64_t>(std::llround(hold_us * 10.0));
-        return event;
-    };
-
-    // Source only: X = a − s = 7,000, less the 3,000 hold; a hold longer than
-    // X leaves 0.
-    for (const double hold_us : { 0.0, 3000.0, 9000.0 }) {
-        auto controller = MakeController();
-        controller->OnSourceRelease(Start(1, PacingRung::SourceOnly, 10000.0));
-        if (hold_us > 0.0) {
-            controller->OnStageEvent(hold_event(1, 15000.0, hold_us));
-            if (hold_us == 3000.0) controller->OnStageEvent(hold_event(1, 15000.0, 1000.0)); // first wins
-        }
-        controller->OnStageEvent(Event(1, Kind::RenderSubmitStart, 15000.0));
-        controller->OnStageEvent(Event(1, Kind::MarkerArrival, 17000.0));
-        const LeadStatistics statistics = controller->Statistics();
-        CHECK_NEAR(statistics.last_sample_us, std::max(0.0, 7000.0 - hold_us));
-        CHECK(statistics.render_start_hold_samples == (hold_us > 0.0 ? 1u : 0u));
-        CHECK_NEAR(statistics.last_render_start_hold_us, hold_us);
-        CHECK(statistics.invalid_inputs == 0);
-    }
-
-    // Marker hold: X = a − s less the hold.
-    auto marker = MakeController();
-    marker->OnSourceRelease(Start(1, PacingRung::MarkerHold, 10000.0));
-    marker->OnStageEvent(hold_event(1, 15000.0, 3000.0));
-    marker->OnStageEvent(Event(1, Kind::MarkerArrival, 17000.0));
-    CHECK_NEAR(marker->Statistics().last_sample_us, 4000.0);
-
-    // GPU rungs: X = max(p, r − c) − s = 12,000, less the hold, and the slack
-    // (L = 0) judges the frame without it.
-    for (const PacingRung rung : { PacingRung::GpuQueueWait, PacingRung::FgInputWait }) {
-        auto controller = MakeController();
-        controller->OnSourceRelease(Start(1, rung, 10000.0));
-        controller->OnStageEvent(hold_event(1, 15000.0, 3000.0));
-        controller->OnStageEvent(Event(1, Kind::RenderSubmitStart, 15000.0));
-        controller->OnStageEvent(Event(1, Kind::PresentCall, 16000.0));
-        controller->OnStageEvent(Event(1, Kind::GpuReady, 22000.0));
-        controller->OnStageEvent(Event(1, Kind::OutputRelease, 22000.0));
-        const LeadStatistics statistics = controller->Statistics();
-        CHECK_NEAR(statistics.last_sample_us, 9000.0);
-        CHECK_NEAR(statistics.last_slack_us, -9000.0);
-        CHECK(statistics.render_start_hold_samples == 1);
-        CHECK(statistics.invalid_inputs == 0);
-    }
-
-    // The hold event may open a frame before its release; a non-positive hold
-    // is invalid.
-    auto early = MakeController();
-    early->OnStageEvent(hold_event(1, 15000.0, 3000.0));
-    early->OnSourceRelease(Start(1, PacingRung::SourceOnly, 10000.0));
-    early->OnStageEvent(Event(1, Kind::MarkerArrival, 17000.0));
-    CHECK_NEAR(early->Statistics().last_sample_us, 4000.0);
-    PacingStageEvent none = hold_event(2, 25000.0, 0.0);
-    early->OnStageEvent(none);
-    CHECK(early->Statistics().invalid_inputs == 1);
-
-    // σ: release → RENDERSUBMIT_START of frames not held, less their own
-    // hold (5,000 − 2,000 = 3,000 µs, bin center 3,010; 5,010 without holds).
-    constexpr uint32_t kEpoch = 7;
-    const auto sigma_us = [&](bool with_hold) {
-        auto controller = MakeController();
-        for (uint64_t frame_id = 2000; frame_id <= 2032; ++frame_id) {
-            const double end_us = 100000.0 + 17000.0 * static_cast<double>(frame_id - 2000);
-            controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(end_us - 17000.0 + 250.0), Qpc(end_us), 14000.0);
-        }
-        for (uint64_t index = 0; index < 32; ++index) controller->OnReportPair(kEpoch, 500 + index, StreamingPair());
-        for (uint64_t index = 1; index <= 32; ++index) {
-            const double source_us = static_cast<double>(index) * kInterval;
-            controller->OnSourceRelease(Start(index, PacingRung::SourceOnly, source_us));
-            if (with_hold) controller->OnStageEvent(hold_event(index, source_us + 5000.0, 2000.0));
-            controller->OnStageEvent(Event(index, Kind::RenderSubmitStart, source_us + 5000.0));
-        }
-        const GpuFloorAnchor anchor = controller->GpuFloorAnchorSnapshot();
-        return anchor.release_to_render_warm ? anchor.release_to_render_us : -1.0;
-    };
-    CHECK_NEAR(sigma_us(false), 5010.0);
-    CHECK_NEAR(sigma_us(true), 3010.0);
-}
-
-// While Reflex report pairs flow, a GPU-wait frame's lead sample waits for
-// its own pair; a held-back frame's sample then leaves out W = first
-// submission − RENDERSUBMIT_START − F. A pair that never comes lets the
-// sample count as measured when the frame closes. Frames not on a GPU wait,
-// and GPU-wait frames while no pairs flow, count at once.
-void TestHeldBackLeadCorrection()
-{
-    auto controller = MakeController();
-    // F = 830 µs and the stream proof from 32 streaming pairs of no pending
-    // frame; the newest pair is NvAPI frame 9000, so pairs flow up to 9016.
-    for (uint64_t index = 0; index < 32; ++index) controller->OnReportPair(7, 8000 + index, StreamingPair());
-    controller->OnReportPair(7, 9000, StreamingPair());
-    CHECK(controller->HandoffStreams());
-    CHECK(controller->Statistics().unmatched_report_pairs == 33);
-
-    // Frame 1 (NvAPI 9003): X = 30,000 µs waits for its pair, which shows it
-    // held back: W = 17,370 − 830 = 16,540 µs.
-    FeedGpuFrame(controller.get(), 1, PacingRung::FgInputWait, 30000.0, 1.0);
-    CHECK(controller->Statistics().samples == 0);
-    controller->OnReportPair(7, Key(1).frame_id, HeldBackPair());
-    CHECK(controller->Statistics().report_pairs == 1);
-    CHECK(controller->Statistics().held_back_frames == 1);
-    CHECK(controller->Statistics().samples == 1);
-    CHECK(controller->Statistics().held_back_corrected_samples == 1);
-    CHECK_NEAR(controller->Statistics().last_held_back_wait_us, 16540.0);
-    CHECK_NEAR(controller->Statistics().last_sample_us, 30000.0 - 16540.0);
-    // A second pair of the same frame changes nothing.
-    controller->OnReportPair(7, Key(1).frame_id, HeldBackPair());
-    CHECK(controller->Statistics().samples == 1);
-
-    // Frame 2: a streaming pair, the sample unchanged.
-    FeedGpuFrame(controller.get(), 2, PacingRung::FgInputWait, 30000.0, 1.0);
-    CHECK(controller->Statistics().samples == 1);
-    controller->OnReportPair(7, Key(2).frame_id, StreamingPair());
-    CHECK(controller->Statistics().samples == 2);
-    CHECK_NEAR(controller->Statistics().last_sample_us, 30000.0);
-
-    // Frame 3 gets no pair: its sample counts when it closes, 8 releases on.
-    FeedGpuFrame(controller.get(), 3, PacingRung::FgInputWait, 29000.0, 1.0);
-    CHECK(controller->Statistics().samples == 2);
-    for (uint64_t index = 4; index < 11; ++index) FeedMarkerFrame(controller.get(), index, PacingRung::SourceOnly, 5000.0);
-    CHECK(controller->Statistics().samples == 9); // frames 4–10 count at once (not a GPU wait)
-    CHECK(controller->Statistics().unpaired_lead_samples == 0);
-    FeedMarkerFrame(controller.get(), 11, PacingRung::SourceOnly, 5000.0);
-    CHECK(controller->Statistics().unpaired_lead_samples == 1);
-    CHECK(controller->Statistics().samples == 11);
-    CHECK_NEAR(controller->Statistics().last_sample_us, 5000.0);
-
-    // Beyond the pair horizon (NvAPI 9036 > 9006 + 16) pairs no longer flow:
-    // a GPU-wait frame counts at once.
-    FeedGpuFrame(controller.get(), 12, PacingRung::FgInputWait, 28000.0, 1.0);
-    CHECK(controller->Statistics().samples == 12);
-    CHECK_NEAR(controller->Statistics().last_sample_us, 28000.0);
-
-    // A handoff window reset drops a waiting sample.
-    controller->OnReportPair(7, Key(12).frame_id, StreamingPair());
-    FeedGpuFrame(controller.get(), 13, PacingRung::FgInputWait, 30000.0, 1.0);
-    const uint64_t before = controller->Statistics().samples;
-    controller->ResetBuckets();
-    controller->OnReportPair(7, Key(13).frame_id, HeldBackPair());
-    CHECK(controller->Statistics().samples == before);
-}
-
-// Developer A/B held_gpu_floor: the NVIDIA driver's hold inside the Present
-// call recorded under frame n (DriverPresentHold events; the longest call of
-// the frame wins) delays frame n + 1's first submission, so frame n + 1's lead
-// sample on a GPU wait leaves it out: max(q + W, H) in all, adding only
-// max(0, H − (q + W)). Nothing changes with the key off, without a hold of
-// frame n, or when frame n is not frame n + 1's predecessor; frame n's own
-// sample never changes. These frames use consecutive NvAPI frame IDs (Key()
-// skips).
-void TestDriverPresentHoldExclusion()
-{
-    const auto key_at = [](uint64_t index, uint64_t id_gap) {
-        PacingPlanKey key = Key(index);
-        key.frame_id = 9000 + index + id_gap;
-        return key;
-    };
-    const auto event_at = [&](uint64_t index, uint64_t id_gap, Kind kind, double at_us,
-        PacingPlanStatus status = PacingPlanStatus::Held) {
-        PacingStageEvent event = Event(index, kind, at_us, status);
-        event.key = key_at(index, id_gap);
-        return event;
-    };
-    const auto release = [&](LeadController* controller, uint64_t index, uint64_t id_gap, PacingRung rung,
-        double source_us, bool key_on) {
-        LeadFrameStart start = Start(index, rung, source_us);
-        start.key = key_at(index, id_gap);
-        start.lead_us = 20000.0;
-        start.driver_hold_exclusion = key_on;
-        controller->OnSourceRelease(start);
-    };
-    const auto hold = [&](LeadController* controller, uint64_t index, uint64_t id_gap, double hold_us) {
-        PacingStageEvent event = event_at(index, id_gap, Kind::DriverPresentHold, 30000.0);
-        event.hold_ticks = static_cast<int64_t>(std::llround(hold_us * 10.0));
-        controller->OnStageEvent(event);
-    };
-    // A GPU-wait frame with sample x_us (p halfway, r and the output at x_us).
-    const auto gpu_frame = [&](LeadController* controller, uint64_t index, uint64_t id_gap, bool key_on,
-        double x_us, std::initializer_list<double> own_holds = {}) {
-        const double source_us = static_cast<double>(index) * kInterval;
-        release(controller, index, id_gap, PacingRung::GpuQueueWait, source_us, key_on);
-        for (const double own_hold_us : own_holds) hold(controller, index, id_gap, own_hold_us);
-        controller->OnStageEvent(event_at(index, id_gap, Kind::PresentCall, source_us + x_us / 2.0));
-        controller->OnStageEvent(event_at(index, id_gap, Kind::GpuReady, source_us + x_us));
-        controller->OnStageEvent(event_at(index, id_gap, Kind::OutputRelease, source_us + x_us));
-    };
-
-    // Nothing else removed (GPU queue wait, no q, no pairs): the whole hold.
-    // Frame 1's own hold leaves its sample as it is and frame 2's by 3,000;
-    // frame 2's calls of 2,000, 4,000 and 1,000 µs keep the longest (4,000)
-    // for frame 3; frame 4 follows frame 3, which had none.
-    for (const bool key_on : { true, false }) {
-        auto controller = MakeController();
-        gpu_frame(controller.get(), 1, 0, key_on, 12000.0, { 3000.0 });
-        CHECK_NEAR(controller->Statistics().last_sample_us, 12000.0);
-        gpu_frame(controller.get(), 2, 0, key_on, 12000.0, { 2000.0, 4000.0, 1000.0 });
-        CHECK_NEAR(controller->Statistics().last_sample_us, key_on ? 9000.0 : 12000.0);
-        CHECK(controller->Statistics().driver_hold_corrected_samples == (key_on ? 1u : 0u));
-        CHECK_NEAR(controller->Statistics().last_driver_hold_us, key_on ? 3000.0 : 0.0);
-        gpu_frame(controller.get(), 3, 0, key_on, 12000.0);
-        CHECK_NEAR(controller->Statistics().last_sample_us, key_on ? 8000.0 : 12000.0);
-        gpu_frame(controller.get(), 4, 0, key_on, 12000.0);
-        CHECK_NEAR(controller->Statistics().last_sample_us, 12000.0);
-        CHECK(controller->Statistics().samples == 4);
-        CHECK(controller->Statistics().driver_hold_corrected_samples == (key_on ? 2u : 0u));
-        CHECK_NEAR(controller->Statistics().last_driver_hold_us, key_on ? 4000.0 : 0.0);
-        CHECK(controller->Statistics().invalid_inputs == 0);
-    }
-
-    // A hold that arrives before its frame's release counts the same, and a
-    // hold longer than the sample leaves 0.
-    auto early = MakeController();
-    hold(early.get(), 1, 0, 20000.0);
-    gpu_frame(early.get(), 1, 0, true, 12000.0);
-    gpu_frame(early.get(), 2, 0, true, 12000.0);
-    CHECK_NEAR(early->Statistics().last_sample_us, 0.0);
-    CHECK(early->Statistics().driver_hold_corrected_samples == 1);
-
-    // The hold must be the immediate predecessor's: a gap in the NvAPI frame
-    // IDs (frame 2 is not frame 1 + 1) leaves the sample whole.
-    auto gap = MakeController();
-    gpu_frame(gap.get(), 1, 0, true, 12000.0, { 3000.0 });
-    gpu_frame(gap.get(), 2, 1, true, 12000.0);
-    CHECK_NEAR(gap->Statistics().last_sample_us, 12000.0);
-    CHECK(gap->Statistics().driver_hold_corrected_samples == 0);
-
-    // Source-only frames keep their sample: only GPU waits take the hold out.
-    auto source_only = MakeController();
-    release(source_only.get(), 1, 0, PacingRung::SourceOnly, 10000.0, true);
-    hold(source_only.get(), 1, 0, 3000.0);
-    source_only->OnStageEvent(event_at(1, 0, Kind::MarkerArrival, 15000.0));
-    release(source_only.get(), 2, 0, PacingRung::SourceOnly, 20000.0, true);
-    source_only->OnStageEvent(event_at(2, 0, Kind::MarkerArrival, 25000.0));
-    CHECK_NEAR(source_only->Statistics().last_sample_us, 5000.0);
-    CHECK(source_only->Statistics().driver_hold_corrected_samples == 0);
-
-    // A non-positive hold is an invalid input.
-    auto invalid = MakeController();
-    hold(invalid.get(), 1, 0, 0.0);
-    CHECK(invalid->Statistics().invalid_inputs == 1);
-
-    // FG input wait with q (TestSimulationRenderQueue's frame 2: X = 17,000,
-    // q = 4,000): a hold up to q adds nothing, a longer one only the excess,
-    // so the sample is X − max(q, H).
-    for (const double hold_us : { 0.0, 3000.0, 4000.0, 5000.0, 6500.0 }) {
-        for (const bool key_on : { true, false }) {
-            auto controller = MakeController();
-            const auto fg_frame = [&](uint64_t index, double source, double simulation_end, double submit,
-                double present, double ready) {
-                release(controller.get(), index, 0, PacingRung::FgInputWait, source, key_on);
-                if (index == 1 && hold_us > 0.0) hold(controller.get(), 1, 0, hold_us);
-                controller->OnStageEvent(event_at(index, 0, Kind::SimulationEnd, simulation_end));
-                controller->OnStageEvent(event_at(index, 0, Kind::RenderSubmitStart, submit));
-                controller->OnStageEvent(event_at(index, 0, Kind::PresentCall, present));
-                controller->OnStageEvent(event_at(index, 0, Kind::GpuReady, ready));
-                controller->OnStageEvent(event_at(index, 0, Kind::OutputRelease, ready, PacingPlanStatus::Late));
-            };
-            fg_frame(1, 10000.0, 12000.0, 12100.0, 18000.0, 21000.0);
-            controller->OnStageEvent(event_at(1, 0, Kind::PresentEnd, 26000.0));
-            fg_frame(2, 20000.0, 22000.0, 26500.0, 32000.0, 37000.0);
-            const LeadStatistics statistics = controller->Statistics();
-            CHECK_NEAR(statistics.last_queue_us, 4000.0);
-            CHECK_NEAR(statistics.last_sample_us, key_on ? 17000.0 - std::max(4000.0, hold_us) : 13000.0);
-            const bool corrected = key_on && hold_us > 4000.0;
-            CHECK(statistics.driver_hold_corrected_samples == (corrected ? 1u : 0u));
-            CHECK_NEAR(statistics.last_driver_hold_us, corrected ? hold_us : 0.0);
-        }
-    }
-
-    // Held-back frame (TestHeldBackLeadCorrection's W = 16,540 µs of a
-    // 30,000 µs sample): a hold up to W adds nothing, a longer one only the
-    // excess, so the sample is X − max(W, H).
-    for (const double hold_us : { 0.0, 10000.0, 20000.0 }) {
-        for (const bool key_on : { true, false }) {
-            auto controller = MakeController();
-            for (uint64_t index = 0; index < 32; ++index) controller->OnReportPair(7, 8000 + index, StreamingPair());
-            controller->OnReportPair(7, 9000, StreamingPair());
-            gpu_frame(controller.get(), 1, 0, key_on, 30000.0);
-            controller->OnReportPair(7, key_at(1, 0).frame_id, StreamingPair());
-            CHECK_NEAR(controller->Statistics().last_sample_us, 30000.0);
-            if (hold_us > 0.0) hold(controller.get(), 1, 0, hold_us);
-            gpu_frame(controller.get(), 2, 0, key_on, 30000.0);
-            CHECK(controller->Statistics().samples == 1); // waits for its pair
-            controller->OnReportPair(7, key_at(2, 0).frame_id, HeldBackPair());
-            const LeadStatistics statistics = controller->Statistics();
-            CHECK(statistics.samples == 2);
-            CHECK(statistics.held_back_corrected_samples == 1);
-            CHECK_NEAR(statistics.last_held_back_wait_us, 16540.0);
-            CHECK_NEAR(statistics.last_sample_us, key_on ? 30000.0 - std::max(16540.0, hold_us) : 30000.0 - 16540.0);
-            const bool corrected = key_on && hold_us > 16540.0;
-            CHECK(statistics.driver_hold_corrected_samples == (corrected ? 1u : 0u));
-            CHECK_NEAR(statistics.last_driver_hold_us, corrected ? hold_us : 0.0);
-        }
-    }
-}
-
 int main()
 {
     std::printf("sizeof(LeadController) = %zu bytes\n", sizeof(LeadController));
@@ -3083,12 +2663,8 @@ int main()
     TestReleaseHeadroomBounds();
     TestReleaseHeadroomWideningFades();
     TestRenderHandoffOffset();
-    TestHandoffHeldBack();
+    TestHandoffStreams();
     TestRenderHandoffGpuFloor();
-    TestGpuFloorAnchorAndRenderStartTarget();
-    TestRenderStartHoldExclusion();
-    TestHeldBackLeadCorrection();
-    TestDriverPresentHoldExclusion();
 
     if (s_failures != 0) {
         std::fprintf(stderr, "%d lead controller checks failed\n", s_failures);

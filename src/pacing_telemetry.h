@@ -14,7 +14,7 @@ void PacingTelemetry_PushPresent(const PacingPresentRecord& record) noexcept; //
 void PacingTelemetry_PushGate(const PacingGateRecord& record) noexcept;       // GPU deadline worker
 void PacingTelemetry_PushReady(const PacingReadyRecord& record) noexcept;     // readiness or GPU deadline worker
 void PacingTelemetry_PushReflex(const PacingReflexRecord& record) noexcept;   // scheduler owner
-void PacingTelemetry_PushWait(const PacingWaitRecord& record) noexcept;       // render thread hold, async marker hook
+void PacingTelemetry_PushWait(const PacingWaitRecord& record) noexcept;       // async marker hook
 void PacingTelemetry_PushDisplay(const PacingDisplaySample& sample) noexcept; // ETW collector thread
 
 struct IDXGISwapChain;

@@ -27,7 +27,7 @@ PHASE3_ROW_COLUMNS = 132   # Phase 3 before Q16
 Q16_ROW_COLUMNS = 133      # + gate_pre_wait_qpc
 PHASE4_ROW_COLUMNS = 136   # + source_placement, pre_sleep_end_qpc, pre_sleep_margin_us
 WAIT_START_ROW_COLUMNS = 138  # + source_wait_start_qpc, pre_sleep_start_qpc (2026-10-08)
-WAIT_ROW_COLUMNS = 141        # + render_start_hold_us, async_marker_wait_us, async_marker_wait_type (current)
+WAIT_ROW_COLUMNS = 140        # + async_marker_wait_us, async_marker_wait_type (current)
 PHASE3_EVENT_COLUMNS = 86  # unchanged since Phase 2: new event kinds only
 LEGACY_SCHEDULER_HEADER = ["frame_id", "timestamp_us", "actual_frame_time_us"]
 FRAMEVIEW_HEADER = [
@@ -81,7 +81,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(len(inspector.CURRENT_PACING_HEADER), WAIT_ROW_COLUMNS)
         self.assertEqual(len(inspector.CURRENT_PACING_EVENTS_HEADER), PHASE3_EVENT_COLUMNS)
         self.assertEqual(inspector.schema_profile("relimiter_pacing", inspector.CURRENT_PACING_HEADER),
-                         "current-source-141")
+                         "current-source-140")
         self.assertEqual(inspector.schema_profile("relimiter_pacing_events",
                                                   inspector.CURRENT_PACING_EVENTS_HEADER), "current-source-86")
 
@@ -134,9 +134,9 @@ class ProfileTests(unittest.TestCase):
         # The wait starts (gated holds, 2026-10-08) are appended after them.
         self.assertEqual(inspector.CURRENT_PACING_HEADER[PHASE4_ROW_COLUMNS:WAIT_START_ROW_COLUMNS],
                          ["source_wait_start_qpc", "pre_sleep_start_qpc"])
-        # The render-thread start hold and async marker waits are appended after them.
+        # The async marker waits are appended after them.
         self.assertEqual(inspector.CURRENT_PACING_HEADER[WAIT_START_ROW_COLUMNS:],
-                         ["render_start_hold_us", "async_marker_wait_us", "async_marker_wait_type"])
+                         ["async_marker_wait_us", "async_marker_wait_type"])
         self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER[PHASE1_EVENT_COLUMNS - 1],
                          "overflowed_present_count")
         self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER[PHASE1_EVENT_COLUMNS:], ["reason"])

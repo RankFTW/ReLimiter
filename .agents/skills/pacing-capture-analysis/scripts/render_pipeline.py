@@ -39,14 +39,11 @@ from both. Per segment it reports:
   rows; analyze_pacing.py stays authoritative for whole-capture metrics) and
   PC Latency;
 - grid epochs per minute by reason;
-- when the file has them (2026-10-12 and later), the waits of the render
-  thread and the driver: quantiles over the segment's frames of
-  render_start_hold_us (ReLimiter's own hold at RENDERSUBMIT_START, the
-  render_start_hold A/B; 0 when it applied without waiting) and
-  async_marker_wait_us (the longest NvAPI_D3D12_SetAsyncFrameMarker call of the
-  frame, inside which the driver paces with DLSS-G under the Reflex Sleep
-  bypass), each with the number of frames that have it, and the async marker
-  type of the frames' longest calls.
+- when the file has them (2026-10-12 and later), the driver's wait inside
+  NvAPI_D3D12_SetAsyncFrameMarker: quantiles over the segment's frames of
+  async_marker_wait_us (the longest call of the frame, inside which the driver
+  paces with DLSS-G under the Reflex Sleep bypass) with the number of frames
+  that have it, and the async marker type of the frames' longest calls.
 
 --replay-floor ANCHOR[+-MS] replays a release floor at a marker of frame n - 1
 (rs_start, rs_end, present_start or present_end) sequentially: a frame whose
@@ -124,7 +121,7 @@ class Frame:
     display: float | None
     pcl_ms: float | None
     m: dict[str, float]
-    waits: dict[str, float] = field(default_factory=dict)  # ms: render_start_hold, async_marker_wait
+    waits: dict[str, float] = field(default_factory=dict)  # ms: async_marker_wait
     async_type: int | None = None                          # marker type of the longest async marker call
 
 
@@ -174,11 +171,9 @@ def load(path: Path, events_path: Path | None = None) -> Capture:
             if any(name not in markers for name in CPU_MARKERS):  # GPU markers may be absent
                 continue
             waits = {}
-            for name, column in (("render_start_hold", "render_start_hold_us"),
-                                 ("async_marker_wait", "async_marker_wait_us")):
-                value = _float(row, column)
-                if value is not None and value >= 0:
-                    waits[name] = value / 1000.0
+            value = _float(row, "async_marker_wait_us")
+            if value is not None and value >= 0:
+                waits["async_marker_wait"] = value / 1000.0
             async_type = _float(row, "async_marker_wait_type") if "async_marker_wait" in waits else None
             frames.append(Frame(int(fid), int(rung), s / per_ms, target / per_ms - lead / 1000.0, target / per_ms,
                                 (_float(row, "interval_us") or 0.0) / 1000.0,
@@ -398,19 +393,15 @@ def segment_report(capture: Capture, segmenter: Segmenter, segment: str,
 
 
 def _waits(frames: list[Frame]) -> dict[str, dict[str, Any]]:
-    """Quantiles (ms) of the wait columns over the frames that have them: render_start_hold_us (0 = the hold
-    applied without waiting) and async_marker_wait_us with the marker types of the longest calls. Empty for a
-    file without the columns or frames without a record."""
+    """Quantiles (ms) of async_marker_wait_us over the frames that have it, with the marker types of the
+    longest calls. Empty for a file without the column or frames without a record."""
     waits: dict[str, dict[str, Any]] = {}
-    for name in ("render_start_hold", "async_marker_wait"):
-        values = [f.waits[name] for f in frames if name in f.waits]
-        if not values:
-            continue
-        waits[name] = _q(values)
-        if name == "async_marker_wait":
-            counts = Counter(ASYNC_MARKER_TYPES.get(f.async_type, str(f.async_type))
-                             for f in frames if "async_marker_wait" in f.waits and f.async_type is not None)
-            waits[name]["types"] = dict(counts)
+    values = [f.waits["async_marker_wait"] for f in frames if "async_marker_wait" in f.waits]
+    if values:
+        waits["async_marker_wait"] = _q(values)
+        counts = Counter(ASYNC_MARKER_TYPES.get(f.async_type, str(f.async_type))
+                         for f in frames if "async_marker_wait" in f.waits and f.async_type is not None)
+        waits["async_marker_wait"]["types"] = dict(counts)
     return waits
 
 

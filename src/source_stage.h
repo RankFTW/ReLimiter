@@ -129,21 +129,13 @@ struct SourceStageRequest {
     uint64_t pre_wait_index = 0;
     int64_t pre_wait_start_qpc = 0;
     int64_t pre_wait_end_qpc = 0;
-    // Render handoff limit and GPU floor: the frame is released no earlier
-    // than this QPC; 0 = none. The grid judges the frame as arriving at
-    // max(now, earliest), so a bound beyond S_n restarts the cadence like any
-    // late source, and the wait runs to max(S_n, earliest). The render-thread
-    // offset (w + d) applies to frames not held only (on held frames it moved
-    // the game's simulation into its render thread's submission); the GPU
-    // floor alone applies to held frames under the developer A/B key
-    // held_gpu_floor.
+    // Render handoff limit: the frame is
+    // released no earlier than this QPC; 0 = no limit. The grid judges the
+    // frame as arriving at max(now, earliest), so a limit beyond S_n restarts
+    // the cadence like any late source, and the wait runs to max(S_n,
+    // earliest). Frames not held only: on held frames the render-thread
+    // offset moved the game's simulation into its render thread's submission.
     int64_t earliest_release_qpc = 0;
-    // Developer A/B (held_gpu_floor): the lead leaves the previous frame's
-    // driver Present hold out of a GPU-rung frame's sample (lead_controller.h),
-    // and a held frame whose arrival is this earliest release restarts a late
-    // cadence on its bucket's early lead (LeadController::EarlyLeadUs) instead
-    // of L.
-    bool held_gpu_floor = false;
 };
 
 struct SourceStageFrame {
@@ -162,9 +154,6 @@ struct SourceStageFrame {
     uint32_t stall_injected_us = 0;
     bool lead_budget_limited = false; // the lead was clamped to its 3 I limit
     bool handoff_limited = false;     // the render handoff limit moved the release past S_n
-    // held_gpu_floor: the GPU floor made this held frame late and the
-    // cadence restarted on the bucket's early lead (cadence_grid.h).
-    bool gpu_floor_restart = false;
 };
 
 // Owner-local counters, cumulative.
@@ -176,7 +165,6 @@ struct SourceStageStatistics {
     uint64_t plan_publish_failures = 0;
     uint64_t duplicate_keys = 0; // same key planned again: not republished (one claim per plan)
     uint64_t clamped_waits = 0;
-    uint64_t gpu_floor_restarts = 0; // SourceStageFrame::gpu_floor_restart
 };
 
 class SourceStage {
@@ -201,7 +189,7 @@ public:
     {
         lead_.OnGpuActiveTime(producer_epoch, frame_id, gpu_active_us, gpu_start_qpc);
     }
-    // A Reflex report pair (LeadController::OnReportPair): the held-back wait
+    // A Reflex report pair (LeadController::OnReportPair): the stream proof
     // and the GPU floor's F.
     void OnReportPair(uint32_t producer_epoch, uint64_t frame_id,
         const HandoffBackPressureSample& sample) noexcept

@@ -87,11 +87,10 @@ CURRENT_PACING_HEADER = PACING_FIXED_RAW_HEADER + PACING_FIXED_DERIVED_HEADER + 
     # injected stall) and of the pre-Sleep wait (ends at pre_sleep_end_qpc), empty
     # when none: they rebuild the gated holds of lockstep engines
     "source_wait_start_qpc", "pre_sleep_start_qpc",
-    # Render-thread start hold A/B and the driver's in-Present pacing: this real
-    # frame's own start hold in µs (0 = applied without waiting, empty = not
-    # applied), and the longest NvAPI_D3D12_SetAsyncFrameMarker call carrying the
-    # frame's NvAPI frame ID in µs with its marker type (empty when none)
-    "render_start_hold_us", "async_marker_wait_us", "async_marker_wait_type",
+    # The driver's in-Present pacing: the longest NvAPI_D3D12_SetAsyncFrameMarker
+    # call carrying the frame's NvAPI frame ID in µs with its marker type (empty
+    # when none)
+    "async_marker_wait_us", "async_marker_wait_type",
 ]
 
 CURRENT_PACING_EVENTS_HEADER = [

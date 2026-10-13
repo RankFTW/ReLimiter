@@ -984,7 +984,7 @@ class Phase4PlacementTests(TemporaryDirectoryTest):
     def test_governor_stretch_and_placement(self):
         rows_path, events_path = self.capture()
         report = pacing.analyze_capture(rows_path, events_path=events_path)
-        self.assertEqual(report["input"]["schema_profile"], "current-source-141")
+        self.assertEqual(report["input"]["schema_profile"], "current-source-140")
         controllers = report["controllers"]
         self.assertEqual((controllers["frames"], controllers["governed_frames"]), (8, 7))
         self.assertEqual(controllers["governor"], {
@@ -1050,7 +1050,7 @@ class InspectorTests(TemporaryDirectoryTest):
 
     def test_kind_detection_and_profiles(self):
         cases = [
-            (inspector.CURRENT_PACING_HEADER, "relimiter_pacing", "current-source-141"),
+            (inspector.CURRENT_PACING_HEADER, "relimiter_pacing", "current-source-140"),
             (inspector.CURRENT_PACING_EVENTS_HEADER, "relimiter_pacing_events", "current-source-86"),
             (inspector.CURRENT_PACING_HEADER[:138], "relimiter_pacing", "historical-source-138"),
             (inspector.CURRENT_PACING_HEADER[:136], "relimiter_pacing", "historical-source-136"),
@@ -1075,7 +1075,7 @@ class InspectorTests(TemporaryDirectoryTest):
         # phase1_purge_design.md section 3: append-only after the Phase 0 tables.
         rows = column_names("PACING_ROW_COLUMNS")
         events = column_names("PACING_EVENT_COLUMNS")
-        self.assertEqual((len(rows), len(events)), (141, 86))
+        self.assertEqual((len(rows), len(events)), (140, 86))
         self.assertEqual(rows[110:122], [
             "clock_map_offset_us", "predicted_render_us", "pcl_status", "pcl_input_ping_qpc",
             "pcl_effective_sim_start_qpc", "pcl_i2fs_us", "pcl_fs2p_us", "pcl_p2d_us", "pcl_total_us",
@@ -1109,8 +1109,8 @@ class InspectorTests(TemporaryDirectoryTest):
         self.assertEqual(rows[133:136], list(pacing.PLACEMENT_COLUMNS))
         # Gated holds (2026-10-08): the wait starts after the placement columns.
         self.assertEqual(rows[136:138], ["source_wait_start_qpc", "pre_sleep_start_qpc"])
-        # Render-thread start hold A/B and the driver's in-Present pacing (2026-10-12).
-        self.assertEqual(rows[138:], ["render_start_hold_us", "async_marker_wait_us", "async_marker_wait_type"])
+        # The driver's in-Present pacing (2026-10-12).
+        self.assertEqual(rows[138:], ["async_marker_wait_us", "async_marker_wait_type"])
 
     def test_enum_tables_match_production(self):
         # C++ and Python share these enum values; the names follow src/pacing_core_types.h.

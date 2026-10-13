@@ -214,13 +214,6 @@ struct SchedulerPacingStatus {
 	double render_handoff_gpu_lead_us = 0.0;
 	uint32_t render_handoff_limited = 0;   // frames the limit released after S, cumulative
 	uint32_t render_handoff_stalls = 0;    // waits that ended without the handoff, cumulative
-	// Held-frame GPU floor (developer A/B held_gpu_floor): the newest planned
-	// frame was held under the key and the GPU floor above is known; held
-	// frames the floor released after S, and cadence restarts the floor
-	// caused on the early lead (SourceStageFrame::gpu_floor_restart), cumulative.
-	bool render_handoff_held_floor = false;
-	uint32_t render_handoff_held_delayed = 0;
-	uint32_t render_handoff_held_restarts = 0;
 };
 
 // Any thread, nonblocking. False when no consistent status is available.

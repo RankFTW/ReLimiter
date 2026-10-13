@@ -588,15 +588,11 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
         QpcIf(line, row.joined.has_source, row.joined.source.source_wait_start_qpc); } },
     { "pre_sleep_start_qpc", [](CsvLine* line, const PacingCsvRow& row) {
         QpcIf(line, row.joined.has_source, row.joined.source.pre_sleep_start_qpc); } },
-    // Appended (render-thread start hold A/B and the driver's in-Present
-    // pacing): this real frame's own render-thread start hold in µs (0 when
-    // the hold applied without waiting; empty when it did not apply), the
-    // longest NvAPI_D3D12_SetAsyncFrameMarker call carrying this frame's NvAPI
+    // Appended (the driver's in-Present pacing): the longest
+    // NvAPI_D3D12_SetAsyncFrameMarker call carrying this real frame's NvAPI
     // frame ID in µs and that call's marker type (empty when none was seen).
     // Joined by NvAPI frame ID within the producer epoch, like the Reflex
     // fields.
-    { "render_start_hold_us", [](CsvLine* line, const PacingCsvRow& row) {
-        DecimalIf(line, row.joined.has_wait && row.joined.wait.has_hold, row.joined.wait.hold_us); } },
     { "async_marker_wait_us", [](CsvLine* line, const PacingCsvRow& row) {
         DecimalIf(line, row.joined.has_wait && row.joined.wait.has_async, row.joined.wait.async_us); } },
     { "async_marker_wait_type", [](CsvLine* line, const PacingCsvRow& row) {

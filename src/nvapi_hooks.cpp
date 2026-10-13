@@ -20,7 +20,6 @@
 #include "native_present_gate.h"
 #include "presentation_gate.h"
 #include "pacing_telemetry.h"
-#include "pacing_resolver.h"
 #include "reflex_clock_map.h"
 #include "runtime_lifecycle.h"
 #include "wake_guard.h"
@@ -483,24 +482,6 @@ static bool SafeCopySleepModeParams(
     __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-// The reflex_markers_optimize override. True when bUseMarkersToOptimize is to
-// be forwarded as false. Logs once per change of the effective value; the
-// callers pass the game's requested value for the log line.
-static bool MarkersOptimizeForcedOff(uint8_t game_requested) noexcept {
-    static std::atomic<bool> s_forced{false};
-    const bool off = g_reflex_markers_optimize_off.load(std::memory_order_relaxed);
-    if (off != s_forced.load(std::memory_order_relaxed) &&
-        s_forced.exchange(off, std::memory_order_relaxed) != off) {
-        if (off) {
-            LOG_INFO("NvAPI: Reflex markers optimization forced off (game requested %u)",
-                game_requested ? 1u : 0u);
-        } else {
-            LOG_INFO("NvAPI: Reflex markers optimization back to the game's value");
-        }
-    }
-    return off;
-}
-
 static NvAPI_Status SafeInvokeSleep(IUnknown* device) noexcept
 {
     if (!s_orig_sleep) return NVAPI_OK;
@@ -551,13 +532,6 @@ static bool SafeReadAsyncFrameMarker(
         return true;
     }
     __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
-}
-
-// Reflex Sleep bypass of this call: Hook_Sleep skips the driver's Sleep, and
-// the render-thread start hold applies, only while it holds.
-static bool ReflexSleepBypassed() noexcept {
-    return NvAPI_ShouldBypassSleep(g_reflex_sleep_bypass.load(std::memory_order_relaxed),
-        g_user_target_fps.load(std::memory_order_relaxed), Scheduler_PacesSource());
 }
 
 // The newest NvAPI_D3D_SetLatencyMarker frame ID of the game itself (not
@@ -624,7 +598,7 @@ static void DrainDeferredMarkers(
     }
 }
 
-// ── Hook: SetSleepMode — capture game params, forward them (limiter interval and markers override on a copy) ──
+// ── Hook: SetSleepMode — capture game params, forward unmodified ──
 static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_PARAMS* params) {
     RuntimeCallbackGuard callback;
     if (callback.IsStopping())
@@ -687,19 +661,13 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
     }
 
     // While the Reflex driver limiter is applied, the game's own call
-    // would clear it: forward a copy with ReLimiter's interval instead.
-    // reflex_markers_optimize=off forwards a copy with bUseMarkersToOptimize
-    // cleared, in the same single driver call. The game's parameters above
-    // stay captured, unchanged, for the restore.
-    if (params_valid && params_device.identity.device) {
-        const uint32_t limiter_us = g_driver_limiter_interval_us.load(std::memory_order_relaxed);
-        const bool markers_off = MarkersOptimizeForcedOff(params_snapshot.bUseMarkersToOptimize);
-        if (limiter_us != 0 || markers_off) {
-            NV_SET_SLEEP_MODE_PARAMS forwarded = params_snapshot;
-            if (limiter_us != 0) forwarded.minimumIntervalUs = limiter_us;
-            if (markers_off) forwarded.bUseMarkersToOptimize = 0;
-            return SafeInvokeSetSleepMode(pDev, &forwarded);
-        }
+    // would clear it: forward a copy with ReLimiter's interval instead. The
+    // game's parameters above stay captured for the restore.
+    const uint32_t limiter_us = g_driver_limiter_interval_us.load(std::memory_order_relaxed);
+    if (limiter_us != 0 && params_valid && params_device.identity.device) {
+        NV_SET_SLEEP_MODE_PARAMS limited = params_snapshot;
+        limited.minimumIntervalUs = limiter_us;
+        return SafeInvokeSetSleepMode(pDev, &limited);
     }
     // Forward game's params unmodified.
     return SafeInvokeSetSleepMode(pDev, params);
@@ -723,7 +691,8 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
         // The bypass is decided once per call, before the pre-wait: the
         // pre-Sleep margin is learned separately with and without the
         // driver's Sleep after the hook.
-        const bool bypass = ReflexSleepBypassed();
+        const bool bypass = NvAPI_ShouldBypassSleep(g_reflex_sleep_bypass.load(std::memory_order_relaxed),
+            g_user_target_fps.load(std::memory_order_relaxed), Scheduler_PacesSource());
         // Pre-Sleep placement: record the Sleep on the presenting
         // device, then wait toward the next source target before the driver
         // Sleep. The owner is held only to plan and to record the wait end,
@@ -835,34 +804,15 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
     LARGE_INTEGER present_start_forward_qpc{};
     if (marker_params.markerType == PRESENT_START && !from_rtss)
         QueryPerformanceCounter(&present_start_forward_qpc);
-    // Render-thread start hold (developer A/B key render_start_hold): a direct
-    // RENDERSUBMIT_START waits for the GPU-anchored target while ReLimiter
-    // paces the source and the Reflex Sleep is bypassed, when the frame's
-    // producer epoch and identity domain match the published anchor and its
-    // target exists (render_handoff.h). Decided before the first forward: the
-    // marker then reaches the driver after the hold, so the driver and the
-    // Reflex reports see the real start.
-    const bool order_after_wait = g_marker_forward_after_wait.load(std::memory_order_relaxed);
-    int64_t start_hold_target_qpc = 0;
-    bool start_hold = false;
-    if (marker_params.markerType == RENDERSUBMIT_START && !from_rtss && marker_device.identity.device &&
-        PacingPipeline_GetConfig().render_start_hold && !PCL_MarkersFlowing() && ReflexSleepBypassed() &&
-        !IsNvSmoothMotionActive() && NvAPI_IsFeedbackDeviceCurrent(marker_device.identity)) {
-        LARGE_INTEGER hold_now{};
-        QueryPerformanceCounter(&hold_now);
-        start_hold = RenderHandoff_RenderStartTarget(static_cast<uint8_t>(PacingIdentityDomain::NvApiFrame),
-            marker_device.identity.producer_epoch, marker_params.frameID, hold_now.QuadPart,
-            &start_hold_target_qpc);
-    }
     // Forward to driver FIRST — Reflex's JIT pacing depends on accurate
     // marker timing. Any work we do before forwarding shifts the driver's
     // perception of pipeline stage boundaries and degrades latency.
     // marker_forward_order=after_wait instead forwards direct
     // immediate markers on exit, after any source wait, as the PCL path does:
-    // the driver (and frame generation) then sees the paced release. A
-    // RENDERSUBMIT_START the start hold applies to is forwarded after the hold.
-    const bool forward_after_wait = start_hold || (!from_rtss &&
-        IsImmediateTimingMarker(marker_params.markerType) && order_after_wait);
+    // the driver (and frame generation) then sees the paced release.
+    const bool forward_after_wait = !from_rtss &&
+        IsImmediateTimingMarker(marker_params.markerType) &&
+        g_marker_forward_after_wait.load(std::memory_order_relaxed);
     NvAPI_Status result = NVAPI_OK;
     bool forwarded = false;
     // Every path returns through forward(): exactly one driver call per marker.
@@ -952,49 +902,12 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
     // the next SIMULATION_START owns the scheduler (or waits for this
     // handoff), and neither step blocks.
     if (marker_params.markerType == RENDERSUBMIT_START && !from_rtss && !PCL_MarkersFlowing()) {
-        const PacingPlanKey submit_key{PacingIdentityDomain::NvApiFrame,
-            marker_device.identity.producer_epoch,
-            FrameTimeline_CurrentControllerGeneration(), marker_params.frameID};
-        int64_t hold_ticks = 0;
-        int64_t hold_end_qpc = 0;
-        if (start_hold) {
-            // Wait only for a target that lies ahead by at most the real
-            // frame interval I; a target further away is a misprediction.
-            LARGE_INTEGER hold_begin{};
-            QueryPerformanceCounter(&hold_begin);
-            hold_end_qpc = hold_begin.QuadPart; // applied without waiting: a hold of 0
-            const int64_t interval_ticks = us_to_qpc(g_effective_interval_us.load(std::memory_order_relaxed));
-            if (start_hold_target_qpc > hold_begin.QuadPart &&
-                start_hold_target_qpc - hold_begin.QuadPart <= interval_ticks) {
-                RenderStartWaitUntil(start_hold_target_qpc);
-                LARGE_INTEGER hold_end{};
-                QueryPerformanceCounter(&hold_end);
-                hold_end_qpc = hold_end.QuadPart;
-            }
-            hold_ticks = hold_end_qpc > hold_begin.QuadPart ? hold_end_qpc - hold_begin.QuadPart : 0;
-            // Exactly one driver call per marker: here after the hold, or at
-            // the end of the hook with the marker_forward_order after_wait.
-            if (!order_after_wait) forward();
-            PacingWaitRecord record{};
-            record.key = PacingPlanKey_Frame(submit_key);
-            record.kind = PacingWaitKind::RenderStartHold;
-            record.thread_id = GetCurrentThreadId();
-            record.entry_qpc = hold_begin.QuadPart;
-            record.exit_qpc = hold_end_qpc;
-            PacingTelemetry_PushWait(record);
-            static std::atomic<uint32_t> s_logged_hold_epoch{ 0 };
-            if (s_logged_hold_epoch.exchange(submit_key.producer_epoch, std::memory_order_relaxed) !=
-                submit_key.producer_epoch) {
-                LOG_INFO("NvAPI: render-thread start hold active (producer %u, frame %llu): waited %.2f ms "
-                         "for the GPU-anchored target (interval %.2f ms)",
-                         submit_key.producer_epoch, marker_params.frameID, qpc_to_us(hold_ticks) / 1000.0,
-                         g_effective_interval_us.load(std::memory_order_relaxed) / 1000.0);
-            }
-        }
         LARGE_INTEGER submit_qpc{};
         QueryPerformanceCounter(&submit_qpc);
-        if (hold_ticks > 0) PresentGate_OnRenderStartHold(submit_key, hold_end_qpc, hold_ticks);
-        PresentGate_OnFrameMarker(submit_key, PacingStageEventKind::RenderSubmitStart, submit_qpc.QuadPart);
+        PresentGate_OnFrameMarker(PacingPlanKey{PacingIdentityDomain::NvApiFrame,
+            marker_device.identity.producer_epoch,
+            FrameTimeline_CurrentControllerGeneration(), marker_params.frameID},
+            PacingStageEventKind::RenderSubmitStart, submit_qpc.QuadPart);
     }
     SchedulerOwnerGuard scheduler_owner;
     if (!scheduler_owner) {
@@ -1229,15 +1142,6 @@ static NvAPI_Status __cdecl Hook_SetAsyncFrameMarker(IUnknown* queue, NV_ASYNC_F
     record.entry_qpc = call_entry.QuadPart;
     record.exit_qpc = call_exit.QuadPart;
     PacingTelemetry_PushWait(record);
-    // Developer A/B held_gpu_floor: the call's duration also reaches the lead
-    // as a stage event of this async marker's frame ID (nonblocking); the lead
-    // keeps the longest call per frame and leaves it out of the next frame's
-    // lead sample. Nothing is pushed with the key off.
-    if (call_exit.QuadPart > call_entry.QuadPart && PacingPipeline_GetConfig().held_gpu_floor) {
-        const PacingPlanKey hold_key{PacingIdentityDomain::NvApiFrame,
-            record.key.producer_epoch, FrameTimeline_CurrentControllerGeneration(), frame_id};
-        PresentGate_OnDriverPresentHold(hold_key, call_exit.QuadPart, call_exit.QuadPart - call_entry.QuadPart);
-    }
     return result;
 }
 
@@ -1277,11 +1181,7 @@ void RestoreGameSleepMode() {
     NvAPI_ReleaseFeedbackDevice(feedback_device.device);
 }
 
-// SetSleepMode on the presenting device with the game's captured parameters:
-// minimumIntervalUs replaced when `interval_us` is given, and
-// bUseMarkersToOptimize forced off by the reflex_markers_optimize override.
-// Only this copy changes; the captured parameters stay the game's.
-static DriverLimiterApply ApplyCapturedSleepMode(const uint32_t* interval_us) noexcept {
+DriverLimiterApply NvAPI_ApplyDriverLimiter(uint32_t minimum_interval_us) noexcept {
     if (!s_orig_sleep_mode) return DriverLimiterApply::Failed;
     NV_SET_SLEEP_MODE_PARAMS params{};
     NvAPIFeedbackDevice params_identity{};
@@ -1291,8 +1191,7 @@ static DriverLimiterApply ApplyCapturedSleepMode(const uint32_t* interval_us) no
         params = s_game_original_params;
         params_identity = s_game_params_identity;
     }
-    if (interval_us) params.minimumIntervalUs = *interval_us;
-    if (MarkersOptimizeForcedOff(params.bUseMarkersToOptimize)) params.bUseMarkersToOptimize = 0;
+    params.minimumIntervalUs = minimum_interval_us;
     const NvAPIFeedbackDevice feedback_device = NvAPI_AcquireFeedbackDevice();
     if (!feedback_device.device) return DriverLimiterApply::NoDevice;
     DriverLimiterApply result = DriverLimiterApply::NoDevice;
@@ -1306,20 +1205,8 @@ static DriverLimiterApply ApplyCapturedSleepMode(const uint32_t* interval_us) no
     return result;
 }
 
-DriverLimiterApply NvAPI_ApplyDriverLimiter(uint32_t minimum_interval_us) noexcept {
-    return ApplyCapturedSleepMode(&minimum_interval_us);
-}
-
-DriverLimiterApply NvAPI_ReapplyGameSleepMode() noexcept {
-    const uint32_t limiter_us = g_driver_limiter_interval_us.load(std::memory_order_relaxed);
-    return ApplyCapturedSleepMode(limiter_us != 0 ? &limiter_us : nullptr);
-}
-
 void NvAPI_ReleaseDriverLimiter() noexcept {
-    // The limiter's interval is gone (sleep_mode.cpp cleared it first): the
-    // game's parameters again, with the markers override while it is set.
-    // Shutdown restores them exactly through RestoreGameSleepMode.
-    NvAPI_ReapplyGameSleepMode();
+    RestoreGameSleepMode();
 }
 
 // ── Installation ──

@@ -243,12 +243,6 @@ static void DrawPacingPipelineStatus() {
     else if (has_status && status.render_handoff == 2)
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
             "Render handoff limit: off (the render thread may wait for the next release; waiting for evidence)");
-    // The GPU floor on held frames (developer A/B held_gpu_floor).
-    if (has_status && status.render_handoff_held_floor)
-        ImGui::TextDisabled("Render handoff GPU floor (held): render thread no earlier than %.2f ms before the GPU "
-            "finishes the previous frame | %u frames delayed | %u restarts at the GPU's pace",
-            status.render_handoff_gpu_lead_us / 1000.0, status.render_handoff_held_delayed,
-            status.render_handoff_held_restarts);
     if (has_status && status.valid)
         ImGui::TextDisabled("Lead: %.2f ms (%s, %u samples%s) | Grid epoch: %u",
             status.lead_us / 1000.0, status.lead_warm ? "warm" : "warming",
@@ -576,25 +570,6 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "driver when the game sends it, then waits. After wait passes it after ReLimiter's source wait, "
         "so the driver, Frame Generation and PC Latency see the paced frame start. Compare both in one session.");
 
-    static const char* const kMarkersOptimizeLabels[] = {"Game", "Off"};
-    static_assert(IM_ARRAYSIZE(kMarkersOptimizeLabels) ==
-        static_cast<int>(ReflexMarkersOptimize::Count));
-    int markers_optimize = static_cast<int>(g_config.reflex_markers_optimize);
-    if (ImGui::Combo("Reflex markers optimization", &markers_optimize, kMarkersOptimizeLabels,
-            IM_ARRAYSIZE(kMarkersOptimizeLabels))) {
-        g_config.reflex_markers_optimize = static_cast<ReflexMarkersOptimize>(markers_optimize);
-        Config_ApplyPacingPipeline();
-        // Takes effect now, not at the game's next SetSleepMode call.
-        NvAPI_ReapplyGameSleepMode();
-        LOG_INFO("OSD: Reflex markers optimization -> %s",
-            ReflexMarkersOptimize_Text(g_config.reflex_markers_optimize));
-        *config_dirty = true;
-    }
-    HelpTip("Diagnostic A/B, NvAPI games only. Game (default) forwards what the game or Streamline asks. "
-        "Off clears 'use markers to optimize' in every SetSleepMode call ReLimiter forwards, so the "
-        "driver's pacing inside Present can be compared with and without it. The game's own parameters "
-        "stay captured and are restored unchanged on exit. One setting per capture.");
-
     static const char* const kRenderQueueLabels[] = {"Keep", "Remove", "Remove after held"};
     static_assert(IM_ARRAYSIZE(kRenderQueueLabels) == static_cast<int>(PacingRenderQueue::Count));
     int render_queue = static_cast<int>(g_config.gpu_queue_wait_render_queue);
@@ -639,34 +614,6 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "frame is never held past its original time while the game's render thread is still inside that "
         "frame's Present, because the next frame would wait too. Watch jitter and long frames; one setting "
         "per capture.");
-
-    if (ImGui::Checkbox("Render-thread start hold", &g_config.render_start_hold)) {
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: render-thread start hold -> %s", g_config.render_start_hold ? "on" : "off");
-        *config_dirty = true;
-    }
-    HelpTip("Diagnostic A/B, direct NVIDIA Reflex markers with the Reflex Sleep bypass on. The driver paces "
-        "frame generation inside the call that presents the frame, and that can hold a game thread that "
-        "has already started the next frame. On, ReLimiter instead holds the game's render thread at the "
-        "start of its frame until about half a GPU frame plus the submission delay before the GPU finishes "
-        "the previous frame, so the frame reaches Present no earlier than the driver would have held it. "
-        "A wait further away than one frame interval is not made. Watch long frames, GPU idle gaps and PC "
-        "Latency; one setting per capture.");
-
-    if (ImGui::Checkbox("Held-frame GPU floor", &g_config.held_gpu_floor)) {
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: held-frame GPU floor -> %s", g_config.held_gpu_floor ? "on" : "off");
-        *config_dirty = true;
-    }
-    HelpTip("Diagnostic A/B, Reflex games with the Reflex Sleep bypass on. A frame released by the lead "
-        "(held) is, with this on, released no earlier than the render handoff GPU floor, the same bound "
-        "frames that are not held already use: about half a GPU frame plus the submission delay before the "
-        "GPU finishes the previous frame. Frames released from the lead alone reach the driver close to "
-        "the previous GPU end, where its own pacing inside Present holds the game and stalls the GPU. "
-        "The lead samples of such frames also leave out the hold the driver measurably spent in that "
-        "call on the frame before, and when the floor makes a frame late enough to restart the cadence, "
-        "the new output target is where such a frame is ready, not a full lead later, so the GPU is not "
-        "made to wait. Watch long frames, GPU idle gaps and PC Latency; one setting per capture.");
 
     static const char* const kSourcePlacementLabels[] = {"Marker", "Pre-Sleep", "Reflex driver limiter"};
     static_assert(IM_ARRAYSIZE(kSourcePlacementLabels) ==

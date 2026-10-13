@@ -176,8 +176,7 @@ void PacingJoiner::AddReflex(const PacingReflexRecord& record, int64_t now_qpc) 
 }
 
 // Merges the record into its frame's entry (the newest one of the key), or
-// opens one: a start hold sets the frame's hold, an async marker call keeps
-// the longest call of the frame.
+// opens one: an async marker call keeps the longest call of the frame.
 void PacingJoiner::AddWait(const PacingWaitRecord& record, int64_t now_qpc) noexcept
 {
     if (!PacingFrameKey_IsValid(record.key) || record.entry_qpc <= 0 || qpc_frequency_ == 0) {
@@ -197,10 +196,7 @@ void PacingJoiner::AddWait(const PacingWaitRecord& record, int64_t now_qpc) noex
         waits_.PushBack(fresh);
         entry = &waits_.At(waits_.TailSequence() - 1);
     }
-    if (record.kind == PacingWaitKind::RenderStartHold) {
-        entry->record.has_hold = true;
-        entry->record.hold_us = wait_us;
-    } else if (!entry->record.has_async || wait_us > entry->record.async_us) {
+    if (!entry->record.has_async || wait_us > entry->record.async_us) {
         entry->record.has_async = true;
         entry->record.async_us = wait_us;
         entry->record.async_type = record.marker_type;

@@ -205,11 +205,6 @@ void ValidateConfig() {
         LOG_WARN("Config: invalid marker_forward_order, resetting to 'before_wait'");
         g_config.marker_forward_order = PacingMarkerForwardOrder::BeforeWait;
     }
-    if (static_cast<unsigned>(g_config.reflex_markers_optimize) >=
-        static_cast<unsigned>(ReflexMarkersOptimize::Count)) {
-        LOG_WARN("Config: invalid reflex_markers_optimize, resetting to 'game'");
-        g_config.reflex_markers_optimize = ReflexMarkersOptimize::Game;
-    }
     if (static_cast<unsigned>(g_config.gpu_queue_wait_render_queue) >=
         static_cast<unsigned>(PacingRenderQueue::Count)) {
         LOG_WARN("Config: invalid gpu_queue_wait_render_queue, resetting to 'keep'");
@@ -306,13 +301,6 @@ static void LoadPacingPipelineKeys(const char* S, const char* P) {
         LOG_WARN("Config: invalid marker_forward_order '%s', resetting to 'before_wait'",
                  forward_order.c_str());
         g_config.marker_forward_order = PacingMarkerForwardOrder::BeforeWait;
-    }
-
-    const std::string markers_optimize = ReadINIString(S, "reflex_markers_optimize", "game", P);
-    if (!ReflexMarkersOptimize_FromText(markers_optimize.c_str(), &g_config.reflex_markers_optimize)) {
-        LOG_WARN("Config: invalid reflex_markers_optimize '%s', resetting to 'game'",
-                 markers_optimize.c_str());
-        g_config.reflex_markers_optimize = ReflexMarkersOptimize::Game;
     }
 
     const std::string render_queue = ReadINIString(S, "gpu_queue_wait_render_queue", "keep", P);
@@ -425,8 +413,6 @@ void LoadConfig(HMODULE hModule) {
     g_config.native_pcl_enabled      = ReadINIBool(S, "native_pcl_enabled", false, P);
     g_config.gpu_present_gate_probes=ReadINIBool(S,"gpu_present_gate_probes",true,P);
     g_config.fg_late_spacing=ReadINIBool(S,"fg_late_spacing",true,P);
-    g_config.render_start_hold=ReadINIBool(S,"render_start_hold",false,P);
-    g_config.held_gpu_floor=ReadINIBool(S,"held_gpu_floor",false,P);
     g_config.reflex_sleep_bypass=ReadINIBool(S,"reflex_sleep_bypass",true,P);
     g_config.reflex_inject           = ReadINIBool(S, "reflex_inject", false, P);
     g_config.flip_model_override     = ReadINIBool(S, "flip_model_override", false, P);
@@ -638,14 +624,10 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIString(S, "output_rung", PacingRungOverride_Text(config.output_rung), P);
     WriteINIString(S, "marker_forward_order",
         PacingMarkerForwardOrder_Text(config.marker_forward_order), P);
-    WriteINIString(S, "reflex_markers_optimize",
-        ReflexMarkersOptimize_Text(config.reflex_markers_optimize), P);
     WriteINIString(S, "gpu_queue_wait_render_queue",
         PacingRenderQueue_Text(config.gpu_queue_wait_render_queue), P);
     WriteINIString(S, "lead_coverage", PacingLeadCoverage_Text(config.lead_coverage), P);
     WriteINIBool(S, "fg_late_spacing", config.fg_late_spacing, P);
-    WriteINIBool(S, "render_start_hold", config.render_start_hold, P);
-    WriteINIBool(S, "held_gpu_floor", config.held_gpu_floor, P);
     WriteINIString(S, "source_placement",
         PacingPlacementOverride_Text(config.source_placement), P);
     WriteINIDouble(S, "stall_inject_ms", config.stall_inject_ms, P);
@@ -888,8 +870,6 @@ static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
     pipeline.gpu_queue_wait_render_queue = config.gpu_queue_wait_render_queue;
     pipeline.lead_coverage = config.lead_coverage;
     pipeline.fg_late_spacing = config.fg_late_spacing;
-    pipeline.render_start_hold = config.render_start_hold;
-    pipeline.held_gpu_floor = config.held_gpu_floor;
     return pipeline;
 }
 
@@ -899,9 +879,6 @@ void Config_ApplyPacingPipeline() {
     PacingPipeline_SetConfig(PacingPipelineConfigFrom(g_config));
     g_marker_forward_after_wait.store(
         g_config.marker_forward_order == PacingMarkerForwardOrder::AfterWait,
-        std::memory_order_relaxed);
-    g_reflex_markers_optimize_off.store(
-        g_config.reflex_markers_optimize == ReflexMarkersOptimize::Off,
         std::memory_order_relaxed);
     g_reflex_sleep_bypass.store(g_config.reflex_sleep_bypass, std::memory_order_relaxed);
 }
@@ -916,12 +893,9 @@ int Config_DeveloperOverrides() {
         (g_config.stall_inject_period_s != d.stall_inject_period_s) +
         (g_config.reflex_sleep_bypass != d.reflex_sleep_bypass) +
         (g_config.marker_forward_order != d.marker_forward_order) +
-        (g_config.reflex_markers_optimize != d.reflex_markers_optimize) +
         (g_config.gpu_queue_wait_render_queue != d.gpu_queue_wait_render_queue) +
         (g_config.lead_coverage != d.lead_coverage) +
         (g_config.fg_late_spacing != d.fg_late_spacing) +
-        (g_config.render_start_hold != d.render_start_hold) +
-        (g_config.held_gpu_floor != d.held_gpu_floor) +
         (g_config.source_placement != d.source_placement);
 }
 
@@ -936,12 +910,9 @@ void Config_ResetDeveloperSettings() {
     g_config.stall_inject_period_s = d.stall_inject_period_s;
     g_config.reflex_sleep_bypass = d.reflex_sleep_bypass;
     g_config.marker_forward_order = d.marker_forward_order;
-    g_config.reflex_markers_optimize = d.reflex_markers_optimize;
     g_config.gpu_queue_wait_render_queue = d.gpu_queue_wait_render_queue;
     g_config.lead_coverage = d.lead_coverage;
     g_config.fg_late_spacing = d.fg_late_spacing;
-    g_config.render_start_hold = d.render_start_hold;
-    g_config.held_gpu_floor = d.held_gpu_floor;
     g_config.source_placement = d.source_placement;
     Config_ApplyPacingPipeline();
     LOG_INFO("Config: developer diagnostics reset to the recommended defaults");
@@ -968,10 +939,6 @@ void ApplyConfig() {
     if (g_config.marker_forward_order != PacingMarkerForwardOrder::BeforeWait)
         LOG_WARN("Diagnostic NvAPI marker forward order: %s (driver sees the paced release)",
             PacingMarkerForwardOrder_Text(g_config.marker_forward_order));
-    if (g_config.reflex_markers_optimize != ReflexMarkersOptimize::Game)
-        LOG_WARN("Diagnostic Reflex markers optimization: %s (NvAPI SetSleepMode forwarded with "
-                 "bUseMarkersToOptimize off)",
-            ReflexMarkersOptimize_Text(g_config.reflex_markers_optimize));
     LOG_INFO("Pacing pipeline: smoothing=%s adaptive_cap=%u adaptive_cap_percentile=%d output_rung=%s source_placement=%s probes=%u gpu_wait_budget_us=%.0f",
         PacingSmoothing_Text(g_config.smoothing), g_config.adaptive_cap ? 1u : 0u,
         g_config.adaptive_cap_percentile,
@@ -995,14 +962,6 @@ void ApplyConfig() {
     if (!g_config.fg_late_spacing)
         LOG_WARN("Pacing pipeline: diagnostic FG late-frame spacing off (the next real frame after one that "
                  "reached its FG input late is released on its original target)");
-    if (g_config.render_start_hold)
-        LOG_WARN("Pacing pipeline: diagnostic render-thread start hold on (RENDERSUBMIT_START of a direct "
-                 "NvAPI frame waits until the GPU-anchored target while ReLimiter paces the source and the "
-                 "Reflex Sleep is bypassed)");
-    if (g_config.held_gpu_floor)
-        LOG_WARN("Pacing pipeline: diagnostic held-frame GPU floor on (frames held by the lead are released no "
-                 "earlier than the render handoff GPU floor, and their lead samples leave out the driver's "
-                 "Present hold measured in NvAPI_D3D12_SetAsyncFrameMarker)");
 }
 
 

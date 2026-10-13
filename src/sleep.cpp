@@ -16,11 +16,6 @@ static HANDLE g_timer = nullptr;
 // Pre-Sleep wait timer (PreSleepWaitUntil): separate from the owner's timer.
 static std::atomic<HANDLE> s_pre_sleep_timer{nullptr};
 static std::atomic_flag s_pre_sleep_busy = ATOMIC_FLAG_INIT;
-// Render-thread start hold timer (RenderStartWaitUntil): its own timer and busy
-// flag, never PreSleepWaitUntil's, which the game's Sleep thread uses at the
-// same time.
-static std::atomic<HANDLE> s_render_start_timer{nullptr};
-static std::atomic_flag s_render_start_busy = ATOMIC_FLAG_INIT;
 static HANDLE CreateHighResolutionTimer() noexcept;
 
 void InitSleepTimer() {
@@ -34,8 +29,6 @@ void InitSleepTimer() {
     }
     if (!s_pre_sleep_timer.load(std::memory_order_acquire))
         s_pre_sleep_timer.store(CreateHighResolutionTimer(), std::memory_order_release);
-    if (!s_render_start_timer.load(std::memory_order_acquire))
-        s_render_start_timer.store(CreateHighResolutionTimer(), std::memory_order_release);
 }
 
 static HANDLE CreateHighResolutionTimer() noexcept {
@@ -79,45 +72,12 @@ bool PreSleepWaitUntil(int64_t target_qpc) {
     return result == WAIT_OBJECT_0 && !RuntimeLifecycle_IsStopping();
 }
 
-bool RenderStartWaitUntil(int64_t target_qpc) {
-    if (RuntimeLifecycle_IsStopping()) return false;
-    if (s_render_start_busy.test_and_set(std::memory_order_acquire)) return false;
-    struct BusyScope {
-        ~BusyScope() { s_render_start_busy.clear(std::memory_order_release); }
-    } busy;
-
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    const double remaining_us = qpc_to_us(target_qpc - now.QuadPart);
-    if (!std::isfinite(remaining_us) || remaining_us <= 0.0 || remaining_us > 500'000.0) return false;
-
-    // Timer only, no spin, like the pre-Sleep wait: the hold's measured
-    // duration (render_start_hold_us) shows any timer lateness.
-    const HANDLE timer = s_render_start_timer.load(std::memory_order_acquire);
-    if (!timer) return false;
-    LARGE_INTEGER due;
-    due.QuadPart = -static_cast<int64_t>(remaining_us * 10.0); // 100 ns units
-    if (!SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) return false;
-    const HANDLE stop_event = RuntimeLifecycle_GetStopEvent();
-    const DWORD timeout_ms = static_cast<DWORD>(remaining_us / 1000.0) + 100;
-    DWORD result = WAIT_FAILED;
-    if (stop_event) {
-        const HANDLE waits[] = { timer, stop_event };
-        result = WaitForMultipleObjects(2, waits, FALSE, timeout_ms);
-    } else {
-        result = WaitForSingleObject(timer, timeout_ms);
-    }
-    return result == WAIT_OBJECT_0 && !RuntimeLifecycle_IsStopping();
-}
-
 void CloseSleepTimer() {
     if (g_timer) {
         CloseHandle(g_timer);
         g_timer = nullptr;
     }
     if (HANDLE timer = s_pre_sleep_timer.exchange(nullptr, std::memory_order_acq_rel))
-        CloseHandle(timer);
-    if (HANDLE timer = s_render_start_timer.exchange(nullptr, std::memory_order_acq_rel))
         CloseHandle(timer);
 }
 

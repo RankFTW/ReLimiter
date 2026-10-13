@@ -131,11 +131,11 @@ class ConfigSavePolicyTests(unittest.TestCase):
         config = HEADER.split("struct Config {", 1)[1].split("};", 1)[0]
         fields = set(re.findall(
             r"\b(?:bool|int|double|float|std::string|PacingSmoothing|PacingRungOverride|"
-            r"PacingMarkerForwardOrder|ReflexMarkersOptimize|PacingRenderQueue|PacingLeadCoverage|PacingPlacementOverride)\s+(\w+)\s*=",
+            r"PacingMarkerForwardOrder|PacingRenderQueue|PacingLeadCoverage|PacingPlacementOverride)\s+(\w+)\s*=",
             config))
         self.assertTrue({"smoothing", "adaptive_cap", "output_rung", "stall_inject_ms",
                          "stall_inject_period_s", "gpu_present_gate_probes",
-                         "gpu_wait_budget_us", "marker_forward_order", "reflex_markers_optimize",
+                         "gpu_wait_budget_us", "marker_forward_order",
                          "gpu_queue_wait_render_queue", "lead_coverage", "source_placement"} <= fields)
         saved = set(re.findall(r"\bconfig\.(\w+)", body("WriteConfigSnapshot")))
         # Every Config field is saved: the section clear before the startup
@@ -202,7 +202,7 @@ class ConfigSavePolicyTests(unittest.TestCase):
         self.assertEqual(fields, {"smoothing", "rung_override", "adaptive_cap",
                                   "adaptive_cap_percentile", "gpu_probes", "gpu_wait_budget_us",
                                   "gpu_wait_interleave_s", "gpu_queue_wait_render_queue",
-                                  "lead_coverage", "fg_late_spacing", "render_start_hold", "held_gpu_floor",
+                                  "lead_coverage", "fg_late_spacing",
                                   "placement_override", "stall_inject_ms",
                                   "stall_inject_period_s"})
         mapping = dict(re.findall(r"\bpipeline\.(\w+)\s*=\s*config\.(\w+);",
@@ -218,9 +218,7 @@ class ConfigSavePolicyTests(unittest.TestCase):
                                    "gpu_wait_interleave_s": "gpu_wait_interleave_s",
                                    "gpu_queue_wait_render_queue": "gpu_queue_wait_render_queue",
                                    "lead_coverage": "lead_coverage",
-                                   "fg_late_spacing": "fg_late_spacing",
-                                   "render_start_hold": "render_start_hold",
-                                   "held_gpu_floor": "held_gpu_floor"})
+                                   "fg_late_spacing": "fg_late_spacing"})
         # The OSD applies pipeline edits through the same function.
         for name, text in (("config.cpp", SOURCE), ("osd.cpp", OSD)):
             self.assertNotRegex(text, r"\bg_frame_time_adaptation\b", name)
@@ -256,15 +254,6 @@ class ConfigSavePolicyTests(unittest.TestCase):
         self.assertRegex(body("Config_ApplyPacingPipeline"),
                          r"g_marker_forward_after_wait\.store\(\s*g_config\.marker_forward_order"
                          r" == PacingMarkerForwardOrder::AfterWait")
-        # reflex_markers_optimize follows the same path to the NvAPI hooks.
-        self.assertIn("ReflexMarkersOptimize_FromText(markers_optimize.c_str(), "
-                      "&g_config.reflex_markers_optimize)", loader)
-        self.assertIn("ReflexMarkersOptimize::Count", validate)
-        self.assertRegex(writer, r'"reflex_markers_optimize",\s*'
-                                 r'ReflexMarkersOptimize_Text\(config\.reflex_markers_optimize\)')
-        self.assertRegex(body("Config_ApplyPacingPipeline"),
-                         r"g_reflex_markers_optimize_off\.store\(\s*g_config\.reflex_markers_optimize"
-                         r" == ReflexMarkersOptimize::Off")
 
     def test_mailboxes_are_bounded_and_destination_specific(self):
         self.assertIn("std::optional<ConfigSaveSnapshot> config", SOURCE)

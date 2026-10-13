@@ -158,10 +158,8 @@ PacingJoinedRow DisplayRow(bool with_latency)
         // Gated holds: where the waits started.
         row.source.pre_sleep_start_qpc = 610;
         row.source.source_wait_start_qpc = 800;
-        // Render-thread start hold and the longest SetAsyncFrameMarker call.
+        // The longest SetAsyncFrameMarker call.
         row.has_wait = true;
-        row.wait.has_hold = true;
-        row.wait.hold_us = 1234.5;
         row.wait.has_async = true;
         row.wait.async_us = 5500.25;
         row.wait.async_type = 11; // OUT_OF_BAND_PRESENT_START
@@ -193,9 +191,6 @@ PacingJoinedRow DisplayRow(bool with_latency)
         row.has_gate = true;
         row.gate.post_wait = true;
         row.gate.post_wait_qpc = 1970;
-        // A hold that applied without waiting: 0, not empty; no async call.
-        row.has_wait = true;
-        row.wait.has_hold = true;
     }
     row.display_source = PacingJoin_DisplaySource(row.display);
     return row;
@@ -224,9 +219,9 @@ void CheckRowsFile(const CsvFile& rows)
     const Cells controller_columns{ "governor_step", "governor_interval_us", "plan_signal_advance_us",
         "gate_pre_wait_qpc", "source_placement", "pre_sleep_end_qpc", "pre_sleep_margin_us",
         "source_wait_start_qpc", "pre_sleep_start_qpc" };
-    const Cells wait_columns{ "render_start_hold_us", "async_marker_wait_us", "async_marker_wait_type" };
+    const Cells wait_columns{ "async_marker_wait_us", "async_marker_wait_type" };
     const size_t tail = plan_columns.size() + controller_columns.size() + wait_columns.size();
-    Check(rows.header.size() == 141, "pacing rows have 141 columns, got " + std::to_string(rows.header.size()));
+    Check(rows.header.size() == 140, "pacing rows have 140 columns, got " + std::to_string(rows.header.size()));
     Check(rows.header.size() >= appended.size() + tail &&
               Cells(rows.header.end() - tail - appended.size(), rows.header.end() - tail) == appended,
           "PC Latency and predicted-render columns are appended in order after clock_map_offset_us");
@@ -240,7 +235,7 @@ void CheckRowsFile(const CsvFile& rows)
           "controller, gate pre-Wait, placement and wait-start columns are appended in order after display_source");
     Check(rows.header.size() >= wait_columns.size() &&
               Cells(rows.header.end() - wait_columns.size(), rows.header.end()) == wait_columns,
-          "render-thread start hold and async marker wait columns are the last columns");
+          "async marker wait columns are the last columns");
     Check(rows.rows.size() == 3, "every pacing row is written");
     if (rows.rows.size() != 3) return;
 
@@ -253,17 +248,14 @@ void CheckRowsFile(const CsvFile& rows)
         { "source_placement", "3" }, { "pre_sleep_end_qpc", "780" }, { "pre_sleep_margin_us", "450.250" },
         { "source_wait_start_qpc", "800" }, { "pre_sleep_start_qpc", "610" } };
     const std::pair<const char*, const char*> wait_cells[] = {
-        { "render_start_hold_us", "1234.500" }, { "async_marker_wait_us", "5500.250" },
-        { "async_marker_wait_type", "11" } };
+        { "async_marker_wait_us", "5500.250" }, { "async_marker_wait_type", "11" } };
     for (const auto& [column, expected] : wait_cells) {
         Check(rows.Cell(0, column) == expected,
               std::string("row 1 ") + column + " = " + expected + ", got " + rows.Cell(0, column));
     }
-    Check(rows.Cell(1, "render_start_hold_us") == "0.000" && rows.Cell(1, "async_marker_wait_us").empty() &&
-              rows.Cell(1, "async_marker_wait_type").empty(),
-          "a hold that applied without waiting is 0 and a frame without an async marker call has empty cells");
-    Check(rows.Cell(2, "render_start_hold_us").empty() && rows.Cell(2, "async_marker_wait_us").empty() &&
-              rows.Cell(2, "async_marker_wait_type").empty(),
+    Check(rows.Cell(1, "async_marker_wait_us").empty() && rows.Cell(1, "async_marker_wait_type").empty(),
+          "a frame without an async marker call has empty cells");
+    Check(rows.Cell(2, "async_marker_wait_us").empty() && rows.Cell(2, "async_marker_wait_type").empty(),
           "rows without wait records have empty wait cells");
     for (const auto& [column, expected] : plan_cells) {
         Check(rows.Cell(0, column) == expected,

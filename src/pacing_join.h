@@ -55,13 +55,10 @@ struct PacingGateJoin {
     int64_t pre_wait_qpc = 0; // PostWait event's pre-Wait GPU time; 0 unknown
 };
 
-// A frame's waits (PacingWaitRecord) merged by frame key: ReLimiter's
-// render-thread start hold and the longest SetAsyncFrameMarker call of the
-// frame, in µs.
+// A frame's waits (PacingWaitRecord) merged by frame key: the longest
+// SetAsyncFrameMarker call of the frame, in µs.
 struct PacingWaitJoin {
     PacingFrameKey key{};
-    bool has_hold = false;   // the hold applied (a hold without a wait is 0 µs)
-    double hold_us = 0.0;
     bool has_async = false;  // at least one SetAsyncFrameMarker call carried this frame ID
     double async_us = 0.0;   // the longest such call
     uint32_t async_type = 0; // that call's marker type

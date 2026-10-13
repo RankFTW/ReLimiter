@@ -94,7 +94,7 @@ static void ConfigureSleepMode(bool enable) {
     if (enable) {
         p.bLowLatencyMode = 1;
         p.bLowLatencyBoost = 1;
-        p.bUseMarkersToOptimize = g_reflex_markers_optimize_off.load(std::memory_order_relaxed) ? 0 : 1;
+        p.bUseMarkersToOptimize = 1;
         p.minimumIntervalUs = 0;
     }
 

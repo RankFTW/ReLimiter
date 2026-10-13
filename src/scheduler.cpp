@@ -253,9 +253,6 @@ std::atomic<bool> s_status_render_handoff_gpu_floor{false};
 std::atomic<double> s_status_render_handoff_gpu_lead_us{0.0};
 std::atomic<uint32_t> s_status_render_handoff_limited{0};
 std::atomic<uint32_t> s_status_render_handoff_stalls{0};
-std::atomic<bool> s_status_render_handoff_held_floor{false};
-std::atomic<uint32_t> s_status_render_handoff_held_delayed{0};
-std::atomic<uint32_t> s_status_render_handoff_held_restarts{0};
 }
 
 static void PublishPacingStatus(const SchedulerPacingStatus& status) noexcept
@@ -315,9 +312,6 @@ static void PublishPacingStatus(const SchedulerPacingStatus& status) noexcept
     s_status_render_handoff_gpu_lead_us.store(status.render_handoff_gpu_lead_us, std::memory_order_relaxed);
     s_status_render_handoff_limited.store(status.render_handoff_limited, std::memory_order_relaxed);
     s_status_render_handoff_stalls.store(status.render_handoff_stalls, std::memory_order_relaxed);
-    s_status_render_handoff_held_floor.store(status.render_handoff_held_floor, std::memory_order_relaxed);
-    s_status_render_handoff_held_delayed.store(status.render_handoff_held_delayed, std::memory_order_relaxed);
-    s_status_render_handoff_held_restarts.store(status.render_handoff_held_restarts, std::memory_order_relaxed);
     s_status_sequence.store(sequence + 2, std::memory_order_release);
 }
 
@@ -384,9 +378,6 @@ bool Scheduler_ReadPacingStatus(SchedulerPacingStatus* status) noexcept
         copy.render_handoff_gpu_lead_us = s_status_render_handoff_gpu_lead_us.load(std::memory_order_relaxed);
         copy.render_handoff_limited = s_status_render_handoff_limited.load(std::memory_order_relaxed);
         copy.render_handoff_stalls = s_status_render_handoff_stalls.load(std::memory_order_relaxed);
-        copy.render_handoff_held_floor = s_status_render_handoff_held_floor.load(std::memory_order_relaxed);
-        copy.render_handoff_held_delayed = s_status_render_handoff_held_delayed.load(std::memory_order_relaxed);
-        copy.render_handoff_held_restarts = s_status_render_handoff_held_restarts.load(std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_acquire);
         if (s_status_sequence.load(std::memory_order_relaxed) != begin) continue;
         *status = copy;
@@ -504,10 +495,6 @@ uint32_t s_handoff_proven_stream = 0;
 uint64_t s_handoff_limited_frames = 0;
 bool s_handoff_logged = false;
 bool s_handoff_stall_logged = false;
-// Developer A/B held_gpu_floor (HeldGpuFloorApplies): the GPU floor applied to
-// the newest planned frame, and held frames it delayed past S.
-bool s_held_gpu_floor_applies = false;
-uint64_t s_held_floor_delayed_frames = 0;
 // For the Reflex Sleep hook (any thread): the newest released frame whose
 // handoff the next frame waits for (0 = the next frame is not limited), its
 // stream (identity domain << 24 | producer epoch), and hook waits that
@@ -806,14 +793,6 @@ static void ResetFeasibility(const char* reason) noexcept
     }
 }
 
-// The GPU floor anchor for the game's render thread (lead_controller.h,
-// render_handoff.h): published after each Reflex report batch and, invalid,
-// after a reset. Owner only (the single writer).
-static void PublishGpuFloorAnchor() noexcept
-{
-    RenderHandoff_PublishGpuFloor(s_source_stage.Lead().GpuFloorAnchorSnapshot());
-}
-
 // Controller lifecycle. The generation bumps only on API change,
 // identity-domain (trigger/route) change and producer-epoch change here;
 // Flush(FLUSH_ALL) bumps it for API change, full swapchain teardown and
@@ -841,7 +820,6 @@ static void ApplyLifecycle(SchedulerTrigger trigger, PacingSourceMarker marker) 
     const uint32_t generation = FrameTimeline_CurrentControllerGeneration();
     if (!s_stage_initialized || generation != s_stage_generation) {
         s_source_stage.Reset(GetQPCFrequency());
-        PublishGpuFloorAnchor();
         s_period_tracker.Forget();
         s_pre_sleep.Reset();
         s_last_plan_index = 0;
@@ -859,7 +837,6 @@ static void ApplyLifecycle(SchedulerTrigger trigger, PacingSourceMarker marker) 
 
     if (s_marker_known && marker != s_last_marker) {
         s_source_stage.ResetBuckets();
-        PublishGpuFloorAnchor();
         LOG_INFO("Scheduler: enforcement marker %d -> %d, lead buckets reset",
                  static_cast<int>(s_last_marker), static_cast<int>(marker));
     }
@@ -1003,12 +980,6 @@ static void FillControllerStatus(SchedulerPacingStatus* status) noexcept
     status->render_handoff_gpu_floor = status->render_handoff_gpu_lead_us > 0.0;
     status->render_handoff_limited = static_cast<uint32_t>(s_handoff_limited_frames);
     status->render_handoff_stalls = static_cast<uint32_t>(s_handoff_stalls);
-    // The GPU floor on held frames (developer A/B held_gpu_floor): the newest
-    // planned frame is held, the key is on and the floor is known.
-    status->render_handoff_held_floor = s_held_gpu_floor_applies && status->render_handoff_gpu_floor;
-    status->render_handoff_held_delayed = static_cast<uint32_t>(s_held_floor_delayed_frames);
-    status->render_handoff_held_restarts =
-        static_cast<uint32_t>(s_source_stage.Statistics().gpu_floor_restarts);
     status->hold_overloaded = s_hold_feasibility.Overloaded();
     const LeadController& lead = s_source_stage.Lead();
     const LeadStatistics lead_statistics = lead.Statistics();
@@ -1214,16 +1185,14 @@ static GovernorDecision UpdatePeriodGovernor(
     ConfigurePeriodGovernor(config.adaptive_cap);
     const bool gpu_hold = IsGpuRung(pipeline.rung);
     ReflexFrameTimeSample sample{};
-    bool reports_fed = false;
     while (ConsumeReflexFrameTimeSample(&sample)) {
-        reports_fed = true;
         // The release headroom's heavy-work start r − A and the queue-order
         // test's GPU start (lead_controller.h).
         if (sample.gpu_active_us > 0.0) {
             s_source_stage.OnGpuActiveTime(sample.producer_epoch, sample.frame_id, sample.gpu_active_us,
                 sample.gpu_start_qpc);
         }
-        // Render handoff GPU floor and the held-back wait (lead_controller.h):
+        // Render handoff GPU floor (lead_controller.h):
         // every report's GPU times and pair.
         if (sample.gpu_end_qpc > 0) {
             s_source_stage.OnGpuRenderEnd(sample.producer_epoch, sample.frame_id, sample.gpu_start_qpc,
@@ -1242,7 +1211,6 @@ static GovernorDecision UpdatePeriodGovernor(
         s_period_governor.OnDemand(sample.sequence, sample.workload_demand_us,
             sample.gpu_execution_available && sample.gpu_service_us >= sample.workload_demand_us);
     }
-    if (reports_fed) PublishGpuFloorAnchor();
 
     frame.qpc = QpcNow();
     frame.qpc_frequency = GetQPCFrequency();
@@ -1445,25 +1413,6 @@ static bool HandoffLimitApplies(const PacingPlanKey& key, const PlannedFrameInpu
         !DriverSleepRuns(input.target_fps);
 }
 
-// Developer A/B held_gpu_floor: a frame held by the lead (plan rung above
-// source only: marker hold, native hold, GPU queue wait, FG input wait),
-// released at SIMULATION_START by the marker or pre-Sleep placement while the
-// driver's Sleep does not run, is released no earlier than its GPU floor
-// (GpuFloorQpc, lead_controller.h). The render-thread offset (w + d) stays
-// for frames not held (HandoffLimitApplies) and so does its stall block: the
-// floor waits for no event.
-static bool HeldGpuFloorApplies(const PlannedFrameInput& input, const PacingPipelineSnapshot& pipeline,
-    const PacingPipelineConfig& config) noexcept
-{
-    return config.held_gpu_floor &&
-        pipeline.rung != PacingRung::SourceOnly &&
-        (pipeline.mode == PacingTimingMode::Vrr || pipeline.mode == PacingTimingMode::Fixed) &&
-        PacingSourcePlacement_WaitsAtMarker(pipeline.placement) &&
-        (input.trigger == SchedulerTrigger::NvApiMarker || input.trigger == SchedulerTrigger::PclMarker) &&
-        input.marker == PacingSourceMarker::SimulationStart &&
-        !DriverSleepRuns(input.target_fps);
-}
-
 // A handoff wait stalled: the render thread took no frame for three of its
 // frame times (at least 3 I), and the frame was released. Once the game has
 // shown its render thread taking a frame before the next release (a handoff
@@ -1563,7 +1512,7 @@ static int64_t HandoffEarliestRelease(const PacingPlanKey& key, double interval_
 // After a planned frame: it is the newest released frame, and the Reflex
 // Sleep hook learns whether the next frame waits for its handoff.
 static void PublishRenderHandoff(const PacingPlanKey& key, const SourceStageFrame& frame,
-    bool limited, bool held_floor) noexcept
+    bool limited) noexcept
 {
     if (!frame.planned) {
         s_handoff_hook_frame.store(0, std::memory_order_release);
@@ -1578,10 +1527,6 @@ static void PublishRenderHandoff(const PacingPlanKey& key, const SourceStageFram
     s_handoff_hook_frame.store(limited && !s_handoff_blocked ? key.frame_id : 0,
         std::memory_order_release);
     if (!frame.handoff_limited) return;
-    if (held_floor) {
-        ++s_held_floor_delayed_frames;
-        return;
-    }
     ++s_handoff_limited_frames;
     if (!s_handoff_logged) {
         s_handoff_logged = true;
@@ -1633,19 +1578,13 @@ static SourceStageFrame RunPlanned(
         NoteHandoffBeforeRelease(key, handoff_frame);
     }
     const bool handoff_limit = HandoffLimitApplies(key, input, pipeline);
-    const bool held_floor = HeldGpuFloorApplies(input, pipeline, config);
     if (handoff_limit) {
         request.earliest_release_qpc = HandoffEarliestRelease(key, input.interval_us, pipeline);
-    } else if (held_floor) {
-        // Held frame: its GPU floor alone, without the render-thread offset.
-        request.earliest_release_qpc = GpuFloorQpc(key);
     }
-    request.held_gpu_floor = config.held_gpu_floor;
 
     g_effective_interval_us.store(input.interval_us, std::memory_order_relaxed);
     const SourceStageFrame frame = s_source_stage.RunPlannedFrame(request, &s_clock);
-    s_held_gpu_floor_applies = held_floor && frame.planned;
-    PublishRenderHandoff(key, frame, handoff_limit, held_floor);
+    PublishRenderHandoff(key, frame, handoff_limit);
     if (s_source_stage.StallInjector().TakeEnabledNotice()) {
         LOG_INFO("Stall injector enabled: %.1f ms every %.1f s",
                  config.stall_inject_ms, config.stall_inject_period_s);
@@ -1913,19 +1852,12 @@ bool Scheduler_PlanReflexSleep(int64_t now_qpc, bool driver_sleep, int64_t hando
     if (request.next_target_valid) {
         request.next_target_qpc = last_target_qpc + us_to_qpc(PreSleepPredictedIntervalUs());
         // Render handoff limit: the next frame (the newest released frame's
-        // successor) is released no earlier than A (HandoffFloorQpc), or, when
-        // the newest frame was held under the developer A/B held_gpu_floor,
-        // than its GPU floor alone, so the pre-wait aims for
-        // max(S_next, floor) − margin.
-        PacingPlanKey next = s_handoff_released;
-        ++next.frame_id;
-        int64_t earliest_qpc = 0;
+        // successor) is released no earlier than A (HandoffFloorQpc), so the
+        // pre-wait aims for max(S_next, A) − margin.
         if (handoff_qpc > 0) {
-            earliest_qpc = HandoffFloorQpc(next, handoff_qpc, PacingPipeline_Read());
-        } else if (s_held_gpu_floor_applies && !driver_sleep) {
-            earliest_qpc = GpuFloorQpc(next);
-        }
-        if (earliest_qpc > 0) {
+            PacingPlanKey next = s_handoff_released;
+            ++next.frame_id;
+            const int64_t earliest_qpc = HandoffFloorQpc(next, handoff_qpc, PacingPipeline_Read());
             request.next_target_qpc = (std::max)(request.next_target_qpc,
                 earliest_qpc + us_to_qpc(s_last_plan_lead_us));
         }

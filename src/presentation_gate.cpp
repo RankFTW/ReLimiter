@@ -233,31 +233,6 @@ void PresentGate_OnFrameMarker(const PacingPlanKey& key, PacingStageEventKind ki
                  static_cast<unsigned long long>(key.frame_id));
 }
 
-// One hold duration of a planned frame as a stage event (RenderStartHold or
-// DriverPresentHold): nothing for an unplanned frame or a non-positive hold.
-static void PushHoldEvent(const PacingPlanKey& key, PacingStageEventKind kind, int64_t end_qpc,
-                          int64_t hold_ticks) noexcept {
-    if (end_qpc <= 0 || hold_ticks <= 0) return;
-    PacingFramePlan plan{};
-    if (!g_frame_plans.Find(key, &plan)) return;
-    PacingStageEvent event{};
-    event.key = plan.key;
-    event.grid_index = plan.grid_index;
-    event.qpc = end_qpc;
-    event.kind = kind;
-    event.rung = plan.rung;
-    event.hold_ticks = hold_ticks;
-    FramePlan_PushStageEvent(event);
-}
-
-void PresentGate_OnRenderStartHold(const PacingPlanKey& key, int64_t end_qpc, int64_t hold_ticks) noexcept {
-    PushHoldEvent(key, PacingStageEventKind::RenderStartHold, end_qpc, hold_ticks);
-}
-
-void PresentGate_OnDriverPresentHold(const PacingPlanKey& key, int64_t end_qpc, int64_t hold_ticks) noexcept {
-    PushHoldEvent(key, PacingStageEventKind::DriverPresentHold, end_qpc, hold_ticks);
-}
-
 void PresentGate_OnPresentStart(const PacingPlanKey& key, int64_t arrival_qpc,
                                 PresentationGateResult* result,
                                 bool* planned, PacingRung* plan_rung) {

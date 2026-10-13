@@ -894,117 +894,6 @@ void TestEarliestReleaseLimitsWait()
     CHECK(fourth.plan.output_target_qpc == request.earliest_release_qpc + Ticks(fourth.plan.lead_us));
 }
 
-// Developer A/B held_gpu_floor on a held frame (GPU queue wait): the GPU floor
-// is the same earliest release as the render handoff limit's (a release
-// beyond S is a late source), and the request's held_gpu_floor reaches the
-// lead, which leaves the driver's Present hold recorded under the previous
-// frame (DriverPresentHold) out of the frame's sample. The key off keeps X.
-void TestHeldFrameGpuFloorAndDriverHold()
-{
-    std::printf("Test: a held frame's GPU floor delays it and the driver hold leaves its sample\n");
-    const PacingPipelineSnapshot pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
-    for (const bool key_on : { true, false }) {
-        ResetStage();
-        ScriptedClock clock;
-        SourceStageRequest request = Request(Key(800), pipeline);
-        const SourceStageFrame first = g_stage.RunPlannedFrame(request, &clock);
-        CHECK(first.planned);
-
-        request = Request(Key(801), pipeline);
-        request.held_gpu_floor = key_on;
-        request.earliest_release_qpc = first.plan.output_target_qpc + Ticks(kIntervalUs) -
-            Ticks(first.plan.lead_us) + Ticks(2'000.0);
-        const SourceStageFrame second = g_stage.RunPlannedFrame(request, &clock);
-        CHECK(second.planned && second.plan.rung == PacingRung::GpuQueueWait);
-        CHECK(second.handoff_limited && second.epoch_started == PacingEpochReason::None);
-        CHECK(second.wait_target_qpc == request.earliest_release_qpc &&
-            second.release_qpc == request.earliest_release_qpc);
-
-        // Frame 1: X = 8,000 and a 3,000 µs driver hold; frame 2: X = 8,000.
-        PacingStageEvent hold = Event(first, PacingStageEventKind::DriverPresentHold,
-            first.release_qpc + Ticks(9'000.0));
-        hold.hold_ticks = Ticks(3'000.0);
-        CHECK(FramePlan_PushStageEvent(hold));
-        for (const SourceStageFrame* frame : { &first, &second }) {
-            CHECK(FramePlan_PushStageEvent(Event(*frame, PacingStageEventKind::PresentCall,
-                frame->release_qpc + Ticks(2'000.0))));
-            CHECK(FramePlan_PushStageEvent(Event(*frame, PacingStageEventKind::GpuReady,
-                frame->release_qpc + Ticks(8'000.0))));
-            CHECK(FramePlan_PushStageEvent(Event(*frame, PacingStageEventKind::OutputRelease,
-                frame->release_qpc + Ticks(8'000.0), PacingPlanStatus::Late)));
-        }
-        CHECK(g_stage.DrainStageEvents() == 7);
-        const LeadStatistics lead = g_stage.Lead().Statistics();
-        CHECK(lead.samples == 2);
-        CHECK(lead.driver_hold_corrected_samples == (key_on ? 1u : 0u));
-        CHECK(key_on ? (lead.last_sample_us > 4'999.0 && lead.last_sample_us < 5'001.0)
-                     : (lead.last_sample_us > 7'999.0 && lead.last_sample_us < 8'001.0));
-        CHECK(lead.invalid_inputs == 0 && lead.unmatched_events == 0);
-    }
-}
-
-// Developer A/B held_gpu_floor: a held frame whose arrival is its GPU floor,
-// late beyond the tolerance, restarts the cadence at the floor plus its
-// bucket's early lead Q_{1−q}(X) − allowance instead of L. A cold bucket, the
-// key off, and a source that arrives after its floor (late on its own)
-// restart on L.
-void TestHeldFloorRestartOnEarlyLead()
-{
-    std::printf("Test: a restart the held frame's GPU floor causes uses the early lead\n");
-    const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
-    const auto near = [](int64_t value, int64_t expected) {
-        return value > expected - 10 && value < expected + 10;
-    };
-    {
-        ResetStage();
-        ScriptedClock clock;
-        const SourceStageFrame first = g_stage.RunPlannedFrame(Request(Key(999), held), &clock);
-        SourceStageRequest request = Request(Key(1000), held);
-        request.held_gpu_floor = true;
-        request.earliest_release_qpc = first.plan.output_target_qpc + Ticks(kIntervalUs) -
-            Ticks(first.plan.lead_us) + Ticks(6'000.0);
-        const SourceStageFrame cold = g_stage.RunPlannedFrame(request, &clock);
-        CHECK(cold.epoch_started == PacingEpochReason::SourceLate && !cold.gpu_floor_restart);
-        CHECK(near(cold.plan.output_target_qpc, request.earliest_release_qpc + Ticks(cold.plan.lead_us)));
-    }
-    struct Case { bool key_on; bool floor_is_arrival; };
-    for (const Case c : { Case{ true, true }, Case{ false, true }, Case{ true, false } }) {
-        ResetStage();
-        ScriptedClock clock;
-        uint64_t frame_id = 1000;
-        SourceStageFrame frame{};
-        // Every frame ready 3,000 µs after its release: L = Q95 3,010 + 500,
-        // early lead Q5 3,010 − 500 = 2,510 µs.
-        for (int i = 0; i < 40; ++i) {
-            frame = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
-            CHECK(frame.planned);
-            const int64_t done = frame.release_qpc + Ticks(3'000.0);
-            CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::PresentCall,
-                frame.release_qpc + Ticks(1'000.0))));
-            CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady, done)));
-            CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease, done,
-                PacingPlanStatus::Late)));
-            g_stage.DrainStageEvents();
-            clock.now = done;
-        }
-        const int64_t late = frame.plan.output_target_qpc + Ticks(kIntervalUs) -
-            Ticks(frame.plan.lead_us) + Ticks(6'000.0);
-        SourceStageRequest request = Request(Key(frame_id), held);
-        request.held_gpu_floor = c.key_on;
-        request.earliest_release_qpc = c.floor_is_arrival ? late : late - Ticks(1'000.0);
-        if (!c.floor_is_arrival) clock.now = late;
-        const uint64_t restarts_before = g_stage.Statistics().gpu_floor_restarts;
-        const SourceStageFrame restart = g_stage.RunPlannedFrame(request, &clock);
-        const bool early = c.key_on && c.floor_is_arrival;
-        CHECK(restart.planned && restart.epoch_started == PacingEpochReason::SourceLate);
-        CHECK(restart.release_qpc == late && restart.plan.source_wake_qpc == late);
-        CHECK(restart.plan.lead_us > 3'509.0 && restart.plan.lead_us < 3'511.0);
-        CHECK(restart.gpu_floor_restart == early);
-        CHECK(g_stage.Statistics().gpu_floor_restarts - restarts_before == (early ? 1u : 0u));
-        CHECK(near(restart.plan.output_target_qpc, late + Ticks(early ? 2'510.0 : restart.plan.lead_us)));
-    }
-}
-
 int main()
 {
     std::printf("=== Source stage tests ===\n");
@@ -1026,8 +915,6 @@ int main()
     TestDemotedGpuQueueWaitLead();
     TestVBlankPhaseTrackerFeedsFixedGrid();
     TestEarliestReleaseLimitsWait();
-    TestHeldFrameGpuFloorAndDriverHold();
-    TestHeldFloorRestartOnEarlyLead();
     TestResetClearsPlans();
     std::printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

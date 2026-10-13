@@ -105,23 +105,7 @@ enum class DriverLimiterApply : uint8_t {
 };
 
 // SetSleepMode on the presenting device with the game's captured parameters
-// and minimum_interval_us (and the reflex_markers_optimize override). Scheduler owner.
+// and minimum_interval_us. Scheduler owner.
 DriverLimiterApply NvAPI_ApplyDriverLimiter(uint32_t minimum_interval_us) noexcept;
-// The limiter's interval ends: SetSleepMode with the game's captured
-// parameters and the reflex_markers_optimize override. With the override at
-// game this restores the game's parameters exactly. Scheduler owner.
+// Restores the game's parameters (RestoreGameSleepMode). Scheduler owner.
 void NvAPI_ReleaseDriverLimiter() noexcept;
-
-// Developer key reflex_markers_optimize = off: every SetSleepMode ReLimiter
-// forwards or applies carries bUseMarkersToOptimize = false. Only the forwarded
-// copy changes: the captured game parameters, and with them
-// RestoreGameSleepMode, keep the game's value. Published by
-// Config_ApplyPacingPipeline.
-inline std::atomic<bool> g_reflex_markers_optimize_off{false};
-
-// SetSleepMode on the presenting device with the game's captured parameters,
-// the driver limiter's interval when applied and the reflex_markers_optimize
-// override: the OSD calls it after changing the key so it takes effect at once
-// instead of at the game's next SetSleepMode call. NoGameParams until the
-// game's first call (the hook then applies the key itself).
-DriverLimiterApply NvAPI_ReapplyGameSleepMode() noexcept;

@@ -88,22 +88,6 @@ void PresentGate_OnPresentStart(const PacingPlanKey& key, int64_t arrival_qpc,
 void PresentGate_OnFrameMarker(const PacingPlanKey& key, PacingStageEventKind kind,
                                int64_t arrival_qpc) noexcept;
 
-// The frame's own render-thread start hold (developer A/B key
-// render_start_hold, Hook_SetLatencyMarker): pushes the RenderStartHold stage
-// event of a planned frame with the hold's end and duration, before the
-// frame's RENDERSUBMIT_START event, so the lead leaves it out of X and σ
-// (lead_controller.h). Never blocks; nothing for an unplanned frame or a
-// non-positive hold.
-void PresentGate_OnRenderStartHold(const PacingPlanKey& key, int64_t end_qpc, int64_t hold_ticks) noexcept;
-
-// One call of the NVIDIA driver's hold inside NvAPI_D3D12_SetAsyncFrameMarker
-// (Hook_SetAsyncFrameMarker), key = the async marker's NvAPI frame ID: pushes
-// the DriverPresentHold stage event of a planned frame with the call's end and
-// duration; the lead keeps the longest per frame and, under the developer A/B
-// held_gpu_floor, leaves it out of the next frame's sample (lead_controller.h).
-// Never blocks; nothing for an unplanned frame or a non-positive hold.
-void PresentGate_OnDriverPresentHold(const PacingPlanKey& key, int64_t end_qpc, int64_t hold_ticks) noexcept;
-
 // Same-thread attribution for the native Present that follows a PRESENT_START
 // marker (pacing_telemetry.h). marker_qpc is the marker arrival, before any
 // hold; gate is the PRESENT_START executor outcome, or {} when none ran.

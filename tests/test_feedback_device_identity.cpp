@@ -173,10 +173,6 @@ uint64_t s_handoff_frame = 0;      // Scheduler_RenderHandoffFrame; 0 = not limi
 unsigned s_handoff_stalls = 0;     // Scheduler_RenderHandoffStalled calls
 int64_t s_planned_handoff_qpc = -1; // handoff_qpc of the newest Scheduler_PlanReflexSleep
 int64_t RealQpc();
-// Render-thread start hold (stubs below: sleep.cpp and the telemetry worker are not linked).
-unsigned s_render_start_waits = 0;
-int64_t s_render_start_wait_target = 0;
-std::vector<PacingWaitRecord> s_wait_records;
 unsigned s_mode_calls = 0;
 int s_sleep_action = 0;
 NV_SET_SLEEP_MODE_PARAMS* s_expected_mode_params = nullptr;
@@ -348,88 +344,6 @@ void TestReflexCallForwarding() {
     s_orig_sleep = old_sleep;
     s_orig_sleep_mode = old_mode;
     NvAPI_ClearFeedbackDevice();
-}
-
-NV_SET_SLEEP_MODE_PARAMS s_recorded_mode{};
-const NV_SET_SLEEP_MODE_PARAMS* s_recorded_pointer = nullptr;
-unsigned s_recorded_calls = 0;
-NvAPI_Status __cdecl RecordingSleepMode(IUnknown*, NV_SET_SLEEP_MODE_PARAMS* params) {
-    s_recorded_mode = *params;
-    s_recorded_pointer = params;
-    ++s_recorded_calls;
-    return NVAPI_OK;
-}
-
-// reflex_markers_optimize: with game the detour forwards the game's own
-// pointer; with off every SetSleepMode ReLimiter forwards or applies carries
-// bUseMarkersToOptimize = 0 (one call, combined with the driver limiter's
-// interval) while the captured game parameters keep 1. Restore forwards the
-// game's original parameters exactly.
-void TestMarkersOptimizeOverride() {
-    FakeDevice device;
-    CHECK(NvAPI_CaptureFeedbackDevice(&device));
-    const auto old_mode = s_orig_sleep_mode;
-    s_orig_sleep_mode = RecordingSleepMode;
-    NV_SET_SLEEP_MODE_PARAMS params{};
-    params.version = NV_SLEEP_PARAMS_VER;
-    params.minimumIntervalUs = 1234;
-    params.bLowLatencyMode = params.bLowLatencyBoost = params.bUseMarkersToOptimize = params.bUseMinQueueTime = 1;
-    g_driver_limiter_interval_us.store(0);
-
-    g_reflex_markers_optimize_off.store(false);
-    CHECK(Hook_SetSleepMode(&device, &params) == NVAPI_OK);
-    CHECK(s_recorded_pointer == &params && s_recorded_mode.bUseMarkersToOptimize == 1);
-
-    // off: a forwarded copy; the game's structure and the captured copy keep 1.
-    g_reflex_markers_optimize_off.store(true);
-    unsigned calls = s_recorded_calls;
-    CHECK(Hook_SetSleepMode(&device, &params) == NVAPI_OK);
-    CHECK(s_recorded_calls == calls + 1);
-    CHECK(s_recorded_pointer != &params);
-    CHECK(s_recorded_mode.bUseMarkersToOptimize == 0 && s_recorded_mode.minimumIntervalUs == 1234);
-    CHECK(s_recorded_mode.bLowLatencyMode && s_recorded_mode.bLowLatencyBoost && s_recorded_mode.bUseMinQueueTime);
-    CHECK(params.bUseMarkersToOptimize == 1);
-    {
-        GameParamsGuard lock;
-        CHECK(s_game_params_captured && s_game_original_params.bUseMarkersToOptimize == 1);
-    }
-
-    // off with the driver limiter: still one call carrying both changes.
-    g_driver_limiter_interval_us.store(16667);
-    calls = s_recorded_calls;
-    CHECK(Hook_SetSleepMode(&device, &params) == NVAPI_OK);
-    CHECK(s_recorded_calls == calls + 1);
-    CHECK(s_recorded_mode.bUseMarkersToOptimize == 0 && s_recorded_mode.minimumIntervalUs == 16667);
-    CHECK(params.minimumIntervalUs == 1234 && g_game_requested_interval.load() == 1234);
-    g_driver_limiter_interval_us.store(0);
-
-    // The limiter's own application and the immediate reapply carry the override.
-    CHECK(NvAPI_ApplyDriverLimiter(8333) == DriverLimiterApply::Applied);
-    CHECK(s_recorded_mode.bUseMarkersToOptimize == 0 && s_recorded_mode.minimumIntervalUs == 8333);
-    CHECK(NvAPI_ReapplyGameSleepMode() == DriverLimiterApply::Applied);
-    CHECK(s_recorded_mode.bUseMarkersToOptimize == 0 && s_recorded_mode.minimumIntervalUs == 1234);
-    g_driver_limiter_interval_us.store(9000);
-    CHECK(NvAPI_ReapplyGameSleepMode() == DriverLimiterApply::Applied);
-    CHECK(s_recorded_mode.bUseMarkersToOptimize == 0 && s_recorded_mode.minimumIntervalUs == 9000);
-    g_driver_limiter_interval_us.store(0);
-
-    // The shutdown restore is the game's original, without the override.
-    calls = s_recorded_calls;
-    RestoreGameSleepMode();
-    CHECK(s_recorded_calls == calls + 1);
-    CHECK(s_recorded_mode.bUseMarkersToOptimize == 1 && s_recorded_mode.minimumIntervalUs == 1234);
-    CHECK(s_recorded_mode.bLowLatencyMode && s_recorded_mode.bLowLatencyBoost && s_recorded_mode.bUseMinQueueTime);
-
-    // Back to game: the reapply returns the game's value at once.
-    g_reflex_markers_optimize_off.store(false);
-    CHECK(NvAPI_ReapplyGameSleepMode() == DriverLimiterApply::Applied);
-    CHECK(s_recorded_mode.bUseMarkersToOptimize == 1 && s_recorded_mode.minimumIntervalUs == 1234);
-    CHECK(Hook_SetSleepMode(&device, &params) == NVAPI_OK && s_recorded_pointer == &params);
-
-    // Without a captured game call there is nothing to reapply.
-    NvAPI_ClearFeedbackDevice();
-    CHECK(NvAPI_ReapplyGameSleepMode() == DriverLimiterApply::NoGameParams);
-    s_orig_sleep_mode = old_mode;
 }
 
 void RepublishDuringQuery() {
@@ -1174,155 +1088,6 @@ void TestFrameMarkerStageEvents() {
     NvAPI_ClearFeedbackDevice();
 }
 
-// Render-thread start hold: a direct RENDERSUBMIT_START waits for the anchor's
-// Ĝ(n − 1) − (P/2 + F) when it lies ahead by at most the real frame interval,
-// then reaches the driver once, after the hold; the hold is a stage event
-// before RenderSubmitStart and a telemetry wait record. A target further away
-// or already past is applied without waiting (0 hold); another producer
-// epoch, the key off and the bypass off do not apply it at all.
-void TestRenderStartHold() {
-    FakeDevice device;
-    CHECK(NvAPI_CaptureFeedbackDevice(&device));
-    s_orig_set_latency_marker = ForwardMarker;
-    const auto saved_pipeline = PacingPipeline_GetConfig();
-    auto pipeline = saved_pipeline;
-    pipeline.render_start_hold = true;
-    PacingPipeline_SetConfig(pipeline);
-    g_reflex_sleep_bypass = true;
-    g_user_target_fps = 157;
-    s_paces_source = true;
-    g_effective_interval_us = 50'000.0; // I = 500,000 ticks
-    const uint32_t epoch = Key(1).producer_epoch;
-    constexpr int64_t kStart = 90'000; // P/2 + F = 9 ms
-    const auto publish_anchor = [&](uint64_t gpu_end_frame, int64_t gpu_end_qpc, uint32_t anchor_epoch) {
-        GpuFloorAnchor anchor;
-        anchor.valid = true;
-        anchor.identity_domain = static_cast<uint8_t>(PacingIdentityDomain::NvApiFrame);
-        anchor.producer_epoch = anchor_epoch;
-        anchor.gpu_end_frame = gpu_end_frame;
-        anchor.gpu_end_qpc = gpu_end_qpc;
-        anchor.qpc_frequency = 10'000'000;
-        anchor.period_us = 10'000.0;
-        anchor.start_us = 9'000.0;
-        RenderHandoff_PublishGpuFloor(anchor);
-    };
-    const auto send = [&](uint64_t frame) {
-        PublishPlan(Key(frame), PacingRung::SourceOnly, 2'000.0);
-        DrainStageEvents();
-        s_wait_records.clear();
-        s_call_order.clear();
-        s_record_call_order = true;
-        s_render_start_waits = 0;
-        SendMarker(&device, frame, RENDERSUBMIT_START);
-        s_record_call_order = false;
-    };
-    using Order = std::vector<std::pair<char, uint64_t>>;
-    const unsigned forwarded_before = s_forwarded_markers;
-
-    // Target 31 ms ahead (within I): waited, then forwarded once; hold event first.
-    const int64_t expected_target = RealQpc() + 400'000;
-    publish_anchor(2999, expected_target, epoch);
-    send(3000);
-    CHECK(s_render_start_waits == 1 && s_render_start_wait_target == expected_target - kStart);
-    CHECK(s_call_order == (Order{{'W', 0}, {'F', 3000}}));
-    CHECK(s_wait_records.size() == 1 && s_wait_records[0].kind == PacingWaitKind::RenderStartHold &&
-        s_wait_records[0].key.frame_id == 3000 && s_wait_records[0].key.producer_epoch == epoch &&
-        s_wait_records[0].exit_qpc > s_wait_records[0].entry_qpc);
-    const int64_t hold_ticks = s_wait_records[0].exit_qpc - s_wait_records[0].entry_qpc;
-    PacingStageEvent event{};
-    CHECK(FramePlan_PopStageEvent(&event) && event.kind == PacingStageEventKind::RenderStartHold &&
-        event.key.frame_id == 3000 && event.hold_ticks == hold_ticks && event.qpc == s_wait_records[0].exit_qpc);
-    PacingStageEvent submit{};
-    CHECK(FramePlan_PopStageEvent(&submit) && submit.kind == PacingStageEventKind::RenderSubmitStart &&
-        submit.qpc >= event.qpc && submit.grid_index == event.grid_index);
-    CHECK(!FramePlan_PopStageEvent(&submit));
-
-    // Target further ahead than I: a misprediction, applied without waiting.
-    publish_anchor(3000, RealQpc() + 1'500'000, epoch);
-    send(3001);
-    CHECK(s_render_start_waits == 0 && s_call_order == (Order{{'F', 3001}}));
-    CHECK(s_wait_records.size() == 1 && s_wait_records[0].exit_qpc == s_wait_records[0].entry_qpc);
-    CHECK(DrainStageEvents().other == 1); // RenderSubmitStart only; no hold event
-
-    // Target already past: applied without waiting.
-    publish_anchor(3001, RealQpc(), epoch);
-    send(3002);
-    CHECK(s_render_start_waits == 0 && s_wait_records.size() == 1 &&
-        s_wait_records[0].exit_qpc == s_wait_records[0].entry_qpc);
-
-    // Not applied: another producer epoch, the bypass off, the key off.
-    publish_anchor(3002, RealQpc() + 120'000, epoch + 1);
-    send(3003);
-    CHECK(s_render_start_waits == 0 && s_wait_records.empty() && s_call_order == (Order{{'F', 3003}}));
-    publish_anchor(3003, RealQpc() + 120'000, epoch);
-    g_reflex_sleep_bypass = false;
-    send(3004);
-    CHECK(s_render_start_waits == 0 && s_wait_records.empty() && s_call_order == (Order{{'F', 3004}}));
-    g_reflex_sleep_bypass = true;
-    pipeline.render_start_hold = false;
-    PacingPipeline_SetConfig(pipeline);
-    publish_anchor(3004, RealQpc() + 120'000, epoch);
-    send(3005);
-    CHECK(s_render_start_waits == 0 && s_wait_records.empty() && s_call_order == (Order{{'F', 3005}}));
-
-    // Exactly one driver call per marker, held or not.
-    CHECK(s_forwarded_markers - forwarded_before == 6);
-    GpuFloorAnchor none;
-    RenderHandoff_PublishGpuFloor(none);
-    PacingPipeline_SetConfig(saved_pipeline);
-    g_user_target_fps = 0;
-    g_effective_interval_us = 0.0;
-    NvAPI_ClearFeedbackDevice();
-}
-
-NvAPI_Status __cdecl AsyncMarkerSleeps(IUnknown*, NV_ASYNC_FRAME_MARKER_PARAMS*) {
-    Sleep(3);
-    return NVAPI_OK;
-}
-
-// Driver Present hold: with the developer A/B held_gpu_floor each
-// SetAsyncFrameMarker call of a planned frame is also a DriverPresentHold
-// stage event keyed by the async marker's frame ID, with the call's end and
-// duration (the telemetry wait record is the same call). The key off and an
-// unplanned frame push nothing; the call's result passes through.
-void TestAsyncMarkerDriverHold() {
-    s_orig_set_async_frame_marker = AsyncMarkerSleeps;
-    const auto saved_pipeline = PacingPipeline_GetConfig();
-    auto pipeline = saved_pipeline;
-    const auto call = [](uint64_t frame, uint32_t type) {
-        NV_ASYNC_FRAME_MARKER_PARAMS params{};
-        params.frameID = frame;
-        params.markerType = type;
-        s_wait_records.clear();
-        CHECK(Hook_SetAsyncFrameMarker(nullptr, &params) == NVAPI_OK);
-    };
-    PublishPlan(Key(4000), PacingRung::GpuQueueWait, 2'000.0);
-    DrainStageEvents();
-
-    pipeline.held_gpu_floor = false;
-    PacingPipeline_SetConfig(pipeline);
-    call(4000, 12);
-    CHECK(s_wait_records.size() == 1 && s_wait_records[0].kind == PacingWaitKind::AsyncFrameMarker);
-    PacingStageEvent event{};
-    CHECK(!FramePlan_PopStageEvent(&event));
-
-    pipeline.held_gpu_floor = true;
-    PacingPipeline_SetConfig(pipeline);
-    call(4000, 12);
-    CHECK(s_wait_records.size() == 1 && s_wait_records[0].exit_qpc > s_wait_records[0].entry_qpc);
-    CHECK(FramePlan_PopStageEvent(&event) && event.kind == PacingStageEventKind::DriverPresentHold &&
-        event.key == Key(4000) && event.rung == PacingRung::GpuQueueWait &&
-        event.qpc == s_wait_records[0].exit_qpc &&
-        event.hold_ticks == s_wait_records[0].exit_qpc - s_wait_records[0].entry_qpc);
-    CHECK(!FramePlan_PopStageEvent(&event));
-
-    call(4001, 12); // no plan for this frame ID
-    CHECK(s_wait_records.size() == 1 && !FramePlan_PopStageEvent(&event));
-
-    PacingPipeline_SetConfig(saved_pipeline);
-    s_orig_set_async_frame_marker = nullptr;
-}
-
 void TestNativeEndpointCancellation() {
     // H2 core with route revalidation: the hold never needs the owner and a
     // revoked route cancels it (Stale) with its partial residence retained.
@@ -1453,14 +1218,7 @@ bool Scheduler_PlanReflexSleep(int64_t, bool, int64_t handoff_qpc, int64_t*, uin
 std::atomic<double> g_effective_interval_us{0.0};
 void Scheduler_EndReflexSleep(uint64_t, int64_t) noexcept {}
 bool PreSleepWaitUntil(int64_t) { return false; }
-bool RenderStartWaitUntil(int64_t target_qpc) {
-    ++s_render_start_waits;
-    s_render_start_wait_target = target_qpc;
-    if (s_record_call_order) s_call_order.push_back({'W', 0});
-    while (RealQpc() < target_qpc) Sleep(0);
-    return true;
-}
-void PacingTelemetry_PushWait(const PacingWaitRecord& record) noexcept { s_wait_records.push_back(record); }
+void PacingTelemetry_PushWait(const PacingWaitRecord&) noexcept {} // async marker hook timing; not asserted here
 void PublishReflexControllerResidence(uint64_t, uint32_t, double residence_us) noexcept {
     ++s_residence_publications;
     s_last_residence_us = residence_us;
@@ -1512,11 +1270,8 @@ int main(int argc, char** argv) {
     TestEnforcementDuringGateAndCancellation();
     TestNativeRouteFromEveryMarker();
     TestFrameMarkerStageEvents();
-    TestRenderStartHold();
-    TestAsyncMarkerDriverHold();
     TestNativeEndpointCancellation();
     TestReflexCallForwarding();
-    TestMarkersOptimizeOverride();
     // No-FG token: native mode transitions clear it; the scheduler-side
     // observation entry point republishes it (not a fixture-only publication).
     NativeGate_SetMode(NativeGateMode::Marker);

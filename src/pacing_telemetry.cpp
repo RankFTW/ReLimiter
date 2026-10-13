@@ -44,7 +44,7 @@ namespace
     // ── Producer queues ──
     constexpr size_t kRecordQueueCapacity = 4096; // bursts of > 2 s at 1000 records/s
     constexpr size_t kReflexQueueCapacity = 2048; // at most one report per frame
-    constexpr size_t kWaitQueueCapacity = 2048;   // a hold and a few async marker calls per frame
+    constexpr size_t kWaitQueueCapacity = 2048;   // a few async marker calls per frame
 
     enum PacingQueue : size_t {
         QueueSource,

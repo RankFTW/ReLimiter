@@ -43,22 +43,6 @@ namespace
     std::atomic<int64_t> s_present_qpc{0};
     std::atomic_flag s_present_writing = ATOMIC_FLAG_INIT;
 
-    // GPU floor anchor (gpu_floor_anchor.h): single writer (the scheduler
-    // owner), seqlock over the independent fields; odd while it writes.
-    std::atomic<uint64_t> s_floor_sequence{0};
-    std::atomic<bool> s_floor_valid{false};
-    std::atomic<uint8_t> s_floor_domain{0};
-    std::atomic<uint32_t> s_floor_epoch{0};
-    std::atomic<uint64_t> s_floor_frame{0};
-    std::atomic<int64_t> s_floor_qpc{0};
-    std::atomic<int64_t> s_floor_frequency{0};
-    std::atomic<double> s_floor_period_us{0.0};
-    std::atomic<double> s_floor_gap_us{0.0};
-    std::atomic<bool> s_floor_gap_warm{false};
-    std::atomic<double> s_floor_start_us{0.0};
-    std::atomic<double> s_floor_sigma_us{0.0};
-    std::atomic<bool> s_floor_sigma_warm{false};
-
     uint32_t StreamOf(uint8_t domain, uint32_t producer_epoch) noexcept
     {
         return (static_cast<uint32_t>(domain) << 24) | (producer_epoch & 0x00FFFFFFu);
@@ -222,76 +206,6 @@ bool RenderHandoff_LatestPresentEnd(uint8_t domain, uint32_t producer_epoch, uin
     if (!ReadPresentEnd(&stream, &newest, &at) || stream != StreamOf(domain, producer_epoch)) return false;
     if (frame_id != nullptr) *frame_id = newest;
     if (qpc != nullptr) *qpc = at;
-    return true;
-}
-
-void RenderHandoff_PublishGpuFloor(const GpuFloorAnchor& anchor) noexcept
-{
-    const uint64_t sequence = s_floor_sequence.load(std::memory_order_relaxed);
-    s_floor_sequence.store(sequence + 1, std::memory_order_relaxed);
-    std::atomic_thread_fence(std::memory_order_release);
-    s_floor_valid.store(anchor.valid, std::memory_order_relaxed);
-    s_floor_domain.store(anchor.identity_domain, std::memory_order_relaxed);
-    s_floor_epoch.store(anchor.producer_epoch, std::memory_order_relaxed);
-    s_floor_frame.store(anchor.gpu_end_frame, std::memory_order_relaxed);
-    s_floor_qpc.store(anchor.gpu_end_qpc, std::memory_order_relaxed);
-    s_floor_frequency.store(anchor.qpc_frequency, std::memory_order_relaxed);
-    s_floor_period_us.store(anchor.period_us, std::memory_order_relaxed);
-    s_floor_gap_us.store(anchor.present_to_gpu_end_us, std::memory_order_relaxed);
-    s_floor_gap_warm.store(anchor.present_gap_warm, std::memory_order_relaxed);
-    s_floor_start_us.store(anchor.start_us, std::memory_order_relaxed);
-    s_floor_sigma_us.store(anchor.release_to_render_us, std::memory_order_relaxed);
-    s_floor_sigma_warm.store(anchor.release_to_render_warm, std::memory_order_relaxed);
-    s_floor_sequence.store(sequence + 2, std::memory_order_release);
-}
-
-bool RenderHandoff_ReadGpuFloor(GpuFloorAnchor* anchor) noexcept
-{
-    for (uint32_t attempt = 0; attempt < RENDER_HANDOFF_GPU_FLOOR_READ_ATTEMPTS; ++attempt) {
-        const uint64_t before = s_floor_sequence.load(std::memory_order_acquire);
-        if (before == 0) return false;
-        if (before & 1u) {
-            YieldProcessor();
-            continue;
-        }
-        GpuFloorAnchor copy;
-        copy.valid = s_floor_valid.load(std::memory_order_relaxed);
-        copy.identity_domain = s_floor_domain.load(std::memory_order_relaxed);
-        copy.producer_epoch = s_floor_epoch.load(std::memory_order_relaxed);
-        copy.gpu_end_frame = s_floor_frame.load(std::memory_order_relaxed);
-        copy.gpu_end_qpc = s_floor_qpc.load(std::memory_order_relaxed);
-        copy.qpc_frequency = s_floor_frequency.load(std::memory_order_relaxed);
-        copy.period_us = s_floor_period_us.load(std::memory_order_relaxed);
-        copy.present_to_gpu_end_us = s_floor_gap_us.load(std::memory_order_relaxed);
-        copy.present_gap_warm = s_floor_gap_warm.load(std::memory_order_relaxed);
-        copy.start_us = s_floor_start_us.load(std::memory_order_relaxed);
-        copy.release_to_render_us = s_floor_sigma_us.load(std::memory_order_relaxed);
-        copy.release_to_render_warm = s_floor_sigma_warm.load(std::memory_order_relaxed);
-        std::atomic_thread_fence(std::memory_order_acquire);
-        if (s_floor_sequence.load(std::memory_order_relaxed) != before) continue;
-        if (!copy.valid) return false;
-        *anchor = copy;
-        return true;
-    }
-    return false;
-}
-
-bool RenderHandoff_RenderStartTarget(uint8_t domain, uint32_t producer_epoch, uint64_t frame_id,
-    int64_t now_qpc, int64_t* target_qpc) noexcept
-{
-    GpuFloorAnchor anchor;
-    if (target_qpc == nullptr || !RenderHandoff_ReadGpuFloor(&anchor)) return false;
-    uint64_t present_end_frame = 0;
-    int64_t present_end_qpc = 0;
-    if (!RenderHandoff_LatestPresentEnd(domain, producer_epoch, &present_end_frame, &present_end_qpc) ||
-        present_end_qpc > now_qpc) {
-        present_end_frame = 0;
-        present_end_qpc = 0;
-    }
-    const int64_t target = gpu_floor::RenderStartQpc(
-        anchor, domain, producer_epoch, frame_id, present_end_frame, present_end_qpc);
-    if (target <= 0) return false;
-    *target_qpc = target;
     return true;
 }
 

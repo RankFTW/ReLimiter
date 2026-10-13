@@ -209,10 +209,6 @@ struct CadenceGridPlanInput {
     // still misses T starts an OutputLate epoch. 0 (unknown) keeps the
     // tolerance alone. Negative or non-finite counts as 0.
     double source_slack_us = 0.0;
-    // The SourceLate restart's lead when the frame's arrival is its GPU floor
-    // (developer A/B held_gpu_floor, source_stage.h): T = now + this, at most
-    // L, instead of now + L. 0 or non-finite keeps L (every other restart).
-    double floor_restart_lead_us = 0.0;
     PacingTimingMode mode = PacingTimingMode::Vrr; // Off suspends the grid
     uint32_t controller_generation = 0;
     CadenceGridFixedReference fixed{}; // used only in Fixed mode
@@ -226,7 +222,6 @@ struct CadenceGridPlan {
     uint32_t epoch = 0;
     PacingEpochReason epoch_reason = PacingEpochReason::None; // None: no epoch started
     bool released_immediately = false; // source late within tolerance (plus slack): S_n = now
-    bool floor_restart = false; // a SourceLate restart on floor_restart_lead_us shorter than L
 };
 
 constexpr size_t kCadenceGridEpochReasonCount =

@@ -232,8 +232,6 @@ void LeadController::Reset(int64_t qpc_frequency) noexcept
     for (LeadSampleWindow& room : room_windows_) room.Reset();
     handoff_window_.Reset();
     handoff_stream_frames_ = 0;
-    report_pair_epoch_ = 0;
-    report_pair_frame_ = 0;
     gpu_end_epoch_ = 0;
     gpu_end_frame_ = 0;
     gpu_end_qpc_ = 0;
@@ -263,7 +261,6 @@ void LeadController::ResetBuckets() noexcept
     release_to_render_window_.Reset();
     for (PendingFrame& frame : pending_) {
         if (frame.occupied && frame.started) frame.finalized = true;
-        frame.lead_sample_waiting = false; // its sample belongs to the old buckets
     }
 }
 
@@ -412,20 +409,6 @@ double LeadController::MedianSampleUs(PacingRung rung, double fg_divisor) const 
     return window.Quantile(0.5);
 }
 
-double LeadController::EarlyLeadUs(PacingRung rung, double fg_divisor, double quantile,
-    double allowance_us) const noexcept
-{
-    size_t index = 0;
-    if (!std::isfinite(quantile) || !std::isfinite(allowance_us) ||
-        !FindBucketIndex(rung, fg_divisor, &index)) {
-        return 0.0;
-    }
-    const LeadSampleWindow& window = buckets_[index].window;
-    if (window.Count() < LEAD_WARM_SAMPLES) return 0.0;
-    return std::max(0.0, window.Quantile(1.0 - std::clamp(quantile, 0.0, 1.0)) -
-        std::max(allowance_us, 0.0));
-}
-
 double LeadController::HoldRoomUs(double fg_divisor, double quantile) const noexcept
 {
     size_t index = 0;
@@ -456,41 +439,31 @@ double LeadController::GpuFloorStartUs() const noexcept
     return gpu_period_window_.Quantile(0.5) / 2.0 + first_submission_window_.Quantile(0.5);
 }
 
-GpuFloorAnchor LeadController::GpuFloorAnchorSnapshot() const noexcept
-{
-    GpuFloorAnchor anchor;
-    const double start_us = GpuFloorStartUs();
-    if (!(start_us > 0.0) || qpc_frequency_ <= 0 || gpu_end_epoch_ == 0 || gpu_end_qpc_ <= 0) return anchor;
-    anchor.valid = true;
-    anchor.identity_domain = static_cast<uint8_t>(PacingIdentityDomain::NvApiFrame);
-    anchor.producer_epoch = gpu_end_epoch_;
-    anchor.gpu_end_frame = gpu_end_frame_;
-    anchor.gpu_end_qpc = gpu_end_qpc_;
-    anchor.qpc_frequency = qpc_frequency_;
-    anchor.period_us = gpu_period_window_.Quantile(0.5);
-    anchor.present_gap_warm = gpu_after_present_window_.Count() >= LEAD_WARM_SAMPLES;
-    anchor.present_to_gpu_end_us = anchor.present_gap_warm
-        ? gpu_after_present_window_.Quantile(LEAD_HANDOFF_GPU_BOUND_QUANTILE) : 0.0;
-    anchor.start_us = start_us;
-    anchor.release_to_render_warm = release_to_render_window_.Count() >= LEAD_WARM_SAMPLES;
-    anchor.release_to_render_us = anchor.release_to_render_warm ? release_to_render_window_.Quantile(0.5) : 0.0;
-    return anchor;
-}
-
 int64_t LeadController::GpuFloorQpc(const PacingPlanKey& key, uint64_t present_end_frame,
     int64_t present_end_qpc) const noexcept
 {
+    const double start_us = GpuFloorStartUs();
+    if (!(start_us > 0.0) || qpc_frequency_ <= 0 || release_to_render_window_.Count() < LEAD_WARM_SAMPLES ||
+        key.identity_domain != PacingIdentityDomain::NvApiFrame || key.producer_epoch == 0 ||
+        key.producer_epoch != gpu_end_epoch_ || gpu_end_qpc_ <= 0 || key.frame_id <= gpu_end_frame_ ||
+        key.frame_id - 1 - gpu_end_frame_ > LEAD_HANDOFF_GPU_HORIZON_FRAMES) {
+        return 0;
+    }
+    const auto ticks = [this](double us) {
+        return static_cast<int64_t>(std::llround(us * static_cast<double>(qpc_frequency_) / kMicrosecondsPerSecond));
+    };
+    const double period_us = gpu_period_window_.Quantile(0.5);
+    // Ĝ(n − 1): the newest report extrapolated, at least the live bound from
+    // a newer frame's PRESENT_END.
+    int64_t predicted_qpc = gpu_end_qpc_ + ticks(static_cast<double>(key.frame_id - 1 - gpu_end_frame_) * period_us);
+    if (present_end_qpc > 0 && present_end_frame > gpu_end_frame_ && present_end_frame < key.frame_id &&
+        gpu_after_present_window_.Count() >= LEAD_WARM_SAMPLES) {
+        const double bound_us = gpu_after_present_window_.Quantile(LEAD_HANDOFF_GPU_BOUND_QUANTILE) +
+            static_cast<double>(key.frame_id - 1 - present_end_frame) * period_us;
+        predicted_qpc = (std::max)(predicted_qpc, present_end_qpc + ticks(bound_us));
+    }
     // Ĝ(n − 1) − (P/2 + F + σ).
-    return gpu_floor::FloorQpc(GpuFloorAnchorSnapshot(), static_cast<uint8_t>(key.identity_domain),
-        key.producer_epoch, key.frame_id, present_end_frame, present_end_qpc);
-}
-
-int64_t LeadController::GpuRenderStartQpc(const PacingPlanKey& key, uint64_t present_end_frame,
-    int64_t present_end_qpc) const noexcept
-{
-    // Ĝ(n − 1) − (P/2 + F).
-    return gpu_floor::RenderStartQpc(GpuFloorAnchorSnapshot(), static_cast<uint8_t>(key.identity_domain),
-        key.producer_epoch, key.frame_id, present_end_frame, present_end_qpc);
+    return predicted_qpc - ticks(start_us + release_to_render_window_.Quantile(0.5));
 }
 
 LeadBucketStatus LeadController::BucketStatus(PacingRung rung, double fg_divisor) const noexcept
@@ -596,7 +569,6 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
     }
     slot.gpu_resume_probe = frame.gpu_resume_probe;
     slot.render_queue = frame.render_queue;
-    slot.driver_hold_exclusion = frame.driver_hold_exclusion;
     SetField(&slot, FieldSource, frame.source_release_qpc);
     RecordReleaseToRender(&slot);
     if (slot.sampled && slot.rung == PacingRung::GpuQueueWait) {
@@ -624,11 +596,9 @@ void LeadController::OnStageEvent(const PacingStageEvent& event) noexcept
         "Field values must match PacingStageEventKind");
     static_assert(FieldCount <= 16, "field_mask holds one bit per Field");
 
-    const bool start_hold_event = event.kind == PacingStageEventKind::RenderStartHold;
-    const bool hold_event = start_hold_event || event.kind == PacingStageEventKind::DriverPresentHold;
     const uint8_t kind = static_cast<uint8_t>(event.kind);
-    if (qpc_frequency_ <= 0 || event.qpc <= 0 || !PacingPlanKey_IsValid(event.key) ||
-        (hold_event ? event.hold_ticks <= 0 : (kind == FieldSource || kind >= FieldCount))) {
+    if (qpc_frequency_ <= 0 || kind == FieldSource || kind >= FieldCount || event.qpc <= 0 ||
+        !PacingPlanKey_IsValid(event.key)) {
         ++statistics_.invalid_inputs;
         return;
     }
@@ -654,19 +624,6 @@ void LeadController::OnStageEvent(const PacingStageEvent& event) noexcept
         return;
     }
 
-    if (hold_event) {
-        // Not a stage time. The render-thread start hold leaves this frame's
-        // X and σ (RenderStartHoldUs): the push precedes the frame's
-        // RENDERSUBMIT_START event, so it is known before σ and any sample
-        // are taken; the first value wins. The driver's Present hold is kept
-        // for the next frame's sample (DriverHoldUs); the longest call wins.
-        if (start_hold_event) {
-            if (frame->render_start_hold_ticks == 0) frame->render_start_hold_ticks = event.hold_ticks;
-        } else if (event.hold_ticks > frame->driver_hold_ticks) {
-            frame->driver_hold_ticks = event.hold_ticks;
-        }
-        return;
-    }
     const Field field = static_cast<Field>(kind);
     if (HasField(*frame, field)) return; // the first value of each kind wins
     SetField(frame, field, event.qpc);
@@ -717,7 +674,7 @@ void LeadController::OnGpuActiveTime(uint32_t producer_epoch, uint64_t frame_id,
     ++statistics_.unmatched_gpu_active;
 }
 
-// Report pairs, the held-back wait and the GPU floor (lead_controller.h).
+// Report pairs and the GPU floor (lead_controller.h).
 namespace
 {
     bool ValidPair(const HandoffBackPressureSample& sample) noexcept
@@ -737,16 +694,6 @@ namespace
     }
 }
 
-bool HandoffBackPressure_HeldBack(const HandoffBackPressureSample& sample, bool streams) noexcept
-{
-    if (!ValidPair(sample)) return false;
-    const bool gpu_waited = sample.gpu_start_us - sample.previous_gpu_end_us > LEAD_HANDOFF_GPU_IDLE_US;
-    // The render thread went straight from frame n − 1 into frame n: the
-    // simulation had ended before it was free.
-    const bool render_busy = sample.simulation_end_us < sample.previous_render_free_us;
-    return !gpu_waited && LateInWindow(sample) && (render_busy || streams);
-}
-
 bool HandoffBackPressure_Streams(const HandoffBackPressureSample& sample) noexcept
 {
     return ValidPair(sample) && !LateInWindow(sample);
@@ -759,38 +706,10 @@ void LeadController::OnReportPair(uint32_t producer_epoch, uint64_t frame_id,
         ++statistics_.invalid_inputs;
         return;
     }
-    if (producer_epoch != report_pair_epoch_) {
-        report_pair_epoch_ = producer_epoch;
-        report_pair_frame_ = frame_id;
-    } else if (frame_id > report_pair_frame_) {
-        report_pair_frame_ = frame_id;
-    }
     if (HandoffBackPressure_Streams(sample)) {
         if (handoff_stream_frames_ < LEAD_HANDOFF_STREAM_PROOF) ++handoff_stream_frames_;
         first_submission_window_.Add(sample.first_submission_us - sample.render_start_us);
     }
-    for (PendingFrame& frame : pending_) {
-        if (!frame.occupied || !frame.started || frame.key.identity_domain != PacingIdentityDomain::NvApiFrame ||
-            frame.key.producer_epoch != producer_epoch || frame.key.frame_id != frame_id) {
-            continue;
-        }
-        if (frame.report_paired) return;
-        frame.report_paired = true;
-        ++statistics_.report_pairs;
-        if (HandoffBackPressure_HeldBack(sample, HandoffStreams())) {
-            ++statistics_.held_back_frames;
-            if (first_submission_window_.Count() >= LEAD_WARM_SAMPLES) {
-                frame.held_back_wait_us = std::max(0.0, sample.first_submission_us - sample.render_start_us -
-                    first_submission_window_.Quantile(0.5));
-            }
-        }
-        if (frame.lead_sample_waiting) {
-            frame.lead_sample_waiting = false;
-            CommitLeadSample(&frame, frame.waiting_lead_sample_us);
-        }
-        return;
-    }
-    ++statistics_.unmatched_report_pairs;
 }
 
 void LeadController::OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, int64_t gpu_start_qpc,
@@ -827,21 +746,8 @@ void LeadController::RecordReleaseToRender(PendingFrame* frame) noexcept
     const double release_to_render_us =
         MicrosecondsBetween(frame->qpc[FieldSource], frame->qpc[FieldRenderSubmit]);
     if (release_to_render_us >= 0.0 && release_to_render_us <= LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us) {
-        // Without the frame's own start hold, which comes after the release.
-        release_to_render_window_.Add(std::max(0.0, release_to_render_us - RenderStartHoldUs(*frame)));
+        release_to_render_window_.Add(release_to_render_us);
     }
-}
-
-double LeadController::RenderStartHoldUs(const PendingFrame& frame) const noexcept
-{
-    if (frame.render_start_hold_ticks <= 0 || qpc_frequency_ <= 0) return 0.0;
-    return MicrosecondsBetween(0, frame.render_start_hold_ticks);
-}
-
-double LeadController::DriverHoldUs(const PendingFrame& frame) const noexcept
-{
-    if (frame.driver_hold_ticks <= 0 || qpc_frequency_ <= 0) return 0.0;
-    return MicrosecondsBetween(0, frame.driver_hold_ticks);
 }
 
 // ── Buckets ──
@@ -1004,12 +910,6 @@ void LeadController::ExpireBehindNewest() noexcept
             continue;
         }
         if (!frame.finalized) ForceFinalize(&frame);
-        // Its report pair did not come in time: the sample counts as measured.
-        if (frame.lead_sample_waiting) {
-            frame.lead_sample_waiting = false;
-            ++statistics_.unpaired_lead_samples;
-            CommitLeadSample(&frame, frame.waiting_lead_sample_us);
-        }
         frame.closed = true;
     }
     for (PendingFrame& frame : pending_) TryFinalize(&frame);
@@ -1280,11 +1180,6 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
         ++statistics_.carried_hold_samples;
         statistics_.last_carried_hold_us = carried_us;
     }
-    const double render_start_hold_us = RenderStartHoldUs(*frame);
-    if (render_start_hold_us > 0.0) {
-        ++statistics_.render_start_hold_samples;
-        statistics_.last_render_start_hold_us = render_start_hold_us;
-    }
     Bucket& bucket = buckets_[frame->bucket];
     // Lockstep engines (lead_controller.h): ReLimiter's waits for later frames
     // that this frame's Present followed are not the game's lateness.
@@ -1314,60 +1209,11 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
     // frame waited for the render thread to leave the previous Present; the
     // slack above keeps it.
     const double queue_us = QueueUs(*frame, Previous(*frame));
-    frame->queue_removed_us = queue_us > 0.0 ? queue_us : 0.0;
-    // The driver's Present hold under the previous NvAPI frame ID delays this
-    // frame's first submission (lead_controller.h); CommitLeadSample takes
-    // what q and W did not already remove.
-    frame->previous_driver_hold_us = 0.0;
-    if (frame->driver_hold_exclusion && IsGpuRung(frame->rung)) {
-        const PendingFrame* previous = Previous(*frame);
-        if (previous != nullptr && previous->key.identity_domain == PacingIdentityDomain::NvApiFrame &&
-            frame->key.identity_domain == PacingIdentityDomain::NvApiFrame &&
-            previous->key.producer_epoch == frame->key.producer_epoch &&
-            previous->key.frame_id + 1 == frame->key.frame_id) {
-            frame->previous_driver_hold_us = DriverHoldUs(*previous);
-        }
-    }
     if (queue_us > 0.0) {
         ++statistics_.queued_samples;
         statistics_.last_queue_us = queue_us;
     }
-    // A frame on a GPU wait also leaves out the time the GPU held its render
-    // thread back, which only its Reflex report pair shows (lead_controller.h).
-    frame->carried_hold_us = carried_us;
-    if (!frame->report_paired && AwaitsReportPair(*frame)) {
-        frame->lead_sample_waiting = true;
-        frame->waiting_lead_sample_us = sample_us - queue_us;
-        return;
-    }
-    CommitLeadSample(frame, sample_us - queue_us);
-}
-
-bool LeadController::AwaitsReportPair(const PendingFrame& frame) const noexcept
-{
-    return IsGpuRung(frame.rung) && frame.key.identity_domain == PacingIdentityDomain::NvApiFrame &&
-        frame.key.producer_epoch == report_pair_epoch_ && report_pair_frame_ != 0 &&
-        frame.key.frame_id <= report_pair_frame_ + LEAD_REPORT_PAIR_HORIZON_FRAMES;
-}
-
-void LeadController::CommitLeadSample(PendingFrame* frame, double lead_sample_us) noexcept
-{
-    Bucket& bucket = buckets_[frame->bucket];
-    const double held_back_us = std::max(0.0, frame->held_back_wait_us - frame->carried_hold_us);
-    if (held_back_us > 0.0) {
-        lead_sample_us = std::max(0.0, lead_sample_us - held_back_us);
-        ++statistics_.held_back_corrected_samples;
-        statistics_.last_held_back_wait_us = held_back_us;
-    }
-    // The driver's Present hold of the previous frame adds only what q and W
-    // did not already remove: max(q + W, H) in all.
-    const double driver_extra_us =
-        std::max(0.0, frame->previous_driver_hold_us - (frame->queue_removed_us + held_back_us));
-    if (driver_extra_us > 0.0) {
-        lead_sample_us = std::max(0.0, lead_sample_us - driver_extra_us);
-        ++statistics_.driver_hold_corrected_samples;
-        statistics_.last_driver_hold_us = frame->previous_driver_hold_us;
-    }
+    const double lead_sample_us = sample_us - queue_us;
     if (lead_sample_us > LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us) {
         ++bucket.excluded_long;
         ++statistics_.excluded_long;
@@ -1407,24 +1253,17 @@ double LeadController::SampleUs(const PendingFrame& frame, const PendingFrame* p
     if (own_ready_qpc != nullptr) *own_ready_qpc = 0;
     if (carried_us != nullptr) *carried_us = 0.0;
     const int64_t source = frame.qpc[FieldSource];
-    // The frame's own render-thread start hold (lead_controller.h) is
-    // ReLimiter's wait between the release and the arrival, ready and Present
-    // times below, so X leaves it out on every rung; no sample goes below 0.
-    const double hold_us = RenderStartHoldUs(frame);
-    const auto without_hold = [hold_us](double x_us) noexcept {
-        return hold_us > 0.0 && std::isfinite(x_us) ? std::max(0.0, x_us - hold_us) : x_us;
-    };
     switch (frame.rung) {
     case PacingRung::SourceOnly:
-        return without_hold(MicrosecondsBetween(source, frame.qpc[FieldMarkerArrival]));
+        return MicrosecondsBetween(source, frame.qpc[FieldMarkerArrival]);
     case PacingRung::MarkerHold:
     case PacingRung::NativeHold: {
         const Field arrival = frame.rung == PacingRung::MarkerHold ? FieldMarkerArrival : FieldNativeArrival;
         const double arrival_us = MicrosecondsBetween(source, frame.qpc[arrival]);
         double hold_begin_us = 0.0;
         double hold_end_us = 0.0;
-        if (!PreviousCpuHold(previous, source, &hold_begin_us, &hold_end_us)) return without_hold(arrival_us);
-        return without_hold(arrival_us - Overlap(0.0, arrival_us, hold_begin_us, hold_end_us));
+        if (!PreviousCpuHold(previous, source, &hold_begin_us, &hold_end_us)) return arrival_us;
+        return arrival_us - Overlap(0.0, arrival_us, hold_begin_us, hold_end_us);
     }
     case PacingRung::GpuQueueWait:
     case PacingRung::FgInputWait: {
@@ -1459,17 +1298,13 @@ double LeadController::SampleUs(const PendingFrame& frame, const PendingFrame* p
                 if (!(carried > 0.0)) carried = 0.0;
             }
         }
-        // c above is the delay of earlier holds; the frame's own start hold
-        // comes off the readiness it is stored with, so the next frame's c
-        // takes the delay this hold carried through a busy GPU.
         const double own_ready_us = std::max(present_us, ready_us - carried);
         if (carried_us != nullptr) *carried_us = (ready_us - own_ready_us) > 0.0 ? ready_us - own_ready_us : 0.0;
-        const double x_us = without_hold(own_ready_us);
         if (own_ready_qpc != nullptr) {
             *own_ready_qpc = source + static_cast<int64_t>(std::llround(
-                x_us * static_cast<double>(qpc_frequency_) / kMicrosecondsPerSecond));
+                own_ready_us * static_cast<double>(qpc_frequency_) / kMicrosecondsPerSecond));
         }
-        return x_us;
+        return own_ready_us;
     }
     case PacingRung::Count:
         break;
