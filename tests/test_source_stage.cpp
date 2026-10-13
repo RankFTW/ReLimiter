@@ -900,22 +900,28 @@ void TestEarliestReleaseLimitsWait()
 // the floor plus the early lead: the bucket's Q5(X) − allowance (3,010 − 500
 // µs here) until 32 frames were released by the floor, a restarted bucket's
 // old median, and then the floor-released frames' own X (TestGpuPacedRing).
-// Its record carries the GPU-paced flag. The key off, a later render-thread
-// term and an arrival after the floor are not GPU-paced; with a cold bucket
-// the floor still releases the frame but without an early lead the grid
-// judges it as before: 6 ms past S is a SourceLate restart.
+// Its record carries the GPU-paced flag. A frame whose pre-Sleep wait started
+// before the floor is the floor's even when its marker lands just after it.
+// The key off, a later render-thread term and an arrival after the floor
+// without a pre-Sleep wait are not GPU-paced; with a cold bucket the floor
+// still releases the frame but without an early lead the grid judges it as
+// before: 6 ms past S is a SourceLate restart.
 void TestGpuPacedCadence()
 {
     std::printf("Test: a frame the GPU floor releases keeps the GPU's pace\n");
     const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
-    struct Case { bool key_on; bool warm; bool restarted; bool floor_binds; bool arrival_first; bool paced; double early_us; };
+    // pre_slept: the frame's pre-Sleep wait (this index) started before the
+    // floor; its marker then arrives 100 µs after the floor.
+    struct Case { bool key_on; bool warm; bool restarted; bool floor_binds; bool arrival_first; bool pre_slept;
+                  bool paced; double early_us; };
     const Case cases[] = {
-        { true, true, false, true, true, true, 2'510.0 },
-        { true, true, true, true, true, true, 2'510.0 },
-        { false, true, false, true, true, false, 0.0 },
-        { true, true, false, false, true, false, 0.0 },
-        { true, true, false, true, false, false, 0.0 },
-        { true, false, false, true, true, true, 0.0 },
+        { true, true, false, true, true, false, true, 2'510.0 },
+        { true, true, true, true, true, false, true, 2'510.0 },
+        { false, true, false, true, true, false, false, 0.0 },
+        { true, true, false, false, true, false, false, 0.0 },
+        { true, true, false, true, false, false, false, 0.0 },
+        { true, true, false, true, false, true, true, 2'510.0 },
+        { true, false, false, true, true, false, true, 0.0 },
     };
     for (const Case& c : cases) {
         ResetStage();
@@ -943,6 +949,11 @@ void TestGpuPacedCadence()
         request.gpu_floor_qpc = floor;
         request.earliest_release_qpc = c.floor_binds ? floor : floor + Ticks(500.0);
         if (!c.arrival_first) clock.now = floor + Ticks(100.0);
+        if (c.pre_slept) {
+            request.pre_wait_index = g_stage.Grid().NextIndex();
+            request.pre_wait_start_qpc = floor - Ticks(8'000.0);
+            request.pre_wait_end_qpc = floor - Ticks(300.0);
+        }
         const uint64_t paced_before = g_stage.Statistics().gpu_paced_frames;
         const SourceStageFrame frame = g_stage.RunPlannedFrame(request, &clock);
         CHECK(frame.planned);
@@ -953,7 +964,8 @@ void TestGpuPacedCadence()
         CHECK(((record.flags & PACING_SOURCE_GPU_PACED) != 0) == c.paced);
         if (c.early_us > 0.0) {
             CHECK(frame.epoch_started == PacingEpochReason::None && frame.gpu_target);
-            CHECK(frame.release_qpc == floor && frame.plan.source_wake_qpc == floor);
+            CHECK(frame.release_qpc == (c.arrival_first ? floor : floor + Ticks(100.0)));
+            CHECK(frame.plan.source_wake_qpc == frame.release_qpc);
             const int64_t target = floor + Ticks(c.early_us);
             CHECK(frame.plan.output_target_qpc > target - 10 && frame.plan.output_target_qpc < target + 10);
         } else {

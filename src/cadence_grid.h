@@ -285,6 +285,8 @@ public:
         int64_t output_qpc) noexcept;
 
     const CadenceGridSnapshot& Snapshot() const noexcept { return snapshot_; }
+    // The grid index the next valid PlanNext takes.
+    uint64_t NextIndex() const noexcept { return next_index_; }
     CadenceGridStatistics Statistics() const noexcept { return statistics_; }
 
 private:

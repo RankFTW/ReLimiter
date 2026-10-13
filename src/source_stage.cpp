@@ -188,8 +188,16 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     // Developer A/B gpu_paced_cadence (source_stage.h): when the GPU floor
     // sets this frame's release, the frame is on time by construction and
     // its output target is at least where such a frame is ready at the
-    // earliest, so the grid follows the GPU instead of restarting.
-    const bool gpu_floor_release = request.gpu_paced_cadence && request.gpu_floor_qpc > arrival_qpc &&
+    // earliest, so the grid follows the GPU instead of restarting. The game
+    // reached ReLimiter at its marker, or earlier at the Reflex Sleep when a
+    // pre-Sleep wait for this index ran: that wait already aims at the floor
+    // (less its margin), so the marker can land just after the floor without
+    // the game being late (Gears of War: E-Day, FG 2× at 120: 21% of the
+    // frames, nearly half of them restarting the cadence).
+    const bool pre_slept = request.pre_wait_index != 0 && request.pre_wait_index == grid_.NextIndex() &&
+        request.pre_wait_start_qpc > 0;
+    const int64_t game_arrival_qpc = pre_slept ? (std::min)(arrival_qpc, request.pre_wait_start_qpc) : arrival_qpc;
+    const bool gpu_floor_release = request.gpu_paced_cadence && request.gpu_floor_qpc > game_arrival_qpc &&
         request.gpu_floor_qpc >= request.earliest_release_qpc;
     if (gpu_floor_release) {
         const double early_us = lead_.EarlyLeadUs(slack_rung, request.fg_divisor,
@@ -291,9 +299,10 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     // only the GPU queue wait may wait for a GpuResume event.
     start.gpu_resume_probe = pipeline.gpu_probes && plan.rung == PacingRung::GpuQueueWait;
     start.render_queue = request.gpu_queue_wait_render_queue;
-    // GPU-paced cadence: the GPU floor released this frame (its wait ran to
-    // the floor from an earlier arrival).
-    frame.gpu_paced = gpu_floor_release && frame.handoff_limited;
+    // GPU-paced cadence: the GPU floor released this frame: the game reached
+    // ReLimiter before its floor and the grid's own S did not bind (the wait
+    // ran to the floor, or the pre-Sleep wait already brought the frame there).
+    frame.gpu_paced = gpu_floor_release && grid_plan.source_wake_qpc <= input.now_qpc;
     if (frame.gpu_paced) ++statistics_.gpu_paced_frames;
     start.gpu_floor_release = frame.gpu_paced;
     lead_.OnSourceRelease(start);

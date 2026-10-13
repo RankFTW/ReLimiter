@@ -1210,14 +1210,21 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
         ++statistics_.carried_hold_samples;
         statistics_.last_carried_hold_us = carried_us;
     }
-    // GPU-paced cadence (EarlyLeadUs): X of a frame the GPU floor released,
-    // with the delay earlier holds carried removed, before any queue below.
-    if (frame->gpu_floor_release && sample_us >= 0.0 &&
-        sample_us <= LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us) {
+    // GPU-paced cadence (EarlyLeadUs): how long a frame the GPU floor
+    // released took to be ready. On the GPU waits the measured readiness
+    // itself, not the sample: its correction for holds carried through a
+    // busy GPU chains through earlier frames, and the early side must not
+    // follow it down (Gears of War: E-Day, FG 2× at 120: targets as little as
+    // 20 ms after the floor while such frames were ready after 26.8 ms or more).
+    const double ready_us = IsGpuRung(frame->rung) && HasField(*frame, FieldGpuReady)
+        ? MicrosecondsBetween(frame->qpc[FieldSource], frame->qpc[FieldGpuReady])
+        : sample_us;
+    if (frame->gpu_floor_release && ready_us >= 0.0 &&
+        ready_us <= LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us) {
         GpuPacedRing& ring = gpu_paced_rings_[IsGpuRung(frame->rung) ? 0 : 1];
         const size_t divisor = frame->bucket % LEAD_DIVISOR_BUCKETS;
         if (ring.divisor != divisor) ring = GpuPacedRing{ {}, 0, 0, divisor };
-        ring.x_us[ring.head] = static_cast<float>(sample_us);
+        ring.x_us[ring.head] = static_cast<float>(ready_us);
         ring.head = (ring.head + 1) % static_cast<uint32_t>(LEAD_GPU_PACED_CAPACITY);
         if (ring.count < LEAD_GPU_PACED_CAPACITY) ++ring.count;
     }
