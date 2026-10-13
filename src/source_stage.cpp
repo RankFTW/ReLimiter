@@ -186,10 +186,12 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     const double median_x_us = lead_.MedianSampleUs(slack_rung, request.fg_divisor);
     input.source_slack_us = median_x_us > 0.0 ? (std::max)(0.0, lead_us - median_x_us) : 0.0;
     // Developer A/B gpu_paced_cadence (source_stage.h): when the GPU floor
-    // sets this frame's release, its output target is at least where such a
-    // frame is ready at the earliest, so the grid follows the GPU.
-    if (request.gpu_paced_cadence && request.gpu_floor_qpc > arrival_qpc &&
-        request.gpu_floor_qpc >= request.earliest_release_qpc) {
+    // sets this frame's release, the frame is on time by construction and
+    // its output target is at least where such a frame is ready at the
+    // earliest, so the grid follows the GPU instead of restarting.
+    const bool gpu_floor_release = request.gpu_paced_cadence && request.gpu_floor_qpc > arrival_qpc &&
+        request.gpu_floor_qpc >= request.earliest_release_qpc;
+    if (gpu_floor_release) {
         const double early_us = lead_.EarlyLeadUs(slack_rung, request.fg_divisor,
             pipeline.lead_quantile, pipeline.allowance_us);
         if (early_us > 0.0) {
@@ -222,7 +224,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     frame.lead_budget_limited = budget_limited;
     frame.epoch_started = grid_plan.epoch_reason;
     frame.grid_epoch_reason = snapshot.epoch_reason;
-    frame.gpu_paced = grid_plan.gpu_paced;
+    frame.gpu_target = grid_plan.gpu_target;
 
     // Publish before the wait: PRESENT_START and the output executors never
     // wait for the owner.
@@ -289,6 +291,11 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     // only the GPU queue wait may wait for a GpuResume event.
     start.gpu_resume_probe = pipeline.gpu_probes && plan.rung == PacingRung::GpuQueueWait;
     start.render_queue = request.gpu_queue_wait_render_queue;
+    // GPU-paced cadence: the GPU floor released this frame (its wait ran to
+    // the floor from an earlier arrival).
+    frame.gpu_paced = gpu_floor_release && frame.handoff_limited;
+    if (frame.gpu_paced) ++statistics_.gpu_paced_frames;
+    start.gpu_floor_release = frame.gpu_paced;
     lead_.OnSourceRelease(start);
     return frame;
 }

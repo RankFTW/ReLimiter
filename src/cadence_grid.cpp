@@ -491,11 +491,12 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
         return plan;
     }
 
-    // GPU-paced target: a later earliest target moves the grid from n
-    // without an epoch. The frame is on time by construction: its lateness
-    // is not judged, so the move never counts as a restart.
-    bool gpu_paced = false;
-    if (input.earliest_target_qpc > target_qpc && input.earliest_target_qpc <= kMaximumNowQpc) {
+    // GPU-paced frame (earliest target given): on time by construction, so
+    // its lateness is not judged and it never restarts the cadence. A later
+    // earliest target moves the grid from n without an epoch.
+    const bool gpu_paced = input.earliest_target_qpc > 0 && input.earliest_target_qpc <= kMaximumNowQpc;
+    bool gpu_target = false;
+    if (gpu_paced && input.earliest_target_qpc > target_qpc) {
         ExactQpc origin{};
         if (!OriginAtOrAfter(next, WholeQpc(input.earliest_target_qpc), &origin)) {
             ++statistics_.invalid_inputs;
@@ -507,7 +508,7 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
             ++statistics_.invalid_inputs;
             return plan;
         }
-        gpu_paced = true;
+        gpu_target = true;
     }
 
     // Step 3: source lateness against S = T - L.
@@ -561,7 +562,7 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
     if (silent_rebase) ++statistics_.silent_rebases;
     if (released_immediately) ++statistics_.released_immediately;
     if (timing.snapped) ++statistics_.snapped_plans;
-    if (gpu_paced) ++statistics_.gpu_paced_plans;
+    if (gpu_target) ++statistics_.gpu_target_plans;
 
     plan.valid = true;
     plan.grid_index = grid_index;
@@ -570,7 +571,7 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
     plan.epoch = next.epoch;
     plan.epoch_reason = reason;
     plan.released_immediately = released_immediately;
-    plan.gpu_paced = gpu_paced;
+    plan.gpu_target = gpu_target;
     return plan;
 }
 

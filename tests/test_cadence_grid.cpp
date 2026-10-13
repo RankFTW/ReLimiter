@@ -444,11 +444,11 @@ namespace
         CHECK(beyond.epoch_reason == PacingEpochReason::SourceLate);
     }
 
-    // GPU-paced target (gpu_paced_cadence): a later earliest target moves
-    // the grid from n without an epoch and the frame's lateness is not
-    // judged; an earlier one, or none, keeps the grid; the next frames
-    // continue from the moved segment, and older indices keep theirs.
-    // I = 10 ms, L = 6 ms, tol = 2.5 ms.
+    // GPU-paced frame (gpu_paced_cadence): a frame with an earliest target is
+    // never judged late; a later earliest target moves the grid from n
+    // without an epoch, an earlier one keeps the grid's T(n) even when the
+    // frame is far past S; the next frames continue from the moved segment,
+    // and older indices keep theirs. I = 10 ms, L = 6 ms, tol = 2.5 ms.
     void TestGpuPacedTarget()
     {
         const int64_t lead_ticks = 60000;
@@ -461,7 +461,7 @@ namespace
         // A later earliest target on the lifecycle's first plan: T moves,
         // the Lifecycle epoch stays.
         const CadenceGridPlan first = grid.PlanNext(input(kStartQpc, kStartQpc + 90000));
-        CHECK(first.epoch_reason == PacingEpochReason::Lifecycle && first.gpu_paced);
+        CHECK(first.epoch_reason == PacingEpochReason::Lifecycle && first.gpu_target);
         CHECK(first.output_target_qpc == kStartQpc + 90000);
         const int64_t t1 = first.output_target_qpc;
 
@@ -470,7 +470,7 @@ namespace
         const int64_t grid_t2 = t1 + 100000;
         const int64_t now2 = grid_t2 - lead_ticks + 200000;
         const CadenceGridPlan second = grid.PlanNext(input(now2, now2 + 25000));
-        CHECK(second.valid && second.gpu_paced && second.epoch_reason == PacingEpochReason::None);
+        CHECK(second.valid && second.gpu_target && second.epoch_reason == PacingEpochReason::None);
         CHECK(!second.released_immediately && second.epoch == first.epoch);
         CHECK(second.output_target_qpc == now2 + 25000 && second.source_wake_qpc == now2);
         CHECK(TargetOf(grid, 1) == t1);
@@ -478,24 +478,28 @@ namespace
         // No earliest target: the grid continues from the moved segment.
         const int64_t t2 = second.output_target_qpc;
         const CadenceGridPlan third = grid.PlanNext(input(t2 + 100000 - lead_ticks, 0));
-        CHECK(!third.gpu_paced && third.epoch_reason == PacingEpochReason::None);
+        CHECK(!third.gpu_target && third.epoch_reason == PacingEpochReason::None);
         CHECK(third.output_target_qpc == t2 + 100000);
         CHECK(third.source_wake_qpc == t2 + 100000 - lead_ticks);
 
-        // An earliest target at or before the grid's T changes nothing.
+        // An earliest target at or before the grid's T keeps T(n), and the
+        // frame is not judged late even 5 ms past S (beyond the tolerance).
         const int64_t t3 = third.output_target_qpc;
-        const CadenceGridPlan fourth = grid.PlanNext(input(t3 + 100000 - lead_ticks, t3 + 100000));
-        CHECK(!fourth.gpu_paced && fourth.output_target_qpc == t3 + 100000);
+        const int64_t now4 = t3 + 100000 - lead_ticks + 50000;
+        const CadenceGridPlan fourth = grid.PlanNext(input(now4, t3 + 100000));
+        CHECK(!fourth.gpu_target && fourth.epoch_reason == PacingEpochReason::None);
+        CHECK(fourth.output_target_qpc == t3 + 100000 && fourth.source_wake_qpc == now4);
+        CHECK(!fourth.released_immediately);
 
         // Without an earliest target the same lateness restarts the cadence.
         const int64_t t4 = fourth.output_target_qpc;
         const int64_t late = t4 + 100000 - lead_ticks + 200000;
         const CadenceGridPlan fifth = grid.PlanNext(input(late, 0));
-        CHECK(fifth.epoch_reason == PacingEpochReason::SourceLate && !fifth.gpu_paced);
+        CHECK(fifth.epoch_reason == PacingEpochReason::SourceLate && !fifth.gpu_target);
         CHECK(fifth.output_target_qpc == late + lead_ticks);
 
         const CadenceGridStatistics statistics = grid.Statistics();
-        CHECK(statistics.gpu_paced_plans == 2);
+        CHECK(statistics.gpu_target_plans == 2);
         CHECK(statistics.epochs_by_reason[static_cast<size_t>(PacingEpochReason::SourceLate)] == 1);
         CHECK(statistics.released_immediately == 0);
     }

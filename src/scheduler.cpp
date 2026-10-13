@@ -256,7 +256,7 @@ std::atomic<uint32_t> s_status_render_handoff_stalls{0};
 std::atomic<bool> s_status_gpu_paced_cadence{false};
 std::atomic<uint32_t> s_status_gpu_paced_recent{0};
 std::atomic<uint32_t> s_status_gpu_paced_frames{0};
-std::atomic<uint32_t> s_status_gpu_paced_held_delayed{0};
+std::atomic<uint32_t> s_status_gpu_paced_moves{0};
 }
 
 static void PublishPacingStatus(const SchedulerPacingStatus& status) noexcept
@@ -319,7 +319,7 @@ static void PublishPacingStatus(const SchedulerPacingStatus& status) noexcept
     s_status_gpu_paced_cadence.store(status.gpu_paced_cadence, std::memory_order_relaxed);
     s_status_gpu_paced_recent.store(status.gpu_paced_recent, std::memory_order_relaxed);
     s_status_gpu_paced_frames.store(status.gpu_paced_frames, std::memory_order_relaxed);
-    s_status_gpu_paced_held_delayed.store(status.gpu_paced_held_delayed, std::memory_order_relaxed);
+    s_status_gpu_paced_moves.store(status.gpu_paced_moves, std::memory_order_relaxed);
     s_status_sequence.store(sequence + 2, std::memory_order_release);
 }
 
@@ -389,7 +389,7 @@ bool Scheduler_ReadPacingStatus(SchedulerPacingStatus* status) noexcept
         copy.gpu_paced_cadence = s_status_gpu_paced_cadence.load(std::memory_order_relaxed);
         copy.gpu_paced_recent = s_status_gpu_paced_recent.load(std::memory_order_relaxed);
         copy.gpu_paced_frames = s_status_gpu_paced_frames.load(std::memory_order_relaxed);
-        copy.gpu_paced_held_delayed = s_status_gpu_paced_held_delayed.load(std::memory_order_relaxed);
+        copy.gpu_paced_moves = s_status_gpu_paced_moves.load(std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_acquire);
         if (s_status_sequence.load(std::memory_order_relaxed) != begin) continue;
         *status = copy;
@@ -508,12 +508,10 @@ uint64_t s_handoff_limited_frames = 0;
 bool s_handoff_logged = false;
 bool s_handoff_stall_logged = false;
 // Developer A/B gpu_paced_cadence (GpuPacedHeldFloorApplies): the newest
-// planned frame was held and released no earlier than its GPU floor; held
-// frames that floor delayed past S; and which of the newest 128 plans the
-// GPU paced (bit i of s_gpu_paced_window = plan i positions back), with
-// their count.
+// planned frame was held and released no earlier than its GPU floor, and
+// which of the newest 128 plans the GPU floor released (bit i of
+// s_gpu_paced_window = plan i positions back), with their count.
 bool s_gpu_paced_held_floor = false;
-uint64_t s_gpu_paced_held_delayed = 0;
 uint64_t s_gpu_paced_window[2] = {};
 uint32_t s_gpu_paced_window_count = 0;
 // For the Reflex Sleep hook (any thread): the newest released frame whose
@@ -1004,8 +1002,9 @@ static void FillControllerStatus(SchedulerPacingStatus* status) noexcept
     status->gpu_paced_cadence = PacingPipeline_GetConfig().gpu_paced_cadence && status->render_handoff_gpu_floor;
     status->gpu_paced_recent = s_gpu_paced_window_count;
     status->gpu_paced_frames = static_cast<uint32_t>(
-        std::min<uint64_t>(s_source_stage.Grid().Statistics().gpu_paced_plans, UINT32_MAX));
-    status->gpu_paced_held_delayed = static_cast<uint32_t>(std::min<uint64_t>(s_gpu_paced_held_delayed, UINT32_MAX));
+        std::min<uint64_t>(s_source_stage.Statistics().gpu_paced_frames, UINT32_MAX));
+    status->gpu_paced_moves = static_cast<uint32_t>(
+        std::min<uint64_t>(s_source_stage.Grid().Statistics().gpu_target_plans, UINT32_MAX));
     status->hold_overloaded = s_hold_feasibility.Overloaded();
     const LeadController& lead = s_source_stage.Lead();
     const LeadStatistics lead_statistics = lead.Statistics();
@@ -1578,11 +1577,9 @@ static void PublishRenderHandoff(const PacingPlanKey& key, const SourceStageFram
     s_handoff_hook_stream.store(HandoffStreamOf(key), std::memory_order_relaxed);
     s_handoff_hook_frame.store(limited && !s_handoff_blocked ? key.frame_id : 0,
         std::memory_order_release);
-    if (!frame.handoff_limited) return;
-    if (held_floor) {
-        ++s_gpu_paced_held_delayed;
-        return;
-    }
+    // A held frame's GPU floor (gpu_paced_cadence) is not the render handoff
+    // limit: the OSD counts it on its own line.
+    if (!frame.handoff_limited || held_floor) return;
     ++s_handoff_limited_frames;
     if (!s_handoff_logged) {
         s_handoff_logged = true;

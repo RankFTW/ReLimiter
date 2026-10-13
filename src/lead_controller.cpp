@@ -239,6 +239,7 @@ void LeadController::Reset(int64_t qpc_frequency) noexcept
     gpu_after_present_window_.Reset();
     first_submission_window_.Reset();
     release_to_render_window_.Reset();
+    gpu_paced_rings_ = {};
     lifecycle_known_ = false;
     lifecycle_ = PacingPlanKey{};
     newest_index_ = 0;
@@ -259,6 +260,7 @@ void LeadController::ResetBuckets() noexcept
     gpu_after_present_window_.Reset();
     first_submission_window_.Reset();
     release_to_render_window_.Reset();
+    gpu_paced_rings_ = {};
     for (PendingFrame& frame : pending_) {
         if (frame.occupied && frame.started) frame.finalized = true;
     }
@@ -417,10 +419,19 @@ double LeadController::EarlyLeadUs(PacingRung rung, double fg_divisor, double qu
         !FindBucketIndex(rung, fg_divisor, &index)) {
         return 0.0;
     }
-    const Bucket& bucket = buckets_[index];
     const double allowance = std::max(allowance_us, 0.0);
+    const double probability = 1.0 - std::clamp(quantile, 0.0, 1.0);
+    // Frames the GPU floor released, of this output class and FG divisor.
+    const GpuPacedRing& ring = gpu_paced_rings_[IsGpuRung(rung) ? 0 : 1];
+    if (ring.count >= LEAD_WARM_SAMPLES && ring.divisor == index % LEAD_DIVISOR_BUCKETS) {
+        std::array<float, LEAD_GPU_PACED_CAPACITY> sorted = ring.x_us;
+        const auto rank = static_cast<std::ptrdiff_t>(std::floor(probability * static_cast<double>(ring.count - 1)));
+        std::nth_element(sorted.begin(), sorted.begin() + rank, sorted.begin() + ring.count);
+        return std::max(0.0, static_cast<double>(sorted[static_cast<size_t>(rank)]) - allowance);
+    }
+    const Bucket& bucket = buckets_[index];
     if (bucket.window.Count() >= LEAD_WARM_SAMPLES) {
-        return std::max(0.0, bucket.window.Quantile(1.0 - std::clamp(quantile, 0.0, 1.0)) - allowance);
+        return std::max(0.0, bucket.window.Quantile(probability) - allowance);
     }
     // A restarted window (holds resuming): the old window's median, as the
     // cold lead uses it.
@@ -587,6 +598,7 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
     }
     slot.gpu_resume_probe = frame.gpu_resume_probe;
     slot.render_queue = frame.render_queue;
+    slot.gpu_floor_release = frame.gpu_floor_release;
     SetField(&slot, FieldSource, frame.source_release_qpc);
     RecordReleaseToRender(&slot);
     if (slot.sampled && slot.rung == PacingRung::GpuQueueWait) {
@@ -1197,6 +1209,17 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
     if (carried_us > 0.0) {
         ++statistics_.carried_hold_samples;
         statistics_.last_carried_hold_us = carried_us;
+    }
+    // GPU-paced cadence (EarlyLeadUs): X of a frame the GPU floor released,
+    // with the delay earlier holds carried removed, before any queue below.
+    if (frame->gpu_floor_release && sample_us >= 0.0 &&
+        sample_us <= LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us) {
+        GpuPacedRing& ring = gpu_paced_rings_[IsGpuRung(frame->rung) ? 0 : 1];
+        const size_t divisor = frame->bucket % LEAD_DIVISOR_BUCKETS;
+        if (ring.divisor != divisor) ring = GpuPacedRing{ {}, 0, 0, divisor };
+        ring.x_us[ring.head] = static_cast<float>(sample_us);
+        ring.head = (ring.head + 1) % static_cast<uint32_t>(LEAD_GPU_PACED_CAPACITY);
+        if (ring.count < LEAD_GPU_PACED_CAPACITY) ++ring.count;
     }
     Bucket& bucket = buckets_[frame->bucket];
     // Lockstep engines (lead_controller.h): ReLimiter's waits for later frames

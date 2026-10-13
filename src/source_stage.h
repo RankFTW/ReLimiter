@@ -141,12 +141,13 @@ struct SourceStageRequest {
     // Developer A/B gpu_paced_cadence, and the GPU floor term of
     // earliest_release_qpc (0 = none). When the GPU floor sets the release
     // (it is the earliest release and later than the frame's arrival), the
-    // frame is ready about the early side of its lead after it, E =
-    // LeadController::EarlyLeadUs: its output target is at least floor + E
-    // and the grid follows it from this frame without a restart
-    // (CadenceGridPlanInput::earliest_target_qpc). A frame the GPU finishes
-    // before the grid's target keeps the grid, so the cadence is the later of
-    // the cap and the GPU's pace.
+    // frame is on time by construction: the grid does not judge its
+    // lateness, and its output target is at least floor + E, E =
+    // LeadController::EarlyLeadUs (how soon frames the floor released were
+    // ready at the earliest), from which the grid continues without a
+    // restart (CadenceGridPlanInput::earliest_target_qpc). A frame the GPU
+    // finishes before the grid's target keeps the grid, so the cadence is the
+    // later of the cap and the GPU's pace.
     bool gpu_paced_cadence = false;
     int64_t gpu_floor_qpc = 0;
 };
@@ -167,7 +168,8 @@ struct SourceStageFrame {
     uint32_t stall_injected_us = 0;
     bool lead_budget_limited = false; // the lead was clamped to its 3 I limit
     bool handoff_limited = false;     // the render handoff limit moved the release past S_n
-    bool gpu_paced = false;           // the GPU set T_n (CadenceGridPlan::gpu_paced)
+    bool gpu_paced = false;           // the GPU floor released it (gpu_paced_cadence)
+    bool gpu_target = false;          // its earliest target moved T_n (CadenceGridPlan::gpu_target)
 };
 
 // Owner-local counters, cumulative.
@@ -179,6 +181,7 @@ struct SourceStageStatistics {
     uint64_t plan_publish_failures = 0;
     uint64_t duplicate_keys = 0; // same key planned again: not republished (one claim per plan)
     uint64_t clamped_waits = 0;
+    uint64_t gpu_paced_frames = 0; // SourceStageFrame::gpu_paced
 };
 
 class SourceStage {

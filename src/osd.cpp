@@ -245,9 +245,9 @@ static void DrawPacingPipelineStatus() {
             "Render handoff limit: off (the render thread may wait for the next release; waiting for evidence)");
     // Developer A/B gpu_paced_cadence: the switch is on and the GPU floor is known.
     if (has_status && status.gpu_paced_cadence)
-        ImGui::TextDisabled("GPU-paced cadence: %u of the newest 128 frames at the GPU's pace | %u frames | "
-            "%u held frames delayed by the GPU floor",
-            status.gpu_paced_recent, status.gpu_paced_frames, status.gpu_paced_held_delayed);
+        ImGui::TextDisabled("GPU-paced cadence: %u of the newest 128 frames released by the GPU floor | %u frames | "
+            "%u cadence moves",
+            status.gpu_paced_recent, status.gpu_paced_frames, status.gpu_paced_moves);
     if (has_status && status.valid)
         ImGui::TextDisabled("Lead: %.2f ms (%s, %u samples%s) | Grid epoch: %u",
             status.lead_us / 1000.0, status.lead_warm ? "warm" : "warming",

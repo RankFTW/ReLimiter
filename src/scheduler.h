@@ -215,13 +215,13 @@ struct SchedulerPacingStatus {
 	uint32_t render_handoff_limited = 0;   // frames the limit released after S, cumulative
 	uint32_t render_handoff_stalls = 0;    // waits that ended without the handoff, cumulative
 	// GPU-paced cadence (developer A/B gpu_paced_cadence): the key is on and
-	// the GPU floor above is known; plans whose output target the GPU set
-	// among the newest 128 plans and in all (CadenceGridPlan::gpu_paced), and
-	// held frames the GPU floor released after S, cumulative.
+	// the GPU floor above is known; frames the GPU floor released among the
+	// newest 128 plans and in all (SourceStageFrame::gpu_paced), and the
+	// plans whose target moved the cadence (CadenceGridPlan::gpu_target).
 	bool gpu_paced_cadence = false;
 	uint32_t gpu_paced_recent = 0;
 	uint32_t gpu_paced_frames = 0;
-	uint32_t gpu_paced_held_delayed = 0;
+	uint32_t gpu_paced_moves = 0;
 };
 
 // Any thread, nonblocking. False when no consistent status is available.

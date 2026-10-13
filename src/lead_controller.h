@@ -52,6 +52,10 @@ constexpr size_t LEAD_RESUME_MEDIAN_SAMPLES = 32;  // newest u − o in the medi
 // evidence (rung_feasibility.h GpuWaitCap).
 constexpr double LEAD_RESUME_LATE_US = 1000.0;
 constexpr size_t LEAD_SLACK_CAPACITY = 120;        // newest slack samples per bucket
+// GPU-paced cadence (developer A/B gpu_paced_cadence): the newest X of frames
+// whose release the GPU floor set, per output class (GPU waits, CPU outputs),
+// for one FG divisor at a time.
+constexpr size_t LEAD_GPU_PACED_CAPACITY = 128;
 constexpr double LEAD_PRESENT_PLACEMENT_US = 150.0;
 constexpr double LEAD_SEED_MIN_US = 1000.0;
 constexpr double LEAD_SEED_MAX_US = 8000.0;
@@ -337,6 +341,10 @@ struct LeadFrameStart {
     // frame's lead sample leaves out the simulation → render queue (above).
     // The FG input wait always does; other rungs never.
     PacingRenderQueue render_queue = PacingRenderQueue::Keep;
+    // Developer A/B gpu_paced_cadence: the GPU floor set this frame's release
+    // (source_stage.h), so its X measures how soon a frame released there is
+    // ready (EarlyLeadUs).
+    bool gpu_floor_release = false;
     // The collision guard's verdict on L (NextLeadUs). The Adaptive cap's
     // slack is judged against L + guard.reduction_us, so lateness the guard
     // accepts on purpose is not a missed target; a judged frame adds its
@@ -598,12 +606,19 @@ public:
     // bucket is cold or unknown. The source slack of a plan is L minus this
     // value.
     double MedianSampleUs(PacingRung rung, double fg_divisor) const noexcept;
-    // The early side of a bucket's lead, max(0, Q_{1−q}(X) − allowance_us),
-    // the mirror of L = Q_q + allowance: how soon after its release a frame
-    // of the bucket is ready at the earliest. While a restarted window is
-    // cold (RestartRung), the old window's median minus the allowance; 0 for
-    // a cold bucket without one, an unknown bucket, or a non-finite q or
-    // allowance. The GPU-paced cadence's output target (source_stage.h).
+    // The early side of the lead, max(0, Q_{1−q}(X) − allowance_us), the
+    // mirror of L = Q_q + allowance: how soon after its release a frame is
+    // ready at the earliest. The GPU-paced cadence's output target
+    // (source_stage.h). Once 32 frames of the rung's output class (GPU waits
+    // or CPU outputs) and FG divisor were released by the GPU floor, the X of
+    // the newest 128 of them (exact lower-index quantile): the bucket's own
+    // samples are of every release, and on the FG input wait leave out the
+    // simulation → render queue, so their early side lies far below where a
+    // frame released at the floor is ready (Gears of War: E-Day, FG 2× at
+    // 120: the cadence never followed the GPU). Before that the bucket's
+    // early side, or while a restarted window is cold (RestartRung) the old
+    // window's median minus the allowance; 0 for a cold bucket without one,
+    // an unknown bucket, or a non-finite q or allowance.
     double EarlyLeadUs(PacingRung rung, double fg_divisor, double quantile, double allowance_us) const noexcept;
     // Hold room: Q_q of R over the newest 256 hold-room samples of the FG
     // divisor, the interval at which a share q of the judged GPU queue wait
@@ -700,6 +715,7 @@ private:
         bool gpu_resume_probe = false;
         PacingRenderQueue render_queue = PacingRenderQueue::Keep; // GPU queue wait A/B
         bool resume_delay_recorded = false;
+        bool gpu_floor_release = false; // LeadFrameStart::gpu_floor_release
         bool resume_waited = false; // the GPU waited at the Signal (w <= o)
         bool resume_late = false;   // and resumed more than LEAD_RESUME_LATE_US after it
         bool call_recorded = false;   // C entered the call window
@@ -825,6 +841,15 @@ private:
     LeadSampleWindow gpu_after_present_window_{};
     LeadSampleWindow first_submission_window_{};
     LeadSampleWindow release_to_render_window_{};
+    // GPU-paced cadence: X of frames the GPU floor released (EarlyLeadUs),
+    // [0] GPU waits, [1] CPU outputs; divisor = the bucket's FG divisor slot.
+    struct GpuPacedRing {
+        std::array<float, LEAD_GPU_PACED_CAPACITY> x_us{};
+        uint32_t head = 0;
+        uint32_t count = 0;
+        size_t divisor = 0;
+    };
+    std::array<GpuPacedRing, 2> gpu_paced_rings_{};
     ReleaseMarginLearner margin_{};
     ReleaseMarginLearner headroom_{ LEAD_HEADROOM_LIMITS };
     // Queue order: the newest LEAD_CONCURRENCY_SAMPLES pairs, 1 = concurrent.

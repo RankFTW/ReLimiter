@@ -54,9 +54,9 @@ enum PacingSourceFlags : uint8_t {
     // marker. Reuses the bit of the retired pre-Reflex pacing, which
     // had the same meaning.
     PACING_SOURCE_PRE_SLEEP = 1u << 1,
-    // The GPU set this frame's output target (developer A/B
-    // gpu_paced_cadence, CadenceGridPlan::gpu_paced). Reuses the bit of the
-    // retired predictor, which no build after Phase 0 set.
+    // The GPU floor released this frame (developer A/B gpu_paced_cadence,
+    // SourceStageFrame::gpu_paced). Reuses the bit of the retired
+    // predictor, which no build after Phase 0 set.
     PACING_SOURCE_GPU_PACED = 1u << 2,
     PACING_SOURCE_FIXED_REFRESH = 1u << 3,
     PACING_SOURCE_BACKGROUND = 1u << 4,
