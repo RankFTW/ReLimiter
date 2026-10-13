@@ -139,17 +139,26 @@ struct SourceStageRequest {
     // floor alone here.
     int64_t earliest_release_qpc = 0;
     // Developer A/B gpu_paced_cadence, and the GPU floor term of
-    // earliest_release_qpc (0 = none). When the GPU floor sets the release
-    // (it is the earliest release and later than the frame's arrival), the
-    // frame is on time by construction: the grid does not judge its
-    // lateness, and its output target is at least floor + E, E =
-    // LeadController::EarlyLeadUs (how soon frames the floor released were
-    // ready at the earliest), from which the grid continues without a
-    // restart (CadenceGridPlanInput::earliest_target_qpc). A frame the GPU
-    // finishes before the grid's target keeps the grid, so the cadence is the
-    // later of the cap and the GPU's pace.
+    // earliest_release_qpc (0 = none; under gpu_paced_present_gate it is the
+    // later of the floor and the render thread's PRESENT_END of the previous
+    // frame). When it sets the release (it is the earliest release and later
+    // than the moment the game reached ReLimiter, below), the frame is on
+    // time by construction: the grid does not judge its lateness, and its
+    // output target is at least floor + E, E = LeadController::EarlyLeadUs
+    // (how soon frames the floor released were ready at the earliest), from
+    // which the grid continues without a restart
+    // (CadenceGridPlanInput::earliest_target_qpc). A frame the GPU finishes
+    // before the grid's target keeps the grid, so the cadence is the later of
+    // the cap and the GPU's pace.
     bool gpu_paced_cadence = false;
     int64_t gpu_floor_qpc = 0;
+    // The game reached ReLimiter at its marker, or earlier at the Reflex
+    // Sleep: the Sleep hook's entry for grid index sleep_entry_index (0 =
+    // none), before any wait in the hook. The pre-Sleep wait aims at the
+    // floor less its margin and the Present-end gate waits there, so the
+    // marker can land just after the floor without the game being late.
+    uint64_t sleep_entry_index = 0;
+    int64_t sleep_entry_qpc = 0;
 };
 
 struct SourceStageFrame {

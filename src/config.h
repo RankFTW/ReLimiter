@@ -92,6 +92,7 @@ struct Config {
     PacingLeadCoverage lead_coverage = PacingLeadCoverage::Q99; // developer A/B: 95 | 99 (default; share of frames the lead covers)
     bool fg_late_spacing = true; // developer A/B: on (default) | off; FG input wait floors the next real frame on a late frame's readiness
     bool gpu_paced_cadence = false; // developer A/B: off (default) | on; frames whose release the GPU floor sets keep the GPU's pace (held frames get the floor too)
+    bool gpu_paced_present_gate = false; // developer A/B: off (default) | on; with gpu_paced_cadence, the frame after a GPU-paced frame is released no earlier than the render thread's PRESENT_END of that frame
     PacingPlacementOverride source_placement = PacingPlacementOverride::PreSleep; // developer: marker | pre_sleep | driver (pre_sleep is the default)
 
     // Reflex Injection

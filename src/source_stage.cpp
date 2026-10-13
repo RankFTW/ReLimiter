@@ -189,14 +189,14 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     // sets this frame's release, the frame is on time by construction and
     // its output target is at least where such a frame is ready at the
     // earliest, so the grid follows the GPU instead of restarting. The game
-    // reached ReLimiter at its marker, or earlier at the Reflex Sleep when a
-    // pre-Sleep wait for this index ran: that wait already aims at the floor
-    // (less its margin), so the marker can land just after the floor without
-    // the game being late (Gears of War: E-Day, FG 2× at 120: 21% of the
-    // frames, nearly half of them restarting the cadence).
-    const bool pre_slept = request.pre_wait_index != 0 && request.pre_wait_index == grid_.NextIndex() &&
-        request.pre_wait_start_qpc > 0;
-    const int64_t game_arrival_qpc = pre_slept ? (std::min)(arrival_qpc, request.pre_wait_start_qpc) : arrival_qpc;
+    // reached ReLimiter at its marker, or earlier at the Reflex Sleep for
+    // this index: the pre-Sleep wait there aims at the floor (less its
+    // margin), so the marker can land just after the floor without the game
+    // being late (Gears of War: E-Day, FG 2× at 120: 21% of the frames,
+    // nearly half of them restarting the cadence).
+    const bool entered_sleep = request.sleep_entry_index != 0 && request.sleep_entry_index == grid_.NextIndex() &&
+        request.sleep_entry_qpc > 0;
+    const int64_t game_arrival_qpc = entered_sleep ? (std::min)(arrival_qpc, request.sleep_entry_qpc) : arrival_qpc;
     const bool gpu_floor_release = request.gpu_paced_cadence && request.gpu_floor_qpc > game_arrival_qpc &&
         request.gpu_floor_qpc >= request.earliest_release_qpc;
     if (gpu_floor_release) {

@@ -165,12 +165,20 @@ void RenderHandoff_PublishPresentEnd(uint8_t domain, uint32_t producer_epoch, ui
     s_present_qpc.store(qpc, std::memory_order_relaxed);
     s_present_sequence.store(sequence + 2, std::memory_order_release);
     s_present_writing.clear(std::memory_order_release);
+    WakeByAddressAll(&s_present_sequence);
 }
 
 namespace
 {
+    struct PresentEndSnapshot {
+        uint64_t sequence = 0;
+        uint32_t stream = 0;
+        uint64_t frame_id = 0;
+        int64_t qpc = 0;
+    };
+
     // A consistent PRESENT_END snapshot; false when none was published yet.
-    bool ReadPresentEnd(uint32_t* stream, uint64_t* frame_id, int64_t* qpc) noexcept
+    bool ReadPresentEnd(PresentEndSnapshot* snapshot) noexcept
     {
         for (;;) {
             const uint64_t before = s_present_sequence.load(std::memory_order_acquire);
@@ -179,33 +187,43 @@ namespace
                 YieldProcessor();
                 continue;
             }
-            *stream = s_present_stream.load(std::memory_order_relaxed);
-            *frame_id = s_present_frame_id.load(std::memory_order_relaxed);
-            *qpc = s_present_qpc.load(std::memory_order_relaxed);
+            snapshot->stream = s_present_stream.load(std::memory_order_relaxed);
+            snapshot->frame_id = s_present_frame_id.load(std::memory_order_relaxed);
+            snapshot->qpc = s_present_qpc.load(std::memory_order_relaxed);
             std::atomic_thread_fence(std::memory_order_acquire);
-            if (s_present_sequence.load(std::memory_order_relaxed) == before) return true;
+            if (s_present_sequence.load(std::memory_order_relaxed) == before) {
+                snapshot->sequence = before;
+                return true;
+            }
         }
+    }
+
+    // The stall span of a wait on (domain, producer epoch): RENDER_HANDOFF_
+    // STALL_INTERVALS render-thread frame times, at least min_stall_ticks;
+    // 0 for no positive minimum.
+    int64_t StallTicks(uint8_t domain, uint32_t producer_epoch, int64_t min_stall_ticks) noexcept
+    {
+        if (min_stall_ticks <= 0) return 0;
+        const int64_t cycle_ticks = RenderHandoff_CycleTicks(domain, producer_epoch);
+        return (std::max)(min_stall_ticks,
+            static_cast<int64_t>(std::llround(RENDER_HANDOFF_STALL_INTERVALS * static_cast<double>(cycle_ticks))));
     }
 }
 
 bool RenderHandoff_LeftPresent(uint8_t domain, uint32_t producer_epoch, uint64_t frame_id) noexcept
 {
-    uint32_t stream = 0;
-    uint64_t newest = 0;
-    int64_t qpc = 0;
-    return ReadPresentEnd(&stream, &newest, &qpc) && stream == StreamOf(domain, producer_epoch) &&
-        newest >= frame_id;
+    PresentEndSnapshot snapshot{};
+    return ReadPresentEnd(&snapshot) && snapshot.stream == StreamOf(domain, producer_epoch) &&
+        snapshot.frame_id >= frame_id;
 }
 
 bool RenderHandoff_LatestPresentEnd(uint8_t domain, uint32_t producer_epoch, uint64_t* frame_id,
     int64_t* qpc) noexcept
 {
-    uint32_t stream = 0;
-    uint64_t newest = 0;
-    int64_t at = 0;
-    if (!ReadPresentEnd(&stream, &newest, &at) || stream != StreamOf(domain, producer_epoch)) return false;
-    if (frame_id != nullptr) *frame_id = newest;
-    if (qpc != nullptr) *qpc = at;
+    PresentEndSnapshot snapshot{};
+    if (!ReadPresentEnd(&snapshot) || snapshot.stream != StreamOf(domain, producer_epoch)) return false;
+    if (frame_id != nullptr) *frame_id = snapshot.frame_id;
+    if (qpc != nullptr) *qpc = snapshot.qpc;
     return true;
 }
 
@@ -214,9 +232,7 @@ RenderHandoffWait RenderHandoff_WaitFor(uint8_t domain, uint32_t producer_epoch,
 {
     const uint32_t stream = StreamOf(domain, producer_epoch);
     const int64_t frequency = QpcFrequency();
-    const int64_t cycle_ticks = RenderHandoff_CycleTicks(domain, producer_epoch);
-    const int64_t stall_ticks = min_stall_ticks <= 0 ? 0 : (std::max)(min_stall_ticks,
-        static_cast<int64_t>(std::llround(RENDER_HANDOFF_STALL_INTERVALS * static_cast<double>(cycle_ticks))));
+    const int64_t stall_ticks = StallTicks(domain, producer_epoch, min_stall_ticks);
     // The render thread's progress: the newest handoff of any frame. Taking
     // the frames queued ahead of frame_id is progress, so a deep queue drains
     // without reaching the deadline.
@@ -241,6 +257,34 @@ RenderHandoffWait RenderHandoff_WaitFor(uint8_t domain, uint32_t producer_epoch,
         const int64_t remaining_ms = ((deadline_qpc - now) * 1000 + frequency - 1) / frequency;
         uint64_t observed = snapshot.sequence;
         WaitOnAddress(&s_sequence, &observed, sizeof(observed),
+            static_cast<DWORD>(remaining_ms < 1 ? 1 : remaining_ms));
+    }
+}
+
+RenderHandoffWait RenderHandoff_WaitForPresentEnd(uint8_t domain, uint32_t producer_epoch, uint64_t frame_id,
+    int64_t min_stall_ticks, int64_t* present_end_qpc) noexcept
+{
+    const uint32_t stream = StreamOf(domain, producer_epoch);
+    const int64_t frequency = QpcFrequency();
+    const int64_t stall_ticks = StallTicks(domain, producer_epoch, min_stall_ticks);
+    // The render thread's progress: the newest PRESENT_END of any frame.
+    int64_t progress_qpc = QpcNow();
+    for (;;) {
+        PresentEndSnapshot snapshot{};
+        const bool published = ReadPresentEnd(&snapshot);
+        if (published && snapshot.stream != stream) return RenderHandoffWait::OtherStream;
+        if (published && snapshot.frame_id >= frame_id) {
+            if (present_end_qpc != nullptr) *present_end_qpc = snapshot.qpc;
+            return RenderHandoffWait::Ready;
+        }
+        if (published && snapshot.qpc > progress_qpc) progress_qpc = snapshot.qpc;
+        const int64_t deadline_qpc = progress_qpc + stall_ticks;
+        const int64_t now = QpcNow();
+        if (frequency <= 0 || stall_ticks <= 0 || now >= deadline_qpc) return RenderHandoffWait::Deadline;
+        // Whole milliseconds, at least one; the loop re-checks the deadline.
+        const int64_t remaining_ms = ((deadline_qpc - now) * 1000 + frequency - 1) / frequency;
+        uint64_t observed = snapshot.sequence;
+        WaitOnAddress(&s_present_sequence, &observed, sizeof(observed),
             static_cast<DWORD>(remaining_ms < 1 ? 1 : remaining_ms));
     }
 }

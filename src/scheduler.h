@@ -104,13 +104,22 @@ void Scheduler_RecordReflexSleep(int64_t now_qpc) noexcept;
 //      without the owner, RenderHandoff_WaitFor (render_handoff.h) waits for
 //      it, and a wait that stalled (the render thread took no frame for
 //      three of its frame times, at least 3 I) calls
-//      Scheduler_RenderHandoffStalled.
-//   3. Scheduler_PlanReflexSleep (caller holds SchedulerOwnerGuard): decides
-//      the pre-wait; true fills *target_qpc and *grid_index. driver_sleep:
-//      the driver's Sleep runs after the hook (not bypassed); the margin is
-//      learned separately for each. handoff_qpc: the handoff from step 2
-//      (0 = none); the pre-wait then aims for max(S_next, handoff + d) −
-//      margin. now_qpc is taken after step 2.
+//      Scheduler_RenderHandoffStalled. Then the Present-end gate (developer
+//      A/B gpu_paced_present_gate), only when the Sleep is bypassed:
+//      Scheduler_PresentGateFrame (any thread) names the newest released
+//      frame whose PRESENT_END the next frame waits for;
+//      RenderHandoff_WaitForPresentEnd waits for it the same way, and a wait
+//      that stalled calls Scheduler_PresentGateStalled.
+//   3. Scheduler_PlanReflexSleep (caller holds SchedulerOwnerGuard): records
+//      sleep_entry_qpc (the hook's entry, before step 2) as the moment the
+//      game reached ReLimiter for the next grid index, and decides the
+//      pre-wait; true fills *target_qpc and *grid_index. driver_sleep: the
+//      driver's Sleep runs after the hook (not bypassed); the margin is
+//      learned separately for each. handoff_qpc and present_end_qpc: the
+//      handoff and the PRESENT_END from step 2 (0 = none); the pre-wait then
+//      aims for max(S_next, handoff + d) − margin, or under the developer A/B
+//      gpu_paced_cadence for max(S_next, GPU floor, PRESENT_END) − margin.
+//      now_qpc is taken after step 2.
 //   4. Without the owner: PreSleepWaitUntil(*target_qpc) (pacing_sleep.h),
 //      then, holding the owner again if it can be taken without waiting,
 //      Scheduler_EndReflexSleep(grid_index, end_qpc) records the wait end
@@ -119,8 +128,11 @@ bool Scheduler_PreSleepPlacementActive() noexcept;
 bool Scheduler_RenderHandoffFrame(uint8_t* identity_domain, uint32_t* producer_epoch,
     uint64_t* frame_id) noexcept;
 void Scheduler_RenderHandoffStalled() noexcept;
-bool Scheduler_PlanReflexSleep(int64_t now_qpc, bool driver_sleep, int64_t handoff_qpc,
-    int64_t* target_qpc, uint64_t* grid_index) noexcept;
+bool Scheduler_PresentGateFrame(uint8_t* identity_domain, uint32_t* producer_epoch,
+    uint64_t* frame_id) noexcept;
+void Scheduler_PresentGateStalled() noexcept;
+bool Scheduler_PlanReflexSleep(int64_t sleep_entry_qpc, int64_t now_qpc, bool driver_sleep, int64_t handoff_qpc,
+    int64_t present_end_qpc, int64_t* target_qpc, uint64_t* grid_index) noexcept;
 void Scheduler_EndReflexSleep(uint64_t grid_index, int64_t end_qpc) noexcept;
 
 // True while ReLimiter's own wait paces the game's source: the published
@@ -222,6 +234,14 @@ struct SchedulerPacingStatus {
 	uint32_t gpu_paced_recent = 0;
 	uint32_t gpu_paced_frames = 0;
 	uint32_t gpu_paced_moves = 0;
+	// Present-end gate (developer A/B gpu_paced_present_gate, with
+	// gpu_paced_cadence on): frames whose previous frame's PRESENT_END was
+	// later than their GPU floor, and gate waits that ended without that
+	// PRESENT_END (the render thread left no Present for three of its frame
+	// times, at least 3 I); both cumulative.
+	bool gpu_paced_present_gate = false;
+	uint32_t present_gate_later = 0;
+	uint32_t present_gate_stalls = 0;
 };
 
 // Any thread, nonblocking. False when no consistent status is available.

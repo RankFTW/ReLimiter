@@ -305,6 +305,7 @@ void CheckPipelineMatchesConfig() {
     CHECK(pipeline.lead_coverage == g_config.lead_coverage);
     CHECK(pipeline.fg_late_spacing == g_config.fg_late_spacing);
     CHECK(pipeline.gpu_paced_cadence == g_config.gpu_paced_cadence);
+    CHECK(pipeline.gpu_paced_present_gate == g_config.gpu_paced_present_gate);
     CHECK(g_marker_forward_after_wait.load() ==
         (g_config.marker_forward_order == PacingMarkerForwardOrder::AfterWait));
 }
@@ -323,6 +324,7 @@ void TestPacingPipelineDefaults() {
     CHECK(g_config.lead_coverage == PacingLeadCoverage::Q99);
     CHECK(g_config.fg_late_spacing);
     CHECK(!g_config.gpu_paced_cadence);
+    CHECK(!g_config.gpu_paced_present_gate);
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
     CheckPipelineMatchesConfig();
     // The startup rewrite saves every new key, including the developer keys.
@@ -331,6 +333,7 @@ void TestPacingPipelineDefaults() {
     CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "99");
     CHECK(Value(local_path, "FrameLimiter", "fg_late_spacing") == "true");
     CHECK(Value(local_path, "FrameLimiter", "gpu_paced_cadence") == "false");
+    CHECK(Value(local_path, "FrameLimiter", "gpu_paced_present_gate") == "false");
     CHECK(Value(local_path, "FrameLimiter", "source_placement") == "pre_sleep");
     CHECK(Value(local_path, "FrameLimiter", "reflex_sleep_bypass") == "true");
     CHECK(Value(local_path, "FrameLimiter", "developer_settings") == "false");
@@ -562,17 +565,20 @@ void TestFgLateSpacingKey() {
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
-// Developer A/B gpu_paced_cadence: true loads, reaches the pipeline, counts as
-// a developer override and resets to false.
-void TestGpuPacedCadenceKey() {
-    Reset(false, false, {{"config_version", "4"}, {"gpu_paced_cadence", "true"}});
-    CHECK(g_config.gpu_paced_cadence);
+// Developer A/Bs gpu_paced_cadence and gpu_paced_present_gate: true loads,
+// reaches the pipeline, counts as a developer override and resets to false.
+void TestGpuPacedKeys() {
+    Reset(false, false, {{"config_version", "4"}, {"gpu_paced_cadence", "true"},
+        {"gpu_paced_present_gate", "true"}});
+    CHECK(g_config.gpu_paced_cadence && g_config.gpu_paced_present_gate);
     CheckPipelineMatchesConfig();
-    CHECK(PacingPipeline_GetConfig().gpu_paced_cadence);
+    CHECK(PacingPipeline_GetConfig().gpu_paced_cadence && PacingPipeline_GetConfig().gpu_paced_present_gate);
     CHECK(Value(local_path, "FrameLimiter", "gpu_paced_cadence") == "true");
-    CHECK(Config_DeveloperOverrides() == 1);
+    CHECK(Value(local_path, "FrameLimiter", "gpu_paced_present_gate") == "true");
+    CHECK(Config_DeveloperOverrides() == 2);
     Config_ResetDeveloperSettings();
     CHECK(!g_config.gpu_paced_cadence && !PacingPipeline_GetConfig().gpu_paced_cadence);
+    CHECK(!g_config.gpu_paced_present_gate && !PacingPipeline_GetConfig().gpu_paced_present_gate);
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
@@ -956,7 +962,7 @@ int main() {
     TestRenderQueueParsing();
     TestLeadCoverageKey();
     TestFgLateSpacingKey();
-    TestGpuPacedCadenceKey();
+    TestGpuPacedKeys();
     TestSourcePlacementParsing();
     TestPacingMethodMigration();
     TestAdaptiveCapMigration();

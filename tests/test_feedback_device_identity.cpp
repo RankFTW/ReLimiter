@@ -172,6 +172,12 @@ bool s_pre_sleep_active = false;
 uint64_t s_handoff_frame = 0;      // Scheduler_RenderHandoffFrame; 0 = not limited
 unsigned s_handoff_stalls = 0;     // Scheduler_RenderHandoffStalled calls
 int64_t s_planned_handoff_qpc = -1; // handoff_qpc of the newest Scheduler_PlanReflexSleep
+// Present-end gate in the Sleep hook (Scheduler_* stubs below).
+uint64_t s_present_gate_frame = 0;      // Scheduler_PresentGateFrame; 0 = no gate
+unsigned s_present_gate_stalls = 0;     // Scheduler_PresentGateStalled calls
+int64_t s_planned_present_end_qpc = -1; // present_end_qpc of the newest Scheduler_PlanReflexSleep
+int64_t s_planned_sleep_entry_qpc = -1; // sleep_entry_qpc of the newest Scheduler_PlanReflexSleep
+int64_t s_planned_now_qpc = -1;         // now_qpc of the newest Scheduler_PlanReflexSleep
 int64_t RealQpc();
 unsigned s_mode_calls = 0;
 int s_sleep_action = 0;
@@ -306,6 +312,46 @@ void TestReflexCallForwarding() {
         const int64_t slow_cycle = RenderHandoff_CycleTicks(1, 9);
         CHECK(slow_cycle >= us_to_qpc(200000.0) - 1 && slow_cycle <= us_to_qpc(200000.0) + 1);
     }
+    // Present-end gate (developer A/B gpu_paced_present_gate): after a
+    // GPU-paced frame a bypassed Sleep waits until the render thread has left
+    // that frame's Present, then plans the pre-wait with that PRESENT_END and
+    // the hook's entry, from before the wait, as the game's arrival.
+    s_handoff_frame=0;
+    RenderHandoff_PublishPresentEnd(1, 7, 50, RealQpc());
+    s_present_gate_frame=51;
+    {
+        std::atomic<int64_t> present_end_qpc{0};
+        const int64_t gate_start=RealQpc();
+        std::thread present_thread([&present_end_qpc] {
+            Sleep(20);
+            const int64_t qpc = RealQpc();
+            present_end_qpc = qpc;
+            RenderHandoff_PublishPresentEnd(1, 7, 51, qpc);
+        });
+        CHECK(Hook_Sleep(&device)==NVAPI_OK);
+        present_thread.join();
+        CHECK(s_planned_present_end_qpc==present_end_qpc.load() && s_present_gate_stalls==0);
+        CHECK(s_planned_sleep_entry_qpc>0 && s_planned_sleep_entry_qpc<=gate_start+us_to_qpc(1000.0));
+        CHECK(s_planned_now_qpc>=present_end_qpc.load());
+    }
+    // The render thread leaves no Present: the wait ends after 3 I, is
+    // reported, and the pre-wait is planned without a PRESENT_END.
+    s_present_gate_frame=52;
+    {
+        const int64_t gate_stall_start=RealQpc();
+        CHECK(Hook_Sleep(&device)==NVAPI_OK);
+        CHECK(s_present_gate_stalls==1 && s_planned_present_end_qpc==0);
+        CHECK(RealQpc()-gate_stall_start>=us_to_qpc(55000.0));
+    }
+    // Another producer's PRESENT_END ends the wait at once without a stall.
+    RenderHandoff_PublishPresentEnd(1, 8, 1, RealQpc());
+    CHECK(Hook_Sleep(&device)==NVAPI_OK && s_present_gate_stalls==1 && s_planned_present_end_qpc==0);
+    // The driver's Sleep runs (bypass off): no gate wait.
+    g_reflex_sleep_bypass=false;
+    s_planned_present_end_qpc=-1;
+    CHECK(Hook_Sleep(&device)==-7 && s_planned_present_end_qpc==0 && s_present_gate_stalls==1);
+    g_reflex_sleep_bypass=true;
+    s_present_gate_frame=0;
     // The driver's Sleep runs (bypass off): no handoff wait.
     g_reflex_sleep_bypass=false;
     s_planned_handoff_qpc=-1;
@@ -1211,8 +1257,20 @@ bool Scheduler_RenderHandoffFrame(uint8_t* domain, uint32_t* producer_epoch, uin
     return true;
 }
 void Scheduler_RenderHandoffStalled() noexcept { ++s_handoff_stalls; }
-bool Scheduler_PlanReflexSleep(int64_t, bool, int64_t handoff_qpc, int64_t*, uint64_t*) noexcept {
+bool Scheduler_PresentGateFrame(uint8_t* domain, uint32_t* producer_epoch, uint64_t* frame_id) noexcept {
+    if (s_present_gate_frame == 0) return false;
+    *domain = 1;
+    *producer_epoch = 7;
+    *frame_id = s_present_gate_frame;
+    return true;
+}
+void Scheduler_PresentGateStalled() noexcept { ++s_present_gate_stalls; }
+bool Scheduler_PlanReflexSleep(int64_t sleep_entry_qpc, int64_t now_qpc, bool, int64_t handoff_qpc,
+    int64_t present_end_qpc, int64_t*, uint64_t*) noexcept {
+    s_planned_sleep_entry_qpc = sleep_entry_qpc;
+    s_planned_now_qpc = now_qpc;
     s_planned_handoff_qpc = handoff_qpc;
+    s_planned_present_end_qpc = present_end_qpc;
     return false;
 }
 std::atomic<double> g_effective_interval_us{0.0};
