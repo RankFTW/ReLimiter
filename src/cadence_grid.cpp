@@ -451,7 +451,7 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
     next.fixed = input.fixed;
     next.snapped = timing.snapped;
 
-    const ExactQpc earliest_target = WholeQpc(input.now_qpc + timing.lead_ticks);
+    const ExactQpc now_plus_lead = WholeQpc(input.now_qpc + timing.lead_ticks);
     PacingEpochReason reason = PacingEpochReason::None;
     bool silent_rebase = false;
     bool segment_ok = true;
@@ -461,7 +461,7 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
             ? PacingEpochReason::Lifecycle
             : PacingEpochReason::ModeChange;
         ExactQpc origin{};
-        segment_ok = OriginAtOrAfter(next, earliest_target, &origin);
+        segment_ok = OriginAtOrAfter(next, now_plus_lead, &origin);
         if (segment_ok) {
             StartSegment(&next, !lifecycle_change, grid_index, origin,
                          timing.interval_ticks);
@@ -491,6 +491,25 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
         return plan;
     }
 
+    // GPU-paced target: a later earliest target moves the grid from n
+    // without an epoch. The frame is on time by construction: its lateness
+    // is not judged, so the move never counts as a restart.
+    bool gpu_paced = false;
+    if (input.earliest_target_qpc > target_qpc && input.earliest_target_qpc <= kMaximumNowQpc) {
+        ExactQpc origin{};
+        if (!OriginAtOrAfter(next, WholeQpc(input.earliest_target_qpc), &origin)) {
+            ++statistics_.invalid_inputs;
+            return plan;
+        }
+        // Supersedes a step-1 or step-2 segment at the same base.
+        StartSegment(&next, true, grid_index, origin, timing.interval_ticks);
+        if (!ResolveTarget(next, grid_index, &target_qpc)) {
+            ++statistics_.invalid_inputs;
+            return plan;
+        }
+        gpu_paced = true;
+    }
+
     // Step 3: source lateness against S = T - L.
     int64_t wake_qpc = target_qpc - timing.lead_ticks;
     // Late tolerance plus the source slack: a source that still makes
@@ -505,9 +524,9 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
         tolerance_ticks += static_cast<int64_t>(slack_ticks);
     }
     bool released_immediately = false;
-    if (input.now_qpc > wake_qpc + tolerance_ticks) {
+    if (!gpu_paced && input.now_qpc > wake_qpc + tolerance_ticks) {
         ExactQpc origin{};
-        if (!OriginAtOrAfter(next, earliest_target, &origin)) {
+        if (!OriginAtOrAfter(next, now_plus_lead, &origin)) {
             ++statistics_.invalid_inputs;
             return plan;
         }
@@ -520,10 +539,11 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
             return plan;
         }
         wake_qpc = target_qpc - timing.lead_ticks;
-    } else if (input.now_qpc > wake_qpc) {
+    } else if (!gpu_paced && input.now_qpc > wake_qpc) {
         released_immediately = true;
     }
-    // A snapped restart can land on an edge after now + L; otherwise S = now.
+    // A snapped restart can land on an edge after now + L; otherwise, and
+    // for a GPU-paced frame, S = max(T - L, now).
     wake_qpc = std::max(wake_qpc, input.now_qpc);
 
     if (reason != PacingEpochReason::None) {
@@ -541,6 +561,7 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
     if (silent_rebase) ++statistics_.silent_rebases;
     if (released_immediately) ++statistics_.released_immediately;
     if (timing.snapped) ++statistics_.snapped_plans;
+    if (gpu_paced) ++statistics_.gpu_paced_plans;
 
     plan.valid = true;
     plan.grid_index = grid_index;
@@ -549,6 +570,7 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
     plan.epoch = next.epoch;
     plan.epoch_reason = reason;
     plan.released_immediately = released_immediately;
+    plan.gpu_paced = gpu_paced;
     return plan;
 }
 

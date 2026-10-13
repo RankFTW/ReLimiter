@@ -30,6 +30,13 @@
 //   The evidence rule only helps when evidence for n arrives before frame
 //   n + 1's output runs; the floor covers that race. Lateness above slack
 //   decays by slack per frame instead of ratcheting the phase later.
+// - GPU-paced target (PlanNext, earliest_target_qpc; developer A/B
+//   gpu_paced_cadence). When the caller's earliest target for frame n is
+//   later than the grid's T(n), the grid follows it from n: a segment with
+//   origin at that target, without an epoch (not a restart). The frame is
+//   on time by construction, so its source lateness is not judged and S
+//   is max(T − L, now). Frames whose earliest target is not later keep the
+//   grid, so the cadence is the later of the cap and the GPU's pace.
 // In both output rules I is the newest interval. When snapped, every restart
 // origin and floored target is the first fixed edge at or after the
 // computed time. Evidence older than the lifecycle's first index is ignored.
@@ -209,6 +216,9 @@ struct CadenceGridPlanInput {
     // still misses T starts an OutputLate epoch. 0 (unknown) keeps the
     // tolerance alone. Negative or non-finite counts as 0.
     double source_slack_us = 0.0;
+    // GPU-paced target (rules above): T(n) is at least this QPC; 0 = none.
+    // A later value moves the grid to it from n without an epoch.
+    int64_t earliest_target_qpc = 0;
     PacingTimingMode mode = PacingTimingMode::Vrr; // Off suspends the grid
     uint32_t controller_generation = 0;
     CadenceGridFixedReference fixed{}; // used only in Fixed mode
@@ -222,6 +232,7 @@ struct CadenceGridPlan {
     uint32_t epoch = 0;
     PacingEpochReason epoch_reason = PacingEpochReason::None; // None: no epoch started
     bool released_immediately = false; // source late within tolerance (plus slack): S_n = now
+    bool gpu_paced = false; // T_n is the earliest target, later than the grid's T(n)
 };
 
 constexpr size_t kCadenceGridEpochReasonCount =
@@ -235,6 +246,7 @@ struct CadenceGridStatistics {
     uint64_t silent_rebases = 0;
     uint64_t released_immediately = 0;
     uint64_t snapped_plans = 0;
+    uint64_t gpu_paced_plans = 0; // CadenceGridPlan::gpu_paced
     // OutputLate epochs started by evidence older than the epoch (also in
     // epochs_by_reason).
     uint64_t older_output_epochs = 0;

@@ -135,7 +135,20 @@ struct SourceStageRequest {
     // the cadence like any late source, and the wait runs to max(S_n,
     // earliest). Frames not held only: on held frames the render-thread
     // offset moved the game's simulation into its render thread's submission.
+    // Under the developer A/B gpu_paced_cadence held frames get their GPU
+    // floor alone here.
     int64_t earliest_release_qpc = 0;
+    // Developer A/B gpu_paced_cadence, and the GPU floor term of
+    // earliest_release_qpc (0 = none). When the GPU floor sets the release
+    // (it is the earliest release and later than the frame's arrival), the
+    // frame is ready about the early side of its lead after it, E =
+    // LeadController::EarlyLeadUs: its output target is at least floor + E
+    // and the grid follows it from this frame without a restart
+    // (CadenceGridPlanInput::earliest_target_qpc). A frame the GPU finishes
+    // before the grid's target keeps the grid, so the cadence is the later of
+    // the cap and the GPU's pace.
+    bool gpu_paced_cadence = false;
+    int64_t gpu_floor_qpc = 0;
 };
 
 struct SourceStageFrame {
@@ -154,6 +167,7 @@ struct SourceStageFrame {
     uint32_t stall_injected_us = 0;
     bool lead_budget_limited = false; // the lead was clamped to its 3 I limit
     bool handoff_limited = false;     // the render handoff limit moved the release past S_n
+    bool gpu_paced = false;           // the GPU set T_n (CadenceGridPlan::gpu_paced)
 };
 
 // Owner-local counters, cumulative.

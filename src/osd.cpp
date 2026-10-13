@@ -243,6 +243,11 @@ static void DrawPacingPipelineStatus() {
     else if (has_status && status.render_handoff == 2)
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
             "Render handoff limit: off (the render thread may wait for the next release; waiting for evidence)");
+    // Developer A/B gpu_paced_cadence: the switch is on and the GPU floor is known.
+    if (has_status && status.gpu_paced_cadence)
+        ImGui::TextDisabled("GPU-paced cadence: %u of the newest 128 frames at the GPU's pace | %u frames | "
+            "%u held frames delayed by the GPU floor",
+            status.gpu_paced_recent, status.gpu_paced_frames, status.gpu_paced_held_delayed);
     if (has_status && status.valid)
         ImGui::TextDisabled("Lead: %.2f ms (%s, %u samples%s) | Grid epoch: %u",
             status.lead_us / 1000.0, status.lead_warm ? "warm" : "warming",
@@ -614,6 +619,19 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "frame is never held past its original time while the game's render thread is still inside that "
         "frame's Present, because the next frame would wait too. Watch jitter and long frames; one setting "
         "per capture.");
+
+    if (ImGui::Checkbox("GPU-paced cadence", &g_config.gpu_paced_cadence)) {
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: GPU-paced cadence -> %s", g_config.gpu_paced_cadence ? "on" : "off");
+        *config_dirty = true;
+    }
+    HelpTip("Diagnostic A/B, Reflex games with the Reflex Sleep bypass on. On, held frames are released no "
+        "earlier than the render handoff GPU floor too (about half a GPU frame plus the submission delay "
+        "before the GPU finishes the previous frame). When that floor sets a frame's release, the GPU is the "
+        "limit: the frame's output target becomes the time such a frame is ready at the earliest, and the "
+        "cadence continues from there instead of holding the frame to the cap's cadence, which would leave "
+        "the GPU idle. Frames the GPU finishes early are still held to the cap. Watch long frames, jitter, "
+        "GPU idle gaps and PC Latency; one setting per capture.");
 
     static const char* const kSourcePlacementLabels[] = {"Marker", "Pre-Sleep", "Reflex driver limiter"};
     static_assert(IM_ARRAYSIZE(kSourcePlacementLabels) ==

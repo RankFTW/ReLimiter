@@ -126,6 +126,19 @@ Turning it off removes two command lists and two fence signals per frame from th
 - A frame that reaches the FG input after its original target can be held to the moved target instead of passing late.
 - Compare jitter above 2 and 4 ms, long frames and PC Latency, one setting per capture in the same scene. The log warns while it is off and logs at INFO the first moved release and the first release kept at its target because the render thread was still in the Present.
 
+### GPU-paced cadence
+
+`gpu_paced_cadence` (default **off**, 64-bit, direct NvAPI Reflex markers with the Sleep bypass on, pre-Sleep or marker placement). A developer A/B for games whose GPU is the limit at the cap, such as Gears of War: E-Day at 120 FPS with FG 2× (GPU active plus frame generation time 16.8–17.6 ms per real frame against a 16.67 ms interval). Without it ReLimiter keeps the cap's cadence: frames drift later than it until the cadence restarts, a restart puts the next targets ahead of frames the GPU cannot finish sooner, and the output hold then holds a GPU that has no idle time, so the frame after it stretches. The overload pause takes the holds away and gives them back every few seconds.
+
+On, one cadence takes the later of the two limits for every frame:
+
+- **Held frames get the GPU floor.** A held frame released at SIMULATION_START by marker or pre-Sleep placement while the driver's Sleep does not run is released no earlier than `Ĝ(n−1) − (P/2 + F + σ)`, the floor frames that are not held already use ([Render handoff limit](#render-handoff-limit)), without the render-thread offset `w + d`. The pre-Sleep wait for the next frame aims for the same floor.
+- **A frame the GPU floor releases keeps the GPU's pace.** When the GPU floor is the frame's earliest release (for frames not held: later than `w + d`) and later than the moment the game reached its release, the GPU sets the release. The frame's output target is then at least the floor plus the early side of its lead: the `(1 − c)` quantile of its lead samples minus the allowance, `c` the **Lead coverage** (the 1st percentile at the default 99%), the mirror of the lead's `c` quantile plus the allowance. That is about where such a frame is ready at the earliest. When it is later than the cadence's own target, the cadence continues from it without a restart, and the frame is not judged late. A frame the GPU finishes early keeps the cadence's target and is held to the cap as before.
+- While a lead window restarts after the overload pause, the early side is the old window's median minus the allowance; with no window at all nothing changes.
+- The OSD line `GPU-paced cadence` (Details) counts the frames among the newest 128 whose target the GPU set, those in all, and the held frames the floor released later than the cadence asked. The pacing rows mark such frames with `source_flags` bit 4.
+- Games whose render thread starts later than the floor (CONTROL Resonant, Rogue Core) are rarely or never released by it, so the switch changes little there; verify with captures.
+- The log warns while it is on and logs `OSD: GPU-paced cadence -> on|off` for a change. Compare long frames, jitter, GPU idle gaps, the overload pauses and PC Latency, one setting per capture in the same scene, with Reflex active.
+
 ### Source placement
 
 `source_placement` (default **Pre-Sleep**, 64-bit, Reflex marker games) sets where the source wait happens. ReLimiter never changes it on its own. The Details lines show the result as **Placement**. State the placement with every latency comparison.
@@ -168,6 +181,7 @@ Settings belong under `[FrameLimiter]`. Leave these at their defaults for normal
 | `gpu_queue_wait_render_queue` | keep | 64-bit, `gpu_queue_wait` only. `keep`, `remove` or `remove_held` (**GPU queue wait render queue**). Invalid values reset to `keep`. |
 | `lead_coverage` | 99 | All holds. `99` or `95`: the share of frames the lead covers (**Lead coverage**). Invalid values reset to `99`. An INI saved with `config_version=2` (4.0 test builds) moves from `95` to `99` once. |
 | `fg_late_spacing` | true | 64-bit, `fg_input_wait` only. `true` or `false` (**FG late-frame spacing**). An INI saved with `config_version=3` or earlier (4.0 test builds) moves from `false` to `true` once. |
+| `gpu_paced_cadence` | false | 64-bit, direct NvAPI Reflex markers, with the Sleep bypass on. `true` or `false` (**GPU-paced cadence**): held frames get the render handoff GPU floor, and a frame that floor releases keeps the GPU's pace instead of being held to the cap's cadence. Developer A/B, off by default. |
 | `source_placement` | pre_sleep | 64-bit, Reflex markers. `marker`, `pre_sleep` or `driver` (**Source placement**). `auto` from earlier versions loads as `marker`; invalid values reset to `pre_sleep`. |
 
 ---
@@ -190,6 +204,8 @@ The main view shows one plain status line; the technical lines are under **Detai
 - `Reflex driver limiter (x.xx ms)` shows the presented-frame interval applied through the **Source placement** diagnostic; an orange `Reflex driver limiter (not applied)` can appear briefly while the driver limit is not in effect; frames that cannot use it are paced at the marker.
 
 **Render handoff limit.** `Render handoff limit: +x.xx ms after the render thread takes the previous frame | n frames delayed | m stalls`, shown while frames are not held and the Reflex Sleep is bypassed. `+x.xx ms` is the learned offset, `n` counts frames it released later than the cadence asked and `m` waits that ended because the render thread took no frame for three of its frame times. Once ReLimiter has measured the GPU's frame period and the game's render timing (below), the line reads `+x.xx ms after the render thread takes the previous frame, render thread no earlier than y.yy ms before the GPU finishes it`: the GPU floor releases the next frame so that its render thread starts no earlier than `y.yy` ms before the GPU is expected to finish the previous frame. An orange `Render handoff limit: off (the render thread may wait for the next release; waiting for evidence)` means two waits in a row ended that way before ReLimiter had seen the render thread take a frame ahead of the next release; the limit comes back once it has, or after the cap, the FG mode or the game's swapchain changes.
+
+**GPU-paced cadence.** `GPU-paced cadence: n of the newest 128 frames at the GPU's pace | t frames | h held frames delayed by the GPU floor`, shown while the developer **GPU-paced cadence** is on and the GPU floor is known. `n` counts the newest 128 planned frames whose output target the GPU set, `t` those since the game started, and `h` held frames the floor released later than the cadence asked (both cumulative).
 
 **Lead | Grid epoch.**
 - Lead is how far ahead of each output target the game is released, whether it is still `warming` (fewer than 32 samples, using a starting estimate) or `warm`, and how many recent frames it is based on. It shows `-` until the source wait has run. The lead is limited to three frame intervals; `, at budget` after the sample count means the lead it wanted was longer and was clamped, so those frames are likely to miss their targets.

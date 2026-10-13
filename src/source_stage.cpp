@@ -185,6 +185,18 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     // planned the frame.
     const double median_x_us = lead_.MedianSampleUs(slack_rung, request.fg_divisor);
     input.source_slack_us = median_x_us > 0.0 ? (std::max)(0.0, lead_us - median_x_us) : 0.0;
+    // Developer A/B gpu_paced_cadence (source_stage.h): when the GPU floor
+    // sets this frame's release, its output target is at least where such a
+    // frame is ready at the earliest, so the grid follows the GPU.
+    if (request.gpu_paced_cadence && request.gpu_floor_qpc > arrival_qpc &&
+        request.gpu_floor_qpc >= request.earliest_release_qpc) {
+        const double early_us = lead_.EarlyLeadUs(slack_rung, request.fg_divisor,
+            pipeline.lead_quantile, pipeline.allowance_us);
+        if (early_us > 0.0) {
+            input.earliest_target_qpc = request.gpu_floor_qpc + static_cast<int64_t>(std::llround(
+                early_us * static_cast<double>(request.qpc_frequency) / 1'000'000.0));
+        }
+    }
     input.mode = pipeline.mode;
     input.controller_generation = request.key.controller_generation;
     if (pipeline.mode == PacingTimingMode::Fixed) input.fixed = request.fixed;
@@ -210,6 +222,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     frame.lead_budget_limited = budget_limited;
     frame.epoch_started = grid_plan.epoch_reason;
     frame.grid_epoch_reason = snapshot.epoch_reason;
+    frame.gpu_paced = grid_plan.gpu_paced;
 
     // Publish before the wait: PRESENT_START and the output executors never
     // wait for the owner.
@@ -295,6 +308,7 @@ void SourceStage::FillSourceRecord(
     if (frame.slept) record->flags |= PACING_SOURCE_SLEPT;
     if (plan.mode == PacingTimingMode::Fixed) record->flags |= PACING_SOURCE_FIXED_REFRESH;
     if (frame.stall_injected_us != 0) record->flags |= PACING_SOURCE_STALL_INJECTED;
+    if (frame.gpu_paced) record->flags |= PACING_SOURCE_GPU_PACED;
     record->wake_target_qpc = frame.wait_target_qpc;
     record->source_wait_start_qpc = frame.wait_start_qpc;
     record->pre_sleep_start_qpc = frame.pre_wait_start_qpc;

@@ -409,6 +409,24 @@ double LeadController::MedianSampleUs(PacingRung rung, double fg_divisor) const 
     return window.Quantile(0.5);
 }
 
+double LeadController::EarlyLeadUs(PacingRung rung, double fg_divisor, double quantile,
+    double allowance_us) const noexcept
+{
+    size_t index = 0;
+    if (!std::isfinite(quantile) || !std::isfinite(allowance_us) ||
+        !FindBucketIndex(rung, fg_divisor, &index)) {
+        return 0.0;
+    }
+    const Bucket& bucket = buckets_[index];
+    const double allowance = std::max(allowance_us, 0.0);
+    if (bucket.window.Count() >= LEAD_WARM_SAMPLES) {
+        return std::max(0.0, bucket.window.Quantile(1.0 - std::clamp(quantile, 0.0, 1.0)) - allowance);
+    }
+    // A restarted window (holds resuming): the old window's median, as the
+    // cold lead uses it.
+    return bucket.reseed_x_us > 0.0 ? std::max(0.0, bucket.reseed_x_us - allowance) : 0.0;
+}
+
 double LeadController::HoldRoomUs(double fg_divisor, double quantile) const noexcept
 {
     size_t index = 0;

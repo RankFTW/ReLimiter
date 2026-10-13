@@ -206,9 +206,9 @@ CONTROLLER_COLUMNS = ("governor_step", "governor_interval_us", "plan_signal_adva
 RESUME_COLUMN = "gate_pre_wait_qpc"
 SOURCE_FLAG_OVERLOAD = 64  # PACING_SOURCE_OVERLOAD: set while the governor stretches the interval
 # PacingSourceFlags names by bit value (src/pacing_telemetry_types.h). Bit 1 was
-# the retired, never-set pre_reflex_paced before Phase 4; predictor_warm is
-# reserved and never set.
-SOURCE_FLAG_NAMES = {1: "slept", 2: "pre_sleep", 4: "predictor_warm", 8: "fixed_refresh", 16: "background",
+# the retired, never-set pre_reflex_paced before Phase 4; bit 4 was the retired,
+# never-set predictor_warm until gpu_paced (developer A/B gpu_paced_cadence).
+SOURCE_FLAG_NAMES = {1: "slept", 2: "pre_sleep", 4: "gpu_paced", 8: "fixed_refresh", 16: "background",
                      32: "passthrough", 64: "overload", 128: "stall_injected"}
 SOURCE_FLAG_PRE_SLEEP = 2       # PACING_SOURCE_PRE_SLEEP: a pre-Sleep wait preceded the frame's marker
 SOURCE_FLAG_FIXED_REFRESH = 8   # PACING_SOURCE_FIXED_REFRESH

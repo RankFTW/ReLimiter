@@ -413,6 +413,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.native_pcl_enabled      = ReadINIBool(S, "native_pcl_enabled", false, P);
     g_config.gpu_present_gate_probes=ReadINIBool(S,"gpu_present_gate_probes",true,P);
     g_config.fg_late_spacing=ReadINIBool(S,"fg_late_spacing",true,P);
+    g_config.gpu_paced_cadence=ReadINIBool(S,"gpu_paced_cadence",false,P);
     g_config.reflex_sleep_bypass=ReadINIBool(S,"reflex_sleep_bypass",true,P);
     g_config.reflex_inject           = ReadINIBool(S, "reflex_inject", false, P);
     g_config.flip_model_override     = ReadINIBool(S, "flip_model_override", false, P);
@@ -628,6 +629,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
         PacingRenderQueue_Text(config.gpu_queue_wait_render_queue), P);
     WriteINIString(S, "lead_coverage", PacingLeadCoverage_Text(config.lead_coverage), P);
     WriteINIBool(S, "fg_late_spacing", config.fg_late_spacing, P);
+    WriteINIBool(S, "gpu_paced_cadence", config.gpu_paced_cadence, P);
     WriteINIString(S, "source_placement",
         PacingPlacementOverride_Text(config.source_placement), P);
     WriteINIDouble(S, "stall_inject_ms", config.stall_inject_ms, P);
@@ -870,6 +872,7 @@ static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
     pipeline.gpu_queue_wait_render_queue = config.gpu_queue_wait_render_queue;
     pipeline.lead_coverage = config.lead_coverage;
     pipeline.fg_late_spacing = config.fg_late_spacing;
+    pipeline.gpu_paced_cadence = config.gpu_paced_cadence;
     return pipeline;
 }
 
@@ -896,6 +899,7 @@ int Config_DeveloperOverrides() {
         (g_config.gpu_queue_wait_render_queue != d.gpu_queue_wait_render_queue) +
         (g_config.lead_coverage != d.lead_coverage) +
         (g_config.fg_late_spacing != d.fg_late_spacing) +
+        (g_config.gpu_paced_cadence != d.gpu_paced_cadence) +
         (g_config.source_placement != d.source_placement);
 }
 
@@ -913,6 +917,7 @@ void Config_ResetDeveloperSettings() {
     g_config.gpu_queue_wait_render_queue = d.gpu_queue_wait_render_queue;
     g_config.lead_coverage = d.lead_coverage;
     g_config.fg_late_spacing = d.fg_late_spacing;
+    g_config.gpu_paced_cadence = d.gpu_paced_cadence;
     g_config.source_placement = d.source_placement;
     Config_ApplyPacingPipeline();
     LOG_INFO("Config: developer diagnostics reset to the recommended defaults");
@@ -962,6 +967,10 @@ void ApplyConfig() {
     if (!g_config.fg_late_spacing)
         LOG_WARN("Pacing pipeline: diagnostic FG late-frame spacing off (the next real frame after one that "
                  "reached its FG input late is released on its original target)");
+    if (g_config.gpu_paced_cadence)
+        LOG_WARN("Pacing pipeline: diagnostic GPU-paced cadence on (held frames are released no earlier than "
+                 "the render handoff GPU floor, and a frame whose release that floor sets keeps the GPU's pace "
+                 "instead of being held to the cap's cadence)");
 }
 
 

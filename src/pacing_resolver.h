@@ -115,6 +115,12 @@ struct PacingPipelineConfig {
     // readiness and floors the next frame's Signal on it (cadence_grid.h,
     // output tracker).
     bool fg_late_spacing = true;
+    // Key gpu_paced_cadence (default off; developer A/B): held frames are
+    // released no earlier than the render handoff GPU floor too, and a frame
+    // whose release that floor sets gets an output target at least the floor
+    // plus the early side of its lead, so the cadence follows the GPU instead
+    // of holding the frame (cadence_grid.h, source_stage.h).
+    bool gpu_paced_cadence = false;
     double stall_inject_ms = 0.0; // 0 = off; [0, kPacingStallInjectMaxMs]
     double stall_inject_period_s = kPacingStallInjectDefaultPeriodS; // [1, 60]
 };
