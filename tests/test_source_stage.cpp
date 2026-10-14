@@ -897,12 +897,13 @@ void TestEarliestReleaseLimitsWait()
 // Developer A/B gpu_paced_cadence: a held frame whose release the GPU floor
 // sets (the floor is the earliest release and later than its arrival) is
 // released at the floor, never judged late, and its output target is at least
-// the floor plus the early lead: the bucket's Q5(X) − allowance (3,010 − 500
-// µs here) until 32 frames were released by the floor, a restarted bucket's
-// old median, and then the floor-released frames' own X (TestGpuPacedRing).
-// Its record carries the GPU-paced flag. A frame whose game entered the Reflex
-// Sleep for its index before the floor is the floor's even when its marker
-// lands just after it. The key off, a later render-thread term and an arrival
+// its release plus the early lead: the bucket's Q5(X) − allowance (3,010 −
+// 500 µs here) until 32 frames were released by the floor, a restarted
+// bucket's old median, and then the floor-released frames' own X
+// (TestGpuPacedRing). Its record carries the GPU-paced flag. A frame whose
+// game entered the Reflex Sleep for its index before the floor is the floor's
+// even when its marker lands just after it (released at the marker). The
+// key off, a later render-thread term and an arrival
 // after the floor without a Sleep entry for this index are not GPU-paced; with
 // a cold bucket the floor still releases the frame but without an early lead
 // the grid judges it as before: 6 ms past S is a SourceLate restart.
@@ -967,7 +968,7 @@ void TestGpuPacedCadence()
             CHECK(frame.epoch_started == PacingEpochReason::None && frame.gpu_target);
             CHECK(frame.release_qpc == (c.arrival_first ? floor : floor + Ticks(100.0)));
             CHECK(frame.plan.source_wake_qpc == frame.release_qpc);
-            const int64_t target = floor + Ticks(c.early_us);
+            const int64_t target = frame.release_qpc + Ticks(c.early_us);
             CHECK(frame.plan.output_target_qpc > target - 10 && frame.plan.output_target_qpc < target + 10);
         } else {
             // A late source restarts at its arrival (the earliest release or
@@ -1026,6 +1027,104 @@ void TestGpuPacedRing()
     }
 }
 
+// Developer A/B gpu_paced_cadence: the GPU-paced rhythm (source_stage.h).
+// After a frame it paced, the next consecutive frame's release is the
+// previous release plus the mean of the newest five GPU periods: never later
+// than its floor (Late: the floor), else pulled a quarter of the way to the
+// floor, never earlier than the floor minus half the median period
+// (EarlyBound). Without a previous paced frame, after a frame gap or in
+// another controller generation: the floor (Start); without a floor: None.
+// The frame's output target follows its release, and a frame the rhythm did
+// not pace restarts it.
+void TestGpuPacedRhythm()
+{
+    std::printf("Test: the GPU-paced rhythm smooths releases between the GPU floor and half a period before it\n");
+    ResetStage();
+    ScriptedClock clock;
+    const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
+    // GPU periods of 17,000 µs (median bin 17,010), 250 µs idle before each.
+    for (uint64_t index = 0; index < 40; ++index) {
+        const int64_t end = kStart + Ticks(17'000.0 * static_cast<double>(index));
+        g_stage.OnGpuRenderEnd(1, 3000 + index, end - Ticks(17'000.0 - 250.0), end, 14'000.0);
+    }
+    CHECK(g_stage.Lead().RecentGpuPeriodUs() == 17'000.0);
+    uint64_t frame_id = 4000;
+    SourceStageFrame last{};
+    const auto finish = [&](const SourceStageFrame& frame, double x_us) {
+        const int64_t done = frame.release_qpc + Ticks(x_us);
+        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::PresentCall,
+            frame.release_qpc + Ticks(1'000.0))));
+        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady, done)));
+        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease, done,
+            PacingPlanStatus::Late)));
+        g_stage.DrainStageEvents();
+        clock.now = done;
+    };
+    // Warm lead: ready 3,000 µs after each release (early side 2,510 µs).
+    for (int i = 0; i < 40; ++i) {
+        last = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
+        finish(last, 3'000.0);
+    }
+    const auto run = [&](int64_t floor, const GpuPacedRhythmRelease& rhythm) {
+        SourceStageRequest request = Request(Key(frame_id++), held);
+        request.gpu_paced_cadence = true;
+        request.gpu_floor_qpc = floor;
+        request.earliest_release_qpc = rhythm.release_qpc;
+        request.gpu_paced_rhythm = rhythm.step;
+        return g_stage.RunPlannedFrame(request, &clock);
+    };
+    const auto steps = [](GpuPacedRhythmStep step) {
+        return g_stage.Statistics().gpu_paced_rhythm[static_cast<size_t>(step)];
+    };
+
+    // No previous paced frame: the floor (6 ms past the grid's S).
+    const int64_t floor0 = last.plan.output_target_qpc + Ticks(kIntervalUs) - Ticks(last.plan.lead_us) +
+        Ticks(6'000.0);
+    const GpuPacedRhythmRelease start = g_stage.GpuPacedRhythm(Key(frame_id), floor0);
+    CHECK(start.step == GpuPacedRhythmStep::Start && start.release_qpc == floor0);
+    const uint64_t starts = steps(GpuPacedRhythmStep::Start);
+    const SourceStageFrame first = run(floor0, start);
+    CHECK(first.planned && first.gpu_paced && first.release_qpc == floor0);
+    CHECK(steps(GpuPacedRhythmStep::Start) == starts + 1);
+    finish(first, 5'000.0);
+
+    // The next frame: candidate = release + 17,000 µs.
+    const int64_t candidate = first.release_qpc + Ticks(17'000.0);
+    const PacingPlanKey next = Key(frame_id);
+    const GpuPacedRhythmRelease late = g_stage.GpuPacedRhythm(next, candidate - Ticks(1'000.0));
+    CHECK(late.step == GpuPacedRhythmStep::Late && late.release_qpc == candidate - Ticks(1'000.0));
+    const GpuPacedRhythmRelease smooth = g_stage.GpuPacedRhythm(next, candidate + Ticks(2'000.0));
+    CHECK(smooth.step == GpuPacedRhythmStep::Smooth && smooth.release_qpc == candidate + Ticks(500.0));
+    // 12 ms before the floor: held at floor − 17,010 / 2.
+    const GpuPacedRhythmRelease bounded = g_stage.GpuPacedRhythm(next, candidate + Ticks(12'000.0));
+    CHECK(bounded.step == GpuPacedRhythmStep::EarlyBound &&
+        bounded.release_qpc == candidate + Ticks(12'000.0) - Ticks(8'505.0));
+    CHECK(g_stage.GpuPacedRhythm(Key(frame_id + 1), candidate).step == GpuPacedRhythmStep::Start);
+    CHECK(g_stage.GpuPacedRhythm(Key(frame_id, 2), candidate).step == GpuPacedRhythmStep::Start);
+    const GpuPacedRhythmRelease none = g_stage.GpuPacedRhythm(next, 0);
+    CHECK(none.step == GpuPacedRhythmStep::None && none.release_qpc == 0);
+
+    // Released on the rhythm; its target follows the release, not the floor.
+    const uint64_t smooths = steps(GpuPacedRhythmStep::Smooth);
+    const SourceStageFrame second = run(candidate + Ticks(2'000.0), smooth);
+    CHECK(second.planned && second.gpu_paced && second.release_qpc == candidate + Ticks(500.0));
+    CHECK(second.epoch_started == PacingEpochReason::None);
+    const int64_t target = second.release_qpc + Ticks(2'510.0);
+    CHECK(second.plan.output_target_qpc > target - 10 && second.plan.output_target_qpc < target + 10);
+    CHECK(steps(GpuPacedRhythmStep::Smooth) == smooths + 1);
+    finish(second, 5'000.0);
+    CHECK(g_stage.GpuPacedRhythm(Key(frame_id), second.release_qpc + Ticks(17'000.0)).step ==
+        GpuPacedRhythmStep::Late);
+
+    // The game arrives after its floor: not paced, the rhythm restarts.
+    const int64_t floor2 = second.release_qpc + Ticks(17'000.0);
+    const GpuPacedRhythmRelease third_rhythm = g_stage.GpuPacedRhythm(Key(frame_id), floor2);
+    clock.now = floor2 + Ticks(100.0);
+    const SourceStageFrame third = run(floor2, third_rhythm);
+    CHECK(third.planned && !third.gpu_paced);
+    CHECK(g_stage.GpuPacedRhythm(Key(frame_id), floor2 + Ticks(17'000.0)).step == GpuPacedRhythmStep::Start);
+}
+
 int main()
 {
     std::printf("=== Source stage tests ===\n");
@@ -1049,6 +1148,7 @@ int main()
     TestEarliestReleaseLimitsWait();
     TestGpuPacedCadence();
     TestGpuPacedRing();
+    TestGpuPacedRhythm();
     TestResetClearsPlans();
     std::printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

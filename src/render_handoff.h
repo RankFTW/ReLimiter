@@ -59,8 +59,8 @@ RenderHandoffWait RenderHandoff_WaitFor(uint8_t domain, uint32_t producer_epoch,
     int64_t min_stall_ticks, int64_t* handoff_qpc) noexcept;
 
 // Render thread (marker hooks): the render thread left the Present of (domain,
-// producer epoch, frame) at qpc, its PRESENT_END, and wakes waiters. A
-// publication racing another is dropped.
+// producer epoch, frame) at qpc, its PRESENT_END. A publication racing another
+// is dropped.
 void RenderHandoff_PublishPresentEnd(uint8_t domain, uint32_t producer_epoch, uint64_t frame_id,
     int64_t qpc) noexcept;
 
@@ -75,11 +75,3 @@ bool RenderHandoff_LeftPresent(uint8_t domain, uint32_t producer_epoch, uint64_t
 // for it.
 bool RenderHandoff_LatestPresentEnd(uint8_t domain, uint32_t producer_epoch, uint64_t* frame_id,
     int64_t* qpc) noexcept;
-
-// Waits, without spinning, until a PRESENT_END of frame_id or a later frame of
-// (domain, producer epoch) is published, or until the render thread left no
-// Present for the stall span (from the start of the wait or its newest
-// PRESENT_END, whichever is later; the span as in RenderHandoff_WaitFor).
-// *present_end_qpc receives that PRESENT_END's QPC when Ready.
-RenderHandoffWait RenderHandoff_WaitForPresentEnd(uint8_t domain, uint32_t producer_epoch, uint64_t frame_id,
-    int64_t min_stall_ticks, int64_t* present_end_qpc) noexcept;

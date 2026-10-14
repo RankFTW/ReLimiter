@@ -541,6 +541,8 @@ This requires suitable NVIDIA PCL markers from the game and Windows tracing perm
 
 While collection is running, Display Pacing uses its ETW display times instead of DXGI. While **Telemetry Logging** is on, display times and PC Latency are also written to the `relimiter_pacing_` file. To disable collection, close the game and set the value back to `false`.
 
+With frame generation, PC Latency is measured on the real rendered frame, not on the generated frames between them. The readout and the capture rows then update about one displayed frame after the display they describe.
+
 ### PC Latency: Access Denied
 
 The optional [PCL Permissions utility](../tools/PCL%20Permissions.cmd) can grant the gaming account membership in **Performance Log Users**, allowing tracing without running the game as administrator.

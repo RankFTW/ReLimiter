@@ -150,7 +150,6 @@ namespace
             left.lead_coverage == right.lead_coverage &&
             left.fg_late_spacing == right.fg_late_spacing &&
             left.gpu_paced_cadence == right.gpu_paced_cadence &&
-            left.gpu_paced_present_gate == right.gpu_paced_present_gate &&
             left.stall_inject_ms == right.stall_inject_ms &&
             left.stall_inject_period_s == right.stall_inject_period_s;
     }
@@ -855,7 +854,6 @@ namespace
         config.lead_coverage = PacingLeadCoverage::Q95;
         config.fg_late_spacing = false;
         config.gpu_paced_cadence = true;
-        config.gpu_paced_present_gate = true;
         PacingPipeline_SetConfig(config);
         CHECK(SameConfig(PacingPipeline_GetConfig(), config));
         CHECK(PacingPipeline_GetConfig().adaptive_cap);

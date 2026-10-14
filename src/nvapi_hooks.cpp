@@ -722,28 +722,13 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
                     QueryPerformanceCounter(&handoff_end);
                     plan_qpc = handoff_end.QuadPart;
                 }
-                // Present-end gate (developer A/B gpu_paced_present_gate):
-                // the frame after a GPU-paced frame waits here, before the
-                // game reads input, until the render thread has left that
-                // frame's Present.
-                int64_t present_end_qpc = 0;
-                if (bypass && Scheduler_PresentGateFrame(&handoff_domain, &handoff_epoch, &handoff_frame)) {
-                    const double interval_us = g_effective_interval_us.load(std::memory_order_relaxed);
-                    const RenderHandoffWait waited = RenderHandoff_WaitForPresentEnd(handoff_domain, handoff_epoch,
-                        handoff_frame, us_to_qpc(RENDER_HANDOFF_STALL_INTERVALS * interval_us), &present_end_qpc);
-                    if (waited == RenderHandoffWait::Deadline) Scheduler_PresentGateStalled();
-                    if (waited != RenderHandoffWait::Ready) present_end_qpc = 0;
-                    LARGE_INTEGER gate_end{};
-                    QueryPerformanceCounter(&gate_end);
-                    plan_qpc = gate_end.QuadPart;
-                }
                 int64_t pre_sleep_target = 0;
                 uint64_t pre_sleep_index = 0;
                 bool planned = false;
                 {
                     SchedulerOwnerGuard scheduler_owner;
                     planned = scheduler_owner && Scheduler_PlanReflexSleep(sleep_entry.QuadPart, plan_qpc,
-                        !bypass, handoff_qpc, present_end_qpc, &pre_sleep_target, &pre_sleep_index);
+                        !bypass, handoff_qpc, &pre_sleep_target, &pre_sleep_index);
                 }
                 if (planned) {
                     PreSleepWaitUntil(pre_sleep_target);

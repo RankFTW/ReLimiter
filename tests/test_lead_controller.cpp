@@ -2546,49 +2546,52 @@ void TestRenderHandoffGpuFloor()
     feed_sigma(controller.get(), 31);
     feed_first_submission(controller.get(), 32);
     // σ is cold (31 samples): no floor; P/2 + F is known.
-    CHECK(controller->GpuFloorQpc(key_of(2034)) == 0);
+    CHECK(controller->GpuFloor(key_of(2034)).floor_qpc == 0);
     CHECK_NEAR(controller->GpuFloorStartUs(), 17010.0 / 2.0 + 830.0);
     feed_sigma(controller.get(), 32);
     // Frame 2034: Ĝ(2033) = G(2032) + 17,010; floor = Ĝ − (8,505 + 830 + 5,010).
-    CHECK(controller->GpuFloorQpc(key_of(2034)) == Qpc(gpu_end_us(2032) + 17010.0 - 14345.0));
+    const GpuFloorEstimate reported_2034 = controller->GpuFloor(key_of(2034));
+    CHECK(reported_2034.floor_qpc == Qpc(gpu_end_us(2032) + 17010.0 - 14345.0));
+    CHECK(reported_2034.anchor == GpuFloorAnchor::Report && reported_2034.frames_ahead == 1);
     // Frame 2033: its predecessor's GPU end is known.
-    CHECK(controller->GpuFloorQpc(key_of(2033)) == Qpc(gpu_end_us(2032) - 14345.0));
+    CHECK(controller->GpuFloor(key_of(2033)).floor_qpc == Qpc(gpu_end_us(2032) - 14345.0));
 
     // Live bound: frame 2033 left its Present 2,000 µs later than its usual
     // place (G − 14,000). For frame 2035, Ĝ(2034) is at least PRESENT_END(2033)
     // + 14,010 + 17,010 instead of G(2032) + 2 × 17,010.
     const double usual_present_end_us = gpu_end_us(2033) - 14000.0;
-    CHECK(controller->GpuFloorQpc(key_of(2035), 2033, Qpc(usual_present_end_us + 2000.0)) ==
-        Qpc(usual_present_end_us + 2000.0 + 14010.0 + 17010.0 - 14345.0));
+    const GpuFloorEstimate bounded = controller->GpuFloor(key_of(2035), 2033, Qpc(usual_present_end_us + 2000.0));
+    CHECK(bounded.floor_qpc == Qpc(usual_present_end_us + 2000.0 + 14010.0 + 17010.0 - 14345.0));
+    CHECK(bounded.anchor == GpuFloorAnchor::PresentEnd && bounded.frames_ahead == 1);
     // An early PRESENT_END never lowers the report's prediction; a PRESENT_END
     // not newer than the newest GPU end, or of frame n itself, is no bound.
     const int64_t reported = Qpc(gpu_end_us(2032) + 2.0 * 17010.0 - 14345.0);
-    CHECK(controller->GpuFloorQpc(key_of(2035), 2033, Qpc(usual_present_end_us - 5000.0)) == reported);
-    CHECK(controller->GpuFloorQpc(key_of(2035), 2032, Qpc(usual_present_end_us + 9000.0)) == reported);
-    CHECK(controller->GpuFloorQpc(key_of(2035), 2035, Qpc(usual_present_end_us + 9000.0)) == reported);
+    CHECK(controller->GpuFloor(key_of(2035), 2033, Qpc(usual_present_end_us - 5000.0)).floor_qpc == reported);
+    CHECK(controller->GpuFloor(key_of(2035), 2032, Qpc(usual_present_end_us + 9000.0)).floor_qpc == reported);
+    CHECK(controller->GpuFloor(key_of(2035), 2035, Qpc(usual_present_end_us + 9000.0)).floor_qpc == reported);
 
     // A GPU frame the GPU waited 2 ms for adds no period: the median stays.
     controller->OnGpuRenderEnd(kEpoch, 2033, Qpc(gpu_end_us(2032) + 2000.0),
         Qpc(gpu_end_us(2032) + 2000.0 + 30000.0), 14000.0);
-    CHECK(controller->GpuFloorQpc(key_of(2035)) == Qpc(gpu_end_us(2032) + 32000.0 + 17010.0 - 14345.0));
+    CHECK(controller->GpuFloor(key_of(2035)).floor_qpc == Qpc(gpu_end_us(2032) + 32000.0 + 17010.0 - 14345.0));
     // An older report is ignored.
     controller->OnGpuRenderEnd(kEpoch, 2030, Qpc(gpu_end_us(2030) - 16000.0), Qpc(gpu_end_us(2030)), 14000.0);
-    CHECK(controller->GpuFloorQpc(key_of(2034)) == Qpc(gpu_end_us(2032) + 32000.0 - 14345.0));
+    CHECK(controller->GpuFloor(key_of(2034)).floor_qpc == Qpc(gpu_end_us(2032) + 32000.0 - 14345.0));
 
     // Horizon: at most 8 frames between the newest GPU end and frame n − 1.
-    CHECK(controller->GpuFloorQpc(key_of(2042)) != 0);
-    CHECK(controller->GpuFloorQpc(key_of(2043)) == 0);
+    CHECK(controller->GpuFloor(key_of(2042)).floor_qpc != 0);
+    CHECK(controller->GpuFloor(key_of(2043)).floor_qpc == 0);
     // Not before the newest GPU end's frame, nor for another producer epoch or
     // identity domain.
-    CHECK(controller->GpuFloorQpc(key_of(2033)) == 0);
-    CHECK(controller->GpuFloorQpc(key_of(2034, kEpoch + 1)) == 0);
+    CHECK(controller->GpuFloor(key_of(2033)).floor_qpc == 0);
+    CHECK(controller->GpuFloor(key_of(2034, kEpoch + 1)).floor_qpc == 0);
     PacingPlanKey pcl = key_of(2034);
     pcl.identity_domain = PacingIdentityDomain::PclFrame;
-    CHECK(controller->GpuFloorQpc(pcl) == 0);
+    CHECK(controller->GpuFloor(pcl).floor_qpc == 0);
     // A new producer epoch restarts the anchor and the period window.
     controller->OnGpuRenderEnd(kEpoch + 1, 5000, Qpc(899000.0), Qpc(900000.0), 14000.0);
-    CHECK(controller->GpuFloorQpc(key_of(2034)) == 0);
-    CHECK(controller->GpuFloorQpc(key_of(5002, kEpoch + 1)) == 0);
+    CHECK(controller->GpuFloor(key_of(2034)).floor_qpc == 0);
+    CHECK(controller->GpuFloor(key_of(5002, kEpoch + 1)).floor_qpc == 0);
     CHECK_NEAR(controller->GpuFloorStartUs(), 0.0);
     // The handoff window reset clears P, F and σ.
     feed_gpu(controller.get(), 2000, 2032);
@@ -2605,7 +2608,127 @@ void TestRenderHandoffGpuFloor()
     feed_sigma(waiting.get(), 32);
     feed_first_submission(waiting.get(), 32);
     CHECK_NEAR(waiting->GpuFloorStartUs(), 0.0);
-    CHECK(waiting->GpuFloorQpc(key_of(2042)) == 0);
+    CHECK(waiting->GpuFloor(key_of(2042)).floor_qpc == 0);
+}
+
+// Developer A/B gpu_paced_cadence: the readiness anchor. A frame newer than
+// the newest report whose GPU readiness and output outcome are known sets
+// Ĝ(n − 1) = its readiness (the hold's release when the GPU waited) + the
+// median readiness → GPU end gap of frames not held + P per frame, in place
+// of the report's extrapolation; a PRESENT_END bound then counts only from a
+// newer frame. Off without the switch, before 32 gaps, for an older frame or
+// another producer epoch. The rhythm's period is the mean of the newest five
+// GPU periods of frames the GPU did not wait for; the floor keeps the median.
+void TestGpuFloorReadyAnchor()
+{
+    constexpr uint32_t kEpoch = 7;
+    constexpr double kGpuPeriod = 17000.0; // bin center 17,010 µs
+    constexpr double kReadyGap = 1530.0;   // readiness → GPU end (frame generation included)
+    const auto key_of = [](uint64_t frame_id, uint32_t epoch = 7) {
+        PacingPlanKey key{};
+        key.identity_domain = PacingIdentityDomain::NvApiFrame;
+        key.producer_epoch = epoch;
+        key.controller_generation = 1;
+        key.frame_id = frame_id;
+        return key;
+    };
+    const auto gpu_end_us = [&](uint64_t frame_id) {
+        return 1'000'000.0 + kGpuPeriod * (static_cast<double>(frame_id) - 3000.0);
+    };
+    const auto start_of = [&](uint64_t frame_id, uint64_t grid_index) {
+        LeadFrameStart start{};
+        start.key = key_of(frame_id);
+        start.grid_index = grid_index;
+        start.rung = PacingRung::FgInputWait;
+        start.fg_divisor = 2.0;
+        start.interval_us = kGpuPeriod;
+        start.source_release_qpc = Qpc(gpu_end_us(frame_id) - 30000.0);
+        return start;
+    };
+    const auto event_of = [&](uint64_t frame_id, uint64_t grid_index, Kind kind, double at_us,
+        PacingPlanStatus status = PacingPlanStatus::Late) {
+        PacingStageEvent event{};
+        event.key = key_of(frame_id);
+        event.grid_index = grid_index;
+        event.kind = kind;
+        event.qpc = Qpc(at_us);
+        event.status = kind == Kind::OutputRelease ? status : PacingPlanStatus::Unknown;
+        return event;
+    };
+    // A frame released, ready kReadyGap before its GPU end (+ late_us), not
+    // held, and its report (when report is true).
+    const auto frame = [&](LeadController* controller, uint64_t frame_id, double late_us, bool report) {
+        const uint64_t grid_index = frame_id - 2900;
+        controller->OnSourceRelease(start_of(frame_id, grid_index));
+        const double ready_us = gpu_end_us(frame_id) - kReadyGap + late_us;
+        controller->OnStageEvent(event_of(frame_id, grid_index, Kind::GpuReady, ready_us));
+        controller->OnStageEvent(event_of(frame_id, grid_index, Kind::OutputRelease, ready_us));
+        if (report) {
+            controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us(frame_id) + late_us - kGpuPeriod + 250.0),
+                Qpc(gpu_end_us(frame_id) + late_us), 14000.0);
+        }
+    };
+
+    auto controller = MakeController();
+    // σ (5,010) and F (830) as in TestRenderHandoffGpuFloor: P/2 + F + σ = 14,345.
+    for (uint64_t index = 1; index <= 32; ++index) {
+        const double source_us = static_cast<double>(index) * kInterval;
+        controller->OnSourceRelease(Start(index, PacingRung::SourceOnly, source_us));
+        controller->OnStageEvent(Event(index, Kind::RenderSubmitStart, source_us + 5000.0));
+    }
+    for (uint64_t index = 0; index < 32; ++index) controller->OnReportPair(kEpoch, 500 + index, StreamingPair());
+    // Periods warm from 40 reports without readiness.
+    for (uint64_t frame_id = 2960; frame_id < 3000; ++frame_id) {
+        controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us(frame_id) - kGpuPeriod + 250.0),
+            Qpc(gpu_end_us(frame_id)), 14000.0);
+    }
+    // 31 frames with readiness and report: 31 gaps, cold.
+    for (uint64_t frame_id = 3000; frame_id <= 3030; ++frame_id) frame(controller.get(), frame_id, 0.0, true);
+    frame(controller.get(), 3031, 400.0, false);
+    const int64_t reported = Qpc(gpu_end_us(3030) + 2.0 * 17010.0 - 14345.0);
+    CHECK(controller->GpuFloor(key_of(3033), 0, 0, true).floor_qpc == reported);
+    // 32 gaps of frames not held, then a newer frame ready 400 µs late.
+    controller->OnGpuRenderEnd(kEpoch, 3031, Qpc(gpu_end_us(3031) + 400.0 - kGpuPeriod + 250.0),
+        Qpc(gpu_end_us(3031) + 400.0), 14000.0);
+    for (uint64_t frame_id = 3032; frame_id <= 3040; ++frame_id) frame(controller.get(), frame_id, 0.0, true);
+    frame(controller.get(), 3041, 400.0, false);
+    // Frame 3043: Ĝ(3042) = ready(3041) + 1,530 + 17,010, not G(3040) + 2 × 17,010.
+    const GpuFloorEstimate anchored = controller->GpuFloor(key_of(3043), 0, 0, true);
+    CHECK(anchored.floor_qpc == Qpc(gpu_end_us(3041) + 400.0 + 17010.0 - 14345.0));
+    CHECK(anchored.anchor == GpuFloorAnchor::Ready && anchored.frames_ahead == 1);
+    // Without the switch the report's extrapolation stays.
+    CHECK(controller->GpuFloor(key_of(3043)).floor_qpc == Qpc(gpu_end_us(3040) + 2.0 * 17010.0 - 14345.0));
+    // A PRESENT_END of a frame not newer than the anchor is no bound, however late.
+    CHECK(controller->GpuFloor(key_of(3043), 3041, Qpc(gpu_end_us(3041)), true).floor_qpc == anchored.floor_qpc);
+    // A held frame anchors at its release when that is later than its readiness.
+    const uint64_t held_grid = 3042 - 2900;
+    controller->OnSourceRelease(start_of(3042, held_grid));
+    controller->OnStageEvent(event_of(3042, held_grid, Kind::GpuReady, gpu_end_us(3042) - kReadyGap));
+    controller->OnStageEvent(event_of(3042, held_grid, Kind::OutputRelease, gpu_end_us(3042) - kReadyGap + 900.0,
+        PacingPlanStatus::Held));
+    const GpuFloorEstimate held = controller->GpuFloor(key_of(3043), 0, 0, true);
+    CHECK(held.floor_qpc == Qpc(gpu_end_us(3042) + 900.0 - 14345.0) && held.frames_ahead == 0);
+    // Not for another producer epoch.
+    CHECK(controller->GpuFloor(key_of(3043, kEpoch + 1), 0, 0, true).floor_qpc == 0);
+
+    // Periods: the floor's median and the rhythm's mean of the newest five.
+    CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
+    CHECK_NEAR(controller->RecentGpuPeriodUs(), 17000.0);
+    for (uint64_t frame_id = 3043; frame_id <= 3047; ++frame_id) {
+        controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us(3042) + 18000.0 * static_cast<double>(frame_id - 3043) + 250.0),
+            Qpc(gpu_end_us(3042) + 18000.0 * static_cast<double>(frame_id - 3042)), 14000.0);
+    }
+    // 3043 follows 3042, which has no report: no period. Then four of 18,000.
+    CHECK_NEAR(controller->RecentGpuPeriodUs(), (17000.0 + 4.0 * 18000.0) / 5.0);
+    CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
+    // A frame the GPU waited 2 ms for adds no period.
+    controller->OnGpuRenderEnd(kEpoch, 3048, Qpc(gpu_end_us(3042) + 5.0 * 18000.0 + 2000.0),
+        Qpc(gpu_end_us(3042) + 6.0 * 18000.0 + 2000.0), 14000.0);
+    CHECK_NEAR(controller->RecentGpuPeriodUs(), (17000.0 + 4.0 * 18000.0) / 5.0);
+    // Cold before five periods.
+    auto cold = MakeController();
+    CHECK_NEAR(cold->RecentGpuPeriodUs(), 0.0);
+    CHECK_NEAR(cold->GpuPeriodUs(), 0.0);
 }
 
 int main()
@@ -2665,6 +2788,7 @@ int main()
     TestRenderHandoffOffset();
     TestHandoffStreams();
     TestRenderHandoffGpuFloor();
+    TestGpuFloorReadyAnchor();
 
     if (s_failures != 0) {
         std::fprintf(stderr, "%d lead controller checks failed\n", s_failures);

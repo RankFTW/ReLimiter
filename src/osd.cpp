@@ -244,14 +244,15 @@ static void DrawPacingPipelineStatus() {
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
             "Render handoff limit: off (the render thread may wait for the next release; waiting for evidence)");
     // Developer A/B gpu_paced_cadence: the switch is on and the GPU floor is known.
-    if (has_status && status.gpu_paced_cadence)
+    if (has_status && status.gpu_paced_cadence) {
         ImGui::TextDisabled("GPU-paced cadence: %u of the newest 128 frames released by the GPU floor | %u frames | "
             "%u cadence moves",
             status.gpu_paced_recent, status.gpu_paced_frames, status.gpu_paced_moves);
-    // Developer A/B gpu_paced_present_gate, with the GPU-paced cadence line.
-    if (has_status && status.gpu_paced_present_gate)
-        ImGui::TextDisabled("Present-end gate: %u frames waited past the GPU floor for the render thread to leave "
-            "the previous Present | %u stalls", status.present_gate_later, status.present_gate_stalls);
+        ImGui::TextDisabled("GPU-paced rhythm: %u smooth | %u late | %u early bound | %u restarts | "
+            "GPU end from readiness %u of %u",
+            status.rhythm_smooth, status.rhythm_late, status.rhythm_early_bound, status.rhythm_start,
+            status.floor_from_ready, status.floor_frames);
+    }
     if (has_status && status.valid)
         ImGui::TextDisabled("Lead: %.2f ms (%s, %u samples%s) | Grid epoch: %u",
             status.lead_us / 1000.0, status.lead_warm ? "warm" : "warming",
@@ -630,23 +631,13 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         *config_dirty = true;
     }
     HelpTip("Diagnostic A/B, Reflex games with the Reflex Sleep bypass on. On, held frames are released no "
-        "earlier than the render handoff GPU floor too (about half a GPU frame plus the submission delay "
-        "before the GPU finishes the previous frame). When that floor sets a frame's release, the GPU is the "
+        "earlier than about the render handoff GPU floor too (about half a GPU frame plus the submission delay "
+        "before the GPU finishes the previous frame), on a steady rhythm that follows the GPU's average frame "
+        "time rather than each frame's floor. When that floor sets a frame's release, the GPU is the "
         "limit: the frame's output target becomes the time such a frame is ready at the earliest, and the "
         "cadence continues from there instead of holding the frame to the cap's cadence, which would leave "
         "the GPU idle. Frames the GPU finishes early are still held to the cap. Watch long frames, jitter, "
         "GPU idle gaps and PC Latency; one setting per capture.");
-
-    if (ImGui::Checkbox("GPU-paced Present-end gate", &g_config.gpu_paced_present_gate)) {
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: GPU-paced Present-end gate -> %s", g_config.gpu_paced_present_gate ? "on" : "off");
-        *config_dirty = true;
-    }
-    HelpTip("Diagnostic A/B, needs GPU-paced cadence. On, the frame after one the GPU floor released waits, "
-        "before the game reads input, until the game's render thread has left that frame's Present, so the "
-        "game's simulation does not run beside the render thread while the GPU is the limit. A wait ends after "
-        "three of the render thread's frame times without a Present (a stall). Watch long frames, jitter, GPU "
-        "idle gaps and PC Latency; one setting per capture.");
 
     static const char* const kSourcePlacementLabels[] = {"Marker", "Pre-Sleep", "Reflex driver limiter"};
     static_assert(IM_ARRAYSIZE(kSourcePlacementLabels) ==

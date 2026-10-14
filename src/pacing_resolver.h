@@ -121,11 +121,6 @@ struct PacingPipelineConfig {
     // plus the early side of its lead, so the cadence follows the GPU instead
     // of holding the frame (cadence_grid.h, source_stage.h).
     bool gpu_paced_cadence = false;
-    // Key gpu_paced_present_gate (default off; developer A/B, with
-    // gpu_paced_cadence): the frame after a frame the GPU floor released is
-    // released no earlier than the render thread's PRESENT_END of that frame,
-    // so its simulation does not run beside the render thread's submission.
-    bool gpu_paced_present_gate = false;
     double stall_inject_ms = 0.0; // 0 = off; [0, kPacingStallInjectMaxMs]
     double stall_inject_period_s = kPacingStallInjectDefaultPeriodS; // [1, 60]
 };

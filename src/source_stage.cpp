@@ -77,6 +77,9 @@ void SourceStage::Reset(int64_t qpc_frequency) noexcept
     g_frame_plans.Clear();
     lead_.Reset(qpc_frequency);
     last_published_key_ = {};
+    qpc_frequency_ = qpc_frequency > 0 ? qpc_frequency : 0;
+    rhythm_key_ = {};
+    rhythm_release_qpc_ = 0;
     g_cadence_grid_publication.Publish(grid_.Snapshot());
 }
 
@@ -84,6 +87,40 @@ void SourceStage::Suspend() noexcept
 {
     grid_.Suspend();
     g_cadence_grid_publication.Publish(grid_.Snapshot());
+}
+
+// GPU-paced rhythm (source_stage.h).
+GpuPacedRhythmRelease SourceStage::GpuPacedRhythm(const PacingPlanKey& key, int64_t floor_qpc) const noexcept
+{
+    GpuPacedRhythmRelease release{};
+    if (floor_qpc <= 0) return release;
+    release.release_qpc = floor_qpc;
+    release.step = GpuPacedRhythmStep::Start;
+    const double period_us = lead_.RecentGpuPeriodUs();
+    const double floor_period_us = lead_.GpuPeriodUs();
+    const bool consecutive = rhythm_release_qpc_ > 0 && PacingPlanKey_IsValid(rhythm_key_) &&
+        rhythm_key_.identity_domain == key.identity_domain && rhythm_key_.producer_epoch == key.producer_epoch &&
+        rhythm_key_.controller_generation == key.controller_generation && rhythm_key_.frame_id + 1 == key.frame_id;
+    if (!consecutive || !(period_us > 0.0) || !(floor_period_us > 0.0) || qpc_frequency_ <= 0) return release;
+    const auto ticks = [this](double us) {
+        return static_cast<int64_t>(std::llround(us * static_cast<double>(qpc_frequency_) / 1'000'000.0));
+    };
+    const int64_t candidate_qpc = rhythm_release_qpc_ + ticks(period_us);
+    if (candidate_qpc >= floor_qpc) {
+        release.step = GpuPacedRhythmStep::Late;
+        return release;
+    }
+    const int64_t pulled_qpc = candidate_qpc + static_cast<int64_t>(std::llround(
+        GPU_PACED_RHYTHM_EARLY_GAIN * static_cast<double>(floor_qpc - candidate_qpc)));
+    const int64_t earliest_qpc = floor_qpc - ticks(floor_period_us / 2.0);
+    if (pulled_qpc < earliest_qpc) {
+        release.release_qpc = earliest_qpc;
+        release.step = GpuPacedRhythmStep::EarlyBound;
+        return release;
+    }
+    release.release_qpc = pulled_qpc;
+    release.step = GpuPacedRhythmStep::Smooth;
+    return release;
 }
 
 size_t SourceStage::DrainStageEvents() noexcept
@@ -203,7 +240,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
         const double early_us = lead_.EarlyLeadUs(slack_rung, request.fg_divisor,
             pipeline.lead_quantile, pipeline.allowance_us);
         if (early_us > 0.0) {
-            input.earliest_target_qpc = request.gpu_floor_qpc + static_cast<int64_t>(std::llround(
+            input.earliest_target_qpc = input.now_qpc + static_cast<int64_t>(std::llround(
                 early_us * static_cast<double>(request.qpc_frequency) / 1'000'000.0));
         }
     }
@@ -301,9 +338,18 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     start.render_queue = request.gpu_queue_wait_render_queue;
     // GPU-paced cadence: the GPU floor released this frame: the game reached
     // ReLimiter before its floor and the grid's own S did not bind (the wait
-    // ran to the floor, or the pre-Sleep wait already brought the frame there).
+    // ran to the floor or the rhythm's release, or the pre-Sleep wait
+    // already brought the frame there).
     frame.gpu_paced = gpu_floor_release && grid_plan.source_wake_qpc <= input.now_qpc;
     if (frame.gpu_paced) ++statistics_.gpu_paced_frames;
+    // The rhythm continues from a frame it paced and restarts otherwise.
+    if (request.gpu_paced_rhythm != GpuPacedRhythmStep::None && frame.gpu_paced) {
+        rhythm_key_ = request.key;
+        rhythm_release_qpc_ = frame.release_qpc;
+        ++statistics_.gpu_paced_rhythm[static_cast<size_t>(request.gpu_paced_rhythm)];
+    } else {
+        rhythm_release_qpc_ = 0;
+    }
     start.gpu_floor_release = frame.gpu_paced;
     lead_.OnSourceRelease(start);
     return frame;

@@ -97,6 +97,44 @@ private:
     bool enabled_notice_ = false;
 };
 
+// ── GPU-paced rhythm ──
+
+// Developer A/B gpu_paced_cadence, held frames released at their GPU floor
+// (scheduler.cpp GpuPacedHeldFloorApplies). With frame generation, DLSS-G
+// shows each real frame about half of that frame's SIMULATION_START interval
+// after its generated frame (Gears of War: E-Day, FG 2× at 120: slope 0.55,
+// r 0.80–0.86 under the Reflex Sleep bypass; it explained 58–86% of the
+// real frames' misplacement). A floor anchored to each frame's newest GPU end
+// copies that GPU end's noise into the start interval (weight 0.85 on the gap
+// two frames back), while the driver's own Sleep averages the newest five
+// GPU frames. So the release follows a rhythm:
+//   candidate = previous release + mean of the newest LEAD_GPU_PERIOD_RECENT
+//               GPU periods (LeadController::RecentGpuPeriodUs);
+//   later than the floor: the floor (a start late against the GPU idles it:
+//               stretched GPU frames 7–15% against 2–10% in the band);
+//   otherwise:  pulled GPU_PACED_RHYTHM_EARLY_GAIN of the way to the floor,
+//               never earlier than the floor minus half the median GPU
+//               period P (early starts cost little: 4–8% stretched).
+// The rhythm continues only from the previous consecutive frame it paced;
+// otherwise the release is the floor. In a replay on the captured GPU
+// timeline it cut the start interval sd from 1.24–1.96 to 0.81–1.22 ms and
+// late starts by about half; replays can reject, not approve.
+constexpr double GPU_PACED_RHYTHM_EARLY_GAIN = 0.25;
+
+enum class GpuPacedRhythmStep : uint8_t {
+    None = 0,       // not a held GPU floor frame, or no floor
+    Start = 1,      // the floor: no previous consecutive rhythm release
+    Late = 2,       // the rhythm was not earlier than the floor: the floor
+    Smooth = 3,     // previous release + period, pulled toward the floor
+    EarlyBound = 4, // the floor minus P/2
+    Count = 5
+};
+
+struct GpuPacedRhythmRelease {
+    int64_t release_qpc = 0; // 0 with GpuPacedRhythmStep::None
+    GpuPacedRhythmStep step = GpuPacedRhythmStep::None;
+};
+
 // ── Planned frame ──
 
 struct SourceStageRequest {
@@ -135,28 +173,31 @@ struct SourceStageRequest {
     // the cadence like any late source, and the wait runs to max(S_n,
     // earliest). Frames not held only: on held frames the render-thread
     // offset moved the game's simulation into its render thread's submission.
-    // Under the developer A/B gpu_paced_cadence held frames get their GPU
-    // floor alone here.
+    // Under the developer A/B gpu_paced_cadence held frames get the GPU-paced
+    // rhythm's release here (SourceStage::GpuPacedRhythm).
     int64_t earliest_release_qpc = 0;
-    // Developer A/B gpu_paced_cadence, and the GPU floor term of
-    // earliest_release_qpc (0 = none; under gpu_paced_present_gate it is the
-    // later of the floor and the render thread's PRESENT_END of the previous
-    // frame). When it sets the release (it is the earliest release and later
-    // than the moment the game reached ReLimiter, below), the frame is on
-    // time by construction: the grid does not judge its lateness, and its
-    // output target is at least floor + E, E = LeadController::EarlyLeadUs
-    // (how soon frames the floor released were ready at the earliest), from
-    // which the grid continues without a restart
-    // (CadenceGridPlanInput::earliest_target_qpc). A frame the GPU finishes
-    // before the grid's target keeps the grid, so the cadence is the later of
-    // the cap and the GPU's pace.
+    // Developer A/B gpu_paced_cadence, and the GPU floor term of the earliest
+    // release (0 = none). When it is later than the moment the game reached
+    // ReLimiter (below) and the earliest release is not later than it, the
+    // GPU sets the release: the frame is on time by construction, the grid
+    // does not judge its lateness, and its output target is at least its
+    // release plus E, E = LeadController::EarlyLeadUs (how soon frames the
+    // floor released were ready at the earliest), from which the grid
+    // continues without a restart (CadenceGridPlanInput::
+    // earliest_target_qpc). A frame the GPU finishes before the grid's target
+    // keeps the grid, so the cadence is the later of the cap and the GPU's
+    // pace. Held frames pass the raw floor here and the GPU-paced rhythm's
+    // release, never later than it, as the earliest release.
     bool gpu_paced_cadence = false;
     int64_t gpu_floor_qpc = 0;
+    // The step that set earliest_release_qpc (SourceStage::GpuPacedRhythm);
+    // None when the rhythm does not apply. A frame it paced continues it.
+    GpuPacedRhythmStep gpu_paced_rhythm = GpuPacedRhythmStep::None;
     // The game reached ReLimiter at its marker, or earlier at the Reflex
     // Sleep: the Sleep hook's entry for grid index sleep_entry_index (0 =
     // none), before any wait in the hook. The pre-Sleep wait aims at the
-    // floor less its margin and the Present-end gate waits there, so the
-    // marker can land just after the floor without the game being late.
+    // GPU-paced release less its margin, so the marker can land just after
+    // the floor without the game being late.
     uint64_t sleep_entry_index = 0;
     int64_t sleep_entry_qpc = 0;
 };
@@ -191,6 +232,9 @@ struct SourceStageStatistics {
     uint64_t duplicate_keys = 0; // same key planned again: not republished (one claim per plan)
     uint64_t clamped_waits = 0;
     uint64_t gpu_paced_frames = 0; // SourceStageFrame::gpu_paced
+    // Frames the GPU-paced rhythm paced, by the step that set their release
+    // (index GpuPacedRhythmStep; None unused).
+    uint64_t gpu_paced_rhythm[static_cast<size_t>(GpuPacedRhythmStep::Count)] = {};
 };
 
 class SourceStage {
@@ -260,6 +304,10 @@ public:
     const LeadController& Lead() const noexcept { return lead_; }
     SourceStallInjector& StallInjector() noexcept { return stall_; }
     SourceStageStatistics Statistics() const noexcept { return statistics_; }
+    // The GPU-paced rhythm's release (above) for frame key whose GPU floor is
+    // floor_qpc (0: none, step None). Owner only; RunPlannedFrame continues
+    // the rhythm from the frames it paced.
+    GpuPacedRhythmRelease GpuPacedRhythm(const PacingPlanKey& key, int64_t floor_qpc) const noexcept;
 
 private:
     CadenceGrid grid_{};
@@ -267,5 +315,9 @@ private:
     SourceStallInjector stall_{};
     SourceStageStatistics statistics_{};
     PacingPlanKey last_published_key_{};
+    int64_t qpc_frequency_ = 0;
+    // The GPU-paced rhythm: the newest frame it paced and that frame's release.
+    PacingPlanKey rhythm_key_{};
+    int64_t rhythm_release_qpc_ = 0;
     bool drain_output_late_ = false;
 };

@@ -239,6 +239,15 @@ void LeadController::Reset(int64_t qpc_frequency) noexcept
     gpu_after_present_window_.Reset();
     first_submission_window_.Reset();
     release_to_render_window_.Reset();
+    recent_periods_us_ = {};
+    recent_period_head_ = 0;
+    recent_period_count_ = 0;
+    ready_epoch_ = 0;
+    ready_frame_ = 0;
+    ready_qpc_ = 0;
+    ready_gaps_us_ = {};
+    ready_gap_head_ = 0;
+    ready_gap_count_ = 0;
     gpu_paced_rings_ = {};
     lifecycle_known_ = false;
     lifecycle_ = PacingPlanKey{};
@@ -260,6 +269,12 @@ void LeadController::ResetBuckets() noexcept
     gpu_after_present_window_.Reset();
     first_submission_window_.Reset();
     release_to_render_window_.Reset();
+    recent_periods_us_ = {};
+    recent_period_head_ = 0;
+    recent_period_count_ = 0;
+    ready_gaps_us_ = {};
+    ready_gap_head_ = 0;
+    ready_gap_count_ = 0;
     gpu_paced_rings_ = {};
     for (PendingFrame& frame : pending_) {
         if (frame.occupied && frame.started) frame.finalized = true;
@@ -468,31 +483,67 @@ double LeadController::GpuFloorStartUs() const noexcept
     return gpu_period_window_.Quantile(0.5) / 2.0 + first_submission_window_.Quantile(0.5);
 }
 
-int64_t LeadController::GpuFloorQpc(const PacingPlanKey& key, uint64_t present_end_frame,
-    int64_t present_end_qpc) const noexcept
+GpuFloorEstimate LeadController::GpuFloor(const PacingPlanKey& key, uint64_t present_end_frame,
+    int64_t present_end_qpc, bool ready_anchor) const noexcept
 {
+    GpuFloorEstimate estimate{};
     const double start_us = GpuFloorStartUs();
     if (!(start_us > 0.0) || qpc_frequency_ <= 0 || release_to_render_window_.Count() < LEAD_WARM_SAMPLES ||
         key.identity_domain != PacingIdentityDomain::NvApiFrame || key.producer_epoch == 0 ||
         key.producer_epoch != gpu_end_epoch_ || gpu_end_qpc_ <= 0 || key.frame_id <= gpu_end_frame_ ||
         key.frame_id - 1 - gpu_end_frame_ > LEAD_HANDOFF_GPU_HORIZON_FRAMES) {
-        return 0;
+        return estimate;
     }
     const auto ticks = [this](double us) {
         return static_cast<int64_t>(std::llround(us * static_cast<double>(qpc_frequency_) / kMicrosecondsPerSecond));
     };
     const double period_us = gpu_period_window_.Quantile(0.5);
-    // Ĝ(n − 1): the newest report extrapolated, at least the live bound from
-    // a newer frame's PRESENT_END.
-    int64_t predicted_qpc = gpu_end_qpc_ + ticks(static_cast<double>(key.frame_id - 1 - gpu_end_frame_) * period_us);
-    if (present_end_qpc > 0 && present_end_frame > gpu_end_frame_ && present_end_frame < key.frame_id &&
+    const uint64_t previous = key.frame_id - 1;
+    // Ĝ(n − 1): the newest report extrapolated by P.
+    int64_t predicted_qpc = gpu_end_qpc_ + ticks(static_cast<double>(previous - gpu_end_frame_) * period_us);
+    GpuFloorAnchor anchor = GpuFloorAnchor::Report;
+    uint64_t anchor_frame = gpu_end_frame_;
+    // The readiness anchor of a newer frame replaces it (an estimate, above).
+    if (ready_anchor && ready_epoch_ == key.producer_epoch && ready_frame_ > gpu_end_frame_ &&
+        ready_frame_ <= previous && ready_gap_count_ >= LEAD_WARM_SAMPLES) {
+        std::array<float, LEAD_GPU_READY_GAP_CAPACITY> gaps = ready_gaps_us_;
+        const auto middle = gaps.begin() + static_cast<std::ptrdiff_t>((ready_gap_count_ - 1) / 2);
+        std::nth_element(gaps.begin(), middle, gaps.begin() + ready_gap_count_);
+        predicted_qpc = ready_qpc_ + ticks(static_cast<double>(*middle) +
+            static_cast<double>(previous - ready_frame_) * period_us);
+        anchor = GpuFloorAnchor::Ready;
+        anchor_frame = ready_frame_;
+    }
+    // At least the live bound from a newer frame's PRESENT_END.
+    if (present_end_qpc > 0 && present_end_frame > anchor_frame && present_end_frame < key.frame_id &&
         gpu_after_present_window_.Count() >= LEAD_WARM_SAMPLES) {
         const double bound_us = gpu_after_present_window_.Quantile(LEAD_HANDOFF_GPU_BOUND_QUANTILE) +
-            static_cast<double>(key.frame_id - 1 - present_end_frame) * period_us;
-        predicted_qpc = (std::max)(predicted_qpc, present_end_qpc + ticks(bound_us));
+            static_cast<double>(previous - present_end_frame) * period_us;
+        const int64_t bound_qpc = present_end_qpc + ticks(bound_us);
+        if (bound_qpc > predicted_qpc) {
+            predicted_qpc = bound_qpc;
+            anchor = GpuFloorAnchor::PresentEnd;
+            anchor_frame = present_end_frame;
+        }
     }
     // Ĝ(n − 1) − (P/2 + F + σ).
-    return predicted_qpc - ticks(start_us + release_to_render_window_.Quantile(0.5));
+    estimate.floor_qpc = predicted_qpc - ticks(start_us + release_to_render_window_.Quantile(0.5));
+    estimate.anchor = anchor;
+    estimate.frames_ahead = static_cast<uint32_t>(previous - anchor_frame);
+    return estimate;
+}
+
+double LeadController::GpuPeriodUs() const noexcept
+{
+    return gpu_period_window_.Count() >= LEAD_WARM_SAMPLES ? gpu_period_window_.Quantile(0.5) : 0.0;
+}
+
+double LeadController::RecentGpuPeriodUs() const noexcept
+{
+    if (recent_period_count_ < LEAD_GPU_PERIOD_RECENT) return 0.0;
+    double sum = 0.0;
+    for (const double period_us : recent_periods_us_) sum += period_us;
+    return sum / static_cast<double>(LEAD_GPU_PERIOD_RECENT);
 }
 
 LeadBucketStatus LeadController::BucketStatus(PacingRung rung, double fg_divisor) const noexcept
@@ -660,6 +711,7 @@ void LeadController::OnStageEvent(const PacingStageEvent& event) noexcept
     if (field == FieldOutputRelease) frame->output_status = event.status;
     if (field == FieldGpuResume) frame->gpu_wait_qpc = event.gpu_wait_qpc;
     if (!frame->started) ++frame->early_events;
+    if (field == FieldGpuReady || field == FieldOutputRelease) NoteReadyAnchor(*frame);
     RecordResumeDelay(frame);
     RecordCallTime(frame);
     RecordWorkStart(frame);
@@ -752,16 +804,64 @@ void LeadController::OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, 
         gpu_end_qpc_ = 0;
         gpu_period_window_.Reset();
         gpu_after_present_window_.Reset();
+        recent_period_head_ = 0;
+        recent_period_count_ = 0;
     }
     if (frame_id <= gpu_end_frame_) return;
     // The GPU's own period: consecutive frames it did not wait for.
     if (gpu_end_frame_ != 0 && frame_id == gpu_end_frame_ + 1 && gpu_end_qpc > gpu_end_qpc_ &&
         gpu_start_qpc > 0 && MicrosecondsBetween(gpu_end_qpc_, gpu_start_qpc) <= LEAD_HANDOFF_GPU_IDLE_US) {
-        gpu_period_window_.Add(MicrosecondsBetween(gpu_end_qpc_, gpu_end_qpc));
+        const double period_us = MicrosecondsBetween(gpu_end_qpc_, gpu_end_qpc);
+        gpu_period_window_.Add(period_us);
+        recent_periods_us_[recent_period_head_] = period_us;
+        recent_period_head_ = (recent_period_head_ + 1) % static_cast<uint32_t>(LEAD_GPU_PERIOD_RECENT);
+        if (recent_period_count_ < LEAD_GPU_PERIOD_RECENT) ++recent_period_count_;
     }
     if (IsPositiveFinite(present_to_gpu_end_us)) gpu_after_present_window_.Add(present_to_gpu_end_us);
+    RecordReadyGap(producer_epoch, frame_id, gpu_end_qpc);
     gpu_end_frame_ = frame_id;
     gpu_end_qpc_ = gpu_end_qpc;
+}
+
+// Readiness anchor (lead_controller.h): the GPU waited for a held frame until
+// its release, so its anchor is the later of the two.
+void LeadController::NoteReadyAnchor(const PendingFrame& frame) noexcept
+{
+    if (frame.key.identity_domain != PacingIdentityDomain::NvApiFrame || frame.key.producer_epoch == 0 ||
+        !HasField(frame, FieldGpuReady) || !HasField(frame, FieldOutputRelease)) {
+        return;
+    }
+    if (frame.key.producer_epoch != ready_epoch_) {
+        ready_epoch_ = frame.key.producer_epoch;
+        ready_frame_ = 0;
+        ready_qpc_ = 0;
+    }
+    if (frame.key.frame_id <= ready_frame_) return;
+    const int64_t ready_qpc = frame.qpc[FieldGpuReady];
+    ready_frame_ = frame.key.frame_id;
+    ready_qpc_ = IsHeldStatus(frame.output_status) ? (std::max)(ready_qpc, frame.qpc[FieldOutputRelease]) : ready_qpc;
+}
+
+// The gap of NvAPI frame (producer_epoch, frame_id) not held: its report's
+// GPU end minus its readiness. Reports arrive while the frame is pending.
+void LeadController::RecordReadyGap(uint32_t producer_epoch, uint64_t frame_id, int64_t gpu_end_qpc) noexcept
+{
+    for (const PendingFrame& frame : pending_) {
+        if (!frame.occupied || frame.key.identity_domain != PacingIdentityDomain::NvApiFrame ||
+            frame.key.producer_epoch != producer_epoch || frame.key.frame_id != frame_id) {
+            continue;
+        }
+        if (!HasField(frame, FieldGpuReady) || !HasField(frame, FieldOutputRelease) ||
+            IsHeldStatus(frame.output_status)) {
+            return;
+        }
+        const double gap_us = MicrosecondsBetween(frame.qpc[FieldGpuReady], gpu_end_qpc);
+        if (!(gap_us >= 0.0) || !(gap_us <= frame.interval_us)) return;
+        ready_gaps_us_[ready_gap_head_] = static_cast<float>(gap_us);
+        ready_gap_head_ = (ready_gap_head_ + 1) % static_cast<uint32_t>(LEAD_GPU_READY_GAP_CAPACITY);
+        if (ready_gap_count_ < LEAD_GPU_READY_GAP_CAPACITY) ++ready_gap_count_;
+        return;
+    }
 }
 
 // σ: release → RENDERSUBMIT_START of a frame not held, once both are known.

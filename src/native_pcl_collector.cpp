@@ -31,6 +31,10 @@ namespace
     constexpr double kLowFpsIntervalMilliseconds = 50.0;
     constexpr double kNoPclStatsWarmupMilliseconds = 5000.0;
     constexpr double kPresentDeferralMilliseconds = 1000.0;
+    // A present group no later present has closed this long after its last
+    // present is taken as complete (several drain waits, so a group split
+    // across two drains is not cut short).
+    constexpr uint64_t kPresentGroupStaleMilliseconds = 250;
     constexpr DWORD kDrainWaitMilliseconds = 100;
     constexpr DWORD kProcessTraceReadyTimeoutMilliseconds = 2000;
     constexpr ULONGLONG kEtwStatusQueryMilliseconds = 1000;
@@ -92,6 +96,9 @@ namespace
         double input_to_frame_start_ema_us = 0.0;
         bool input_to_frame_start_initialized = false;
         bool logged_simulation_fallback = false;
+
+        // Presents of the app frame being assembled, held until its group closes.
+        PresentFrameGrouper<std::shared_ptr<PresentEvent>> groups;
 
         bool dropped_input_chain_active = false;
         double dropped_input_to_frame_start_us = 0.0;
@@ -158,43 +165,32 @@ namespace
                 saw_pcl_timing_ = true;
             }
 
+            // Presents of one app frame are told apart only once the frame's
+            // group closes (see PresentFrameGrouper); the chain's grouper
+            // returns the presents now resolved, oldest first.
             SwapchainPclState& chain = swapchain_states_[present->SwapChainAddress];
-            display_latencies_.clear();
-            if (present->FinalState == PresentResult::Discarded) {
-                ProcessNotDisplayedPresent(*present, chain);
-                PublishPresentRecords(*present, nullptr, chain);
-                UpdateLastSimulationStart(*present, chain);
-                return;
-            }
+            resolved_presents_.clear();
+            chain.groups.Add(
+                present,
+                present->PclSimStartTime != 0,
+                HasPresentMonFrameType(*present),
+                QueryQpc(),
+                &resolved_presents_);
+            ProcessResolvedPresents(chain);
+        }
 
-            if (present->FinalState != PresentResult::Presented) {
-                return;
+        // Resolves groups no further present has closed for a while (the game
+        // stopped presenting, or the last frame of a stream), so their
+        // samples are not held indefinitely.
+        void FlushStalePresentGroups(uint64_t now_qpc)
+        {
+            const uint64_t stale_qpc =
+                qpc_frequency_ * kPresentGroupStaleMilliseconds / 1000;
+            for (auto& entry : swapchain_states_) {
+                resolved_presents_.clear();
+                entry.second.groups.FlushIfStale(now_qpc, stale_qpc, &resolved_presents_);
+                ProcessResolvedPresents(entry.second);
             }
-
-            const auto displayed_entries = CopyAndSanitizeDisplayedEntries(*present);
-            bool has_valid_display_timestamp = false;
-            for (const auto& displayed : displayed_entries) {
-                if (displayed.second == 0) {
-                    continue;
-                }
-
-                has_valid_display_timestamp = true;
-                NativePclDisplayLatency latency;
-                if (ProcessDisplayedPresent(
-                        *present,
-                        displayed.second,
-                        displayed.first,
-                        chain,
-                        &latency)) {
-                    display_latencies_.push_back(latency);
-                }
-            }
-
-            if (!has_valid_display_timestamp) {
-                ProcessNotDisplayedPresent(*present, chain);
-            }
-            PublishPresentRecords(*present, &displayed_entries, chain);
-            UpdateLastSimulationStart(*present, chain);
         }
 
         void UpdateEtwStatus(const EtwStatus& status) noexcept
@@ -289,6 +285,97 @@ namespace
     private:
         using DisplayEntry = std::pair<FrameType, uint64_t>;
 
+        void ProcessResolvedPresents(SwapchainPclState& chain)
+        {
+            for (const auto& resolved : resolved_presents_) {
+                ProcessResolvedPresent(
+                    *resolved.present,
+                    resolved.role,
+                    PresentAssociation_EffectiveIdentity(
+                        resolved.role,
+                        IdentityOf(*resolved.present),
+                        IdentityOf(*resolved.head)),
+                    chain);
+            }
+            resolved_presents_.clear();
+        }
+
+        void ProcessResolvedPresent(
+            const PresentEvent& present,
+            PresentGroupRole role,
+            const PresentAppIdentity& identity,
+            SwapchainPclState& chain)
+        {
+            display_latencies_.clear();
+            if (present.FinalState == PresentResult::Discarded) {
+                ProcessNotDisplayedPresent(identity, chain);
+                PublishPresentRecords(present, identity, role, nullptr, chain);
+                UpdateLastSimulationStart(identity, chain);
+                return;
+            }
+
+            if (present.FinalState != PresentResult::Presented) {
+                return;
+            }
+
+            const auto displayed_entries = CopyAndSanitizeDisplayedEntries(present);
+            bool has_valid_display_timestamp = false;
+            for (const auto& displayed : displayed_entries) {
+                if (displayed.second == 0) {
+                    continue;
+                }
+
+                has_valid_display_timestamp = true;
+                NativePclDisplayLatency latency;
+                if (ProcessDisplayedPresent(
+                        present,
+                        identity,
+                        displayed.second,
+                        displayed.first,
+                        chain,
+                        &latency)) {
+                    display_latencies_.push_back(latency);
+                }
+            }
+
+            if (!has_valid_display_timestamp) {
+                ProcessNotDisplayedPresent(identity, chain);
+            }
+            PublishPresentRecords(present, identity, role, &displayed_entries, chain);
+            UpdateLastSimulationStart(identity, chain);
+        }
+
+        static PresentAppIdentity IdentityOf(const PresentEvent& present) noexcept
+        {
+            PresentAppIdentity identity{};
+            identity.pcl_frame_id = present.PclFrameId;
+            identity.pcl_sim_start_qpc = present.PclSimStartTime;
+            identity.pcl_input_ping_qpc = present.PclInputPingTime;
+            identity.pcl_present_start_qpc = present.PclPresentStartTime;
+            identity.app_sim_start_qpc = present.AppSimStartTime;
+            return identity;
+        }
+
+        // PresentMon names the frame type of a display instance (Application,
+        // Repeated, XeFG, AFMF): its verdict is kept as is. DLSS-G leaves it
+        // unset, so its presents are told apart by position in the app frame.
+        static bool HasPresentMonFrameType(const PresentEvent& present) noexcept
+        {
+            for (const DisplayEntry& displayed : present.Displayed) {
+                if (displayed.second == 0) continue;
+                switch (displayed.first) {
+                    case FrameType::Application:
+                    case FrameType::Repeated:
+                    case FrameType::Intel_XEFG:
+                    case FrameType::AMD_AFMF:
+                        return true;
+                    default:
+                        break;
+                }
+            }
+            return false;
+        }
+
         // Logs occurrences 1, 2, 4, 8, ... so repeated conditions stay sparse.
         static bool ShouldLogOccurrence(uint64_t count) noexcept
         {
@@ -366,11 +453,6 @@ namespace
             return displayed_entries;
         }
 
-        static bool HasInputPing(const PresentEvent& present) noexcept
-        {
-            return present.PclInputPingTime != 0;
-        }
-
         static PresentObservationFinalState NormalizeFinalState(
             PresentResult final_state) noexcept
         {
@@ -426,12 +508,14 @@ namespace
         // share its present-level fields and sanitized entries.
         void PublishPresentRecords(
             const PresentEvent& present,
+            const PresentAppIdentity& identity,
+            PresentGroupRole role,
             const std::vector<DisplayEntry>* displayed_entries,
             const SwapchainPclState& chain) noexcept
         {
-            const PresentTimelineObservation observation =
-                BuildPresentObservation(present, displayed_entries, chain);
-            PublishDisplaySamples(present, displayed_entries, observation);
+            const PresentTimelineObservation observation = BuildPresentObservation(
+                present, identity, role, displayed_entries, chain);
+            PublishDisplaySamples(present, identity, displayed_entries, observation);
         }
 
         // One sample per sanitized display instance (non-zero screen time after
@@ -442,6 +526,7 @@ namespace
         // Latency.
         void PublishDisplaySamples(
             const PresentEvent& present,
+            const PresentAppIdentity& identity,
             const std::vector<DisplayEntry>* displayed_entries,
             const PresentTimelineObservation& observation) noexcept
         {
@@ -454,7 +539,7 @@ namespace
             sample.ready_qpc = observation.gpu_ready_qpc;
             sample.pcl_frame_id = observation.pcl_frame_id;
             sample.pcl_sim_start_qpc = observation.pcl_sim_start_qpc;
-            sample.pcl_present_start_qpc = present.PclPresentStartTime;
+            sample.pcl_present_start_qpc = identity.pcl_present_start_qpc;
             sample.final_state = static_cast<uint8_t>(observation.final_state);
             sample.presentation_mode =
                 static_cast<uint8_t>(observation.presentation_mode);
@@ -498,6 +583,8 @@ namespace
 
         PresentTimelineObservation BuildPresentObservation(
             const PresentEvent& present,
+            const PresentAppIdentity& identity,
+            PresentGroupRole role,
             const std::vector<DisplayEntry>* displayed_entries,
             const SwapchainPclState& chain) const noexcept
         {
@@ -515,8 +602,8 @@ namespace
                 : 0;
             observation.report_qpc = QueryQpc();
             observation.qpc_frequency = qpc_frequency_;
-            observation.pcl_frame_id = present.PclFrameId;
-            observation.pcl_sim_start_qpc = present.PclSimStartTime;
+            observation.pcl_frame_id = identity.pcl_frame_id;
+            observation.pcl_sim_start_qpc = identity.pcl_sim_start_qpc;
             observation.gpu_ready_qpc = present.ReadyTime;
             switch (present.PresentMode) {
             case PresentMode::Hardware_Legacy_Flip: observation.presentation_mode = PresentObservationMode::HardwareLegacyFlip; break;
@@ -534,7 +621,7 @@ namespace
             observation.nvidia_flip_delay_qpc = present.FlipDelay;
 
             uint32_t evidence = PRESENT_CLASSIFICATION_EVIDENCE_NONE;
-            if (present.PclSimStartTime != 0) {
+            if (identity.pcl_sim_start_qpc != 0) {
                 evidence |=
                     PRESENT_CLASSIFICATION_EVIDENCE_PCL_SIMULATION_MARKER;
             }
@@ -579,13 +666,18 @@ namespace
             }
 
             const bool used_simulation_fallback =
+                role == PresentGroupRole::Standalone &&
                 observation.final_state == PresentObservationFinalState::Presented &&
                 observation.displayed_instance_count != 0 &&
-                present.PclSimStartTime == 0 &&
+                identity.pcl_sim_start_qpc == 0 &&
                 chain.last_simulation_qpc != 0;
             if (used_simulation_fallback) {
                 evidence |=
                     PRESENT_CLASSIFICATION_EVIDENCE_SIMULATION_FALLBACK;
+            }
+            if (role == PresentGroupRole::Generated) {
+                evidence |=
+                    PRESENT_CLASSIFICATION_EVIDENCE_EARLIER_PRESENT_OF_FRAME;
             }
             observation.frame_classification =
                 PresentAssociation_ClassifyFrame(evidence);
@@ -617,14 +709,14 @@ namespace
         }
 
         static void UpdateLastSimulationStart(
-            const PresentEvent& present,
+            const PresentAppIdentity& identity,
             SwapchainPclState& chain) noexcept
         {
-            if (present.PclSimStartTime != 0) {
-                chain.last_simulation_qpc = present.PclSimStartTime;
+            if (identity.pcl_sim_start_qpc != 0) {
+                chain.last_simulation_qpc = identity.pcl_sim_start_qpc;
             }
-            else if (present.AppSimStartTime != 0) {
-                chain.last_simulation_qpc = present.AppSimStartTime;
+            else if (identity.app_sim_start_qpc != 0) {
+                chain.last_simulation_qpc = identity.app_sim_start_qpc;
             }
         }
 
@@ -643,17 +735,17 @@ namespace
         }
 
         void ProcessNotDisplayedPresent(
-            const PresentEvent& present,
+            const PresentAppIdentity& identity,
             SwapchainPclState& chain) noexcept
         {
-            if (present.PclSimStartTime == 0) {
+            if (identity.pcl_sim_start_qpc == 0) {
                 return;
             }
 
-            if (HasInputPing(present)) {
+            if (identity.pcl_input_ping_qpc != 0) {
                 const double input_to_frame_start_us = QpcDeltaToMicroseconds(
-                    present.PclInputPingTime,
-                    present.PclSimStartTime,
+                    identity.pcl_input_ping_qpc,
+                    identity.pcl_sim_start_qpc,
                     qpc_frequency_);
                 if (!std::isfinite(input_to_frame_start_us)) {
                     return;
@@ -661,7 +753,7 @@ namespace
 
                 chain.dropped_input_chain_active = true;
                 chain.dropped_input_to_frame_start_us = input_to_frame_start_us;
-                chain.last_dropped_simulation_qpc = present.PclSimStartTime;
+                chain.last_dropped_simulation_qpc = identity.pcl_sim_start_qpc;
                 chain.dropped_frame_count = 1;
                 return;
             }
@@ -669,7 +761,7 @@ namespace
             if (chain.dropped_input_chain_active) {
                 const double simulation_delta_us = QpcDeltaToMicroseconds(
                     chain.last_dropped_simulation_qpc,
-                    present.PclSimStartTime,
+                    identity.pcl_sim_start_qpc,
                     qpc_frequency_);
                 if (!std::isfinite(simulation_delta_us)) {
                     FlagMalformedDroppedChain(chain);
@@ -679,7 +771,7 @@ namespace
                 chain.dropped_input_to_frame_start_us += simulation_delta_us;
                 ++chain.dropped_frame_count;
             }
-            chain.last_dropped_simulation_qpc = present.PclSimStartTime;
+            chain.last_dropped_simulation_qpc = identity.pcl_sim_start_qpc;
         }
 
         // Returns true when a latency sample was published for this display
@@ -687,6 +779,7 @@ namespace
         // instance's pacing display sample.
         bool ProcessDisplayedPresent(
             const PresentEvent& present,
+            const PresentAppIdentity& identity,
             uint64_t display_qpc,
             FrameType frame_type,
             SwapchainPclState& chain,
@@ -695,23 +788,25 @@ namespace
             uint32_t accumulated_dropped_frames = 0;
             double dropped_accumulation_us = 0.0;
 
-            // PCL input state changes only when this present carries a new PCL
-            // simulation marker. Markerless generated displays reuse the last
-            // simulation start without consuming or corrupting a dropped chain.
-            if (present.PclSimStartTime != 0) {
-                if (HasInputPing(present)) {
+            // PCL input state changes only when the frame identity carries a
+            // new PCL simulation marker (the marker present, or under frame
+            // generation the real present of its group). Presents without one
+            // reuse a simulation start without consuming or corrupting a
+            // dropped chain.
+            if (identity.pcl_sim_start_qpc != 0) {
+                if (identity.pcl_input_ping_qpc != 0) {
                     UpdateInputToFrameStartEma(
                         chain,
                         QpcDeltaToMicroseconds(
-                            present.PclInputPingTime,
-                            present.PclSimStartTime,
+                            identity.pcl_input_ping_qpc,
+                            identity.pcl_sim_start_qpc,
                             qpc_frequency_));
                     ClearDroppedInputChain(chain);
                 }
                 else if (chain.dropped_input_chain_active) {
                     const double final_simulation_delta_us = QpcDeltaToMicroseconds(
                         chain.last_dropped_simulation_qpc,
-                        present.PclSimStartTime,
+                        identity.pcl_sim_start_qpc,
                         qpc_frequency_);
                     if (!std::isfinite(final_simulation_delta_us)) {
                         FlagMalformedDroppedChain(chain);
@@ -733,9 +828,11 @@ namespace
                       chain.last_display_qpc, display_qpc, qpc_frequency_) / 1000.0;
             chain.last_display_qpc = display_qpc;
 
-            const uint64_t simulation_start_qpc = present.PclSimStartTime != 0
-                ? present.PclSimStartTime
-                : chain.last_simulation_qpc;
+            const uint64_t simulation_start_qpc = identity.pcl_sim_start_qpc != 0
+                ? identity.pcl_sim_start_qpc
+                : identity.fallback_sim_start_qpc != 0
+                    ? identity.fallback_sim_start_qpc
+                    : chain.last_simulation_qpc;
             if (!chain.input_to_frame_start_initialized ||
                 simulation_start_qpc == 0) {
                 return false;
@@ -754,7 +851,7 @@ namespace
                 return false;
             }
 
-            if (present.PclSimStartTime == 0 &&
+            if (identity.pcl_sim_start_qpc == 0 &&
                 !chain.logged_simulation_fallback) {
                 LOG_INFO(
                     "Native PCL: using prior simulation start for markerless "
@@ -765,7 +862,7 @@ namespace
             }
 
             NativePclInternalSample sample;
-            sample.pcl_frame_id = present.PclFrameId;
+            sample.pcl_frame_id = identity.pcl_frame_id;
             sample.present_start_qpc = present.PresentStartTime;
             sample.display_qpc = display_qpc;
             sample.sample_qpc = QueryQpc();
@@ -778,8 +875,8 @@ namespace
             sample.dropped_accumulation_us = dropped_accumulation_us;
             sample.dropped_frame_count = accumulated_dropped_frames;
             sample.effective_sim_start_qpc = simulation_start_qpc;
-            sample.pcl_input_ping_qpc = present.PclInputPingTime;
-            sample.used_simulation_fallback = present.PclSimStartTime == 0;
+            sample.pcl_input_ping_qpc = identity.pcl_input_ping_qpc;
+            sample.used_simulation_fallback = identity.pcl_sim_start_qpc == 0;
 
             NativePclStatus status = NativePclStatus::Native;
             if (loss_window_.IsActive()) {
@@ -816,6 +913,8 @@ namespace
         // instance that published one. Cleared per present; the capacity is
         // reused, so steady state does not allocate.
         std::vector<NativePclDisplayLatency> display_latencies_;
+        // Presents a swapchain's grouper released, in order; reused scratch.
+        std::vector<PresentGroupResolved<std::shared_ptr<PresentEvent>>> resolved_presents_;
     };
 
     std::wstring MakeSessionName()
@@ -843,6 +942,7 @@ namespace
             for (const auto& present : presents) {
                 accumulator.ProcessPresent(present);
             }
+            accumulator.FlushStalePresentGroups(QueryQpc());
         }
         catch (...) {
             LOG_ERROR("Native PCL: failed while draining PresentMon events");
