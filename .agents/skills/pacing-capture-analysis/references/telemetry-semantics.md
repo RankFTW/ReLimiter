@@ -99,7 +99,7 @@ Gated holds (lockstep engines, `lead_controller.h`): frame n's gated hold is the
 | Column | Meaning |
 |---|---|
 | `async_marker_wait_us` | The longest `NvAPI_D3D12_SetAsyncFrameMarker` call carrying this frame's NvAPI frame ID, in µs (three decimals), from the entry to the return of ReLimiter's pass-through timing hook. With DLSS-G frame generation under the Reflex Sleep bypass the NVIDIA driver can pace inside this call, sleeping the thread that calls the game's Present (Streamline's sl.dlss_g, through sl.common); a long value is that sleep. Empty when no such call was seen for the frame |
-| `async_marker_wait_type` | The marker type (`NV_LATENCY_MARKER_TYPE`) of that longest call: 9 OUT_OF_BAND_RENDERSUBMIT_START, 10 OUT_OF_BAND_RENDERSUBMIT_END, 11 OUT_OF_BAND_PRESENT_START, 12 OUT_OF_BAND_PRESENT_END; empty with `async_marker_wait_us` |
+| `async_marker_wait_type` | The marker type (`NV_LATENCY_MARKER_TYPE`) of that longest call: 4 PRESENT_START, 5 PRESENT_END, 9 OUT_OF_BAND_RENDERSUBMIT_START, 10 OUT_OF_BAND_RENDERSUBMIT_END, 11 OUT_OF_BAND_PRESENT_START, 12 OUT_OF_BAND_PRESENT_END; empty with `async_marker_wait_us`. In Gears of War: E-Day with DLSS-G under the bypass every wait above 1 ms is type 5: the driver's in-Present sleep happens in the PRESENT_END call, on 4–6% of frames, when the game's PRESENT_START of frame n comes before about the Reflex GPU end of frame n − 1 (frame generation included); from 2 ms before it nearly always |
 
 The hook confirms that the call's frame ID and the game's SetLatencyMarker frame IDs share one domain at the first call (INFO log, below). It never modifies the call; compare `async_marker_wait_us` with the frame's `reflex_*` times and the render thread's stall before judging a driver sleep.
 

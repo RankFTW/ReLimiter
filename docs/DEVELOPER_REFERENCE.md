@@ -409,7 +409,7 @@ Turn on **Telemetry Logging** (Advanced) to record a capture; the User Guide des
 - `gate_pre_wait_qpc` and `gate_post_wait_qpc`, the GPU queue wait's GPU time before and after the wait (with **GPU Wait Probes**; empty when unknown).
 - PC Latency (with PC latency collection).
 - `source_placement`, with `pre_sleep_end_qpc` and `pre_sleep_margin_us` (the end and margin of the frame's pre-Sleep wait; empty without one), and `source_wait_start_qpc` and `pre_sleep_start_qpc` (where the source wait and pre-Sleep wait started; empty without that wait).
-- `async_marker_wait_us` (the longest `NvAPI_D3D12_SetAsyncFrameMarker` call carrying the frame's NvAPI frame ID, where the driver paces with frame generation under the Sleep bypass; empty when none) and `async_marker_wait_type` (that call's marker type: 9–12, the out-of-band render submit and Present markers). Both are joined by NvAPI frame ID within the producer epoch, like the Reflex columns, and a full wait queue drops records, so empty is not zero.
+- `async_marker_wait_us` (the longest `NvAPI_D3D12_SetAsyncFrameMarker` call carrying the frame's NvAPI frame ID, where the driver paces with frame generation under the Sleep bypass; empty when none) and `async_marker_wait_type` (that call's marker type: 4 and 5, the Present markers, or 9–12, the out-of-band render submit and Present markers; the driver's long waits seen so far are all 5, PRESENT_END). Both are joined by NvAPI frame ID within the producer epoch, like the Reflex columns, and a full wait queue drops records, so empty is not zero.
 
 **`relimiter_pacing_events_`** has one row per event:
 
