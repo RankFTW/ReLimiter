@@ -29,6 +29,7 @@ void FgInput_RecordMarker(uint64_t, uint32_t, uint32_t, int64_t) noexcept {}
 
 #include <array>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <new>
 #include <thread>
@@ -178,11 +179,15 @@ int64_t RealQpc();
 unsigned s_mode_calls = 0;
 int s_sleep_action = 0;
 NV_SET_SLEEP_MODE_PARAMS* s_expected_mode_params = nullptr;
+std::vector<NV_SET_SLEEP_MODE_PARAMS> s_forwarded_modes; // recorded while s_record_modes
+bool s_record_modes = false;
+NvAPI_Status s_mode_result = -9;
 
 NvAPI_Status __cdecl FakeSleepMode(IUnknown*, NV_SET_SLEEP_MODE_PARAMS* params) {
-    CHECK(params == s_expected_mode_params); // unchanged original pointer
+    if (s_expected_mode_params) CHECK(params == s_expected_mode_params); // unchanged original pointer
     ++s_mode_calls;
-    return -9; // preserve a driver's failure; requested params are not accepted-state proof
+    if (s_record_modes) s_forwarded_modes.push_back(*params);
+    return s_mode_result; // -9 by default: preserve a driver's failure; requested params are not accepted-state proof
 }
 // Actions: 2 clears the feedback device during Sleep, 4 faults natively.
 NvAPI_Status __cdecl FakeDriverSleep(IUnknown* device) {
@@ -347,6 +352,146 @@ void TestReflexCallForwarding() {
     // Unsupported settings versions are still forwarded unchanged.
     params.version = 0;
     CHECK(Hook_SetSleepMode(&device, &params) == -9);
+    s_orig_sleep = old_sleep;
+    s_orig_sleep_mode = old_mode;
+    NvAPI_ClearFeedbackDevice();
+}
+
+bool SameModeExceptLowLatency(const NV_SET_SLEEP_MODE_PARAMS& a, const NV_SET_SLEEP_MODE_PARAMS& b) {
+    return a.version == b.version && a.minimumIntervalUs == b.minimumIntervalUs &&
+        a.bUseMarkersToOptimize == b.bUseMarkersToOptimize && a.bUseMinQueueTime == b.bUseMinQueueTime &&
+        std::memcmp(a.rsvd, b.rsvd, sizeof(a.rsvd)) == 0;
+}
+bool SameMode(const NV_SET_SLEEP_MODE_PARAMS& a, const NV_SET_SLEEP_MODE_PARAMS& b) {
+    return SameModeExceptLowLatency(a, b) && a.bLowLatencyMode == b.bLowLatencyMode &&
+        a.bLowLatencyBoost == b.bLowLatencyBoost;
+}
+bool IsLowLatencyOffCopy(const NV_SET_SLEEP_MODE_PARAMS& forwarded, const NV_SET_SLEEP_MODE_PARAMS& game) {
+    return forwarded.bLowLatencyMode == 0 && forwarded.bLowLatencyBoost == 0 &&
+        SameModeExceptLowLatency(forwarded, game);
+}
+
+// Developer A/B bypass_low_latency_off: while the Sleep is bypassed the
+// driver's low latency mode is turned off through SetSleepMode, once per
+// transition, and the game's own SetSleepMode calls cannot undo it; leaving
+// the bypass (or the key) sends the game's newest parameters exactly.
+void TestBypassLowLatencyOff() {
+    FakeDevice device;
+    CHECK(NvAPI_CaptureFeedbackDevice(&device));
+    const auto old_sleep = s_orig_sleep;
+    const auto old_mode = s_orig_sleep_mode;
+    s_orig_sleep = FakeDriverSleep;
+    s_orig_sleep_mode = FakeSleepMode;
+    s_expected_mode_params = nullptr;
+    s_mode_result = NVAPI_OK;
+    s_record_modes = true;
+    s_forwarded_modes.clear();
+    g_reflex_sleep_bypass = true;
+    g_user_target_fps = 157;
+    s_paces_source = true;
+    g_bypass_low_latency_off = true;
+
+    // No game parameters captured yet: nothing to apply, the state stays off.
+    CHECK(Hook_Sleep(&device) == NVAPI_OK && s_forwarded_modes.empty());
+    CHECK(!s_low_latency_forced_off.load());
+
+    NV_SET_SLEEP_MODE_PARAMS game{};
+    game.version = NV_SLEEP_PARAMS_VER;
+    game.bLowLatencyMode = game.bLowLatencyBoost = 1;
+    game.minimumIntervalUs = 4321;
+    game.bUseMarkersToOptimize = game.bUseMinQueueTime = 1;
+    game.rsvd[3] = 9;
+    game.rsvd[29] = 7;
+    // The game's call before any override is forwarded as it is.
+    CHECK(Hook_SetSleepMode(&device, &game) == NVAPI_OK);
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], game));
+    s_forwarded_modes.clear();
+
+#ifdef _WIN64
+    // Smooth Motion returns before the transition.
+    s_smooth_motion = true;
+    CHECK(Hook_Sleep(&device) == NVAPI_OK && s_forwarded_modes.empty() && !s_low_latency_forced_off.load());
+    s_smooth_motion = false;
+#endif
+
+    // (a) Key on and bypass on: the first Sleep forwards one SetSleepMode with
+    // low latency and boost off and every other field the game's.
+    const unsigned driver_sleeps = s_sleep_calls;
+    CHECK(Hook_Sleep(&device) == NVAPI_OK && s_sleep_calls == driver_sleeps);
+    CHECK(s_forwarded_modes.size() == 1 && IsLowLatencyOffCopy(s_forwarded_modes[0], game));
+    CHECK(s_low_latency_forced_off.load());
+    // The captured game parameters, and the game's own struct, stay the game's.
+    CHECK(s_game_original_params.bLowLatencyMode == 1 && s_game_original_params.bLowLatencyBoost == 1);
+    CHECK(game.bLowLatencyMode == 1 && game.bLowLatencyBoost == 1);
+
+    // (b) The same state: no further SetSleepMode.
+    s_forwarded_modes.clear();
+    CHECK(Hook_Sleep(&device) == NVAPI_OK && Hook_Sleep(&device) == NVAPI_OK && s_forwarded_modes.empty());
+
+    // (c) A game call with low latency on, while applied, goes out with it off;
+    // the captured parameters take the game's newest values.
+    NV_SET_SLEEP_MODE_PARAMS again = game;
+    again.minimumIntervalUs = 2222;
+    CHECK(Hook_SetSleepMode(&device, &again) == NVAPI_OK);
+    CHECK(s_forwarded_modes.size() == 1 && IsLowLatencyOffCopy(s_forwarded_modes[0], again));
+    CHECK(again.bLowLatencyMode == 1 && again.bLowLatencyBoost == 1);
+    CHECK(s_game_original_params.minimumIntervalUs == 2222 && s_game_original_params.bLowLatencyMode == 1);
+    s_forwarded_modes.clear();
+
+    // (d) Bypass off: the next Sleep restores the game's newest parameters
+    // exactly, once, and the driver's Sleep runs again.
+    g_reflex_sleep_bypass = false;
+    CHECK(Hook_Sleep(&device) == -7 && s_sleep_calls == driver_sleeps + 1);
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], again));
+    CHECK(!s_low_latency_forced_off.load());
+    s_forwarded_modes.clear();
+    CHECK(Hook_Sleep(&device) == -7 && s_forwarded_modes.empty());
+    // Not applied: the game's call is forwarded as it is.
+    CHECK(Hook_SetSleepMode(&device, &again) == NVAPI_OK);
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], again));
+    s_forwarded_modes.clear();
+
+    // Bypass on again re-applies; the key off then restores, once.
+    g_reflex_sleep_bypass = true;
+    CHECK(Hook_Sleep(&device) == NVAPI_OK);
+    CHECK(s_forwarded_modes.size() == 1 && IsLowLatencyOffCopy(s_forwarded_modes[0], again));
+    s_forwarded_modes.clear();
+    g_bypass_low_latency_off = false;
+    CHECK(Hook_Sleep(&device) == NVAPI_OK);
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], again));
+    CHECK(!s_low_latency_forced_off.load());
+    s_forwarded_modes.clear();
+
+    // (e) Key off: Sleep makes no extra call and the game's call is unmodified.
+    CHECK(Hook_Sleep(&device) == NVAPI_OK && s_forwarded_modes.empty());
+    CHECK(Hook_SetSleepMode(&device, &game) == NVAPI_OK);
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], game));
+    s_forwarded_modes.clear();
+
+    // A failed driver call leaves the state off; a later Sleep retries it.
+    g_bypass_low_latency_off = true;
+    s_mode_result = -9;
+    CHECK(Hook_Sleep(&device) == NVAPI_OK && s_forwarded_modes.size() == 1 && !s_low_latency_forced_off.load());
+    CHECK(Hook_Sleep(&device) == NVAPI_OK && s_forwarded_modes.size() == 2 && !s_low_latency_forced_off.load());
+    s_mode_result = NVAPI_OK;
+    s_forwarded_modes.clear();
+    CHECK(Hook_Sleep(&device) == NVAPI_OK && s_forwarded_modes.size() == 1 && s_low_latency_forced_off.load());
+    CHECK(IsLowLatencyOffCopy(s_forwarded_modes[0], game));
+    s_forwarded_modes.clear();
+
+    // The shutdown restore sends the game's parameters exactly and clears the state.
+    RestoreGameSleepMode();
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], game));
+    CHECK(!s_low_latency_forced_off.load());
+    s_forwarded_modes.clear();
+
+    // Global state back to what later tests expect.
+    g_bypass_low_latency_off = false;
+    g_reflex_sleep_bypass = false;
+    g_user_target_fps = 0;
+    s_record_modes = false;
+    s_mode_result = -9;
+    s_forwarded_modes.clear();
     s_orig_sleep = old_sleep;
     s_orig_sleep_mode = old_mode;
     NvAPI_ClearFeedbackDevice();
@@ -1281,6 +1426,7 @@ int main(int argc, char** argv) {
     TestFrameMarkerStageEvents();
     TestNativeEndpointCancellation();
     TestReflexCallForwarding();
+    TestBypassLowLatencyOff();
     // No-FG token: native mode transitions clear it; the scheduler-side
     // observation entry point republishes it (not a fixture-only publication).
     NativeGate_SetMode(NativeGateMode::Marker);

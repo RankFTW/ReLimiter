@@ -238,6 +238,7 @@ void Reset(bool creation_failure = false, bool initial_write_failure = false,
     stale.adaptive_cap = true; // LoadConfig must apply the loaded adaptive_cap
     PacingPipeline_SetConfig(stale);
     g_reflex_sleep_bypass.store(false);
+    g_bypass_low_latency_off.store(true); // LoadConfig must apply the loaded value
     g_marker_forward_after_wait.store(true); // LoadConfig must apply the loaded order
     LoadConfig(nullptr);
     CHECK(creates == 1);
@@ -323,6 +324,7 @@ void TestPacingPipelineDefaults() {
     CHECK(g_config.lead_coverage == PacingLeadCoverage::Q99);
     CHECK(g_config.fg_late_spacing);
     CHECK(!g_config.gpu_paced_cadence);
+    CHECK(!g_config.bypass_low_latency_off && !g_bypass_low_latency_off.load());
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
     CheckPipelineMatchesConfig();
     // The startup rewrite saves every new key, including the developer keys.
@@ -331,6 +333,7 @@ void TestPacingPipelineDefaults() {
     CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "99");
     CHECK(Value(local_path, "FrameLimiter", "fg_late_spacing") == "true");
     CHECK(Value(local_path, "FrameLimiter", "gpu_paced_cadence") == "false");
+    CHECK(Value(local_path, "FrameLimiter", "bypass_low_latency_off") == "false");
     CHECK(Value(local_path, "FrameLimiter", "source_placement") == "pre_sleep");
     CHECK(Value(local_path, "FrameLimiter", "reflex_sleep_bypass") == "true");
     CHECK(Value(local_path, "FrameLimiter", "developer_settings") == "false");
@@ -573,6 +576,19 @@ void TestGpuPacedCadenceKey() {
     CHECK(Config_DeveloperOverrides() == 1);
     Config_ResetDeveloperSettings();
     CHECK(!g_config.gpu_paced_cadence && !PacingPipeline_GetConfig().gpu_paced_cadence);
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// Developer A/B bypass_low_latency_off: true loads, reaches the NvAPI hooks'
+// atomic, is saved, counts as a developer override and resets to false.
+void TestBypassLowLatencyOffKey() {
+    Reset(false, false, {{"config_version", "4"}, {"bypass_low_latency_off", "true"}});
+    CHECK(g_config.bypass_low_latency_off && g_bypass_low_latency_off.load());
+    CheckPipelineMatchesConfig();
+    CHECK(Value(local_path, "FrameLimiter", "bypass_low_latency_off") == "true");
+    CHECK(Config_DeveloperOverrides() == 1);
+    Config_ResetDeveloperSettings();
+    CHECK(!g_config.bypass_low_latency_off && !g_bypass_low_latency_off.load());
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
@@ -957,6 +973,7 @@ int main() {
     TestLeadCoverageKey();
     TestFgLateSpacingKey();
     TestGpuPacedCadenceKey();
+    TestBypassLowLatencyOffKey();
     TestSourcePlacementParsing();
     TestPacingMethodMigration();
     TestAdaptiveCapMigration();

@@ -92,6 +92,7 @@ struct Config {
     PacingLeadCoverage lead_coverage = PacingLeadCoverage::Q99; // developer A/B: 95 | 99 (default; share of frames the lead covers)
     bool fg_late_spacing = true; // developer A/B: on (default) | off; FG input wait floors the next real frame on a late frame's readiness
     bool gpu_paced_cadence = false; // developer A/B: off (default) | on; frames whose release the GPU floor sets keep the GPU's pace (held frames get the floor too)
+    bool bypass_low_latency_off = false; // developer A/B: off (default) | on; the driver's low latency mode is turned off while the Reflex Sleep is bypassed (64-bit)
     PacingPlacementOverride source_placement = PacingPlacementOverride::PreSleep; // developer: marker | pre_sleep | driver (pre_sleep is the default)
 
     // Reflex Injection
@@ -277,7 +278,7 @@ void ApplyConfig();
 
 // Apply only the pacing pipeline fields (smoothing, adaptive_cap, output_rung,
 // source_placement, gpu_present_gate_probes, stall injector,
-// marker_forward_order, reflex_sleep_bypass) to the resolver (which carries
+// marker_forward_order, reflex_sleep_bypass, bypass_low_latency_off) to the resolver (which carries
 // adaptive_cap to the period governor) and the NvAPI hooks. Part of
 // ApplyConfig; the OSD calls it after editing those fields.
 void Config_ApplyPacingPipeline();

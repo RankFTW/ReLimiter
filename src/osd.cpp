@@ -564,6 +564,17 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "Leaves markers and the game's SleepMode parameters unchanged. Off returns to the driver's Sleep. "
         "With the cap off or in passthrough (Dynamic MFG) the Sleep always reaches the driver.");
 
+    if (ImGui::Checkbox("Driver low latency off while bypassed", &g_config.bypass_low_latency_off)) {
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: driver low latency off while bypassed -> %s",
+            g_config.bypass_low_latency_off ? "on" : "off");
+        *config_dirty = true;
+    }
+    HelpTip("Diagnostic A/B, Reflex games with the Reflex Sleep bypass on. On, the driver's low latency mode "
+        "is turned off while ReLimiter bypasses the Reflex Sleep, so the driver stops pacing inside the "
+        "game's Present and ReLimiter is the only pacer. The game's own setting is restored when the "
+        "bypass stops. Compare jitter, long frames and PC Latency; one setting per capture.");
+
     static const char* const kMarkerForwardOrderLabels[] = {"Before wait", "After wait"};
     static_assert(IM_ARRAYSIZE(kMarkerForwardOrderLabels) ==
         static_cast<int>(PacingMarkerForwardOrder::Count));

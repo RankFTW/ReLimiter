@@ -54,6 +54,15 @@ static NV_SET_SLEEP_MODE_PARAMS s_game_original_params = {};
 static NvAPIFeedbackDevice s_game_params_identity = {};
 static bool s_game_params_captured = false;
 static std::atomic_flag s_game_params_lock = ATOMIC_FLAG_INIT;
+// bypass_low_latency_off: true while ReLimiter has turned the driver's low
+// latency mode off through SetSleepMode (UpdateLowLatencyOverride). Cleared
+// whenever the game's parameters reach the driver again. The forward lock
+// serializes a transition (driver call and state change) with the forwarding
+// of the game's own SetSleepMode calls, so a game call can neither land
+// between the two nor undo the override; concurrent Sleep calls that find it
+// taken skip the transition and retry on their next Sleep.
+static std::atomic<bool> s_low_latency_forced_off{ false };
+static SRWLOCK s_sleep_mode_forward_lock = SRWLOCK_INIT;
 
 class GameParamsGuard {
 public:
@@ -72,6 +81,8 @@ static void ResetGameSleepParams() noexcept {
     s_game_params_identity = {};
     s_game_params_captured = false;
     g_game_requested_interval.store(0, std::memory_order_relaxed);
+    // The device the override was applied to is gone.
+    s_low_latency_forced_off.store(false, std::memory_order_release);
 }
 
 bool NvAPI_IsSameDevice(IUnknown* left, IUnknown* right) noexcept {
@@ -598,7 +609,70 @@ static void DrainDeferredMarkers(
     }
 }
 
-// ── Hook: SetSleepMode — capture game params, forward unmodified ──
+// SetSleepMode on the presenting device with the game's captured parameters:
+// minimumIntervalUs replaced when `interval_us` is given, and bLowLatencyMode
+// and bLowLatencyBoost cleared when `low_latency_off` (bypass_low_latency_off).
+// Only this copy changes; the captured parameters stay the game's, and
+// `game_params` (optional) receives them as captured. The presenting device
+// must be the one they belong to.
+static DriverLimiterApply ApplyCapturedSleepMode(
+    const uint32_t* interval_us, bool low_latency_off,
+    NV_SET_SLEEP_MODE_PARAMS* game_params = nullptr) noexcept {
+    if (!s_orig_sleep_mode) return DriverLimiterApply::Failed;
+    NV_SET_SLEEP_MODE_PARAMS params{};
+    NvAPIFeedbackDevice params_identity{};
+    {
+        GameParamsGuard lock;
+        if (!s_game_params_captured) return DriverLimiterApply::NoGameParams;
+        params = s_game_original_params;
+        params_identity = s_game_params_identity;
+    }
+    if (game_params) *game_params = params;
+    if (interval_us) params.minimumIntervalUs = *interval_us;
+    if (low_latency_off) {
+        params.bLowLatencyMode = 0;
+        params.bLowLatencyBoost = 0;
+    }
+    const NvAPIFeedbackDevice feedback_device = NvAPI_AcquireFeedbackDevice();
+    if (!feedback_device.device) return DriverLimiterApply::NoDevice;
+    DriverLimiterApply result = DriverLimiterApply::NoDevice;
+    if (NvAPI_IsSameFeedbackPublication(params_identity, feedback_device) &&
+        NvAPI_IsFeedbackDeviceCurrent(feedback_device)) {
+        result = SafeInvokeSetSleepMode(feedback_device.device, &params) == NVAPI_OK
+            ? DriverLimiterApply::Applied
+            : DriverLimiterApply::Failed;
+    }
+    NvAPI_ReleaseFeedbackDevice(feedback_device.device);
+    return result;
+}
+
+// Moves the driver's low latency mode with the Reflex Sleep bypass
+// (bypass_low_latency_off): off while bypassed, the game's own after. Called
+// from Hook_Sleep on the presenting device. The state changes only after a
+// successful driver call; a thread that loses the try-lock, a missing game
+// parameter set and a failed call all retry on a later Sleep. A state that
+// already matches costs a few atomic loads.
+static void UpdateLowLatencyOverride(bool bypass) noexcept {
+    const bool want = bypass && g_bypass_low_latency_off.load(std::memory_order_relaxed);
+    if (want == s_low_latency_forced_off.load(std::memory_order_acquire)) return;
+    if (!TryAcquireSRWLockExclusive(&s_sleep_mode_forward_lock)) return;
+    if (want != s_low_latency_forced_off.load(std::memory_order_acquire)) {
+        NV_SET_SLEEP_MODE_PARAMS game{};
+        if (ApplyCapturedSleepMode(nullptr, want, &game) == DriverLimiterApply::Applied) {
+            s_low_latency_forced_off.store(want, std::memory_order_release);
+            if (want)
+                LOG_INFO("NvAPI: driver low latency mode off while the Reflex Sleep is bypassed "
+                         "(game requested low_latency=%u boost=%u)",
+                    game.bLowLatencyMode ? 1u : 0u, game.bLowLatencyBoost ? 1u : 0u);
+            else
+                LOG_INFO("NvAPI: driver low latency mode back to the game's (low_latency=%u boost=%u)",
+                    game.bLowLatencyMode ? 1u : 0u, game.bLowLatencyBoost ? 1u : 0u);
+        }
+    }
+    ReleaseSRWLockExclusive(&s_sleep_mode_forward_lock);
+}
+
+// ── Hook: SetSleepMode — capture game params, forward them (limiter interval and low latency override on a copy) ──
 static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_PARAMS* params) {
     RuntimeCallbackGuard callback;
     if (callback.IsStopping())
@@ -649,6 +723,8 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
                 s_game_original_params = {};
                 s_game_params_identity = params_device.identity;
                 s_game_params_captured = false;
+                // Another device: the override was never applied to it.
+                s_low_latency_forced_off.store(false, std::memory_order_release);
             }
             // The newest game parameters: the driver limiter applies
             // its interval on top of them and restores them.
@@ -660,6 +736,9 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
         }
     }
 
+    // Forwarding is serialized with override transitions (above).
+    AcquireSRWLockExclusive(&s_sleep_mode_forward_lock);
+    NvAPI_Status result = NVAPI_OK;
     // While the Reflex driver limiter is applied, the game's own call
     // would clear it: forward a copy with ReLimiter's interval instead. The
     // game's parameters above stay captured for the restore.
@@ -667,10 +746,22 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
     if (limiter_us != 0 && params_valid && params_device.identity.device) {
         NV_SET_SLEEP_MODE_PARAMS limited = params_snapshot;
         limited.minimumIntervalUs = limiter_us;
-        return SafeInvokeSetSleepMode(pDev, &limited);
+        result = SafeInvokeSetSleepMode(pDev, &limited);
+    } else if (params_valid && params_device.identity.device &&
+               s_low_latency_forced_off.load(std::memory_order_acquire)) {
+        // The low latency override (bypass_low_latency_off) is applied to the
+        // driver: the game's own call, which may carry low latency on every
+        // frame, must not undo it. The captured game parameters stay the game's.
+        NV_SET_SLEEP_MODE_PARAMS forced = params_snapshot;
+        forced.bLowLatencyMode = 0;
+        forced.bLowLatencyBoost = 0;
+        result = SafeInvokeSetSleepMode(pDev, &forced);
+    } else {
+        // Forward game's params unmodified.
+        result = SafeInvokeSetSleepMode(pDev, params);
     }
-    // Forward game's params unmodified.
-    return SafeInvokeSetSleepMode(pDev, params);
+    ReleaseSRWLockExclusive(&s_sleep_mode_forward_lock);
+    return result;
 }
 
 // ── Hook: Sleep — forward to driver for Reflex queue management. ──
@@ -699,6 +790,9 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
         // not during the waits. A busy owner skips the wait; the
         // SIMULATION_START trim still paces the frame.
         if (IsPresentingFeedbackDevice(pDev)) {
+            // bypass_low_latency_off: the driver's low latency mode follows
+            // the bypass, before the pre-Sleep wait.
+            UpdateLowLatencyOverride(bypass);
             LARGE_INTEGER sleep_entry{};
             QueryPerformanceCounter(&sleep_entry);
             Scheduler_RecordReflexSleep(sleep_entry.QuadPart);
@@ -1178,30 +1272,16 @@ void RestoreGameSleepMode() {
     }
     LOG_INFO("Restoring game's sleep mode params");
     SafeInvokeSetSleepMode(feedback_device.device, &params);
+    // The game's parameters, low latency mode included, are the driver's again.
+    s_low_latency_forced_off.store(false, std::memory_order_release);
     NvAPI_ReleaseFeedbackDevice(feedback_device.device);
 }
 
 DriverLimiterApply NvAPI_ApplyDriverLimiter(uint32_t minimum_interval_us) noexcept {
-    if (!s_orig_sleep_mode) return DriverLimiterApply::Failed;
-    NV_SET_SLEEP_MODE_PARAMS params{};
-    NvAPIFeedbackDevice params_identity{};
-    {
-        GameParamsGuard lock;
-        if (!s_game_params_captured) return DriverLimiterApply::NoGameParams;
-        params = s_game_original_params;
-        params_identity = s_game_params_identity;
-    }
-    params.minimumIntervalUs = minimum_interval_us;
-    const NvAPIFeedbackDevice feedback_device = NvAPI_AcquireFeedbackDevice();
-    if (!feedback_device.device) return DriverLimiterApply::NoDevice;
-    DriverLimiterApply result = DriverLimiterApply::NoDevice;
-    if (NvAPI_IsSameFeedbackPublication(params_identity, feedback_device) &&
-        NvAPI_IsFeedbackDeviceCurrent(feedback_device)) {
-        result = SafeInvokeSetSleepMode(feedback_device.device, &params) == NVAPI_OK
-            ? DriverLimiterApply::Applied
-            : DriverLimiterApply::Failed;
-    }
-    NvAPI_ReleaseFeedbackDevice(feedback_device.device);
+    const DriverLimiterApply result = ApplyCapturedSleepMode(&minimum_interval_us, false);
+    // The call carried the game's own low latency settings.
+    if (result == DriverLimiterApply::Applied)
+        s_low_latency_forced_off.store(false, std::memory_order_release);
     return result;
 }
 

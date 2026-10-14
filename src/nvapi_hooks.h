@@ -12,6 +12,10 @@ extern PFN_NvAPI_D3D_SetLatencyMarker  s_orig_set_latency_marker;
 // dereference only through NvAPI_AcquireFeedbackDevice for generation safety.
 extern std::atomic<IUnknown*> g_dev;
 inline std::atomic<bool> g_reflex_sleep_bypass{false};
+// Developer A/B bypass_low_latency_off: while the Sleep is bypassed, Hook_Sleep
+// has the driver's low latency mode turned off (SetSleepMode forwarded with
+// bLowLatencyMode and bLowLatencyBoost 0) so ReLimiter is the only pacer.
+inline std::atomic<bool> g_bypass_low_latency_off{false};
 // marker_forward_order == after_wait: direct SIMULATION_START/RENDERSUBMIT_START
 // reach the driver after the source wait instead of on hook entry.
 inline std::atomic<bool> g_marker_forward_after_wait{false};

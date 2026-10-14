@@ -414,6 +414,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.gpu_present_gate_probes=ReadINIBool(S,"gpu_present_gate_probes",true,P);
     g_config.fg_late_spacing=ReadINIBool(S,"fg_late_spacing",true,P);
     g_config.gpu_paced_cadence=ReadINIBool(S,"gpu_paced_cadence",false,P);
+    g_config.bypass_low_latency_off=ReadINIBool(S,"bypass_low_latency_off",false,P);
     g_config.reflex_sleep_bypass=ReadINIBool(S,"reflex_sleep_bypass",true,P);
     g_config.reflex_inject           = ReadINIBool(S, "reflex_inject", false, P);
     g_config.flip_model_override     = ReadINIBool(S, "flip_model_override", false, P);
@@ -630,6 +631,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIString(S, "lead_coverage", PacingLeadCoverage_Text(config.lead_coverage), P);
     WriteINIBool(S, "fg_late_spacing", config.fg_late_spacing, P);
     WriteINIBool(S, "gpu_paced_cadence", config.gpu_paced_cadence, P);
+    WriteINIBool(S, "bypass_low_latency_off", config.bypass_low_latency_off, P);
     WriteINIString(S, "source_placement",
         PacingPlacementOverride_Text(config.source_placement), P);
     WriteINIDouble(S, "stall_inject_ms", config.stall_inject_ms, P);
@@ -884,6 +886,7 @@ void Config_ApplyPacingPipeline() {
         g_config.marker_forward_order == PacingMarkerForwardOrder::AfterWait,
         std::memory_order_relaxed);
     g_reflex_sleep_bypass.store(g_config.reflex_sleep_bypass, std::memory_order_relaxed);
+    g_bypass_low_latency_off.store(g_config.bypass_low_latency_off, std::memory_order_relaxed);
 }
 
 int Config_DeveloperOverrides() {
@@ -900,6 +903,7 @@ int Config_DeveloperOverrides() {
         (g_config.lead_coverage != d.lead_coverage) +
         (g_config.fg_late_spacing != d.fg_late_spacing) +
         (g_config.gpu_paced_cadence != d.gpu_paced_cadence) +
+        (g_config.bypass_low_latency_off != d.bypass_low_latency_off) +
         (g_config.source_placement != d.source_placement);
 }
 
@@ -918,6 +922,7 @@ void Config_ResetDeveloperSettings() {
     g_config.lead_coverage = d.lead_coverage;
     g_config.fg_late_spacing = d.fg_late_spacing;
     g_config.gpu_paced_cadence = d.gpu_paced_cadence;
+    g_config.bypass_low_latency_off = d.bypass_low_latency_off;
     g_config.source_placement = d.source_placement;
     Config_ApplyPacingPipeline();
     LOG_INFO("Config: developer diagnostics reset to the recommended defaults");
@@ -971,6 +976,9 @@ void ApplyConfig() {
         LOG_WARN("Pacing pipeline: diagnostic GPU-paced cadence on (held frames are released no earlier than "
                  "the render handoff GPU floor, and a frame whose release that floor sets keeps the GPU's pace "
                  "instead of being held to the cap's cadence)");
+    if (g_config.bypass_low_latency_off)
+        LOG_WARN("Diagnostic driver low latency off while bypassed: NvAPI SetSleepMode forwarded with low latency "
+                 "mode off while the Reflex Sleep is bypassed");
 }
 
 

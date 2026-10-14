@@ -146,6 +146,19 @@ On, one cadence takes the later of the two limits for every frame:
 - Games whose render thread starts later than the floor (CONTROL Resonant, Rogue Core) are rarely or never released by it, so the switch changes little there; verify with captures.
 - The log warns while it is on and logs `OSD: GPU-paced cadence -> on|off` for a change. Compare long frames, jitter, GPU idle gaps, the overload pauses and PC Latency, one setting per capture in the same scene, with Reflex active.
 
+### Driver low latency off while bypassed
+
+`bypass_low_latency_off` (default **off**, 64-bit, Reflex games with the Sleep bypass on). A developer A/B that leaves ReLimiter as the only pacer. The bypass removes the game's Reflex Sleep call from the driver, not the game's low latency mode: the game's `NvAPI_D3D_SetSleepMode` still reaches the driver with low latency on, and NVIDIA's documentation says low latency mode paces even without the Sleep call, at a less optimal point. In Gears of War: E-Day with DLSS Frame Generation 2× at a 120 FPS cap and the bypass on, that point is inside the game's Present: the driver sleeps the Present thread in `NvAPI_D3D12_SetAsyncFrameMarker` (PRESENT_END).
+
+On, while the bypass applies, ReLimiter sends the game's newest `SetSleepMode` parameters with `bLowLatencyMode` and `bLowLatencyBoost` cleared; every other field stays the game's.
+
+- **Only while bypassed.** The override starts on the first Reflex Sleep that is bypassed after the game's `SetSleepMode` has been seen, and ends on the first Sleep that is not: the cap is off, pacing is suspended, the Reflex driver limiter placement, Dynamic MFG passthrough, the key set back to off, or the bypass turned off. Leaving it sends the game's newest parameters exactly. It also ends at shutdown.
+- **The game's calls cannot undo it.** While the override is applied, the game's own `SetSleepMode` calls (some games send them every frame) are forwarded with low latency and boost off. ReLimiter's copy of the game's parameters never changes.
+- **Why.** In the Gears capture with the bypass on, the driver's in-Present sleep touched 7–12% of frames and accounted for 39–68% of the misplaced real frames. Away from it ReLimiter already paced as well as the driver's own Sleep.
+- **Unknown.** How DLSS Frame Generation paces generated and real frames without the driver's low latency mode; whether the driver keeps returning Reflex latency reports that the GPU floor needs; and the effect in CONTROL Resonant, whose render thread the driver's in-Present pacing holds before the next frame today. Verify each with captures.
+- The log warns while the key is on. At INFO each change logs once: `NvAPI: driver low latency mode off while the Reflex Sleep is bypassed (game requested low_latency=N boost=N)` and `NvAPI: driver low latency mode back to the game's (low_latency=N boost=N)`. `OSD: driver low latency off while bypassed -> on|off` logs a change in the overlay.
+- Compare jitter above 2 and 4 ms, long frames, the frames the driver placed away from their GPU gap and PC Latency, one setting per capture in the same scene, with Reflex active, against the same capture with the key off.
+
 ### Source placement
 
 `source_placement` (default **Pre-Sleep**, 64-bit, Reflex marker games) sets where the source wait happens. ReLimiter never changes it on its own. The Details lines show the result as **Placement**. State the placement with every latency comparison.
@@ -184,6 +197,7 @@ Settings belong under `[FrameLimiter]`. Leave these at their defaults for normal
 | `gpu_wait_budget_us` | 1500 | 64-bit, `gpu_queue_wait` only. 500–5000 µs; values outside are clamped with a log warning, and 0, negative or non-finite values load as 1500. The top level of the GPU wait cap ladder (**GPU wait budget**). |
 | `gpu_wait_interleave_s` | 0 | 64-bit, Output override **Auto** only. 0 is off; otherwise 1–10 s (values outside are clamped with a log warning; negative or non-finite values load as 0). Alternates held and not-held blocks of the `gpu_queue_wait` output (**GPU wait A/B blocks**). |
 | `reflex_sleep_bypass` | true | 64-bit. `true` skips the driver's Reflex Sleep while an FPS cap is set and ReLimiter paces the game, held or not; frames not held use the render handoff limit. The Sleep reaches the driver in Dynamic MFG passthrough and with the Reflex driver limiter. `false` always returns to the driver's Sleep, which the **Reflex driver limiter** placement needs. |
+| `bypass_low_latency_off` | false | 64-bit, Reflex games, with the Sleep bypass on. `true` or `false` (**Driver low latency off while bypassed**): while the Reflex Sleep is bypassed, the driver's low latency mode is turned off (`SetSleepMode` is forwarded with low latency and boost off), so ReLimiter is the only pacer; the game's own setting is restored when the bypass stops and at shutdown. Developer A/B, off by default. |
 | `marker_forward_order` | before_wait | 64-bit, NvAPI markers. `before_wait` or `after_wait`: when SIMULATION_START reaches the driver relative to ReLimiter's wait (**Marker forward order**). Invalid values reset to `before_wait`. |
 | `gpu_queue_wait_render_queue` | keep | 64-bit, `gpu_queue_wait` only. `keep`, `remove` or `remove_held` (**GPU queue wait render queue**). Invalid values reset to `keep`. |
 | `lead_coverage` | 99 | All holds. `99` or `95`: the share of frames the lead covers (**Lead coverage**). Invalid values reset to `99`. An INI saved with `config_version=2` (4.0 test builds) moves from `95` to `99` once. |
