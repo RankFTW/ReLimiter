@@ -37,7 +37,12 @@
 //   When the earliest target is later than the grid's T(n), the grid
 //   follows it from n: a segment with origin at that target, without an
 //   epoch. Otherwise the grid keeps T(n), so the cadence is the later of
-//   the cap and the GPU's pace.
+//   the cap and the GPU's pace. Its output is not judged either
+//   (ObserveOutput with gpu_paced): T(n) is the early side of where such a
+//   frame is ready, and that early side lags a change from cap-bound to
+//   GPU-bound frames, so judging it restarted the cadence every few frames
+//   (Gears of War: E-Day, FG 2×) and the restarts paused the holds. The
+//   output spacing floor still spaces the next frame after it.
 // In both output rules I is the newest interval. When snapped, every restart
 // origin and floored target is the first fixed edge at or after the
 // computed time. Evidence older than the lifecycle's first index is ignored.
@@ -248,6 +253,9 @@ struct CadenceGridStatistics {
     uint64_t released_immediately = 0;
     uint64_t snapped_plans = 0;
     uint64_t gpu_target_plans = 0; // CadenceGridPlan::gpu_target
+    // Outputs of GPU-paced frames later than T(n) + tol (or, for older
+    // evidence, implied later than T(b) + tol) that started no epoch.
+    uint64_t gpu_paced_late_outputs = 0;
     // OutputLate epochs started by evidence older than the epoch (also in
     // epochs_by_reason).
     uint64_t older_output_epochs = 0;
@@ -277,12 +285,13 @@ public:
     CadenceGridPlan PlanNext(const CadenceGridPlanInput& input) noexcept;
 
     // Output evidence for a planned index (rules above). Returns OutputLate
-    // when it started an epoch, otherwise None. The caller publishes
-    // Snapshot() after an epoch.
+    // when it started an epoch, otherwise None; never for a GPU-paced frame
+    // (gpu_paced). The caller publishes Snapshot() after an epoch.
     PacingEpochReason ObserveOutput(
         uint32_t controller_generation,
         uint64_t grid_index,
-        int64_t output_qpc) noexcept;
+        int64_t output_qpc,
+        bool gpu_paced = false) noexcept;
 
     const CadenceGridSnapshot& Snapshot() const noexcept { return snapshot_; }
     // The grid index the next valid PlanNext takes.

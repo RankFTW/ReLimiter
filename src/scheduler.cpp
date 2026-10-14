@@ -542,12 +542,14 @@ std::atomic<uint32_t> s_handoff_hook_stalls{0};
 // GPU-paced rhythm diagnostics (developer A/B gpu_paced_cadence): held frames
 // whose GPU floor was known, by the anchor that set it, and how many frames
 // ahead of the readiness anchor the floor extrapolated (index capped at the
-// horizon); the totals at the newest periodic log line and its time.
+// horizon); the totals at the newest periodic log line (with the grid's
+// GPU-paced late outputs) and its time.
 uint64_t s_floor_anchor_frames[4] = {};
 uint64_t s_ready_ahead_frames[LEAD_HANDOFF_GPU_HORIZON_FRAMES + 1] = {};
 uint64_t s_rhythm_logged_steps[static_cast<size_t>(GpuPacedRhythmStep::Count)] = {};
 uint64_t s_rhythm_logged_anchors[4] = {};
 uint64_t s_rhythm_logged_ahead[LEAD_HANDOFF_GPU_HORIZON_FRAMES + 1] = {};
+uint64_t s_rhythm_logged_late_outputs = 0;
 int64_t s_rhythm_log_qpc = 0;
 // The Reflex Sleep hook's entry for grid index s_sleep_entry_index
 // (Scheduler_PlanReflexSleep): when the game reached ReLimiter for it.
@@ -1603,6 +1605,9 @@ static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
         s_rhythm_logged_ahead[frames] = s_ready_ahead_frames[frames];
         ready_floors += ahead[frames];
     }
+    const uint64_t late_outputs_total = s_source_stage.Grid().Statistics().gpu_paced_late_outputs;
+    const uint64_t late_outputs = late_outputs_total - s_rhythm_logged_late_outputs;
+    s_rhythm_logged_late_outputs = late_outputs_total;
     if (paced == 0 && floors == 0) return;
     // Median and largest frames-ahead of the readiness anchor.
     size_t median_ahead = 0;
@@ -1621,7 +1626,7 @@ static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
     const LeadController& lead = s_source_stage.Lead();
     LOG_INFO("GPU-paced rhythm: %llu frames (smooth %llu, late %llu, early bound %llu, start %llu); floors %llu "
              "(readiness %llu, report %llu, PRESENT_END %llu); readiness anchor gaps %u, frames ahead p50 %zu max %zu; "
-             "period %.2f ms (median %.2f)",
+             "period %.2f ms (median %.2f); late outputs followed %llu",
         static_cast<unsigned long long>(paced),
         static_cast<unsigned long long>(steps[static_cast<size_t>(GpuPacedRhythmStep::Smooth)]),
         static_cast<unsigned long long>(steps[static_cast<size_t>(GpuPacedRhythmStep::Late)]),
@@ -1631,7 +1636,8 @@ static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
         static_cast<unsigned long long>(anchors[static_cast<size_t>(GpuFloorAnchor::Ready)]),
         static_cast<unsigned long long>(anchors[static_cast<size_t>(GpuFloorAnchor::Report)]),
         static_cast<unsigned long long>(anchors[static_cast<size_t>(GpuFloorAnchor::PresentEnd)]),
-        lead.ReadyGapCount(), median_ahead, max_ahead, lead.RecentGpuPeriodUs() / 1000.0, lead.GpuPeriodUs() / 1000.0);
+        lead.ReadyGapCount(), median_ahead, max_ahead, lead.RecentGpuPeriodUs() / 1000.0, lead.GpuPeriodUs() / 1000.0,
+        static_cast<unsigned long long>(late_outputs));
 }
 
 // A_n = max(w_{n−1} + d, G_n): the newest released frame's render handoff

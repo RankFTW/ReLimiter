@@ -578,7 +578,8 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
 PacingEpochReason CadenceGrid::ObserveOutput(
     uint32_t controller_generation,
     uint64_t grid_index,
-    int64_t output_qpc) noexcept
+    int64_t output_qpc,
+    bool gpu_paced) noexcept
 {
     // Idle caps plan with L = 0 and no output hold, so a PRESENT_START after
     // T(n) is the frame's own work, not a late output: restarting the grid
@@ -612,6 +613,12 @@ PacingEpochReason CadenceGrid::ObserveOutput(
         interval_ticks, snapshot_.qpc_frequency);
     if (RoundExact(implied) <= target_qpc + tolerance_ticks) {
         if (older) ++statistics_.ignored_output_observations;
+        return PacingEpochReason::None;
+    }
+
+    // A GPU-paced frame's late output follows the GPU (rules above).
+    if (gpu_paced) {
+        ++statistics_.gpu_paced_late_outputs;
         return PacingEpochReason::None;
     }
 

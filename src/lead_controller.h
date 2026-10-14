@@ -696,6 +696,9 @@ public:
     // later than its Present-side time, inside [s, that time]; 0 when the
     // frame or that time is unknown.
     int64_t GatedHoldTicks(const PacingPlanKey& key, uint64_t grid_index) const noexcept;
+    // The pending frame (key, grid_index) was released by the GPU floor
+    // (LeadFrameStart::gpu_floor_release); false when it is not pending.
+    bool GpuFloorReleased(const PacingPlanKey& key, uint64_t grid_index) const noexcept;
     // Slack window and last budget decision of the bucket; empty for an invalid rung.
     LeadFeasibility Feasibility(PacingRung rung, double fg_divisor) const noexcept;
     LeadStatistics Statistics() const noexcept { return statistics_; }

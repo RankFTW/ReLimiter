@@ -1007,6 +1007,12 @@ int64_t LeadController::GatedHoldTicks(const PacingPlanKey& key, uint64_t grid_i
     return GatedHoldTicks(slot);
 }
 
+bool LeadController::GpuFloorReleased(const PacingPlanKey& key, uint64_t grid_index) const noexcept
+{
+    const PendingFrame& slot = pending_[static_cast<size_t>(grid_index % LEAD_PENDING_CAPACITY)];
+    return slot.occupied && slot.grid_index == grid_index && slot.key == key && slot.gpu_floor_release;
+}
+
 void LeadController::Discard(PendingFrame* frame) noexcept
 {
     if (frame->occupied && !frame->closed) {

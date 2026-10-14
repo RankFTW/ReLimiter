@@ -504,6 +504,43 @@ namespace
         CHECK(statistics.released_immediately == 0);
     }
 
+    // GPU-paced frame: its output is not judged either. Late output evidence
+    // of a GPU-paced frame starts no epoch and moves no target (counted);
+    // the same evidence without the flag restarts the cadence. I = 10 ms,
+    // L = 6 ms, tol = 2.5 ms.
+    void TestGpuPacedOutputNotJudged()
+    {
+        auto input = [&](int64_t now, int64_t earliest_target) {
+            CadenceGridPlanInput in = Input(now, 10000.0, 6000.0);
+            in.earliest_target_qpc = earliest_target;
+            return in;
+        };
+        CadenceGrid grid;
+        const CadenceGridPlan first = grid.PlanNext(input(kStartQpc, kStartQpc + 90000));
+        const int64_t t1 = first.output_target_qpc;
+        const CadenceGridPlan second = grid.PlanNext(input(t1 + 40000, t1 + 130000));
+        CHECK(second.gpu_target && second.output_target_qpc == t1 + 130000);
+        const int64_t t2 = second.output_target_qpc;
+        const CadenceGridPlan third = grid.PlanNext(input(t2 + 40000, t2 + 100000));
+        const int64_t t3 = third.output_target_qpc;
+        const uint64_t sequence = grid.Snapshot().sequence;
+
+        // An on-time output is not counted.
+        CHECK(grid.ObserveOutput(kGeneration, 1, t1 + 20000, true) == PacingEpochReason::None);
+        CHECK(grid.Statistics().gpu_paced_late_outputs == 0);
+        // 7 ms late: no epoch, T(3) unchanged.
+        CHECK(grid.ObserveOutput(kGeneration, 2, t2 + 70000, true) == PacingEpochReason::None);
+        CHECK(grid.Statistics().gpu_paced_late_outputs == 1);
+        CHECK(grid.Snapshot().sequence == sequence);
+        CHECK(grid.Snapshot().epoch == first.epoch);
+        CHECK(TargetOf(grid, 3) == t3);
+        // The same evidence of a frame that is not GPU-paced restarts it.
+        CHECK(grid.ObserveOutput(kGeneration, 2, t2 + 70000) == PacingEpochReason::OutputLate);
+        CHECK(grid.Snapshot().epoch == first.epoch + 1);
+        CHECK(TargetOf(grid, 3) == t2 + 70000 + 100000);
+        CHECK(grid.Statistics().gpu_paced_late_outputs == 1);
+    }
+
     void TestOutputLateThreshold()
     {
         CadenceGrid grid;
@@ -1808,6 +1845,7 @@ int main()
     TestSourceLateThreshold();
     TestSourceSlackExtendsTolerance();
     TestGpuPacedTarget();
+    TestGpuPacedOutputNotJudged();
     TestOutputLateThreshold();
     TestOldEvidenceIgnored();
     TestOlderOutputEvidence();

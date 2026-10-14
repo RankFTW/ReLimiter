@@ -137,8 +137,11 @@ size_t SourceStage::DrainStageEvents() noexcept
         // frames that this frame's Present followed are not a late output.
         const int64_t gated_ticks = lead_.GatedHoldTicks(event.key, event.grid_index);
         if (gated_ticks > 0) ++statistics_.gated_outputs;
-        if (grid_.ObserveOutput(event.key.controller_generation, event.grid_index, event.qpc - gated_ticks) ==
-            PacingEpochReason::OutputLate) {
+        // A frame the GPU floor released follows the GPU at its output too
+        // (cadence_grid.h).
+        const bool gpu_paced = lead_.GpuFloorReleased(event.key, event.grid_index);
+        if (grid_.ObserveOutput(event.key.controller_generation, event.grid_index, event.qpc - gated_ticks,
+                gpu_paced) == PacingEpochReason::OutputLate) {
             ++statistics_.output_late_epochs;
             epoch_started = true;
         }

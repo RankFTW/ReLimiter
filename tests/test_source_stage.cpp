@@ -896,17 +896,18 @@ void TestEarliestReleaseLimitsWait()
 
 // Developer A/B gpu_paced_cadence: a held frame whose release the GPU floor
 // sets (the floor is the earliest release and later than its arrival) is
-// released at the floor, never judged late, and its output target is at least
-// its release plus the early lead: the bucket's Q5(X) − allowance (3,010 −
-// 500 µs here) until 32 frames were released by the floor, a restarted
-// bucket's old median, and then the floor-released frames' own X
-// (TestGpuPacedRing). Its record carries the GPU-paced flag. A frame whose
-// game entered the Reflex Sleep for its index before the floor is the floor's
-// even when its marker lands just after it (released at the marker). The
-// key off, a later render-thread term and an arrival
-// after the floor without a Sleep entry for this index are not GPU-paced; with
-// a cold bucket the floor still releases the frame but without an early lead
-// the grid judges it as before: 6 ms past S is a SourceLate restart.
+// released at the floor, never judged late at its source or its output, and
+// its output target is at least its release plus the early lead: the
+// bucket's Q5(X) − allowance (3,010 − 500 µs here) until 32 frames were
+// released by the floor, a restarted bucket's old median, and then the
+// floor-released frames' own X (TestGpuPacedRing). Its record carries the
+// GPU-paced flag. A frame whose game entered the Reflex Sleep for its index
+// before the floor is the floor's even when its marker lands just after it
+// (released at the marker). The key off, a later render-thread term and an
+// arrival after the floor without a Sleep entry for this index are not
+// GPU-paced, and their output 8 ms past T restarts the cadence; with a cold
+// bucket the floor still releases the frame but without an early lead the
+// grid judges its source as before: 6 ms past S is a SourceLate restart.
 void TestGpuPacedCadence()
 {
     std::printf("Test: a frame the GPU floor releases keeps the GPU's pace\n");
@@ -977,6 +978,14 @@ void TestGpuPacedCadence()
             const int64_t target = frame.release_qpc + Ticks(frame.plan.lead_us);
             CHECK(frame.plan.output_target_qpc > target - 10 && frame.plan.output_target_qpc < target + 10);
         }
+        // An output 8 ms past T (beyond the tolerance) restarts the cadence
+        // only for a frame the GPU floor did not release.
+        const uint64_t late_before = g_stage.Statistics().output_late_epochs;
+        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease,
+            frame.plan.output_target_qpc + Ticks(8'000.0), PacingPlanStatus::Held)));
+        g_stage.DrainStageEvents();
+        CHECK(g_stage.Statistics().output_late_epochs - late_before == (c.paced ? 0u : 1u));
+        CHECK(g_stage.DrainStartedOutputLate() == !c.paced);
     }
 }
 
