@@ -823,8 +823,14 @@ void LeadController::OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, 
     gpu_end_qpc_ = gpu_end_qpc;
 }
 
-// Readiness anchor (lead_controller.h): the GPU waited for a held frame until
-// its release, so its anchor is the later of the two.
+// Readiness anchor (lead_controller.h): the readiness, or for a queued GPU
+// wait the later of the readiness and the release.
+int64_t LeadController::ReadyAnchorQpc(const PendingFrame& frame) noexcept
+{
+    const int64_t ready_qpc = frame.qpc[FieldGpuReady];
+    return IsHeldStatus(frame.output_status) ? (std::max)(ready_qpc, frame.qpc[FieldOutputRelease]) : ready_qpc;
+}
+
 void LeadController::NoteReadyAnchor(const PendingFrame& frame) noexcept
 {
     if (frame.key.identity_domain != PacingIdentityDomain::NvApiFrame || frame.key.producer_epoch == 0 ||
@@ -837,13 +843,12 @@ void LeadController::NoteReadyAnchor(const PendingFrame& frame) noexcept
         ready_qpc_ = 0;
     }
     if (frame.key.frame_id <= ready_frame_) return;
-    const int64_t ready_qpc = frame.qpc[FieldGpuReady];
     ready_frame_ = frame.key.frame_id;
-    ready_qpc_ = IsHeldStatus(frame.output_status) ? (std::max)(ready_qpc, frame.qpc[FieldOutputRelease]) : ready_qpc;
+    ready_qpc_ = ReadyAnchorQpc(frame);
 }
 
-// The gap of NvAPI frame (producer_epoch, frame_id) not held: its report's
-// GPU end minus its readiness. Reports arrive while the frame is pending.
+// The gap of NvAPI frame (producer_epoch, frame_id): its report's GPU end
+// minus its anchor. Reports arrive while the frame is pending.
 void LeadController::RecordReadyGap(uint32_t producer_epoch, uint64_t frame_id, int64_t gpu_end_qpc) noexcept
 {
     for (const PendingFrame& frame : pending_) {
@@ -851,11 +856,8 @@ void LeadController::RecordReadyGap(uint32_t producer_epoch, uint64_t frame_id, 
             frame.key.producer_epoch != producer_epoch || frame.key.frame_id != frame_id) {
             continue;
         }
-        if (!HasField(frame, FieldGpuReady) || !HasField(frame, FieldOutputRelease) ||
-            IsHeldStatus(frame.output_status)) {
-            return;
-        }
-        const double gap_us = MicrosecondsBetween(frame.qpc[FieldGpuReady], gpu_end_qpc);
+        if (!HasField(frame, FieldGpuReady) || !HasField(frame, FieldOutputRelease)) return;
+        const double gap_us = MicrosecondsBetween(ReadyAnchorQpc(frame), gpu_end_qpc);
         if (!(gap_us >= 0.0) || !(gap_us <= frame.interval_us)) return;
         ready_gaps_us_[ready_gap_head_] = static_cast<float>(gap_us);
         ready_gap_head_ = (ready_gap_head_ + 1) % static_cast<uint32_t>(LEAD_GPU_READY_GAP_CAPACITY);

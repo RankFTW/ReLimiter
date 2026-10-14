@@ -306,11 +306,15 @@ constexpr CollisionDistanceLimits LEAD_HEADROOM_LIMITS{ 1000.0, 750.0, 3000.0 };
 // Reflex report arrives. Its gap to the frame's Reflex GPU end is nearly
 // constant (Gears, FG 2×: 1.53 ms, sd 0.12, frame generation included). When
 // a frame newer than the newest report has its readiness and output outcome
-// known, Ĝ(n − 1) is that readiness (or the hold's release when the GPU
-// waited) plus the median gap of the newest LEAD_GPU_READY_GAP_CAPACITY
-// frames that were not held, extrapolated by P: an estimate rather than a
-// bound, so it replaces the older report's extrapolation, and the PRESENT_END
-// bound applies on top of it only from a newer frame.
+// known, Ĝ(n − 1) is that frame's anchor, its readiness or, when the GPU
+// wait was queued, the later of its readiness and the release, plus the
+// median anchor → GPU end gap of the newest LEAD_GPU_READY_GAP_CAPACITY
+// frames, extrapolated by P: an estimate rather than a bound, so it replaces
+// the older report's extrapolation, and the PRESENT_END bound applies on top
+// of it only from a newer frame. Every frame adds a gap from that same
+// anchor: the GPU waits report a queued wait as held whether or not the GPU
+// reached it first (Gears, FG 2× GPU-paced: 97.5% reached it after the
+// release), so gaps of frames not held alone never warmed the window.
 //
 // Report pairs (frame n's Reflex report and n − 1's, driver clock): a pair
 // whose first work reached the driver in the first half of the render
@@ -679,6 +683,8 @@ public:
     // (0 until that many): the GPU-paced rhythm's period (source_stage.h).
     double GpuPeriodUs() const noexcept;
     double RecentGpuPeriodUs() const noexcept;
+    // Anchor → GPU end gaps in the readiness anchor's window (above).
+    uint32_t ReadyGapCount() const noexcept { return ready_gap_count_; }
     // The stream proof is complete (above).
     bool HandoffStreams() const noexcept { return handoff_stream_frames_ >= LEAD_HANDOFF_STREAM_PROOF; }
     // Handoff samples in the window. At LEAD_HANDOFF_MIN_SAMPLES the game has
@@ -806,8 +812,9 @@ private:
     void ExpireBehindNewest() noexcept;
     void RecordResumeDelay(PendingFrame* frame) noexcept;
     // Readiness anchor (above): the newest NvAPI frame with its GPU readiness
-    // and output outcome known; the gap of a frame not held when its report
-    // arrives.
+    // and output outcome known, and each frame's anchor → GPU end gap when its
+    // report arrives.
+    static int64_t ReadyAnchorQpc(const PendingFrame& frame) noexcept;
     void NoteReadyAnchor(const PendingFrame& frame) noexcept;
     void RecordReadyGap(uint32_t producer_epoch, uint64_t frame_id, int64_t gpu_end_qpc) noexcept;
     // Copies the newest `count` u − o observations (count <= resume_delay_count_).
@@ -892,8 +899,7 @@ private:
     uint32_t recent_period_head_ = 0;
     uint32_t recent_period_count_ = 0;
     // Readiness anchor (above): producer epoch, NvAPI frame and QPC of the
-    // newest anchor (readiness, or the hold's release when the GPU waited),
-    // and the readiness → GPU end gaps in µs of frames not held.
+    // newest anchor (ReadyAnchorQpc), and the anchor → GPU end gaps in µs.
     uint32_t ready_epoch_ = 0;
     uint64_t ready_frame_ = 0;
     int64_t ready_qpc_ = 0;

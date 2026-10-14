@@ -1620,7 +1620,7 @@ static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
     }
     const LeadController& lead = s_source_stage.Lead();
     LOG_INFO("GPU-paced rhythm: %llu frames (smooth %llu, late %llu, early bound %llu, start %llu); floors %llu "
-             "(readiness %llu, report %llu, PRESENT_END %llu); readiness anchor frames ahead p50 %zu max %zu; "
+             "(readiness %llu, report %llu, PRESENT_END %llu); readiness anchor gaps %u, frames ahead p50 %zu max %zu; "
              "period %.2f ms (median %.2f)",
         static_cast<unsigned long long>(paced),
         static_cast<unsigned long long>(steps[static_cast<size_t>(GpuPacedRhythmStep::Smooth)]),
@@ -1631,7 +1631,7 @@ static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
         static_cast<unsigned long long>(anchors[static_cast<size_t>(GpuFloorAnchor::Ready)]),
         static_cast<unsigned long long>(anchors[static_cast<size_t>(GpuFloorAnchor::Report)]),
         static_cast<unsigned long long>(anchors[static_cast<size_t>(GpuFloorAnchor::PresentEnd)]),
-        median_ahead, max_ahead, lead.RecentGpuPeriodUs() / 1000.0, lead.GpuPeriodUs() / 1000.0);
+        lead.ReadyGapCount(), median_ahead, max_ahead, lead.RecentGpuPeriodUs() / 1000.0, lead.GpuPeriodUs() / 1000.0);
 }
 
 // A_n = max(w_{n−1} + d, G_n): the newest released frame's render handoff

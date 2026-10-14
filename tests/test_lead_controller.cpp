@@ -2613,12 +2613,15 @@ void TestRenderHandoffGpuFloor()
 
 // Developer A/B gpu_paced_cadence: the readiness anchor. A frame newer than
 // the newest report whose GPU readiness and output outcome are known sets
-// Ĝ(n − 1) = its readiness (the hold's release when the GPU waited) + the
-// median readiness → GPU end gap of frames not held + P per frame, in place
-// of the report's extrapolation; a PRESENT_END bound then counts only from a
-// newer frame. Off without the switch, before 32 gaps, for an older frame or
-// another producer epoch. The rhythm's period is the mean of the newest five
-// GPU periods of frames the GPU did not wait for; the floor keeps the median.
+// Ĝ(n − 1) = its anchor (its readiness, or for a queued GPU wait the later of
+// readiness and release) + the median anchor → GPU end gap + P per frame, in
+// place of the report's extrapolation; a PRESENT_END bound then counts only
+// from a newer frame. Gaps come from every frame: the GPU waits report a
+// queued wait as held even when the GPU reached it after the release, as
+// nearly every GPU-paced frame does. Off without the switch, before 32 gaps,
+// for an older frame or another producer epoch. The rhythm's period is the
+// mean of the newest five GPU periods of frames the GPU did not wait for;
+// the floor keeps the median.
 void TestGpuFloorReadyAnchor()
 {
     constexpr uint32_t kEpoch = 7;
@@ -2655,14 +2658,16 @@ void TestGpuFloorReadyAnchor()
         event.status = kind == Kind::OutputRelease ? status : PacingPlanStatus::Unknown;
         return event;
     };
-    // A frame released, ready kReadyGap before its GPU end (+ late_us), not
-    // held, and its report (when report is true).
+    // A frame released, ready kReadyGap before its GPU end (+ late_us), its
+    // queued GPU wait released 1 ms before the GPU reached it (reported held,
+    // as the GPU waits do), and its report (when report is true).
     const auto frame = [&](LeadController* controller, uint64_t frame_id, double late_us, bool report) {
         const uint64_t grid_index = frame_id - 2900;
         controller->OnSourceRelease(start_of(frame_id, grid_index));
         const double ready_us = gpu_end_us(frame_id) - kReadyGap + late_us;
         controller->OnStageEvent(event_of(frame_id, grid_index, Kind::GpuReady, ready_us));
-        controller->OnStageEvent(event_of(frame_id, grid_index, Kind::OutputRelease, ready_us));
+        controller->OnStageEvent(event_of(frame_id, grid_index, Kind::OutputRelease, ready_us - 1000.0,
+            PacingPlanStatus::Held));
         if (report) {
             controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us(frame_id) + late_us - kGpuPeriod + 250.0),
                 Qpc(gpu_end_us(frame_id) + late_us), 14000.0);
@@ -2687,7 +2692,7 @@ void TestGpuFloorReadyAnchor()
     frame(controller.get(), 3031, 400.0, false);
     const int64_t reported = Qpc(gpu_end_us(3030) + 2.0 * 17010.0 - 14345.0);
     CHECK(controller->GpuFloor(key_of(3033), 0, 0, true).floor_qpc == reported);
-    // 32 gaps of frames not held, then a newer frame ready 400 µs late.
+    // 32 gaps, then a newer frame ready 400 µs late.
     controller->OnGpuRenderEnd(kEpoch, 3031, Qpc(gpu_end_us(3031) + 400.0 - kGpuPeriod + 250.0),
         Qpc(gpu_end_us(3031) + 400.0), 14000.0);
     for (uint64_t frame_id = 3032; frame_id <= 3040; ++frame_id) frame(controller.get(), frame_id, 0.0, true);
