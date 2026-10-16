@@ -2736,6 +2736,184 @@ void TestGpuFloorReadyAnchor()
     CHECK_NEAR(cold->GpuPeriodUs(), 0.0);
 }
 
+// Developer A/B gpu_paced_hold_margin: the GPU need window. D = readiness of
+// frame n − the anchor of frame n − 1 (its readiness, or for a held frame the
+// later of readiness and release), for consecutive frames of one producer
+// epoch only, 0 < D <= 3 I; the newest 128 values, one FG divisor slot at a
+// time; the lower-index quantile sorted[floor(q (n − 1))] from 32 values.
+void TestGpuNeedWindow()
+{
+    constexpr double kFrameInterval = 17000.0;
+    uint64_t grid_index = 0;
+    // A frame of the FG input wait: released, GPU-ready at ready_us, output
+    // released at release_us with the given status.
+    const auto frame = [&](LeadController* controller, uint64_t frame_id, double ready_us, double release_us,
+        PacingPlanStatus status, double fg_divisor = 2.0, uint32_t epoch = 7) {
+        PacingPlanKey key{};
+        key.identity_domain = PacingIdentityDomain::NvApiFrame;
+        key.producer_epoch = epoch;
+        key.controller_generation = 1;
+        key.frame_id = frame_id;
+        ++grid_index;
+        LeadFrameStart start{};
+        start.key = key;
+        start.grid_index = grid_index;
+        start.rung = PacingRung::FgInputWait;
+        start.fg_divisor = fg_divisor;
+        start.interval_us = kFrameInterval;
+        start.source_release_qpc = Qpc(ready_us - 20000.0);
+        controller->OnSourceRelease(start);
+        PacingStageEvent ready{};
+        ready.key = key;
+        ready.grid_index = grid_index;
+        ready.kind = Kind::GpuReady;
+        ready.qpc = Qpc(ready_us);
+        controller->OnStageEvent(ready);
+        PacingStageEvent release = ready;
+        release.kind = Kind::OutputRelease;
+        release.qpc = Qpc(release_us);
+        release.status = status;
+        controller->OnStageEvent(release);
+    };
+    const auto lower_quantile = [](std::vector<double> values, double q) {
+        std::sort(values.begin(), values.end());
+        return values[static_cast<size_t>(std::floor(q * static_cast<double>(values.size() - 1)))];
+    };
+    constexpr PacingPlanStatus kNotHeld = PacingPlanStatus::Late;
+
+    // Consecutive frames: D = ready(n) − anchor(n − 1) (not held: its readiness).
+    // The first frame has no predecessor, 40 values follow in a shuffled order.
+    // Cold below 32, then the Q75 and Q90 of the spread.
+    auto controller = MakeController();
+    CHECK(controller->GpuNeedCount() == 0);
+    CHECK_NEAR(controller->GpuNeedQuantileUs(0.75), 0.0);
+    double ready_us = 1'000'000.0;
+    uint64_t frame_id = 5000;
+    frame(controller.get(), frame_id++, ready_us, ready_us, kNotHeld);
+    CHECK(controller->GpuNeedCount() == 0);
+    std::vector<double> needs;
+    for (int k = 0; k < 40; ++k) {
+        const double need_us = 10000.0 + 100.0 * static_cast<double>((k * 7) % 40);
+        needs.push_back(need_us);
+        ready_us += need_us;
+        frame(controller.get(), frame_id++, ready_us, ready_us, kNotHeld);
+        if (k == 0) {
+            // The window holds exactly D of the first pair.
+            CHECK(controller->GpuNeedCount() == 1);
+        }
+        if (k == 30) {
+            CHECK(controller->GpuNeedCount() == 31);
+            CHECK_NEAR(controller->GpuNeedQuantileUs(0.75), 0.0);
+            CHECK_NEAR(controller->GpuNeedQuantileUs(0.90), 0.0);
+        }
+        if (k == 31) {
+            CHECK(controller->GpuNeedCount() == 32);
+            CHECK_NEAR(controller->GpuNeedQuantileUs(0.75), lower_quantile(needs, 0.75));
+            CHECK_NEAR(controller->GpuNeedQuantileUs(0.90), lower_quantile(needs, 0.90));
+            CHECK_NEAR(controller->GpuNeedQuantileUs(0.0), lower_quantile(needs, 0.0));
+        }
+    }
+    // 40 values 10,000 … 13,900 in steps of 100: ranks floor(0.75 × 39) = 29 and floor(0.90 × 39) = 35.
+    CHECK(controller->GpuNeedCount() == 40);
+    CHECK_NEAR(controller->GpuNeedQuantileUs(0.75), 12900.0);
+    CHECK_NEAR(controller->GpuNeedQuantileUs(0.90), 13500.0);
+
+    // A frame gap adds nothing: frame n − 1 missing. The next consecutive frame does.
+    ready_us += 17000.0;
+    frame_id += 1;
+    frame(controller.get(), frame_id++, ready_us, ready_us, kNotHeld);
+    CHECK(controller->GpuNeedCount() == 40);
+    ready_us += 17000.0;
+    frame(controller.get(), frame_id++, ready_us, ready_us, kNotHeld);
+    CHECK(controller->GpuNeedCount() == 41);
+    // A frame older than the anchor adds nothing either.
+    frame(controller.get(), frame_id - 5, ready_us + 17000.0, ready_us + 17000.0, kNotHeld);
+    CHECK(controller->GpuNeedCount() == 41);
+
+    // A held previous frame is measured from its release (Signal), not its
+    // readiness: ready 17,000 apart, released 700 after readiness: D = 16,300.
+    auto held = MakeController();
+    ready_us = 2'000'000.0;
+    frame_id = 6000;
+    frame(held.get(), frame_id++, ready_us, ready_us + 700.0, PacingPlanStatus::Held);
+    for (int k = 0; k < 33; ++k) {
+        ready_us += 17000.0;
+        frame(held.get(), frame_id++, ready_us, ready_us + 700.0, PacingPlanStatus::Held);
+    }
+    CHECK(held->GpuNeedCount() == 33);
+    CHECK_NEAR(held->GpuNeedQuantileUs(0.75), 16300.0);
+    CHECK_NEAR(held->GpuNeedQuantileUs(0.90), 16300.0);
+
+    // Values beyond the long-sample limit (3 I) are dropped, 3 I itself and
+    // anything not positive (a release after the next frame's readiness) too.
+    const uint32_t kept = held->GpuNeedCount();
+    ready_us += 3.0 * kFrameInterval + 800.0;
+    frame(held.get(), frame_id++, ready_us, ready_us - 900.0, kNotHeld);
+    CHECK(held->GpuNeedCount() == kept); // D = 51,800 − 700 = 51,100 > 3 I
+    ready_us += 3.0 * kFrameInterval;
+    frame(held.get(), frame_id++, ready_us, ready_us, kNotHeld);
+    CHECK(held->GpuNeedCount() == kept + 1); // exactly 3 I
+    ready_us += 17000.0;
+    frame(held.get(), frame_id++, ready_us, ready_us + 30000.0, PacingPlanStatus::Held);
+    CHECK(held->GpuNeedCount() == kept + 2);
+    ready_us += 17000.0; // the previous release is 30,000 after its readiness: D = −13,000
+    frame(held.get(), frame_id++, ready_us, ready_us, kNotHeld);
+    CHECK(held->GpuNeedCount() == kept + 2);
+
+    // A producer epoch change restarts the window: the first frame of the new
+    // epoch has no predecessor in it.
+    CHECK(controller->GpuNeedCount() == 41);
+    ready_us += 17000.0;
+    frame(controller.get(), 100, ready_us, ready_us, kNotHeld, 2.0, 8);
+    CHECK(controller->GpuNeedCount() == 0);
+    CHECK_NEAR(controller->GpuNeedQuantileUs(0.75), 0.0);
+    ready_us += 15000.0;
+    frame(controller.get(), 101, ready_us, ready_us, kNotHeld, 2.0, 8);
+    CHECK(controller->GpuNeedCount() == 1);
+
+    // A different FG divisor slot restarts it: the new frame's D opens the
+    // window of its own slot.
+    auto divisors = MakeController();
+    ready_us = 3'000'000.0;
+    frame_id = 7000;
+    frame(divisors.get(), frame_id++, ready_us, ready_us, kNotHeld);
+    for (int k = 0; k < 40; ++k) {
+        ready_us += 17000.0;
+        frame(divisors.get(), frame_id++, ready_us, ready_us, kNotHeld);
+    }
+    CHECK(divisors->GpuNeedCount() == 40);
+    CHECK_NEAR(divisors->GpuNeedQuantileUs(0.75), 17000.0);
+    ready_us += 12000.0;
+    frame(divisors.get(), frame_id++, ready_us, ready_us, kNotHeld, 3.0);
+    CHECK(divisors->GpuNeedCount() == 1);
+    CHECK_NEAR(divisors->GpuNeedQuantileUs(0.75), 0.0);
+    for (int k = 0; k < 32; ++k) {
+        ready_us += 12000.0;
+        frame(divisors.get(), frame_id++, ready_us, ready_us, kNotHeld, 3.0);
+    }
+    CHECK(divisors->GpuNeedCount() == 33);
+    CHECK_NEAR(divisors->GpuNeedQuantileUs(0.75), 12000.0);
+
+    // Only the newest 128 values count: 128 of 12,000 after the 17,000 ones.
+    for (int k = 0; k < 40; ++k) {
+        ready_us += 17000.0;
+        frame(divisors.get(), frame_id++, ready_us, ready_us, kNotHeld, 3.0);
+    }
+    for (int k = 0; k < 128; ++k) {
+        ready_us += 12000.0;
+        frame(divisors.get(), frame_id++, ready_us, ready_us, kNotHeld, 3.0);
+    }
+    CHECK(divisors->GpuNeedCount() == 128);
+    CHECK_NEAR(divisors->GpuNeedQuantileUs(0.90), 12000.0);
+
+    // Clears with the readiness gaps: a bucket reset and a full reset.
+    divisors->ResetBuckets();
+    CHECK(divisors->GpuNeedCount() == 0);
+    CHECK_NEAR(divisors->GpuNeedQuantileUs(0.75), 0.0);
+    controller->Reset(kFrequency);
+    CHECK(controller->GpuNeedCount() == 0);
+}
+
 int main()
 {
     std::printf("sizeof(LeadController) = %zu bytes\n", sizeof(LeadController));
@@ -2794,6 +2972,7 @@ int main()
     TestHandoffStreams();
     TestRenderHandoffGpuFloor();
     TestGpuFloorReadyAnchor();
+    TestGpuNeedWindow();
 
     if (s_failures != 0) {
         std::fprintf(stderr, "%d lead controller checks failed\n", s_failures);

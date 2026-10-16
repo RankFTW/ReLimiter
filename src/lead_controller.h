@@ -65,6 +65,9 @@ constexpr size_t LEAD_GPU_PACED_CAPACITY = 128;
 // Reflex GPU end.
 constexpr size_t LEAD_GPU_PERIOD_RECENT = 5;
 constexpr size_t LEAD_GPU_READY_GAP_CAPACITY = 64;
+// GPU-paced hold margin (developer A/B gpu_paced_hold_margin): the newest
+// LEAD_GPU_NEED_CAPACITY per-frame GPU needs D (GpuNeedQuantileUs).
+constexpr size_t LEAD_GPU_NEED_CAPACITY = 128;
 constexpr double LEAD_PRESENT_PLACEMENT_US = 150.0;
 constexpr double LEAD_SEED_MIN_US = 1000.0;
 constexpr double LEAD_SEED_MAX_US = 8000.0;
@@ -315,6 +318,17 @@ constexpr CollisionDistanceLimits LEAD_HEADROOM_LIMITS{ 1000.0, 750.0, 3000.0 };
 // anchor: the GPU waits report a queued wait as held whether or not the GPU
 // reached it first (Gears, FG 2× GPU-paced: 97.5% reached it after the
 // release), so gaps of frames not held alone never warmed the window.
+//
+// GPU need (developer A/B gpu_paced_hold_margin): the GPU time D from the
+// release of frame n − 1's output (its anchor above) to frame n's GPU
+// readiness, taken when frame n's anchor replaces n − 1's. It is frame
+// generation and Present of n − 1 plus frame n's render, with the game's own
+// submission waits but without ReLimiter's own holds (the anchor of a held
+// frame is its release): a period that included the holds would feed the
+// hold margin's interval back into itself. Only consecutive frames of one
+// producer epoch count, D above LEAD_LONG_SAMPLE_INTERVALS intervals is
+// dropped, the newest LEAD_GPU_NEED_CAPACITY values form the window and a
+// different FG divisor slot restarts it.
 //
 // Report pairs (frame n's Reflex report and n − 1's, driver clock): a pair
 // whose first work reached the driver in the first half of the render
@@ -683,6 +697,10 @@ public:
     // (0 until that many): the GPU-paced rhythm's period (source_stage.h).
     double GpuPeriodUs() const noexcept;
     double RecentGpuPeriodUs() const noexcept;
+    // GPU need window (above): the lower-index quantile sorted[floor(q (n − 1))]
+    // of the newest D, 0 until LEAD_WARM_SAMPLES of them.
+    double GpuNeedQuantileUs(double q) const noexcept;
+    uint32_t GpuNeedCount() const noexcept { return gpu_need_.count; }
     // Anchor → GPU end gaps in the readiness anchor's window (above).
     uint32_t ReadyGapCount() const noexcept { return ready_gap_count_; }
     // The stream proof is complete (above).
@@ -820,6 +838,7 @@ private:
     static int64_t ReadyAnchorQpc(const PendingFrame& frame) noexcept;
     void NoteReadyAnchor(const PendingFrame& frame) noexcept;
     void RecordReadyGap(uint32_t producer_epoch, uint64_t frame_id, int64_t gpu_end_qpc) noexcept;
+    void RecordGpuNeed(const PendingFrame& frame) noexcept;
     // Copies the newest `count` u − o observations (count <= resume_delay_count_).
     void NewestResumeDelays(size_t count, double* delays_us) const noexcept;
     double MedianResumeDelayUs() const noexcept;
@@ -909,6 +928,14 @@ private:
     std::array<float, LEAD_GPU_READY_GAP_CAPACITY> ready_gaps_us_{};
     uint32_t ready_gap_head_ = 0;
     uint32_t ready_gap_count_ = 0;
+    // GPU need window (above); divisor = the frames' FG divisor slot.
+    struct GpuNeedWindow {
+        std::array<float, LEAD_GPU_NEED_CAPACITY> us{};
+        uint32_t head = 0;
+        uint32_t count = 0;
+        size_t divisor = 0;
+    };
+    GpuNeedWindow gpu_need_{};
     // GPU-paced cadence: X of frames the GPU floor released (EarlyLeadUs),
     // [0] GPU waits, [1] CPU outputs; divisor = the bucket's FG divisor slot.
     struct GpuPacedRing {

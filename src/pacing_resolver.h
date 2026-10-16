@@ -121,6 +121,11 @@ struct PacingPipelineConfig {
     // plus the early side of its lead, so the cadence follows the GPU instead
     // of holding the frame (cadence_grid.h, source_stage.h).
     bool gpu_paced_cadence = false;
+    // Key gpu_paced_hold_margin (default off; developer A/B, needs
+    // gpu_paced_cadence): the VRR cadence of GPU-paced held frames runs at
+    // the 75th or 90th percentile of the GPU's recent per-frame need
+    // (scheduler.cpp GpuPacedHoldIntervalUs), never below the cap's interval.
+    PacingHoldMargin gpu_paced_hold_margin = PacingHoldMargin::Off;
     double stall_inject_ms = 0.0; // 0 = off; [0, kPacingStallInjectMaxMs]
     double stall_inject_period_s = kPacingStallInjectDefaultPeriodS; // [1, 60]
 };
@@ -261,6 +266,8 @@ const char* PacingRenderQueue_Text(PacingRenderQueue render_queue) noexcept;
 bool PacingRenderQueue_FromText(const char* text, PacingRenderQueue* render_queue) noexcept;
 const char* PacingLeadCoverage_Text(PacingLeadCoverage coverage) noexcept;
 bool PacingLeadCoverage_FromText(const char* text, PacingLeadCoverage* coverage) noexcept;
+const char* PacingHoldMargin_Text(PacingHoldMargin margin) noexcept;
+bool PacingHoldMargin_FromText(const char* text, PacingHoldMargin* margin) noexcept;
 const char* PacingPlacementOverride_Text(PacingPlacementOverride placement) noexcept;
 bool PacingPlacementOverride_FromText(const char* text, PacingPlacementOverride* placement) noexcept;
 

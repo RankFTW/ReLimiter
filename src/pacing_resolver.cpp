@@ -327,6 +327,7 @@ namespace
         std::atomic<PacingLeadCoverage> lead_coverage{ kDefaultConfig.lead_coverage };
         std::atomic<bool> fg_late_spacing{ kDefaultConfig.fg_late_spacing };
         std::atomic<bool> gpu_paced_cadence{ kDefaultConfig.gpu_paced_cadence };
+        std::atomic<PacingHoldMargin> gpu_paced_hold_margin{ kDefaultConfig.gpu_paced_hold_margin };
         std::atomic<double> stall_inject_ms{ kDefaultConfig.stall_inject_ms };
         std::atomic<double> stall_inject_period_s{ kDefaultConfig.stall_inject_period_s };
     };
@@ -349,6 +350,8 @@ namespace
         config.lead_coverage = s_config.lead_coverage.load(std::memory_order_relaxed);
         config.fg_late_spacing = s_config.fg_late_spacing.load(std::memory_order_relaxed);
         config.gpu_paced_cadence = s_config.gpu_paced_cadence.load(std::memory_order_relaxed);
+        config.gpu_paced_hold_margin =
+            s_config.gpu_paced_hold_margin.load(std::memory_order_relaxed);
         config.stall_inject_ms = s_config.stall_inject_ms.load(std::memory_order_relaxed);
         config.stall_inject_period_s =
             s_config.stall_inject_period_s.load(std::memory_order_relaxed);
@@ -501,6 +504,10 @@ PacingPipelineConfig PacingPipeline_ClampConfig(PacingPipelineConfig config) noe
         static_cast<uint32_t>(PacingLeadCoverage::Count)) {
         config.lead_coverage = kDefaultConfig.lead_coverage;
     }
+    if (static_cast<uint32_t>(config.gpu_paced_hold_margin) >=
+        static_cast<uint32_t>(PacingHoldMargin::Count)) {
+        config.gpu_paced_hold_margin = kDefaultConfig.gpu_paced_hold_margin;
+    }
     config.adaptive_cap_percentile = PacingPipeline_AdaptiveCapFitTier(config.adaptive_cap_percentile);
     config.stall_inject_ms = ClampFinite(config.stall_inject_ms,
         kDefaultConfig.stall_inject_ms, 0.0, kPacingStallInjectMaxMs);
@@ -544,6 +551,7 @@ void PacingPipeline_SetConfig(const PacingPipelineConfig& config) noexcept
     s_config.lead_coverage.store(safe_config.lead_coverage, std::memory_order_relaxed);
     s_config.fg_late_spacing.store(safe_config.fg_late_spacing, std::memory_order_relaxed);
     s_config.gpu_paced_cadence.store(safe_config.gpu_paced_cadence, std::memory_order_relaxed);
+    s_config.gpu_paced_hold_margin.store(safe_config.gpu_paced_hold_margin, std::memory_order_relaxed);
     s_config.stall_inject_ms.store(safe_config.stall_inject_ms, std::memory_order_relaxed);
     s_config.stall_inject_period_s.store(
         safe_config.stall_inject_period_s, std::memory_order_relaxed);
@@ -678,6 +686,21 @@ const char* PacingLeadCoverage_Text(PacingLeadCoverage coverage) noexcept
 bool PacingLeadCoverage_FromText(const char* text, PacingLeadCoverage* coverage) noexcept
 {
     return EnumFromText(text, coverage, PacingLeadCoverage_Text);
+}
+
+const char* PacingHoldMargin_Text(PacingHoldMargin margin) noexcept
+{
+    switch (margin) {
+        case PacingHoldMargin::Off: return "off";
+        case PacingHoldMargin::Q75: return "75";
+        case PacingHoldMargin::Q90: return "90";
+        default: return "unknown";
+    }
+}
+
+bool PacingHoldMargin_FromText(const char* text, PacingHoldMargin* margin) noexcept
+{
+    return EnumFromText(text, margin, PacingHoldMargin_Text);
 }
 
 const char* PacingPlacementOverride_Text(PacingPlacementOverride placement) noexcept

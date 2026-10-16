@@ -253,6 +253,19 @@ static void DrawPacingPipelineStatus() {
             status.rhythm_smooth, status.rhythm_late, status.rhythm_early_bound, status.rhythm_start,
             status.floor_from_ready, status.floor_frames);
     }
+    // Developer A/B gpu_paced_hold_margin: the key is on.
+    if (has_status && status.gpu_paced_hold_margin != 0) {
+        const char* margin = PacingHoldMargin_Text(static_cast<PacingHoldMargin>(status.gpu_paced_hold_margin));
+        if (status.gpu_paced_hold_interval_us > 0.0 && status.gpu_paced_hold_cap_us > 0.0) {
+            ImGui::TextDisabled("GPU-paced hold margin Q%s: interval %.2f ms (+%.1f%% over the cap) | "
+                "GPU need %.2f ms from %u frames", margin, status.gpu_paced_hold_interval_us / 1000.0,
+                (status.gpu_paced_hold_interval_us / status.gpu_paced_hold_cap_us - 1.0) * 100.0,
+                status.gpu_paced_hold_need_us / 1000.0, status.gpu_paced_hold_frames);
+        } else {
+            ImGui::TextDisabled("GPU-paced hold margin Q%s: not applied | GPU need from %u frames",
+                margin, status.gpu_paced_hold_frames);
+        }
+    }
     if (has_status && status.valid)
         ImGui::TextDisabled("Lead: %.2f ms (%s, %u samples%s) | Grid epoch: %u",
             status.lead_us / 1000.0, status.lead_warm ? "warm" : "warming",
@@ -649,6 +662,20 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "cadence continues from there instead of holding the frame to the cap's cadence, which would leave "
         "the GPU idle. Frames the GPU finishes early are still held to the cap. Watch long frames, jitter, "
         "GPU idle gaps and PC Latency; one setting per capture.");
+
+    static const char* const kHoldMarginLabels[] = {"Off", "75%", "90%"};
+    static_assert(IM_ARRAYSIZE(kHoldMarginLabels) == static_cast<int>(PacingHoldMargin::Count));
+    int hold_margin = static_cast<int>(g_config.gpu_paced_hold_margin);
+    if (ImGui::Combo("GPU-paced hold margin", &hold_margin, kHoldMarginLabels, IM_ARRAYSIZE(kHoldMarginLabels))) {
+        g_config.gpu_paced_hold_margin = static_cast<PacingHoldMargin>(hold_margin);
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: GPU-paced hold margin -> %s", PacingHoldMargin_Text(g_config.gpu_paced_hold_margin));
+        *config_dirty = true;
+    }
+    HelpTip("Diagnostic A/B, needs GPU-paced cadence. When the GPU is the limit, frames are held to a cadence "
+        "slightly slower than the GPU's recent frame times, so the GPU's own frame-time spikes are absorbed. "
+        "It costs a few percent of frame rate and about a millisecond of latency (more at 90% than at 75%). "
+        "Compare one setting per capture.");
 
     static const char* const kSourcePlacementLabels[] = {"Marker", "Pre-Sleep", "Reflex driver limiter"};
     static_assert(IM_ARRAYSIZE(kSourcePlacementLabels) ==

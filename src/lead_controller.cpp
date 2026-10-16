@@ -248,6 +248,7 @@ void LeadController::Reset(int64_t qpc_frequency) noexcept
     ready_gaps_us_ = {};
     ready_gap_head_ = 0;
     ready_gap_count_ = 0;
+    gpu_need_ = {};
     gpu_paced_rings_ = {};
     lifecycle_known_ = false;
     lifecycle_ = PacingPlanKey{};
@@ -275,6 +276,7 @@ void LeadController::ResetBuckets() noexcept
     ready_gaps_us_ = {};
     ready_gap_head_ = 0;
     ready_gap_count_ = 0;
+    gpu_need_ = {};
     gpu_paced_rings_ = {};
     for (PendingFrame& frame : pending_) {
         if (frame.occupied && frame.started) frame.finalized = true;
@@ -841,10 +843,37 @@ void LeadController::NoteReadyAnchor(const PendingFrame& frame) noexcept
         ready_epoch_ = frame.key.producer_epoch;
         ready_frame_ = 0;
         ready_qpc_ = 0;
+        gpu_need_ = {};
     }
     if (frame.key.frame_id <= ready_frame_) return;
+    RecordGpuNeed(frame);
     ready_frame_ = frame.key.frame_id;
     ready_qpc_ = ReadyAnchorQpc(frame);
+}
+
+// D = frame's readiness − the previous frame's anchor (lead_controller.h),
+// before the frame's anchor replaces it.
+void LeadController::RecordGpuNeed(const PendingFrame& frame) noexcept
+{
+    if (ready_frame_ == 0 || frame.key.frame_id != ready_frame_ + 1) return;
+    const double need_us = MicrosecondsBetween(ready_qpc_, frame.qpc[FieldGpuReady]);
+    if (!(need_us > 0.0) || !(need_us <= LEAD_LONG_SAMPLE_INTERVALS * frame.interval_us)) return;
+    const size_t divisor = frame.bucket % LEAD_DIVISOR_BUCKETS;
+    if (gpu_need_.count > 0 && gpu_need_.divisor != divisor) gpu_need_ = {};
+    gpu_need_.divisor = divisor;
+    gpu_need_.us[gpu_need_.head] = static_cast<float>(need_us);
+    gpu_need_.head = (gpu_need_.head + 1) % static_cast<uint32_t>(LEAD_GPU_NEED_CAPACITY);
+    if (gpu_need_.count < LEAD_GPU_NEED_CAPACITY) ++gpu_need_.count;
+}
+
+double LeadController::GpuNeedQuantileUs(double q) const noexcept
+{
+    if (gpu_need_.count < LEAD_WARM_SAMPLES) return 0.0;
+    std::array<float, LEAD_GPU_NEED_CAPACITY> sorted = gpu_need_.us;
+    const auto rank = static_cast<std::ptrdiff_t>(
+        std::floor(std::clamp(q, 0.0, 1.0) * static_cast<double>(gpu_need_.count - 1)));
+    std::nth_element(sorted.begin(), sorted.begin() + rank, sorted.begin() + gpu_need_.count);
+    return static_cast<double>(sorted[static_cast<size_t>(rank)]);
 }
 
 // The gap of NvAPI frame (producer_epoch, frame_id): its report's GPU end

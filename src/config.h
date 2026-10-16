@@ -92,6 +92,7 @@ struct Config {
     PacingLeadCoverage lead_coverage = PacingLeadCoverage::Q99; // developer A/B: 95 | 99 (default; share of frames the lead covers)
     bool fg_late_spacing = true; // developer A/B: on (default) | off; FG input wait floors the next real frame on a late frame's readiness
     bool gpu_paced_cadence = false; // developer A/B: off (default) | on; frames whose release the GPU floor sets keep the GPU's pace (held frames get the floor too)
+    PacingHoldMargin gpu_paced_hold_margin = PacingHoldMargin::Off; // developer A/B: off (default) | 75 | 90; with gpu_paced_cadence the VRR cadence runs at that quantile of the GPU's recent frame need (64-bit)
     bool bypass_low_latency_off = false; // developer A/B: off (default) | on; the driver's low latency mode is turned off while the Reflex Sleep is bypassed (64-bit)
     PacingPlacementOverride source_placement = PacingPlacementOverride::PreSleep; // developer: marker | pre_sleep | driver (pre_sleep is the default)
 

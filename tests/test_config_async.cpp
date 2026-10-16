@@ -306,6 +306,7 @@ void CheckPipelineMatchesConfig() {
     CHECK(pipeline.lead_coverage == g_config.lead_coverage);
     CHECK(pipeline.fg_late_spacing == g_config.fg_late_spacing);
     CHECK(pipeline.gpu_paced_cadence == g_config.gpu_paced_cadence);
+    CHECK(pipeline.gpu_paced_hold_margin == g_config.gpu_paced_hold_margin);
     CHECK(g_marker_forward_after_wait.load() ==
         (g_config.marker_forward_order == PacingMarkerForwardOrder::AfterWait));
 }
@@ -324,6 +325,7 @@ void TestPacingPipelineDefaults() {
     CHECK(g_config.lead_coverage == PacingLeadCoverage::Q99);
     CHECK(g_config.fg_late_spacing);
     CHECK(!g_config.gpu_paced_cadence);
+    CHECK(g_config.gpu_paced_hold_margin == PacingHoldMargin::Off);
     CHECK(!g_config.bypass_low_latency_off && !g_bypass_low_latency_off.load());
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
     CheckPipelineMatchesConfig();
@@ -333,6 +335,7 @@ void TestPacingPipelineDefaults() {
     CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "99");
     CHECK(Value(local_path, "FrameLimiter", "fg_late_spacing") == "true");
     CHECK(Value(local_path, "FrameLimiter", "gpu_paced_cadence") == "false");
+    CHECK(Value(local_path, "FrameLimiter", "gpu_paced_hold_margin") == "off");
     CHECK(Value(local_path, "FrameLimiter", "bypass_low_latency_off") == "false");
     CHECK(Value(local_path, "FrameLimiter", "source_placement") == "pre_sleep");
     CHECK(Value(local_path, "FrameLimiter", "reflex_sleep_bypass") == "true");
@@ -577,6 +580,42 @@ void TestGpuPacedCadenceKey() {
     Config_ResetDeveloperSettings();
     CHECK(!g_config.gpu_paced_cadence && !PacingPipeline_GetConfig().gpu_paced_cadence);
     ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// Developer A/B gpu_paced_hold_margin: 75 and 90 load, reach the pipeline
+// (the scheduler's configuration), are saved as text and count as a developer
+// override; other text loads as off; out-of-range values validate to off; a
+// reset returns to off.
+void TestGpuPacedHoldMarginKey() {
+    struct Case { const char* text; PacingHoldMargin expected; const char* saved; };
+    for (const Case& test : {Case{"75", PacingHoldMargin::Q75, "75"},
+            Case{"90", PacingHoldMargin::Q90, "90"},
+            Case{"off", PacingHoldMargin::Off, "off"},
+            Case{"95", PacingHoldMargin::Off, "off"},
+            Case{"true", PacingHoldMargin::Off, "off"},
+            Case{"", PacingHoldMargin::Off, "off"}}) {
+        Reset(false, false, {{"config_version", "4"}, {"gpu_paced_hold_margin", test.text}});
+        CHECK(g_config.gpu_paced_hold_margin == test.expected);
+        CheckPipelineMatchesConfig();
+        CHECK(PacingPipeline_GetConfig().gpu_paced_hold_margin == test.expected);
+        CHECK(Value(local_path, "FrameLimiter", "gpu_paced_hold_margin") == test.saved);
+        CHECK(Config_DeveloperOverrides() == (test.expected == PacingHoldMargin::Off ? 0 : 1));
+        Config_ResetDeveloperSettings();
+        CHECK(g_config.gpu_paced_hold_margin == PacingHoldMargin::Off);
+        CHECK(PacingPipeline_GetConfig().gpu_paced_hold_margin == PacingHoldMargin::Off);
+        ReleaseStart();CHECK(OwnerShutdown());
+    }
+    Reset();
+    g_config.gpu_paced_hold_margin = static_cast<PacingHoldMargin>(7);
+    ValidateConfig();
+    CHECK(g_config.gpu_paced_hold_margin == PacingHoldMargin::Off);
+    g_config.gpu_paced_hold_margin = PacingHoldMargin::Q90;
+    Config_ApplyPacingPipeline();
+    CHECK(PacingPipeline_GetConfig().gpu_paced_hold_margin == PacingHoldMargin::Q90);
+    RequestSaveConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+    CheckWorkerWrites();
+    CHECK(Value(local_path, "FrameLimiter", "gpu_paced_hold_margin") == "90");
 }
 
 // Developer A/B bypass_low_latency_off: true loads, reaches the NvAPI hooks'
@@ -973,6 +1012,7 @@ int main() {
     TestLeadCoverageKey();
     TestFgLateSpacingKey();
     TestGpuPacedCadenceKey();
+    TestGpuPacedHoldMarginKey();
     TestBypassLowLatencyOffKey();
     TestSourcePlacementParsing();
     TestPacingMethodMigration();

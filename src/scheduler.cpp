@@ -257,6 +257,11 @@ std::atomic<bool> s_status_gpu_paced_cadence{false};
 std::atomic<uint32_t> s_status_gpu_paced_recent{0};
 std::atomic<uint32_t> s_status_gpu_paced_frames{0};
 std::atomic<uint32_t> s_status_gpu_paced_moves{0};
+std::atomic<uint8_t> s_status_gpu_paced_hold_margin{0};
+std::atomic<double> s_status_gpu_paced_hold_interval_us{0.0};
+std::atomic<double> s_status_gpu_paced_hold_cap_us{0.0};
+std::atomic<double> s_status_gpu_paced_hold_need_us{0.0};
+std::atomic<uint32_t> s_status_gpu_paced_hold_frames{0};
 std::atomic<uint32_t> s_status_rhythm_start{0};
 std::atomic<uint32_t> s_status_rhythm_late{0};
 std::atomic<uint32_t> s_status_rhythm_smooth{0};
@@ -326,6 +331,11 @@ static void PublishPacingStatus(const SchedulerPacingStatus& status) noexcept
     s_status_gpu_paced_recent.store(status.gpu_paced_recent, std::memory_order_relaxed);
     s_status_gpu_paced_frames.store(status.gpu_paced_frames, std::memory_order_relaxed);
     s_status_gpu_paced_moves.store(status.gpu_paced_moves, std::memory_order_relaxed);
+    s_status_gpu_paced_hold_margin.store(status.gpu_paced_hold_margin, std::memory_order_relaxed);
+    s_status_gpu_paced_hold_interval_us.store(status.gpu_paced_hold_interval_us, std::memory_order_relaxed);
+    s_status_gpu_paced_hold_cap_us.store(status.gpu_paced_hold_cap_us, std::memory_order_relaxed);
+    s_status_gpu_paced_hold_need_us.store(status.gpu_paced_hold_need_us, std::memory_order_relaxed);
+    s_status_gpu_paced_hold_frames.store(status.gpu_paced_hold_frames, std::memory_order_relaxed);
     s_status_rhythm_start.store(status.rhythm_start, std::memory_order_relaxed);
     s_status_rhythm_late.store(status.rhythm_late, std::memory_order_relaxed);
     s_status_rhythm_smooth.store(status.rhythm_smooth, std::memory_order_relaxed);
@@ -402,6 +412,11 @@ bool Scheduler_ReadPacingStatus(SchedulerPacingStatus* status) noexcept
         copy.gpu_paced_recent = s_status_gpu_paced_recent.load(std::memory_order_relaxed);
         copy.gpu_paced_frames = s_status_gpu_paced_frames.load(std::memory_order_relaxed);
         copy.gpu_paced_moves = s_status_gpu_paced_moves.load(std::memory_order_relaxed);
+        copy.gpu_paced_hold_margin = s_status_gpu_paced_hold_margin.load(std::memory_order_relaxed);
+        copy.gpu_paced_hold_interval_us = s_status_gpu_paced_hold_interval_us.load(std::memory_order_relaxed);
+        copy.gpu_paced_hold_cap_us = s_status_gpu_paced_hold_cap_us.load(std::memory_order_relaxed);
+        copy.gpu_paced_hold_need_us = s_status_gpu_paced_hold_need_us.load(std::memory_order_relaxed);
+        copy.gpu_paced_hold_frames = s_status_gpu_paced_hold_frames.load(std::memory_order_relaxed);
         copy.rhythm_start = s_status_rhythm_start.load(std::memory_order_relaxed);
         copy.rhythm_late = s_status_rhythm_late.load(std::memory_order_relaxed);
         copy.rhythm_smooth = s_status_rhythm_smooth.load(std::memory_order_relaxed);
@@ -532,6 +547,15 @@ bool s_handoff_stall_logged = false;
 bool s_gpu_paced_held_floor = false;
 uint64_t s_gpu_paced_window[2] = {};
 uint32_t s_gpu_paced_window_count = 0;
+// Developer A/B gpu_paced_hold_margin (GpuPacedHoldIntervalUs): the realized
+// hold interval (0 = not applied; it then restarts from the cap), the cap
+// interval and the GPU need it was built from on the newest frame, and
+// whether OnMarker reached the function this frame (frames that do not, such
+// as passthrough, idle caps, fixed refresh and DMFG, clear the state).
+double s_gpu_paced_hold_us = 0.0;
+double s_gpu_paced_hold_cap_us = 0.0;
+double s_gpu_paced_hold_need_us = 0.0;
+bool s_gpu_paced_hold_ran = false;
 // For the Reflex Sleep hook (any thread): the newest released frame whose
 // handoff the next frame waits for (0 = the next frame is not limited), its
 // stream (identity domain << 24 | producer epoch), and hook waits that
@@ -613,6 +637,14 @@ static void TakeLeadResumes(uint32_t* waited, uint32_t* late) noexcept
     *late = TakeCounterDelta(lead.resume_late_samples, &s_gpu_wait_late_resumes_seen);
 }
 
+// The GPU-paced hold margin restarts from the cap interval.
+static void ClearGpuPacedHold() noexcept
+{
+    s_gpu_paced_hold_us = 0.0;
+    s_gpu_paced_hold_cap_us = 0.0;
+    s_gpu_paced_hold_need_us = 0.0;
+}
+
 // Starts a fresh period-governor and cadence-readout history. The
 // governor step belongs to one interval and one workload regime. Demand
 // reports and output evidence admitted before the reset describe the old
@@ -627,6 +659,7 @@ static void ResetAdaptationRegime(const char* reason) noexcept
     DiscardReflexFrameTimeSamples();
     Scheduler_ResetSmoothness();
     s_lfc.Reset();
+    ClearGpuPacedHold();
     LOG_INFO("Scheduler: period governor and cadence readout reset (%s)", reason);
 }
 
@@ -1040,6 +1073,11 @@ static void FillControllerStatus(SchedulerPacingStatus* status) noexcept
         std::min<uint64_t>(s_source_stage.Statistics().gpu_paced_frames, UINT32_MAX));
     status->gpu_paced_moves = static_cast<uint32_t>(
         std::min<uint64_t>(s_source_stage.Grid().Statistics().gpu_target_plans, UINT32_MAX));
+    status->gpu_paced_hold_margin = static_cast<uint8_t>(PacingPipeline_GetConfig().gpu_paced_hold_margin);
+    status->gpu_paced_hold_interval_us = s_gpu_paced_hold_us;
+    status->gpu_paced_hold_cap_us = s_gpu_paced_hold_cap_us;
+    status->gpu_paced_hold_need_us = s_gpu_paced_hold_need_us;
+    status->gpu_paced_hold_frames = s_source_stage.Lead().GpuNeedCount();
     const SourceStageStatistics stage_statistics = s_source_stage.Statistics();
     const auto clamp32 = [](uint64_t value) { return static_cast<uint32_t>(std::min<uint64_t>(value, UINT32_MAX)); };
     status->rhythm_start = clamp32(stage_statistics.gpu_paced_rhythm[static_cast<size_t>(GpuPacedRhythmStep::Start)]);
@@ -1502,6 +1540,52 @@ static bool GpuPacedHeldFloorApplies(const PlannedFrameInput& input, const Pacin
         !DriverSleepRuns(input.target_fps);
 }
 
+// Developer A/B gpu_paced_hold_margin: the quantile of the GPU's recent
+// per-frame need (LeadController::GpuNeedQuantileUs) the cadence runs at.
+static double HoldMarginQuantile(PacingHoldMargin margin) noexcept
+{
+    switch (margin) {
+        case PacingHoldMargin::Q75: return 0.75;
+        case PacingHoldMargin::Q90: return 0.90;
+        default: return 0.0;
+    }
+}
+
+// Developer A/B gpu_paced_hold_margin: while the frame is GPU-paced and held
+// (GpuPacedHeldFloorApplies) on VRR, the grid interval is no shorter than a
+// quantile of the GPU's recent per-frame need, so the real frames the GPU
+// would otherwise release early are held and its frame-time variance is
+// absorbed. The realized interval slews toward max(interval, need) like the
+// Adaptive cap's (GOVERNOR_RISE_FRACTION up, GOVERNOR_FALL_SLEW_FRACTION down
+// per frame, of the cap interval); the cap interval is the lower bound. A
+// frame it does not apply to, or a cold window, clears the state: it restarts
+// from the cap. The need excludes ReLimiter's own holds (lead_controller.h):
+// one that included them would feed the interval back into itself.
+static double GpuPacedHoldIntervalUs(const PlannedFrameInput& input, const PacingPipelineSnapshot& pipeline,
+    const PacingPipelineConfig& config, double interval_us) noexcept
+{
+    s_gpu_paced_hold_ran = true;
+    const double quantile = HoldMarginQuantile(config.gpu_paced_hold_margin);
+    if (!(quantile > 0.0) || !(interval_us > 0.0) || pipeline.mode != PacingTimingMode::Vrr ||
+        !GpuPacedHeldFloorApplies(input, pipeline, config)) {
+        ClearGpuPacedHold();
+        return interval_us;
+    }
+    const double need_us = s_source_stage.Lead().GpuNeedQuantileUs(quantile);
+    if (!(need_us > 0.0)) {
+        ClearGpuPacedHold();
+        return interval_us;
+    }
+    if (!(s_gpu_paced_hold_us > 0.0)) s_gpu_paced_hold_us = interval_us;
+    const double target_us = (std::max)(interval_us, need_us);
+    s_gpu_paced_hold_us += std::clamp(target_us - s_gpu_paced_hold_us,
+        -GOVERNOR_FALL_SLEW_FRACTION * interval_us, GOVERNOR_RISE_FRACTION * interval_us);
+    s_gpu_paced_hold_us = (std::max)(interval_us, s_gpu_paced_hold_us);
+    s_gpu_paced_hold_cap_us = interval_us;
+    s_gpu_paced_hold_need_us = need_us;
+    return s_gpu_paced_hold_us;
+}
+
 // A handoff wait stalled: the render thread took no frame for three of its
 // frame times (at least 3 I), and the frame was released. Once the game has
 // shown its render thread taking a frame before the next release (a handoff
@@ -1575,7 +1659,7 @@ static int64_t GpuFloorQpc(const PacingPlanKey& key) noexcept
 
 // GPU-paced rhythm diagnostics: one INFO line every 5 s while the developer
 // A/B gpu_paced_cadence is on and the rhythm paced frames since the last one.
-static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
+static void LogGpuPacedRhythm(int64_t now_qpc, PacingHoldMargin hold_margin) noexcept
 {
     constexpr double kLogPeriodS = 5.0;
     if (s_rhythm_log_qpc != 0 &&
@@ -1624,9 +1708,21 @@ static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
         }
     }
     const LeadController& lead = s_source_stage.Lead();
+    // Hold margin (developer A/B gpu_paced_hold_margin), only while it is on.
+    char margin_text[160] = "";
+    if (hold_margin != PacingHoldMargin::Off) {
+        if (s_gpu_paced_hold_us > 0.0) {
+            std::snprintf(margin_text, sizeof(margin_text), "; hold margin Q%s interval %.2f ms (need %.2f ms, cap %.2f ms)",
+                PacingHoldMargin_Text(hold_margin), s_gpu_paced_hold_us / 1000.0,
+                s_gpu_paced_hold_need_us / 1000.0, s_gpu_paced_hold_cap_us / 1000.0);
+        } else {
+            std::snprintf(margin_text, sizeof(margin_text), "; hold margin Q%s not applied (GPU need from %u frames)",
+                PacingHoldMargin_Text(hold_margin), lead.GpuNeedCount());
+        }
+    }
     LOG_INFO("GPU-paced rhythm: %llu frames (smooth %llu, late %llu, early bound %llu, start %llu); floors %llu "
              "(readiness %llu, report %llu, PRESENT_END %llu); readiness anchor gaps %u, frames ahead p50 %zu max %zu; "
-             "period %.2f ms (median %.2f); late outputs followed %llu",
+             "period %.2f ms (median %.2f); late outputs followed %llu%s",
         static_cast<unsigned long long>(paced),
         static_cast<unsigned long long>(steps[static_cast<size_t>(GpuPacedRhythmStep::Smooth)]),
         static_cast<unsigned long long>(steps[static_cast<size_t>(GpuPacedRhythmStep::Late)]),
@@ -1637,7 +1733,7 @@ static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
         static_cast<unsigned long long>(anchors[static_cast<size_t>(GpuFloorAnchor::Report)]),
         static_cast<unsigned long long>(anchors[static_cast<size_t>(GpuFloorAnchor::PresentEnd)]),
         lead.ReadyGapCount(), median_ahead, max_ahead, lead.RecentGpuPeriodUs() / 1000.0, lead.GpuPeriodUs() / 1000.0,
-        static_cast<unsigned long long>(late_outputs));
+        static_cast<unsigned long long>(late_outputs), margin_text);
 }
 
 // A_n = max(w_{n−1} + d, G_n): the newest released frame's render handoff
@@ -1796,7 +1892,7 @@ static SourceStageFrame RunPlanned(
             PopCount64(s_gpu_paced_window[0]) + PopCount64(s_gpu_paced_window[1]));
     }
     PublishRenderHandoff(key, frame, handoff_limit, held_floor);
-    if (config.gpu_paced_cadence && frame.planned) LogGpuPacedRhythm(frame.release_qpc);
+    if (config.gpu_paced_cadence && frame.planned) LogGpuPacedRhythm(frame.release_qpc, config.gpu_paced_hold_margin);
     if (s_source_stage.StallInjector().TakeEnabledNotice()) {
         LOG_INFO("Stall injector enabled: %.1f ms every %.1f s",
                  config.stall_inject_ms, config.stall_inject_period_s);
@@ -2130,6 +2226,15 @@ void OnMarker(
             if (!retain_for_governor) DiscardReflexFrameTimeSamples();
         }
     } pending_feedback;
+    // The GPU-paced hold margin restarts from the cap on every frame that
+    // does not reach GpuPacedHoldIntervalUs (passthrough, idle caps, fixed
+    // refresh, DMFG, suspension).
+    struct GpuPacedHoldScope {
+        ~GpuPacedHoldScope() noexcept {
+            if (!s_gpu_paced_hold_ran) ClearGpuPacedHold();
+            s_gpu_paced_hold_ran = false;
+        }
+    } gpu_paced_hold;
     // The Reflex driver limiter is applied only while this frame
     // resolves to it; every other exit releases it (restores the game's
     // Sleep parameters once).
@@ -2389,6 +2494,7 @@ void OnMarker(
         GovernorLadder(input.base_interval_us, GovernorFixedRefresh{}, LfcQuantumUs(input.fg_divisor)),
         pipeline, config, input.fg_divisor);
     input.interval_us = ApplyLfc(GovernedIntervalUs(input.governor, input.base_interval_us), input.fg_divisor);
+    input.interval_us = GpuPacedHoldIntervalUs(input, pipeline, config, input.interval_us);
     input.period_identity_us = VrrPeriodIdentityUs(target_fps, fg_divisor_raw);
     // The governor consumed this frame's reports before the end-of-frame
     // poll; keep that poll's samples for the next frame.

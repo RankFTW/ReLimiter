@@ -215,6 +215,11 @@ void ValidateConfig() {
         LOG_WARN("Config: invalid lead_coverage, resetting to '99'");
         g_config.lead_coverage = PacingLeadCoverage::Q99;
     }
+    if (static_cast<unsigned>(g_config.gpu_paced_hold_margin) >=
+        static_cast<unsigned>(PacingHoldMargin::Count)) {
+        LOG_WARN("Config: invalid gpu_paced_hold_margin, resetting to 'off'");
+        g_config.gpu_paced_hold_margin = PacingHoldMargin::Off;
+    }
     if (static_cast<unsigned>(g_config.source_placement) >=
         static_cast<unsigned>(PacingPlacementOverride::Count)) {
         LOG_WARN("Config: invalid source_placement, resetting to 'pre_sleep'");
@@ -314,6 +319,12 @@ static void LoadPacingPipelineKeys(const char* S, const char* P) {
     if (!PacingLeadCoverage_FromText(lead_coverage.c_str(), &g_config.lead_coverage)) {
         LOG_WARN("Config: invalid lead_coverage '%s', resetting to '99'", lead_coverage.c_str());
         g_config.lead_coverage = PacingLeadCoverage::Q99;
+    }
+
+    const std::string hold_margin = ReadINIString(S, "gpu_paced_hold_margin", "off", P);
+    if (!PacingHoldMargin_FromText(hold_margin.c_str(), &g_config.gpu_paced_hold_margin)) {
+        LOG_WARN("Config: invalid gpu_paced_hold_margin '%s', resetting to 'off'", hold_margin.c_str());
+        g_config.gpu_paced_hold_margin = PacingHoldMargin::Off;
     }
 
     const std::string placement = ReadINIString(S, "source_placement", "pre_sleep", P);
@@ -631,6 +642,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIString(S, "lead_coverage", PacingLeadCoverage_Text(config.lead_coverage), P);
     WriteINIBool(S, "fg_late_spacing", config.fg_late_spacing, P);
     WriteINIBool(S, "gpu_paced_cadence", config.gpu_paced_cadence, P);
+    WriteINIString(S, "gpu_paced_hold_margin", PacingHoldMargin_Text(config.gpu_paced_hold_margin), P);
     WriteINIBool(S, "bypass_low_latency_off", config.bypass_low_latency_off, P);
     WriteINIString(S, "source_placement",
         PacingPlacementOverride_Text(config.source_placement), P);
@@ -875,6 +887,7 @@ static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
     pipeline.lead_coverage = config.lead_coverage;
     pipeline.fg_late_spacing = config.fg_late_spacing;
     pipeline.gpu_paced_cadence = config.gpu_paced_cadence;
+    pipeline.gpu_paced_hold_margin = config.gpu_paced_hold_margin;
     return pipeline;
 }
 
@@ -903,6 +916,7 @@ int Config_DeveloperOverrides() {
         (g_config.lead_coverage != d.lead_coverage) +
         (g_config.fg_late_spacing != d.fg_late_spacing) +
         (g_config.gpu_paced_cadence != d.gpu_paced_cadence) +
+        (g_config.gpu_paced_hold_margin != d.gpu_paced_hold_margin) +
         (g_config.bypass_low_latency_off != d.bypass_low_latency_off) +
         (g_config.source_placement != d.source_placement);
 }
@@ -922,6 +936,7 @@ void Config_ResetDeveloperSettings() {
     g_config.lead_coverage = d.lead_coverage;
     g_config.fg_late_spacing = d.fg_late_spacing;
     g_config.gpu_paced_cadence = d.gpu_paced_cadence;
+    g_config.gpu_paced_hold_margin = d.gpu_paced_hold_margin;
     g_config.bypass_low_latency_off = d.bypass_low_latency_off;
     g_config.source_placement = d.source_placement;
     Config_ApplyPacingPipeline();
@@ -976,6 +991,9 @@ void ApplyConfig() {
         LOG_WARN("Pacing pipeline: diagnostic GPU-paced cadence on (held frames are released no earlier than "
                  "the render handoff GPU floor, and a frame whose release that floor sets keeps the GPU's pace "
                  "instead of being held to the cap's cadence)");
+    if (g_config.gpu_paced_hold_margin != PacingHoldMargin::Off)
+        LOG_WARN("Diagnostic GPU-paced hold margin: Q%s (the cadence runs at a quantile of the GPU's recent "
+                 "frame need while frames are GPU-paced)", PacingHoldMargin_Text(g_config.gpu_paced_hold_margin));
     if (g_config.bypass_low_latency_off)
         LOG_WARN("Diagnostic driver low latency off while bypassed: NvAPI SetSleepMode forwarded with low latency "
                  "mode off while the Reflex Sleep is bypassed");

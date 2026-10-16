@@ -226,6 +226,15 @@ struct SchedulerPacingStatus {
 	uint32_t gpu_paced_recent = 0;
 	uint32_t gpu_paced_frames = 0;
 	uint32_t gpu_paced_moves = 0;
+	// GPU-paced hold margin (developer A/B gpu_paced_hold_margin): the key's
+	// PacingHoldMargin; while the margin applies, the realized grid interval,
+	// the cap interval it started from and the GPU need quantile it follows
+	// (all 0 while it does not apply), and the GPU need window's frames.
+	uint8_t gpu_paced_hold_margin = 0;
+	double gpu_paced_hold_interval_us = 0.0;
+	double gpu_paced_hold_cap_us = 0.0;
+	double gpu_paced_hold_need_us = 0.0;
+	uint32_t gpu_paced_hold_frames = 0;
 	// GPU-paced rhythm (source_stage.h), cumulative: frames it paced by the
 	// step that set their release, and held frames whose GPU floor was known,
 	// in all and anchored on a frame's GPU readiness (lead_controller.h).

@@ -150,6 +150,7 @@ namespace
             left.lead_coverage == right.lead_coverage &&
             left.fg_late_spacing == right.fg_late_spacing &&
             left.gpu_paced_cadence == right.gpu_paced_cadence &&
+            left.gpu_paced_hold_margin == right.gpu_paced_hold_margin &&
             left.stall_inject_ms == right.stall_inject_ms &&
             left.stall_inject_period_s == right.stall_inject_period_s;
     }
@@ -563,6 +564,27 @@ namespace
         CHECK(!PacingLeadCoverage_FromText("97", &parsed) && parsed == PacingLeadCoverage::Q95);
     }
 
+    // gpu_paced_hold_margin (developer A/B): off by default; out-of-range
+    // values clamp to off; INI text off | 75 | 90.
+    void TestHoldMarginConfig()
+    {
+        PacingPipelineConfig config{};
+        CHECK(config.gpu_paced_hold_margin == PacingHoldMargin::Off);
+        config.gpu_paced_hold_margin = static_cast<PacingHoldMargin>(9);
+        CHECK(PacingPipeline_ClampConfig(config).gpu_paced_hold_margin == PacingHoldMargin::Off);
+        config.gpu_paced_hold_margin = PacingHoldMargin::Q90;
+        CHECK(PacingPipeline_ClampConfig(config).gpu_paced_hold_margin == PacingHoldMargin::Q90);
+        PacingHoldMargin parsed = PacingHoldMargin::Off;
+        CHECK(PacingHoldMargin_FromText("75", &parsed) && parsed == PacingHoldMargin::Q75);
+        CHECK(PacingHoldMargin_FromText("90", &parsed) && parsed == PacingHoldMargin::Q90);
+        CHECK(PacingHoldMargin_FromText("off", &parsed) && parsed == PacingHoldMargin::Off);
+        parsed = PacingHoldMargin::Q75;
+        CHECK(!PacingHoldMargin_FromText("95", &parsed) && parsed == PacingHoldMargin::Q75);
+        CHECK(std::strcmp(PacingHoldMargin_Text(PacingHoldMargin::Q75), "75") == 0);
+        CHECK(std::strcmp(PacingHoldMargin_Text(PacingHoldMargin::Q90), "90") == 0);
+        CHECK(std::strcmp(PacingHoldMargin_Text(PacingHoldMargin::Off), "off") == 0);
+    }
+
     void TestProbesCopied()
     {
         PacingPipelineConfig config{};
@@ -854,6 +876,7 @@ namespace
         config.lead_coverage = PacingLeadCoverage::Q95;
         config.fg_late_spacing = false;
         config.gpu_paced_cadence = true;
+        config.gpu_paced_hold_margin = PacingHoldMargin::Q75;
         PacingPipeline_SetConfig(config);
         CHECK(SameConfig(PacingPipeline_GetConfig(), config));
         CHECK(PacingPipeline_GetConfig().adaptive_cap);
@@ -1238,6 +1261,7 @@ int main()
     TestHoldFeasibility();
     TestSmoothingTable();
     TestLeadCoverage();
+    TestHoldMarginConfig();
     TestProbesCopied();
     TestSameResult();
     TestPublishGeneration();
