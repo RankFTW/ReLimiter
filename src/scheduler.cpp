@@ -574,6 +574,8 @@ uint64_t s_rhythm_logged_steps[static_cast<size_t>(GpuPacedRhythmStep::Count)] =
 uint64_t s_rhythm_logged_anchors[4] = {};
 uint64_t s_rhythm_logged_ahead[LEAD_HANDOFF_GPU_HORIZON_FRAMES + 1] = {};
 uint64_t s_rhythm_logged_late_outputs = 0;
+uint64_t s_rhythm_logged_smoothed = 0;
+double s_rhythm_logged_smoothed_us = 0.0;
 int64_t s_rhythm_log_qpc = 0;
 // The Reflex Sleep hook's entry for grid index s_sleep_entry_index
 // (Scheduler_PlanReflexSleep): when the game reached ReLimiter for it.
@@ -1659,7 +1661,7 @@ static int64_t GpuFloorQpc(const PacingPlanKey& key) noexcept
 
 // GPU-paced rhythm diagnostics: one INFO line every 5 s while the developer
 // A/B gpu_paced_cadence is on and the rhythm paced frames since the last one.
-static void LogGpuPacedRhythm(int64_t now_qpc, PacingHoldMargin hold_margin) noexcept
+static void LogGpuPacedRhythm(int64_t now_qpc, PacingHoldMargin hold_margin, bool smoothing) noexcept
 {
     constexpr double kLogPeriodS = 5.0;
     if (s_rhythm_log_qpc != 0 &&
@@ -1692,6 +1694,10 @@ static void LogGpuPacedRhythm(int64_t now_qpc, PacingHoldMargin hold_margin) noe
     const uint64_t late_outputs_total = s_source_stage.Grid().Statistics().gpu_paced_late_outputs;
     const uint64_t late_outputs = late_outputs_total - s_rhythm_logged_late_outputs;
     s_rhythm_logged_late_outputs = late_outputs_total;
+    const uint64_t smoothed = stage.gpu_paced_smoothed - s_rhythm_logged_smoothed;
+    const double smoothed_us = stage.gpu_paced_smoothed_us - s_rhythm_logged_smoothed_us;
+    s_rhythm_logged_smoothed = stage.gpu_paced_smoothed;
+    s_rhythm_logged_smoothed_us = stage.gpu_paced_smoothed_us;
     if (paced == 0 && floors == 0) return;
     // Median and largest frames-ahead of the readiness anchor.
     size_t median_ahead = 0;
@@ -1720,9 +1726,23 @@ static void LogGpuPacedRhythm(int64_t now_qpc, PacingHoldMargin hold_margin) noe
                 PacingHoldMargin_Text(hold_margin), lead.GpuNeedCount());
         }
     }
+    // Release smoothing (developer A/B gpu_paced_release_smoothing), only while it is on.
+    char smoothing_text[160] = "";
+    if (smoothing) {
+        const double period_us = s_source_stage.SmoothingPeriodUs();
+        if (period_us > 0.0) {
+            std::snprintf(smoothing_text, sizeof(smoothing_text),
+                "; release smoothing %llu frames earlier, mean %.2f ms (period %.2f ms)",
+                static_cast<unsigned long long>(smoothed),
+                smoothed > 0 ? smoothed_us / 1000.0 / static_cast<double>(smoothed) : 0.0, period_us / 1000.0);
+        } else {
+            std::snprintf(smoothing_text, sizeof(smoothing_text), "; release smoothing not warm (%zu of %zu intervals)",
+                s_source_stage.SmoothingIntervalCount(), static_cast<size_t>(LEAD_WARM_SAMPLES));
+        }
+    }
     LOG_INFO("GPU-paced rhythm: %llu frames (smooth %llu, late %llu, early bound %llu, start %llu); floors %llu "
              "(readiness %llu, report %llu, PRESENT_END %llu); readiness anchor gaps %u, frames ahead p50 %zu max %zu; "
-             "period %.2f ms (median %.2f); late outputs followed %llu%s",
+             "period %.2f ms (median %.2f); late outputs followed %llu%s%s",
         static_cast<unsigned long long>(paced),
         static_cast<unsigned long long>(steps[static_cast<size_t>(GpuPacedRhythmStep::Smooth)]),
         static_cast<unsigned long long>(steps[static_cast<size_t>(GpuPacedRhythmStep::Late)]),
@@ -1733,7 +1753,7 @@ static void LogGpuPacedRhythm(int64_t now_qpc, PacingHoldMargin hold_margin) noe
         static_cast<unsigned long long>(anchors[static_cast<size_t>(GpuFloorAnchor::Report)]),
         static_cast<unsigned long long>(anchors[static_cast<size_t>(GpuFloorAnchor::PresentEnd)]),
         lead.ReadyGapCount(), median_ahead, max_ahead, lead.RecentGpuPeriodUs() / 1000.0, lead.GpuPeriodUs() / 1000.0,
-        static_cast<unsigned long long>(late_outputs), margin_text);
+        static_cast<unsigned long long>(late_outputs), margin_text, smoothing_text);
 }
 
 // A_n = max(w_{n−1} + d, G_n): the newest released frame's render handoff
@@ -1856,9 +1876,11 @@ static SourceStageFrame RunPlanned(
         // released on the GPU-paced rhythm (source_stage.h), never later than
         // the floor.
         const GpuFloorEstimate floor = GpuFloor(key);
-        const GpuPacedRhythmRelease rhythm = s_source_stage.GpuPacedRhythm(key, floor.floor_qpc);
+        const GpuPacedRhythmRelease rhythm = s_source_stage.GpuPacedRhythm(key, floor.floor_qpc,
+            config.gpu_paced_release_smoothing);
         request.earliest_release_qpc = rhythm.release_qpc;
         request.gpu_paced_rhythm = rhythm.step;
+        request.gpu_paced_rhythm_qpc = rhythm.rhythm_qpc;
         request.gpu_floor_qpc = floor.floor_qpc;
         if (floor.floor_qpc > 0) {
             ++s_floor_anchor_frames[static_cast<size_t>(floor.anchor)];
@@ -1892,7 +1914,9 @@ static SourceStageFrame RunPlanned(
             PopCount64(s_gpu_paced_window[0]) + PopCount64(s_gpu_paced_window[1]));
     }
     PublishRenderHandoff(key, frame, handoff_limit, held_floor);
-    if (config.gpu_paced_cadence && frame.planned) LogGpuPacedRhythm(frame.release_qpc, config.gpu_paced_hold_margin);
+    if (config.gpu_paced_cadence && frame.planned) {
+        LogGpuPacedRhythm(frame.release_qpc, config.gpu_paced_hold_margin, config.gpu_paced_release_smoothing);
+    }
     if (s_source_stage.StallInjector().TakeEnabledNotice()) {
         LOG_INFO("Stall injector enabled: %.1f ms every %.1f s",
                  config.stall_inject_ms, config.stall_inject_period_s);
@@ -2176,7 +2200,8 @@ bool Scheduler_PlanReflexSleep(int64_t sleep_entry_qpc, int64_t now_qpc, bool dr
         if (handoff_qpc > 0) {
             earliest_qpc = HandoffFloorQpc(next, handoff_qpc, PacingPipeline_Read());
         } else if (s_gpu_paced_held_floor && !driver_sleep) {
-            earliest_qpc = s_source_stage.GpuPacedRhythm(next, GpuFloorQpc(next)).release_qpc;
+            earliest_qpc = s_source_stage.GpuPacedRhythm(next, GpuFloorQpc(next),
+                PacingPipeline_GetConfig().gpu_paced_release_smoothing).release_qpc;
         }
         if (earliest_qpc > 0) {
             request.next_target_qpc = (std::max)(request.next_target_qpc,

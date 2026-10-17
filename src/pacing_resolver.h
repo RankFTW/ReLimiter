@@ -126,6 +126,11 @@ struct PacingPipelineConfig {
     // the 75th or 90th percentile of the GPU's recent per-frame need
     // (scheduler.cpp GpuPacedHoldIntervalUs), never below the cap's interval.
     PacingHoldMargin gpu_paced_hold_margin = PacingHoldMargin::Off;
+    // Key gpu_paced_release_smoothing (default off; developer A/B, needs
+    // gpu_paced_cadence): GPU-paced held frames are released on a second,
+    // smoother rhythm never later than the GPU-paced rhythm's release
+    // (source_stage.h GPU_PACED_SMOOTHING_GAIN).
+    bool gpu_paced_release_smoothing = false;
     double stall_inject_ms = 0.0; // 0 = off; [0, kPacingStallInjectMaxMs]
     double stall_inject_period_s = kPacingStallInjectDefaultPeriodS; // [1, 60]
 };

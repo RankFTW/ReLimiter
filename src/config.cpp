@@ -425,6 +425,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.gpu_present_gate_probes=ReadINIBool(S,"gpu_present_gate_probes",true,P);
     g_config.fg_late_spacing=ReadINIBool(S,"fg_late_spacing",true,P);
     g_config.gpu_paced_cadence=ReadINIBool(S,"gpu_paced_cadence",false,P);
+    g_config.gpu_paced_release_smoothing=ReadINIBool(S,"gpu_paced_release_smoothing",false,P);
     g_config.bypass_low_latency_off=ReadINIBool(S,"bypass_low_latency_off",false,P);
     g_config.reflex_sleep_bypass=ReadINIBool(S,"reflex_sleep_bypass",true,P);
     g_config.reflex_inject           = ReadINIBool(S, "reflex_inject", false, P);
@@ -643,6 +644,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIBool(S, "fg_late_spacing", config.fg_late_spacing, P);
     WriteINIBool(S, "gpu_paced_cadence", config.gpu_paced_cadence, P);
     WriteINIString(S, "gpu_paced_hold_margin", PacingHoldMargin_Text(config.gpu_paced_hold_margin), P);
+    WriteINIBool(S, "gpu_paced_release_smoothing", config.gpu_paced_release_smoothing, P);
     WriteINIBool(S, "bypass_low_latency_off", config.bypass_low_latency_off, P);
     WriteINIString(S, "source_placement",
         PacingPlacementOverride_Text(config.source_placement), P);
@@ -888,6 +890,7 @@ static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
     pipeline.fg_late_spacing = config.fg_late_spacing;
     pipeline.gpu_paced_cadence = config.gpu_paced_cadence;
     pipeline.gpu_paced_hold_margin = config.gpu_paced_hold_margin;
+    pipeline.gpu_paced_release_smoothing = config.gpu_paced_release_smoothing;
     return pipeline;
 }
 
@@ -917,6 +920,7 @@ int Config_DeveloperOverrides() {
         (g_config.fg_late_spacing != d.fg_late_spacing) +
         (g_config.gpu_paced_cadence != d.gpu_paced_cadence) +
         (g_config.gpu_paced_hold_margin != d.gpu_paced_hold_margin) +
+        (g_config.gpu_paced_release_smoothing != d.gpu_paced_release_smoothing) +
         (g_config.bypass_low_latency_off != d.bypass_low_latency_off) +
         (g_config.source_placement != d.source_placement);
 }
@@ -937,6 +941,7 @@ void Config_ResetDeveloperSettings() {
     g_config.fg_late_spacing = d.fg_late_spacing;
     g_config.gpu_paced_cadence = d.gpu_paced_cadence;
     g_config.gpu_paced_hold_margin = d.gpu_paced_hold_margin;
+    g_config.gpu_paced_release_smoothing = d.gpu_paced_release_smoothing;
     g_config.bypass_low_latency_off = d.bypass_low_latency_off;
     g_config.source_placement = d.source_placement;
     Config_ApplyPacingPipeline();
@@ -994,6 +999,9 @@ void ApplyConfig() {
     if (g_config.gpu_paced_hold_margin != PacingHoldMargin::Off)
         LOG_WARN("Diagnostic GPU-paced hold margin: Q%s (the cadence runs at a quantile of the GPU's recent "
                  "frame need while frames are GPU-paced)", PacingHoldMargin_Text(g_config.gpu_paced_hold_margin));
+    if (g_config.gpu_paced_release_smoothing)
+        LOG_WARN("Diagnostic GPU-paced release smoothing on (with GPU-paced cadence, a later GPU floor deepens "
+                 "the queue for a few frames instead of moving the release rhythm)");
     if (g_config.bypass_low_latency_off)
         LOG_WARN("Diagnostic driver low latency off while bypassed: NvAPI SetSleepMode forwarded with low latency "
                  "mode off while the Reflex Sleep is bypassed");

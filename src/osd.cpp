@@ -677,6 +677,17 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "It costs a few percent of frame rate and about a millisecond of latency (more at 90% than at 75%). "
         "Compare one setting per capture.");
 
+    if (ImGui::Checkbox("GPU-paced release smoothing", &g_config.gpu_paced_release_smoothing)) {
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: GPU-paced release smoothing -> %s", g_config.gpu_paced_release_smoothing ? "on" : "off");
+        *config_dirty = true;
+    }
+    HelpTip("Diagnostic A/B, needs GPU-paced cadence. When the GPU slips (a frame the game submitted late), "
+        "the next frames keep their release rhythm and run a few milliseconds further ahead for a few frames, "
+        "instead of moving the rhythm, which frame generation turns into misplaced real frames. It is never "
+        "later than the GPU-paced release. Costs about half a millisecond of latency on average. Compare one "
+        "setting per capture.");
+
     static const char* const kSourcePlacementLabels[] = {"Marker", "Pre-Sleep", "Reflex driver limiter"};
     static_assert(IM_ARRAYSIZE(kSourcePlacementLabels) ==
         static_cast<int>(PacingPlacementOverride::Count));

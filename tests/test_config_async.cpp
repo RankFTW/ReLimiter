@@ -307,6 +307,7 @@ void CheckPipelineMatchesConfig() {
     CHECK(pipeline.fg_late_spacing == g_config.fg_late_spacing);
     CHECK(pipeline.gpu_paced_cadence == g_config.gpu_paced_cadence);
     CHECK(pipeline.gpu_paced_hold_margin == g_config.gpu_paced_hold_margin);
+    CHECK(pipeline.gpu_paced_release_smoothing == g_config.gpu_paced_release_smoothing);
     CHECK(g_marker_forward_after_wait.load() ==
         (g_config.marker_forward_order == PacingMarkerForwardOrder::AfterWait));
 }
@@ -326,6 +327,7 @@ void TestPacingPipelineDefaults() {
     CHECK(g_config.fg_late_spacing);
     CHECK(!g_config.gpu_paced_cadence);
     CHECK(g_config.gpu_paced_hold_margin == PacingHoldMargin::Off);
+    CHECK(!g_config.gpu_paced_release_smoothing);
     CHECK(!g_config.bypass_low_latency_off && !g_bypass_low_latency_off.load());
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
     CheckPipelineMatchesConfig();
@@ -336,6 +338,7 @@ void TestPacingPipelineDefaults() {
     CHECK(Value(local_path, "FrameLimiter", "fg_late_spacing") == "true");
     CHECK(Value(local_path, "FrameLimiter", "gpu_paced_cadence") == "false");
     CHECK(Value(local_path, "FrameLimiter", "gpu_paced_hold_margin") == "off");
+    CHECK(Value(local_path, "FrameLimiter", "gpu_paced_release_smoothing") == "false");
     CHECK(Value(local_path, "FrameLimiter", "bypass_low_latency_off") == "false");
     CHECK(Value(local_path, "FrameLimiter", "source_placement") == "pre_sleep");
     CHECK(Value(local_path, "FrameLimiter", "reflex_sleep_bypass") == "true");
@@ -579,6 +582,20 @@ void TestGpuPacedCadenceKey() {
     CHECK(Config_DeveloperOverrides() == 1);
     Config_ResetDeveloperSettings();
     CHECK(!g_config.gpu_paced_cadence && !PacingPipeline_GetConfig().gpu_paced_cadence);
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// Developer A/B gpu_paced_release_smoothing: true loads, reaches the
+// pipeline, is saved, counts as a developer override and resets to false.
+void TestGpuPacedReleaseSmoothingKey() {
+    Reset(false, false, {{"config_version", "4"}, {"gpu_paced_release_smoothing", "true"}});
+    CHECK(g_config.gpu_paced_release_smoothing);
+    CheckPipelineMatchesConfig();
+    CHECK(PacingPipeline_GetConfig().gpu_paced_release_smoothing);
+    CHECK(Value(local_path, "FrameLimiter", "gpu_paced_release_smoothing") == "true");
+    CHECK(Config_DeveloperOverrides() == 1);
+    Config_ResetDeveloperSettings();
+    CHECK(!g_config.gpu_paced_release_smoothing && !PacingPipeline_GetConfig().gpu_paced_release_smoothing);
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
@@ -1013,6 +1030,7 @@ int main() {
     TestFgLateSpacingKey();
     TestGpuPacedCadenceKey();
     TestGpuPacedHoldMarginKey();
+    TestGpuPacedReleaseSmoothingKey();
     TestBypassLowLatencyOffKey();
     TestSourcePlacementParsing();
     TestPacingMethodMigration();
