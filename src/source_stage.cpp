@@ -146,7 +146,9 @@ GpuPacedRhythmRelease SourceStage::GpuPacedRhythm(const PacingPlanKey& key, int6
     if (smoothed_qpc >= release.rhythm_qpc) return release;
     const int64_t pulled_qpc = smoothed_qpc + static_cast<int64_t>(std::llround(
         GPU_PACED_SMOOTHING_GAIN * static_cast<double>(release.rhythm_qpc - smoothed_qpc)));
-    release.release_qpc = (std::min)((std::max)(pulled_qpc, earliest_qpc), release.rhythm_qpc);
+    // One GPU period below the floor, not the rhythm's half (source_stage.h).
+    const int64_t smoothing_earliest_qpc = floor_qpc - ticks(floor_period_us);
+    release.release_qpc = (std::min)((std::max)(pulled_qpc, smoothing_earliest_qpc), release.rhythm_qpc);
     return release;
 }
 

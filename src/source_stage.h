@@ -137,13 +137,21 @@ constexpr double GPU_PACED_RHYTHM_EARLY_GAIN = 0.25;
 //               releases (after LEAD_WARM_SAMPLES);
 //   not earlier than the rhythm's release: the rhythm's release;
 //   otherwise:  pulled GPU_PACED_SMOOTHING_GAIN of the way to it, never
-//               earlier than the floor minus P/2 (the rhythm's own bound).
+//               earlier than the floor minus P (one GPU period: one more
+//               frame queued at most).
 // So a later floor deepens the queue for a few frames instead of stretching
-// the start interval, and an earlier one still releases at once. A replay on
-// captured releases (GPU timeline fixed) estimated 0.4–0.6 ms mean and
-// 1.8–3.3 ms p95 of extra lead for fewer misplaced real frames; slower pulls
-// added up to 17 ms at p95 for no further gain. Replays can reject, not
-// approve.
+// the start interval, and an earlier one still releases at once. The bound
+// is a full period, not the rhythm's P/2: a stall longer than P/2 moves the
+// floor past it, and a game that arrives late after the stall (its game
+// thread waited for the hitched render thread) was held to floor − P/2
+// about 7 ms longer, so the second frame after each big stall started
+// 21–30 ms after the previous one (deviation p50 +3.7 to +5.0 ms, up to
+// 14; the driver's Sleep +0.04). A replay on captured releases (GPU timeline
+// fixed, never later than captured) estimated 0.4–0.6 ms mean and 1.8–3.3 ms
+// p95 of extra lead for fewer misplaced real frames, and with the full
+// period that frame's deviation p50 1.0–1.4 ms for 3–4 ms more lead on it;
+// slower pulls added up to 17 ms at p95 for no further gain. Replays can
+// reject, not approve.
 constexpr size_t GPU_PACED_SMOOTHING_PERIODS = 64;
 constexpr double GPU_PACED_SMOOTHING_GAIN = 0.25;
 

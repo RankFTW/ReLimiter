@@ -1142,8 +1142,9 @@ void TestGpuPacedRhythm()
 // frame at the previous release plus the mean interval, pulled a quarter of
 // the way to the rhythm's release (earlier than it); a floor that moves
 // earlier releases at the rhythm's release at once; never earlier than the
-// floor minus P/2. The rhythm continues from the release it made, not the
-// smoothed one. Off, the release is the rhythm's.
+// floor minus P, so below the rhythm's own floor − P/2 after a large step.
+// The rhythm continues from the release it made, not the smoothed one. Off,
+// the release is the rhythm's.
 void TestGpuPacedReleaseSmoothing()
 {
     std::printf("Test: release smoothing keeps the rhythm through a later GPU floor, never later than the rhythm\n");
@@ -1231,11 +1232,22 @@ void TestGpuPacedReleaseSmoothing()
     const int64_t expected = smoothed_candidate + static_cast<int64_t>(std::llround(
         0.25 * static_cast<double>(rhythm2.rhythm_qpc - smoothed_candidate)));
     CHECK(std::llabs(rhythm2.release_qpc - expected) <= 1 && rhythm2.release_qpc < rhythm2.rhythm_qpc);
-    // A floor 20 ms later: never earlier than the floor minus 17,010 / 2 µs.
+    // A floor 14 ms later: the rhythm stops at floor − 17,010 / 2 µs; the
+    // smoothing goes below that, above floor − 17,010 µs.
+    const int64_t mid_floor = rhythm_previous + Ticks(31'000.0);
+    const GpuPacedRhythmRelease deep = g_stage.GpuPacedRhythm(Key(frame_id), mid_floor, true);
+    const int64_t deep_expected = smoothed_candidate + static_cast<int64_t>(std::llround(
+        0.25 * static_cast<double>(deep.rhythm_qpc - smoothed_candidate)));
+    CHECK(deep.step == GpuPacedRhythmStep::EarlyBound && deep.rhythm_qpc == mid_floor - Ticks(8'505.0));
+    CHECK(std::llabs(deep.release_qpc - deep_expected) <= 1 && deep.release_qpc < mid_floor - Ticks(8'505.0) &&
+        deep.release_qpc > mid_floor - Ticks(17'010.0));
+    // A floor 20 ms later: never earlier than the floor minus 17,010 µs.
     const int64_t far_floor = rhythm_previous + Ticks(37'000.0);
     const GpuPacedRhythmRelease bounded = g_stage.GpuPacedRhythm(Key(frame_id), far_floor, true);
-    CHECK(bounded.step == GpuPacedRhythmStep::EarlyBound && bounded.release_qpc == far_floor - Ticks(8'505.0) &&
-        bounded.rhythm_qpc == bounded.release_qpc);
+    CHECK(bounded.step == GpuPacedRhythmStep::EarlyBound && bounded.rhythm_qpc == far_floor - Ticks(8'505.0) &&
+        bounded.release_qpc == far_floor - Ticks(17'010.0));
+    // Off, the rhythm's own bound.
+    CHECK(g_stage.GpuPacedRhythm(Key(frame_id), far_floor).release_qpc == far_floor - Ticks(8'505.0));
     // Without a consecutive paced frame the rhythm restarts at the floor.
     const GpuPacedRhythmRelease restart = g_stage.GpuPacedRhythm(Key(frame_id + 1), floor2, true);
     CHECK(restart.step == GpuPacedRhythmStep::Start && restart.release_qpc == floor2 &&
