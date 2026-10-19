@@ -202,9 +202,12 @@ namespace
     {
         Harness harness;
         harness.Run(30, 12'000.0);
-        // Two restarts within 0.5 s are evidence.
+        // Two restarts within 0.5 s are evidence (an on-time frame between
+        // them: consecutive restarted frames are one restart).
         harness.Demand(12'000.0);
         harness.Frame(true);
+        harness.Demand(12'000.0);
+        harness.Frame();
         harness.Demand(12'000.0);
         GovernorDecision decision = harness.Frame(true);
         CHECK(decision.cause == GovernorCause::Demand);
@@ -225,6 +228,47 @@ namespace
         CHECK_NEAR(decision.stretch, harness.governor.TargetStretch(), 1e-12);
         CHECK(decision.phase == GovernorPhase::Holding);
         CHECK(harness.governor.Statistics().misses_used == 0);
+    }
+
+    // One late event counts once: a run of consecutive restarted frames (a
+    // hitch restarts its own frame and the frames queued behind it) is one
+    // restart, so however long it is no restart pair, while two runs within
+    // 0.5 s are. The 10% window still counts every restarted frame, so frames
+    // that restart one after another for a second still rise.
+    void TestRestartRunIsOneRestart()
+    {
+        Harness harness;
+        harness.Run(30, 12'000.0);
+        for (int frame = 0; frame < 3; ++frame) {
+            harness.Demand(12'000.0);
+            CHECK(harness.Frame(true).cause == GovernorCause::None);
+        }
+        CHECK(harness.Run(60, 12'000.0).cause == GovernorCause::None);
+        CHECK(harness.governor.TargetStretch() == 1.0);
+        CHECK(harness.governor.Statistics().rises == 0);
+        // Two runs within 0.5 s: a pair.
+        harness.Demand(12'000.0);
+        harness.Frame(true);
+        harness.Demand(12'000.0);
+        harness.Frame(true);
+        harness.Demand(12'000.0);
+        CHECK(harness.Frame().cause == GovernorCause::None);
+        harness.Demand(12'000.0);
+        CHECK(harness.Frame(true).cause == GovernorCause::Demand);
+
+        // Every frame restarting: no pair, but the miss window (from the
+        // harness's first frame) has its second of frames 70 frames into it.
+        Harness sustained;
+        sustained.Run(30, 12'000.0);
+        int frames = 0;
+        GovernorCause cause = GovernorCause::None;
+        for (; frames < 300 && cause == GovernorCause::None; ++frames) {
+            sustained.Demand(12'000.0);
+            cause = sustained.Frame(true).cause;
+        }
+        CHECK(cause == GovernorCause::Demand);
+        CHECK(frames == 71);
+        CHECK(sustained.governor.TargetStretch() > 1.0);
     }
 
     // More than 10% of a window's frames restarting rises by 5% without demand.
@@ -347,18 +391,20 @@ namespace
         harness.Demand(coupled());
         harness.Frame(true);
         harness.Demand(coupled());
+        harness.Frame();
+        harness.Demand(coupled());
         const GovernorDecision failed = harness.Frame(true);
         CHECK(failed.cause == GovernorCause::ProbeFailed);
         CHECK(harness.governor.Statistics().probe_failures == 1);
         CHECK_NEAR(harness.governor.TargetStretch(), risen, 1e-9);
         // The next probe needs 2 s of calm after the evidence ends (0.5 s
-        // after the first restart of the pair).
+        // after the first restart of the pair, two frames before the second).
         frames = 0;
         for (; frames < 1000; ++frames) {
             harness.Demand(coupled());
             if (harness.Frame().cause == GovernorCause::Probe) break;
         }
-        CHECK(frames >= 246 && frames <= 249);
+        CHECK(frames >= 245 && frames <= 248);
     }
 
     // Evidence after a release fall: back to the level before it, and the
@@ -623,6 +669,8 @@ namespace
         harness.Demand(12'000.0);
         harness.Frame(true);
         harness.Demand(12'000.0);
+        harness.Frame();
+        harness.Demand(12'000.0);
         harness.Frame(true);
         harness.Run(10, 12'000.0);
         CHECK(harness.governor.Stretch() > 1.0);
@@ -816,6 +864,7 @@ int main()
     TestInvalidInputs();
     TestDemandAloneNeverRises();
     TestDemandRiseWithEvidence();
+    TestRestartRunIsOneRestart();
     TestMissRateRise();
     TestDemandFall();
     TestReleaseFallsToRiseNeed();

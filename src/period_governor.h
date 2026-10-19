@@ -4,7 +4,16 @@
 // The Adaptive cap lengthens the interval I only while the frames themselves
 // show it is too short: two cadence restarts within 0.5 s, a quarter of the
 // newest 24 measured frames ready after their target, or more than 10% of the
-// frames of a window of at least 1 s restarting. Reflex workload demand only
+// frames of a window of at least 1 s restarting. One late frame counts once:
+// consecutive governed frames that restarted are one restart, and a late
+// frame less late than the late frame before it (the queue behind a hitch
+// running down) is not counted as ready after its target (the scheduler
+// feeds late_outputs without LeadStatistics::draining_late_samples). Gears of
+// War: E-Day, FG 2× at 120 with the Adaptive cap: one 25 ms simulation
+// hitch restarted the cadence on two consecutive frames after it and left five
+// frames late, each evidence on its own, and the interval rose +21 → +42% in
+// 0.6 s. The 10% window still counts every restarted frame, so frames that
+// restart one after another for a second still rise. Reflex workload demand only
 // sizes a rise (max(Q90 of the newest 12 reports, Q_p of the newest second) +
 // m, at most +8% of I_0 per 0.25 s; +5% when misses are high and demand does
 // not explain them), so a measurement that grows with the interval (Rogue
@@ -66,7 +75,7 @@ constexpr double GOVERNOR_MARGIN_FRACTION = 0.03;
 // Evidence that the interval is too short.
 constexpr uint32_t GOVERNOR_OUTPUT_FRAMES = 24;         // newest measured frames
 constexpr uint32_t GOVERNOR_OUTPUT_LATE_MIN = 6;        // ready after their target (the lead expects 1 in 20)
-constexpr double GOVERNOR_RESTART_WINDOW_S = 0.5;       // two restarts this close
+constexpr double GOVERNOR_RESTART_WINDOW_S = 0.5;       // two restarts this close (a run of restarted frames is one)
 // Rises.
 constexpr double GOVERNOR_RISE_STEP = 0.08;             // demand rise at most +8% of I_0
 constexpr double GOVERNOR_RISE_DWELL_S = 0.25;          // between rises
@@ -171,11 +180,13 @@ struct GovernorFrame {
     // PeriodGovernor_LfcIntervalUs(I, lfc_quantum_us).
     double lfc_quantum_us = 0.0;
     // SourceLate or OutputLate epoch, or an infeasible lead
-    // (Feasibility_LeadInfeasible), since the previous governed frame.
+    // (Feasibility_LeadInfeasible), since the previous governed frame. A run
+    // of consecutive missed frames is one restart for the restart pair.
     bool missed = false;
     // Lead samples measured since the previous governed frame (one per frame
     // whose readiness was measured), and how many of them were ready after
-    // their target (negative slack, X > L).
+    // their target (negative slack, X > L), without the draining ones
+    // (LeadStatistics::draining_late_samples).
     uint32_t outputs = 0;
     uint32_t late_outputs = 0;
     // Hold room (Auto GPU queue wait, LeadController::HoldRoomUs): the
@@ -320,8 +331,9 @@ private:
     // Evidence.
     uint32_t output_bits_ = 0;        // newest GOVERNOR_OUTPUT_FRAMES outcomes, 1 = ready after target
     uint32_t output_count_ = 0;
-    int64_t last_restart_qpc_ = 0;
-    int64_t previous_restart_qpc_ = 0;
+    int64_t last_restart_qpc_ = 0;     // first frame of the newest run of missed frames
+    int64_t previous_restart_qpc_ = 0; // and of the run before it
+    bool previous_missed_ = false;     // the previous valid frame was missed
     MissRateWindow window_;           // governed frames since the last rise or window close
     int64_t last_evidence_qpc_ = 0;
     // Target.

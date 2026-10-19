@@ -515,9 +515,16 @@ struct LeadStatistics {
     double last_slack_us = 0.0;      // newest slack L − X, long samples included
     // Slack samples (one per frame whose readiness was measured, long ones
     // included) and of those, frames ready after their target (L − X < 0):
-    // the Adaptive cap's output evidence.
+    // the Adaptive cap's output evidence. Draining: late frames whose
+    // predecessor (the previous grid index, sample emitted) was late by
+    // more. That is the queue behind one late frame running down: the
+    // interval is absorbing it, so the Adaptive cap does not count it
+    // (Gears of War: E-Day, a 25 ms simulation hitch left its frame and the
+    // four queued behind it ready 21.7, 18.9, 17.4, 6.1 and 1.0 ms after
+    // their targets, six of the newest 24 from one hitch).
     uint64_t slack_samples = 0;
     uint64_t negative_slack_samples = 0;
+    uint64_t draining_late_samples = 0;
 };
 
 // ── Release margin and headroom ──
@@ -762,6 +769,8 @@ private:
         int64_t own_ready_qpc = 0;
         double interval_us = 0.0;
         double lead_us = 0.0;      // the plan's L, for the slack
+        double slack_us = 0.0;     // L − X once the sample is emitted (slack_known)
+        bool slack_known = false;
         double guard_reduction_us = 0.0; // the collision guard's reduction of L
         double guard_offset_us = 0.0;    // its limit minus I (guard_judged)
         bool guard_judged = false;       // a judged GPU queue wait lead: adds a hold-room sample

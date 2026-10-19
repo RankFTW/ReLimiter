@@ -138,6 +138,7 @@ void PeriodGovernor::ResetState(bool settle) noexcept
     output_count_ = 0;
     last_restart_qpc_ = 0;
     previous_restart_qpc_ = 0;
+    previous_missed_ = false;
     window_.Restart();
     last_evidence_qpc_ = 0;
     last_rise_qpc_ = 0;
@@ -221,6 +222,8 @@ GovernorDecision PeriodGovernor::OnFrame(const GovernorFrame& frame) noexcept
     } else {
         Track(frame, &decision);
     }
+    // Runs of missed frames span settling frames too: Track sees the frame before.
+    previous_missed_ = frame.missed;
 
     const bool snapped = frame.fixed.snapped && IsPositiveFinite(frame.fixed.refresh_us);
     const double tracked_us = frame.base_interval_us * stretch_;
@@ -291,7 +294,9 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
     GovernorCause reported = GovernorCause::None;
 
     // 1. Evidence: restarts, outputs ready after their target, a high miss rate.
-    if (frame.missed) {
+    // A run of consecutive missed frames is one restart (period_governor.h):
+    // one hitch restarts the cadence on the frames queued behind it too.
+    if (frame.missed && !previous_missed_) {
         previous_restart_qpc_ = last_restart_qpc_;
         last_restart_qpc_ = qpc;
     }

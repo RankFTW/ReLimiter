@@ -1381,7 +1381,16 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
     AddSlack(&bucket.slack, slack_us);
     statistics_.last_slack_us = slack_us;
     ++statistics_.slack_samples;
-    if (slack_us < 0.0) ++statistics_.negative_slack_samples;
+    if (slack_us < 0.0) {
+        ++statistics_.negative_slack_samples;
+        // Draining (lead_controller.h): the frame before it was late by more.
+        const PendingFrame* previous = Previous(*frame);
+        if (previous != nullptr && previous->slack_known && previous->slack_us < slack_us) {
+            ++statistics_.draining_late_samples;
+        }
+    }
+    frame->slack_us = slack_us;
+    frame->slack_known = true;
     // Hold room (lead_controller.h): a frame late even against its unguarded
     // lead is the overload's, not the hold's; a gated frame's X contains
     // ReLimiter's own later waits, which would make R grow with the interval.

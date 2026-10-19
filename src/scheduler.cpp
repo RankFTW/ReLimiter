@@ -479,9 +479,11 @@ double s_governor_base_interval_us = 0.0; // that frame's I_0 (status)
 // SourceLate epoch or its lead was infeasible, or a drain started an
 // OutputLate epoch. Consumed by the next governed frame.
 bool s_governor_miss_pending = false;
-// Lead slack samples already given to the governor (output evidence).
+// Lead slack samples already given to the governor (output evidence), late
+// ones and late ones draining (LeadStatistics::draining_late_samples).
 uint64_t s_governor_outputs_seen = 0;
 uint64_t s_governor_late_outputs_seen = 0;
+uint64_t s_governor_draining_outputs_seen = 0;
 // Overload guard. Owner only. Overload
 // demotes every Auto hold rung to source only. Output overrides are never
 // changed.
@@ -621,13 +623,17 @@ static uint32_t TakeCounterDelta(uint64_t current, uint64_t* seen) noexcept
     return static_cast<uint32_t>(std::min<uint64_t>(delta, UINT32_MAX));
 }
 
-// Lead slack samples since the previous call: frames whose readiness was
-// measured, and of those, ready after their target.
+// Lead samples measured since the previous call, and of those, ready after
+// their target, without the draining ones (a frame less late than the frame
+// before it, itself late): the queue behind one late frame running down is
+// one late frame, not several (lead_controller.h).
 static void TakeLeadOutputs(uint32_t* outputs, uint32_t* late_outputs) noexcept
 {
     const LeadStatistics lead = s_source_stage.Lead().Statistics();
     *outputs = TakeCounterDelta(lead.slack_samples, &s_governor_outputs_seen);
-    *late_outputs = TakeCounterDelta(lead.negative_slack_samples, &s_governor_late_outputs_seen);
+    const uint32_t late = TakeCounterDelta(lead.negative_slack_samples, &s_governor_late_outputs_seen);
+    const uint32_t draining = TakeCounterDelta(lead.draining_late_samples, &s_governor_draining_outputs_seen);
+    *late_outputs = late > draining ? late - draining : 0u;
 }
 
 // Waited GPU queue wait resumes recorded since the previous call, and of

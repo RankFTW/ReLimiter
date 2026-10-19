@@ -62,7 +62,7 @@ See [Removed and migrated keys](https://github.com/RankFTW/ReLimiter/blob/main/d
 
 ### Adaptive cap
 
-- **Adaptive cap replaces Frame-Time Adaptation.** It is **off by default**. When the game cannot hold the cap, it lengthens the frame interval, by up to 60%, so the game runs at a slightly lower but steady rate instead of missing frames at random, and it shortens the interval again once the game can hold it. The interval rises only when frames are actually late; an isolated hitch does not lengthen it.
+- **Adaptive cap replaces Frame-Time Adaptation.** It is **off by default**. When the game cannot hold the cap, it lengthens the frame interval, by up to 60%, so the game runs at a slightly lower but steady rate instead of missing frames at random, and it shortens the interval again once the game can hold it. The interval rises only when frames are actually late; an isolated hitch does not lengthen it, and neither do the frames it restarts or delays right behind it.
 - **Smoother changes.** On VRR the interval changes without restarting the cadence. On a fixed-refresh cap that matches whole refreshes the interval is rounded up to whole refreshes. Resets (cap or FG multiplier change, Dynamic MFG, OLED Care, regaining focus, a new graphics API or swapchain, turning it off) return to the cap immediately.
 - **With the GPU wait output** it also keeps just enough frame interval for the GPU wait to hold frames in GPU-heavy scenes.
 - **With frame generation** it counts the GPU time frame generation needs for each rendered frame, so it does not shorten the interval below what the GPU can render and generate.

@@ -1964,6 +1964,40 @@ void TestGuardedSlackUsesUnguardedLead()
     CHECK(controller->Statistics().invalid_inputs == invalid + 3);
 }
 
+// Adaptive cap output evidence (lead_controller.h): a late frame whose
+// previous frame (grid index n − 1, sample emitted) was late by more is
+// draining; a late frame as late as or later than that one, after a frame on
+// time, or without a sampled previous frame is not.
+void TestDrainingLateSamples()
+{
+    auto controller = MakeController();
+    const auto feed = [&](uint64_t index, double x_us) {
+        const double source_us = static_cast<double>(index) * kInterval;
+        LeadFrameStart start = Start(index, PacingRung::SourceOnly, source_us);
+        start.lead_us = 5000.0;
+        controller->OnSourceRelease(start);
+        controller->OnStageEvent(Event(index, Kind::MarkerArrival, source_us + x_us));
+        controller->OnStageEvent(Event(index, Kind::OutputRelease, source_us + x_us, PacingPlanStatus::SourceOnly));
+    };
+    const auto late = [&]() { return controller->Statistics().negative_slack_samples; };
+    const auto draining = [&]() { return controller->Statistics().draining_late_samples; };
+    feed(1, 4000.0); // on time
+    feed(2, 9000.0); // 4 ms late after a frame on time
+    CHECK(late() == 1 && draining() == 0);
+    feed(3, 7000.0); // 2 ms, less than the frame before: draining
+    feed(4, 6000.0); // 1 ms: draining
+    CHECK(late() == 3 && draining() == 2);
+    feed(5, 6000.0); // as late as the frame before
+    feed(6, 8000.0); // later than it
+    CHECK(late() == 5 && draining() == 2);
+    feed(7, 5000.0); // slack 0: on time
+    feed(8, 5500.0); // late after a frame on time
+    CHECK(late() == 6 && draining() == 2);
+    feed(10, 5200.0); // grid index 9 has no sample: less late than frame 8, but not draining
+    CHECK(late() == 7 && draining() == 2);
+    CHECK(controller->Statistics().slack_samples == 9);
+}
+
 namespace
 {
     // A GPU queue wait frame two indices from its neighbors (X = r − s)
@@ -2961,6 +2995,7 @@ int main()
     TestReleaseMarginObservations();
     TestCollisionGuardLimitsLead();
     TestGuardedSlackUsesUnguardedLead();
+    TestDrainingLateSamples();
     TestHoldRoomSamples();
     TestLockstepGatedHold();
     TestHeadroomGuardLimitsLead();
