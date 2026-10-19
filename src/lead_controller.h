@@ -367,11 +367,15 @@ struct GpuFloorEstimate {
 
 // ── Inputs and status ──
 
-// The collision guard's verdict on one lead (NextLeadUs).
+// The collision guard's verdict on one lead (NextLeadUs), and how much the
+// GPU wait cap lowered it.
 struct LeadGuardOutcome {
     bool judged = false;       // a GPU queue wait lead the guard judged (C or D window warm)
     double offset_us = 0.0;    // the limit minus I: Q10(D) − H, or Q10(C) − M
     double reduction_us = 0.0; // how much the guard lowered L (>= 0)
+    // How much the GPU wait cap lowered the target this lead follows (>= 0):
+    // min(Q_q + allowance, 3 I) − (median X + cap) while the cap binds.
+    double cap_reduction_us = 0.0;
 };
 
 // The owner's source release of one planned frame (plan fields plus s).
@@ -397,9 +401,10 @@ struct LeadFrameStart {
     // ready (EarlyLeadUs).
     bool gpu_floor_release = false;
     // The collision guard's verdict on L (NextLeadUs). The Adaptive cap's
-    // slack is judged against L + guard.reduction_us, so lateness the guard
-    // accepts on purpose is not a missed target; a judged frame adds its
-    // hold room X − guard.offset_us.
+    // slack is judged against L + guard.reduction_us + guard.cap_reduction_us,
+    // so lateness the guard or the GPU wait cap accepts on purpose is not a
+    // missed target; a judged frame adds its hold room X − guard.offset_us
+    // when it is not late against L + guard.reduction_us.
     LeadGuardOutcome guard{};
     // ReLimiter's waits for this frame before s: the source wait
     // [wait_start_qpc, wait_end_qpc] and a pre-Sleep wait [pre_wait_start_qpc,
@@ -514,7 +519,8 @@ struct LeadStatistics {
     double last_sample_us = 0.0;     // newest sample added to a bucket
     double last_slack_us = 0.0;      // newest slack L − X, long samples included
     // Slack samples (one per frame whose readiness was measured, long ones
-    // included) and of those, frames ready after their target (L − X < 0):
+    // included) and of those, frames ready after their target (L − X < 0,
+    // with L the lead before the collision guard and the GPU wait cap):
     // the Adaptive cap's output evidence. Draining: late frames whose
     // predecessor (the previous grid index, sample emitted) was late by
     // more. That is the queue behind one late frame running down: the
@@ -772,6 +778,7 @@ private:
         double slack_us = 0.0;     // L − X once the sample is emitted (slack_known)
         bool slack_known = false;
         double guard_reduction_us = 0.0; // the collision guard's reduction of L
+        double cap_reduction_us = 0.0;   // the GPU wait cap's (LeadGuardOutcome::cap_reduction_us)
         double guard_offset_us = 0.0;    // its limit minus I (guard_judged)
         bool guard_judged = false;       // a judged GPU queue wait lead: adds a hold-room sample
         int64_t wait_start_qpc = 0;     // ReLimiter's source wait before s; 0 none

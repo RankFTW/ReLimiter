@@ -359,9 +359,15 @@ double LeadController::NextLeadUs(const LeadRequest& request, bool* budget_limit
     bucket.target_us = bucket.quantile_us + ValidAllowance(request.allowance_us);
     // GPU wait cap (rung_feasibility.h GpuWaitCap; gpu_wait_budget_us): a
     // typical GPU queue wait frame waits at most the cap before its target.
+    // The frames it lets run late are not the Adaptive cap's evidence
+    // (LeadGuardOutcome::cap_reduction_us): the cap is relative to the
+    // median X, so its late share does not fall when the interval rises.
     if (request.rung == PacingRung::GpuQueueWait && IsPositiveFinite(request.gpu_wait_cap_us)) {
         const double capped_us = bucket.window.Quantile(0.5) + request.gpu_wait_cap_us;
         if (capped_us < bucket.target_us) {
+            if (guard != nullptr) {
+                guard->cap_reduction_us = std::max(0.0, std::min(bucket.target_us, max_lead_us) - capped_us);
+            }
             bucket.target_us = capped_us;
             ++statistics_.gpu_wait_capped_frames;
         }
@@ -600,6 +606,7 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
     if (qpc_frequency_ <= 0 || !PacingPlanKey_IsValid(frame.key) || frame.source_release_qpc <= 0 ||
         !IsPositiveFinite(frame.interval_us) || !std::isfinite(frame.lead_us) || frame.lead_us < 0.0 ||
         !std::isfinite(frame.guard.reduction_us) || frame.guard.reduction_us < 0.0 ||
+        !std::isfinite(frame.guard.cap_reduction_us) || frame.guard.cap_reduction_us < 0.0 ||
         !std::isfinite(frame.guard.offset_us) ||
         !FindBucketIndex(frame.rung, frame.fg_divisor, &bucket_index)) {
         ++statistics_.invalid_inputs;
@@ -635,6 +642,7 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
     slot.interval_us = frame.interval_us;
     slot.lead_us = frame.lead_us;
     slot.guard_reduction_us = frame.guard.reduction_us;
+    slot.cap_reduction_us = frame.guard.cap_reduction_us;
     slot.guard_offset_us = frame.guard.offset_us;
     slot.guard_judged = frame.guard.judged && frame.rung == PacingRung::GpuQueueWait;
     // ReLimiter's waits before this release (lockstep engines, lead_controller.h).
@@ -1376,8 +1384,13 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
     }
     // A long sample is excluded from the lead but is a missed target.
     // A frame the collision guard made late on purpose is judged against its
-    // unguarded lead, and every frame without its gated hold.
-    const double slack_us = frame->lead_us + frame->guard_reduction_us - std::max(0.0, sample_us - gated_us);
+    // unguarded lead, and every frame without its gated hold. The Adaptive
+    // cap's evidence also leaves out the GPU wait cap's lowering: in Rogue
+    // Core the cap bound 86% of frames, 4.3% were late against the capped
+    // lead but 0.8% against the uncapped one, and the capped share grew
+    // from 2.2% to 6.0% as the interval rose from 10 to 12 ms.
+    const double guarded_slack_us = frame->lead_us + frame->guard_reduction_us - std::max(0.0, sample_us - gated_us);
+    const double slack_us = guarded_slack_us + frame->cap_reduction_us;
     AddSlack(&bucket.slack, slack_us);
     statistics_.last_slack_us = slack_us;
     ++statistics_.slack_samples;
@@ -1394,7 +1407,8 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
     // Hold room (lead_controller.h): a frame late even against its unguarded
     // lead is the overload's, not the hold's; a gated frame's X contains
     // ReLimiter's own later waits, which would make R grow with the interval.
-    if (frame->guard_judged && gated_ticks == 0 && slack_us >= 0.0) {
+    // Judged against the lead the GPU queue wait ran with (the cap included).
+    if (frame->guard_judged && gated_ticks == 0 && guarded_slack_us >= 0.0) {
         room_windows_[frame->bucket % LEAD_DIVISOR_BUCKETS].Add(sample_us - frame->guard_offset_us);
         ++statistics_.room_samples;
     }

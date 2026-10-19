@@ -1439,12 +1439,16 @@ void TestGpuWaitCap()
 
     LeadRequest request = Request(PacingRung::GpuQueueWait, 500.0);
     request.gpu_wait_cap_us = 1000.0;
-    CHECK(std::fabs(controller->NextLeadUs(request) - 11000.0) <= 20.0);
+    LeadGuardOutcome outcome{};
+    CHECK(std::fabs(controller->NextLeadUs(request, nullptr, &outcome) - 11000.0) <= 20.0);
     CHECK(std::fabs(controller->BucketStatus(PacingRung::GpuQueueWait, 1.0).target_us - 11000.0) <= 20.0);
     CHECK(controller->Statistics().gpu_wait_capped_frames == 1);
+    // The cap lowered the target from Q95 + allowance (14,510) to p50 + cap (11,010).
+    CHECK(std::fabs(outcome.cap_reduction_us - 3500.0) <= 20.0);
 
     request.gpu_wait_cap_us = 0.0;
-    controller->NextLeadUs(request);
+    controller->NextLeadUs(request, nullptr, &outcome);
+    CHECK(outcome.cap_reduction_us == 0.0);
     CHECK(std::fabs(controller->BucketStatus(PacingRung::GpuQueueWait, 1.0).target_us - 14500.0) <= 20.0);
     request.gpu_wait_cap_us = kNaN;
     controller->NextLeadUs(request);
@@ -1962,6 +1966,46 @@ void TestGuardedSlackUsesUnguardedLead()
     bad.guard.offset_us = kNaN;
     controller->OnSourceRelease(bad);
     CHECK(controller->Statistics().invalid_inputs == invalid + 3);
+}
+
+// A frame late only because the GPU wait cap lowered its lead is judged
+// against the lead without the cap: no Adaptive cap miss. Late beyond that
+// lead it is one. The hold room still judges against the lead the wait ran
+// with: a judged frame late against it adds no room sample. A negative or
+// non-finite cap reduction is an invalid release.
+void TestCappedSlackUsesUncappedLead()
+{
+    auto controller = MakeController();
+    // Frames two indices apart: X = r − s.
+    const auto frame = [&](uint64_t index, double x_us) {
+        const double source_us = static_cast<double>(index) * 10000.0;
+        LeadFrameStart start = Start(index, PacingRung::GpuQueueWait, source_us);
+        start.lead_us = 2000.0;
+        start.guard.cap_reduction_us = 1500.0;
+        start.guard.judged = true;
+        controller->OnSourceRelease(start);
+        controller->OnStageEvent(Event(index, Kind::PresentCall, source_us + x_us / 2.0));
+        controller->OnStageEvent(Event(index, Kind::GpuReady, source_us + x_us));
+        controller->OnStageEvent(Event(index, Kind::OutputRelease, source_us + x_us));
+    };
+    frame(1, 3000.0); // late against L = 2,000 only
+    CHECK_NEAR(controller->Statistics().last_slack_us, 500.0);
+    CHECK(controller->Statistics().negative_slack_samples == 0);
+    CHECK(controller->Statistics().room_samples == 0);
+    frame(3, 4000.0); // late against L + 1,500 too
+    CHECK_NEAR(controller->Statistics().last_slack_us, -500.0);
+    CHECK(controller->Statistics().negative_slack_samples == 1);
+    frame(5, 1500.0); // on time against L: a room sample
+    CHECK(controller->Statistics().room_samples == 1);
+    CHECK(controller->Statistics().slack_samples == 3);
+
+    const uint64_t invalid = controller->Statistics().invalid_inputs;
+    LeadFrameStart bad = Start(7, PacingRung::GpuQueueWait, 70000.0);
+    bad.guard.cap_reduction_us = -1.0;
+    controller->OnSourceRelease(bad);
+    bad.guard.cap_reduction_us = kNaN;
+    controller->OnSourceRelease(bad);
+    CHECK(controller->Statistics().invalid_inputs == invalid + 2);
 }
 
 // Adaptive cap output evidence (lead_controller.h): a late frame whose
@@ -2995,6 +3039,7 @@ int main()
     TestReleaseMarginObservations();
     TestCollisionGuardLimitsLead();
     TestGuardedSlackUsesUnguardedLead();
+    TestCappedSlackUsesUncappedLead();
     TestDrainingLateSamples();
     TestHoldRoomSamples();
     TestLockstepGatedHold();
