@@ -152,6 +152,7 @@ namespace
             left.gpu_paced_cadence == right.gpu_paced_cadence &&
             left.gpu_paced_hold_margin == right.gpu_paced_hold_margin &&
             left.gpu_paced_release_smoothing == right.gpu_paced_release_smoothing &&
+            left.adaptive_cap_hold_room == right.adaptive_cap_hold_room &&
             left.stall_inject_ms == right.stall_inject_ms &&
             left.stall_inject_period_s == right.stall_inject_period_s;
     }
@@ -879,6 +880,7 @@ namespace
         config.gpu_paced_cadence = true;
         config.gpu_paced_hold_margin = PacingHoldMargin::Q75;
         config.gpu_paced_release_smoothing = true;
+        config.adaptive_cap_hold_room = false;
         PacingPipeline_SetConfig(config);
         CHECK(SameConfig(PacingPipeline_GetConfig(), config));
         CHECK(PacingPipeline_GetConfig().adaptive_cap);

@@ -688,6 +688,16 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "later than the GPU-paced release. Costs about half a millisecond of latency on average. Compare one "
         "setting per capture.");
 
+    if (ImGui::Checkbox("Adaptive cap hold room", &g_config.adaptive_cap_hold_room)) {
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: Adaptive cap hold room -> %s", g_config.adaptive_cap_hold_room ? "on" : "off");
+        *config_dirty = true;
+    }
+    HelpTip("Diagnostic A/B, with Adaptive cap and the GPU wait output on Auto. On (default), the interval is "
+        "kept long enough for the GPU wait to hold frames: the GPU's work for a frame plus the release headroom. "
+        "When the GPU is the limit this can lower the frame rate by about 20%. Off, the interval follows only late "
+        "frames and the game's workload reports. Compare one setting per capture, in the same scene.");
+
     static const char* const kSourcePlacementLabels[] = {"Marker", "Pre-Sleep", "Reflex driver limiter"};
     static_assert(IM_ARRAYSIZE(kSourcePlacementLabels) ==
         static_cast<int>(PacingPlacementOverride::Count));

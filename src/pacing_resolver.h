@@ -131,6 +131,10 @@ struct PacingPipelineConfig {
     // smoother rhythm never later than the GPU-paced rhythm's release
     // (source_stage.h GPU_PACED_SMOOTHING_GAIN).
     bool gpu_paced_release_smoothing = false;
+    // Key adaptive_cap_hold_room (default on; developer A/B): with Adaptive
+    // cap and the Auto GPU queue wait, the interval is kept at least at the
+    // hold room (lead_controller.h HoldRoomUs, period_governor.h).
+    bool adaptive_cap_hold_room = true;
     double stall_inject_ms = 0.0; // 0 = off; [0, kPacingStallInjectMaxMs]
     double stall_inject_period_s = kPacingStallInjectDefaultPeriodS; // [1, 60]
 };

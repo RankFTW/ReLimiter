@@ -308,6 +308,7 @@ void CheckPipelineMatchesConfig() {
     CHECK(pipeline.gpu_paced_cadence == g_config.gpu_paced_cadence);
     CHECK(pipeline.gpu_paced_hold_margin == g_config.gpu_paced_hold_margin);
     CHECK(pipeline.gpu_paced_release_smoothing == g_config.gpu_paced_release_smoothing);
+    CHECK(pipeline.adaptive_cap_hold_room == g_config.adaptive_cap_hold_room);
     CHECK(g_marker_forward_after_wait.load() ==
         (g_config.marker_forward_order == PacingMarkerForwardOrder::AfterWait));
 }
@@ -329,6 +330,7 @@ void TestPacingPipelineDefaults() {
     CHECK(g_config.gpu_paced_hold_margin == PacingHoldMargin::Off);
     CHECK(!g_config.gpu_paced_release_smoothing);
     CHECK(!g_config.bypass_low_latency_off && !g_bypass_low_latency_off.load());
+    CHECK(g_config.adaptive_cap_hold_room);
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
     CheckPipelineMatchesConfig();
     // The startup rewrite saves every new key, including the developer keys.
@@ -340,6 +342,7 @@ void TestPacingPipelineDefaults() {
     CHECK(Value(local_path, "FrameLimiter", "gpu_paced_hold_margin") == "off");
     CHECK(Value(local_path, "FrameLimiter", "gpu_paced_release_smoothing") == "false");
     CHECK(Value(local_path, "FrameLimiter", "bypass_low_latency_off") == "false");
+    CHECK(Value(local_path, "FrameLimiter", "adaptive_cap_hold_room") == "true");
     CHECK(Value(local_path, "FrameLimiter", "source_placement") == "pre_sleep");
     CHECK(Value(local_path, "FrameLimiter", "reflex_sleep_bypass") == "true");
     CHECK(Value(local_path, "FrameLimiter", "developer_settings") == "false");
@@ -568,6 +571,20 @@ void TestFgLateSpacingKey() {
     CHECK(Config_DeveloperOverrides() == 1);
     Config_ResetDeveloperSettings();
     CHECK(g_config.fg_late_spacing && PacingPipeline_GetConfig().fg_late_spacing);
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// Developer A/B adaptive_cap_hold_room: false loads, reaches the pipeline, is
+// saved, counts as a developer override and resets to true.
+void TestAdaptiveCapHoldRoomKey() {
+    Reset(false, false, {{"config_version", "4"}, {"adaptive_cap_hold_room", "false"}});
+    CHECK(!g_config.adaptive_cap_hold_room);
+    CheckPipelineMatchesConfig();
+    CHECK(!PacingPipeline_GetConfig().adaptive_cap_hold_room);
+    CHECK(Value(local_path, "FrameLimiter", "adaptive_cap_hold_room") == "false");
+    CHECK(Config_DeveloperOverrides() == 1);
+    Config_ResetDeveloperSettings();
+    CHECK(g_config.adaptive_cap_hold_room && PacingPipeline_GetConfig().adaptive_cap_hold_room);
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
@@ -1031,6 +1048,7 @@ int main() {
     TestGpuPacedCadenceKey();
     TestGpuPacedHoldMarginKey();
     TestGpuPacedReleaseSmoothingKey();
+    TestAdaptiveCapHoldRoomKey();
     TestBypassLowLatencyOffKey();
     TestSourcePlacementParsing();
     TestPacingMethodMigration();

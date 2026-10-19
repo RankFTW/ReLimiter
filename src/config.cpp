@@ -427,6 +427,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.gpu_paced_cadence=ReadINIBool(S,"gpu_paced_cadence",false,P);
     g_config.gpu_paced_release_smoothing=ReadINIBool(S,"gpu_paced_release_smoothing",false,P);
     g_config.bypass_low_latency_off=ReadINIBool(S,"bypass_low_latency_off",false,P);
+    g_config.adaptive_cap_hold_room=ReadINIBool(S,"adaptive_cap_hold_room",true,P);
     g_config.reflex_sleep_bypass=ReadINIBool(S,"reflex_sleep_bypass",true,P);
     g_config.reflex_inject           = ReadINIBool(S, "reflex_inject", false, P);
     g_config.flip_model_override     = ReadINIBool(S, "flip_model_override", false, P);
@@ -646,6 +647,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIString(S, "gpu_paced_hold_margin", PacingHoldMargin_Text(config.gpu_paced_hold_margin), P);
     WriteINIBool(S, "gpu_paced_release_smoothing", config.gpu_paced_release_smoothing, P);
     WriteINIBool(S, "bypass_low_latency_off", config.bypass_low_latency_off, P);
+    WriteINIBool(S, "adaptive_cap_hold_room", config.adaptive_cap_hold_room, P);
     WriteINIString(S, "source_placement",
         PacingPlacementOverride_Text(config.source_placement), P);
     WriteINIDouble(S, "stall_inject_ms", config.stall_inject_ms, P);
@@ -891,6 +893,7 @@ static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
     pipeline.gpu_paced_cadence = config.gpu_paced_cadence;
     pipeline.gpu_paced_hold_margin = config.gpu_paced_hold_margin;
     pipeline.gpu_paced_release_smoothing = config.gpu_paced_release_smoothing;
+    pipeline.adaptive_cap_hold_room = config.adaptive_cap_hold_room;
     return pipeline;
 }
 
@@ -922,6 +925,7 @@ int Config_DeveloperOverrides() {
         (g_config.gpu_paced_hold_margin != d.gpu_paced_hold_margin) +
         (g_config.gpu_paced_release_smoothing != d.gpu_paced_release_smoothing) +
         (g_config.bypass_low_latency_off != d.bypass_low_latency_off) +
+        (g_config.adaptive_cap_hold_room != d.adaptive_cap_hold_room) +
         (g_config.source_placement != d.source_placement);
 }
 
@@ -943,6 +947,7 @@ void Config_ResetDeveloperSettings() {
     g_config.gpu_paced_hold_margin = d.gpu_paced_hold_margin;
     g_config.gpu_paced_release_smoothing = d.gpu_paced_release_smoothing;
     g_config.bypass_low_latency_off = d.bypass_low_latency_off;
+    g_config.adaptive_cap_hold_room = d.adaptive_cap_hold_room;
     g_config.source_placement = d.source_placement;
     Config_ApplyPacingPipeline();
     LOG_INFO("Config: developer diagnostics reset to the recommended defaults");
@@ -992,6 +997,9 @@ void ApplyConfig() {
     if (!g_config.fg_late_spacing)
         LOG_WARN("Pacing pipeline: diagnostic FG late-frame spacing off (the next real frame after one that "
                  "reached its FG input late is released on its original target)");
+    if (!g_config.adaptive_cap_hold_room)
+        LOG_WARN("Pacing pipeline: diagnostic Adaptive cap hold room off (the interval follows only late frames "
+                 "and the workload reports, not the interval the GPU queue wait needs to hold frames)");
     if (g_config.gpu_paced_cadence)
         LOG_WARN("Pacing pipeline: diagnostic GPU-paced cadence on (held frames are released no earlier than "
                  "the render handoff GPU floor, and a frame whose release that floor sets keeps the GPU's pace "

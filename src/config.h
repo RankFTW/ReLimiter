@@ -95,6 +95,7 @@ struct Config {
     PacingHoldMargin gpu_paced_hold_margin = PacingHoldMargin::Off; // developer A/B: off (default) | 75 | 90; with gpu_paced_cadence the VRR cadence runs at that quantile of the GPU's recent frame need (64-bit)
     bool gpu_paced_release_smoothing = false; // developer A/B: off (default) | on; with gpu_paced_cadence a later GPU floor deepens the queue for a few frames instead of moving the release rhythm (64-bit)
     bool bypass_low_latency_off = false; // developer A/B: off (default) | on; the driver's low latency mode is turned off while the Reflex Sleep is bypassed (64-bit)
+    bool adaptive_cap_hold_room = true; // developer A/B: on (default) | off; with Adaptive cap and the Auto GPU queue wait the interval is kept at least at the hold room
     PacingPlacementOverride source_placement = PacingPlacementOverride::PreSleep; // developer: marker | pre_sleep | driver (pre_sleep is the default)
 
     // Reflex Injection

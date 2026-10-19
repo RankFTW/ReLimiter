@@ -1336,7 +1336,9 @@ static GovernorDecision UpdatePeriodGovernor(
     frame.missed = s_governor_miss_pending;
     s_governor_miss_pending = false;
     TakeLeadOutputs(&frame.outputs, &frame.late_outputs);
-    if (config.rung_override == PacingRungOverride::Auto &&
+    // Developer A/B adaptive_cap_hold_room: off leaves the interval to the
+    // late-frame evidence and the workload reports.
+    if (config.adaptive_cap_hold_room && config.rung_override == PacingRungOverride::Auto &&
         PacingPipeline_LeadRung(pipeline) == PacingRung::GpuQueueWait) {
         frame.room_us = s_source_stage.Lead().HoldRoomUs(fg_divisor, frame.quantile);
     }

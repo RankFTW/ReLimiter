@@ -329,6 +329,7 @@ namespace
         std::atomic<bool> gpu_paced_cadence{ kDefaultConfig.gpu_paced_cadence };
         std::atomic<PacingHoldMargin> gpu_paced_hold_margin{ kDefaultConfig.gpu_paced_hold_margin };
         std::atomic<bool> gpu_paced_release_smoothing{ kDefaultConfig.gpu_paced_release_smoothing };
+        std::atomic<bool> adaptive_cap_hold_room{ kDefaultConfig.adaptive_cap_hold_room };
         std::atomic<double> stall_inject_ms{ kDefaultConfig.stall_inject_ms };
         std::atomic<double> stall_inject_period_s{ kDefaultConfig.stall_inject_period_s };
     };
@@ -355,6 +356,8 @@ namespace
             s_config.gpu_paced_hold_margin.load(std::memory_order_relaxed);
         config.gpu_paced_release_smoothing =
             s_config.gpu_paced_release_smoothing.load(std::memory_order_relaxed);
+        config.adaptive_cap_hold_room =
+            s_config.adaptive_cap_hold_room.load(std::memory_order_relaxed);
         config.stall_inject_ms = s_config.stall_inject_ms.load(std::memory_order_relaxed);
         config.stall_inject_period_s =
             s_config.stall_inject_period_s.load(std::memory_order_relaxed);
@@ -556,6 +559,7 @@ void PacingPipeline_SetConfig(const PacingPipelineConfig& config) noexcept
     s_config.gpu_paced_cadence.store(safe_config.gpu_paced_cadence, std::memory_order_relaxed);
     s_config.gpu_paced_hold_margin.store(safe_config.gpu_paced_hold_margin, std::memory_order_relaxed);
     s_config.gpu_paced_release_smoothing.store(safe_config.gpu_paced_release_smoothing, std::memory_order_relaxed);
+    s_config.adaptive_cap_hold_room.store(safe_config.adaptive_cap_hold_room, std::memory_order_relaxed);
     s_config.stall_inject_ms.store(safe_config.stall_inject_ms, std::memory_order_relaxed);
     s_config.stall_inject_period_s.store(
         safe_config.stall_inject_period_s, std::memory_order_relaxed);
