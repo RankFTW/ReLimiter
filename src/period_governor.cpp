@@ -338,10 +338,19 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
         reported = GovernorCause::ProbeFailed;
     }
     // A release fall that brought evidence back failed: return, and scale
-    // the demand so later falls stop above the interval that failed.
-    if (releasing_from_stretch_ > 0.0 && evidence) {
+    // the demand so later falls stop above the interval that failed. The
+    // fall is to blame only once the realized interval is below the level
+    // it fell from: while the hold room keeps it there, the evidence is not
+    // the fall's (Rogue Core: a fall the room held at +39% "failed" on a
+    // loading hitch and set k = 1.55 for minutes). The scale rises only when
+    // the measured need set the level the interval fell to, not the cap
+    // (release_need_us_ 0) and not the hold room: there the interval at the
+    // evidence says nothing about the need (Rogue Core: two falls to the cap
+    // at a need of 4.6-5.5 ms set k = 1.40 and 1.69, which then lifted the
+    // GPU-bound need of a heavier scene to +59%).
+    if (releasing_from_stretch_ > 0.0 && evidence && stretch_ < releasing_from_stretch_ - kStretchEpsilon) {
         target_stretch_ = std::max(target_stretch_, releasing_from_stretch_);
-        if (IsPositiveFinite(release_need_us_)) {
+        if (IsPositiveFinite(release_need_us_) && room_stretch_ < stretch_ - kStretchEpsilon) {
             demand_scale_ = std::max(demand_scale_, paced(base_us * stretch_) / release_need_us_);
         }
         releasing_from_stretch_ = 0.0;
@@ -415,7 +424,8 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
                 const double next_us = std::max(base_us, need_us + margin_us);
                 if (next_us < target_us - kStretchEpsilon * base_us) {
                     releasing_from_stretch_ = std::max(releasing_from_stretch_, target_stretch_);
-                    release_need_us_ = measured_need_us;
+                    // A fall to the cap was not set by the need (above).
+                    release_need_us_ = next_us > base_us ? measured_need_us : 0.0;
                     target_stretch_ = next_us / base_us;
                     probing_from_stretch_ = 0.0;
                     last_fall_qpc_ = qpc;

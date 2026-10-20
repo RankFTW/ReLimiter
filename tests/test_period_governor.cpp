@@ -502,6 +502,69 @@ namespace
         CHECK_NEAR(harness.governor.DemandScale(), 1.0, 1e-12);
     }
 
+    // A release to the cap (the need plus a margin below it) that brings
+    // evidence back fails and returns, but the cap, not the need, set the
+    // level it fell to: the demand scale stays 1.
+    void TestFailedFallToCapKeepsScale()
+    {
+        Harness harness;
+        harness.Run(30, 12'000.0);
+        for (int frame = 0; frame < 200 && harness.Target() < 12'000.0; ++frame) {
+            harness.Demand(12'000.0);
+            harness.Frame(false, true);
+        }
+        const double risen = harness.Target();
+        CHECK(harness.RunUntil(GovernorCause::Release, 1000, 7'000.0) > 0);
+        CHECK_NEAR(harness.Target(), kBase, 1e-6);
+        for (int frame = 0; frame < 200 && harness.governor.Stretch() > 1.05; ++frame) {
+            harness.Demand(7'000.0, 1, true);
+            harness.Frame();
+        }
+        GovernorDecision decision{};
+        for (int frame = 0; frame < 6; ++frame) {
+            harness.Demand(7'000.0, 1, true);
+            decision = harness.Frame(false, true);
+        }
+        CHECK(decision.cause == GovernorCause::ReleaseFailed);
+        CHECK(harness.governor.Statistics().release_failures == 1);
+        CHECK_NEAR(harness.Target(), risen, 1e-6);
+        CHECK_NEAR(harness.governor.DemandScale(), 1.0, 1e-12);
+    }
+
+    // A fall is to blame only once the realized interval is below the level
+    // it fell from. With the hold room above that level, evidence right after
+    // the fall is not a failed release. With the room below that level but
+    // above the fall's target, it is one, and the interval returns, but the
+    // room set the interval at the evidence: the demand scale stays 1.
+    void TestFallUnderHoldRoomAttribution()
+    {
+        for (const bool room_above : {true, false}) {
+            Harness harness;
+            harness.Run(30, 12'000.0);
+            for (int frame = 0; frame < 200 && harness.Target() < 12'000.0; ++frame) {
+                harness.Demand(12'000.0);
+                harness.Frame(false, true);
+            }
+            const double risen = harness.Target();
+            harness.room_us = room_above ? risen + 600.0 : 11'500.0;
+            CHECK(harness.RunUntil(GovernorCause::Release, 1000, 10'000.0) > 0);
+            for (int frame = 0; frame < 40; ++frame) {
+                harness.Demand(10'000.0, 1, true);
+                harness.Frame();
+            }
+            CHECK_NEAR(harness.governor.Stretch(), harness.room_us / kBase, 1e-9);
+            GovernorDecision decision{};
+            for (int frame = 0; frame < 6; ++frame) {
+                harness.Demand(10'000.0, 1, true);
+                decision = harness.Frame(false, true);
+            }
+            CHECK((decision.cause == GovernorCause::ReleaseFailed) == !room_above);
+            CHECK(harness.governor.Statistics().release_failures == (room_above ? 0u : 1u));
+            if (!room_above) CHECK_NEAR(harness.Target(), risen, 1e-6);
+            CHECK_NEAR(harness.governor.DemandScale(), 1.0, 1e-12);
+        }
+    }
+
     // GPU execution time does not grow with the interval: while it binds most
     // reports of the newest second no probe starts. Once a CPU stage binds
     // the majority, the probe follows.
@@ -872,6 +935,8 @@ int main()
     TestFailedProbeBacksOff();
     TestFailedReleaseScalesDemand();
     TestReleaseUnderHoldRoomHolds();
+    TestFailedFallToCapKeepsScale();
+    TestFallUnderHoldRoomAttribution();
     TestNoProbeWhileGpuBinds();
     TestProbeWaitsAfterRelease();
     TestRecurringLoadHolds();

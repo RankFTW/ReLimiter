@@ -33,7 +33,11 @@
 // for a calm second failed: the target returns to the level before it, and
 // the demand scale k (1 after a reset) becomes at least the realized interval
 // at the evidence over the need the fall used, so every later need, rise
-// and fall is k times the measured one and no probe runs. Gears of War:
+// and fall is k times the measured one and no probe runs. A fall is to blame
+// only once the realized interval is below the level it fell from (the hold
+// room can keep it there), and k rises only when the measured need set the
+// level the interval fell to: not a fall to the cap, and not while the hold
+// room sets the realized interval. Gears of War:
 // E-Day held FG 2× fell to the GPU work's +10% every 5–10 s and climbed back to
 // +28%: at the same interval its render thread either kept up or ran a frame
 // behind, and only the latter showed in the stage times. The realized
