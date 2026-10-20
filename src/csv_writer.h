@@ -46,9 +46,8 @@ enum class PacingCsvEventType : uint8_t {
     // Derived from Source records
     GovernorStep = 16,   // governor phase transition: value governor step, previous_value the
                          // previous governed record's step, reason GovernorCause
-    RungFeasibility = 17, // value 1 demoted / 0 not, previous_value previous state, reason FeasibilityCause
-    GpuWaitCap = 18      // GPU wait cap ladder level change: value new level (0..3), previous_value previous
-                         // record's level, reason GpuWaitCapCause
+    RungFeasibility = 17 // value 1 demoted / 0 not, previous_value previous state, reason FeasibilityCause
+    // 18 was gpu_wait_cap (the GPU wait cap ladder, removed 2026-10-20); older files carry it.
 };
 
 // Cumulative pacing telemetry producer drops (full queue or worker stopped).
@@ -108,8 +107,7 @@ struct PacingCsvEvent {
     uint64_t value = 0;
     uint64_t native_swapchain = 0;     // loss-window rows; selected swapchain of snapshot rows
     uint8_t reason = 0;                // grid-epoch rows: PacingEpochReason; pipeline-change rows: PacingFallbackReason;
-                                       // governor-step rows: GovernorCause; rung-feasibility rows: FeasibilityCause;
-                                       // gpu-wait-cap rows: GpuWaitCapCause
+                                       // governor-step rows: GovernorCause; rung-feasibility rows: FeasibilityCause
     double clock_map_offset_us = 0.0;  // clock-map rows
     PacingQueueDrops drops{};          // queue-drop rows
     PacingJoinStatistics join{};       // join-statistics rows

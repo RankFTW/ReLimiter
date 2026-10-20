@@ -164,8 +164,8 @@ struct SchedulerPacingStatus {
 	bool hold_overloaded = false;          // every Auto hold resolves source only
 	// Collision-aware release (lead_controller.h). Current on every publication;
 	// counters since the lead controller's last lifecycle reset.
-	double release_margin_us = 0.0;        // learned release margin M (to the next Present call)
-	double release_headroom_us = 0.0;      // learned release headroom H (to the next frame's heavy GPU work)
+	double release_margin_us = 0.0;        // fixed release margin M (to the next Present call)
+	double release_headroom_us = 0.0;      // release headroom H (to the next frame's heavy GPU work; gpu_wait_headroom_us)
 	bool collision_headroom = false;       // the newest judged lead used the headroom guard (else the margin)
 	double collision_limit_us = 0.0;       // newest judged GPU queue wait limit; 0 = none
 	uint32_t collision_checked = 0;        // GPU queue wait leads judged (D or C window warm)
@@ -181,14 +181,6 @@ struct SchedulerPacingStatus {
 	// Developer A/B interleave (gpu_wait_interleave_s).
 	uint8_t hold_interleave = 0;              // 0 off, 1 held block, 2 not-held block
 	double hold_interleave_remaining_s = 0.0; // seconds until the block ends
-
-	// GPU queue wait cap (rung_feasibility.h GpuWaitCap). Current on every publication.
-	double gpu_wait_cap_us = 0.0;       // the cap at the current level
-	uint8_t gpu_wait_cap_level = 0;     // 0 = gpu_wait_budget_us .. 3 = half of it
-	uint32_t gpu_wait_cap_late = 0;     // late resumes (u − o > 1 ms) in the window
-	uint32_t gpu_wait_cap_samples = 0;  // waited resumes in the window (at most 64)
-	bool gpu_wait_cap_checking = false; // the newest step down is being checked
-	bool gpu_wait_cap_open = false;     // the open top: no cap (Auto, next frame's GPU work behind the wait)
 
 	// Period governor. Current on every publication.
 	bool governor_enabled = false;     // adaptive_cap

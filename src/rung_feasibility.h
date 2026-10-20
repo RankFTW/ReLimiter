@@ -1,6 +1,6 @@
 #pragma once
 
-// Feasibility evidence, the overload guard and the GPU queue wait cap.
+// Feasibility evidence and the overload guard.
 // The earlier rung reduction was removed; the overload guard returns as
 // measured guards:
 // - HoldFeasibility: every Auto hold rung, FG input wait included, resolves
@@ -9,15 +9,17 @@
 //   the interval) until a 2 s window passes without restarts. Output
 //   overrides are never changed.
 // - HoldInterleave: the developer A/B blocks of the Auto GPU queue wait.
-// - GpuWaitCap: the GPU queue wait stays on; late GPU resumes lower the cap
-//   on its lead (median X + cap), a calm stretch raises it again.
 // - Feasibility_LeadInfeasible, still a missed frame for the Adaptive cap;
-// - FeasibilityCause and GpuWaitCapCause, the telemetry event reasons.
+// - FeasibilityCause, the telemetry event reasons.
 // An earlier saturation fallback (the Auto GPU
 // queue wait off after more than 32 of 128 waited resumes late, back on by
 // GPU load) was replaced by the collision-aware release (lead_controller.h):
 // late resumes came from the next Present call landing within
 // about 2.5 ms of the release Signal, which GPU load only correlated with.
+// The GPU wait cap ladder that followed (the lead at most median X + a cap
+// lowered by late resumes) was removed as well: at a fixed distance to the
+// next frame's heavy GPU work, shorter holds were the late ones, so a cap on
+// the hold length pushed the wrong way (lead_controller.h, collision guard).
 // Pure C++17 without Windows, logger or config dependencies.
 
 #include "lead_controller.h"
@@ -31,27 +33,6 @@
 
 constexpr uint32_t FEASIBILITY_NEGATIVE_SLACK_MIN = 24;   // of the last 120 slack samples
 
-// GPU wait cap ladder. The levels are fractions of the developer
-// key gpu_wait_budget_us (default 1.5 ms: 1.5 / 1.25 / 1.0 / 0.75 ms).
-constexpr uint32_t GPU_WAIT_CAP_LEVELS = 4;
-constexpr std::array<double, GPU_WAIT_CAP_LEVELS> GPU_WAIT_CAP_FRACTIONS = { 1.0, 5.0 / 6.0, 2.0 / 3.0, 0.5 };
-constexpr uint32_t GPU_WAIT_CAP_WINDOW = 64;           // newest waited resumes judged for a step down
-constexpr double GPU_WAIT_CAP_DOWN_SHARE = 0.05;       // step down: more than 5% of them late
-constexpr double GPU_WAIT_CAP_DOWN_DWELL_S = 0.5;      // a step down at least 0.5 s after any change
-constexpr double GPU_WAIT_CAP_TRIAL_FROM_S = 2.0;      // a step down is checked on the waited
-constexpr double GPU_WAIT_CAP_TRIAL_UNTIL_S = 3.0;     // resumes from 2 s to 3 s after it
-constexpr uint32_t GPU_WAIT_CAP_TRIAL_MIN_SAMPLES = 32; // fewer: the step down stands unchecked
-constexpr double GPU_WAIT_CAP_BACKOFF_S = 30.0;        // no step down this long after a failed check
-constexpr double GPU_WAIT_CAP_UP_CALM_S = 30.0;        // step up after this long ...
-constexpr double GPU_WAIT_CAP_UP_SHARE = 0.01;         // ... with at most 1% late
-constexpr uint32_t GPU_WAIT_CAP_UP_MIN_SAMPLES = 20;   // the calm share is judged from this many on
-// Open top: the level value (telemetry gpu_wait_cap_level) of
-// "no cap", above level 0. The scheduler allows it with Output override
-// Auto, GPU Wait Probes and the queue-order verdict that the next frame's GPU
-// work runs behind the wait (lead_controller.h): late resumes cannot come
-// from the wait there. In CONTROL Resonant a budget of 4000 (effectively no
-// cap) gave adjacent jitter p50 0.10 ms against 1.04 ms at 1500, no late resume.
-constexpr uint32_t GPU_WAIT_CAP_OPEN = 255;
 
 // Lead infeasible: a full window of slack samples with at least 24
 // negative while the bucket's lead is budget-limited. The Adaptive cap
@@ -88,19 +69,6 @@ enum class FeasibilityCause : uint8_t {
 };
 
 const char* FeasibilityCause_Text(FeasibilityCause cause) noexcept;
-
-// gpu_wait_cap event reasons.
-enum class GpuWaitCapCause : uint8_t {
-    None = 0,
-    LateResumes = 1, // stepped down: more than 5% of the newest 64 waited resumes late
-    TrialFailed = 2, // the step down's check found the resumes still late: back up one level
-    Calm = 3,        // stepped up after 30 s with at most 1% late
-    Reset = 4,       // lifecycle, cap, FG divisor or route change: back to the budget
-    Opened = 5,      // the open top became allowed at level 0: no cap
-    Closed = 6       // the open top is no longer allowed: back to the budget
-};
-
-const char* GpuWaitCapCause_Text(GpuWaitCapCause cause) noexcept;
 
 // ── Overload guard ──
 
@@ -182,85 +150,3 @@ private:
     uint64_t rng_ = 0x9E3779B97F4A7C15ull;
 };
 
-// ── GPU queue wait cap ──
-
-struct GpuWaitCapTransition {
-    bool changed = false;
-    uint32_t level = 0;          // after the transition; GPU_WAIT_CAP_OPEN for the open top
-    uint32_t previous_level = 0; // likewise
-    GpuWaitCapCause cause = GpuWaitCapCause::None;
-    // The evidence: LateResumes the full window, TrialFailed the trial's
-    // resumes, Calm the calm stretch's resumes.
-    uint32_t late = 0;
-    uint32_t samples = 0;
-};
-
-// The cap ladder of the GPU queue wait. GPU resumes more than 1 ms after the Signal come in
-// slow states lasting about a second, more likely the longer the GPU has
-// recently waited. The ladder steps down one level when more than 5% of the
-// newest 64 waited resumes were late (at least 0.5 s after any change; the
-// window restarts). A step down is checked on the waited resumes from 2 s to
-// 3 s after it: with at least 32 of them and more than 5% late, the shorter
-// wait cured nothing (a loaded GPU), so the cap returns to the level before
-// and no step down is tried for 30 s. After 30 s in which at most 1% of the
-// waited resumes were late (judged from 20 on), it steps up one level.
-// While the open top is allowed (GPU_WAIT_CAP_OPEN) there is one more level
-// above level 0, no cap: entered at once at level 0, and after a step down
-// from it only by the same calm stretch; a failed check of that step down
-// returns to it. When it is no longer allowed the cap returns to level 0.
-// Owner only; pure, fixed storage, not thread-safe.
-class GpuWaitCap {
-public:
-    // Level 0 (the budget), the open top closed, windows, check and backoff
-    // cleared.
-    void Reset() noexcept;
-    // The waited resumes recorded since the previous call (LeadStatistics
-    // resume_waited_samples and resume_late_samples deltas; late <= waited),
-    // observed at qpc. Late ones are taken first. The 0.5 s dwell, the check
-    // and the backoff allow at most one level change per call; ignored with
-    // an invalid clock.
-    GpuWaitCapTransition OnResumes(int64_t qpc, int64_t frequency, uint32_t waited, uint32_t late) noexcept;
-    // Whether the open top is allowed, once per frame: opens it at level 0
-    // unless a step down from it awaits its calm stretch or check (Opened),
-    // closes it when no longer allowed (Closed).
-    GpuWaitCapTransition SetTopAllowed(bool allowed, int64_t qpc) noexcept;
-
-    uint32_t Level() const noexcept { return level_; }
-    bool Open() const noexcept { return open_; }
-    // The level value for telemetry: GPU_WAIT_CAP_OPEN while open, else Level().
-    uint32_t TelemetryLevel() const noexcept { return open_ ? GPU_WAIT_CAP_OPEN : level_; }
-    // budget_us times the level's fraction; 0 (no cap) while open, and for
-    // a non-positive or non-finite budget.
-    double CapUs(double budget_us) const noexcept;
-    uint32_t WindowSamples() const noexcept { return count_; }
-    uint32_t WindowLate() const noexcept { return late_count_; }
-    bool Checking() const noexcept { return trial_; }
-    GpuWaitCapCause LastCause() const noexcept { return last_cause_; }
-
-private:
-    GpuWaitCapTransition OnResume(int64_t qpc, int64_t frequency, bool late) noexcept;
-    // A step down or a failed check: the window and the calm stretch restart.
-    void Step(int64_t qpc, uint32_t level) noexcept;
-    // Opens or closes the top as a transition with the given cause.
-    GpuWaitCapTransition SetOpen(int64_t qpc, bool open, GpuWaitCapCause cause) noexcept;
-
-    std::array<uint8_t, GPU_WAIT_CAP_WINDOW> window_{}; // 1 = late
-    uint32_t head_ = 0;  // next write position; the oldest sample once full
-    uint32_t count_ = 0;
-    uint32_t late_count_ = 0;
-    uint32_t level_ = 0;
-    bool open_ = false;           // above level 0: no cap
-    bool top_allowed_ = false;    // the scheduler's newest SetTopAllowed
-    bool reopen_on_calm_ = false; // stepped down from the open top: reopen only after calm
-    bool trial_from_open_ = false; // the running check is of a step down from the open top
-    int64_t last_change_qpc_ = 0;    // 0 = no change yet
-    int64_t calm_since_qpc_ = 0;     // 0 = the calm stretch starts at the next resume
-    uint32_t calm_count_ = 0;
-    uint32_t calm_late_ = 0;
-    bool trial_ = false;
-    int64_t trial_start_qpc_ = 0;
-    uint32_t trial_count_ = 0;
-    uint32_t trial_late_ = 0;
-    int64_t down_blocked_until_qpc_ = 0; // 0 = no backoff
-    GpuWaitCapCause last_cause_ = GpuWaitCapCause::None;
-};

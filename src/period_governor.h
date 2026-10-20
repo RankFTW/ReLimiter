@@ -44,9 +44,9 @@
 // interval moves at most +3% / -1% per frame. The
 // hold room is a floor beside this target: while the Auto GPU
 // queue wait reports one, the realized interval is at least the Adaptive cap
-// percentile of the intervals at which its frames reach the GPU wait before
-// their collision-guarded release (lead_controller.h), the smallest interval
-// that lets that share be held; above the maximum stretch it is infeasible
+// percentile of the intervals at which its frames are held at least a minimum
+// hold before their collision-guarded release (lead_controller.h: the guard's
+// inequality solved for the interval), the smallest interval
 // and not applied. No evidence gates it: that interval does not grow with
 // the interval it buys (release falls of 20 sessions). On
 // VRR every change is a silent grid rebase; on snapped fixed refresh the
@@ -195,7 +195,7 @@ struct GovernorFrame {
     uint32_t late_outputs = 0;
     // Hold room (Auto GPU queue wait, LeadController::HoldRoomUs): the
     // interval at which the Adaptive cap percentile of recent judged frames
-    // reaches the GPU wait before its guarded release; 0 = none. A floor of
+    // is held at least the minimum hold before its guarded release; 0 = none. A floor of
     // the realized interval while it is within GOVERNOR_MAX_STRETCH, on VRR
     // without LFC and on unsnapped fixed refresh.
     double room_us = 0.0;

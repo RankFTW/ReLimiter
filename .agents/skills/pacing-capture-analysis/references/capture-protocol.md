@@ -11,7 +11,7 @@ Record or hold constant:
 - Graphics API, enforcement path, marker source, and native/injected Reflex state
 - Target FPS, pacing mode, wake guard, background cap, and FG-off cap
 - FG type and configured/detected multiplier; DMFG mode and driver target
-- Smoothing (`smoothing`: `off` or `on`; the earlier `low`/`medium`/`high` are `on`), Adaptive cap state (`adaptive_cap`; the evidence-gated controller since 2026-10-04, the Swappy-style windowed rules of the design review 2026-10-03 before it, the Phase 4 continuous tracker with hold and probe rules before that, Phase 3 stepped governor, earlier builds the continuous offset with its percentile, window and bias), Output override, GPU Wait Probes and the developer `gpu_wait_budget_us` (default 1500 µs, the top level of the GPU wait cap ladder since 2026-10-04; 0 loads as 1500 and meant off in earlier builds)
+- Smoothing (`smoothing`: `off` or `on`; the earlier `low`/`medium`/`high` are `on`), Adaptive cap state (`adaptive_cap`; the evidence-gated controller since 2026-10-04, the Swappy-style windowed rules of the design review 2026-10-03 before it, the Phase 4 continuous tracker with hold and probe rules before that, Phase 3 stepped governor, earlier builds the continuous offset with its percentile, window and bias), Output override, GPU Wait Probes and the developer `gpu_wait_headroom_us` (default 1000 µs, the release headroom of the collision-aware release since 2026-10-20; builds from 2026-10-04 to 2026-10-20 had `gpu_wait_budget_us` instead, default 1500 µs, the top level of the GPU wait cap ladder, and 0 loaded as 1500 and meant off in earlier builds)
 - Reflex Sleep bypass (`reflex_sleep_bypass`, default `true` since 2026-10-09: the game's NvAPI Sleep never reaches the driver while ReLimiter paces a positive cap, held or not), source placement (`source_placement`, default `pre_sleep`), `config_version` (2 = INI on the 2026-10-09 defaults) and `log_level` (`info` writes the `Hold feasibility:`, `Render handoff limit:` and `Scheduler: cap/FG change` lines that date transitions inside a capture). A latency conclusion needs Reflex active (FG forces it on); record whether it was.
 - Native PC Latency collection (`native_pcl_enabled`), ETW permission and status, and FrameView version/options
 
@@ -88,13 +88,13 @@ The dependency-free regression script `scripts/test_archive_capture.ps1` runs on
 
 Question: does the output hold reduce display jitter compared with releasing the game on the cadence alone, and where does it stop helping? The kit is `assets/pacing-evaluation-plan.json` (the single source of the setups, scenes, protocol, thresholds and decision rule) and `scripts/compare_pacing.py`.
 
-Setups (arms), switched in-session from the OSD's **Advanced → Developer diagnostics** (shown only with `developer_settings=true`, which `common_settings` sets); every other setting is held by the plan's `common_settings` (`config_version=2` so the INI is not moved to the 2026-10-09 defaults, `native_pcl_enabled=true`, Adaptive cap off, GPU Wait Probes on, `gpu_wait_budget_us=1500`, Reflex Sleep bypass off so Arm C's driver limiter can apply):
+Setups (arms), switched in-session from the OSD's **Advanced → Developer diagnostics** (shown only with `developer_settings=true`, which `common_settings` sets); every other setting is held by the plan's `common_settings` (`config_version=2` so the INI is not moved to the 2026-10-09 defaults, `native_pcl_enabled=true`, Adaptive cap off, GPU Wait Probes on, `gpu_wait_headroom_us=1000`, Reflex Sleep bypass off so Arm C's driver limiter can apply):
 
 | Arm | Settings | Answers |
 |---|---|---|
 | A | Smoothing off | the release cadence alone (baseline) |
-| B | Smoothing on, Output override Auto | the shipping hold, with the GPU wait cap, the collision-aware release of the GPU queue wait and the overload fallback |
-| Bp | Smoothing on, Output override GPU wait | the hold without the overload fallback and the collision-aware release (an override bypasses only those two; it keeps the GPU wait cap) |
+| B | Smoothing on, Output override Auto | the shipping hold, with the collision-aware release of the GPU queue wait and the overload fallback |
+| Bp | Smoothing on, Output override GPU wait | the hold without the overload fallback and the collision-aware release (an override bypasses only those two; the lead is the plain lead, with no cap since 2026-10-20) |
 | C | Source placement Reflex driver limiter | ReLimiter's release cadence against NVIDIA's limiter |
 
 Procedure:
@@ -147,7 +147,7 @@ Analysis:
   - The post-wait work does not interrupt a running packet of another queue on the same engine: no packet was marked preempted (`QueuePacket/win:Stop`, `bPreempted`) among 1.07 million in session 31224.
   - There, a waited resume was max(132 µs, the running packet's remaining time + 96 µs) within −13 / +19 µs (p10 / p90).
   - Locate the game's long packets relative to its Present call and to the release. Their position before the next Present call is where releases collide, so the timeline predicts collisions at margins the capture did not reach.
-  - Compare the start of each frame's first long packet with `r − A` (`ready_gpu_qpc` minus `reflex_gpu_active_render_us`), the reference of the release headroom guard (from 2026-10-08). In session 31224 it was within −117 / +65 µs (p10 / p90). A wider spread in another game means the headroom guard's reference is off there; check the margin fallback's figures before trusting the headroom.
+  - Compare the start of each frame's first long packet with `r − A` (`ready_gpu_qpc` minus `reflex_gpu_active_render_us`), the reference of the release headroom guard (from 2026-10-08). In session 31224 it was within −117 / +65 µs (p10 / p90). A wider spread in another game means the headroom guard's reference is off there; check the margin fallback's figures before trusting the headroom. The headroom is a fixed distance since 2026-10-20, so a different spread cannot be absorbed by a learned value any more.
 
 ## Minimum report
 

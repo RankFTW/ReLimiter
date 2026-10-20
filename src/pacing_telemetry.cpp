@@ -151,7 +151,7 @@ namespace
         KnownValue pipeline_generation;   // Source records with pipeline_generation != 0
         uint32_t pipeline_rung = 0;       // plan_rung of the record that showed pipeline_generation
         uint8_t pipeline_reason = 0;      // PacingFallbackReason of pipeline_generation
-        PacingControllerEventState controllers{}; // governor_step, rung_feasibility and gpu_wait_cap
+        PacingControllerEventState controllers{}; // governor_step and rung_feasibility
         bool loss_window_active = false;
         uint64_t loss_window_swapchain = 0;
         PacingClockMapStatus clock_map_status = PacingClockMapStatus::Unknown;
@@ -269,13 +269,12 @@ namespace
         PushEvent(type, event_qpc, event);
     }
 
-    // governor_step, rung_feasibility and gpu_wait_cap rows, from the pure derivation.
+    // governor_step and rung_feasibility rows, from the pure derivation.
     void PushControllerEvents(const PacingControllerEvents& events, int64_t event_qpc) noexcept
     {
         const std::pair<PacingCsvEventType, const PacingControllerEvent*> rows[] = {
             { PacingCsvEventType::GovernorStep, &events.governor },
-            { PacingCsvEventType::RungFeasibility, &events.feasibility },
-            { PacingCsvEventType::GpuWaitCap, &events.gpu_wait_cap } };
+            { PacingCsvEventType::RungFeasibility, &events.feasibility } };
         for (const auto& [type, derived] : rows) {
             if (!derived->emit) continue;
             const KnownValue previous{ derived->has_previous, derived->previous_value };

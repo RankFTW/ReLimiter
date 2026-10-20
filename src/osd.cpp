@@ -273,24 +273,12 @@ static void DrawPacingPipelineStatus() {
     else
         ImGui::TextDisabled("Lead: - | Grid epoch: -");
     const bool gpu_rung = pipeline.rung == PacingRung::GpuQueueWait || pipeline.rung == PacingRung::FgInputWait;
-    // GPU wait cap ladder: shown on the GPU queue wait; orange
-    // below the budget; off at the open top.
     if (has_status && status.valid && pipeline.rung == PacingRung::GpuQueueWait) {
-        const char* checking = status.gpu_wait_cap_checking ? ", checking" : "";
-        if (status.gpu_wait_cap_open)
-            ImGui::TextDisabled("GPU wait cap off (next frame's GPU work waits behind the gate) | late resumes %u/%u",
-                status.gpu_wait_cap_late, status.gpu_wait_cap_samples);
-        else if (status.gpu_wait_cap_level > 0)
-            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "GPU wait cap %.0f us (level %u/%u%s) | late resumes %u/%u",
-                status.gpu_wait_cap_us, static_cast<unsigned>(status.gpu_wait_cap_level),
-                GPU_WAIT_CAP_LEVELS - 1u, checking, status.gpu_wait_cap_late, status.gpu_wait_cap_samples);
-        else
-            ImGui::TextDisabled("GPU wait cap %.0f us%s | late resumes %u/%u", status.gpu_wait_cap_us, checking,
-                status.gpu_wait_cap_late, status.gpu_wait_cap_samples);
-        // Collision-aware release: the learned headroom (to the next frame's
+        // Collision-aware release: the release headroom (to the next frame's
         // heavy GPU work) or, without current Reflex GPU active times, the
-        // learned margin (to the next Present call); the newest limit and
-        // the share of leads it lowered (Output override Auto only).
+        // release margin (to the next Present call); the newest limit, the
+        // share of leads it lowered and the late resumes measured (Output
+        // override Auto only).
         if (pipeline.reason == PacingFallbackReason::Override) {
             ImGui::TextDisabled("Release headroom %.2f ms, margin %.2f ms | guard off (output override)",
                 status.release_headroom_us / 1000.0, status.release_margin_us / 1000.0);
@@ -319,19 +307,15 @@ static void DrawPacingPipelineStatus() {
     HelpTip("Mode, output point and fallback reason resolved from Smoothing, the pacing route and the display. "
         "Lead is how far ahead of each output target the game is released; 'at budget' means it is clamped "
         "to three frame intervals. A grid epoch starts on a cap, LFC or FG divisor change, a fixed-refresh "
-        "Adaptive cap step, or after a late frame; the cadence never catches up. 'GPU wait cap' limits how "
-        "long a typical frame waits on the GPU before its target (lead <= median release-to-ready time + cap). "
-        "'Late resumes' counts GPU resumes more than 1 ms after the release among the last 64 that waited. "
-        "When more than 5% are late, the cap steps down (1.5, 1.25, 1.0, 0.75 ms by default); 'checking' "
-        "means a step down is judged 2-3 s later and undone if resumes are still late. After 30 s with at "
-        "most 1% late it steps back up. 'Release headroom' keeps the release at least this long before the "
-        "next frame's heavy GPU work starts (its GPU ready time minus its Reflex GPU active time): the GPU "
-        "does not interrupt that work for the frame being released, so the lead is limited to one interval "
-        "plus the game's short release-to-GPU-work time minus the headroom ('limit'); a frame that would need "
-        "more arrives a little late and is shown when ready. The headroom starts at 1 ms and is learned from "
-        "late resumes (0.75-3 ms). Without Reflex GPU times, 'Release margin' does the same against the next "
-        "frame's Present call instead (2.5 ms to start, 1-4 ms). 'guarded' is the share of leads the limit "
-        "lowered, 'late' the late resumes among those measured. 'Hold off' "
+        "Adaptive cap step, or after a late frame; the cadence never catches up. 'Release headroom' keeps "
+        "the release at least this long before the next frame's heavy GPU work starts (its GPU ready time "
+        "minus its Reflex GPU active time): the GPU does not interrupt that work for the frame being "
+        "released, so the lead is limited to one interval plus the game's short release-to-GPU-work time "
+        "minus the headroom ('limit'); a frame that would need more arrives a little late and is shown when "
+        "ready. The headroom is 1 ms. Without Reflex GPU times, 'Release margin' does the same against the "
+        "next frame's Present call instead (2.5 ms). 'guarded' is the share of leads the limit lowered, "
+        "'late' the waited GPU resumes more than 1 ms after the release among those measured; nothing acts "
+        "on them. 'Hold off' "
         "means ReLimiter stopped holding frames on its own (reason 'infeasible'): under overload, when more "
         "than 10% of frames restarted the cadence within 2 s and the Adaptive cap could not lengthen the "
         "interval; holds resume after 2 s without restarts. "
@@ -506,22 +490,21 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
     }
     HelpTip("GPU wait output only: GPU timestamp queries immediately before and after the queue Wait. "
         "The times are exported as gate_pre_wait_qpc and gate_post_wait_qpc in the pacing CSV, refine "
-        "the lead and measure the late GPU resumes that move the GPU wait cap. Off keeps the cap at the "
-        "budget and removes two command lists and two fence signals per frame from the game's queue.");
-    float budget = static_cast<float>(g_config.gpu_wait_budget_us);
-    ImGui::SliderFloat("GPU wait budget", &budget, static_cast<float>(kPacingGpuWaitBudgetMinUs),
-        static_cast<float>(kPacingGpuWaitBudgetMaxUs), "%.0f us", ImGuiSliderFlags_AlwaysClamp);
+        "the lead and measure the late GPU resumes shown on the Details lines. Off removes two command "
+        "lists and two fence signals per frame from the game's queue.");
+    float headroom = static_cast<float>(g_config.gpu_wait_headroom_us);
+    ImGui::SliderFloat("GPU wait release headroom", &headroom, static_cast<float>(kPacingGpuWaitHeadroomMinUs),
+        static_cast<float>(kPacingGpuWaitHeadroomMaxUs), "%.0f us", ImGuiSliderFlags_AlwaysClamp);
     if (ImGui::IsItemEdited())
-        g_config.gpu_wait_budget_us = static_cast<double>(budget);
+        g_config.gpu_wait_headroom_us = static_cast<double>(headroom);
     if (ImGui::IsItemDeactivatedAfterEdit()) {
         Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: GPU wait budget -> %.0f us", g_config.gpu_wait_budget_us);
+        LOG_INFO("OSD: GPU wait release headroom -> %.0f us", g_config.gpu_wait_headroom_us);
         *config_dirty = true;
     }
-    HelpTip("GPU wait output only: the highest GPU wait cap (default 1500 us). A typical frame waits on "
-        "the GPU at most the cap before its target (lead <= median release-to-ready time + cap); late GPU "
-        "resumes step the cap down to 5/6, 2/3 and 1/2 of this budget. Longer waits smooth more frames but "
-        "make late GPU resumes more likely; shorter ones leave more frames ready after their target.");
+    HelpTip("Diagnostic, GPU wait output with Output override Auto. How long before the next frame's heavy "
+        "GPU work a held frame is released (default 1000 us), so its resume does not queue behind that work. "
+        "It also sets the Adaptive cap hold room. For reproducing a report; leave it at the default.");
     float interleave_s = static_cast<float>(g_config.gpu_wait_interleave_s);
     ImGui::SliderFloat("GPU wait A/B blocks", &interleave_s, 0.0f,
         static_cast<float>(kPacingGpuWaitInterleaveMaxS), interleave_s > 0.0f ? "%.1f s" : "Off",

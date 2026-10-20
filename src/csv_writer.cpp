@@ -620,7 +620,6 @@ static const char* PacingEventTypeText(PacingCsvEventType type)
     case PacingCsvEventType::StallInjected: return "stall_injected";
     case PacingCsvEventType::GovernorStep: return "governor_step";
     case PacingCsvEventType::RungFeasibility: return "rung_feasibility";
-    case PacingCsvEventType::GpuWaitCap: return "gpu_wait_cap";
     }
     return "unknown";
 }
@@ -640,7 +639,6 @@ static bool PacingEventHasValue(const PacingCsvEvent& event)
     case PacingCsvEventType::StallInjected:
     case PacingCsvEventType::GovernorStep:
     case PacingCsvEventType::RungFeasibility:
-    case PacingCsvEventType::GpuWaitCap:
         return true;
     default:
         return false;
@@ -648,16 +646,14 @@ static bool PacingEventHasValue(const PacingCsvEvent& event)
 }
 
 // Grid-epoch rows carry the PacingEpochReason, pipeline-change rows the
-// PacingFallbackReason, governor-step rows the GovernorCause,
-// rung-feasibility rows the FeasibilityCause and gpu-wait-cap rows the
-// GpuWaitCapCause.
+// PacingFallbackReason, governor-step rows the GovernorCause and
+// rung-feasibility rows the FeasibilityCause.
 static bool PacingEventHasReason(const PacingCsvEvent& event)
 {
     return event.type == PacingCsvEventType::GridEpoch ||
         event.type == PacingCsvEventType::PipelineChange ||
         event.type == PacingCsvEventType::GovernorStep ||
-        event.type == PacingCsvEventType::RungFeasibility ||
-        event.type == PacingCsvEventType::GpuWaitCap;
+        event.type == PacingCsvEventType::RungFeasibility;
 }
 
 static bool PacingEventIsLossWindow(const PacingCsvEvent& event)

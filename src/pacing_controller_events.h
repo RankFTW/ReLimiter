@@ -1,7 +1,7 @@
 #pragma once
 
-// Controller events of the pacing telemetry worker: governor_step,
-// rung_feasibility and gpu_wait_cap,
+// Controller events of the pacing telemetry worker: governor_step and
+// rung_feasibility,
 // derived from Source record fields like the grid-epoch and pipeline-change
 // events. Pure C++17 without Windows, logger or CSV
 // dependencies so the derivation is testable; the worker owns the single
@@ -14,9 +14,9 @@
 // One derived event. value and previous_value are the governor step
 // (governor_step: on VRR the stretch in whole percent of I_0, on a
 // snapped fixed refresh whole refreshes above the base), the demoted flag
-// 0/1 (rung_feasibility) or the GPU wait cap ladder level 0..3 (gpu_wait_cap);
-// reason is the GovernorCause, FeasibilityCause or GpuWaitCapCause of the
-// record that showed it.
+// 0/1 (rung_feasibility); reason is the GovernorCause or FeasibilityCause of
+// the record that showed it. (Builds before 2026-10-20 also wrote gpu_wait_cap
+// events for the removed GPU wait cap ladder.)
 struct PacingControllerEvent {
     bool emit = false;
     bool has_previous = false; // false: first observation or capture-start state
@@ -28,7 +28,6 @@ struct PacingControllerEvent {
 struct PacingControllerEvents {
     PacingControllerEvent governor{};
     PacingControllerEvent feasibility{};
-    PacingControllerEvent gpu_wait_cap{};
 };
 
 // Worker-owned derivation state. The known values also feed the
@@ -40,9 +39,6 @@ struct PacingControllerEventState {
     bool feasibility_known = false;    // any record was seen
     uint8_t feasibility_demoted = 0;   // demoted flag of the newest record
     uint8_t feasibility_cause = 0;     // FeasibilityCause of the newest rung_feasibility event
-    bool gpu_wait_cap_known = false;   // any record was seen
-    uint8_t gpu_wait_cap_level = 0;    // GPU wait cap ladder level of the newest record
-    uint8_t gpu_wait_cap_cause = 0;    // GpuWaitCapCause of the newest gpu_wait_cap event
 };
 
 // A record is governed when the period governor ran for it
@@ -68,11 +64,6 @@ inline bool PacingControllerEvents_IsGoverned(const PacingSourceRecord& record) 
 // saturation fallback's saturated, load_dropped and recheck; slow_resumes and
 // the hold scorecard's score_not_held, score_held, probe_not_held and
 // probe_held; resume_spread and lead_infeasible.
-// gpu_wait_cap: gpu_wait_cap_level differs from the previous record (every
-// record carries the ladder level, 255 for the open top), or a first record
-// is not level 0. reason is the record's gpu_wait_cap_cause (late_resumes,
-// trial_failed, calm, reset, opened or closed), or none for a transition
-// whose record was dropped.
 PacingControllerEvents PacingControllerEvents_Observe(
     PacingControllerEventState* state, const PacingSourceRecord& record) noexcept;
 

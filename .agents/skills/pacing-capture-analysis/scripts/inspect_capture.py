@@ -125,8 +125,8 @@ CURRENT_PACING_EVENTS_HEADER = [
     # Phase 1: cumulative ETW loss counters (capture_start, capture_end and queue_drops rows)
     "etw_events_lost", "etw_buffers_lost", "lost_present_count", "overflowed_present_count",
     # Phase 2: grid_epoch (PacingEpochReason) and pipeline_change (PacingFallbackReason) rows;
-    # Phase 3: governor_step (GovernorCause), rung_feasibility (FeasibilityCause) and gpu_wait_cap
-    # (GpuWaitCapCause) rows
+    # Phase 3: governor_step (GovernorCause), rung_feasibility (FeasibilityCause) and, in files
+    # from builds of 2026-10-04 to 2026-10-20, gpu_wait_cap (GpuWaitCapCause) rows
     "reason",
 ]
 

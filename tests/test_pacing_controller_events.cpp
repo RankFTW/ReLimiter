@@ -1,10 +1,8 @@
 // Controller events of the pacing telemetry worker (src/pacing_controller_events.*):
-// governor_step
-// (cause-only, one event per phase transition), rung_feasibility and
-// gpu_wait_cap
-// derivation from Source records and the capture-start snapshot. Directly
-// tests the production derivation; the worker thread, the scheduler's record
-// fields and the CSV rows need live capture validation.
+// governor_step (cause-only, one event per phase transition) and
+// rung_feasibility derivation from Source records and the capture-start
+// snapshot. Directly tests the production derivation; the worker thread, the
+// scheduler's record fields and the CSV rows need live capture validation.
 
 #include "pacing_controller_events.h"
 
@@ -32,11 +30,6 @@ namespace
     constexpr uint8_t kCauseBase = 7;
     constexpr uint8_t kLeadInfeasible = 1;
     constexpr uint8_t kRetry = 3;
-    // GpuWaitCapCause wire values.
-    constexpr uint8_t kLateResumes = 1;
-    constexpr uint8_t kTrialFailed = 2;
-    constexpr uint8_t kCalm = 3;
-    constexpr uint8_t kCapReset = 4;
 
     PacingSourceRecord Governed(uint8_t step, uint8_t cause = 0, uint32_t generation = 1)
     {
@@ -147,94 +140,37 @@ namespace
         CHECK(SameEvent(PacingControllerEvents_Observe(&state, record).feasibility, true, 0, 1, 0));
     }
 
-    void TestGpuWaitCap()
+    void TestNullState()
     {
-        PacingControllerEventState state{};
-        // A first record at level 0 is the baseline, not an event.
-        PacingSourceRecord record = Ungoverned();
-        CHECK(!PacingControllerEvents_Observe(&state, record).gpu_wait_cap.emit);
-        CHECK(state.gpu_wait_cap_known);
-        // Unchanged levels are not events, governed or not.
-        CHECK(!PacingControllerEvents_Observe(&state, Governed(3)).gpu_wait_cap.emit);
-        // A step down carries its cause and the previous level.
-        record.gpu_wait_cap_level = 1;
-        record.gpu_wait_cap_cause = kLateResumes;
-        CHECK(SameEvent(PacingControllerEvents_Observe(&state, record).gpu_wait_cap,
-            true, 0, 1, kLateResumes));
-        // Frames after the transition carry no cause and no event.
-        record.gpu_wait_cap_cause = 0;
-        CHECK(!PacingControllerEvents_Observe(&state, record).gpu_wait_cap.emit);
-        PacingSourceRecord governed = Governed(0);
-        governed.gpu_wait_cap_level = 1;
-        CHECK(!PacingControllerEvents_Observe(&state, governed).gpu_wait_cap.emit);
-        // A failed trial returns to the level before.
-        record.gpu_wait_cap_level = 2;
-        record.gpu_wait_cap_cause = kLateResumes;
-        CHECK(SameEvent(PacingControllerEvents_Observe(&state, record).gpu_wait_cap,
-            true, 1, 2, kLateResumes));
-        record.gpu_wait_cap_level = 1;
-        record.gpu_wait_cap_cause = kTrialFailed;
-        CHECK(SameEvent(PacingControllerEvents_Observe(&state, record).gpu_wait_cap,
-            true, 2, 1, kTrialFailed));
-        // Calm steps up; a reset returns to level 0 (a multi-level jump is one event).
-        record.gpu_wait_cap_level = 3;
-        record.gpu_wait_cap_cause = kLateResumes;
-        PacingControllerEvents_Observe(&state, record);
-        record.gpu_wait_cap_level = 2;
-        record.gpu_wait_cap_cause = kCalm;
-        CHECK(SameEvent(PacingControllerEvents_Observe(&state, record).gpu_wait_cap,
-            true, 3, 2, kCalm));
-        record.gpu_wait_cap_level = 0;
-        record.gpu_wait_cap_cause = kCapReset;
-        CHECK(SameEvent(PacingControllerEvents_Observe(&state, record).gpu_wait_cap,
-            true, 2, 0, kCapReset));
-        // A change whose transition record was dropped has reason none.
-        record.gpu_wait_cap_level = 1;
-        record.gpu_wait_cap_cause = 0;
-        CHECK(SameEvent(PacingControllerEvents_Observe(&state, record).gpu_wait_cap,
-            true, 0, 1, 0));
-    }
-
-    void TestGpuWaitCapFirstRecord()
-    {
-        // A first record already above level 0 (capture or worker started
-        // mid-run) is an event without a previous value.
-        PacingControllerEventState state{};
-        PacingSourceRecord record = Governed(0);
-        record.gpu_wait_cap_level = 2;
-        CHECK(SameEvent(PacingControllerEvents_Observe(&state, record).gpu_wait_cap,
-            false, 0, 2, 0));
         // A null state is ignored.
-        CHECK(!PacingControllerEvents_Observe(nullptr, record).gpu_wait_cap.emit);
+        PacingSourceRecord record = Governed(0, kCauseMisses);
+        record.feasibility_demoted = 1;
+        const PacingControllerEvents events = PacingControllerEvents_Observe(nullptr, record);
+        CHECK(!events.governor.emit && !events.feasibility.emit);
     }
 
     void TestSnapshot()
     {
         PacingControllerEventState state{};
         const PacingControllerEvents empty = PacingControllerEvents_Snapshot(state);
-        CHECK(!empty.governor.emit && !empty.feasibility.emit && !empty.gpu_wait_cap.emit);
-        // Only feasibility and the cap are known after an ungoverned record.
+        CHECK(!empty.governor.emit && !empty.feasibility.emit);
+        // Only feasibility is known after an ungoverned record.
         PacingControllerEvents_Observe(&state, Ungoverned());
         const PacingControllerEvents ungoverned = PacingControllerEvents_Snapshot(state);
         CHECK(!ungoverned.governor.emit);
         CHECK(SameEvent(ungoverned.feasibility, false, 0, 0, 0));
-        CHECK(SameEvent(ungoverned.gpu_wait_cap, false, 0, 0, 0));
         PacingSourceRecord record = Governed(2, kCauseMisses);
         record.feasibility_demoted = 1;
         record.feasibility_cause = kLeadInfeasible;
-        record.gpu_wait_cap_level = 2;
-        record.gpu_wait_cap_cause = kLateResumes;
         PacingControllerEvents_Observe(&state, record);
         PacingSourceRecord later = Governed(7); // the ramp continues without events
         later.feasibility_demoted = 1;
-        later.gpu_wait_cap_level = 2;
         PacingControllerEvents_Observe(&state, later);
         // The snapshot carries the current state and the cause of the latest
         // event, not the latest record's (empty) cause fields.
         const PacingControllerEvents snapshot = PacingControllerEvents_Snapshot(state);
         CHECK(SameEvent(snapshot.governor, false, 0, 7, kCauseMisses));
         CHECK(SameEvent(snapshot.feasibility, false, 0, 1, kLeadInfeasible));
-        CHECK(SameEvent(snapshot.gpu_wait_cap, false, 0, 2, kLateResumes));
         // The snapshot does not change the state.
         CHECK(state.governor_step == 7 && state.governor_known);
     }
@@ -245,8 +181,7 @@ int main()
     TestGovernorSteps();
     TestGovernorLifecycle();
     TestFeasibility();
-    TestGpuWaitCap();
-    TestGpuWaitCapFirstRecord();
+    TestNullState();
     TestSnapshot();
     if (s_failures != 0) {
         std::fprintf(stderr, "%d pacing controller event checks failed\n", s_failures);

@@ -66,7 +66,7 @@ The pieces that decide the details:
 | Source stage | Plans each frame, waits until `S`, releases the game | [Frame Plans and the Lead](#frame-plans-and-the-lead) |
 | Pipeline resolver | Chooses the output point and where the source waits | [Output Points](#output-points) |
 | Output executors | Hold or pass on each finished frame | [Output Points](#output-points) |
-| Protections | GPU wait cap, collision-aware release, overload guard, render handoff limit, Adaptive cap | [Protecting Pacing Under Load](#protecting-pacing-under-load) |
+| Protections | Collision-aware release, overload guard, render handoff limit, Adaptive cap | [Protecting Pacing Under Load](#protecting-pacing-under-load) |
 
 Source: `src/scheduler.cpp` (`OnMarker`, `RunPlanned`), `src/source_stage.h`, `src/cadence_grid.h`, `src/pacing_resolver.h`.
 
@@ -217,7 +217,7 @@ The lead for the next frame comes from the bucket's samples:
 - **Quantile plus allowance.** The warm target is the 99th percentile of the window plus an allowance of 0.5 ms (Smoothing off: 99th percentile, no allowance). About 99 of 100 frames are then finished before their target, and the rest are late and never held. The developer A/B **Lead coverage** (`lead_coverage=95`) uses the 95th percentile instead; the render handoff offset keeps the 95th either way.
 - **Slew.** After the first warm lead, the lead moves toward its target by at most `min(100 µs, I / 64)` per planned frame.
 - **Budget.** The lead is limited to `[0, 3 I]`. Details marks `, at budget` when the wanted lead was longer, so those frames are likely to miss their targets.
-- **Output-specific limits.** On `gpu_queue_wait` the GPU wait cap and the collision-aware release can lower the lead further (see [Protecting Pacing Under Load](#protecting-pacing-under-load)).
+- **Output-specific limits.** On `gpu_queue_wait` with Output override Auto the collision-aware release can lower the lead further (see [Protecting Pacing Under Load](#protecting-pacing-under-load)). Nothing else limits the GPU wait's lead.
 - **Other placements.** Present-based pacing uses a fixed 150 µs lead; idle mode and passthrough use 0.
 
 While the overload guard steps a GPU wait aside, its frames are still planned with the GPU wait's lead (at least the warm `source_only` lead), so the release phase does not jump when holds pause or resume.
@@ -376,41 +376,31 @@ A hold only helps while the game can keep up with its cadence. The mechanisms be
 
 Every executor checks the clock against `T` before it holds anything. A frame that is already late passes on unchanged, the cadence restarts when the lateness exceeds the tolerance, and the output spacing floor keeps the frames after it from being squeezed (see [No catch-up burst](#no-catch-up-burst)). A hold that is implausibly long, or a GPU wait target beyond the horizon, is declined rather than performed.
 
-### GPU wait cap ladder
-
-On `gpu_queue_wait` the lead is limited to the median `X` of the window plus a *cap*, so a typical frame waits on the GPU at most the cap before its target. The cap has four levels, fractions of a 1.5 ms budget: 100%, 5/6, 2/3 and 1/2 (1.5, 1.25, 1.0 and 0.75 ms).
-
-- **Step down** one level when more than 5% of the newest 64 *waited* GPU resumes (frames whose GPU was already waiting at the release) came more than 1 ms after the release, and at least 0.5 s after any level change.
-- **Check.** The waited resumes from 2 s to 3 s after a step down are judged. With at least 32 of them and more than 5% still late, the step is undone and no step down is tried for 30 s; with fewer than 32 the step stands.
-- **Step up** one level after 30 s in which at most 1% of the waited resumes were late (judged from 20 resumes on).
-- **Open top.** With Output override Auto and GPU Wait Probes on, when the next frame's GPU work is seen queueing behind the wait (see below), there is one level above the budget: no cap. Late resumes still bring the cap back.
-
-The late-resume evidence needs GPU Wait Probes (GPU timestamps placed just before and after the wait). Nothing switches the GPU wait off for late resumes.
-
 ### Collision-aware release
 
-On `gpu_queue_wait`, a late resume happens when the work after the wait becomes ready while the game's next frame already runs a long command buffer on the same GPU engine: the GPU does not interrupt it, so the resume waits. The release headroom limits the lead so the release does not land in that window:
+On `gpu_queue_wait`, a late resume happens when the work after the wait becomes ready while the game's next frame already runs a long command buffer on the same GPU engine: the GPU does not interrupt it, so the resume waits. The release headroom limits the lead so the release does not land in that window. The lead is `L = min(Q_q(X) + allowance, I + Q10(D) − H)`, at most `3 I`:
 
-- **Release headroom `H`.** The lead is at most `I + Q10(D) − H`, where `D` is a frame's time from source release to the start of its heavy GPU work (GPU ready time minus the GPU active render time from its Reflex latency report) and `Q10` is the 10th percentile of the newest 256 values. `H` starts at 1.0 ms and is learned between 0.75 and 3 ms.
-- **Release margin `M`.** Without current Reflex GPU active times (none for 64 frames), the same guard uses the time to the next frame's Present call: at most `I + Q10(C) − M`, with `C` the release-to-Present-call time. `M` starts at 2.5 ms and is learned between 1 and 4 ms.
-- Either limit applies once 32 samples exist. Both are learned from waited GPU resumes: they widen at once where late resumes collect and narrow one 0.25 ms step after 1,024 resumes in a row with the band below the edge clean or, above the start value, with its late resumes faded (fewer than 4, weighted; the evidence halves about every 23,000 resumes). Without GPU Wait Probes they stay at their start values.
+- **Release headroom `H`.** The limit is `I + Q10(D) − H`, where `D` is a frame's time from source release to the start of its heavy GPU work (GPU ready time minus the GPU active render time from its Reflex latency report) and `Q10` is the 10th percentile of the newest 256 values. `H` is a fixed 1.0 ms (the developer key `gpu_wait_headroom_us` changes it only for reproducing a report).
+- **Release margin `M`.** Without current Reflex GPU active times (none within the newest 64 GPU wait releases), the same guard uses the time to the next frame's Present call: at most `I + Q10(C) − M`, with `C` the release-to-Present-call time. `M` is fixed at 2.5 ms.
+- Either limit applies once 32 samples exist. Nothing widens or narrows `H` or `M`. Late resumes (more than 1 ms after the release) are measured and shown on the OSD and in telemetry, but nothing acts on them. In about 1.35 million waited GPU resumes with probes and Reflex GPU times in Deep Rock Galactic: Rogue Core, late resumes were 0.00–0.05% per 250 µs distance bin from 1 ms on, and 99.2% of them were closer than 1 ms. A headroom that was learned from late resumes had widened to 1.75 ms from 10 of 123 resumes at a session's start and could not narrow again, because the guard keeps releases out of the region it would have to measure.
+- **A relaxing limit does not jump the lead.** A tighter limit applies at once. When it relaxes, or the guard stands aside, the lead returns to the unguarded lead at the lead slew (`min(100 µs, I / 64)` per planned frame), never in one step. The frames the slew still holds back count as the guard's own reduction, so the Adaptive cap does not count them as late frames.
 - **Frames that need more lead** reach their gate after the release and are shown when they are ready. Their slack is judged against the lead before the limit, so the Adaptive cap does not count that as a late frame.
-- **Standing aside.** Some games run the next frame's GPU work behind the wait (one queue, in order); the wait cannot delay it there. For each waited release whose next frame had begun submitting, the guard compares the next frame's GPU start with the release. It stands aside once at least 32 such pairs exist and none of the newest 64 began more than 100 µs before the release. One pair that did restores the guard at once. The Adaptive cap's hold room stands aside with it. No GPU load, timer or mode switch is involved.
+- **Standing aside.** Some games run the next frame's GPU work behind the wait (one queue, in order); the wait cannot delay it there. For each waited release whose next frame had begun submitting, the guard compares the next frame's GPU start with the release. It stands aside only while at least 32 such pairs exist, none of the newest 64 began more than 100 µs before the release, and the heavy-work window is current (a Reflex GPU active time arrived within the newest 64 GPU wait releases). Without current Reflex reports the Present-call margin guard applies until a report arrives. One pair that did begin earlier restores the guard at once. The Adaptive cap's hold room stands aside with it. The pairs are kept across resets; after a lifecycle reset the guard waits for a warm heavy-work window (32 frames) before standing aside again. No GPU load, timer or mode switch is involved.
 
-The guard applies with Output override Auto only.
+The guard applies with Output override Auto only. With a GPU wait override the lead is the plain lead (`Q_q(X) + allowance`, at most `3 I`) with no limit on top.
 
 ```mermaid
 flowchart TD
-    A["Warm lead L0 = Q95 + allowance, at most median X + cap, at most 3 I"] --> B{"Output override Auto and rung gpu_queue_wait?"}
+    A["Warm lead L0 = Q_q(X) + allowance, at most 3 I"] --> B{"Output override Auto and rung gpu_queue_wait?"}
     B -->|no| Z["L = L0"]
-    B -->|yes| C{"Next frame's GPU work runs behind the wait?"}
+    B -->|yes| C{"Next frame's GPU work runs behind the wait, with a current D window?"}
     C -->|yes| Z
     C -->|no| D{"32 or more current D samples?"}
     D -->|yes| E["limit = I + Q10 of D − H"]
     D -->|no| F{"32 or more C samples?"}
     F -->|yes| G["limit = I + Q10 of C − M"]
     F -->|no| Z
-    E --> H["L = min(L0, max(0, limit))"]
+    E --> H["L = min(L0, max(0, limit)); a relaxing limit returns at the lead slew"]
     G --> H
 ```
 
@@ -485,13 +475,13 @@ sequenceDiagram
 
 **Adaptive cap** lengthens `I` while frames show it is too short and shortens it again when they do not. It is off by default. The stretch `I / I_0` stays between 1.0 and 1.6 (`I_0` is the cap interval times the FG divisor).
 
-- **Evidence gates every rise.** Two restarts within 0.5 s, or 6 of the newest 24 measured frames ready after their target (the lead expects about 1 in 100), or more than 10% of the frames of a window of at least 1 s restarting the cadence (a window closes after 2 s and restarts after every rise). One late frame counts once: consecutive restarted frames are one restart, and a late frame less late than the late frame before it (the queue behind a hitch running down) is not counted among the 24; the 10% window counts every restarted frame. A frame counts as ready after its target only against the lead before the collision-aware release and the GPU wait cap lowered it, since that lateness is accepted on purpose and a longer `I` does not reduce it. Reflex workload reports alone never lengthen `I`.
+- **Evidence gates every rise.** Two restarts within 0.5 s, or 6 of the newest 24 measured frames ready after their target (the lead expects about 1 in 100), or more than 10% of the frames of a window of at least 1 s restarting the cadence (a window closes after 2 s and restarts after every rise). One late frame counts once: consecutive restarted frames are one restart, and a late frame less late than the late frame before it (the queue behind a hitch running down) is not counted among the 24; the 10% window counts every restarted frame. A frame counts as ready after its target only against the lead before the collision-aware release lowered it (including the frames the lead slew still holds back after its limit relaxed), since that lateness is accepted on purpose and a longer `I` does not reduce it. Reflex workload reports alone never lengthen `I`.
 - **Demand sizes a rise.** What recent frames need is the larger of the 90th percentile of the newest 12 Reflex workload reports (at least 4) and the Adaptive cap fit percentile (75, 90 or 99; default 75) of the newest second of reports (at least 16). A report's workload is its longest stage: simulation, render submission or GPU work, where GPU work is the GPU active render time plus, with frame generation, the AI frame time (the generated frames run on the same GPU within the real frame's interval). A rise goes to need plus a margin `m = max(250 µs, 3% of I)`, by at most 8% of `I_0` per 0.25 s. Reports above 1.5 times the median count as hitches and are ignored; reports above 3 `I` are ignored. When more than 10% of a window's frames restarted and demand does not explain it, the rise is 5%.
 - **Falls.** After 0.5 s of headroom (the Adaptive cap fit value of the newest second plus two margins fits inside the interval actually paced), `I` falls to need (as defined above, the same as a rise uses) plus one margin, never below `I_0`, so a fall never lands where the next rise would put it back. Without that headroom, after 1 s without evidence it *probes* below the demand: 3% of `I_0`, 1.5 times further for each probe that stayed calm, up to 12%. Evidence after a probe returns it to the level before it and doubles the calm time the next probe needs (1, 2, 4, up to 8 s). A probe waits a calm second after any fall, and none starts while GPU execution time (plus AI frame time) is the largest stage in most reports of the newest second: it does not grow with `I`, so a probe below it can only fail.
 - **Failed falls.** A fall to the need that brings evidence back before it has held for a calm second failed: `I` returns to the level before it, and the *demand scale* `k` becomes at least the interval actually paced at the evidence divided by the need that fall used. From then on every need (rises, falls and the headroom test) is `k` times the measured one, so a later fall stops one margin above the interval that failed and still follows the demand when it changes, and no probe runs. `k` is 1 again after a reset. The workload reports can miss part of what a frame needs: in Gears of War: E-Day held with FG 2×, the render thread either kept up or fell a frame behind at the same interval, and only the second showed in its stage times; the cap fell to the GPU work's +10% every 5 to 10 s and climbed back to +28%. A fall is to blame only once the paced interval is below the level it fell from (the hold room can keep it there), and `k` rises only when the need set the level the interval fell to, not `I_0` and not the hold room.
 - **Recurring loads.** After a rise `I` does not fall for 1.5 s per overload episode of the last 20 s, up to 8 s.
 - **Realized interval.** The interval actually paced follows the target at +3% per frame up and −1% per frame down.
-- **Hold room.** With the Auto GPU queue wait, the interval is also kept at least as long as the GPU wait needs: the Adaptive cap fit percentile of the intervals at which recent frames would have reached the wait before their guarded release. It needs no evidence, and it is skipped when it would exceed +60%.
+- **Hold room.** With the Auto GPU queue wait, the interval is also kept at least as long as the GPU wait needs: the collision-aware release's limit solved for the interval, `Q_fit(X) + h_min − (Q10(D) − H)` (or `− (Q10(C) − M)` without Reflex GPU active times). `Q_fit(X)` is the Adaptive cap fit percentile of `X` over the newest 256 judged frames, `h_min` a minimum hold of 0.25 ms, and `Q10(D) − H` the guard's current distance, so the room never uses older distances than the guard. `h_min` applies only to the room, never to the release decision. It needs no evidence, is 0 while the guard stands aside, and is skipped when it would exceed +60%.
 - **Resets.** A cap or FG divisor change, DMFG, OLED Care, regaining focus, a new lifecycle or turning it off return `I` to `I_0`; the next 32 frames are not judged.
 - On VRR, interval changes are silent rebases. On a snapped fixed-refresh grid the interval is quantized to whole refreshes and each change of the count is a `GovernorStep` epoch.
 
@@ -513,7 +503,7 @@ stateDiagram-v2
     Falling : realized interval above its target, down 1 percent per frame
 ```
 
-Source: `src/rung_feasibility.h`, `src/rung_feasibility.cpp` (`HoldFeasibility`, `GpuWaitCap`), `src/lead_controller.h`, `src/lead_controller.cpp` (`CollisionGuardedLeadUs`, `HandoffOffsetUs`, `RecordHandoff`), `src/scheduler.cpp` (`HandoffLimitApplies`, `HandoffEarliestRelease`, `RenderHandoffStalled`, `RecordGovernorMiss`), `src/render_handoff.h`, `src/nvapi_hooks.cpp` (`Hook_Sleep`), `src/period_governor.h`, `src/period_governor.cpp` (`Track`), `src/gpu_present_gate.cpp` (`GpuPresent_HorizonTicks`), `src/presentation_gate.cpp` (`PresentGate_Execute`).
+Source: `src/rung_feasibility.h`, `src/rung_feasibility.cpp` (`HoldFeasibility`), `src/lead_controller.h`, `src/lead_controller.cpp` (`CollisionGuardedLeadUs`, `CollisionOffsetUs`, `HoldRoomUs`, `HandoffOffsetUs`, `RecordHandoff`), `src/scheduler.cpp` (`HandoffLimitApplies`, `HandoffEarliestRelease`, `RenderHandoffStalled`, `RecordGovernorMiss`), `src/render_handoff.h`, `src/nvapi_hooks.cpp` (`Hook_Sleep`), `src/period_governor.h`, `src/period_governor.cpp` (`Track`), `src/gpu_present_gate.cpp` (`GpuPresent_HorizonTicks`), `src/presentation_gate.cpp` (`PresentGate_Execute`).
 
 ---
 
@@ -527,7 +517,7 @@ I = (1 / cap) × FG divisor
 
 At a 120 FPS cap with 2× FG, real frames are `I = 16.7 ms` apart and the display shows two frames per interval. The Adaptive cap stretch applies to this real-frame interval, so the output frame rate drops by the same proportion.
 
-**The FG divisor.** The divisor is 1 without FG and 2 or more once FG is confirmed active, taken from the sources in this order: NVIDIA Smooth Motion, the driver profile override, the actual multiplier from the FG state, the configured Streamline state, and finally positive Reflex AI frame evidence when Streamline has not reported FG off. The scheduler resolves it once per frame and the OSD and frame splitting read that same value. A change of the raw divisor is a `PeriodChange` epoch and resets the Adaptive cap, the overload guard, the pre-Sleep margin window and the GPU wait cap. The grid interval follows a linear ramp over 50 ms after a toggle; those frames are silent rebases.
+**The FG divisor.** The divisor is 1 without FG and 2 or more once FG is confirmed active, taken from the sources in this order: NVIDIA Smooth Motion, the driver profile override, the actual multiplier from the FG state, the configured Streamline state, and finally positive Reflex AI frame evidence when Streamline has not reported FG off. The scheduler resolves it once per frame and the OSD and frame splitting read that same value. A change of the raw divisor is a `PeriodChange` epoch and resets the Adaptive cap, the overload guard and the pre-Sleep margin window. The grid interval follows a linear ramp over 50 ms after a toggle; those frames are silent rebases.
 
 **Pacing real frames.** With FG presenting, Auto uses `fg_input_wait` once its route has qualified: the GPU waits in front of each real frame's entry to frame generation, so real frames enter FG on the cadence. Until it qualifies, nothing is held (`source_only`, reason `fg_unqualified`); FG without its route is not held at a marker. Where the FG input wait cannot run (the 32-bit addon, an API other than DX12, or markers from Streamline PCL), the reason names that requirement instead (`architecture`, `api`, `no_native_route`). The lead of `fg_input_wait` leaves out the game's simulation to render queue time `q`, because a pipelined game's finished frame otherwise waits there and the lead would learn that wait as part of its pipeline.
 
@@ -604,8 +594,8 @@ Source: `src/feedback.cpp`, `src/feedback.h`, `src/reflex_clock_map.h`, `src/pac
 | `tol` | Late tolerance: `max(I / 4, 500 µs)`. |
 | slack | `L` minus the median `X` of the rung; how much later than `S` a source can arrive and still make `T`. |
 | `C`, `D` | Release-to-Present-call time and release-to-heavy-GPU-work time of a GPU wait frame. |
-| `H` | Release headroom: how long before the next frame's heavy GPU work the GPU wait is released (learned, start 1.0 ms). |
-| `M` | Release margin: the same distance to the next Present call (learned, start 2.5 ms). Used without Reflex GPU times. |
+| `H` | Release headroom: how long before the next frame's heavy GPU work the GPU wait is released (fixed, 1.0 ms). |
+| `M` | Release margin: the same distance to the next Present call (fixed, 2.5 ms). Used without Reflex GPU times. |
 | `w` | RENDERSUBMIT_START: the moment the game's render thread takes a frame. |
 | `e`, `b` | SIMULATION_END and PRESENT_END markers of a frame. |
 | `q` | The time a finished frame waited for the render thread to leave the previous Present; left out of the `fg_input_wait` lead. |

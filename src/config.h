@@ -81,7 +81,7 @@ struct Config {
     bool native_pcl_enabled = false;
     // Pacing diagnostics (x64). Change one at a time for A/B captures.
     bool gpu_present_gate_probes = true;              // developer: GPU queue-wait pre/post timestamp bracket
-    double gpu_wait_budget_us = kPacingGpuWaitBudgetDefaultUs; // developer: GPU wait cap ladder top level, 500–5000 µs
+    double gpu_wait_headroom_us = kPacingGpuWaitHeadroomDefaultUs; // developer: GPU queue wait release headroom, 500–3000 µs
     double gpu_wait_interleave_s = 0.0; // developer: held / not-held A/B blocks of the Auto GPU queue wait; 0 = off, 1–10 s
     // Skip the driver's Reflex Sleep while a cap is set; ReLimiter's own
     // pre-Sleep wait paces instead (default on: far fewer long frames at the

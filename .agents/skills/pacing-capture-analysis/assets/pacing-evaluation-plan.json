@@ -22,7 +22,7 @@
     "native_pcl_enabled": "true",
     "adaptive_cap": "false",
     "gpu_present_gate_probes": "true",
-    "gpu_wait_budget_us": "1500",
+    "gpu_wait_headroom_us": "1000",
     "marker_forward_order": "before_wait",
     "stall_inject_ms": "0",
     "reflex_sleep_bypass": "false",

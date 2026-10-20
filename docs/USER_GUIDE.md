@@ -197,7 +197,6 @@ The technical lines are under **Details**, a collapsed node below the status lin
 | **Render handoff limit** | Shown while frames are not held and the game's Reflex Sleep is bypassed: ReLimiter keeps the game from queueing finished frames ahead of its render thread. An orange `off` means it is waiting for evidence; it needs no action. |
 | **Lead** | How far ahead of each target the game is released, whether it is still `warming` or `warm`, and how many frames it is based on. `, at budget` means the wanted lead was clamped to three frame intervals, so those frames are likely to miss their targets. |
 | **Grid epoch** | Counts cadence restarts (after a cap or mode change, a new swapchain or a late frame). An occasional increase is normal; a counter that climbs steadily means frames keep missing their targets. |
-| **GPU wait cap** | Shown on `gpu_queue_wait`: how long a typical frame may wait on the GPU, and how many recent GPU resumes were late. Grey at its normal level; orange means the wait was shortened because resumes were late, and it steps back up by itself. |
 | **Release headroom** / **Release margin** | Shown on `gpu_queue_wait`: how much room ReLimiter leaves before the game's next frame starts heavy GPU work (headroom) or its next Present call (margin). A `guard off` note means the room is not needed in this game. |
 | **Driver Sleep** | Average time the game's Reflex Sleep call spends in the driver, shown while a GPU wait is the output. A readout only. |
 | **Adaptive cap** | Shown with [Adaptive cap](#adaptive-cap) on: how much longer the interval is than the cap, its phase and the last cause. |
@@ -234,7 +233,7 @@ Games that do not call the Reflex Sleep, idle caps, NVIDIA Smooth Motion and the
 
 When the game cannot reach the cap, holding frames makes things worse, so ReLimiter pauses its holds on its own. The status line reads `Paused: the game can't reach the cap right now`, the output becomes `source_only` with the reason `infeasible`, and **Details** shows an orange `Hold off: overload` line. ReLimiter keeps pacing the game while the holds are paused, and they resume by themselves once frames have been on time for about two seconds.
 
-What you can do: lower the cap, or turn on [Adaptive cap](#adaptive-cap), which lengthens the interval first so holds usually stay on. A GPU wait that is shortened because GPU resumes were late (the orange **GPU wait cap** line) is a related, milder adjustment that steps back up by itself after a calm stretch.
+What you can do: lower the cap, or turn on [Adaptive cap](#adaptive-cap), which lengthens the interval first so holds usually stay on.
 
 ---
 
@@ -473,7 +472,7 @@ Advanced includes the **Adaptive cap fit** choice (while Adaptive cap is on), Re
 
 ### Developer Settings
 
-ReLimiter also has developer settings for A/B testing: forcing an output point, switching smoothing off, changing the GPU wait budget, the Reflex Sleep bypass and the source placement, and a stall injector. They are hidden unless `developer_settings=true` is set under `[FrameLimiter]` in `relimiter.ini`, and they can make pacing worse on purpose. While any of them differs from its default, the main view shows an amber `N developer setting(s) changed from the defaults` line with a **Reset** button, even when the settings are hidden. Details of every setting are in the [Developer Reference](DEVELOPER_REFERENCE.md#developer-diagnostics).
+ReLimiter also has developer settings for A/B testing: forcing an output point, switching smoothing off, changing the GPU wait release headroom, the Reflex Sleep bypass and the source placement, and a stall injector. They are hidden unless `developer_settings=true` is set under `[FrameLimiter]` in `relimiter.ini`, and they can make pacing worse on purpose. While any of them differs from its default, the main view shows an amber `N developer setting(s) changed from the defaults` line with a **Reset** button, even when the settings are hidden. Details of every setting are in the [Developer Reference](DEVELOPER_REFERENCE.md#developer-diagnostics).
 
 ---
 
@@ -583,7 +582,7 @@ Most settings can be changed through the overlay. For manual changes, close the 
 | `vsync_mode` | game | `game`, `off`, `on` |
 | `dynamic_mfg_passthrough` | false | Manual Dynamic MFG compatibility option |
 
-The developer keys (`smoothing`, `output_rung`, `gpu_wait_budget_us`, `reflex_sleep_bypass`, `source_placement` and others) are listed in the [Developer Reference](DEVELOPER_REFERENCE.md#developer-ini-keys). Leave them at their defaults for normal play.
+The developer keys (`smoothing`, `output_rung`, `gpu_wait_headroom_us`, `reflex_sleep_bypass`, `source_placement` and others) are listed in the [Developer Reference](DEVELOPER_REFERENCE.md#developer-ini-keys). Leave them at their defaults for normal play.
 
 #### Removed and migrated keys
 
@@ -594,7 +593,7 @@ Older configurations are updated automatically at the next launch, when ReLimite
 - `smoothing=low`, `medium` and `high` become `smoothing=on`. Smoothing is always on for users; only On and Off remain, and Off is a developer key.
 - A `relimiter.ini` without `config_version`, written by an older version that saved every key including the old defaults, is moved once to `reflex_sleep_bypass=true` and `source_placement=pre_sleep`; every other value is kept, and ReLimiter then writes `config_version=4`. An INI that already has `config_version=2` or later keeps those two settings, so set `reflex_sleep_bypass=false` or `source_placement=marker` there to stay on the older behavior. An INI saved by a 4.0 test build also moves once to the new defaults `lead_coverage=99` (from `config_version=2`) and `fg_late_spacing=true` (from `config_version` 2 or 3). A new INI starts with the recommended defaults.
 
-The following keys have been removed. ReLimiter ignores them and drops them when it rewrites the INI: `pacing_method`, `adaptive_smoothing`, `smoothing_percentile`, `smoothing_window`, `smoothing_release_speed`, `smoothing_bias_us`, `gpu_present_gate_mode`, `gpu_present_gate_slack_us`, `gpu_present_gate_max_delay_us`, `estimator_a_mode`, `estimator_a_fixed_reserve_us`, `native_arrival_predictor_mode`, `presentation_gate_location`, `adaptive_deadline_reserve_mode`, `gpu_readiness_observer`, and from earlier versions `reflex_pre_sleep_pacing`, `reflex_gpu_combined`, `gpu_present_gate_phase_controller`, `gpu_present_gate_hold`, `marker_gate_bypass`, `adaptive_cycle_trial`, `ready_present_*` and `readiness_phase_*`. `dmfg_output_cap` is removed as well: it was read but never applied. `reflex_pre_sleep_pacing` has no replacement key; [pre-Sleep placement](#pre-sleep-placement) is automatic and controlled by the developer key `source_placement`.
+The following keys have been removed. ReLimiter ignores them and drops them when it rewrites the INI: `pacing_method`, `adaptive_smoothing`, `smoothing_percentile`, `smoothing_window`, `smoothing_release_speed`, `smoothing_bias_us`, `gpu_present_gate_mode`, `gpu_present_gate_slack_us`, `gpu_present_gate_max_delay_us`, `estimator_a_mode`, `estimator_a_fixed_reserve_us`, `native_arrival_predictor_mode`, `presentation_gate_location`, `adaptive_deadline_reserve_mode`, `gpu_readiness_observer`, and from earlier versions `reflex_pre_sleep_pacing`, `reflex_gpu_combined`, `gpu_present_gate_phase_controller`, `gpu_present_gate_hold`, `marker_gate_bypass`, `adaptive_cycle_trial`, `ready_present_*` and `readiness_phase_*`. `dmfg_output_cap` is removed as well: it was read but never applied. `gpu_wait_budget_us` is removed too: the GPU queue wait no longer has a cap for it to size, and `gpu_wait_headroom_us` is a different, developer-only setting. `reflex_pre_sleep_pacing` has no replacement key; [pre-Sleep placement](#pre-sleep-placement) is automatic and controlled by the developer key `source_placement`.
 
 ### Screen and Compatibility
 
@@ -649,7 +648,7 @@ Open **Details** under the pacing status line and check **Output** and **Reason*
 
 1. Use a cap inside your display's VRR range. Smoothing is always on; the status line says whether frames are being held.
 2. Check for another active limiter in the game, RTSS or driver settings.
-3. If **Grid epoch** climbs steadily, frames keep missing their targets: try a lower cap. If the status line reads **Paused: the game can't reach the cap right now**, ReLimiter has stopped holding frames because of overload and resumes on its own; see [Overload Pause](#overload-pause). An orange **GPU wait cap** line under **Details** means the GPU queue wait is waiting less on the GPU because GPU resumes were late; it steps back up after a calm stretch.
+3. If **Grid epoch** climbs steadily, frames keep missing their targets: try a lower cap. If the status line reads **Paused: the game can't reach the cap right now**, ReLimiter has stopped holding frames because of overload and resumes on its own; see [Overload Pause](#overload-pause).
 4. Try **Adaptive cap** if heavy areas or scenes drop the frame rate below the cap, or turn it off if its frame-rate changes are undesirable.
 5. Compare VSync Game, Off and On. Change one option at a time.
 6. If an amber line says developer settings are changed from the defaults, press its **Reset** button; this also stops a running stall injector.

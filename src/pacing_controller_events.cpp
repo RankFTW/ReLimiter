@@ -41,27 +41,6 @@ static PacingControllerEvent ObserveFeasibility(
     return event;
 }
 
-static PacingControllerEvent ObserveGpuWaitCap(
-    PacingControllerEventState* state, const PacingSourceRecord& record) noexcept
-{
-    PacingControllerEvent event{};
-    const uint8_t level = record.gpu_wait_cap_level;
-    const bool changed = state->gpu_wait_cap_known
-        ? state->gpu_wait_cap_level != level
-        : level != 0;
-    if (changed) {
-        event.emit = true;
-        event.has_previous = state->gpu_wait_cap_known;
-        event.previous_value = state->gpu_wait_cap_level;
-        event.value = level;
-        event.reason = record.gpu_wait_cap_cause;
-        state->gpu_wait_cap_cause = record.gpu_wait_cap_cause;
-    }
-    state->gpu_wait_cap_known = true;
-    state->gpu_wait_cap_level = level;
-    return event;
-}
-
 PacingControllerEvents PacingControllerEvents_Observe(
     PacingControllerEventState* state, const PacingSourceRecord& record) noexcept
 {
@@ -69,7 +48,6 @@ PacingControllerEvents PacingControllerEvents_Observe(
     if (state == nullptr) return events;
     events.governor = ObserveGovernor(state, record);
     events.feasibility = ObserveFeasibility(state, record);
-    events.gpu_wait_cap = ObserveGpuWaitCap(state, record);
     return events;
 }
 
@@ -87,11 +65,6 @@ PacingControllerEvents PacingControllerEvents_Snapshot(const PacingControllerEve
         events.feasibility.emit = true;
         events.feasibility.value = state.feasibility_demoted;
         events.feasibility.reason = state.feasibility_cause;
-    }
-    if (state.gpu_wait_cap_known) {
-        events.gpu_wait_cap.emit = true;
-        events.gpu_wait_cap.value = state.gpu_wait_cap_level;
-        events.gpu_wait_cap.reason = state.gpu_wait_cap_cause;
     }
     return events;
 }

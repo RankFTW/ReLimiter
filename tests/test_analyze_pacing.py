@@ -1131,10 +1131,10 @@ class InspectorTests(TemporaryDirectoryTest):
                 self.assertEqual({value: snake(name) for value, name in values(enum).items()}, table)
         event_types = (ROOT / "src/csv_writer.h").read_text(encoding="utf-8")
         for name, value in (("GridEpoch", 13), ("PipelineChange", 14), ("StallInjected", 15),
-                            ("GovernorStep", 16), ("RungFeasibility", 17), ("GpuWaitCap", 18)):
+                            ("GovernorStep", 16), ("RungFeasibility", 17)):
             self.assertIn(f"{name} = {value}", event_types)
         for text in ('"grid_epoch"', '"pipeline_change"', '"stall_injected"', '"governor_step"',
-                     '"rung_feasibility"', '"gpu_wait_cap"'):
+                     '"rung_feasibility"'):
             self.assertIn(f"return {text};", SOURCE)
 
     def test_controller_cause_tables_match_production(self):
@@ -1143,9 +1143,7 @@ class InspectorTests(TemporaryDirectoryTest):
                 ("src/period_governor.h", "src/period_governor.cpp", "GovernorCause",
                  pacing.GOVERNOR_CAUSE_NAMES),
                 ("src/rung_feasibility.h", "src/rung_feasibility.cpp", "FeasibilityCause",
-                 pacing.FEASIBILITY_CAUSE_NAMES),
-                ("src/rung_feasibility.h", "src/rung_feasibility.cpp", "GpuWaitCapCause",
-                 pacing.GPU_WAIT_CAP_CAUSE_NAMES)):
+                 pacing.FEASIBILITY_CAUSE_NAMES)):
             with self.subTest(enum=enum):
                 declaration = (ROOT / header).read_text(encoding="utf-8")
                 body = declaration.split(f"enum class {enum} : uint8_t {{", 1)[1].split("};", 1)[0]

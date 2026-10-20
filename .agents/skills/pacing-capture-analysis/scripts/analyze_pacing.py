@@ -188,7 +188,9 @@ FEASIBILITY_CAUSE_NAMES = {0: "none", 1: "lead_infeasible", 2: "resume_spread", 
                            5: "slow_resumes", 6: "score_not_held", 7: "score_held", 8: "probe_not_held",
                            9: "probe_held", 10: "ab_held", 11: "ab_not_held", 12: "saturated",
                            13: "load_dropped", 14: "recheck"}
-# GpuWaitCapCause (GpuWaitCapCause_Text): gpu_wait_cap event reasons. value is the
+# GpuWaitCapCause (GpuWaitCapCause_Text): gpu_wait_cap event reasons. Historical: only
+# files from builds between 2026-10-04 and 2026-10-20 carry these events; the GPU wait
+# cap ladder was removed on 2026-10-20 and current builds write none. value is the
 # ladder level 0..3 (0 = gpu_wait_budget_us, 1/2/3 = 5/6, 2/3, 1/2 of it) or 255, the
 # open top (no cap; from 2026-10-09, Auto with the next frame's GPU work behind the
 # wait): late_resumes stepped down (more than 5% of the newest 64 waited resumes later
@@ -1997,7 +1999,7 @@ class ControllerSummary:
                            "by_cause": feasibility["demotions"]["by_cause"],
                            "restorations": feasibility["restorations"]["count"],
                            "restorations_by_cause": feasibility["restorations"]["by_cause"]}),
-            # Ladder level changes of the GPU queue wait cap (absent from builds before the ladder: count 0).
+            # Ladder level changes of the GPU queue wait cap (historical: only files from builds of 2026-10-04 to 2026-10-20 carry them; absent from earlier and later builds: count 0).
             "gpu_wait_cap": (None if events is None else
                              {key: events["gpu_wait_cap"][key] for key in ("count", "down", "up")}),
         }

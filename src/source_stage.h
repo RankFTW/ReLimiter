@@ -188,12 +188,10 @@ struct SourceStageRequest {
     double max_wait_intervals = 2.0;   // safety clamp of the source wait, in grid intervals
     double stall_inject_ms = 0.0;
     double stall_inject_period_s = kPacingStallInjectDefaultPeriodS;
-    // GPU queue wait cap (GpuWaitCap::CapUs): the warm lead is at most median
-    // X + this. 0 = uncapped; only the GpuQueueWait rung uses it.
-    double gpu_wait_cap_us = 0.0;
     // Collision-aware release (lead_controller.h): the GPU queue wait lead is
-    // at most I + Q10(D) − the release headroom, or I + Q10(C) − the release
-    // margin without current Reflex GPU active times. Output override Auto only.
+    // at most I + Q10(D) − the release headroom (the pipeline's
+    // gpu_wait_headroom_us), or I + Q10(C) − the release margin without
+    // current Reflex GPU active times. Output override Auto only.
     bool collision_guard = false;
     // Developer A/B (gpu_queue_wait_render_queue): whether the GPU queue wait's
     // lead sample leaves out the simulation → render queue (lead_controller.h).

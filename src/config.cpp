@@ -246,17 +246,17 @@ void ValidateConfig() {
         g_config.stall_inject_period_s,
         kPacingStallInjectMinPeriodS,
         kPacingStallInjectMaxPeriodS);
-    // gpu_wait_budget_us: the GPU wait cap ladder's top level. Older builds
-    // saved 0 for "off"; 0 or less now loads as the default.
-    if (!std::isfinite(g_config.gpu_wait_budget_us) || g_config.gpu_wait_budget_us <= 0.0) {
-        g_config.gpu_wait_budget_us = kPacingGpuWaitBudgetDefaultUs;
+    // gpu_wait_headroom_us: the collision guard's release headroom; 0 or
+    // less (or non-finite) loads as the default.
+    if (!std::isfinite(g_config.gpu_wait_headroom_us) || g_config.gpu_wait_headroom_us <= 0.0) {
+        g_config.gpu_wait_headroom_us = kPacingGpuWaitHeadroomDefaultUs;
     } else {
-        const double budget_us = Clamp(
-            g_config.gpu_wait_budget_us, kPacingGpuWaitBudgetMinUs, kPacingGpuWaitBudgetMaxUs);
-        if (budget_us != g_config.gpu_wait_budget_us)
-            LOG_WARN("Config: gpu_wait_budget_us %.0f outside [500, 5000], clamped",
-                     g_config.gpu_wait_budget_us);
-        g_config.gpu_wait_budget_us = budget_us;
+        const double headroom_us = Clamp(
+            g_config.gpu_wait_headroom_us, kPacingGpuWaitHeadroomMinUs, kPacingGpuWaitHeadroomMaxUs);
+        if (headroom_us != g_config.gpu_wait_headroom_us)
+            LOG_WARN("Config: gpu_wait_headroom_us %.0f outside [500, 3000], clamped",
+                     g_config.gpu_wait_headroom_us);
+        g_config.gpu_wait_headroom_us = headroom_us;
     }
     // gpu_wait_interleave_s: 0 (or less, or non-finite) is off; else [1, 10] s.
     if (!std::isfinite(g_config.gpu_wait_interleave_s) || g_config.gpu_wait_interleave_s <= 0.0) {
@@ -336,7 +336,7 @@ static void LoadPacingPipelineKeys(const char* S, const char* P) {
     g_config.stall_inject_ms = ReadINIDouble(S, "stall_inject_ms", 0.0, P);
     g_config.stall_inject_period_s = ReadINIDouble(
         S, "stall_inject_period_s", kPacingStallInjectDefaultPeriodS, P);
-    g_config.gpu_wait_budget_us = ReadINIDouble(S, "gpu_wait_budget_us", kPacingGpuWaitBudgetDefaultUs, P);
+    g_config.gpu_wait_headroom_us = ReadINIDouble(S, "gpu_wait_headroom_us", kPacingGpuWaitHeadroomDefaultUs, P);
     g_config.gpu_wait_interleave_s = ReadINIDouble(S, "gpu_wait_interleave_s", 0.0, P);
 
     // adaptive_cap replaces adaptive_smoothing; the legacy value is its default.
@@ -652,7 +652,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
         PacingPlacementOverride_Text(config.source_placement), P);
     WriteINIDouble(S, "stall_inject_ms", config.stall_inject_ms, P);
     WriteINIDouble(S, "stall_inject_period_s", config.stall_inject_period_s, P);
-    WriteINIDouble(S, "gpu_wait_budget_us", config.gpu_wait_budget_us, P);
+    WriteINIDouble(S, "gpu_wait_headroom_us", config.gpu_wait_headroom_us, P);
     WriteINIDouble(S, "gpu_wait_interleave_s", config.gpu_wait_interleave_s, P);
 
     // ── Frame Generation ──
@@ -885,7 +885,7 @@ static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
     pipeline.gpu_probes = config.gpu_present_gate_probes;
     pipeline.stall_inject_ms = config.stall_inject_ms;
     pipeline.stall_inject_period_s = config.stall_inject_period_s;
-    pipeline.gpu_wait_budget_us = config.gpu_wait_budget_us;
+    pipeline.gpu_wait_headroom_us = config.gpu_wait_headroom_us;
     pipeline.gpu_wait_interleave_s = config.gpu_wait_interleave_s;
     pipeline.gpu_queue_wait_render_queue = config.gpu_queue_wait_render_queue;
     pipeline.lead_coverage = config.lead_coverage;
@@ -912,7 +912,7 @@ int Config_DeveloperOverrides() {
     const Config& d = s_default_config;
     return (g_config.smoothing != d.smoothing) + (g_config.output_rung != d.output_rung) +
         (g_config.gpu_present_gate_probes != d.gpu_present_gate_probes) +
-        (g_config.gpu_wait_budget_us != d.gpu_wait_budget_us) +
+        (g_config.gpu_wait_headroom_us != d.gpu_wait_headroom_us) +
         (g_config.gpu_wait_interleave_s != d.gpu_wait_interleave_s) +
         (g_config.stall_inject_ms != d.stall_inject_ms) +
         (g_config.stall_inject_period_s != d.stall_inject_period_s) +
@@ -934,7 +934,7 @@ void Config_ResetDeveloperSettings() {
     g_config.smoothing = d.smoothing;
     g_config.output_rung = d.output_rung;
     g_config.gpu_present_gate_probes = d.gpu_present_gate_probes;
-    g_config.gpu_wait_budget_us = d.gpu_wait_budget_us;
+    g_config.gpu_wait_headroom_us = d.gpu_wait_headroom_us;
     g_config.gpu_wait_interleave_s = d.gpu_wait_interleave_s;
     g_config.stall_inject_ms = d.stall_inject_ms;
     g_config.stall_inject_period_s = d.stall_inject_period_s;
@@ -974,12 +974,12 @@ void ApplyConfig() {
     if (g_config.marker_forward_order != PacingMarkerForwardOrder::BeforeWait)
         LOG_WARN("Diagnostic NvAPI marker forward order: %s (driver sees the paced release)",
             PacingMarkerForwardOrder_Text(g_config.marker_forward_order));
-    LOG_INFO("Pacing pipeline: smoothing=%s adaptive_cap=%u adaptive_cap_percentile=%d output_rung=%s source_placement=%s probes=%u gpu_wait_budget_us=%.0f",
+    LOG_INFO("Pacing pipeline: smoothing=%s adaptive_cap=%u adaptive_cap_percentile=%d output_rung=%s source_placement=%s probes=%u gpu_wait_headroom_us=%.0f",
         PacingSmoothing_Text(g_config.smoothing), g_config.adaptive_cap ? 1u : 0u,
         g_config.adaptive_cap_percentile,
         PacingRungOverride_Text(g_config.output_rung),
         PacingPlacementOverride_Text(g_config.source_placement),
-        g_config.gpu_present_gate_probes ? 1u : 0u, g_config.gpu_wait_budget_us);
+        g_config.gpu_present_gate_probes ? 1u : 0u, g_config.gpu_wait_headroom_us);
     if (g_config.stall_inject_ms > 0.0)
         LOG_WARN("Pacing pipeline: diagnostic stall injector %.1f ms every %.1f s",
             g_config.stall_inject_ms, g_config.stall_inject_period_s);

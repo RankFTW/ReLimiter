@@ -271,7 +271,7 @@ namespace
         std::atomic<double> allowance_us{ kInitialSnapshot.allowance_us };
         std::atomic<double> handoff_quantile{ kInitialSnapshot.handoff_quantile };
         std::atomic<bool> gpu_probes{ kInitialSnapshot.gpu_probes };
-        std::atomic<double> gpu_wait_budget_us{ kInitialSnapshot.gpu_wait_budget_us };
+        std::atomic<double> gpu_wait_headroom_us{ kInitialSnapshot.gpu_wait_headroom_us };
     };
     SnapshotPublication s_pipeline;
 
@@ -289,7 +289,7 @@ namespace
         snapshot.allowance_us = s_pipeline.allowance_us.load(std::memory_order_relaxed);
         snapshot.handoff_quantile = s_pipeline.handoff_quantile.load(std::memory_order_relaxed);
         snapshot.gpu_probes = s_pipeline.gpu_probes.load(std::memory_order_relaxed);
-        snapshot.gpu_wait_budget_us = s_pipeline.gpu_wait_budget_us.load(std::memory_order_relaxed);
+        snapshot.gpu_wait_headroom_us = s_pipeline.gpu_wait_headroom_us.load(std::memory_order_relaxed);
         return snapshot;
     }
 
@@ -306,7 +306,7 @@ namespace
         s_pipeline.allowance_us.store(snapshot.allowance_us, std::memory_order_relaxed);
         s_pipeline.handoff_quantile.store(snapshot.handoff_quantile, std::memory_order_relaxed);
         s_pipeline.gpu_probes.store(snapshot.gpu_probes, std::memory_order_relaxed);
-        s_pipeline.gpu_wait_budget_us.store(snapshot.gpu_wait_budget_us, std::memory_order_relaxed);
+        s_pipeline.gpu_wait_headroom_us.store(snapshot.gpu_wait_headroom_us, std::memory_order_relaxed);
     }
 
     // ── Configuration ──
@@ -321,7 +321,7 @@ namespace
         std::atomic<int> adaptive_cap_percentile{ kDefaultConfig.adaptive_cap_percentile };
         std::atomic<PacingPlacementOverride> placement_override{ kDefaultConfig.placement_override };
         std::atomic<bool> gpu_probes{ kDefaultConfig.gpu_probes };
-        std::atomic<double> gpu_wait_budget_us{ kDefaultConfig.gpu_wait_budget_us };
+        std::atomic<double> gpu_wait_headroom_us{ kDefaultConfig.gpu_wait_headroom_us };
         std::atomic<double> gpu_wait_interleave_s{ kDefaultConfig.gpu_wait_interleave_s };
         std::atomic<PacingRenderQueue> gpu_queue_wait_render_queue{ kDefaultConfig.gpu_queue_wait_render_queue };
         std::atomic<PacingLeadCoverage> lead_coverage{ kDefaultConfig.lead_coverage };
@@ -345,7 +345,7 @@ namespace
             s_config.adaptive_cap_percentile.load(std::memory_order_relaxed);
         config.placement_override = s_config.placement_override.load(std::memory_order_relaxed);
         config.gpu_probes = s_config.gpu_probes.load(std::memory_order_relaxed);
-        config.gpu_wait_budget_us = s_config.gpu_wait_budget_us.load(std::memory_order_relaxed);
+        config.gpu_wait_headroom_us = s_config.gpu_wait_headroom_us.load(std::memory_order_relaxed);
         config.gpu_wait_interleave_s = s_config.gpu_wait_interleave_s.load(std::memory_order_relaxed);
         config.gpu_queue_wait_render_queue =
             s_config.gpu_queue_wait_render_queue.load(std::memory_order_relaxed);
@@ -467,7 +467,7 @@ PacingPipelineSnapshot PacingPipeline_Resolve(
     result.lead_quantile = safe_config.lead_coverage == PacingLeadCoverage::Q99 ? kLeadCoverageQ99 : lead.quantile;
     result.allowance_us = lead.allowance_us;
     result.handoff_quantile = lead.quantile;
-    result.gpu_wait_budget_us = safe_config.gpu_wait_budget_us;
+    result.gpu_wait_headroom_us = safe_config.gpu_wait_headroom_us;
     return result;
 }
 
@@ -485,7 +485,7 @@ bool PacingPipeline_SameResult(
         left.allowance_us == right.allowance_us &&
         left.handoff_quantile == right.handoff_quantile &&
         left.gpu_probes == right.gpu_probes &&
-        left.gpu_wait_budget_us == right.gpu_wait_budget_us;
+        left.gpu_wait_headroom_us == right.gpu_wait_headroom_us;
 }
 
 PacingPipelineConfig PacingPipeline_ClampConfig(PacingPipelineConfig config) noexcept
@@ -520,13 +520,13 @@ PacingPipelineConfig PacingPipeline_ClampConfig(PacingPipelineConfig config) noe
     config.stall_inject_period_s = ClampFinite(config.stall_inject_period_s,
         kDefaultConfig.stall_inject_period_s,
         kPacingStallInjectMinPeriodS, kPacingStallInjectMaxPeriodS);
-    // Developer key gpu_wait_budget_us: [500, 5000] µs; non-positive or
-    // non-finite (older builds saved 0 for "off") is the default.
-    config.gpu_wait_budget_us = !std::isfinite(config.gpu_wait_budget_us) ||
-            config.gpu_wait_budget_us <= 0.0
-        ? kPacingGpuWaitBudgetDefaultUs
-        : (std::clamp)(config.gpu_wait_budget_us,
-            kPacingGpuWaitBudgetMinUs, kPacingGpuWaitBudgetMaxUs);
+    // Developer key gpu_wait_headroom_us: [500, 3000] µs; non-positive or
+    // non-finite is the default.
+    config.gpu_wait_headroom_us = !std::isfinite(config.gpu_wait_headroom_us) ||
+            config.gpu_wait_headroom_us <= 0.0
+        ? kPacingGpuWaitHeadroomDefaultUs
+        : (std::clamp)(config.gpu_wait_headroom_us,
+            kPacingGpuWaitHeadroomMinUs, kPacingGpuWaitHeadroomMaxUs);
     // Developer key gpu_wait_interleave_s: 0, negative or non-finite is off;
     // otherwise [1, 10] s.
     config.gpu_wait_interleave_s = !std::isfinite(config.gpu_wait_interleave_s) ||
@@ -550,7 +550,7 @@ void PacingPipeline_SetConfig(const PacingPipelineConfig& config) noexcept
         safe_config.adaptive_cap_percentile, std::memory_order_relaxed);
     s_config.placement_override.store(safe_config.placement_override, std::memory_order_relaxed);
     s_config.gpu_probes.store(safe_config.gpu_probes, std::memory_order_relaxed);
-    s_config.gpu_wait_budget_us.store(safe_config.gpu_wait_budget_us, std::memory_order_relaxed);
+    s_config.gpu_wait_headroom_us.store(safe_config.gpu_wait_headroom_us, std::memory_order_relaxed);
     s_config.gpu_wait_interleave_s.store(safe_config.gpu_wait_interleave_s, std::memory_order_relaxed);
     s_config.gpu_queue_wait_render_queue.store(
         safe_config.gpu_queue_wait_render_queue, std::memory_order_relaxed);

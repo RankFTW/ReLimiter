@@ -144,7 +144,7 @@ namespace
             left.adaptive_cap_percentile == right.adaptive_cap_percentile &&
             left.placement_override == right.placement_override &&
             left.gpu_probes == right.gpu_probes &&
-            left.gpu_wait_budget_us == right.gpu_wait_budget_us &&
+            left.gpu_wait_headroom_us == right.gpu_wait_headroom_us &&
             left.gpu_wait_interleave_s == right.gpu_wait_interleave_s &&
             left.gpu_queue_wait_render_queue == right.gpu_queue_wait_render_queue &&
             left.lead_coverage == right.lead_coverage &&
@@ -896,27 +896,27 @@ namespace
         PacingPipeline_SetConfig(config);
         CHECK(PacingPipeline_GetConfig().adaptive_cap_percentile == 99);
 
-        // gpu_wait_budget_us: [500, 5000] µs, default 1500; non-positive or
-        // non-finite values (0 used to mean "off") are the default.
-        struct BudgetCase { double input; double expected; };
-        const BudgetCase budget_cases[] = {
-            { -5.0, 1500.0 }, { nan, 1500.0 }, { 0.0, 1500.0 }, { 200.0, 500.0 },
-            { 1000.0, 1000.0 }, { 9000.0, 5000.0 },
-            { std::numeric_limits<double>::infinity(), 1500.0 },
+        // gpu_wait_headroom_us: [500, 3000] µs, default 1000; non-positive or
+        // non-finite values are the default.
+        struct HeadroomCase { double input; double expected; };
+        const HeadroomCase headroom_cases[] = {
+            { -5.0, 1000.0 }, { nan, 1000.0 }, { 0.0, 1000.0 }, { 200.0, 500.0 },
+            { 1500.0, 1500.0 }, { 9000.0, 3000.0 },
+            { std::numeric_limits<double>::infinity(), 1000.0 },
         };
-        for (const BudgetCase& test : budget_cases) {
-            PacingPipelineConfig budget{};
-            budget.gpu_wait_budget_us = test.input;
-            CHECK(PacingPipeline_ClampConfig(budget).gpu_wait_budget_us == test.expected);
-            CHECK(Resolve(budget, QualifiedDx12(), ActiveVrr()).gpu_wait_budget_us == test.expected);
+        for (const HeadroomCase& test : headroom_cases) {
+            PacingPipelineConfig headroom{};
+            headroom.gpu_wait_headroom_us = test.input;
+            CHECK(PacingPipeline_ClampConfig(headroom).gpu_wait_headroom_us == test.expected);
+            CHECK(Resolve(headroom, QualifiedDx12(), ActiveVrr()).gpu_wait_headroom_us == test.expected);
         }
-        CHECK(PacingPipelineConfig{}.gpu_wait_budget_us == kPacingGpuWaitBudgetDefaultUs);
-        PacingPipelineConfig budget{};
-        budget.gpu_wait_budget_us = 1000.0;
+        CHECK(PacingPipelineConfig{}.gpu_wait_headroom_us == kPacingGpuWaitHeadroomDefaultUs);
+        PacingPipelineConfig headroom{};
+        headroom.gpu_wait_headroom_us = 1500.0;
         const PacingPipelineSnapshot without = Resolve(PacingPipelineConfig{}, QualifiedDx12(), ActiveVrr());
-        CHECK(!PacingPipeline_SameResult(Resolve(budget, QualifiedDx12(), ActiveVrr()), without));
-        PacingPipeline_SetConfig(budget);
-        CHECK(PacingPipeline_GetConfig().gpu_wait_budget_us == 1000.0);
+        CHECK(!PacingPipeline_SameResult(Resolve(headroom, QualifiedDx12(), ActiveVrr()), without));
+        PacingPipeline_SetConfig(headroom);
+        CHECK(PacingPipeline_GetConfig().gpu_wait_headroom_us == 1500.0);
         PacingPipeline_SetConfig(PacingPipelineConfig{});
         CHECK(SameConfig(PacingPipeline_GetConfig(), PacingPipelineConfig{}));
 

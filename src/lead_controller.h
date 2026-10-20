@@ -48,8 +48,8 @@ constexpr uint64_t LEAD_PENDING_EXPIRY_FRAMES = 8; // frames this far behind the
 constexpr uint64_t LEAD_PENDING_AHEAD_FRAMES = 8;  // events accepted this far ahead of it
 constexpr size_t LEAD_RESUME_DELAY_CAPACITY = 128; // recent probe-measured u − o observations
 constexpr size_t LEAD_RESUME_MEDIAN_SAMPLES = 32;  // newest u − o in the median (decontamination fallback)
-// A waited u − o above this is a late GPU resume: the GPU wait cap ladder's
-// evidence (rung_feasibility.h GpuWaitCap).
+// A waited u − o above this is a late GPU resume: measured and shown (OSD,
+// telemetry), never acted on.
 constexpr double LEAD_RESUME_LATE_US = 1000.0;
 constexpr size_t LEAD_SLACK_CAPACITY = 120;        // newest slack samples per bucket
 // GPU-paced cadence (developer A/B gpu_paced_cadence): the newest X of frames
@@ -85,48 +85,12 @@ constexpr double LEAD_BUDGET_INTERVALS = LEAD_LONG_SAMPLE_INTERVALS;
 // 92-100% of late resumes and
 // 95-100% of the 5-8 ms GPU stalls fell inside that window, and the late
 // share was 0.00-0.27% at margins of 2.5 ms or more. The GPU queue wait lead
-// is therefore at most I + Q10(C) − M: a frame that needs a longer lead
+// is therefore at most I + Q10(C) − M without current Reflex GPU active times
+// (the headroom guard below needs them): a frame that needs a longer lead
 // arrives at its gate after the Signal and is shown when ready, instead of
-// colliding. M is the release margin learned from the waited resumes.
+// colliding. M is fixed.
 constexpr double LEAD_CALL_QUANTILE = 0.10;        // low quantile of C
-constexpr double LEAD_MARGIN_START_US = 2500.0;    // the margin before evidence (and without probes)
-constexpr double LEAD_MARGIN_MIN_US = 1000.0;
-constexpr double LEAD_MARGIN_MAX_US = 4000.0;
-constexpr double LEAD_MARGIN_CUSHION_US = 500.0;   // margin = collision edge + this
-constexpr double LEAD_MARGIN_BIN_US = 250.0;       // edge resolution and step
-constexpr size_t LEAD_MARGIN_BINS = 32;            // 0..8 ms; the last bin also holds larger margins
-// Evidence decays by 1/32768 per waited resume (half-life about 22,700, a
-// few minutes of play): collisions come in heavy stretches (0.5-5% late at
-// 1.75-2 ms in a session's first two minutes, 45-97% in its heaviest 30 s
-// stretches), so the margin keeps the edge of the recurring heavy stretches
-// instead of the calm one in between. A 4,096-resume memory narrowed to
-// 2.0-2.25 ms in calm stretches (offline replay).
-constexpr double LEAD_MARGIN_DECAY_SAMPLES = 32768.0;
-constexpr double LEAD_MARGIN_MIN_SAMPLES = 32.0;   // weighted resumes for a bin to count
-constexpr double LEAD_MARGIN_MIN_LATE = 4.0;       // weighted late resumes for a bin to collide
-// The background is the late share at margins at least 1 ms above M; the
-// learner judges nothing before 256 weighted resumes measure it. A bin
-// collides when its late share exceeds the background by more than 2.5
-// points, at z > 2.5. Widening scans upward from the edge below the
-// background and stops at the first measured bin that does not collide: an
-// earlier build jumped 2.5 -> 4.0 ms on 15 late resumes of
-// 960 shortly after a focus change (lateness well above the collision
-// window), and with M = 4.0 ms 98.8% of frames reached the GPU wait after
-// their release (display jitter p50 438 us against 82 at the normal margin).
-constexpr double LEAD_MARGIN_BACKGROUND_SAMPLES = 256.0;
-constexpr double LEAD_MARGIN_EXCESS_SHARE = 0.025;
-constexpr double LEAD_MARGIN_EXCESS_Z = 2.5;
-// The bin just below the edge is clean with at least 512 weighted resumes and
-// a late share at most 0.5 points above the background. The edge narrows one
-// bin after 1,024 consecutive waited resumes with it clean or, above the
-// start, with fewer than LEAD_MARGIN_MIN_LATE weighted late resumes left
-// there; widening needs no wait. The guard keeps releases about a cushion
-// above the edge, so the bin below it seldom collects 512 resumes (Rogue Core
-// at H = 2.25 ms: at most 199 weighted in 15 minutes, none late at any
-// distance); without the second test a widening never faded.
-constexpr double LEAD_MARGIN_CLEAN_SAMPLES = 512.0;
-constexpr double LEAD_MARGIN_CLEAN_SHARE = 0.005;
-constexpr uint32_t LEAD_MARGIN_NARROW_SAMPLES = 1024;
+constexpr double LEAD_RELEASE_MARGIN_US = 2500.0;  // M
 
 // Release headroom. A late resume is the work after the GPU
 // wait queued behind one of the next frame's long command buffers on the same
@@ -136,16 +100,24 @@ constexpr uint32_t LEAD_MARGIN_NARROW_SAMPLES = 1024;
 // r − A, its GPU readiness minus its Reflex GPU active render time (within
 // −117 / +65 µs, p10 / p90, of the first long command buffer in that trace),
 // so D = r − A − s is the source release → heavy GPU work time and the
-// headroom of frame n's release is I − L_{n+1} + D_{n+1}. Over five probed
-// sessions the late share fell to at most 1.3% from 0.5 ms of headroom and to
-// at most 0.5% from 0.75 ms, while the margin to the next Present call that
-// did the same ranged from 1.5 to 3.5 ms by scene. The GPU queue wait lead is
-// therefore at most I + Q10(D) − H, H the learned headroom; without current
-// Reflex GPU active times the Present-call guard above applies. Without GPU
-// Wait Probes (no waited resumes) H stays at its start, as M does. In
-// a replay of 14 sessions H = 1.0 ms cut late resumes from 1,659 to 523 (nine
-// pre-guard sessions) and from 619 to 103 (five recent ones) with about as
-// many frames reaching the GPU wait late (14.5 / 12.8% against 13.1 / 12.9%).
+// headroom of frame n's release is I − L_{n+1} + D_{n+1}. The GPU queue wait
+// lead is therefore at most I + Q10(D) − H, H a fixed distance (developer key
+// gpu_wait_headroom_us, default 1.0 ms). In all 1.35 million waited resumes
+// with probes and Reflex GPU times (47 Rogue Core captures) late resumes
+// (u − o > 1 ms) were 0.00-0.05% per 250 µs distance bin from 1 ms on, and
+// 99.2% of them were closer than 1 ms; live at H = 1.0 ms 0.006-0.040% of
+// waited resumes were late. The distance used to be learned from late
+// resumes (widen at once, narrow as old evidence decayed, kept across
+// resets). That was a latch: it widened to 1.75 ms on 10 of 123 resumes at a
+// session's start and could not narrow, because the guard itself keeps
+// releases out of the region below the edge it would have to measure. The
+// GPU load dependence the raw table shows (late at 0.5-0.75 ms: 0.16-0.18% at
+// A/I <= 0.75, 4.9% at 0.85-0.95) is composition: heavy sections hold more
+// frames briefly (holds < 250 µs 1.6% of waited resumes at A/I <= 0.6,
+// 32% at 0.85-0.95), and short holds are the late ones at a fixed distance
+// (3.9% against 0.04-0.45% for longer holds at 0.5-1 ms); with holds of at
+// least 500 µs the load gradient is 0.05-0.75%.
+constexpr double LEAD_RELEASE_HEADROOM_US = 1000.0; // H, the default of gpu_wait_headroom_us
 constexpr double LEAD_WORK_QUANTILE = 0.10;        // low quantile of D
 // A heavy-work window without a new sample for this many GPU queue wait
 // frames is stale (Reflex reports stopped): the Present-call guard applies.
@@ -165,9 +137,15 @@ constexpr uint32_t LEAD_WORK_STALE_FRAMES = 64;
 // off (Output override GPU wait) 2,309 waited frames above its limit had no
 // late resume while jitter fell from 1.91 to 1.04 ms. The
 // guards therefore stand aside only once LEAD_WARM_SAMPLES of the newest
-// LEAD_CONCURRENCY_SAMPLES pairs exist and none was concurrent; one
-// concurrent pair restores them at once. Without probes or Reflex reports no
-// pair exists and the guards stay. Under the guard D cannot show this: the
+// LEAD_CONCURRENCY_SAMPLES pairs exist and none was concurrent, and only
+// while the heavy-work window is current (Reflex GPU active times arriving):
+// without them no new pair can show the order changing, so the Present-call
+// guard applies. One concurrent pair restores the guards at once. Without
+// probes or Reflex reports no pair exists and the guards stay. The verdict
+// does not need a pair on every frame: a pair needs a waited frame whose next
+// frame had begun submitting by the release, and frames without one cannot
+// collide (CONTROL Resonant: gaps of up to 362 GPU queue wait frames between
+// pairs). Under the guard D cannot show this: the
 // next frame's heavy work queues behind the guarded release, so Q10(D) rises
 // with the lead (CONTROL: p10 4.7 ms guarded, 5.5 ms at +1.7 ms, 8.1 ms at
 // +4.6 ms lead) and never shows the room.
@@ -176,28 +154,20 @@ constexpr size_t LEAD_CONCURRENCY_SAMPLES = 64;
 // pairs start p50 0.7-0.9 ms before the Signal.
 constexpr double LEAD_CONCURRENCY_TOLERANCE_US = 100.0;
 
-// Bounds of a learned collision distance: the release margin (to the next
-// Present call) or the release headroom (to the next frame's heavy GPU work).
-struct CollisionDistanceLimits {
-    double start_us;
-    double min_us;
-    double max_us;
-};
-constexpr CollisionDistanceLimits LEAD_MARGIN_LIMITS{ LEAD_MARGIN_START_US, LEAD_MARGIN_MIN_US, LEAD_MARGIN_MAX_US };
-// 1.0 ms to start: 0.75 ms gave more lead in the replay but more late
-// resumes in 8 of 14 sessions, 0.5 ms more than four times as many late
-// resumes as the 2.5 ms release margin.
-constexpr CollisionDistanceLimits LEAD_HEADROOM_LIMITS{ 1000.0, 750.0, 3000.0 };
-
-// Hold room (Adaptive cap): a GPU queue wait frame the guard
-// judged reaches its gate before its guarded release once the interval is at
-// least R = X − (limit − I), X minus Q10(D) − H (or Q10(C) − M). The period
-// governor keeps the interval at least at the Adaptive cap percentile of R
-// (period_governor.h). Across the release falls of 20 sessions the time from
-// the gate to the next frame's heavy GPU work moved 0.93 µs per µs of
-// interval while A and D moved −0.01 and +0.06: R does not grow with the
-// interval it buys. A frame late even against its unguarded lead is the
-// overload's evidence, not the hold's, and adds no R.
+// Hold room (Adaptive cap): the same inequality as the guard, solved for the
+// interval. A judged GPU queue wait frame is held at least h before its
+// guarded release once X + h <= L = I + (limit − I), so the interval it needs
+// is R = X + h − (Q10(D) − H) (or − (Q10(C) − M)). The period governor keeps
+// the interval at least at the Adaptive cap percentile of R over the newest
+// 256 judged frames (period_governor.h): Q_fit(X) + h − the guard's current
+// offset, so the room uses the guard's own distances, never older ones. h is
+// a minimum hold: at 0.5-1 ms of distance holds under 250 µs were 3.9% late
+// against at most 0.45% for longer ones. Across the release falls of 20
+// sessions the time from the gate to the next frame's heavy GPU work moved
+// 0.93 µs per µs of interval while A and D moved −0.01 and +0.06. A frame
+// late even against its unguarded lead is the overload's evidence, not the
+// hold's, and adds no X to the room.
+constexpr double LEAD_ROOM_MIN_HOLD_US = 250.0; // h
 
 // Lockstep engines (CONTROL Resonant): the game finishes
 // frame n's render submission and Present only after ReLimiter releases
@@ -367,15 +337,13 @@ struct GpuFloorEstimate {
 
 // ── Inputs and status ──
 
-// The collision guard's verdict on one lead (NextLeadUs), and how much the
-// GPU wait cap lowered it.
+// The collision guard's verdict on one lead (NextLeadUs).
 struct LeadGuardOutcome {
     bool judged = false;       // a GPU queue wait lead the guard judged (C or D window warm)
     double offset_us = 0.0;    // the limit minus I: Q10(D) − H, or Q10(C) − M
-    double reduction_us = 0.0; // how much the guard lowered L (>= 0)
-    // How much the GPU wait cap lowered the target this lead follows (>= 0):
-    // min(Q_q + allowance, 3 I) − (median X + cap) while the cap binds.
-    double cap_reduction_us = 0.0;
+    // How much lower the lead is than the unguarded lead (>= 0): the guard's
+    // limit, and after the limit relaxed, the lead slewing back up to it.
+    double reduction_us = 0.0;
 };
 
 // The owner's source release of one planned frame (plan fields plus s).
@@ -401,10 +369,9 @@ struct LeadFrameStart {
     // ready (EarlyLeadUs).
     bool gpu_floor_release = false;
     // The collision guard's verdict on L (NextLeadUs). The Adaptive cap's
-    // slack is judged against L + guard.reduction_us + guard.cap_reduction_us,
-    // so lateness the guard or the GPU wait cap accepts on purpose is not a
-    // missed target; a judged frame adds its hold room X − guard.offset_us
-    // when it is not late against L + guard.reduction_us.
+    // slack is judged against L + guard.reduction_us, so lateness the guard
+    // accepts on purpose is not a missed target; a judged frame adds its X to
+    // the hold room when it is not late against that unguarded lead.
     LeadGuardOutcome guard{};
     // ReLimiter's waits for this frame before s: the source wait
     // [wait_start_qpc, wait_end_qpc] and a pre-Sleep wait [pre_wait_start_qpc,
@@ -425,11 +392,11 @@ struct LeadRequest {
     PacingTimingMode mode = PacingTimingMode::Vrr;
     double quantile = 0.95;
     double allowance_us = 500.0;
-    double gpu_wait_cap_us = 0.0; // GPU queue wait: warm target at most median X + this; 0 = uncapped
-    // GPU queue wait: L at most I + Q10(D) − release headroom once 32 D
-    // samples exist and are current, else I + Q10(C) − release margin once 32
-    // C samples exist; neither while the next frame's GPU work runs behind
-    // the wait (queue order, above).
+    // GPU queue wait: L at most I + Q10(D) − release_headroom_us once 32 D
+    // samples exist and are current, else I + Q10(C) − LEAD_RELEASE_MARGIN_US
+    // once 32 C samples exist; neither while the next frame's GPU work runs
+    // behind the wait (queue order, above).
+    double release_headroom_us = LEAD_RELEASE_HEADROOM_US;
     bool collision_guard = false;
 };
 
@@ -456,38 +423,34 @@ struct LeadStatistics {
     uint64_t samples = 0;            // samples added to a bucket
     uint64_t excluded_long = 0;      // samples above 3 I, not added
     uint64_t budget_limited_frames = 0; // lead decisions whose warm target exceeded the budget
-    uint64_t gpu_wait_capped_frames = 0; // warm GPU queue wait targets lowered by gpu_wait_cap_us
     // Collision guard: GPU queue wait leads it judged (C or D window warm)
-    // and of those, leads it lowered; the headroom guard judged
-    // headroom_checked_frames of them, the Present-call guard the rest.
+    // and of those, leads it lowered (its limit or the slew back up to it);
+    // the headroom guard judged headroom_checked_frames of them, the
+    // Present-call guard the rest.
     uint64_t collision_checked_frames = 0;
     uint64_t collision_guarded_frames = 0;
     uint64_t headroom_checked_frames = 0;
     double last_collision_limit_us = 0.0; // the newest judged limit: I + Q10(D) − H or I + Q10(C) − M
     bool last_guard_headroom = false;     // the newest judged lead used the headroom guard
     // Release margin evidence (waited resumes with the next Present call
-    // known) and the learner's steps.
+    // known; measured, not acted on).
     uint64_t margin_samples = 0;
     uint64_t margin_late_samples = 0;
-    uint64_t margin_widened = 0;
-    uint64_t margin_narrowed = 0;
     // Release headroom: D samples (GPU queue wait frames with r and a Reflex
-    // GPU active time), Reflex GPU active times without a pending frame,
-    // waited resumes with the next frame's heavy GPU work start known, and
-    // the learner's steps.
+    // GPU active time), Reflex GPU active times without a pending frame, and
+    // waited resumes with the next frame's heavy GPU work start known
+    // (measured, not acted on).
     uint64_t work_samples = 0;
     uint64_t unmatched_gpu_active = 0;
     uint64_t headroom_samples = 0;
     uint64_t headroom_late_samples = 0;
-    uint64_t headroom_widened = 0;
-    uint64_t headroom_narrowed = 0;
     // Queue order (above): waited releases paired with the next frame's GPU
     // start, those whose next frame's GPU work started before the release
     // (concurrent), and the newest g_{n+1} − o_n.
     uint64_t concurrency_samples = 0;
     uint64_t concurrent_samples = 0;
     double last_concurrency_us = 0.0;
-    uint64_t room_samples = 0;       // hold room samples R (judged GPU queue wait frames not late against L + reduction)
+    uint64_t room_samples = 0;       // hold room samples X (judged GPU queue wait frames not late against L + reduction)
     // Slack samples judged without the gated hold of later frames (lockstep
     // engines), and the newest such hold.
     uint64_t gated_hold_samples = 0;
@@ -500,7 +463,7 @@ struct LeadStatistics {
     // the Wait after the Signal (u − o is GPU backlog), or the pre-Wait time is unknown.
     uint64_t resume_not_waited = 0;
     // Waited u − o observations (the GPU waited at the Signal), and of those,
-    // resumes later than LEAD_RESUME_LATE_US: the GPU wait cap's evidence.
+    // resumes later than LEAD_RESUME_LATE_US.
     uint64_t resume_waited_samples = 0;
     uint64_t resume_late_samples = 0;
     uint64_t invalid_inputs = 0;     // rejected frequency, requests, releases and events
@@ -520,7 +483,7 @@ struct LeadStatistics {
     double last_slack_us = 0.0;      // newest slack L − X, long samples included
     // Slack samples (one per frame whose readiness was measured, long ones
     // included) and of those, frames ready after their target (L − X < 0,
-    // with L the lead before the collision guard and the GPU wait cap):
+    // with L the lead before the collision guard):
     // the Adaptive cap's output evidence. Draining: late frames whose
     // predecessor (the previous grid index, sample emitted) was late by
     // more. That is the queue behind one late frame running down: the
@@ -531,42 +494,6 @@ struct LeadStatistics {
     uint64_t slack_samples = 0;
     uint64_t negative_slack_samples = 0;
     uint64_t draining_late_samples = 0;
-};
-
-// ── Release margin and headroom ──
-
-// Learns a collision distance: the collision edge (the lowest distance whose
-// late-resume share matches the background) plus LEAD_MARGIN_CUSHION_US,
-// within the limits. The controller runs two: the release margin M, measured
-// to the next Present call (p_{n+1} − o_n), and the release headroom H,
-// measured to the next frame's heavy GPU work (r_{n+1} − A_{n+1} − o_n).
-// Decayed per-bin counts of waited resumes; colliding bins reached upward
-// from the edge widen it at once. Each narrowing step needs the bin just
-// below the edge to stay, for LEAD_MARGIN_NARROW_SAMPLES resumes, either clean
-// or (above the start) with fewer than LEAD_MARGIN_MIN_LATE weighted late
-// resumes: widening is quick, a widening fades over minutes with its late
-// resumes. Without evidence (no probes) the distance stays at its start.
-class ReleaseMarginLearner {
-public:
-    explicit ReleaseMarginLearner(CollisionDistanceLimits limits = LEAD_MARGIN_LIMITS) noexcept
-        : limits_(limits), margin_us_(limits.start_us) {}
-    void Reset() noexcept;
-    // One waited resume: margin_us = the distance from the release to the
-    // collision reference, late = u − o > LEAD_RESUME_LATE_US.
-    // Returns +1 when the distance widened, −1 when it narrowed, else 0.
-    int Add(double margin_us, bool late) noexcept;
-    double MarginUs() const noexcept { return margin_us_; }
-    double EdgeUs() const noexcept { return margin_us_ - LEAD_MARGIN_CUSHION_US; }
-
-private:
-    static size_t BinOf(double margin_us) noexcept;
-    bool Colliding(size_t bin, double background) const noexcept;
-
-    CollisionDistanceLimits limits_;
-    std::array<double, LEAD_MARGIN_BINS> resumes_{};
-    std::array<double, LEAD_MARGIN_BINS> late_{};
-    double margin_us_;
-    uint32_t narrow_run_ = 0;
 };
 
 // ── Sample window ──
@@ -684,12 +611,14 @@ public:
     // window's median minus the allowance; 0 for a cold bucket without one,
     // an unknown bucket, or a non-finite q or allowance.
     double EarlyLeadUs(PacingRung rung, double fg_divisor, double quantile, double allowance_us) const noexcept;
-    // Hold room: Q_q of R over the newest 256 hold-room samples of the FG
-    // divisor, the interval at which a share q of the judged GPU queue wait
-    // frames would have reached the GPU wait before their guarded release;
-    // 0 until 32 samples, for a non-finite q, after a reset, and while the
-    // queue order shows the next frame's GPU work behind the wait.
-    double HoldRoomUs(double fg_divisor, double quantile) const noexcept;
+    // Hold room (above): Q_q of the newest 256 hold-room samples X of the FG
+    // divisor plus LEAD_ROOM_MIN_HOLD_US minus the guard's current offset at
+    // release_headroom_us (LEAD_RELEASE_HEADROOM_US when not positive and
+    // finite), the interval at which a share q of the judged GPU queue wait
+    // frames would hold at least h before their guarded release; 0 until 32
+    // samples, without a warm guard window, for a non-finite q, after a
+    // reset, and while the guard stands aside (queue order).
+    double HoldRoomUs(double fg_divisor, double quantile, double release_headroom_us) const noexcept;
     // Render handoff offset d (above): max(0, Q_{1−q}(h) − allowance_us) over
     // the newest 256 samples, 0 before LEAD_HANDOFF_MIN_SAMPLES or for a
     // non-finite q or allowance.
@@ -733,16 +662,11 @@ public:
     // Slack window and last budget decision of the bucket; empty for an invalid rung.
     LeadFeasibility Feasibility(PacingRung rung, double fg_divisor) const noexcept;
     LeadStatistics Statistics() const noexcept { return statistics_; }
-    // The learned release margin M (LEAD_MARGIN_START_US until evidence) and
-    // release headroom H (LEAD_HEADROOM_LIMITS.start_us until evidence).
-    // Kept across Reset: they describe the GPU scheduler and the game's GPU
-    // work, not the lifecycle.
-    double ReleaseMarginUs() const noexcept { return margin_.MarginUs(); }
-    double ReleaseHeadroomUs() const noexcept { return headroom_.MarginUs(); }
     // Queue order (above): the collision guards stand aside while the newest
-    // pairs show the next frame's GPU work running behind the wait. Kept
-    // across Reset, like M and H: it describes the game's GPU submission.
-    bool NextGpuWorkBehindWait() const noexcept;
+    // pairs show the next frame's GPU work running behind the wait and the
+    // FG divisor's heavy-work window is current. The pairs are kept across
+    // Reset: they describe the game's GPU submission, not the lifecycle.
+    bool NextGpuWorkBehindWait(double fg_divisor) const noexcept;
     size_t ConcurrencyPairs() const noexcept { return concurrency_count_; }
     size_t ConcurrentPairs() const noexcept { return concurrent_in_window_; }
 
@@ -778,8 +702,6 @@ private:
         double slack_us = 0.0;     // L − X once the sample is emitted (slack_known)
         bool slack_known = false;
         double guard_reduction_us = 0.0; // the collision guard's reduction of L
-        double cap_reduction_us = 0.0;   // the GPU wait cap's (LeadGuardOutcome::cap_reduction_us)
-        double guard_offset_us = 0.0;    // its limit minus I (guard_judged)
         bool guard_judged = false;       // a judged GPU queue wait lead: adds a hold-room sample
         int64_t wait_start_qpc = 0;     // ReLimiter's source wait before s; 0 none
         int64_t wait_end_qpc = 0;
@@ -825,7 +747,9 @@ private:
         uint64_t excluded_long = 0;
         double quantile_us = 0.0;
         double target_us = 0.0;
-        double lead_us = 0.0;
+        double lead_us = 0.0;          // the lead before the collision guard
+        double returned_lead_us = 0.0; // the lead NextLeadUs returned last
+        bool held_back = false;        // returned_lead_us was below lead_us (the guard or its slew)
         double budget_us = 0.0;
         bool warm_applied = false;
         bool budget_limited = false;
@@ -868,6 +792,13 @@ private:
     void RecordConcurrency(PendingFrame* frame) noexcept;
     double CollisionGuardedLeadUs(const LeadRequest& request, size_t bucket_index, double lead_us,
         LeadGuardOutcome* guard) noexcept;
+    // The guard's limit minus I for an FG divisor slot: Q10(D) − headroom_us
+    // while the heavy-work window is warm and current (*headroom true), else
+    // Q10(C) − LEAD_RELEASE_MARGIN_US while the call window is warm; false
+    // when neither is. One evaluator for the guard and the hold room.
+    bool CollisionOffsetUs(size_t divisor, double headroom_us, double* offset_us, bool* headroom) const noexcept;
+    bool WorkCurrent(size_t divisor) const noexcept;
+    bool BehindWait(size_t divisor) const noexcept;
 
     // Sample assembly
     bool PreviousResolved(const PendingFrame& frame) const noexcept;
@@ -909,8 +840,8 @@ private:
     size_t resume_delay_count_ = 0;
     // Collision guard: release → Present call times C and release → heavy
     // GPU work times D of GPU queue wait frames per FG divisor, the GPU queue
-    // wait releases since each work window's newest sample, the release
-    // margin and the release headroom; the hold room R per FG divisor.
+    // wait releases since each work window's newest sample, and the hold
+    // room's X per FG divisor.
     std::array<LeadSampleWindow, LEAD_DIVISOR_BUCKETS> call_windows_{};
     std::array<LeadSampleWindow, LEAD_DIVISOR_BUCKETS> work_windows_{};
     std::array<uint32_t, LEAD_DIVISOR_BUCKETS> work_age_frames_{};
@@ -961,8 +892,6 @@ private:
         size_t divisor = 0;
     };
     std::array<GpuPacedRing, 2> gpu_paced_rings_{};
-    ReleaseMarginLearner margin_{};
-    ReleaseMarginLearner headroom_{ LEAD_HEADROOM_LIMITS };
     // Queue order: the newest LEAD_CONCURRENCY_SAMPLES pairs, 1 = concurrent.
     std::array<uint8_t, LEAD_CONCURRENCY_SAMPLES> concurrency_{};
     size_t concurrency_head_ = 0;

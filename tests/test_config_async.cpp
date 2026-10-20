@@ -364,10 +364,10 @@ void TestPacingPipelineDefaults() {
 // fg_late_spacing=false: it moves to true once; a version-4 INI keeps false.
 void TestRecommendedDefaultsMigration() {
     Reset(false, false, {{"reflex_sleep_bypass", "false"}, {"source_placement", "marker"},
-        {"gpu_wait_budget_us", "4000"}, {"adaptive_cap", "true"}});
+        {"gpu_wait_headroom_us", "2000"}, {"adaptive_cap", "true"}});
     CHECK(g_config.reflex_sleep_bypass && g_reflex_sleep_bypass.load());
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
-    CHECK(g_config.gpu_wait_budget_us == 4000.0 && g_config.adaptive_cap);
+    CHECK(g_config.gpu_wait_headroom_us == 2000.0 && g_config.adaptive_cap);
     CheckPipelineMatchesConfig();
     CHECK(Value(local_path, "FrameLimiter", "config_version") == "4");
     CHECK(Value(local_path, "FrameLimiter", "reflex_sleep_bypass") == "true");
@@ -402,7 +402,7 @@ void TestRecommendedDefaultsMigration() {
 // and applies them, leaving the user's settings alone.
 void TestDeveloperSettingsReset() {
     Reset(false, false, {{"config_version", "2"}, {"developer_settings", "true"}, {"smoothing", "off"},
-        {"output_rung", "gpu"}, {"gpu_wait_budget_us", "4000"}, {"reflex_sleep_bypass", "false"},
+        {"output_rung", "gpu"}, {"gpu_wait_headroom_us", "2000"}, {"reflex_sleep_bypass", "false"},
         {"source_placement", "marker"}, {"adaptive_cap", "true"}, {"adaptive_cap_percentile", "90"}});
     CHECK(g_config.developer_settings);
     CHECK(Value(local_path, "FrameLimiter", "developer_settings") == "true");
@@ -410,7 +410,7 @@ void TestDeveloperSettingsReset() {
     Config_ResetDeveloperSettings();
     CHECK(Config_DeveloperOverrides() == 0);
     CHECK(g_config.smoothing == PacingSmoothing::On && g_config.output_rung == PacingRungOverride::Auto);
-    CHECK(g_config.gpu_wait_budget_us == kPacingGpuWaitBudgetDefaultUs);
+    CHECK(g_config.gpu_wait_headroom_us == kPacingGpuWaitHeadroomDefaultUs);
     CHECK(g_config.reflex_sleep_bypass && g_reflex_sleep_bypass.load());
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
     CHECK(g_config.adaptive_cap && g_config.adaptive_cap_percentile == 90 && g_config.developer_settings);

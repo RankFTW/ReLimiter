@@ -96,7 +96,7 @@ struct PacingSourceRecord {
     // Controller fields. The first
     // two are CSV row columns (the third controller column,
     // plan_signal_advance_us, is a constant); the causes and the overload
-    // guard state feed the governor_step, rung_feasibility and gpu_wait_cap events.
+    // guard state feed the governor_step and rung_feasibility events.
     // governor_step: VRR, the stretch in whole percent of I_0; snapped
     // fixed refresh, whole refreshes above the base; 0 when not governed.
     uint8_t governor_step = 0;
@@ -106,8 +106,6 @@ struct PacingSourceRecord {
                                          // keeps an Auto hold off
     uint8_t feasibility_cause = 0;       // FeasibilityCause of the newest transition (4 = overload, 3 = retry,
                                          // 10/11 = A/B interleave; 1/2, 5..9 and 12..14 only from older builds)
-    uint8_t gpu_wait_cap_level = 0;      // GPU queue wait cap ladder level 0..3 (0 = gpu_wait_budget_us), 255 = open top (no cap); every record
-    uint8_t gpu_wait_cap_cause = 0;      // GpuWaitCapCause of a level change on this frame; 0 otherwise
 
     // Source placement. CSV row columns.
     uint8_t source_placement = 0;        // PacingSourcePlacement of the resolved pipeline

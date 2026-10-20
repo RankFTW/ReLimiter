@@ -1412,68 +1412,6 @@ void TestRestartRungSourceFloor()
     CHECK(risen->Statistics().invalid_inputs == 0);
 }
 
-// GPU wait cap (rung_feasibility.h GpuWaitCap): a warm GPU queue wait target
-// is at most median X + cap; other rungs (the FG input wait included), cold
-// buckets and cap 0 are unchanged.
-void TestGpuWaitCap()
-{
-    // 37 samples of 10,000 and 3 of 14,000 µs: lower-index p50 = 10,010 and
-    // Q95 = 14,010 (bin centers). Frames two indices apart have no previous
-    // frame, so X = r − s.
-    auto controller = MakeController();
-    for (uint64_t frame = 0; frame < 40; ++frame) {
-        FeedGpuFrame(controller.get(), 1 + 2 * frame, PacingRung::GpuQueueWait,
-            frame < 37 ? 10000.0 : 14000.0, 1.0);
-    }
-    for (uint64_t frame = 0; frame < 40; ++frame) {
-        FeedMarkerFrame(controller.get(), 101 + frame, PacingRung::SourceOnly,
-            frame < 37 ? 10000.0 : 14000.0);
-    }
-    for (uint64_t frame = 0; frame < 40; ++frame) {
-        FeedGpuFrame(controller.get(), 201 + 2 * frame, PacingRung::FgInputWait,
-            frame < 37 ? 10000.0 : 14000.0, 1.0);
-    }
-    CHECK(controller->BucketStatus(PacingRung::GpuQueueWait, 1.0).samples == 40);
-    CHECK(controller->BucketStatus(PacingRung::SourceOnly, 1.0).samples == 40);
-    CHECK(controller->BucketStatus(PacingRung::FgInputWait, 1.0).samples == 40);
-
-    LeadRequest request = Request(PacingRung::GpuQueueWait, 500.0);
-    request.gpu_wait_cap_us = 1000.0;
-    LeadGuardOutcome outcome{};
-    CHECK(std::fabs(controller->NextLeadUs(request, nullptr, &outcome) - 11000.0) <= 20.0);
-    CHECK(std::fabs(controller->BucketStatus(PacingRung::GpuQueueWait, 1.0).target_us - 11000.0) <= 20.0);
-    CHECK(controller->Statistics().gpu_wait_capped_frames == 1);
-    // The cap lowered the target from Q95 + allowance (14,510) to p50 + cap (11,010).
-    CHECK(std::fabs(outcome.cap_reduction_us - 3500.0) <= 20.0);
-
-    request.gpu_wait_cap_us = 0.0;
-    controller->NextLeadUs(request, nullptr, &outcome);
-    CHECK(outcome.cap_reduction_us == 0.0);
-    CHECK(std::fabs(controller->BucketStatus(PacingRung::GpuQueueWait, 1.0).target_us - 14500.0) <= 20.0);
-    request.gpu_wait_cap_us = kNaN;
-    controller->NextLeadUs(request);
-    CHECK(std::fabs(controller->BucketStatus(PacingRung::GpuQueueWait, 1.0).target_us - 14500.0) <= 20.0);
-    // A cap above Q95 + allowance does not raise the target.
-    request.gpu_wait_cap_us = 5000.0;
-    controller->NextLeadUs(request);
-    CHECK(std::fabs(controller->BucketStatus(PacingRung::GpuQueueWait, 1.0).target_us - 14500.0) <= 20.0);
-    CHECK(controller->Statistics().gpu_wait_capped_frames == 1);
-
-    LeadRequest source_only = Request(PacingRung::SourceOnly, 500.0);
-    source_only.gpu_wait_cap_us = 1000.0;
-    CHECK(std::fabs(controller->NextLeadUs(source_only) - 14500.0) <= 20.0);
-    LeadRequest fg = Request(PacingRung::FgInputWait, 500.0);
-    fg.gpu_wait_cap_us = 1000.0;
-    CHECK(std::fabs(controller->NextLeadUs(fg) - 14500.0) <= 20.0);
-    CHECK(controller->Statistics().gpu_wait_capped_frames == 1);
-
-    // A cold GPU queue wait bucket keeps its seed.
-    auto cold_controller = MakeController();
-    LeadRequest cold = Request(PacingRung::GpuQueueWait, 500.0);
-    cold.gpu_wait_cap_us = 1000.0;
-    CHECK_NEAR(cold_controller->NextLeadUs(cold), 5000.0);
-}
-
 void TestSlackWindow()
 {
     auto controller = MakeController();
@@ -1573,7 +1511,7 @@ void TestResumeDelayRequiresWait()
 
     // GPU backlog: it reached the Wait after the Signal, so u − o is its own
     // earlier work, not Signal→resume latency; none of it enters the
-    // history or the GPU wait cap's resume counters.
+    // history or the late-resume counters.
     for (uint64_t index = 35; index <= 66; ++index) FeedProbedGpuFrame(controller.get(), index, 2000.0, 1.0);
     CHECK_NEAR(FallbackMedianUs(controller.get(), 67), 300.0);
     CHECK(controller->Statistics().resume_waited_samples == 32); // waited frames only
@@ -1645,8 +1583,9 @@ void TestClearSlackEvidence()
     CHECK(controller->Statistics().invalid_inputs == 0);
 }
 
-// The GPU wait cap's evidence: every waited u − o counts, those above 1 ms
-// (stalls included) are late; backlogged frames count in neither.
+// Late-resume counters (measured and shown, never acted on): every waited
+// u − o counts, those above 1 ms (stalls included) are late; backlogged
+// frames count in neither.
 void TestResumeCounters()
 {
     auto controller = MakeController();
@@ -1697,129 +1636,11 @@ namespace
     }
 }
 
-// Nothing is judged before the background (margins at least 1 ms above M) is
-// measured; then a colliding bin above the edge widens it at once; the bin
-// just below the edge must be well measured and clean for 1,024 resumes per
-// 0.25 ms narrowing step; a band 1% late never narrows it; late resumes
-// there widen it again.
-void TestReleaseMarginLearnerSteps()
-{
-    ReleaseMarginLearner learner;
-    CHECK_NEAR(learner.MarginUs(), LEAD_MARGIN_START_US);
-    CHECK_NEAR(learner.EdgeUs(), LEAD_MARGIN_START_US - LEAD_MARGIN_CUSHION_US);
-    // Without a measured background even late resumes at the edge change nothing.
-    ReleaseMarginLearner unmeasured;
-    for (int resume = 0; resume < 2000; ++resume) CHECK(unmeasured.Add(2100.0, true) == 0);
-    CHECK_NEAR(unmeasured.MarginUs(), 2500.0);
-    // Clean resumes far from the edge are no evidence either way; NaN is ignored.
-    for (int resume = 0; resume < 5000; ++resume) CHECK(learner.Add(6000.0, false) == 0);
-    CHECK(learner.Add(kNaN, true) == 0);
-    CHECK_NEAR(learner.MarginUs(), 2500.0);
-
-    // Half the resumes at 2.6 ms late, clean at 6 ms: the [2.5, 2.75) bin
-    // collides (the empty bins between it and the edge are skipped), the
-    // edge moves to 2.75 ms, M = 3.25 ms, in one step.
-    int widened = 0;
-    for (int resume = 0; resume < 400; ++resume) {
-        widened += learner.Add(2600.0, resume % 2 == 0) > 0 ? 1 : 0;
-        CHECK(learner.Add(6000.0, false) >= 0);
-    }
-    CHECK(widened == 1);
-    CHECK_NEAR(learner.MarginUs(), 3250.0);
-
-    // Narrowing: a clean background (400 resumes at 6 ms), then clean resumes
-    // in the bin just below the edge ([1.75, 2.0) ms). The bin is well
-    // measured from its 517th decayed resume, so the 1,024th consecutive
-    // clean one is resume 1,540.
-    ReleaseMarginLearner narrowing;
-    for (int resume = 0; resume < 400; ++resume) narrowing.Add(6000.0, false);
-    for (int resume = 1; resume <= 1539; ++resume) CHECK(narrowing.Add(1900.0, false) == 0);
-    CHECK_NEAR(narrowing.MarginUs(), 2500.0);
-    CHECK(narrowing.Add(1900.0, false) == -1);
-    CHECK_NEAR(narrowing.MarginUs(), 2250.0);
-    // 1% late there is not clean (nor colliding): no step either way.
-    ReleaseMarginLearner slightly_late;
-    for (int resume = 0; resume < 400; ++resume) slightly_late.Add(6000.0, false);
-    for (int resume = 1; resume <= 8000; ++resume) CHECK(slightly_late.Add(1900.0, resume % 100 == 0) == 0);
-    CHECK_NEAR(slightly_late.MarginUs(), 2500.0);
-    // Nothing measured below 1.75 ms: no further step.
-    for (int resume = 0; resume < 3000; ++resume) narrowing.Add(1900.0, false);
-    CHECK_NEAR(narrowing.MarginUs(), 2250.0);
-    // Late resumes at 1.9 ms now collide above the edge: back to 2.5 ms.
-    int step = 0;
-    for (int resume = 0; resume < 400 && step == 0; ++resume) step = narrowing.Add(1900.0, true);
-    CHECK(step == 1);
-    CHECK_NEAR(narrowing.MarginUs(), 2500.0);
-
-    learner.Reset();
-    CHECK_NEAR(learner.MarginUs(), LEAD_MARGIN_START_US);
-}
-
-// Once the background (margins at least 1 ms above M) is measured, lateness
-// that does not depend on the margin (10% everywhere) never widens. The
-// margin stays in [1, 4] ms.
-void TestReleaseMarginLearnerBackgroundAndBounds()
-{
-    ReleaseMarginLearner background;
-    for (int resume = 0; resume < 1000; ++resume) CHECK(background.Add(6000.0, resume % 10 == 5) == 0);
-    for (int resume = 0; resume < 8000; ++resume) {
-        CHECK(background.Add(2600.0, resume % 10 == 0) == 0);
-        CHECK(background.Add(6000.0, resume % 10 == 5) == 0);
-    }
-    CHECK_NEAR(background.MarginUs(), 2500.0);
-
-    // Collisions up to 3.5 ms put the edge there: M = 4 ms. A colliding bin
-    // above that cannot raise M past the bound.
-    ReleaseMarginLearner high;
-    for (int resume = 0; resume < 400; ++resume) {
-        high.Add(3400.0, resume % 2 == 0);
-        high.Add(7000.0, false);
-    }
-    CHECK_NEAR(high.MarginUs(), LEAD_MARGIN_MAX_US);
-    for (int resume = 0; resume < 400; ++resume) {
-        CHECK(high.Add(4400.0, resume % 2 == 0) == 0);
-        high.Add(7000.0, false);
-    }
-    CHECK_NEAR(high.MarginUs(), LEAD_MARGIN_MAX_US);
-
-    // Clean resumes at every margin up to 2.5 ms (and a clean background at
-    // 6 ms) narrow step by step to 1 ms.
-    ReleaseMarginLearner low;
-    for (int resume = 0; resume < 30000; ++resume) {
-        const int which = resume % 11;
-        low.Add(which == 10 ? 6000.0 : 125.0 + 250.0 * which, false);
-    }
-    CHECK_NEAR(low.MarginUs(), LEAD_MARGIN_MIN_US);
-}
-
-// Session 48860: late resumes far above the collision window (slow frames
-// after a focus change), with clean, measured bins between them and the
-// edge, never widen it; the first build jumped 2.5 -> 4.0 ms on such
-// evidence. The same lateness at the edge, below the clean bins, widens it
-// one bin.
-void TestReleaseMarginIgnoresDistantLateness()
-{
-    ReleaseMarginLearner learner;
-    const double margins[] = { 2600.0, 3000.0, 3400.0, 4500.0, 6000.0, 7900.0 };
-    for (int resume = 0; resume < 6000; ++resume) {
-        const int which = resume % 6;
-        CHECK(learner.Add(margins[which], which == 5) == 0);
-    }
-    CHECK_NEAR(learner.MarginUs(), 2500.0);
-    int step = 0;
-    for (int resume = 0; resume < 600 && step == 0; ++resume) {
-        step = learner.Add(2100.0, true);
-        const int which = resume % 6;
-        if (step == 0) step = learner.Add(margins[which], which == 5);
-    }
-    CHECK(step == 1);
-    CHECK_NEAR(learner.MarginUs(), 2750.0);
-}
-
 // Waited resumes pair with the next frame's Present call in either order;
 // a resume the GPU did not wait for, or a next frame that is not a paced GPU
-// queue wait frame, is no observation. The learned margin survives a
-// lifecycle reset; the statistics do not.
+// queue wait frame, is no observation. The margin is fixed: late resumes
+// close to the next Present call move no limit. A lifecycle reset restarts
+// the statistics.
 void TestReleaseMarginObservations()
 {
     auto controller = MakeController();
@@ -1858,19 +1679,24 @@ void TestReleaseMarginObservations()
     controller->OnStageEvent(Event(5, Kind::PresentCall, 51000.0));
     CHECK(controller->Statistics().margin_samples == 2);
 
-    // Late resumes 2.6 ms before the next Present call, with a clean
-    // background at 6 ms, widen the margin.
-    auto learning = MakeController();
+    // Late resumes 2.6 ms before the next Present call (a quarter of all
+    // frames): the Present-call guard's offset stays Q10(C) − 2.5 ms
+    // (C = 1,000, bin center 1,010).
+    auto late = MakeController();
     for (uint64_t index = 1; index <= 800; ++index) {
         const bool near = index % 2 == 1;
-        FeedMarginFrame(learning.get(), index, near ? 2600.0 : 6000.0, near && index % 4 == 1);
+        FeedMarginFrame(late.get(), index, near ? 2600.0 : 6000.0, near && index % 4 == 1);
     }
-    CHECK(learning->Statistics().margin_samples == 799);
-    CHECK(learning->Statistics().margin_widened == 1);
-    CHECK_NEAR(learning->ReleaseMarginUs(), 3250.0);
-    learning->Reset(kFrequency);
-    CHECK_NEAR(learning->ReleaseMarginUs(), 3250.0);
-    CHECK(learning->Statistics().margin_samples == 0);
+    CHECK(late->Statistics().margin_samples == 799);
+    CHECK(late->Statistics().margin_late_samples == 200);
+    LeadRequest request = Request(PacingRung::GpuQueueWait, 500.0, 7000.0);
+    request.collision_guard = true;
+    LeadGuardOutcome guard{};
+    late->NextLeadUs(request, nullptr, &guard);
+    CHECK(guard.judged && !late->Statistics().last_guard_headroom);
+    CHECK(std::fabs(guard.offset_us - (1010.0 - LEAD_RELEASE_MARGIN_US)) <= 20.0);
+    late->Reset(kFrequency);
+    CHECK(late->Statistics().margin_samples == 0);
 }
 
 // With the guard requested, a warm GPU queue wait lead is at most
@@ -1898,13 +1724,20 @@ void TestCollisionGuardLimitsLead()
     CHECK(statistics.collision_checked_frames == 1 && statistics.collision_guarded_frames == 1);
     CHECK(std::fabs(statistics.last_collision_limit_us - 9510.0) <= 20.0);
 
-    // A limit above the lead leaves it: judged, not guarded.
+    // A limit above the lead lets it back up at the lead slew (100 µs per
+    // frame), never in one step: judged and still held back until it is there.
     request.interval_us = 10000.0;
+    CHECK(std::fabs(controller->NextLeadUs(request, nullptr, &guard) - 9610.0) <= 20.0);
+    CHECK(guard.judged);
+    CHECK(std::fabs(guard.reduction_us - 900.0) <= 20.0);
+    statistics = controller->Statistics();
+    CHECK(statistics.collision_checked_frames == 2 && statistics.collision_guarded_frames == 2);
+    for (int frame = 0; frame < 8; ++frame) controller->NextLeadUs(request, nullptr, &guard);
     CHECK(std::fabs(controller->NextLeadUs(request, nullptr, &guard) - 10510.0) <= 20.0);
     CHECK(guard.judged);
     CHECK_NEAR(guard.reduction_us, 0.0);
-    statistics = controller->Statistics();
-    CHECK(statistics.collision_checked_frames == 2 && statistics.collision_guarded_frames == 1);
+    const uint64_t checked = controller->Statistics().collision_checked_frames;
+    CHECK(checked == 11 && controller->Statistics().collision_guarded_frames == 10);
 
     // Only the GPU queue wait is guarded.
     for (uint64_t frame = 0; frame < 40; ++frame) {
@@ -1913,7 +1746,7 @@ void TestCollisionGuardLimitsLead()
     LeadRequest fg = Request(PacingRung::FgInputWait, 500.0, 7000.0);
     fg.collision_guard = true;
     CHECK(std::fabs(controller->NextLeadUs(fg) - 10510.0) <= 20.0);
-    CHECK(controller->Statistics().collision_checked_frames == 2);
+    CHECK(controller->Statistics().collision_checked_frames == checked);
 
     // An enforcement marker change restarts the call window: no limit until
     // 32 new C samples.
@@ -1922,7 +1755,7 @@ void TestCollisionGuardLimitsLead()
     controller->NextLeadUs(request, nullptr, &guard);
     CHECK(!guard.judged);
     CHECK_NEAR(guard.reduction_us, 0.0);
-    CHECK(controller->Statistics().collision_checked_frames == 2);
+    CHECK(controller->Statistics().collision_checked_frames == checked);
 
     // A cold bucket's seed is limited too once C is known.
     auto cold = MakeController();
@@ -1966,46 +1799,6 @@ void TestGuardedSlackUsesUnguardedLead()
     bad.guard.offset_us = kNaN;
     controller->OnSourceRelease(bad);
     CHECK(controller->Statistics().invalid_inputs == invalid + 3);
-}
-
-// A frame late only because the GPU wait cap lowered its lead is judged
-// against the lead without the cap: no Adaptive cap miss. Late beyond that
-// lead it is one. The hold room still judges against the lead the wait ran
-// with: a judged frame late against it adds no room sample. A negative or
-// non-finite cap reduction is an invalid release.
-void TestCappedSlackUsesUncappedLead()
-{
-    auto controller = MakeController();
-    // Frames two indices apart: X = r − s.
-    const auto frame = [&](uint64_t index, double x_us) {
-        const double source_us = static_cast<double>(index) * 10000.0;
-        LeadFrameStart start = Start(index, PacingRung::GpuQueueWait, source_us);
-        start.lead_us = 2000.0;
-        start.guard.cap_reduction_us = 1500.0;
-        start.guard.judged = true;
-        controller->OnSourceRelease(start);
-        controller->OnStageEvent(Event(index, Kind::PresentCall, source_us + x_us / 2.0));
-        controller->OnStageEvent(Event(index, Kind::GpuReady, source_us + x_us));
-        controller->OnStageEvent(Event(index, Kind::OutputRelease, source_us + x_us));
-    };
-    frame(1, 3000.0); // late against L = 2,000 only
-    CHECK_NEAR(controller->Statistics().last_slack_us, 500.0);
-    CHECK(controller->Statistics().negative_slack_samples == 0);
-    CHECK(controller->Statistics().room_samples == 0);
-    frame(3, 4000.0); // late against L + 1,500 too
-    CHECK_NEAR(controller->Statistics().last_slack_us, -500.0);
-    CHECK(controller->Statistics().negative_slack_samples == 1);
-    frame(5, 1500.0); // on time against L: a room sample
-    CHECK(controller->Statistics().room_samples == 1);
-    CHECK(controller->Statistics().slack_samples == 3);
-
-    const uint64_t invalid = controller->Statistics().invalid_inputs;
-    LeadFrameStart bad = Start(7, PacingRung::GpuQueueWait, 70000.0);
-    bad.guard.cap_reduction_us = -1.0;
-    controller->OnSourceRelease(bad);
-    bad.guard.cap_reduction_us = kNaN;
-    controller->OnSourceRelease(bad);
-    CHECK(controller->Statistics().invalid_inputs == invalid + 2);
 }
 
 // Adaptive cap output evidence (lead_controller.h): a late frame whose
@@ -2060,30 +1853,33 @@ namespace
     }
 }
 
-// A judged GPU queue wait frame adds its hold room R = X − (limit − I); a
-// frame late even against its unguarded lead, an unjudged frame and other
-// rungs add none. HoldRoomUs is Q_q of R from 32 samples, per FG divisor;
-// a marker change restarts it.
+// A judged GPU queue wait frame adds its X to the hold room; a frame late
+// even against its unguarded lead, an unjudged frame and other rungs add
+// none. HoldRoomUs is the guard's inequality solved for the interval:
+// Q_q(X) + h − the guard's current offset (Q10(C) − M without Reflex GPU
+// times, Q10(D) − H with them, H the request's headroom), from 32 samples,
+// per FG divisor; a marker change restarts it.
 void TestHoldRoomSamples()
 {
     auto controller = MakeController();
     LeadGuardOutcome judged{};
     judged.judged = true;
-    judged.offset_us = 2000.0;
-    // R = 9,000 − 2,000 = 7,000 (bin center 7,010) for 30 frames and
-    // 11,000 − 2,000 = 9,000 (9,010) for 10.
+    judged.offset_us = 2000.0; // the plan's offset: not what the room uses
+    // X = 9,000 (bin center 9,010) for 30 frames and 11,000 (11,010) for
+    // 10; C = 1,000 (1,010): offset 1,010 − 2,500 = −1,490, so the room is
+    // Q_q(X) + 250 + 1,490.
     for (uint64_t frame = 0; frame < 40; ++frame) {
-        if (frame == 31) CHECK_NEAR(controller->HoldRoomUs(1.0, 0.5), 0.0);
+        if (frame == 31) CHECK_NEAR(controller->HoldRoomUs(1.0, 0.5, LEAD_RELEASE_HEADROOM_US), 0.0);
         FeedRoomFrame(controller.get(), 1 + 2 * frame, frame < 30 ? 9000.0 : 11000.0, 12000.0, judged);
     }
     CHECK(controller->Statistics().room_samples == 40);
-    CHECK_NEAR(controller->HoldRoomUs(1.0, 0.5), 7010.0);
-    CHECK_NEAR(controller->HoldRoomUs(1.0, 0.75), 7010.0); // sorted[29]
-    CHECK_NEAR(controller->HoldRoomUs(1.0, 0.9), 9010.0);  // sorted[35]
-    CHECK_NEAR(controller->HoldRoomUs(1.0, kNaN), 0.0);
-    CHECK_NEAR(controller->HoldRoomUs(2.0, 0.5), 0.0);
+    CHECK_NEAR(controller->HoldRoomUs(1.0, 0.5, LEAD_RELEASE_HEADROOM_US), 10750.0);
+    CHECK_NEAR(controller->HoldRoomUs(1.0, 0.75, LEAD_RELEASE_HEADROOM_US), 10750.0); // sorted[29]
+    CHECK_NEAR(controller->HoldRoomUs(1.0, 0.9, LEAD_RELEASE_HEADROOM_US), 12750.0);  // sorted[35]
+    CHECK_NEAR(controller->HoldRoomUs(1.0, kNaN, LEAD_RELEASE_HEADROOM_US), 0.0);
+    CHECK_NEAR(controller->HoldRoomUs(2.0, 0.5, LEAD_RELEASE_HEADROOM_US), 0.0);
 
-    // Late against L + reduction (overload), unjudged, or another rung: no R.
+    // Late against L + reduction (overload), unjudged, or another rung: no X.
     FeedRoomFrame(controller.get(), 101, 9000.0, 8000.0, judged);
     FeedRoomFrame(controller.get(), 103, 9000.0, 12000.0, LeadGuardOutcome{});
     FeedRoomFrame(controller.get(), 105, 9000.0, 12000.0, judged, PacingRung::FgInputWait);
@@ -2095,7 +1891,18 @@ void TestHoldRoomSamples()
     CHECK(controller->Statistics().room_samples == 41);
 
     controller->ResetBuckets();
-    CHECK_NEAR(controller->HoldRoomUs(1.0, 0.5), 0.0);
+    CHECK_NEAR(controller->HoldRoomUs(1.0, 0.5, LEAD_RELEASE_HEADROOM_US), 0.0);
+
+    // With Reflex GPU times (A = 6,000: D = 3,000, Q10 3,010) the headroom
+    // guard's offset is 3,010 − H: the room follows the request's headroom.
+    auto reflex = MakeController();
+    for (uint64_t frame = 0; frame < 40; ++frame) {
+        FeedRoomFrame(reflex.get(), 1 + 2 * frame, frame < 30 ? 9000.0 : 11000.0, 12000.0, judged);
+        reflex->OnGpuActiveTime(Key(1 + 2 * frame).producer_epoch, Key(1 + 2 * frame).frame_id, 6000.0);
+    }
+    CHECK_NEAR(reflex->HoldRoomUs(1.0, 0.5, 1000.0), 9010.0 + 250.0 - 2010.0);
+    CHECK_NEAR(reflex->HoldRoomUs(1.0, 0.5, 2000.0), 9010.0 + 250.0 - 1010.0);
+    CHECK_NEAR(reflex->HoldRoomUs(1.0, 0.5, kNaN), 9010.0 + 250.0 - 2010.0); // the default H
 }
 
 // Lockstep engines: the waits (source and pre-Sleep, clipped to [s, Present])
@@ -2236,10 +2043,14 @@ void TestHeadroomGuardLimitsLead()
     CHECK(std::fabs(controller->NextLeadUs(request, nullptr, &guard) - 9510.0) <= 20.0);
     statistics = controller->Statistics();
     CHECK(!statistics.last_guard_headroom && statistics.headroom_checked_frames == 1);
-    // One report makes the window current again.
+    // One report makes the window current again; the looser limit returns
+    // at the lead slew (100 µs per frame), not in one step.
     FeedWorkFrame(controller.get(), 170, 6000.0);
-    CHECK(std::fabs(controller->NextLeadUs(request, nullptr, &guard) - 10010.0) <= 20.0);
+    CHECK(std::fabs(controller->NextLeadUs(request, nullptr, &guard) - 9610.0) <= 20.0);
     CHECK(controller->Statistics().last_guard_headroom);
+    for (int frame = 0; frame < 3; ++frame) controller->NextLeadUs(request, nullptr, &guard);
+    CHECK(std::fabs(controller->NextLeadUs(request, nullptr, &guard) - 10010.0) <= 20.0);
+    const uint64_t checked = controller->Statistics().collision_checked_frames;
 
     // Reports without a pending frame, or with an invalid time.
     const uint64_t invalid = controller->Statistics().invalid_inputs;
@@ -2260,15 +2071,15 @@ void TestHeadroomGuardLimitsLead()
     controller->NextLeadUs(request, nullptr, &guard);
     CHECK(!guard.judged);
     CHECK_NEAR(guard.reduction_us, 0.0);
-    CHECK(controller->Statistics().collision_checked_frames == 3);
+    CHECK(controller->Statistics().collision_checked_frames == checked);
 }
 
 // Waited resumes pair with the next frame's heavy GPU work start r − A in
 // either order; a next frame without its report yet is waited for, a source
-// only next frame is no observation. Late resumes 0.6 ms before the next
-// frame's heavy work, with a clean background at 3 ms, widen the headroom
-// from 1.0 to 1.25 ms while the margin (no background at 3.5 ms and up) stays.
-// The headroom survives a lifecycle reset; the statistics do not.
+// only next frame is no observation. The headroom is fixed: late resumes
+// 0.6 ms before the next frame's heavy work move no limit; the guard's
+// offset is Q10(D) − the request's headroom, its default when that is not
+// positive and finite. A lifecycle reset restarts the statistics.
 void TestReleaseHeadroomObservations()
 {
     auto controller = MakeController();
@@ -2304,18 +2115,32 @@ void TestReleaseHeadroomObservations()
     CHECK(controller->Statistics().headroom_samples == 2);
     CHECK(controller->Statistics().work_samples == 2); // frames 2 and 3; frame 1 has no report
 
-    auto learning = MakeController();
+    // A quarter of the frames released 0.6 ms before the next frame's heavy
+    // work and late (D = 1,000, bin center 1,010).
+    auto late = MakeController();
     for (uint64_t index = 1; index <= 800; ++index) {
         const bool near = index % 2 == 1;
-        FeedHeadroomFrame(learning.get(), index, near ? 600.0 : 3000.0, near && index % 4 == 1);
+        FeedHeadroomFrame(late.get(), index, near ? 600.0 : 3000.0, near && index % 4 == 1);
     }
-    CHECK(learning->Statistics().headroom_samples == 799);
-    CHECK(learning->Statistics().headroom_widened == 1);
-    CHECK_NEAR(learning->ReleaseHeadroomUs(), 1250.0);
-    CHECK_NEAR(learning->ReleaseMarginUs(), LEAD_MARGIN_START_US);
-    learning->Reset(kFrequency);
-    CHECK_NEAR(learning->ReleaseHeadroomUs(), 1250.0);
-    CHECK(learning->Statistics().headroom_samples == 0);
+    CHECK(late->Statistics().headroom_samples == 799);
+    CHECK(late->Statistics().headroom_late_samples == 200);
+    LeadRequest request = Request(PacingRung::GpuQueueWait, 500.0, 7000.0);
+    request.collision_guard = true;
+    LeadGuardOutcome guard{};
+    late->NextLeadUs(request, nullptr, &guard);
+    CHECK(guard.judged && late->Statistics().last_guard_headroom);
+    CHECK(std::fabs(guard.offset_us - (1010.0 - LEAD_RELEASE_HEADROOM_US)) <= 20.0);
+    request.release_headroom_us = 2000.0;
+    late->NextLeadUs(request, nullptr, &guard);
+    CHECK(std::fabs(guard.offset_us - (1010.0 - 2000.0)) <= 20.0);
+    request.release_headroom_us = 0.0;
+    late->NextLeadUs(request, nullptr, &guard);
+    CHECK(std::fabs(guard.offset_us - (1010.0 - LEAD_RELEASE_HEADROOM_US)) <= 20.0);
+    request.release_headroom_us = kNaN;
+    late->NextLeadUs(request, nullptr, &guard);
+    CHECK(std::fabs(guard.offset_us - (1010.0 - LEAD_RELEASE_HEADROOM_US)) <= 20.0);
+    late->Reset(kFrequency);
+    CHECK(late->Statistics().headroom_samples == 0);
 }
 
 // Queue order (Rogue Core): the collision guard stands aside
@@ -2323,8 +2148,10 @@ void TestReleaseHeadroomObservations()
 // the release, starting only after it, and comes back at the first pair
 // whose next frame started more than 100 µs before the release, until that
 // pair leaves the newest 64. A next frame submitting after the release, or
-// one without a GPU start, is no pair. The verdict outlives a lifecycle
-// reset; the hold room is 0 while the guard stands aside.
+// one without a GPU start, is no pair. It stands aside only while the
+// heavy-work window is current: 65 GPU queue wait releases without a Reflex
+// report bring the guard back until a report arrives. The pairs outlive a
+// lifecycle reset; the hold room is 0 while the guard stands aside.
 void TestCollisionGuardQueueOrder()
 {
     auto controller = MakeController();
@@ -2361,27 +2188,27 @@ void TestCollisionGuardQueueOrder()
     CHECK(controller->Statistics().concurrency_samples == 0);
 
     for (uint32_t n = 0; n + 1 < LEAD_WARM_SAMPLES; ++n) pair(5000.0, 6050.0);
-    CHECK(!controller->NextGpuWorkBehindWait());
+    CHECK(!controller->NextGpuWorkBehindWait(1.0));
     controller->NextLeadUs(request, nullptr, &guard);
     CHECK(guard.judged);
     pair(5000.0, 6050.0);
-    CHECK(controller->NextGpuWorkBehindWait());
+    CHECK(controller->NextGpuWorkBehindWait(1.0));
     CHECK(controller->ConcurrencyPairs() == LEAD_WARM_SAMPLES);
     const uint64_t checked = controller->Statistics().collision_checked_frames;
     const double lead = controller->NextLeadUs(request, nullptr, &guard);
     CHECK(!guard.judged);
-    CHECK_NEAR(guard.reduction_us, 0.0);
-    CHECK_NEAR(lead, controller->BucketStatus(PacingRung::GpuQueueWait, 1.0).lead_us);
-    CHECK(lead > 10010.0 + 20.0); // above the guard's limit
+    // The lead returns to the unguarded lead at the lead slew.
+    CHECK(std::fabs(lead - (10010.0 + 100.0)) <= 20.0);
+    CHECK_NEAR(lead + guard.reduction_us, controller->BucketStatus(PacingRung::GpuQueueWait, 1.0).lead_us);
     CHECK(controller->Statistics().collision_checked_frames == checked);
-    CHECK_NEAR(controller->HoldRoomUs(1.0, 0.75), 0.0);
+    CHECK_NEAR(controller->HoldRoomUs(1.0, 0.75, LEAD_RELEASE_HEADROOM_US), 0.0);
 
     // 50 µs before the release is within the tolerance; 1 ms before is
     // concurrent work: the guard is back at once.
     pair(5000.0, 5950.0);
-    CHECK(controller->NextGpuWorkBehindWait());
+    CHECK(controller->NextGpuWorkBehindWait(1.0));
     pair(5000.0, 5000.0);
-    CHECK(!controller->NextGpuWorkBehindWait());
+    CHECK(!controller->NextGpuWorkBehindWait(1.0));
     CHECK(controller->ConcurrentPairs() == 1);
     CHECK(controller->Statistics().concurrent_samples == 1);
     CHECK_NEAR(controller->Statistics().last_concurrency_us, -1000.0);
@@ -2389,72 +2216,29 @@ void TestCollisionGuardQueueOrder()
     CHECK(guard.judged);
     // It stays until that pair leaves the newest 64.
     for (size_t n = 0; n + 1 < LEAD_CONCURRENCY_SAMPLES; ++n) pair(5000.0, 6050.0);
-    CHECK(!controller->NextGpuWorkBehindWait());
+    CHECK(!controller->NextGpuWorkBehindWait(1.0));
     pair(5000.0, 6050.0);
-    CHECK(controller->NextGpuWorkBehindWait());
+    CHECK(controller->NextGpuWorkBehindWait(1.0));
 
+    // Without Reflex reports for 65 GPU queue wait releases the guard is back
+    // (Present-call margin) until one arrives.
+    for (uint64_t frame = 0; frame < 65; ++frame) FeedWorkFrame(controller.get(), index + frame, 0.0);
+    CHECK(!controller->NextGpuWorkBehindWait(1.0));
+    controller->NextLeadUs(request, nullptr, &guard);
+    CHECK(guard.judged && !controller->Statistics().last_guard_headroom);
+    FeedWorkFrame(controller.get(), index + 65, 6000.0);
+    CHECK(controller->NextGpuWorkBehindWait(1.0));
+
+    // The pairs outlive a lifecycle reset; the heavy-work window does not.
     controller->Reset(kFrequency);
-    CHECK(controller->NextGpuWorkBehindWait());
+    CHECK(controller->ConcurrencyPairs() == LEAD_CONCURRENCY_SAMPLES);
+    CHECK(!controller->NextGpuWorkBehindWait(1.0));
+    for (uint64_t frame = 0; frame < LEAD_WARM_SAMPLES; ++frame) {
+        FeedWorkFrame(controller.get(), 1001 + 2 * frame, 6000.0);
+    }
+    CHECK(controller->NextGpuWorkBehindWait(1.0));
     CHECK(controller->Statistics().concurrency_samples == 0);
     CHECK(controller->Statistics().invalid_inputs == 0);
-}
-
-// The headroom learner keeps its own bounds: 1.0 ms to start, 0.75-3 ms.
-void TestReleaseHeadroomBounds()
-{
-    ReleaseMarginLearner headroom{ LEAD_HEADROOM_LIMITS };
-    CHECK_NEAR(headroom.MarginUs(), 1000.0);
-    // Half late in every band below 2.5 ms, clean at 7 ms: the edge climbs
-    // band by band but the headroom stops at 3 ms.
-    for (int resume = 0; resume < 20000; ++resume) {
-        const int which = resume % 12;
-        const bool far = which >= 10;
-        headroom.Add(far ? 7000.0 : 125.0 + 250.0 * which, !far && (resume / 12) % 2 == 0);
-    }
-    CHECK_NEAR(headroom.MarginUs(), 3000.0);
-    // Clean resumes in every band narrow it, but not below 0.75 ms.
-    ReleaseMarginLearner low{ LEAD_HEADROOM_LIMITS };
-    for (int resume = 0; resume < 30000; ++resume) {
-        const int which = resume % 11;
-        low.Add(which == 10 ? 6000.0 : 125.0 + 250.0 * which, false);
-    }
-    CHECK_NEAR(low.MarginUs(), 750.0);
-    low.Reset();
-    CHECK_NEAR(low.MarginUs(), 1000.0);
-}
-
-// A widening stands while its late resumes do and fades with them. The guard
-// keeps resumes about a cushion above the edge, so the bin just below it never
-// collects the 512 resumes the clean rule needs (a Rogue Core session: at most
-// 199 weighted in 15 minutes at H = 2.25 ms). Here late resumes at 1.6 ms
-// widen the headroom to 2.25 ms, then every resume lands clean at 2.4 or 6 ms:
-// it holds for 30,000 (the bin still has at least 4 weighted late resumes),
-// is back at the 1.0 ms start by 60,000, goes no lower without resumes
-// measured there, and late resumes at 1.1 ms widen it again at once.
-void TestReleaseHeadroomWideningFades()
-{
-    ReleaseMarginLearner headroom{ LEAD_HEADROOM_LIMITS };
-    for (int resume = 0; resume < 400; ++resume) headroom.Add(6000.0, false);
-    int step = 0;
-    for (int resume = 0; resume < 200 && step == 0; ++resume) {
-        step = headroom.Add(1600.0, resume % 2 == 0);
-        headroom.Add(6000.0, false);
-    }
-    CHECK(step == 1);
-    CHECK_NEAR(headroom.MarginUs(), 2250.0);
-    for (int resume = 0; resume < 30000; ++resume) CHECK(headroom.Add(resume % 2 == 0 ? 2400.0 : 6000.0, false) == 0);
-    CHECK_NEAR(headroom.MarginUs(), 2250.0);
-    for (int resume = 0; resume < 30000; ++resume) CHECK(headroom.Add(resume % 2 == 0 ? 2400.0 : 6000.0, false) <= 0);
-    CHECK_NEAR(headroom.MarginUs(), 1000.0);
-    for (int resume = 0; resume < 100000; ++resume) CHECK(headroom.Add(resume % 2 == 0 ? 2400.0 : 6000.0, false) == 0);
-    CHECK_NEAR(headroom.MarginUs(), 1000.0);
-    step = 0;
-    for (int resume = 0; resume < 200 && step == 0; ++resume) {
-        step = headroom.Add(1100.0, resume % 2 == 0);
-        headroom.Add(6000.0, false);
-    }
-    CHECK(step == 1);
-    CHECK_NEAR(headroom.MarginUs(), 1750.0);
 }
 
 // Render handoff offset: each frame released
@@ -3024,7 +2808,6 @@ int main()
     TestLifecycleChange();
     TestInvalidInputs();
     TestBudgetClamp();
-    TestGpuWaitCap();
     TestRestartRung();
     TestRestartRungSourceFloor();
     TestDeepPipelineFits();
@@ -3033,21 +2816,15 @@ int main()
     TestResumeDelayRequiresWait();
     TestClearSlackEvidence();
     TestResumeCounters();
-    TestReleaseMarginLearnerSteps();
-    TestReleaseMarginLearnerBackgroundAndBounds();
-    TestReleaseMarginIgnoresDistantLateness();
     TestReleaseMarginObservations();
     TestCollisionGuardLimitsLead();
     TestGuardedSlackUsesUnguardedLead();
-    TestCappedSlackUsesUncappedLead();
     TestDrainingLateSamples();
     TestHoldRoomSamples();
     TestLockstepGatedHold();
     TestHeadroomGuardLimitsLead();
     TestReleaseHeadroomObservations();
     TestCollisionGuardQueueOrder();
-    TestReleaseHeadroomBounds();
-    TestReleaseHeadroomWideningFades();
     TestRenderHandoffOffset();
     TestHandoffStreams();
     TestRenderHandoffGpuFloor();

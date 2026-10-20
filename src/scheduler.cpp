@@ -226,12 +226,6 @@ std::atomic<uint32_t> s_status_release_headroom_samples{0};
 std::atomic<uint32_t> s_status_release_headroom_late{0};
 std::atomic<uint8_t> s_status_hold_interleave{0};
 std::atomic<double> s_status_hold_interleave_remaining_s{0.0};
-std::atomic<double> s_status_gpu_wait_cap_us{0.0};
-std::atomic<uint8_t> s_status_gpu_wait_cap_level{0};
-std::atomic<uint32_t> s_status_gpu_wait_cap_late{0};
-std::atomic<uint32_t> s_status_gpu_wait_cap_samples{0};
-std::atomic<bool> s_status_gpu_wait_cap_checking{false};
-std::atomic<bool> s_status_gpu_wait_cap_open{false};
 std::atomic<bool> s_status_governor_enabled{false};
 std::atomic<uint8_t> s_status_governor_step{0};
 std::atomic<double> s_status_governor_stretch{1.0};
@@ -300,12 +294,6 @@ static void PublishPacingStatus(const SchedulerPacingStatus& status) noexcept
     s_status_release_headroom_late.store(status.release_headroom_late, std::memory_order_relaxed);
     s_status_hold_interleave.store(status.hold_interleave, std::memory_order_relaxed);
     s_status_hold_interleave_remaining_s.store(status.hold_interleave_remaining_s, std::memory_order_relaxed);
-    s_status_gpu_wait_cap_us.store(status.gpu_wait_cap_us, std::memory_order_relaxed);
-    s_status_gpu_wait_cap_level.store(status.gpu_wait_cap_level, std::memory_order_relaxed);
-    s_status_gpu_wait_cap_late.store(status.gpu_wait_cap_late, std::memory_order_relaxed);
-    s_status_gpu_wait_cap_samples.store(status.gpu_wait_cap_samples, std::memory_order_relaxed);
-    s_status_gpu_wait_cap_checking.store(status.gpu_wait_cap_checking, std::memory_order_relaxed);
-    s_status_gpu_wait_cap_open.store(status.gpu_wait_cap_open, std::memory_order_relaxed);
     s_status_governor_enabled.store(status.governor_enabled, std::memory_order_relaxed);
     s_status_governor_step.store(status.governor_step, std::memory_order_relaxed);
     s_status_governor_stretch.store(status.governor_stretch, std::memory_order_relaxed);
@@ -381,12 +369,6 @@ bool Scheduler_ReadPacingStatus(SchedulerPacingStatus* status) noexcept
         copy.hold_interleave = s_status_hold_interleave.load(std::memory_order_relaxed);
         copy.hold_interleave_remaining_s =
             s_status_hold_interleave_remaining_s.load(std::memory_order_relaxed);
-        copy.gpu_wait_cap_us = s_status_gpu_wait_cap_us.load(std::memory_order_relaxed);
-        copy.gpu_wait_cap_level = s_status_gpu_wait_cap_level.load(std::memory_order_relaxed);
-        copy.gpu_wait_cap_late = s_status_gpu_wait_cap_late.load(std::memory_order_relaxed);
-        copy.gpu_wait_cap_samples = s_status_gpu_wait_cap_samples.load(std::memory_order_relaxed);
-        copy.gpu_wait_cap_checking = s_status_gpu_wait_cap_checking.load(std::memory_order_relaxed);
-        copy.gpu_wait_cap_open = s_status_gpu_wait_cap_open.load(std::memory_order_relaxed);
         copy.governor_enabled = s_status_governor_enabled.load(std::memory_order_relaxed);
         copy.governor_step = s_status_governor_step.load(std::memory_order_relaxed);
         copy.governor_stretch = s_status_governor_stretch.load(std::memory_order_relaxed);
@@ -494,17 +476,8 @@ HoldInterleave s_hold_interleave;
 bool s_interleave_active = false;
 // FeasibilityCause of the newest guard or interleave transition (Source records).
 FeasibilityCause s_feasibility_cause = FeasibilityCause::None;
-// GPU queue wait cap ladder. Owner only. The lead's waited and
-// late resume counters already given to it, and the cause of a level change
-// not yet on a Source record (gpu_wait_cap events).
-GpuWaitCap s_gpu_wait_cap;
-uint64_t s_gpu_wait_resumes_seen = 0;
-uint64_t s_gpu_wait_late_resumes_seen = 0;
-GpuWaitCapCause s_gpu_wait_cap_cause_pending = GpuWaitCapCause::None;
-// Collision-aware release: the release margin and headroom last logged, and
-// the guard of the newest judged lead last logged (-1 none, 0 margin, 1 headroom).
-double s_logged_release_margin_us = LEAD_MARGIN_START_US;
-double s_logged_release_headroom_us = LEAD_HEADROOM_LIMITS.start_us;
+// Collision-aware release: the guard of the newest judged lead last logged
+// (-1 none, 0 margin, 1 headroom).
 int s_logged_collision_guard = -1;
 // The first lead sample that left out the game's simulation → render queue
 // (lead_controller.h) has been logged. Once per process.
@@ -636,15 +609,6 @@ static void TakeLeadOutputs(uint32_t* outputs, uint32_t* late_outputs) noexcept
     *late_outputs = late > draining ? late - draining : 0u;
 }
 
-// Waited GPU queue wait resumes recorded since the previous call, and of
-// those, resumes later than LEAD_RESUME_LATE_US.
-static void TakeLeadResumes(uint32_t* waited, uint32_t* late) noexcept
-{
-    const LeadStatistics lead = s_source_stage.Lead().Statistics();
-    *waited = TakeCounterDelta(lead.resume_waited_samples, &s_gpu_wait_resumes_seen);
-    *late = TakeCounterDelta(lead.resume_late_samples, &s_gpu_wait_late_resumes_seen);
-}
-
 // The GPU-paced hold margin restarts from the cap interval.
 static void ClearGpuPacedHold() noexcept
 {
@@ -725,120 +689,21 @@ static void ApplyInterleaveTransition(const HoldInterleaveTransition& transition
     s_feasibility_cause = transition.hold ? FeasibilityCause::AbHeld : FeasibilityCause::AbNotHeld;
 }
 
-// The GPU queue wait cap of the next plan: the ladder's level of the budget
-// while the GPU queue wait's lead plans the frame (also while it is demoted,
-// PacingPipeline_LeadRung); 0 (uncapped) otherwise.
-static double GpuWaitCapUs(const PacingPipelineSnapshot& pipeline) noexcept
-{
-    return PacingPipeline_LeadRung(pipeline) == PacingRung::GpuQueueWait
-        ? s_gpu_wait_cap.CapUs(pipeline.gpu_wait_budget_us)
-        : 0.0;
-}
-
-// A ladder level as log text: "off" for the open top, else its cap.
-static void GpuWaitCapText(uint32_t level, double budget_us, char* text, size_t size) noexcept
-{
-    if (level == GPU_WAIT_CAP_OPEN || level >= GPU_WAIT_CAP_LEVELS) {
-        std::snprintf(text, size, "off");
-        return;
-    }
-    std::snprintf(text, size, "%.0f us", budget_us * GPU_WAIT_CAP_FRACTIONS[level]);
-}
-
-static void LogGpuWaitCapTransition(const GpuWaitCapTransition& transition, double budget_us) noexcept
-{
-    if (!transition.changed) return;
-    s_gpu_wait_cap_cause_pending = transition.cause;
-    char from[32];
-    char to[32];
-    GpuWaitCapText(transition.previous_level, budget_us, from, sizeof(from));
-    GpuWaitCapText(transition.level, budget_us, to, sizeof(to));
-    switch (transition.cause) {
-    case GpuWaitCapCause::LateResumes:
-        LOG_INFO("GPU wait cap: %s -> %s (%u of %u waited resumes later than %.0f us; checked %.0f-%.0f s from now)",
-                 from, to, transition.late, transition.samples, LEAD_RESUME_LATE_US,
-                 GPU_WAIT_CAP_TRIAL_FROM_S, GPU_WAIT_CAP_TRIAL_UNTIL_S);
-        break;
-    case GpuWaitCapCause::TrialFailed:
-        LOG_INFO("GPU wait cap: %s -> %s (still %u of %u resumes late after the step down; no step down for %.0f s)",
-                 from, to, transition.late, transition.samples, GPU_WAIT_CAP_BACKOFF_S);
-        break;
-    case GpuWaitCapCause::Opened:
-        LOG_INFO("GPU wait cap: %s -> off (the next frame's GPU work runs behind the wait; "
-                 "late resumes bring the cap back)", from);
-        break;
-    case GpuWaitCapCause::Closed:
-        LOG_INFO("GPU wait cap: off -> %s (no longer Auto with probes and the next frame's GPU work behind the wait)", to);
-        break;
-    default:
-        LOG_INFO("GPU wait cap: %s -> %s (%u of %u resumes late in %.0f s)",
-                 from, to, transition.late, transition.samples, GPU_WAIT_CAP_UP_CALM_S);
-        break;
-    }
-}
-
-// The cap's open top (rung_feasibility.h GPU_WAIT_CAP_OPEN): allowed with
-// Output override Auto, GPU Wait Probes (the ladder's late-resume evidence)
-// and the queue-order verdict that the next frame's GPU work runs behind the
-// wait (lead_controller.h). Output override GPU wait keeps the budget.
-static void UpdateGpuWaitCapTop(const PacingPipelineSnapshot& pipeline, const PacingPipelineConfig& config,
-    int64_t qpc) noexcept
-{
-    const bool allowed = config.rung_override == PacingRungOverride::Auto && pipeline.gpu_probes &&
-        s_source_stage.Lead().NextGpuWorkBehindWait();
-    LogGpuWaitCapTransition(s_gpu_wait_cap.SetTopAllowed(allowed, qpc), pipeline.gpu_wait_budget_us);
-}
-
-// Feeds the cap ladder the probed GPU queue wait's newly waited resumes.
-// Resumes recorded while another rung or no probe is resolved are discarded,
-// so the ladder never judges them later.
-static void ObserveGpuWaitResumes(const PacingPipelineSnapshot& pipeline, int64_t qpc) noexcept
-{
-    uint32_t waited = 0;
-    uint32_t late = 0;
-    TakeLeadResumes(&waited, &late);
-    if (pipeline.rung != PacingRung::GpuQueueWait || !pipeline.gpu_probes || waited == 0) return;
-    LogGpuWaitCapTransition(s_gpu_wait_cap.OnResumes(qpc, GetQPCFrequency(), waited, late),
-        pipeline.gpu_wait_budget_us);
-}
-
-// Logs each step of the learned release margin and headroom, each switch
-// between the headroom guard and the Present-call margin (collision-aware
-// release), each change of the queue-order verdict, and the first lead
-// sample that left out the game's simulation → render queue.
-static void ObserveReleaseMargin() noexcept
+// Logs each switch between the headroom guard and the Present-call margin
+// (collision-aware release), each change of the queue-order verdict for the
+// frame's FG divisor, and the first lead sample that left out the game's
+// simulation → render queue.
+static void ObserveCollisionGuard(double fg_divisor) noexcept
 {
     const LeadController& lead = s_source_stage.Lead();
     const LeadStatistics statistics = lead.Statistics();
-    const double margin_us = lead.ReleaseMarginUs();
-    if (margin_us != s_logged_release_margin_us) {
-        LOG_INFO("Release margin: %.2f -> %.2f ms (%s; %llu of %llu waited resumes late; GPU queue wait leads guarded %llu of %llu)",
-                 s_logged_release_margin_us / 1000.0, margin_us / 1000.0,
-                 margin_us > s_logged_release_margin_us ? "late resumes closer to the release" : "below the edge clean or its late resumes faded",
-                 static_cast<unsigned long long>(statistics.margin_late_samples),
-                 static_cast<unsigned long long>(statistics.margin_samples),
-                 static_cast<unsigned long long>(statistics.collision_guarded_frames),
-                 static_cast<unsigned long long>(statistics.collision_checked_frames));
-        s_logged_release_margin_us = margin_us;
-    }
-    const double headroom_us = lead.ReleaseHeadroomUs();
-    if (headroom_us != s_logged_release_headroom_us) {
-        LOG_INFO("Release headroom: %.2f -> %.2f ms (%s; %llu of %llu waited resumes late; GPU queue wait leads guarded %llu of %llu)",
-                 s_logged_release_headroom_us / 1000.0, headroom_us / 1000.0,
-                 headroom_us > s_logged_release_headroom_us ? "late resumes closer to the next frame's GPU work" : "below the edge clean or its late resumes faded",
-                 static_cast<unsigned long long>(statistics.headroom_late_samples),
-                 static_cast<unsigned long long>(statistics.headroom_samples),
-                 static_cast<unsigned long long>(statistics.collision_guarded_frames),
-                 static_cast<unsigned long long>(statistics.collision_checked_frames));
-        s_logged_release_headroom_us = headroom_us;
-    }
     if (!s_logged_lead_queue && statistics.queued_samples > 0) {
         LOG_INFO("Lead: a sample left out %.0f us of the game's simulation -> render queue "
                  "(sample %.0f us; the render thread was still inside the previous Present)",
                  statistics.last_queue_us, statistics.last_sample_us);
         s_logged_lead_queue = true;
     }
-    const bool behind_wait = lead.NextGpuWorkBehindWait();
+    const bool behind_wait = lead.NextGpuWorkBehindWait(fg_divisor);
     if (behind_wait != s_logged_behind_wait) {
         if (behind_wait) {
             LOG_INFO("Collision guard: stands aside (in the newest %zu waited releases the next frame's GPU work, "
@@ -859,27 +724,13 @@ static void ObserveReleaseMargin() noexcept
     s_logged_collision_guard = guard;
 }
 
-// Back to the budget; resumes recorded before the reset are discarded.
-static void ResetGpuWaitCap(const char* reason) noexcept
-{
-    if (s_gpu_wait_cap.Level() != 0 || s_gpu_wait_cap.Open()) {
-        LOG_INFO("GPU wait cap reset (%s): back to the budget", reason);
-        s_gpu_wait_cap_cause_pending = GpuWaitCapCause::Reset;
-    }
-    s_gpu_wait_cap.Reset();
-    uint32_t discarded = 0;
-    TakeLeadResumes(&discarded, &discarded);
-}
-
 // Lifecycle, cap, raw FG divisor or route change: the lead slack windows
 // restart, so the Adaptive cap's infeasible-lead misses hold only evidence
-// observed after the change; the overload guard ends any demotion and the
-// GPU wait cap returns to the budget.
+// observed after the change; the overload guard ends any demotion.
 static void ResetFeasibility(const char* reason) noexcept
 {
     s_source_stage.ClearSlackEvidence();
     ResetHoldFeasibility(reason);
-    ResetGpuWaitCap(reason);
     s_handoff_stall_run = 0;
     if (s_handoff_blocked) {
         LOG_INFO("Render handoff limit: back on (%s)", reason);
@@ -1027,14 +878,10 @@ static void PushSourceRelease(
     record->regime = static_cast<uint8_t>(context.regime);
     record->marker_qpc = s_source_marker_qpc;
     record->target_fps = context.target_fps;
-    // Guard and A/B interleave state (rung_feasibility events) and the GPU wait cap
-    // level, with the cause of a change not yet recorded (gpu_wait_cap events).
+    // Guard and A/B interleave state (rung_feasibility events).
     const bool interleave_off = s_interleave_active && !s_hold_interleave.Holding();
     record->feasibility_demoted = s_hold_feasibility.Overloaded() || interleave_off ? 1 : 0;
     record->feasibility_cause = static_cast<uint8_t>(s_feasibility_cause);
-    record->gpu_wait_cap_level = static_cast<uint8_t>(s_gpu_wait_cap.TelemetryLevel());
-    record->gpu_wait_cap_cause = static_cast<uint8_t>(s_gpu_wait_cap_cause_pending);
-    s_gpu_wait_cap_cause_pending = GpuWaitCapCause::None;
     PacingTelemetry_PushSource(*record);
 }
 
@@ -1043,7 +890,7 @@ static int64_t QpcNow() noexcept
     return s_clock.Now();
 }
 
-// Governor, overload guard, collision guard and GPU wait cap fields of the OSD status.
+// Governor, overload guard and collision guard fields of the OSD status.
 static void FillControllerStatus(SchedulerPacingStatus* status) noexcept
 {
     const GovernorStatistics governor = s_period_governor.Statistics();
@@ -1101,14 +948,15 @@ static void FillControllerStatus(SchedulerPacingStatus* status) noexcept
     const LeadController& lead = s_source_stage.Lead();
     const LeadStatistics lead_statistics = lead.Statistics();
     const auto clip = [](uint64_t value) { return static_cast<uint32_t>(std::min<uint64_t>(value, UINT32_MAX)); };
-    status->release_margin_us = lead.ReleaseMarginUs();
-    status->release_headroom_us = lead.ReleaseHeadroomUs();
+    status->release_margin_us = LEAD_RELEASE_MARGIN_US;
+    status->release_headroom_us = pipeline.gpu_wait_headroom_us;
     status->collision_headroom = lead_statistics.collision_checked_frames != 0 && lead_statistics.last_guard_headroom;
     status->collision_limit_us =
         lead_statistics.collision_checked_frames != 0 ? lead_statistics.last_collision_limit_us : 0.0;
     status->collision_checked = clip(lead_statistics.collision_checked_frames);
     status->collision_guarded = clip(lead_statistics.collision_guarded_frames);
-    status->collision_behind_wait = lead.NextGpuWorkBehindWait();
+    status->collision_behind_wait =
+        lead.NextGpuWorkBehindWait(s_last_fg_divisor_raw > 0 ? static_cast<double>(s_last_fg_divisor_raw) : 1.0);
     status->queue_order_pairs = static_cast<uint32_t>(lead.ConcurrencyPairs());
     status->release_margin_samples = clip(lead_statistics.margin_samples);
     status->release_margin_late = clip(lead_statistics.margin_late_samples);
@@ -1117,12 +965,6 @@ static void FillControllerStatus(SchedulerPacingStatus* status) noexcept
     status->hold_interleave = !s_interleave_active ? 0 : (s_hold_interleave.Holding() ? 1 : 2);
     status->hold_interleave_remaining_s =
         s_interleave_active ? s_hold_interleave.RemainingS(QpcNow(), GetQPCFrequency()) : 0.0;
-    status->gpu_wait_cap_us = s_gpu_wait_cap.CapUs(pipeline.gpu_wait_budget_us);
-    status->gpu_wait_cap_level = static_cast<uint8_t>(s_gpu_wait_cap.Level());
-    status->gpu_wait_cap_open = s_gpu_wait_cap.Open();
-    status->gpu_wait_cap_late = s_gpu_wait_cap.WindowLate();
-    status->gpu_wait_cap_samples = s_gpu_wait_cap.WindowSamples();
-    status->gpu_wait_cap_checking = s_gpu_wait_cap.Checking();
 }
 
 static bool IsProcessFocused() noexcept
@@ -1340,7 +1182,7 @@ static GovernorDecision UpdatePeriodGovernor(
     // late-frame evidence and the workload reports.
     if (config.adaptive_cap_hold_room && config.rung_override == PacingRungOverride::Auto &&
         PacingPipeline_LeadRung(pipeline) == PacingRung::GpuQueueWait) {
-        frame.room_us = s_source_stage.Lead().HoldRoomUs(fg_divisor, frame.quantile);
+        frame.room_us = s_source_stage.Lead().HoldRoomUs(fg_divisor, frame.quantile, pipeline.gpu_wait_headroom_us);
     }
     const GovernorDecision decision = s_period_governor.OnFrame(frame);
     // The evidence restarts on a fixed-refresh step or a reset, not on
@@ -1857,8 +1699,6 @@ static SourceStageFrame RunPlanned(
     if (pipeline.mode == PacingTimingMode::Fixed) request.fixed = input.fixed;
     request.stall_inject_ms = config.stall_inject_ms;
     request.stall_inject_period_s = config.stall_inject_period_s;
-    UpdateGpuWaitCapTop(pipeline, config, QpcNow());
-    request.gpu_wait_cap_us = GpuWaitCapUs(pipeline);
     // Collision-aware release: Auto only, so the GPU wait output override
     // keeps its earlier behavior.
     request.collision_guard = config.rung_override == PacingRungOverride::Auto;
@@ -1978,8 +1818,7 @@ static SourceStageFrame RunPlanned(
     s_prev_enforcement_ts = release;
     PublishCadence(cadence_context, release);
 
-    ObserveGpuWaitResumes(pipeline, release);
-    ObserveReleaseMargin();
+    ObserveCollisionGuard(input.fg_divisor);
     if (input.governed) {
         RecordGovernorMiss(frame, input.governor, pre_sleep_late);
         // Overload guard: judged while the pre-guard Auto rung holds.
@@ -2238,7 +2077,7 @@ void Scheduler_EndReflexSleep(uint64_t grid_index, int64_t end_qpc) noexcept
 // Order: owner prologue → stage events → pipeline
 // → interval (VRR: I_0 → governor → LFC; fixed: I_0 → governor) → plan
 // (published before the wait) → wait → stall injector → release → governor miss
-// and GPU wait cap readout → one source record.
+// and collision guard readout → one source record.
 void OnMarker(
     uint64_t frameID,
     int64_t now,

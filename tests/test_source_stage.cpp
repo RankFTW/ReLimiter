@@ -691,7 +691,7 @@ void TestResumeHistoryThroughStage()
         g_stage.DrainStageEvents();
         clock.now += Ticks(2'000.0);
     }
-    // Every waited u − o reached the GPU wait cap's counters (and the C1 history).
+    // Every waited u − o reached the late-resume counters (and the C1 history).
     CHECK(g_stage.Lead().Statistics().resume_waited_samples == 40);
     CHECK(g_stage.Lead().Statistics().resume_not_waited == 0);
 

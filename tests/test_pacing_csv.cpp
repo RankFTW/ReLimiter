@@ -4,7 +4,7 @@
 // native PCL loss counters on capture and queue-drop rows, the pcl_status
 // event, the frame-plan columns, display source, reason column and
 // grid_epoch / pipeline_change / stall_injected events,
-// the controller columns and governor_step / rung_feasibility / gpu_wait_cap
+// the controller columns and governor_step / rung_feasibility
 // events, and the source-placement columns.
 // The logger and the native PCL snapshot are stubs; the telemetry
 // worker that produces these records is not exercised here (its controller
@@ -148,8 +148,6 @@ PacingJoinedRow DisplayRow(bool with_latency)
         row.source.governor_interval_us = 11025.0;
         row.source.governor_cause = 2;      // events only: never a row cell
         row.source.feasibility_demoted = 1; // events only: never a row cell
-        row.source.gpu_wait_cap_level = 2;  // events only: never a row cell
-        row.source.gpu_wait_cap_cause = 1;  // events only: never a row cell
         // Pre-Sleep placement
         row.source.flags = PACING_SOURCE_PRE_SLEEP;
         row.source.source_placement = 3; // PacingSourcePlacement::PreSleep
@@ -381,13 +379,6 @@ void CheckEventsFile(const CsvFile& events)
     Check(events.Cell(feasibility, "previous_value").empty() && events.Cell(feasibility, "value") == "1" &&
               events.Cell(feasibility, "reason") == "1",
           "a capture-start rung_feasibility has the demoted state, the FeasibilityCause and no previous value");
-    const size_t wait_cap = RowOfEvent(events, "gpu_wait_cap");
-    Check(wait_cap < events.rows.size(), "a gpu_wait_cap event is written");
-    if (wait_cap < events.rows.size()) {
-        Check(events.Cell(wait_cap, "previous_value") == "1" && events.Cell(wait_cap, "value") == "2" &&
-                  events.Cell(wait_cap, "reason") == "1" && events.Cell(wait_cap, "event_qpc") == "13000",
-              "gpu_wait_cap carries the previous level, the new level and the GpuWaitCapCause");
-    }
     Check(events.Cell(governor, "clock_map_offset_us").empty() && events.Cell(governor, "source_drops").empty(),
           "controller events leave unrelated columns empty");
 }
@@ -473,15 +464,6 @@ int main()
     feasibility.value = 1;  // demoted
     feasibility.reason = 1; // FeasibilityCause::LeadInfeasible
     CSV_PushPacingEvent(feasibility);
-
-    PacingCsvEvent gpu_wait_cap{};
-    gpu_wait_cap.type = PacingCsvEventType::GpuWaitCap;
-    gpu_wait_cap.event_qpc = 13000;
-    gpu_wait_cap.has_previous = true;
-    gpu_wait_cap.previous_value = 1;
-    gpu_wait_cap.value = 2;
-    gpu_wait_cap.reason = 1; // GpuWaitCapCause::LateResumes
-    CSV_PushPacingEvent(gpu_wait_cap);
 
     CSV_SetEnabled(false);
     Check(CSV_Shutdown(), "writer stops");

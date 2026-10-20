@@ -63,13 +63,14 @@ constexpr double kPacingStallInjectMaxMs = 200.0;
 constexpr double kPacingStallInjectMinPeriodS = 1.0;
 constexpr double kPacingStallInjectMaxPeriodS = 60.0;
 constexpr double kPacingStallInjectDefaultPeriodS = 5.0;
-// Developer key gpu_wait_budget_us: the GPU queue wait cap ladder's highest
-// level (rung_feasibility.h GpuWaitCap); the warm lead is at most the median
-// release-to-ready time plus the current cap. Non-positive or non-finite
-// values load as the default.
-constexpr double kPacingGpuWaitBudgetMinUs = 500.0;
-constexpr double kPacingGpuWaitBudgetMaxUs = 5000.0;
-constexpr double kPacingGpuWaitBudgetDefaultUs = 1500.0;
+// Developer key gpu_wait_headroom_us: the release headroom of the GPU queue
+// wait's collision-aware release, the fixed distance between a release and
+// the next frame's heavy GPU work (lead_controller.h LEAD_RELEASE_HEADROOM_US).
+// For reproducing a report without a rebuild; users never tune it.
+// Non-positive or non-finite values load as the default.
+constexpr double kPacingGpuWaitHeadroomMinUs = 500.0;
+constexpr double kPacingGpuWaitHeadroomMaxUs = 3000.0;
+constexpr double kPacingGpuWaitHeadroomDefaultUs = 1000.0;
 // Developer key gpu_wait_interleave_s: with Output override Auto,
 // the GPU queue wait alternates held and not held in blocks of about this many
 // seconds for unbiased A/B captures (rung_feasibility.h HoldInterleave). 0 is
@@ -106,7 +107,7 @@ struct PacingPipelineConfig {
     int adaptive_cap_percentile = kAdaptiveCapPercentileDefault; // user key; a tier of kAdaptiveCapFitTiers
     PacingPlacementOverride placement_override = PacingPlacementOverride::PreSleep; // key source_placement
     bool gpu_probes = true;       // developer key gpu_present_gate_probes
-    double gpu_wait_budget_us = kPacingGpuWaitBudgetDefaultUs; // developer key gpu_wait_budget_us: [500, 5000]
+    double gpu_wait_headroom_us = kPacingGpuWaitHeadroomDefaultUs; // developer key gpu_wait_headroom_us: [500, 3000]
     double gpu_wait_interleave_s = 0.0; // developer key gpu_wait_interleave_s: 0 = off, else [1, 10]
     PacingRenderQueue gpu_queue_wait_render_queue = PacingRenderQueue::Keep; // developer key (A/B)
     PacingLeadCoverage lead_coverage = PacingLeadCoverage::Q99; // key lead_coverage; 95 is the developer A/B
@@ -196,7 +197,7 @@ struct PacingPipelineSnapshot {
     // quantile, whatever lead_coverage says.
     double handoff_quantile = 0.95;
     bool gpu_probes = true;
-    double gpu_wait_budget_us = kPacingGpuWaitBudgetDefaultUs; // the GPU wait cap ladder's top level
+    double gpu_wait_headroom_us = kPacingGpuWaitHeadroomDefaultUs; // the collision guard's release headroom
 };
 
 // The rung whose lead plans the frame: the GPU queue wait while the overload

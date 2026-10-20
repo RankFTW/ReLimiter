@@ -126,97 +126,6 @@ double LeadSampleWindow::Quantile(double probability) const noexcept
     return BinCenterUs(static_cast<uint32_t>(bin));
 }
 
-// ── Release margin and headroom ──
-
-void ReleaseMarginLearner::Reset() noexcept
-{
-    *this = ReleaseMarginLearner{ limits_ };
-}
-
-size_t ReleaseMarginLearner::BinOf(double margin_us) noexcept
-{
-    if (!(margin_us > 0.0)) return 0;
-    const double bin = std::floor(margin_us / LEAD_MARGIN_BIN_US);
-    return bin >= static_cast<double>(LEAD_MARGIN_BINS - 1) ? LEAD_MARGIN_BINS - 1 : static_cast<size_t>(bin);
-}
-
-// More late resumes in the bin than the background share plus
-// LEAD_MARGIN_EXCESS_SHARE explains, at z > LEAD_MARGIN_EXCESS_Z.
-bool ReleaseMarginLearner::Colliding(size_t bin, double background) const noexcept
-{
-    const double resumes = resumes_[bin];
-    const double late = late_[bin];
-    if (resumes < LEAD_MARGIN_MIN_SAMPLES || late < LEAD_MARGIN_MIN_LATE) return false;
-    const double share = std::min(0.5, background + LEAD_MARGIN_EXCESS_SHARE);
-    return (late - resumes * share) / std::sqrt(resumes * share * (1.0 - share)) > LEAD_MARGIN_EXCESS_Z;
-}
-
-int ReleaseMarginLearner::Add(double margin_us, bool late) noexcept
-{
-    if (!std::isfinite(margin_us)) return 0;
-    constexpr double kKeep = 1.0 - 1.0 / LEAD_MARGIN_DECAY_SAMPLES;
-    for (size_t bin = 0; bin < LEAD_MARGIN_BINS; ++bin) {
-        resumes_[bin] *= kKeep;
-        late_[bin] *= kKeep;
-    }
-    const size_t added = BinOf(margin_us);
-    resumes_[added] += 1.0;
-    if (late) late_[added] += 1.0;
-
-    // Background: the late share at margins at least 1 ms above M. Nothing
-    // is judged before it is measured.
-    const size_t background_bin = BinOf(margin_us_ + 1000.0);
-    double background_resumes = 0.0;
-    double background_late = 0.0;
-    for (size_t bin = background_bin; bin < LEAD_MARGIN_BINS; ++bin) {
-        background_resumes += resumes_[bin];
-        background_late += late_[bin];
-    }
-    if (background_resumes < LEAD_MARGIN_BACKGROUND_SAMPLES) {
-        narrow_run_ = 0;
-        return 0;
-    }
-    const double background = background_late / background_resumes;
-
-    double edge_us = EdgeUs();
-    // Widen through the colliding bins upward from the edge, below the
-    // background: bins with too few resumes are skipped, and the first
-    // measured bin that does not collide ends the scan, so lateness away
-    // from the collision window cannot move the edge.
-    for (size_t bin = static_cast<size_t>(std::floor(edge_us / LEAD_MARGIN_BIN_US + 0.5));
-         bin < background_bin; ++bin) {
-        if (resumes_[bin] < LEAD_MARGIN_MIN_SAMPLES) continue;
-        if (!Colliding(bin, background)) break;
-        edge_us = static_cast<double>(bin + 1) * LEAD_MARGIN_BIN_US;
-        narrow_run_ = 0;
-    }
-    // Narrow one bin after the bin just below the edge stayed clean (well
-    // measured, and late at most LEAD_MARGIN_CLEAN_SHARE above the background)
-    // or, above the start, held fewer late resumes than a collision needs.
-    // The guard keeps releases about a cushion above the edge, so few resumes
-    // land below it to measure it clean; without the second test a widening
-    // would stand until the game closes instead of fading with its evidence.
-    const double below = std::floor(edge_us / LEAD_MARGIN_BIN_US + 0.5) - 1.0;
-    const size_t below_bin = below >= 0.0 ? static_cast<size_t>(below) : LEAD_MARGIN_BINS;
-    const bool clean = below_bin < LEAD_MARGIN_BINS && resumes_[below_bin] >= LEAD_MARGIN_CLEAN_SAMPLES &&
-        late_[below_bin] <= resumes_[below_bin] * (background + LEAD_MARGIN_CLEAN_SHARE);
-    const bool faded = below_bin < LEAD_MARGIN_BINS && edge_us > limits_.start_us - LEAD_MARGIN_CUSHION_US &&
-        late_[below_bin] < LEAD_MARGIN_MIN_LATE;
-    if (clean || faded) {
-        if (++narrow_run_ >= LEAD_MARGIN_NARROW_SAMPLES) {
-            edge_us -= LEAD_MARGIN_BIN_US;
-            narrow_run_ = 0;
-        }
-    } else {
-        narrow_run_ = 0;
-    }
-
-    const double margin = std::clamp(edge_us + LEAD_MARGIN_CUSHION_US, limits_.min_us, limits_.max_us);
-    const int step = margin > margin_us_ ? 1 : (margin < margin_us_ ? -1 : 0);
-    margin_us_ = margin;
-    return step;
-}
-
 // ── Lifecycle ──
 
 void LeadController::Reset(int64_t qpc_frequency) noexcept
@@ -357,21 +266,6 @@ double LeadController::NextLeadUs(const LeadRequest& request, bool* budget_limit
 
     bucket.budget_us = max_lead_us;
     bucket.target_us = bucket.quantile_us + ValidAllowance(request.allowance_us);
-    // GPU wait cap (rung_feasibility.h GpuWaitCap; gpu_wait_budget_us): a
-    // typical GPU queue wait frame waits at most the cap before its target.
-    // The frames it lets run late are not the Adaptive cap's evidence
-    // (LeadGuardOutcome::cap_reduction_us): the cap is relative to the
-    // median X, so its late share does not fall when the interval rises.
-    if (request.rung == PacingRung::GpuQueueWait && IsPositiveFinite(request.gpu_wait_cap_us)) {
-        const double capped_us = bucket.window.Quantile(0.5) + request.gpu_wait_cap_us;
-        if (capped_us < bucket.target_us) {
-            if (guard != nullptr) {
-                guard->cap_reduction_us = std::max(0.0, std::min(bucket.target_us, max_lead_us) - capped_us);
-            }
-            bucket.target_us = capped_us;
-            ++statistics_.gpu_wait_capped_frames;
-        }
-    }
     // Past 3 I only the Adaptive cap, if the user enabled it, can help.
     bucket.budget_limited = bucket.target_us > max_lead_us;
     if (bucket.budget_limited) ++statistics_.budget_limited_frames;
@@ -391,38 +285,67 @@ double LeadController::NextLeadUs(const LeadRequest& request, bool* budget_limit
 // work window is warm and current, else at most I + Q10(C) − M (release
 // margin) while the call window is warm (lead_controller.h). Neither while
 // the newest queue-order pairs show the next frame's GPU work running behind
-// the wait: it cannot delay the resume there.
+// the wait: it cannot delay the resume there. A tighter limit applies at
+// once; once it relaxes, the lead returns to the unguarded lead at the lead
+// slew, never in one step.
 double LeadController::CollisionGuardedLeadUs(const LeadRequest& request, size_t bucket_index,
     double lead_us, LeadGuardOutcome* guard) noexcept
 {
-    if (request.rung != PacingRung::GpuQueueWait || !request.collision_guard || NextGpuWorkBehindWait()) {
-        return lead_us;
-    }
+    Bucket& bucket = buckets_[bucket_index];
     const size_t divisor = bucket_index % LEAD_DIVISOR_BUCKETS;
-    const LeadSampleWindow& work = work_windows_[divisor];
-    const LeadSampleWindow& calls = call_windows_[divisor];
-    double limit_us = 0.0;
-    if (work.Count() >= LEAD_WARM_SAMPLES && work_age_frames_[divisor] <= LEAD_WORK_STALE_FRAMES) {
-        limit_us = request.interval_us + work.Quantile(LEAD_WORK_QUANTILE) - headroom_.MarginUs();
-        ++statistics_.headroom_checked_frames;
-        statistics_.last_guard_headroom = true;
-    } else if (calls.Count() >= LEAD_WARM_SAMPLES) {
-        limit_us = request.interval_us + calls.Quantile(LEAD_CALL_QUANTILE) - margin_.MarginUs();
-        statistics_.last_guard_headroom = false;
-    } else {
-        return lead_us;
+    double returned_us = lead_us;
+    bool judged = false;
+    if (request.rung == PacingRung::GpuQueueWait && request.collision_guard && !BehindWait(divisor)) {
+        double offset_us = 0.0;
+        bool headroom = false;
+        if (CollisionOffsetUs(divisor, request.release_headroom_us, &offset_us, &headroom)) {
+            judged = true;
+            const double limit_us = request.interval_us + offset_us;
+            ++statistics_.collision_checked_frames;
+            if (headroom) ++statistics_.headroom_checked_frames;
+            statistics_.last_guard_headroom = headroom;
+            statistics_.last_collision_limit_us = limit_us;
+            if (guard != nullptr) {
+                guard->judged = true;
+                guard->offset_us = offset_us;
+            }
+            returned_us = std::min(returned_us, std::max(0.0, limit_us));
+        }
     }
-    ++statistics_.collision_checked_frames;
-    statistics_.last_collision_limit_us = limit_us;
-    if (guard != nullptr) {
-        guard->judged = true;
-        guard->offset_us = limit_us - request.interval_us;
+    if (bucket.held_back) {
+        const double step_us = std::min(LEAD_SLEW_MAX_US, request.interval_us / kIntervalSlewDivisor);
+        returned_us = std::min(returned_us, bucket.returned_lead_us + step_us);
     }
-    if (lead_us <= limit_us) return lead_us;
-    ++statistics_.collision_guarded_frames;
-    const double guarded_us = std::max(0.0, limit_us);
-    if (guard != nullptr) guard->reduction_us = lead_us - guarded_us;
-    return guarded_us;
+    bucket.held_back = returned_us < lead_us;
+    bucket.returned_lead_us = returned_us;
+    if (bucket.held_back) {
+        if (judged) ++statistics_.collision_guarded_frames;
+        if (guard != nullptr) guard->reduction_us = lead_us - returned_us;
+    }
+    return returned_us;
+}
+
+bool LeadController::WorkCurrent(size_t divisor) const noexcept
+{
+    return work_windows_[divisor].Count() >= LEAD_WARM_SAMPLES &&
+        work_age_frames_[divisor] <= LEAD_WORK_STALE_FRAMES;
+}
+
+bool LeadController::CollisionOffsetUs(size_t divisor, double headroom_us, double* offset_us,
+    bool* headroom) const noexcept
+{
+    if (WorkCurrent(divisor)) {
+        const double distance_us = IsPositiveFinite(headroom_us) ? headroom_us : LEAD_RELEASE_HEADROOM_US;
+        *offset_us = work_windows_[divisor].Quantile(LEAD_WORK_QUANTILE) - distance_us;
+        *headroom = true;
+        return true;
+    }
+    if (call_windows_[divisor].Count() >= LEAD_WARM_SAMPLES) {
+        *offset_us = call_windows_[divisor].Quantile(LEAD_CALL_QUANTILE) - LEAD_RELEASE_MARGIN_US;
+        *headroom = false;
+        return true;
+    }
+    return false;
 }
 
 double LeadController::MedianSampleUs(PacingRung rung, double fg_divisor) const noexcept
@@ -461,16 +384,23 @@ double LeadController::EarlyLeadUs(PacingRung rung, double fg_divisor, double qu
     return bucket.reseed_x_us > 0.0 ? std::max(0.0, bucket.reseed_x_us - allowance) : 0.0;
 }
 
-double LeadController::HoldRoomUs(double fg_divisor, double quantile) const noexcept
+// Hold room (lead_controller.h): the guard's inequality solved for the
+// interval with the guard's own current offset.
+double LeadController::HoldRoomUs(double fg_divisor, double quantile, double release_headroom_us) const noexcept
 {
     size_t index = 0;
     if (!std::isfinite(quantile) || !FindBucketIndex(PacingRung::GpuQueueWait, fg_divisor, &index)) return 0.0;
+    const size_t divisor = index % LEAD_DIVISOR_BUCKETS;
     // No collision limit while the next frame's GPU work runs behind the
     // wait (queue order), so no room to make for it.
-    if (NextGpuWorkBehindWait()) return 0.0;
-    const LeadSampleWindow& room = room_windows_[index % LEAD_DIVISOR_BUCKETS];
-    if (room.Count() < LEAD_WARM_SAMPLES) return 0.0;
-    return room.Quantile(std::clamp(quantile, 0.0, 1.0));
+    if (BehindWait(divisor)) return 0.0;
+    const LeadSampleWindow& room = room_windows_[divisor];
+    double offset_us = 0.0;
+    bool headroom = false;
+    if (room.Count() < LEAD_WARM_SAMPLES || !CollisionOffsetUs(divisor, release_headroom_us, &offset_us, &headroom)) {
+        return 0.0;
+    }
+    return std::max(0.0, room.Quantile(std::clamp(quantile, 0.0, 1.0)) + LEAD_ROOM_MIN_HOLD_US - offset_us);
 }
 
 double LeadController::HandoffOffsetUs(double quantile, double allowance_us) const noexcept
@@ -606,7 +536,6 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
     if (qpc_frequency_ <= 0 || !PacingPlanKey_IsValid(frame.key) || frame.source_release_qpc <= 0 ||
         !IsPositiveFinite(frame.interval_us) || !std::isfinite(frame.lead_us) || frame.lead_us < 0.0 ||
         !std::isfinite(frame.guard.reduction_us) || frame.guard.reduction_us < 0.0 ||
-        !std::isfinite(frame.guard.cap_reduction_us) || frame.guard.cap_reduction_us < 0.0 ||
         !std::isfinite(frame.guard.offset_us) ||
         !FindBucketIndex(frame.rung, frame.fg_divisor, &bucket_index)) {
         ++statistics_.invalid_inputs;
@@ -642,8 +571,6 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
     slot.interval_us = frame.interval_us;
     slot.lead_us = frame.lead_us;
     slot.guard_reduction_us = frame.guard.reduction_us;
-    slot.cap_reduction_us = frame.guard.cap_reduction_us;
-    slot.guard_offset_us = frame.guard.offset_us;
     slot.guard_judged = frame.guard.judged && frame.rung == PacingRung::GpuQueueWait;
     // ReLimiter's waits before this release (lockstep engines, lead_controller.h).
     const auto valid_wait = [&](int64_t start_qpc, int64_t end_qpc) noexcept {
@@ -941,6 +868,8 @@ void LeadController::ResetBucket(Bucket* bucket) noexcept
     bucket->quantile_us = 0.0;
     bucket->target_us = 0.0;
     bucket->lead_us = 0.0;
+    bucket->returned_lead_us = 0.0;
+    bucket->held_back = false;
     bucket->budget_us = 0.0;
     bucket->warm_applied = false;
     bucket->budget_limited = false;
@@ -1131,9 +1060,9 @@ void LeadController::RecordCallTime(PendingFrame* frame) noexcept
 }
 
 // A waited GPU queue wait resume of frame n and frame n + 1's Present call:
-// one release margin observation. Frame n + 1 must be a paced GPU queue
-// wait frame too: a pair across a rung or mode change (focus loss, idle cap,
-// overload) is no evidence about the release timing.
+// one release margin observation (measured, not acted on). Frame n + 1 must
+// be a paced GPU queue wait frame too: a pair across a rung or mode change
+// (focus loss, idle cap, overload) is no evidence about the release timing.
 void LeadController::RecordReleaseMargin(PendingFrame* frame) noexcept
 {
     if (frame == nullptr || frame->margin_recorded || !frame->resume_waited ||
@@ -1148,11 +1077,9 @@ void LeadController::RecordReleaseMargin(PendingFrame* frame) noexcept
     frame->margin_recorded = true;
     if (next->rung != PacingRung::GpuQueueWait || !next->sampled) return;
     const double margin_us = MicrosecondsBetween(frame->qpc[FieldOutputRelease], next->qpc[FieldPresentCall]);
+    if (!std::isfinite(margin_us)) return;
     ++statistics_.margin_samples;
     if (frame->resume_late) ++statistics_.margin_late_samples;
-    const int step = margin_.Add(margin_us, frame->resume_late);
-    if (step > 0) ++statistics_.margin_widened;
-    else if (step < 0) ++statistics_.margin_narrowed;
 }
 
 // D = r − A − s of a sampled GPU queue wait frame with its readiness and a
@@ -1176,9 +1103,9 @@ void LeadController::RecordWorkStart(PendingFrame* frame) noexcept
 }
 
 // A waited GPU queue wait resume of frame n and the start of frame n + 1's
-// heavy GPU work, r_{n+1} − A_{n+1}: one release headroom observation. As
-// for the margin, frame n + 1 must be a paced GPU queue wait frame; one
-// without a Reflex GPU active time yet is waited for.
+// heavy GPU work, r_{n+1} − A_{n+1}: one release headroom observation
+// (measured, not acted on). As for the margin, frame n + 1 must be a paced
+// GPU queue wait frame; one without a Reflex GPU active time yet is waited for.
 void LeadController::RecordReleaseHeadroom(PendingFrame* frame) noexcept
 {
     if (frame == nullptr || frame->headroom_recorded || !frame->resume_waited ||
@@ -1198,9 +1125,6 @@ void LeadController::RecordReleaseHeadroom(PendingFrame* frame) noexcept
     if (!std::isfinite(headroom_us)) return;
     ++statistics_.headroom_samples;
     if (frame->resume_late) ++statistics_.headroom_late_samples;
-    const int step = headroom_.Add(headroom_us, frame->resume_late);
-    if (step > 0) ++statistics_.headroom_widened;
-    else if (step < 0) ++statistics_.headroom_narrowed;
 }
 
 // A waited GPU queue wait release o_n and frame n + 1's GPU start g_{n+1}:
@@ -1242,9 +1166,16 @@ void LeadController::RecordConcurrency(PendingFrame* frame) noexcept
     statistics_.last_concurrency_us = start_us;
 }
 
-bool LeadController::NextGpuWorkBehindWait() const noexcept
+bool LeadController::BehindWait(size_t divisor) const noexcept
 {
-    return concurrency_count_ >= LEAD_WARM_SAMPLES && concurrent_in_window_ == 0;
+    return concurrency_count_ >= LEAD_WARM_SAMPLES && concurrent_in_window_ == 0 && WorkCurrent(divisor);
+}
+
+bool LeadController::NextGpuWorkBehindWait(double fg_divisor) const noexcept
+{
+    size_t index = 0;
+    return FindBucketIndex(PacingRung::GpuQueueWait, fg_divisor, &index) &&
+        BehindWait(index % LEAD_DIVISOR_BUCKETS);
 }
 
 void LeadController::NewestResumeDelays(size_t count, double* delays_us) const noexcept
@@ -1384,13 +1315,8 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
     }
     // A long sample is excluded from the lead but is a missed target.
     // A frame the collision guard made late on purpose is judged against its
-    // unguarded lead, and every frame without its gated hold. The Adaptive
-    // cap's evidence also leaves out the GPU wait cap's lowering: in Rogue
-    // Core the cap bound 86% of frames, 4.3% were late against the capped
-    // lead but 0.8% against the uncapped one, and the capped share grew
-    // from 2.2% to 6.0% as the interval rose from 10 to 12 ms.
-    const double guarded_slack_us = frame->lead_us + frame->guard_reduction_us - std::max(0.0, sample_us - gated_us);
-    const double slack_us = guarded_slack_us + frame->cap_reduction_us;
+    // unguarded lead, and every frame without its gated hold.
+    const double slack_us = frame->lead_us + frame->guard_reduction_us - std::max(0.0, sample_us - gated_us);
     AddSlack(&bucket.slack, slack_us);
     statistics_.last_slack_us = slack_us;
     ++statistics_.slack_samples;
@@ -1407,9 +1333,8 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
     // Hold room (lead_controller.h): a frame late even against its unguarded
     // lead is the overload's, not the hold's; a gated frame's X contains
     // ReLimiter's own later waits, which would make R grow with the interval.
-    // Judged against the lead the GPU queue wait ran with (the cap included).
-    if (frame->guard_judged && gated_ticks == 0 && guarded_slack_us >= 0.0) {
-        room_windows_[frame->bucket % LEAD_DIVISOR_BUCKETS].Add(sample_us - frame->guard_offset_us);
+    if (frame->guard_judged && gated_ticks == 0 && slack_us >= 0.0) {
+        room_windows_[frame->bucket % LEAD_DIVISOR_BUCKETS].Add(sample_us);
         ++statistics_.room_samples;
     }
     // FG input wait, and the GPU queue wait under the A/B key

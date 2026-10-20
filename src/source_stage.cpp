@@ -220,7 +220,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     lead_request.mode = pipeline.mode;
     lead_request.quantile = pipeline.lead_quantile;
     lead_request.allowance_us = pipeline.allowance_us;
-    lead_request.gpu_wait_cap_us = request.gpu_wait_cap_us;
+    lead_request.release_headroom_us = pipeline.gpu_wait_headroom_us;
     // The collision guard limits the lead of frames whose GPU actually waits
     // at the gate; a demoted GPU queue wait keeps its unguarded lead.
     lead_request.collision_guard = request.collision_guard && pipeline.rung == PacingRung::GpuQueueWait;

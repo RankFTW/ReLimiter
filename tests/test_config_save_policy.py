@@ -135,7 +135,7 @@ class ConfigSavePolicyTests(unittest.TestCase):
             config))
         self.assertTrue({"smoothing", "adaptive_cap", "output_rung", "stall_inject_ms",
                          "stall_inject_period_s", "gpu_present_gate_probes",
-                         "gpu_wait_budget_us", "marker_forward_order",
+                         "gpu_wait_headroom_us", "marker_forward_order",
                          "gpu_queue_wait_render_queue", "lead_coverage", "source_placement"} <= fields)
         saved = set(re.findall(r"\bconfig\.(\w+)", body("WriteConfigSnapshot")))
         # Every Config field is saved: the section clear before the startup
@@ -200,7 +200,7 @@ class ConfigSavePolicyTests(unittest.TestCase):
         resolver_config = RESOLVER.split("struct PacingPipelineConfig {", 1)[1].split("\n};", 1)[0]
         fields = set(re.findall(r"^\s*[\w:]+\s+(\w+)\s*=", resolver_config, re.MULTILINE))
         self.assertEqual(fields, {"smoothing", "rung_override", "adaptive_cap",
-                                  "adaptive_cap_percentile", "gpu_probes", "gpu_wait_budget_us",
+                                  "adaptive_cap_percentile", "gpu_probes", "gpu_wait_headroom_us",
                                   "gpu_wait_interleave_s", "gpu_queue_wait_render_queue",
                                   "lead_coverage", "fg_late_spacing", "gpu_paced_cadence",
                                   "gpu_paced_hold_margin", "gpu_paced_release_smoothing",
@@ -216,7 +216,7 @@ class ConfigSavePolicyTests(unittest.TestCase):
                                    "gpu_probes": "gpu_present_gate_probes",
                                    "stall_inject_ms": "stall_inject_ms",
                                    "stall_inject_period_s": "stall_inject_period_s",
-                                   "gpu_wait_budget_us": "gpu_wait_budget_us",
+                                   "gpu_wait_headroom_us": "gpu_wait_headroom_us",
                                    "gpu_wait_interleave_s": "gpu_wait_interleave_s",
                                    "gpu_queue_wait_render_queue": "gpu_queue_wait_render_queue",
                                    "lead_coverage": "lead_coverage",
