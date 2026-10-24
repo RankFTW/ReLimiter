@@ -122,39 +122,6 @@ private:
 // late starts by about half; replays can reject, not approve.
 constexpr double GPU_PACED_RHYTHM_EARLY_GAIN = 0.25;
 
-// Developer A/B gpu_paced_release_smoothing, on top of the rhythm. A GPU
-// frame stretched by the game's own CPU hitch moves the floor later, and the
-// rhythm follows within a few frames (the pull above and the five-period
-// mean), so the next SIMULATION_START intervals change and DLSS-G misplaces
-// those real frames (Gears of War: E-Day, FG 2× at 120: 68–91% of display
-// jumps within four frames after a GPU starvation; 0.5–0.8 misplaced real
-// frames in the three after each, against 0.1–0.2 under the driver's Sleep,
-// which keeps its start interval and lets the queue deepen). The smoothing
-// leaves the rhythm as it is (it continues from the release it would have
-// made, GpuPacedRhythmRelease::rhythm_qpc) and releases at
-//   candidate = previous release + mean of the newest
-//               GPU_PACED_SMOOTHING_PERIODS intervals of the rhythm's own
-//               releases (after LEAD_WARM_SAMPLES);
-//   not earlier than the rhythm's release: the rhythm's release;
-//   otherwise:  pulled GPU_PACED_SMOOTHING_GAIN of the way to it, never
-//               earlier than the floor minus P (one GPU period: one more
-//               frame queued at most).
-// So a later floor deepens the queue for a few frames instead of stretching
-// the start interval, and an earlier one still releases at once. The bound
-// is a full period, not the rhythm's P/2: a stall longer than P/2 moves the
-// floor past it, and a game that arrives late after the stall (its game
-// thread waited for the hitched render thread) was held to floor − P/2
-// about 7 ms longer, so the second frame after each big stall started
-// 21–30 ms after the previous one (deviation p50 +3.7 to +5.0 ms, up to
-// 14; the driver's Sleep +0.04). A replay on captured releases (GPU timeline
-// fixed, never later than captured) estimated 0.4–0.6 ms mean and 1.8–3.3 ms
-// p95 of extra lead for fewer misplaced real frames, and with the full
-// period that frame's deviation p50 1.0–1.4 ms for 3–4 ms more lead on it;
-// slower pulls added up to 17 ms at p95 for no further gain. Replays can
-// reject, not approve.
-constexpr size_t GPU_PACED_SMOOTHING_PERIODS = 64;
-constexpr double GPU_PACED_SMOOTHING_GAIN = 0.25;
-
 enum class GpuPacedRhythmStep : uint8_t {
     None = 0,       // not a held GPU floor frame, or no floor
     Start = 1,      // the floor: no previous consecutive rhythm release
@@ -167,9 +134,6 @@ enum class GpuPacedRhythmStep : uint8_t {
 struct GpuPacedRhythmRelease {
     int64_t release_qpc = 0; // 0 with GpuPacedRhythmStep::None
     GpuPacedRhythmStep step = GpuPacedRhythmStep::None;
-    // The rhythm's own release; release_qpc is earlier only when the
-    // smoothing (gpu_paced_release_smoothing) moved it.
-    int64_t rhythm_qpc = 0;
 };
 
 // ── Planned frame ──
@@ -216,21 +180,21 @@ struct SourceStageRequest {
     // ReLimiter (below) and the earliest release is not later than it, the
     // GPU sets the release: the frame is on time by construction, the grid
     // does not judge its lateness, and its output target is at least its
-    // release plus E, E = LeadController::EarlyLeadUs (how soon frames the
-    // floor released were ready at the earliest), from which the grid
-    // continues without a restart (CadenceGridPlanInput::
-    // earliest_target_qpc). A frame the GPU finishes before the grid's target
-    // keeps the grid, so the cadence is the later of the cap and the GPU's
-    // pace. Held frames pass the raw floor here and the GPU-paced rhythm's
-    // release, never later than it, as the earliest release.
+    // release plus min(E, L), E = LeadController::EarlyLeadUs (how soon frames
+    // the floor released were ready at the earliest) and L the frame's lead,
+    // from which the grid continues without a restart (CadenceGridPlanInput::
+    // earliest_target_qpc). E above L would put the grid's S = T − L after the
+    // floor and hold a frame the GPU released past it while still moving T: a
+    // grid that drifts later without an epoch. A frame the GPU finishes
+    // before the grid's target keeps the grid, so the cadence is the later of
+    // the cap and the GPU's pace. Held frames pass the raw floor here and the
+    // GPU-paced rhythm's release, never later than it, as the earliest
+    // release.
     bool gpu_paced_cadence = false;
     int64_t gpu_floor_qpc = 0;
     // The step that set earliest_release_qpc (SourceStage::GpuPacedRhythm);
     // None when the rhythm does not apply. A frame it paced continues it.
     GpuPacedRhythmStep gpu_paced_rhythm = GpuPacedRhythmStep::None;
-    // GpuPacedRhythmRelease::rhythm_qpc of that release (0 = none): the
-    // rhythm continues from the later of it and the actual release.
-    int64_t gpu_paced_rhythm_qpc = 0;
     // The game reached ReLimiter at its marker, or earlier at the Reflex
     // Sleep: the Sleep hook's entry for grid index sleep_entry_index (0 =
     // none), before any wait in the hook. The pre-Sleep wait aims at the
@@ -273,10 +237,6 @@ struct SourceStageStatistics {
     // Frames the GPU-paced rhythm paced, by the step that set their release
     // (index GpuPacedRhythmStep; None unused).
     uint64_t gpu_paced_rhythm[static_cast<size_t>(GpuPacedRhythmStep::Count)] = {};
-    // Developer A/B gpu_paced_release_smoothing: paced frames released before
-    // the rhythm's own release, and the sum of those advances (µs).
-    uint64_t gpu_paced_smoothed = 0;
-    double gpu_paced_smoothed_us = 0.0;
 };
 
 class SourceStage {
@@ -347,16 +307,9 @@ public:
     SourceStallInjector& StallInjector() noexcept { return stall_; }
     SourceStageStatistics Statistics() const noexcept { return statistics_; }
     // The GPU-paced rhythm's release (above) for frame key whose GPU floor is
-    // floor_qpc (0: none, step None), smoothed when `smoothing`
-    // (gpu_paced_release_smoothing). Owner only; RunPlannedFrame continues
+    // floor_qpc (0: none, step None). Owner only; RunPlannedFrame continues
     // the rhythm from the frames it paced.
-    GpuPacedRhythmRelease GpuPacedRhythm(const PacingPlanKey& key, int64_t floor_qpc,
-        bool smoothing = false) const noexcept;
-    // The smoothing's period: the mean of the newest
-    // GPU_PACED_SMOOTHING_PERIODS rhythm release intervals; 0 until
-    // LEAD_WARM_SAMPLES. And how many intervals the window holds.
-    double SmoothingPeriodUs() const noexcept;
-    size_t SmoothingIntervalCount() const noexcept { return smoothing_interval_count_; }
+    GpuPacedRhythmRelease GpuPacedRhythm(const PacingPlanKey& key, int64_t floor_qpc) const noexcept;
 
 private:
     // Frame key continues the rhythm: the next frame of the newest one it paced.
@@ -368,15 +321,8 @@ private:
     SourceStageStatistics statistics_{};
     PacingPlanKey last_published_key_{};
     int64_t qpc_frequency_ = 0;
-    // The GPU-paced rhythm: the newest frame it paced, the release the rhythm
-    // made for it (never earlier than the actual one) and its actual release.
+    // The GPU-paced rhythm: the newest frame it paced and its release.
     PacingPlanKey rhythm_key_{};
     int64_t rhythm_release_qpc_ = 0;
-    int64_t smoothed_release_qpc_ = 0;
-    // The smoothing's window: intervals of the rhythm's releases between
-    // consecutive paced frames, newest GPU_PACED_SMOOTHING_PERIODS.
-    std::array<double, GPU_PACED_SMOOTHING_PERIODS> smoothing_intervals_us_{};
-    size_t smoothing_interval_count_ = 0;
-    size_t smoothing_interval_next_ = 0;
     bool drain_output_late_ = false;
 };

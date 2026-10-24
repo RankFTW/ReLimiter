@@ -223,19 +223,6 @@ enum class PacingLeadCoverage : uint8_t {
     Count
 };
 
-// Key `gpu_paced_hold_margin` (developer A/B, with gpu_paced_cadence): the
-// cadence of GPU-paced held frames (VRR) runs at the quantile of the GPU's
-// recent per-frame need (LeadController::GpuNeedQuantileUs) instead of at the
-// GPU's own pace, so real frames are held and the GPU's frame-time variance is
-// absorbed, at a few percent of frame rate. Off (default) keeps the cap's
-// interval. INI text: off | 75 | 90.
-enum class PacingHoldMargin : uint8_t {
-    Off = 0,
-    Q75 = 1,
-    Q90 = 2,
-    Count
-};
-
 // Keyed stage observation, pushed by any thread, drained by the scheduler owner.
 struct PacingStageEvent {
     PacingPlanKey key{};

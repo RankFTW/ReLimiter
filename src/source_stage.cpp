@@ -80,9 +80,6 @@ void SourceStage::Reset(int64_t qpc_frequency) noexcept
     qpc_frequency_ = qpc_frequency > 0 ? qpc_frequency : 0;
     rhythm_key_ = {};
     rhythm_release_qpc_ = 0;
-    smoothed_release_qpc_ = 0;
-    smoothing_interval_count_ = 0;
-    smoothing_interval_next_ = 0;
     g_cadence_grid_publication.Publish(grid_.Snapshot());
 }
 
@@ -99,22 +96,12 @@ bool SourceStage::RhythmContinues(const PacingPlanKey& key) const noexcept
         rhythm_key_.controller_generation == key.controller_generation && rhythm_key_.frame_id + 1 == key.frame_id;
 }
 
-double SourceStage::SmoothingPeriodUs() const noexcept
-{
-    if (smoothing_interval_count_ < LEAD_WARM_SAMPLES) return 0.0;
-    double sum_us = 0.0;
-    for (size_t index = 0; index < smoothing_interval_count_; ++index) sum_us += smoothing_intervals_us_[index];
-    return sum_us / static_cast<double>(smoothing_interval_count_);
-}
-
-// GPU-paced rhythm and its smoothing (source_stage.h).
-GpuPacedRhythmRelease SourceStage::GpuPacedRhythm(const PacingPlanKey& key, int64_t floor_qpc,
-    bool smoothing) const noexcept
+// GPU-paced rhythm (source_stage.h).
+GpuPacedRhythmRelease SourceStage::GpuPacedRhythm(const PacingPlanKey& key, int64_t floor_qpc) const noexcept
 {
     GpuPacedRhythmRelease release{};
     if (floor_qpc <= 0) return release;
     release.release_qpc = floor_qpc;
-    release.rhythm_qpc = floor_qpc;
     release.step = GpuPacedRhythmStep::Start;
     const double period_us = lead_.RecentGpuPeriodUs();
     const double floor_period_us = lead_.GpuPeriodUs();
@@ -139,16 +126,6 @@ GpuPacedRhythmRelease SourceStage::GpuPacedRhythm(const PacingPlanKey& key, int6
             release.step = GpuPacedRhythmStep::Smooth;
         }
     }
-    release.rhythm_qpc = release.release_qpc;
-    const double smoothing_period_us = smoothing ? SmoothingPeriodUs() : 0.0;
-    if (!(smoothing_period_us > 0.0) || smoothed_release_qpc_ <= 0) return release;
-    const int64_t smoothed_qpc = smoothed_release_qpc_ + ticks(smoothing_period_us);
-    if (smoothed_qpc >= release.rhythm_qpc) return release;
-    const int64_t pulled_qpc = smoothed_qpc + static_cast<int64_t>(std::llround(
-        GPU_PACED_SMOOTHING_GAIN * static_cast<double>(release.rhythm_qpc - smoothed_qpc)));
-    // One GPU period below the floor, not the rhythm's half (source_stage.h).
-    const int64_t smoothing_earliest_qpc = floor_qpc - ticks(floor_period_us);
-    release.release_qpc = (std::min)((std::max)(pulled_qpc, smoothing_earliest_qpc), release.rhythm_qpc);
     return release;
 }
 
@@ -272,8 +249,9 @@ SourceStageFrame SourceStage::RunPlannedFrame(
         const double early_us = lead_.EarlyLeadUs(slack_rung, request.fg_divisor,
             pipeline.lead_quantile, pipeline.allowance_us);
         if (early_us > 0.0) {
+            // Never past S = T − L (source_stage.h).
             input.earliest_target_qpc = input.now_qpc + static_cast<int64_t>(std::llround(
-                early_us * static_cast<double>(request.qpc_frequency) / 1'000'000.0));
+                (std::min)(early_us, lead_us) * static_cast<double>(request.qpc_frequency) / 1'000'000.0));
         }
     }
     input.mode = pipeline.mode;
@@ -374,31 +352,14 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     // already brought the frame there).
     frame.gpu_paced = gpu_floor_release && grid_plan.source_wake_qpc <= input.now_qpc;
     if (frame.gpu_paced) ++statistics_.gpu_paced_frames;
-    // The rhythm continues from a frame it paced and restarts otherwise. It
-    // continues from the release it made (the smoothing's is never later;
-    // a game that arrived later sets the actual one), the smoothing from the
-    // actual release; the rhythm's release intervals fill the smoothing's
-    // window whether or not the smoothing is on.
+    // The rhythm continues from the release of a frame it paced and restarts
+    // otherwise.
     if (request.gpu_paced_rhythm != GpuPacedRhythmStep::None && frame.gpu_paced) {
-        const int64_t rhythm_qpc = (std::max)(frame.release_qpc, request.gpu_paced_rhythm_qpc);
-        const double us_per_tick = qpc_frequency_ > 0 ? 1'000'000.0 / static_cast<double>(qpc_frequency_) : 0.0;
-        if (RhythmContinues(request.key) && us_per_tick > 0.0) {
-            smoothing_intervals_us_[smoothing_interval_next_] =
-                static_cast<double>(rhythm_qpc - rhythm_release_qpc_) * us_per_tick;
-            smoothing_interval_next_ = (smoothing_interval_next_ + 1) % GPU_PACED_SMOOTHING_PERIODS;
-            smoothing_interval_count_ = (std::min)(smoothing_interval_count_ + 1, GPU_PACED_SMOOTHING_PERIODS);
-        }
-        if (frame.release_qpc < rhythm_qpc) {
-            ++statistics_.gpu_paced_smoothed;
-            statistics_.gpu_paced_smoothed_us += static_cast<double>(rhythm_qpc - frame.release_qpc) * us_per_tick;
-        }
         rhythm_key_ = request.key;
-        rhythm_release_qpc_ = rhythm_qpc;
-        smoothed_release_qpc_ = frame.release_qpc;
+        rhythm_release_qpc_ = frame.release_qpc;
         ++statistics_.gpu_paced_rhythm[static_cast<size_t>(request.gpu_paced_rhythm)];
     } else {
         rhythm_release_qpc_ = 0;
-        smoothed_release_qpc_ = 0;
     }
     start.gpu_floor_release = frame.gpu_paced;
     lead_.OnSourceRelease(start);

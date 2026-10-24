@@ -253,19 +253,6 @@ static void DrawPacingPipelineStatus() {
             status.rhythm_smooth, status.rhythm_late, status.rhythm_early_bound, status.rhythm_start,
             status.floor_from_ready, status.floor_frames);
     }
-    // Developer A/B gpu_paced_hold_margin: the key is on.
-    if (has_status && status.gpu_paced_hold_margin != 0) {
-        const char* margin = PacingHoldMargin_Text(static_cast<PacingHoldMargin>(status.gpu_paced_hold_margin));
-        if (status.gpu_paced_hold_interval_us > 0.0 && status.gpu_paced_hold_cap_us > 0.0) {
-            ImGui::TextDisabled("GPU-paced hold margin Q%s: interval %.2f ms (+%.1f%% over the cap) | "
-                "GPU need %.2f ms from %u frames", margin, status.gpu_paced_hold_interval_us / 1000.0,
-                (status.gpu_paced_hold_interval_us / status.gpu_paced_hold_cap_us - 1.0) * 100.0,
-                status.gpu_paced_hold_need_us / 1000.0, status.gpu_paced_hold_frames);
-        } else {
-            ImGui::TextDisabled("GPU-paced hold margin Q%s: not applied | GPU need from %u frames",
-                margin, status.gpu_paced_hold_frames);
-        }
-    }
     if (has_status && status.valid)
         ImGui::TextDisabled("Lead: %.2f ms (%s, %u samples%s) | Grid epoch: %u",
             status.lead_us / 1000.0, status.lead_warm ? "warm" : "warming",
@@ -643,43 +630,22 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "time rather than each frame's floor. When that floor sets a frame's release, the GPU is the "
         "limit: the frame's output target becomes the time such a frame is ready at the earliest, and the "
         "cadence continues from there instead of holding the frame to the cap's cadence, which would leave "
-        "the GPU idle. Frames the GPU finishes early are still held to the cap. Watch long frames, jitter, "
-        "GPU idle gaps and PC Latency; one setting per capture.");
-
-    static const char* const kHoldMarginLabels[] = {"Off", "75%", "90%"};
-    static_assert(IM_ARRAYSIZE(kHoldMarginLabels) == static_cast<int>(PacingHoldMargin::Count));
-    int hold_margin = static_cast<int>(g_config.gpu_paced_hold_margin);
-    if (ImGui::Combo("GPU-paced hold margin", &hold_margin, kHoldMarginLabels, IM_ARRAYSIZE(kHoldMarginLabels))) {
-        g_config.gpu_paced_hold_margin = static_cast<PacingHoldMargin>(hold_margin);
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: GPU-paced hold margin -> %s", PacingHoldMargin_Text(g_config.gpu_paced_hold_margin));
-        *config_dirty = true;
-    }
-    HelpTip("Diagnostic A/B, needs GPU-paced cadence. When the GPU is the limit, frames are held to a cadence "
-        "slightly slower than the GPU's recent frame times, so the GPU's own frame-time spikes are absorbed. "
-        "It costs a few percent of frame rate and about a millisecond of latency (more at 90% than at 75%). "
-        "Compare one setting per capture.");
-
-    if (ImGui::Checkbox("GPU-paced release smoothing", &g_config.gpu_paced_release_smoothing)) {
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: GPU-paced release smoothing -> %s", g_config.gpu_paced_release_smoothing ? "on" : "off");
-        *config_dirty = true;
-    }
-    HelpTip("Diagnostic A/B, needs GPU-paced cadence. When the GPU slips (a frame the game submitted late), "
-        "the next frames keep their release rhythm and run a few milliseconds further ahead for a few frames, "
-        "instead of moving the rhythm, which frame generation turns into misplaced real frames. It is never "
-        "later than the GPU-paced release. Costs about half a millisecond of latency on average. Compare one "
-        "setting per capture.");
+        "the GPU idle. A frame whose GPU waited at ReLimiter's Signal sets no floor for the next one: its timing "
+        "is ReLimiter's own, not the GPU's. Frames the GPU finishes early are still held to the cap. With "
+        "Adaptive cap on, the FG input wait's hold room follows the GPU's recent frame need at the Adaptive cap "
+        "fit. Watch long frames, jitter, GPU idle gaps and PC Latency; one setting per capture.");
 
     if (ImGui::Checkbox("Adaptive cap hold room", &g_config.adaptive_cap_hold_room)) {
         Config_ApplyPacingPipeline();
         LOG_INFO("OSD: Adaptive cap hold room -> %s", g_config.adaptive_cap_hold_room ? "on" : "off");
         *config_dirty = true;
     }
-    HelpTip("Diagnostic A/B, with Adaptive cap and the GPU wait output on Auto. On (default), the interval is "
-        "kept long enough for the GPU wait to hold frames: the GPU's work for a frame plus the release headroom. "
-        "When the GPU is the limit this can lower the frame rate by about 20%. Off, the interval follows only late "
-        "frames and the game's workload reports. Compare one setting per capture, in the same scene.");
+    HelpTip("Diagnostic A/B, with Adaptive cap and Output override on Auto. On (default), the interval is kept "
+        "long enough for the GPU wait to hold frames: on the GPU queue wait the GPU's work for a frame plus the "
+        "release headroom, on the FG input wait (with GPU-paced cadence) the GPU's recent frame need at the "
+        "Adaptive cap fit. When the GPU is the limit this can lower the frame rate by about 20%. Off, the "
+        "interval follows only late frames and the game's workload reports. Compare one setting per capture, in "
+        "the same scene.");
 
     static const char* const kSourcePlacementLabels[] = {"Marker", "Pre-Sleep", "Reflex driver limiter"};
     static_assert(IM_ARRAYSIZE(kSourcePlacementLabels) ==

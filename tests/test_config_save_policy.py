@@ -35,6 +35,8 @@ RETIRED_KEYS = (
     "gpu_present_gate_max_delay_us", "adaptive_deadline_reserve_mode", "smoothing_window",
     "smoothing_release_speed", "smoothing_bias_us", "smoothing_percentile",
     "gpu_readiness_observer",
+    # Retired with the GPU-paced cadence's GPU-set gate.
+    "gpu_paced_hold_margin", "gpu_paced_release_smoothing",
 )
 
 # Keys read once for migration (pacing_method, adaptive_smoothing) and never saved.
@@ -131,7 +133,7 @@ class ConfigSavePolicyTests(unittest.TestCase):
         config = HEADER.split("struct Config {", 1)[1].split("};", 1)[0]
         fields = set(re.findall(
             r"\b(?:bool|int|double|float|std::string|PacingSmoothing|PacingRungOverride|"
-            r"PacingMarkerForwardOrder|PacingRenderQueue|PacingLeadCoverage|PacingHoldMargin|PacingPlacementOverride)\s+(\w+)\s*=",
+            r"PacingMarkerForwardOrder|PacingRenderQueue|PacingLeadCoverage|PacingPlacementOverride)\s+(\w+)\s*=",
             config))
         self.assertTrue({"smoothing", "adaptive_cap", "output_rung", "stall_inject_ms",
                          "stall_inject_period_s", "gpu_present_gate_probes",
@@ -203,7 +205,6 @@ class ConfigSavePolicyTests(unittest.TestCase):
                                   "adaptive_cap_percentile", "gpu_probes", "gpu_wait_headroom_us",
                                   "gpu_wait_interleave_s", "gpu_queue_wait_render_queue",
                                   "lead_coverage", "fg_late_spacing", "gpu_paced_cadence",
-                                  "gpu_paced_hold_margin", "gpu_paced_release_smoothing",
                                   "adaptive_cap_hold_room",
                                   "placement_override", "stall_inject_ms",
                                   "stall_inject_period_s"})
@@ -222,8 +223,6 @@ class ConfigSavePolicyTests(unittest.TestCase):
                                    "lead_coverage": "lead_coverage",
                                    "fg_late_spacing": "fg_late_spacing",
                                    "gpu_paced_cadence": "gpu_paced_cadence",
-                                   "gpu_paced_hold_margin": "gpu_paced_hold_margin",
-                                   "gpu_paced_release_smoothing": "gpu_paced_release_smoothing",
                                    "adaptive_cap_hold_room": "adaptive_cap_hold_room"})
         # The OSD applies pipeline edits through the same function.
         for name, text in (("config.cpp", SOURCE), ("osd.cpp", OSD)):

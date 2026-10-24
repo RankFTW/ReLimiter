@@ -995,7 +995,8 @@ void TestGpuPacedCadence()
 // floor, the early lead is the low side of their own X (ready 5,000 µs after
 // the floor here: 5,000 − 500 µs), not of the bucket, whose samples include
 // every earlier release (3,000 µs). No frame the floor releases restarts the
-// cadence, however far its floor lies past S.
+// cadence, however far its floor lies past S. The early lead never exceeds
+// the frame's lead L.
 void TestGpuPacedRing()
 {
     std::printf("Test: the GPU-paced target follows the X of frames the floor released\n");
@@ -1036,6 +1037,26 @@ void TestGpuPacedRing()
         finish(frame, 5'000.0);
         last = frame;
     }
+
+    // E above L: a restart leaves the bucket cold at its old median (3,010 +
+    // 500 µs) while the ring keeps 4,500 µs. The earliest target is the
+    // release + L, never past it, so S = T − L stays at the release.
+    for (int i = 0; i < 40; ++i) {
+        last = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
+        finish(last, 3'000.0);
+    }
+    g_stage.RestartLead(PacingRung::GpuQueueWait);
+    const int64_t floor = last.plan.output_target_qpc + Ticks(kIntervalUs) -
+        Ticks(last.plan.lead_us) + Ticks(6'000.0);
+    SourceStageRequest request = Request(Key(frame_id++), held);
+    request.gpu_paced_cadence = true;
+    request.gpu_floor_qpc = floor;
+    request.earliest_release_qpc = floor;
+    const SourceStageFrame clamped = g_stage.RunPlannedFrame(request, &clock);
+    CHECK(clamped.planned && clamped.gpu_paced && clamped.release_qpc == floor);
+    CHECK(clamped.plan.lead_us > 3'509.0 && clamped.plan.lead_us < 3'511.0);
+    const double clamped_us = static_cast<double>(clamped.plan.output_target_qpc - floor) / 10.0;
+    CHECK(clamped_us > 3'509.0 && clamped_us < 3'511.0);
 }
 
 // Developer A/B gpu_paced_cadence: the GPU-paced rhythm (source_stage.h).
@@ -1053,12 +1074,6 @@ void TestGpuPacedRhythm()
     ResetStage();
     ScriptedClock clock;
     const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
-    // GPU periods of 17,000 µs (median bin 17,010), 250 µs idle before each.
-    for (uint64_t index = 0; index < 40; ++index) {
-        const int64_t end = kStart + Ticks(17'000.0 * static_cast<double>(index));
-        g_stage.OnGpuRenderEnd(1, 3000 + index, end - Ticks(17'000.0 - 250.0), end, 14'000.0);
-    }
-    CHECK(g_stage.Lead().RecentGpuPeriodUs() == 17'000.0);
     uint64_t frame_id = 4000;
     SourceStageFrame last{};
     const auto finish = [&](const SourceStageFrame& frame, double x_us) {
@@ -1071,11 +1086,16 @@ void TestGpuPacedRhythm()
         g_stage.DrainStageEvents();
         clock.now = done;
     };
-    // Warm lead: ready 3,000 µs after each release (early side 2,510 µs).
+    // Warm lead: ready 3,000 µs after each release (early side 2,510 µs). The
+    // frames are not held, so their reports give GPU periods: 17,000 µs
+    // (median bin 17,010), 250 µs idle before each.
     for (int i = 0; i < 40; ++i) {
         last = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
         finish(last, 3'000.0);
+        const int64_t end = kStart + Ticks(17'000.0 * static_cast<double>(i));
+        g_stage.OnGpuRenderEnd(1, frame_id - 1, end - Ticks(17'000.0 - 250.0), end, 14'000.0);
     }
+    CHECK(g_stage.Lead().RecentGpuPeriodUs() == 17'000.0);
     const auto run = [&](int64_t floor, const GpuPacedRhythmRelease& rhythm) {
         SourceStageRequest request = Request(Key(frame_id++), held);
         request.gpu_paced_cadence = true;
@@ -1136,124 +1156,6 @@ void TestGpuPacedRhythm()
     CHECK(g_stage.GpuPacedRhythm(Key(frame_id), floor2 + Ticks(17'000.0)).step == GpuPacedRhythmStep::Start);
 }
 
-// Developer A/B gpu_paced_release_smoothing (source_stage.h). The rhythm's
-// release intervals of consecutive paced frames fill the smoothing's window,
-// which is cold until 32. Warm and on: a floor that moves later releases the
-// frame at the previous release plus the mean interval, pulled a quarter of
-// the way to the rhythm's release (earlier than it); a floor that moves
-// earlier releases at the rhythm's release at once; never earlier than the
-// floor minus P, so below the rhythm's own floor − P/2 after a large step.
-// The rhythm continues from the release it made, not the smoothed one. Off,
-// the release is the rhythm's.
-void TestGpuPacedReleaseSmoothing()
-{
-    std::printf("Test: release smoothing keeps the rhythm through a later GPU floor, never later than the rhythm\n");
-    ResetStage();
-    ScriptedClock clock;
-    const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
-    // GPU periods of 17,000 µs (median bin 17,010), 250 µs idle before each.
-    for (uint64_t index = 0; index < 40; ++index) {
-        const int64_t end = kStart + Ticks(17'000.0 * static_cast<double>(index));
-        g_stage.OnGpuRenderEnd(1, 3000 + index, end - Ticks(17'000.0 - 250.0), end, 14'000.0);
-    }
-    uint64_t frame_id = 4000;
-    SourceStageFrame last{};
-    const auto finish = [&](const SourceStageFrame& frame, double x_us) {
-        const int64_t done = frame.release_qpc + Ticks(x_us);
-        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::PresentCall,
-            frame.release_qpc + Ticks(1'000.0))));
-        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady, done)));
-        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease, done,
-            PacingPlanStatus::Late)));
-        g_stage.DrainStageEvents();
-        clock.now = done;
-    };
-    for (int i = 0; i < 40; ++i) {
-        last = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
-        finish(last, 3'000.0);
-    }
-    const auto run = [&](int64_t floor, const GpuPacedRhythmRelease& rhythm) {
-        SourceStageRequest request = Request(Key(frame_id++), held);
-        request.gpu_paced_cadence = true;
-        request.gpu_floor_qpc = floor;
-        request.earliest_release_qpc = rhythm.release_qpc;
-        request.gpu_paced_rhythm = rhythm.step;
-        request.gpu_paced_rhythm_qpc = rhythm.rhythm_qpc;
-        return g_stage.RunPlannedFrame(request, &clock);
-    };
-
-    // Paced frames 17,000 µs apart, each at its floor: the window stays cold
-    // (the smoothing leaves the rhythm's release) until 32 intervals.
-    int64_t floor = last.plan.output_target_qpc + Ticks(kIntervalUs) - Ticks(last.plan.lead_us) +
-        Ticks(6'000.0);
-    for (size_t i = 0; i <= LEAD_WARM_SAMPLES; ++i) {
-        const GpuPacedRhythmRelease rhythm = g_stage.GpuPacedRhythm(Key(frame_id), floor, true);
-        CHECK(rhythm.release_qpc == floor && rhythm.rhythm_qpc == floor);
-        last = run(floor, rhythm);
-        CHECK(last.gpu_paced && last.release_qpc == floor);
-        finish(last, 5'000.0);
-        floor = last.release_qpc + Ticks(17'000.0);
-    }
-    CHECK(g_stage.SmoothingIntervalCount() == LEAD_WARM_SAMPLES && g_stage.SmoothingPeriodUs() == 17'000.0);
-
-    // The floor moves 6 ms later. The rhythm: candidate + 1,500 µs (Smooth).
-    const int64_t candidate = last.release_qpc + Ticks(17'000.0);
-    const PacingPlanKey next = Key(frame_id);
-    const int64_t later_floor = candidate + Ticks(6'000.0);
-    const GpuPacedRhythmRelease plain = g_stage.GpuPacedRhythm(next, later_floor);
-    CHECK(plain.step == GpuPacedRhythmStep::Smooth && plain.release_qpc == candidate + Ticks(1'500.0) &&
-        plain.rhythm_qpc == plain.release_qpc);
-    // Smoothed: release + 17,000 µs, a quarter of the way to the rhythm's.
-    const GpuPacedRhythmRelease smoothed = g_stage.GpuPacedRhythm(next, later_floor, true);
-    CHECK(smoothed.step == GpuPacedRhythmStep::Smooth && smoothed.rhythm_qpc == candidate + Ticks(1'500.0) &&
-        smoothed.release_qpc == candidate + Ticks(375.0));
-    // A floor that moves earlier: the rhythm's release, the floor.
-    const GpuPacedRhythmRelease earlier = g_stage.GpuPacedRhythm(next, candidate - Ticks(2'000.0), true);
-    CHECK(earlier.step == GpuPacedRhythmStep::Late && earlier.release_qpc == candidate - Ticks(2'000.0) &&
-        earlier.rhythm_qpc == earlier.release_qpc);
-
-    // Released at the smoothed release, 1,125 µs before the rhythm's.
-    const SourceStageStatistics before = g_stage.Statistics();
-    const SourceStageFrame slipped = run(later_floor, smoothed);
-    CHECK(slipped.gpu_paced && slipped.release_qpc == candidate + Ticks(375.0));
-    CHECK(g_stage.Statistics().gpu_paced_smoothed == before.gpu_paced_smoothed + 1);
-    CHECK(std::fabs(g_stage.Statistics().gpu_paced_smoothed_us - before.gpu_paced_smoothed_us - 1'125.0) < 0.5);
-    finish(slipped, 5'000.0);
-
-    // The rhythm continues from its own release (candidate + 1,500 µs): a
-    // floor 1 ms past its next candidate pulls it 250 µs.
-    const int64_t rhythm_previous = candidate + Ticks(1'500.0);
-    const int64_t floor2 = rhythm_previous + Ticks(18'000.0);
-    const GpuPacedRhythmRelease rhythm2 = g_stage.GpuPacedRhythm(Key(frame_id), floor2, true);
-    CHECK(rhythm2.step == GpuPacedRhythmStep::Smooth && rhythm2.rhythm_qpc == rhythm_previous + Ticks(17'250.0));
-    // The smoothing continues from the actual release with the window's mean
-    // ((32 × 17,000 + 18,500) / 33 µs) and is still earlier than the rhythm.
-    const int64_t smoothed_candidate = slipped.release_qpc + Ticks((32.0 * 17'000.0 + 18'500.0) / 33.0);
-    const int64_t expected = smoothed_candidate + static_cast<int64_t>(std::llround(
-        0.25 * static_cast<double>(rhythm2.rhythm_qpc - smoothed_candidate)));
-    CHECK(std::llabs(rhythm2.release_qpc - expected) <= 1 && rhythm2.release_qpc < rhythm2.rhythm_qpc);
-    // A floor 14 ms later: the rhythm stops at floor − 17,010 / 2 µs; the
-    // smoothing goes below that, above floor − 17,010 µs.
-    const int64_t mid_floor = rhythm_previous + Ticks(31'000.0);
-    const GpuPacedRhythmRelease deep = g_stage.GpuPacedRhythm(Key(frame_id), mid_floor, true);
-    const int64_t deep_expected = smoothed_candidate + static_cast<int64_t>(std::llround(
-        0.25 * static_cast<double>(deep.rhythm_qpc - smoothed_candidate)));
-    CHECK(deep.step == GpuPacedRhythmStep::EarlyBound && deep.rhythm_qpc == mid_floor - Ticks(8'505.0));
-    CHECK(std::llabs(deep.release_qpc - deep_expected) <= 1 && deep.release_qpc < mid_floor - Ticks(8'505.0) &&
-        deep.release_qpc > mid_floor - Ticks(17'010.0));
-    // A floor 20 ms later: never earlier than the floor minus 17,010 µs.
-    const int64_t far_floor = rhythm_previous + Ticks(37'000.0);
-    const GpuPacedRhythmRelease bounded = g_stage.GpuPacedRhythm(Key(frame_id), far_floor, true);
-    CHECK(bounded.step == GpuPacedRhythmStep::EarlyBound && bounded.rhythm_qpc == far_floor - Ticks(8'505.0) &&
-        bounded.release_qpc == far_floor - Ticks(17'010.0));
-    // Off, the rhythm's own bound.
-    CHECK(g_stage.GpuPacedRhythm(Key(frame_id), far_floor).release_qpc == far_floor - Ticks(8'505.0));
-    // Without a consecutive paced frame the rhythm restarts at the floor.
-    const GpuPacedRhythmRelease restart = g_stage.GpuPacedRhythm(Key(frame_id + 1), floor2, true);
-    CHECK(restart.step == GpuPacedRhythmStep::Start && restart.release_qpc == floor2 &&
-        restart.rhythm_qpc == floor2);
-}
-
 int main()
 {
     std::printf("=== Source stage tests ===\n");
@@ -1278,7 +1180,6 @@ int main()
     TestGpuPacedCadence();
     TestGpuPacedRing();
     TestGpuPacedRhythm();
-    TestGpuPacedReleaseSmoothing();
     TestResetClearsPlans();
     std::printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

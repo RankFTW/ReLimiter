@@ -2364,12 +2364,13 @@ void TestHandoffStreams()
 }
 
 // The GPU floor of frame n: Ĝ(n − 1) − (P/2 + F + σ). P: the median GPU
-// period of consecutive frames the GPU did not wait for; F: the median
-// first-submission delay of streaming pairs; σ: the median release →
-// RENDERSUBMIT_START of frames not held. Ĝ: the newest GPU end extrapolated
-// by P, at least a newer frame's PRESENT_END plus the 5th percentile of the
-// reports' PRESENT_END → GPU end gaps. It applies within the horizon, for the
-// GPU end's producer epoch and NvAPI frames, once the windows are warm.
+// period of consecutive frames the GPU did not wait for and whose pace it
+// set; F: the median first-submission delay of streaming pairs; σ: the
+// median release → RENDERSUBMIT_START of frames not held. Ĝ: the newest GPU
+// end extrapolated by P, at least a newer frame's PRESENT_END plus the 5th
+// percentile of the reports' PRESENT_END → GPU end gaps. It applies within
+// the horizon, for the GPU end's producer epoch and NvAPI frames, once the
+// windows are warm.
 void TestRenderHandoffGpuFloor()
 {
     constexpr uint32_t kEpoch = 7;
@@ -2383,9 +2384,28 @@ void TestRenderHandoffGpuFloor()
         return key;
     };
     const auto gpu_end_us = [&](uint64_t frame_id) { return 100000.0 + kGpuPeriod * static_cast<double>(frame_id - 2000); };
+    // A pending frame not held (source only): the GPU set its pace.
+    const auto not_held = [&](LeadController* controller, uint64_t frame_id) {
+        LeadFrameStart start{};
+        start.key = key_of(frame_id);
+        start.grid_index = frame_id - 1900;
+        start.rung = PacingRung::SourceOnly;
+        start.fg_divisor = 1.0;
+        start.interval_us = kInterval;
+        start.source_release_qpc = Qpc(gpu_end_us(frame_id) - 30000.0);
+        controller->OnSourceRelease(start);
+        PacingStageEvent release{};
+        release.key = start.key;
+        release.grid_index = start.grid_index;
+        release.kind = Kind::OutputRelease;
+        release.qpc = Qpc(gpu_end_us(frame_id) - 29000.0);
+        release.status = PacingPlanStatus::SourceOnly;
+        controller->OnStageEvent(release);
+    };
     // GPU ends whose frames the GPU did not wait for (250 µs idle), gap 14,000 µs.
     const auto feed_gpu = [&](LeadController* controller, uint64_t first, uint64_t last) {
         for (uint64_t frame_id = first; frame_id <= last; ++frame_id) {
+            not_held(controller, frame_id);
             controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us(frame_id) - kGpuPeriod + 250.0),
                 Qpc(gpu_end_us(frame_id)), 14000.0);
         }
@@ -2433,6 +2453,7 @@ void TestRenderHandoffGpuFloor()
     CHECK(controller->GpuFloor(key_of(2035), 2035, Qpc(usual_present_end_us + 9000.0)).floor_qpc == reported);
 
     // A GPU frame the GPU waited 2 ms for adds no period: the median stays.
+    not_held(controller.get(), 2033);
     controller->OnGpuRenderEnd(kEpoch, 2033, Qpc(gpu_end_us(2032) + 2000.0),
         Qpc(gpu_end_us(2032) + 2000.0 + 30000.0), 14000.0);
     CHECK(controller->GpuFloor(key_of(2035)).floor_qpc == Qpc(gpu_end_us(2032) + 32000.0 + 17010.0 - 14345.0));
@@ -2464,6 +2485,7 @@ void TestRenderHandoffGpuFloor()
     // period and no floor.
     auto waiting = MakeController();
     for (uint64_t frame_id = 2000; frame_id <= 2040; ++frame_id) {
+        not_held(waiting.get(), frame_id);
         waiting->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us(frame_id) - kGpuPeriod + 2000.0),
             Qpc(gpu_end_us(frame_id)), 14000.0);
     }
@@ -2481,9 +2503,10 @@ void TestRenderHandoffGpuFloor()
 // from a newer frame. Gaps come from every frame: the GPU waits report a
 // queued wait as held even when the GPU reached it after the release, as
 // nearly every GPU-paced frame does. Off without the switch, before 32 gaps,
-// for an older frame or another producer epoch. The rhythm's period is the
-// mean of the newest five GPU periods of frames the GPU did not wait for;
-// the floor keeps the median.
+// for an older frame or another producer epoch, and withheld when the GPU
+// waited at that frame's Signal. The rhythm's period is the mean of the
+// newest five GPU periods of frames the GPU did not wait for; the floor
+// keeps the median.
 void TestGpuFloorReadyAnchor()
 {
     constexpr uint32_t kEpoch = 7;
@@ -2544,8 +2567,16 @@ void TestGpuFloorReadyAnchor()
         controller->OnStageEvent(Event(index, Kind::RenderSubmitStart, source_us + 5000.0));
     }
     for (uint64_t index = 0; index < 32; ++index) controller->OnReportPair(kEpoch, 500 + index, StreamingPair());
-    // Periods warm from 40 reports without readiness.
+    // Periods warm from 40 reports of frames not held, without readiness.
+    const auto not_held = [&](uint64_t frame_id) {
+        LeadFrameStart start = start_of(frame_id, frame_id - 2900);
+        start.rung = PacingRung::SourceOnly;
+        controller->OnSourceRelease(start);
+        controller->OnStageEvent(event_of(frame_id, frame_id - 2900, Kind::OutputRelease,
+            gpu_end_us(frame_id) - 29000.0, PacingPlanStatus::SourceOnly));
+    };
     for (uint64_t frame_id = 2960; frame_id < 3000; ++frame_id) {
+        not_held(frame_id);
         controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us(frame_id) - kGpuPeriod + 250.0),
             Qpc(gpu_end_us(frame_id)), 14000.0);
     }
@@ -2567,14 +2598,17 @@ void TestGpuFloorReadyAnchor()
     CHECK(controller->GpuFloor(key_of(3043)).floor_qpc == Qpc(gpu_end_us(3040) + 2.0 * 17010.0 - 14345.0));
     // A PRESENT_END of a frame not newer than the anchor is no bound, however late.
     CHECK(controller->GpuFloor(key_of(3043), 3041, Qpc(gpu_end_us(3041)), true).floor_qpc == anchored.floor_qpc);
-    // A held frame anchors at its release when that is later than its readiness.
+    // A held frame whose GPU waited at its Signal (ready 900 µs before the
+    // release): its timing is ReLimiter's, so no floor, and no older anchor
+    // stands in for it.
     const uint64_t held_grid = 3042 - 2900;
     controller->OnSourceRelease(start_of(3042, held_grid));
     controller->OnStageEvent(event_of(3042, held_grid, Kind::GpuReady, gpu_end_us(3042) - kReadyGap));
     controller->OnStageEvent(event_of(3042, held_grid, Kind::OutputRelease, gpu_end_us(3042) - kReadyGap + 900.0,
         PacingPlanStatus::Held));
     const GpuFloorEstimate held = controller->GpuFloor(key_of(3043), 0, 0, true);
-    CHECK(held.floor_qpc == Qpc(gpu_end_us(3042) + 900.0 - 14345.0) && held.frames_ahead == 0);
+    CHECK(held.floor_qpc == 0 && held.withheld && held.anchor == GpuFloorAnchor::None);
+    CHECK(controller->GpuFloor(key_of(3043)).withheld);
     // Not for another producer epoch.
     CHECK(controller->GpuFloor(key_of(3043, kEpoch + 1), 0, 0, true).floor_qpc == 0);
 
@@ -2582,6 +2616,7 @@ void TestGpuFloorReadyAnchor()
     CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
     CHECK_NEAR(controller->RecentGpuPeriodUs(), 17000.0);
     for (uint64_t frame_id = 3043; frame_id <= 3047; ++frame_id) {
+        not_held(frame_id);
         controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us(3042) + 18000.0 * static_cast<double>(frame_id - 3043) + 250.0),
             Qpc(gpu_end_us(3042) + 18000.0 * static_cast<double>(frame_id - 3042)), 14000.0);
     }
@@ -2589,6 +2624,7 @@ void TestGpuFloorReadyAnchor()
     CHECK_NEAR(controller->RecentGpuPeriodUs(), (17000.0 + 4.0 * 18000.0) / 5.0);
     CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
     // A frame the GPU waited 2 ms for adds no period.
+    not_held(3048);
     controller->OnGpuRenderEnd(kEpoch, 3048, Qpc(gpu_end_us(3042) + 5.0 * 18000.0 + 2000.0),
         Qpc(gpu_end_us(3042) + 6.0 * 18000.0 + 2000.0), 14000.0);
     CHECK_NEAR(controller->RecentGpuPeriodUs(), (17000.0 + 4.0 * 18000.0) / 5.0);
@@ -2598,11 +2634,149 @@ void TestGpuFloorReadyAnchor()
     CHECK_NEAR(cold->GpuPeriodUs(), 0.0);
 }
 
-// Developer A/B gpu_paced_hold_margin: the GPU need window. D = readiness of
-// frame n − the anchor of frame n − 1 (its readiness, or for a held frame the
-// later of readiness and release), for consecutive frames of one producer
-// epoch only, 0 < D <= 3 I; the newest 128 values, one FG divisor slot at a
-// time; the lower-index quantile sorted[floor(q (n − 1))] from 32 values.
+// The floor applies only while the GPU set the newest known frame's pace
+// (lead_controller.h): a frame that reached the wait after its Signal or had
+// no hold. A frame whose GPU waited at its Signal (the probe's pre-wait time,
+// else readiness, at or before it) or whose evidence is missing withholds the
+// floor, adds no period with either neighbour and no PRESENT_END gap: its GPU
+// end follows ReLimiter's Signal. Without this, held frames ending on a
+// stretched cadence set P to that cadence and the floor followed it (Rogue
+// Core with Adaptive cap: P 11.77 ms against 7.4 ms of GPU work).
+void TestGpuFloorGpuSetPace()
+{
+    constexpr uint32_t kEpoch = 7;
+    constexpr double kGpuPeriod = 17000.0;  // bin center 17,010 µs
+    constexpr double kStart = 17010.0 / 2.0 + 830.0 + 5010.0; // P/2 + F + σ = 14,345
+    const auto key_of = [](uint64_t frame_id) {
+        PacingPlanKey key{};
+        key.identity_domain = PacingIdentityDomain::NvApiFrame;
+        key.producer_epoch = 7;
+        key.controller_generation = 1;
+        key.frame_id = frame_id;
+        return key;
+    };
+    auto controller = MakeController();
+    // σ 5,010 and F 830 as in TestRenderHandoffGpuFloor.
+    for (uint64_t index = 1; index <= 32; ++index) {
+        const double source_us = static_cast<double>(index) * kInterval;
+        controller->OnSourceRelease(Start(index, PacingRung::SourceOnly, source_us));
+        controller->OnStageEvent(Event(index, Kind::RenderSubmitStart, source_us + 5000.0));
+    }
+    for (uint64_t index = 0; index < 32; ++index) controller->OnReportPair(kEpoch, 500 + index, StreamingPair());
+
+    std::vector<double> ends(3000, 0.0);
+    double gpu_end_us = 1'000'000.0;
+    const auto send = [&](uint64_t frame_id, Kind kind, double at_us, PacingPlanStatus status, double wait_us = 0.0) {
+        PacingStageEvent event{};
+        event.key = key_of(frame_id);
+        event.grid_index = frame_id - 1900;
+        event.kind = kind;
+        event.qpc = Qpc(at_us);
+        event.status = kind == Kind::OutputRelease ? status : PacingPlanStatus::Unknown;
+        if (wait_us > 0.0) event.gpu_wait_qpc = Qpc(wait_us);
+        controller->OnStageEvent(event);
+    };
+    // Frame frame_id ends period_us after the previous GPU end, its first
+    // work 250 µs after it. Its Signal is 3,000 µs before its GPU end; a held
+    // frame's readiness is ready_after_signal_us after it (≤ 0: the GPU
+    // waited at the Signal); NaN sends no readiness; wait_after_signal_us
+    // adds a probe. pending false: a report without a pending frame.
+    const auto frame = [&](uint64_t frame_id, PacingPlanStatus status, double ready_after_signal_us, double period_us,
+        double present_gap_us = 14000.0, bool pending = true, double wait_after_signal_us = kNaN) {
+        const double end_us = gpu_end_us + period_us;
+        const double signal_us = end_us - 3000.0;
+        if (pending) {
+            LeadFrameStart start{};
+            start.key = key_of(frame_id);
+            start.grid_index = frame_id - 1900;
+            start.rung = status == PacingPlanStatus::SourceOnly ? PacingRung::SourceOnly : PacingRung::FgInputWait;
+            start.fg_divisor = 1.0;
+            start.interval_us = kGpuPeriod;
+            start.source_release_qpc = Qpc(end_us - 30000.0);
+            controller->OnSourceRelease(start);
+            if (std::isfinite(ready_after_signal_us)) {
+                send(frame_id, Kind::GpuReady, signal_us + ready_after_signal_us, status);
+            }
+            if (std::isfinite(wait_after_signal_us)) {
+                send(frame_id, Kind::GpuResume, signal_us + 200.0, status, signal_us + wait_after_signal_us);
+            }
+            send(frame_id, Kind::OutputRelease, signal_us, status);
+        }
+        controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us + 250.0), Qpc(end_us), present_gap_us);
+        gpu_end_us = end_us;
+        ends[frame_id - 2000] = end_us;
+    };
+    const auto floor_after = [&](uint64_t reported) {
+        return Qpc(ends[reported - 2000] + 17010.0 - kStart);
+    };
+
+    // 33 frames not held: 32 periods of 17,000.
+    for (uint64_t frame_id = 2000; frame_id <= 2032; ++frame_id) {
+        frame(frame_id, PacingPlanStatus::SourceOnly, kNaN, kGpuPeriod);
+    }
+    CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
+    CHECK_NEAR(controller->RecentGpuPeriodUs(), 17000.0);
+    GpuFloorEstimate estimate = controller->GpuFloor(key_of(2034));
+    CHECK(estimate.floor_qpc == floor_after(2032) && !estimate.withheld);
+
+    // Held, the GPU waited 500 µs at the Signal, on a 30,000 µs cadence:
+    // no period, no gap, no floor.
+    frame(2033, PacingPlanStatus::Held, -500.0, 30000.0, 5000.0);
+    CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
+    CHECK_NEAR(controller->RecentGpuPeriodUs(), 17000.0);
+    estimate = controller->GpuFloor(key_of(2034));
+    CHECK(estimate.floor_qpc == 0 && estimate.withheld && estimate.anchor == GpuFloorAnchor::None);
+
+    // Held but reached the wait 800 µs after the Signal: the GPU set it. The
+    // pair with the held frame adds no period; the floor applies again.
+    frame(2034, PacingPlanStatus::Held, 800.0, 25000.0);
+    CHECK_NEAR(controller->RecentGpuPeriodUs(), 17000.0);
+    estimate = controller->GpuFloor(key_of(2035));
+    CHECK(estimate.floor_qpc == Qpc(ends[34] - kStart) && estimate.anchor == GpuFloorAnchor::Report);
+    // Two frames the GPU set: one period.
+    frame(2035, PacingPlanStatus::Held, 800.0, 18000.0);
+    CHECK_NEAR(controller->RecentGpuPeriodUs(), (4.0 * 17000.0 + 18000.0) / 5.0);
+
+    // The probe decides over readiness: ready after the Signal, but the GPU
+    // reached the Wait 100 µs before it.
+    frame(2036, PacingPlanStatus::Held, 800.0, kGpuPeriod, 5000.0, true, -100.0);
+    CHECK(controller->GpuFloor(key_of(2037)).withheld);
+    // Ready exactly at the Signal counts as waited.
+    frame(2037, PacingPlanStatus::Held, 0.0, kGpuPeriod, 5000.0);
+    CHECK(controller->GpuFloor(key_of(2038)).withheld);
+    // Missing evidence: a held frame without readiness, a report without a
+    // pending frame.
+    frame(2038, PacingPlanStatus::Held, kNaN, kGpuPeriod, 5000.0);
+    CHECK(controller->GpuFloor(key_of(2039)).withheld);
+    frame(2039, PacingPlanStatus::Held, 800.0, kGpuPeriod, 5000.0, false);
+    CHECK(controller->GpuFloor(key_of(2040)).withheld);
+    // An output not held (late) needs no readiness: the GPU set it.
+    frame(2040, PacingPlanStatus::Late, kNaN, kGpuPeriod);
+    estimate = controller->GpuFloor(key_of(2041));
+    CHECK(estimate.floor_qpc == Qpc(ends[40] - kStart) && !estimate.withheld);
+
+    // The held frames' 5,000 µs PRESENT_END gaps (4 of 41) stayed out of the
+    // window: its 5th percentile is still 14,010, so a PRESENT_END(2041)
+    // 5,000 µs after G(2040) bounds Ĝ(2041) at 19,010 after it.
+    const GpuFloorEstimate bounded = controller->GpuFloor(key_of(2042), 2041, Qpc(ends[40] + 5000.0));
+    CHECK(bounded.anchor == GpuFloorAnchor::PresentEnd &&
+        bounded.floor_qpc == Qpc(ends[40] + 5000.0 + 14010.0 - kStart));
+
+    // Every frame held on a stretched cadence (25,000 µs, GPU work 17,000):
+    // the period stays the GPU's and no frame gets a floor.
+    for (uint64_t frame_id = 2041; frame_id <= 2100; ++frame_id) {
+        frame(frame_id, PacingPlanStatus::Held, -300.0, 25000.0, 5000.0);
+        CHECK(controller->GpuFloor(key_of(frame_id + 1)).withheld);
+    }
+    CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
+}
+
+// The FG input wait's hold room: the GPU need window. D = readiness of frame
+// n − the anchor of frame n − 1 (its readiness, or for a held frame the later
+// of readiness and release), for consecutive frames of one producer epoch
+// only, 0 < D <= 3 I; the newest 128 values, one FG divisor slot at a time,
+// queried for that slot; the lower-index quantile sorted[floor(q (n − 1))]
+// from 32 values.
 void TestGpuNeedWindow()
 {
     constexpr double kFrameInterval = 17000.0;
@@ -2648,7 +2822,7 @@ void TestGpuNeedWindow()
     // Cold below 32, then the Q75 and Q90 of the spread.
     auto controller = MakeController();
     CHECK(controller->GpuNeedCount() == 0);
-    CHECK_NEAR(controller->GpuNeedQuantileUs(0.75), 0.0);
+    CHECK_NEAR(controller->GpuNeedQuantileUs(0.75, 2.0), 0.0);
     double ready_us = 1'000'000.0;
     uint64_t frame_id = 5000;
     frame(controller.get(), frame_id++, ready_us, ready_us, kNotHeld);
@@ -2665,20 +2839,20 @@ void TestGpuNeedWindow()
         }
         if (k == 30) {
             CHECK(controller->GpuNeedCount() == 31);
-            CHECK_NEAR(controller->GpuNeedQuantileUs(0.75), 0.0);
-            CHECK_NEAR(controller->GpuNeedQuantileUs(0.90), 0.0);
+            CHECK_NEAR(controller->GpuNeedQuantileUs(0.75, 2.0), 0.0);
+            CHECK_NEAR(controller->GpuNeedQuantileUs(0.90, 2.0), 0.0);
         }
         if (k == 31) {
             CHECK(controller->GpuNeedCount() == 32);
-            CHECK_NEAR(controller->GpuNeedQuantileUs(0.75), lower_quantile(needs, 0.75));
-            CHECK_NEAR(controller->GpuNeedQuantileUs(0.90), lower_quantile(needs, 0.90));
-            CHECK_NEAR(controller->GpuNeedQuantileUs(0.0), lower_quantile(needs, 0.0));
+            CHECK_NEAR(controller->GpuNeedQuantileUs(0.75, 2.0), lower_quantile(needs, 0.75));
+            CHECK_NEAR(controller->GpuNeedQuantileUs(0.90, 2.0), lower_quantile(needs, 0.90));
+            CHECK_NEAR(controller->GpuNeedQuantileUs(0.0, 2.0), lower_quantile(needs, 0.0));
         }
     }
     // 40 values 10,000 … 13,900 in steps of 100: ranks floor(0.75 × 39) = 29 and floor(0.90 × 39) = 35.
     CHECK(controller->GpuNeedCount() == 40);
-    CHECK_NEAR(controller->GpuNeedQuantileUs(0.75), 12900.0);
-    CHECK_NEAR(controller->GpuNeedQuantileUs(0.90), 13500.0);
+    CHECK_NEAR(controller->GpuNeedQuantileUs(0.75, 2.0), 12900.0);
+    CHECK_NEAR(controller->GpuNeedQuantileUs(0.90, 2.0), 13500.0);
 
     // A frame gap adds nothing: frame n − 1 missing. The next consecutive frame does.
     ready_us += 17000.0;
@@ -2703,8 +2877,8 @@ void TestGpuNeedWindow()
         frame(held.get(), frame_id++, ready_us, ready_us + 700.0, PacingPlanStatus::Held);
     }
     CHECK(held->GpuNeedCount() == 33);
-    CHECK_NEAR(held->GpuNeedQuantileUs(0.75), 16300.0);
-    CHECK_NEAR(held->GpuNeedQuantileUs(0.90), 16300.0);
+    CHECK_NEAR(held->GpuNeedQuantileUs(0.75, 2.0), 16300.0);
+    CHECK_NEAR(held->GpuNeedQuantileUs(0.90, 2.0), 16300.0);
 
     // Values beyond the long-sample limit (3 I) are dropped, 3 I itself and
     // anything not positive (a release after the next frame's readiness) too.
@@ -2728,7 +2902,7 @@ void TestGpuNeedWindow()
     ready_us += 17000.0;
     frame(controller.get(), 100, ready_us, ready_us, kNotHeld, 2.0, 8);
     CHECK(controller->GpuNeedCount() == 0);
-    CHECK_NEAR(controller->GpuNeedQuantileUs(0.75), 0.0);
+    CHECK_NEAR(controller->GpuNeedQuantileUs(0.75, 2.0), 0.0);
     ready_us += 15000.0;
     frame(controller.get(), 101, ready_us, ready_us, kNotHeld, 2.0, 8);
     CHECK(controller->GpuNeedCount() == 1);
@@ -2744,17 +2918,20 @@ void TestGpuNeedWindow()
         frame(divisors.get(), frame_id++, ready_us, ready_us, kNotHeld);
     }
     CHECK(divisors->GpuNeedCount() == 40);
-    CHECK_NEAR(divisors->GpuNeedQuantileUs(0.75), 17000.0);
+    CHECK_NEAR(divisors->GpuNeedQuantileUs(0.75, 2.0), 17000.0);
+    // Asked for another FG divisor: 0, the window is not of its frames.
+    CHECK_NEAR(divisors->GpuNeedQuantileUs(0.75, 3.0), 0.0);
     ready_us += 12000.0;
     frame(divisors.get(), frame_id++, ready_us, ready_us, kNotHeld, 3.0);
     CHECK(divisors->GpuNeedCount() == 1);
-    CHECK_NEAR(divisors->GpuNeedQuantileUs(0.75), 0.0);
+    CHECK_NEAR(divisors->GpuNeedQuantileUs(0.75, 3.0), 0.0);
     for (int k = 0; k < 32; ++k) {
         ready_us += 12000.0;
         frame(divisors.get(), frame_id++, ready_us, ready_us, kNotHeld, 3.0);
     }
     CHECK(divisors->GpuNeedCount() == 33);
-    CHECK_NEAR(divisors->GpuNeedQuantileUs(0.75), 12000.0);
+    CHECK_NEAR(divisors->GpuNeedQuantileUs(0.75, 3.0), 12000.0);
+    CHECK_NEAR(divisors->GpuNeedQuantileUs(0.75, 2.0), 0.0);
 
     // Only the newest 128 values count: 128 of 12,000 after the 17,000 ones.
     for (int k = 0; k < 40; ++k) {
@@ -2766,12 +2943,12 @@ void TestGpuNeedWindow()
         frame(divisors.get(), frame_id++, ready_us, ready_us, kNotHeld, 3.0);
     }
     CHECK(divisors->GpuNeedCount() == 128);
-    CHECK_NEAR(divisors->GpuNeedQuantileUs(0.90), 12000.0);
+    CHECK_NEAR(divisors->GpuNeedQuantileUs(0.90, 3.0), 12000.0);
 
     // Clears with the readiness gaps: a bucket reset and a full reset.
     divisors->ResetBuckets();
     CHECK(divisors->GpuNeedCount() == 0);
-    CHECK_NEAR(divisors->GpuNeedQuantileUs(0.75), 0.0);
+    CHECK_NEAR(divisors->GpuNeedQuantileUs(0.75, 3.0), 0.0);
     controller->Reset(kFrequency);
     CHECK(controller->GpuNeedCount() == 0);
 }
@@ -2829,6 +3006,7 @@ int main()
     TestHandoffStreams();
     TestRenderHandoffGpuFloor();
     TestGpuFloorReadyAnchor();
+    TestGpuFloorGpuSetPace();
     TestGpuNeedWindow();
 
     if (s_failures != 0) {

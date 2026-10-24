@@ -193,11 +193,13 @@ struct GovernorFrame {
     // (LeadStatistics::draining_late_samples).
     uint32_t outputs = 0;
     uint32_t late_outputs = 0;
-    // Hold room (Auto GPU queue wait, LeadController::HoldRoomUs): the
-    // interval at which the Adaptive cap percentile of recent judged frames
-    // is held at least the minimum hold before its guarded release; 0 = none. A floor of
-    // the realized interval while it is within GOVERNOR_MAX_STRETCH, on VRR
-    // without LFC and on unsnapped fixed refresh.
+    // Hold room (Auto, scheduler UpdatePeriodGovernor): for the GPU queue
+    // wait (LeadController::HoldRoomUs) the interval at which the Adaptive
+    // cap percentile of recent judged frames is held at least the minimum
+    // hold before its guarded release; with gpu_paced_cadence, for the FG
+    // input wait (GpuNeedQuantileUs) that percentile of the GPU need D;
+    // 0 = none. A floor of the realized interval while it is within
+    // GOVERNOR_MAX_STRETCH, on VRR without LFC and on unsnapped fixed refresh.
     double room_us = 0.0;
 };
 

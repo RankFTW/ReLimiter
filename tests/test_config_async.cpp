@@ -306,8 +306,6 @@ void CheckPipelineMatchesConfig() {
     CHECK(pipeline.lead_coverage == g_config.lead_coverage);
     CHECK(pipeline.fg_late_spacing == g_config.fg_late_spacing);
     CHECK(pipeline.gpu_paced_cadence == g_config.gpu_paced_cadence);
-    CHECK(pipeline.gpu_paced_hold_margin == g_config.gpu_paced_hold_margin);
-    CHECK(pipeline.gpu_paced_release_smoothing == g_config.gpu_paced_release_smoothing);
     CHECK(pipeline.adaptive_cap_hold_room == g_config.adaptive_cap_hold_room);
     CHECK(g_marker_forward_after_wait.load() ==
         (g_config.marker_forward_order == PacingMarkerForwardOrder::AfterWait));
@@ -327,8 +325,6 @@ void TestPacingPipelineDefaults() {
     CHECK(g_config.lead_coverage == PacingLeadCoverage::Q99);
     CHECK(g_config.fg_late_spacing);
     CHECK(!g_config.gpu_paced_cadence);
-    CHECK(g_config.gpu_paced_hold_margin == PacingHoldMargin::Off);
-    CHECK(!g_config.gpu_paced_release_smoothing);
     CHECK(!g_config.bypass_low_latency_off && !g_bypass_low_latency_off.load());
     CHECK(g_config.adaptive_cap_hold_room);
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
@@ -339,8 +335,6 @@ void TestPacingPipelineDefaults() {
     CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "99");
     CHECK(Value(local_path, "FrameLimiter", "fg_late_spacing") == "true");
     CHECK(Value(local_path, "FrameLimiter", "gpu_paced_cadence") == "false");
-    CHECK(Value(local_path, "FrameLimiter", "gpu_paced_hold_margin") == "off");
-    CHECK(Value(local_path, "FrameLimiter", "gpu_paced_release_smoothing") == "false");
     CHECK(Value(local_path, "FrameLimiter", "bypass_low_latency_off") == "false");
     CHECK(Value(local_path, "FrameLimiter", "adaptive_cap_hold_room") == "true");
     CHECK(Value(local_path, "FrameLimiter", "source_placement") == "pre_sleep");
@@ -602,56 +596,6 @@ void TestGpuPacedCadenceKey() {
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
-// Developer A/B gpu_paced_release_smoothing: true loads, reaches the
-// pipeline, is saved, counts as a developer override and resets to false.
-void TestGpuPacedReleaseSmoothingKey() {
-    Reset(false, false, {{"config_version", "4"}, {"gpu_paced_release_smoothing", "true"}});
-    CHECK(g_config.gpu_paced_release_smoothing);
-    CheckPipelineMatchesConfig();
-    CHECK(PacingPipeline_GetConfig().gpu_paced_release_smoothing);
-    CHECK(Value(local_path, "FrameLimiter", "gpu_paced_release_smoothing") == "true");
-    CHECK(Config_DeveloperOverrides() == 1);
-    Config_ResetDeveloperSettings();
-    CHECK(!g_config.gpu_paced_release_smoothing && !PacingPipeline_GetConfig().gpu_paced_release_smoothing);
-    ReleaseStart();CHECK(OwnerShutdown());
-}
-
-// Developer A/B gpu_paced_hold_margin: 75 and 90 load, reach the pipeline
-// (the scheduler's configuration), are saved as text and count as a developer
-// override; other text loads as off; out-of-range values validate to off; a
-// reset returns to off.
-void TestGpuPacedHoldMarginKey() {
-    struct Case { const char* text; PacingHoldMargin expected; const char* saved; };
-    for (const Case& test : {Case{"75", PacingHoldMargin::Q75, "75"},
-            Case{"90", PacingHoldMargin::Q90, "90"},
-            Case{"off", PacingHoldMargin::Off, "off"},
-            Case{"95", PacingHoldMargin::Off, "off"},
-            Case{"true", PacingHoldMargin::Off, "off"},
-            Case{"", PacingHoldMargin::Off, "off"}}) {
-        Reset(false, false, {{"config_version", "4"}, {"gpu_paced_hold_margin", test.text}});
-        CHECK(g_config.gpu_paced_hold_margin == test.expected);
-        CheckPipelineMatchesConfig();
-        CHECK(PacingPipeline_GetConfig().gpu_paced_hold_margin == test.expected);
-        CHECK(Value(local_path, "FrameLimiter", "gpu_paced_hold_margin") == test.saved);
-        CHECK(Config_DeveloperOverrides() == (test.expected == PacingHoldMargin::Off ? 0 : 1));
-        Config_ResetDeveloperSettings();
-        CHECK(g_config.gpu_paced_hold_margin == PacingHoldMargin::Off);
-        CHECK(PacingPipeline_GetConfig().gpu_paced_hold_margin == PacingHoldMargin::Off);
-        ReleaseStart();CHECK(OwnerShutdown());
-    }
-    Reset();
-    g_config.gpu_paced_hold_margin = static_cast<PacingHoldMargin>(7);
-    ValidateConfig();
-    CHECK(g_config.gpu_paced_hold_margin == PacingHoldMargin::Off);
-    g_config.gpu_paced_hold_margin = PacingHoldMargin::Q90;
-    Config_ApplyPacingPipeline();
-    CHECK(PacingPipeline_GetConfig().gpu_paced_hold_margin == PacingHoldMargin::Q90);
-    RequestSaveConfig();
-    ReleaseStart();CHECK(OwnerShutdown());
-    CheckWorkerWrites();
-    CHECK(Value(local_path, "FrameLimiter", "gpu_paced_hold_margin") == "90");
-}
-
 // Developer A/B bypass_low_latency_off: true loads, reaches the NvAPI hooks'
 // atomic, is saved, counts as a developer override and resets to false.
 void TestBypassLowLatencyOffKey() {
@@ -778,7 +722,7 @@ constexpr const char* retired_keys[] = {
     "gpu_present_gate_slack_us", "gpu_present_gate_max_delay_us",
     "adaptive_deadline_reserve_mode", "smoothing_window", "smoothing_release_speed",
     "smoothing_bias_us", "smoothing_percentile", "gpu_readiness_observer", "adaptive_smoothing",
-    "dmfg_output_cap"};
+    "dmfg_output_cap", "gpu_paced_hold_margin", "gpu_paced_release_smoothing"};
 
 void TestRetiredKeysIgnoredAndDropped() {
     Reset(false, false, {{"ready_present_mode", "active"}, {"ready_present_slack_us", "2000"},
@@ -794,7 +738,8 @@ void TestRetiredKeysIgnoredAndDropped() {
         {"smoothing_window", "dual"}, {"smoothing_release_speed", "0.25"},
         {"smoothing_bias_us", "1000"}, {"smoothing_percentile", "0.5"},
         {"gpu_readiness_observer", "true"}, {"adaptive_smoothing", "true"},
-        {"dmfg_output_cap", "144"}});
+        {"dmfg_output_cap", "144"}, {"gpu_paced_hold_margin", "75"},
+        {"gpu_paced_release_smoothing", "true"}});
     // Only the migrations take effect; the pipeline otherwise matches a fresh INI.
     CHECK(g_config.adaptive_cap && g_config.output_rung == PacingRungOverride::Auto);
     CHECK(g_config.smoothing == PacingSmoothing::On && g_config.gpu_present_gate_probes);
@@ -1046,8 +991,6 @@ int main() {
     TestLeadCoverageKey();
     TestFgLateSpacingKey();
     TestGpuPacedCadenceKey();
-    TestGpuPacedHoldMarginKey();
-    TestGpuPacedReleaseSmoothingKey();
     TestAdaptiveCapHoldRoomKey();
     TestBypassLowLatencyOffKey();
     TestSourcePlacementParsing();
