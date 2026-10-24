@@ -2500,13 +2500,13 @@ void TestRenderHandoffGpuFloor()
 // Ĝ(n − 1) = its anchor (its readiness, or for a queued GPU wait the later of
 // readiness and release) + the median anchor → GPU end gap + P per frame, in
 // place of the report's extrapolation; a PRESENT_END bound then counts only
-// from a newer frame. Gaps come from every frame: the GPU waits report a
-// queued wait as held even when the GPU reached it after the release, as
-// nearly every GPU-paced frame does. Off without the switch, before 32 gaps,
-// for an older frame or another producer epoch, and withheld when the GPU
-// waited at that frame's Signal. The rhythm's period is the mean of the
-// newest five GPU periods of frames the GPU did not wait for; the floor
-// keeps the median.
+// from a newer frame. Gaps come from every frame whose pace the GPU set, held
+// or not: the GPU waits report a queued wait as held even when the GPU
+// reached it after the release, as nearly every GPU-paced frame does. Off
+// without the switch, before 32 gaps, for an older frame or another producer
+// epoch, and withheld when the GPU waited at that frame's Signal. The
+// rhythm's period is the mean of the newest five GPU periods of frames the
+// GPU did not wait for; the floor keeps the median.
 void TestGpuFloorReadyAnchor()
 {
     constexpr uint32_t kEpoch = 7;
@@ -2771,6 +2771,90 @@ void TestGpuFloorGpuSetPace()
     CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
 }
 
+// The readiness anchor on the GPU queue wait (lead_controller.h): the
+// pre-gate query runs after the game's measured GPU work, so the GPU end
+// precedes the readiness (Rogue Core: −0.21 ms on every frame of every
+// capture) and a gap that had to be positive never warmed the window. Gaps
+// are signed, within one interval either side of 0, and only frames whose
+// pace the GPU set add one: a frame whose GPU waited at the Signal anchors
+// at the release, which its measured GPU end does not follow.
+void TestGpuQueueWaitReadyGap()
+{
+    constexpr uint32_t kEpoch = 7;
+    constexpr double kGpuPeriod = 17000.0; // bin center 17,010 µs
+    constexpr double kStart = 17010.0 / 2.0 + 830.0 + 5010.0; // P/2 + F + σ = 14,345
+    const auto key_of = [](uint64_t frame_id) {
+        PacingPlanKey key{};
+        key.identity_domain = PacingIdentityDomain::NvApiFrame;
+        key.producer_epoch = 7;
+        key.controller_generation = 1;
+        key.frame_id = frame_id;
+        return key;
+    };
+    auto controller = MakeController();
+    // σ 5,010 and F 830 as in TestRenderHandoffGpuFloor.
+    for (uint64_t index = 1; index <= 32; ++index) {
+        const double source_us = static_cast<double>(index) * kInterval;
+        controller->OnSourceRelease(Start(index, PacingRung::SourceOnly, source_us));
+        controller->OnStageEvent(Event(index, Kind::RenderSubmitStart, source_us + 5000.0));
+    }
+    for (uint64_t index = 0; index < 32; ++index) controller->OnReportPair(kEpoch, 500 + index, StreamingPair());
+
+    std::vector<double> ends(200, 0.0);
+    double gpu_end_us = 1'000'000.0;
+    const auto send = [&](uint64_t frame_id, Kind kind, double at_us) {
+        PacingStageEvent event{};
+        event.key = key_of(frame_id);
+        event.grid_index = frame_id - 1900;
+        event.kind = kind;
+        event.qpc = Qpc(at_us);
+        event.status = kind == Kind::OutputRelease ? PacingPlanStatus::Held : PacingPlanStatus::Unknown;
+        controller->OnStageEvent(event);
+    };
+    // A held GPU queue wait frame ending kGpuPeriod after the previous GPU
+    // end: ready ready_us after its GPU end, its Signal signal_us after its
+    // readiness (< 0: the GPU reached the wait after the Signal).
+    const auto frame = [&](uint64_t frame_id, double ready_us, double signal_us, bool report) {
+        const double end_us = gpu_end_us + kGpuPeriod;
+        LeadFrameStart start{};
+        start.key = key_of(frame_id);
+        start.grid_index = frame_id - 1900;
+        start.rung = PacingRung::GpuQueueWait;
+        start.fg_divisor = 1.0;
+        start.interval_us = kGpuPeriod;
+        start.source_release_qpc = Qpc(end_us - 30000.0);
+        controller->OnSourceRelease(start);
+        send(frame_id, Kind::GpuReady, end_us + ready_us);
+        send(frame_id, Kind::OutputRelease, end_us + ready_us + signal_us);
+        if (report) controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us + 250.0), Qpc(end_us), 14000.0);
+        gpu_end_us = end_us;
+        ends[frame_id - 2000] = end_us;
+    };
+
+    // 33 frames ready 200 µs after their GPU end, the GPU at the wait 800 µs
+    // after the Signal: 32 periods, 33 gaps of −200 µs.
+    for (uint64_t frame_id = 2000; frame_id <= 2032; ++frame_id) frame(frame_id, 200.0, -800.0, true);
+    CHECK(controller->ReadyGapCount() == 33);
+    // Frame 2033 known before its report: Ĝ(2034) = ready(2033) − 200 + P.
+    frame(2033, 200.0, -800.0, false);
+    const GpuFloorEstimate anchored = controller->GpuFloor(key_of(2035), 0, 0, true);
+    CHECK(anchored.anchor == GpuFloorAnchor::Ready && anchored.frames_ahead == 1);
+    CHECK(anchored.floor_qpc == Qpc(ends[33] + 17010.0 - kStart));
+    controller->OnGpuRenderEnd(kEpoch, 2033, Qpc(ends[32] + 250.0), Qpc(ends[33]), 14000.0);
+    CHECK(controller->ReadyGapCount() == 34);
+
+    // The GPU waited 500 µs at the Signal: anchor at the release, gap −700
+    // µs, ReLimiter's hold: no gap.
+    frame(2034, 200.0, 500.0, true);
+    CHECK(controller->ReadyGapCount() == 34);
+    // A gap beyond one interval either side is no gap.
+    frame(2035, 17500.0, -800.0, true);
+    CHECK(controller->ReadyGapCount() == 34);
+    // A positive one within it counts (the FG input wait's side).
+    frame(2036, -1500.0, -800.0, true);
+    CHECK(controller->ReadyGapCount() == 35);
+}
+
 // The FG input wait's hold room: the GPU need window. D = readiness of frame
 // n − the anchor of frame n − 1 (its readiness, or for a held frame the later
 // of readiness and release), for consecutive frames of one producer epoch
@@ -3007,6 +3091,7 @@ int main()
     TestRenderHandoffGpuFloor();
     TestGpuFloorReadyAnchor();
     TestGpuFloorGpuSetPace();
+    TestGpuQueueWaitReadyGap();
     TestGpuNeedWindow();
 
     if (s_failures != 0) {

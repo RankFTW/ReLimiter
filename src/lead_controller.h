@@ -60,9 +60,8 @@ constexpr size_t LEAD_GPU_PACED_CAPACITY = 128;
 // LEAD_GPU_PERIOD_RECENT GPU frame periods (the driver's own Sleep weighted
 // the newest five GPU frames about equally in Gears of War: E-Day; the floor's
 // median of 256 follows load changes too slowly). The readiness anchor keeps
-// the newest LEAD_GPU_READY_GAP_CAPACITY gaps from a frame's GPU readiness
-// (its pre-hold readiness, or the hold's release when the GPU waited) to its
-// Reflex GPU end.
+// the newest LEAD_GPU_READY_GAP_CAPACITY signed gaps from the GPU readiness
+// of a frame whose pace the GPU set to its Reflex GPU end.
 constexpr size_t LEAD_GPU_PERIOD_RECENT = 5;
 constexpr size_t LEAD_GPU_READY_GAP_CAPACITY = 64;
 // Adaptive cap hold room of the FG input wait (scheduler.cpp
@@ -296,19 +295,28 @@ constexpr double LEAD_ROOM_MIN_HOLD_US = 250.0; // h
 // waits read back each frame's GPU readiness on ReLimiter's own GPU timeline
 // (the FG input prefix, or the GPU queue wait's pre-gate query), long before
 // its Reflex report arrives. Its gap to the frame's Reflex GPU end is nearly
-// constant (Gears, FG 2×: 1.53 ms, sd 0.12, frame generation included). When
-// a frame newer than the newest report has its readiness and output outcome
-// known, Ĝ(n − 1) is that frame's anchor, its readiness or, when the GPU
-// wait was queued, the later of its readiness and the release, plus the
-// median anchor → GPU end gap of the newest LEAD_GPU_READY_GAP_CAPACITY
-// frames, extrapolated by P: an estimate rather than a bound, so it replaces
-// the older report's extrapolation, and the PRESENT_END bound applies on top
-// of it only from a newer frame. Every frame adds a gap from that same
-// anchor: the GPU waits report a queued wait as held whether or not the GPU
-// reached it first (Gears, FG 2× GPU-paced: 97.5% reached it after the
-// release), so gaps of frames not held alone never warmed the window. The
-// floor itself uses the anchor only when the GPU set that frame's pace
-// (above), where the anchor is its readiness.
+// constant, and its sign depends on the wait's place in the frame: the GPU
+// end follows the readiness on the FG input wait (frame generation runs
+// after the prefix; Gears, FG 2×: +1.45 ms, p10–p90 55 µs) and precedes it
+// on the GPU queue wait when the game's measured GPU work ends before the
+// Present (Rogue Core −0.21 ms, p10–p90 42 µs; Gears without FG −0.34 ms).
+// When a frame newer than the newest report has its readiness and output
+// outcome known, Ĝ(n − 1) is that frame's anchor, its readiness or, when
+// the GPU wait was queued, the later of its readiness and the release, plus
+// the median gap of the newest LEAD_GPU_READY_GAP_CAPACITY frames,
+// extrapolated by P: an estimate rather than a bound, so it replaces the
+// older report's extrapolation, and the PRESENT_END bound applies on top of
+// it only from a newer frame. The floor uses the anchor only when the GPU
+// set that frame's pace (above), where the anchor is its readiness, so only
+// such frames add a gap, within one interval either side of 0. A frame whose
+// GPU waited at the Signal anchors at the release; on the GPU queue wait its
+// measured GPU end does not follow that release, so its gap is ReLimiter's
+// own hold (Rogue Core: −0.4 to −1.4 ms) and must stay out. The output
+// status cannot decide it: the GPU waits report every queued wait as held,
+// and frames not held alone never warmed the window (Gears, FG 2×
+// GPU-paced: 97.5% reached the wait after the release). A gap that had to
+// be positive rejected every GPU queue wait frame, so the anchor never
+// engaged there.
 //
 // GPU need (the Adaptive cap hold room of the FG input wait): the GPU time D
 // from the release of frame n − 1's output (its anchor above) to frame n's
@@ -614,8 +622,8 @@ public:
     // driver's clock (non-finite or not positive: not counted). The GPU
     // floor's anchor; consecutive frames the GPU did not wait for (start at
     // most LEAD_HANDOFF_GPU_IDLE_US after the previous end) add their interval
-    // to the period window, every frame its gap to the gap window. A new
-    // producer epoch restarts all three; older frames are ignored.
+    // to the period window, a frame whose pace the GPU set its gap to the gap
+    // window. A new producer epoch restarts all three; older frames are ignored.
     void OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, int64_t gpu_start_qpc,
         int64_t gpu_end_qpc, double present_to_gpu_end_us) noexcept;
 

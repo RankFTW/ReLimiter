@@ -772,7 +772,7 @@ void LeadController::OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, 
         if (recent_period_count_ < LEAD_GPU_PERIOD_RECENT) ++recent_period_count_;
     }
     if (gpu_set && IsPositiveFinite(present_to_gpu_end_us)) gpu_after_present_window_.Add(present_to_gpu_end_us);
-    if (frame != nullptr) RecordReadyGap(*frame, gpu_end_qpc);
+    if (gpu_set) RecordReadyGap(*frame, gpu_end_qpc);
     gpu_end_frame_ = frame_id;
     gpu_end_qpc_ = gpu_end_qpc;
     gpu_end_gpu_set_ = gpu_set;
@@ -857,13 +857,15 @@ double LeadController::GpuNeedQuantileUs(double q, double fg_divisor) const noex
     return static_cast<double>(sorted[static_cast<size_t>(rank)]);
 }
 
-// The gap of a pending NvAPI frame: its report's GPU end minus its anchor.
-// Reports arrive while the frame is pending.
+// The gap of a pending NvAPI frame whose pace the GPU set: its report's GPU
+// end minus its anchor, signed (lead_controller.h: negative on the GPU queue
+// wait when the game's GPU work ends before the Present), within one
+// interval. Reports arrive while the frame is pending.
 void LeadController::RecordReadyGap(const PendingFrame& frame, int64_t gpu_end_qpc) noexcept
 {
     if (!HasField(frame, FieldGpuReady) || !HasField(frame, FieldOutputRelease)) return;
     const double gap_us = MicrosecondsBetween(ReadyAnchorQpc(frame), gpu_end_qpc);
-    if (!(gap_us >= 0.0) || !(gap_us <= frame.interval_us)) return;
+    if (!(std::fabs(gap_us) <= frame.interval_us)) return;
     ready_gaps_us_[ready_gap_head_] = static_cast<float>(gap_us);
     ready_gap_head_ = (ready_gap_head_ + 1) % static_cast<uint32_t>(LEAD_GPU_READY_GAP_CAPACITY);
     if (ready_gap_count_ < LEAD_GPU_READY_GAP_CAPACITY) ++ready_gap_count_;
