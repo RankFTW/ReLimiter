@@ -1156,7 +1156,7 @@ void TestGpuPacedRhythm()
     CHECK(g_stage.GpuPacedRhythm(Key(frame_id), floor2 + Ticks(17'000.0)).step == GpuPacedRhythmStep::Start);
 }
 
-// The held GPU floor applies before its cap lead is warm only after a
+// The held GPU floor applies before the cap held 32 frames only after a
 // cadence restart in the producer epoch (lead_controller.h): a SourceLate
 // restart at the plan and an OutputLate restart from the stage events count;
 // a cap or FG divisor change (ResetGpuFloor) clears it.

@@ -279,8 +279,8 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     frame.planned = true;
     frame.lead_budget_limited = budget_limited;
     frame.epoch_started = grid_plan.epoch_reason;
-    // A restart is the held GPU floor's eligibility while its cap lead is
-    // cold (lead_controller.h).
+    // A restart is the held GPU floor's eligibility before the cap held
+    // LEAD_WARM_SAMPLES frames (lead_controller.h).
     if (grid_plan.epoch_reason == PacingEpochReason::SourceLate) {
         lead_.NoteCadenceRestart(request.key.producer_epoch);
     }

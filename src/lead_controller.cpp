@@ -169,7 +169,7 @@ void LeadController::Reset(int64_t qpc_frequency) noexcept
     ready_gaps_us_ = {};
     ready_gap_head_ = 0;
     ready_gap_count_ = 0;
-    cap_lead_ = {};
+    cap_held_frames_ = 0;
     restart_epoch_ = 0;
     gpu_need_ = {};
     gpu_paced_rings_ = {};
@@ -199,7 +199,7 @@ void LeadController::ResetBuckets() noexcept
     ready_gaps_us_ = {};
     ready_gap_head_ = 0;
     ready_gap_count_ = 0;
-    cap_lead_ = {};
+    cap_held_frames_ = 0;
     restart_epoch_ = 0;
     gpu_need_ = {};
     gpu_paced_rings_ = {};
@@ -221,7 +221,7 @@ void LeadController::ResetGpuFloor() noexcept
     ready_gaps_us_ = {};
     ready_gap_head_ = 0;
     ready_gap_count_ = 0;
-    cap_lead_ = {};
+    cap_held_frames_ = 0;
     restart_epoch_ = 0;
 }
 
@@ -475,12 +475,13 @@ GpuFloorEstimate LeadController::GpuFloor(const PacingPlanKey& key, uint64_t pre
         key.frame_id - 1 - gpu_end_frame_ > LEAD_HANDOFF_GPU_HORIZON_FRAMES) {
         return estimate;
     }
-    // A held frame (cap bound, above): bounded once the cap lead and the
-    // readiness gaps are warm; while the cap lead is cold, unbounded only
-    // after a cadence restart in this producer epoch.
+    // A held frame (cap bound, above): bounded once the cap held
+    // LEAD_WARM_SAMPLES frames, the readiness gaps are warm and the cap's lead
+    // is known; before those frames, unbounded only after a cadence restart in
+    // this producer epoch.
     const bool held = IsPositiveFinite(cap.interval_us);
-    const bool cap_warm = cap_lead_.count >= LEAD_WARM_SAMPLES;
-    const bool bounded = held && cap_warm && ready_gap_count_ >= LEAD_WARM_SAMPLES;
+    const bool cap_warm = cap_held_frames_ >= LEAD_WARM_SAMPLES;
+    const bool bounded = held && cap_warm && ready_gap_count_ >= LEAD_WARM_SAMPLES && IsPositiveFinite(cap.lead_us);
     if (held && !bounded && (cap_warm || !CadenceRestartSeen(key.producer_epoch))) {
         estimate.ineligible = true;
         return estimate;
@@ -517,12 +518,12 @@ GpuFloorEstimate LeadController::GpuFloor(const PacingPlanKey& key, uint64_t pre
     }
     // Ĝ(n − 1) − (P/2 + F + σ).
     estimate.floor_qpc = predicted_qpc - ticks(start_us + release_to_render_window_.Quantile(0.5));
-    // The cap bound: Ĝ(n − 1) − ḡ + I − L̄cap − slack, the cap's release of
+    // The cap bound: Ĝ(n − 1) − ḡ + I − L − slack, the cap's release of
     // frame n plus frame n − 1's predicted lateness beyond the slack.
     if (bounded) {
         const double slack_us = std::isfinite(cap.slack_us) && cap.slack_us > 0.0 ? cap.slack_us : 0.0;
         const int64_t cap_qpc = predicted_qpc -
-            ticks(ReadyGapMedianUs() + CapLeadUs() - cap.interval_us + slack_us);
+            ticks(ReadyGapMedianUs() + cap.lead_us - cap.interval_us + slack_us);
         if (cap_qpc < estimate.floor_qpc) {
             estimate.floor_qpc = cap_qpc;
             estimate.cap_bound = true;
@@ -814,7 +815,7 @@ void LeadController::OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, 
         gpu_after_present_window_.Reset();
         recent_period_head_ = 0;
         recent_period_count_ = 0;
-        cap_lead_ = {};
+        cap_held_frames_ = 0;
     }
     if (frame_id <= gpu_end_frame_) return;
     const PendingFrame* frame = FindNvApiFrame(producer_epoch, frame_id);
@@ -834,7 +835,7 @@ void LeadController::OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, 
     }
     if (gpu_set && IsPositiveFinite(present_to_gpu_end_us)) gpu_after_present_window_.Add(present_to_gpu_end_us);
     if (gpu_set) RecordReadyGap(*frame, gpu_end_qpc);
-    if (frame != nullptr) RecordCapLead(*frame);
+    if (frame != nullptr) NoteCapHeld(*frame);
     gpu_end_frame_ = frame_id;
     gpu_end_qpc_ = gpu_end_qpc;
     gpu_end_gpu_set_ = gpu_set;
@@ -936,35 +937,15 @@ double LeadController::ReadyGapMedianUs() const noexcept
     return ready_gap_count_ > 0 ? LowerMedian(ready_gaps_us_, ready_gap_count_) : 0.0;
 }
 
-// Cap lead (lead_controller.h) of a reported frame m whose GPU waited at its
-// Signal (a probe at or before it, else readiness before it) and that the
-// GPU floor did not release: anchor(m − 1) + I_m − s_m with frame m − 1
-// pending and anchored, at most the long-sample limit. Taken at the report,
-// by when the frame's probe has normally been read back.
-void LeadController::RecordCapLead(const PendingFrame& frame) noexcept
+// A reported frame the cap held (lead_controller.h): its GPU waited at its
+// Signal (a probe at or before it, else readiness before it) and the GPU
+// floor did not release it. Taken at the report, by when the frame's probe
+// has normally been read back.
+void LeadController::NoteCapHeld(const PendingFrame& frame) noexcept
 {
-    if (!frame.started || frame.gpu_floor_release || !PreviousGpuHeld(frame) ||
-        frame.key.frame_id <= 1) {
-        return;
+    if (frame.started && !frame.gpu_floor_release && PreviousGpuHeld(frame) && cap_held_frames_ < UINT32_MAX) {
+        ++cap_held_frames_;
     }
-    const PendingFrame* previous = FindNvApiFrame(frame.key.producer_epoch, frame.key.frame_id - 1);
-    if (previous == nullptr || !HasField(*previous, FieldGpuReady) || !HasField(*previous, FieldOutputRelease)) {
-        return;
-    }
-    const double lead_us = MicrosecondsBetween(frame.qpc[FieldSource], ReadyAnchorQpc(*previous)) +
-        frame.interval_us;
-    if (!(lead_us > 0.0) || !(lead_us <= LEAD_LONG_SAMPLE_INTERVALS * frame.interval_us)) return;
-    const size_t divisor = frame.bucket % LEAD_DIVISOR_BUCKETS;
-    if (cap_lead_.count > 0 && cap_lead_.divisor != divisor) cap_lead_ = {};
-    cap_lead_.divisor = divisor;
-    cap_lead_.us[cap_lead_.head] = static_cast<float>(lead_us);
-    cap_lead_.head = (cap_lead_.head + 1) % static_cast<uint32_t>(LEAD_CAP_LEAD_CAPACITY);
-    if (cap_lead_.count < LEAD_CAP_LEAD_CAPACITY) ++cap_lead_.count;
-}
-
-double LeadController::CapLeadUs() const noexcept
-{
-    return cap_lead_.count >= LEAD_WARM_SAMPLES ? LowerMedian(cap_lead_.us, cap_lead_.count) : 0.0;
 }
 
 // σ: release → RENDERSUBMIT_START of a frame not held, once both are known.

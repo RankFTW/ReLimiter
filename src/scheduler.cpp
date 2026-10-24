@@ -516,10 +516,11 @@ std::atomic<uint32_t> s_handoff_hook_stream{0};
 std::atomic<uint32_t> s_handoff_hook_stalls{0};
 // GPU-paced rhythm diagnostics (developer A/B gpu_paced_cadence): held frames
 // whose GPU floor was known, by the anchor that set it, those whose floor the
-// cap bound set, those whose floor was not eligible yet (no cap lead and no
-// cadence restart), and how many frames ahead of the readiness anchor the
-// floor extrapolated (index capped at the horizon); the totals at the newest
-// periodic log line (with the grid's GPU-paced late outputs) and its time.
+// cap bound set, those whose floor was not eligible yet (fewer than 32 frames
+// the cap held and no cadence restart), and how many frames ahead of the
+// readiness anchor the floor extrapolated (index capped at the horizon); the
+// totals at the newest periodic log line (with the grid's GPU-paced late
+// outputs) and its time.
 uint64_t s_floor_anchor_frames[4] = {};
 uint64_t s_floor_cap_bound_frames = 0;
 uint64_t s_floor_ineligible_frames = 0;
@@ -1439,13 +1440,15 @@ static int64_t GpuFloorQpc(const PacingPlanKey& key) noexcept
 }
 
 // A held frame's GPU floor (GpuPacedHeldFloorApplies): the cap bound with the
-// frame's grid interval and the output spacing slack, half the grid's late
-// tolerance of that interval. One function for the plan and the pre-Sleep
-// wait, so both aim at the same release.
-static GpuFloorEstimate HeldGpuFloor(const PacingPlanKey& key, double interval_us) noexcept
+// frame's grid interval, the cap's lead (the newest plan's) and the output
+// spacing slack, half the grid's late tolerance of that interval. One
+// function for the plan and the pre-Sleep wait, so both aim at the same
+// release.
+static GpuFloorEstimate HeldGpuFloor(const PacingPlanKey& key, double interval_us, double lead_us) noexcept
 {
     GpuFloorCap cap{};
     cap.interval_us = interval_us;
+    cap.lead_us = lead_us;
     const int64_t frequency = GetQPCFrequency();
     if (frequency > 0 && std::isfinite(interval_us) && interval_us > 0.0) {
         const double tolerance_ticks = static_cast<double>(CadenceGrid_LateToleranceTicks(
@@ -1513,7 +1516,7 @@ static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
     const LeadController& lead = s_source_stage.Lead();
     LOG_INFO("GPU-paced rhythm: %llu frames (smooth %llu, late %llu, early bound %llu, start %llu); floors %llu "
              "(readiness %llu, report %llu, PRESENT_END %llu; cap-bounded %llu), not eligible %llu; "
-             "readiness anchor gaps %u, cap lead %.2f ms (%u); frames ahead p50 %zu max %zu; period %.2f ms "
+             "readiness anchor gaps %u, cap-held frames %u; frames ahead p50 %zu max %zu; period %.2f ms "
              "(median %.2f); late outputs followed %llu",
         static_cast<unsigned long long>(paced),
         static_cast<unsigned long long>(steps[static_cast<size_t>(GpuPacedRhythmStep::Smooth)]),
@@ -1526,7 +1529,7 @@ static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
         static_cast<unsigned long long>(anchors[static_cast<size_t>(GpuFloorAnchor::PresentEnd)]),
         static_cast<unsigned long long>(cap_bound),
         static_cast<unsigned long long>(ineligible),
-        lead.ReadyGapCount(), lead.CapLeadUs() / 1000.0, lead.CapLeadCount(), median_ahead, max_ahead,
+        lead.ReadyGapCount(), lead.CapHeldFrames(), median_ahead, max_ahead,
         lead.RecentGpuPeriodUs() / 1000.0, lead.GpuPeriodUs() / 1000.0,
         static_cast<unsigned long long>(late_outputs));
 }
@@ -1649,7 +1652,7 @@ static SourceStageFrame RunPlanned(
         // bounded by the cap's own release (lead_controller.h) and released
         // on the GPU-paced rhythm (source_stage.h), never later than the
         // floor.
-        const GpuFloorEstimate floor = HeldGpuFloor(key, input.interval_us);
+        const GpuFloorEstimate floor = HeldGpuFloor(key, input.interval_us, s_last_plan_lead_us);
         const GpuPacedRhythmRelease rhythm = s_source_stage.GpuPacedRhythm(key, floor.floor_qpc);
         request.earliest_release_qpc = rhythm.release_qpc;
         request.gpu_paced_rhythm = rhythm.step;
@@ -1975,7 +1978,7 @@ bool Scheduler_PlanReflexSleep(int64_t sleep_entry_qpc, int64_t now_qpc, bool dr
             earliest_qpc = HandoffFloorQpc(next, handoff_qpc, PacingPipeline_Read());
         } else if (s_gpu_paced_held_floor && !driver_sleep) {
             earliest_qpc = s_source_stage.GpuPacedRhythm(next,
-                HeldGpuFloor(next, s_last_plan_interval_us).floor_qpc).release_qpc;
+                HeldGpuFloor(next, s_last_plan_interval_us, s_last_plan_lead_us).floor_qpc).release_qpc;
         }
         if (earliest_qpc > 0) {
             request.next_target_qpc = (std::max)(request.next_target_qpc,

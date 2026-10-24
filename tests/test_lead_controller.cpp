@@ -2705,10 +2705,10 @@ void TestGpuFloorGpuSetFilters()
         }
         controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us + 250.0), Qpc(end_us), present_gap_us);
         gpu_end_us = end_us;
-        ends[frame_id - 2000] = end_us;
+        ends[static_cast<size_t>(frame_id - 2000)] = end_us;
     };
     const auto floor_after = [&](uint64_t reported) {
-        return Qpc(ends[reported - 2000] + 17010.0 - kStart);
+        return Qpc(ends[static_cast<size_t>(reported - 2000)] + 17010.0 - kStart);
     };
 
     // 33 frames not held: 32 periods of 17,000.
@@ -2773,7 +2773,8 @@ void TestGpuFloorGpuSetFilters()
     // (held frames are bounded by the cap's release, TestGpuFloorCapBound).
     for (uint64_t frame_id = 2045; frame_id <= 2100; ++frame_id) {
         frame(frame_id, PacingPlanStatus::Held, -300.0, 25000.0, 5000.0);
-        CHECK(controller->GpuFloor(key_of(frame_id + 1)).floor_qpc == Qpc(ends[frame_id - 2000] - kStart));
+        CHECK(controller->GpuFloor(key_of(frame_id + 1)).floor_qpc ==
+            Qpc(ends[static_cast<size_t>(frame_id - 2000)] - kStart));
     }
     CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
     CHECK_NEAR(controller->RecentGpuPeriodUs(), three_periods);
@@ -2806,16 +2807,20 @@ void TestGpuFloorGpuSetFilters()
 }
 
 // Cap bound (lead_controller.h): a held frame's floor is
-// min(Ĝ(n − 1) − (P/2 + F + σ), Ĝ(n − 1) − ḡ + I − L̄cap − slack). The shape
-// of CONTROL FG 2× at 130: the cap releases every frame 38 ms before its
-// target, a frame queued in front of the render thread, so the floor's own
-// depth lies 8 ms past the cap's S. Bounded, a frame whose predecessor was
-// held at its target gets S − slack, and the floor moves later only by that
-// predecessor's lateness beyond the slack. Eligibility: before the cap lead
-// is warm, only after a cadence restart in the producer epoch, and then
-// unbounded; floor-released frames add no cap lead; a warm cap lead without
-// readiness gaps gives no floor; frames not held take no bound.
-// ResetGpuFloor clears the output-shaped windows but keeps F and σ.
+// min(Ĝ(n − 1) − (P/2 + F + σ), Ĝ(n − 1) − ḡ + I − L − slack), L the cap's
+// lead. The shape of CONTROL FG 2× at 130: the cap releases every frame
+// 38 ms before its target, a frame queued in front of the render thread, so
+// the floor's own depth lies 8 ms past the cap's S. Bounded, a frame whose
+// predecessor was held at its target gets S − slack, and the floor moves
+// later only by that predecessor's lateness beyond the slack. The bound
+// follows the cap's lead at once, also while the floor releases every
+// frame (a lead measured from frames the floor did not release froze there
+// while L rose, and the floor took every frame). Eligibility: before the cap
+// held 32 frames, only after a cadence restart in the producer epoch, and
+// then unbounded; floor-released frames are not frames the cap held; 32
+// such frames without readiness gaps or without the cap's lead give no
+// floor; frames not held take no bound. ResetGpuFloor clears the
+// output-shaped windows but keeps F and σ.
 void TestGpuFloorCapBound()
 {
     constexpr uint32_t kEpoch = 7;
@@ -2826,6 +2831,7 @@ void TestGpuFloorCapBound()
     constexpr double kStart = 17010.0 / 2.0 + 830.0 + 5010.0; // P/2 + F + σ = 14,345
     GpuFloorCap cap{};
     cap.interval_us = kI;
+    cap.lead_us = kLead;
     cap.slack_us = kSlack;
     const auto key_of = [](uint64_t frame_id, uint32_t epoch = 7) {
         PacingPlanKey key{};
@@ -2874,13 +2880,12 @@ void TestGpuFloorCapBound()
     // Signal at T, ready ready_after_us after T (≤ 0: the GPU waited at the
     // Signal), reported with its GPU end kGap after its anchor (no GPU start:
     // no period).
-    const auto held = [&](uint64_t frame_id, double ready_after_us, bool report = true, bool floor_released = false,
-        double fg_divisor = 2.0) {
+    const auto held = [&](uint64_t frame_id, double ready_after_us, bool report = true, bool floor_released = false) {
         LeadFrameStart start{};
         start.key = key_of(frame_id);
         start.grid_index = frame_id - 2900;
         start.rung = PacingRung::FgInputWait;
-        start.fg_divisor = fg_divisor;
+        start.fg_divisor = 2.0;
         start.interval_us = kI;
         start.source_release_qpc = Qpc(target_us(frame_id) - kLead);
         start.gpu_floor_release = floor_released;
@@ -2896,16 +2901,14 @@ void TestGpuFloorCapBound()
 
     // P from 40 frames not held, then 130 held frames: every fourth reached
     // its wait 300 µs after the Signal (the GPU set it: a readiness gap of
-    // 1,500), the rest 1,000 µs before it (cap leads of 38,000, or 38,300
-    // after a frame that was late).
+    // 1,500), the rest 1,000 µs before it (the cap held them).
     not_held(2950, 2989);
     CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
     for (uint64_t frame_id = 3000; frame_id < 3130; ++frame_id) {
         held(frame_id, frame_id % 4 == 0 ? 300.0 : -1000.0);
     }
     CHECK(controller->ReadyGapCount() == 33);
-    CHECK(controller->CapLeadCount() == LEAD_CAP_LEAD_CAPACITY);
-    CHECK_NEAR(controller->CapLeadUs(), 38000.0);
+    CHECK(controller->CapHeldFrames() == 97);
 
     // Frame 3130 (3129 held at its target): S = T(3129) + I − L. The floor's
     // own depth gives Ĝ(3129) − 14,345 = S + 8,155; bounded, S − slack.
@@ -2929,18 +2932,37 @@ void TestGpuFloorCapBound()
     CHECK(estimate.cap_bound && estimate.anchor == GpuFloorAnchor::Ready);
     CHECK(estimate.floor_qpc == Qpc(target_us(3131) + kI - kLead - kSlack));
 
-    // A cap or FG divisor change: P, the gaps, the cap leads and the restart
+    // The cap's lead rose to 45,000 while the floor released every frame
+    // (none the cap held): the bound moves with it at once, to the new S.
+    held(3132, -1000.0, true, true);
+    CHECK(controller->CapHeldFrames() == 97);
+    GpuFloorCap deeper = cap;
+    deeper.lead_us = 45000.0;
+    estimate = controller->GpuFloor(key_of(3133), 0, 0, true, deeper);
+    CHECK(estimate.cap_bound && estimate.floor_qpc == Qpc(target_us(3132) + kI - 45000.0 - kSlack));
+    // A lead shorter than the floor's own depth leaves the floor's own.
+    GpuFloorCap shallow = cap;
+    shallow.lead_us = 25000.0;
+    estimate = controller->GpuFloor(key_of(3133), 0, 0, true, shallow);
+    CHECK(!estimate.cap_bound && !estimate.ineligible &&
+        estimate.floor_qpc == Qpc(target_us(3132) + kGap - kStart));
+    // Without the cap's lead (no plan yet): no floor.
+    GpuFloorCap unknown = cap;
+    unknown.lead_us = 0.0;
+    CHECK(controller->GpuFloor(key_of(3133), 0, 0, true, unknown).ineligible);
+
+    // A cap or FG divisor change: P, the gaps, the frames the cap held and the restart
     // clear; F and σ stay (the floor returns with P alone).
     controller->NoteCadenceRestart(kEpoch);
     CHECK(controller->CadenceRestartSeen(kEpoch) && !controller->CadenceRestartSeen(kEpoch + 1));
     controller->ResetGpuFloor();
     CHECK_NEAR(controller->GpuPeriodUs(), 0.0);
-    CHECK(controller->ReadyGapCount() == 0 && controller->CapLeadCount() == 0);
+    CHECK(controller->ReadyGapCount() == 0 && controller->CapHeldFrames() == 0);
     CHECK(!controller->CadenceRestartSeen(kEpoch));
     not_held(3200, 3239);
     estimate = controller->GpuFloor(key_of(3240));
     CHECK(estimate.floor_qpc == Qpc(target_us(3239) - kStart));
-    // Held, with no cap lead and no restart: not eligible.
+    // Held, before the cap held a frame and with no restart: not eligible.
     estimate = controller->GpuFloor(key_of(3240), 0, 0, true, cap);
     CHECK(estimate.floor_qpc == 0 && estimate.ineligible);
     // A restart of another producer epoch does not count; one of this
@@ -2951,19 +2973,17 @@ void TestGpuFloorCapBound()
     estimate = controller->GpuFloor(key_of(3240), 0, 0, true, cap);
     CHECK(!estimate.ineligible && !estimate.cap_bound && estimate.floor_qpc == Qpc(target_us(3239) - kStart));
 
-    // Frames the GPU floor released add no cap lead.
+    // Frames the GPU floor released are not frames the cap held.
     for (uint64_t frame_id = 3240; frame_id < 3280; ++frame_id) held(frame_id, -1000.0, true, true);
-    CHECK(controller->CapLeadCount() == 0);
-    // Frames the cap held do; warm without readiness gaps (no frame the GPU
-    // set), the held floor does not apply even after the restart.
+    CHECK(controller->CapHeldFrames() == 0);
+    // Frames the cap held count; 32 of them without readiness gaps (no frame
+    // the GPU set): the held floor does not apply even after the restart.
     for (uint64_t frame_id = 3280; frame_id < 3320; ++frame_id) held(frame_id, -1000.0);
-    CHECK(controller->CapLeadCount() == 40 && controller->ReadyGapCount() == 0);
+    CHECK(controller->CapHeldFrames() == 40 && controller->ReadyGapCount() == 0);
     CHECK(controller->GpuFloor(key_of(3320), 0, 0, true, cap).ineligible);
-    // Another FG divisor slot restarts the cap leads; a new producer epoch too.
-    held(3320, -1000.0, true, false, 3.0);
-    CHECK(controller->CapLeadCount() == 1);
+    // A new producer epoch starts the count again.
     controller->OnGpuRenderEnd(kEpoch + 1, 100, 0, Qpc(9'000'000.0), 14000.0);
-    CHECK(controller->CapLeadCount() == 0);
+    CHECK(controller->CapHeldFrames() == 0);
 }
 
 // The readiness anchor on the GPU queue wait (lead_controller.h): the
@@ -3023,7 +3043,7 @@ void TestGpuQueueWaitReadyGap()
         send(frame_id, Kind::OutputRelease, end_us + ready_us + signal_us);
         if (report) controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us + 250.0), Qpc(end_us), 14000.0);
         gpu_end_us = end_us;
-        ends[frame_id - 2000] = end_us;
+        ends[static_cast<size_t>(frame_id - 2000)] = end_us;
     };
 
     // 33 frames ready 200 µs after their GPU end, the GPU at the wait 800 µs
