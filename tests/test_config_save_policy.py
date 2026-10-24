@@ -35,7 +35,7 @@ RETIRED_KEYS = (
     "gpu_present_gate_max_delay_us", "adaptive_deadline_reserve_mode", "smoothing_window",
     "smoothing_release_speed", "smoothing_bias_us", "smoothing_percentile",
     "gpu_readiness_observer",
-    # Retired with the GPU-paced cadence's GPU-set gate.
+    # Retired with the GPU-paced cadence's GPU-set filters (no hold margin or release smoothing).
     "gpu_paced_hold_margin", "gpu_paced_release_smoothing",
 )
 

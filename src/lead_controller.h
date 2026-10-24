@@ -61,9 +61,11 @@ constexpr size_t LEAD_GPU_PACED_CAPACITY = 128;
 // the newest five GPU frames about equally in Gears of War: E-Day; the floor's
 // median of 256 follows load changes too slowly). The readiness anchor keeps
 // the newest LEAD_GPU_READY_GAP_CAPACITY signed gaps from the GPU readiness
-// of a frame whose pace the GPU set to its Reflex GPU end.
+// of a frame whose pace the GPU set to its Reflex GPU end, and the cap bound
+// of held frames the newest LEAD_CAP_LEAD_CAPACITY cap leads.
 constexpr size_t LEAD_GPU_PERIOD_RECENT = 5;
 constexpr size_t LEAD_GPU_READY_GAP_CAPACITY = 64;
+constexpr size_t LEAD_CAP_LEAD_CAPACITY = 64;
 // Adaptive cap hold room of the FG input wait (scheduler.cpp
 // UpdatePeriodGovernor): the newest LEAD_GPU_NEED_CAPACITY per-frame GPU
 // needs D (GpuNeedQuantileUs).
@@ -274,23 +276,48 @@ constexpr double LEAD_ROOM_MIN_HOLD_US = 250.0; // h
 // at sd 0.58 ms around the target; a free-running cadence at P with
 // proportional-integral phase correction reached sd 0.85 ms and fell 2–4
 // ms further toward the edge after a 0.5 ms GPU step.
-// The floor states the GPU's own limit, so it applies only while the GPU set
-// the newest known frame's pace (GpuSetPace): that frame reached ReLimiter's
-// GPU wait after its release (readiness, or the probe's pre-wait time, later
-// than the Signal), or had no ReLimiter hold at all. A frame whose GPU
-// waited at the Signal, or whose evidence is missing, sets no floor
-// (GpuFloorEstimate::withheld): its GPU end follows ReLimiter's own Signal,
-// and the work of the next frame queued behind that wait ends after it, so
-// both Ĝ and P would measure the cadence ReLimiter set and the floor would
-// follow it. With an Adaptive cap stretch above the GPU's need that loop held
-// the cadence above the interval (Rogue Core 130: 83–89 fps at a 9.5 ms
-// interval, median P 11.77 ms against 7.4 ms of GPU work); at a reachable cap
-// it moved held releases 3.6 ms later (CONTROL FG 2× at 130: 73% of frames
-// held, 72% of the floor's releases right after one, display jumps ×5). The
-// newest known frame is the newer of the readiness anchor's and the newest
-// report's; an older frame never stands in for a newer held one. The same
-// pairs feed P and RecentGpuPeriodUs, and only frames whose pace the GPU set
-// feed the PRESENT_END → GPU end gap.
+// GpuSetPace classifies a frame as paced by the GPU: it reached ReLimiter's
+// GPU wait after its release (the probe's pre-wait time, else readiness,
+// later than the Signal) or had no ReLimiter hold at all. A frame whose GPU
+// waited at the Signal ends its GPU work after ReLimiter's own Signal, and
+// the next frame's work queued behind that wait ends after it, so only pairs
+// of frames the GPU set feed P and RecentGpuPeriodUs, and only such frames
+// feed the PRESENT_END → GPU end gap: otherwise P measured the cadence
+// ReLimiter set and the floor followed it (Rogue Core 130 with an Adaptive
+// cap stretch: 83–89 fps at a 9.5 ms interval, median P 11.77 ms against
+// 7.4 ms of GPU work). The classifier never switches the floor off for a
+// frame: as a per-frame choice between two release depths it read the
+// floor's own early target as GPU lateness and alternated every 2–3 frames
+// (CONTROL FG 2× at 130: 214 switches in 48 s, SIMULATION_START intervals
+// of 23 then 7–8 ms, 171 display jumps per 1,000; with the cadence off 24%
+// of the frames already read GPU-set there).
+//
+// Cap bound (held frames, developer A/B gpu_paced_cadence; GpuFloorCap): the
+// floor of a frame the cap holds is at most the cap's own release of it plus
+// the GPU's lateness beyond the output's slack:
+//   min(Ĝ(n − 1) − (P/2 + F + σ), Ĝ(n − 1) − ḡ + I − L̄cap − slack),
+// ḡ the median readiness gap (below), so Ĝ(n − 1) − ḡ is frame n − 1's
+// predicted anchor; L̄cap the median cap lead of the newest
+// LEAD_CAP_LEAD_CAPACITY frames m the cap held, anchor(m − 1) + I_m − s_m,
+// for a frame whose GPU waited at its Signal and that the floor did not
+// release, consecutive with m − 1 and taken at m's report (a frame released
+// at its S gives its lead L, a late arrival less, so the bound follows the
+// game's actual release phase); slack the output spacing slack, half the
+// grid's late tolerance of I. With frame n − 1 held at its target the bound
+// is S(n) − slack + k (P − I), k the frames Ĝ extrapolates, and P comes only
+// from frames the GPU set, so ReLimiter's holds never move it later and the
+// floor cannot follow them. The floor's own depth, P/2 + F + σ, is Gears'
+// operating point: in a game whose cap runs a deeper queue it sat 13.8 ms
+// past S (CONTROL FG 2× at 130: the render thread started 7.6 ms before
+// G(n − 1) on the floor against 14.7 ms on the cap, a frame less queued,
+// simulation 7.4 / 20 ms p50 / p90 against 4.4 / 8.9). The bound applies
+// once L̄cap and ḡ hold LEAD_WARM_SAMPLES values. Until L̄cap does, the
+// floor applies unbounded only after a cadence restart in this producer
+// epoch (NoteCadenceRestart: SourceLate or OutputLate), else not at all
+// (GpuFloorEstimate::ineligible): an unbounded floor past S from the start
+// would release every frame and leave L̄cap empty for good. Frames not held
+// (the render handoff limit) take no bound.
+//
 // Readiness anchor (as Ĝ, developer A/B gpu_paced_cadence only): the GPU
 // waits read back each frame's GPU readiness on ReLimiter's own GPU timeline
 // (the FG input prefix, or the GPU queue wait's pre-gate query), long before
@@ -306,17 +333,15 @@ constexpr double LEAD_ROOM_MIN_HOLD_US = 250.0; // h
 // the median gap of the newest LEAD_GPU_READY_GAP_CAPACITY frames,
 // extrapolated by P: an estimate rather than a bound, so it replaces the
 // older report's extrapolation, and the PRESENT_END bound applies on top of
-// it only from a newer frame. The floor uses the anchor only when the GPU
-// set that frame's pace (above), where the anchor is its readiness, so only
-// such frames add a gap, within one interval either side of 0. A frame whose
-// GPU waited at the Signal anchors at the release; on the GPU queue wait its
-// measured GPU end does not follow that release, so its gap is ReLimiter's
-// own hold (Rogue Core: −0.4 to −1.4 ms) and must stay out. The output
-// status cannot decide it: the GPU waits report every queued wait as held,
-// and frames not held alone never warmed the window (Gears, FG 2×
-// GPU-paced: 97.5% reached the wait after the release). A gap that had to
-// be positive rejected every GPU queue wait frame, so the anchor never
-// engaged there.
+// it only from a newer frame. Only frames whose pace the GPU set add a gap,
+// within one interval either side of 0: a frame whose GPU waited at the
+// Signal anchors at the release, and on the GPU queue wait its measured GPU
+// end does not follow that release, so its gap is ReLimiter's own hold
+// (Rogue Core: −0.4 to −1.4 ms). The output status cannot decide it: the GPU
+// waits report every queued wait as held, and frames not held alone never
+// warmed the window (Gears, FG 2× GPU-paced: 97.5% reached the wait after
+// the release). A gap that had to be positive rejected every GPU queue wait
+// frame, so the anchor never engaged there.
 //
 // GPU need (the Adaptive cap hold room of the FG input wait): the GPU time D
 // from the release of frame n − 1's output (its anchor above) to frame n's
@@ -338,7 +363,10 @@ constexpr double LEAD_ROOM_MIN_HOLD_US = 250.0; // h
 // (LEAD_HANDOFF_STREAM_PROOF such pairs complete the stream proof,
 // LeadController::HandoffStreams) and gives one F. The period, gap, F and σ
 // windows clear with the handoff window; the stream proof and the newest GPU
-// end stay until a lifecycle reset.
+// end stay until a lifecycle reset. A cap or FG divisor change
+// (ResetGpuFloor) clears the period, PRESENT_END gap, readiness gap and cap
+// lead windows and the cadence restart; F, σ and the anchors stay, as they
+// describe the game rather than the cap's output.
 struct HandoffBackPressureSample {
     // Frame n, µs on the driver's clock from any common origin.
     double simulation_end_us = 0.0;   // SIMULATION_END
@@ -363,11 +391,23 @@ enum class GpuFloorAnchor : uint8_t {
 };
 struct GpuFloorEstimate {
     int64_t floor_qpc = 0; // 0: the floor does not apply
-    GpuFloorAnchor anchor = GpuFloorAnchor::None;
+    GpuFloorAnchor anchor = GpuFloorAnchor::None; // the anchor of Ĝ(n − 1), also under the cap bound
     uint32_t frames_ahead = 0; // frames from the anchor's frame to n − 1 (extrapolated by P)
-    // The windows were warm but the newest known frame's GPU waited at
-    // ReLimiter's Signal or its evidence is missing (GpuSetPace): no floor.
-    bool withheld = false;
+    // Held frames (GpuFloorCap): the cap bound set floor_qpc, earlier than
+    // Ĝ(n − 1) − (P/2 + F + σ).
+    bool cap_bound = false;
+    // Held frames: the windows were warm but the floor is not eligible yet,
+    // without a warm cap lead (and readiness gaps) or, while the cap lead is
+    // cold, a cadence restart in this producer epoch: no floor.
+    bool ineligible = false;
+};
+// A held frame's cap bound inputs (LeadController::GpuFloor, above): its
+// grid interval I and the output spacing slack, half the grid's late
+// tolerance of I (CadenceGrid_LateToleranceTicks), in µs. interval_us 0: a
+// frame not held, no cap bound and no eligibility rule.
+struct GpuFloorCap {
+    double interval_us = 0.0;
+    double slack_us = 0.0;
 };
 
 // ── Inputs and status ──
@@ -587,6 +627,14 @@ public:
     // Q_q (at its last request) of the same FG divisor, which the demoted
     // frames kept current. Other rungs, the resume history and statistics stay.
     void RestartRung(PacingRung rung) noexcept;
+    // A cap or FG divisor change (above): the GPU floor's period, PRESENT_END
+    // gap, readiness gap and cap lead windows and its cadence restart start
+    // again; F, σ, the stream proof and the anchors stay.
+    void ResetGpuFloor() noexcept;
+    // The cadence restarted (SourceLate or OutputLate) in producer_epoch:
+    // the held floor's eligibility while the cap lead is cold (above).
+    void NoteCadenceRestart(uint32_t producer_epoch) noexcept;
+    bool CadenceRestartSeen(uint32_t producer_epoch) const noexcept;
     // One call per planned frame; applies at most one slew step to the
     // selected bucket and clamps L to [0, 3 I]. Present placement returns
     // 150 µs; None placement and Off or Idle mode return 0 without touching a
@@ -620,10 +668,12 @@ public:
     // gpuRenderEndTime as QPC through the stable Reflex clock map (end 0
     // unknown: ignored) and its PRESENT_END → GPU end gap in µs on the
     // driver's clock (non-finite or not positive: not counted). The GPU
-    // floor's anchor; consecutive frames the GPU did not wait for (start at
-    // most LEAD_HANDOFF_GPU_IDLE_US after the previous end) add their interval
-    // to the period window, a frame whose pace the GPU set its gap to the gap
-    // window. A new producer epoch restarts all three; older frames are ignored.
+    // floor's anchor; consecutive frames the GPU set and did not wait for
+    // (start at most LEAD_HANDOFF_GPU_IDLE_US after the previous end) add
+    // their interval to the period window, a frame whose pace the GPU set its
+    // PRESENT_END and readiness gaps, a frame the cap held its cap lead. A new
+    // producer epoch restarts the period, PRESENT_END gap and cap lead
+    // windows; older frames are ignored.
     void OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, int64_t gpu_start_qpc,
         int64_t gpu_end_qpc, double present_to_gpu_end_us) noexcept;
 
@@ -663,13 +713,15 @@ public:
     double GpuFloorStartUs() const noexcept;
     // The GPU floor of the frame key (above), with the render thread's newest
     // PRESENT_END of key's stream (frame and QPC; 0 unknown) for the live
-    // bound and, with ready_anchor (developer A/B gpu_paced_cadence), the
-    // readiness anchor; floor_qpc 0 when it does not apply (another identity
-    // domain or producer epoch, no GPU end within the horizon, a cold
-    // window, or withheld: the GPU did not set the newest known frame's
-    // pace). The estimate names the anchor that set Ĝ(n − 1).
+    // bound, with ready_anchor (developer A/B gpu_paced_cadence) the
+    // readiness anchor, and with a held frame's cap (interval_us > 0) its cap
+    // bound and eligibility; floor_qpc 0 when it does not apply (another
+    // identity domain or producer epoch, no GPU end within the horizon, a
+    // cold window, or a held frame not eligible yet). The estimate names the
+    // anchor that set Ĝ(n − 1) and whether the cap bound set the floor.
     GpuFloorEstimate GpuFloor(const PacingPlanKey& key, uint64_t present_end_frame = 0,
-        int64_t present_end_qpc = 0, bool ready_anchor = false) const noexcept;
+        int64_t present_end_qpc = 0, bool ready_anchor = false,
+        const GpuFloorCap& cap = GpuFloorCap{}) const noexcept;
     // GPU frame periods (above): the median P of the newest 256 (0 until
     // LEAD_WARM_SAMPLES), and the mean of the newest LEAD_GPU_PERIOD_RECENT
     // (0 until that many): the GPU-paced rhythm's period (source_stage.h).
@@ -682,6 +734,10 @@ public:
     uint32_t GpuNeedCount() const noexcept { return gpu_need_.count; }
     // Anchor → GPU end gaps in the readiness anchor's window (above).
     uint32_t ReadyGapCount() const noexcept { return ready_gap_count_; }
+    // Cap leads (above): the median of the newest LEAD_CAP_LEAD_CAPACITY, 0
+    // until LEAD_WARM_SAMPLES, and their count.
+    double CapLeadUs() const noexcept;
+    uint32_t CapLeadCount() const noexcept { return cap_lead_.count; }
     // The stream proof is complete (above).
     bool HandoffStreams() const noexcept { return handoff_stream_frames_ >= LEAD_HANDOFF_STREAM_PROOF; }
     // Handoff samples in the window. At LEAD_HANDOFF_MIN_SAMPLES the game has
@@ -816,13 +872,17 @@ private:
     // The GPU, not ReLimiter, set the frame's pace (above): it had no hold,
     // or its GPU reached the wait after the Signal (probe pre-wait time, else
     // readiness, strictly later). A hold without that evidence counts as
-    // waited, so missing evidence never certifies a floor.
+    // waited, so missing evidence never feeds P or a gap.
     static bool GpuSetPace(const PendingFrame& frame) noexcept;
     // The pending NvAPI frame (producer_epoch, frame_id), nullptr when it is
     // not pending.
     const PendingFrame* FindNvApiFrame(uint32_t producer_epoch, uint64_t frame_id) const noexcept;
     void NoteReadyAnchor(const PendingFrame& frame) noexcept;
     void RecordReadyGap(const PendingFrame& frame, int64_t gpu_end_qpc) noexcept;
+    // Median of the readiness gaps; meaningful from LEAD_WARM_SAMPLES.
+    double ReadyGapMedianUs() const noexcept;
+    // The cap lead of a reported frame the cap held (above).
+    void RecordCapLead(const PendingFrame& frame) noexcept;
     void RecordGpuNeed(const PendingFrame& frame) noexcept;
     // Copies the newest `count` u − o observations (count <= resume_delay_count_).
     void NewestResumeDelays(size_t count, double* delays_us) const noexcept;
@@ -903,7 +963,9 @@ private:
     uint32_t gpu_end_epoch_ = 0;
     uint64_t gpu_end_frame_ = 0;
     int64_t gpu_end_qpc_ = 0;
-    bool gpu_end_gpu_set_ = false; // GpuSetPace of the newest report's frame
+    // GpuSetPace of the newest report's frame, refreshed by a probe that
+    // arrives after the report: the next report's period pair reads it.
+    bool gpu_end_gpu_set_ = false;
     LeadSampleWindow gpu_period_window_{};
     LeadSampleWindow gpu_after_present_window_{};
     LeadSampleWindow first_submission_window_{};
@@ -918,10 +980,19 @@ private:
     uint32_t ready_epoch_ = 0;
     uint64_t ready_frame_ = 0;
     int64_t ready_qpc_ = 0;
-    bool ready_gpu_set_ = false; // GpuSetPace of the anchor's frame
     std::array<float, LEAD_GPU_READY_GAP_CAPACITY> ready_gaps_us_{};
     uint32_t ready_gap_head_ = 0;
     uint32_t ready_gap_count_ = 0;
+    // Cap bound (above): the newest cap leads in µs of one FG divisor slot,
+    // and the producer epoch of the newest cadence restart (0 none).
+    struct CapLeadWindow {
+        std::array<float, LEAD_CAP_LEAD_CAPACITY> us{};
+        uint32_t head = 0;
+        uint32_t count = 0;
+        size_t divisor = 0;
+    };
+    CapLeadWindow cap_lead_{};
+    uint32_t restart_epoch_ = 0;
     // GPU need window (above); divisor = the frames' FG divisor slot.
     struct GpuNeedWindow {
         std::array<float, LEAD_GPU_NEED_CAPACITY> us{};

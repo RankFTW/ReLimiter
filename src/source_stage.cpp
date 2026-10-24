@@ -150,6 +150,7 @@ size_t SourceStage::DrainStageEvents() noexcept
                 gpu_paced) == PacingEpochReason::OutputLate) {
             ++statistics_.output_late_epochs;
             epoch_started = true;
+            lead_.NoteCadenceRestart(event.key.producer_epoch);
         }
     }
     statistics_.stage_events += drained;
@@ -278,6 +279,11 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     frame.planned = true;
     frame.lead_budget_limited = budget_limited;
     frame.epoch_started = grid_plan.epoch_reason;
+    // A restart is the held GPU floor's eligibility while its cap lead is
+    // cold (lead_controller.h).
+    if (grid_plan.epoch_reason == PacingEpochReason::SourceLate) {
+        lead_.NoteCadenceRestart(request.key.producer_epoch);
+    }
     frame.grid_epoch_reason = snapshot.epoch_reason;
     frame.gpu_target = grid_plan.gpu_target;
 

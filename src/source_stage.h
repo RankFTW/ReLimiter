@@ -117,7 +117,9 @@ private:
 //               never earlier than the floor minus half the median GPU
 //               period P (early starts cost little: 4–8% stretched).
 // The rhythm continues only from the previous consecutive frame it paced;
-// otherwise the release is the floor. In a replay on the captured GPU
+// otherwise the release is the floor. A cap or FG divisor change
+// (ResetGpuFloor) restarts it with the floor's windows: its period and its
+// release belong to the old output. In a replay on the captured GPU
 // timeline it cut the start interval sd from 1.24–1.96 to 0.81–1.22 ms and
 // late starts by about half; replays can reject, not approve.
 constexpr double GPU_PACED_RHYTHM_EARLY_GAIN = 0.25;
@@ -254,6 +256,14 @@ public:
     void ClearSlackEvidence() noexcept { lead_.ClearSlackEvidence(); }
     // Holds resume after an overload demotion (LeadController::RestartRung).
     void RestartLead(PacingRung rung) noexcept { lead_.RestartRung(rung); }
+    // A cap or FG divisor change: the GPU floor's output-shaped windows
+    // (LeadController::ResetGpuFloor) and the GPU-paced rhythm restart.
+    void ResetGpuFloor() noexcept
+    {
+        lead_.ResetGpuFloor();
+        rhythm_key_ = {};
+        rhythm_release_qpc_ = 0;
+    }
     // A Reflex report's GPU active render time and GPU start
     // (LeadController::OnGpuActiveTime).
     void OnGpuActiveTime(uint32_t producer_epoch, uint64_t frame_id, double gpu_active_us,

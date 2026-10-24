@@ -982,8 +982,9 @@ void ApplyConfig() {
                  "and the workload reports, not the interval the GPU queue wait needs to hold frames)");
     if (g_config.gpu_paced_cadence)
         LOG_WARN("Pacing pipeline: diagnostic GPU-paced cadence on (held frames are released no earlier than "
-                 "the render handoff GPU floor while the GPU sets the pace, and a frame whose release that floor "
-                 "sets keeps the GPU's pace instead of being held to the cap's cadence)");
+                 "the render handoff GPU floor, bounded by the cap's own release plus the GPU's lateness, and "
+                 "a frame whose release that floor sets keeps the GPU's pace instead of being held to the cap's "
+                 "cadence)");
     if (g_config.bypass_low_latency_off)
         LOG_WARN("Diagnostic driver low latency off while bypassed: NvAPI SetSleepMode forwarded with low latency "
                  "mode off while the Reflex Sleep is bypassed");

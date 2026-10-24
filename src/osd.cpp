@@ -630,8 +630,9 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "time rather than each frame's floor. When that floor sets a frame's release, the GPU is the "
         "limit: the frame's output target becomes the time such a frame is ready at the earliest, and the "
         "cadence continues from there instead of holding the frame to the cap's cadence, which would leave "
-        "the GPU idle. A frame whose GPU waited at ReLimiter's Signal sets no floor for the next one: its timing "
-        "is ReLimiter's own, not the GPU's. Frames the GPU finishes early are still held to the cap. With "
+        "the GPU idle. A held frame's floor never goes past the cap's own release of it by more than how late "
+        "the GPU finished the previous frame, so ReLimiter's holds never move it. Frames the GPU finishes early are "
+        "still held to the cap. With "
         "Adaptive cap on, the FG input wait's hold room follows the GPU's recent frame need at the Adaptive cap "
         "fit. Watch long frames, jitter, GPU idle gaps and PC Latency; one setting per capture.");
 

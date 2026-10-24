@@ -1156,6 +1156,55 @@ void TestGpuPacedRhythm()
     CHECK(g_stage.GpuPacedRhythm(Key(frame_id), floor2 + Ticks(17'000.0)).step == GpuPacedRhythmStep::Start);
 }
 
+// The held GPU floor applies before its cap lead is warm only after a
+// cadence restart in the producer epoch (lead_controller.h): a SourceLate
+// restart at the plan and an OutputLate restart from the stage events count;
+// a cap or FG divisor change (ResetGpuFloor) clears it.
+void TestCadenceRestartsCountForTheFloor()
+{
+    std::printf("Test: SourceLate and OutputLate restarts make the held GPU floor eligible\n");
+    ResetStage();
+    ScriptedClock clock;
+    const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
+    uint64_t frame_id = 5000;
+    SourceStageFrame last{};
+    // Ready 3,000 µs after each release: L = Q95 3,010 + 500.
+    const auto finish = [&](const SourceStageFrame& frame) {
+        const int64_t done = frame.release_qpc + Ticks(3'000.0);
+        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::PresentCall,
+            frame.release_qpc + Ticks(1'000.0))));
+        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady, done)));
+        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease, done,
+            PacingPlanStatus::Late)));
+        g_stage.DrainStageEvents();
+        clock.now = done;
+    };
+    for (int i = 0; i < 40; ++i) {
+        last = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
+        finish(last);
+    }
+    CHECK(!g_stage.Lead().CadenceRestartSeen(1));
+
+    // The game reaches the next release 8 ms after its S: SourceLate.
+    clock.now = last.plan.output_target_qpc + Ticks(kIntervalUs) - Ticks(last.plan.lead_us) + Ticks(8'000.0);
+    const SourceStageFrame late = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
+    CHECK(late.planned && late.epoch_started == PacingEpochReason::SourceLate);
+    CHECK(g_stage.Lead().CadenceRestartSeen(1) && !g_stage.Lead().CadenceRestartSeen(2));
+    g_stage.ResetGpuFloor();
+    CHECK(!g_stage.Lead().CadenceRestartSeen(1));
+    finish(late);
+
+    // An output 8 ms past its target: OutputLate.
+    const SourceStageFrame next = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
+    CHECK(next.planned && next.epoch_started == PacingEpochReason::None);
+    const uint64_t late_before = g_stage.Statistics().output_late_epochs;
+    CHECK(FramePlan_PushStageEvent(Event(next, PacingStageEventKind::OutputRelease,
+        next.plan.output_target_qpc + Ticks(8'000.0), PacingPlanStatus::Held)));
+    g_stage.DrainStageEvents();
+    CHECK(g_stage.Statistics().output_late_epochs == late_before + 1);
+    CHECK(g_stage.Lead().CadenceRestartSeen(1));
+}
+
 int main()
 {
     std::printf("=== Source stage tests ===\n");
@@ -1180,6 +1229,7 @@ int main()
     TestGpuPacedCadence();
     TestGpuPacedRing();
     TestGpuPacedRhythm();
+    TestCadenceRestartsCountForTheFloor();
     TestResetClearsPlans();
     std::printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
