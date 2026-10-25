@@ -165,7 +165,7 @@ struct SourceStageRequest {
     // Developer A/B gated_hold_gpu_idle (lead_controller.h): a GPU wait frame
     // ready after its Present call credits later frames' waits only up to its
     // GPU idle.
-    bool gated_hold_gpu_idle = true;
+    bool gated_hold_gpu_idle = false;
     // The ended pre-Sleep wait for pre_wait_index (PreSleepPlacement::
     // EndedWait): recorded with the frame when the plan takes that index, so
     // it can gate earlier frames of a lockstep engine (lead_controller.h).

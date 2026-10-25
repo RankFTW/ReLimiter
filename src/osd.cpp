@@ -653,12 +653,13 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         LOG_INFO("OSD: gated hold GPU idle -> %s", g_config.gated_hold_gpu_idle ? "on" : "off");
         *config_dirty = true;
     }
-    HelpTip("Diagnostic A/B, GPU queue wait and FG input wait, with Adaptive cap. On (default), a frame whose "
-        "GPU finished after its Present call counts as late for Adaptive cap unless the GPU waited for the "
-        "frame's own work: ReLimiter's waits for later frames during its render submission are credited only "
-        "as far as the GPU idled inside the frame. Off, they are credited in full, as for lockstep games, which "
-        "can hide frames the GPU could not finish in time. On can lengthen the interval a few percent when the "
-        "GPU is the limit. Compare one setting per capture, in the same scene.");
+    HelpTip("Diagnostic A/B, GPU queue wait and FG input wait, with Adaptive cap. Off (default), ReLimiter's waits "
+        "for later frames during a frame's render submission are credited in full when judging whether the frame "
+        "was late, as for games that finish a frame only after the next release. On, a frame whose GPU finished "
+        "after its Present call counts as late for Adaptive cap unless the GPU waited for the frame's own work. "
+        "On counted more late frames in GPU-heavy scenes and lengthened the interval about 3% without the "
+        "GPU-paced cadence, with no measurable pacing difference in Gears of War: E-Day. Compare one setting per "
+        "capture, in the same scene.");
 
     static const char* const kSourcePlacementLabels[] = {"Marker", "Pre-Sleep", "Reflex driver limiter"};
     static_assert(IM_ARRAYSIZE(kSourcePlacementLabels) ==

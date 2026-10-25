@@ -1892,9 +1892,6 @@ void TestLockstepGatedHold()
     CHECK(controller->Statistics().gated_hold_samples == 2);
 
     // A judged GPU queue wait frame gated by the next release adds no room.
-    // Ready after its Present call, its slack waits for its report and
-    // credits the gated hold (3,000) only up to the GPU's idle inside its
-    // span (500): 12,000 − (9,000 − 500).
     auto room = MakeController();
     LeadGuardOutcome judged{};
     judged.judged = true;
@@ -1910,10 +1907,8 @@ void TestLockstepGatedHold()
     room->OnStageEvent(Event(1, Kind::PresentCall, 15500.0));
     room->OnStageEvent(Event(1, Kind::GpuReady, 19000.0));
     room->OnStageEvent(Event(1, Kind::OutputRelease, 19000.0));
-    CHECK(room->Statistics().slack_samples == 0);
-    Report(room.get(), Key(1).producer_epoch, Key(1).frame_id, 7000.0, 0, 7500.0);
     CHECK(room->Statistics().slack_samples == 1);
-    CHECK_NEAR(room->Statistics().last_slack_us, 3500.0);
+    CHECK_NEAR(room->Statistics().last_slack_us, 6000.0);
     CHECK(room->Statistics().room_samples == 0);
 }
 
