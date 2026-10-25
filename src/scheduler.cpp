@@ -467,9 +467,12 @@ int s_logged_collision_guard = -1;
 // The first lead sample that left out the game's simulation → render queue
 // (lead_controller.h) has been logged. Once per process.
 bool s_logged_lead_queue = false;
-// The queue-order verdict last logged (lead_controller.h): the next frame's
-// GPU work runs behind the wait, so the collision guard stands aside.
+// The queue-order verdicts last logged (lead_controller.h): the next frame's
+// GPU work runs behind the GPU queue wait (the collision guard stands aside)
+// or behind the FG input wait (the lead samples leave out the frame's wait
+// for the previous frame).
 bool s_logged_behind_wait = false;
+bool s_logged_fg_behind_wait = false;
 PacingRoute s_last_route = PacingRoute::None;
 bool s_route_known = false;
 
@@ -661,9 +664,9 @@ static void ApplyInterleaveTransition(const HoldInterleaveTransition& transition
 }
 
 // Logs each switch between the headroom guard and the Present-call margin
-// (collision-aware release), each change of the queue-order verdict for the
-// frame's FG divisor, and the first lead sample that left out the game's
-// simulation → render queue.
+// (collision-aware release), each change of the GPU queue wait's and the FG
+// input wait's queue-order verdict for the frame's FG divisor, and the first
+// lead sample that left out the game's simulation → render queue.
 static void ObserveCollisionGuard(double fg_divisor) noexcept
 {
     const LeadController& lead = s_source_stage.Lead();
@@ -674,17 +677,29 @@ static void ObserveCollisionGuard(double fg_divisor) noexcept
                  statistics.last_queue_us, statistics.last_sample_us);
         s_logged_lead_queue = true;
     }
-    const bool behind_wait = lead.NextGpuWorkBehindWait(fg_divisor);
+    const bool behind_wait = lead.NextGpuWorkBehindWait(PacingRung::GpuQueueWait, fg_divisor);
     if (behind_wait != s_logged_behind_wait) {
         if (behind_wait) {
             LOG_INFO("Collision guard: stands aside (in the newest %zu waited releases the next frame's GPU work, "
                      "submitting before the release, started only after it: it runs behind the wait; newest %+.0f us)",
-                     lead.ConcurrencyPairs(), statistics.last_concurrency_us);
+                     lead.ConcurrencyPairs(PacingRung::GpuQueueWait), statistics.last_concurrency_us);
         } else {
             LOG_INFO("Collision guard: back (the next frame's GPU work started %.0f us before a waited release: "
                      "it runs beside the wait)", -statistics.last_concurrency_us);
         }
         s_logged_behind_wait = behind_wait;
+    }
+    const bool fg_behind_wait = lead.NextGpuWorkBehindWait(PacingRung::FgInputWait, fg_divisor);
+    if (fg_behind_wait != s_logged_fg_behind_wait) {
+        if (fg_behind_wait) {
+            LOG_INFO("Lead: the next frame's GPU work runs behind the FG input wait (newest %zu waited releases; "
+                     "newest %+.0f us after the release): lead samples leave out its wait for the previous frame",
+                     lead.ConcurrencyPairs(PacingRung::FgInputWait), statistics.last_fg_concurrency_us);
+        } else {
+            LOG_INFO("Lead: FG input wait lead samples keep the measured readiness (the next frame's GPU work "
+                     "ran beside the wait, Reflex reports stopped, or frame generation is off)");
+        }
+        s_logged_fg_behind_wait = fg_behind_wait;
     }
     if (statistics.collision_checked_frames == 0) return;
     const int guard = statistics.last_guard_headroom ? 1 : 0;
@@ -922,8 +937,9 @@ static void FillControllerStatus(SchedulerPacingStatus* status) noexcept
     status->collision_checked = clip(lead_statistics.collision_checked_frames);
     status->collision_guarded = clip(lead_statistics.collision_guarded_frames);
     status->collision_behind_wait =
-        lead.NextGpuWorkBehindWait(s_last_fg_divisor_raw > 0 ? static_cast<double>(s_last_fg_divisor_raw) : 1.0);
-    status->queue_order_pairs = static_cast<uint32_t>(lead.ConcurrencyPairs());
+        lead.NextGpuWorkBehindWait(PacingRung::GpuQueueWait,
+            s_last_fg_divisor_raw > 0 ? static_cast<double>(s_last_fg_divisor_raw) : 1.0);
+    status->queue_order_pairs = static_cast<uint32_t>(lead.ConcurrencyPairs(PacingRung::GpuQueueWait));
     status->release_margin_samples = clip(lead_statistics.margin_samples);
     status->release_margin_late = clip(lead_statistics.margin_late_samples);
     status->release_headroom_samples = clip(lead_statistics.headroom_samples);

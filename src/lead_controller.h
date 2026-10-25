@@ -2,7 +2,9 @@
 
 // Lead controller. Learns the lead L from the source release to the output
 // target per (rung, FG divisor) bucket, from per-frame samples X that exclude
-// ReLimiter's own holds, including GPU holds carried through a busy GPU.
+// ReLimiter's own holds, including, where the next frame's GPU work runs
+// behind a GPU wait, the time a frame's GPU work waited for the GPU to finish
+// the previous frame.
 // Pure C++17 without Windows, logger or config
 // dependencies. Owned and called only by the scheduler owner; not thread-safe.
 //
@@ -126,29 +128,35 @@ constexpr uint32_t LEAD_WORK_STALE_FRAMES = 64;
 // Queue order. Both guards assume the next frame's GPU work can
 // run while frame n's GPU waits at its gate, so it can occupy the engine when
 // the Signal comes. Some games run it behind the wait instead (one queue, in
-// order): then it cannot delay the resume, and the hold delays it (the
-// carried delay). The test: frame n's GPU waited at the Signal o_n (probe),
-// frame n + 1 had begun submitting (RENDERSUBMIT_START <= o_n), and frame n +
-// 1's GPU work started at g_{n+1} (its Reflex gpuRenderStartTime through the
-// stable clock map). g_{n+1} < o_n − LEAD_CONCURRENCY_TOLERANCE_US shows
-// concurrent work. Rogue Core: 72-94% of such pairs in four captures,
-// guarded or not, from the first or second pair. CONTROL Resonant: none of
-// 3,661 pairs in three captures (g − o at least 38 µs), and with the guard
-// off (Output override GPU wait) 2,309 waited frames above its limit had no
-// late resume while jitter fell from 1.91 to 1.04 ms. The
-// guards therefore stand aside only once LEAD_WARM_SAMPLES of the newest
-// LEAD_CONCURRENCY_SAMPLES pairs exist and none was concurrent, and only
-// while the heavy-work window is current (Reflex GPU active times arriving):
-// without them no new pair can show the order changing, so the Present-call
-// guard applies. One concurrent pair restores the guards at once. Without
-// probes or Reflex reports no pair exists and the guards stay. The verdict
-// does not need a pair on every frame: a pair needs a waited frame whose next
-// frame had begun submitting by the release, and frames without one cannot
-// collide (CONTROL Resonant: gaps of up to 362 GPU queue wait frames between
-// pairs). Under the guard D cannot show this: the
-// next frame's heavy work queues behind the guarded release, so Q10(D) rises
-// with the lead (CONTROL: p10 4.7 ms guarded, 5.5 ms at +1.7 ms, 8.1 ms at
-// +4.6 ms lead) and never shows the room.
+// order): then it cannot delay the resume, and the hold delays it. The test:
+// frame n's GPU waited at the Signal o_n (GPU queue wait: the probe; FG input
+// wait: its readiness before the Signal), frame n + 1 had begun submitting
+// (RENDERSUBMIT_START <= o_n), and frame n + 1's GPU work started at g_{n+1}
+// (its Reflex gpuRenderStartTime through the stable clock map). g_{n+1} <
+// o_n − LEAD_CONCURRENCY_TOLERANCE_US shows concurrent work. Each GPU output
+// keeps its own pairs. Rogue Core (GPU queue wait): 72-94% of such pairs in
+// four captures, guarded or not, from the first or second pair. CONTROL
+// Resonant: none of 3,661 GPU queue wait pairs in three captures (g − o at
+// least 38 µs), and with the guard off (Output override GPU wait) 2,309
+// waited frames above its limit had no late resume while jitter fell from
+// 1.91 to 1.04 ms; on the FG input wait g − o was at least 1.8 ms on every
+// frame (the frame generation of frame n runs first), as in Gears of War:
+// E-Day (none of 508 pairs). An output's verdict is "behind the wait" once
+// LEAD_WARM_SAMPLES of its newest LEAD_CONCURRENCY_SAMPLES pairs exist and
+// none was concurrent, and only while Reflex reports are current (the GPU
+// queue wait: its heavy-work window; the FG input wait: a report within the
+// newest LEAD_WORK_STALE_FRAMES frames of the FG divisor slot): without them
+// no new pair can show the order changing. One concurrent pair ends it at
+// once. Without probes or Reflex reports no pair exists. The verdict does not
+// need a pair on every frame: a pair needs a waited frame whose next frame
+// had begun submitting by the release, and frames without one cannot collide
+// (CONTROL Resonant: gaps of up to 362 GPU queue wait frames between pairs).
+// Behind the wait the GPU queue wait's guards stand aside, and on both GPU
+// outputs the lead sample leaves out the frame's wait for the GPU to finish
+// frame n − 1 (LeadController::SampleUs). Under the guard D cannot show
+// this: the next frame's heavy work queues behind the guarded release, so
+// Q10(D) rises with the lead (CONTROL: p10 4.7 ms guarded, 5.5 ms at +1.7 ms,
+// 8.1 ms at +4.6 ms lead) and never shows the room.
 constexpr size_t LEAD_CONCURRENCY_SAMPLES = 64;
 // Clock map spread (about 6 µs) and probe mapping; Rogue Core's concurrent
 // pairs start p50 0.7-0.9 ms before the Signal.
@@ -196,7 +204,8 @@ constexpr double LEAD_ROOM_MIN_HOLD_US = 250.0; // h
 // 15.6 ms on 90% of frames and 18 ms more PC latency than with the driver's
 // Sleep. Without q the lead fell to 26.2 ms with the source still
 // on the grid. Time after b_{n−1} stays in X (a lockstep frame waits there
-// for a later release, above), and the carried delay starts at w or later.
+// for a later release, above), and the wait for frame n − 1 behind the wait
+// (SampleUs) starts at w or later.
 // The slack keeps X: q does not change when the frame was ready.
 // FG input wait only. The FG input wait's back-pressure comes from its own
 // GPU gate, and its output point lies a GPU frame after the Present call.
@@ -535,12 +544,16 @@ struct LeadStatistics {
     uint64_t unmatched_gpu_active = 0;
     uint64_t headroom_samples = 0;
     uint64_t headroom_late_samples = 0;
-    // Queue order (above): waited releases paired with the next frame's GPU
-    // start, those whose next frame's GPU work started before the release
-    // (concurrent), and the newest g_{n+1} − o_n.
+    // Queue order (above), GPU queue wait and FG input wait: waited releases
+    // paired with the next frame's GPU start, those whose next frame's GPU
+    // work started before the release (concurrent), and the newest
+    // g_{n+1} − o_n.
     uint64_t concurrency_samples = 0;
     uint64_t concurrent_samples = 0;
     double last_concurrency_us = 0.0;
+    uint64_t fg_concurrency_samples = 0;
+    uint64_t fg_concurrent_samples = 0;
+    double last_fg_concurrency_us = 0.0;
     uint64_t room_samples = 0;       // hold room samples X (judged GPU queue wait frames not late against L + reduction)
     // Slack samples judged without the gated hold of later frames (lockstep
     // engines), and the newest such hold.
@@ -558,10 +571,10 @@ struct LeadStatistics {
     uint64_t resume_waited_samples = 0;
     uint64_t resume_late_samples = 0;
     uint64_t invalid_inputs = 0;     // rejected frequency, requests, releases and events
-    // GPU-rung samples shortened by the delay earlier GPU holds carried
-    // through a busy GPU, and the newest such delay.
-    uint64_t carried_hold_samples = 0;
-    double last_carried_hold_us = 0.0;
+    // GPU-rung samples that left out the frame's wait for the GPU to finish
+    // the previous frame (behind the wait, SampleUs), and the newest such wait.
+    uint64_t predecessor_wait_samples = 0;
+    double last_predecessor_wait_us = 0.0;
     // Lead samples shortened by the game's simulation → render queue q
     // (above: FG input wait, and GPU queue wait under the A/B key), and the
     // newest such q.
@@ -757,6 +770,11 @@ public:
     uint32_t ReadyGapCount() const noexcept { return ready_gap_count_; }
     // Frames the cap held in this producer epoch since the last reset (above).
     uint32_t CapHeldFrames() const noexcept { return cap_held_frames_; }
+    // Lower-index median of the newest LEAD_RESUME_MEDIAN_SAMPLES waited
+    // u − o observations (held, probed GPU queue wait frames whose GPU waited
+    // at the Signal); 0 before any. A held frame without a probe resumes at
+    // o + this (behind the wait, SampleUs).
+    double MedianResumeDelayUs() const noexcept;
     // The stream proof is complete (above).
     bool HandoffStreams() const noexcept { return handoff_stream_frames_ >= LEAD_HANDOFF_STREAM_PROOF; }
     // Handoff samples in the window. At LEAD_HANDOFF_MIN_SAMPLES the game has
@@ -774,13 +792,16 @@ public:
     // Slack window and last budget decision of the bucket; empty for an invalid rung.
     LeadFeasibility Feasibility(PacingRung rung, double fg_divisor) const noexcept;
     LeadStatistics Statistics() const noexcept { return statistics_; }
-    // Queue order (above): the collision guards stand aside while the newest
-    // pairs show the next frame's GPU work running behind the wait and the
-    // FG divisor's heavy-work window is current. The pairs are kept across
-    // Reset: they describe the game's GPU submission, not the lifecycle.
-    bool NextGpuWorkBehindWait(double fg_divisor) const noexcept;
-    size_t ConcurrencyPairs() const noexcept { return concurrency_count_; }
-    size_t ConcurrentPairs() const noexcept { return concurrent_in_window_; }
+    // Queue order (above) of a GPU output (GpuQueueWait or FgInputWait; false
+    // for the others): the newest pairs show the next frame's GPU work
+    // running behind the wait and the FG divisor slot's Reflex reports are
+    // current. Behind the wait the GPU queue wait's guards stand aside and the
+    // output's lead samples leave out the frame's wait for the previous
+    // frame. The pairs are kept across Reset: they describe the game's GPU
+    // submission, not the lifecycle.
+    bool NextGpuWorkBehindWait(PacingRung rung, double fg_divisor) const noexcept;
+    size_t ConcurrencyPairs(PacingRung rung) const noexcept;
+    size_t ConcurrentPairs(PacingRung rung) const noexcept;
 
 private:
     static constexpr size_t kBucketCount =
@@ -806,9 +827,6 @@ private:
         uint64_t grid_index = 0;
         std::array<int64_t, FieldCount> qpc{};
         int64_t gpu_wait_qpc = 0;  // pre-Wait GPU time of the GpuResume event; 0 unknown
-        // GPU rungs: s + X, the readiness without the delay earlier GPU
-        // holds carried into this frame; 0 until the sample is emitted.
-        int64_t own_ready_qpc = 0;
         double interval_us = 0.0;
         double lead_us = 0.0;      // the plan's L, for the slack
         double slack_us = 0.0;     // L − X once the sample is emitted (slack_known)
@@ -905,7 +923,6 @@ private:
     void RecordGpuNeed(const PendingFrame& frame) noexcept;
     // Copies the newest `count` u − o observations (count <= resume_delay_count_).
     void NewestResumeDelays(size_t count, double* delays_us) const noexcept;
-    double MedianResumeDelayUs() const noexcept;
     // Collision guard
     void RecordCallTime(PendingFrame* frame) noexcept;
     void RecordReleaseMargin(PendingFrame* frame) noexcept;
@@ -913,6 +930,7 @@ private:
     void RecordReleaseHeadroom(PendingFrame* frame) noexcept;
     // σ of a frame not held (GPU floor, above).
     void RecordReleaseToRender(PendingFrame* frame) noexcept;
+    // One queue-order pair (o_n, g_{n+1}) of a waited GPU-rung frame n.
     void RecordConcurrency(PendingFrame* frame) noexcept;
     double CollisionGuardedLeadUs(const LeadRequest& request, size_t bucket_index, double lead_us,
         LeadGuardOutcome* guard) noexcept;
@@ -922,15 +940,22 @@ private:
     // when neither is. One evaluator for the guard and the hold room.
     bool CollisionOffsetUs(size_t divisor, double headroom_us, double* offset_us, bool* headroom) const noexcept;
     bool WorkCurrent(size_t divisor) const noexcept;
-    bool BehindWait(size_t divisor) const noexcept;
+    bool BehindWait(PacingRung rung, size_t divisor) const noexcept;
+    // F, the median first submission − RENDERSUBMIT_START of the stream
+    // proof's pairs (GPU floor, above); 0 until LEAD_WARM_SAMPLES.
+    double FirstSubmissionUs() const noexcept;
 
     // Sample assembly
     bool PreviousResolved(const PendingFrame& frame) const noexcept;
     void TryFinalize(PendingFrame* frame) noexcept;
     void ForceFinalize(PendingFrame* frame) noexcept;
     void EmitSample(PendingFrame* frame) noexcept;
+    // The lead sample X of a frame (below) and, through raw_us, its measured
+    // release → output point (the GPU waits: max(p, r) − s; the other rungs:
+    // X), and through predecessor_wait_us the GPU wait for frame n − 1 that X
+    // leaves out (0 otherwise).
     double SampleUs(const PendingFrame& frame, const PendingFrame* previous,
-        int64_t* own_ready_qpc = nullptr, double* carried_us = nullptr) const noexcept;
+        double* raw_us = nullptr, double* predecessor_wait_us = nullptr) const noexcept;
     // The game's simulation → render queue q (above), in µs: FG input wait,
     // and GPU queue wait per its render_queue; 0 for other rungs or without
     // e, w, p and the previous frame's b.
@@ -948,8 +973,9 @@ private:
         double* begin_us, double* end_us) const noexcept;
     bool PreviousGpuResume(const PendingFrame* previous, int64_t origin_qpc,
         double* resume_us) const noexcept;
-    // The previous GPU-rung frame's GPU waited at its gate (probe w <= o, else
-    // held and ready before the Signal): only then can it carry a delay.
+    // A GPU-rung frame's GPU waited at its gate (probe w <= o, else held and
+    // ready before the Signal): a frame the cap held (cap bound), a queue-order
+    // pair's frame n on the FG input wait, the render queue's RemoveHeld.
     static bool PreviousGpuHeld(const PendingFrame& previous) noexcept;
     double MicrosecondsBetween(int64_t from_qpc, int64_t to_qpc) const noexcept;
 
@@ -1026,11 +1052,24 @@ private:
         size_t divisor = 0;
     };
     std::array<GpuPacedRing, 2> gpu_paced_rings_{};
-    // Queue order: the newest LEAD_CONCURRENCY_SAMPLES pairs, 1 = concurrent.
-    std::array<uint8_t, LEAD_CONCURRENCY_SAMPLES> concurrency_{};
-    size_t concurrency_head_ = 0;
-    size_t concurrency_count_ = 0;
-    size_t concurrent_in_window_ = 0;
+    // The measured readiness (release → GPU ready) of every GPU-rung frame per
+    // FG divisor slot: the early side's stand-in until the GPU floor's ring is
+    // warm (EarlyLeadUs). The lead samples leave out the wait for frame n − 1
+    // behind the wait, so they would put such a frame's target earlier than it
+    // can be ready.
+    std::array<GpuPacedRing, LEAD_DIVISOR_BUCKETS> gpu_ready_rings_{};
+    // Queue order: the newest LEAD_CONCURRENCY_SAMPLES pairs of each GPU
+    // output ([0] GPU queue wait, [1] FG input wait), 1 = concurrent.
+    struct QueueOrderWindow {
+        std::array<uint8_t, LEAD_CONCURRENCY_SAMPLES> pairs{};
+        size_t head = 0;
+        size_t count = 0;
+        size_t concurrent = 0;
+    };
+    std::array<QueueOrderWindow, 2> queue_order_{};
+    // FG input wait frames since the newest Reflex report of one, per FG
+    // divisor slot (LEAD_WORK_STALE_FRAMES + 1 after a reset: stale).
+    std::array<uint32_t, LEAD_DIVISOR_BUCKETS> fg_report_age_frames_{};
     int64_t qpc_frequency_ = 0;
     bool lifecycle_known_ = false;
     PacingPlanKey lifecycle_{}; // identity domain, producer epoch and generation of the newest release

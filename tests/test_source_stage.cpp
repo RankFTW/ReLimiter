@@ -899,14 +899,14 @@ void TestEarliestReleaseLimitsWait()
 // Developer A/B gpu_paced_cadence: a held frame whose release the GPU floor
 // sets (the floor is the earliest release and later than its arrival) is
 // released at the floor, never judged late at its source or its output, and
-// its output target is at least its release plus the early lead: the
-// bucket's Q5(X) − allowance (3,010 − 500 µs here) until 32 frames were
-// released by the floor, a restarted bucket's old median, and then the
-// floor-released frames' own X (TestGpuPacedRing). Its record carries the
-// GPU-paced flag. A frame whose game entered the Reflex Sleep for its index
-// before the floor is the floor's even when its marker lands just after it
-// (released at the marker). The key off, a later render-thread term and an
-// arrival after the floor without a Sleep entry for this index are not
+// its output target is at least its release plus the early lead: until 32
+// frames were released by the floor, the Q5 of the GPU waits' measured
+// readiness − allowance (3,000 − 500 µs here; a restarted lead keeps it),
+// and then the floor-released frames' own X (TestGpuPacedRing). Its record
+// carries the GPU-paced flag. A frame whose game entered the Reflex Sleep for
+// its index before the floor is the floor's even when its marker lands just
+// after it (released at the marker). The key off, a later render-thread term
+// and an arrival after the floor without a Sleep entry for this index are not
 // GPU-paced, and their output 8 ms past T restarts the cadence; with a cold
 // bucket the floor still releases the frame but without an early lead the
 // grid judges its source as before: 6 ms past S is a SourceLate restart.
@@ -920,12 +920,12 @@ void TestGpuPacedCadence()
     struct Case { bool key_on; bool warm; bool restarted; bool floor_binds; bool arrival_first; int sleep;
                   bool paced; double early_us; };
     const Case cases[] = {
-        { true, true, false, true, true, 0, true, 2'510.0 },
-        { true, true, true, true, true, 0, true, 2'510.0 },
+        { true, true, false, true, true, 0, true, 2'500.0 },
+        { true, true, true, true, true, 0, true, 2'500.0 },
         { false, true, false, true, true, 0, false, 0.0 },
         { true, true, false, false, true, 0, false, 0.0 },
         { true, true, false, true, false, 0, false, 0.0 },
-        { true, true, false, true, false, 1, true, 2'510.0 },
+        { true, true, false, true, false, 1, true, 2'500.0 },
         { true, true, false, true, false, 2, false, 0.0 },
         { true, false, false, true, true, 0, true, 0.0 },
     };
@@ -993,10 +993,9 @@ void TestGpuPacedCadence()
 
 // Developer A/B gpu_paced_cadence: once 32 frames were released by the GPU
 // floor, the early lead is the low side of their own X (ready 5,000 µs after
-// the floor here: 5,000 − 500 µs), not of the bucket, whose samples include
-// every earlier release (3,000 µs). No frame the floor releases restarts the
-// cadence, however far its floor lies past S. The early lead never exceeds
-// the frame's lead L.
+// the floor here: 5,000 − 500 µs), not of every GPU wait frame's readiness
+// (3,000 µs). No frame the floor releases restarts the cadence, however far
+// its floor lies past S. The early lead never exceeds the frame's lead L.
 void TestGpuPacedRing()
 {
     std::printf("Test: the GPU-paced target follows the X of frames the floor released\n");
@@ -1032,7 +1031,7 @@ void TestGpuPacedRing()
         CHECK(frame.epoch_started == PacingEpochReason::None);
         const double early_us = static_cast<double>(frame.plan.output_target_qpc - floor) / 10.0;
         // 32 floor-released samples precede frame i = 32.
-        if (i == 0) CHECK(early_us > 2'500.0 && early_us < 2'520.0);
+        if (i == 0) CHECK(early_us > 2'499.0 && early_us < 2'501.0);
         if (i >= 32) CHECK(early_us > 4'499.0 && early_us < 4'501.0);
         finish(frame, 5'000.0);
         last = frame;
@@ -1086,7 +1085,7 @@ void TestGpuPacedRhythm()
         g_stage.DrainStageEvents();
         clock.now = done;
     };
-    // Warm lead: ready 3,000 µs after each release (early side 2,510 µs). The
+    // Warm lead: ready 3,000 µs after each release (early side 2,500 µs). The
     // frames are not held, so their reports give GPU periods: 17,000 µs
     // (median bin 17,010), 250 µs idle before each.
     for (int i = 0; i < 40; ++i) {
@@ -1140,7 +1139,7 @@ void TestGpuPacedRhythm()
     const SourceStageFrame second = run(candidate + Ticks(2'000.0), smooth);
     CHECK(second.planned && second.gpu_paced && second.release_qpc == candidate + Ticks(500.0));
     CHECK(second.epoch_started == PacingEpochReason::None);
-    const int64_t target = second.release_qpc + Ticks(2'510.0);
+    const int64_t target = second.release_qpc + Ticks(2'500.0);
     CHECK(second.plan.output_target_qpc > target - 10 && second.plan.output_target_qpc < target + 10);
     CHECK(steps(GpuPacedRhythmStep::Smooth) == smooths + 1);
     finish(second, 5'000.0);

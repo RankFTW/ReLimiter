@@ -246,10 +246,14 @@ void TestNativeHoldOverlap()
     CHECK(controller->BucketStatus(PacingRung::NativeHold, 1.0).samples == 2);
 }
 
+// GPU queue wait sample with the queue order unknown (no Reflex reports):
+// the measured readiness, floored at the Present call, whatever the previous
+// frame's GPU did. A frame after one that promised a probe still waits for
+// it (the resume is the GPU's pass of that frame's gate behind the wait).
 void TestGpuQueueSample()
 {
     auto controller = MakeController();
-    // No previous frame: resume = p, so X = r − s.
+    // X = r − s.
     controller->OnSourceRelease(Start(1, PacingRung::GpuQueueWait, 10000.0));
     controller->OnStageEvent(Event(1, Kind::PresentCall, 12000.0));
     controller->OnStageEvent(Event(1, Kind::GpuReady, 15000.0));
@@ -258,14 +262,14 @@ void TestGpuQueueSample()
     controller->OnStageEvent(Event(1, Kind::OutputRelease, 18000.0));
     controller->OnStageEvent(Resume(1, 18300.0, 15000.0)); // u − o = 300
 
-    // Probe u_1 after p_2: X = (17500 − 16000) + (23000 − 18300).
+    // Frame 1's GPU waited at its gate until 18300: X stays r − s.
     controller->OnSourceRelease(Start(2, PacingRung::GpuQueueWait, 16000.0));
     controller->OnStageEvent(Event(2, Kind::PresentCall, 17500.0));
     controller->OnStageEvent(Event(2, Kind::GpuReady, 23000.0));
     CHECK(controller->Statistics().samples == 2);
-    CHECK_NEAR(controller->Statistics().last_sample_us, 6200.0);
+    CHECK_NEAR(controller->Statistics().last_sample_us, 7000.0);
 
-    // Frame 2 has no probe: u_2 = o_2 + median{300}.
+    // Frame 3 promised a probe: frame 4 waits for u_3.
     controller->OnStageEvent(Event(2, Kind::OutputRelease, 24000.0));
     LeadFrameStart probed = Start(3, PacingRung::GpuQueueWait, 22000.0);
     probed.gpu_resume_probe = true;
@@ -273,177 +277,45 @@ void TestGpuQueueSample()
     controller->OnStageEvent(Event(3, Kind::PresentCall, 23000.0));
     controller->OnStageEvent(Event(3, Kind::GpuReady, 28000.0));
     CHECK(controller->Statistics().samples == 3);
-    CHECK_NEAR(controller->Statistics().last_sample_us, 4700.0); // 1000 + (28000 − 24300)
-
-    // Frame 3 promised a probe: frame 4 waits for u_3 instead of estimating it.
+    CHECK_NEAR(controller->Statistics().last_sample_us, 6000.0);
     controller->OnStageEvent(Event(3, Kind::OutputRelease, 29000.0));
     controller->OnSourceRelease(Start(4, PacingRung::GpuQueueWait, 27000.0));
     controller->OnStageEvent(Event(4, Kind::PresentCall, 28500.0));
     controller->OnStageEvent(Event(4, Kind::GpuReady, 33000.0));
     CHECK(controller->Statistics().samples == 3);
-    controller->OnStageEvent(Resume(3, 29400.0, 28000.0)); // u − o = 400
+    controller->OnStageEvent(Resume(3, 29400.0, 28000.0));
     CHECK(controller->Statistics().samples == 4);
-    CHECK_NEAR(controller->Statistics().last_sample_us, 5100.0); // 1500 + (33000 − 29400)
+    CHECK_NEAR(controller->Statistics().last_sample_us, 6000.0);
 
-    // p after the probe: max(p, u) = p.
-    controller->OnStageEvent(Event(4, Kind::OutputRelease, 34000.0));
-    controller->OnStageEvent(Resume(4, 35000.0, 33000.0)); // u − o = 1000
+    // GPU work that finished before the present call: X = p − s.
+    controller->OnStageEvent(Event(4, Kind::OutputRelease, 34000.0, PacingPlanStatus::Late));
     controller->OnSourceRelease(Start(5, PacingRung::GpuQueueWait, 33500.0));
-    controller->OnStageEvent(Event(5, Kind::PresentCall, 35500.0));
-    controller->OnStageEvent(Event(5, Kind::GpuReady, 39000.0));
-    CHECK_NEAR(controller->Statistics().last_sample_us, 5500.0); // 2000 + 3500
-
-    // Lower-index median of {300, 400, 1000} is 400: u_5 = 40000 + 400.
-    controller->OnStageEvent(Event(5, Kind::OutputRelease, 40000.0));
-    controller->OnSourceRelease(Start(6, PacingRung::GpuQueueWait, 38000.0));
-    controller->OnStageEvent(Event(6, Kind::PresentCall, 39000.0));
-    controller->OnStageEvent(Event(6, Kind::GpuReady, 45000.0));
-    CHECK_NEAR(controller->Statistics().last_sample_us, 5600.0); // 1000 + (45000 − 40400)
-
-    // A Late previous frame queued no wait, and GPU work that finished
-    // before the present call adds nothing: X = p − s.
-    controller->OnStageEvent(Event(6, Kind::OutputRelease, 45500.0, PacingPlanStatus::Late));
-    controller->OnSourceRelease(Start(7, PacingRung::GpuQueueWait, 44000.0));
-    controller->OnStageEvent(Event(7, Kind::GpuReady, 45000.0));
-    CHECK(controller->Statistics().samples == 6);
-    controller->OnStageEvent(Event(7, Kind::PresentCall, 47000.0));
-    CHECK(controller->Statistics().samples == 7);
+    controller->OnStageEvent(Event(5, Kind::GpuReady, 34000.0));
+    CHECK(controller->Statistics().samples == 4);
+    controller->OnStageEvent(Event(5, Kind::PresentCall, 36500.0));
+    CHECK(controller->Statistics().samples == 5);
     CHECK_NEAR(controller->Statistics().last_sample_us, 3000.0);
 
     const LeadStatistics statistics = controller->Statistics();
+    CHECK(statistics.predecessor_wait_samples == 0);
     CHECK(statistics.missing_ready == 0);
     CHECK(statistics.unmatched_events == 0);
     CHECK(statistics.invalid_inputs == 0);
 }
 
-void TestGpuResumeWithoutHistory()
+// The GPU waits learn per FG divisor slot: an FG input wait frame of
+// divisor 2 lands in its own bucket.
+void TestGpuRungBuckets()
 {
     auto controller = MakeController();
-    controller->OnSourceRelease(Start(1, PacingRung::GpuQueueWait, 10000.0));
-    controller->OnStageEvent(Event(1, Kind::PresentCall, 11000.0));
-    controller->OnStageEvent(Event(1, Kind::GpuReady, 13000.0));
-    controller->OnStageEvent(Event(1, Kind::OutputRelease, 18000.0));
-    // No probe observed yet: u_1 = o_1 + 0.
-    controller->OnSourceRelease(Start(2, PacingRung::GpuQueueWait, 16000.0));
-    controller->OnStageEvent(Event(2, Kind::PresentCall, 17000.0));
-    controller->OnStageEvent(Event(2, Kind::GpuReady, 21000.0));
-    CHECK(controller->Statistics().samples == 2);
-    CHECK_NEAR(controller->Statistics().last_sample_us, 4000.0); // 1000 + (21000 − 18000)
-
-    // FG input waits use the same formula in their own divisor bucket.
+    FeedGpuFrame(controller.get(), 1, PacingRung::GpuQueueWait, 5000.0, 1.0);
+    CHECK_NEAR(controller->Statistics().last_sample_us, 5000.0);
     FeedGpuFrame(controller.get(), 100, PacingRung::FgInputWait, 6000.0, 2.0);
     CHECK_NEAR(controller->Statistics().last_sample_us, 6000.0);
     CHECK(controller->BucketStatus(PacingRung::FgInputWait, 2.0).samples == 1);
     CHECK(controller->BucketStatus(PacingRung::FgInputWait, 1.0).samples == 0);
     CHECK(controller->BucketStatus(PacingRung::GpuQueueWait, 2.0).samples == 0);
-}
-
-// Carried hold on the FG input wait: holds carried through a busy GPU. Frame n's GPU
-// work waits behind frame n − 1's release; with the RENDERSUBMIT_START time w
-// the sample is the frame's own readiness, w + G, not the chained r − s.
-void TestGpuCarriedHold()
-{
-    auto controller = MakeController();
-    const PacingRung fg = PacingRung::FgInputWait;
-    // Frame 1: no previous frame, X = r − s = 11000 (w + G with G = 9000).
-    controller->OnSourceRelease(Start(1, fg, 10000.0));
-    controller->OnStageEvent(Event(1, Kind::RenderSubmitStart, 12000.0));
-    controller->OnStageEvent(Event(1, Kind::PresentCall, 18000.0));
-    controller->OnStageEvent(Event(1, Kind::GpuReady, 21000.0));
-    CHECK_NEAR(controller->Statistics().last_sample_us, 11000.0);
-    controller->OnStageEvent(Event(1, Kind::OutputRelease, 28000.0)); // held to T_1, u_1 = o_1
-
-    // Frame 2: the GPU is free of frame 1 at u_1 = 28000, its own readiness
-    // was 21000, so the hold carried c = max(22000, 28000) − max(22000, 21000)
-    // = 6000: X = (37000 − 6000) − 20000 = 11000, not 17000.
-    controller->OnSourceRelease(Start(2, fg, 20000.0));
-    controller->OnStageEvent(Event(2, Kind::RenderSubmitStart, 22000.0));
-    controller->OnStageEvent(Event(2, Kind::PresentCall, 28000.0));
-    controller->OnStageEvent(Event(2, Kind::GpuReady, 37000.0));
-    CHECK_NEAR(controller->Statistics().last_sample_us, 11000.0);
-    CHECK(controller->Statistics().carried_hold_samples == 1);
-    CHECK_NEAR(controller->Statistics().last_carried_hold_us, 6000.0);
-    controller->OnStageEvent(Event(2, Kind::OutputRelease, 38000.0));
-
-    // Frame 3 chains through frame 2: f = max(r_2, u_2) = 38000 and f' =
-    // frame 2's own readiness 31000, so c = 38000 − 32000 = 6000 again.
-    controller->OnSourceRelease(Start(3, fg, 30000.0));
-    controller->OnStageEvent(Event(3, Kind::RenderSubmitStart, 32000.0));
-    controller->OnStageEvent(Event(3, Kind::PresentCall, 38000.0));
-    controller->OnStageEvent(Event(3, Kind::GpuReady, 47000.0));
-    CHECK_NEAR(controller->Statistics().last_sample_us, 11000.0);
-    CHECK(controller->Statistics().carried_hold_samples == 2);
-    controller->OnStageEvent(Event(3, Kind::OutputRelease, 48000.0));
-
-    // Without the marker w = p = u_3 hides the carried delay (the chained
-    // formula): X = p + (r − max(p, u)) = 8000 + 9000.
-    controller->OnSourceRelease(Start(4, fg, 40000.0));
-    controller->OnStageEvent(Event(4, Kind::PresentCall, 48000.0));
-    controller->OnStageEvent(Event(4, Kind::GpuReady, 57000.0));
-    CHECK_NEAR(controller->Statistics().last_sample_us, 17000.0);
-    CHECK(controller->Statistics().carried_hold_samples == 2);
-
-    // A marker before s is clamped to s: c = max(s, 58000) − max(s, 57000) =
-    // 1000, and the floor at p holds X at 9000.
-    controller->OnStageEvent(Event(4, Kind::OutputRelease, 58000.0));
-    controller->OnSourceRelease(Start(5, fg, 50000.0, kInterval, 2.0));
-    controller->OnStageEvent(Event(5, Kind::RenderSubmitStart, 49000.0));
-    controller->OnStageEvent(Event(5, Kind::PresentCall, 59000.0));
-    controller->OnStageEvent(Event(5, Kind::GpuReady, 60000.0));
-    CHECK_NEAR(controller->Statistics().last_sample_us, 9000.0);
-    CHECK(controller->Statistics().invalid_inputs == 0);
-    CHECK(controller->Statistics().unmatched_events == 0);
-}
-
-// Only a previous frame whose GPU waited at its gate carries a delay, and the
-// GPU queue wait starts its own work at p, not at RENDERSUBMIT_START.
-void TestCarriedHoldNeedsAHeldPreviousFrame()
-{
-    // FG input wait: frame 1 was ready at 21000, after its Signal at 20500
-    // (late): frame 2 inherits nothing, X = 37000 − 20000.
-    auto late = MakeController();
-    late->OnSourceRelease(Start(1, PacingRung::FgInputWait, 10000.0));
-    late->OnStageEvent(Event(1, Kind::RenderSubmitStart, 12000.0));
-    late->OnStageEvent(Event(1, Kind::PresentCall, 18000.0));
-    late->OnStageEvent(Event(1, Kind::GpuReady, 21000.0));
-    late->OnStageEvent(Event(1, Kind::OutputRelease, 20500.0));
-    late->OnSourceRelease(Start(2, PacingRung::FgInputWait, 20000.0));
-    late->OnStageEvent(Event(2, Kind::RenderSubmitStart, 22000.0));
-    late->OnStageEvent(Event(2, Kind::PresentCall, 28000.0));
-    late->OnStageEvent(Event(2, Kind::GpuReady, 37000.0));
-    CHECK_NEAR(late->Statistics().last_sample_us, 17000.0);
-    CHECK(late->Statistics().carried_hold_samples == 0);
-
-    // A probed GPU queue wait whose GPU reached the Wait after the Signal
-    // (w = 21050 > o = 20500) did not hold either.
-    auto probed = MakeController();
-    LeadFrameStart first = Start(1, PacingRung::GpuQueueWait, 10000.0);
-    first.gpu_resume_probe = true;
-    probed->OnSourceRelease(first);
-    probed->OnStageEvent(Event(1, Kind::PresentCall, 14000.0));
-    probed->OnStageEvent(Event(1, Kind::GpuReady, 21000.0));
-    probed->OnStageEvent(Event(1, Kind::OutputRelease, 20500.0));
-    probed->OnStageEvent(Resume(1, 21056.0, 21050.0));
-    probed->OnSourceRelease(Start(2, PacingRung::GpuQueueWait, 20000.0));
-    probed->OnStageEvent(Event(2, Kind::PresentCall, 21000.0));
-    probed->OnStageEvent(Event(2, Kind::GpuReady, 30000.0));
-    CHECK_NEAR(probed->Statistics().last_sample_us, 10000.0);
-    CHECK(probed->Statistics().carried_hold_samples == 0);
-
-    // GPU queue wait, frame 1 held (ready 21000, Signal and u at 28000): the
-    // early RENDERSUBMIT_START at 22000 is ignored, w = p = 26000, so c =
-    // 28000 − 26000 = 2000 and X = (37000 − 2000) − 20000 = 15000.
-    auto queue = MakeController();
-    queue->OnSourceRelease(Start(1, PacingRung::GpuQueueWait, 10000.0));
-    queue->OnStageEvent(Event(1, Kind::PresentCall, 18000.0));
-    queue->OnStageEvent(Event(1, Kind::GpuReady, 21000.0));
-    queue->OnStageEvent(Event(1, Kind::OutputRelease, 28000.0));
-    queue->OnSourceRelease(Start(2, PacingRung::GpuQueueWait, 20000.0));
-    queue->OnStageEvent(Event(2, Kind::RenderSubmitStart, 22000.0));
-    queue->OnStageEvent(Event(2, Kind::PresentCall, 26000.0));
-    queue->OnStageEvent(Event(2, Kind::GpuReady, 37000.0));
-    CHECK_NEAR(queue->Statistics().last_sample_us, 15000.0);
-    CHECK_NEAR(queue->Statistics().last_carried_hold_us, 2000.0);
+    CHECK(controller->BucketStatus(PacingRung::GpuQueueWait, 1.0).samples == 1);
 }
 
 // The game's simulation → render queue: an FG input wait
@@ -451,7 +323,7 @@ void TestCarriedHoldNeedsAHeldPreviousFrame()
 // leave the previous frame's Present, q = max(0, min(w_n, b_{n−1}) −
 // max(s_n, e_n)); the slack keeps X. Other rungs keep X with the same stage
 // times (on source only q was the game's own pipeline depth).
-// No GPU frame is held, so the carried hold adds nothing.
+// The queue order is unknown, so the measured readiness stays whole.
 void TestSimulationRenderQueue()
 {
     auto controller = MakeController();
@@ -524,16 +396,16 @@ void TestSimulationRenderQueue()
         PacingPlanStatus::Held);
     CHECK_NEAR(controller->Statistics().last_sample_us, 4000.0);
     CHECK(controller->Statistics().queued_samples == 2);
-    CHECK(controller->Statistics().carried_hold_samples == 0);
+    CHECK(controller->Statistics().predecessor_wait_samples == 0);
     CHECK(controller->Statistics().invalid_inputs == 0);
     CHECK(controller->Statistics().unmatched_events == 0);
 }
 
 // Developer A/B gpu_queue_wait_render_queue on the GPU queue wait. Frame 2
 // finished at 22000 and its render thread left frame 1's Present at 25000:
-// q = 3000 of X = 37000 − 20000. Frame 1 was ready at 21000 before its
-// Signal at 24000, so held it was a GPU wait at the gate; no delay carried
-// into frame 2 (u_1 = 24000 < p_2 = 27000). Keep learns X, Remove X − q
+// q = 3000 of X = 37000 − 20000 (the queue order is unknown, so X is the
+// measured readiness). Frame 1 was ready at 21000 before its Signal at
+// 24000, so held it was a GPU wait at the gate. Keep learns X, Remove X − q
 // either way, RemoveHeld X − q only behind the held frame.
 void TestGpuQueueWaitRenderQueue()
 {
@@ -556,7 +428,7 @@ void TestGpuQueueWaitRenderQueue()
         controller->OnStageEvent(Event(2, Kind::PresentCall, 27000.0));
         controller->OnStageEvent(Event(2, Kind::GpuReady, 37000.0));
         controller->OnStageEvent(Event(2, Kind::OutputRelease, 37000.0, PacingPlanStatus::Late));
-        CHECK(controller->Statistics().carried_hold_samples == 0);
+        CHECK(controller->Statistics().predecessor_wait_samples == 0);
         *queued = controller->Statistics().queued_samples;
         return controller->Statistics().last_sample_us;
     };
@@ -575,56 +447,6 @@ void TestGpuQueueWaitRenderQueue()
     CHECK(queued == 1);
     CHECK_NEAR(sample(PacingRenderQueue::RemoveHeld, late, &queued), 17000.0);
     CHECK(queued == 0);
-}
-
-// Closed loop of the carried hold on the FG input wait: a GPU at 95% of the interval behind
-// ReLimiter's own holds. The chained sample made X follow L up to the
-// budget; the carried-hold sample keeps the lead near the frame's own w + G.
-double RunGpuChainLoop(bool render_submit_marker, uint32_t* negative)
-{
-    auto controller = MakeController();
-    const double target_origin = 100000.0;
-    double free_us = 0.0; // the GPU is free of the previous frame
-    double lead = 0.0;
-    for (uint64_t n = 1; n <= 3000; ++n) {
-        LeadRequest request = Request(PacingRung::FgInputWait);
-        request.quantile = 0.75;
-        lead = controller->NextLeadUs(request);
-        const double target = target_origin + static_cast<double>(n) * kInterval;
-        const double source = target - lead;
-        const double submit = source + 2000.0 + static_cast<double>((n * 37) % 1000);
-        const double present = source + 8000.0;
-        const double gpu = 9200.0 + static_cast<double>((n * 53) % 600);
-        const double ready = std::max(std::max(submit, free_us) + gpu, present + 200.0);
-        const bool held = ready <= target;
-        const double output = held ? target : ready;
-        LeadFrameStart start = Start(n, PacingRung::FgInputWait, source);
-        start.lead_us = lead;
-        controller->OnSourceRelease(start);
-        if (render_submit_marker) controller->OnStageEvent(Event(n, Kind::RenderSubmitStart, submit));
-        controller->OnStageEvent(Event(n, Kind::PresentCall, present));
-        controller->OnStageEvent(Event(n, Kind::GpuReady, ready));
-        controller->OnStageEvent(Event(n, Kind::OutputRelease, output,
-            held ? PacingPlanStatus::Held : PacingPlanStatus::Late));
-        free_us = output;
-    }
-    *negative = controller->Feasibility(PacingRung::FgInputWait, 1.0).negative_count;
-    return lead;
-}
-
-void TestGpuChainLeadStaysOwn()
-{
-    uint32_t negative = 0;
-    // Own readiness w + G is at most 3000 + 9800: Q75 about 12.3 ms, plus
-    // the 500 µs allowance.
-    const double own = RunGpuChainLoop(true, &negative);
-    std::printf("chain loop: lead with marker %.0f us, negative %u/120\n", own, negative);
-    CHECK(own < 14000.0);
-    CHECK(negative < 24);
-    uint32_t chained_negative = 0;
-    const double chained = RunGpuChainLoop(false, &chained_negative);
-    std::printf("chain loop: lead without marker %.0f us, negative %u/120\n", chained, chained_negative);
-    CHECK(chained > own + 4000.0); // the chained sample climbs toward 2 I
 }
 
 // Rogue Core capture: the game's release-to-ready time X
@@ -1260,23 +1082,10 @@ namespace
             source_us + 4000.0 + wait_offset_us));
     }
 
-    // The resume history median, read through its only consumer, the C1
-    // decontamination fallback: frame grid_index is held on the GPU queue
-    // wait without a probe, so frame grid_index + 1 uses u = o + median and
-    // X = 1000 + (14000 − (2000 + median)) = 13000 − median. Adds no history.
-    double FallbackMedianUs(LeadController* controller, uint64_t grid_index)
+    // The resume history median (LeadController::MedianResumeDelayUs).
+    double FallbackMedianUs(LeadController* controller)
     {
-        const double source_us = static_cast<double>(grid_index) * kInterval;
-        controller->OnSourceRelease(Start(grid_index, PacingRung::GpuQueueWait, source_us));
-        controller->OnStageEvent(Event(grid_index, Kind::PresentCall, source_us + 1000.0));
-        controller->OnStageEvent(Event(grid_index, Kind::GpuReady, source_us + 2000.0));
-        controller->OnStageEvent(Event(grid_index, Kind::OutputRelease, source_us + 8000.0));
-        controller->OnSourceRelease(Start(grid_index + 1, PacingRung::GpuQueueWait, source_us + 6000.0));
-        controller->OnStageEvent(Event(grid_index + 1, Kind::PresentCall, source_us + 7000.0));
-        const uint64_t samples = controller->Statistics().samples;
-        controller->OnStageEvent(Event(grid_index + 1, Kind::GpuReady, source_us + 20000.0));
-        CHECK(controller->Statistics().samples == samples + 1);
-        return 13000.0 - controller->Statistics().last_sample_us;
+        return controller->MedianResumeDelayUs();
     }
 }
 
@@ -1460,16 +1269,17 @@ void TestSlackWindow()
     CHECK(controller->Statistics().invalid_inputs == invalid + 2);
 }
 
-// C1 decontamination fallback median: lower-index median of the newest 32
-// waited u − o observations of held, probed frames; 0 before any.
+// Resume history median: lower-index median of the newest 32 waited u − o
+// observations of held, probed frames; 0 before any. Behind the wait it is a
+// held frame's resume without a probe.
 void TestResumeHistoryMedian()
 {
     auto controller = MakeController();
-    CHECK_NEAR(FallbackMedianUs(controller.get(), 1), 0.0);
+    CHECK_NEAR(FallbackMedianUs(controller.get()), 0.0);
     for (uint64_t index = 3; index < 3 + LEAD_RESUME_MEDIAN_SAMPLES - 1; ++index) {
         FeedProbedGpuFrame(controller.get(), index, 300.0);
     }
-    CHECK_NEAR(FallbackMedianUs(controller.get(), 34), 300.0); // 31 observations already count
+    CHECK_NEAR(FallbackMedianUs(controller.get()), 300.0); // 31 observations already count
 
     // Frames without a probe or without a hold add nothing.
     FeedGpuFrame(controller.get(), 40, PacingRung::GpuQueueWait, 4000.0, 1.0);
@@ -1478,23 +1288,23 @@ void TestResumeHistoryMedian()
     controller->OnStageEvent(Event(41, Kind::OutputRelease, late_source_us + 4000.0, PacingPlanStatus::Late));
     controller->OnStageEvent(Event(41, Kind::GpuResume, late_source_us + 9000.0));
     FeedProbedGpuFrame(controller.get(), 50, 300.0); // the 32nd 300
-    CHECK_NEAR(FallbackMedianUs(controller.get(), 51), 300.0);
+    CHECK_NEAR(FallbackMedianUs(controller.get()), 300.0);
 
     // Newest 32 only: 16 × 300 then 16 × 900 → lower-index median 300; one more → 900.
     for (uint64_t index = 60; index < 76; ++index) FeedProbedGpuFrame(controller.get(), index, 900.0);
-    CHECK_NEAR(FallbackMedianUs(controller.get(), 76), 300.0);
+    CHECK_NEAR(FallbackMedianUs(controller.get()), 300.0);
     FeedProbedGpuFrame(controller.get(), 80, 900.0);
-    CHECK_NEAR(FallbackMedianUs(controller.get(), 81), 900.0);
+    CHECK_NEAR(FallbackMedianUs(controller.get()), 900.0);
 
-    // Not clamped: the fallback uses the measured median as is.
+    // Not clamped: the measured median as is.
     for (uint64_t index = 90; index < 90 + LEAD_RESUME_MEDIAN_SAMPLES; ++index) {
         FeedProbedGpuFrame(controller.get(), index, 2500.0);
     }
-    CHECK_NEAR(FallbackMedianUs(controller.get(), 130), 2500.0);
+    CHECK_NEAR(FallbackMedianUs(controller.get()), 2500.0);
 
     // A lifecycle reset clears the history.
     controller->Reset(kFrequency);
-    CHECK_NEAR(FallbackMedianUs(controller.get(), 200), 0.0);
+    CHECK_NEAR(FallbackMedianUs(controller.get()), 0.0);
     CHECK(controller->Statistics().invalid_inputs == 0);
 }
 
@@ -1506,14 +1316,14 @@ void TestResumeDelayRequiresWait()
         FeedProbedGpuFrame(controller.get(), index, 300.0);
     }
     FeedProbedGpuFrame(controller.get(), 32, 300.0, 0.0);
-    CHECK_NEAR(FallbackMedianUs(controller.get(), 33), 300.0);
+    CHECK_NEAR(FallbackMedianUs(controller.get()), 300.0);
     CHECK(controller->Statistics().resume_not_waited == 0);
 
     // GPU backlog: it reached the Wait after the Signal, so u − o is its own
     // earlier work, not Signal→resume latency; none of it enters the
     // history or the late-resume counters.
     for (uint64_t index = 35; index <= 66; ++index) FeedProbedGpuFrame(controller.get(), index, 2000.0, 1.0);
-    CHECK_NEAR(FallbackMedianUs(controller.get(), 67), 300.0);
+    CHECK_NEAR(FallbackMedianUs(controller.get()), 300.0);
     CHECK(controller->Statistics().resume_waited_samples == 32); // waited frames only
     CHECK(controller->Statistics().resume_late_samples == 0);
     CHECK(controller->Statistics().resume_not_waited == 32);
@@ -1522,10 +1332,10 @@ void TestResumeDelayRequiresWait()
     FeedGpuFrame(controller.get(), 69, PacingRung::GpuQueueWait, 4000.0, 1.0);
     controller->OnStageEvent(Event(69, Kind::GpuResume, 69.0 * kInterval + 6000.0));
     CHECK(controller->Statistics().resume_not_waited == 33);
-    CHECK_NEAR(FallbackMedianUs(controller.get(), 70), 300.0);
+    CHECK_NEAR(FallbackMedianUs(controller.get()), 300.0);
 
-    // The backlogged frame did not hold (w > o): its u_{n−1} = s_73 + 2000 is
-    // the GPU's own work, not a delay ReLimiter carried, so X = r − s = 5000.
+    // With the queue order unknown the sample after the backlogged frame is
+    // the measured readiness, X = r − s = 5000.
     FeedProbedGpuFrame(controller.get(), 72, 8000.0, 1.0);
     const double source_us = 73.0 * kInterval;
     controller->OnSourceRelease(Start(73, PacingRung::GpuQueueWait, source_us));
@@ -1558,22 +1368,11 @@ void TestClearSlackEvidence()
         CHECK(feasibility.samples == 0);
         CHECK(feasibility.negative_count == 0);
     }
-    // ... while the lead windows, the budget flag and the resume history (C1) stay.
+    // ... while the lead windows, the budget flag and the resume history stay.
     CHECK(controller->BucketStatus(PacingRung::SourceOnly, 1.0).samples == 120);
     CHECK(controller->BucketStatus(PacingRung::MarkerHold, 1.0).warm);
     CHECK(controller->Feasibility(PacingRung::MarkerHold, 1.0).budget_limited);
-
-    // The decontamination fallback still uses the uncleared median: frame 200
-    // has no probe, so u_200 = o_200 + 300 and X_201 = 1000 + (12000 − 8300).
-    const double source_us = 200.0 * kInterval;
-    controller->OnSourceRelease(Start(200, PacingRung::GpuQueueWait, source_us));
-    controller->OnStageEvent(Event(200, Kind::PresentCall, source_us + 1000.0));
-    controller->OnStageEvent(Event(200, Kind::GpuReady, source_us + 2000.0));
-    controller->OnStageEvent(Event(200, Kind::OutputRelease, source_us + 8000.0));
-    controller->OnSourceRelease(Start(201, PacingRung::GpuQueueWait, source_us + 6000.0));
-    controller->OnStageEvent(Event(201, Kind::PresentCall, source_us + 7000.0));
-    controller->OnStageEvent(Event(201, Kind::GpuReady, source_us + 12000.0));
-    CHECK_NEAR(controller->Statistics().last_sample_us, 4700.0);
+    CHECK_NEAR(FallbackMedianUs(controller.get()), 300.0);
 
     // New slack accumulates from an empty window.
     FeedLeadFrame(controller.get(), 300, 2000.0, 1000.0);
@@ -2188,12 +1987,14 @@ void TestCollisionGuardQueueOrder()
     CHECK(controller->Statistics().concurrency_samples == 0);
 
     for (uint32_t n = 0; n + 1 < LEAD_WARM_SAMPLES; ++n) pair(5000.0, 6050.0);
-    CHECK(!controller->NextGpuWorkBehindWait(1.0));
+    CHECK(!controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
     controller->NextLeadUs(request, nullptr, &guard);
     CHECK(guard.judged);
     pair(5000.0, 6050.0);
-    CHECK(controller->NextGpuWorkBehindWait(1.0));
-    CHECK(controller->ConcurrencyPairs() == LEAD_WARM_SAMPLES);
+    CHECK(controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
+    CHECK(controller->ConcurrencyPairs(PacingRung::GpuQueueWait) == LEAD_WARM_SAMPLES);
+    CHECK(controller->ConcurrencyPairs(PacingRung::FgInputWait) == 0);
+    CHECK(!controller->NextGpuWorkBehindWait(PacingRung::FgInputWait, 2.0));
     const uint64_t checked = controller->Statistics().collision_checked_frames;
     const double lead = controller->NextLeadUs(request, nullptr, &guard);
     CHECK(!guard.judged);
@@ -2203,40 +2004,46 @@ void TestCollisionGuardQueueOrder()
     CHECK(controller->Statistics().collision_checked_frames == checked);
     CHECK_NEAR(controller->HoldRoomUs(1.0, 0.75, LEAD_RELEASE_HEADROOM_US), 0.0);
 
-    // 50 µs before the release is within the tolerance; 1 ms before is
-    // concurrent work: the guard is back at once.
+    // Behind the wait the next frame's sample leaves out its wait for frame
+    // n: it submitted at s + 5,000 and the GPU passed frame n's gate at
+    // u = s + 6,100, so X = (s + 14,000 − 1,100) − (s + 4,000). 50 µs before
+    // the release is within the tolerance; 1 ms before is concurrent work:
+    // the guard is back at once.
     pair(5000.0, 5950.0);
-    CHECK(controller->NextGpuWorkBehindWait(1.0));
+    CHECK(controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
+    CHECK_NEAR(controller->Statistics().last_sample_us, 8900.0);
+    CHECK_NEAR(controller->Statistics().last_predecessor_wait_us, 1100.0);
     pair(5000.0, 5000.0);
-    CHECK(!controller->NextGpuWorkBehindWait(1.0));
-    CHECK(controller->ConcurrentPairs() == 1);
+    CHECK(!controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
+    CHECK(controller->ConcurrentPairs(PacingRung::GpuQueueWait) == 1);
     CHECK(controller->Statistics().concurrent_samples == 1);
     CHECK_NEAR(controller->Statistics().last_concurrency_us, -1000.0);
     controller->NextLeadUs(request, nullptr, &guard);
     CHECK(guard.judged);
     // It stays until that pair leaves the newest 64.
     for (size_t n = 0; n + 1 < LEAD_CONCURRENCY_SAMPLES; ++n) pair(5000.0, 6050.0);
-    CHECK(!controller->NextGpuWorkBehindWait(1.0));
+    CHECK(!controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
+    CHECK_NEAR(controller->Statistics().last_sample_us, 10000.0); // the measured readiness
     pair(5000.0, 6050.0);
-    CHECK(controller->NextGpuWorkBehindWait(1.0));
+    CHECK(controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
 
     // Without Reflex reports for 65 GPU queue wait releases the guard is back
     // (Present-call margin) until one arrives.
     for (uint64_t frame = 0; frame < 65; ++frame) FeedWorkFrame(controller.get(), index + frame, 0.0);
-    CHECK(!controller->NextGpuWorkBehindWait(1.0));
+    CHECK(!controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
     controller->NextLeadUs(request, nullptr, &guard);
     CHECK(guard.judged && !controller->Statistics().last_guard_headroom);
     FeedWorkFrame(controller.get(), index + 65, 6000.0);
-    CHECK(controller->NextGpuWorkBehindWait(1.0));
+    CHECK(controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
 
     // The pairs outlive a lifecycle reset; the heavy-work window does not.
     controller->Reset(kFrequency);
-    CHECK(controller->ConcurrencyPairs() == LEAD_CONCURRENCY_SAMPLES);
-    CHECK(!controller->NextGpuWorkBehindWait(1.0));
+    CHECK(controller->ConcurrencyPairs(PacingRung::GpuQueueWait) == LEAD_CONCURRENCY_SAMPLES);
+    CHECK(!controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
     for (uint64_t frame = 0; frame < LEAD_WARM_SAMPLES; ++frame) {
         FeedWorkFrame(controller.get(), 1001 + 2 * frame, 6000.0);
     }
-    CHECK(controller->NextGpuWorkBehindWait(1.0));
+    CHECK(controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
     CHECK(controller->Statistics().concurrency_samples == 0);
     CHECK(controller->Statistics().invalid_inputs == 0);
 }
@@ -3073,6 +2880,190 @@ void TestGpuFloorPeriodAcrossReset()
     CHECK_NEAR(controller->GpuPeriodUs(), 0.0);
 }
 
+// FG input wait queue order and the lead sample behind the wait
+// (lead_controller.h). Frame k's target is T = 1,000,000 + k I; it is
+// released L earlier, submits from RENDERSUBMIT_START w = s + 2,000, calls
+// the FG input at p = s + 8,000, and its GPU work starts 2,000 after the GPU
+// passed frame k − 1's gate (that frame's frame generation first); held to T
+// when ready by then. 32 waited pairs whose next frame started after the
+// Signal make the verdict "behind the wait"; until then, with stale reports
+// or after a concurrent pair, the sample is the measured readiness. Behind
+// the wait it is the frame's own work at any lead, a late predecessor adds
+// nothing, F moves w_c to the first submission and without RENDERSUBMIT_START
+// w_c = p. The slack keeps the measured readiness: a late frame is late.
+void TestFgInputWaitBehindWaitSample()
+{
+    auto controller = MakeController();
+    const PacingRung fg = PacingRung::FgInputWait;
+    double gate_us = 0.0; // the GPU passed the previous frame's gate
+    const auto frame = [&](uint64_t k, double lead_us, double gpu_us, bool submit = true, bool report = true,
+        double start_after_gate_us = 2000.0) {
+        const double target = 1'000'000.0 + static_cast<double>(k) * kInterval;
+        const double source = target - lead_us;
+        const double free = gate_us > 0.0 ? gate_us : target - kInterval;
+        const double ready = free + gpu_us;
+        const bool held = ready <= target;
+        const double release = held ? target : ready;
+        LeadFrameStart start = Start(k, fg, source, kInterval, 2.0);
+        start.lead_us = lead_us;
+        controller->OnSourceRelease(start);
+        if (submit) controller->OnStageEvent(Event(k, Kind::RenderSubmitStart, source + 2000.0));
+        controller->OnStageEvent(Event(k, Kind::PresentCall, source + 8000.0));
+        controller->OnStageEvent(Event(k, Kind::GpuReady, ready));
+        controller->OnStageEvent(Event(k, Kind::OutputRelease, release,
+            held ? PacingPlanStatus::Held : PacingPlanStatus::Late));
+        if (report) {
+            controller->OnGpuActiveTime(Key(k).producer_epoch, Key(k).frame_id, 7000.0,
+                Qpc(free + start_after_gate_us));
+        }
+        gate_us = std::max(ready, release);
+    };
+    const auto behind = [&]() { return controller->NextGpuWorkBehindWait(fg, 2.0); };
+    const auto last = [&]() { return controller->Statistics().last_sample_us; };
+
+    // L = 20,000, the GPU 9,000 after the gate: ready at T − 1,000, X = 19,000.
+    uint64_t k = 1;
+    for (; k <= 32; ++k) frame(k, 20000.0, 9000.0);
+    CHECK(controller->ConcurrencyPairs(fg) == LEAD_WARM_SAMPLES - 1 && !behind());
+    frame(k++, 20000.0, 9000.0);
+    CHECK_NEAR(last(), 19000.0);
+    CHECK(behind() && controller->ConcurrentPairs(fg) == 0);
+    CHECK(controller->Statistics().fg_concurrency_samples == LEAD_WARM_SAMPLES);
+    CHECK_NEAR(controller->Statistics().last_fg_concurrency_us, 2000.0);
+    CHECK(!controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 2.0));
+    CHECK(controller->Statistics().predecessor_wait_samples == 0);
+
+    // Behind the wait: the GPU passed frame 33's gate at T − 10,000, 8,000
+    // after w, so X = 19,000 − 8,000, the same at leads of 30 and 40 ms. The
+    // slack keeps the measured readiness: L − X_raw = 1,000.
+    frame(k++, 20000.0, 9000.0);
+    CHECK_NEAR(last(), 11000.0);
+    CHECK_NEAR(controller->Statistics().last_slack_us, 1000.0);
+    CHECK(controller->Statistics().predecessor_wait_samples == 1);
+    CHECK_NEAR(controller->Statistics().last_predecessor_wait_us, 8000.0);
+    frame(k++, 30000.0, 9000.0);
+    CHECK_NEAR(last(), 11000.0);
+    frame(k++, 40000.0, 9000.0);
+    CHECK_NEAR(last(), 11000.0);
+    CHECK_NEAR(controller->Statistics().last_slack_us, 1000.0);
+
+    // A frame the GPU needs 13 ms for is ready 3,000 after T: its own work
+    // is 2,000 + 13,000. The next frame starts behind that late frame, not
+    // its Signal: its own work is 11,000 again and its slack −2,000. The
+    // lateness drains by 1,000 per frame.
+    frame(k++, 20000.0, 13000.0);
+    CHECK_NEAR(last(), 15000.0);
+    CHECK_NEAR(controller->Statistics().last_slack_us, -3000.0);
+    frame(k++, 20000.0, 9000.0);
+    CHECK_NEAR(last(), 11000.0);
+    CHECK_NEAR(controller->Statistics().last_slack_us, -2000.0);
+    frame(k++, 20000.0, 9000.0);
+    frame(k++, 20000.0, 9000.0);
+    frame(k++, 20000.0, 9000.0);
+    CHECK_NEAR(last(), 11000.0);
+    CHECK(behind());
+
+    // F, the stream proof's first-submission delay (830 µs): the frame's GPU
+    // work can start only then, 7,170 before the gate. Without
+    // RENDERSUBMIT_START it starts at the FG input call, 2,000 before it.
+    for (uint64_t index = 0; index < LEAD_WARM_SAMPLES; ++index) {
+        controller->OnReportPair(Key(1).producer_epoch, 500 + index, StreamingPair());
+    }
+    frame(k++, 20000.0, 9000.0);
+    CHECK_NEAR(last(), 11830.0);
+    frame(k++, 20000.0, 9000.0, false);
+    CHECK_NEAR(last(), 17000.0);
+
+    // 65 FG input wait frames without a Reflex report: the reports are stale
+    // and the sample is the measured readiness until one arrives.
+    for (int i = 0; i < 65; ++i) frame(k++, 20000.0, 9000.0, true, false);
+    CHECK(!behind());
+    CHECK_NEAR(last(), 19000.0);
+    frame(k++, 20000.0, 9000.0);
+    CHECK(behind());
+    frame(k++, 20000.0, 9000.0);
+    CHECK_NEAR(last(), 11830.0);
+
+    // The pairs outlive a lifecycle reset; the reports must be current again.
+    const size_t pairs = controller->ConcurrencyPairs(fg);
+    controller->Reset(kFrequency);
+    CHECK(controller->ConcurrencyPairs(fg) == pairs && !behind());
+    frame(k++, 20000.0, 9000.0);
+    CHECK(behind());
+    frame(k++, 20000.0, 9000.0);
+    CHECK_NEAR(last(), 11000.0);
+
+    // One pair whose next frame's GPU work started 1 ms before the Signal
+    // (concurrent): the measured readiness at once.
+    frame(k++, 20000.0, 9000.0, true, true, -1000.0);
+    CHECK(!behind() && controller->ConcurrentPairs(fg) == 1);
+    CHECK(controller->Statistics().fg_concurrent_samples == 1);
+    frame(k++, 20000.0, 9000.0);
+    CHECK_NEAR(last(), 19000.0);
+    CHECK(controller->Statistics().invalid_inputs == 0);
+}
+
+// Closed loop behind the FG input wait (CONTROL Resonant FG 2× at 130):
+// frame n's GPU work starts 2,000 µs (frame n − 1's frame generation) after
+// the GPU passed frame n − 1's gate, P = 9,400–10,399 µs at I = 10,000, and
+// the render thread submits from s + 2,000–2,999. Without Reflex reports
+// (queue order unknown) the sample is the measured readiness, L + (r − T),
+// and the lead climbs to the 3 I budget. With them the sample is the frame's
+// own work and the lead comes down to about Q95(w − s + P) + 0.5 ms, while as
+// many frames are late as before over the same 1,000 GPU periods: the GPU
+// sets their readiness, not the lead. The slack counts every late frame.
+void TestFgBehindWaitLeadFalls()
+{
+    auto controller = MakeController();
+    const PacingRung fg = PacingRung::FgInputWait;
+    double gate_us = 0.0;
+    double lead = 0.0;
+    const auto run = [&](uint64_t first, uint64_t count, bool reports) {
+        uint32_t late = 0;
+        for (uint64_t n = first; n < first + count; ++n) {
+            lead = controller->NextLeadUs(Request(fg, 500.0, kInterval, 2.0));
+            const double target = 100'000.0 + static_cast<double>(n) * kInterval;
+            const double source = target - lead;
+            const double submit = source + 2000.0 + static_cast<double>((n * 37) % 1000);
+            const double present = submit + 6000.0;
+            const double gpu = 9400.0 + static_cast<double>((n * 53) % 1000);
+            const double free = gate_us > 0.0 ? gate_us : target - kInterval;
+            const double gpu_start = std::max(free + 2000.0, submit);
+            const double ready = std::max(gpu_start + gpu - 2000.0, present);
+            const bool held = ready <= target;
+            const double release = held ? target : ready;
+            LeadFrameStart start = Start(n, fg, source, kInterval, 2.0);
+            start.lead_us = lead;
+            controller->OnSourceRelease(start);
+            controller->OnStageEvent(Event(n, Kind::RenderSubmitStart, submit));
+            controller->OnStageEvent(Event(n, Kind::PresentCall, present));
+            controller->OnStageEvent(Event(n, Kind::GpuReady, ready));
+            controller->OnStageEvent(Event(n, Kind::OutputRelease, release,
+                held ? PacingPlanStatus::Held : PacingPlanStatus::Late));
+            if (reports) {
+                controller->OnGpuActiveTime(Key(n).producer_epoch, Key(n).frame_id, gpu - 2000.0, Qpc(gpu_start));
+            }
+            gate_us = std::max(ready, release);
+            if (!held) ++late;
+        }
+        return late;
+    };
+    run(1, 1000, false);
+    const uint32_t late_measured = run(1001, 1000, false);
+    const double lead_measured = lead;
+    run(2001, 1000, true);
+    const uint32_t late_own = run(3001, 1000, true);
+    const double lead_own = lead;
+    std::printf("FG behind-wait loop: lead %.0f us measured, %.0f us own work; late %u / %u of 1,000\n",
+        lead_measured, lead_own, late_measured, late_own);
+    CHECK(lead_measured > 24000.0);
+    CHECK(lead_own > 12000.0 && lead_own < 15000.0);
+    CHECK(late_own <= late_measured + 10 && late_measured <= late_own + 10);
+    CHECK(controller->NextGpuWorkBehindWait(fg, 2.0));
+    const uint32_t late_window = run(4001, LEAD_SLACK_CAPACITY, true);
+    CHECK(controller->Feasibility(fg, 2.0).negative_count == late_window);
+}
+
 // The readiness anchor on the GPU queue wait (lead_controller.h): the
 // pre-gate query runs after the game's measured GPU work, so the GPU end
 // precedes the readiness (Rogue Core: −0.21 ms on every frame of every
@@ -3349,12 +3340,9 @@ int main()
     TestMarkerHoldOverlap();
     TestNativeHoldOverlap();
     TestGpuQueueSample();
-    TestGpuResumeWithoutHistory();
-    TestGpuCarriedHold();
-    TestCarriedHoldNeedsAHeldPreviousFrame();
+    TestGpuRungBuckets();
     TestSimulationRenderQueue();
     TestGpuQueueWaitRenderQueue();
-    TestGpuChainLeadStaysOwn();
     TestCpuFedGpuQueueLeadCoversReadiness();
     TestRungTransitions();
     TestLongSampleExclusion();
@@ -3395,6 +3383,8 @@ int main()
     TestGpuFloorGpuSetFilters();
     TestGpuFloorCapBound();
     TestGpuFloorPeriodAcrossReset();
+    TestFgInputWaitBehindWaitSample();
+    TestFgBehindWaitLeadFalls();
     TestGpuQueueWaitReadyGap();
     TestGpuNeedWindow();
 
