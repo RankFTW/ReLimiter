@@ -1063,6 +1063,17 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
             const double gap_us = ReflexTimestampDeltaUs(r.presentEndTime, r.gpuRenderEndTime);
             if (gap_us < effective_interval_us * 3.0) pending_sample.present_end_to_gpu_end_us = gap_us;
         }
+        // The lead sample behind the wait (lead_controller.h): whether this
+        // frame's first work reached the driver while its render thread
+        // streamed, from its own times within 3 I of RENDERSUBMIT_START.
+        if (r.renderSubmitStartTime > 0 && r.renderSubmitEndTime > 0 && r.driverStartTime > 0) {
+            const double render_end_us = ReflexSignedDeltaUs(r.renderSubmitStartTime, r.renderSubmitEndTime);
+            const double first_work_us = ReflexSignedDeltaUs(r.renderSubmitStartTime, r.driverStartTime);
+            pending_sample.first_work_streamed =
+                std::abs(render_end_us) < effective_interval_us * 3.0 &&
+                std::abs(first_work_us) < effective_interval_us * 3.0 &&
+                HandoffFirstWorkStreams(0.0, render_end_us, first_work_us);
+        }
         pending_sample.owned_cpu_stage_us = sample_owned_cpu_stage_us;
         pending_sample.gpu_frame_time_us = ft;
         pending_sample.present_duration_us = sample_present_duration_us;
