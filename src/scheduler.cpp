@@ -1128,12 +1128,11 @@ static GovernorDecision UpdatePeriodGovernor(
     ReflexFrameTimeSample sample{};
     while (ConsumeReflexFrameTimeSample(&sample)) {
         // The release headroom's heavy-work start r − A, the queue-order
-        // test's GPU start, the lead sample behind the wait and the FG input
-        // wait's GPU need (lead_controller.h).
+        // test's GPU start and the FG input wait's GPU need
+        // (lead_controller.h).
         if (sample.gpu_active_us > 0.0) {
             LeadGpuReport report{};
             report.active_us = sample.gpu_active_us;
-            report.span_us = sample.gpu_render_duration_us;
             report.work_us = sample.gpu_execution_available ? sample.gpu_service_us : 0.0;
             report.start_qpc = sample.gpu_start_qpc;
             s_source_stage.OnGpuReport(sample.producer_epoch, sample.frame_id, report);
