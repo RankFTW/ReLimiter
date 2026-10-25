@@ -203,25 +203,23 @@ void LeadController::ResetBuckets() noexcept
     work_age_frames_.fill(0);
     for (LeadSampleWindow& room : room_windows_) room.Reset();
     handoff_window_.Reset();
-    gpu_period_window_.Reset();
+    // The floor's windows as at a cap or FG divisor change, without P.
+    ResetGpuFloor();
     gpu_period_carry_us_ = 0.0;
-    gpu_after_present_window_.Reset();
     first_submission_window_.Reset();
     release_to_render_window_.Reset();
-    recent_periods_us_ = {};
-    recent_period_head_ = 0;
-    recent_period_count_ = 0;
-    ready_gaps_us_ = {};
-    ready_gap_head_ = 0;
-    ready_gap_count_ = 0;
-    cap_held_frames_ = 0;
-    restart_epoch_ = 0;
     gpu_need_ = {};
     gpu_paced_rings_ = {};
     gpu_ready_rings_ = {};
     fg_report_age_frames_.fill(LEAD_WORK_STALE_FRAMES + 1);
+    // Frames already released (lead_controller.h): no sample, and their later
+    // events add nothing to the release-relative windows.
     for (PendingFrame& frame : pending_) {
-        if (frame.occupied && frame.started) frame.finalized = true;
+        if (!frame.occupied || !frame.started) continue;
+        frame.finalized = true;
+        frame.call_recorded = true;
+        frame.work_recorded = true;
+        frame.release_to_render_recorded = true;
     }
 }
 
@@ -242,6 +240,11 @@ void LeadController::ResetGpuFloor() noexcept
     ready_gap_count_ = 0;
     cap_held_frames_ = 0;
     restart_epoch_ = 0;
+    // Frames released before the change (lead_controller.h).
+    for (PendingFrame& frame : pending_) {
+        if (frame.occupied && frame.started) frame.floor_fenced = true;
+    }
+    gpu_end_gpu_set_ = false;
 }
 
 void LeadController::NoteCadenceRestart(uint32_t producer_epoch) noexcept
@@ -257,6 +260,10 @@ bool LeadController::CadenceRestartSeen(uint32_t producer_epoch) const noexcept
 void LeadController::ClearSlackEvidence() noexcept
 {
     for (Bucket& bucket : buckets_) bucket.slack = SlackWindow{};
+    // Frames released before the restart (lead_controller.h).
+    for (PendingFrame& frame : pending_) {
+        if (frame.occupied && frame.started && !frame.finalized) frame.slack_fenced = true;
+    }
 }
 
 // The rung resumes holding after the overload guard demoted it: its
@@ -621,7 +628,7 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
 {
     size_t bucket_index = 0;
     if (qpc_frequency_ <= 0 || !PacingPlanKey_IsValid(frame.key) || frame.source_release_qpc <= 0 ||
-        !IsPositiveFinite(frame.interval_us) || !std::isfinite(frame.lead_us) || frame.lead_us < 0.0 ||
+        !IsPositiveFinite(frame.interval_us) || frame.output_target_qpc <= 0 ||
         !std::isfinite(frame.guard.reduction_us) || frame.guard.reduction_us < 0.0 ||
         !std::isfinite(frame.guard.offset_us) ||
         !FindBucketIndex(frame.rung, frame.fg_divisor, &bucket_index)) {
@@ -656,7 +663,7 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
     slot.rung = frame.rung;
     slot.bucket = static_cast<uint8_t>(bucket_index);
     slot.interval_us = frame.interval_us;
-    slot.lead_us = frame.lead_us;
+    slot.target_qpc = frame.output_target_qpc;
     slot.guard_reduction_us = frame.guard.reduction_us;
     slot.guard_judged = frame.guard.judged && frame.rung == PacingRung::GpuQueueWait;
     // ReLimiter's waits before this release (lockstep engines, lead_controller.h).
@@ -741,7 +748,7 @@ void LeadController::OnStageEvent(const PacingStageEvent& event) noexcept
         // deferred readback) still decides its verdict for the next pair.
         if (event.key.identity_domain == PacingIdentityDomain::NvApiFrame &&
             event.key.producer_epoch == gpu_end_epoch_ && event.key.frame_id == gpu_end_frame_) {
-            gpu_end_gpu_set_ = GpuSetPace(*frame);
+            gpu_end_gpu_set_ = !frame->floor_fenced && GpuSetPace(*frame);
         }
     }
     if (!frame->started) ++frame->early_events;
@@ -849,8 +856,11 @@ void LeadController::OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, 
     }
     if (frame_id <= gpu_end_frame_) return;
     const PendingFrame* frame = FindNvApiFrame(producer_epoch, frame_id);
-    // Not pending: no evidence that the GPU set its pace.
-    const bool gpu_set = frame != nullptr && GpuSetPace(*frame);
+    // Not pending: no evidence that the GPU set its pace. Released before the
+    // floor's windows restarted (ResetGpuFloor, ResetBuckets): nothing for
+    // them, but its GPU end still anchors Ĝ.
+    const bool admitted = frame != nullptr && !frame->floor_fenced;
+    const bool gpu_set = admitted && GpuSetPace(*frame);
     // The GPU's own period: consecutive frames it did not wait for, both
     // paced by the GPU (lead_controller.h): a frame queued behind
     // ReLimiter's Signal, or ending after its own, measures the cadence.
@@ -865,7 +875,7 @@ void LeadController::OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, 
     }
     if (gpu_set && IsPositiveFinite(present_to_gpu_end_us)) gpu_after_present_window_.Add(present_to_gpu_end_us);
     if (gpu_set) RecordReadyGap(*frame, gpu_end_qpc);
-    if (frame != nullptr) NoteCapHeld(*frame);
+    if (admitted) NoteCapHeld(*frame);
     gpu_end_frame_ = frame_id;
     gpu_end_qpc_ = gpu_end_qpc;
     gpu_end_gpu_set_ = gpu_set;
@@ -1496,28 +1506,35 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
         ++statistics_.gated_hold_samples;
         statistics_.last_gated_hold_us = gated_us;
     }
-    // A long sample is excluded from the lead but is a missed target.
-    // A frame the collision guard made late on purpose is judged against its
-    // unguarded lead, and every frame without its gated hold. The slack takes
-    // the measured release → output point, not the lead sample: behind the
-    // wait a frame the GPU cannot finish by T is late, and the Adaptive cap's
-    // late-output evidence needs it.
-    const double slack_us = frame->lead_us + frame->guard_reduction_us - std::max(0.0, raw_us - gated_us);
-    AddSlack(&bucket.slack, slack_us);
-    statistics_.last_slack_us = slack_us;
-    ++statistics_.slack_samples;
-    if (slack_us < 0.0) {
-        ++statistics_.negative_slack_samples;
-        // Draining (lead_controller.h): the frame before it was late by more.
-        const PendingFrame* previous = Previous(*frame);
-        if (previous != nullptr && previous->slack_known && previous->slack_us < slack_us) {
-            ++statistics_.draining_late_samples;
+    // A long sample is excluded from the lead but is a missed target. The
+    // slack (LeadStatistics) is how long before its target T the frame was
+    // ready: T − s less the measured release → output point, not the lead
+    // sample (behind the wait a frame the GPU cannot finish by T is late, and
+    // the Adaptive cap's late-output evidence needs it), plus the collision
+    // guard's reduction (lateness it accepts on purpose) and without the
+    // gated hold. L − X would credit a frame released after S with time it
+    // never had.
+    const double slack_us = MicrosecondsBetween(frame->qpc[FieldSource], frame->target_qpc) +
+        frame->guard_reduction_us - std::max(0.0, raw_us - gated_us);
+    // A frame released before the evidence restarted is not counted
+    // (ClearSlackEvidence); its slack still marks the next frame draining.
+    if (!frame->slack_fenced) {
+        AddSlack(&bucket.slack, slack_us);
+        statistics_.last_slack_us = slack_us;
+        ++statistics_.slack_samples;
+        if (slack_us < 0.0) {
+            ++statistics_.negative_slack_samples;
+            // Draining (lead_controller.h): the frame before it was late by more.
+            const PendingFrame* previous = Previous(*frame);
+            if (previous != nullptr && previous->slack_known && previous->slack_us < slack_us) {
+                ++statistics_.draining_late_samples;
+            }
         }
     }
     frame->slack_us = slack_us;
     frame->slack_known = true;
-    // Hold room (lead_controller.h): a frame late even against its unguarded
-    // lead is the overload's, not the hold's; a gated frame's X contains
+    // Hold room (lead_controller.h): a frame late even with the guard's
+    // reduction is the overload's, not the hold's; a gated frame's X contains
     // ReLimiter's own later waits, which would make R grow with the interval.
     // The room is how far before its gate the frame arrives: the measured X.
     if (frame->guard_judged && gated_ticks == 0 && slack_us >= 0.0) {

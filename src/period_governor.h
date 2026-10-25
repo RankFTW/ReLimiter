@@ -189,7 +189,7 @@ struct GovernorFrame {
     bool missed = false;
     // Lead samples measured since the previous governed frame (one per frame
     // whose readiness was measured), and how many of them were ready after
-    // their target (negative slack, X > L), without the draining ones
+    // their target (negative slack, LeadStatistics), without the draining ones
     // (LeadStatistics::draining_late_samples).
     uint32_t outputs = 0;
     uint32_t late_outputs = 0;

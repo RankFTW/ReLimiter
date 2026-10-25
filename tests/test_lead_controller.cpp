@@ -79,7 +79,14 @@ namespace
         start.fg_divisor = fg_divisor;
         start.interval_us = interval_us;
         start.source_release_qpc = Qpc(source_us);
+        start.output_target_qpc = start.source_release_qpc; // T = s unless SetLead
         return start;
+    }
+
+    // A frame released at its S = T − L: T = s + L.
+    void SetLead(LeadFrameStart* start, double lead_us)
+    {
+        start->output_target_qpc = start->source_release_qpc + static_cast<int64_t>(std::llround(lead_us * 10.0));
     }
 
     PacingStageEvent Event(uint64_t grid_index, Kind kind, double at_us,
@@ -331,7 +338,7 @@ void TestSimulationRenderQueue()
     const auto gpu_frame = [&](uint64_t index, PacingRung rung, double source, double simulation_end,
         double submit, double present, double ready) {
         LeadFrameStart start = Start(index, rung, source);
-        start.lead_us = 20000.0;
+        SetLead(&start, 20000.0);
         controller->OnSourceRelease(start);
         controller->OnStageEvent(Event(index, Kind::SimulationEnd, simulation_end));
         controller->OnStageEvent(Event(index, Kind::RenderSubmitStart, submit));
@@ -473,7 +480,7 @@ double RunCpuFedGpuQueueLoop(double* final_lead)
         const double wait = ready + 50.0;                 // the GPU reaches the Wait after r
         const double resume = wait <= target ? target + 300.0 : wait + 6.0;
         LeadFrameStart start = Start(n, PacingRung::GpuQueueWait, source, kRogueInterval);
-        start.lead_us = lead;
+        SetLead(&start, lead);
         start.gpu_resume_probe = true;
         controller->OnSourceRelease(start);
         controller->OnStageEvent(Event(n, Kind::RenderSubmitStart, source + 500.0));
@@ -1065,7 +1072,7 @@ namespace
     {
         const double source_us = static_cast<double>(grid_index) * kInterval;
         LeadFrameStart start = Start(grid_index, PacingRung::SourceOnly, source_us);
-        start.lead_us = lead_us;
+        SetLead(&start, lead_us);
         controller->OnSourceRelease(start);
         controller->OnStageEvent(Event(grid_index, Kind::MarkerArrival, source_us + x_us));
     }
@@ -1224,7 +1231,7 @@ void TestRestartRungSourceFloor()
 void TestSlackWindow()
 {
     auto controller = MakeController();
-    // Slack = L − X: positive, zero and negative samples.
+    // Released at S = T − L: slack = L − X. Positive, zero and negative samples.
     FeedLeadFrame(controller.get(), 1, 2000.0, 3000.0);
     CHECK_NEAR(controller->Statistics().last_slack_us, 1000.0);
     FeedLeadFrame(controller.get(), 2, 3000.0, 3000.0);
@@ -1259,14 +1266,54 @@ void TestSlackWindow()
     CHECK(controller->Feasibility(PacingRung::SourceOnly, 1.0).samples == 0);
     CHECK(controller->Feasibility(PacingRung::SourceOnly, 1.0).negative_count == 0);
 
-    // Invalid plan leads are rejected with the release.
+    // Invalid plan targets are rejected with the release.
     const uint64_t invalid = controller->Statistics().invalid_inputs;
     LeadFrameStart bad = Start(200, PacingRung::SourceOnly, 2000000.0);
-    bad.lead_us = kNaN;
+    bad.output_target_qpc = 0;
     controller->OnSourceRelease(bad);
-    bad.lead_us = -1.0;
+    bad.output_target_qpc = -1;
     controller->OnSourceRelease(bad);
     CHECK(controller->Statistics().invalid_inputs == invalid + 2);
+}
+
+// The slack is how long before its target T the frame was ready, T − s +
+// the guard's reduction − X (LeadStatistics): a frame released at S has
+// L − X; a source released after S within the grid's tolerance has less than
+// L to T (L − X would call it on time), and a frame the GPU floor released,
+// whose target the GPU moved, is judged against that target like any other:
+// late, it did not keep the cap's cadence (the Adaptive cap's evidence
+// with the GPU-paced cadence).
+void TestSlackAgainstTarget()
+{
+    auto controller = MakeController();
+    const auto feed = [&](uint64_t index, double target_after_s_us, double x_us, bool floor_released = false) {
+        const double source_us = static_cast<double>(index) * kInterval;
+        LeadFrameStart start = Start(index, PacingRung::SourceOnly, source_us);
+        start.output_target_qpc = Qpc(source_us + target_after_s_us);
+        start.gpu_floor_release = floor_released;
+        controller->OnSourceRelease(start);
+        controller->OnStageEvent(Event(index, Kind::MarkerArrival, source_us + x_us));
+    };
+    const auto slack = [&]() { return controller->Statistics().last_slack_us; };
+    const auto late = [&]() { return controller->Statistics().negative_slack_samples; };
+    feed(1, 5000.0, 4000.0); // L = 5,000, released at S
+    CHECK_NEAR(slack(), 1000.0);
+    feed(3, 3000.0, 4000.0); // released 2,000 after S: ready 1,000 after T
+    CHECK_NEAR(slack(), -1000.0);
+    CHECK(late() == 1);
+    feed(5, -500.0, 1000.0); // released after T itself
+    CHECK_NEAR(slack(), -1500.0);
+    CHECK(late() == 2);
+    // GPU floor releases: T moved to s + 3,000.
+    feed(7, 3000.0, 3500.0, true);
+    CHECK_NEAR(slack(), -500.0);
+    CHECK(late() == 3);
+    feed(9, 3000.0, 2500.0, true);
+    CHECK_NEAR(slack(), 500.0);
+    CHECK(late() == 3);
+    const LeadFeasibility feasibility = controller->Feasibility(PacingRung::SourceOnly, 1.0);
+    CHECK(feasibility.samples == 5 && feasibility.negative_count == 3);
+    CHECK(controller->Statistics().invalid_inputs == 0);
 }
 
 // Resume history median: lower-index median of the newest 32 waited u − o
@@ -1379,6 +1426,27 @@ void TestClearSlackEvidence()
     const LeadFeasibility fresh = controller->Feasibility(PacingRung::SourceOnly, 1.0);
     CHECK(fresh.samples == 1);
     CHECK(fresh.negative_count == 1);
+
+    // A frame released before a restart and ready after it adds no slack
+    // evidence; its slack still makes the next frame draining.
+    const double source_us = 310.0 * kInterval;
+    LeadFrameStart pending = Start(310, PacingRung::SourceOnly, source_us);
+    SetLead(&pending, 1000.0);
+    controller->OnSourceRelease(pending);
+    controller->ClearSlackEvidence();
+    const LeadStatistics before = controller->Statistics();
+    controller->OnStageEvent(Event(310, Kind::MarkerArrival, source_us + 9000.0)); // 8,000 late
+    LeadStatistics after = controller->Statistics();
+    CHECK(after.samples == before.samples + 1); // the lead window keeps it
+    CHECK(after.slack_samples == before.slack_samples);
+    CHECK(after.negative_slack_samples == before.negative_slack_samples);
+    CHECK(controller->Feasibility(PacingRung::SourceOnly, 1.0).samples == 0);
+    FeedLeadFrame(controller.get(), 311, 5000.0, 1000.0); // 4,000 late: less than frame 310
+    after = controller->Statistics();
+    CHECK(after.slack_samples == before.slack_samples + 1);
+    CHECK(after.negative_slack_samples == before.negative_slack_samples + 1);
+    CHECK(after.draining_late_samples == before.draining_late_samples + 1);
+    CHECK(controller->Feasibility(PacingRung::SourceOnly, 1.0).negative_count == 1);
     CHECK(controller->Statistics().invalid_inputs == 0);
 }
 
@@ -1572,6 +1640,50 @@ void TestCollisionGuardLimitsLead()
     CHECK(std::fabs(cold->NextLeadUs(seed) - 1710.0) <= 20.0);
 }
 
+// A reset restarts windows (lead_controller.h): a frame released before an
+// enforcement-marker change still explains the frames after it, but its
+// later Present call (C), readiness and report (D), measured from the old
+// release point, add nothing to the windows the change cleared.
+void TestResetBucketsFencesEarlierFrames()
+{
+    auto controller = MakeController();
+    LeadRequest request = Request(PacingRung::GpuQueueWait, 500.0, 6000.0);
+    request.collision_guard = true;
+    LeadGuardOutcome guard{};
+    const auto release = [&](uint64_t index) {
+        controller->OnSourceRelease(Start(index, PacingRung::GpuQueueWait, static_cast<double>(index) * kInterval));
+    };
+    const auto call = [&](uint64_t index) {
+        controller->OnStageEvent(Event(index, Kind::PresentCall, static_cast<double>(index) * kInterval + 200.0));
+    };
+    const auto work = [&](uint64_t index) {
+        controller->OnStageEvent(Event(index, Kind::GpuReady, static_cast<double>(index) * kInterval + 3000.0));
+        controller->OnGpuActiveTime(Key(index).producer_epoch, Key(index).frame_id, 1000.0, 0);
+    };
+    release(1);
+    controller->ResetBuckets();
+    call(1);
+    work(1);
+    CHECK(controller->Statistics().work_samples == 0);
+    // 31 C samples of frames released after the change: no limit yet; the
+    // 32nd sets it.
+    for (uint64_t frame = 1; frame < LEAD_WARM_SAMPLES; ++frame) {
+        release(1 + 2 * frame);
+        call(1 + 2 * frame);
+    }
+    controller->NextLeadUs(request, nullptr, &guard);
+    CHECK(!guard.judged);
+    release(1 + 2 * LEAD_WARM_SAMPLES);
+    call(1 + 2 * LEAD_WARM_SAMPLES);
+    controller->NextLeadUs(request, nullptr, &guard);
+    CHECK(guard.judged);
+    // A frame released after the change adds its D.
+    release(3 + 2 * LEAD_WARM_SAMPLES);
+    work(3 + 2 * LEAD_WARM_SAMPLES);
+    CHECK(controller->Statistics().work_samples == 1);
+    CHECK(controller->Statistics().invalid_inputs == 0);
+}
+
 // A frame the guard made late is judged against its unguarded lead: no
 // Adaptive cap miss for lateness the guard accepted. A negative or
 // non-finite reduction and a non-finite offset are invalid releases.
@@ -1579,7 +1691,7 @@ void TestGuardedSlackUsesUnguardedLead()
 {
     auto controller = MakeController();
     LeadFrameStart start = Start(1, PacingRung::GpuQueueWait, 10000.0);
-    start.lead_us = 2000.0;
+    SetLead(&start, 2000.0);
     start.guard.reduction_us = 1500.0;
     controller->OnSourceRelease(start);
     controller->OnStageEvent(Event(1, Kind::PresentCall, 11000.0));
@@ -1610,7 +1722,7 @@ void TestDrainingLateSamples()
     const auto feed = [&](uint64_t index, double x_us) {
         const double source_us = static_cast<double>(index) * kInterval;
         LeadFrameStart start = Start(index, PacingRung::SourceOnly, source_us);
-        start.lead_us = 5000.0;
+        SetLead(&start, 5000.0);
         controller->OnSourceRelease(start);
         controller->OnStageEvent(Event(index, Kind::MarkerArrival, source_us + x_us));
         controller->OnStageEvent(Event(index, Kind::OutputRelease, source_us + x_us, PacingPlanStatus::SourceOnly));
@@ -1643,7 +1755,7 @@ namespace
     {
         const double source_us = static_cast<double>(grid_index) * kInterval;
         LeadFrameStart start = Start(grid_index, rung, source_us);
-        start.lead_us = lead_us;
+        SetLead(&start, lead_us);
         start.guard = guard;
         controller->OnSourceRelease(start);
         controller->OnStageEvent(Event(grid_index, Kind::PresentCall, source_us + 1000.0));
@@ -1714,12 +1826,12 @@ void TestLockstepGatedHold()
     auto controller = MakeController();
     const PacingRung h0 = PacingRung::SourceOnly;
     LeadFrameStart first = Start(1, h0, 10000.0);
-    first.lead_us = 5000.0;
+    SetLead(&first, 5000.0);
     controller->OnSourceRelease(first);
     // Frame 2: pre-Sleep wait [9,000, 11,000] (1,000 after s_1), source wait
     // [14,000, 18,000], s = 18,000.
     LeadFrameStart second = Start(2, h0, 18000.0);
-    second.lead_us = 5000.0;
+    SetLead(&second, 5000.0);
     second.pre_wait_start_qpc = Qpc(9000.0);
     second.pre_wait_end_qpc = Qpc(11000.0);
     second.wait_start_qpc = Qpc(14000.0);
@@ -1769,7 +1881,7 @@ void TestLockstepGatedHold()
     judged.judged = true;
     judged.offset_us = 2000.0;
     LeadFrameStart gpu = Start(1, PacingRung::GpuQueueWait, 10000.0);
-    gpu.lead_us = 12000.0;
+    SetLead(&gpu, 12000.0);
     gpu.guard = judged;
     room->OnSourceRelease(gpu);
     LeadFrameStart next = Start(2, PacingRung::GpuQueueWait, 15000.0);
@@ -2200,6 +2312,7 @@ void TestRenderHandoffGpuFloor()
         start.fg_divisor = 1.0;
         start.interval_us = kInterval;
         start.source_release_qpc = Qpc(gpu_end_us(frame_id) - 30000.0);
+        start.output_target_qpc = start.source_release_qpc;
         controller->OnSourceRelease(start);
         PacingStageEvent release{};
         release.key = start.key;
@@ -2338,6 +2451,7 @@ void TestGpuFloorReadyAnchor()
         start.fg_divisor = 2.0;
         start.interval_us = kGpuPeriod;
         start.source_release_qpc = Qpc(gpu_end_us(frame_id) - 30000.0);
+        start.output_target_qpc = start.source_release_qpc;
         return start;
     };
     const auto event_of = [&](uint64_t frame_id, uint64_t grid_index, Kind kind, double at_us,
@@ -2501,6 +2615,7 @@ void TestGpuFloorGpuSetFilters()
             start.fg_divisor = 1.0;
             start.interval_us = kGpuPeriod;
             start.source_release_qpc = Qpc(end_us - 30000.0);
+            start.output_target_qpc = start.source_release_qpc;
             controller->OnSourceRelease(start);
             if (std::isfinite(ready_after_signal_us)) {
                 send(frame_id, Kind::GpuReady, signal_us + ready_after_signal_us, status);
@@ -2586,12 +2701,12 @@ void TestGpuFloorGpuSetFilters()
     CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
     CHECK_NEAR(controller->RecentGpuPeriodUs(), three_periods);
 
-    // A probe read back after the report: 2101, ready 300 µs before its
+    // A probe read back after the report: the frame, ready 300 µs before its
     // Signal, is reported as waited; its probe then shows the GPU reached the
-    // Wait 400 µs after the Signal, so with 2102 (the GPU set it) the pair
-    // adds a period of 16,000.
-    {
-        const uint64_t frame_id = 2101;
+    // Wait 400 µs after the Signal, so with the next frame (the GPU set it)
+    // the pair adds a period. With a cap or FG divisor change between the
+    // report and the probe (ResetGpuFloor), it pairs nothing.
+    const auto late_probe = [&](uint64_t frame_id, bool change_before_probe) {
         const double end_us = gpu_end_us + 16000.0;
         const double signal_us = end_us - 3000.0;
         LeadFrameStart start{};
@@ -2601,16 +2716,26 @@ void TestGpuFloorGpuSetFilters()
         start.fg_divisor = 1.0;
         start.interval_us = kGpuPeriod;
         start.source_release_qpc = Qpc(end_us - 30000.0);
+        start.output_target_qpc = start.source_release_qpc;
         controller->OnSourceRelease(start);
         send(frame_id, Kind::GpuReady, signal_us - 300.0, PacingPlanStatus::Held);
         send(frame_id, Kind::OutputRelease, signal_us, PacingPlanStatus::Held);
         controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(gpu_end_us + 250.0), Qpc(end_us), 14000.0);
         gpu_end_us = end_us;
-        ends[frame_id - 2000] = end_us;
+        ends[static_cast<size_t>(frame_id - 2000)] = end_us;
+        if (change_before_probe) controller->ResetGpuFloor();
         send(frame_id, Kind::GpuResume, signal_us + 500.0, PacingPlanStatus::Held, signal_us + 400.0);
-    }
+    };
+    late_probe(2101, false);
     frame(2102, PacingPlanStatus::Held, 800.0, 16000.0);
     CHECK_NEAR(controller->RecentGpuPeriodUs(), (17000.0 + 18000.0 + 2.0 * 19000.0 + 16000.0) / 5.0);
+    // After the change 32 frames the GPU set give 31 periods: P stays the
+    // carried one until the 33rd.
+    late_probe(2103, true);
+    for (uint64_t frame_id = 2104; frame_id <= 2135; ++frame_id) frame(frame_id, PacingPlanStatus::Held, 800.0, 12000.0);
+    CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
+    frame(2136, PacingPlanStatus::Held, 800.0, 12000.0);
+    CHECK_NEAR(controller->GpuPeriodUs(), 12010.0);
 }
 
 // Cap bound (lead_controller.h): a held frame's floor is
@@ -2677,6 +2802,7 @@ void TestGpuFloorCapBound()
             start.fg_divisor = 1.0;
             start.interval_us = kI;
             start.source_release_qpc = Qpc(target_us(frame_id) - kLead);
+            start.output_target_qpc = Qpc(target_us(frame_id));
             controller->OnSourceRelease(start);
             send(frame_id, Kind::OutputRelease, target_us(frame_id) - kLead, PacingPlanStatus::SourceOnly);
             controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(target_us(frame_id) - kI + 250.0),
@@ -2695,6 +2821,7 @@ void TestGpuFloorCapBound()
         start.fg_divisor = 2.0;
         start.interval_us = kI;
         start.source_release_qpc = Qpc(target_us(frame_id) - kLead);
+        start.output_target_qpc = Qpc(target_us(frame_id));
         start.gpu_floor_release = floor_released;
         controller->OnSourceRelease(start);
         const double signal_us = target_us(frame_id);
@@ -2760,10 +2887,16 @@ void TestGpuFloorCapBound()
 
     // A cap or FG divisor change: the gaps, the frames the cap held and the
     // restart clear; P carries over until 32 new pairs exist
-    // (TestGpuFloorPeriodAcrossReset); F and σ stay.
+    // (TestGpuFloorPeriodAcrossReset); F and σ stay. Frames released before
+    // the change and reported after it (3133 the cap held, 3134 the GPU set)
+    // add no frame the cap held and no gap.
     controller->NoteCadenceRestart(kEpoch);
     CHECK(controller->CadenceRestartSeen(kEpoch) && !controller->CadenceRestartSeen(kEpoch + 1));
+    held(3133, -1000.0, false);
+    held(3134, 300.0, false);
     controller->ResetGpuFloor();
+    controller->OnGpuRenderEnd(kEpoch, 3133, 0, Qpc(target_us(3133) + kGap), 14000.0);
+    controller->OnGpuRenderEnd(kEpoch, 3134, 0, Qpc(target_us(3134) + 300.0 + kGap), 14000.0);
     CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
     CHECK(controller->ReadyGapCount() == 0 && controller->CapHeldFrames() == 0);
     CHECK(!controller->CadenceRestartSeen(kEpoch));
@@ -2821,10 +2954,11 @@ void TestGpuFloorPeriodAcrossReset()
     }
     for (uint64_t index = 0; index < 32; ++index) controller->OnReportPair(kEpoch, 500 + index, StreamingPair());
     // Frames not held, each ending period_us after the previous one, the GPU
-    // idle 250 µs between them.
+    // idle 250 µs between them; with render_submit their RENDERSUBMIT_START
+    // 5,000 µs after the release (σ).
     uint64_t frame_id = 3000;
     double end_us = 1'000'000.0;
-    const auto not_held = [&](int count, double period_us) {
+    const auto not_held = [&](int count, double period_us, bool render_submit = false) {
         for (int i = 0; i < count; ++i, ++frame_id) {
             LeadFrameStart start{};
             start.key = key_of(frame_id);
@@ -2833,6 +2967,7 @@ void TestGpuFloorPeriodAcrossReset()
             start.fg_divisor = 1.0;
             start.interval_us = period_us;
             start.source_release_qpc = Qpc(end_us);
+            start.output_target_qpc = start.source_release_qpc;
             controller->OnSourceRelease(start);
             PacingStageEvent event{};
             event.key = start.key;
@@ -2841,6 +2976,12 @@ void TestGpuFloorPeriodAcrossReset()
             event.qpc = start.source_release_qpc;
             event.status = PacingPlanStatus::SourceOnly;
             controller->OnStageEvent(event);
+            if (render_submit) {
+                event.kind = Kind::RenderSubmitStart;
+                event.qpc = Qpc(end_us + 5000.0);
+                event.status = PacingPlanStatus::Unknown;
+                controller->OnStageEvent(event);
+            }
             controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(end_us + 250.0), Qpc(end_us + period_us), 14000.0);
             end_us += period_us;
         }
@@ -2855,8 +2996,10 @@ void TestGpuFloorPeriodAcrossReset()
     CHECK(controller->GpuFloor(key_of(frame_id)).floor_qpc == Qpc(end_us - start_17 - kSigma));
     // A frame further ahead extrapolates the newest GPU end by that P.
     CHECK(controller->GpuFloor(key_of(frame_id + 1)).floor_qpc == Qpc(end_us + 17010.0 - start_17 - kSigma));
-    // 31 new pairs of 12,000 µs keep it; the 32nd makes their median P.
-    not_held(31, 12000.0);
+    // No period pairs the first frame after the change with the last one
+    // before it: 32 new frames of 12,000 µs give 31 pairs and keep it; the
+    // 33rd makes their median P.
+    not_held(32, 12000.0);
     CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
     not_held(1, 12000.0);
     CHECK_NEAR(controller->GpuPeriodUs(), 12010.0);
@@ -2871,6 +3014,34 @@ void TestGpuFloorPeriodAcrossReset()
     // So do a bucket reset and a lifecycle reset.
     not_held(40, 17000.0);
     controller->ResetGpuFloor();
+    CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
+    // A frame released before the bucket reset adds no σ after it: with F
+    // and P warm again, 31 new σ give no floor and the 32nd does.
+    LeadFrameStart early{};
+    early.key = key_of(frame_id);
+    early.grid_index = frame_id - 2900;
+    early.rung = PacingRung::SourceOnly;
+    early.fg_divisor = 1.0;
+    early.interval_us = 17000.0;
+    early.source_release_qpc = Qpc(end_us);
+    early.output_target_qpc = early.source_release_qpc;
+    controller->OnSourceRelease(early);
+    controller->ResetBuckets();
+    CHECK_NEAR(controller->GpuPeriodUs(), 0.0);
+    PacingStageEvent submit{};
+    submit.key = early.key;
+    submit.grid_index = early.grid_index;
+    submit.kind = Kind::RenderSubmitStart;
+    submit.qpc = Qpc(end_us + 5000.0);
+    controller->OnStageEvent(submit);
+    ++frame_id;
+    for (uint64_t index = 0; index < 32; ++index) controller->OnReportPair(kEpoch, 700 + index, StreamingPair());
+    not_held(40, 17000.0);
+    not_held(31, 17000.0, true);
+    CHECK(controller->GpuFloor(key_of(frame_id)).floor_qpc == 0);
+    not_held(1, 17000.0, true);
+    CHECK(controller->GpuFloor(key_of(frame_id)).floor_qpc == Qpc(end_us - start_17 - kSigma));
+    // A bucket reset restarts a warm period window too.
     CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
     controller->ResetBuckets();
     CHECK_NEAR(controller->GpuPeriodUs(), 0.0);
@@ -2905,7 +3076,7 @@ void TestFgInputWaitBehindWaitSample()
         const bool held = ready <= target;
         const double release = held ? target : ready;
         LeadFrameStart start = Start(k, fg, source, kInterval, 2.0);
-        start.lead_us = lead_us;
+        SetLead(&start, lead_us);
         controller->OnSourceRelease(start);
         if (submit) controller->OnStageEvent(Event(k, Kind::RenderSubmitStart, source + 2000.0));
         controller->OnStageEvent(Event(k, Kind::PresentCall, source + 8000.0));
@@ -3033,7 +3204,7 @@ void TestFgBehindWaitLeadFalls()
             const bool held = ready <= target;
             const double release = held ? target : ready;
             LeadFrameStart start = Start(n, fg, source, kInterval, 2.0);
-            start.lead_us = lead;
+            SetLead(&start, lead);
             controller->OnSourceRelease(start);
             controller->OnStageEvent(Event(n, Kind::RenderSubmitStart, submit));
             controller->OnStageEvent(Event(n, Kind::PresentCall, present));
@@ -3116,6 +3287,7 @@ void TestGpuQueueWaitReadyGap()
         start.fg_divisor = 1.0;
         start.interval_us = kGpuPeriod;
         start.source_release_qpc = Qpc(end_us - 30000.0);
+        start.output_target_qpc = start.source_release_qpc;
         controller->OnSourceRelease(start);
         send(frame_id, Kind::GpuReady, end_us + ready_us);
         send(frame_id, Kind::OutputRelease, end_us + ready_us + signal_us);
@@ -3175,6 +3347,7 @@ void TestGpuNeedWindow()
         start.fg_divisor = fg_divisor;
         start.interval_us = kFrameInterval;
         start.source_release_qpc = Qpc(ready_us - 20000.0);
+        start.output_target_qpc = start.source_release_qpc;
         controller->OnSourceRelease(start);
         PacingStageEvent ready{};
         ready.key = key;
@@ -3363,12 +3536,14 @@ int main()
     TestRestartRungSourceFloor();
     TestDeepPipelineFits();
     TestSlackWindow();
+    TestSlackAgainstTarget();
     TestResumeHistoryMedian();
     TestResumeDelayRequiresWait();
     TestClearSlackEvidence();
     TestResumeCounters();
     TestReleaseMarginObservations();
     TestCollisionGuardLimitsLead();
+    TestResetBucketsFencesEarlierFrames();
     TestGuardedSlackUsesUnguardedLead();
     TestDrainingLateSamples();
     TestHoldRoomSamples();

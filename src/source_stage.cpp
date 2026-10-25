@@ -345,7 +345,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     start.fg_divisor = plan.fg_divisor;
     start.interval_us = plan.interval_us;
     start.source_release_qpc = frame.release_qpc;
-    start.lead_us = plan.lead_us;
+    start.output_target_qpc = plan.output_target_qpc;
     start.guard = guard;
     start.wait_start_qpc = frame.wait_start_qpc;
     start.wait_end_qpc = frame.wait_end_qpc;

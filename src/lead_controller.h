@@ -454,7 +454,9 @@ struct LeadFrameStart {
     double fg_divisor = 1.0;
     double interval_us = 0.0;      // the plan's grid interval I
     int64_t source_release_qpc = 0; // s
-    double lead_us = 0.0;          // the plan's lead L; slack = L − X. Finite, >= 0
+    // The plan's output target T (> 0): the slack is T − s plus the guard's
+    // reduction, less X (LeadStatistics).
+    int64_t output_target_qpc = 0;
     // Frames outside Vrr and Fixed are tracked for matching but never sampled.
     PacingTimingMode mode = PacingTimingMode::Vrr;
     // H3: the plan's GPU hold reports a post-wait resume probe (u), so the
@@ -469,9 +471,9 @@ struct LeadFrameStart {
     // ready (EarlyLeadUs).
     bool gpu_floor_release = false;
     // The collision guard's verdict on L (NextLeadUs). The Adaptive cap's
-    // slack is judged against L + guard.reduction_us, so lateness the guard
-    // accepts on purpose is not a missed target; a judged frame adds its X to
-    // the hold room when it is not late against that unguarded lead.
+    // slack adds guard.reduction_us, so lateness the guard accepts on
+    // purpose is not a missed target; a judged frame adds its X to the hold
+    // room when it is not late even so.
     LeadGuardOutcome guard{};
     // ReLimiter's waits for this frame before s: the source wait
     // [wait_start_qpc, wait_end_qpc] and a pre-Sleep wait [pre_wait_start_qpc,
@@ -515,7 +517,7 @@ struct LeadBucketStatus {
 // Per-bucket feasibility evidence for the overload guard.
 struct LeadFeasibility {
     uint32_t samples = 0;        // slack samples in the window (at most LEAD_SLACK_CAPACITY)
-    uint32_t negative_count = 0; // of those, frames with X > L
+    uint32_t negative_count = 0; // of those, frames ready after their target
     bool budget_limited = false; // the bucket's last lead decision was budget-limited
 };
 
@@ -584,11 +586,21 @@ struct LeadStatistics {
     uint64_t handoff_samples = 0;
     double last_handoff_us = 0.0;
     double last_sample_us = 0.0;     // newest sample added to a bucket
-    double last_slack_us = 0.0;      // newest slack L − X, long samples included
+    double last_slack_us = 0.0;      // newest counted slack, long samples included
     // Slack samples (one per frame whose readiness was measured, long ones
-    // included) and of those, frames ready after their target (L − X < 0,
-    // with L the lead before the collision guard):
-    // the Adaptive cap's output evidence. Draining: late frames whose
+    // included) and of those, frames ready after their target: the Adaptive
+    // cap's output evidence. The slack is T − s + the guard's reduction − X,
+    // T the plan's output target and X the measured release → output point
+    // without the gated hold. A frame released at S = T − L has L − X; a
+    // source released late within the grid's tolerance and a frame the GPU
+    // floor released have less than L to T. A floor-released frame's target
+    // moved past the grid's only when even its earliest readiness came after
+    // it, so a late one did not keep the cap's cadence (GPU-paced cadence:
+    // CONTROL FG 2× at 130 85%, Rogue Core at 130 99.7% of floor-released
+    // frames late; against L 78% and 99%, but in Gears of War: E-Day 1.7% at
+    // a 34.5 ms lead and 93% at the 28.3 ms lead replayed for the own-work
+    // sample). Frames released before the evidence restarted
+    // (ClearSlackEvidence) are not counted. Draining: late frames whose
     // predecessor (the previous grid index, sample emitted) was late by
     // more. That is the queue behind one late frame running down: the
     // interval is absorbing it, so the Adaptive cap does not count it
@@ -641,13 +653,19 @@ public:
     // statistics cleared.
     // A non-positive frequency is counted and disables sampling until the next Reset.
     void Reset(int64_t qpc_frequency) noexcept;
-    // Enforcement marker change: buckets cleared. Frames already released
-    // produce no sample but still decontaminate the next frame.
+    // Enforcement marker change: buckets, C, D, σ, F and the GPU need
+    // cleared, and the GPU floor's windows as at ResetGpuFloor but without
+    // P. Frames already released produce no sample but still decontaminate
+    // the next frame; their later events add nothing to C, D and σ (measured
+    // from the old release point) or to the floor's windows. F and the GPU
+    // need are the driver's and the GPU's own and still take them.
     void ResetBuckets() noexcept;
     // Every bucket's slack window: an overload-guard evidence restart (a
     // governor step or reset, or a lifecycle, cap, FG divisor or route
     // change), or an infeasible-lead miss consumed by the Adaptive cap. Lead
-    // windows, budget flags and the resume history stay.
+    // windows, budget flags and the resume history stay. Frames released
+    // before it add no slack evidence; their slack still makes the next
+    // frame draining.
     void ClearSlackEvidence() noexcept;
     // The rung resumes holding after an overload demotion: each of its
     // sampled buckets restarts its window, and until 32 new samples arrive
@@ -659,7 +677,9 @@ public:
     // A cap or FG divisor change (above): the GPU floor's period, PRESENT_END
     // gap and readiness gap windows, its cap-held frames and its cadence
     // restart start again (P carries over until the new period window is
-    // warm); F, σ, the stream proof and the anchors stay.
+    // warm); F, σ, the stream proof and the anchors stay. Reports of frames
+    // released before it add nothing to those windows, and no period pairs
+    // a frame from before it with one after.
     void ResetGpuFloor() noexcept;
     // The cadence restarted (SourceLate or OutputLate) on a held frame in
     // producer_epoch: the held floor's eligibility before its cap-held frames
@@ -828,9 +848,11 @@ private:
         std::array<int64_t, FieldCount> qpc{};
         int64_t gpu_wait_qpc = 0;  // pre-Wait GPU time of the GpuResume event; 0 unknown
         double interval_us = 0.0;
-        double lead_us = 0.0;      // the plan's L, for the slack
-        double slack_us = 0.0;     // L − X once the sample is emitted (slack_known)
+        int64_t target_qpc = 0;    // the plan's T, for the slack
+        double slack_us = 0.0;     // T − s + reduction − X once the sample is emitted (slack_known)
         bool slack_known = false;
+        bool slack_fenced = false; // released before the slack evidence restarted: its slack is not counted
+        bool floor_fenced = false; // released before the GPU floor's windows restarted: its report adds nothing
         double guard_reduction_us = 0.0; // the collision guard's reduction of L
         bool guard_judged = false;       // a judged GPU queue wait lead: adds a hold-room sample
         int64_t wait_start_qpc = 0;     // ReLimiter's source wait before s; 0 none
@@ -853,19 +875,19 @@ private:
         bool gpu_floor_release = false; // LeadFrameStart::gpu_floor_release
         bool resume_waited = false; // the GPU waited at the Signal (w <= o)
         bool resume_late = false;   // and resumed more than LEAD_RESUME_LATE_US after it
-        bool call_recorded = false;   // C entered the call window
+        bool call_recorded = false;   // C entered the call window, or given up (ResetBuckets)
         bool margin_recorded = false; // p_{n+1} − o_n entered the margin learner
         double gpu_active_us = 0.0;   // Reflex GPU active render time A; 0 unknown
-        bool work_recorded = false;     // D = r − A − s entered the work window
+        bool work_recorded = false;     // D = r − A − s entered the work window, or given up
         bool headroom_recorded = false; // r_{n+1} − A_{n+1} − o_n entered the headroom learner
         int64_t gpu_start_qpc = 0;      // Reflex gpuRenderStartTime as QPC; 0 unknown
         bool concurrency_recorded = false; // (o_n, g_{n+1}) entered the queue-order window
-        bool release_to_render_recorded = false; // σ of this frame entered its window
+        bool release_to_render_recorded = false; // σ of this frame entered its window, or given up
     };
 
     // The newest LEAD_SLACK_CAPACITY slack signs of one bucket.
     struct SlackWindow {
-        std::array<uint8_t, LEAD_SLACK_CAPACITY> negative{}; // 1 when X > L
+        std::array<uint8_t, LEAD_SLACK_CAPACITY> negative{}; // 1 when the frame was ready after its target
         uint32_t head = 0; // next write position; the oldest sample once full
         uint32_t count = 0;
         uint32_t negative_count = 0;
