@@ -314,11 +314,16 @@ constexpr double LEAD_ROOM_MIN_HOLD_US = 250.0; // h
 // The bound applies once LEAD_WARM_SAMPLES frames the cap held were
 // reported in this producer epoch (CapHeldFrames: the GPU waited at the
 // Signal and the floor did not release the frame) and ḡ is warm. Before
-// that, the floor applies unbounded only after a cadence restart in this
-// producer epoch (NoteCadenceRestart: SourceLate or OutputLate), else not
-// at all (GpuFloorEstimate::ineligible): where the GPU is the limit the cap
-// rarely holds a frame and the floor keeps its own depth (Gears). Frames not
-// held (the render handoff limit) take no bound.
+// that, the floor applies unbounded only after a cadence restart of a held
+// frame in this producer epoch (NoteCadenceRestart: SourceLate or
+// OutputLate), else not at all (GpuFloorEstimate::ineligible): where the GPU
+// is the limit the cap rarely holds a frame and the floor keeps its own depth
+// (Gears). A restart of a frame not held does not count: the first frame
+// after an FG change lands late on the new grid while FG is not presenting
+// yet, and as the only restart it made the floor apply unbounded once FG
+// presented (CONTROL FG 2× at 130: the floor then released most frames
+// whenever it lay past S, and for 13 s the cap held 15–23 frames). Frames
+// not held (the render handoff limit) take no bound.
 //
 // Readiness anchor (as Ĝ, developer A/B gpu_paced_cadence only): the GPU
 // waits read back each frame's GPU readiness on ReLimiter's own GPU timeline
@@ -400,8 +405,8 @@ struct GpuFloorEstimate {
     bool cap_bound = false;
     // Held frames: the windows were warm but the floor is not eligible yet,
     // without LEAD_WARM_SAMPLES frames the cap held (and readiness gaps and
-    // the cap's lead) or, before those frames, a cadence restart in this
-    // producer epoch: no floor.
+    // the cap's lead) or, before those frames, a cadence restart of a held
+    // frame in this producer epoch: no floor.
     bool ineligible = false;
 };
 // A held frame's cap bound inputs (LeadController::GpuFloor, above): its
@@ -636,8 +641,9 @@ public:
     // gap and readiness gap windows, its cap-held frames and its cadence
     // restart start again; F, σ, the stream proof and the anchors stay.
     void ResetGpuFloor() noexcept;
-    // The cadence restarted (SourceLate or OutputLate) in producer_epoch:
-    // the held floor's eligibility before its cap-held frames (above).
+    // The cadence restarted (SourceLate or OutputLate) on a held frame in
+    // producer_epoch: the held floor's eligibility before its cap-held frames
+    // (above).
     void NoteCadenceRestart(uint32_t producer_epoch) noexcept;
     bool CadenceRestartSeen(uint32_t producer_epoch) const noexcept;
     // One call per planned frame; applies at most one slew step to the

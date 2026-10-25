@@ -477,8 +477,8 @@ GpuFloorEstimate LeadController::GpuFloor(const PacingPlanKey& key, uint64_t pre
     }
     // A held frame (cap bound, above): bounded once the cap held
     // LEAD_WARM_SAMPLES frames, the readiness gaps are warm and the cap's lead
-    // is known; before those frames, unbounded only after a cadence restart in
-    // this producer epoch.
+    // is known; before those frames, unbounded only after a cadence restart of
+    // a held frame in this producer epoch.
     const bool held = IsPositiveFinite(cap.interval_us);
     const bool cap_warm = cap_held_frames_ >= LEAD_WARM_SAMPLES;
     const bool bounded = held && cap_warm && ready_gap_count_ >= LEAD_WARM_SAMPLES && IsPositiveFinite(cap.lead_us);

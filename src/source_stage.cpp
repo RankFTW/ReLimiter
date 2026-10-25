@@ -150,7 +150,9 @@ size_t SourceStage::DrainStageEvents() noexcept
                 gpu_paced) == PacingEpochReason::OutputLate) {
             ++statistics_.output_late_epochs;
             epoch_started = true;
-            lead_.NoteCadenceRestart(event.key.producer_epoch);
+            // Only a held output's restart counts for the held GPU floor
+            // (lead_controller.h).
+            if (event.rung != PacingRung::SourceOnly) lead_.NoteCadenceRestart(event.key.producer_epoch);
         }
     }
     statistics_.stage_events += drained;
@@ -279,9 +281,11 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     frame.planned = true;
     frame.lead_budget_limited = budget_limited;
     frame.epoch_started = grid_plan.epoch_reason;
-    // A restart is the held GPU floor's eligibility before the cap held
-    // LEAD_WARM_SAMPLES frames (lead_controller.h).
-    if (grid_plan.epoch_reason == PacingEpochReason::SourceLate) {
+    // A restart of a held frame is the held GPU floor's eligibility before
+    // the cap held LEAD_WARM_SAMPLES frames (lead_controller.h); a frame not
+    // held is not the cap's cadence (the first frame after an FG change lands
+    // late on the new grid while FG is not yet presenting).
+    if (grid_plan.epoch_reason == PacingEpochReason::SourceLate && pipeline.rung != PacingRung::SourceOnly) {
         lead_.NoteCadenceRestart(request.key.producer_epoch);
     }
     frame.grid_epoch_reason = snapshot.epoch_reason;

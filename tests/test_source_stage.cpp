@@ -1157,12 +1157,14 @@ void TestGpuPacedRhythm()
 }
 
 // The held GPU floor applies before the cap held 32 frames only after a
-// cadence restart in the producer epoch (lead_controller.h): a SourceLate
-// restart at the plan and an OutputLate restart from the stage events count;
-// a cap or FG divisor change (ResetGpuFloor) clears it.
+// cadence restart of a held frame in the producer epoch (lead_controller.h):
+// a SourceLate restart at the plan and an OutputLate restart from the stage
+// events count; a cap or FG divisor change (ResetGpuFloor) clears it. The
+// restarts of frames not held do not count: after an FG change the first
+// frame lands late on the new grid while FG is not presenting yet.
 void TestCadenceRestartsCountForTheFloor()
 {
-    std::printf("Test: SourceLate and OutputLate restarts make the held GPU floor eligible\n");
+    std::printf("Test: SourceLate and OutputLate restarts of held frames make the held GPU floor eligible\n");
     ResetStage();
     ScriptedClock clock;
     const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
@@ -1203,6 +1205,28 @@ void TestCadenceRestartsCountForTheFloor()
     g_stage.DrainStageEvents();
     CHECK(g_stage.Statistics().output_late_epochs == late_before + 1);
     CHECK(g_stage.Lead().CadenceRestartSeen(1));
+
+    // Frames not held: their SourceLate and OutputLate restarts do not count.
+    g_stage.ResetGpuFloor();
+    finish(next);
+    const PacingPipelineSnapshot not_held = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
+    for (int i = 0; i < 4; ++i) {
+        last = g_stage.RunPlannedFrame(Request(Key(frame_id++), not_held), &clock);
+        finish(last);
+    }
+    clock.now = last.plan.output_target_qpc + Ticks(kIntervalUs) - Ticks(last.plan.lead_us) + Ticks(8'000.0);
+    const SourceStageFrame late_not_held = g_stage.RunPlannedFrame(Request(Key(frame_id++), not_held), &clock);
+    CHECK(late_not_held.planned && late_not_held.epoch_started == PacingEpochReason::SourceLate);
+    CHECK(late_not_held.plan.rung == PacingRung::SourceOnly);
+    CHECK(!g_stage.Lead().CadenceRestartSeen(1));
+    finish(late_not_held);
+    const SourceStageFrame output_not_held = g_stage.RunPlannedFrame(Request(Key(frame_id++), not_held), &clock);
+    const uint64_t not_held_before = g_stage.Statistics().output_late_epochs;
+    CHECK(FramePlan_PushStageEvent(Event(output_not_held, PacingStageEventKind::OutputRelease,
+        output_not_held.plan.output_target_qpc + Ticks(8'000.0), PacingPlanStatus::SourceOnly)));
+    g_stage.DrainStageEvents();
+    CHECK(g_stage.Statistics().output_late_epochs == not_held_before + 1);
+    CHECK(!g_stage.Lead().CadenceRestartSeen(1));
 }
 
 int main()
