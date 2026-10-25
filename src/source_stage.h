@@ -219,6 +219,7 @@ struct SourceStageFrame {
     int64_t release_qpc = 0;       // s_n, after the wait and any injected stall
     int64_t pre_wait_start_qpc = 0; // the request's pre-Sleep wait when the plan took its index; 0 none
     int64_t pre_wait_end_qpc = 0;
+    int64_t game_arrival_qpc = 0;   // when the game reached ReLimiter for the frame, before any wait of ReLimiter's own
     uint32_t stall_injected_us = 0;
     bool lead_budget_limited = false; // the lead was clamped to its 3 I limit
     bool handoff_limited = false;     // the render handoff limit moved the release past S_n
@@ -264,12 +265,10 @@ public:
         rhythm_key_ = {};
         rhythm_release_qpc_ = 0;
     }
-    // A Reflex report's GPU active render time and GPU start
-    // (LeadController::OnGpuActiveTime).
-    void OnGpuActiveTime(uint32_t producer_epoch, uint64_t frame_id, double gpu_active_us,
-        int64_t gpu_start_qpc) noexcept
+    // A Reflex report's GPU times (LeadController::OnGpuReport).
+    void OnGpuReport(uint32_t producer_epoch, uint64_t frame_id, const LeadGpuReport& report) noexcept
     {
-        lead_.OnGpuActiveTime(producer_epoch, frame_id, gpu_active_us, gpu_start_qpc);
+        lead_.OnGpuReport(producer_epoch, frame_id, report);
     }
     // A Reflex report pair (LeadController::OnReportPair): the stream proof
     // and the GPU floor's F.

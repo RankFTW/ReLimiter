@@ -279,6 +279,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     plan.mode = pipeline.mode;
     plan.marker = request.marker;
     frame.planned = true;
+    frame.game_arrival_qpc = game_arrival_qpc;
     frame.lead_budget_limited = budget_limited;
     frame.epoch_started = grid_plan.epoch_reason;
     // A restart of a held frame is the held GPU floor's eligibility before

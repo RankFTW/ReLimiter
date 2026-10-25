@@ -271,6 +271,7 @@ struct ReflexOwnedWaitsSlot {
     std::atomic<int64_t> wait_end_qpc{ 0 };
     std::atomic<int64_t> pre_wait_start_qpc{ 0 };
     std::atomic<int64_t> pre_wait_end_qpc{ 0 };
+    std::atomic<int64_t> arrival_qpc{ 0 };
     std::atomic<uint32_t> producer_epoch{ 0 };
     std::atomic<uint64_t> frame_id{ 0 };
 };
@@ -292,6 +293,7 @@ void PublishReflexOwnedWaits(
     slot.wait_end_qpc.store(waits.wait_end_qpc, std::memory_order_relaxed);
     slot.pre_wait_start_qpc.store(waits.pre_wait_start_qpc, std::memory_order_relaxed);
     slot.pre_wait_end_qpc.store(waits.pre_wait_end_qpc, std::memory_order_relaxed);
+    slot.arrival_qpc.store(waits.arrival_qpc, std::memory_order_relaxed);
     slot.producer_epoch.store(producer_epoch, std::memory_order_release);
     slot.frame_id.store(frame_id, std::memory_order_release);
 }
@@ -312,6 +314,7 @@ static bool PeekReflexOwnedWaits(
     waits->wait_end_qpc = slot.wait_end_qpc.load(std::memory_order_relaxed);
     waits->pre_wait_start_qpc = slot.pre_wait_start_qpc.load(std::memory_order_relaxed);
     waits->pre_wait_end_qpc = slot.pre_wait_end_qpc.load(std::memory_order_relaxed);
+    waits->arrival_qpc = slot.arrival_qpc.load(std::memory_order_relaxed);
     return slot.producer_epoch.load(std::memory_order_acquire) == producer_epoch &&
         slot.frame_id.load(std::memory_order_acquire) == frame_id;
 }
@@ -360,7 +363,7 @@ static void LogSerialFramesChange(bool serial) noexcept
 {
     if (serial == s_serial_frames_logged) return;
     s_serial_frames_logged = serial;
-    LOG_INFO("Feedback: frame span demand %s (next simulation start after the previous Present end in %u of %u report pairs)",
+    LOG_INFO("Feedback: frame span demand %s (next frame reached ReLimiter after the previous Present end in %u of %u report pairs)",
              serial ? "on" : "off", s_serial_frames.SerialPairs(), s_serial_frames.Pairs());
 }
 
@@ -584,6 +587,36 @@ static int64_t ReflexTimestampToQpc(uint64_t driver_us) noexcept
         static_cast<int64_t>(std::llround(remainder_us * static_cast<double>(qpc_frequency) / 1'000'000.0));
 }
 
+// The serial detector's input for frame_id on the driver clock: when the game
+// reached ReLimiter for that frame, before any wait of ReLimiter's own. A frame
+// ReLimiter planned has its arrival published with the owned waits; a frame it
+// did not plan has nothing of ReLimiter's before its simulation, so the
+// simulation start is the arrival. 0 (the detector breaks the pair without
+// judging it) when the frame is planned but its arrival cannot be placed on
+// the driver clock: the arrival is 0 or the clock map is not stable yet.
+static uint64_t SerialFrameArrivalUs(
+    uint64_t frame_id,
+    uint32_t producer_epoch,
+    uint64_t simulation_start_us) noexcept
+{
+    ReflexOwnedWaits owned{};
+    if (!PeekReflexOwnedWaits(frame_id, producer_epoch, &owned)) return simulation_start_us;
+    const int64_t qpc_frequency = GetQPCFrequency();
+    if (owned.arrival_qpc <= 0 || qpc_frequency <= 0 ||
+        s_reflex_clock_map.Status() != PacingClockMapStatus::Stable) {
+        return 0;
+    }
+    // local_us = driver_us + offset, inverted; whole seconds first so the
+    // product stays exact.
+    const int64_t seconds = owned.arrival_qpc / qpc_frequency;
+    const int64_t remainder = owned.arrival_qpc % qpc_frequency;
+    const double local_us = static_cast<double>(seconds) * 1'000'000.0 +
+        static_cast<double>(remainder) * 1'000'000.0 / static_cast<double>(qpc_frequency);
+    const double driver_us = local_us - s_reflex_clock_map.OffsetUs();
+    if (!(driver_us >= 1.0)) return 0;
+    return static_cast<uint64_t>(std::llround(driver_us));
+}
+
 // Once per admitted report, after it is committed to the adaptation queue,
 // so a deferred report never consumes its PRESENT_START entry early.
 static void PushReflexPacingRecord(
@@ -773,7 +806,10 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
         const auto& r = params.frameReport[i];
         if (r.frameID == 0 || r.frameID <= s_last_reflex_frame_id) continue;
         const bool serial_frames =
-            s_serial_frames.Push(r.frameID, r.simStartTime, r.presentEndTime);
+            s_serial_frames.Push(
+                r.frameID,
+                SerialFrameArrivalUs(r.frameID, sample_producer_epoch, r.simStartTime),
+                r.presentEndTime);
         LogSerialFramesChange(serial_frames);
 
         double sample_present_to_gpu_end_us = 0.0;

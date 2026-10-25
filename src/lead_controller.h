@@ -153,10 +153,13 @@ constexpr uint32_t LEAD_WORK_STALE_FRAMES = 64;
 // (CONTROL Resonant: gaps of up to 362 GPU queue wait frames between pairs).
 // Behind the wait the GPU queue wait's guards stand aside, and on both GPU
 // outputs the lead sample leaves out the frame's wait for the GPU to finish
-// frame n − 1 (LeadController::SampleUs). Under the guard D cannot show
-// this: the next frame's heavy work queues behind the guarded release, so
-// Q10(D) rises with the lead (CONTROL: p10 4.7 ms guarded, 5.5 ms at +1.7 ms,
-// 8.1 ms at +4.6 ms lead) and never shows the room.
+// frame n − 1 (LeadController::SampleUs), unless the GPU then waited inside
+// the frame for its submissions (LEAD_HANDOFF_GPU_IDLE_US or more): such a
+// frame's submissions set its readiness, and it keeps its X. Such a sample
+// waits for the frame's Reflex report. Under the guard D
+// cannot show this: the next frame's heavy work queues behind the guarded
+// release, so Q10(D) rises with the lead (CONTROL: p10 4.7 ms guarded,
+// 5.5 ms at +1.7 ms, 8.1 ms at +4.6 ms lead) and never shows the room.
 constexpr size_t LEAD_CONCURRENCY_SAMPLES = 64;
 // Clock map spread (about 6 µs) and probe mapping; Rogue Core's concurrent
 // pairs start p50 0.7-0.9 ms before the Signal.
@@ -359,19 +362,23 @@ constexpr double LEAD_ROOM_MIN_HOLD_US = 250.0; // h
 // the release). A gap that had to be positive rejected every GPU queue wait
 // frame, so the anchor never engaged there.
 //
-// GPU need (the Adaptive cap hold room of the FG input wait): the GPU time D
-// from the release of frame n − 1's output (its anchor above) to frame n's
-// GPU readiness, taken when frame n's anchor replaces n − 1's. It is frame
-// generation and Present of n − 1 plus frame n's render, with the game's own
-// submission waits but without ReLimiter's own holds (the anchor of a held
-// frame is its release): a period that included the holds would feed the
-// room back into itself. A frame ReLimiter holds is ready before its target,
-// so its D is at most the interval and the room never rises from frames it
-// can hold; a GPU that cannot keep up gives D its own period. Only
-// consecutive frames of one producer epoch count, D above
-// LEAD_LONG_SAMPLE_INTERVALS intervals is dropped, the newest
-// LEAD_GPU_NEED_CAPACITY values form the window and a different FG divisor
-// slot restarts it.
+// GPU need (the Adaptive cap hold room of the FG input wait): the GPU
+// execution time of a real frame from its Reflex report, the active render
+// time plus the AI frame time (LeadGpuReport::work_us, the governor's GPU
+// service), of sampled FG input wait frames: execution time does not move
+// with ReLimiter's cadence. The readiness gap it replaced (frame n's
+// readiness − frame n − 1's anchor) did: a frame the cap holds is ready at
+// its own release plus its work, so the gap was the interval less the
+// frame's slack, and its quantile held whatever interval the Adaptive cap had
+// reached (Gears of War: E-Day, FG 2× at 120 with GPU-paced cadence and the
+// Adaptive cap at 75: gap p50/p75 20.1/21.1 ms at a 20.7 ms interval against
+// 17.7/17.9 ms of GPU work; the room set the realized interval at +20–36%).
+// Execution time overstates the GPU's saturated period by the frame
+// generation overlap (Gears 17.93 against 17.48 ms, CONTROL Resonant +1.3%),
+// which errs toward holding. Values above LEAD_LONG_SAMPLE_INTERVALS
+// intervals are dropped, the newest LEAD_GPU_NEED_CAPACITY form the window,
+// another FG divisor slot or producer epoch restarts it, and it reads 0
+// while the slot's FG reports are stale (LEAD_WORK_STALE_FRAMES).
 //
 // Report pairs (frame n's Reflex report and n − 1's, driver clock): a pair
 // whose first work reached the driver in the first half of the render
@@ -444,6 +451,16 @@ struct LeadGuardOutcome {
     // How much lower the lead is than the unguarded lead (>= 0): the guard's
     // limit, and after the limit relaxed, the lead slewing back up to it.
     double reduction_us = 0.0;
+};
+
+// One Reflex latency report's GPU times for a frame (LeadController::OnGpuReport).
+struct LeadGpuReport {
+    double active_us = 0.0; // gpuActiveRenderTimeUs: the frame's GPU busy time A (> 0)
+    double span_us = 0.0;   // gpuRenderEndTime − gpuRenderStartTime on the driver's clock; 0 unknown
+    // A plus the AI frame time when the report gave execution-only evidence
+    // (the governor's GPU service); 0 otherwise. The FG input wait's GPU need.
+    double work_us = 0.0;
+    int64_t start_qpc = 0;  // gpuRenderStartTime as QPC through the stable clock map; 0 unknown
 };
 
 // The owner's source release of one planned frame (plan fields plus s).
@@ -577,6 +594,13 @@ struct LeadStatistics {
     // the previous frame (behind the wait, SampleUs), and the newest such wait.
     uint64_t predecessor_wait_samples = 0;
     double last_predecessor_wait_us = 0.0;
+    // Behind the wait: samples that kept their X because the GPU waited
+    // inside the frame for its submissions, and the newest wait for frame
+    // n − 1 they kept; samples whose report did not arrive before the frame
+    // closed (the wait left out).
+    uint64_t absorbed_wait_samples = 0;
+    double last_absorbed_wait_us = 0.0;
+    uint64_t report_missing_samples = 0;
     // Lead samples shortened by the game's simulation → render queue q
     // (above: FG input wait, and GPU queue wait under the A/B key), and the
     // newest such q.
@@ -703,13 +727,13 @@ public:
     void OnSourceRelease(const LeadFrameStart& frame) noexcept;
     void OnStageEvent(const PacingStageEvent& event) noexcept;
     // The Reflex latency report of NvAPI frame (producer_epoch, frame_id):
-    // its GPU active render time A and, through the stable clock map, the
-    // QPC of its gpuRenderStartTime (0 unknown; the queue-order test).
-    // Pairs with the pending frame of that key (reports arrive about three
-    // frames after the source release); a report without one is counted and
-    // dropped.
-    void OnGpuActiveTime(uint32_t producer_epoch, uint64_t frame_id, double gpu_active_us,
-        int64_t gpu_start_qpc = 0) noexcept;
+    // its GPU active render time A, span and execution time, and through the
+    // stable clock map the QPC of its gpuRenderStartTime (0 unknown; the
+    // queue-order test). Pairs with the pending frame of that key (reports
+    // arrive about two to four frames after the source release); a report
+    // without one is counted and dropped. The first report of a frame wins.
+    // A lead sample behind the wait is emitted here (SampleUs).
+    void OnGpuReport(uint32_t producer_epoch, uint64_t frame_id, const LeadGpuReport& report) noexcept;
     // The Reflex report pair of NvAPI frame (producer_epoch, frame_id) and
     // its previous frame (above): every pair counts toward the stream proof
     // and, if it streams, its first-submission delay toward F.
@@ -782,8 +806,9 @@ public:
     double GpuPeriodUs() const noexcept;
     double RecentGpuPeriodUs() const noexcept;
     // GPU need window (above): the lower-index quantile sorted[floor(q (n − 1))]
-    // of the newest D of fg_divisor's slot, 0 until LEAD_WARM_SAMPLES of them
-    // or while the window holds another FG divisor's frames.
+    // of the newest GPU execution times of fg_divisor's slot, 0 until
+    // LEAD_WARM_SAMPLES of them, while the window holds another FG divisor's
+    // frames, or while that slot's FG reports are stale.
     double GpuNeedQuantileUs(double q, double fg_divisor) const noexcept;
     uint32_t GpuNeedCount() const noexcept { return gpu_need_.count; }
     // Anchor → GPU end gaps in the readiness anchor's window (above).
@@ -867,7 +892,8 @@ private:
         bool occupied = false;
         bool started = false;   // source release seen
         bool sampled = false;   // Vrr or Fixed: produces a sample
-        bool finalized = false; // sample emitted or given up
+        bool finalized = false; // outcome judged (slack, rings, room) or given up
+        bool lead_sampled = false; // lead window sample emitted or given up
         bool closed = false;    // expired: no longer waited on
         bool gpu_resume_probe = false;
         PacingRenderQueue render_queue = PacingRenderQueue::Keep; // GPU queue wait A/B
@@ -878,6 +904,7 @@ private:
         bool call_recorded = false;   // C entered the call window, or given up (ResetBuckets)
         bool margin_recorded = false; // p_{n+1} − o_n entered the margin learner
         double gpu_active_us = 0.0;   // Reflex GPU active render time A; 0 unknown
+        double gpu_span_us = 0.0;     // Reflex GPU start → end span on the driver's clock; 0 unknown
         bool work_recorded = false;     // D = r − A − s entered the work window, or given up
         bool headroom_recorded = false; // r_{n+1} − A_{n+1} − o_n entered the headroom learner
         int64_t gpu_start_qpc = 0;      // Reflex gpuRenderStartTime as QPC; 0 unknown
@@ -942,7 +969,7 @@ private:
     double ReadyGapMedianUs() const noexcept;
     // A reported frame the cap held (above).
     void NoteCapHeld(const PendingFrame& frame) noexcept;
-    void RecordGpuNeed(const PendingFrame& frame) noexcept;
+    void RecordGpuNeed(const PendingFrame& frame, double work_us) noexcept;
     // Copies the newest `count` u − o observations (count <= resume_delay_count_).
     void NewestResumeDelays(size_t count, double* delays_us) const noexcept;
     // Collision guard
@@ -971,13 +998,21 @@ private:
     bool PreviousResolved(const PendingFrame& frame) const noexcept;
     void TryFinalize(PendingFrame* frame) noexcept;
     void ForceFinalize(PendingFrame* frame) noexcept;
-    void EmitSample(PendingFrame* frame) noexcept;
-    // The lead sample X of a frame (below) and, through raw_us, its measured
-    // release → output point (the GPU waits: max(p, r) − s; the other rungs:
-    // X), and through predecessor_wait_us the GPU wait for frame n − 1 that X
-    // leaves out (0 otherwise).
-    double SampleUs(const PendingFrame& frame, const PendingFrame* previous,
-        double* raw_us = nullptr, double* predecessor_wait_us = nullptr) const noexcept;
+    // The outcome at readiness: render handoff, readiness rings, slack and
+    // hold room, all from the measured readiness. The lead window sample
+    // follows it, but behind the wait only with the frame's Reflex report
+    // (LeadSampleWaitsForReport) or once the frame closes without one.
+    void EmitOutcome(PendingFrame* frame) noexcept;
+    void EmitLeadSample(PendingFrame* frame) noexcept;
+    bool LeadSampleWaitsForReport(const PendingFrame& frame) const noexcept;
+    // A frame's measured release → output point X (below; the GPU waits:
+    // max(p, r) − s), and the lead sample from it: behind the wait without
+    // the GPU wait for frame n − 1 (through predecessor_wait_us, 0
+    // otherwise), unless the GPU waited inside the frame for its submissions
+    // (through absorbed_us, the wait kept in the sample).
+    double MeasuredUs(const PendingFrame& frame, const PendingFrame* previous) const noexcept;
+    double SampleUs(const PendingFrame& frame, const PendingFrame* previous, double raw_us,
+        double* predecessor_wait_us = nullptr, double* absorbed_us = nullptr) const noexcept;
     // The game's simulation → render queue q (above), in µs: FG input wait,
     // and GPU queue wait per its render_queue; 0 for other rungs or without
     // e, w, p and the previous frame's b.
@@ -1057,12 +1092,14 @@ private:
     // the newest cadence restart (0 none).
     uint32_t cap_held_frames_ = 0;
     uint32_t restart_epoch_ = 0;
-    // GPU need window (above); divisor = the frames' FG divisor slot.
+    // GPU need window (above); divisor = the frames' FG divisor slot, epoch
+    // their producer epoch.
     struct GpuNeedWindow {
         std::array<float, LEAD_GPU_NEED_CAPACITY> us{};
         uint32_t head = 0;
         uint32_t count = 0;
         size_t divisor = 0;
+        uint32_t epoch = 0;
     };
     GpuNeedWindow gpu_need_{};
     // GPU-paced cadence: X of frames the GPU floor released (EarlyLeadUs),

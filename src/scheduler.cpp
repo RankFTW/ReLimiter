@@ -1127,11 +1127,16 @@ static GovernorDecision UpdatePeriodGovernor(
     const bool gpu_hold = IsGpuRung(pipeline.rung);
     ReflexFrameTimeSample sample{};
     while (ConsumeReflexFrameTimeSample(&sample)) {
-        // The release headroom's heavy-work start r − A and the queue-order
-        // test's GPU start (lead_controller.h).
+        // The release headroom's heavy-work start r − A, the queue-order
+        // test's GPU start, the lead sample behind the wait and the FG input
+        // wait's GPU need (lead_controller.h).
         if (sample.gpu_active_us > 0.0) {
-            s_source_stage.OnGpuActiveTime(sample.producer_epoch, sample.frame_id, sample.gpu_active_us,
-                sample.gpu_start_qpc);
+            LeadGpuReport report{};
+            report.active_us = sample.gpu_active_us;
+            report.span_us = sample.gpu_render_duration_us;
+            report.work_us = sample.gpu_execution_available ? sample.gpu_service_us : 0.0;
+            report.start_qpc = sample.gpu_start_qpc;
+            s_source_stage.OnGpuReport(sample.producer_epoch, sample.frame_id, report);
         }
         // Render handoff GPU floor (lead_controller.h):
         // every report's GPU times and pair.
@@ -1164,8 +1169,9 @@ static GovernorDecision UpdatePeriodGovernor(
     // late-frame evidence and the workload reports. The room is the interval
     // at which the Auto output holds the fit percentile of frames: the GPU
     // queue wait's from its collision guard, the FG input wait's (under the
-    // developer A/B gpu_paced_cadence) the fit quantile of the GPU need D,
-    // which leaves out ReLimiter's own holds (lead_controller.h).
+    // developer A/B gpu_paced_cadence) the fit quantile of the GPU execution
+    // time per real frame, which ReLimiter's cadence does not move
+    // (lead_controller.h).
     if (config.adaptive_cap_hold_room && config.rung_override == PacingRungOverride::Auto) {
         const PacingRung lead_rung = PacingPipeline_LeadRung(pipeline);
         if (lead_rung == PacingRung::GpuQueueWait) {
@@ -1752,6 +1758,7 @@ static SourceStageFrame RunPlanned(
             waits.wait_end_qpc = frame.wait_end_qpc;
             waits.pre_wait_start_qpc = frame.pre_wait_start_qpc;
             waits.pre_wait_end_qpc = frame.pre_wait_end_qpc;
+            waits.arrival_qpc = frame.game_arrival_qpc;
             PublishReflexOwnedWaits(input.frame_id, key.producer_epoch, waits);
         }
     }

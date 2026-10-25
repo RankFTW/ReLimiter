@@ -105,6 +105,10 @@ struct ReflexOwnedWaits {
 	int64_t wait_end_qpc = 0;
 	int64_t pre_wait_start_qpc = 0;
 	int64_t pre_wait_end_qpc = 0;
+	// When the game reached ReLimiter for the frame, before any wait of
+	// ReLimiter's own (the marker hook or the Reflex Sleep hook, whichever
+	// came first); 0 when unknown. Feeds the serial-frame detector.
+	int64_t arrival_qpc = 0;
 };
 void PublishReflexOwnedWaits(
 	uint64_t frame_id,

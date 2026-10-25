@@ -217,6 +217,7 @@ void LeadController::ResetBuckets() noexcept
     for (PendingFrame& frame : pending_) {
         if (!frame.occupied || !frame.started) continue;
         frame.finalized = true;
+        frame.lead_sampled = true;
         frame.call_recorded = true;
         frame.work_recorded = true;
         frame.release_to_render_recorded = true;
@@ -660,6 +661,7 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
     slot.started = true;
     slot.sampled = frame.mode == PacingTimingMode::Vrr || frame.mode == PacingTimingMode::Fixed;
     slot.finalized = !slot.sampled;
+    slot.lead_sampled = !slot.sampled;
     slot.rung = frame.rung;
     slot.bucket = static_cast<uint8_t>(bucket_index);
     slot.interval_us = frame.interval_us;
@@ -770,12 +772,13 @@ void LeadController::OnStageEvent(const PacingStageEvent& event) noexcept
     TryFinalize(Find(index + 1));
 }
 
-// The Reflex report of an NvAPI frame arrives about three frames after its
+// The Reflex report of an NvAPI frame arrives two to four frames after its
 // source release, while the frame is still in the pending table (32 slots).
-void LeadController::OnGpuActiveTime(uint32_t producer_epoch, uint64_t frame_id, double gpu_active_us,
-    int64_t gpu_start_qpc) noexcept
+void LeadController::OnGpuReport(uint32_t producer_epoch, uint64_t frame_id, const LeadGpuReport& report) noexcept
 {
-    if (qpc_frequency_ <= 0 || producer_epoch == 0 || !IsPositiveFinite(gpu_active_us)) {
+    if (qpc_frequency_ <= 0 || producer_epoch == 0 || !IsPositiveFinite(report.active_us) ||
+        !std::isfinite(report.span_us) || report.span_us < 0.0 ||
+        !std::isfinite(report.work_us) || report.work_us < 0.0) {
         ++statistics_.invalid_inputs;
         return;
     }
@@ -785,16 +788,21 @@ void LeadController::OnGpuActiveTime(uint32_t producer_epoch, uint64_t frame_id,
             continue;
         }
         if (frame.gpu_active_us > 0.0) return; // the first report wins
-        frame.gpu_active_us = gpu_active_us;
-        frame.gpu_start_qpc = gpu_start_qpc > 0 ? gpu_start_qpc : 0;
+        frame.gpu_active_us = report.active_us;
+        frame.gpu_span_us = report.span_us;
+        frame.gpu_start_qpc = report.start_qpc > 0 ? report.start_qpc : 0;
         if (frame.sampled && frame.rung == PacingRung::FgInputWait) {
             fg_report_age_frames_[frame.bucket % LEAD_DIVISOR_BUCKETS] = 0;
+            RecordGpuNeed(frame, report.work_us);
         }
         RecordWorkStart(&frame);
         if (frame.grid_index > 0) {
             RecordReleaseHeadroom(Find(frame.grid_index - 1));
             RecordConcurrency(Find(frame.grid_index - 1));
         }
+        // A lead sample behind the wait waits for this report, after the pair
+        // above: a concurrent pair ends the verdict first.
+        TryFinalize(&frame);
         return;
     }
     ++statistics_.unmatched_gpu_active;
@@ -920,25 +928,23 @@ void LeadController::NoteReadyAnchor(const PendingFrame& frame) noexcept
         ready_epoch_ = frame.key.producer_epoch;
         ready_frame_ = 0;
         ready_qpc_ = 0;
-        gpu_need_ = {};
     }
     if (frame.key.frame_id <= ready_frame_) return;
-    RecordGpuNeed(frame);
     ready_frame_ = frame.key.frame_id;
     ready_qpc_ = ReadyAnchorQpc(frame);
 }
 
-// D = frame's readiness − the previous frame's anchor (lead_controller.h),
-// before the frame's anchor replaces it.
-void LeadController::RecordGpuNeed(const PendingFrame& frame) noexcept
+// The GPU need of a sampled FG input wait frame (lead_controller.h): its
+// report's execution time, at most LEAD_LONG_SAMPLE_INTERVALS intervals.
+void LeadController::RecordGpuNeed(const PendingFrame& frame, double work_us) noexcept
 {
-    if (ready_frame_ == 0 || frame.key.frame_id != ready_frame_ + 1) return;
-    const double need_us = MicrosecondsBetween(ready_qpc_, frame.qpc[FieldGpuReady]);
-    if (!(need_us > 0.0) || !(need_us <= LEAD_LONG_SAMPLE_INTERVALS * frame.interval_us)) return;
+    if (!(work_us > 0.0) || !(work_us <= LEAD_LONG_SAMPLE_INTERVALS * frame.interval_us)) return;
     const size_t divisor = frame.bucket % LEAD_DIVISOR_BUCKETS;
-    if (gpu_need_.count > 0 && gpu_need_.divisor != divisor) gpu_need_ = {};
+    const uint32_t epoch = frame.key.producer_epoch;
+    if (gpu_need_.count > 0 && (gpu_need_.divisor != divisor || gpu_need_.epoch != epoch)) gpu_need_ = {};
     gpu_need_.divisor = divisor;
-    gpu_need_.us[gpu_need_.head] = static_cast<float>(need_us);
+    gpu_need_.epoch = epoch;
+    gpu_need_.us[gpu_need_.head] = static_cast<float>(work_us);
     gpu_need_.head = (gpu_need_.head + 1) % static_cast<uint32_t>(LEAD_GPU_NEED_CAPACITY);
     if (gpu_need_.count < LEAD_GPU_NEED_CAPACITY) ++gpu_need_.count;
 }
@@ -948,7 +954,8 @@ double LeadController::GpuNeedQuantileUs(double q, double fg_divisor) const noex
     size_t index = 0;
     if (gpu_need_.count < LEAD_WARM_SAMPLES || !std::isfinite(q) ||
         !FindBucketIndex(PacingRung::FgInputWait, fg_divisor, &index) ||
-        gpu_need_.divisor != index % LEAD_DIVISOR_BUCKETS) {
+        gpu_need_.divisor != index % LEAD_DIVISOR_BUCKETS ||
+        fg_report_age_frames_[gpu_need_.divisor] > LEAD_WORK_STALE_FRAMES) {
         return 0.0;
     }
     std::array<float, LEAD_GPU_NEED_CAPACITY> sorted = gpu_need_.us;
@@ -1171,7 +1178,7 @@ void LeadController::ExpireBehindNewest() noexcept
             Discard(&frame);
             continue;
         }
-        if (!frame.finalized) ForceFinalize(&frame);
+        if (!frame.finalized || !frame.lead_sampled) ForceFinalize(&frame);
         frame.closed = true;
     }
     for (PendingFrame& frame : pending_) TryFinalize(&frame);
@@ -1438,39 +1445,51 @@ bool LeadController::PreviousResolved(const PendingFrame& frame) const noexcept
 
 void LeadController::TryFinalize(PendingFrame* frame) noexcept
 {
-    if (frame == nullptr || !frame->occupied || !frame->started || frame->finalized) return;
+    if (frame == nullptr || !frame->occupied || !frame->started || (frame->finalized && frame->lead_sampled)) return;
     const uint16_t own = OwnFieldMask(frame->rung);
     if ((frame->field_mask & own) != own || !PreviousResolved(*frame)) return;
-    EmitSample(frame);
+    if (!frame->finalized) EmitOutcome(frame);
+    if (!frame->lead_sampled && !LeadSampleWaitsForReport(*frame)) EmitLeadSample(frame);
 }
 
 void LeadController::ForceFinalize(PendingFrame* frame) noexcept
 {
     const uint16_t own = OwnFieldMask(frame->rung);
     if ((frame->field_mask & own) == own) {
-        EmitSample(frame);
+        if (!frame->finalized) EmitOutcome(frame);
+        if (!frame->lead_sampled) {
+            // Closed behind the wait without its report: the whole wait for
+            // frame n − 1 is left out (SampleUs).
+            if (LeadSampleWaitsForReport(*frame)) ++statistics_.report_missing_samples;
+            EmitLeadSample(frame);
+        }
         return;
     }
     frame->finalized = true;
+    frame->lead_sampled = true;
     const bool presented = HasField(*frame, FieldPresentCall);
     if (IsGpuRung(frame->rung) && presented) ++statistics_.missing_ready;
     else ++statistics_.incomplete_dropped;
 }
 
-void LeadController::EmitSample(PendingFrame* frame) noexcept
+// Behind the wait the lead sample needs the frame's own report: its GPU span
+// and active time show how much of the wait for frame n − 1 the GPU absorbed
+// (SampleUs). Reports arrive two to four frames after the release.
+bool LeadController::LeadSampleWaitsForReport(const PendingFrame& frame) const noexcept
+{
+    return IsGpuRung(frame.rung) && !(frame.gpu_active_us > 0.0) &&
+        BehindWait(frame.rung, frame.bucket % LEAD_DIVISOR_BUCKETS);
+}
+
+void LeadController::EmitOutcome(PendingFrame* frame) noexcept
 {
     frame->finalized = true;
     RecordHandoff(*frame, Previous(*frame));
-    double raw_us = 0.0;
-    double predecessor_wait_us = 0.0;
-    const double sample_us = SampleUs(*frame, Previous(*frame), &raw_us, &predecessor_wait_us);
-    if (!std::isfinite(sample_us) || !std::isfinite(raw_us)) {
+    const double raw_us = MeasuredUs(*frame, Previous(*frame));
+    if (!std::isfinite(raw_us)) {
+        frame->lead_sampled = true;
         ++statistics_.invalid_inputs;
         return;
-    }
-    if (predecessor_wait_us > 0.0) {
-        ++statistics_.predecessor_wait_samples;
-        statistics_.last_predecessor_wait_us = predecessor_wait_us;
     }
     // GPU-paced cadence (EarlyLeadUs): how long a frame the GPU floor
     // released took to be ready. On the GPU waits the measured readiness
@@ -1483,7 +1502,7 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
     const bool gpu_ready = IsGpuRung(frame->rung) && HasField(*frame, FieldGpuReady);
     const double ready_us = gpu_ready
         ? MicrosecondsBetween(frame->qpc[FieldSource], frame->qpc[FieldGpuReady])
-        : sample_us;
+        : raw_us;
     const bool ready_in_range = ready_us >= 0.0 && ready_us <= LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us;
     const auto add = [&](GpuPacedRing* ring) noexcept {
         ring->x_us[ring->head] = static_cast<float>(ready_us);
@@ -1541,15 +1560,38 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
         room_windows_[divisor].Add(raw_us);
         ++statistics_.room_samples;
     }
+}
+
+void LeadController::EmitLeadSample(PendingFrame* frame) noexcept
+{
+    frame->lead_sampled = true;
+    const PendingFrame* previous = Previous(*frame);
+    const double raw_us = MeasuredUs(*frame, previous);
+    double predecessor_wait_us = 0.0;
+    double absorbed_us = 0.0;
+    const double sample_us = SampleUs(*frame, previous, raw_us, &predecessor_wait_us, &absorbed_us);
+    if (!std::isfinite(sample_us)) {
+        ++statistics_.invalid_inputs;
+        return;
+    }
+    if (predecessor_wait_us > 0.0) {
+        ++statistics_.predecessor_wait_samples;
+        statistics_.last_predecessor_wait_us = predecessor_wait_us;
+    }
+    if (absorbed_us > 0.0) {
+        ++statistics_.absorbed_wait_samples;
+        statistics_.last_absorbed_wait_us = absorbed_us;
+    }
     // FG input wait, and the GPU queue wait under the A/B key
     // (lead_controller.h): the lead learns X without the time the finished
     // frame waited for the render thread to leave the previous Present; the
-    // slack above keeps it.
-    const double queue_us = QueueUs(*frame, Previous(*frame));
+    // slack keeps it.
+    const double queue_us = QueueUs(*frame, previous);
     if (queue_us > 0.0) {
         ++statistics_.queued_samples;
         statistics_.last_queue_us = queue_us;
     }
+    Bucket& bucket = buckets_[frame->bucket];
     const double lead_sample_us = sample_us - queue_us;
     if (lead_sample_us > LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us) {
         ++bucket.excluded_long;
@@ -1564,14 +1606,49 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
 // X relative to the frame's source release s:
 //   H0: a − s.   H1/H2: (a − s) − overlap([s, a], previous CPU hold), with the
 //   native arrival for H2.
-//   H3 and FG input wait: the measured max(p, r) − s (raw_us), except where
-//   this output's queue order says the next frame's GPU work runs behind the
-//   wait (BehindWait, lead_controller.h): X = max(p, r − d) − s with
-//   d = max(0, f − w_c), the time the frame's submitted GPU work waited for
-//   the GPU to finish frame n − 1. f = max(r_{n−1}, u_{n−1}) is when the GPU
-//   passed frame n − 1's gate, w_c = min(p, max(s, w + F)) where the frame's
-//   first GPU work reached the driver (w = RENDERSUBMIT_START, F the median
-//   first-submission delay; w_c = p without RENDERSUBMIT_START).
+//   H3 and FG input wait: the measured max(p, r) − s. The slack and the hold
+//   room take it (EmitOutcome).
+double LeadController::MeasuredUs(const PendingFrame& frame, const PendingFrame* previous) const noexcept
+{
+    const int64_t source = frame.qpc[FieldSource];
+    switch (frame.rung) {
+    case PacingRung::SourceOnly:
+        return MicrosecondsBetween(source, frame.qpc[FieldMarkerArrival]);
+    case PacingRung::MarkerHold:
+    case PacingRung::NativeHold: {
+        const Field arrival = frame.rung == PacingRung::MarkerHold ? FieldMarkerArrival : FieldNativeArrival;
+        const double arrival_us = MicrosecondsBetween(source, frame.qpc[arrival]);
+        double hold_begin_us = 0.0;
+        double hold_end_us = 0.0;
+        return PreviousCpuHold(previous, source, &hold_begin_us, &hold_end_us)
+            ? arrival_us - Overlap(0.0, arrival_us, hold_begin_us, hold_end_us)
+            : arrival_us;
+    }
+    case PacingRung::GpuQueueWait:
+    case PacingRung::FgInputWait:
+        return std::max(MicrosecondsBetween(source, frame.qpc[FieldPresentCall]),
+            MicrosecondsBetween(source, frame.qpc[FieldGpuReady]));
+    case PacingRung::Count:
+        break;
+    }
+    return std::numeric_limits<double>::quiet_NaN();
+}
+
+// The lead sample from X (raw_us): X itself, except on H3 and the FG input
+// wait where this output's queue order says the next frame's GPU work runs
+// behind the wait (BehindWait, lead_controller.h): X = max(p, r − d) − s.
+// d = max(0, f − w_c) is the time the frame's submitted GPU work waited for
+// the GPU to finish frame n − 1: f = max(r_{n−1}, u_{n−1}) is when the GPU
+// passed frame n − 1's gate, w_c = min(p, max(s, w + F)) where the frame's
+// first GPU work reached the driver (w = RENDERSUBMIT_START, F the median
+// first-submission delay; w_c = p without RENDERSUBMIT_START). A frame whose
+// GPU then waited for its submissions keeps its X: idle, the frame's span
+// beyond its active time (its report), less the FG input wait's own hold
+// inside that span, (o − r)+ (the frame generation after the Signal lies
+// inside the span; the GPU queue wait's readiness query lies after it), of
+// LEAD_HANDOFF_GPU_IDLE_US or more (the GPU waited, as for the period pairs).
+// In order, a frame that starved would not have been ready earlier with
+// the GPU free sooner: its submissions set its readiness.
 //   Behind the wait frame n's GPU work follows ReLimiter's release of frame
 //   n − 1: r_n = o_{n−1} + P_n, so the measured X is L + P_n − I and tracks
 //   the lead; a lead learned from it never fell (CONTROL Resonant FG 2× at
@@ -1585,73 +1662,64 @@ void LeadController::EmitSample(PendingFrame* frame) noexcept
 //   set the lead's Q99. f counts whether or not frame n − 1 waited: the
 //   frame's own work starts where the GPU is free of frame n − 1, whoever
 //   set that. The rest of frame n − 1's work after its gate (its frame
-//   generation, about 2 ms) stays in X. With concurrent or unknown queue
-//   order the GPU can start frame n's work beside the wait (Rogue Core), so
-//   the wait for frame n − 1 is not frame n's to drop. The floor at p holds
-//   because a frame is never ready before its Present call. The slack and the
-//   hold room take raw_us (EmitSample).
-double LeadController::SampleUs(const PendingFrame& frame, const PendingFrame* previous,
-    double* raw_us, double* predecessor_wait_us) const noexcept
+//   generation, about 2 ms) stays in X. A frame whose submissions set its
+//   readiness keeps its X: with the Adaptive cap stretching Gears of War:
+//   E-Day (FG 2× at 120) the GPU started each held frame 1.7 ms after the
+//   gate and idled 3.3 ms (p50, hold removed; p10 about 1.5) inside it; the
+//   whole d left 36% of those frames ready after their targets (lead at the
+//   median of X). d less the idle still left 4.4% late in a closed-loop
+//   model of that capture: it keeps subtracting from the tail frames that
+//   set Q99. In CONTROL the idle is 0.17–0.23 ms and d stays. The sample
+//   waits for the frame's report (LeadSampleWaitsForReport); a frame closed
+//   without one leaves d out. With concurrent or
+//   unknown queue order the GPU can start frame n's work beside the wait
+//   (Rogue Core), so the wait for frame n − 1 is not frame n's to drop. The
+//   floor at p holds because a frame is never ready before its Present call.
+double LeadController::SampleUs(const PendingFrame& frame, const PendingFrame* previous, double raw_us,
+    double* predecessor_wait_us, double* absorbed_us) const noexcept
 {
     if (predecessor_wait_us != nullptr) *predecessor_wait_us = 0.0;
-    double raw = std::numeric_limits<double>::quiet_NaN();
-    double sample = raw;
+    if (absorbed_us != nullptr) *absorbed_us = 0.0;
+    if (!IsGpuRung(frame.rung) || previous == nullptr || !previous->started || !IsGpuRung(previous->rung) ||
+        !BehindWait(frame.rung, frame.bucket % LEAD_DIVISOR_BUCKETS)) {
+        return raw_us;
+    }
     const int64_t source = frame.qpc[FieldSource];
-    switch (frame.rung) {
-    case PacingRung::SourceOnly:
-        sample = MicrosecondsBetween(source, frame.qpc[FieldMarkerArrival]);
-        raw = sample;
-        break;
-    case PacingRung::MarkerHold:
-    case PacingRung::NativeHold: {
-        const Field arrival = frame.rung == PacingRung::MarkerHold ? FieldMarkerArrival : FieldNativeArrival;
-        const double arrival_us = MicrosecondsBetween(source, frame.qpc[arrival]);
-        double hold_begin_us = 0.0;
-        double hold_end_us = 0.0;
-        sample = PreviousCpuHold(previous, source, &hold_begin_us, &hold_end_us)
-            ? arrival_us - Overlap(0.0, arrival_us, hold_begin_us, hold_end_us)
-            : arrival_us;
-        raw = sample;
-        break;
+    const double present_us = MicrosecondsBetween(source, frame.qpc[FieldPresentCall]);
+    const double ready_us = MicrosecondsBetween(source, frame.qpc[FieldGpuReady]);
+    bool free_known = false;
+    double free_us = 0.0;
+    double resume_us = 0.0;
+    if (PreviousGpuResume(previous, source, &resume_us)) {
+        free_us = resume_us;
+        free_known = true;
     }
-    case PacingRung::GpuQueueWait:
-    case PacingRung::FgInputWait: {
-        const double present_us = MicrosecondsBetween(source, frame.qpc[FieldPresentCall]);
-        const double ready_us = MicrosecondsBetween(source, frame.qpc[FieldGpuReady]);
-        raw = std::max(present_us, ready_us);
-        sample = raw;
-        if (previous == nullptr || !previous->started || !IsGpuRung(previous->rung) ||
-            !BehindWait(frame.rung, frame.bucket % LEAD_DIVISOR_BUCKETS)) {
-            break;
-        }
-        bool free_known = false;
-        double free_us = 0.0;
-        double resume_us = 0.0;
-        if (PreviousGpuResume(previous, source, &resume_us)) {
-            free_us = resume_us;
-            free_known = true;
-        }
-        if (HasField(*previous, FieldGpuReady)) {
-            const double previous_ready_us = MicrosecondsBetween(source, previous->qpc[FieldGpuReady]);
-            free_us = free_known ? std::max(free_us, previous_ready_us) : previous_ready_us;
-            free_known = true;
-        }
-        if (!free_known) break;
-        double start_us = present_us;
-        if (HasField(frame, FieldRenderSubmit)) {
-            start_us = std::clamp(MicrosecondsBetween(source, frame.qpc[FieldRenderSubmit]) + FirstSubmissionUs(),
-                0.0, std::max(present_us, 0.0));
-        }
-        const double wait_us = free_us - start_us;
-        if (!(wait_us > 0.0)) break;
-        sample = std::max(present_us, ready_us - wait_us);
-        if (predecessor_wait_us != nullptr) *predecessor_wait_us = raw - sample;
-        break;
+    if (HasField(*previous, FieldGpuReady)) {
+        const double previous_ready_us = MicrosecondsBetween(source, previous->qpc[FieldGpuReady]);
+        free_us = free_known ? std::max(free_us, previous_ready_us) : previous_ready_us;
+        free_known = true;
     }
-    case PacingRung::Count:
-        break;
+    if (!free_known) return raw_us;
+    double start_us = present_us;
+    if (HasField(frame, FieldRenderSubmit)) {
+        start_us = std::clamp(MicrosecondsBetween(source, frame.qpc[FieldRenderSubmit]) + FirstSubmissionUs(),
+            0.0, std::max(present_us, 0.0));
     }
-    if (raw_us != nullptr) *raw_us = raw;
+    const double wait_us = free_us - start_us;
+    if (!(wait_us > 0.0)) return raw_us;
+    if (frame.gpu_active_us > 0.0 && frame.gpu_span_us > 0.0) {
+        double hold_us = 0.0;
+        if (frame.rung == PacingRung::FgInputWait && HasField(frame, FieldOutputRelease)) {
+            hold_us = std::max(0.0, MicrosecondsBetween(frame.qpc[FieldGpuReady], frame.qpc[FieldOutputRelease]));
+        }
+        const double idle_us = std::max(0.0, frame.gpu_span_us - frame.gpu_active_us - hold_us);
+        if (idle_us >= LEAD_HANDOFF_GPU_IDLE_US) {
+            if (absorbed_us != nullptr) *absorbed_us = wait_us;
+            return raw_us;
+        }
+    }
+    const double sample = std::max(present_us, ready_us - wait_us);
+    if (predecessor_wait_us != nullptr) *predecessor_wait_us = raw_us - sample;
     return sample;
 }
 

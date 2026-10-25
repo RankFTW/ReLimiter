@@ -88,8 +88,9 @@ namespace
         CHECK(demand.gpu_render_us == 13800.0);
     }
 
-    // A serial engine starts frame n + 1's simulation at or after frame
-    // n's Present end; 124 of the newest 128 consecutive pairs make it serial.
+    // A serial engine's frame n + 1 reaches ReLimiter (arrival, before any
+    // wait of ReLimiter's own) at or after frame n's Present end; 124 of the
+    // newest 128 consecutive pairs make it serial.
     void TestSerialFrameDetector()
     {
         SerialFrameDetector detector;
@@ -142,6 +143,46 @@ namespace
             t += 7000;
         }
         CHECK(!detector.Serial());
+
+        // The arrival, not the released simulation start, is judged: a
+        // pipelined game whose frames reach ReLimiter 2 ms before the previous
+        // Present end is not serial although ReLimiter's source hold delays
+        // each simulation start past that Present end (the start is not even
+        // passed).
+        detector.Reset();
+        for (int i = 0; i < 300; ++i) {
+            detector.Push(frame++, t, t + 9000); // previous Present end at t - 2000
+            t += 7000;
+        }
+        CHECK(detector.Pairs() == 128 && detector.SerialPairs() == 0 && !detector.Serial());
+        // An arrival exactly at the previous Present end is serial; one
+        // microsecond before it is not.
+        detector.Reset();
+        uint64_t previous_end = t + 6000;
+        detector.Push(frame++, t, previous_end);
+        detector.Push(frame++, previous_end, previous_end + 6000);
+        CHECK(detector.Pairs() == 1 && detector.SerialPairs() == 1);
+        previous_end += 6000;
+        detector.Push(frame++, previous_end - 1, previous_end + 6000);
+        CHECK(detector.Pairs() == 2 && detector.SerialPairs() == 1);
+
+        // An unknown arrival (0) breaks the pair chain without counting: the
+        // pair into it and the pair out of it are both unjudged.
+        detector.Reset();
+        t += 100'000;
+        detector.Push(frame++, t, t + 6000);
+        detector.Push(frame++, t + 6200, t + 12'200);
+        CHECK(detector.Pairs() == 1 && detector.SerialPairs() == 1);
+        detector.Push(frame++, 0, t + 18'400);
+        CHECK(detector.Pairs() == 1 && detector.SerialPairs() == 1);
+        detector.Push(frame++, t + 18'600, t + 24'600);
+        CHECK(detector.Pairs() == 1 && detector.SerialPairs() == 1);
+        detector.Push(frame++, t + 24'800, t + 30'800);
+        CHECK(detector.Pairs() == 2 && detector.SerialPairs() == 2);
+        // A Present end at or before the arrival breaks the pair too.
+        detector.Push(frame++, t + 40'000, t + 40'000);
+        detector.Push(frame++, t + 50'000, t + 56'000);
+        CHECK(detector.Pairs() == 2 && detector.SerialPairs() == 2);
     }
 
     // With serial frames the demand is the larger of the stage maximum

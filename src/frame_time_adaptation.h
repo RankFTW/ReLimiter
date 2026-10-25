@@ -32,21 +32,27 @@
 
 constexpr uint32_t SERIAL_FRAME_WINDOW = 128;      // consecutive report pairs judged
 constexpr uint32_t SERIAL_FRAME_MIN_SERIAL = 124;  // about 97% serial pairs: on
-// Off only below this (hysteresis): Gears of War: E-Day sat at 123-124 of 128 and
-// toggled the frame span demand every few seconds.
+// Off only below this (hysteresis): judged from the released simulation start,
+// Gears of War: E-Day sat at 123-124 of 128 and toggled the frame span demand
+// every few seconds.
 constexpr uint32_t SERIAL_FRAME_OFF_BELOW = 116;   // about 91%
 constexpr double FRAME_SPAN_PRESENT_CAP_US = 2000.0; // Present call share: max(2 ms, I/4)
 
 // Serial engine evidence from Reflex reports in frame order: a pair of
-// consecutive frame IDs is serial when frame n + 1's simulation starts at or
-// after frame n's Present end. Serial once the window is full and at least
+// consecutive frame IDs is serial when frame n + 1 reached ReLimiter at or
+// after frame n's Present end. The arrival is when the game reached ReLimiter
+// for the frame, before any wait of ReLimiter's own, or the frame's
+// simulation start when ReLimiter held nothing before it: a released
+// simulation start would make a pipelined game look serial through
+// ReLimiter's own source hold. Serial once the window is full and at least
 // SERIAL_FRAME_MIN_SERIAL pairs are serial; serial until fewer than
-// SERIAL_FRAME_OFF_BELOW are (hysteresis). A frame ID gap or an invalid
-// report starts a new pair without judging one. Not thread-safe (the Reflex
-// poll owns it).
+// SERIAL_FRAME_OFF_BELOW are (hysteresis). A frame ID gap, an arrival of 0
+// (unknown) or a report whose Present end is not after its arrival starts a
+// new pair without judging one. Not thread-safe (the Reflex poll owns it).
 class SerialFrameDetector {
 public:
-    bool Push(uint64_t frame_id, uint64_t simulation_start_us, uint64_t present_end_us) noexcept;
+    // arrival_us and present_end_us are on the same clock (driver microseconds).
+    bool Push(uint64_t frame_id, uint64_t arrival_us, uint64_t present_end_us) noexcept;
     bool Serial() const noexcept;
     uint32_t SerialPairs() const noexcept { return serial_count_; }
     uint32_t Pairs() const noexcept { return count_; }

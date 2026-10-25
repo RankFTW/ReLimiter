@@ -141,15 +141,15 @@ FrameTimeAdaptationDemand FrameTimeAdaptation_ComputeDemand(
 
 bool SerialFrameDetector::Push(
     uint64_t frame_id,
-    uint64_t simulation_start_us,
+    uint64_t arrival_us,
     uint64_t present_end_us) noexcept
 {
-    if (frame_id == 0 || simulation_start_us == 0 || present_end_us <= simulation_start_us) {
+    if (frame_id == 0 || arrival_us == 0 || present_end_us <= arrival_us) {
         previous_frame_id_ = 0;
         return Serial();
     }
     if (previous_frame_id_ != 0 && frame_id == previous_frame_id_ + 1) {
-        const uint8_t serial = simulation_start_us >= previous_present_end_us_ ? 1u : 0u;
+        const uint8_t serial = arrival_us >= previous_present_end_us_ ? 1u : 0u;
         if (count_ == SERIAL_FRAME_WINDOW) {
             serial_count_ -= pairs_[head_];
         } else {
