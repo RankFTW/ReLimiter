@@ -1654,6 +1654,7 @@ static SourceStageFrame RunPlanned(
     // keeps its earlier behavior.
     request.collision_guard = config.rung_override == PacingRungOverride::Auto;
     request.gpu_queue_wait_render_queue = config.gpu_queue_wait_render_queue;
+    request.gated_hold_gpu_idle = config.gated_hold_gpu_idle;
     // An ended pre-Sleep wait gates earlier frames of a lockstep engine like
     // the source wait (lead_controller.h).
     s_pre_sleep.EndedWait(&request.pre_wait_index, &request.pre_wait_start_qpc, &request.pre_wait_end_qpc);

@@ -648,6 +648,18 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "interval follows only late frames and the game's workload reports. Compare one setting per capture, in "
         "the same scene.");
 
+    if (ImGui::Checkbox("Gated hold GPU idle", &g_config.gated_hold_gpu_idle)) {
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: gated hold GPU idle -> %s", g_config.gated_hold_gpu_idle ? "on" : "off");
+        *config_dirty = true;
+    }
+    HelpTip("Diagnostic A/B, GPU queue wait and FG input wait, with Adaptive cap. On (default), a frame whose "
+        "GPU finished after its Present call counts as late for Adaptive cap unless the GPU waited for the "
+        "frame's own work: ReLimiter's waits for later frames during its render submission are credited only "
+        "as far as the GPU idled inside the frame. Off, they are credited in full, as for lockstep games, which "
+        "can hide frames the GPU could not finish in time. On can lengthen the interval a few percent when the "
+        "GPU is the limit. Compare one setting per capture, in the same scene.");
+
     static const char* const kSourcePlacementLabels[] = {"Marker", "Pre-Sleep", "Reflex driver limiter"};
     static_assert(IM_ARRAYSIZE(kSourcePlacementLabels) ==
         static_cast<int>(PacingPlacementOverride::Count));

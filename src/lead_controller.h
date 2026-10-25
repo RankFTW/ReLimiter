@@ -192,6 +192,21 @@ constexpr double LEAD_ROOM_MIN_HOLD_US = 250.0; // h
 // judge frame n without it; the lead keeps the measured X, because a lockstep
 // frame cannot be ready before the release it waits for. In a serial engine
 // (Rogue Core) the next wait starts after Present(n): no frame is gated.
+// On the GPU waits a gated hold can move the output point only through the
+// frame's Present call or its submissions: when its GPU readiness is the
+// output point (r > p), the slack credits the hold only up to the GPU's idle
+// inside the frame's span (span − A − the FG input wait's own hold), from the
+// frame's Reflex report (developer A/B gated_hold_gpu_idle, default on).
+// Without that bound a pipelined engine whose next pre-Sleep wait overlaps
+// frame n's render submission hid every GPU-throughput late frame from the
+// Adaptive cap: in Gears of War: E-Day (FG 2× at 120) the credit was frame
+// n + 1's pre-Sleep wait, 11.2–12.5 ms on 53–100% of frames, and of the frames
+// ready after their targets (12–28%) 0.2–1.4% counted; CONTROL Resonant (FG 2×
+// at 130, Adaptive cap 75) 10.8 ms on 94%, 0.9% of the 15.6% counted. Those
+// frames' GPU ran back to back (0.21–0.38 ms from the previous frame's GPU
+// end to their start, 0.17–0.6 ms idle inside), so the hold could not have
+// moved them. Such a slack waits for the report; a frame closed without one
+// keeps the whole credit. The cadence grid's late-output check keeps it.
 
 // The game's simulation → render queue (CONTROL Resonant, FG 2× with the
 // driver's Reflex Sleep bypassed). A pipelined engine's
@@ -492,6 +507,10 @@ struct LeadFrameStart {
     // frame's lead sample leaves out the simulation → render queue (above).
     // The FG input wait always does; other rungs never.
     PacingRenderQueue render_queue = PacingRenderQueue::Keep;
+    // Developer A/B gated_hold_gpu_idle (default on): a GPU wait frame ready
+    // after its Present call credits a gated hold only up to its GPU idle
+    // (above).
+    bool gated_hold_gpu_idle = true;
     // Developer A/B gpu_paced_cadence: the GPU floor set this frame's release
     // (source_stage.h), so its X measures how soon a frame released there is
     // ready (EarlyLeadUs).
@@ -888,8 +907,10 @@ private:
         bool slack_known = false;
         bool slack_fenced = false; // released before the slack evidence restarted: its slack is not counted
         bool floor_fenced = false; // released before the GPU floor's windows restarted: its report adds nothing
+        bool slack_pending = false; // outcome judged, the slack waits for the frame's report (SlackWaitsForReport)
         double guard_reduction_us = 0.0; // the collision guard's reduction of L
         bool guard_judged = false;       // a judged GPU queue wait lead: adds a hold-room sample
+        bool gated_gpu_idle = false;     // LeadFrameStart::gated_hold_gpu_idle
         int64_t wait_start_qpc = 0;     // ReLimiter's source wait before s; 0 none
         int64_t wait_end_qpc = 0;
         int64_t pre_wait_start_qpc = 0; // and its pre-Sleep wait; 0 none
@@ -1012,10 +1033,18 @@ private:
     // The outcome at readiness: render handoff, readiness rings, slack and
     // hold room, all from the measured readiness. The lead window sample
     // follows it, but behind the wait a frame the cap released waits for its
-    // Reflex report (LeadSampleWaitsForReport) or closes without one.
+    // Reflex report (LeadSampleWaitsForReport) or closes without one; so does
+    // the slack of a gated GPU wait frame ready after its Present call
+    // (SlackWaitsForReport, above).
     void EmitOutcome(PendingFrame* frame) noexcept;
+    void EmitSlack(PendingFrame* frame) noexcept;
     void EmitLeadSample(PendingFrame* frame) noexcept;
     bool LeadSampleWaitsForReport(const PendingFrame& frame) const noexcept;
+    bool SlackWaitsForReport(const PendingFrame& frame) const noexcept;
+    // The GPU's idle inside the frame's span on the driver's clock: span − A,
+    // less the FG input wait's own hold after readiness; false without the
+    // frame's report, or on the FG input wait without its release.
+    bool GpuIdleInSpanUs(const PendingFrame& frame, double* idle_us) const noexcept;
     // A frame's measured release → output point X (below; the GPU waits:
     // max(p, r) − s), and the lead sample from it: behind the wait without
     // the GPU wait for frame n − 1 (through predecessor_wait_us, 0

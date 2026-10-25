@@ -1,10 +1,11 @@
 // Period governor C2 (src/period_governor.*): the evidence-gated Adaptive cap:
 // rises need evidence
 // (restarts, outputs ready after their target, a high miss rate) and are
-// sized by demand in bounded steps, demand-headroom falls, probes with growth
-// and backoff, recurring-load holds, hitch reports, maximum stretch,
-// LFC-paced judging, fixed-refresh quantization and epochs, resets, invalid
-// inputs and the hold room floor. Directly tests the production
+// sized by demand in bounded steps, demand-headroom falls over the
+// recurring-load memory, probes with growth and backoff, recurring-load
+// holds, hitch reports, maximum stretch, LFC-paced judging, fixed-refresh
+// quantization and epochs, resets, invalid inputs and the hold room floor
+// with its memory. Directly tests the production
 // logic; the scheduler wiring (demand drain, miss, output and hold-room feed,
 // LFC after the governor) needs live verification.
 
@@ -529,6 +530,16 @@ namespace
         CHECK(harness.governor.Statistics().release_failures == 1);
         CHECK_NEAR(harness.Target(), risen, 1e-6);
         CHECK_NEAR(harness.governor.DemandScale(), 1.0, 1e-12);
+        // The return is an overload episode like a rise: nothing falls for
+        // 3 s (two episodes, the rise and the return). The heaviest second
+        // of the load is still remembered, so the way down is a probe.
+        int frames = 1;
+        for (; frames <= 1000; ++frames) {
+            harness.Demand(7'000.0);
+            const GovernorCause cause = harness.Frame().cause;
+            if (cause == GovernorCause::Release || cause == GovernorCause::Probe) break;
+        }
+        CHECK(frames == 300);
     }
 
     // A fall is to blame only once the realized interval is below the level
@@ -613,17 +624,67 @@ namespace
     }
 
     // Recurring loads: each episode of the last 20 s holds a rise 1.5 s
-    // longer before any fall.
+    // longer before any fall. The load is the overload's six reports, not a
+    // second of it, so the recurring-load memory does not hold the fall.
     void TestRecurringLoadHolds()
     {
         Harness harness;
         for (int episode = 1; episode <= 3; ++episode) {
-            harness.Run(110, 12'000.0); // a full second of the load's demand
+            harness.Run(110, 8'000.0);
             CHECK(harness.Overload(12'000.0).cause == GovernorCause::Demand);
             // hold (1.5 s per episode of the last 20 s) + 0.5 s headroom
             const int release = harness.RunUntil(GovernorCause::Release, 2000, 8'000.0);
             CHECK(release >= 150 * episode + 49 && release <= 150 * episode + 51);
         }
+    }
+
+    // Falls never go below the recurring-load memory, the heaviest of the
+    // newest 8 s's per-second Q75 (period_governor.h): a lull is no headroom;
+    // a fall in a lull of a load that had already fallen stops at the memory,
+    // not at the lull's need; a lasting drop falls to its own need once its
+    // heavier seconds have left the memory. GPU-bound reports: no probes.
+    void TestFallOutlastsRecurringLull()
+    {
+        const auto until_release = [](Harness* harness, int limit, double demand_us) {
+            for (int frame = 1; frame <= limit; ++frame) {
+                harness->Demand(demand_us, 1, true);
+                if (harness->Frame().cause == GovernorCause::Release) return frame;
+            }
+            return -1;
+        };
+        const auto risen = [&](Harness* harness) {
+            for (int frame = 0; frame < 30; ++frame) {
+                harness->Demand(12'000.0, 1, true);
+                harness->Frame();
+            }
+            for (int frame = 0; frame < 200 && harness->Target() < 12'000.0; ++frame) {
+                harness->Demand(12'000.0, 1, true);
+                harness->Frame(false, true);
+            }
+            CHECK(until_release(harness, 800, 12'000.0) == -1);
+            return harness->Target();
+        };
+        const double level = 12'000.0 + 0.03 * 11'600.0;
+
+        Harness lull;
+        CHECK_NEAR(risen(&lull), level, 1e-6);
+        CHECK(until_release(&lull, 150, 8'000.0) == -1);
+        CHECK(until_release(&lull, 300, 12'000.0) == -1);
+        CHECK_NEAR(lull.Target(), level, 1e-6);
+
+        Harness staged;
+        risen(&staged);
+        CHECK(until_release(&staged, 300, 11'000.0) == -1);
+        CHECK(until_release(&staged, 1000, 8'000.0) > 0);
+        CHECK_NEAR(staged.Target(), 11'000.0 + 0.03 * level, 1e-6);
+        CHECK(staged.governor.Statistics().memory_falls == 1);
+
+        Harness lasting;
+        risen(&lasting);
+        const int release = until_release(&lasting, 1000, 11'000.0);
+        CHECK(release >= 800 && release <= 900);
+        CHECK_NEAR(lasting.Target(), 11'000.0 + 0.03 * level, 1e-6);
+        CHECK(lasting.governor.Statistics().memory_falls == 0);
     }
 
     // A report above 1.5x the median of the newest second is a hitch.
@@ -795,21 +856,37 @@ namespace
         CHECK(statistics.rises == 0 && statistics.probes == 0 && statistics.falls == 0);
         CHECK(statistics.room_frames == 302);
 
-        // A lower room: down at 1% per frame.
+        // A lower room is a dip until it has lasted about as long as the
+        // higher one was seen: the floor keeps the median of the newest
+        // seconds' rooms (three at 10,600 here), then follows the lower room
+        // down at 1% per frame.
         harness.room_us = 10'300.0;
-        decision = harness.Frame();
-        CHECK(decision.cause == GovernorCause::None && decision.phase == GovernorPhase::Falling);
+        decision = harness.Run(250);
+        CHECK_NEAR(decision.interval_us, 10'600.0, 1e-6);
+        CHECK(harness.governor.Statistics().room_memory_frames > 0);
+        int frames = 1;
+        for (; frames <= 200; ++frames) {
+            decision = harness.Frame();
+            if (decision.phase == GovernorPhase::Falling) break;
+        }
+        CHECK(frames <= 200);
+        CHECK(decision.cause == GovernorCause::None);
         CHECK_NEAR(decision.stretch, 1.06 * 0.99, 1e-12);
         harness.Run(10);
         CHECK_NEAR(harness.governor.Stretch(), 1.03, 1e-12);
         // Within one margin (300 µs) below the target it still counts as the
-        // room's; further below it stops, and the interval returns to the cap.
-        harness.room_us = 9'800.0;
-        CHECK(harness.Frame().cause == GovernorCause::None);
-        harness.room_us = 9'600.0;
-        CHECK(harness.Frame().cause == GovernorCause::Room);
-        CHECK(harness.RunUntil(GovernorCause::Base, 10) > 0);
-        CHECK(harness.governor.Stretch() == 1.0);
+        // room's; further below it stops, and the interval returns to the cap
+        // (a fresh governor: the memory needs three seconds).
+        Harness margin;
+        margin.room_us = 10'300.0;
+        CHECK(margin.Frame().cause == GovernorCause::Room);
+        margin.Run(10);
+        margin.room_us = 9'800.0;
+        CHECK(margin.Frame().cause == GovernorCause::None);
+        margin.room_us = 9'600.0;
+        CHECK(margin.Frame().cause == GovernorCause::Room);
+        CHECK(margin.RunUntil(GovernorCause::Base, 10) > 0);
+        CHECK(margin.governor.Stretch() == 1.0);
 
         // A return to the cap with the room still within the margin ends the
         // report too: when the room sets the interval again it is reported
@@ -858,6 +935,60 @@ namespace
         Harness disabled(false);
         disabled.room_us = 10'600.0;
         CHECK(disabled.Run(20).stretch == 1.0);
+    }
+
+    // While a room is reported its floor is at least the median of the newest
+    // seconds' rooms (period_governor.h): a dip of the room keeps the
+    // interval; a frame without a room (hold room off, another rung, stale
+    // reports) ends it at once, and so does a reset.
+    void TestRoomMemory()
+    {
+        Harness harness;
+        harness.room_us = 11'500.0;
+        harness.Run(800);
+        CHECK_NEAR(harness.governor.Stretch(), 1.15, 1e-12);
+        harness.room_us = 10'000.0;
+        GovernorDecision decision = harness.Run(150);
+        CHECK_NEAR(decision.stretch, 1.15, 1e-12);
+        CHECK(harness.governor.Statistics().room_memory_frames == 150);
+        harness.room_us = 0.0;
+        decision = harness.Frame();
+        CHECK_NEAR(decision.stretch, 1.15 * 0.99, 1e-12);
+        CHECK(harness.RunUntil(GovernorCause::Base, 100) > 0);
+        // The memory went with it: a lower room is followed at once.
+        harness.room_us = 10'300.0;
+        harness.Run(20);
+        CHECK_NEAR(harness.governor.Stretch(), 1.03, 1e-12);
+
+        Harness reset;
+        reset.room_us = 11'500.0;
+        reset.Run(800);
+        reset.governor.Reset();
+        reset.room_us = 10'300.0;
+        reset.Run(static_cast<int>(GOVERNOR_SETTLE_FRAMES) + 20);
+        CHECK_NEAR(reset.governor.Stretch(), 1.03, 1e-12);
+
+        // A room above the governor's own target: its dip is not the room
+        // stopping to set the interval, so no room report in it.
+        Harness above;
+        above.room_us = 11'500.0;
+        const auto frames = [&](int count, bool late) {
+            GovernorDecision decision{};
+            int reports = 0;
+            for (int frame = 0; frame < count; ++frame) {
+                above.Demand(10'500.0, 1, true);
+                decision = above.Frame(false, late);
+                if (decision.cause == GovernorCause::Room) ++reports;
+            }
+            return reports;
+        };
+        frames(800, false);
+        frames(6, true);
+        CHECK_NEAR(above.Target(), 10'800.0, 1e-6);
+        frames(10, false);
+        above.room_us = 10'000.0;
+        CHECK(frames(150, false) == 0);
+        CHECK_NEAR(above.governor.Stretch(), 1.15, 1e-12);
     }
 
     void TestText()
@@ -940,12 +1071,14 @@ int main()
     TestNoProbeWhileGpuBinds();
     TestProbeWaitsAfterRelease();
     TestRecurringLoadHolds();
+    TestFallOutlastsRecurringLull();
     TestHitchReports();
     TestMaximumStretch();
     TestLfcPacedDemand();
     TestFixedQuantization();
     TestReset();
     TestHoldRoom();
+    TestRoomMemory();
     TestText();
     TestLfcOnOutputInterval();
     if (s_failures != 0) {

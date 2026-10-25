@@ -357,6 +357,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     // only the GPU queue wait may wait for a GpuResume event.
     start.gpu_resume_probe = pipeline.gpu_probes && plan.rung == PacingRung::GpuQueueWait;
     start.render_queue = request.gpu_queue_wait_render_queue;
+    start.gated_hold_gpu_idle = request.gated_hold_gpu_idle;
     // GPU-paced cadence: the GPU floor released this frame: the game reached
     // ReLimiter before its floor and the grid's own S did not bind (the wait
     // ran to the floor or the rhythm's release, or the pre-Sleep wait

@@ -1892,6 +1892,9 @@ void TestLockstepGatedHold()
     CHECK(controller->Statistics().gated_hold_samples == 2);
 
     // A judged GPU queue wait frame gated by the next release adds no room.
+    // Ready after its Present call, its slack waits for its report and
+    // credits the gated hold (3,000) only up to the GPU's idle inside its
+    // span (500): 12,000 − (9,000 − 500).
     auto room = MakeController();
     LeadGuardOutcome judged{};
     judged.judged = true;
@@ -1907,9 +1910,125 @@ void TestLockstepGatedHold()
     room->OnStageEvent(Event(1, Kind::PresentCall, 15500.0));
     room->OnStageEvent(Event(1, Kind::GpuReady, 19000.0));
     room->OnStageEvent(Event(1, Kind::OutputRelease, 19000.0));
+    CHECK(room->Statistics().slack_samples == 0);
+    Report(room.get(), Key(1).producer_epoch, Key(1).frame_id, 7000.0, 0, 7500.0);
     CHECK(room->Statistics().slack_samples == 1);
-    CHECK_NEAR(room->Statistics().last_slack_us, 6000.0);
+    CHECK_NEAR(room->Statistics().last_slack_us, 3500.0);
     CHECK(room->Statistics().room_samples == 0);
+}
+
+// A gated GPU wait frame ready after its Present call (lead_controller.h):
+// its slack credits the gated hold only up to the GPU's idle inside its span,
+// the FG input wait's own hold after readiness left out, so it waits for the
+// frame's report and release. Closed without a report, with the developer
+// A/B key off, or at a Present-call output point, the whole hold is
+// credited. A pending slack is fenced by an evidence restart and given up at
+// a reset.
+void TestGatedHoldGpuIdle()
+{
+    const PacingRung fg = PacingRung::FgInputWait;
+    // Frame 1 (s 10,000, T 30,000) calls Present at 22,000 unless given;
+    // frame 2's pre-Sleep wait [11,000, 15,000] gates it by 4,000. Released
+    // at its readiness when that comes after T, else at T.
+    const auto setup = [&](bool bound, double ready_us, double present_us = 22000.0) {
+        auto controller = MakeController();
+        LeadFrameStart first = Start(1, fg, 10000.0, kInterval, 2.0);
+        SetLead(&first, 20000.0);
+        first.gated_hold_gpu_idle = bound;
+        controller->OnSourceRelease(first);
+        LeadFrameStart second = Start(2, fg, 15000.0, kInterval, 2.0);
+        SetLead(&second, 20000.0);
+        second.gated_hold_gpu_idle = bound;
+        second.pre_wait_start_qpc = Qpc(11000.0);
+        second.pre_wait_end_qpc = Qpc(15000.0);
+        controller->OnSourceRelease(second);
+        controller->OnStageEvent(Event(1, Kind::PresentCall, present_us));
+        controller->OnStageEvent(Event(1, Kind::GpuReady, ready_us));
+        controller->OnStageEvent(Event(1, Kind::OutputRelease, std::max(ready_us, 30000.0)));
+        return controller;
+    };
+    const auto report = [&](LeadController* controller, double span_us) {
+        Report(controller, Key(1).producer_epoch, Key(1).frame_id, 15000.0, 0, span_us);
+    };
+
+    // Ready 3,000 after T, the GPU busy but 300 inside the span: late by
+    // 2,700 (23,000 − 300 against 20,000), counted once the report came.
+    auto busy = setup(true, 33000.0);
+    CHECK(busy->Statistics().slack_samples == 0);
+    CHECK(busy->Statistics().gated_hold_samples == 0);
+    report(busy.get(), 15300.0);
+    CHECK(busy->Statistics().slack_samples == 1);
+    CHECK(busy->Statistics().negative_slack_samples == 1);
+    CHECK_NEAR(busy->Statistics().last_slack_us, -2700.0);
+    CHECK_NEAR(busy->Statistics().last_gated_hold_us, 4000.0);
+    // The GPU idled 5,000 inside the span: the whole 4,000 is credited.
+    auto idle = setup(true, 33000.0);
+    report(idle.get(), 20000.0);
+    CHECK(idle->Statistics().negative_slack_samples == 0);
+    CHECK_NEAR(idle->Statistics().last_slack_us, 1000.0);
+    // Ready 2,000 before T and held to it: the hold is not idle.
+    auto held = setup(true, 28000.0);
+    report(held.get(), 17300.0);
+    CHECK_NEAR(held->Statistics().last_slack_us, 2300.0);
+
+    // Closed without its report: the whole hold, as for CPU holds.
+    auto closed = setup(true, 33000.0);
+    for (uint64_t index = 3; index <= 2 + LEAD_PENDING_EXPIRY_FRAMES; ++index) {
+        LeadFrameStart later = Start(index, fg, 10000.0 + static_cast<double>(index) * 5000.0, kInterval, 2.0);
+        SetLead(&later, 20000.0);
+        closed->OnSourceRelease(later);
+    }
+    CHECK(closed->Statistics().slack_samples == 1);
+    CHECK(closed->Statistics().negative_slack_samples == 0);
+    CHECK_NEAR(closed->Statistics().last_slack_us, 1000.0);
+    // The A/B key off: the whole hold at readiness.
+    auto off = setup(false, 33000.0);
+    CHECK(off->Statistics().slack_samples == 1);
+    CHECK_NEAR(off->Statistics().last_slack_us, 1000.0);
+    // The Present call is the output point (33,000 after readiness at
+    // 32,500): the hold may have delayed it, so the whole hold at readiness.
+    auto call = setup(true, 32500.0, 33000.0);
+    CHECK(call->Statistics().slack_samples == 1);
+    CHECK_NEAR(call->Statistics().last_slack_us, 1000.0);
+
+    // The GPU queue wait (its hold lies outside the span), the report before
+    // readiness: judged at once, bounded only with the key on and readiness
+    // after the Present call (frame 2's source wait [11,000, 15,000] gates
+    // frame 1 by 4,000; 300 idle).
+    const auto queue = [&](bool bound, double present_us) {
+        auto controller = MakeController();
+        LeadFrameStart first = Start(1, PacingRung::GpuQueueWait, 10000.0);
+        SetLead(&first, 20000.0);
+        first.gated_hold_gpu_idle = bound;
+        controller->OnSourceRelease(first);
+        LeadFrameStart second = Start(2, PacingRung::GpuQueueWait, 15000.0);
+        SetLead(&second, 20000.0);
+        second.gated_hold_gpu_idle = bound;
+        second.wait_start_qpc = Qpc(11000.0);
+        second.wait_end_qpc = Qpc(15000.0);
+        controller->OnSourceRelease(second);
+        controller->OnStageEvent(Event(1, Kind::PresentCall, present_us));
+        report(controller.get(), 15300.0);
+        controller->OnStageEvent(Event(1, Kind::GpuReady, 33000.0));
+        CHECK(controller->Statistics().slack_samples == 1);
+        return controller->Statistics().last_slack_us;
+    };
+    CHECK_NEAR(queue(true, 22000.0), -2700.0);
+    CHECK_NEAR(queue(false, 22000.0), 1000.0);
+    // Its Present call after readiness is the output point: 20,000 − (23,500 − 4,000).
+    CHECK_NEAR(queue(true, 33500.0), 500.0);
+
+    // An evidence restart fences a pending slack; a reset gives it up.
+    auto fenced = setup(true, 33000.0);
+    fenced->ClearSlackEvidence();
+    report(fenced.get(), 15300.0);
+    CHECK(fenced->Statistics().slack_samples == 0);
+    CHECK(fenced->Statistics().negative_slack_samples == 0);
+    auto reset = setup(true, 33000.0);
+    reset->ResetBuckets();
+    report(reset.get(), 15300.0);
+    CHECK(reset->Statistics().slack_samples == 0);
+    CHECK(reset->Statistics().gated_hold_samples == 0);
 }
 
 namespace
@@ -3793,6 +3912,7 @@ int main()
     TestDrainingLateSamples();
     TestHoldRoomSamples();
     TestLockstepGatedHold();
+    TestGatedHoldGpuIdle();
     TestHeadroomGuardLimitsLead();
     TestReleaseHeadroomObservations();
     TestCollisionGuardQueueOrder();

@@ -20,7 +20,19 @@
 // Core's render-submit stage) cannot lengthen it on its own.
 // Falls: after 0.5 s of demand headroom (Q_p + 2 m below the interval), to
 // the need a rise would use (max(Q90 of the newest 12, Q_p)) + m, so a fall
-// never lands where the next rise would put it back; otherwise probes below
+// never lands where the next rise would put it back, and never below the
+// recurring-load memory: the heaviest per-second Q_p of the newest 8 s (the
+// longest a recurring load is held below), which the headroom test uses
+// too. Gears of War: E-Day, FG 2× at 120: the GPU need dipped from 17.5–19
+// to 14.0–14.6 ms for 1.0–1.75 s every 3.5–5 s; each newest-second fall in
+// a dip went to the cap as the load came back (three falls to I_0 in 10 s,
+// 24–39 frames late by up to 18–19 ms after each). The median of those
+// seconds fell into the dips too (17.3 ms against 17.3–18.5 for the load):
+// a fall there fails, and since the need set its level the demand scale
+// would rise and stay. A fall is a decision that must hold, so it takes the
+// worst second; the hold room below is a floor applied every frame, so it
+// takes the typical one and does not turn its own wander into a floor.
+// Otherwise probes below
 // the demand after 1 s without evidence (3% of I_0, 1.5x further per held
 // probe, up to 12%); a probe that brings evidence back returns and doubles
 // the calm time the next needs (up to 8 s). A probe needs a calm second
@@ -48,7 +60,12 @@
 // hold before their collision-guarded release (lead_controller.h: the guard's
 // inequality solved for the interval), the smallest interval
 // and not applied. No evidence gates it: that interval does not grow with
-// the interval it buys (release falls of 20 sessions). On
+// the interval it buys (release falls of 20 sessions). While a room is
+// reported the floor is at least the median of the newest 8 s's rooms (the
+// FG input wait's room, a quantile of 128 GPU needs, fell to 15.7 ms in the
+// Gears dips and the interval followed it while 61 frames came late); a
+// frame without one (hold room off, another rung, stale reports) clears it.
+// A failed release fall is an overload episode like a rise. On
 // VRR every change is a silent grid rebase; on snapped fixed refresh the
 // interval is quantized to whole refreshes and every quantized change is a
 // GovernorStep epoch. Pure C++17 without Windows, logger or config
@@ -101,6 +118,11 @@ constexpr size_t GOVERNOR_EPISODE_CAPACITY = 32;
 constexpr double GOVERNOR_HOLD_PER_EPISODE_S = 1.5;     // no fall this long per episode after a rise
 constexpr double GOVERNOR_HOLD_MAX_S = 8.0;
 constexpr uint32_t GOVERNOR_SETTLE_FRAMES = 32;         // after a reset or a fixed-refresh step
+// Recurring-load memory: one value per second of the newest seconds.
+constexpr size_t GOVERNOR_MEMORY_SECONDS = 8;           // GOVERNOR_HOLD_MAX_S: the longest a recurring load is held
+constexpr uint32_t GOVERNOR_MEMORY_MIN_SECONDS = 3;     // a median of fewer is unknown
+static_assert(static_cast<double>(GOVERNOR_MEMORY_SECONDS) == GOVERNOR_HOLD_MAX_S,
+    "the memory spans the longest recurring-load hold");
 
 // ── Windowed miss rate ──
 
@@ -235,6 +257,8 @@ struct GovernorStatistics {
     uint64_t invalid_frames = 0;
     uint64_t room_frames = 0;     // frames whose target the hold room raised
     uint64_t room_infeasible = 0; // frames whose hold room exceeded the maximum stretch (not applied)
+    uint64_t memory_falls = 0;    // release falls the recurring-load memory sized above the newest second
+    uint64_t room_memory_frames = 0; // frames whose hold room the memory raised
     GovernorCause last_cause = GovernorCause::None;
     double max_stretch = 1.0;     // largest stretch since the last reset of the statistics (never reset)
 };
@@ -320,8 +344,25 @@ private:
     // (at least GOVERNOR_DEMAND_SLOW_MIN_REPORTS of them); false when stale.
     bool GpuBindsDemand() const noexcept;
     double HoldS(int64_t qpc, int64_t frequency) noexcept;
+    // An overload episode starts unless the newest rise is within GOVERNOR_EPISODE_GAP_S.
+    void NoteEpisode(int64_t qpc, int64_t frequency) noexcept;
     void Track(const GovernorFrame& frame, GovernorDecision* decision) noexcept;
     static double MarginUs(double interval_us) noexcept;
+
+    // Recurring-load memory (above): one value per second, newest
+    // GOVERNOR_MEMORY_SECONDS kept.
+    struct SecondMemory {
+        std::array<double, GOVERNOR_MEMORY_SECONDS> us{};
+        std::array<int64_t, GOVERNOR_MEMORY_SECONDS> qpc{};
+        uint32_t head = 0;
+        uint32_t count = 0;
+    };
+    static void Remember(SecondMemory* memory, double us, int64_t qpc) noexcept;
+    // The lower-index quantile q of the values of the newest
+    // GOVERNOR_MEMORY_SECONDS seconds (1: the heaviest, 0.5: the median);
+    // false with fewer than GOVERNOR_MEMORY_MIN_SECONDS of them.
+    static bool Recall(const SecondMemory& memory, double quantile, int64_t qpc, int64_t frequency,
+        double* us) noexcept;
 
     // Demand reports with the frame time they were first seen at (0 until
     // the next frame stamps them).
@@ -360,6 +401,13 @@ private:
     std::array<int64_t, GOVERNOR_EPISODE_CAPACITY> episodes_{}; // start times, oldest first from episode_head_
     uint32_t episode_head_ = 0;
     uint32_t episode_count_ = 0;
+    // Recurring-load memory (above): the unscaled per-second Q_p and the
+    // hold room; the start of the second being collected (0 = none) and the
+    // newest room in it (0 = none).
+    SecondMemory need_memory_{};
+    SecondMemory room_memory_{};
+    int64_t memory_second_qpc_ = 0;
+    double second_room_us_ = 0.0;
     // Realized.
     double stretch_ = 1.0;            // realized I / I_0
     double interval_us_ = 0.0;        // governed interval of the newest valid frame; 0 before any

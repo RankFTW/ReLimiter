@@ -154,6 +154,10 @@ void PeriodGovernor::ResetState(bool settle) noexcept
     episodes_.fill(0);
     episode_head_ = 0;
     episode_count_ = 0;
+    need_memory_ = SecondMemory{};
+    room_memory_ = SecondMemory{};
+    memory_second_qpc_ = 0;
+    second_room_us_ = 0.0;
 }
 
 // ── Inputs ──
@@ -324,8 +328,20 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
     // The need as measured, before the demand scale.
     const double measured_need_us = fast_known && slow_known ? std::max(fast_us, slow_us)
         : fast_known ? fast_us : slow_us;
+    // Recurring-load memory (period_governor.h): the Q_p of each second as it
+    // ends, and the hold room it ended with (step 6 below).
+    if (memory_second_qpc_ == 0) {
+        memory_second_qpc_ = qpc;
+    } else if (since(memory_second_qpc_) >= GOVERNOR_DEMAND_SLOW_S) {
+        if (slow_known) Remember(&need_memory_, slow_us, qpc);
+        if (second_room_us_ > 0.0) Remember(&room_memory_, second_room_us_, qpc);
+        memory_second_qpc_ = qpc;
+    }
+    double memory_need_us = 0.0;
+    const bool memory_known = Recall(need_memory_, 1.0, qpc, frequency, &memory_need_us);
     fast_us *= demand_scale_;
     slow_us *= demand_scale_;
+    const double memory_us = memory_known ? memory_need_us * demand_scale_ : 0.0;
 
     // 2. A probe that brought evidence back failed: return, wait longer next time.
     if (probing_from_stretch_ > 0.0 && evidence) {
@@ -356,6 +372,8 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
         releasing_from_stretch_ = 0.0;
         release_need_us_ = 0.0;
         probing_from_stretch_ = 0.0;
+        // The return is a rise by evidence: the load recurs (HoldS).
+        NoteEpisode(qpc, frequency);
         last_rise_qpc_ = qpc;
         ++statistics_.release_failures;
         reported = GovernorCause::ReleaseFailed;
@@ -387,11 +405,7 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
         }
         rise_us = std::min(rise_us, maximum_us);
         if (cause != GovernorCause::None && rise_us > target_us + kStretchEpsilon * base_us) {
-            if (since(last_rise_qpc_) > GOVERNOR_EPISODE_GAP_S) {
-                episodes_[(episode_head_ + episode_count_) % static_cast<uint32_t>(GOVERNOR_EPISODE_CAPACITY)] = qpc;
-                if (episode_count_ < GOVERNOR_EPISODE_CAPACITY) ++episode_count_;
-                else episode_head_ = (episode_head_ + 1) % static_cast<uint32_t>(GOVERNOR_EPISODE_CAPACITY);
-            }
+            NoteEpisode(qpc, frequency);
             target_stretch_ = rise_us / base_us;
             last_rise_qpc_ = qpc;
             headroom_since_qpc_ = 0;
@@ -410,26 +424,30 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
     // 4. Fall to the demand after 0.5 s of headroom; never while a recurring
     // load is held after its newest rise. The fall goes to the need a rise
     // would size from the same reports (the newest 12 included), so it never
-    // lands where the next rise would put it back up.
+    // lands where the next rise would put it back up, and not below the
+    // recurring-load memory, which the headroom test also uses: a lull of a
+    // recurring load is not headroom (period_governor.h).
     const bool holding = since(last_rise_qpc_) < HoldS(qpc, frequency);
     {
         const double target_us = base_us * target_stretch_;
         const double margin_us = MarginUs(paced(target_us));
         if (!evidence && !holding && slow_known &&
-            slow_us + GOVERNOR_FALL_HEADROOM_MARGINS * margin_us < paced(target_us)) {
+            std::max(slow_us, memory_us) + GOVERNOR_FALL_HEADROOM_MARGINS * margin_us < paced(target_us)) {
             if (headroom_since_qpc_ == 0) {
                 headroom_since_qpc_ = qpc;
             } else if (since(headroom_since_qpc_) >= GOVERNOR_FALL_HOLD_S) {
-                const double need_us = fast_known ? std::max(fast_us, slow_us) : slow_us;
+                const double newest_us = fast_known ? std::max(fast_us, slow_us) : slow_us;
+                const double need_us = std::max(newest_us, memory_us);
                 const double next_us = std::max(base_us, need_us + margin_us);
                 if (next_us < target_us - kStretchEpsilon * base_us) {
                     releasing_from_stretch_ = std::max(releasing_from_stretch_, target_stretch_);
                     // A fall to the cap was not set by the need (above).
-                    release_need_us_ = next_us > base_us ? measured_need_us : 0.0;
+                    release_need_us_ = next_us > base_us ? std::max(measured_need_us, memory_need_us) : 0.0;
                     target_stretch_ = next_us / base_us;
                     probing_from_stretch_ = 0.0;
                     last_fall_qpc_ = qpc;
                     ++statistics_.falls;
+                    if (memory_us > newest_us && next_us > base_us) ++statistics_.memory_falls;
                     reported = GovernorCause::Release;
                 }
                 headroom_since_qpc_ = qpc;
@@ -474,7 +492,9 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
     }
 
     // 6. Hold room: a floor of the realized interval within the maximum
-    // stretch (period_governor.h).
+    // stretch, while one is reported at least the median of the newest
+    // seconds' rooms (period_governor.h). A frame without a room clears that
+    // memory, so turning the room off ends it at once.
     double room_raw = 0.0;
     if (IsPositiveFinite(frame.room_us) && !snapped && !IsPositiveFinite(frame.lfc_quantum_us)) {
         room_raw = frame.room_us / base_us;
@@ -483,7 +503,19 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
             room_raw = 0.0;
         }
     }
-    room_stretch_ = std::max(1.0, room_raw);
+    double room_floor = room_raw;
+    if (room_raw > 0.0) {
+        second_room_us_ = frame.room_us;
+        double remembered_us = 0.0;
+        if (Recall(room_memory_, 0.5, qpc, frequency, &remembered_us) && remembered_us / base_us > room_floor) {
+            room_floor = std::min(remembered_us / base_us, GOVERNOR_MAX_STRETCH);
+            ++statistics_.room_memory_frames;
+        }
+    } else {
+        room_memory_ = SecondMemory{};
+        second_room_us_ = 0.0;
+    }
+    room_stretch_ = std::max(1.0, room_floor);
     const double effective_stretch = std::max(target_stretch_, room_stretch_);
     if (room_stretch_ > target_stretch_ + kStretchEpsilon) ++statistics_.room_frames;
 
@@ -510,7 +542,7 @@ void PeriodGovernor::Track(const GovernorFrame& frame, GovernorDecision* decisio
     } else if (!room_setting_ && room_stretch_ > target_stretch_ + kStretchEpsilon) {
         room_setting_ = true;
         reported = GovernorCause::Room;
-    } else if (room_setting_ && room_raw < target_stretch_ - margin_stretch) {
+    } else if (room_setting_ && room_floor < target_stretch_ - margin_stretch) {
         room_setting_ = false;
         reported = GovernorCause::Room;
     }
@@ -536,6 +568,41 @@ double PeriodGovernor::HoldS(int64_t qpc, int64_t frequency) noexcept
         --episode_count_;
     }
     return std::min(GOVERNOR_HOLD_MAX_S, GOVERNOR_HOLD_PER_EPISODE_S * static_cast<double>(episode_count_));
+}
+
+void PeriodGovernor::NoteEpisode(int64_t qpc, int64_t frequency) noexcept
+{
+    if (last_rise_qpc_ != 0 && PacingQpc_ElapsedSeconds(last_rise_qpc_, qpc, frequency) <= GOVERNOR_EPISODE_GAP_S) {
+        return;
+    }
+    episodes_[(episode_head_ + episode_count_) % static_cast<uint32_t>(GOVERNOR_EPISODE_CAPACITY)] = qpc;
+    if (episode_count_ < GOVERNOR_EPISODE_CAPACITY) ++episode_count_;
+    else episode_head_ = (episode_head_ + 1) % static_cast<uint32_t>(GOVERNOR_EPISODE_CAPACITY);
+}
+
+void PeriodGovernor::Remember(SecondMemory* memory, double us, int64_t qpc) noexcept
+{
+    const uint32_t slot = (memory->head + memory->count) % static_cast<uint32_t>(GOVERNOR_MEMORY_SECONDS);
+    memory->us[slot] = us;
+    memory->qpc[slot] = qpc;
+    if (memory->count < GOVERNOR_MEMORY_SECONDS) ++memory->count;
+    else memory->head = (memory->head + 1) % static_cast<uint32_t>(GOVERNOR_MEMORY_SECONDS);
+}
+
+bool PeriodGovernor::Recall(const SecondMemory& memory, double quantile, int64_t qpc, int64_t frequency,
+    double* us) noexcept
+{
+    std::array<double, GOVERNOR_MEMORY_SECONDS> values{};
+    uint32_t count = 0;
+    for (uint32_t index = 0; index < memory.count; ++index) {
+        const uint32_t slot = (memory.head + index) % static_cast<uint32_t>(GOVERNOR_MEMORY_SECONDS);
+        if (PacingQpc_ElapsedSeconds(memory.qpc[slot], qpc, frequency) > GOVERNOR_HOLD_MAX_S) continue;
+        values[count++] = memory.us[slot];
+    }
+    if (count < GOVERNOR_MEMORY_MIN_SECONDS) return false;
+    std::sort(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(count));
+    *us = PacingMetrics_QuantileOfSorted(values.data(), count, quantile);
+    return true;
 }
 
 bool PeriodGovernor::DemandQuantile(double quantile, uint32_t newest, uint32_t min_reports,

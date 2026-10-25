@@ -217,6 +217,7 @@ void LeadController::ResetBuckets() noexcept
     for (PendingFrame& frame : pending_) {
         if (!frame.occupied || !frame.started) continue;
         frame.finalized = true;
+        frame.slack_pending = false;
         frame.lead_sampled = true;
         frame.call_recorded = true;
         frame.work_recorded = true;
@@ -263,7 +264,7 @@ void LeadController::ClearSlackEvidence() noexcept
     for (Bucket& bucket : buckets_) bucket.slack = SlackWindow{};
     // Frames released before the restart (lead_controller.h).
     for (PendingFrame& frame : pending_) {
-        if (frame.occupied && frame.started && !frame.finalized) frame.slack_fenced = true;
+        if (frame.occupied && frame.started && (!frame.finalized || frame.slack_pending)) frame.slack_fenced = true;
     }
 }
 
@@ -682,6 +683,7 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
     }
     slot.gpu_resume_probe = frame.gpu_resume_probe;
     slot.render_queue = frame.render_queue;
+    slot.gated_gpu_idle = frame.gated_hold_gpu_idle;
     slot.gpu_floor_release = frame.gpu_floor_release;
     SetField(&slot, FieldSource, frame.source_release_qpc);
     RecordReleaseToRender(&slot);
@@ -1181,7 +1183,7 @@ void LeadController::ExpireBehindNewest() noexcept
             Discard(&frame);
             continue;
         }
-        if (!frame.finalized || !frame.lead_sampled) ForceFinalize(&frame);
+        if (!frame.finalized || !frame.lead_sampled || frame.slack_pending) ForceFinalize(&frame);
         frame.closed = true;
     }
     for (PendingFrame& frame : pending_) TryFinalize(&frame);
@@ -1448,10 +1450,14 @@ bool LeadController::PreviousResolved(const PendingFrame& frame) const noexcept
 
 void LeadController::TryFinalize(PendingFrame* frame) noexcept
 {
-    if (frame == nullptr || !frame->occupied || !frame->started || (frame->finalized && frame->lead_sampled)) return;
+    if (frame == nullptr || !frame->occupied || !frame->started ||
+        (frame->finalized && frame->lead_sampled && !frame->slack_pending)) {
+        return;
+    }
     const uint16_t own = OwnFieldMask(frame->rung);
     if ((frame->field_mask & own) != own || !PreviousResolved(*frame)) return;
     if (!frame->finalized) EmitOutcome(frame);
+    if (frame->slack_pending && !SlackWaitsForReport(*frame)) EmitSlack(frame);
     if (!frame->lead_sampled && !LeadSampleWaitsForReport(*frame)) EmitLeadSample(frame);
 }
 
@@ -1460,6 +1466,8 @@ void LeadController::ForceFinalize(PendingFrame* frame) noexcept
     const uint16_t own = OwnFieldMask(frame->rung);
     if ((frame->field_mask & own) == own) {
         if (!frame->finalized) EmitOutcome(frame);
+        // Closed without its report: the whole gated hold is credited.
+        if (frame->slack_pending) EmitSlack(frame);
         if (!frame->lead_sampled) {
             // Closed behind the wait without its report: the wait for frame
             // n − 1 is left out (SampleUs).
@@ -1483,6 +1491,29 @@ bool LeadController::LeadSampleWaitsForReport(const PendingFrame& frame) const n
 {
     return IsGpuRung(frame.rung) && !frame.gpu_floor_release && !(frame.gpu_active_us > 0.0) &&
         BehindWait(frame.rung, frame.bucket % LEAD_DIVISOR_BUCKETS);
+}
+
+// A gated GPU wait frame ready after its Present call credits its gated hold
+// only up to its GPU idle (lead_controller.h): its slack waits until that is
+// known, from its report and, on the FG input wait, its release.
+bool LeadController::SlackWaitsForReport(const PendingFrame& frame) const noexcept
+{
+    double idle_us = 0.0;
+    return frame.gated_gpu_idle && IsGpuRung(frame.rung) &&
+        frame.qpc[FieldGpuReady] > frame.qpc[FieldPresentCall] && !GpuIdleInSpanUs(frame, &idle_us) &&
+        GatedHoldTicks(frame) > 0;
+}
+
+bool LeadController::GpuIdleInSpanUs(const PendingFrame& frame, double* idle_us) const noexcept
+{
+    if (!(frame.gpu_active_us > 0.0) || !(frame.gpu_span_us > 0.0)) return false;
+    double hold_us = 0.0;
+    if (frame.rung == PacingRung::FgInputWait) {
+        if (!HasField(frame, FieldOutputRelease) || !HasField(frame, FieldGpuReady)) return false;
+        hold_us = std::max(0.0, MicrosecondsBetween(frame.qpc[FieldGpuReady], frame.qpc[FieldOutputRelease]));
+    }
+    *idle_us = std::max(0.0, frame.gpu_span_us - frame.gpu_active_us - hold_us);
+    return true;
 }
 
 void LeadController::EmitOutcome(PendingFrame* frame) noexcept
@@ -1520,14 +1551,30 @@ void LeadController::EmitOutcome(PendingFrame* frame) noexcept
         add(&ring);
     }
     if (gpu_ready && ready_in_range) add(&gpu_ready_rings_[divisor]);
+    frame->slack_pending = true;
+    if (!SlackWaitsForReport(*frame)) EmitSlack(frame);
+}
+
+void LeadController::EmitSlack(PendingFrame* frame) noexcept
+{
+    frame->slack_pending = false;
+    const double raw_us = MeasuredUs(*frame, Previous(*frame));
+    if (!std::isfinite(raw_us)) return;
     Bucket& bucket = buckets_[frame->bucket];
     // Lockstep engines (lead_controller.h): ReLimiter's waits for later frames
-    // that this frame's Present followed are not the game's lateness.
+    // that this frame's Present followed are not the game's lateness. A GPU
+    // wait frame ready after its Present call: only as far as the GPU idled
+    // inside its span (developer A/B gated_hold_gpu_idle).
     const int64_t gated_ticks = GatedHoldTicks(*frame);
-    const double gated_us = gated_ticks > 0 ? MicrosecondsBetween(0, gated_ticks) : 0.0;
+    double gated_us = gated_ticks > 0 ? MicrosecondsBetween(0, gated_ticks) : 0.0;
     if (gated_us > 0.0) {
         ++statistics_.gated_hold_samples;
         statistics_.last_gated_hold_us = gated_us;
+        double idle_us = 0.0;
+        if (frame->gated_gpu_idle && IsGpuRung(frame->rung) &&
+            frame->qpc[FieldGpuReady] > frame->qpc[FieldPresentCall] && GpuIdleInSpanUs(*frame, &idle_us)) {
+            gated_us = std::min(gated_us, idle_us);
+        }
     }
     // A long sample is excluded from the lead but is a missed target. The
     // slack (LeadStatistics) is how long before its target T the frame was
@@ -1561,7 +1608,7 @@ void LeadController::EmitOutcome(PendingFrame* frame) noexcept
     // ReLimiter's own later waits, which would make R grow with the interval.
     // The room is how far before its gate the frame arrives: the measured X.
     if (frame->guard_judged && gated_ticks == 0 && slack_us >= 0.0) {
-        room_windows_[divisor].Add(raw_us);
+        room_windows_[frame->bucket % LEAD_DIVISOR_BUCKETS].Add(raw_us);
         ++statistics_.room_samples;
     }
 }
@@ -1718,15 +1765,11 @@ double LeadController::SampleUs(const PendingFrame& frame, const PendingFrame* p
     }
     const double wait_us = free_us - start_us;
     if (!(wait_us > 0.0)) return raw_us;
-    if (!frame.gpu_floor_release && frame.first_work_streamed && frame.gpu_active_us > 0.0 &&
-        frame.gpu_span_us > 0.0 && (frame.rung != PacingRung::FgInputWait || HasField(frame, FieldOutputRelease))) {
-        const double hold_us = frame.rung == PacingRung::FgInputWait
-            ? std::max(0.0, MicrosecondsBetween(frame.qpc[FieldGpuReady], frame.qpc[FieldOutputRelease]))
-            : 0.0;
-        if (frame.gpu_span_us - frame.gpu_active_us - hold_us >= LEAD_HANDOFF_GPU_IDLE_US) {
-            if (kept_wait_us != nullptr) *kept_wait_us = wait_us;
-            return raw_us;
-        }
+    double idle_us = 0.0;
+    if (!frame.gpu_floor_release && frame.first_work_streamed && GpuIdleInSpanUs(frame, &idle_us) &&
+        idle_us >= LEAD_HANDOFF_GPU_IDLE_US) {
+        if (kept_wait_us != nullptr) *kept_wait_us = wait_us;
+        return raw_us;
     }
     const double sample = std::max(present_us, ready_us - wait_us);
     if (predecessor_wait_us != nullptr) *predecessor_wait_us = raw_us - sample;
