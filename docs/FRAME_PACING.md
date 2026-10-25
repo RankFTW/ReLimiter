@@ -119,7 +119,7 @@ The **Grid epoch** counter in Details counts epochs. An occasional increase is n
 The late tolerance is `tol = max(I / 4, 500 µs)`.
 
 - **Output late.** A finished frame whose output time `o` is later than `T(n) + tol` starts an `OutputLate` epoch. Output evidence that arrives for a frame older than the epoch's base is converted to the equivalent output of the base frame first (`o + (b − n) · I`), so a pipelined game whose next source was already planned does not get a short display interval.
-- **Source late.** A source that arrives after `S` is released at once on the same grid when it is within `tol` plus its *slack*. The slack is `L` minus the median measured `X` of the rung (never more than `L`); a source that still makes `T` does not restart the cadence. Later than that, the grid restarts (`SourceLate`).
+- **Source late.** A source that arrives after `S` is released at once on the same grid when it is within `tol` plus its *slack*. The slack is `L` minus the median measured `X` of the rung (never more than `L`); a source that still makes `T` does not restart the cadence. Later than that, the grid restarts (`SourceLate`). The `S` it is judged against uses the shorter of this frame's lead and the previous frame's: the game's wait before the marker aimed at the previous frame's lead, and ReLimiter switches the lead at once when the output changes (another output's lead, a restarted lead). Judged against the new lead, the first frame after the FG input wait took over restarted the cadence and moved the targets 4.4–10.5 ms later (CONTROL Resonant, FG 2× at 130, lead 17.15 → 21.65 ms).
 - **Idle mode** ignores output evidence: its lead is 0 and nothing is held, so late evidence would only stretch the cap.
 
 ### No catch-up burst

@@ -43,6 +43,15 @@
 //   GPU-bound frames, so judging it restarted the cadence every few frames
 //   (Gears of War: E-Day, FG 2×) and the restarts paused the holds. The
 //   output spacing floor still spaces the next frame after it.
+// - Lead discontinuity. A source is judged late against
+//   S = T − min(L(n), L(n − 1)), L(n − 1) the previous plan's lead: the
+//   frame's pre-wait aimed at that S. L grows by at most one slew step per
+//   frame except where ReLimiter switches it (another output rung's or FG
+//   divisor's lead, a restarted lead); judged against the new lead, the first
+//   frame after such a switch restarted the cadence and moved T 4.4–10.5 ms
+//   later (CONTROL Resonant, FG 2× at 130: L 17.15 → 21.65 ms when the FG
+//   input wait engaged). Within the previous lead it is released immediately
+//   on the same grid.
 // In both output rules I is the newest interval. When snapped, every restart
 // origin and floored target is the first fixed edge at or after the
 // computed time. Evidence older than the lifecycle's first index is ignored.
@@ -216,8 +225,9 @@ struct CadenceGridPlanInput {
     bool governor_step = false;
     double lead_us = 0.0;       // L; may exceed the interval. Negative clamps to 0
     // How much later than S a source can arrive and still make T: L minus
-    // the median measured X of its rung. A source later than S by the
-    // late tolerance plus this restarts the cadence (SourceLate); up to it
+    // the median measured X of its rung. A source later than the judged S
+    // (lead discontinuity, rules above) by the late tolerance plus this
+    // restarts the cadence (SourceLate); up to it
     // the frame is released immediately on the same grid, and an output that
     // still misses T starts an OutputLate epoch. 0 (unknown) keeps the
     // tolerance alone. Negative or non-finite counts as 0.
@@ -304,6 +314,7 @@ private:
     uint64_t next_index_ = 1;
     uint64_t lifecycle_base_index_ = 0; // first index of the newest Lifecycle epoch
     bool has_grid_ = false; // a segment exists (kept while suspended)
+    int64_t last_lead_ticks_ = 0; // L of the newest plan (0: none since Reset)
 };
 
 // ── Publication ──

@@ -2951,12 +2951,13 @@ void TestGpuFloorCapBound()
     unknown.lead_us = 0.0;
     CHECK(controller->GpuFloor(key_of(3133), 0, 0, true, unknown).ineligible);
 
-    // A cap or FG divisor change: P, the gaps, the frames the cap held and the restart
-    // clear; F and σ stay (the floor returns with P alone).
+    // A cap or FG divisor change: the gaps, the frames the cap held and the
+    // restart clear; P carries over until 32 new pairs exist
+    // (TestGpuFloorPeriodAcrossReset); F and σ stay.
     controller->NoteCadenceRestart(kEpoch);
     CHECK(controller->CadenceRestartSeen(kEpoch) && !controller->CadenceRestartSeen(kEpoch + 1));
     controller->ResetGpuFloor();
-    CHECK_NEAR(controller->GpuPeriodUs(), 0.0);
+    CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
     CHECK(controller->ReadyGapCount() == 0 && controller->CapHeldFrames() == 0);
     CHECK(!controller->CadenceRestartSeen(kEpoch));
     not_held(3200, 3239);
@@ -2984,6 +2985,92 @@ void TestGpuFloorCapBound()
     // A new producer epoch starts the count again.
     controller->OnGpuRenderEnd(kEpoch + 1, 100, 0, Qpc(9'000'000.0), 14000.0);
     CHECK(controller->CapHeldFrames() == 0);
+}
+
+// A cap or FG divisor change (ResetGpuFloor) keeps P until the new period
+// window is warm (lead_controller.h): right after the change the floor
+// applies with the P in use before it, and the new pairs' median takes over
+// at 32. Without it the floor stopped for the 32 pairs, and a GPU that limits
+// the new cap restarted the cadence on nearly every frame meanwhile. A
+// lifecycle reset, a bucket reset and a new producer epoch clear the carried P.
+void TestGpuFloorPeriodAcrossReset()
+{
+    constexpr uint32_t kEpoch = 7;
+    constexpr double kSigma = 5010.0;
+    const auto key_of = [](uint64_t frame_id) {
+        PacingPlanKey key{};
+        key.identity_domain = PacingIdentityDomain::NvApiFrame;
+        key.producer_epoch = 7;
+        key.controller_generation = 1;
+        key.frame_id = frame_id;
+        return key;
+    };
+    auto controller = MakeController();
+    // σ 5,010 and F 830 as in TestRenderHandoffGpuFloor.
+    for (uint64_t index = 1; index <= 32; ++index) {
+        const double source_us = static_cast<double>(index) * kInterval;
+        controller->OnSourceRelease(Start(index, PacingRung::SourceOnly, source_us));
+        controller->OnStageEvent(Event(index, Kind::RenderSubmitStart, source_us + 5000.0));
+    }
+    for (uint64_t index = 0; index < 32; ++index) controller->OnReportPair(kEpoch, 500 + index, StreamingPair());
+    // Frames not held, each ending period_us after the previous one, the GPU
+    // idle 250 µs between them.
+    uint64_t frame_id = 3000;
+    double end_us = 1'000'000.0;
+    const auto not_held = [&](int count, double period_us) {
+        for (int i = 0; i < count; ++i, ++frame_id) {
+            LeadFrameStart start{};
+            start.key = key_of(frame_id);
+            start.grid_index = frame_id - 2900;
+            start.rung = PacingRung::SourceOnly;
+            start.fg_divisor = 1.0;
+            start.interval_us = period_us;
+            start.source_release_qpc = Qpc(end_us);
+            controller->OnSourceRelease(start);
+            PacingStageEvent event{};
+            event.key = start.key;
+            event.grid_index = start.grid_index;
+            event.kind = Kind::OutputRelease;
+            event.qpc = start.source_release_qpc;
+            event.status = PacingPlanStatus::SourceOnly;
+            controller->OnStageEvent(event);
+            controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(end_us + 250.0), Qpc(end_us + period_us), 14000.0);
+            end_us += period_us;
+        }
+    };
+    not_held(40, 17000.0);
+    CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
+    const double start_17 = 17010.0 / 2.0 + 830.0;
+
+    controller->ResetGpuFloor();
+    CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
+    CHECK_NEAR(controller->GpuFloorStartUs(), start_17);
+    CHECK(controller->GpuFloor(key_of(frame_id)).floor_qpc == Qpc(end_us - start_17 - kSigma));
+    // A frame further ahead extrapolates the newest GPU end by that P.
+    CHECK(controller->GpuFloor(key_of(frame_id + 1)).floor_qpc == Qpc(end_us + 17010.0 - start_17 - kSigma));
+    // 31 new pairs of 12,000 µs keep it; the 32nd makes their median P.
+    not_held(31, 12000.0);
+    CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
+    not_held(1, 12000.0);
+    CHECK_NEAR(controller->GpuPeriodUs(), 12010.0);
+    CHECK(controller->GpuFloor(key_of(frame_id)).floor_qpc == Qpc(end_us - (12010.0 / 2.0 + 830.0) - kSigma));
+    // Another change carries the new P.
+    controller->ResetGpuFloor();
+    CHECK_NEAR(controller->GpuPeriodUs(), 12010.0);
+
+    // A new producer epoch clears it: its window starts cold.
+    controller->OnGpuRenderEnd(kEpoch + 1, 100, 0, Qpc(end_us + 5'000'000.0), 14000.0);
+    CHECK_NEAR(controller->GpuPeriodUs(), 0.0);
+    // So do a bucket reset and a lifecycle reset.
+    not_held(40, 17000.0);
+    controller->ResetGpuFloor();
+    CHECK_NEAR(controller->GpuPeriodUs(), 17010.0);
+    controller->ResetBuckets();
+    CHECK_NEAR(controller->GpuPeriodUs(), 0.0);
+    not_held(40, 17000.0);
+    controller->ResetGpuFloor();
+    controller->Reset(kFrequency);
+    CHECK_NEAR(controller->GpuPeriodUs(), 0.0);
 }
 
 // The readiness anchor on the GPU queue wait (lead_controller.h): the
@@ -3307,6 +3394,7 @@ int main()
     TestGpuFloorReadyAnchor();
     TestGpuFloorGpuSetFilters();
     TestGpuFloorCapBound();
+    TestGpuFloorPeriodAcrossReset();
     TestGpuQueueWaitReadyGap();
     TestGpuNeedWindow();
 

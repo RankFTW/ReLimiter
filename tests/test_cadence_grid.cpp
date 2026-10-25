@@ -444,6 +444,50 @@ namespace
         CHECK(beyond.epoch_reason == PacingEpochReason::SourceLate);
     }
 
+    // Lead discontinuity: a source is judged against S = T − min(L(n),
+    // L(n − 1)). I = 10 ms, tol = 2.5 ms. The lead switches from 2 ms to
+    // 8 ms (another output rung's lead): a source at the previous S is 6 ms
+    // past the new S but on time for the S its pre-wait aimed at, so it is
+    // released immediately on the same grid. The next frame is judged
+    // against the new lead, and a lead that shrinks is judged against the
+    // shorter one.
+    void TestLeadIncreaseJudgedWithPreviousLead()
+    {
+        CadenceGrid grid;
+        const int64_t tolerance = 25000;
+        const CadenceGridPlan first = grid.PlanNext(Input(kStartQpc, 10000.0, 2000.0));
+        const int64_t t1 = first.output_target_qpc;
+
+        const int64_t old_wake2 = t1 + 100000 - 20000;
+        const CadenceGridPlan jumped = grid.PlanNext(Input(old_wake2 + tolerance, 10000.0, 8000.0));
+        CHECK(jumped.valid && jumped.epoch_reason == PacingEpochReason::None);
+        CHECK(jumped.released_immediately);
+        CHECK(jumped.output_target_qpc == t1 + 100000);
+        CHECK(jumped.source_wake_qpc == old_wake2 + tolerance);
+
+        // Beyond the previous lead's tolerance it still restarts.
+        CadenceGrid late_grid;
+        const int64_t lt1 = late_grid.PlanNext(Input(kStartQpc, 10000.0, 2000.0)).output_target_qpc;
+        const CadenceGridPlan late_jump =
+            late_grid.PlanNext(Input(lt1 + 100000 - 20000 + tolerance + 1, 10000.0, 8000.0));
+        CHECK(late_jump.epoch_reason == PacingEpochReason::SourceLate);
+
+        // The next frame: L(n − 1) is 8 ms now.
+        const int64_t t2 = jumped.output_target_qpc;
+        const CadenceGridPlan third =
+            grid.PlanNext(Input(t2 + 100000 - 80000 + tolerance + 1, 10000.0, 8000.0));
+        CHECK(third.epoch_reason == PacingEpochReason::SourceLate);
+
+        // A shrinking lead: judged against the new, shorter lead, so a source
+        // within its tolerance keeps the cadence though it is far past the
+        // previous lead's S.
+        const int64_t t3 = third.output_target_qpc;
+        const CadenceGridPlan shrunk =
+            grid.PlanNext(Input(t3 + 100000 - 20000 + tolerance, 10000.0, 2000.0));
+        CHECK(shrunk.epoch_reason == PacingEpochReason::None && shrunk.released_immediately);
+        CHECK(shrunk.output_target_qpc == t3 + 100000);
+    }
+
     // GPU-paced frame (gpu_paced_cadence): a frame with an earliest target is
     // never judged late; a later earliest target moves the grid from n
     // without an epoch, an earlier one keeps the grid's T(n) even when the
@@ -1844,6 +1888,7 @@ int main()
     TestLateTolerance();
     TestSourceLateThreshold();
     TestSourceSlackExtendsTolerance();
+    TestLeadIncreaseJudgedWithPreviousLead();
     TestGpuPacedTarget();
     TestGpuPacedOutputNotJudged();
     TestOutputLateThreshold();

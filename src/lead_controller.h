@@ -371,9 +371,15 @@ constexpr double LEAD_ROOM_MIN_HOLD_US = 250.0; // h
 // LeadController::HandoffStreams) and gives one F. The period, gap, F and σ
 // windows clear with the handoff window; the stream proof and the newest GPU
 // end stay until a lifecycle reset. A cap or FG divisor change
-// (ResetGpuFloor) clears the period, PRESENT_END gap, readiness gap and cap
-// lead windows and the cadence restart; F, σ and the anchors stay, as they
-// describe the game rather than the cap's output.
+// (ResetGpuFloor) clears the period, PRESENT_END gap and readiness gap
+// windows, the cap-held frames and the cadence restart; F, σ and the anchors
+// stay, as they describe the game rather than the cap's output. Until the new
+// period window holds LEAD_WARM_SAMPLES, P is the one in use before the
+// change (GpuPeriodUs): without it the floor stopped until 32 new pairs
+// existed, and a GPU that limits the new cap restarted the cadence on nearly
+// every frame meanwhile (CONTROL at 130 after FG was turned off: 11.4 ms of
+// GPU work for a 7.69 ms interval, 27 restarts in the 0.54 s before the
+// floor returned; the overload guard then took the holds away for 4–7 s).
 struct HandoffBackPressureSample {
     // Frame n, µs on the driver's clock from any common origin.
     double simulation_end_us = 0.0;   // SIMULATION_END
@@ -639,7 +645,8 @@ public:
     void RestartRung(PacingRung rung) noexcept;
     // A cap or FG divisor change (above): the GPU floor's period, PRESENT_END
     // gap and readiness gap windows, its cap-held frames and its cadence
-    // restart start again; F, σ, the stream proof and the anchors stay.
+    // restart start again (P carries over until the new period window is
+    // warm); F, σ, the stream proof and the anchors stay.
     void ResetGpuFloor() noexcept;
     // The cadence restarted (SourceLate or OutputLate) on a held frame in
     // producer_epoch: the held floor's eligibility before its cap-held frames
@@ -720,7 +727,8 @@ public:
     // non-finite q or allowance.
     double HandoffOffsetUs(double quantile, double allowance_us) const noexcept;
     // The GPU floor (above): how long before the previous frame's GPU end the
-    // render thread starts, P/2 + F; 0 until the period and F windows are warm.
+    // render thread starts, P/2 + F; 0 until P (GpuPeriodUs) and the F window
+    // are warm.
     double GpuFloorStartUs() const noexcept;
     // The GPU floor of the frame key (above), with the render thread's newest
     // PRESENT_END of key's stream (frame and QPC; 0 unknown) for the live
@@ -733,9 +741,11 @@ public:
     GpuFloorEstimate GpuFloor(const PacingPlanKey& key, uint64_t present_end_frame = 0,
         int64_t present_end_qpc = 0, bool ready_anchor = false,
         const GpuFloorCap& cap = GpuFloorCap{}) const noexcept;
-    // GPU frame periods (above): the median P of the newest 256 (0 until
-    // LEAD_WARM_SAMPLES), and the mean of the newest LEAD_GPU_PERIOD_RECENT
-    // (0 until that many): the GPU-paced rhythm's period (source_stage.h).
+    // GPU frame periods (above): the median P of the newest 256 from
+    // LEAD_WARM_SAMPLES; before that, after a cap or FG divisor change, the P
+    // in use before it, else 0. And the mean of the newest
+    // LEAD_GPU_PERIOD_RECENT (0 until that many): the GPU-paced rhythm's
+    // period (source_stage.h).
     double GpuPeriodUs() const noexcept;
     double RecentGpuPeriodUs() const noexcept;
     // GPU need window (above): the lower-index quantile sorted[floor(q (n − 1))]
@@ -976,6 +986,9 @@ private:
     // arrives after the report: the next report's period pair reads it.
     bool gpu_end_gpu_set_ = false;
     LeadSampleWindow gpu_period_window_{};
+    // P in use before the newest ResetGpuFloor, until gpu_period_window_ is
+    // warm again (0: none; a lifecycle reset or a new producer epoch clears it).
+    double gpu_period_carry_us_ = 0.0;
     LeadSampleWindow gpu_after_present_window_{};
     LeadSampleWindow first_submission_window_{};
     LeadSampleWindow release_to_render_window_{};

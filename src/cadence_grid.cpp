@@ -403,6 +403,7 @@ void CadenceGrid::Reset() noexcept
     empty.last_planned_index = snapshot_.last_planned_index;
     snapshot_ = empty;
     has_grid_ = false;
+    last_lead_ticks_ = 0;
 }
 
 void CadenceGrid::Suspend() noexcept
@@ -511,8 +512,13 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
         gpu_target = true;
     }
 
-    // Step 3: source lateness against S = T - L.
+    // Step 3: source lateness against S = T - L, with L no longer than the
+    // previous plan's (lead discontinuity, cadence_grid.h): the frame's
+    // pre-wait aimed at that S.
     int64_t wake_qpc = target_qpc - timing.lead_ticks;
+    const int64_t judged_lead_ticks = last_lead_ticks_ > 0 && !lifecycle_change
+        ? std::min(timing.lead_ticks, last_lead_ticks_)
+        : timing.lead_ticks;
     // Late tolerance plus the source slack: a source that still makes
     // T keeps the cadence. Gears of War: E-Day with FG restarted it on 953
     // frames in 80 s, 65% of them ready before the old target, and each
@@ -525,7 +531,7 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
         tolerance_ticks += static_cast<int64_t>(slack_ticks);
     }
     bool released_immediately = false;
-    if (!gpu_paced && input.now_qpc > wake_qpc + tolerance_ticks) {
+    if (!gpu_paced && input.now_qpc > target_qpc - judged_lead_ticks + tolerance_ticks) {
         ExactQpc origin{};
         if (!OriginAtOrAfter(next, now_plus_lead, &origin)) {
             ++statistics_.invalid_inputs;
@@ -556,6 +562,7 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
     ++next.sequence;
     snapshot_ = next;
     has_grid_ = true;
+    last_lead_ticks_ = timing.lead_ticks;
     ++next_index_;
 
     ++statistics_.plans;

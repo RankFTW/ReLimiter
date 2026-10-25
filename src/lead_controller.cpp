@@ -157,6 +157,7 @@ void LeadController::Reset(int64_t qpc_frequency) noexcept
     gpu_end_qpc_ = 0;
     gpu_end_gpu_set_ = false;
     gpu_period_window_.Reset();
+    gpu_period_carry_us_ = 0.0;
     gpu_after_present_window_.Reset();
     first_submission_window_.Reset();
     release_to_render_window_.Reset();
@@ -190,6 +191,7 @@ void LeadController::ResetBuckets() noexcept
     for (LeadSampleWindow& room : room_windows_) room.Reset();
     handoff_window_.Reset();
     gpu_period_window_.Reset();
+    gpu_period_carry_us_ = 0.0;
     gpu_after_present_window_.Reset();
     first_submission_window_.Reset();
     release_to_render_window_.Reset();
@@ -213,6 +215,8 @@ void LeadController::ResetBuckets() noexcept
 // proof and the anchors stay.
 void LeadController::ResetGpuFloor() noexcept
 {
+    // P carries over until the new window is warm (lead_controller.h).
+    gpu_period_carry_us_ = GpuPeriodUs();
     gpu_period_window_.Reset();
     recent_periods_us_ = {};
     recent_period_head_ = 0;
@@ -458,10 +462,9 @@ double LeadController::HandoffOffsetUs(double quantile, double allowance_us) con
 
 double LeadController::GpuFloorStartUs() const noexcept
 {
-    if (gpu_period_window_.Count() < LEAD_WARM_SAMPLES || first_submission_window_.Count() < LEAD_WARM_SAMPLES) {
-        return 0.0;
-    }
-    return gpu_period_window_.Quantile(0.5) / 2.0 + first_submission_window_.Quantile(0.5);
+    const double period_us = GpuPeriodUs();
+    if (!(period_us > 0.0) || first_submission_window_.Count() < LEAD_WARM_SAMPLES) return 0.0;
+    return period_us / 2.0 + first_submission_window_.Quantile(0.5);
 }
 
 GpuFloorEstimate LeadController::GpuFloor(const PacingPlanKey& key, uint64_t present_end_frame,
@@ -489,7 +492,7 @@ GpuFloorEstimate LeadController::GpuFloor(const PacingPlanKey& key, uint64_t pre
     const auto ticks = [this](double us) {
         return static_cast<int64_t>(std::llround(us * static_cast<double>(qpc_frequency_) / kMicrosecondsPerSecond));
     };
-    const double period_us = gpu_period_window_.Quantile(0.5);
+    const double period_us = GpuPeriodUs();
     const uint64_t previous = key.frame_id - 1;
     // Ĝ(n − 1): the newest report extrapolated by P.
     int64_t predicted_qpc = gpu_end_qpc_ + ticks(static_cast<double>(previous - gpu_end_frame_) * period_us);
@@ -536,7 +539,7 @@ GpuFloorEstimate LeadController::GpuFloor(const PacingPlanKey& key, uint64_t pre
 
 double LeadController::GpuPeriodUs() const noexcept
 {
-    return gpu_period_window_.Count() >= LEAD_WARM_SAMPLES ? gpu_period_window_.Quantile(0.5) : 0.0;
+    return gpu_period_window_.Count() >= LEAD_WARM_SAMPLES ? gpu_period_window_.Quantile(0.5) : gpu_period_carry_us_;
 }
 
 double LeadController::RecentGpuPeriodUs() const noexcept
@@ -812,6 +815,7 @@ void LeadController::OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, 
         gpu_end_qpc_ = 0;
         gpu_end_gpu_set_ = false;
         gpu_period_window_.Reset();
+        gpu_period_carry_us_ = 0.0;
         gpu_after_present_window_.Reset();
         recent_period_head_ = 0;
         recent_period_count_ = 0;
