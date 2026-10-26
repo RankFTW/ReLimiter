@@ -1063,6 +1063,10 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
             const double gap_us = ReflexTimestampDeltaUs(r.presentEndTime, r.gpuRenderEndTime);
             if (gap_us < effective_interval_us * 3.0) pending_sample.present_end_to_gpu_end_us = gap_us;
         }
+        if (r.renderSubmitEndTime > 0) {
+            pending_sample.render_done_qpc =
+                ReflexTimestampToQpc((std::max)(r.renderSubmitEndTime, r.presentStartTime));
+        }
         // The lead sample behind the wait (lead_controller.h): whether this
         // frame's first work reached the driver while its render thread
         // streamed, from its own times within 3 I of RENDERSUBMIT_START.

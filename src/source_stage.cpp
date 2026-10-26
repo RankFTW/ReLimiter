@@ -223,9 +223,11 @@ SourceStageFrame SourceStage::RunPlannedFrame(
 
     CadenceGridPlanInput input{};
     // The render handoff limit's earliest release is the frame's arrival for
-    // the grid (source_stage.h).
+    // the grid (source_stage.h). A held frame's release floor replaces the
+    // GPU's release for the wait only (render coupling, lead_controller.h).
     const int64_t arrival_qpc = clock->Now();
-    input.now_qpc = (std::max)(arrival_qpc, request.earliest_release_qpc);
+    const int64_t gpu_now_qpc = (std::max)(arrival_qpc, request.earliest_release_qpc);
+    input.now_qpc = (std::max)(arrival_qpc, SourceStage_WakeEarliestQpc(request));
     input.qpc_frequency = request.qpc_frequency;
     input.interval_us = request.interval_us;
     input.period_change = request.period_change;
@@ -249,13 +251,16 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     const int64_t game_arrival_qpc = entered_sleep ? (std::min)(arrival_qpc, request.sleep_entry_qpc) : arrival_qpc;
     const bool gpu_floor_release = request.gpu_paced_cadence && request.gpu_floor_qpc > game_arrival_qpc &&
         request.gpu_floor_qpc >= request.earliest_release_qpc;
-    if (gpu_floor_release) {
-        const double early_us = lead_.EarlyLeadUs(slack_rung, request.fg_divisor,
-            pipeline.lead_quantile, pipeline.allowance_us);
-        if (early_us > 0.0) {
-            // Never past S = T − L (source_stage.h).
-            input.earliest_target_qpc = input.now_qpc + static_cast<int64_t>(std::llround(
-                (std::min)(early_us, lead_us) * static_cast<double>(request.qpc_frequency) / 1'000'000.0));
+    const double early_us = gpu_floor_release || request.held_gpu_floor
+        ? lead_.EarlyLeadUs(slack_rung, request.fg_divisor, pipeline.lead_quantile, pipeline.allowance_us)
+        : 0.0;
+    if (early_us > 0.0) {
+        frame.early_lead_us = (std::min)(early_us, lead_us);
+        // Never past S = T − L (source_stage.h), from the GPU's release also
+        // when the release floor pulls the wait earlier.
+        if (gpu_floor_release) {
+            input.earliest_target_qpc = gpu_now_qpc + static_cast<int64_t>(std::llround(
+                frame.early_lead_us * static_cast<double>(request.qpc_frequency) / 1'000'000.0));
         }
     }
     input.mode = pipeline.mode;
@@ -368,22 +373,30 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     start.gpu_resume_probe = pipeline.gpu_probes && plan.rung == PacingRung::GpuQueueWait;
     start.render_queue = request.gpu_queue_wait_render_queue;
     // GPU-paced cadence: the GPU floor released this frame: the game reached
-    // ReLimiter before its floor and the grid's own S did not bind (the wait
-    // ran to the floor or the rhythm's release, or the pre-Sleep wait
-    // already brought the frame there).
-    frame.gpu_paced = gpu_floor_release && grid_plan.source_wake_qpc <= input.now_qpc;
-    if (frame.gpu_paced) ++statistics_.gpu_paced_frames;
-    // The rhythm continues from the release of a frame it paced and restarts
-    // otherwise.
+    // ReLimiter before its floor and the grid's own S did not bind against
+    // the GPU's release (the wait ran to the floor or the rhythm's release,
+    // or the pre-Sleep wait already brought the frame there). The release
+    // floor may still have pulled its wait back to the cap's release
+    // (render coupling): its exemption, rhythm and early side stay the GPU's.
+    frame.gpu_paced = gpu_floor_release && grid_plan.source_wake_qpc <= gpu_now_qpc;
+    if (frame.gpu_paced) {
+        ++statistics_.gpu_paced_frames;
+        frame.floor_pull_ticks = (std::max)(gpu_now_qpc - grid_plan.source_wake_qpc, int64_t{0});
+        if (frame.floor_pull_ticks > 0) ++statistics_.floor_pulled_frames;
+    }
+    // The rhythm continues from the GPU's release of a frame it paced and
+    // restarts otherwise.
     if (request.gpu_paced_rhythm != GpuPacedRhythmStep::None && frame.gpu_paced) {
         rhythm_key_ = request.key;
-        rhythm_release_qpc_ = frame.release_qpc;
+        rhythm_release_qpc_ = frame.release_qpc + frame.floor_pull_ticks;
         ++statistics_.gpu_paced_rhythm[static_cast<size_t>(request.gpu_paced_rhythm)];
     } else {
         rhythm_release_qpc_ = 0;
     }
     start.gpu_floor_release = frame.gpu_paced;
     start.gpu_target = frame.gpu_target;
+    start.floor_pull_us = static_cast<double>(frame.floor_pull_ticks) * 1'000'000.0 /
+        static_cast<double>(request.qpc_frequency);
     lead_.OnSourceRelease(start);
     return frame;
 }

@@ -197,6 +197,13 @@ struct SourceStageRequest {
     // release.
     bool gpu_paced_cadence = false;
     int64_t gpu_floor_qpc = 0;
+    // Held frames (render coupling, lead_controller.h): R, the release floor
+    // (GpuFloorEstimate::release_floor_qpc), 0 = none. When earlier than
+    // earliest_release_qpc it replaces it for the wait only: the frame is
+    // released at max(S, its arrival, R), while the floor, the earliest
+    // release and the target derived from them stay those of the GPU's
+    // release (SourceStage_WakeEarliestQpc).
+    int64_t release_floor_qpc = 0;
     // The step that set earliest_release_qpc (SourceStage::GpuPacedRhythm);
     // None when the rhythm does not apply. A frame it paced continues it.
     GpuPacedRhythmStep gpu_paced_rhythm = GpuPacedRhythmStep::None;
@@ -215,6 +222,15 @@ struct SourceStageRequest {
     uint64_t sleep_entry_index = 0;
     int64_t sleep_entry_qpc = 0;
 };
+
+// The earliest release the source wait runs to: the earliest release, or the
+// held frame's release floor when that is earlier (render coupling).
+inline int64_t SourceStage_WakeEarliestQpc(const SourceStageRequest& request) noexcept
+{
+    return request.release_floor_qpc > 0 && request.release_floor_qpc < request.earliest_release_qpc
+        ? request.release_floor_qpc
+        : request.earliest_release_qpc;
+}
 
 struct SourceStageFrame {
     bool planned = false;    // false: invalid request or grid input; no plan, no wait
@@ -235,6 +251,13 @@ struct SourceStageFrame {
     bool handoff_limited = false;     // the render handoff limit moved the release past S_n
     bool gpu_paced = false;           // the GPU floor released it (gpu_paced_cadence)
     bool gpu_target = false;          // its earliest target moved T_n (CadenceGridPlan::gpu_target)
+    // Developer A/B gpu_paced_cadence, held floor: min(E, L), how soon after
+    // the GPU's release the plan expects such a frame ready
+    // (LeadController::EarlyLeadUs), 0 unknown; and how far the release floor
+    // pulled a frame the GPU paced back from the floor's release, in QPC
+    // ticks (render coupling, lead_controller.h; 0 none).
+    double early_lead_us = 0.0;
+    int64_t floor_pull_ticks = 0;
 };
 
 // Owner-local counters, cumulative.
@@ -247,6 +270,7 @@ struct SourceStageStatistics {
     uint64_t duplicate_keys = 0; // same key planned again: not republished (one claim per plan)
     uint64_t clamped_waits = 0;
     uint64_t gpu_paced_frames = 0; // SourceStageFrame::gpu_paced
+    uint64_t floor_pulled_frames = 0; // of those, released at the cap's release (floor_pull_ticks > 0)
     // Frames the GPU-paced rhythm paced, by the step that set their release
     // (index GpuPacedRhythmStep; None unused).
     uint64_t gpu_paced_rhythm[static_cast<size_t>(GpuPacedRhythmStep::Count)] = {};
@@ -287,12 +311,14 @@ public:
     {
         lead_.OnReportPair(producer_epoch, frame_id, sample);
     }
-    // A Reflex report's GPU start and end and PRESENT_END → GPU end gap, the
-    // GPU floor's anchor (LeadController::OnGpuRenderEnd).
+    // A Reflex report's GPU start and end, PRESENT_END → GPU end gap and the
+    // later of RENDERSUBMIT_END and PRESENT_START: the GPU floor's anchor and
+    // the cap bound's evidence (LeadController::OnGpuRenderEnd).
     void OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, int64_t gpu_start_qpc,
-        int64_t gpu_end_qpc, double present_to_gpu_end_us) noexcept
+        int64_t gpu_end_qpc, double present_to_gpu_end_us, int64_t render_done_qpc = 0) noexcept
     {
-        lead_.OnGpuRenderEnd(producer_epoch, frame_id, gpu_start_qpc, gpu_end_qpc, present_to_gpu_end_us);
+        lead_.OnGpuRenderEnd(producer_epoch, frame_id, gpu_start_qpc, gpu_end_qpc, present_to_gpu_end_us,
+            render_done_qpc);
     }
     // Timing mode Off: grid suspended and published; the next plan starts a
     // ModeChange epoch.

@@ -3071,6 +3071,222 @@ void TestGpuFloorCapBound()
     CHECK(status.frames == 0 && status.mode == CapBoundMode::Cold);
 }
 
+// Render coupling (lead_controller.h): a held frame's release floor is
+// own − φ (own − min(C, T(n − 1) + I − L − slack)) once the newest reported
+// held frames show a render thread that finished before the previous frame's
+// readiness (32 of the newest 128 set Decoupled, a full window with none
+// Coupled, unchanged between), so a late predecessor no longer moves the
+// release; the floor itself, and with it the GPU's exemption and target,
+// keeps it. At the floor's own depth (φ = 0), without T(n − 1), and until
+// the window decides (or while the render thread waits on the GPU, Gears of
+// War: E-Day) the release floor is the floor. Unknown report times leave the
+// bit clear; ResetGpuFloor and a new producer epoch restart the window.
+void TestGpuFloorRenderCoupling()
+{
+    constexpr uint32_t kEpoch = 7;
+    constexpr double kI = 17000.0;
+    constexpr double kLead = 38000.0;
+    constexpr double kGap = 1500.0;
+    constexpr double kSlack = 2125.0;
+    constexpr double kStart = 17010.0 / 2.0 + 830.0 + 5010.0; // P/2 + F + σ = 14,345
+    constexpr double kDelta = kLead - kI + kSlack + kGap - kStart;
+    const auto key_of = [](uint64_t frame_id, uint32_t epoch = 7) {
+        PacingPlanKey key{};
+        key.identity_domain = PacingIdentityDomain::NvApiFrame;
+        key.producer_epoch = epoch;
+        key.controller_generation = 1;
+        key.frame_id = frame_id;
+        return key;
+    };
+    auto controller = MakeController();
+    for (uint64_t index = 1; index <= 32; ++index) {
+        const double source_us = static_cast<double>(index) * kInterval;
+        controller->OnSourceRelease(Start(index, PacingRung::SourceOnly, source_us));
+        controller->OnStageEvent(Event(index, Kind::RenderSubmitStart, source_us + 5000.0));
+    }
+    for (uint64_t index = 0; index < 32; ++index) controller->OnReportPair(kEpoch, 500 + index, StreamingPair());
+
+    const auto target_us = [&](uint64_t frame_id) { return 2'000'000.0 + kI * (static_cast<double>(frame_id) - 3000.0); };
+    const auto send = [&](uint64_t frame_id, Kind kind, double at_us, PacingPlanStatus status) {
+        PacingStageEvent event{};
+        event.key = key_of(frame_id);
+        event.grid_index = frame_id - 2900;
+        event.kind = kind;
+        event.qpc = Qpc(at_us);
+        event.status = kind == Kind::OutputRelease ? status : PacingPlanStatus::Unknown;
+        controller->OnStageEvent(event);
+    };
+    for (uint64_t frame_id = 2950; frame_id <= 2989; ++frame_id) {
+        LeadFrameStart start{};
+        start.key = key_of(frame_id);
+        start.grid_index = frame_id - 2900;
+        start.rung = PacingRung::SourceOnly;
+        start.fg_divisor = 1.0;
+        start.interval_us = kI;
+        start.source_release_qpc = Qpc(target_us(frame_id) - kLead);
+        start.output_target_qpc = Qpc(target_us(frame_id));
+        controller->OnSourceRelease(start);
+        send(frame_id, Kind::OutputRelease, target_us(frame_id) - kLead, PacingPlanStatus::SourceOnly);
+        controller->OnGpuRenderEnd(kEpoch, frame_id, Qpc(target_us(frame_id) - kI + 250.0),
+            Qpc(target_us(frame_id)), 14000.0);
+    }
+    // A held FG input wait frame ready ready_after_us after its Signal at T,
+    // reported with its render thread done render_after_us after frame
+    // n − 1's readiness (NaN: the report has no such time).
+    std::array<double, 2048> ready_at{};
+    const auto held = [&](uint64_t frame_id, double ready_after_us, double render_after_us) {
+        LeadFrameStart start{};
+        start.key = key_of(frame_id);
+        start.grid_index = frame_id - 2900;
+        start.rung = PacingRung::FgInputWait;
+        start.fg_divisor = 2.0;
+        start.interval_us = kI;
+        start.source_release_qpc = Qpc(target_us(frame_id) - kLead);
+        start.output_target_qpc = Qpc(target_us(frame_id));
+        controller->OnSourceRelease(start);
+        const double signal_us = target_us(frame_id);
+        ready_at[static_cast<size_t>(frame_id - 2900)] = signal_us + ready_after_us;
+        send(frame_id, Kind::GpuReady, signal_us + ready_after_us, PacingPlanStatus::Unknown);
+        send(frame_id, Kind::OutputRelease, signal_us, PacingPlanStatus::Held);
+        // Frame 3000's predecessor is not pending: its render time counts from
+        // that frame's target instead, and the controller has no readiness.
+        const double previous_ready_us = ready_at[static_cast<size_t>(frame_id - 2901)] > 0.0
+            ? ready_at[static_cast<size_t>(frame_id - 2901)]
+            : target_us(frame_id - 1);
+        const int64_t render_done_qpc =
+            std::isfinite(render_after_us) ? Qpc(previous_ready_us + render_after_us) : 0;
+        controller->OnGpuRenderEnd(kEpoch, frame_id, 0, Qpc((std::max)(signal_us + ready_after_us, signal_us) + kGap),
+            14000.0, render_done_qpc);
+    };
+    // T(n − 1) given: the scheduler's newest plan target.
+    const auto floor_of = [&](uint64_t frame_id, bool previous_known = true) {
+        GpuFloorCap cap{};
+        cap.interval_us = kI;
+        cap.lead_us = kLead;
+        cap.slack_us = kSlack;
+        cap.previous_target_qpc = previous_known ? Qpc(target_us(frame_id - 1)) : 0;
+        return controller->GpuFloor(key_of(frame_id), 0, 0, true, cap);
+    };
+
+    // Bounded (half the frames waited at the Signal, half give readiness
+    // gaps) before the render coupling decides: Gears' render thread, done
+    // 100 µs after the previous frame's readiness, 100 frames (no full
+    // window). A late predecessor moves the release with the floor.
+    for (uint64_t frame_id = 3000; frame_id < 3100; ++frame_id) {
+        held(frame_id, frame_id % 2 == 0 ? 300.0 : -1000.0, 100.0);
+    }
+    CapBoundStatus status = controller->CapBound();
+    CHECK(status.mode == CapBoundMode::Bounded && status.blend == 1.0);
+    CHECK(status.coupling == RenderCoupling::Unknown && status.ahead == 0 && status.frames == 100);
+    held(3100, 3000.0, 100.0);
+    GpuFloorEstimate estimate = floor_of(3101);
+    CHECK(estimate.cap_bound && estimate.floor_qpc == Qpc(target_us(3100) + kI - kLead + 3000.0 - kSlack));
+    CHECK(estimate.release_floor_qpc == estimate.floor_qpc);
+
+    // CONTROL's render thread, done 2,000 µs before the previous frame's
+    // readiness: 31 such frames in a full window stay Unknown, the 32nd
+    // decides.
+    for (uint64_t frame_id = 3101; frame_id < 3132; ++frame_id) {
+        held(frame_id, frame_id % 2 == 0 ? 300.0 : -1000.0, -2000.0);
+    }
+    status = controller->CapBound();
+    CHECK(status.coupling == RenderCoupling::Unknown && status.ahead == 31 && status.frames == 128);
+    held(3132, 300.0, -2000.0);
+    status = controller->CapBound();
+    CHECK(status.coupling == RenderCoupling::Decoupled && status.ahead == 32 && status.coupling_switches == 0);
+    for (uint64_t frame_id = 3133; frame_id < 3260; ++frame_id) {
+        held(frame_id, frame_id % 2 == 0 ? 300.0 : -1000.0, -2000.0);
+    }
+    status = controller->CapBound();
+    CHECK(status.mode == CapBoundMode::Bounded && status.blend == 1.0 && status.ahead == 128);
+
+    // 3260 ready 3,000 µs after its Signal: the floor of 3261 lies that much
+    // less the slack past its S, its release floor at S − slack.
+    held(3260, 3000.0, -2000.0);
+    const double s_3261 = target_us(3260) + kI - kLead;
+    estimate = floor_of(3261);
+    CHECK(estimate.cap_bound && estimate.floor_qpc == Qpc(s_3261 + 3000.0 - kSlack));
+    CHECK(estimate.release_floor_qpc == Qpc(s_3261 - kSlack));
+    // Without T(n − 1): the floor.
+    CHECK(floor_of(3261, false).release_floor_qpc == estimate.floor_qpc);
+    // A predecessor held at its target: both at S − slack.
+    held(3261, -1000.0, -2000.0);
+    estimate = floor_of(3262);
+    CHECK(estimate.floor_qpc == Qpc(target_us(3261) + kI - kLead - kSlack) &&
+        estimate.release_floor_qpc == estimate.floor_qpc);
+
+    // The floor's own depth (none of 128 waited at an unmoved Signal), φ
+    // stepped to 0: the release floor is the floor's own, still Decoupled.
+    for (uint64_t frame_id = 3262; frame_id < 3390; ++frame_id) held(frame_id, 300.0, -2000.0);
+    status = controller->CapBound();
+    CHECK(status.mode == CapBoundMode::Depth && status.coupling == RenderCoupling::Decoupled);
+    for (int step = 0; step < 103; ++step) controller->AdvanceCapBound(true, kDelta, kI);
+    CHECK(controller->CapBound().blend == 0.0);
+    estimate = floor_of(3390);
+    CHECK(!estimate.cap_bound && estimate.floor_qpc == Qpc(target_us(3389) + 300.0 + kGap - kStart));
+    CHECK(estimate.release_floor_qpc == estimate.floor_qpc);
+    controller->AdvanceCapBound(false, 0.0, kI);
+    CHECK(controller->CapBound().blend == 1.0);
+
+    // Gears' render thread again, or a report without the time: 127 such
+    // frames keep Decoupled, the 128th makes it Coupled, and a late
+    // predecessor moves the release again.
+    for (uint64_t frame_id = 3390; frame_id < 3517; ++frame_id) {
+        held(frame_id, frame_id % 2 == 0 ? 300.0 : -1000.0, frame_id % 3 == 0 ? kNaN : 100.0);
+    }
+    status = controller->CapBound();
+    CHECK(status.coupling == RenderCoupling::Decoupled && status.ahead == 1);
+    held(3517, -1000.0, 100.0);
+    status = controller->CapBound();
+    CHECK(status.coupling == RenderCoupling::Coupled && status.ahead == 0 && status.coupling_switches == 1);
+    CHECK(status.mode == CapBoundMode::Bounded);
+    held(3518, 3000.0, 100.0);
+    estimate = floor_of(3519);
+    CHECK(estimate.floor_qpc == Qpc(target_us(3518) + kI - kLead + 3000.0 - kSlack));
+    CHECK(estimate.release_floor_qpc == estimate.floor_qpc);
+
+    // A cap or FG divisor change and a new producer epoch restart it.
+    for (uint64_t frame_id = 3519; frame_id < 3551; ++frame_id) held(frame_id, -1000.0, -2000.0);
+    CHECK(controller->CapBound().coupling == RenderCoupling::Decoupled);
+    controller->ResetGpuFloor();
+    status = controller->CapBound();
+    CHECK(status.coupling == RenderCoupling::Unknown && status.ahead == 0 && status.coupling_switches == 0);
+    for (uint64_t frame_id = 3551; frame_id < 3584; ++frame_id) held(frame_id, -1000.0, -2000.0);
+    CHECK(controller->CapBound().coupling == RenderCoupling::Decoupled);
+    controller->OnGpuRenderEnd(kEpoch + 1, 100, 0, Qpc(9'000'000.0), 14000.0);
+    CHECK(controller->CapBound().coupling == RenderCoupling::Unknown);
+}
+
+// GPU-paced cadence (EarlyLeadUs): the early side is the low side of how
+// soon frames the GPU floor released were ready, from the floor's release
+// also for a frame pulled back to the cap's earlier release (render coupling,
+// lead_controller.h): from that release the early side would grow by the pull
+// and move such frames' targets later. Here every frame is released 2,000 µs
+// before its floor and ready 7,000 µs after its release; then, at a 50 ms
+// interval, 80 ms before its floor and ready 100 ms after its release (a pull
+// within the lead's 3 I range).
+void TestGpuPacedEarlyLeadFromFloorRelease()
+{
+    const PacingRung gpu = PacingRung::GpuQueueWait;
+    const auto early = [&](double interval_us, double pull_us, double ready_us) {
+        auto controller = MakeController();
+        for (uint64_t k = 1; k <= 40; ++k) {
+            const double source = static_cast<double>(k) * interval_us;
+            LeadFrameStart start = Start(k, gpu, source, interval_us);
+            SetLead(&start, pull_us + 1000.0);
+            start.gpu_floor_release = true;
+            start.floor_pull_us = pull_us;
+            controller->OnSourceRelease(start);
+            controller->OnStageEvent(Event(k, Kind::PresentCall, source + 1000.0));
+            controller->OnStageEvent(Event(k, Kind::GpuReady, source + ready_us));
+            controller->OnStageEvent(Event(k, Kind::OutputRelease, source + ready_us, PacingPlanStatus::Late));
+        }
+        return controller->EarlyLeadUs(gpu, 1.0, 0.95, 500.0);
+    };
+    CHECK_NEAR(early(kInterval, 2000.0, 7000.0), 5000.0 - 500.0);
+    CHECK_NEAR(early(50000.0, 80000.0, 100000.0), 20000.0 - 500.0);
+}
+
 // A cap or FG divisor change (ResetGpuFloor) keeps P until the new period
 // window is warm (lead_controller.h): right after the change the floor
 // applies with the P in use before it, and the new pairs' median takes over
@@ -3215,7 +3431,8 @@ void TestFgInputWaitBehindWaitSample()
     // work reached the driver early in its render submission; floor: the GPU
     // floor released it.
     const auto frame = [&](uint64_t k, double lead_us, double gpu_us, bool submit = true, bool report = true,
-        double start_after_gate_us = 2000.0, double span_extra_us = 0.0, bool streamed = true, bool floor = false) {
+        double start_after_gate_us = 2000.0, double span_extra_us = 0.0, bool streamed = true, bool floor = false,
+        double pull_us = 0.0) {
         const double target = 1'000'000.0 + static_cast<double>(k) * kInterval;
         const double source = target - lead_us;
         const double free = gate_us > 0.0 ? gate_us : target - kInterval;
@@ -3225,6 +3442,7 @@ void TestFgInputWaitBehindWaitSample()
         LeadFrameStart start = Start(k, fg, source, kInterval, 2.0);
         SetLead(&start, lead_us);
         start.gpu_floor_release = floor;
+        start.floor_pull_us = pull_us;
         controller->OnSourceRelease(start);
         if (submit) controller->OnStageEvent(Event(k, Kind::RenderSubmitStart, source + 2000.0));
         controller->OnStageEvent(Event(k, Kind::PresentCall, source + 8000.0));
@@ -3379,6 +3597,28 @@ void TestFgInputWaitBehindWaitSample()
         ++k;
     }
     CHECK(controller->Statistics().kept_wait_samples == 1);
+    // Pulled back to the cap's release (render coupling, lead_controller.h):
+    // the cap's sample. Starved, it keeps the measured readiness, and its
+    // sample waits for its report, unlike a frame the floor released.
+    frame(k++, 20000.0, 9000.0, true, true, 2000.0, 1000.0 + 3000.0, true, true, 1500.0);
+    CHECK_NEAR(last(), 19000.0);
+    CHECK(controller->Statistics().kept_wait_samples == 2);
+    before = controller->Statistics();
+    const double free_p = gate_us;
+    frame(k, 20000.0, 9000.0, true, false, 2000.0, 0.0, true, true, 1500.0);
+    CHECK(controller->Statistics().samples == before.samples);
+    Report(controller.get(), Key(k).producer_epoch, Key(k).frame_id, 7000.0, Qpc(free_p + 2000.0), 8000.0);
+    ++k;
+    CHECK(controller->Statistics().samples == before.samples + 1);
+    CHECK_NEAR(last(), 11830.0);
+    // A pull of a fraction of a microsecond is still a pull: the cap's sample.
+    before = controller->Statistics();
+    const double free_t = gate_us;
+    frame(k, 20000.0, 9000.0, true, false, 2000.0, 0.0, true, true, 0.1);
+    CHECK(controller->Statistics().samples == before.samples);
+    Report(controller.get(), Key(k).producer_epoch, Key(k).frame_id, 7000.0, Qpc(free_t + 2000.0), 8000.0);
+    ++k;
+    CHECK(controller->Statistics().samples == before.samples + 1);
 
     // 65 FG input wait frames without a Reflex report: the reports are stale
     // and the sample is the measured readiness until one arrives.
@@ -4104,6 +4344,8 @@ int main()
     TestGpuFloorReadyAnchor();
     TestGpuFloorGpuSetFilters();
     TestGpuFloorCapBound();
+    TestGpuFloorRenderCoupling();
+    TestGpuPacedEarlyLeadFromFloorRelease();
     TestGpuFloorPeriodAcrossReset();
     TestFgInputWaitBehindWaitSample();
     TestFgBehindWaitLeadFalls();

@@ -493,12 +493,14 @@ bool s_route_known = false;
 
 // Pre-Sleep placement. Owner only.
 PreSleepPlacement s_pre_sleep;
-// Newest planned frame: the pre-wait predicts the next index from it.
+// Newest planned frame: the pre-wait predicts the next index from it, and
+// a held floor's release from its min(E, L) (SourceStageFrame::early_lead_us).
 uint64_t s_last_plan_index = 0;
 uint32_t s_last_plan_generation = 0;
 double s_last_plan_lead_us = 0.0;
 double s_last_plan_interval_us = 0.0;
 int64_t s_last_plan_release_qpc = 0;
+double s_last_plan_early_lead_us = 0.0;
 // Margin of the newest pre-wait and the index it was made for (telemetry).
 uint64_t s_pre_sleep_wait_index = 0;
 double s_pre_sleep_wait_margin_us = 0.0;
@@ -540,7 +542,9 @@ std::atomic<uint32_t> s_handoff_hook_stalls{0};
 // between its ends and the sum of their gaps Δ in µs, and how many frames
 // ahead of the readiness anchor the floor extrapolated (index capped at the
 // horizon); the totals at the newest periodic log line (with the grid's
-// GPU-paced late outputs) and its time, and the cap bound's mode last logged.
+// GPU-paced late outputs and the frames the release floor pulled back to the
+// cap's release) and its time, and the cap bound's mode and render coupling
+// last logged.
 uint64_t s_floor_anchor_frames[4] = {};
 uint64_t s_floor_cap_bound_frames = 0;
 uint64_t s_floor_ineligible_frames = 0;
@@ -556,8 +560,10 @@ uint64_t s_rhythm_logged_modes[3] = {};
 uint64_t s_rhythm_logged_blending = 0;
 double s_rhythm_logged_gap_sum_us = 0.0;
 CapBoundMode s_cap_bound_mode_logged = CapBoundMode::Cold;
+RenderCoupling s_render_coupling_logged = RenderCoupling::Unknown;
 uint64_t s_rhythm_logged_ahead[LEAD_HANDOFF_GPU_HORIZON_FRAMES + 1] = {};
 uint64_t s_rhythm_logged_late_outputs = 0;
+uint64_t s_rhythm_logged_pulled = 0;
 int64_t s_rhythm_log_qpc = 0;
 // The Reflex Sleep hook's entry for grid index s_sleep_entry_index
 // (Scheduler_PlanReflexSleep): when the game reached ReLimiter for it.
@@ -1168,7 +1174,7 @@ static GovernorDecision UpdatePeriodGovernor(
         // every report's GPU times and pair.
         if (sample.gpu_end_qpc > 0) {
             s_source_stage.OnGpuRenderEnd(sample.producer_epoch, sample.frame_id, sample.gpu_start_qpc,
-                sample.gpu_end_qpc, sample.present_end_to_gpu_end_us);
+                sample.gpu_end_qpc, sample.present_end_to_gpu_end_us, sample.render_done_qpc);
         }
         if (sample.back_pressure_known) {
             s_source_stage.OnReportPair(sample.producer_epoch, sample.frame_id, sample.back_pressure);
@@ -1487,11 +1493,23 @@ static int64_t GpuFloorQpc(const PacingPlanKey& key) noexcept
     return GpuFloor(key).floor_qpc;
 }
 
+// T of the grid's newest planned index when the newest plan took it, else 0.
+static int64_t NewestPlanTargetQpc() noexcept
+{
+    const CadenceGridSnapshot& grid = s_source_stage.Grid().Snapshot();
+    int64_t target_qpc = 0;
+    if (s_last_plan_index == 0 || s_last_plan_index != grid.last_planned_index ||
+        !CadenceGrid_TargetOf(grid, s_last_plan_generation, s_last_plan_index, &target_qpc)) {
+        return 0;
+    }
+    return target_qpc;
+}
+
 // A held frame's GPU floor (GpuPacedHeldFloorApplies): the cap bound with the
-// frame's grid interval, the cap's lead (the newest plan's) and the output
-// spacing slack, half the grid's late tolerance of that interval. One
-// function for the plan and the pre-Sleep wait, so both aim at the same
-// release.
+// frame's grid interval, the cap's lead (the newest plan's), the output
+// spacing slack, half the grid's late tolerance of that interval, and the
+// newest plan's target for the release floor. One function for the plan and
+// the pre-Sleep wait, so both aim at the same release.
 static GpuFloorEstimate HeldGpuFloor(const PacingPlanKey& key, double interval_us, double lead_us) noexcept
 {
     GpuFloorCap cap{};
@@ -1503,6 +1521,7 @@ static GpuFloorEstimate HeldGpuFloor(const PacingPlanKey& key, double interval_u
             interval_us * static_cast<double>(frequency) / 1'000'000.0, frequency));
         cap.slack_us = tolerance_ticks / 2.0 * 1'000'000.0 / static_cast<double>(frequency);
     }
+    cap.previous_target_qpc = NewestPlanTargetQpc();
     return GpuFloor(key, cap);
 }
 
@@ -1515,6 +1534,19 @@ static const char* CapBoundModeName(CapBoundMode mode) noexcept
         return "at own depth";
     case CapBoundMode::Bounded:
         return "bounded";
+    }
+    return "?";
+}
+
+static const char* RenderCouplingName(RenderCoupling coupling) noexcept
+{
+    switch (coupling) {
+    case RenderCoupling::Unknown:
+        return "unknown";
+    case RenderCoupling::Coupled:
+        return "waits on the GPU";
+    case RenderCoupling::Decoupled:
+        return "ahead of the GPU";
     }
     return "?";
 }
@@ -1568,6 +1600,8 @@ static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
     s_rhythm_logged_blending = s_floor_blending_frames;
     const double gap_sum_us = s_floor_gap_sum_us - s_rhythm_logged_gap_sum_us;
     s_rhythm_logged_gap_sum_us = s_floor_gap_sum_us;
+    const uint64_t pulled = stage.floor_pulled_frames - s_rhythm_logged_pulled;
+    s_rhythm_logged_pulled = stage.floor_pulled_frames;
     if (paced == 0 && floors == 0 && ineligible == 0) return;
     // Median and largest frames-ahead of the readiness anchor.
     size_t median_ahead = 0;
@@ -1588,8 +1622,9 @@ static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
     LOG_INFO("GPU-paced rhythm: %llu frames (smooth %llu, late %llu, early bound %llu, start %llu); floors %llu "
              "(readiness %llu, report %llu, PRESENT_END %llu; cap-bounded %llu), not eligible %llu; cap bound %s "
              "(waited at the Signal %u of %u, blend %.2f, %llu switches; floors at own depth %llu, bounded %llu, "
-             "blending %llu, mean gap %.2f ms); readiness anchor gaps %u; frames ahead p50 %zu max %zu; "
-             "period %.2f ms (median %.2f); late outputs followed %llu",
+             "blending %llu, mean gap %.2f ms); render thread %s (done before the previous frame's readiness %u "
+             "of %u, %llu switches; released at the cap's release %llu); readiness anchor gaps %u; frames ahead "
+             "p50 %zu max %zu; period %.2f ms (median %.2f); late outputs followed %llu",
         static_cast<unsigned long long>(paced),
         static_cast<unsigned long long>(steps[static_cast<size_t>(GpuPacedRhythmStep::Smooth)]),
         static_cast<unsigned long long>(steps[static_cast<size_t>(GpuPacedRhythmStep::Late)]),
@@ -1608,28 +1643,46 @@ static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
         static_cast<unsigned long long>(modes[static_cast<size_t>(CapBoundMode::Bounded)]),
         static_cast<unsigned long long>(blending),
         floors > 0 ? gap_sum_us / static_cast<double>(floors) / 1000.0 : 0.0,
+        RenderCouplingName(cap.coupling), cap.ahead, cap.frames,
+        static_cast<unsigned long long>(cap.coupling_switches),
+        static_cast<unsigned long long>(pulled),
         lead.ReadyGapCount(), median_ahead, max_ahead,
         lead.RecentGpuPeriodUs() / 1000.0, lead.GpuPeriodUs() / 1000.0,
         static_cast<unsigned long long>(late_outputs));
 }
 
-// The held floor's cap bound changed mode (developer A/B gpu_paced_cadence,
-// lead_controller.h): one INFO line per change between the cap bound and the
-// floor's own depth; a reset back to Cold is not logged.
+// The held floor's cap bound changed mode, or the render coupling changed
+// (developer A/B gpu_paced_cadence, lead_controller.h): one INFO line per
+// change between the cap bound and the floor's own depth, and per change of
+// whether the game's render thread runs ahead of the GPU; a reset back to
+// Cold or Unknown is not logged.
 static void LogCapBoundMode(uint64_t frame_id) noexcept
 {
     const CapBoundStatus cap = s_source_stage.Lead().CapBound();
-    if (cap.mode == s_cap_bound_mode_logged) return;
-    s_cap_bound_mode_logged = cap.mode;
-    if (cap.mode == CapBoundMode::Cold) return;
-    if (cap.mode == CapBoundMode::Bounded) {
-        LOG_INFO("GPU-paced cadence: held GPU floor bounded by the cap's release from frame %llu (the GPU waited at "
-                 "an unmoved Signal on %u of the newest %u reported held frames)",
-            static_cast<unsigned long long>(frame_id), cap.waited, cap.frames);
-    } else {
-        LOG_INFO("GPU-paced cadence: held GPU floor at its own depth from frame %llu (the GPU waited at an unmoved "
-                 "Signal on none of the newest %u reported held frames)",
-            static_cast<unsigned long long>(frame_id), cap.frames);
+    if (cap.mode != s_cap_bound_mode_logged) {
+        s_cap_bound_mode_logged = cap.mode;
+        if (cap.mode == CapBoundMode::Bounded) {
+            LOG_INFO("GPU-paced cadence: held GPU floor bounded by the cap's release from frame %llu (the GPU waited "
+                     "at an unmoved Signal on %u of the newest %u reported held frames)",
+                static_cast<unsigned long long>(frame_id), cap.waited, cap.frames);
+        } else if (cap.mode == CapBoundMode::Depth) {
+            LOG_INFO("GPU-paced cadence: held GPU floor at its own depth from frame %llu (the GPU waited at an "
+                     "unmoved Signal on none of the newest %u reported held frames)",
+                static_cast<unsigned long long>(frame_id), cap.frames);
+        }
+    }
+    if (cap.coupling != s_render_coupling_logged) {
+        s_render_coupling_logged = cap.coupling;
+        if (cap.coupling == RenderCoupling::Decoupled) {
+            LOG_INFO("GPU-paced cadence: render thread ahead of the GPU from frame %llu (done before the previous "
+                     "frame's readiness on %u of the newest %u reported held frames): bounded held frames are "
+                     "released at the cap's release",
+                static_cast<unsigned long long>(frame_id), cap.ahead, cap.frames);
+        } else if (cap.coupling == RenderCoupling::Coupled) {
+            LOG_INFO("GPU-paced cadence: render thread waits on the GPU from frame %llu (done before the previous "
+                     "frame's readiness on none of the newest %u reported held frames)",
+                static_cast<unsigned long long>(frame_id), cap.frames);
+        }
     }
 }
 
@@ -1787,6 +1840,9 @@ static SourceStageFrame RunPlanned(
         request.earliest_release_qpc = rhythm.release_qpc;
         request.gpu_paced_rhythm = rhythm.step;
         request.gpu_floor_qpc = floor.floor_qpc;
+        // Render coupling: released at the cap's release instead when the
+        // render thread runs ahead of the GPU (lead_controller.h).
+        request.release_floor_qpc = floor.release_floor_qpc;
         // The cap bound's blend steps once this plan is published, back to
         // the cap's release when no floor applied.
         request.held_gpu_floor = true;
@@ -1854,12 +1910,13 @@ static SourceStageFrame RunPlanned(
         pre_slept = s_pre_sleep.OnPlannedArrival(frame.plan.grid_index, ready_qpc,
             source_wake_qpc, GetQPCFrequency(), &pre_sleep_end_qpc);
         pre_sleep_late = pre_slept &&
-            ready_qpc > (std::max)(source_wake_qpc, request.earliest_release_qpc);
+            ready_qpc > (std::max)(source_wake_qpc, SourceStage_WakeEarliestQpc(request));
         s_last_plan_index = frame.plan.grid_index;
         s_last_plan_generation = frame.plan.key.controller_generation;
         s_last_plan_lead_us = frame.plan.lead_us;
         s_last_plan_interval_us = frame.plan.interval_us;
         s_last_plan_release_qpc = frame.release_qpc;
+        s_last_plan_early_lead_us = frame.early_lead_us;
     }
 
     // Owned source wait for Reflex feedback (NvAPI source frames only).
@@ -2116,15 +2173,24 @@ bool Scheduler_PlanReflexSleep(int64_t sleep_entry_qpc, int64_t now_qpc, bool dr
         // when the newest frame was held under the developer A/B
         // gpu_paced_cadence, at the GPU-paced rhythm's release from its
         // bounded GPU floor (HeldGpuFloor, as the plan computes it), so the
-        // pre-wait aims for max(S_next, that release) − margin.
+        // pre-wait aims for max(S_next, that release) − margin. A release
+        // floor before it (render coupling, lead_controller.h) releases the
+        // frame at the cap's S′ instead, T′ − L with T′ at least the GPU's
+        // release + min(E, L) (the newest plan's), so the pre-wait aims there
+        // and the marker lands on the release.
         PacingPlanKey next = s_handoff_released;
         ++next.frame_id;
         int64_t earliest_qpc = 0;
         if (handoff_qpc > 0) {
             earliest_qpc = HandoffFloorQpc(next, handoff_qpc, PacingPipeline_Read());
         } else if (s_gpu_paced_held_floor && !driver_sleep) {
-            earliest_qpc = s_source_stage.GpuPacedRhythm(next,
-                HeldGpuFloor(next, s_last_plan_interval_us, s_last_plan_lead_us).floor_qpc).release_qpc;
+            const GpuFloorEstimate floor = HeldGpuFloor(next, s_last_plan_interval_us, s_last_plan_lead_us);
+            earliest_qpc = s_source_stage.GpuPacedRhythm(next, floor.floor_qpc).release_qpc;
+            if (floor.release_floor_qpc > 0 && floor.release_floor_qpc < earliest_qpc) {
+                const int64_t moved_target_qpc = earliest_qpc + us_to_qpc(s_last_plan_early_lead_us);
+                earliest_qpc = (std::max)(floor.release_floor_qpc,
+                    moved_target_qpc - us_to_qpc(s_last_plan_lead_us));
+            }
         }
         if (earliest_qpc > 0) {
             request.next_target_qpc = (std::max)(request.next_target_qpc,

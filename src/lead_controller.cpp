@@ -571,7 +571,8 @@ GpuFloorEstimate LeadController::GpuFloor(const PacingPlanKey& key, uint64_t pre
         }
     }
     // Ĝ(n − 1) − (P/2 + F + σ).
-    estimate.floor_qpc = predicted_qpc - ticks(start_us + release_to_render_window_.Quantile(0.5));
+    const int64_t own_qpc = predicted_qpc - ticks(start_us + release_to_render_window_.Quantile(0.5));
+    estimate.floor_qpc = own_qpc;
     // The cap bound: Ĝ(n − 1) − ḡ + I − L − slack, the cap's release of
     // frame n plus frame n − 1's predicted lateness beyond the slack; the
     // floor moves the blend's share of the gap back to it.
@@ -579,16 +580,26 @@ GpuFloorEstimate LeadController::GpuFloor(const PacingPlanKey& key, uint64_t pre
         const double slack_us = std::isfinite(cap.slack_us) && cap.slack_us > 0.0 ? cap.slack_us : 0.0;
         const int64_t cap_qpc = predicted_qpc -
             ticks(ReadyGapMedianUs() + cap.lead_us - cap.interval_us + slack_us);
-        if (cap_qpc < estimate.floor_qpc) {
-            const int64_t gap_ticks = estimate.floor_qpc - cap_qpc;
-            estimate.cap_gap_us = MicrosecondsBetween(cap_qpc, estimate.floor_qpc);
-            const auto applied_ticks = static_cast<int64_t>(
-                std::llround(static_cast<double>(cap_bound_.blend) * static_cast<double>(gap_ticks)));
-            if (applied_ticks > 0) {
-                estimate.floor_qpc -= applied_ticks;
-                estimate.cap_bound = true;
-            }
+        const auto blended = [&](int64_t bound_qpc) noexcept {
+            if (bound_qpc >= own_qpc) return own_qpc;
+            return own_qpc - static_cast<int64_t>(std::llround(
+                static_cast<double>(cap_bound_.blend) * static_cast<double>(own_qpc - bound_qpc)));
+        };
+        if (cap_qpc < own_qpc) {
+            estimate.cap_gap_us = MicrosecondsBetween(cap_qpc, own_qpc);
+            estimate.floor_qpc = blended(cap_qpc);
+            estimate.cap_bound = estimate.floor_qpc < own_qpc;
         }
+        estimate.release_floor_qpc = estimate.floor_qpc;
+        // Render coupling: a render thread ahead of the GPU is released
+        // without frame n − 1's predicted lateness, at most the cap's own
+        // release of frame n less the slack.
+        if (cap_bound_.coupling == RenderCoupling::Decoupled && cap.previous_target_qpc > 0) {
+            const int64_t release_qpc = cap.previous_target_qpc + ticks(cap.interval_us - cap.lead_us - slack_us);
+            estimate.release_floor_qpc = std::min(estimate.floor_qpc, blended(std::min(cap_qpc, release_qpc)));
+        }
+    } else {
+        estimate.release_floor_qpc = estimate.floor_qpc;
     }
     estimate.anchor = anchor;
     estimate.frames_ahead = static_cast<uint32_t>(previous - anchor_frame);
@@ -726,6 +737,10 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
     slot.render_queue = frame.render_queue;
     slot.gpu_floor_release = frame.gpu_floor_release;
     slot.gpu_target = frame.gpu_target;
+    slot.floor_pull_us = frame.gpu_floor_release && std::isfinite(frame.floor_pull_us) && frame.floor_pull_us > 0.0
+        ? static_cast<uint32_t>((std::max)(std::llround((std::min)(frame.floor_pull_us,
+            static_cast<double>(UINT32_MAX))), 1LL))
+        : 0u;
     SetField(&slot, FieldSource, frame.source_release_qpc);
     RecordReleaseToRender(&slot);
     if (slot.sampled && IsGpuRung(slot.rung)) {
@@ -895,7 +910,7 @@ void LeadController::OnReportPair(uint32_t producer_epoch, uint64_t frame_id,
 }
 
 void LeadController::OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, int64_t gpu_start_qpc,
-    int64_t gpu_end_qpc, double present_to_gpu_end_us) noexcept
+    int64_t gpu_end_qpc, double present_to_gpu_end_us, int64_t render_done_qpc) noexcept
 {
     if (producer_epoch == 0 || frame_id == 0 || gpu_end_qpc <= 0 || qpc_frequency_ <= 0) return;
     if (producer_epoch != gpu_end_epoch_) {
@@ -931,7 +946,12 @@ void LeadController::OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, 
     }
     if (gpu_set && IsPositiveFinite(present_to_gpu_end_us)) gpu_after_present_window_.Add(present_to_gpu_end_us);
     if (gpu_set) RecordReadyGap(*frame, gpu_end_qpc);
-    if (admitted) NoteCapBoundEvidence(*frame);
+    if (admitted) {
+        const PendingFrame* previous = FindNvApiFrame(producer_epoch, frame_id - 1);
+        const int64_t previous_ready_qpc =
+            previous != nullptr && HasField(*previous, FieldGpuReady) ? previous->qpc[FieldGpuReady] : 0;
+        NoteCapBoundEvidence(*frame, render_done_qpc, previous_ready_qpc);
+    }
     gpu_end_frame_ = frame_id;
     gpu_end_qpc_ = gpu_end_qpc;
     gpu_end_gpu_set_ = gpu_set;
@@ -1035,10 +1055,12 @@ double LeadController::ReadyGapMedianUs() const noexcept
 // A reported held frame's cap bound evidence (lead_controller.h): a GPU-rung
 // frame held at its Signal whose wait is known (a probe, else readiness),
 // set when its GPU waited at that Signal and its plan did not move its
-// target, whoever released it. Taken once, at the report (OnGpuRenderEnd
-// takes each frame once), by when the probe has normally been read back;
-// the bit does not change afterwards.
-void LeadController::NoteCapBoundEvidence(const PendingFrame& frame) noexcept
+// target, whoever released it; and its render coupling evidence, set when
+// its render thread's last submission came before frame n − 1's readiness.
+// Taken once, at the report (OnGpuRenderEnd takes each frame once), by when
+// the probe has normally been read back; the bits do not change afterwards.
+void LeadController::NoteCapBoundEvidence(const PendingFrame& frame, int64_t render_done_qpc,
+    int64_t previous_ready_qpc) noexcept
 {
     if (!frame.started || !IsGpuRung(frame.rung) || !HasField(frame, FieldOutputRelease) ||
         !IsHeldStatus(frame.output_status)) {
@@ -1047,13 +1069,18 @@ void LeadController::NoteCapBoundEvidence(const PendingFrame& frame) noexcept
     const bool probed = HasField(frame, FieldGpuResume) && frame.gpu_wait_qpc != 0;
     if (!probed && !HasField(frame, FieldGpuReady)) return;
     const bool waited = PreviousGpuHeld(frame) && !frame.gpu_target;
+    const bool ahead = render_done_qpc > 0 && previous_ready_qpc > 0 && render_done_qpc < previous_ready_qpc;
     CapBoundWindow& window = cap_bound_;
     // Shift in the newest entry; bit 63 of the second word is the entry
     // LEAD_CAP_BOUND_FRAMES places back, 0 until the window is full.
-    const auto dropped = static_cast<uint32_t>(window.bits[1] >> 63);
-    window.bits[1] = (window.bits[1] << 1) | (window.bits[0] >> 63);
-    window.bits[0] = (window.bits[0] << 1) | (waited ? 1u : 0u);
-    window.waited = window.waited - dropped + (waited ? 1u : 0u);
+    const auto shift_in = [](std::array<uint64_t, 2>* bits, bool bit) noexcept {
+        const auto dropped = static_cast<uint32_t>((*bits)[1] >> 63);
+        (*bits)[1] = ((*bits)[1] << 1) | ((*bits)[0] >> 63);
+        (*bits)[0] = ((*bits)[0] << 1) | (bit ? 1u : 0u);
+        return dropped;
+    };
+    window.waited = window.waited - shift_in(&window.bits, waited) + (waited ? 1u : 0u);
+    window.ahead = window.ahead - shift_in(&window.ahead_bits, ahead) + (ahead ? 1u : 0u);
     if (window.frames < LEAD_CAP_BOUND_FRAMES) ++window.frames;
     const CapBoundMode before = window.mode;
     if (window.waited >= LEAD_WARM_SAMPLES) {
@@ -1062,6 +1089,15 @@ void LeadController::NoteCapBoundEvidence(const PendingFrame& frame) noexcept
         window.mode = CapBoundMode::Depth;
     }
     if (before != CapBoundMode::Cold && window.mode != before) ++window.switches;
+    const RenderCoupling coupling_before = window.coupling;
+    if (window.ahead >= LEAD_WARM_SAMPLES) {
+        window.coupling = RenderCoupling::Decoupled;
+    } else if (window.frames == LEAD_CAP_BOUND_FRAMES && window.ahead == 0) {
+        window.coupling = RenderCoupling::Coupled;
+    }
+    if (coupling_before != RenderCoupling::Unknown && window.coupling != coupling_before) {
+        ++window.coupling_switches;
+    }
 }
 
 CapBoundStatus LeadController::CapBound() const noexcept
@@ -1072,6 +1108,9 @@ CapBoundStatus LeadController::CapBound() const noexcept
     status.frames = cap_bound_.frames;
     status.blend = static_cast<double>(cap_bound_.blend);
     status.switches = cap_bound_.switches;
+    status.coupling = cap_bound_.coupling;
+    status.ahead = cap_bound_.ahead;
+    status.coupling_switches = cap_bound_.coupling_switches;
     return status;
 }
 
@@ -1577,10 +1616,12 @@ void LeadController::ForceFinalize(PendingFrame* frame) noexcept
 // Behind the wait the lead sample of a frame the cap released needs the
 // frame's own report: it shows whether the frame's submissions set its
 // readiness (SampleUs). A frame the GPU floor released never keeps X, so its
-// sample does not wait. Reports arrive two to four frames after the release.
+// sample does not wait; one pulled back to the cap's release (render
+// coupling, lead_controller.h) is the cap's. Reports arrive two to four
+// frames after the release.
 bool LeadController::LeadSampleWaitsForReport(const PendingFrame& frame) const noexcept
 {
-    return IsGpuRung(frame.rung) && !frame.gpu_floor_release && !(frame.gpu_active_us > 0.0) &&
+    return IsGpuRung(frame.rung) && !FloorSetRelease(frame) && !(frame.gpu_active_us > 0.0) &&
         BehindWait(frame.rung, frame.bucket % LEAD_DIVISOR_BUCKETS);
 }
 
@@ -1607,7 +1648,10 @@ void LeadController::EmitOutcome(PendingFrame* frame) noexcept
         return;
     }
     // GPU-paced cadence (EarlyLeadUs): how long a frame the GPU floor
-    // released took to be ready. On the GPU waits the measured readiness
+    // released took to be ready, from the floor's release also when the
+    // frame was pulled back to the cap's (render coupling, lead_controller.h):
+    // from its earlier release the early side would grow by the pull and move
+    // T later on every such frame. On the GPU waits the measured readiness
     // itself, not the sample: behind the wait the sample leaves out the
     // frame's wait for frame n − 1, and the early side must not follow it
     // down (Gears of War: E-Day, FG 2× at 120: targets as little as 20 ms
@@ -1618,19 +1662,22 @@ void LeadController::EmitOutcome(PendingFrame* frame) noexcept
     const double ready_us = gpu_ready
         ? MicrosecondsBetween(frame->qpc[FieldSource], frame->qpc[FieldGpuReady])
         : raw_us;
-    const bool ready_in_range = ready_us >= 0.0 && ready_us <= LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us;
-    const auto add = [&](GpuPacedRing* ring) noexcept {
-        ring->x_us[ring->head] = static_cast<float>(ready_us);
+    const auto in_range = [&](double x_us) noexcept {
+        return x_us >= 0.0 && x_us <= LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us;
+    };
+    const auto add = [&](GpuPacedRing* ring, double x_us) noexcept {
+        ring->x_us[ring->head] = static_cast<float>(x_us);
         ring->head = (ring->head + 1) % static_cast<uint32_t>(LEAD_GPU_PACED_CAPACITY);
         if (ring->count < LEAD_GPU_PACED_CAPACITY) ++ring->count;
     };
     const size_t divisor = frame->bucket % LEAD_DIVISOR_BUCKETS;
-    if (frame->gpu_floor_release && ready_in_range) {
+    const double floor_ready_us = ready_us - static_cast<double>(frame->floor_pull_us);
+    if (frame->gpu_floor_release && in_range(floor_ready_us)) {
         GpuPacedRing& ring = gpu_paced_rings_[IsGpuRung(frame->rung) ? 0 : 1];
         if (ring.divisor != divisor) ring = GpuPacedRing{ {}, 0, 0, divisor };
-        add(&ring);
+        add(&ring, floor_ready_us);
     }
-    if (gpu_ready && ready_in_range) add(&gpu_ready_rings_[divisor]);
+    if (gpu_ready && in_range(ready_us)) add(&gpu_ready_rings_[divisor], ready_us);
     RecordSpikeGpu(frame);
     Bucket& bucket = buckets_[frame->bucket];
     // Lockstep engines (lead_controller.h): ReLimiter's waits for later frames
@@ -1831,7 +1878,7 @@ double LeadController::SampleUs(const PendingFrame& frame, const PendingFrame* p
     const double wait_us = free_us - start_us;
     if (!(wait_us > 0.0)) return raw_us;
     double idle_us = 0.0;
-    if (!frame.gpu_floor_release && frame.first_work_streamed && GpuIdleInSpanUs(frame, &idle_us) &&
+    if (!FloorSetRelease(frame) && frame.first_work_streamed && GpuIdleInSpanUs(frame, &idle_us) &&
         idle_us >= LEAD_HANDOFF_GPU_IDLE_US) {
         if (kept_wait_us != nullptr) *kept_wait_us = wait_us;
         return raw_us;

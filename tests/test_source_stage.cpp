@@ -1155,6 +1155,83 @@ void TestGpuPacedRhythm()
     CHECK(g_stage.GpuPacedRhythm(Key(frame_id), floor2 + Ticks(17'000.0)).step == GpuPacedRhythmStep::Start);
 }
 
+// Render coupling (lead_controller.h): a held frame whose release floor lies
+// before the GPU's release is released at the grid's S (its T − L) or, later,
+// at its arrival. It stays the GPU's frame otherwise: no lateness judged
+// (GpuFloorReleased), its target the GPU's release + min(E, L), and the
+// rhythm continuing from the GPU's release. A release floor at or after the
+// GPU's release changes nothing.
+void TestReleaseFloorAtCapRelease()
+{
+    std::printf("Test: a release floor before the GPU's release releases the frame at the cap's S\n");
+    ResetStage();
+    ScriptedClock clock;
+    const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
+    uint64_t frame_id = 6000;
+    SourceStageFrame last{};
+    const auto finish = [&](const SourceStageFrame& frame, int64_t ready_qpc) {
+        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::PresentCall,
+            frame.release_qpc + Ticks(1'000.0))));
+        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady, ready_qpc)));
+        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease, ready_qpc,
+            PacingPlanStatus::Late)));
+        g_stage.DrainStageEvents();
+        clock.now = ready_qpc;
+    };
+    // Warm lead (ready 3,000 µs after each release: early side 2,500 µs) and
+    // GPU periods of 17,000 µs from frames not held.
+    for (int i = 0; i < 40; ++i) {
+        last = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
+        finish(last, last.release_qpc + Ticks(3'000.0));
+        const int64_t end = kStart + Ticks(17'000.0 * static_cast<double>(i));
+        g_stage.OnGpuRenderEnd(1, frame_id - 1, end - Ticks(17'000.0 - 250.0), end, 14'000.0);
+    }
+    const auto request_for = [&](int64_t floor, int64_t release_floor) {
+        SourceStageRequest request = Request(Key(frame_id++), held);
+        request.gpu_paced_cadence = true;
+        request.gpu_floor_qpc = floor;
+        request.earliest_release_qpc = floor;
+        request.release_floor_qpc = release_floor;
+        request.gpu_paced_rhythm = GpuPacedRhythmStep::Start;
+        return request;
+    };
+    const auto s_after = [&](const SourceStageFrame& frame) {
+        return frame.plan.output_target_qpc + Ticks(kIntervalUs) - Ticks(frame.plan.lead_us);
+    };
+
+    // The floor 6 ms past the grid's S, the release floor 1 ms before it:
+    // T = floor + 2,500 and the frame released at T − L, before the floor.
+    const uint64_t pulled = g_stage.Statistics().floor_pulled_frames;
+    int64_t floor = s_after(last) + Ticks(6'000.0);
+    const SourceStageFrame first = g_stage.RunPlannedFrame(request_for(floor, s_after(last) - Ticks(1'000.0)), &clock);
+    CHECK(first.planned && first.gpu_paced && first.epoch_started == PacingEpochReason::None);
+    CHECK(g_stage.Lead().GpuFloorReleased(first.plan.key, first.plan.grid_index));
+    CHECK(first.plan.output_target_qpc > floor + Ticks(2'499.0) && first.plan.output_target_qpc < floor + Ticks(2'501.0));
+    CHECK(first.release_qpc == first.plan.source_wake_qpc && first.release_qpc < floor);
+    CHECK(std::llabs(first.release_qpc - (first.plan.output_target_qpc - Ticks(first.plan.lead_us))) <= 1);
+    CHECK(first.floor_pull_ticks == floor - first.release_qpc);
+    CHECK(g_stage.Statistics().floor_pulled_frames == pulled + 1);
+    // The rhythm continues from the floor: 17,000 µs on is not earlier than
+    // a floor 500 µs before that (Late), which a rhythm from the earlier
+    // release would have pulled toward it (Smooth).
+    CHECK(g_stage.GpuPacedRhythm(Key(frame_id), floor + Ticks(16'500.0)).step == GpuPacedRhythmStep::Late);
+    finish(first, floor + Ticks(3'000.0));
+
+    // The game arrives after the grid's S: released at its arrival.
+    floor = s_after(first) + Ticks(6'000.0);
+    clock.now = floor - Ticks(300.0);
+    const SourceStageFrame arrived = g_stage.RunPlannedFrame(request_for(floor, s_after(first) - Ticks(1'000.0)), &clock);
+    CHECK(arrived.planned && arrived.gpu_paced && arrived.release_qpc == floor - Ticks(300.0));
+    CHECK(arrived.floor_pull_ticks == Ticks(300.0));
+    finish(arrived, floor + Ticks(3'000.0));
+
+    // A release floor at or after the floor: released at the floor.
+    floor = s_after(arrived) + Ticks(6'000.0);
+    const SourceStageFrame kept = g_stage.RunPlannedFrame(request_for(floor, floor + Ticks(1'000.0)), &clock);
+    CHECK(kept.planned && kept.gpu_paced && kept.release_qpc == floor && kept.floor_pull_ticks == 0);
+    CHECK(g_stage.Statistics().floor_pulled_frames == pulled + 2);
+}
+
 // The held GPU floor applies before the cap held 32 frames only after a
 // cadence restart of a held frame in the producer epoch (lead_controller.h):
 // a SourceLate restart at the plan and an OutputLate restart from the stage
@@ -1252,6 +1329,7 @@ int main()
     TestGpuPacedCadence();
     TestGpuPacedRing();
     TestGpuPacedRhythm();
+    TestReleaseFloorAtCapRelease();
     TestCadenceRestartsCountForTheFloor();
     TestResetClearsPlans();
     std::printf("=== %d checks, %d failures ===\n", g_checks, g_failures);

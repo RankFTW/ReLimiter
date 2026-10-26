@@ -60,6 +60,11 @@ struct ReflexFrameTimeSample {
 	// floor's live bound); 0 when either is missing, the GPU end comes first,
 	// or it exceeds 3 I.
 	double present_end_to_gpu_end_us = 0.0;
+	// The later of the report's renderSubmitEndTime and presentStartTime as
+	// local QPC through the stable Reflex clock map: when the game's render
+	// thread finished the frame (the held floor's render coupling,
+	// lead_controller.h); 0 without renderSubmitEndTime or a stable map.
+	int64_t render_done_qpc = 0;
 	// The frame's first work (driverStartTime) reached the driver before the
 	// middle of its own render submission (HandoffFirstWorkStreams on its
 	// RENDERSUBMIT_START/END); false when any of them is missing. The lead
