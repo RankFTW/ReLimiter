@@ -3581,13 +3581,13 @@ namespace
 }
 
 // Spike floor (lead_controller.h): behind the wait the lead is at least the
-// fourth-largest of the newest 32 block maxima of 64 arrivals plus the
+// second-largest of the newest 32 block maxima of 64 arrivals plus the
 // median r − g, once 4 blocks and 32 GPU times are known. One 10,000 µs
 // simulation every 64 frames arrives after 10,500 (bin center 10,510): the
 // floor is 17,510 against an own lead near 13.4 ms (the samples of the frames
 // behind a late one keep frame n − 1's frame generation), the lead rises to it
 // at the slew, and those frames, late before, are ready by their targets.
-// Three blocks with a longer simulation do not move the tail; a fourth does.
+// One block with a longer simulation does not move the tail; a second does.
 // The floor is off with the request's key off, on CPU rungs and without the
 // queue order behind the wait; a reset of the buckets clears it, the GPU
 // floor's reset and an evidence restart keep it. It never counts as a
@@ -3626,12 +3626,11 @@ void TestLeadSpikeFloor()
     CHECK(loop.controller->SpikeFloorUs(PacingRung::MarkerHold, 1.0) == 0.0);
     CHECK(loop.controller->SpikeFloorUs(PacingRung::GpuQueueWait, 2.0) == 0.0);
 
-    // A 16,000 µs simulation (arrival 16,500, bin center 16,510) in three
-    // blocks (frames 424, 488, 552) leaves the tail; a fourth (616) sets it.
-    // The 10,000 µs frame at 458 is ready by its target at the floor.
-    const auto monster_of = [&](uint64_t n) {
-        return n == 424 || n == 488 || n == 552 || n == 616 ? 16000.0 : sim_of(n);
-    };
+    // A 16,000 µs simulation (arrival 16,500, bin center 16,510) in one block
+    // (frame 424; frames 386–449 close at 449) leaves the tail; a second in
+    // the next block (488; 450–513) sets it. The 10,000 µs frame at 458 is
+    // ready by its target at the floor.
+    const auto monster_of = [&](uint64_t n) { return n == 424 || n == 488 ? 16000.0 : sim_of(n); };
     uint32_t late_spikes_after = 0;
     uint32_t spikes_after = 0;
     while (loop.n < 460) {
@@ -3643,9 +3642,9 @@ void TestLeadSpikeFloor()
         }
     }
     CHECK(spikes_after == 1 && late_spikes_after == 0);
-    while (loop.n < 600) loop.Frame(monster_of(loop.n + 1));
+    while (loop.n < 512) loop.Frame(monster_of(loop.n + 1));
     CHECK_NEAR(loop.controller->SpikeTailUs(), 10510.0);
-    while (loop.n < 650) loop.Frame(monster_of(loop.n + 1));
+    loop.Frame(monster_of(loop.n + 1));
     CHECK_NEAR(loop.controller->SpikeTailUs(), 16510.0);
     CHECK_NEAR(loop.controller->SpikeFloorUs(fg, 2.0), 23510.0);
 

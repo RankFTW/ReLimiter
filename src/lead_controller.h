@@ -76,7 +76,7 @@ constexpr size_t LEAD_GPU_NEED_CAPACITY = 128;
 // floor applies, and the GPU times kept (their median is Γ).
 constexpr uint32_t LEAD_SPIKE_BLOCK_SAMPLES = 64;
 constexpr size_t LEAD_SPIKE_BLOCKS = 32;
-constexpr size_t LEAD_SPIKE_TAIL_RANK = 4;
+constexpr size_t LEAD_SPIKE_TAIL_RANK = 2;
 constexpr uint32_t LEAD_SPIKE_WARM_BLOCKS = 4;
 constexpr size_t LEAD_SPIKE_GPU_SAMPLES = 32;
 static_assert(LEAD_SPIKE_WARM_BLOCKS >= LEAD_SPIKE_TAIL_RANK && LEAD_SPIKE_TAIL_RANK >= 1,
@@ -261,9 +261,20 @@ constexpr double LEAD_ROOM_MIN_HOLD_US = 250.0; // h
 //   5.05 / 12.1 at L 29.8). Held-first frames (Gears of War: E-Day, first
 //   work pinned to the previous Signal) add no arrival.
 // - Q_tail: the LEAD_SPIKE_TAIL_RANK-th largest of the maxima of the newest
-//   LEAD_SPIKE_BLOCKS closed blocks of LEAD_SPIKE_BLOCK_SAMPLES arrivals: the
-//   lead's own outlier rank over a window eight times longer, about one
-//   frame in a thousand, so up to three isolated long seconds do not set it.
+//   LEAD_SPIKE_BLOCKS closed blocks of LEAD_SPIKE_BLOCK_SAMPLES arrivals
+//   (about 31 s at 65 real frames per second): every arrival of that window
+//   but the longest is covered, so one isolated long second does not set it.
+//   A game whose long simulations recur leaves at most one uncovered per
+//   window besides new maxima. The fourth-largest (the lead's own outlier
+//   rank, about one frame in a thousand) left the three longest of each
+//   window: live in CONTROL Resonant (FG 2× at 130) it cut the GPU's waits
+//   above 3 ms from 11.9 to 2.4 per minute without the GPU-paced cadence and
+//   19.5 → 6.8 with it, jitter above 2 ms 25.1 → 10.4 and 20.9 → 13.0 per
+//   1,000, for 2.2–2.6 ms of PC latency (lead 28.4–28.8 → 31.2–31.3 ms), but
+//   the waits left were 22–25 ms simulations 5–9 ms beyond it, 3–5 display
+//   jumps each. Replayed, the second-largest added 0.8–3.9 ms of lead in
+//   those scenes and removed most of them; the largest also set the lead in
+//   Gears of War: E-Day's GPU-paced cadence (40% of frames) and is not used.
 // - Γ: the median GPU start → readiness time (r − g) of the newest
 //   LEAD_SPIKE_GPU_SAMPLES frames.
 // A frame whose work reaches the GPU after the GPU is free is ready a + Γ
@@ -272,12 +283,11 @@ constexpr double LEAD_ROOM_MIN_HOLD_US = 250.0; // h
 // blocks and LEAD_SPIKE_GPU_SAMPLES GPU times are known, and enters only the
 // warm target, max(Q_q + allowance, L_spike): the slew, S, the pre-Sleep
 // target and the GPU floor's cap bound follow one lead. It needs no load
-// threshold: where the arrival tail is thin it lies below the lead (CONTROL's
-// light scene 0.3 ms below at p50, Gears 1.4–9.7 ms below). It is not part of
-// the 3 I budget the Adaptive cap answers. Replayed on those CONTROL captures
-// the lead rose 29.6 → 33.6 ms (36.0 with the GPU-paced cadence) and the
-// GPU's waits for late arrivals fell 8.3 → 4.2 (9.4 → 1.3) per minute. Reset
-// and ResetBuckets clear it; ResetGpuFloor, RestartRung and
+// threshold: where the arrival tail is thin it lies below the lead (Gears
+// 1.4–9.7 ms below in every capture, CONTROL's light scene within 0.3 ms).
+// It is not part of the 3 I budget the Adaptive cap answers, and it did not
+// slow the game's render submission (CONTROL p50 7.8–8.0 ms with and without
+// it). Reset and ResetBuckets clear it; ResetGpuFloor, RestartRung and
 // ClearSlackEvidence keep it (game properties, like F and σ).
 
 // Render handoff offset. A frame

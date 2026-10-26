@@ -57,9 +57,10 @@ live, long frames rose from 1.8 to 11.2 per 1,000 because the submission slowed
 while the simulation overlapped it. Treat a replay as a screen that can
 reject a floor, never as evidence that one is safe.
 
---replay-spike-floor[=RANK] (default 4; write the value after "=" and put the
-capture paths first) replays the lead spike floor per segment: for a GPU wait
-frame whose next GPU work runs behind the wait, L' = max(L, L_spike) with
+--replay-spike-floor[=RANK] (default 2, the production rank; write the value
+after "=" and put the capture paths first) replays the lead spike floor per
+segment: for a GPU wait frame whose next GPU work runs behind the wait,
+L' = max(L, L_spike) with
 L_spike = Q_tail(a) + Gamma. a is the CPU arrival: the release -> the first
 GPU work reaching the driver (driver_start) less the time the finished
 simulation waited for the render thread (q = max(0, min(w, b(n-1)) -
@@ -125,6 +126,7 @@ SPIKE_BLOCKS = 32          # newest closed blocks it keeps
 SPIKE_MIN_BLOCKS = 4       # closed blocks it needs before it gives a floor
 SPIKE_GAMMA_SAMPLES = 32   # newest r - g values of Gamma, and the least it needs
 SPIKE_WARM_S = 32.0        # not evaluated: the first seconds of a segment
+SPIKE_TAIL_RANK = 2        # the rank LeadController uses (LEAD_SPIKE_TAIL_RANK): the default of the replay
 SPIKE_RANGE_INTERVALS = 3.0  # arrivals and r - g beyond this many intervals are not samples
 STALL_ABSOLUTE_MS = 3.0
 SPIKE_CAVEAT = ("the replay keeps the render thread's timing as captured (the arrival is not changed by the "
@@ -813,11 +815,13 @@ def main() -> int:
     parser.add_argument("--replay-segment", choices=("held", "not_held"), default="held")
     parser.add_argument("--replay-submit-saving-ms", type=float, default=0.0,
                         help="assume each replayed submission this much shorter (optimistic bound)")
-    parser.add_argument("--replay-spike-floor", nargs="?", const=4, type=int, metavar="RANK", dest="spike_rank",
+    parser.add_argument("--replay-spike-floor", nargs="?", const=SPIKE_TAIL_RANK, type=int, metavar="RANK",
+                        dest="spike_rank",
                         help="replay the lead spike floor L' = max(L, Q_tail + Gamma) per segment, Q_tail the "
-                             "RANK-th largest block maximum of the arrivals (default 4; write --replay-spike-floor="
-                             "RANK, capture paths first). The replay keeps the render thread's timing as captured "
-                             "and can only reject a floor, never approve one")
+                             f"RANK-th largest block maximum of the arrivals (default {SPIKE_TAIL_RANK}, the "
+                             "production rank; write --replay-spike-floor=RANK, capture paths first). The replay "
+                             "keeps the render thread's timing as captured and can only reject a floor, never "
+                             "approve one")
     parser.add_argument("--predict", action="store_true",
                         help="with --replay-spike-floor: L' = L_spike alone (archives whose captured lead exceeds "
                              "the floor); same reject-only caveat")
