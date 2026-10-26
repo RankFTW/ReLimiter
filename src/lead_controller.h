@@ -67,6 +67,10 @@ constexpr size_t LEAD_GPU_PACED_CAPACITY = 128;
 // of a frame whose pace the GPU set to its Reflex GPU end.
 constexpr size_t LEAD_GPU_PERIOD_RECENT = 5;
 constexpr size_t LEAD_GPU_READY_GAP_CAPACITY = 64;
+// GPU-paced cadence, held floor: the cap bound's evidence is the newest
+// LEAD_CAP_BOUND_FRAMES reported held frames (two 64-bit words; cap bound,
+// below).
+constexpr uint32_t LEAD_CAP_BOUND_FRAMES = 128;
 // Adaptive cap hold room of the FG input wait (scheduler.cpp
 // UpdatePeriodGovernor): the newest LEAD_GPU_NEED_CAPACITY per-frame GPU
 // needs D (GpuNeedQuantileUs).
@@ -386,19 +390,40 @@ constexpr double LEAD_ROOM_MIN_HOLD_US = 250.0; // h
 // measured median stayed at 20–24 ms, so the bound sat 5–7 ms past S before
 // any lateness, behind the floor's own 4–5.5 ms, and the floor released
 // 92–94% of frames).
-// The bound applies once LEAD_WARM_SAMPLES frames the cap held were
-// reported in this producer epoch (CapHeldFrames: the GPU waited at the
-// Signal and the floor did not release the frame) and ḡ is warm. Before
-// that, the floor applies unbounded only after a cadence restart of a held
-// frame in this producer epoch (NoteCadenceRestart: SourceLate or
-// OutputLate), else not at all (GpuFloorEstimate::ineligible): where the GPU
-// is the limit the cap rarely holds a frame and the floor keeps its own depth
-// (Gears). A restart of a frame not held does not count: the first frame
-// after an FG change lands late on the new grid while FG is not presenting
-// yet, and as the only restart it made the floor apply unbounded once FG
-// presented (CONTROL FG 2× at 130: the floor then released most frames
-// whenever it lay past S, and for 13 s the cap held 15–23 frames). Frames
-// not held (the render handoff limit) take no bound.
+// Which depth applies (CapBound): the newest LEAD_CAP_BOUND_FRAMES reported
+// held GPU-rung frames whose wait is known, each set when its GPU waited at
+// its Signal (a probe at or before it, else readiness before it) and its
+// plan did not move its target (LeadFrameStart::gpu_target), whoever
+// released it. Bounded once LEAD_WARM_SAMPLES of them are set, the floor's
+// own depth (Depth) once the window is full and none is; between the two
+// the mode stays. Before either the floor applies at its own depth only
+// after a cadence restart of a held frame in this producer epoch
+// (NoteCadenceRestart: SourceLate or OutputLate), else not at all
+// (GpuFloorEstimate::ineligible); bounded, it also needs ḡ warm and the
+// cap's lead, else no floor. Frames the floor released count: evidence from
+// frames it did not release is what its own depth removes. The cumulative
+// count of those this replaced (32 in the producer epoch bound it for good)
+// fell from 61–78% of the held frames to 5–7% in CONTROL Resonant (FG 2× at
+// 130) under the own depth, where the waits at an unmoved Signal stayed at
+// 50–63% (64–79% bounded, 62–71% without the cadence); Gears of War: E-Day
+// (FG 2× at 120) has 7–8% with the cadence alone at either depth and
+// 93–97% with the Adaptive cap. Bound for good, Gears' render thread started
+// L − 19.7 ms before the GPU's need on the frames the floor released and
+// its held-first work followed the lead (850 frames per minute at L 32 ms).
+// The exit is at none of the newest 128: at 16 CONTROL switched 12 times in
+// one capture; at none, replayed on 24 captures, CONTROL left the bound once
+// (0.9 s, every frame late and its GPU work above I) and Gears switched 2–6
+// times per capture at its section changes. The floor is
+//   Ĝ(n − 1) − (P/2 + F + σ) − φ Δ,
+// Δ the gap from the floor's own depth back to the cap bound (0 when the
+// bound lies past it or ḡ or the cap's lead is unknown), φ the blend: 1
+// bounded, 0 at the own depth. After each published plan of a held frame
+// whose floor applied (AdvanceCapBound) φ moves toward its mode by at most
+// min(LEAD_SLEW_MAX_US, I/64) / Δ, so a switch moves the floor like a lead
+// change rather than by Δ at once (CONTROL about 7 ms, Gears 2–4 ms); Δ
+// itself moves with its inputs. A switch to bounded from Cold without a
+// restart sets φ = 1 at once: no floor applied, the frames were at the cap's
+// release. Frames not held (the render handoff limit) take no bound.
 //
 // Readiness anchor (as Ĝ, developer A/B gpu_paced_cadence only): the GPU
 // waits read back each frame's GPU readiness on ReLimiter's own GPU timeline
@@ -486,18 +511,36 @@ enum class GpuFloorAnchor : uint8_t {
     PresentEnd = 2, // the render thread's newest PRESENT_END bound
     Ready = 3       // the newest frame's GPU readiness (readiness anchor)
 };
+// The held GPU floor's depth (cap bound, above): Cold before the evidence
+// window decides, Depth the floor's own, Bounded the cap bound.
+enum class CapBoundMode : uint8_t {
+    Cold = 0,
+    Depth = 1,
+    Bounded = 2
+};
 struct GpuFloorEstimate {
     int64_t floor_qpc = 0; // 0: the floor does not apply
     GpuFloorAnchor anchor = GpuFloorAnchor::None; // the anchor of Ĝ(n − 1), also under the cap bound
     uint32_t frames_ahead = 0; // frames from the anchor's frame to n − 1 (extrapolated by P)
-    // Held frames (GpuFloorCap): the cap bound set floor_qpc, earlier than
-    // Ĝ(n − 1) − (P/2 + F + σ).
+    // Held frames (GpuFloorCap): the cap bound moved floor_qpc earlier than
+    // Ĝ(n − 1) − (P/2 + F + σ) (φ Δ > 0).
     bool cap_bound = false;
-    // Held frames: the windows were warm but the floor is not eligible yet,
-    // without LEAD_WARM_SAMPLES frames the cap held (and readiness gaps and
-    // the cap's lead) or, before those frames, a cadence restart of a held
-    // frame in this producer epoch: no floor.
+    // Held frames: the windows were warm but the floor does not apply: Cold
+    // without a cadence restart of a held frame in this producer epoch, or
+    // bounded without warm readiness gaps or the cap's lead.
     bool ineligible = false;
+    // Held frames: the mode, and Δ, how far the cap bound lies before the
+    // floor's own depth in µs (>= 0).
+    CapBoundMode cap_mode = CapBoundMode::Cold;
+    double cap_gap_us = 0.0;
+};
+// The cap bound's evidence window and blend (LeadController::CapBound).
+struct CapBoundStatus {
+    CapBoundMode mode = CapBoundMode::Cold;
+    uint32_t waited = 0;   // entries whose GPU waited at a Signal their plan did not move
+    uint32_t frames = 0;   // entries, at most LEAD_CAP_BOUND_FRAMES
+    double blend = 0.0;    // φ
+    uint64_t switches = 0; // Depth ↔ Bounded changes since the last reset
 };
 // A held frame's cap bound inputs (LeadController::GpuFloor, above): its
 // grid interval I, the cap's lead L (the newest plan's) and the output
@@ -562,6 +605,10 @@ struct LeadFrameStart {
     // (source_stage.h), so its X measures how soon a frame released there is
     // ready (EarlyLeadUs).
     bool gpu_floor_release = false;
+    // Developer A/B gpu_paced_cadence: the frame's earliest target moved its
+    // T (CadenceGridPlan::gpu_target): a wait at that Signal is no evidence
+    // that the cap held it (cap bound, above).
+    bool gpu_target = false;
     // The collision guard's verdict on L (NextLeadUs). The Adaptive cap's
     // slack adds guard.reduction_us, so lateness the guard accepts on
     // purpose is not a missed target; a judged frame adds its X to the hold
@@ -908,8 +955,12 @@ public:
     uint32_t GpuNeedCount() const noexcept { return gpu_need_.count; }
     // Anchor → GPU end gaps in the readiness anchor's window (above).
     uint32_t ReadyGapCount() const noexcept { return ready_gap_count_; }
-    // Frames the cap held in this producer epoch since the last reset (above).
-    uint32_t CapHeldFrames() const noexcept { return cap_held_frames_; }
+    // The cap bound's mode, evidence window and blend (above).
+    CapBoundStatus CapBound() const noexcept;
+    // After a published plan of a held frame whose GPU floor applied: move
+    // the blend toward the mode by at most min(LEAD_SLEW_MAX_US, I/64) of
+    // gap_us, that floor's GpuFloorEstimate::cap_gap_us (above).
+    void AdvanceCapBound(double gap_us, double interval_us) noexcept;
     // Lower-index median of the newest LEAD_RESUME_MEDIAN_SAMPLES waited
     // u − o observations (held, probed GPU queue wait frames whose GPU waited
     // at the Signal); 0 before any. A held frame without a probe resumes at
@@ -1008,6 +1059,7 @@ private:
         bool release_to_render_recorded = false; // σ of this frame entered its window, or given up
         bool spike_recorded = false;     // its spike floor arrival was decided (added or left out)
         bool spike_gpu_recorded = false; // its r − g was decided
+        bool gpu_target = false;         // LeadFrameStart::gpu_target
     };
 
     // The newest LEAD_SLACK_CAPACITY slack signs of one bucket.
@@ -1066,8 +1118,8 @@ private:
     void RecordReadyGap(const PendingFrame& frame, int64_t gpu_end_qpc) noexcept;
     // Median of the readiness gaps; meaningful from LEAD_WARM_SAMPLES.
     double ReadyGapMedianUs() const noexcept;
-    // A reported frame the cap held (above).
-    void NoteCapHeld(const PendingFrame& frame) noexcept;
+    // A reported held frame's cap bound evidence (above).
+    void NoteCapBoundEvidence(const PendingFrame& frame) noexcept;
     void RecordGpuNeed(const PendingFrame& frame, double work_us) noexcept;
     // Copies the newest `count` u − o observations (count <= resume_delay_count_).
     void NewestResumeDelays(size_t count, double* delays_us) const noexcept;
@@ -1198,9 +1250,18 @@ private:
     std::array<float, LEAD_GPU_READY_GAP_CAPACITY> ready_gaps_us_{};
     uint32_t ready_gap_head_ = 0;
     uint32_t ready_gap_count_ = 0;
-    // Cap bound (above): the frames the cap held, and the producer epoch of
-    // the newest cadence restart (0 none).
-    uint32_t cap_held_frames_ = 0;
+    // Cap bound (above): the evidence window (bit i of bits: the entry i
+    // places back, newest at bit 0), its mode and blend, and the producer
+    // epoch of the newest cadence restart (0 none).
+    struct CapBoundWindow {
+        std::array<uint64_t, 2> bits{};
+        uint32_t frames = 0;
+        uint32_t waited = 0;
+        CapBoundMode mode = CapBoundMode::Cold;
+        float blend = 0.0f;
+        uint64_t switches = 0;
+    };
+    CapBoundWindow cap_bound_{};
     uint32_t restart_epoch_ = 0;
     // GPU need window (above); divisor = the frames' FG divisor slot, epoch
     // their producer epoch.

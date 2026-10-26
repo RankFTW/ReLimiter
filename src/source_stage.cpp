@@ -296,8 +296,15 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     // Publish before the wait: PRESENT_START and the output executors never
     // wait for the owner.
     frame.plan_published = g_frame_plans.Publish(plan);
-    if (frame.plan_published) last_published_key_ = plan.key;
-    else ++statistics_.plan_publish_failures;
+    if (frame.plan_published) {
+        last_published_key_ = plan.key;
+        // The held floor's cap bound blend: one step per published plan
+        // (lead_controller.h), after this frame's floor and before the next
+        // frame's pre-Sleep wait reads it.
+        if (request.cap_gap_us >= 0.0) lead_.AdvanceCapBound(request.cap_gap_us, request.interval_us);
+    } else {
+        ++statistics_.plan_publish_failures;
+    }
 
     // Source wait until S_n, clamped so a bad target cannot hang the game.
     const int64_t wait_now = clock->Now();
@@ -374,6 +381,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
         rhythm_release_qpc_ = 0;
     }
     start.gpu_floor_release = frame.gpu_paced;
+    start.gpu_target = frame.gpu_target;
     lead_.OnSourceRelease(start);
     return frame;
 }

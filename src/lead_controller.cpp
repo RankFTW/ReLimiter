@@ -182,7 +182,7 @@ void LeadController::Reset(int64_t qpc_frequency) noexcept
     ready_gaps_us_ = {};
     ready_gap_head_ = 0;
     ready_gap_count_ = 0;
-    cap_held_frames_ = 0;
+    cap_bound_ = CapBoundWindow{};
     restart_epoch_ = 0;
     gpu_need_ = {};
     gpu_paced_rings_ = {};
@@ -254,7 +254,7 @@ void LeadController::ResetGpuFloor() noexcept
     ready_gaps_us_ = {};
     ready_gap_head_ = 0;
     ready_gap_count_ = 0;
-    cap_held_frames_ = 0;
+    cap_bound_ = CapBoundWindow{};
     restart_epoch_ = 0;
     // Frames released before the change (lead_controller.h).
     for (PendingFrame& frame : pending_) {
@@ -527,16 +527,18 @@ GpuFloorEstimate LeadController::GpuFloor(const PacingPlanKey& key, uint64_t pre
         key.frame_id - 1 - gpu_end_frame_ > LEAD_HANDOFF_GPU_HORIZON_FRAMES) {
         return estimate;
     }
-    // A held frame (cap bound, above): bounded once the cap held
-    // LEAD_WARM_SAMPLES frames, the readiness gaps are warm and the cap's lead
-    // is known; before those frames, unbounded only after a cadence restart of
-    // a held frame in this producer epoch.
+    // A held frame (cap bound, above): the mode decides the depth. Cold
+    // applies the floor's own depth only after a cadence restart of a held
+    // frame in this producer epoch; bounded needs ḡ and the cap's lead.
     const bool held = IsPositiveFinite(cap.interval_us);
-    const bool cap_warm = cap_held_frames_ >= LEAD_WARM_SAMPLES;
-    const bool bounded = held && cap_warm && ready_gap_count_ >= LEAD_WARM_SAMPLES && IsPositiveFinite(cap.lead_us);
-    if (held && !bounded && (cap_warm || !CadenceRestartSeen(key.producer_epoch))) {
-        estimate.ineligible = true;
-        return estimate;
+    const bool bound_known = ready_gap_count_ >= LEAD_WARM_SAMPLES && IsPositiveFinite(cap.lead_us);
+    if (held) {
+        estimate.cap_mode = cap_bound_.mode;
+        if ((cap_bound_.mode == CapBoundMode::Cold && !CadenceRestartSeen(key.producer_epoch)) ||
+            (cap_bound_.mode == CapBoundMode::Bounded && !bound_known)) {
+            estimate.ineligible = true;
+            return estimate;
+        }
     }
     const auto ticks = [this](double us) {
         return static_cast<int64_t>(std::llround(us * static_cast<double>(qpc_frequency_) / kMicrosecondsPerSecond));
@@ -571,14 +573,21 @@ GpuFloorEstimate LeadController::GpuFloor(const PacingPlanKey& key, uint64_t pre
     // Ĝ(n − 1) − (P/2 + F + σ).
     estimate.floor_qpc = predicted_qpc - ticks(start_us + release_to_render_window_.Quantile(0.5));
     // The cap bound: Ĝ(n − 1) − ḡ + I − L − slack, the cap's release of
-    // frame n plus frame n − 1's predicted lateness beyond the slack.
-    if (bounded) {
+    // frame n plus frame n − 1's predicted lateness beyond the slack; the
+    // floor moves the blend's share of the gap back to it.
+    if (held && bound_known) {
         const double slack_us = std::isfinite(cap.slack_us) && cap.slack_us > 0.0 ? cap.slack_us : 0.0;
         const int64_t cap_qpc = predicted_qpc -
             ticks(ReadyGapMedianUs() + cap.lead_us - cap.interval_us + slack_us);
         if (cap_qpc < estimate.floor_qpc) {
-            estimate.floor_qpc = cap_qpc;
-            estimate.cap_bound = true;
+            const int64_t gap_ticks = estimate.floor_qpc - cap_qpc;
+            estimate.cap_gap_us = MicrosecondsBetween(cap_qpc, estimate.floor_qpc);
+            const auto applied_ticks = static_cast<int64_t>(
+                std::llround(static_cast<double>(cap_bound_.blend) * static_cast<double>(gap_ticks)));
+            if (applied_ticks > 0) {
+                estimate.floor_qpc -= applied_ticks;
+                estimate.cap_bound = true;
+            }
         }
     }
     estimate.anchor = anchor;
@@ -716,6 +725,7 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
     slot.gpu_resume_probe = frame.gpu_resume_probe;
     slot.render_queue = frame.render_queue;
     slot.gpu_floor_release = frame.gpu_floor_release;
+    slot.gpu_target = frame.gpu_target;
     SetField(&slot, FieldSource, frame.source_release_qpc);
     RecordReleaseToRender(&slot);
     if (slot.sampled && IsGpuRung(slot.rung)) {
@@ -898,7 +908,7 @@ void LeadController::OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, 
         gpu_after_present_window_.Reset();
         recent_period_head_ = 0;
         recent_period_count_ = 0;
-        cap_held_frames_ = 0;
+        cap_bound_ = CapBoundWindow{};
     }
     if (frame_id <= gpu_end_frame_) return;
     const PendingFrame* frame = FindNvApiFrame(producer_epoch, frame_id);
@@ -921,7 +931,7 @@ void LeadController::OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, 
     }
     if (gpu_set && IsPositiveFinite(present_to_gpu_end_us)) gpu_after_present_window_.Add(present_to_gpu_end_us);
     if (gpu_set) RecordReadyGap(*frame, gpu_end_qpc);
-    if (admitted) NoteCapHeld(*frame);
+    if (admitted) NoteCapBoundEvidence(*frame);
     gpu_end_frame_ = frame_id;
     gpu_end_qpc_ = gpu_end_qpc;
     gpu_end_gpu_set_ = gpu_set;
@@ -1022,15 +1032,67 @@ double LeadController::ReadyGapMedianUs() const noexcept
     return ready_gap_count_ > 0 ? LowerMedian(ready_gaps_us_, ready_gap_count_) : 0.0;
 }
 
-// A reported frame the cap held (lead_controller.h): its GPU waited at its
-// Signal (a probe at or before it, else readiness before it) and the GPU
-// floor did not release it. Taken at the report, by when the frame's probe
-// has normally been read back.
-void LeadController::NoteCapHeld(const PendingFrame& frame) noexcept
+// A reported held frame's cap bound evidence (lead_controller.h): a GPU-rung
+// frame held at its Signal whose wait is known (a probe, else readiness),
+// set when its GPU waited at that Signal and its plan did not move its
+// target, whoever released it. Taken once, at the report (OnGpuRenderEnd
+// takes each frame once), by when the probe has normally been read back;
+// the bit does not change afterwards.
+void LeadController::NoteCapBoundEvidence(const PendingFrame& frame) noexcept
 {
-    if (frame.started && !frame.gpu_floor_release && PreviousGpuHeld(frame) && cap_held_frames_ < UINT32_MAX) {
-        ++cap_held_frames_;
+    if (!frame.started || !IsGpuRung(frame.rung) || !HasField(frame, FieldOutputRelease) ||
+        !IsHeldStatus(frame.output_status)) {
+        return;
     }
+    const bool probed = HasField(frame, FieldGpuResume) && frame.gpu_wait_qpc != 0;
+    if (!probed && !HasField(frame, FieldGpuReady)) return;
+    const bool waited = PreviousGpuHeld(frame) && !frame.gpu_target;
+    CapBoundWindow& window = cap_bound_;
+    // Shift in the newest entry; bit 63 of the second word is the entry
+    // LEAD_CAP_BOUND_FRAMES places back, 0 until the window is full.
+    const auto dropped = static_cast<uint32_t>(window.bits[1] >> 63);
+    window.bits[1] = (window.bits[1] << 1) | (window.bits[0] >> 63);
+    window.bits[0] = (window.bits[0] << 1) | (waited ? 1u : 0u);
+    window.waited = window.waited - dropped + (waited ? 1u : 0u);
+    if (window.frames < LEAD_CAP_BOUND_FRAMES) ++window.frames;
+    const CapBoundMode before = window.mode;
+    if (window.waited >= LEAD_WARM_SAMPLES) {
+        // From Cold without a restart no floor applied: the frames were at
+        // the cap's release, so the bound applies at once.
+        if (before == CapBoundMode::Cold && !CadenceRestartSeen(frame.key.producer_epoch)) window.blend = 1.0f;
+        window.mode = CapBoundMode::Bounded;
+    } else if (window.frames == LEAD_CAP_BOUND_FRAMES && window.waited == 0) {
+        window.mode = CapBoundMode::Depth;
+    }
+    if (before != CapBoundMode::Cold && window.mode != before) ++window.switches;
+}
+
+CapBoundStatus LeadController::CapBound() const noexcept
+{
+    CapBoundStatus status{};
+    status.mode = cap_bound_.mode;
+    status.waited = cap_bound_.waited;
+    status.frames = cap_bound_.frames;
+    status.blend = static_cast<double>(cap_bound_.blend);
+    status.switches = cap_bound_.switches;
+    return status;
+}
+
+// The blend's step (lead_controller.h): toward the mode by at most the
+// lead's slew of the gap; a gap within one step, or unknown, moves it there.
+void LeadController::AdvanceCapBound(double gap_us, double interval_us) noexcept
+{
+    const float target = cap_bound_.mode == CapBoundMode::Bounded ? 1.0f : 0.0f;
+    if (cap_bound_.blend == target) return;
+    const double step_us = std::min(LEAD_SLEW_MAX_US, interval_us / kIntervalSlewDivisor);
+    if (!std::isfinite(gap_us) || !(step_us > 0.0) || !(gap_us > step_us)) {
+        cap_bound_.blend = target;
+        return;
+    }
+    const double blend = static_cast<double>(cap_bound_.blend);
+    const double step = step_us / gap_us;
+    cap_bound_.blend = static_cast<float>(target > cap_bound_.blend ? std::min(1.0, blend + step)
+                                                                    : std::max(0.0, blend - step));
 }
 
 // σ: release → RENDERSUBMIT_START of a frame not held, once both are known.

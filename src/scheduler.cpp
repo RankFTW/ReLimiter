@@ -534,19 +534,28 @@ std::atomic<uint32_t> s_handoff_hook_stream{0};
 std::atomic<uint32_t> s_handoff_hook_stalls{0};
 // GPU-paced rhythm diagnostics (developer A/B gpu_paced_cadence): held frames
 // whose GPU floor was known, by the anchor that set it, those whose floor the
-// cap bound set, those whose floor was not eligible yet (fewer than 32 frames
-// the cap held and no cadence restart), and how many frames ahead of the
-// readiness anchor the floor extrapolated (index capped at the horizon); the
-// totals at the newest periodic log line (with the grid's GPU-paced late
-// outputs) and its time.
+// cap bound moved, those whose floor did not apply (cap bound Cold without a
+// cadence restart, or bounded without readiness gaps or the cap's lead), by
+// the cap bound's mode (index CapBoundMode) with those whose blend was
+// between its ends and the sum of their gaps Δ in µs, and how many frames
+// ahead of the readiness anchor the floor extrapolated (index capped at the
+// horizon); the totals at the newest periodic log line (with the grid's
+// GPU-paced late outputs) and its time, and the cap bound's mode last logged.
 uint64_t s_floor_anchor_frames[4] = {};
 uint64_t s_floor_cap_bound_frames = 0;
 uint64_t s_floor_ineligible_frames = 0;
+uint64_t s_floor_mode_frames[3] = {};
+uint64_t s_floor_blending_frames = 0;
+double s_floor_gap_sum_us = 0.0;
 uint64_t s_ready_ahead_frames[LEAD_HANDOFF_GPU_HORIZON_FRAMES + 1] = {};
 uint64_t s_rhythm_logged_steps[static_cast<size_t>(GpuPacedRhythmStep::Count)] = {};
 uint64_t s_rhythm_logged_anchors[4] = {};
 uint64_t s_rhythm_logged_cap_bound = 0;
 uint64_t s_rhythm_logged_ineligible = 0;
+uint64_t s_rhythm_logged_modes[3] = {};
+uint64_t s_rhythm_logged_blending = 0;
+double s_rhythm_logged_gap_sum_us = 0.0;
+CapBoundMode s_cap_bound_mode_logged = CapBoundMode::Cold;
 uint64_t s_rhythm_logged_ahead[LEAD_HANDOFF_GPU_HORIZON_FRAMES + 1] = {};
 uint64_t s_rhythm_logged_late_outputs = 0;
 int64_t s_rhythm_log_qpc = 0;
@@ -1497,6 +1506,19 @@ static GpuFloorEstimate HeldGpuFloor(const PacingPlanKey& key, double interval_u
     return GpuFloor(key, cap);
 }
 
+static const char* CapBoundModeName(CapBoundMode mode) noexcept
+{
+    switch (mode) {
+    case CapBoundMode::Cold:
+        return "cold";
+    case CapBoundMode::Depth:
+        return "at own depth";
+    case CapBoundMode::Bounded:
+        return "bounded";
+    }
+    return "?";
+}
+
 // GPU-paced rhythm diagnostics: one INFO line every 5 s while the developer
 // A/B gpu_paced_cadence is on and the rhythm paced frames, or held frames had
 // a GPU floor, since the last one.
@@ -1537,6 +1559,15 @@ static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
     s_rhythm_logged_cap_bound = s_floor_cap_bound_frames;
     const uint64_t ineligible = s_floor_ineligible_frames - s_rhythm_logged_ineligible;
     s_rhythm_logged_ineligible = s_floor_ineligible_frames;
+    uint64_t modes[3] = {};
+    for (size_t mode = 0; mode < 3; ++mode) {
+        modes[mode] = s_floor_mode_frames[mode] - s_rhythm_logged_modes[mode];
+        s_rhythm_logged_modes[mode] = s_floor_mode_frames[mode];
+    }
+    const uint64_t blending = s_floor_blending_frames - s_rhythm_logged_blending;
+    s_rhythm_logged_blending = s_floor_blending_frames;
+    const double gap_sum_us = s_floor_gap_sum_us - s_rhythm_logged_gap_sum_us;
+    s_rhythm_logged_gap_sum_us = s_floor_gap_sum_us;
     if (paced == 0 && floors == 0 && ineligible == 0) return;
     // Median and largest frames-ahead of the readiness anchor.
     size_t median_ahead = 0;
@@ -1553,10 +1584,12 @@ static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
         }
     }
     const LeadController& lead = s_source_stage.Lead();
+    const CapBoundStatus cap = lead.CapBound();
     LOG_INFO("GPU-paced rhythm: %llu frames (smooth %llu, late %llu, early bound %llu, start %llu); floors %llu "
-             "(readiness %llu, report %llu, PRESENT_END %llu; cap-bounded %llu), not eligible %llu; "
-             "readiness anchor gaps %u, cap-held frames %u; frames ahead p50 %zu max %zu; period %.2f ms "
-             "(median %.2f); late outputs followed %llu",
+             "(readiness %llu, report %llu, PRESENT_END %llu; cap-bounded %llu), not eligible %llu; cap bound %s "
+             "(waited at the Signal %u of %u, blend %.2f, %llu switches; floors at own depth %llu, bounded %llu, "
+             "blending %llu, mean gap %.2f ms); readiness anchor gaps %u; frames ahead p50 %zu max %zu; "
+             "period %.2f ms (median %.2f); late outputs followed %llu",
         static_cast<unsigned long long>(paced),
         static_cast<unsigned long long>(steps[static_cast<size_t>(GpuPacedRhythmStep::Smooth)]),
         static_cast<unsigned long long>(steps[static_cast<size_t>(GpuPacedRhythmStep::Late)]),
@@ -1568,9 +1601,36 @@ static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
         static_cast<unsigned long long>(anchors[static_cast<size_t>(GpuFloorAnchor::PresentEnd)]),
         static_cast<unsigned long long>(cap_bound),
         static_cast<unsigned long long>(ineligible),
-        lead.ReadyGapCount(), lead.CapHeldFrames(), median_ahead, max_ahead,
+        CapBoundModeName(cap.mode), cap.waited, cap.frames, cap.blend,
+        static_cast<unsigned long long>(cap.switches),
+        static_cast<unsigned long long>(modes[static_cast<size_t>(CapBoundMode::Cold)] +
+            modes[static_cast<size_t>(CapBoundMode::Depth)]),
+        static_cast<unsigned long long>(modes[static_cast<size_t>(CapBoundMode::Bounded)]),
+        static_cast<unsigned long long>(blending),
+        floors > 0 ? gap_sum_us / static_cast<double>(floors) / 1000.0 : 0.0,
+        lead.ReadyGapCount(), median_ahead, max_ahead,
         lead.RecentGpuPeriodUs() / 1000.0, lead.GpuPeriodUs() / 1000.0,
         static_cast<unsigned long long>(late_outputs));
+}
+
+// The held floor's cap bound changed mode (developer A/B gpu_paced_cadence,
+// lead_controller.h): one INFO line per change between the cap bound and the
+// floor's own depth; a reset back to Cold is not logged.
+static void LogCapBoundMode(uint64_t frame_id) noexcept
+{
+    const CapBoundStatus cap = s_source_stage.Lead().CapBound();
+    if (cap.mode == s_cap_bound_mode_logged) return;
+    s_cap_bound_mode_logged = cap.mode;
+    if (cap.mode == CapBoundMode::Cold) return;
+    if (cap.mode == CapBoundMode::Bounded) {
+        LOG_INFO("GPU-paced cadence: held GPU floor bounded by the cap's release from frame %llu (the GPU waited at "
+                 "an unmoved Signal on %u of the newest %u reported held frames)",
+            static_cast<unsigned long long>(frame_id), cap.waited, cap.frames);
+    } else {
+        LOG_INFO("GPU-paced cadence: held GPU floor at its own depth from frame %llu (the GPU waited at an unmoved "
+                 "Signal on none of the newest %u reported held frames)",
+            static_cast<unsigned long long>(frame_id), cap.frames);
+    }
 }
 
 // A_n = max(w_{n−1} + d, G_n): the newest released frame's render handoff
@@ -1730,7 +1790,13 @@ static SourceStageFrame RunPlanned(
         if (floor.ineligible) ++s_floor_ineligible_frames;
         if (floor.cap_bound) ++s_floor_cap_bound_frames;
         if (floor.floor_qpc > 0) {
+            // The cap bound's blend steps once this plan is published.
+            request.cap_gap_us = floor.cap_gap_us;
             ++s_floor_anchor_frames[static_cast<size_t>(floor.anchor)];
+            ++s_floor_mode_frames[static_cast<size_t>(floor.cap_mode)];
+            const double blend = s_source_stage.Lead().CapBound().blend;
+            if (blend > 0.0 && blend < 1.0) ++s_floor_blending_frames;
+            s_floor_gap_sum_us += floor.cap_gap_us;
             if (floor.anchor == GpuFloorAnchor::Ready) {
                 ++s_ready_ahead_frames[(std::min)(static_cast<size_t>(floor.frames_ahead),
                     static_cast<size_t>(LEAD_HANDOFF_GPU_HORIZON_FRAMES))];
@@ -1762,6 +1828,7 @@ static SourceStageFrame RunPlanned(
     }
     PublishRenderHandoff(key, frame, handoff_limit, held_floor);
     if (config.gpu_paced_cadence && frame.planned) {
+        LogCapBoundMode(key.frame_id);
         LogGpuPacedRhythm(frame.release_qpc);
     }
     if (s_source_stage.StallInjector().TakeEnabledNotice()) {
