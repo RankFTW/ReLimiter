@@ -253,12 +253,20 @@ static void DrawPacingPipelineStatus() {
             status.rhythm_smooth, status.rhythm_late, status.rhythm_early_bound, status.rhythm_start,
             status.floor_from_ready, status.floor_frames);
     }
-    if (has_status && status.valid)
+    if (has_status && status.valid) {
         ImGui::TextDisabled("Lead: %.2f ms (%s, %u samples%s) | Grid epoch: %u",
             status.lead_us / 1000.0, status.lead_warm ? "warm" : "warming",
             status.lead_samples, status.lead_budget_limited ? ", at budget" : "", status.grid_epoch);
-    else
+        // Lead spike floor (lead_controller.h): shown where it applies.
+        if (status.lead_floor_us > 0.0) {
+            ImGui::TextDisabled("Lead spike floor: %.2f ms = arrival tail %.2f + GPU %.2f | own quantile %.2f ms%s",
+                status.lead_floor_us / 1000.0, status.lead_floor_tail_us / 1000.0,
+                status.lead_floor_gpu_us / 1000.0, status.lead_quantile_us / 1000.0,
+                status.lead_floor_limited ? " | sets the lead" : "");
+        }
+    } else {
         ImGui::TextDisabled("Lead: - | Grid epoch: -");
+    }
     const bool gpu_rung = pipeline.rung == PacingRung::GpuQueueWait || pipeline.rung == PacingRung::FgInputWait;
     if (has_status && status.valid && pipeline.rung == PacingRung::GpuQueueWait) {
         // Collision-aware release: the release headroom (to the next frame's
@@ -648,18 +656,16 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "interval follows only late frames and the game's workload reports. Compare one setting per capture, in "
         "the same scene.");
 
-    if (ImGui::Checkbox("Gated hold GPU idle", &g_config.gated_hold_gpu_idle)) {
+    if (ImGui::Checkbox("Lead spike floor", &g_config.lead_spike_floor)) {
         Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: gated hold GPU idle -> %s", g_config.gated_hold_gpu_idle ? "on" : "off");
+        LOG_INFO("OSD: lead spike floor -> %s", g_config.lead_spike_floor ? "on" : "off");
         *config_dirty = true;
     }
-    HelpTip("Diagnostic A/B, GPU queue wait and FG input wait, with Adaptive cap. Off (default), ReLimiter's waits "
-        "for later frames during a frame's render submission are credited in full when judging whether the frame "
-        "was late, as for games that finish a frame only after the next release. On, a frame whose GPU finished "
-        "after its Present call counts as late for Adaptive cap unless the GPU waited for the frame's own work. "
-        "On counted more late frames in GPU-heavy scenes and lengthened the interval about 3% without the "
-        "GPU-paced cadence, with no measurable pacing difference in Gears of War: E-Day. Compare one setting per "
-        "capture, in the same scene.");
+    HelpTip("Diagnostic A/B, GPU waits with Output override on Auto. On (default), while the game's next frame "
+        "waits behind the GPU wait, the lead also covers the game's rare long simulation frames, so a slow frame "
+        "on the CPU does not leave the GPU waiting. In CONTROL Resonant at a cap the GPU could only just hold "
+        "this costs a few ms of latency in heavy scenes; light scenes keep their lead. Off, the lead covers only "
+        "the usual frame. Compare one setting per capture, in the same scene.");
 
     static const char* const kSourcePlacementLabels[] = {"Marker", "Pre-Sleep", "Reflex driver limiter"};
     static_assert(IM_ARRAYSIZE(kSourcePlacementLabels) ==

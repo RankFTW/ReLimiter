@@ -57,6 +57,29 @@ live, long frames rose from 1.8 to 11.2 per 1,000 because the submission slowed
 while the simulation overlapped it. Treat a replay as a screen that can
 reject a floor, never as evidence that one is safe.
 
+--replay-spike-floor[=RANK] (default 4; write the value after "=" and put the
+capture paths first) replays the lead spike floor per segment: for a GPU wait
+frame whose next GPU work runs behind the wait, L' = max(L, L_spike) with
+L_spike = Q_tail(a) + Gamma. a is the CPU arrival: the release -> the first
+GPU work reaching the driver (driver_start) less the time the finished
+simulation waited for the render thread (q = max(0, min(w, b(n-1)) -
+max(s, e)), w = RENDERSUBMIT_START clamped to [s, p]); kept when the first
+work streamed (before the middle of [w, RENDERSUBMIT_END]), 0 <= a <= 3 I and
+the frame was not Signal-pinned (e < gate_signal_after(n-1) <= w). Gamma is
+the median of the newest 32 values of r - g (ready_gpu_qpc - GPU start,
+0 < r - g <= 3 I); Q_tail is the RANK-th largest of the maxima of the newest
+32 closed blocks of 64 kept arrivals (at least 4 blocks, and RANK). Both come
+from the frames before the one evaluated. The stall model is
+max(0, a - (lead - I + G)) with G the median of g - f over frames whose first
+work waited for the gate (f = max(r, Signal) of n - 1), I the median
+interval_us of the segment. Each segment reports L' p5/p50/p95, the share of
+frames where L_spike > L, the median L' - L and stalls per minute above I/4
+and above 3 ms for the model at L and replayed at L', over the segment after
+its first 32 s. --predict (needs --replay-spike-floor) sets L' = L_spike for
+archives whose captured lead exceeds the floor. The replay keeps the render
+thread's timing as captured (a is not changed by the floor) and can only
+reject a floor, never approve one.
+
 Quantiles are lower-index, sorted[floor(p * (n - 1))]. Offline evidence only.
 """
 
@@ -67,7 +90,7 @@ import csv
 import json
 import statistics
 from bisect import bisect_right
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -97,6 +120,15 @@ RENDER_THREAD_IDLE_MS = 0.3  # the render thread started frame n less than this 
 GPU_IDLE_MS = 1.0            # the GPU waited for the frame beyond this (LEAD_HANDOFF_GPU_IDLE_US)
 STREAM_PROOF = 32            # pairs with the first work in the first half of the window (LEAD_HANDOFF_STREAM_PROOF)
 GAP_SECONDS = 1.0          # display intervals and durations never bridge a gap longer than this
+SPIKE_BLOCK = 64           # kept arrivals per block of the spike floor's tail estimator
+SPIKE_BLOCKS = 32          # newest closed blocks it keeps
+SPIKE_MIN_BLOCKS = 4       # closed blocks it needs before it gives a floor
+SPIKE_GAMMA_SAMPLES = 32   # newest r - g values of Gamma, and the least it needs
+SPIKE_WARM_S = 32.0        # not evaluated: the first seconds of a segment
+SPIKE_RANGE_INTERVALS = 3.0  # arrivals and r - g beyond this many intervals are not samples
+STALL_ABSOLUTE_MS = 3.0
+SPIKE_CAVEAT = ("the replay keeps the render thread's timing as captured (the arrival is not changed by the "
+                "floor) and can only reject a floor, never approve one")
 
 
 def _float(row: dict[str, str], name: str) -> float | None:
@@ -123,6 +155,10 @@ class Frame:
     m: dict[str, float]
     waits: dict[str, float] = field(default_factory=dict)  # ms: async_marker_wait
     async_type: int | None = None                          # marker type of the longest async marker call
+    lead_ms: float = 0.0                                   # plan_lead_us
+    present_call: float | None = None                      # p_qpc: the game's Present call (ms)
+    ready: float | None = None                             # ready_gpu_qpc: GPU readiness (ms)
+    signal: float | None = None                            # gate_signal_after_qpc: the gate's Signal (ms)
 
 
 @dataclass
@@ -175,10 +211,14 @@ def load(path: Path, events_path: Path | None = None) -> Capture:
             if value is not None and value >= 0:
                 waits["async_marker_wait"] = value / 1000.0
             async_type = _float(row, "async_marker_wait_type") if "async_marker_wait" in waits else None
+            call, ready, signal = (_float(row, n) for n in ("p_qpc", "ready_gpu_qpc", "gate_signal_after_qpc"))
             frames.append(Frame(int(fid), int(rung), s / per_ms, target / per_ms - lead / 1000.0, target / per_ms,
                                 (_float(row, "interval_us") or 0.0) / 1000.0,
                                 None if display is None or display <= 0 else display / per_ms, pcl_ms, markers,
-                                waits, None if async_type is None else int(async_type)))
+                                waits, None if async_type is None else int(async_type), lead / 1000.0,
+                                call / per_ms if call and call > 0 else None,
+                                ready / per_ms if ready and ready > 0 else None,
+                                signal / per_ms if signal and signal > 0 else None))
     unique: dict[int, Frame] = {}
     for frame in frames:
         unique.setdefault(frame.frame_id, frame)  # FG outputs repeat a real frame's row
@@ -493,9 +533,140 @@ def replay(capture: Capture, segmenter: Segmenter, segment: str, anchor: str, of
     }
 
 
+def _gate_pass(prev: Frame) -> float | None:
+    """f: when the GPU passed the previous frame's gate, max(ready, Signal) of n - 1."""
+    values = [v for v in (prev.ready, prev.signal) if v is not None]
+    return max(values) if values else None
+
+
+def _spike_sample(f: Frame, prev: Frame | None, interval_ms: float) -> tuple[float | None, str | None, float | None, float | None]:
+    """(arrival a, why a is not kept, r - g, g - f) of frame n, in ms.
+
+    a = (driver_start - s) - q with q = max(0, min(w, b(n-1)) - max(s, e)) (LeadController::QueueUs; w is
+    RENDERSUBMIT_START clamped to [s, p]): the time from the release to the first work reaching the driver
+    less the time the finished simulation waited for the render thread. Kept only when the first work
+    streamed (driver_start before the middle of [w, RENDERSUBMIT_END]), 0 <= a <= 3 I, and the frame was
+    not Signal-pinned (e < o(n-1) <= w: the render thread waited for the Signal, not for work).
+    g - f only over frames whose first work waited for the gate (driver_start < f)."""
+    m = f.m
+    limit = SPIKE_RANGE_INTERVALS * interval_ms
+    gamma = None
+    if f.ready is not None and "gpu_start" in m and 0 < f.ready - m["gpu_start"] <= limit:
+        gamma = f.ready - m["gpu_start"]
+    if prev is None or "driver_start" not in m:
+        return None, "no_arrival", gamma, None
+    driver = m["driver_start"]
+    passed = _gate_pass(prev)
+    gap = m["gpu_start"] - passed if passed is not None and "gpu_start" in m and driver < passed else None
+    call = f.present_call if f.present_call is not None else m["present_start"]
+    w = min(max(m["rs_start"], f.s), call)
+    arrival = (driver - f.s) - max(0.0, min(w, prev.m["present_end"]) - max(f.s, m["sim_end"]))
+    if driver >= (w + m["rs_end"]) / 2.0:
+        return None, "not_streamed", gamma, gap
+    if prev.signal is not None and m["sim_end"] < prev.signal <= w:
+        return None, "signal_pinned", gamma, gap
+    if not 0.0 <= arrival <= limit:
+        return None, "arrival_out_of_range", gamma, gap
+    return arrival, None, gamma, gap
+
+
+def _percentiles(values: list[float]) -> dict[str, float | None]:
+    ordered = sorted(values)
+    return {"p5": lower_quantile(ordered, 0.05), "p50": lower_quantile(ordered, 0.5),
+            "p95": lower_quantile(ordered, 0.95)}
+
+
+def spike_floor(capture: Capture, segmenter: Segmenter, segment: str, rank: int,
+                predict: bool = False) -> dict[str, Any]:
+    """Reject-only replay of the lead spike floor on the segment's real frames, in the capture's order.
+
+    Per frame: L_spike = Q_tail + Gamma from the frames before it (the floor cannot know the arrival it
+    is applied to). Q_tail is the rank-th largest of the maxima of the newest SPIKE_BLOCKS closed blocks of
+    SPIKE_BLOCK kept arrivals (at least SPIKE_MIN_BLOCKS and rank blocks); Gamma is the median of the
+    newest SPIKE_GAMMA_SAMPLES values of r - g (GPU start -> readiness, 0 < r - g <= 3 I). Without both
+    there is no floor and the frame is not evaluated. L' = max(L, L_spike), or L_spike alone with predict.
+    stall = max(0, a - (lead - I + G)) with G the median g - f over the segment's frames whose first work
+    waited for the gate. The arrival a is as captured: the replay keeps the render thread's timing and can
+    only reject. The first SPIKE_WARM_S of the segment feed the estimators but are not evaluated."""
+    frames = capture.frames
+    stream = []
+    for i, f in enumerate(frames):
+        if segmenter.at(f.s) == segment:
+            stream.append((f, frames[i - 1] if i and f.frame_id - frames[i - 1].frame_id == 1 else None))
+    if not stream:
+        return {"frames": 0}
+    interval = lower_quantile(sorted(f.interval_ms for f, _ in stream), 0.5)
+    result: dict[str, Any] = {"frames": len(stream), "interval_ms": interval, "evaluated": 0}
+    if not interval or interval <= 0:
+        return {**result, "reason": "no frame interval"}
+    samples = [_spike_sample(f, prev, interval) for f, prev in stream]
+    gaps = sorted(gap for _, _, _, gap in samples if gap is not None)
+    if not gaps:
+        return {**result, "reason": "no frame whose first work waited for the gate (G undefined)"}
+    g_median = lower_quantile(gaps, 0.5)
+    origin = stream[0][0].s
+    warm_end = origin + SPIKE_WARM_S * 1000.0
+    blocks: deque[float] = deque(maxlen=SPIKE_BLOCKS)
+    block: list[float] = []
+    gammas: deque[float] = deque(maxlen=SPIKE_GAMMA_SAMPLES)
+    excluded: Counter[str] = Counter()
+    kept = 0
+    tails, gamma_values, spikes, leads, replayed, model_stalls, replay_stalls = [], [], [], [], [], [], []
+    for (f, _), (arrival, why, gamma, _) in zip(stream, samples):
+        if arrival is not None and f.s >= warm_end and len(gammas) >= SPIKE_GAMMA_SAMPLES \
+                and len(blocks) >= max(SPIKE_MIN_BLOCKS, rank):
+            tail = sorted(blocks, reverse=True)[rank - 1]
+            gamma_median = lower_quantile(sorted(gammas), 0.5)
+            spike = tail + gamma_median
+            lead = spike if predict else max(f.lead_ms, spike)
+            tails.append(tail)
+            gamma_values.append(gamma_median)
+            spikes.append(spike)
+            leads.append(f.lead_ms)
+            replayed.append(lead)
+            model_stalls.append(max(0.0, arrival - (f.lead_ms - interval + g_median)))
+            replay_stalls.append(max(0.0, arrival - (lead - interval + g_median)))
+        if why is not None:
+            excluded[why] += 1
+        if arrival is not None:
+            kept += 1
+            block.append(arrival)
+            if len(block) == SPIKE_BLOCK:
+                blocks.append(max(block))
+                block = []
+        if gamma is not None:
+            gammas.append(gamma)
+    duration_ms = sum(b.s - a.s for (a, _), (b, _) in zip(stream, stream[1:])
+                      if a.s >= warm_end and 0 < b.s - a.s < GAP_SECONDS * 1000)
+    minutes = duration_ms / 60000.0
+    result.update({"gap_g_minus_f_ms": g_median, "gap_samples": len(gaps), "kept_arrivals": kept,
+                   "excluded": dict(excluded), "warmup_s": SPIKE_WARM_S, "closed_blocks": kept // SPIKE_BLOCK})
+    if not spikes:
+        return {**result, "reason": f"no evaluated frame: needs {SPIKE_GAMMA_SAMPLES} r - g values and "
+                                    f"{max(SPIKE_MIN_BLOCKS, rank)} closed blocks of {SPIKE_BLOCK} kept arrivals "
+                                    f"after {SPIKE_WARM_S:.0f} s"}
+    tolerance = interval / 4.0
+    counts = {"model_over_tol": sum(s > tolerance for s in model_stalls),
+              "replay_over_tol": sum(s > tolerance for s in replay_stalls),
+              "model_over_3ms": sum(s > STALL_ABSOLUTE_MS for s in model_stalls),
+              "replay_over_3ms": sum(s > STALL_ABSOLUTE_MS for s in replay_stalls)}
+    deltas = sorted(p - l for p, l in zip(replayed, leads))
+    result.update({
+        "evaluated": len(spikes), "minutes": minutes, "tolerance_ms": tolerance,
+        "L_ms": _percentiles(leads), "q_tail_ms": _percentiles(tails), "gamma_ms": _percentiles(gamma_values),
+        "L_spike_ms": _percentiles(spikes), "L_prime_ms": _percentiles(replayed),
+        "binding_share": sum(s > l for s, l in zip(spikes, leads)) / len(spikes),
+        "delta_L_p50_ms": lower_quantile(deltas, 0.5),
+        "stalls": counts,
+        "stalls_per_min": {k: v / minutes if minutes > 0 else None for k, v in counts.items()},
+    })
+    return result
+
+
 def analyze(path: Path, events_path: Path | None = None, settle_s: float = 2.0, quantile: float = 0.95,
             allowance_us: float = 500.0, replays: list[tuple[str, float]] | None = None,
-            replay_segment: str = "held", submit_saving_ms: float = 0.0) -> dict[str, Any]:
+            replay_segment: str = "held", submit_saving_ms: float = 0.0, spike_rank: int | None = None,
+            predict: bool = False) -> dict[str, Any]:
     capture = load(path, events_path)
     segmenter = Segmenter(capture, settle_s * 1000.0)
     origin = capture.frames[0].s if capture.frames else 0.0
@@ -509,6 +680,12 @@ def analyze(path: Path, events_path: Path | None = None, settle_s: float = 2.0, 
     }
     if replays:
         report["replays"] = [replay(capture, segmenter, replay_segment, a, o, submit_saving_ms) for a, o in replays]
+    if spike_rank is not None:
+        report["spike_floor"] = {
+            "rank": spike_rank, "predict": predict, "caveat": SPIKE_CAVEAT,
+            "segments": {seg: spike_floor(capture, segmenter, seg, spike_rank, predict)
+                         for seg in ("held", "not_held")},
+        }
     return report
 
 
@@ -590,7 +767,37 @@ def format_report(report: dict[str, Any]) -> str:
                      f"{100 * r['present_end_later_over_1ms_share']:.1f}%, > I/4 "
                      f"{100 * r['present_end_later_over_tolerance_share']:.2f}%, p99 {r['present_end_later_p99_ms']:.2f} ms "
                      f"({r['caveat']})")
+    if "spike_floor" in report:
+        lines.extend(_format_spike_floor(report["spike_floor"]))
     return "\n".join(lines)
+
+
+def _format_spike_floor(entry: dict[str, Any]) -> list[str]:
+    rule = "L' = L_spike" if entry["predict"] else "L' = max(L, L_spike)"
+    lines = [f"  spike floor replay (rank {entry['rank']}, {rule}; {entry['caveat']}):"]
+    for name, seg in entry["segments"].items():
+        if not seg.get("frames"):
+            lines.append(f"    [{name}] no frames")
+            continue
+        if not seg.get("evaluated"):
+            lines.append(f"    [{name}] {seg['frames']} real frames, not evaluated: {seg['reason']}")
+            continue
+        pct = lambda p: f"{_fmt(p['p5'])} / {_fmt(p['p50'])} / {_fmt(p['p95'])}"  # noqa: E731
+        rates, counts = seg["stalls_per_min"], seg["stalls"]
+        lines.append(f"    [{name}] {seg['frames']} real frames, {seg['evaluated']} evaluated over "
+                     f"{seg['minutes']:.2f} min after {seg['warmup_s']:.0f} s; I {_fmt(seg['interval_ms'])} ms, "
+                     f"G {_fmt(seg['gap_g_minus_f_ms'])} ms ({seg['gap_samples']} samples), kept arrivals "
+                     f"{seg['kept_arrivals']}, excluded {seg['excluded'] or 'none'}")
+        lines.append(f"      ms p5 / p50 / p95: L {pct(seg['L_ms'])}; Q_tail {pct(seg['q_tail_ms'])}; "
+                     f"Gamma {pct(seg['gamma_ms'])}; L_spike {pct(seg['L_spike_ms'])}; L' {pct(seg['L_prime_ms'])}")
+        lines.append(f"      L_spike > L on {100 * seg['binding_share']:.1f}%, L' - L p50 "
+                     f"{_fmt(seg['delta_L_p50_ms'])} ms")
+        lines.append(f"      stalls per min (count) > I/4 = {_fmt(seg['tolerance_ms'])} ms: model@L "
+                     f"{_fmt(rates['model_over_tol'], 1)} ({counts['model_over_tol']}), replayed "
+                     f"{_fmt(rates['replay_over_tol'], 1)} ({counts['replay_over_tol']}); > 3 ms: model@L "
+                     f"{_fmt(rates['model_over_3ms'], 1)} ({counts['model_over_3ms']}), replayed "
+                     f"{_fmt(rates['replay_over_3ms'], 1)} ({counts['replay_over_3ms']})")
+    return lines
 
 
 def main() -> int:
@@ -606,12 +813,25 @@ def main() -> int:
     parser.add_argument("--replay-segment", choices=("held", "not_held"), default="held")
     parser.add_argument("--replay-submit-saving-ms", type=float, default=0.0,
                         help="assume each replayed submission this much shorter (optimistic bound)")
+    parser.add_argument("--replay-spike-floor", nargs="?", const=4, type=int, metavar="RANK", dest="spike_rank",
+                        help="replay the lead spike floor L' = max(L, Q_tail + Gamma) per segment, Q_tail the "
+                             "RANK-th largest block maximum of the arrivals (default 4; write --replay-spike-floor="
+                             "RANK, capture paths first). The replay keeps the render thread's timing as captured "
+                             "and can only reject a floor, never approve one")
+    parser.add_argument("--predict", action="store_true",
+                        help="with --replay-spike-floor: L' = L_spike alone (archives whose captured lead exceeds "
+                             "the floor); same reject-only caveat")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     if args.events and len(args.captures) > 1:
         parser.error("--events needs a single capture")
+    if args.predict and args.spike_rank is None:
+        parser.error("--predict needs --replay-spike-floor")
+    if args.spike_rank is not None and not 1 <= args.spike_rank <= SPIKE_BLOCKS:
+        parser.error(f"--replay-spike-floor RANK must be 1..{SPIKE_BLOCKS}")
     reports = [analyze(path, args.events, args.settle_seconds, args.quantile, args.allowance_us,
-                       args.replay_floor, args.replay_segment, args.replay_submit_saving_ms)
+                       args.replay_floor, args.replay_segment, args.replay_submit_saving_ms, args.spike_rank,
+                       args.predict)
                for path in args.captures]
     print(json.dumps(reports, indent=2) if args.json else "\n\n".join(format_report(r) for r in reports))
     return 0

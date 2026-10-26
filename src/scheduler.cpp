@@ -211,6 +211,11 @@ std::atomic<uint8_t> s_status_epoch_reason{0};
 std::atomic<uint64_t> s_status_stage_events_dropped{0};
 std::atomic<uint32_t> s_status_stalls_injected{0};
 std::atomic<bool> s_status_lead_budget_limited{false};
+std::atomic<double> s_status_lead_quantile_us{0.0};
+std::atomic<double> s_status_lead_floor_us{0.0};
+std::atomic<double> s_status_lead_floor_tail_us{0.0};
+std::atomic<double> s_status_lead_floor_gpu_us{0.0};
+std::atomic<bool> s_status_lead_floor_limited{false};
 std::atomic<bool> s_status_hold_overloaded{false};
 std::atomic<double> s_status_release_margin_us{0.0};
 std::atomic<double> s_status_release_headroom_us{0.0};
@@ -274,6 +279,11 @@ static void PublishPacingStatus(const SchedulerPacingStatus& status) noexcept
     s_status_stage_events_dropped.store(status.stage_events_dropped, std::memory_order_relaxed);
     s_status_stalls_injected.store(status.stalls_injected, std::memory_order_relaxed);
     s_status_lead_budget_limited.store(status.lead_budget_limited, std::memory_order_relaxed);
+    s_status_lead_quantile_us.store(status.lead_quantile_us, std::memory_order_relaxed);
+    s_status_lead_floor_us.store(status.lead_floor_us, std::memory_order_relaxed);
+    s_status_lead_floor_tail_us.store(status.lead_floor_tail_us, std::memory_order_relaxed);
+    s_status_lead_floor_gpu_us.store(status.lead_floor_gpu_us, std::memory_order_relaxed);
+    s_status_lead_floor_limited.store(status.lead_floor_limited, std::memory_order_relaxed);
     s_status_hold_overloaded.store(status.hold_overloaded, std::memory_order_relaxed);
     s_status_release_margin_us.store(status.release_margin_us, std::memory_order_relaxed);
     s_status_release_headroom_us.store(status.release_headroom_us, std::memory_order_relaxed);
@@ -343,6 +353,11 @@ bool Scheduler_ReadPacingStatus(SchedulerPacingStatus* status) noexcept
         copy.stage_events_dropped = s_status_stage_events_dropped.load(std::memory_order_relaxed);
         copy.stalls_injected = s_status_stalls_injected.load(std::memory_order_relaxed);
         copy.lead_budget_limited = s_status_lead_budget_limited.load(std::memory_order_relaxed);
+        copy.lead_quantile_us = s_status_lead_quantile_us.load(std::memory_order_relaxed);
+        copy.lead_floor_us = s_status_lead_floor_us.load(std::memory_order_relaxed);
+        copy.lead_floor_tail_us = s_status_lead_floor_tail_us.load(std::memory_order_relaxed);
+        copy.lead_floor_gpu_us = s_status_lead_floor_gpu_us.load(std::memory_order_relaxed);
+        copy.lead_floor_limited = s_status_lead_floor_limited.load(std::memory_order_relaxed);
         copy.hold_overloaded = s_status_hold_overloaded.load(std::memory_order_relaxed);
         copy.release_margin_us = s_status_release_margin_us.load(std::memory_order_relaxed);
         copy.release_headroom_us = s_status_release_headroom_us.load(std::memory_order_relaxed);
@@ -1137,6 +1152,7 @@ static GovernorDecision UpdatePeriodGovernor(
             report.work_us = sample.gpu_execution_available ? sample.gpu_service_us : 0.0;
             report.start_qpc = sample.gpu_start_qpc;
             report.first_work_streamed = sample.first_work_streamed;
+            report.first_submission_delay_us = sample.first_submission_delay_us;
             s_source_stage.OnGpuReport(sample.producer_epoch, sample.frame_id, report);
         }
         // Render handoff GPU floor (lead_controller.h):
@@ -1627,6 +1643,34 @@ static void PublishRenderHandoff(const PacingPlanKey& key, const SourceStageFram
     }
 }
 
+// Lead spike floor transitions (lead_controller.h), default log: "on" when the
+// floor first sets the newest plan's lead target, "off" once it has not for
+// LEAD_WINDOW_CAPACITY plans, so a floor near the own lead does not repeat.
+static bool s_lead_floor_logged = false;
+static size_t s_lead_floor_idle_plans = 0;
+
+static void NoteLeadSpikeFloor(const SourceStageFrame& frame, const LeadBucketStatus& bucket,
+    double allowance_us) noexcept
+{
+    if (!frame.planned) return;
+    const double own_us = bucket.quantile_us + allowance_us;
+    if (bucket.spike_floor_limited) {
+        s_lead_floor_idle_plans = 0;
+        if (s_lead_floor_logged) return;
+        s_lead_floor_logged = true;
+        const LeadController& lead = s_source_stage.Lead();
+        LOG_INFO("Lead spike floor: on at %.1f ms (arrival tail %.1f ms + GPU %.1f ms; own lead %.1f ms), %s FG %gx",
+            bucket.spike_floor_us / 1000.0, lead.SpikeTailUs() / 1000.0, lead.SpikeGpuUs() / 1000.0,
+            own_us / 1000.0, PacingRung_Text(frame.plan.rung), frame.plan.fg_divisor);
+        return;
+    }
+    if (!s_lead_floor_logged || ++s_lead_floor_idle_plans < LEAD_WINDOW_CAPACITY) return;
+    s_lead_floor_logged = false;
+    s_lead_floor_idle_plans = 0;
+    LOG_INFO("Lead spike floor: off (own lead %.1f ms, floor %.1f ms)", own_us / 1000.0,
+        bucket.spike_floor_us / 1000.0);
+}
+
 // Plans, publishes, waits, records. Exactly one source record.
 static SourceStageFrame RunPlanned(
     const PlannedFrameInput& input,
@@ -1654,7 +1698,9 @@ static SourceStageFrame RunPlanned(
     // keeps its earlier behavior.
     request.collision_guard = config.rung_override == PacingRungOverride::Auto;
     request.gpu_queue_wait_render_queue = config.gpu_queue_wait_render_queue;
-    request.gated_hold_gpu_idle = config.gated_hold_gpu_idle;
+    // Lead spike floor (lead_controller.h): Auto only, like the collision
+    // guard, so the GPU wait output override keeps its earlier behavior.
+    request.spike_floor = config.lead_spike_floor && config.rung_override == PacingRungOverride::Auto;
     // An ended pre-Sleep wait gates earlier frames of a lockstep engine like
     // the source wait (lead_controller.h).
     s_pre_sleep.EndedWait(&request.pre_wait_index, &request.pre_wait_start_qpc, &request.pre_wait_end_qpc);
@@ -1819,6 +1865,12 @@ static SourceStageFrame RunPlanned(
         s_source_stage.Lead().BucketStatus(frame.plan.rung, frame.plan.fg_divisor);
     status.lead_warm = bucket.warm;
     status.lead_samples = bucket.samples;
+    status.lead_quantile_us = bucket.quantile_us;
+    status.lead_floor_us = bucket.spike_floor_us;
+    status.lead_floor_tail_us = s_source_stage.Lead().SpikeTailUs();
+    status.lead_floor_gpu_us = s_source_stage.Lead().SpikeGpuUs();
+    status.lead_floor_limited = bucket.spike_floor_limited;
+    NoteLeadSpikeFloor(frame, bucket, pipeline.allowance_us);
     status.grid_epoch = frame.plan.grid_epoch;
     status.grid_index = frame.plan.grid_index;
     status.epoch_reason = static_cast<uint8_t>(frame.grid_epoch_reason);

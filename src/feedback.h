@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <atomic>
+#include <limits>
 
 // DrainCorrelator: every frame on the scheduler owner. Reflex latency-report
 // ingestion only (period governor demand, PacingReflexRecord, clock map);
@@ -64,6 +65,10 @@ struct ReflexFrameTimeSample {
 	// RENDERSUBMIT_START/END); false when any of them is missing. The lead
 	// sample behind the wait (lead_controller.h).
 	bool first_work_streamed = false;
+	// Its driverStartTime − renderSubmitStartTime in µs on the driver's clock
+	// when it streamed (the lead's spike floor, lead_controller.h); NaN
+	// otherwise.
+	double first_submission_delay_us = std::numeric_limits<double>::quiet_NaN();
 	// Render handoff report pair (lead_controller.h): this frame's and the
 	// previous frame's report times, in µs on the driver's clock from this
 	// frame's RENDERSUBMIT_START. Known only when both reports carry every

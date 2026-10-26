@@ -1912,120 +1912,6 @@ void TestLockstepGatedHold()
     CHECK(room->Statistics().room_samples == 0);
 }
 
-// A gated GPU wait frame ready after its Present call (lead_controller.h):
-// its slack credits the gated hold only up to the GPU's idle inside its span,
-// the FG input wait's own hold after readiness left out, so it waits for the
-// frame's report and release. Closed without a report, with the developer
-// A/B key off, or at a Present-call output point, the whole hold is
-// credited. A pending slack is fenced by an evidence restart and given up at
-// a reset.
-void TestGatedHoldGpuIdle()
-{
-    const PacingRung fg = PacingRung::FgInputWait;
-    // Frame 1 (s 10,000, T 30,000) calls Present at 22,000 unless given;
-    // frame 2's pre-Sleep wait [11,000, 15,000] gates it by 4,000. Released
-    // at its readiness when that comes after T, else at T.
-    const auto setup = [&](bool bound, double ready_us, double present_us = 22000.0) {
-        auto controller = MakeController();
-        LeadFrameStart first = Start(1, fg, 10000.0, kInterval, 2.0);
-        SetLead(&first, 20000.0);
-        first.gated_hold_gpu_idle = bound;
-        controller->OnSourceRelease(first);
-        LeadFrameStart second = Start(2, fg, 15000.0, kInterval, 2.0);
-        SetLead(&second, 20000.0);
-        second.gated_hold_gpu_idle = bound;
-        second.pre_wait_start_qpc = Qpc(11000.0);
-        second.pre_wait_end_qpc = Qpc(15000.0);
-        controller->OnSourceRelease(second);
-        controller->OnStageEvent(Event(1, Kind::PresentCall, present_us));
-        controller->OnStageEvent(Event(1, Kind::GpuReady, ready_us));
-        controller->OnStageEvent(Event(1, Kind::OutputRelease, std::max(ready_us, 30000.0)));
-        return controller;
-    };
-    const auto report = [&](LeadController* controller, double span_us) {
-        Report(controller, Key(1).producer_epoch, Key(1).frame_id, 15000.0, 0, span_us);
-    };
-
-    // Ready 3,000 after T, the GPU busy but 300 inside the span: late by
-    // 2,700 (23,000 − 300 against 20,000), counted once the report came.
-    auto busy = setup(true, 33000.0);
-    CHECK(busy->Statistics().slack_samples == 0);
-    CHECK(busy->Statistics().gated_hold_samples == 0);
-    report(busy.get(), 15300.0);
-    CHECK(busy->Statistics().slack_samples == 1);
-    CHECK(busy->Statistics().negative_slack_samples == 1);
-    CHECK_NEAR(busy->Statistics().last_slack_us, -2700.0);
-    CHECK_NEAR(busy->Statistics().last_gated_hold_us, 4000.0);
-    // The GPU idled 5,000 inside the span: the whole 4,000 is credited.
-    auto idle = setup(true, 33000.0);
-    report(idle.get(), 20000.0);
-    CHECK(idle->Statistics().negative_slack_samples == 0);
-    CHECK_NEAR(idle->Statistics().last_slack_us, 1000.0);
-    // Ready 2,000 before T and held to it: the hold is not idle.
-    auto held = setup(true, 28000.0);
-    report(held.get(), 17300.0);
-    CHECK_NEAR(held->Statistics().last_slack_us, 2300.0);
-
-    // Closed without its report: the whole hold, as for CPU holds.
-    auto closed = setup(true, 33000.0);
-    for (uint64_t index = 3; index <= 2 + LEAD_PENDING_EXPIRY_FRAMES; ++index) {
-        LeadFrameStart later = Start(index, fg, 10000.0 + static_cast<double>(index) * 5000.0, kInterval, 2.0);
-        SetLead(&later, 20000.0);
-        closed->OnSourceRelease(later);
-    }
-    CHECK(closed->Statistics().slack_samples == 1);
-    CHECK(closed->Statistics().negative_slack_samples == 0);
-    CHECK_NEAR(closed->Statistics().last_slack_us, 1000.0);
-    // The A/B key off: the whole hold at readiness.
-    auto off = setup(false, 33000.0);
-    CHECK(off->Statistics().slack_samples == 1);
-    CHECK_NEAR(off->Statistics().last_slack_us, 1000.0);
-    // The Present call is the output point (33,000 after readiness at
-    // 32,500): the hold may have delayed it, so the whole hold at readiness.
-    auto call = setup(true, 32500.0, 33000.0);
-    CHECK(call->Statistics().slack_samples == 1);
-    CHECK_NEAR(call->Statistics().last_slack_us, 1000.0);
-
-    // The GPU queue wait (its hold lies outside the span), the report before
-    // readiness: judged at once, bounded only with the key on and readiness
-    // after the Present call (frame 2's source wait [11,000, 15,000] gates
-    // frame 1 by 4,000; 300 idle).
-    const auto queue = [&](bool bound, double present_us) {
-        auto controller = MakeController();
-        LeadFrameStart first = Start(1, PacingRung::GpuQueueWait, 10000.0);
-        SetLead(&first, 20000.0);
-        first.gated_hold_gpu_idle = bound;
-        controller->OnSourceRelease(first);
-        LeadFrameStart second = Start(2, PacingRung::GpuQueueWait, 15000.0);
-        SetLead(&second, 20000.0);
-        second.gated_hold_gpu_idle = bound;
-        second.wait_start_qpc = Qpc(11000.0);
-        second.wait_end_qpc = Qpc(15000.0);
-        controller->OnSourceRelease(second);
-        controller->OnStageEvent(Event(1, Kind::PresentCall, present_us));
-        report(controller.get(), 15300.0);
-        controller->OnStageEvent(Event(1, Kind::GpuReady, 33000.0));
-        CHECK(controller->Statistics().slack_samples == 1);
-        return controller->Statistics().last_slack_us;
-    };
-    CHECK_NEAR(queue(true, 22000.0), -2700.0);
-    CHECK_NEAR(queue(false, 22000.0), 1000.0);
-    // Its Present call after readiness is the output point: 20,000 − (23,500 − 4,000).
-    CHECK_NEAR(queue(true, 33500.0), 500.0);
-
-    // An evidence restart fences a pending slack; a reset gives it up.
-    auto fenced = setup(true, 33000.0);
-    fenced->ClearSlackEvidence();
-    report(fenced.get(), 15300.0);
-    CHECK(fenced->Statistics().slack_samples == 0);
-    CHECK(fenced->Statistics().negative_slack_samples == 0);
-    auto reset = setup(true, 33000.0);
-    reset->ResetBuckets();
-    report(reset.get(), 15300.0);
-    CHECK(reset->Statistics().slack_samples == 0);
-    CHECK(reset->Statistics().gated_hold_samples == 0);
-}
-
 namespace
 {
     // The Reflex report of frame grid_index: its GPU active render time.
@@ -3632,6 +3518,207 @@ void TestFgHeldFirstWorkLeadFalls()
     CHECK(controller->Statistics().kept_wait_samples > 0);
 }
 
+namespace
+{
+    // Spike floor loop behind the FG input wait (FG 2×, I = 10,000; CONTROL
+    // Resonant's shape): frame n is released at s = T − L and simulates for
+    // sim µs; its render thread takes it when the simulation ends and the
+    // previous Present has returned, sends its first work F = 500 later and
+    // calls Present 5,000 after RENDERSUBMIT_START (PRESENT_END 100 later).
+    // The GPU starts at the first work or 2,000 (frame generation) after frame
+    // n − 1's gate, whichever is later, and is ready 7,000 after its start;
+    // the wait releases at max(r, T). A normal frame (sim 2,000) arrives
+    // after a = 2,500 and is ready 9,500 after its release: the own lead is
+    // Q95 + 500 = 10,010.
+    struct SpikeLoop {
+        std::unique_ptr<LeadController> controller = MakeController();
+        LeadRequest request = Request(PacingRung::FgInputWait, 500.0, kInterval, 2.0);
+        uint64_t n = 0;
+        double gate = 0.0;
+        double present_end = 0.0;
+        double lead = 0.0;
+        double largest_step = 0.0;
+        bool budget_limited = false;
+
+        // Returns whether the frame was ready by its target.
+        bool Frame(double sim_us, bool streamed = true)
+        {
+            ++n;
+            const double previous_lead = lead;
+            lead = controller->NextLeadUs(request, &budget_limited);
+            if (n > LEAD_WARM_SAMPLES + 2) largest_step = std::max(largest_step, std::fabs(lead - previous_lead));
+            const PacingRung fg = PacingRung::FgInputWait;
+            const double target = 100'000.0 + static_cast<double>(n) * kInterval;
+            const double source = target - lead;
+            const double simulated = source + sim_us;
+            const double submit = std::max(simulated, present_end);
+            const double gpu_start = std::max(gate > 0.0 ? gate + 2000.0 : 0.0, submit + 500.0);
+            const double ready = gpu_start + 7000.0;
+            const bool held = ready <= target;
+            const double release = held ? target : ready;
+            LeadFrameStart start = Start(n, fg, source, kInterval, 2.0);
+            SetLead(&start, lead);
+            controller->OnSourceRelease(start);
+            controller->OnStageEvent(Event(n, Kind::SimulationEnd, simulated));
+            controller->OnStageEvent(Event(n, Kind::RenderSubmitStart, submit));
+            controller->OnStageEvent(Event(n, Kind::PresentCall, submit + 5000.0));
+            controller->OnStageEvent(Event(n, Kind::PresentEnd, submit + 5100.0));
+            controller->OnStageEvent(Event(n, Kind::GpuReady, ready));
+            controller->OnStageEvent(Event(n, Kind::OutputRelease, release,
+                held ? PacingPlanStatus::Held : PacingPlanStatus::Late));
+            LeadGpuReport report{};
+            report.active_us = 7000.0;
+            report.span_us = 7000.0;
+            report.start_qpc = Qpc(gpu_start);
+            report.first_work_streamed = streamed;
+            report.first_submission_delay_us = 500.0;
+            controller->OnGpuReport(Key(n).producer_epoch, Key(n).frame_id, report);
+            gate = std::max(ready, release);
+            present_end = submit + 5100.0;
+            return held;
+        }
+    };
+}
+
+// Spike floor (lead_controller.h): behind the wait the lead is at least the
+// fourth-largest of the newest 32 block maxima of 64 arrivals plus the
+// median r − g, once 4 blocks and 32 GPU times are known. One 10,000 µs
+// simulation every 64 frames arrives after 10,500 (bin center 10,510): the
+// floor is 17,510 against an own lead near 13.4 ms (the samples of the frames
+// behind a late one keep frame n − 1's frame generation), the lead rises to it
+// at the slew, and those frames, late before, are ready by their targets.
+// Three blocks with a longer simulation do not move the tail; a fourth does.
+// The floor is off with the request's key off, on CPU rungs and without the
+// queue order behind the wait; a reset of the buckets clears it, the GPU
+// floor's reset and an evidence restart keep it. It never counts as a
+// budget-limited lead.
+void TestLeadSpikeFloor()
+{
+    const PacingRung fg = PacingRung::FgInputWait;
+    constexpr double kSpike = 10000.0;
+    const auto sim_of = [](uint64_t n) { return n % 64 == 10 ? kSpike : 2000.0; };
+    SpikeLoop loop;
+    uint32_t late_spikes_before = 0;
+    while (loop.n < 200) {
+        const double sim = sim_of(loop.n + 1);
+        if (!loop.Frame(sim) && sim == kSpike) ++late_spikes_before;
+    }
+    // Three blocks closed: no floor yet, the own lead.
+    CHECK(loop.controller->NextGpuWorkBehindWait(fg, 2.0));
+    CHECK(loop.controller->SpikeFloorUs(fg, 2.0) == 0.0);
+    const LeadBucketStatus cold = loop.controller->BucketStatus(fg, 2.0);
+    CHECK(!cold.spike_floor_limited);
+    CHECK_NEAR(loop.lead, cold.target_us);
+    CHECK(loop.lead < 17510.0 - 1000.0);
+    CHECK(late_spikes_before == 3);
+    loop.largest_step = 0.0;
+    while (loop.n < 400) loop.Frame(sim_of(loop.n + 1));
+    CHECK_NEAR(loop.controller->SpikeTailUs(), 10510.0);
+    CHECK_NEAR(loop.controller->SpikeGpuUs(), 7000.0);
+    CHECK_NEAR(loop.controller->SpikeFloorUs(fg, 2.0), 17510.0);
+    CHECK_NEAR(loop.lead, 17510.0);
+    CHECK(loop.largest_step <= LEAD_SLEW_MAX_US + 1e-6);
+    const LeadBucketStatus status = loop.controller->BucketStatus(fg, 2.0);
+    CHECK(status.spike_floor_limited && !status.budget_limited);
+    CHECK_NEAR(status.spike_floor_us, 17510.0);
+    CHECK(loop.controller->Statistics().spike_samples == loop.n - 1);
+    // CPU rungs and the GPU queue wait without its queue order: no floor.
+    CHECK(loop.controller->SpikeFloorUs(PacingRung::MarkerHold, 1.0) == 0.0);
+    CHECK(loop.controller->SpikeFloorUs(PacingRung::GpuQueueWait, 2.0) == 0.0);
+
+    // A 16,000 µs simulation (arrival 16,500, bin center 16,510) in three
+    // blocks (frames 424, 488, 552) leaves the tail; a fourth (616) sets it.
+    // The 10,000 µs frame at 458 is ready by its target at the floor.
+    const auto monster_of = [&](uint64_t n) {
+        return n == 424 || n == 488 || n == 552 || n == 616 ? 16000.0 : sim_of(n);
+    };
+    uint32_t late_spikes_after = 0;
+    uint32_t spikes_after = 0;
+    while (loop.n < 460) {
+        const double sim = monster_of(loop.n + 1);
+        const bool held = loop.Frame(sim);
+        if (sim == kSpike) {
+            ++spikes_after;
+            if (!held) ++late_spikes_after;
+        }
+    }
+    CHECK(spikes_after == 1 && late_spikes_after == 0);
+    while (loop.n < 600) loop.Frame(monster_of(loop.n + 1));
+    CHECK_NEAR(loop.controller->SpikeTailUs(), 10510.0);
+    while (loop.n < 650) loop.Frame(monster_of(loop.n + 1));
+    CHECK_NEAR(loop.controller->SpikeTailUs(), 16510.0);
+    CHECK_NEAR(loop.controller->SpikeFloorUs(fg, 2.0), 23510.0);
+
+    // The request's key off: the own target, reached at the slew.
+    loop.request.spike_floor = false;
+    const double lead_on = loop.lead;
+    loop.Frame(sim_of(loop.n + 1));
+    CHECK_NEAR(loop.lead, lead_on - LEAD_SLEW_MAX_US);
+    CHECK(!loop.controller->BucketStatus(fg, 2.0).spike_floor_limited);
+    loop.request.spike_floor = true;
+
+    // The GPU floor's reset and an evidence restart keep the floor; a reset
+    // of the buckets clears it.
+    loop.controller->ResetGpuFloor();
+    loop.controller->ClearSlackEvidence();
+    CHECK_NEAR(loop.controller->SpikeFloorUs(fg, 2.0), 23510.0);
+    loop.controller->ResetBuckets();
+    CHECK(loop.controller->SpikeFloorUs(fg, 2.0) == 0.0);
+    CHECK(loop.controller->SpikeTailUs() == 0.0 && loop.controller->SpikeGpuUs() == 0.0);
+
+    // A floor beyond 3 I (arrivals of 24,500 in every block: 24,510 + 7,000)
+    // holds the lead at 3 I without a budget-limited lead.
+    SpikeLoop budget;
+    while (budget.n < 520) budget.Frame(budget.n % 64 == 10 ? 24000.0 : 2000.0);
+    CHECK_NEAR(budget.controller->SpikeFloorUs(fg, 2.0), 31510.0);
+    CHECK_NEAR(budget.lead, 3.0 * kInterval);
+    CHECK(!budget.budget_limited && !budget.controller->BucketStatus(fg, 2.0).budget_limited);
+    CHECK(budget.controller->Statistics().budget_limited_frames == 0);
+}
+
+// The spike floor's arrival a = (w − s − q) + F_n of one frame behind frame
+// 1, whose Present returned at 30,000 and whose wait released at
+// signal_us: frame 2 simulates 2,000 from its release and its render thread
+// takes it at 30,000, first work 500 later. Released 5,000 earlier, the
+// longer queue q leaves a at 2,500. A frame whose render thread took it only
+// after frame 1's Signal although its simulation had ended before it, one
+// whose first work did not stream and one without F add nothing.
+void TestSpikeArrival()
+{
+    const PacingRung fg = PacingRung::FgInputWait;
+    const auto arrival = [&](double source_us, double signal_us, bool streamed, double delay_us,
+        uint64_t* excluded) {
+        auto controller = MakeController();
+        controller->OnSourceRelease(Start(1, fg, 10000.0, kInterval, 2.0));
+        controller->OnStageEvent(Event(1, Kind::SimulationEnd, 12000.0));
+        controller->OnStageEvent(Event(1, Kind::RenderSubmitStart, 12000.0));
+        controller->OnStageEvent(Event(1, Kind::PresentCall, 17000.0));
+        controller->OnStageEvent(Event(1, Kind::PresentEnd, 30000.0));
+        controller->OnStageEvent(Event(1, Kind::GpuReady, signal_us - 500.0));
+        controller->OnStageEvent(Event(1, Kind::OutputRelease, signal_us));
+        controller->OnSourceRelease(Start(2, fg, source_us, kInterval, 2.0));
+        controller->OnStageEvent(Event(2, Kind::SimulationEnd, source_us + 2000.0));
+        controller->OnStageEvent(Event(2, Kind::RenderSubmitStart, 30000.0));
+        controller->OnStageEvent(Event(2, Kind::PresentCall, 35000.0));
+        LeadGpuReport report{};
+        report.active_us = 7000.0;
+        report.span_us = 7000.0;
+        report.first_work_streamed = streamed;
+        report.first_submission_delay_us = delay_us;
+        controller->OnGpuReport(Key(2).producer_epoch, Key(2).frame_id, report);
+        *excluded = controller->Statistics().spike_excluded;
+        return controller->Statistics().spike_samples == 1 ? controller->Statistics().last_spike_arrival_us
+                                                           : -1.0;
+    };
+    uint64_t excluded = 0;
+    CHECK_NEAR(arrival(20000.0, 31000.0, true, 500.0, &excluded), 2500.0);
+    CHECK(excluded == 0);
+    CHECK_NEAR(arrival(15000.0, 31000.0, true, 500.0, &excluded), 2500.0);
+    CHECK(arrival(20000.0, 25000.0, true, 500.0, &excluded) < 0.0 && excluded == 1);
+    CHECK(arrival(20000.0, 31000.0, false, 500.0, &excluded) < 0.0 && excluded == 1);
+    CHECK(arrival(20000.0, 31000.0, true, kNaN, &excluded) < 0.0 && excluded == 1);
+}
+
 // The readiness anchor on the GPU queue wait (lead_controller.h): the
 // pre-gate query runs after the game's measured GPU work, so the GPU end
 // precedes the readiness (Rogue Core: −0.21 ms on every frame of every
@@ -3907,7 +3994,6 @@ int main()
     TestDrainingLateSamples();
     TestHoldRoomSamples();
     TestLockstepGatedHold();
-    TestGatedHoldGpuIdle();
     TestHeadroomGuardLimitsLead();
     TestReleaseHeadroomObservations();
     TestCollisionGuardQueueOrder();
@@ -3922,6 +4008,8 @@ int main()
     TestFgBehindWaitLeadFalls();
     TestFgSubmissionSetLeadCoversReadiness();
     TestFgHeldFirstWorkLeadFalls();
+    TestLeadSpikeFloor();
+    TestSpikeArrival();
     TestGpuQueueWaitReadyGap();
     TestGpuNeedWindow();
 

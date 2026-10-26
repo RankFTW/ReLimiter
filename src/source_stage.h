@@ -162,10 +162,9 @@ struct SourceStageRequest {
     // Developer A/B (gpu_queue_wait_render_queue): whether the GPU queue wait's
     // lead sample leaves out the simulation → render queue (lead_controller.h).
     PacingRenderQueue gpu_queue_wait_render_queue = PacingRenderQueue::Keep;
-    // Developer A/B gated_hold_gpu_idle (lead_controller.h): a GPU wait frame
-    // ready after its Present call credits later frames' waits only up to its
-    // GPU idle.
-    bool gated_hold_gpu_idle = false;
+    // Lead spike floor (lead_controller.h; developer key lead_spike_floor,
+    // Output override Auto only).
+    bool spike_floor = true;
     // The ended pre-Sleep wait for pre_wait_index (PreSleepPlacement::
     // EndedWait): recorded with the frame when the plan takes that index, so
     // it can gate earlier frames of a lockstep engine (lead_controller.h).

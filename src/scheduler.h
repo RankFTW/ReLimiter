@@ -159,6 +159,14 @@ struct SchedulerPacingStatus {
 	uint64_t stage_events_dropped = 0;
 	uint32_t stalls_injected = 0; // developer stall injector, cumulative
 	bool lead_budget_limited = false; // the newest lead was clamped to 3 I
+	// Lead spike floor (lead_controller.h) of the newest plan's bucket: the
+	// bucket's Q_q, the floor (0 where it does not apply), its arrival tail and
+	// GPU term, and whether the floor set the bucket's last warm target.
+	double lead_quantile_us = 0.0;
+	double lead_floor_us = 0.0;
+	double lead_floor_tail_us = 0.0;
+	double lead_floor_gpu_us = 0.0;
+	bool lead_floor_limited = false;
 
 	// Overload guard. Current on every publication.
 	bool hold_overloaded = false;          // every Auto hold resolves source only

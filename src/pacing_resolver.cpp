@@ -328,7 +328,7 @@ namespace
         std::atomic<bool> fg_late_spacing{ kDefaultConfig.fg_late_spacing };
         std::atomic<bool> gpu_paced_cadence{ kDefaultConfig.gpu_paced_cadence };
         std::atomic<bool> adaptive_cap_hold_room{ kDefaultConfig.adaptive_cap_hold_room };
-        std::atomic<bool> gated_hold_gpu_idle{ kDefaultConfig.gated_hold_gpu_idle };
+        std::atomic<bool> lead_spike_floor{ kDefaultConfig.lead_spike_floor };
         std::atomic<double> stall_inject_ms{ kDefaultConfig.stall_inject_ms };
         std::atomic<double> stall_inject_period_s{ kDefaultConfig.stall_inject_period_s };
     };
@@ -353,7 +353,7 @@ namespace
         config.gpu_paced_cadence = s_config.gpu_paced_cadence.load(std::memory_order_relaxed);
         config.adaptive_cap_hold_room =
             s_config.adaptive_cap_hold_room.load(std::memory_order_relaxed);
-        config.gated_hold_gpu_idle = s_config.gated_hold_gpu_idle.load(std::memory_order_relaxed);
+        config.lead_spike_floor = s_config.lead_spike_floor.load(std::memory_order_relaxed);
         config.stall_inject_ms = s_config.stall_inject_ms.load(std::memory_order_relaxed);
         config.stall_inject_period_s =
             s_config.stall_inject_period_s.load(std::memory_order_relaxed);
@@ -550,7 +550,7 @@ void PacingPipeline_SetConfig(const PacingPipelineConfig& config) noexcept
     s_config.fg_late_spacing.store(safe_config.fg_late_spacing, std::memory_order_relaxed);
     s_config.gpu_paced_cadence.store(safe_config.gpu_paced_cadence, std::memory_order_relaxed);
     s_config.adaptive_cap_hold_room.store(safe_config.adaptive_cap_hold_room, std::memory_order_relaxed);
-    s_config.gated_hold_gpu_idle.store(safe_config.gated_hold_gpu_idle, std::memory_order_relaxed);
+    s_config.lead_spike_floor.store(safe_config.lead_spike_floor, std::memory_order_relaxed);
     s_config.stall_inject_ms.store(safe_config.stall_inject_ms, std::memory_order_relaxed);
     s_config.stall_inject_period_s.store(
         safe_config.stall_inject_period_s, std::memory_order_relaxed);

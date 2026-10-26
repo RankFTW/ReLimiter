@@ -128,11 +128,10 @@ struct PacingPipelineConfig {
     // with gpu_paced_cadence, of the FG input wait (GpuNeedQuantileUs);
     // period_governor.h.
     bool adaptive_cap_hold_room = true;
-    // Key gated_hold_gpu_idle (default off; developer A/B): a GPU wait frame
-    // ready after its Present call is judged late (the Adaptive cap's slack)
-    // with later frames' waits credited only up to its GPU idle inside its
-    // span (lead_controller.h, lockstep engines).
-    bool gated_hold_gpu_idle = false;
+    // Key lead_spike_floor (default on; developer A/B): with Output override
+    // Auto, a GPU wait lead behind the wait is at least the arrival tail plus
+    // the GPU's start → readiness time (lead_controller.h, spike floor).
+    bool lead_spike_floor = true;
     double stall_inject_ms = 0.0; // 0 = off; [0, kPacingStallInjectMaxMs]
     double stall_inject_period_s = kPacingStallInjectDefaultPeriodS; // [1, 60]
 };

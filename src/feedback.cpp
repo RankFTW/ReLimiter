@@ -1073,6 +1073,7 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
                 std::abs(render_end_us) < effective_interval_us * 3.0 &&
                 std::abs(first_work_us) < effective_interval_us * 3.0 &&
                 HandoffFirstWorkStreams(0.0, render_end_us, first_work_us);
+            if (pending_sample.first_work_streamed) pending_sample.first_submission_delay_us = first_work_us;
         }
         pending_sample.owned_cpu_stage_us = sample_owned_cpu_stage_us;
         pending_sample.gpu_frame_time_us = ft;
