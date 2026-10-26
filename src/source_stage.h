@@ -200,12 +200,13 @@ struct SourceStageRequest {
     // The step that set earliest_release_qpc (SourceStage::GpuPacedRhythm);
     // None when the rhythm does not apply. A frame it paced continues it.
     GpuPacedRhythmStep gpu_paced_rhythm = GpuPacedRhythmStep::None;
-    // A held frame whose GPU floor applied (GpuPacedHeldFloorApplies): the
-    // gap between the floor's own depth and the cap bound
-    // (GpuFloorEstimate::cap_gap_us, >= 0). After the plan is published the
-    // cap bound's blend takes one step (LeadController::AdvanceCapBound);
-    // negative: no step.
-    double cap_gap_us = -1.0;
+    // A held frame under GpuPacedHeldFloorApplies, and the gap between its
+    // GPU floor's own depth and the cap bound (GpuFloorEstimate::cap_gap_us).
+    // After the plan is published the cap bound's blend takes one step from
+    // them and whether the floor applied (gpu_floor_qpc > 0;
+    // LeadController::AdvanceCapBound).
+    bool held_gpu_floor = false;
+    double cap_gap_us = 0.0;
     // The game reached ReLimiter at its marker, or earlier at the Reflex
     // Sleep: the Sleep hook's entry for grid index sleep_entry_index (0 =
     // none), before any wait in the hook. The pre-Sleep wait aims at the

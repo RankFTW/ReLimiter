@@ -1057,9 +1057,6 @@ void LeadController::NoteCapBoundEvidence(const PendingFrame& frame) noexcept
     if (window.frames < LEAD_CAP_BOUND_FRAMES) ++window.frames;
     const CapBoundMode before = window.mode;
     if (window.waited >= LEAD_WARM_SAMPLES) {
-        // From Cold without a restart no floor applied: the frames were at
-        // the cap's release, so the bound applies at once.
-        if (before == CapBoundMode::Cold && !CadenceRestartSeen(frame.key.producer_epoch)) window.blend = 1.0f;
         window.mode = CapBoundMode::Bounded;
     } else if (window.frames == LEAD_CAP_BOUND_FRAMES && window.waited == 0) {
         window.mode = CapBoundMode::Depth;
@@ -1079,9 +1076,14 @@ CapBoundStatus LeadController::CapBound() const noexcept
 }
 
 // The blend's step (lead_controller.h): toward the mode by at most the
-// lead's slew of the gap; a gap within one step, or unknown, moves it there.
-void LeadController::AdvanceCapBound(double gap_us, double interval_us) noexcept
+// lead's slew of the gap, a gap within one step or unknown moving it there;
+// a held frame without a floor was at the cap's release.
+void LeadController::AdvanceCapBound(bool floor_applied, double gap_us, double interval_us) noexcept
 {
+    if (!floor_applied) {
+        cap_bound_.blend = 1.0f;
+        return;
+    }
     const float target = cap_bound_.mode == CapBoundMode::Bounded ? 1.0f : 0.0f;
     if (cap_bound_.blend == target) return;
     const double step_us = std::min(LEAD_SLEW_MAX_US, interval_us / kIntervalSlewDivisor);

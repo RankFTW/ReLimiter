@@ -301,7 +301,9 @@ SourceStageFrame SourceStage::RunPlannedFrame(
         // The held floor's cap bound blend: one step per published plan
         // (lead_controller.h), after this frame's floor and before the next
         // frame's pre-Sleep wait reads it.
-        if (request.cap_gap_us >= 0.0) lead_.AdvanceCapBound(request.cap_gap_us, request.interval_us);
+        if (request.held_gpu_floor) {
+            lead_.AdvanceCapBound(request.gpu_floor_qpc > 0, request.cap_gap_us, request.interval_us);
+        }
     } else {
         ++statistics_.plan_publish_failures;
     }

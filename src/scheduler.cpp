@@ -1787,11 +1787,13 @@ static SourceStageFrame RunPlanned(
         request.earliest_release_qpc = rhythm.release_qpc;
         request.gpu_paced_rhythm = rhythm.step;
         request.gpu_floor_qpc = floor.floor_qpc;
+        // The cap bound's blend steps once this plan is published, back to
+        // the cap's release when no floor applied.
+        request.held_gpu_floor = true;
+        request.cap_gap_us = floor.cap_gap_us;
         if (floor.ineligible) ++s_floor_ineligible_frames;
         if (floor.cap_bound) ++s_floor_cap_bound_frames;
         if (floor.floor_qpc > 0) {
-            // The cap bound's blend steps once this plan is published.
-            request.cap_gap_us = floor.cap_gap_us;
             ++s_floor_anchor_frames[static_cast<size_t>(floor.anchor)];
             ++s_floor_mode_frames[static_cast<size_t>(floor.cap_mode)];
             const double blend = s_source_stage.Lead().CapBound().blend;
