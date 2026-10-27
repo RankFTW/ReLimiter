@@ -586,8 +586,10 @@ PacingEpochReason CadenceGrid::ObserveOutput(
     uint32_t controller_generation,
     uint64_t grid_index,
     int64_t output_qpc,
-    bool gpu_paced) noexcept
+    bool gpu_paced,
+    int64_t* late_ticks) noexcept
 {
+    if (late_ticks != nullptr) *late_ticks = 0;
     // Idle caps plan with L = 0 and no output hold, so a PRESENT_START after
     // T(n) is the frame's own work, not a late output: restarting the grid
     // there would stretch the cap to I + (a - s).
@@ -618,7 +620,8 @@ PacingEpochReason CadenceGrid::ObserveOutput(
     }
     const int64_t tolerance_ticks = CadenceGrid_LateToleranceTicks(
         interval_ticks, snapshot_.qpc_frequency);
-    if (RoundExact(implied) <= target_qpc + tolerance_ticks) {
+    const int64_t implied_qpc = RoundExact(implied);
+    if (implied_qpc <= target_qpc + tolerance_ticks) {
         if (older) ++statistics_.ignored_output_observations;
         return PacingEpochReason::None;
     }
@@ -642,5 +645,6 @@ PacingEpochReason CadenceGrid::ObserveOutput(
     ++statistics_.epochs_by_reason[
         static_cast<size_t>(PacingEpochReason::OutputLate)];
     if (older) ++statistics_.older_output_epochs;
+    if (late_ticks != nullptr) *late_ticks = implied_qpc - (target_qpc + tolerance_ticks);
     return PacingEpochReason::OutputLate;
 }

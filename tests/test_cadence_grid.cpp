@@ -775,6 +775,106 @@ namespace
         }
     }
 
+    // late_ticks out parameter: how far the (epoch-base carried) output lies
+    // beyond T + tolerance when it restarts the grid; 0 for every other
+    // outcome. I = 10 ms, L = 2 ms, tol = 25,000 ticks.
+    void TestOutputLateTicksOutParam()
+    {
+        constexpr int64_t kSentinel = 123456789;
+        // Nothing is late: written as 0 (not left untouched) and no epoch.
+        {
+            CadenceGrid grid;
+            int64_t now_qpc = kStartQpc;
+            PlanSteady(&grid, 3, 10000.0, 2000.0, &now_qpc);
+            const int64_t t2 = TargetOf(grid, 2);
+            int64_t late = kSentinel;
+            CHECK(grid.ObserveOutput(kGeneration, 2, t2, false, &late) == PacingEpochReason::None);
+            CHECK(late == 0);
+            late = kSentinel;
+            CHECK(grid.ObserveOutput(kGeneration, 2, t2 + 25000, false, &late) ==
+                  PacingEpochReason::None);
+            CHECK(late == 0);
+            // Ignored evidence (a frame not planned yet) is also 0.
+            late = kSentinel;
+            CHECK(grid.ObserveOutput(kGeneration, 9, t2 + 900000, false, &late) ==
+                  PacingEpochReason::None);
+            CHECK(late == 0);
+            late = kSentinel;
+            CHECK(grid.ObserveOutput(kGeneration + 1, 2, t2 + 900000, false, &late) ==
+                  PacingEpochReason::None);
+            CHECK(late == 0);
+            CHECK(grid.Snapshot().epoch == 1);
+        }
+
+        // A restarting output reports its excess over T + tol, 1 tick at the
+        // threshold and the exact excess further out.
+        {
+            CadenceGrid grid;
+            int64_t now_qpc = kStartQpc;
+            PlanSteady(&grid, 3, 10000.0, 2000.0, &now_qpc);
+            const int64_t t2 = TargetOf(grid, 2);
+            int64_t late = kSentinel;
+            CHECK(grid.ObserveOutput(kGeneration, 2, t2 + 25001, false, &late) ==
+                  PacingEpochReason::OutputLate);
+            CHECK(late == 1);
+            // The moved frame is on time now: the out value is rewritten to 0.
+            CHECK(grid.ObserveOutput(kGeneration, 2, t2 + 25001, false, &late) ==
+                  PacingEpochReason::None);
+            CHECK(late == 0);
+        }
+        {
+            CadenceGrid grid;
+            int64_t now_qpc = kStartQpc;
+            PlanSteady(&grid, 3, 10000.0, 2000.0, &now_qpc);
+            const int64_t t2 = TargetOf(grid, 2);
+            int64_t late = kSentinel;
+            CHECK(grid.ObserveOutput(kGeneration, 2, t2 + 60000, false, &late) ==
+                  PacingEpochReason::OutputLate);
+            CHECK(late == 60000 - 25000);
+        }
+
+        // Older evidence is carried to the epoch base (o + I) before it is
+        // judged against T(b) + tol.
+        {
+            CadenceGrid grid;
+            int64_t now_qpc = kStartQpc;
+            PlanSteady(&grid, 3, 10000.0, 2000.0, &now_qpc);
+            const int64_t t3 = TargetOf(grid, 3);
+            const CadenceGridPlan source_late =
+                grid.PlanNext(Input(t3 + 500000, 10000.0, 2000.0));
+            CHECK(source_late.epoch_reason == PacingEpochReason::SourceLate);
+            const int64_t t4 = source_late.output_target_qpc;
+            grid.PlanNext(Input(source_late.source_wake_qpc + 1000, 10000.0, 2000.0));
+            const int64_t on_time = t4 - 100000 + 25000;
+            int64_t late = kSentinel;
+            CHECK(grid.ObserveOutput(kGeneration, 3, on_time, false, &late) ==
+                  PacingEpochReason::None);
+            CHECK(late == 0);
+            CHECK(grid.ObserveOutput(kGeneration, 3, on_time + 7000, false, &late) ==
+                  PacingEpochReason::OutputLate);
+            CHECK(late == 7000);
+            CHECK(grid.Statistics().older_output_epochs == 1);
+        }
+
+        // A GPU-paced late output follows the GPU: no epoch and 0.
+        {
+            CadenceGrid grid;
+            int64_t now_qpc = kStartQpc;
+            PlanSteady(&grid, 3, 10000.0, 2000.0, &now_qpc);
+            const int64_t t2 = TargetOf(grid, 2);
+            int64_t late = kSentinel;
+            CHECK(grid.ObserveOutput(kGeneration, 2, t2 + 60000, true, &late) ==
+                  PacingEpochReason::None);
+            CHECK(late == 0);
+            CHECK(grid.Statistics().gpu_paced_late_outputs == 1);
+            CHECK(grid.Snapshot().epoch == 1);
+            // The same evidence of a frame that is not GPU-paced still reports.
+            CHECK(grid.ObserveOutput(kGeneration, 2, t2 + 60000, false, &late) ==
+                  PacingEpochReason::OutputLate);
+            CHECK(late == 35000);
+        }
+    }
+
     // ── Segment history ──
 
     void TestSegmentLookupAndStale()
@@ -1894,6 +1994,7 @@ int main()
     TestOutputLateThreshold();
     TestOldEvidenceIgnored();
     TestOlderOutputEvidence();
+    TestOutputLateTicksOutParam();
     TestSegmentLookupAndStale();
     TestLifecycleModeSuspendReset();
     TestInvalidInputs();

@@ -159,6 +159,12 @@ struct SourceStageRequest {
     // gpu_wait_headroom_us), or I + Q10(C) − the release margin without
     // current Reflex GPU active times. Output override Auto only.
     bool collision_guard = false;
+    // The overload guard (not an A/B not-held block) demoted the frame's Auto
+    // hold rung: the frame's lead is at least the warm lead of the rung that
+    // outputs it, which is what lets the pause end (the source-only window
+    // is the only one still learning). An A/B not-held block plans exactly
+    // like a held block of the same rung, without that floor.
+    bool overload_demoted = false;
     // Developer A/B (gpu_queue_wait_render_queue): whether the GPU queue wait's
     // lead sample leaves out the simulation → render queue (lead_controller.h).
     PacingRenderQueue gpu_queue_wait_render_queue = PacingRenderQueue::Keep;
@@ -248,6 +254,9 @@ struct SourceStageFrame {
     int64_t game_arrival_qpc = 0;   // when the game reached ReLimiter for the frame, before any wait of ReLimiter's own
     uint32_t stall_injected_us = 0;
     bool lead_budget_limited = false; // the lead was clamped to its 3 I limit
+    // The collision guard's reduction of the plan's lead, demand − returned
+    // (LeadGuardOutcome::reduction_us); 0 when it did not act.
+    double guard_reduction_us = 0.0;
     bool handoff_limited = false;     // the render handoff limit moved the release past S_n
     bool gpu_paced = false;           // the GPU floor released it (gpu_paced_cadence)
     bool gpu_target = false;          // its earliest target moved T_n (CadenceGridPlan::gpu_target)
@@ -260,6 +269,14 @@ struct SourceStageFrame {
     int64_t floor_pull_ticks = 0;
 };
 
+// One OutputLate epoch of a drain, attributed to the frame whose output it
+// was (SourceStage::DrainedOutputLate).
+struct SourceStageOutputLate {
+    PacingPlanKey key{};
+    uint64_t grid_index = 0;
+    double lateness_us = 0.0; // how far the output was past T + the grid's late tolerance (> 0)
+};
+
 // Owner-local counters, cumulative.
 struct SourceStageStatistics {
     uint64_t stage_events = 0;
@@ -267,6 +284,7 @@ struct SourceStageStatistics {
     uint64_t output_late_epochs = 0;
     uint64_t gated_outputs = 0; // outputs judged without ReLimiter's waits for later frames (lockstep engines)
     uint64_t plan_publish_failures = 0;
+    uint64_t output_late_dropped = 0; // OutputLate epochs beyond kMaxOutputLatePerDrain in one drain
     uint64_t duplicate_keys = 0; // same key planned again: not republished (one claim per plan)
     uint64_t clamped_waits = 0;
     uint64_t gpu_paced_frames = 0; // SourceStageFrame::gpu_paced
@@ -279,6 +297,7 @@ struct SourceStageStatistics {
 class SourceStage {
 public:
     static constexpr size_t kMaxStageEventsPerCall = FramePlanRegistry::kCapacity;
+    static constexpr size_t kMaxOutputLatePerDrain = 32;
 
     // Lifecycle change: grid reset, every plan cleared, lead controller reset,
     // grid snapshot published.
@@ -289,8 +308,12 @@ public:
     // or route change) or an infeasible-lead governor miss: the lead slack
     // windows only (LeadController::ClearSlackEvidence).
     void ClearSlackEvidence() noexcept { lead_.ClearSlackEvidence(); }
-    // Holds resume after an overload demotion (LeadController::RestartRung).
-    void RestartLead(PacingRung rung) noexcept { lead_.RestartRung(rung); }
+    // Holds resume after an overload demotion (LeadController::RestartRung);
+    // carried_lead_us is the last demoted plan's lead, for its FG divisor.
+    void RestartLead(PacingRung rung, double carried_lead_us = 0.0, double carried_fg_divisor = 1.0) noexcept
+    {
+        lead_.RestartRung(rung, carried_lead_us, carried_fg_divisor);
+    }
     // A cap or FG divisor change: the GPU floor's output-shaped windows
     // (LeadController::ResetGpuFloor) and the GPU-paced rhythm restart.
     void ResetGpuFloor() noexcept
@@ -331,6 +354,10 @@ public:
     // True when the latest DrainStageEvents call started an OutputLate epoch
     // (a period governor miss input).
     bool DrainStartedOutputLate() const noexcept { return drain_output_late_; }
+    // The OutputLate epochs the latest DrainStageEvents call started, each
+    // attributed to its own frame (the overload guard's evidence).
+    size_t DrainedOutputLateCount() const noexcept { return output_late_count_; }
+    const SourceStageOutputLate& DrainedOutputLate(size_t index) const noexcept { return output_late_[index]; }
 
     // Plans, publishes the plan, waits until S_n (clamped to
     // max_wait_intervals), runs the stall injector, records s_n and feeds the
@@ -370,4 +397,6 @@ private:
     PacingPlanKey rhythm_key_{};
     int64_t rhythm_release_qpc_ = 0;
     bool drain_output_late_ = false;
+    std::array<SourceStageOutputLate, kMaxOutputLatePerDrain> output_late_{};
+    size_t output_late_count_ = 0;
 };

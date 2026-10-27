@@ -1075,6 +1075,152 @@ namespace
         CHECK_RESULT(Resolve(config, QualifiedDx12(), both), Idle, Marker, SourceOnly, IdleCap);
     }
 
+    // PacingPipeline_LeadRung: the rung whose lead plans the frame. Only a
+    // demoted Auto hold rung (rung SourceOnly, reason Infeasible) plans with
+    // its auto_rung; everything else plans with the rung itself.
+    void TestLeadRungOfDemotedAutoRungs()
+    {
+        const PacingPipelineConfig config{};
+
+        // Overload guard: each Auto hold rung is demoted and its own rung leads.
+        PacingRuntimeState overloaded = ActiveVrr();
+        overloaded.hold_overloaded = true;
+        PacingPipelineSnapshot result = Resolve(config, QualifiedDx12(), overloaded);
+        CHECK_RESULT(result, Vrr, Marker, SourceOnly, Infeasible);
+        CHECK(PacingPipeline_LeadRung(result) == PacingRung::GpuQueueWait);
+
+        PacingRuntimeState fg_overloaded = ActiveFg();
+        fg_overloaded.hold_overloaded = true;
+        result = Resolve(config, QualifiedDx12(), fg_overloaded);
+        CHECK_RESULT(result, Vrr, Marker, SourceOnly, Infeasible);
+        CHECK(PacingPipeline_LeadRung(result) == PacingRung::FgInputWait);
+
+        result = Resolve(config, VulkanPcl(), overloaded);
+        CHECK_RESULT(result, Vrr, Marker, SourceOnly, Infeasible);
+        CHECK(PacingPipeline_LeadRung(result) == PacingRung::MarkerHold);
+
+        // Fixed refresh, NvAPI route: the Auto rung is the marker hold too.
+        PacingRuntimeState fixed_overloaded = overloaded;
+        fixed_overloaded.vrr = false;
+        result = Resolve(config, QualifiedDx12(), fixed_overloaded);
+        CHECK_RESULT(result, Fixed, Marker, SourceOnly, Infeasible);
+        CHECK(PacingPipeline_LeadRung(result) == PacingRung::MarkerHold);
+
+        // A not-held A/B block (gpu_queue_wait_off) demotes the GPU queue wait
+        // exactly like the overload guard: same lead rung.
+        PacingRuntimeState not_held_block = ActiveVrr();
+        not_held_block.gpu_queue_wait_off = true;
+        result = Resolve(config, QualifiedDx12(), not_held_block);
+        CHECK_RESULT(result, Vrr, Marker, SourceOnly, Infeasible);
+        CHECK(PacingPipeline_LeadRung(result) == PacingRung::GpuQueueWait);
+
+        // The resolver never demotes the Auto rung to native hold, but the
+        // function is rung-generic: a demoted native hold leads with native hold.
+        PacingPipelineSnapshot native_demoted{};
+        native_demoted.rung = PacingRung::SourceOnly;
+        native_demoted.reason = PacingFallbackReason::Infeasible;
+        native_demoted.auto_rung = PacingRung::NativeHold;
+        CHECK(PacingPipeline_LeadRung(native_demoted) == PacingRung::NativeHold);
+    }
+
+    // Not demoted: the lead rung is the resolved rung, whatever auto_rung says.
+    void TestLeadRungOfRungsThatAreNotDemoted()
+    {
+        const PacingPipelineConfig config{};
+
+        // Auto, held rungs not demoted.
+        PacingPipelineSnapshot result = Resolve(config, QualifiedDx12(), ActiveVrr());
+        CHECK_RESULT(result, Vrr, Marker, GpuQueueWait, None);
+        CHECK(PacingPipeline_LeadRung(result) == PacingRung::GpuQueueWait);
+        result = Resolve(config, QualifiedDx12(), ActiveFg());
+        CHECK(PacingPipeline_LeadRung(result) == PacingRung::FgInputWait);
+        result = Resolve(config, VulkanPcl(), ActiveVrr());
+        CHECK(PacingPipeline_LeadRung(result) == PacingRung::MarkerHold);
+        // A not-held A/B block only demotes the GPU queue wait; the FG input
+        // wait and the marker hold keep leading.
+        PacingRuntimeState fg_paused = ActiveFg();
+        fg_paused.gpu_queue_wait_off = true;
+        CHECK(PacingPipeline_LeadRung(Resolve(config, QualifiedDx12(), fg_paused)) ==
+              PacingRung::FgInputWait);
+        PacingRuntimeState paused = ActiveVrr();
+        paused.gpu_queue_wait_off = true;
+        CHECK(PacingPipeline_LeadRung(Resolve(config, VulkanPcl(), paused)) ==
+              PacingRung::MarkerHold);
+
+        // Output overrides are never demoted (reason Override, never Infeasible),
+        // not even under overload plus an A/B block.
+        PacingRuntimeState both = ActiveVrr();
+        both.hold_overloaded = true;
+        both.gpu_queue_wait_off = true;
+        struct Override {
+            PacingRungOverride value;
+            PacingRung rung;
+        };
+        const Override overrides[] = {
+            { PacingRungOverride::Gpu, PacingRung::GpuQueueWait },
+            { PacingRungOverride::Native, PacingRung::NativeHold },
+            { PacingRungOverride::Marker, PacingRung::MarkerHold },
+        };
+        for (const Override& entry : overrides) {
+            result = Resolve(WithOverride(entry.value), QualifiedDx12(), both);
+            CHECK(result.rung == entry.rung);
+            CHECK(result.reason == PacingFallbackReason::Override);
+            CHECK(PacingPipeline_LeadRung(result) == entry.rung);
+        }
+        PacingRuntimeState fg_both = ActiveFg();
+        fg_both.hold_overloaded = true;
+        fg_both.gpu_queue_wait_off = true;
+        result = Resolve(WithOverride(PacingRungOverride::Gpu), QualifiedDx12(), fg_both);
+        CHECK_RESULT(result, Vrr, Marker, FgInputWait, Override);
+        CHECK(PacingPipeline_LeadRung(result) == PacingRung::FgInputWait);
+        // An override resolving to source only stays source only.
+        result = Resolve(WithOverride(PacingRungOverride::SourceOnly), QualifiedDx12(), both);
+        CHECK(result.rung == PacingRung::SourceOnly && result.reason == PacingFallbackReason::Override);
+        CHECK(PacingPipeline_LeadRung(result) == PacingRung::SourceOnly);
+
+        // Idle cap, passthrough, uncapped, Smoothing Off and the present route
+        // are source only with their own reasons, under overload too.
+        PacingRuntimeState idle = both;
+        idle.idle_cap = true;
+        result = Resolve(config, QualifiedDx12(), idle);
+        CHECK_RESULT(result, Idle, Marker, SourceOnly, IdleCap);
+        CHECK(PacingPipeline_LeadRung(result) == PacingRung::SourceOnly);
+        PacingRuntimeState passthrough = both;
+        passthrough.swapchain_valid = false;
+        result = Resolve(config, QualifiedDx12(), passthrough);
+        CHECK(result.reason == PacingFallbackReason::Passthrough);
+        CHECK(PacingPipeline_LeadRung(result) == PacingRung::SourceOnly);
+        PacingRuntimeState uncapped = both;
+        uncapped.uncapped = true;
+        CHECK(PacingPipeline_LeadRung(Resolve(config, QualifiedDx12(), uncapped)) ==
+              PacingRung::SourceOnly);
+        result = Resolve(WithSmoothing(PacingSmoothing::Off), QualifiedDx12(), both);
+        CHECK(result.reason == PacingFallbackReason::SmoothingOff);
+        CHECK(PacingPipeline_LeadRung(result) == PacingRung::SourceOnly);
+        result = Resolve(config, PresentBased(), both);
+        CHECK(result.reason == PacingFallbackReason::PresentRoute);
+        CHECK(PacingPipeline_LeadRung(result) == PacingRung::SourceOnly);
+
+        // A natural source only (auto_rung SourceOnly: nothing to demote)
+        // stays source only, also with the overload guard raised.
+        PacingCapabilities unqualified = QualifiedDx12();
+        unqualified.fg_input_route_ready = false;
+        PacingRuntimeState fg_overloaded = ActiveFg();
+        fg_overloaded.hold_overloaded = true;
+        result = Resolve(config, unqualified, fg_overloaded);
+        CHECK_RESULT(result, Vrr, Marker, SourceOnly, FgUnqualified);
+        CHECK(result.auto_rung == PacingRung::SourceOnly);
+        CHECK(PacingPipeline_LeadRung(result) == PacingRung::SourceOnly);
+        // A demoted rung is recognised by the Infeasible reason, not by
+        // auto_rung alone: a source-only result with another reason keeps its
+        // rung even when auto_rung names a hold rung.
+        PacingPipelineSnapshot other_reason{};
+        other_reason.rung = PacingRung::SourceOnly;
+        other_reason.reason = PacingFallbackReason::SmoothingOff;
+        other_reason.auto_rung = PacingRung::GpuQueueWait;
+        CHECK(PacingPipeline_LeadRung(other_reason) == PacingRung::SourceOnly);
+    }
+
     template <typename Enum, typename TextOf>
     void CheckLabels(uint32_t count, TextOf text_of, Enum invalid)
     {
@@ -1238,6 +1384,8 @@ int main()
     TestGpuQueueRule();
     TestAutoRung();
     TestHoldFeasibility();
+    TestLeadRungOfDemotedAutoRungs();
+    TestLeadRungOfRungsThatAreNotDemoted();
     TestSmoothingTable();
     TestLeadCoverage();
     TestProbesCopied();

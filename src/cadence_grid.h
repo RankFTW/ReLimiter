@@ -296,12 +296,16 @@ public:
 
     // Output evidence for a planned index (rules above). Returns OutputLate
     // when it started an epoch, otherwise None; never for a GPU-paced frame
-    // (gpu_paced). The caller publishes Snapshot() after an epoch.
+    // (gpu_paced). The caller publishes Snapshot() after an epoch. With
+    // *late_ticks (optional), an OutputLate epoch's lateness beyond the
+    // tolerance (the output, carried to the epoch base, less T + tolerance;
+    // > 0); 0 otherwise.
     PacingEpochReason ObserveOutput(
         uint32_t controller_generation,
         uint64_t grid_index,
         int64_t output_qpc,
-        bool gpu_paced = false) noexcept;
+        bool gpu_paced = false,
+        int64_t* late_ticks = nullptr) noexcept;
 
     const CadenceGridSnapshot& Snapshot() const noexcept { return snapshot_; }
     // The grid index the next valid PlanNext takes.

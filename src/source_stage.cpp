@@ -133,6 +133,7 @@ size_t SourceStage::DrainStageEvents() noexcept
 {
     size_t drained = 0;
     bool epoch_started = false;
+    output_late_count_ = 0;
     PacingStageEvent event{};
     while (drained < kMaxStageEventsPerCall && FramePlan_PopStageEvent(&event)) {
         ++drained;
@@ -146,10 +147,19 @@ size_t SourceStage::DrainStageEvents() noexcept
         // A frame the GPU floor released follows the GPU at its output too
         // (cadence_grid.h).
         const bool gpu_paced = lead_.GpuFloorReleased(event.key, event.grid_index);
+        int64_t late_ticks = 0;
         if (grid_.ObserveOutput(event.key.controller_generation, event.grid_index, event.qpc - gated_ticks,
-                gpu_paced) == PacingEpochReason::OutputLate) {
+                gpu_paced, &late_ticks) == PacingEpochReason::OutputLate) {
             ++statistics_.output_late_epochs;
             epoch_started = true;
+            // The epoch belongs to the frame whose output it was, however
+            // late the output arrived (the overload guard's evidence).
+            if (output_late_count_ < kMaxOutputLatePerDrain && qpc_frequency_ > 0) {
+                output_late_[output_late_count_++] = SourceStageOutputLate{ event.key, event.grid_index,
+                    static_cast<double>(late_ticks) * 1'000'000.0 / static_cast<double>(qpc_frequency_) };
+            } else {
+                ++statistics_.output_late_dropped;
+            }
             // Only a held output's restart counts for the held GPU floor
             // (lead_controller.h).
             if (event.rung != PacingRung::SourceOnly) lead_.NoteCadenceRestart(event.key.producer_epoch);
@@ -180,14 +190,22 @@ SourceStageFrame SourceStage::RunPlannedFrame(
         return frame;
     }
 
-    // A demoted GPU queue wait keeps its lead (PacingPipeline_LeadRung), but
-    // never below the warm lead of the rung that outputs the demoted frames.
-    // Only that rung's window learns while the GPU queue wait is demoted: a
-    // load rise during the demotion otherwise left every frame planned with
-    // the stale lead and late against it, so the overload guard never saw the
-    // restart-free 2 s it needs to resume holds (CONTROL: an 8.05 ms
-    // lead learned while loading, PRESENT_START 12.5 ms after the release in
-    // play, 447 restarts in 1,123 frames, stuck on source only).
+    // A frame whose Auto hold rung the overload guard or an A/B block demoted
+    // is planned with that rung's lead (PacingPipeline_LeadRung): a demotion
+    // takes the hold away, never the lead. Under the overload guard the
+    // demand is at least the warm lead of the rung that outputs the demoted
+    // frames, the only window still learning while the hold rung is demoted:
+    // a load rise during the pause otherwise left every frame planned with
+    // the stale lead and late against it, so the guard never saw the
+    // restart-free 2 s it needs to resume holds (CONTROL: an 8.05 ms lead
+    // learned while loading, PRESENT_START 12.5 ms after the release in play,
+    // 447 restarts in 1,123 frames, stuck on source only). An A/B not-held
+    // block has no pause to end and plans exactly like a held block of the
+    // rung, without that floor. The collision guard then limits the demand
+    // when the lead rung is the GPU queue wait: it is the limit applied to
+    // every frame planned with that lead, held or not (a paused frame planned
+    // past it sat at 14.8-16.6 ms while the first guarded held frames after
+    // it were limited to 11.2-11.6 ms).
     const PacingRung lead_rung = PacingPipeline_LeadRung(pipeline);
     LeadRequest lead_request{};
     lead_request.rung = lead_rung;
@@ -201,24 +219,22 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     lead_request.quantile = pipeline.lead_quantile;
     lead_request.allowance_us = pipeline.allowance_us;
     lead_request.release_headroom_us = pipeline.gpu_wait_headroom_us;
-    // The collision guard limits the lead of frames whose GPU actually waits
-    // at the gate; a demoted GPU queue wait keeps its unguarded lead.
-    lead_request.collision_guard = request.collision_guard && pipeline.rung == PacingRung::GpuQueueWait;
+    lead_request.collision_guard = request.collision_guard;
     lead_request.spike_floor = request.spike_floor;
-    bool budget_limited = false;
-    LeadGuardOutcome guard{};
-    double lead_us = lead_.NextLeadUs(lead_request, &budget_limited, &guard);
-    PacingRung slack_rung = lead_rung;
-    if (lead_rung != pipeline.rung && lead_.BucketStatus(pipeline.rung, request.fg_divisor).warm) {
+    bool output_budget_limited = false;
+    if (request.overload_demoted && lead_rung != pipeline.rung &&
+        lead_.BucketStatus(pipeline.rung, request.fg_divisor).warm) {
         LeadRequest output_request = lead_request;
         output_request.rung = pipeline.rung;
-        bool output_budget_limited = false;
-        const double output_lead_us = lead_.NextLeadUs(output_request, &output_budget_limited);
-        if (output_lead_us > lead_us) {
-            lead_us = output_lead_us;
-            budget_limited = output_budget_limited;
-            slack_rung = pipeline.rung;
-        }
+        lead_request.demand_floor_us = lead_.NextLeadUs(output_request, &output_budget_limited);
+    }
+    bool budget_limited = false;
+    LeadGuardOutcome guard{};
+    const double lead_us = lead_.NextLeadUs(lead_request, &budget_limited, &guard);
+    PacingRung slack_rung = lead_rung;
+    if (guard.demand_floored) {
+        budget_limited = output_budget_limited;
+        slack_rung = pipeline.rung;
     }
 
     CadenceGridPlanInput input{};
@@ -287,6 +303,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     frame.planned = true;
     frame.game_arrival_qpc = game_arrival_qpc;
     frame.lead_budget_limited = budget_limited;
+    frame.guard_reduction_us = guard.reduction_us;
     frame.epoch_started = grid_plan.epoch_reason;
     // A restart of a held frame is the held GPU floor's eligibility before
     // the cap held LEAD_WARM_SAMPLES frames (lead_controller.h); a frame not
@@ -358,6 +375,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     start.key = plan.key;
     start.grid_index = plan.grid_index;
     start.rung = plan.rung;
+    start.demoted_from = lead_rung != pipeline.rung ? lead_rung : PacingRung::SourceOnly;
     start.fg_divisor = plan.fg_divisor;
     start.interval_us = plan.interval_us;
     start.source_release_qpc = frame.release_qpc;

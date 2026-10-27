@@ -184,7 +184,8 @@ struct PacingPipelineSnapshot {
     // The resolved rung before the overload guard (the override or
     // fallback rung when not Auto). Differs from `rung` only while the guard
     // demotes an Auto hold (reason Infeasible); the FG route qualification
-    // check, the guard's judged frames and telemetry read it.
+    // check, the guard's judged frames, the lead rung of the demoted frames
+    // (PacingPipeline_LeadRung) and telemetry read it.
     PacingRung auto_rung = PacingRung::SourceOnly;
     PacingFallbackReason reason = PacingFallbackReason::Passthrough;
     double lead_quantile = 0.99; // q of the lead controller: L = Q_q(X) + allowance (lead_coverage, default 99)
@@ -196,21 +197,24 @@ struct PacingPipelineSnapshot {
     double gpu_wait_headroom_us = kPacingGpuWaitHeadroomDefaultUs; // the collision guard's release headroom
 };
 
-// The rung whose lead plans the frame: the GPU queue wait while the overload
-// guard or a not-held A/B block demotes it (rung SourceOnly, reason
-// Infeasible, auto_rung GpuQueueWait), else the rung. The not-held frames then keep the
-// held frames' release phase: the source-only lead targets the Present call
-// and is about 4.5 ms shorter, and switching between them moved the release
-// by that much in one frame (11.8-13.2 ms display intervals
-// at every held -> not-held switch). The source stage plans such a frame with
-// at least the warm lead of the rung that outputs it, the only one of the two
-// windows still learning (source_stage.cpp).
+// The rung whose lead plans the frame: the Auto hold rung (GPU queue wait, FG
+// input wait, marker hold or native hold) while the overload guard or a
+// not-held A/B block demotes it (rung SourceOnly, reason Infeasible,
+// auto_rung the hold rung), else the rung. The demoted frames then keep the
+// held frames' release phase: a demotion only takes the hold away, never the
+// lead. The source-only lead targets the Present call and is about 4.5 ms
+// shorter, and switching between the two moved the release by that much in
+// one frame (11.8-13.2 ms display intervals at every held -> not-held
+// switch); paused frames planned with the GPU queue wait's unguarded lead
+// moved it 3-5 ms the other way at every resume. The source stage plans such
+// a frame with at least the warm lead of the rung that outputs it, the only
+// one of the two windows still learning, and applies the collision guard to
+// that demand where the lead rung is the GPU queue wait (source_stage.cpp).
 constexpr PacingRung PacingPipeline_LeadRung(const PacingPipelineSnapshot& pipeline) noexcept
 {
     return pipeline.rung == PacingRung::SourceOnly &&
-            pipeline.reason == PacingFallbackReason::Infeasible &&
-            pipeline.auto_rung == PacingRung::GpuQueueWait
-        ? PacingRung::GpuQueueWait
+            pipeline.reason == PacingFallbackReason::Infeasible
+        ? pipeline.auto_rung
         : pipeline.rung;
 }
 

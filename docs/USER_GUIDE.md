@@ -231,7 +231,7 @@ Games that do not call the Reflex Sleep, idle caps, NVIDIA Smooth Motion and the
 
 ### Overload Pause
 
-When the game cannot reach the cap, holding frames makes things worse, so ReLimiter pauses its holds on its own. The status line reads `Paused: the game can't reach the cap right now`, the output becomes `source_only` with the reason `infeasible`, and **Details** shows an orange `Hold off: overload` line. ReLimiter keeps pacing the game while the holds are paused, and they resume by themselves once frames have been on time for about two seconds.
+When the game cannot reach the cap, holding frames makes things worse, so ReLimiter pauses its holds on its own. It pauses only when its own waits or the render handoff limit can make a difference: while the graphics card itself is the limit and ReLimiter's holds change nothing, the holds stay on (at the cost of about 1 ms of PC latency while that lasts). During a pause the status line reads `Paused: the game can't reach the cap right now`, the output becomes `source_only` with the reason `infeasible`, and **Details** shows an orange `Hold off: overload` line. ReLimiter keeps pacing the game while the holds are paused, and they resume by themselves after about two seconds without late frames that point to overload. The holds resume from the timing they were using during the pause and move to their new target a little at a time.
 
 What you can do: lower the cap, or turn on [Adaptive cap](#adaptive-cap), which lengthens the interval first so holds usually stay on.
 

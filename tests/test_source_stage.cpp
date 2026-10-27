@@ -7,10 +7,12 @@
 #include "source_stage.h"
 #include "pll.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 namespace {
 
@@ -33,6 +35,11 @@ constexpr double kSeedLeadUs = 5'000.0;    // cold lead: clamp(I / 2, 1 ms, 8 ms
 int64_t Ticks(double microseconds)
 {
     return static_cast<int64_t>(microseconds * static_cast<double>(kFrequency) / 1'000'000.0);
+}
+
+bool Near(double value, double expected, double tolerance = 1.0)
+{
+    return value > expected - tolerance && value < expected + tolerance;
 }
 
 PacingPlanKey Key(uint64_t frame_id, uint32_t generation = 1, uint32_t producer_epoch = 1)
@@ -523,6 +530,7 @@ void TestStageEventDrainObservesOutput()
     CHECK(g_stage.DrainStageEvents() == 1);
     CHECK(g_stage.Statistics().output_late_epochs == 0);
     CHECK(!g_stage.DrainStartedOutputLate());
+    CHECK(g_stage.DrainedOutputLateCount() == 0); // another lifecycle: no entry
 
     const uint64_t unmatched = g_stage.Lead().Statistics().unmatched_events;
     const int64_t output = first.plan.output_target_qpc + Ticks(5'000.0); // tol = 2.5 ms
@@ -533,6 +541,10 @@ void TestStageEventDrainObservesOutput()
     CHECK(g_stage.DrainStageEvents() == 2);
     CHECK(g_stage.Statistics().output_late_epochs == 1);
     CHECK(g_stage.DrainStartedOutputLate()); // per drain: the governor's OutputLate miss
+    CHECK(g_stage.DrainedOutputLateCount() == 1);
+    CHECK(g_stage.DrainedOutputLate(0).key == first.plan.key);
+    CHECK(g_stage.DrainedOutputLate(0).grid_index == first.plan.grid_index);
+    CHECK(Near(g_stage.DrainedOutputLate(0).lateness_us, 2'500.0, 0.01)); // 5,000 µs − tolerance
     CHECK(g_stage.Lead().Statistics().unmatched_events == unmatched);
     CadenceGridSnapshot snapshot{};
     CHECK(g_cadence_grid_publication.Read(&snapshot));
@@ -547,6 +559,7 @@ void TestStageEventDrainObservesOutput()
     // The next drain without a late output clears the flag.
     CHECK(g_stage.DrainStageEvents() == 0);
     CHECK(!g_stage.DrainStartedOutputLate());
+    CHECK(g_stage.DrainedOutputLateCount() == 0);
 }
 
 void TestLockstepOutputJudgedWithoutGatedHold()
@@ -710,54 +723,689 @@ void TestResumeHistoryThroughStage()
     CHECK(g_stage.Lead().Statistics().resume_waited_samples == 40);
 }
 
-// The overload guard demotes the GPU queue wait (rung source only, reason
-// infeasible): its frames keep the GPU queue wait's lead for the release
-// phase but never plan below the warm source-only lead,
-// the window they feed (an 8.05 ms lead learned while
-// loading, PRESENT_START 12.5 ms after the release in play).
-void TestDemotedGpuQueueWaitLead()
+// ── Overload pauses and resumes ──
+//
+// The overload guard and a not-held A/B block demote the Auto hold rung to
+// source only (reason Infeasible, auto_rung the hold rung). A demoted frame is
+// planned with the hold rung's lead, so the release phase does not move when
+// holds pause or resume: demand = max(the hold rung's lead, the warm
+// source-only lead), then the collision guard where the lead rung is the GPU
+// queue wait. A resume carries the last paused plan's lead.
+
+PacingPipelineSnapshot DemotedPipeline(PacingRung auto_rung)
 {
-    std::printf("Test: a demoted GPU queue wait plans with at least the warm source-only lead\n");
-    ResetStage();
+    PacingPipelineSnapshot pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
+    pipeline.reason = PacingFallbackReason::Infeasible;
+    pipeline.auto_rung = auto_rung;
+    return pipeline;
+}
+
+// Scripted frames of the pause tests. A GPU queue wait or FG input wait frame
+// is ready x µs after its release, makes its Present call call_us after it and
+// is released 100 µs after its readiness (status Held: its GPU waited at the
+// gate); any other rung (a demoted frame included) reaches PRESENT_START x µs
+// after its release. With active_us the frame's Reflex report follows (D = X −
+// A). The C window of the collision guard follows call_us: its limit is
+// I + Q10(C) − M, 8,510 µs at call_us 1,010 (bins are 20 µs wide, ranked at
+// their centre), and 10,510 µs at 3,000. X is at least C: a lead sample is the
+// later of the Present call and the readiness.
+struct PauseRig {
+    explicit PauseRig(uint64_t first_frame_id) : frame_id(first_frame_id) {}
+
     ScriptedClock clock;
+    uint64_t frame_id;
+    bool collision_guard = true; // Output override Auto
+    // Frames of a demoted pipeline are an overload pause (the warm
+    // source-only lead floors them); false: an A/B not-held block.
+    bool overload_demoted = true;
+    double fg_divisor = 1.0;
+    double call_us = 1'010.0;
     const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
-    PacingPipelineSnapshot demoted = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
-    demoted.reason = PacingFallbackReason::Infeasible;
-    demoted.auto_rung = PacingRung::GpuQueueWait;
-    uint64_t frame_id = 900;
-    // A GPU queue wait frame is ready x_us after its release; a demoted frame
-    // reaches PRESENT_START then.
-    const auto run = [&](const PacingPipelineSnapshot& pipeline, double x_us) {
-        const SourceStageFrame frame = g_stage.RunPlannedFrame(Request(Key(frame_id++), pipeline), &clock);
+
+    SourceStageFrame Run(const PacingPipelineSnapshot& pipeline, double x_us, double active_us = 0.0)
+    {
+        const uint64_t id = frame_id++;
+        SourceStageRequest request = Request(Key(id), pipeline);
+        request.collision_guard = collision_guard;
+        request.overload_demoted = overload_demoted;
+        request.fg_divisor = fg_divisor;
+        const SourceStageFrame frame = g_stage.RunPlannedFrame(request, &clock);
         CHECK(frame.planned);
         const int64_t done = frame.release_qpc + Ticks(x_us);
-        if (pipeline.rung == PacingRung::GpuQueueWait) {
+        if (pipeline.rung == PacingRung::GpuQueueWait || pipeline.rung == PacingRung::FgInputWait) {
             CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::PresentCall,
-                frame.release_qpc + Ticks(1'000.0))));
+                frame.release_qpc + Ticks(call_us))));
             CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady, done)));
-            CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease, done,
-                PacingPlanStatus::Late)));
+            CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease,
+                done + Ticks(100.0), PacingPlanStatus::Held)));
         } else {
             CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::MarkerArrival, done)));
         }
         g_stage.DrainStageEvents();
+        if (active_us > 0.0) {
+            LeadGpuReport report{};
+            report.active_us = active_us;
+            g_stage.OnGpuReport(1, id, report);
+        }
         clock.now = done;
         return frame;
-    };
-    const auto near = [](double value, double expected) {
-        return value > expected - 1.0 && value < expected + 1.0;
-    };
-    for (int frame = 0; frame < 40; ++frame) run(held, 3'000.0);
-    CHECK(near(run(held, 3'000.0).plan.lead_us, 3'510.0)); // Q95 3,010 + 500
-    // Demoted with a cold source-only window: the GPU queue wait's lead.
-    CHECK(near(run(demoted, 6'000.0).plan.lead_us, 3'510.0));
-    // The demoted frames warm the source-only window (Q95 6,010): its lead,
+    }
+
+    SourceStageFrame RunFrames(const PacingPipelineSnapshot& pipeline, int count, double x_us,
+        double active_us = 0.0)
+    {
+        SourceStageFrame last{};
+        for (int frame = 0; frame < count; ++frame) last = Run(pipeline, x_us, active_us);
+        return last;
+    }
+};
+
+constexpr double kCollisionLimitUs = kIntervalUs + 1'010.0 - LEAD_RELEASE_MARGIN_US; // call_us 1,010
+
+// Rule pinned: a frame the overload guard demoted (a pause) is planned with
+// the GPU wait's lead and, once the source-only window is warm, at least its
+// lead (it learns while the hold is demoted: an 8.05 ms lead learned while
+// loading, PRESENT_START 12.5 ms after the release in play).
+void TestDemotedGpuQueueWaitLead()
+{
+    std::printf("Test: a paused GPU queue wait plans with at least the warm source-only lead\n");
+    ResetStage();
+    PauseRig rig(900);
+    rig.call_us = 3'000.0; // collision limit 10,510 µs: nothing is guarded here
+    const PacingPipelineSnapshot demoted = DemotedPipeline(PacingRung::GpuQueueWait);
+    rig.RunFrames(rig.held, 40, 3'000.0);
+    SourceStageFrame frame = rig.Run(rig.held, 3'000.0);
+    CHECK(Near(frame.plan.lead_us, 3'510.0)); // Q95 3,010 + 500
+    // Paused with a cold source-only window: the GPU queue wait's lead.
+    frame = rig.Run(demoted, 6'000.0);
+    CHECK(Near(frame.plan.lead_us, 3'510.0));
+    CHECK(frame.plan.rung == PacingRung::SourceOnly);
+    CHECK(frame.guard_reduction_us == 0.0);
+    // The paused frames warm the source-only window (Q95 6,010): its lead,
     // while the GPU queue wait's own lead stays.
-    for (int frame = 0; frame < 40; ++frame) run(demoted, 6'000.0);
-    CHECK(near(run(demoted, 6'000.0).plan.lead_us, 6'510.0));
-    CHECK(near(g_stage.Lead().BucketStatus(PacingRung::GpuQueueWait, 1.0).lead_us, 3'510.0));
-    // Holding again: the GPU queue wait's lead only.
-    CHECK(near(run(held, 3'000.0).plan.lead_us, 3'510.0));
+    rig.RunFrames(demoted, 40, 6'000.0);
+    frame = rig.Run(demoted, 6'000.0);
+    CHECK(Near(frame.plan.lead_us, 6'510.0));
+    CHECK(frame.guard_reduction_us == 0.0);
+    CHECK(Near(g_stage.Lead().BucketStatus(PacingRung::GpuQueueWait, 1.0).lead_us, 3'510.0));
+}
+
+// Rule pinned: the lead of the first held frame after demoted ones follows the
+// way the demotion ended, not a plain switch: an overload that ends carries
+// the last paused plan's lead (RestartLead with carry), a reset restarts at
+// the cold reseed target, and an A/B not-held block shares the held frames'
+// bucket, so its switch moves nothing (and never saw the source-only lead).
+void TestDemotedToHeldTransitions()
+{
+    std::printf("Test: demoted frames hand over to held ones by carry, reset or an A/B block switch\n");
+    const PacingPipelineSnapshot demoted = DemotedPipeline(PacingRung::GpuQueueWait);
+    // Overload ends: carry; reset: reseed max(old median 3,010, warm
+    // source-only Q95 6,010) + 500.
+    for (int carry = 0; carry < 2; ++carry) {
+        ResetStage();
+        PauseRig rig(2300);
+        rig.call_us = 3'000.0;
+        rig.RunFrames(rig.held, 40, 3'000.0);
+        const double paused_us = rig.RunFrames(demoted, 41, 6'000.0).plan.lead_us;
+        CHECK(Near(paused_us, 6'510.0));
+        if (carry != 0) {
+            g_stage.RestartLead(PacingRung::GpuQueueWait, paused_us, 1.0);
+        } else {
+            g_stage.RestartLead(PacingRung::GpuQueueWait);
+        }
+        const double first_held_us = rig.Run(rig.held, 3'000.0).plan.lead_us;
+        if (carry != 0) {
+            CHECK(first_held_us == paused_us);
+        } else {
+            CHECK(Near(first_held_us, 6'510.0));
+        }
+    }
+
+    // A/B not-held block: no floor while it lasts, no jump at either switch.
+    ResetStage();
+    PauseRig rig(2500);
+    rig.call_us = 3'000.0;
+    rig.overload_demoted = false;
+    const double before_us = rig.RunFrames(rig.held, 40, 3'000.0).plan.lead_us;
+    CHECK(Near(before_us, 3'510.0));
+    for (int frame = 0; frame < 40; ++frame) {
+        CHECK(rig.Run(demoted, 6'000.0).plan.lead_us == before_us);
+    }
+    CHECK(g_stage.Lead().BucketStatus(PacingRung::SourceOnly, 1.0).warm); // warm, and never used
+    CHECK(rig.Run(demoted, 6'000.0).plan.lead_us == before_us);
+    CHECK(rig.Run(rig.held, 3'000.0).plan.lead_us == before_us);
+}
+
+// Rule pinned (R1): the collision guard is the limit applied to every frame
+// planned with the GPU queue wait's lead, a paused one included, and to the
+// demand after the source-only floor: neither the GPU wait's own lead nor a
+// warm source-only lead above the limit is exempt. Without the guard (Output
+// override GPU wait) nothing changes.
+void TestDemotedGpuQueueWaitLeadIsGuarded()
+{
+    std::printf("Test: a demoted GPU queue wait frame is guarded, whichever lead sets the demand\n");
+    const PacingPipelineSnapshot demoted = DemotedPipeline(PacingRung::GpuQueueWait);
+
+    // The GPU wait's own lead (9,510) is above the limit: the held frames are
+    // limited to it and so is the paused frame, which used to keep it whole.
+    {
+        ResetStage();
+        PauseRig rig(1100);
+        rig.RunFrames(rig.held, 40, 9'000.0);
+        const SourceStageFrame held = rig.Run(rig.held, 9'000.0);
+        CHECK(Near(held.plan.lead_us, kCollisionLimitUs));
+        CHECK(Near(held.guard_reduction_us, 9'510.0 - kCollisionLimitUs));
+        CHECK(Near(g_stage.Lead().BucketStatus(PacingRung::GpuQueueWait, 1.0).lead_us, 9'510.0));
+        const SourceStageFrame paused = rig.Run(demoted, 9'000.0);
+        CHECK(Near(paused.plan.lead_us, kCollisionLimitUs));
+        CHECK(Near(paused.guard_reduction_us, 9'510.0 - kCollisionLimitUs)); // demand − returned
+        CHECK(paused.plan.lead_us + paused.guard_reduction_us > 9'509.0);
+    }
+
+    // The warm source-only lead (12,510) above the limit: the demand is the
+    // source-only lead and the guard limits it, no exemption. The cold
+    // source-only window leaves the GPU wait's lead (3,510).
+    const auto run_pause = [&](bool collision_guard, double* reductions_us) {
+        ResetStage();
+        PauseRig rig(1300);
+        rig.collision_guard = collision_guard;
+        rig.RunFrames(rig.held, 40, 3'000.0);
+        double leads[40] = {};
+        for (int frame = 0; frame < 40; ++frame) {
+            const SourceStageFrame paused = rig.Run(demoted, 12'000.0);
+            leads[frame] = paused.plan.lead_us;
+            reductions_us[frame] = paused.guard_reduction_us;
+        }
+        CHECK(Near(g_stage.Lead().BucketStatus(PacingRung::SourceOnly, 1.0).lead_us, 12'510.0));
+        return std::vector<double>(leads, leads + 40);
+    };
+    double reductions[40] = {};
+    std::vector<double> leads = run_pause(true, reductions);
+    for (int frame = 0; frame < 40; ++frame) {
+        if (frame < 32) {
+            CHECK(Near(leads[frame], 3'510.0)); // cold source-only window
+            CHECK(reductions[frame] == 0.0);
+        } else {
+            CHECK(Near(leads[frame], kCollisionLimitUs));
+            CHECK(Near(reductions[frame], 12'510.0 - kCollisionLimitUs));
+        }
+    }
+    // Output override GPU wait: no collision guard, no change.
+    leads = run_pause(false, reductions);
+    for (int frame = 0; frame < 40; ++frame) {
+        CHECK(Near(leads[frame], frame < 32 ? 3'510.0 : 12'510.0));
+        CHECK(reductions[frame] == 0.0);
+    }
+}
+
+// Rule pinned (R1): the collision guard stays GPU-queue-wait only. A demoted
+// FG input wait or marker hold keeps its rung's lead (at least the warm
+// source-only lead) and is never guarded, even with the guard's C window warm
+// and its limit (8,510 µs) below the lead.
+void TestDemotedFgInputWaitAndMarkerHoldKeepTheirLead()
+{
+    std::printf("Test: a demoted FG input wait or marker hold keeps its lead and is never guarded\n");
+    struct Case { PacingRung rung; double fg_divisor; };
+    const Case cases[] = {
+        { PacingRung::FgInputWait, 2.0 },
+        { PacingRung::MarkerHold, 1.0 },
+    };
+    for (const Case& c : cases) {
+        ResetStage();
+        PauseRig rig(1500);
+        rig.fg_divisor = c.fg_divisor;
+        // The GPU queue wait's guard is armed for this FG divisor slot.
+        rig.RunFrames(rig.held, 40, 3'000.0);
+        CHECK(Near(rig.Run(rig.held, 3'000.0).plan.lead_us, 3'510.0));
+        const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, c.rung);
+        const PacingPipelineSnapshot demoted = DemotedPipeline(c.rung);
+        // The rung's own lead is 12,510, far above the limit.
+        rig.RunFrames(held, 40, 12'000.0);
+        const double rung_lead_us = g_stage.Lead().BucketStatus(c.rung, c.fg_divisor).lead_us;
+        CHECK(Near(rung_lead_us, 12'510.0));
+        const double limit_us = g_stage.Lead().Statistics().last_collision_limit_us;
+        CHECK(Near(limit_us, kCollisionLimitUs));
+        // Cold source-only window: the rung's lead, unguarded.
+        SourceStageFrame frame{};
+        for (int paused = 0; paused < 32; ++paused) {
+            frame = rig.Run(demoted, 14'000.0);
+            CHECK(Near(frame.plan.lead_us, 12'510.0));
+            CHECK(frame.guard_reduction_us == 0.0);
+        }
+        // Warm source-only window (Q95 14,010): its lead is the demand,
+        // still unguarded.
+        for (int paused = 0; paused < 8; ++paused) {
+            frame = rig.Run(demoted, 14'000.0);
+            CHECK(Near(frame.plan.lead_us, 14'510.0));
+            CHECK(frame.guard_reduction_us == 0.0);
+        }
+        CHECK(Near(g_stage.Lead().BucketStatus(c.rung, c.fg_divisor).lead_us, 12'510.0));
+    }
+}
+
+// Rule pinned (R1): an A/B not-held block (rung source only + Infeasible, not
+// an overload pause: overload_demoted false) plans exactly like a held block
+// of the same rung: the rung's own lead, collision-guarded for the GPU queue
+// wait, with no source-only floor, however warm that window is. A frame the
+// overload guard demoted plans max(own lead, warm source-only lead), guarded.
+// The pipelines are resolved the way the scheduler does it: gpu_queue_wait_off
+// and hold_overloaded both give rung SourceOnly, reason Infeasible.
+void TestNotHeldBlockPlansLikeAHeldBlock()
+{
+    std::printf("Test: an A/B not-held block plans the same lead as a held block; an overload pause adds the source-only floor\n");
+    PacingCapabilities capabilities{};
+    capabilities.x64 = true;
+    capabilities.api = PacingApi::DX12;
+    capabilities.route = PacingRoute::NvApiMarkers;
+    capabilities.native_route_qualified = true;
+    capabilities.gpu_queue_ready = true;
+    PacingRuntimeState runtime{};
+    runtime.swapchain_valid = true;
+    runtime.vrr = true;
+    const PacingPipelineConfig config{};
+    PacingRuntimeState block = runtime;
+    block.gpu_queue_wait_off = true;
+    PacingRuntimeState overload = runtime;
+    overload.hold_overloaded = true;
+    PacingPipelineSnapshot variants[] = {
+        PacingPipeline_Resolve(config, capabilities, runtime),  // held
+        PacingPipeline_Resolve(config, capabilities, block),    // A/B not-held block
+        PacingPipeline_Resolve(config, capabilities, overload), // overload pause
+    };
+    CHECK(variants[0].rung == PacingRung::GpuQueueWait);
+    for (size_t variant = 1; variant < 3; ++variant) {
+        CHECK(variants[variant].rung == PacingRung::SourceOnly &&
+              variants[variant].reason == PacingFallbackReason::Infeasible);
+        CHECK(PacingPipeline_LeadRung(variants[variant]) == PacingRung::GpuQueueWait);
+    }
+    // The same quantile and allowance as the other tests' pipelines.
+    for (PacingPipelineSnapshot& variant : variants) {
+        variant.lead_quantile = 0.95;
+        variant.allowance_us = 500.0;
+    }
+    const PacingPipelineSnapshot source_only = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
+
+    // The warm source-only window's lead exceeds the GPU wait's own lead
+    // (A), and also the guard's limit (B, C: C is a guarded GPU wait lead).
+    struct History {
+        double call_us; double gpu_x_us; double source_x_us;
+        double own_lead_us; double own_reduction_us;           // held and block
+        double overload_lead_us; double overload_reduction_us; // overload pause
+    };
+    const History histories[] = {
+        { 3'000.0, 3'000.0, 6'000.0, 3'510.0, 0.0, 6'510.0, 0.0 },
+        { 3'000.0, 3'000.0, 12'000.0, 3'510.0, 0.0, 10'510.0, 2'000.0 },
+        { 1'010.0, 9'000.0, 12'000.0, kCollisionLimitUs, 9'510.0 - kCollisionLimitUs,
+          kCollisionLimitUs, 12'510.0 - kCollisionLimitUs },
+    };
+    for (const History& history : histories) {
+        double leads[3][10] = {};
+        double reductions[3][10] = {};
+        for (size_t variant = 0; variant < 3; ++variant) {
+            ResetStage();
+            PauseRig rig(1700);
+            rig.call_us = history.call_us;
+            rig.RunFrames(variants[0], 40, history.gpu_x_us);
+            rig.RunFrames(source_only, 40, history.source_x_us);
+            CHECK(g_stage.Lead().BucketStatus(PacingRung::SourceOnly, 1.0).warm);
+            rig.overload_demoted = variant == 2;
+            for (int frame = 0; frame < 10; ++frame) {
+                const SourceStageFrame planned = rig.Run(variants[variant], history.gpu_x_us);
+                leads[variant][frame] = planned.plan.lead_us;
+                reductions[variant][frame] = planned.guard_reduction_us;
+            }
+        }
+        for (int frame = 0; frame < 10; ++frame) {
+            CHECK(Near(leads[0][frame], history.own_lead_us));
+            CHECK(Near(reductions[0][frame], history.own_reduction_us));
+            CHECK(leads[1][frame] == leads[0][frame]);
+            CHECK(reductions[1][frame] == reductions[0][frame]);
+            CHECK(Near(leads[2][frame], history.overload_lead_us));
+            CHECK(Near(reductions[2][frame], history.overload_reduction_us));
+        }
+    }
+
+    // FG input wait and marker hold: demoted without an overload pause, the
+    // frame plans the rung's own lead; paused, the warm source-only lead.
+    struct Case { PacingRung rung; double fg_divisor; };
+    const Case cases[] = { { PacingRung::FgInputWait, 2.0 }, { PacingRung::MarkerHold, 1.0 } };
+    for (const Case& c : cases) {
+        double leads[2] = {};
+        for (int paused = 0; paused < 2; ++paused) {
+            ResetStage();
+            PauseRig rig(1900);
+            rig.fg_divisor = c.fg_divisor;
+            rig.RunFrames(Pipeline(PacingTimingMode::Vrr, c.rung), 40, 3'000.0);
+            rig.RunFrames(source_only, 40, 9'000.0);
+            rig.overload_demoted = paused != 0;
+            leads[paused] = rig.Run(DemotedPipeline(c.rung), 3'000.0).plan.lead_us;
+        }
+        CHECK(Near(leads[0], 3'510.0));
+        CHECK(Near(leads[1], 9'510.0));
+    }
+}
+
+// Rule pinned (R2): when the overload ends the first held frame is planned
+// with the last paused plan's lead (RestartLead with the carried lead), then
+// the lead slews at most min(100 µs, I / 64) per frame, also at the 32nd
+// sample; a reset (no carry) keeps the old reseed.
+struct PauseResumeScript {
+    PacingRung rung = PacingRung::GpuQueueWait;
+    double fg_divisor = 1.0;
+    double call_us = 3'000.0;
+    double history_x_us = 3'000.0;
+    int paused_early = 40;     // paused frames at paused_early_x_us
+    double paused_early_x_us = 6'000.0;
+    int paused_late = 20;      // then at paused_late_x_us (the source-only lead lags its target)
+    double paused_late_x_us = 9'000.0;
+    double resumed_x_us = 9'000.0;
+};
+
+struct PauseResume {
+    double last_held_us = 0.0;
+    double last_paused_us = 0.0;
+    double resumed_us[60] = {};
+};
+
+PauseResume RunPauseResume(const PauseResumeScript& script, bool carry)
+{
+    ResetStage();
+    PauseRig rig(2000);
+    rig.call_us = script.call_us;
+    rig.fg_divisor = script.fg_divisor;
+    const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, script.rung);
+    const PacingPipelineSnapshot demoted = DemotedPipeline(script.rung);
+    PauseResume result;
+    result.last_held_us = rig.RunFrames(held, 40, script.history_x_us).plan.lead_us;
+    rig.RunFrames(demoted, script.paused_early, script.paused_early_x_us);
+    result.last_paused_us = rig.RunFrames(demoted, script.paused_late, script.paused_late_x_us).plan.lead_us;
+    if (carry) {
+        g_stage.RestartLead(script.rung, result.last_paused_us, script.fg_divisor);
+    } else {
+        g_stage.RestartLead(script.rung);
+    }
+    for (double& lead_us : result.resumed_us) {
+        lead_us = rig.Run(held, script.resumed_x_us).plan.lead_us;
+    }
+    return result;
+}
+
+void TestPauseToResumeCarriesTheLead()
+{
+    std::printf("Test: the first held frame after a pause is planned with the last paused lead\n");
+    // Unguarded, GPU queue wait and FG input wait (FG divisor 2).
+    for (const PacingRung rung : { PacingRung::GpuQueueWait, PacingRung::FgInputWait }) {
+        PauseResumeScript script;
+        script.rung = rung;
+        script.fg_divisor = rung == PacingRung::FgInputWait ? 2.0 : 1.0;
+        const PauseResume carried = RunPauseResume(script, true);
+        CHECK(Near(carried.last_held_us, 3'510.0));
+        // The paused frames' source-only lead lags its target (9,510): the
+        // lead the resume must not jump away from.
+        CHECK(carried.last_paused_us > 7'000.0 && carried.last_paused_us < 9'000.0);
+        CHECK(carried.resumed_us[0] == carried.last_paused_us);
+        const double step_us = (std::min)(LEAD_SLEW_MAX_US, kIntervalUs / 64.0);
+        for (size_t frame = 1; frame < 60; ++frame) {
+            const double change_us = carried.resumed_us[frame] - carried.resumed_us[frame - 1];
+            CHECK(change_us >= -1e-9 && change_us <= step_us + 1e-9);
+        }
+        CHECK(Near(carried.resumed_us[59], 9'510.0)); // reached the cold, then the warm target
+
+        // A reset passes no carry: the cold target at once.
+        const PauseResume reset = RunPauseResume(script, false);
+        CHECK(reset.last_paused_us == carried.last_paused_us);
+        CHECK(Near(reset.resumed_us[0], 9'510.0));
+        CHECK(reset.resumed_us[0] - reset.last_paused_us > LEAD_SLEW_MAX_US);
+        CHECK(Near(reset.resumed_us[59], 9'510.0));
+    }
+
+    // Guarded: the paused plan is at the collision limit like the held ones
+    // before it, so pause and resume do not move the lead at all.
+    PauseResumeScript guarded;
+    guarded.call_us = 1'010.0;
+    guarded.history_x_us = 9'000.0;
+    guarded.paused_early_x_us = 9'000.0;
+    guarded.paused_early = 20;
+    guarded.paused_late = 40;
+    const PauseResume result = RunPauseResume(guarded, true);
+    CHECK(Near(result.last_held_us, kCollisionLimitUs));
+    CHECK(Near(result.last_paused_us, kCollisionLimitUs));
+    CHECK(result.resumed_us[0] == result.last_paused_us);
+    for (const double lead_us : result.resumed_us) CHECK(Near(lead_us, kCollisionLimitUs));
+}
+
+// Rule pinned (G2): the demoted frames are planned with the GPU queue wait's
+// lead, so they age the heavy-work window and a Reflex report of one refreshes
+// it (LeadFrameStart::demoted_from). The guard's D limit (I + Q10(D) − H)
+// stays current through a long pause with reports and falls back to the C
+// limit once LEAD_WORK_STALE_FRAMES demoted frames passed without one.
+void TestDemotedFramesAgeAndRefreshTheWorkWindow()
+{
+    std::printf("Test: demoted frames age the work window and their Reflex reports refresh it\n");
+    const PacingPipelineSnapshot demoted = DemotedPipeline(PacingRung::GpuQueueWait);
+    // D = 9,000 − 7,990 = 1,010 (bin centre 1,010) at a lead of 9,510.
+    const double d_limit_us = kIntervalUs + 1'010.0 - Pipeline(PacingTimingMode::Vrr,
+        PacingRung::GpuQueueWait).gpu_wait_headroom_us;
+    CHECK(d_limit_us > 9'510.0 && d_limit_us > kCollisionLimitUs);
+    const auto warm = [&](PauseRig* rig) {
+        // 60 frames: the C limit (8,510) guards until D is warm, then the lead
+        // slews back up to its 9,510 at 100 µs per frame.
+        rig->RunFrames(rig->held, 60, 9'000.0, 7'990.0);
+        CHECK(g_stage.Lead().Statistics().work_samples >= LEAD_WARM_SAMPLES);
+        const SourceStageFrame frame = rig->Run(rig->held, 9'000.0, 7'990.0);
+        CHECK(g_stage.Lead().Statistics().last_guard_headroom);
+        CHECK(Near(g_stage.Lead().Statistics().last_collision_limit_us, d_limit_us));
+        CHECK(Near(frame.plan.lead_us, 9'510.0));
+    };
+
+    // A 100-frame pause with an occasional report: the D limit stays.
+    {
+        ResetStage();
+        PauseRig rig(2600);
+        warm(&rig);
+        SourceStageFrame frame{};
+        for (int paused = 0; paused < 100; ++paused) {
+            frame = rig.Run(demoted, 3'000.0, paused % 30 == 0 ? 5'000.0 : 0.0);
+            CHECK(Near(frame.plan.lead_us, 9'510.0));
+        }
+        CHECK(g_stage.Lead().Statistics().last_guard_headroom);
+        CHECK(Near(g_stage.Lead().Statistics().last_collision_limit_us, d_limit_us));
+    }
+
+    // Without a report the window is current for LEAD_WORK_STALE_FRAMES + 1
+    // demoted frames (each is planned before it ages the window), then stale:
+    // the C limit applies at once, and one report makes it current again.
+    {
+        ResetStage();
+        PauseRig rig(3000);
+        warm(&rig);
+        SourceStageFrame frame = rig.RunFrames(demoted, static_cast<int>(LEAD_WORK_STALE_FRAMES) + 1, 3'000.0);
+        CHECK(g_stage.Lead().Statistics().last_guard_headroom);
+        CHECK(Near(frame.plan.lead_us, 9'510.0));
+        frame = rig.Run(demoted, 3'000.0);
+        CHECK(!g_stage.Lead().Statistics().last_guard_headroom);
+        CHECK(Near(g_stage.Lead().Statistics().last_collision_limit_us, kCollisionLimitUs));
+        CHECK(Near(frame.plan.lead_us, kCollisionLimitUs));
+        rig.Run(demoted, 3'000.0, 5'000.0); // planned stale, its report refreshes
+        rig.Run(demoted, 3'000.0);
+        CHECK(g_stage.Lead().Statistics().last_guard_headroom);
+        CHECK(Near(g_stage.Lead().Statistics().last_collision_limit_us, d_limit_us));
+    }
+}
+
+// ── OutputLate attribution ──
+//
+// DrainStageEvents lists each OutputLate epoch of the drain with its own
+// frame's key and grid index and its lateness beyond T + tolerance (the
+// overload guard's evidence); I = 10 ms, tolerance 2.5 ms.
+
+// Rule pinned: the entry is the output's own frame and lateness, also when
+// the output is observed after later frames were planned; evidence older than
+// the newest epoch is carried to the epoch base like the grid judges it.
+void TestDrainedOutputLateCarriesItsOwnFrame()
+{
+    std::printf("Test: a drained OutputLate carries its own key, grid index and lateness\n");
+    const PacingPipelineSnapshot pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
+    const int64_t tolerance = Ticks(2'500.0);
+    const auto late_us = [](int64_t ticks) { return static_cast<double>(ticks) / 10.0; };
+
+    // The newest frame's own output, and one at the tolerance edge.
+    {
+        ResetStage();
+        ScriptedClock clock;
+        const SourceStageFrame first = g_stage.RunPlannedFrame(Request(Key(7000), pipeline), &clock);
+        CHECK(first.planned);
+        CHECK(g_stage.DrainedOutputLateCount() == 0);
+        const int64_t target = first.plan.output_target_qpc;
+        CHECK(FramePlan_PushStageEvent(Event(first, PacingStageEventKind::OutputRelease,
+            target + tolerance, PacingPlanStatus::SourceOnly)));
+        CHECK(g_stage.DrainStageEvents() == 1);
+        CHECK(g_stage.DrainedOutputLateCount() == 0 && !g_stage.DrainStartedOutputLate());
+        CHECK(FramePlan_PushStageEvent(Event(first, PacingStageEventKind::OutputRelease,
+            target + tolerance + 1, PacingPlanStatus::SourceOnly)));
+        CHECK(g_stage.DrainStageEvents() == 1);
+        CHECK(g_stage.DrainedOutputLateCount() == 1 && g_stage.DrainStartedOutputLate());
+        CHECK(g_stage.DrainedOutputLate(0).key == first.plan.key);
+        CHECK(g_stage.DrainedOutputLate(0).grid_index == first.plan.grid_index);
+        CHECK(Near(g_stage.DrainedOutputLate(0).lateness_us, 0.1, 0.01)); // one tick
+        // The list belongs to its drain: the next one starts empty.
+        CHECK(g_stage.DrainStageEvents() == 0);
+        CHECK(g_stage.DrainedOutputLateCount() == 0 && !g_stage.DrainStartedOutputLate());
+    }
+
+    // A delayed OutputLate: frame 1's output arrives after frames 2 and 3 were
+    // planned and keeps frame 1's index; lateness 5,000 − 2,500 µs.
+    {
+        ResetStage();
+        ScriptedClock clock;
+        const SourceStageFrame first = g_stage.RunPlannedFrame(Request(Key(7100), pipeline), &clock);
+        const SourceStageFrame second = g_stage.RunPlannedFrame(Request(Key(7101), pipeline), &clock);
+        const SourceStageFrame third = g_stage.RunPlannedFrame(Request(Key(7102), pipeline), &clock);
+        CHECK(first.planned && second.planned && third.planned);
+        CHECK(third.plan.grid_index == first.plan.grid_index + 2);
+        CHECK(FramePlan_PushStageEvent(Event(first, PacingStageEventKind::OutputRelease,
+            first.plan.output_target_qpc + Ticks(5'000.0), PacingPlanStatus::SourceOnly)));
+        CHECK(g_stage.DrainStageEvents() == 1);
+        CHECK(g_stage.DrainedOutputLateCount() == 1);
+        CHECK(g_stage.DrainedOutputLate(0).key == first.plan.key);
+        CHECK(g_stage.DrainedOutputLate(0).grid_index == first.plan.grid_index);
+        CHECK(Near(g_stage.DrainedOutputLate(0).lateness_us, 2'500.0, 0.01));
+        CHECK(g_stage.DrainStartedOutputLate());
+
+        // Two in one drain, each its own frame, in observation order; the
+        // second is late against the grid the first restarted.
+        const int64_t second_output = first.plan.output_target_qpc + Ticks(5'000.0) +
+            Ticks(kIntervalUs) + Ticks(6'000.0);
+        CHECK(FramePlan_PushStageEvent(Event(second, PacingStageEventKind::OutputRelease,
+            second_output, PacingPlanStatus::SourceOnly)));
+        CHECK(g_stage.DrainStageEvents() == 1);
+        CHECK(g_stage.DrainedOutputLateCount() == 1);
+        CHECK(g_stage.DrainedOutputLate(0).key == second.plan.key);
+        CHECK(g_stage.DrainedOutputLate(0).grid_index == second.plan.grid_index);
+        CHECK(Near(g_stage.DrainedOutputLate(0).lateness_us, 3'500.0, 0.01));
+    }
+    {
+        ResetStage();
+        ScriptedClock clock;
+        const SourceStageFrame first = g_stage.RunPlannedFrame(Request(Key(7200), pipeline), &clock);
+        const SourceStageFrame second = g_stage.RunPlannedFrame(Request(Key(7201), pipeline), &clock);
+        CHECK(first.planned && second.planned);
+        const int64_t first_output = first.plan.output_target_qpc + Ticks(5'000.0);
+        const int64_t second_output = first_output + Ticks(kIntervalUs) + Ticks(6'000.0);
+        CHECK(FramePlan_PushStageEvent(Event(first, PacingStageEventKind::OutputRelease, first_output,
+            PacingPlanStatus::SourceOnly)));
+        CHECK(FramePlan_PushStageEvent(Event(second, PacingStageEventKind::OutputRelease, second_output,
+            PacingPlanStatus::SourceOnly)));
+        CHECK(g_stage.DrainStageEvents() == 2);
+        CHECK(g_stage.DrainedOutputLateCount() == 2);
+        CHECK(g_stage.DrainedOutputLate(0).key == first.plan.key);
+        CHECK(g_stage.DrainedOutputLate(0).grid_index == first.plan.grid_index);
+        CHECK(Near(g_stage.DrainedOutputLate(0).lateness_us, 2'500.0, 0.01));
+        CHECK(g_stage.DrainedOutputLate(1).key == second.plan.key);
+        CHECK(g_stage.DrainedOutputLate(1).grid_index == second.plan.grid_index);
+        CHECK(Near(g_stage.DrainedOutputLate(1).lateness_us, 3'500.0, 0.01));
+        CHECK(g_stage.DrainStageEvents() == 0);
+        CHECK(g_stage.DrainedOutputLateCount() == 0);
+    }
+
+    // Older evidence: a SourceLate epoch started at frame 4 before frame 2's
+    // late output arrived. The output keeps frame 2's index and its lateness
+    // is judged at the epoch base: o + 2 I against T(4) + tolerance.
+    {
+        ResetStage();
+        ScriptedClock clock;
+        SourceStageFrame frames[3];
+        for (int frame = 0; frame < 3; ++frame) {
+            frames[frame] = g_stage.RunPlannedFrame(Request(Key(7300 + frame), pipeline), &clock);
+            CHECK(frames[frame].planned);
+        }
+        clock.now = frames[2].plan.output_target_qpc + Ticks(9'000.0);
+        const SourceStageFrame fourth = g_stage.RunPlannedFrame(Request(Key(7303), pipeline), &clock);
+        CHECK(fourth.planned && fourth.epoch_started == PacingEpochReason::SourceLate);
+        const int64_t output = frames[1].plan.output_target_qpc + Ticks(10'000.0);
+        const int64_t late_ticks = output + 2 * Ticks(kIntervalUs) -
+            (fourth.plan.output_target_qpc + tolerance);
+        CHECK(late_ticks > 0);
+        CHECK(FramePlan_PushStageEvent(Event(frames[1], PacingStageEventKind::OutputRelease, output,
+            PacingPlanStatus::SourceOnly)));
+        CHECK(g_stage.DrainStageEvents() == 1);
+        CHECK(g_stage.DrainedOutputLateCount() == 1);
+        CHECK(g_stage.DrainedOutputLate(0).key == frames[1].plan.key);
+        CHECK(g_stage.DrainedOutputLate(0).grid_index == frames[1].plan.grid_index);
+        CHECK(Near(g_stage.DrainedOutputLate(0).lateness_us, late_us(late_ticks), 0.01));
+    }
+
+    // A frame of another lifecycle is no entry.
+    {
+        ResetStage();
+        ScriptedClock clock;
+        const SourceStageFrame first = g_stage.RunPlannedFrame(Request(Key(7400), pipeline), &clock);
+        PacingStageEvent foreign = Event(first, PacingStageEventKind::OutputRelease,
+            first.plan.output_target_qpc + Ticks(8'000.0), PacingPlanStatus::SourceOnly);
+        foreign.key.controller_generation = 99;
+        CHECK(FramePlan_PushStageEvent(foreign));
+        CHECK(g_stage.DrainStageEvents() == 1);
+        CHECK(g_stage.DrainedOutputLateCount() == 0 && !g_stage.DrainStartedOutputLate());
+    }
+}
+
+// Rule pinned: the list holds kMaxOutputLatePerDrain entries (the oldest of
+// the drain); the rest are counted in output_late_dropped, every epoch still
+// counts in output_late_epochs.
+void TestDrainedOutputLateOverflowIsCounted()
+{
+    std::printf("Test: OutputLate epochs beyond the per-drain list are counted as dropped\n");
+    ResetStage();
+    ScriptedClock clock;
+    const PacingPipelineSnapshot pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
+    constexpr size_t kFrames = SourceStage::kMaxOutputLatePerDrain + 8;
+    SourceStageFrame frames[kFrames];
+    for (size_t frame = 0; frame < kFrames; ++frame) {
+        frames[frame] = g_stage.RunPlannedFrame(Request(Key(8000 + frame), pipeline), &clock);
+        CHECK(frames[frame].planned);
+    }
+    // Each output is 6,000 µs past the grid the previous OutputLate restarted:
+    // 3,500 µs beyond the tolerance, every one an epoch.
+    const SourceStageStatistics before = g_stage.Statistics();
+    int64_t output = frames[0].plan.output_target_qpc + Ticks(6'000.0);
+    for (size_t frame = 0; frame < kFrames; ++frame) {
+        CHECK(FramePlan_PushStageEvent(Event(frames[frame], PacingStageEventKind::OutputRelease, output,
+            PacingPlanStatus::SourceOnly)));
+        output += Ticks(kIntervalUs) + Ticks(6'000.0);
+    }
+    CHECK(g_stage.DrainStageEvents() == kFrames);
+    CHECK(g_stage.Statistics().output_late_epochs - before.output_late_epochs == kFrames);
+    CHECK(g_stage.DrainedOutputLateCount() == SourceStage::kMaxOutputLatePerDrain);
+    CHECK(g_stage.Statistics().output_late_dropped - before.output_late_dropped ==
+          kFrames - SourceStage::kMaxOutputLatePerDrain);
+    for (size_t index = 0; index < g_stage.DrainedOutputLateCount(); ++index) {
+        CHECK(g_stage.DrainedOutputLate(index).key == frames[index].plan.key);
+        CHECK(g_stage.DrainedOutputLate(index).grid_index == frames[index].plan.grid_index);
+        CHECK(Near(g_stage.DrainedOutputLate(index).lateness_us, 3'500.0, 0.01));
+    }
+    CHECK(g_stage.DrainStartedOutputLate());
+    CHECK(g_stage.DrainStageEvents() == 0);
+    CHECK(g_stage.DrainedOutputLateCount() == 0);
 }
 
 void TestVBlankPhaseTrackerFeedsFixedGrid()
@@ -988,6 +1636,14 @@ void TestGpuPacedCadence()
         g_stage.DrainStageEvents();
         CHECK(g_stage.Statistics().output_late_epochs - late_before == (c.paced ? 0u : 1u));
         CHECK(g_stage.DrainStartedOutputLate() == !c.paced);
+        // A frame the GPU floor released is no OutputLate entry; the others
+        // list their own frame, 8,000 − 2,500 µs beyond the tolerance.
+        CHECK(g_stage.DrainedOutputLateCount() == (c.paced ? 0u : 1u));
+        if (!c.paced) {
+            CHECK(g_stage.DrainedOutputLate(0).key == frame.plan.key);
+            CHECK(g_stage.DrainedOutputLate(0).grid_index == frame.plan.grid_index);
+            CHECK(Near(g_stage.DrainedOutputLate(0).lateness_us, 5'500.0, 0.01));
+        }
     }
 }
 
@@ -1324,6 +1980,14 @@ int main()
     TestLeadBudgetLimited();
     TestResumeHistoryThroughStage();
     TestDemotedGpuQueueWaitLead();
+    TestDemotedToHeldTransitions();
+    TestDemotedGpuQueueWaitLeadIsGuarded();
+    TestDemotedFgInputWaitAndMarkerHoldKeepTheirLead();
+    TestNotHeldBlockPlansLikeAHeldBlock();
+    TestPauseToResumeCarriesTheLead();
+    TestDemotedFramesAgeAndRefreshTheWorkWindow();
+    TestDrainedOutputLateCarriesItsOwnFrame();
+    TestDrainedOutputLateOverflowIsCounted();
     TestVBlankPhaseTrackerFeedsFixedGrid();
     TestEarliestReleaseLimitsWait();
     TestGpuPacedCadence();

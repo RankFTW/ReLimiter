@@ -470,7 +470,19 @@ uint64_t s_governor_draining_outputs_seen = 0;
 // demotes every Auto hold rung to source only. Output overrides are never
 // changed.
 HoldFeasibility s_hold_feasibility;
-bool s_restart_pending = false; // SourceLate (not pre-Sleep-late) or OutputLate since the previous governed frame
+// The judged plans in grid order, each with its own restart, hold and verdict
+// (rung_feasibility.h): the guard's input. Reset fences drop them unfed.
+HoldEvidence s_hold_evidence;
+// The newest planned frame when the guard or an A/B block demoted its Auto
+// hold rung: that rung, the lead it planned and its FG divisor, the lead the
+// resumed rung carries (LeadController::RestartRung). Rung SourceOnly: the
+// newest plan was not demoted.
+struct DemotedPlan {
+    PacingRung rung = PacingRung::SourceOnly;
+    double lead_us = 0.0;
+    double fg_divisor = 1.0;
+};
+DemotedPlan s_last_demoted_plan;
 // Developer A/B interleave (gpu_wait_interleave_s). Owner only.
 HoldInterleave s_hold_interleave;
 bool s_interleave_active = false;
@@ -630,7 +642,7 @@ static void ResetAdaptationRegime(const char* reason) noexcept
 {
     s_period_governor.Reset();
     s_governor_miss_pending = false;
-    s_restart_pending = false;
+    s_hold_evidence.Reset();
     uint32_t discarded = 0;
     TakeLeadOutputs(&discarded, &discarded);
     DiscardReflexFrameTimeSamples();
@@ -641,13 +653,17 @@ static void ResetAdaptationRegime(const char* reason) noexcept
 
 // Holds resume after an overload: the resuming rungs' lead windows describe
 // frames from before it, so they restart from their old
-// median (LeadController::RestartRung).
-static void RestartResumingLeads() noexcept
+// median (LeadController::RestartRung). The demoted rung of an overload that
+// ended on its own carries the lead its last demoted plan used (the first
+// resumed frame keeps it, then the lead slews to the restarted target); a
+// reset (cap, FG divisor, lifecycle, route) carries none.
+static void RestartResumingLeads(PacingRung demoted = PacingRung::SourceOnly, double carried_lead_us = 0.0,
+    double carried_fg_divisor = 1.0) noexcept
 {
-    s_source_stage.RestartLead(PacingRung::GpuQueueWait);
-    s_source_stage.RestartLead(PacingRung::MarkerHold);
-    s_source_stage.RestartLead(PacingRung::NativeHold);
-    s_source_stage.RestartLead(PacingRung::FgInputWait);
+    for (const PacingRung rung : { PacingRung::GpuQueueWait, PacingRung::MarkerHold, PacingRung::NativeHold,
+             PacingRung::FgInputWait }) {
+        s_source_stage.RestartLead(rung, rung == demoted ? carried_lead_us : 0.0, carried_fg_divisor);
+    }
 }
 
 // Ends any overload demotion; holds resume on the next resolve.
@@ -658,6 +674,7 @@ static void ResetHoldFeasibility(const char* reason) noexcept
         RestartResumingLeads();
     }
     s_hold_feasibility.Reset();
+    s_hold_evidence.Reset();
     s_feasibility_cause = FeasibilityCause::None;
 }
 
@@ -668,12 +685,12 @@ static void ApplyHoldTransition(const HoldFeasibilityTransition& transition) noe
     if (!transition.changed) return;
     s_feasibility_cause = transition.cause;
     if (transition.cause == FeasibilityCause::Overload) {
-        LOG_INFO("Hold feasibility: overload, %u of %u frames restarted the cadence in %.1f s; holds off until %.0f s pass without restarts",
+        LOG_INFO("Hold feasibility: overload, %u of %u frames restarted the cadence where holds or the render handoff limit could act, in %.1f s; holds off until %.0f s pass without such restarts",
                  transition.misses, transition.frames, transition.elapsed_s, MISS_WINDOW_S);
         return;
     }
-    RestartResumingLeads();
-    LOG_INFO("Hold feasibility: overload over after %.0f s without restarts; holds resume (leads restarted)",
+    RestartResumingLeads(s_last_demoted_plan.rung, s_last_demoted_plan.lead_us, s_last_demoted_plan.fg_divisor);
+    LOG_INFO("Hold feasibility: overload over after %.0f s without such restarts; holds resume (leads restarted, the demoted lead carried over)",
              MISS_WINDOW_S);
 }
 
@@ -1344,23 +1361,23 @@ struct PlannedFrameInput {
 // instead of every frame. Seen by the next governed frame.
 // A frame whose pre-Sleep wait made it late (the margin is still being
 // learned or the driver's Sleep ran long) is the placement's miss, not
-// overload: not a governor miss.
-static void RecordGovernorMiss(const SourceStageFrame& frame, const GovernorDecision& governor,
+// overload: not a governor miss. Returns whether the frame's own SourceLate
+// epoch is a restart for the overload guard (the same test).
+static bool RecordGovernorMiss(const SourceStageFrame& frame, const GovernorDecision& governor,
     bool pre_sleep_late) noexcept
 {
-    if (!frame.planned) return;
+    if (!frame.planned) return false;
     if (frame.epoch_started == PacingEpochReason::SourceLate) {
-        if (!pre_sleep_late) {
-            s_governor_miss_pending = true;
-            s_restart_pending = true;
-        }
-        return;
+        if (pre_sleep_late) return false;
+        s_governor_miss_pending = true;
+        return true;
     }
     if (Feasibility_LeadInfeasible(
             s_source_stage.Lead().Feasibility(frame.plan.rung, frame.plan.fg_divisor))) {
         s_governor_miss_pending = true;
         if (governor.valid && governor.can_stretch) s_source_stage.ClearSlackEvidence();
     }
+    return false;
 }
 
 static bool PreSleepAvailable() noexcept;
@@ -1379,6 +1396,18 @@ static uint32_t HandoffStreamOf(const PacingPlanKey& key) noexcept
     return (static_cast<uint32_t>(key.identity_domain) << 24) | (key.producer_epoch & 0x00FFFFFFu);
 }
 
+// Render handoff limit preconditions other than the rung and the stall block:
+// the frame is released at SIMULATION_START by the marker or pre-Sleep
+// placement while the driver's Sleep does not run.
+static bool HandoffLimitPossible(const PlannedFrameInput& input, const PacingPipelineSnapshot& pipeline) noexcept
+{
+    return (pipeline.mode == PacingTimingMode::Vrr || pipeline.mode == PacingTimingMode::Fixed) &&
+        PacingSourcePlacement_WaitsAtMarker(pipeline.placement) &&
+        (input.trigger == SchedulerTrigger::NvApiMarker || input.trigger == SchedulerTrigger::PclMarker) &&
+        input.marker == PacingSourceMarker::SimulationStart &&
+        !DriverSleepRuns(input.target_fps);
+}
+
 // Render handoff limit: a frame that is not held, released at
 // SIMULATION_START by the marker or pre-Sleep placement, while the driver's
 // Sleep does not run. Held frames are not limited (it moved CONTROL's
@@ -1394,13 +1423,7 @@ static bool HandoffLimitApplies(const PacingPlanKey& key, const PlannedFrameInpu
         s_handoff_stall_run = 0;
         LOG_INFO("Render handoff limit: back on (the render thread takes frames ahead of the next release)");
     }
-    return !s_handoff_blocked &&
-        pipeline.rung == PacingRung::SourceOnly &&
-        (pipeline.mode == PacingTimingMode::Vrr || pipeline.mode == PacingTimingMode::Fixed) &&
-        PacingSourcePlacement_WaitsAtMarker(pipeline.placement) &&
-        (input.trigger == SchedulerTrigger::NvApiMarker || input.trigger == SchedulerTrigger::PclMarker) &&
-        input.marker == PacingSourceMarker::SimulationStart &&
-        !DriverSleepRuns(input.target_fps);
+    return !s_handoff_blocked && pipeline.rung == PacingRung::SourceOnly && HandoffLimitPossible(input, pipeline);
 }
 
 // Developer A/B gpu_paced_cadence: a frame held by the lead (plan rung above
@@ -1727,6 +1750,44 @@ static int64_t HandoffEarliestRelease(const PacingPlanKey& key, double interval_
     return HandoffFloorQpc(key, handoff_qpc, pipeline);
 }
 
+// The render handoff limit's state when a frame arrives, for the overload
+// guard (HandoffWouldHold): taken before the frame's own wait and read after
+// it, without any wait of its own.
+struct HandoffSnapshot {
+    bool possible = false;      // the limit's preconditions hold, rung aside; a predecessor was released
+    bool active = false;        // a handoff of the stream within RENDER_HANDOFF_ACTIVITY_S
+    uint64_t predecessor = 0;   // the newest released frame, whose handoff the limit waits for
+    uint64_t latest_frame = 0;  // the render thread's newest handoff
+    int64_t latest_qpc = 0;
+};
+
+static HandoffSnapshot TakeHandoffSnapshot(const PacingPlanKey& key, const PlannedFrameInput& input,
+    const PacingPipelineSnapshot& pipeline, bool latest_known, uint64_t latest_frame, int64_t latest_qpc) noexcept
+{
+    HandoffSnapshot snapshot{};
+    const PacingPlanKey& released = s_handoff_released;
+    snapshot.possible = !s_handoff_blocked && HandoffLimitPossible(input, pipeline) &&
+        released.frame_id != 0 && released.identity_domain == key.identity_domain &&
+        released.producer_epoch == key.producer_epoch && released.frame_id < key.frame_id;
+    snapshot.predecessor = released.frame_id;
+    snapshot.latest_frame = latest_frame;
+    snapshot.latest_qpc = latest_qpc;
+    snapshot.active = latest_known &&
+        PacingQpc_ElapsedSeconds(latest_qpc, QpcNow(), GetQPCFrequency()) < RENDER_HANDOFF_ACTIVITY_S;
+    return snapshot;
+}
+
+// The render handoff limit (HandoffEarliestRelease, with the rung test left
+// out) would hold a frame that arrived at arrival_qpc: the render thread had
+// not taken the previous frame, or took it so recently that its handoff plus
+// the offset d lies after the arrival. The GPU floor term is not part of it.
+static bool HandoffWouldHold(const HandoffSnapshot& snapshot, int64_t arrival_qpc, int64_t offset_qpc) noexcept
+{
+    if (!snapshot.possible || !snapshot.active) return false;
+    if (snapshot.latest_frame < snapshot.predecessor) return true;
+    return snapshot.latest_qpc + offset_qpc > arrival_qpc;
+}
+
 // After a planned frame: it is the newest released frame, and the Reflex
 // Sleep hook learns whether the next frame waits for its handoff.
 static void PublishRenderHandoff(const PacingPlanKey& key, const SourceStageFrame& frame,
@@ -1810,6 +1871,9 @@ static SourceStageFrame RunPlanned(
     // Collision-aware release: Auto only, so the GPU wait output override
     // keeps its earlier behavior.
     request.collision_guard = config.rung_override == PacingRungOverride::Auto;
+    // The pipeline of this frame was resolved with the overload guard's state:
+    // a pause (not an A/B not-held block) floors the demoted lead.
+    request.overload_demoted = s_hold_feasibility.Overloaded();
     request.gpu_queue_wait_render_queue = config.gpu_queue_wait_render_queue;
     // Lead spike floor (lead_controller.h): Auto only, like the collision
     // guard, so the GPU wait output override keeps its earlier behavior.
@@ -1823,10 +1887,13 @@ static SourceStageFrame RunPlanned(
         RenderHandoffStalled(s_handoff_released.frame_id);
     }
     uint64_t handoff_frame = 0;
-    if (RenderHandoff_Latest(static_cast<uint8_t>(key.identity_domain), key.producer_epoch, &handoff_frame, nullptr)) {
-        NoteHandoffBeforeRelease(key, handoff_frame);
-    }
+    int64_t handoff_qpc = 0;
+    const bool handoff_known = RenderHandoff_Latest(static_cast<uint8_t>(key.identity_domain),
+        key.producer_epoch, &handoff_frame, &handoff_qpc);
+    if (handoff_known) NoteHandoffBeforeRelease(key, handoff_frame);
     const bool handoff_limit = HandoffLimitApplies(key, input, pipeline);
+    const HandoffSnapshot handoff_snapshot =
+        TakeHandoffSnapshot(key, input, pipeline, handoff_known, handoff_frame, handoff_qpc);
     const bool held_floor = GpuPacedHeldFloorApplies(input, pipeline, config);
     if (handoff_limit) {
         request.earliest_release_qpc = HandoffEarliestRelease(key, input.interval_us, pipeline);
@@ -1917,6 +1984,10 @@ static SourceStageFrame RunPlanned(
         s_last_plan_interval_us = frame.plan.interval_us;
         s_last_plan_release_qpc = frame.release_qpc;
         s_last_plan_early_lead_us = frame.early_lead_us;
+        const PacingRung plan_lead_rung = PacingPipeline_LeadRung(pipeline);
+        s_last_demoted_plan = plan_lead_rung != pipeline.rung
+            ? DemotedPlan{ plan_lead_rung, frame.plan.lead_us, frame.plan.fg_divisor }
+            : DemotedPlan{};
     }
 
     // Owned source wait for Reflex feedback (NvAPI source frames only).
@@ -1946,19 +2017,30 @@ static SourceStageFrame RunPlanned(
 
     ObserveCollisionGuard(input.fg_divisor);
     if (input.governed) {
-        RecordGovernorMiss(frame, input.governor, pre_sleep_late);
-        // Overload guard: judged while the pre-guard Auto rung holds.
-        HoldFeasibilityFrame hold{};
-        hold.qpc = release;
-        hold.qpc_frequency = GetQPCFrequency();
-        hold.judged = frame.planned &&
+        const bool source_restart = RecordGovernorMiss(frame, input.governor, pre_sleep_late);
+        // Overload guard: judged while the pre-guard Auto rung holds. The
+        // plan's record resolves when its own verdict is known (O1).
+        const bool judged = frame.planned &&
             (pipeline.mode == PacingTimingMode::Vrr || pipeline.mode == PacingTimingMode::Fixed) &&
             config.rung_override == PacingRungOverride::Auto &&
             pipeline.auto_rung != PacingRung::SourceOnly;
-        hold.restarted = s_restart_pending;
-        s_restart_pending = false;
-        hold.can_stretch = input.governor.valid && input.governor.can_stretch;
-        ApplyHoldTransition(s_hold_feasibility.OnFrame(hold));
+        if (judged) {
+            HoldEvidencePlan evidence{};
+            evidence.key = frame.plan.key;
+            evidence.grid_index = frame.plan.grid_index;
+            evidence.qpc = release;
+            evidence.qpc_frequency = GetQPCFrequency();
+            evidence.can_stretch = input.governor.valid && input.governor.can_stretch;
+            evidence.source_late = source_restart;
+            // ReLimiter's own source-side waits held the frame.
+            evidence.waited = frame.wait_end_qpc > frame.wait_start_qpc ||
+                frame.pre_wait_end_qpc > frame.pre_wait_start_qpc;
+            evidence.handoff_would_hold = HandoffWouldHold(handoff_snapshot, frame.game_arrival_qpc,
+                us_to_qpc(s_source_stage.Lead().HandoffOffsetUs(pipeline.handoff_quantile, pipeline.allowance_us)));
+            evidence.guard_reduction_us = frame.guard_reduction_us;
+            s_hold_evidence.Add(evidence, &s_hold_feasibility, ApplyHoldTransition);
+        }
+        s_hold_evidence.Resolve(s_source_stage.Lead(), &s_hold_feasibility, ApplyHoldTransition);
     }
 
     PacingSourceRecord source{};
@@ -2264,11 +2346,13 @@ void OnMarker(
 
     ApplyLifecycle(trigger, marker);
     s_source_stage.DrainStageEvents();
-    // An OutputLate epoch is a governor miss for the next governed frame
-    // and a cadence restart for the hold feasibility guard.
-    if (s_source_stage.DrainStartedOutputLate()) {
-        s_governor_miss_pending = true;
-        s_restart_pending = true;
+    // An OutputLate epoch is a governor miss for the next governed frame and
+    // a restart of its own frame for the hold feasibility guard, however
+    // late the output was observed.
+    if (s_source_stage.DrainStartedOutputLate()) s_governor_miss_pending = true;
+    for (size_t index = 0; index < s_source_stage.DrainedOutputLateCount(); ++index) {
+        const SourceStageOutputLate& late = s_source_stage.DrainedOutputLate(index);
+        s_hold_evidence.NoteOutputLate(late.key, late.grid_index, late.lateness_us);
     }
     // One configuration snapshot for this frame's resolve, governor and plan.
     const PacingPipelineConfig config = PacingPipeline_GetConfig();

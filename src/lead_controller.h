@@ -134,10 +134,28 @@ constexpr double LEAD_RELEASE_MARGIN_US = 2500.0;  // M
 // 32% at 0.85-0.95), and short holds are the late ones at a fixed distance
 // (3.9% against 0.04-0.45% for longer holds at 0.5-1 ms); with holds of at
 // least 500 µs the load gradient is 0.05-0.75%.
+//
+// D's samples come from frames whose predecessor's GPU waited at its gate
+// (the probe at or before the Signal, else readiness before it). Behind a
+// GPU-bound stretch the next frame's heavy work queues behind the previous
+// frame's GPU work and D grows with that backlog (Rogue Core: D p10 2.9 ms
+// after a waited predecessor, 3.9–5.0 ms after one that was not; a window
+// that kept the second kind through an overloaded stretch limited the first
+// held frames after it at 11.2–11.6 ms against 9.7 ms in steady state, and
+// the GPU resumed late on 9–25 frames per burst). A frame whose predecessor's
+// verdict is still pending adds
+// its sample when the predecessor's GpuReady or GpuResume event arrives. C
+// (the Present call window) is sampled from every GPU queue wait frame: it is
+// the guard when D is cold or stale.
 constexpr double LEAD_RELEASE_HEADROOM_US = 1000.0; // H, the default of gpu_wait_headroom_us
 constexpr double LEAD_WORK_QUANTILE = 0.10;        // low quantile of D
-// A heavy-work window without a new sample for this many GPU queue wait
-// frames is stale (Reflex reports stopped): the Present-call guard applies.
+// The heavy-work window is current while it holds LEAD_WARM_SAMPLES D samples
+// and at most this many frames planned with the GPU queue wait's lead (held,
+// demoted by the overload guard, or in a not-held A/B block) passed since the
+// newest Reflex report of such a frame: the age counts every such frame and
+// any report of one resets it, whether or not that report adds a D sample,
+// so a pause with reports keeps the window current and one without reports
+// (Reflex stopped) ends it, and the Present-call guard applies.
 constexpr uint32_t LEAD_WORK_STALE_FRAMES = 64;
 
 // Queue order. Both guards assume the next frame's GPU work can
@@ -610,12 +628,25 @@ struct GpuFloorCap {
 
 // ── Inputs and status ──
 
+// ReLimiter's own gate's verdict on one planned frame (LeadController::GateHeld).
+enum class LeadGate : uint8_t {
+    NotHeld = 0,
+    Held = 1,
+    Pending = 2, // the evidence is still arriving
+    Unknown = 3  // the evidence is gone or cannot arrive
+};
+
 // The collision guard's verdict on one lead (NextLeadUs).
 struct LeadGuardOutcome {
     bool judged = false;       // a GPU queue wait lead the guard judged (C or D window warm)
     double offset_us = 0.0;    // the limit minus I: Q10(D) − H, or Q10(C) − M
-    // How much lower the lead is than the unguarded lead (>= 0): the guard's
-    // limit, and after the limit relaxed, the lead slewing back up to it.
+    // The lead was the request's demand floor (LeadRequest::demand_floor_us),
+    // not the bucket's own lead.
+    bool demand_floored = false;
+    // How much lower the returned lead is than the demand the guard saw (>=
+    // 0; the bucket's lead, or the demand floor when that is higher): the
+    // guard's limit, and after the limit relaxed, the lead slewing back up
+    // to it.
     double reduction_us = 0.0;
 };
 
@@ -664,6 +695,12 @@ struct LeadFrameStart {
     // T (CadenceGridPlan::gpu_target): a wait at that Signal is no evidence
     // that the cap held it (cap bound, above).
     bool gpu_target = false;
+    // The Auto hold rung that planned this frame's lead while the overload
+    // guard or a not-held A/B block demoted the frame to `rung` (source
+    // only; PacingPipeline_LeadRung); SourceOnly when the frame was not
+    // demoted. A frame planned with the GPU queue wait's lead ages and
+    // refreshes the heavy-work window like a held one (above).
+    PacingRung demoted_from = PacingRung::SourceOnly;
     // Developer A/B gpu_paced_cadence, a frame the GPU floor released whose
     // render thread runs ahead of the GPU (render coupling, above): how much
     // earlier than the floor's release it was released, at the cap's (µs,
@@ -702,6 +739,11 @@ struct LeadRequest {
     bool collision_guard = false;
     // Spike floor (above; developer key lead_spike_floor).
     bool spike_floor = true;
+    // R1: the lead is at least this (µs; 0 none) before the collision guard
+    // sees it: the warm lead of the rung that outputs a frame whose hold
+    // rung the overload guard or an A/B block demoted. The bucket's own
+    // slew state is untouched; LeadGuardOutcome::demand_floored reports it.
+    double demand_floor_us = 0.0;
 };
 
 struct LeadBucketStatus {
@@ -893,7 +935,14 @@ public:
     // cold seed. For the GPU waits that base is at least the warm source-only
     // Q_q (at its last request) of the same FG divisor, which the demoted
     // frames kept current. Other rungs, the resume history and statistics stay.
-    void RestartRung(PacingRung rung) noexcept;
+    // carried_lead_us > 0 (the last demoted plan's lead, for fg_divisor's
+    // bucket only): the bucket continues from it. Its first lead is the
+    // carried lead itself, so the resume changes nothing; the cold phase
+    // and the switch to the warm target then slew at min(LEAD_SLEW_MAX_US,
+    // I / 64) toward their targets instead of jumping. 0 (cap, FG divisor,
+    // lifecycle or route resets): the cold target applies at once, as does
+    // the first warm target.
+    void RestartRung(PacingRung rung, double carried_lead_us = 0.0, double fg_divisor = 1.0) noexcept;
     // A cap or FG divisor change (above): the GPU floor's period, PRESENT_END
     // gap and readiness gap windows, its cap-held frames and its cadence
     // restart start again (P carries over until the new period window is
@@ -917,7 +966,10 @@ public:
     // order shows the next frame's GPU work behind the wait (not judged); the
     // bucket's slew continues from the unguarded lead, and *guard (optional)
     // receives the guard's verdict: whether it judged the lead, its limit
-    // minus I and how much it lowered the lead.
+    // minus I and how much it lowered the lead. The guard sees the demand,
+    // max(the bucket's lead, request.demand_floor_us), and the lead it
+    // returns slews up to the demand once the limit relaxed (the reduction
+    // is demand − returned).
     double NextLeadUs(const LeadRequest& request, bool* budget_limited = nullptr,
         LeadGuardOutcome* guard = nullptr) noexcept;
     void OnSourceRelease(const LeadFrameStart& frame) noexcept;
@@ -1042,6 +1094,22 @@ public:
     // later than its Present-side time, inside [s, that time]; 0 when the
     // frame or that time is unknown.
     int64_t GatedHoldTicks(const PacingPlanKey& key, uint64_t grid_index) const noexcept;
+    // Whether ReLimiter's own gate held planned frame (key, grid_index): the
+    // overload guard's per-frame evidence (rung_feasibility.h). GPU queue wait
+    // and FG input wait: the frame's GPU waited at its gate (the probe at or
+    // before the Signal, else readiness before it); marker and native CPU
+    // holds: the output release came after the hold start; a frame whose
+    // output was reported not held, and source only: NotHeld. Pending until
+    // the OutputRelease event (and, for the GPU waits, the probe or readiness)
+    // arrived. Unknown: the slot expired, was discarded or belongs to
+    // another key or generation, or its evidence cannot arrive any more
+    // (the frame closed, or a held CPU frame without its hold start).
+    LeadGate GateHeld(const PacingPlanKey& key, uint64_t grid_index) const noexcept;
+    // The frame (key, grid_index) is still in the table and its OutputRelease
+    // event has not arrived: its output (and any OutputLate epoch of it) is
+    // still to come, however old the plan is. False once the output arrived
+    // and when the slot expired, was discarded or belongs to another key.
+    bool OutputPending(const PacingPlanKey& key, uint64_t grid_index) const noexcept;
     // The pending frame (key, grid_index) was released by the GPU floor
     // (LeadFrameStart::gpu_floor_release); false when it is not pending.
     bool GpuFloorReleased(const PacingPlanKey& key, uint64_t grid_index) const noexcept;
@@ -1128,6 +1196,7 @@ private:
         bool spike_recorded = false;     // its spike floor arrival was decided (added or left out)
         bool spike_gpu_recorded = false; // its r − g was decided
         bool gpu_target = false;         // LeadFrameStart::gpu_target
+        bool gpu_wait_lead = false;      // planned with the GPU queue wait's lead (held or demoted)
     };
 
     // The newest LEAD_SLACK_CAPACITY slack signs of one bucket.
@@ -1148,10 +1217,11 @@ private:
         double returned_lead_us = 0.0; // the lead NextLeadUs returned last
         bool held_back = false;        // returned_lead_us was below lead_us (the guard or its slew)
         double budget_us = 0.0;
-        bool warm_applied = false;
+        bool lead_started = false; // lead_us holds a lead to slew from (a warm bucket, or a carried restart)
         bool budget_limited = false;
         bool spike_floor_limited = false; // the spike floor set the last warm target
         double reseed_x_us = 0.0; // X base before a RestartRung (median, GPU waits floored): the cold lead's base; 0 = the seed
+        bool carry_unreturned = false; // RestartRung's carried lead has not been returned yet
     };
 
     static bool FindBucketIndex(PacingRung rung, double fg_divisor, size_t* index) noexcept;
@@ -1270,10 +1340,18 @@ private:
         double* begin_us, double* end_us) const noexcept;
     bool PreviousGpuResume(const PendingFrame* previous, int64_t origin_qpc,
         double* resume_us) const noexcept;
-    // A GPU-rung frame's GPU waited at its gate (probe w <= o, else held and
-    // ready before the Signal): a frame the cap held (cap bound), a queue-order
-    // pair's frame n on the FG input wait, the render queue's RemoveHeld.
+    // A GPU-rung frame's gate from the evidence present now: the probe (w <= o)
+    // once it arrived, else held and ready before the Signal; Pending without
+    // its OutputRelease or either. Read once by consumers that take a frame
+    // at one event (the cap bound at the report, a queue-order pair's frame n
+    // on the FG input wait, the render queue's RemoveHeld): a probe still to
+    // come does not hold them back.
+    static LeadGate GpuGateEvidence(const PendingFrame& frame) noexcept;
     static bool PreviousGpuHeld(const PendingFrame& previous) noexcept;
+    // The verdict for frames whose decision is sealed once (GateHeld, the D
+    // samples of the successor): GpuGateEvidence, but Pending while a resume
+    // probe the plan expects (gpu_resume_probe) can still arrive.
+    static LeadGate GpuGateVerdict(const PendingFrame& frame) noexcept;
     double MicrosecondsBetween(int64_t from_qpc, int64_t to_qpc) const noexcept;
 
     // Requests
@@ -1286,8 +1364,9 @@ private:
     size_t resume_delay_head_ = 0;
     size_t resume_delay_count_ = 0;
     // Collision guard: release → Present call times C and release → heavy
-    // GPU work times D of GPU queue wait frames per FG divisor, the GPU queue
-    // wait releases since each work window's newest sample, and the hold
+    // GPU work times D of GPU queue wait frames per FG divisor, the frames
+    // planned with the GPU queue wait's lead since the newest Reflex report
+    // of one (the work window's age, LEAD_WORK_STALE_FRAMES), and the hold
     // room's X per FG divisor.
     std::array<LeadSampleWindow, LEAD_DIVISOR_BUCKETS> call_windows_{};
     std::array<LeadSampleWindow, LEAD_DIVISOR_BUCKETS> work_windows_{};
