@@ -326,6 +326,7 @@ void TestPacingPipelineDefaults() {
     CHECK(g_config.fg_late_spacing);
     CHECK(!g_config.gpu_paced_cadence);
     CHECK(!g_config.bypass_low_latency_off && !g_bypass_low_latency_off.load());
+    CHECK(!g_config.flip_metering_off);
     CHECK(g_config.adaptive_cap_hold_room);
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
     CheckPipelineMatchesConfig();
@@ -336,6 +337,7 @@ void TestPacingPipelineDefaults() {
     CHECK(Value(local_path, "FrameLimiter", "fg_late_spacing") == "true");
     CHECK(Value(local_path, "FrameLimiter", "gpu_paced_cadence") == "false");
     CHECK(Value(local_path, "FrameLimiter", "bypass_low_latency_off") == "false");
+    CHECK(Value(local_path, "FrameLimiter", "flip_metering_off") == "false");
     CHECK(Value(local_path, "FrameLimiter", "adaptive_cap_hold_room") == "true");
     CHECK(Value(local_path, "FrameLimiter", "source_placement") == "pre_sleep");
     CHECK(Value(local_path, "FrameLimiter", "reflex_sleep_bypass") == "true");
@@ -606,6 +608,18 @@ void TestBypassLowLatencyOffKey() {
     CHECK(Config_DeveloperOverrides() == 1);
     Config_ResetDeveloperSettings();
     CHECK(!g_config.bypass_low_latency_off && !g_bypass_low_latency_off.load());
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// Developer flip_metering_off: true loads, is saved, counts as a developer
+// override and resets to false (the block itself is installed at init only).
+void TestFlipMeteringOffKey() {
+    Reset(false, false, {{"config_version", "4"}, {"flip_metering_off", "true"}});
+    CHECK(g_config.flip_metering_off);
+    CHECK(Value(local_path, "FrameLimiter", "flip_metering_off") == "true");
+    CHECK(Config_DeveloperOverrides() == 1);
+    Config_ResetDeveloperSettings();
+    CHECK(!g_config.flip_metering_off);
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
@@ -993,6 +1007,7 @@ int main() {
     TestGpuPacedCadenceKey();
     TestAdaptiveCapHoldRoomKey();
     TestBypassLowLatencyOffKey();
+    TestFlipMeteringOffKey();
     TestSourcePlacementParsing();
     TestPacingMethodMigration();
     TestAdaptiveCapMigration();

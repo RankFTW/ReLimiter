@@ -87,6 +87,12 @@ extern std::atomic<uint32_t> g_game_requested_interval;
 // Install NvAPI hooks. Call after MH_Initialize().
 void InstallNvAPIHooks();
 
+// Developer flip_metering_off: hides NvAPI_D3D12_SetFlipConfig from every later
+// nvapi_QueryInterface request in the process (64-bit). Call once during init,
+// after MH_Initialize() and before the game's frame generation resolves NvAPI
+// functions; interception lasts until the addon shuts down.
+void InstallFlipMeteringBlock();
+
 // Forward a marker call through the real trampoline
 NvAPI_Status InvokeSetLatencyMarker(IUnknown* dev, NV_LATENCY_MARKER_PARAMS* params);
 

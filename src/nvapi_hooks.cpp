@@ -28,6 +28,7 @@
 #include <array>
 #include <atomic>
 #include <algorithm>
+#include <cstring>
 
 // ── Trampolines ──
 PFN_NvAPI_D3D_SetSleepMode     s_orig_sleep_mode      = nullptr;
@@ -1342,4 +1343,59 @@ void InstallNvAPIHooks() {
                  status == MH_OK ? "installed" : "not installed");
     }
 #endif // _WIN64
+}
+
+// ── Flip metering block (developer flip_metering_off) ──
+// NvAPI_D3D12_SetFlipConfig (QueryInterface ID 0xF3148C42) configures hardware
+// flip metering: the display engine spaces the flips of a batch of frames,
+// which DLSS Frame Generation relies on where the GPU has it. The key hides the
+// function: nvapi_QueryInterface returns nullptr for its ID (as Special K,
+// OptiScaler and RenoDX Commander do), so frame generation never configures
+// flip metering and runs as on a GPU without it. Installed during init, not
+// with the deferred hooks: frame generation resolves the function itself, and
+// a pointer it resolved before the hook stays usable.
+#ifdef _WIN64
+static constexpr NvU32 kNvApiIdSetFlipConfig = 0xF3148C42;
+static PFN_NvAPI_QueryInterface s_orig_query_interface = nullptr;
+static std::atomic<bool> s_flip_config_hidden_logged{false};
+
+static void* __cdecl Hook_QueryInterface(NvU32 id) {
+    if (id != kNvApiIdSetFlipConfig) return s_orig_query_interface ? s_orig_query_interface(id) : nullptr;
+    if (!s_flip_config_hidden_logged.exchange(true, std::memory_order_relaxed)) {
+        char path[MAX_PATH] = "unknown";
+        HMODULE caller = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                static_cast<LPCSTR>(_ReturnAddress()), &caller) && caller != nullptr) {
+            GetModuleFileNameA(caller, path, MAX_PATH);
+        }
+        const char* name = std::strrchr(path, '\\');
+        LOG_WARN("Flip metering off: NvAPI_D3D12_SetFlipConfig hidden from %s", name ? name + 1 : path);
+    }
+    return nullptr;
+}
+#endif
+
+void InstallFlipMeteringBlock() {
+#ifdef _WIN64
+    // Pinned: the hook lives in nvapi64.dll for the rest of the process.
+    HMODULE nvapi = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"nvapi64.dll", &nvapi) &&
+        (LoadLibraryW(L"nvapi64.dll") == nullptr ||
+         !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"nvapi64.dll", &nvapi))) {
+        LOG_WARN("Flip metering off: nvapi64.dll unavailable, nothing hidden");
+        return;
+    }
+    void* query = reinterpret_cast<void*>(GetProcAddress(nvapi, "nvapi_QueryInterface"));
+    if (query == nullptr) {
+        LOG_WARN("Flip metering off: nvapi_QueryInterface not found, nothing hidden");
+        return;
+    }
+    const MH_STATUS status = InstallHook(query, reinterpret_cast<void*>(&Hook_QueryInterface),
+        reinterpret_cast<void**>(&s_orig_query_interface));
+    if (status == MH_OK || status == MH_ERROR_ENABLED) {
+        LOG_INFO("Flip metering off: nvapi_QueryInterface hook installed, NvAPI_D3D12_SetFlipConfig hidden from later requests");
+    } else {
+        LOG_WARN("Flip metering off: nvapi_QueryInterface hook not installed (%d), flip metering unchanged", status);
+    }
+#endif
 }

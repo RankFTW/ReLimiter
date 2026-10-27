@@ -93,6 +93,7 @@ struct Config {
     bool fg_late_spacing = true; // developer A/B: on (default) | off; FG input wait floors the next real frame on a late frame's readiness
     bool gpu_paced_cadence = false; // developer A/B: off (default) | on; frames whose release the GPU floor sets keep the GPU's pace (held frames get the floor too)
     bool bypass_low_latency_off = false; // developer A/B: off (default) | on; the driver's low latency mode is turned off while the Reflex Sleep is bypassed (64-bit)
+    bool flip_metering_off = false; // developer: off (default) | on; NvAPI_D3D12_SetFlipConfig is hidden from the game, so frame generation runs without hardware flip metering, as on GPUs without it (64-bit, from the next launch)
     bool adaptive_cap_hold_room = true; // developer A/B: on (default) | off; with Adaptive cap and Output override Auto the interval is kept at least at the hold room of the GPU queue wait or (with gpu_paced_cadence) the FG input wait
     bool lead_spike_floor = true; // developer A/B: on (default) | off; with Output override Auto a GPU wait lead behind the wait covers the game's rare long simulations (lead_controller.h)
     PacingPlacementOverride source_placement = PacingPlacementOverride::PreSleep; // developer: marker | pre_sleep | driver (pre_sleep is the default)

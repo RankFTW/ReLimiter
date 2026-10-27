@@ -502,6 +502,32 @@ void RepublishDuringQuery() {
     CHECK(NvAPI_CaptureFeedbackDevice(s_reentrant_device, &s_reentrant_publication));
 }
 
+#ifdef _WIN64
+// Developer flip_metering_off: the nvapi_QueryInterface detour hides
+// NvAPI_D3D12_SetFlipConfig on every request (nullptr, the driver is not asked)
+// and forwards every other ID with the driver's result.
+static int s_query_calls = 0;
+static NvU32 s_query_last = 0;
+static int s_query_target = 0;
+static void* __cdecl FakeQueryInterface(NvU32 id) {
+    ++s_query_calls;
+    s_query_last = id;
+    return &s_query_target;
+}
+
+void TestFlipMeteringBlock() {
+    const auto old_query = s_orig_query_interface;
+    s_orig_query_interface = FakeQueryInterface;
+    s_query_calls = 0;
+    CHECK(Hook_QueryInterface(0xF3148C42) == nullptr);
+    CHECK(Hook_QueryInterface(0xF3148C42) == nullptr);
+    CHECK(s_query_calls == 0);
+    CHECK(Hook_QueryInterface(0x852CD1D2) == &s_query_target); // NvAPI_D3D_Sleep
+    CHECK(s_query_calls == 1 && s_query_last == 0x852CD1D2);
+    s_orig_query_interface = old_query;
+}
+#endif
+
 void TestIdentityNormalization() {
     FakeDevice native, unrelated, alias, wrapper, nested, sibling;
     alias.canonical = &native;
@@ -1427,6 +1453,9 @@ int main(int argc, char** argv) {
     TestNativeEndpointCancellation();
     TestReflexCallForwarding();
     TestBypassLowLatencyOff();
+#ifdef _WIN64
+    TestFlipMeteringBlock();
+#endif
     // No-FG token: native mode transitions clear it; the scheduler-side
     // observation entry point republishes it (not a fixture-only publication).
     NativeGate_SetMode(NativeGateMode::Marker);

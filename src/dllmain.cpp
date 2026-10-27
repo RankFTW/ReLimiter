@@ -564,6 +564,9 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
                  g_gsync_active.load() ? "active" : "inactive",
                  g_pacing_mode.load() == PacingMode::VRR ? "VRR" : "Fixed");
 
+        // Developer flip_metering_off: before the game's frame generation
+        // resolves NvAPI_D3D12_SetFlipConfig, so not with the deferred hooks.
+        if (g_config.flip_metering_off) InstallFlipMeteringBlock();
         HWMonitor_Init();
         s_hw_monitor_started = true;
         if (g_config.dlss_info_hooks) NGXHooks_Init();

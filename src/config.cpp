@@ -415,6 +415,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.fg_late_spacing=ReadINIBool(S,"fg_late_spacing",true,P);
     g_config.gpu_paced_cadence=ReadINIBool(S,"gpu_paced_cadence",false,P);
     g_config.bypass_low_latency_off=ReadINIBool(S,"bypass_low_latency_off",false,P);
+    g_config.flip_metering_off=ReadINIBool(S,"flip_metering_off",false,P);
     g_config.adaptive_cap_hold_room=ReadINIBool(S,"adaptive_cap_hold_room",true,P);
     g_config.lead_spike_floor=ReadINIBool(S,"lead_spike_floor",true,P);
     g_config.reflex_sleep_bypass=ReadINIBool(S,"reflex_sleep_bypass",true,P);
@@ -634,6 +635,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIBool(S, "fg_late_spacing", config.fg_late_spacing, P);
     WriteINIBool(S, "gpu_paced_cadence", config.gpu_paced_cadence, P);
     WriteINIBool(S, "bypass_low_latency_off", config.bypass_low_latency_off, P);
+    WriteINIBool(S, "flip_metering_off", config.flip_metering_off, P);
     WriteINIBool(S, "adaptive_cap_hold_room", config.adaptive_cap_hold_room, P);
     WriteINIBool(S, "lead_spike_floor", config.lead_spike_floor, P);
     WriteINIString(S, "source_placement",
@@ -910,6 +912,7 @@ int Config_DeveloperOverrides() {
         (g_config.fg_late_spacing != d.fg_late_spacing) +
         (g_config.gpu_paced_cadence != d.gpu_paced_cadence) +
         (g_config.bypass_low_latency_off != d.bypass_low_latency_off) +
+        (g_config.flip_metering_off != d.flip_metering_off) +
         (g_config.adaptive_cap_hold_room != d.adaptive_cap_hold_room) +
         (g_config.lead_spike_floor != d.lead_spike_floor) +
         (g_config.source_placement != d.source_placement);
@@ -931,6 +934,7 @@ void Config_ResetDeveloperSettings() {
     g_config.fg_late_spacing = d.fg_late_spacing;
     g_config.gpu_paced_cadence = d.gpu_paced_cadence;
     g_config.bypass_low_latency_off = d.bypass_low_latency_off;
+    g_config.flip_metering_off = d.flip_metering_off;
     g_config.adaptive_cap_hold_room = d.adaptive_cap_hold_room;
     g_config.lead_spike_floor = d.lead_spike_floor;
     g_config.source_placement = d.source_placement;
@@ -996,6 +1000,9 @@ void ApplyConfig() {
     if (g_config.bypass_low_latency_off)
         LOG_WARN("Diagnostic driver low latency off while bypassed: NvAPI SetSleepMode forwarded with low latency "
                  "mode off while the Reflex Sleep is bypassed");
+    if (g_config.flip_metering_off)
+        LOG_WARN("Diagnostic flip metering off: NvAPI_D3D12_SetFlipConfig is hidden from later NvAPI requests, so "
+                 "frame generation that asks for it afterwards runs without hardware flip metering (set at launch)");
 }
 
 

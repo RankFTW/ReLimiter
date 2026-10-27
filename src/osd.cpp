@@ -567,6 +567,16 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "game's Present and ReLimiter is the only pacer. The game's own setting is restored when the "
         "bypass stops. Compare jitter, long frames and PC Latency; one setting per capture.");
 
+    if (ImGui::Checkbox("Flip metering off (next launch)", &g_config.flip_metering_off)) {
+        LOG_INFO("OSD: flip metering off -> %s (applies from the next launch)",
+            g_config.flip_metering_off ? "on" : "off");
+        *config_dirty = true;
+    }
+    HelpTip("Diagnostic, DLSS Frame Generation on GPUs with hardware flip metering (RTX 50). On hides "
+        "NvAPI_D3D12_SetFlipConfig from the game, so frame generation runs as on a GPU without flip "
+        "metering: the display engine no longer spaces the generated frames. Takes effect at the next "
+        "game launch. Leave off with Smooth Motion, which needs flip metering.");
+
     static const char* const kMarkerForwardOrderLabels[] = {"Before wait", "After wait"};
     static_assert(IM_ARRAYSIZE(kMarkerForwardOrderLabels) ==
         static_cast<int>(PacingMarkerForwardOrder::Count));
