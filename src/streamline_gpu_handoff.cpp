@@ -152,6 +152,111 @@ void ReportAdmission(bool final) noexcept {
             stages[i]->last_thread.load(std::memory_order_relaxed), last_sync.load(), last_flags.load());
     }
 }
+// Presenter diagnostic, counts only (no authority, no rejection): which threads and
+// queues present the route's native swapchain, and where those presents fall against
+// the worker cycle (one worker forward-fence Wait to the next) and the worker interval
+// (a forward-fence Wait to its back-fence Signal). Fence edges are recorded under the
+// lock, presents without it. The filtered fences keep marking edges after a revocation
+// until the binding retires.
+struct PresenterDiagnostic {
+    std::atomic<uint64_t> native{0}, generation{0};
+    std::atomic<ID3D12CommandQueue*> worker_queue{nullptr};
+    std::atomic<DWORD> worker_thread{0}, presenter_thread{0};
+    // One word, so a Present's single fetch_add both counts it and says whether it
+    // landed inside the interval: bit 63 is set while open, the rest counts its Presents.
+    static constexpr uint64_t Open = 1ull << 63;
+    std::atomic<uint64_t> interval{0};
+    std::atomic<bool> cycle_valid{false};
+    std::atomic<uint32_t> cycle_presents{0};
+    std::atomic<int64_t> back_signal_qpc{0}, back_to_input_min_us{INT64_MAX};
+    std::atomic<uint64_t> worker{0}, presenter{0}, other{0}, inside_source_present{0};
+    std::atomic<uint64_t> queue_match{0}, queue_mismatch{0}, presenter_in_interval{0};
+    std::array<std::atomic<uint64_t>, 6> per_cycle{}, per_interval{}; // 0, 1, 2, 3, 4, 5+ presents
+    std::array<std::atomic<uint64_t>, 5> back_to_input{}; // < 2, < 5, < 10, < 20, >= 20 ms
+    uint64_t reported = 0; // installer worker only
+    int64_t last_report = 0;
+} presenter_diag;
+int64_t QpcFrequency() noexcept {
+    static const int64_t hz = [] { LARGE_INTEGER value{}; QueryPerformanceFrequency(&value); return value.QuadPart; }();
+    return hz;
+}
+// Caller holds the lock.
+void RecordPresenterFence(ID3D12CommandQueue* queue, ID3D12Fence* fence, bool signal) noexcept {
+    auto& d = presenter_diag;
+    constexpr auto relaxed = std::memory_order_relaxed;
+    if (fence && fence == forward_filter.load(std::memory_order_acquire)) {
+        if (signal) { // the game's forward Signal of its next frame
+            const auto back = d.back_signal_qpc.exchange(0, relaxed);
+            if (back <= 0) return;
+            const int64_t us = (Now() - back) * 1000000 / QpcFrequency();
+            d.back_to_input[us < 2000 ? 0 : us < 5000 ? 1 : us < 10000 ? 2 : us < 20000 ? 3 : 4].fetch_add(1, relaxed);
+            if (us < d.back_to_input_min_us.load(relaxed)) d.back_to_input_min_us.store(us, relaxed);
+            return;
+        }
+        // A worker's forward Wait ends the previous worker cycle's count and opens the next
+        // cycle and its worker interval.
+        const auto presents = d.cycle_presents.exchange(0, relaxed);
+        if (d.cycle_valid.exchange(true, relaxed)) d.per_cycle[presents < 5 ? presents : 5].fetch_add(1, relaxed);
+        d.native.store(route.cycle.input.native, relaxed);
+        d.generation.store(route.cycle.input.swapchain, relaxed);
+        d.worker_queue.store(queue, relaxed);
+        d.worker_thread.store(GetCurrentThreadId(), relaxed);
+        // Opened after the worker is published: a Present that joins it (acquire) sees this worker.
+        d.interval.store(PresenterDiagnostic::Open, std::memory_order_release);
+    } else if (signal && fence && fence == back_filter.load(std::memory_order_acquire)) {
+        if (const auto prior = d.interval.exchange(0, relaxed); prior & PresenterDiagnostic::Open) {
+            const auto inside = prior & ~PresenterDiagnostic::Open;
+            d.per_interval[inside < 5 ? inside : 5].fetch_add(1, relaxed);
+        }
+        d.back_signal_qpc.store(Now(), relaxed);
+    }
+}
+// Lock-free: a native Present of the route's swapchain while a binding is retained.
+void RecordPresenterPresent(const StreamlineBoundaryEvidence& evidence) noexcept {
+    auto& d = presenter_diag;
+    constexpr auto relaxed = std::memory_order_relaxed;
+    const auto native = d.native.load(relaxed);
+    if (!native || evidence.swapchain != native || evidence.generation != d.generation.load(relaxed) ||
+        !tracking.load(std::memory_order_acquire)) return;
+    const DWORD thread = GetCurrentThreadId();
+    const bool inside = (d.interval.fetch_add(1, std::memory_order_acquire) & PresenterDiagnostic::Open) != 0;
+    d.cycle_presents.fetch_add(1, relaxed);
+    if (StreamlineInputScope::Current()) d.inside_source_present.fetch_add(1, relaxed);
+    else if (thread == d.worker_thread.load(relaxed)) d.worker.fetch_add(1, relaxed);
+    else {
+        DWORD learned = 0;
+        const bool first = d.presenter_thread.compare_exchange_strong(learned, thread, relaxed);
+        (first || learned == thread ? d.presenter : d.other).fetch_add(1, relaxed);
+        if (inside) d.presenter_in_interval.fetch_add(1, relaxed);
+    }
+    (evidence.queue == reinterpret_cast<uint64_t>(d.worker_queue.load(relaxed)) ? d.queue_match : d.queue_mismatch)
+        .fetch_add(1, relaxed);
+}
+void ReportPresenters(bool final) noexcept {
+    auto& d = presenter_diag;
+    constexpr auto relaxed = std::memory_order_relaxed;
+    const auto now = Now();
+    const auto total = d.worker.load(relaxed) + d.presenter.load(relaxed) + d.other.load(relaxed) +
+        d.inside_source_present.load(relaxed);
+    if (total == d.reported || (!final && now - d.last_report < QpcFrequency() * 5)) return;
+    d.reported = total; d.last_report = now;
+    const auto min_us = d.back_to_input_min_us.load(relaxed);
+    LOG_INFO("Streamline GPU: presents worker=%llu presenter=%llu thread=%lu other=%llu inside_source_present=%llu "
+             "queue_match=%llu queue_mismatch=%llu presenter_in_worker_interval=%llu "
+             "per_worker_cycle[0,1,2,3,4,5+]=%llu/%llu/%llu/%llu/%llu/%llu "
+             "per_worker_interval[0,1,2,3,4,5+]=%llu/%llu/%llu/%llu/%llu/%llu "
+             "back_signal_to_input_ms[<2,<5,<10,<20,20+]=%llu/%llu/%llu/%llu/%llu min_us=%lld",
+        d.worker.load(relaxed), d.presenter.load(relaxed), static_cast<unsigned long>(d.presenter_thread.load(relaxed)),
+        d.other.load(relaxed), d.inside_source_present.load(relaxed), d.queue_match.load(relaxed),
+        d.queue_mismatch.load(relaxed), d.presenter_in_interval.load(relaxed),
+        d.per_cycle[0].load(relaxed), d.per_cycle[1].load(relaxed), d.per_cycle[2].load(relaxed),
+        d.per_cycle[3].load(relaxed), d.per_cycle[4].load(relaxed), d.per_cycle[5].load(relaxed),
+        d.per_interval[0].load(relaxed), d.per_interval[1].load(relaxed), d.per_interval[2].load(relaxed),
+        d.per_interval[3].load(relaxed), d.per_interval[4].load(relaxed), d.per_interval[5].load(relaxed),
+        d.back_to_input[0].load(relaxed), d.back_to_input[1].load(relaxed), d.back_to_input[2].load(relaxed),
+        d.back_to_input[3].load(relaxed), d.back_to_input[4].load(relaxed),
+        min_us == INT64_MAX ? -1LL : static_cast<long long>(min_us));
+}
 struct Lock {
     bool held = false;
     explicit Lock(const char* critical_failure) noexcept {
@@ -446,6 +551,7 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
     fence_admission.Record(site ? nullptr : "selected_plugin_site_missing");
     Lock lock("fence_before_lock_busy");
     if (!lock.held) return {};
+    RecordPresenterFence(queue, fence, signal);
     // The worker may have finished before the outer source scope published its
     // return. Resolve that pending completion before considering a new input.
     if (source && signal) CompleteCycle();
@@ -547,6 +653,7 @@ void StreamlineHandoff_Boundary(const StreamlineBoundaryEvidence& evidence) noex
         StreamlineHandoff_Invalidate(reason, evidence.stage == StreamlineBoundaryStage::DestroyQueue ? evidence.queue : evidence.swapchain);
         return;
     }
+    RecordPresenterPresent(evidence);
     if (!tracking.load(std::memory_order_acquire) || !worker_scope.transaction) return;
     Lock lock("worker_present_lock_busy");
     if (!lock.held || route.epoch != epoch.load(std::memory_order_acquire) || !WorkerMatches()) return;
@@ -563,6 +670,7 @@ void StreamlineHandoff_Service(bool final) noexcept {
             invalidation.epoch, invalidation.reason, invalidation.qpc, invalidation.thread, invalidation.object,
             maintenance_deferrals.load(), callback_contentions.load(), invalidations.DroppedValues());
     ReportAdmission(final); // no formatting or I/O from marker/Present/queue callbacks
+    ReportPresenters(final);
     // Snapshot only scalars while locked. Registry/context and policy lookups
     // can overlap a critical fence callback and must not hold its SRW lock.
     Lock snapshot_lock(nullptr);
@@ -594,6 +702,10 @@ void StreamlineHandoff_Service(bool final) noexcept {
         route = {}; retained_epoch.store(0, std::memory_order_release); tracking.store(false, std::memory_order_release);
         completed_source_transaction.store(0, std::memory_order_relaxed);
         forward_filter.store(nullptr, std::memory_order_release); back_filter.store(nullptr, std::memory_order_release);
+        // A worker cycle or interval spanning the gap to the next binding is not counted.
+        presenter_diag.cycle_valid.store(false, std::memory_order_relaxed);
+        presenter_diag.cycle_presents.store(0, std::memory_order_relaxed); presenter_diag.interval.store(0, std::memory_order_relaxed);
+        presenter_diag.back_signal_qpc.store(0, std::memory_order_relaxed);
         lock.Unlock();
         // The source queue outlives the binding, so the gate keeps it
         // registered and only re-reads the FG swapchain identity. Destroying a
