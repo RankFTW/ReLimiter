@@ -179,7 +179,7 @@ bool Release(IUnknown* object) noexcept {
     __try { object->Release(); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { faulted.store(true, std::memory_order_release); return false; }
 }
-void Reject(StreamlineInputScope* scope = nullptr, const char* reason = "handoff_mismatch") noexcept {
+void Reject(StreamlineInputScope* scope, const char* reason) noexcept {
     if (scope) scope->invalid = true;
     StreamlineHandoff_Invalidate(reason);
 }
@@ -195,6 +195,67 @@ bool WorkerMatches() noexcept {
     return worker_scope.epoch == route.epoch && worker_scope.transaction == route.cycle.input.transaction &&
         worker_scope.queue == route.worker && route.cycle.worker_thread == GetCurrentThreadId();
 }
+// Each rejection names the check that failed; the first one of a binding is
+// logged (`binding invalidated ... reason=`). These read route state under the lock.
+constexpr const char* SiteChangedReasons[4] = {"source_signal_site_changed", "source_wait_site_changed",
+    "worker_wait_site_changed", "worker_signal_site_changed"};
+const char* SourceSignalRejection(const StreamlineInputScope& scope, ID3D12CommandQueue* queue, ID3D12Fence* fence,
+    uint64_t value, uint64_t site) noexcept {
+    if (!SamePolicy(scope)) return "route_policy_mismatch";
+    if (!route.cycle.complete) return "previous_cycle_incomplete";
+    if (route.proxy != reinterpret_cast<IDXGISwapChain*>(scope.proxy)) return "proxy_changed";
+    if (route.source != queue) return "source_queue_changed";
+    if (route.forward != fence) return "forward_fence_changed";
+    if (route.source_thread != GetCurrentThreadId()) return "source_thread_changed";
+    if (scope.input.source <= route.previous_frame) return "source_frame_not_newer";
+    if (value <= route.previous_forward) return "forward_value_not_newer";
+    if (route.successes && route.sites[0] != site) return SiteChangedReasons[0];
+    return nullptr;
+}
+const char* SourceWaitRejection(const StreamlineInputScope& scope, ID3D12CommandQueue* queue, ID3D12Fence* fence,
+    uint64_t value) noexcept {
+    if (!scope.owns_cycle) return "source_wait_before_signal";
+    if (route.epoch != scope.input.binding) return "source_wait_binding_changed";
+    if (route.source != queue) return "source_wait_queue_changed";
+    if (route.cycle.input.transaction != scope.input.transaction) return "source_wait_transaction_changed";
+    if (route.cycle.begun & 2) return "source_wait_repeated";
+    if (fence == route.forward) return "source_wait_on_forward_fence";
+    if (value <= route.previous_back) return "back_value_not_newer";
+    return nullptr;
+}
+const char* WorkerWaitRejection(ID3D12CommandQueue* queue, uint64_t site) noexcept {
+    if (!site) return "worker_wait_site_missing";
+    if (queue == route.source) return "worker_wait_on_source_queue";
+    if (route.cycle.begun & 4) return "worker_wait_repeated";
+    return nullptr;
+}
+// WorkerMatches(), split so the name says which part differed.
+const char* WorkerSignalRejection(ID3D12CommandQueue* queue, uint64_t site) noexcept {
+    if (!site) return "worker_signal_site_missing";
+    if (worker_scope.epoch != route.epoch || worker_scope.transaction != route.cycle.input.transaction)
+        return "worker_signal_without_wait";
+    if (route.cycle.worker_thread != GetCurrentThreadId()) return "worker_signal_thread_changed";
+    if (worker_scope.queue != route.worker || queue != route.worker) return "worker_signal_queue_changed";
+    if (route.cycle.begun & 8) return "worker_signal_repeated";
+    if (!route.cycle.executions) return "worker_signal_before_execute";
+    if (!route.cycle.callbacks) return "worker_signal_before_present";
+    return nullptr;
+}
+// Outside the input scope, Interested() admits the forward and back fences before
+// the lock; a binding replaced since then can leave a fence of neither.
+const char* UnexpectedFenceRejection(ID3D12Fence* fence, bool signal) noexcept {
+    if (fence == route.forward) return signal ? "forward_signal_outside_input" : "forward_wait_value_mismatch";
+    if (fence == route.back) return signal ? "back_signal_value_mismatch" : "back_wait_outside_input";
+    return "fence_not_in_route";
+}
+const char* WorkerPresentRejection(const StreamlineBoundaryEvidence& evidence) noexcept {
+    if (evidence.swapchain != route.cycle.input.native) return "worker_present_swapchain_changed";
+    if (evidence.generation != route.cycle.input.swapchain) return "worker_present_generation_changed";
+    if (evidence.queue != reinterpret_cast<uint64_t>(route.worker)) return "present_queue_not_worker";
+    if (!route.cycle.executions) return "worker_present_before_execute";
+    if (route.cycle.begun & 8) return "worker_present_after_back_signal";
+    return nullptr;
+}
 void CompleteCycle(const char* validated_reason = nullptr, bool validated = false) noexcept {
     auto& cycle = route.cycle;
     if (!cycle.outer_done && cycle.input.transaction &&
@@ -204,10 +265,10 @@ void CompleteCycle(const char* validated_reason = nullptr, bool validated = fals
         !cycle.executions || !cycle.callbacks || route.epoch != epoch.load(std::memory_order_acquire)) return;
     if (const auto* reason = validated ? validated_reason : InputRejection(cycle.input)) { Reject(nullptr, reason); return; }
     if (!route.successes) route.sites = cycle.sites;
-    else if (route.sites != cycle.sites) { Reject(); return; }
+    else if (route.sites != cycle.sites) { Reject(nullptr, "cycle_sites_changed"); return; }
     // Distinct input and consumer sites are learned from exact fence edges,
     // not fixed RVAs, signal ordinals, thread/FPS ratios or module ownership alone.
-    if (cycle.sites[0] == cycle.sites[3] || cycle.sites[1] == cycle.sites[2]) { Reject(); return; }
+    if (cycle.sites[0] == cycle.sites[3] || cycle.sites[1] == cycle.sites[2]) { Reject(nullptr, "cycle_sites_not_distinct"); return; }
     cycle.complete = true;
     route.previous_frame = cycle.input.source;
     route.previous_forward = cycle.forward;
@@ -355,20 +416,23 @@ StreamlineInputScope::StreamlineInputScope(uint64_t object, UINT sync, UINT flag
 StreamlineInputScope::~StreamlineInputScope() {
     using namespace streamline_handoff;
     const DWORD error = GetLastError();
-    bool valid = result_ == S_OK && !invalid && input.transaction && streamline_handoff::Current(input) &&
-        config == GpuPresent_GetConfig().word && multiplier == g_fg_multiplier.load(std::memory_order_acquire);
+    const char* failure = result_ != S_OK ? "present_failed" : invalid ? "input_invalidated" :
+        !input.transaction ? "input_missing" : streamline_handoff::InputRejection(input);
+    if (!failure && (config != GpuPresent_GetConfig().word || multiplier != g_fg_multiplier.load(std::memory_order_acquire)))
+        failure = "input_policy_changed";
     if (owns_cycle) {
         // Never lose a successful outer completion to a competing callback or
         // maintenance lock. The two source calls completed on this owning thread;
         // worker edges remain independently required by CompleteCycle under mutex.
-        valid = valid && successful_source_fences == 3;
+        if (!failure && successful_source_fences != 3) failure = "source_fences_incomplete";
+        const bool valid = !failure;
         if (valid) completed_source_transaction.store(input.transaction, std::memory_order_release);
-        else Reject();
+        else Reject(nullptr, failure);
         // Finish only our own successfully begun measurement. An exact-hash
         // private integration may already own this call; never finish its token.
         if (handoff) GpuPresent_FinishFgInput(input.transaction, valid);
         pins.fetch_sub(1, std::memory_order_release);
-    } else if (input.transaction && authorized.load(std::memory_order_acquire)) Reject();
+    } else if (input.transaction && authorized.load(std::memory_order_acquire)) Reject(nullptr, "present_without_input_signal");
     current_ = previous_;
     SetLastError(error);
 }
@@ -389,19 +453,16 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
         scope->multiplier != g_fg_multiplier.load(std::memory_order_acquire))) { Reject(scope, "source_policy_changed"); return {}; }
     unsigned role = 0;
     if (source) {
-        if (!queue || !fence || !site || !value || value == UINT64_MAX) { Reject(scope); return {}; }
+        if (!queue || !fence || !site || !value || value == UINT64_MAX) { Reject(scope, "source_fence_args_invalid"); return {}; }
         if (signal) {
-            if (scope->owns_cycle) { Reject(scope); return {}; } // ambiguous, not "first Signal wins"
+            if (scope->owns_cycle) { Reject(scope, "source_signal_repeated"); return {}; } // ambiguous, not "first Signal wins"
             if (!route.epoch) {
                 route.epoch = scope->input.binding; route.config = scope->config; route.multiplier = scope->multiplier;
                 route.sync_interval = scope->sync_interval;
                 route.source_thread = GetCurrentThreadId(); route.cycle.input = scope->input;
                 if (!Retain(reinterpret_cast<IDXGISwapChain*>(scope->proxy), &route.proxy) ||
-                    !Retain(queue, &route.source) || !Retain(fence, &route.forward)) { Reject(scope); return {}; }
-            } else if (!SamePolicy(*scope) || !route.cycle.complete || route.proxy != reinterpret_cast<IDXGISwapChain*>(scope->proxy) ||
-                route.source != queue || route.forward != fence || route.source_thread != GetCurrentThreadId() ||
-                scope->input.source <= route.previous_frame || value <= route.previous_forward ||
-                (route.successes && route.sites[0] != site)) { Reject(scope); return {}; }
+                    !Retain(queue, &route.source) || !Retain(fence, &route.forward)) { Reject(scope, "source_retain_failed"); return {}; }
+            } else if (const auto* reason = SourceSignalRejection(*scope, queue, fence, value, site)) { Reject(scope, reason); return {}; }
             completed_source_transaction.store(0, std::memory_order_relaxed);
             route.cycle = {}; route.cycle.input = scope->input; route.cycle.forward = value; route.cycle.begin = Now();
             scope->owns_cycle = true; pins.fetch_add(1, std::memory_order_acq_rel);
@@ -410,30 +471,27 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
             forward_filter.store(route.forward, std::memory_order_release);
             role = 1;
         } else {
-            if (!scope->owns_cycle || route.epoch != scope->input.binding || route.source != queue ||
-                route.cycle.input.transaction != scope->input.transaction || (route.cycle.begun & 2) ||
-                fence == route.forward || value <= route.previous_back) { Reject(scope); return {}; }
-            if (!route.back) { if (!Retain(fence, &route.back)) { Reject(scope); return {}; } }
-            else if (route.back != fence) { Reject(scope); return {}; }
+            if (const auto* reason = SourceWaitRejection(*scope, queue, fence, value)) { Reject(scope, reason); return {}; }
+            if (!route.back) { if (!Retain(fence, &route.back)) { Reject(scope, "back_retain_failed"); return {}; } }
+            else if (route.back != fence) { Reject(scope, "back_fence_changed"); return {}; }
             route.cycle.back = value; role = 2;
             back_filter.store(route.back, std::memory_order_release);
         }
     } else {
         if (route.epoch != epoch.load(std::memory_order_acquire)) return {};
-        if (route.cycle.complete) { Reject(); return {}; }
+        if (route.cycle.complete) { Reject(nullptr, "fence_call_after_cycle_complete"); return {}; }
         if (!signal && fence == route.forward && value == route.cycle.forward) {
-            if (!site || queue == route.source || (route.cycle.begun & 4)) { Reject(); return {}; }
-            if (!route.worker) { if (!Retain(queue, &route.worker)) { Reject(); return {}; } }
-            else if (route.worker != queue) { Reject(); return {}; }
+            if (const auto* reason = WorkerWaitRejection(queue, site)) { Reject(nullptr, reason); return {}; }
+            if (!route.worker) { if (!Retain(queue, &route.worker)) { Reject(nullptr, "worker_retain_failed"); return {}; } }
+            else if (route.worker != queue) { Reject(nullptr, "worker_queue_changed"); return {}; }
             route.cycle.worker_thread = GetCurrentThreadId();
             worker_scope = {route.epoch, route.cycle.input.transaction, queue}; role = 3;
         } else if (signal && fence == route.back && value == route.cycle.back) {
-            if (!site || !WorkerMatches() || queue != route.worker || (route.cycle.begun & 8) ||
-                !route.cycle.executions || !route.cycle.callbacks) { Reject(); return {}; }
+            if (const auto* reason = WorkerSignalRejection(queue, site)) { Reject(nullptr, reason); return {}; }
             role = 4;
-        } else { Reject(); return {}; }
+        } else { Reject(nullptr, UnexpectedFenceRejection(fence, signal)); return {}; }
     }
-    if (route.successes && route.sites[role - 1] != site) { Reject(scope, "callsite_changed"); return {}; }
+    if (route.successes && route.sites[role - 1] != site) { Reject(scope, SiteChangedReasons[role - 1]); return {}; }
     route.cycle.sites[role - 1] = site;
     route.cycle.begun |= 1u << (role - 1);
     const StreamlineFenceCall call{route.epoch, route.cycle.input.transaction, role};
@@ -492,9 +550,7 @@ void StreamlineHandoff_Boundary(const StreamlineBoundaryEvidence& evidence) noex
     if (!tracking.load(std::memory_order_acquire) || !worker_scope.transaction) return;
     Lock lock("worker_present_lock_busy");
     if (!lock.held || route.epoch != epoch.load(std::memory_order_acquire) || !WorkerMatches()) return;
-    if (evidence.swapchain != route.cycle.input.native || evidence.generation != route.cycle.input.swapchain ||
-        evidence.queue != reinterpret_cast<uint64_t>(route.worker) || !route.cycle.executions ||
-        (route.cycle.begun & 8)) { Reject(); return; }
+    if (const auto* reason = WorkerPresentRejection(evidence)) { Reject(nullptr, reason); return; }
     route.cycle.callbacks = 1; // no real/generated inference
 }
 void StreamlineHandoff_Service(bool final) noexcept {
