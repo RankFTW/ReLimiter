@@ -143,6 +143,7 @@ enum class PacingCapability : uint8_t {
     NativeRoute = 0,  // native Present attribution qualified (H)
     GpuQueue = 1,     // GPU present-queue wait ready (G)
     FgInputRoute = 2, // FG input fence route ready (G)
+    FgSeparatePresenter = 3, // FG presents from its own thread and queue, so the route cannot qualify (G)
     Count
 };
 
@@ -153,6 +154,7 @@ struct PacingCapabilities {
     bool native_route_qualified = false;
     bool gpu_queue_ready = false;
     bool fg_input_route_ready = false;
+    bool fg_separate_presenter = false;
 };
 
 struct PacingRuntimeState {

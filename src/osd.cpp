@@ -353,6 +353,9 @@ static void DrawPacingSummaryLine(const PacingPipelineSnapshot& pipeline, bool h
     case PacingFallbackReason::PresentRoute:
         ImGui::TextColored(gray, "Capped: smooth pacing needs NVIDIA Reflex in the game");
         return;
+    case PacingFallbackReason::FgRouteUnsupported:
+        ImGui::TextColored(gray, "Capped: frame generation paces its own frames here (frames are not held)");
+        return;
     case PacingFallbackReason::NoNativeRoute:
     case PacingFallbackReason::NoGpuQueue:
     case PacingFallbackReason::FgUnqualified:

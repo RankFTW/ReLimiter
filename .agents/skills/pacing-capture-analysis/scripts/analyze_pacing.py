@@ -146,7 +146,8 @@ EPOCH_REASON_NAMES = {0: "none", 1: "lifecycle", 2: "mode_change", 3: "period_ch
 # PacingFallbackReason: pipeline_change event reasons.
 FALLBACK_REASON_NAMES = {0: "none", 1: "passthrough", 2: "idle_cap", 3: "smoothing_off", 4: "override",
                          5: "present_route", 6: "architecture", 7: "api", 8: "fixed_refresh",
-                         9: "no_native_route", 10: "no_gpu_queue", 11: "fg_unqualified", 12: "infeasible"}
+                         9: "no_native_route", 10: "no_gpu_queue", 11: "fg_unqualified", 12: "infeasible",
+                         13: "fg_route_unsupported"}
 # PacingDisplaySource: display_source cells (empty without a display sample).
 DISPLAY_SOURCE_NAMES = {1: "etw", 2: "dxgi"}
 PLAN_COLUMNS = ("plan_rung", "plan_status", "display_source")

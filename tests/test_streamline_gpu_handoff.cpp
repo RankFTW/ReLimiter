@@ -76,6 +76,12 @@ void GpuPresent_OnFgBindingRetired(uint64_t) noexcept { ++retires; }
 bool GpuPresent_BeginFgInput(uint64_t, const GpuPresentFgInput& input) noexcept;
 void GpuPresent_FinishFgInput(uint64_t, bool valid) noexcept { ++finishes; if (!valid) ++invalid_finishes; }
 GpuPresentFgRouteDiagnostics GpuPresent_FgRouteDiagnostics() noexcept { return {}; }
+static bool separate_published = false;
+static uint32_t separate_controller = 0;
+void PacingPipeline_PublishCapability(PacingCapability capability, bool available, uint32_t controller) noexcept {
+    if (capability != PacingCapability::FgSeparatePresenter) return;
+    separate_published = available; separate_controller = controller;
+}
 bool NativeGate_CrossThreadVerified() noexcept { return false; }
 
 struct Object { void** table; std::atomic<unsigned> refs{1}; };
@@ -493,6 +499,38 @@ int main() {
         g_fg_multiplier = multiplier; const auto previous_begins = begins;
         Warm(); CHECK(begins == previous_begins); Cycle(); CHECK(begins == previous_begins + 1); Reset();
     }
+    // Frame generation that presents from its own thread and a known other queue
+    // (no hardware flip metering) marks the route unsupported for its identity.
+    // An unknown queue (0), no Present, or a Present of an earlier cycle is no
+    // such evidence and does not clear it either; a cycle with a worker-local
+    // Present clears it, and so does FG presenting stopping.
+    CHECK(!separate_published); // the metered cycles above never set it
+    const auto self_paced = [](uint64_t presenter_queue, const char* reason) {
+        const auto value = Source();
+        std::thread worker([=] {
+            CHECK(Fence(&b,&forward_fence,value,0x130,false) == S_OK);
+            q::ObserveExecute(As<ID3D12CommandQueue>(&b),7,reinterpret_cast<ID3D12CommandList* const*>(1));
+            if (presenter_queue != UINT64_MAX) {
+                std::thread presenter([=] {
+                    StreamlineHandoff_Boundary({StreamlineBoundaryStage::Present,0x1000,presenter_queue,0,1});
+                });
+                presenter.join();
+            }
+            CHECK(Fence(&b,&back_fence,value+10000,0x140,true) == S_OK);
+        });
+        worker.join();
+        CHECK(std::strcmp(h::rejection.load(),reason) == 0);
+        StreamlineHandoff_Service();
+    };
+    const auto other_queue = reinterpret_cast<uint64_t>(&a);
+    self_paced(0,"worker_signal_before_present"); CHECK(!separate_published);
+    self_paced(UINT64_MAX,"worker_signal_before_present"); CHECK(!separate_published);
+    self_paced(other_queue,"worker_present_on_other_queue"); CHECK(separate_published && separate_controller == 3);
+    self_paced(UINT64_MAX,"worker_signal_before_present"); CHECK(separate_published);
+    Cycle(); CHECK(!separate_published);
+    Reset(); self_paced(other_queue,"worker_present_on_other_queue"); CHECK(separate_published);
+    g_fg_presenting = false; StreamlineHandoff_Service(); CHECK(!separate_published);
+    g_fg_presenting = true; StreamlineHandoff_Service(); Reset();
     // Actual shared Present/Present1 wrappers, not just directly constructed
     // scopes: all documented intervals 0..4 preserve arguments and qualify only
     // after the same four source/worker rounds. GPU Begin precedes host Signal.

@@ -47,13 +47,16 @@ namespace
     // The first failing FG input wait requirement; None when all hold. The
     // GPU gate keys FG inputs to NvAPI frames on DX12; no executor claims an
     // FgInputWait plan elsewhere, so only a ready route on DX12 NvAPI markers
-    // can still qualify (FgUnqualified).
+    // can still qualify (FgUnqualified). A route whose frame generation
+    // presents from its own thread and queue cannot (FgRouteUnsupported).
     PacingFallbackReason FgInputBlocker(const PacingCapabilities& capabilities) noexcept
     {
         if (!capabilities.x64) return PacingFallbackReason::Architecture;
         if (capabilities.api != PacingApi::DX12) return PacingFallbackReason::Api;
         if (capabilities.route != PacingRoute::NvApiMarkers) return PacingFallbackReason::NoNativeRoute;
-        if (!capabilities.fg_input_route_ready) return PacingFallbackReason::FgUnqualified;
+        if (!capabilities.fg_input_route_ready)
+            return capabilities.fg_separate_presenter ? PacingFallbackReason::FgRouteUnsupported
+                                                      : PacingFallbackReason::FgUnqualified;
         return PacingFallbackReason::None;
     }
 
@@ -748,6 +751,7 @@ const char* PacingFallbackReason_Text(PacingFallbackReason reason) noexcept
         case PacingFallbackReason::NoGpuQueue: return "no_gpu_queue";
         case PacingFallbackReason::FgUnqualified: return "fg_unqualified";
         case PacingFallbackReason::Infeasible: return "infeasible";
+        case PacingFallbackReason::FgRouteUnsupported: return "fg_route_unsupported";
         default: return "unknown";
     }
 }

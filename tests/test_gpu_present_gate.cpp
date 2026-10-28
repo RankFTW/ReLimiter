@@ -63,6 +63,9 @@ void TestConfigWord() {
     // FG route qualification keeps the observers delivering inputs.
     PublishRung(PacingRung::SourceOnly,PacingFallbackReason::FgUnqualified);
     CHECK(GpuPresent_RequiresReadiness());
+    // So does an unsupported route, so its evidence can still clear.
+    PublishRung(PacingRung::SourceOnly,PacingFallbackReason::FgRouteUnsupported);
+    CHECK(GpuPresent_RequiresReadiness());
     PublishRung(PacingRung::SourceOnly,PacingFallbackReason::Override);
     CHECK(!GpuPresent_RequiresReadiness());
     auto pipeline=PacingPipeline_GetConfig();pipeline.rung_override=PacingRungOverride::Gpu;PacingPipeline_SetConfig(pipeline);

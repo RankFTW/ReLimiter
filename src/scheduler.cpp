@@ -851,6 +851,8 @@ static PacingPipelineSnapshot ResolvePipeline(
         PacingPipeline_HasCapability(PacingCapability::GpuQueue, generation);
     capabilities.fg_input_route_ready =
         PacingPipeline_HasCapability(PacingCapability::FgInputRoute, generation);
+    capabilities.fg_separate_presenter =
+        PacingPipeline_HasCapability(PacingCapability::FgSeparatePresenter, generation);
 
     // A Present fallback frame is a marker-flow excursion, not a route change
     // for the evidence: it neither resets it nor becomes the tracked route.

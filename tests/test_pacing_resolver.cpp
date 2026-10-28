@@ -416,6 +416,12 @@ namespace
         capabilities = QualifiedDx12();
         capabilities.fg_input_route_ready = false;
         CHECK_RESULT(Resolve(config, capabilities, ActiveFg()), Vrr, Marker, SourceOnly, FgUnqualified);
+        // Frame generation presenting from its own thread and queue: unsupported,
+        // not pending; a qualified route still wins over that evidence.
+        capabilities.fg_separate_presenter = true;
+        CHECK_RESULT(Resolve(config, capabilities, ActiveFg()), Vrr, Marker, SourceOnly, FgRouteUnsupported);
+        capabilities.fg_input_route_ready = true;
+        CHECK_RESULT(Resolve(config, capabilities, ActiveFg()), Vrr, Marker, FgInputWait, None);
     }
 
     // ── Rules 7 and 8: GPU queue wait, else marker hold ──
@@ -1238,7 +1244,7 @@ namespace
     void TestLabels()
     {
         CheckLabels(static_cast<uint32_t>(PacingRung::Count), PacingRung_Text, PacingRung::Count);
-        CheckLabels(13u, PacingFallbackReason_Text, static_cast<PacingFallbackReason>(13));
+        CheckLabels(14u, PacingFallbackReason_Text, static_cast<PacingFallbackReason>(14));
         CheckLabels(4u, PacingTimingMode_Text, static_cast<PacingTimingMode>(4));
         CHECK(std::strcmp(PacingRung_Text(PacingRung::GpuQueueWait), "gpu_queue_wait") == 0);
         CHECK(std::strcmp(PacingFallbackReason_Text(PacingFallbackReason::FgUnqualified), "fg_unqualified") == 0);

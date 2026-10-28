@@ -162,7 +162,8 @@ enum class PacingFallbackReason : uint8_t {
     NoNativeRoute = 9, // native Present attribution not qualified
     NoGpuQueue = 10,   // GPU queue not ready
     FgUnqualified = 11, // FG presenting without a qualified FG input route
-    Infeasible = 12     // the overload guard demoted the Auto rung (older builds: the resume spread switch-off)
+    Infeasible = 12,    // the overload guard demoted the Auto rung (older builds: the resume spread switch-off)
+    FgRouteUnsupported = 13 // FG presents its own frames on another thread and queue: no FG input wait
 };
 
 // ── Plans and stage events ──

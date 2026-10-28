@@ -8,6 +8,7 @@
 #include "swapchain_manager.h"
 #include "runtime_lifecycle.h"
 #include "logger.h"
+#include "pacing_resolver.h"
 #include "bounded_mpsc_queue.h"
 #include <d3d12.h>
 #include <dxgi.h>
@@ -152,110 +153,45 @@ void ReportAdmission(bool final) noexcept {
             stages[i]->last_thread.load(std::memory_order_relaxed), last_sync.load(), last_flags.load());
     }
 }
-// Presenter diagnostic, counts only (no authority, no rejection): which threads and
-// queues present the route's native swapchain, and where those presents fall against
-// the worker cycle (one worker forward-fence Wait to the next) and the worker interval
-// (a forward-fence Wait to its back-fence Signal). Fence edges are recorded under the
-// lock, presents without it. The filtered fences keep marking edges after a revocation
-// until the binding retires.
-struct PresenterDiagnostic {
-    std::atomic<uint64_t> native{0}, generation{0};
-    std::atomic<ID3D12CommandQueue*> worker_queue{nullptr};
-    std::atomic<DWORD> worker_thread{0}, presenter_thread{0};
-    // One word, so a Present's single fetch_add both counts it and says whether it
-    // landed inside the interval: bit 63 is set while open, the rest counts its Presents.
-    static constexpr uint64_t Open = 1ull << 63;
-    std::atomic<uint64_t> interval{0};
-    std::atomic<bool> cycle_valid{false};
-    std::atomic<uint32_t> cycle_presents{0};
-    std::atomic<int64_t> back_signal_qpc{0}, back_to_input_min_us{INT64_MAX};
-    std::atomic<uint64_t> worker{0}, presenter{0}, other{0}, inside_source_present{0};
-    std::atomic<uint64_t> queue_match{0}, queue_mismatch{0}, presenter_in_interval{0};
-    std::array<std::atomic<uint64_t>, 6> per_cycle{}, per_interval{}; // 0, 1, 2, 3, 4, 5+ presents
-    std::array<std::atomic<uint64_t>, 5> back_to_input{}; // < 2, < 5, < 10, < 20, >= 20 ms
-    uint64_t reported = 0; // installer worker only
-    int64_t last_report = 0;
-} presenter_diag;
-int64_t QpcFrequency() noexcept {
-    static const int64_t hz = [] { LARGE_INTEGER value{}; QueryPerformanceFrequency(&value); return value.QuadPart; }();
-    return hz;
-}
-// Caller holds the lock.
-void RecordPresenterFence(ID3D12CommandQueue* queue, ID3D12Fence* fence, bool signal) noexcept {
-    auto& d = presenter_diag;
+// Separate presenter (fg_route_unsupported). Without hardware flip metering,
+// DLSS-G presents the native swapchain from its own thread and queue after the
+// worker's return Signal, so the worker-local Present this route requires never
+// comes (Valor Mortis with SetFlipConfig hidden: every Present on one other
+// thread, none on the worker's queue). Positive evidence only: during the
+// current cycle (its token), a native Present of the bound swapchain outside
+// any source scope, on a thread other than the known worker's and a known queue
+// other than its queue. The worker identity outlives a binding, so each
+// binding's first cycle can be judged; Presents are seen lock-free.
+constexpr const char* OtherQueuePresentReason = "worker_present_on_other_queue";
+constexpr const char* PresentQueueNotWorkerReason = "present_queue_not_worker";
+struct SeparatePresenter {
+    std::atomic<uint64_t> native{0}, generation{0};         // the cycle's swapchain, published at the source Signal
+    std::atomic<ID3D12CommandQueue*> worker_queue{nullptr}; // published at the worker Wait
+    std::atomic<DWORD> worker_thread{0};
+    // Cycle token: advanced at each source Signal (under the lock). A Present
+    // records the token it loaded before its checks, so a stale observation can
+    // only miss a cycle, never mark the next one.
+    std::atomic<uint64_t> cycle{0}, seen_cycle{0};
+    // The unsupported route's identity: written under the lock, read and
+    // re-judged by Service every pass without it.
+    std::atomic<uint64_t> tag_native{0}, tag_generation{0};
+    std::atomic<uint32_t> tag_producer{0}, tag_controller{0};
+    std::atomic<int> tag_multiplier{0};
+    std::atomic<bool> evident{false};
+    bool published = false; // installer worker only
+} separate;
+// Lock-free: a native Present outside any source scope.
+void RecordSeparatePresent(const StreamlineBoundaryEvidence& evidence) noexcept {
     constexpr auto relaxed = std::memory_order_relaxed;
-    if (fence && fence == forward_filter.load(std::memory_order_acquire)) {
-        if (signal) { // the game's forward Signal of its next frame
-            const auto back = d.back_signal_qpc.exchange(0, relaxed);
-            if (back <= 0) return;
-            const int64_t us = (Now() - back) * 1000000 / QpcFrequency();
-            d.back_to_input[us < 2000 ? 0 : us < 5000 ? 1 : us < 10000 ? 2 : us < 20000 ? 3 : 4].fetch_add(1, relaxed);
-            if (us < d.back_to_input_min_us.load(relaxed)) d.back_to_input_min_us.store(us, relaxed);
-            return;
-        }
-        // A worker's forward Wait ends the previous worker cycle's count and opens the next
-        // cycle and its worker interval.
-        const auto presents = d.cycle_presents.exchange(0, relaxed);
-        if (d.cycle_valid.exchange(true, relaxed)) d.per_cycle[presents < 5 ? presents : 5].fetch_add(1, relaxed);
-        d.native.store(route.cycle.input.native, relaxed);
-        d.generation.store(route.cycle.input.swapchain, relaxed);
-        d.worker_queue.store(queue, relaxed);
-        d.worker_thread.store(GetCurrentThreadId(), relaxed);
-        // Opened after the worker is published: a Present that joins it (acquire) sees this worker.
-        d.interval.store(PresenterDiagnostic::Open, std::memory_order_release);
-    } else if (signal && fence && fence == back_filter.load(std::memory_order_acquire)) {
-        if (const auto prior = d.interval.exchange(0, relaxed); prior & PresenterDiagnostic::Open) {
-            const auto inside = prior & ~PresenterDiagnostic::Open;
-            d.per_interval[inside < 5 ? inside : 5].fetch_add(1, relaxed);
-        }
-        d.back_signal_qpc.store(Now(), relaxed);
-    }
-}
-// Lock-free: a native Present of the route's swapchain while a binding is retained.
-void RecordPresenterPresent(const StreamlineBoundaryEvidence& evidence) noexcept {
-    auto& d = presenter_diag;
-    constexpr auto relaxed = std::memory_order_relaxed;
-    const auto native = d.native.load(relaxed);
-    if (!native || evidence.swapchain != native || evidence.generation != d.generation.load(relaxed) ||
-        !tracking.load(std::memory_order_acquire)) return;
-    const DWORD thread = GetCurrentThreadId();
-    const bool inside = (d.interval.fetch_add(1, std::memory_order_acquire) & PresenterDiagnostic::Open) != 0;
-    d.cycle_presents.fetch_add(1, relaxed);
-    if (StreamlineInputScope::Current()) d.inside_source_present.fetch_add(1, relaxed);
-    else if (thread == d.worker_thread.load(relaxed)) d.worker.fetch_add(1, relaxed);
-    else {
-        DWORD learned = 0;
-        const bool first = d.presenter_thread.compare_exchange_strong(learned, thread, relaxed);
-        (first || learned == thread ? d.presenter : d.other).fetch_add(1, relaxed);
-        if (inside) d.presenter_in_interval.fetch_add(1, relaxed);
-    }
-    (evidence.queue == reinterpret_cast<uint64_t>(d.worker_queue.load(relaxed)) ? d.queue_match : d.queue_mismatch)
-        .fetch_add(1, relaxed);
-}
-void ReportPresenters(bool final) noexcept {
-    auto& d = presenter_diag;
-    constexpr auto relaxed = std::memory_order_relaxed;
-    const auto now = Now();
-    const auto total = d.worker.load(relaxed) + d.presenter.load(relaxed) + d.other.load(relaxed) +
-        d.inside_source_present.load(relaxed);
-    if (total == d.reported || (!final && now - d.last_report < QpcFrequency() * 5)) return;
-    d.reported = total; d.last_report = now;
-    const auto min_us = d.back_to_input_min_us.load(relaxed);
-    LOG_INFO("Streamline GPU: presents worker=%llu presenter=%llu thread=%lu other=%llu inside_source_present=%llu "
-             "queue_match=%llu queue_mismatch=%llu presenter_in_worker_interval=%llu "
-             "per_worker_cycle[0,1,2,3,4,5+]=%llu/%llu/%llu/%llu/%llu/%llu "
-             "per_worker_interval[0,1,2,3,4,5+]=%llu/%llu/%llu/%llu/%llu/%llu "
-             "back_signal_to_input_ms[<2,<5,<10,<20,20+]=%llu/%llu/%llu/%llu/%llu min_us=%lld",
-        d.worker.load(relaxed), d.presenter.load(relaxed), static_cast<unsigned long>(d.presenter_thread.load(relaxed)),
-        d.other.load(relaxed), d.inside_source_present.load(relaxed), d.queue_match.load(relaxed),
-        d.queue_mismatch.load(relaxed), d.presenter_in_interval.load(relaxed),
-        d.per_cycle[0].load(relaxed), d.per_cycle[1].load(relaxed), d.per_cycle[2].load(relaxed),
-        d.per_cycle[3].load(relaxed), d.per_cycle[4].load(relaxed), d.per_cycle[5].load(relaxed),
-        d.per_interval[0].load(relaxed), d.per_interval[1].load(relaxed), d.per_interval[2].load(relaxed),
-        d.per_interval[3].load(relaxed), d.per_interval[4].load(relaxed), d.per_interval[5].load(relaxed),
-        d.back_to_input[0].load(relaxed), d.back_to_input[1].load(relaxed), d.back_to_input[2].load(relaxed),
-        d.back_to_input[3].load(relaxed), d.back_to_input[4].load(relaxed),
-        min_us == INT64_MAX ? -1LL : static_cast<long long>(min_us));
+    const auto cycle = separate.cycle.load(std::memory_order_acquire);
+    const auto native = separate.native.load(relaxed);
+    if (!cycle || !native || evidence.swapchain != native || evidence.generation != separate.generation.load(relaxed) ||
+        StreamlineInputScope::Current() || !tracking.load(std::memory_order_acquire)) return;
+    const auto* worker = separate.worker_queue.load(std::memory_order_acquire);
+    // An unknown queue (0) is no evidence of another queue.
+    if (!worker || !evidence.queue || GetCurrentThreadId() == separate.worker_thread.load(relaxed) ||
+        evidence.queue == reinterpret_cast<uint64_t>(worker)) return;
+    separate.seen_cycle.store(cycle, relaxed);
 }
 struct Lock {
     bool held = false;
@@ -287,6 +223,44 @@ bool Release(IUnknown* object) noexcept {
 void Reject(StreamlineInputScope* scope, const char* reason) noexcept {
     if (scope) scope->invalid = true;
     StreamlineHandoff_Invalidate(reason);
+}
+// A structural reason marks this route identity unsupported. Caller holds the lock.
+void RejectRoute(const char* reason) noexcept {
+    if (reason == OtherQueuePresentReason || reason == PresentQueueNotWorkerReason) {
+        constexpr auto relaxed = std::memory_order_relaxed;
+        const auto& input = route.cycle.input;
+        separate.tag_native.store(input.native, relaxed); separate.tag_generation.store(input.swapchain, relaxed);
+        separate.tag_producer.store(input.producer, relaxed); separate.tag_controller.store(input.controller, relaxed);
+        separate.tag_multiplier.store(route.multiplier, relaxed);
+        separate.evident.store(true, std::memory_order_release);
+    }
+    Reject(nullptr, reason);
+}
+// Installer worker: the separate-presenter capability for the current controller,
+// while the evidence matches the current route identity and FG presents. Cleared
+// by a completed cycle or a worker-local Present, never by time.
+void PublishSeparatePresenter() noexcept {
+    constexpr auto relaxed = std::memory_order_relaxed;
+    const auto context = NativeGate_GetContext(Now());
+    const bool fg = g_fg_mode.load(std::memory_order_acquire) == 1 && g_fg_presenting.load(std::memory_order_acquire);
+    auto& s = separate;
+    bool evident = s.evident.load(std::memory_order_acquire);
+    if (evident && !(fg && s.tag_native.load(relaxed) == context.native_swapchain &&
+            s.tag_generation.load(relaxed) == context.swapchain_generation &&
+            s.tag_producer.load(relaxed) == context.producer_epoch &&
+            s.tag_controller.load(relaxed) == context.controller_generation &&
+            s.tag_multiplier.load(relaxed) == g_fg_multiplier.load(std::memory_order_acquire))) {
+        s.evident.store(false, relaxed);
+        evident = false;
+    }
+    PacingPipeline_PublishCapability(PacingCapability::FgSeparatePresenter, evident, context.controller_generation);
+    if (evident == s.published) return;
+    s.published = evident;
+    if (evident)
+        LOG_INFO("Streamline GPU: frame generation presents from its own thread and queue (no hardware flip metering); "
+                 "the FG input wait cannot hold it, the cap applies at the source (fg_route_unsupported)");
+    else
+        LOG_INFO("Streamline GPU: the separate presenter is no longer current; the FG input route is judged again");
 }
 bool SamePolicy(const StreamlineInputScope& scope) noexcept {
     const auto& a = route.cycle.input;
@@ -343,7 +317,10 @@ const char* WorkerSignalRejection(ID3D12CommandQueue* queue, uint64_t site) noex
     if (worker_scope.queue != route.worker || queue != route.worker) return "worker_signal_queue_changed";
     if (route.cycle.begun & 8) return "worker_signal_repeated";
     if (!route.cycle.executions) return "worker_signal_before_execute";
-    if (!route.cycle.callbacks) return "worker_signal_before_present";
+    if (!route.cycle.callbacks)
+        return separate.seen_cycle.load(std::memory_order_relaxed) == separate.cycle.load(std::memory_order_relaxed) &&
+            separate.worker_queue.load(std::memory_order_relaxed) == route.worker
+            ? OtherQueuePresentReason : "worker_signal_before_present";
     return nullptr;
 }
 // Outside the input scope, Interested() admits the forward and back fences before
@@ -356,7 +333,8 @@ const char* UnexpectedFenceRejection(ID3D12Fence* fence, bool signal) noexcept {
 const char* WorkerPresentRejection(const StreamlineBoundaryEvidence& evidence) noexcept {
     if (evidence.swapchain != route.cycle.input.native) return "worker_present_swapchain_changed";
     if (evidence.generation != route.cycle.input.swapchain) return "worker_present_generation_changed";
-    if (evidence.queue != reinterpret_cast<uint64_t>(route.worker)) return "present_queue_not_worker";
+    if (!evidence.queue) return "worker_present_queue_unknown";
+    if (evidence.queue != reinterpret_cast<uint64_t>(route.worker)) return PresentQueueNotWorkerReason;
     if (!route.cycle.executions) return "worker_present_before_execute";
     if (route.cycle.begun & 8) return "worker_present_after_back_signal";
     return nullptr;
@@ -375,6 +353,7 @@ void CompleteCycle(const char* validated_reason = nullptr, bool validated = fals
     // not fixed RVAs, signal ordinals, thread/FPS ratios or module ownership alone.
     if (cycle.sites[0] == cycle.sites[3] || cycle.sites[1] == cycle.sites[2]) { Reject(nullptr, "cycle_sites_not_distinct"); return; }
     cycle.complete = true;
+    separate.evident.store(false, std::memory_order_relaxed); // a completed cycle proves the worker-local route
     route.previous_frame = cycle.input.source;
     route.previous_forward = cycle.forward;
     route.previous_back = cycle.back;
@@ -551,7 +530,6 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
     fence_admission.Record(site ? nullptr : "selected_plugin_site_missing");
     Lock lock("fence_before_lock_busy");
     if (!lock.held) return {};
-    RecordPresenterFence(queue, fence, signal);
     // The worker may have finished before the outer source scope published its
     // return. Resolve that pending completion before considering a new input.
     if (source && signal) CompleteCycle();
@@ -571,6 +549,9 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
             } else if (const auto* reason = SourceSignalRejection(*scope, queue, fence, value, site)) { Reject(scope, reason); return {}; }
             completed_source_transaction.store(0, std::memory_order_relaxed);
             route.cycle = {}; route.cycle.input = scope->input; route.cycle.forward = value; route.cycle.begin = Now();
+            separate.generation.store(scope->input.swapchain, std::memory_order_relaxed);
+            separate.native.store(scope->input.native, std::memory_order_relaxed);
+            separate.cycle.fetch_add(1, std::memory_order_release); // opens this cycle's evidence
             scope->owns_cycle = true; pins.fetch_add(1, std::memory_order_acq_rel);
             retained_epoch.store(route.epoch, std::memory_order_release);
             tracking.store(true, std::memory_order_release);
@@ -591,9 +572,11 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
             if (!route.worker) { if (!Retain(queue, &route.worker)) { Reject(nullptr, "worker_retain_failed"); return {}; } }
             else if (route.worker != queue) { Reject(nullptr, "worker_queue_changed"); return {}; }
             route.cycle.worker_thread = GetCurrentThreadId();
+            separate.worker_thread.store(route.cycle.worker_thread, std::memory_order_relaxed);
+            separate.worker_queue.store(queue, std::memory_order_release);
             worker_scope = {route.epoch, route.cycle.input.transaction, queue}; role = 3;
         } else if (signal && fence == route.back && value == route.cycle.back) {
-            if (const auto* reason = WorkerSignalRejection(queue, site)) { Reject(nullptr, reason); return {}; }
+            if (const auto* reason = WorkerSignalRejection(queue, site)) { RejectRoute(reason); return {}; }
             role = 4;
         } else { Reject(nullptr, UnexpectedFenceRejection(fence, signal)); return {}; }
     }
@@ -653,24 +636,30 @@ void StreamlineHandoff_Boundary(const StreamlineBoundaryEvidence& evidence) noex
         StreamlineHandoff_Invalidate(reason, evidence.stage == StreamlineBoundaryStage::DestroyQueue ? evidence.queue : evidence.swapchain);
         return;
     }
-    RecordPresenterPresent(evidence);
+    RecordSeparatePresent(evidence);
     if (!tracking.load(std::memory_order_acquire) || !worker_scope.transaction) return;
     Lock lock("worker_present_lock_busy");
     if (!lock.held || route.epoch != epoch.load(std::memory_order_acquire) || !WorkerMatches()) return;
-    if (const auto* reason = WorkerPresentRejection(evidence)) { Reject(nullptr, reason); return; }
+    if (const auto* reason = WorkerPresentRejection(evidence)) { RejectRoute(reason); return; }
     route.cycle.callbacks = 1; // no real/generated inference
+    separate.evident.store(false, std::memory_order_relaxed); // a worker-local Present proves the route
 }
 void StreamlineHandoff_Service(bool final) noexcept {
     using namespace streamline_handoff;
     if (final) StreamlineHandoff_Invalidate("final_drain");
     else if (const auto* reason = PolicyRejection()) StreamlineHandoff_Invalidate(reason);
     Invalidation invalidation;
-    for (unsigned i = 0; i < 32 && invalidations.Pop(&invalidation); ++i)
+    for (unsigned i = 0; i < 32 && invalidations.Pop(&invalidation); ++i) {
+        // While frame generation presents from its own thread every binding fails
+        // the same way; the state is logged once instead (PublishSeparatePresenter).
+        if (separate.published && (invalidation.reason == OtherQueuePresentReason ||
+                                   invalidation.reason == PresentQueueNotWorkerReason)) continue;
         LOG_INFO("Streamline GPU: binding invalidated epoch=%llu reason=%s qpc=%lld thread=%lu object=%llu maintenance_deferrals=%llu callback_contentions=%llu record_drops=%llu",
             invalidation.epoch, invalidation.reason, invalidation.qpc, invalidation.thread, invalidation.object,
             maintenance_deferrals.load(), callback_contentions.load(), invalidations.DroppedValues());
+    }
+    PublishSeparatePresenter();
     ReportAdmission(final); // no formatting or I/O from marker/Present/queue callbacks
-    ReportPresenters(final);
     // Snapshot only scalars while locked. Registry/context and policy lookups
     // can overlap a critical fence callback and must not hold its SRW lock.
     Lock snapshot_lock(nullptr);
@@ -702,10 +691,6 @@ void StreamlineHandoff_Service(bool final) noexcept {
         route = {}; retained_epoch.store(0, std::memory_order_release); tracking.store(false, std::memory_order_release);
         completed_source_transaction.store(0, std::memory_order_relaxed);
         forward_filter.store(nullptr, std::memory_order_release); back_filter.store(nullptr, std::memory_order_release);
-        // A worker cycle or interval spanning the gap to the next binding is not counted.
-        presenter_diag.cycle_valid.store(false, std::memory_order_relaxed);
-        presenter_diag.cycle_presents.store(0, std::memory_order_relaxed); presenter_diag.interval.store(0, std::memory_order_relaxed);
-        presenter_diag.back_signal_qpc.store(0, std::memory_order_relaxed);
         lock.Unlock();
         // The source queue outlives the binding, so the gate keeps it
         // registered and only re-reads the FG swapchain identity. Destroying a
@@ -713,7 +698,8 @@ void StreamlineHandoff_Service(bool final) noexcept {
         // plugin-owned fence is destroyed or signalled here.
         if (old.source) GpuPresent_OnFgBindingRetired(reinterpret_cast<uint64_t>(old.source));
         const bool released = Release(old.proxy) & Release(old.source) & Release(old.worker) & Release(old.forward) & Release(old.back);
-        LOG_INFO("Streamline GPU: binding retired epoch=%llu last_reason=%s retained_refs_released=%d", old.epoch, reason, released);
+        if (!separate.published)
+            LOG_INFO("Streamline GPU: binding retired epoch=%llu last_reason=%s retained_refs_released=%d", old.epoch, reason, released);
         return;
     }
     if (route.cycle.complete && !route.device_checked) {
