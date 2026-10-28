@@ -58,6 +58,9 @@ void StreamlineHandoff_Execute(ID3D12CommandQueue*) noexcept;
 bool StreamlineHandoff_Tracking() noexcept;
 bool StreamlineHandoff_Interested(ID3D12Fence*) noexcept;
 void StreamlineHandoff_RejectQueueMethods() noexcept;
+// Dependency diagnostic (counts only): every queue Signal/Wait from the queue hooks;
+// records only calls on the FG worker's queue and the separate presenter's queue.
+void StreamlineHandoff_RecordQueueFence(ID3D12CommandQueue*, ID3D12Fence*, uint64_t value, bool signal) noexcept;
 #else
 inline void StreamlineHandoff_Invalidate(const char* = "explicit_invalidation", uint64_t = 0) noexcept {}
 inline StreamlineHandoffStatus StreamlineHandoff_ReadStatus() noexcept { return {}; }

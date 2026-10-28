@@ -56,10 +56,12 @@ template<class Forward> HRESULT ObserveFence(ID3D12CommandQueue* queue, ID3D12Fe
     RuntimeCallbackGuard callback;
     Depth nested;
     StreamlineFenceCall call;
-    if (!callback.IsStopping() && depth == 1 && ready.load(std::memory_order_acquire) &&
-        StreamlineHandoff_Interested(fence)) {
-        if (MatchesQueue(queue)) call = StreamlineHandoff_BeforeFence(queue, fence, value, PluginSite(), signal);
-        else StreamlineHandoff_RejectQueueMethods();
+    if (!callback.IsStopping() && depth == 1 && ready.load(std::memory_order_acquire)) {
+        StreamlineHandoff_RecordQueueFence(queue, fence, value, signal);
+        if (StreamlineHandoff_Interested(fence)) {
+            if (MatchesQueue(queue)) call = StreamlineHandoff_BeforeFence(queue, fence, value, PluginSite(), signal);
+            else StreamlineHandoff_RejectQueueMethods();
+        }
     }
     SetLastError(incoming);
     const HRESULT result = forward();

@@ -12,6 +12,7 @@
 #include "bounded_mpsc_queue.h"
 #include <d3d12.h>
 #include <dxgi.h>
+#include <cstdio>
 #include <array>
 #include <atomic>
 
@@ -180,6 +181,7 @@ struct SeparatePresenter {
     std::atomic<bool> evident{false};
     bool published = false; // installer worker only
 } separate;
+void RecordChainPresenter(uint64_t queue) noexcept; // dependency diagnostic, below
 // Lock-free: a native Present outside any source scope.
 void RecordSeparatePresent(const StreamlineBoundaryEvidence& evidence) noexcept {
     constexpr auto relaxed = std::memory_order_relaxed;
@@ -192,6 +194,159 @@ void RecordSeparatePresent(const StreamlineBoundaryEvidence& evidence) noexcept 
     if (!worker || !evidence.queue || GetCurrentThreadId() == separate.worker_thread.load(relaxed) ||
         evidence.queue == reinterpret_cast<uint64_t>(worker)) return;
     separate.seen_cycle.store(cycle, relaxed);
+    RecordChainPresenter(evidence.queue);
+}
+// Dependency diagnostic, counts only (no authority, no rejection): which fences the
+// FG worker's queue and the separate presenter's queue signal and wait on, and for a
+// wait on a fence the other side signals, whether the waited value is at, below or
+// above that side's newest Signal so far. It answers, before a hold is designed for
+// frame generation that presents its own frames, whether the presenter's queue is the
+// game's source queue and how its Presents depend on the worker's work.
+// Only the installer worker publishes the two queues, from observation records; the
+// hooks push records for published queues only. Destroying any queue advances one
+// epoch; every record carries the epoch it read before the queues. The installer
+// worker aggregates in push order: older-epoch records are dropped, and a newer epoch
+// reports, resets and unpublishes both sides until observations of that epoch
+// publish them again. So a Wait is judged only against Signals of its own epoch
+// pushed before it, and nothing crosses a queue's destruction. A side also restarts,
+// after being reported, when its queue changes. The tables keep the first 8 fences
+// per queue and direction.
+struct ChainRecord {
+    enum class Kind : uint8_t { WorkerSignal, WorkerWait, PresenterSignal, PresenterWait, WorkerSeen, PresenterSeen };
+    Kind kind = Kind::WorkerSignal;
+    bool presenter_is_source = false; // PresenterSeen
+    const void* queue = nullptr;
+    const void* fence = nullptr;
+    uint64_t value = 0, epoch = 0;
+};
+struct ChainDiagnostic {
+    // Queues: written by the installer worker only. Epoch: advanced by any queue destroy.
+    std::atomic<ID3D12CommandQueue*> worker_queue{nullptr}, presenter_queue{nullptr}, source_queue{nullptr};
+    std::atomic<uint64_t> epoch{1};
+    std::atomic<ID3D12Fence*> forward_fence{nullptr}, back_fence{nullptr};
+    std::atomic<DWORD> presenter_thread{0};
+    relimiter::BoundedMpscQueue<ChainRecord, 1024> records;
+} chain;
+// Installer worker only.
+struct ChainTally { const void* fence = nullptr; uint64_t calls = 0, last = 0, at = 0, below = 0, above = 0; };
+struct ChainTable {
+    std::array<ChainTally, 8> entries{};
+    uint64_t overflow = 0;
+    const ChainTally* Find(const void* fence) const noexcept {
+        for (const auto& entry : entries) if (entry.fence == fence) return &entry;
+        return nullptr;
+    }
+    ChainTally* Claim(const void* fence) noexcept {
+        for (auto& entry : entries) {
+            if (entry.fence == fence) return &entry;
+            if (!entry.fence) { entry.fence = fence; return &entry; }
+        }
+        ++overflow;
+        return nullptr;
+    }
+};
+struct ChainSide { const void* queue = nullptr; ChainTable signals, waits; };
+struct ChainAggregate {
+    ChainSide worker, presenter;
+    uint64_t epoch = 1, presenter_is_source = 0, presenter_other = 0, dropped = 0, version = 0, reported = 0;
+    int64_t last_report = 0;
+} aggregate;
+void ReportChainTable(const char* side, const char* direction, const ChainTable& table, const void* queue) noexcept {
+    char line[1024]; int used = 0;
+    const void* forward = chain.forward_fence.load(std::memory_order_relaxed);
+    const void* back = chain.back_fence.load(std::memory_order_relaxed);
+    for (const auto& entry : table.entries) {
+        if (!entry.fence || used >= static_cast<int>(sizeof(line))) break;
+        const int wrote = std::snprintf(line + used, sizeof(line) - used, " [%p%s calls=%llu last=%llu at=%llu below=%llu above=%llu]",
+            entry.fence, entry.fence == forward ? " forward" : entry.fence == back ? " back" : "",
+            static_cast<unsigned long long>(entry.calls), static_cast<unsigned long long>(entry.last),
+            static_cast<unsigned long long>(entry.at), static_cast<unsigned long long>(entry.below),
+            static_cast<unsigned long long>(entry.above));
+        if (wrote < 0) break;
+        used += wrote;
+    }
+    if (used == 0) return;
+    LOG_INFO("Streamline GPU: chain %s %s queue=%p overflow=%llu:%s", side, direction, queue,
+        static_cast<unsigned long long>(table.overflow), line);
+}
+void ReportChainSide(const char* name, const ChainSide& side) noexcept {
+    ReportChainTable(name, "signals", side.signals, side.queue);
+    ReportChainTable(name, "waits", side.waits, side.queue);
+}
+// Reports the previous queue's counts, then publishes `queue` (nullptr unpublishes).
+void RestartChainSide(const char* name, ChainSide& side, std::atomic<ID3D12CommandQueue*>& published, const void* queue) noexcept {
+    if (side.queue) ReportChainSide(name, side);
+    side = {};
+    side.queue = queue;
+    published.store(const_cast<ID3D12CommandQueue*>(static_cast<const ID3D12CommandQueue*>(queue)), std::memory_order_release);
+    ++aggregate.version;
+}
+// A queue was destroyed: nothing of the previous epoch is counted or published again.
+void AdvanceChainEpoch(uint64_t epoch) noexcept {
+    RestartChainSide("worker", aggregate.worker, chain.worker_queue, nullptr);
+    RestartChainSide("presenter", aggregate.presenter, chain.presenter_queue, nullptr);
+    aggregate.epoch = epoch;
+}
+void AggregateChain(const ChainRecord& record) noexcept {
+    using Kind = ChainRecord::Kind;
+    auto& a = aggregate;
+    if (record.epoch < a.epoch) { ++a.dropped; return; }
+    if (record.epoch > a.epoch) AdvanceChainEpoch(record.epoch);
+    const bool worker = record.kind == Kind::WorkerSignal || record.kind == Kind::WorkerWait || record.kind == Kind::WorkerSeen;
+    auto& side = worker ? a.worker : a.presenter;
+    if (record.kind == Kind::WorkerSeen || record.kind == Kind::PresenterSeen) {
+        if (record.kind == Kind::PresenterSeen) { ++(record.presenter_is_source ? a.presenter_is_source : a.presenter_other); ++a.version; }
+        if (side.queue != record.queue)
+            RestartChainSide(worker ? "worker" : "presenter", side, worker ? chain.worker_queue : chain.presenter_queue, record.queue);
+        return;
+    }
+    if (side.queue != record.queue) { ++a.dropped; return; }
+    ++a.version;
+    const bool signal = record.kind == Kind::WorkerSignal || record.kind == Kind::PresenterSignal;
+    auto* entry = (signal ? side.signals : side.waits).Claim(record.fence);
+    if (!entry) return;
+    ++entry->calls;
+    entry->last = record.value;
+    if (signal) return;
+    if (const auto* signalled = (worker ? a.presenter : a.worker).signals.Find(record.fence))
+        ++(record.value == signalled->last ? entry->at : record.value < signalled->last ? entry->below : entry->above);
+}
+void PushChainSeen(ChainRecord::Kind kind, const void* queue, bool presenter_is_source) noexcept {
+    ChainRecord record;
+    record.kind = kind;
+    record.queue = queue;
+    record.presenter_is_source = presenter_is_source;
+    record.epoch = chain.epoch.load(std::memory_order_acquire);
+    chain.records.Push(record);
+}
+// A separate-presenter Present passed RecordSeparatePresent's checks.
+void RecordChainPresenter(uint64_t queue) noexcept {
+    auto* presenter = reinterpret_cast<ID3D12CommandQueue*>(queue);
+    chain.presenter_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    PushChainSeen(ChainRecord::Kind::PresenterSeen, presenter, presenter == chain.source_queue.load(std::memory_order_acquire));
+}
+// Any destroyed queue's address can be reused by a later queue.
+void RecordChainDestroyed() noexcept { chain.epoch.fetch_add(1, std::memory_order_acq_rel); }
+void ReportChain(bool final) noexcept {
+    auto& a = aggregate;
+    ChainRecord record;
+    for (unsigned i = 0; i < 4096 && chain.records.Pop(&record); ++i) AggregateChain(record);
+    // A destroy without records since: unpublish now, so no reused address is matched.
+    if (const uint64_t epoch = chain.epoch.load(std::memory_order_acquire); epoch > a.epoch) AdvanceChainEpoch(epoch);
+    const auto context = NativeGate_GetContext(Now());
+    if (a.version == a.reported || (!final && (context.qpc_frequency <= 0 ||
+        context.now_qpc - a.last_report < context.qpc_frequency * 5))) return;
+    a.reported = a.version; a.last_report = context.now_qpc;
+    constexpr auto relaxed = std::memory_order_relaxed;
+    LOG_INFO("Streamline GPU: chain presenter_queue=%p thread=%lu source_queue=%p worker_queue=%p "
+             "presenter_is_source=%llu presenter_other=%llu forward=%p back=%p record_drops=%llu stale_records=%llu",
+        a.presenter.queue, static_cast<unsigned long>(chain.presenter_thread.load(relaxed)),
+        static_cast<void*>(chain.source_queue.load(relaxed)), a.worker.queue,
+        static_cast<unsigned long long>(a.presenter_is_source), static_cast<unsigned long long>(a.presenter_other),
+        static_cast<void*>(chain.forward_fence.load(relaxed)), static_cast<void*>(chain.back_fence.load(relaxed)),
+        static_cast<unsigned long long>(chain.records.DroppedValues()), static_cast<unsigned long long>(a.dropped));
+    ReportChainSide("worker", a.worker);
+    ReportChainSide("presenter", a.presenter);
 }
 struct Lock {
     bool held = false;
@@ -546,6 +701,8 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
                 route.source_thread = GetCurrentThreadId(); route.cycle.input = scope->input;
                 if (!Retain(reinterpret_cast<IDXGISwapChain*>(scope->proxy), &route.proxy) ||
                     !Retain(queue, &route.source) || !Retain(fence, &route.forward)) { Reject(scope, "source_retain_failed"); return {}; }
+                chain.source_queue.store(queue, std::memory_order_release);
+                chain.forward_fence.store(fence, std::memory_order_relaxed);
             } else if (const auto* reason = SourceSignalRejection(*scope, queue, fence, value, site)) { Reject(scope, reason); return {}; }
             completed_source_transaction.store(0, std::memory_order_relaxed);
             route.cycle = {}; route.cycle.input = scope->input; route.cycle.forward = value; route.cycle.begin = Now();
@@ -559,7 +716,10 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
             role = 1;
         } else {
             if (const auto* reason = SourceWaitRejection(*scope, queue, fence, value)) { Reject(scope, reason); return {}; }
-            if (!route.back) { if (!Retain(fence, &route.back)) { Reject(scope, "back_retain_failed"); return {}; } }
+            if (!route.back) {
+                if (!Retain(fence, &route.back)) { Reject(scope, "back_retain_failed"); return {}; }
+                chain.back_fence.store(fence, std::memory_order_relaxed);
+            }
             else if (route.back != fence) { Reject(scope, "back_fence_changed"); return {}; }
             route.cycle.back = value; role = 2;
             back_filter.store(route.back, std::memory_order_release);
@@ -574,6 +734,7 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
             route.cycle.worker_thread = GetCurrentThreadId();
             separate.worker_thread.store(route.cycle.worker_thread, std::memory_order_relaxed);
             separate.worker_queue.store(queue, std::memory_order_release);
+            PushChainSeen(ChainRecord::Kind::WorkerSeen, queue, false);
             worker_scope = {route.epoch, route.cycle.input.transaction, queue}; role = 3;
         } else if (signal && fence == route.back && value == route.cycle.back) {
             if (const auto* reason = WorkerSignalRejection(queue, site)) { RejectRoute(reason); return {}; }
@@ -621,6 +782,7 @@ void StreamlineHandoff_Execute(ID3D12CommandQueue* queue) noexcept {
 void StreamlineHandoff_Boundary(const StreamlineBoundaryEvidence& evidence) noexcept {
     using namespace streamline_handoff;
     if (evidence.stage != StreamlineBoundaryStage::Present) {
+        if (evidence.stage == StreamlineBoundaryStage::DestroyQueue) RecordChainDestroyed();
         if (evidence.stage == StreamlineBoundaryStage::DestroyQueue) {
             Lock lock("queue_lifecycle_lock_busy");
             if (!lock.held) return;
@@ -659,6 +821,7 @@ void StreamlineHandoff_Service(bool final) noexcept {
             maintenance_deferrals.load(), callback_contentions.load(), invalidations.DroppedValues());
     }
     PublishSeparatePresenter();
+    ReportChain(final);
     ReportAdmission(final); // no formatting or I/O from marker/Present/queue callbacks
     // Snapshot only scalars while locked. Registry/context and policy lookups
     // can overlap a critical fence callback and must not hold its SRW lock.
@@ -736,4 +899,20 @@ bool StreamlineHandoff_ReleaseAfterRundown() noexcept {
 void StreamlineHandoff_RejectQueueMethods() noexcept {
     streamline_handoff::fence_admission.Record("queue_vtable_methods_mismatch");
     streamline_handoff::Reject(nullptr, "queue_vtable_methods_mismatch");
+}
+void StreamlineHandoff_RecordQueueFence(ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t value, bool signal) noexcept {
+    using namespace streamline_handoff;
+    using Kind = ChainRecord::Kind;
+    if (!queue || !fence) return;
+    // The epoch before the queues: a match after a destroy carries the destroy's epoch.
+    const uint64_t epoch = chain.epoch.load(std::memory_order_acquire);
+    ChainRecord record;
+    if (queue == chain.worker_queue.load(std::memory_order_acquire)) record.kind = signal ? Kind::WorkerSignal : Kind::WorkerWait;
+    else if (queue == chain.presenter_queue.load(std::memory_order_acquire)) record.kind = signal ? Kind::PresenterSignal : Kind::PresenterWait;
+    else return;
+    record.queue = queue;
+    record.fence = fence;
+    record.value = value;
+    record.epoch = epoch;
+    chain.records.Push(record);
 }
