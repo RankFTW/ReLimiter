@@ -1240,6 +1240,77 @@ static NvAPI_Status __cdecl Hook_SetAsyncFrameMarker(IUnknown* queue, NV_ASYNC_F
     return result;
 }
 
+#ifdef _WIN64
+// ── Hook: SetFlipConfig — pass-through observation ──
+// DLSS Frame Generation calls NvAPI_D3D12_SetFlipConfig before the first Present
+// of each batch so the display engine spaces that batch's flips (hardware flip
+// metering). The hook never alters the call or its result. It logs the first
+// configuration and each change of the batch size, the presented frames, the
+// driver's status and its feedback (not the batch time, which follows the frame
+// rate), at most kFlipConfigLogLimit times, so a log shows whether metering was
+// asked for and what the driver answered.
+static constexpr NvU32 kNvApiIdSetFlipConfig = 0xF3148C42;
+static constexpr uint32_t kFlipConfigLogLimit = 16;
+static PFN_NvAPI_D3D12_SetFlipConfig s_orig_set_flip_config = nullptr;
+// The flip metering block's trampoline (below): the original nvapi_QueryInterface
+// once the block's hook exists, enabled or not.
+static PFN_NvAPI_QueryInterface s_orig_query_interface = nullptr;
+static std::atomic<uint64_t> s_flip_config_signature{UINT64_MAX};
+static std::atomic<uint64_t> s_flip_config_calls{0};
+static std::atomic<uint32_t> s_flip_config_logs{0};
+
+static NvAPI_Status SafeInvokeSetFlipConfig(IUnknown* queue, UINT source, NV_FLIP_CONFIG* config) noexcept {
+    if (!s_orig_set_flip_config) return NVAPI_ERROR;
+    __try { return s_orig_set_flip_config(queue, source, config); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return NVAPI_ERROR; }
+}
+
+static bool SafeReadFlipConfig(const NV_FLIP_CONFIG* config, NV_FLIP_CONFIG* out) noexcept {
+    __try { *out = *config; return true; }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static const char* FlipConfigFeedbackText(NvU32 mask) noexcept {
+    switch (mask) {
+    case 0: return "ok";
+    case 1: return "no_iflip";
+    case 2: return "mirroring_detected";
+    case 3: return "no_iflip+mirroring_detected";
+    default: return "unknown_bits";
+    }
+}
+
+static NvAPI_Status __cdecl Hook_SetFlipConfig(IUnknown* queue, UINT source, NV_FLIP_CONFIG* config) {
+    RuntimeCallbackGuard callback;
+    const NvAPI_Status result = SafeInvokeSetFlipConfig(queue, source, config);
+    const uint64_t call = s_flip_config_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    NV_FLIP_CONFIG seen{};
+    if (callback.IsStopping() || !config || !SafeReadFlipConfig(config, &seen)) return result;
+    const NvU32 struct_version = seen.version >> 16;
+    const bool v2 = struct_version >= 2;
+    const NvU32 presented = v2 ? seen.nPresentedFramesPerBatch : 0;
+    const uint64_t signature = (static_cast<uint64_t>(static_cast<uint32_t>(result)) << 32) |
+        (static_cast<uint64_t>(seen.nFramesPerBatch & 0xFFu) << 24) |
+        (static_cast<uint64_t>(presented & 0xFFu) << 16) |
+        (static_cast<uint64_t>(seen.flipConfigFeedbackMask & 0xFFu) << 8) | (struct_version & 0xFFu);
+    if (s_flip_config_signature.exchange(signature, std::memory_order_relaxed) == signature) return result;
+    const uint32_t logged = s_flip_config_logs.fetch_add(1, std::memory_order_relaxed);
+    if (logged < kFlipConfigLogLimit) {
+        LOG_INFO("NvAPI: SetFlipConfig call %llu: status=%d frames_per_batch=%u%s presented_per_batch=%u "
+                 "time_per_batch_ms=%.2f feedback=0x%x (%s) vidpn_source=%u version=%u thread=%lu",
+                 static_cast<unsigned long long>(call), result, seen.nFramesPerBatch,
+                 seen.nFramesPerBatch == 0 ? " (metering off)" : "", presented,
+                 v2 ? static_cast<double>(seen.timePerBatchMs) : 0.0, seen.flipConfigFeedbackMask,
+                 FlipConfigFeedbackText(seen.flipConfigFeedbackMask), source, struct_version,
+                 static_cast<unsigned long>(GetCurrentThreadId()));
+    } else if (logged == kFlipConfigLogLimit) {
+        LOG_INFO("NvAPI: SetFlipConfig configuration changed again; later changes are not logged (limit %u lines)",
+                 kFlipConfigLogLimit);
+    }
+    return result;
+}
+#endif
+
 // ── Public API ──
 NvAPI_Status InvokeSetLatencyMarker(IUnknown* dev, NV_LATENCY_MARKER_PARAMS* params) {
     return s_orig_set_latency_marker(dev, params);
@@ -1342,6 +1413,16 @@ void InstallNvAPIHooks() {
         LOG_INFO("NvAPI: SetAsyncFrameMarker timing hook %s",
                  status == MH_OK ? "installed" : "not installed");
     }
+    // Through the block's trampoline when the block's hook exists (enabled now or
+    // later by a reload): this request must never reach the block, which would log
+    // it as its first hidden request. Under the block frame generation never gets
+    // the function, so nothing is observed.
+    if (void* pSetFlipConfig = s_orig_query_interface ? s_orig_query_interface(kNvApiIdSetFlipConfig)
+                                                      : NvAPI_QI(kNvApiIdSetFlipConfig)) {
+        const MH_STATUS status = InstallHook(pSetFlipConfig, (void*)&Hook_SetFlipConfig,
+            (void**)&s_orig_set_flip_config);
+        LOG_INFO("NvAPI: SetFlipConfig observation hook %s", status == MH_OK ? "installed" : "not installed");
+    }
 #endif // _WIN64
 }
 
@@ -1355,8 +1436,6 @@ void InstallNvAPIHooks() {
 // with the deferred hooks: frame generation resolves the function itself, and
 // a pointer it resolved before the hook stays usable.
 #ifdef _WIN64
-static constexpr NvU32 kNvApiIdSetFlipConfig = 0xF3148C42;
-static PFN_NvAPI_QueryInterface s_orig_query_interface = nullptr;
 static std::atomic<bool> s_flip_config_hidden_logged{false};
 
 static void* __cdecl Hook_QueryInterface(NvU32 id) {

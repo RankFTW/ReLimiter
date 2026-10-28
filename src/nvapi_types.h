@@ -9,6 +9,7 @@
 
 typedef int NvAPI_Status;
 constexpr NvAPI_Status NVAPI_OK = 0;
+constexpr NvAPI_Status NVAPI_ERROR = -1;
 
 typedef uint32_t NvU32;
 
@@ -59,9 +60,23 @@ struct NV_ASYNC_FRAME_MARKER_PARAMS {
 };
 static_assert(sizeof(NV_ASYNC_FRAME_MARKER_PARAMS) == 88, "layout of nvapi.h's V1 structure");
 
+// NvAPI_D3D12_SetFlipConfig configuration (nvapi.h NV_FLIP_CONFIG_V1 / V2, both
+// 24 bytes; the version word is sizeof | (n << 16)). V1 has reserved words where
+// V2 has nPresentedFramesPerBatch and timePerBatchMs.
+struct NV_FLIP_CONFIG {
+    NvU32 version;
+    NvU32 nFramesPerBatch;          // 0: flip metering off
+    NvU32 flipConfigFeedbackMask;   // from the driver: bit 0 NO_IFLIP, bit 1 MIRRORING_DETECTED
+    NvU32 nPresentedFramesPerBatch; // V2
+    float timePerBatchMs;           // V2, <= 0 if unknown
+    NvU32 reserved;
+};
+static_assert(sizeof(NV_FLIP_CONFIG) == 24, "layout of nvapi.h's V1 and V2 structures");
+
 // Function pointer types for NvAPI hooks
 using PFN_NvAPI_D3D_SetSleepMode       = NvAPI_Status(__cdecl*)(IUnknown*, NV_SET_SLEEP_MODE_PARAMS*);
 using PFN_NvAPI_D3D_Sleep              = NvAPI_Status(__cdecl*)(IUnknown*);
 using PFN_NvAPI_D3D_SetLatencyMarker   = NvAPI_Status(__cdecl*)(IUnknown*, NV_LATENCY_MARKER_PARAMS*);
 using PFN_NvAPI_D3D12_SetAsyncFrameMarker = NvAPI_Status(__cdecl*)(IUnknown*, NV_ASYNC_FRAME_MARKER_PARAMS*);
+using PFN_NvAPI_D3D12_SetFlipConfig = NvAPI_Status(__cdecl*)(IUnknown*, UINT, NV_FLIP_CONFIG*);
 using PFN_NvAPI_QueryInterface         = void*(__cdecl*)(NvU32);

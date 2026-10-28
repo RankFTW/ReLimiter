@@ -506,6 +506,7 @@ void RepublishDuringQuery() {
 // Developer flip_metering_off: the nvapi_QueryInterface detour hides
 // NvAPI_D3D12_SetFlipConfig on every request (nullptr, the driver is not asked)
 // and forwards every other ID with the driver's result.
+static int s_flip_config_log_writes = 0; // Log_Write lines of the SetFlipConfig observer
 static int s_query_calls = 0;
 static NvU32 s_query_last = 0;
 static int s_query_target = 0;
@@ -525,6 +526,55 @@ void TestFlipMeteringBlock() {
     CHECK(Hook_QueryInterface(0x852CD1D2) == &s_query_target); // NvAPI_D3D_Sleep
     CHECK(s_query_calls == 1 && s_query_last == 0x852CD1D2);
     s_orig_query_interface = old_query;
+}
+
+// The SetFlipConfig observer passes the call through unchanged and logs one line
+// per distinct configuration and driver answer (not per batch), at most
+// kFlipConfigLogLimit lines and one line that says later changes are not logged.
+static NvAPI_Status s_flip_driver_status = NVAPI_OK;
+static NvU32 s_flip_driver_feedback = 0;
+static int s_flip_driver_calls = 0;
+static IUnknown* s_flip_driver_queue = nullptr;
+static UINT s_flip_driver_source = 0;
+static NV_FLIP_CONFIG* s_flip_driver_config = nullptr;
+static NvAPI_Status __cdecl FakeSetFlipConfig(IUnknown* queue, UINT source, NV_FLIP_CONFIG* config) {
+    ++s_flip_driver_calls;
+    s_flip_driver_queue = queue; s_flip_driver_source = source; s_flip_driver_config = config;
+    config->flipConfigFeedbackMask = s_flip_driver_feedback;
+    return s_flip_driver_status;
+}
+
+void TestFlipConfigObserver() {
+    const auto old = s_orig_set_flip_config;
+    s_orig_set_flip_config = FakeSetFlipConfig;
+    NV_FLIP_CONFIG config{};
+    config.version = sizeof(NV_FLIP_CONFIG) | (2u << 16);
+    config.nFramesPerBatch = 4; config.nPresentedFramesPerBatch = 4; config.timePerBatchMs = 12.5f;
+    auto* queue = reinterpret_cast<IUnknown*>(&s_query_target);
+    const int logs = s_flip_config_log_writes;
+    // The driver's status and feedback reach the caller; the inputs stay as given.
+    s_flip_driver_status = -104; s_flip_driver_feedback = 2;
+    CHECK(Hook_SetFlipConfig(queue, 3, &config) == -104);
+    CHECK(s_flip_driver_calls == 1 && s_flip_driver_queue == queue && s_flip_driver_source == 3 &&
+          s_flip_driver_config == &config);
+    CHECK(config.flipConfigFeedbackMask == 2 && config.nFramesPerBatch == 4 && config.timePerBatchMs == 12.5f);
+    CHECK(s_flip_config_log_writes == logs + 1);
+    // The same configuration with another batch time is not logged again.
+    config.timePerBatchMs = 13.25f;
+    Hook_SetFlipConfig(queue, 3, &config);
+    CHECK(s_flip_config_log_writes == logs + 1);
+    // A change of the driver's answer is.
+    s_flip_driver_status = NVAPI_OK; s_flip_driver_feedback = 0;
+    Hook_SetFlipConfig(queue, 3, &config);
+    CHECK(s_flip_config_log_writes == logs + 2);
+    // A configuration that changes on every batch stops being logged at the limit.
+    for (int i = 0; i < 64; ++i) {
+        config.nFramesPerBatch = (i % 2) ? 4 : 0;
+        Hook_SetFlipConfig(queue, 3, &config);
+    }
+    CHECK(s_flip_config_log_writes == logs + static_cast<int>(kFlipConfigLogLimit) + 1);
+    CHECK(s_flip_driver_calls == 3 + 64);
+    s_orig_set_flip_config = old;
 }
 #endif
 
@@ -1349,7 +1399,13 @@ MarkerLog g_marker_log;
 void ResetFeedbackProducerLifecycle() noexcept { ++s_lifecycle_resets; }
 IUnknown* SwapMgr_AcquirePresentingDevice() noexcept { return nullptr; }
 ActiveAPI SwapMgr_GetActiveAPI() { return ActiveAPI::None; } // native calls bootstrap feedback
-void Log_Write(LogLevel, const char*, ...) {}
+void Log_Write(LogLevel, const char* fmt, ...) {
+#ifdef _WIN64
+    if (fmt && std::strncmp(fmt, "NvAPI: SetFlipConfig", 20) == 0) ++s_flip_config_log_writes;
+#else
+    (void)fmt;
+#endif
+}
 // Frame-ID-keyed SIMULATION_START samples for the CPU-latency readout; tail
 // markers (drained from the deferred queue) are counted.
 void MarkerLog::Record(uint32_t type, int64_t ts, uint64_t id) noexcept {
@@ -1455,6 +1511,7 @@ int main(int argc, char** argv) {
     TestBypassLowLatencyOff();
 #ifdef _WIN64
     TestFlipMeteringBlock();
+    TestFlipConfigObserver();
 #endif
     // No-FG token: native mode transitions clear it; the scheduler-side
     // observation entry point republishes it (not a fixture-only publication).
