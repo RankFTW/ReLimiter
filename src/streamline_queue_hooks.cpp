@@ -142,6 +142,8 @@ void StreamlineQueue_SetFeatureModule(void* options, void* state) noexcept {
     if (b) FreeLibrary(b);
 }
 void StreamlineQueue_Drain(bool final) noexcept { StreamlineHandoff_Service(final); }
+StreamlineQueueOwnedScope::StreamlineQueueOwnedScope() noexcept { ++streamline_queue::depth; }
+StreamlineQueueOwnedScope::~StreamlineQueueOwnedScope() { --streamline_queue::depth; }
 void StreamlineQueue_BlockFeature() noexcept {
     streamline_queue::feature_blocked = true;
     streamline_queue::plugin_begin.store(0, std::memory_order_release);

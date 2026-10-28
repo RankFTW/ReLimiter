@@ -82,6 +82,12 @@ bool GpuPresent_ReleaseAfterRundown() noexcept;
 // Called with a D3D12 native queue identity; never releases resources in the callback.
 void GpuPresent_OnQueueDestroy(uint64_t native_queue) noexcept;
 GpuPresentExecution GpuPresent_Execute(NativeGateCall*,GpuReadinessCall*,PresentTimelineSpan*) noexcept;
+// Developer presenter probe (fg_presenter_probe_us): a native Present of the
+// selected swapchain while frame generation presents its own frames
+// (fg_route_unsupported) is held on its present queue until call + the probe
+// time, in alternating 4 s held / not-held blocks. No plan claim; never holds
+// the CPU. Fallback when it does not apply or the wait was not committed.
+GpuPresentExecution GpuPresent_ExecutePresenterProbe(PresentTimelineSpan* span) noexcept;
 bool GpuPresent_ReadStatus(GpuPresentTrace*) noexcept;
 struct NativeGateContext;
 // Admission diagnostics, not worker completion or enforcement authority. Recent

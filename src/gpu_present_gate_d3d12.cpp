@@ -1,6 +1,8 @@
 #include "gpu_present_gate.h"
 #include "gpu_readiness.h" // probe
 #include "gpu_readiness_d3d12_queue.h"
+#include "config.h"
+#include "streamline_queue_hooks.h"
 #include "frame_timeline.h"
 #include "frame_plan.h"
 #include "cadence_grid.h"
@@ -45,6 +47,9 @@ struct Ticket {
     PacingPlanKey key{}; // exact plan; every stage event of this ticket carries it
     bool signalled=false;
     bool fg=false;
+    // Developer presenter probe (fg_presenter_probe_us): no plan, grid index
+    // 0, so no stage event and no output record; Current() checks the probe.
+    bool probe=false;
     int fg_multiplier=0;
     double fg_divisor=1.0; // the plan's: displayed frames per grid frame
     // fg_late_spacing: T(n) without the spacing floor at the decision (0 =
@@ -400,6 +405,12 @@ void PublishFgInputCapability() noexcept {
         &fg_input_capability);
 }
 bool RungResolved(PacingRung rung) noexcept {return PacingPipeline_Read().rung==rung;}
+// Developer presenter probe: on, and frame generation presenting its own
+// frames is what the resolver reports (never the metered worker-local route).
+bool PresenterProbeActive() noexcept {
+    return g_fg_presenter_probe_us.load(std::memory_order_relaxed)>0 &&
+        PacingPipeline_Read().reason==PacingFallbackReason::FgRouteUnsupported;
+}
 bool Current(const Ticket& ticket,const char* stage="worker_current") noexcept {
     const auto context=NativeGate_GetContext(Qpc());
     IdentityDiagnostic record;record.stage=stage;record.source=ticket.source;record.queue=ticket.trace.queue;record.ticket=ticket.trace.ticket;
@@ -409,6 +420,17 @@ bool Current(const Ticket& ticket,const char* stage="worker_current") noexcept {
         if(applies && expected!=actual)record.mask|=1ull<<field;
     };
     check(0,1,!stopping.load(std::memory_order_acquire) && !RuntimeLifecycle_IsStopping());
+    if(ticket.probe) {
+        // Still frame generation on the same swapchain and settings; field 16
+        // (h3_rung) stands for "probe still active" here.
+        check(2,1,context.observe_frame_generation);
+        check(7,ticket.native_swapchain,context.native_swapchain);
+        check(10,ticket.trace.settings,GpuPresent_GetConfig().word);
+        check(15,ticket.trace.swapchain,FrameTimeline_GetPresentSwapchainGeneration(ticket.native_swapchain));
+        check(16,1,PresenterProbeActive());
+        if(record.mask)PublishIdentityDiagnostic(record);
+        return !record.mask;
+    }
     check(1,1,context.supported);
     check(2,ticket.fg,context.observe_frame_generation,ticket.fg);
     if(!ticket.fg)check(2,1,context.no_frame_generation);
@@ -861,6 +883,7 @@ struct EnqueueRequest {
     double fg_divisor=1.0; // the plan's
     int64_t floor_base_qpc=0; // fg_late_spacing: T(n) without the floor (Ticket)
     uint64_t fg_binding=0;
+    bool probe=false; // developer presenter probe: no plan (Ticket::probe)
 };
 // trace->target_qpc is the resolved output target; trace->grid_index the plan's
 // index. False: no ticket (trace->status says why; Late when the target passed).
@@ -925,6 +948,7 @@ bool Enqueue(const EnqueueRequest& request,GpuPresentTrace* trace) noexcept {
     ticket.fg=request.fg;ticket.fg_multiplier=request.fg_multiplier;ticket.fg_divisor=request.fg_divisor;
     ticket.floor_base_qpc=request.floor_base_qpc;ticket.floor_checked=ticket.floor_blocked=false;
     ticket.fg_binding=request.fg_binding;
+    ticket.probe=request.probe;
     ticket.fg_epoch=fg_epoch.load(std::memory_order_acquire);
     const auto abandon_prepared=[&] {
         ticket.state.store(TicketState::Free,std::memory_order_release);
@@ -1289,6 +1313,46 @@ GpuPresentExecution GpuPresent_Execute(NativeGateCall* native,GpuReadinessCall* 
     native->trace.native_release_qpc=decided; // the executor owns this call; no CPU hold follows
     SetOutputAttribution(trace,execution==GpuPresentExecution::WaitCommitted);
     span->gpu_present=trace;PublishStatus(trace,context,span->native_swapchain);return execution;
+}
+// Developer presenter probe (fg_presenter_probe_us): the experiment before a
+// full pacer for frame generation that presents its own frames. Each native
+// Present of the selected swapchain, after ReShade's effects were submitted,
+// is held on its present queue (DLSS-G's presenter queue, from the ReShade
+// present event) until call + the probe time by a time fence the worker
+// signals, in alternating 4 s blocks, held then not held, so one capture
+// shows both. It measures whether a released Present flips promptly while the
+// game's GPU work runs, and whether frame generation's own pacer moves its
+// calls when its flips are held. Grid index 0 and no plan claim: no stage
+// event, output record or cadence feedback. The gate's own queue calls are
+// hidden from the Streamline queue hooks, which would count them as presenter
+// operations.
+GpuPresentExecution GpuPresent_ExecutePresenterProbe(PresentTimelineSpan* span) noexcept {
+    using namespace gpu_present;
+    const int hold_us=g_fg_presenter_probe_us.load(std::memory_order_relaxed);
+    if(hold_us<=0 || !span || (span->present_flags&9u) || frequency<=0)return GpuPresentExecution::Fallback;
+    const auto begin=Qpc();
+    if(((begin/(4*frequency))&1) || !PresenterProbeActive())return GpuPresentExecution::Fallback;
+    const auto current=NativeGate_GetContext(begin);
+    if(!current.observe_frame_generation || current.native_swapchain!=span->native_swapchain)
+        return GpuPresentExecution::Fallback;
+    const auto queue_identity=present_queue.load(std::memory_order_acquire);
+    const PacingPlanKey key{PacingIdentityDomain::NvApiFrame,FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::NvApiFrame),
+        FrameTimeline_CurrentControllerGeneration(),0};
+    const auto context=AdmissionContext(key,span->key.swapchain_generation,queue_identity,begin);
+    GpuPresentTrace trace;trace.mode=ReadyPresentMode::Active;trace.settings=context.config.word;trace.begin_qpc=begin;
+    trace.swapchain=span->key.swapchain_generation;trace.present_sequence=span->key.present_sequence;
+    trace.target_qpc=trace.nominal_target_qpc=begin+static_cast<int64_t>(hold_us)*frequency/1000000;
+    trace.status=GpuPresentStatus::Planned;
+    EnqueueRequest request;request.native=queue_identity;request.context=context;request.span=span;request.key=key;
+    request.probe=true;
+    bool committed=false;
+    if(!failed.load() && !stopping.load() && !RuntimeLifecycle_IsStopping()) {
+        StreamlineQueueOwnedScope owned;
+        committed=Enqueue(request,&trace);
+    }
+    SetOutputAttribution(trace,committed);
+    span->gpu_present=trace;
+    return committed?GpuPresentExecution::WaitCommitted:GpuPresentExecution::Fallback;
 }
 bool GpuPresent_ReadStatus(GpuPresentTrace* trace) noexcept {
     GpuPresentStatusSnapshot snapshot;

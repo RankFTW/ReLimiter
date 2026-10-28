@@ -142,6 +142,7 @@ bool GpuPresent_Stop() noexcept {return true;}
 bool GpuPresent_ReleaseAfterRundown() noexcept {return true;}
 void GpuPresent_OnQueueDestroy(uint64_t) noexcept {}
 GpuPresentExecution GpuPresent_Execute(NativeGateCall*,GpuReadinessCall*,PresentTimelineSpan*) noexcept {return GpuPresentExecution::Fallback;}
+GpuPresentExecution GpuPresent_ExecutePresenterProbe(PresentTimelineSpan*) noexcept {return GpuPresentExecution::Fallback;}
 bool GpuPresent_ReadStatus(GpuPresentTrace*) noexcept {return false;}
 bool GpuPresent_ReadStatusSnapshot(GpuPresentStatusSnapshot*) noexcept {return false;}
 #endif

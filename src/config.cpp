@@ -22,6 +22,7 @@
 #include <ShlObj.h>
 
 Config g_config;
+std::atomic<int> g_fg_presenter_probe_us{0};
 
 // Recommended defaults, for the developer diagnostics count and reset.
 static const Config s_default_config{};
@@ -180,6 +181,9 @@ void ValidateConfig() {
     // ── FG-Off FPS ──
     if (g_config.fg_off_fps != 0)
         g_config.fg_off_fps = Clamp(g_config.fg_off_fps, 30, 360);
+
+    // ── Presenter probe (developer experiment) ──
+    g_config.fg_presenter_probe_us = Clamp(g_config.fg_presenter_probe_us, 0, 10000);
 
     // ── VSync ──
     static const char* vsync_modes[] = {"game", "off", "on"};
@@ -416,6 +420,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.gpu_paced_cadence=ReadINIBool(S,"gpu_paced_cadence",false,P);
     g_config.bypass_low_latency_off=ReadINIBool(S,"bypass_low_latency_off",false,P);
     g_config.flip_metering_off=ReadINIBool(S,"flip_metering_off",false,P);
+    g_config.fg_presenter_probe_us=ReadINIInt(S,"fg_presenter_probe_us",0,P);
     g_config.adaptive_cap_hold_room=ReadINIBool(S,"adaptive_cap_hold_room",true,P);
     g_config.lead_spike_floor=ReadINIBool(S,"lead_spike_floor",true,P);
     g_config.reflex_sleep_bypass=ReadINIBool(S,"reflex_sleep_bypass",true,P);
@@ -636,6 +641,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIBool(S, "gpu_paced_cadence", config.gpu_paced_cadence, P);
     WriteINIBool(S, "bypass_low_latency_off", config.bypass_low_latency_off, P);
     WriteINIBool(S, "flip_metering_off", config.flip_metering_off, P);
+    WriteINIInt(S, "fg_presenter_probe_us", config.fg_presenter_probe_us, P);
     WriteINIBool(S, "adaptive_cap_hold_room", config.adaptive_cap_hold_room, P);
     WriteINIBool(S, "lead_spike_floor", config.lead_spike_floor, P);
     WriteINIString(S, "source_placement",
@@ -895,6 +901,7 @@ void Config_ApplyPacingPipeline() {
         std::memory_order_relaxed);
     g_reflex_sleep_bypass.store(g_config.reflex_sleep_bypass, std::memory_order_relaxed);
     g_bypass_low_latency_off.store(g_config.bypass_low_latency_off, std::memory_order_relaxed);
+    g_fg_presenter_probe_us.store(g_config.fg_presenter_probe_us, std::memory_order_relaxed);
 }
 
 int Config_DeveloperOverrides() {
@@ -913,6 +920,7 @@ int Config_DeveloperOverrides() {
         (g_config.gpu_paced_cadence != d.gpu_paced_cadence) +
         (g_config.bypass_low_latency_off != d.bypass_low_latency_off) +
         (g_config.flip_metering_off != d.flip_metering_off) +
+        (g_config.fg_presenter_probe_us != d.fg_presenter_probe_us) +
         (g_config.adaptive_cap_hold_room != d.adaptive_cap_hold_room) +
         (g_config.lead_spike_floor != d.lead_spike_floor) +
         (g_config.source_placement != d.source_placement);
@@ -935,6 +943,7 @@ void Config_ResetDeveloperSettings() {
     g_config.gpu_paced_cadence = d.gpu_paced_cadence;
     g_config.bypass_low_latency_off = d.bypass_low_latency_off;
     g_config.flip_metering_off = d.flip_metering_off;
+    g_config.fg_presenter_probe_us = d.fg_presenter_probe_us;
     g_config.adaptive_cap_hold_room = d.adaptive_cap_hold_room;
     g_config.lead_spike_floor = d.lead_spike_floor;
     g_config.source_placement = d.source_placement;
@@ -1003,6 +1012,10 @@ void ApplyConfig() {
     if (g_config.flip_metering_off)
         LOG_WARN("Diagnostic flip metering off: NvAPI_D3D12_SetFlipConfig is hidden from later NvAPI requests, so "
                  "frame generation that asks for it afterwards runs without hardware flip metering (set at launch)");
+    if (g_config.fg_presenter_probe_us > 0)
+        LOG_WARN("Diagnostic presenter probe: while frame generation presents its own frames, each native Present "
+                 "is held on its present queue until %d us after the call, in alternating 4 s held / not-held blocks",
+                 g_config.fg_presenter_probe_us);
 }
 
 

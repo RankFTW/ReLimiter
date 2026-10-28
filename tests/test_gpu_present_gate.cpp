@@ -189,6 +189,9 @@ BOOL FakeQpc(LARGE_INTEGER* value) {value->QuadPart=fake_clock;return TRUE;}
 
 bool RuntimeLifecycle_IsStopping() noexcept {return false;}
 std::atomic<int> g_fg_multiplier{1};
+std::atomic<int> g_fg_presenter_probe_us{0};
+StreamlineQueueOwnedScope::StreamlineQueueOwnedScope() noexcept {}
+StreamlineQueueOwnedScope::~StreamlineQueueOwnedScope() {}
 IUnknown* SwapMgr_AcquirePresentingDevice() noexcept {return nullptr;}
 void HWSpin(int64_t target) {fake_clock=(std::max)(fake_clock,target);}
 std::atomic<double> g_effective_interval_us{11111},g_last_gate_sleep_us{0};
