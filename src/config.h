@@ -96,6 +96,7 @@ struct Config {
     bool bypass_low_latency_off = false; // developer A/B: off (default) | on; the driver's low latency mode is turned off while the Reflex Sleep is bypassed (64-bit)
     bool flip_metering_off = false; // developer: off (default) | on; NvAPI_D3D12_SetFlipConfig is hidden from the game, so frame generation runs without hardware flip metering, as on GPUs without it (64-bit, from the next launch)
     int fg_presenter_probe_us = 0; // developer experiment: 0 (default, off) | 1–10000; DLSS-G presenting its own frames: each native Present held on its present queue to call + this many µs, in alternating 4 s held / not-held blocks (64-bit)
+    bool gpu_priority_probe = false; // developer experiment: off (default) | on; two DIRECT queues of ReLimiter's own (high and normal priority) measure how long a released queue's work waits for the GPU (64-bit, from the next launch)
     bool adaptive_cap_hold_room = true; // developer A/B: on (default) | off; with Adaptive cap and Output override Auto the interval is kept at least at the hold room of the GPU queue wait or (with gpu_paced_cadence) the FG input wait
     bool lead_spike_floor = true; // developer A/B: on (default) | off; with Output override Auto a GPU wait lead behind the wait covers the game's rare long simulations (lead_controller.h)
     PacingPlacementOverride source_placement = PacingPlacementOverride::PreSleep; // developer: marker | pre_sleep | driver (pre_sleep is the default)

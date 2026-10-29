@@ -161,6 +161,8 @@ if(RELIMITER_64BIT)
         src/gpu_readiness_d3d12.cpp
         src/gpu_readiness_d3d12_queue.cpp
         src/gpu_present_gate_d3d12.cpp
+        src/gpu_priority_probe.cpp
+        src/gpu_priority_probe.h
     )
 endif()
 

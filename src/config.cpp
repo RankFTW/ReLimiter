@@ -421,6 +421,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.bypass_low_latency_off=ReadINIBool(S,"bypass_low_latency_off",false,P);
     g_config.flip_metering_off=ReadINIBool(S,"flip_metering_off",false,P);
     g_config.fg_presenter_probe_us=ReadINIInt(S,"fg_presenter_probe_us",0,P);
+    g_config.gpu_priority_probe=ReadINIBool(S,"gpu_priority_probe",false,P);
     g_config.adaptive_cap_hold_room=ReadINIBool(S,"adaptive_cap_hold_room",true,P);
     g_config.lead_spike_floor=ReadINIBool(S,"lead_spike_floor",true,P);
     g_config.reflex_sleep_bypass=ReadINIBool(S,"reflex_sleep_bypass",true,P);
@@ -642,6 +643,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIBool(S, "bypass_low_latency_off", config.bypass_low_latency_off, P);
     WriteINIBool(S, "flip_metering_off", config.flip_metering_off, P);
     WriteINIInt(S, "fg_presenter_probe_us", config.fg_presenter_probe_us, P);
+    WriteINIBool(S, "gpu_priority_probe", config.gpu_priority_probe, P);
     WriteINIBool(S, "adaptive_cap_hold_room", config.adaptive_cap_hold_room, P);
     WriteINIBool(S, "lead_spike_floor", config.lead_spike_floor, P);
     WriteINIString(S, "source_placement",
@@ -921,6 +923,7 @@ int Config_DeveloperOverrides() {
         (g_config.bypass_low_latency_off != d.bypass_low_latency_off) +
         (g_config.flip_metering_off != d.flip_metering_off) +
         (g_config.fg_presenter_probe_us != d.fg_presenter_probe_us) +
+        (g_config.gpu_priority_probe != d.gpu_priority_probe) +
         (g_config.adaptive_cap_hold_room != d.adaptive_cap_hold_room) +
         (g_config.lead_spike_floor != d.lead_spike_floor) +
         (g_config.source_placement != d.source_placement);
@@ -944,6 +947,7 @@ void Config_ResetDeveloperSettings() {
     g_config.bypass_low_latency_off = d.bypass_low_latency_off;
     g_config.flip_metering_off = d.flip_metering_off;
     g_config.fg_presenter_probe_us = d.fg_presenter_probe_us;
+    g_config.gpu_priority_probe = d.gpu_priority_probe;
     g_config.adaptive_cap_hold_room = d.adaptive_cap_hold_room;
     g_config.lead_spike_floor = d.lead_spike_floor;
     g_config.source_placement = d.source_placement;
@@ -1016,6 +1020,9 @@ void ApplyConfig() {
         LOG_WARN("Diagnostic presenter probe: while frame generation presents its own frames, each native Present "
                  "is held on its present queue until %d us after the call, in alternating 4 s held / not-held blocks",
                  g_config.fg_presenter_probe_us);
+    if (g_config.gpu_priority_probe)
+        LOG_WARN("Diagnostic GPU priority probe: two DIRECT queues of ReLimiter's own (high and normal priority) "
+                 "measure how long a released queue's work waits for the GPU (set at launch)");
 }
 
 

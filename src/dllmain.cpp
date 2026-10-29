@@ -47,6 +47,7 @@
 #include "frame_timeline.h"
 #include "native_present_gate.h"
 #include "gpu_present_gate.h"
+#include "gpu_priority_probe.h"
 #include "gpu_readiness.h"
 
 static bool    s_addon_initialised = false;
@@ -578,6 +579,7 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
             LOG_WARN("GPU readiness observer worker failed to start; observer unavailable, pacing unchanged");
         }
         if(!GpuPresent_Start())LOG_WARN("GPU Present deadline worker unavailable; experimental gate disabled");
+        if(!GpuPriorityProbe_Start())LOG_WARN("GPU priority probe unavailable");
         // Publish callbacks only after every fallible worker/subsystem has been
         // created, minimizing partial-initialization rollback exposure.
         reshade::register_event<reshade::addon_event::init_device>(on_init_device);
@@ -624,9 +626,11 @@ static bool StopOwnedProducers() {
     // Discharge committed GPU time waits BEFORE stopping observers or waiting
     // for callbacks. A native Present may be blocked behind those time gates.
     const bool gpu_present_stopped=GpuPresent_Stop();
+    // The priority probe's queue Waits are its own; it releases them before joining.
+    const bool priority_probe_stopped=GpuPriorityProbe_Stop();
     bool native_pcl_stopped = NativePcl_Stop();
     bool auxiliary_workers_stopped =
-        DLSSPresets_Shutdown() && native_pcl_stopped && gpu_present_stopped;
+        DLSSPresets_Shutdown() && native_pcl_stopped && gpu_present_stopped && priority_probe_stopped;
     auxiliary_workers_stopped = GpuReadiness_Stop() && auxiliary_workers_stopped;
     auxiliary_workers_stopped =
         NGXHooks_BeginShutdown() && auxiliary_workers_stopped;
