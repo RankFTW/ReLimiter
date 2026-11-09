@@ -169,6 +169,22 @@ namespace
                   "repeated disable preserves capture epoch");
     }
 
+    // The control file's "capture start": every start is its own capture
+    // epoch, also while capture is already on (a start rotates); stop ends it.
+    bool TestStartCaptureRotates()
+    {
+        FrameTimeline_SetEnabled(false);
+        const FrameTimelineCaptureState off = FrameTimeline_CurrentCaptureState();
+        const FrameTimelineCaptureState first = FrameTimeline_StartCapture();
+        const FrameTimelineCaptureState second = FrameTimeline_StartCapture();
+        FrameTimeline_SetEnabled(false);
+        const FrameTimelineCaptureState stopped = FrameTimeline_CurrentCaptureState();
+        return Check(first.enabled && first.epoch != off.epoch, "start enables a new capture epoch") &&
+            Check(second.enabled && second.epoch != first.epoch, "a start while capturing rotates the epoch") &&
+            Check(FrameTimeline_CurrentCaptureState().epoch == stopped.epoch && !stopped.enabled &&
+                  stopped.epoch != second.epoch, "stop ends the capture");
+    }
+
     bool TestPresentIdentityAndAttempts()
     {
         FrameTimeline_SetEnabled(false);
@@ -506,6 +522,7 @@ int main()
         TestCanonicalKeys() &&
         TestIdentityEpochs() &&
         TestCaptureStateTransitions() &&
+        TestStartCaptureRotates() &&
         TestPresentIdentityAndAttempts() &&
         TestConcurrentQueueProducers() &&
         TestCaptureJournalAndFinalDrain() &&

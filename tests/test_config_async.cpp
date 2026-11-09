@@ -623,6 +623,39 @@ void TestFlipMeteringOffKey() {
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
+// Developer control file: Config_SetLiveKey sets one live key as the OSD does
+// (validated like an INI value, published to the cap atomics and the
+// pipeline) and queues no save; it refuses unparsable values, launch-only and
+// unknown keys and leaves the field alone then.
+void TestLiveKeySetter() {
+    Reset(false, false, {{"config_version", "4"}, {"target_fps", "100"}});
+    char error[128] = {};
+    CHECK(Config_SetLiveKey("target_fps", "60", error, sizeof(error)) && error[0] == '\0');
+    CHECK(g_config.target_fps == 60 && g_user_target_fps.load() == 60);
+    CHECK(Config_SetLiveKey("target_fps", "10", error, sizeof(error)));
+    CHECK(g_config.target_fps == 30 && g_user_target_fps.load() == 30);
+    CHECK(Config_SetLiveKey("source_placement", "MARKER", error, sizeof(error)));
+    CHECK(Config_SetLiveKey("reflex_sleep_bypass", "off", error, sizeof(error)));
+    CHECK(Config_SetLiveKey("gpu_wait_headroom_us", "2000", error, sizeof(error)));
+    CHECK(Config_SetLiveKey("adaptive_cap", "TRUE", error, sizeof(error)));
+    CHECK(g_config.source_placement == PacingPlacementOverride::Marker);
+    CHECK(!g_config.reflex_sleep_bypass && !g_reflex_sleep_bypass.load());
+    CHECK(g_config.gpu_wait_headroom_us == 2000.0 && g_config.adaptive_cap);
+    CheckPipelineMatchesConfig();
+
+    CHECK(!Config_SetLiveKey("source_placement", "sideways", error, sizeof(error)) && error[0] != '\0');
+    CHECK(g_config.source_placement == PacingPlacementOverride::Marker);
+    CHECK(!Config_SetLiveKey("target_fps", "60fps", error, sizeof(error)) && g_config.target_fps == 30);
+    CHECK(!Config_SetLiveKey("target_fps", "", error, sizeof(error)) && g_config.target_fps == 30);
+    CHECK(!Config_SetLiveKey("adaptive_cap", "maybe", error, sizeof(error)) && g_config.adaptive_cap);
+    CHECK(!Config_SetLiveKey("flip_metering_off", "true", error, sizeof(error)) && !g_config.flip_metering_off);
+    CHECK(!Config_SetLiveKey("no_such_key", "1", error, sizeof(error)));
+
+    // No save queued: draining the writer leaves the loaded cap in the INI.
+    ReleaseStart();CHECK(OwnerShutdown());
+    CHECK(Value(local_path, "FrameLimiter", "target_fps") == "100");
+}
+
 // pacing_method=marker becomes output_rung=marker; automatic, native and
 // invalid methods become auto. A present output_rung always wins.
 void TestPacingMethodMigration() {
@@ -1008,6 +1041,7 @@ int main() {
     TestAdaptiveCapHoldRoomKey();
     TestBypassLowLatencyOffKey();
     TestFlipMeteringOffKey();
+    TestLiveKeySetter();
     TestSourcePlacementParsing();
     TestPacingMethodMigration();
     TestAdaptiveCapMigration();

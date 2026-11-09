@@ -2068,6 +2068,7 @@ void DrawSettings(reshade::api::effect_runtime*) {
     RuntimeCallbackGuard callback;
     if (callback.IsStopping()) return;
     try {
+        ConfigOwnerLock owner;
         DrawSettingsImpl();
     }
     catch (...) {
@@ -3294,6 +3295,7 @@ void DrawOSD(reshade::api::effect_runtime*) {
     RuntimeCallbackGuard callback;
     if (callback.IsStopping()) return;
     try {
+        ConfigOwnerLock owner;
         DrawOSDImpl();
     }
     catch (...) {

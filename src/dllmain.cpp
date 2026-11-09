@@ -48,6 +48,7 @@
 #include "native_present_gate.h"
 #include "gpu_present_gate.h"
 #include "gpu_priority_probe.h"
+#include "control_file.h"
 #include "gpu_readiness.h"
 
 static bool    s_addon_initialised = false;
@@ -297,6 +298,10 @@ static void on_present_impl(reshade::api::command_queue* queue,
 
     // MMCSS registration for the present thread (once)
     Hardening_OnFirstPresent();
+
+    // Developer control file: queued harness commands run here, on the
+    // thread that owns g_config, as the OSD's edits do.
+    ControlFile_OnPresent();
 
     // Native PCL waits for meaningful latency activity so the ETW session
     // does not ingest the game's unrelated startup burst. Markerless games
@@ -580,6 +585,7 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         }
         if(!GpuPresent_Start())LOG_WARN("GPU Present deadline worker unavailable; experimental gate disabled");
         if(!GpuPriorityProbe_Start())LOG_WARN("GPU priority probe unavailable");
+        if(!ControlFile_Start(hModule))LOG_WARN("Control file unavailable");
         // Publish callbacks only after every fallible worker/subsystem has been
         // created, minimizing partial-initialization rollback exposure.
         reshade::register_event<reshade::addon_event::init_device>(on_init_device);
@@ -632,6 +638,7 @@ static bool StopOwnedProducers() {
     bool auxiliary_workers_stopped =
         DLSSPresets_Shutdown() && native_pcl_stopped && gpu_present_stopped && priority_probe_stopped;
     auxiliary_workers_stopped = GpuReadiness_Stop() && auxiliary_workers_stopped;
+    auxiliary_workers_stopped = ControlFile_Stop() && auxiliary_workers_stopped;
     auxiliary_workers_stopped =
         NGXHooks_BeginShutdown() && auxiliary_workers_stopped;
     auxiliary_workers_stopped =

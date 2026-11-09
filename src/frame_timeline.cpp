@@ -64,6 +64,11 @@ void FrameTimeline_SetEnabled(bool enabled) noexcept
     s_capture.Transition(enabled);
 }
 
+FrameTimelineCaptureState FrameTimeline_StartCapture() noexcept
+{
+    return s_capture.Transition(true, s_capture.Current().enabled);
+}
+
 bool FrameTimeline_IsEnabled() noexcept
 {
     return FrameTimeline_CurrentCaptureState().enabled;

@@ -143,6 +143,11 @@ void FrameTimeline_StopCapture() noexcept;
 void FrameTimeline_ResumeCapture() noexcept;
 
 void FrameTimeline_SetEnabled(bool enabled) noexcept;
+// Starts a capture epoch: enables capture, or rotates to a new epoch while it
+// is on (the developer control file's "capture start"). Returns the state
+// after the request; a rejected request (full transition journal, stopped
+// capture) leaves the prior state and epoch.
+FrameTimelineCaptureState FrameTimeline_StartCapture() noexcept;
 bool FrameTimeline_IsEnabled() noexcept;
 FrameTimelineCaptureState FrameTimeline_CurrentCaptureState() noexcept;
 

@@ -10,7 +10,11 @@
 #include "reflex_inject.h"
 #include "logger.h"
 #include <Windows.h>
+#include <cerrno>
+#include <climits>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <cstdio>
 #include <array>
@@ -39,6 +43,11 @@ static char s_ini_path[MAX_PATH] = {};
 static bool s_first_launch = false;
 static std::vector<OSDPreset> s_user_presets;
 static char s_shared_presets_path[MAX_PATH] = {};
+static SRWLOCK s_owner_lock = SRWLOCK_INIT;
+
+void Config_LockOwner() noexcept { AcquireSRWLockExclusive(&s_owner_lock); }
+bool Config_TryLockOwner() noexcept { return TryAcquireSRWLockExclusive(&s_owner_lock) != FALSE; }
+void Config_UnlockOwner() noexcept { ReleaseSRWLockExclusive(&s_owner_lock); }
 
 // Live settings/slots belong to the caller (UI, or quiesced init/shutdown).
 // Only these value-owned snapshots cross to the writer; never slot references.
@@ -422,6 +431,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.flip_metering_off=ReadINIBool(S,"flip_metering_off",false,P);
     g_config.fg_presenter_probe_us=ReadINIInt(S,"fg_presenter_probe_us",0,P);
     g_config.gpu_priority_probe=ReadINIBool(S,"gpu_priority_probe",false,P);
+    g_config.control_file=ReadINIBool(S,"control_file",false,P);
     g_config.adaptive_cap_hold_room=ReadINIBool(S,"adaptive_cap_hold_room",true,P);
     g_config.lead_spike_floor=ReadINIBool(S,"lead_spike_floor",true,P);
     g_config.reflex_sleep_bypass=ReadINIBool(S,"reflex_sleep_bypass",true,P);
@@ -644,6 +654,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIBool(S, "flip_metering_off", config.flip_metering_off, P);
     WriteINIInt(S, "fg_presenter_probe_us", config.fg_presenter_probe_us, P);
     WriteINIBool(S, "gpu_priority_probe", config.gpu_priority_probe, P);
+    WriteINIBool(S, "control_file", config.control_file, P);
     WriteINIBool(S, "adaptive_cap_hold_room", config.adaptive_cap_hold_room, P);
     WriteINIBool(S, "lead_spike_floor", config.lead_spike_floor, P);
     WriteINIString(S, "source_placement",
@@ -906,6 +917,115 @@ void Config_ApplyPacingPipeline() {
     g_fg_presenter_probe_us.store(g_config.fg_presenter_probe_us, std::memory_order_relaxed);
 }
 
+// ── Live keys (developer control file) ──
+// The keys the OSD changes at runtime, parsed strictly (an INI read falls
+// back to a default instead). Each writes its g_config field only when the
+// text parses.
+namespace live_key {
+bool ParseBool(const char* text, bool* value) {
+    static const char* const kTrue[] = {"true", "1", "yes", "on"};
+    static const char* const kFalse[] = {"false", "0", "no", "off"};
+    for (const char* token : kTrue)
+        if (_stricmp(text, token) == 0) { *value = true; return true; }
+    for (const char* token : kFalse)
+        if (_stricmp(text, token) == 0) { *value = false; return true; }
+    return false;
+}
+bool ParseInt(const char* text, int* value) {
+    char* end = nullptr;
+    errno = 0;
+    const long long parsed = strtoll(text, &end, 10);
+    if (end == text || *end != '\0' || errno == ERANGE || parsed < INT_MIN || parsed > INT_MAX) return false;
+    *value = static_cast<int>(parsed);
+    return true;
+}
+bool ParseDouble(const char* text, double* value) {
+    char* end = nullptr;
+    const double parsed = strtod(text, &end);
+    if (end == text || *end != '\0' || !std::isfinite(parsed)) return false;
+    *value = parsed;
+    return true;
+}
+template <bool Config::*Field> bool SetBool(const char* text) { return ParseBool(text, &(g_config.*Field)); }
+template <int Config::*Field> bool SetInt(const char* text) { return ParseInt(text, &(g_config.*Field)); }
+template <double Config::*Field> bool SetDouble(const char* text) { return ParseDouble(text, &(g_config.*Field)); }
+template <typename Enum, Enum Config::*Field, bool (*Parse)(const char*, Enum*) noexcept>
+bool SetEnum(const char* text) { return Parse(text, &(g_config.*Field)); }
+
+// Where the OSD publishes the key: the cap atomics, else only the pipeline.
+enum class Publish : uint8_t { Pipeline, TargetFps, BackgroundFps, FgOffFps };
+struct Key {
+    const char* name;
+    bool (*set)(const char* text);
+    Publish publish;
+};
+constexpr Key kKeys[] = {
+    {"target_fps", &SetInt<&Config::target_fps>, Publish::TargetFps},
+    {"background_fps", &SetInt<&Config::background_fps>, Publish::BackgroundFps},
+    {"fg_off_fps", &SetInt<&Config::fg_off_fps>, Publish::FgOffFps},
+    {"smoothing", &SetEnum<PacingSmoothing, &Config::smoothing, PacingSmoothing_FromText>, Publish::Pipeline},
+    {"output_rung", &SetEnum<PacingRungOverride, &Config::output_rung, PacingRungOverride_FromText>,
+        Publish::Pipeline},
+    {"marker_forward_order", &SetEnum<PacingMarkerForwardOrder, &Config::marker_forward_order,
+        PacingMarkerForwardOrder_FromText>, Publish::Pipeline},
+    {"gpu_queue_wait_render_queue", &SetEnum<PacingRenderQueue, &Config::gpu_queue_wait_render_queue,
+        PacingRenderQueue_FromText>, Publish::Pipeline},
+    {"lead_coverage", &SetEnum<PacingLeadCoverage, &Config::lead_coverage, PacingLeadCoverage_FromText>,
+        Publish::Pipeline},
+    {"source_placement", &SetEnum<PacingPlacementOverride, &Config::source_placement,
+        PacingPlacementOverride_FromText>, Publish::Pipeline},
+    {"adaptive_cap", &SetBool<&Config::adaptive_cap>, Publish::Pipeline},
+    {"adaptive_cap_percentile", &SetInt<&Config::adaptive_cap_percentile>, Publish::Pipeline},
+    {"adaptive_cap_hold_room", &SetBool<&Config::adaptive_cap_hold_room>, Publish::Pipeline},
+    {"gpu_present_gate_probes", &SetBool<&Config::gpu_present_gate_probes>, Publish::Pipeline},
+    {"gpu_wait_headroom_us", &SetDouble<&Config::gpu_wait_headroom_us>, Publish::Pipeline},
+    {"gpu_wait_interleave_s", &SetDouble<&Config::gpu_wait_interleave_s>, Publish::Pipeline},
+    {"stall_inject_ms", &SetDouble<&Config::stall_inject_ms>, Publish::Pipeline},
+    {"stall_inject_period_s", &SetDouble<&Config::stall_inject_period_s>, Publish::Pipeline},
+    {"reflex_sleep_bypass", &SetBool<&Config::reflex_sleep_bypass>, Publish::Pipeline},
+    {"bypass_low_latency_off", &SetBool<&Config::bypass_low_latency_off>, Publish::Pipeline},
+    {"fg_late_spacing", &SetBool<&Config::fg_late_spacing>, Publish::Pipeline},
+    {"gpu_paced_cadence", &SetBool<&Config::gpu_paced_cadence>, Publish::Pipeline},
+    {"lead_spike_floor", &SetBool<&Config::lead_spike_floor>, Publish::Pipeline},
+    {"fg_presenter_probe_us", &SetInt<&Config::fg_presenter_probe_us>, Publish::Pipeline},
+};
+}
+
+bool Config_SetLiveKey(const char* key, const char* value, char* error, size_t error_size) {
+    const auto fail = [&](const char* reason) {
+        if (error && error_size) snprintf(error, error_size, "%s", reason);
+        return false;
+    };
+    if (!key || !*key || !value || !*value) return fail("usage: set <key> <value>");
+    const live_key::Key* entry = nullptr;
+    for (const auto& candidate : live_key::kKeys) {
+        if (strcmp(candidate.name, key) == 0) {
+            entry = &candidate;
+            break;
+        }
+    }
+    if (!entry) return fail("not a live key (launch-only keys: edit the INI and relaunch)");
+    if (!entry->set(value)) return fail("invalid value");
+    ValidateConfig();
+    switch (entry->publish) {
+        case live_key::Publish::TargetFps:
+            g_user_target_fps.store(g_config.target_fps, std::memory_order_relaxed);
+            break;
+        case live_key::Publish::BackgroundFps:
+            g_background_fps.store(g_config.background_fps, std::memory_order_relaxed);
+            break;
+        case live_key::Publish::FgOffFps:
+            g_fg_off_fps.store(g_config.fg_off_fps, std::memory_order_relaxed);
+            break;
+        case live_key::Publish::Pipeline:
+            break;
+    }
+    Config_ApplyPacingPipeline();
+    LOG_INFO("Control: %s=%s", key, value);
+    if (error && error_size) error[0] = '\0';
+    return true;
+}
+
 int Config_DeveloperOverrides() {
     const Config& d = s_default_config;
     return (g_config.smoothing != d.smoothing) + (g_config.output_rung != d.output_rung) +
@@ -924,6 +1044,7 @@ int Config_DeveloperOverrides() {
         (g_config.flip_metering_off != d.flip_metering_off) +
         (g_config.fg_presenter_probe_us != d.fg_presenter_probe_us) +
         (g_config.gpu_priority_probe != d.gpu_priority_probe) +
+        (g_config.control_file != d.control_file) +
         (g_config.adaptive_cap_hold_room != d.adaptive_cap_hold_room) +
         (g_config.lead_spike_floor != d.lead_spike_floor) +
         (g_config.source_placement != d.source_placement);
@@ -948,6 +1069,7 @@ void Config_ResetDeveloperSettings() {
     g_config.flip_metering_off = d.flip_metering_off;
     g_config.fg_presenter_probe_us = d.fg_presenter_probe_us;
     g_config.gpu_priority_probe = d.gpu_priority_probe;
+    g_config.control_file = d.control_file;
     g_config.adaptive_cap_hold_room = d.adaptive_cap_hold_room;
     g_config.lead_spike_floor = d.lead_spike_floor;
     g_config.source_placement = d.source_placement;
@@ -1023,6 +1145,10 @@ void ApplyConfig() {
     if (g_config.gpu_priority_probe)
         LOG_WARN("Diagnostic GPU priority probe: two DIRECT queues of ReLimiter's own (high and normal priority) "
                  "measure how long a released queue's work waits for the GPU (set at launch)");
+    if (g_config.control_file)
+        LOG_WARN("Diagnostic control file: relimiter_control.txt next to the INI is polled for test harness commands "
+                 "(set, capture, mark, ping); results and pacing state go to relimiter_control_status.txt "
+                 "(set at launch)");
 }
 
 

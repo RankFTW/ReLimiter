@@ -91,6 +91,8 @@ set(ADDON_SOURCES
     src/gpu_readiness.cpp
     src/gpu_present_types.cpp
     src/gpu_present_gate.cpp
+    src/control_file.cpp
+    src/control_file.h
     src/nvapi_marker_census.h
     src/present_association.cpp
     src/vsync_control.cpp

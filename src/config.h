@@ -97,6 +97,7 @@ struct Config {
     bool flip_metering_off = false; // developer: off (default) | on; NvAPI_D3D12_SetFlipConfig is hidden from the game, so frame generation runs without hardware flip metering, as on GPUs without it (64-bit, from the next launch)
     int fg_presenter_probe_us = 0; // developer experiment: 0 (default, off) | 1–10000; DLSS-G presenting its own frames: each native Present held on its present queue to call + this many µs, in alternating 4 s held / not-held blocks (64-bit)
     bool gpu_priority_probe = false; // developer experiment: off (default) | on; two DIRECT queues of ReLimiter's own (high and normal priority) measure how long a released queue's work waits for the GPU (64-bit, from the next launch)
+    bool control_file = false; // developer: off (default) | on; a test harness drives ReLimiter through relimiter_control.txt next to the INI (control_file.h) (from the next launch)
     bool adaptive_cap_hold_room = true; // developer A/B: on (default) | off; with Adaptive cap and Output override Auto the interval is kept at least at the hold room of the GPU queue wait or (with gpu_paced_cadence) the FG input wait
     bool lead_spike_floor = true; // developer A/B: on (default) | off; with Output override Auto a GPU wait lead behind the wait covers the game's rare long simulations (lead_controller.h)
     PacingPlacementOverride source_placement = PacingPlacementOverride::PreSleep; // developer: marker | pre_sleep | driver (pre_sleep is the default)
@@ -290,6 +291,29 @@ void ApplyConfig();
 // adaptive_cap to the period governor) and the NvAPI hooks. Part of
 // ApplyConfig; the OSD calls it after editing those fields.
 void Config_ApplyPacingPipeline();
+
+// Developer control file (control_file.h): sets one live key the way the OSD
+// does (parse, ValidateConfig, publish: the cap atomics or the pacing
+// pipeline) and queues no save (the addon still saves its settings when the
+// game exits). Only the keys the OSD changes at runtime; false with a reason
+// in error for an unknown or launch-only key or an unparsable value. The
+// caller holds the config owner lock (below).
+bool Config_SetLiveKey(const char* key, const char* value, char* error, size_t error_size);
+
+// Serializes the live editors of g_config across threads: the OSD callbacks
+// (DrawSettings and DrawOSD, run by every ReShade runtime on its own present
+// thread) take it for their whole frame; the control file only tries it and
+// leaves its commands for a later present when it is held. Not recursive.
+void Config_LockOwner() noexcept;
+bool Config_TryLockOwner() noexcept;
+void Config_UnlockOwner() noexcept;
+class ConfigOwnerLock {
+public:
+    ConfigOwnerLock() noexcept { Config_LockOwner(); }
+    ~ConfigOwnerLock() { Config_UnlockOwner(); }
+    ConfigOwnerLock(const ConfigOwnerLock&) = delete;
+    ConfigOwnerLock& operator=(const ConfigOwnerLock&) = delete;
+};
 
 // Developer diagnostics (developer_settings): how many of their keys differ
 // from the recommended defaults (the OSD warns while any does), and a reset

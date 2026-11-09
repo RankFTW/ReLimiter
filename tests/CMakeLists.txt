@@ -160,6 +160,24 @@ if(MSVC)
     target_compile_options(test_frame_plan PRIVATE /W4 /utf-8 /permissive-)
 endif()
 
+## ── Developer control file parser tests ──
+# The command-file parser only (header); the poller and the present-callback
+# execution need a live game.
+
+add_executable(test_control_file test_control_file.cpp)
+set_target_properties(test_control_file PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+target_include_directories(test_control_file PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+if(MSVC)
+    set_property(TARGET test_control_file PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(test_control_file PRIVATE /W4 /utf-8 /permissive-)
+endif()
+
 ## ── Pacing pipeline resolver tests ──
 # Directly tests the production resolver rules, generation publication and
 # capability tags. Owner and executor wiring needs live validation.
@@ -518,5 +536,6 @@ add_test(NAME pacing_controller_events COMMAND test_pacing_controller_events)
 add_test(NAME source_stage COMMAND test_source_stage)
 add_test(NAME frame_plan COMMAND test_frame_plan)
 set_tests_properties(frame_plan PROPERTIES TIMEOUT 60)
+add_test(NAME control_file COMMAND test_control_file)
 add_test(NAME dxgi_display_source COMMAND test_dxgi_display_source)
 add_test(NAME pqi COMMAND test_pqi)
