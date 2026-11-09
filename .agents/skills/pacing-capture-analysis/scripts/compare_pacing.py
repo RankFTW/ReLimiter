@@ -42,7 +42,7 @@ from typing import Any
 
 import analyze_pacing as pacing
 
-PLAN_SCHEMA = "relimiter-pacing-evaluation/1"
+PLAN_SCHEMA = "relimiter-pacing-evaluation/2"
 SCENE_CLASSES = ("light", "heavy")
 FEASIBILITY_EVENT = "rung_feasibility"
 PIPELINE_EVENT = "pipeline_change"
@@ -98,9 +98,20 @@ def validate_plan(plan: dict[str, Any]) -> None:
                 raise PlanError(f"comparison {comparison.get('id')!r}: unknown {role} arm")
         comparison_ids.add(comparison.get("id"))
     decision = plan["decision"]
-    for key in ("hold", "raw_hold"):
-        if decision.get(key) not in comparison_ids:
-            raise PlanError(f"decision.{key} must name a comparison id")
+    rules = decision.get("judge")
+    if not isinstance(rules, list) or not rules:
+        raise PlanError("decision.judge must list at least one rule")
+    rule_ids = set()
+    for rule in rules:
+        if rule.get("comparison") not in comparison_ids:
+            raise PlanError(f"decision rule {rule.get('id')!r} must name a comparison id")
+        if not rule.get("id") or rule["id"] in rule_ids:
+            raise PlanError("every decision rule needs a unique id")
+        rule_ids.add(rule["id"])
+    fallback = decision.get("fallback")
+    if fallback is not None and (fallback.get("comparison") not in comparison_ids or
+                                 fallback.get("judged") not in rule_ids):
+        raise PlanError("decision.fallback must name a comparison id and a decision rule id ('judged')")
     names = metric_names(plan["analysis"].get("deviation_thresholds_us", []))
     for metric in [*decision.get("primary_metrics", []), decision.get("latency_metric")]:
         if metric not in names:
@@ -491,11 +502,9 @@ def _scene_entry(comparisons: list[dict[str, Any]], comparison_id: str, scene_id
     return None
 
 
-def decide(plan: dict[str, Any], comparisons: list[dict[str, Any]]) -> dict[str, Any]:
-    """The plan's decision rule.
+def judge_rule(plan: dict[str, Any], comparisons: list[dict[str, Any]], rule: dict[str, Any]) -> dict[str, Any]:
+    """One decision rule: is the candidate of the rule's comparison supported?
 
-    Hold as the default output (comparison decision.hold, the shipping hold vs
-    releasing on the cadence alone):
       supported    - every light scene 'better' on every primary metric, every
                      heavy scene 'better' or 'no_difference' on each (decided,
                      with replicates), and the latency increase within the
@@ -503,35 +512,32 @@ def decide(plan: dict[str, Any], comparisons: list[dict[str, Any]]) -> dict[str,
       rejected     - any scene 'worse' on a primary metric, or a latency
                      increase above the budget;
       inconclusive - otherwise (missing runs, no replicate, no difference).
-    Fallback (decision.raw_hold, the hold without the overload fallback
-    vs the cadence alone), per heavy scene: 'needed' when the raw hold is
-    'worse' on a primary metric while the shipping hold is not; 'not_needed'
-    when the raw hold is not worse on any; else 'inconclusive'.
     """
     decision = plan["decision"]
     primary = decision["primary_metrics"]
     latency_metric = decision["latency_metric"]
     budget = float(decision.get("latency_budget_us", math.inf))
+    name = rule["comparison"]
     reasons: list[str] = []
     rejected = False
     supported = True
     for scene in plan["scenes"]:
-        entry = _scene_entry(comparisons, decision["hold"], scene["id"])
+        entry = _scene_entry(comparisons, name, scene["id"])
         if entry is None or entry["status"] != "compared":
             supported = False
-            reasons.append(f"{scene['id']}: hold comparison has no runs for one arm")
+            reasons.append(f"{scene['id']}: {name} has no runs for one arm")
             continue
         for metric in primary:
             outcome = entry["metrics"][metric]["verdict"]
             if outcome == "worse":
                 rejected = True
-                reasons.append(f"{scene['id']} ({scene['class']}): hold is worse on {metric}")
+                reasons.append(f"{scene['id']} ({scene['class']}): the candidate is worse on {metric}")
             elif scene["class"] == "light" and outcome != "better":
                 supported = False
-                reasons.append(f"{scene['id']} (light): hold is {outcome} on {metric}, not better")
+                reasons.append(f"{scene['id']} (light): the candidate is {outcome} on {metric}, not better")
             elif scene["class"] == "heavy" and outcome not in ("better", "no_difference"):
                 supported = False
-                reasons.append(f"{scene['id']} (heavy): hold is {outcome} on {metric}")
+                reasons.append(f"{scene['id']} (heavy): the candidate is {outcome} on {metric}")
         latency = entry["metrics"][latency_metric]
         if latency["delta"] is None:
             supported = False
@@ -540,28 +546,44 @@ def decide(plan: dict[str, Any], comparisons: list[dict[str, Any]]) -> dict[str,
             rejected = True
             reasons.append(f"{scene['id']}: {latency_metric} rises {latency['delta']:.0f} us, "
                            f"above the {budget:.0f} us budget")
-    hold_status = "rejected" if rejected else "supported" if supported else "inconclusive"
+    status = "rejected" if rejected else "supported" if supported else "inconclusive"
+    return {"label": rule.get("label", rule["id"]), "comparison": name, "status": status, "reasons": reasons}
 
+
+def decide(plan: dict[str, Any], comparisons: list[dict[str, Any]]) -> dict[str, Any]:
+    """The plan's decision rules (decision.judge, see judge_rule) and the
+    optional fallback check (decision.fallback: a comparison without the
+    mechanism under test, here the hold without its overload fallback, against
+    the same baseline as the rule it names in 'judged'), per heavy scene:
+    'needed' when that comparison is 'worse' on a primary metric while the
+    judged rule's is not; 'not_needed' when it is not worse on any; else
+    'inconclusive'."""
+    decision = plan["decision"]
+    rules = {rule["id"]: judge_rule(plan, comparisons, rule) for rule in decision["judge"]}
     fallback = {}
-    for scene in plan["scenes"]:
-        if scene["class"] != "heavy":
-            continue
-        raw = _scene_entry(comparisons, decision["raw_hold"], scene["id"])
-        shipped = _scene_entry(comparisons, decision["hold"], scene["id"])
-        if raw is None or raw["status"] != "compared" or shipped is None or shipped["status"] != "compared":
-            fallback[scene["id"]] = "inconclusive"
-            continue
-        raw_worse = any(raw["metrics"][metric]["verdict"] == "worse" for metric in primary)
-        shipped_worse = any(shipped["metrics"][metric]["verdict"] == "worse" for metric in primary)
-        raw_known = all(raw["metrics"][metric]["verdict"] in ("better", "worse", "no_difference")
-                        for metric in primary)
-        if raw_worse and not shipped_worse:
-            fallback[scene["id"]] = "needed"
-        elif not raw_worse and raw_known:
-            fallback[scene["id"]] = "not_needed"
-        else:
-            fallback[scene["id"]] = "inconclusive"
-    return {"hold_default": {"status": hold_status, "reasons": reasons}, "fallback": fallback}
+    check = decision.get("fallback")
+    if check is not None:
+        primary = decision["primary_metrics"]
+        judged = rules[check["judged"]]["comparison"]
+        for scene in plan["scenes"]:
+            if scene["class"] != "heavy":
+                continue
+            raw = _scene_entry(comparisons, check["comparison"], scene["id"])
+            shipped = _scene_entry(comparisons, judged, scene["id"])
+            if raw is None or raw["status"] != "compared" or shipped is None or shipped["status"] != "compared":
+                fallback[scene["id"]] = "inconclusive"
+                continue
+            raw_worse = any(raw["metrics"][metric]["verdict"] == "worse" for metric in primary)
+            shipped_worse = any(shipped["metrics"][metric]["verdict"] == "worse" for metric in primary)
+            raw_known = all(raw["metrics"][metric]["verdict"] in ("better", "worse", "no_difference")
+                            for metric in primary)
+            if raw_worse and not shipped_worse:
+                fallback[scene["id"]] = "needed"
+            elif not raw_worse and raw_known:
+                fallback[scene["id"]] = "not_needed"
+            else:
+                fallback[scene["id"]] = "inconclusive"
+    return {"rules": rules, "fallback": fallback}
 
 
 # ── Report ──
@@ -643,9 +665,10 @@ def format_report(report: dict[str, Any]) -> str:
                              f"  noise {_format(entry['noise'], metric)}  -> {entry['verdict']}")
     decision = report["decision"]
     lines.append("")
-    lines.append(f"Decision: hold as default output - {decision['hold_default']['status']}")
-    for reason in decision["hold_default"]["reasons"]:
-        lines.append(f"  - {reason}")
+    for rule in decision["rules"].values():
+        lines.append(f"Decision: {rule['label']} ({rule['comparison']}) - {rule['status']}")
+        for reason in rule["reasons"]:
+            lines.append(f"  - {reason}")
     for scene, status in decision["fallback"].items():
         lines.append(f"Fallback in {scene}: {status}")
     lines.append("")

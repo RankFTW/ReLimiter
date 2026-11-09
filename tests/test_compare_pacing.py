@@ -74,30 +74,47 @@ class DecisionTests(unittest.TestCase):
         worse = {self.PRIMARY[0]: "worse", self.PRIMARY[1]: "no_difference"}
         decided = compare.decide(plan, self.comparisons(metrics(**better, latency=900.0),
                                                         metrics(**same), metrics(**worse)))
-        self.assertEqual(decided["hold_default"]["status"], "supported")
+        self.assertEqual(decided["rules"]["hold_default"]["status"], "supported")
         self.assertEqual(decided["fallback"], {"heavy": "needed"})
 
         # The hold is worse in a heavy scene: rejected even when light scenes improve.
         decided = compare.decide(plan, self.comparisons(metrics(**better), metrics(**worse), metrics(**worse)))
-        self.assertEqual(decided["hold_default"]["status"], "rejected")
+        self.assertEqual(decided["rules"]["hold_default"]["status"], "rejected")
         self.assertEqual(decided["fallback"], {"heavy": "inconclusive"})
 
         # A latency increase above the budget rejects.
         decided = compare.decide(plan, self.comparisons(metrics(**better, latency=2500.0),
                                                         metrics(**same), metrics(**same)))
-        self.assertEqual(decided["hold_default"]["status"], "rejected")
+        self.assertEqual(decided["rules"]["hold_default"]["status"], "rejected")
         self.assertEqual(decided["fallback"], {"heavy": "not_needed"})
 
         # No detectable improvement in a light scene is not support.
         decided = compare.decide(plan, self.comparisons(metrics(**same), metrics(**same), metrics(**same)))
-        self.assertEqual(decided["hold_default"]["status"], "inconclusive")
+        self.assertEqual(decided["rules"]["hold_default"]["status"], "inconclusive")
 
         # Unreplicated heavy-scene arms decide nothing: not support.
         unreplicated = dict.fromkeys(self.PRIMARY, "no_replicate")
         decided = compare.decide(plan, self.comparisons(metrics(**better), metrics(**unreplicated),
                                                         metrics(**unreplicated)))
-        self.assertEqual(decided["hold_default"]["status"], "inconclusive")
+        self.assertEqual(decided["rules"]["hold_default"]["status"], "inconclusive")
         self.assertEqual(decided["fallback"], {"heavy": "inconclusive"})
+
+    def test_rules_judge_their_own_comparison_without_fallback(self):
+        # A plan whose question is not the hold: two rules, no fallback check.
+        plan = self.plan()
+        plan["decision"]["judge"] = [{"id": "first", "comparison": "hold_vs_release"},
+                                     {"id": "second", "comparison": "raw_hold_vs_release"}]
+        del plan["decision"]["fallback"]
+        plan["runs"] = []
+        compare.validate_plan(plan)
+        better = dict.fromkeys(self.PRIMARY, "better")
+        same = dict.fromkeys(self.PRIMARY, "no_difference")
+        worse = {self.PRIMARY[0]: "worse", self.PRIMARY[1]: "no_difference"}
+        decided = compare.decide(plan, self.comparisons(metrics(**better), metrics(**same), metrics(**worse)))
+        self.assertEqual(decided["rules"]["first"]["status"], "supported")
+        self.assertEqual(decided["rules"]["second"]["status"], "rejected")
+        self.assertEqual(decided["rules"]["first"]["label"], "first")
+        self.assertEqual(decided["fallback"], {})
 
 
 class EndToEndTests(unittest.TestCase):
@@ -185,11 +202,11 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(scene["metrics"]["dev_share_over_1000us"]["verdict"], "better")
         self.assertEqual(scene["metrics"]["dev_share_over_2000us"]["verdict"], "no_difference")
         self.assertAlmostEqual(scene["metrics"]["pc_latency_p50_us"]["delta"], 1000.0, places=3)
-        self.assertEqual(report["decision"]["hold_default"]["status"], "supported")
+        self.assertEqual(report["decision"]["rules"]["hold_default"]["status"], "supported")
 
         # The same captures with a 500 us latency budget reject the hold.
         rejected = compare.evaluate(self.plan(latency_budget_us=500.0))
-        self.assertEqual(rejected["decision"]["hold_default"]["status"], "rejected")
+        self.assertEqual(rejected["decision"]["rules"]["hold_default"]["status"], "rejected")
 
 
 class PlanTests(unittest.TestCase):
@@ -202,6 +219,22 @@ class PlanTests(unittest.TestCase):
             compare.validate_plan(broken)
         broken = copy.deepcopy(plan)
         broken["decision"]["primary_metrics"] = ["jitter_p95_us"]
+        with self.assertRaises(compare.PlanError):
+            compare.validate_plan(broken)
+        broken = copy.deepcopy(plan)
+        broken["decision"]["judge"][0]["comparison"] = "no_such_comparison"
+        with self.assertRaises(compare.PlanError):
+            compare.validate_plan(broken)
+        broken = copy.deepcopy(plan)
+        broken["decision"]["fallback"]["judged"] = "no_such_rule"
+        with self.assertRaises(compare.PlanError):
+            compare.validate_plan(broken)
+        broken = copy.deepcopy(plan)
+        broken["schema"] = "relimiter-pacing-evaluation/1"
+        with self.assertRaises(compare.PlanError):
+            compare.validate_plan(broken)
+        broken = copy.deepcopy(plan)
+        broken["decision"]["judge"] = []
         with self.assertRaises(compare.PlanError):
             compare.validate_plan(broken)
 

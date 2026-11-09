@@ -1,5 +1,5 @@
 {
-  "schema": "relimiter-pacing-evaluation/1",
+  "schema": "relimiter-pacing-evaluation/2",
   "question": "Does holding each frame to the cap cadence (the output hold) reduce display jitter compared with releasing the game on the cadence alone, and where does it stop helping?",
   "notes": [
     "Copy this file next to the archived captures, fill build, scenes and each run's capture path (relative to this file), then run compare_pacing.py on it.",
@@ -187,14 +187,23 @@
     }
   ],
   "decision": {
-    "hold": "hold_vs_release",
-    "raw_hold": "raw_hold_vs_release",
     "primary_metrics": [
       "jitter_p99_us",
       "dev_share_over_2000us"
     ],
     "latency_metric": "pc_latency_p50_us",
-    "latency_budget_us": 2000
+    "latency_budget_us": 2000,
+    "judge": [
+      {
+        "id": "hold_default",
+        "comparison": "hold_vs_release",
+        "label": "hold as default output"
+      }
+    ],
+    "fallback": {
+      "comparison": "raw_hold_vs_release",
+      "judged": "hold_default"
+    }
   },
   "runs": [
     {
