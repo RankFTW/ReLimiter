@@ -1017,6 +1017,15 @@ static void RunPassthrough(
     s_source_stage.Suspend();
     const int64_t release = QpcNow();
     s_prev_enforcement_ts = release;
+    // No owned wait, as under the driver limiter: the frame's Reflex report
+    // matches this release with nothing to subtract. Uncapped, that match is
+    // what makes the Reflex AI frame time count as evidence that frame
+    // generation presents (CheckDeferredFGInference in compatibility mode).
+    if (context.trigger == SchedulerTrigger::NvApiMarker && context.producer_epoch != 0 &&
+        context.producer_epoch == FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::NvApiFrame)) {
+        PublishReflexOwnedSleep(context.frame_id, context.producer_epoch,
+            static_cast<PacingSourceMarker>(context.marker), 0.0);
+    }
     PublishCadence(context, release);
     PacingSourceRecord source{};
     source.flags = static_cast<uint8_t>(PACING_SOURCE_PASSTHROUGH | extra_flags);
@@ -1290,6 +1299,16 @@ static GovernorFixedRefresh FixedRefreshLadder(
     fixed.snapped = CadenceGrid_SnapsToFixed(base_interval_us * ticks_per_us, reference, nullptr);
     fixed.refresh_us = reference.refresh_ticks / ticks_per_us;
     return fixed;
+}
+
+// The interval a Reflex report poll clamps its stage samples against: the
+// effective interval, else the cap's, else 60 FPS.
+static double ReportFeedbackIntervalUs() noexcept
+{
+    const double effective_us = g_effective_interval_us.load(std::memory_order_relaxed);
+    if (effective_us > 0.0) return effective_us;
+    const int target_fps = g_user_target_fps.load(std::memory_order_relaxed);
+    return target_fps > 0 ? 1000000.0 / static_cast<double>(target_fps) : 16666.667;
 }
 
 // VRR cap interval before the governor and LFC (I_0 = cap × FG divisor).
@@ -2419,16 +2438,15 @@ void OnMarker(
         return;
     }
 
+    // One Reflex report poll per frame while frame generation is loaded:
+    // here, before routing, while its divisor is unconfirmed (the report's AI
+    // frame time is evidence for it) or on a fixed refresh; otherwise after a
+    // frame's plan, or at the VRR passthrough exits below, which plan nothing.
     int fg_divisor_raw = ComputeFGDivisorRaw();
-    if (IsFGDllLoaded() && (fg_divisor_raw == 1 || !runtime.vrr)) {
-        double feedback_interval_us = g_effective_interval_us.load(std::memory_order_relaxed);
-        if (!(feedback_interval_us > 0.0)) {
-            const int target_fps = g_user_target_fps.load(std::memory_order_relaxed);
-            feedback_interval_us = target_fps > 0
-                ? 1000000.0 / static_cast<double>(target_fps)
-                : 16666.667;
-        }
-        PollReflexLatencyReport(feedback_interval_us);
+    const bool fg_loaded = IsFGDllLoaded();
+    const bool polled_before_routing = fg_loaded && (fg_divisor_raw == 1 || !runtime.vrr);
+    if (polled_before_routing) {
+        PollReflexLatencyReport(ReportFeedbackIntervalUs());
         fg_divisor_raw = ComputeFGDivisorRaw();
     }
     g_resolved_fg_divisor.store(fg_divisor_raw, std::memory_order_relaxed);
@@ -2521,6 +2539,7 @@ void OnMarker(
         RunPassthrough(GetCadenceContext(Scheduler_MakePlanKey(frameID, trigger), trigger,
             marker, input.regime, input.target_fps), ResolvePipeline(trigger, config, runtime),
             input.extra_flags, input.fg_divisor);
+        if (fg_loaded && !polled_before_routing) PollReflexLatencyReport(ReportFeedbackIntervalUs());
         return;
     }
 
@@ -2574,6 +2593,7 @@ void OnMarker(
         RunPassthrough(GetCadenceContext(Scheduler_MakePlanKey(frameID, trigger), trigger,
             marker, input.regime, target_fps), ResolvePipeline(trigger, config, runtime),
             0, input.fg_divisor);
+        if (fg_loaded && !polled_before_routing) PollReflexLatencyReport(ReportFeedbackIntervalUs());
         return;
     }
     input.regime = SchedulerCadenceRegime::Vrr;
