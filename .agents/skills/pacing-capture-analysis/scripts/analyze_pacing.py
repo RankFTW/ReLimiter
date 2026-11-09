@@ -416,15 +416,17 @@ class RowFilters:
     start_seconds: float | None = None  # relative to the first row's time, inclusive
     end_seconds: float | None = None    # exclusive
     warmup_seconds: float = 0.0         # rows earlier than this after the first row are excluded
+    start_qpc: int | None = None        # absolute row-time window in QPC ticks, inclusive
+    end_qpc: int | None = None          # exclusive
 
     def uses_time(self) -> bool:
         return (self.start_seconds is not None or self.end_seconds is not None or
-                self.warmup_seconds > 0.0)
+                self.warmup_seconds > 0.0 or self.start_qpc is not None or self.end_qpc is not None)
 
     def describe(self) -> dict[str, Any]:
         return {"swapchain": self.swapchain, "observer_epoch": self.observer_epoch,
                 "start_seconds": self.start_seconds, "end_seconds": self.end_seconds,
-                "warmup_seconds": self.warmup_seconds}
+                "warmup_seconds": self.warmup_seconds, "start_qpc": self.start_qpc, "end_qpc": self.end_qpc}
 
 
 class RowSelection:
@@ -531,6 +533,10 @@ class RowSelection:
         if filters.start_seconds is not None and relative < filters.start_seconds:
             return "time_range"
         if filters.end_seconds is not None and relative >= filters.end_seconds:
+            return "time_range"
+        if filters.start_qpc is not None and row.row_time_qpc < filters.start_qpc:
+            return "time_range"
+        if filters.end_qpc is not None and row.row_time_qpc >= filters.end_qpc:
             return "time_range"
         return None
 
@@ -2473,7 +2479,8 @@ def format_report(report: dict[str, Any]) -> str:
     attrition = report["attrition"]
     integrity = report["integrity"]
     active = {name: filters[name] for name in ("swapchain", "observer_epoch", "start_seconds",
-                                               "end_seconds") if filters[name] is not None}
+                                               "end_seconds", "start_qpc", "end_qpc")
+              if filters.get(name) is not None}
     if filters["warmup_seconds"]:
         active["warmup_seconds"] = filters["warmup_seconds"]
     lines = [

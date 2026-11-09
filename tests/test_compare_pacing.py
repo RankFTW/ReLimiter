@@ -82,10 +82,11 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(decided["rules"]["hold_default"]["status"], "rejected")
         self.assertEqual(decided["fallback"], {"heavy": "inconclusive"})
 
-        # A latency increase above the budget rejects.
+        # A latency increase never decides: the rule stays supported and reports the change.
         decided = compare.decide(plan, self.comparisons(metrics(**better, latency=2500.0),
                                                         metrics(**same), metrics(**same)))
-        self.assertEqual(decided["rules"]["hold_default"]["status"], "rejected")
+        self.assertEqual(decided["rules"]["hold_default"]["status"], "supported")
+        self.assertEqual(decided["rules"]["hold_default"]["latency"]["light"]["delta"], 2500.0)
         self.assertEqual(decided["fallback"], {"heavy": "not_needed"})
 
         # No detectable improvement in a light scene is not support.
@@ -133,21 +134,26 @@ class EndToEndTests(unittest.TestCase):
     def tearDown(self):
         self._directory.cleanup()
 
-    def capture(self, epoch, swing_us, rung, reason, latency_us):
+    def capture(self, epoch, swing_us, rung, reason, latency_us, interval_us=None, lead_us=None):
+        """latency_us: a number, or a function of the frame index. interval_us and
+        lead_us (display minus Present start), functions of the frame index,
+        replace the alternating 10 ms +/- swing and the 5 ms lead."""
         rows = []
         display = 1_000_000_000
         for frame in range(self.FRAMES):
-            interval_us = 10_000 + (swing_us if frame % 2 else -swing_us)
-            display += interval_us * 10
+            step_us = interval_us(frame) if interval_us else 10_000 + (swing_us if frame % 2 else -swing_us)
+            display += int(step_us * 10)
+            latency = latency_us(frame) if callable(latency_us) else latency_us
+            lead = int((lead_us(frame) if lead_us else 5_000) * 10)
             rows.append(dict(
                 row_kind="1", sequence=str(frame + 1), capture_epoch=str(epoch),
                 qpc_frequency=str(FREQUENCY), observer_epoch="1", native_swapchain=str(SWAPCHAIN),
-                thread_id="7100", present_start_qpc=str(display - 50_000), display_qpc=str(display),
+                thread_id="7100", present_start_qpc=str(display - lead), display_qpc=str(display),
                 display_index="0", display_count="1", frame_type="1", frame_classification="0",
                 final_state="1", loss_window="0", join_rule="1", identity_domain="1", producer_epoch="1",
                 frame_id=str(frame + 1), source_release_qpc=str(display - 150_000), interval_us="10000.000",
                 fg_divisor="1.000", plan_rung=str(rung), source_placement="1", pcl_status="3",
-                pcl_total_us=f"{latency_us:.3f}"))
+                pcl_total_us=f"{latency:.3f}"))
         suffix = f"Game_1_2_capture_{epoch}.csv"
         rows_path = write_csv(self.directory / f"relimiter_pacing_{suffix}", inspector.CURRENT_PACING_HEADER, rows)
 
@@ -162,13 +168,12 @@ class EndToEndTests(unittest.TestCase):
             event("", "capture_end", display, csv_row_drops=0, csv_event_drops=0)])
         return rows_path.name
 
-    def plan(self, latency_budget_us):
+    def plan(self):
         plan = json.loads(TEMPLATE.read_text(encoding="utf-8"))
         plan["scenes"] = [{"id": "light", "class": "light", "description": "synthetic"}]
         plan["protocol"].update(warmup_seconds=0, min_display_intervals=1000)
         plan["analysis"].update(bootstrap_iterations=40, block_seconds=5.0)
-        plan["decision"].update(primary_metrics=["jitter_p99_us", "dev_share_over_1000us"],
-                                latency_budget_us=latency_budget_us)
+        plan["decision"].update(primary_metrics=["jitter_p99_us", "dev_share_over_1000us"])
         smoothing_off, none = 3, 0
         plan["runs"] = [
             {"scene": "light", "arm": "A", "order": 1, "capture": self.capture(1, 1500, 0, smoothing_off, 20_000)},
@@ -182,7 +187,7 @@ class EndToEndTests(unittest.TestCase):
         return path
 
     def test_hold_beats_release_and_mislabelled_run_is_excluded(self):
-        report = compare.evaluate(self.plan(latency_budget_us=2000.0))
+        report = compare.evaluate(self.plan())
         runs = report["runs"]
         self.assertTrue(all(run["status"] == "analyzed" for run in runs))
         self.assertTrue(any(flag.startswith("arm_mismatch") for flag in runs[4]["flags"]))
@@ -202,11 +207,112 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(scene["metrics"]["dev_share_over_1000us"]["verdict"], "better")
         self.assertEqual(scene["metrics"]["dev_share_over_2000us"]["verdict"], "no_difference")
         self.assertAlmostEqual(scene["metrics"]["pc_latency_p50_us"]["delta"], 1000.0, places=3)
-        self.assertEqual(report["decision"]["rules"]["hold_default"]["status"], "supported")
+        rule = report["decision"]["rules"]["hold_default"]
+        self.assertEqual(rule["status"], "supported")
+        self.assertAlmostEqual(rule["latency"]["light"]["delta"], 1000.0, places=3)
 
-        # The same captures with a 500 us latency budget reject the hold.
-        rejected = compare.evaluate(self.plan(latency_budget_us=500.0))
-        self.assertEqual(rejected["decision"]["rules"]["hold_default"]["status"], "rejected")
+    def route_report(self, captures, route_seconds=30, windows=None):
+        """compare_pacing on route-paired runs: captures are (arm, order, rung,
+        reason, capture keyword arguments); every window starts at QPC 1e9."""
+        plan = json.loads(TEMPLATE.read_text(encoding="utf-8"))
+        plan["scenes"] = [{"id": "light", "class": "light", "route_seconds": route_seconds}]
+        plan["protocol"].update(warmup_seconds=0, min_display_intervals=1000)
+        plan["analysis"].update(bootstrap_iterations=200, block_seconds=5.0)
+        windows = windows or {}
+        plan["runs"] = [{"scene": "light", "arm": arm, "order": order,
+                         "capture": self.capture(order, 50, rung, reason, **kwargs),
+                         "route_window_qpc": [1_000_000_000, 1_000_000_000 + int(
+                             windows.get(order, route_seconds) * FREQUENCY)]}
+                        for arm, order, rung, reason, kwargs in captures]
+        path = self.directory / "plan.json"
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        return plan, compare.evaluate(path)
+
+    def test_route_pairing_compares_the_same_route_stretch(self):
+        # Latency follows the route (30 ms light and 60 ms heavy stretches,
+        # the same in every run); the hold adds 1 ms everywhere. Resampling
+        # each run's blocks on its own mixes light and heavy stretches and
+        # cannot see the 1 ms; route pairing compares like with like.
+        def route(offset_us):
+            return {"latency_us": lambda frame: 30_000.0 + 30_000.0 * ((frame // 500) % 2) + offset_us}
+        smoothing_off, none = 3, 0
+        plan, report = self.route_report([("A", 1, 0, smoothing_off, route(0.0)), ("B", 2, 3, none, route(1000.0)),
+                                          ("A", 3, 0, smoothing_off, route(0.0)), ("B", 4, 3, none, route(1000.0))])
+
+        def latency(report):
+            hold = next(entry for entry in report["comparisons"] if entry["id"] == "hold_vs_release")
+            return hold["scenes"][0]["metrics"]["pc_latency_p50_us"]
+
+        paired = latency(report)
+        self.assertGreater(paired["interval"][0], 0.0)
+        self.assertEqual(paired["verdict"], "worse")
+        for run in plan["runs"]:
+            del run["route_window_qpc"]
+        path = self.directory / "plan.json"
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        unpaired = latency(compare.evaluate(path))
+        self.assertLessEqual(unpaired["interval"][0], 0.0)
+        self.assertEqual(unpaired["verdict"], "no_difference")
+
+    def test_route_run_with_another_window_length_is_excluded(self):
+        # Half a window would pair the candidate's first half against the
+        # baseline's whole route.
+        smoothing_off, none, flat = 3, 0, {"latency_us": 30_000.0}
+        _, report = self.route_report([("A", 1, 0, smoothing_off, flat), ("B", 2, 3, none, flat),
+                                       ("A", 3, 0, smoothing_off, flat), ("B", 4, 3, none, flat)],
+                                      windows={4: 15})
+        flags = next(run for run in report["runs"] if run["order"] == 4)["flags"]
+        self.assertTrue(any(flag.startswith("route_window_mismatch") for flag in flags))
+        hold = next(entry for entry in report["comparisons"] if entry["id"] == "hold_vs_release")
+        self.assertEqual(hold["scenes"][0]["candidate_runs"], 1)
+
+    def test_route_keeps_the_final_partial_block(self):
+        # A 27 s route in 5 s blocks ends in a 2 s block; the candidate's
+        # jitter happens only there and must reach its metrics.
+        def last_stretch(frame):
+            return 10_000 + ((2_000 if frame % 2 else -2_000) if 2_500 <= frame < 2_700 else 0)
+        smoothing_off, none = 3, 0
+        flat, spiky = {"latency_us": 30_000.0}, {"latency_us": 30_000.0, "interval_us": last_stretch}
+        _, report = self.route_report([("A", 1, 0, smoothing_off, flat), ("B", 2, 3, none, spiky)],
+                                      route_seconds=27)
+        candidate = next(run for run in report["runs"] if run["order"] == 2)
+        self.assertGreater(candidate["metrics"]["jitter_p99_us"], 1_000.0)
+
+    def test_route_stops_at_the_declared_end_of_a_longer_window(self):
+        # A 28 s window is within tolerance of a 27 s route, but the stretch
+        # after 27 s is not part of the route: its jitter must not count.
+        def after_the_route(frame):
+            return 10_000 + ((2_000 if frame % 2 else -2_000) if 2_700 <= frame < 2_800 else 0)
+        smoothing_off, none = 3, 0
+        flat, spiky = {"latency_us": 30_000.0}, {"latency_us": 30_000.0, "interval_us": after_the_route}
+        _, report = self.route_report([("A", 1, 0, smoothing_off, flat), ("B", 2, 3, none, spiky)],
+                                      route_seconds=27, windows={2: 28})
+        candidate = next(run for run in report["runs"] if run["order"] == 2)
+        self.assertFalse(any(flag.startswith("route_window_mismatch") for flag in candidate["flags"]))
+        self.assertLess(candidate["metrics"]["jitter_p99_us"], 1_000.0)
+
+    def test_route_run_with_a_gap_inside_is_excluded(self):
+        # Displays stop for 10 s in the middle of a full-length window: the
+        # empty blocks are not the same route stretch as another run's.
+        def pause(frame):
+            return 10_000_000 if frame == 1_000 else 10_000
+        smoothing_off = 3
+        _, report = self.route_report([("A", 1, 0, smoothing_off, {"latency_us": 30_000.0, "interval_us": pause})])
+        self.assertTrue(any(flag.startswith("incomplete_route_coverage") for flag in report["runs"][0]["flags"]))
+
+    def test_route_blocks_use_the_present_time_the_window_selects_on(self):
+        # The last frame is presented inside the window and displayed 75 ms
+        # later, after the window ends: it is a long frame of this route.
+        def interval(frame):
+            return 80_000 if frame == 2_999 else 10_000
+        def lead(frame):
+            return 75_000 if frame == 2_999 else 5_000
+        smoothing_off = 3
+        _, report = self.route_report([("A", 1, 0, smoothing_off,
+                                        {"latency_us": 30_000.0, "interval_us": interval, "lead_us": lead})])
+        run = report["runs"][0]
+        self.assertEqual(run["intervals"], self.FRAMES - 1)
+        self.assertGreater(run["metrics"]["long_frame_share"], 0.0)
 
 
 class PlanTests(unittest.TestCase):
@@ -235,6 +341,10 @@ class PlanTests(unittest.TestCase):
             compare.validate_plan(broken)
         broken = copy.deepcopy(plan)
         broken["decision"]["judge"] = []
+        with self.assertRaises(compare.PlanError):
+            compare.validate_plan(broken)
+        broken = copy.deepcopy(plan)
+        broken["decision"]["latency_budget_us"] = 2000
         with self.assertRaises(compare.PlanError):
             compare.validate_plan(broken)
 

@@ -192,7 +192,6 @@
       "dev_share_over_2000us"
     ],
     "latency_metric": "pc_latency_p50_us",
-    "latency_budget_us": 2000,
     "judge": [
       {
         "id": "hold_default",

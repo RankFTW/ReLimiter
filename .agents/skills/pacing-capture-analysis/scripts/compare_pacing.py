@@ -17,11 +17,19 @@ the arm's expectation.
 
 Per scene and comparison: candidate - baseline of the run means, a 95%
 block-bootstrap interval (time blocks resampled within each run), and the
-noise floor, the largest spread between runs of the same arm. A difference is
-'better' or 'worse' only when its interval excludes zero and it exceeds both
-the noise floor and the plan's minimum effect; otherwise 'no_difference'.
-Arms with a single run have no noise floor ('no_replicate'). Lower is better
-for every metric.
+noise floor, the largest spread between runs of the same arm. Runs that replay
+the same route at the same speed (the autonomous testbed) carry their move
+window (route_window_qpc; the scene gives route_seconds): each is analyzed
+inside it, timed at the Present start the window selects on, in blocks counted
+from the route start (the last may be partial), and every run of the scene
+resamples the same block positions, so the interval compares the same route
+stretch in every run. A window of another length, or a capture that does not
+cover it, flags and excludes the run. A difference is 'better' or 'worse'
+only when its interval excludes zero and it exceeds both the noise floor and
+the plan's minimum effect; otherwise 'no_difference'. Arms with a single run
+have no noise floor ('no_replicate'). Lower is better for every metric. Each
+decision rule decides on the pacing metrics and reports the latency change
+beside its verdict.
 
 Offline evidence only: the verdicts are as good as the runs' scene control
 and replication; they do not replace inspecting integrity warnings.
@@ -48,7 +56,13 @@ FEASIBILITY_EVENT = "rung_feasibility"
 PIPELINE_EVENT = "pipeline_change"
 
 # Run flags that exclude a run from the comparisons unless --include-flagged.
-EXCLUDING_FLAGS = ("arm_mismatch", "too_few_intervals", "no_display_intervals")
+EXCLUDING_FLAGS = ("arm_mismatch", "too_few_intervals", "no_display_intervals", "route_window_mismatch",
+                   "incomplete_route_coverage")
+
+
+def route_tolerance_s(route_seconds: float) -> float:
+    """How far a route-paired run's window may differ from its scene's route duration."""
+    return max(1.0, 0.03 * route_seconds)
 
 
 def metric_names(thresholds_us: list[float]) -> list[str]:
@@ -112,6 +126,9 @@ def validate_plan(plan: dict[str, Any]) -> None:
     if fallback is not None and (fallback.get("comparison") not in comparison_ids or
                                  fallback.get("judged") not in rule_ids):
         raise PlanError("decision.fallback must name a comparison id and a decision rule id ('judged')")
+    if "latency_budget_us" in decision:
+        raise PlanError("decision.latency_budget_us is retired: the latency change is reported beside each "
+                        "decision, never a cutoff; remove it")
     names = metric_names(plan["analysis"].get("deviation_thresholds_us", []))
     for metric in [*decision.get("primary_metrics", []), decision.get("latency_metric")]:
         if metric not in names:
@@ -119,6 +136,21 @@ def validate_plan(plan: dict[str, Any]) -> None:
     for run in plan["runs"]:
         if run.get("scene") not in scenes or run.get("arm") not in arms:
             raise PlanError(f"run {run!r} names an unknown scene or arm")
+    block_s = float(plan["analysis"].get("block_seconds", 5.0))
+    for scene_id, scene in scenes.items():
+        captured = [run for run in plan["runs"] if run["scene"] == scene_id and run.get("capture")]
+        windowed = [run for run in captured if run.get("route_window_qpc") is not None]
+        if not windowed:
+            continue
+        if len(windowed) != len(captured):
+            raise PlanError(f"scene {scene_id!r}: route pairing needs route_window_qpc on every captured run")
+        if not float(scene.get("route_seconds") or 0.0) >= block_s:
+            raise PlanError(f"scene {scene_id!r}: route-paired runs need route_seconds of at least one block")
+        for run in windowed:
+            window = run["route_window_qpc"]
+            if not (isinstance(window, list) and len(window) == 2 and
+                    all(isinstance(value, int) for value in window) and window[1] > window[0]):
+                raise PlanError(f"run {run.get('order')!r}: route_window_qpc must be [start, end] QPC ticks")
 
 
 # ── Per-run series ──
@@ -138,14 +170,19 @@ class Block:
 class ChainSeries:
     """Display-change samples of one native swapchain: (seconds, kind, value)."""
     display_changes: int = 0
+    frequency: int = 0
     intervals: list[tuple[float, float | None, float | None, int | None]] = field(default_factory=list)
     animation_error: list[tuple[float, float]] = field(default_factory=list)
     pc_latency: list[tuple[float, float]] = field(default_factory=list)
 
 
-def collect_series(path: Path, warmup_s: float) -> tuple[ChainSeries | None, Counter[str], Counter[str]]:
-    """Primary-swapchain series plus plan-rung and source-placement row counts."""
-    selection = pacing.RowSelection(pacing.RowFilters(warmup_seconds=warmup_s))
+def collect_series(path: Path, filters: Any, route_time: bool = False
+                   ) -> tuple[ChainSeries | None, Counter[str], Counter[str]]:
+    """Primary-swapchain series plus plan-rung and source-placement row counts.
+    Samples are timed at their display, or with route_time at the row time the
+    route window selects on (present start, else p), so that a route-paired
+    run's selection and block membership use one clock."""
+    selection = pacing.RowSelection(filters)
     chains: dict[int, ChainSeries] = {}
     rungs: Counter[str] = Counter()
     placements: Counter[str] = Counter()
@@ -158,7 +195,8 @@ def collect_series(path: Path, warmup_s: float) -> tuple[ChainSeries | None, Cou
             continue
         series = chains.setdefault(row.chain_key, ChainSeries())
         series.display_changes += 1
-        seconds = row.display_qpc / row.qpc_frequency
+        series.frequency = row.qpc_frequency
+        seconds = (row.row_time_qpc if route_time else row.display_qpc) / row.qpc_frequency
         if derived["display_interval_us"] is not None:
             deviation = derived["deviation_us"]
             series.intervals.append((seconds, derived["adjacent_jitter_us"],
@@ -173,16 +211,23 @@ def collect_series(path: Path, warmup_s: float) -> tuple[ChainSeries | None, Cou
     return primary, rungs, placements
 
 
-def build_blocks(series: ChainSeries, block_s: float, thresholds_us: list[float]) -> list[Block]:
+def build_blocks(series: ChainSeries, block_s: float, thresholds_us: list[float],
+                 origin_s: float | None = None, count: int | None = None) -> list[Block]:
+    """Time blocks of block_s from the run's first sample, or, for a route-paired
+    run, exactly count blocks from origin_s (the route start), empty ones
+    included, so that block k of every run of the scene is the same stretch of
+    the route; samples outside them are dropped."""
     times = ([sample[0] for sample in series.intervals] + [sample[0] for sample in series.animation_error] +
              [sample[0] for sample in series.pc_latency])
-    if not times:
+    if not times and count is None:
         return []
-    origin = min(times)
+    origin = min(times) if origin_s is None else origin_s
     blocks: dict[int, Block] = {}
 
-    def block(seconds: float) -> Block:
+    def block(seconds: float) -> Block | None:
         index = int((seconds - origin) // block_s)
+        if count is not None and not 0 <= index < count:
+            return None
         found = blocks.get(index)
         if found is None:
             found = blocks[index] = Block(deviation_over=[0] * len(thresholds_us))
@@ -190,6 +235,8 @@ def build_blocks(series: ChainSeries, block_s: float, thresholds_us: list[float]
 
     for seconds, jitter, deviation, long_frame in series.intervals:
         target = block(seconds)
+        if target is None:
+            continue
         if jitter is not None:
             target.jitter.append(jitter)
         if deviation is not None:
@@ -201,9 +248,15 @@ def build_blocks(series: ChainSeries, block_s: float, thresholds_us: list[float]
             target.long_known += 1
             target.long_frames += long_frame
     for seconds, value in series.animation_error:
-        block(seconds).animation_error.append(value)
+        target = block(seconds)
+        if target is not None:
+            target.animation_error.append(value)
     for seconds, value in series.pc_latency:
-        block(seconds).pc_latency.append(value)
+        target = block(seconds)
+        if target is not None:
+            target.pc_latency.append(value)
+    if count is not None:
+        return [blocks.get(index) or Block(deviation_over=[0] * len(thresholds_us)) for index in range(count)]
     return [blocks[index] for index in sorted(blocks)]
 
 
@@ -230,7 +283,8 @@ def block_metrics(blocks: list[Block], thresholds_us: list[float]) -> dict[str, 
 
 def bootstrap(blocks: list[Block], thresholds_us: list[float], iterations: int,
               seed: str) -> dict[str, list[float | None]]:
-    """Block bootstrap: resample the run's time blocks with replacement."""
+    """Block bootstrap: resample the run's time blocks with replacement. Runs
+    sharing a seed and a block count draw the same block positions."""
     names = metric_names(thresholds_us)
     draws: dict[str, list[float | None]] = {name: [] for name in names}
     if not blocks:
@@ -362,11 +416,15 @@ def analyze_run(index: int, run: dict[str, Any], plan: dict[str, Any], base: Pat
         return result
     protocol, analysis = plan["protocol"], plan["analysis"]
     thresholds = list(analysis.get("deviation_thresholds_us", []))
+    block_s = float(analysis.get("block_seconds", 5.0))
     warmup = float(protocol.get("warmup_seconds", 0.0))
+    window = run.get("route_window_qpc")
+    filters = (pacing.RowFilters(start_qpc=int(window[0]), end_qpc=int(window[1])) if window
+               else pacing.RowFilters(warmup_seconds=warmup))
     events_path = (base / run["events"]).resolve() if run.get("events") else pacing.events_sibling(path)
     try:
-        report = pacing.analyze_capture(path, events_path, pacing.RowFilters(warmup_seconds=warmup))
-        series, row_rungs, placements = collect_series(path, warmup)
+        report = pacing.analyze_capture(path, events_path, filters)
+        series, row_rungs, placements = collect_series(path, filters, route_time=bool(window))
     except (OSError, ValueError) as error:
         result.status = "error"
         result.notes.append(str(error))
@@ -392,14 +450,48 @@ def analyze_run(index: int, run: dict[str, Any], plan: dict[str, Any], base: Pat
     if series is None or not series.intervals:
         result.flags.append("no_display_intervals: native PC Latency collection or display rows missing")
         return result
-    result.intervals = len(series.intervals)
-    result.duration_s = series.intervals[-1][0] - series.intervals[0][0]
+    if window:
+        # Route-paired: block k is the same route stretch in every run of the
+        # scene and one seed draws the same blocks for all of them, so the
+        # difference interval compares like with like (difference_interval).
+        # A window of another length or a capture that does not cover it would
+        # compare different stretches: such runs are flagged and excluded.
+        scene = next(scene for scene in plan["scenes"] if scene["id"] == run["scene"])
+        route_s = float(scene["route_seconds"])
+        start_s, end_s = int(window[0]) / series.frequency, int(window[1]) / series.frequency
+        if abs((end_s - start_s) - route_s) > route_tolerance_s(route_s):
+            result.flags.append(f"route_window_mismatch: {end_s - start_s:.2f} s window, route {route_s:.2f} s")
+        # Exactly the declared stretch [start, start + route_seconds), however
+        # long the accepted window, and covered throughout: a gap longer than a
+        # block (a pause, lost rows) would leave the arms' blocks unlike.
+        stop_s = start_s + route_s
+
+        def inside(samples):
+            return [sample for sample in samples if start_s <= sample[0] < stop_s]
+        route_series = ChainSeries(display_changes=series.display_changes, frequency=series.frequency,
+                                   intervals=inside(series.intervals),
+                                   animation_error=inside(series.animation_error),
+                                   pc_latency=inside(series.pc_latency))
+        times = [start_s, *(sample[0] for sample in route_series.intervals), stop_s]
+        gap, at = max((b - a, a - start_s) for a, b in zip(times, times[1:]))
+        if gap > block_s:
+            result.flags.append(f"incomplete_route_coverage: no display interval for {gap:.1f} s from "
+                                f"{at:.1f} s of the {route_s:.1f} s route")
+        count = math.ceil(route_s / block_s - 1e-9)  # the last block may be partial
+        blocks = build_blocks(route_series, block_s, thresholds, start_s, count)
+        analyzed = route_series.intervals
+        draw_seed = f"{seed}:route:{run['scene']}"
+    else:
+        analyzed = series.intervals
+        blocks = build_blocks(series, block_s, thresholds)
+        draw_seed = f"{seed}:{index}:{run['capture']}"
+    result.intervals = len(analyzed)
+    result.duration_s = analyzed[-1][0] - analyzed[0][0] if analyzed else 0.0
     minimum = int(protocol.get("min_display_intervals", 0))
     if result.intervals < minimum:
         result.flags.append(f"too_few_intervals: {result.intervals} < {minimum}")
-    blocks = build_blocks(series, float(analysis.get("block_seconds", 5.0)), thresholds)
     result.metrics = block_metrics(blocks, thresholds)
-    result.draws = bootstrap(blocks, thresholds, iterations, f"{seed}:{index}:{run['capture']}")
+    result.draws = bootstrap(blocks, thresholds, iterations, draw_seed)
     if result.metrics["pc_latency_p50_us"] is None:
         result.notes.append("no native PC Latency samples: latency metric unavailable")
     return result
@@ -503,22 +595,25 @@ def _scene_entry(comparisons: list[dict[str, Any]], comparison_id: str, scene_id
 
 
 def judge_rule(plan: dict[str, Any], comparisons: list[dict[str, Any]], rule: dict[str, Any]) -> dict[str, Any]:
-    """One decision rule: is the candidate of the rule's comparison supported?
+    """One decision rule: is the candidate of the rule's comparison better paced?
 
       supported    - every light scene 'better' on every primary metric, every
                      heavy scene 'better' or 'no_difference' on each (decided,
-                     with replicates), and the latency increase within the
-                     budget in every scene;
-      rejected     - any scene 'worse' on a primary metric, or a latency
-                     increase above the budget;
+                     with replicates);
+      rejected     - any scene 'worse' on a primary metric;
       inconclusive - otherwise (missing runs, no replicate, no difference).
+
+    Latency never gates the verdict: each compared scene's change in the
+    plan's latency metric (delta, interval, verdict) is reported beside it,
+    so a pacing gain is weighed against its latency cost, not cut off at a
+    budget.
     """
     decision = plan["decision"]
     primary = decision["primary_metrics"]
     latency_metric = decision["latency_metric"]
-    budget = float(decision.get("latency_budget_us", math.inf))
     name = rule["comparison"]
     reasons: list[str] = []
+    latency: dict[str, dict[str, Any]] = {}
     rejected = False
     supported = True
     for scene in plan["scenes"]:
@@ -538,16 +633,12 @@ def judge_rule(plan: dict[str, Any], comparisons: list[dict[str, Any]], rule: di
             elif scene["class"] == "heavy" and outcome not in ("better", "no_difference"):
                 supported = False
                 reasons.append(f"{scene['id']} (heavy): the candidate is {outcome} on {metric}")
-        latency = entry["metrics"][latency_metric]
-        if latency["delta"] is None:
-            supported = False
-            reasons.append(f"{scene['id']}: {latency_metric} unavailable")
-        elif latency["delta"] > budget:
-            rejected = True
-            reasons.append(f"{scene['id']}: {latency_metric} rises {latency['delta']:.0f} us, "
-                           f"above the {budget:.0f} us budget")
+        change = entry["metrics"][latency_metric]
+        latency[scene["id"]] = {"metric": latency_metric, "delta": change.get("delta"),
+                                "interval": change.get("interval"), "verdict": change.get("verdict")}
     status = "rejected" if rejected else "supported" if supported else "inconclusive"
-    return {"label": rule.get("label", rule["id"]), "comparison": name, "status": status, "reasons": reasons}
+    return {"label": rule.get("label", rule["id"]), "comparison": name, "status": status, "reasons": reasons,
+            "latency": latency}
 
 
 def decide(plan: dict[str, Any], comparisons: list[dict[str, Any]]) -> dict[str, Any]:
@@ -603,6 +694,10 @@ def evaluate(plan_path: Path, iterations: int | None = None, seed: int | None = 
         "method": {"bootstrap_iterations": iterations, "seed": seed,
                    "block_seconds": analysis.get("block_seconds"), "confidence": analysis.get("confidence"),
                    "warmup_seconds": plan["protocol"].get("warmup_seconds"),
+                   "pairing": ("route: runs with route_window_qpc are analyzed inside that window, their blocks "
+                               "aligned to the route start and resampled at the same positions in every run of "
+                               "the scene" if any(run.get("route_window_qpc") for run in plan["runs"])
+                               else "none: each run's blocks are resampled independently"),
                    "include_flagged": include_flagged,
                    "quantiles": "lower-index sorted[floor(p * (n - 1))] (analyze_pacing.py)",
                    "noise_floor": "largest spread between runs of the same arm in the scene",
@@ -669,6 +764,11 @@ def format_report(report: dict[str, Any]) -> str:
         lines.append(f"Decision: {rule['label']} ({rule['comparison']}) - {rule['status']}")
         for reason in rule["reasons"]:
             lines.append(f"  - {reason}")
+        for scene, change in rule["latency"].items():
+            low, high = change["interval"] or (None, None)
+            lines.append(f"  latency in {scene} ({change['metric']}): {_format(change['delta'], change['metric'])}"
+                         f" [{_format(low, change['metric'])}, {_format(high, change['metric'])}]"
+                         f" -> {change['verdict']}")
     for scene, status in decision["fallback"].items():
         lines.append(f"Fallback in {scene}: {status}")
     lines.append("")
