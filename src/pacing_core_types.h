@@ -166,6 +166,26 @@ enum class PacingFallbackReason : uint8_t {
     FgRouteUnsupported = 13 // FG presents its own frames on another thread and queue: no FG input wait
 };
 
+// The rung a Source record shows for its pipeline generation (the
+// telemetry's pipeline_change): a planned record its plan rung; a record of
+// a pipeline that plans nothing, passthrough or the Reflex driver limiter,
+// SourceOnly by definition. An unplanned frame of any other pipeline shows
+// none: its rung waits for the pipeline's first planned frame.
+inline bool PacingSourceRecord_PipelineRung(const PacingSourceRecord& record, uint32_t* rung) noexcept
+{
+    if (record.pipeline_generation == 0) return false;
+    if (record.grid_index != 0) {
+        *rung = record.plan_rung;
+        return true;
+    }
+    if (record.fallback_reason == static_cast<uint8_t>(PacingFallbackReason::Passthrough) ||
+        record.source_placement == static_cast<uint8_t>(PacingSourcePlacement::DriverLimiter)) {
+        *rung = static_cast<uint32_t>(PacingRung::SourceOnly);
+        return true;
+    }
+    return false;
+}
+
 // ── Plans and stage events ──
 
 // One real frame's plan. The source stage publishes it before its wait;

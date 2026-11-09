@@ -788,6 +788,48 @@ namespace
         CHECK(!PacingSourcePlacement_WaitsAtMarker(PacingSourcePlacement::DriverLimiter));
     }
 
+    // The rung a Source record shows for its pipeline (the telemetry's
+    // pipeline_change), from records shaped like the scheduler's. Under the
+    // Reflex driver limiter every record is unplanned; its pipeline must still
+    // be announced, or a capture under it repeats the previous pipeline.
+    void TestPipelineRungOfRecords()
+    {
+        PacingRuntimeState sleeping = ActiveVrr();
+        sleeping.pre_sleep_available = true;
+        const auto record_of = [](const PacingPipelineSnapshot& pipeline, uint64_t grid_index) {
+            PacingSourceRecord record{};
+            record.pipeline_generation = 7;
+            record.grid_index = grid_index;
+            record.plan_rung = static_cast<uint8_t>(pipeline.rung);
+            record.fallback_reason = static_cast<uint8_t>(pipeline.reason);
+            record.source_placement = static_cast<uint8_t>(pipeline.placement);
+            return record;
+        };
+        uint32_t rung = 99;
+
+        PacingPipelineConfig config{};
+        const PacingPipelineSnapshot held = Resolve(config, QualifiedDx12(), sleeping);
+        CHECK(PacingSourceRecord_PipelineRung(record_of(held, 12), &rung) &&
+              rung == static_cast<uint32_t>(PacingRung::GpuQueueWait));
+        rung = 99;
+        CHECK(!PacingSourceRecord_PipelineRung(record_of(held, 0), &rung) && rung == 99);
+        PacingSourceRecord unpublished = record_of(held, 12);
+        unpublished.pipeline_generation = 0;
+        CHECK(!PacingSourceRecord_PipelineRung(unpublished, &rung));
+
+        PacingRuntimeState uncapped = sleeping;
+        uncapped.uncapped = true;
+        CHECK(PacingSourceRecord_PipelineRung(record_of(Resolve(config, QualifiedDx12(), uncapped), 0), &rung) &&
+              rung == static_cast<uint32_t>(PacingRung::SourceOnly));
+
+        config.placement_override = PacingPlacementOverride::Driver;
+        const PacingPipelineSnapshot driver = Resolve(config, QualifiedDx12(), sleeping);
+        CHECK(driver.placement == PacingSourcePlacement::DriverLimiter);
+        rung = 99;
+        CHECK(PacingSourceRecord_PipelineRung(record_of(driver, 0), &rung) &&
+              rung == static_cast<uint32_t>(PacingRung::SourceOnly));
+    }
+
     void TestConfigClamp()
     {
         const PacingPipelineConfig defaults{};
@@ -1399,6 +1441,7 @@ int main()
     TestPublishGeneration();
     TestCapabilities();
     TestSourcePlacement();
+    TestPipelineRungOfRecords();
     TestConfigClamp();
     TestSmoothingText();
     TestRungOverrideText();

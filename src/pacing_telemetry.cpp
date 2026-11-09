@@ -374,8 +374,7 @@ namespace
     // rung-feasibility and gpu-wait-cap events (pacing_controller_events.h), derived
     // from Source record fields like the producer-epoch and controller-generation events.
     // A pipeline generation is reported by the first record that shows its
-    // rung: a planned record (grid_index != 0) or a passthrough pipeline,
-    // whose rung is SourceOnly by definition.
+    // rung (PacingSourceRecord_PipelineRung).
     void TrackPlan(const PacingSourceRecord& record, int64_t event_qpc) noexcept
     {
         const bool planned = record.grid_index != 0;
@@ -388,12 +387,10 @@ namespace
                 s_state.grid_epoch_reason = record.epoch_reason;
             }
         }
-        const bool passthrough = record.fallback_reason ==
-            static_cast<uint8_t>(PacingFallbackReason::Passthrough);
         KnownValue& pipeline = s_state.pipeline_generation;
-        if (record.pipeline_generation != 0 && (planned || passthrough) &&
+        uint32_t rung = 0;
+        if (PacingSourceRecord_PipelineRung(record, &rung) &&
             (!pipeline.valid || pipeline.value != record.pipeline_generation)) {
-            const uint32_t rung = planned ? record.plan_rung : static_cast<uint32_t>(PacingRung::SourceOnly);
             const KnownValue previous_rung{ pipeline.valid, s_state.pipeline_rung };
             PushValueEvent(PacingCsvEventType::PipelineChange, event_qpc, previous_rung,
                 rung, record.fallback_reason);
