@@ -537,10 +537,9 @@ namespace
         CHECK_LEAD(unknown, kDefaultLeadQuantile, 500.0);
     }
 
-    // lead_coverage: Q99 (the default) raises only the lead's quantile, on
-    // every rung and smoothing level; the allowance and the render handoff
-    // quantile stay the Smoothing table's. Q95 (developer A/B) keeps the
-    // table's quantile.
+    // lead_coverage sets only the lead's quantile, on every rung and
+    // smoothing level: 0.99 by default, the key's percentile otherwise. The
+    // allowance and the render handoff quantile stay the Smoothing table's.
     void TestLeadCoverage()
     {
         PacingPipelineConfig config{};
@@ -560,6 +559,19 @@ namespace
         result = Resolve(config, QualifiedDx12(), ActiveVrr());
         CHECK_LEAD(result, 0.95, 0.0);
         CHECK(result.handoff_quantile == 0.95);
+        const struct { PacingLeadCoverage coverage; double quantile; const char* text; } lower[] = {
+            { PacingLeadCoverage::Q50, 0.50, "50" }, { PacingLeadCoverage::Q75, 0.75, "75" },
+            { PacingLeadCoverage::Q90, 0.90, "90" },
+        };
+        config.smoothing = PacingSmoothing::On;
+        for (const auto& entry : lower) {
+            config.lead_coverage = entry.coverage;
+            result = Resolve(config, QualifiedDx12(), ActiveFg());
+            CHECK_LEAD(result, entry.quantile, 500.0);
+            CHECK(result.handoff_quantile == 0.95);
+            PacingLeadCoverage text_value = PacingLeadCoverage::Q99;
+            CHECK(PacingLeadCoverage_FromText(entry.text, &text_value) && text_value == entry.coverage);
+        }
 
         PacingPipelineConfig invalid{};
         invalid.lead_coverage = static_cast<PacingLeadCoverage>(9);

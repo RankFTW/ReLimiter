@@ -114,8 +114,22 @@ Turning it off removes two command lists and two fence signals per frame from th
 
 - **99%** (default) leaves about 1 frame in 100 ready after its target. Such frames are shown when ready; with frame generation each one moves two or more displayed frames.
 - **95%** leaves about 1 in 20, for a shorter lead and a little less latency: in CONTROL Resonant captures about 2–2.6 ms less lead at the median with frame generation, about 0.5 ms in Rogue Core.
-- Frames late because the GPU or the game's render thread was still busy with the previous frame are not helped; the extra lead only adds latency there.
-- The render handoff limit keeps 95% with either setting. Compare long frames, jitter, frames ready after their target and PC Latency, one setting per capture in the same scene. The log warns while it is not **99%**.
+- **90%**, **75%** and **50%** leave about 1 in 10, 4 and 2. They map the trade between the hold's latency and the frames it can no longer hold: a frame is released the lead before its target and needs only its own time, so the hold costs about the distance from the game's typical frame time to the covered percentile.
+- The lead spike floor still applies below 99% and can then set the lead instead (with it, 95% kept about 1 ms more PC latency in the same game); turn `lead_spike_floor` off to compare coverages.
+- Measured in Phantom Blade Zero with DLSS frame generation 2× (hardware flip metering) at a 100 FPS cap the GPU reaches with room, spike floor off, each against NVIDIA's Reflex limiter at the same cap in the same session (about 30 displayed intervals per minute over 1.5 times the median, 74 steps over 4 ms per 1,000 displayed frames):
+
+  | Lead coverage | PC latency | Long intervals per minute | Steps over 4 ms per 1,000 |
+  |---|---|---|---|
+  | 50% | +0.8 ms | −6 | −38 |
+  | 75% | +1.8 ms | −12 | −53 |
+  | 90% | +2.0 ms | −19 | −61 |
+  | 95% | +2.9 ms | −19 | −60 |
+  | 99% | +4.9 ms | −21 | −62 |
+  | 99% with the spike floor (default) | +4.8 ms | −20 | −65 |
+
+  Two to four one-minute runs per row on one route; long intervals vary by about 5 per minute between runs.
+- Frames late because the GPU or the game's render thread was still busy with the previous frame are not helped; the extra lead only adds latency there. At a cap the GPU barely reaches (the same game at 120 FPS) 90% had 2–4 ms less PC latency than the default with no measurable difference in long intervals or steps.
+- The render handoff limit keeps 95% whatever the coverage. Compare long frames, jitter, frames ready after their target and PC Latency, one setting per capture in the same scene. The log warns while it is not **99%**.
 
 ### FG late-frame spacing
 
@@ -213,7 +227,7 @@ Settings belong under `[FrameLimiter]`. Leave these at their defaults for normal
 | `lead_spike_floor` | true | 64-bit, `gpu_queue_wait` and the FG input wait with **Output override** on **Auto**, while the next frame's GPU work runs behind the wait. `true` or `false` (**Lead spike floor**): `false` leaves the lead at its own percentile, without the floor for the game's rare long simulation frames (see [Lead and late frames](#lead-and-late-frames), **Spike floor**). Developer A/B, on by default. |
 | `marker_forward_order` | before_wait | 64-bit, NvAPI markers. `before_wait` or `after_wait`: when SIMULATION_START reaches the driver relative to ReLimiter's wait (**Marker forward order**). Invalid values reset to `before_wait`. |
 | `gpu_queue_wait_render_queue` | keep | 64-bit, `gpu_queue_wait` only. `keep`, `remove` or `remove_held` (**GPU queue wait render queue**). Invalid values reset to `keep`. |
-| `lead_coverage` | 99 | All holds. `99` or `95`: the share of frames the lead covers (**Lead coverage**). Invalid values reset to `99`. An INI saved with `config_version=2` (4.0 test builds) moves from `95` to `99` once. |
+| `lead_coverage` | 99 | All holds. `99`, `95`, `90`, `75` or `50`: the share of frames the lead covers (**Lead coverage**). Invalid values reset to `99`. An INI saved with `config_version=2` (4.0 test builds) moves from `95` to `99` once. |
 | `fg_late_spacing` | true | 64-bit, `fg_input_wait` only. `true` or `false` (**FG late-frame spacing**). An INI saved with `config_version=3` or earlier (4.0 test builds) moves from `false` to `true` once. |
 | `gpu_paced_cadence` | false | 64-bit, direct NvAPI Reflex markers, with the Sleep bypass on. `true` or `false` (**GPU-paced cadence**): held frames get the render handoff GPU floor and are released on a rhythm that follows the GPU's average frame period, a frame that floor releases keeps the GPU's pace instead of being held to the cap's cadence, and the GPU floor also uses the GPU waits' own readiness timestamps. Developer A/B, off by default. |
 | `source_placement` | pre_sleep | 64-bit, Reflex markers. `marker`, `pre_sleep` or `driver` (**Source placement**). `auto` from earlier versions loads as `marker`; invalid values reset to `pre_sleep`. |

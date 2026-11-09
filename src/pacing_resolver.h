@@ -110,7 +110,7 @@ struct PacingPipelineConfig {
     double gpu_wait_headroom_us = kPacingGpuWaitHeadroomDefaultUs; // developer key gpu_wait_headroom_us: [500, 3000]
     double gpu_wait_interleave_s = 0.0; // developer key gpu_wait_interleave_s: 0 = off, else [1, 10]
     PacingRenderQueue gpu_queue_wait_render_queue = PacingRenderQueue::Keep; // developer key (A/B)
-    PacingLeadCoverage lead_coverage = PacingLeadCoverage::Q99; // key lead_coverage; 95 is the developer A/B
+    PacingLeadCoverage lead_coverage = PacingLeadCoverage::Q99; // key lead_coverage; below 99 is the developer A/B
     // Key fg_late_spacing (default on; off is the developer A/B): the FG input
     // wait records a frame that reached its wait after the Signal at its
     // readiness and floors the next frame's Signal on it (cadence_grid.h,

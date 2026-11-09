@@ -29,10 +29,12 @@ namespace
     static_assert(sizeof(kLead) / sizeof(kLead[0]) ==
             static_cast<size_t>(PacingSmoothing::Count),
         "one lead entry per smoothing level");
-    // lead_coverage Q99 (the default) replaces the table's quantile for the
-    // lead only; the render handoff offset keeps the table's. Q95 (developer
-    // A/B) keeps the table's for both.
-    constexpr double kLeadCoverageQ99 = 0.99;
+    // lead_coverage sets the lead's quantile only; the render handoff offset
+    // keeps the table's, whatever the coverage.
+    constexpr double kLeadCoverageQuantile[] = { 0.50, 0.75, 0.90, 0.95, 0.99 };
+    static_assert(sizeof(kLeadCoverageQuantile) / sizeof(kLeadCoverageQuantile[0]) ==
+            static_cast<size_t>(PacingLeadCoverage::Count),
+        "one quantile per lead coverage");
 
     struct RungDecision {
         PacingRung rung;
@@ -463,7 +465,7 @@ PacingPipelineSnapshot PacingPipeline_Resolve(
     result.rung = decision.rung;
     result.reason = decision.reason;
     const LeadParameters lead = kLead[static_cast<size_t>(safe_config.smoothing)];
-    result.lead_quantile = safe_config.lead_coverage == PacingLeadCoverage::Q99 ? kLeadCoverageQ99 : lead.quantile;
+    result.lead_quantile = kLeadCoverageQuantile[static_cast<size_t>(safe_config.lead_coverage)];
     result.allowance_us = lead.allowance_us;
     result.handoff_quantile = lead.quantile;
     result.gpu_wait_headroom_us = safe_config.gpu_wait_headroom_us;
@@ -679,6 +681,9 @@ bool PacingRenderQueue_FromText(const char* text, PacingRenderQueue* render_queu
 const char* PacingLeadCoverage_Text(PacingLeadCoverage coverage) noexcept
 {
     switch (coverage) {
+        case PacingLeadCoverage::Q50: return "50";
+        case PacingLeadCoverage::Q75: return "75";
+        case PacingLeadCoverage::Q90: return "90";
         case PacingLeadCoverage::Q95: return "95";
         case PacingLeadCoverage::Q99: return "99";
         default: return "unknown";

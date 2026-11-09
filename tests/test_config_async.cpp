@@ -539,8 +539,8 @@ void TestRenderQueueParsing() {
 }
 
 // Developer A/B lead_coverage: 95 loads (in a version-3 INI), reaches the
-// pipeline, counts as a developer override and resets to 99; other text
-// falls back to 99.
+// pipeline, counts as a developer override and resets to 99; 50 loads and
+// is saved as written; other text falls back to 99.
 void TestLeadCoverageKey() {
     Reset(false, false, {{"config_version", "3"}, {"lead_coverage", "95"}});
     CHECK(g_config.lead_coverage == PacingLeadCoverage::Q95);
@@ -550,6 +550,11 @@ void TestLeadCoverageKey() {
     Config_ResetDeveloperSettings();
     CHECK(g_config.lead_coverage == PacingLeadCoverage::Q99);
     CHECK(PacingPipeline_GetConfig().lead_coverage == PacingLeadCoverage::Q99);
+    ReleaseStart();CHECK(OwnerShutdown());
+    Reset(false, false, {{"config_version", "4"}, {"lead_coverage", "50"}});
+    CHECK(g_config.lead_coverage == PacingLeadCoverage::Q50);
+    CheckPipelineMatchesConfig();
+    CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "50");
     ReleaseStart();CHECK(OwnerShutdown());
     Reset(false, false, {{"config_version", "3"}, {"lead_coverage", "97"}});
     CHECK(g_config.lead_coverage == PacingLeadCoverage::Q99);
