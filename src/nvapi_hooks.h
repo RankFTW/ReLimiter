@@ -16,6 +16,38 @@ inline std::atomic<bool> g_reflex_sleep_bypass{false};
 // has the driver's low latency mode turned off (SetSleepMode forwarded with
 // bLowLatencyMode and bLowLatencyBoost 0) so ReLimiter is the only pacer.
 inline std::atomic<bool> g_bypass_low_latency_off{false};
+// Developer A/B driver_low_latency_off: while the game's Reflex Sleep is
+// forwarded to the driver, SetSleepMode reaches the driver with bLowLatencyMode
+// and bLowLatencyBoost 0 (the game and Streamline keep their own setting).
+inline std::atomic<bool> g_driver_low_latency_off{false};
+// Developer key sleep_status_every_frame: the poll of the driver's sleep status
+// in Hook_Sleep (developer_settings) runs at every Sleep, not once per second.
+inline std::atomic<bool> g_sleep_status_every_frame{false};
+// The driver's sleep status as the pacing CSV's driver_sleep_interval_us and
+// driver_use_game_sleep columns: bit 63 set = a result, bits 40..62 = the
+// feedback-device publication the result belongs to (SleepStatusToken), bit 32 =
+// bUseGameSleep, low 32 bits = sleepIntervalUs. g_sleep_status_newest is the
+// newest successful NvAPI_D3D_GetSleepStatus result (the game's own call or the
+// poll); g_sleep_status_at_sleep_return is the newest one when the presenting
+// device's Reflex Sleep last returned, taken by the next source record (the
+// scheduler owner exchanges it to 0), so a frame without a Sleep has none.
+// g_sleep_status_token is the current publication's token, set where the
+// publication changes (before the words are cleared); a result stores the token
+// captured before its driver query, and is rejected at publication to
+// g_sleep_status_at_sleep_return and at consumption when it does not equal the
+// current one, so a query that straddled a publication change never answers for
+// the new publication.
+constexpr uint32_t kSleepStatusTokenMask = 0x7FFFFFu; // bits 40..62 of the word
+constexpr uint64_t SleepStatusWord(uint32_t interval_us, bool use_game_sleep, uint32_t token = 0) noexcept {
+	return (uint64_t{1} << 63) | ((uint64_t{token} & kSleepStatusTokenMask) << 40) |
+	       (use_game_sleep ? (uint64_t{1} << 32) : 0) | interval_us;
+}
+constexpr uint32_t SleepStatusToken(uint64_t word) noexcept {
+	return static_cast<uint32_t>((word >> 40) & kSleepStatusTokenMask);
+}
+inline std::atomic<uint32_t> g_sleep_status_token{0};
+inline std::atomic<uint64_t> g_sleep_status_newest{0};
+inline std::atomic<uint64_t> g_sleep_status_at_sleep_return{0};
 // marker_forward_order == after_wait: direct SIMULATION_START/RENDERSUBMIT_START
 // reach the driver after the source wait instead of on hook entry.
 inline std::atomic<bool> g_marker_forward_after_wait{false};
@@ -111,7 +143,8 @@ enum class DriverLimiterApply : uint8_t {
 	Applied = 0,
 	NoGameParams, // the game's SetSleepMode parameters were never captured
 	NoDevice,     // no current feedback device, or it is not the one the parameters belong to
-	Failed        // no trampoline, or the driver call failed
+	Failed,       // no trampoline, or the driver call failed
+	Busy          // the forward lock was held: nothing sent, repaired by the next call
 };
 
 // SetSleepMode on the presenting device with the game's captured parameters

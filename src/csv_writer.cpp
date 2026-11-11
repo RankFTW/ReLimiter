@@ -3,6 +3,7 @@
 #include "logger.h"
 #include "nvapi_marker_census.h"
 #include "pacing_controller_events.h"
+#include "instrumentation_state.h"
 
 #include <Windows.h>
 
@@ -597,6 +598,42 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
         DecimalIf(line, row.joined.has_wait && row.joined.wait.has_async, row.joined.wait.async_us); } },
     { "async_marker_wait_type", [](CsvLine* line, const PacingCsvRow& row) {
         UnsignedIf(line, row.joined.has_wait && row.joined.wait.has_async, row.joined.wait.async_type); } },
+    // Appended (the driver's Reflex Sleep): the call start and return of the
+    // driver's Sleep that belongs to this frame's grid index (QPC); empty
+    // when no Sleep matched (bypassed, not the presenting device, or the plan
+    // was not the next index after the Sleep) or without a Source record.
+    { "driver_sleep_start_qpc", [](CsvLine* line, const PacingCsvRow& row) {
+        QpcIf(line, row.joined.has_source, row.joined.source.driver_sleep_start_qpc); } },
+    { "driver_sleep_end_qpc", [](CsvLine* line, const PacingCsvRow& row) {
+        QpcIf(line, row.joined.has_source, row.joined.source.driver_sleep_end_qpc); } },
+    // Appended (the driver's sleep status): sleepIntervalUs and bUseGameSleep
+    // of the newest successful NvAPI_D3D_GetSleepStatus result when this
+    // frame's Reflex Sleep returned (µs, 0/1); empty when no result existed
+    // or no Sleep preceded the Source record.
+    { "driver_sleep_interval_us", [](CsvLine* line, const PacingCsvRow& row) {
+        UnsignedIf(line, row.joined.has_source && row.joined.source.driver_sleep_status_valid != 0,
+            row.joined.source.driver_sleep_interval_us); } },
+    { "driver_use_game_sleep", [](CsvLine* line, const PacingCsvRow& row) {
+        UnsignedIf(line, row.joined.has_source && row.joined.source.driver_sleep_status_valid != 0,
+            row.joined.source.driver_use_game_sleep); } },
+    // Appended (flip metering input): the QPC and the timePerBatchMs (as µs)
+    // of the newest NvAPI_D3D12_SetFlipConfig call that enabled metering
+    // (nFramesPerBatch > 0), as known when the row was completed; empty when
+    // none (the µs cell is also empty when that call carried no batch time).
+    { "flip_config_qpc", [](CsvLine* line, const PacingCsvRow& row) {
+        QpcIf(line, row.flip_config_valid != 0, row.flip_config_qpc); } },
+    { "flip_time_per_batch_us", [](CsvLine* line, const PacingCsvRow& row) {
+        UnsignedIf(line, row.flip_config_valid != 0 && row.flip_time_per_batch_us != 0,
+            row.flip_time_per_batch_us); } },
+    // Appended (developer key gpu_start_probe): the QPC of the first
+    // ExecuteCommandLists after the previous Present on the presenting queue
+    // (read before the call was forwarded) and the QPC at which the
+    // completion of ReLimiter's Signal enqueued in front of that submission
+    // was observed (the sampler's wake); both empty without a probe sample.
+    { "gpu_first_submit_qpc", [](CsvLine* line, const PacingCsvRow& row) {
+        QpcIf(line, row.joined.has_ready, row.joined.ready.gpu_first_submit_qpc); } },
+    { "gpu_start_qpc", [](CsvLine* line, const PacingCsvRow& row) {
+        QpcIf(line, row.joined.has_ready, row.joined.ready.gpu_start_qpc); } },
 };
 
 static const char* PacingEventTypeText(PacingCsvEventType type)
@@ -1216,6 +1253,15 @@ void CSV_PushPacingRow(uint64_t sequence, const PacingJoinedRow& row, const Paci
     slot.row.capture_epoch = capture.epoch;
     slot.row.joined = row;
     slot.row.derived = derived;
+    // The newest metering SetFlipConfig call at or before this row's present
+    // start (the display's, else the native Present's entry; the newest call
+    // when the row has neither): a row completed in a burst by the worker
+    // still gets the call that was current when its frame was presented.
+    const int64_t present_start_qpc = row.has_display && row.display.present_start_qpc != 0
+        ? static_cast<int64_t>(row.display.present_start_qpc)
+        : (row.has_present ? row.present.p_qpc : 0);
+    slot.row.flip_config_valid =
+        FlipConfig_ReadAt(present_start_qpc, &slot.row.flip_config_qpc, &slot.row.flip_time_per_batch_us) ? 1 : 0;
     s_pacing_row_write_pos.store(write_position + 1, std::memory_order_release);
 }
 

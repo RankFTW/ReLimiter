@@ -585,6 +585,194 @@ namespace
         CHECK(grid.Statistics().gpu_paced_late_outputs == 1);
     }
 
+    // Driver-released frame (cadence_grid.h): the driver's Sleep returned
+    // after S and the game entered it on time (entry <= judged S + tol, source
+    // slack included). I = 10 ms, L = 6 ms, tol = 2.5 ms; frame 2's grid
+    // target is T1 + 10 ms and S = T1 + 4 ms.
+    struct DriverFrame {
+        CadenceGrid grid;
+        int64_t t1 = 0;
+        int64_t grid_t2 = 0; // the grid's T(2)
+        int64_t s2 = 0;      // S(2) = T(2) − L
+        int64_t tolerance = 25000;
+    };
+
+    void PrimeDriverFrame(DriverFrame* frame)
+    {
+        const CadenceGridPlan first = frame->grid.PlanNext(Input(kStartQpc, 10000.0, 6000.0));
+        CHECK(first.valid && first.output_target_qpc == kStartQpc + 60000);
+        frame->t1 = first.output_target_qpc;
+        frame->grid_t2 = frame->t1 + 100000;
+        frame->s2 = frame->grid_t2 - 60000;
+    }
+
+    CadenceGridPlanInput DriverInput(int64_t now, int64_t release, int64_t arrival, int64_t driver_earliest)
+    {
+        CadenceGridPlanInput in = Input(now, 10000.0, 6000.0);
+        in.driver_release_qpc = release;
+        in.game_arrival_qpc = arrival;
+        in.driver_earliest_target_qpc = driver_earliest;
+        return in;
+    }
+
+    // (a) The driver returned after S, the game entered on time, the earliest
+    // target is later than the grid's: no epoch, the target moves to it, the
+    // next index continues from the moved target.
+    void TestDriverReleasedFollowsEarliestTarget()
+    {
+        DriverFrame f;
+        PrimeDriverFrame(&f);
+        const int64_t now = f.s2 + 50000; // beyond S + tol: SourceLate without the rule
+        const int64_t earliest = f.grid_t2 + 30000;
+        const CadenceGridPlan second = f.grid.PlanNext(
+            DriverInput(now, f.s2 + 5000, f.s2 - 10000, earliest));
+        CHECK(second.valid && second.driver_released && second.gpu_target);
+        CHECK(second.epoch_reason == PacingEpochReason::None && second.epoch == 1);
+        CHECK(second.output_target_qpc == earliest);
+        CHECK(second.source_wake_qpc == now && !second.released_immediately);
+        CHECK(TargetOf(f.grid, 1) == f.t1);
+        CHECK(f.grid.Statistics().driver_released_plans == 1);
+        CHECK(f.grid.Statistics().gpu_target_plans == 1);
+        CHECK(f.grid.Statistics().epochs_by_reason[static_cast<size_t>(PacingEpochReason::SourceLate)] == 0);
+
+        // The next index continues from the moved target without the driver
+        // fields: T(3) = earliest + I, no restart, nothing driver-released.
+        const CadenceGridPlan third = f.grid.PlanNext(Input(earliest + 100000 - 60000, 10000.0, 6000.0));
+        CHECK(!third.driver_released && !third.gpu_target && third.epoch_reason == PacingEpochReason::None);
+        CHECK(third.output_target_qpc == earliest + 100000);
+        CHECK(f.grid.Statistics().driver_released_plans == 1);
+
+        // The stage marks the output of a driver-released frame GPU-paced
+        // (ObserveOutput's flag): a late output starts no epoch, as for a
+        // floor-released frame.
+        CHECK(f.grid.ObserveOutput(kGeneration, 2, earliest + 70000, true) == PacingEpochReason::None);
+        CHECK(f.grid.Statistics().gpu_paced_late_outputs == 1);
+    }
+
+    // (b) An earliest target not later than the grid's keeps T(2), and the
+    // frame is not judged late even far past S + tol: no SourceLate epoch.
+    // The caller's own earliest target and the driver's: the later wins.
+    void TestDriverReleasedKeepsGridTarget()
+    {
+        DriverFrame f;
+        PrimeDriverFrame(&f);
+        const int64_t now = f.s2 + 80000;
+        const CadenceGridPlan second = f.grid.PlanNext(
+            DriverInput(now, f.s2 + 1000, f.s2, f.grid_t2 - 10000));
+        CHECK(second.valid && second.driver_released && !second.gpu_target);
+        CHECK(second.epoch_reason == PacingEpochReason::None);
+        CHECK(second.output_target_qpc == f.grid_t2);
+        CHECK(second.source_wake_qpc == now && !second.released_immediately);
+        CHECK(f.grid.Statistics().epochs_by_reason[static_cast<size_t>(PacingEpochReason::SourceLate)] == 0);
+
+        // Both an earliest target of the caller and the driver's: the later.
+        {
+            DriverFrame g;
+            PrimeDriverFrame(&g);
+            CadenceGridPlanInput in = DriverInput(g.s2, g.s2 + 1000, g.s2, g.grid_t2 + 30000);
+            in.earliest_target_qpc = g.grid_t2 + 50000;
+            CHECK(g.grid.PlanNext(in).output_target_qpc == g.grid_t2 + 50000);
+        }
+        {
+            DriverFrame g;
+            PrimeDriverFrame(&g);
+            CadenceGridPlanInput in = DriverInput(g.s2, g.s2 + 1000, g.s2, g.grid_t2 + 50000);
+            in.earliest_target_qpc = g.grid_t2 + 30000;
+            CHECK(g.grid.PlanNext(in).output_target_qpc == g.grid_t2 + 50000);
+        }
+    }
+
+    // (c) The game entered the Sleep later than the judged wake + tolerance:
+    // the frame was late itself, so SourceLate as today and the driver's
+    // earliest target is not used. The boundary is inclusive; the source
+    // slack extends it like it extends step 3's tolerance.
+    void TestDriverReleasedNeedsOnTimeEntry()
+    {
+        {
+            DriverFrame f;
+            PrimeDriverFrame(&f);
+            const int64_t now = f.s2 + 50000;
+            const CadenceGridPlan second = f.grid.PlanNext(
+                DriverInput(now, f.s2 + 5000, f.s2 + f.tolerance + 1, f.grid_t2 + 30000));
+            CHECK(second.valid && !second.driver_released && !second.gpu_target);
+            CHECK(second.epoch_reason == PacingEpochReason::SourceLate);
+            CHECK(second.output_target_qpc == now + 60000);
+            CHECK(f.grid.Statistics().driver_released_plans == 0);
+        }
+        {
+            DriverFrame f;
+            PrimeDriverFrame(&f);
+            const CadenceGridPlan second = f.grid.PlanNext(
+                DriverInput(f.s2 + 50000, f.s2 + 5000, f.s2 + f.tolerance, f.grid_t2 + 30000));
+            CHECK(second.driver_released && second.epoch_reason == PacingEpochReason::None);
+        }
+        {
+            // An unknown entry (0) never releases.
+            DriverFrame f;
+            PrimeDriverFrame(&f);
+            const CadenceGridPlan second = f.grid.PlanNext(
+                DriverInput(f.s2 + 50000, f.s2 + 5000, 0, f.grid_t2 + 30000));
+            CHECK(!second.driver_released && second.epoch_reason == PacingEpochReason::SourceLate);
+        }
+        {
+            // Source slack of 2 ms makes an entry 4 ms after S on time.
+            DriverFrame f;
+            PrimeDriverFrame(&f);
+            CadenceGridPlanInput in = DriverInput(f.s2 + 50000, f.s2 + 5000, f.s2 + 40000, f.grid_t2 + 30000);
+            in.source_slack_us = 2000.0;
+            const CadenceGridPlan second = f.grid.PlanNext(in);
+            CHECK(second.driver_released && second.epoch_reason == PacingEpochReason::None);
+        }
+    }
+
+    // (d) The driver's return not after S: the Sleep did not hold the frame,
+    // so today's behavior and nothing reported. No stamp at all is the same.
+    void TestDriverReleaseNotAfterWakeIsToday()
+    {
+        for (const int64_t release_offset : {int64_t{0}, int64_t{-3000}}) {
+            DriverFrame f;
+            PrimeDriverFrame(&f);
+            const int64_t now = f.s2 + 50000;
+            const CadenceGridPlan second = f.grid.PlanNext(
+                DriverInput(now, f.s2 + release_offset, f.s2 - 10000, f.grid_t2 + 30000));
+            CHECK(second.valid && !second.driver_released && !second.gpu_target);
+            CHECK(second.epoch_reason == PacingEpochReason::SourceLate);
+            CHECK(second.output_target_qpc == now + 60000);
+            CHECK(f.grid.Statistics().driver_released_plans == 0);
+        }
+        // Without a driver stamp the arrival and earliest target are ignored.
+        DriverFrame g;
+        PrimeDriverFrame(&g);
+        const CadenceGridPlan second = g.grid.PlanNext(
+            DriverInput(g.s2 + 50000, 0, g.s2 - 10000, g.grid_t2 + 30000));
+        CHECK(!second.driver_released && second.epoch_reason == PacingEpochReason::SourceLate);
+    }
+
+    // (e) Driver-released without an earliest target (E unknown) and the
+    // frame late: the grid judges it, SourceLate as today; the plan still
+    // reports the release.
+    void TestDriverReleasedWithoutEarliestTarget()
+    {
+        DriverFrame f;
+        PrimeDriverFrame(&f);
+        const int64_t now = f.s2 + 50000;
+        const CadenceGridPlan second = f.grid.PlanNext(
+            DriverInput(now, f.s2 + 5000, f.s2 - 10000, 0));
+        CHECK(second.valid && second.driver_released && !second.gpu_target);
+        CHECK(second.epoch_reason == PacingEpochReason::SourceLate);
+        CHECK(second.output_target_qpc == now + 60000);
+        CHECK(f.grid.Statistics().driver_released_plans == 1);
+        CHECK(f.grid.Statistics().epochs_by_reason[static_cast<size_t>(PacingEpochReason::SourceLate)] == 1);
+
+        // Within the tolerance the frame is released immediately as before.
+        DriverFrame g;
+        PrimeDriverFrame(&g);
+        const CadenceGridPlan inside = g.grid.PlanNext(
+            DriverInput(g.s2 + 10000, g.s2 + 5000, g.s2 - 10000, 0));
+        CHECK(inside.driver_released && inside.released_immediately);
+        CHECK(inside.epoch_reason == PacingEpochReason::None && inside.output_target_qpc == g.grid_t2);
+    }
+
     void TestOutputLateThreshold()
     {
         CadenceGrid grid;
@@ -1991,6 +2179,11 @@ int main()
     TestLeadIncreaseJudgedWithPreviousLead();
     TestGpuPacedTarget();
     TestGpuPacedOutputNotJudged();
+    TestDriverReleasedFollowsEarliestTarget();
+    TestDriverReleasedKeepsGridTarget();
+    TestDriverReleasedNeedsOnTimeEntry();
+    TestDriverReleaseNotAfterWakeIsToday();
+    TestDriverReleasedWithoutEarliestTarget();
     TestOutputLateThreshold();
     TestOldEvidenceIgnored();
     TestOlderOutputEvidence();

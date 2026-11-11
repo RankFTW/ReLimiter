@@ -1647,6 +1647,350 @@ void TestGpuPacedCadence()
     }
 }
 
+// Developer A/B gpu_paced_cadence, the driver's Reflex Sleep kept (the Sleep
+// is not bypassed): a frame the driver's Sleep released late is the driver's,
+// not ReLimiter's. The Sleep for its index returned after S = T − L and the
+// game entered it on time, so the frame is GPU-paced exactly as one the GPU
+// floor releases: no wait of ReLimiter's own, no SourceLate epoch, its
+// output not judged, its output target the later of the grid's T and arrival
+// + min(E, L), the lead controller told gpu_floor_release (with no floor
+// pull), the record flagged GPU-paced and carrying both stamps. Unknown E
+// (a cold bucket) still marks the frame GPU-paced, but the grid judges its
+// source. The key off, another index, no Sleep entry, a Sleep that returned
+// before S and an entry after S + tol are not driver-released; the stamps are
+// recorded whenever the index matched, key on or off.
+struct DriverSetup {
+    bool key_on = true;
+    bool warm = true;
+    bool entered = true;    // the Sleep hook's entry was recorded for this index
+    int index = 1;          // driver Sleep index: 0 none, 1 this index, 2 another
+    double entry_us = -4'000.0; // hook entry relative to S
+    double start_us = -3'000.0; // driver Sleep call start relative to S
+    double end_us = 2'000.0;    // driver Sleep return relative to S
+    double now_us = 6'000.0;    // arrival at the stage (clock) relative to S: beyond S + tol
+};
+
+struct DriverRun {
+    SourceStageFrame frame{};
+    PacingSourceRecord record{};
+    int waits = 0;
+    int64_t s = 0;
+    int64_t now = 0;
+    uint64_t gpu_paced_frames = 0;
+    uint64_t driver_released_frames = 0;
+    uint64_t floor_pulled_frames = 0;
+    bool lead_saw_floor_release = false;
+};
+
+DriverRun RunDriverFrame(const DriverSetup& setup, bool with_driver_fields)
+{
+    ResetStage();
+    ScriptedClock clock;
+    const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
+    uint64_t frame_id = 3000;
+    SourceStageFrame last{};
+    // Ready 3,000 µs after each release: L = Q95 3,010 + 500, E = 2,500.
+    for (int i = 0; i < (setup.warm ? 40 : 1); ++i) {
+        last = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
+        CHECK(last.planned && !last.gpu_paced);
+        const int64_t done = last.release_qpc + Ticks(3'000.0);
+        CHECK(FramePlan_PushStageEvent(Event(last, PacingStageEventKind::PresentCall,
+            last.release_qpc + Ticks(1'000.0))));
+        CHECK(FramePlan_PushStageEvent(Event(last, PacingStageEventKind::GpuReady, done)));
+        CHECK(FramePlan_PushStageEvent(Event(last, PacingStageEventKind::OutputRelease, done,
+            PacingPlanStatus::Late)));
+        g_stage.DrainStageEvents();
+        clock.now = done;
+    }
+    DriverRun run;
+    run.s = last.plan.output_target_qpc + Ticks(kIntervalUs) - Ticks(last.plan.lead_us);
+    SourceStageRequest request = Request(Key(frame_id), held);
+    request.gpu_paced_cadence = setup.key_on;
+    // The rhythm the scheduler would hand a held frame: a frame without a GPU
+    // floor never continues it.
+    request.gpu_paced_rhythm = GpuPacedRhythmStep::Smooth;
+    const uint64_t next = g_stage.Grid().NextIndex();
+    if (setup.entered) {
+        request.sleep_entry_index = next;
+        request.sleep_entry_qpc = run.s + Ticks(setup.entry_us);
+    }
+    if (with_driver_fields && setup.index != 0) {
+        request.driver_sleep_index = next + (setup.index == 1 ? 0 : 1);
+        request.driver_sleep_start_qpc = run.s + Ticks(setup.start_us);
+        request.driver_sleep_end_qpc = run.s + Ticks(setup.end_us);
+    }
+    clock.now = run.now = run.s + Ticks(setup.now_us);
+    const int waits_before = clock.wait_calls;
+    // The statistics are cumulative across Reset: count this frame only.
+    const SourceStageStatistics stats_before = g_stage.Statistics();
+    run.frame = g_stage.RunPlannedFrame(request, &clock);
+    run.waits = clock.wait_calls - waits_before;
+    SourceStage::FillSourceRecord(run.frame, held, &run.record);
+    const SourceStageStatistics stats_after = g_stage.Statistics();
+    run.gpu_paced_frames = stats_after.gpu_paced_frames - stats_before.gpu_paced_frames;
+    run.driver_released_frames = stats_after.driver_released_frames - stats_before.driver_released_frames;
+    run.floor_pulled_frames = stats_after.floor_pulled_frames - stats_before.floor_pulled_frames;
+    run.lead_saw_floor_release = g_stage.Lead().GpuFloorReleased(run.frame.plan.key, run.frame.plan.grid_index);
+    return run;
+}
+
+void TestDriverReleasedFrameIsGpuPaced()
+{
+    std::printf("Test: a frame the driver's Sleep released is GPU-paced and ReLimiter adds no delay\n");
+    const DriverSetup setup;
+    const DriverRun run = RunDriverFrame(setup, true);
+    const SourceStageFrame& frame = run.frame;
+    CHECK(frame.planned && frame.driver_released && frame.gpu_paced);
+    CHECK(frame.epoch_started == PacingEpochReason::None && frame.gpu_target);
+    // Nothing of ReLimiter's own: no wait, released on arrival, no floor pull.
+    CHECK(run.waits == 0 && frame.release_qpc == run.now && frame.wait_start_qpc == 0);
+    CHECK(frame.floor_pull_ticks == 0 && run.floor_pulled_frames == 0);
+    // Target: arrival + min(E, L), E = 2,500 µs.
+    CHECK(Near(frame.early_lead_us, 2'500.0, 0.01));
+    const int64_t target = run.now + Ticks(2'500.0);
+    CHECK(frame.plan.output_target_qpc > target - 10 && frame.plan.output_target_qpc < target + 10);
+    CHECK(frame.plan.source_wake_qpc == run.now);
+    // The game's arrival is the Sleep hook's entry.
+    CHECK(frame.game_arrival_qpc == run.s + Ticks(setup.entry_us));
+    // The lead controller sees a floor release (its readiness enters the GPU-paced ring).
+    CHECK(run.lead_saw_floor_release);
+    CHECK(run.gpu_paced_frames == 1 && run.driver_released_frames == 1);
+    // The record: GPU-paced flag and both stamps.
+    CHECK((run.record.flags & PACING_SOURCE_GPU_PACED) != 0);
+    CHECK(run.record.driver_sleep_start_qpc == run.s + Ticks(setup.start_us));
+    CHECK(run.record.driver_sleep_end_qpc == run.s + Ticks(setup.end_us));
+    // Its output is not judged: 8 ms past T restarts nothing.
+    const uint64_t late_before = g_stage.Statistics().output_late_epochs;
+    CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease,
+        frame.plan.output_target_qpc + Ticks(8'000.0), PacingPlanStatus::Held)));
+    g_stage.DrainStageEvents();
+    CHECK(g_stage.Statistics().output_late_epochs == late_before);
+    CHECK(!g_stage.DrainStartedOutputLate() && g_stage.DrainedOutputLateCount() == 0);
+
+    // The rhythm is not continued by it.
+    CHECK(g_stage.Statistics().gpu_paced_rhythm[static_cast<size_t>(GpuPacedRhythmStep::Smooth)] == 0);
+}
+
+// Developer key driver_limiter_hold: a frame of the Reflex driver limiter
+// placement is planned with the marker placement's lead and waits for nothing,
+// early or late; the driver's release (the Sleep fields, under
+// gpu_paced_cadence) sets its deadline as for any driver-released frame. The
+// record keeps the placement and has no wait stamps.
+void TestDriverLimiterHoldPlansWithoutAWait()
+{
+    std::printf("Test: driver_limiter_hold plans a driver-limited frame with the marker lead and no wait\n");
+    const PacingPipelineSnapshot hold = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait,
+        PacingSourcePlacement::DriverLimiter);
+    const auto warm = [&](ScriptedClock* clock, uint64_t* frame_id, bool key) {
+        SourceStageFrame last{};
+        for (int i = 0; i < 40; ++i) {
+            SourceStageRequest request = Request(Key((*frame_id)++), hold);
+            request.driver_limiter_hold = key;
+            last = g_stage.RunPlannedFrame(request, clock);
+            CHECK(last.planned);
+            const int64_t done = last.release_qpc + Ticks(3'000.0);
+            CHECK(FramePlan_PushStageEvent(Event(last, PacingStageEventKind::PresentCall,
+                last.release_qpc + Ticks(1'000.0))));
+            CHECK(FramePlan_PushStageEvent(Event(last, PacingStageEventKind::GpuReady, done)));
+            CHECK(FramePlan_PushStageEvent(Event(last, PacingStageEventKind::OutputRelease, done,
+                PacingPlanStatus::Late)));
+            g_stage.DrainStageEvents();
+            clock->now = done;
+        }
+        return last;
+    };
+
+    // Key on: every frame arrives well before its S and is released on arrival.
+    ResetStage();
+    ScriptedClock clock;
+    uint64_t frame_id = 9000;
+    const uint64_t clamped_before = g_stage.Statistics().clamped_waits;
+    const SourceStageFrame last = warm(&clock, &frame_id, true);
+    CHECK(clock.wait_calls == 0 && !last.slept && last.wait_start_qpc == 0 && last.wait_target_qpc == 0);
+    CHECK(last.plan.rung == PacingRung::GpuQueueWait && Near(last.plan.lead_us, 3'510.0));
+    CHECK(g_stage.Statistics().clamped_waits == clamped_before);
+
+    // A frame the driver's Sleep released late: the cadence's driver-released rule.
+    const int64_t s = last.plan.output_target_qpc + Ticks(kIntervalUs) - Ticks(last.plan.lead_us);
+    SourceStageRequest request = Request(Key(frame_id), hold);
+    request.driver_limiter_hold = true;
+    request.gpu_paced_cadence = true;
+    request.sleep_entry_index = g_stage.Grid().NextIndex();
+    request.sleep_entry_qpc = s - Ticks(4'000.0);
+    request.driver_sleep_index = request.sleep_entry_index;
+    request.driver_sleep_start_qpc = s - Ticks(3'000.0);
+    request.driver_sleep_end_qpc = s + Ticks(2'000.0);
+    clock.now = s + Ticks(6'000.0);
+    const int64_t arrival = clock.now;
+    const SourceStageFrame frame = g_stage.RunPlannedFrame(request, &clock);
+    CHECK(frame.planned && frame.driver_released && frame.gpu_paced);
+    CHECK(clock.wait_calls == 0 && frame.release_qpc == arrival && frame.wait_start_qpc == 0);
+    CHECK(frame.early_lead_us > 0.0 &&
+          frame.plan.output_target_qpc == arrival + Ticks(frame.early_lead_us));
+    PacingSourceRecord record{};
+    SourceStage::FillSourceRecord(frame, hold, &record);
+    CHECK(record.source_placement == static_cast<uint8_t>(PacingSourcePlacement::DriverLimiter));
+    CHECK(record.wake_target_qpc == 0 && record.source_wait_start_qpc == 0 && record.pre_sleep_start_qpc == 0);
+    CHECK(record.driver_sleep_start_qpc == request.driver_sleep_start_qpc &&
+          record.driver_sleep_end_qpc == request.driver_sleep_end_qpc);
+    CHECK((record.flags & PACING_SOURCE_GPU_PACED) != 0 && (record.flags & PACING_SOURCE_SLEPT) == 0);
+
+    // Key off: the placement is the driver limiter's, with no lead, and an early frame waits.
+    ResetStage();
+    ScriptedClock plain_clock;
+    SourceStageRequest first = Request(Key(9500), hold);
+    const SourceStageFrame first_frame = g_stage.RunPlannedFrame(first, &plain_clock);
+    CHECK(first_frame.planned && first_frame.plan.lead_us == 0.0);
+    plain_clock.now += Ticks(3'000.0);
+    SourceStageRequest second = Request(Key(9501), hold);
+    const SourceStageFrame second_frame = g_stage.RunPlannedFrame(second, &plain_clock);
+    CHECK(second_frame.planned && second_frame.slept && plain_clock.wait_calls == 1);
+}
+
+// Developer key pre_sleep_precise: the marker plan shares the precise pre-wait's
+// committed release target. The lead the plan recomputed at the marker can put S
+// after that target; a pre-wait that reached the target (end >= target) leaves
+// no wait at the marker, one that did not, another index, or no committed
+// target waits as always.
+void TestPreciseReleaseTargetIsCommitted()
+{
+    std::printf("Test: a precise pre-wait that reached its committed target leaves no marker-site wait\n");
+    struct Case {
+        const char* name; bool committed; double end_us; int index_offset; bool waits;
+        int epoch_offset = 0; double interval_scale = 1.0; PacingTimingMode mode = PacingTimingMode::Vrr;
+    };
+    const Case cases[] = {
+        { "no committed target", false, -50.0, 0, true },
+        { "reached", true, -50.0, 0, false },
+        { "not reached", true, -300.0, 0, true },
+        { "another index", true, -50.0, 1, true },
+        { "cadence restarted since the commitment", true, -50.0, 0, true, -1 },
+        { "interval changed since the commitment", true, -50.0, 0, true, 0, 1.5 },
+        { "prediction interval differs from the plan's (low frame rate compensation)", true, -50.0, 0, true, 0,
+          33'333.0 / 34'722.0 },
+        { "interval moved below 1% since the commitment", true, -50.0, 0, true, 0, 1.005 },
+        { "interval equal up to numerical noise", true, -50.0, 0, false, 0, 1.0 + 1e-9 },
+        { "timing mode changed since the commitment", true, -50.0, 0, true, 0, 1.0, PacingTimingMode::Fixed },
+    };
+    for (const Case& c : cases) {
+        ResetStage();
+        ScriptedClock clock;
+        const PacingPipelineSnapshot pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
+        const SourceStageFrame first = g_stage.RunPlannedFrame(Request(Key(9700), pipeline), &clock);
+        clock.now = first.release_qpc + Ticks(3'000.0);
+        const int64_t arrival = clock.now;
+        SourceStageRequest request = Request(Key(9701), pipeline);
+        request.pre_wait_index = g_stage.Grid().NextIndex() + c.index_offset;
+        request.pre_wait_start_qpc = arrival - Ticks(900.0);
+        // The committed target lies before the marker's S, as when the lead fell.
+        const int64_t committed = arrival - Ticks(100.0);
+        request.pre_wait_end_qpc = committed + Ticks(c.end_us + 100.0);
+        request.precise_release_qpc = c.committed ? committed : 0;
+        request.precise_grid_epoch = static_cast<uint32_t>(
+            static_cast<int64_t>(g_stage.Grid().Snapshot().epoch) + c.epoch_offset);
+        request.precise_interval_us = request.interval_us * c.interval_scale;
+        request.precise_mode = c.mode;
+        const int waits = clock.wait_calls;
+        const SourceStageFrame frame = g_stage.RunPlannedFrame(request, &clock);
+        CHECK(frame.planned);
+        CHECK(clock.wait_calls == waits + (c.waits ? 1 : 0));
+        CHECK(frame.slept == c.waits);
+        if (!c.waits) CHECK(frame.release_qpc == arrival && frame.wait_start_qpc == 0);
+    }
+}
+
+void TestDriverReleasedWithoutKnownEarliestTarget()
+{
+    std::printf("Test: a driver-released frame with E unknown is GPU-paced but judged by the grid\n");
+    DriverSetup setup;
+    setup.warm = false;
+    const DriverRun run = RunDriverFrame(setup, true);
+    CHECK(run.frame.planned && run.frame.driver_released && run.frame.gpu_paced);
+    CHECK(run.frame.early_lead_us == 0.0 && !run.frame.gpu_target);
+    // Judged as today: 6 ms past S is a SourceLate restart at the arrival.
+    CHECK(run.frame.epoch_started == PacingEpochReason::SourceLate);
+    CHECK(run.lead_saw_floor_release);
+    CHECK((run.record.flags & PACING_SOURCE_GPU_PACED) != 0);
+}
+
+void TestDriverSleepKeyOffChangesNothingButTheStamps()
+{
+    std::printf("Test: with the key off the driver Sleep fields only fill the stamps\n");
+    DriverSetup setup;
+    setup.key_on = false;
+    const DriverRun with = RunDriverFrame(setup, true);
+    const DriverRun without = RunDriverFrame(setup, false);
+    CHECK(with.frame.planned && without.frame.planned);
+    CHECK(!with.frame.driver_released && !with.frame.gpu_paced && !with.frame.gpu_target);
+    CHECK(with.frame.epoch_started == PacingEpochReason::SourceLate);
+    CHECK(with.frame.epoch_started == without.frame.epoch_started);
+    CHECK(with.frame.plan.output_target_qpc == without.frame.plan.output_target_qpc);
+    CHECK(with.frame.plan.source_wake_qpc == without.frame.plan.source_wake_qpc);
+    CHECK(with.frame.release_qpc == without.frame.release_qpc && with.waits == without.waits);
+    CHECK(with.frame.gpu_paced == without.frame.gpu_paced && with.frame.gpu_target == without.frame.gpu_target);
+    CHECK(with.frame.early_lead_us == without.frame.early_lead_us && with.frame.floor_pull_ticks == 0);
+    CHECK(with.frame.game_arrival_qpc == without.frame.game_arrival_qpc);
+    CHECK(with.lead_saw_floor_release == without.lead_saw_floor_release && !with.lead_saw_floor_release);
+    CHECK(with.gpu_paced_frames == without.gpu_paced_frames && with.driver_released_frames == 0);
+    CHECK(with.record.flags == without.record.flags);
+    CHECK(with.record.wake_target_qpc == without.record.wake_target_qpc);
+    // The stamps are recorded all the same.
+    CHECK(with.record.driver_sleep_start_qpc == with.s + Ticks(setup.start_us));
+    CHECK(with.record.driver_sleep_end_qpc == with.s + Ticks(setup.end_us));
+    CHECK(without.record.driver_sleep_start_qpc == 0 && without.record.driver_sleep_end_qpc == 0);
+}
+
+void TestDriverReleaseNeedsAMatchingSleep()
+{
+    std::printf("Test: no driver release without a matching index, entry, return after S or an on-time entry\n");
+    struct Case { const char* name; DriverSetup setup; bool stamps; };
+    std::vector<Case> cases;
+    {
+        DriverSetup c; c.index = 2;
+        cases.push_back({ "another index", c, false });
+    }
+    {
+        DriverSetup c; c.index = 0;
+        cases.push_back({ "no driver Sleep", c, false });
+    }
+    {
+        DriverSetup c; c.entered = false;
+        cases.push_back({ "no Sleep entry for this index", c, true });
+    }
+    {
+        DriverSetup c; c.start_us = 2'000.0; c.end_us = 2'000.0; // end not after start
+        cases.push_back({ "empty Sleep interval", c, false });
+    }
+    {
+        DriverSetup c; c.end_us = 0.0; // returned at S, not after
+        cases.push_back({ "returned at S", c, true });
+    }
+    {
+        DriverSetup c; c.end_us = -500.0; c.start_us = -3'000.0;
+        cases.push_back({ "returned before S", c, true });
+    }
+    {
+        DriverSetup c; c.entry_us = 3'100.0; // beyond S + tolerance (2,500 + about 500 µs of slack)
+        cases.push_back({ "entered late", c, true });
+    }
+    for (const Case& c : cases) {
+        const DriverRun run = RunDriverFrame(c.setup, true);
+        std::printf("  %s\n", c.name);
+        CHECK(run.frame.planned && !run.frame.driver_released && !run.frame.gpu_paced);
+        CHECK(run.frame.epoch_started == PacingEpochReason::SourceLate && !run.frame.gpu_target);
+        CHECK(!run.lead_saw_floor_release && run.driver_released_frames == 0 && run.gpu_paced_frames == 0);
+        CHECK((run.record.flags & PACING_SOURCE_GPU_PACED) == 0);
+        CHECK((run.record.driver_sleep_start_qpc != 0) == c.stamps);
+        CHECK((run.record.driver_sleep_end_qpc != 0) == c.stamps);
+    }
+    // An entry inside the tolerance is on time (the boundary itself is the
+    // grid's: test_cadence_grid.cpp).
+    DriverSetup edge;
+    edge.entry_us = 2'400.0;
+    const DriverRun on_time = RunDriverFrame(edge, true);
+    CHECK(on_time.frame.driver_released && on_time.frame.gpu_paced);
+}
+
 // Developer A/B gpu_paced_cadence: once 32 frames were released by the GPU
 // floor, the early lead is the low side of their own X (ready 5,000 µs after
 // the floor here: 5,000 − 500 µs), not of every GPU wait frame's readiness
@@ -1991,6 +2335,12 @@ int main()
     TestVBlankPhaseTrackerFeedsFixedGrid();
     TestEarliestReleaseLimitsWait();
     TestGpuPacedCadence();
+    TestDriverReleasedFrameIsGpuPaced();
+    TestDriverReleasedWithoutKnownEarliestTarget();
+    TestDriverSleepKeyOffChangesNothingButTheStamps();
+    TestDriverReleaseNeedsAMatchingSleep();
+    TestPreciseReleaseTargetIsCommitted();
+    TestDriverLimiterHoldPlansWithoutAWait();
     TestGpuPacedRing();
     TestGpuPacedRhythm();
     TestReleaseFloorAtCapRelease();

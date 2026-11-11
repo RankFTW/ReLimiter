@@ -27,7 +27,9 @@ PHASE3_ROW_COLUMNS = 132   # Phase 3 before Q16
 Q16_ROW_COLUMNS = 133      # + gate_pre_wait_qpc
 PHASE4_ROW_COLUMNS = 136   # + source_placement, pre_sleep_end_qpc, pre_sleep_margin_us
 WAIT_START_ROW_COLUMNS = 138  # + source_wait_start_qpc, pre_sleep_start_qpc (2026-10-08)
-WAIT_ROW_COLUMNS = 140        # + async_marker_wait_us, async_marker_wait_type (current)
+WAIT_ROW_COLUMNS = 140        # + async_marker_wait_us, async_marker_wait_type (2026-10-12)
+DRIVER_SLEEP_ROW_COLUMNS = 142  # + driver_sleep_start_qpc, driver_sleep_end_qpc (2026-11-10)
+PROBE_ROW_COLUMNS = 148         # + driver sleep status, flip config and GPU start probe columns (current)
 PHASE3_EVENT_COLUMNS = 86  # unchanged since Phase 2: new event kinds only
 LEGACY_SCHEDULER_HEADER = ["frame_id", "timestamp_us", "actual_frame_time_us"]
 FRAMEVIEW_HEADER = [
@@ -78,10 +80,10 @@ class ProfileTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 self.assertEqual(inspector.detect_kind(header), kind)
                 self.assertEqual(inspector.schema_profile(kind, header), f"current-source-{len(header)}")
-        self.assertEqual(len(inspector.CURRENT_PACING_HEADER), WAIT_ROW_COLUMNS)
+        self.assertEqual(len(inspector.CURRENT_PACING_HEADER), PROBE_ROW_COLUMNS)
         self.assertEqual(len(inspector.CURRENT_PACING_EVENTS_HEADER), PHASE3_EVENT_COLUMNS)
         self.assertEqual(inspector.schema_profile("relimiter_pacing", inspector.CURRENT_PACING_HEADER),
-                         "current-source-140")
+                         "current-source-148")
         self.assertEqual(inspector.schema_profile("relimiter_pacing_events",
                                                   inspector.CURRENT_PACING_EVENTS_HEADER), "current-source-86")
 
@@ -99,6 +101,13 @@ class ProfileTests(unittest.TestCase):
             ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:Q16_ROW_COLUMNS], "historical-source-133"),
             ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:PHASE4_ROW_COLUMNS], "historical-source-136"),
             ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:WAIT_START_ROW_COLUMNS], "historical-source-138"),
+            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:WAIT_ROW_COLUMNS], "historical-source-140"),
+            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:DRIVER_SLEEP_ROW_COLUMNS],
+             "historical-source-142"),
+            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:DRIVER_SLEEP_ROW_COLUMNS + 1],
+             "historical-or-unknown"),
+            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:WAIT_ROW_COLUMNS + 1],
+             "historical-or-unknown"),
             ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:WAIT_START_ROW_COLUMNS + 1],
              "historical-or-unknown"),
             ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:Q16_ROW_COLUMNS + 1], "historical-or-unknown"),
@@ -135,8 +144,16 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(inspector.CURRENT_PACING_HEADER[PHASE4_ROW_COLUMNS:WAIT_START_ROW_COLUMNS],
                          ["source_wait_start_qpc", "pre_sleep_start_qpc"])
         # The async marker waits are appended after them.
-        self.assertEqual(inspector.CURRENT_PACING_HEADER[WAIT_START_ROW_COLUMNS:],
+        self.assertEqual(inspector.CURRENT_PACING_HEADER[WAIT_START_ROW_COLUMNS:WAIT_ROW_COLUMNS],
                          ["async_marker_wait_us", "async_marker_wait_type"])
+        # The driver's Reflex Sleep stamps (2026-11-10), then the sleep status, the flip config and
+        # the GPU start probe columns, which are the last ones.
+        self.assertEqual(inspector.CURRENT_PACING_HEADER[WAIT_ROW_COLUMNS:DRIVER_SLEEP_ROW_COLUMNS],
+                         ["driver_sleep_start_qpc", "driver_sleep_end_qpc"])
+        self.assertEqual(inspector.CURRENT_PACING_HEADER[DRIVER_SLEEP_ROW_COLUMNS:],
+                         ["driver_sleep_interval_us", "driver_use_game_sleep",
+                          "flip_config_qpc", "flip_time_per_batch_us",
+                          "gpu_first_submit_qpc", "gpu_start_qpc"])
         self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER[PHASE1_EVENT_COLUMNS - 1],
                          "overflowed_present_count")
         self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER[PHASE1_EVENT_COLUMNS:], ["reason"])

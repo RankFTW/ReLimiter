@@ -9,6 +9,7 @@
 #include "gpu_readiness_d3d12_queue.h"
 #include "pacing_telemetry.h"
 #include "frame_plan.h"
+#include "instrumentation_state.h"
 #include <array>
 #include <atomic>
 
@@ -23,6 +24,15 @@ struct QueueSlot : GpuReadinessQueue {
     std::atomic<bool> retired{false};
     std::atomic<uint64_t> identity{0}; // visible even while AddRef is in flight
     std::atomic<uint32_t> scope_pins{0};
+    // gpu_start_probe (see ArmStartProbe): fence creation failed (not retried),
+    // the thread of the Present whose end armed the probe, and the record the
+    // first submission after it left for the next Present's sample.
+    std::atomic<bool> probe_failed{false};
+    std::atomic<uint32_t> probe_arm_thread{0};
+    std::atomic<uint32_t> probe_state{0}; // 0 idle, 1 a probe record is pending
+    uint32_t probe_thread = 0;            // pending record: submitting thread,
+    int64_t probe_submit_qpc = 0;         // the QPC of the first submission
+    uint64_t probe_value = 0;             // and its probe fence value
     uint64_t generation=0;
     uint64_t device_identity=0; // validated native device interface for this lifetime
     bool resources_released=false; // sampler-owned while Reclaiming
@@ -41,6 +51,8 @@ struct SampleSlot {
     GpuTimestampSlot* timestamp_slot = nullptr;
     ReadyPresentObservation present_observation{};
     PacingFrameKey source_key{}; // pacing telemetry; valid only when the native gate attributed the frame
+    uint64_t probe_value = 0;    // gpu_start_probe: probe fence value taken from the queue; 0 = none
+    int64_t probe_first_submit_qpc = 0;
 };
 struct PresentScope {
     uint64_t native = 0;
@@ -59,6 +71,8 @@ std::array<SampleSlot, kSampleCapacity> s_samples;
 SRWLOCK s_registration=SRWLOCK_INIT;
 std::atomic<uint64_t> s_queue_generation{1};
 std::atomic<bool> s_stopping{true};
+std::atomic<QueueSlot*> s_probe_armed{nullptr}; // gpu_start_probe: the queue whose next submission is probed
+std::atomic<bool> s_probe_dead{false};           // gpu_start_probe: a failure ended the probe for the session
 std::atomic<uint64_t> s_sample_sequence{1}, s_dropped{0}, s_signals{0}, s_completions{0};
 HANDLE s_thread = nullptr;
 HANDLE s_stop_event = nullptr;
@@ -69,6 +83,7 @@ thread_local PresentScope s_scope;
 int64_t Qpc() noexcept { LARGE_INTEGER qpc{}; QueryPerformanceCounter(&qpc); return qpc.QuadPart; }
 void WakeWorker() noexcept { if (s_work_event) SetEvent(s_work_event); }
 
+bool ProbeActive() noexcept;
 bool Eligible() noexcept {
     // Explicit CSV observer in native Shadow may measure the exposed queue
     // prefix under static DLSS FG. It cannot create runtime gate authority:
@@ -78,7 +93,11 @@ bool Eligible() noexcept {
         NativeGate_GetContext(Qpc()).observe_frame_generation;
     return !s_stopping.load(std::memory_order_acquire) && !RuntimeLifecycle_IsStopping() &&
         (GpuReadiness_IsEnabled() || GpuPresent_RequiresReadiness()) && SwapMgr_GetActiveAPI() == ActiveAPI::DX12 &&
-        (fg_observation || (NativeGate_HasNoFrameGeneration(FrameTimeline_CurrentControllerGeneration()) &&
+        // gpu_start_probe: the key asks for the frame's queue observation under
+        // frame generation too (unkeyed samples; the FG readiness record keeps
+        // the readiness timestamp and the joiner adds the probe pair).
+        (fg_observation || ProbeActive() ||
+        (NativeGate_HasNoFrameGeneration(FrameTimeline_CurrentControllerGeneration()) &&
         !g_fg_active.load(std::memory_order_relaxed) && !g_fg_presenting.load(std::memory_order_relaxed) &&
         g_fg_mode.load(std::memory_order_relaxed) == 0));
 }
@@ -113,6 +132,15 @@ QueueSlot* FindOrRequest(ID3D12CommandQueue* queue, uint64_t expected_device=0) 
     WakeWorker();
     return nullptr; // worker creates fence; never wait for it here
 }
+// gpu_start_probe: the QPC at which the sampler observed the completion of the
+// sample's probe Signal; 0 when none was stamped (not yet, not attributable).
+int64_t ProbeWake(const SampleSlot& slot) noexcept {
+    if (!slot.probe_value || !slot.queue) return 0;
+    const GpuStartProbeEntry& entry = slot.queue->probe_ring[slot.probe_value % kGpuStartProbeRing];
+    if (entry.value.load() != slot.probe_value) return 0;
+    const int64_t wake = entry.wake_qpc.load();
+    return wake > 0 ? wake : 0;
+}
 // Pacing telemetry: one record per published
 // sample. ready_qpc is the mapped GPU completion query, 0 when not valid.
 void PushPacingReady(const SampleSlot& slot) noexcept {
@@ -127,6 +155,8 @@ void PushPacingReady(const SampleSlot& slot) noexcept {
     record.ready_qpc = valid ? sample.timestamp.mapped_qpc : 0;
     record.valid = static_cast<uint8_t>(valid);
     record.before_gate = static_cast<uint8_t>(sample.before_gate ? 1 : 0);
+    record.gpu_first_submit_qpc = slot.probe_first_submit_qpc;
+    record.gpu_start_qpc = ProbeWake(slot);
     PacingTelemetry_PushReady(record);
 }
 // GpuReady r of an H3 Present: the valid pre-gate readiness query
@@ -186,9 +216,64 @@ void FinishScope(bool valid) noexcept {
     s_scope = {};
     s_scope.depth = depth;
 }
+// ── Developer key gpu_start_probe: when the GPU starts a frame ──
+// A Signal of the probe fence goes in front of the first ExecuteCommandLists
+// the presenting queue gets after a Present. The end of a Present arms the
+// queue (ArmStartProbe; the arm pins the queue like a Present scope does);
+// the first submission on that queue consumes the arm
+// (GpuReadiness_OnExecuteCommandList, on the game's thread, before the call is
+// forwarded), and the next Present's readiness sample takes the record
+// (GpuReadinessCall). The sampler stamps the Signal's completion from the
+// probe fence's event (Worker). Nothing here blocks or allocates on the
+// game's thread; a failed Signal ends the probe for the session.
+bool ProbeActive() noexcept {
+    return g_gpu_start_probe.load(std::memory_order_relaxed) && !s_probe_dead.load(std::memory_order_relaxed) &&
+        !s_stopping.load(std::memory_order_acquire);
+}
+void ProbeDisable(const char* what, HRESULT result) noexcept {
+    if (!s_probe_dead.exchange(true))
+        LOG_INFO("GPU start probe: %s (hr=0x%08X); the probe is off for this session", what,
+            static_cast<unsigned>(result));
+}
+void DropProbeArm(QueueSlot* queue) noexcept {
+    QueueSlot* expected = queue;
+    if (s_probe_armed.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel))
+        queue->scope_pins.fetch_sub(1, std::memory_order_release);
+}
+// At the end of a Present on the presenting queue, before FinishScope (the
+// scope's pin keeps the queue alive until the arm holds its own).
+void ArmStartProbe() noexcept {
+    QueueSlot* queue = s_scope.queue;
+    if (!queue || s_scope.depth != 0 || !ProbeActive() || !queue->probe_ready.load(std::memory_order_acquire) ||
+        queue->retired.load() || queue->faulted.load() || queue->uncertain_submission.load()) return;
+    queue->probe_state.store(0, std::memory_order_release); // an unclaimed record of an earlier frame
+    queue->probe_arm_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    queue->scope_pins.fetch_add(1, std::memory_order_acq_rel);
+    if (QueueSlot* previous = s_probe_armed.exchange(queue, std::memory_order_acq_rel))
+        previous->scope_pins.fetch_sub(1, std::memory_order_release);
+}
+// The caller owns the arm and its pin. The first submission after the arming
+// Present counts only from that Present's thread: from another thread the
+// frame boundary is unknown and the frame is left without a probe.
+void StartProbeSubmit(QueueSlot* queue) noexcept {
+    if (!ProbeActive() || !queue->probe_ready.load(std::memory_order_acquire) || queue->retired.load() ||
+        queue->faulted.load() || queue->uncertain_submission.load()) return;
+    const uint32_t thread = GetCurrentThreadId();
+    if (thread != queue->probe_arm_thread.load(std::memory_order_relaxed)) return;
+    uint64_t value = 0;
+    if (!GpuReadinessQueue_ProbeBegin(queue, &value)) return; // the sampler owns the entry: no probe this frame
+    const int64_t submit_qpc = Qpc();
+    const HRESULT result = GpuReadinessQueue_ProbeSignal(queue, value);
+    if (FAILED(result)) { ProbeDisable("Signal failed", result); return; }
+    queue->probe_thread = thread;
+    queue->probe_submit_qpc = submit_qpc;
+    queue->probe_value = value;
+    queue->probe_state.store(1, std::memory_order_release);
+}
 void ReclaimRetiredQueues() noexcept {
     for(auto& queue:s_queues) {
         if(!queue.retired.load(std::memory_order_acquire) || queue.faulted.load() || queue.uncertain_submission.load())continue;
+        DropProbeArm(&queue); // a retired queue's arm must not hold it
         if(!TryAcquireSRWLockExclusive(&s_registration))continue;
         const auto state=queue.state.load(std::memory_order_acquire);
         bool idle=state!=QueueState::Empty && state!=QueueState::Creating &&
@@ -210,6 +295,8 @@ void ReclaimRetiredQueues() noexcept {
         queue.observation_faults.store(0,std::memory_order_relaxed);
         queue.last_submitted=0;queue.calibration={};queue.wake_value=0;queue.wake_qpc=0;
         queue.notification_failed=false;
+        queue.probe_failed.store(false);queue.probe_next.store(1);queue.probe_state.store(0);
+        for(auto& entry:queue.probe_ring){entry.value.store(0);entry.wake_qpc.store(0);}
         for(auto& timestamp:queue.timestamps) {
             timestamp.retire_value=0;timestamp.ownership.store(GpuTimestampOwnership::Free,std::memory_order_release);
         }
@@ -225,6 +312,18 @@ void Poll(bool stopping) noexcept {
             const HRESULT result = GpuReadinessQueue_Initialize(&queue);
             queue.state.store(SUCCEEDED(result) && queue.fence ? QueueState::Ready : QueueState::Failed, std::memory_order_release);
             if (FAILED(result)) LOG_WARN("GPU readiness: timestamp queue initialization failed (hr=0x%08X)", result);
+        }
+    }
+    // gpu_start_probe: the probe fence of every ready queue, only while the key
+    // is on, created here and never on the game's thread.
+    if (!stopping && ProbeActive()) {
+        for (auto& queue : s_queues) {
+            if (queue.state.load(std::memory_order_acquire) != QueueState::Ready || queue.retired.load() ||
+                queue.faulted.load() || queue.uncertain_submission.load() || queue.probe_ready.load() ||
+                queue.probe_failed.load()) continue;
+            const HRESULT result = GpuReadinessQueue_InitializeProbe(&queue);
+            if (SUCCEEDED(result)) queue.probe_ready.store(true, std::memory_order_release);
+            else { queue.probe_failed.store(true); ProbeDisable("fence creation failed", result); }
         }
     }
     for (auto& slot : s_samples) {
@@ -315,21 +414,33 @@ void Poll(bool stopping) noexcept {
 DWORD WINAPI Worker(void*) noexcept {
     while (!s_stopping.load(std::memory_order_acquire)) {
         Poll(false);
-        HANDLE handles[2 + kQueueCapacity]{s_stop_event, s_work_event};
-        QueueSlot* owners[2 + kQueueCapacity]{};
+        HANDLE handles[2 + 2 * kQueueCapacity]{s_stop_event, s_work_event};
+        QueueSlot* owners[2 + 2 * kQueueCapacity]{};
         DWORD count = 2;
         for (auto& queue : s_queues) {
             if (!queue.armed_value) continue;
             handles[count] = queue.completion_event;
             owners[count++] = &queue;
         }
+        const DWORD completion_count = count;
+        // gpu_start_probe: the probe fences' events wake the sampler at the
+        // completion of each Signal.
+        for (auto& queue : s_queues) {
+            if (count >= MAXIMUM_WAIT_OBJECTS) break;
+            if (!queue.probe_ready.load(std::memory_order_acquire) || !queue.probe_event) continue;
+            handles[count] = queue.probe_event;
+            owners[count++] = &queue;
+        }
         const DWORD wait = WaitForMultipleObjects(count, handles, FALSE, 50);
+        const int64_t wake_qpc = Qpc();
         if (wait == WAIT_OBJECT_0) break;
-        if (wait >= WAIT_OBJECT_0 + 2 && wait < WAIT_OBJECT_0 + count) {
+        if (wait >= WAIT_OBJECT_0 + 2 && wait < WAIT_OBJECT_0 + completion_count) {
             auto* queue = owners[wait-WAIT_OBJECT_0];
             queue->wake_value = queue->armed_value;
-            queue->wake_qpc = Qpc();
+            queue->wake_qpc = wake_qpc;
             queue->armed_value = 0;
+        } else if (wait >= WAIT_OBJECT_0 + completion_count && wait < WAIT_OBJECT_0 + count) {
+            GpuReadinessQueue_ProbeStamp(owners[wait-WAIT_OBJECT_0]);
         } else if (wait == WAIT_FAILED) {
             LOG_WARN("GPU readiness: sampler wait failed; closing observation admission");
             s_stopping.store(true, std::memory_order_release);
@@ -361,6 +472,9 @@ bool GpuReadiness_Start() noexcept {
 }
 bool GpuReadiness_Stop() noexcept {
     s_stopping.store(true, std::memory_order_release);
+    // gpu_start_probe: no arm outlives the sampler (it pins its queue).
+    if (QueueSlot* armed = s_probe_armed.exchange(nullptr, std::memory_order_acq_rel))
+        armed->scope_pins.fetch_sub(1, std::memory_order_release);
     if (!s_thread) return true;
     SetEvent(s_stop_event);
     if (WaitForSingleObject(s_thread, 5000) != WAIT_OBJECT_0) return false;
@@ -370,6 +484,9 @@ bool GpuReadiness_Stop() noexcept {
 }
 bool GpuReadiness_ReleaseAfterRundown() noexcept {
     if (s_thread || !s_stopping.load()) return false;
+    // gpu_start_probe: an arm that raced the stop still pins its queue.
+    if (QueueSlot* armed = s_probe_armed.exchange(nullptr, std::memory_order_acq_rel))
+        armed->scope_pins.fetch_sub(1, std::memory_order_release);
     for(const auto& queue:s_queues)if(queue.scope_pins.load(std::memory_order_acquire))return false;
     for (auto& slot : s_samples) {
         if (slot.state.load() == SampleState::Preparing) {
@@ -425,7 +542,19 @@ void GpuReadiness_OnFinishPresent(reshade::api::swapchain* swapchain) noexcept {
     const bool valid = swapchain && s_scope.valid && s_scope.completed && s_scope.calls == 1 && s_scope.depth == 0 &&
         swapchain->get_native() == s_scope.native && s_scope.settings == GpuReadiness_Settings() && Eligible() &&
         FrameTimeline_GetPresentSwapchainGeneration(s_scope.native) == s_scope.generation;
+    ArmStartProbe();
     FinishScope(valid);
+}
+// gpu_start_probe, from ReShade's execute_command_list event: the game's
+// thread, before the submission is forwarded. Nothing but one atomic load
+// unless a Present armed a queue and this is that queue's first submission.
+void GpuReadiness_OnExecuteCommandList(reshade::api::command_queue* queue) noexcept {
+    QueueSlot* armed = s_probe_armed.load(std::memory_order_acquire);
+    if (!armed || !queue) return;
+    if (armed->identity.load() != queue->get_native()) return;
+    if (!s_probe_armed.compare_exchange_strong(armed, nullptr, std::memory_order_acq_rel)) return;
+    StartProbeSubmit(armed);
+    armed->scope_pins.fetch_sub(1, std::memory_order_release);
 }
 GpuReadinessCall::GpuReadinessCall(const PresentTimelineSpan* span, bool before_gate) noexcept {
     if (!GpuReadiness_IsEnabled() && !GpuPresent_RequiresReadiness() && !s_scope.valid) return;
@@ -483,6 +612,14 @@ GpuReadinessCall::GpuReadinessCall(const PresentTimelineSpan* span, bool before_
     sample.settings_generation = s_scope.settings;
     sample.fence_value = queue->next_value++;
     sample.before_gate=before_gate;
+    // gpu_start_probe: the first submission since the previous Present, from
+    // this Present's thread (StartProbeSubmit), belongs to this frame.
+    slot->probe_value = 0;
+    slot->probe_first_submit_qpc = 0;
+    if (queue->probe_state.exchange(0, std::memory_order_acq_rel) == 1 && queue->probe_thread == sample.thread_id) {
+        slot->probe_value = queue->probe_value;
+        slot->probe_first_submit_qpc = queue->probe_submit_qpc;
+    }
     slot->present_observation={};
     slot->source_key={};
     const auto& trace = span->native_gate;

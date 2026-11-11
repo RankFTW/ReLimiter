@@ -46,12 +46,18 @@ struct PreSleepRequest {
     double interval_us = 0.0;       // I of the newest plan
     int64_t last_release_qpc = 0;   // source release of the newest plan; 0 = none
     bool driver_sleep = false;      // the driver's Sleep runs after this Sleep hook
+    // Developer key pre_sleep_precise: the wait aims at the release target
+    // S = T − L itself, the learned margin is not used (the learner keeps
+    // running for Status() and its residuals), and the wait ends with the
+    // hardware spin (PreSleepWaitUntil(..., true)). The guards stay.
+    bool precise = false;
 };
 
 struct PreSleepDecision {
     bool wait = false;
-    int64_t wait_target_qpc = 0; // S_next − margin
-    double margin_us = 0.0;
+    int64_t wait_target_qpc = 0; // S_next − margin; S_next itself when precise
+    double margin_us = 0.0;      // 0 when precise
+    bool precise = false;        // the wait ends with the hardware spin
 };
 
 // Why a Sleep produced no pre-wait (statistics).
@@ -106,11 +112,16 @@ public:
     // is pending, so the margin covers the timer's overshoot, the driver's
     // Sleep, the game's work up to the marker and the marker hook's own
     // processing, or ready − Sleep entry for a probe.
-    // Residuals measured under the other driver_sleep are dropped. Returns
+    // Residuals measured under the other driver_sleep are dropped. A frame
+    // the driver's Sleep released (driver_released, developer A/B
+    // gpu_paced_cadence) adds no residual, from its pre-wait or from a probe:
+    // the driver, not the placement's timer, the game or the marker hook,
+    // set when it reached the marker, so it says nothing the margin covers.
+    // The pending wait and the probe are consumed all the same. Returns
     // true when this frame had a pre-wait (its end in *wait_end_qpc); a probe
     // returns false.
     bool OnPlannedArrival(uint64_t grid_index, int64_t ready_qpc, int64_t source_wake_qpc,
-        int64_t qpc_frequency, int64_t* wait_end_qpc) noexcept;
+        int64_t qpc_frequency, bool driver_released, int64_t* wait_end_qpc) noexcept;
     // The ended pre-wait still pending for its predicted index: the Sleep
     // hook's entry and the wait's end (lockstep gate, lead_controller.h).
     bool EndedWait(uint64_t* grid_index, int64_t* start_qpc, int64_t* end_qpc) const noexcept;

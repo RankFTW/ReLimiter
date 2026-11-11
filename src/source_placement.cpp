@@ -108,7 +108,10 @@ PreSleepDecision PreSleepPlacement::Decide(const PreSleepRequest& request) noexc
         skip(PreSleepSkip::StalePlan);
         return decision;
     }
-    decision.margin_us = MarginUs();
+    // pre_sleep_precise aims at S itself; the learned margin is not used
+    // (the learner still takes the residuals, for Status()).
+    decision.precise = request.precise;
+    decision.margin_us = request.precise ? 0.0 : MarginUs();
     const int64_t target = request.next_target_qpc -
         MicrosecondsToTicks(std::max(request.lead_us, 0.0) + decision.margin_us, request.qpc_frequency);
     const int64_t ahead = target - request.now_qpc;
@@ -158,11 +161,11 @@ bool PreSleepPlacement::EndedWait(uint64_t* grid_index, int64_t* start_qpc, int6
 }
 
 bool PreSleepPlacement::OnPlannedArrival(uint64_t grid_index, int64_t ready_qpc,
-    int64_t source_wake_qpc, int64_t qpc_frequency, int64_t* wait_end_qpc) noexcept
+    int64_t source_wake_qpc, int64_t qpc_frequency, bool driver_released, int64_t* wait_end_qpc) noexcept
 {
     if (wait_end_qpc != nullptr) *wait_end_qpc = 0;
     if (probe_index_ != 0 && grid_index >= probe_index_) {
-        if (grid_index == probe_index_ && qpc_frequency > 0 &&
+        if (grid_index == probe_index_ && qpc_frequency > 0 && !driver_released &&
             probe_driver_sleep_ == window_driver_sleep_) {
             AddResidual(ready_qpc, probe_qpc_, qpc_frequency);
             ++statistics_.probes;
@@ -186,7 +189,9 @@ bool PreSleepPlacement::OnPlannedArrival(uint64_t grid_index, int64_t ready_qpc,
     if (wait_end_qpc != nullptr) *wait_end_qpc = end_qpc;
     const int64_t target_qpc = pending_target_qpc_;
     if (qpc_frequency <= 0 || target_qpc <= 0) return true;
-    if (pending_driver_sleep_ == window_driver_sleep_) AddResidual(ready_qpc, target_qpc, qpc_frequency);
+    if (!driver_released && pending_driver_sleep_ == window_driver_sleep_) {
+        AddResidual(ready_qpc, target_qpc, qpc_frequency);
+    }
     if (source_wake_qpc > 0 && ready_qpc > source_wake_qpc) ++statistics_.late_arrivals;
     return true;
 }

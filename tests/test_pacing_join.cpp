@@ -502,6 +502,57 @@ namespace
             "a repeated row gets no FG input-wait residence") && ok;
     }
 
+    // GPU start probe on a frame generation row: the keyed FG prefix Ready
+    // record is the row's readiness (its timestamp stays), the probe pair of
+    // the unkeyed observer sample joins through the Present's (swapchain
+    // generation, present sequence), and a row without a probe stays empty.
+    bool TestProbePairJoinsFrameGenerationRow()
+    {
+        g_joiner.Reset(kFrequency);
+        const PacingFrameKey key = Key(70);
+        PacingSourceRecord source = Source(key, Ms(90));
+        source.fg_divisor = 2.0;
+        g_joiner.AddSource(source, Ms(90));
+        PacingPresentRecord present = Present(Ms(100), Ms(101), key);
+        present.swapchain_generation = 7;
+        present.present_sequence = 905;
+        g_joiner.AddPresent(present, Ms(101));
+        PacingReadyRecord prefix{};
+        prefix.key = key;
+        prefix.swapchain_generation = 7;
+        prefix.submit_qpc = Ms(95);
+        prefix.ready_qpc = Ms(103);
+        prefix.valid = 1;
+        prefix.before_gate = 1;
+        g_joiner.AddReady(prefix, Ms(104));
+        PacingReadyRecord probe{};
+        probe.swapchain_generation = 7;
+        probe.present_sequence = 905;
+        probe.gpu_first_submit_qpc = Ms(92);
+        probe.gpu_start_qpc = Ms(94);
+        g_joiner.AddReady(probe, Ms(105));
+        g_joiner.AddDisplay(Display(Ms(100) + kMillisecond / 2, Ms(116), 70), Ms(150));
+        PacingJoinedRow rows[4];
+        bool ok = Check(TakeRows(Ms(400), false, rows, 4) == 1, "the FG row is emitted");
+        ok = Check(rows[0].has_ready && rows[0].ready.ready_qpc == Ms(103) && rows[0].ready.valid == 1 &&
+            rows[0].ready.before_gate == 1,
+            "the keyed prefix record keeps the readiness timestamp") && ok;
+        ok = Check(rows[0].ready.gpu_first_submit_qpc == Ms(92) && rows[0].ready.gpu_start_qpc == Ms(94),
+            "the probe pair joins through the Present identity") && ok;
+
+        g_joiner.Reset(kFrequency);
+        g_joiner.AddSource(source, Ms(90));
+        g_joiner.AddPresent(present, Ms(101));
+        g_joiner.AddReady(prefix, Ms(104));
+        probe.present_sequence = 906; // another Present's sample
+        g_joiner.AddReady(probe, Ms(105));
+        g_joiner.AddDisplay(Display(Ms(100) + kMillisecond / 2, Ms(116), 70), Ms(150));
+        ok = Check(TakeRows(Ms(400), false, rows, 4) == 1 && rows[0].has_ready &&
+            rows[0].ready.gpu_first_submit_qpc == 0 && rows[0].ready.gpu_start_qpc == 0,
+            "another Present's probe is not joined") && ok;
+        return ok;
+    }
+
     bool TestRetentionEviction()
     {
         g_joiner.Reset(kFrequency);
@@ -752,6 +803,7 @@ int main()
     ok = TestUnjoinedPresentRows() && ok;
     ok = TestGateReadyReflexJoins() && ok;
     ok = TestFgInputResidence() && ok;
+    ok = TestProbePairJoinsFrameGenerationRow() && ok;
     ok = TestRetentionEviction() && ok;
     ok = TestProducerEpochChange() && ok;
     ok = TestFinalDrainAndLimits() && ok;

@@ -132,9 +132,28 @@ struct PacingPipelineConfig {
     // Auto, a GPU wait lead behind the wait is at least the arrival tail plus
     // the GPU's start → readiness time (lead_controller.h, spike floor).
     bool lead_spike_floor = true;
+    // Key pre_sleep_precise (default off; developer A/B): the pre-Sleep wait
+    // aims at the release target itself (no learned margin) and ends with the
+    // hardware spin, so the game thread returns from ReLimiter's wait at the
+    // target (source_placement.h PreSleepRequest::precise).
+    bool pre_sleep_precise = false;
+    // Key driver_limiter_hold (default off; developer A/B): with the Reflex
+    // driver limiter placement the output rung resolves as for the other
+    // placements and ReLimiter plans each frame without a start wait. Takes
+    // effect with gpu_paced_cadence only (PacingPipeline_DriverLimiterHold).
+    bool driver_limiter_hold = false;
     double stall_inject_ms = 0.0; // 0 = off; [0, kPacingStallInjectMaxMs]
     double stall_inject_period_s = kPacingStallInjectDefaultPeriodS; // [1, 60]
 };
+
+// The driver limiter placement keeps its output hold: the frame's deadline
+// comes from the cadence planning of driver-released frames, which the grid
+// reaches only under gpu_paced_cadence (source_stage.cpp driver_sleep), so
+// the key needs it. Pure function of the configuration.
+constexpr bool PacingPipeline_DriverLimiterHold(const PacingPipelineConfig& config) noexcept
+{
+    return config.driver_limiter_hold && config.gpu_paced_cadence;
+}
 
 // ── Inputs ──
 
@@ -243,6 +262,10 @@ PacingPipelineConfig PacingPipeline_ClampConfig(PacingPipelineConfig config) noe
 // Control plane. Stores the clamped configuration.
 void PacingPipeline_SetConfig(const PacingPipelineConfig& config) noexcept;
 PacingPipelineConfig PacingPipeline_GetConfig() noexcept;
+// Single atomic loads (no consistent-read retry) for the Sleep planning path:
+// pre_sleep_precise, and PacingPipeline_DriverLimiterHold of the published config.
+bool PacingPipeline_PreSleepPrecise() noexcept;
+bool PacingPipeline_DriverLimiterHoldKey() noexcept;
 
 // A capability published for one controller generation answers true only for
 // that generation, so a lifecycle change invalidates it without a clear call.

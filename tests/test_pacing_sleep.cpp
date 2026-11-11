@@ -71,6 +71,28 @@ int main()
     CHECK(g_adaptive_wake_guard.LastFinalError() == 0.0);
     CHECK(g_adaptive_wake_guard.wake_errors.Size() == 0);
 
+    // PreSleepWaitUntil with `precise` (developer key pre_sleep_precise): the
+    // guards are the timer wait's; inside the spin lead no timer is needed and
+    // the hardware spin finishes the wait. The pre-Sleep timer is never
+    // created here (InitSleepTimer is not called), so nothing waits.
+    stopping = false;
+    stop_during_spin = false;
+    spin_calls = 0;
+    QueryPerformanceCounter(&now);
+    CHECK(!PreSleepWaitUntil(now.QuadPart - 1, true) && spin_calls == 0);              // passed
+    CHECK(!PreSleepWaitUntil(now.QuadPart + GetQPCFrequency(), true) && spin_calls == 0); // beyond 500 ms
+    CHECK(!PreSleepWaitUntil(now.QuadPart + us_to_qpc(5000.0), true) && spin_calls == 0); // needs the timer
+    QueryPerformanceCounter(&now);
+    CHECK(!PreSleepWaitUntil(now.QuadPart + us_to_qpc(PRE_SLEEP_SPIN_LEAD_US / 2.0), false) &&
+        spin_calls == 0);                                                              // timer only: no spin
+    QueryPerformanceCounter(&now);
+    CHECK(PreSleepWaitUntil(now.QuadPart + us_to_qpc(PRE_SLEEP_SPIN_LEAD_US / 2.0), true) && spin_calls == 1);
+    stop_during_spin = true;
+    QueryPerformanceCounter(&now);
+    CHECK(!PreSleepWaitUntil(now.QuadPart + us_to_qpc(PRE_SLEEP_SPIN_LEAD_US / 2.0), true) && spin_calls == 2);
+    stopping = false;
+    stop_during_spin = false;
+
     std::printf("pacing sleep: %d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }

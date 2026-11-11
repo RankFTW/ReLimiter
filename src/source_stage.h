@@ -227,6 +227,39 @@ struct SourceStageRequest {
     // the floor without the game being late.
     uint64_t sleep_entry_index = 0;
     int64_t sleep_entry_qpc = 0;
+    // The driver's Reflex Sleep for grid index driver_sleep_index (0 = none;
+    // Scheduler_EndDriverSleep, Hook_Sleep): the QPC its call started and
+    // returned. The scheduler fills them while the driver's Sleep runs (the
+    // bypass off). They are recorded in the source record whenever the index
+    // is the next plan's. Under the developer A/B gpu_paced_cadence the frame
+    // is also judged driver-released (cadence_grid.h): the Sleep's return and
+    // sleep_entry_qpc, the game's entry, go to the grid, with the earliest
+    // target arrival + min(E, L) when E is known. This gate is deliberate
+    // for the experiment (arm B, key off, against arm BC, key on, in one
+    // session); the cutover that removes it is a later change.
+    uint64_t driver_sleep_index = 0;
+    int64_t driver_sleep_start_qpc = 0;
+    int64_t driver_sleep_end_qpc = 0;
+    // Developer A/B driver_limiter_hold: the Reflex driver limiter placement
+    // keeps its output hold. The frame is planned and published like any
+    // other, its lead is the marker placement's, and ReLimiter waits for
+    // nothing: the game's release is the driver's Sleep (judged through the
+    // driver_sleep_* fields above), the frame's deadline the grid's T.
+    bool driver_limiter_hold = false;
+    // Developer key pre_sleep_precise: the committed release target of the
+    // precise pre-wait for pre_wait_index (0 = none). When that wait ended at or
+    // after it (pre_wait_end_qpc), the marker-site wait does not run: the
+    // release target was decided once, by the pre-wait, and the lead the
+    // marker plan recomputed since cannot move it later.
+    int64_t precise_release_qpc = 0;
+    // The cadence the commitment was made under: it holds only while the plan is
+    // still in that grid epoch and timing mode with the same grid interval (cap,
+    // frame generation factor, governor step), so a cadence restart (OutputLate,
+    // SourceLate, a mode change) or a regime change plans a wake the pre-wait did
+    // not cover and the marker-site wait runs. A lead change alone keeps it.
+    uint32_t precise_grid_epoch = 0;
+    double precise_interval_us = 0.0;
+    PacingTimingMode precise_mode = PacingTimingMode::Off;
 };
 
 // The earliest release the source wait runs to: the earliest release, or the
@@ -258,8 +291,19 @@ struct SourceStageFrame {
     // (LeadGuardOutcome::reduction_us); 0 when it did not act.
     double guard_reduction_us = 0.0;
     bool handoff_limited = false;     // the render handoff limit moved the release past S_n
-    bool gpu_paced = false;           // the GPU floor released it (gpu_paced_cadence)
+    // The GPU floor released it (gpu_paced_cadence), or the driver's Sleep
+    // did (driver_released): its readiness enters the GPU-paced ring and its
+    // output is not judged. Only a floor-paced frame has a floor pull and
+    // continues the rhythm.
+    bool gpu_paced = false;
+    // The driver's Reflex Sleep released it (CadenceGridPlan::driver_released);
+    // also set when no earliest target was known, then the grid judged it.
+    bool driver_released = false;
     bool gpu_target = false;          // its earliest target moved T_n (CadenceGridPlan::gpu_target)
+    // The driver's Sleep that matched the plan's index (request fields; 0 =
+    // none), for the source record.
+    int64_t driver_sleep_start_qpc = 0;
+    int64_t driver_sleep_end_qpc = 0;
     // Developer A/B gpu_paced_cadence, held floor: min(E, L), how soon after
     // the GPU's release the plan expects such a frame ready
     // (LeadController::EarlyLeadUs), 0 unknown; and how far the release floor
@@ -289,6 +333,7 @@ struct SourceStageStatistics {
     uint64_t clamped_waits = 0;
     uint64_t gpu_paced_frames = 0; // SourceStageFrame::gpu_paced
     uint64_t floor_pulled_frames = 0; // of those, released at the cap's release (floor_pull_ticks > 0)
+    uint64_t driver_released_frames = 0; // SourceStageFrame::driver_released (also in gpu_paced_frames)
     // Frames the GPU-paced rhythm paced, by the step that set their release
     // (index GpuPacedRhythmStep; None unused).
     uint64_t gpu_paced_rhythm[static_cast<size_t>(GpuPacedRhythmStep::Count)] = {};

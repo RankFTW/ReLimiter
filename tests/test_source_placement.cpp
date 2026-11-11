@@ -57,8 +57,9 @@ namespace
 
         // One frame: Sleep at release + 1 ms, the pre-wait ends at its target,
         // the marker arrives `residual_us` later (`residual_us` after the
-        // Sleep without a pre-wait). Returns the decision.
-        PreSleepDecision Step(double residual_us)
+        // Sleep without a pre-wait). The driver's Sleep released the frame
+        // when `driver_released`. Returns the decision.
+        PreSleepDecision Step(double residual_us, bool driver_released = false)
         {
             const PreSleepRequest request = Request(1'000.0);
             const PreSleepDecision decision = placement.Decide(request);
@@ -71,12 +72,12 @@ namespace
                 placement.OnWaitEnd(index, decision.wait_target_qpc);
                 const int64_t arrival = decision.wait_target_qpc + residual;
                 CHECK(placement.OnPlannedArrival(index, arrival, source_wake,
-                    kFrequency, &end));
+                    kFrequency, driver_released, &end));
                 CHECK(end == decision.wait_target_qpc);
                 release = std::max(arrival, source_wake);
             } else {
                 const int64_t arrival = request.now_qpc + residual;
-                CHECK(!placement.OnPlannedArrival(index, arrival, source_wake, kFrequency, &end));
+                CHECK(!placement.OnPlannedArrival(index, arrival, source_wake, kFrequency, driver_released, &end));
                 CHECK(end == 0);
                 release = std::max(arrival, source_wake);
             }
@@ -108,9 +109,9 @@ namespace
         // The arrival of another index is not paired; an older one leaves it pending.
         int64_t end = 0;
         CHECK(!loop.placement.OnPlannedArrival(request.next_index - 1, decision.wait_target_qpc + 100,
-            0, kFrequency, &end));
+            0, kFrequency, false, &end));
         CHECK(loop.placement.OnPlannedArrival(request.next_index, decision.wait_target_qpc + 3'000,
-            0, kFrequency, &end));
+            0, kFrequency, false, &end));
         CHECK(end == decision.wait_target_qpc);
         CHECK(!loop.placement.EndedWait(&ended_index, &ended_start, &ended_end)); // consumed
         CHECK(loop.placement.Status().samples == 1);
@@ -122,7 +123,7 @@ namespace
         CHECK(second.wait);
         loop.placement.OnWaitEnd(later.next_index, second.wait_target_qpc);
         CHECK(!loop.placement.OnPlannedArrival(later.next_index + 1, second.wait_target_qpc,
-            0, kFrequency, &end));
+            0, kFrequency, false, &end));
         CHECK(loop.placement.Statistics().unmatched_arrivals == 1);
     }
 
@@ -264,7 +265,7 @@ namespace
         CHECK(!mixed.placement.Decide(request).wait); // duplicate index
         int64_t end = 0;
         CHECK(mixed.placement.OnPlannedArrival(request.next_index,
-            decision.wait_target_qpc + 300 * kTicksPerUs, 0, kFrequency, &end));
+            decision.wait_target_qpc + 300 * kTicksPerUs, 0, kFrequency, false, &end));
         CHECK(mixed.placement.Status().samples == 0);
         CHECK(mixed.placement.MarginUs() == PRE_SLEEP_MARGIN_INITIAL_US);
     }
@@ -283,7 +284,7 @@ namespace
         loop.placement.OnWaitEnd(request.next_index, late_end);
         int64_t end = 0;
         CHECK(loop.placement.OnPlannedArrival(request.next_index, late_end + 100 * kTicksPerUs,
-            0, kFrequency, &end));
+            0, kFrequency, false, &end));
         CHECK(end == late_end);
         CHECK(loop.placement.Status().residual_p50_us == 400.0);
 
@@ -294,10 +295,55 @@ namespace
         CHECK(second.wait);
         loop.placement.OnWaitEnd(next.next_index, second.wait_target_qpc);
         CHECK(loop.placement.OnPlannedArrival(next.next_index, second.wait_target_qpc - 50 * kTicksPerUs,
-            0, kFrequency, &end));
+            0, kFrequency, false, &end));
         const PreSleepStatus status = loop.placement.Status();
         CHECK(status.samples == 2 && status.residual_p50_us <= 400.0);
         CHECK(loop.placement.Statistics().late_arrivals == 0);
+    }
+
+    // A frame the driver's Sleep released adds no residual, neither from its
+    // pending pre-wait nor from a too-close probe (the driver, not the
+    // placement's timer, the game or the marker hook set when it arrived),
+    // and still consumes the pending wait or the probe. A normal arrival
+    // behaves as before.
+    void TestDriverReleasedAddsNoResidual()
+    {
+        // Pending pre-wait.
+        Loop loop;
+        for (int frame = 0; frame < 20; ++frame) loop.Step(300.0);
+        const PreSleepStatistics before = loop.placement.Statistics();
+        CHECK(before.residuals == 20 && loop.placement.Status().samples == 20);
+        CHECK(loop.placement.MarginUs() == 450.0);
+        CHECK(loop.Step(5'000.0, true).wait);
+        PreSleepStatistics after = loop.placement.Statistics();
+        CHECK(after.residuals == before.residuals && loop.placement.Status().samples == 20);
+        CHECK(loop.placement.MarginUs() == 450.0);
+        // The pending wait was consumed: it is no longer pending, and the
+        // next frame plans its own pre-wait as usual.
+        uint64_t ended_index = 0;
+        int64_t ended_start = 0;
+        int64_t ended_end = 0;
+        CHECK(!loop.placement.EndedWait(&ended_index, &ended_start, &ended_end));
+        CHECK(after.unmatched_arrivals == before.unmatched_arrivals);
+        // The same arrival of a normal frame is a residual and widens the margin.
+        CHECK(loop.Step(5'000.0).wait);
+        CHECK(loop.placement.Statistics().residuals == before.residuals + 1);
+        CHECK(loop.placement.Status().samples == 21);
+
+        // Too-close probe: a margin wider than the room skips the pre-wait and
+        // leaves a probe; a driver-released arrival consumes it without a residual.
+        Loop probe;
+        for (size_t frame = 0; frame < PRE_SLEEP_RESIDUAL_CAPACITY; ++frame) probe.Step(7'500.0);
+        CHECK(probe.placement.MarginUs() == 7'650.0);
+        const PreSleepStatistics probes_before = probe.placement.Statistics();
+        CHECK(!probe.Step(20.0, true).wait);
+        after = probe.placement.Statistics();
+        CHECK(after.probes == probes_before.probes && after.residuals == probes_before.residuals);
+        CHECK(probe.placement.MarginUs() == 7'650.0);
+        // The probe was consumed: the next normal Sleep measures its own.
+        CHECK(!probe.Step(20.0).wait);
+        CHECK(probe.placement.Statistics().probes == probes_before.probes + 1);
+        CHECK(probe.placement.Statistics().residuals == probes_before.residuals + 1);
     }
 
     void TestReset()
@@ -309,6 +355,69 @@ namespace
         CHECK(status.samples == 0 && status.margin_us == PRE_SLEEP_MARGIN_INITIAL_US);
         // After a reset the same index may be pre-waited again.
         CHECK(loop.placement.Decide(loop.Request(5'000.0)).wait);
+    }
+
+    // Developer key pre_sleep_precise: the pre-wait aims at S = T − L itself,
+    // the learned margin is not used (and not changed by the decision), the
+    // residual learner keeps running, and the guards stay.
+    void TestPreciseAimsAtTheReleaseTarget()
+    {
+        Loop loop;
+        for (int frame = 0; frame < 20; ++frame) loop.Step(1'200.0);
+        const double learned = loop.placement.Status().margin_us;
+        CHECK(learned > PRE_SLEEP_MARGIN_INITIAL_US);
+
+        Loop plain = loop;
+        PreSleepRequest request = loop.Request(1'000.0);
+        const int64_t release_target = request.next_target_qpc - static_cast<int64_t>(kLead) * kTicksPerUs;
+        const PreSleepDecision learned_aim = plain.placement.Decide(request);
+        CHECK(learned_aim.wait && !learned_aim.precise && learned_aim.margin_us == learned);
+        CHECK(learned_aim.wait_target_qpc == release_target - static_cast<int64_t>(learned * kTicksPerUs));
+
+        request.precise = true;
+        const PreSleepDecision decision = loop.placement.Decide(request);
+        CHECK(decision.wait && decision.precise);
+        CHECK(decision.margin_us == 0.0);
+        CHECK(decision.wait_target_qpc == release_target);
+        CHECK(loop.placement.Status().margin_us == learned);
+
+        // The learner keeps running: the residual is measured from the target.
+        const uint32_t samples = loop.placement.Status().samples;
+        loop.placement.OnWaitEnd(request.next_index, decision.wait_target_qpc);
+        int64_t end = 0;
+        CHECK(loop.placement.OnPlannedArrival(request.next_index, decision.wait_target_qpc + 900 * kTicksPerUs,
+            release_target, kFrequency, false, &end));
+        CHECK(end == release_target);
+        CHECK(loop.placement.Status().samples == samples + 1);
+
+        // Guards: too close (under 200 µs left) and too far (over 2 I) still skip;
+        // 300 µs left waits precisely where the learned margin would skip it.
+        Loop close = plain;
+        close.placement.Reset();
+        PreSleepRequest short_room = close.Request(1'000.0);
+        short_room.precise = true;
+        short_room.now_qpc = release_target - 100 * kTicksPerUs;
+        CHECK(!close.placement.Decide(short_room).wait);
+        CHECK(close.placement.Statistics().skipped[static_cast<size_t>(PreSleepSkip::TooClose)] == 1);
+        Loop room = loop;
+        room.placement.Reset();
+        PreSleepRequest enough = room.Request(1'000.0);
+        enough.precise = true;
+        enough.now_qpc = release_target - 300 * kTicksPerUs;
+        const PreSleepDecision close_wait = room.placement.Decide(enough);
+        CHECK(close_wait.wait && close_wait.wait_target_qpc == release_target);
+        Loop imprecise = loop;
+        imprecise.placement.Reset();
+        PreSleepRequest same = imprecise.Request(1'000.0);
+        same.now_qpc = release_target - 300 * kTicksPerUs;
+        CHECK(!imprecise.placement.Decide(same).wait);
+        Loop distant = loop;
+        distant.placement.Reset();
+        PreSleepRequest ahead = distant.Request(1'000.0);
+        ahead.precise = true;
+        ahead.now_qpc = release_target - static_cast<int64_t>(2.0 * kInterval + 100.0) * kTicksPerUs;
+        CHECK(!distant.placement.Decide(ahead).wait);
+        CHECK(distant.placement.Statistics().skipped[static_cast<size_t>(PreSleepSkip::TooFar)] == 1);
     }
 }
 
@@ -322,7 +431,9 @@ int main()
     TestResidualFromTarget();
     TestTooCloseStillMeasures();
     TestDriverSleepRegime();
+    TestDriverReleasedAddsNoResidual();
     TestReset();
+    TestPreciseAimsAtTheReleaseTarget();
     if (s_failures != 0) {
         std::fprintf(stderr, "%d source placement check(s) failed\n", s_failures);
         return 1;

@@ -151,6 +151,9 @@ namespace
             left.fg_late_spacing == right.fg_late_spacing &&
             left.gpu_paced_cadence == right.gpu_paced_cadence &&
             left.adaptive_cap_hold_room == right.adaptive_cap_hold_room &&
+            left.lead_spike_floor == right.lead_spike_floor &&
+            left.pre_sleep_precise == right.pre_sleep_precise &&
+            left.driver_limiter_hold == right.driver_limiter_hold &&
             left.stall_inject_ms == right.stall_inject_ms &&
             left.stall_inject_period_s == right.stall_inject_period_s;
     }
@@ -798,6 +801,103 @@ namespace
         CHECK(std::string_view(PacingSourcePlacement_Text(static_cast<PacingSourcePlacement>(9))) == "unknown");
         CHECK(PacingSourcePlacement_WaitsAtMarker(PacingSourcePlacement::PreSleep));
         CHECK(!PacingSourcePlacement_WaitsAtMarker(PacingSourcePlacement::DriverLimiter));
+    }
+
+    // Developer key driver_limiter_hold: the Reflex driver limiter keeps the
+    // source side, the output rung resolves as for the other placements. It
+    // needs gpu_paced_cadence (the cadence planning of driver-released frames);
+    // without it, and with either key off, nothing changes.
+    void TestDriverLimiterHold()
+    {
+        PacingRuntimeState sleeping = ActiveVrr();
+        sleeping.pre_sleep_available = true;
+        PacingRuntimeState fg_sleeping = ActiveFg();
+        fg_sleeping.pre_sleep_available = true;
+        PacingPipelineConfig config{};
+        config.placement_override = PacingPlacementOverride::Driver;
+
+        // Off by default: the driver limiter holds nothing (reason override).
+        CHECK(!config.driver_limiter_hold && !config.pre_sleep_precise);
+        CHECK(!PacingPipeline_DriverLimiterHold(config));
+        CHECK_RESULT(Resolve(config, QualifiedDx12(), sleeping), Vrr, DriverLimiter, SourceOnly, Override);
+        // The key alone, without gpu_paced_cadence, changes nothing; so does gpu_paced_cadence alone.
+        config.driver_limiter_hold = true;
+        CHECK(!PacingPipeline_DriverLimiterHold(config));
+        CHECK_RESULT(Resolve(config, QualifiedDx12(), sleeping), Vrr, DriverLimiter, SourceOnly, Override);
+        config.driver_limiter_hold = false;
+        config.gpu_paced_cadence = true;
+        CHECK(!PacingPipeline_DriverLimiterHold(config));
+        CHECK_RESULT(Resolve(config, QualifiedDx12(), sleeping), Vrr, DriverLimiter, SourceOnly, Override);
+
+        // Both on: the rung of the other placements, with the driver as the source.
+        config.driver_limiter_hold = true;
+        CHECK(PacingPipeline_DriverLimiterHold(config));
+        PacingPipelineSnapshot hold = Resolve(config, QualifiedDx12(), sleeping);
+        CHECK_RESULT(hold, Vrr, DriverLimiter, GpuQueueWait, None);
+        CHECK(hold.auto_rung == PacingRung::GpuQueueWait);
+        CHECK_RESULT(Resolve(config, QualifiedDx12(), fg_sleeping), Vrr, DriverLimiter, FgInputWait, None);
+        // The same fallbacks and reasons as the other placements.
+        PacingCapabilities no_queue = QualifiedDx12();
+        no_queue.gpu_queue_ready = false;
+        CHECK_RESULT(Resolve(config, no_queue, sleeping), Vrr, DriverLimiter, MarkerHold, NoGpuQueue);
+        PacingCapabilities no_fg_route = QualifiedDx12();
+        no_fg_route.fg_input_route_ready = false;
+        CHECK_RESULT(Resolve(config, no_fg_route, fg_sleeping), Vrr, DriverLimiter, SourceOnly, FgUnqualified);
+        PacingRuntimeState overloaded = sleeping;
+        overloaded.hold_overloaded = true;
+        PacingPipelineSnapshot demoted = Resolve(config, QualifiedDx12(), overloaded);
+        CHECK_RESULT(demoted, Vrr, DriverLimiter, SourceOnly, Infeasible);
+        CHECK(demoted.auto_rung == PacingRung::GpuQueueWait);
+        CHECK(PacingPipeline_LeadRung(demoted) == PacingRung::GpuQueueWait);
+        PacingPipelineConfig source_only = config;
+        source_only.rung_override = PacingRungOverride::SourceOnly;
+        CHECK_RESULT(Resolve(source_only, QualifiedDx12(), sleeping), Vrr, DriverLimiter, SourceOnly, Override);
+        PacingPipelineConfig gpu = config;
+        gpu.rung_override = PacingRungOverride::Gpu;
+        CHECK_RESULT(Resolve(gpu, QualifiedDx12(), sleeping), Vrr, DriverLimiter, GpuQueueWait, Override);
+        PacingPipelineConfig smoothing_off = config;
+        smoothing_off.smoothing = PacingSmoothing::Off;
+        CHECK_RESULT(Resolve(smoothing_off, QualifiedDx12(), sleeping), Vrr, DriverLimiter, SourceOnly, SmoothingOff);
+        PacingRuntimeState idle = sleeping;
+        idle.idle_cap = true;
+        CHECK_RESULT(Resolve(config, QualifiedDx12(), idle), Idle, Marker, SourceOnly, IdleCap);
+        PacingRuntimeState fixed = sleeping;
+        fixed.vrr = false;
+        CHECK_RESULT(Resolve(config, QualifiedDx12(), fixed), Fixed, DriverLimiter, MarkerHold, FixedRefresh);
+
+        // The placement itself is unchanged: a limiter that cannot be applied
+        // and routes without the driver limiter keep the marker placement, and
+        // the other placements do not see the key.
+        PacingRuntimeState unavailable = sleeping;
+        unavailable.driver_limiter_unavailable = true;
+        CHECK_RESULT(Resolve(config, QualifiedDx12(), unavailable), Vrr, Marker, GpuQueueWait, None);
+        CHECK_RESULT(Resolve(config, VulkanPcl(), sleeping), Vrr, Marker, MarkerHold, Api);
+        config.placement_override = PacingPlacementOverride::PreSleep;
+        CHECK_RESULT(Resolve(config, QualifiedDx12(), sleeping), Vrr, PreSleep, GpuQueueWait, None);
+        config.placement_override = PacingPlacementOverride::Marker;
+        CHECK_RESULT(Resolve(config, QualifiedDx12(), sleeping), Vrr, Marker, GpuQueueWait, None);
+
+        // A Source record of the pipeline: planned frames show their plan rung, an
+        // unplanned one under the hold waits for the first planned frame, an
+        // unplanned one of the plain driver limiter shows source only.
+        const auto record_of = [](const PacingPipelineSnapshot& pipeline, uint64_t grid_index) {
+            PacingSourceRecord record{};
+            record.pipeline_generation = 7;
+            record.grid_index = grid_index;
+            record.plan_rung = static_cast<uint8_t>(pipeline.rung);
+            record.fallback_reason = static_cast<uint8_t>(pipeline.reason);
+            record.source_placement = static_cast<uint8_t>(pipeline.placement);
+            return record;
+        };
+        uint32_t rung = 99;
+        CHECK(PacingSourceRecord_PipelineRung(record_of(hold, 12), &rung) &&
+              rung == static_cast<uint32_t>(PacingRung::GpuQueueWait));
+        rung = 99;
+        CHECK(!PacingSourceRecord_PipelineRung(record_of(hold, 0), &rung) && rung == 99);
+        PacingPipelineConfig plain{};
+        plain.placement_override = PacingPlacementOverride::Driver;
+        CHECK(PacingSourceRecord_PipelineRung(record_of(Resolve(plain, QualifiedDx12(), sleeping), 0), &rung) &&
+              rung == static_cast<uint32_t>(PacingRung::SourceOnly));
     }
 
     // The rung a Source record shows for its pipeline (the telemetry's
@@ -1453,6 +1553,7 @@ int main()
     TestPublishGeneration();
     TestCapabilities();
     TestSourcePlacement();
+    TestDriverLimiterHold();
     TestPipelineRungOfRecords();
     TestConfigClamp();
     TestSmoothingText();

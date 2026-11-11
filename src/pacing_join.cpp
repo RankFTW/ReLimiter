@@ -506,6 +506,22 @@ void PacingJoiner::AttachWorkerRecords(PacingJoinedRow* row) noexcept
         row->has_ready = true;
         row->ready = ready->record;
         ++statistics_.ready_joined;
+        // The keyed FG readiness record (the one preferred above) carries no GPU
+        // start probe: join the pair through the Present's own identity,
+        // without replacing the readiness timestamp.
+        if (row->ready.gpu_first_submit_qpc == 0 && row->has_present &&
+            row->present.swapchain_generation != 0 && row->present.present_sequence != 0) {
+            const uint64_t generation = row->present.swapchain_generation;
+            const uint64_t sequence = row->present.present_sequence;
+            const RetainedReady* probe = FindNewest(readies_, [generation, sequence](const PacingReadyRecord& candidate) {
+                return candidate.swapchain_generation == generation &&
+                    candidate.present_sequence == sequence && candidate.gpu_first_submit_qpc != 0;
+            });
+            if (probe != nullptr) {
+                row->ready.gpu_first_submit_qpc = probe->record.gpu_first_submit_qpc;
+                row->ready.gpu_start_qpc = probe->record.gpu_start_qpc;
+            }
+        }
     }
 
     if (key_valid) {

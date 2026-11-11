@@ -330,6 +330,8 @@ namespace
         std::atomic<double> gpu_wait_interleave_s{ kDefaultConfig.gpu_wait_interleave_s };
         std::atomic<PacingRenderQueue> gpu_queue_wait_render_queue{ kDefaultConfig.gpu_queue_wait_render_queue };
         std::atomic<PacingLeadCoverage> lead_coverage{ kDefaultConfig.lead_coverage };
+        std::atomic<bool> pre_sleep_precise{ kDefaultConfig.pre_sleep_precise };
+        std::atomic<bool> driver_limiter_hold{ kDefaultConfig.driver_limiter_hold };
         std::atomic<bool> fg_late_spacing{ kDefaultConfig.fg_late_spacing };
         std::atomic<bool> gpu_paced_cadence{ kDefaultConfig.gpu_paced_cadence };
         std::atomic<bool> adaptive_cap_hold_room{ kDefaultConfig.adaptive_cap_hold_room };
@@ -358,6 +360,8 @@ namespace
         config.gpu_paced_cadence = s_config.gpu_paced_cadence.load(std::memory_order_relaxed);
         config.adaptive_cap_hold_room =
             s_config.adaptive_cap_hold_room.load(std::memory_order_relaxed);
+        config.pre_sleep_precise = s_config.pre_sleep_precise.load(std::memory_order_relaxed);
+        config.driver_limiter_hold = s_config.driver_limiter_hold.load(std::memory_order_relaxed);
         config.lead_spike_floor = s_config.lead_spike_floor.load(std::memory_order_relaxed);
         config.stall_inject_ms = s_config.stall_inject_ms.load(std::memory_order_relaxed);
         config.stall_inject_period_s =
@@ -448,11 +452,15 @@ PacingPipelineSnapshot PacingPipeline_Resolve(
             if (!present_route) {
                 result.placement = MarkerRoutePlacement(safe_config, capabilities, runtime);
             }
-            if (result.placement == PacingSourcePlacement::DriverLimiter) {
+            if (result.placement == PacingSourcePlacement::DriverLimiter &&
+                !PacingPipeline_DriverLimiterHold(safe_config)) {
                 // One clock: the driver paces the source, nothing is held.
                 decision = { PacingRung::SourceOnly, PacingFallbackReason::Override };
                 result.auto_rung = decision.rung;
             } else {
+                // Also the driver limiter with driver_limiter_hold: the
+                // source side stays the driver's, the output rung is the
+                // one the other placements get, with their fallbacks.
                 bool is_auto = false;
                 decision = ResolveRung(safe_config, capabilities, runtime, &is_auto);
                 result.auto_rung = decision.rung;
@@ -559,12 +567,28 @@ void PacingPipeline_SetConfig(const PacingPipelineConfig& config) noexcept
     s_config.stall_inject_ms.store(safe_config.stall_inject_ms, std::memory_order_relaxed);
     s_config.stall_inject_period_s.store(
         safe_config.stall_inject_period_s, std::memory_order_relaxed);
+    s_config.pre_sleep_precise.store(safe_config.pre_sleep_precise, std::memory_order_relaxed);
+    s_config.driver_limiter_hold.store(safe_config.driver_limiter_hold, std::memory_order_relaxed);
     EndWrite(&s_config.sequence, claimed);
 }
 
 PacingPipelineConfig PacingPipeline_GetConfig() noexcept
 {
     return ReadConsistent<PacingPipelineConfig>(s_config.sequence, LoadConfigFields);
+}
+
+// Single-field reads of the published configuration for the Sleep planning path:
+// one relaxed atomic load each, no sequence and no retry. A switch read while the
+// configuration is being written answers with the old or the new value.
+bool PacingPipeline_PreSleepPrecise() noexcept
+{
+    return s_config.pre_sleep_precise.load(std::memory_order_relaxed);
+}
+
+bool PacingPipeline_DriverLimiterHoldKey() noexcept
+{
+    return s_config.driver_limiter_hold.load(std::memory_order_relaxed) &&
+        s_config.gpu_paced_cadence.load(std::memory_order_relaxed);
 }
 
 void PacingPipeline_PublishCapability(

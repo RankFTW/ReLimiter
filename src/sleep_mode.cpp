@@ -70,6 +70,11 @@ void ReflexDriverLimiter_Update(double interval_us, bool active) noexcept
     // The Sleep-mode hook forwards game calls with this value while it is set.
     g_driver_limiter_interval_us.store(desired, std::memory_order_relaxed);
     const DriverLimiterApply result = NvAPI_ApplyDriverLimiter(desired);
+    if (result == DriverLimiterApply::Busy) {
+        // Left pending: the next OnMarker applies it (no failure, no retry delay).
+        g_driver_limiter_interval_us.store(s_applied_us, std::memory_order_relaxed);
+        return;
+    }
     if (result == DriverLimiterApply::Applied) {
         if (s_applied_us == 0) {
             LOG_INFO("Reflex driver limiter applied: minimumIntervalUs=%u (presented-frame interval)", desired);

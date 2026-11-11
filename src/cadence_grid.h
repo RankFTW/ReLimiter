@@ -43,6 +43,21 @@
 //   GPU-bound frames, so judging it restarted the cadence every few frames
 //   (Gears of War: E-Day, FG 2×) and the restarts paused the holds. The
 //   output spacing floor still spaces the next frame after it.
+// - Driver-released frame (PlanNext, driver_release_qpc; developer A/B
+//   gpu_paced_cadence, the driver's Reflex Sleep kept, so the A/B gate stays
+//   until the cutover that removes it). The driver's Sleep paces the game
+//   and holds a frame the cadence has not placed: it returns after the
+//   frame's source wake S = T(n) − L, the frame reaches PlanNext late, and
+//   judged against S that restarted the cadence and held a frame the driver
+//   had already placed (Phantom Blade Zero, FG 2× at the GPU's edge). A
+//   frame is driver-released when the Sleep returned after S and the game
+//   had reached the Sleep on time: its entry (game_arrival_qpc) is no later
+//   than the judged wake S (below) plus the late tolerance, source slack
+//   included. The driver, not the game, then set its release. It is a
+//   GPU-paced frame exactly as above when driver_earliest_target_qpc is
+//   given (the later of it and earliest_target_qpc is its earliest target);
+//   without one it is judged as any frame, but the plan still reports
+//   driver_released.
 // - Lead discontinuity. A source is judged late against
 //   S = T − min(L(n), L(n − 1)), L(n − 1) the previous plan's lead: the
 //   frame's pre-wait aimed at that S. L grows by at most one slew step per
@@ -235,6 +250,13 @@ struct CadenceGridPlanInput {
     // GPU-paced frame (rules above): T(n) is at least this QPC and the
     // frame's lateness is not judged; 0 = none.
     int64_t earliest_target_qpc = 0;
+    // Driver-released frame (rules above): the QPC the driver's Reflex Sleep
+    // returned at (0 = none: the frame is not judged for it), the QPC the game
+    // entered that Sleep at (0 = unknown) and the earliest target such a
+    // frame has (0 = unknown, the lead's early side is not known yet).
+    int64_t driver_release_qpc = 0;
+    int64_t game_arrival_qpc = 0;
+    int64_t driver_earliest_target_qpc = 0;
     PacingTimingMode mode = PacingTimingMode::Vrr; // Off suspends the grid
     uint32_t controller_generation = 0;
     CadenceGridFixedReference fixed{}; // used only in Fixed mode
@@ -249,6 +271,9 @@ struct CadenceGridPlan {
     PacingEpochReason epoch_reason = PacingEpochReason::None; // None: no epoch started
     bool released_immediately = false; // source late within tolerance (plus slack): S_n = now
     bool gpu_target = false; // T_n is the earliest target, later than the grid's T(n)
+    // The driver's Sleep released the frame (rules above), whether or not an
+    // earliest target was available to follow.
+    bool driver_released = false;
 };
 
 constexpr size_t kCadenceGridEpochReasonCount =
@@ -263,6 +288,7 @@ struct CadenceGridStatistics {
     uint64_t released_immediately = 0;
     uint64_t snapped_plans = 0;
     uint64_t gpu_target_plans = 0; // CadenceGridPlan::gpu_target
+    uint64_t driver_released_plans = 0; // CadenceGridPlan::driver_released
     // Outputs of GPU-paced frames later than T(n) + tol (or, for older
     // evidence, implied later than T(b) + tol) that started no epoch.
     uint64_t gpu_paced_late_outputs = 0;

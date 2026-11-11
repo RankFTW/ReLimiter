@@ -410,6 +410,16 @@ static void on_finish_present(reshade::api::command_queue*, reshade::api::swapch
     NativeGate_PublishRouteCapability(FrameTimeline_CurrentControllerGeneration());
 }
 
+// Developer key gpu_start_probe (gpu_readiness_d3d12.cpp): before the
+// submission is forwarded. Registered always (ReShade's event lists are not
+// safe to edit while the game submits); one atomic load per command list
+// unless a Present armed the probe.
+static void on_execute_command_list(reshade::api::command_queue* queue, reshade::api::command_list*) {
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) return;
+    GpuReadiness_OnExecuteCommandList(queue);
+}
+
 static void on_destroy_command_queue(reshade::api::command_queue* queue) {
     RuntimeCallbackGuard callback;
     if (!callback.IsStopping() && queue && queue->get_device() &&
@@ -595,6 +605,7 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         reshade::register_event<reshade::addon_event::present>(on_present);
         reshade::register_event<reshade::addon_event::finish_present>(on_finish_present);
         reshade::register_event<reshade::addon_event::destroy_command_queue>(on_destroy_command_queue);
+        reshade::register_event<reshade::addon_event::execute_command_list>(on_execute_command_list);
         reshade::register_event<reshade::addon_event::create_swapchain>(on_create_swapchain);
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(on_set_fullscreen_state);
         if (s_imgui_available) RegisterOSD();

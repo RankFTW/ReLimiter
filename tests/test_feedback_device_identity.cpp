@@ -73,6 +73,11 @@ constexpr GUID kUnwrappedObject = {
     { 0x81, 0x2f, 0x5e, 0x9c, 0xd3, 0x7a, 0x1b, 0x42 }
 };
 
+// A sleep status word of the current feedback-device publication (SleepStatusWord's token).
+static uint64_t CurrentStatusWord(uint32_t interval_us, bool use_game_sleep) {
+    return SleepStatusWord(interval_us, use_game_sleep, g_sleep_status_token.load());
+}
+
 class FakeDevice final : public IUnknown {
 public:
     // Graph edges are borrowed from fixtures whose lifetimes enclose each
@@ -175,6 +180,18 @@ unsigned s_handoff_stalls = 0;     // Scheduler_RenderHandoffStalled calls
 int64_t s_planned_handoff_qpc = -1; // handoff_qpc of the newest Scheduler_PlanReflexSleep
 int64_t s_planned_sleep_entry_qpc = -1; // sleep_entry_qpc of the newest Scheduler_PlanReflexSleep
 int64_t s_planned_now_qpc = -1;         // now_qpc of the newest Scheduler_PlanReflexSleep
+unsigned s_driver_sleep_calls = 0;       // Scheduler_EndDriverSleep calls
+int64_t s_driver_sleep_start_qpc = 0;    // its newest stamps
+int64_t s_driver_sleep_end_qpc = 0;
+bool s_driver_hold_active = false;        // Scheduler_DriverLimiterHoldActive
+unsigned s_sleep_entry_records = 0;       // Scheduler_RecordReflexSleepEntry calls
+int64_t s_recorded_entry_qpc = 0;         // and its newest argument
+bool s_plan_waits = false;                // Scheduler_PlanReflexSleep plans a pre-wait
+bool s_plan_precise = false;              // and reports the developer key pre_sleep_precise
+unsigned s_plan_calls = 0;                // Scheduler_PlanReflexSleep calls
+unsigned s_pre_sleep_waits = 0;           // PreSleepWaitUntil calls
+int64_t s_pre_sleep_wait_target = 0;      // and its newest arguments
+bool s_pre_sleep_wait_precise = false;
 int64_t RealQpc();
 unsigned s_mode_calls = 0;
 int s_sleep_action = 0;
@@ -218,12 +235,17 @@ void TestReflexCallForwarding() {
     g_reflex_sleep_bypass=true;g_user_target_fps=157;
     g_pacer_latency_us=500.0;
     const auto bypass_calls=s_sleep_calls;
+    const auto driver_sleep_calls=s_driver_sleep_calls;
     // Bypass: no driver call and no stale Sleep duration.
     CHECK(Hook_Sleep(&device)==NVAPI_OK && s_sleep_calls==bypass_calls);
     CHECK(g_pacer_latency_us.load()==0.0);
+    // The scheduler is told of the driver's Sleep only when it ran.
+    CHECK(s_driver_sleep_calls==driver_sleep_calls);
     // Passthrough (Dynamic MFG, uncapped) or the driver limiter: the driver's Sleep runs.
     s_paces_source=false;
     CHECK(Hook_Sleep(&device)==-7 && s_sleep_calls==bypass_calls+1);
+    CHECK(s_driver_sleep_calls==driver_sleep_calls+1 && s_driver_sleep_start_qpc>0 &&
+        s_driver_sleep_end_qpc>=s_driver_sleep_start_qpc);
     s_paces_source=true;
     g_user_target_fps=0;
     CHECK(Hook_Sleep(&device)==-7 && s_sleep_calls==bypass_calls+2);
@@ -335,12 +357,21 @@ void TestReflexCallForwarding() {
         s_smooth_motion = scenario == 5;
 #endif
         const unsigned before = s_sleep_calls;
+        const unsigned driver_calls_before = s_driver_sleep_calls;
         const double latency_before = g_pacer_latency_us.load();
         const bool bypass = s_smooth_motion || scenario == 6;
         CHECK(Hook_Sleep(&device) == (bypass || scenario == 4 ? NVAPI_OK : -7));
         CHECK(s_sleep_calls == before + (bypass ? 0 : 1));
         // A device replaced during the driver call never updates Sleep latency.
         if (scenario == 2) CHECK(g_pacer_latency_us.load() == latency_before);
+        // The driver's Sleep is published once it ran and the presenting
+        // device is still current; not after the device was replaced during
+        // it, with no trampoline, or under the Smooth Motion bypass.
+        if (scenario == 0) CHECK(s_driver_sleep_calls == driver_calls_before + 1);
+        if (scenario == 2 || scenario == 6) CHECK(s_driver_sleep_calls == driver_calls_before);
+#ifdef _WIN64
+        if (scenario == 5) CHECK(s_driver_sleep_calls == driver_calls_before);
+#endif
     }
     s_smooth_motion = false;
     s_sleep_action = 0;
@@ -497,6 +528,199 @@ void TestBypassLowLatencyOff() {
     NvAPI_ClearFeedbackDevice();
 }
 
+// Developer A/B driver_low_latency_off: while the game's Sleep is forwarded the
+// driver's low latency mode is off (low latency and boost 0, every other
+// field the game's, minimumIntervalUs whatever the limiter or the game
+// passes), once per transition, the game's own SetSleepMode calls cannot undo
+// it, the bypassed case is bypass_low_latency_off's alone, and a key switched
+// at run time re-applies the mode at the next Sleep.
+void TestDriverLowLatencyOff() {
+    FakeDevice device;
+    CHECK(NvAPI_CaptureFeedbackDevice(&device));
+    const auto old_sleep = s_orig_sleep;
+    const auto old_mode = s_orig_sleep_mode;
+    s_orig_sleep = FakeDriverSleep;
+    s_orig_sleep_mode = FakeSleepMode;
+    s_expected_mode_params = nullptr;
+    s_mode_result = NVAPI_OK;
+    s_record_modes = true;
+    s_forwarded_modes.clear();
+    g_reflex_sleep_bypass = false;
+    g_user_target_fps = 157;
+    s_paces_source = false;
+    g_driver_low_latency_off = false;
+    g_bypass_low_latency_off = false;
+
+    NV_SET_SLEEP_MODE_PARAMS game{};
+    game.version = NV_SLEEP_PARAMS_VER;
+    game.bLowLatencyMode = game.bLowLatencyBoost = 1;
+    game.minimumIntervalUs = 4321;
+    game.bUseMarkersToOptimize = game.bUseMinQueueTime = 1;
+    game.rsvd[3] = 9;
+    CHECK(Hook_SetSleepMode(&device, &game) == NVAPI_OK);
+    s_forwarded_modes.clear();
+
+    // Key off: the forwarded Sleep makes no SetSleepMode call.
+    const unsigned driver_sleeps = s_sleep_calls;
+    CHECK(Hook_Sleep(&device) == -7 && s_sleep_calls == driver_sleeps + 1 && s_forwarded_modes.empty());
+    CHECK(!s_low_latency_forced_off.load());
+
+    // Key on: the Sleep sends one copy with low latency and boost off, then the driver's Sleep runs.
+    g_driver_low_latency_off = true;
+    CHECK(Hook_Sleep(&device) == -7 && s_sleep_calls == driver_sleeps + 2);
+    CHECK(s_forwarded_modes.size() == 1 && IsLowLatencyOffCopy(s_forwarded_modes[0], game));
+    CHECK(s_low_latency_forced_off.load());
+    CHECK(s_game_original_params.bLowLatencyMode == 1 && game.bLowLatencyMode == 1);
+    s_forwarded_modes.clear();
+    CHECK(Hook_Sleep(&device) == -7 && Hook_Sleep(&device) == -7 && s_forwarded_modes.empty()); // once per transition
+
+    // The game's own call, with low latency on, goes out with it off.
+    NV_SET_SLEEP_MODE_PARAMS again = game;
+    again.minimumIntervalUs = 2222;
+    CHECK(Hook_SetSleepMode(&device, &again) == NVAPI_OK);
+    CHECK(s_forwarded_modes.size() == 1 && IsLowLatencyOffCopy(s_forwarded_modes[0], again));
+    CHECK(again.bLowLatencyMode == 1 && s_game_original_params.minimumIntervalUs == 2222);
+    s_forwarded_modes.clear();
+
+    // With the Reflex driver limiter applied its interval stays in every copy.
+    NV_SET_SLEEP_MODE_PARAMS limited = again;
+    limited.minimumIntervalUs = 8000;
+    g_driver_limiter_interval_us = 8000;
+    CHECK(Hook_SetSleepMode(&device, &again) == NVAPI_OK);
+    CHECK(s_forwarded_modes.size() == 1 && IsLowLatencyOffCopy(s_forwarded_modes[0], limited));
+    s_forwarded_modes.clear();
+    // The forward lock held (a SetSleepMode or a transition in flight): nothing is sent, the
+    // flag is untouched, the operation stays pending for the next call.
+    AcquireSRWLockExclusive(&s_sleep_mode_forward_lock);
+    CHECK(NvAPI_ApplyDriverLimiter(7000) == DriverLimiterApply::Busy);
+    ReleaseSRWLockExclusive(&s_sleep_mode_forward_lock);
+    CHECK(s_forwarded_modes.empty() && s_low_latency_forced_off.load());
+    CHECK(NvAPI_ApplyDriverLimiter(6000) == DriverLimiterApply::Applied);
+    limited.minimumIntervalUs = 6000;
+    CHECK(s_forwarded_modes.size() == 1 && IsLowLatencyOffCopy(s_forwarded_modes[0], limited));
+    CHECK(s_low_latency_forced_off.load());
+    s_forwarded_modes.clear();
+    // The key off at run time: the next Sleep restores the game's low latency, keeping the limiter's interval.
+    g_driver_limiter_interval_us = 6000;
+    g_driver_low_latency_off = false;
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], limited));
+    CHECK(!s_low_latency_forced_off.load());
+    s_forwarded_modes.clear();
+    CHECK(NvAPI_ApplyDriverLimiter(5000) == DriverLimiterApply::Applied); // key off: the game's low latency
+    limited.minimumIntervalUs = 5000;
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], limited));
+    CHECK(!s_low_latency_forced_off.load());
+    s_forwarded_modes.clear();
+    g_driver_limiter_interval_us = 0;
+
+    // Key back on without the limiter: the game's interval, low latency off.
+    g_driver_low_latency_off = true;
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_forwarded_modes.size() == 1 && IsLowLatencyOffCopy(s_forwarded_modes[0], again));
+    s_forwarded_modes.clear();
+
+    // Bypassed Sleep: the key does not apply, only bypass_low_latency_off does.
+    g_reflex_sleep_bypass = true;
+    s_paces_source = true;
+    CHECK(Hook_Sleep(&device) == NVAPI_OK);
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], again));
+    CHECK(!s_low_latency_forced_off.load());
+    s_forwarded_modes.clear();
+    g_bypass_low_latency_off = true;
+    CHECK(Hook_Sleep(&device) == NVAPI_OK);
+    CHECK(s_forwarded_modes.size() == 1 && IsLowLatencyOffCopy(s_forwarded_modes[0], again));
+    CHECK(s_low_latency_forced_off.load());
+    s_forwarded_modes.clear();
+    // Forwarded again with the key still on: the state already matches, no call.
+    g_reflex_sleep_bypass = false;
+    s_paces_source = false;
+    CHECK(Hook_Sleep(&device) == -7 && s_forwarded_modes.empty() && s_low_latency_forced_off.load());
+    g_bypass_low_latency_off = false;
+
+    // The shutdown restore sends the game's parameters exactly and clears the state.
+    RestoreGameSleepMode();
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], again));
+    CHECK(!s_low_latency_forced_off.load());
+    s_forwarded_modes.clear();
+
+    g_driver_low_latency_off = false;
+    g_driver_limiter_interval_us = 0;
+    g_reflex_sleep_bypass = false;
+    g_user_target_fps = 0;
+    s_paces_source = true;
+    s_record_modes = false;
+    s_mode_result = -9;
+    s_forwarded_modes.clear();
+    s_orig_sleep = old_sleep;
+    s_orig_sleep_mode = old_mode;
+    NvAPI_ClearFeedbackDevice();
+}
+
+// Hook_Sleep: the pre-Sleep wait runs with the scheduler's `precise` flag
+// (developer key pre_sleep_precise), bypassed or not; with the driver limiter
+// hold ReLimiter plans and waits for nothing and only records the Sleep's
+// entry; and the newest sleep status is left for the next Source record when
+// the Sleep returns.
+void TestPreSleepPreciseAndHoldWiring() {
+    FakeDevice device;
+    CHECK(NvAPI_CaptureFeedbackDevice(&device));
+    const auto old_sleep = s_orig_sleep;
+    s_orig_sleep = FakeDriverSleep;
+    g_reflex_sleep_bypass = false;
+    g_user_target_fps = 157;
+    s_paces_source = false;
+
+    s_pre_sleep_active = true;
+    s_plan_waits = true;
+    s_plan_precise = true;
+    unsigned waits = s_pre_sleep_waits;
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_pre_sleep_waits == waits + 1 && s_pre_sleep_wait_target == 12345 && s_pre_sleep_wait_precise);
+    s_plan_precise = false;
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_pre_sleep_waits == waits + 2 && !s_pre_sleep_wait_precise);
+    g_reflex_sleep_bypass = true;
+    s_paces_source = true;
+    s_plan_precise = true;
+    CHECK(Hook_Sleep(&device) == NVAPI_OK);
+    CHECK(s_pre_sleep_waits == waits + 3 && s_pre_sleep_wait_precise);
+    s_plan_waits = false;
+
+    // The driver limiter hold: no plan, no wait, only the entry.
+    s_pre_sleep_active = false;
+    s_driver_hold_active = true;
+    g_reflex_sleep_bypass = false;
+    s_paces_source = false;
+    waits = s_pre_sleep_waits;
+    const unsigned plans = s_plan_calls;
+    const unsigned records = s_sleep_entry_records;
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_plan_calls == plans && s_pre_sleep_waits == waits && s_sleep_entry_records == records + 1 &&
+          s_recorded_entry_qpc > 0);
+    s_driver_hold_active = false;
+    CHECK(Hook_Sleep(&device) == -7 && s_sleep_entry_records == records + 1 && s_plan_calls == plans);
+
+    // The sleep status the next Source record carries: the newest result when the Sleep returned.
+    g_sleep_status_newest = CurrentStatusWord(6500, true);
+    g_sleep_status_at_sleep_return = 0;
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(g_sleep_status_at_sleep_return.load() == CurrentStatusWord(6500, true));
+    g_sleep_status_at_sleep_return = 0;
+    g_reflex_sleep_bypass = true;
+    s_paces_source = true;
+    CHECK(Hook_Sleep(&device) == NVAPI_OK);
+    CHECK(g_sleep_status_at_sleep_return.load() == CurrentStatusWord(6500, true));
+
+    g_sleep_status_newest = 0;
+    g_sleep_status_at_sleep_return = 0;
+    g_reflex_sleep_bypass = false;
+    g_user_target_fps = 0;
+    s_paces_source = true;
+    s_orig_sleep = old_sleep;
+    NvAPI_ClearFeedbackDevice();
+}
+
 void RepublishDuringQuery() {
     NvAPI_ClearFeedbackDevice(s_reentrant_expected);
     CHECK(NvAPI_CaptureFeedbackDevice(s_reentrant_device, &s_reentrant_publication));
@@ -507,6 +731,7 @@ void RepublishDuringQuery() {
 // NvAPI_D3D12_SetFlipConfig on every request (nullptr, the driver is not asked)
 // and forwards every other ID with the driver's result.
 static int s_flip_config_log_writes = 0; // Log_Write lines of the SetFlipConfig observer
+static int s_reflex_observe_log_writes = 0; // Log_Write lines that start with "Reflex observe: "
 static int s_query_calls = 0;
 static NvU32 s_query_last = 0;
 static int s_query_target = 0;
@@ -559,10 +784,15 @@ void TestFlipConfigObserver() {
           s_flip_driver_config == &config);
     CHECK(config.flipConfigFeedbackMask == 2 && config.nFramesPerBatch == 4 && config.timePerBatchMs == 12.5f);
     CHECK(s_flip_config_log_writes == logs + 1);
+    // The newest call that enabled metering is kept for the pacing CSV: its QPC and batch time in µs.
+    int64_t flip_qpc = 0;
+    uint32_t flip_us = 0;
+    CHECK(FlipConfig_Read(&flip_qpc, &flip_us) && flip_qpc > 0 && flip_us == 12500);
     // The same configuration with another batch time is not logged again.
     config.timePerBatchMs = 13.25f;
     Hook_SetFlipConfig(queue, 3, &config);
     CHECK(s_flip_config_log_writes == logs + 1);
+    CHECK(FlipConfig_Read(&flip_qpc, &flip_us) && flip_us == 13250);
     // A change of the driver's answer is.
     s_flip_driver_status = NVAPI_OK; s_flip_driver_feedback = 0;
     Hook_SetFlipConfig(queue, 3, &config);
@@ -574,7 +804,269 @@ void TestFlipConfigObserver() {
     }
     CHECK(s_flip_config_log_writes == logs + static_cast<int>(kFlipConfigLogLimit) + 1);
     CHECK(s_flip_driver_calls == 3 + 64);
+    // The newest call that enabled metering: a call that turns it off does not
+    // replace it, a V1 structure has no batch time, a later V2 call does.
+    config.nFramesPerBatch = 4;
+    config.timePerBatchMs = 13.25f;
+    Hook_SetFlipConfig(queue, 3, &config);
+    CHECK(FlipConfig_Read(&flip_qpc, &flip_us) && flip_us == 13250);
+    const int64_t metering_qpc = flip_qpc;
+    config.nFramesPerBatch = 0;
+    Hook_SetFlipConfig(queue, 3, &config);
+    CHECK(FlipConfig_Read(&flip_qpc, &flip_us) && flip_qpc == metering_qpc && flip_us == 13250);
+    NV_FLIP_CONFIG v1 = config;
+    v1.version = sizeof(NV_FLIP_CONFIG) | (1u << 16);
+    v1.nFramesPerBatch = 2;
+    Hook_SetFlipConfig(queue, 3, &v1);
+    CHECK(FlipConfig_Read(&flip_qpc, &flip_us) && flip_qpc >= metering_qpc && flip_us == 0);
+    config.nFramesPerBatch = 4;
+    config.timePerBatchMs = 8.5f;
+    Hook_SetFlipConfig(queue, 3, &config);
+    CHECK(FlipConfig_Read(&flip_qpc, &flip_us) && flip_us == 8500);
     s_orig_set_flip_config = old;
+}
+
+// The Reflex observation hooks forward every argument and return the driver's
+// result unchanged. They log the first SetReflexSync call and each change of its
+// tuple (not each frame's timeInQueueUs), each out-of-band queue call up to a
+// limit, and each change of the sleep status (the game's calls and the
+// developer poll, once per second, through the trampoline).
+static NvAPI_Status s_sync_status = NVAPI_OK;
+static int s_sync_calls = 0;
+static IUnknown* s_sync_device = nullptr;
+static NV_SET_REFLEX_SYNC_PARAMS* s_sync_params = nullptr;
+static NvAPI_Status __cdecl FakeSetReflexSync(IUnknown* device, NV_SET_REFLEX_SYNC_PARAMS* params) {
+    ++s_sync_calls; s_sync_device = device; s_sync_params = params;
+    return s_sync_status;
+}
+static int s_oob_calls = 0;
+static IUnknown* s_oob_queue = nullptr;
+static int s_oob_type = -1;
+static NvAPI_Status __cdecl FakeNotifyOutOfBand(IUnknown* queue, int type) {
+    ++s_oob_calls; s_oob_queue = queue; s_oob_type = type;
+    return -5;
+}
+static int s_hint_calls = 0;
+static IUnknown* s_hint_device = nullptr;
+static NvAPI_Status __cdecl FakeLowLatencyHint(IUnknown* device) {
+    ++s_hint_calls; s_hint_device = device;
+    return -6;
+}
+static int s_status_calls = 0;
+static NV_GET_SLEEP_STATUS_PARAMS s_status_input{};   // what the driver received
+static NV_GET_SLEEP_STATUS_PARAMS s_status_answer{};  // what it answers
+static NvAPI_Status s_status_result = NVAPI_OK;       // and its status
+static NvAPI_Status __cdecl FakeGetSleepStatus(IUnknown*, NV_GET_SLEEP_STATUS_PARAMS* params) {
+    ++s_status_calls;
+    s_status_input = *params;
+    *params = s_status_answer;
+    return s_status_result;
+}
+
+void TestReflexObservation() {
+    const auto old_sync = s_orig_set_reflex_sync;
+    const auto old_oob = s_orig_notify_out_of_band;
+    const auto old_hint = s_orig_low_latency_hint;
+    const auto old_status = s_orig_get_sleep_status;
+    s_orig_set_reflex_sync = FakeSetReflexSync;
+    s_orig_notify_out_of_band = FakeNotifyOutOfBand;
+    s_orig_low_latency_hint = FakeLowLatencyHint;
+    s_orig_get_sleep_status = FakeGetSleepStatus;
+    auto* device = reinterpret_cast<IUnknown*>(&s_query_target);
+
+    // SetReflexSync: arguments and result pass through; the call is logged once.
+    NV_SET_REFLEX_SYNC_PARAMS sync{};
+    sync.version = static_cast<NvU32>(sizeof(sync)) | (1u << 16);
+    sync.bEnable = 1;
+    sync.vblankIntervalUs = 16667;
+    sync.timeInQueueUs = -250;
+    sync.timeInQueueUsTarget = 2000;
+    sync.fgMultiplier = 2;
+    int logs = s_reflex_observe_log_writes;
+    s_sync_status = -104;
+    CHECK(Hook_SetReflexSync(device, &sync) == -104);
+    CHECK(s_sync_calls == 1 && s_sync_device == device && s_sync_params == &sync);
+    CHECK(sync.bEnable == 1 && sync.bDisable == 0 && sync.vblankIntervalUs == 16667 && sync.timeInQueueUs == -250 &&
+          sync.timeInQueueUsTarget == 2000 && sync.fgMultiplier == 2);
+    CHECK(s_reflex_observe_log_writes == logs + 1);
+    // timeInQueueUs changes every frame: no line.
+    for (int i = 0; i < 10; ++i) {
+        sync.timeInQueueUs = 100 * i;
+        CHECK(Hook_SetReflexSync(device, &sync) == -104);
+    }
+    CHECK(s_sync_calls == 11 && s_reflex_observe_log_writes == logs + 1);
+    // A change of the multiplier, of a reserved byte and of the driver's status each are.
+    sync.fgMultiplier = 3;
+    Hook_SetReflexSync(device, &sync);
+    CHECK(s_reflex_observe_log_writes == logs + 2);
+    sync.rsvd[5] = 0xAB;
+    Hook_SetReflexSync(device, &sync);
+    CHECK(s_reflex_observe_log_writes == logs + 3);
+    s_sync_status = NVAPI_OK;
+    Hook_SetReflexSync(device, &sync);
+    CHECK(s_reflex_observe_log_writes == logs + 4);
+    CHECK(Hook_SetReflexSync(device, nullptr) == NVAPI_OK && s_sync_params == nullptr); // forwarded as given
+
+    // NotifyOutOfBandCommandQueue: each call, up to the limit and one line that says so.
+    auto* queue = reinterpret_cast<IUnknown*>(&s_oob_type);
+    logs = s_reflex_observe_log_writes;
+    CHECK(Hook_NotifyOutOfBandCommandQueue(queue, 3) == -5);
+    CHECK(s_oob_calls == 1 && s_oob_queue == queue && s_oob_type == 3);
+    CHECK(s_reflex_observe_log_writes == logs + 1);
+    for (int i = 0; i < 40; ++i) Hook_NotifyOutOfBandCommandQueue(queue, i % 4);
+    CHECK(s_oob_calls == 41 && s_oob_type == 39 % 4);
+    CHECK(s_reflex_observe_log_writes == logs + static_cast<int>(kOutOfBandLogLimit) + 1);
+
+    // SetCreateCommandQueueLowLatencyHint.
+    logs = s_reflex_observe_log_writes;
+    CHECK(Hook_SetCreateCommandQueueLowLatencyHint(device) == -6);
+    CHECK(s_hint_calls == 1 && s_hint_device == device);
+    CHECK(s_reflex_observe_log_writes == logs + 1);
+
+    // GetSleepStatus of the game: the driver's answer reaches the caller; a change
+    // of the flags or of the interval by 5% or more is logged, a smaller one is not.
+    s_status_answer = {};
+    s_status_answer.bLowLatencyMode = 1;
+    s_status_answer.sleepIntervalUs = 8000;
+    s_status_answer.fgMultiplier = 2;
+    NV_GET_SLEEP_STATUS_PARAMS out{};
+    out.version = static_cast<NvU32>(NV_GET_SLEEP_STATUS_PARAMS_VER);
+    logs = s_reflex_observe_log_writes;
+    CHECK(Hook_GetSleepStatus(device, &out) == NVAPI_OK);
+    CHECK(s_status_calls == 1 && s_status_input.version == static_cast<NvU32>(NV_GET_SLEEP_STATUS_PARAMS_VER) &&
+          s_reflex_observe_log_writes == logs + 1);
+    CHECK(out.bLowLatencyMode == 1 && out.sleepIntervalUs == 8000 && out.fgMultiplier == 2);
+    Hook_GetSleepStatus(device, &out);
+    s_status_answer.sleepIntervalUs = 8200;   // 2.5%
+    Hook_GetSleepStatus(device, &out);
+    CHECK(s_reflex_observe_log_writes == logs + 1);
+    s_status_answer.sleepIntervalUs = 9000;   // 12.5%
+    Hook_GetSleepStatus(device, &out);
+    CHECK(s_reflex_observe_log_writes == logs + 2);
+    s_status_answer.fgMultiplier = 3;
+    Hook_GetSleepStatus(device, &out);
+    CHECK(s_reflex_observe_log_writes == logs + 3);
+
+    // The newest successful result of the presenting device is kept for the pacing
+    // CSV (driver_sleep_interval_us, driver_use_game_sleep): another device's
+    // answer and a failed call are not, and a publication change clears it.
+    g_sleep_status_newest = 0;
+    FakeDevice presenting;
+    CHECK(NvAPI_CaptureFeedbackDevice(&presenting));
+    s_status_answer.sleepIntervalUs = 8333;
+    s_status_answer.bUseGameSleep = 1;
+    // Without the status instrumentation (developer_settings, sleep_status_every_frame) the
+    // game's call is not observed at all.
+    const bool saved_developer = g_config.developer_settings;
+    g_config.developer_settings = false;
+    g_sleep_status_every_frame = false;
+    Hook_GetSleepStatus(&presenting, &out);
+    CHECK(g_sleep_status_newest.load() == 0);
+    g_sleep_status_every_frame = true;
+    Hook_GetSleepStatus(&presenting, &out);
+    CHECK(g_sleep_status_newest.load() == CurrentStatusWord(8333, true));
+    g_sleep_status_every_frame = false;
+    g_sleep_status_newest = 0;
+    g_config.developer_settings = true;
+    Hook_GetSleepStatus(device, &out);
+    CHECK(g_sleep_status_newest.load() == 0);
+    Hook_GetSleepStatus(&presenting, &out);
+    CHECK(g_sleep_status_newest.load() == CurrentStatusWord(8333, true));
+    s_status_answer.sleepIntervalUs = 1111;
+    s_status_result = -9;
+    Hook_GetSleepStatus(&presenting, &out);
+    CHECK(g_sleep_status_newest.load() == CurrentStatusWord(8333, true));
+    s_status_result = NVAPI_OK;
+    g_sleep_status_at_sleep_return = CurrentStatusWord(8333, true);
+    NvAPI_ClearFeedbackDevice();
+    CHECK(g_sleep_status_newest.load() == 0 && g_sleep_status_at_sleep_return.load() == 0);
+    // A result whose driver query straddled a publication change carries the old
+    // publication's token: it is not recorded, and a stale word is not carried to the
+    // next Source record.
+    const uint32_t stale_token = g_sleep_status_token.load() + 1;
+    NV_GET_SLEEP_STATUS_PARAMS stale_status{};
+    stale_status.sleepIntervalUs = 4321;
+    RecordSleepStatus(NVAPI_OK, stale_status, stale_token);
+    CHECK(g_sleep_status_newest.load() == 0);
+    RecordSleepStatus(NVAPI_OK, stale_status, g_sleep_status_token.load());
+    CHECK(g_sleep_status_newest.load() == CurrentStatusWord(4321, false));
+    g_sleep_status_newest = SleepStatusWord(4321, false, stale_token);
+    PublishSleepStatusAtSleepReturn(g_sleep_status_token.load());
+    CHECK(g_sleep_status_at_sleep_return.load() == 0);
+    // A Sleep that retained the old publication does not carry the new publication's result.
+    g_sleep_status_newest = CurrentStatusWord(4321, false);
+    PublishSleepStatusAtSleepReturn(stale_token);
+    CHECK(g_sleep_status_at_sleep_return.load() == 0);
+    g_sleep_status_newest = 0;
+    s_status_answer.bUseGameSleep = 0;
+    s_status_answer.sleepIntervalUs = 9000;
+
+    // The poll: off without developer_settings; with it, one driver call per second
+    // with a zeroed structure of the current version, through the trampoline.
+    g_config.developer_settings = saved_developer;
+    const bool old_developer = g_config.developer_settings;
+    g_config.developer_settings = false;
+    s_sleep_status_poll_ms.store(0);
+    const int status_calls = s_status_calls;
+    PollSleepStatus(device, g_sleep_status_token.load());
+    CHECK(s_status_calls == status_calls);
+    g_config.developer_settings = true;
+    logs = s_reflex_observe_log_writes;
+    PollSleepStatus(device, g_sleep_status_token.load());
+    CHECK(s_status_calls == status_calls + 1);
+    CHECK(s_status_input.version == static_cast<NvU32>(NV_GET_SLEEP_STATUS_PARAMS_VER) &&
+          s_status_input.sleepIntervalUs == 0 && s_status_input.fgMultiplier == 0 &&
+          s_status_input.bLowLatencyMode == 0);
+    CHECK(s_reflex_observe_log_writes == logs + 1);
+    PollSleepStatus(device, g_sleep_status_token.load());
+    CHECK(s_status_calls == status_calls + 1);
+    // sleep_status_every_frame: the poll runs at every Sleep, and its result is the newest one.
+    g_sleep_status_every_frame = true;
+    s_status_answer.sleepIntervalUs = 7777;
+    PollSleepStatus(device, g_sleep_status_token.load());
+    PollSleepStatus(device, g_sleep_status_token.load());
+    CHECK(s_status_calls == status_calls + 3);
+    CHECK(g_sleep_status_newest.load() == CurrentStatusWord(7777, false));
+    // A poll whose Sleep retained a publication that is no longer current: the query runs,
+    // the result is dropped (not tagged with the current publication's token).
+    g_sleep_status_newest = 0;
+    PollSleepStatus(device, g_sleep_status_token.load() + 1);
+    CHECK(s_status_calls == status_calls + 4 && g_sleep_status_newest.load() == 0);
+    g_sleep_status_newest = CurrentStatusWord(7777, false);
+    g_sleep_status_every_frame = false;
+    PollSleepStatus(device, g_sleep_status_token.load());
+    CHECK(s_status_calls == status_calls + 4); // once per second again
+    // The snapshot a Sleep leaves for the next Source record.
+    g_sleep_status_at_sleep_return = 0;
+    PublishSleepStatusAtSleepReturn(g_sleep_status_token.load());
+    CHECK(g_sleep_status_at_sleep_return.load() == CurrentStatusWord(7777, false));
+    g_sleep_status_at_sleep_return = 0;
+    g_sleep_status_newest = 0;
+    g_config.developer_settings = old_developer;
+
+    // Thread map: one line after the 600th Sleep and one for each change of a
+    // recorded thread or async queue; Sleeps in one frame and frames without a Sleep are counted.
+    s_reflex_threads.sleep_calls.store(kThreadMapAfterSleeps - 1);
+    ObserveLatencyMarkerThread(SIMULATION_START);
+    const uint64_t doubles = s_reflex_threads.double_sleeps.load();
+    const uint64_t without_sleep = s_reflex_threads.frames_without_sleep.load();
+    logs = s_reflex_observe_log_writes;
+    ObserveReflexSleep();
+    CHECK(s_reflex_observe_log_writes == logs + 1);
+    ObserveReflexSleep();
+    CHECK(s_reflex_observe_log_writes == logs + 1 && s_reflex_threads.double_sleeps.load() == doubles + 1);
+    ObserveAsyncMarkerThread(9, queue);
+    ObserveReflexSleep();
+    CHECK(s_reflex_observe_log_writes == logs + 2);
+    ObserveLatencyMarkerThread(SIMULATION_START); // a Sleep came before it
+    CHECK(s_reflex_threads.frames_without_sleep.load() == without_sleep);
+    ObserveLatencyMarkerThread(SIMULATION_START); // none did
+    CHECK(s_reflex_threads.frames_without_sleep.load() == without_sleep + 1);
+
+    s_orig_set_reflex_sync = old_sync;
+    s_orig_notify_out_of_band = old_oob;
+    s_orig_low_latency_hint = old_hint;
+    s_orig_get_sleep_status = old_status;
 }
 #endif
 
@@ -1402,6 +1894,7 @@ ActiveAPI SwapMgr_GetActiveAPI() { return ActiveAPI::None; } // native calls boo
 void Log_Write(LogLevel, const char* fmt, ...) {
 #ifdef _WIN64
     if (fmt && std::strncmp(fmt, "NvAPI: SetFlipConfig", 20) == 0) ++s_flip_config_log_writes;
+    if (fmt && std::strncmp(fmt, "Reflex observe: ", 16) == 0) ++s_reflex_observe_log_writes;
 #else
     (void)fmt;
 #endif
@@ -1445,15 +1938,35 @@ bool Scheduler_RenderHandoffFrame(uint8_t* domain, uint32_t* producer_epoch, uin
 }
 void Scheduler_RenderHandoffStalled() noexcept { ++s_handoff_stalls; }
 bool Scheduler_PlanReflexSleep(int64_t sleep_entry_qpc, int64_t now_qpc, bool, int64_t handoff_qpc,
-    int64_t*, uint64_t*) noexcept {
+    int64_t* target_qpc, uint64_t* grid_index, bool* precise) noexcept {
+    ++s_plan_calls;
     s_planned_sleep_entry_qpc = sleep_entry_qpc;
     s_planned_now_qpc = now_qpc;
     s_planned_handoff_qpc = handoff_qpc;
-    return false;
+    if (!s_plan_waits) return false;
+    *target_qpc = 12345;
+    *grid_index = 7;
+    *precise = s_plan_precise;
+    return true;
+}
+bool Scheduler_DriverLimiterHoldActive() noexcept { return s_driver_hold_active; }
+void Scheduler_RecordReflexSleepEntry(int64_t sleep_entry_qpc) noexcept {
+    ++s_sleep_entry_records;
+    s_recorded_entry_qpc = sleep_entry_qpc;
 }
 std::atomic<double> g_effective_interval_us{0.0};
 void Scheduler_EndReflexSleep(uint64_t, int64_t) noexcept {}
-bool PreSleepWaitUntil(int64_t) { return false; }
+void Scheduler_EndDriverSleep(int64_t start_qpc, int64_t end_qpc) noexcept {
+    ++s_driver_sleep_calls;
+    s_driver_sleep_start_qpc = start_qpc;
+    s_driver_sleep_end_qpc = end_qpc;
+}
+bool PreSleepWaitUntil(int64_t target_qpc, bool precise) {
+    ++s_pre_sleep_waits;
+    s_pre_sleep_wait_target = target_qpc;
+    s_pre_sleep_wait_precise = precise;
+    return true;
+}
 void PacingTelemetry_PushWait(const PacingWaitRecord&) noexcept {} // async marker hook timing; not asserted here
 void PublishReflexControllerResidence(uint64_t, uint32_t, double residence_us) noexcept {
     ++s_residence_publications;
@@ -1509,9 +2022,12 @@ int main(int argc, char** argv) {
     TestNativeEndpointCancellation();
     TestReflexCallForwarding();
     TestBypassLowLatencyOff();
+    TestDriverLowLatencyOff();
+    TestPreSleepPreciseAndHoldWiring();
 #ifdef _WIN64
     TestFlipMeteringBlock();
     TestFlipConfigObserver();
+    TestReflexObservation();
 #endif
     // No-FG token: native mode transitions clear it; the scheduler-side
     // observation entry point republishes it (not a fixture-only publication).

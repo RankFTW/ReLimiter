@@ -211,8 +211,11 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     lead_request.rung = lead_rung;
     lead_request.fg_divisor = request.fg_divisor;
     lead_request.interval_us = request.interval_us;
-    // A pre-Sleep frame is released by the trim at the marker: marker lead.
-    lead_request.placement = PacingSourcePlacement_WaitsAtMarker(pipeline.placement)
+    // A pre-Sleep frame is released by the trim at the marker: marker lead. A
+    // frame the driver's Reflex limiter releases (driver_limiter_hold) is
+    // released at the marker as well, only without a wait of ReLimiter's own.
+    lead_request.placement = PacingSourcePlacement_WaitsAtMarker(pipeline.placement) ||
+            (request.driver_limiter_hold && pipeline.placement == PacingSourcePlacement::DriverLimiter)
         ? PacingSourcePlacement::Marker
         : pipeline.placement;
     lead_request.mode = pipeline.mode;
@@ -267,7 +270,17 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     const int64_t game_arrival_qpc = entered_sleep ? (std::min)(arrival_qpc, request.sleep_entry_qpc) : arrival_qpc;
     const bool gpu_floor_release = request.gpu_paced_cadence && request.gpu_floor_qpc > game_arrival_qpc &&
         request.gpu_floor_qpc >= request.earliest_release_qpc;
-    const double early_us = gpu_floor_release || request.held_gpu_floor
+    // The driver's Sleep for this index ran (the bypass off). Under the
+    // developer A/B gpu_paced_cadence the grid judges whether it released the
+    // frame (cadence_grid.h, driver-released frame): the Sleep's return, the
+    // game's entry into it and, once E is known, its earliest target. The key
+    // gate is deliberate for the experiment (arm B, key off, against arm BC,
+    // key on, in one session); the cutover that removes it is a later change.
+    const bool driver_sleep_matched = request.driver_sleep_index != 0 &&
+        request.driver_sleep_index == grid_.NextIndex() &&
+        request.driver_sleep_end_qpc > request.driver_sleep_start_qpc;
+    const bool driver_sleep = request.gpu_paced_cadence && driver_sleep_matched && entered_sleep;
+    const double early_us = gpu_floor_release || request.held_gpu_floor || driver_sleep
         ? lead_.EarlyLeadUs(slack_rung, request.fg_divisor, pipeline.lead_quantile, pipeline.allowance_us)
         : 0.0;
     if (early_us > 0.0) {
@@ -276,6 +289,14 @@ SourceStageFrame SourceStage::RunPlannedFrame(
         // when the release floor pulls the wait earlier.
         if (gpu_floor_release) {
             input.earliest_target_qpc = gpu_now_qpc + static_cast<int64_t>(std::llround(
+                frame.early_lead_us * static_cast<double>(request.qpc_frequency) / 1'000'000.0));
+        }
+    }
+    if (driver_sleep) {
+        input.driver_release_qpc = request.driver_sleep_end_qpc;
+        input.game_arrival_qpc = request.sleep_entry_qpc;
+        if (frame.early_lead_us > 0.0) {
+            input.driver_earliest_target_qpc = arrival_qpc + static_cast<int64_t>(std::llround(
                 frame.early_lead_us * static_cast<double>(request.qpc_frequency) / 1'000'000.0));
         }
     }
@@ -314,6 +335,11 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     }
     frame.grid_epoch_reason = snapshot.epoch_reason;
     frame.gpu_target = grid_plan.gpu_target;
+    frame.driver_released = grid_plan.driver_released;
+    if (driver_sleep_matched) {
+        frame.driver_sleep_start_qpc = request.driver_sleep_start_qpc;
+        frame.driver_sleep_end_qpc = request.driver_sleep_end_qpc;
+    }
 
     // Publish before the wait: PRESENT_START and the output executors never
     // wait for the owner.
@@ -343,9 +369,19 @@ SourceStageFrame SourceStage::RunPlannedFrame(
         wait_target == request.earliest_release_qpc;
     if (wait_target - wait_now > max_wait_ticks) {
         wait_target = wait_now + max_wait_ticks;
-        ++statistics_.clamped_waits;
+        if (!request.driver_limiter_hold) ++statistics_.clamped_waits;
     }
-    if (wait_target > wait_now) {
+    // pre_sleep_precise: the pre-wait's committed release stands only under the
+    // cadence it was made in (request.precise_grid_epoch and the regime): a restart
+    // or a regime change leaves the marker wait to the plan's new wake.
+    const bool precise_regime_same = request.precise_grid_epoch != 0 &&
+        plan.grid_epoch == request.precise_grid_epoch && plan.mode == request.precise_mode &&
+        request.precise_interval_us > 0.0 && plan.interval_us > 0.0 &&
+        std::fabs(plan.interval_us - request.precise_interval_us) <= 1.0; // numerical noise only
+    const bool precise_committed = request.precise_release_qpc > 0 && request.pre_wait_index != 0 &&
+        request.pre_wait_index == plan.grid_index && request.pre_wait_end_qpc >= request.precise_release_qpc &&
+        precise_regime_same;
+    if (wait_target > wait_now && !request.driver_limiter_hold && !precise_committed) {
         frame.wait_target_qpc = wait_target;
         frame.wait_start_qpc = wait_now;
         frame.slept = clock->WaitUntil(wait_target);
@@ -396,15 +432,20 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     // or the pre-Sleep wait already brought the frame there). The release
     // floor may still have pulled its wait back to the cap's release
     // (render coupling): its exemption, rhythm and early side stay the GPU's.
-    frame.gpu_paced = gpu_floor_release && grid_plan.source_wake_qpc <= gpu_now_qpc;
-    if (frame.gpu_paced) {
-        ++statistics_.gpu_paced_frames;
+    // A frame the driver's Sleep released (driver_released) is GPU-paced the
+    // same way, with nothing of ReLimiter's own delaying it: no floor pull
+    // and no rhythm.
+    const bool floor_paced = gpu_floor_release && grid_plan.source_wake_qpc <= gpu_now_qpc;
+    frame.gpu_paced = floor_paced || frame.driver_released;
+    if (frame.gpu_paced) ++statistics_.gpu_paced_frames;
+    if (frame.driver_released) ++statistics_.driver_released_frames;
+    if (floor_paced) {
         frame.floor_pull_ticks = (std::max)(gpu_now_qpc - grid_plan.source_wake_qpc, int64_t{0});
         if (frame.floor_pull_ticks > 0) ++statistics_.floor_pulled_frames;
     }
     // The rhythm continues from the GPU's release of a frame it paced and
     // restarts otherwise.
-    if (request.gpu_paced_rhythm != GpuPacedRhythmStep::None && frame.gpu_paced) {
+    if (request.gpu_paced_rhythm != GpuPacedRhythmStep::None && floor_paced) {
         rhythm_key_ = request.key;
         rhythm_release_qpc_ = frame.release_qpc + frame.floor_pull_ticks;
         ++statistics_.gpu_paced_rhythm[static_cast<size_t>(request.gpu_paced_rhythm)];
@@ -438,6 +479,8 @@ void SourceStage::FillSourceRecord(
     record->wake_target_qpc = frame.wait_target_qpc;
     record->source_wait_start_qpc = frame.wait_start_qpc;
     record->pre_sleep_start_qpc = frame.pre_wait_start_qpc;
+    record->driver_sleep_start_qpc = frame.driver_sleep_start_qpc;
+    record->driver_sleep_end_qpc = frame.driver_sleep_end_qpc;
     record->release_qpc = frame.release_qpc;
     record->interval_us = plan.interval_us;
     record->fg_divisor = plan.fg_divisor;

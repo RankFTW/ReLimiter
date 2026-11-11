@@ -55,8 +55,9 @@ enum PacingSourceFlags : uint8_t {
     // had the same meaning.
     PACING_SOURCE_PRE_SLEEP = 1u << 1,
     // The GPU floor released this frame (developer A/B gpu_paced_cadence,
-    // SourceStageFrame::gpu_paced). Reuses the bit of the retired
-    // predictor, which no build after Phase 0 set.
+    // SourceStageFrame::gpu_paced), or the driver's Reflex Sleep did (the
+    // Sleep kept, same key; SourceStageFrame::driver_released). Reuses the
+    // bit of the retired predictor, which no build after Phase 0 set.
     PACING_SOURCE_GPU_PACED = 1u << 2,
     PACING_SOURCE_FIXED_REFRESH = 1u << 3,
     PACING_SOURCE_BACKGROUND = 1u << 4,
@@ -116,6 +117,22 @@ struct PacingSourceRecord {
     // frames. CSV row columns.
     int64_t source_wait_start_qpc = 0;   // source wait [start, release]; 0 = no wait
     int64_t pre_sleep_start_qpc = 0;     // pre-Sleep wait [start, pre_sleep_end_qpc] (the Sleep hook's entry); 0 = none
+    // The driver's Reflex Sleep that belongs to this frame (QPC call start and
+    // return, Hook_Sleep): the Sleep for the frame's grid index ran, the
+    // bypass off. Recorded whenever it matched the plan's index, whether or
+    // not the developer A/B gpu_paced_cadence used it; 0 = none matched.
+    // CSV row columns.
+    int64_t driver_sleep_start_qpc = 0;
+    int64_t driver_sleep_end_qpc = 0;
+    // The driver's sleep status (NvAPI_D3D_GetSleepStatus) as the newest
+    // successful result stood when this frame's Reflex Sleep returned (the
+    // game's own call or ReLimiter's poll, nvapi_hooks.h
+    // g_sleep_status_at_sleep_return); no result, or no Sleep before this
+    // record: driver_sleep_status_valid 0. CSV row columns
+    // driver_sleep_interval_us and driver_use_game_sleep.
+    uint8_t driver_sleep_status_valid = 0;
+    uint8_t driver_use_game_sleep = 0;
+    uint32_t driver_sleep_interval_us = 0;
 };
 
 // Present thread of the selected native swapchain, after the native call returns.
@@ -176,6 +193,13 @@ struct PacingReadyRecord {
     int64_t ready_qpc = 0; // mapped GPU timestamp; 0 when invalid
     uint8_t valid = 0;
     uint8_t before_gate = 0; // 1 when the query was submitted before any ReLimiter hold
+    // Developer key gpu_start_probe: the QPC of the frame's first
+    // ExecuteCommandLists on the presenting queue, read before the call was
+    // forwarded, and the QPC at which the completion of ReLimiter's Signal in
+    // front of that submission was observed (the sampler's wake). 0 = none
+    // (probe off or failed, frame boundary unknown, completion not observed).
+    int64_t gpu_first_submit_qpc = 0;
+    int64_t gpu_start_qpc = 0;
 };
 
 enum class PacingClockMapStatus : uint8_t {

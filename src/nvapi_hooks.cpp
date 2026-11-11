@@ -24,10 +24,12 @@
 #include "runtime_lifecycle.h"
 #include "wake_guard.h"
 #include "logger.h"
+#include "instrumentation_state.h"
 #include <intrin.h>
 #include <array>
 #include <atomic>
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 // ── Trampolines ──
@@ -36,6 +38,10 @@ PFN_NvAPI_D3D_Sleep            s_orig_sleep            = nullptr;
 PFN_NvAPI_D3D_SetLatencyMarker s_orig_set_latency_marker = nullptr;
 // NvAPI_D3D12_SetAsyncFrameMarker: pass-through timing only (Hook_SetAsyncFrameMarker).
 static PFN_NvAPI_D3D12_SetAsyncFrameMarker s_orig_set_async_frame_marker = nullptr;
+// NvAPI_D3D_GetSleepStatus: the trampoline serves the game's own calls
+// (Hook_GetSleepStatus) and the developer poll of the driver's status
+// (PollSleepStatus), which must not count as the game's call.
+static PFN_NvAPI_D3D_GetSleepStatus s_orig_get_sleep_status = nullptr;
 
 // ── Shared state ──
 std::atomic<IUnknown*> g_dev{ nullptr };
@@ -79,6 +85,13 @@ public:
 static void ResetGameSleepParams() noexcept {
     GameParamsGuard lock;
     s_game_original_params = {};
+    // The status snapshots belong to the publication that is going away; the next
+    // publication's token (EndFeedbackDeviceTransition advances the sequence by 2).
+    g_sleep_status_token.store(
+        static_cast<uint32_t>(((s_feedback_device_publication_sequence.load(std::memory_order_relaxed) + 2) >> 1) & kSleepStatusTokenMask),
+        std::memory_order_release);
+    g_sleep_status_newest.store(0, std::memory_order_relaxed);
+    g_sleep_status_at_sleep_return.store(0, std::memory_order_relaxed);
     s_game_params_identity = {};
     s_game_params_captured = false;
     g_game_requested_interval.store(0, std::memory_order_relaxed);
@@ -305,7 +318,12 @@ bool NvAPI_CaptureFeedbackDevice(
     return false; // Bounded retry under publication churn; caller may retry.
 }
 
-NvAPIFeedbackDevice NvAPI_AcquireFeedbackDevice() noexcept {
+// `drain` false is the measurement observer's snapshot (Hook_GetSleepStatus): the
+// same publication protocol, but it never takes the retirement lock, so it cannot
+// wait on a drainer. It only counts as a reader while it loads and references the
+// device; a retired reference it kept a drainer from releasing is reclaimed by the
+// next draining acquisition or retirement (every marker and Sleep hook).
+static NvAPIFeedbackDevice AcquireFeedbackDeviceImpl(bool drain) noexcept {
     for (int attempt = 0; attempt < 3; ++attempt) {
         const uint64_t before =
             s_feedback_device_transition_sequence.load(
@@ -320,7 +338,7 @@ NvAPIFeedbackDevice NvAPI_AcquireFeedbackDevice() noexcept {
             s_feedback_device_acquire_readers.fetch_sub(
                 1,
                 std::memory_order_release);
-            TryDrainRetiredFeedbackDevices();
+            if (drain) TryDrainRetiredFeedbackDevices();
             continue;
         }
         IUnknown* device = g_dev.load(std::memory_order_relaxed);
@@ -336,7 +354,7 @@ NvAPIFeedbackDevice NvAPI_AcquireFeedbackDevice() noexcept {
         s_feedback_device_acquire_readers.fetch_sub(
             1,
             std::memory_order_release);
-        TryDrainRetiredFeedbackDevices();
+        if (drain) TryDrainRetiredFeedbackDevices();
 
         if (device && before == after && (after & 1u) == 0) {
             return { device, producer_epoch, publication_sequence };
@@ -344,6 +362,10 @@ NvAPIFeedbackDevice NvAPI_AcquireFeedbackDevice() noexcept {
         NvAPI_ReleaseFeedbackDevice(device);
     }
     return {};
+}
+
+NvAPIFeedbackDevice NvAPI_AcquireFeedbackDevice() noexcept {
+    return AcquireFeedbackDeviceImpl(true);
 }
 
 bool NvAPI_IsFeedbackDeviceCurrent(
@@ -535,12 +557,14 @@ static bool SafeReadAsyncFrameMarker(
     const NV_ASYNC_FRAME_MARKER_PARAMS* params,
     uint64_t* frame_id,
     uint32_t* marker_type,
-    uint64_t* present_frame_id) noexcept
+    uint64_t* present_frame_id,
+    uint8_t* vendor_internal) noexcept
 {
     __try {
         *frame_id = params->frameID;
         *marker_type = params->markerType;
         *present_frame_id = params->presentFrameID;
+        *vendor_internal = params->vendorInternal;
         return true;
     }
     __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -550,6 +574,272 @@ static bool SafeReadAsyncFrameMarker(
 // RTSS); the first SetAsyncFrameMarker call logs it to show that both use
 // one frame-ID domain.
 static std::atomic<uint64_t> s_newest_app_marker_frame{0};
+
+// ── Reflex observation (diagnostics only) ──
+// What the game and Streamline ask of Reflex and what the driver answers: the
+// observation hooks (below, with Hook_SetFlipConfig), the thread map and the
+// sleep status poll read arguments and results and log them, with line limits.
+// Nothing here changes a parameter, a result, the order or the timing of a
+// forwarded call. Every line starts with "Reflex observe: ".
+
+// File name of the module that contains the return address ("unknown" when
+// none does). Called only when a line is logged; the hook passes its own
+// _ReturnAddress().
+static void CallerModuleName(void* return_address, char* out, size_t size) noexcept {
+    char path[MAX_PATH] = {};
+    HMODULE caller = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            static_cast<LPCSTR>(return_address), &caller) && caller != nullptr &&
+        GetModuleFileNameA(caller, path, MAX_PATH) != 0) {
+        const char* name = std::strrchr(path, '\\');
+        std::snprintf(out, size, "%s", name ? name + 1 : path);
+    } else {
+        std::snprintf(out, size, "unknown");
+    }
+}
+
+// Lower-case hex of the bytes when any of them is non-zero (returns true),
+// else an empty string (returns false). `size` includes the terminator.
+static bool ReservedBytesHex(const uint8_t* bytes, size_t count, char* out, size_t size) noexcept {
+    static constexpr char digits[] = "0123456789abcdef";
+    out[0] = '\0';
+    bool any = false;
+    for (size_t i = 0; i < count; ++i) any = any || bytes[i] != 0;
+    if (!any) return false;
+    size_t pos = 0;
+    for (size_t i = 0; i < count && pos + 2 < size; ++i) {
+        out[pos++] = digits[bytes[i] >> 4];
+        out[pos++] = digits[bytes[i] & 15];
+    }
+    out[pos] = '\0';
+    return true;
+}
+
+// FNV-1a over fixed-width fields: the change signature of a logged tuple.
+static constexpr uint64_t kObserveHashSeed = 14695981039346656037ull;
+static uint64_t ObserveHash(uint64_t hash, const void* data, size_t size) noexcept {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < size; ++i) hash = (hash ^ bytes[i]) * 1099511628211ull;
+    return hash;
+}
+
+// One line counter per log: true while the line is within the limit; the first
+// refusal logs one line that later lines are dropped.
+static bool ReflexObserveBudget(std::atomic<uint32_t>& lines, uint32_t limit, const char* what) noexcept {
+    const uint32_t line = lines.fetch_add(1, std::memory_order_relaxed);
+    if (line < limit) return true;
+    if (line == limit)
+        LOG_INFO("Reflex observe: %s; later lines are not logged (limit %u lines)", what, limit);
+    return false;
+}
+
+static NvAPI_Status SafeInvokeGetSleepStatus(
+    IUnknown* device,
+    NV_GET_SLEEP_STATUS_PARAMS* params) noexcept
+{
+    if (!s_orig_get_sleep_status) return NVAPI_ERROR;
+    __try { return s_orig_get_sleep_status(device, params); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return NVAPI_ERROR; }
+}
+
+// Change detection of the driver's sleep status, for the game's own calls and
+// for ReLimiter's poll (one tracker each). sleepIntervalUs varies: a change of
+// less than 5% of the last logged value is no change.
+struct SleepStatusTracker {
+    std::atomic<uint64_t> signature{UINT64_MAX};
+    std::atomic<uint32_t> interval_us{0};
+    std::atomic<uint32_t> lines{0};
+
+    // True for the first result and whenever the status, a flag, the version,
+    // the multiplier or a reserved byte changes, or the interval by 5% or more.
+    bool Changed(NvAPI_Status status, const NV_GET_SLEEP_STATUS_PARAMS& s) noexcept {
+        uint64_t hash = kObserveHashSeed;
+        hash = ObserveHash(hash, &status, sizeof(status));
+        hash = ObserveHash(hash, &s.version, sizeof(s.version));
+        hash = ObserveHash(hash, &s.bLowLatencyMode, sizeof(s.bLowLatencyMode));
+        hash = ObserveHash(hash, &s.bFsVrr, sizeof(s.bFsVrr));
+        hash = ObserveHash(hash, &s.bCplVsyncOn, sizeof(s.bCplVsyncOn));
+        hash = ObserveHash(hash, &s.bUseGameSleep, sizeof(s.bUseGameSleep));
+        hash = ObserveHash(hash, &s.bFullscreenIFlip, sizeof(s.bFullscreenIFlip));
+        hash = ObserveHash(hash, &s.fgMultiplier, sizeof(s.fgMultiplier));
+        hash = ObserveHash(hash, s.rsvd, sizeof(s.rsvd));
+        const bool fields_changed = signature.exchange(hash, std::memory_order_relaxed) != hash;
+        const uint32_t last = interval_us.load(std::memory_order_relaxed);
+        const uint64_t diff = s.sleepIntervalUs > last ? s.sleepIntervalUs - last : last - s.sleepIntervalUs;
+        const bool interval_changed = diff != 0 && diff * 20u >= last;
+        if (fields_changed || interval_changed) interval_us.store(s.sleepIntervalUs, std::memory_order_relaxed);
+        return fields_changed || interval_changed;
+    }
+};
+
+// `source` is "game call" or "poll"; `module` is the game call's caller.
+static void LogSleepStatus(const char* source, NvAPI_Status status, const NV_GET_SLEEP_STATUS_PARAMS& s,
+    const char* module) noexcept {
+    char hex[2 * sizeof(s.rsvd) + 1];
+    char rsvd_text[sizeof(hex) + 8] = "";
+    if (ReservedBytesHex(s.rsvd, sizeof(s.rsvd), hex, sizeof(hex)))
+        std::snprintf(rsvd_text, sizeof(rsvd_text), " rsvd=%s", hex);
+    char module_text[MAX_PATH + 16] = "";
+    if (module) std::snprintf(module_text, sizeof(module_text), " module=%s", module);
+    LOG_INFO("Reflex observe: GetSleepStatus %s status=%d version=0x%08x low_latency=%u fs_vrr=%u cpl_vsync=%u "
+             "interval=%u us use_game_sleep=%u fullscreen_iflip=%u fg_multiplier=%u%s%s thread=%lu",
+             source, status, s.version, s.bLowLatencyMode ? 1u : 0u, s.bFsVrr ? 1u : 0u,
+             s.bCplVsyncOn ? 1u : 0u, s.sleepIntervalUs, s.bUseGameSleep ? 1u : 0u,
+             s.bFullscreenIFlip ? 1u : 0u, static_cast<unsigned>(s.fgMultiplier), rsvd_text, module_text,
+             static_cast<unsigned long>(GetCurrentThreadId()));
+}
+
+// The driver's own sleep status, read by ReLimiter at most once per second from
+// Hook_Sleep (the presenting device, under developer_settings), through the
+// trampoline: the game's hook never sees it. The only driver call this
+// observation adds. The developer key sleep_status_every_frame reads it at
+// every Sleep instead, so the pacing CSV's driver_sleep_interval_us follows the
+// driver's interval frame by frame.
+static constexpr uint32_t kPolledSleepStatusLogLimit = 64;
+static SleepStatusTracker s_polled_sleep_status;
+static std::atomic<ULONGLONG> s_sleep_status_poll_ms{0};
+
+// The newest successful result of NvAPI_D3D_GetSleepStatus, from the game's
+// call or from the poll (g_sleep_status_newest).
+static void RecordSleepStatus(NvAPI_Status result, const NV_GET_SLEEP_STATUS_PARAMS& status,
+    uint32_t publication_token) noexcept {
+    if (result != NVAPI_OK) return;
+    // A query that straddled a publication change belongs to the old publication.
+    if (publication_token != g_sleep_status_token.load(std::memory_order_acquire)) return;
+    g_sleep_status_newest.store(SleepStatusWord(status.sleepIntervalUs, status.bUseGameSleep != 0, publication_token),
+        std::memory_order_relaxed);
+}
+
+// The token of a feedback-device publication (g_sleep_status_token's value while it is
+// the current one): the publication a retained or acquired identity belongs to.
+static uint32_t PublicationToken(const NvAPIFeedbackDevice& identity) noexcept {
+    return static_cast<uint32_t>((identity.publication_sequence >> 1) & kSleepStatusTokenMask);
+}
+
+// The newest result when the presenting device's Sleep returns: the next
+// source record carries it (g_sleep_status_at_sleep_return). `publication_token` is
+// the token of the publication the Sleep retained at entry
+// (PublicationToken(sleep_device.identity)): the result is carried only when it
+// belongs to that publication and that publication is still the current one.
+static void PublishSleepStatusAtSleepReturn(uint32_t publication_token) noexcept {
+    const uint64_t newest = g_sleep_status_newest.load(std::memory_order_relaxed);
+    const bool current = (newest >> 63) != 0 && SleepStatusToken(newest) == publication_token &&
+        publication_token == g_sleep_status_token.load(std::memory_order_acquire);
+    g_sleep_status_at_sleep_return.store(current ? newest : 0, std::memory_order_relaxed);
+}
+
+static void PollSleepStatus(IUnknown* device, uint32_t publication_token) noexcept {
+    if (!g_config.developer_settings || !s_orig_get_sleep_status) return;
+    if (!g_sleep_status_every_frame.load(std::memory_order_relaxed)) {
+        const ULONGLONG now = GetTickCount64();
+        ULONGLONG next = s_sleep_status_poll_ms.load(std::memory_order_relaxed);
+        if (now < next ||
+            !s_sleep_status_poll_ms.compare_exchange_strong(next, now + 1000, std::memory_order_relaxed))
+            return;
+    }
+    // The token is the retained Sleep device's (passed in), not whatever publication is
+    // current now: RecordSleepStatus drops the result when that lifetime has ended.
+    NV_GET_SLEEP_STATUS_PARAMS status{};
+    status.version = static_cast<NvU32>(NV_GET_SLEEP_STATUS_PARAMS_VER);
+    const NvAPI_Status result = SafeInvokeGetSleepStatus(device, &status);
+    RecordSleepStatus(result, status, publication_token);
+    if (s_polled_sleep_status.Changed(result, status) &&
+        ReflexObserveBudget(s_polled_sleep_status.lines, kPolledSleepStatusLogLimit, "sleep status poll changed again"))
+        LogSleepStatus("poll", result, status, nullptr);
+}
+
+// Thread map: the thread of the newest call of the Reflex Sleep, of each
+// latency marker type and of each async marker type (with its queue), and
+// the Sleeps that did not follow the frame pattern. Relaxed atomics only; the
+// Present is left out (no accessor of the game Present's thread exists).
+static constexpr uint32_t kObserveMarkerTypes = 13;   // NV_LATENCY_MARKER_TYPE 0..12
+static constexpr uint64_t kThreadMapAfterSleeps = 600;
+static constexpr uint32_t kThreadMapLogLimit = 16;
+struct ReflexThreadMap {
+    std::atomic<uint32_t> sleep_thread{0};
+    std::atomic<uint32_t> marker_thread[kObserveMarkerTypes]{};
+    std::atomic<uint32_t> async_thread[kObserveMarkerTypes]{};
+    std::atomic<uint64_t> async_queue[kObserveMarkerTypes]{};
+    std::atomic<uint64_t> sleep_calls{0};
+    // Sleeps since the newest SIMULATION_START: a second one is two Sleeps in one frame.
+    std::atomic<uint64_t> sleeps_since_simulation_start{0};
+    std::atomic<uint64_t> double_sleeps{0};
+    std::atomic<uint64_t> frames_without_sleep{0};
+    std::atomic<uint64_t> logged_signature{0};
+    std::atomic<uint32_t> lines{0};
+};
+static ReflexThreadMap s_reflex_threads;
+
+static uint64_t ThreadMapSignature() noexcept {
+    uint64_t hash = kObserveHashSeed;
+    const uint32_t sleep_thread = s_reflex_threads.sleep_thread.load(std::memory_order_relaxed);
+    hash = ObserveHash(hash, &sleep_thread, sizeof(sleep_thread));
+    for (uint32_t type = 0; type < kObserveMarkerTypes; ++type) {
+        const uint32_t marker = s_reflex_threads.marker_thread[type].load(std::memory_order_relaxed);
+        const uint32_t async = s_reflex_threads.async_thread[type].load(std::memory_order_relaxed);
+        const uint64_t queue = s_reflex_threads.async_queue[type].load(std::memory_order_relaxed);
+        hash = ObserveHash(hash, &marker, sizeof(marker));
+        hash = ObserveHash(hash, &async, sizeof(async));
+        hash = ObserveHash(hash, &queue, sizeof(queue));
+    }
+    return hash;
+}
+
+static void LogThreadMap() noexcept {
+    char markers[224] = "";
+    char async[544] = "";
+    size_t markers_length = 0, async_length = 0;
+    for (uint32_t type = 0; type < kObserveMarkerTypes; ++type) {
+        const uint32_t marker = s_reflex_threads.marker_thread[type].load(std::memory_order_relaxed);
+        if (marker != 0)
+            markers_length += std::snprintf(markers + markers_length, sizeof(markers) - markers_length,
+                "%s%u:%u", markers_length ? "," : "", type, marker);
+        const uint32_t async_thread = s_reflex_threads.async_thread[type].load(std::memory_order_relaxed);
+        if (async_thread != 0)
+            async_length += std::snprintf(async + async_length, sizeof(async) - async_length,
+                "%s%u:%u@0x%llx", async_length ? "," : "", type, async_thread,
+                static_cast<unsigned long long>(s_reflex_threads.async_queue[type].load(std::memory_order_relaxed)));
+    }
+    LOG_INFO("Reflex observe: threads sleep=%u markers={%s} async={%s} double_sleeps=%llu "
+             "frames_without_sleep=%llu sleep_calls=%llu",
+             s_reflex_threads.sleep_thread.load(std::memory_order_relaxed), markers, async,
+             static_cast<unsigned long long>(s_reflex_threads.double_sleeps.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(s_reflex_threads.frames_without_sleep.load(std::memory_order_relaxed)),
+             static_cast<unsigned long long>(s_reflex_threads.sleep_calls.load(std::memory_order_relaxed)));
+}
+
+// A Sleep on the presenting device (Hook_Sleep). One line after the first 600
+// Sleeps and again whenever a recorded thread or async queue changes.
+static void ObserveReflexSleep() noexcept {
+    s_reflex_threads.sleep_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    if (s_reflex_threads.sleeps_since_simulation_start.fetch_add(1, std::memory_order_relaxed) != 0)
+        s_reflex_threads.double_sleeps.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t calls = s_reflex_threads.sleep_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (calls < kThreadMapAfterSleeps) return;
+    const uint64_t signature = ThreadMapSignature();
+    const bool first = calls == kThreadMapAfterSleeps;
+    if (!first && s_reflex_threads.logged_signature.load(std::memory_order_relaxed) == signature) return;
+    if (s_reflex_threads.logged_signature.exchange(signature, std::memory_order_relaxed) == signature && !first)
+        return; // another thread logged it first
+    if (ReflexObserveBudget(s_reflex_threads.lines, kThreadMapLogLimit, "thread map changed again"))
+        LogThreadMap();
+}
+
+// A latency marker of the game on the presenting device (Hook_SetLatencyMarker).
+static void ObserveLatencyMarkerThread(uint32_t type) noexcept {
+    if (type >= kObserveMarkerTypes) return;
+    s_reflex_threads.marker_thread[type].store(GetCurrentThreadId(), std::memory_order_relaxed);
+    // A SIMULATION_START with no Sleep since the previous one: a frame without a Sleep.
+    if (type == SIMULATION_START &&
+        s_reflex_threads.sleeps_since_simulation_start.exchange(0, std::memory_order_relaxed) == 0)
+        s_reflex_threads.frames_without_sleep.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void ObserveAsyncMarkerThread(uint32_t type, IUnknown* queue) noexcept {
+    if (type >= kObserveMarkerTypes) return;
+    s_reflex_threads.async_thread[type].store(GetCurrentThreadId(), std::memory_order_relaxed);
+    s_reflex_threads.async_queue[type].store(reinterpret_cast<uint64_t>(queue), std::memory_order_relaxed);
+}
 
 // RenderSubmitEnd(N) and SimulationStart(N+1) can be emitted concurrently.
 // Tail diagnostics must not take the single scheduler owner and make the
@@ -647,23 +937,29 @@ static DriverLimiterApply ApplyCapturedSleepMode(
     return result;
 }
 
-// Moves the driver's low latency mode with the Reflex Sleep bypass
-// (bypass_low_latency_off): off while bypassed, the game's own after. Called
-// from Hook_Sleep on the presenting device. The state changes only after a
-// successful driver call; a thread that loses the try-lock, a missing game
-// parameter set and a failed call all retry on a later Sleep. A state that
-// already matches costs a few atomic loads.
+// Moves the driver's low latency mode with the Reflex Sleep: off while it is
+// bypassed with bypass_low_latency_off, off while it is forwarded with
+// driver_low_latency_off, the game's own otherwise. Called from Hook_Sleep on
+// the presenting device. The state changes only after a successful driver
+// call; a thread that loses the try-lock, a missing game parameter set and a
+// failed call all retry on a later Sleep (so a key switched at run time
+// re-applies the mode at the next Sleep). A state that already matches costs a
+// few atomic loads. The call carries the Reflex driver limiter's interval while
+// it is applied: the limiter must survive the change.
 static void UpdateLowLatencyOverride(bool bypass) noexcept {
-    const bool want = bypass && g_bypass_low_latency_off.load(std::memory_order_relaxed);
+    const bool want = bypass ? g_bypass_low_latency_off.load(std::memory_order_relaxed)
+                             : g_driver_low_latency_off.load(std::memory_order_relaxed);
     if (want == s_low_latency_forced_off.load(std::memory_order_acquire)) return;
     if (!TryAcquireSRWLockExclusive(&s_sleep_mode_forward_lock)) return;
     if (want != s_low_latency_forced_off.load(std::memory_order_acquire)) {
         NV_SET_SLEEP_MODE_PARAMS game{};
-        if (ApplyCapturedSleepMode(nullptr, want, &game) == DriverLimiterApply::Applied) {
+        uint32_t limiter_us = g_driver_limiter_interval_us.load(std::memory_order_relaxed);
+        if (ApplyCapturedSleepMode(limiter_us != 0 ? &limiter_us : nullptr, want, &game) ==
+            DriverLimiterApply::Applied) {
             s_low_latency_forced_off.store(want, std::memory_order_release);
             if (want)
-                LOG_INFO("NvAPI: driver low latency mode off while the Reflex Sleep is bypassed "
-                         "(game requested low_latency=%u boost=%u)",
+                LOG_INFO("NvAPI: driver low latency mode off while the Reflex Sleep is %s "
+                         "(game requested low_latency=%u boost=%u)", bypass ? "bypassed" : "forwarded",
                     game.bLowLatencyMode ? 1u : 0u, game.bLowLatencyBoost ? 1u : 0u);
             else
                 LOG_INFO("NvAPI: driver low latency mode back to the game's (low_latency=%u boost=%u)",
@@ -675,6 +971,7 @@ static void UpdateLowLatencyOverride(bool bypass) noexcept {
 
 // ── Hook: SetSleepMode — capture game params, forward them (limiter interval and low latency override on a copy) ──
 static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_PARAMS* params) {
+    void* const caller_address = _ReturnAddress();
     RuntimeCallbackGuard callback;
     if (callback.IsStopping())
         return SafeInvokeSetSleepMode(pDev, params);
@@ -698,14 +995,29 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
     // backlog. Logged on change only (some games call this every frame).
     if (params_valid) {
         static std::atomic<uint64_t> s_logged_sleep_mode{ UINT64_MAX };
+        static std::atomic<uint64_t> s_logged_sleep_mode_extra{ UINT64_MAX };
         const uint64_t word = (static_cast<uint64_t>(params_snapshot.minimumIntervalUs) << 8) |
             (params_snapshot.bLowLatencyMode ? 1u : 0u) |
             (params_snapshot.bLowLatencyBoost ? 2u : 0u) |
-            (params_snapshot.bUseMarkersToOptimize ? 4u : 0u);
-        if (s_logged_sleep_mode.exchange(word, std::memory_order_relaxed) != word) {
-            LOG_INFO("NvAPI: game SetSleepMode low_latency=%u boost=%u markers_optimize=%u interval=%u us",
+            (params_snapshot.bUseMarkersToOptimize ? 4u : 0u) |
+            (params_snapshot.bUseMinQueueTime ? 8u : 0u);
+        uint64_t extra = ObserveHash(kObserveHashSeed, &params_snapshot.version, sizeof(params_snapshot.version));
+        extra = ObserveHash(extra, params_snapshot.rsvd, sizeof(params_snapshot.rsvd));
+        const bool word_changed = s_logged_sleep_mode.exchange(word, std::memory_order_relaxed) != word;
+        const bool extra_changed = s_logged_sleep_mode_extra.exchange(extra, std::memory_order_relaxed) != extra;
+        if (word_changed || extra_changed) {
+            char module[MAX_PATH];
+            CallerModuleName(caller_address, module, sizeof(module));
+            char hex[2 * sizeof(params_snapshot.rsvd) + 1];
+            char rsvd_text[sizeof(hex) + 8] = "";
+            if (ReservedBytesHex(params_snapshot.rsvd, sizeof(params_snapshot.rsvd), hex, sizeof(hex)))
+                std::snprintf(rsvd_text, sizeof(rsvd_text), " rsvd=%s", hex);
+            LOG_INFO("NvAPI: game SetSleepMode low_latency=%u boost=%u markers_optimize=%u interval=%u us "
+                     "min_queue_time=%u version=0x%08x%s module=%s thread=%lu",
                 params_snapshot.bLowLatencyMode ? 1u : 0u, params_snapshot.bLowLatencyBoost ? 1u : 0u,
-                params_snapshot.bUseMarkersToOptimize ? 1u : 0u, params_snapshot.minimumIntervalUs);
+                params_snapshot.bUseMarkersToOptimize ? 1u : 0u, params_snapshot.minimumIntervalUs,
+                params_snapshot.bUseMinQueueTime ? 1u : 0u, params_snapshot.version, rsvd_text, module,
+                static_cast<unsigned long>(GetCurrentThreadId()));
         }
     }
 
@@ -744,15 +1056,21 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
     // would clear it: forward a copy with ReLimiter's interval instead. The
     // game's parameters above stay captured for the restore.
     const uint32_t limiter_us = g_driver_limiter_interval_us.load(std::memory_order_relaxed);
+    const bool low_latency_off = s_low_latency_forced_off.load(std::memory_order_acquire);
     if (limiter_us != 0 && params_valid && params_device.identity.device) {
         NV_SET_SLEEP_MODE_PARAMS limited = params_snapshot;
         limited.minimumIntervalUs = limiter_us;
+        // driver_low_latency_off: the limiter's copy carries the override too.
+        if (low_latency_off) {
+            limited.bLowLatencyMode = 0;
+            limited.bLowLatencyBoost = 0;
+        }
         result = SafeInvokeSetSleepMode(pDev, &limited);
-    } else if (params_valid && params_device.identity.device &&
-               s_low_latency_forced_off.load(std::memory_order_acquire)) {
-        // The low latency override (bypass_low_latency_off) is applied to the
-        // driver: the game's own call, which may carry low latency on every
-        // frame, must not undo it. The captured game parameters stay the game's.
+    } else if (params_valid && params_device.identity.device && low_latency_off) {
+        // The low latency override (bypass_low_latency_off or
+        // driver_low_latency_off) is applied to the driver: the game's own
+        // call, which may carry low latency on every frame, must not undo it.
+        // The captured game parameters stay the game's.
         NV_SET_SLEEP_MODE_PARAMS forced = params_snapshot;
         forced.bLowLatencyMode = 0;
         forced.bLowLatencyBoost = 0;
@@ -773,6 +1091,7 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
     RuntimeCallbackGuard callback;
     if (callback.IsStopping()) return SafeInvokeSleep(pDev);
     const FeedbackDeviceGuard sleep_device(pDev);
+    const uint32_t sleep_token = PublicationToken(sleep_device.identity);
     if (!sleep_device.identity.device) return SafeInvokeSleep(pDev);
 
     // Smooth Motion: bypass Reflex Sleep entirely — SM controls presentation
@@ -790,7 +1109,9 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
         // Sleep. The owner is held only to plan and to record the wait end,
         // not during the waits. A busy owner skips the wait; the
         // SIMULATION_START trim still paces the frame.
-        if (IsPresentingFeedbackDevice(pDev)) {
+        const bool presenting_at_entry = IsPresentingFeedbackDevice(pDev);
+        if (presenting_at_entry) {
+            ObserveReflexSleep();
             // bypass_low_latency_off: the driver's low latency mode follows
             // the bypass, before the pre-Sleep wait.
             UpdateLowLatencyOverride(bypass);
@@ -819,23 +1140,36 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
                 }
                 int64_t pre_sleep_target = 0;
                 uint64_t pre_sleep_index = 0;
+                bool pre_sleep_precise = false;
                 bool planned = false;
                 {
                     SchedulerOwnerGuard scheduler_owner;
                     planned = scheduler_owner && Scheduler_PlanReflexSleep(sleep_entry.QuadPart, plan_qpc,
-                        !bypass, handoff_qpc, &pre_sleep_target, &pre_sleep_index);
+                        !bypass, handoff_qpc, &pre_sleep_target, &pre_sleep_index, &pre_sleep_precise);
                 }
                 if (planned) {
-                    PreSleepWaitUntil(pre_sleep_target);
+                    // pre_sleep_precise: the wait ends at the target with the
+                    // hardware spin, inside this call, before the driver's Sleep.
+                    PreSleepWaitUntil(pre_sleep_target, pre_sleep_precise);
                     LARGE_INTEGER wait_end{};
                     QueryPerformanceCounter(&wait_end);
                     SchedulerOwnerGuard scheduler_owner;
                     if (scheduler_owner) Scheduler_EndReflexSleep(pre_sleep_index, wait_end.QuadPart);
                 }
+            } else if (Scheduler_DriverLimiterHoldActive()) {
+                // driver_limiter_hold: no wait of ReLimiter's own, the driver's
+                // Sleep releases the frame. Only the entry is recorded, the
+                // moment the game reached ReLimiter for the next grid index.
+                SchedulerOwnerGuard scheduler_owner;
+                if (scheduler_owner) Scheduler_RecordReflexSleepEntry(sleep_entry.QuadPart);
             }
         }
         if (bypass) {
             g_pacer_latency_us.store(0.0,std::memory_order_relaxed);
+            if (presenting_at_entry) {
+                PollSleepStatus(pDev, sleep_token);
+                PublishSleepStatusAtSleepReturn(sleep_token);
+            }
             return NVAPI_OK;
         }
         LARGE_INTEGER t0, t1;
@@ -846,11 +1180,24 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
             !IsPresentingFeedbackDevice(pDev)) {
             return result;
         }
+        // The driver's Sleep for the next grid index: its start and return go
+        // to the scheduler, which records them for the frame and, under the
+        // developer A/B gpu_paced_cadence, judges whether the driver released
+        // it (cadence_grid.h). A busy owner skips it, like the pre-wait's end.
+        // The call itself is unchanged.
+        if (presenting_at_entry) {
+            SchedulerOwnerGuard scheduler_owner;
+            if (scheduler_owner) Scheduler_EndDriverSleep(t0.QuadPart, t1.QuadPart);
+        }
         double dur_us = qpc_to_us(t1.QuadPart - t0.QuadPart);
         if (dur_us > 0.0 && dur_us < 100000.0) {
             double prev = g_pacer_latency_us.load(std::memory_order_relaxed);
             double smoothed = (prev > 0.0) ? prev + 0.16 * (dur_us - prev) : dur_us;
             g_pacer_latency_us.store(smoothed, std::memory_order_relaxed);
+        }
+        if (presenting_at_entry) {
+            PollSleepStatus(pDev, sleep_token);
+            PublishSleepStatusAtSleepReturn(sleep_token);
         }
         return result;
     }
@@ -919,6 +1266,7 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
         return result;
     };
     if (!forward_after_wait) forward();
+    if (!from_rtss) ObserveLatencyMarkerThread(static_cast<uint32_t>(marker_params.markerType));
     // Never relabel a marker from A with B's epoch after the driver returns.
     // Failed admission still forwards exactly once with the original pointer.
     if (!marker_device.identity.device) return forward(); // Guard logged the cause.
@@ -1209,10 +1557,13 @@ static NvAPI_Status __cdecl Hook_SetAsyncFrameMarker(IUnknown* queue, NV_ASYNC_F
     if (!s_orig_set_async_frame_marker) return NVAPI_OK;
     if (callback.IsStopping() || !params) return SafeInvokeAsyncFrameMarker(queue, params);
 
+    void* const caller_address = _ReturnAddress();
     uint64_t frame_id = 0;
     uint64_t present_frame_id = 0;
     uint32_t marker_type = 0;
-    const bool known = SafeReadAsyncFrameMarker(params, &frame_id, &marker_type, &present_frame_id);
+    uint8_t vendor_internal = 0;
+    const bool known = SafeReadAsyncFrameMarker(params, &frame_id, &marker_type, &present_frame_id,
+        &vendor_internal);
     LARGE_INTEGER call_entry{};
     QueryPerformanceCounter(&call_entry);
     const NvAPI_Status result = SafeInvokeAsyncFrameMarker(queue, params);
@@ -1220,13 +1571,21 @@ static NvAPI_Status __cdecl Hook_SetAsyncFrameMarker(IUnknown* queue, NV_ASYNC_F
     QueryPerformanceCounter(&call_exit);
     if (!known) return result;
 
-    static std::atomic<bool> s_first_call{ true };
-    if (s_first_call.exchange(false, std::memory_order_relaxed)) {
+    ObserveAsyncMarkerThread(marker_type, queue);
+    // The first call of each marker type (types above 31 are not logged).
+    static std::atomic<uint32_t> s_first_call_types{ 0 };
+    const uint32_t type_bit = marker_type < 32 ? 1u << marker_type : 0u;
+    if (type_bit != 0 && (s_first_call_types.load(std::memory_order_relaxed) & type_bit) == 0 &&
+        (s_first_call_types.fetch_or(type_bit, std::memory_order_relaxed) & type_bit) == 0) {
+        char module[MAX_PATH];
+        CallerModuleName(caller_address, module, sizeof(module));
         LOG_INFO("NvAPI: first SetAsyncFrameMarker call - type=%u, frameID=%llu, presentFrameID=%llu, "
-                 "newest app NvAPI marker frameID=%llu, thread=%u, %.1f us",
+                 "newest app NvAPI marker frameID=%llu, thread=%u, %.1f us, vendorInternal=%u, queue=%p, "
+                 "module=%s",
                  marker_type, frame_id, present_frame_id,
                  s_newest_app_marker_frame.load(std::memory_order_relaxed), GetCurrentThreadId(),
-                 qpc_to_us(call_exit.QuadPart - call_entry.QuadPart));
+                 qpc_to_us(call_exit.QuadPart - call_entry.QuadPart), vendor_internal ? 1u : 0u,
+                 static_cast<void*>(queue), module);
     }
     PacingWaitRecord record{};
     record.key = PacingFrameKey{PacingIdentityDomain::NvApiFrame,
@@ -1282,12 +1641,24 @@ static const char* FlipConfigFeedbackText(NvU32 mask) noexcept {
 
 static NvAPI_Status __cdecl Hook_SetFlipConfig(IUnknown* queue, UINT source, NV_FLIP_CONFIG* config) {
     RuntimeCallbackGuard callback;
+    // The call's time for the pacing CSV (flip_config_qpc), read before the
+    // driver sees it; nothing of the call changes.
+    LARGE_INTEGER call_qpc{};
+    QueryPerformanceCounter(&call_qpc);
     const NvAPI_Status result = SafeInvokeSetFlipConfig(queue, source, config);
     const uint64_t call = s_flip_config_calls.fetch_add(1, std::memory_order_relaxed) + 1;
     NV_FLIP_CONFIG seen{};
     if (callback.IsStopping() || !config || !SafeReadFlipConfig(config, &seen)) return result;
     const NvU32 struct_version = seen.version >> 16;
     const bool v2 = struct_version >= 2;
+    // The newest call that enabled metering, with its batch time in µs (0 when
+    // the structure has none or it is not positive).
+    if (seen.nFramesPerBatch > 0) {
+        const double batch_us = v2 && seen.timePerBatchMs > 0.0f
+            ? static_cast<double>(seen.timePerBatchMs) * 1000.0 : 0.0;
+        FlipConfig_Record(call_qpc.QuadPart, batch_us >= 4294967295.0 ? UINT32_MAX
+            : static_cast<uint32_t>(batch_us + 0.5));
+    }
     const NvU32 presented = v2 ? seen.nPresentedFramesPerBatch : 0;
     const uint64_t signature = (static_cast<uint64_t>(static_cast<uint32_t>(result)) << 32) |
         (static_cast<uint64_t>(seen.nFramesPerBatch & 0xFFu) << 24) |
@@ -1307,6 +1678,252 @@ static NvAPI_Status __cdecl Hook_SetFlipConfig(IUnknown* queue, UINT source, NV_
         LOG_INFO("NvAPI: SetFlipConfig configuration changed again; later changes are not logged (limit %u lines)",
                  kFlipConfigLogLimit);
     }
+    return result;
+}
+
+// ── Reflex observation hooks (pass-through; see "Reflex observation" above) ──
+// NvAPI_D3D_SetReflexSync, NvAPI_D3D12_NotifyOutOfBandCommandQueue,
+// NvAPI_D3D_GetSleepStatus (the game's own calls) and
+// NvAPI_D3D12_SetCreateCommandQueueLowLatencyHint. Each forwards the original
+// arguments to the driver and returns its result unchanged; arguments are
+// copied (SEH-guarded) only to be logged.
+static constexpr NvU32 kNvApiIdSetReflexSync = 0xB9F6FAFF;
+static constexpr NvU32 kNvApiIdNotifyOutOfBandCommandQueue = 0x03D6E8CB;
+static constexpr NvU32 kNvApiIdGetSleepStatus = 0xAEF96CA1;
+static constexpr NvU32 kNvApiIdSetCreateCommandQueueLowLatencyHint = 0x548C224F;
+static constexpr uint32_t kReflexSyncLogLimit = 32;
+static constexpr uint32_t kOutOfBandLogLimit = 32;
+static constexpr uint32_t kGameSleepStatusLogLimit = 16;
+static constexpr uint32_t kLowLatencyHintLogLimit = 8;
+static constexpr ULONGLONG kReflexSyncSummaryMs = 5000;
+
+static PFN_NvAPI_D3D_SetReflexSync s_orig_set_reflex_sync = nullptr;
+static PFN_NvAPI_D3D12_NotifyOutOfBandCommandQueue s_orig_notify_out_of_band = nullptr;
+static PFN_NvAPI_D3D12_SetCreateCommandQueueLowLatencyHint s_orig_low_latency_hint = nullptr;
+
+static NvAPI_Status SafeInvokeSetReflexSync(IUnknown* device, NV_SET_REFLEX_SYNC_PARAMS* params) noexcept {
+    if (!s_orig_set_reflex_sync) return NVAPI_ERROR;
+    __try { return s_orig_set_reflex_sync(device, params); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return NVAPI_ERROR; }
+}
+
+static bool SafeCopySleepStatus(
+    const NV_GET_SLEEP_STATUS_PARAMS* source,
+    NV_GET_SLEEP_STATUS_PARAMS* destination) noexcept
+{
+    if (!source || !destination) return false;
+    __try {
+        *destination = *source;
+        return true;
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static bool SafeCopyReflexSyncParams(const NV_SET_REFLEX_SYNC_PARAMS* source,
+    NV_SET_REFLEX_SYNC_PARAMS* destination) noexcept {
+    __try { *destination = *source; return true; }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static NvAPI_Status SafeInvokeNotifyOutOfBand(IUnknown* queue, int type) noexcept {
+    if (!s_orig_notify_out_of_band) return NVAPI_ERROR;
+    __try { return s_orig_notify_out_of_band(queue, type); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return NVAPI_ERROR; }
+}
+
+static NvAPI_Status SafeInvokeLowLatencyHint(IUnknown* device) noexcept {
+    if (!s_orig_low_latency_hint) return NVAPI_ERROR;
+    __try { return s_orig_low_latency_hint(device); }
+    __except(EXCEPTION_EXECUTE_HANDLER) { return NVAPI_ERROR; }
+}
+
+// SetReflexSync: a line for the first call and each change of the tuple
+// (timeInQueueUs is left out of it: it changes every frame); timeInQueueUs is
+// summarized instead, at most every kReflexSyncSummaryMs while calls arrive.
+static std::atomic<uint64_t> s_reflex_sync_signature{UINT64_MAX};
+static std::atomic<uint64_t> s_reflex_sync_calls{0};
+static std::atomic<uint32_t> s_reflex_sync_lines{0};
+struct ReflexSyncWindow {
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint64_t> enables{0};
+    std::atomic<uint64_t> disables{0};
+    std::atomic<uint64_t> queue_samples{0};     // calls with bEnable
+    std::atomic<int64_t> queue_sum{0};
+    std::atomic<int32_t> queue_min{INT32_MAX};
+    std::atomic<int32_t> queue_max{INT32_MIN};
+    std::atomic<NvU32> target_us{0};            // newest values
+    std::atomic<NvU32> vblank_us{0};
+    std::atomic<NvU32> fg_multiplier{0};
+    std::atomic<ULONGLONG> next_summary_ms{0};
+};
+static ReflexSyncWindow s_reflex_sync_window;
+
+static void RecordReflexSyncCall(const NV_SET_REFLEX_SYNC_PARAMS& seen) noexcept {
+    ReflexSyncWindow& window = s_reflex_sync_window;
+    window.calls.fetch_add(1, std::memory_order_relaxed);
+    if (seen.bDisable) window.disables.fetch_add(1, std::memory_order_relaxed);
+    if (seen.bEnable) {
+        window.enables.fetch_add(1, std::memory_order_relaxed);
+        const int32_t queue_us = seen.timeInQueueUs;
+        window.queue_samples.fetch_add(1, std::memory_order_relaxed);
+        window.queue_sum.fetch_add(queue_us, std::memory_order_relaxed);
+        int32_t low = window.queue_min.load(std::memory_order_relaxed);
+        while (queue_us < low && !window.queue_min.compare_exchange_weak(low, queue_us, std::memory_order_relaxed)) {}
+        int32_t high = window.queue_max.load(std::memory_order_relaxed);
+        while (queue_us > high && !window.queue_max.compare_exchange_weak(high, queue_us, std::memory_order_relaxed)) {}
+    }
+    window.target_us.store(seen.timeInQueueUsTarget, std::memory_order_relaxed);
+    window.vblank_us.store(seen.vblankIntervalUs, std::memory_order_relaxed);
+    window.fg_multiplier.store(seen.fgMultiplier, std::memory_order_relaxed);
+    // The first call starts the first window.
+    const ULONGLONG now = GetTickCount64();
+    ULONGLONG next = window.next_summary_ms.load(std::memory_order_relaxed);
+    if (next == 0) {
+        window.next_summary_ms.compare_exchange_strong(next, now + kReflexSyncSummaryMs, std::memory_order_relaxed);
+        return;
+    }
+    if (now < next ||
+        !window.next_summary_ms.compare_exchange_strong(next, now + kReflexSyncSummaryMs, std::memory_order_relaxed))
+        return;
+    const uint64_t calls = window.calls.exchange(0, std::memory_order_relaxed);
+    const uint64_t enables = window.enables.exchange(0, std::memory_order_relaxed);
+    const uint64_t disables = window.disables.exchange(0, std::memory_order_relaxed);
+    const uint64_t samples = window.queue_samples.exchange(0, std::memory_order_relaxed);
+    const int64_t sum = window.queue_sum.exchange(0, std::memory_order_relaxed);
+    const int32_t low_us = window.queue_min.exchange(INT32_MAX, std::memory_order_relaxed);
+    const int32_t high_us = window.queue_max.exchange(INT32_MIN, std::memory_order_relaxed);
+    if (calls == 0) return;
+    if (samples != 0) {
+        LOG_INFO("Reflex observe: SetReflexSync summary calls=%llu enable=%llu disable=%llu "
+                 "time_in_queue_us min=%d mean=%.1f max=%d (n=%llu) target=%u us vblank_interval=%u us "
+                 "fg_multiplier=%u",
+                 static_cast<unsigned long long>(calls), static_cast<unsigned long long>(enables),
+                 static_cast<unsigned long long>(disables), low_us,
+                 static_cast<double>(sum) / static_cast<double>(samples), high_us,
+                 static_cast<unsigned long long>(samples), window.target_us.load(std::memory_order_relaxed),
+                 window.vblank_us.load(std::memory_order_relaxed),
+                 static_cast<unsigned>(window.fg_multiplier.load(std::memory_order_relaxed)));
+    } else {
+        LOG_INFO("Reflex observe: SetReflexSync summary calls=%llu enable=%llu disable=%llu "
+                 "time_in_queue_us none (no enable call) target=%u us vblank_interval=%u us fg_multiplier=%u",
+                 static_cast<unsigned long long>(calls), static_cast<unsigned long long>(enables),
+                 static_cast<unsigned long long>(disables), window.target_us.load(std::memory_order_relaxed),
+                 window.vblank_us.load(std::memory_order_relaxed),
+                 static_cast<unsigned>(window.fg_multiplier.load(std::memory_order_relaxed)));
+    }
+}
+
+static NvAPI_Status __cdecl Hook_SetReflexSync(IUnknown* device, NV_SET_REFLEX_SYNC_PARAMS* params) {
+    void* const caller_address = _ReturnAddress();
+    RuntimeCallbackGuard callback;
+    NV_SET_REFLEX_SYNC_PARAMS seen{};
+    // The inputs as the game gave them, copied before the driver sees them.
+    const bool read = !callback.IsStopping() && params && SafeCopyReflexSyncParams(params, &seen);
+    const NvAPI_Status result = SafeInvokeSetReflexSync(device, params);
+    if (!read) return result;
+    const uint64_t call = s_reflex_sync_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    RecordReflexSyncCall(seen);
+    const uint32_t flags = (seen.bEnable ? 1u : 0u) | (seen.bDisable ? 2u : 0u) | (seen.flagsRsvd << 2);
+    uint64_t signature = kObserveHashSeed;
+    signature = ObserveHash(signature, &result, sizeof(result));
+    signature = ObserveHash(signature, &seen.version, sizeof(seen.version));
+    signature = ObserveHash(signature, &flags, sizeof(flags));
+    signature = ObserveHash(signature, &seen.vblankIntervalUs, sizeof(seen.vblankIntervalUs));
+    signature = ObserveHash(signature, &seen.timeInQueueUsTarget, sizeof(seen.timeInQueueUsTarget));
+    signature = ObserveHash(signature, &seen.fgMultiplier, sizeof(seen.fgMultiplier));
+    signature = ObserveHash(signature, seen.rsvd, sizeof(seen.rsvd));
+    if (s_reflex_sync_signature.exchange(signature, std::memory_order_relaxed) == signature) return result;
+    if (!ReflexObserveBudget(s_reflex_sync_lines, kReflexSyncLogLimit, "SetReflexSync parameters changed again"))
+        return result;
+    char module[MAX_PATH];
+    CallerModuleName(caller_address, module, sizeof(module));
+    char hex[2 * sizeof(seen.rsvd) + 1];
+    char rsvd_text[sizeof(hex) + 8] = "";
+    if (ReservedBytesHex(seen.rsvd, sizeof(seen.rsvd), hex, sizeof(hex)))
+        std::snprintf(rsvd_text, sizeof(rsvd_text), " rsvd=%s", hex);
+    LOG_INFO("Reflex observe: SetReflexSync call %llu: status=%d version=0x%08x enable=%u disable=%u "
+             "flags_rsvd=0x%x vblank_interval=%u us time_in_queue=%d us time_in_queue_target=%u us "
+             "fg_multiplier=%u%s module=%s thread=%lu",
+             static_cast<unsigned long long>(call), result, seen.version, seen.bEnable ? 1u : 0u,
+             seen.bDisable ? 1u : 0u, static_cast<unsigned>(seen.flagsRsvd), seen.vblankIntervalUs,
+             seen.timeInQueueUs, seen.timeInQueueUsTarget, static_cast<unsigned>(seen.fgMultiplier), rsvd_text,
+             module, static_cast<unsigned long>(GetCurrentThreadId()));
+    return result;
+}
+
+static const char* OutOfBandTypeName(int type) noexcept {
+    switch (type) {
+    case 0: return "render";
+    case 1: return "present";
+    case 2: return "ignore";
+    case 3: return "render_present";
+    default: return "unknown";
+    }
+}
+
+static std::atomic<uint32_t> s_out_of_band_lines{0};
+static NvAPI_Status __cdecl Hook_NotifyOutOfBandCommandQueue(IUnknown* queue, int type) {
+    void* const caller_address = _ReturnAddress();
+    RuntimeCallbackGuard callback;
+    const NvAPI_Status result = SafeInvokeNotifyOutOfBand(queue, type);
+    if (callback.IsStopping() ||
+        !ReflexObserveBudget(s_out_of_band_lines, kOutOfBandLogLimit, "NotifyOutOfBandCommandQueue calls continue"))
+        return result;
+    char module[MAX_PATH];
+    CallerModuleName(caller_address, module, sizeof(module));
+    LOG_INFO("Reflex observe: NotifyOutOfBandCommandQueue queue=%p type=%d (%s) status=%d module=%s thread=%lu",
+             static_cast<void*>(queue), type, OutOfBandTypeName(type), result, module,
+             static_cast<unsigned long>(GetCurrentThreadId()));
+    return result;
+}
+
+static SleepStatusTracker s_game_sleep_status;
+static NvAPI_Status __cdecl Hook_GetSleepStatus(IUnknown* device, NV_GET_SLEEP_STATUS_PARAMS* params) {
+    void* const caller_address = _ReturnAddress();
+    RuntimeCallbackGuard callback;
+    // Without the status instrumentation (developer_settings or sleep_status_every_frame)
+    // the game's call is only forwarded and logged: no feedback-device acquisition. With
+    // it, the published feedback device and its publication token are captured before the
+    // driver query: a result is the frame's sleep status only when it came from that
+    // device and the publication has not changed since (RecordSleepStatus). The
+    // acquisition does not wait and never drains retired references (a contended or
+    // empty one drops the observation).
+    const bool observe = g_config.developer_settings || g_sleep_status_every_frame.load(std::memory_order_relaxed);
+    const NvAPIFeedbackDevice published = observe ? AcquireFeedbackDeviceImpl(false) : NvAPIFeedbackDevice{};
+    const NvAPI_Status result = SafeInvokeGetSleepStatus(device, params);
+    NV_GET_SLEEP_STATUS_PARAMS seen{};
+    // The driver's answer, read after the call.
+    if (callback.IsStopping() || !params || !SafeCopySleepStatus(params, &seen)) {
+        NvAPI_ReleaseFeedbackDevice(published.device);
+        return result;
+    }
+    if (published.device) {
+        if (NvAPI_IsSameDevice(device, published.device))
+            RecordSleepStatus(result, seen, static_cast<uint32_t>((published.publication_sequence >> 1) & kSleepStatusTokenMask));
+        NvAPI_ReleaseFeedbackDevice(published.device);
+    }
+    if (!s_game_sleep_status.Changed(result, seen) ||
+        !ReflexObserveBudget(s_game_sleep_status.lines, kGameSleepStatusLogLimit, "GetSleepStatus changed again"))
+        return result;
+    char module[MAX_PATH];
+    CallerModuleName(caller_address, module, sizeof(module));
+    LogSleepStatus("game call", result, seen, module);
+    return result;
+}
+
+static std::atomic<uint32_t> s_low_latency_hint_lines{0};
+static NvAPI_Status __cdecl Hook_SetCreateCommandQueueLowLatencyHint(IUnknown* device) {
+    void* const caller_address = _ReturnAddress();
+    RuntimeCallbackGuard callback;
+    const NvAPI_Status result = SafeInvokeLowLatencyHint(device);
+    if (callback.IsStopping() ||
+        !ReflexObserveBudget(s_low_latency_hint_lines, kLowLatencyHintLogLimit,
+            "SetCreateCommandQueueLowLatencyHint calls continue"))
+        return result;
+    char module[MAX_PATH];
+    CallerModuleName(caller_address, module, sizeof(module));
+    LOG_INFO("Reflex observe: SetCreateCommandQueueLowLatencyHint device=%p status=%d module=%s thread=%lu",
+             static_cast<void*>(device), result, module, static_cast<unsigned long>(GetCurrentThreadId()));
     return result;
 }
 #endif
@@ -1350,10 +1967,20 @@ void RestoreGameSleepMode() {
 }
 
 DriverLimiterApply NvAPI_ApplyDriverLimiter(uint32_t minimum_interval_us) noexcept {
-    const DriverLimiterApply result = ApplyCapturedSleepMode(&minimum_interval_us, false);
-    // The call carried the game's own low latency settings.
+    // The limiter applies while the Sleep is forwarded: driver_low_latency_off
+    // decides whether the call carries the game's low latency settings or the
+    // override (bypass_low_latency_off needs the bypass, which excludes the limiter).
+    // The driver call and the flag that records it are one operation under the
+    // forward lock, like UpdateLowLatencyOverride: a concurrent SetSleepMode
+    // can neither land between the two nor read a flag that does not match
+    // the driver. Nonblocking admission: a held lock leaves the operation
+    // pending (Busy), repaired by the next OnMarker's call.
+    if (!TryAcquireSRWLockExclusive(&s_sleep_mode_forward_lock)) return DriverLimiterApply::Busy;
+    const bool low_latency_off = g_driver_low_latency_off.load(std::memory_order_relaxed);
+    const DriverLimiterApply result = ApplyCapturedSleepMode(&minimum_interval_us, low_latency_off);
     if (result == DriverLimiterApply::Applied)
-        s_low_latency_forced_off.store(false, std::memory_order_release);
+        s_low_latency_forced_off.store(low_latency_off, std::memory_order_release);
+    ReleaseSRWLockExclusive(&s_sleep_mode_forward_lock);
     return result;
 }
 
@@ -1423,6 +2050,25 @@ void InstallNvAPIHooks() {
             (void**)&s_orig_set_flip_config);
         LOG_INFO("NvAPI: SetFlipConfig observation hook %s", status == MH_OK ? "installed" : "not installed");
     }
+    // Reflex observation hooks: resolved through NvAPI_QI like the hooks above.
+    const auto install_observer = [&](NvU32 id, void* detour, void** original) -> const char* {
+        void* target = NvAPI_QI(id);
+        if (!target) return "unavailable";
+        return InstallHook(target, detour, original) == MH_OK ? "installed" : "not installed";
+    };
+    const char* reflex_sync_hook = install_observer(kNvApiIdSetReflexSync,
+        reinterpret_cast<void*>(&Hook_SetReflexSync), reinterpret_cast<void**>(&s_orig_set_reflex_sync));
+    const char* out_of_band_hook = install_observer(kNvApiIdNotifyOutOfBandCommandQueue,
+        reinterpret_cast<void*>(&Hook_NotifyOutOfBandCommandQueue),
+        reinterpret_cast<void**>(&s_orig_notify_out_of_band));
+    const char* sleep_status_hook = install_observer(kNvApiIdGetSleepStatus,
+        reinterpret_cast<void*>(&Hook_GetSleepStatus), reinterpret_cast<void**>(&s_orig_get_sleep_status));
+    const char* low_latency_hint_hook = install_observer(kNvApiIdSetCreateCommandQueueLowLatencyHint,
+        reinterpret_cast<void*>(&Hook_SetCreateCommandQueueLowLatencyHint),
+        reinterpret_cast<void**>(&s_orig_low_latency_hint));
+    LOG_INFO("Reflex observe: hooks SetReflexSync %s, NotifyOutOfBandCommandQueue %s, GetSleepStatus %s, "
+             "SetCreateCommandQueueLowLatencyHint %s",
+             reflex_sync_hook, out_of_band_hook, sleep_status_hook, low_latency_hint_hook);
 #endif // _WIN64
 }
 

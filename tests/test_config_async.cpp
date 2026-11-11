@@ -307,6 +307,11 @@ void CheckPipelineMatchesConfig() {
     CHECK(pipeline.fg_late_spacing == g_config.fg_late_spacing);
     CHECK(pipeline.gpu_paced_cadence == g_config.gpu_paced_cadence);
     CHECK(pipeline.adaptive_cap_hold_room == g_config.adaptive_cap_hold_room);
+    CHECK(pipeline.pre_sleep_precise == g_config.pre_sleep_precise);
+    CHECK(pipeline.driver_limiter_hold == g_config.driver_limiter_hold);
+    CHECK(g_driver_low_latency_off.load() == g_config.driver_low_latency_off);
+    CHECK(g_sleep_status_every_frame.load() == g_config.sleep_status_every_frame);
+    CHECK(g_gpu_start_probe.load() == g_config.gpu_start_probe);
     CHECK(g_marker_forward_after_wait.load() ==
         (g_config.marker_forward_order == PacingMarkerForwardOrder::AfterWait));
 }
@@ -327,6 +332,8 @@ void TestPacingPipelineDefaults() {
     CHECK(!g_config.gpu_paced_cadence);
     CHECK(!g_config.bypass_low_latency_off && !g_bypass_low_latency_off.load());
     CHECK(!g_config.flip_metering_off);
+    CHECK(!g_config.pre_sleep_precise && !g_config.driver_low_latency_off && !g_config.driver_limiter_hold &&
+          !g_config.sleep_status_every_frame && !g_config.gpu_start_probe);
     CHECK(g_config.adaptive_cap_hold_room);
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
     CheckPipelineMatchesConfig();
@@ -338,6 +345,9 @@ void TestPacingPipelineDefaults() {
     CHECK(Value(local_path, "FrameLimiter", "gpu_paced_cadence") == "false");
     CHECK(Value(local_path, "FrameLimiter", "bypass_low_latency_off") == "false");
     CHECK(Value(local_path, "FrameLimiter", "flip_metering_off") == "false");
+    for (const char* key : {"pre_sleep_precise", "driver_low_latency_off", "driver_limiter_hold",
+            "sleep_status_every_frame", "gpu_start_probe"})
+        CHECK(Value(local_path, "FrameLimiter", key) == "false");
     CHECK(Value(local_path, "FrameLimiter", "adaptive_cap_hold_room") == "true");
     CHECK(Value(local_path, "FrameLimiter", "source_placement") == "pre_sleep");
     CHECK(Value(local_path, "FrameLimiter", "reflex_sleep_bypass") == "true");
@@ -626,6 +636,43 @@ void TestFlipMeteringOffKey() {
     Config_ResetDeveloperSettings();
     CHECK(!g_config.flip_metering_off);
     ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// Developer measurement keys pre_sleep_precise, driver_low_latency_off,
+// driver_limiter_hold, sleep_status_every_frame and gpu_start_probe: off by
+// default, each loads, reaches its consumer (the pipeline or the atomics of the
+// hooks and the GPU probe), is saved, counts as one developer override, is a
+// live key and resets to false.
+void TestMeasurementKeys() {
+    struct Case { const char* key; bool PacingPipelineConfig::*pipeline; bool Config::*field; };
+    for (const Case& test : {Case{"pre_sleep_precise", &PacingPipelineConfig::pre_sleep_precise, &Config::pre_sleep_precise},
+            Case{"driver_low_latency_off", nullptr, &Config::driver_low_latency_off},
+            Case{"driver_limiter_hold", &PacingPipelineConfig::driver_limiter_hold, &Config::driver_limiter_hold},
+            Case{"sleep_status_every_frame", nullptr, &Config::sleep_status_every_frame},
+            Case{"gpu_start_probe", nullptr, &Config::gpu_start_probe}}) {
+        Reset(false, false, {{"config_version", "4"}, {test.key, "true"}});
+        CHECK(g_config.*test.field);
+        if (test.pipeline) CHECK(PacingPipeline_GetConfig().*test.pipeline);
+        CheckPipelineMatchesConfig();
+        CHECK(g_driver_low_latency_off.load() == (std::strcmp(test.key, "driver_low_latency_off") == 0));
+        CHECK(g_sleep_status_every_frame.load() == (std::strcmp(test.key, "sleep_status_every_frame") == 0));
+        CHECK(g_gpu_start_probe.load() == (std::strcmp(test.key, "gpu_start_probe") == 0));
+        CHECK(Value(local_path, "FrameLimiter", test.key) == "true");
+        CHECK(Config_DeveloperOverrides() == 1);
+        // A live key: strict parse, published at once, not saved by the command.
+        char error[128] = {};
+        CHECK(Config_SetLiveKey(test.key, "off", error, sizeof(error)) && !(g_config.*test.field));
+        CheckPipelineMatchesConfig();
+        CHECK(Config_DeveloperOverrides() == 0);
+        CHECK(Config_SetLiveKey(test.key, "1", error, sizeof(error)) && g_config.*test.field);
+        CheckPipelineMatchesConfig();
+        CHECK(!Config_SetLiveKey(test.key, "maybe", error, sizeof(error)) && g_config.*test.field);
+        Config_ResetDeveloperSettings();
+        CHECK(!(g_config.*test.field));
+        CheckPipelineMatchesConfig();
+        CHECK(Config_DeveloperOverrides() == 0);
+        ReleaseStart();CHECK(OwnerShutdown());
+    }
 }
 
 // Developer control file: Config_SetLiveKey sets one live key as the OSD does
@@ -1045,6 +1092,7 @@ int main() {
     TestGpuPacedCadenceKey();
     TestAdaptiveCapHoldRoomKey();
     TestBypassLowLatencyOffKey();
+    TestMeasurementKeys();
     TestFlipMeteringOffKey();
     TestLiveKeySetter();
     TestSourcePlacementParsing();

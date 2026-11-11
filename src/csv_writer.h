@@ -20,6 +20,11 @@ struct PacingCsvRow {
     uint64_t sequence = 0;
     uint32_t capture_epoch = 0;
     PacingJoinedRow joined{};
+    // The newest NvAPI_D3D12_SetFlipConfig call that enabled metering, read
+    // by CSV_PushPacingRow when the row was completed (instrumentation_state.h).
+    uint8_t flip_config_valid = 0;
+    int64_t flip_config_qpc = 0;
+    uint32_t flip_time_per_batch_us = 0;
     PacingDerivedMetrics derived{};
 };
 

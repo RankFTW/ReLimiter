@@ -1,5 +1,6 @@
 #include "config.h"
 #include "nvapi_hooks.h"
+#include "instrumentation_state.h"
 #include "osd_position_policy.h"
 #include "blackout.h"
 #include "scheduler.h"
@@ -428,9 +429,14 @@ void LoadConfig(HMODULE hModule) {
     g_config.fg_late_spacing=ReadINIBool(S,"fg_late_spacing",true,P);
     g_config.gpu_paced_cadence=ReadINIBool(S,"gpu_paced_cadence",false,P);
     g_config.bypass_low_latency_off=ReadINIBool(S,"bypass_low_latency_off",false,P);
+    g_config.driver_low_latency_off=ReadINIBool(S,"driver_low_latency_off",false,P);
     g_config.flip_metering_off=ReadINIBool(S,"flip_metering_off",false,P);
     g_config.fg_presenter_probe_us=ReadINIInt(S,"fg_presenter_probe_us",0,P);
     g_config.gpu_priority_probe=ReadINIBool(S,"gpu_priority_probe",false,P);
+    g_config.pre_sleep_precise=ReadINIBool(S,"pre_sleep_precise",false,P);
+    g_config.driver_limiter_hold=ReadINIBool(S,"driver_limiter_hold",false,P);
+    g_config.sleep_status_every_frame=ReadINIBool(S,"sleep_status_every_frame",false,P);
+    g_config.gpu_start_probe=ReadINIBool(S,"gpu_start_probe",false,P);
     g_config.control_file=ReadINIBool(S,"control_file",false,P);
     g_config.adaptive_cap_hold_room=ReadINIBool(S,"adaptive_cap_hold_room",true,P);
     g_config.lead_spike_floor=ReadINIBool(S,"lead_spike_floor",true,P);
@@ -651,9 +657,14 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIBool(S, "fg_late_spacing", config.fg_late_spacing, P);
     WriteINIBool(S, "gpu_paced_cadence", config.gpu_paced_cadence, P);
     WriteINIBool(S, "bypass_low_latency_off", config.bypass_low_latency_off, P);
+    WriteINIBool(S, "driver_low_latency_off", config.driver_low_latency_off, P);
     WriteINIBool(S, "flip_metering_off", config.flip_metering_off, P);
     WriteINIInt(S, "fg_presenter_probe_us", config.fg_presenter_probe_us, P);
     WriteINIBool(S, "gpu_priority_probe", config.gpu_priority_probe, P);
+    WriteINIBool(S, "pre_sleep_precise", config.pre_sleep_precise, P);
+    WriteINIBool(S, "driver_limiter_hold", config.driver_limiter_hold, P);
+    WriteINIBool(S, "sleep_status_every_frame", config.sleep_status_every_frame, P);
+    WriteINIBool(S, "gpu_start_probe", config.gpu_start_probe, P);
     WriteINIBool(S, "control_file", config.control_file, P);
     WriteINIBool(S, "adaptive_cap_hold_room", config.adaptive_cap_hold_room, P);
     WriteINIBool(S, "lead_spike_floor", config.lead_spike_floor, P);
@@ -902,6 +913,8 @@ static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
     pipeline.gpu_paced_cadence = config.gpu_paced_cadence;
     pipeline.adaptive_cap_hold_room = config.adaptive_cap_hold_room;
     pipeline.lead_spike_floor = config.lead_spike_floor;
+    pipeline.pre_sleep_precise = config.pre_sleep_precise;
+    pipeline.driver_limiter_hold = config.driver_limiter_hold;
     return pipeline;
 }
 
@@ -914,6 +927,9 @@ void Config_ApplyPacingPipeline() {
         std::memory_order_relaxed);
     g_reflex_sleep_bypass.store(g_config.reflex_sleep_bypass, std::memory_order_relaxed);
     g_bypass_low_latency_off.store(g_config.bypass_low_latency_off, std::memory_order_relaxed);
+    g_driver_low_latency_off.store(g_config.driver_low_latency_off, std::memory_order_relaxed);
+    g_sleep_status_every_frame.store(g_config.sleep_status_every_frame, std::memory_order_relaxed);
+    g_gpu_start_probe.store(g_config.gpu_start_probe, std::memory_order_relaxed);
     g_fg_presenter_probe_us.store(g_config.fg_presenter_probe_us, std::memory_order_relaxed);
 }
 
@@ -984,10 +1000,15 @@ constexpr Key kKeys[] = {
     {"stall_inject_period_s", &SetDouble<&Config::stall_inject_period_s>, Publish::Pipeline},
     {"reflex_sleep_bypass", &SetBool<&Config::reflex_sleep_bypass>, Publish::Pipeline},
     {"bypass_low_latency_off", &SetBool<&Config::bypass_low_latency_off>, Publish::Pipeline},
+    {"driver_low_latency_off", &SetBool<&Config::driver_low_latency_off>, Publish::Pipeline},
     {"fg_late_spacing", &SetBool<&Config::fg_late_spacing>, Publish::Pipeline},
     {"gpu_paced_cadence", &SetBool<&Config::gpu_paced_cadence>, Publish::Pipeline},
     {"lead_spike_floor", &SetBool<&Config::lead_spike_floor>, Publish::Pipeline},
     {"fg_presenter_probe_us", &SetInt<&Config::fg_presenter_probe_us>, Publish::Pipeline},
+    {"pre_sleep_precise", &SetBool<&Config::pre_sleep_precise>, Publish::Pipeline},
+    {"driver_limiter_hold", &SetBool<&Config::driver_limiter_hold>, Publish::Pipeline},
+    {"sleep_status_every_frame", &SetBool<&Config::sleep_status_every_frame>, Publish::Pipeline},
+    {"gpu_start_probe", &SetBool<&Config::gpu_start_probe>, Publish::Pipeline},
 };
 }
 
@@ -1041,13 +1062,18 @@ int Config_DeveloperOverrides() {
         (g_config.fg_late_spacing != d.fg_late_spacing) +
         (g_config.gpu_paced_cadence != d.gpu_paced_cadence) +
         (g_config.bypass_low_latency_off != d.bypass_low_latency_off) +
+        (g_config.driver_low_latency_off != d.driver_low_latency_off) +
         (g_config.flip_metering_off != d.flip_metering_off) +
         (g_config.fg_presenter_probe_us != d.fg_presenter_probe_us) +
         (g_config.gpu_priority_probe != d.gpu_priority_probe) +
         (g_config.control_file != d.control_file) +
         (g_config.adaptive_cap_hold_room != d.adaptive_cap_hold_room) +
         (g_config.lead_spike_floor != d.lead_spike_floor) +
-        (g_config.source_placement != d.source_placement);
+        (g_config.source_placement != d.source_placement) +
+        (g_config.pre_sleep_precise != d.pre_sleep_precise) +
+        (g_config.driver_limiter_hold != d.driver_limiter_hold) +
+        (g_config.sleep_status_every_frame != d.sleep_status_every_frame) +
+        (g_config.gpu_start_probe != d.gpu_start_probe);
 }
 
 void Config_ResetDeveloperSettings() {
@@ -1066,6 +1092,7 @@ void Config_ResetDeveloperSettings() {
     g_config.fg_late_spacing = d.fg_late_spacing;
     g_config.gpu_paced_cadence = d.gpu_paced_cadence;
     g_config.bypass_low_latency_off = d.bypass_low_latency_off;
+    g_config.driver_low_latency_off = d.driver_low_latency_off;
     g_config.flip_metering_off = d.flip_metering_off;
     g_config.fg_presenter_probe_us = d.fg_presenter_probe_us;
     g_config.gpu_priority_probe = d.gpu_priority_probe;
@@ -1073,6 +1100,10 @@ void Config_ResetDeveloperSettings() {
     g_config.adaptive_cap_hold_room = d.adaptive_cap_hold_room;
     g_config.lead_spike_floor = d.lead_spike_floor;
     g_config.source_placement = d.source_placement;
+    g_config.pre_sleep_precise = d.pre_sleep_precise;
+    g_config.driver_limiter_hold = d.driver_limiter_hold;
+    g_config.sleep_status_every_frame = d.sleep_status_every_frame;
+    g_config.gpu_start_probe = d.gpu_start_probe;
     Config_ApplyPacingPipeline();
     LOG_INFO("Config: developer diagnostics reset to the recommended defaults");
 }
@@ -1145,6 +1176,20 @@ void ApplyConfig() {
     if (g_config.gpu_priority_probe)
         LOG_WARN("Diagnostic GPU priority probe: two DIRECT queues of ReLimiter's own (high and normal priority) "
                  "measure how long a released queue's work waits for the GPU (set at launch)");
+    if (g_config.pre_sleep_precise)
+        LOG_WARN("Diagnostic precise pre-Sleep wait: the wait before the game's Reflex Sleep aims at the release "
+                 "target itself and ends with the hardware spin (source_placement=pre_sleep)");
+    if (g_config.driver_low_latency_off)
+        LOG_WARN("Diagnostic driver low latency off while forwarded: NvAPI SetSleepMode reaches the driver with low "
+                 "latency mode and boost off while the game's Reflex Sleep is forwarded");
+    if (g_config.driver_limiter_hold)
+        LOG_WARN("Diagnostic driver limiter hold: with source_placement=driver and gpu_paced_cadence ReLimiter holds "
+                 "the output on the cadence the driver's Sleep sets, with no start wait of its own");
+    if (g_config.sleep_status_every_frame)
+        LOG_WARN("Diagnostic sleep status poll: the driver's sleep status is read at every Reflex Sleep");
+    if (g_config.gpu_start_probe)
+        LOG_WARN("Diagnostic GPU start probe: a Signal of ReLimiter's own in front of the first submission of each "
+                 "frame on the presenting queue measures when the GPU starts it");
     if (g_config.control_file)
         LOG_WARN("Diagnostic control file: relimiter_control.txt next to the INI is polled for test harness commands "
                  "(set, capture, mark, ping); results and pacing state go to relimiter_control_status.txt "

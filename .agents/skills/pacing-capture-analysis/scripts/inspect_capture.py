@@ -91,6 +91,19 @@ CURRENT_PACING_HEADER = PACING_FIXED_RAW_HEADER + PACING_FIXED_DERIVED_HEADER + 
     # call carrying the frame's NvAPI frame ID in µs with its marker type (empty
     # when none)
     "async_marker_wait_us", "async_marker_wait_type",
+    # The driver's Reflex Sleep that belongs to the frame (QPC call start and
+    # return, Hook_Sleep; empty when no driver Sleep matched the frame's index)
+    "driver_sleep_start_qpc", "driver_sleep_end_qpc",
+    # The driver's sleep status when the frame's Reflex Sleep returned
+    # (sleepIntervalUs in µs, bUseGameSleep 0/1; empty when none), the newest
+    # NvAPI_D3D12_SetFlipConfig call that enabled flip metering when the row was
+    # completed (QPC; timePerBatchMs as µs, empty when none or without a batch
+    # time) and the developer GPU start probe (QPC of the frame's first
+    # ExecuteCommandLists on the presenting queue and of the observed
+    # completion of ReLimiter's Signal in front of it; empty without a sample)
+    "driver_sleep_interval_us", "driver_use_game_sleep",
+    "flip_config_qpc", "flip_time_per_batch_us",
+    "gpu_first_submit_qpc", "gpu_start_qpc",
 ]
 
 CURRENT_PACING_EVENTS_HEADER = [
@@ -133,10 +146,13 @@ CURRENT_PACING_EVENTS_HEADER = [
 # Earlier files carry a prefix of the current header of these lengths. The
 # events header did not change in Phase 3 or 4 (new event kinds only), so a
 # Phase 2 events file is current-source-86.
-HISTORICAL_PACING_HEADER_LENGTHS = (138, 136, 133, 132, 129, 122, 111)  # before the wait columns;
-                                                                       # Phase 4 before the wait starts;
-                                                                       # Phase 3 (Q16); Phase 3 before Q16;
-                                                                       # Phase 2; Phase 1; Phase 0
+HISTORICAL_PACING_HEADER_LENGTHS = (142, 140, 138, 136, 133, 132, 129, 122, 111)  # before the sleep status, flip config
+                                                                              # and GPU start columns;
+                                                                              # before the driver Sleep columns;
+                                                                              # before the wait columns;
+                                                                              # Phase 4 before the wait starts;
+                                                                              # Phase 3 (Q16); Phase 3 before Q16;
+                                                                              # Phase 2; Phase 1; Phase 0
 HISTORICAL_PACING_EVENTS_HEADER_LENGTHS = (85, 81, 50)  # Phase 1; Phase 0; before snapshot rows
 
 

@@ -5,12 +5,14 @@
 // event, the frame-plan columns, display source, reason column and
 // grid_epoch / pipeline_change / stall_injected events,
 // the controller columns and governor_step / rung_feasibility
-// events, and the source-placement columns.
+// events, the source-placement columns, and the appended driver sleep status,
+// flip config and GPU start probe columns.
 // The logger and the native PCL snapshot are stubs; the telemetry
 // worker that produces these records is not exercised here (its controller
 // event derivation is tested by test_pacing_controller_events).
 
 #include "csv_writer.h"
+#include "instrumentation_state.h"
 #include "logger.h"
 
 #include <Windows.h>
@@ -156,6 +158,17 @@ PacingJoinedRow DisplayRow(bool with_latency)
         // Gated holds: where the waits started.
         row.source.pre_sleep_start_qpc = 610;
         row.source.source_wait_start_qpc = 800;
+        // The driver's Reflex Sleep that belongs to the frame.
+        row.source.driver_sleep_start_qpc = 700;
+        row.source.driver_sleep_end_qpc = 760;
+        // The driver's sleep status when the frame's Sleep returned.
+        row.source.driver_sleep_status_valid = 1;
+        row.source.driver_sleep_interval_us = 8333;
+        row.source.driver_use_game_sleep = 1;
+        // GPU start probe of the frame's readiness sample.
+        row.has_ready = true;
+        row.ready.gpu_first_submit_qpc = 1100;
+        row.ready.gpu_start_qpc = 1150;
         // The longest SetAsyncFrameMarker call.
         row.has_wait = true;
         row.wait.has_async = true;
@@ -184,6 +197,12 @@ PacingJoinedRow DisplayRow(bool with_latency)
         row.source.plan_rung = 1;
         row.source.governor_step = 3;        // hidden: the governor did not run (interval 0)
         row.source.source_placement = 1;     // PacingSourcePlacement::Marker, no pre-Sleep wait
+        // A status the Sleep hook never published stays hidden behind its valid flag.
+        row.source.driver_sleep_interval_us = 999;
+        row.source.driver_use_game_sleep = 1;
+        // A probe whose Signal completion was not observed has a first submit only.
+        row.has_ready = true;
+        row.ready.gpu_first_submit_qpc = 1200;
         row.has_present = true; // plan_status 0: empty
         // PostWait without a valid pre-Wait readback: gate_pre_wait_qpc empty.
         row.has_gate = true;
@@ -201,9 +220,77 @@ PacingJoinedRow UnjoinedPresentRow()
     row.row_kind = 2;
     row.has_present = true;
     row.present.plan_status = 3; // PacingPlanStatus::Late
+    row.present.p_qpc = 2000;    // no display: the Present's entry is the row's present start
     return row;
 }
 
+
+// The flip config ring never waits: the newest call at or before a QPC, a
+// writer inside a slot (odd sequence) is skipped by readers, every slot
+// contended reads empty, and the ring keeps the newest 64 calls.
+void CheckFlipConfigRing()
+{
+    constexpr int64_t base = 1'000'000'000;
+    FlipConfig_Record(base + 10, 1);
+    FlipConfig_Record(base + 20, 2);
+    FlipConfig_Record(base + 30, 3);
+    int64_t qpc = 0;
+    uint32_t us = 0;
+    Check(FlipConfig_ReadAt(base + 25, &qpc, &us) && qpc == base + 20 && us == 2,
+          "a read at a QPC takes the newest call at or before it");
+    Check(FlipConfig_Read(&qpc, &us) && qpc == base + 30 && us == 3, "a read without a QPC takes the newest call");
+
+    // A writer contending for the newest slot: the read drops that observation and does not wait.
+    const uint32_t newest_slot = (g_flip_config.next.load() - 1) % FLIP_CONFIG_RING;
+    const uint32_t kept = g_flip_config.ring[newest_slot].sequence.load();
+    g_flip_config.ring[newest_slot].sequence.store(kept - 1); // odd: a writer is inside
+    Check(FlipConfig_Read(&qpc, &us) && qpc == base + 20 && us == 2,
+          "a slot a writer is inside is skipped, the older call answers");
+    g_flip_config.ring[newest_slot].sequence.store(kept);
+
+    // Every slot contended: the reader fails open.
+    uint32_t saved[FLIP_CONFIG_RING];
+    for (uint32_t slot = 0; slot < FLIP_CONFIG_RING; ++slot) {
+        saved[slot] = g_flip_config.ring[slot].sequence.load();
+        g_flip_config.ring[slot].sequence.store(saved[slot] | 1u);
+    }
+    Check(!FlipConfig_Read(&qpc, &us) && !FlipConfig_ReadAt(base + 25, &qpc, &us),
+          "with every slot contended a read finds nothing instead of waiting");
+    for (uint32_t slot = 0; slot < FLIP_CONFIG_RING; ++slot) g_flip_config.ring[slot].sequence.store(saved[slot]);
+
+    // More calls than slots: the newest 64 remain.
+    for (uint32_t call = 0; call < FLIP_CONFIG_RING + 6; ++call) FlipConfig_Record(base + 100 + call, 100 + call);
+    Check(FlipConfig_Read(&qpc, &us) && qpc == base + 100 + FLIP_CONFIG_RING + 5 && us == 100 + FLIP_CONFIG_RING + 5,
+          "the ring keeps the newest calls");
+    Check(FlipConfig_ReadAt(base + 106, &qpc, &us) && qpc == base + 106,
+          "calls among the newest 64 stay readable by QPC");
+
+    // A writer lapped by 64 calls does not own its slot: while a writer is inside (odd
+    // sequence) the claim of a later call for that slot fails and that call is dropped,
+    // so the payload the first writer finishes is never mixed with another call's QPC.
+    const uint32_t lapped_slot = g_flip_config.next.load() % FLIP_CONFIG_RING;
+    FlipConfigEntry& lapped = g_flip_config.ring[lapped_slot];
+    const uint32_t owner_sequence = lapped.sequence.load();
+    const int64_t owner_qpc = lapped.qpc.load();
+    const uint32_t owner_us = lapped.time_per_batch_us.load();
+    lapped.sequence.store(owner_sequence | 1u);
+    FlipConfig_Record(base + 900, 900);
+    Check(lapped.sequence.load() == (owner_sequence | 1u) && lapped.qpc.load() == owner_qpc &&
+              lapped.time_per_batch_us.load() == owner_us,
+          "a writer that cannot claim the slot drops its call and writes nothing");
+    lapped.sequence.store(owner_sequence);
+
+    // Equal QPCs: the later call answers, also across the generation wrap.
+    FlipConfig_Record(base + 2000, 11);
+    FlipConfig_Record(base + 2000, 12);
+    Check(FlipConfig_ReadAt(base + 2000, &qpc, &us) && qpc == base + 2000 && us == 12,
+          "of two calls with the same QPC the later one answers");
+    g_flip_config.next.store(0xFFFFFFFFu);
+    FlipConfig_Record(base + 3000, 21);
+    FlipConfig_Record(base + 3000, 22);
+    Check(FlipConfig_ReadAt(base + 3000, &qpc, &us) && us == 22,
+          "the later of two equal-QPC calls answers across the generation wrap");
+}
 void CheckRowsFile(const CsvFile& rows)
 {
     const Cells appended{ "clock_map_offset_us", "predicted_render_us", "pcl_status",
@@ -218,22 +305,29 @@ void CheckRowsFile(const CsvFile& rows)
         "gate_pre_wait_qpc", "source_placement", "pre_sleep_end_qpc", "pre_sleep_margin_us",
         "source_wait_start_qpc", "pre_sleep_start_qpc" };
     const Cells wait_columns{ "async_marker_wait_us", "async_marker_wait_type" };
-    const size_t tail = plan_columns.size() + controller_columns.size() + wait_columns.size();
-    Check(rows.header.size() == 140, "pacing rows have 140 columns, got " + std::to_string(rows.header.size()));
-    Check(rows.header.size() >= appended.size() + tail &&
-              Cells(rows.header.end() - tail - appended.size(), rows.header.end() - tail) == appended,
+    const Cells driver_columns{ "driver_sleep_start_qpc", "driver_sleep_end_qpc" };
+    const Cells measurement_columns{ "driver_sleep_interval_us", "driver_use_game_sleep", "flip_config_qpc",
+        "flip_time_per_batch_us", "gpu_first_submit_qpc", "gpu_start_qpc" };
+    const size_t last = wait_columns.size() + driver_columns.size() + measurement_columns.size();
+    const size_t tail = plan_columns.size() + controller_columns.size() + last;
+    // `count` columns that end `from_end` columns before the end of the header.
+    const auto slice = [&rows](size_t from_end, size_t count) {
+        if (rows.header.size() < from_end || from_end < count) return Cells{};
+        return Cells(rows.header.end() - from_end, rows.header.end() - from_end + count);
+    };
+    Check(rows.header.size() == 148, "pacing rows have 148 columns, got " + std::to_string(rows.header.size()));
+    Check(slice(tail + appended.size(), appended.size()) == appended,
           "PC Latency and predicted-render columns are appended in order after clock_map_offset_us");
-    Check(rows.header.size() >= tail &&
-              Cells(rows.header.end() - tail, rows.header.end() - controller_columns.size() - wait_columns.size()) ==
-                  plan_columns,
+    Check(slice(tail, plan_columns.size()) == plan_columns,
           "frame-plan columns are appended in order after pcl_simulation_fallback");
-    Check(rows.header.size() >= controller_columns.size() + wait_columns.size() &&
-              Cells(rows.header.end() - controller_columns.size() - wait_columns.size(),
-                  rows.header.end() - wait_columns.size()) == controller_columns,
+    Check(slice(controller_columns.size() + last, controller_columns.size()) == controller_columns,
           "controller, gate pre-Wait, placement and wait-start columns are appended in order after display_source");
-    Check(rows.header.size() >= wait_columns.size() &&
-              Cells(rows.header.end() - wait_columns.size(), rows.header.end()) == wait_columns,
-          "async marker wait columns are the last columns");
+    Check(slice(last, wait_columns.size()) == wait_columns,
+          "async marker wait columns follow the wait-start columns");
+    Check(slice(driver_columns.size() + measurement_columns.size(), driver_columns.size()) == driver_columns,
+          "driver Sleep columns follow the async marker wait columns");
+    Check(slice(measurement_columns.size(), measurement_columns.size()) == measurement_columns,
+          "driver sleep status, flip config and GPU start probe columns are the last columns");
     Check(rows.rows.size() == 3, "every pacing row is written");
     if (rows.rows.size() != 3) return;
 
@@ -255,6 +349,31 @@ void CheckRowsFile(const CsvFile& rows)
           "a frame without an async marker call has empty cells");
     Check(rows.Cell(2, "async_marker_wait_us").empty() && rows.Cell(2, "async_marker_wait_type").empty(),
           "rows without wait records have empty wait cells");
+    Check(rows.Cell(0, "driver_sleep_start_qpc") == "700" && rows.Cell(0, "driver_sleep_end_qpc") == "760",
+          "a frame the driver's Sleep matched carries both stamps");
+    Check(rows.Cell(1, "driver_sleep_start_qpc").empty() && rows.Cell(1, "driver_sleep_end_qpc").empty(),
+          "a Source record without a matched driver Sleep has empty stamps");
+    Check(rows.Cell(2, "driver_sleep_start_qpc").empty() && rows.Cell(2, "driver_sleep_end_qpc").empty(),
+          "rows without a Source record have empty driver Sleep cells");
+    // Driver sleep status, flip config (recorded between the rows) and GPU start probe.
+    Check(rows.Cell(0, "driver_sleep_interval_us") == "8333" && rows.Cell(0, "driver_use_game_sleep") == "1",
+          "a Source record with a sleep status carries both cells");
+    Check(rows.Cell(1, "driver_sleep_interval_us").empty() && rows.Cell(1, "driver_use_game_sleep").empty(),
+          "a Source record without a published sleep status has empty cells");
+    Check(rows.Cell(2, "driver_sleep_interval_us").empty() && rows.Cell(2, "driver_use_game_sleep").empty(),
+          "rows without a Source record have empty sleep status cells");
+    Check(rows.Cell(0, "flip_config_qpc").empty() && rows.Cell(0, "flip_time_per_batch_us").empty(),
+          "rows completed before any metering SetFlipConfig call have empty flip config cells");
+    Check(rows.Cell(1, "flip_config_qpc") == "500" && rows.Cell(1, "flip_time_per_batch_us") == "8333",
+          "a row carries the newest metering call at or before its present start (500, not the later 1500 or 5000)");
+    Check(rows.Cell(2, "flip_config_qpc") == "1500" && rows.Cell(2, "flip_time_per_batch_us").empty(),
+          "an unjoined Present row uses the Present's entry as its start; a call without a batch time leaves the microseconds empty");
+    Check(rows.Cell(0, "gpu_first_submit_qpc") == "1100" && rows.Cell(0, "gpu_start_qpc") == "1150",
+          "a readiness sample with a GPU start probe carries both stamps");
+    Check(rows.Cell(1, "gpu_first_submit_qpc") == "1200" && rows.Cell(1, "gpu_start_qpc").empty(),
+          "a probe whose completion was not observed has the first submit only");
+    Check(rows.Cell(2, "gpu_first_submit_qpc").empty() && rows.Cell(2, "gpu_start_qpc").empty(),
+          "rows without a readiness record have empty probe cells");
     for (const auto& [column, expected] : plan_cells) {
         Check(rows.Cell(0, column) == expected,
               std::string("row 1 ") + column + " = " + expected + ", got " + rows.Cell(0, column));
@@ -402,6 +521,9 @@ int main()
     CSV_Init(directory.string().c_str());
     CSV_SetEnabled(true);
     CSV_PushPacingRow(1, DisplayRow(true), PacingDerivedMetrics{});
+    FlipConfig_Record(500, 8333);  // metering SetFlipConfig calls before and after the rows' present starts
+    FlipConfig_Record(1500, 0);    // one without a batch time
+    FlipConfig_Record(5000, 7000); // a later one no row sees
     CSV_PushPacingRow(2, DisplayRow(false), PacingDerivedMetrics{});
     CSV_PushPacingRow(3, UnjoinedPresentRow(), PacingDerivedMetrics{});
 
@@ -474,6 +596,7 @@ int main()
     if (!rows_path.empty()) CheckRowsFile(Read(rows_path));
     if (!events_path.empty()) CheckEventsFile(Read(events_path));
     std::filesystem::remove_all(directory, error);
+    CheckFlipConfigRing();
 
     if (g_failures != 0) {
         std::cerr << g_failures << " pacing CSV checks failed\n";

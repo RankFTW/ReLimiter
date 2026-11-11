@@ -115,17 +115,34 @@ void Scheduler_RecordReflexSleep(int64_t now_qpc) noexcept;
 //      margin, or under the developer A/B gpu_paced_cadence for max(S_next,
 //      the GPU-paced rhythm's release) − margin. now_qpc is taken after
 //      step 2.
-//   4. Without the owner: PreSleepWaitUntil(*target_qpc) (pacing_sleep.h),
+//   4. Without the owner: PreSleepWaitUntil(*target_qpc, *precise)
+//      (pacing_sleep.h; *precise is the developer key pre_sleep_precise:
+//      the target is S itself and the wait ends with the hardware spin),
 //      then, holding the owner again if it can be taken without waiting,
 //      Scheduler_EndReflexSleep(grid_index, end_qpc) records the wait end
 //      for the residual.
+//   5. Scheduler_EndDriverSleep (caller holds SchedulerOwnerGuard; skipped
+//      when the owner is busy): after the driver's Sleep returns (not
+//      bypassed), records its call start and return for the next grid index.
+//      The source stage puts them in the frame's source record and, under the
+//      developer A/B gpu_paced_cadence, judges whether the driver released
+//      the frame (cadence_grid.h, driver-released frame).
+//   With the Reflex driver limiter placement and the developer A/B
+//   driver_limiter_hold (Scheduler_DriverLimiterHoldActive, any thread) steps
+//   2 to 4 do not run: ReLimiter waits for nothing here. Only
+//   Scheduler_RecordReflexSleepEntry (caller holds SchedulerOwnerGuard) records
+//   the hook's entry as the moment the game reached ReLimiter for the next
+//   grid index, which the cadence judges the driver's release against.
 bool Scheduler_PreSleepPlacementActive() noexcept;
+bool Scheduler_DriverLimiterHoldActive() noexcept;
+void Scheduler_RecordReflexSleepEntry(int64_t sleep_entry_qpc) noexcept;
 bool Scheduler_RenderHandoffFrame(uint8_t* identity_domain, uint32_t* producer_epoch,
     uint64_t* frame_id) noexcept;
 void Scheduler_RenderHandoffStalled() noexcept;
 bool Scheduler_PlanReflexSleep(int64_t sleep_entry_qpc, int64_t now_qpc, bool driver_sleep, int64_t handoff_qpc,
-    int64_t* target_qpc, uint64_t* grid_index) noexcept;
+    int64_t* target_qpc, uint64_t* grid_index, bool* precise) noexcept;
 void Scheduler_EndReflexSleep(uint64_t grid_index, int64_t end_qpc) noexcept;
+void Scheduler_EndDriverSleep(int64_t start_qpc, int64_t end_qpc) noexcept;
 
 // True while ReLimiter's own wait paces the game's source: the published
 // placement is marker, pre_sleep or present, held or not. False in

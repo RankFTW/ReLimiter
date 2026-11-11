@@ -206,6 +206,7 @@ class ConfigSavePolicyTests(unittest.TestCase):
                                   "gpu_wait_interleave_s", "gpu_queue_wait_render_queue",
                                   "lead_coverage", "fg_late_spacing", "gpu_paced_cadence",
                                   "adaptive_cap_hold_room", "lead_spike_floor",
+                                  "pre_sleep_precise", "driver_limiter_hold",
                                   "placement_override", "stall_inject_ms",
                                   "stall_inject_period_s"})
         mapping = dict(re.findall(r"\bpipeline\.(\w+)\s*=\s*config\.(\w+);",
@@ -224,7 +225,9 @@ class ConfigSavePolicyTests(unittest.TestCase):
                                    "fg_late_spacing": "fg_late_spacing",
                                    "gpu_paced_cadence": "gpu_paced_cadence",
                                    "adaptive_cap_hold_room": "adaptive_cap_hold_room",
-                                   "lead_spike_floor": "lead_spike_floor"})
+                                   "lead_spike_floor": "lead_spike_floor",
+                                   "pre_sleep_precise": "pre_sleep_precise",
+                                   "driver_limiter_hold": "driver_limiter_hold"})
         # The OSD applies pipeline edits through the same function.
         for name, text in (("config.cpp", SOURCE), ("osd.cpp", OSD)):
             self.assertNotRegex(text, r"\bg_frame_time_adaptation\b", name)

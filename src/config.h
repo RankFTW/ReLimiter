@@ -101,6 +101,11 @@ struct Config {
     bool adaptive_cap_hold_room = true; // developer A/B: on (default) | off; with Adaptive cap and Output override Auto the interval is kept at least at the hold room of the GPU queue wait or (with gpu_paced_cadence) the FG input wait
     bool lead_spike_floor = true; // developer A/B: on (default) | off; with Output override Auto a GPU wait lead behind the wait covers the game's rare long simulations (lead_controller.h)
     PacingPlacementOverride source_placement = PacingPlacementOverride::PreSleep; // developer: marker | pre_sleep | driver (pre_sleep is the default)
+    bool pre_sleep_precise = false; // developer A/B: off (default) | on; the pre-Sleep wait aims at the release target itself and ends with the hardware spin, so the game thread returns from ReLimiter's wait at the target (64-bit, source_placement=pre_sleep)
+    bool driver_low_latency_off = false; // developer A/B: off (default) | on; the driver's low latency mode is turned off while the game's Reflex Sleep is forwarded (64-bit)
+    bool driver_limiter_hold = false; // developer A/B: off (default) | on; with source_placement=driver and gpu_paced_cadence ReLimiter holds the output on the cadence the driver's Sleep sets, without any start wait (64-bit)
+    bool sleep_status_every_frame = false; // developer: off (default) | on; the driver's sleep status is polled at every Reflex Sleep instead of once per second (64-bit)
+    bool gpu_start_probe = false; // developer experiment: off (default) | on; a Signal in front of the first submission of each frame measures when the GPU starts it (64-bit DX12, frames with a readiness sample)
 
     // Reflex Injection
     bool reflex_inject = false;         // Synthesize Reflex markers for non-Reflex games
@@ -287,7 +292,8 @@ void ApplyConfig();
 
 // Apply only the pacing pipeline fields (smoothing, adaptive_cap, output_rung,
 // source_placement, gpu_present_gate_probes, stall injector,
-// marker_forward_order, reflex_sleep_bypass, bypass_low_latency_off) to the resolver (which carries
+// marker_forward_order, reflex_sleep_bypass, bypass_low_latency_off, driver_low_latency_off,
+// sleep_status_every_frame, gpu_start_probe) to the resolver (which carries
 // adaptive_cap to the period governor) and the NvAPI hooks. Part of
 // ApplyConfig; the OSD calls it after editing those fields.
 void Config_ApplyPacingPipeline();

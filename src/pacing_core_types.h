@@ -178,8 +178,12 @@ inline bool PacingSourceRecord_PipelineRung(const PacingSourceRecord& record, ui
         *rung = record.plan_rung;
         return true;
     }
+    // The Reflex driver limiter plans nothing and resolves {SourceOnly,
+    // Override}; with driver_limiter_hold (any other reason) its frames are
+    // planned, and an unplanned one waits for the first planned frame's rung.
     if (record.fallback_reason == static_cast<uint8_t>(PacingFallbackReason::Passthrough) ||
-        record.source_placement == static_cast<uint8_t>(PacingSourcePlacement::DriverLimiter)) {
+        (record.source_placement == static_cast<uint8_t>(PacingSourcePlacement::DriverLimiter) &&
+         record.fallback_reason == static_cast<uint8_t>(PacingFallbackReason::Override))) {
         *rung = static_cast<uint32_t>(PacingRung::SourceOnly);
         return true;
     }

@@ -516,6 +516,11 @@ double s_last_plan_early_lead_us = 0.0;
 // Margin of the newest pre-wait and the index it was made for (telemetry).
 uint64_t s_pre_sleep_wait_index = 0;
 double s_pre_sleep_wait_margin_us = 0.0;
+uint64_t s_precise_wait_index = 0;       // pre_sleep_precise: index of the newest precise pre-wait
+int64_t s_precise_wait_target_qpc = 0;   // and its committed release target
+uint32_t s_precise_wait_epoch = 0;       // and the cadence it was made under (source_stage.h)
+double s_precise_wait_interval_us = 0.0;
+PacingTimingMode s_precise_wait_mode = PacingTimingMode::Off;
 // Reflex Sleep on the presenting device: written by the Sleep hook (any
 // thread), read by the owner for placement availability.
 std::atomic<int64_t> s_last_reflex_sleep_qpc{0};
@@ -576,11 +581,17 @@ RenderCoupling s_render_coupling_logged = RenderCoupling::Unknown;
 uint64_t s_rhythm_logged_ahead[LEAD_HANDOFF_GPU_HORIZON_FRAMES + 1] = {};
 uint64_t s_rhythm_logged_late_outputs = 0;
 uint64_t s_rhythm_logged_pulled = 0;
+uint64_t s_rhythm_logged_driver_released = 0;
 int64_t s_rhythm_log_qpc = 0;
 // The Reflex Sleep hook's entry for grid index s_sleep_entry_index
 // (Scheduler_PlanReflexSleep): when the game reached ReLimiter for it.
 uint64_t s_sleep_entry_index = 0;
 int64_t s_sleep_entry_qpc = 0;
+// The driver's Reflex Sleep (Scheduler_EndDriverSleep, Hook_Sleep): the call
+// that returned for grid index s_driver_sleep_index, its start and return.
+uint64_t s_driver_sleep_index = 0;
+int64_t s_driver_sleep_start_qpc = 0;
+int64_t s_driver_sleep_end_qpc = 0;
 
 // LFC on the output interval (period_governor.h)
 LfcHysteresis s_lfc{};
@@ -801,6 +812,7 @@ static void ApplyLifecycle(SchedulerTrigger trigger, PacingSourceMarker marker) 
         s_period_tracker.Forget();
         s_pre_sleep.Reset();
         s_sleep_entry_index = 0;
+        s_driver_sleep_index = 0;
         s_last_plan_index = 0;
         ResetFeedbackAccumulators();
         ApplyFeedbackResetRequests();
@@ -917,6 +929,19 @@ static void PushSourceRelease(
     const bool interleave_off = s_interleave_active && !s_hold_interleave.Holding();
     record->feasibility_demoted = s_hold_feasibility.Overloaded() || interleave_off ? 1 : 0;
     record->feasibility_cause = static_cast<uint8_t>(s_feasibility_cause);
+    // The driver's sleep status as it stood when this frame's Reflex Sleep
+    // returned (Hook_Sleep, presenting device): taken once, so a record
+    // without a Sleep before it carries none.
+    uint64_t sleep_status = g_sleep_status_at_sleep_return.exchange(0, std::memory_order_relaxed);
+    // A result of another feedback-device publication is not this frame's.
+    if ((sleep_status >> 63) != 0 &&
+        SleepStatusToken(sleep_status) != g_sleep_status_token.load(std::memory_order_acquire))
+        sleep_status = 0;
+    if ((sleep_status >> 63) != 0) {
+        record->driver_sleep_status_valid = 1;
+        record->driver_use_game_sleep = static_cast<uint8_t>((sleep_status >> 32) & 1u);
+        record->driver_sleep_interval_us = static_cast<uint32_t>(sleep_status & 0xFFFFFFFFu);
+    }
     PacingTelemetry_PushSource(*record);
 }
 
@@ -1646,7 +1671,9 @@ static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
     s_rhythm_logged_gap_sum_us = s_floor_gap_sum_us;
     const uint64_t pulled = stage.floor_pulled_frames - s_rhythm_logged_pulled;
     s_rhythm_logged_pulled = stage.floor_pulled_frames;
-    if (paced == 0 && floors == 0 && ineligible == 0) return;
+    const uint64_t driver_released = stage.driver_released_frames - s_rhythm_logged_driver_released;
+    s_rhythm_logged_driver_released = stage.driver_released_frames;
+    if (paced == 0 && floors == 0 && ineligible == 0 && driver_released == 0) return;
     // Median and largest frames-ahead of the readiness anchor.
     size_t median_ahead = 0;
     size_t max_ahead = 0;
@@ -1668,7 +1695,7 @@ static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
              "(waited at the Signal %u of %u, blend %.2f, %llu switches; floors at own depth %llu, bounded %llu, "
              "blending %llu, mean gap %.2f ms); render thread %s (done before the previous frame's readiness %u "
              "of %u, %llu switches; released at the cap's release %llu); readiness anchor gaps %u; frames ahead "
-             "p50 %zu max %zu; period %.2f ms (median %.2f); late outputs followed %llu",
+             "p50 %zu max %zu; period %.2f ms (median %.2f); late outputs followed %llu; driver-released %llu",
         static_cast<unsigned long long>(paced),
         static_cast<unsigned long long>(steps[static_cast<size_t>(GpuPacedRhythmStep::Smooth)]),
         static_cast<unsigned long long>(steps[static_cast<size_t>(GpuPacedRhythmStep::Late)]),
@@ -1692,7 +1719,8 @@ static void LogGpuPacedRhythm(int64_t now_qpc) noexcept
         static_cast<unsigned long long>(pulled),
         lead.ReadyGapCount(), median_ahead, max_ahead,
         lead.RecentGpuPeriodUs() / 1000.0, lead.GpuPeriodUs() / 1000.0,
-        static_cast<unsigned long long>(late_outputs));
+        static_cast<unsigned long long>(late_outputs),
+        static_cast<unsigned long long>(driver_released));
 }
 
 // The held floor's cap bound changed mode, or the render coupling changed
@@ -1902,6 +1930,13 @@ static SourceStageFrame RunPlanned(
     // An ended pre-Sleep wait gates earlier frames of a lockstep engine like
     // the source wait (lead_controller.h).
     s_pre_sleep.EndedWait(&request.pre_wait_index, &request.pre_wait_start_qpc, &request.pre_wait_end_qpc);
+    // The marker plan shares the precise pre-wait's committed release target: the
+    // source stage waits no more when that wait reached it (source_stage.h).
+    const bool precise_pending = request.pre_wait_index != 0 && request.pre_wait_index == s_precise_wait_index;
+    request.precise_release_qpc = precise_pending ? s_precise_wait_target_qpc : 0;
+    request.precise_grid_epoch = precise_pending ? s_precise_wait_epoch : 0;
+    request.precise_interval_us = precise_pending ? s_precise_wait_interval_us : 0.0;
+    request.precise_mode = s_precise_wait_mode;
     // Render handoff limit: Sleep-hook waits that stalled first, then
     // whether the render thread already took this frame's predecessor.
     for (uint32_t stalls = s_handoff_hook_stalls.exchange(0, std::memory_order_relaxed); stalls > 0; --stalls) {
@@ -1949,10 +1984,23 @@ static SourceStageFrame RunPlanned(
             }
         }
     }
+    // The Reflex driver limiter placement reaches RunPlanned only with
+    // driver_limiter_hold (OnMarker): the driver releases the frame, ReLimiter
+    // plans it and waits for nothing.
+    request.driver_limiter_hold = pipeline.placement == PacingSourcePlacement::DriverLimiter;
     // The moment the game reached ReLimiter, when it entered the Reflex
     // Sleep for the index this plan is expected to take (source_stage.h).
     request.sleep_entry_index = s_sleep_entry_index;
     request.sleep_entry_qpc = s_sleep_entry_qpc;
+    // The driver's Reflex Sleep for the index this plan is expected to take,
+    // while it runs (the bypass off). The source stage records it for every
+    // such frame and, under the developer A/B gpu_paced_cadence, judges
+    // whether the driver released the frame (source_stage.h).
+    if (DriverSleepRuns(input.target_fps)) {
+        request.driver_sleep_index = s_driver_sleep_index;
+        request.driver_sleep_start_qpc = s_driver_sleep_start_qpc;
+        request.driver_sleep_end_qpc = s_driver_sleep_end_qpc;
+    }
     // GPU-paced cadence: the GPU floor term of the earliest release, so the
     // source stage knows when the GPU, not the render thread's handoff, sets
     // it (held frames: set above).
@@ -1996,7 +2044,7 @@ static SourceStageFrame RunPlanned(
         const int64_t source_wake_qpc = frame.plan.output_target_qpc - us_to_qpc(frame.plan.lead_us);
         const int64_t ready_qpc = frame.wait_start_qpc != 0 ? frame.wait_start_qpc : frame.release_qpc;
         pre_slept = s_pre_sleep.OnPlannedArrival(frame.plan.grid_index, ready_qpc,
-            source_wake_qpc, GetQPCFrequency(), &pre_sleep_end_qpc);
+            source_wake_qpc, GetQPCFrequency(), frame.driver_released, &pre_sleep_end_qpc);
         pre_sleep_late = pre_slept &&
             ready_qpc > (std::max)(source_wake_qpc, SourceStage_WakeEarliestQpc(request));
         s_last_plan_index = frame.plan.grid_index;
@@ -2196,6 +2244,25 @@ bool Scheduler_PreSleepPlacementActive() noexcept
         (pipeline.mode == PacingTimingMode::Vrr || pipeline.mode == PacingTimingMode::Fixed);
 }
 
+// The Reflex driver limiter placement with driver_limiter_hold: the driver
+// paces the source and ReLimiter only plans the frames and holds their output.
+bool Scheduler_DriverLimiterHoldActive() noexcept
+{
+    const PacingPipelineSnapshot pipeline = PacingPipeline_Read();
+    return pipeline.placement == PacingSourcePlacement::DriverLimiter &&
+        (pipeline.mode == PacingTimingMode::Vrr || pipeline.mode == PacingTimingMode::Fixed) &&
+        PacingPipeline_DriverLimiterHoldKey();
+}
+
+// The hook's entry as the moment the game reached ReLimiter for the next grid
+// index (Scheduler_PlanReflexSleep without a wait to plan).
+void Scheduler_RecordReflexSleepEntry(int64_t sleep_entry_qpc) noexcept
+{
+    if (sleep_entry_qpc <= 0) return;
+    s_sleep_entry_index = s_source_stage.Grid().Snapshot().last_planned_index + 1;
+    s_sleep_entry_qpc = sleep_entry_qpc;
+}
+
 bool Scheduler_PacesSource() noexcept
 {
     const PacingSourcePlacement placement = PacingPipeline_Read().placement;
@@ -2242,9 +2309,10 @@ static double PreSleepPredictedIntervalUs() noexcept
 }
 
 bool Scheduler_PlanReflexSleep(int64_t sleep_entry_qpc, int64_t now_qpc, bool driver_sleep, int64_t handoff_qpc,
-    int64_t* target_qpc, uint64_t* grid_index) noexcept
+    int64_t* target_qpc, uint64_t* grid_index, bool* precise) noexcept
 {
-    if (target_qpc == nullptr || grid_index == nullptr || !Scheduler_PreSleepPlacementActive()) {
+    if (target_qpc == nullptr || grid_index == nullptr || precise == nullptr ||
+        !Scheduler_PreSleepPlacementActive()) {
         return false;
     }
     // The hook's wait saw the newest released frame's handoff before this
@@ -2269,8 +2337,13 @@ bool Scheduler_PlanReflexSleep(int64_t sleep_entry_qpc, int64_t now_qpc, bool dr
     request.next_target_valid = s_last_plan_index != 0 &&
         s_last_plan_index == grid.last_planned_index &&
         CadenceGrid_TargetOf(grid, s_last_plan_generation, s_last_plan_index, &last_target_qpc);
+    // The interval the next target's prediction used: the pre_sleep_precise commitment
+    // is bound to it (source_stage.h), not to the previous plan's interval (low frame
+    // rate compensation makes them differ).
+    double predicted_interval_us = s_last_plan_interval_us;
     if (request.next_target_valid) {
-        request.next_target_qpc = last_target_qpc + us_to_qpc(PreSleepPredictedIntervalUs());
+        predicted_interval_us = PreSleepPredictedIntervalUs();
+        request.next_target_qpc = last_target_qpc + us_to_qpc(predicted_interval_us);
         // Render handoff limit: the next frame (the newest released frame's
         // successor) is released no earlier than A (HandoffFloorQpc), or,
         // when the newest frame was held under the developer A/B
@@ -2304,18 +2377,37 @@ bool Scheduler_PlanReflexSleep(int64_t sleep_entry_qpc, int64_t now_qpc, bool dr
     request.interval_us = s_last_plan_interval_us;
     request.last_release_qpc = s_last_plan_release_qpc;
     request.driver_sleep = driver_sleep;
+    request.precise = PacingPipeline_PreSleepPrecise();
     const PreSleepDecision decision = s_pre_sleep.Decide(request);
     if (!decision.wait) return false;
     s_pre_sleep_wait_index = request.next_index;
     s_pre_sleep_wait_margin_us = decision.margin_us;
+    // pre_sleep_precise: the pre-wait's target is the release target of this
+    // index; the marker plan that follows takes it as committed.
+    s_precise_wait_index = decision.precise ? request.next_index : 0;
+    s_precise_wait_target_qpc = decision.precise ? decision.wait_target_qpc : 0;
+    s_precise_wait_epoch = decision.precise ? grid.epoch : 0;
+    s_precise_wait_interval_us = decision.precise ? predicted_interval_us : 0.0;
+    s_precise_wait_mode = grid.mode;
     *target_qpc = decision.wait_target_qpc;
     *grid_index = request.next_index;
+    *precise = decision.precise;
     return true;
 }
 
 void Scheduler_EndReflexSleep(uint64_t grid_index, int64_t end_qpc) noexcept
 {
     s_pre_sleep.OnWaitEnd(grid_index, end_qpc);
+}
+
+// The driver's Sleep for the next grid index returned (Hook_Sleep, presenting
+// device, bypass off). The index is the one the next plan takes, as
+// Scheduler_PlanReflexSleep derives it.
+void Scheduler_EndDriverSleep(int64_t start_qpc, int64_t end_qpc) noexcept
+{
+    s_driver_sleep_index = s_source_stage.Grid().Snapshot().last_planned_index + 1;
+    s_driver_sleep_start_qpc = start_qpc;
+    s_driver_sleep_end_qpc = end_qpc;
 }
 
 // ── Main entry point ──
@@ -2464,6 +2556,7 @@ void OnMarker(
             ResetFeasibility("cap or FG divisor change");
             s_pre_sleep.Reset();
             s_sleep_entry_index = 0;
+            s_driver_sleep_index = 0;
             // The GPU floor's output-shaped windows and the GPU-paced rhythm
             // belong to the old cap and FG work (lead_controller.h).
             s_source_stage.ResetGpuFloor();
@@ -2573,7 +2666,10 @@ void OnMarker(
             if (ApplyDriverLimiter(DriverLimiterIntervalUs(input))) {
                 driver_limiter.active = true;
                 driver_limiter.interval_us = DriverLimiterIntervalUs(input);
-                RunDriverLimited(input, pipeline);
+                // driver_limiter_hold: the driver still releases the frame,
+                // ReLimiter plans it (no wait) so the output rung holds it.
+                if (PacingPipeline_DriverLimiterHold(config)) RunPlanned(input, pipeline, config);
+                else RunDriverLimited(input, pipeline);
                 return;
             }
             runtime.driver_limiter_unavailable = true;
@@ -2616,7 +2712,8 @@ void OnMarker(
         if (ApplyDriverLimiter(DriverLimiterIntervalUs(input))) {
             driver_limiter.active = true;
             driver_limiter.interval_us = DriverLimiterIntervalUs(input);
-            RunDriverLimited(input, pipeline);
+            if (PacingPipeline_DriverLimiterHold(config)) RunPlanned(input, pipeline, config);
+            else RunDriverLimited(input, pipeline);
             PollReflexLatencyReport(input.interval_us);
             return;
         }
