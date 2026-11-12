@@ -13,6 +13,7 @@ void PacingTelemetry_PushSource(const PacingSourceRecord& record) noexcept;   //
 void PacingTelemetry_PushPresent(const PacingPresentRecord& record) noexcept; // Present threads
 void PacingTelemetry_PushGate(const PacingGateRecord& record) noexcept;       // GPU deadline worker
 void PacingTelemetry_PushReady(const PacingReadyRecord& record) noexcept;     // readiness or GPU deadline worker
+void PacingTelemetry_PushGpuQueue(const PacingGpuQueueRecord& record) noexcept; // gpu_queue_probe completion thread (developer key)
 void PacingTelemetry_PushReflex(const PacingReflexRecord& record) noexcept;   // scheduler owner
 void PacingTelemetry_PushWait(const PacingWaitRecord& record) noexcept;       // async marker hook
 void PacingTelemetry_PushDisplay(const PacingDisplaySample& sample) noexcept; // ETW collector thread
@@ -114,6 +115,22 @@ inline PacingPresentAttribution PacingTelemetry_TakePresentAttribution(
         return {};
     }
     return attribution;
+}
+
+// The key of the attribution, without consuming it: the same validity rule as the take above (a
+// valid key, a marker time that is not in the future and no older than max_age_qpc), an empty key
+// otherwise. For a site in front of the Present's native call (the queue probe's readiness site)
+// that tags its frame with the identity the Present's own pacing row will take.
+inline PacingFrameKey PacingTelemetry_PeekPresentAttributionKey(
+    int64_t now_qpc, int64_t max_age_qpc) noexcept
+{
+    const PacingPresentAttribution& attribution = t_pacing_present_attribution;
+    if (!PacingFrameKey_IsValid(attribution.key) || attribution.marker_qpc <= 0 ||
+        now_qpc < attribution.marker_qpc ||
+        now_qpc - attribution.marker_qpc > max_age_qpc) {
+        return {};
+    }
+    return attribution.key;
 }
 
 // GPU deadline gate output for the native Present in progress on this thread.

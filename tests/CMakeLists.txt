@@ -221,6 +221,130 @@ if(MSVC)
     target_compile_options(test_cadence_grid PRIVATE /W4 /utf-8 /permissive-)
 endif()
 
+## ── Unified pacer tests ──
+# Directly tests the production pure law (src/unified_pacer.cpp): interval
+# composition, start target and no catch-up, pairs and staleness, hard limit,
+# start resolution and the Sleep-mode tuple. Hooks and pacing need live validation.
+
+add_executable(test_unified_pacer
+    test_unified_pacer.cpp
+    ${CMAKE_SOURCE_DIR}/src/unified_pacer.cpp
+    ${CMAKE_SOURCE_DIR}/src/unified_queue_law.cpp
+)
+set_target_properties(test_unified_pacer PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+target_include_directories(test_unified_pacer PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+if(MSVC)
+    set_property(TARGET test_unified_pacer PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(test_unified_pacer PRIVATE /W4 /utf-8 /permissive-)
+endif()
+
+## ── Unified queue law tests ──
+# Directly tests the production pure queue law (src/unified_queue_law.cpp) and the probe feed
+# ring (src/gpu_queue_law_feed.cpp), and the law through the production unified pacer: samples
+# from records, the window statistics, the fixed points of P, the fallback rule, the credit's
+# rule switching and the key off identity. The probe's records on a live queue need live validation.
+
+add_executable(test_unified_queue_law
+    test_unified_queue_law.cpp
+    ${CMAKE_SOURCE_DIR}/src/unified_pacer.cpp
+    ${CMAKE_SOURCE_DIR}/src/unified_queue_law.cpp
+    ${CMAKE_SOURCE_DIR}/src/gpu_queue_law_feed.cpp
+)
+set_target_properties(test_unified_queue_law PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+target_include_directories(test_unified_queue_law PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+if(MSVC)
+    set_property(TARGET test_unified_queue_law PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(test_unified_queue_law PRIVATE /W4 /utf-8 /permissive-)
+endif()
+
+## ── GPU queue probe core tests ──
+# Directly tests the production accounting core of the developer probe
+# gpu_queue_probe (src/gpu_queue_probe_core.cpp): empty / first-gap split, start stamps,
+# the done chain, parked and out-of-order stamps, boundaries, incomplete frames, lateness
+# bounds and the bounded wait-free ring. The D3D12 hook, fences and completion thread need
+# live validation.
+
+add_executable(test_gpu_queue_probe_core
+    test_gpu_queue_probe_core.cpp
+    ${CMAKE_SOURCE_DIR}/src/gpu_queue_probe_core.cpp
+)
+set_target_properties(test_gpu_queue_probe_core PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+target_include_directories(test_gpu_queue_probe_core PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+if(MSVC)
+    set_property(TARGET test_gpu_queue_probe_core PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(test_gpu_queue_probe_core PRIVATE /W4 /utf-8 /permissive-)
+endif()
+
+# The pure dependency rule of the probe's source key (src/gpu_queue_dependency.cpp): tables, matching by
+# fence and value, hop limit, CPU-signalled branch end, window selection by command lists, tie to the
+# presenting queue, aged-out fences. The hooks that feed it need live validation.
+add_executable(test_gpu_queue_dependency
+    test_gpu_queue_dependency.cpp
+    ${CMAKE_SOURCE_DIR}/src/gpu_queue_dependency.cpp
+)
+set_target_properties(test_gpu_queue_dependency PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+target_include_directories(test_gpu_queue_dependency PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(MSVC)
+    set_property(TARGET test_gpu_queue_dependency PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(test_gpu_queue_dependency PRIVATE /W4 /utf-8 /permissive-)
+endif()
+
+## ── Marker stamps tests ──
+# Directly tests the production lock-free stamp ring of the game's own SIMULATION_START,
+# SIMULATION_END, RENDERSUBMIT_START and RENDERSUBMIT_END markers (src/marker_stamps.cpp) and the
+# hooks' gate (MarkerStamps_Capture / MarkerStamps_Publish): consistent reads against concurrent writers, the complete
+# frame key (domain, producer epoch, frame id), replacement by a later frame, the reset and a hook
+# resuming after it, the duplicate policy (latest sample, one whole), the key-off identity (no clock
+# read, nothing stamped), the CPU time of a span (same thread only, known rate only) and the cycle
+# rate's decision logic (src/marker_rate.cpp: paired reads, invariant TSC, agreement of the thread
+# cycle counter). On Windows it also runs the thread sample's micro-benchmark and the calibration
+# (src/marker_cycles.cpp; prints, no assertion on speed). The marker hooks, their threads and the
+# real marker streams of a game need live validation.
+
+add_executable(test_marker_stamps
+    test_marker_stamps.cpp
+    ${CMAKE_SOURCE_DIR}/src/marker_stamps.cpp
+    ${CMAKE_SOURCE_DIR}/src/marker_rate.cpp
+)
+if(WIN32)
+    target_sources(test_marker_stamps PRIVATE ${CMAKE_SOURCE_DIR}/src/marker_cycles.cpp)
+endif()
+set_target_properties(test_marker_stamps PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+target_include_directories(test_marker_stamps PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+if(MSVC)
+    set_property(TARGET test_marker_stamps PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(test_marker_stamps PRIVATE /W4 /utf-8 /permissive-)
+endif()
+
 ## ── Lead controller C1 tests ──
 # Directly tests the production sample formulas, pending-frame assembly,
 # histogram quantile and lead slew. Event producers and pacing need live validation.
@@ -299,6 +423,8 @@ add_executable(test_source_stage
     test_source_stage.cpp
     ${CMAKE_SOURCE_DIR}/src/source_stage.cpp
     ${CMAKE_SOURCE_DIR}/src/cadence_grid.cpp
+    ${CMAKE_SOURCE_DIR}/src/unified_pacer.cpp
+    ${CMAKE_SOURCE_DIR}/src/unified_queue_law.cpp
     ${CMAKE_SOURCE_DIR}/src/cadence_grid_publication.cpp
     ${CMAKE_SOURCE_DIR}/src/frame_plan.cpp
     ${CMAKE_SOURCE_DIR}/src/lead_controller.cpp
@@ -355,6 +481,8 @@ add_executable(test_hook_regressions
     ${CMAKE_SOURCE_DIR}/src/gpu_present_types.cpp
     ${CMAKE_SOURCE_DIR}/src/native_present_gate.cpp
     ${CMAKE_SOURCE_DIR}/src/pacing_resolver.cpp
+    ${CMAKE_SOURCE_DIR}/src/vtable_copy.cpp
+    ${CMAKE_SOURCE_DIR}/src/startup_breadcrumb.cpp
     ${CMAKE_SOURCE_DIR}/src/hooks.cpp)
 target_include_directories(test_hook_regressions PRIVATE
     ${CMAKE_SOURCE_DIR}/src
@@ -362,6 +490,88 @@ target_include_directories(test_hook_regressions PRIVATE
     ${CMAKE_SOURCE_DIR}/deps/reshade/deps/minhook/include)
 target_compile_definitions(test_hook_regressions PRIVATE
     NOMINMAX WIN32_LEAN_AND_MEAN)
+
+# The hook batch (src/hooks.cpp alone; MinHook, the logger and the breadcrumb are fakes in the test): one apply per
+# batch, publication before the queue, the empty and the nested batch, the exclusive install lock, refused
+# admission, the failing-apply path (pending hooks enabled one by one, none left queued) and a retained hook set
+# enabled again. The real MinHook freeze and the site wiring need live validation.
+add_executable(test_hook_batch
+    test_hook_batch.cpp
+    ${CMAKE_SOURCE_DIR}/src/hooks.cpp)
+target_include_directories(test_hook_batch PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/deps/reshade/deps/minhook/include)
+target_compile_definitions(test_hook_batch PRIVATE
+    NOMINMAX WIN32_LEAN_AND_MEAN)
+
+# The hook installer thread (src/hooks.cpp alone; MinHook, the logger and the breadcrumb are fakes; the thread, its
+# descriptor, self-check and death are real): the kill switch, the unprotected fallback, dispatch and results, the
+# single job slot, the inline entry, stop, death before a job and in flight. Skipped (77) where the debug
+# privilege cannot be removed from the token.
+add_executable(test_hook_installer
+    test_hook_installer.cpp
+    ${CMAKE_SOURCE_DIR}/src/hooks.cpp)
+target_include_directories(test_hook_installer PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/deps/reshade/deps/minhook/include)
+target_compile_definitions(test_hook_installer PRIVATE
+    NOMINMAX WIN32_LEAN_AND_MEAN)
+
+# The installer thread against the REAL MinHook (minhook_static): a requester enabling and disabling a real hook
+# through hooks.cpp, another engine suspending every thread it can open in a tight loop, and a caller of the hooked
+# function. Every thread must keep making progress and every call must land in the original or the detour. Has its
+# own watchdog; skipped (77) where the installer thread is not protected.
+add_executable(test_hook_installer_stress
+    test_hook_installer_stress.cpp
+    ${CMAKE_SOURCE_DIR}/src/hooks.cpp)
+target_include_directories(test_hook_installer_stress PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/deps/reshade/deps/minhook/include)
+target_compile_definitions(test_hook_installer_stress PRIVATE
+    NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(test_hook_installer_stress PRIVATE minhook_static)
+
+# The start-up breadcrumb (src/startup_breadcrumb.cpp): the record seqlock, the marks (first-wins, nothing after
+# Running except Closed, the 32nd completed present), the judgement of a previous launch's record (valid and
+# before Running only) and the reset/attach protocol on real temporary files, including a dropped mapping as the
+# kill equivalent, a record torn in every way, a missing, short or unwritable file, and a file held by another
+# handle. The logger's warning line and the hook sites need live validation.
+add_executable(test_startup_breadcrumb
+    test_startup_breadcrumb.cpp
+    ${CMAKE_SOURCE_DIR}/src/startup_breadcrumb.cpp
+)
+set_target_properties(test_startup_breadcrumb PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+target_include_directories(test_startup_breadcrumb PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_startup_breadcrumb PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+if(MSVC)
+    set_property(TARGET test_startup_breadcrumb PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(test_startup_breadcrumb PRIVATE /W4 /utf-8 /permissive-)
+endif()
+
+# The pure rules of the native route's private vtable copy (src/vtable_copy.cpp): the copy extent on a synthetic
+# vtable, the forwarding records (immutable, the chain after a replacement), the verdict on a changed vptr,
+# the thread-local dedup record, the teardown rules. Builds for both architectures. The install, the detours and
+# DXGI itself need live validation.
+add_executable(test_vtable_copy
+    test_vtable_copy.cpp
+    ${CMAKE_SOURCE_DIR}/src/vtable_copy.cpp
+)
+set_target_properties(test_vtable_copy PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+target_include_directories(test_vtable_copy PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(MSVC)
+    set_property(TARGET test_vtable_copy PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(test_vtable_copy PRIVATE /W4 /utf-8 /permissive-)
+endif()
 
 add_executable(test_shutdown_lifecycle test_shutdown_lifecycle.cpp)
 add_executable(test_native_pcl_snapshot test_native_pcl_snapshot.cpp)
@@ -373,6 +583,7 @@ add_executable(test_native_present_gate test_native_present_gate.cpp
     ${CMAKE_SOURCE_DIR}/src/frame_timeline.cpp)
 add_executable(test_gpu_present_gate test_gpu_present_gate.cpp
     ${CMAKE_SOURCE_DIR}/src/gpu_present_gate.cpp ${CMAKE_SOURCE_DIR}/src/gpu_present_types.cpp
+    ${CMAKE_SOURCE_DIR}/src/startup_breadcrumb.cpp
     ${CMAKE_SOURCE_DIR}/src/gpu_readiness.cpp
     ${CMAKE_SOURCE_DIR}/src/frame_timeline.cpp ${CMAKE_SOURCE_DIR}/src/wake_guard.cpp
     ${CMAKE_SOURCE_DIR}/src/pacing_resolver.cpp ${CMAKE_SOURCE_DIR}/src/frame_plan.cpp
@@ -412,12 +623,16 @@ add_executable(test_feedback_device_identity
     test_feedback_device_identity.cpp
     ${CMAKE_SOURCE_DIR}/src/native_present_gate.cpp
     ${CMAKE_SOURCE_DIR}/src/feedback_device_identity.cpp
+    ${CMAKE_SOURCE_DIR}/src/unified_pacer.cpp
+    ${CMAKE_SOURCE_DIR}/src/marker_stamps.cpp
+    ${CMAKE_SOURCE_DIR}/src/unified_queue_law.cpp
     ${CMAKE_SOURCE_DIR}/src/frame_timeline.cpp
     ${CMAKE_SOURCE_DIR}/src/frame_plan.cpp
     ${CMAKE_SOURCE_DIR}/src/cadence_grid.cpp
     ${CMAKE_SOURCE_DIR}/src/cadence_grid_publication.cpp
     ${CMAKE_SOURCE_DIR}/src/pacing_resolver.cpp
-    ${CMAKE_SOURCE_DIR}/src/render_handoff.cpp)
+    ${CMAKE_SOURCE_DIR}/src/render_handoff.cpp
+    ${CMAKE_SOURCE_DIR}/src/unified_pacer.cpp)
 target_link_libraries(test_feedback_device_identity PRIVATE Synchronization)
 target_include_directories(test_feedback_device_identity PRIVATE
     ${CMAKE_SOURCE_DIR}/deps/reshade/include
@@ -465,7 +680,7 @@ if(MSVC)
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     target_compile_options(test_pacing_csv PRIVATE /W4 /utf-8 /permissive-)
 endif()
-foreach(regression_target IN ITEMS test_hook_regressions
+foreach(regression_target IN ITEMS test_hook_regressions test_hook_batch test_hook_installer test_hook_installer_stress
     test_pacing_metrics test_pacing_join test_reflex_clock_map test_native_pcl_loss_window
     test_native_present_gate test_cross_thread_slot
     test_gpu_readiness
@@ -506,6 +721,13 @@ set_tests_properties(feedback_device_identity PROPERTIES TIMEOUT 30)
 add_test(NAME oled_care COMMAND test_oled_care)
 add_test(NAME osd_position COMMAND test_osd_position)
 add_test(NAME hook_regressions COMMAND test_hook_regressions)
+add_test(NAME hook_batch COMMAND test_hook_batch)
+add_test(NAME hook_installer COMMAND test_hook_installer)
+set_tests_properties(hook_installer PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+add_test(NAME hook_installer_stress COMMAND test_hook_installer_stress)
+set_tests_properties(hook_installer_stress PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+add_test(NAME vtable_copy COMMAND test_vtable_copy)
+add_test(NAME startup_breadcrumb COMMAND test_startup_breadcrumb)
 add_test(NAME shutdown_lifecycle COMMAND test_shutdown_lifecycle)
 add_test(NAME swapchain_selection_policy COMMAND test_swapchain_selection_policy)
 add_test(NAME pacing_sleep COMMAND test_pacing_sleep)
@@ -528,6 +750,12 @@ add_test(NAME frame_time_adaptation COMMAND test_frame_time_adaptation)
 add_test(NAME pacing_resolver COMMAND test_pacing_resolver)
 add_test(NAME cadence_grid COMMAND test_cadence_grid)
 set_tests_properties(cadence_grid PROPERTIES TIMEOUT 60)
+add_test(NAME unified_pacer COMMAND test_unified_pacer)
+set_tests_properties(unified_pacer PROPERTIES TIMEOUT 120)
+add_test(NAME unified_queue_law COMMAND test_unified_queue_law)
+add_test(NAME gpu_queue_probe_core COMMAND test_gpu_queue_probe_core)
+add_test(NAME gpu_queue_dependency COMMAND test_gpu_queue_dependency)
+add_test(NAME marker_stamps COMMAND test_marker_stamps)
 add_test(NAME lead_controller COMMAND test_lead_controller)
 add_test(NAME period_governor COMMAND test_period_governor)
 add_test(NAME source_placement COMMAND test_source_placement)

@@ -11,6 +11,26 @@
 // Published by Config_ApplyPacingPipeline; read on the game's thread.
 inline std::atomic<bool> g_gpu_start_probe{false};
 
+// Developer key gpu_queue_probe: what the presenting queue does per frame (gpu_queue_probe.h).
+// Published by Config_ApplyPacingPipeline; read on the game's thread.
+inline std::atomic<bool> g_gpu_queue_probe{false};
+
+// Developer key unified_queue_law (64-bit): the probe's per-frame records also feed the unified
+// pacer's queue law (gpu_queue_law_feed.h). Published by Config_ApplyPacingPipeline; read on
+// the probe's completion thread.
+inline std::atomic<bool> g_gpu_queue_law_feed{false};
+
+// Developer key unified_queue_upstream (64-bit; 0 on Win32): 0 off, 1 the game's render markers are
+// stamped locally (marker_stamps.h). Published by
+// Config_ApplyPacingPipeline; read on the threads that call the marker hooks.
+inline std::atomic<int> g_unified_queue_upstream{0};
+
+// Developer key gpu_queue_probe_source (64-bit; 0 on Win32): 0 the probe adopts the presenting
+// queue (or the frame generation source queue), 1 it follows the per-frame fence dependencies to
+// the queue that carries the frame's rendering. Effective only with the probe on. Published by
+// Config_ApplyPacingPipeline.
+inline std::atomic<int> g_gpu_queue_probe_source{0};
+
 // The newest SetFlipConfig calls that enabled flip metering (nFramesPerBatch >
 // 0), for the pacing CSV's flip_config_qpc and flip_time_per_batch_us: a ring
 // of the newest FLIP_CONFIG_RING calls, so each row takes the newest call at or

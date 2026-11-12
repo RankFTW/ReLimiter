@@ -48,6 +48,8 @@ HookInstallGuard::HookInstallGuard() noexcept : admitted_(true) {}
 HookInstallGuard::~HookInstallGuard() {}
 bool Hooks_PinTargetModule(void*) noexcept { return true; }
 MH_STATUS InstallHookPublished(void*, void*, void*, HookOriginalPublisher) { return MH_ERROR_DISABLED; }
+MH_STATUS Hooks_FlushBatch() noexcept { return MH_OK; }
+bool Hooks_TargetEnabled(void*) noexcept { return false; }
 
 static HRESULT Forward(IDXGISwapChain* base, UINT sync, UINT flags, bool& skip) {
     CHECK(base == reinterpret_cast<IDXGISwapChain*>(0x1000));

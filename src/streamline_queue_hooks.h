@@ -1,9 +1,15 @@
 #pragma once
 #include <Windows.h>
+#include <array>
 #include <cstdint>
 struct StreamlineComEvidence;
 #ifdef _WIN64
 void StreamlineQueue_Offer(const StreamlineComEvidence&) noexcept;
+// The one owner of the native queue detours (ID3D12CommandQueue slots 10, 14, 15). Idempotent:
+// identical methods already installed answer true without touching MinHook, other methods false.
+// StreamlineQueue_Offer enables the Streamline observation on top of it; gpu_queue_probe adopts
+// the same detours.
+bool StreamlineQueue_EnsureHooks(const std::array<uint64_t, 3>& methods) noexcept;
 void StreamlineQueue_SetFeatureModule(void* options, void* state) noexcept;
 void StreamlineQueue_BlockFeature() noexcept;
 void StreamlineQueue_Drain(bool final = false) noexcept;

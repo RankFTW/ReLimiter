@@ -93,6 +93,7 @@ struct PacingJoinedRow {
     bool has_source = false;
     bool has_gate = false;
     bool has_ready = false;
+    bool has_gpu_queue = false;
     bool has_reflex = false;
     bool has_wait = false;
     PacingDisplaySample display{};
@@ -100,6 +101,7 @@ struct PacingJoinedRow {
     PacingSourceRecord source{};
     PacingGateJoin gate{};
     PacingReadyRecord ready{};
+    PacingGpuQueueRecord gpu_queue{};
     PacingReflexRecord reflex{};
     PacingWaitJoin wait{};
 };
@@ -129,6 +131,8 @@ struct PacingJoinStatistics {
     uint64_t source_capacity_evictions = 0;
     uint64_t gate_capacity_evictions = 0;
     uint64_t ready_capacity_evictions = 0;
+    uint64_t gpu_queue_joined = 0;
+    uint64_t gpu_queue_capacity_evictions = 0;
     uint64_t reflex_capacity_evictions = 0;
     // Cross-thread hand-off evidence: displays with an ETW frame ID whose
     // Present carried a cross-thread key that matched it, or did not.
@@ -169,6 +173,9 @@ public:
     void AddPresent(const PacingPresentRecord& record, int64_t now_qpc) noexcept;
     void AddGate(const PacingGateRecord& record, int64_t now_qpc) noexcept;
     void AddReady(const PacingReadyRecord& record, int64_t now_qpc) noexcept;
+    // Developer key gpu_queue_probe: what the presenting queue did for one frame; retained and
+    // joined to the row through (swapchain_generation, present_sequence) of its Present.
+    void AddGpuQueue(const PacingGpuQueueRecord& record, int64_t now_qpc) noexcept;
     void AddReflex(const PacingReflexRecord& record, int64_t now_qpc) noexcept;
     void AddWait(const PacingWaitRecord& record, int64_t now_qpc) noexcept;
     // Queues a display sample for joining after the grace. Returns false and
@@ -227,6 +234,7 @@ private:
     };
     using RetainedGate = Retained<PacingGateJoin>;
     using RetainedReady = Retained<PacingReadyRecord>;
+    using RetainedGpuQueue = Retained<PacingGpuQueueRecord>;
     using RetainedReflex = Retained<PacingReflexRecord>;
     using RetainedWait = Retained<PacingWaitJoin>;
 
@@ -257,6 +265,7 @@ private:
     PacingJoinRing<RetainedReady, PACING_JOIN_RETENTION_CAPACITY> readies_{};
     PacingJoinRing<RetainedReflex, PACING_JOIN_RETENTION_CAPACITY> reflexes_{};
     PacingJoinRing<RetainedWait, PACING_JOIN_RETENTION_CAPACITY> waits_{};
+    PacingJoinRing<RetainedGpuQueue, PACING_JOIN_RETENTION_CAPACITY> gpu_queues_{};
     PacingJoinRing<PendingDisplay, PACING_JOIN_PENDING_DISPLAY_CAPACITY> pending_displays_{};
     std::array<SwapchainDisplayState, PACING_JOIN_SWAPCHAIN_CAPACITY> swapchains_{};
     uint64_t swapchain_use_clock_ = 0;

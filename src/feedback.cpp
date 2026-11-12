@@ -1057,8 +1057,11 @@ static bool TryIngestReflexLatency(double effective_interval_us) {
         pending_sample.gpu_service_us = sample_gpu_service_us;
         pending_sample.gpu_execution_available = r.gpuActiveRenderTimeUs > 0;
         pending_sample.gpu_active_us = static_cast<double>(r.gpuActiveRenderTimeUs);
+        pending_sample.ai_frame_us = static_cast<double>(r.aiFrameTimeUs);
         pending_sample.gpu_start_qpc = ReflexTimestampToQpc(r.gpuRenderStartTime);
         pending_sample.gpu_end_qpc = ReflexTimestampToQpc(r.gpuRenderEndTime);
+        pending_sample.gpu_start_driver_us = r.gpuRenderStartTime;
+        pending_sample.os_queue_start_driver_us = r.osRenderQueueStartTime;
         if (r.presentEndTime > 0 && r.gpuRenderEndTime > r.presentEndTime) {
             const double gap_us = ReflexTimestampDeltaUs(r.presentEndTime, r.gpuRenderEndTime);
             if (gap_us < effective_interval_us * 3.0) pending_sample.present_end_to_gpu_end_us = gap_us;

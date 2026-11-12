@@ -5,6 +5,8 @@
 #include "frame_timeline.h"
 #include "health.h"
 #include "logger.h"
+#include "native_present_gate.h"
+#include "nvapi_hooks.h"
 #include "pacing_resolver.h"
 #include "scheduler.h"
 #include "streamline_hooks.h"
@@ -146,7 +148,8 @@ void WriteStatus(const Result* last, int64_t now) noexcept
         "last_seq=%llu\nlast_ok=%d\nlast_qpc=%lld\nlast_message=%s\n"
         "capture=%d\ncapture_epoch=%u\ntarget_fps=%d\n"
         "mode=%s\nrung=%s\nauto_rung=%s\nreason=%s\nplacement=%s\npipeline_generation=%u\n"
-        "fg_presenting=%d\nfg_multiplier=%d\nnvapi_markers=%d\n",
+        "fg_presenting=%d\nfg_multiplier=%d\nnvapi_markers=%d\ncross_thread_verified=%d\n"
+        "unified_pacer=%d\nunified_driver_pacing=%d\n",
         GetCurrentProcessId(), static_cast<long long>(now), static_cast<long long>(s_frequency),
         static_cast<unsigned long long>(s_presents.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(s_queued_seq),
@@ -157,7 +160,9 @@ void WriteStatus(const Result* last, int64_t now) noexcept
         PacingTimingMode_Text(pipeline.mode), PacingRung_Text(pipeline.rung), PacingRung_Text(pipeline.auto_rung),
         PacingFallbackReason_Text(pipeline.reason), PacingSourcePlacement_Text(pipeline.placement),
         pipeline.generation, g_fg_presenting.load(std::memory_order_relaxed) ? 1 : 0,
-        g_fg_multiplier.load(std::memory_order_relaxed), AreNvAPIMarkersFlowing() ? 1 : 0);
+        g_fg_multiplier.load(std::memory_order_relaxed), AreNvAPIMarkersFlowing() ? 1 : 0,
+        NativeGate_CrossThreadVerified() ? 1 : 0,
+        PacingPipeline_UnifiedPacerKey() ? 1 : 0, g_unified_driver_pacing.load(std::memory_order_relaxed) ? 1 : 0);
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(text)) return;
     const HANDLE file = CreateFileW(s_status_temp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL, nullptr);

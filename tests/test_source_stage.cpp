@@ -92,6 +92,17 @@ public:
     int wait_calls = 0;
     int stall_calls = 0;
     int64_t last_wait_target = 0;
+    // Failing waits (the unified marker wait): from this WaitUntil call on (1-based, 0 = never)
+    // the wait returns false without moving the clock; `stuck` returns true without moving it;
+    // `reject_over_ticks` makes a wait longer than that fail like the production waiter does
+    // (waits over 500 ms); `longest_wait_ticks` is the longest wait asked for.
+    int fail_from_call = 0;
+    bool stuck = false;
+    int64_t reject_over_ticks = 0;
+    int64_t longest_wait_ticks = 0;
+    // The first N waits report false although the chunk's end has already passed when the
+    // waiter is entered (the clock is at the chunk's end): not a cancellation.
+    int already_passed_calls = 0;
     PacingPlanKey expected_key{};
     bool plan_visible_at_wait = false;
     bool grid_visible_at_wait = false;
@@ -112,6 +123,17 @@ public:
             CadenceGrid_TargetOf(snapshot, expected_key.controller_generation,
                 plan_at_wait.grid_index, &target) &&
             target == plan_at_wait.output_target_qpc;
+        longest_wait_ticks = (std::max)(longest_wait_ticks, target_qpc - now);
+        if (already_passed_calls > 0) {
+            --already_passed_calls;
+            if (target_qpc > now) now = target_qpc;
+            return false;
+        }
+        if ((fail_from_call > 0 && wait_calls >= fail_from_call) ||
+            (reject_over_ticks > 0 && target_qpc - now > reject_over_ticks)) {
+            return false;
+        }
+        if (stuck) return true;
         if (target_qpc > now) now = target_qpc;
         return true;
     }
@@ -2305,6 +2327,1277 @@ void TestCadenceRestartsCountForTheFloor()
     CHECK(!g_stage.Lead().CadenceRestartSeen(1));
 }
 
+// ── Unified pacer (developer key unified_pacer): the unified branch of RunPlannedFrame ──
+
+UnifiedIntervalTerms CapTerms(double interval_us)
+{
+    UnifiedIntervalTerms terms{};
+    terms.cap_us = interval_us;
+    return terms;
+}
+
+SourceStageRequest UnifiedRequest(const PacingPlanKey& key, std::atomic<uint64_t>* mailbox)
+{
+    SourceStageRequest request = Request(key,
+        Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly, PacingSourcePlacement::Unified));
+    request.unified.active = true;
+    request.unified.terms = CapTerms(kIntervalUs);
+    request.unified.raw_fg_divisor = 1;
+    request.unified.mailbox = mailbox;
+    return request;
+}
+
+// The Sleep hook's side as the scheduler runs it: reserve at A, wait to T, publish R.
+UnifiedStart SleepHook(std::atomic<uint64_t>* mailbox, int64_t arrival, UnifiedSleepOutcome outcome,
+    int64_t release_qpc)
+{
+    UnifiedStart start{};
+    CHECK(g_stage.Unified().Reserve(g_stage.Grid().NextIndex(), 1, arrival, CapTerms(kIntervalUs), &start) ==
+          UnifiedReserveStatus::Reserved);
+    if (outcome != UnifiedSleepOutcome::None) {
+        mailbox->store(UnifiedMailbox_Pack(start.token, outcome, release_qpc - arrival), std::memory_order_release);
+    }
+    return start;
+}
+
+void TestUnifiedBranch()
+{
+    std::printf("Test: the unified branch resolves the start, commits R once and plans H = B + L\n");
+    ResetStage();
+    g_stage.SetUnifiedEnabled(true, 1);
+    std::atomic<uint64_t> mailbox{0};
+    ScriptedClock clock;
+
+    // First frame: no origin, no Sleep: the marker-site path releases at the arrival.
+    const SourceStageFrame first = g_stage.RunPlannedFrame(UnifiedRequest(Key(100), &mailbox), &clock);
+    CHECK(first.planned && first.unified.valid);
+    CHECK(first.unified.kind == UnifiedResolutionKind::MarkerPath);
+    CHECK((first.unified.flags & kUpReset) != 0 && (first.unified.flags & kUpMarkerStart) != 0);
+    CHECK(first.release_qpc == kStart && clock.wait_calls == 0);
+    // One frame generation factor: B = R, so H = R + L.
+    CHECK(std::llabs(first.plan.output_target_qpc - first.release_qpc - Ticks(first.plan.lead_us)) <= 1);
+
+    // Second frame through the Sleep: T(2) = O(1) + I; the Sleep waited to T.
+    const int64_t arrival2 = kStart + Ticks(4'000.0);
+    clock.now = arrival2;
+    UnifiedStart start2{};
+    {
+        start2 = SleepHook(&mailbox, arrival2, UnifiedSleepOutcome::None, 0);
+        const int64_t t2 = UnifiedPacer_TargetTicks(start2.target);
+        CHECK(t2 == kStart + Ticks(kIntervalUs) && !start2.release_now);
+        mailbox.store(UnifiedMailbox_Pack(start2.token, UnifiedSleepOutcome::Completed, t2 - arrival2),
+            std::memory_order_release);
+        clock.now = t2;
+    }
+    const int waits = clock.wait_calls;
+    const SourceStageFrame second = g_stage.RunPlannedFrame(UnifiedRequest(Key(101), &mailbox), &clock);
+    CHECK(second.planned && second.unified.kind == UnifiedResolutionKind::Consumed);
+    CHECK(second.release_qpc == kStart + Ticks(kIntervalUs));
+    CHECK(clock.wait_calls == waits); // nothing waited at the marker
+    CHECK(mailbox.load() == 0);       // consumed once
+    CHECK(second.pre_wait_start_qpc == arrival2 && second.pre_wait_end_qpc == second.release_qpc);
+    CHECK(second.game_arrival_qpc == arrival2);
+    CHECK(second.plan.grid_index == first.plan.grid_index + 1);
+    CHECK(second.plan.interval_us == kIntervalUs);
+
+    // A late arrival: released at once; the origin moves to the actual release, so the
+    // next start is never closer than I (no catch-up).
+    const int64_t t3 = kStart + Ticks(2 * kIntervalUs);
+    const int64_t arrival3 = t3 + Ticks(3'000.0);
+    clock.now = arrival3;
+    const UnifiedStart start3 = SleepHook(&mailbox, arrival3, UnifiedSleepOutcome::Late, arrival3);
+    CHECK(start3.release_now);
+    const SourceStageFrame third = g_stage.RunPlannedFrame(UnifiedRequest(Key(102), &mailbox), &clock);
+    CHECK(third.planned && third.release_qpc == arrival3);
+    CHECK((third.unified.flags & kUpLate) != 0);
+    clock.now = arrival3 + Ticks(1'000.0);
+    const UnifiedStart start4 = SleepHook(&mailbox, clock.now, UnifiedSleepOutcome::None, 0);
+    CHECK(UnifiedPacer_TargetTicks(start4.target) >= third.release_qpc + Ticks(kIntervalUs) - 1);
+
+    // A Sleep still running at the marker (no word): the marker waits to T(n).
+    clock.now = arrival3 + Ticks(2'000.0);
+    const int64_t t4 = UnifiedPacer_TargetTicks(start4.target);
+    const int waits_before = clock.wait_calls;
+    const SourceStageFrame fourth = g_stage.RunPlannedFrame(UnifiedRequest(Key(103), &mailbox), &clock);
+    CHECK(fourth.planned && fourth.unified.kind == UnifiedResolutionKind::WaitRunning);
+    CHECK((fourth.unified.flags & kUpSleepRunning) != 0);
+    CHECK(clock.wait_calls == waits_before + 1 && fourth.release_qpc >= t4);
+    CHECK(fourth.wait_start_qpc != 0 && fourth.wait_end_qpc >= fourth.wait_start_qpc);
+
+    // A reported failure: consumed, the marker waits to T.
+    clock.now = fourth.release_qpc + Ticks(500.0);
+    const UnifiedStart start5 = SleepHook(&mailbox, clock.now, UnifiedSleepOutcome::Failed, clock.now);
+    const SourceStageFrame fifth = g_stage.RunPlannedFrame(UnifiedRequest(Key(104), &mailbox), &clock);
+    CHECK(fifth.planned && fifth.unified.kind == UnifiedResolutionKind::WaitFailed);
+    CHECK((fifth.unified.flags & kUpSleepFailed) != 0 && mailbox.load() == 0);
+    CHECK(fifth.release_qpc >= UnifiedPacer_TargetTicks(start5.target));
+
+    // Every release is committed once and never earlier than T.
+    CHECK(g_stage.Unified().Counters().late_releases >= 1);
+
+    // An output that is late against H starts no OutputLate epoch under the unified pacer:
+    // the grid follows the start.
+    const uint32_t epoch = g_stage.Grid().Snapshot().epoch;
+    FramePlan_PushStageEvent(Event(fifth, PacingStageEventKind::OutputRelease,
+        fifth.plan.output_target_qpc + Ticks(20'000.0), PacingPlanStatus::Held));
+    g_stage.DrainStageEvents();
+    CHECK(!g_stage.DrainStartedOutputLate());
+    CHECK(g_stage.Grid().Snapshot().epoch == epoch);
+
+    // Key off: the unified branch is not entered, whatever the request carries.
+    g_stage.SetUnifiedEnabled(false, 1);
+    ResetStage();
+    SourceStageRequest off = UnifiedRequest(Key(200), &mailbox);
+    off.pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
+    const SourceStageFrame normal = g_stage.RunPlannedFrame(off, &clock);
+    CHECK(normal.planned && !normal.unified.valid);
+}
+
+// A frame whose planning the unified branch takes: the scheduler's decision helper.
+void TestUnifiedPlanningDecision()
+{
+    std::printf("Test: the unified branch plans every key-on marker-route frame (Unified or the Marker fallback)\n");
+    const PacingPipelineSnapshot unified = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly,
+        PacingSourcePlacement::Unified);
+    const PacingPipelineSnapshot marker = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly,
+        PacingSourcePlacement::Marker);
+    CHECK(SourceStage_UnifiedPlans(unified, true, true));
+    CHECK(SourceStage_UnifiedPlans(marker, true, true)); // no recent Sleep: the key-on fallback
+    CHECK(SourceStage_UnifiedPlans(Pipeline(PacingTimingMode::Fixed, PacingRung::SourceOnly,
+        PacingSourcePlacement::Marker), true, true));
+    CHECK(SourceStage_UnifiedPlans(Pipeline(PacingTimingMode::Idle, PacingRung::SourceOnly,
+        PacingSourcePlacement::Marker), true, true));
+    // The key off, or a stage the key has not enabled yet.
+    CHECK(!SourceStage_UnifiedPlans(unified, false, true));
+    CHECK(!SourceStage_UnifiedPlans(marker, false, true));
+    CHECK(!SourceStage_UnifiedPlans(marker, true, false));
+    // Passthrough, the present route and the placements the key forces away stay out.
+    PacingPipelineSnapshot passthrough = marker;
+    passthrough.mode = PacingTimingMode::Off;
+    passthrough.placement = PacingSourcePlacement::None;
+    CHECK(!SourceStage_UnifiedPlans(passthrough, true, true));
+    passthrough.placement = PacingSourcePlacement::Marker;
+    CHECK(!SourceStage_UnifiedPlans(passthrough, true, true)); // mode Off alone excludes it
+    CHECK(!SourceStage_UnifiedPlans(Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly,
+        PacingSourcePlacement::Present), true, true));
+    CHECK(!SourceStage_UnifiedPlans(Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly,
+        PacingSourcePlacement::PreSleep), true, true));
+    CHECK(!SourceStage_UnifiedPlans(Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly,
+        PacingSourcePlacement::DriverLimiter), true, true));
+}
+
+SourceStageRequest UnifiedMarkerRequest(const PacingPlanKey& key, std::atomic<uint64_t>* mailbox,
+    double interval_us = kIntervalUs)
+{
+    SourceStageRequest request = UnifiedRequest(key, mailbox);
+    request.pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly, PacingSourcePlacement::Marker);
+    request.unified.terms = CapTerms(interval_us);
+    return request;
+}
+
+// Key on, no Sleep word ever (a game without the Reflex Sleep, or after Sleep activity expired):
+// the law plans T(n) at the marker and the marker waits to it.
+void TestUnifiedMarkerOnlyFrames()
+{
+    std::printf("Test: unified request with no Sleep word: the marker-site start plans and waits\n");
+    ResetStage();
+    g_stage.SetUnifiedEnabled(true, 1);
+    std::atomic<uint64_t> mailbox{0};
+    ScriptedClock clock;
+    int64_t previous_release = 0;
+    for (int index = 0; index < 6; ++index) {
+        // The game arrives 4 ms after the previous release.
+        clock.now = index == 0 ? kStart : previous_release + Ticks(4'000.0);
+        const SourceStageFrame frame =
+            g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(300 + index), &mailbox), &clock);
+        CHECK(frame.planned && frame.unified.valid);
+        CHECK(frame.unified.kind == UnifiedResolutionKind::MarkerPath);
+        CHECK((frame.unified.flags & kUpMarkerStart) != 0 && frame.unified.start.token == 0);
+        if (index == 0) {
+            CHECK(frame.release_qpc == kStart && clock.wait_calls == 0);
+        } else {
+            CHECK(frame.release_qpc == previous_release + Ticks(kIntervalUs)); // R = T, never earlier
+            CHECK(frame.wait_target_qpc == frame.release_qpc && frame.slept);
+            CHECK((frame.unified.flags & kUpReset) == 0);
+        }
+        CHECK(frame.plan.fg_divisor == 1.0 && frame.plan.interval_us == kIntervalUs);
+        previous_release = frame.release_qpc;
+    }
+    CHECK(clock.wait_calls == 5 && mailbox.load() == 0);
+    g_stage.SetUnifiedEnabled(false, 1);
+}
+
+// The marker-site wait never commits a release before T(n).
+void TestUnifiedFailedMarkerWait()
+{
+    std::printf("Test: a cancelled, stuck or over-long marker wait never commits R < T\n");
+    std::atomic<uint64_t> mailbox{0};
+
+    // A cancelled wait (WaitUntil false, the clock does not move): released at once, the law
+    // reset with the reset flag, nothing committed; the next frame starts from its arrival.
+    {
+        ResetStage();
+        g_stage.SetUnifiedEnabled(true, 1);
+        ScriptedClock clock;
+        const SourceStageFrame first = g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(400), &mailbox), &clock);
+        CHECK(first.planned && first.release_qpc == kStart && g_stage.Unified().HasOrigin());
+        const int64_t arrival = kStart + Ticks(4'000.0);
+        clock.now = arrival;
+        clock.fail_from_call = clock.wait_calls + 1;
+        const SourceStageFrame failed = g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(401), &mailbox), &clock);
+        const int64_t target = UnifiedPacer_TargetTicks(failed.unified.start.target);
+        CHECK(failed.planned && target == kStart + Ticks(kIntervalUs));
+        CHECK(clock.wait_calls == 1 && !failed.slept);
+        CHECK(failed.release_qpc == arrival && failed.release_qpc < target);
+        CHECK(!g_stage.Unified().HasOrigin()); // R < T was not committed: no origin, none in the future
+        CHECK((failed.unified.flags & kUpReset) != 0);
+        clock.fail_from_call = 0;
+        clock.now = arrival + Ticks(2'000.0);
+        const int waits = clock.wait_calls;
+        const SourceStageFrame next = g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(402), &mailbox), &clock);
+        CHECK(next.planned && next.release_qpc == arrival + Ticks(2'000.0) && clock.wait_calls == waits);
+        CHECK((next.unified.flags & kUpReset) != 0 && next.unified.kind == UnifiedResolutionKind::MarkerPath);
+        clock.now = next.release_qpc + Ticks(1'000.0);
+        const SourceStageFrame following = g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(403), &mailbox), &clock);
+        CHECK(following.release_qpc == next.release_qpc + Ticks(kIntervalUs)); // I after the actual release
+        CHECK((following.unified.flags & kUpReset) == 0);
+        g_stage.SetUnifiedEnabled(false, 1);
+    }
+
+    // A wait that returns true but does not move the clock makes no progress: stop, release at once.
+    {
+        ResetStage();
+        g_stage.SetUnifiedEnabled(true, 1);
+        ScriptedClock clock;
+        g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(410), &mailbox), &clock);
+        const int64_t arrival = kStart + Ticks(4'000.0);
+        clock.now = arrival;
+        clock.stuck = true;
+        const int waits = clock.wait_calls;
+        const SourceStageFrame frame = g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(411), &mailbox), &clock);
+        CHECK(frame.planned && clock.wait_calls == waits + 1 && !frame.slept); // no spinning on a stuck clock
+        CHECK(frame.release_qpc == arrival && !g_stage.Unified().HasOrigin());
+        CHECK((frame.unified.flags & kUpReset) != 0);
+        g_stage.SetUnifiedEnabled(false, 1);
+    }
+
+    // A game limit of 1 s: the law accepts the interval, the waiter rejects waits over 500 ms,
+    // so the marker waits in chunks of at most 250 ms and reaches T exactly.
+    {
+        ResetStage();
+        g_stage.SetUnifiedEnabled(true, 1);
+        ScriptedClock clock;
+        clock.reject_over_ticks = Ticks(500'000.0);
+        g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(420), &mailbox, 1'000'000.0), &clock);
+        const int64_t arrival = kStart + Ticks(4'000.0);
+        clock.now = arrival;
+        const int waits = clock.wait_calls;
+        const SourceStageFrame frame =
+            g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(421), &mailbox, 1'000'000.0), &clock);
+        const int64_t target = UnifiedPacer_TargetTicks(frame.unified.start.target);
+        CHECK(frame.planned && target == kStart + Ticks(1'000'000.0));
+        CHECK(frame.release_qpc == target && frame.slept && g_stage.Unified().HasOrigin());
+        CHECK((frame.unified.flags & kUpReset) == 0);
+        CHECK(clock.wait_calls >= waits + 4);
+        CHECK(clock.longest_wait_ticks > 0 && clock.longest_wait_ticks <= Ticks(kUnifiedMarkerWaitChunkUs));
+        CHECK(frame.wait_target_qpc == target && frame.wait_start_qpc == arrival && frame.wait_end_qpc == target);
+        // The same interval with the waiter failing in the third chunk: R < T is not committed.
+        clock.now = frame.release_qpc + Ticks(4'000.0);
+        clock.fail_from_call = clock.wait_calls + 3;
+        const int64_t arrival2 = clock.now;
+        const SourceStageFrame failed =
+            g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(422), &mailbox, 1'000'000.0), &clock);
+        const int64_t target2 = UnifiedPacer_TargetTicks(failed.unified.start.target);
+        CHECK(failed.planned && target2 == frame.release_qpc + Ticks(1'000'000.0));
+        CHECK(failed.release_qpc == arrival2 + 2 * Ticks(kUnifiedMarkerWaitChunkUs));
+        CHECK(failed.release_qpc < target2 && !g_stage.Unified().HasOrigin());
+        CHECK((failed.unified.flags & kUpReset) != 0);
+        g_stage.SetUnifiedEnabled(false, 1);
+    }
+
+    // The chunk's end passed before the waiter was entered (it returns false with the clock at
+    // the chunk's end): not a cancellation. The wait continues to T, R >= T, no reset.
+    {
+        ResetStage();
+        g_stage.SetUnifiedEnabled(true, 1);
+        ScriptedClock clock;
+        g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(440), &mailbox, 1'000'000.0), &clock);
+        const int64_t arrival = kStart + Ticks(4'000.0);
+        clock.now = arrival;
+        clock.already_passed_calls = 2;
+        const int waits = clock.wait_calls;
+        const SourceStageFrame frame =
+            g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(441), &mailbox, 1'000'000.0), &clock);
+        const int64_t target = UnifiedPacer_TargetTicks(frame.unified.start.target);
+        CHECK(frame.planned && target == kStart + Ticks(1'000'000.0));
+        CHECK(frame.release_qpc == target && g_stage.Unified().HasOrigin());
+        CHECK((frame.unified.flags & kUpReset) == 0 && frame.slept);
+        CHECK(clock.wait_calls == waits + 4 && clock.longest_wait_ticks <= Ticks(kUnifiedMarkerWaitChunkUs));
+        g_stage.SetUnifiedEnabled(false, 1);
+    }
+
+    // A Sleep that reported failure: the marker wait also fails, nothing is committed before T.
+    {
+        ResetStage();
+        g_stage.SetUnifiedEnabled(true, 1);
+        ScriptedClock clock;
+        g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(430), &mailbox), &clock);
+        const int64_t arrival = kStart + Ticks(4'000.0);
+        clock.now = arrival;
+        const UnifiedStart start = SleepHook(&mailbox, arrival, UnifiedSleepOutcome::Failed, arrival);
+        clock.fail_from_call = clock.wait_calls + 1;
+        const SourceStageFrame frame = g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(431), &mailbox), &clock);
+        CHECK(frame.planned && frame.unified.kind == UnifiedResolutionKind::WaitFailed);
+        CHECK(frame.release_qpc < UnifiedPacer_TargetTicks(start.target));
+        CHECK(!g_stage.Unified().HasOrigin() && mailbox.load() == 0);
+        CHECK((frame.unified.flags & kUpReset) != 0 && (frame.unified.flags & kUpSleepFailed) != 0);
+        g_stage.SetUnifiedEnabled(false, 1);
+    }
+}
+
+// A unified plan carries the raw frame generation factor, never the ramped divisor, and keeps
+// the forwarded Sleep's driver timing when its index matches.
+void TestUnifiedRawDivisorAndDriverSleep()
+{
+    std::printf("Test: the unified plan uses the raw FG divisor and keeps the matching driver Sleep timing\n");
+    ResetStage();
+    g_stage.SetUnifiedEnabled(true, 1);
+    std::atomic<uint64_t> mailbox{0};
+    ScriptedClock clock;
+
+    SourceStageRequest request = UnifiedMarkerRequest(Key(500), &mailbox, 2 * kIntervalUs);
+    request.fg_divisor = 1.4;            // the 50 ms ramp, mid-transition 1 -> 2
+    request.unified.raw_fg_divisor = 2;  // the resolved factor N
+    request.driver_sleep_index = g_stage.Grid().NextIndex();
+    request.driver_sleep_start_qpc = kStart - Ticks(1'500.0);
+    request.driver_sleep_end_qpc = kStart - Ticks(500.0);
+    const SourceStageFrame frame = g_stage.RunPlannedFrame(request, &clock);
+    CHECK(frame.planned && frame.plan.fg_divisor == 2.0 && frame.plan.interval_us == 2 * kIntervalUs);
+    CHECK(frame.driver_sleep_start_qpc == request.driver_sleep_start_qpc &&
+          frame.driver_sleep_end_qpc == request.driver_sleep_end_qpc);
+    PacingSourceRecord record{};
+    SourceStage::FillSourceRecord(frame, request.pipeline, &record);
+    CHECK(record.fg_divisor == 2.0);
+    CHECK(record.driver_sleep_start_qpc == request.driver_sleep_start_qpc &&
+          record.driver_sleep_end_qpc == request.driver_sleep_end_qpc);
+
+    // A Sleep of another index, or one without a span, is not this frame's.
+    clock.now = frame.release_qpc + Ticks(4'000.0);
+    SourceStageRequest other = UnifiedMarkerRequest(Key(501), &mailbox, 2 * kIntervalUs);
+    other.fg_divisor = 1.9;
+    other.unified.raw_fg_divisor = 2;
+    other.driver_sleep_index = g_stage.Grid().NextIndex() + 3;
+    other.driver_sleep_start_qpc = clock.now - Ticks(1'500.0);
+    other.driver_sleep_end_qpc = clock.now - Ticks(500.0);
+    const SourceStageFrame mismatched = g_stage.RunPlannedFrame(other, &clock);
+    CHECK(mismatched.planned && mismatched.plan.fg_divisor == 2.0);
+    CHECK(mismatched.driver_sleep_start_qpc == 0 && mismatched.driver_sleep_end_qpc == 0);
+    g_stage.SetUnifiedEnabled(false, 1);
+}
+
+// Saturation rule (b): the law's USED report of a frame reaches the lead by exact identity, the
+// key sets the lead's queue-wait mode, and the law's report-stream liveness follows to the lead.
+void TestUnifiedUsedReportReachesTheLead()
+{
+    std::printf("Test: a used queue-wait report reaches the lead; the key sets its mode and liveness\n");
+    ResetStage();
+    g_stage.SetUnifiedEnabled(true, 1);
+    CHECK(g_stage.Lead().QueueWaitMode() && !g_stage.Lead().QueueWaitLive());
+    std::atomic<uint64_t> mailbox{0};
+    ScriptedClock clock;
+
+    const auto run = [&](uint64_t frame_id, int64_t arrival) {
+        SourceStageRequest request = UnifiedMarkerRequest(Key(frame_id), &mailbox);
+        request.pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait,
+            PacingSourcePlacement::Marker);
+        clock.now = arrival;
+        return g_stage.RunPlannedFrame(request, &clock);
+    };
+    // The frame's own GPU rung events, an unheld output, then one drain.
+    const auto finish = [&](const SourceStageFrame& frame) {
+        FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::PresentCall,
+            frame.release_qpc + Ticks(3'000.0)));
+        FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady,
+            frame.release_qpc + Ticks(9'000.0)));
+        FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease,
+            frame.release_qpc + Ticks(9'500.0), PacingPlanStatus::Late)); // an unheld output (Unknown counts as a hold)
+        g_stage.DrainStageEvents();
+    };
+
+    // Frame 1: no report stream yet, so its sample is fed as today, at readiness.
+    const SourceStageFrame first = run(700, kStart);
+    CHECK(first.planned);
+    finish(first);
+    CHECK(!g_stage.Lead().QueueWaitLive());
+    CHECK(g_stage.Lead().Statistics().queue_wait_samples == 0);
+
+    // Frame 2: its report is used (the predecessor's hold is known, unheld) before its
+    // readiness: the stream is live, and the sample is fed with z_used removed.
+    const SourceStageFrame second = run(701, first.release_qpc + Ticks(4'000.0));
+    CHECK(second.planned);
+    g_stage.OnUnifiedReport(PacingIdentityDomain::NvApiFrame, 1, 701, 4'000.0);
+    CHECK(g_stage.Unified().Counters().reports_used == 1);
+    CHECK(g_stage.Lead().QueueWaitLive());
+    const uint64_t samples = g_stage.Lead().Statistics().queue_wait_samples;
+    finish(second);
+    CHECK(g_stage.Lead().Statistics().queue_wait_samples == samples + 1);
+    CHECK(Near(g_stage.Lead().Statistics().last_queue_wait_removed_us, 4'000.0));
+
+    // Frame 3: readiness first (live stream: the sample is deferred), the report after it.
+    const SourceStageFrame third = run(702, second.release_qpc + Ticks(4'000.0));
+    CHECK(third.planned);
+    const uint64_t deferred = g_stage.Lead().Statistics().queue_wait_deferred;
+    const uint64_t fed = g_stage.Lead().Statistics().queue_wait_samples;
+    finish(third);
+    CHECK(g_stage.Lead().Statistics().queue_wait_deferred == deferred + 1);
+    CHECK(g_stage.Lead().Statistics().queue_wait_samples == fed); // waiting for the report
+    g_stage.OnUnifiedReport(PacingIdentityDomain::NvApiFrame, 1, 702, 2'500.0);
+    CHECK(g_stage.Lead().Statistics().queue_wait_samples == fed + 1);
+    CHECK(Near(g_stage.Lead().Statistics().last_queue_wait_removed_us, 2'500.0));
+
+    // A report of another producer epoch is not this frame's: nothing more is fed.
+    g_stage.OnUnifiedReport(PacingIdentityDomain::NvApiFrame, 2, 702, 9'000.0);
+    CHECK(g_stage.Lead().Statistics().queue_wait_samples == fed + 1);
+
+    // The key off: the mode follows, and nothing is deferred any more.
+    g_stage.SetUnifiedEnabled(false, 1);
+    CHECK(!g_stage.Lead().QueueWaitMode() && !g_stage.Lead().QueueWaitLive());
+}
+
+// The cutover to the legacy planning leaves a zero-floor segment at once: PlanNext keeps the
+// current segment while the commanded interval, mode and generation are unchanged, so a floor left
+// on it would be the legacy floor. The cadence-grid test asserts the value; here the stage wiring:
+// key off, a legacy plan at the same interval, key on again, and a legacy frame under the key.
+void TestUnifiedDisplayFloorClearedAtCutover()
+{
+    std::printf("Test: leaving the unified planning leaves a zero-floor segment; on again plans a floor\n");
+    ResetStage();
+    g_stage.SetUnifiedEnabled(true, 1);
+    std::atomic<uint64_t> mailbox{0};
+    ScriptedClock clock;
+    const auto floor_ticks = [] { return g_stage.Grid().Snapshot().current.floor_interval_ticks; };
+
+    const SourceStageFrame a = g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(950), &mailbox), &clock);
+    CHECK(a.planned && floor_ticks() > 0.0);
+    clock.now = a.release_qpc + Ticks(4'000.0);
+    const SourceStageFrame b = g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(951), &mailbox), &clock);
+    CHECK(b.planned && floor_ticks() > 0.0);
+
+    // Key off: the grid's current segment has no floor, in the published copy too.
+    g_stage.SetUnifiedEnabled(false, 1);
+    CHECK(floor_ticks() == 0.0);
+    CadenceGridSnapshot read{};
+    CHECK(g_cadence_grid_publication.Read(&read) && read.current.floor_interval_ticks == 0.0);
+    // The next legacy plan, at the same commanded interval, keeps that segment.
+    clock.now = b.release_qpc + Ticks(4'000.0);
+    const SourceStageFrame c =
+        g_stage.RunPlannedFrame(Request(Key(952), Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly)), &clock);
+    CHECK(c.planned && !c.unified.valid && floor_ticks() == 0.0);
+
+    // On again: a floor is planned again; the off in between had none.
+    g_stage.SetUnifiedEnabled(true, 1);
+    clock.now = c.release_qpc + Ticks(4'000.0);
+    const SourceStageFrame d = g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(953), &mailbox), &clock);
+    CHECK(d.planned && d.unified.valid && floor_ticks() > 0.0);
+    // A frame the unified branch does not plan, under the key, does not inherit the floor either.
+    clock.now = d.release_qpc + Ticks(4'000.0);
+    const SourceStageFrame e =
+        g_stage.RunPlannedFrame(Request(Key(954), Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly)), &clock);
+    CHECK(e.planned && !e.unified.valid && floor_ticks() == 0.0);
+    g_stage.SetUnifiedEnabled(false, 1);
+}
+
+// Reports made usable by a law OnReady/OnOutput reach the lead BEFORE the lead processes that
+// event: frame n's report arrives while its predecessor's output is unknown; n's PresentCall and
+// GpuReady are already there, so the lead only finalizes n when the predecessor's output arrives.
+// The law resolves the report at that output, the used report is delivered, and then the lead
+// handles the same event: ONE subtracted sample for n, no raw one. With the lead first the
+// sample would be fed raw (stream not live) and the report rejected as stale.
+void TestUnifiedReportResolvedBeforeLeadFinalizes()
+{
+    std::printf("Test: a report made usable by the predecessor's output reaches the lead before it finalizes n\n");
+    ResetStage();
+    g_stage.SetUnifiedEnabled(true, 1);
+    const uint64_t used_before = g_stage.Unified().Counters().reports_used; // cumulative across Reset
+    std::atomic<uint64_t> mailbox{0};
+    ScriptedClock clock;
+    const auto run = [&](uint64_t frame_id, int64_t arrival) {
+        SourceStageRequest request = UnifiedMarkerRequest(Key(frame_id), &mailbox);
+        request.pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait,
+            PacingSourcePlacement::Marker);
+        clock.now = arrival;
+        return g_stage.RunPlannedFrame(request, &clock);
+    };
+    const SourceStageFrame first = run(900, kStart);
+    const SourceStageFrame second = run(901, first.release_qpc + Ticks(4'000.0));
+    CHECK(first.planned && second.planned);
+
+    // Both frames' presents and readiness; the first's output is still unknown.
+    for (const SourceStageFrame* frame : { &first, &second }) {
+        FramePlan_PushStageEvent(Event(*frame, PacingStageEventKind::PresentCall,
+            frame->release_qpc + Ticks(3'000.0)));
+        FramePlan_PushStageEvent(Event(*frame, PacingStageEventKind::GpuReady,
+            frame->release_qpc + Ticks(9'000.0)));
+    }
+    g_stage.DrainStageEvents();
+    CHECK(!g_stage.Lead().QueueWaitLive());
+
+    // n's report: not usable yet (the predecessor's hold is unknown): not live, nothing used.
+    g_stage.OnUnifiedReport(PacingIdentityDomain::NvApiFrame, 1, 901, 4'000.0);
+    CHECK(g_stage.Unified().Counters().reports_used == used_before);
+    CHECK(!g_stage.Lead().QueueWaitLive());
+    const uint64_t samples = g_stage.Lead().Statistics().samples;
+    const uint64_t fed = g_stage.Lead().Statistics().queue_wait_samples;
+
+    // The predecessor's output: the law resolves n's report, the lead gets it, then finalizes n.
+    FramePlan_PushStageEvent(Event(first, PacingStageEventKind::OutputRelease,
+        first.release_qpc + Ticks(9'500.0), PacingPlanStatus::Late)); // unheld (Unknown counts as a hold)
+    g_stage.DrainStageEvents();
+    CHECK(g_stage.Unified().Counters().reports_used == used_before + 1);
+    CHECK(g_stage.Lead().QueueWaitLive());
+    CHECK(g_stage.Lead().Statistics().samples == samples + 1);           // n's sample, once
+    CHECK(g_stage.Lead().Statistics().queue_wait_samples == fed + 1);    // fed subtracted, not raw
+    CHECK(Near(g_stage.Lead().Statistics().last_queue_wait_removed_us, 4'000.0));
+    g_stage.SetUnifiedEnabled(false, 1);
+}
+
+// Used reports are REGISTERED with the lead and the deferred samples FLUSHED after the lead has
+// recorded the event: frame n (here 912) has its readiness and its report while n - 1 (911) has
+// an unheld output but no readiness yet, so n defers. When n - 1's readiness arrives the law
+// resolves n's report at that very event; the sample of n is emitted once, after the lead has
+// recorded that readiness (the lead's flush follows OnStageEvent), subtracted, and never raw.
+// LIMIT: the reviewer's numbers (raw 10 ms, predecessor wait d 1.5 ms, z_used 1 ms: 8.5 ms, not
+// 9 ms) need the lead's behind-wait evidence warm (32 waited pairs and the reports behind
+// them); the stage exposes the lead const, so that script (TestFgInputWaitBehindWaitSample) is
+// reproduced at the lead's own level. Here z_used removed is max(0, z_used - d) with d = 0 (cold
+// queue order), asserted as 1 ms, and the one-sample / flush-after-event relations.
+void TestUnifiedDeferredSampleWaitsForPredecessorReadiness()
+{
+    std::printf("Test: a deferred sample is emitted after the predecessor's readiness event, once, subtracted\n");
+    ResetStage();
+    g_stage.SetUnifiedEnabled(true, 1);
+    const uint64_t used0 = g_stage.Unified().Counters().reports_used; // cumulative across Reset
+    std::atomic<uint64_t> mailbox{0};
+    ScriptedClock clock;
+    const auto run = [&](uint64_t frame_id, int64_t arrival) {
+        SourceStageRequest request = UnifiedMarkerRequest(Key(frame_id), &mailbox);
+        request.pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait,
+            PacingSourcePlacement::Marker);
+        clock.now = arrival;
+        return g_stage.RunPlannedFrame(request, &clock);
+    };
+    const auto push = [&](const SourceStageFrame& frame, PacingStageEventKind kind, double after_release_us) {
+        FramePlan_PushStageEvent(Event(frame, kind, frame.release_qpc + Ticks(after_release_us),
+            kind == PacingStageEventKind::OutputRelease ? PacingPlanStatus::Late : PacingPlanStatus::Unknown));
+    };
+    const SourceStageFrame f0 = run(910, kStart);
+    const SourceStageFrame f1 = run(911, f0.release_qpc + Ticks(4'000.0));
+    const SourceStageFrame f2 = run(912, f1.release_qpc + Ticks(4'000.0));
+    CHECK(f0.planned && f1.planned && f2.planned);
+
+    // Frame 0 completes (its hold is known: none). Frame 1's report is used at once: live.
+    push(f0, PacingStageEventKind::PresentCall, 3'000.0);
+    push(f0, PacingStageEventKind::GpuReady, 9'000.0);
+    push(f0, PacingStageEventKind::OutputRelease, 9'500.0);
+    g_stage.DrainStageEvents();
+    g_stage.OnUnifiedReport(PacingIdentityDomain::NvApiFrame, 1, 911, 1'000.0);
+    CHECK(g_stage.Unified().Counters().reports_used == used0 + 1);
+    CHECK(g_stage.Lead().QueueWaitLive());
+    const uint64_t samples = g_stage.Lead().Statistics().samples;
+    const uint64_t fed = g_stage.Lead().Statistics().queue_wait_samples;
+    const uint64_t deferred = g_stage.Lead().Statistics().queue_wait_deferred;
+
+    // Frame 1: an unheld output, no readiness yet. Frame 2: its readiness; its report waits for
+    // frame 1's hold (unknown without frame 1's readiness), so the sample of frame 2 defers.
+    push(f1, PacingStageEventKind::OutputRelease, 9'500.0);
+    push(f2, PacingStageEventKind::PresentCall, 3'000.0);
+    push(f2, PacingStageEventKind::GpuReady, 9'000.0);
+    g_stage.DrainStageEvents();
+    g_stage.OnUnifiedReport(PacingIdentityDomain::NvApiFrame, 1, 912, 1'000.0);
+    CHECK(g_stage.Unified().Counters().reports_used == used0 + 1); // not usable yet
+    CHECK(g_stage.Lead().Statistics().queue_wait_deferred == deferred + 1);
+    CHECK(g_stage.Lead().Statistics().samples == samples && g_stage.Lead().Statistics().queue_wait_samples == fed);
+
+    // Frame 1's readiness: the law resolves frame 2's report at this event; the lead records the
+    // event, then emits frame 1's and frame 2's samples, each once and subtracted.
+    push(f1, PacingStageEventKind::PresentCall, 3'000.0);
+    push(f1, PacingStageEventKind::GpuReady, 9'000.0);
+    g_stage.DrainStageEvents();
+    CHECK(g_stage.Unified().Counters().reports_used == used0 + 2);
+    CHECK(g_stage.Lead().Statistics().samples == samples + 2);
+    CHECK(g_stage.Lead().Statistics().queue_wait_samples == fed + 2);
+    CHECK(Near(g_stage.Lead().Statistics().last_queue_wait_removed_us, 1'000.0));
+    g_stage.SetUnifiedEnabled(false, 1);
+}
+
+// The key's transition is applied BEFORE the stage events are drained (the scheduler's
+// production entry DrainStageEventsUnderKey): a late output queued across the toggle is judged by
+// the rules of the invocation's key. Off: the legacy OutputLate restart (as at 9746673); on: the
+// output is judged GPU-paced (no restart).
+void TestKeyTransitionBeforeTheDrain()
+{
+    std::printf("Test: the key's transition is applied before the stage events are drained\n");
+    const PacingPipelineSnapshot pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
+    const int64_t tolerance = Ticks(2'500.0);
+    const auto queue_late_output = [&](const SourceStageFrame& frame) {
+        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease,
+            frame.plan.output_target_qpc + tolerance + Ticks(5'000.0), PacingPlanStatus::SourceOnly)));
+    };
+
+    // The key goes OFF: the stage still runs unified when the scheduler's invocation starts.
+    {
+        ResetStage();
+        g_stage.SetUnifiedEnabled(true, 1);
+        ScriptedClock clock;
+        const SourceStageFrame frame = g_stage.RunPlannedFrame(Request(Key(8100), pipeline), &clock);
+        CHECK(frame.planned);
+        queue_late_output(frame);
+        // The stale state: a drain under the old key suppresses the legacy restart (the defect).
+        {
+            const uint32_t epoch = g_stage.Grid().Snapshot().epoch;
+            const uint64_t before = g_stage.Statistics().output_late_epochs;
+            g_stage.DrainStageEvents();
+            CHECK(!g_stage.DrainStartedOutputLate() && g_stage.Statistics().output_late_epochs == before);
+            CHECK(g_stage.Grid().Snapshot().epoch == epoch);
+        }
+        // Production order: the transition, then the drain: the legacy restart.
+        ResetStage();
+        g_stage.SetUnifiedEnabled(true, 1);
+        const SourceStageFrame again = g_stage.RunPlannedFrame(Request(Key(8101), pipeline), &clock);
+        CHECK(again.planned);
+        queue_late_output(again);
+        const uint32_t epoch = g_stage.Grid().Snapshot().epoch;
+        const uint64_t before = g_stage.Statistics().output_late_epochs;
+        g_stage.DrainStageEventsUnderKey(false, 1);
+        CHECK(!g_stage.UnifiedEnabled());
+        CHECK(g_stage.DrainStartedOutputLate() && g_stage.DrainedOutputLateCount() == 1);
+        CHECK(g_stage.Statistics().output_late_epochs == before + 1);
+        CHECK(g_stage.Grid().Snapshot().epoch == epoch + 1);
+        // The key off the whole time: the same entry changes nothing.
+        queue_late_output(again);
+        g_stage.DrainStageEventsUnderKey(false, 1);
+        CHECK(!g_stage.UnifiedEnabled());
+    }
+
+    // The mirror, the key goes ON: the first drain after it is judged GPU-paced (no OutputLate
+    // restart) although the frame was planned by the legacy branch.
+    {
+        ResetStage();
+        g_stage.SetUnifiedEnabled(false, 1);
+        ScriptedClock clock;
+        const SourceStageFrame frame = g_stage.RunPlannedFrame(Request(Key(8200), pipeline), &clock);
+        CHECK(frame.planned);
+        queue_late_output(frame);
+        const uint32_t epoch = g_stage.Grid().Snapshot().epoch;
+        const uint64_t before = g_stage.Statistics().output_late_epochs;
+        g_stage.DrainStageEventsUnderKey(true, 1);
+        CHECK(g_stage.UnifiedEnabled());
+        CHECK(!g_stage.DrainStartedOutputLate() && g_stage.DrainedOutputLateCount() == 0);
+        CHECK(g_stage.Statistics().output_late_epochs == before);
+        CHECK(g_stage.Grid().Snapshot().epoch == epoch);
+        g_stage.SetUnifiedEnabled(false, 1);
+    }
+}
+
+// Hold credit (unified_pacer.h): the law banks the GPU's spare time and the plan carries the
+// ADVANCE it grants the frame: credit c in [-J, +32 J] (J = I_disp = 10 ms, the cap term; 32 the
+// report window), starting at 0, 0 while the report stream is not live; each used report refills
+// min(32 J, c + J - gpu_active), each hold debits max(-J, c - h); advance = max(0, -c). Every
+// assertion below fails with the rule it pins removed.
+void TestUnifiedHoldAdvanceOnPlans()
+{
+    std::printf("Test: plans carry the hold advance the law granted; the key off leaves none\n");
+    std::atomic<uint64_t> mailbox{0};
+    constexpr double kJ = kIntervalUs;
+    constexpr double kBank = 32.0 * kIntervalUs;
+
+    struct Step { double active_us; double hold_us; bool report; };
+    struct Planned { float advance; bool live; double credit; };
+    // One stream: frame k ready 10 ms after the previous, its output unheld (hold_us 0) or held for
+    // hold_us, then (report) its report with the frame's GPU active time. The predecessor's hold is
+    // known by then, so every report but the first is used at once. Returns what each plan got;
+    // the registry copy, the frame's unified record and the law's own (idempotent) grant are
+    // checked against each plan on the way.
+    const auto stream = [&](const std::vector<Step>& steps) {
+        ResetStage();
+        g_stage.SetUnifiedEnabled(true, 1);
+        g_stage.SetUnifiedOptions(false, 4'000.0); // the credit rule is pinned on the earlier law
+        ScriptedClock clock;
+        std::vector<Planned> planned;
+        int64_t previous_release = kStart - Ticks(4'000.0);
+        for (size_t index = 0; index < steps.size(); ++index) {
+            const uint64_t frame_id = 1000 + static_cast<uint64_t>(index);
+            clock.now = previous_release + Ticks(4'000.0);
+            const SourceStageFrame frame =
+                g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(frame_id), &mailbox), &clock);
+            CHECK(frame.planned && frame.unified.valid);
+            // The plan's advance, the record and the law's grant agree.
+            const UnifiedHoldGrant grant = g_stage.Unified().GrantHold(frame.plan.grid_index, kJ);
+            CHECK(grant.live == frame.unified.hold_live);
+            CHECK(frame.unified.hold_credit_us == (grant.live ? grant.credit_us : 0.0));
+            CHECK(frame.plan.hold_advance_us == (grant.live && grant.advance_us > 0.0
+                ? static_cast<float>(grant.advance_us) : 0.0f));
+            CHECK(frame.plan.hold_advance_us >= 0.0f);
+            PacingFramePlan published{};
+            CHECK(g_frame_plans.Find(frame.plan.key, &published) &&
+                  published.hold_advance_us == frame.plan.hold_advance_us);
+            planned.push_back({ frame.plan.hold_advance_us, frame.unified.hold_live,
+                                frame.unified.hold_credit_us });
+            previous_release = frame.release_qpc;
+            const int64_t ready = kStart + Ticks(10'000.0 * static_cast<double>(index + 1));
+            FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady, ready));
+            FramePlan_PushStageEvent(steps[index].hold_us > 0.0
+                ? Event(frame, PacingStageEventKind::OutputRelease, ready + Ticks(steps[index].hold_us),
+                    PacingPlanStatus::Held)
+                : Event(frame, PacingStageEventKind::OutputRelease, ready + Ticks(100.0)));
+            g_stage.DrainStageEvents();
+            if (steps[index].report) {
+                g_stage.OnUnifiedReport(PacingIdentityDomain::NvApiFrame, 1, frame_id, 1'000.0,
+                    steps[index].active_us);
+            }
+        }
+        return planned;
+    };
+    const auto phase = [](std::vector<Step>* steps, size_t count, double active_us, double hold_us,
+        bool report = true) {
+        for (size_t index = 0; index < count; ++index) steps->push_back({ active_us, hold_us, report });
+    };
+
+    // Saturated with holds (GPU active 14 ms > J, holds of 1 ms): not live before the first used
+    // report (plans 0 and 1: no advance, no credit); then the debt reaches -J within a few frames
+    // and stays: advance J, never more (the credit is bounded at -J).
+    {
+        std::vector<Step> steps;
+        phase(&steps, 30, 14'000.0, 1'000.0);
+        const std::vector<Planned> plans = stream(steps);
+        CHECK(!plans[0].live && !plans[1].live && plans[0].advance == 0.0f && plans[1].advance == 0.0f);
+        CHECK(plans[2].live && plans[2].credit < 0.0 && plans[2].advance > 0.0f); // in debt at once
+        for (size_t index = 6; index < plans.size(); ++index) {
+            CHECK(plans[index].live);
+            CHECK(plans[index].advance == static_cast<float>(kJ));
+            CHECK(plans[index].credit == -kJ);
+        }
+    }
+    // Headroom (GPU active 4 ms < J): the credit starts at 0 and only grows, so there is never an
+    // advance, from the first frame on.
+    {
+        std::vector<Step> steps;
+        phase(&steps, 40, 4'000.0, 1'000.0);
+        const std::vector<Planned> plans = stream(steps);
+        for (const Planned& plan : plans) CHECK(plan.advance == 0.0f);
+        CHECK(plans[2].live && plans[2].credit >= 0.0);
+        CHECK(plans[20].credit > plans[5].credit && plans[20].credit > 0.0); // the refill banks it
+    }
+    // A heavy stretch (active J + 1 ms, holds of 1 ms: -2 ms per frame, 60 frames = 120 ms) after
+    // 200 headroom frames: the bank (capped at 32 J) absorbs it, no advance at all, and it was spent.
+    {
+        std::vector<Step> steps;
+        phase(&steps, 200, 4'000.0, 0.0);
+        phase(&steps, 60, kJ + 1'000.0, 1'000.0);
+        const std::vector<Planned> plans = stream(steps);
+        double bank = 0.0;
+        for (size_t index = 0; index < 200; ++index) bank = std::max(bank, plans[index].credit);
+        CHECK(bank == kBank); // the cap: 32 J, not more, and reached
+        for (const Planned& plan : plans) CHECK(plan.advance == 0.0f);
+        const double after = plans.back().credit;
+        CHECK(after > 190'000.0 && after < 215'000.0); // 320 ms less ~60 frames of -2 ms
+    }
+    // A stream that stops reporting (stale beyond the report window) is not live: no advance and an
+    // empty grant, though the debt was J before.
+    {
+        std::vector<Step> steps;
+        phase(&steps, 12, 14'000.0, 1'000.0);
+        phase(&steps, 45, 14'000.0, 1'000.0, false);
+        const std::vector<Planned> plans = stream(steps);
+        CHECK(plans[11].live && plans[11].advance == static_cast<float>(kJ));
+        for (size_t index = 52; index < plans.size(); ++index) {
+            CHECK(!plans[index].live && plans[index].advance == 0.0f && plans[index].credit == 0.0);
+        }
+    }
+    // The key off: legacy plans have no advance, published too.
+    {
+        g_stage.SetUnifiedEnabled(false, 1);
+        ScriptedClock clock;
+        clock.now = kStart + Ticks(1'000'000.0);
+        const SourceStageFrame legacy = g_stage.RunPlannedFrame(
+            Request(Key(3000), Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly)), &clock);
+        CHECK(legacy.planned && !legacy.unified.valid && legacy.plan.hold_advance_us == 0.0f);
+        PacingFramePlan published{};
+        CHECK(g_frame_plans.Find(legacy.plan.key, &published) && published.hold_advance_us == 0.0f);
+    }
+}
+
+// Developer keys unified_every_frame_service / unified_queue_target_us reach the law through
+// SourceStage::SetUnifiedOptions. The law's defaults are every-frame service on, target 2000 us.
+// A saturated stream (every frame's GPU needs 12 ms, 6 ms of queue wait, cap 10 ms) is GPU-bound
+// at I = G + P with P = (z - target) * 0.1, so two targets change the plan interval by the P
+// difference; a stream whose queue wait is below the saturation threshold (0.3 ms) has no pair
+// for the earlier estimator (key false) and binds only with every-frame service; a disabled
+// stage ignores the call and turning the key off restores the defaults; a used report's service
+// sample and GPU wait reach the frame's unified status.
+void TestUnifiedOptionsPlumbed()
+{
+    std::printf("Test: the unified options reach the law (defaults on / 2000; target moves I_gpu)\n");
+    std::atomic<uint64_t> mailbox{0};
+    constexpr double kGpuUs = 12'000.0;
+    constexpr double kQueueUs = 6'000.0;
+
+    // 40 frames, each ready kGpuUs after the previous, unheld, its report a queue wait of
+    // `z_raw_us`. Options are set explicitly unless `use_defaults`. Returns the last plan.
+    const auto stream = [&](bool every_frame, double target_us, double z_raw_us, bool use_defaults = false) {
+        ResetStage();
+        g_stage.SetUnifiedEnabled(true, 1);
+        if (!use_defaults) g_stage.SetUnifiedOptions(every_frame, target_us);
+        ScriptedClock clock;
+        int64_t previous_release = kStart - Ticks(4'000.0);
+        SourceStageFrame frame{};
+        for (int index = 0; index < 40; ++index) {
+            const uint64_t frame_id = 4000 + static_cast<uint64_t>(index);
+            clock.now = previous_release + Ticks(4'000.0);
+            frame = g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(frame_id), &mailbox), &clock);
+            CHECK(frame.planned && frame.unified.valid);
+            previous_release = frame.release_qpc;
+            const int64_t ready = kStart + Ticks(kGpuUs * static_cast<double>(index + 1));
+            FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady, ready));
+            FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease, ready + Ticks(100.0)));
+            g_stage.DrainStageEvents();
+            g_stage.OnUnifiedReport(PacingIdentityDomain::NvApiFrame, 1, frame_id, z_raw_us, 0.0);
+        }
+        return frame;
+    };
+
+    // The stage's law starts with the defaults.
+    g_stage.SetUnifiedEnabled(false, 1);
+    g_stage.SetUnifiedEnabled(true, 1);
+    CHECK(g_stage.Unified().Options().every_frame_service == kPacingUnifiedEveryFrameServiceDefault);
+    CHECK(g_stage.Unified().Options().every_frame_service && g_stage.Unified().Options().queue_target_us == 2'000.0);
+    const SourceStageFrame by_default = stream(true, 0.0, kQueueUs, true);
+    CHECK(by_default.unified.status.bindable && by_default.plan.interval_us > kIntervalUs);
+    // The defaults through the plumbing are the same law.
+    CHECK(stream(true, 2'000.0, kQueueUs).plan.interval_us == by_default.plan.interval_us);
+
+    // The earlier law (every frame off, target 4000): P = (6000 - 4000) * 0.1 = 200 us. A target
+    // 3 ms lower raises P by 300 us, one 3 ms higher lowers it by 300 us (clamp G / 8 not reached).
+    const SourceStageFrame earlier = stream(false, 4'000.0, kQueueUs);
+    CHECK(earlier.unified.status.bindable && earlier.plan.interval_us > kIntervalUs);
+    CHECK(Near(earlier.plan.interval_us - kGpuUs, 200.0, 1.0));
+    CHECK(Near(stream(false, 1'000.0, kQueueUs).plan.interval_us - earlier.plan.interval_us, 300.0, 1.0));
+    CHECK(Near(earlier.plan.interval_us - stream(false, 7'000.0, kQueueUs).plan.interval_us, 300.0, 1.0));
+    // The new default target: P = (6000 - 2000) * 0.1 = 400 us.
+    CHECK(Near(by_default.plan.interval_us - kGpuUs, 400.0, 1.0));
+
+    // A queue wait below the saturation threshold: no saturated pair, so the earlier estimator is
+    // not bindable (the cap holds), while every-frame service binds.
+    const SourceStageFrame earlier_small = stream(false, 4'000.0, 300.0);
+    CHECK(!earlier_small.unified.status.bindable && earlier_small.plan.interval_us == kIntervalUs);
+    const SourceStageFrame every_small = stream(true, 4'000.0, 300.0);
+    CHECK(every_small.unified.status.bindable && every_small.plan.interval_us > kIntervalUs);
+
+    // A disabled stage ignores the call; the options a keyed session set are gone after the key off.
+    ResetStage();
+    g_stage.SetUnifiedEnabled(false, 1);
+    g_stage.SetUnifiedOptions(false, 0.0);
+    g_stage.SetUnifiedEnabled(true, 1);
+    CHECK(g_stage.Unified().Options().every_frame_service && g_stage.Unified().Options().queue_target_us == 2'000.0);
+    g_stage.SetUnifiedOptions(false, 0.0);
+    CHECK(!g_stage.Unified().Options().every_frame_service);
+    g_stage.SetUnifiedEnabled(false, 1);
+    g_stage.SetUnifiedEnabled(true, 1);
+    CHECK(g_stage.Unified().Options().every_frame_service && g_stage.Unified().Options().queue_target_us == 2'000.0);
+
+    // The newest used report's service sample and GPU wait: a report with z_raw = -2 ms says the GPU
+    // waited 2 ms for work; the sample is G_k less that wait (12 ms - 2 ms), the plan after it sees both.
+    const SourceStageFrame waited = stream(true, 2'000.0, -2'000.0);
+    CHECK(waited.unified.status.gpu_wait_valid && Near(waited.unified.status.gpu_wait_us, 2'000.0, 1.0));
+    CHECK(waited.unified.status.service_sample_valid &&
+          Near(waited.unified.status.service_sample_us, kGpuUs - 2'000.0, 1.0));
+    CHECK(by_default.unified.status.gpu_wait_valid && by_default.unified.status.gpu_wait_us == 0.0);
+    CHECK(by_default.unified.status.service_sample_valid &&
+          Near(by_default.unified.status.service_sample_us, kGpuUs, 1.0));
+    g_stage.SetUnifiedEnabled(false, 1);
+}
+
+// The record's flags come from the start (the Sleep's Reserve) but the service sample columns from
+// the later Status(n): kUpCorrectionRefused must follow the sample. Reservation -> a new report ->
+// marker, in both directions: refusal clear at Reserve and set at the marker, and set at Reserve
+// and clear at the marker. A report refuses the correction when it has a wait (z_raw < 0), and
+// G_k - wait falls below the frame's GPU active time (12 - 2 = 10 ms < 11 ms active); 5 ms active
+// accepts it.
+void TestUnifiedCorrectionRefusalFollowsTheSample()
+{
+    std::printf("Test: kUpCorrectionRefused comes from the status of the sample columns\n");
+    constexpr double kRefusedActiveUs = 11'000.0;
+    constexpr double kAcceptedActiveUs = 5'000.0;
+    const uint32_t bit = static_cast<uint32_t>(kUpCorrectionRefused);
+
+    // The pure helper: only the one bit moves.
+    UnifiedStatus refused_status{};
+    refused_status.flags = bit | kUpStale;
+    CHECK(SourceStage_ApplyCorrectionRefusal(kUpReset, refused_status) == (kUpReset | bit));
+    CHECK(SourceStage_ApplyCorrectionRefusal(kUpReset | bit, UnifiedStatus{}) == kUpReset);
+    CHECK(SourceStage_ApplyCorrectionRefusal(0x1234u, UnifiedStatus{}) == 0x1234u);
+
+    const auto transition = [&](double active_at_reserve_us, double active_at_marker_us) {
+        std::atomic<uint64_t> mailbox{0};
+        ResetStage();
+        g_stage.SetUnifiedEnabled(true, 1);
+        g_stage.SetUnifiedOptions(true, 2'000.0);
+        ScriptedClock clock;
+        int64_t previous_release = kStart - Ticks(4'000.0);
+        SourceStageFrame frame{};
+        constexpr int kFrames = 24;
+        for (int index = 0; index < kFrames; ++index) {
+            const uint64_t frame_id = 5000 + static_cast<uint64_t>(index);
+            clock.now = previous_release + Ticks(4'000.0);
+            frame = g_stage.RunPlannedFrame(UnifiedMarkerRequest(Key(frame_id), &mailbox), &clock);
+            previous_release = frame.release_qpc;
+            const int64_t ready = kStart + Ticks(12'000.0 * static_cast<double>(index + 1));
+            FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady, ready));
+            FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease, ready + Ticks(100.0)));
+            g_stage.DrainStageEvents();
+            // The newest frame's report is held back: it arrives after the Reserve.
+            if (index + 1 < kFrames) {
+                g_stage.OnUnifiedReport(PacingIdentityDomain::NvApiFrame, 1, frame_id, -2'000.0,
+                    active_at_reserve_us);
+            }
+        }
+        // The Sleep hook's Reserve for the next frame: its status holds the older reports only.
+        const int64_t arrival = previous_release + Ticks(4'000.0);
+        clock.now = arrival;
+        const UnifiedStart reserved = SleepHook(&mailbox, arrival, UnifiedSleepOutcome::None, 0);
+        const int64_t target = UnifiedPacer_TargetTicks(reserved.target);
+        mailbox.store(UnifiedMailbox_Pack(reserved.token, UnifiedSleepOutcome::Completed, target - arrival),
+            std::memory_order_release);
+        clock.now = target;
+        // The new report arrives between the Reserve and the marker.
+        g_stage.OnUnifiedReport(PacingIdentityDomain::NvApiFrame, 1, 5000 + kFrames - 1, -2'000.0,
+            active_at_marker_us);
+        const SourceStageFrame marker = g_stage.RunPlannedFrame(
+            UnifiedMarkerRequest(Key(5000 + kFrames), &mailbox), &clock);
+        CHECK(marker.planned && marker.unified.kind == UnifiedResolutionKind::Consumed);
+        return std::make_pair(reserved, marker);
+    };
+
+    // Clear at the Reserve, set at the marker.
+    {
+        const auto [reserved, marker] = transition(kAcceptedActiveUs, kRefusedActiveUs);
+        CHECK((reserved.flags & bit) == 0);
+        CHECK(marker.unified.status.service_correction_refused);
+        CHECK((marker.unified.status.flags & bit) != 0);
+        CHECK((marker.unified.flags & bit) != 0); // the record follows the sample, not the start
+        CHECK((marker.unified.start.flags & bit) == 0);
+    }
+    // Set at the Reserve, clear at the marker.
+    {
+        const auto [reserved, marker] = transition(kRefusedActiveUs, kAcceptedActiveUs);
+        CHECK((reserved.flags & bit) != 0);
+        CHECK(!marker.unified.status.service_correction_refused);
+        CHECK((marker.unified.flags & bit) == 0);
+        CHECK((marker.unified.start.flags & bit) != 0);
+    }
+    g_stage.SetUnifiedEnabled(false, 1);
+}
+
+// Key unified_hold_share. The allowance a = min(share * C, A) (C the measured completion spacing,
+// A the reports' frame generation time); room = J - median(active). With room < a (no room) every
+// used report refills a and the credit is bounded by W * a (W = 32 reports); with room >= a, or
+// a = 0, the signed rule refills J - active with the bounds [-J, W * J]. Stage streams: VRR-only
+// terms, J = 12.7 ms, completions every 14.7 ms (C = 14.7 ms), no holds. The share reaches the
+// law through SetUnifiedOptions; the key-off stage has share 0; J and the start interval contain
+// nothing derived from C; the record's cycle is the status's.
+void TestUnifiedHoldSharePlumbed()
+{
+    std::printf("Test: unified_hold_share reaches the law: the allowance is bounded by share * C and A\n");
+    std::atomic<uint64_t> mailbox{0};
+    constexpr double kSpacingUs = 14'700.0;
+    constexpr double kActiveUs = 14'000.0; // room = 12.7 - 14.0 = -1.3 ms
+    constexpr double kJUs = 12'700.0;
+    constexpr double kWindow = static_cast<double>(kUnifiedExpireAge);
+
+    // 96 frames: after the cycle is valid (16 spacings) there are enough reports for a credit
+    // refilling by at most 1.47 ms to reach its bound W * a.
+    const auto stream = [&](double share, double ai_us, double active_us = 14'000.0) { // room = 12.7 - 14.0 = -1.3 ms
+        ResetStage();
+        g_stage.SetUnifiedEnabled(true, 1);
+        g_stage.SetUnifiedOptions(true, 2'000.0, share);
+        ScriptedClock clock;
+        std::vector<SourceStageFrame> frames;
+        int64_t previous_release = kStart - Ticks(4'000.0);
+        for (int index = 0; index < 96; ++index) {
+            const uint64_t frame_id = 6000 + static_cast<uint64_t>(index);
+            clock.now = previous_release + Ticks(4'000.0);
+            SourceStageRequest request = UnifiedMarkerRequest(Key(frame_id), &mailbox);
+            request.unified.terms = UnifiedIntervalTerms{};
+            request.unified.terms.vrr_us = kJUs;
+            const SourceStageFrame frame = g_stage.RunPlannedFrame(request, &clock);
+            CHECK(frame.planned && frame.unified.valid);
+            frames.push_back(frame);
+            previous_release = frame.release_qpc;
+            const int64_t ready = kStart + Ticks(kSpacingUs * static_cast<double>(index + 1));
+            FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady, ready));
+            FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease, ready + Ticks(100.0)));
+            g_stage.DrainStageEvents();
+            g_stage.OnUnifiedReport(PacingIdentityDomain::NvApiFrame, 1, frame_id, 1'000.0, active_us, ai_us);
+        }
+        return frames;
+    };
+
+    // The key-off stage and a fresh keyed stage have share 0.
+    g_stage.SetUnifiedEnabled(false, 1);
+    CHECK(g_stage.Unified().Options().hold_share == 0.0);
+    g_stage.SetUnifiedEnabled(true, 1);
+    CHECK(g_stage.Unified().Options().hold_share == kPacingUnifiedHoldShareDefault);
+
+    // SIGNED RULE, share 0 (a = 0): the credit refills J - active = -1.3 ms per report: in debt
+    // once live, at its lower bound -J at the end, never positive; no cycle measured.
+    const std::vector<SourceStageFrame> off = stream(0.0, 1'700.0);
+    for (const SourceStageFrame& frame : off) {
+        CHECK(!frame.unified.status.cycle_valid);
+        if (frame.unified.hold_live) CHECK(frame.unified.hold_credit_us <= 0.0);
+    }
+    CHECK(off.back().unified.hold_live && Near(off.back().unified.hold_credit_us, -kJUs, 1.0));
+    CHECK(off.back().plan.hold_advance_us > 0.0f);
+
+    // SIGNED RULE, share 0.1 but no frame generation time (A = 0 -> a = 0): the same debt as
+    // share 0, though the share is on and the cycle is measured.
+    const std::vector<SourceStageFrame> no_ai = stream(0.1, 0.0);
+    for (const SourceStageFrame& frame : no_ai) {
+        if (frame.unified.hold_live) CHECK(frame.unified.hold_credit_us <= 0.0);
+    }
+    CHECK(no_ai.back().unified.status.cycle_valid);
+    CHECK(no_ai.back().unified.hold_live && Near(no_ai.back().unified.hold_credit_us, -kJUs, 1.0));
+    CHECK(no_ai.back().plan.hold_advance_us > 0.0f);
+
+    // NO-ROOM ALLOWANCE, share 0.1, ai 1.7 ms: room = -1.3 ms < a = min(1.47, 1.7) = 1.47 ms, so
+    // every report once C is valid refills a; the credit climbs out of the early debt and ends at
+    // its bound W * a = 32 * 1.47 = 47.04 ms, no advance. Nothing in the start interval or the
+    // floor's J changed.
+    const std::vector<SourceStageFrame> on = stream(0.1, 1'700.0);
+    const SourceStageFrame& last = on.back();
+    CHECK(last.unified.status.cycle_valid && Near(last.unified.status.cycle_us, kSpacingUs, 2.0));
+    CHECK(last.unified.hold_live && Near(last.unified.hold_credit_us, kWindow * 1'470.0, 2.0));
+    CHECK(last.plan.hold_advance_us == 0.0f);
+    CHECK(last.plan.interval_us == off.back().plan.interval_us);
+    CHECK(last.unified.start.gpu_interval_us == off.back().unified.start.gpu_interval_us);
+    CHECK(!on[3].unified.status.cycle_valid); // fewer than the minimum count of spacings
+    for (const SourceStageFrame& frame : on) CHECK(frame.plan.hold_advance_us >= 0.0f);
+
+    // NO-ROOM ALLOWANCE bounded by A: ai 0.5 ms < share * C, so a = 0.5 ms and the credit ends at
+    // W * a = 16 ms, below the 1.7 ms run's.
+    const std::vector<SourceStageFrame> bounded = stream(0.1, 500.0);
+    CHECK(bounded.back().unified.hold_live && Near(bounded.back().unified.hold_credit_us, kWindow * 500.0, 2.0));
+    CHECK(bounded.back().unified.hold_credit_us < last.unified.hold_credit_us);
+    CHECK(bounded.back().plan.hold_advance_us == 0.0f);
+
+    // SIGNED RULE with room: active 10.0 ms, room = +2.7 ms >= a = 1.47 ms, so the allowance does
+    // not apply: the signed refill +2.7 ms per report runs under the bounds [-J, W * J], past the
+    // allowance's bound W * a (the credit is not capped by it).
+    const std::vector<SourceStageFrame> room = stream(0.1, 1'700.0, 10'000.0);
+    CHECK(room.back().unified.hold_live && room.back().unified.hold_credit_us > kWindow * 1'470.0 * 2.0);
+    CHECK(room.back().unified.hold_credit_us <= kWindow * kJUs);
+    CHECK(room.back().plan.hold_advance_us == 0.0f);
+
+    // Turning the key off restores the share.
+    g_stage.SetUnifiedEnabled(false, 1);
+    CHECK(g_stage.Unified().Options().hold_share == 0.0);
+}
+
+// Keys unified_queue_law / unified_queue_rank / unified_queue_allow_us reach the law through
+// SourceStage::SetUnifiedOptions (defaulted trailing parameters, clamped by the law) and the probe's
+// records through SourceStage::OnQueueRecord, both only while unified is enabled. In use (16 valid
+// records), the plan's interval is the law's I_gpu: cycle 14.7 ms, margin 1.5 ms, J = 12.7 ms (VRR
+// terms): q = 1.5 ms, P = q / 32, I_gpu = 14.7 ms + 46.875 us.
+void TestUnifiedQueueLawPlumbed()
+{
+    std::printf("Test: unified_queue_law options and probe records reach the law; the plan takes its I_gpu\n");
+    std::atomic<uint64_t> mailbox{0};
+    const auto record = [](double cycle_us, double margin_us) {
+        PacingGpuQueueRecord r{};
+        r.valid = PacingGpuQueueRecord::kCycle | PacingGpuQueueRecord::kEmpty |
+            PacingGpuQueueRecord::kBoundaryIdle | PacingGpuQueueRecord::kHoldBlock |
+            PacingGpuQueueRecord::kWaitIdle | PacingGpuQueueRecord::kMinMarginFree;
+        r.cycle_us = cycle_us;
+        r.min_margin_free_us = margin_us;
+        return r;
+    };
+    const auto feed = [&](int count) {
+        for (int i = 0; i < count; ++i)
+            g_stage.OnQueueRecord(record(14'700.0, 1'500.0));
+    };
+
+    // The key-off stage takes neither the options nor the records.
+    ResetStage();
+    g_stage.SetUnifiedEnabled(false, 1);
+    g_stage.SetUnifiedOptions(true, 2'000.0, 0.0, true, 3, 2'500);
+    feed(16);
+    CHECK(!g_stage.Unified().Options().queue_law && !g_stage.Unified().QueueLawInUse());
+
+    // Enabled with the defaults: the law is off, 2, 4000, and the records are ignored.
+    g_stage.SetUnifiedEnabled(true, 1);
+    CHECK(!g_stage.Unified().Options().queue_law && g_stage.Unified().Options().queue_rank == kPacingUnifiedQueueRankDefault &&
+          g_stage.Unified().Options().queue_allow_us == static_cast<double>(kPacingUnifiedQueueAllowDefaultUs));
+    g_stage.SetUnifiedOptions(true, 2'000.0);
+    CHECK(!g_stage.Unified().Options().queue_law);
+    feed(16);
+    CHECK(!g_stage.Unified().QueueLawInUse());
+
+    // The numbers are clamped by the law.
+    g_stage.SetUnifiedOptions(true, 2'000.0, 0.0, true, 99, 99'999);
+    CHECK(g_stage.Unified().Options().queue_law && g_stage.Unified().Options().queue_rank == kPacingUnifiedQueueRankMax &&
+          g_stage.Unified().Options().queue_allow_us == static_cast<double>(kPacingUnifiedQueueAllowMaxUs));
+    g_stage.SetUnifiedOptions(true, 2'000.0, 0.0, true, 3, 2'500);
+    CHECK(g_stage.Unified().Options().queue_rank == 3 && g_stage.Unified().Options().queue_allow_us == 2'500.0);
+    feed(11);
+    CHECK(!g_stage.Unified().QueueLawInUse()); // fewer than 12 valid arrivals: the report rule
+    feed(5);
+    CHECK(g_stage.Unified().QueueLawInUse());
+
+    // The plan takes the law's I_gpu and the record carries its statistics.
+    ScriptedClock clock;
+    clock.now = kStart;
+    SourceStageRequest request = UnifiedMarkerRequest(Key(7000), &mailbox);
+    request.unified.terms = UnifiedIntervalTerms{};
+    request.unified.terms.vrr_us = 12'700.0;
+    const SourceStageFrame frame = g_stage.RunPlannedFrame(request, &clock);
+    CHECK(frame.planned && frame.unified.valid);
+    const UnifiedStatus& status = frame.unified.status;
+    CHECK(status.ql_valid && status.ql_valid_frames == 16 && status.bindable);
+    CHECK(Near(status.ql_base_us, 14'700.0) && Near(status.ql_need_us, 14'700.0) && Near(status.ql_service_us, 14'700.0));
+    CHECK(Near(status.ql_q_us, 1'500.0) && Near(status.ql_p_us, 1'500.0 / 32.0));
+    CHECK(Near(status.gpu_interval_us, 14'700.0 + 1'500.0 / 32.0, 1e-6));
+    CHECK(Near(frame.plan.interval_us, 14'700.0 + 1'500.0 / 32.0, 1e-6));
+    CHECK((frame.unified.flags & kUpQueueLaw) != 0 && (frame.unified.flags & kUpBoundGpu) != 0);
+
+    // The law off again: no window, no bits, no count on the next plan.
+    g_stage.SetUnifiedOptions(true, 2'000.0, 0.0, false, 3, 2'500);
+    CHECK(!g_stage.Unified().QueueLawInUse());
+    clock.now = frame.release_qpc + Ticks(4'000.0);
+    request = UnifiedMarkerRequest(Key(7001), &mailbox);
+    request.unified.terms = UnifiedIntervalTerms{};
+    request.unified.terms.vrr_us = 12'700.0;
+    const SourceStageFrame off = g_stage.RunPlannedFrame(request, &clock);
+    CHECK(off.planned && off.unified.status.ql_valid_frames == -1 && (off.unified.flags & kUpQueueLaw) == 0);
+    CHECK(Near(off.plan.interval_us, 12'700.0, 1e-6));
+
+    // The key off puts the options back.
+    g_stage.SetUnifiedEnabled(false, 1);
+    CHECK(!g_stage.Unified().Options().queue_law && !g_stage.Unified().QueueLawInUse());
+}
+
+// The queue law counts the starvation in its base only for frames the GPU term paced: the term was
+// the binding one at the frame's plan and the start wait ran to it (the frame did not arrive after
+// its planned start). The record of frame k is matched to frame k's own plan entry. VRR terms
+// J = 12.7 ms; every record has a 14.7 ms cycle.
+//  - Late arrivals (40 ms after the previous release, after every planned start): never paced:
+//    B is the need (cycle - starve = 12.7 ms), the GPU term never binds.
+//  - Early arrivals (the starts wait): from the 13th plan the law's I_gpu binds and those frames
+//    are paced: with 15 of the newest 16 records starved by 1 ms, B = 13.7 ms + 15 / 16 ms.
+void TestUnifiedQueueLawPacedFrames()
+{
+    std::printf("Test: the queue law counts the starvation of GPU-paced frames only\n");
+    std::atomic<uint64_t> mailbox{0};
+    const auto record = [](const SourceStageFrame& frame, double starve_us) {
+        PacingGpuQueueRecord r{};
+        r.valid = PacingGpuQueueRecord::kCycle | PacingGpuQueueRecord::kEmpty |
+            PacingGpuQueueRecord::kBoundaryIdle | PacingGpuQueueRecord::kHoldBlock |
+            PacingGpuQueueRecord::kWaitIdle | PacingGpuQueueRecord::kMinMarginFree;
+        r.cycle_us = 14'700.0;
+        r.empty_us = starve_us;
+        r.min_margin_free_us = 500.0;
+        r.key = PacingPlanKey_Frame(frame.plan.key);
+        return r;
+    };
+    const auto run = [&](bool late, double starve_us, int starve_from) {
+        ResetStage();
+        g_stage.SetUnifiedEnabled(true, 1);
+        g_stage.SetUnifiedOptions(true, 2'000.0, 0.0, true, 2, 4'000, 4);
+        ScriptedClock clock;
+        int64_t previous_release = kStart - Ticks(4'000.0);
+        SourceStageFrame frame{};
+        for (int k = 0; k < 32; ++k) {
+            clock.now = previous_release + Ticks(late ? 40'000.0 : 4'000.0);
+            SourceStageRequest request = UnifiedMarkerRequest(Key(9'000 + static_cast<uint64_t>(k)), &mailbox);
+            request.unified.terms = UnifiedIntervalTerms{};
+            request.unified.terms.vrr_us = 12'700.0;
+            frame = g_stage.RunPlannedFrame(request, &clock);
+            CHECK(frame.planned && frame.unified.valid);
+            previous_release = frame.release_qpc;
+            g_stage.OnQueueRecord(record(frame, k >= starve_from ? starve_us : 0.0));
+        }
+        return frame;
+    };
+
+    const SourceStageFrame late = run(true, 2'000.0, 0);
+    CHECK(late.unified.status.ql_valid && late.unified.status.ql_valid_frames == 16);
+    CHECK(Near(late.unified.status.ql_base_us, 12'700.0, 1e-6));
+    CHECK((late.unified.flags & kUpBoundGpu) == 0 && (late.unified.flags & kUpQueueLawPaced) == 0);
+    CHECK(Near(late.plan.interval_us, 12'700.0, 1e-6)); // the VRR term keeps binding
+
+    const SourceStageFrame early = run(false, 1'000.0, 16);
+    CHECK(early.unified.status.ql_valid && early.unified.status.bindable);
+    CHECK(Near(early.unified.status.ql_base_us, 13'700.0 + 15.0 * 1'000.0 / 16.0, 1e-6));
+    CHECK((early.unified.flags & kUpBoundGpu) != 0 && (early.unified.flags & kUpQueueLawPaced) != 0);
+
+    // Only a wait that RAN to its target paces a frame. Frame 25 of a GPU-bound stream (records from
+    // frame 16 on starved by 1 ms) is reserved by the Sleep hook (GPU term binding, the marker
+    // before the target) and then:
+    //  - the reservation reports Failed and the marker arrives AFTER the target: it waits for
+    //    nothing (the release is already past the target) and no wait delayed the start;
+    //  - the reservation reports Late (the waiter began after the target) while its own
+    //    release_now stayed false;
+    // neither is paced: the starvation of its record leaves the base (1 ms / 16 below the stream
+    // that planned frame 25 early). With the wait evidence removed (release past the target is
+    // enough) both would be paced and the base would not move.
+    enum class Reservation { None, FailedThenLateMarker, LateOutcome };
+    const auto reserved_run = [&](Reservation mode) {
+        ResetStage();
+        g_stage.SetUnifiedEnabled(true, 1);
+        g_stage.SetUnifiedOptions(true, 2'000.0, 0.0, true, 2, 4'000, 4);
+        ScriptedClock clock;
+        int64_t previous_release = kStart - Ticks(4'000.0);
+        SourceStageFrame frame{};
+        for (int k = 0; k <= 26; ++k) {
+            SourceStageRequest request = UnifiedMarkerRequest(Key(9'500 + static_cast<uint64_t>(k)), &mailbox);
+            request.unified.terms = UnifiedIntervalTerms{};
+            request.unified.terms.vrr_us = 12'700.0;
+            clock.now = previous_release + Ticks(4'000.0);
+            int waits = clock.wait_calls;
+            if (k == 25 && mode != Reservation::None) {
+                const int64_t arrival = clock.now;
+                UnifiedStart reserved{};
+                CHECK(g_stage.Unified().Reserve(g_stage.Grid().NextIndex(), 1, arrival, request.unified.terms,
+                          &reserved) == UnifiedReserveStatus::Reserved);
+                CHECK((reserved.flags & kUpBoundGpu) != 0 && !reserved.release_now);
+                const int64_t target = UnifiedPacer_TargetTicks(reserved.target);
+                if (mode == Reservation::FailedThenLateMarker) {
+                    mailbox.store(UnifiedMailbox_Pack(reserved.token, UnifiedSleepOutcome::Failed, 0),
+                        std::memory_order_release);
+                } else {
+                    mailbox.store(UnifiedMailbox_Pack(reserved.token, UnifiedSleepOutcome::Late,
+                                      target + Ticks(500.0) - arrival), std::memory_order_release);
+                }
+                clock.now = target + Ticks(1'000.0); // the marker is already past the target
+                waits = clock.wait_calls;
+            }
+            frame = g_stage.RunPlannedFrame(request, &clock);
+            CHECK(frame.planned && frame.unified.valid);
+            if (k == 25 && mode == Reservation::FailedThenLateMarker)
+                CHECK(frame.unified.kind == UnifiedResolutionKind::WaitFailed && clock.wait_calls == waits);
+            if (k == 25 && mode == Reservation::LateOutcome)
+                CHECK(frame.unified.kind == UnifiedResolutionKind::Consumed && clock.wait_calls == waits);
+            previous_release = frame.release_qpc;
+            if (k <= 25)
+                g_stage.OnQueueRecord(record(frame, k >= 16 ? 1'000.0 : 0.0));
+        }
+        return frame.unified.status.ql_base_us;
+    };
+    const double planned_early = reserved_run(Reservation::None);
+    CHECK(Near(planned_early, 13'700.0 + 10.0 * 1'000.0 / 16.0, 1e-6)); // frames 16..25 starved and paced
+    CHECK(Near(reserved_run(Reservation::FailedThenLateMarker), planned_early - 1'000.0 / 16.0, 1e-6));
+    CHECK(Near(reserved_run(Reservation::LateOutcome), planned_early - 1'000.0 / 16.0, 1e-6));
+    g_stage.SetUnifiedEnabled(false, 1);
+}
+
 int main()
 {
     std::printf("=== Source stage tests ===\n");
@@ -2340,6 +3633,22 @@ int main()
     TestDriverSleepKeyOffChangesNothingButTheStamps();
     TestDriverReleaseNeedsAMatchingSleep();
     TestPreciseReleaseTargetIsCommitted();
+    TestUnifiedBranch();
+    TestUnifiedPlanningDecision();
+    TestUnifiedMarkerOnlyFrames();
+    TestUnifiedFailedMarkerWait();
+    TestUnifiedRawDivisorAndDriverSleep();
+    TestUnifiedUsedReportReachesTheLead();
+    TestUnifiedDisplayFloorClearedAtCutover();
+    TestUnifiedReportResolvedBeforeLeadFinalizes();
+    TestUnifiedDeferredSampleWaitsForPredecessorReadiness();
+    TestKeyTransitionBeforeTheDrain();
+    TestUnifiedHoldAdvanceOnPlans();
+    TestUnifiedOptionsPlumbed();
+    TestUnifiedCorrectionRefusalFollowsTheSample();
+    TestUnifiedHoldSharePlumbed();
+    TestUnifiedQueueLawPlumbed();
+    TestUnifiedQueueLawPacedFrames();
     TestDriverLimiterHoldPlansWithoutAWait();
     TestGpuPacedRing();
     TestGpuPacedRhythm();

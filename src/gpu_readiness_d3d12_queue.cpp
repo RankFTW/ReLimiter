@@ -1,4 +1,5 @@
 #include "gpu_readiness_d3d12_queue.h"
+#include "gpu_queue_probe.h"
 #include <cstring>
 
 namespace {
@@ -136,8 +137,11 @@ void GpuReadinessQueue_CopyCalibration(GpuReadinessQueue* queue,
 HRESULT GpuReadinessQueue_Submit(GpuReadinessQueue* queue, GpuTimestampSlot* slot,
     GpuReadinessSample* sample) noexcept {
     sample->timestamp.submit_before_qpc = Qpc();
+    // gpu_queue_probe: ReLimiter's own timestamp list is not part of the game's frame.
+    const bool own = GpuQueueProbe_OwnSubmissionBegin();
     __try { queue->queue->ExecuteCommandLists(1, &slot->commands); }
     __except (EXCEPTION_EXECUTE_HANDLER) { queue->faulted.store(true); }
+    GpuQueueProbe_OwnSubmissionEnd(own);
     sample->timestamp.submit_after_qpc = Qpc();
     sample->signal_before_qpc = Qpc();
     HRESULT result = E_FAIL;

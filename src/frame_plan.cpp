@@ -1,5 +1,7 @@
 #include "frame_plan.h"
 
+#include <thread>
+
 namespace
 {
     // A reader overlapping the owner's publication of the same slot retries
@@ -60,6 +62,8 @@ void FramePlanRegistry::WriteSlot(Slot* slot, const PacingFramePlan& plan) noexc
     slot->interval_us.store(plan.interval_us, std::memory_order_relaxed);
     slot->fg_divisor.store(plan.fg_divisor, std::memory_order_relaxed);
     slot->packed_enums.store(PackEnums(plan), std::memory_order_relaxed);
+    slot->hold_advance_us.store(plan.hold_advance_us, std::memory_order_relaxed);
+    slot->law_hold_sequence.store(plan.law_hold_sequence, std::memory_order_relaxed);
 
     slot->sequence.store(sequence + 2, std::memory_order_release);
 }
@@ -89,6 +93,8 @@ bool FramePlanRegistry::TryReadSlot(
     copy.interval_us = slot.interval_us.load(std::memory_order_relaxed);
     copy.fg_divisor = slot.fg_divisor.load(std::memory_order_relaxed);
     UnpackEnums(slot.packed_enums.load(std::memory_order_relaxed), &copy);
+    copy.hold_advance_us = slot.hold_advance_us.load(std::memory_order_relaxed);
+    copy.law_hold_sequence = slot.law_hold_sequence.load(std::memory_order_relaxed);
 
     std::atomic_thread_fence(std::memory_order_acquire);
     if (slot.sequence.load(std::memory_order_relaxed) != before) return false;
@@ -215,9 +221,54 @@ uint64_t PacingStageEventQueue::Dropped() const noexcept
     return queue_.DroppedValues();
 }
 
+std::atomic<uint64_t> g_up_ready_index{0};
+std::atomic<int64_t> g_up_ready_qpc{0};
+std::atomic<bool> g_up_ready_publish{false};
+
+namespace
+{
+    std::atomic<FramePlanReadyWaker> s_ready_waker{nullptr};
+
+    // Raises `value` to `candidate` only when candidate is larger: a producer that finds a larger
+    // (or equal) value stops, so an older value is never stored. Lock-free, never waits for another
+    // producer (each failed compare-exchange means another producer stored a newer value).
+    template <typename T>
+    bool RaiseMaximum(std::atomic<T>* value, T candidate) noexcept
+    {
+        T observed = value->load(std::memory_order_relaxed);
+        while (observed < candidate) {
+            if (value->compare_exchange_weak(observed, candidate, std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+void FramePlan_SetReadyWaker(FramePlanReadyWaker waker) noexcept
+{
+    s_ready_waker.store(waker, std::memory_order_release);
+}
+
+void FramePlan_RaiseReady(uint64_t grid_index, int64_t qpc) noexcept
+{
+    // The QPC first: a waiter woken by the index raise finds the newest completion time already there.
+    if (qpc > 0) (void)RaiseMaximum(&g_up_ready_qpc, qpc);
+    if (RaiseMaximum(&g_up_ready_index, grid_index)) {
+        const FramePlanReadyWaker waker = s_ready_waker.load(std::memory_order_acquire);
+        if (waker != nullptr) waker(&g_up_ready_index);
+    }
+}
+
 bool FramePlan_PushStageEvent(const PacingStageEvent& event) noexcept
 {
-    return s_stage_events.Push(event);
+    const bool pushed = s_stage_events.Push(event);
+    if (g_up_ready_publish.load(std::memory_order_relaxed) &&
+        event.kind == PacingStageEventKind::GpuReady && event.grid_index != 0) {
+        FramePlan_RaiseReady(event.grid_index, event.qpc);
+    }
+    return pushed;
 }
 
 bool FramePlan_PopStageEvent(PacingStageEvent* event) noexcept

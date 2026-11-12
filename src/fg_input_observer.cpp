@@ -384,15 +384,24 @@ void FgInput_InstallAndDrain() noexcept {
             reinterpret_cast<uint64_t>(reviewed_module));
     }
     auto* base = reinterpret_cast<BYTE*>(reviewed_module);
+    void* const present_target = base + 0x54690;
+    void* const present1_target = base + 0x543b0;
+    MH_STATUS present_status = MH_OK, present1_status = MH_OK;
+    if (!present_enabled)
+        present_status = InstallHook(present_target, reinterpret_cast<void*>(&HookPresent), &original_present);
+    if (!present1_enabled)
+        present1_status = InstallHook(present1_target, reinterpret_cast<void*>(&HookPresent1), &original_present1);
+    // Inside a batch the hooks are only queued: enable them now, the flags below read the result.
+    Hooks_FlushBatch();
     if (!present_enabled) {
-        const auto status = InstallHook(base + 0x54690, reinterpret_cast<void*>(&HookPresent), &original_present);
-        present_enabled = status == MH_OK || status == MH_ERROR_ENABLED;
-        LOG_INFO("FG input: Present installation status=%d", status);
+        present_enabled = (present_status == MH_OK || present_status == MH_ERROR_ENABLED) &&
+            Hooks_TargetEnabled(present_target);
+        LOG_INFO("FG input: Present installation status=%d enabled=%d", present_status, present_enabled ? 1 : 0);
     }
     if (!present1_enabled) {
-        const auto status = InstallHook(base + 0x543b0, reinterpret_cast<void*>(&HookPresent1), &original_present1);
-        present1_enabled = status == MH_OK || status == MH_ERROR_ENABLED;
-        LOG_INFO("FG input: Present1 installation status=%d", status);
+        present1_enabled = (present1_status == MH_OK || present1_status == MH_ERROR_ENABLED) &&
+            Hooks_TargetEnabled(present1_target);
+        LOG_INFO("FG input: Present1 installation status=%d enabled=%d", present1_status, present1_enabled ? 1 : 0);
     }
     installed.store(present_enabled || present1_enabled, std::memory_order_release);
 }

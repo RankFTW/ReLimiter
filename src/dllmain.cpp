@@ -34,6 +34,7 @@
 #include "frame_splitting.h"
 #include "config.h"
 #include "logger.h"
+#include "startup_breadcrumb.h"
 #include "csv_writer.h"
 #include "pacing_telemetry.h"
 #include "swapchain_manager.h"
@@ -49,6 +50,8 @@
 #include "gpu_present_gate.h"
 #include "gpu_priority_probe.h"
 #include "control_file.h"
+#include "gpu_queue_probe.h"
+#include "scheduler.h"
 #include "gpu_readiness.h"
 
 static bool    s_addon_initialised = false;
@@ -293,8 +296,12 @@ static void on_present_impl(reshade::api::command_queue* queue,
     // Init is provisional; only the selected presenter may recapture global
     // state or pace. The try-only guard also handles late load and subsequent
     // destroy/recreate lifetimes without a permanent late-init barrier.
+    NativeGate_NoteEntry(NativeGateEntry::OnPresent);
+    // Diagnostics (one relaxed load): who calls ReShade's Present, captured at the first present event after each tick.
+    if (VSync_StackCaptureArmed()) VSync_NoteOnPresentStack(sc ? static_cast<uint64_t>(sc->get_native()) : 0);
     SwapchainPresentGuard presenter(sc);
     if (!presenter) return;
+    Breadcrumb_Mark(StartupStage::FirstPresentEvent);  // first-wins
 
     // MMCSS registration for the present thread (once)
     Hardening_OnFirstPresent();
@@ -319,10 +326,25 @@ static void on_present_impl(reshade::api::command_queue* queue,
         bool expected = false;
         if (s_hooks_installed.compare_exchange_strong(
                 expected, true, std::memory_order_acq_rel)) {
-            InstallLoadLibraryHooks();
-            LOG_INFO("LoadLibrary hooks installed (deferred)");
-            InstallNvAPIHooks();
-            LOG_INFO("NvAPI hooks installed (deferred)");
+            {
+                // One batch for every hook of this block: one install-lock hold and one MinHook freeze instead
+                // of one per hook. What is logged as installed is read after the apply.
+                HookBatch batch(HookBatchSite::FirstPresent);
+                InstallLoadLibraryHooks();
+                InstallNvAPIHooks();
+                batch.Apply();
+            }
+            LoadLibraryHooks_ReportInstalled();
+            NvAPIHooks_ReportInstalled();
+            switch (Hooks_InstallerState()) {
+            case HookInstallerState::Ready: LOG_INFO("Hooks: installer thread ready (protected)"); break;
+            case HookInstallerState::Unprotected:
+                LOG_INFO("Hooks: installer thread unprotected (its self-check found it can be suspended, for example with "
+                         "the debug privilege enabled); freezing MinHook calls run on the calling thread");
+                break;
+            case HookInstallerState::Starting: LOG_INFO("Hooks: installer thread still starting; calls run on the calling thread so far"); break;
+            default: break;
+            }
         }
     }
 
@@ -353,6 +375,9 @@ static void on_present_impl(reshade::api::command_queue* queue,
         const bool recapture = SwapMgr_ConsumeRecaptureFlag();
         if (api == ActiveAPI::DX11 || api == ActiveAPI::DX12) {
             auto native = reinterpret_cast<IDXGISwapChain*>(sc->get_native());
+            // The native object's Present entry is a private copy of its vtable: installed when the object has
+            // none, rebuilt over another module's vtable when it replaced ours (one load and one compare otherwise).
+            VSync_ObserveNativeVptr(reinterpret_cast<uint64_t>(native));
             static std::atomic<ActiveAPI> s_last_notified_api{ActiveAPI::None};
 
             const bool pointer_changed = native &&
@@ -368,6 +393,7 @@ static void on_present_impl(reshade::api::command_queue* queue,
                     DispRes_OnSwapchainInit(reinterpret_cast<uint64_t>(native),
                                             api, SwapMgr_GetHWND());
                 }
+                VSync_NoteCapturedSwapchain(native);
                 LOG_INFO("on_present: captured presenting swapchain %p (hwnd=%p, api=%d, "
                          "ptr_changed=%d, api_changed=%d, recapture=%d)",
                          native, SwapMgr_GetHWND(), static_cast<int>(api),
@@ -399,6 +425,8 @@ static void on_present_impl(reshade::api::command_queue* queue,
         const uint64_t native = sc->get_native();
         NativeGate_BeginScope(native, FrameTimeline_GetPresentSwapchainGeneration(native));
     }
+    // Start-up breadcrumb: a completed present of the selected swapchain (the 32nd marks Running).
+    Breadcrumb_PresentCompleted();
 }
 
 static void on_finish_present(reshade::api::command_queue*, reshade::api::swapchain* sc) {
@@ -407,7 +435,11 @@ static void on_finish_present(reshade::api::command_queue*, reshade::api::swapch
     GpuReadiness_OnFinishPresent(sc);
     const uint64_t native = sc->get_native();
     NativeGate_EndScope(native, FrameTimeline_GetPresentSwapchainGeneration(native));
+    // The inline Present pair's fallback: a completed present scope of the selected native swapchain (counts the
+    // scopes in which the vtable entry that carries the route did not run).
+    VSync_NoteFinishedPresent(native);
     NativeGate_PublishRouteCapability(FrameTimeline_CurrentControllerGeneration());
+    VSync_RouteDiagnosticsTick();
 }
 
 // Developer key gpu_start_probe (gpu_readiness_d3d12.cpp): before the
@@ -427,7 +459,11 @@ static void on_destroy_command_queue(reshade::api::command_queue* queue) {
         StreamlineDiscovery_RecordBoundary({StreamlineBoundaryStage::DestroyQueue,
             0, queue->get_native(), queue->get_device()->get_native()});
     }
-    if (!callback.IsStopping()) GpuReadiness_OnQueueDestroy(queue);
+    if (!callback.IsStopping()) {
+        GpuReadiness_OnQueueDestroy(queue);
+        if (queue && queue->get_device() && queue->get_device()->get_api() == reshade::api::device_api::d3d12)
+            GpuQueueProbe_OnQueueDestroy(reinterpret_cast<void*>(static_cast<uintptr_t>(queue->get_native())));
+    }
 }
 
 static void on_present(reshade::api::command_queue* queue,
@@ -469,6 +505,7 @@ static void on_present(reshade::api::command_queue* queue,
 // ── Core initialization (always outside the loader lock) ──
 static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
     if (s_addon_initialised) return true;   // already done
+    Breadcrumb_Mark(StartupStage::InitBegun);
 
     // Register with ReShade using the handle supplied by its post-load entry
     // point. Full initialization is never attempted from DllMain.
@@ -515,7 +552,7 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
              g_config.osd_preset_prev_key.empty() ? "(none)" : g_config.osd_preset_prev_key.c_str(),
              g_config.osd_preset_next_key.empty() ? "(none)" : g_config.osd_preset_next_key.c_str());
 
-    const MH_STATUS minhook_status = MH_Initialize();
+    const MH_STATUS minhook_status = Hooks_Initialize();
     const bool reactivating_retained_hooks =
         minhook_status == MH_ERROR_ALREADY_INITIALIZED;
     if (minhook_status != MH_OK && !reactivating_retained_hooks) {
@@ -524,6 +561,15 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
     }
     s_minhook_initialised = true;
     Hooks_ResetInstallAdmission();
+    // The hook installer thread (hooks.h): one thread other engines cannot suspend runs the freezing MinHook calls.
+    // The key is read once, here, before the thread exists; false keeps every call on its requester. The call only
+    // creates the thread and returns: until the thread reports ready (after its protection self-check) calls run
+    // inline. DoInit runs from AddonInit, never from DllMain or a loader callback.
+    if (Hooks_StartInstallerThread(g_config.hook_installer_thread))
+        LOG_INFO("Hooks: installer thread created (it serves freezing MinHook calls once its self-check passed)");
+    else
+        LOG_INFO("Hooks: no installer thread (%s); freezing MinHook calls run on the calling thread",
+                 g_config.hook_installer_thread ? "creation failed or MinHook unusable" : "hook_installer_thread=false");
     LOG_INFO(
         reactivating_retained_hooks
             ? "MinHook retained lifetime reactivated"
@@ -582,11 +628,18 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
 
         // Developer flip_metering_off: before the game's frame generation
         // resolves NvAPI_D3D12_SetFlipConfig, so not with the deferred hooks.
-        if (g_config.flip_metering_off) InstallFlipMeteringBlock();
+        {
+            // One batch for the install block of init: the flip-metering block and the NGX hooks are enabled
+            // by one freeze. The block's report is read after the apply.
+            HookBatch batch(HookBatchSite::Init);
+            if (g_config.flip_metering_off) InstallFlipMeteringBlock();
+            if (g_config.dlss_info_hooks) NGXHooks_Init();
+            else LOG_INFO("DLSS info hooks disabled by user config");
+            batch.Apply();
+        }
+        ReportFlipMeteringBlock();
         HWMonitor_Init();
         s_hw_monitor_started = true;
-        if (g_config.dlss_info_hooks) NGXHooks_Init();
-        else LOG_INFO("DLSS info hooks disabled by user config");
         Blackout_Init();
         s_blackout_started = true;
 
@@ -612,6 +665,7 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         LOG_INFO("ReShade events + OSD registered");
 
     if (reactivating_retained_hooks) {
+        LOG_INFO("Hooks: the retained hooks of a previous addon load are enabled again (MH_EnableHook(MH_ALL_HOOKS))");
         const MH_STATUS enable_status = EnableAllHooks();
         if (enable_status != MH_OK && enable_status != MH_ERROR_ENABLED) {
             LOG_ERROR("Failed to reactivate retained hooks (%d)", enable_status);
@@ -623,6 +677,7 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
     Log_EndInitPhase();
     Log_SetLevel(Log_ParseLevel(g_config.log_level.c_str()));
     s_addon_initialised = true;
+    Breadcrumb_Mark(StartupStage::InitEnded);
     return true;
 }
 
@@ -649,6 +704,11 @@ static bool StopOwnedProducers() {
     bool auxiliary_workers_stopped =
         DLSSPresets_Shutdown() && native_pcl_stopped && gpu_present_stopped && priority_probe_stopped;
     auxiliary_workers_stopped = GpuReadiness_Stop() && auxiliary_workers_stopped;
+    // gpu_queue_probe: its thread pushes telemetry and holds queue references; ends before the
+    // hooks are disabled and before the telemetry worker stops.
+    // The queue law's session summary (a line, only with unified_queue_law on), before the probe stops.
+    Scheduler_LogQueueLawSummary();
+    auxiliary_workers_stopped = GpuQueueProbe_Shutdown(5000) && auxiliary_workers_stopped;
     auxiliary_workers_stopped = ControlFile_Stop() && auxiliary_workers_stopped;
     auxiliary_workers_stopped =
         NGXHooks_BeginShutdown() && auxiliary_workers_stopped;
@@ -668,6 +728,25 @@ static bool StopOwnedProducers() {
     return auxiliary_workers_stopped;
 }
 
+// Teardown's hook disable. Installer admission is closed FIRST (Hooks_BeginShutdown returns only after every
+// installer already inside has left), so the list of DXGI inline patches to leave enabled is complete: a typed
+// hook installed by a render thread during shutdown is in it, or its install is refused. The vptrs that are still
+// ours go back (the detours keep forwarding and the callback rundown drains the calls inside them). The two DXGI
+// Present inline patches are never disabled: they stay enabled and pass through (the module is retained), so
+// MinHook never writes its saved bytes over a prologue another module patches at the same moment; every other
+// hook is disabled as before.
+static MH_STATUS DisableHooksForShutdown() {
+    Hooks_BeginShutdown();
+    VSync_RestoreVtables();
+    void* keep_enabled[32];
+    const size_t kept = VSync_InlineTargetsLeftEnabled(keep_enabled, 32);
+    const MH_STATUS status = kept != 0 ? DisableAllHooksExcept(keep_enabled, kept) : DisableAllHooks();
+    // The teardown disable was the last freezing call of this lifetime: the installer thread leaves (not joined;
+    // calls made later run on the caller).
+    Hooks_StopInstallerThread();
+    return status;
+}
+
 static bool RollbackInitialization(HMODULE addon_module) {
     RuntimeLifecycle_BeginShutdown();
     if (s_addon_registered) {
@@ -675,8 +754,10 @@ static bool RollbackInitialization(HMODULE addon_module) {
         s_addon_registered = false;
     }
     bool auxiliary_workers_stopped = StopOwnedProducers();
+    if (s_minhook_initialised)
+        LOG_INFO("Hooks: shutdown path A disables every hook (MH_DisableHook(MH_ALL_HOOKS)) except the DXGI Present / Present1 inline patches, which stay enabled and pass through; vtable vptrs that are still ours are restored first");
     const MH_STATUS disable_status = s_minhook_initialised
-        ? DisableAllHooks()
+        ? DisableHooksForShutdown()
         : MH_OK;
     FocusLock_Remove();
     const bool callbacks_drained = RuntimeLifecycle_WaitForCallbacks(5000);
@@ -716,6 +797,7 @@ static bool RollbackInitialization(HMODULE addon_module) {
 
     s_addon_initialised = false;
     auxiliary_workers_stopped = Config_Shutdown() && auxiliary_workers_stopped;
+    if (auxiliary_workers_stopped) Breadcrumb_Mark(StartupStage::Closed);
     if (auxiliary_workers_stopped)
         auxiliary_workers_stopped = Log_Shutdown();
     if (auxiliary_workers_stopped) RuntimeLifecycle_Shutdown();
@@ -752,6 +834,7 @@ bool AddonInit(HMODULE addon_module, HMODULE reshade_module) {
     s_present_seen.store(false, std::memory_order_release);
     if (!RuntimeLifecycle_Initialize()) {
         LOG_ERROR("Runtime lifecycle initialization failed");
+        Breadcrumb_Mark(StartupStage::Closed);
         const bool logger_stopped = Log_Shutdown();
         if (acquired_new_reference && logger_stopped)
             ReleaseRuntimeReference();
@@ -798,8 +881,10 @@ static void AddonUninitImpl(HMODULE addon_module) {
     // Stop every owned producer before disabling hooks and draining callbacks.
     bool auxiliary_workers_stopped = StopOwnedProducers();
 
+    if (s_minhook_initialised)
+        LOG_INFO("Hooks: shutdown path B disables every hook (MH_DisableHook(MH_ALL_HOOKS)) except the DXGI Present / Present1 inline patches, which stay enabled and pass through; vtable vptrs that are still ours are restored first");
     const MH_STATUS disable_status = s_minhook_initialised
-        ? DisableAllHooks()
+        ? DisableHooksForShutdown()
         : MH_OK;
     FocusLock_Remove();
     const bool callbacks_drained = RuntimeLifecycle_WaitForCallbacks(5000);
@@ -855,6 +940,7 @@ static void AddonUninitImpl(HMODULE addon_module) {
                 ? "Startup shutdown complete; retained hooks ready for ReShade reload"
                 : "Gameplay shutdown complete; restart required before reloading ReLimiter");
     s_addon_initialised = false;
+    if (auxiliary_workers_stopped) Breadcrumb_Mark(StartupStage::Closed);
     if (auxiliary_workers_stopped)
         auxiliary_workers_stopped = Log_Shutdown();
     if (auxiliary_workers_stopped) RuntimeLifecycle_Shutdown();

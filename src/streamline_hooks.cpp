@@ -732,11 +732,16 @@ bool HookStreamlinePCL(HMODULE hInterposer) {
         GetProcAddress(hInterposer, "slGetFeatureFunction"));
     if (!pGetFeatureFunction) return false;
 
+    // Inside a batch InstallHook only queues: each group below is enabled by one flush, and the flags, logs and
+    // bound pointers are read from Hooks_TargetEnabled afterwards, never from the queue status.
+    void* const feature_target = reinterpret_cast<void*>(pGetFeatureFunction);
     if (!feature_installed) {
-        feature_installed = InstallHook(
-            reinterpret_cast<void*>(pGetFeatureFunction),
+        const MH_STATUS status = InstallHook(
+            feature_target,
             reinterpret_cast<void*>(&Detour_slGetFeatureFunction),
-            &s_orig_slGetFeatureFunction) == MH_OK;
+            &s_orig_slGetFeatureFunction);
+        Hooks_FlushBatch();
+        feature_installed = status == MH_OK && Hooks_TargetEnabled(feature_target);
         if (!feature_installed) return false;
     }
 
@@ -756,24 +761,20 @@ bool HookStreamlinePCL(HMODULE hInterposer) {
             "not rebound; generic GPU binding disabled until restart.");
     }
     if (options_installed && (g_config.streamline_compat || state_installed)) return ready;
+    void* options_target = nullptr;
+    void* state_target = nullptr;
+    MH_STATUS options_status = MH_OK;
+    MH_STATUS state_status = MH_OK;
     if (!options_installed) {
         void* fn = functions.set_options;
         sl_Result r = functions.options_result;
         if (r == sl_eOk && fn) {
-            const MH_STATUS status = InstallHook(fn,
+            options_target = fn;
+            options_status = InstallHook(fn,
                 g_config.streamline_compat
                     ? reinterpret_cast<void*>(&Detour_SetOptions_Compat)
                     : reinterpret_cast<void*>(&Detour_SetOptions),
                 &s_orig_SetOptions);
-            options_installed = status == MH_OK;
-            if (options_installed) {
-                bound_options = fn;
-                LOG_INFO("Streamline: hooked slDLSSGSetOptions");
-            } else if (!options_failure_logged) {
-                options_failure_logged = true;
-                LOG_WARN("Streamline: slDLSSGSetOptions at %p could not be hooked (%s); frame generation "
-                    "is not detected through Streamline. Retrying.", fn, MH_StatusToString(status));
-            }
         }
     }
     // Compatibility mode must not invoke GetState independently or hook it.
@@ -781,17 +782,32 @@ bool HookStreamlinePCL(HMODULE hInterposer) {
         void* fn = functions.get_state;
         sl_Result r = functions.state_result;
         if (r == sl_eOk && fn) {
-            const MH_STATUS status = InstallHook(fn, reinterpret_cast<void*>(&Detour_GetState),
-                &s_orig_GetState);
-            state_installed = status == MH_OK;
-            if (state_installed) {
-                bound_state = fn;
-                LOG_INFO("Streamline: hooked slDLSSGGetState");
-            } else if (!state_failure_logged) {
-                state_failure_logged = true;
-                LOG_WARN("Streamline: slDLSSGGetState at %p could not be hooked (%s). Retrying.",
-                    fn, MH_StatusToString(status));
-            }
+            state_target = fn;
+            state_status = InstallHook(fn, reinterpret_cast<void*>(&Detour_GetState), &s_orig_GetState);
+        }
+    }
+    Hooks_FlushBatch();
+    if (options_target) {
+        options_installed = options_status == MH_OK && Hooks_TargetEnabled(options_target);
+        if (options_installed) {
+            bound_options = options_target;
+            LOG_INFO("Streamline: hooked slDLSSGSetOptions");
+        } else if (!options_failure_logged) {
+            options_failure_logged = true;
+            LOG_WARN("Streamline: slDLSSGSetOptions at %p could not be hooked (%s); frame generation "
+                "is not detected through Streamline. Retrying.", options_target,
+                options_status == MH_OK ? "enable failed" : MH_StatusToString(options_status));
+        }
+    }
+    if (state_target) {
+        state_installed = state_status == MH_OK && Hooks_TargetEnabled(state_target);
+        if (state_installed) {
+            bound_state = state_target;
+            LOG_INFO("Streamline: hooked slDLSSGGetState");
+        } else if (!state_failure_logged) {
+            state_failure_logged = true;
+            LOG_WARN("Streamline: slDLSSGGetState at %p could not be hooked (%s). Retrying.",
+                state_target, state_status == MH_OK ? "enable failed" : MH_StatusToString(state_status));
         }
     }
     return ready;

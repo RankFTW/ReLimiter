@@ -133,6 +133,79 @@ struct PacingSourceRecord {
     uint8_t driver_sleep_status_valid = 0;
     uint8_t driver_use_game_sleep = 0;
     uint32_t driver_sleep_interval_us = 0;
+
+    // Developer key unified_pacer (src/unified_pacer.h): the
+    // start law's decision for this frame, filled in RunPlanned. up_valid 0
+    // (key off, passthrough, DMFG): every up_ CSV cell is empty. Each *_valid
+    // byte gates its own cell; up_grid_target_qpc 0 and up_outstanding -1 are
+    // empty too. up_queue_wait_raw_us and up_queue_wait_us are law state
+    // repeated across rows (the newest used report and the median of three),
+    // never a per-frame sample. CSV row columns up_grid_target_qpc ..
+    // up_ql_valid_frames, then sim_end_marker_qpc .. sim_end_tid (kUp* bits, unified_pacer.h).
+    uint8_t up_valid = 0;
+    int64_t up_grid_target_qpc = 0;      // T(n)
+    double up_interval_us = 0.0;         // I(n)
+    uint8_t up_gpu_interval_valid = 0;   // I_gpu bindable
+    double up_gpu_interval_us = 0.0;     // I_gpu
+    uint8_t up_gpu_service_valid = 0;    // at least 16 valid pairs
+    double up_gpu_service_us = 0.0;      // G-hat
+    uint8_t up_queue_wait_valid = 0;     // a report has been used since the reset
+    double up_queue_wait_raw_us = 0.0;   // signed z_raw of the newest used report
+    double up_queue_wait_us = 0.0;       // z-tilde, frozen while stale
+    int32_t up_outstanding = -1;         // frames unfinished at the release; -1 = limit inactive
+    double up_limit_wait_us = 0.0;       // time in the hard-limit loop
+    uint8_t up_ready_age_valid = 0;      // a completion had been seen
+    double up_ready_age_us = 0.0;        // R - g_up_ready_qpc
+    uint32_t up_flags = 0;               // kUp* bits
+    uint8_t up_hold_budget_valid = 0;    // the report stream was live at the plan (key on); 0 = the cell is empty
+    double up_hold_budget_us = 0.0;      // the signed hold credit at the plan (µs); negative = debt, advance = -credit
+    // Newest report the law had used at the plan: the service sample the law
+    // used (completion spacing minus the time the GPU waited for the frame's
+    // work, after the active-time rule; kUp flag 0x80000 = correction refused)
+    // in µs, and that wait, max(0, -queue wait) (µs). Each cell is empty when
+    // its valid byte is 0.
+    uint8_t up_service_sample_valid = 0;
+    double up_service_sample_us = 0.0;
+    uint8_t up_gpu_wait_valid = 0;
+    double up_gpu_wait_us = 0.0;
+    // Developer key unified_hold_share: C, the measured frame interval (median
+    // completion spacing of the newest used reports) at the frame's plan (µs);
+    // empty when C is not valid, the share is 0 or the key is off.
+    uint8_t up_cycle_valid = 0;
+    double up_cycle_us = 0.0;
+    // Developer key unified_queue_law: the queue law's statistics at the frame's plan (µs):
+    // B (mean cycle), N (mean need), S (the hold-free, starvation-free service need), q (the queue
+    // quantile term) and P (the law's correction of the interval). The five cells are empty when
+    // up_ql_valid is 0 (law off, or not computable).
+    // up_ql_valid_frames: valid samples among the newest 16 arrivals; -1 = none (law off or no
+    // window), empty cell. up_flags carries 0x200000 (law in use), 0x400000 (positive P limited by
+    // B - J) and 0x800000 (guard active).
+    uint8_t up_ql_valid = 0;
+    double up_ql_base_us = 0.0;
+    double up_ql_need_us = 0.0;
+    double up_ql_service_us = 0.0; // S-hat, the hold-free, starvation-free service need
+    double up_ql_q_us = 0.0;
+    double up_ql_p_us = 0.0;
+    int32_t up_ql_valid_frames = -1;
+    // Developer key unified_queue_upstream (1): the frame's own marker stamps (QPC; 0 = not seen or
+    // key 0, empty cell). The CSV cells of the removed render-thread terms of the queue law (margin,
+    // offset, queue term, feed contrast, spread, span wait) have no field: they write 0 on a unified row.
+    int64_t sim_end_marker_qpc = 0;
+    int64_t render_submit_start_marker_qpc = 0;
+    int64_t render_submit_end_marker_qpc = 0;
+    // Developer key unified_queue_upstream (1): CPU time of the thread inside the frame's own
+    // render-submit and simulation spans (µs), each valid only when the span's start and end
+    // markers were stamped on the same thread (the span minus this time is the time that thread
+    // waited inside its own span), and the ids of the threads that sent the markers (0 = not
+    // seen). Telemetry only.
+    double render_submit_cpu_us = 0.0;
+    double sim_cpu_us = 0.0;
+    uint8_t render_submit_cpu_valid = 0;
+    uint8_t sim_cpu_valid = 0;
+    uint32_t render_submit_tid = 0;
+    uint32_t sim_tid = 0;
+    uint32_t render_submit_end_tid = 0;
+    uint32_t sim_end_tid = 0;
 };
 
 // Present thread of the selected native swapchain, after the native call returns.
@@ -200,6 +273,67 @@ struct PacingReadyRecord {
     // (probe off or failed, frame boundary unknown, completion not observed).
     int64_t gpu_first_submit_qpc = 0;
     int64_t gpu_start_qpc = 0;
+};
+
+// Developer key gpu_queue_probe (gpu_queue_probe_core.h): what the presenting queue did for one
+// frame, seen from ExecuteCommandLists calls (enq) and event-timed fence completions (start,
+// done). Joined to a pacing row through the Present's identity (swapchain_generation,
+// present_sequence). Every field has its own valid bit in `valid`: a cell is empty when its bit
+// is clear (probe off, value unknown, frame incomplete). Times are QPC; *_us are microseconds.
+struct PacingGpuQueueRecord {
+    static constexpr uint32_t kSubmits = 1u << 0;
+    static constexpr uint32_t kFirstSubmit = 1u << 1;
+    static constexpr uint32_t kFirstStart = 1u << 2;
+    static constexpr uint32_t kLastSubmit = 1u << 3;
+    static constexpr uint32_t kLastDone = 1u << 4;
+    static constexpr uint32_t kEmpty = 1u << 5;
+    static constexpr uint32_t kFirstGap = 1u << 6;
+    static constexpr uint32_t kStampLate = 1u << 7;
+    static constexpr uint32_t kMinMargin = 1u << 8;
+    static constexpr uint32_t kWaitBlock = 1u << 9;
+    static constexpr uint32_t kHoldBlock = 1u << 10;
+    static constexpr uint32_t kMinMarginFree = 1u << 11;
+    static constexpr uint32_t kBoundaryIdle = 1u << 12;
+    static constexpr uint32_t kCycle = 1u << 13;
+    static constexpr uint32_t kWaitIdle = 1u << 14;
+    // The probe session (queue adoption) the record was measured in; set when the record is
+    // pushed, not written to the CSV. The queue law drops records of a retired session.
+    uint64_t session_generation = 0;
+    uint64_t swapchain_generation = 0;
+    // The frame the record belongs to when the boundary knows it (the frame generation input of
+    // the source queue: domain, producer epoch, frame id). Valid keys join through the row's own
+    // key first; (swapchain_generation, present_sequence) joins otherwise.
+    PacingFrameKey key{};
+    uint64_t present_sequence = 0;
+    uint32_t valid = 0;
+    uint32_t submits = 0;
+    int64_t first_submit_qpc = 0;
+    int64_t first_start_qpc = 0;
+    int64_t last_submit_qpc = 0;
+    int64_t last_done_qpc = 0;
+    double empty_us = 0.0;
+    double first_gap_us = 0.0;
+    double stamp_late_us = 0.0;
+    double min_margin_us = 0.0;
+    double wait_block_us = 0.0;
+    // Queue law inputs (gpu_queue_probe_core.h): time submissions were kept waiting by ReLimiter's
+    // own hold, the smallest queue wait not counting that time, the time the queue was free of
+    // work and of pending waits before the frame's first submission, the interval between this
+    // frame's last completion and the previous frame's, and the time queue Waits were pending
+    // with nothing queued behind them.
+    double hold_block_us = 0.0;
+    double min_margin_free_us = 0.0;
+    double boundary_idle_us = 0.0;
+    double cycle_us = 0.0;
+    double wait_idle_us = 0.0;
+    // Which queue the record describes: 0 unknown, 1 the presenting queue, 2 the source queue of
+    // the frame generation input, 3 the render queue the presenting queue depends on (found by
+    // per-frame fence dependencies). Set when the record is pushed; CSV column gq_queue_role.
+    uint8_t queue_role = 0;
+    // The queue law's hold identity: the sequence the law assigned to the grant of the hold this frame's work was
+    // queued behind, announced with the hold (GpuQueueProbe_OnHoldAnnounce); 0 = no law hold was announced for the
+    // frame. Not written to the CSV; the law's record debit names this sequence.
+    uint64_t law_hold_sequence = 0;
 };
 
 enum class PacingClockMapStatus : uint8_t {

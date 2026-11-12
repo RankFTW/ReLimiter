@@ -79,7 +79,11 @@ static LRESULT CALLBACK FocusLockWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
 void FocusLock_Install(HWND hwnd) {
     if (s_installed.load(std::memory_order_relaxed)) return;
     if (!hwnd) return;
-    HookInstallGuard hook_install;
+    // The creates below need the install lock (the batch only takes it at its first enable), so the site holds it
+    // as before. One batch: the four hooks are enabled by one MinHook freeze instead of four.
+    HookInstallGuard install_lock;
+    if (!install_lock) return;
+    HookBatch hook_install(HookBatchSite::FocusLock);
     if (!hook_install) return;
 
     s_hwnd.store(hwnd, std::memory_order_release);
@@ -96,14 +100,14 @@ void FocusLock_Install(HWND hwnd) {
     void* target_gf = GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetFocus");
 
     if (target_fg)
-        MH_CreateHook(target_fg, reinterpret_cast<void*>(Hook_GetForegroundWindow),
-                      reinterpret_cast<void**>(&s_orig_GetForegroundWindow));
+        Hooks_CreateHook(target_fg, reinterpret_cast<void*>(Hook_GetForegroundWindow),
+                         reinterpret_cast<void**>(&s_orig_GetForegroundWindow));
     if (target_aw)
-        MH_CreateHook(target_aw, reinterpret_cast<void*>(Hook_GetActiveWindow),
-                      reinterpret_cast<void**>(&s_orig_GetActiveWindow));
+        Hooks_CreateHook(target_aw, reinterpret_cast<void*>(Hook_GetActiveWindow),
+                         reinterpret_cast<void**>(&s_orig_GetActiveWindow));
     if (target_gf)
-        MH_CreateHook(target_gf, reinterpret_cast<void*>(Hook_GetFocus),
-                      reinterpret_cast<void**>(&s_orig_GetFocus));
+        Hooks_CreateHook(target_gf, reinterpret_cast<void*>(Hook_GetFocus),
+                         reinterpret_cast<void**>(&s_orig_GetFocus));
 
     void* target_cc = GetProcAddress(GetModuleHandleW(L"user32.dll"), "ClipCursor");
     Hooks_PinTargetModule(target_fg);
@@ -111,16 +115,20 @@ void FocusLock_Install(HWND hwnd) {
     Hooks_PinTargetModule(target_gf);
     Hooks_PinTargetModule(target_cc);
     if (target_cc)
-        MH_CreateHook(target_cc, reinterpret_cast<void*>(Hook_ClipCursor),
-                      reinterpret_cast<void**>(&s_orig_ClipCursor));
+        Hooks_CreateHook(target_cc, reinterpret_cast<void*>(Hook_ClipCursor),
+                         reinterpret_cast<void**>(&s_orig_ClipCursor));
 
-    if (target_fg) MH_EnableHook(target_fg);
-    if (target_aw) MH_EnableHook(target_aw);
-    if (target_gf) MH_EnableHook(target_gf);
-    if (target_cc) MH_EnableHook(target_cc);
+    if (target_fg) Hooks_EnableOrQueue(target_fg);
+    if (target_aw) Hooks_EnableOrQueue(target_aw);
+    if (target_gf) Hooks_EnableOrQueue(target_gf);
+    if (target_cc) Hooks_EnableOrQueue(target_cc);
+    hook_install.Apply();
 
     s_installed.store(true, std::memory_order_relaxed);
-    LOG_INFO("FocusLock: installed on HWND %p", hwnd);
+    unsigned enabled = 0;
+    for (void* target : { target_fg, target_aw, target_gf, target_cc })
+        if (target && Hooks_TargetEnabled(target)) ++enabled;
+    LOG_INFO("FocusLock: installed on HWND %p (%u of 4 hooks enabled)", hwnd, enabled);
 }
 
 void FocusLock_Remove() {

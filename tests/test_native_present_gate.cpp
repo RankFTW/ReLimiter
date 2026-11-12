@@ -1,6 +1,7 @@
 // Direct production policy and capture-independent registry tests. These do
 // not prove a game's marker/Present causal mapping or displayed pacing.
 #include "native_present_gate.h"
+#include <cstring>
 #include "frame_timeline.h"
 #include <atomic>
 #include <cstdio>
@@ -379,8 +380,113 @@ void TestFgObservationDoesNotAuthorizeEnforcement() {
     CHECK(!route.EndScope(context.native_swapchain,context.swapchain_generation));
     CHECK(route.QualifiedFrames()==0);
 }
+// Native route diagnostics: a scope that ends without a Present call counts, a scope with one call does
+// not, and the rejected-Present counters are separate per entry point and monotonic.
+void TestRouteDiagnosticCounters() {
+    NativePresentGateRoute route;
+    const uint64_t before = NativeGate_ScopesWithoutCalls();
+    Frame(&route, 1);
+    CHECK(NativeGate_ScopesWithoutCalls() == before);
+    const auto context = Context(2);
+    route.Marker(context, Key(2), NativeGateMode::Native, 1);   // not yet qualified: warming
+    route.MarkerReleased(context.now_qpc);
+    route.BeginScope(context.native_swapchain, context.swapchain_generation);
+    CHECK(!route.EndScope(context.native_swapchain, context.swapchain_generation));
+    CHECK(NativeGate_ScopesWithoutCalls() == before + 1);
+    CHECK(route.QualifiedFrames() == 0);
+    const uint64_t present = NativeGate_PresentsRejected(false), present1 = NativeGate_PresentsRejected(true);
+    NativeGate_NotePresentRejected(false);
+    NativeGate_NotePresentRejected(false);
+    NativeGate_NotePresentRejected(true);
+    CHECK(NativeGate_PresentsRejected(false) == present + 2 && NativeGate_PresentsRejected(true) == present1 + 1);
+}
+// Where the route counters put each gate step: a BeginCall before the scope opened, without a marker, after
+// a scope native mismatch, the Present flags histogram, and a mismatch pair that logs once per change.
+void TestRouteDiagnosticOutcomes() {
+    using C = NativeGateCallOutcome;
+    using S = NativeGateScopeEvent;
+    auto at = [](const NativeGateDiagnostics& d, C c) { return d.call[static_cast<size_t>(c)]; };
+    auto sc = [](const NativeGateDiagnostics& d, S s) { return d.scope[static_cast<size_t>(s)]; };
+    NativePresentGateRoute route;
+    auto begin = NativeGate_Diagnostics();
+    // No marker pending: BeginScope notes it, BeginCall is unmapped for lack of a pending frame.
+    route.BeginScope(0x1000, 10);
+    route.BeginCall(Context(1), 0, 1);
+    route.EndCall(true, false);
+    auto d = NativeGate_Diagnostics();
+    CHECK(sc(d, S::NoPending) == sc(begin, S::NoPending) + 1);
+    CHECK(at(d, C::UnmappedNoPending) == at(begin, C::UnmappedNoPending) + 1);
+    // The hooked Present runs outside the scope (before BeginScope): no scope yet.
+    auto context = Context(1);
+    route.Marker(context, Key(1), NativeGateMode::Native, 1);
+    route.MarkerReleased(context.now_qpc);
+    begin = NativeGate_Diagnostics();
+    route.BeginCall(context, 0, 1);
+    route.EndCall(true, false);
+    route.BeginScope(context.native_swapchain, context.swapchain_generation);
+    CHECK(!route.EndScope(context.native_swapchain, context.swapchain_generation));
+    d = NativeGate_Diagnostics();
+    CHECK(at(d, C::UnmappedNoScope) == at(begin, C::UnmappedNoScope) + 1);
+    CHECK(d.scopes_without_call == begin.scopes_without_call + 1);
+    // A scope opened with another native handle never opens (BeginCall sees no scope), the mismatch is
+    // counted at BeginScope and EndScope. The same pair again does not advance the mismatch sequence; a
+    // different pair does.
+    for (int pass = 0; pass < 3; ++pass) {
+        const uint64_t other = pass == 2 ? 0x3333 : 0x2222;
+        context = Context(2 + pass);
+        route.Marker(context, Key(2 + pass), NativeGateMode::Native, 1);
+        route.MarkerReleased(context.now_qpc);
+        begin = NativeGate_Diagnostics();
+        route.BeginScope(other, context.swapchain_generation);
+        route.BeginCall(context, 0, 1);
+        route.EndCall(true, false);
+        route.EndScope(other, context.swapchain_generation);
+        d = NativeGate_Diagnostics();
+        CHECK(sc(d, S::NativeMismatch) == sc(begin, S::NativeMismatch) + 1);
+        CHECK(at(d, C::UnmappedNoScope) == at(begin, C::UnmappedNoScope) + 1);
+        CHECK(sc(d, S::EndNativeMismatch) == sc(begin, S::EndNativeMismatch) + 1);
+        CHECK(d.mismatch_scope_native == other && d.mismatch_marker_native == 0x1000);
+        CHECK((d.mismatch_sequence != begin.mismatch_sequence) == (pass != 1));
+    }
+    // Flags histogram: zero, TEST, DO_NOT_WAIT, other; TEST and DO_NOT_WAIT are special Presents.
+    const uint32_t flags[] = {0, 0x1, 0x8, 0x200};
+    for (uint32_t value : flags) {
+        context = Context(10);
+        route.Marker(context, Key(10), NativeGateMode::Native, 1);
+        route.MarkerReleased(context.now_qpc);
+        route.BeginScope(context.native_swapchain, context.swapchain_generation);
+        begin = NativeGate_Diagnostics();
+        route.BeginCall(context, value, 1);
+        route.EndCall(true, false);
+        d = NativeGate_Diagnostics();
+        const uint64_t zero = d.flags_zero - begin.flags_zero, test = d.flags_test - begin.flags_test,
+            dnw = d.flags_do_not_wait - begin.flags_do_not_wait, other = d.flags_other - begin.flags_other;
+        CHECK(zero + test + dnw + other == 1);
+        CHECK((value == 0 && zero == 1) || (value == 0x1 && test == 1) || (value == 0x8 && dnw == 1) ||
+              (value == 0x200 && other == 1));
+        CHECK((at(d, C::SpecialPresent) == at(begin, C::SpecialPresent) + 1) == ((value & 0x9u) != 0));
+        route.EndScope(context.native_swapchain, context.swapchain_generation);
+    }
+    NativeGate_NoteEntry(NativeGateEntry::TypedPresent);
+    d = NativeGate_Diagnostics();
+    CHECK(d.entries[static_cast<size_t>(NativeGateEntry::TypedPresent)] != 0 &&
+          d.entry_thread[static_cast<size_t>(NativeGateEntry::TypedPresent)] != 0);
+    NativeGate_NoteEntry(NativeGateEntry::VtablePresent);
+    NativeGate_NoteEntry(NativeGateEntry::VtablePresent1);
+    NativeGate_NoteEntry(NativeGateEntry::InnerPassThrough);
+    d = NativeGate_Diagnostics();
+    CHECK(d.entries[static_cast<size_t>(NativeGateEntry::VtablePresent)] != 0 &&
+          d.entries[static_cast<size_t>(NativeGateEntry::VtablePresent1)] != 0 &&
+          d.entries[static_cast<size_t>(NativeGateEntry::InnerPassThrough)] != 0);
+    char text[1400];
+    CHECK(NativeGate_DiagnosticsText(text, sizeof(text)) > 0 && std::strstr(text, "begin_call mapped=") != nullptr);
+    CHECK(std::strstr(text, "vtable_present=") != nullptr && std::strstr(text, "vtable_present1=") != nullptr &&
+          std::strstr(text, "inner_pass_through=") != nullptr);
+}
 }
 int main() {
+    TestRouteDiagnosticCounters();
+    TestRouteDiagnosticOutcomes();
     // Mode changes bump the settings generation and invalidate the
     // prediction epoch exactly once per change.
     NativeGate_SetMode(NativeGateMode::Native);

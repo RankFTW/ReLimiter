@@ -169,6 +169,8 @@ uint64_t FrameTimeline_RegisterPresentSwapchain(
 void FrameTimeline_UnregisterPresentSwapchain(uint64_t native_swapchain) noexcept;
 uint64_t FrameTimeline_PresentRegistryOverflows() noexcept;
 uint64_t FrameTimeline_PresentRegistrationMismatches() noexcept;
+// Present-generation reads that returned 0 because the registry lock was contended (diagnostics only).
+uint64_t FrameTimeline_PresentGenerationLockFailures() noexcept;
 uint64_t FrameTimeline_UnregisteredPresentCalls() noexcept;
 uint64_t FrameTimeline_PresentAttemptIdentityFailures() noexcept;
 

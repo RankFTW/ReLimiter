@@ -25,6 +25,7 @@ See the [User Guide](https://github.com/RankFTW/ReLimiter/blob/main/docs/USER_GU
 - **DX11 games with native Reflex markers** use the marker route (64-bit addon) instead of Present-based pacing. The route is chosen again after a graphics API change or a new swapchain.
 - **Background FPS, FG-Off Cap and OLED Care** run on the same cadence without an output hold.
 - **Finer timer resolution.** While it waits, ReLimiter asks Windows for its finest system timer resolution (usually 0.5 ms) for the game's process and releases it when the game closes. Other programs' timers are unaffected on Windows 10 2004 and later.
+- **[WIP] A queue-based pacer, on by default in 64-bit DirectX 12 games.** ReLimiter now watches what the game's own GPU queue does every frame (how long it sits empty, how far ahead its work arrives, how long waits hold it) and sets the frame interval from that instead of from the driver's per-frame GPU time reports. It follows the queue that carries the frame's rendering, even where the game presents on a separate queue. Where that measurement is not available (DirectX 11, Vulkan, OpenGL, 32-bit, or while too few frames could be measured) the report-based pacing keeps running, so those games behave as before. Settings saved by earlier test builds move to the new defaults once.
 
 ### Defaults and settings
 
@@ -43,7 +44,7 @@ See the [User Guide](https://github.com/RankFTW/ReLimiter/blob/main/docs/USER_GU
 
 Older configurations are updated once at the first launch, when ReLimiter rewrites `relimiter.ini`:
 
-- An INI without `config_version`, written by an older version that saved every key including the old defaults, moves once to `reflex_sleep_bypass=true` and `source_placement=pre_sleep`. Every other value is kept, and ReLimiter writes `config_version=4`. An INI that already has `config_version=2` or later keeps those two settings: set `reflex_sleep_bypass=false` or `source_placement=marker` there to stay on the older behavior. An INI saved by a 4.0 test build also moves once to the new defaults `lead_coverage=99` (from `config_version=2`) and `fg_late_spacing=true` (from `config_version` 2 or 3). A new INI starts with the recommended defaults.
+- An INI without `config_version`, written by an older version that saved every key including the old defaults, moves once to `reflex_sleep_bypass=true` and `source_placement=pre_sleep`. Every other value is kept, and ReLimiter writes `config_version=5`. An INI that already has `config_version=2` or later keeps those two settings: set `reflex_sleep_bypass=false` or `source_placement=marker` there to stay on the older behavior. An INI saved by a 4.0 test build also moves once to the new defaults `lead_coverage=99` (from `config_version=2`) and `fg_late_spacing=true` (from `config_version` 2 or 3). An INI saved before `config_version=5` also moves once to the new defaults `unified_queue_law=true`, `gpu_queue_probe=true` and `gpu_queue_probe_source=1` (the queue-based pacer). A new INI starts with the recommended defaults.
 - `adaptive_smoothing` becomes `adaptive_cap` if `adaptive_cap` is not set.
 - `smoothing=low`, `medium` and `high` become `smoothing=on`.
 - `pacing_method=marker` becomes the developer override `output_rung=marker`; other values become `auto`. A migrated marker preference stays a developer override until **Output override** is set back to **Auto** (shown with `developer_settings=true`) so that ReLimiter chooses again.
@@ -93,6 +94,9 @@ See [Removed and migrated keys](https://github.com/RankFTW/ReLimiter/blob/main/d
 - **PC Latency with DLSS Frame Generation is measured on the real frame.** The generated frame was labelled real, so PC Latency and the real-frame telemetry described the generated frame shown about half an interval earlier. PC Latency now updates about one displayed frame after the display it describes.
 - **Frame generation turned on while uncapped is recognized.** With Streamline compatibility (the default), DLSS Frame Generation enabled while no cap was set was never confirmed as presenting: the OSD showed it off, and a cap set afterwards paced the real frames at the full cap until frame generation was switched off and on again. Seen in Phantom Blade Zero. ReLimiter also keeps reading Reflex latency reports while uncapped with frame generation, so its diagnostics stay current.
 - Hook and device lifetime fixes and shutdown safeguards.
+- **[WIP] The pacer no longer fails to engage after some launches.** ReLimiter now has its own native Present entry that overlays and other add-ons cannot remove, so a launch in which another tool took over the Present call no longer leaves the pacer idle.
+- **[WIP] Safer start-up.** Hooks are installed in batches, so the game's threads are frozen for fewer and shorter moments, from a protected installer thread that other tools cannot suspend (`hook_installer_thread=false` in `relimiter.ini` turns the thread off for a game that does not tolerate it; it is a compatibility switch, not a tuning option). ReLimiter also writes a start-up evidence file and keeps the previous log as `relimiter_<exe>.prev.log`.
+- **[WIP] GPU wait gate fixes.** No GPU wait is queued before the thread that signals it is running, and a removed graphics device no longer leaves that thread spinning.
 
 ### Removed
 

@@ -37,8 +37,11 @@ static const Config s_default_config{};
 // without this version carries the old defaults of those two keys. 3: lead
 // coverage 99 became the default; test builds since the key existed saved
 // lead_coverage=95. 4: FG late-frame spacing became the default; test builds
-// since the key existed saved fg_late_spacing=false.
-static constexpr int kConfigVersion = 4;
+// since the key existed saved fg_late_spacing=false. 5: the queue law, the
+// queue probe and the probe's source key (queue that carries the rendering)
+// became the defaults; earlier builds saved unified_queue_law=false,
+// gpu_queue_probe=false and gpu_queue_probe_source=0.
+static constexpr int kConfigVersion = 5;
 
 static char s_ini_path[MAX_PATH] = {};
 static bool s_first_launch = false;
@@ -255,6 +258,28 @@ void ValidateConfig() {
         g_config.stall_inject_period_s,
         kPacingStallInjectMinPeriodS,
         kPacingStallInjectMaxPeriodS);
+    // unified_queue_target_us (developer, only read under unified_pacer): non-finite loads as the
+    // default, otherwise [0, kPacingUnifiedQueueTargetMaxUs].
+    if (!std::isfinite(g_config.unified_queue_target_us)) {
+        LOG_WARN("Config: non-finite unified_queue_target_us, resetting to %.0f",
+                 kPacingUnifiedQueueTargetDefaultUs);
+        g_config.unified_queue_target_us = kPacingUnifiedQueueTargetDefaultUs;
+    }
+    g_config.unified_queue_target_us = Clamp(
+        g_config.unified_queue_target_us, 0.0, kPacingUnifiedQueueTargetMaxUs);
+    // unified_hold_share (developer, only read under unified_pacer): non-finite loads as the default,
+    // otherwise [0, kPacingUnifiedHoldShareMax].
+    if (!std::isfinite(g_config.unified_hold_share)) {
+        LOG_WARN("Config: non-finite unified_hold_share, resetting to %.0f", kPacingUnifiedHoldShareDefault);
+        g_config.unified_hold_share = kPacingUnifiedHoldShareDefault;
+    }
+    g_config.unified_hold_share = Clamp(g_config.unified_hold_share, 0.0, kPacingUnifiedHoldShareMax);
+    // unified_queue_rank [1, 8] and unified_queue_allow_us [0, 20000] (developer, only read with the queue law).
+    g_config.unified_queue_rank = Clamp(g_config.unified_queue_rank, 1, kPacingUnifiedQueueRankMax);
+    g_config.gpu_queue_probe_source = Clamp(g_config.gpu_queue_probe_source, 0, kPacingGpuQueueProbeSourceMax);
+    g_config.unified_queue_need_frames = Clamp(g_config.unified_queue_need_frames, 1, kPacingUnifiedQueueNeedFramesMax);
+    g_config.unified_queue_upstream = Clamp(g_config.unified_queue_upstream, 0, kPacingUnifiedQueueUpstreamMax);
+    g_config.unified_queue_allow_us = Clamp(g_config.unified_queue_allow_us, 0, kPacingUnifiedQueueAllowMaxUs);
     // gpu_wait_headroom_us: the collision guard's release headroom; 0 or
     // less (or non-finite) loads as the default.
     if (!std::isfinite(g_config.gpu_wait_headroom_us) || g_config.gpu_wait_headroom_us <= 0.0) {
@@ -437,6 +462,17 @@ void LoadConfig(HMODULE hModule) {
     g_config.driver_limiter_hold=ReadINIBool(S,"driver_limiter_hold",false,P);
     g_config.sleep_status_every_frame=ReadINIBool(S,"sleep_status_every_frame",false,P);
     g_config.gpu_start_probe=ReadINIBool(S,"gpu_start_probe",false,P);
+    g_config.gpu_queue_probe=ReadINIBool(S,"gpu_queue_probe",kPacingGpuQueueProbeDefault,P);
+    g_config.gpu_queue_probe_source=ReadINIInt(S,"gpu_queue_probe_source",kPacingGpuQueueProbeSourceDefault,P);
+    g_config.unified_pacer=ReadINIBool(S,"unified_pacer",kPacingUnifiedPacerDefault,P);
+    g_config.unified_every_frame_service=ReadINIBool(S,"unified_every_frame_service",kPacingUnifiedEveryFrameServiceDefault,P);
+    g_config.unified_queue_target_us=ReadINIDouble(S,"unified_queue_target_us",kPacingUnifiedQueueTargetDefaultUs,P);
+    g_config.unified_hold_share=ReadINIDouble(S,"unified_hold_share",kPacingUnifiedHoldShareDefault,P);
+    g_config.unified_queue_law=ReadINIBool(S,"unified_queue_law",kPacingUnifiedQueueLawDefault,P);
+    g_config.unified_queue_rank=ReadINIInt(S,"unified_queue_rank",kPacingUnifiedQueueRankDefault,P);
+    g_config.unified_queue_need_frames=ReadINIInt(S,"unified_queue_need_frames",kPacingUnifiedQueueNeedFramesDefault,P);
+    g_config.unified_queue_upstream=ReadINIInt(S,"unified_queue_upstream",kPacingUnifiedQueueUpstreamDefault,P);
+    g_config.unified_queue_allow_us=ReadINIInt(S,"unified_queue_allow_us",kPacingUnifiedQueueAllowDefaultUs,P);
     g_config.control_file=ReadINIBool(S,"control_file",false,P);
     g_config.adaptive_cap_hold_room=ReadINIBool(S,"adaptive_cap_hold_room",true,P);
     g_config.lead_spike_floor=ReadINIBool(S,"lead_spike_floor",true,P);
@@ -466,6 +502,17 @@ void LoadConfig(HMODULE hModule) {
     if (!s_first_launch && saved_version < 4 && !g_config.fg_late_spacing) {
         LOG_INFO("Config: moved to the recommended default fg_late_spacing=true (was false)");
         g_config.fg_late_spacing = true;
+    }
+    if (!s_first_launch && saved_version < 5 &&
+        (g_config.unified_queue_law != kPacingUnifiedQueueLawDefault ||
+         g_config.gpu_queue_probe != kPacingGpuQueueProbeDefault ||
+         g_config.gpu_queue_probe_source != kPacingGpuQueueProbeSourceDefault)) {
+        LOG_INFO("Config: moved to the recommended defaults unified_queue_law=true gpu_queue_probe=true "
+                 "gpu_queue_probe_source=1 (was %s, %s, %d)", g_config.unified_queue_law ? "true" : "false",
+                 g_config.gpu_queue_probe ? "true" : "false", g_config.gpu_queue_probe_source);
+        g_config.unified_queue_law = kPacingUnifiedQueueLawDefault;
+        g_config.gpu_queue_probe = kPacingGpuQueueProbeDefault;
+        g_config.gpu_queue_probe_source = kPacingGpuQueueProbeSourceDefault;
     }
     g_config.osd_show_adaptive_smoothing = ReadINIBool(S, "osd_show_adaptive_smoothing", false, P);
     g_config.osd_show_0_1pct_low     = ReadINIBool(S, "osd_show_0_1pct_low", false, P);
@@ -507,6 +554,8 @@ void LoadConfig(HMODULE hModule) {
 #else
     g_config.dlss_info_hooks         = false;  // NGX/DLSS doesn't exist on 32-bit
 #endif
+    // Compatibility switch of the hook installer thread (hooks.h), read once at initialisation; both addons.
+    g_config.hook_installer_thread   = ReadINIBool(S, "hook_installer_thread", true, P);
 
     LOG_INFO("Config: values read, calling ApplyConfig...");
     ValidateConfig();
@@ -665,6 +714,17 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIBool(S, "driver_limiter_hold", config.driver_limiter_hold, P);
     WriteINIBool(S, "sleep_status_every_frame", config.sleep_status_every_frame, P);
     WriteINIBool(S, "gpu_start_probe", config.gpu_start_probe, P);
+    WriteINIBool(S, "gpu_queue_probe", config.gpu_queue_probe, P);
+    WriteINIInt(S, "gpu_queue_probe_source", config.gpu_queue_probe_source, P);
+    WriteINIBool(S, "unified_pacer", config.unified_pacer, P);
+    WriteINIBool(S, "unified_every_frame_service", config.unified_every_frame_service, P);
+    WriteINIDouble(S, "unified_queue_target_us", config.unified_queue_target_us, P);
+    WriteINIDouble(S, "unified_hold_share", config.unified_hold_share, P);
+    WriteINIBool(S, "unified_queue_law", config.unified_queue_law, P);
+    WriteINIInt(S, "unified_queue_rank", config.unified_queue_rank, P);
+    WriteINIInt(S, "unified_queue_need_frames", config.unified_queue_need_frames, P);
+    WriteINIInt(S, "unified_queue_upstream", config.unified_queue_upstream, P);
+    WriteINIInt(S, "unified_queue_allow_us", config.unified_queue_allow_us, P);
     WriteINIBool(S, "control_file", config.control_file, P);
     WriteINIBool(S, "adaptive_cap_hold_room", config.adaptive_cap_hold_room, P);
     WriteINIBool(S, "lead_spike_floor", config.lead_spike_floor, P);
@@ -687,6 +747,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIBool(S,"gpu_present_gate_probes",config.gpu_present_gate_probes,P);
     WriteINIBool(S,"reflex_sleep_bypass",config.reflex_sleep_bypass,P);
     WriteINIBool(S, "dlss_info_hooks", config.dlss_info_hooks, P);
+    WriteINIBool(S, "hook_installer_thread", config.hook_installer_thread, P);
     if (!config.streamline_compat)
         WriteINIString(S, "streamline_compat", "force_false", P);
     else
@@ -915,13 +976,28 @@ static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
     pipeline.lead_spike_floor = config.lead_spike_floor;
     pipeline.pre_sleep_precise = config.pre_sleep_precise;
     pipeline.driver_limiter_hold = config.driver_limiter_hold;
+    pipeline.unified_pacer = config.unified_pacer;
+    pipeline.unified_every_frame_service = config.unified_every_frame_service;
+    pipeline.unified_queue_target_us = config.unified_queue_target_us;
+    pipeline.unified_hold_share = config.unified_hold_share;
+    pipeline.unified_queue_law = config.unified_queue_law;
+    pipeline.unified_queue_rank = config.unified_queue_rank;
+    pipeline.gpu_queue_probe_source = config.gpu_queue_probe_source;
+    pipeline.unified_queue_need_frames = config.unified_queue_need_frames;
+    pipeline.unified_queue_upstream = config.unified_queue_upstream;
+    pipeline.unified_queue_allow_us = config.unified_queue_allow_us;
     return pipeline;
 }
 
 void Config_ApplyPacingPipeline() {
     // adaptive_cap reaches the period governor through the
     // pipeline configuration; the scheduler owner applies it each frame.
-    PacingPipeline_SetConfig(PacingPipelineConfigFrom(g_config));
+    // The key the clamp will publish is noted for the Sleep-mode reconcile BEFORE the
+    // pipeline exposes it, so a hook that can see the new key already sees the reconcile
+    // pending (an unchanged key is one load and a branch).
+    const PacingPipelineConfig pipeline = PacingPipelineConfigFrom(g_config);
+    NvAPI_PrepareUnifiedKey(PacingPipeline_ClampConfig(pipeline).unified_pacer);
+    PacingPipeline_SetConfig(pipeline);
     g_marker_forward_after_wait.store(
         g_config.marker_forward_order == PacingMarkerForwardOrder::AfterWait,
         std::memory_order_relaxed);
@@ -930,6 +1006,14 @@ void Config_ApplyPacingPipeline() {
     g_driver_low_latency_off.store(g_config.driver_low_latency_off, std::memory_order_relaxed);
     g_sleep_status_every_frame.store(g_config.sleep_status_every_frame, std::memory_order_relaxed);
     g_gpu_start_probe.store(g_config.gpu_start_probe, std::memory_order_relaxed);
+    // The queue law forces the probe on (64-bit, with the unified pacer, the law's only user) and
+    // feeds it to the law. The probe itself is a 64-bit, Direct3D 12 measurement: on Win32 nothing
+    // starts it.
+    const bool queue_law = g_config.unified_queue_law && PacingPipeline_ClampConfig(pipeline).unified_pacer;
+    g_gpu_queue_probe.store((g_config.gpu_queue_probe && sizeof(void*) == 8) || queue_law, std::memory_order_relaxed);
+    g_gpu_queue_law_feed.store(queue_law, std::memory_order_relaxed);
+    g_unified_queue_upstream.store(sizeof(void*) == 8 ? g_config.unified_queue_upstream : 0, std::memory_order_relaxed);
+    g_gpu_queue_probe_source.store(sizeof(void*) == 8 ? g_config.gpu_queue_probe_source : 0, std::memory_order_relaxed);
     g_fg_presenter_probe_us.store(g_config.fg_presenter_probe_us, std::memory_order_relaxed);
 }
 
@@ -1009,6 +1093,17 @@ constexpr Key kKeys[] = {
     {"driver_limiter_hold", &SetBool<&Config::driver_limiter_hold>, Publish::Pipeline},
     {"sleep_status_every_frame", &SetBool<&Config::sleep_status_every_frame>, Publish::Pipeline},
     {"gpu_start_probe", &SetBool<&Config::gpu_start_probe>, Publish::Pipeline},
+    {"gpu_queue_probe", &SetBool<&Config::gpu_queue_probe>, Publish::Pipeline},
+    {"gpu_queue_probe_source", &SetInt<&Config::gpu_queue_probe_source>, Publish::Pipeline},
+    {"unified_pacer", &SetBool<&Config::unified_pacer>, Publish::Pipeline},
+    {"unified_every_frame_service", &SetBool<&Config::unified_every_frame_service>, Publish::Pipeline},
+    {"unified_queue_target_us", &SetDouble<&Config::unified_queue_target_us>, Publish::Pipeline},
+    {"unified_hold_share", &SetDouble<&Config::unified_hold_share>, Publish::Pipeline},
+    {"unified_queue_law", &SetBool<&Config::unified_queue_law>, Publish::Pipeline},
+    {"unified_queue_rank", &SetInt<&Config::unified_queue_rank>, Publish::Pipeline},
+    {"unified_queue_need_frames", &SetInt<&Config::unified_queue_need_frames>, Publish::Pipeline},
+    {"unified_queue_upstream", &SetInt<&Config::unified_queue_upstream>, Publish::Pipeline},
+    {"unified_queue_allow_us", &SetInt<&Config::unified_queue_allow_us>, Publish::Pipeline},
 };
 }
 
@@ -1073,7 +1168,18 @@ int Config_DeveloperOverrides() {
         (g_config.pre_sleep_precise != d.pre_sleep_precise) +
         (g_config.driver_limiter_hold != d.driver_limiter_hold) +
         (g_config.sleep_status_every_frame != d.sleep_status_every_frame) +
-        (g_config.gpu_start_probe != d.gpu_start_probe);
+        (g_config.gpu_start_probe != d.gpu_start_probe) +
+        (g_config.gpu_queue_probe != d.gpu_queue_probe) +
+        (g_config.gpu_queue_probe_source != d.gpu_queue_probe_source) +
+        (g_config.unified_pacer != d.unified_pacer) +
+        (g_config.unified_every_frame_service != d.unified_every_frame_service) +
+        (g_config.unified_queue_target_us != d.unified_queue_target_us) +
+        (g_config.unified_hold_share != d.unified_hold_share) +
+        (g_config.unified_queue_law != d.unified_queue_law) +
+        (g_config.unified_queue_rank != d.unified_queue_rank) +
+        (g_config.unified_queue_need_frames != d.unified_queue_need_frames) +
+        (g_config.unified_queue_upstream != d.unified_queue_upstream) +
+        (g_config.unified_queue_allow_us != d.unified_queue_allow_us);
 }
 
 void Config_ResetDeveloperSettings() {
@@ -1104,6 +1210,17 @@ void Config_ResetDeveloperSettings() {
     g_config.driver_limiter_hold = d.driver_limiter_hold;
     g_config.sleep_status_every_frame = d.sleep_status_every_frame;
     g_config.gpu_start_probe = d.gpu_start_probe;
+    g_config.gpu_queue_probe = d.gpu_queue_probe;
+    g_config.gpu_queue_probe_source = d.gpu_queue_probe_source;
+    g_config.unified_pacer = d.unified_pacer;
+    g_config.unified_every_frame_service = d.unified_every_frame_service;
+    g_config.unified_queue_target_us = d.unified_queue_target_us;
+    g_config.unified_hold_share = d.unified_hold_share;
+    g_config.unified_queue_law = d.unified_queue_law;
+    g_config.unified_queue_rank = d.unified_queue_rank;
+    g_config.unified_queue_need_frames = d.unified_queue_need_frames;
+    g_config.unified_queue_upstream = d.unified_queue_upstream;
+    g_config.unified_queue_allow_us = d.unified_queue_allow_us;
     Config_ApplyPacingPipeline();
     LOG_INFO("Config: developer diagnostics reset to the recommended defaults");
 }
@@ -1190,6 +1307,35 @@ void ApplyConfig() {
     if (g_config.gpu_start_probe)
         LOG_WARN("Diagnostic GPU start probe: a Signal of ReLimiter's own in front of the first submission of each "
                  "frame on the presenting queue measures when the GPU starts it");
+    if (g_config.gpu_queue_probe != kPacingGpuQueueProbeDefault)
+        LOG_WARN("Diagnostic GPU queue probe off: the presenting queue's submissions are not measured "
+                 "(gpu_queue_probe=false; the queue law needs it and forces it on)");
+    if (g_config.gpu_queue_probe_source != kPacingGpuQueueProbeSourceDefault)
+        LOG_WARN("Diagnostic GPU queue probe source %d: the probe adopts the presenting queue, not the queue "
+                 "that carries the frame's rendering (effective with the probe on; 64-bit DX12)",
+                 g_config.gpu_queue_probe_source);
+    if (g_config.unified_pacer != kPacingUnifiedPacerDefault) {
+        if (g_config.unified_pacer)
+            LOG_WARN("Diagnostic unified pacer: one start law (cap, VRR ceiling, game limit, GPU service time) replaces the "
+                     "pacing mechanisms; 64-bit only");
+        else
+            LOG_WARN("Diagnostic unified pacer off: the earlier pacing mechanisms run (unified_pacer=false)");
+    }
+    if (g_config.unified_every_frame_service != kPacingUnifiedEveryFrameServiceDefault)
+        LOG_WARN("Diagnostic unified every-frame service off: the unified pacer's service estimate takes a sample "
+                 "only from saturated pairs, the earlier estimator (needs unified_pacer)");
+    if (g_config.unified_queue_target_us != kPacingUnifiedQueueTargetDefaultUs)
+        LOG_WARN("Diagnostic unified queue target: %.0f us instead of %.0f us (needs unified_pacer)",
+                 g_config.unified_queue_target_us, kPacingUnifiedQueueTargetDefaultUs);
+    if (g_config.unified_hold_share > 0.0)
+        LOG_WARN("Diagnostic unified hold share: a used report refills the hold credit with at least %.3f of the "
+                 "measured completion spacing (needs unified_pacer)", g_config.unified_hold_share);
+    if (g_config.unified_queue_law != kPacingUnifiedQueueLawDefault)
+        LOG_WARN("Diagnostic unified queue law off: the GPU interval and the hold credit's refill come from the "
+                 "reports (unified_queue_law=false; needs unified_pacer; 64-bit DX12)");
+    if (g_config.unified_queue_upstream != 0)
+        LOG_WARN("Diagnostic unified queue upstream %d: the game's render markers are stamped locally "
+                 "(64-bit DX12)", g_config.unified_queue_upstream);
     if (g_config.control_file)
         LOG_WARN("Diagnostic control file: relimiter_control.txt next to the INI is polled for test harness commands "
                  "(set, capture, mark, ping); results and pacing state go to relimiter_control_status.txt "

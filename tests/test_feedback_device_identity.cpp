@@ -192,6 +192,26 @@ unsigned s_plan_calls = 0;                // Scheduler_PlanReflexSleep calls
 unsigned s_pre_sleep_waits = 0;           // PreSleepWaitUntil calls
 int64_t s_pre_sleep_wait_target = 0;      // and its newest arguments
 bool s_pre_sleep_wait_precise = false;
+int64_t s_pre_sleep_max_ahead = 0;        // the longest wait PreSleepWaitUntil was asked for (ticks)
+// Key unified_pacer (spec 4.1): the Scheduler_Unified* stubs below, the Sleep hook's
+// PreSleepWaitUntil (spins to its target when s_pre_sleep_wait_blocks), the probe's
+// arming calls and Dynamic MFG.
+bool s_unified_active = false;                 // Scheduler_UnifiedActive
+SchedulerUnifiedReserve s_unified_reserve_result = SchedulerUnifiedReserve::Inactive;
+SchedulerUnifiedReservation s_unified_reservation{}; // handed out on Reserved
+unsigned s_unified_reserve_calls = 0;
+int64_t s_unified_reserve_arrival = 0;
+unsigned s_unified_publishes = 0;              // Scheduler_UnifiedPublishSleep
+SchedulerUnifiedReservation s_unified_published{};
+UnifiedSleepOutcome s_unified_outcome = UnifiedSleepOutcome::None;
+int64_t s_unified_release_qpc = 0;
+int64_t s_unified_arrival_qpc = 0;
+UnifiedLimitResult s_unified_limit{};
+bool s_pre_sleep_wait_blocks = false;
+bool s_dmfg_active = false;                    // IsDmfgActive (64-bit)
+unsigned s_probe_arm_calls = 0;                // GpuReadiness_ArmProbeForFrame
+uint32_t s_probe_arm_epoch = 0;
+uint64_t s_probe_arm_frame = 0;
 int64_t RealQpc();
 unsigned s_mode_calls = 0;
 int s_sleep_action = 0;
@@ -199,18 +219,22 @@ NV_SET_SLEEP_MODE_PARAMS* s_expected_mode_params = nullptr;
 std::vector<NV_SET_SLEEP_MODE_PARAMS> s_forwarded_modes; // recorded while s_record_modes
 bool s_record_modes = false;
 NvAPI_Status s_mode_result = -9;
+void (*s_on_mode_forward)() = nullptr; // an interleaving point inside the driver's SetSleepMode
 
 NvAPI_Status __cdecl FakeSleepMode(IUnknown*, NV_SET_SLEEP_MODE_PARAMS* params) {
     if (s_expected_mode_params) CHECK(params == s_expected_mode_params); // unchanged original pointer
     ++s_mode_calls;
     if (s_record_modes) s_forwarded_modes.push_back(*params);
+    if (s_on_mode_forward) s_on_mode_forward();
     return s_mode_result; // -9 by default: preserve a driver's failure; requested params are not accepted-state proof
 }
-// Actions: 2 clears the feedback device during Sleep, 4 faults natively.
+// Actions: 2 clears the feedback device during Sleep, 4 faults natively, 8 lasts about a
+// millisecond (a driver that paces).
 NvAPI_Status __cdecl FakeDriverSleep(IUnknown* device) {
     ++s_sleep_calls;
     if (s_sleep_action == 2) NvAPI_ClearFeedbackDevice(device);
     if (s_sleep_action == 4) RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
+    if (s_sleep_action == 8) Sleep(1);
     return -7; // a driver failure is returned to the game unchanged
 }
 
@@ -720,6 +744,749 @@ void TestPreSleepPreciseAndHoldWiring() {
     s_orig_sleep = old_sleep;
     NvAPI_ClearFeedbackDevice();
 }
+
+#ifdef _WIN64
+// Key unified_pacer (spec 4.1). The key is published as ResolvePipeline publishes it, WITHOUT
+// the epoch (the scheduler bumps that later): the first hook after the publication must
+// already see the transition through NvAPI_SleepModeReconcilePending. The tuple, the hard
+// limit, the self-check and the Sleep hook are production code, the scheduler's reservation
+// and publication are stubs.
+void SetUnifiedKey(bool on) {
+    PacingPipelineConfig config = PacingPipeline_GetConfig();
+    config.unified_pacer = on;
+    // The order Config_ApplyPacingPipeline uses: the clamped key is noted FIRST, then published.
+    NvAPI_PrepareUnifiedKey(PacingPipeline_ClampConfig(config).unified_pacer);
+    PacingPipeline_SetConfig(config);
+    CHECK(PacingPipeline_UnifiedPacerKey() == on);
+}
+// The forward is the game's parameters with this interval, low latency and boost off when asked.
+bool IsTuple(const NV_SET_SLEEP_MODE_PARAMS& forwarded, const NV_SET_SLEEP_MODE_PARAMS& game,
+    uint32_t interval_us, bool low_latency_off) {
+    NV_SET_SLEEP_MODE_PARAMS expected = game;
+    expected.minimumIntervalUs = interval_us;
+    if (low_latency_off) expected.bLowLatencyMode = expected.bLowLatencyBoost = 0;
+    return SameMode(forwarded, expected);
+}
+
+// The Sleep-mode tuple: with the key off nothing is recorded; entering from the driver
+// limiter clears the interval; leaving with driver_low_latency_off restores the game's
+// interval at the FIRST hook after the key publication (no epoch bump); Dynamic MFG gives
+// the game's parameters back; a game call while the boolean already matches still forwards
+// the full tuple; a busy lock, captured parameters held by another thread and a failed
+// call leave the reconcile pending (no backoff, no spin).
+void TestUnifiedSleepModeTuple() {
+    FakeDevice device;
+    CHECK(NvAPI_CaptureFeedbackDevice(&device));
+    const auto old_sleep = s_orig_sleep;
+    const auto old_mode = s_orig_sleep_mode;
+    const PacingPipelineConfig old_config = PacingPipeline_GetConfig();
+    s_orig_sleep = FakeDriverSleep;
+    s_orig_sleep_mode = FakeSleepMode;
+    s_expected_mode_params = nullptr;
+    s_mode_result = NVAPI_OK;
+    s_record_modes = true;
+    s_forwarded_modes.clear();
+    g_reflex_sleep_bypass = false;
+    g_user_target_fps = 0;
+    s_paces_source = true;
+    s_unified_active = false;
+    CHECK(!NvAPI_SleepModeReconcilePending());
+
+    // Key off: the game's call is forwarded as it is, and nothing is recorded.
+    NV_SET_SLEEP_MODE_PARAMS game{};
+    game.version = NV_SLEEP_PARAMS_VER;
+    game.bLowLatencyMode = game.bLowLatencyBoost = 1;
+    game.minimumIntervalUs = 4321;
+    game.bUseMarkersToOptimize = game.bUseMinQueueTime = 1;
+    game.rsvd[3] = 9;
+    CHECK(Hook_SetSleepMode(&device, &game) == NVAPI_OK);
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], game));
+    CHECK(!s_applied_sleep_valid && !s_applied_key.load() && !NvAPI_SleepModeReconcilePending());
+    s_forwarded_modes.clear();
+
+    // Entering from the driver limiter: the limiter's interval (not recorded with the key
+    // off), then key on with the limiter released (its interval is already 0): the first
+    // hook sees it pending, the interval is cleared, low latency is off.
+    g_driver_limiter_interval_us = 8333;
+    CHECK(NvAPI_ApplyDriverLimiter(8333) == DriverLimiterApply::Applied);
+    CHECK(s_forwarded_modes.size() == 1 && IsTuple(s_forwarded_modes[0], game, 8333, false));
+    CHECK(!s_applied_sleep_valid && !NvAPI_SleepModeReconcilePending());
+    s_forwarded_modes.clear();
+    SetUnifiedKey(true);
+    CHECK(NvAPI_SleepModeReconcilePending());
+    g_driver_limiter_interval_us = 0;
+    NvAPI_ReleaseDriverLimiter();
+    CHECK(s_forwarded_modes.size() == 1 && IsTuple(s_forwarded_modes[0], game, 0, true));
+    CHECK(s_applied_sleep_valid && s_applied_key.load() && s_applied_sleep_mode.owner == UnifiedSleepOwner::Unified &&
+          s_applied_sleep_mode.interval_us == 0 && s_low_latency_forced_off.load());
+    s_forwarded_modes.clear();
+    // Applied: the next Sleeps forward nothing, and the driver's Sleep still runs.
+    const unsigned driver_sleeps = s_sleep_calls;
+    CHECK(Hook_Sleep(&device) == -7 && Hook_Sleep(&device) == -7 && s_sleep_calls == driver_sleeps + 2);
+    CHECK(s_forwarded_modes.empty());
+
+    // A game call while the boolean already matches: the full tuple (interval 0 as well),
+    // not the game's interval with low latency off.
+    NV_SET_SLEEP_MODE_PARAMS again = game;
+    again.minimumIntervalUs = 2222;
+    CHECK(s_low_latency_forced_off.load());
+    CHECK(Hook_SetSleepMode(&device, &again) == NVAPI_OK);
+    CHECK(s_forwarded_modes.size() == 1 && IsTuple(s_forwarded_modes[0], again, 0, true));
+    CHECK(s_game_original_params.minimumIntervalUs == 2222 && g_game_requested_interval.load() == 2222);
+    CHECK(s_applied_sleep_mode.interval_us == 0);
+    s_forwarded_modes.clear();
+
+    // Dynamic MFG: the game's parameters exactly (a bump from OnMarker, key on only), then
+    // its own calls unmodified (the game's pointer); leaving it: the tuple again.
+    s_dmfg_active = true;
+    NvAPI_BumpSleepModeEpoch();
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], again));
+    CHECK(s_applied_sleep_mode.owner == UnifiedSleepOwner::Game && !s_low_latency_forced_off.load());
+    s_forwarded_modes.clear();
+    NV_SET_SLEEP_MODE_PARAMS dmfg_call = again;
+    dmfg_call.minimumIntervalUs = 3333;
+    s_expected_mode_params = &dmfg_call;
+    CHECK(Hook_SetSleepMode(&device, &dmfg_call) == NVAPI_OK);
+    s_expected_mode_params = nullptr;
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], dmfg_call));
+    CHECK(s_applied_sleep_mode.interval_us == 3333);
+    s_forwarded_modes.clear();
+    s_dmfg_active = false;
+    NvAPI_BumpSleepModeEpoch();
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_forwarded_modes.size() == 1 && IsTuple(s_forwarded_modes[0], dmfg_call, 0, true));
+    CHECK(s_low_latency_forced_off.load());
+    s_forwarded_modes.clear();
+
+    // Leaving the key with driver_low_latency_off, through the real pending check: the key
+    // publication alone makes the next Sleep reconcile (the epoch is bumped much later, or
+    // never in this test). The boolean already says off, the interval is the game's again;
+    // settled afterwards, nothing recorded.
+    g_driver_low_latency_off = true;
+    SetUnifiedKey(false);
+    CHECK(NvAPI_SleepModeReconcilePending() && s_low_latency_forced_off.load());
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_forwarded_modes.size() == 1 && IsTuple(s_forwarded_modes[0], dmfg_call, 3333, true));
+    CHECK(!NvAPI_SleepModeReconcilePending() && !s_applied_sleep_valid && !s_applied_key.load());
+    s_forwarded_modes.clear();
+    CHECK(Hook_Sleep(&device) == -7 && s_forwarded_modes.empty()); // the key-off path, nothing to do
+    // The scheduler's bump for the same transition arrives later (ResolvePipeline): it is
+    // absorbed, the restoration is not forwarded a second time.
+    NvAPI_BumpSleepModeEpoch();
+    CHECK(!NvAPI_SleepModeReconcilePending());
+    CHECK(Hook_Sleep(&device) == -7 && s_forwarded_modes.empty());
+
+    // Leaving with the limiter: key on, then off with the limiter's interval published.
+    SetUnifiedKey(true);
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_forwarded_modes.size() == 1 && IsTuple(s_forwarded_modes[0], dmfg_call, 0, true));
+    s_forwarded_modes.clear();
+    g_driver_limiter_interval_us = 6000;
+    SetUnifiedKey(false);
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_forwarded_modes.size() == 1 && IsTuple(s_forwarded_modes[0], dmfg_call, 6000, true));
+    CHECK(!NvAPI_SleepModeReconcilePending());
+    s_forwarded_modes.clear();
+    // Limiter released and the override off: the key-off path restores the game's parameters.
+    g_driver_limiter_interval_us = 0;
+    g_driver_low_latency_off = false;
+    NvAPI_ReleaseDriverLimiter();
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], dmfg_call));
+    CHECK(!s_low_latency_forced_off.load() && !NvAPI_SleepModeReconcilePending());
+    s_forwarded_modes.clear();
+
+    // A held forward lock, captured parameters held by another thread and a failed call leave
+    // it pending, never blocking or spinning; the next call retries at once (no backoff).
+    SetUnifiedKey(true);
+    AcquireSRWLockExclusive(&s_sleep_mode_forward_lock);
+    NvAPI_ReconcileSleepMode();
+    ReleaseSRWLockExclusive(&s_sleep_mode_forward_lock);
+    CHECK(s_forwarded_modes.empty() && NvAPI_SleepModeReconcilePending());
+    CHECK(!s_game_params_lock.test_and_set()); // the captured parameters taken by "another thread"
+    NvAPI_ReconcileSleepMode();
+    CHECK(Hook_Sleep(&device) == -7);
+    s_game_params_lock.clear();
+    CHECK(s_forwarded_modes.empty() && NvAPI_SleepModeReconcilePending());
+    s_mode_result = -9;
+    NvAPI_ReconcileSleepMode();
+    NvAPI_ReconcileSleepMode();
+    CHECK(s_forwarded_modes.size() == 2 && !s_applied_sleep_valid);
+    s_mode_result = NVAPI_OK;
+    s_forwarded_modes.clear();
+    NvAPI_ReconcileSleepMode();
+    CHECK(s_forwarded_modes.size() == 1 && IsTuple(s_forwarded_modes[0], dmfg_call, 0, true));
+    NvAPI_ReconcileSleepMode();
+    CHECK(s_forwarded_modes.size() == 1);
+    s_forwarded_modes.clear();
+
+    // Key off again: the first reconcile restores the key-off row, then the key-off paths.
+    SetUnifiedKey(false);
+    CHECK(NvAPI_SleepModeReconcilePending());
+    NvAPI_ReconcileSleepMode();
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], dmfg_call));
+    CHECK(!NvAPI_SleepModeReconcilePending() && !s_applied_sleep_valid);
+
+    PacingPipeline_SetConfig(old_config);
+    g_driver_low_latency_off = false;
+    g_driver_limiter_interval_us = 0;
+    s_record_modes = false;
+    s_mode_result = -9;
+    s_forwarded_modes.clear();
+    s_orig_sleep = old_sleep;
+    s_orig_sleep_mode = old_mode;
+    NvAPI_ClearFeedbackDevice();
+}
+
+// The key transition. Pending is published BEFORE the key, in both directions (Prepare first,
+// as Config_ApplyPacingPipeline orders it): while the transition is in flight nothing is
+// forwarded for either side. An older writer's clear (the restoration settling) never erases a
+// newer pending (a key-on noted meanwhile). A key on and off in a game without captured
+// parameters settles with no forward. A bump while a key-off restoration is forwarding
+// satisfies the transition exactly once; a real bump with the key on is never swallowed. An
+// unchanged-off call stores nothing.
+void BumpDuringForward() {
+    s_on_mode_forward = nullptr;
+    NvAPI_BumpSleepModeEpoch();
+}
+void PrepareOnDuringForward() {
+    s_on_mode_forward = nullptr;
+    NvAPI_PrepareUnifiedKey(true);
+}
+void TestUnifiedKeyTransitions() {
+    FakeDevice device;
+    CHECK(NvAPI_CaptureFeedbackDevice(&device));
+    const auto old_sleep = s_orig_sleep;
+    const auto old_mode = s_orig_sleep_mode;
+    const PacingPipelineConfig old_config = PacingPipeline_GetConfig();
+    s_orig_sleep = FakeDriverSleep;
+    s_orig_sleep_mode = FakeSleepMode;
+    s_expected_mode_params = nullptr;
+    s_mode_result = NVAPI_OK;
+    s_record_modes = true;
+    s_forwarded_modes.clear();
+    g_reflex_sleep_bypass = false;
+    g_user_target_fps = 0;
+    g_driver_low_latency_off = false;
+    g_driver_limiter_interval_us = 0;
+    s_unified_active = false;
+    CHECK(!NvAPI_SleepModeReconcilePending() && !s_game_params_captured);
+
+    // An unchanged-off application stores nothing: the word and the epoch stay as they were.
+    const uint32_t epoch_before = s_sleep_mode_epoch.load();
+    NvAPI_PrepareUnifiedKey(false);
+    NvAPI_PrepareUnifiedKey(false);
+    CHECK(s_transition_state.load() == 0 && !NvAPI_SleepModeReconcilePending() &&
+          s_sleep_mode_epoch.load() == epoch_before);
+
+    // Key on, then off, in a game whose SetSleepMode parameters were never captured. Pending
+    // is set before the key is visible, nothing is forwarded while the transition is in
+    // flight, the reconcile has nothing to apply, and the key going off settles at once with
+    // no forward (nothing was applied, nothing is owed).
+    NvAPI_PrepareUnifiedKey(true);
+    CHECK(NvAPI_SleepModeReconcilePending() && !PacingPipeline_UnifiedPacerKey());
+    NvAPI_ReconcileSleepMode();
+    CHECK(Hook_Sleep(&device) == -7 && s_forwarded_modes.empty());
+    SetUnifiedKey(true);
+    CHECK(Hook_Sleep(&device) == -7 && s_forwarded_modes.empty() && NvAPI_SleepModeReconcilePending());
+    CHECK((s_transition_state.load() & kTransitionOwed) == 0);
+    SetUnifiedKey(false);
+    CHECK(!NvAPI_SleepModeReconcilePending());
+    CHECK(Hook_Sleep(&device) == -7 && s_forwarded_modes.empty());
+
+    // With captured parameters a Unified tuple is applied and a restoration is owed.
+    NV_SET_SLEEP_MODE_PARAMS game{};
+    game.version = NV_SLEEP_PARAMS_VER;
+    game.bLowLatencyMode = game.bLowLatencyBoost = 1;
+    game.minimumIntervalUs = 4321;
+    CHECK(Hook_SetSleepMode(&device, &game) == NVAPI_OK);
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], game) && !NvAPI_SleepModeReconcilePending());
+    s_forwarded_modes.clear();
+    SetUnifiedKey(true);
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_forwarded_modes.size() == 1 && IsTuple(s_forwarded_modes[0], game, 0, true));
+    CHECK((s_transition_state.load() & kTransitionOwed) != 0);
+    s_forwarded_modes.clear();
+
+    // Off direction: Prepare first keeps it pending (the restoration is owed) while the key is
+    // still published on; in that window nothing is forwarded. Then the key is published and
+    // the first hook restores the game's parameters, once.
+    NvAPI_PrepareUnifiedKey(false);
+    CHECK(NvAPI_SleepModeReconcilePending() && PacingPipeline_UnifiedPacerKey());
+    NvAPI_ReconcileSleepMode();
+    CHECK(Hook_Sleep(&device) == -7 && s_forwarded_modes.empty());
+    SetUnifiedKey(false);
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], game));
+    CHECK(!NvAPI_SleepModeReconcilePending());
+    s_forwarded_modes.clear();
+
+    // An older writer's clear must not erase a newer pending: a key-on is noted while the
+    // key-off restoration is forwarding; when the restoration settles (clearing what it owed)
+    // the pending the new transition set is still there, and the key-on reconcile follows.
+    SetUnifiedKey(true);
+    CHECK(Hook_Sleep(&device) == -7);
+    s_forwarded_modes.clear();
+    SetUnifiedKey(false);
+    s_on_mode_forward = PrepareOnDuringForward;
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], game));
+    CHECK((s_transition_state.load() & kTransitionOwed) == 0 && (s_transition_state.load() & kTransitionKey) != 0);
+    CHECK(NvAPI_SleepModeReconcilePending());
+    s_forwarded_modes.clear();
+    SetUnifiedKey(true); // the pipeline publishes what was noted
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_forwarded_modes.size() == 1 && IsTuple(s_forwarded_modes[0], game, 0, true));
+    s_forwarded_modes.clear();
+
+    // A bump while the key-off restoration is forwarding satisfies the transition exactly once.
+    SetUnifiedKey(false);
+    s_on_mode_forward = BumpDuringForward;
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], game));
+    CHECK(!NvAPI_SleepModeReconcilePending());
+    s_forwarded_modes.clear();
+    CHECK(Hook_Sleep(&device) == -7 && s_forwarded_modes.empty());
+    NvAPI_BumpSleepModeEpoch(); // and a later bump with the key off changes nothing
+    CHECK(!NvAPI_SleepModeReconcilePending() && Hook_Sleep(&device) == -7 && s_forwarded_modes.empty());
+
+    // A real bump with the key on is never swallowed: the tuple is forwarded again.
+    SetUnifiedKey(true);
+    CHECK(Hook_Sleep(&device) == -7);
+    s_forwarded_modes.clear();
+    NvAPI_BumpSleepModeEpoch();
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_forwarded_modes.size() == 1 && IsTuple(s_forwarded_modes[0], game, 0, true));
+    s_forwarded_modes.clear();
+    SetUnifiedKey(false);
+    CHECK(Hook_Sleep(&device) == -7 && s_forwarded_modes.size() == 1 && !NvAPI_SleepModeReconcilePending());
+
+    // An off/on key pair the scheduler never observed (no bump), Dynamic MFG active: with the key
+    // on the game's own tuple is recorded and nothing is owed; with the key off a legacy
+    // override (driver_low_latency_off) turns the driver's low latency off and records nothing;
+    // the key on again must NOT accept the old record: the key generation moved, so the game's
+    // parameters are forwarded again and low latency is restored. (Without the generation the
+    // epoch and the tuple are unchanged and the old record matches: no forward.)
+    s_forwarded_modes.clear();
+    s_dmfg_active = true;
+    SetUnifiedKey(true);
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], game));
+    CHECK(s_applied_sleep_valid && s_applied_sleep_mode.owner == UnifiedSleepOwner::Game &&
+          (s_transition_state.load() & kTransitionOwed) == 0);
+    s_forwarded_modes.clear();
+    const uint32_t epoch_at_pair = s_sleep_mode_epoch.load();
+    SetUnifiedKey(false);
+    CHECK(!NvAPI_SleepModeReconcilePending()); // nothing owed: settled without a forward
+    g_driver_low_latency_off = true;
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_forwarded_modes.size() == 1 && IsTuple(s_forwarded_modes[0], game, 4321, true) &&
+          s_low_latency_forced_off.load());
+    s_forwarded_modes.clear();
+    SetUnifiedKey(true);
+    CHECK(s_sleep_mode_epoch.load() == epoch_at_pair); // the scheduler saw neither toggle
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], game));
+    CHECK(!s_low_latency_forced_off.load());
+    s_forwarded_modes.clear();
+    g_driver_low_latency_off = false;
+    s_dmfg_active = false;
+    SetUnifiedKey(false);
+    CHECK(!NvAPI_SleepModeReconcilePending() && Hook_Sleep(&device) == -7 && s_forwarded_modes.empty());
+
+    s_on_mode_forward = nullptr;
+    PacingPipeline_SetConfig(old_config);
+    NvAPI_PrepareUnifiedKey(PacingPipeline_UnifiedPacerKey());
+    CHECK(!NvAPI_SleepModeReconcilePending());
+    s_record_modes = false;
+    s_mode_result = -9;
+    s_forwarded_modes.clear();
+    s_orig_sleep = old_sleep;
+    s_orig_sleep_mode = old_mode;
+    NvAPI_ClearFeedbackDevice();
+}
+
+// A scripted environment for the Sleep hook's wait: a clock that only moves when the wait
+// advances it, the ready index and its QPC, completions delivered at defined times (inside
+// a start wait or a limit wait), the start-wait chunks and limit waits counted. No real time.
+class ScriptedSleepEnv final : public UnifiedSleepEnv {
+public:
+    struct Completion {
+        int64_t at;
+        uint64_t index;
+        int64_t qpc;
+    };
+    static constexpr int64_t kFrequency = 10'000'000;
+    int64_t now = 1'000'000;
+    uint64_t index = 0;
+    int64_t ready_qpc = 0;
+    std::vector<Completion> completions; // sorted by time
+    size_t next_completion = 0;
+    unsigned start_waits = 0;
+    unsigned limit_waits = 0;
+    int64_t longest_start_wait = 0;
+    bool start_wait_fails = false;
+
+    int64_t Now() noexcept override { return now; }
+    uint64_t ReadyIndex() noexcept override { return index; }
+    int64_t ReadyQpc() noexcept override { return ready_qpc; }
+    int64_t Frequency() noexcept override { return kFrequency; }
+    void Advance(int64_t to) {
+        while (next_completion < completions.size() && completions[next_completion].at <= to) {
+            index = completions[next_completion].index;
+            ready_qpc = completions[next_completion].qpc;
+            ++next_completion;
+        }
+        if (to > now) now = to;
+    }
+    // Returns at the next completion before the deadline, else at the deadline.
+    void WaitForChange(uint64_t, int64_t deadline_qpc) noexcept override {
+        ++limit_waits;
+        int64_t until = deadline_qpc;
+        if (next_completion < completions.size() && completions[next_completion].at < until)
+            until = completions[next_completion].at;
+        Advance(until);
+    }
+    void StartWait(int64_t target_qpc) noexcept override {
+        ++start_waits;
+        if (target_qpc - now > longest_start_wait) longest_start_wait = target_qpc - now;
+        Advance(start_wait_fails ? now + 100 : target_qpc); // a failure returns early
+    }
+};
+
+// The coarse-plus-tail wait of the limit on a scripted clock.
+class ScriptedWaitPrimitives final : public UnifiedWaitPrimitives {
+public:
+    int64_t now = 0;
+    int64_t frequency = 10'000'000;
+    uint64_t index = 5;
+    int64_t coarse_overshoot = 0;    // ticks the OS timer returns late
+    int64_t index_change_at = -1;    // the index changes at this time
+    std::vector<uint32_t> coarse_requests;
+    unsigned relaxes = 0;
+    int64_t early_ticks = -1;        // the next early_waits coarse waits return after this many ticks
+    int early_waits = 0;
+    void Tick(int64_t to) {
+        now = to;
+        if (index_change_at >= 0 && now >= index_change_at) index = 6;
+    }
+    int64_t Now() noexcept override { return now; }
+    int64_t Frequency() noexcept override { return frequency; }
+    uint64_t Index() noexcept override { return index; }
+    void CoarseWait(uint64_t, uint32_t milliseconds) noexcept override {
+        coarse_requests.push_back(milliseconds);
+        int64_t end = now + static_cast<int64_t>(milliseconds) * frequency / 1000 + coarse_overshoot;
+        if (early_waits > 0) { // spurious early return: no change, less time than asked
+            --early_waits;
+            if (now + early_ticks < end) end = now + early_ticks;
+        }
+        if (index_change_at >= 0 && index_change_at < end) end = index_change_at; // woken by the change
+        Tick(end);
+    }
+    void Relax() noexcept override {
+        ++relaxes;
+        Tick(now + 1);
+    }
+};
+
+// The Sleep hook under the key. The hook-level cases assert only what a real clock cannot
+// break (R is never before T for a consumed wait; a failed wait ends before T); every timing
+// case runs on the scripted clock: the start wait to T FIRST (in chunks of at most 250 ms), the
+// hard limit at E (never before T), R = the clock after it, the unfinished frames re-read at R.
+void TestUnifiedSleepHook() {
+    FakeDevice device;
+    CHECK(NvAPI_CaptureFeedbackDevice(&device));
+    const auto old_sleep = s_orig_sleep;
+    const auto old_mode = s_orig_sleep_mode;
+    const PacingPipelineConfig old_config = PacingPipeline_GetConfig();
+    LARGE_INTEGER frequency_value{};
+    QueryPerformanceFrequency(&frequency_value);
+    const int64_t frequency = frequency_value.QuadPart;
+    s_orig_sleep = FakeDriverSleep;
+    s_orig_sleep_mode = FakeSleepMode;
+    s_expected_mode_params = nullptr;
+    s_mode_result = NVAPI_OK;
+    s_record_modes = true;
+    s_forwarded_modes.clear();
+    SetUnifiedKey(true);
+    NV_SET_SLEEP_MODE_PARAMS game{};
+    game.version = NV_SLEEP_PARAMS_VER;
+    game.bLowLatencyMode = game.bLowLatencyBoost = 1;
+    game.minimumIntervalUs = 4321;
+    CHECK(Hook_SetSleepMode(&device, &game) == NVAPI_OK);
+    s_forwarded_modes.clear();
+    s_unified_active = true;
+    g_reflex_sleep_bypass = true;
+    g_user_target_fps = 157;
+    s_paces_source = true;
+    g_up_ready_index.store(6);
+    g_up_ready_qpc.store(RealQpc());
+    SchedulerUnifiedReservation reservation;
+    reservation.token = 5;
+    reservation.grid_index = 7;
+    reservation.lifecycle_base = 1;
+    reservation.interval_ticks = frequency / 100; // I = 10 ms
+    s_unified_reserve_result = SchedulerUnifiedReserve::Reserved;
+    const unsigned plans = s_plan_calls;
+
+    // Completed: the start wait ran to T; the genuine Sleep ran (the bypass is not consulted,
+    // so its NVAPI_OK would be the bypass's), no pre-Sleep plan, the Sleep-mode forwarded nothing.
+    s_pre_sleep_wait_blocks = true;
+    reservation.target_qpc = RealQpc() + 3 * frequency / 1000;
+    s_unified_reservation = reservation;
+    unsigned waits = s_pre_sleep_waits;
+    unsigned driver_sleeps = s_sleep_calls;
+    unsigned reserves = s_unified_reserve_calls;
+    unsigned publishes = s_unified_publishes;
+    unsigned end_reports = s_driver_sleep_calls;
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_unified_reserve_calls == reserves + 1 && s_unified_reserve_arrival > 0);
+    // Real clock: the target is a few ms ahead, and the thread may be descheduled before the
+    // hook reads the clock, so either valid outcome is accepted: the wait ran and Completed, or
+    // T had passed at entry (no wait) and it is Late. Exact timing is asserted only on the
+    // scripted clock below.
+    CHECK(s_unified_publishes == publishes + 1 && s_unified_published.token == 5 &&
+          s_unified_published.grid_index == 7);
+    CHECK((s_pre_sleep_waits == waits + 1 && s_pre_sleep_wait_target == reservation.target_qpc &&
+           s_pre_sleep_wait_precise && s_unified_outcome == UnifiedSleepOutcome::Completed) ||
+          (s_pre_sleep_waits == waits && s_unified_outcome == UnifiedSleepOutcome::Late));
+    CHECK(s_sleep_calls == driver_sleeps + 1 && s_driver_sleep_calls == end_reports + 1 && s_plan_calls == plans);
+    CHECK(s_unified_release_qpc >= reservation.target_qpc && s_unified_arrival_qpc == s_unified_reserve_arrival &&
+          s_unified_arrival_qpc <= s_unified_release_qpc);
+    CHECK(s_unified_limit.outstanding == 0 && s_unified_limit.flags == 0);
+    CHECK(s_forwarded_modes.empty());
+
+    // Late: no start wait was needed (T passed), R is the clock after the limit.
+    reservation.target_qpc = RealQpc() - frequency / 1000;
+    s_unified_reservation = reservation;
+    waits = s_pre_sleep_waits;
+    publishes = s_unified_publishes;
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_pre_sleep_waits == waits && s_unified_publishes == publishes + 1);
+    CHECK(s_unified_outcome == UnifiedSleepOutcome::Late && s_unified_release_qpc >= reservation.target_qpc);
+
+    // Failed: the wait could not run to T (stopping, busy flag or timer failure): R < T, never
+    // Completed or Late, and the limit did not run (inactive, nothing re-read). One call
+    // only: the first chunk ended early.
+    s_pre_sleep_wait_blocks = false;
+    reservation.target_qpc = RealQpc() + 60 * frequency;
+    s_unified_reservation = reservation;
+    waits = s_pre_sleep_waits;
+    publishes = s_unified_publishes;
+    CHECK(Hook_Sleep(&device) == -7);
+    CHECK(s_pre_sleep_waits == waits + 1 && s_unified_publishes == publishes + 1);
+    CHECK(s_unified_outcome == UnifiedSleepOutcome::Failed && s_unified_release_qpc < reservation.target_qpc);
+    CHECK(s_unified_limit.flags == 0 && s_unified_limit.outstanding == -1);
+
+    // Duplicate, busy owner, inactive pipeline: no wait, nothing published, the Sleep forwarded.
+    for (const auto status : {SchedulerUnifiedReserve::Duplicate, SchedulerUnifiedReserve::Busy,
+             SchedulerUnifiedReserve::Inactive}) {
+        s_unified_reserve_result = status;
+        waits = s_pre_sleep_waits;
+        publishes = s_unified_publishes;
+        driver_sleeps = s_sleep_calls;
+        reserves = s_unified_reserve_calls;
+        CHECK(Hook_Sleep(&device) == -7);
+        CHECK(s_unified_reserve_calls == reserves + 1 && s_pre_sleep_waits == waits &&
+              s_unified_publishes == publishes && s_sleep_calls == driver_sleeps + 1);
+    }
+    s_unified_reserve_result = SchedulerUnifiedReserve::Reserved;
+    g_up_ready_index.store(0);
+    g_up_ready_qpc.store(0);
+
+    // ── The wait on the scripted clock ──
+    auto scripted_reservation = [&](const ScriptedSleepEnv& env, uint64_t grid, int64_t target, int64_t interval) {
+        SchedulerUnifiedReservation scripted;
+        scripted.token = 9;
+        scripted.grid_index = grid;
+        scripted.lifecycle_base = 1;
+        scripted.target_qpc = target;
+        scripted.interval_ticks = interval;
+        (void)env;
+        return scripted;
+    };
+    // An early arrival whose completions land BEFORE T: 4 frames outstanding at the arrival
+    // (grid 10, ready 5), frames up to 8 complete 2 ms in, T is 8 ms in. The start wait runs
+    // first and ends at T; at E one frame is outstanding: no wait, no flag, R is T exactly, the
+    // row reports the count at R.
+    {
+        ScriptedSleepEnv env;
+        const int64_t arrival = env.now;
+        env.index = 5;
+        env.ready_qpc = arrival;
+        env.completions = {{arrival + 20'000, 8, arrival + 20'000}};
+        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 10, arrival + 80'000, 200'000));
+        CHECK(result.outcome == UnifiedSleepOutcome::Completed && result.release_qpc == arrival + 80'000);
+        CHECK(result.limit.flags == 0 && result.limit.outstanding == 1);
+        CHECK(env.start_waits == 1 && env.limit_waits == 0 && result.limit.wait_ticks == 0);
+    }
+    // A late arrival, completions recent, none arriving: the limit waits to its one deadline
+    // max(T, E) + I (flags waited and timeout), R is that deadline (never past it), and the
+    // row reports 4 at R. No start wait.
+    {
+        ScriptedSleepEnv env;
+        const int64_t arrival = env.now;
+        env.index = 5;
+        env.ready_qpc = arrival;
+        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 10, arrival - 10'000, 100'000));
+        CHECK(result.outcome == UnifiedSleepOutcome::Late && env.start_waits == 0);
+        CHECK((result.limit.flags & (kUpLimitWaited | kUpLimitTimeout)) == (kUpLimitWaited | kUpLimitTimeout));
+        CHECK(result.release_qpc == arrival + 100'000 && result.limit.wait_ticks == 100'000);
+        CHECK(result.limit.outstanding == 4);
+    }
+    // Three unfinished frames (grid 9, ready 5) are below the hard limit of four: with fresh
+    // completions and a late arrival the limit does not wait, R is the arrival, the row reports 3.
+    {
+        ScriptedSleepEnv env;
+        const int64_t arrival = env.now;
+        env.index = 5;
+        env.ready_qpc = arrival;
+        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 9, arrival - 10'000, 100'000));
+        CHECK(result.outcome == UnifiedSleepOutcome::Late && env.start_waits == 0);
+        CHECK(result.limit.flags == 0 && env.limit_waits == 0 && result.limit.wait_ticks == 0);
+        CHECK(result.release_qpc == arrival && result.limit.outstanding == 3);
+    }
+    // A completion 2 ms in wakes the wait (flag waited, no time-out), and R is that moment.
+    {
+        ScriptedSleepEnv env;
+        const int64_t arrival = env.now;
+        env.index = 5;
+        env.ready_qpc = arrival;
+        env.completions = {{arrival + 20'000, 8, arrival + 20'000}};
+        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 10, arrival - 10'000, 5'000'000));
+        CHECK((result.limit.flags & kUpLimitTimeout) == 0 && (result.limit.flags & kUpLimitWaited) != 0);
+        CHECK(result.release_qpc == arrival + 20'000 && result.limit.wait_ticks == 20'000);
+        CHECK(result.limit.outstanding == 1 && env.limit_waits == 1);
+    }
+    // No completion yet, or stale evidence (older than 2 I): inactive, no wait, -1 stays -1.
+    for (const bool stale : {false, true}) {
+        ScriptedSleepEnv env;
+        const int64_t arrival = env.now;
+        env.index = 5;
+        env.ready_qpc = stale ? arrival - 3 * 100'000 : 0;
+        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 10, arrival - 10'000, 100'000));
+        CHECK((result.limit.flags & kUpLimitInactive) != 0 && result.limit.outstanding == -1);
+        CHECK(env.limit_waits == 0 && result.limit.wait_ticks == 0 && result.release_qpc == arrival);
+    }
+    // Chunked start wait for a long interval (a game limit of one second): 600 ms to T runs as
+    // 250 + 250 + 100 ms, none longer than 250 ms, R is T, and the outcome is Completed.
+    {
+        ScriptedSleepEnv env;
+        const int64_t arrival = env.now;
+        env.index = 6;
+        env.ready_qpc = arrival;
+        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 7, arrival + 6'000'000, 10'000'000));
+        CHECK(env.start_waits == 3 && env.longest_start_wait == 2'500'000);
+        CHECK(result.outcome == UnifiedSleepOutcome::Completed && result.release_qpc == arrival + 6'000'000);
+    }
+    // A start wait that fails (cancelled, stopping, timer failure): Failed with R < T after one
+    // call, and the limit does not run.
+    {
+        ScriptedSleepEnv env;
+        const int64_t arrival = env.now;
+        env.index = 5;
+        env.ready_qpc = arrival;
+        env.start_wait_fails = true;
+        const auto result = UnifiedSleepWait(env, scripted_reservation(env, 10, arrival + 6'000'000, 100'000));
+        CHECK(env.start_waits == 1 && result.outcome == UnifiedSleepOutcome::Failed);
+        CHECK(result.release_qpc < arrival + 6'000'000 && result.limit.flags == 0 &&
+              result.limit.outstanding == -1 && env.limit_waits == 0);
+    }
+
+    // The limit's own wait never asks for more than its budget (scripted clock, 10 MHz).
+    {   // 8.33 ms left: the coarse wait is 8 ms (rounded down), the tail ends exactly at the deadline.
+        ScriptedWaitPrimitives wait;
+        UnifiedWaitForChange(wait, 5, 83'300);
+        CHECK(wait.coarse_requests == std::vector<uint32_t>{8} && wait.now == 83'300 && wait.relaxes == 3'300);
+    }
+    {   // A change of the index during the coarse wait ends it at once, without the tail.
+        ScriptedWaitPrimitives wait;
+        wait.index_change_at = 20'000;
+        UnifiedWaitForChange(wait, 5, 83'300);
+        CHECK(wait.now == 20'000 && wait.relaxes == 0 && wait.index == 6);
+    }
+    {   // Under a millisecond left: no coarse wait, the tail alone, never past the deadline.
+        ScriptedWaitPrimitives wait;
+        UnifiedWaitForChange(wait, 5, 5'000);
+        CHECK(wait.coarse_requests.empty() && wait.now == 5'000 && wait.relaxes == 5'000);
+    }
+    {   // A budget over one second waits one second and returns (the limit calls again).
+        ScriptedWaitPrimitives wait;
+        UnifiedWaitForChange(wait, 5, 20'000'000);
+        CHECK(wait.coarse_requests == std::vector<uint32_t>{1000} && wait.now == 10'000'000 && wait.relaxes == 0);
+    }
+    {   // A deadline that has passed: nothing is waited for.
+        ScriptedWaitPrimitives wait;
+        wait.now = 100;
+        UnifiedWaitForChange(wait, 5, 100);
+        CHECK(wait.coarse_requests.empty() && wait.relaxes == 0 && wait.now == 100);
+    }
+    {   // An early coarse return without a change, 5 ms left: the coarse wait is repeated for
+        // the 4 ms still remaining (floor), not a 5 ms spin; the deadline is met exactly.
+        ScriptedWaitPrimitives wait;
+        wait.early_waits = 1;
+        wait.early_ticks = 10'000; // returns after 1 ms
+        UnifiedWaitForChange(wait, 5, 50'000);
+        CHECK((wait.coarse_requests == std::vector<uint32_t>{5, 4}) && wait.now == 50'000 && wait.relaxes == 0);
+    }
+    {   // A primitive that always returns early, one tick at a time: a bounded number of coarse
+        // waits, then the tail, which ends exactly at the deadline (never past it).
+        ScriptedWaitPrimitives wait;
+        wait.early_waits = 1'000'000;
+        wait.early_ticks = 1;
+        UnifiedWaitForChange(wait, 5, 83'300);
+        CHECK(wait.coarse_requests.size() == 8 && wait.now == 83'300 && wait.relaxes > 0);
+    }
+
+    // Self-check (the durations are scripted; the hook feeds it the genuine Sleep's duration): a
+    // Sleep over 200 us in 16 of 64 sets "driver paces", fewer than 3 clear it, a bump (a key
+    // toggle or Dynamic MFG) starts over.
+    NvAPI_BumpSleepModeEpoch();
+    const int64_t slow = us_to_qpc(1000.0), fast = us_to_qpc(50.0);
+    CHECK(!g_unified_driver_pacing.load());
+    for (int sleep = 0; sleep < 15; ++sleep) UnifiedSleepSelfCheck(slow);
+    CHECK(!g_unified_driver_pacing.load());
+    UnifiedSleepSelfCheck(slow);
+    CHECK(g_unified_driver_pacing.load());
+    for (int sleep = 0; sleep < 12; ++sleep) UnifiedSleepSelfCheck(fast);
+    CHECK(g_unified_driver_pacing.load()); // the fast entries went to empty slots: 16 slow remain
+    for (int sleep = 0; sleep < 64; ++sleep) UnifiedSleepSelfCheck(fast);
+    CHECK(!g_unified_driver_pacing.load());
+    for (int sleep = 0; sleep < 16; ++sleep) UnifiedSleepSelfCheck(slow);
+    CHECK(g_unified_driver_pacing.load());
+    NvAPI_BumpSleepModeEpoch();
+    CHECK(!g_unified_driver_pacing.load());
+    UnifiedSleepSelfCheck(slow);
+    CHECK(!g_unified_driver_pacing.load()); // the ring started over
+
+    // Not on the presenting device: the Sleep neither reserves nor publishes.
+    {
+        FakeDevice other;
+        reserves = s_unified_reserve_calls;
+        publishes = s_unified_publishes;
+        s_unified_reserve_result = SchedulerUnifiedReserve::Reserved;
+        (void)Hook_Sleep(&other);
+        CHECK(s_unified_reserve_calls == reserves && s_unified_publishes == publishes);
+    }
+
+    s_unified_active = false;
+    s_unified_reserve_result = SchedulerUnifiedReserve::Inactive;
+    s_pre_sleep_wait_blocks = false;
+    g_reflex_sleep_bypass = false;
+    g_user_target_fps = 0;
+    SetUnifiedKey(false);
+    CHECK(NvAPI_SleepModeReconcilePending());
+    NvAPI_ReconcileSleepMode();
+    CHECK(!NvAPI_SleepModeReconcilePending());
+    PacingPipeline_SetConfig(old_config);
+    s_record_modes = false;
+    s_mode_result = -9;
+    s_forwarded_modes.clear();
+    s_orig_sleep = old_sleep;
+    s_orig_sleep_mode = old_mode;
+    NvAPI_ClearFeedbackDevice();
+}
+#endif
 
 void RepublishDuringQuery() {
     NvAPI_ClearFeedbackDevice(s_reentrant_expected);
@@ -1374,6 +2141,67 @@ void TestMarkerForwardOrder() {
     NvAPI_ClearFeedbackDevice();
 }
 
+#ifdef _WIN64
+// Key unified_pacer: markers are forwarded first whatever marker_forward_order says (nothing
+// waits in the hook for the unified path), and the enforcement marker's wait is still
+// published as controller residence. Key off keeps the option. The RENDERSUBMIT_START of the
+// presenting device arms the gpu_start_probe for that frame; no other marker does.
+void TestUnifiedMarkerForwardAndProbeArm() {
+    FakeDevice device;
+    CHECK(NvAPI_CaptureFeedbackDevice(&device));
+    const PacingPipelineConfig old_config = PacingPipeline_GetConfig();
+    s_orig_set_latency_marker = ForwardMarker;
+    s_record_call_order = true;
+    s_on_marker_sleep_ms = 2;
+    g_marker_forward_after_wait.store(true);
+    using Order = std::vector<std::pair<char, uint64_t>>;
+
+    s_call_order.clear();
+    SendMarker(&device, 1301, SIMULATION_START);
+    CHECK(s_call_order == (Order{{'O', 1301}, {'F', 1301}})); // key off: after the wait, as ordered
+    CHECK(s_last_residence_us == 0.0);
+
+    SetUnifiedKey(true);
+    s_call_order.clear();
+    SendMarker(&device, 1302, SIMULATION_START);
+    CHECK(s_call_order == (Order{{'F', 1302}, {'O', 1302}})); // key on: forward first
+    CHECK(s_last_residence_us > 0.0);
+    s_call_order.clear();
+    SendMarker(&device, 1302, RENDERSUBMIT_START);
+    SendMarker(&device, 1302, RENDERSUBMIT_END);
+    CHECK(s_call_order == (Order{{'F', 1302}, {'F', 1302}}));
+
+    SetUnifiedKey(false);
+    s_call_order.clear();
+    SendMarker(&device, 1303, SIMULATION_START);
+    CHECK(s_call_order == (Order{{'O', 1303}, {'F', 1303}})); // key off again
+
+    // The probe flag off (the default): RENDERSUBMIT_START never calls the arm.
+    const unsigned arms = s_probe_arm_calls;
+    SendMarker(&device, 1304, SIMULATION_START);
+    SendMarker(&device, 1304, RENDERSUBMIT_START);
+    CHECK(s_probe_arm_calls == arms);
+    // On: RENDERSUBMIT_START of the presenting device arms the frame, no other marker does.
+    g_gpu_start_probe = true;
+    SendMarker(&device, 1305, SIMULATION_START);
+    SendMarker(&device, 1305, RENDERSUBMIT_END);
+    SendMarker(&device, 1305, PRESENT_END);
+    CHECK(s_probe_arm_calls == arms);
+    SendMarker(&device, 1305, RENDERSUBMIT_START);
+    CHECK(s_probe_arm_calls == arms + 1 && s_probe_arm_frame == 1305 &&
+          s_probe_arm_epoch == FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::NvApiFrame));
+    g_gpu_start_probe = false;
+
+    PacingPipeline_SetConfig(old_config);
+    // The key was published on and off without a reconcile (no game parameters): settled.
+    CHECK(!NvAPI_SleepModeReconcilePending());
+    g_marker_forward_after_wait.store(false);
+    s_on_marker_sleep_ms = 0;
+    s_record_call_order = false;
+    NvAPI_ClearFeedbackDevice();
+}
+#endif
+
 void TestSourceAdmissionWithBusyTail() {
     // Immutable source-ID pattern from a captured trace:
     // 8768..13418 with 40 SimStart calls that collided with a busy owner.
@@ -1961,10 +2789,42 @@ void Scheduler_EndDriverSleep(int64_t start_qpc, int64_t end_qpc) noexcept {
     s_driver_sleep_start_qpc = start_qpc;
     s_driver_sleep_end_qpc = end_qpc;
 }
+// Key unified_pacer (spec 4.1): the scheduler's reservation and publication, controlled by
+// the s_unified_* stubs; the hard limit, the tuple and the Sleep hook are production code.
+bool Scheduler_UnifiedActive() noexcept { return s_unified_active; }
+SchedulerUnifiedReserve Scheduler_UnifiedReserve(int64_t arrival_qpc, SchedulerUnifiedReservation* out) noexcept {
+    ++s_unified_reserve_calls;
+    s_unified_reserve_arrival = arrival_qpc;
+    if (s_unified_reserve_result == SchedulerUnifiedReserve::Reserved && out) *out = s_unified_reservation;
+    return s_unified_reserve_result;
+}
+void Scheduler_UnifiedPublishSleep(const SchedulerUnifiedReservation& reservation, UnifiedSleepOutcome outcome,
+    int64_t release_qpc, int64_t arrival_qpc, const UnifiedLimitResult& limit) noexcept {
+    ++s_unified_publishes;
+    s_unified_published = reservation;
+    s_unified_outcome = outcome;
+    s_unified_release_qpc = release_qpc;
+    s_unified_arrival_qpc = arrival_qpc;
+    s_unified_limit = limit;
+}
+void GpuReadiness_ArmProbeForFrame(uint32_t producer_epoch, uint64_t frame_id) noexcept {
+    ++s_probe_arm_calls;
+    s_probe_arm_epoch = producer_epoch;
+    s_probe_arm_frame = frame_id;
+}
 bool PreSleepWaitUntil(int64_t target_qpc, bool precise) {
     ++s_pre_sleep_waits;
     s_pre_sleep_wait_target = target_qpc;
     s_pre_sleep_wait_precise = precise;
+    if (RealQpc() < target_qpc && target_qpc - RealQpc() > s_pre_sleep_max_ahead)
+        s_pre_sleep_max_ahead = target_qpc - RealQpc();
+    if (s_pre_sleep_wait_blocks) {
+        // The wait that reaches its target (a timer for the long part, a spin for the rest).
+        while (RealQpc() < target_qpc) {
+            if (target_qpc - RealQpc() > us_to_qpc(5000.0)) Sleep(1);
+            else _mm_pause();
+        }
+    }
     return true;
 }
 void PacingTelemetry_PushWait(const PacingWaitRecord&) noexcept {} // async marker hook timing; not asserted here
@@ -1999,9 +2859,12 @@ double qpc_to_us(int64_t delta) { return static_cast<double>(delta) / 10.0; }
 RuntimeCallbackGuard::RuntimeCallbackGuard() noexcept : stopping_(false) {}
 RuntimeCallbackGuard::~RuntimeCallbackGuard() = default;
 MH_STATUS InstallHook(void*, void*, void**) { return MH_ERROR_UNSUPPORTED_FUNCTION; }
+bool Hooks_InBatch() noexcept { return false; }
+bool Hooks_TargetEnabled(void*) noexcept { return false; }
 #ifdef _WIN64
 bool PCL_MarkersFlowing() { return false; }
 bool IsNvSmoothMotionActive() { return s_smooth_motion; }
+bool IsDmfgActive() { return s_dmfg_active; }
 #endif
 
 int main(int argc, char** argv) {
@@ -2024,6 +2887,12 @@ int main(int argc, char** argv) {
     TestBypassLowLatencyOff();
     TestDriverLowLatencyOff();
     TestPreSleepPreciseAndHoldWiring();
+#ifdef _WIN64
+    TestUnifiedSleepModeTuple();
+    TestUnifiedKeyTransitions();
+    TestUnifiedSleepHook();
+    TestUnifiedMarkerForwardAndProbeArm();
+#endif
 #ifdef _WIN64
     TestFlipMeteringBlock();
     TestFlipConfigObserver();

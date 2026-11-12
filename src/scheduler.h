@@ -2,6 +2,7 @@
 
 #include "pacing_core_types.h"
 #include "scheduler_cadence.h"
+#include "unified_pacer.h"
 
 #include <cstdint>
 #include <atomic>
@@ -143,6 +144,44 @@ bool Scheduler_PlanReflexSleep(int64_t sleep_entry_qpc, int64_t now_qpc, bool dr
     int64_t* target_qpc, uint64_t* grid_index, bool* precise) noexcept;
 void Scheduler_EndReflexSleep(uint64_t grid_index, int64_t end_qpc) noexcept;
 void Scheduler_EndDriverSleep(int64_t start_qpc, int64_t end_qpc) noexcept;
+
+// ── Unified pacer (developer key unified_pacer; spec 4.1) ──
+// True when the published pipeline places the source at the Sleep hook: placement
+// Unified and mode Vrr, Fixed or Idle. Any thread; one snapshot read.
+bool Scheduler_UnifiedActive() noexcept;
+
+// The Sleep hook's reservation for the next grid index (spec 4.1 "Hook_Sleep under the
+// key" step 3): the start target and the interval the owner computed from the law. `token`
+// is nonzero and tags the mailbox word.
+struct SchedulerUnifiedReservation {
+    uint32_t token = 0;
+    uint64_t grid_index = 0;
+    uint64_t lifecycle_base = 0;
+    int64_t target_qpc = 0;       // UnifiedPacer_TargetTicks(T): wait to this when > the clock
+    int64_t interval_ticks = 0;   // I(n) in ticks (UnifiedStart::interval_ticks): the hard limit's deadline and staleness
+    uint32_t flags = 0;
+};
+enum class SchedulerUnifiedReserve : uint8_t {
+    Reserved,  // wait (limit, then the start wait) and publish with Scheduler_UnifiedPublishSleep
+    Duplicate, // a second Sleep for the same index: no wait, no publication (flag 0x8000 at the marker)
+    Busy,      // the owner was taken: no reservation, no wait (flag 0x4000 at the marker)
+    Inactive,  // not a unified frame (no plan can be made): forward the Sleep untouched
+};
+// Sleep hook, presenting device, caller does NOT hold the owner: takes the owner
+// without waiting. Reserved fills *out.
+SchedulerUnifiedReserve Scheduler_UnifiedReserve(int64_t arrival_qpc, SchedulerUnifiedReservation* out) noexcept;
+// Sleep hook after the start wait, no owner: publishes the hard-limit statistics (one
+// token-tagged slot, written only for a newer token under a try-acquire seqlock) and the
+// mailbox word (token << 34 | outcome << 32 | R − A; never over a newer token's word).
+// A stale reservation (retired or superseded at the marker) finds nothing to match and is
+// discarded there; the marker discards a statistics snapshot that does not validate.
+void Scheduler_UnifiedPublishSleep(const SchedulerUnifiedReservation& reservation,
+    UnifiedSleepOutcome outcome, int64_t release_qpc, int64_t arrival_qpc,
+    const UnifiedLimitResult& limit) noexcept;
+// Developer key unified_queue_law: logs the law's session counters once and clears them (process
+// shutdown, before the probe stops). Any thread; takes the owner without waiting and logs nothing
+// when it is busy or the key was off.
+void Scheduler_LogQueueLawSummary() noexcept;
 
 // True while ReLimiter's own wait paces the game's source: the published
 // placement is marker, pre_sleep or present, held or not. False in

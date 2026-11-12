@@ -191,12 +191,13 @@ class ConfigSavePolicyTests(unittest.TestCase):
     def test_apply_config_configures_the_pacing_pipeline(self):
         self.assertIn("Config_ApplyPacingPipeline();", body("ApplyConfig"))
         pipeline = body("Config_ApplyPacingPipeline")
-        self.assertIn("PacingPipeline_SetConfig(PacingPipelineConfigFrom(g_config))", pipeline)
+        self.assertIn("PacingPipelineConfigFrom(g_config)", pipeline)
+        # The key is noted for the Sleep-mode reconcile before the pipeline publishes it.
+        self.assertLess(pipeline.index("NvAPI_PrepareUnifiedKey("), pipeline.index("PacingPipeline_SetConfig("))
         # adaptive_cap (the only switch) reaches the period
         # governor through the published pipeline configuration; the retired
         # Frame-Time Adaptation setter is gone.
-        self.assertEqual(call_arguments(pipeline, "PacingPipeline_SetConfig"),
-                         [["PacingPipelineConfigFrom(g_config)"]])
+        self.assertEqual(call_arguments(pipeline, "PacingPipeline_SetConfig"), [["pipeline"]])
         self.assertEqual(call_arguments(pipeline, "SetConfig"), [])
         # Every PacingPipelineConfig field comes from its Config field.
         resolver_config = RESOLVER.split("struct PacingPipelineConfig {", 1)[1].split("\n};", 1)[0]
@@ -208,7 +209,11 @@ class ConfigSavePolicyTests(unittest.TestCase):
                                   "adaptive_cap_hold_room", "lead_spike_floor",
                                   "pre_sleep_precise", "driver_limiter_hold",
                                   "placement_override", "stall_inject_ms",
-                                  "stall_inject_period_s"})
+                                  "stall_inject_period_s", "unified_pacer",
+                                  "unified_every_frame_service", "unified_queue_target_us",
+                                  "unified_hold_share", "unified_queue_law", "unified_queue_rank",
+                                  "unified_queue_need_frames", "gpu_queue_probe_source", "unified_queue_upstream",
+                                  "unified_queue_allow_us"})
         mapping = dict(re.findall(r"\bpipeline\.(\w+)\s*=\s*config\.(\w+);",
                                   body("PacingPipelineConfigFrom")))
         self.assertEqual(mapping, {"smoothing": "smoothing", "rung_override": "output_rung",
@@ -227,7 +232,17 @@ class ConfigSavePolicyTests(unittest.TestCase):
                                    "adaptive_cap_hold_room": "adaptive_cap_hold_room",
                                    "lead_spike_floor": "lead_spike_floor",
                                    "pre_sleep_precise": "pre_sleep_precise",
-                                   "driver_limiter_hold": "driver_limiter_hold"})
+                                   "driver_limiter_hold": "driver_limiter_hold",
+                                   "unified_pacer": "unified_pacer",
+                                   "unified_every_frame_service": "unified_every_frame_service",
+                                   "unified_queue_target_us": "unified_queue_target_us",
+                                   "unified_hold_share": "unified_hold_share",
+                                   "unified_queue_law": "unified_queue_law",
+                                   "unified_queue_rank": "unified_queue_rank",
+                                   "unified_queue_need_frames": "unified_queue_need_frames",
+                                   "gpu_queue_probe_source": "gpu_queue_probe_source",
+                                   "unified_queue_upstream": "unified_queue_upstream",
+                                   "unified_queue_allow_us": "unified_queue_allow_us"})
         # The OSD applies pipeline edits through the same function.
         for name, text in (("config.cpp", SOURCE), ("osd.cpp", OSD)):
             self.assertNotRegex(text, r"\bg_frame_time_adaptation\b", name)
@@ -249,6 +264,13 @@ class ConfigSavePolicyTests(unittest.TestCase):
         self.assertIn("g_config.stall_inject_ms, 0.0, kPacingStallInjectMaxMs", validate)
         self.assertRegex(validate, r"g_config\.stall_inject_period_s,\s*kPacingStallInjectMinPeriodS,"
                                    r"\s*kPacingStallInjectMaxPeriodS")
+        self.assertRegex(validate, r"g_config\.unified_queue_target_us,\s*0\.0,\s*kPacingUnifiedQueueTargetMaxUs")
+        self.assertRegex(validate, r"g_config\.unified_hold_share,\s*0\.0,\s*kPacingUnifiedHoldShareMax")
+        self.assertRegex(validate, r"g_config\.unified_queue_rank,\s*1,\s*kPacingUnifiedQueueRankMax")
+        self.assertRegex(validate, r"g_config\.unified_queue_need_frames,\s*1,\s*kPacingUnifiedQueueNeedFramesMax")
+        self.assertRegex(validate, r"g_config\.unified_queue_upstream,\s*0,\s*kPacingUnifiedQueueUpstreamMax")
+        self.assertRegex(validate, r"g_config\.gpu_queue_probe_source,\s*0,\s*kPacingGpuQueueProbeSourceMax")
+        self.assertRegex(validate, r"g_config\.unified_queue_allow_us,\s*0,\s*kPacingUnifiedQueueAllowMaxUs")
         writer = body("WriteConfigSnapshot")
         self.assertIn('"smoothing", PacingSmoothing_Text(config.smoothing)', writer)
         self.assertIn('"output_rung", PacingRungOverride_Text(config.output_rung)', writer)

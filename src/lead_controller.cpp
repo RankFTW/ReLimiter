@@ -195,6 +195,7 @@ void LeadController::Reset(int64_t qpc_frequency) noexcept
     statistics_ = LeadStatistics{};
     qpc_frequency_ = qpc_frequency > 0 ? qpc_frequency : 0;
     if (qpc_frequency <= 0) ++statistics_.invalid_inputs;
+    queue_wait_live_ = false; // the owner's SetQueueWaitLive says when the stream is live again
 }
 
 void LeadController::ResetBuckets() noexcept
@@ -333,6 +334,123 @@ void LeadController::RestartRung(PacingRung rung, double carried_lead_us, double
     }
 }
 
+// ── Saturation rule (lead_controller.h; unified pacer only) ──
+//
+// Invariant: a hold may delay the next frame's GPU work only while the GPU has
+// slack; it must never lower the GPU's throughput below the start rate. The
+// lead sample of a GPU-rung frame minus the queue wait removes the positive
+// feedback hold → queue wait → larger lead → more holds.
+
+void LeadController::SetQueueWaitMode(bool enabled) noexcept
+{
+    if (enabled == queue_wait_mode_) return;
+    DropDeferredSamples();
+    for (PendingFrame& frame : pending_) {
+        frame.z_known = false;
+        frame.z_deferred = false;
+        frame.z_used_us = 0.0f;
+    }
+    queue_wait_mode_ = enabled;
+    queue_wait_live_ = false;
+}
+
+void LeadController::SetQueueWaitLive(bool live) noexcept
+{
+    if (live == queue_wait_live_) return;
+    const bool was_live = queue_wait_live_;
+    queue_wait_live_ = live;
+    if (was_live && !live) DropDeferredSamples(); // each frame feeds once: no sample for them
+}
+
+void LeadController::DropDeferredSamples() noexcept
+{
+    for (PendingFrame& frame : pending_) {
+        if (!frame.occupied || !frame.z_deferred || frame.lead_sampled) continue;
+        frame.z_deferred = false;
+        frame.lead_sampled = true;
+        ++statistics_.queue_wait_dropped;
+    }
+}
+
+// The one liveness rule (lead_controller.h): at the moment a GPU-rung frame's
+// sample would be emitted it waits for z_used while the stream is live, and is
+// fed as today otherwise.
+//
+// The ONE bound of a deferred frame is LEAD_QUEUE_WAIT_LIFETIME_FRAMES (22
+// frames, lead_controller.h: min(the law's 32-frame window, the pending
+// table's 32 slots − the 8 frames events may open ahead − 2)): the frame and
+// the predecessor inputs its sample reads stay in the table that long, and a
+// z_used delivered up to that many releases after the frame's own release
+// feeds it. A later report feeds nothing: the frame is dropped and counted
+// (queue_wait_dropped) and the report is ignored. The legacy 8-frame expiry
+// (LEAD_PENDING_EXPIRY_FRAMES) still closes the frame's gate evidence and
+// every frame that is not deferred, and applies unchanged with the rule off;
+// it no longer ends a deferred frame's sample.
+bool LeadController::LeadSampleDefers(const PendingFrame& frame) const noexcept
+{
+    return queue_wait_mode_ && queue_wait_live_ && !frame.z_known && IsGpuRung(frame.rung);
+}
+
+// Exact identity and the frame's state, then z_used stored (z_known): another
+// key (epoch, generation), a reused slot, an unreleased, already sampled or
+// dropped frame, a frame that already has one, or a non-GPU rung feeds
+// nothing. Returns the slot, nullptr when the report is ignored.
+LeadController::PendingFrame* LeadController::AcceptQueueWaitUsed(const PacingPlanKey& key, uint64_t grid_index,
+    double z_used_us) noexcept
+{
+    if (!queue_wait_mode_) return nullptr;
+    if (!std::isfinite(z_used_us) || z_used_us < 0.0) {
+        ++statistics_.invalid_inputs;
+        return nullptr;
+    }
+    PendingFrame& slot = pending_[static_cast<size_t>(grid_index % LEAD_PENDING_CAPACITY)];
+    if (!slot.occupied || !slot.started || slot.grid_index != grid_index || slot.key != key ||
+        slot.lead_sampled || slot.z_known || !IsGpuRung(slot.rung)) {
+        return nullptr;
+    }
+    slot.z_known = true;
+    slot.z_used_us = static_cast<float>(z_used_us);
+    return &slot;
+}
+
+// The owner records the frame's z_used, then the stage events the sample
+// reads (the predecessor's readiness, resume and output), then calls
+// FlushQueueWaitSamples: a deferred frame is never emitted before that.
+void LeadController::RegisterQueueWaitUsed(const PacingPlanKey& key, uint64_t grid_index,
+    double z_used_us) noexcept
+{
+    AcceptQueueWaitUsed(key, grid_index, z_used_us);
+}
+
+// In grid order, so a frame's predecessor evidence is complete first: every
+// frame whose z_used is registered and whose sample is still to come
+// (TryFinalize: own fields and predecessor resolved).
+void LeadController::FlushQueueWaitSamples() noexcept
+{
+    if (!queue_wait_mode_ || !lifecycle_known_) return;
+    const uint64_t window = LEAD_PENDING_CAPACITY - 1;
+    const uint64_t first = newest_index_ >= window ? newest_index_ - window : 0;
+    for (uint64_t index = first; index <= newest_index_; ++index) {
+        PendingFrame* frame = Find(index);
+        if (frame != nullptr && frame->started && !frame->lead_sampled && frame->z_known) {
+            TryFinalize(frame, true);
+        }
+    }
+}
+
+// A direct caller: Register and flush that one frame at once.
+void LeadController::OnQueueWaitUsed(const PacingPlanKey& key, uint64_t grid_index, double z_used_us) noexcept
+{
+    PendingFrame* slot = AcceptQueueWaitUsed(key, grid_index, z_used_us);
+    if (slot == nullptr) return;
+    if (slot->z_deferred) {
+        slot->z_deferred = false;
+        EmitLeadSample(slot);
+        return;
+    }
+    TryFinalize(slot); // the sample is still to come: it now carries z_used
+}
+
 // ── Lead ──
 
 double LeadController::NextLeadUs(const LeadRequest& request, bool* budget_limited,
@@ -430,7 +548,10 @@ double LeadController::CollisionGuardedLeadUs(const LeadRequest& request, size_t
         bool headroom = false;
         if (CollisionOffsetUs(divisor, request.release_headroom_us, &offset_us, &headroom)) {
             judged = true;
-            const double limit_us = request.interval_us + offset_us;
+            double limit_us = request.interval_us + offset_us;
+            // Physical terms (lead_controller.h, anchor_offset_us): H − R =
+            // L − delta is what the guard limits, so delta joins the limit.
+            if (request.anchor_offset_us > 0.0) limit_us += request.anchor_offset_us;
             ++statistics_.collision_checked_frames;
             if (headroom) ++statistics_.headroom_checked_frames;
             statistics_.last_guard_headroom = headroom;
@@ -780,6 +901,18 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
         ? static_cast<uint32_t>((std::max)(std::llround((std::min)(frame.floor_pull_us,
             static_cast<double>(UINT32_MAX))), 1LL))
         : 0u;
+    // Lead anchor (lead_controller.h, unified pacer only): the owner sets
+    // frame.anchored only there, so with the key off this is one not-taken
+    // branch on a bool and the slot keeps its zero from the whole-struct
+    // reset (slots are only reset that way). s keeps its physical meaning in
+    // every check; delta = (s − B) enters only the lead quantities
+    // (EmitOutcome, EmitLeadSample, RecordSpikeArrival). An anchor not
+    // earlier than s is none.
+    if (frame.anchored && frame.lead_anchor_qpc > 0 && frame.lead_anchor_qpc < frame.source_release_qpc) {
+        slot.anchor_delta_us = static_cast<float>(
+            MicrosecondsBetween(frame.lead_anchor_qpc, frame.source_release_qpc));
+        slot.anchored = slot.anchor_delta_us > 0.0f;
+    }
     SetField(&slot, FieldSource, frame.source_release_qpc);
     RecordReleaseToRender(&slot);
     // The work window's age counts every frame planned with the GPU queue
@@ -1386,10 +1519,17 @@ void LeadController::StartLifecycle(const PacingPlanKey& key, uint64_t grid_inde
 void LeadController::ExpireBehindNewest() noexcept
 {
     for (PendingFrame& frame : pending_) {
-        if (!frame.occupied || frame.closed ||
-            frame.grid_index + LEAD_PENDING_EXPIRY_FRAMES > newest_index_) {
+        if (!frame.occupied) continue;
+        if (frame.closed) {
+            // Saturation rule: a frame whose sample is kept for z_used ends at
+            // the one lifetime bound (LeadSampleDefers).
+            if (queue_wait_mode_ && !frame.lead_sampled &&
+                frame.grid_index + LEAD_QUEUE_WAIT_LIFETIME_FRAMES < newest_index_) {
+                ForceFinalize(&frame);
+            }
             continue;
         }
+        if (frame.grid_index + LEAD_PENDING_EXPIRY_FRAMES > newest_index_) continue;
         if (!frame.started) {
             Discard(&frame);
             continue;
@@ -1674,13 +1814,28 @@ bool LeadController::PreviousResolved(const PendingFrame& frame) const noexcept
     return !IsHeldStatus(previous->output_status) || HasField(*previous, hold_start);
 }
 
-void LeadController::TryFinalize(PendingFrame* frame) noexcept
+void LeadController::TryFinalize(PendingFrame* frame, bool flush) noexcept
 {
     if (frame == nullptr || !frame->occupied || !frame->started || (frame->finalized && frame->lead_sampled)) return;
     const uint16_t own = OwnFieldMask(frame->rung);
     if ((frame->field_mask & own) != own || !PreviousResolved(*frame)) return;
     if (!frame->finalized) EmitOutcome(frame);
-    if (!frame->lead_sampled && !LeadSampleWaitsForReport(*frame)) EmitLeadSample(frame);
+    if (!frame->lead_sampled && !LeadSampleWaitsForReport(*frame)) {
+        if (queue_wait_mode_) {
+            // Saturation rule: a deferred frame waits for its flush (the
+            // registered z_used is applied there, after the predecessor's
+            // events); another waits for z_used while the stream is live.
+            if (frame->z_deferred ? !flush : LeadSampleDefers(*frame)) {
+                if (!frame->z_deferred) {
+                    frame->z_deferred = true;
+                    ++statistics_.queue_wait_deferred;
+                }
+                return;
+            }
+            frame->z_deferred = false;
+        }
+        EmitLeadSample(frame);
+    }
 }
 
 void LeadController::ForceFinalize(PendingFrame* frame) noexcept
@@ -1689,6 +1844,16 @@ void LeadController::ForceFinalize(PendingFrame* frame) noexcept
     if ((frame->field_mask & own) == own) {
         if (!frame->finalized) EmitOutcome(frame);
         if (!frame->lead_sampled) {
+            if (queue_wait_mode_ && LeadSampleDefers(*frame)) {
+                // Saturation rule: kept for z_used through the one lifetime
+                // bound (LeadSampleDefers); past it, without z_used, the
+                // frame feeds nothing (never the raw sample).
+                if (frame->grid_index + LEAD_QUEUE_WAIT_LIFETIME_FRAMES >= newest_index_) return;
+                frame->z_deferred = false;
+                frame->lead_sampled = true;
+                ++statistics_.queue_wait_dropped;
+                return;
+            }
             // Closed behind the wait without its report: the wait for frame
             // n − 1 is left out (SampleUs).
             if (LeadSampleWaitsForReport(*frame)) ++statistics_.report_missing_samples;
@@ -1755,6 +1920,10 @@ void LeadController::EmitOutcome(PendingFrame* frame) noexcept
     const auto in_range = [&](double x_us) noexcept {
         return x_us >= 0.0 && x_us <= LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us;
     };
+    // Lead anchor (unified pacer only): a duration measured from s that
+    // becomes a lead quantity is measured from B instead (the range checks
+    // above stay on s). With no anchor nothing below is computed.
+    const bool anchored = frame->anchored;
     const auto add = [&](GpuPacedRing* ring, double x_us) noexcept {
         ring->x_us[ring->head] = static_cast<float>(x_us);
         ring->head = (ring->head + 1) % static_cast<uint32_t>(LEAD_GPU_PACED_CAPACITY);
@@ -1765,9 +1934,15 @@ void LeadController::EmitOutcome(PendingFrame* frame) noexcept
     if (frame->gpu_floor_release && in_range(floor_ready_us)) {
         GpuPacedRing& ring = gpu_paced_rings_[IsGpuRung(frame->rung) ? 0 : 1];
         if (ring.divisor != divisor) ring = GpuPacedRing{ {}, 0, 0, divisor };
-        add(&ring, floor_ready_us);
+        double ring_x_us = floor_ready_us;
+        if (anchored) ring_x_us += static_cast<double>(frame->anchor_delta_us);
+        add(&ring, ring_x_us);
     }
-    if (gpu_ready && in_range(ready_us)) add(&gpu_ready_rings_[divisor], ready_us);
+    if (gpu_ready && in_range(ready_us)) {
+        double ready_x_us = ready_us;
+        if (anchored) ready_x_us += static_cast<double>(frame->anchor_delta_us);
+        add(&gpu_ready_rings_[divisor], ready_x_us);
+    }
     RecordSpikeGpu(frame);
     Bucket& bucket = buckets_[frame->bucket];
     // Lockstep engines (lead_controller.h): ReLimiter's waits for later frames
@@ -1786,8 +1961,10 @@ void LeadController::EmitOutcome(PendingFrame* frame) noexcept
     // guard's reduction (lateness it accepts on purpose) and without the
     // gated hold. L − X would credit a frame released after S with time it
     // never had.
-    const double slack_us = MicrosecondsBetween(frame->qpc[FieldSource], frame->target_qpc) +
-        frame->guard_reduction_us - std::max(0.0, raw_us - gated_us);
+    double slack_us = MicrosecondsBetween(frame->qpc[FieldSource], frame->target_qpc);
+    if (anchored) slack_us += static_cast<double>(frame->anchor_delta_us); // T − B instead of T − s
+    slack_us += frame->guard_reduction_us;
+    slack_us -= std::max(0.0, raw_us - gated_us);
     // A frame released before the evidence restarted is not counted
     // (ClearSlackEvidence); its slack still marks the next frame draining.
     if (!frame->slack_fenced) {
@@ -1845,15 +2022,31 @@ void LeadController::EmitLeadSample(PendingFrame* frame) noexcept
         statistics_.last_queue_us = queue_us;
     }
     Bucket& bucket = buckets_[frame->bucket];
-    const double lead_sample_us = sample_us - queue_us;
+    double lead_sample_us = sample_us - queue_us;
+    if (frame->z_known) {
+        // Saturation rule (unified pacer only): the lead learns the readiness
+        // without the queue wait. SampleUs already removed
+        // predecessor_wait_us (d: the wait for frame n − 1 including its hold,
+        // behind the wait) and z_used is the part of the reported wait that
+        // is not that hold, so only the excess over d is removed here, never
+        // the same wait twice. Check: z_used = d removes nothing more.
+        const double removed_us = std::max(0.0, static_cast<double>(frame->z_used_us) - predecessor_wait_us);
+        lead_sample_us = std::max(0.0, lead_sample_us - removed_us);
+        ++statistics_.queue_wait_samples;
+        statistics_.last_queue_wait_removed_us = removed_us;
+    }
     if (lead_sample_us > LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us) {
         ++bucket.excluded_long;
         ++statistics_.excluded_long;
         return;
     }
-    bucket.window.Add(lead_sample_us);
+    // Lead anchor: after the range check on the sample measured from s, the
+    // sample is the readiness measured from B (unified pacer only).
+    double window_sample_us = lead_sample_us;
+    if (frame->anchored) window_sample_us += static_cast<double>(frame->anchor_delta_us);
+    bucket.window.Add(window_sample_us);
     ++statistics_.samples;
-    statistics_.last_sample_us = lead_sample_us;
+    statistics_.last_sample_us = window_sample_us;
 }
 
 // X relative to the frame's source release s:
@@ -2046,10 +2239,14 @@ void LeadController::RecordSpikeArrival(PendingFrame* frame, double first_submis
         ++statistics_.spike_excluded;
         return;
     }
+    // Lead anchor: the arrival's range check above is on s; the binned arrival
+    // is measured from B (unified pacer only).
+    double binned_us = arrival_us;
+    if (frame->anchored) binned_us += static_cast<double>(frame->anchor_delta_us);
     ++statistics_.spike_samples;
-    statistics_.last_spike_arrival_us = arrival_us;
+    statistics_.last_spike_arrival_us = binned_us;
     SpikeMemory& memory = spike_memory_;
-    const auto bin = static_cast<uint16_t>(std::min(arrival_us / LEAD_HISTOGRAM_BIN_US,
+    const auto bin = static_cast<uint16_t>(std::min(binned_us / LEAD_HISTOGRAM_BIN_US,
         static_cast<double>(std::numeric_limits<uint16_t>::max())));
     if (memory.current_count == 0 || bin > memory.current_max_bin) memory.current_max_bin = bin;
     if (++memory.current_count < LEAD_SPIKE_BLOCK_SAMPLES) return;

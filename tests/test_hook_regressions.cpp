@@ -25,6 +25,9 @@ void StreamlineQueue_Drain(bool) noexcept {}
 #include <mutex>
 #include <thread>
 
+// The newest log line of the production code under test (Log_Write below keeps only the last).
+static thread_local char s_last_test_log[2048]{};
+
 namespace {
 void Check(bool condition, const char* message) {
     if (condition) return;
@@ -35,6 +38,7 @@ void Check(bool condition, const char* message) {
 struct FakeHook {
     void* target = nullptr;
     bool enabled = false;
+    bool queued_enable = false;
 };
 std::array<FakeHook, 64> s_fake_hooks{};
 std::mutex s_fake_mutex;
@@ -46,6 +50,7 @@ HANDLE s_create_entered = nullptr;
 HANDLE s_release_create = nullptr;
 HANDLE s_enable_entered = nullptr;
 bool s_test_stopping = false;
+uint64_t s_native_handle_override = 0; // the swap manager's native handle seen by the production detours (0: 0x1000)
 void* s_expected_self = nullptr;
 const DXGI_PRESENT_PARAMETERS* s_expected_parameters = nullptr;
 unsigned s_background_starts = 0;
@@ -374,6 +379,701 @@ void TestNativeGateHookPlacement() {
       s_present1_targets[0].original = present1_original;
 }
 
+// ── The private vtable copy of the selected object: the route's Present entry ──
+// A swapchain-like object whose vtable names code of this image for 43 slots, driven through the production
+// install / reconcile / destroy / teardown and the production detours. The fake native handle (0x1000) is not
+// these objects, so every body that runs is the identity rejection path: it is counted once per outermost
+// entry, which is how "one body per call" is observed here.
+unsigned s_vt_present_calls = 0, s_vt_present1_calls = 0;
+bool s_vt_forward_same = false;
+IDXGISwapChain* s_vt_forward_other = nullptr;
+const DXGI_PRESENT_PARAMETERS* s_vt_expected_parameters = nullptr;
+size_t s_vt_first_record = vtable_copy::kNoRecord;
+constexpr size_t kVtSlots = 43;
+
+HRESULT STDMETHODCALLTYPE VtSlot() { return 0; }
+// Slot 0 of the test vtables (IUnknown::QueryInterface): the install reads the object through it. A real signature:
+// on Win32 the callee pops its arguments.
+HRESULT STDMETHODCALLTYPE VtQueryInterface(IDXGISwapChain*, REFIID, void** out) {
+    if (out) *out = nullptr;
+    return E_NOINTERFACE;
+}
+HRESULT STDMETHODCALLTYPE VtPresentAlt(IDXGISwapChain*, UINT, UINT) { return 9; }
+bool RejectAllVptrs(uintptr_t) { return false; }
+HRESULT STDMETHODCALLTYPE InlineProbeOriginal(IDXGISwapChain*, UINT, UINT) { return 7; }
+HRESULT STDMETHODCALLTYPE VtPresent(IDXGISwapChain* self, UINT interval, UINT flags) {
+    ++s_vt_present_calls;
+    Check(interval == 3 && flags == 4, "the vtable original gets the caller's arguments");
+    HRESULT result = 1;
+    // The same object through the inline patch's detour: an inner entry.
+    if (s_vt_forward_same) result += s_present_thunks[0](self, interval, flags);
+    // Another object from inside the original: its own outermost entry.
+    if (s_vt_forward_other) result += s_present_thunks[0](s_vt_forward_other, interval, flags);
+    return result;
+}
+HRESULT STDMETHODCALLTYPE VtPresent1(IDXGISwapChain1*, UINT interval, UINT flags,
+                                     const DXGI_PRESENT_PARAMETERS* parameters) {
+    ++s_vt_present1_calls;
+    Check(interval == 3 && flags == 4 && parameters == s_vt_expected_parameters,
+          "the vtable Present1 original gets the caller's parameters unchanged");
+    return 21;
+}
+// Another module's detour on its own vtable after ours: it calls the entry it saved (our detour).
+HRESULT STDMETHODCALLTYPE ForeignPresent(IDXGISwapChain* self, UINT interval, UINT flags) {
+    return s_vtable_present_thunks[s_vt_first_record](self, interval, flags) + 1000;
+}
+
+struct VtObject { void** vptr; };
+VtObject s_nest[5];
+bool s_nest_reentered = false;
+// The inline original of the nesting test: each object's Present calls the next object's (through the inline
+// detour); the deepest calls its own once more (an inner entry), then ends.
+HRESULT STDMETHODCALLTYPE NestLevel(IDXGISwapChain* self_object, UINT interval, UINT flags) {
+    const size_t index = static_cast<size_t>(reinterpret_cast<VtObject*>(self_object) - s_nest);
+    if (index + 1 < 5)
+        return s_present_thunks[0](reinterpret_cast<IDXGISwapChain*>(&s_nest[index + 1]), interval, flags);
+    if (s_nest_reentered) return 7;
+    s_nest_reentered = true;
+    return s_present_thunks[0](self_object, interval, flags);
+}
+
+uint64_t EntryCount(NativeGateEntry entry) {
+    return NativeGate_Diagnostics().entries[static_cast<size_t>(entry)];
+}
+
+// A vtable of `slots` entries (the locator at index -1) that ends exactly where readable memory ends: the page
+// after it has `guard_protect` (PAGE_NOACCESS or PAGE_GUARD), so a verbatim copy stops there. Every slot names VtSlot.
+char* s_last_guard_page = nullptr;
+void** VtableBeforeGuardPage(size_t slots, DWORD guard_protect = PAGE_NOACCESS) {
+    char* base = static_cast<char*>(VirtualAlloc(nullptr, 2 * 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    Check(base != nullptr, "allocate a vtable page");
+    DWORD old = 0;
+    Check(VirtualProtect(base + 4096, 4096, guard_protect, &old) != FALSE, "protect the guard page");
+    s_last_guard_page = base + 4096;
+    void** vptr = reinterpret_cast<void**>(base + 4096) - slots;
+    vptr[-1] = base; // the locator
+    for (size_t i = 0; i < slots; ++i) vptr[i] = reinterpret_cast<void*>(&VtSlot);
+    vptr[0] = reinterpret_cast<void*>(&VtQueryInterface);
+    return vptr;
+}
+// The test vtables above live in private pages; a class vtable lives in a module's image. This stands in for the
+// production residency check where the page tests need it, so the check itself is tested with the real one.
+bool AcceptAllVptrs(uintptr_t) { return true; }
+bool LastLogHas(const char* text) { return std::strstr(s_last_test_log, text) != nullptr; }
+// Executable memory that belongs to no module: a hook's private thunk. Never called.
+void* NonModuleCode() {
+    unsigned char* page = static_cast<unsigned char*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE,
+                                                                   PAGE_EXECUTE_READWRITE));
+    Check(page != nullptr, "allocate non-module code");
+    page[0] = 0xC3;
+    return page;
+}
+
+void TestVtableCopyEntry() {
+    static void* vtable_storage[1 + kVtSlots];
+    static void* foreign_storage[1 + kVtSlots];
+    struct FakeObject { void** vptr; };
+    static FakeObject object, other;
+    vtable_storage[0] = foreign_storage[0] = reinterpret_cast<void*>(&object); // the locator: copied as it is
+    for (size_t i = 0; i < kVtSlots; ++i) vtable_storage[1 + i] = foreign_storage[1 + i] = reinterpret_cast<void*>(&VtSlot);
+    vtable_storage[1 + 8] = reinterpret_cast<void*>(&VtPresent);
+    vtable_storage[1 + 22] = foreign_storage[1 + 22] = reinterpret_cast<void*>(&VtPresent1);
+    vtable_storage[1 + 0] = reinterpret_cast<void*>(&VtQueryInterface);
+    foreign_storage[1 + 8] = reinterpret_cast<void*>(&ForeignPresent);
+    void** const original_vptr = vtable_storage + 1;
+    void** const foreign_vptr = foreign_storage + 1;
+    object.vptr = other.vptr = original_vptr;
+    auto* self = reinterpret_cast<IDXGISwapChain*>(&object);
+    auto* self1 = reinterpret_cast<IDXGISwapChain1*>(&object);
+    auto* other_self = reinterpret_cast<IDXGISwapChain*>(&other);
+    const uint64_t object_handle = reinterpret_cast<uint64_t>(&object);
+    const auto present_original = s_present_targets[0].original.load();
+    s_present_targets[0].original = InlineProbeOriginal;
+    DXGI_PRESENT_PARAMETERS parameters{};
+    s_vt_expected_parameters = &parameters;
+
+    // Selection: the object, and only the object, gets our copy; the class vtable is not written.
+    VSync_OnNativeSelected(object_handle);
+    const size_t first = s_records.IndexOfCopy(reinterpret_cast<uintptr_t>(object.vptr));
+    s_vt_first_record = first;
+    Check(first != vtable_copy::kNoRecord && object.vptr != original_vptr, "selection points the object at our copy");
+    Check(other.vptr == original_vptr && original_vptr[8] == reinterpret_cast<void*>(&VtPresent),
+          "another object of the class and the class vtable are untouched");
+    Check(object.vptr[8] == reinterpret_cast<void*>(s_vtable_present_thunks[first]) &&
+          object.vptr[22] == reinterpret_cast<void*>(s_vtable_present1_thunks[first]),
+          "slots 8 and 22 of the copy name our detours");
+    Check(object.vptr[-1] == original_vptr[-1] && object.vptr[7] == original_vptr[7] &&
+          object.vptr[kVtSlots - 1] == original_vptr[kVtSlots - 1], "the locator and every other entry are copied");
+    Check(s_records.Get(first)->original_present == reinterpret_cast<uintptr_t>(&VtPresent),
+          "the record forwards to the slot value read at copy time");
+    void* inline_present = nullptr; void* inline_present1 = nullptr;
+    Check(VtableOriginalTargets(object_handle, &inline_present, &inline_present1) &&
+          inline_present == reinterpret_cast<void*>(&VtPresent),
+          "the inline patch is installed on the function the record forwards to, not on our detour");
+    char text[300];
+    char text_route[800];
+    DescribeVtableSlot("Present", object_handle, 8, false, s_present_targets, text, sizeof(text));
+    Check(std::strstr(text, "our vtable detour") != nullptr && std::strstr(text, "installed") != nullptr,
+          "the diagnostics report our detour in the slot as installed");
+
+    // One entry: the vtable detour runs the body (here the rejection) once and calls the record's original.
+    s_vt_forward_same = false;
+    s_vt_forward_other = nullptr;
+    uint64_t vt_before = EntryCount(NativeGateEntry::VtablePresent), typed_before = EntryCount(NativeGateEntry::TypedPresent),
+             inner_before = EntryCount(NativeGateEntry::InnerPassThrough), rejected_before = NativeGate_PresentsRejected(false);
+    unsigned calls_before = s_vt_present_calls;
+    Check(reinterpret_cast<PFN_Present>(object.vptr[8])(self, 3, 4) == 1, "the vtable detour returns the original's result");
+    Check(s_vt_present_calls == calls_before + 1 && EntryCount(NativeGateEntry::VtablePresent) == vt_before + 1 &&
+          EntryCount(NativeGateEntry::TypedPresent) == typed_before &&
+          EntryCount(NativeGateEntry::InnerPassThrough) == inner_before &&
+          NativeGate_PresentsRejected(false) == rejected_before + 1, "one vtable entry, one body");
+
+    // Dedup: the same object reaching the inline detour from inside the original passes straight through.
+    s_vt_forward_same = true;
+    vt_before = EntryCount(NativeGateEntry::VtablePresent); typed_before = EntryCount(NativeGateEntry::TypedPresent);
+    inner_before = EntryCount(NativeGateEntry::InnerPassThrough); rejected_before = NativeGate_PresentsRejected(false);
+    Check(reinterpret_cast<PFN_Present>(object.vptr[8])(self, 3, 4) == 1 + 7, "the inner entry reaches the inline original");
+    Check(EntryCount(NativeGateEntry::VtablePresent) == vt_before + 1 && EntryCount(NativeGateEntry::TypedPresent) == typed_before + 1 &&
+          EntryCount(NativeGateEntry::InnerPassThrough) == inner_before + 1 &&
+          NativeGate_PresentsRejected(false) == rejected_before + 1,
+          "both entries counted per kind, the inner one separately, the body once");
+
+    // Another object from inside the original is not suppressed: its own outermost entry, its own body.
+    s_vt_forward_same = false;
+    s_vt_forward_other = other_self;
+    inner_before = EntryCount(NativeGateEntry::InnerPassThrough); rejected_before = NativeGate_PresentsRejected(false);
+    Check(reinterpret_cast<PFN_Present>(object.vptr[8])(self, 3, 4) == 1 + 7, "the other object reaches its original");
+    Check(EntryCount(NativeGateEntry::InnerPassThrough) == inner_before &&
+          NativeGate_PresentsRejected(false) == rejected_before + 2, "a Present on another swapchain is not suppressed");
+    s_vt_forward_other = nullptr;
+
+    // Present1: parameters and result pass through unchanged.
+    vt_before = EntryCount(NativeGateEntry::VtablePresent1);
+    Check(reinterpret_cast<PFN_Present1>(object.vptr[22])(self1, 3, 4, &parameters) == 21 &&
+          s_vt_present1_calls == 1 && EntryCount(NativeGateEntry::VtablePresent1) == vt_before + 1,
+          "the vtable Present1 detour forwards its parameters and result");
+
+    // Dedup beyond four objects: five distinct objects nested on one thread (each original presents the next one
+    // through the inline detour); the fifth object and its inner entry still run one body: five bodies, one pass-through.
+    for (VtObject& n : s_nest) n.vptr = original_vptr;
+    s_nest_reentered = false;
+    const auto saved_inline = s_present_targets[0].original.load();
+    s_present_targets[0].original = NestLevel;
+    inner_before = EntryCount(NativeGateEntry::InnerPassThrough); rejected_before = NativeGate_PresentsRejected(false);
+    Check(s_present_thunks[0](reinterpret_cast<IDXGISwapChain*>(&s_nest[0]), 3, 4) == 7, "five nested objects reach the original");
+    Check(NativeGate_PresentsRejected(false) == rejected_before + 5 && EntryCount(NativeGateEntry::InnerPassThrough) == inner_before + 1,
+          "the fifth nested object runs its body once and its inner entry passes through");
+    s_present_targets[0].original = saved_inline;
+
+    // Another module replaces the vptr AFTER our copy: left as it is. Counted, no new record, no chain, no
+    // vptr write against it.
+    const size_t records_before = s_records.Size();
+    Check(!vtable_copy::ShouldRestoreVptr(reinterpret_cast<uintptr_t>(foreign_vptr), reinterpret_cast<uintptr_t>(object.vptr)),
+          "a foreign vptr is not ours");
+    VSync_ObserveNativeVptr(object_handle); // ours: nothing happens
+    Check(s_records.Size() == records_before && s_vptr_replacements.load() == 0, "an unchanged vptr is a no-op");
+    object.vptr = foreign_vptr;
+    VSync_ObserveNativeVptr(object_handle);
+    Check(s_vptr_replacements.load() == 1 && object.vptr == foreign_vptr && s_records.Size() == records_before &&
+          s_records.IndexOfCopy(reinterpret_cast<uintptr_t>(object.vptr)) == vtable_copy::kNoRecord,
+          "a vptr another module replaced after us is counted and left: no new copy, no write");
+    VSync_ObserveNativeVptr(object_handle);
+    Check(s_vptr_replacements.load() == 1 && s_records.Size() == records_before && object.vptr == foreign_vptr,
+          "the same foreign vptr is not counted again");
+    s_present_targets[0].original = InlineProbeOriginal;
+    vt_before = EntryCount(NativeGateEntry::VtablePresent); inner_before = EntryCount(NativeGateEntry::InnerPassThrough);
+    calls_before = s_vt_present_calls;
+    Check(reinterpret_cast<PFN_Present>(object.vptr[8])(self, 3, 4) == 1001,
+          "the other module's detour reaches our first detour, which forwards to the original");
+    Check(EntryCount(NativeGateEntry::VtablePresent) == vt_before + 1 && s_vt_present_calls == calls_before + 1,
+          "one vtable entry, the original once");
+
+    // Destroy: the vptr goes back only while it still equals our copy.
+    VSync_OnNativeDestroyed(object_handle);
+    Check(object.vptr == foreign_vptr && s_vtable_restores.load() == 0, "destroy leaves a vptr that is not ours");
+
+    // The history is process-global: destroy and init of the same native object do not forget the foreign vptr, and
+    // it is left alone on the next selection of this object and of any other (no copy over it, no chain into a cycle).
+    s_vtable_failures.store(0);
+    VSync_OnNativeSelected(object_handle);
+    Check(object.vptr == foreign_vptr && s_records.Size() == records_before && s_vtable_failures.load() == 1 &&
+          LastLogHas("foreign vtable"), "a foreign vptr seen over our copy is left alone on re-selection of the same object");
+    VSync_OnNativeDestroyed(object_handle);
+    other.vptr = foreign_vptr;
+    VSync_OnNativeSelected(reinterpret_cast<uint64_t>(&other));
+    Check(other.vptr == foreign_vptr && s_records.Size() == records_before && s_vtable_failures.load() == 2,
+          "and on the selection of another object");
+    VSync_OnNativeDestroyed(reinterpret_cast<uint64_t>(&other));
+    other.vptr = original_vptr;
+    object.vptr = original_vptr;
+    VSync_OnNativeSelected(object_handle); // a re-created swapchain at the same address: the existing record is reused
+    Check(s_records.IndexOfCopy(reinterpret_cast<uintptr_t>(object.vptr)) == first && s_records.Size() == records_before,
+          "the same vtable image shares its copy and record");
+    VSync_OnNativeDestroyed(object_handle);
+    Check(object.vptr == original_vptr && s_vtable_restores.load() == 1, "destroy restores the vptr it replaced");
+
+    // Teardown restores the vptrs that are still ours, no others.
+    VSync_OnNativeSelected(object_handle);
+    VSync_OnNativeSelected(reinterpret_cast<uint64_t>(&other));
+    other.vptr = foreign_vptr;
+    VSync_RestoreVtables();
+    Check(object.vptr == original_vptr && other.vptr == foreign_vptr,
+          "teardown restores only the vptrs that are still ours");
+    other.vptr = original_vptr;
+
+    // The vtables below are in private pages: the residency check is replaced where a page vtable must install.
+    s_vptr_in_module = AcceptAllVptrs;
+    static FakeObject page_object;
+    void* const private_thunk = NonModuleCode();
+
+    // ANY of slots 0 to 40 outside every loaded module (a hook's private thunk, whose owner can free it) refuses
+    // the install, and the slot is in the log. The vtable ends exactly at unreadable memory with 41 slots.
+    s_vtable_failures.store(0);
+    for (size_t slot : {size_t(31), size_t(0), vtable_copy::kPresentSlot, vtable_copy::kPresent1Slot, size_t(40)}) {
+        void** const page_vptr = VtableBeforeGuardPage(vtable_copy::kRequiredSlots);
+        page_vptr[8] = reinterpret_cast<void*>(&VtPresent);
+        page_vptr[22] = reinterpret_cast<void*>(&VtPresent1);
+        page_vptr[slot] = private_thunk;
+        page_object.vptr = page_vptr;
+        const uint32_t failures_before = s_vtable_failures.load();
+        VSync_OnNativeSelected(reinterpret_cast<uint64_t>(&page_object));
+        char needle[32];
+        std::snprintf(needle, sizeof(needle), "slot %zu (", slot);
+        Check(page_object.vptr == page_vptr && s_vtable_failures.load() == failures_before + 1 && LastLogHas(needle),
+              "a non-module pointer in any of slots 0 to 40 refuses the install and logs the slot");
+        VSync_OnNativeDestroyed(reinterpret_cast<uint64_t>(&page_object));
+    }
+
+    // The same vtable with every slot in a module installs, verbatim, and destroy restores it.
+    void** const good_vptr = VtableBeforeGuardPage(vtable_copy::kRequiredSlots);
+    good_vptr[8] = reinterpret_cast<void*>(&VtPresent);
+    good_vptr[22] = reinterpret_cast<void*>(&VtPresent1);
+    page_object.vptr = good_vptr;
+    VSync_OnNativeSelected(reinterpret_cast<uint64_t>(&page_object));
+    Check(page_object.vptr != good_vptr && s_records.IndexOfCopy(reinterpret_cast<uintptr_t>(page_object.vptr)) !=
+          vtable_copy::kNoRecord && page_object.vptr[30] == good_vptr[30] && page_object.vptr[40] == good_vptr[40] &&
+          page_object.vptr[-1] == good_vptr[-1], "a vtable with exactly 41 readable slots, all in modules, installs verbatim");
+    VSync_OnNativeDestroyed(reinterpret_cast<uint64_t>(&page_object));
+    Check(page_object.vptr == good_vptr, "destroy restores it");
+
+    // A copy goes only over a class vtable: a vptr in private memory (the real residency check) is refused.
+    s_vptr_in_module = &IsModuleAddress;
+    page_object.vptr = good_vptr;
+    const uint32_t failures_private = s_vtable_failures.load();
+    VSync_OnNativeSelected(reinterpret_cast<uint64_t>(&page_object));
+    Check(page_object.vptr == good_vptr && s_vtable_failures.load() == failures_private + 1 && LastLogHas("private memory"),
+          "a vptr in private memory is never copied over");
+    VSync_OnNativeDestroyed(reinterpret_cast<uint64_t>(&page_object));
+    s_vptr_in_module = AcceptAllVptrs;
+
+    // Fewer than the 41 slots of IDXGISwapChain4 are readable: the read stops at the guard page WITHOUT touching it
+    // (the guard stays set), and nothing is installed.
+    void** const short_vptr = VtableBeforeGuardPage(vtable_copy::kRequiredSlots - 1, PAGE_READWRITE | PAGE_GUARD);
+    short_vptr[8] = reinterpret_cast<void*>(&VtPresent);
+    short_vptr[22] = reinterpret_cast<void*>(&VtPresent1);
+    page_object.vptr = short_vptr;
+    const uint32_t failures_short = s_vtable_failures.load();
+    VSync_OnNativeSelected(reinterpret_cast<uint64_t>(&page_object));
+    MEMORY_BASIC_INFORMATION guard_info{};
+    Check(VirtualQuery(s_last_guard_page, &guard_info, sizeof(guard_info)) == sizeof(guard_info) &&
+          (guard_info.Protect & PAGE_GUARD) != 0, "the guard page was not touched: its guard is still set");
+    Check(page_object.vptr == short_vptr && s_vtable_failures.load() == failures_short + 1,
+          "a vtable with fewer than 41 readable slots is left alone and refused");
+    VSync_OnNativeDestroyed(reinterpret_cast<uint64_t>(&page_object));
+
+    // A foreign vptr over ours when the binding is dropped, with NO present event in between (a resize's destroy and
+    // init): destroy remembers it before forgetting the binding, so the selection leaves it; teardown does the same.
+    static void* race_storage[2][1 + kVtSlots];
+    void** race_vptr[2];
+    for (int k = 0; k < 2; ++k) {
+        race_storage[k][0] = reinterpret_cast<void*>(&object);
+        for (size_t i = 0; i < kVtSlots; ++i) race_storage[k][1 + i] = reinterpret_cast<void*>(&VtSlot);
+        race_storage[k][1 + 8] = reinterpret_cast<void*>(&ForeignPresent);
+        race_storage[k][1 + 22] = reinterpret_cast<void*>(&VtPresent1);
+        race_vptr[k] = race_storage[k] + 1;
+    }
+    static FakeObject race_object;
+    race_object.vptr = original_vptr;
+    VSync_OnNativeSelected(reinterpret_cast<uint64_t>(&race_object));
+    Check(race_object.vptr != original_vptr, "the race object has our copy");
+    race_object.vptr = race_vptr[0]; // another module replaces it; no present event observes that
+    Check(!s_history.IsForeign(reinterpret_cast<uintptr_t>(race_vptr[0])), "not remembered yet");
+    VSync_OnNativeDestroyed(reinterpret_cast<uint64_t>(&race_object));
+    Check(race_object.vptr == race_vptr[0] && s_history.IsForeign(reinterpret_cast<uintptr_t>(race_vptr[0])),
+          "destroy remembers the foreign vptr before the binding is cleared");
+    s_vtable_failures.store(0);
+    VSync_OnNativeSelected(reinterpret_cast<uint64_t>(&race_object));
+    Check(race_object.vptr == race_vptr[0] && s_vtable_failures.load() == 1 && LastLogHas("foreign vtable"),
+          "the init of the same object leaves the foreign vptr: no copy over it");
+    VSync_OnNativeDestroyed(reinterpret_cast<uint64_t>(&race_object));
+    race_object.vptr = original_vptr;
+    VSync_OnNativeSelected(reinterpret_cast<uint64_t>(&race_object));
+    race_object.vptr = race_vptr[1];
+    VSync_RestoreVtables(); // teardown drops the binding too
+    Check(race_object.vptr == race_vptr[1] && s_history.IsForeign(reinterpret_cast<uintptr_t>(race_vptr[1])),
+          "teardown remembers a foreign vptr before dropping the binding");
+
+    // Every binding holds a live copy: a ninth object is refused (no live binding is forgotten, since a foreign
+    // replacement of that object would then look like an unseen vtable) until one of them is destroyed.
+    static FakeObject live[8];
+    for (FakeObject& o : live) {
+        o.vptr = original_vptr;
+        VSync_OnNativeSelected(reinterpret_cast<uint64_t>(&o));
+        Check(o.vptr != original_vptr, "eight objects hold live copies");
+    }
+    static FakeObject ninth;
+    ninth.vptr = original_vptr;
+    s_vtable_failures.store(0);
+    VSync_OnNativeSelected(reinterpret_cast<uint64_t>(&ninth));
+    Check(ninth.vptr == original_vptr && s_vtable_failures.load() == 1 && LastLogHas("bindings are taken"),
+          "with every binding taken a new object is refused, not evicting one");
+    Check(live[0].vptr != original_vptr && s_records.IndexOfCopy(reinterpret_cast<uintptr_t>(live[0].vptr)) != vtable_copy::kNoRecord,
+          "the first object keeps its binding and its copy");
+    // A binding whose object's vptr an overlay changed is NOT evicted either (no guess that its copy is gone):
+    // the ninth stays refused, and the foreign vptr is remembered when that object's destroy drops the binding.
+    static void* overlay_storage[1 + kVtSlots];
+    overlay_storage[0] = reinterpret_cast<void*>(&object);
+    for (size_t i = 0; i < kVtSlots; ++i) overlay_storage[1 + i] = reinterpret_cast<void*>(&VtSlot);
+    overlay_storage[1 + 8] = reinterpret_cast<void*>(&ForeignPresent);
+    overlay_storage[1 + 22] = reinterpret_cast<void*>(&VtPresent1);
+    void** const overlay_vptr = overlay_storage + 1;
+    void** const live1_copy = live[1].vptr;
+    live[1].vptr = overlay_vptr;
+    VSync_OnNativeSelected(reinterpret_cast<uint64_t>(&ninth));
+    Check(ninth.vptr == original_vptr && live[1].vptr == overlay_vptr,
+          "a binding whose vptr was changed by an overlay is not evicted: the ninth is still refused");
+    VSync_OnNativeDestroyed(reinterpret_cast<uint64_t>(&live[1]));
+    Check(live[1].vptr == overlay_vptr && s_history.IsForeign(reinterpret_cast<uintptr_t>(overlay_vptr)),
+          "destroy of that object remembers the overlay's vptr");
+    live[1].vptr = live1_copy; // keep the object consistent for the cleanup below
+    VSync_OnNativeDestroyed(reinterpret_cast<uint64_t>(&live[0]));
+    VSync_OnNativeSelected(reinterpret_cast<uint64_t>(&ninth));
+    Check(ninth.vptr != original_vptr, "a destroyed object frees a binding for the next one");
+    for (FakeObject& o : live) VSync_OnNativeDestroyed(reinterpret_cast<uint64_t>(&o));
+    VSync_OnNativeDestroyed(reinterpret_cast<uint64_t>(&ninth));
+
+    // History full: nothing NEW is installed (and it is logged); a vptr already in the history still is.
+    s_vptr_in_module = &IsModuleAddress;
+    for (uintptr_t v = 0x1000; !s_history.Full(); v += 8) s_history.Note(v, vtable_copy::VptrHistory::Kind::Replaced);
+    static void* fresh_storage[1 + kVtSlots];
+    fresh_storage[0] = reinterpret_cast<void*>(&object);
+    for (size_t i = 0; i < kVtSlots; ++i) fresh_storage[1 + i] = reinterpret_cast<void*>(&VtSlot);
+    fresh_storage[1 + 8] = reinterpret_cast<void*>(&VtPresent);
+    fresh_storage[1 + 22] = reinterpret_cast<void*>(&VtPresent1);
+    static FakeObject fresh_object;
+    fresh_object.vptr = fresh_storage + 1;
+    s_vtable_failures.store(0);
+    VSync_OnNativeSelected(reinterpret_cast<uint64_t>(&fresh_object));
+    Check(fresh_object.vptr == fresh_storage + 1 && s_vtable_failures.load() == 1 && LastLogHas("history is full"),
+          "with the vptr history full a new vptr is not installed over");
+    VSync_OnNativeDestroyed(reinterpret_cast<uint64_t>(&fresh_object));
+    object.vptr = original_vptr; // already in the history: still installs
+    VSync_OnNativeSelected(object_handle);
+    Check(object.vptr != original_vptr && s_records.IndexOfCopy(reinterpret_cast<uintptr_t>(object.vptr)) == first,
+          "a vptr already in the history is still installed over");
+    VSync_OnNativeDestroyed(object_handle);
+    const auto handle_of = [](const void* o) { return reinterpret_cast<uint64_t>(o); };
+    const auto bindings_of = [&](const void* o) {
+        size_t n = 0;
+        for (const VtableBinding& b : s_bindings) if (b.object == reinterpret_cast<uintptr_t>(o)) ++n;
+        return n;
+    };
+
+    // Provenance: an overlay's temporary restore of the original vptr does not erase the installed copy's identity
+    // (a refused reinstall keeps it), so when the overlay puts our saved copy back, destroy still restores it.
+    static FakeObject prov;
+    prov.vptr = original_vptr;
+    VSync_OnNativeSelected(handle_of(&prov));
+    void** const prov_copy = prov.vptr;
+    Check(prov_copy != original_vptr && s_records.IndexOfCopy(reinterpret_cast<uintptr_t>(prov_copy)) != vtable_copy::kNoRecord,
+          "the provenance object has our copy");
+    s_vptr_in_module = RejectAllVptrs; // the reinstall is refused: nothing but the binding remembers the copy
+    prov.vptr = original_vptr;         // the overlay restores the original
+    VSync_ObserveNativeVptr(handle_of(&prov));
+    Check(prov.vptr == original_vptr, "a refused reinstall leaves the original vptr");
+    s_vptr_in_module = &IsModuleAddress;
+    prov.vptr = prov_copy;             // the overlay restores our saved copy
+    VSync_ObserveNativeVptr(handle_of(&prov));
+    VSync_OnNativeDestroyed(handle_of(&prov));
+    Check(prov.vptr == original_vptr, "destroy restores the copy whose identity survived the overlay's restore");
+
+    // Admission is checked under the vtable lock in both entry points: a callback paused past a stopping check
+    // cannot install after the teardown's restoration.
+    static FakeObject stopping;
+    stopping.vptr = original_vptr;
+    s_test_stopping = true;
+    VSync_OnNativeSelected(handle_of(&stopping));
+    VSync_ObserveNativeVptr(handle_of(&stopping));
+    s_test_stopping = false;
+    Check(stopping.vptr == original_vptr && bindings_of(&stopping) == 0, "nothing installs or binds while stopping");
+    VSync_ObserveNativeVptr(handle_of(&stopping));
+    Check(stopping.vptr != original_vptr, "the same present event installs once the addon runs");
+    VSync_OnNativeDestroyed(handle_of(&stopping));
+
+    // An unbound object that already shows one of our copies is adopted, never copied again.
+    static FakeObject adopted;
+    adopted.vptr = prov_copy;
+    const size_t records_adopt = s_records.Size();
+    const uint32_t adopted_before = s_vtable_adopted.load();
+    VSync_ObserveNativeVptr(handle_of(&adopted));
+    Check(adopted.vptr == prov_copy && s_records.Size() == records_adopt && s_vtable_adopted.load() == adopted_before + 1 &&
+          bindings_of(&adopted) == 1, "an unbound object showing our copy is adopted, not copied");
+    VSync_OnNativeDestroyed(handle_of(&adopted));
+    Check(adopted.vptr == original_vptr, "its destroy restores the original the record names");
+    adopted.vptr = prov_copy;
+    VSync_OnNativeSelected(handle_of(&adopted));
+    Check(adopted.vptr == prov_copy && s_records.Size() == records_adopt, "selection adopts as well");
+    VSync_OnNativeDestroyed(handle_of(&adopted));
+
+    // A lost destroy: the next selection or present of the same address is judged by the same rule on the SAME binding.
+    static FakeObject lost;
+    lost.vptr = original_vptr;
+    VSync_OnNativeSelected(handle_of(&lost));
+    void** const lost_copy = lost.vptr;
+    Check(lost_copy != original_vptr && bindings_of(&lost) == 1, "the lost-destroy object has a binding and our copy");
+    lost.vptr = original_vptr; // no destroy: a new object lives at this address with the class vtable
+    const size_t records_lost = s_records.Size();
+    VSync_OnNativeSelected(handle_of(&lost));
+    Check(lost.vptr == lost_copy && bindings_of(&lost) == 1 && s_records.Size() == records_lost,
+          "a selection of the same address installs again on the same binding (one binding, one copy)");
+    lost.vptr = original_vptr;
+    VSync_ObserveNativeVptr(handle_of(&lost));
+    Check(lost.vptr == lost_copy && bindings_of(&lost) == 1, "a present event does the same");
+    lost.vptr = lost_copy; // our copy there: kept
+    VSync_OnNativeSelected(handle_of(&lost));
+    VSync_ObserveNativeVptr(handle_of(&lost));
+    Check(lost.vptr == lost_copy && bindings_of(&lost) == 1 && s_records.Size() == records_lost, "our copy there is kept");
+    lost.vptr = foreign_vptr; // anything else: the usual foreign rules, still one binding
+    VSync_OnNativeSelected(handle_of(&lost));
+    Check(lost.vptr == foreign_vptr && bindings_of(&lost) == 1 && s_history.IsForeign(reinterpret_cast<uintptr_t>(foreign_vptr)),
+          "another vtable over a lost binding is left alone and remembered");
+    VSync_OnNativeDestroyed(handle_of(&lost));
+
+    // ── The inline pair: not installed where the vtable entry carries the route ──
+    static FakeObject carried;
+    carried.vptr = original_vptr;
+    VSync_OnNativeSelected(handle_of(&carried));
+    Check(carried.vptr != original_vptr, "the carried object has our copy");
+    // Free two typed slots: earlier tests filled the table.
+    s_present_targets[14].target.store(nullptr); s_present_targets[14].enabled = false;
+    s_present_targets[13].target.store(nullptr); s_present_targets[13].enabled = false;
+    const auto typed_has = [&](void* target) {
+        for (const auto& e : s_present_targets) if (e.target.load() == target) return true;
+        for (const auto& e : s_present1_targets) if (e.target.load() == target) return true;
+        return false;
+    };
+    VSync_InstallDXGIHooksImpl(&carried);
+    Check(!typed_has(reinterpret_cast<void*>(&VtPresent)) && !typed_has(reinterpret_cast<void*>(&VtPresent1)),
+          "with the copy installed no inline hook is created for Present or Present1");
+    DescribeWatch("Present", 0, text, sizeof(text));
+    Check(std::strstr(text, "not installed because the vtable entry carries the route") != nullptr &&
+          std::strstr(text, "never installed by us") == nullptr, "the diagnostics call it a normal state");
+    DescribeVtableRoute(handle_of(&carried), text_route, sizeof(text_route));
+    Check(std::strstr(text_route, "inline pair: not installed, the vtable entry carries the route") != nullptr,
+          "the vtable route line says so");
+
+    // The copy refused (a vptr in private memory under the real residency check): the pair is installed as before.
+    static FakeObject refused;
+    void** const refused_vptr = VtableBeforeGuardPage(vtable_copy::kRequiredSlots);
+    refused_vptr[8] = reinterpret_cast<void*>(&VtPresentAlt);
+    refused_vptr[22] = reinterpret_cast<void*>(&VtPresent1);
+    refused.vptr = refused_vptr;
+    VSync_OnNativeSelected(handle_of(&refused));
+    Check(refused.vptr == refused_vptr, "the copy is refused over a private-memory vptr");
+    VSync_InstallDXGIHooksImpl(&refused);
+    Check(typed_has(reinterpret_cast<void*>(&VtPresentAlt)) && TypedTargetEnabled(s_present_targets, reinterpret_cast<void*>(&VtPresentAlt)),
+          "a refused copy installs the inline Present hook (one batch)");
+    VSync_OnNativeDestroyed(handle_of(&refused));
+
+    // The fallback counter: 31 scopes without a vtable entry install nothing; an entry resets the run; a new copy
+    // (a new generation) resets it; the 32nd consecutive scope installs the pair once, through one batch.
+    s_native_handle_override = handle_of(&carried); // the swap manager's selection
+    VSync_OnNativeSelected(handle_of(&carried));    // selected again after the refused one: the fallback's identity is this object's
+    s_selected_vtable_entries.fetch_add(1);
+    VSync_NoteFinishedPresent(handle_of(&carried)); // syncs the entry count
+    for (int i = 0; i < 31; ++i) VSync_NoteFinishedPresent(handle_of(&carried));
+    Check(!s_fallback.Fired() && s_fallback.Count() == 31 && !typed_has(reinterpret_cast<void*>(&VtPresent)),
+          "31 scopes without a vtable entry install nothing");
+
+    // Another object never counts for, or resets, the selected object's run; finishes of other swapchains do not count;
+    // selecting an object again (its existing copy kept: no install, no adoption) refreshes the fallback's identity.
+    static FakeObject bob;
+    bob.vptr = original_vptr;
+    const uint32_t generation_before = s_route_generation.load();
+    s_native_handle_override = handle_of(&bob);
+    VSync_OnNativeSelected(handle_of(&bob));
+    Check(s_route_object.load() == handle_of(&bob) && s_fallback.Count() == 0 && s_route_generation.load() != generation_before,
+          "selecting another object hands the fallback's identity over and starts its run");
+    const uint64_t selected_entries = s_selected_vtable_entries.load(), all_entries = s_vtable_entries.load();
+    reinterpret_cast<PFN_Present>(carried.vptr[8])(reinterpret_cast<IDXGISwapChain*>(&carried), 3, 4); // an unselected object's entry
+    Check(s_vtable_entries.load() == all_entries + 1 && s_selected_vtable_entries.load() == selected_entries,
+          "an entry on an object that is not selected counts in the diagnostics only");
+    for (int i = 0; i < 40; ++i) VSync_NoteFinishedPresent(handle_of(&carried));
+    Check(!s_fallback.Fired() && s_fallback.Count() == 0, "finishes of an unselected swapchain neither count nor consume the one-shot");
+    const size_t records_reselect = s_records.Size();
+    const uint32_t generation_bob = s_route_generation.load();
+    s_native_handle_override = handle_of(&carried);
+    VSync_OnNativeSelected(handle_of(&carried)); // existing binding, copy kept
+    Check(s_route_object.load() == handle_of(&carried) && s_route_generation.load() != generation_bob &&
+          s_fallback.Count() == 0 && s_records.Size() == records_reselect && carried.vptr != original_vptr,
+          "selecting an object whose copy is kept publishes its identity again");
+    for (int i = 0; i < 10; ++i) VSync_NoteFinishedPresent(handle_of(&carried));
+    const uint64_t selected_before_bob = s_selected_vtable_entries.load();
+    reinterpret_cast<PFN_Present>(bob.vptr[8])(reinterpret_cast<IDXGISwapChain*>(&bob), 3, 4); // bob is not selected now
+    Check(s_selected_vtable_entries.load() == selected_before_bob, "the other object's entry is not selected-object evidence");
+    VSync_NoteFinishedPresent(handle_of(&carried));
+    Check(s_fallback.Count() == 11 && !s_fallback.Fired(), "and it does not reset the selected object's run");
+    VSync_OnNativeDestroyed(handle_of(&bob));
+    reinterpret_cast<PFN_Present>(carried.vptr[8])(reinterpret_cast<IDXGISwapChain*>(&carried), 3, 4); // a vtable entry runs
+    VSync_NoteFinishedPresent(handle_of(&carried));
+    Check(!s_fallback.Fired() && s_fallback.Count() == 0, "a scope with a vtable entry resets the run");
+    for (int i = 0; i < 20; ++i) VSync_NoteFinishedPresent(handle_of(&carried));
+    VSync_OnNativeDestroyed(handle_of(&carried));
+    carried.vptr = original_vptr;
+    VSync_OnNativeSelected(handle_of(&carried)); // a new copy install: a new generation
+    Check(s_fallback.Count() == 0 && !s_fallback.Fired(), "a new copy install starts the run again");
+    for (int i = 0; i < 31; ++i) VSync_NoteFinishedPresent(handle_of(&carried));
+    Check(!s_fallback.Fired() && !typed_has(reinterpret_cast<void*>(&VtPresent)), "31 scopes of the new generation install nothing");
+    VSync_NoteFinishedPresent(handle_of(&carried));
+    Check(s_fallback.Fired() && typed_has(reinterpret_cast<void*>(&VtPresent)) && typed_has(reinterpret_cast<void*>(&VtPresent1)) &&
+          TypedTargetEnabled(s_present_targets, reinterpret_cast<void*>(&VtPresent)) &&
+          TypedTargetEnabled(s_present1_targets, reinterpret_cast<void*>(&VtPresent1)),
+          "the 32nd scope installs the inline Present / Present1 pair");
+    size_t typed_count = 0;
+    for (const auto& e : s_present_targets) if (e.target.load()) ++typed_count;
+    for (int i = 0; i < 64; ++i) VSync_NoteFinishedPresent(handle_of(&carried));
+    size_t typed_count_after = 0;
+    for (const auto& e : s_present_targets) if (e.target.load()) ++typed_count_after;
+    Check(typed_count == typed_count_after, "the pair is installed once, never again");
+    DescribeVtableRoute(handle_of(&carried), text_route, sizeof(text_route));
+    Check(std::strstr(text_route, "installed by the fallback") != nullptr, "the route line reports the fallback");
+    VSync_OnNativeDestroyed(handle_of(&carried));
+    s_native_handle_override = 0;
+    s_present_targets[0].original = present_original;
+}
+
+// A structured exception that leaves the Present body and is caught by a caller (here the retry path's
+// GetDesc raises): the detour's SEH __finally unlinks the dedup node, so the thread's list does not point at a dead
+// frame and the next detour for the same object is an outermost entry again.
+HRESULT STDMETHODCALLTYPE ReturnInvalidCall(IDXGISwapChain*, UINT, UINT) { return DXGI_ERROR_INVALID_CALL; }
+HRESULT STDMETHODCALLTYPE RaisingGetDesc(void*, DXGI_SWAP_CHAIN_DESC*) {
+    RaiseException(0xE0000042u, 0, 0, nullptr);
+    return 0;
+}
+bool CallPresentCatching(IDXGISwapChain* self) {
+    __try {
+        s_present_thunks[0](self, 3, 4);
+        return false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return true;
+    }
+}
+void TestDedupSehUnwind() {
+    static void* storage[1 + kVtSlots];
+    for (size_t i = 0; i < kVtSlots; ++i) storage[1 + i] = reinterpret_cast<void*>(&VtSlot);
+    storage[1 + 12] = reinterpret_cast<void*>(&RaisingGetDesc); // IDXGISwapChain::GetDesc
+    struct SehObject { void** vptr; };
+    static SehObject object;
+    object.vptr = storage + 1;
+    auto* self = reinterpret_cast<IDXGISwapChain*>(&object);
+    const auto saved_original = s_present_targets[0].original.load();
+    const int saved_mode = s_vsync_mode.load();
+    s_native_handle_override = reinterpret_cast<uint64_t>(&object); // the body runs: this is the selected swapchain
+    s_vsync_mode.store(1);                                           // VSync off: ALLOW_TEARING is added ...
+    s_present_targets[0].original = ReturnInvalidCall;                // ... and rejected: the retry path calls GetDesc
+    Check(CallPresentCatching(self), "the structured exception reaches the caller's handler");
+    Check(!t_dedup.Contains(reinterpret_cast<uintptr_t>(&object)) && t_dedup.Depth() == 0,
+          "the dedup node was unlinked during the unwind: no dead frame left in the thread's list");
+    s_vsync_mode.store(0);
+    s_present_targets[0].original = InlineProbeOriginal;
+    const uint64_t inner_before = EntryCount(NativeGateEntry::InnerPassThrough);
+    Check(s_present_thunks[0](self, 3, 4) == 7 && EntryCount(NativeGateEntry::InnerPassThrough) == inner_before,
+          "the next detour for the same object is an outermost entry, not a pass-through");
+    s_native_handle_override = 0;
+    s_vsync_mode.store(saved_mode);
+    s_present_targets[0].original = saved_original;
+}
+
+// Teardown: the DXGI Present / Present1 inline patches are never disabled; every other hook is.
+// The FF 25 jump of a hook chain decodes per architecture: x64 rip-relative to an 8-byte target, Win32 an absolute
+// address of a 4-byte target (the diagnostics' DecodeJump picks by pointer size; both forms are tested here).
+void TestDecodeJumpPerArchitecture() {
+    alignas(8) uint8_t block[64]{};
+    const uint64_t target64 = 0x1122334455667788ull;
+    std::memcpy(block + 32, &target64, 8);
+    uint8_t code[16]{0xFF, 0x25};
+    const int32_t disp = 32 - 6; // rip-relative to the next instruction (jump at block[0], 6 bytes long)
+    std::memcpy(code + 2, &disp, 4);
+    uint64_t next = 0;
+    Check(DecodeJumpFor(true, code, reinterpret_cast<uint64_t>(block), &next) && next == target64,
+          "x64 FF 25 is rip-relative to an 8-byte target");
+
+    // Relative targets wrap to 32 bits on Win32 (address + length + displacement mod 2^32), not on x64.
+    uint8_t wrap_e9[16]{0xE9, 0x00, 0x00, 0x00, 0x10}; // +0x10000000
+    Check(DecodeJumpFor(false, wrap_e9, 0xF8000000ull, &next) && next == 0x08000005ull &&
+          DecodeJumpFor(true, wrap_e9, 0xF8000000ull, &next) && next == 0x108000005ull,
+          "E9 wraps to 32 bits on Win32 only");
+    uint8_t wrap_eb[16]{0xEB, 0x7F};
+    Check(DecodeJumpFor(false, wrap_eb, 0xFFFFFFF0ull, &next) && next == 0x71ull &&
+          DecodeJumpFor(true, wrap_eb, 0xFFFFFFF0ull, &next) && next == 0x100000071ull,
+          "EB wraps to 32 bits on Win32 only");
+    uint8_t back_eb[16]{0xEB, 0x80}; // -128 from 0x10 + 2
+    Check(DecodeJumpFor(false, back_eb, 0x10ull, &next) && next == 0xFFFFFF92ull &&
+          DecodeJumpFor(true, back_eb, 0x10ull, &next) && next == 0xFFFFFFFFFFFFFF92ull,
+          "a backward EB below zero wraps to 32 bits on Win32 only");
+    uint8_t back_e9[16]{0xE9, 0xF0, 0xFF, 0xFF, 0xFF}; // -16 from 0x100 + 5
+    Check(DecodeJumpFor(false, back_e9, 0x100ull, &next) && next == 0xF5ull &&
+          DecodeJumpFor(true, back_e9, 0x100ull, &next) && next == 0xF5ull, "a backward E9 inside the space is alike");
+
+    // Win32 form: the operand is the ABSOLUTE address of a 4-byte cell (below 4 GB).
+    unsigned char* low = static_cast<unsigned char*>(VirtualAlloc(
+        sizeof(void*) == 4 ? nullptr : reinterpret_cast<void*>(0x30000000), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (low && reinterpret_cast<uintptr_t>(low) <= 0xFFFFFFFFull - 64) {
+        const uint32_t cell_target = 0x00ABCDEFu;
+        std::memcpy(low + 16, &cell_target, 4);
+        uint8_t code32[16]{0xFF, 0x25};
+        const uint32_t cell_address = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(low + 16));
+        std::memcpy(code32 + 2, &cell_address, 4);
+        next = 0;
+        Check(DecodeJumpFor(false, code32, 0x1234, &next) && next == cell_target,
+              "Win32 FF 25 is an absolute address of a 4-byte target, not rip-relative");
+        // The 64-bit-only forms are not decoded as Win32 jumps.
+        uint8_t mov_rax[16]{0x48, 0xB8, 1, 2, 3, 4, 5, 6, 7, 8, 0xFF, 0xE0};
+        Check(!DecodeJumpFor(false, mov_rax, 0x1234, &next) && DecodeJumpFor(true, mov_rax, 0x1234, &next),
+              "mov rax + jmp rax is an x64 form only");
+        // E9 is the same on both.
+        uint8_t rel[16]{0xE9, 0x10, 0, 0, 0};
+        Check(DecodeJumpFor(false, rel, 0x1000, &next) && next == 0x1015 && DecodeJumpFor(true, rel, 0x1000, &next) && next == 0x1015,
+              "E9 rel32 decodes alike");
+    }
+}
+
+void TestTeardownLeavesDxgiHooksEnabled() {
+    // Installer admission is closed before the list is collected: a typed hook cannot be added after it.
+    Hooks_BeginShutdown();
+    bool already = false;
+    Check(InstallTypedHook(s_present_targets, reinterpret_cast<void*>(&VtSlot), s_present_thunks, &already) == MH_ERROR_DISABLED,
+          "after the admission closes no typed hook can be installed, so the collected list is complete");
+    void* keep[32];
+    const size_t kept = VSync_InlineTargetsLeftEnabled(keep, 32);
+    size_t typed = 0;
+    for (const auto& entry : s_present_targets) if (entry.target.load() && entry.enabled) ++typed;
+    for (const auto& entry : s_present1_targets) if (entry.target.load() && entry.enabled) ++typed;
+    Check(kept == typed && kept >= 2, "every enabled typed DXGI target is listed to stay enabled");
+    Check(DisableAllHooksExcept(keep, kept) == MH_OK, "disable except the DXGI targets");
+    bool others_disabled = true, others_exist = false;
+    size_t typed_enabled = 0;
+    for (const FakeHook& hook : s_fake_hooks) {
+        if (!hook.target) continue;
+        bool is_typed = false;
+        for (size_t i = 0; i < kept; ++i) is_typed = is_typed || keep[i] == hook.target;
+        if (is_typed) { if (hook.enabled) ++typed_enabled; }
+        else { others_exist = true; if (hook.enabled) others_disabled = false; }
+    }
+    Check(typed_enabled == kept, "the DXGI Present / Present1 inline patches are not disabled (no bytes written back)");
+    Check(others_exist && others_disabled, "every other hook is disabled as before");
+}
+
 void TestLoaderNotifications() {
     HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     Check(event != nullptr, "create notification event");
@@ -420,7 +1120,6 @@ void TestLoaderNotifications() {
 
 // Boundary fakes, not copied installation/forwarding implementations.
 Config g_config{};
-static thread_local char s_last_test_log[2048]{};
 void Log_Write(LogLevel, const char* format, ...) {
       va_list arguments;
       va_start(arguments, format);
@@ -446,7 +1145,8 @@ bool FrameTimeline_BeginPresentAttempt(
       span->capture_epoch=s_capture_native?1:0;return s_capture_native || runtime;
 }
 uint64_t FrameTimeline_GetPresentSwapchainGeneration(uint64_t) noexcept { return 1; }
-uint64_t SwapMgr_GetNativeHandle() { return 0x1000; }
+uint64_t FrameTimeline_PresentGenerationLockFailures() noexcept { return 0; }
+uint64_t SwapMgr_GetNativeHandle() { return s_native_handle_override ? s_native_handle_override : 0x1000; }
 NativeGateContext NativeGate_GetContext(int64_t now) noexcept { auto c = s_native_context; c.now_qpc = now; return c; }
 void NativeGate_Execute(NativeGateCall* call, uint64_t) noexcept {
       if (call->trace.status != NativeGateStatus::Native) return;
@@ -477,6 +1177,7 @@ extern "C" MH_STATUS WINAPI MH_CreateHook(void* target, void*, void** original) 
     }
     return MH_OK;
 }
+extern "C" const char* WINAPI MH_StatusToString(MH_STATUS) { return "stub"; }
 extern "C" MH_STATUS WINAPI MH_EnableHook(void* target) {
     if (s_enable_entered) SetEvent(s_enable_entered);
     std::lock_guard<std::mutex> lock(s_fake_mutex);
@@ -501,6 +1202,25 @@ extern "C" MH_STATUS WINAPI MH_RemoveHook(void*) {
     s_remove_calls.fetch_add(1);
     return MH_OK;
 }
+extern "C" MH_STATUS WINAPI MH_Initialize(VOID) { return MH_OK; }
+extern "C" MH_STATUS WINAPI MH_QueueDisableHook(void* target) {
+    std::lock_guard<std::mutex> lock(s_fake_mutex);
+    for (FakeHook& hook : s_fake_hooks)
+        if (!target || hook.target == target) hook.queued_enable = false;
+    return MH_OK;
+}
+extern "C" MH_STATUS WINAPI MH_QueueEnableHook(void* target) {
+    std::lock_guard<std::mutex> lock(s_fake_mutex);
+    for (FakeHook& hook : s_fake_hooks)
+        if (!target || hook.target == target) hook.queued_enable = true;
+    return MH_OK;
+}
+extern "C" MH_STATUS WINAPI MH_ApplyQueued(VOID) {
+    std::lock_guard<std::mutex> lock(s_fake_mutex);
+    for (FakeHook& hook : s_fake_hooks)
+        if (hook.target) hook.enabled = hook.queued_enable;
+    return MH_OK;
+}
 
 int main() {
       NativeGate_SetMode(NativeGateMode::Shadow);
@@ -518,7 +1238,11 @@ int main() {
     TestRetainedEnableFailure();
     TestExactTargetThunks();
       TestNativeGateHookPlacement();
+      TestVtableCopyEntry();
       TestLoaderNotifications();
+      TestDecodeJumpPerArchitecture();
+      TestTeardownLeavesDxgiHooksEnabled();
+      TestDedupSehUnwind();
     Hooks_BeginShutdown();
     static std::atomic<TestFunction> original{nullptr};
     Check(InstallHook(reinterpret_cast<void*>(&Target<6>),

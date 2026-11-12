@@ -49,6 +49,29 @@ constexpr size_t LEAD_DIVISOR_BUCKETS = 4;         // FG divisor 1..4
 constexpr size_t LEAD_PENDING_CAPACITY = 32;       // frames being assembled, by grid index
 constexpr uint64_t LEAD_PENDING_EXPIRY_FRAMES = 8; // frames this far behind the newest release close
 constexpr uint64_t LEAD_PENDING_AHEAD_FRAMES = 8;  // events accepted this far ahead of it
+// Saturation rule (SetQueueWaitMode; unified pacer only): the ONE lifetime
+// bound of a deferred lead sample. The sample of a GPU-rung frame waits for
+// the law's z_used, which the law accepts while its ring entry exists and
+// the frame is within its 32-frame window (kUnifiedExpireAge,
+// unified_pacer.h; mirrored here, the lead has no law dependency). The frame
+// and the predecessor inputs its sample reads must stay in the 32-slot
+// pending table that long: events open slots LEAD_PENDING_AHEAD_FRAMES ahead
+// of the newest release, so frame m's slot is safe through newest − m <=
+// 32 − 8 − 1 = 23 and its predecessor's (reused one index earlier) through
+// 22, the last distance the frame may be kept. Bound = min(32, LEAD_PENDING_CAPACITY
+// − LEAD_PENDING_AHEAD_FRAMES − 2) = 22: a z_used delivered up to that many
+// releases after the frame's own release feeds it, a later one feeds
+// nothing. The 8-frame expiry above is unchanged with the rule off and for
+// every frame that is not deferred.
+constexpr uint64_t LEAD_QUEUE_WAIT_LAW_WINDOW_FRAMES = 32;
+constexpr uint64_t LEAD_QUEUE_WAIT_TABLE_FRAMES =
+    LEAD_PENDING_CAPACITY - LEAD_PENDING_AHEAD_FRAMES - 2;
+constexpr uint64_t LEAD_QUEUE_WAIT_LIFETIME_FRAMES =
+    LEAD_QUEUE_WAIT_LAW_WINDOW_FRAMES < LEAD_QUEUE_WAIT_TABLE_FRAMES ? LEAD_QUEUE_WAIT_LAW_WINDOW_FRAMES
+                                                                      : LEAD_QUEUE_WAIT_TABLE_FRAMES;
+static_assert(LEAD_QUEUE_WAIT_LIFETIME_FRAMES + 2 + LEAD_PENDING_AHEAD_FRAMES <= LEAD_PENDING_CAPACITY &&
+        LEAD_QUEUE_WAIT_LIFETIME_FRAMES > LEAD_PENDING_EXPIRY_FRAMES,
+    "a deferred frame and its predecessor must outlive the 8-frame expiry yet fit the pending table");
 constexpr size_t LEAD_RESUME_DELAY_CAPACITY = 128; // recent probe-measured u − o observations
 constexpr size_t LEAD_RESUME_MEDIAN_SAMPLES = 32;  // newest u − o in the median (decontamination fallback)
 // A waited u − o above this is a late GPU resume: measured and shown (OSD,
@@ -720,6 +743,25 @@ struct LeadFrameStart {
     int64_t wait_end_qpc = 0;
     int64_t pre_wait_start_qpc = 0;
     int64_t pre_wait_end_qpc = 0;
+    // Lead anchor (unified pacer): B, the instant the lead is measured from
+    // (H = B + L); 0 none, and an anchor that is not earlier than s is
+    // ignored. s (source_release_qpc) keeps its physical meaning in every
+    // wait and stage-time check: the wait validation above, release → render,
+    // the gated hold, C and D, the behind-wait correction, the render queue,
+    // the spike arrival's coordinates and the render handoff. The slot stores
+    // delta = (s − B) in µs (>= 0; 0 without an anchor) and adds it only where
+    // a duration measured from s becomes a lead quantity, after the range
+    // checks: the lead window's sample (after the behind-wait correction and
+    // q), the GPU-paced cadence's early side (EarlyLeadUs), the slack, which
+    // becomes T − B − X (the existing slack plus delta), and the spike
+    // floor's binned arrival. A lead L then covers a readiness measured from
+    // B while every wait check still sees s. Without an anchor on every frame
+    // each result is unchanged.
+    int64_t lead_anchor_qpc = 0;
+    // The owner sets this together with lead_anchor_qpc, only in the unified
+    // pacer's branch: the lead anchor is applied only when it is true (the
+    // controller compares no anchor value otherwise).
+    bool anchored = false;
 };
 
 // Everything NextLeadUs needs from the plan being made and the resolved pipeline.
@@ -744,6 +786,15 @@ struct LeadRequest {
     // rung the overload guard or an A/B block demoted. The bucket's own
     // slew state is untouched; LeadGuardOutcome::demand_floored reports it.
     double demand_floor_us = 0.0;
+    // Lead anchor (above): the planned frame's own delta = (s − B) in µs, 0
+    // none (always 0 with the unified pacer off). L itself is learned from
+    // the slots' samples, which carry their own deltas; the one place the
+    // planned frame's delta is read is the collision guard (GPU queue wait
+    // rung), which limits the physical release → target distance H − R =
+    // L − delta: the limit is I + offset + delta, added only if this is
+    // positive, so the capped target is the same R-relative one for any
+    // anchor. Not validated or counted otherwise.
+    double anchor_offset_us = 0.0;
 };
 
 struct LeadBucketStatus {
@@ -872,6 +923,16 @@ struct LeadStatistics {
     uint64_t spike_excluded = 0;
     uint64_t spike_gpu_samples = 0;
     double last_spike_arrival_us = 0.0;
+    // Saturation rule (SetQueueWaitMode, below; unified pacer only): GPU-rung
+    // lead samples that waited for the law's z_used (deferred), were fed with
+    // it (queue_wait_samples; last_queue_wait_removed_us is the newest part
+    // removed after the predecessor wait SampleUs already took out), and
+    // frames dropped without a sample (the stream stopped being live before
+    // z_used, the frame expired without one, a mode change or reset).
+    uint64_t queue_wait_deferred = 0;
+    uint64_t queue_wait_samples = 0;
+    uint64_t queue_wait_dropped = 0;
+    double last_queue_wait_removed_us = 0.0;
 };
 
 // ── Sample window ──
@@ -1002,6 +1063,63 @@ public:
     // ignored.
     void OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, int64_t gpu_start_qpc,
         int64_t gpu_end_qpc, double present_to_gpu_end_us, int64_t render_done_qpc = 0) noexcept;
+    // Saturation rule (unified pacer only; the owner calls these with the key
+    // and never otherwise).
+    //
+    // Invariant: a hold may delay the next frame's GPU work only while the
+    // GPU has slack; it must never lower the GPU's throughput below the start
+    // rate. A GPU-rung lead sample contains the time the frame's work waited
+    // in the GPU queue, which the holds themselves create: a hold raises that
+    // wait, the wait raises the sample and so the lead, and a larger lead
+    // holds more (positive feedback). With the mode on the lead sample of
+    // frame n is today's sample minus z_used(n), the law's queue wait of the
+    // frame's report without the predecessor's hold (max(0, z_raw −
+    // hold(pred)); UnifiedPacer::PopUsedReport), anchored as ever (+ delta).
+    // A larger z then means fewer holds (negative feedback). With headroom
+    // z_used is about 0 and the lead is today's, one feed delay later.
+    //
+    // Liveness, the one rule (LeadSampleDefers): while the mode is on and the
+    // report stream is live (SetQueueWaitLive) at the moment a GPU-rung
+    // frame's sample would be emitted, it is deferred until OnQueueWaitUsed;
+    // with the stream not live at that moment it is fed as today, at
+    // readiness, unsubtracted. A deferred frame is dropped, feeding nothing,
+    // when the stream stops being live before its report arrives, or when no
+    // report came by LEAD_QUEUE_WAIT_LIFETIME_FRAMES (the ONE bound of a
+    // deferred frame, above; the 8-frame expiry no longer ends it). Each
+    // frame feeds at most once across transitions both ways. Rungs without a
+    // GPU wait (source only, CPU holds) are never deferred: their sample
+    // holds no GPU queue wait.
+    //
+    // No double subtraction: SampleUs already removed d (the frame's wait for
+    // frame n − 1 including its hold, predecessor_wait_us) behind the wait,
+    // and z_used is the part of the reported queue wait that is not the
+    // predecessor's hold, so only max(0, z_used − d) is removed. A mode
+    // change resets the deferral state (deferred frames are dropped, the
+    // stream counts as not live until SetQueueWaitLive says otherwise).
+    void SetQueueWaitMode(bool enabled) noexcept;
+    // The law's QueueWaitLive; a live → not live change drops every deferred
+    // frame (no sample).
+    void SetQueueWaitLive(bool live) noexcept;
+    // The law used the report of frame (key, grid_index): z_used_us (>= 0, the
+    // value the law stored). The key must equal the slot's key exactly; a
+    // missing, stale (already sampled or dropped), cross-epoch or unknown
+    // frame is ignored, never a raw sample. Feeds the deferred sample at
+    // once, or keeps z_used for a frame whose sample is still to come.
+    void OnQueueWaitUsed(const PacingPlanKey& key, uint64_t grid_index, double z_used_us) noexcept;
+    // The owner's ordered form (it applies a report that became used while
+    // it is still recording the stage events the sample reads): Register
+    // stores z_used under the same identity rules without emitting or
+    // finalizing anything and leaves a deferred frame deferred, and a stage
+    // event does not emit it either; FlushQueueWaitSamples then emits, in grid
+    // order, every frame whose z_used is registered and whose own fields and
+    // predecessor are resolved (TryFinalize), after the predecessor's
+    // readiness, resume and output were recorded: SampleUs then removes the
+    // predecessor wait d before z_used is applied. OnQueueWaitUsed is the
+    // direct form: Register, then emit that one frame at once.
+    void RegisterQueueWaitUsed(const PacingPlanKey& key, uint64_t grid_index, double z_used_us) noexcept;
+    void FlushQueueWaitSamples() noexcept;
+    bool QueueWaitMode() const noexcept { return queue_wait_mode_; }
+    bool QueueWaitLive() const noexcept { return queue_wait_live_; }
 
     LeadBucketStatus BucketStatus(PacingRung rung, double fg_divisor) const noexcept;
     // Spike floor (above): L_spike for a bucket, 0 where it does not apply
@@ -1162,6 +1280,9 @@ private:
         uint32_t floor_pull_us = 0;
         double guard_reduction_us = 0.0; // the collision guard's reduction of L
         bool guard_judged = false;       // a judged GPU queue wait lead: adds a hold-room sample
+        bool z_known = false;     // OnQueueWaitUsed arrived before the sample was emitted
+        bool z_deferred = false;  // the lead sample waits for z_used (saturation rule)
+        float z_used_us = 0.0f;   // the law's z_used of this frame (z_known); placed in the padding
         int64_t wait_start_qpc = 0;     // ReLimiter's source wait before s; 0 none
         int64_t wait_end_qpc = 0;
         int64_t pre_wait_start_qpc = 0; // and its pre-Sleep wait; 0 none
@@ -1190,6 +1311,13 @@ private:
         bool work_recorded = false;     // D = r − A − s entered the work window, or given up
         bool headroom_recorded = false; // r_{n+1} − A_{n+1} − o_n entered the headroom learner
         bool first_work_streamed = false; // LeadGpuReport::first_work_streamed
+        // Lead anchor (unified pacer only): (s − B) in µs, stored at the
+        // release only when the owner passed an anchor, so a slot is 0 (the
+        // whole-struct reset) with the key off. Added to the lead sample, the
+        // early side's readiness, the slack and the spike arrival. Placed in
+        // the padding between the bools: PendingFrame does not grow.
+        bool anchored = false; // LeadFrameStart::anchored with delta > 0: the emit paths add anchor_delta_us
+        float anchor_delta_us = 0.0f;
         int64_t gpu_start_qpc = 0;      // Reflex gpuRenderStartTime as QPC; 0 unknown
         bool concurrency_recorded = false; // (o_n, g_{n+1}) entered the queue-order window
         bool release_to_render_recorded = false; // σ of this frame entered its window, or given up
@@ -1288,7 +1416,9 @@ private:
 
     // Sample assembly
     bool PreviousResolved(const PendingFrame& frame) const noexcept;
-    void TryFinalize(PendingFrame* frame) noexcept;
+    // flush: a deferred frame whose z_used is registered may emit (only
+    // FlushQueueWaitSamples passes true).
+    void TryFinalize(PendingFrame* frame, bool flush = false) noexcept;
     void ForceFinalize(PendingFrame* frame) noexcept;
     // The outcome at readiness: render handoff, readiness rings, slack and
     // hold room, all from the measured readiness. The lead window sample
@@ -1297,6 +1427,14 @@ private:
     void EmitOutcome(PendingFrame* frame) noexcept;
     void EmitLeadSample(PendingFrame* frame) noexcept;
     bool LeadSampleWaitsForReport(const PendingFrame& frame) const noexcept;
+    // Saturation rule: the frame's lead sample would wait for z_used now (mode
+    // on, GPU rung, z_used unknown, stream live).
+    bool LeadSampleDefers(const PendingFrame& frame) const noexcept;
+    // The frame (key, grid_index) accepting z_used_us (saturation rule): its
+    // slot with z_known set, nullptr when the report is ignored.
+    PendingFrame* AcceptQueueWaitUsed(const PacingPlanKey& key, uint64_t grid_index, double z_used_us) noexcept;
+    // Drops every deferred frame without a sample.
+    void DropDeferredSamples() noexcept;
     // The GPU floor set the frame's actual release: released by it and not
     // pulled back to the cap's (render coupling, above). Such a frame's
     // starvation says nothing about the cap's lead.
@@ -1481,6 +1619,9 @@ private:
     double spike_gpu_median_us_ = 0.0;
     int64_t qpc_frequency_ = 0;
     bool lifecycle_known_ = false;
+    // Saturation rule (SetQueueWaitMode / SetQueueWaitLive).
+    bool queue_wait_mode_ = false;
+    bool queue_wait_live_ = false;
     PacingPlanKey lifecycle_{}; // identity domain, producer epoch and generation of the newest release
     uint64_t newest_index_ = 0;
     LeadStatistics statistics_{};

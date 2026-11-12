@@ -423,6 +423,21 @@ namespace
         partial.swapchain_generation = 0;
         partial.present_sequence = 902;
         g_joiner.AddReady(partial, Ms(104));
+        PacingGpuQueueRecord queue_probe{};
+        queue_probe.swapchain_generation = 6;
+        queue_probe.present_sequence = 901;
+        queue_probe.valid = PacingGpuQueueRecord::kSubmits | PacingGpuQueueRecord::kFirstSubmit;
+        queue_probe.submits = 47;
+        queue_probe.first_submit_qpc = Ms(99);
+        g_joiner.AddGpuQueue(queue_probe, Ms(104));
+        PacingGpuQueueRecord other_present = queue_probe; // another Present's frame never joins
+        other_present.present_sequence = 903;
+        other_present.submits = 1;
+        g_joiner.AddGpuQueue(other_present, Ms(104));
+        PacingGpuQueueRecord unsequenced_probe = queue_probe; // both identifiers must be non-zero
+        unsequenced_probe.swapchain_generation = 0;
+        unsequenced_probe.present_sequence = 902;
+        g_joiner.AddGpuQueue(unsequenced_probe, Ms(104));
         PacingPresentRecord unsequenced = Present(Ms(200), Ms(201));
         unsequenced.present_sequence = 902;
         g_joiner.AddPresent(unsequenced, Ms(201));
@@ -434,8 +449,84 @@ namespace
             "FG input waits join by frame key; queue waits need the Present ticket") && ok;
         ok = Check(rows[0].has_ready && rows[0].ready.ready_qpc == Ms(104),
             "Ready falls back to (swapchain generation, present sequence)") && ok;
-        return Check(rows[1].has_present && !rows[1].has_ready,
-            "sequence joins need both identifiers non-zero") && ok;
+        ok = Check(rows[0].has_gpu_queue && rows[0].gpu_queue.submits == 47 &&
+            rows[0].gpu_queue.first_submit_qpc == Ms(99) && rows[0].gpu_queue.valid == 0x3u,
+            "a GPU queue record joins by (swapchain generation, present sequence) and keeps its valid bits") && ok;
+        return Check(rows[1].has_present && !rows[1].has_ready && !rows[1].has_gpu_queue,
+            "sequence joins need both identifiers non-zero, also for the GPU queue record") && ok;
+    }
+
+    // GPU queue probe records join by the frame key first (under frame generation a real frame's
+    // record has a key and no Present sequence), else by (swapchain generation, present sequence).
+    bool TestGpuQueueKeyFirstJoin()
+    {
+        const auto record = [](const PacingFrameKey& key, uint64_t generation, uint64_t sequence,
+                                uint32_t submits) {
+            PacingGpuQueueRecord queue{};
+            queue.key = key;
+            queue.swapchain_generation = generation;
+            queue.present_sequence = sequence;
+            queue.valid = PacingGpuQueueRecord::kSubmits;
+            queue.submits = submits;
+            return queue;
+        };
+        PacingJoinedRow rows[4];
+        bool ok = true;
+
+        // A row without a Present identity (frame generation): the key-only record joins it.
+        g_joiner.Reset(kFrequency);
+        const PacingFrameKey fg_key = Key(70);
+        g_joiner.AddSource(Source(fg_key, Ms(90)), Ms(90));
+        g_joiner.AddGpuQueue(record(fg_key, 0, 0, 31), Ms(104));
+        g_joiner.AddDisplay(Display(Ms(100) + kMillisecond / 2, Ms(116), 70), Ms(150));
+        ok = Check(TakeRows(Ms(400), false, rows, 4) == 1 && rows[0].key == fg_key && !rows[0].has_present &&
+                rows[0].has_gpu_queue && rows[0].gpu_queue.submits == 31 &&
+                g_joiner.Statistics().gpu_queue_joined == 1,
+            "a key-only GPU queue record joins a row with the same key and no Present identity") && ok;
+
+        // A different key does not join it.
+        g_joiner.Reset(kFrequency);
+        g_joiner.AddSource(Source(fg_key, Ms(90)), Ms(90));
+        g_joiner.AddGpuQueue(record(Key(71), 0, 0, 31), Ms(104));
+        g_joiner.AddGpuQueue(record(Key(70, 4), 0, 0, 32), Ms(104)); // another producer epoch
+        g_joiner.AddDisplay(Display(Ms(100) + kMillisecond / 2, Ms(116), 70), Ms(150));
+        ok = Check(TakeRows(Ms(400), false, rows, 4) == 1 && !rows[0].has_gpu_queue &&
+                g_joiner.Statistics().gpu_queue_joined == 0,
+            "a GPU queue record with another key (frame or producer epoch) does not join") && ok;
+
+        // A pair-only record still joins a keyed row through the Present's identity.
+        const PacingFrameKey key = Key(72);
+        const auto present_row = [&](uint64_t sequence) {
+            g_joiner.Reset(kFrequency);
+            g_joiner.AddSource(Source(key, Ms(90)), Ms(90));
+            PacingPresentRecord present = Present(Ms(100), Ms(101), key);
+            present.swapchain_generation = 8;
+            present.present_sequence = sequence;
+            g_joiner.AddPresent(present, Ms(101));
+        };
+        present_row(910);
+        g_joiner.AddGpuQueue(record({}, 8, 910, 12), Ms(104));
+        g_joiner.AddDisplay(Display(Ms(100) + kMillisecond / 2, Ms(116)), Ms(150));
+        ok = Check(TakeRows(Ms(400), false, rows, 4) == 1 && rows[0].has_present && rows[0].has_gpu_queue &&
+                rows[0].gpu_queue.submits == 12 && g_joiner.Statistics().gpu_queue_joined == 1,
+            "a pair-only GPU queue record still joins through (swapchain generation, present sequence)") && ok;
+
+        // A row with both identities prefers the key match, even when the pair record is newer.
+        present_row(910);
+        g_joiner.AddGpuQueue(record(key, 0, 0, 20), Ms(104));
+        g_joiner.AddGpuQueue(record({}, 8, 910, 10), Ms(105));
+        g_joiner.AddDisplay(Display(Ms(100) + kMillisecond / 2, Ms(116)), Ms(150));
+        ok = Check(TakeRows(Ms(400), false, rows, 4) == 1 && rows[0].has_gpu_queue &&
+                rows[0].gpu_queue.submits == 20 && g_joiner.Statistics().gpu_queue_joined == 1,
+            "a record whose key matches is preferred over a newer pair match") && ok;
+
+        // Neither the key nor the pair matches: no join.
+        present_row(911);
+        g_joiner.AddGpuQueue(record(Key(99), 8, 912, 5), Ms(104));
+        g_joiner.AddDisplay(Display(Ms(100) + kMillisecond / 2, Ms(116)), Ms(150));
+        return Check(TakeRows(Ms(400), false, rows, 4) == 1 && rows[0].has_present && !rows[0].has_gpu_queue &&
+                g_joiner.Statistics().gpu_queue_joined == 0,
+            "no GPU queue record joins when neither the key nor the Present identity matches") && ok;
     }
 
     // FG input wait: the Gate record and the FG input prefix Ready record carry
@@ -803,6 +894,7 @@ int main()
     ok = TestUnjoinedPresentRows() && ok;
     ok = TestGateReadyReflexJoins() && ok;
     ok = TestFgInputResidence() && ok;
+    ok = TestGpuQueueKeyFirstJoin() && ok;
     ok = TestProbePairJoinsFrameGenerationRow() && ok;
     ok = TestRetentionEviction() && ok;
     ok = TestProducerEpochChange() && ok;

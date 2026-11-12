@@ -192,6 +192,11 @@ std::atomic<int> g_fg_multiplier{1};
 std::atomic<int> g_fg_presenter_probe_us{0};
 StreamlineQueueOwnedScope::StreamlineQueueOwnedScope() noexcept {}
 StreamlineQueueOwnedScope::~StreamlineQueueOwnedScope() {}
+// gpu_queue_probe (the D3D12 side is not linked here; the key stays off in these tests).
+void GpuQueueProbe_OnGateEnqueue(void*) noexcept {}
+void GpuQueueProbe_OnFgInputBoundary(void*,uint64_t,const PacingFrameKey&) noexcept {}
+void GpuQueueProbe_OnHoldRelease(void*,const void*,uint64_t,int64_t,int64_t) noexcept {}
+void GpuQueueProbe_OnHoldAnnounce(void*,const void*,uint64_t,int64_t,uint64_t) noexcept {}
 IUnknown* SwapMgr_AcquirePresentingDevice() noexcept {return nullptr;}
 void HWSpin(int64_t target) {fake_clock=(std::max)(fake_clock,target);}
 std::atomic<double> g_effective_interval_us{11111},g_last_gate_sleep_us{0};
@@ -250,7 +255,7 @@ public:
 };
 class FakeQueue final:public ID3D12CommandQueue {
 public:
-    ULONG refs=2;unsigned waits=0;bool complete_on_signal=true;
+    ULONG refs=2;unsigned waits=0;bool complete_on_signal=true,allow_execute=false;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID,void**) override{return E_NOINTERFACE;}
     ULONG STDMETHODCALLTYPE AddRef() override{return ++refs;}
     ULONG STDMETHODCALLTYPE Release() override{return --refs;}
@@ -261,7 +266,7 @@ public:
     HRESULT STDMETHODCALLTYPE GetDevice(REFIID,void**) override{return E_NOTIMPL;}
     void STDMETHODCALLTYPE UpdateTileMappings(ID3D12Resource*,UINT,const D3D12_TILED_RESOURCE_COORDINATE*,const D3D12_TILE_REGION_SIZE*,ID3D12Heap*,UINT,const D3D12_TILE_RANGE_FLAGS*,const UINT*,const UINT*,D3D12_TILE_MAPPING_FLAGS) override{}
     void STDMETHODCALLTYPE CopyTileMappings(ID3D12Resource*,const D3D12_TILED_RESOURCE_COORDINATE*,ID3D12Resource*,const D3D12_TILED_RESOURCE_COORDINATE*,const D3D12_TILE_REGION_SIZE*,D3D12_TILE_MAPPING_FLAGS) override{}
-    void STDMETHODCALLTYPE ExecuteCommandLists(UINT,ID3D12CommandList* const*) override{CHECK(false);}
+    void STDMETHODCALLTYPE ExecuteCommandLists(UINT,ID3D12CommandList* const*) override{CHECK(allow_execute);}
     void STDMETHODCALLTYPE SetMarker(UINT,const void*,UINT) override{}
     void STDMETHODCALLTYPE BeginEvent(UINT,const void*,UINT) override{}
     void STDMETHODCALLTYPE EndEvent() override{}
@@ -346,11 +351,15 @@ void TestWorkerModeLifecycle() {
     PublishRung(PacingRung::GpuQueueWait);
     CHECK(GpuPresent_Start());
     CHECK(wait_for(mmcss_prioritized,1) && mmcss_registered==1 && mmcss_freed==0);
+    // Admission is open only with a live worker: its first service pass publishes the heartbeat.
+    for(int attempt=0;attempt<5000 && heartbeat.load()<=0;++attempt)Sleep(1);
+    CHECK(heartbeat.load()>0 && !(admission.load()&kClosed));
     PublishRung(PacingRung::MarkerHold);SetEvent(work_event);
     CHECK(wait_for(mmcss_freed,1) && mmcss_reverted==1);
     PublishRung(PacingRung::FgInputWait);SetEvent(work_event);
     CHECK(wait_for(mmcss_prioritized,2) && mmcss_registered==2);
     CHECK(GpuPresent_Stop());
+    CHECK(admission.load()&kClosed);
     CHECK(GpuPresent_ReleaseAfterRundown());
     CHECK(mmcss_reverted==2 && mmcss_freed==2);
     PublishRung(PacingRung::MarkerHold);
@@ -553,6 +562,11 @@ void TestExecutor() {
     PublishPlan(3,3,PacingRung::GpuQueueWait);
     ExpectDecided(ExecuteFrame(3),3,3,GpuPresentStatus::WorkerStale,PacingPlanStatus::Undeliverable);
     heartbeat=fake_clock;CHECK(driver.waits==1);
+    // Before the worker's first service pass (heartbeat 0) no Wait is enqueued either.
+    heartbeat=0;
+    PublishPlan(5,5,PacingRung::GpuQueueWait);
+    ExpectDecided(ExecuteFrame(5),5,5,GpuPresentStatus::WorkerStale,PacingPlanStatus::Undeliverable);
+    heartbeat=fake_clock;CHECK(driver.waits==1);
     // Stale: the grid no longer resolves the plan.
     PublishGrid(false);
     PublishPlan(4,4,PacingRung::GpuQueueWait);
@@ -732,6 +746,135 @@ void TestExecutor() {
         CHECK(decision.status==PacingPlanStatus::Held && decision.target==GridTarget(41)+3000-694);
         CHECK(decision.grid_target==GridTarget(41));
     }
+    // Hold credit, Decide level: the plan's hold advance moves the resolved target (here the
+    // floored one) earlier by exactly that under the live key; 0 and the key off resolve as today.
+    // Frame 44 came out 3,000 ticks late, so the floor moves frame 45 later (slack 1,388 from I,
+    // 694 from I / 2). Held while the lowered target is ahead of now, Late once it is not.
+    {
+        const auto saved_pipeline=PacingPipeline_GetConfig();
+        const auto set_key=[&](bool on) {
+            auto pipeline=saved_pipeline;pipeline.unified_pacer=on;PacingPipeline_SetConfig(pipeline);
+        };
+        PacingFramePlan plan;
+        plan.key=PlanKey(45);plan.grid_index=45;plan.interval_us=kInterval;plan.rung=PacingRung::FgInputWait;
+        plan.mode=PacingTimingMode::Vrr;plan.output_target_qpc=GridTarget(45);plan.fg_divisor=2.0;
+        const auto generation_now=FrameTimeline_CurrentControllerGeneration();
+        CHECK(g_cadence_output_tracker.Record(generation_now,44,GridTarget(44)+3000));
+        const auto now=GridTarget(45)-5000;
+        for(const bool displayed_slack:{false,true}) {
+            const auto floored=GridTarget(45)+3000-(displayed_slack?694:1388);
+            for(const float advance:{0.0f,400.0f,9000.0f}) {
+                plan.hold_advance_us=advance;
+                for(const bool key:{false,true}) {
+                    set_key(key);
+                    const auto decision=Decide(plan,now,displayed_slack);
+                    CHECK(decision.grid_target==GridTarget(45));
+                    const auto expected=floored-(key?static_cast<int64_t>(advance):0); // 1 tick = 1 us here
+                    CHECK(decision.target==expected);
+                    if(expected>now)CHECK(decision.status==PacingPlanStatus::Held && decision.gate==GpuPresentStatus::Planned);
+                    else CHECK(decision.status==PacingPlanStatus::Late && decision.gate==GpuPresentStatus::Late);
+                }
+            }
+        }
+        // FloorAfterLatePass: the ticket's advance (copied from the plan at admission) is applied
+        // to the late pass's floor under the key, so the pass does not undo the advance; key off
+        // gives the floor itself; a floor the advance brings to or below the ticket's target moves nothing.
+        {
+            Ticket late;
+            late.fg=true;late.fg_divisor=2.0;late.key=PlanKey(45);
+            late.trace.grid_index=45;late.trace.interval_qpc=11111;
+            fake_clock=now;
+            const auto nominal=GridTarget(45),floor=GridTarget(45)+3000-694;
+            const auto reset=[&] {
+                late.trace.target_qpc=nominal;late.trace.phase_adjust_qpc=0;
+                CHECK(g_cadence_output_tracker.Record(generation_now,45,nominal));
+            };
+            const auto pass=[&](bool key,float advance) {
+                set_key(key);late.hold_advance_us=advance;reset();
+                int64_t next=0;FloorAfterLatePass(queue,late,&next);
+            };
+            pass(true,0.0f);
+            CHECK(late.trace.target_qpc==floor && late.trace.phase_adjust_qpc==floor-nominal);
+            ExpectRecorded(45,floor);
+            pass(true,400.0f);
+            CHECK(late.trace.target_qpc==floor-400 && late.trace.phase_adjust_qpc==floor-400-nominal);
+            ExpectRecorded(45,floor-400);
+            pass(false,400.0f); // key off: the advance is ignored
+            CHECK(late.trace.target_qpc==floor && late.trace.phase_adjust_qpc==floor-nominal);
+            pass(true,4000.0f); // floor - advance is not later than the ticket's target
+            CHECK(late.trace.target_qpc==nominal && !late.trace.phase_adjust_qpc);
+            ExpectRecorded(45,nominal);
+        }
+        PacingPipeline_SetConfig(saved_pipeline);
+    }
+    // Hold credit, admission: the plan's hold advance reaches the admitted ticket through the real
+    // entry points (Execute -> Enqueue on the GPU queue wait, BeginFgInput -> Enqueue on the FG
+    // input), the only place the late pass reads it from. Values are unused elsewhere in this file,
+    // so a removed admission copy leaves a stale or default field and fails. The FG prefix queue
+    // gets a fake list slot and fence so BeginFgInput reaches its Enqueue (the readback itself,
+    // ReadTimestamp, needs a real device and is never driven: the measurement is dropped unread).
+    {
+        const auto saved_pipeline=PacingPipeline_GetConfig();
+        auto keyed=saved_pipeline;keyed.unified_pacer=true;PacingPipeline_SetConfig(keyed);
+        const auto generation_now=FrameTimeline_CurrentControllerGeneration();
+        const auto find_ticket=[&](const PacingPlanKey& key)->Ticket* {
+            for(auto& candidate:queue.tickets)
+                if(candidate.state.load()!=TicketState::Free && candidate.key==key)return &candidate;
+            return nullptr;
+        };
+        // GPU queue wait route (Execute).
+        PublishRung(PacingRung::GpuQueueWait);
+        constexpr uint64_t kGpuIndex=49,kFgIndex=47;
+        fake_clock=GridTarget(kGpuIndex)-5000;heartbeat=fake_clock;
+        PacingFramePlan gpu_plan;
+        gpu_plan.key=PlanKey(kGpuIndex);gpu_plan.grid_index=kGpuIndex;gpu_plan.interval_us=kInterval;
+        gpu_plan.rung=PacingRung::GpuQueueWait;gpu_plan.mode=PacingTimingMode::Vrr;
+        gpu_plan.output_target_qpc=GridTarget(kGpuIndex);gpu_plan.hold_advance_us=250.0f;
+        CHECK(g_frame_plans.Publish(gpu_plan));
+        const auto gpu_outcome=ExecuteFrame(kGpuIndex);
+        CHECK(gpu_outcome.execution==GpuPresentExecution::WaitCommitted);
+        Ticket* gpu_ticket=find_ticket(PlanKey(kGpuIndex));
+        CHECK(gpu_ticket && !gpu_ticket->fg && gpu_ticket->hold_advance_us==250.0f);
+        CHECK(gpu_ticket->trace.target_qpc==GridTarget(kGpuIndex)-250); // the resolver took the same advance
+        // FG input route (BeginFgInput).
+        fg_context=true;g_fg_multiplier=2;PublishRung(PacingRung::FgInputWait);
+        queue.fg_ready=true;queue.fg_native=0x1000;queue.fg_swapchain=FrameTimeline_GetPresentSwapchainGeneration(0x1000);
+        Fence prefix;
+        driver.allow_execute=true;
+        queue.fg_queue.queue=&driver;queue.fg_queue.fence=&prefix;
+        queue.fg_queue.timestamps[0].commands=reinterpret_cast<ID3D12CommandList*>(static_cast<uintptr_t>(0x10));
+        fake_clock=GridTarget(kFgIndex)-5000;heartbeat=fake_clock;
+        PacingFramePlan fg_plan;
+        fg_plan.key=PlanKey(kFgIndex);fg_plan.grid_index=kFgIndex;fg_plan.interval_us=kInterval;
+        fg_plan.rung=PacingRung::FgInputWait;fg_plan.mode=PacingTimingMode::Vrr;fg_plan.fg_divisor=2.0;
+        fg_plan.output_target_qpc=GridTarget(kFgIndex);fg_plan.hold_advance_us=321.0f;
+        CHECK(g_frame_plans.Publish(fg_plan));
+        GpuPresentFgInput input;
+        input.native=0x1000;input.swapchain=queue.fg_swapchain;input.observer=GpuReadiness_Settings();input.prediction=1;
+        input.producer=PlanKey(0).producer_epoch;input.controller=generation_now;
+        input.transaction=9;input.source=kFgIndex;
+        CHECK(GpuPresent_BeginFgInput(reinterpret_cast<uint64_t>(&driver),input));
+        Ticket* fg_ticket=find_ticket(PlanKey(kFgIndex));
+        CHECK(fg_ticket && fg_ticket->fg && fg_ticket->hold_advance_us==321.0f);
+        CHECK(fg_ticket->trace.target_qpc==GridTarget(kFgIndex)-321);
+        GpuPresent_FinishFgInput(input.transaction,true);
+        // Drop the unread prefix measurement and the fake prefix queue, then release both tickets.
+        auto& measurement=queue.fg_measurements[0];
+        CHECK(measurement.state.load()==TicketState::Submitted && measurement.slot);
+        measurement.slot->ownership=GpuTimestampOwnership::Free;measurement.slot->retire_value=0;
+        measurement.slot=nullptr;measurement.sample={};measurement.state=TicketState::Free;
+        queue.fg_queue.timestamps[0].commands=nullptr;
+        queue.fg_queue.last_submitted=0;queue.fg_queue.fence=nullptr;queue.fg_queue.queue=nullptr;
+        queue.fg_sequence=0;driver.allow_execute=false;
+        fake_clock=GridTarget(kGpuIndex);heartbeat=fake_clock;Service();
+        CHECK(gpu_ticket->signalled && fg_ticket->signalled);
+        for(const auto& ticket:queue.tickets)CHECK(ticket.state.load()==TicketState::Free);
+        fg_context=false;g_fg_multiplier=1;
+        queue.fg_ready=false;queue.fg_native=queue.fg_swapchain=0;queue.fg_thread=0;
+        {std::lock_guard<std::mutex> lock(pacing_record_mutex);pacing_signalled_fifo.clear();}
+        PacingStageEvent leftover;while(FramePlan_PopStageEvent(&leftover)) {}
+        PacingPipeline_SetConfig(saved_pipeline);
+    }
     // fg_late_spacing, worker: an FG input wait whose floor moved its Signal
     // 3,000 ticks past T(n) wakes at T(n). While the game's render thread is
     // still inside the frame's Present (no PRESENT_END of it published) it is
@@ -784,6 +927,36 @@ void TestExecutor() {
         PacingPipeline_SetConfig(saved_pipeline);
     }
 
+    // A CPU Signal that fails keeps its obligation (retried; the Wait stays undischarged). A fence that reports
+    // device removal (UINT64_MAX) discharges it: the runtime has released every GPU wait on that device.
+    {
+        PublishRung(PacingRung::GpuQueueWait);
+        constexpr uint64_t index=31;
+        fake_clock=GridTarget(index)-5000;heartbeat=fake_clock;
+        PublishPlan(index,index,PacingRung::GpuQueueWait);
+        outcome=ExecuteFrame(index);
+        CHECK(outcome.execution==GpuPresentExecution::WaitCommitted);
+        ExpectStage(index,index,PacingStageEventKind::PresentCall,fake_clock);
+        Ticket* held=nullptr;
+        for(auto& ticket:queue.tickets)if(ticket.trace.ticket==outcome.trace.ticket)held=&ticket;
+        CHECK(held!=nullptr);
+        Fence* time=nullptr;
+        for(auto& fence:time_fences)if(&fence==held->time)time=&fence;
+        CHECK(time!=nullptr);
+        time->fail=true;
+        fake_clock=GridTarget(index);heartbeat=fake_clock;
+        Service();
+        CHECK(!held->signalled && held->state.load()==TicketState::Submitted && !Discharged());
+        ExpectNoStage();
+        time->value=UINT64_MAX;
+        Service();
+        CHECK(held->signalled && NextSignalled(GpuPresentStatus::Drained));
+        ExpectStage(index,index,PacingStageEventKind::OutputRelease,fake_clock,PacingPlanStatus::Held);
+        ExpectNoStage();
+        CHECK(Discharged());
+        time->fail=false;time->value=0;
+        failed=false;admission=0;heartbeat=fake_clock;
+    }
     // UINT64_MAX on the done fence is device removal, never retirement.
     PublishRung(PacingRung::GpuQueueWait);
     fake_clock=GridTarget(30)-5000;heartbeat=fake_clock;

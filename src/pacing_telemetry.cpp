@@ -5,9 +5,12 @@
 #include "csv_writer.h"
 #include "dxgi_display_source.h"
 #include "fg_divisor.h"
+#include "instrumentation_state.h"
 #include "frame_timeline.h"
 #include "logger.h"
+#include "marker_cycles.h"
 #include "native_pcl_measurement.h"
+#include "marker_stamps.h"
 #include "native_present_gate.h"
 #include "pacing_controller_events.h"
 #include "pacing_core_types.h"
@@ -51,6 +54,7 @@ namespace
         QueuePresent,
         QueueGate,
         QueueReady,
+        QueueGpuQueue,
         QueueReflex,
         QueueWait,
         QueueDisplay,
@@ -61,6 +65,7 @@ namespace
     relimiter::BoundedMpscQueue<PacingPresentRecord, kRecordQueueCapacity> s_present_queue;
     relimiter::BoundedMpscQueue<PacingGateRecord, kRecordQueueCapacity> s_gate_queue;
     relimiter::BoundedMpscQueue<PacingReadyRecord, kRecordQueueCapacity> s_ready_queue;
+    relimiter::BoundedMpscQueue<PacingGpuQueueRecord, kRecordQueueCapacity> s_gpu_queue_queue; // one per frame
     relimiter::BoundedMpscQueue<PacingReflexRecord, kReflexQueueCapacity> s_reflex_queue;
     relimiter::BoundedMpscQueue<PacingWaitRecord, kWaitQueueCapacity> s_wait_queue;
     relimiter::BoundedMpscQueue<PacingDisplaySample, kRecordQueueCapacity> s_display_queue;
@@ -223,6 +228,8 @@ namespace
             s_inactive_drops[QueueGate].load(std::memory_order_relaxed);
         drops.ready = s_ready_queue.DroppedValues() +
             s_inactive_drops[QueueReady].load(std::memory_order_relaxed);
+        drops.gpu_queue = s_gpu_queue_queue.DroppedValues() +
+            s_inactive_drops[QueueGpuQueue].load(std::memory_order_relaxed);
         drops.reflex = s_reflex_queue.DroppedValues() +
             s_inactive_drops[QueueReflex].load(std::memory_order_relaxed);
         drops.display = s_display_queue.DroppedValues() +
@@ -232,7 +239,8 @@ namespace
 
     uint64_t TotalDrops(const PacingQueueDrops& drops) noexcept
     {
-        return drops.source + drops.present + drops.gate + drops.ready + drops.reflex + drops.display;
+        return drops.source + drops.present + drops.gate + drops.ready + drops.gpu_queue + drops.reflex +
+            drops.display;
     }
 
     void PublishSnapshot(const PacingTelemetrySnapshot& snapshot) noexcept
@@ -461,7 +469,51 @@ namespace
 
     // ── Worker cycle ──
 
-    void ProcessRow(const PacingJoinedRow& row, int64_t now_qpc) noexcept
+    // Developer key unified_queue_upstream >= 1: the frame's own SIMULATION_END, RENDERSUBMIT_START
+    // and RENDERSUBMIT_END as the marker hooks stamped them (marker_stamps.h). Taken when the row
+    // completes, not when the Source record is pushed: the Source record is built at the frame's
+    // SIMULATION_START release, before any of the three exists. The stamps are found by the row's
+    // complete key (domain, producer epoch, frame id): a frame id of another domain or producer
+    // epoch, or a frame the ring no longer holds or a reset cleared, leaves the cells at 0 (empty).
+    void FillMarkerStamps(PacingJoinedRow* row) noexcept
+    {
+        if (g_unified_queue_upstream.load(std::memory_order_relaxed) < 1 || !row->has_source) return;
+        const PacingFrameKey& key = row->source.key;
+        static_assert(static_cast<uint8_t>(PacingIdentityDomain::NvApiFrame) == kMarkerDomainNvApi &&
+                      static_cast<uint8_t>(PacingIdentityDomain::PclFrame) == kMarkerDomainPcl &&
+                      static_cast<uint8_t>(FrameIdentityDomain::NvApiFrame) == kMarkerDomainNvApi &&
+                      static_cast<uint8_t>(FrameIdentityDomain::PclFrame) == kMarkerDomainPcl,
+                      "the stamp ring's domain values are the identity domains'");
+        if (key.domain != PacingIdentityDomain::NvApiFrame && key.domain != PacingIdentityDomain::PclFrame) return;
+        MarkerStamps stamps{};
+        if (!MarkerStamps_Get(MarkerStampKey{ static_cast<uint8_t>(key.domain), key.producer_epoch, key.frame_id},
+                              &stamps)) return;
+        row->source.sim_end_marker_qpc = stamps.sim_end_qpc;
+        row->source.render_submit_start_marker_qpc = stamps.render_start_qpc;
+        row->source.render_submit_end_marker_qpc = stamps.render_end_qpc;
+        // The marker's thread ids (the start marker's for the span's own, the end marker's beside
+        // it, so a game that sends a span's markers from two threads shows) and the CPU time of
+        // the span's thread between its markers: only from one thread and a known cycle rate.
+        const auto tid = [&stamps](MarkerStampKind kind) { return stamps.tid[static_cast<unsigned>(kind)]; };
+        row->source.render_submit_tid = tid(MarkerStampKind::RenderSubmitStart);
+        row->source.render_submit_end_tid = tid(MarkerStampKind::RenderSubmitEnd);
+        row->source.sim_tid = tid(MarkerStampKind::SimulationStart);
+        row->source.sim_end_tid = tid(MarkerStampKind::SimulationEnd);
+        const double rate_hz = MarkerCycles_RateHz();
+        double cpu_us = 0.0;
+        if (MarkerStamps_SpanCpuUs(stamps, MarkerStampKind::RenderSubmitStart, MarkerStampKind::RenderSubmitEnd,
+                                   rate_hz, &cpu_us)) {
+            row->source.render_submit_cpu_us = cpu_us;
+            row->source.render_submit_cpu_valid = 1;
+        }
+        if (MarkerStamps_SpanCpuUs(stamps, MarkerStampKind::SimulationStart, MarkerStampKind::SimulationEnd,
+                                   rate_hz, &cpu_us)) {
+            row->source.sim_cpu_us = cpu_us;
+            row->source.sim_cpu_valid = 1;
+        }
+    }
+
+    void ProcessRow(PacingJoinedRow& row, int64_t now_qpc) noexcept
     {
         // One sequence for the window and the CSV row: snapshot events name
         // their window by row-sequence range.
@@ -469,7 +521,10 @@ namespace
         const PacingMetricInput input = PacingJoin_MetricInput(row, s_qpc_frequency);
         const PacingDerivedMetrics derived = Chains().Process(input);
         Window().Add(now_qpc, row_sequence, input.native_swapchain, derived);
-        if (s_state.capture_enabled) CSV_PushPacingRow(row_sequence, row, derived);
+        if (s_state.capture_enabled) {
+            FillMarkerStamps(&row);
+            CSV_PushPacingRow(row_sequence, row, derived);
+        }
     }
 
     bool EmitRow(int64_t now_qpc, bool final_drain) noexcept
@@ -512,6 +567,8 @@ namespace
             [now_qpc](const PacingGateRecord& record) { Joiner().AddGate(record, now_qpc); });
         DrainQueue<decltype(s_ready_queue), PacingReadyRecord>(&s_ready_queue, kRecordQueueCapacity,
             [now_qpc](const PacingReadyRecord& record) { Joiner().AddReady(record, now_qpc); });
+        DrainQueue<decltype(s_gpu_queue_queue), PacingGpuQueueRecord>(&s_gpu_queue_queue, kRecordQueueCapacity,
+            [now_qpc](const PacingGpuQueueRecord& record) { Joiner().AddGpuQueue(record, now_qpc); });
         DrainQueue<decltype(s_reflex_queue), PacingReflexRecord>(&s_reflex_queue, kReflexQueueCapacity,
             [now_qpc](const PacingReflexRecord& record) {
                 TrackClockMap(record, now_qpc);
@@ -770,8 +827,8 @@ namespace
         const uint64_t total_drops = TotalDrops(drops);
         if (total_drops != s_state.logged_drops) {
             s_state.logged_drops = total_drops;
-            LOG_WARN("Pacing telemetry: dropped records source=%llu present=%llu gate=%llu ready=%llu reflex=%llu display=%llu",
-                drops.source, drops.present, drops.gate, drops.ready, drops.reflex, drops.display);
+            LOG_WARN("Pacing telemetry: dropped records source=%llu present=%llu gate=%llu ready=%llu gpu_queue=%llu reflex=%llu display=%llu",
+                drops.source, drops.present, drops.gate, drops.ready, drops.gpu_queue, drops.reflex, drops.display);
         }
         const PacingJoinStatistics join = Joiner().Statistics();
         if (join.display_samples == s_state.logged_display_samples &&
@@ -809,6 +866,12 @@ namespace
             LOG_INFO("Pacing telemetry: cross-thread PRESENT_START hand-off verified by ETW frame IDs "
                 "(%llu agreements)", static_cast<unsigned long long>(join.cross_thread_agreements));
         }
+        else if (was_verified && !verified) {
+            LOG_WARN("Pacing telemetry: cross-thread PRESENT_START hand-off verification revoked by an ETW frame ID "
+                "disagreement (%llu of %llu); 64 consecutive agreements are needed again",
+                static_cast<unsigned long long>(join.cross_thread_disagreements),
+                static_cast<unsigned long long>(join.cross_thread_agreements + join.cross_thread_disagreements));
+        }
         else if (disagreements != 0) {
             LOG_WARN("Pacing telemetry: cross-thread PRESENT_START hand-off disagrees with ETW frame IDs "
                 "(%llu of %llu); native route uses only verified mappings",
@@ -829,6 +892,10 @@ namespace
         StepDxgiDisplaySource(now_qpc, final_drain);
         s_state.last_cycle_qpc = now_qpc;
         while (EmitRow(now_qpc, final_drain)) {}
+        // Developer key unified_queue_upstream >= 1: the one-shot cycle-rate calibration for the
+        // marker CPU time cells, one 5 ms slice per cycle on this worker (never on a hook).
+        if (!final_drain && g_unified_queue_upstream.load(std::memory_order_relaxed) >= 1)
+            MarkerCycles_CalibrateStep();
         ReportCrossThreadEvidence();
 
         if (final_drain || now_qpc - s_state.last_snapshot_qpc >= MillisecondsToTicks(kSnapshotIntervalMilliseconds)) {
@@ -883,6 +950,7 @@ namespace
         DrainQueue<decltype(s_present_queue), PacingPresentRecord>(&s_present_queue, kRecordQueueCapacity, discard);
         DrainQueue<decltype(s_gate_queue), PacingGateRecord>(&s_gate_queue, kRecordQueueCapacity, discard);
         DrainQueue<decltype(s_ready_queue), PacingReadyRecord>(&s_ready_queue, kRecordQueueCapacity, discard);
+        DrainQueue<decltype(s_gpu_queue_queue), PacingGpuQueueRecord>(&s_gpu_queue_queue, kRecordQueueCapacity, discard);
         DrainQueue<decltype(s_reflex_queue), PacingReflexRecord>(&s_reflex_queue, kReflexQueueCapacity, discard);
         DrainQueue<decltype(s_wait_queue), PacingWaitRecord>(&s_wait_queue, kWaitQueueCapacity, discard);
         DrainQueue<decltype(s_display_queue), PacingDisplaySample>(&s_display_queue, kRecordQueueCapacity, discard);
@@ -911,6 +979,11 @@ void PacingTelemetry_PushGate(const PacingGateRecord& record) noexcept
 void PacingTelemetry_PushReady(const PacingReadyRecord& record) noexcept
 {
     PushRecord(&s_ready_queue, QueueReady, record);
+}
+
+void PacingTelemetry_PushGpuQueue(const PacingGpuQueueRecord& record) noexcept
+{
+    PushRecord(&s_gpu_queue_queue, QueueGpuQueue, record);
 }
 
 void PacingTelemetry_PushReflex(const PacingReflexRecord& record) noexcept

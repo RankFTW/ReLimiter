@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 // Grid logic and target resolution. The publication and the output tracker
 // live in cadence_grid_publication.cpp.
@@ -165,13 +166,15 @@ namespace
         bool keep_history,
         uint64_t base_index,
         const ExactQpc& origin,
-        double interval_ticks) noexcept
+        double interval_ticks,
+        double floor_interval_ticks = 0.0) noexcept
     {
         CadenceGridSegment segments[kCadenceGridSegmentHistory] = {};
         segments[0].base_index = base_index;
         segments[0].origin_qpc = origin.whole;
         segments[0].origin_fraction = origin.fraction;
         segments[0].interval_ticks = interval_ticks;
+        segments[0].floor_interval_ticks = floor_interval_ticks;
         uint32_t count = 1;
         const uint32_t existing = keep_history ? SegmentCount(*snapshot) : 0;
         for (uint32_t position = 0;
@@ -349,14 +352,18 @@ int64_t CadenceGrid_LateToleranceTicks(
     return static_cast<int64_t>(std::floor(tolerance_ticks));
 }
 
-bool CadenceGrid_ResolveOutputTarget(
+namespace
+{
+// The resolution as it always was: nominal target, then the spacing floor.
+bool ResolveOutputTargetImpl(
     const CadenceGridSnapshot& snapshot,
     uint32_t controller_generation,
     uint64_t grid_index,
     const CadenceGridOutputTracker& tracker,
     int64_t* target_qpc,
     bool* floored,
-    double display_divisor) noexcept
+    double display_divisor,
+    bool display_floor) noexcept
 {
     if (floored != nullptr) *floored = false;
     int64_t target = 0;
@@ -372,7 +379,18 @@ bool CadenceGrid_ResolveOutputTarget(
         return true;
     }
     // TargetOf succeeded, so a segment resolves grid_index.
-    const double interval_ticks = SegmentFor(snapshot, grid_index)->interval_ticks;
+    // Spacing floor o(n - 1) + I_floor - slack. I_floor is the segment's display-side interval
+    // (key unified_pacer: I_disp, never the GPU term) ONLY when the caller passes display_floor
+    // (the executors pass the live key), else the commanded I: a snapshot copied or published
+    // under the key and resolved after it was turned off must not apply the floor, whatever its
+    // segments still hold. The slack comes from the displayed interval I_floor / D. The start
+    // grid and the nominal target keep the commanded I(n): a hold may delay the next frame's
+    // GPU work only while the GPU has slack, so the floor must not space outputs wider than the
+    // display-side interval when the hardware term binds.
+    const CadenceGridSegment& segment = *SegmentFor(snapshot, grid_index);
+    const double interval_ticks = display_floor && segment.floor_interval_ticks > 0.0
+        ? segment.floor_interval_ticks
+        : segment.interval_ticks;
     const double displayed_ticks = std::isfinite(display_divisor) && display_divisor > 1.0
         ? interval_ticks / display_divisor
         : interval_ticks;
@@ -390,6 +408,38 @@ bool CadenceGrid_ResolveOutputTarget(
     if (!OriginAtOrAfter(snapshot, floor_exact, &floored_target)) return true;
     *target_qpc = RoundExact(floored_target);
     if (floored != nullptr) *floored = true;
+    return true;
+}
+} // namespace
+
+bool CadenceGrid_ResolveOutputTarget(
+    const CadenceGridSnapshot& snapshot,
+    uint32_t controller_generation,
+    uint64_t grid_index,
+    const CadenceGridOutputTracker& tracker,
+    int64_t* target_qpc,
+    bool* floored,
+    double display_divisor,
+    bool display_floor,
+    double advance_us) noexcept
+{
+    if (!ResolveOutputTargetImpl(snapshot, controller_generation, grid_index, tracker, target_qpc,
+            floored, display_divisor, display_floor)) {
+        return false;
+    }
+    // Hold credit (key unified_pacer): a debt is repaid by releasing the frame earlier by the
+    // advance, applied to the resolved target (nominal or floored alike). Only under the live
+    // key (display_floor); the existing late path releases a target that is already due.
+    if (display_floor && std::isfinite(advance_us) && advance_us > 0.0 && snapshot.qpc_frequency > 0) {
+        const double advance_ticks = std::round(
+            advance_us * static_cast<double>(snapshot.qpc_frequency) / kMicrosecondsPerSecond);
+        if (advance_ticks > 0.0) {
+            // Underflow guard: never below 1 (a positive, long-due target); the product is capped.
+            const int64_t ticks = advance_ticks < 9.0e18 ? static_cast<int64_t>(advance_ticks)
+                                                         : std::numeric_limits<int64_t>::max();
+            *target_qpc = ticks >= *target_qpc ? 1 : *target_qpc - ticks;
+        }
+    }
     return true;
 }
 
@@ -603,6 +653,108 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
     return plan;
 }
 
+CadenceGridPlan CadenceGrid::PlanAt(const CadenceGridPlanAtInput& input) noexcept
+{
+    CadenceGridPlan plan{};
+    if (input.mode == PacingTimingMode::Off) {
+        Suspend();
+        return plan;
+    }
+    const double ticks_per_us = input.qpc_frequency > 0
+        ? static_cast<double>(input.qpc_frequency) / kMicrosecondsPerSecond
+        : 0.0;
+    const double interval_ticks = input.interval_us * ticks_per_us;
+    const double lead_ticks = std::max(input.lead_us, 0.0) * ticks_per_us;
+    if (input.now_qpc <= 0 || input.now_qpc > kMaximumNowQpc || input.qpc_frequency <= 0 ||
+        !std::isfinite(input.interval_us) || !std::isfinite(interval_ticks) ||
+        interval_ticks < kMinimumIntervalTicks || interval_ticks > kMaximumSpanTicks ||
+        !std::isfinite(input.lead_us) || !std::isfinite(lead_ticks) || lead_ticks > kMaximumSpanTicks ||
+        input.origin_qpc <= 0 || input.origin_qpc > kMaximumNowQpc ||
+        !std::isfinite(input.origin_fraction) || input.origin_fraction < 0.0 || input.origin_fraction >= 1.0 ||
+        input.source_wake_qpc <= 0 || input.source_wake_qpc > kMaximumNowQpc) {
+        ++statistics_.invalid_inputs;
+        return plan;
+    }
+
+    const uint64_t grid_index = next_index_;
+    const bool lifecycle_change = !has_grid_ ||
+        input.controller_generation != snapshot_.controller_generation;
+    const bool mode_change = !lifecycle_change && input.mode != snapshot_.mode;
+    const bool interval_change = !lifecycle_change && !mode_change &&
+        std::fabs(interval_ticks - snapshot_.current.interval_ticks) > kIntervalChangeToleranceTicks;
+
+    // Work on a copy so a failure part-way leaves the grid unchanged.
+    CadenceGridSnapshot next = snapshot_;
+    next.valid = true;
+    next.controller_generation = input.controller_generation;
+    next.mode = input.mode;
+    next.qpc_frequency = input.qpc_frequency;
+    next.fixed = CadenceGridFixedReference{};
+    next.snapped = false;
+
+    ExactQpc origin{};
+    origin.whole = input.origin_qpc;
+    origin.fraction = input.origin_fraction;
+    // Key unified_pacer: the display-side floor interval (0 or an unusable value = none).
+    const double floor_interval_ticks = std::isfinite(input.display_interval_us) &&
+            input.display_interval_us > 0.0 &&
+            input.display_interval_us * ticks_per_us <= kMaximumSpanTicks
+        ? input.display_interval_us * ticks_per_us
+        : 0.0;
+    StartSegment(&next, !lifecycle_change, grid_index, origin, interval_ticks, floor_interval_ticks);
+
+    PacingEpochReason reason = PacingEpochReason::None;
+    if (lifecycle_change) {
+        reason = PacingEpochReason::Lifecycle;
+    } else if (mode_change) {
+        reason = PacingEpochReason::ModeChange;
+    } else if (input.period_change) {
+        reason = PacingEpochReason::PeriodChange;
+    }
+    const bool silent_rebase = reason == PacingEpochReason::None && interval_change;
+    if (reason != PacingEpochReason::None) {
+        BeginEpoch(&next, reason, grid_index);
+        ++statistics_.epochs_by_reason[static_cast<size_t>(reason)];
+    }
+    if (reason == PacingEpochReason::Lifecycle) lifecycle_base_index_ = grid_index;
+    next.last_planned_index = grid_index;
+    ++next.sequence;
+    snapshot_ = next;
+    has_grid_ = true;
+    last_lead_ticks_ = static_cast<int64_t>(std::floor(lead_ticks + 0.5));
+    ++next_index_;
+
+    ++statistics_.plans;
+    if (silent_rebase) ++statistics_.silent_rebases;
+
+    plan.valid = true;
+    plan.grid_index = grid_index;
+    plan.output_target_qpc = origin.whole;
+    plan.source_wake_qpc = std::max(input.source_wake_qpc, input.now_qpc);
+    plan.epoch = next.epoch;
+    plan.epoch_reason = reason;
+    plan.released_immediately = input.source_wake_qpc <= input.now_qpc;
+    return plan;
+}
+
+bool CadenceGrid::ClearDisplayFloor() noexcept
+{
+    // Every retained segment: the history ring resolves older indices (a frame planned under the
+    // key whose floor is still to be resolved), and a later copy of the snapshot must carry none.
+    const uint32_t count = SegmentCount(snapshot_);
+    bool cleared = false;
+    for (uint32_t position = 0; position < count; ++position) {
+        CadenceGridSegment& segment =
+            position == 0 ? snapshot_.current : snapshot_.older[position - 1];
+        if (segment.floor_interval_ticks != 0.0) {
+            segment.floor_interval_ticks = 0.0;
+            cleared = true;
+        }
+    }
+    if (cleared) ++snapshot_.sequence;
+    return cleared;
+}
+
 PacingEpochReason CadenceGrid::ObserveOutput(
     uint32_t controller_generation,
     uint64_t grid_index,
@@ -660,6 +812,8 @@ PacingEpochReason CadenceGrid::ObserveOutput(
         ++statistics_.unresolved_output_observations;
         return PacingEpochReason::None;
     }
+    // No floor carry: this restart is reached through PlanNext's regime (the unified pacer
+    // judges every output as GPU-paced and never gets here); a floor belongs to PlanAt only.
     StartSegment(&snapshot_, true, base_index, origin, interval_ticks);
     BeginEpoch(&snapshot_, PacingEpochReason::OutputLate, base_index);
     ++snapshot_.sequence;

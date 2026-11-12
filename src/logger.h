@@ -8,7 +8,9 @@
 
 enum class LogLevel { Error = 0, Warn = 1, Info = 2, Debug = 3 };
 
-// Initialize logger. Opens log file next to hModule DLL.
+// Initialize logger. Opens relimiter_<exe>.log (next to the game exe, else the addon DLL, else %TEMP%) after moving
+// the previous log to relimiter_<exe>.prev.log, then attaches the start-up breadcrumb (relimiter_<exe>.crumb, see
+// startup_breadcrumb.h) and warns once when the previous launch ended during start-up.
 void Log_Init(HMODULE hModule, LogLevel level);
 // Outside loader lock only. Closes admission, drains synchronous/buffered
 // producers, joins the flush worker, then closes the file. False retains state;

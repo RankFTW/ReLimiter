@@ -97,12 +97,15 @@ bool GpuReadiness_ReleaseAfterRundown() noexcept;
 void GpuReadiness_OnQueueDestroy(reshade::api::command_queue* queue) noexcept;
 void GpuReadiness_OnPresent(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain) noexcept;
 void GpuReadiness_OnFinishPresent(reshade::api::swapchain* swapchain) noexcept;
-// Developer key gpu_start_probe, from ReShade's execute_command_list event
-// (before the submission is forwarded; the game's thread): the first
-// submission on the queue a Present armed gets a Signal of ReLimiter's own in
-// front of it, which attributes the frame's GPU start to its readiness sample
-// (PacingReadyRecord gpu_first_submit_qpc, gpu_start_qpc). One atomic load
-// while nothing is armed; no D3D call with the key off.
+// Developer key gpu_start_probe. A Present's end queues the presenting queue; the next
+// RENDERSUBMIT_START of the presenting device (GpuReadiness_ArmProbeForFrame, from the
+// NvAPI and PCL marker hooks) arms it for that frame; from ReShade's
+// execute_command_list event (any submitting thread, before the submission is
+// forwarded) the first submission on the armed queue gets a Signal of ReLimiter's own in
+// front of it, which attributes the frame's GPU start to the readiness sample of the
+// Present with that frame's key (PacingReadyRecord gpu_first_submit_qpc, gpu_start_qpc).
+// One atomic load while nothing is queued or armed; no D3D call with the key off.
+void GpuReadiness_ArmProbeForFrame(uint32_t producer_epoch, uint64_t frame_id) noexcept;
 void GpuReadiness_OnExecuteCommandList(reshade::api::command_queue* queue) noexcept;
 
 // Thin native-hook scope: no GPU wait, fence creation, allocation or scheduler

@@ -984,7 +984,7 @@ class Phase4PlacementTests(TemporaryDirectoryTest):
     def test_governor_stretch_and_placement(self):
         rows_path, events_path = self.capture()
         report = pacing.analyze_capture(rows_path, events_path=events_path)
-        self.assertEqual(report["input"]["schema_profile"], "current-source-148")
+        self.assertEqual(report["input"]["schema_profile"], "current-source-199")
         controllers = report["controllers"]
         self.assertEqual((controllers["frames"], controllers["governed_frames"]), (8, 7))
         self.assertEqual(controllers["governor"], {
@@ -1050,8 +1050,18 @@ class InspectorTests(TemporaryDirectoryTest):
 
     def test_kind_detection_and_profiles(self):
         cases = [
-            (inspector.CURRENT_PACING_HEADER, "relimiter_pacing", "current-source-148"),
+            (inspector.CURRENT_PACING_HEADER, "relimiter_pacing", "current-source-199"),
             (inspector.CURRENT_PACING_EVENTS_HEADER, "relimiter_pacing_events", "current-source-86"),
+            (inspector.CURRENT_PACING_HEADER[:148], "relimiter_pacing", "historical-source-148"),
+            (inspector.CURRENT_PACING_HEADER[:189], "relimiter_pacing", "historical-source-189"),
+            (inspector.CURRENT_PACING_HEADER[:195], "relimiter_pacing", "historical-source-195"),
+            (inspector.CURRENT_PACING_HEADER[:198], "relimiter_pacing", "historical-source-198"),
+            (inspector.CURRENT_PACING_HEADER[:158], "relimiter_pacing", "historical-source-158"),
+            (inspector.CURRENT_PACING_HEADER[:159], "relimiter_pacing", "historical-source-159"),
+            (inspector.CURRENT_PACING_HEADER[:161], "relimiter_pacing", "historical-source-161"),
+            (inspector.CURRENT_PACING_HEADER[:162], "relimiter_pacing", "historical-source-162"),
+            (inspector.CURRENT_PACING_HEADER[:183], "relimiter_pacing", "historical-source-183"),
+            (inspector.CURRENT_PACING_HEADER[:172], "relimiter_pacing", "historical-source-172"),
             (inspector.CURRENT_PACING_HEADER[:142], "relimiter_pacing", "historical-source-142"),
             (inspector.CURRENT_PACING_HEADER[:140], "relimiter_pacing", "historical-source-140"),
             (inspector.CURRENT_PACING_HEADER[:138], "relimiter_pacing", "historical-source-138"),
@@ -1077,7 +1087,7 @@ class InspectorTests(TemporaryDirectoryTest):
         # phase1_purge_design.md section 3: append-only after the Phase 0 tables.
         rows = column_names("PACING_ROW_COLUMNS")
         events = column_names("PACING_EVENT_COLUMNS")
-        self.assertEqual((len(rows), len(events)), (148, 86))
+        self.assertEqual((len(rows), len(events)), (199, 86))
         self.assertEqual(rows[110:122], [
             "clock_map_offset_us", "predicted_render_us", "pcl_status", "pcl_input_ping_qpc",
             "pcl_effective_sim_start_qpc", "pcl_i2fs_us", "pcl_fs2p_us", "pcl_p2d_us", "pcl_total_us",
@@ -1118,7 +1128,24 @@ class InspectorTests(TemporaryDirectoryTest):
         # The driver's sleep status, the flip config and the GPU start probe (current).
         self.assertEqual(rows[142:], ["driver_sleep_interval_us", "driver_use_game_sleep",
                                       "flip_config_qpc", "flip_time_per_batch_us",
-                                      "gpu_first_submit_qpc", "gpu_start_qpc"])
+                                      "gpu_first_submit_qpc", "gpu_start_qpc",
+                                      "up_grid_target_qpc", "up_interval_us", "up_gpu_interval_us",
+                                      "up_gpu_service_us", "up_queue_wait_raw_us", "up_queue_wait_us",
+                                      "up_outstanding", "up_limit_wait_us", "up_ready_age_us", "up_flags",
+                                      "up_hold_budget_us", "up_service_sample_us", "up_gpu_wait_us",
+                                      "up_cycle_us", "gq_submits", "gq_first_submit_qpc",
+                                      "gq_first_start_qpc", "gq_last_submit_qpc", "gq_last_done_qpc",
+                                      "gq_empty_us", "gq_first_gap_us", "gq_stamp_late_us",
+                                      "gq_min_margin_us", "gq_wait_block_us", "gq_hold_block_us",
+                                      "gq_min_margin_free_us", "gq_boundary_idle_us", "gq_cycle_us",
+                                      "gq_wait_idle_us", "up_ql_base_us", "up_ql_need_us",
+                                      "up_ql_service_us", "up_ql_q_us", "up_ql_p_us", "up_ql_valid_frames",
+                                      "sim_end_marker_qpc", "render_submit_start_marker_qpc",
+                                      "render_submit_end_marker_qpc", "up_ql_rt_margin_us",
+                                      "up_ql_rt_offset_us", "up_ql_q_rt_us", "render_submit_cpu_us",
+                                      "sim_cpu_us", "render_submit_tid", "sim_tid", "render_submit_end_tid",
+                                      "sim_end_tid", "up_ql_rt_contrast_us", "up_ql_rt_spread_us",
+                                      "up_ql_rt_wait_us", "gq_queue_role"])
 
     def test_enum_tables_match_production(self):
         # C++ and Python share these enum values; the names follow src/pacing_core_types.h.

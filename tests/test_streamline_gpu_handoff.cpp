@@ -52,10 +52,26 @@ void Log_Write(LogLevel, const char*, ...) {
     }
     ++log_writes;
 }
+// No batch in these tests: an install enables its target as it returns MH_OK, so the target is enabled exactly then.
+static std::vector<void*> enabled_targets;
 MH_STATUS InstallHookPublished(void* target, void*, void* slot, HookOriginalPublisher publish) {
     ++installs; if (installs == fail_install) return MH_ERROR_MEMORY_ALLOC;
-    publish(slot,target); return MH_OK;
+    publish(slot,target); enabled_targets.push_back(target); return MH_OK;
 }
+MH_STATUS Hooks_FlushBatch() noexcept { return MH_OK; }
+bool Hooks_TargetEnabled(void* target) noexcept {
+    for (void* enabled_target : enabled_targets) if (enabled_target == target) return true;
+    return false;
+}
+// gpu_queue_probe (its D3D12 side is not linked here; the key stays off in these tests).
+unsigned GpuQueueProbe_ExecuteEnterActive(void*) noexcept { return 0; }
+void GpuQueueProbe_ExecuteLeaveActive(unsigned) noexcept {}
+unsigned GpuQueueProbe_WaitBeginActive(void*, void*, uint64_t) noexcept { return 0; }
+void GpuQueueProbe_WaitEndActive(unsigned) noexcept {}
+void GpuQueueProbe_DependencyExecuteActive(void*, unsigned) noexcept {}
+void GpuQueueProbe_DependencySignalActive(void*, void*, uint64_t) noexcept {}
+void GpuQueueProbe_DependencyWaitActive(void*, void*, uint64_t) noexcept {}
+void GpuQueueProbe_OnFgInputBoundary(void*, uint64_t, const PacingFrameKey&) noexcept {}
 bool GpuPresent_RequiresReadiness() noexcept { return enabled; }
 bool GpuPresent_IsFgSupported(uint32_t controller) noexcept { return scheduler_supported && controller == 3; }
 ReadyPresentConfig GpuPresent_GetConfig() noexcept { return {ReadyPresentMode::Active,500,8000,config}; }
@@ -413,7 +429,7 @@ int main() {
     CHECK(q::RuntimeMethods(q::targets));
     CHECK(!q::RuntimeMethods({1,2,3})); CHECK(!q::RuntimeMethods({q::targets[0],q::targets[0],q::targets[2]}));
     q::original_execute = &Execute; q::original_signal = &Signal; q::original_wait = &Wait;
-    q::ready = true; q::plugin_begin = 0x100; q::plugin_end = 0x200;
+    q::streamline_ready = true; q::plugin_begin = 0x100; q::plugin_end = 0x200;
         // Rejections before the first retained route must remain observable. No
         // marker/proxy/queue callback writes a log or relaxes admission to diagnose it.
         const auto quiet_logs = log_writes;
@@ -651,7 +667,7 @@ int main() {
     stopping = true; const auto prior_signals = signals;
     CHECK(Fence(&a,&forward_fence,1,0,true) == S_OK && signals == prior_signals + 1); stopping = false;
     StreamlineComEvidence methods; for (unsigned i=0;i<3;++i) methods.entries[6+i] = q::targets[i];
-    fail_install = 2; StreamlineQueue_Offer(methods); CHECK(installs == 3 && !q::ready);
+    fail_install = 2; StreamlineQueue_Offer(methods); CHECK(installs == 3 && !q::streamline_ready && !q::hooks_installed);
     StreamlineQueue_Offer(methods); CHECK(installs == 3);
     // Shared proxy wrapper forwards exactly, preserves LastError and never QIs
     // the original parameter array. Acquisition copies only standard methods.

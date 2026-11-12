@@ -271,6 +271,19 @@ static bool PacingRowIsGoverned(const PacingCsvRow& row)
     return row.joined.has_source && PacingControllerEvents_IsGoverned(row.joined.source);
 }
 
+// Unified pacer cells are empty unless the joined Source record carries the
+// start law's decision (up_valid).
+static bool PacingRowHasUnified(const PacingCsvRow& row)
+{
+    return row.joined.has_source && row.joined.source.up_valid != 0;
+}
+
+// GPU queue probe cells are empty unless the row joined a record whose valid bit for the field is set.
+static bool PacingRowHasGpuQueue(const PacingCsvRow& row, uint32_t bit)
+{
+    return row.joined.has_gpu_queue && (row.joined.gpu_queue.valid & bit) != 0;
+}
+
 using PacingRowColumnWriter = void (*)(CsvLine* line, const PacingCsvRow& row);
 struct PacingRowColumn {
     const char* name;
@@ -634,6 +647,193 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
         QpcIf(line, row.joined.has_ready, row.joined.ready.gpu_first_submit_qpc); } },
     { "gpu_start_qpc", [](CsvLine* line, const PacingCsvRow& row) {
         QpcIf(line, row.joined.has_ready, row.joined.ready.gpu_start_qpc); } },
+    // Appended (developer key unified_pacer): the start law's decision for
+    // the frame (PacingSourceRecord::up_*). Every cell is empty when the
+    // Source record is absent or up_valid is 0; each column also has its own
+    // rule: no T, no bindable I_gpu, fewer than 16 pairs, no used report,
+    // limit inactive (-1 outstanding), no completion yet.
+    { "up_grid_target_qpc", [](CsvLine* line, const PacingCsvRow& row) {
+        QpcIf(line, PacingRowHasUnified(row), row.joined.source.up_grid_target_qpc); } },
+    { "up_interval_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row), row.joined.source.up_interval_us); } },
+    { "up_gpu_interval_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row) && row.joined.source.up_gpu_interval_valid != 0,
+            row.joined.source.up_gpu_interval_us); } },
+    { "up_gpu_service_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row) && row.joined.source.up_gpu_service_valid != 0,
+            row.joined.source.up_gpu_service_us); } },
+    { "up_queue_wait_raw_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row) && row.joined.source.up_queue_wait_valid != 0,
+            row.joined.source.up_queue_wait_raw_us); } },
+    { "up_queue_wait_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row) && row.joined.source.up_queue_wait_valid != 0,
+            row.joined.source.up_queue_wait_us); } },
+    { "up_outstanding", [](CsvLine* line, const PacingCsvRow& row) {
+        if (PacingRowHasUnified(row) && row.joined.source.up_outstanding >= 0) {
+            line->Signed(row.joined.source.up_outstanding);
+        }
+        else {
+            line->Empty();
+        } } },
+    { "up_limit_wait_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row), row.joined.source.up_limit_wait_us); } },
+    { "up_ready_age_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row) && row.joined.source.up_ready_age_valid != 0,
+            row.joined.source.up_ready_age_us); } },
+    { "up_flags", [](CsvLine* line, const PacingCsvRow& row) {
+        UnsignedIf(line, PacingRowHasUnified(row), row.joined.source.up_flags); } },
+    // Appended (developer key unified_pacer): the signed hold credit at the
+    // frame's plan in µs. Positive = spare GPU time banked over the report
+    // window; 0.000 = none; negative = debt (the executors release the frame's
+    // targets earlier by the debt). Empty = key off or the report stream not live.
+    { "up_hold_budget_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row) && row.joined.source.up_hold_budget_valid != 0,
+            row.joined.source.up_hold_budget_us); } },
+    // Appended (developer key unified_pacer): the service sample the law used
+    // for the newest used report (completion spacing minus the GPU's wait for
+    // the frame's work, after the active-time rule) and that wait,
+    // max(0, -queue wait), in µs; empty when none or the key is off.
+    { "up_service_sample_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row) && row.joined.source.up_service_sample_valid != 0,
+            row.joined.source.up_service_sample_us); } },
+    { "up_gpu_wait_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row) && row.joined.source.up_gpu_wait_valid != 0,
+            row.joined.source.up_gpu_wait_us); } },
+    // Appended (developer key unified_hold_share): C, the measured frame
+    // interval (median completion spacing of the newest used reports) at the
+    // frame's plan, in µs; empty when C is not valid, the share is 0 or the
+    // key is off.
+    { "up_cycle_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row) && row.joined.source.up_cycle_valid != 0,
+            row.joined.source.up_cycle_us); } },
+    // Appended (developer key gpu_queue_probe): what the presenting queue did for the frame's
+    // submissions (ExecuteCommandLists calls between ReLimiter's Present-time enqueues), joined
+    // through the Present's (swapchain generation, present sequence). Each cell is empty when
+    // the row has no record or the field's valid bit is clear.
+    { "gq_submits", [](CsvLine* line, const PacingCsvRow& row) {
+        UnsignedIf(line, PacingRowHasGpuQueue(row, PacingGpuQueueRecord::kSubmits),
+            row.joined.gpu_queue.submits); } },
+    { "gq_first_submit_qpc", [](CsvLine* line, const PacingCsvRow& row) {
+        QpcIf(line, PacingRowHasGpuQueue(row, PacingGpuQueueRecord::kFirstSubmit),
+            row.joined.gpu_queue.first_submit_qpc); } },
+    { "gq_first_start_qpc", [](CsvLine* line, const PacingCsvRow& row) {
+        QpcIf(line, PacingRowHasGpuQueue(row, PacingGpuQueueRecord::kFirstStart),
+            row.joined.gpu_queue.first_start_qpc); } },
+    { "gq_last_submit_qpc", [](CsvLine* line, const PacingCsvRow& row) {
+        QpcIf(line, PacingRowHasGpuQueue(row, PacingGpuQueueRecord::kLastSubmit),
+            row.joined.gpu_queue.last_submit_qpc); } },
+    { "gq_last_done_qpc", [](CsvLine* line, const PacingCsvRow& row) {
+        QpcIf(line, PacingRowHasGpuQueue(row, PacingGpuQueueRecord::kLastDone),
+            row.joined.gpu_queue.last_done_qpc); } },
+    { "gq_empty_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasGpuQueue(row, PacingGpuQueueRecord::kEmpty),
+            row.joined.gpu_queue.empty_us); } },
+    { "gq_first_gap_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasGpuQueue(row, PacingGpuQueueRecord::kFirstGap),
+            row.joined.gpu_queue.first_gap_us); } },
+    { "gq_stamp_late_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasGpuQueue(row, PacingGpuQueueRecord::kStampLate),
+            row.joined.gpu_queue.stamp_late_us); } },
+    { "gq_min_margin_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasGpuQueue(row, PacingGpuQueueRecord::kMinMargin),
+            row.joined.gpu_queue.min_margin_us); } },
+    { "gq_wait_block_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasGpuQueue(row, PacingGpuQueueRecord::kWaitBlock),
+            row.joined.gpu_queue.wait_block_us); } },
+    // Appended (queue law inputs of the probe, timeline model): time submissions were kept waiting
+    // by ReLimiter's own hold, the smallest queue wait not counting that time, the time the queue
+    // was free of work and pending waits before the frame's first submission, the interval between
+    // this frame's last completion and the previous frame's, and the time queue Waits were pending
+    // with nothing queued behind them. Empty like the other gq_ cells.
+    { "gq_hold_block_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasGpuQueue(row, PacingGpuQueueRecord::kHoldBlock),
+            row.joined.gpu_queue.hold_block_us); } },
+    { "gq_min_margin_free_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasGpuQueue(row, PacingGpuQueueRecord::kMinMarginFree),
+            row.joined.gpu_queue.min_margin_free_us); } },
+    { "gq_boundary_idle_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasGpuQueue(row, PacingGpuQueueRecord::kBoundaryIdle),
+            row.joined.gpu_queue.boundary_idle_us); } },
+    { "gq_cycle_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasGpuQueue(row, PacingGpuQueueRecord::kCycle),
+            row.joined.gpu_queue.cycle_us); } },
+    { "gq_wait_idle_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasGpuQueue(row, PacingGpuQueueRecord::kWaitIdle),
+            row.joined.gpu_queue.wait_idle_us); } },
+    // Appended (developer key unified_queue_law): the queue law's statistics at the frame's plan.
+    // The four value cells are empty when the law was not computable or the key was off;
+    // up_ql_valid_frames is empty without a window.
+    { "up_ql_base_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row) && row.joined.source.up_ql_valid != 0,
+            row.joined.source.up_ql_base_us); } },
+    { "up_ql_need_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row) && row.joined.source.up_ql_valid != 0,
+            row.joined.source.up_ql_need_us); } },
+    { "up_ql_service_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row) && row.joined.source.up_ql_valid != 0,
+            row.joined.source.up_ql_service_us); } },
+    { "up_ql_q_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row) && row.joined.source.up_ql_valid != 0,
+            row.joined.source.up_ql_q_us); } },
+    { "up_ql_p_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row) && row.joined.source.up_ql_valid != 0,
+            row.joined.source.up_ql_p_us); } },
+    { "up_ql_valid_frames", [](CsvLine* line, const PacingCsvRow& row) {
+        if (PacingRowHasUnified(row) && row.joined.source.up_ql_valid_frames >= 0) {
+            line->Signed(row.joined.source.up_ql_valid_frames);
+        }
+        else {
+            line->Empty();
+        } } },
+    // Appended (developer key unified_queue_upstream, 1): the frame's own marker stamps (QPC; empty
+    // when the key is 0 or the stamp was not seen). The three cells after them were the render-thread
+    // margin, the offset c' and the render-thread queue term of the queue law; the render-thread
+    // terms were removed, the columns stay for a stable header and are always 0 on a row the
+    // unified pacer decided (empty on every other row).
+    { "sim_end_marker_qpc", [](CsvLine* line, const PacingCsvRow& row) {
+        QpcIf(line, row.joined.has_source, row.joined.source.sim_end_marker_qpc); } },
+    { "render_submit_start_marker_qpc", [](CsvLine* line, const PacingCsvRow& row) {
+        QpcIf(line, row.joined.has_source, row.joined.source.render_submit_start_marker_qpc); } },
+    { "render_submit_end_marker_qpc", [](CsvLine* line, const PacingCsvRow& row) {
+        QpcIf(line, row.joined.has_source, row.joined.source.render_submit_end_marker_qpc); } },
+    { "up_ql_rt_margin_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row), 0.0); } },
+    { "up_ql_rt_offset_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row), 0.0); } },
+    { "up_ql_q_rt_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row), 0.0); } },
+    // Appended (developer key unified_queue_upstream, 1): the CPU time of the thread inside the
+    // frame's render-submit and simulation spans (µs; empty when the span's markers were not on
+    // one thread or a stamp is missing) and the ids of the threads that sent the markers (empty
+    // at 0).
+    { "render_submit_cpu_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, row.joined.has_source && row.joined.source.render_submit_cpu_valid != 0,
+            row.joined.source.render_submit_cpu_us); } },
+    { "sim_cpu_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, row.joined.has_source && row.joined.source.sim_cpu_valid != 0,
+            row.joined.source.sim_cpu_us); } },
+    { "render_submit_tid", [](CsvLine* line, const PacingCsvRow& row) {
+        NonZeroIf(line, row.joined.has_source, row.joined.source.render_submit_tid); } },
+    { "sim_tid", [](CsvLine* line, const PacingCsvRow& row) {
+        NonZeroIf(line, row.joined.has_source, row.joined.source.sim_tid); } },
+    { "render_submit_end_tid", [](CsvLine* line, const PacingCsvRow& row) {
+        NonZeroIf(line, row.joined.has_source, row.joined.source.render_submit_end_tid); } },
+    { "sim_end_tid", [](CsvLine* line, const PacingCsvRow& row) {
+        NonZeroIf(line, row.joined.has_source, row.joined.source.sim_end_tid); } },
+    // Appended (formerly the render-thread feed rule's contrast and spread and the span wait of the
+    // record that entered the window): the rule was removed, the columns stay for a stable header
+    // and are always 0 on a row the unified pacer decided (empty on every other row).
+    { "up_ql_rt_contrast_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row), 0.0); } },
+    { "up_ql_rt_spread_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row), 0.0); } },
+    { "up_ql_rt_wait_us", [](CsvLine* line, const PacingCsvRow& row) {
+        DecimalIf(line, PacingRowHasUnified(row), 0.0); } },
+    // Appended (developer key gpu_queue_probe): which queue the probe record describes (1 the
+    // presenting queue, 2 the frame generation source queue, 3 the render queue found by fence
+    // dependencies); empty when the row has no probe record or the role is unknown.
+    { "gq_queue_role", [](CsvLine* line, const PacingCsvRow& row) {
+        NonZeroIf(line, row.joined.has_gpu_queue, row.joined.gpu_queue.queue_role); } },
 };
 
 static const char* PacingEventTypeText(PacingCsvEventType type)

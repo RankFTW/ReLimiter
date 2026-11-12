@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pacing_core_types.h"
+#include <cstddef>
 #include <cstdint>
 
 // Native Present route: PRESENT_START -> native Present
@@ -119,6 +120,43 @@ void NativeGate_EndScope(uint64_t native_swapchain, uint64_t generation) noexcep
 // Native Present scopes that took their PRESENT_START from another thread
 // (cross-thread hand-off); cumulative, for the runtime log.
 uint64_t NativeGate_CrossThreadAdoptions() noexcept;
+// Native route diagnostics, cumulative: game Presents rejected at the identity guard of the hooked
+// Present (present1 false) or Present1 body (self is not the swapchain the swap manager holds), and
+// scopes that ended with no counted Present call (calls_ == 0). Relaxed counters, no other effect.
+void NativeGate_NotePresentRejected(bool present1) noexcept;
+uint64_t NativeGate_PresentsRejected(bool present1) noexcept;
+uint64_t NativeGate_ScopesWithoutCalls() noexcept;
+// Route diagnostics (log text only; no decision reads them): cumulative relaxed counters of where the
+// Present path of the native route is entered and what each gate step saw, so a route that never
+// qualifies can be told apart from the log. TypedPresent/TypedPresent1 count entries of the inline
+// patch's detours, VtablePresent/VtablePresent1 entries of the private vtable copy's detours (the route's
+// normal entry); InnerPassThrough counts the entries of either kind that passed straight to their
+// original because the same object was already inside a detour on that thread (the body runs once, in
+// the outermost entry).
+enum class NativeGateEntry : uint8_t {
+    OnPresent, TypedPresent, TypedPresent1, BeginScope, EndScope, GateCall,
+    VtablePresent, VtablePresent1, InnerPassThrough, Count };
+// One increment, and the thread id when it differs from the last seen.
+void NativeGate_NoteEntry(NativeGateEntry entry) noexcept;
+enum class NativeGateCallOutcome : uint8_t {
+    Mapped, UnmappedNoPending, UnmappedNoScope, UnmappedInvalid, Nested, Stale, SpecialPresent, MultipleCalls, Count };
+enum class NativeGateScopeEvent : uint8_t {
+    NoPending, NativeMismatch, GenerationMismatch, AlreadyOpen, ZeroGeneration,
+    EndNativeMismatch, EndGenerationMismatch, Count };
+struct NativeGateDiagnostics {
+    uint64_t entries[static_cast<size_t>(NativeGateEntry::Count)];
+    uint32_t entry_thread[static_cast<size_t>(NativeGateEntry::Count)];
+    uint64_t call[static_cast<size_t>(NativeGateCallOutcome::Count)]; // BeginCall outcomes
+    uint64_t flags_zero, flags_test, flags_do_not_wait, flags_other;  // Present flags at the gate
+    uint64_t scope[static_cast<size_t>(NativeGateScopeEvent::Count)];
+    uint64_t present_rejected, present1_rejected, scopes_without_call;
+    // The scope (native, generation) against the marker-time context at the last change of that pair.
+    uint64_t mismatch_sequence, mismatch_scope_native, mismatch_scope_generation,
+        mismatch_marker_native, mismatch_marker_generation;
+};
+NativeGateDiagnostics NativeGate_Diagnostics() noexcept;
+// The counters as one line of text (no newline); returns the length written (truncated to size).
+size_t NativeGate_DiagnosticsText(char* out, size_t size) noexcept;
 // A PRESENT_START that does not reach NativeGate_OnMarker (stale token):
 // withdraws the published frame so no Present takes an older one.
 void NativeGate_WithdrawMarker() noexcept;

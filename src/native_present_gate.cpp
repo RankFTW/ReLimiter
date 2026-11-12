@@ -1,6 +1,14 @@
 #include "native_present_gate.h"
 #include "cross_thread_slot.h"
 #include <atomic>
+#include <cstdio>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <Windows.h>
 
 namespace {
 std::atomic<uint64_t> s_config{0}; // mode in low two bits, generation above
@@ -41,6 +49,52 @@ std::atomic<uint64_t> s_handoff_adoptions{0};
 std::atomic<uint32_t> s_cross_agreements{0};   // consecutive verified Presents
 std::atomic<bool> s_cross_verified{false};
 std::atomic<uint64_t> s_cross_disagreements{0};
+// Native route diagnostics (cumulative, relaxed): Presents rejected at the identity guard of each
+// hooked Present body, and scopes that ended with no counted Present call.
+std::atomic<uint64_t> s_present_rejected{0};
+std::atomic<uint64_t> s_present1_rejected{0};
+std::atomic<uint64_t> s_scopes_without_calls{0};
+// Route diagnostics (log text only; relaxed, no decision reads them).
+struct RouteDiag {
+    std::atomic<uint64_t> entries[static_cast<size_t>(NativeGateEntry::Count)]{};
+    std::atomic<uint32_t> entry_thread[static_cast<size_t>(NativeGateEntry::Count)]{};
+    std::atomic<uint64_t> call[static_cast<size_t>(NativeGateCallOutcome::Count)]{};
+    std::atomic<uint64_t> flags[4]{}; // zero, TEST, DO_NOT_WAIT, other
+    std::atomic<uint64_t> scope[static_cast<size_t>(NativeGateScopeEvent::Count)]{};
+    std::atomic<uint64_t> mismatch[4]{}; // scope native/generation, marker-time native/generation
+    std::atomic<uint64_t> mismatch_sequence{0};
+};
+RouteDiag s_diag;
+void NoteScopeEvent(NativeGateScopeEvent event) noexcept {
+    s_diag.scope[static_cast<size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+}
+// The sequence changes only when the (scope, marker-time) pair changes, so a log keyed on it prints
+// the first mismatch and then each change, not every frame.
+void NoteScopeMismatch(uint64_t scope_native, uint64_t scope_generation, uint64_t marker_native,
+    uint64_t marker_generation) noexcept {
+    const uint64_t values[4] = {scope_native, scope_generation, marker_native, marker_generation};
+    bool same = s_diag.mismatch_sequence.load(std::memory_order_relaxed) != 0;
+    for (size_t i = 0; i < 4 && same; ++i) same = s_diag.mismatch[i].load(std::memory_order_relaxed) == values[i];
+    if (same) return;
+    for (size_t i = 0; i < 4; ++i) s_diag.mismatch[i].store(values[i], std::memory_order_relaxed);
+    s_diag.mismatch_sequence.fetch_add(1, std::memory_order_release);
+}
+void NoteCallOutcome(NativeGateStatus status, bool pending, bool scope, uint32_t flags) noexcept {
+    NativeGateCallOutcome outcome = NativeGateCallOutcome::Mapped;
+    switch (status) {
+    case NativeGateStatus::Unmapped:
+        outcome = !pending ? NativeGateCallOutcome::UnmappedNoPending
+                : !scope ? NativeGateCallOutcome::UnmappedNoScope : NativeGateCallOutcome::UnmappedInvalid;
+        break;
+    case NativeGateStatus::Nested: outcome = NativeGateCallOutcome::Nested; break;
+    case NativeGateStatus::Stale: outcome = NativeGateCallOutcome::Stale; break;
+    case NativeGateStatus::SpecialPresent: outcome = NativeGateCallOutcome::SpecialPresent; break;
+    case NativeGateStatus::MultipleCalls: outcome = NativeGateCallOutcome::MultipleCalls; break;
+    default: break;
+    }
+    s_diag.call[static_cast<size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+    s_diag.flags[flags == 0 ? 0 : (flags & 0x1u) ? 1 : (flags & 0x8u) ? 2 : 3].fetch_add(1, std::memory_order_relaxed);
+}
 thread_local uint64_t s_local_marker_sequence = 0; // published by this thread's newest marker
 thread_local bool s_presents_own_markers = false;  // this thread completed a scope with its own marker
 thread_local bool s_pending_adopted = false;       // the route's pending frame came from another thread
@@ -142,8 +196,16 @@ void NativePresentGateRoute::MarkerReleased(int64_t qpc) noexcept {
     if (pending_) trace_.marker_release_qpc = qpc;
 }
 void NativePresentGateRoute::BeginScope(uint64_t native, uint64_t generation) noexcept {
-    if (!pending_) return;
-    if (scope_ || native != context_.native_swapchain || generation != context_.swapchain_generation) {
+    if (generation == 0) NoteScopeEvent(NativeGateScopeEvent::ZeroGeneration);
+    if (!pending_) { NoteScopeEvent(NativeGateScopeEvent::NoPending); return; }
+    const bool native_mismatch = native != context_.native_swapchain;
+    const bool generation_mismatch = generation != context_.swapchain_generation;
+    if (scope_ || native_mismatch || generation_mismatch) {
+        if (scope_) NoteScopeEvent(NativeGateScopeEvent::AlreadyOpen);
+        if (native_mismatch) NoteScopeEvent(NativeGateScopeEvent::NativeMismatch);
+        if (generation_mismatch) NoteScopeEvent(NativeGateScopeEvent::GenerationMismatch);
+        if (native_mismatch || generation_mismatch)
+            NoteScopeMismatch(native, generation, context_.native_swapchain, context_.swapchain_generation);
         invalid_ = true;
         qualified_ = 0;
         status_ = NativeGateStatus::Unmapped;
@@ -154,6 +216,9 @@ void NativePresentGateRoute::BeginScope(uint64_t native, uint64_t generation) no
 bool NativePresentGateRoute::EndScope(uint64_t native, uint64_t generation,
     NativeGateTrace* completed) noexcept {
     if (!pending_) return false;
+    if (native != context_.native_swapchain) NoteScopeEvent(NativeGateScopeEvent::EndNativeMismatch);
+    if (generation != context_.swapchain_generation) NoteScopeEvent(NativeGateScopeEvent::EndGenerationMismatch);
+    if (calls_ == 0) s_scopes_without_calls.fetch_add(1, std::memory_order_relaxed);
     bool valid = false;
     if (native != context_.native_swapchain || generation != context_.swapchain_generation ||
         !scope_ || invalid_ || !completed_ || calls_ != 1 || depth_ != 0 ||
@@ -201,6 +266,7 @@ NativeGateTrace NativePresentGateRoute::BeginCall(const NativeGateContext& c,
     }
     native_selected_ = false; // one native hold maximum, including failures/retries
     status_ = result.status;
+    NoteCallOutcome(result.status, pending_, scope_, flags);
     return result;
 }
 void NativePresentGateRoute::EndCall(bool success, bool retried,
@@ -302,6 +368,7 @@ void NativeGate_OnMarkerReleased(int64_t qpc) noexcept {
     s_handoff.Amend(s_local_marker_sequence, [qpc](MarkerHandoff* record) { record->release_qpc = qpc; });
 }
 void NativeGate_BeginScope(uint64_t native, uint64_t generation) noexcept {
+    NativeGate_NoteEntry(NativeGateEntry::BeginScope);
     ClaimOrAdoptMarker();
     s_route.BeginScope(native, generation);
 }
@@ -309,6 +376,7 @@ uint64_t NativeGate_CrossThreadAdoptions() noexcept {
     return s_handoff_adoptions.load(std::memory_order_relaxed);
 }
 void NativeGate_EndScope(uint64_t native, uint64_t generation) noexcept {
+    NativeGate_NoteEntry(NativeGateEntry::EndScope);
     const bool adopted = s_pending_adopted;
     NativeGateTrace completed{};
     const bool valid = s_route.EndScope(native, generation, &completed);
@@ -338,7 +406,84 @@ bool NativeGate_CrossThreadVerified() noexcept { return s_cross_verified.load(st
 uint64_t NativeGate_CrossThreadDisagreements() noexcept {
     return s_cross_disagreements.load(std::memory_order_relaxed);
 }
+void NativeGate_NotePresentRejected(bool present1) noexcept {
+    (present1 ? s_present1_rejected : s_present_rejected).fetch_add(1, std::memory_order_relaxed);
+}
+uint64_t NativeGate_PresentsRejected(bool present1) noexcept {
+    return (present1 ? s_present1_rejected : s_present_rejected).load(std::memory_order_relaxed);
+}
+uint64_t NativeGate_ScopesWithoutCalls() noexcept {
+    return s_scopes_without_calls.load(std::memory_order_relaxed);
+}
+void NativeGate_NoteEntry(NativeGateEntry entry) noexcept {
+    const size_t index = static_cast<size_t>(entry);
+    if (index >= static_cast<size_t>(NativeGateEntry::Count)) return;
+    s_diag.entries[index].fetch_add(1, std::memory_order_relaxed);
+    const uint32_t thread = GetCurrentThreadId();
+    if (s_diag.entry_thread[index].load(std::memory_order_relaxed) != thread)
+        s_diag.entry_thread[index].store(thread, std::memory_order_relaxed);
+}
+NativeGateDiagnostics NativeGate_Diagnostics() noexcept {
+    NativeGateDiagnostics out{};
+    for (size_t i = 0; i < static_cast<size_t>(NativeGateEntry::Count); ++i) {
+        out.entries[i] = s_diag.entries[i].load(std::memory_order_relaxed);
+        out.entry_thread[i] = s_diag.entry_thread[i].load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < static_cast<size_t>(NativeGateCallOutcome::Count); ++i)
+        out.call[i] = s_diag.call[i].load(std::memory_order_relaxed);
+    out.flags_zero = s_diag.flags[0].load(std::memory_order_relaxed);
+    out.flags_test = s_diag.flags[1].load(std::memory_order_relaxed);
+    out.flags_do_not_wait = s_diag.flags[2].load(std::memory_order_relaxed);
+    out.flags_other = s_diag.flags[3].load(std::memory_order_relaxed);
+    for (size_t i = 0; i < static_cast<size_t>(NativeGateScopeEvent::Count); ++i)
+        out.scope[i] = s_diag.scope[i].load(std::memory_order_relaxed);
+    out.present_rejected = s_present_rejected.load(std::memory_order_relaxed);
+    out.present1_rejected = s_present1_rejected.load(std::memory_order_relaxed);
+    out.scopes_without_call = s_scopes_without_calls.load(std::memory_order_relaxed);
+    out.mismatch_sequence = s_diag.mismatch_sequence.load(std::memory_order_acquire);
+    out.mismatch_scope_native = s_diag.mismatch[0].load(std::memory_order_relaxed);
+    out.mismatch_scope_generation = s_diag.mismatch[1].load(std::memory_order_relaxed);
+    out.mismatch_marker_native = s_diag.mismatch[2].load(std::memory_order_relaxed);
+    out.mismatch_marker_generation = s_diag.mismatch[3].load(std::memory_order_relaxed);
+    return out;
+}
+size_t NativeGate_DiagnosticsText(char* out, size_t size) noexcept {
+    if (!out || size == 0) return 0;
+    const NativeGateDiagnostics d = NativeGate_Diagnostics();
+    using E = NativeGateEntry;
+    using C = NativeGateCallOutcome;
+    using S = NativeGateScopeEvent;
+    auto ull = [](uint64_t v) { return static_cast<unsigned long long>(v); };
+    auto entry = [&](E e) { return d.entries[static_cast<size_t>(e)]; };
+    auto thread = [&](E e) { return static_cast<unsigned long>(d.entry_thread[static_cast<size_t>(e)]); };
+    auto call = [&](C c) { return ull(d.call[static_cast<size_t>(c)]); };
+    auto scope = [&](S s) { return ull(d.scope[static_cast<size_t>(s)]); };
+    const int written = std::snprintf(out, size,
+        "entries on_present=%llu(t%lu) typed_present=%llu(t%lu) typed_present1=%llu(t%lu) "
+        "begin_scope=%llu(t%lu) end_scope=%llu(t%lu) gate_call=%llu(t%lu) "
+        "vtable_present=%llu(t%lu) vtable_present1=%llu(t%lu) inner_pass_through=%llu(t%lu); "
+        "present_rejected=%llu present1_rejected=%llu scopes_without_call=%llu; "
+        "begin_call mapped=%llu unmapped_no_pending=%llu unmapped_no_scope=%llu unmapped_invalid=%llu "
+        "nested=%llu stale=%llu special=%llu multiple=%llu; "
+        "flags zero=%llu test=%llu do_not_wait=%llu other=%llu; "
+        "begin_scope no_pending=%llu native_mismatch=%llu generation_mismatch=%llu already_open=%llu "
+        "zero_generation=%llu; end_scope native_mismatch=%llu generation_mismatch=%llu",
+        ull(entry(E::OnPresent)), thread(E::OnPresent), ull(entry(E::TypedPresent)), thread(E::TypedPresent),
+        ull(entry(E::TypedPresent1)), thread(E::TypedPresent1), ull(entry(E::BeginScope)), thread(E::BeginScope),
+        ull(entry(E::EndScope)), thread(E::EndScope), ull(entry(E::GateCall)), thread(E::GateCall),
+        ull(entry(E::VtablePresent)), thread(E::VtablePresent), ull(entry(E::VtablePresent1)), thread(E::VtablePresent1),
+        ull(entry(E::InnerPassThrough)), thread(E::InnerPassThrough),
+        ull(d.present_rejected), ull(d.present1_rejected), ull(d.scopes_without_call),
+        call(C::Mapped), call(C::UnmappedNoPending), call(C::UnmappedNoScope), call(C::UnmappedInvalid),
+        call(C::Nested), call(C::Stale), call(C::SpecialPresent), call(C::MultipleCalls),
+        ull(d.flags_zero), ull(d.flags_test), ull(d.flags_do_not_wait), ull(d.flags_other),
+        scope(S::NoPending), scope(S::NativeMismatch), scope(S::GenerationMismatch), scope(S::AlreadyOpen),
+        scope(S::ZeroGeneration), scope(S::EndNativeMismatch), scope(S::EndGenerationMismatch));
+    if (written < 0) { out[0] = '\0'; return 0; }
+    return static_cast<size_t>(written) < size ? static_cast<size_t>(written) : size - 1;
+}
 NativeGateCall::NativeGateCall(const NativeGateContext& c, uint32_t flags) noexcept {
+    NativeGate_NoteEntry(NativeGateEntry::GateCall);
     const uint64_t config = s_config.load(std::memory_order_acquire);
     trace = s_route.BeginCall(c, flags, config >> 2);
     trace.mode = RouteMode(config);

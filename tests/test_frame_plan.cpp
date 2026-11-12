@@ -60,6 +60,8 @@ namespace
         plan.rung = static_cast<PacingRung>(counter % 5);
         plan.mode = static_cast<PacingTimingMode>(counter % 4);
         plan.marker = static_cast<PacingSourceMarker>(counter % 3);
+        plan.hold_advance_us = counter % 3 == 0 ? 0.0f : static_cast<float>(counter) * 0.5f;
+        plan.law_hold_sequence = counter % 2 == 0 ? 0 : 1'000'000'000'000ull + counter; // a 64-bit identity
         return plan;
     }
 
@@ -86,7 +88,9 @@ namespace
             left.fg_divisor == right.fg_divisor &&
             left.rung == right.rung &&
             left.mode == right.mode &&
-            left.marker == right.marker;
+            left.marker == right.marker &&
+            left.hold_advance_us == right.hold_advance_us &&
+            left.law_hold_sequence == right.law_hold_sequence;
     }
 
     bool PlanMatchesCounter(const PacingFramePlan& plan, const PacingPlanKey& key)
@@ -690,13 +694,134 @@ namespace
         while (FramePlan_PopStageEvent(&event)) ++drained;
         CHECK(drained == PacingStageEventQueue::kCapacity);
     }
+
+    // ── Hard-limit ready maxima (developer key unified_pacer) ──
+
+    int s_ready_wakes = 0;
+    const void* s_ready_wake_address = nullptr;
+
+    PacingStageEvent ReadyEvent(uint64_t index, int64_t qpc, PacingStageEventKind kind = PacingStageEventKind::GpuReady)
+    {
+        PacingStageEvent event{};
+        event.key = MakeKey(index, 1);
+        event.grid_index = index;
+        event.qpc = qpc;
+        event.kind = kind;
+        event.rung = PacingRung::SourceOnly;
+        return event;
+    }
+
+    void ResetReadyMaxima()
+    {
+        PacingStageEvent drained{};
+        while (FramePlan_PopStageEvent(&drained)) {}
+        g_up_ready_index.store(0);
+        g_up_ready_qpc.store(0);
+        s_ready_wakes = 0;
+        s_ready_wake_address = nullptr;
+    }
+
+    // Two independent monotone maxima: an older value is never stored, a producer that loses a
+    // race simply stops, and every index raise (only) wakes the waiters.
+    void TestReadyMaximaOrdering()
+    {
+        ResetReadyMaxima();
+        FramePlan_SetReadyWaker([](const void* address) noexcept {
+            ++s_ready_wakes;
+            s_ready_wake_address = address;
+        });
+
+        // Key off (publish flag clear): nothing is published.
+        CHECK(!g_up_ready_publish.load());
+        FramePlan_PushStageEvent(ReadyEvent(3, 300));
+        CHECK(g_up_ready_index.load() == 0 && g_up_ready_qpc.load() == 0 && s_ready_wakes == 0);
+
+        g_up_ready_publish.store(true);
+        FramePlan_PushStageEvent(ReadyEvent(5, 500));
+        CHECK(g_up_ready_index.load() == 5 && g_up_ready_qpc.load() == 500);
+        CHECK(s_ready_wakes == 1 && s_ready_wake_address == &g_up_ready_index);
+
+        // An older producer (index 4, QPC 450) that arrives after: nothing is stored, no wake.
+        FramePlan_PushStageEvent(ReadyEvent(4, 450));
+        CHECK(g_up_ready_index.load() == 5 && g_up_ready_qpc.load() == 500 && s_ready_wakes == 1);
+        // The same index again: no raise.
+        FramePlan_PushStageEvent(ReadyEvent(5, 480));
+        CHECK(g_up_ready_index.load() == 5 && g_up_ready_qpc.load() == 500 && s_ready_wakes == 1);
+
+        // The two maxima are independent: a lower index with a newer QPC raises only the QPC
+        // (the completion evidence is fresher), a higher index with an older QPC raises only the index.
+        FramePlan_RaiseReady(4, 700);
+        CHECK(g_up_ready_index.load() == 5 && g_up_ready_qpc.load() == 700 && s_ready_wakes == 1);
+        FramePlan_RaiseReady(8, 600);
+        CHECK(g_up_ready_index.load() == 8 && g_up_ready_qpc.load() == 700 && s_ready_wakes == 2);
+
+        // Other stage events and an unkeyed grid index publish nothing.
+        FramePlan_PushStageEvent(ReadyEvent(20, 2000, PacingStageEventKind::OutputRelease));
+        FramePlan_PushStageEvent(ReadyEvent(0, 3000));
+        CHECK(g_up_ready_index.load() == 8 && g_up_ready_qpc.load() == 700 && s_ready_wakes == 2);
+
+        g_up_ready_publish.store(false);
+        FramePlan_SetReadyWaker(nullptr);
+        ResetReadyMaxima();
+    }
+
+    // Several producers and one reader with fixed counts: both values are monotone for the reader
+    // at every read and end at the maxima; no producer waits for another.
+    void TestReadyMaximaProducersAndReader()
+    {
+        ResetReadyMaxima();
+        g_up_ready_publish.store(true);
+        constexpr unsigned kProducers = 3;
+        constexpr uint64_t kPerProducer = 20000;
+        std::atomic<unsigned> started{0};
+        std::atomic<bool> done{false};
+        std::atomic<uint64_t> backwards{0};
+        std::atomic<uint64_t> reads{0};
+        std::vector<std::thread> threads;
+        for (unsigned producer = 0; producer < kProducers; ++producer) {
+            threads.emplace_back([&, producer]() {
+                started.fetch_add(1);
+                while (started.load() < kProducers) {}
+                for (uint64_t step = 0; step < kPerProducer; ++step) {
+                    const uint64_t index = step * kProducers + producer + 1;
+                    FramePlan_PushStageEvent(ReadyEvent(index, static_cast<int64_t>(index) * 10));
+                    // (the queue's consumer is the reader thread only: Pop has a single consumer)
+                }
+            });
+        }
+        std::thread reader([&]() {
+            uint64_t last_index = 0;
+            int64_t last_qpc = 0;
+            PacingStageEvent drained{};
+            while (!done.load(std::memory_order_acquire)) {
+                while (FramePlan_PopStageEvent(&drained)) {}
+                const int64_t qpc = g_up_ready_qpc.load(std::memory_order_acquire);
+                const uint64_t index = g_up_ready_index.load(std::memory_order_acquire);
+                reads.fetch_add(1, std::memory_order_relaxed);
+                if (index < last_index || qpc < last_qpc) backwards.fetch_add(1);
+                last_index = index;
+                last_qpc = qpc;
+            }
+        });
+        for (unsigned producer = 0; producer < kProducers; ++producer) threads[producer].join();
+        done.store(true, std::memory_order_release);
+        reader.join();
+
+        CHECK(g_up_ready_index.load() == kPerProducer * kProducers);
+        CHECK(g_up_ready_qpc.load() == static_cast<int64_t>(kPerProducer * kProducers) * 10);
+        CHECK(backwards.load() == 0);
+        std::printf("ready maxima: %llu reads against %u producers\n",
+            static_cast<unsigned long long>(reads.load()), kProducers);
+        g_up_ready_publish.store(false);
+        ResetReadyMaxima();
+    }
 }
 
 int main()
 {
     std::printf("sizeof(FramePlanRegistry) = %zu bytes, sizeof(PacingStageEventQueue) = %zu bytes\n",
         sizeof(FramePlanRegistry), sizeof(PacingStageEventQueue));
-    CHECK(sizeof(FramePlanRegistry) == FramePlanRegistry::kCapacity * 96);
+    CHECK(sizeof(FramePlanRegistry) == FramePlanRegistry::kCapacity * 104);
 
     TestExactKeyFind();
     TestInvalidKeyRejected();
@@ -710,6 +835,8 @@ int main()
     TestStageQueueOrderAndDrops();
     TestStageQueueMultiProducerFifo();
     TestGlobalStageQueue();
+    TestReadyMaximaOrdering();
+    TestReadyMaximaProducersAndReader();
 
     if (s_failures != 0) {
         std::fprintf(stderr, "%d frame-plan checks failed\n", s_failures);

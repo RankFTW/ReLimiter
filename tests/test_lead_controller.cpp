@@ -5610,10 +5610,853 @@ void TestGpuNeedWindow()
     CHECK(held->Statistics().invalid_inputs == 0);
 }
 
+namespace
+{
+    // An H0 frame released at s = index·I with T = s + 5,000, whose anchor B
+    // lies anchor_before_us before s (NaN: no anchor) and whose output
+    // arrives x_us after s.
+    void FeedAnchoredH0(LeadController* controller, uint64_t index, double x_us, double anchor_before_us)
+    {
+        const double source_us = static_cast<double>(index) * kInterval;
+        LeadFrameStart start = Start(index, PacingRung::SourceOnly, source_us);
+        SetLead(&start, 5000.0);
+        if (!std::isnan(anchor_before_us)) {
+            start.lead_anchor_qpc = Qpc(source_us - anchor_before_us);
+            start.anchored = true;
+        }
+        controller->OnSourceRelease(start);
+        controller->OnStageEvent(Event(index, Kind::MarkerArrival, source_us + x_us));
+    }
+
+    // FG input wait frames of the spike loop's shape (FG 2×, I = 10,000) with
+    // a varying simulation, GPU floor releases on every second frame and the
+    // anchor of one mode; the controller's lead drives the release.
+    // mode 0: no anchor; 1: B = s; 2: B after s; 3: a negative B; 4: no
+    // anchor, but LeadRequest::anchor_offset_us set.
+    struct AnchorLoop {
+        std::unique_ptr<LeadController> controller = MakeController();
+        LeadRequest request = Request(PacingRung::FgInputWait, 500.0, kInterval, 2.0);
+        std::vector<double> leads;
+        uint64_t n = 0;
+        double gate = 0.0;
+        double present_end = 0.0;
+        double lead = 0.0;
+
+        void Frame(int mode)
+        {
+            ++n;
+            request.anchor_offset_us = mode == 4 ? 3000.0 : 0.0;
+            lead = controller->NextLeadUs(request);
+            leads.push_back(lead);
+            const double sim_us = n % 64 == 10 ? 10000.0 : 2000.0 + static_cast<double>(n * 37 % 11) * 100.0;
+            const double target = 100'000.0 + static_cast<double>(n) * kInterval;
+            const double source = target - lead;
+            const double simulated = source + sim_us;
+            const double submit = std::max(simulated, present_end);
+            const double gpu_start = std::max(gate > 0.0 ? gate + 2000.0 : 0.0, submit + 500.0);
+            const double ready = gpu_start + 7000.0;
+            const bool held = ready <= target;
+            const double release = held ? target : ready;
+            LeadFrameStart start = Start(n, PacingRung::FgInputWait, source, kInterval, 2.0);
+            SetLead(&start, lead);
+            start.gpu_floor_release = n % 2 == 0;
+            // The owner's unified branch passes the anchor with the flag; B = s, B after s and
+            // a non-positive B are anchors the controller ignores.
+            if (mode == 1) start.lead_anchor_qpc = start.source_release_qpc;
+            if (mode == 2) start.lead_anchor_qpc = start.source_release_qpc + 5000;
+            if (mode == 3) start.lead_anchor_qpc = -5000;
+            start.anchored = mode >= 1 && mode <= 3;
+            controller->OnSourceRelease(start);
+            controller->OnStageEvent(Event(n, Kind::SimulationEnd, simulated));
+            controller->OnStageEvent(Event(n, Kind::RenderSubmitStart, submit));
+            controller->OnStageEvent(Event(n, Kind::PresentCall, submit + 5000.0));
+            controller->OnStageEvent(Event(n, Kind::PresentEnd, submit + 5100.0));
+            controller->OnStageEvent(Event(n, Kind::GpuReady, ready));
+            controller->OnStageEvent(Event(n, Kind::OutputRelease, release,
+                held ? PacingPlanStatus::Held : PacingPlanStatus::Late));
+            LeadGpuReport report{};
+            report.active_us = 7000.0;
+            report.span_us = 7000.0;
+            report.start_qpc = Qpc(gpu_start);
+            report.first_work_streamed = true;
+            report.first_submission_delay_us = 500.0;
+            controller->OnGpuReport(Key(n).producer_epoch, Key(n).frame_id, report);
+            gate = std::max(ready, release);
+            present_end = submit + 5100.0;
+        }
+    };
+}
+
+// Lead anchor (lead_controller.h): the lead window's sample and the slack are
+// measured from B: the sample is X + (s − B) and the slack T − B − X, the
+// existing slack plus delta; the range check of the sample is still on X.
+// An anchor that is not earlier than s (B = s, B after s, a non-positive
+// QPC) is none: delta is never negative.
+void TestLeadAnchorSampleAndSlack()
+{
+    auto base = MakeController();
+    auto anchored = MakeController();
+    // L = 5,000 released at S: slack = L − X for the baseline.
+    FeedAnchoredH0(base.get(), 1, 4000.0, kNaN);
+    FeedAnchoredH0(anchored.get(), 1, 4000.0, 3000.0);
+    CHECK_NEAR(base->Statistics().last_sample_us, 4000.0);
+    CHECK_NEAR(anchored->Statistics().last_sample_us, 7000.0);
+    CHECK_NEAR(base->Statistics().last_slack_us, 1000.0);
+    CHECK_NEAR(anchored->Statistics().last_slack_us, 4000.0);
+    // A frame ready 1,000 after its target by the baseline's slack: the
+    // anchored slack is the baseline's plus delta.
+    FeedAnchoredH0(base.get(), 2, 6000.0, kNaN);
+    FeedAnchoredH0(anchored.get(), 2, 6000.0, 3000.0);
+    CHECK_NEAR(base->Statistics().last_slack_us, -1000.0);
+    CHECK_NEAR(anchored->Statistics().last_slack_us, 2000.0);
+    CHECK(base->Statistics().negative_slack_samples == 1);
+    CHECK(anchored->Statistics().negative_slack_samples == 0);
+    // The range check is on X (3 I = 30,000): 29,500 is kept as 32,500, 30,500
+    // is excluded either way, and its slack still counts.
+    FeedAnchoredH0(base.get(), 3, 29500.0, kNaN);
+    FeedAnchoredH0(anchored.get(), 3, 29500.0, 3000.0);
+    CHECK_NEAR(base->Statistics().last_sample_us, 29500.0);
+    CHECK_NEAR(anchored->Statistics().last_sample_us, 32500.0);
+    FeedAnchoredH0(base.get(), 4, 30500.0, kNaN);
+    FeedAnchoredH0(anchored.get(), 4, 30500.0, 3000.0);
+    for (LeadController* controller : { base.get(), anchored.get() }) {
+        const LeadStatistics statistics = controller->Statistics();
+        CHECK(statistics.samples == 3 && statistics.excluded_long == 1);
+        CHECK(statistics.slack_samples == 4 && statistics.invalid_inputs == 0);
+        CHECK(controller->BucketStatus(PacingRung::SourceOnly, 1.0).samples == 3);
+    }
+    CHECK_NEAR(base->Statistics().last_sample_us, 29500.0);
+    CHECK_NEAR(anchored->Statistics().last_sample_us, 32500.0);
+
+    // B = s, B after s and a non-positive B: no anchor, the baseline's results.
+    for (const double before : { 0.0, -500.0 }) {
+        auto controller = MakeController();
+        FeedAnchoredH0(controller.get(), 1, 4000.0, before);
+        CHECK_NEAR(controller->Statistics().last_sample_us, 4000.0);
+        CHECK_NEAR(controller->Statistics().last_slack_us, 1000.0);
+    }
+    auto negative = MakeController();
+    LeadFrameStart start = Start(1, PacingRung::SourceOnly, 10000.0);
+    SetLead(&start, 5000.0);
+    start.lead_anchor_qpc = -1;
+    start.anchored = true;
+    negative->OnSourceRelease(start);
+    negative->OnStageEvent(Event(1, Kind::MarkerArrival, 14000.0));
+    CHECK_NEAR(negative->Statistics().last_sample_us, 4000.0);
+    CHECK_NEAR(negative->Statistics().last_slack_us, 1000.0);
+    CHECK(negative->Statistics().invalid_inputs == 0);
+}
+
+// Lead anchor: s keeps its physical meaning in every wait check. A frame's
+// waits end at s, after B: they still gate the earlier frame (the wait
+// validation is against s, not B), and the collision guard's windows C and
+// D (GPU queue wait, measured from s) are the baseline's. The guard limits the
+// physical release → target distance H − R = L − delta, so its limit is
+// I + offset + delta (LeadRequest::anchor_offset_us) and the capped lead is
+// the baseline's plus delta.
+void TestLeadAnchorKeepsPhysicalRelease()
+{
+    // Frame 2: pre-Sleep wait [13,000, 15,000] and source wait [15,000, 18,000]
+    // with s = 18,000; B = 14,000 lies inside the pre-Sleep wait. Frame 1's
+    // PRESENT_START (20,000) follows s: both waits are its gated hold, 2,000
+    // + 3,000 µs, with or without the anchor.
+    const auto gated = [](bool anchored, double* slack_us) {
+        auto controller = MakeController();
+        const PacingRung h0 = PacingRung::SourceOnly;
+        LeadFrameStart first = Start(1, h0, 10000.0);
+        SetLead(&first, 5000.0);
+        controller->OnSourceRelease(first);
+        LeadFrameStart second = Start(2, h0, 18000.0);
+        SetLead(&second, 5000.0);
+        second.pre_wait_start_qpc = Qpc(13000.0);
+        second.pre_wait_end_qpc = Qpc(15000.0);
+        second.wait_start_qpc = Qpc(15000.0);
+        second.wait_end_qpc = Qpc(18000.0);
+        if (anchored) {
+            second.lead_anchor_qpc = Qpc(14000.0);
+            second.anchored = true;
+        }
+        controller->OnSourceRelease(second);
+        controller->OnStageEvent(Event(1, Kind::MarkerArrival, 20000.0));
+        *slack_us = controller->Statistics().last_slack_us;
+        return controller->GatedHoldTicks(Key(1), 1);
+    };
+    double base_slack = 0.0;
+    double anchored_slack = 0.0;
+    CHECK(gated(false, &base_slack) == 50000);
+    CHECK(gated(true, &anchored_slack) == 50000);
+    // X = 10,000 less the 5,000 gated: slack 5,000 − 5,000.
+    CHECK_NEAR(base_slack, 0.0);
+    CHECK_NEAR(anchored_slack, 0.0);
+    // A wait that ends after s is still ignored.
+    auto late = MakeController();
+    LeadFrameStart first = Start(1, PacingRung::SourceOnly, 10000.0);
+    SetLead(&first, 5000.0);
+    late->OnSourceRelease(first);
+    LeadFrameStart second = Start(2, PacingRung::SourceOnly, 18000.0);
+    second.wait_start_qpc = Qpc(15000.0);
+    second.wait_end_qpc = Qpc(18500.0);
+    second.lead_anchor_qpc = Qpc(14000.0);
+    second.anchored = true;
+    late->OnSourceRelease(second);
+    late->OnStageEvent(Event(1, Kind::MarkerArrival, 20000.0));
+    CHECK(late->GatedHoldTicks(Key(1), 1) == 0);
+
+    // C = p − s = 5,000 and D = r − A − s = 4,000 of 41 waited frames whose
+    // anchor lies 3,000 before s: the guard's limit I + Q10(D) − H, and its
+    // offset, are the baseline's; the bucket's own lead is 3,000 higher.
+    const auto run = [](double anchor_before_us, double* unguarded_us, LeadGuardOutcome* guard,
+        uint64_t* work_samples) {
+        auto controller = MakeController();
+        for (uint64_t index = 1; index <= 41; ++index) {
+            const double source_us = static_cast<double>(index) * kInterval;
+            LeadFrameStart start = Start(index, PacingRung::GpuQueueWait, source_us);
+            if (!std::isnan(anchor_before_us)) {
+                start.lead_anchor_qpc = Qpc(source_us - anchor_before_us);
+                start.anchored = true;
+            }
+            controller->OnSourceRelease(start);
+            controller->OnStageEvent(Event(index, Kind::PresentCall, source_us + 5000.0));
+            controller->OnStageEvent(Event(index, Kind::GpuReady, source_us + 10000.0));
+            controller->OnStageEvent(Event(index, Kind::OutputRelease, source_us + 10500.0));
+            FeedGpuActive(controller.get(), index, 6000.0);
+        }
+        LeadRequest request = Request(PacingRung::GpuQueueWait, 500.0, 7000.0);
+        request.collision_guard = true;
+        request.anchor_offset_us = std::isnan(anchor_before_us) ? 0.0 : anchor_before_us;
+        const double guarded_us = controller->NextLeadUs(request, nullptr, guard);
+        *unguarded_us = controller->BucketStatus(PacingRung::GpuQueueWait, 1.0).lead_us;
+        *work_samples = controller->Statistics().work_samples;
+        CHECK(controller->Statistics().invalid_inputs == 0);
+        return guarded_us;
+    };
+    LeadGuardOutcome base_guard{};
+    LeadGuardOutcome anchored_guard{};
+    double base_unguarded = 0.0;
+    double anchored_unguarded = 0.0;
+    uint64_t base_work = 0;
+    uint64_t anchored_work = 0;
+    const double base_lead = run(kNaN, &base_unguarded, &base_guard, &base_work);
+    const double anchored_lead = run(3000.0, &anchored_unguarded, &anchored_guard, &anchored_work);
+    CHECK(base_work == 40 && anchored_work == 40);
+    // Q95 10,010 + 500 against 13,010 + 500; the limit is 7,000 + 4,010 − 1,000.
+    CHECK(std::fabs(base_unguarded - 10510.0) <= 20.0);
+    CHECK(std::fabs(anchored_unguarded - 13510.0) <= 20.0);
+    CHECK(base_guard.judged && anchored_guard.judged);
+    CHECK(std::fabs(base_guard.offset_us - 3010.0) <= 20.0);
+    CHECK_NEAR(anchored_guard.offset_us, base_guard.offset_us);
+    CHECK(std::fabs(base_lead - 10010.0) <= 20.0);
+    CHECK_NEAR(anchored_lead, base_lead + 3000.0);
+    CHECK_NEAR(anchored_guard.reduction_us, base_guard.reduction_us);
+    CHECK_NEAR(anchored_guard.reduction_us, anchored_unguarded - anchored_lead);
+}
+
+// Lead anchor: the spike floor's binned arrival and the GPU-paced cadence's
+// early side are measured from B; the arrival's range check stays on s.
+void TestLeadAnchorSpikeAndEarlySide()
+{
+    const PacingRung fg = PacingRung::FgInputWait;
+    // TestSpikeArrival's frame 2 (a = 2,500 from its release at 20,000),
+    // anchored anchor_before_us earlier.
+    const auto arrival = [&](double anchor_before_us, uint64_t* spike_samples) {
+        auto controller = MakeController();
+        controller->OnSourceRelease(Start(1, fg, 10000.0, kInterval, 2.0));
+        controller->OnStageEvent(Event(1, Kind::SimulationEnd, 12000.0));
+        controller->OnStageEvent(Event(1, Kind::RenderSubmitStart, 12000.0));
+        controller->OnStageEvent(Event(1, Kind::PresentCall, 17000.0));
+        controller->OnStageEvent(Event(1, Kind::PresentEnd, 30000.0));
+        controller->OnStageEvent(Event(1, Kind::GpuReady, 30500.0));
+        controller->OnStageEvent(Event(1, Kind::OutputRelease, 31000.0));
+        LeadFrameStart start = Start(2, fg, 20000.0, kInterval, 2.0);
+        if (!std::isnan(anchor_before_us)) {
+            start.lead_anchor_qpc = Qpc(20000.0 - anchor_before_us);
+            start.anchored = true;
+        }
+        controller->OnSourceRelease(start);
+        controller->OnStageEvent(Event(2, Kind::SimulationEnd, 22000.0));
+        controller->OnStageEvent(Event(2, Kind::RenderSubmitStart, 30000.0));
+        controller->OnStageEvent(Event(2, Kind::PresentCall, 35000.0));
+        LeadGpuReport report{};
+        report.active_us = 7000.0;
+        report.span_us = 7000.0;
+        report.first_work_streamed = true;
+        report.first_submission_delay_us = 500.0;
+        controller->OnGpuReport(Key(2).producer_epoch, Key(2).frame_id, report);
+        *spike_samples = controller->Statistics().spike_samples;
+        return controller->Statistics().last_spike_arrival_us;
+    };
+    uint64_t samples = 0;
+    CHECK_NEAR(arrival(kNaN, &samples), 2500.0);
+    CHECK(samples == 1);
+    CHECK_NEAR(arrival(3000.0, &samples), 5500.0);
+    CHECK(samples == 1);
+    // 2,500 on s is within 3 I: counted, though measured from B it lies beyond.
+    CHECK_NEAR(arrival(29000.0, &samples), 31500.0);
+    CHECK(samples == 1);
+    CHECK_NEAR(arrival(0.0, &samples), 2500.0);
+
+    // The early side (TestGpuPacedEarlyLeadFromFloorRelease): frames the GPU
+    // floor released, ready 7,000 after their release, 2,000 before their
+    // floor: 5,000 − allowance; from an anchor 3,000 earlier it is 3,000 more.
+    const PacingRung gpu = PacingRung::GpuQueueWait;
+    const auto early = [&](double anchor_before_us) {
+        auto controller = MakeController();
+        for (uint64_t k = 1; k <= 40; ++k) {
+            const double source = static_cast<double>(k) * kInterval;
+            LeadFrameStart start = Start(k, gpu, source);
+            SetLead(&start, 3000.0);
+            start.gpu_floor_release = true;
+            start.floor_pull_us = 2000.0;
+            if (!std::isnan(anchor_before_us)) {
+                start.lead_anchor_qpc = Qpc(source - anchor_before_us);
+                start.anchored = true;
+            }
+            controller->OnSourceRelease(start);
+            controller->OnStageEvent(Event(k, Kind::PresentCall, source + 1000.0));
+            controller->OnStageEvent(Event(k, Kind::GpuReady, source + 7000.0));
+            controller->OnStageEvent(Event(k, Kind::OutputRelease, source + 7000.0, PacingPlanStatus::Late));
+        }
+        return controller->EarlyLeadUs(gpu, 1.0, 0.95, 500.0);
+    };
+    CHECK_NEAR(early(kNaN), 5000.0 - 500.0);
+    CHECK_NEAR(early(3000.0), 8000.0 - 500.0);
+}
+
+// Lead anchor, no anchor: a frame sequence run without an anchor, with B = s,
+// with B after s, with a negative B and with only LeadRequest::anchor_offset_us
+// set gives bit-identical leads, samples, slack, spike floor and early side.
+void TestLeadAnchorNoAnchorIsIdentical()
+{
+    struct Snapshot {
+        std::vector<double> leads;
+        LeadStatistics statistics;
+        LeadBucketStatus bucket;
+        double tail = 0.0;
+        double spike_floor = 0.0;
+        double early = 0.0;
+    };
+    const PacingRung fg = PacingRung::FgInputWait;
+    const auto run = [&](int mode) {
+        AnchorLoop loop;
+        while (loop.n < 300) loop.Frame(mode);
+        Snapshot snapshot;
+        snapshot.leads = loop.leads;
+        snapshot.statistics = loop.controller->Statistics();
+        snapshot.bucket = loop.controller->BucketStatus(fg, 2.0);
+        snapshot.tail = loop.controller->SpikeTailUs();
+        snapshot.spike_floor = loop.controller->SpikeFloorUs(fg, 2.0);
+        snapshot.early = loop.controller->EarlyLeadUs(fg, 2.0, 0.95, 500.0);
+        return snapshot;
+    };
+    const Snapshot base = run(0);
+    CHECK(base.statistics.samples > 200 && base.statistics.spike_samples > 200);
+    CHECK(base.statistics.slack_samples > 200 && base.tail > 0.0 && base.early > 0.0);
+    for (int mode = 1; mode <= 4; ++mode) {
+        const Snapshot other = run(mode);
+        CHECK(other.leads == base.leads);
+        const LeadStatistics& a = base.statistics;
+        const LeadStatistics& b = other.statistics;
+        CHECK(a.samples == b.samples && a.excluded_long == b.excluded_long);
+        CHECK(a.last_sample_us == b.last_sample_us && a.last_slack_us == b.last_slack_us);
+        CHECK(a.slack_samples == b.slack_samples && a.negative_slack_samples == b.negative_slack_samples);
+        CHECK(a.draining_late_samples == b.draining_late_samples);
+        CHECK(a.spike_samples == b.spike_samples && a.last_spike_arrival_us == b.last_spike_arrival_us);
+        CHECK(a.queued_samples == b.queued_samples && a.predecessor_wait_samples == b.predecessor_wait_samples);
+        CHECK(a.kept_wait_samples == b.kept_wait_samples && a.handoff_samples == b.handoff_samples);
+        CHECK(b.invalid_inputs == 0);
+        CHECK(base.bucket.quantile_us == other.bucket.quantile_us && base.bucket.median_us == other.bucket.median_us);
+        CHECK(base.bucket.target_us == other.bucket.target_us && base.bucket.lead_us == other.bucket.lead_us);
+        CHECK(base.tail == other.tail && base.spike_floor == other.spike_floor && base.early == other.early);
+    }
+}
+
+namespace
+{
+    // A GPU-rung frame of the saturation rule: released at s = index·I, ready
+    // x_us later (the Present call halfway), output at readiness.
+    void FeedQueueFrame(LeadController* controller, uint64_t index, PacingRung rung, double fg_divisor, double x_us)
+    {
+        const double source_us = static_cast<double>(index) * kInterval;
+        controller->OnSourceRelease(Start(index, rung, source_us, kInterval, fg_divisor));
+        controller->OnStageEvent(Event(index, Kind::PresentCall, source_us + x_us / 2.0));
+        controller->OnStageEvent(Event(index, Kind::GpuReady, source_us + x_us));
+        controller->OnStageEvent(Event(index, Kind::OutputRelease, source_us + x_us));
+    }
+
+    // The path of frame n without any queue (6,000 to 7,000 µs).
+    double IntrinsicPathUs(uint64_t index)
+    {
+        return 6000.0 + static_cast<double>(index * 37 % 11) * 100.0;
+    }
+
+    // Frames 1..frames, each ready IntrinsicPathUs + backlog_us after its
+    // release. With `rule` the saturation rule is on and the stream live, and
+    // frame n's z_used (z_us) arrives after frame n + delay was released; off,
+    // no z_used is given. Returns the next lead.
+    double SaturationLead(PacingRung rung, double fg_divisor, double backlog_us, double z_us, bool rule,
+        uint64_t frames, uint64_t delay, LeadStatistics* statistics = nullptr)
+    {
+        auto controller = MakeController();
+        controller->SetQueueWaitMode(rule);
+        controller->SetQueueWaitLive(rule);
+        for (uint64_t n = 1; n <= frames; ++n) {
+            FeedQueueFrame(controller.get(), n, rung, fg_divisor, IntrinsicPathUs(n) + backlog_us);
+            if (rule && n > delay) controller->OnQueueWaitUsed(Key(n - delay), n - delay, z_us);
+        }
+        if (statistics != nullptr) *statistics = controller->Statistics();
+        return controller->NextLeadUs(Request(rung, 500.0, kInterval, fg_divisor));
+    }
+}
+
+// Saturation rule (lead_controller.h): behind a backlog every frame's path is
+// its intrinsic path plus the queue wait (8,000 µs) and the law reports
+// z_used = 8,000; the lead equals the lead of the same run with the intrinsic
+// paths and z_used = 0, for FG factor 1 (GPU queue wait) and 2 (FG input
+// wait). Without the rule (key off) the backlog is in the lead. The anchored
+// sample is the readiness from B minus z_used.
+void TestSaturationBacklogLeadIsIntrinsic()
+{
+    struct Case { PacingRung rung; double divisor; };
+    for (const Case& test : { Case{ PacingRung::GpuQueueWait, 1.0 }, Case{ PacingRung::FgInputWait, 2.0 } }) {
+        LeadStatistics statistics;
+        const double intrinsic = SaturationLead(test.rung, test.divisor, 0.0, 0.0, true, 60, 3);
+        const double backlog = SaturationLead(test.rung, test.divisor, 8000.0, 8000.0, true, 60, 3, &statistics);
+        // Exact: removing the subtraction leaves the 8,000 µs in the lead.
+        CHECK(std::fabs(backlog - intrinsic) < 1e-9);
+        // Every frame waited for its z_used; the last three have none yet.
+        CHECK(statistics.queue_wait_deferred == 60 && statistics.queue_wait_samples == 57);
+        CHECK(statistics.samples == 57 && statistics.queue_wait_dropped == 0);
+        CHECK_NEAR(statistics.last_queue_wait_removed_us, 8000.0);
+        // The same frames with z_used ignored (the rule off, or z_used delivered as 0) keep the whole queue
+        // wait in the lead: 8,000 µs (400 bins) above the intrinsic one, and clearly above the rule's.
+        const double without_rule = SaturationLead(test.rung, test.divisor, 8000.0, 0.0, false, 57, 0);
+        const double z_ignored = SaturationLead(test.rung, test.divisor, 8000.0, 0.0, true, 60, 3);
+        const double intrinsic_57 = SaturationLead(test.rung, test.divisor, 0.0, 0.0, false, 57, 0);
+        CHECK_NEAR(without_rule, intrinsic_57 + 8000.0);
+        CHECK_NEAR(z_ignored, intrinsic + 8000.0);
+        CHECK(without_rule > backlog + 7000.0 && z_ignored > backlog + 7000.0);
+        CHECK_NEAR(intrinsic, intrinsic_57);
+    }
+
+    // Anchored as ever: X = 10,000 from s, z_used = 4,000, B = s − 3,000.
+    auto controller = MakeController();
+    controller->SetQueueWaitMode(true);
+    controller->SetQueueWaitLive(true);
+    LeadFrameStart start = Start(1, PacingRung::GpuQueueWait, 10000.0);
+    start.lead_anchor_qpc = Qpc(7000.0);
+    start.anchored = true;
+    controller->OnSourceRelease(start);
+    controller->OnStageEvent(Event(1, Kind::PresentCall, 15000.0));
+    controller->OnStageEvent(Event(1, Kind::GpuReady, 20000.0));
+    controller->OnStageEvent(Event(1, Kind::OutputRelease, 20000.0));
+    CHECK(controller->Statistics().samples == 0);
+    controller->OnQueueWaitUsed(Key(1), 1, 4000.0);
+    CHECK(controller->Statistics().samples == 1);
+    CHECK_NEAR(controller->Statistics().last_sample_us, 10000.0 - 4000.0 + 3000.0);
+}
+
+// Saturation rule behind the wait (queue order shown, SampleUs removes the
+// frame's wait d for frame n − 1 including its hold: here 8,000 µs, X 19,000 →
+// 11,000): z_used removes only what exceeds d, never the same wait twice.
+// z_used = 10,000 removes 2,000 more (sample 9,000); z_used = 5,000, below d,
+// removes nothing more (sample 11,000).
+void TestSaturationNoDoubleSubtraction()
+{
+    auto controller = MakeController();
+    const PacingRung fg = PacingRung::FgInputWait;
+    double gate_us = 0.0; // the GPU passed the previous frame's gate
+    // Frame k: released 20,000 before its target T = 1,000,000 + k I, submitting from
+    // w = s + 2,000, calling the FG input at p = s + 8,000, its GPU work 9,000 after
+    // the GPU passed the previous gate; held to T (TestFgInputWaitBehindWaitSample).
+    const auto frame = [&](uint64_t k) {
+        const double lead_us = 20000.0;
+        const double target = 1'000'000.0 + static_cast<double>(k) * kInterval;
+        const double source = target - lead_us;
+        const double free = gate_us > 0.0 ? gate_us : target - kInterval;
+        const double ready = free + 9000.0;
+        const bool held = ready <= target;
+        const double release = held ? target : ready;
+        LeadFrameStart start = Start(k, fg, source, kInterval, 2.0);
+        SetLead(&start, lead_us);
+        controller->OnSourceRelease(start);
+        controller->OnStageEvent(Event(k, Kind::RenderSubmitStart, source + 2000.0));
+        controller->OnStageEvent(Event(k, Kind::PresentCall, source + 8000.0));
+        controller->OnStageEvent(Event(k, Kind::GpuReady, ready));
+        controller->OnStageEvent(Event(k, Kind::OutputRelease, release,
+            held ? PacingPlanStatus::Held : PacingPlanStatus::Late));
+        Report(controller.get(), Key(k).producer_epoch, Key(k).frame_id, 7000.0, Qpc(free + 2000.0), 7000.0, 0.0,
+            true);
+        gate_us = std::max(ready, release);
+    };
+    uint64_t k = 1;
+    for (; k <= 33; ++k) frame(k);
+    CHECK(controller->NextGpuWorkBehindWait(fg, 2.0));
+    controller->SetQueueWaitMode(true);
+    controller->SetQueueWaitLive(true);
+    const uint64_t before = controller->Statistics().samples;
+
+    // z_used > d: 2,000 more is removed.
+    frame(k);
+    CHECK(controller->Statistics().samples == before); // waits for z_used
+    controller->OnQueueWaitUsed(Key(k), k, 10000.0);
+    CHECK(controller->Statistics().samples == before + 1);
+    CHECK_NEAR(controller->Statistics().last_predecessor_wait_us, 8000.0);
+    CHECK_NEAR(controller->Statistics().last_queue_wait_removed_us, 10000.0 - 8000.0);
+    CHECK_NEAR(controller->Statistics().last_sample_us, 19000.0 - 8000.0 - (10000.0 - 8000.0));
+    ++k;
+
+    // z_used < d: nothing more is removed.
+    frame(k);
+    controller->OnQueueWaitUsed(Key(k), k, 5000.0);
+    CHECK(controller->Statistics().samples == before + 2);
+    CHECK_NEAR(controller->Statistics().last_predecessor_wait_us, 8000.0);
+    CHECK_NEAR(controller->Statistics().last_queue_wait_removed_us, 0.0);
+    CHECK_NEAR(controller->Statistics().last_sample_us, 19000.0 - 8000.0);
+    CHECK(controller->Statistics().queue_wait_samples == 2 && controller->Statistics().invalid_inputs == 0);
+}
+
+// Saturation rule at headroom: z_used = 0, so the lead equals the key-off
+// lead of the same frames, apart from the feed delay (the newest frames wait
+// for their z_used): the rule's controller after 60 frames with a delay of 3
+// equals the key-off controller fed frames 1..57.
+void TestSaturationHeadroomMatchesKeyOff()
+{
+    struct Case { PacingRung rung; double divisor; };
+    for (const Case& test : { Case{ PacingRung::GpuQueueWait, 1.0 }, Case{ PacingRung::FgInputWait, 2.0 } }) {
+        LeadStatistics statistics;
+        const double with_rule = SaturationLead(test.rung, test.divisor, 0.0, 0.0, true, 60, 3, &statistics);
+        const double key_off = SaturationLead(test.rung, test.divisor, 0.0, 0.0, false, 57, 0);
+        CHECK_NEAR(with_rule, key_off);
+        CHECK(statistics.queue_wait_samples == 57 && statistics.samples == 57);
+        CHECK_NEAR(statistics.last_queue_wait_removed_us, 0.0);
+    }
+}
+
+// Saturation rule: a frame whose z_used never arrives feeds nothing (also
+// when it closes), a z_used of another epoch, an unknown frame or a frame
+// already sampled or dropped is ignored, and with the stream not live frames
+// are fed at readiness as today. A live → not live change drops the deferred
+// frames; each frame feeds once across transitions in both directions and a
+// mode change drops the deferred ones too.
+void TestSaturationFeedsEachFrameOnce()
+{
+    const PacingRung gpu = PacingRung::GpuQueueWait;
+    const auto x_of = [](uint64_t n) { return 10000.0 + static_cast<double>(n) * 100.0; };
+
+    // Frame 10 never reports: no sample, not at its expiry either.
+    auto controller = MakeController();
+    controller->SetQueueWaitMode(true);
+    controller->SetQueueWaitLive(true);
+    for (uint64_t n = 1; n <= 40; ++n) {
+        FeedQueueFrame(controller.get(), n, gpu, 1.0, x_of(n));
+        if (n > 2 && n - 2 != 10) controller->OnQueueWaitUsed(Key(n - 2), n - 2, 0.0);
+    }
+    CHECK(controller->Statistics().samples == 37);
+    CHECK(controller->Statistics().queue_wait_deferred == 40 && controller->Statistics().queue_wait_dropped == 1);
+    controller->OnQueueWaitUsed(Key(10), 10, 0.0); // the dropped frame
+    PacingPlanKey other_epoch = Key(39);
+    other_epoch.producer_epoch = 99;
+    controller->OnQueueWaitUsed(other_epoch, 39, 0.0);
+    controller->OnQueueWaitUsed(Key(500), 500, 0.0); // unknown frame
+    CHECK(controller->Statistics().samples == 37);
+    controller->OnQueueWaitUsed(Key(39), 39, 0.0);
+    controller->OnQueueWaitUsed(Key(40), 40, 0.0);
+    CHECK(controller->Statistics().samples == 39);
+    CHECK_NEAR(controller->Statistics().last_sample_us, x_of(40));
+    CHECK(controller->Statistics().invalid_inputs == 0);
+
+    // Transitions both ways.
+    auto transitions = MakeController();
+    transitions->SetQueueWaitMode(true);
+    transitions->SetQueueWaitLive(true);
+    for (uint64_t n = 1; n <= 5; ++n) FeedQueueFrame(transitions.get(), n, gpu, 1.0, x_of(n));
+    CHECK(transitions->Statistics().samples == 0 && transitions->Statistics().queue_wait_deferred == 5);
+    transitions->OnQueueWaitUsed(Key(1), 1, 0.0);
+    transitions->OnQueueWaitUsed(Key(2), 2, 0.0);
+    transitions->OnQueueWaitUsed(Key(1), 1, 0.0); // once per frame
+    CHECK(transitions->Statistics().samples == 2);
+    // Stream not live: frames 3-5 are dropped, no sample.
+    transitions->SetQueueWaitLive(false);
+    CHECK(transitions->Statistics().queue_wait_dropped == 3 && transitions->Statistics().samples == 2);
+    // Frame 6 is ready with the stream not live: fed at readiness, unsubtracted.
+    FeedQueueFrame(transitions.get(), 6, gpu, 1.0, x_of(6));
+    CHECK(transitions->Statistics().samples == 3);
+    CHECK_NEAR(transitions->Statistics().last_sample_us, x_of(6));
+    transitions->OnQueueWaitUsed(Key(6), 6, 5000.0); // fed already
+    transitions->OnQueueWaitUsed(Key(3), 3, 0.0);    // dropped
+    CHECK(transitions->Statistics().samples == 3 && transitions->Statistics().queue_wait_samples == 2);
+    // Live again: frame 7 waits for its z_used and is fed without it.
+    transitions->SetQueueWaitLive(true);
+    FeedQueueFrame(transitions.get(), 7, gpu, 1.0, x_of(7));
+    CHECK(transitions->Statistics().samples == 3);
+    transitions->OnQueueWaitUsed(Key(7), 7, 3000.0);
+    CHECK(transitions->Statistics().samples == 4);
+    CHECK_NEAR(transitions->Statistics().last_sample_us, x_of(7) - 3000.0);
+    // A mode change drops the deferred frame; key off feeds as today.
+    FeedQueueFrame(transitions.get(), 8, gpu, 1.0, x_of(8));
+    transitions->SetQueueWaitMode(false);
+    CHECK(transitions->Statistics().queue_wait_dropped == 4 && transitions->Statistics().samples == 4);
+    transitions->OnQueueWaitUsed(Key(8), 8, 0.0);
+    CHECK(transitions->Statistics().samples == 4);
+    FeedQueueFrame(transitions.get(), 9, gpu, 1.0, x_of(9));
+    CHECK(transitions->Statistics().samples == 5);
+    CHECK_NEAR(transitions->Statistics().last_sample_us, x_of(9));
+}
+
+// Saturation rule, collision guard in physical terms (GPU queue wait, FG
+// factors 1 and 2): under the key the frames are anchored delta = 3,000 µs
+// before their release and the guard's limit is I + offset + delta, so the
+// capped target minus the release (the lead less delta) equals the key-off
+// value of the same inputs.
+void TestSaturationGuardInPhysicalTerms()
+{
+    for (const double divisor : { 1.0, 2.0 }) {
+        const auto run = [&](bool key, double* unguarded_us, LeadGuardOutcome* guard, double* limit_us) {
+            auto controller = MakeController();
+            controller->SetQueueWaitMode(key);
+            controller->SetQueueWaitLive(key);
+            for (uint64_t index = 1; index <= 41; ++index) {
+                const double source_us = static_cast<double>(index) * kInterval;
+                LeadFrameStart start = Start(index, PacingRung::GpuQueueWait, source_us, kInterval, divisor);
+                if (key) {
+                    start.lead_anchor_qpc = Qpc(source_us - 3000.0);
+                    start.anchored = true;
+                }
+                controller->OnSourceRelease(start);
+                controller->OnStageEvent(Event(index, Kind::PresentCall, source_us + 5000.0));
+                controller->OnStageEvent(Event(index, Kind::GpuReady, source_us + 10000.0));
+                controller->OnStageEvent(Event(index, Kind::OutputRelease, source_us + 10500.0));
+                FeedGpuActive(controller.get(), index, 6000.0);
+                if (key) controller->OnQueueWaitUsed(Key(index), index, 0.0);
+            }
+            LeadRequest request = Request(PacingRung::GpuQueueWait, 500.0, 7000.0, divisor);
+            request.collision_guard = true;
+            request.anchor_offset_us = key ? 3000.0 : 0.0;
+            const double lead_us = controller->NextLeadUs(request, nullptr, guard);
+            *unguarded_us = controller->BucketStatus(PacingRung::GpuQueueWait, divisor).lead_us;
+            *limit_us = controller->Statistics().last_collision_limit_us;
+            return lead_us;
+        };
+        LeadGuardOutcome off_guard{};
+        LeadGuardOutcome on_guard{};
+        double off_unguarded = 0.0;
+        double on_unguarded = 0.0;
+        double off_limit = 0.0;
+        double on_limit = 0.0;
+        const double off_lead = run(false, &off_unguarded, &off_guard, &off_limit);
+        const double on_lead = run(true, &on_unguarded, &on_guard, &on_limit);
+        CHECK(off_guard.judged && on_guard.judged);
+        // The limit is 7,000 + Q10(D) − 1,000; the key-on lead is 3,000 above it in the anchor's terms.
+        CHECK(std::fabs(off_lead - 10010.0) <= 20.0);
+        CHECK_NEAR(on_guard.offset_us, off_guard.offset_us);
+        CHECK_NEAR(on_limit, off_limit + 3000.0);
+        CHECK_NEAR(on_lead - 3000.0, off_lead);
+        CHECK(on_unguarded > on_limit); // the guard did cap it
+        CHECK_NEAR(on_unguarded - on_lead, off_unguarded - off_lead);
+    }
+}
+
+namespace
+{
+    // The FG input wait script of TestFgInputWaitBehindWaitSample: frame k is
+    // released 20,000 before its target T = 1,000,000 + k I, submits from
+    // w = s + 2,000, calls the FG input at p = s + 8,000, and its GPU work
+    // starts 9,000 after the GPU passed the previous gate (held to T). After 33
+    // frames the queue order shows the next frame's work behind the wait; each
+    // frame then has X = 19,000 and d = 8,000 (sample 11,000).
+    struct BehindWaitScript {
+        std::unique_ptr<LeadController> controller = MakeController();
+        double gate_us = 0.0;
+        uint64_t next = 1;
+
+        static double TargetUs(uint64_t k) { return 1'000'000.0 + static_cast<double>(k) * kInterval; }
+
+        // Releases and completes the next frame; returns its grid index.
+        uint64_t Frame()
+        {
+            const uint64_t k = next++;
+            const double lead_us = 20000.0;
+            const double source = TargetUs(k) - lead_us;
+            const double free = gate_us > 0.0 ? gate_us : TargetUs(k) - kInterval;
+            const double ready = free + 9000.0;
+            const bool held = ready <= TargetUs(k);
+            const double release = held ? TargetUs(k) : ready;
+            LeadFrameStart start = Start(k, PacingRung::FgInputWait, source, kInterval, 2.0);
+            SetLead(&start, lead_us);
+            controller->OnSourceRelease(start);
+            controller->OnStageEvent(Event(k, Kind::RenderSubmitStart, source + 2000.0));
+            controller->OnStageEvent(Event(k, Kind::PresentCall, source + 8000.0));
+            controller->OnStageEvent(Event(k, Kind::GpuReady, ready));
+            controller->OnStageEvent(Event(k, Kind::OutputRelease, release,
+                held ? PacingPlanStatus::Held : PacingPlanStatus::Late));
+            Report(controller.get(), Key(k).producer_epoch, Key(k).frame_id, 7000.0, Qpc(free + 2000.0), 7000.0, 0.0,
+                true);
+            gate_us = std::max(ready, release);
+            return k;
+        }
+    };
+}
+
+// Saturation rule, report/event order (RegisterQueueWaitUsed,
+// FlushQueueWaitSamples): frame n has its readiness and report while frame
+// n − 1 has an unheld output and no readiness yet, so n defers. n's z_used
+// (1,000) is registered BEFORE n − 1's readiness is recorded: nothing emits,
+// not even at that stage event. The flush then gives raw 10,000 less the
+// predecessor wait d = 1,500 = 8,500 (z_used below d removes nothing more),
+// not the 9,000 an immediate OnQueueWaitUsed gave without d.
+void TestSaturationRegisterFlushOrder()
+{
+    struct Result {
+        double sample_us;
+        double removed_us;
+        double predecessor_wait_us;
+        uint64_t samples_before;
+        uint64_t samples_after_register;
+    };
+    const auto run = [](bool ordered) {
+        BehindWaitScript script;
+        for (int i = 0; i < 33; ++i) script.Frame();
+        LeadController* controller = script.controller.get();
+        CHECK(controller->NextGpuWorkBehindWait(PacingRung::FgInputWait, 2.0));
+        controller->SetQueueWaitMode(true);
+        controller->SetQueueWaitLive(true);
+        const PacingRung fg = PacingRung::FgInputWait;
+        const double s34 = BehindWaitScript::TargetUs(34) - 20000.0;
+        const double s35 = BehindWaitScript::TargetUs(35) - 20000.0;
+        // Frame 34: released, output not held, no readiness or resume yet.
+        LeadFrameStart previous = Start(34, fg, s34, kInterval, 2.0);
+        SetLead(&previous, 20000.0);
+        controller->OnSourceRelease(previous);
+        controller->OnStageEvent(Event(34, Kind::OutputRelease, s34 + 12000.0, PacingPlanStatus::Late));
+        // Frame 35: w = s + 1,000, p = s + 4,000, r = s + 10,000 (X = 10,000), report in.
+        LeadFrameStart frame = Start(35, fg, s35, kInterval, 2.0);
+        SetLead(&frame, 20000.0);
+        controller->OnSourceRelease(frame);
+        controller->OnStageEvent(Event(35, Kind::RenderSubmitStart, s35 + 1000.0));
+        controller->OnStageEvent(Event(35, Kind::PresentCall, s35 + 4000.0));
+        controller->OnStageEvent(Event(35, Kind::GpuReady, s35 + 10000.0));
+        controller->OnStageEvent(Event(35, Kind::OutputRelease, s35 + 10000.0, PacingPlanStatus::Late));
+        Report(controller, Key(35).producer_epoch, Key(35).frame_id, 7000.0, Qpc(s35 + 2000.0), 7000.0, 0.0, true);
+        Result result{};
+        result.samples_before = controller->Statistics().samples;
+        // n − 1's readiness at w + 1,500 (d = 1,500).
+        const PacingStageEvent previous_ready = Event(34, Kind::GpuReady, s35 + 2500.0);
+        if (ordered) {
+            controller->RegisterQueueWaitUsed(Key(35), 35, 1000.0);
+            controller->OnStageEvent(previous_ready);
+            result.samples_after_register = controller->Statistics().samples;
+            controller->FlushQueueWaitSamples();
+        } else {
+            controller->OnQueueWaitUsed(Key(35), 35, 1000.0); // before n − 1's readiness
+            result.samples_after_register = controller->Statistics().samples;
+            controller->OnStageEvent(previous_ready);
+        }
+        result.sample_us = controller->Statistics().last_sample_us;
+        result.removed_us = controller->Statistics().last_queue_wait_removed_us;
+        result.predecessor_wait_us = controller->Statistics().last_predecessor_wait_us;
+        CHECK(controller->Statistics().samples == result.samples_before + 1);
+        // Once per frame.
+        controller->FlushQueueWaitSamples();
+        controller->OnQueueWaitUsed(Key(35), 35, 1000.0);
+        CHECK(controller->Statistics().samples == result.samples_before + 1);
+        return result;
+    };
+    const Result ordered = run(true);
+    CHECK(ordered.samples_after_register == ordered.samples_before); // nothing emitted before the flush
+    CHECK_NEAR(ordered.predecessor_wait_us, 1500.0);
+    CHECK_NEAR(ordered.removed_us, 0.0);
+    CHECK_NEAR(ordered.sample_us, 10000.0 - 1500.0);
+    // The old order: emitted at once, without the predecessor's readiness.
+    const Result immediate = run(false);
+    CHECK(immediate.samples_after_register == immediate.samples_before + 1);
+    CHECK_NEAR(immediate.sample_us, 10000.0 - 1000.0);
+}
+
+// Saturation rule, one lifetime bound (LEAD_QUEUE_WAIT_LIFETIME_FRAMES): in
+// the queue-order script (d = 8,000) a z_used = 10,000 delivered 9, 20 and
+// LEAD_QUEUE_WAIT_LIFETIME_FRAMES releases late still feeds every frame
+// once with X − d − (z_used − d) = 9,000, though the lead closes pending
+// frames after 8; a report one release later feeds nothing, the frame feeds
+// once at most and is counted dropped; with the rule off (or for a frame
+// that is not deferred) the 8-frame expiry is unchanged.
+void TestSaturationReportLifetime()
+{
+    for (const uint64_t late : { uint64_t{9}, uint64_t{20}, LEAD_QUEUE_WAIT_LIFETIME_FRAMES }) {
+        BehindWaitScript script;
+        for (int i = 0; i < 33; ++i) script.Frame();
+        LeadController* controller = script.controller.get();
+        controller->SetQueueWaitMode(true);
+        controller->SetQueueWaitLive(true);
+        const uint64_t base = controller->Statistics().samples;
+        uint64_t fed = 0;
+        for (uint64_t i = 0; i < 40; ++i) {
+            const uint64_t n = script.Frame();
+            if (i < late) continue;
+            const uint64_t m = n - late;
+            controller->OnQueueWaitUsed(Key(m), m, 10000.0);
+            ++fed;
+            CHECK(controller->Statistics().samples == base + fed);
+            CHECK_NEAR(controller->Statistics().last_sample_us, 19000.0 - 8000.0 - (10000.0 - 8000.0));
+            controller->OnQueueWaitUsed(Key(m), m, 10000.0); // once
+            CHECK(controller->Statistics().samples == base + fed);
+        }
+        CHECK(fed == 40 - late);
+        CHECK(controller->Statistics().queue_wait_dropped == 0);
+        CHECK(controller->Statistics().invalid_inputs == 0);
+    }
+
+    // Later than the bound: nothing, at most once. Frames 1-37 of 60 are dropped by
+    // release 60 (m + 22 < 60); every report came one release too late.
+    constexpr uint64_t kLate = LEAD_QUEUE_WAIT_LIFETIME_FRAMES + 1;
+    LeadStatistics statistics;
+    SaturationLead(PacingRung::GpuQueueWait, 1.0, 8000.0, 8000.0, true, 60, kLate, &statistics);
+    CHECK(statistics.samples == 0 && statistics.queue_wait_samples == 0);
+    CHECK(statistics.queue_wait_dropped == 60 - LEAD_QUEUE_WAIT_LIFETIME_FRAMES - 1);
+    // On time at the bound itself: every frame feeds.
+    SaturationLead(PacingRung::GpuQueueWait, 1.0, 8000.0, 8000.0, true, 60, LEAD_QUEUE_WAIT_LIFETIME_FRAMES,
+        &statistics);
+    CHECK(statistics.samples == 60 - LEAD_QUEUE_WAIT_LIFETIME_FRAMES && statistics.queue_wait_dropped == 0);
+
+    // The 8-frame expiry is unchanged: an incomplete frame is counted when
+    // frame 9 is released, with the rule off and on, and with the rule off a
+    // complete frame behind a predecessor that waits for its probe is sampled
+    // then (frame 1 closes).
+    const PacingRung gpu = PacingRung::GpuQueueWait;
+    for (const bool rule : { false, true }) {
+        auto controller = MakeController();
+        controller->SetQueueWaitMode(rule);
+        controller->SetQueueWaitLive(rule);
+        controller->OnSourceRelease(Start(1, gpu, 10000.0));
+        controller->OnStageEvent(Event(1, Kind::PresentCall, 10100.0));
+        for (uint64_t n = 2; n <= 8; ++n) controller->OnSourceRelease(Start(n, gpu, static_cast<double>(n) * 10000.0));
+        CHECK(controller->Statistics().missing_ready == 0);
+        controller->OnSourceRelease(Start(9, gpu, 90000.0));
+        CHECK(controller->Statistics().missing_ready == 1);
+    }
+    auto legacy = MakeController();
+    LeadFrameStart first = Start(1, gpu, 10000.0);
+    first.gpu_resume_probe = true;
+    legacy->OnSourceRelease(first);
+    legacy->OnStageEvent(Event(1, Kind::PresentCall, 15000.0));
+    legacy->OnStageEvent(Event(1, Kind::GpuReady, 20000.0));
+    legacy->OnStageEvent(Event(1, Kind::OutputRelease, 20000.0));
+    legacy->OnSourceRelease(Start(2, gpu, 20000.0));
+    legacy->OnStageEvent(Event(2, Kind::PresentCall, 25000.0));
+    legacy->OnStageEvent(Event(2, Kind::GpuReady, 30000.0));
+    legacy->OnStageEvent(Event(2, Kind::OutputRelease, 30000.0));
+    CHECK(legacy->Statistics().samples == 1); // frame 2 waits for frame 1's probe
+    for (uint64_t n = 3; n <= 8; ++n) legacy->OnSourceRelease(Start(n, gpu, static_cast<double>(n) * 10000.0));
+    CHECK(legacy->Statistics().samples == 1);
+    legacy->OnSourceRelease(Start(9, gpu, 90000.0));
+    CHECK(legacy->Statistics().samples == 2);
+}
+
 int main()
 {
     std::printf("sizeof(LeadController) = %zu bytes\n", sizeof(LeadController));
-    // Each window's ring holds 32-bit bins (samples beyond 40.96 ms keep theirs).
+    // Each window's ring holds 32-bit bins (samples beyond 40.96 ms keep theirs). The pending
+    // frames' lead anchor delta (unified pacer, a float in the padding between bools) does not
+    // grow PendingFrame.
     CHECK(sizeof(LeadController) < 208u * 1024u);
 
     TestSourceOnlySample();
@@ -5689,6 +6532,17 @@ int main()
     TestSpikeArrival();
     TestGpuQueueWaitReadyGap();
     TestGpuNeedWindow();
+    TestLeadAnchorSampleAndSlack();
+    TestLeadAnchorKeepsPhysicalRelease();
+    TestLeadAnchorSpikeAndEarlySide();
+    TestLeadAnchorNoAnchorIsIdentical();
+    TestSaturationBacklogLeadIsIntrinsic();
+    TestSaturationHeadroomMatchesKeyOff();
+    TestSaturationFeedsEachFrameOnce();
+    TestSaturationNoDoubleSubtraction();
+    TestSaturationGuardInPhysicalTerms();
+    TestSaturationRegisterFlushOrder();
+    TestSaturationReportLifetime();
 
     if (s_failures != 0) {
         std::fprintf(stderr, "%d lead controller checks failed\n", s_failures);

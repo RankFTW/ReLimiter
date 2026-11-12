@@ -221,7 +221,7 @@ GOVERNOR_LADDER_MAX_STEP = 10
 # ── Phase 4 source placement (src/pacing_core_types.h, phase4_design.md P4-6 and P4-15) ──
 
 # PacingSourcePlacement (PacingSourcePlacement_Text): source_placement cells.
-PLACEMENT_NAMES = {0: "none", 1: "marker", 2: "present", 3: "pre_sleep", 4: "driver_limiter"}
+PLACEMENT_NAMES = {0: "none", 1: "marker", 2: "present", 3: "pre_sleep", 4: "driver_limiter", 5: "unified"}
 # Appended after RESUME_COLUMN; absent from 133-column and earlier files.
 PLACEMENT_COLUMNS = ("source_placement", "pre_sleep_end_qpc", "pre_sleep_margin_us")
 

@@ -63,6 +63,54 @@ constexpr double kPacingStallInjectMaxMs = 200.0;
 constexpr double kPacingStallInjectMinPeriodS = 1.0;
 constexpr double kPacingStallInjectMaxPeriodS = 60.0;
 constexpr double kPacingStallInjectDefaultPeriodS = 5.0;
+// Key unified_pacer: the user-configuration default (Config::unified_pacer, its INI fallback,
+// the developer-override baseline and the startup warning all read it; reverting the default is
+// this one line). PacingPipelineConfig{} below stays false on purpose: many resolver, source
+// stage and scheduler tests construct a default pipeline, and the runtime value comes from Config
+// through Config_ApplyPacingPipeline. Before the first publication the resolver runs the earlier
+// pipeline; the key's ordinary transition applies at publication, the same path as ticking the
+// checkbox. 64-bit only: PacingPipeline_ClampConfig forces the key false on Win32.
+constexpr bool kPacingUnifiedPacerDefault = true;
+// Developer keys unified_every_frame_service (default on) and unified_queue_target_us (default
+// 2000 µs), only read under unified_pacer: the queue term's target of the unified law's GPU
+// interval, [0, kPacingUnifiedQueueTargetMaxUs]. The defaults equal UnifiedOptions' and
+// kUnifiedQueueTargetUs (unified_pacer.h; the law has no config dependency, source_stage.cpp
+// asserts the equality). The earlier law is false with 4000.
+constexpr bool kPacingUnifiedEveryFrameServiceDefault = true;
+constexpr double kPacingUnifiedQueueTargetDefaultUs = 2000.0;
+constexpr double kPacingUnifiedQueueTargetMaxUs = 20000.0;
+// Developer key unified_hold_share (default 0 = off, only read under unified_pacer): the share of
+// the measured completion spacing the hold credit's refill of a used report is at least;
+// [0, kPacingUnifiedHoldShareMax]. The default equals UnifiedOptions' (source_stage.cpp asserts it).
+constexpr double kPacingUnifiedHoldShareDefault = 0.0;
+constexpr double kPacingUnifiedHoldShareMax = 0.25;
+// Developer keys unified_queue_law, unified_queue_rank and unified_queue_allow_us (defaults on, 2,
+// 4000 µs; only read under unified_pacer, 64-bit only): the queue law on the presenting queue
+// probe's signals; the rank (1..kPacingUnifiedQueueRankMax) of the queue margin statistic and the
+// margin M in µs (0..kPacingUnifiedQueueAllowMaxUs) the law allows. The law falls back to the
+// report-based interval whenever the probe's records are not valid, so a game without a Direct3D 12
+// presenting queue runs as without the key.
+constexpr bool kPacingUnifiedQueueLawDefault = true;
+constexpr int kPacingUnifiedQueueRankDefault = 2;
+constexpr int kPacingUnifiedQueueRankMax = 8;
+// Developer key unified_queue_need_frames (default 4, 1..16; only read with unified_queue_law): the
+// number of newest valid records the queue law's base follows the GPU's need over.
+constexpr int kPacingUnifiedQueueNeedFramesDefault = 4;
+constexpr int kPacingUnifiedQueueNeedFramesMax = 16;
+// Developer key unified_queue_upstream (default 0, 0..1): 1 stamps the game's render markers
+// locally as telemetry; no decision reads them. A saved 2 or 3 (removed modes) loads as 1.
+constexpr int kPacingUnifiedQueueUpstreamDefault = 0;
+constexpr int kPacingUnifiedQueueUpstreamMax = 1;
+// Developer key gpu_queue_probe (default on; 64-bit, Direct3D 12 only): the presenting queue probe
+// the queue law reads; also forced on while the law is in use.
+constexpr bool kPacingGpuQueueProbeDefault = true;
+// Developer key gpu_queue_probe_source (default 1, 0..1; 64-bit, only effective with the queue
+// probe on): 1 adopts the queue that carries the frame's rendering by following the per-frame
+// fence dependencies from the presenting queue, 0 adopts the presenting queue.
+constexpr int kPacingGpuQueueProbeSourceDefault = 1;
+constexpr int kPacingGpuQueueProbeSourceMax = 1;
+constexpr int kPacingUnifiedQueueAllowDefaultUs = 4000;
+constexpr int kPacingUnifiedQueueAllowMaxUs = 20000;
 // Developer key gpu_wait_headroom_us: the release headroom of the GPU queue
 // wait's collision-aware release, the fixed distance between a release and
 // the next frame's heavy GPU work (lead_controller.h LEAD_RELEASE_HEADROOM_US).
@@ -142,6 +190,44 @@ struct PacingPipelineConfig {
     // placements and ReLimiter plans each frame without a start wait. Takes
     // effect with gpu_paced_cadence only (PacingPipeline_DriverLimiterHold).
     bool driver_limiter_hold = false;
+    // Key unified_pacer (default off; developer, 64-bit only): the first build of
+    // the unified pacer (unified_pacer.h). PacingPipeline_ClampConfig forces the
+    // values the law replaces (smoothing On, Auto rung, no Adaptive cap, no
+    // GPU-paced cadence, no driver limiter hold, no precise pre-wait, no
+    // interleave, no stall injection, lead coverage Q99, fg_late_spacing and
+    // lead_spike_floor on, GPU queue wait render queue Keep, the placement
+    // override ignored) while the key is on, and false on Win32.
+    bool unified_pacer = false;
+    // Key unified_every_frame_service (default on; developer, only read under unified_pacer):
+    // the law's service estimate takes a sample from every reported frame, the GPU wait taken
+    // out, not only from saturated pairs (unified_pacer.h UnifiedOptions); false is the earlier
+    // estimator. ClampConfig forces it false on Win32 (the unified pacer is 64-bit only).
+    bool unified_every_frame_service = kPacingUnifiedEveryFrameServiceDefault;
+    // Key unified_queue_target_us (developer, only read under unified_pacer): the queue term's
+    // target in µs. ClampConfig: non-finite = kPacingUnifiedQueueTargetDefaultUs, otherwise
+    // [0, kPacingUnifiedQueueTargetMaxUs]; the default on Win32.
+    double unified_queue_target_us = kPacingUnifiedQueueTargetDefaultUs;
+    // Key unified_hold_share (developer, only read under unified_pacer): share in [0, 0.25] of the
+    // measured completion spacing that a used report refills the hold credit with at least;
+    // 0 = off. ClampConfig: non-finite = kPacingUnifiedHoldShareDefault, otherwise
+    // [0, kPacingUnifiedHoldShareMax]; forced to the default on Win32.
+    double unified_hold_share = kPacingUnifiedHoldShareDefault;
+    // Keys unified_queue_law (default off), unified_queue_rank [1, kPacingUnifiedQueueRankMax] and
+    // unified_queue_allow_us [0, kPacingUnifiedQueueAllowMaxUs] (developer, only read under
+    // unified_pacer): ClampConfig clamps both numbers and forces the law off on Win32 (the
+    // numbers are not forced: they have no effect without the law).
+    bool unified_queue_law = kPacingUnifiedQueueLawDefault;
+    int unified_queue_rank = kPacingUnifiedQueueRankDefault;
+    // Key unified_queue_need_frames [1, kPacingUnifiedQueueNeedFramesMax] (developer, only read with
+    // unified_queue_law): ClampConfig clamps it; no effect without the law.
+    int unified_queue_need_frames = kPacingUnifiedQueueNeedFramesDefault;
+    // Key gpu_queue_probe_source [0, kPacingGpuQueueProbeSourceMax] (developer): ClampConfig clamps
+    // it and forces 0 on Win32.
+    int gpu_queue_probe_source = kPacingGpuQueueProbeSourceDefault;
+    // Key unified_queue_upstream [0, kPacingUnifiedQueueUpstreamMax] (developer): ClampConfig clamps
+    // it and forces 0 on Win32.
+    int unified_queue_upstream = kPacingUnifiedQueueUpstreamDefault;
+    int unified_queue_allow_us = kPacingUnifiedQueueAllowDefaultUs;
     double stall_inject_ms = 0.0; // 0 = off; [0, kPacingStallInjectMaxMs]
     double stall_inject_period_s = kPacingStallInjectDefaultPeriodS; // [1, 60]
 };
@@ -266,6 +352,8 @@ PacingPipelineConfig PacingPipeline_GetConfig() noexcept;
 // pre_sleep_precise, and PacingPipeline_DriverLimiterHold of the published config.
 bool PacingPipeline_PreSleepPrecise() noexcept;
 bool PacingPipeline_DriverLimiterHoldKey() noexcept;
+// One atomic load: the key unified_pacer of the published configuration (false on Win32).
+bool PacingPipeline_UnifiedPacerKey() noexcept;
 
 // A capability published for one controller generation answers true only for
 // that generation, so a lifecycle change invalidates it without a clear call.

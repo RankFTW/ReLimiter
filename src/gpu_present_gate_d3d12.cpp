@@ -12,6 +12,7 @@
 #include "wake_guard.h"
 #include "hw_spin.h"
 #include "logger.h"
+#include "startup_breadcrumb.h"
 #include "swapchain_manager.h"
 #include "streamline_hooks.h"
 #include "streamline_gpu_handoff.h"
@@ -19,6 +20,8 @@
 #include "bounded_mpsc_queue.h"
 #include "pacing_telemetry.h"
 #include "render_handoff.h"
+#include "gpu_queue_probe.h"
+#include "instrumentation_state.h"
 #include <d3d12.h>
 #include <avrt.h>
 #include <array>
@@ -46,12 +49,20 @@ struct Ticket {
     uint64_t source=0,observer=0,prediction=0,native_swapchain=0;
     PacingPlanKey key{}; // exact plan; every stage event of this ticket carries it
     bool signalled=false;
+    int64_t probe_enq_qpc=0; // gpu_queue_probe: QPC at the hold Wait's enqueue (key on only); 0 = none
     bool fg=false;
     // Developer presenter probe (fg_presenter_probe_us): no plan, grid index
     // 0, so no stage event and no output record; Current() checks the probe.
     bool probe=false;
     int fg_multiplier=0;
     double fg_divisor=1.0; // the plan's: displayed frames per grid frame
+    // Hold credit (key unified_pacer): the plan's hold advance in us (>= 0), one float copied at
+    // admission. Read only by FloorAfterLatePass, as the resolver's advance_us, which ignores it
+    // with the key off (display_floor false); without it the late pass would undo the advance.
+    float hold_advance_us=0.0f;
+    // The law's identity of this frame's grant (PacingFramePlan::law_hold_sequence; 0 = none), announced with the
+    // hold Wait to the gpu queue probe, which attaches it to the frame record the hold delayed.
+    uint64_t law_hold_sequence=0;
     // fg_late_spacing: T(n) without the spacing floor at the decision (0 =
     // switch off). At T(n) the worker checks once whether the game's render
     // thread has left this frame's Present; while it has not, no floor holds
@@ -270,6 +281,11 @@ HRESULT EnqueueRetirement(Queue* queue,Ticket* ticket) noexcept {
 uint64_t Completed(Ticket* ticket) noexcept {
     __try {return ticket->done->GetCompletedValue();}
     __except(EXCEPTION_EXECUTE_HANDLER) {failed=true;return 0;}
+}
+// UINT64_MAX is device removal: the runtime has released every GPU wait on a removed device's fences.
+bool DeviceRemoved(ID3D12Fence* fence) noexcept {
+    __try {return fence->GetCompletedValue()==UINT64_MAX;}
+    __except(EXCEPTION_EXECUTE_HANDLER) {return false;}
 }
 bool MatchesFgDevice(ID3D12CommandQueue* queue,IUnknown* expected) noexcept {
     IUnknown* actual=nullptr;
@@ -615,9 +631,10 @@ void FloorAfterLatePass(Queue& queue,Ticket& ticket,int64_t* next) noexcept {
     DrainFgReadback(queue,next,true);
     CadenceGridSnapshot snapshot;
     int64_t target=0;
+    const bool key=PacingPipeline_UnifiedPacerKey();
     if(!g_cadence_grid_publication.Read(&snapshot) ||
         !CadenceGrid_ResolveOutputTarget(snapshot,generation,index,g_cadence_output_tracker,&target,nullptr,
-            ticket.fg_divisor) ||
+            ticket.fg_divisor,key,key?ticket.hold_advance_us:0.0) ||
         target<=ticket.trace.target_qpc)return;
     const double interval_us=ticket.trace.interval_qpc>0
         ?static_cast<double>(ticket.trace.interval_qpc)*1e6/static_cast<double>(frequency):0.0;
@@ -685,7 +702,24 @@ int64_t Service() noexcept {
                     ticket.trace.worker_flags=worker_flags;
                     ticket.trace.signal_before_qpc=Qpc();ticket.trace.signal_result=CpuSignal(&ticket);
                     ticket.trace.signal_after_qpc=Qpc();
+                    // Start-up breadcrumb, once: the first time-fence Signal returned.
+                    {
+                        static std::atomic<bool> signal_marked{false};
+                        if(!signal_marked.load(std::memory_order_relaxed)) {signal_marked.store(true,std::memory_order_relaxed);Breadcrumb_Mark(StartupStage::FirstGateSignal);}
+                    }
                     ticket.signalled=SUCCEEDED(ticket.trace.signal_result);
+                    // A failed Signal keeps the obligation (retried every ms) unless the device was removed: the
+                    // runtime has released every GPU wait then, and retrying would only spin the worker and run the
+                    // stop into its timeout.
+                    if(!ticket.signalled && DeviceRemoved(ticket.time)) {
+                        ticket.signalled=true;
+                        Fail("device removed",DXGI_ERROR_DEVICE_REMOVED);
+                    }
+                    // gpu_queue_probe (key off: one load and a branch): the release of the hold's Wait.
+                    // The enqueue stamp stays until the ticket is freed (Enqueue still reads it for the announce).
+                    if(ticket.signalled && g_gpu_queue_probe.load(std::memory_order_relaxed) && ticket.probe_enq_qpc>0)
+                        GpuQueueProbe_OnHoldRelease(queue.native,ticket.time,ticket.trace.ticket,ticket.probe_enq_qpc,
+                            ticket.trace.signal_before_qpc);
                     ticket.trace.status=ticket.signalled?(current?GpuPresentStatus::Released:GpuPresentStatus::Drained):GpuPresentStatus::Failed;
                     if(!ticket.signalled)Fail("CPU fence Signal",ticket.trace.signal_result);
                     // OutputRelease o of a queued wait: the Signal time, status Held
@@ -711,7 +745,7 @@ int64_t Service() noexcept {
                 const auto completed=Completed(&ticket);
                 if(completed==UINT64_MAX) {failed=true;admission.fetch_or(kClosed);}
                 else if(completed>=ticket.trace.ticket && !ticket.post_slot && !ticket.pre_slot)
-                    ticket.state.store(TicketState::Free,std::memory_order_release);
+                    {if(ticket.probe_enq_qpc)ticket.probe_enq_qpc=0;ticket.state.store(TicketState::Free,std::memory_order_release);}
             }
         }
     }
@@ -728,6 +762,7 @@ int64_t Service() noexcept {
         // Worker-cadence observation of the done fence; coarse, post-wait event only.
         if(!ticket.trace.ready_qpc)ticket.trace.ready_qpc=ticket.post_sample.timestamp.completion_observe_before_qpc;
         FinishPostWait(&queue,&ticket);
+        if(ticket.probe_enq_qpc)ticket.probe_enq_qpc=0;
         ticket.state.store(TicketState::Free,std::memory_order_release);
     }
     // All due time-fence obligations above take priority over FG readback.
@@ -881,6 +916,8 @@ struct EnqueueRequest {
     bool fg=false;
     int fg_multiplier=0;
     double fg_divisor=1.0; // the plan's
+    float hold_advance_us=0.0f; // the plan's (Ticket::hold_advance_us)
+    uint64_t law_hold_sequence=0; // the plan's (Ticket::law_hold_sequence)
     int64_t floor_base_qpc=0; // fg_late_spacing: T(n) without the floor (Ticket)
     uint64_t fg_binding=0;
     bool probe=false; // developer presenter probe: no plan (Ticket::probe)
@@ -949,6 +986,8 @@ bool Enqueue(const EnqueueRequest& request,GpuPresentTrace* trace) noexcept {
     ticket.floor_base_qpc=request.floor_base_qpc;ticket.floor_checked=ticket.floor_blocked=false;
     ticket.fg_binding=request.fg_binding;
     ticket.probe=request.probe;
+    ticket.hold_advance_us=request.hold_advance_us;
+    ticket.law_hold_sequence=request.law_hold_sequence;
     ticket.fg_epoch=fg_epoch.load(std::memory_order_acquire);
     const auto abandon_prepared=[&] {
         ticket.state.store(TicketState::Free,std::memory_order_release);
@@ -990,6 +1029,9 @@ bool Enqueue(const EnqueueRequest& request,GpuPresentTrace* trace) noexcept {
     };
     // Publish a guaranteed signal obligation BEFORE any GPU Wait. Stop waits
     // for this admission count while the worker continues signalling Armed slots.
+    // gpu_queue_probe (key off: one load and a branch): the metadata of the hold's probe events is set
+    // BEFORE the ticket is published (the worker reads and clears it once it releases the ticket).
+    if(g_gpu_queue_probe.load(std::memory_order_relaxed))ticket.probe_enq_qpc=Qpc();
     ticket.state.store(TicketState::Armed,std::memory_order_release);
     gpu_present_shared::outstanding.store(true,std::memory_order_release);
     const bool woke=SetEvent(work_event)!=FALSE;
@@ -999,7 +1041,19 @@ bool Enqueue(const EnqueueRequest& request,GpuPresentTrace* trace) noexcept {
         ticket.pre_sample.signal_result=GpuReadinessQueue_Submit(&queue->post_queue,ticket.pre_slot,&ticket.pre_sample);
         if(FAILED(ticket.pre_sample.signal_result))Fail("pre-wait timestamp submission",ticket.pre_sample.signal_result);
     }
+    // gpu_queue_probe (key off: one load and a branch): the hold Wait is a boundary of the frames of the queue it
+    // waits on, and its identity is announced BEFORE the Wait goes on the queue (the release call comes after
+    // the release). The enqueue time was taken before the ticket was published (probe_enq_qpc).
+    if(g_gpu_queue_probe.load(std::memory_order_relaxed)) {
+        GpuQueueProbe_OnHoldAnnounce(queue->native,ticket.time,trace->ticket,ticket.probe_enq_qpc,ticket.law_hold_sequence);
+        GpuQueueProbe_OnGateEnqueue(queue->native);
+    }
     trace->wait_result=woke?EnqueueWait(queue,&ticket):E_FAIL;
+    if(SUCCEEDED(trace->wait_result)) {
+        // Start-up breadcrumb, once: the first Wait is on the queue.
+        static std::atomic<bool> wait_marked{false};
+        if(!wait_marked.load(std::memory_order_relaxed)) {wait_marked.store(true,std::memory_order_relaxed);Breadcrumb_Mark(StartupStage::FirstGateWaitEnqueued);}
+    }
     if(ticket.post_slot && SUCCEEDED(trace->wait_result) && SUCCEEDED(ticket.pre_sample.signal_result)) {
         prepare_sample(&ticket.post_sample,trace->ticket*2+1);
         ticket.post_sample.signal_result=GpuReadinessQueue_Submit(&queue->post_queue,ticket.post_slot,&ticket.post_sample);
@@ -1036,9 +1090,11 @@ OutputDecision Decide(const PacingFramePlan& plan,int64_t now,bool displayed_sla
     OutputDecision decision;
     CadenceGridSnapshot snapshot;
     bool floored=false;
+    const bool key=PacingPipeline_UnifiedPacerKey();
     if(!g_cadence_grid_publication.Read(&snapshot) ||
         !CadenceGrid_ResolveOutputTarget(snapshot,plan.key.controller_generation,plan.grid_index,
-            g_cadence_output_tracker,&decision.target,&floored,displayed_slack?plan.fg_divisor:1.0)) {
+            g_cadence_output_tracker,&decision.target,&floored,displayed_slack?plan.fg_divisor:1.0,
+            key,key?plan.hold_advance_us:0.0)) {
         decision.status=PacingPlanStatus::Stale;decision.gate=GpuPresentStatus::PlanStale;decision.target=0;
         return decision;
     }
@@ -1205,9 +1261,12 @@ bool GpuPresent_Start() noexcept {
     if(!work_event || !timer) {
         if(work_event)CloseHandle(work_event);if(timer)CloseHandle(timer);work_event=timer=nullptr;return false;
     }
-    stopping=false;failed=false;heartbeat=Qpc();admission=0;
+    // Admission opens only once the worker thread exists, and the heartbeat is the worker's own: until its first
+    // service pass an admission finds a stale worker and enqueues no Wait that nothing could signal.
+    stopping=false;failed=false;heartbeat=0;
     thread=CreateThread(nullptr,0,Worker,nullptr,0,nullptr);
     if(!thread) {stopping=true;admission=kClosed;CloseHandle(work_event);CloseHandle(timer);work_event=timer=nullptr;return false;}
+    admission=0;
     return true;
 }
 bool GpuPresent_Stop() noexcept {
@@ -1249,7 +1308,7 @@ bool GpuPresent_ReleaseAfterRundown() noexcept {
         queue.post_released=true;
         for(auto& ticket:queue.tickets) {
             Release(ticket.time);Release(ticket.done);ticket.time=ticket.done=nullptr;
-            ticket.signalled=false;ticket.state.store(TicketState::Free,std::memory_order_release);
+            ticket.signalled=false;if(ticket.probe_enq_qpc)ticket.probe_enq_qpc=0;ticket.state.store(TicketState::Free,std::memory_order_release);
         }
         Release(queue.native);queue.native=nullptr;queue.state=QueueState::Failed;
     }
@@ -1303,6 +1362,7 @@ GpuPresentExecution GpuPresent_Execute(NativeGateCall* native,GpuReadinessCall* 
             current.no_frame_generation && current.native_swapchain==span->native_swapchain &&
             current.swapchain_generation==span->key.swapchain_generation;
         EnqueueRequest request;request.native=queue_identity;request.context=context;request.span=span;request.key=plan.key;
+        request.hold_advance_us=plan.hold_advance_us;request.law_hold_sequence=plan.law_hold_sequence;
         if(!eligible)trace.status=GpuPresentStatus::Unsupported;
         if(eligible && Enqueue(request,&trace))execution=GpuPresentExecution::WaitCommitted;
         else outcome=AdmissionOutcome(trace);
@@ -1371,6 +1431,12 @@ bool GpuPresent_ReadStatusSnapshot(GpuPresentStatusSnapshot* snapshot) noexcept 
 // True: a prefix measurement is pending and FinishFgInput must follow.
 bool GpuPresent_BeginFgInput(uint64_t native,const GpuPresentFgInput& input) noexcept {
     using namespace gpu_present;
+    // gpu_queue_probe (key off: one load and a branch): the boundary of this real frame on the FG
+    // input's source queue, in front of every eligibility check (the frame generation counterpart
+    // of the readiness site, which is not used under frame generation).
+    if(g_gpu_queue_probe.load(std::memory_order_relaxed) && native && input.source && input.transaction)
+        GpuQueueProbe_OnFgInputBoundary(reinterpret_cast<void*>(native),input.swapchain,
+            PacingFrameKey{PacingIdentityDomain::NvApiFrame,input.producer,input.source});
     if(fg_pending_transaction) {fg_route_pending.fetch_add(1,std::memory_order_relaxed);return false;}
     if(!native || !input.source || !input.transaction) {fg_route_invalid.fetch_add(1,std::memory_order_relaxed);return false;}
     if(input.binding && !StreamlineHandoff_IsCurrent(input.binding)) {
@@ -1471,6 +1537,7 @@ bool GpuPresent_BeginFgInput(uint64_t native,const GpuPresentFgInput& input) noe
         span.native_swapchain=input.native;span.key.swapchain_generation=input.swapchain;
         EnqueueRequest request;request.native=native;request.context=context;request.span=&span;request.key=plan.key;
         request.fg=true;request.fg_multiplier=multiplier;request.fg_divisor=plan.fg_divisor;request.fg_binding=input.binding;
+        request.hold_advance_us=plan.hold_advance_us;request.law_hold_sequence=plan.law_hold_sequence;
         request.floor_base_qpc=late_spacing?decision.grid_target:0;
         if(!Enqueue(request,&trace))outcome=AdmissionOutcome(trace);
     }

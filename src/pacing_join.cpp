@@ -91,6 +91,7 @@ void PacingJoiner::Reset(uint64_t qpc_frequency) noexcept
     presents_.Clear();
     gates_.Clear();
     readies_.Clear();
+    gpu_queues_.Clear();
     reflexes_.Clear();
     waits_.Clear();
     pending_displays_.Clear();
@@ -163,6 +164,12 @@ void PacingJoiner::AddReady(const PacingReadyRecord& record, int64_t now_qpc) no
 {
     EvictOlderThan(&readies_, now_qpc, retention_ticks_);
     Retain(&readies_, RetainedReady{ record, now_qpc }, &statistics_.ready_capacity_evictions);
+}
+
+void PacingJoiner::AddGpuQueue(const PacingGpuQueueRecord& record, int64_t now_qpc) noexcept
+{
+    EvictOlderThan(&gpu_queues_, now_qpc, retention_ticks_);
+    Retain(&gpu_queues_, RetainedGpuQueue{ record, now_qpc }, &statistics_.gpu_queue_capacity_evictions);
 }
 
 void PacingJoiner::AddReflex(const PacingReflexRecord& record, int64_t now_qpc) noexcept
@@ -243,6 +250,7 @@ void PacingJoiner::EvictAgedRecords(int64_t now_qpc) noexcept
     EvictOlderThan(&sources_, now_qpc, retention_ticks_);
     EvictOlderThan(&gates_, now_qpc, retention_ticks_);
     EvictOlderThan(&readies_, now_qpc, retention_ticks_);
+    EvictOlderThan(&gpu_queues_, now_qpc, retention_ticks_);
     EvictOlderThan(&reflexes_, now_qpc, retention_ticks_);
     EvictOlderThan(&waits_, now_qpc, retention_ticks_);
 }
@@ -522,6 +530,30 @@ void PacingJoiner::AttachWorkerRecords(PacingJoinedRow* row) noexcept
                 row->ready.gpu_start_qpc = probe->record.gpu_start_qpc;
             }
         }
+    }
+
+    // GPU queue probe: the frame key first (under frame generation a real frame's record carries
+    // its key and no Present sequence), else (swapchain generation, present sequence) of the
+    // row's Present.
+    const RetainedGpuQueue* queue = nullptr;
+    if (key_valid) {
+        queue = FindNewest(gpu_queues_,
+            [&key](const PacingGpuQueueRecord& candidate) { return candidate.key == key; });
+    }
+    if (queue == nullptr && row->has_present && row->present.swapchain_generation != 0 &&
+        row->present.present_sequence != 0) {
+        const uint64_t generation = row->present.swapchain_generation;
+        const uint64_t sequence = row->present.present_sequence;
+        queue = FindNewest(gpu_queues_,
+            [generation, sequence](const PacingGpuQueueRecord& candidate) {
+                return candidate.swapchain_generation == generation &&
+                    candidate.present_sequence == sequence;
+            });
+    }
+    if (queue != nullptr) {
+        row->has_gpu_queue = true;
+        row->gpu_queue = queue->record;
+        ++statistics_.gpu_queue_joined;
     }
 
     if (key_valid) {

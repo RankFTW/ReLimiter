@@ -73,8 +73,13 @@ void StreamlineProxy_Install(HMODULE module, uint64_t table, const StreamlineCom
                     // A partial install can forward but cannot qualify any input.
                     present = InstallHook(reinterpret_cast<void*>(result.present), reinterpret_cast<void*>(&ObservePresent), &original_present);
                     present1 = InstallHook(reinterpret_cast<void*>(result.present1), reinterpret_cast<void*>(&ObservePresent1), &original_present1);
-                    if (present == MH_OK && present1 == MH_OK) expected_vtable.store(result.vtable, std::memory_order_release);
-                    result.outcome = present == MH_OK && present1 == MH_OK ? "installed" : "install_incomplete";
+                    // Inside a batch the two hooks are only queued: enable them now, the result decides the outcome.
+                    Hooks_FlushBatch();
+                    const bool enabled = present == MH_OK && present1 == MH_OK &&
+                        Hooks_TargetEnabled(reinterpret_cast<void*>(result.present)) &&
+                        Hooks_TargetEnabled(reinterpret_cast<void*>(result.present1));
+                    if (enabled) expected_vtable.store(result.vtable, std::memory_order_release);
+                    result.outcome = enabled ? "installed" : "install_incomplete";
                 }
             }
         }

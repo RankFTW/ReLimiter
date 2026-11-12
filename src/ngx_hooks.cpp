@@ -689,6 +689,14 @@ static void RetainHookPlan(const NGXHookPlan& plan) noexcept {
     }
 }
 
+// MH_DisableHook freezes, so it goes through the hook installer (hooks.h). A MinHook left unusable by the death of
+// that thread is not a disabled hook: the status then is a failure IsDisableSuccess does not accept.
+static MH_STATUS DisableTarget(void* target) noexcept {
+    if (Hooks_MinHookUnusable()) return MH_ERROR_NOT_INITIALIZED;
+    const MH_STATUS status = Hooks_DisableHook(target);
+    return Hooks_MinHookUnusable() ? MH_ERROR_NOT_INITIALIZED : status;
+}
+
 static bool IsDisableSuccess(MH_STATUS status) noexcept {
     return status == MH_OK || status == MH_ERROR_DISABLED ||
         status == MH_ERROR_NOT_CREATED;
@@ -728,14 +736,15 @@ static bool CleanupInstallPlans(
         bool removable = true;
         MH_STATUS cleanup_status = MH_OK;
         if (plan.enabled) {
-            cleanup_status = MH_DisableHook(plan.target);
+            cleanup_status = DisableTarget(plan.target);
             removable = IsDisableSuccess(cleanup_status);
         }
         if (removable && cleanup_status != MH_ERROR_NOT_CREATED) {
-            cleanup_status = MH_RemoveHook(plan.target);
+            cleanup_status = Hooks_RemoveHook(plan.target);
             removable = IsRemoveSuccess(cleanup_status);
         }
         if (removable) {
+            Hooks_ForgetTarget(plan.target);
             if (originals_published) ClearOriginal(plan.slot);
             continue;
         }
@@ -796,7 +805,7 @@ static InstallTransactionResult InstallHookTransaction() {
                 ? InstallTransactionResult::CleanFailure
                 : InstallTransactionResult::CleanupRequired;
         }
-        const MH_STATUS status = MH_CreateHook(
+        const MH_STATUS status = Hooks_CreateHook(
             plan.target, plan.detour, &plan.trampoline);
         if (status != MH_OK) {
             LOG_WARN("NGX: failed to create %s hook from %ls (status=%d)",
@@ -813,17 +822,35 @@ static InstallTransactionResult InstallHookTransaction() {
         PublishOriginal(plans[i].slot, plans[i].trampoline);
     }
 
+    // Queue every target in the install batch (NGXHooks_TryInstall opens it, or runs inside the caller's). The
+    // transaction cannot retain or roll back before it knows what was enabled, so it applies the batch here and
+    // reads each target's result from Hooks_TargetEnabled. A target that could not even be queued stops the
+    // queueing; the ones queued before it are applied and settled the same way (nothing stays queued), as the
+    // targets enabled before a failing one were.
+    bool all_enabled = true;
     for (size_t i = 0; i < plan_count; ++i) {
         NGXHookPlan& plan = plans[i];
-        const MH_STATUS status = MH_EnableHook(plan.target);
+        const MH_STATUS status = Hooks_EnableOrQueue(plan.target);
         if (status != MH_OK && status != MH_ERROR_ENABLED) {
-            LOG_WARN("NGX: failed to enable %s hook from %ls (status=%d)",
+            LOG_WARN("NGX: failed to queue %s hook from %ls (status=%d)",
                      HookSlotName(plan.slot), plan.module_name, status);
-            return CleanupInstallPlans(plans, plan_count, true)
-                ? InstallTransactionResult::CleanFailure
-                : InstallTransactionResult::CleanupRequired;
+            all_enabled = false;
+            break;
         }
-        plan.enabled = true;
+    }
+    Hooks_FlushBatch();
+    for (size_t i = 0; i < plan_count; ++i) {
+        NGXHookPlan& plan = plans[i];
+        plan.enabled = Hooks_TargetEnabled(plan.target);
+        if (plan.enabled || !all_enabled) continue;
+        all_enabled = false;
+        LOG_WARN("NGX: failed to enable %s hook from %ls",
+                 HookSlotName(plan.slot), plan.module_name);
+    }
+    if (!all_enabled) {
+        return CleanupInstallPlans(plans, plan_count, true)
+            ? InstallTransactionResult::CleanFailure
+            : InstallTransactionResult::CleanupRequired;
     }
 
     for (size_t i = 0; i < plan_count; ++i) {
@@ -842,7 +869,7 @@ static bool RemoveOwnedHooksAfterRundown() {
 
     for (size_t i = 0; i < s_hook_count; ++i) {
         const NGXHookRecord record = s_hook_records[i];
-        const MH_STATUS disable_status = MH_DisableHook(record.target);
+        const MH_STATUS disable_status = DisableTarget(record.target);
         if (!IsDisableSuccess(disable_status)) {
             retained[retained_count++] = record;
             LOG_ERROR("NGX: failed to disable %s target %p (status=%d)",
@@ -852,7 +879,7 @@ static bool RemoveOwnedHooksAfterRundown() {
 
         const MH_STATUS remove_status = disable_status == MH_ERROR_NOT_CREATED
             ? MH_ERROR_NOT_CREATED
-            : MH_RemoveHook(record.target);
+            : Hooks_RemoveHook(record.target);
         if (!IsRemoveSuccess(remove_status)) {
             retained[retained_count++] = record;
             LOG_ERROR("NGX: failed to remove %s target %p (status=%d)",
@@ -860,6 +887,7 @@ static bool RemoveOwnedHooksAfterRundown() {
             continue;
         }
 
+        Hooks_ForgetTarget(record.target);
         ClearOriginal(record.slot);
     }
 
@@ -886,7 +914,12 @@ static void LogLoadedNGXModulesOnce() {
 // ── Public API ──
 
 void NGXHooks_TryInstall() {
-    HookInstallGuard hook_install;
+    // The transaction creates hooks itself, so it holds the install lock for its whole run (taken before the
+    // lifecycle lock, as ever). The batch is the caller's when there is one (the init batch, a loader scan),
+    // otherwise its own; the transaction applies it before it retains or rolls back (InstallHookTransaction).
+    HookInstallGuard install_lock;
+    if (!install_lock) return;
+    HookBatch hook_install(HookBatchSite::LoaderScan);
     if (!hook_install) return;
     AcquireSRWLockExclusive(&s_hook_lifecycle_lock);
     if (s_hook_state != NGXHookState::Uninstalled &&

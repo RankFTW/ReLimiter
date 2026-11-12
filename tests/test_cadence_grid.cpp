@@ -2051,6 +2051,7 @@ namespace
         snapshot.current.origin_qpc = static_cast<int64_t>(counter * 23);
         snapshot.current.origin_fraction = static_cast<double>(counter % 1000) / 1000.0;
         snapshot.current.interval_ticks = static_cast<double>(counter) + 0.25;
+        snapshot.current.floor_interval_ticks = static_cast<double>(counter % 7) + 0.125;
         for (size_t position = 0; position + 1 < kCadenceGridSegmentHistory; ++position) {
             CadenceGridSegment& segment = snapshot.older[position];
             const uint64_t salt = counter * 29 + position;
@@ -2058,6 +2059,7 @@ namespace
             segment.origin_qpc = static_cast<int64_t>(salt * 31);
             segment.origin_fraction = static_cast<double>(salt % 997) / 997.0;
             segment.interval_ticks = static_cast<double>(salt) + 0.5;
+            segment.floor_interval_ticks = static_cast<double>(salt % 5) + 0.375;
         }
         snapshot.segment_count = static_cast<uint32_t>(counter % 9);
         snapshot.snapped = (counter % 5) == 0;
@@ -2071,7 +2073,8 @@ namespace
         return left.base_index == right.base_index &&
             left.origin_qpc == right.origin_qpc &&
             left.origin_fraction == right.origin_fraction &&
-            left.interval_ticks == right.interval_ticks;
+            left.interval_ticks == right.interval_ticks &&
+            left.floor_interval_ticks == right.floor_interval_ticks;
     }
 
     bool SnapshotsEqual(const CadenceGridSnapshot& left, const CadenceGridSnapshot& right)
@@ -2164,11 +2167,460 @@ namespace
                     static_cast<unsigned long long>(distinct),
                     static_cast<unsigned long long>(torn));
     }
+
+    // ── Unified pacer: PlanAt ──
+
+    CadenceGridPlanAtInput AtInput(
+        int64_t now_qpc,
+        double interval_us,
+        int64_t origin_qpc,
+        double fraction,
+        int64_t release_qpc,
+        PacingTimingMode mode = PacingTimingMode::Vrr,
+        uint32_t generation = kGeneration,
+        bool period_change = false)
+    {
+        CadenceGridPlanAtInput input{};
+        input.now_qpc = now_qpc;
+        input.qpc_frequency = kFrequency;
+        input.interval_us = interval_us;
+        input.origin_qpc = origin_qpc;
+        input.origin_fraction = fraction;
+        input.source_wake_qpc = release_qpc;
+        input.lead_us = 2000.0;
+        input.period_change = period_change;
+        input.mode = mode;
+        input.controller_generation = generation;
+        return input;
+    }
+
+    void TestPlanAtEpochsAndSegments()
+    {
+        CadenceGrid grid;
+        const double interval_us = 8333.0;
+        const int64_t release1 = kStartQpc;
+        const int64_t origin1 = kStartQpc + 50000;
+        // A new grid starts a Lifecycle epoch; the release is judged by nobody.
+        const CadenceGridPlan first = grid.PlanAt(AtInput(release1 + 100, interval_us, origin1, 0.25, release1));
+        CHECK(first.valid && first.grid_index == 1 && first.epoch == 1);
+        CHECK(first.epoch_reason == PacingEpochReason::Lifecycle);
+        CHECK(first.output_target_qpc == origin1);
+        CHECK(first.source_wake_qpc == release1 + 100); // max(R, now)
+        CHECK(first.released_immediately == false || first.source_wake_qpc == release1 + 100);
+        CHECK(TargetOf(grid, 1) == origin1);
+
+        // The next index at a different interval: a silent rebase, no epoch.
+        const int64_t origin2 = origin1 + RoundTicks(Ticks(7000.0));
+        const CadenceGridPlan second = grid.PlanAt(AtInput(release1 + 90000, 7000.0, origin2, 0.5, release1 + 80000));
+        CHECK(second.valid && second.grid_index == 2 && second.epoch == 1);
+        CHECK(second.epoch_reason == PacingEpochReason::None);
+        CHECK(grid.Statistics().silent_rebases == 1);
+        CHECK(TargetOf(grid, 2) == origin2 + 1); // origin + floor(fraction + 0.5)
+        CHECK(TargetOf(grid, 1) == origin1);     // an older index resolves through its own segment
+
+        // A period change, a mode change and a new generation start their epochs.
+        const CadenceGridPlan period = grid.PlanAt(AtInput(release1 + 190000, 7000.0, origin2 + 70000, 0.0,
+            release1 + 180000, PacingTimingMode::Vrr, kGeneration, true));
+        CHECK(period.valid && period.epoch_reason == PacingEpochReason::PeriodChange && period.epoch == 2);
+        const CadenceGridPlan mode = grid.PlanAt(AtInput(release1 + 290000, 7000.0, origin2 + 140000, 0.0,
+            release1 + 280000, PacingTimingMode::Fixed));
+        CHECK(mode.valid && mode.epoch_reason == PacingEpochReason::ModeChange);
+        CHECK(TargetOf(grid, 1) == origin1); // history kept across a mode change
+        const CadenceGridPlan lifecycle = grid.PlanAt(AtInput(release1 + 390000, 7000.0, origin2 + 210000, 0.0,
+            release1 + 380000, PacingTimingMode::Fixed, kGeneration + 1));
+        CHECK(lifecycle.valid && lifecycle.epoch_reason == PacingEpochReason::Lifecycle);
+        CHECK(!Resolves(grid, 1, kGeneration + 1)); // a new lifecycle drops the history
+
+        // Invalid input leaves the grid unchanged; Off suspends it.
+        const uint64_t next_index = grid.NextIndex();
+        CHECK(!grid.PlanAt(AtInput(release1 + 400000, 7000.0, origin2 + 220000, 1.0, release1 + 390000,
+            PacingTimingMode::Fixed, kGeneration + 1)).valid);
+        CHECK(!grid.PlanAt(AtInput(release1 + 400000, 0.0, origin2 + 220000, 0.0, release1 + 390000,
+            PacingTimingMode::Fixed, kGeneration + 1)).valid);
+        CHECK(grid.NextIndex() == next_index);
+        CHECK(!grid.PlanAt(AtInput(release1 + 400000, 7000.0, origin2 + 220000, 0.0, release1 + 390000,
+            PacingTimingMode::Off)).valid);
+        CHECK(!grid.Snapshot().valid);
+    }
+
+    // The executors resolve the effective target F from PlanAt origins (spec 2.5):
+    // F = max(H, o(n - 1) + I - s). An on-time predecessor leaves F = H; a retreating H
+    // gives F = o(n - 1) + I - s; a late predecessor record raises F.
+    void TestPlanAtOutputFloor()
+    {
+        const double interval_us = 8333.0;
+        const double interval_ticks = Ticks(interval_us);
+        const int64_t slack = CadenceGrid_LateToleranceTicks(interval_ticks, kFrequency) / 2;
+        const int64_t interval = RoundTicks(interval_ticks);
+        const int64_t h1 = kStartQpc + 100000;
+
+        const auto resolve = [&](CadenceGrid& grid, CadenceGridOutputTracker& tracker, uint64_t index,
+            int64_t* target, bool* floored) {
+            CHECK(CadenceGrid_ResolveOutputTarget(grid.Snapshot(), kGeneration, index, tracker, target, floored));
+        };
+        int64_t target = 0;
+        bool floored = false;
+
+        // On-time predecessor: F = H.
+        {
+            CadenceGrid grid;
+            CadenceGridOutputTracker tracker;
+            grid.PlanAt(AtInput(kStartQpc, interval_us, h1, 0.0, kStartQpc));
+            grid.PlanAt(AtInput(kStartQpc + interval, interval_us, h1 + interval, 0.0, kStartQpc + interval));
+            CHECK(tracker.Record(kGeneration, 1, h1));
+            resolve(grid, tracker, 2, &target, &floored);
+            CHECK(target == h1 + interval && !floored);
+        }
+        // H retreats (the lead fell): F = o(n - 1) + I - s, output spacing never shrinks below I - s.
+        {
+            CadenceGrid grid;
+            CadenceGridOutputTracker tracker;
+            grid.PlanAt(AtInput(kStartQpc, interval_us, h1, 0.0, kStartQpc));
+            const int64_t retreated = h1 + interval - RoundTicks(Ticks(3000.0));
+            grid.PlanAt(AtInput(kStartQpc + interval, interval_us, retreated, 0.0, kStartQpc + interval));
+            CHECK(tracker.Record(kGeneration, 1, h1));
+            resolve(grid, tracker, 2, &target, &floored);
+            CHECK(floored && target == h1 + interval - slack);
+        }
+        // A late predecessor record (RecordLater) raises F.
+        {
+            CadenceGrid grid;
+            CadenceGridOutputTracker tracker;
+            grid.PlanAt(AtInput(kStartQpc, interval_us, h1, 0.0, kStartQpc));
+            grid.PlanAt(AtInput(kStartQpc + interval, interval_us, h1 + interval, 0.0, kStartQpc + interval));
+            CHECK(tracker.Record(kGeneration, 1, h1));
+            const int64_t late_ready = h1 + RoundTicks(Ticks(4000.0));
+            CHECK(tracker.RecordLater(kGeneration, 1, late_ready));
+            resolve(grid, tracker, 2, &target, &floored);
+            CHECK(floored && target == late_ready + interval - slack);
+            CHECK(target > h1 + interval);
+        }
+    }
+
+    // Developer key unified_pacer, saturation rule (a): when the hardware term binds the commanded
+    // I(n) (here 20.2 ms) the output spacing floor uses the display-side interval I_disp (16.67 ms)
+    // for both o(n - 1) + I - slack and the slack (from I_disp / D). The start grid and the
+    // nominal target keep I(n); display_interval_us 0 (key off, PlanNext) is today's floor.
+    // A hold may delay the next frame's GPU work only while the GPU has slack; the floor must
+    // not space outputs wider than the display-side interval.
+    void TestPlanAtDisplaySideFloor()
+    {
+        const double commanded_us = 20200.0;
+        const double display_us = 16670.0;
+        const int64_t commanded = RoundTicks(Ticks(commanded_us));
+        const int64_t display = RoundTicks(Ticks(display_us));
+        const int64_t h1 = kStartQpc + 100000;
+        const int64_t h2 = h1 + 100000; // H(2) retreats below every floor below
+        const auto slack_of = [](int64_t interval_ticks, double divisor) {
+            const double displayed = divisor > 1.0 ? static_cast<double>(interval_ticks) / divisor
+                                                   : static_cast<double>(interval_ticks);
+            return CadenceGrid_LateToleranceTicks(displayed, kFrequency) / 2;
+        };
+
+        const auto plan_two = [&](double display_interval_us, CadenceGrid* grid) {
+            CadenceGridPlanAtInput first = AtInput(kStartQpc, commanded_us, h1, 0.0, kStartQpc);
+            first.display_interval_us = display_interval_us;
+            CHECK(grid->PlanAt(first).valid);
+            CadenceGridPlanAtInput second =
+                AtInput(kStartQpc + commanded, commanded_us, h2, 0.0, kStartQpc + commanded);
+            second.display_interval_us = display_interval_us;
+            CHECK(grid->PlanAt(second).valid);
+        };
+        const auto resolve = [&](const CadenceGridSnapshot& snapshot, double divisor, int64_t* target,
+            bool* floored) {
+            CadenceGridOutputTracker tracker;
+            CHECK(tracker.Record(kGeneration, 1, h1));
+            CHECK(CadenceGrid_ResolveOutputTarget(snapshot, kGeneration, 2, tracker, target, floored, divisor, true));
+        };
+        int64_t target = 0;
+        bool floored = false;
+
+        // I_disp bound: the floor is o(n - 1) + I_disp - slack(I_disp), not the commanded interval's.
+        CadenceGrid bound;
+        plan_two(display_us, &bound);
+        CHECK(TargetOf(bound, 2) == h2); // the nominal target keeps its grid position
+        CHECK(std::fabs(bound.Snapshot().current.floor_interval_ticks - Ticks(display_us)) < 1e-6);
+        CHECK(std::fabs(bound.Snapshot().current.interval_ticks - Ticks(commanded_us)) < 1e-6);
+        resolve(bound.Snapshot(), 1.0, &target, &floored);
+        CHECK(floored && target == h1 + display - slack_of(display, 1.0));
+        const int64_t bound_target = target;
+        // The slack comes from I_disp / D (frame generation): wider interval, smaller slack.
+        resolve(bound.Snapshot(), 2.0, &target, &floored);
+        CHECK(floored && target == h1 + display - slack_of(display, 2.0));
+        CHECK(slack_of(display, 2.0) < slack_of(display, 1.0));
+
+        // display_interval_us 0 is today's floor on the commanded interval, and sets no segment value.
+        CadenceGrid today;
+        plan_two(0.0, &today);
+        CHECK(today.Snapshot().current.floor_interval_ticks == 0.0);
+        resolve(today.Snapshot(), 1.0, &target, &floored);
+        CHECK(floored && target == h1 + commanded - slack_of(commanded, 1.0));
+        CHECK(bound_target < target);                       // the display-side floor spaces outputs less
+        CHECK(bound_target - h1 < display);                 // never wider than I_disp
+        // An unusable value (negative, NaN) is none.
+        CadenceGrid invalid;
+        plan_two(-5.0, &invalid);
+        CHECK(invalid.Snapshot().current.floor_interval_ticks == 0.0);
+        CadenceGrid not_a_number;
+        plan_two(std::nan(""), &not_a_number);
+        CHECK(not_a_number.Snapshot().current.floor_interval_ticks == 0.0);
+
+        // An on-time predecessor leaves T(n) under either floor.
+        {
+            CadenceGrid grid;
+            CadenceGridPlanAtInput first = AtInput(kStartQpc, commanded_us, h1, 0.0, kStartQpc);
+            first.display_interval_us = display_us;
+            grid.PlanAt(first);
+            CadenceGridPlanAtInput second =
+                AtInput(kStartQpc + commanded, commanded_us, h1 + commanded, 0.0, kStartQpc + commanded);
+            second.display_interval_us = display_us;
+            grid.PlanAt(second);
+            resolve(grid.Snapshot(), 1.0, &target, &floored);
+            CHECK(!floored && target == h1 + commanded);
+        }
+
+        // The published copy carries the floor interval to the executors.
+        CadenceGridPublication publication;
+        publication.Publish(bound.Snapshot());
+        CadenceGridSnapshot read{};
+        CHECK(publication.Read(&read));
+        CHECK(read.current.floor_interval_ticks == bound.Snapshot().current.floor_interval_ticks);
+        resolve(read, 1.0, &target, &floored);
+        CHECK(floored && target == bound_target);
+    }
+
+    // The cutover to the legacy planning clears the display-side floor at once: PlanNext keeps the
+    // current segment while the commanded interval, mode and generation are unchanged and the
+    // source is on time, so a floor left on it would shorten the legacy floor. Unified at a
+    // commanded 20 ms with I_disp 16.667 ms; key off with the legacy cap 50 fps (20 ms): the next
+    // legacy plan's floor is 20 ms; on again: the floor is planned again.
+    void TestClearDisplayFloorAtCutover()
+    {
+        const double commanded_us = 20000.0;
+        const double display_us = 16667.0;
+        const int64_t commanded = RoundTicks(Ticks(commanded_us));
+        const int64_t display = RoundTicks(Ticks(display_us));
+        const int64_t h1 = kStartQpc + 100000;
+        const auto slack_of = [](int64_t interval_ticks) {
+            return CadenceGrid_LateToleranceTicks(static_cast<double>(interval_ticks), kFrequency) / 2;
+        };
+        CadenceGrid grid;
+        CadenceGridOutputTracker tracker;
+        int64_t target = 0;
+        bool floored = false;
+
+        // Unified: two on-time plans carrying the display-side floor.
+        CadenceGridPlanAtInput first = AtInput(kStartQpc, commanded_us, h1, 0.0, kStartQpc);
+        first.display_interval_us = display_us;
+        CHECK(grid.PlanAt(first).valid);
+        CadenceGridPlanAtInput second =
+            AtInput(kStartQpc + commanded, commanded_us, h1 + commanded, 0.0, kStartQpc + commanded);
+        second.display_interval_us = display_us;
+        CHECK(grid.PlanAt(second).valid);
+        CHECK(grid.Snapshot().current.floor_interval_ticks > 0.0);
+        const int64_t t2 = TargetOf(grid, 2);
+        CHECK(t2 == h1 + commanded);
+
+        // Key off: a zero-floor segment now; nothing else moves.
+        const CadenceGridSnapshot before = grid.Snapshot();
+        const uint64_t next_index = grid.NextIndex();
+        CHECK(grid.ClearDisplayFloor());
+        const CadenceGridSnapshot& cleared = grid.Snapshot();
+        CHECK(cleared.current.floor_interval_ticks == 0.0);
+        CHECK(cleared.current.base_index == before.current.base_index &&
+              cleared.current.origin_qpc == before.current.origin_qpc &&
+              cleared.current.origin_fraction == before.current.origin_fraction &&
+              cleared.current.interval_ticks == before.current.interval_ticks);
+        CHECK(cleared.segment_count == before.segment_count && cleared.epoch == before.epoch &&
+              cleared.epoch_base_index == before.epoch_base_index &&
+              cleared.last_planned_index == before.last_planned_index && grid.NextIndex() == next_index);
+        CHECK(TargetOf(grid, 2) == t2 && TargetOf(grid, 1) == h1);
+        CHECK(!grid.ClearDisplayFloor()); // nothing left to clear
+
+        // The next legacy plan (cap 50 fps: the same 20 ms) keeps the segment: floor 0.
+        const CadenceGridPlan legacy = grid.PlanNext(Input(t2, commanded_us, 2000.0));
+        CHECK(legacy.valid && legacy.grid_index == 3);
+        CHECK(grid.Snapshot().current.floor_interval_ticks == 0.0);
+        // The floor is 20 ms: an output 50 ms late for index 2 floors index 3 at o(2) + I - slack(I),
+        // not at the unified o(2) + I_disp - slack(I_disp).
+        const int64_t o2 = t2 + 50000;
+        CHECK(tracker.Record(kGeneration, 2, o2));
+        CHECK(CadenceGrid_ResolveOutputTarget(grid.Snapshot(), kGeneration, 3, tracker, &target, &floored));
+        CHECK(floored && target == o2 + commanded - slack_of(commanded));
+        CHECK(target != o2 + display - slack_of(display));
+
+        // On again: the floor is planned again, the off in between had none.
+        const int64_t t3 = TargetOf(grid, 3);
+        CadenceGridPlanAtInput again = AtInput(t3, commanded_us, t3 + 100000, 0.0, t3);
+        again.display_interval_us = display_us;
+        CHECK(grid.PlanAt(again).valid);
+        CHECK(grid.Snapshot().current.floor_interval_ticks > 0.0);
+        CHECK(tracker.Record(kGeneration, 3, t3));
+        CHECK(CadenceGrid_ResolveOutputTarget(grid.Snapshot(), kGeneration, 4, tracker, &target, &floored, 1.0, true));
+        CHECK(floored && target == t3 + display - slack_of(display));
+        // A clear on an empty grid changes nothing.
+        CadenceGrid empty;
+        CHECK(!empty.ClearDisplayFloor());
+    }
+
+    // The display floor reaches the key-off path through neither retained history nor copies:
+    // ClearDisplayFloor clears EVERY retained segment, and the floor is consumed only when the
+    // caller passes display_floor (the executors pass the live key). Unified frames 1..3 with a
+    // floor of 16.667 ms against the commanded 20 ms; a snapshot copy is taken before the clear.
+    void TestDisplayFloorGatedAtUseAndClearedEverywhere()
+    {
+        const double commanded_us = 20000.0;
+        const double display_us = 16667.0;
+        const int64_t commanded = RoundTicks(Ticks(commanded_us));
+        const int64_t display = RoundTicks(Ticks(display_us));
+        const int64_t h1 = kStartQpc + 100000;
+        const auto slack_of = [](int64_t interval_ticks) {
+            return CadenceGrid_LateToleranceTicks(static_cast<double>(interval_ticks), kFrequency) / 2;
+        };
+        CadenceGrid grid;
+        for (int index = 0; index < 3; ++index) {
+            CadenceGridPlanAtInput plan = AtInput(kStartQpc + index * commanded, commanded_us,
+                h1 + index * commanded, 0.0, kStartQpc + index * commanded);
+            plan.display_interval_us = display_us;
+            CHECK(grid.PlanAt(plan).valid);
+        }
+        CHECK(grid.Snapshot().segment_count == 3);
+        const CadenceGridSnapshot copied = grid.Snapshot(); // published to an executor before the clear
+        for (uint32_t position = 0; position < 3; ++position) {
+            const CadenceGridSegment& segment =
+                position == 0 ? copied.current : copied.older[position - 1];
+            CHECK(segment.floor_interval_ticks > 0.0);
+        }
+
+        // Key off: every retained segment, history included, loses its floor.
+        CHECK(grid.ClearDisplayFloor());
+        const CadenceGridSnapshot& fresh = grid.Snapshot();
+        for (uint32_t position = 0; position < fresh.segment_count; ++position) {
+            const CadenceGridSegment& segment =
+                position == 0 ? fresh.current : fresh.older[position - 1];
+            CHECK(segment.floor_interval_ticks == 0.0);
+        }
+        CHECK(!grid.ClearDisplayFloor());
+
+        // Frame 2 after a late output of frame 1: the legacy floor o(1) + I - slack(I).
+        const int64_t t1 = TargetOf(grid, 1);
+        const int64_t o1 = t1 + 100000;
+        CadenceGridOutputTracker tracker;
+        CHECK(tracker.Record(kGeneration, 1, o1));
+        const int64_t legacy = o1 + commanded - slack_of(commanded);
+        const int64_t unified = o1 + display - slack_of(display);
+        CHECK(unified != legacy && unified > t1 + commanded); // the unified floor would bind too
+        int64_t target = 0;
+        bool floored = false;
+        // (i) a fresh snapshot, whatever the caller passes.
+        CHECK(CadenceGrid_ResolveOutputTarget(fresh, kGeneration, 2, tracker, &target, &floored));
+        CHECK(floored && target == legacy);
+        CHECK(CadenceGrid_ResolveOutputTarget(fresh, kGeneration, 2, tracker, &target, &floored, 1.0, true));
+        CHECK(floored && target == legacy);
+        // (ii) the copy taken before the clear, with the live key off: the data is ignored.
+        CHECK(CadenceGrid_ResolveOutputTarget(copied, kGeneration, 2, tracker, &target, &floored, 1.0, false));
+        CHECK(floored && target == legacy);
+        // (iii) the same copy with the key on: the unified floor applies, so the parameter gates it.
+        CHECK(CadenceGrid_ResolveOutputTarget(copied, kGeneration, 2, tracker, &target, &floored, 1.0, true));
+        CHECK(floored && target == unified);
+    }
+
+    // Hold credit (key unified_pacer): under the live key (display_floor) and a finite advance > 0
+    // the resolved target (nominal or floored) is exactly the advance earlier; *floored unchanged.
+    // Key off, 0, negative and non-finite advances resolve as today; no clock is involved.
+    void TestAdvanceResolve()
+    {
+        const double commanded_us = 20200.0;
+        const double display_us = 16670.0;
+        const int64_t commanded = RoundTicks(Ticks(commanded_us));
+        const int64_t h1 = kStartQpc + 100000;
+        const int64_t h2 = h1 + 100000; // retreats below every floor below
+        CadenceGrid grid;
+        CadenceGridPlanAtInput first = AtInput(kStartQpc, commanded_us, h1, 0.0, kStartQpc);
+        first.display_interval_us = display_us;
+        CHECK(grid.PlanAt(first).valid);
+        CadenceGridPlanAtInput second =
+            AtInput(kStartQpc + commanded, commanded_us, h2, 0.0, kStartQpc + commanded);
+        second.display_interval_us = display_us;
+        CHECK(grid.PlanAt(second).valid);
+        const CadenceGridSnapshot& snapshot = grid.Snapshot();
+        const int64_t t1 = TargetOf(grid, 1);
+        const int64_t t2 = TargetOf(grid, 2);
+        CHECK(t1 == h1 && t2 == h2);
+        CadenceGridOutputTracker tracker;
+        CHECK(tracker.Record(kGeneration, 1, h1));
+
+        const double advance_us = 1234.5;
+        const int64_t advance_ticks = std::llround(advance_us * static_cast<double>(kFrequency) / 1e6);
+        CHECK(advance_ticks > 0);
+        for (const double divisor : { 1.0, 2.0 }) {
+            int64_t target = 0;
+            bool floored = false;
+            const auto resolve = [&](uint64_t index, bool display_floor, double advance) {
+                floored = !(index == 1); // the call must set it
+                target = -1;
+                CHECK(CadenceGrid_ResolveOutputTarget(snapshot, kGeneration, index, tracker, &target,
+                    &floored, divisor, display_floor, advance));
+            };
+            // Nominal (index 1: no earlier output): T(1); floored (index 2): the unified floor.
+            resolve(1, true, 0.0);
+            CHECK(!floored && target == t1);
+            resolve(2, true, 0.0);
+            const int64_t unified = target;
+            CHECK(floored && unified > t2);
+            resolve(2, false, 0.0);
+            const int64_t legacy = target;
+            CHECK(floored && legacy > t2 && legacy != unified);
+
+            // Live key and an advance: exactly that much earlier, the flag as without it.
+            resolve(1, true, advance_us);
+            CHECK(!floored && target == t1 - advance_ticks);
+            resolve(2, true, advance_us);
+            CHECK(floored && target == unified - advance_ticks);
+            // Key off ignores it (nominal and floored).
+            resolve(1, false, advance_us);
+            CHECK(!floored && target == t1);
+            resolve(2, false, advance_us);
+            CHECK(floored && target == legacy);
+            // Non-integral tick conversions (10 MHz: 1 us = 10 ticks) round to nearest, halves away
+            // from zero (std::round, as production): 2.4 -> 2, 2.6 -> 3, exactly 2.5 -> 3, 0.4 -> 0
+            // (no advance at all). Truncation would give 2 for the 2.6 and the 2.5.
+            const struct { double us; int64_t ticks; } rounding[] = {
+                { 0.24, 2 }, { 0.26, 3 }, { 0.25, 3 }, { 0.04, 0 }, { 1.0, 10 }, { 100.04, 1000 }, { 100.06, 1001 } };
+            for (const auto& step : rounding) {
+                resolve(1, true, step.us);
+                CHECK(!floored && target == t1 - step.ticks);
+                resolve(2, true, step.us);
+                CHECK(floored && target == unified - step.ticks);
+            }
+            // Zero, negative, NaN and infinite advances are no advance.
+            for (const double none : { 0.0, -5.0, std::numeric_limits<double>::quiet_NaN(),
+                     std::numeric_limits<double>::infinity() }) {
+                resolve(1, true, none);
+                CHECK(!floored && target == t1);
+                resolve(2, true, none);
+                CHECK(floored && target == unified);
+            }
+            // A target the advance overtakes stays positive (the late path releases it).
+            resolve(1, true, 1e9);
+            CHECK(target >= 1 && target < t1);
+            // Stale stays stale.
+            CHECK(!CadenceGrid_ResolveOutputTarget(snapshot, kGeneration + 1, 2, tracker, &target,
+                &floored, divisor, true, advance_us));
+            CHECK(!floored);
+        }
+    }
 }
 
 int main()
 {
     TestRoundingWithoutDrift();
+    TestPlanAtEpochsAndSegments();
+    TestPlanAtOutputFloor();
+    TestPlanAtDisplaySideFloor();
+    TestClearDisplayFloorAtCutover();
+    TestDisplayFloorGatedAtUseAndClearedEverywhere();
+    TestAdvanceResolve();
     TestSilentRebaseContinuity();
     TestSegmentHistoryDepth();
     TestPeriodChangeCarriesFraction();

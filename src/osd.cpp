@@ -699,6 +699,20 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "the game does not call the Reflex Sleep. Marker waits at SIMULATION_START. Reflex driver limiter "
         "hands the frame cap to the driver's own limiter (NvAPI minimumIntervalUs, needs the Reflex Sleep "
         "bypass off) and ReLimiter holds nothing. ReLimiter never changes this setting itself.");
+
+    if (ImGui::Checkbox("Unified pacer", &g_config.unified_pacer)) {
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: unified pacer -> %s", g_config.unified_pacer ? "on" : "off");
+        *config_dirty = true;
+    }
+    HelpTip("Diagnostic A/B, 64-bit Reflex games. On, one start law replaces the other pacing mechanisms: "
+        "the Reflex Sleep releases each frame at its start target (the largest of the cap, the display's "
+        "limit, the game's own limit and the GPU's frame time) and the output follows the start. While it "
+        "is on, smoothing, the output override, the Adaptive cap, GPU-paced cadence, the driver limiter "
+        "hold, pre-Sleep precise, the A/B blocks, the stall injector, lead coverage, FG late-frame "
+        "spacing, the lead spike floor, the GPU queue wait render queue and the source placement are "
+        "overridden (the settings keep their values and return when it is off). ReLimiter also manages "
+        "the Sleep-mode parameters the driver sees. One setting per capture.");
 #endif
     ImGui::Spacing();
 }

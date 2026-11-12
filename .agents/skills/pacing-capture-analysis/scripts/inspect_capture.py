@@ -104,6 +104,51 @@ CURRENT_PACING_HEADER = PACING_FIXED_RAW_HEADER + PACING_FIXED_DERIVED_HEADER + 
     "driver_sleep_interval_us", "driver_use_game_sleep",
     "flip_config_qpc", "flip_time_per_batch_us",
     "gpu_first_submit_qpc", "gpu_start_qpc",
+    # Developer key unified_pacer: the start law's decision for the frame
+    # (T(n), I(n), I_gpu, G-hat, the newest used report's signed queue wait and
+    # its median of three, the frames outstanding at the release, the time in the
+    # hard-limit wait, R minus the newest completion, the kUp* flag bits); empty
+    # with the key off and per each column's own rule
+    "up_grid_target_qpc", "up_interval_us", "up_gpu_interval_us", "up_gpu_service_us",
+    "up_queue_wait_raw_us", "up_queue_wait_us", "up_outstanding", "up_limit_wait_us",
+    "up_ready_age_us", "up_flags",
+    # the signed hold credit at the frame's plan in µs (negative = debt; empty = key off or report stream not live)
+    "up_hold_budget_us",
+    # the service sample the law used for the newest used report (completion spacing minus the GPU's wait for the
+    # frame's work, after the active-time rule) and that wait, max(0, -queue wait), in µs (empty when none or key off)
+    "up_service_sample_us", "up_gpu_wait_us",
+    # developer key unified_hold_share: the measured frame interval C (median completion spacing of the newest
+    # used reports) at the frame's plan, in µs (empty when C is not valid, the share is 0 or the key is off)
+    "up_cycle_us",
+    # developer key gpu_queue_probe: what the presenting queue did for the frame's submissions (ExecuteCommandLists
+    # calls), joined through the Present's identity; QPC columns and µs columns, each empty when the record is
+    # missing or the field is unknown
+    "gq_submits", "gq_first_submit_qpc", "gq_first_start_qpc", "gq_last_submit_qpc", "gq_last_done_qpc",
+    "gq_empty_us", "gq_first_gap_us", "gq_stamp_late_us", "gq_min_margin_us", "gq_wait_block_us",
+    # queue law inputs of the probe (timeline model): the time ReLimiter's own hold kept submissions waiting,
+    # the smallest queue wait not counting it, the time the queue was free of work and pending waits before the
+    # frame's first submission, the interval between this frame's last completion and the previous one's, and the
+    # time queue Waits were pending with nothing queued behind them
+    "gq_hold_block_us", "gq_min_margin_free_us", "gq_boundary_idle_us", "gq_cycle_us", "gq_wait_idle_us",
+    # developer key unified_queue_law: the law's mean cycle B, mean need N, service need S, queue quantile term q and correction
+    # P at the frame's plan, in µs, and the valid samples among the newest 16 arrivals (empty when the law is not
+    # computable or off)
+    "up_ql_base_us", "up_ql_need_us", "up_ql_service_us", "up_ql_q_us", "up_ql_p_us", "up_ql_valid_frames",
+    # developer key unified_queue_upstream (1): the frame's own marker stamps (QPC; empty when the key is 0 or the stamp
+    # was not seen); the next three were the render-thread margin, offset c' and queue term of the queue law, removed
+    # with the render-thread terms: always 0 on a row the unified pacer decided (empty on every other row)
+    "sim_end_marker_qpc", "render_submit_start_marker_qpc", "render_submit_end_marker_qpc",
+    "up_ql_rt_margin_us", "up_ql_rt_offset_us", "up_ql_q_rt_us",
+    # developer key unified_queue_upstream: the CPU time of the thread inside the frame's render-submit and
+    # simulation spans in µs (empty when the span's markers were not on one thread), then the ids of the threads
+    # that sent the render-submit start, simulation start, render-submit end and simulation end markers
+    "render_submit_cpu_us", "sim_cpu_us", "render_submit_tid", "sim_tid", "render_submit_end_tid", "sim_end_tid",
+    # formerly the render-thread feed rule's contrast, spread and span wait; the rule was removed, the columns stay
+    # and are always 0 on a row the unified pacer decided (empty on every other row)
+    "up_ql_rt_contrast_us", "up_ql_rt_spread_us", "up_ql_rt_wait_us",
+    # developer key gpu_queue_probe: which queue the probe record describes (1 presenting, 2 frame generation
+    # source, 3 render queue by dependency; empty without a probe record or when unknown)
+    "gq_queue_role",
 ]
 
 CURRENT_PACING_EVENTS_HEADER = [
@@ -146,13 +191,23 @@ CURRENT_PACING_EVENTS_HEADER = [
 # Earlier files carry a prefix of the current header of these lengths. The
 # events header did not change in Phase 3 or 4 (new event kinds only), so a
 # Phase 2 events file is current-source-86.
-HISTORICAL_PACING_HEADER_LENGTHS = (142, 140, 138, 136, 133, 132, 129, 122, 111)  # before the sleep status, flip config
-                                                                              # and GPU start columns;
-                                                                              # before the driver Sleep columns;
-                                                                              # before the wait columns;
-                                                                              # Phase 4 before the wait starts;
-                                                                              # Phase 3 (Q16); Phase 3 before Q16;
-                                                                              # Phase 2; Phase 1; Phase 0
+HISTORICAL_PACING_HEADER_LENGTHS = (198, 195, 189, 183, 172, 162, 161, 159, 158, 148, 142, 140, 138, 136, 133, 132, 129, 122, 111)  # before the queue role column;
+                                                                                                                                      # before the render-thread feed columns;
+                                                                                                                                # before the CPU time and thread id columns;
+                                                                                                                                # before the marker stamp and render-thread columns;
+                                                                                                                      # before the queue law input and statistics columns;
+                                                                                                              # before the GPU queue probe columns;
+                                                                                                              # before the measured frame interval column;
+                                                                                                              # before the service sample and GPU wait columns;
+                                                                                                              # before the hold budget column;
+                                                                                            # before the unified pacer columns;
+                                                                                  # before the sleep status, flip config
+                                                                                  # and GPU start columns;
+                                                                                  # before the driver Sleep columns;
+                                                                                  # before the wait columns;
+                                                                                  # Phase 4 before the wait starts;
+                                                                                  # Phase 3 (Q16); Phase 3 before Q16;
+                                                                                  # Phase 2; Phase 1; Phase 0
 HISTORICAL_PACING_EVENTS_HEADER_LENGTHS = (85, 81, 50)  # Phase 1; Phase 0; before snapshot rows
 
 

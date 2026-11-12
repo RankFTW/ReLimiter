@@ -147,15 +147,20 @@ void FgQueue_InstallAndDrain() noexcept {
             reinterpret_cast<uint64_t>(module));
     }
     auto* base=reinterpret_cast<BYTE*>(module);
+    void* const signal_target = base+0x794d0;
+    void* const wait_target = base+0x79590;
+    MH_STATUS signal_status=MH_OK, wait_status=MH_OK;
+    if (!signal_enabled) signal_status=InstallHook(signal_target,reinterpret_cast<void*>(&HookSignal),&original_signal);
+    if (!wait_enabled) wait_status=InstallHook(wait_target,reinterpret_cast<void*>(&HookWait),&original_wait);
+    // Inside a batch the hooks are only queued: enable them now, the flags below read the result.
+    Hooks_FlushBatch();
     if (!signal_enabled) {
-        const auto status=InstallHook(base+0x794d0,reinterpret_cast<void*>(&HookSignal),&original_signal);
-        signal_enabled=status==MH_OK;
-        LOG_INFO("FG queue: signal installation status=%d",status);
+        signal_enabled=signal_status==MH_OK && Hooks_TargetEnabled(signal_target);
+        LOG_INFO("FG queue: signal installation status=%d enabled=%d",signal_status,signal_enabled?1:0);
     }
     if (!wait_enabled) {
-        const auto status=InstallHook(base+0x79590,reinterpret_cast<void*>(&HookWait),&original_wait);
-        wait_enabled=status==MH_OK;
-        LOG_INFO("FG queue: wait installation status=%d",status);
+        wait_enabled=wait_status==MH_OK && Hooks_TargetEnabled(wait_target);
+        LOG_INFO("FG queue: wait installation status=%d enabled=%d",wait_status,wait_enabled?1:0);
     }
 }
 void FgQueue_BeginWorkerLifetime() noexcept {

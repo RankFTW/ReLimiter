@@ -1,5 +1,6 @@
 #include "logger.h"
 #include "shutdown_admission.h"
+#include "startup_breadcrumb.h"
 #include <reshade.hpp>
 #include <cstdio>
 #include <cstring>
@@ -136,7 +137,20 @@ static void RawFlush() {
     if (s_hfile != INVALID_HANDLE_VALUE) FlushFileBuffers(s_hfile);
 }
 
+// "<dir>\relimiter_<exe>.log" -> "<dir>\relimiter_<exe><suffix>" (suffix: ".prev.log" or ".crumb").
+static bool SiblingPath(const char* log_path, const char* suffix, char* out, size_t cap) {
+    const size_t len = strlen(log_path);
+    if (len < 4 || _stricmp(log_path + len - 4, ".log") != 0) return false;
+    const int n = snprintf(out, cap, "%.*s%s", static_cast<int>(len - 4), log_path, suffix);
+    return n > 0 && static_cast<size_t>(n) < cap;
+}
+
 static bool TryOpen(const char* path) {
+    // Keep the previous launch's log: relimiter_<exe>.prev.log in the same directory, replacing an older one.
+    // Failure is not an error (no previous log, the file is held by a live launch, a read-only folder).
+    char prev_path[MAX_PATH];
+    if (SiblingPath(path, ".prev.log", prev_path, sizeof(prev_path)))
+        MoveFileExA(path, prev_path, MOVEFILE_REPLACE_EXISTING);
     HANDLE h = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ,
                            nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h != INVALID_HANDLE_VALUE) {
@@ -146,11 +160,14 @@ static bool TryOpen(const char* path) {
     return false;
 }
 
-void Log_Init(HMODULE hModule, LogLevel level) {
+// Opens the log under the lifecycle and file locks. True: the log is open and `previous` holds the verdict on the
+// previous launch's start-up breadcrumb (reported by Log_Init once the locks are released, because Log_Write
+// takes the file lock during the init phase).
+static bool InitLocked(HMODULE hModule, LogLevel level, BreadcrumbVerdict* previous) {
     std::lock_guard<std::mutex> lifecycle_lock(s_lifecycle_mutex);
-    if (s_flush_thread || !s_write_admission.IsDrained()) return;
+    if (s_flush_thread || !s_write_admission.IsDrained()) return false;
     std::lock_guard<std::mutex> file_lock(s_mutex);
-    if (s_hfile != INVALID_HANDLE_VALUE) return; // already initialized
+    if (s_hfile != INVALID_HANDLE_VALUE) return false; // already initialized
 
     s_level.store(level, std::memory_order_release);
     s_init_phase.store(true, std::memory_order_release);
@@ -204,7 +221,7 @@ void Log_Init(HMODULE hModule, LogLevel level) {
 
     OutputDebugStringA("[relimiter] LOG INIT FAILED — could not open any log file\n");
     s_write_admission.Open(); // still allow ReShade warning/error forwarding
-    return;
+    return false;
 
 opened:
     {
@@ -215,7 +232,23 @@ opened:
         if (n > 0) RawWrite(header, n);
         RawFlush();
     }
+    {
+        // The breadcrumb file sits next to the log that opened; it is read (and reset) after the new log is open.
+        char crumb_path[MAX_PATH];
+        if (SiblingPath(path, ".crumb", crumb_path, sizeof(crumb_path)))
+            *previous = Breadcrumb_Attach(crumb_path);
+    }
     s_write_admission.Open();
+    return true;
+}
+
+void Log_Init(HMODULE hModule, LogLevel level) {
+    BreadcrumbVerdict previous;
+    // InitLocked releases the lifecycle and file locks before the warning is written (Log_Write takes the file lock).
+    if (!InitLocked(hModule, level, &previous)) return;
+    char message[160];
+    if (Breadcrumb_Describe(previous, message, sizeof(message)) > 0)
+        LOG_WARN("%s", message);
 }
 
 bool Log_Shutdown() {

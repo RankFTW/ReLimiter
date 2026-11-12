@@ -133,6 +133,7 @@ void GpuReadiness_OnQueueDestroy(reshade::api::command_queue*) noexcept {}
 void GpuReadiness_OnPresent(reshade::api::command_queue*, reshade::api::swapchain*) noexcept {}
 void GpuReadiness_OnFinishPresent(reshade::api::swapchain*) noexcept {}
 void GpuReadiness_OnExecuteCommandList(reshade::api::command_queue*) noexcept {}
+void GpuReadiness_ArmProbeForFrame(uint32_t, uint64_t) noexcept {}
 GpuReadinessCall::GpuReadinessCall(const PresentTimelineSpan*, bool) noexcept {}
 GpuReadinessCall::~GpuReadinessCall() = default;
 void GpuReadinessCall::Complete(bool, bool) noexcept {}

@@ -7,6 +7,7 @@
 #include "feedback_device_identity.h"
 #include "swapchain_manager.h"
 #include "runtime_lifecycle.h"
+#include "gpu_queue_probe.h"
 #include "logger.h"
 #include "pacing_resolver.h"
 #include "bounded_mpsc_queue.h"
@@ -67,6 +68,52 @@ struct Route {
 struct Marker { GpuPresentFgInput input{}; int64_t release = 0; };
 thread_local Marker marker;
 thread_local GpuPresentFgInput last_marker;
+// gpu_queue_probe: the real frame's marker, recorded whatever the gate's demand or policy (the
+// probe measures the source queue whenever its key is on). Validated like an input (frame, producer,
+// controller, frame generation observed, producer epoch and controller of the current context)
+// except the gate's policy and binding epoch; and, for a Present on another thread than the marker's
+// (Gears), through its own hand-off slot (cross_thread_slot.h: the newest marker, taken exactly once
+// by the game's own outermost proxy Present, which frame generation never calls) WITHOUT the gate's
+// NativeGate_CrossThreadVerified, which is lost while frame generation is on. What that leaves
+// unverified is what the gate verifies with ETW frame ids: that Present(n) takes marker n and not
+// n - 1. The probe's key is the one the Present's pacing row takes from the same newest marker
+// (PacingTelemetry_TakePresentAttribution), so a frame is attributed to the row the pipeline itself
+// attributes that Present to.
+thread_local Marker probe_marker;
+thread_local uint64_t probe_sequence = 0;
+thread_local uint64_t probe_last_frame = 0;
+thread_local uint32_t probe_last_producer = 0;
+CrossThreadSlot<Marker> probe_slot;
+bool ProbeInputCurrent(const GpuPresentFgInput& input) noexcept {
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    const auto context = NativeGate_GetContext(now.QuadPart);
+    return context.observe_frame_generation && context.native_swapchain == input.native &&
+        context.swapchain_generation == input.swapchain && context.producer_epoch == input.producer &&
+        context.controller_generation == input.controller && input.observer == GpuReadiness_Settings() &&
+        input.prediction == NativeGate_PredictionEpoch();
+}
+void ProbeRecordMarker(uint64_t frame, uint32_t producer, uint32_t controller, int64_t release) noexcept {
+    // A duplicate of the accepted frame keeps what is recorded and published.
+    if (frame && probe_last_producer == producer && frame == probe_last_frame) return;
+    probe_marker = {};
+    bool valid = false;
+    if (frame && producer && controller) {
+        const auto context = NativeGate_GetContext(release);
+        if (context.observe_frame_generation && context.native_swapchain && context.producer_epoch == producer &&
+            context.controller_generation == controller) {
+            if (!(probe_last_producer == producer && frame < probe_last_frame)) { // one input per frame, in order
+                probe_last_producer = producer; probe_last_frame = frame;
+                probe_marker.input = {0, frame, context.native_swapchain, context.swapchain_generation,
+                    GpuReadiness_Settings(), NativeGate_PredictionEpoch(), producer, controller};
+                probe_marker.release = release;
+                valid = true;
+            }
+        }
+    }
+    // The newest marker (an empty one withdraws the previous) for a Present on another thread.
+    probe_sequence = probe_slot.Publish(probe_marker, valid);
+}
 // Cross-thread hand-off (cross_thread_slot.h): the newest marker (empty
 // when rejected) for a proxy Present on another thread. Taken only by the
 // game's own outermost proxy Present, which frame generation never calls,
@@ -577,6 +624,7 @@ bool StreamlineHandoff_Interested(ID3D12Fence* fence) noexcept {
 }
 void StreamlineHandoff_RecordMarker(uint64_t frame, uint32_t producer, uint32_t controller, int64_t release) noexcept {
     using namespace streamline_handoff;
+    if (g_gpu_queue_probe.load(std::memory_order_relaxed)) ProbeRecordMarker(frame, producer, controller, release);
     marker = {};
     // Publish the outcome on every exit: a rejected marker withdraws the
     // previous one, so a Present elsewhere never takes an older frame.
@@ -606,6 +654,23 @@ StreamlineInputScope::StreamlineInputScope(uint64_t object, UINT sync, UINT flag
     const DWORD error = GetLastError();
     current_ = this; // invalid and nested calls mask, never inherit, the parent
     auto source = marker; marker = {};
+    if (g_gpu_queue_probe.load(std::memory_order_relaxed) && !previous_) {
+        // The probe's input of this outermost proxy Present: this thread's own marker (claimed, so no
+        // other thread takes it), else the newest marker another thread published (taken exactly once).
+        // Gears hands its markers over across threads. Fresh and still current, or dropped.
+        static const int64_t frequency = [] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart; }();
+        Marker taken;
+        bool have = false;
+        if (probe_marker.input.source) {
+            taken = probe_marker; probe_slot.Claim(probe_sequence); have = true;
+        } else if (probe_slot.Take(&taken)) have = true;
+        probe_marker = {};
+        const auto now = Now();
+        if (have && taken.release > 0 && now >= taken.release && now - taken.release <= frequency / 4 &&
+            ProbeInputCurrent(taken.input)) {
+            probe_input = taken.input; probe_pending = true;
+        }
+    }
     if (source.input.source) {
         marker_slot.Claim(marker_sequence); // same-thread marker
     } else if (!previous_ && NativeGate_CrossThreadVerified() && marker_slot.Take(&source)) {
@@ -751,6 +816,18 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
     // Source/proxy/fences remain retained until this outer scope drops its pin.
     if (gate) scope->handoff = GpuPresent_BeginFgInput(reinterpret_cast<uint64_t>(queue), scope->input);
     return call;
+}
+// gpu_queue_probe: the first queue Signal inside an outermost proxy Present scope that has a probe
+// input is the source Signal of that real frame; its queue is the source queue. It validates what
+// the marker validated (see ProbeRecordMarker) and that the queue is present; the gate's fence
+// qualification (site, forward fence, plugin) is the gate's demand and is not required.
+void StreamlineHandoff_ProbeSourceSignal(ID3D12CommandQueue* queue) noexcept {
+    auto* scope = StreamlineInputScope::Current();
+    if (!scope || !scope->probe_pending || !queue) return;
+    scope->probe_pending = false;
+    const auto& input = scope->probe_input;
+    GpuQueueProbe_OnFgInputBoundary(queue, input.swapchain,
+        PacingFrameKey{PacingIdentityDomain::NvApiFrame, input.producer, input.source});
 }
 void StreamlineHandoff_AfterFence(const StreamlineFenceCall& call, HRESULT result) noexcept {
     using namespace streamline_handoff;

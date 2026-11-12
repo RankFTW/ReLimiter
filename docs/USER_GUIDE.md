@@ -563,6 +563,8 @@ If scripts are blocked on a managed computer, follow your organization's policy.
 
 At the default level (`log_level=warn`) `relimiter_<GameName>.log` in the game directory records only warnings and errors: something failed, data was lost, an INI value was invalid, or a developer setting is on. Enable **Advanced Logging** (`info`) before reproducing a problem to also record what ReLimiter decided along the way: device and swapchain changes, the pacing route, overload pauses and similar events. Logging preferences are saved; turn detailed logging off when it is no longer needed.
 
+Each launch starts a new log. The previous launch's log is kept as `relimiter_<GameName>.prev.log` in the same folder (an older `.prev.log` is replaced), so the log of a launch that froze or crashed is still there after the next start. ReLimiter also keeps a small file, `relimiter_<GameName>.crumb`, next to the log that records how far start-up got. If the previous launch ended before it was running normally and without a clean shutdown (for example it froze while loading and was closed from Task Manager), the next launch's log, at any log level, starts with a warning: `the previous launch ended during start-up; last stage: <stage>`. Include that line, the `.prev.log` and the current log in a report. The warning appears only for launches that stopped during start-up, not after a game that ran and was closed normally.
+
 ---
 
 ## INI Configuration Reference
@@ -578,7 +580,7 @@ Most settings can be changed through the overlay. For manual changes, close the 
 | `adaptive_cap_percentile` | 75 | **Adaptive cap fit** (Advanced): `75`, `90` or `99`, the share of recent frames the lengthened interval plans for. Other values move to the nearest of the three (up to 82 → 75, 83–94 → 90, 95 and above → 99). |
 | `advanced_settings` | false | Show advanced user controls |
 | `developer_settings` | false | INI-only. Shows the developer settings in the Advanced section; see [Developer Settings](#developer-settings). |
-| `config_version` | 4 | Written by ReLimiter; do not edit. Records which defaults the file was written with; see [Removed and migrated keys](#removed-and-migrated-keys). |
+| `config_version` | 5 | Written by ReLimiter; do not edit. Records which defaults the file was written with; see [Removed and migrated keys](#removed-and-migrated-keys). |
 | `background_fps` | 30 | 0 is uncapped; otherwise 20–60 FPS |
 | `fg_off_fps` | 0 | 0 disables the override; otherwise 30–360 FPS via INI |
 | `vsync_mode` | game | `game`, `off`, `on` |
@@ -593,7 +595,7 @@ Older configurations are updated automatically at the next launch, when ReLimite
 - `pacing_method=marker` becomes `output_rung=marker` if `output_rung` is not set; `automatic`, `native` and other values become `auto`. Note that this carries a Reflex / Marker preference forward as a developer override; set **Output override** back to **Auto** (it is shown with `developer_settings=true`) to let ReLimiter choose.
 - `adaptive_smoothing` becomes `adaptive_cap` if `adaptive_cap` is not set.
 - `smoothing=low`, `medium` and `high` become `smoothing=on`. Smoothing is always on for users; only On and Off remain, and Off is a developer key.
-- A `relimiter.ini` without `config_version`, written by an older version that saved every key including the old defaults, is moved once to `reflex_sleep_bypass=true` and `source_placement=pre_sleep`; every other value is kept, and ReLimiter then writes `config_version=4`. An INI that already has `config_version=2` or later keeps those two settings, so set `reflex_sleep_bypass=false` or `source_placement=marker` there to stay on the older behavior. An INI saved by a 4.0 test build also moves once to the new defaults `lead_coverage=99` (from `config_version=2`) and `fg_late_spacing=true` (from `config_version` 2 or 3). A new INI starts with the recommended defaults.
+- A `relimiter.ini` without `config_version`, written by an older version that saved every key including the old defaults, is moved once to `reflex_sleep_bypass=true` and `source_placement=pre_sleep`; every other value is kept, and ReLimiter then writes `config_version=5`. An INI that already has `config_version=2` or later keeps those two settings, so set `reflex_sleep_bypass=false` or `source_placement=marker` there to stay on the older behavior. An INI saved by a 4.0 test build also moves once to the new defaults `lead_coverage=99` (from `config_version=2`) and `fg_late_spacing=true` (from `config_version` 2 or 3). An INI saved before `config_version=5` also moves once to the new defaults `unified_queue_law=true`, `gpu_queue_probe=true` and `gpu_queue_probe_source=1` (the queue-based pacer, which only does anything in 64-bit DirectX 12 games); set them to `false`, `false` and `0` in an INI that already has `config_version=5` to keep the report-based pacing. A new INI starts with the recommended defaults.
 
 The following keys have been removed. ReLimiter ignores them and drops them when it rewrites the INI: `pacing_method`, `adaptive_smoothing`, `smoothing_percentile`, `smoothing_window`, `smoothing_release_speed`, `smoothing_bias_us`, `gpu_present_gate_mode`, `gpu_present_gate_slack_us`, `gpu_present_gate_max_delay_us`, `estimator_a_mode`, `estimator_a_fixed_reserve_us`, `native_arrival_predictor_mode`, `presentation_gate_location`, `adaptive_deadline_reserve_mode`, `gpu_readiness_observer`, and from earlier versions `reflex_pre_sleep_pacing`, `reflex_gpu_combined`, `gpu_present_gate_phase_controller`, `gpu_present_gate_hold`, `marker_gate_bypass`, `adaptive_cycle_trial`, `ready_present_*` and `readiness_phase_*`. `dmfg_output_cap` is removed as well: it was read but never applied. `gpu_wait_budget_us` is removed too: the GPU queue wait no longer has a cap for it to size, and `gpu_wait_headroom_us` is a different, developer-only setting. The developer keys `gpu_paced_hold_margin` and `gpu_paced_release_smoothing` from 4.0 test builds are removed as well. `reflex_pre_sleep_pacing` has no replacement key; [pre-Sleep placement](#pre-sleep-placement) is automatic and controlled by the developer key `source_placement`.
 
@@ -612,6 +614,7 @@ The following keys have been removed. ReLimiter ignores them and drops them when
 | `reflex_inject` | false | Enable optional Reflex injection |
 | `flip_model_override` | false | DX11 flip-model compatibility; restart required |
 | `dlss_info_hooks` | true on 64-bit | DLSS information for the OSD; restart required |
+| `hook_installer_thread` | true | Compatibility switch, not a tuning option: ReLimiter patches the game's functions from one helper thread that other tools cannot pause, so a hook installation cannot freeze up against another injector. `false` patches from the calling thread instead; restart required |
 | `streamline_compat` | true, with per-game adjustments | Normal compatibility preference; `force_false` enables proactive hooks |
 
 ### OSD and Recording

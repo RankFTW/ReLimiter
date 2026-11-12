@@ -3,6 +3,8 @@
 #include "scheduler.h"
 #include "correlator.h"
 #include "marker_log.h"
+#include "marker_stamps.h"
+#include "marker_cycles.h"
 #include "nvapi_hooks.h"
 #include "nvapi_types.h"
 #include "presentation_gate.h"
@@ -11,6 +13,8 @@
 #include "frame_timeline.h"
 #include "health.h"
 #include "wake_guard.h"
+#include "gpu_readiness.h"
+#include "instrumentation_state.h"
 #include "logger.h"
 
 #include <Windows.h>
@@ -149,6 +153,22 @@ static int32_t Hooked_slPCLSetMarker(
     const uint32_t type = marker;
     LARGE_INTEGER ts{};
     QueryPerformanceCounter(&ts);
+
+    // Developer key unified_queue_upstream: freeze the lifetime (reset generation, PCL producer
+    // epoch) and the sample FIRST, before anything below that can be descheduled across a lifetime
+    // change or rotate it: the flow-timeout rotation, the token (GetFrameID, which can also begin
+    // an epoch for a synthetic ID) and the marker log. The stamp is published only if the epoch and
+    // the ring's generation are still the captured ones, so a call suspended across another
+    // thread's rotation, and a call whose own rotation or token step changed the epoch, publish
+    // nothing: an old arrival is never relabelled into the new lifetime. The accepted cost: the
+    // first marker of a resumed PCL lifetime gets no stamp (it is a SIMULATION_START). The QPC is
+    // the arrival time read above; with the key
+    // off: one load and a branch not taken. PCL marker values are the NV_LATENCY_MARKER_TYPE values.
+    const MarkerStampCapture stamp_capture = MarkerStamps_Capture(
+        type, [] { return FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::PclFrame); },
+        [&ts] {
+            return MarkerClockSample{ ts.QuadPart, MarkerCycles_ThreadCycles(), GetCurrentThreadId() };
+        });
     const int64_t previous_marker_qpc =
         s_latest_marker_qpc.load(std::memory_order_acquire);
     if (type == SIMULATION_START && previous_marker_qpc > 0 &&
@@ -177,6 +197,12 @@ static int32_t Hooked_slPCLSetMarker(
     s_latest_marker_qpc.store(ts.QuadPart, std::memory_order_release);
 
     g_marker_log.Record(type, ts.QuadPart, frameID);
+
+    // Developer key unified_queue_upstream: publish the capture taken above under this frame's
+    // key; dropped when the PCL producer epoch or the ring's reset generation is no longer the
+    // captured one. With the key off the capture was one load and a branch not taken.
+    MarkerStamps_Publish(stamp_capture, kMarkerDomainPcl, frameID,
+        [] { return FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::PclFrame); });
 
     // PRESENT_START: H0 release or H1 hold on the exact PCL plan key (built
     // as the scheduler builds it), then forward. The executor reads only the
@@ -207,6 +233,12 @@ static int32_t Hooked_slPCLSetMarker(
                 : type == SIMULATION_END ? PacingStageEventKind::SimulationEnd
                 : PacingStageEventKind::PresentEnd,
             ts.QuadPart);
+        // gpu_start_probe: the frame whose first submission the probe times, by the
+        // PCL identity (the producer epoch of the PCL domain, Streamline's token).
+        // A load of the developer flag and a not-taken branch with the probe off.
+        if (type == RENDERSUBMIT_START && g_gpu_start_probe.load(std::memory_order_relaxed))
+            GpuReadiness_ArmProbeForFrame(
+                FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::PclFrame), frameID);
     }
 
     SchedulerOwnerGuard scheduler_owner;
@@ -270,16 +302,16 @@ bool InstallPCLHooks() {
     if (s_installed.load(std::memory_order_acquire)) return true;
     HookInstallGuard hook_install;
     if (!hook_install || !Hooks_PinTargetModule(pcl_func)) return false;
-    MH_STATUS st = MH_CreateHook(pcl_func,
+    MH_STATUS st = Hooks_CreateHook(pcl_func,
         reinterpret_cast<void*>(&Hooked_slPCLSetMarker),
         reinterpret_cast<void**>(&s_orig_SetMarker));
     if (st != MH_OK) {
         LOG_WARN("PCL: MH_CreateHook failed (%d)", st);
         return false;
     }
-    if (MH_EnableHook(pcl_func) != MH_OK) {
+    if (Hooks_EnableOrQueue(pcl_func) != MH_OK) {
         LOG_WARN("PCL: MH_EnableHook failed");
-        MH_RemoveHook(pcl_func);
+        Hooks_RemoveHook(pcl_func);  // MH_ERROR_DISABLED (MinHook unusable): the hook stays retained
         return false;
     }
 

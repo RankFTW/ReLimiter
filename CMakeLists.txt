@@ -69,6 +69,12 @@ set(ADDON_SOURCES
     src/hw_spin.cpp
     src/loadlib_hooks.cpp
     src/marker_log.cpp
+    src/marker_stamps.h
+    src/marker_stamps.cpp
+    src/marker_cycles.h
+    src/marker_cycles.cpp
+    src/marker_rate.h
+    src/marker_rate.cpp
     src/native_pcl_measurement.cpp
     src/nvapi_hooks.cpp
     src/osd.cpp
@@ -83,6 +89,8 @@ set(ADDON_SOURCES
     src/vblank_thread.cpp
     src/wake_guard.cpp
     src/logger.cpp
+    src/startup_breadcrumb.h
+    src/startup_breadcrumb.cpp
     src/csv_writer.cpp
     src/pqi.cpp
     src/presentation_gate.cpp
@@ -96,6 +104,8 @@ set(ADDON_SOURCES
     src/nvapi_marker_census.h
     src/present_association.cpp
     src/vsync_control.cpp
+    src/vtable_copy.h
+    src/vtable_copy.cpp
     src/vk_enforce.cpp
     src/blackout.cpp
     src/focus_lock.cpp
@@ -103,9 +113,19 @@ set(ADDON_SOURCES
     src/pacing_core_types.h
     src/cadence_grid.h
     src/cadence_grid.cpp
+    src/unified_pacer.h
+    src/unified_pacer.cpp
+    src/unified_queue_law.h
+    src/unified_queue_law.cpp
+    src/gpu_queue_law_feed.h
+    src/gpu_queue_law_feed.cpp
     src/cadence_grid_publication.cpp
     src/lead_controller.h
     src/lead_controller.cpp
+    src/gpu_queue_probe_core.h
+    src/gpu_queue_probe_core.cpp
+    src/gpu_queue_dependency.h
+    src/gpu_queue_dependency.cpp
     src/period_governor.h
     src/period_governor.cpp
     src/source_placement.h
@@ -163,6 +183,7 @@ if(RELIMITER_64BIT)
         src/gpu_readiness_d3d12.cpp
         src/gpu_readiness_d3d12_queue.cpp
         src/gpu_present_gate_d3d12.cpp
+        src/gpu_queue_probe_d3d12.cpp
         src/gpu_priority_probe.cpp
         src/gpu_priority_probe.h
     )

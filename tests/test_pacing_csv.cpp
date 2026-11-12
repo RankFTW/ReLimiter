@@ -169,6 +169,69 @@ PacingJoinedRow DisplayRow(bool with_latency)
         row.has_ready = true;
         row.ready.gpu_first_submit_qpc = 1100;
         row.ready.gpu_start_qpc = 1150;
+        // The unified pacer's decision for the frame (developer key unified_pacer).
+        row.source.up_valid = 1;
+        row.source.up_grid_target_qpc = 123456789;
+        row.source.up_interval_us = 8333.3333;
+        row.source.up_gpu_interval_valid = 1;
+        row.source.up_gpu_interval_us = 8000.25;
+        row.source.up_gpu_service_valid = 1;
+        row.source.up_gpu_service_us = 7990.5;
+        row.source.up_queue_wait_valid = 1;
+        row.source.up_queue_wait_raw_us = -1250.5;
+        row.source.up_queue_wait_us = 3900.0;
+        row.source.up_outstanding = 2;
+        row.source.up_limit_wait_us = 1500.125;
+        row.source.up_ready_age_valid = 1;
+        row.source.up_ready_age_us = 2500.75;
+        row.source.up_flags = 0x20011; // 0x0001 released late, 0x0010 bound by I_cap, 0x20000 Sleep wait still running
+        row.source.up_hold_budget_valid = 1;
+        row.source.up_hold_budget_us = 1234.5;
+        row.source.up_service_sample_valid = 1;
+        row.source.up_service_sample_us = 7900.625;
+        row.source.up_gpu_wait_valid = 1;
+        row.source.up_gpu_wait_us = 1250.5;
+        row.source.up_cycle_valid = 1;
+        row.source.up_cycle_us = 14700.125;
+        // GPU queue probe record of the frame's Present: every field valid.
+        row.has_gpu_queue = true;
+        row.gpu_queue.valid = 0x3FFu;
+        row.gpu_queue.submits = 47;
+        row.gpu_queue.first_submit_qpc = 3000;
+        row.gpu_queue.first_start_qpc = 3010;
+        row.gpu_queue.last_submit_qpc = 3900;
+        row.gpu_queue.last_done_qpc = 4100;
+        row.gpu_queue.empty_us = 12.5;
+        row.gpu_queue.first_gap_us = 310.125;
+        row.gpu_queue.stamp_late_us = 22.25;
+        row.gpu_queue.min_margin_us = 0.0;
+        row.gpu_queue.wait_block_us = 1500.75;
+        row.gpu_queue.valid |= PacingGpuQueueRecord::kHoldBlock | PacingGpuQueueRecord::kMinMarginFree |
+            PacingGpuQueueRecord::kBoundaryIdle | PacingGpuQueueRecord::kCycle | PacingGpuQueueRecord::kWaitIdle;
+        row.gpu_queue.hold_block_us = 810.5;
+        row.gpu_queue.min_margin_free_us = 0.0;
+        row.gpu_queue.boundary_idle_us = 42.125;
+        row.gpu_queue.cycle_us = 8333.25;
+        row.gpu_queue.wait_idle_us = 120.75;
+        row.gpu_queue.queue_role = 3;
+        row.source.up_ql_valid = 1;
+        row.source.up_ql_base_us = 8333.25;
+        row.source.up_ql_need_us = 7100.5;
+        row.source.up_ql_service_us = 6900.75;
+        row.source.up_ql_q_us = -250.125;
+        row.source.up_ql_p_us = -7.81;
+        row.source.up_ql_valid_frames = 14;
+        row.source.sim_end_marker_qpc = 5000;
+        row.source.render_submit_start_marker_qpc = 5100;
+        row.source.render_submit_end_marker_qpc = 5200;
+        row.source.render_submit_cpu_valid = 1;
+        row.source.render_submit_cpu_us = 4200.125;
+        row.source.sim_cpu_valid = 1;
+        row.source.sim_cpu_us = 0.0;
+        row.source.render_submit_tid = 4812;
+        row.source.sim_tid = 4812;
+        row.source.render_submit_end_tid = 4812;
+        row.source.sim_end_tid = 4812;
         // The longest SetAsyncFrameMarker call.
         row.has_wait = true;
         row.wait.has_async = true;
@@ -200,9 +263,52 @@ PacingJoinedRow DisplayRow(bool with_latency)
         // A status the Sleep hook never published stays hidden behind its valid flag.
         row.source.driver_sleep_interval_us = 999;
         row.source.driver_use_game_sleep = 1;
+        // Values of a record the unified pacer did not decide stay hidden behind up_valid = 0.
+        row.source.up_grid_target_qpc = 999;
+        row.source.up_interval_us = 1.0;
+        row.source.up_gpu_interval_valid = 1;
+        row.source.up_gpu_service_valid = 1;
+        row.source.up_queue_wait_valid = 1;
+        row.source.up_outstanding = 3;
+        row.source.up_ready_age_valid = 1;
+        row.source.up_flags = 0x1000;
+        row.source.up_hold_budget_valid = 1;
+        row.source.up_hold_budget_us = 5.0;
+        row.source.up_service_sample_valid = 1;
+        row.source.up_service_sample_us = 6.0;
+        row.source.up_gpu_wait_valid = 1;
+        row.source.up_gpu_wait_us = 7.0;
+        row.source.up_cycle_valid = 1;
+        row.source.up_cycle_us = 15.0;
         // A probe whose Signal completion was not observed has a first submit only.
         row.has_ready = true;
         row.ready.gpu_first_submit_qpc = 1200;
+        // The queue probe saw part of the frame: only the fields whose valid bit is set print.
+        row.has_gpu_queue = true;
+        row.gpu_queue.valid = PacingGpuQueueRecord::kSubmits | PacingGpuQueueRecord::kFirstSubmit |
+            PacingGpuQueueRecord::kLastDone | PacingGpuQueueRecord::kWaitBlock;
+        row.gpu_queue.submits = 5;
+        row.gpu_queue.first_submit_qpc = 3100;
+        row.gpu_queue.last_done_qpc = 3300;
+        row.gpu_queue.wait_block_us = 7.5;
+        row.gpu_queue.first_start_qpc = 9; // hidden: valid bit clear
+        row.gpu_queue.last_submit_qpc = 9;
+        row.gpu_queue.empty_us = 9.0;
+        row.gpu_queue.first_gap_us = 9.0;
+        row.gpu_queue.stamp_late_us = 9.0;
+        row.gpu_queue.min_margin_us = 9.0;
+        row.gpu_queue.valid |= PacingGpuQueueRecord::kHoldBlock | PacingGpuQueueRecord::kCycle;
+        row.gpu_queue.hold_block_us = 3.5;
+        row.gpu_queue.cycle_us = 9000.0;
+        row.gpu_queue.queue_role = 0; // role unknown: empty
+        row.gpu_queue.min_margin_free_us = 9.0; // hidden: valid bit clear
+        row.gpu_queue.boundary_idle_us = 9.0;
+        row.gpu_queue.wait_idle_us = 9.0;
+        row.source.up_ql_base_us = 9.0; // hidden: up_valid 0
+        row.source.up_ql_valid_frames = 7;
+        row.source.render_submit_start_marker_qpc = 6000; // only one stamp seen
+        row.source.render_submit_tid = 4812; // sent from two threads: no CPU time, both ids
+        row.source.render_submit_end_tid = 5120;
         row.has_present = true; // plan_status 0: empty
         // PostWait without a valid pre-Wait readback: gate_pre_wait_qpc empty.
         row.has_gate = true;
@@ -210,6 +316,72 @@ PacingJoinedRow DisplayRow(bool with_latency)
         row.gate.post_wait_qpc = 1970;
     }
     row.display_source = PacingJoin_DisplaySource(row.display);
+    return row;
+}
+
+// A unified pacer row whose optional values are all absent: up_valid 1 with no T, no bindable I_gpu,
+// fewer than 16 pairs, no used report, the limit inactive (-1) and no completion yet. The values the
+// *_valid bytes hide are non-zero.
+PacingJoinedRow UnifiedEmptyRuleRow()
+{
+    PacingJoinedRow row = DisplayRow(false);
+    row.source.up_valid = 1;
+    row.source.up_grid_target_qpc = 0;
+    row.source.up_interval_us = 16666.5;
+    row.source.up_gpu_interval_valid = 0;
+    row.source.up_gpu_interval_us = 7.0;
+    row.source.up_gpu_service_valid = 0;
+    row.source.up_gpu_service_us = 8.0;
+    row.source.up_queue_wait_valid = 0;
+    row.source.up_queue_wait_raw_us = -9.0;
+    row.source.up_queue_wait_us = 10.0;
+    row.source.up_outstanding = -1;
+    row.source.up_limit_wait_us = 0.0;
+    row.source.up_ready_age_valid = 0;
+    row.source.up_ready_age_us = 11.0;
+    row.source.up_flags = 0x1008; // reset and hard limit inactive
+    row.source.up_hold_budget_valid = 0; // stream not live: the value stays hidden
+    row.source.up_hold_budget_us = 9.0;
+    row.source.up_service_sample_valid = 0; // no used report: the values stay hidden
+    row.source.up_service_sample_us = 12.0;
+    row.source.up_gpu_wait_valid = 0;
+    row.source.up_gpu_wait_us = 13.0;
+    row.source.up_cycle_valid = 0; // C not valid, share 0 or key off: the value stays hidden
+    row.source.up_cycle_us = 14.0;
+    // The law was not computable (the four values stay hidden), but its window exists.
+    row.source.up_ql_valid = 0;
+    row.source.up_ql_base_us = 1.0;
+    row.source.up_ql_need_us = 2.0;
+    row.source.up_ql_service_us = 2.5;
+    row.source.up_ql_q_us = 3.0;
+    row.source.up_ql_p_us = 4.0;
+    row.source.up_ql_valid_frames = 9;
+    row.gpu_queue.queue_role = 2; // the base row has a probe record: the role prints
+    return row;
+}
+
+// A unified pacer row with a live stream and a credit of exactly 0.0.
+PacingJoinedRow UnifiedZeroBudgetRow()
+{
+    PacingJoinedRow row = DisplayRow(false);
+    row.source.up_valid = 1;
+    row.source.up_interval_us = 8333.0;
+    row.source.up_hold_budget_valid = 1;
+    row.source.up_hold_budget_us = 0.0;
+    row.source.up_service_sample_valid = 0; // DisplayRow carries a sample: this row has none
+    row.source.up_gpu_wait_valid = 1; // a used report the GPU did not wait for: 0.000; no service sample
+    row.source.up_gpu_wait_us = 0.0;
+    row.source.up_cycle_valid = 0; // DisplayRow carries a cycle: this row has none
+    row.source.up_ql_valid_frames = -1; // no queue law window: an empty cell
+    return row;
+}
+
+// A unified pacer row with a debt: a live stream and a signed credit of -2500.25 µs (the executors
+// release the frame's targets 2500.25 µs earlier).
+PacingJoinedRow UnifiedDebtRow()
+{
+    PacingJoinedRow row = UnifiedZeroBudgetRow();
+    row.source.up_hold_budget_us = -2500.25;
     return row;
 }
 
@@ -308,14 +480,31 @@ void CheckRowsFile(const CsvFile& rows)
     const Cells driver_columns{ "driver_sleep_start_qpc", "driver_sleep_end_qpc" };
     const Cells measurement_columns{ "driver_sleep_interval_us", "driver_use_game_sleep", "flip_config_qpc",
         "flip_time_per_batch_us", "gpu_first_submit_qpc", "gpu_start_qpc" };
-    const size_t last = wait_columns.size() + driver_columns.size() + measurement_columns.size();
+    const Cells unified_columns{ "up_grid_target_qpc", "up_interval_us", "up_gpu_interval_us",
+        "up_gpu_service_us", "up_queue_wait_raw_us", "up_queue_wait_us", "up_outstanding",
+        "up_limit_wait_us", "up_ready_age_us", "up_flags", "up_hold_budget_us", "up_service_sample_us",
+        "up_gpu_wait_us", "up_cycle_us" };
+    const Cells gpu_queue_columns{ "gq_submits", "gq_first_submit_qpc", "gq_first_start_qpc",
+        "gq_last_submit_qpc", "gq_last_done_qpc", "gq_empty_us", "gq_first_gap_us", "gq_stamp_late_us",
+        "gq_min_margin_us", "gq_wait_block_us" };
+    const Cells queue_law_columns{ "gq_hold_block_us", "gq_min_margin_free_us", "gq_boundary_idle_us",
+        "gq_cycle_us", "gq_wait_idle_us", "up_ql_base_us", "up_ql_need_us", "up_ql_service_us", "up_ql_q_us",
+        "up_ql_p_us", "up_ql_valid_frames" };
+    const Cells upstream_columns{ "sim_end_marker_qpc", "render_submit_start_marker_qpc",
+        "render_submit_end_marker_qpc", "up_ql_rt_margin_us", "up_ql_rt_offset_us", "up_ql_q_rt_us",
+        "render_submit_cpu_us", "sim_cpu_us", "render_submit_tid", "sim_tid", "render_submit_end_tid",
+        "sim_end_tid", "up_ql_rt_contrast_us", "up_ql_rt_spread_us", "up_ql_rt_wait_us" };
+    const Cells queue_role_columns{ "gq_queue_role" };
+    const size_t last = wait_columns.size() + driver_columns.size() + measurement_columns.size() +
+        unified_columns.size() + gpu_queue_columns.size() + queue_law_columns.size() + upstream_columns.size() +
+        queue_role_columns.size();
     const size_t tail = plan_columns.size() + controller_columns.size() + last;
     // `count` columns that end `from_end` columns before the end of the header.
     const auto slice = [&rows](size_t from_end, size_t count) {
         if (rows.header.size() < from_end || from_end < count) return Cells{};
         return Cells(rows.header.end() - from_end, rows.header.end() - from_end + count);
     };
-    Check(rows.header.size() == 148, "pacing rows have 148 columns, got " + std::to_string(rows.header.size()));
+    Check(rows.header.size() == 199, "pacing rows have 199 columns, got " + std::to_string(rows.header.size()));
     Check(slice(tail + appended.size(), appended.size()) == appended,
           "PC Latency and predicted-render columns are appended in order after clock_map_offset_us");
     Check(slice(tail, plan_columns.size()) == plan_columns,
@@ -324,12 +513,32 @@ void CheckRowsFile(const CsvFile& rows)
           "controller, gate pre-Wait, placement and wait-start columns are appended in order after display_source");
     Check(slice(last, wait_columns.size()) == wait_columns,
           "async marker wait columns follow the wait-start columns");
-    Check(slice(driver_columns.size() + measurement_columns.size(), driver_columns.size()) == driver_columns,
+    Check(slice(driver_columns.size() + measurement_columns.size() + unified_columns.size() +
+                    gpu_queue_columns.size() + queue_law_columns.size() + upstream_columns.size() +
+                    queue_role_columns.size(),
+                driver_columns.size()) == driver_columns,
           "driver Sleep columns follow the async marker wait columns");
-    Check(slice(measurement_columns.size(), measurement_columns.size()) == measurement_columns,
-          "driver sleep status, flip config and GPU start probe columns are the last columns");
-    Check(rows.rows.size() == 3, "every pacing row is written");
-    if (rows.rows.size() != 3) return;
+    Check(slice(measurement_columns.size() + unified_columns.size() + gpu_queue_columns.size() +
+                    queue_law_columns.size() + upstream_columns.size() + queue_role_columns.size(),
+                measurement_columns.size()) == measurement_columns,
+          "driver sleep status, flip config and GPU start probe columns follow the driver Sleep columns");
+    Check(slice(unified_columns.size() + gpu_queue_columns.size() + queue_law_columns.size() +
+                    upstream_columns.size() + queue_role_columns.size(),
+                unified_columns.size()) == unified_columns,
+          "the unified pacer columns follow the GPU start probe columns");
+    Check(slice(gpu_queue_columns.size() + queue_law_columns.size() + upstream_columns.size() +
+                    queue_role_columns.size(),
+                gpu_queue_columns.size()) == gpu_queue_columns,
+          "the GPU queue probe columns follow the unified pacer columns");
+    Check(slice(queue_law_columns.size() + upstream_columns.size() + queue_role_columns.size(),
+                queue_law_columns.size()) == queue_law_columns,
+          "the queue law input and statistics columns follow the GPU queue probe columns");
+    Check(slice(queue_role_columns.size(), queue_role_columns.size()) == queue_role_columns,
+          "the probe queue role column is the last column");
+    Check(slice(queue_role_columns.size() + upstream_columns.size(), upstream_columns.size()) == upstream_columns,
+          "the marker stamp and render-thread queue law columns precede the queue role column");
+    Check(rows.rows.size() == 6, "every pacing row is written");
+    if (rows.rows.size() != 6) return;
 
     const std::pair<const char*, const char*> plan_cells[] = {
         { "grid_epoch", "3" }, { "grid_index", "42" }, { "plan_output_target_qpc", "1900" },
@@ -400,6 +609,152 @@ void CheckRowsFile(const CsvFile& rows)
               rows.Cell(2, "pre_sleep_margin_us").empty() && rows.Cell(2, "source_wait_start_qpc").empty(),
           "unjoined Present rows without a Source record have no placement or wait cells");
     for (const auto& row : rows.rows) Check(row.size() == rows.header.size(), "every row has one cell per column");
+
+    // Unified pacer columns (developer key unified_pacer).
+    const std::pair<const char*, const char*> unified_cells[] = {
+        { "up_grid_target_qpc", "123456789" }, { "up_interval_us", "8333.333" },
+        { "up_gpu_interval_us", "8000.250" }, { "up_gpu_service_us", "7990.500" },
+        { "up_queue_wait_raw_us", "-1250.500" }, // signed, never clipped
+        { "up_queue_wait_us", "3900.000" }, { "up_outstanding", "2" },
+        { "up_limit_wait_us", "1500.125" }, { "up_ready_age_us", "2500.750" },
+        { "up_flags", "131089" }, { "up_hold_budget_us", "1234.500" },
+        { "up_service_sample_us", "7900.625" }, { "up_gpu_wait_us", "1250.500" },
+        { "up_cycle_us", "14700.125" } };
+    for (const auto& [column, expected] : unified_cells) {
+        Check(rows.Cell(0, column) == expected,
+              std::string("row 1 ") + column + " = " + expected + ", got " + rows.Cell(0, column));
+        Check(rows.Cell(1, column).empty(),
+              std::string("row 2 ") + column + " is empty with up_valid 0 whatever the record holds");
+        Check(rows.Cell(2, column).empty(),
+              std::string("row 3 ") + column + " is empty without a Source record");
+    }
+    // up_valid 1 with each column's own rule: no T, I_gpu not bindable, fewer than 16 pairs, no used
+    // report, limit inactive and no completion yet leave their cells empty; the interval, the limit
+    // wait and the flags have no such rule.
+    Check(rows.Cell(3, "up_interval_us") == "16666.500" && rows.Cell(3, "up_limit_wait_us") == "0.000" &&
+              rows.Cell(3, "up_flags") == "4104",
+          "a unified row without optional values keeps its interval, limit wait and flags");
+    // A live stream with a credit of exactly 0.0 is a value, not an empty cell.
+    Check(rows.Cell(4, "up_hold_budget_us") == "0.000",
+          "a hold credit of 0 prints 0.000, got " + rows.Cell(4, "up_hold_budget_us"));
+    // A used report with no GPU wait is a value (0.000); its missing service sample stays empty.
+    Check(rows.Cell(4, "up_gpu_wait_us") == "0.000" && rows.Cell(4, "up_service_sample_us").empty(),
+          "a valid GPU wait of 0 prints 0.000 and an invalid sample is empty");
+    // 0.000 stays a value; a debt prints signed.
+    Check(rows.Cell(5, "up_hold_budget_us") == "-2500.250",
+          "a negative hold credit prints signed (-2500.250), got " + rows.Cell(5, "up_hold_budget_us"));
+    for (const char* column : { "up_grid_target_qpc", "up_gpu_interval_us", "up_gpu_service_us",
+             "up_queue_wait_raw_us", "up_queue_wait_us", "up_outstanding", "up_ready_age_us",
+             "up_hold_budget_us", "up_service_sample_us", "up_gpu_wait_us", "up_cycle_us" }) {
+        Check(rows.Cell(3, column).empty(),
+              std::string("row 4 ") + column + " is empty by its own rule");
+    }
+
+    // GPU queue probe columns (developer key gpu_queue_probe), joined by the Present's identity.
+    const std::pair<const char*, const char*> gq_cells[] = {
+        { "gq_submits", "47" }, { "gq_first_submit_qpc", "3000" }, { "gq_first_start_qpc", "3010" },
+        { "gq_last_submit_qpc", "3900" }, { "gq_last_done_qpc", "4100" }, { "gq_empty_us", "12.500" },
+        { "gq_first_gap_us", "310.125" }, { "gq_stamp_late_us", "22.250" },
+        { "gq_min_margin_us", "0.000" }, // a valid zero is a value, not an empty cell
+        { "gq_wait_block_us", "1500.750" } };
+    for (const auto& [column, expected] : gq_cells) {
+        Check(rows.Cell(0, column) == expected,
+              std::string("row 1 ") + column + " = " + expected + ", got " + rows.Cell(0, column));
+        Check(rows.Cell(2, column).empty(),
+              std::string("row 3 ") + column + " is empty without a GPU queue record");
+    }
+    // Row 2 (the second) has a record with only some valid bits: the others stay empty whatever the fields hold.
+    const std::pair<const char*, const char*> gq_partial_cells[] = {
+        { "gq_submits", "5" }, { "gq_first_submit_qpc", "3100" }, { "gq_last_done_qpc", "3300" },
+        { "gq_wait_block_us", "7.500" } };
+    for (const auto& [column, expected] : gq_partial_cells) {
+        Check(rows.Cell(1, column) == expected,
+              std::string("row 2 ") + column + " = " + expected + ", got " + rows.Cell(1, column));
+    }
+    for (const char* column : { "gq_first_start_qpc", "gq_last_submit_qpc", "gq_empty_us", "gq_first_gap_us",
+             "gq_stamp_late_us", "gq_min_margin_us" }) {
+        Check(rows.Cell(1, column).empty(),
+              std::string("row 2 ") + column + " is empty while its valid bit is clear");
+    }
+
+    // Queue law inputs (gq_ cells 173-177) and the law's statistics (up_ql_ cells 178-183).
+    const std::pair<const char*, const char*> ql_cells[] = {
+        { "gq_hold_block_us", "810.500" }, { "gq_min_margin_free_us", "0.000" }, // a valid zero is a value
+        { "gq_boundary_idle_us", "42.125" }, { "gq_cycle_us", "8333.250" }, { "gq_wait_idle_us", "120.750" },
+        { "up_ql_base_us", "8333.250" }, { "up_ql_need_us", "7100.500" }, { "up_ql_service_us", "6900.750" },
+        { "up_ql_q_us", "-250.125" }, { "up_ql_p_us", "-7.810" }, { "up_ql_valid_frames", "14" } };
+    for (const auto& [column, expected] : ql_cells) {
+        Check(rows.Cell(0, column) == expected,
+              std::string("row 1 ") + column + " = " + expected + ", got " + rows.Cell(0, column));
+        Check(rows.Cell(2, column).empty(),
+              std::string("row 3 ") + column + " is empty without a record or a Source record");
+    }
+    // Row 2 (the second) has hold block and cycle valid only; its Source record has up_valid 0.
+    Check(rows.Cell(1, "gq_hold_block_us") == "3.500" && rows.Cell(1, "gq_cycle_us") == "9000.000",
+          "a partial GPU queue record prints the queue law inputs whose bits are set");
+    for (const char* column : { "gq_min_margin_free_us", "gq_boundary_idle_us", "gq_wait_idle_us",
+             "up_ql_base_us", "up_ql_need_us", "up_ql_service_us", "up_ql_q_us", "up_ql_p_us",
+             "up_ql_valid_frames" }) {
+        Check(rows.Cell(1, column).empty(),
+              std::string("row 2 ") + column + " is empty: valid bit clear or up_valid 0");
+    }
+    // Row 4: up_valid 1 but the law not computable: the five values are empty, the window size is a value.
+    Check(rows.Cell(3, "up_ql_valid_frames") == "9" && rows.Cell(3, "up_ql_base_us").empty() &&
+              rows.Cell(3, "up_ql_need_us").empty() && rows.Cell(3, "up_ql_service_us").empty() &&
+              rows.Cell(3, "up_ql_q_us").empty() && rows.Cell(3, "up_ql_p_us").empty(),
+          "a law that is not computable keeps its valid-frame count and empties the five values");
+    // Row 5 has no window at all: valid frames -1 is an empty cell.
+    Check(rows.Cell(4, "up_ql_valid_frames").empty(), "valid frames -1 (no window) is an empty cell");
+
+    // Marker stamps (frame's own markers, QPC, empty at 0).
+    const std::pair<const char*, const char*> stamp_cells[] = {
+        { "sim_end_marker_qpc", "5000" }, { "render_submit_start_marker_qpc", "5100" },
+        { "render_submit_end_marker_qpc", "5200" } };
+    for (const auto& [column, expected] : stamp_cells) {
+        Check(rows.Cell(0, column) == expected,
+              std::string("row 1 ") + column + " = " + expected + ", got " + rows.Cell(0, column));
+        Check(rows.Cell(2, column).empty(),
+              std::string("row 3 ") + column + " is empty without a Source record");
+    }
+    // Row 2: one stamp seen, the others 0 (empty).
+    Check(rows.Cell(1, "render_submit_start_marker_qpc") == "6000" && rows.Cell(1, "sim_end_marker_qpc").empty() &&
+              rows.Cell(1, "render_submit_end_marker_qpc").empty(),
+          "a stamp of 0 is an empty cell, a seen stamp prints as an integer");
+
+    // The columns of the removed render-thread terms of the queue law (margin, offset, queue term,
+    // feed contrast, spread, span wait) are always 0 on a row the unified pacer decided (rows 1 and
+    // 4) and empty on every other row (row 2: up_valid 0, row 3: no Source record).
+    for (const char* column : { "up_ql_rt_margin_us", "up_ql_rt_offset_us", "up_ql_q_rt_us",
+                                "up_ql_rt_contrast_us", "up_ql_rt_spread_us", "up_ql_rt_wait_us" }) {
+        Check(rows.Cell(0, column) == "0.000", std::string("row 1 ") + column + " is 0.000, got " + rows.Cell(0, column));
+        Check(rows.Cell(3, column) == "0.000", std::string("row 4 ") + column + " is 0.000, got " + rows.Cell(3, column));
+        Check(rows.Cell(1, column).empty(), std::string("row 2 ") + column + " is empty: up_valid 0");
+        Check(rows.Cell(2, column).empty(), std::string("row 3 ") + column + " is empty without a Source record");
+    }
+
+    // The probe record's queue role: a role prints only with a probe record, 0 is empty.
+    Check(rows.Cell(0, "gq_queue_role") == "3", "row 1 gq_queue_role = 3, got " + rows.Cell(0, "gq_queue_role"));
+    Check(rows.Cell(1, "gq_queue_role").empty(), "row 2 gq_queue_role is empty: role 0");
+    Check(rows.Cell(2, "gq_queue_role").empty(), "row 3 gq_queue_role is empty without a probe record");
+    Check(rows.Cell(3, "gq_queue_role") == "2", "row 4 gq_queue_role = 2, got " + rows.Cell(3, "gq_queue_role"));
+
+    // CPU time inside the frame's own spans and the ids of the threads that sent the markers.
+    const std::pair<const char*, const char*> cpu_cells[] = {
+        { "render_submit_cpu_us", "4200.125" }, { "sim_cpu_us", "0.000" }, // a valid zero is a value
+        { "render_submit_tid", "4812" }, { "sim_tid", "4812" }, { "render_submit_end_tid", "4812" },
+        { "sim_end_tid", "4812" } };
+    for (const auto& [column, expected] : cpu_cells) {
+        Check(rows.Cell(0, column) == expected,
+              std::string("row 1 ") + column + " = " + expected + ", got " + rows.Cell(0, column));
+        Check(rows.Cell(2, column).empty(),
+              std::string("row 3 ") + column + " is empty without a Source record");
+    }
+    // Row 2: a span whose markers came from two threads has no CPU time (empty) but both ids show; a
+    // marker not seen has no id. The cells need only the Source record, not up_valid.
+    Check(rows.Cell(1, "render_submit_cpu_us").empty() && rows.Cell(1, "sim_cpu_us").empty() &&
+              rows.Cell(1, "render_submit_tid") == "4812" && rows.Cell(1, "render_submit_end_tid") == "5120" &&
+              rows.Cell(1, "sim_tid").empty() && rows.Cell(1, "sim_end_tid").empty(),
+          "a cross-thread span has an empty CPU time with both thread ids shown, an unseen marker an empty id");
 
     const std::pair<const char*, const char*> latency_cells[] = {
         { "predicted_render_us", "4321.500" }, { "pcl_status", "3" }, { "pcl_input_ping_qpc", "900" },
@@ -526,6 +881,9 @@ int main()
     FlipConfig_Record(5000, 7000); // a later one no row sees
     CSV_PushPacingRow(2, DisplayRow(false), PacingDerivedMetrics{});
     CSV_PushPacingRow(3, UnjoinedPresentRow(), PacingDerivedMetrics{});
+    CSV_PushPacingRow(4, UnifiedEmptyRuleRow(), PacingDerivedMetrics{});
+    CSV_PushPacingRow(5, UnifiedZeroBudgetRow(), PacingDerivedMetrics{});
+    CSV_PushPacingRow(6, UnifiedDebtRow(), PacingDerivedMetrics{});
 
     PacingCsvEvent status{};
     status.type = PacingCsvEventType::PclStatus;

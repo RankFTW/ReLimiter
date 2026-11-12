@@ -43,16 +43,26 @@ static DWORD WINAPI InstallWorker(void* context) {
         // An auto-reset event retains notifications arriving during this scan.
         // The timeout retries failed installs and discovers non-LoadLibrary loads.
         HMODULE interposer = nullptr;
-        if (GetModuleHandleExW(0, L"sl.interposer.dll", &interposer)) {
-            s_streamline_present.store(true, std::memory_order_release);
-            const bool streamline_ready = HookStreamlinePCL(interposer);
-            StreamlineFactoryProbe_TryWorker(interposer, streamline_ready);
-            FreeLibrary(interposer);
+        {
+            // One batch per scan. It is lazy: it takes no lock until something installs, so an idle scan (and
+            // the discovery, probing and drains of every scan) never holds the install lock for it. A group that
+            // installs holds the lock from its first create to its apply: groups that must act on their enable
+            // result (the Streamline hooks, the queue hooks, the FG hooks, NGX) flush the batch themselves, which
+            // applies and releases the lock; the batch's own Apply, before the wait below, does the same for
+            // whatever is left.
+            HookBatch batch(HookBatchSite::LoaderScan);
+            if (GetModuleHandleExW(0, L"sl.interposer.dll", &interposer)) {
+                s_streamline_present.store(true, std::memory_order_release);
+                const bool streamline_ready = HookStreamlinePCL(interposer);
+                StreamlineFactoryProbe_TryWorker(interposer, streamline_ready);
+            }
+            if (!g_config.streamline_compat) NGXHooks_TryInstall();
+            FgInput_InstallAndDrain();
+            StreamlineFactoryProbe_Drain();
+            StreamlineProxy_Drain();
+            batch.Apply();
         }
-        if (!g_config.streamline_compat) NGXHooks_TryInstall();
-        FgInput_InstallAndDrain();
-        StreamlineFactoryProbe_Drain();
-        StreamlineProxy_Drain();
+        if (interposer) FreeLibrary(interposer);
         StreamlineQueue_Drain();
         if (RuntimeLifecycle_IsStopping()) break;
         // Loads on this worker do not self-notify. Other notifications coalesce;
@@ -126,6 +136,11 @@ static HMODULE WINAPI Hook_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, D
     return h;
 }
 
+#ifdef _WIN64
+// InstallLoadLibraryHooks queued its hooks and LoadLibraryHooks_ReportInstalled has not reported them yet.
+static bool s_report_pending = false;
+#endif
+
 void InstallLoadLibraryHooks() {
 #ifndef _WIN64
     // Streamline and NGX are 64-bit only — skip LoadLibrary hooks on 32-bit
@@ -154,6 +169,22 @@ void InstallLoadLibraryHooks() {
     InstallHook((void*)&LoadLibraryExA, (void*)&Hook_LoadLibraryExA, (void**)&s_orig_LoadLibraryExA);
     InstallHook((void*)&LoadLibraryExW, (void*)&Hook_LoadLibraryExW, (void**)&s_orig_LoadLibraryExW);
     LoadLibraryHooks_RequestInstall();
+    s_report_pending = true;
+    // Inside a batch the four hooks are only queued: the caller reports after the batch applied.
+    if (!Hooks_InBatch()) LoadLibraryHooks_ReportInstalled();
+#endif
+}
+
+void LoadLibraryHooks_ReportInstalled() {
+#ifdef _WIN64
+    if (!s_report_pending) return;
+    s_report_pending = false;
+    if (Hooks_TargetEnabled((void*)&LoadLibraryA) && Hooks_TargetEnabled((void*)&LoadLibraryW) &&
+        Hooks_TargetEnabled((void*)&LoadLibraryExA) && Hooks_TargetEnabled((void*)&LoadLibraryExW)) {
+        LOG_INFO("LoadLibrary hooks installed (deferred)");
+    } else {
+        LOG_WARN("LoadLibrary hooks not (all) installed: module loads are noticed by the worker's timed scan only");
+    }
 #endif
 }
 

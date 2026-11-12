@@ -58,6 +58,7 @@ void VkEnforce_OnPresent(
             s_gl_vsync_attempted = true;
             LOG_INFO("VSync: OpenGL detected in VkEnforce_OnPresent, installing hooks...");
             VSync_InstallOpenGLHooks();
+            LOG_INFO("Hooks: MH_EnableHook(MH_ALL_HOOKS) after the OpenGL VSync hooks");
             EnableAllHooks();
             VSync_ApplyOpenGL();
         }

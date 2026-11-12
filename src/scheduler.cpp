@@ -1,5 +1,6 @@
 #include "scheduler.h"
 #include "source_stage.h"
+#include "marker_stamps.h"
 #include "pacing_resolver.h"
 #include "fg_divisor.h"
 #include "display_state.h"
@@ -23,10 +24,14 @@
 #include "render_handoff.h"
 #include "frame_timeline.h"
 #include "pacing_telemetry.h"
+#include "gpu_queue_law_feed.h"
+#include "marker_stamps.h"
+#include <cstdio>
 #include "logger.h"
 #include <Windows.h>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <atomic>
 
 // ── User config ──
@@ -521,6 +526,30 @@ int64_t s_precise_wait_target_qpc = 0;   // and its committed release target
 uint32_t s_precise_wait_epoch = 0;       // and the cadence it was made under (source_stage.h)
 double s_precise_wait_interval_us = 0.0;
 PacingTimingMode s_precise_wait_mode = PacingTimingMode::Off;
+// Developer key unified_pacer (unified_pacer.h, spec 4.1 to 4.3). The mailbox word is written by
+// the Sleep hook outside the owner and consumed once by the owner at the marker. The Sleep
+// hook's hard-limit statistics travel in a few slots indexed by the reservation token: each
+// slot is a seqlock whose writer takes it with a try-acquire and only for a newer token (a
+// retired Sleep cannot overwrite another frame's slot), and the marker uses a snapshot only
+// when its token and sequence validate, else it discards it.
+std::atomic<uint64_t> s_up_mailbox{0};
+std::atomic<uint32_t> s_up_pending_flags{0}; // kUpOwnerBusy / kUpDuplicateSleep seen since the last record
+constexpr uint32_t kUpStatsSlots = 4;
+struct UnifiedSleepStats {
+    std::atomic<uint32_t> sequence{0};  // odd while a writer owns the slot
+    std::atomic<uint32_t> token{0};     // the reservation the slot describes (0 = none)
+    std::atomic<uint32_t> limit_flags{0};
+    std::atomic<int32_t> outstanding{-1};
+    std::atomic<int64_t> limit_wait_ticks{0};
+    std::atomic<int64_t> ready_age_ticks{-1}; // -1 = no completion yet
+};
+UnifiedSleepStats s_up_stats[kUpStatsSlots];
+bool s_up_key = false;             // the key as ResolvePipeline last saw it
+bool s_up_reconcile = false;       // OnMarker reconciles the Sleep-mode tuple: the key is on, or its toggle is not applied yet
+bool s_up_idle_regime = false;     // the idle regime as OnMarker last saw it (key on)
+double s_up_idle_interval_us = 0.0; // I_idle of the newest OnMarker (0 = not idle; key on)
+bool s_up_law_feed_active = false;  // owner: the probe's feed is being drained for the queue law (unified_queue_law)
+uint64_t s_up_retired_session_seen = 0; // owner: the newest feed-retired session already applied to the law
 // Reflex Sleep on the presenting device: written by the Sleep hook (any
 // thread), read by the owner for placement availability.
 std::atomic<int64_t> s_last_reflex_sleep_qpc{0};
@@ -645,6 +674,61 @@ static void TakeLeadOutputs(uint32_t* outputs, uint32_t* late_outputs) noexcept
     *late_outputs = late > draining ? late - draining : 0u;
 }
 
+// Developer key unified_queue_law: the law's counters (UnifiedQueueLawSummary), logged ONCE per
+// transition and cleared: the law switched off, the unified pacer switched off, a lifecycle reset
+// of the stage, and the process shutdown (Scheduler_LogQueueLawSummary). Nothing with the key off
+// (the counters stay zero) and nothing per frame. Owner thread.
+static void LogQueueLawSummary(const char* reason) noexcept
+{
+    UnifiedPacer& pacer = s_source_stage.Unified();
+    const UnifiedQueueLawSummary s = pacer.QueueLawSummary();
+    pacer.ClearQueueLawSummary();
+    if (s.frames_planned == 0 && s.records_accepted == 0 && s.records_retired == 0 &&
+        s.grants_law == 0 && s.grants_report == 0)
+        return;
+    char credit_note[320];
+    credit_note[0] = '\0';
+    size_t credit_note_length = 0;
+    if (s.holds_settled_orphan != 0)
+        credit_note_length += static_cast<size_t>(std::snprintf(credit_note, sizeof(credit_note),
+            "; %llu law-granted holds settled from the measured hold (their probe record would not come)",
+            static_cast<unsigned long long>(s.holds_settled_orphan)));
+    if (s.frames_no_hold_credit != 0 && credit_note_length < sizeof(credit_note))
+        std::snprintf(credit_note + credit_note_length, sizeof(credit_note) - credit_note_length,
+            "; %llu frames with the law in use took the report-based credit and holds (render queue found by dependency)",
+            static_cast<unsigned long long>(s.frames_no_hold_credit));
+    LOG_INFO("Queue law summary (%s): planned %llu, law in use %llu; records %llu accepted (%llu valid, "
+             "%llu late), %llu dropped from a retired session; hold grants %llu law / %llu report; holds "
+             "debited %llu by record / %llu by the report rule, %llu never debited, %llu lost unmeasured%s",
+             reason, static_cast<unsigned long long>(s.frames_planned),
+             static_cast<unsigned long long>(s.frames_in_use),
+             static_cast<unsigned long long>(s.records_accepted), static_cast<unsigned long long>(s.records_valid),
+             static_cast<unsigned long long>(s.records_late), static_cast<unsigned long long>(s.records_retired),
+             static_cast<unsigned long long>(s.grants_law), static_cast<unsigned long long>(s.grants_report),
+             static_cast<unsigned long long>(s.holds_debited_record),
+             static_cast<unsigned long long>(s.holds_debited_report),
+             static_cast<unsigned long long>(s.holds_never_debited),
+             static_cast<unsigned long long>(s.holds_lost_unmeasured), credit_note);
+}
+
+void Scheduler_LogQueueLawSummary() noexcept
+{
+    SchedulerOwnerGuard owner;
+    if (!owner) return; // the owner is busy: no summary (never blocks)
+    LogQueueLawSummary("process shutdown");
+}
+
+// Developer key unified_pacer: empties the law and the Sleep hook's mailbox (spec 2.6).
+// Runs where the adaptation regime resets (cap, FG divisor, DMFG, OLED, focus, lifecycle),
+// on suspension and on a regime change; one bool check with the key off.
+static void ResetUnifiedLaw() noexcept
+{
+    if (!s_source_stage.UnifiedEnabled()) return;
+    s_source_stage.ResetUnified(FrameTimeline_CurrentControllerGeneration());
+    s_up_mailbox.store(0, std::memory_order_release);
+    s_up_pending_flags.store(0, std::memory_order_relaxed);
+}
+
 // Starts a fresh period-governor and cadence-readout history. The
 // governor step belongs to one interval and one workload regime. Demand
 // reports and output evidence admitted before the reset describe the old
@@ -659,6 +743,7 @@ static void ResetAdaptationRegime(const char* reason) noexcept
     DiscardReflexFrameTimeSamples();
     Scheduler_ResetSmoothness();
     s_lfc.Reset();
+    ResetUnifiedLaw();
     LOG_INFO("Scheduler: period governor and cadence readout reset (%s)", reason);
 }
 
@@ -808,7 +893,11 @@ static void ApplyLifecycle(SchedulerTrigger trigger, PacingSourceMarker marker) 
 
     const uint32_t generation = FrameTimeline_CurrentControllerGeneration();
     if (!s_stage_initialized || generation != s_stage_generation) {
+        LogQueueLawSummary("lifecycle reset");
         s_source_stage.Reset(GetQPCFrequency());
+        // The producer epoch or lifecycle restarted the frame ids: the stamps of the old ones go
+        // (marker_stamps.h; a reset of an empty ring is one atomic add).
+        MarkerStamps_Reset();
         s_period_tracker.Forget();
         s_pre_sleep.Reset();
         s_sleep_entry_index = 0;
@@ -874,6 +963,9 @@ static PacingPipelineSnapshot ResolvePipeline(
         s_route_known = true;
     }
 
+    // The developer key unified_pacer's transition is applied by ApplyUnifiedKeyTransition at the
+    // start of the invocation (OnMarker, before the stage events are drained), never here.
+
     // Overload guard: Auto only. The developer A/B interleave turns the Auto
     // GPU queue wait off in its not-held blocks.
     const bool interleave = InterleaveActive(config);
@@ -893,22 +985,87 @@ static PacingPipelineSnapshot ResolvePipeline(
         ApplyInterleaveTransition(
             s_hold_interleave.Decide(s_clock.Now(), GetQPCFrequency(), config.gpu_wait_interleave_s));
     }
-    runtime.hold_overloaded = s_hold_feasibility.Overloaded();
-    runtime.gpu_queue_wait_off = interleave && !s_hold_interleave.Holding();
+    // Key unified_pacer: the performance demotions are bypassed (the law limits the unfinished frames itself).
+    runtime.hold_overloaded = !config.unified_pacer && s_hold_feasibility.Overloaded();
+    runtime.gpu_queue_wait_off = !config.unified_pacer && interleave && !s_hold_interleave.Holding();
 
     const PacingPipelineSnapshot resolved =
         PacingPipeline_Resolve(config, capabilities, runtime);
     if (PacingPipeline_Publish(resolved)) {
         const PacingPipelineSnapshot published = PacingPipeline_Read();
-        LOG_INFO("Pacing pipeline %u: mode=%s placement=%s rung=%s reason=%s",
+        char route_diag[1400];
+        NativeGate_DiagnosticsText(route_diag, sizeof(route_diag));
+        LOG_INFO("Pacing pipeline %u: mode=%s placement=%s rung=%s reason=%s native_route_diag: %s",
                  published.generation,
                  PacingTimingMode_Text(published.mode),
                  PacingSourcePlacement_Text(published.placement),
                  PacingRung_Text(published.rung),
-                 PacingFallbackReason_Text(published.reason));
+                 PacingFallbackReason_Text(published.reason),
+                 route_diag);
         return published;
     }
     return PacingPipeline_Read();
+}
+
+// Developer key unified_queue_law: the probe's finished frames to the law, in arrival order,
+// before the plan (the owner, from OnMarker's keyed branch and the Sleep hook's reservation,
+// both under the owner guard: the feed's one consumer). The records drained here are the newest
+// the probe had pushed before this call (each describes a frame one to two frames older than the
+// frame about to be planned); the law decides from them, or falls back to the report-based rule
+// when fewer than 12 of its newest 16 arrivals are valid or the newest valid one is older than
+// 4 planned frames. Law off (the stage's option): one comparison, nothing drained. Entering or
+// leaving the law, and every key transition, discards the ring so no stale record is applied.
+static void DrainQueueLawFeed(bool law_on) noexcept
+{
+    if (law_on != s_up_law_feed_active) {
+        GpuQueueLawFeed_Reset();
+        s_up_law_feed_active = law_on;
+    }
+    if (!law_on) return;
+    // A retirement the probe published (its adopted queue was destroyed) first: the law's window is
+    // emptied, its outstanding grants settled, and records of that session still in the ring are dropped
+    // by the pacer when they are popped below.
+    const uint64_t retired = GpuQueueLawFeed_RetiredSession();
+    if (retired != s_up_retired_session_seen) {
+        s_up_retired_session_seen = retired;
+        s_source_stage.RetireQueueSession(retired);
+    }
+    PacingGpuQueueRecord record;
+    while (GpuQueueLawFeed_Pop(&record))
+        s_source_stage.OnQueueRecord(record);
+}
+
+// Developer key unified_pacer: the owner's transition to the key of THIS invocation's
+// configuration snapshot. It runs once per transition, at the start of OnMarker, BEFORE the
+// stage events are drained, so that one invocation (drain, resolve, governor, plan) runs under
+// ONE value of the key. The rule, for both directions: the events drained by an invocation
+// are judged by the rules of that invocation's key, whichever branch planned their frames.
+// Key off: a late output restarts the cadence as in 9746673 (OutputLate), no unified report
+// is registered or flushed, and the law/lead/mailbox state has been reset. Key on: outputs
+// are judged GPU-paced (no OutputLate restart: the grid follows the start), and used reports
+// feed the lead. A toggle resets the law, the feasibility evidence, the lead buckets and the
+// pre-Sleep margin, and leaves a Sleep-mode epoch pending so the first reconcile applies the
+// new key's tuple exactly (spec 5).
+static void ApplyUnifiedKeyTransition(const PacingPipelineConfig& config) noexcept
+{
+    if (config.unified_pacer == s_up_key) return;
+    s_up_key = config.unified_pacer;
+    s_up_law_feed_active = false; // the next keyed drain discards what the ring holds
+    s_up_reconcile = true;
+    if (!s_up_key) LogQueueLawSummary("unified pacer off"); // s_up_key is the new value: the key went off
+    s_source_stage.SetUnifiedEnabled(s_up_key, FrameTimeline_CurrentControllerGeneration());
+    s_up_mailbox.store(0, std::memory_order_release);
+    s_up_pending_flags.store(0, std::memory_order_relaxed);
+    // The waker is installed before the publication starts (frame_plan.cpp stays free of Windows).
+    FramePlan_SetReadyWaker([](const void* address) noexcept { WakeByAddressAll(const_cast<void*>(address)); });
+    g_up_ready_publish.store(s_up_key, std::memory_order_relaxed);
+    ResetFeasibility("unified pacer");
+    s_pre_sleep.Reset();
+    s_source_stage.ResetBuckets();
+    s_sleep_entry_index = 0;
+    s_driver_sleep_index = 0;
+    NvAPI_BumpSleepModeEpoch();
+    LOG_INFO("Unified pacer %s", s_up_key ? "on" : "off");
 }
 
 // Exactly one source record per OnMarker call, pushed after its release, just
@@ -1210,6 +1367,15 @@ static GovernorDecision UpdatePeriodGovernor(
     const bool gpu_hold = IsGpuRung(pipeline.rung);
     ReflexFrameTimeSample sample{};
     while (ConsumeReflexFrameTimeSample(&sample)) {
+        // Developer key unified_pacer: the report's signed queue wait (spec 2.3) from the two
+        // raw timestamps the sample carries (gpuRenderStart − osRenderQueueStart, NAN when missing).
+        if (config.unified_pacer) {
+            const double queue_wait_us = sample.gpu_start_driver_us != 0 && sample.os_queue_start_driver_us != 0
+                ? static_cast<double>(static_cast<int64_t>(sample.gpu_start_driver_us - sample.os_queue_start_driver_us))
+                : std::numeric_limits<double>::quiet_NaN();
+            s_source_stage.OnUnifiedReport(PacingIdentityDomain::NvApiFrame, sample.producer_epoch,
+                sample.frame_id, queue_wait_us, sample.gpu_active_us, sample.ai_frame_us);
+        }
         // The release headroom's heavy-work start r − A, the queue-order
         // test's GPU start, the lead sample behind the wait and the FG input
         // wait's GPU need (lead_controller.h).
@@ -1433,6 +1599,8 @@ static bool PreSleepAvailable() noexcept;
 // ReLimiter, so with a cap the bypass applies whenever it is on.
 static bool DriverSleepRuns(int target_fps) noexcept
 {
+    // Key unified_pacer: the Sleep is never bypassed.
+    if (PacingPipeline_UnifiedPacerKey()) return PreSleepAvailable();
     return PreSleepAvailable() &&
         !NvAPI_ShouldBypassSleep(g_reflex_sleep_bypass.load(std::memory_order_relaxed), target_fps, true);
 }
@@ -1447,7 +1615,8 @@ static uint32_t HandoffStreamOf(const PacingPlanKey& key) noexcept
 // placement while the driver's Sleep does not run.
 static bool HandoffLimitPossible(const PlannedFrameInput& input, const PacingPipelineSnapshot& pipeline) noexcept
 {
-    return (pipeline.mode == PacingTimingMode::Vrr || pipeline.mode == PacingTimingMode::Fixed) &&
+    return !PacingPipeline_UnifiedPacerKey() &&
+        (pipeline.mode == PacingTimingMode::Vrr || pipeline.mode == PacingTimingMode::Fixed) &&
         PacingSourcePlacement_WaitsAtMarker(pipeline.placement) &&
         (input.trigger == SchedulerTrigger::NvApiMarker || input.trigger == SchedulerTrigger::PclMarker) &&
         input.marker == PacingSourceMarker::SimulationStart &&
@@ -1488,6 +1657,152 @@ static bool GpuPacedHeldFloorApplies(const PlannedFrameInput& input, const Pacin
         (input.trigger == SchedulerTrigger::NvApiMarker || input.trigger == SchedulerTrigger::PclMarker) &&
         input.marker == PacingSourceMarker::SimulationStart &&
         !DriverSleepRuns(input.target_fps);
+}
+
+// Developer key unified_pacer: the interval terms of I(n) (unified_pacer.h) from the cap,
+// the raw frame generation factor N (never the ramped divisor), the VRR ceiling, the game's
+// own limit and the idle regime. Owner only. The VRR cap with the cap off is the Reflex VRR
+// cap; a fixed refresh with the cap off has no cap term (passthrough upstream).
+static UnifiedIntervalTerms BuildUnifiedTerms(PacingTimingMode mode, double idle_interval_us) noexcept
+{
+    UnifiedIntervalTerms terms{};
+    const int divisor = g_resolved_fg_divisor.load(std::memory_order_relaxed);
+    const double n = static_cast<double>(divisor > 0 ? divisor : 1);
+    terms.idle = mode == PacingTimingMode::Idle;
+    if (terms.idle) {
+        terms.idle_us = idle_interval_us;
+        terms.cap_us = idle_interval_us; // I_idle replaces I_cap
+    } else {
+        int cap_fps = g_user_target_fps.load(std::memory_order_relaxed);
+        const double vrr_fps = UnifiedPacer_VrrCapFps(g_ceiling_hz.load(std::memory_order_relaxed));
+        if (cap_fps <= 0 && mode == PacingTimingMode::Vrr) cap_fps = static_cast<int>(vrr_fps);
+        if (cap_fps > 0) terms.cap_us = n * 1'000'000.0 / static_cast<double>(cap_fps);
+        if (mode == PacingTimingMode::Vrr && vrr_fps > 0.0) terms.vrr_us = n * 1'000'000.0 / vrr_fps;
+    }
+    // The game's own limit stays in every regime (Idle included): I = max(I_idle, I_game, ...).
+    const uint32_t game_us = g_game_requested_interval.load(std::memory_order_relaxed);
+    if (game_us > 0) terms.game_us = n * static_cast<double>(game_us);
+    return terms;
+}
+
+// 30-bit token order (UnifiedMailbox_Pack masks tokens to 30 bits): a is newer than b.
+static bool UpTokenNewer(uint32_t a, uint32_t b) noexcept
+{
+    return static_cast<int32_t>((a - b) << 2) > 0;
+}
+
+// Sleep hook, no owner: publishes the hard-limit statistics of reservation `token` into its
+// slot. The slot is taken with a try-acquire, and only when it holds an older token; a
+// contended or newer slot keeps what it has and the marker discards the unvalidated snapshot.
+static void PublishUnifiedStats(uint32_t token, const UnifiedLimitResult& limit) noexcept
+{
+    UnifiedSleepStats& slot = s_up_stats[token % kUpStatsSlots];
+    uint32_t sequence = slot.sequence.load(std::memory_order_acquire);
+    if ((sequence & 1u) != 0) return;
+    const uint32_t held = slot.token.load(std::memory_order_relaxed);
+    if (held != 0 && !UpTokenNewer(token, held)) return;
+    if (!slot.sequence.compare_exchange_strong(sequence, sequence + 1, std::memory_order_acq_rel,
+            std::memory_order_relaxed)) {
+        return; // the sequence moved after the token was read: another writer owns or owned the slot
+    }
+    std::atomic_thread_fence(std::memory_order_release); // the odd sequence is visible before any field below
+    slot.token.store(token, std::memory_order_relaxed);
+    slot.limit_flags.store(limit.flags, std::memory_order_relaxed);
+    slot.outstanding.store(limit.outstanding, std::memory_order_relaxed);
+    slot.limit_wait_ticks.store(limit.wait_ticks, std::memory_order_relaxed);
+    slot.ready_age_ticks.store(limit.ready_age_ticks, std::memory_order_relaxed);
+    slot.sequence.store(sequence + 2, std::memory_order_release);
+}
+
+struct UnifiedStatsSnapshot {
+    uint32_t limit_flags = 0;
+    int32_t outstanding = -1;
+    int64_t limit_wait_ticks = 0;
+    int64_t ready_age_ticks = -1;
+};
+
+// Owner: the statistics of reservation `token`, true only for one coherent snapshot of that
+// token (an absent, replaced or concurrently written slot is false and nothing is used).
+static bool ReadUnifiedStats(uint32_t token, UnifiedStatsSnapshot* out) noexcept
+{
+    const UnifiedSleepStats& slot = s_up_stats[token % kUpStatsSlots];
+    const uint32_t before = slot.sequence.load(std::memory_order_acquire);
+    if ((before & 1u) != 0 || slot.token.load(std::memory_order_relaxed) != token) return false;
+    out->limit_flags = slot.limit_flags.load(std::memory_order_relaxed);
+    out->outstanding = slot.outstanding.load(std::memory_order_relaxed);
+    out->limit_wait_ticks = slot.limit_wait_ticks.load(std::memory_order_relaxed);
+    out->ready_age_ticks = slot.ready_age_ticks.load(std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return slot.sequence.load(std::memory_order_relaxed) == before;
+}
+
+// The unified columns of the frame's source record (spec 6); empty cells stay unset.
+static void FillUnifiedRecord(const SourceStageFrame& frame, PacingSourceRecord* record) noexcept
+{
+    if (!frame.planned || !frame.unified.valid) return;
+    const SourceStageUnifiedFrame& unified = frame.unified;
+    const UnifiedStart& start = unified.start;
+    uint32_t flags = unified.flags | s_up_pending_flags.exchange(0, std::memory_order_relaxed);
+    // The Sleep hook's hard-limit statistics, when this frame consumed that Sleep's word and the
+    // snapshot of its token validates; otherwise the cells stay empty.
+    UnifiedStatsSnapshot stats{};
+    if (start.token != 0 &&
+        (unified.kind == UnifiedResolutionKind::Consumed || unified.kind == UnifiedResolutionKind::WaitFailed) &&
+        ReadUnifiedStats(start.token, &stats)) {
+        flags |= stats.limit_flags;
+        record->up_outstanding = stats.outstanding;
+        record->up_limit_wait_us = qpc_to_us(stats.limit_wait_ticks);
+        if (stats.ready_age_ticks >= 0) {
+            record->up_ready_age_valid = 1;
+            record->up_ready_age_us = qpc_to_us(stats.ready_age_ticks);
+        }
+    }
+    if (g_unified_driver_pacing.load(std::memory_order_relaxed)) flags |= kUpDriverPaces;
+    record->up_valid = 1;
+    record->up_grid_target_qpc = start.target.base;
+    record->up_interval_us = start.interval_us;
+    if (start.gpu_interval_us > 0.0) {
+        record->up_gpu_interval_valid = 1;
+        record->up_gpu_interval_us = start.gpu_interval_us;
+    }
+    if (unified.status.service_valid) {
+        record->up_gpu_service_valid = 1;
+        record->up_gpu_service_us = unified.status.service_us;
+    }
+    if (unified.status.queue_wait_valid) {
+        record->up_queue_wait_valid = 1;
+        record->up_queue_wait_raw_us = unified.status.queue_wait_raw_us;
+        record->up_queue_wait_us = unified.status.queue_wait_us;
+    }
+    record->up_flags = flags;
+    if (unified.hold_live) { // the signed credit at the plan; not live leaves the cell empty
+        record->up_hold_budget_valid = 1;
+        record->up_hold_budget_us = unified.hold_credit_us;
+    }
+    // The newest used report's service sample and GPU wait, as the law computed them at this plan.
+    if (unified.status.service_sample_valid) {
+        record->up_service_sample_valid = 1;
+        record->up_service_sample_us = unified.status.service_sample_us;
+    }
+    if (unified.status.gpu_wait_valid) {
+        record->up_gpu_wait_valid = 1;
+        record->up_gpu_wait_us = unified.status.gpu_wait_us;
+    }
+    if (unified.status.cycle_valid) { // the measured completion spacing C at this plan (hold share on)
+        record->up_cycle_valid = 1;
+        record->up_cycle_us = unified.status.cycle_us;
+    }
+    // The queue law (key unified_queue_law): its statistics at this plan, the number of valid
+    // frames among the newest 16 arrivals whenever the key is on (-1 = key off).
+    record->up_ql_valid_frames = unified.status.ql_valid_frames;
+    if (unified.status.ql_valid) {
+        record->up_ql_valid = 1;
+        record->up_ql_base_us = unified.status.ql_base_us;
+        record->up_ql_need_us = unified.status.ql_need_us;
+        record->up_ql_service_us = unified.status.ql_service_us;
+        record->up_ql_q_us = unified.status.ql_q_us;
+        record->up_ql_p_us = unified.status.ql_p_us;
+    }
 }
 
 // A handoff wait stalled: the render thread took no frame for three of its
@@ -1922,7 +2237,12 @@ static SourceStageFrame RunPlanned(
     request.collision_guard = config.rung_override == PacingRungOverride::Auto;
     // The pipeline of this frame was resolved with the overload guard's state:
     // a pause (not an A/B not-held block) floors the demoted lead.
-    request.overload_demoted = s_hold_feasibility.Overloaded();
+    request.overload_demoted = !config.unified_pacer && s_hold_feasibility.Overloaded();
+    // Developer key unified_pacer, every planned frame of the marker route (placement Unified,
+    // or the Marker fallback while the game calls no Reflex Sleep; passthrough, the present
+    // route and mode Off excluded): the unified branch of the source stage plans it (spec 4.2);
+    // no pre-Sleep residual, hold evidence or handoff limit.
+    const bool unified = SourceStage_UnifiedPlans(pipeline, config.unified_pacer, s_source_stage.UnifiedEnabled());
     request.gpu_queue_wait_render_queue = config.gpu_queue_wait_render_queue;
     // Lead spike floor (lead_controller.h): Auto only, like the collision
     // guard, so the GPU wait output override keeps its earlier behavior.
@@ -2009,8 +2329,16 @@ static SourceStageFrame RunPlanned(
         request.gpu_floor_qpc = GpuFloorQpc(key);
     }
 
+    if (unified) {
+        request.unified.active = true;
+        request.unified.terms = BuildUnifiedTerms(pipeline.mode, s_up_idle_interval_us);
+        const int raw_divisor = g_resolved_fg_divisor.load(std::memory_order_relaxed);
+        request.unified.raw_fg_divisor = raw_divisor > 0 ? raw_divisor : 1;
+        request.unified.mailbox = &s_up_mailbox;
+    }
     g_effective_interval_us.store(input.interval_us, std::memory_order_relaxed);
     const SourceStageFrame frame = s_source_stage.RunPlannedFrame(request, &s_clock);
+    if (unified && frame.planned) g_effective_interval_us.store(frame.plan.interval_us, std::memory_order_relaxed);
     s_gpu_paced_held_floor = held_floor && frame.planned;
     if (frame.planned) {
         // The newest 128 plans: shift in this plan's bit, drop the oldest.
@@ -2040,13 +2368,20 @@ static SourceStageFrame RunPlanned(
     int64_t pre_sleep_end_qpc = 0;
     bool pre_slept = false;
     bool pre_sleep_late = false;
-    if (frame.planned) {
+    if (frame.planned && !unified) {
         const int64_t source_wake_qpc = frame.plan.output_target_qpc - us_to_qpc(frame.plan.lead_us);
         const int64_t ready_qpc = frame.wait_start_qpc != 0 ? frame.wait_start_qpc : frame.release_qpc;
         pre_slept = s_pre_sleep.OnPlannedArrival(frame.plan.grid_index, ready_qpc,
             source_wake_qpc, GetQPCFrequency(), frame.driver_released, &pre_sleep_end_qpc);
         pre_sleep_late = pre_slept &&
             ready_qpc > (std::max)(source_wake_qpc, SourceStage_WakeEarliestQpc(request));
+    }
+    if (frame.planned && unified && frame.pre_wait_end_qpc != 0) {
+        // A consumed Sleep-hook start wait is the pre-Sleep wait of the record, as the existing one.
+        pre_slept = true;
+        pre_sleep_end_qpc = frame.pre_wait_end_qpc;
+    }
+    if (frame.planned) {
         s_last_plan_index = frame.plan.grid_index;
         s_last_plan_generation = frame.plan.key.controller_generation;
         s_last_plan_lead_us = frame.plan.lead_us;
@@ -2084,12 +2419,12 @@ static SourceStageFrame RunPlanned(
     s_prev_enforcement_ts = release;
     PublishCadence(cadence_context, release);
 
-    ObserveCollisionGuard(input.fg_divisor);
+    ObserveCollisionGuard(unified && frame.planned ? frame.plan.fg_divisor : input.fg_divisor);
     if (input.governed) {
         const bool source_restart = RecordGovernorMiss(frame, input.governor, pre_sleep_late);
         // Overload guard: judged while the pre-guard Auto rung holds. The
         // plan's record resolves when its own verdict is known (O1).
-        const bool judged = frame.planned &&
+        const bool judged = frame.planned && !config.unified_pacer &&
             (pipeline.mode == PacingTimingMode::Vrr || pipeline.mode == PacingTimingMode::Fixed) &&
             config.rung_override == PacingRungOverride::Auto &&
             pipeline.auto_rung != PacingRung::SourceOnly;
@@ -2132,6 +2467,7 @@ static SourceStageFrame RunPlanned(
         }
     }
     SourceStage::FillSourceRecord(frame, pipeline, &source);
+    if (unified) FillUnifiedRecord(frame, &source);
     PushSourceRelease(cadence_context, &source);
 
     SchedulerPacingStatus status{};
@@ -2265,9 +2601,12 @@ void Scheduler_RecordReflexSleepEntry(int64_t sleep_entry_qpc) noexcept
 
 bool Scheduler_PacesSource() noexcept
 {
+    // Unified (key unified_pacer) paces the source at the Sleep hook; the placement can still be
+    // published as Unified for the first Sleep after a key-off, before ResolvePipeline republishes.
     const PacingSourcePlacement placement = PacingPipeline_Read().placement;
     return placement == PacingSourcePlacement::Marker ||
         placement == PacingSourcePlacement::PreSleep ||
+        placement == PacingSourcePlacement::Unified ||
         placement == PacingSourcePlacement::Present;
 }
 
@@ -2410,6 +2749,79 @@ void Scheduler_EndDriverSleep(int64_t start_qpc, int64_t end_qpc) noexcept
     s_driver_sleep_end_qpc = end_qpc;
 }
 
+// ── Unified pacer: the Sleep hook's side (spec 4.1) ──
+
+bool Scheduler_UnifiedActive() noexcept
+{
+    const PacingPipelineSnapshot pipeline = PacingPipeline_Read();
+    return pipeline.placement == PacingSourcePlacement::Unified &&
+        (pipeline.mode == PacingTimingMode::Vrr || pipeline.mode == PacingTimingMode::Fixed ||
+         pipeline.mode == PacingTimingMode::Idle);
+}
+
+SchedulerUnifiedReserve Scheduler_UnifiedReserve(int64_t arrival_qpc, SchedulerUnifiedReservation* out) noexcept
+{
+    if (out == nullptr || !Scheduler_UnifiedActive()) return SchedulerUnifiedReserve::Inactive;
+    SchedulerOwnerGuard owner;
+    if (!owner) {
+        s_up_pending_flags.fetch_or(kUpOwnerBusy, std::memory_order_relaxed);
+        return SchedulerUnifiedReserve::Busy;
+    }
+    // The reservation's I_gpu comes from the records drained now, including those the probe
+    // finished after the previous marker's drain.
+    DrainQueueLawFeed(s_source_stage.Unified().Options().queue_law);
+    if (!s_source_stage.UnifiedEnabled() || !s_stage_initialized) return SchedulerUnifiedReserve::Inactive;
+    const PacingPipelineSnapshot pipeline = PacingPipeline_Read();
+    UnifiedStart start{};
+    const UnifiedReserveStatus status = s_source_stage.Unified().Reserve(
+        s_source_stage.Grid().NextIndex(), FrameTimeline_CurrentControllerGeneration(), arrival_qpc,
+        BuildUnifiedTerms(pipeline.mode, s_up_idle_interval_us), &start);
+    if (status == UnifiedReserveStatus::Duplicate) {
+        s_up_pending_flags.fetch_or(kUpDuplicateSleep, std::memory_order_relaxed);
+        return SchedulerUnifiedReserve::Duplicate;
+    }
+    if (status != UnifiedReserveStatus::Reserved) return SchedulerUnifiedReserve::Inactive;
+    // A reset inside the law (generation change, 250 ms gap) clears the mailbox word too.
+    if ((start.flags & kUpReset) != 0) s_up_mailbox.store(0, std::memory_order_release);
+    out->token = start.token;
+    out->grid_index = start.grid_index;
+    out->lifecycle_base = start.lifecycle_base;
+    out->target_qpc = UnifiedPacer_TargetTicks(start.target);
+    out->interval_ticks = start.interval_ticks;
+    out->flags = start.flags;
+    return SchedulerUnifiedReserve::Reserved;
+}
+
+void Scheduler_UnifiedPublishSleep(const SchedulerUnifiedReservation& reservation,
+    UnifiedSleepOutcome outcome, int64_t release_qpc, int64_t arrival_qpc,
+    const UnifiedLimitResult& limit) noexcept
+{
+    if (reservation.token == 0) return;
+    PublishUnifiedStats(reservation.token, limit);
+    // The word never replaces a newer reservation's: a retired Sleep resuming late finds the
+    // slot taken and is discarded.
+    const uint64_t word = UnifiedMailbox_Pack(reservation.token, outcome, release_qpc - arrival_qpc);
+    uint64_t current = s_up_mailbox.load(std::memory_order_acquire);
+    while (current == 0 || !UpTokenNewer(UnifiedMailbox_Token(current), reservation.token & 0x3FFFFFFFu)) {
+        if (s_up_mailbox.compare_exchange_weak(current, word, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return;
+        }
+    }
+}
+
+// An OutputLate epoch the stage drain started is a governor miss for the next governed frame and
+// a restart of its own frame for the hold feasibility guard, however late the output was
+// observed (as in 9746673, right after the drain).
+static void NoteDrainedOutputLate() noexcept
+{
+    if (s_source_stage.DrainStartedOutputLate()) s_governor_miss_pending = true;
+    for (size_t index = 0; index < s_source_stage.DrainedOutputLateCount(); ++index) {
+        const SourceStageOutputLate& late = s_source_stage.DrainedOutputLate(index);
+        s_hold_evidence.NoteOutputLate(late.key, late.grid_index, late.lateness_us);
+    }
+}
+
 // ── Main entry point ──
 // Order: owner prologue → stage events → pipeline
 // → interval (VRR: I_0 → governor → LFC; fixed: I_0 → governor) → plan
@@ -2426,6 +2838,13 @@ void OnMarker(
     // any scheduler-owned model is read or mutated for this frame (Flush
     // requests).
     ApplyFeedbackResetRequests();
+    // Developer key unified_pacer, or a toggle that has not applied yet: reconcile the one
+    // effective Sleep-mode tuple from the game thread (spec 4.1). A key load and a flag
+    // load with the key off.
+    if (PacingPipeline_UnifiedPacerKey() || s_up_reconcile) {
+        if (NvAPI_SleepModeReconcilePending()) NvAPI_ReconcileSleepMode();
+        else s_up_reconcile = false;
+    }
     // Demand reports not consumed by the period governor this frame are
     // discarded at exit, except on VRR frames whose end-of-frame poll feeds
     // the next frame's governor.
@@ -2458,17 +2877,40 @@ void OnMarker(
     }
 
     ApplyLifecycle(trigger, marker);
-    s_source_stage.DrainStageEvents();
-    // An OutputLate epoch is a governor miss for the next governed frame and
-    // a restart of its own frame for the hold feasibility guard, however
-    // late the output was observed.
-    if (s_source_stage.DrainStartedOutputLate()) s_governor_miss_pending = true;
-    for (size_t index = 0; index < s_source_stage.DrainedOutputLateCount(); ++index) {
-        const SourceStageOutputLate& late = s_source_stage.DrainedOutputLate(index);
-        s_hold_evidence.NoteOutputLate(late.key, late.grid_index, late.lateness_us);
-    }
-    // One configuration snapshot for this frame's resolve, governor and plan.
-    const PacingPipelineConfig config = PacingPipeline_GetConfig();
+    // One configuration snapshot decides the invocation; `config` is defined once.
+    // Settled key-off branch: exactly the 9746673 order: the direct stage drain, the OutputLate
+    // handling, THEN the snapshot, so a configuration published during the drain is seen at the
+    // same marker as before. A key published during that drain is applied right after the
+    // snapshot (the safety net: that one boundary invocation drained its events under the old
+    // rules, the transition's reset follows).
+    // Keyed branch (the key on or a transition pending: a key load and a flag, not taken with
+    // the key off): snapshot, the key's transition, the drain under the key of that snapshot, the
+    // OutputLate handling, so the drain, the resolve, the governor and the plan run under one
+    // value of the key.
+    const PacingPipelineConfig config = [&]() noexcept -> PacingPipelineConfig {
+        if (s_up_key || PacingPipeline_UnifiedPacerKey()) {
+            PacingPipelineConfig snapshot = PacingPipeline_GetConfig();
+            ApplyUnifiedKeyTransition(snapshot);
+            // Developer keys unified_every_frame_service / unified_queue_target_us: this
+            // invocation's snapshot values, set before the drain so the whole invocation uses one
+            // value. Keyed branch only; the settled key-off branch never reaches the law.
+            if (s_source_stage.Unified().Options().queue_law && !snapshot.unified_queue_law)
+                LogQueueLawSummary("law off");
+            s_source_stage.SetUnifiedOptions(snapshot.unified_every_frame_service,
+                snapshot.unified_queue_target_us, snapshot.unified_hold_share,
+                snapshot.unified_queue_law, snapshot.unified_queue_rank, snapshot.unified_queue_allow_us,
+                snapshot.unified_queue_need_frames);
+            DrainQueueLawFeed(snapshot.unified_queue_law);
+            s_source_stage.DrainStageEventsUnderKey(s_up_key, FrameTimeline_CurrentControllerGeneration());
+            NoteDrainedOutputLate();
+            return snapshot;
+        }
+        s_source_stage.DrainStageEvents();
+        NoteDrainedOutputLate();
+        PacingPipelineConfig snapshot = PacingPipeline_GetConfig();
+        if (snapshot.unified_pacer != s_up_key) ApplyUnifiedKeyTransition(snapshot);
+        return snapshot;
+    }();
     // Vblank edges feed the fixed-refresh phase tracker on the owner only.
     // Entering fixed refresh starts it over, as at startup: a phase kept from
     // an earlier fixed period is stale, and the grid's ModeChange epoch would
@@ -2503,6 +2945,7 @@ void OnMarker(
     }
     if (suspended) {
         runtime.swapchain_valid = false;
+        ResetUnifiedLaw();
         const PacingPipelineSnapshot pipeline = ResolvePipeline(trigger, config, runtime);
         RunPassthrough(GetCadenceContext(Scheduler_MakePlanKey(frameID, trigger),
             trigger, marker, SchedulerCadenceRegime::Suspended), pipeline, 0, 1.0);
@@ -2515,7 +2958,11 @@ void OnMarker(
     const bool dmfg_changed = s_dmfg_state_initialized && dmfg_active != s_last_dmfg_active;
     s_dmfg_state_initialized = true;
     s_last_dmfg_active = dmfg_active;
-    if (dmfg_changed) ResetAdaptationRegime(dmfg_active ? "DMFG entered" : "DMFG exited");
+    if (dmfg_changed) {
+        ResetAdaptationRegime(dmfg_active ? "DMFG entered" : "DMFG exited");
+        // Developer key unified_pacer: the Sleep-mode tuple follows DMFG (spec 4.1).
+        if (config.unified_pacer) NvAPI_BumpSleepModeEpoch();
+    }
     if (dmfg_active) {
         NativeGate_PublishNoFrameGeneration(false, 0);
         static bool s_dmfg_logged = false;
@@ -2620,6 +3067,14 @@ void OnMarker(
         input.fg_divisor = 1.0;
         idle_interval_us = 1000000.0 / static_cast<double>(fg_off_cap);
     }
+    // Developer key unified_pacer: the idle interval for the next reservation, and a regime
+    // change (idle against not) resets the law.
+    if (config.unified_pacer) {
+        const bool unified_idle = idle_interval_us > 0.0;
+        s_up_idle_interval_us = idle_interval_us;
+        if (unified_idle != s_up_idle_regime) ResetUnifiedLaw();
+        s_up_idle_regime = unified_idle;
+    }
     if (idle_interval_us > 0.0) {
         runtime.idle_cap = true;
         const PacingPipelineSnapshot pipeline = ResolvePipeline(trigger, config, runtime);
@@ -2680,8 +3135,13 @@ void OnMarker(
     }
 
     // ── VRR ──
-    input.target_fps = target_fps;
-    if (target_fps <= 0) {
+    // Key unified_pacer: with the cap off VRR is paced at the VRR cap (Hz - Hz^2/3600), spec 2.2.
+    int vrr_target_fps = target_fps;
+    if (vrr_target_fps <= 0 && config.unified_pacer) {
+        vrr_target_fps = static_cast<int>(UnifiedPacer_VrrCapFps(g_ceiling_hz.load(std::memory_order_relaxed)));
+    }
+    input.target_fps = vrr_target_fps;
+    if (vrr_target_fps <= 0) {
         // No limit: pass through for minimum latency.
         input.regime = SchedulerCadenceRegime::Uncapped;
         input.fg_divisor = ComputeFGDivisor();
@@ -2696,15 +3156,18 @@ void OnMarker(
     PacingPipelineSnapshot pipeline = ResolvePipeline(trigger, config, runtime);
     input.fg_divisor = ComputeFGDivisor(); // one call per frame: it advances a ramp
     // I_0 (no LFC) → governor I_k → LFC hysteresis on I_k → grid interval.
-    input.base_interval_us = VrrCapIntervalUs(target_fps, input.fg_divisor);
+    input.base_interval_us = VrrCapIntervalUs(vrr_target_fps, input.fg_divisor);
     input.governed = true;
     // The governor judges demand against the LFC-paced interval, from the
     // previous frame's LFC state (ApplyLfc runs after it).
     input.governor = UpdatePeriodGovernor(
         GovernorLadder(input.base_interval_us, GovernorFixedRefresh{}, LfcQuantumUs(input.fg_divisor)),
         pipeline, config, input.fg_divisor);
-    input.interval_us = ApplyLfc(GovernedIntervalUs(input.governor, input.base_interval_us), input.fg_divisor);
-    input.period_identity_us = VrrPeriodIdentityUs(target_fps, fg_divisor_raw);
+    // Key unified_pacer: no LFC multiple (the law owns the interval).
+    input.interval_us = config.unified_pacer
+        ? GovernedIntervalUs(input.governor, input.base_interval_us)
+        : ApplyLfc(GovernedIntervalUs(input.governor, input.base_interval_us), input.fg_divisor);
+    input.period_identity_us = VrrPeriodIdentityUs(vrr_target_fps, fg_divisor_raw);
     // The governor consumed this frame's reports before the end-of-frame
     // poll; keep that poll's samples for the next frame.
     pending_feedback.retain_for_governor = true;

@@ -612,6 +612,239 @@ void TestRuntime() {
     complete_gpu(); Poll(false);
     CHECK(retiring->ownership.load()==GpuTimestampOwnership::Free);
 
+    // gpu_start_probe (spec 8): the record belongs to the Present of its frame. A Present's end
+    // queues the queue (ArmStartProbe), the frame's RENDERSUBMIT_START arms it
+    // (GpuReadiness_ArmProbeForFrame, the pin moves), the first submission on the armed
+    // queue stamps the frame on the record (the ReShade queue object that
+    // GpuReadiness_OnExecuteCommandList takes is not faked: its two steps are replayed),
+    // and only the sample keyed to that frame takes it; an unkeyed sample takes the pending
+    // one. The probe fence is a fixture; the readiness fence and queue counters are restored.
+    {
+        FakeFence probe_fence;
+        const auto saved_signal=queue.last_signal;
+        const auto saved_signals=queue.signals;
+        registered.probe_fence=&probe_fence;
+        registered.probe_event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+        CHECK(registered.probe_event);
+        registered.probe_ready=true;
+        g_gpu_start_probe=true;
+        s_probe_dead=false;
+        auto first_submission = [&] {
+            QueueSlot* armed=s_probe_armed.exchange(nullptr);
+            CHECK(armed==&registered);
+            ProbeFirstSubmission(armed); // consumes the pin the arm held
+            probe_fence.Complete(registered.probe_next.load()-1);
+            GpuReadinessQueue_ProbeStamp(&registered);
+        };
+        auto keyed_span = [&](uint64_t frame,uint32_t epoch) {
+            auto probe_span=prepare();
+            probe_span.native_gate.mode=NativeGateMode::Native;probe_span.native_gate.status=NativeGateStatus::Native;
+            probe_span.native_gate.source_frame_id=frame;probe_span.native_gate.producer_epoch=epoch;
+            probe_span.native_gate.controller_generation=FrameTimeline_CurrentControllerGeneration();
+            probe_span.native_gate.prediction_epoch=NativeGate_PredictionEpoch();
+            probe_span.native_gate.swapchain_generation=generation;
+            return probe_span;
+        };
+        auto finish_sample = [&] { FinishScope(true); complete_gpu(); Poll(false); consume(GpuReadinessStatus::Completed); };
+
+        // The queue is queued at a Present's end, armed for frame 901 by its marker, and its
+        // first submission leaves the record with that frame.
+        auto armed_span=prepare();
+        (void)armed_span;
+        uint32_t pins=registered.scope_pins.load();
+        ArmStartProbe();
+        CHECK(s_probe_queue.load()==&registered && !s_probe_armed.load() && registered.scope_pins.load()==pins+1);
+        GpuReadiness_ArmProbeForFrame(3,901);
+        CHECK(!s_probe_queue.load() && s_probe_armed.load()==&registered && registered.scope_pins.load()==pins+1);
+        first_submission();
+        CHECK(!s_probe_armed.load() && registered.scope_pins.load()==pins && registered.probe_state.load()==1);
+        ProbeStamp record;
+        CHECK(registered.probe_record.Read(&record) && record.frame==901 && record.epoch==3 &&
+            record.value!=0 && record.submit_qpc>0);
+
+        // The Present of frame 902, and of frame 901 of another producer epoch, leave it pending.
+        const std::pair<uint64_t,uint32_t> wrong_frames[]={{902,3},{901,2}};
+        for(const auto& wrong:wrong_frames) {
+            auto probe_span=keyed_span(wrong.first,wrong.second);
+            { GpuReadinessCall call(&probe_span); call.Complete(true,false); }
+            CHECK(s_scope.sample && !s_scope.sample->probe_value && !s_scope.sample->probe_first_submit_qpc);
+            CHECK(registered.probe_state.load()==1);
+            finish_sample();
+            CHECK(!s_last_ready_record.gpu_first_submit_qpc && !s_last_ready_record.gpu_start_qpc);
+        }
+        // The Present of frame 901 takes the pair, once, with the sampler's stamp.
+        {
+            auto mine=keyed_span(901,3);
+            { GpuReadinessCall call(&mine); call.Complete(true,false); }
+            CHECK(s_scope.sample && s_scope.sample->probe_value==record.value &&
+                s_scope.sample->probe_first_submit_qpc==record.submit_qpc && registered.probe_state.load()==0);
+            finish_sample();
+            CHECK(s_last_ready_record.gpu_first_submit_qpc==record.submit_qpc &&
+                s_last_ready_record.gpu_start_qpc>=record.submit_qpc);
+            auto later=keyed_span(901,3);
+            { GpuReadinessCall call(&later); call.Complete(true,false); }
+            CHECK(s_scope.sample && !s_scope.sample->probe_value);
+            finish_sample();
+        }
+
+        // An unkeyed sample (frame generation observer, PCL markers) takes the pending record.
+        armed_span=prepare();
+        ArmStartProbe();
+        GpuReadiness_ArmProbeForFrame(3,903);
+        first_submission();
+        CHECK(registered.probe_state.load()==1);
+        {
+            auto unkeyed=prepare();
+            { GpuReadinessCall call(&unkeyed); call.Complete(true,false); }
+            CHECK(s_scope.sample && s_scope.sample->probe_value && s_scope.sample->probe_first_submit_qpc &&
+                registered.probe_state.load()==0);
+            finish_sample();
+            CHECK(s_last_ready_record.gpu_first_submit_qpc>0 && s_last_ready_record.gpu_start_qpc>0);
+        }
+
+        // Pins: a queued queue that is queued again keeps one pin; an arm without a frame
+        // gives it up; a retired queue frees a queued or an armed arm before the pin test;
+        // ProbeDisable and a faulted queue drop both pointers.
+        armed_span=prepare();
+        pins=registered.scope_pins.load();
+        ArmStartProbe();
+        ArmStartProbe();
+        CHECK(s_probe_queue.load()==&registered && registered.scope_pins.load()==pins+1);
+        GpuReadiness_ArmProbeForFrame(3,0);
+        CHECK(!s_probe_queue.load() && !s_probe_armed.load() && registered.scope_pins.load()==pins);
+        ArmStartProbe();
+        registered.retired=true;
+        ReclaimRetiredQueues();
+        registered.retired=false;
+        CHECK(!s_probe_queue.load() && registered.scope_pins.load()==pins);
+        ArmStartProbe();
+        GpuReadiness_ArmProbeForFrame(3,904);
+        CHECK(s_probe_armed.load()==&registered);
+        registered.retired=true;
+        ReclaimRetiredQueues();
+        registered.retired=false;
+        CHECK(!s_probe_armed.load() && registered.scope_pins.load()==pins);
+        ArmStartProbe();
+        GpuReadiness_ArmProbeForFrame(3,905);
+        ArmStartProbe();
+        CHECK(s_probe_armed.load()==&registered && s_probe_queue.load()==&registered &&
+            registered.scope_pins.load()==pins+2);
+        ProbeDisable("test",E_FAIL);
+        CHECK(!s_probe_queue.load() && !s_probe_armed.load() && registered.scope_pins.load()==pins);
+        s_probe_dead=false;
+        ArmStartProbe();
+        GpuReadiness_ArmProbeForFrame(3,906);
+        ArmStartProbe();
+        registered.faulted=true;
+        Poll(false);
+        registered.faulted=false;
+        CHECK(!s_probe_queue.load() && !s_probe_armed.load() && registered.scope_pins.load()==pins);
+
+        // An arm is immutable once claimed (spec 8, review P1): a submitter that claimed
+        // frame 910 and is paused before its Signal still stamps frame 910 when a later Present
+        // and marker (frame 911) come for the same queue; that arm is skipped, not written over,
+        // and its pin is given back.
+        registered.probe_state=0;
+        ArmStartProbe();
+        GpuReadiness_ArmProbeForFrame(3,910);
+        QueueSlot* claimed_queue=s_probe_armed.exchange(nullptr);
+        CHECK(claimed_queue==&registered);
+        ProbeStamp claimed;
+        CHECK(ClaimProbeArm(claimed_queue,&claimed) && claimed.frame==910 && claimed.epoch==3);
+        CHECK(registered.probe_arm_state.load()==kProbeClaimed && !ClaimProbeArm(claimed_queue,&claimed));
+        ArmStartProbe();
+        GpuReadiness_ArmProbeForFrame(3,911);
+        CHECK(!s_probe_queue.load() && !s_probe_armed.load() && registered.probe_arm_state.load()==kProbeClaimed);
+        CHECK(registered.scope_pins.load()==pins+1); // only the claimed arm's pin
+        ProbeStamp read_back;
+        CHECK(registered.probe_arm.Read(&read_back) && read_back.frame==910); // never overwritten
+        const uint32_t first_value=static_cast<uint32_t>(registered.probe_next.load());
+        SubmitProbe(claimed_queue,claimed);
+        FinishProbeArm(claimed_queue);
+        claimed_queue->scope_pins.fetch_sub(1);
+        probe_fence.Complete(registered.probe_next.load()-1);
+        ProbeStamp published;
+        CHECK(registered.probe_state.load()==1 && registered.probe_record.Read(&published));
+        CHECK(published.frame==910 && published.epoch==3 && published.value==first_value);
+        CHECK(registered.scope_pins.load()==pins && registered.probe_arm_state.load()==kProbeArmIdle);
+        // Nothing armed: no claim. An arm nobody claimed is replaced by the next frame's.
+        CHECK(!ClaimProbeArm(&registered,&claimed));
+        ArmStartProbe();
+        GpuReadiness_ArmProbeForFrame(3,912);
+        ArmStartProbe();
+        GpuReadiness_ArmProbeForFrame(3,913);
+        CHECK(s_probe_armed.load()==&registered && registered.scope_pins.load()==pins+1);
+        claimed_queue=s_probe_armed.exchange(nullptr);
+        CHECK(ClaimProbeArm(claimed_queue,&claimed) && claimed.frame==913);
+        FinishProbeArm(claimed_queue);
+        claimed_queue->scope_pins.fetch_sub(1);
+        CHECK(registered.scope_pins.load()==pins);
+        registered.probe_state=0;
+
+        // Concurrent marker and submitter on one queue: every record carries the frame its
+        // own claim copied, frames only advance, probe values are consecutive, and the pins
+        // balance.
+        {
+            std::atomic<bool> markers_done{false};
+            std::atomic<uint64_t> records{0};
+            uint64_t last_frame=0, last_value=registered.probe_next.load()-1;
+            std::thread submitter([&] {
+                while(!markers_done.load()) {
+                    QueueSlot* armed=s_probe_armed.exchange(nullptr);
+                    if(!armed) continue;
+                    ProbeStamp arm;
+                    if(ClaimProbeArm(armed,&arm)) {
+                        const uint64_t before=registered.probe_next.load();
+                        SubmitProbe(armed,arm);
+                        if(registered.probe_next.load()==before+1) {
+                            ProbeStamp record;
+                            CHECK(registered.probe_record.Read(&record));
+                            CHECK(record.frame==arm.frame && record.epoch==arm.epoch && record.value==before);
+                            CHECK(record.frame>last_frame && record.value==last_value+1);
+                            last_frame=record.frame;last_value=record.value;
+                            ++records;
+                            probe_fence.Complete(record.value);
+                        }
+                        FinishProbeArm(armed);
+                    }
+                    armed->scope_pins.fetch_sub(1);
+                }
+            });
+            std::thread markers([&] {
+                s_scope.queue=&registered; // thread-local: this thread's Present scope
+                s_scope.depth=0;
+                for(uint64_t frame=2000;frame<5000;++frame) {
+                    ArmStartProbe();
+                    GpuReadiness_ArmProbeForFrame(3,frame);
+                    if((frame&15)==0) std::this_thread::yield();
+                }
+                s_scope={};
+                markers_done=true;
+            });
+            markers.join();
+            submitter.join();
+            CHECK(records.load()>0);
+            DropAllProbeArms();
+            CHECK(registered.scope_pins.load()==pins && registered.probe_arm_state.load()!=kProbeClaimed &&
+                registered.probe_arm_state.load()!=kProbeArmWriting);
+            registered.probe_state=0;
+        }
+        // A key that is off queues nothing and arms nothing.
+        g_gpu_start_probe=false;
+        ArmStartProbe();
+        GpuReadiness_ArmProbeForFrame(3,907);
+        CHECK(!s_probe_queue.load() && !s_probe_armed.load() && registered.scope_pins.load()==pins);
+
+        FinishScope(false);
+        CHECK(registered.scope_pins.load()==1);
+        registered.probe_ready=false;
+        registered.probe_fence=nullptr;
+        CloseHandle(registered.probe_event);
+        registered.probe_event=nullptr;
+        queue.last_signal=saved_signal;
+        queue.signals=saved_signals;
+    }
+
     GpuReadinessQueue no_event;
     no_event.fence=&fence;
     const auto registration_count=fence.registrations;
@@ -704,6 +937,11 @@ uint32_t FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain) noexcept;
 bool GpuPresent_RequiresReadiness() noexcept {return s_gpu_runtime;}
 void GpuPresent_OnQueueDestroy(uint64_t) noexcept {}
 void GpuPresent_ObservePresentQueue(uint64_t,uint64_t) noexcept {}
+// gpu_queue_probe (the D3D12 side is not linked here; the key stays off in these tests).
+void GpuQueueProbe_OnPresentBoundary(void*,uint64_t,uint64_t,const PacingFrameKey&) noexcept {}
+void GpuQueueProbe_DependencyScopeBeginActive(void*) noexcept {}
+void GpuQueueProbe_DependencyScopeEndActive() noexcept {}
+void GpuQueueProbe_OnFgPresentSiteActive(void*, uint64_t, uint64_t) noexcept {}
 std::atomic<bool> g_fg_active{false}, g_fg_presenting{false};
 std::atomic<int> g_fg_mode{0};
 void Log_Write(LogLevel,const char*,...) {}

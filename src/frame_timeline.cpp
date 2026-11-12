@@ -35,6 +35,7 @@ namespace
     std::atomic<uint64_t> s_next_swapchain_generation{ 1 };
     std::atomic<uint64_t> s_present_registry_overflows{ 0 };
     std::atomic<uint64_t> s_present_registration_mismatches{ 0 };
+    std::atomic<uint64_t> s_present_generation_lock_failures{ 0 }; // diagnostics only
     std::atomic<uint64_t> s_unregistered_present_calls{ 0 };
     std::atomic<uint64_t> s_present_attempt_identity_failures{ 0 };
     std::shared_mutex s_present_registry_lock;
@@ -166,7 +167,10 @@ uint64_t FrameTimeline_GetPresentSwapchainGeneration(uint64_t native_swapchain) 
 {
     if (native_swapchain == 0) return 0;
     std::shared_lock<std::shared_mutex> registry(s_present_registry_lock,std::try_to_lock);
-    if(!registry.owns_lock())return 0;
+    if(!registry.owns_lock()) {
+        s_present_generation_lock_failures.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
     for (const ActivePresentSwapchainSlot& active_slot : s_active_present_swapchains) {
         const uint32_t index = active_slot.registry_slot_plus_one.load(std::memory_order_acquire);
         if (index == 0 || index > s_present_registry_size.load(std::memory_order_acquire)) continue;
@@ -269,6 +273,11 @@ void FrameTimeline_UnregisterPresentSwapchain(uint64_t native_swapchain) noexcep
 uint64_t FrameTimeline_PresentRegistryOverflows() noexcept
 {
     return s_present_registry_overflows.load(std::memory_order_relaxed);
+}
+
+uint64_t FrameTimeline_PresentGenerationLockFailures() noexcept
+{
+    return s_present_generation_lock_failures.load(std::memory_order_relaxed);
 }
 
 uint64_t FrameTimeline_PresentRegistrationMismatches() noexcept

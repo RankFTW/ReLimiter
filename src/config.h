@@ -106,6 +106,17 @@ struct Config {
     bool driver_limiter_hold = false; // developer A/B: off (default) | on; with source_placement=driver and gpu_paced_cadence ReLimiter holds the output on the cadence the driver's Sleep sets, without any start wait (64-bit)
     bool sleep_status_every_frame = false; // developer: off (default) | on; the driver's sleep status is polled at every Reflex Sleep instead of once per second (64-bit)
     bool gpu_start_probe = false; // developer experiment: off (default) | on; a Signal in front of the first submission of each frame measures when the GPU starts it (64-bit DX12, frames with a readiness sample)
+    bool gpu_queue_probe = kPacingGpuQueueProbeDefault; // developer measurement: on (default) | off; 64-bit DX12; per frame the presenting queue's submissions, empty time and margins (pacing CSV gq_*); nothing runs without a Direct3D 12 presenting queue
+    int gpu_queue_probe_source = kPacingGpuQueueProbeSourceDefault; // developer: 0–1, default 1; 1 lets the queue probe adopt the queue that carries the frame's rendering by following per-frame fence dependencies from the presenting queue (64-bit DX12; effective only with the probe on; 0 on Win32)
+    bool unified_pacer = kPacingUnifiedPacerDefault; // developer: on (default) | off; the unified pacer replaces the pacing mechanisms with one start law (64-bit only; forced off on Win32); false is the earlier pipeline
+    bool unified_every_frame_service = kPacingUnifiedEveryFrameServiceDefault; // developer: on (default) | off; with unified_pacer, on: the law's service estimate takes a sample from every reported frame, the GPU wait taken out; off: the earlier estimator, saturated pairs only (use with unified_queue_target_us=4000) (64-bit only; forced off on Win32)
+    double unified_queue_target_us = kPacingUnifiedQueueTargetDefaultUs; // developer: 0–20000 µs, default 2000 (the earlier law: 4000); with unified_pacer, the queue term's target (64-bit only; the default on Win32)
+    double unified_hold_share = kPacingUnifiedHoldShareDefault; // developer: 0–0.25, default 0 (off); with unified_pacer, the share of the measured completion spacing a used report refills the hold credit with at least (64-bit only; 0 on Win32)
+    bool unified_queue_law = kPacingUnifiedQueueLawDefault; // developer: on (default) | off; with unified_pacer, the queue law on the presenting queue probe's signals sets the GPU interval and the hold credit's refill; forces the probe on (64-bit DX12 only; off on Win32)
+    int unified_queue_rank = kPacingUnifiedQueueRankDefault; // developer: 1–8, default 2; with the queue law, the rank of the smallest queue margins that is used
+    int unified_queue_need_frames = kPacingUnifiedQueueNeedFramesDefault; // developer: 1–16, default 4; with the queue law, how many of the newest valid records the base follows the GPU's need over
+    int unified_queue_upstream = kPacingUnifiedQueueUpstreamDefault; // developer: 0–1, default 0 (off); 1 stamps the game's render markers locally as telemetry, no decision reads them (64-bit only; 0 on Win32); a saved 2 or 3 loads as 1
+    int unified_queue_allow_us = kPacingUnifiedQueueAllowDefaultUs; // developer: 0–20000 µs, default 4000; with the queue law, the queue margin M the law allows
 
     // Reflex Injection
     bool reflex_inject = false;         // Synthesize Reflex markers for non-Reflex games
@@ -174,6 +185,11 @@ struct Config {
     // for DLSS quality, resolution, and feature detection on the OSD.
     // Disable if experiencing crashes related to DLSS pipeline.
     bool dlss_info_hooks = true;
+
+    // Compatibility switch, not a tuning option: the freezing MinHook calls run on one installer thread that other
+    // engines cannot suspend (hooks.h). false runs every call on the thread that asks, as before. Read once at
+    // initialisation, before the thread is created (restart required); 64- and 32-bit.
+    bool hook_installer_thread = true;
 };
 
 extern Config g_config;
@@ -293,7 +309,9 @@ void ApplyConfig();
 // Apply only the pacing pipeline fields (smoothing, adaptive_cap, output_rung,
 // source_placement, gpu_present_gate_probes, stall injector,
 // marker_forward_order, reflex_sleep_bypass, bypass_low_latency_off, driver_low_latency_off,
-// sleep_status_every_frame, gpu_start_probe) to the resolver (which carries
+// sleep_status_every_frame, gpu_start_probe, gpu_queue_probe, unified_pacer, unified_every_frame_service,
+// unified_queue_target_us, unified_hold_share, unified_queue_law, unified_queue_rank,
+// unified_queue_allow_us) to the resolver (which carries
 // adaptive_cap to the period governor) and the NvAPI hooks. Part of
 // ApplyConfig; the OSD calls it after editing those fields.
 void Config_ApplyPacingPipeline();

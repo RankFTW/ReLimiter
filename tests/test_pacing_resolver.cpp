@@ -155,7 +155,20 @@ namespace
             left.pre_sleep_precise == right.pre_sleep_precise &&
             left.driver_limiter_hold == right.driver_limiter_hold &&
             left.stall_inject_ms == right.stall_inject_ms &&
-            left.stall_inject_period_s == right.stall_inject_period_s;
+            left.stall_inject_period_s == right.stall_inject_period_s &&
+            // Win32 clamps the every-frame key false (the unified pacer is 64-bit only), whereas the
+            // initial publication and the defaults carry true: compared on 64-bit only.
+            (sizeof(void*) != 8 || left.unified_every_frame_service == right.unified_every_frame_service) &&
+            left.unified_queue_target_us == right.unified_queue_target_us &&
+            left.unified_hold_share == right.unified_hold_share &&
+            // Win32 forces the law off and the probe source to 0, whereas the defaults carry on and 1:
+            // compared on 64-bit only.
+            (sizeof(void*) != 8 || left.unified_queue_law == right.unified_queue_law) &&
+            left.unified_queue_rank == right.unified_queue_rank &&
+            left.unified_queue_need_frames == right.unified_queue_need_frames &&
+            (sizeof(void*) != 8 || left.gpu_queue_probe_source == right.gpu_queue_probe_source) &&
+            left.unified_queue_upstream == right.unified_queue_upstream &&
+            left.unified_queue_allow_us == right.unified_queue_allow_us;
     }
 
     // ── Initial publication (must run first) ──
@@ -900,6 +913,102 @@ namespace
               rung == static_cast<uint32_t>(PacingRung::SourceOnly));
     }
 
+    // ── Developer key unified_pacer ──
+
+    // 64-bit only: the clamp forces the replaced mechanisms off, the placement follows the
+    // Sleep (never the driver limiter), the performance demotions are bypassed and the
+    // physical blockers stay.
+    void TestUnifiedPacerKey()
+    {
+        PacingRuntimeState sleeping = ActiveVrr();
+        sleeping.pre_sleep_available = true;
+        PacingRuntimeState fg_sleeping = ActiveFg();
+        fg_sleeping.pre_sleep_available = true;
+        PacingPipelineConfig key{};
+        key.unified_pacer = true;
+        if (sizeof(void*) != 8) {
+            CHECK(!PacingPipeline_ClampConfig(key).unified_pacer);
+            CHECK_RESULT(Resolve(key, QualifiedDx12(), sleeping), Vrr, PreSleep, GpuQueueWait, None);
+            return;
+        }
+        CHECK(!PacingPipelineConfig{}.unified_pacer);
+
+        PacingPipelineConfig user = key;
+        user.smoothing = PacingSmoothing::Off;
+        user.rung_override = PacingRungOverride::Native;
+        user.adaptive_cap = true;
+        user.adaptive_cap_hold_room = true;
+        user.gpu_paced_cadence = true;
+        user.driver_limiter_hold = true;
+        user.pre_sleep_precise = true;
+        user.gpu_wait_interleave_s = 5.0;
+        user.stall_inject_ms = 100.0;
+        user.lead_coverage = PacingLeadCoverage::Q50;
+        user.fg_late_spacing = false;
+        user.lead_spike_floor = false;
+        user.gpu_queue_wait_render_queue = PacingRenderQueue::Remove;
+        user.placement_override = PacingPlacementOverride::Driver;
+        const PacingPipelineConfig forced = PacingPipeline_ClampConfig(user);
+        CHECK(forced.unified_pacer);
+        CHECK(forced.smoothing == PacingSmoothing::On && forced.rung_override == PacingRungOverride::Auto);
+        CHECK(!forced.adaptive_cap && !forced.adaptive_cap_hold_room && !forced.gpu_paced_cadence);
+        CHECK(!forced.driver_limiter_hold && !forced.pre_sleep_precise);
+        CHECK(forced.gpu_wait_interleave_s == 0.0 && forced.stall_inject_ms == 0.0);
+        CHECK(forced.lead_coverage == PacingLeadCoverage::Q99 && forced.fg_late_spacing && forced.lead_spike_floor);
+        CHECK(forced.gpu_queue_wait_render_queue == PacingRenderQueue::Keep);
+        CHECK(forced.placement_override == PacingPlacementOverride::Driver); // ignored, not forced
+        // The same values without the key are untouched.
+        user.unified_pacer = false;
+        CHECK(PacingPipeline_ClampConfig(user).smoothing == PacingSmoothing::Off);
+
+        // Placement follows the Sleep; the driver limiter is never chosen.
+        user.unified_pacer = true;
+        CHECK_RESULT(Resolve(user, QualifiedDx12(), sleeping), Vrr, Unified, GpuQueueWait, None);
+        CHECK_RESULT(Resolve(key, QualifiedDx12(), sleeping), Vrr, Unified, GpuQueueWait, None);
+        CHECK_RESULT(Resolve(key, QualifiedDx12(), ActiveVrr()), Vrr, Marker, GpuQueueWait, None);
+        CHECK_RESULT(Resolve(key, QualifiedDx12(), fg_sleeping), Vrr, Unified, FgInputWait, None);
+        CHECK(std::strcmp(PacingSourcePlacement_Text(PacingSourcePlacement::Unified), "unified") == 0);
+        CHECK(!PacingSourcePlacement_WaitsAtMarker(PacingSourcePlacement::Unified));
+
+        // The performance demotions are bypassed: the GPU rung stays with reason none.
+        PacingRuntimeState overloaded = sleeping;
+        overloaded.hold_overloaded = true;
+        CHECK_RESULT(Resolve(key, QualifiedDx12(), overloaded), Vrr, Unified, GpuQueueWait, None);
+        PacingRuntimeState paused = sleeping;
+        paused.gpu_queue_wait_off = true;
+        CHECK_RESULT(Resolve(key, QualifiedDx12(), paused), Vrr, Unified, GpuQueueWait, None);
+        PacingRuntimeState fg_overloaded = fg_sleeping;
+        fg_overloaded.hold_overloaded = true;
+        CHECK_RESULT(Resolve(key, QualifiedDx12(), fg_overloaded), Vrr, Unified, FgInputWait, None);
+        // Key off: the same runtime still demotes (unchanged).
+        CHECK_RESULT(Resolve(PacingPipelineConfig{}, QualifiedDx12(), overloaded), Vrr, PreSleep, SourceOnly, Infeasible);
+
+        // The physical blockers stay.
+        PacingCapabilities no_queue = QualifiedDx12();
+        no_queue.gpu_queue_ready = false;
+        CHECK_RESULT(Resolve(key, no_queue, sleeping), Vrr, Unified, MarkerHold, NoGpuQueue);
+        PacingCapabilities no_native = QualifiedDx12();
+        no_native.native_route_qualified = false;
+        CHECK_RESULT(Resolve(key, no_native, sleeping), Vrr, Unified, MarkerHold, NoNativeRoute);
+        PacingCapabilities no_fg_route = QualifiedDx12();
+        no_fg_route.fg_input_route_ready = false;
+        CHECK_RESULT(Resolve(key, no_fg_route, fg_sleeping), Vrr, Unified, SourceOnly, FgUnqualified);
+        PacingCapabilities win32 = QualifiedDx12();
+        win32.x64 = false;
+        CHECK_RESULT(Resolve(key, win32, sleeping), Vrr, Unified, MarkerHold, Architecture);
+        PacingRuntimeState fixed = sleeping;
+        fixed.vrr = false;
+        CHECK_RESULT(Resolve(key, QualifiedDx12(), fixed), Fixed, Unified, MarkerHold, FixedRefresh);
+        // Idle and passthrough rules; a present route keeps its placement.
+        PacingRuntimeState idle = sleeping;
+        idle.idle_cap = true;
+        CHECK_RESULT(Resolve(key, QualifiedDx12(), idle), Idle, Unified, SourceOnly, IdleCap);
+        PacingRuntimeState uncapped = sleeping;
+        uncapped.uncapped = true;
+        CHECK_RESULT(Resolve(key, QualifiedDx12(), uncapped), Off, None, SourceOnly, Passthrough);
+        CHECK_RESULT(Resolve(key, PresentBased(), sleeping), Vrr, Present, SourceOnly, PresentRoute);
+    }
+
     // The rung a Source record shows for its pipeline (the telemetry's
     // pipeline_change), from records shaped like the scheduler's. Under the
     // Reflex driver limiter every record is unplanned; its pipeline must still
@@ -1071,6 +1180,207 @@ namespace
         }
         CHECK(PacingPipelineConfig{}.gpu_wait_interleave_s == 0.0);
         PacingPipeline_SetConfig(PacingPipelineConfig{});
+    }
+
+    // Developer keys unified_every_frame_service and unified_queue_target_us: defaults (on, 2000;
+    // the earlier law is off with 4000), the clamp (non-finite = the default, otherwise [0, 20000];
+    // Win32 yields false and 2000), the key unified_pacer does not gate them, and the publish round trip.
+    void TestUnifiedLawOptionKeys()
+    {
+        const PacingPipelineConfig defaults{};
+        CHECK(defaults.unified_every_frame_service && kPacingUnifiedEveryFrameServiceDefault);
+        CHECK(defaults.unified_queue_target_us == 2000.0 &&
+              defaults.unified_queue_target_us == kPacingUnifiedQueueTargetDefaultUs);
+        CHECK(kPacingUnifiedQueueTargetMaxUs == 20000.0);
+
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        const double infinity = std::numeric_limits<double>::infinity();
+        const bool wide = sizeof(void*) == 8;
+        struct Case { double value; double expected; };
+        for (const Case& test : { Case{ 0.0, 0.0 }, Case{ 1500.0, 1500.0 }, Case{ 4000.0, 4000.0 },
+                Case{ 20000.0, 20000.0 }, Case{ 20000.5, 20000.0 }, Case{ 1e12, 20000.0 }, Case{ -0.5, 0.0 },
+                Case{ -1e9, 0.0 }, Case{ nan, 2000.0 }, Case{ infinity, 2000.0 }, Case{ -infinity, 2000.0 } }) {
+            PacingPipelineConfig config{};
+            config.unified_queue_target_us = test.value;
+            // Independent of the unified_pacer key: the clamp reads only its own field.
+            for (const bool key : { false, true }) {
+                config.unified_pacer = key;
+                const PacingPipelineConfig clamped = PacingPipeline_ClampConfig(config);
+                CHECK(clamped.unified_queue_target_us == (wide ? test.expected : 2000.0));
+            }
+            PacingPipeline_SetConfig(config);
+            CHECK(PacingPipeline_GetConfig().unified_queue_target_us == (wide ? test.expected : 2000.0));
+        }
+
+        // The default is on: 64-bit keeps it (the key unified_pacer does not gate it), Win32 forces false.
+        PacingPipelineConfig flags{};
+        CHECK(PacingPipeline_ClampConfig(flags).unified_every_frame_service == wide);
+        flags.unified_pacer = true;
+        CHECK(PacingPipeline_ClampConfig(flags).unified_every_frame_service == wide);
+        PacingPipeline_SetConfig(flags);
+        CHECK(PacingPipeline_GetConfig().unified_every_frame_service == wide);
+        // The earlier estimator, explicit, is kept on both.
+        flags.unified_every_frame_service = false;
+        CHECK(!PacingPipeline_ClampConfig(flags).unified_every_frame_service);
+        PacingPipeline_SetConfig(flags);
+        CHECK(!PacingPipeline_GetConfig().unified_every_frame_service);
+
+        // Neither option changes a resolution (the placement and rung come from the key alone).
+        PacingPipelineConfig plain{};
+        plain.unified_pacer = true;
+        PacingPipelineConfig tuned = plain;
+        tuned.unified_every_frame_service = false;
+        tuned.unified_queue_target_us = 9000.0;
+        PacingRuntimeState sleeping = ActiveVrr();
+        sleeping.pre_sleep_available = true;
+        CHECK(PacingPipeline_SameResult(Resolve(plain, QualifiedDx12(), sleeping),
+                                        Resolve(tuned, QualifiedDx12(), sleeping)));
+        PacingPipeline_SetConfig(PacingPipelineConfig{});
+        CHECK(SameConfig(PacingPipeline_GetConfig(), PacingPipelineConfig{}));
+    }
+
+    // Developer key unified_hold_share: default 0, the clamp (non-finite = 0, otherwise [0, 0.25]; 0
+    // on Win32), independent of the key unified_pacer, and the publish round trip.
+    void TestUnifiedHoldShareKey()
+    {
+        CHECK(PacingPipelineConfig{}.unified_hold_share == 0.0 && kPacingUnifiedHoldShareDefault == 0.0);
+        CHECK(kPacingUnifiedHoldShareMax == 0.25);
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        const double infinity = std::numeric_limits<double>::infinity();
+        const bool wide = sizeof(void*) == 8;
+        struct Case { double value; double expected; };
+        for (const Case& test : { Case{ 0.0, 0.0 }, Case{ 0.1, 0.1 }, Case{ 0.25, 0.25 }, Case{ 0.5, 0.25 },
+                Case{ 1e12, 0.25 }, Case{ -0.25, 0.0 }, Case{ nan, 0.0 }, Case{ infinity, 0.0 },
+                Case{ -infinity, 0.0 } }) {
+            PacingPipelineConfig config{};
+            config.unified_hold_share = test.value;
+            for (const bool key : { false, true }) {
+                config.unified_pacer = key;
+                CHECK(PacingPipeline_ClampConfig(config).unified_hold_share == (wide ? test.expected : 0.0));
+            }
+            PacingPipeline_SetConfig(config);
+            CHECK(PacingPipeline_GetConfig().unified_hold_share == (wide ? test.expected : 0.0));
+        }
+        PacingPipeline_SetConfig(PacingPipelineConfig{});
+        CHECK(PacingPipeline_GetConfig().unified_hold_share == 0.0);
+    }
+
+    // Developer keys unified_queue_law, unified_queue_rank, unified_queue_allow_us: defaults (on, 2,
+    // 4000), the clamp (rank 1..8, allowance 0..20000; the law off on Win32), independence from
+    // the key unified_pacer, and the publish round trip.
+    void TestUnifiedQueueLawKeys()
+    {
+        const PacingPipelineConfig defaults{};
+        CHECK(defaults.unified_queue_law && kPacingUnifiedQueueLawDefault && defaults.unified_queue_rank == 2 &&
+              defaults.unified_queue_allow_us == 4000);
+        CHECK(PacingPipeline_ClampConfig(defaults).unified_queue_law == (sizeof(void*) == 8));
+        CHECK(kPacingUnifiedQueueRankMax == 8 && kPacingUnifiedQueueAllowMaxUs == 20000);
+        const bool wide = sizeof(void*) == 8;
+        struct Case { int value; int expected; };
+        for (const Case& test : { Case{ 1, 1 }, Case{ 2, 2 }, Case{ 8, 8 }, Case{ 9, 8 }, Case{ 1000000, 8 },
+                Case{ 0, 1 }, Case{ -5, 1 } }) {
+            PacingPipelineConfig config{};
+            config.unified_queue_rank = test.value;
+            for (const bool key : { false, true }) {
+                config.unified_pacer = key;
+                CHECK(PacingPipeline_ClampConfig(config).unified_queue_rank == test.expected);
+            }
+            PacingPipeline_SetConfig(config);
+            CHECK(PacingPipeline_GetConfig().unified_queue_rank == test.expected);
+        }
+        for (const Case& test : { Case{ 0, 0 }, Case{ 4000, 4000 }, Case{ 20000, 20000 }, Case{ 20001, 20000 },
+                Case{ 1 << 30, 20000 }, Case{ -1, 0 }, Case{ -100000, 0 } }) {
+            PacingPipelineConfig config{};
+            config.unified_queue_allow_us = test.value;
+            CHECK(PacingPipeline_ClampConfig(config).unified_queue_allow_us == test.expected);
+            PacingPipeline_SetConfig(config);
+            CHECK(PacingPipeline_GetConfig().unified_queue_allow_us == test.expected);
+        }
+        // The law is forced off on Win32 and kept on 64-bit, with or without the key unified_pacer.
+        PacingPipelineConfig law{};
+        law.unified_queue_law = true;
+        for (const bool key : { false, true }) {
+            law.unified_pacer = key;
+            CHECK(PacingPipeline_ClampConfig(law).unified_queue_law == wide);
+        }
+        PacingPipeline_SetConfig(law);
+        CHECK(PacingPipeline_GetConfig().unified_queue_law == wide);
+        law.unified_queue_law = false;
+        PacingPipeline_SetConfig(law);
+        CHECK(!PacingPipeline_GetConfig().unified_queue_law);
+        PacingPipeline_SetConfig(PacingPipelineConfig{});
+        CHECK(SameConfig(PacingPipeline_GetConfig(), PacingPipelineConfig{}));
+    }
+
+    // Developer key unified_queue_need_frames: default 4, clamp 1..16 (a number with no effect without
+    // the law, so not forced on Win32), independence from unified_pacer and the publish round trip.
+    void TestUnifiedQueueNeedFramesKey()
+    {
+        CHECK(PacingPipelineConfig{}.unified_queue_need_frames == 4 && kPacingUnifiedQueueNeedFramesDefault == 4);
+        CHECK(kPacingUnifiedQueueNeedFramesMax == 16);
+        struct Case { int value; int expected; };
+        for (const Case& test : { Case{ 1, 1 }, Case{ 4, 4 }, Case{ 16, 16 }, Case{ 17, 16 }, Case{ 1 << 30, 16 },
+                Case{ 0, 1 }, Case{ -9, 1 } }) {
+            PacingPipelineConfig config{};
+            config.unified_queue_need_frames = test.value;
+            for (const bool key : { false, true }) {
+                config.unified_pacer = key;
+                CHECK(PacingPipeline_ClampConfig(config).unified_queue_need_frames == test.expected);
+            }
+            PacingPipeline_SetConfig(config);
+            CHECK(PacingPipeline_GetConfig().unified_queue_need_frames == test.expected);
+        }
+        PacingPipeline_SetConfig(PacingPipelineConfig{});
+        CHECK(SameConfig(PacingPipeline_GetConfig(), PacingPipelineConfig{}));
+    }
+
+    // Developer key unified_queue_upstream: default 0, clamp 0..1 (the removed modes 2 and 3 clamp to 1),
+    // forced 0 on Win32, independent of the key unified_pacer and the law, and the publish round trip.
+    void TestUnifiedQueueUpstreamKey()
+    {
+        CHECK(PacingPipelineConfig{}.unified_queue_upstream == 0 && kPacingUnifiedQueueUpstreamDefault == 0);
+        CHECK(kPacingUnifiedQueueUpstreamMax == 1);
+        const bool wide = sizeof(void*) == 8;
+        struct Case { int value; int expected; };
+        for (const Case& test : { Case{ 0, 0 }, Case{ 1, 1 }, Case{ 2, 1 }, Case{ 3, 1 }, Case{ 4, 1 },
+                Case{ 1 << 30, 1 }, Case{ -1, 0 }, Case{ -1000, 0 } }) {
+            PacingPipelineConfig config{};
+            config.unified_queue_upstream = test.value;
+            for (const bool key : { false, true }) {
+                config.unified_pacer = key;
+                CHECK(PacingPipeline_ClampConfig(config).unified_queue_upstream == (wide ? test.expected : 0));
+            }
+            PacingPipeline_SetConfig(config);
+            CHECK(PacingPipeline_GetConfig().unified_queue_upstream == (wide ? test.expected : 0));
+        }
+        PacingPipeline_SetConfig(PacingPipelineConfig{});
+        CHECK(SameConfig(PacingPipeline_GetConfig(), PacingPipelineConfig{}));
+    }
+
+    // Developer key gpu_queue_probe_source: default 1, clamp 0..1, forced 0 on Win32, independent of
+    // the key unified_pacer and the law, and the publish round trip.
+    void TestGpuQueueProbeSourceKey()
+    {
+        CHECK(PacingPipelineConfig{}.gpu_queue_probe_source == 1 && kPacingGpuQueueProbeSourceDefault == 1);
+        CHECK(kPacingGpuQueueProbeDefault);
+        CHECK(PacingPipeline_ClampConfig(PacingPipelineConfig{}).gpu_queue_probe_source ==
+              (sizeof(void*) == 8 ? 1 : 0));
+        CHECK(kPacingGpuQueueProbeSourceMax == 1);
+        const bool wide = sizeof(void*) == 8;
+        struct Case { int value; int expected; };
+        for (const Case& test : { Case{ 0, 0 }, Case{ 1, 1 }, Case{ 2, 1 }, Case{ 1 << 30, 1 },
+                Case{ -1, 0 }, Case{ -1000, 0 } }) {
+            PacingPipelineConfig config{};
+            config.gpu_queue_probe_source = test.value;
+            for (const bool key : { false, true }) {
+                config.unified_pacer = key;
+                CHECK(PacingPipeline_ClampConfig(config).gpu_queue_probe_source == (wide ? test.expected : 0));
+            }
+            PacingPipeline_SetConfig(config);
+            CHECK(PacingPipeline_GetConfig().gpu_queue_probe_source == (wide ? test.expected : 0));
+        }
+        PacingPipeline_SetConfig(PacingPipelineConfig{});
+        CHECK(SameConfig(PacingPipeline_GetConfig(), PacingPipelineConfig{}));
     }
 
     // ── Text ──
@@ -1554,8 +1864,15 @@ int main()
     TestCapabilities();
     TestSourcePlacement();
     TestDriverLimiterHold();
+    TestUnifiedPacerKey();
     TestPipelineRungOfRecords();
     TestConfigClamp();
+    TestUnifiedLawOptionKeys();
+    TestUnifiedHoldShareKey();
+    TestUnifiedQueueLawKeys();
+    TestUnifiedQueueNeedFramesKey();
+    TestUnifiedQueueUpstreamKey();
+    TestGpuQueueProbeSourceKey();
     TestSmoothingText();
     TestRungOverrideText();
     TestLabels();

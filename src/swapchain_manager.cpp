@@ -15,6 +15,7 @@
 #include "streamline_hooks.h"
 #include "wake_guard.h"
 #include "logger.h"
+#include "vsync_control.h"
 #include <dxgi.h>
 #include <array>
 #include <atomic>
@@ -25,6 +26,14 @@
 
 static std::atomic<ActiveAPI>  s_active_api{ActiveAPI::None};
 static std::atomic<uint64_t>   s_native_handle{0};      // IDXGISwapChain* or VkSwapchainKHR
+// The native handle changes only here: one INFO line per change (the native route's identity guard
+// compares the Present hooks' `self` with it).
+static void PublishNativeHandle(uint64_t native, const char* why) noexcept {
+    const uint64_t previous = s_native_handle.exchange(native, std::memory_order_relaxed);
+    if (previous != native)
+        LOG_INFO("SwapMgr: native swapchain handle 0x%llX -> 0x%llX (%s)",
+                 static_cast<unsigned long long>(previous), static_cast<unsigned long long>(native), why);
+}
 static std::atomic<uint64_t>   s_presenting_device_native{0}; // owned IUnknown*
 static std::atomic<uint64_t>   s_presenting_device_sequence{0};
 static std::atomic<uint32_t>   s_presenting_device_readers{0};
@@ -328,7 +337,9 @@ static void ActivateSwapchain(reshade::api::swapchain* sc, bool resize) {
             native, DetectPresentTimelineApi(dev));
     }
     s_active_api.store(api, std::memory_order_relaxed);
-    s_native_handle.store(native, std::memory_order_relaxed);
+    PublishNativeHandle(native, "init");
+    // The native object's own Present entry: a private copy of its vtable (see vtable_copy.h).
+    if (api == ActiveAPI::DX11 || api == ActiveAPI::DX12) VSync_OnNativeSelected(native);
     s_owner_device_native.store(dev->get_native(), std::memory_order_relaxed);
     if ((api == ActiveAPI::DX11 || api == ActiveAPI::DX12) && dev != nullptr) {
         PublishPresentingDevice(
@@ -404,7 +415,7 @@ static void DeactivateSwapchain(bool resize) {
     if (resize) {
         // Resize: preserve API, invalidate handle only (Req 1.3)
         s_valid.store(false, std::memory_order_release);
-        s_native_handle.store(0, std::memory_order_relaxed);
+        PublishNativeHandle(0, "resize");
         LOG_INFO("SwapMgr: destroy_swapchain (resize=true, api preserved=%d)",
                  static_cast<int>(current_api));
         NotifySubsystemsDestroy(/*full_teardown=*/false, current_api);
@@ -412,7 +423,7 @@ static void DeactivateSwapchain(bool resize) {
         // Full teardown is reached only for the selected native identity, or
         // an explicit presenter handoff. Also reset same-API launcher state.
         s_valid.store(false, std::memory_order_release);
-        s_native_handle.store(0, std::memory_order_relaxed);
+        PublishNativeHandle(0, "full teardown");
         PublishPresentingDevice(nullptr);
         s_owner_device_native.store(0, std::memory_order_relaxed);
         s_vk_device.store(0, std::memory_order_relaxed);
@@ -451,6 +462,8 @@ void SwapMgr_OnDestroySwapchain(reshade::api::swapchain* sc, bool resize) {
     const SwapchainSelectionIdentity identity{sc->get_native(), static_cast<uint8_t>(api)};
     if (api == ActiveAPI::DX11 || api == ActiveAPI::DX12) {
         FrameTimeline_UnregisterPresentSwapchain(identity.native);
+        // The vptr goes back only if it still equals our copy (every DXGI swapchain with a copy, selected or not).
+        VSync_OnNativeDestroyed(identity.native);
     }
     // Exact native handle AND API, regardless of whether devices are shared.
     if (!s_selection.Destroy(identity)) return;

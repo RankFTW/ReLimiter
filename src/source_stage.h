@@ -16,6 +16,7 @@
 #include "pacing_core_types.h"
 #include "pacing_resolver.h"
 #include "pacing_telemetry_types.h"
+#include "unified_pacer.h"
 
 #include <array>
 #include <cstddef>
@@ -140,6 +141,60 @@ struct GpuPacedRhythmRelease {
 
 // ── Planned frame ──
 
+// ── Unified pacer (developer key unified_pacer; unified_pacer.h) ──
+
+// The marker-site start wait of the unified branch runs in chunks of at most this long (the
+// production waiter and PreSleepWaitUntil reject waits over 500 ms; the law accepts any I).
+constexpr double kUnifiedMarkerWaitChunkUs = 250'000.0;
+
+// The record's flags come from the start (captured at the Sleep's Reserve, or the marker's own
+// plan) while the service sample columns come from the later Status(n) of the plan. The
+// kUpCorrectionRefused bit describes that sample, so it is taken from the same status; every
+// other flag stays as the start made it.
+inline uint32_t SourceStage_ApplyCorrectionRefusal(uint32_t flags, const UnifiedStatus& status) noexcept
+{
+    return (flags & ~static_cast<uint32_t>(kUpCorrectionRefused)) |
+        (status.flags & static_cast<uint32_t>(kUpCorrectionRefused));
+}
+
+// The frames the unified branch plans: with the key on and the stage enabled, every planned
+// frame of the marker route (mode Vrr, Fixed or Idle) whose source placement is Unified (the
+// Sleep hook reserved the start) or Marker (the key-on fallback when the game calls no Reflex
+// Sleep: the law plans T(n) at the marker). Passthrough (mode Off), the present route and
+// every other placement keep their own branch.
+inline bool SourceStage_UnifiedPlans(const PacingPipelineSnapshot& pipeline, bool key, bool stage_enabled) noexcept
+{
+    return key && stage_enabled && pipeline.mode != PacingTimingMode::Off &&
+        pipeline.route != PacingRoute::PresentBased &&
+        (pipeline.placement == PacingSourcePlacement::Unified ||
+         pipeline.placement == PacingSourcePlacement::Marker);
+}
+
+// What the owner gives the unified branch of RunPlannedFrame. `active` false (the
+// key off, or a frame the branch does not plan: SourceStage_UnifiedPlans) leaves the
+// frame to the existing branch.
+struct SourceStageUnifiedRequest {
+    bool active = false;
+    UnifiedIntervalTerms terms{};          // the interval terms of this frame (marker-site path)
+    int raw_fg_divisor = 1;                // N, the raw frame generation factor
+    std::atomic<uint64_t>* mailbox = nullptr; // the Sleep hook's completion word (consumed once)
+};
+
+// What the unified branch resolved and committed, for the source record.
+struct SourceStageUnifiedFrame {
+    bool valid = false;
+    UnifiedResolutionKind kind = UnifiedResolutionKind::MarkerPath;
+    UnifiedStart start{};      // T(n), I(n), the reservation's arrival, resolution/binding/reset flags
+    uint32_t flags = 0;        // start.flags | kUpLate (a late release)
+    double delta_us = 0.0;     // (R − B) in µs
+    int64_t anchor_qpc = 0;    // B(n)
+    UnifiedStatus status{};    // the law's state at this plan
+    // The law's hold grant at this plan (UnifiedPacer::GrantHold): the report stream was live, and
+    // the signed credit in µs (negative = debt; the plan's advance is -credit). For telemetry.
+    bool hold_live = false;
+    double hold_credit_us = 0.0;
+};
+
 struct SourceStageRequest {
     PacingPlanKey key{};
     PacingSourceMarker marker = PacingSourceMarker::Unknown;
@@ -260,6 +315,8 @@ struct SourceStageRequest {
     uint32_t precise_grid_epoch = 0;
     double precise_interval_us = 0.0;
     PacingTimingMode precise_mode = PacingTimingMode::Off;
+    // Developer key unified_pacer: the unified branch (above).
+    SourceStageUnifiedRequest unified{};
 };
 
 // The earliest release the source wait runs to: the earliest release, or the
@@ -311,6 +368,8 @@ struct SourceStageFrame {
     // ticks (render coupling, lead_controller.h; 0 none).
     double early_lead_us = 0.0;
     int64_t floor_pull_ticks = 0;
+    // Developer key unified_pacer: set by the unified branch.
+    SourceStageUnifiedFrame unified{};
 };
 
 // One OutputLate epoch of a drain, attributed to the frame whose output it
@@ -359,6 +418,42 @@ public:
     {
         lead_.RestartRung(rung, carried_lead_us, carried_fg_divisor);
     }
+
+    // ── Developer key unified_pacer ──
+    // The law is owned here: stage events and reports feed it only while enabled
+    // (the key on), so the key-off stage is untouched. SetUnifiedEnabled(false)
+    // also resets it.
+    void SetUnifiedEnabled(bool enabled, uint32_t controller_generation) noexcept;
+    bool UnifiedEnabled() const noexcept { return unified_enabled_; }
+    // Resets the law (spec 2.6) at the grid's next index.
+    void ResetUnified(uint32_t controller_generation) noexcept;
+    // Developer keys unified_every_frame_service / unified_queue_target_us (the invocation's
+    // configuration snapshot): forwarded to the law only while unified is enabled, so the key-off
+    // stage keeps the defaults. Turning the key off sets the law's options back to the defaults;
+    // a toggle off then on starts with the snapshot's values at the first keyed invocation.
+    // hold_share: key unified_hold_share (0 = off, the default; [0, 0.25]).
+    // queue_law, queue_rank, queue_allow_us, queue_need_frames: keys unified_queue_law,
+    // unified_queue_rank, unified_queue_allow_us, unified_queue_need_frames (the omitted
+    // arguments: law off, 2, 4000, 4; the configuration's defaults arrive through the snapshot; the law clamps the numbers).
+    void SetUnifiedOptions(bool every_frame_service, double queue_target_us,
+        double hold_share = kPacingUnifiedHoldShareDefault,
+        bool queue_law = false,
+        int queue_rank = kPacingUnifiedQueueRankDefault,
+        int queue_allow_us = kPacingUnifiedQueueAllowDefaultUs,
+        int queue_need_frames = kPacingUnifiedQueueNeedFramesDefault) noexcept;
+    // A finished frame of the presenting queue probe (the scheduler drains the feed, in arrival
+    // order, before it plans): forwarded to the law while unified is enabled and the key
+    // unified_queue_law is on (the law ignores it otherwise).
+    void OnQueueRecord(const PacingGpuQueueRecord& record) noexcept;
+    // The probe's adopted queue was destroyed (the feed's retired session): the law's session is retired.
+    void RetireQueueSession(uint64_t session) noexcept;
+    // A Reflex report's queue wait (ReflexFrameTimeSample::queue_wait_us, signed), its GPU
+    // active render time (gpuActiveRenderTimeUs, <= 0 = unknown): the hold credit's refill, and
+    // its frame generation time (aiFrameTimeUs, <= 0 = none): the bound of the hold share.
+    void OnUnifiedReport(PacingIdentityDomain domain, uint32_t producer_epoch, uint64_t frame_id,
+        double queue_wait_us, double gpu_active_us = 0.0, double ai_frame_us = 0.0) noexcept;
+    UnifiedPacer& Unified() noexcept { return unified_; }
+    const UnifiedPacer& Unified() const noexcept { return unified_; }
     // A cap or FG divisor change: the GPU floor's output-shaped windows
     // (LeadController::ResetGpuFloor) and the GPU-paced rhythm restart.
     void ResetGpuFloor() noexcept
@@ -396,6 +491,11 @@ public:
     // controller; OutputRelease events with a grid index feed ObserveOutput
     // and publish the grid when an epoch started. Returns the events drained.
     size_t DrainStageEvents() noexcept;
+    // The production entry of the scheduler's drain: the owner's key transition first (a no-op
+    // when the stage already runs under `unified_key`), then the drain, so the drain judges its
+    // events under the key of the invocation's own configuration snapshot (one rule, both
+    // directions: events are judged by the key's rules whichever branch planned their frames).
+    size_t DrainStageEventsUnderKey(bool unified_key, uint32_t controller_generation) noexcept;
     // True when the latest DrainStageEvents call started an OutputLate epoch
     // (a period governor miss input).
     bool DrainStartedOutputLate() const noexcept { return drain_output_late_; }
@@ -431,6 +531,12 @@ public:
 private:
     // Frame key continues the rhythm: the next frame of the newest one it paced.
     bool RhythmContinues(const PacingPlanKey& key) const noexcept;
+    // The unified branch of RunPlannedFrame (spec 4.2).
+    SourceStageFrame RunUnifiedFrame(const SourceStageRequest& request, SourceStageClock* clock) noexcept;
+    // Key unified_pacer, saturation rule (b): the law's used reports to the lead (exact
+    // identity, each frame once) when forward_reports, and the law's report-stream liveness
+    // (QueueWaitLive at the grid's next index) to the lead. Only with the key on.
+    void SyncUnifiedLead(bool forward_reports) noexcept;
 
     CadenceGrid grid_{};
     LeadController lead_{};
@@ -444,4 +550,7 @@ private:
     bool drain_output_late_ = false;
     std::array<SourceStageOutputLate, kMaxOutputLatePerDrain> output_late_{};
     size_t output_late_count_ = 0;
+    UnifiedPacer unified_{};
+    bool unified_enabled_ = false;
+    uint32_t unified_generation_ = 0; // the controller generation of the law's lifecycle
 };

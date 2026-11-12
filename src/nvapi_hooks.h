@@ -125,6 +125,12 @@ void InstallNvAPIHooks();
 // functions; interception lasts until the addon shuts down.
 void InstallFlipMeteringBlock();
 
+// Inside a HookBatch the two installers above only queue their hooks. Call these after the batch applied: each
+// logs what is really installed (and begins the NvAPI producer epoch) from Hooks_TargetEnabled. Outside a batch
+// the installers call them themselves, so they need no second call; a second call without an install is a no-op.
+void NvAPIHooks_ReportInstalled();
+void ReportFlipMeteringBlock();
+
 // Forward a marker call through the real trampoline
 NvAPI_Status InvokeSetLatencyMarker(IUnknown* dev, NV_LATENCY_MARKER_PARAMS* params);
 
@@ -152,3 +158,32 @@ enum class DriverLimiterApply : uint8_t {
 DriverLimiterApply NvAPI_ApplyDriverLimiter(uint32_t minimum_interval_us) noexcept;
 // Restores the game's parameters (RestoreGameSleepMode). Scheduler owner.
 void NvAPI_ReleaseDriverLimiter() noexcept;
+
+// Unified pacer (developer key unified_pacer, spec 4.1).
+// True while the Sleep hook runs the unified path and its self-check found the driver
+// pacing on its own (a Sleep over 200 us in at least 16 of the last 64; cleared below 3
+// of 64). Diagnosis only: nothing else reads it.
+inline std::atomic<bool> g_unified_driver_pacing{false};
+
+// The Sleep-mode tuple: one applied record {publication, owner, low latency off, interval,
+// epoch} under the forward lock, against the desired tuple (UnifiedPacer_SleepModeDesired:
+// the key, Dynamic MFG, the bypass state, the developer low-latency overrides, the
+// limiter interval and the game's captured parameters). The record is kept only while the
+// key is on (or a reconcile is pending): with the key off and settled nothing is recorded
+// and every key-off path is as before. The epoch is bumped on key toggles and Dynamic MFG
+// transitions; it matters only inside the key-on tuple. The bump also restarts the Sleep
+// self-check. Scheduler owner.
+void NvAPI_BumpSleepModeEpoch() noexcept;
+// The key the clamp will publish (Config_ApplyPacingPipeline calls it BEFORE
+// PacingPipeline_SetConfig): the key is noted, making the reconcile pending, before any
+// reader can observe it. An unchanged key is one load and a branch. Any thread.
+void NvAPI_PrepareUnifiedKey(bool clamped_key) noexcept;
+// The published pending state, one load: true while the key is on or being published, or
+// while a restoration is owed (a Unified or Limiter tuple was applied and the game's
+// parameters are not back): callers then reconcile instead of the key-off paths. Any thread.
+bool NvAPI_SleepModeReconcilePending() noexcept;
+// Forwards the desired tuple when it differs from the applied record (an invalid record
+// differs). Never blocks or spins: a held forward lock, captured parameters held by another
+// thread, a missing parameter set or a failed call leaves it pending for the next call (no
+// backoff). Any thread (the Sleep hook, the owner's OnMarker).
+void NvAPI_ReconcileSleepMode() noexcept;

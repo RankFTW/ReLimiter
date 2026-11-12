@@ -31,7 +31,7 @@ enum class FramePlanClaim : uint8_t {
 // sequence value; 64-bit, never reused). The claim word stores the newest
 // publication number whose output was claimed and only ever increases, so a
 // claim taken from a stale copy can never mark or unmark a newer plan in the
-// same slot. sizeof(FramePlanRegistry) is 256 * 96 = 24,576 bytes on x64 and
+// same slot. sizeof(FramePlanRegistry) is 256 * 104 = 26,624 bytes on x64 and
 // Win32.
 class FramePlanRegistry {
 public:
@@ -80,6 +80,8 @@ private:
         std::atomic<uint32_t> pipeline_generation{ 0 };
         // identity domain, rung, timing mode and marker, one byte each
         std::atomic<uint32_t> packed_enums{ 0 };
+        std::atomic<float> hold_advance_us{ 0.0f }; // PacingFramePlan::hold_advance_us (the slot's padding)
+        std::atomic<uint64_t> law_hold_sequence{ 0 }; // PacingFramePlan::law_hold_sequence
     };
 
     static size_t SlotIndex(uint64_t frame_id) noexcept;
@@ -119,3 +121,25 @@ private:
 bool FramePlan_PushStageEvent(const PacingStageEvent& event) noexcept;
 bool FramePlan_PopStageEvent(PacingStageEvent* event) noexcept;
 uint64_t FramePlan_DroppedStageEvents() noexcept;
+
+// Developer key unified_pacer, hard limit (unified_pacer.h): two independent monotone maxima,
+// each raised by a compare-exchange loop that only ever stores a larger value, so a producer
+// that loses a race stops and never leaves an older value behind; nothing waits for another
+// producer. g_up_ready_index is the highest grid index whose GpuReady stage event was pushed (a
+// later completion retires every earlier one); g_up_ready_qpc is the largest completion QPC
+// seen (the hard limit's freshness test: "is completion evidence fresh" is about the newest
+// completion of any frame; the ready-age telemetry). The two need no coherence. Published by
+// FramePlan_PushStageEvent from any thread while g_up_ready_publish is set (the scheduler sets
+// it while the key is on); waiters sleep on g_up_ready_index with WaitOnAddress (it changes
+// on every index raise) and every index raise wakes them through the installed waker (a plain
+// function pointer, so this unit stays free of Windows dependencies). The QPC is raised before
+// the index. Readers load the two atomics separately.
+extern std::atomic<uint64_t> g_up_ready_index;
+extern std::atomic<int64_t> g_up_ready_qpc;
+extern std::atomic<bool> g_up_ready_publish;
+using FramePlanReadyWaker = void (*)(const void* address) noexcept;
+void FramePlan_SetReadyWaker(FramePlanReadyWaker waker) noexcept;
+
+// Raises both maxima (the QPC first), waking the waiters when the index rose. The body of the
+// publication in FramePlan_PushStageEvent, exposed for tests.
+void FramePlan_RaiseReady(uint64_t grid_index, int64_t qpc) noexcept;

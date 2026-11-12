@@ -88,7 +88,8 @@ enum class PacingSourcePlacement : uint8_t {
     Marker = 1,  // at the enforcement marker (SIMULATION_START by default)
     Present = 2, // present-based routes
     PreSleep = 3, // before the driver's Reflex Sleep, trimmed at the enforcement marker
-    DriverLimiter = 4 // the Reflex driver limiter paces the source; ReLimiter plans nothing
+    DriverLimiter = 4, // the Reflex driver limiter paces the source; ReLimiter plans nothing
+    Unified = 5        // the unified pacer: the Sleep hook releases at the start target (unified_pacer.h); the marker waits only in the resolution fallbacks
 };
 
 // True when the source stage waits at the enforcement marker: Marker, and
@@ -207,6 +208,17 @@ struct PacingFramePlan {
     PacingRung rung = PacingRung::SourceOnly;
     PacingTimingMode mode = PacingTimingMode::Off;
     PacingSourceMarker marker = PacingSourceMarker::Unknown;
+    // Developer key unified_pacer, hold credit (unified_pacer.h): the ADVANCE in µs the executors
+    // subtract from the resolved targets (nominal or floored) under the live key; >= 0, 0 = none
+    // (key off, a report stream that is not live, no debt). A debt in the credit is repaid by
+    // releasing the next frames earlier by it. Fits the padding after the enums.
+    float hold_advance_us = 0.0f;
+    // Key unified_queue_law: the stable identity the law gave this frame's grant (UnifiedHoldGrant::
+    // law_sequence; 0 = a report-rule grant, no live grant, the law not in use, or the key off). It
+    // travels with the plan to the GPU gate, which announces it with the hold Wait
+    // (GpuQueueProbe_OnHoldAnnounce); the probe attaches it to the frame record the hold delayed
+    // (PacingGpuQueueRecord::law_hold_sequence), and the law's record debit names it.
+    uint64_t law_hold_sequence = 0;
 };
 
 enum class PacingStageEventKind : uint8_t {

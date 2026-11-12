@@ -68,9 +68,12 @@ void NativeGate_PublishRouteCapability(uint32_t controller_generation) noexcept
                  "the native route takes each frame from the marker thread (cross-thread hand-off)");
     const uint64_t previous = s_published.exchange(word, std::memory_order_acq_rel);
     if (previous == word) return;
-    if ((previous & 1u) != (word & 1u))
-        LOG_INFO("NativeGate: native route %s (controller generation %u)",
-            qualified ? "qualified" : "not qualified", controller_generation);
+    if ((previous & 1u) != (word & 1u)) {
+        char diag[1400];
+        NativeGate_DiagnosticsText(diag, sizeof(diag));
+        LOG_INFO("NativeGate: native route %s (controller generation %u; %s)",
+            qualified ? "qualified" : "not qualified", controller_generation, diag);
+    }
 }
 
 namespace {

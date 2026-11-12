@@ -23,6 +23,7 @@ void CadenceGridPublication::AtomicSegment::Store(
     origin_qpc.store(segment.origin_qpc, std::memory_order_relaxed);
     origin_fraction.store(segment.origin_fraction, std::memory_order_relaxed);
     interval_ticks.store(segment.interval_ticks, std::memory_order_relaxed);
+    floor_interval_ticks.store(segment.floor_interval_ticks, std::memory_order_relaxed);
 }
 
 CadenceGridSegment CadenceGridPublication::AtomicSegment::Load() const noexcept
@@ -32,6 +33,7 @@ CadenceGridSegment CadenceGridPublication::AtomicSegment::Load() const noexcept
     segment.origin_qpc = origin_qpc.load(std::memory_order_relaxed);
     segment.origin_fraction = origin_fraction.load(std::memory_order_relaxed);
     segment.interval_ticks = interval_ticks.load(std::memory_order_relaxed);
+    segment.floor_interval_ticks = floor_interval_ticks.load(std::memory_order_relaxed);
     return segment;
 }
 

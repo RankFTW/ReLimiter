@@ -87,6 +87,11 @@ struct CadenceGridSegment {
     int64_t origin_qpc = 0;
     double origin_fraction = 0.0; // [0, 1)
     double interval_ticks = 0.0;
+    // Developer key unified_pacer: the display-side interval the output spacing floor uses
+    // (CadenceGrid_ResolveOutputTarget: o(n - 1) + I_disp - slack, slack from I_disp / D);
+    // 0 = none, the floor then uses interval_ticks. T(n) and the nominal target always keep
+    // interval_ticks. Set only by CadenceGrid::PlanAt.
+    double floor_interval_ticks = 0.0;
 };
 
 // Fixed-refresh vblank reference: edges at edge_qpc + m * refresh_ticks.
@@ -215,6 +220,15 @@ extern CadenceGridOutputTracker g_cadence_output_tracker;
 // floor when unknown. D > 1 serves frame generation, where a real frame's
 // error lands mostly on one displayed interval of I / D, so the floor
 // allows the same share of the displayed interval as without it.
+// display_floor (developer key unified_pacer; the executors pass the live key): the
+// segment's display-side floor interval (CadenceGridSegment::floor_interval_ticks) replaces I
+// in both terms when it is set; false (the default) ignores it, whatever the snapshot holds,
+// so a snapshot copied under the key never reaches the key-off path.
+// advance_us (the plan's hold advance, PacingFramePlan::hold_advance_us): with display_floor
+// (the live key) and a finite value > 0, the resolved target (nominal or floored, exactly as
+// without it) is moved earlier by llround(advance_us * qpc_frequency / 1e6) ticks (never
+// below 1): a hold debt is repaid by releasing the frame earlier by the debt. *floored is
+// unchanged by it. Key off (display_floor false), 0, negative or non-finite: exactly as before.
 // When snapped, a floored target moves to the first edge at or after the
 // floor. *floored (optional) is true when the floor won. False (Stale)
 // exactly when CadenceGrid_TargetOf is false.
@@ -225,7 +239,9 @@ bool CadenceGrid_ResolveOutputTarget(
     const CadenceGridOutputTracker& tracker,
     int64_t* target_qpc,
     bool* floored,
-    double display_divisor = 1.0) noexcept;
+    double display_divisor = 1.0,
+    bool display_floor = false,
+    double advance_us = 0.0) noexcept;
 
 // ── Owner ──
 
@@ -276,6 +292,26 @@ struct CadenceGridPlan {
     bool driver_released = false;
 };
 
+// Unified pacer plan (developer key unified_pacer; unified_pacer.h): the output
+// target H is given, derived from the frame's own release R(n) (H = B + L), so
+// the grid follows the start and never judges lateness.
+struct CadenceGridPlanAtInput {
+    int64_t now_qpc = 0;
+    int64_t qpc_frequency = 0;
+    double interval_us = 0.0;     // I(n), grid interval (frame generation divisor applied)
+    int64_t origin_qpc = 0;       // floor(H(n))
+    double origin_fraction = 0.0; // H(n) - floor(H(n)), in [0, 1)
+    int64_t source_wake_qpc = 0;  // R(n), the committed release
+    double lead_us = 0.0;         // L, for the grid's lead bookkeeping
+    bool period_change = false;   // cap, N or regime changed I: a PeriodChange epoch
+    PacingTimingMode mode = PacingTimingMode::Vrr; // Off suspends the grid
+    uint32_t controller_generation = 0;
+    // I_disp: the display-side interval the output spacing floor uses when the commanded I(n)
+    // is bound by the hardware term (UnifiedPacer_DisplayInterval); 0 = none, the floor uses
+    // I(n). Stored on the segment (CadenceGridSegment::floor_interval_ticks).
+    double display_interval_us = 0.0;
+};
+
 constexpr size_t kCadenceGridEpochReasonCount =
     static_cast<size_t>(PacingEpochReason::GovernorStep) + 1;
 
@@ -319,6 +355,25 @@ public:
     // an invalid plan and leaves the grid unchanged. The caller publishes
     // Snapshot() afterwards.
     CadenceGridPlan PlanNext(const CadenceGridPlanInput& input) noexcept;
+
+    // The unified pacer's plan for the next grid index (CadenceGridPlanAtInput):
+    // starts a Lifecycle epoch on a new grid or controller generation, ModeChange
+    // on a mode change, PeriodChange when flagged, otherwise a silent rebase;
+    // StartSegment(keep_history = !lifecycle, base n, origin and fraction,
+    // interval). No lateness judging and no snapping. output_target_qpc =
+    // origin, source_wake_qpc = max(source_wake, now). Invalid input returns an
+    // invalid plan and leaves the grid unchanged. The caller publishes
+    // Snapshot() afterwards.
+    CadenceGridPlan PlanAt(const CadenceGridPlanAtInput& input) noexcept;
+
+    // Leaving unified planning (key off, or a frame the unified branch does not plan): the
+    // current segment's display-side floor interval becomes 0, so the output spacing floor is
+    // the commanded interval's again. Base index, origin, fraction, interval, history, epoch,
+    // indices and lead bookkeeping stay exactly as they are; only the snapshot's sequence
+    // moves. True when a non-zero floor was cleared (the caller publishes Snapshot()). PlanNext
+    // never sets a floor and keeps the current segment while the source is on time, so this
+    // cutover must not wait for a later interval change.
+    bool ClearDisplayFloor() noexcept;
 
     // Output evidence for a planned index (rules above). Returns OutputLate
     // when it started an epoch, otherwise None; never for a GPU-paced frame
@@ -365,6 +420,7 @@ private:
         std::atomic<int64_t> origin_qpc{0};
         std::atomic<double> origin_fraction{0.0};
         std::atomic<double> interval_ticks{0.0};
+        std::atomic<double> floor_interval_ticks{0.0};
 
         void Store(const CadenceGridSegment& segment) noexcept;
         CadenceGridSegment Load() const noexcept;

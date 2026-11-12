@@ -51,11 +51,17 @@ struct ReflexFrameTimeSample {
 	uint32_t feedback_generation = 0;
 	bool gpu_execution_available = false; // FIFO-only authority: service came from driver active time, not elapsed fallback
 	double gpu_active_us = 0.0; // the report's gpuActiveRenderTimeUs; the lead controller's release headroom
+	double ai_frame_us = 0.0;   // the report's aiFrameTimeUs (frame generation time); developer key unified_pacer's hold share bound
 	// The report's gpuRenderStartTime and gpuRenderEndTime as local QPC
 	// through the stable Reflex clock map (the lead controller's queue-order
 	// test and the render handoff GPU floor); 0 otherwise.
 	int64_t gpu_start_qpc = 0;
 	int64_t gpu_end_qpc = 0;
+	// Developer key unified_pacer: the report's gpuRenderStartTime and osRenderQueueStartTime
+	// as the driver reported them (µs on the driver's clock, 0 = missing), copied raw. The
+	// scheduler derives the signed queue wait from them under the key.
+	uint64_t gpu_start_driver_us = 0;
+	uint64_t os_queue_start_driver_us = 0;
 	// presentEndTime → gpuRenderEndTime in µs on the driver's clock (the GPU
 	// floor's live bound); 0 when either is missing, the GPU end comes first,
 	// or it exceeds 3 I.

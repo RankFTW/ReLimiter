@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -183,6 +184,8 @@ void ReflexInject_SetEnabled(bool) noexcept {}
 void Log_SetLevel(LogLevel) {}
 LogLevel Log_ParseLevel(const char*) { return LogLevel::Warn; }
 const char* Log_GetProcessName() { return "config-test"; }
+// The Sleep-mode reconcile's key note (nvapi_hooks.cpp is not linked here).
+void NvAPI_PrepareUnifiedKey(bool) noexcept {}
 void Log_Write(LogLevel, const char*, ...) {
     CHECK(config_test::logger_alive.load());
     if (GetCurrentThreadId() != config_test::caller_thread) ++config_test::worker_logs;
@@ -202,6 +205,11 @@ bool OwnerShutdown(DWORD timeout = 5000) {
     if (!Config_Shutdown(timeout)) return false;
     return Log_Shutdown();
 }
+// unified_pacer is on by default while the unified pacer is tested (kPacingUnifiedPacerDefault); the
+// tests of the other pacing keys compare the pipeline with the user's values that the key would
+// force, so Reset seeds unified_pacer=false (the earlier pipeline) unless the test seeds the key
+// itself or turns the seeding off (the default tests do).
+bool seed_earlier_pipeline = true;
 // One [FrameLimiter] key seeded into the fake local INI before LoadConfig.
 struct IniEntry {
     const char* key;
@@ -222,6 +230,8 @@ void Reset(bool creation_failure = false, bool initial_write_failure = false,
         std::lock_guard<std::mutex> lock(mutex);
         disk.clear();
         for (const auto& entry : ini) disk[{ local_path, "FrameLimiter", entry.key }] = entry.value;
+        const decltype(disk)::key_type unified_key{ local_path, "FrameLimiter", "unified_pacer" };
+        if (seed_earlier_pipeline && disk.count(unified_key) == 0) disk[unified_key] = "false";
         writes.clear();
         hold_start = true;
         hold_io = false;
@@ -250,6 +260,17 @@ void Reset(bool creation_failure = false, bool initial_write_failure = false,
     std::lock_guard<std::mutex> lock(mutex);
     writes.clear();
     entered_io = false;
+}
+// Developer overrides other than unified_pacer, which Reset seeds false for the tests of the other keys.
+int OverridesBesidesUnified() {
+    return Config_DeveloperOverrides() - (g_config.unified_pacer != kPacingUnifiedPacerDefault ? 1 : 0);
+}
+// The developer reset returns unified_pacer to its default (on); the tests of the other keys read
+// the earlier pipeline, so they put the key back to false (the seeding of Reset) afterwards.
+void ResetDeveloperKeepingEarlierPipeline() {
+    Config_ResetDeveloperSettings();
+    char error[64] = {};
+    if (seed_earlier_pipeline) CHECK(Config_SetLiveKey("unified_pacer", "false", error, sizeof(error)));
 }
 void ReleaseStart() {
     std::lock_guard<std::mutex> lock(mutex);
@@ -293,35 +314,65 @@ void CheckWorkerWrites() {
 // exactly the live config.
 void CheckPipelineMatchesConfig() {
     const PacingPipelineConfig pipeline = PacingPipeline_GetConfig();
-    CHECK(pipeline.smoothing == g_config.smoothing);
-    CHECK(pipeline.rung_override == g_config.output_rung);
-    CHECK(pipeline.adaptive_cap == g_config.adaptive_cap);
+    // Key unified_pacer (64-bit) forces the mechanisms the law replaces (PacingPipeline_ClampConfig);
+    // g_config keeps the user's values and the pipeline holds the forced ones.
+    const bool forced = g_config.unified_pacer && sizeof(void*) == 8;
+    CHECK(pipeline.smoothing == (forced ? PacingSmoothing::On : g_config.smoothing));
+    CHECK(pipeline.rung_override == (forced ? PacingRungOverride::Auto : g_config.output_rung));
+    CHECK(pipeline.adaptive_cap == (forced ? false : g_config.adaptive_cap));
     CHECK(pipeline.adaptive_cap_percentile == g_config.adaptive_cap_percentile);
     CHECK(pipeline.placement_override == g_config.source_placement);
     CHECK(pipeline.gpu_probes == g_config.gpu_present_gate_probes);
-    CHECK(pipeline.stall_inject_ms == g_config.stall_inject_ms);
+    CHECK(pipeline.stall_inject_ms == (forced ? 0.0 : g_config.stall_inject_ms));
     CHECK(pipeline.stall_inject_period_s == g_config.stall_inject_period_s);
-    CHECK(pipeline.gpu_wait_interleave_s == g_config.gpu_wait_interleave_s);
-    CHECK(pipeline.gpu_queue_wait_render_queue == g_config.gpu_queue_wait_render_queue);
-    CHECK(pipeline.lead_coverage == g_config.lead_coverage);
-    CHECK(pipeline.fg_late_spacing == g_config.fg_late_spacing);
-    CHECK(pipeline.gpu_paced_cadence == g_config.gpu_paced_cadence);
-    CHECK(pipeline.adaptive_cap_hold_room == g_config.adaptive_cap_hold_room);
-    CHECK(pipeline.pre_sleep_precise == g_config.pre_sleep_precise);
-    CHECK(pipeline.driver_limiter_hold == g_config.driver_limiter_hold);
+    CHECK(pipeline.gpu_wait_interleave_s == (forced ? 0.0 : g_config.gpu_wait_interleave_s));
+    CHECK(pipeline.gpu_queue_wait_render_queue ==
+        (forced ? PacingRenderQueue::Keep : g_config.gpu_queue_wait_render_queue));
+    CHECK(pipeline.lead_coverage == (forced ? PacingLeadCoverage::Q99 : g_config.lead_coverage));
+    CHECK(pipeline.fg_late_spacing == (forced ? true : g_config.fg_late_spacing));
+    CHECK(pipeline.gpu_paced_cadence == (forced ? false : g_config.gpu_paced_cadence));
+    // Key unified_pacer forces the hold room off (config clamp), the user's value stays in g_config.
+    CHECK(pipeline.adaptive_cap_hold_room ==
+        (g_config.adaptive_cap_hold_room && !(g_config.unified_pacer && sizeof(void*) == 8)));
+    CHECK(pipeline.unified_pacer == (g_config.unified_pacer && sizeof(void*) == 8));
+    // Keys unified_every_frame_service and unified_queue_target_us: 64-bit only, the clamp forces
+    // them off / to the default on Win32; the user's values stay in g_config.
+    CHECK(pipeline.unified_every_frame_service == (g_config.unified_every_frame_service && sizeof(void*) == 8));
+    CHECK(pipeline.unified_queue_target_us ==
+        (sizeof(void*) == 8 ? g_config.unified_queue_target_us : kPacingUnifiedQueueTargetDefaultUs));
+    // Key unified_hold_share: 64-bit only, forced to the default (0) on Win32.
+    CHECK(pipeline.unified_hold_share == (sizeof(void*) == 8 ? g_config.unified_hold_share : 0.0));
+    CHECK(pipeline.pre_sleep_precise == (forced ? false : g_config.pre_sleep_precise));
+    CHECK(pipeline.driver_limiter_hold == (forced ? false : g_config.driver_limiter_hold));
     CHECK(g_driver_low_latency_off.load() == g_config.driver_low_latency_off);
     CHECK(g_sleep_status_every_frame.load() == g_config.sleep_status_every_frame);
     CHECK(g_gpu_start_probe.load() == g_config.gpu_start_probe);
+    // The queue law forces the probe on and feeds the law while the unified pacer is on (64-bit only);
+    // the probe key is a 64-bit measurement; the user's values stay in g_config.
+    const bool is64 = sizeof(void*) == 8;
+    const bool law_in_use = g_config.unified_queue_law && pipeline.unified_pacer;
+    CHECK(g_gpu_queue_probe.load() == ((g_config.gpu_queue_probe && is64) || law_in_use));
+    CHECK(g_gpu_queue_law_feed.load() == law_in_use);
+    CHECK(pipeline.unified_queue_law == (g_config.unified_queue_law && is64));
+    CHECK(pipeline.unified_queue_rank == g_config.unified_queue_rank);
+    CHECK(pipeline.unified_queue_need_frames == g_config.unified_queue_need_frames);
+    // The upstream stamping key: 64-bit only (0 on Win32), in the pipeline snapshot and the hook gate.
+    CHECK(pipeline.unified_queue_upstream == (sizeof(void*) == 8 ? g_config.unified_queue_upstream : 0));
+    CHECK(g_unified_queue_upstream.load() == (sizeof(void*) == 8 ? g_config.unified_queue_upstream : 0));
+    CHECK(g_gpu_queue_probe_source.load() == (sizeof(void*) == 8 ? g_config.gpu_queue_probe_source : 0));
+    CHECK(pipeline.gpu_queue_probe_source == (sizeof(void*) == 8 ? g_config.gpu_queue_probe_source : 0));
+    CHECK(pipeline.unified_queue_allow_us == g_config.unified_queue_allow_us);
     CHECK(g_marker_forward_after_wait.load() ==
         (g_config.marker_forward_order == PacingMarkerForwardOrder::AfterWait));
 }
 
 void TestPacingPipelineDefaults() {
+    seed_earlier_pipeline = false; // the fresh configuration, unified_pacer at its default
     Reset();
     CHECK(g_config.smoothing == PacingSmoothing::On);
     CHECK(g_config.output_rung == PacingRungOverride::Auto);
     CHECK(!g_config.adaptive_cap && g_config.gpu_present_gate_probes && !g_config.advanced_settings);
-    CHECK(!g_config.developer_settings && Config_DeveloperOverrides() == 0);
+    CHECK(!g_config.developer_settings && OverridesBesidesUnified() == 0);
     CHECK(g_config.stall_inject_ms == 0.0 && g_config.stall_inject_period_s == 5.0);
     // Recommended defaults: the Reflex Sleep bypass and pre-Sleep placement.
     CHECK(g_config.reflex_sleep_bypass && g_reflex_sleep_bypass.load());
@@ -334,6 +385,30 @@ void TestPacingPipelineDefaults() {
     CHECK(!g_config.flip_metering_off);
     CHECK(!g_config.pre_sleep_precise && !g_config.driver_low_latency_off && !g_config.driver_limiter_hold &&
           !g_config.sleep_status_every_frame && !g_config.gpu_start_probe);
+    // The queue probe, the queue law and the probe's source key are on by default (one constant each).
+    CHECK(g_config.gpu_queue_probe && kPacingGpuQueueProbeDefault);
+    // The unified pacer is on by default while it is tested (one constant); the pipeline holds it on 64-bit only.
+    CHECK(kPacingUnifiedPacerDefault && g_config.unified_pacer);
+    // The earlier law (false, 4000) is an explicit setting; the defaults are the every-frame estimate and 2000 µs.
+    CHECK(g_config.unified_every_frame_service && kPacingUnifiedEveryFrameServiceDefault);
+    CHECK(g_config.unified_queue_target_us == 2000.0 && kPacingUnifiedQueueTargetDefaultUs == 2000.0);
+    CHECK(g_config.unified_hold_share == 0.0 && kPacingUnifiedHoldShareDefault == 0.0);
+    CHECK(g_config.unified_queue_law && g_config.unified_queue_rank == 2 && g_config.unified_queue_allow_us == 4000);
+    CHECK(kPacingUnifiedQueueLawDefault && kPacingUnifiedQueueRankDefault == 2 &&
+          kPacingUnifiedQueueAllowDefaultUs == 4000);
+    CHECK(Value(local_path, "FrameLimiter", "unified_queue_law") == "true");
+    CHECK(Value(local_path, "FrameLimiter", "unified_queue_rank") == "2");
+    CHECK(Value(local_path, "FrameLimiter", "unified_queue_allow_us") == "4000");
+    CHECK(g_config.unified_queue_need_frames == 4 && kPacingUnifiedQueueNeedFramesDefault == 4);
+    CHECK(Value(local_path, "FrameLimiter", "unified_queue_need_frames") == "4");
+    CHECK(g_config.gpu_queue_probe_source == 1 && kPacingGpuQueueProbeSourceDefault == 1);
+    CHECK(Value(local_path, "FrameLimiter", "gpu_queue_probe_source") == "1");
+    CHECK(g_gpu_queue_probe_source.load() == (sizeof(void*) == 8 ? 1 : 0));
+    CHECK(g_config.unified_queue_upstream == 0 && kPacingUnifiedQueueUpstreamDefault == 0);
+    CHECK(Value(local_path, "FrameLimiter", "unified_queue_upstream") == "0");
+    CHECK(g_unified_queue_upstream.load() == 0);
+    CHECK(g_gpu_queue_law_feed.load() == (sizeof(void*) == 8) && g_gpu_queue_probe.load() == (sizeof(void*) == 8));
+    CHECK(Value(local_path, "FrameLimiter", "gpu_queue_probe") == "true");
     CHECK(g_config.adaptive_cap_hold_room);
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
     CheckPipelineMatchesConfig();
@@ -348,17 +423,21 @@ void TestPacingPipelineDefaults() {
     for (const char* key : {"pre_sleep_precise", "driver_low_latency_off", "driver_limiter_hold",
             "sleep_status_every_frame", "gpu_start_probe"})
         CHECK(Value(local_path, "FrameLimiter", key) == "false");
+    CHECK(Value(local_path, "FrameLimiter", "unified_pacer") == "true");
+    CHECK(Value(local_path, "FrameLimiter", "unified_every_frame_service") == "true");
+    CHECK(Value(local_path, "FrameLimiter", "unified_queue_target_us") == "2000.000000");
     CHECK(Value(local_path, "FrameLimiter", "adaptive_cap_hold_room") == "true");
     CHECK(Value(local_path, "FrameLimiter", "source_placement") == "pre_sleep");
     CHECK(Value(local_path, "FrameLimiter", "reflex_sleep_bypass") == "true");
     CHECK(Value(local_path, "FrameLimiter", "developer_settings") == "false");
-    CHECK(Value(local_path, "FrameLimiter", "config_version") == "4");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "5");
     CHECK(Value(local_path, "FrameLimiter", "smoothing") == "on");
     CHECK(Value(local_path, "FrameLimiter", "adaptive_cap") == "false");
     CHECK(Value(local_path, "FrameLimiter", "output_rung") == "auto");
     CHECK(Value(local_path, "FrameLimiter", "stall_inject_ms") == "0.000000");
     CHECK(Value(local_path, "FrameLimiter", "stall_inject_period_s") == "5.000000");
     CHECK(Value(local_path, "FrameLimiter", "gpu_present_gate_probes") == "true");
+    seed_earlier_pipeline = true;
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
@@ -375,7 +454,7 @@ void TestRecommendedDefaultsMigration() {
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
     CHECK(g_config.gpu_wait_headroom_us == 2000.0 && g_config.adaptive_cap);
     CheckPipelineMatchesConfig();
-    CHECK(Value(local_path, "FrameLimiter", "config_version") == "4");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "5");
     CHECK(Value(local_path, "FrameLimiter", "reflex_sleep_bypass") == "true");
     CHECK(Value(local_path, "FrameLimiter", "source_placement") == "pre_sleep");
     ReleaseStart();CHECK(OwnerShutdown());
@@ -387,7 +466,7 @@ void TestRecommendedDefaultsMigration() {
     CHECK(g_config.lead_coverage == PacingLeadCoverage::Q99);
     CheckPipelineMatchesConfig();
     CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "99");
-    CHECK(Value(local_path, "FrameLimiter", "config_version") == "4");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "5");
     ReleaseStart();CHECK(OwnerShutdown());
 
     Reset(false, false, {{"config_version", "3"}, {"lead_coverage", "95"}, {"fg_late_spacing", "false"}});
@@ -403,16 +482,73 @@ void TestRecommendedDefaultsMigration() {
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
+// An INI from before config_version 5 saved the old defaults of the queue law, the queue probe and the
+// probe's source key (false, false, 0): it moves to the new defaults once and keeps every other value; a
+// version-5 INI keeps its explicit choices; keys the INI does not carry take the new defaults; a first
+// launch (no INI) takes the defaults and is written at version 5.
+void TestQueueDefaultsMigration() {
+    const bool is64 = sizeof(void*) == 8;
+    // An INI of version 4 as the earlier build wrote it.
+    Reset(false, false, {{"config_version", "4"}, {"unified_pacer", "true"}, {"unified_queue_law", "false"},
+        {"gpu_queue_probe", "false"}, {"gpu_queue_probe_source", "0"}, {"unified_queue_rank", "3"},
+        {"unified_queue_allow_us", "2500"}, {"target_fps", "100"}});
+    CHECK(g_config.unified_queue_law && g_config.gpu_queue_probe && g_config.gpu_queue_probe_source == 1);
+    CHECK(g_config.unified_queue_rank == 3 && g_config.unified_queue_allow_us == 2500 && g_config.target_fps == 100);
+    CheckPipelineMatchesConfig();
+    CHECK(g_gpu_queue_probe.load() == is64 && g_gpu_queue_law_feed.load() == is64);
+    CHECK(g_gpu_queue_probe_source.load() == (is64 ? 1 : 0));
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "5");
+    CHECK(Value(local_path, "FrameLimiter", "unified_queue_law") == "true");
+    CHECK(Value(local_path, "FrameLimiter", "gpu_queue_probe") == "true");
+    CHECK(Value(local_path, "FrameLimiter", "gpu_queue_probe_source") == "1");
+    CHECK(Value(local_path, "FrameLimiter", "unified_queue_rank") == "3");
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    // One key different is enough, and an INI without a version is older still.
+    Reset(false, false, {{"unified_pacer", "true"}, {"gpu_queue_probe_source", "0"}});
+    CHECK(g_config.unified_queue_law && g_config.gpu_queue_probe && g_config.gpu_queue_probe_source == 1);
+    CHECK(Value(local_path, "FrameLimiter", "gpu_queue_probe_source") == "1");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "5");
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    // Keys the old INI does not carry take the new defaults.
+    Reset(false, false, {{"config_version", "4"}, {"unified_pacer", "true"}});
+    CHECK(g_config.unified_queue_law && g_config.gpu_queue_probe && g_config.gpu_queue_probe_source == 1);
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    // Version 5: the explicit choices stay, saved as they are.
+    Reset(false, false, {{"config_version", "5"}, {"unified_pacer", "true"}, {"unified_queue_law", "false"},
+        {"gpu_queue_probe", "false"}, {"gpu_queue_probe_source", "0"}});
+    CHECK(!g_config.unified_queue_law && !g_config.gpu_queue_probe && g_config.gpu_queue_probe_source == 0);
+    CHECK(!g_gpu_queue_probe.load() && !g_gpu_queue_law_feed.load() && g_gpu_queue_probe_source.load() == 0);
+    CheckPipelineMatchesConfig();
+    CHECK(Value(local_path, "FrameLimiter", "unified_queue_law") == "false");
+    CHECK(Value(local_path, "FrameLimiter", "gpu_queue_probe") == "false");
+    CHECK(Value(local_path, "FrameLimiter", "gpu_queue_probe_source") == "0");
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "5");
+    CHECK(OverridesBesidesUnified() == 3);
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    // A first launch (no INI at all) takes the defaults and writes version 5.
+    seed_earlier_pipeline = false;
+    Reset();
+    CHECK(g_config.unified_queue_law && g_config.gpu_queue_probe && g_config.gpu_queue_probe_source == 1);
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "5");
+    seed_earlier_pipeline = true;
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
 // developer_settings is read and saved; every developer key away from its
 // default is counted, and Reset returns exactly those keys to the defaults
 // and applies them, leaving the user's settings alone.
 void TestDeveloperSettingsReset() {
     Reset(false, false, {{"config_version", "2"}, {"developer_settings", "true"}, {"smoothing", "off"},
         {"output_rung", "gpu"}, {"gpu_wait_headroom_us", "2000"}, {"reflex_sleep_bypass", "false"},
-        {"source_placement", "marker"}, {"adaptive_cap", "true"}, {"adaptive_cap_percentile", "90"}});
+        {"source_placement", "marker"}, {"adaptive_cap", "true"}, {"adaptive_cap_percentile", "90"},
+        {"unified_pacer", "false"}});
     CHECK(g_config.developer_settings);
     CHECK(Value(local_path, "FrameLimiter", "developer_settings") == "true");
-    CHECK(Config_DeveloperOverrides() == 5);
+    CHECK(Config_DeveloperOverrides() == 6);
     Config_ResetDeveloperSettings();
     CHECK(Config_DeveloperOverrides() == 0);
     CHECK(g_config.smoothing == PacingSmoothing::On && g_config.output_rung == PacingRungOverride::Auto);
@@ -420,6 +556,7 @@ void TestDeveloperSettingsReset() {
     CHECK(g_config.reflex_sleep_bypass && g_reflex_sleep_bypass.load());
     CHECK(g_config.source_placement == PacingPlacementOverride::PreSleep);
     CHECK(g_config.adaptive_cap && g_config.adaptive_cap_percentile == 90 && g_config.developer_settings);
+    CHECK(g_config.unified_pacer == kPacingUnifiedPacerDefault); // the reset returns the key to its default
     CheckPipelineMatchesConfig();
     ReleaseStart();CHECK(OwnerShutdown());
 }
@@ -556,8 +693,8 @@ void TestLeadCoverageKey() {
     CHECK(g_config.lead_coverage == PacingLeadCoverage::Q95);
     CheckPipelineMatchesConfig();
     CHECK(Value(local_path, "FrameLimiter", "lead_coverage") == "95");
-    CHECK(Config_DeveloperOverrides() == 1);
-    Config_ResetDeveloperSettings();
+    CHECK(OverridesBesidesUnified() == 1);
+    ResetDeveloperKeepingEarlierPipeline();
     CHECK(g_config.lead_coverage == PacingLeadCoverage::Q99);
     CHECK(PacingPipeline_GetConfig().lead_coverage == PacingLeadCoverage::Q99);
     ReleaseStart();CHECK(OwnerShutdown());
@@ -579,8 +716,8 @@ void TestFgLateSpacingKey() {
     CHECK(!g_config.fg_late_spacing);
     CheckPipelineMatchesConfig();
     CHECK(Value(local_path, "FrameLimiter", "fg_late_spacing") == "false");
-    CHECK(Config_DeveloperOverrides() == 1);
-    Config_ResetDeveloperSettings();
+    CHECK(OverridesBesidesUnified() == 1);
+    ResetDeveloperKeepingEarlierPipeline();
     CHECK(g_config.fg_late_spacing && PacingPipeline_GetConfig().fg_late_spacing);
     ReleaseStart();CHECK(OwnerShutdown());
 }
@@ -593,8 +730,8 @@ void TestAdaptiveCapHoldRoomKey() {
     CheckPipelineMatchesConfig();
     CHECK(!PacingPipeline_GetConfig().adaptive_cap_hold_room);
     CHECK(Value(local_path, "FrameLimiter", "adaptive_cap_hold_room") == "false");
-    CHECK(Config_DeveloperOverrides() == 1);
-    Config_ResetDeveloperSettings();
+    CHECK(OverridesBesidesUnified() == 1);
+    ResetDeveloperKeepingEarlierPipeline();
     CHECK(g_config.adaptive_cap_hold_room && PacingPipeline_GetConfig().adaptive_cap_hold_room);
     ReleaseStart();CHECK(OwnerShutdown());
 }
@@ -607,8 +744,8 @@ void TestGpuPacedCadenceKey() {
     CheckPipelineMatchesConfig();
     CHECK(PacingPipeline_GetConfig().gpu_paced_cadence);
     CHECK(Value(local_path, "FrameLimiter", "gpu_paced_cadence") == "true");
-    CHECK(Config_DeveloperOverrides() == 1);
-    Config_ResetDeveloperSettings();
+    CHECK(OverridesBesidesUnified() == 1);
+    ResetDeveloperKeepingEarlierPipeline();
     CHECK(!g_config.gpu_paced_cadence && !PacingPipeline_GetConfig().gpu_paced_cadence);
     ReleaseStart();CHECK(OwnerShutdown());
 }
@@ -620,8 +757,8 @@ void TestBypassLowLatencyOffKey() {
     CHECK(g_config.bypass_low_latency_off && g_bypass_low_latency_off.load());
     CheckPipelineMatchesConfig();
     CHECK(Value(local_path, "FrameLimiter", "bypass_low_latency_off") == "true");
-    CHECK(Config_DeveloperOverrides() == 1);
-    Config_ResetDeveloperSettings();
+    CHECK(OverridesBesidesUnified() == 1);
+    ResetDeveloperKeepingEarlierPipeline();
     CHECK(!g_config.bypass_low_latency_off && !g_bypass_low_latency_off.load());
     ReleaseStart();CHECK(OwnerShutdown());
 }
@@ -632,8 +769,8 @@ void TestFlipMeteringOffKey() {
     Reset(false, false, {{"config_version", "4"}, {"flip_metering_off", "true"}});
     CHECK(g_config.flip_metering_off);
     CHECK(Value(local_path, "FrameLimiter", "flip_metering_off") == "true");
-    CHECK(Config_DeveloperOverrides() == 1);
-    Config_ResetDeveloperSettings();
+    CHECK(OverridesBesidesUnified() == 1);
+    ResetDeveloperKeepingEarlierPipeline();
     CHECK(!g_config.flip_metering_off);
     ReleaseStart();CHECK(OwnerShutdown());
 }
@@ -642,7 +779,7 @@ void TestFlipMeteringOffKey() {
 // driver_limiter_hold, sleep_status_every_frame and gpu_start_probe: off by
 // default, each loads, reaches its consumer (the pipeline or the atomics of the
 // hooks and the GPU probe), is saved, counts as one developer override, is a
-// live key and resets to false.
+// live key and resets to false. (gpu_queue_probe is on by default: see TestUnifiedQueueLawKeys.)
 void TestMeasurementKeys() {
     struct Case { const char* key; bool PacingPipelineConfig::*pipeline; bool Config::*field; };
     for (const Case& test : {Case{"pre_sleep_precise", &PacingPipelineConfig::pre_sleep_precise, &Config::pre_sleep_precise},
@@ -652,27 +789,484 @@ void TestMeasurementKeys() {
             Case{"gpu_start_probe", nullptr, &Config::gpu_start_probe}}) {
         Reset(false, false, {{"config_version", "4"}, {test.key, "true"}});
         CHECK(g_config.*test.field);
-        if (test.pipeline) CHECK(PacingPipeline_GetConfig().*test.pipeline);
+        // The key is 64-bit only: the clamp forces it false on Win32.
+        if (test.pipeline && (sizeof(void*) == 8 ||
+                (test.field != &Config::unified_pacer && test.field != &Config::unified_every_frame_service))) {
+            CHECK(PacingPipeline_GetConfig().*test.pipeline);
+        }
         CheckPipelineMatchesConfig();
         CHECK(g_driver_low_latency_off.load() == (std::strcmp(test.key, "driver_low_latency_off") == 0));
         CHECK(g_sleep_status_every_frame.load() == (std::strcmp(test.key, "sleep_status_every_frame") == 0));
         CHECK(g_gpu_start_probe.load() == (std::strcmp(test.key, "gpu_start_probe") == 0));
+        CHECK(g_gpu_queue_probe.load() == (sizeof(void*) == 8)); // the default probe key, no law (earlier pipeline)
         CHECK(Value(local_path, "FrameLimiter", test.key) == "true");
-        CHECK(Config_DeveloperOverrides() == 1);
+        CHECK(OverridesBesidesUnified() == 1);
         // A live key: strict parse, published at once, not saved by the command.
         char error[128] = {};
         CHECK(Config_SetLiveKey(test.key, "off", error, sizeof(error)) && !(g_config.*test.field));
         CheckPipelineMatchesConfig();
-        CHECK(Config_DeveloperOverrides() == 0);
+        CHECK(OverridesBesidesUnified() == 0);
         CHECK(Config_SetLiveKey(test.key, "1", error, sizeof(error)) && g_config.*test.field);
         CheckPipelineMatchesConfig();
         CHECK(!Config_SetLiveKey(test.key, "maybe", error, sizeof(error)) && g_config.*test.field);
-        Config_ResetDeveloperSettings();
+        ResetDeveloperKeepingEarlierPipeline();
         CHECK(!(g_config.*test.field));
         CheckPipelineMatchesConfig();
-        CHECK(Config_DeveloperOverrides() == 0);
+        CHECK(OverridesBesidesUnified() == 0);
         ReleaseStart();CHECK(OwnerShutdown());
     }
+}
+
+// unified_queue_target_us (developer, only read under unified_pacer): default 2000 µs, loads from
+// the INI, is clamped to [0, 20000] by ValidateConfig (a non-finite INI value is the default),
+// is saved, counts as one developer override only away from 2000 (4000 is the earlier law),
+// is a live key (a non-finite or unparsable value is
+// refused and leaves the field alone; an out-of-range value is clamped), reaches the pipeline
+// (the default on Win32) and resets to 2000.
+void TestUnifiedQueueTargetKey() {
+    struct Case { const char* value; double expected; };
+    for (const Case& test : {Case{"6000", 6000.0}, Case{"4000", 4000.0}, Case{"2000", 2000.0}, Case{"0", 0.0},
+            Case{"20000", 20000.0}, Case{"25000", 20000.0}, Case{"-5", 0.0}, Case{"inf", 2000.0}}) {
+        Reset(false, false, {{"config_version", "4"}, {"unified_queue_target_us", test.value}});
+        CHECK(g_config.unified_queue_target_us == test.expected);
+        CheckPipelineMatchesConfig();
+        CHECK(PacingPipeline_GetConfig().unified_queue_target_us ==
+            (sizeof(void*) == 8 ? test.expected : kPacingUnifiedQueueTargetDefaultUs));
+        CHECK(OverridesBesidesUnified() == (test.expected != 2000.0 ? 1 : 0));
+        char saved[32] = {};
+        snprintf(saved, sizeof(saved), "%.6f", test.expected);
+        CHECK(Value(local_path, "FrameLimiter", "unified_queue_target_us") == saved);
+        ReleaseStart();CHECK(OwnerShutdown());
+    }
+    // "nan" loads as some finite value inside the range, whatever the C library's atof gives.
+    Reset(false, false, {{"config_version", "4"}, {"unified_queue_target_us", "nan"}});
+    CHECK(std::isfinite(g_config.unified_queue_target_us) && g_config.unified_queue_target_us >= 0.0 &&
+          g_config.unified_queue_target_us <= kPacingUnifiedQueueTargetMaxUs);
+    CheckPipelineMatchesConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    // Live key and ValidateConfig for a value set directly.
+    Reset(false, false, {{"config_version", "4"}});
+    char error[128] = {};
+    CHECK(Config_SetLiveKey("unified_queue_target_us", "7500", error, sizeof(error)));
+    CHECK(g_config.unified_queue_target_us == 7500.0 && OverridesBesidesUnified() == 1);
+    CheckPipelineMatchesConfig();
+    CHECK(PacingPipeline_GetConfig().unified_queue_target_us ==
+        (sizeof(void*) == 8 ? 7500.0 : kPacingUnifiedQueueTargetDefaultUs));
+    CHECK(Config_SetLiveKey("unified_queue_target_us", "99999", error, sizeof(error)));
+    CHECK(g_config.unified_queue_target_us == 20000.0);
+    CHECK(Config_SetLiveKey("unified_queue_target_us", "-1", error, sizeof(error)));
+    CHECK(g_config.unified_queue_target_us == 0.0);
+    CheckPipelineMatchesConfig();
+    CHECK(Config_SetLiveKey("unified_queue_target_us", "2500", error, sizeof(error)));
+    // Invalid values are refused and leave the field alone (NaN and infinity never parse).
+    for (const char* bad : {"nan", "inf", "-inf", "abc", "12ms"}) {
+        CHECK(!Config_SetLiveKey("unified_queue_target_us", bad, error, sizeof(error)) && error[0] != '\0');
+        CHECK(g_config.unified_queue_target_us == 2500.0);
+        CheckPipelineMatchesConfig();
+    }
+    g_config.unified_queue_target_us = std::numeric_limits<double>::quiet_NaN();
+    ValidateConfig();
+    CHECK(g_config.unified_queue_target_us == 2000.0);
+    g_config.unified_queue_target_us = 1e9;
+    ValidateConfig();
+    CHECK(g_config.unified_queue_target_us == 20000.0);
+    g_config.unified_queue_target_us = 3000.0;
+    ResetDeveloperKeepingEarlierPipeline();
+    CHECK(g_config.unified_queue_target_us == 2000.0 && OverridesBesidesUnified() == 0);
+    CheckPipelineMatchesConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// unified_pacer (developer, on by default while it is tested: kPacingUnifiedPacerDefault): the
+// default is on with no developer override, the pipeline holds it on 64-bit only (Win32 forces it
+// false without the override count, the reset or the warning seeing a deviation: they compare
+// g_config with its default), false in the INI is the earlier pipeline and one developer override,
+// it is a live key and the reset returns it to the default.
+void TestUnifiedPacerKey() {
+    const bool wide = sizeof(void*) == 8;
+    seed_earlier_pipeline = false;
+    Reset(false, false, {{"config_version", "4"}});
+    seed_earlier_pipeline = true;
+    CHECK(g_config.unified_pacer == kPacingUnifiedPacerDefault && kPacingUnifiedPacerDefault);
+    CHECK(Config_DeveloperOverrides() == 0);
+    CHECK(PacingPipeline_GetConfig().unified_pacer == wide);
+    CHECK(PacingPipeline_UnifiedPacerKey() == wide);
+    CheckPipelineMatchesConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+    // A fresh INI without the key reads the default; false is the earlier pipeline.
+    Reset(false, false, {{"config_version", "4"}, {"unified_pacer", "false"}});
+    CHECK(!g_config.unified_pacer && Config_DeveloperOverrides() == 1);
+    CHECK(!PacingPipeline_GetConfig().unified_pacer && !PacingPipeline_UnifiedPacerKey());
+    CHECK(Value(local_path, "FrameLimiter", "unified_pacer") == "false");
+    CheckPipelineMatchesConfig();
+    char error[128] = {};
+    CHECK(Config_SetLiveKey("unified_pacer", "on", error, sizeof(error)));
+    CHECK(g_config.unified_pacer && Config_DeveloperOverrides() == 0);
+    CHECK(PacingPipeline_GetConfig().unified_pacer == wide);
+    CheckPipelineMatchesConfig();
+    CHECK(Config_SetLiveKey("unified_pacer", "0", error, sizeof(error)));
+    CHECK(!g_config.unified_pacer && Config_DeveloperOverrides() == 1);
+    CHECK(!PacingPipeline_GetConfig().unified_pacer);
+    CHECK(!Config_SetLiveKey("unified_pacer", "maybe", error, sizeof(error)) && !g_config.unified_pacer);
+    Config_ResetDeveloperSettings();
+    CHECK(g_config.unified_pacer == kPacingUnifiedPacerDefault && Config_DeveloperOverrides() == 0);
+    CHECK(PacingPipeline_GetConfig().unified_pacer == wide);
+    CheckPipelineMatchesConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// unified_every_frame_service (developer, only read under unified_pacer): on by default; off is the
+// earlier estimator and counts as one developer override. Loads, is saved, is a live key, reaches the
+// pipeline (forced false on Win32, where the unified pacer does not exist) and resets to on.
+void TestUnifiedEveryFrameServiceKey() {
+    const bool wide = sizeof(void*) == 8;
+    Reset(false, false, {{"config_version", "4"}});
+    CHECK(g_config.unified_every_frame_service && OverridesBesidesUnified() == 0);
+    CHECK(PacingPipeline_GetConfig().unified_every_frame_service == wide);
+    CheckPipelineMatchesConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+    Reset(false, false, {{"config_version", "4"}, {"unified_every_frame_service", "false"}});
+    CHECK(!g_config.unified_every_frame_service && OverridesBesidesUnified() == 1);
+    CHECK(!PacingPipeline_GetConfig().unified_every_frame_service);
+    CheckPipelineMatchesConfig();
+    CHECK(Value(local_path, "FrameLimiter", "unified_every_frame_service") == "false");
+    char error[128] = {};
+    CHECK(Config_SetLiveKey("unified_every_frame_service", "on", error, sizeof(error)));
+    CHECK(g_config.unified_every_frame_service && OverridesBesidesUnified() == 0);
+    CHECK(PacingPipeline_GetConfig().unified_every_frame_service == wide);
+    CheckPipelineMatchesConfig();
+    CHECK(Config_SetLiveKey("unified_every_frame_service", "0", error, sizeof(error)));
+    CHECK(!g_config.unified_every_frame_service && OverridesBesidesUnified() == 1);
+    CHECK(!PacingPipeline_GetConfig().unified_every_frame_service);
+    CHECK(!Config_SetLiveKey("unified_every_frame_service", "maybe", error, sizeof(error)) &&
+          !g_config.unified_every_frame_service);
+    ResetDeveloperKeepingEarlierPipeline();
+    CHECK(g_config.unified_every_frame_service && OverridesBesidesUnified() == 0);
+    CHECK(PacingPipeline_GetConfig().unified_every_frame_service == wide);
+    CheckPipelineMatchesConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// unified_hold_share (developer, only read under unified_pacer): default 0 (off, no override), loads
+// from the INI, is clamped to [0, 0.25] (a non-finite value is 0), is saved, counts as one developer
+// override when above 0, is a live key (unparsable and non-finite values are refused, an
+// out-of-range one is clamped), reaches the pipeline (0 on Win32) and resets to 0.
+void TestUnifiedHoldShareKey() {
+    const bool wide = sizeof(void*) == 8;
+    struct Case { const char* value; double expected; };
+    for (const Case& test : {Case{"0.1", 0.1}, Case{"0.25", 0.25}, Case{"0", 0.0}, Case{"1", 0.25},
+            Case{"0.98", 0.25}, Case{"-0.5", 0.0}, Case{"inf", 0.0}}) {
+        Reset(false, false, {{"config_version", "4"}, {"unified_hold_share", test.value}});
+        CHECK(g_config.unified_hold_share == test.expected);
+        CheckPipelineMatchesConfig();
+        CHECK(PacingPipeline_GetConfig().unified_hold_share == (wide ? test.expected : 0.0));
+        CHECK(OverridesBesidesUnified() == (test.expected != 0.0 ? 1 : 0));
+        char saved[32] = {};
+        snprintf(saved, sizeof(saved), "%.6f", test.expected);
+        CHECK(Value(local_path, "FrameLimiter", "unified_hold_share") == saved);
+        ReleaseStart();CHECK(OwnerShutdown());
+    }
+    // "nan" loads as some finite value inside the range, whatever the C library's atof gives.
+    Reset(false, false, {{"config_version", "4"}, {"unified_hold_share", "nan"}});
+    CHECK(std::isfinite(g_config.unified_hold_share) && g_config.unified_hold_share >= 0.0 &&
+          g_config.unified_hold_share <= kPacingUnifiedHoldShareMax);
+    CheckPipelineMatchesConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    Reset(false, false, {{"config_version", "4"}});
+    CHECK(g_config.unified_hold_share == 0.0 && OverridesBesidesUnified() == 0);
+    char error[128] = {};
+    CHECK(Config_SetLiveKey("unified_hold_share", "0.2", error, sizeof(error)));
+    CHECK(g_config.unified_hold_share == 0.2 && OverridesBesidesUnified() == 1);
+    CheckPipelineMatchesConfig();
+    CHECK(PacingPipeline_GetConfig().unified_hold_share == (wide ? 0.2 : 0.0));
+    CHECK(Config_SetLiveKey("unified_hold_share", "5", error, sizeof(error)) && g_config.unified_hold_share == 0.25);
+    CHECK(Config_SetLiveKey("unified_hold_share", "-1", error, sizeof(error)) && g_config.unified_hold_share == 0.0);
+    CHECK(Config_SetLiveKey("unified_hold_share", "0.05", error, sizeof(error)));
+    for (const char* bad : {"nan", "inf", "-inf", "abc", "0.05x"}) {
+        CHECK(!Config_SetLiveKey("unified_hold_share", bad, error, sizeof(error)) && error[0] != '\0');
+        CHECK(g_config.unified_hold_share == 0.05);
+        CheckPipelineMatchesConfig();
+    }
+    g_config.unified_hold_share = std::numeric_limits<double>::quiet_NaN();
+    ValidateConfig();
+    CHECK(g_config.unified_hold_share == 0.0);
+    g_config.unified_hold_share = 7.0;
+    ValidateConfig();
+    CHECK(g_config.unified_hold_share == 0.25);
+    g_config.unified_hold_share = 0.2;
+    ResetDeveloperKeepingEarlierPipeline();
+    CHECK(g_config.unified_hold_share == 0.0 && OverridesBesidesUnified() == 0);
+    CheckPipelineMatchesConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// unified_queue_law, unified_queue_rank, unified_queue_allow_us (developer, only read under
+// unified_pacer): the law is on by default and the numbers 2 and 4000; they load, are clamped
+// (rank 1..8, allowance 0..20000), are saved, count as developer overrides only away from their
+// defaults, are live keys (an unparsable value is refused, an out-of-range one clamped), reach the
+// pipeline (the law is forced off on Win32), the law forces the probe atomic on and sets the feed
+// atomic (64-bit, while the unified pacer is on), and reset to the defaults. The probe key is on by
+// default too; the earlier pipeline (unified_pacer false) neither feeds nor needs the law.
+void TestUnifiedQueueLawKeys() {
+    const bool wide = sizeof(void*) == 8;
+    // Defaults with the unified pacer on: the law and the probe published, no override.
+    Reset(false, false, {{"config_version", "5"}, {"unified_pacer", "true"}});
+    CHECK(g_config.unified_queue_law && g_config.gpu_queue_probe && OverridesBesidesUnified() == 0);
+    CHECK(PacingPipeline_GetConfig().unified_queue_law == wide);
+    CHECK(g_gpu_queue_probe.load() == wide && g_gpu_queue_law_feed.load() == wide);
+    CheckPipelineMatchesConfig();
+    CHECK(Value(local_path, "FrameLimiter", "unified_queue_law") == "true");
+    CHECK(Value(local_path, "FrameLimiter", "gpu_queue_probe") == "true");
+    ReleaseStart();CHECK(OwnerShutdown());
+    // The earlier pipeline: the law is not in use, nothing is fed; the probe key alone keeps the probe on.
+    Reset(false, false, {{"config_version", "5"}});
+    CHECK(g_config.unified_queue_law && !g_gpu_queue_law_feed.load() && g_gpu_queue_probe.load() == wide);
+    CheckPipelineMatchesConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+    // The law and the probe key off from the INI: two overrides, nothing published.
+    Reset(false, false, {{"config_version", "5"}, {"unified_pacer", "true"}, {"unified_queue_law", "false"},
+        {"gpu_queue_probe", "false"}});
+    CHECK(!g_config.unified_queue_law && !g_config.gpu_queue_probe && OverridesBesidesUnified() == 2);
+    CHECK(!PacingPipeline_GetConfig().unified_queue_law);
+    CHECK(!g_gpu_queue_probe.load() && !g_gpu_queue_law_feed.load());
+    CheckPipelineMatchesConfig();
+    CHECK(Value(local_path, "FrameLimiter", "unified_queue_law") == "false");
+    CHECK(Value(local_path, "FrameLimiter", "gpu_queue_probe") == "false");
+    char error[128] = {};
+    // The law forces the probe on although the user's probe key is off, and feeds it.
+    CHECK(Config_SetLiveKey("unified_queue_law", "on", error, sizeof(error)) && g_config.unified_queue_law);
+    CHECK(g_gpu_queue_probe.load() == wide && g_gpu_queue_law_feed.load() == wide && !g_config.gpu_queue_probe);
+    CheckPipelineMatchesConfig();
+    CHECK(Config_SetLiveKey("unified_queue_law", "0", error, sizeof(error)) && !g_config.unified_queue_law);
+    CHECK(!g_gpu_queue_probe.load() && !g_gpu_queue_law_feed.load());
+    CheckPipelineMatchesConfig();
+    // The user's own probe key survives the law switching off.
+    CHECK(Config_SetLiveKey("gpu_queue_probe", "on", error, sizeof(error)));
+    CHECK(g_gpu_queue_probe.load() == wide && !g_gpu_queue_law_feed.load());
+    CHECK(Config_SetLiveKey("unified_queue_law", "1", error, sizeof(error)));
+    CHECK(g_gpu_queue_probe.load() == wide && g_gpu_queue_law_feed.load() == wide);
+    CHECK(Config_SetLiveKey("unified_queue_law", "0", error, sizeof(error)));
+    CHECK(g_gpu_queue_probe.load() == wide && !g_gpu_queue_law_feed.load());
+    CHECK(!Config_SetLiveKey("unified_queue_law", "maybe", error, sizeof(error)) && !g_config.unified_queue_law);
+    CHECK(!Config_SetLiveKey("gpu_queue_probe", "maybe", error, sizeof(error)) && g_config.gpu_queue_probe);
+    // The developer reset returns both to on.
+    Config_ResetDeveloperSettings();
+    CHECK(g_config.unified_queue_law && g_config.gpu_queue_probe && OverridesBesidesUnified() == 0);
+    CHECK(g_gpu_queue_probe.load() == wide && g_gpu_queue_law_feed.load() == wide);
+    CheckPipelineMatchesConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    struct Case { const char* value; int expected; };
+    for (const Case& test : {Case{"1", 1}, Case{"8", 8}, Case{"4", 4}, Case{"2", 2}, Case{"0", 1}, Case{"-3", 1},
+            Case{"9", 8}, Case{"500", 8}}) {
+        Reset(false, false, {{"config_version", "4"}, {"unified_queue_rank", test.value}});
+        CHECK(g_config.unified_queue_rank == test.expected);
+        CheckPipelineMatchesConfig();
+        CHECK(PacingPipeline_GetConfig().unified_queue_rank == test.expected);
+        CHECK(OverridesBesidesUnified() == (test.expected != 2 ? 1 : 0));
+        char saved[32] = {};
+        snprintf(saved, sizeof(saved), "%d", test.expected);
+        CHECK(Value(local_path, "FrameLimiter", "unified_queue_rank") == saved);
+        ReleaseStart();CHECK(OwnerShutdown());
+    }
+    for (const Case& test : {Case{"0", 0}, Case{"1500", 1500}, Case{"4000", 4000}, Case{"20000", 20000},
+            Case{"20001", 20000}, Case{"999999", 20000}, Case{"-1", 0}}) {
+        Reset(false, false, {{"config_version", "4"}, {"unified_queue_allow_us", test.value}});
+        CHECK(g_config.unified_queue_allow_us == test.expected);
+        CheckPipelineMatchesConfig();
+        CHECK(PacingPipeline_GetConfig().unified_queue_allow_us == test.expected);
+        CHECK(OverridesBesidesUnified() == (test.expected != 4000 ? 1 : 0));
+        char saved[32] = {};
+        snprintf(saved, sizeof(saved), "%d", test.expected);
+        CHECK(Value(local_path, "FrameLimiter", "unified_queue_allow_us") == saved);
+        ReleaseStart();CHECK(OwnerShutdown());
+    }
+
+    Reset(false, false, {{"config_version", "4"}});
+    CHECK(Config_SetLiveKey("unified_queue_rank", "5", error, sizeof(error)) && g_config.unified_queue_rank == 5);
+    CHECK(Config_SetLiveKey("unified_queue_rank", "50", error, sizeof(error)) && g_config.unified_queue_rank == 8);
+    CHECK(Config_SetLiveKey("unified_queue_rank", "3", error, sizeof(error)));
+    CHECK(Config_SetLiveKey("unified_queue_allow_us", "2500", error, sizeof(error)) &&
+          g_config.unified_queue_allow_us == 2500);
+    CHECK(Config_SetLiveKey("unified_queue_allow_us", "30000", error, sizeof(error)) &&
+          g_config.unified_queue_allow_us == 20000);
+    CHECK(Config_SetLiveKey("unified_queue_allow_us", "2500", error, sizeof(error)));
+    CheckPipelineMatchesConfig();
+    CHECK(OverridesBesidesUnified() == 2);
+    for (const char* bad : {"abc", "2x", ""}) {
+        CHECK(!Config_SetLiveKey("unified_queue_rank", bad, error, sizeof(error)) && g_config.unified_queue_rank == 3);
+        CHECK(!Config_SetLiveKey("unified_queue_allow_us", bad, error, sizeof(error)) &&
+              g_config.unified_queue_allow_us == 2500);
+    }
+    g_config.unified_queue_rank = 40;
+    g_config.unified_queue_allow_us = -9;
+    ValidateConfig();
+    CHECK(g_config.unified_queue_rank == 8 && g_config.unified_queue_allow_us == 0);
+    g_config.unified_queue_rank = -2;
+    ValidateConfig();
+    CHECK(g_config.unified_queue_rank == 1);
+    ResetDeveloperKeepingEarlierPipeline();
+    CHECK(g_config.unified_queue_rank == 2 && g_config.unified_queue_allow_us == 4000 &&
+          g_config.unified_queue_law && OverridesBesidesUnified() == 0);
+    CheckPipelineMatchesConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// unified_queue_need_frames (developer, only read with unified_queue_law): default 4; loads, is
+// clamped to 1..16, is saved, counts as one developer override only away from 4, is a live key (an
+// unparsable value is refused, an out-of-range one clamped), reaches the pipeline on both
+// architectures (it has no effect without the law) and resets to 4.
+void TestUnifiedQueueNeedFramesKey() {
+    struct Case { const char* value; int expected; };
+    for (const Case& test : {Case{"1", 1}, Case{"4", 4}, Case{"16", 16}, Case{"8", 8}, Case{"0", 1},
+            Case{"-7", 1}, Case{"17", 16}, Case{"1000", 16}}) {
+        Reset(false, false, {{"config_version", "4"}, {"unified_queue_need_frames", test.value}});
+        CHECK(g_config.unified_queue_need_frames == test.expected);
+        CheckPipelineMatchesConfig();
+        CHECK(PacingPipeline_GetConfig().unified_queue_need_frames == test.expected);
+        CHECK(OverridesBesidesUnified() == (test.expected != 4 ? 1 : 0));
+        char saved[32] = {};
+        snprintf(saved, sizeof(saved), "%d", test.expected);
+        CHECK(Value(local_path, "FrameLimiter", "unified_queue_need_frames") == saved);
+        ReleaseStart();CHECK(OwnerShutdown());
+    }
+    Reset(false, false, {{"config_version", "4"}});
+    char error[128] = {};
+    CHECK(Config_SetLiveKey("unified_queue_need_frames", "6", error, sizeof(error)) &&
+          g_config.unified_queue_need_frames == 6);
+    CHECK(OverridesBesidesUnified() == 1);
+    CHECK(Config_SetLiveKey("unified_queue_need_frames", "99", error, sizeof(error)) &&
+          g_config.unified_queue_need_frames == 16);
+    CHECK(Config_SetLiveKey("unified_queue_need_frames", "-1", error, sizeof(error)) &&
+          g_config.unified_queue_need_frames == 1);
+    CHECK(Config_SetLiveKey("unified_queue_need_frames", "3", error, sizeof(error)));
+    CheckPipelineMatchesConfig();
+    for (const char* bad : {"abc", "2x", ""}) {
+        CHECK(!Config_SetLiveKey("unified_queue_need_frames", bad, error, sizeof(error)) &&
+              g_config.unified_queue_need_frames == 3);
+    }
+    g_config.unified_queue_need_frames = 40;
+    ValidateConfig();
+    CHECK(g_config.unified_queue_need_frames == 16);
+    g_config.unified_queue_need_frames = 0;
+    ValidateConfig();
+    CHECK(g_config.unified_queue_need_frames == 1);
+    ResetDeveloperKeepingEarlierPipeline();
+    CHECK(g_config.unified_queue_need_frames == 4 && OverridesBesidesUnified() == 0);
+    CheckPipelineMatchesConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// unified_queue_upstream (developer): default 0 (off); loads, is clamped to 0..1 (the removed modes 2
+// and 3 of an older INI load as 1, silently), is saved, counts as one developer override only away
+// from 0, is a live key (an unparsable value is refused, an out-of-range one clamped), reaches the
+// pipeline snapshot and the hook gate atomic (64-bit; 0 on Win32) and resets to 0. The removed keys
+// unified_queue_upstream_lead_us and unified_queue_upstream_feed_permille of an older INI are ignored.
+void TestUnifiedQueueUpstreamKey() {
+    const bool wide = sizeof(void*) == 8;
+    CHECK(kPacingUnifiedQueueUpstreamMax == 1);
+    struct Case { const char* value; int expected; };
+    for (const Case& test : {Case{"0", 0}, Case{"1", 1}, Case{"2", 1}, Case{"3", 1}, Case{"4", 1}, Case{"99", 1},
+            Case{"-1", 0}, Case{"-50", 0}}) {
+        Reset(false, false, {{"config_version", "4"}, {"unified_queue_upstream", test.value}});
+        CHECK(g_config.unified_queue_upstream == test.expected);
+        CheckPipelineMatchesConfig();
+        CHECK(PacingPipeline_GetConfig().unified_queue_upstream == (wide ? test.expected : 0));
+        CHECK(g_unified_queue_upstream.load() == (wide ? test.expected : 0));
+        CHECK(OverridesBesidesUnified() == (test.expected != 0 ? 1 : 0));
+        char saved[32] = {};
+        snprintf(saved, sizeof(saved), "%d", test.expected);
+        CHECK(Value(local_path, "FrameLimiter", "unified_queue_upstream") == saved);
+        ReleaseStart();CHECK(OwnerShutdown());
+    }
+    // An INI that still holds the removed keys loads as without them.
+    Reset(false, false, {{"config_version", "4"}, {"unified_queue_upstream_lead_us", "1500"},
+        {"unified_queue_upstream_feed_permille", "300"}});
+    CHECK(g_config.unified_queue_upstream == 0 && OverridesBesidesUnified() == 0);
+    CheckPipelineMatchesConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+    Reset(false, false, {{"config_version", "4"}});
+    CHECK(g_unified_queue_upstream.load() == 0);
+    char error[128] = {};
+    CHECK(Config_SetLiveKey("unified_queue_upstream", "1", error, sizeof(error)) &&
+          g_config.unified_queue_upstream == 1);
+    CHECK(g_unified_queue_upstream.load() == (wide ? 1 : 0) && OverridesBesidesUnified() == 1);
+    CHECK(Config_SetLiveKey("unified_queue_upstream", "7", error, sizeof(error)) &&
+          g_config.unified_queue_upstream == 1);
+    CHECK(Config_SetLiveKey("unified_queue_upstream", "2", error, sizeof(error)) &&
+          g_config.unified_queue_upstream == 1);
+    CHECK(g_unified_queue_upstream.load() == (wide ? 1 : 0));
+    CHECK(Config_SetLiveKey("unified_queue_upstream", "0", error, sizeof(error)) &&
+          g_unified_queue_upstream.load() == 0);
+    CHECK(Config_SetLiveKey("unified_queue_upstream", "3", error, sizeof(error)) &&
+          g_config.unified_queue_upstream == 1);
+    CheckPipelineMatchesConfig();
+    for (const char* bad : {"abc", "1x", ""}) {
+        CHECK(!Config_SetLiveKey("unified_queue_upstream", bad, error, sizeof(error)) &&
+              g_config.unified_queue_upstream == 1);
+    }
+    g_config.unified_queue_upstream = 9;
+    ValidateConfig();
+    CHECK(g_config.unified_queue_upstream == 1);
+    g_config.unified_queue_upstream = -3;
+    ValidateConfig();
+    CHECK(g_config.unified_queue_upstream == 0);
+    g_config.unified_queue_upstream = 1;
+    ResetDeveloperKeepingEarlierPipeline();
+    CHECK(g_config.unified_queue_upstream == 0 && g_unified_queue_upstream.load() == 0 &&
+          OverridesBesidesUnified() == 0);
+    CheckPipelineMatchesConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// gpu_queue_probe_source (developer): default 1; loads, is clamped to 0..1, is saved, counts as one
+// developer override only away from 1, is a live key (an unparsable value is refused, an
+// out-of-range one clamped), reaches the pipeline snapshot and the probe's atomic (64-bit; 0 on
+// Win32; the probe key itself is independent) and resets to 1.
+void TestGpuQueueProbeSourceKey() {
+    const bool wide = sizeof(void*) == 8;
+    struct Case { const char* value; int expected; };
+    for (const Case& test : {Case{"0", 0}, Case{"1", 1}, Case{"2", 1}, Case{"99", 1}, Case{"-1", 0}, Case{"-9", 0}}) {
+        Reset(false, false, {{"config_version", "5"}, {"gpu_queue_probe_source", test.value}});
+        CHECK(g_config.gpu_queue_probe_source == test.expected);
+        CheckPipelineMatchesConfig();
+        CHECK(PacingPipeline_GetConfig().gpu_queue_probe_source == (wide ? test.expected : 0));
+        CHECK(g_gpu_queue_probe_source.load() == (wide ? test.expected : 0));
+        CHECK(g_config.gpu_queue_probe);
+        CHECK(OverridesBesidesUnified() == (test.expected != 1 ? 1 : 0));
+        char saved[32] = {};
+        snprintf(saved, sizeof(saved), "%d", test.expected);
+        CHECK(Value(local_path, "FrameLimiter", "gpu_queue_probe_source") == saved);
+        ReleaseStart();CHECK(OwnerShutdown());
+    }
+    Reset(false, false, {{"config_version", "5"}});
+    CHECK(g_gpu_queue_probe_source.load() == (wide ? 1 : 0));
+    char error[128] = {};
+    CHECK(Config_SetLiveKey("gpu_queue_probe_source", "0", error, sizeof(error)) &&
+          g_config.gpu_queue_probe_source == 0);
+    CHECK(g_gpu_queue_probe_source.load() == 0 && OverridesBesidesUnified() == 1);
+    CHECK(Config_SetLiveKey("gpu_queue_probe_source", "5", error, sizeof(error)) &&
+          g_config.gpu_queue_probe_source == 1);
+    CHECK(g_gpu_queue_probe_source.load() == (wide ? 1 : 0));
+    CHECK(Config_SetLiveKey("gpu_queue_probe_source", "0", error, sizeof(error)));
+    CheckPipelineMatchesConfig();
+    for (const char* bad : {"abc", "1x", ""}) {
+        CHECK(!Config_SetLiveKey("gpu_queue_probe_source", bad, error, sizeof(error)) &&
+              g_config.gpu_queue_probe_source == 0);
+    }
+    g_config.gpu_queue_probe_source = 9;
+    ValidateConfig();
+    CHECK(g_config.gpu_queue_probe_source == 1);
+    g_config.gpu_queue_probe_source = -3;
+    ValidateConfig();
+    CHECK(g_config.gpu_queue_probe_source == 0);
+    ResetDeveloperKeepingEarlierPipeline();
+    CHECK(g_config.gpu_queue_probe_source == 1 && g_gpu_queue_probe_source.load() == (wide ? 1 : 0) &&
+          OverridesBesidesUnified() == 0);
+    CheckPipelineMatchesConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
 }
 
 // Developer control file: Config_SetLiveKey sets one live key as the OSD does
@@ -1083,6 +1677,7 @@ int main() {
     caller_thread = GetCurrentThreadId();
     TestPacingPipelineDefaults();
     TestRecommendedDefaultsMigration();
+    TestQueueDefaultsMigration();
     TestDeveloperSettingsReset();
     TestSmoothingParsing();
     TestMarkerForwardOrderParsing();
@@ -1093,6 +1688,14 @@ int main() {
     TestAdaptiveCapHoldRoomKey();
     TestBypassLowLatencyOffKey();
     TestMeasurementKeys();
+    TestUnifiedPacerKey();
+    TestUnifiedQueueTargetKey();
+    TestUnifiedEveryFrameServiceKey();
+    TestUnifiedHoldShareKey();
+    TestUnifiedQueueLawKeys();
+    TestUnifiedQueueNeedFramesKey();
+    TestUnifiedQueueUpstreamKey();
+    TestGpuQueueProbeSourceKey();
     TestFlipMeteringOffKey();
     TestLiveKeySetter();
     TestSourcePlacementParsing();

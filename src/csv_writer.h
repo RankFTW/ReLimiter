@@ -61,6 +61,7 @@ struct PacingQueueDrops {
     uint64_t present = 0;
     uint64_t gate = 0;
     uint64_t ready = 0;
+    uint64_t gpu_queue = 0; // not a CSV column
     uint64_t reflex = 0;
     uint64_t display = 0;
 };

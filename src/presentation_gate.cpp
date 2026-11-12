@@ -139,9 +139,11 @@ void PresentGate_Execute(const PacingPlanKey& key, PacingRung rung,
 
     CadenceGridSnapshot snapshot{};
     int64_t target_qpc = 0;
+    const bool key_on = PacingPipeline_UnifiedPacerKey();
     const bool resolved = g_cadence_grid_publication.Read(&snapshot) &&
         CadenceGrid_ResolveOutputTarget(snapshot, key.controller_generation, plan.grid_index,
-            g_cadence_output_tracker, &target_qpc, nullptr);
+            g_cadence_output_tracker, &target_qpc, nullptr, 1.0, key_on,
+            key_on ? plan.hold_advance_us : 0.0);
     const int64_t decision_qpc = NowQpc();
     if (!resolved) {
         FinishClaim(plan, rung, PacingPlanStatus::Stale, decision_qpc, outcome);
