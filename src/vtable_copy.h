@@ -190,6 +190,17 @@ public:
             if (state_.compare_exchange_weak(state, next, std::memory_order_acq_rel, std::memory_order_acquire)) return;
         }
     }
+    // The next generation, in one step: the generation moves and the run restarts together, and that is the only way
+    // the generation changes at run time (the route's removal and every selection use it). Returns the new one.
+    uint32_t Advance() noexcept {
+        uint64_t state = state_.load(std::memory_order_acquire);
+        for (;;) {
+            const uint32_t next_generation = (GenerationOf(state) + 1) & kGenerationMask;
+            const uint64_t next = Pack(next_generation, 0, (state & kFired) != 0);
+            if (state_.compare_exchange_weak(state, next, std::memory_order_acq_rel, std::memory_order_acquire))
+                return next_generation;
+        }
+    }
     uint32_t Count() const noexcept { return static_cast<uint32_t>(state_.load(std::memory_order_acquire) & kCountMask); }
     uint32_t Generation() const noexcept { return GenerationOf(state_.load(std::memory_order_acquire)); }
     bool Fired() const noexcept { return (state_.load(std::memory_order_acquire) & kFired) != 0; }

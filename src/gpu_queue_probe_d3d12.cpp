@@ -195,6 +195,7 @@ struct Dependency {
     dq::RetainGate retain_gate;                // queue references taken atomically with the lifetime check
     std::atomic<uint64_t> windows_kept{0};     // windows that did not qualify while a queue was adopted (adoption kept)
     std::atomic<uint64_t> retain_timeouts{0};  // queue destructions that gave up waiting for a retainer inside its window
+    std::atomic<uint64_t> retain_leaks{0};     // ... and took (and never release) one native reference of that queue instead
     uint32_t unqualified_logged_session = 0;   // the session in which such a window was logged (once per session)
 };
 Dependency dep;
@@ -804,7 +805,8 @@ void LogDependency(const char* reason) noexcept {
              "time-out) %llu, of them lock time-outs %llu; Present thread pulls skipped on a lock time-out %llu (their "
              "frames were evaluated by the next pull), backlog overflows %llu; clears applied later by the next lock "
              "holder %llu; windows that did not qualify while a queue was adopted (adoption kept) %llu; queue "
-             "destructions that stopped waiting for a queue reference in flight %llu; boundaries from the dependency Signal "
+             "destructions that stopped waiting for a queue reference in flight %llu (%llu native queue references "
+             "taken and never released, on purpose); boundaries from the dependency Signal "
              "%llu, tags %llu (%llu pushed at the readiness site); "
              "core join_ambiguous %llu, join_missing %llu, untagged_boundaries %llu, tags_unmatched %llu, "
              "irregular_boundary_events %llu, frames_invalidated_by_irregular_boundary %llu",
@@ -814,7 +816,7 @@ void LogDependency(const char* reason) noexcept {
              u(dep.tables.DroppedWaits()), u(dep.tables.DroppedLists()), u(dep.tables.RowOverflow()),
              u(dep.stale_decisions.load()), u(dep.tables.PublishTimeouts()), u(dep.reader.pulls_skipped()),
              u(dep.backlog_overflows.load()), u(dep.tables.ClearsDeferred()), u(dep.windows_kept.load()),
-             u(dep.retain_timeouts.load()), u(g.dep_boundaries.load()),
+             u(dep.retain_timeouts.load()), u(dep.retain_leaks.load()), u(g.dep_boundaries.load()),
              u(g.dep_tags.load()), u(g.dep_tags_late.load()), u(counters.join_ambiguous), u(counters.join_missing),
              u(counters.untagged_boundaries), u(counters.tags_unmatched), u(counters.irregular_boundary_events),
              u(counters.frames_invalidated_by_irregular_boundary));
@@ -1660,7 +1662,14 @@ void GpuQueueProbe_OnQueueDestroy(void* native_queue) noexcept {
         // native Release, one that was not never touches the pointer.
         DependencyInvalidate(true);
         static constexpr unsigned kRetainWaitSpins = 2048;
-        if (!dep.retain_gate.WaitForRetainers(kRetainWaitSpins)) dep.retain_timeouts.fetch_add(1, std::memory_order_relaxed);
+        // A retainer still inside after the bound may be descheduled between its epoch check and its AddRef: this
+        // destroy callback runs before the queue's final native Release, so one reference taken here is on a live object;
+        // it is NEVER released (a deliberate, counted leak of one object), which keeps the retainer's later AddRef safe.
+        const auto leak = [native_queue] {
+            if (GpuReadinessQueue_Retain(static_cast<ID3D12CommandQueue*>(native_queue)))
+                dep.retain_leaks.fetch_add(1, std::memory_order_relaxed);
+        };
+        if (!dep.retain_gate.WaitOrLeak(kRetainWaitSpins, leak)) dep.retain_timeouts.fetch_add(1, std::memory_order_relaxed);
     }
     if (native_queue && g.identity.load(std::memory_order_acquire) == static_cast<ID3D12CommandQueue*>(native_queue)) {
         // The law's session of this queue is retired explicitly: its window is emptied, its outstanding grants settled

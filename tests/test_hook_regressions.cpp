@@ -899,10 +899,10 @@ void TestVtableCopyEntry() {
     // selecting an object again (its existing copy kept: no install, no adoption) refreshes the fallback's identity.
     static FakeObject bob;
     bob.vptr = original_vptr;
-    const uint32_t generation_before = s_route_generation.load();
+    const uint32_t generation_before = s_fallback.Generation();
     s_native_handle_override = handle_of(&bob);
     VSync_OnNativeSelected(handle_of(&bob));
-    Check(s_route_object.load() == handle_of(&bob) && s_fallback.Count() == 0 && s_route_generation.load() != generation_before,
+    Check(s_route_object.load() == handle_of(&bob) && s_fallback.Count() == 0 && s_fallback.Generation() != generation_before,
           "selecting another object hands the fallback's identity over and starts its run");
     const uint64_t selected_entries = s_selected_vtable_entries.load(), all_entries = s_vtable_entries.load();
     reinterpret_cast<PFN_Present>(carried.vptr[8])(reinterpret_cast<IDXGISwapChain*>(&carried), 3, 4); // an unselected object's entry
@@ -911,10 +911,10 @@ void TestVtableCopyEntry() {
     for (int i = 0; i < 40; ++i) VSync_NoteFinishedPresent(handle_of(&carried));
     Check(!s_fallback.Fired() && s_fallback.Count() == 0, "finishes of an unselected swapchain neither count nor consume the one-shot");
     const size_t records_reselect = s_records.Size();
-    const uint32_t generation_bob = s_route_generation.load();
+    const uint32_t generation_bob = s_fallback.Generation();
     s_native_handle_override = handle_of(&carried);
     VSync_OnNativeSelected(handle_of(&carried)); // existing binding, copy kept
-    Check(s_route_object.load() == handle_of(&carried) && s_route_generation.load() != generation_bob &&
+    Check(s_route_object.load() == handle_of(&carried) && s_fallback.Generation() != generation_bob &&
           s_fallback.Count() == 0 && s_records.Size() == records_reselect && carried.vptr != original_vptr,
           "selecting an object whose copy is kept publishes its identity again");
     for (int i = 0; i < 10; ++i) VSync_NoteFinishedPresent(handle_of(&carried));
@@ -923,7 +923,22 @@ void TestVtableCopyEntry() {
     Check(s_selected_vtable_entries.load() == selected_before_bob, "the other object's entry is not selected-object evidence");
     VSync_NoteFinishedPresent(handle_of(&carried));
     Check(s_fallback.Count() == 11 && !s_fallback.Fired(), "and it does not reset the selected object's run");
+    // Removing the selected route at destroy advances the fallback's generation: a finisher that counted 31 scopes for
+    // the object that is now gone cannot commit the one-shot, and a later object's full run still fires once.
+    s_native_handle_override = handle_of(&bob);
+    VSync_OnNativeSelected(handle_of(&bob));
+    for (int i = 0; i < 31; ++i) VSync_NoteFinishedPresent(handle_of(&bob));
+    Check(s_route_object.load() == handle_of(&bob) && s_fallback.Count() == 31 && !s_fallback.Fired(), "31 scopes counted for the object");
+    const uint32_t generation_gone = s_fallback.Generation();
     VSync_OnNativeDestroyed(handle_of(&bob));
+    Check(s_route_object.load() == 0 && s_fallback.Generation() != generation_gone && s_fallback.Count() == 0,
+          "destroying the selected route removes it and advances the counter's generation in one step");
+    Check(!s_fallback.NoteScope(false, generation_gone) && !s_fallback.Fired(),
+          "the stale 32nd finisher is refused: the one-shot is not consumed for an object that is gone");
+    VSync_NoteFinishedPresent(handle_of(&bob));
+    Check(s_fallback.Count() == 0, "a finish of the destroyed object counts nothing");
+    s_native_handle_override = handle_of(&carried);
+    VSync_OnNativeSelected(handle_of(&carried)); // the next selected object starts its own run (it fires below, once)
     reinterpret_cast<PFN_Present>(carried.vptr[8])(reinterpret_cast<IDXGISwapChain*>(&carried), 3, 4); // a vtable entry runs
     VSync_NoteFinishedPresent(handle_of(&carried));
     Check(!s_fallback.Fired() && s_fallback.Count() == 0, "a scope with a vtable entry resets the run");

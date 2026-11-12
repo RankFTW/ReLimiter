@@ -691,8 +691,7 @@ static std::atomic<uint32_t> s_vtable_installs{0}, s_vtable_failures{0}, s_vtabl
 // (vtable_copy::FallbackCounter). s_vtable_entries counts every vtable entry (diagnostics); the fallback reads only
 // s_selected_vtable_entries, the entries whose body ran for the swap manager's selected object, so another object's
 // entries never count or reset the selected object's run.
-static std::atomic<uintptr_t> s_route_object{0};   // the fallback's selected identity: the object ...
-static std::atomic<uint32_t> s_route_generation{0}; // ... and the generation of its run (every actual selection)
+static std::atomic<uintptr_t> s_route_object{0};   // the fallback's selected identity: the object (its run's generation lives in s_fallback)
 static std::atomic<uint64_t> s_vtable_entries{0};
 static std::atomic<uint64_t> s_selected_vtable_entries{0};
 static std::atomic<uint64_t> s_entries_at_last_finish{0};
@@ -705,9 +704,8 @@ static void PublishFallbackIdentity(uintptr_t object) noexcept {
     // reads the new generation sees the new owner; one that counted for the old generation is refused by the counter
     // (its generation is no longer current), also at the commit of the one-shot.
     s_route_object.store(object, std::memory_order_release);
-    const uint32_t generation = s_route_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
     s_entries_at_last_finish.store(s_selected_vtable_entries.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    s_fallback.Reset(generation);
+    s_fallback.Advance(); // the generation and the run's reset are ONE step in the counter
 }
 
 static bool GuardedReadPointer(void*, uintptr_t address, uintptr_t* value) noexcept {
@@ -853,7 +851,7 @@ static void DescribeVtableRoute(uint64_t native, char* out, size_t size) noexcep
                   s_vptr_restored.load(std::memory_order_relaxed),
                   static_cast<unsigned long long>(s_vtable_entries.load(std::memory_order_relaxed)),
                   static_cast<unsigned long long>(s_selected_vtable_entries.load(std::memory_order_relaxed)),
-                  s_route_generation.load(std::memory_order_relaxed), inline_state);
+                  s_fallback.Generation(), inline_state);
 }
 
 // Native route diagnostics while the route is not qualified: a scope/marker-time mismatch is logged
@@ -1600,8 +1598,9 @@ void VSync_OnNativeDestroyed(uint64_t native) {
         s_vtable_object.store(0, std::memory_order_release);
         s_vtable_expected.store(0, std::memory_order_relaxed);
     }
-    uintptr_t route = native;
-    s_route_object.compare_exchange_strong(route, 0, std::memory_order_relaxed);
+    // The selected route is removed with its generation: a finisher that counted for this object (count 31) can no
+    // longer commit the one-shot for an object that is gone (under the vtable lock, as every publish).
+    if (s_route_object.load(std::memory_order_relaxed) == native) PublishFallbackIdentity(0);
 }
 
 void VSync_RestoreVtables() {
@@ -1616,7 +1615,7 @@ void VSync_RestoreVtables() {
     }
     s_vtable_object.store(0, std::memory_order_release);
     s_vtable_expected.store(0, std::memory_order_relaxed);
-    s_route_object.store(0, std::memory_order_relaxed);
+    PublishFallbackIdentity(0);
     if (restored || foreign)
         LOG_INFO("Hooks: vtable copies at shutdown: %u object vptrs restored, %u no longer ours and left alone "
                  "(the copies and detours stay mapped)", restored, foreign);
@@ -1750,9 +1749,9 @@ void VSync_NoteFinishedPresent(uint64_t native) {
     if (!native || s_fallback.Fired()) return;
     // Only the finish of the swapchain that is selected NOW and whose copy the fallback's identity names counts: a
     // finish of any other swapchain neither counts nor consumes the one-shot.
-    // The generation is read first and the owner after it: a publish stores the owner before it bumps the generation,
+    // The generation is read first and the owner after it: a publish stores the owner before it advances the generation,
     // so a generation read here belongs to an owner read here or later.
-    const uint32_t generation = s_route_generation.load(std::memory_order_acquire);
+    const uint32_t generation = s_fallback.Generation();
     if (s_route_object.load(std::memory_order_acquire) != native || SwapMgr_GetNativeHandle() != native) return;
     // A scope counts as bypassed when no vtable entry of THIS selected object ran since the previous finished scope
     // (any thread: with frame generation the native Present can run on another thread than ReShade's present event).

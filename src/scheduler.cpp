@@ -549,7 +549,6 @@ bool s_up_reconcile = false;       // OnMarker reconciles the Sleep-mode tuple: 
 bool s_up_idle_regime = false;     // the idle regime as OnMarker last saw it (key on)
 double s_up_idle_interval_us = 0.0; // I_idle of the newest OnMarker (0 = not idle; key on)
 bool s_up_law_feed_active = false;  // owner: the probe's feed is being drained for the queue law (unified_queue_law)
-uint64_t s_up_retired_session_seen = 0; // owner: the newest feed-retired session already applied to the law
 // Reflex Sleep on the presenting device: written by the Sleep hook (any
 // thread), read by the owner for placement availability.
 std::atomic<int64_t> s_last_reflex_sleep_qpc{0};
@@ -1022,14 +1021,14 @@ static void DrainQueueLawFeed(bool law_on) noexcept
         s_up_law_feed_active = law_on;
     }
     if (!law_on) return;
-    // A retirement the probe published (its adopted queue was destroyed) first: the law's window is
-    // emptied, its outstanding grants settled, and records of that session still in the ring are dropped
-    // by the pacer when they are popped below.
+    // The retirement watermark the probe published (its adopted queue was destroyed) first, on EVERY
+    // active drain, never cached: RetireQueueSession is idempotent (an older or already-retired session
+    // changes nothing), so after a law off/on or a stage reset the pacer is told again and a late
+    // record of the retired session is dropped. The window is emptied, its outstanding grants settled,
+    // and records of that session still in the ring are dropped by the pacer when popped below.
     const uint64_t retired = GpuQueueLawFeed_RetiredSession();
-    if (retired != s_up_retired_session_seen) {
-        s_up_retired_session_seen = retired;
+    if (retired != 0)
         s_source_stage.RetireQueueSession(retired);
-    }
     PacingGpuQueueRecord record;
     while (GpuQueueLawFeed_Pop(&record))
         s_source_stage.OnQueueRecord(record);

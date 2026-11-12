@@ -1816,6 +1816,25 @@ namespace
         off.pacer.RetireQueueSession(3);
         CHECK(off.pacer.QueueLawSummary().records_retired == 0);
 
+        // Law off then on: the pacer forgot the session, the drain tells it again (the watermark is applied on
+        // every active drain, the call is idempotent), and a late record of the retired session is dropped.
+        Rig toggled(true);
+        for (int i = 0; i < 12; ++i)
+            toggled.pacer.OnQueueRecord(Session(Record(8000.0, 0.0, 500.0), 7));
+        toggled.pacer.RetireQueueSession(7);
+        UnifiedOptions toggle_options = toggled.pacer.Options();
+        toggle_options.queue_law = false;
+        toggled.pacer.SetOptions(toggle_options);
+        toggle_options.queue_law = true;
+        toggled.pacer.SetOptions(toggle_options);
+        // (a late record before the drain re-applies the watermark would be accepted: the drain applies it first)
+        toggled.pacer.RetireQueueSession(7);
+        toggled.pacer.RetireQueueSession(7); // every drain: idempotent
+        toggled.pacer.OnQueueRecord(Session(Record(8000.0, 0.0, 500.0), 7));
+        CHECK(toggled.pacer.QueueLawSummary().records_retired == 1);
+        toggled.pacer.OnQueueRecord(Session(Record(8000.0, 0.0, 500.0), 8));
+        CHECK(toggled.pacer.QueueLawSummary().records_retired == 1 && !toggled.pacer.QueueLawInUse());
+
         // The feed's retired-session value only grows, from any thread.
         CHECK(GpuQueueLawFeed_RetiredSession() == 0 || GpuQueueLawFeed_RetiredSession() > 0);
         const uint64_t base = GpuQueueLawFeed_RetiredSession();

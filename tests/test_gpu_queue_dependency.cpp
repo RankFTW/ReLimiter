@@ -1086,6 +1086,13 @@ void TestRetainGateOrdersReferencesAgainstDestruction() {
     bool timed_out = false;
     CHECK(gate.RetainAtEpoch(tables, epoch, [&] { timed_out = !gate.WaitForRetainers(16); return true; }));
     CHECK(timed_out); // a destroyer inside the window of a retainer gives up after its bound
+    // The destroyer's give-up takes a native reference of the queue that it never releases (a fake queue here): none when
+    // no retainer is inside, exactly one when one is.
+    struct FakeQueue { int refs = 1; } fake; // the game's own reference
+    CHECK(gate.WaitOrLeak(16, [&] { ++fake.refs; }) && fake.refs == 1);
+    bool gave_up = false;
+    CHECK(gate.RetainAtEpoch(tables, tables.Epoch(), [&] { gave_up = !gate.WaitOrLeak(16, [&] { ++fake.refs; }); return true; }));
+    CHECK(gave_up && fake.refs == 2); // the game's final Release leaves the leaked one: the object stays alive
     tables.Clear();   // the queue was destroyed since the decision's epoch
     CHECK(!gate.RetainAtEpoch(tables, epoch, [&] { ++retained; return true; }) && retained == 2 && gate.inflight() == 0);
 

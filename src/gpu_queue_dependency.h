@@ -280,6 +280,14 @@ public:
         return ok;
     }
     bool WaitForRetainers(unsigned spins) const noexcept;
+    // The destroyer's side: waits (bounded); when a retainer is still inside after `spins`, runs `leak` (the owner takes
+    // one native reference it never releases: the destroy callback runs before the final Release, so the object is alive,
+    // and the preempted retainer's later AddRef lands on a live object). False = gave up and `leak` ran.
+    template <class Fn> bool WaitOrLeak(unsigned spins, Fn&& leak) const noexcept {
+        if (WaitForRetainers(spins)) return true;
+        leak();
+        return false;
+    }
     uint32_t inflight() const noexcept { return inflight_.load(std::memory_order_seq_cst); }
 private:
     std::atomic<uint32_t> inflight_{0};
