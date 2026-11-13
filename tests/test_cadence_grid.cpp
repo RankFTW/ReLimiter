@@ -2243,7 +2243,7 @@ namespace
         CHECK(!grid.Snapshot().valid);
     }
 
-    // The executors resolve the effective target F from PlanAt origins (spec 2.5):
+    // The executors resolve the effective target F from PlanAt origins:
     // F = max(H, o(n - 1) + I - s). An on-time predecessor leaves F = H; a retreating H
     // gives F = o(n - 1) + I - s; a late predecessor record raises F.
     void TestPlanAtOutputFloor()

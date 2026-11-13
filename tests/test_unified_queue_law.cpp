@@ -1256,7 +1256,7 @@ namespace
 
     void TestWholeIntervalBound()
     {
-        // The reviewer's case, the frames GPU-paced so the gating does not help: cap 20 ms (J), the
+        // A case with the frames GPU-paced so the gating does not help: cap 20 ms (J), the
         // need rises 16 -> 19.2 ms and the starvation falls 4 -> 0.8 ms while the cycles stay 20 ms.
         // B = mean4(need) + mean16(starve) = 19.2 + 3.2 = 22.4 ms is above the attainable cap; the
         // bound C + max(0, C - J) = 20 ms cuts I_gpu to it and sets the flag. P stays B's correction.

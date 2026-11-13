@@ -587,7 +587,7 @@ void SourceStage::FillSourceRecord(
     record->stall_injected_us = frame.stall_injected_us;
 }
 
-// ── Unified pacer (developer key unified_pacer; unified_pacer.h, spec 4.1 and 4.2) ──
+// ── Unified pacer (developer key unified_pacer; unified_pacer.h) ──
 
 void SourceStage::SetUnifiedOptions(bool every_frame_service, double queue_target_us,
     double hold_share, bool queue_law, int queue_rank, int queue_allow_us, int queue_need_frames) noexcept
@@ -677,7 +677,7 @@ SourceStageFrame SourceStage::RunUnifiedFrame(
     const uint64_t n = grid_.NextIndex();
     const double ticks_per_us = static_cast<double>(request.qpc_frequency) / 1'000'000.0;
 
-    // 1. Start resolution (spec 4.1 table): the Sleep's completion word, or the law's
+    // 1. Start resolution: the Sleep's completion word, or the law's
     //    own plan of T(n) here. Nothing is planned before this: where the marker waits,
     //    it waits first, so B and H describe the actual release.
     const int64_t marker_arrival_qpc = clock->Now();

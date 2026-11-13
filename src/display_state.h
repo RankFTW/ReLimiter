@@ -6,7 +6,7 @@
 #include "nvapi_types.h"
 
 // Display state: atomic values read by scheduler, written by poll thread.
-// All atomics use std::memory_order_relaxed per spec §IV.1.
+// All atomics use std::memory_order_relaxed.
 
 // ── Pacing mode ──
 enum class PacingMode { VRR, Fixed };

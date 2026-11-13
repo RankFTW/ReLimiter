@@ -612,6 +612,10 @@ IUnknown* SwapMgr_AcquirePresentingDevice() noexcept {
     return nullptr;
 }
 
+uint64_t SwapMgr_PresentingDeviceSequence() noexcept {
+    return s_presenting_device_sequence.load(std::memory_order_acquire);
+}
+
 bool SwapMgr_IsPresentingDevice(IUnknown* candidate) noexcept {
     if (!candidate) return false;
     IUnknown* presenting = SwapMgr_AcquirePresentingDevice();

@@ -898,7 +898,7 @@ void TestDemotedToHeldTransitions()
     CHECK(rig.Run(rig.held, 3'000.0).plan.lead_us == before_us);
 }
 
-// Rule pinned (R1): the collision guard is the limit applied to every frame
+// Rule pinned: the collision guard is the limit applied to every frame
 // planned with the GPU queue wait's lead, a paused one included, and to the
 // demand after the source-only floor: neither the GPU wait's own lead nor a
 // warm source-only lead above the limit is exempt. Without the guard (Output
@@ -960,7 +960,7 @@ void TestDemotedGpuQueueWaitLeadIsGuarded()
     }
 }
 
-// Rule pinned (R1): the collision guard stays GPU-queue-wait only. A demoted
+// Rule pinned: the collision guard stays GPU-queue-wait only. A demoted
 // FG input wait or marker hold keeps its rung's lead (at least the warm
 // source-only lead) and is never guarded, even with the guard's C window warm
 // and its limit (8,510 µs) below the lead.
@@ -1005,7 +1005,7 @@ void TestDemotedFgInputWaitAndMarkerHoldKeepTheirLead()
     }
 }
 
-// Rule pinned (R1): an A/B not-held block (rung source only + Infeasible, not
+// Rule pinned: an A/B not-held block (rung source only + Infeasible, not
 // an overload pause: overload_demoted false) plans exactly like a held block
 // of the same rung: the rung's own lead, collision-guarded for the GPU queue
 // wait, with no source-only floor, however warm that window is. A frame the
@@ -1107,7 +1107,7 @@ void TestNotHeldBlockPlansLikeAHeldBlock()
     }
 }
 
-// Rule pinned (R2): when the overload ends the first held frame is planned
+// Rule pinned: when the overload ends the first held frame is planned
 // with the last paused plan's lead (RestartLead with the carried lead), then
 // the lead slews at most min(100 µs, I / 64) per frame, also at the 32nd
 // sample; a reset (no carry) keeps the old reseed.
@@ -2866,7 +2866,7 @@ void TestUnifiedReportResolvedBeforeLeadFinalizes()
 // an unheld output but no readiness yet, so n defers. When n - 1's readiness arrives the law
 // resolves n's report at that very event; the sample of n is emitted once, after the lead has
 // recorded that readiness (the lead's flush follows OnStageEvent), subtracted, and never raw.
-// LIMIT: the reviewer's numbers (raw 10 ms, predecessor wait d 1.5 ms, z_used 1 ms: 8.5 ms, not
+// LIMIT: the numbers of the case (raw 10 ms, predecessor wait d 1.5 ms, z_used 1 ms: 8.5 ms, not
 // 9 ms) need the lead's behind-wait evidence warm (32 waited pairs and the reports behind
 // them); the stage exposes the lead const, so that script (TestFgInputWaitBehindWaitSample) is
 // reproduced at the lead's own level. Here z_used removed is max(0, z_used - d) with d = 0 (cold

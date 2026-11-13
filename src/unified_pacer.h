@@ -13,7 +13,7 @@
 // UnifiedHardLimit and the Sleep-mode functions are stateless and run on any
 // thread (the Sleep hook runs the hard limit without the owner).
 //
-// Terms (spec_unified_pacer_first_build.md): n is the cadence grid index of a
+// Terms: n is the cadence grid index of a
 // real frame, A(n) the Sleep hook's entry, T(n) the start target, R(n) the
 // committed release, O(n) = max(T(n), R(n)) the origin of the next target
 // (T(n+1) = O(n) + I(n+1)): a late release is never caught up.
@@ -312,7 +312,7 @@ constexpr bool operator!=(const UnifiedSleepModeTuple& left, const UnifiedSleepM
     return !(left == right);
 }
 
-// The desired tuple (spec 4.1 table):
+// The desired tuple:
 //   key on, DMFG off:                 Unified, low latency off, interval 0
 //   key on, DMFG on:                  Game, the game's low latency and interval
 //   key off, limiter interval ≠ 0:    Limiter, off iff driver_low_latency_off, the limiter's interval
@@ -496,7 +496,7 @@ public:
     bool PlanStartAtMarker(uint64_t grid_index, uint32_t controller_generation,
         int64_t arrival_qpc, const UnifiedIntervalTerms& terms, UnifiedStart* start) noexcept;
 
-    // Start resolution (spec 4.1 table) for n = NextIndex(), with the mailbox
+    // Start resolution for n = NextIndex(), with the mailbox
     // word the owner loaded (acquire). `arrival_qpc` is the marker's arrival,
     // used when the law plans the start itself. Stores the start it resolved as
     // the pending start CommitRelease needs.

@@ -2,6 +2,7 @@
 #include "oled_care_policy.h"
 #include "swapchain_manager.h"
 #include "logger.h"
+#include "hotkey_poller.h"
 #include <Windows.h>
 #include <Xinput.h>
 #include <atomic>
@@ -274,8 +275,26 @@ private:
 
 // ── Background thread ──
 // Blackout windows need a message pump. This thread creates/destroys
-// them and pumps messages while they're alive.
+// them and pumps messages while they're alive. It is also the hotkey poller
+// (hotkey_poller.h): Hotkeys_Poll on every wake, kHotkeyPollPeriodMs apart; the
+// window and OLED work of the loop keeps its 16 ms cadence on every second wake.
+// One wake: a high-resolution waitable timer when there is one (the global timer
+// resolution can be the default 15.6 ms), else the stop event's timeout. Shutdown's
+// SetEvent wakes it at once.
+static void WaitForNextTick(HANDLE timer) {
+    LARGE_INTEGER due;
+    due.QuadPart = -static_cast<LONGLONG>(kHotkeyPollPeriodMs) * 10000;
+    if (!timer || !SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+        WaitForSingleObject(s_stop_event, kHotkeyPollPeriodMs);
+        return;
+    }
+    const HANDLE waits[] = { s_stop_event, timer };
+    WaitForMultipleObjects(2, waits, FALSE, 1000);
+}
+
 static DWORD WINAPI BlackoutThread(LPVOID) {
+    HANDLE tick_timer = CreateWaitableTimerExW(
+        nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     // Register window class on this thread
     if (!s_class_registered) {
         WNDCLASSEXW wc = {};
@@ -288,11 +307,18 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
             s_class_registered = true;
         else {
             LOG_ERROR("Blackout: window class registration failed (%lu)", GetLastError());
+            // No window can be made, but the hotkeys still need their poller.
+            while (s_thread_running.load(std::memory_order_relaxed)) {
+                Hotkeys_Poll();
+                WaitForNextTick(tick_timer);
+            }
+            if (tick_timer) CloseHandle(tick_timer);
             s_thread_running.store(false, std::memory_order_relaxed);
             return 0;
         }
     }
 
+    unsigned wake = 0;
     bool was_focused = true;
     OLEDCarePolicy oled_policy(GetTickCount64());
     OLEDInputPoller oled_input;
@@ -301,6 +327,11 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
     bool oled_creation_failed = false;
 
     while (s_thread_running.load(std::memory_order_relaxed)) {
+        Hotkeys_Poll();
+        if ((wake++ & 1u) != 0) {
+            WaitForNextTick(tick_timer);
+            continue;
+        }
         // Check for show/hide requests
         if (s_request_show.exchange(false, std::memory_order_relaxed)) {
             s_user_enabled.store(true, std::memory_order_relaxed);
@@ -391,8 +422,9 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
             DispatchMessageW(&msg);
         }
 
-        WaitForSingleObject(s_stop_event, 16);  // ~60Hz, immediately woken by shutdown
+        WaitForNextTick(tick_timer);
     }
+    if (tick_timer) CloseHandle(tick_timer);
 
     // Cleanup on thread exit
     DestroyOLEDWindows();
@@ -410,6 +442,15 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
 
 // ── Public API ──
 
+// The hotkey poller's thread is the blackout service thread; when it cannot exist the OSD
+// callback polls per frame on the presenting thread (hotkey_poller.h), as before the service thread existed.
+// One line per transition into that state (Blackout_Init runs once per addon load).
+static void LogHotkeyFallback() {
+    Hotkeys_SetServiceThreadPolling(false);
+    LOG_WARN("Hotkeys: the poller thread could not be created; hotkeys are polled per frame by the overlay "
+             "callback on the presenting thread instead");
+}
+
 void Blackout_Init() {
     if (s_thread) return;
     s_active.store(false, std::memory_order_relaxed);
@@ -422,17 +463,20 @@ void Blackout_Init() {
     s_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!s_stop_event) {
         LOG_ERROR("Blackout: stop event creation failed (%lu)", GetLastError());
+        LogHotkeyFallback();
         return;
     }
     s_thread_running.store(true, std::memory_order_relaxed);
     s_thread = CreateThread(nullptr, 0, BlackoutThread, nullptr, 0, nullptr);
-    if (s_thread)
+    if (s_thread) {
+        Hotkeys_SetServiceThreadPolling(true);
         LOG_INFO("Blackout: thread started");
-    else {
+    } else {
         s_thread_running.store(false, std::memory_order_relaxed);
         CloseHandle(s_stop_event);
         s_stop_event = nullptr;
         LOG_ERROR("Blackout: thread creation failed");
+        LogHotkeyFallback();
     }
 }
 
@@ -449,6 +493,7 @@ bool Blackout_Shutdown() {
     s_thread = nullptr;
     CloseHandle(s_stop_event);
     s_stop_event = nullptr;
+    Hotkeys_SetServiceThreadPolling(false);  // joined: nothing polls but the overlay callback
     s_active.store(false, std::memory_order_relaxed);
     s_oled_active.store(false, std::memory_order_relaxed);
     s_user_enabled.store(false, std::memory_order_relaxed);

@@ -293,7 +293,7 @@ void LeadController::ClearSlackEvidence() noexcept
 // no earlier than its PRESENT_START. Without it a load rise during the
 // demotion resumed the wait from a window learned before it (a lead learned
 // while loading was far below the X seen in play).
-// The demoted frames were planned with this rung's lead (R1), so the lead
+// The demoted frames were planned with this rung's lead, so the lead
 // they used is the one the first resumed frame keeps: a carried lead starts
 // the bucket there and the cold phase and the switch to the warm target
 // slew from it. Jumping to the restarted cold target moved the release
@@ -530,7 +530,7 @@ double LeadController::NextLeadUs(const LeadRequest& request, bool* budget_limit
 // next frame's GPU work running behind the wait: it cannot delay the resume
 // there. A tighter limit applies at once; once it relaxes, the lead returns
 // to the demand at the lead slew, never in one step. Held and demoted
-// frames of the rung take the same path (R1): the guard is the limit applied
+// frames of the rung take the same path: the guard is the limit applied
 // to every frame planned with the GPU queue wait's lead.
 double LeadController::CollisionGuardedLeadUs(const LeadRequest& request, size_t bucket_index,
     double lead_us, LeadGuardOutcome* guard) noexcept

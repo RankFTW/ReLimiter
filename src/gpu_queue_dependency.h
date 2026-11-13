@@ -21,24 +21,33 @@
 //
 // Fence lifetime. Table entries carry the frame counter (Entry::epoch) of the moment they were recorded and
 // age out after kAgeWindows windows; a Signal joins a Wait only within kMaxSignalSkewFrames of it; the tables
-// are cleared on a swapchain, device or queue lifetime change.
+// are cleared on a swapchain, device or queue lifetime change. The tables hold identities only (an address and a
+// value) and never a reference to a fence: nothing here is dereferenced, so no game fence is kept alive by the rule.
+// The ONE exception in the probe is not the rule's: when the game's own Signal behind every submission of an adopted
+// render queue is borrowed as the submissions' done marker (gpu_queue_borrow.h, role 3), the probe takes ONE
+// reference on that ONE fence at its first bind and releases it with the session (end, queue destruction, another
+// adoption, failure); a game that counts a fence's references sees one more for that time.
 //
 // Threading and the one lock. The tables serve the adoption decision, not the per-frame record, so they are
 // plain arrays behind ONE small spin lock (Tables). EVERY path that takes it, on any thread (the detours on
-// game threads, the Present thread's pull and publication, clear on whichever thread destroys a queue or
-// ends a session), takes it with the same bounded spin (kSpinBound test-and-set iterations with a pause, no
-// kernel wait; there is no unbounded acquisition). A detour that times out DROPS its event and COUNTS it; a
-// Present thread pull that times out is SKIPPED and COUNTED (nothing is lost: the next pull copies everything
-// newer than the previous cursor); a publication that times out is discarded and counted. A clear is never
+// game threads, the evaluator's pull and publication, the Present thread's counter snapshot, clear on whichever
+// thread destroys a queue or ends a session), takes it with the same bounded spin (kSpinBound test-and-set
+// iterations with a pause, no kernel wait; there is no unbounded acquisition). A detour that times out DROPS its
+// event and COUNTS it; a pull that times out is SKIPPED and COUNTED (nothing is lost: the next pull copies
+// everything newer than the previous cursor); a publication that times out is discarded and counted. The one
+// path that does not take the lock is the Execute of a queue whose row exists (Tables::NoteExecute: one
+// compare-exchange on that row's packed counter word, see there for the clear/reader argument). A clear is never
 // lost: Clear() advances the lifetime epoch (Tables::Epoch, not the frame counter of Entry::epoch) at once,
 // with a plain atomic add that every reader sees, and resets the tables only when it gets the lock; if it
 // does not, the next successful lock holder (a writer or the pull) notices that the epoch it holds the tables
 // for is behind and resets them before its own work (a pending clear). A decision is published with the epoch
-// it was computed for and is only valid while that epoch is current, so a clear invalidates it at once. The
-// Present thread never evaluates under the lock: Reader::Pull copies only the entries recorded since its
-// previous pull and the command list rows under it (a few kilobytes at most), then resolves and evaluates on
-// its own copy; a window whose epoch changed restarts and adopts nothing. The resolver and the evaluator
-// belong to the Present thread alone.
+// it was computed for and is only valid while that epoch is current, so a clear invalidates it at once. Nothing
+// evaluates under the lock: Reader::Pull copies only the entries recorded since its previous pull and the
+// command list rows under it (a few kilobytes at most), then the resolver and the evaluator run on its own copy;
+// a window whose epoch changed restarts and adopts nothing. The resolver and the evaluator belong to ONE
+// consumer at a time (FrameFeed::Evaluate, serialised by its guard): the probe's worker while a session runs,
+// the Present thread before an adoption and whenever no session is running; the Present thread's own part is
+// FrameFeed::OnBoundary (a ring push, one bounded counter snapshot, a queue push).
 
 #include <atomic>
 #include <cstddef>
@@ -74,16 +83,34 @@ struct Row {
 };
 
 // The Signal and Wait tables (the newest kLogCapacity entries each) and the per-queue command list counters, behind
-// the one lock described above.
+// the one lock described above. The command list counters are the exception on the DETOUR side: an Execute of a queue whose
+// row exists takes a lock-free path (NoteExecute, below); everything else, every reader and every clear still use the lock.
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4324) // padded due to alignas: the padding is the layout (writer groups on their own cache lines)
+#endif
 class Tables {
 public:
     static constexpr unsigned kSpinBound = 512; // test-and-set iterations of any lock attempt before it gives up
 
-    // Detour side. False = dropped (the lock did not come free within kSpinBound) and counted. Uncontended cost:
-    // one interlocked exchange, one epoch load, the record write and one release store.
+    // Detour side. False = dropped (the lock did not come free within kSpinBound) and counted. Uncontended cost of a Signal
+    // or a Wait: one interlocked exchange, one epoch load, the record write and one release store. An append cannot go below
+    // one read-modify-write: a claim-and-write ring would need a second one (ownership of the slot against a writer that was
+    // preempted across a clear and a lap) to keep a stale write from tearing a newer entry.
     bool RecordSignal(const Entry& entry) noexcept;
     bool RecordWait(const Entry& entry) noexcept;
-    bool NoteExecute(uint64_t queue, uint32_t lists) noexcept; // a queue beyond kQueueSlots is counted as overflow
+    // Command lists of one Execute of `queue` (a queue beyond kQueueSlots is counted as overflow). FAST PATH (the common case:
+    // the queue's row exists in the current epoch): the epoch, the row count, the row's packed counter word, then the row's
+    // queue identity are loaded IN THAT ORDER (no lock, no scan beyond the rows up to the queue's) and ONE compare-exchange of
+    // that same word adds this call (one call, `lists` command lists). It never drops and never spins (a lost race is retried,
+    // at most kFastAttempts times, then the locked path). Everything new (the first Execute of a queue in an epoch, a pending
+    // clear, a packed field about to overflow, a ninth queue) takes the locked path, whose bounded spin and drop-and-count are
+    // the old ones. Correctness of the fast path against Clear, the readers and a rebuilt row (identity and word of ONE row
+    // incarnation): see NoteExecute in gpu_queue_dependency.cpp.
+    bool NoteExecute(uint64_t queue, uint32_t lists) noexcept;
+    // Tests: NoteExecute with `seam(0)` called after the packed word was loaded and `seam(1)` after the identity was loaded
+    // (a test rebuilds the row from inside the seam: the schedule that could mix two incarnations). Production passes an empty seam.
+    template <class Seam> bool NoteExecuteSeam(uint64_t queue, uint32_t lists, Seam&& seam) noexcept;
 
     // Lifetime change, queue destruction, teardown (any thread): advances the epoch at once (every published
     // decision is invalid from here on) and empties the tables and counters, now if the lock comes free within
@@ -96,6 +123,11 @@ public:
     void Unpublish() noexcept { decision_epoch_.store(0, std::memory_order_release); }
     // The published queue, 0 when none or when its epoch is no longer the current one.
     uint64_t PublishedQueue() const noexcept;
+    // The command list counters and the epoch they belong to, as of now (bounded lock, a pending clear applied first):
+    // the frame boundary's snapshot (FrameFeed::OnBoundary). Each row is exact as of one instant; two rows may be a few
+    // nanoseconds apart (an Execute in flight lands in this snapshot or the next, as before). False = the lock did not come
+    // free within kSpinBound: nothing is copied and `*epoch` is the current epoch (the caller marks the counters unknown).
+    bool SnapshotRows(Row* out, size_t* count, uint64_t* epoch) noexcept;
 
     uint64_t Epoch() const noexcept { return epoch_.load(std::memory_order_seq_cst); }
     uint64_t DroppedSignals() const noexcept { return dropped_signals_.load(std::memory_order_relaxed); }
@@ -104,34 +136,124 @@ public:
     uint64_t RowOverflow() const noexcept { return row_overflow_.load(std::memory_order_relaxed); }
     uint64_t ClearsDeferred() const noexcept { return clears_deferred_.load(std::memory_order_relaxed); }
     uint64_t PublishTimeouts() const noexcept { return publish_timeouts_.load(std::memory_order_relaxed); }
-    // Every record dropped or lost by the tables (time-outs, queues beyond the rows), cumulative.
+    // Every record dropped or lost by the tables (time-outs, queues beyond the rows), cumulative. Lock-free: the frame
+    // boundary reads it as the loss counter of that moment (FrameFeed).
     uint64_t Lost() const noexcept { return DroppedSignals() + DroppedWaits() + DroppedLists() + RowOverflow(); }
 
     // Tests: hold the lock from the calling thread (false when it did not come free) and release it.
     bool HoldLockForTest() noexcept { return TryLock(kSpinBound); }
     void ReleaseLockForTest() noexcept { Unlock(); }
 
+    // The fast path's lost-race retries before it takes the locked path.
+    static constexpr unsigned kFastAttempts = 4;
+
 private:
     friend class Reader;
+    // One queue's counters. `queue` and the base counters are written under the lock (a row is created, or rebuilt after a
+    // clear, only by a lock holder) and `queue` never changes within an epoch; `packed` is the counters the fast path adds to:
+    // [tag:20][calls:16][lists:28] with the tag the low bits of the epoch the row was created in. A field about to overflow is
+    // moved to the base counters by a lock holder (spill), so a row's value is base + packed fields, exact and unbounded.
+    // A rebuild writes `packed` = kRetired (never usable), then `queue` (release), then the new tagged word (release).
+    struct RowSlot {
+        std::atomic<uint64_t> queue{0};
+        std::atomic<uint64_t> packed{0};
+        uint64_t base_lists = 0, base_calls = 0;
+    };
+    static constexpr unsigned kListsBits = 28, kCallsBits = 16, kTagBits = 20;
+    static constexpr uint64_t kListsMask = (uint64_t{1} << kListsBits) - 1;
+    static constexpr uint64_t kCallsMask = (uint64_t{1} << kCallsBits) - 1;
+    static constexpr uint64_t kTagMask = (uint64_t{1} << kTagBits) - 1;
+    static constexpr uint64_t kOneCall = uint64_t{1} << kListsBits;
+    static constexpr uint64_t kRetired = ~uint64_t{0}; // calls field full: no fast path ever adds to it
+    static uint64_t TagOf(uint64_t epoch) noexcept { return epoch & kTagMask; }
+    static uint64_t Pack(uint64_t tag, uint64_t calls, uint64_t lists) noexcept {
+        return (tag << (kListsBits + kCallsBits)) | (calls << kListsBits) | lists;
+    }
+    static uint64_t WordTag(uint64_t word) noexcept { return word >> (kListsBits + kCallsBits); }
+    static uint64_t WordCalls(uint64_t word) noexcept { return (word >> kListsBits) & kCallsMask; }
+    static uint64_t WordLists(uint64_t word) noexcept { return word & kListsMask; }
+
     bool TryLock(unsigned spins) noexcept;
     void Unlock() noexcept { lock_.store(false, std::memory_order_release); }
     // Under the lock: resets the tables when the epoch moved on since they were last reset (a pending clear).
     void SyncLocked() noexcept;
+    bool NoteExecuteLocked(uint64_t queue, uint32_t lists) noexcept;
+    // Under the lock: adds one call of `lists` command lists to `slot` (current epoch's tag), spilling when a field would overflow.
+    void AddLocked(RowSlot& slot, uint64_t tag, uint32_t lists) noexcept;
+    // Under the lock: the rows as Row values (base + packed fields); returns the count.
+    size_t CopyRowsLocked(Row* out) const noexcept;
 
-    std::atomic<bool> lock_{false};
-    std::atomic<uint64_t> epoch_{1};
-    // Under the lock:
-    uint64_t tables_epoch_ = 1; // the epoch the tables below belong to
-    Entry signals_[kLogCapacity], waits_[kLogCapacity];
-    uint64_t signal_head_ = 0, wait_head_ = 0; // entries recorded since the last reset
-    Row rows_[kQueueSlots];
-    size_t row_count_ = 0;
+    // LAYOUT BY WRITER: a cache line is written by one group of writers. T0 the lock: the interlocked
+    // exchange of every recorder and reader. T1 what every Execute's fast path READS and almost nobody writes (the epoch, the
+    // row count, the published decision). T2 the rows: `packed` is added to by the Execute fast path (the detour threads);
+    // `queue` and the base counters under the lock, rarely. T3 the logs, under the lock. T4 the counters of dropped records.
+    // Checked by LayoutOk() (static_assert below the class).
+    alignas(64) std::atomic<bool> lock_{false};
+    alignas(64) std::atomic<uint64_t> epoch_{1};
+    // Rows in use: written under the lock (release), read by the fast path (acquire): a row below the count is initialised.
+    std::atomic<uint32_t> row_count_{0};
     // The published decision: queue first, then the epoch it is valid for (release); valid while that is current.
     std::atomic<uint64_t> decision_queue_{0}, decision_epoch_{0};
+    alignas(64) RowSlot rows_[kQueueSlots];
+    // Under the lock:
+    alignas(64) uint64_t tables_epoch_ = 1; // the epoch the tables below belong to
+    Entry signals_[kLogCapacity], waits_[kLogCapacity];
+    uint64_t signal_head_ = 0, wait_head_ = 0; // entries recorded since the last reset
     // Counters (written under the lock or by a dropped detour; read anywhere):
-    std::atomic<uint64_t> dropped_signals_{0}, dropped_waits_{0}, dropped_lists_{0}, row_overflow_{0},
+    alignas(64) std::atomic<uint64_t> dropped_signals_{0}, dropped_waits_{0}, dropped_lists_{0}, row_overflow_{0},
         clears_deferred_{0}, publish_timeouts_{0};
+public:
+    // True when the groups above start on cache lines of their own (a writer group never shares a line with another).
+    static constexpr bool LayoutOk() noexcept {
+        return offsetof(Tables, lock_) % 64 == 0 && offsetof(Tables, epoch_) % 64 == 0 && offsetof(Tables, rows_) % 64 == 0 &&
+            offsetof(Tables, tables_epoch_) % 64 == 0 && offsetof(Tables, dropped_signals_) % 64 == 0 &&
+            offsetof(Tables, epoch_) >= offsetof(Tables, lock_) + 64 &&
+            offsetof(Tables, decision_epoch_) + sizeof(uint64_t) <= offsetof(Tables, epoch_) + 64 &&
+            offsetof(Tables, rows_) >= offsetof(Tables, epoch_) + 64 && offsetof(Tables, tables_epoch_) >= offsetof(Tables, rows_) + sizeof(RowSlot) * kQueueSlots;
+    }
 };
+static_assert(Tables::LayoutOk(), "gpu_queue_dependency::Tables: writer groups must start on cache lines of their own");
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+
+// The fast path of Execute, in the header so that a test can interleave a rebuild between its loads (NoteExecuteSeam). The
+// argument that it never pairs one row incarnation's identity with another's counters:
+//  * One row incarnation = one tag. A row is (re)built only under the lock, in the order: (1) packed = kRetired (relaxed),
+//    (2) queue = Q (release), (3) packed = Pack(tag(epoch), 0, 0) (release). Its tagged word exists only after (3), so a caller
+//    that read a tagged word of incarnation I read it after I's queue store (acquire/release on `packed`).
+//  * The caller reads the packed word FIRST (acquire), the identity SECOND (acquire), and compare-exchanges THAT word. The
+//    identity it read is I's or a later incarnation's, never an earlier one's. If it is a later incarnation J's (the row was
+//    rebuilt between the two loads), J's step (1) happened before J's queue store (release) the caller acquired, so it
+//    happens-before the caller's compare-exchange, which therefore reads kRetired or a later word, never I's: it fails and the
+//    caller leaves for the locked path. If the identity is I's, the word the caller expects is I's own word and an add to it
+//    is an add to Q's row of that epoch (the Clear argument of NoteExecute in the .cpp applies). A failed compare-exchange
+//    re-reads the identity AFTER its fresh word, under the same rule.
+//  * Reading the identity first (the previous order) could pair the old row's identity with the rebuilt row's word, whose tag
+//    matches the caller's already-current epoch: a call of queue A credited to queue B.
+template <class Seam> bool Tables::NoteExecuteSeam(uint64_t queue, uint32_t lists, Seam&& seam) noexcept {
+    if (!queue) return false;
+    const uint64_t tag = TagOf(epoch_.load(std::memory_order_acquire));
+    const uint32_t count = row_count_.load(std::memory_order_acquire);
+    for (uint32_t i = 0; i < count; ++i) {
+        RowSlot& slot = rows_[i];
+        uint64_t word = slot.packed.load(std::memory_order_acquire);
+        seam(0);
+        uint64_t identity = slot.queue.load(std::memory_order_acquire);
+        seam(1);
+        if (identity != queue) continue;
+        for (unsigned attempt = 0; attempt < kFastAttempts; ++attempt) {
+            if (WordTag(word) != tag || WordLists(word) + lists > kListsMask || WordCalls(word) == kCallsMask) break;
+            if (slot.packed.compare_exchange_weak(word, word + kOneCall + lists, std::memory_order_acq_rel,
+                    std::memory_order_acquire))
+                return true;
+            identity = slot.queue.load(std::memory_order_acquire); // the fresh word first, then its identity
+            if (identity != queue) break;
+        }
+        break; // the row is known but the word is not usable now: the locked path decides
+    }
+    return NoteExecuteLocked(queue, lists);
+}
 
 // The Present thread's copy of the tables: Pull() takes the lock (bounded), copies what is new, releases it;
 // everything after that (the resolver, the evaluator) runs on the copy.
@@ -153,6 +275,8 @@ public:
     bool epoch_changed() const noexcept { return changed_; } // as of the latest Pull (false for a skipped one)
     // Records dropped, lost or overwritten so far (cumulative; the tables' loss at the latest pull plus the overruns).
     uint64_t loss() const noexcept { return loss_; }
+    // The mirror's own part of loss(): entries a frame still needed that a pull overwrote (cumulative).
+    uint64_t overrun() const noexcept { return overrun_; }
     uint64_t pulls_skipped() const noexcept { return skipped_.load(std::memory_order_relaxed); }
     const Entry* signals() const noexcept { return signals_; }
     size_t signal_count() const noexcept { return signal_count_; }
@@ -392,6 +516,136 @@ private:
     Decision decision_;
     uint64_t frames_total_ = 0, windows_ = 0, ambiguous_total_ = 0, multi_edge_total_ = 0, missing_join_total_ = 0,
         unsignalled_total_ = 0, ambiguous_signals_total_ = 0;
+};
+
+// ── The frame feed: the Present thread's boundary, the evaluator's drain ──
+// What DependencyEvaluate did on the Present thread at every Present, in two halves that may run on different threads:
+//  * OnBoundary (the PRODUCER, the Present thread, one at a time: the caller serialises it): the cheap, Present-time half.
+//    The 3-boundary ring of Present scopes, the frame it closes (the frame before this Present: its late Signals are in by
+//    now), the command list counters as of THIS boundary (one bounded locked copy of at most eight rows, Tables::SnapshotRows)
+//    and the loss counter of this moment (four relaxed loads, Tables::Lost()) go into a PendingFrame in a bounded queue of
+//    kBacklog frames. A restart (lifetime change, clear, mode change) empties the ring and starts a new generation.
+//  * Evaluate (the CONSUMER: the probe's worker while a session runs, else the Present thread itself; the evaluator guard
+//    serialises every caller): the pull of the Signal and Wait tables (the one bounded locked copy of what is new), the
+//    resolver, the evaluator and the publication of a decision. Nothing of it runs at a Present while the worker evaluates.
+// Semantics against the old inline path. A batch of frames is resolved exactly as one pull at the Present that pushed the
+// batch's LAST frame resolved its backlog: the loss counter handed to BeginPull and AddFrame is the one read at that Present
+// (PendingFrame::lost) plus the mirror's own overruns, the poison watermark is the batch size plus one frame, the counters of
+// a frame are those of its own boundary (inexact when its snapshot could not take the lock), the frame counter its entries age
+// against is the one at its Present. A consumer that runs late therefore decides exactly as one that runs at every Present
+// would (tests: TestFeedDecidesLikeTheInlinePath). A pull that cannot take the lock is skipped and counted and the frames stay
+// in the consumer's backlog (kBacklog, past it the window restarts and the loss baseline stays the previous pull's); a
+// producer that finds the queue full drops that frame, counts it, and the consumer restarts the window.
+// The first frame resolved after a restart is the one pushed after it: frames of an older generation or of an older tables epoch
+// are discarded, never evaluated against tables that were cleared.
+struct BoundaryInput {
+    uint64_t presenting_queue = 0;
+    uint64_t scope = 0;       // this Present's scope (0 = none: the frame it closes is not evaluated)
+    int64_t qpc = 0;          // the boundary's clock
+    bool keyed = false;       // the boundary carried a real frame identity
+    uint32_t frame_counter = 0; // Entry::epoch now
+    uint8_t mode = 1;         // 1 the rule, 2 diagnostic (frame generation)
+    bool restart = false;     // the tables were cleared or the lifetime changed (a reset was pending)
+};
+struct PendingFrame {
+    uint64_t scope = 0, presenting_queue = 0, generation = 0, epoch = 0, lost = 0;
+    int64_t window_begin = 0, window_end = 0;
+    uint32_t current_epoch = 0;
+    uint8_t mode = 1;
+    bool keyed = false, rows_exact = false;
+    uint8_t row_count = 0;
+    Row rows[kQueueSlots];
+};
+// The consumer's callbacks, all on the evaluating thread under the evaluator guard.
+class FeedSink {
+public:
+    virtual void OnReset() noexcept = 0;                                    // the evaluator was reset: decision gone
+    virtual void OnDecision(uint8_t mode, const Decision& decision) noexcept = 0; // a window completed and was published
+    virtual void UnderGuard() noexcept {}                                   // end of the step, guard still held
+protected:
+    ~FeedSink() = default;
+};
+class FrameFeed {
+public:
+    static constexpr size_t kBacklog = 8;  // frames waiting for a pull (queue and consumer backlog each)
+    static constexpr size_t kHelpAt = 4;   // a Present thread helps when this many frames wait (the worker is late)
+
+    // PRODUCER (one caller at a time).
+    void OnBoundary(Tables& tables, const BoundaryInput& input) noexcept;
+
+    // CONSUMER (any thread; false = another thread is evaluating, nothing was done).
+    bool Evaluate(Tables& tables, FeedSink& sink) noexcept;
+
+    // Frames waiting for evaluation (queued or held by a skipped pull) and whether Evaluate has anything to do: lock-free.
+    size_t PendingFrames() const noexcept {
+        return static_cast<size_t>(head_.load(std::memory_order_acquire) - tail_.load(std::memory_order_acquire)) +
+            held_hint_.load(std::memory_order_relaxed);
+    }
+    bool HasWork() const noexcept {
+        return PendingFrames() != 0 || generation_.load(std::memory_order_acquire) != seen_generation_hint_.load(std::memory_order_relaxed) ||
+            boundaries_.load(std::memory_order_acquire) != seen_boundaries_hint_.load(std::memory_order_relaxed);
+    }
+
+    // Under the evaluator guard (inside FeedSink callbacks): the decision of the latest completed window, empty after a reset.
+    const Decision& decision() const noexcept { return decision_; }
+    uint64_t windows() const noexcept { return windows_.load(std::memory_order_relaxed); }
+    uint64_t frames() const noexcept { return frames_.load(std::memory_order_relaxed); }
+    uint64_t ambiguous() const noexcept { return ambiguous_.load(std::memory_order_relaxed); }
+    uint64_t multi_edge() const noexcept { return multi_edge_.load(std::memory_order_relaxed); }
+    uint64_t missing() const noexcept { return missing_.load(std::memory_order_relaxed); }
+    uint64_t unsignalled() const noexcept { return unsignalled_.load(std::memory_order_relaxed); }
+    uint64_t ambiguous_signals() const noexcept { return ambiguous_signals_.load(std::memory_order_relaxed); }
+    uint64_t stale_decisions() const noexcept { return stale_decisions_.load(std::memory_order_relaxed); }
+    uint64_t backlog_overflows() const noexcept { return backlog_overflows_.load(std::memory_order_relaxed); }
+    // Pulls that did not take the lock plus boundary snapshots that did not (each makes a frame's counters inexact).
+    uint64_t pulls_skipped() const noexcept {
+        return reader_.pulls_skipped() + snapshots_skipped_.load(std::memory_order_relaxed);
+    }
+    // Tests: the consumer's mirrors.
+    const Reader& reader() const noexcept { return reader_; }
+    const Evaluator& evaluator() const noexcept { return evaluator_; }
+
+private:
+    struct ScopeRecord {
+        uint64_t scope = 0;
+        int64_t qpc = 0;
+        uint64_t epoch = 0; // the tables' epoch at this boundary
+        bool keyed = false;
+    };
+    void Step(Tables& tables, FeedSink& sink) noexcept;
+    void ResetEvaluator(FeedSink& sink, Tables& tables, bool diagnostic, uint64_t baseline) noexcept;
+
+    // Producer (one at a time):
+    ScopeRecord ring_[3];
+    uint32_t ring_count_ = 0;
+    Row prev_rows_[kQueueSlots];
+    size_t prev_row_count_ = 0;
+    uint64_t prev_epoch_ = 0;
+    bool prev_valid_ = false;
+    uint8_t producer_mode_ = 0;
+    PendingFrame queue_[kBacklog];
+    std::atomic<uint64_t> head_{0}, tail_{0};     // frames pushed / taken (monotonic); a slot is free once tail passed it
+    std::atomic<uint64_t> generation_{0};          // restarts so far; a frame carries the one it was pushed in
+    std::atomic<uint64_t> restart_loss_{0};        // the loss counter at the latest restart
+    std::atomic<uint8_t> restart_mode_{0};
+    std::atomic<bool> queue_full_{false};          // a frame was dropped: the consumer restarts the window
+    std::atomic<int64_t> open_begin_{INT64_MAX};   // the window begin of the next frame to be pushed (the pull's needed-since)
+    std::atomic<uint64_t> snapshots_skipped_{0};
+    std::atomic<uint64_t> boundaries_{0};          // boundaries so far: every one is followed by a pull (the cursors keep pace), frame or not
+    std::atomic<uint64_t> last_lost_{0};           // the loss counter at the latest boundary (release, after its frame was queued)
+    // Consumer (under `evaluating_`):
+    std::atomic<bool> evaluating_{false};
+    Reader reader_;
+    Evaluator evaluator_;
+    PendingFrame held_[kBacklog];
+    size_t held_count_ = 0;
+    std::atomic<uint32_t> held_hint_{0};
+    uint64_t seen_generation_ = 0, seen_boundaries_ = 0;
+    std::atomic<uint64_t> seen_generation_hint_{0}, seen_boundaries_hint_{0};
+    uint8_t mode_ = 0;
+    Decision decision_;
+    std::atomic<uint64_t> windows_{0}, frames_{0}, ambiguous_{0}, multi_edge_{0}, missing_{0}, unsignalled_{0},
+        ambiguous_signals_{0}, stale_decisions_{0}, backlog_overflows_{0};
 };
 
 } // namespace gpu_queue_dependency

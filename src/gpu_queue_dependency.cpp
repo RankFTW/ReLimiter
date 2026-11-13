@@ -32,7 +32,9 @@ void Tables::SyncLocked() noexcept {
     if (epoch == tables_epoch_) return;
     tables_epoch_ = epoch;
     signal_head_ = wait_head_ = 0;
-    row_count_ = 0;
+    // The rows are emptied logically: a fast-path caller that loads the count afterwards finds none; one that loaded it
+    // before holds the old epoch's tag, which no row created from here on carries (NoteExecute).
+    row_count_.store(0, std::memory_order_release);
 }
 
 bool Tables::RecordSignal(const Entry& entry) noexcept {
@@ -59,32 +61,103 @@ bool Tables::RecordWait(const Entry& entry) noexcept {
     return true;
 }
 
+// NoteExecute. The fast path in one paragraph, and why it is correct against Clear and the readers.
+//
+// A row's counters live in ONE 64-bit word, [tag:20][calls:16][lists:28], whose tag is the low 20 bits of the epoch the row
+// was created in (always under the lock, after SyncLocked, so the tag of the epoch the tables belong to). The fast path
+// (NoteExecuteSeam in the header, which also carries the argument that the identity and the word it uses are of ONE row
+// incarnation) loads the epoch E, then the row count (acquire: every row below the count is fully written: queue, then
+// word, then the count's release store), then the row's word W, then its queue identity, and succeeds only through ONE
+// compare-exchange W -> W + one call + lists, taken only while tag(W) == tag(E) and no field would overflow.
+//  * Clear: the epoch advances FIRST (seq_cst add), the tables are emptied afterwards by a lock holder (SyncLocked: count to
+//    zero). A caller that loads E after the advance finds every row of the old epoch with a tag other than tag(E) and takes
+//    the locked path, whose SyncLocked applies the pending clear before the call is counted in the new epoch (as before). A
+//    caller that loaded E before the advance is concurrent with the Clear and is ordered before it: its add lands in a row
+//    of the old epoch (discarded by the reset) or, when the row was re-created in the meantime, fails (the re-created word has
+//    the new tag, and the compare-exchange compares the whole word) and the caller starts over. So no add of an old epoch is
+//    ever applied to a row of the new one, and every call is counted exactly once in the epoch it was ordered in, or dropped
+//    and counted (the locked path only). A tag repeats every 2^20 epochs: a caller preempted between its loads and its
+//    exchange across a million clears, with the word equal at both ends, is the residual (a queue lifetime change is seconds
+//    apart at best).
+//  * Readers (Pull, SnapshotRows) hold the lock, apply a pending clear, and read base + the packed fields: each row is the exact
+//    value as of one instant. A spill (field about to overflow: a lock holder takes the packed word with an exchange, adds
+//    its fields to the base counters and stores the new value) is ordered against the fast path by the word itself: an
+//    exchange that comes first leaves the fast caller's expected value stale, so its exchange fails; one that comes later is
+//    inside the taken value. Nothing is counted twice or lost.
+//  * The loss accounting is the old one: only the locked path can time out; it drops the call and counts it
+//    (DroppedLists), a ninth queue is counted in RowOverflow on every call, as before. The fast path never loses a call.
 bool Tables::NoteExecute(uint64_t queue, uint32_t lists) noexcept {
-    if (!queue) return false;
+    return NoteExecuteSeam(queue, lists, [](int) noexcept {});
+}
+
+void Tables::AddLocked(RowSlot& slot, uint64_t tag, uint32_t lists) noexcept {
+    uint64_t word = slot.packed.load(std::memory_order_relaxed);
+    while (WordTag(word) == tag && WordLists(word) + lists <= kListsMask && WordCalls(word) < kCallsMask) {
+        if (slot.packed.compare_exchange_weak(word, word + kOneCall + lists, std::memory_order_acq_rel,
+                std::memory_order_relaxed))
+            return;
+    }
+    // A field would overflow (or an oversized call): the fast counters are taken whole, with this call, into the base.
+    const uint64_t taken = slot.packed.exchange(Pack(tag, 0, 0), std::memory_order_acq_rel);
+    slot.base_lists += WordLists(taken) + lists;
+    slot.base_calls += WordCalls(taken) + 1;
+}
+
+bool Tables::NoteExecuteLocked(uint64_t queue, uint32_t lists) noexcept {
     if (!TryLock(kSpinBound)) {
         dropped_lists_.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     SyncLocked();
+    const uint64_t tag = TagOf(tables_epoch_);
+    const uint32_t count = row_count_.load(std::memory_order_relaxed);
     bool counted = false;
-    for (size_t i = 0; i < row_count_; ++i) {
-        if (rows_[i].queue == queue) {
-            rows_[i].lists += lists;
-            ++rows_[i].calls;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (rows_[i].queue.load(std::memory_order_relaxed) == queue) {
+            AddLocked(rows_[i], tag, lists);
             counted = true;
             break;
         }
     }
-    if (!counted && row_count_ < kQueueSlots) {
-        Row& row = rows_[row_count_++];
-        row.queue = queue;
-        row.lists = lists;
-        row.calls = 1;
+    if (!counted && count < kQueueSlots) {
+        // A new row INCARNATION (the slot may hold a previous epoch's row that a fast caller is still looking at): retired
+        // word, then the identity, then the tagged word, each published with release (see NoteExecuteSeam in the header).
+        RowSlot& slot = rows_[count];
+        slot.base_lists = slot.base_calls = 0;
+        slot.packed.store(kRetired, std::memory_order_relaxed);
+        slot.queue.store(queue, std::memory_order_release);
+        slot.packed.store(Pack(tag, 0, 0), std::memory_order_release);
+        AddLocked(slot, tag, lists);
+        row_count_.store(count + 1, std::memory_order_release); // the row is complete for the fast path from here on
         counted = true;
     }
     if (!counted) row_overflow_.fetch_add(1, std::memory_order_relaxed);
     Unlock();
     return counted;
+}
+
+size_t Tables::CopyRowsLocked(Row* out) const noexcept {
+    const uint32_t count = row_count_.load(std::memory_order_relaxed);
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint64_t word = rows_[i].packed.load(std::memory_order_acquire);
+        out[i].queue = rows_[i].queue.load(std::memory_order_relaxed);
+        out[i].lists = rows_[i].base_lists + WordLists(word);
+        out[i].calls = rows_[i].base_calls + WordCalls(word);
+    }
+    return count;
+}
+
+bool Tables::SnapshotRows(Row* out, size_t* count, uint64_t* epoch) noexcept {
+    if (!TryLock(kSpinBound)) {
+        *count = 0;
+        *epoch = epoch_.load(std::memory_order_acquire);
+        return false;
+    }
+    SyncLocked();
+    *epoch = tables_epoch_;
+    *count = CopyRowsLocked(out);
+    Unlock();
+    return true;
 }
 
 void Tables::Clear() noexcept {
@@ -158,8 +231,7 @@ bool Reader::Pull(Tables& tables) noexcept {
         wait_next_ = (wait_next_ + 1) % kLogCapacity;
         if (wait_count_ < kLogCapacity) ++wait_count_;
     }
-    row_count_ = tables.row_count_;
-    for (size_t i = 0; i < row_count_; ++i) rows_[i] = tables.rows_[i];
+    row_count_ = tables.CopyRowsLocked(rows_);
     const uint64_t lost = tables.Lost();
     tables.Unlock();
     loss_ = lost + overrun_;
@@ -639,6 +711,208 @@ bool MakeAdoptionSnapshot(const Decision& decision, uint64_t published_queue, Ad
     out->queue = published_queue;
     out->decision = decision;
     return true;
+}
+
+// ── The frame feed ──
+void FrameFeed::OnBoundary(Tables& tables, const BoundaryInput& in) noexcept {
+    const uint64_t lost = tables.Lost();
+    const uint64_t epoch = tables.Epoch();
+    if (in.restart || producer_mode_ != in.mode) {
+        // A new lifetime or mode: the ring and the counters' snapshot are of the old one; the consumer resets the evaluator
+        // when it sees the new generation (the loss baseline is this moment's).
+        producer_mode_ = in.mode;
+        ring_count_ = 0;
+        prev_valid_ = false;
+        restart_mode_.store(in.mode, std::memory_order_relaxed);
+        restart_loss_.store(lost, std::memory_order_relaxed);
+        generation_.store(generation_.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+    }
+    const uint64_t generation = generation_.load(std::memory_order_relaxed);
+    if (ring_count_ == 3) {
+        ring_[0] = ring_[1];
+        ring_[1] = ring_[2];
+        ring_count_ = 2;
+    }
+    ring_[ring_count_].scope = in.scope;
+    ring_[ring_count_].qpc = in.qpc;
+    ring_[ring_count_].epoch = epoch;
+    ring_[ring_count_].keyed = in.keyed;
+    ++ring_count_;
+    if (ring_count_ == 3 && ring_[1].scope != 0) {
+        const uint64_t head = head_.load(std::memory_order_relaxed);
+        if (head - tail_.load(std::memory_order_acquire) >= kBacklog) {
+            queue_full_.store(true, std::memory_order_release); // the evaluator is further behind than the backlog: restart
+        } else {
+            PendingFrame& f = queue_[head % kBacklog];
+            f.scope = ring_[1].scope;
+            f.presenting_queue = in.presenting_queue;
+            f.generation = generation;
+            f.epoch = ring_[0].epoch; // a clear since the frame's window began leaves it with data of another epoch
+            f.lost = lost;            // the loss counter of this moment: what a pull at this Present would have read
+            f.window_begin = ring_[0].qpc;
+            f.window_end = ring_[1].qpc;
+            f.current_epoch = in.frame_counter;
+            f.mode = in.mode;
+            f.keyed = ring_[1].keyed;
+            f.rows_exact = prev_valid_;
+            f.row_count = static_cast<uint8_t>(prev_valid_ ? prev_row_count_ : 0);
+            for (size_t i = 0; i < f.row_count; ++i) f.rows[i] = prev_rows_[i];
+            head_.store(head + 1, std::memory_order_release);
+        }
+    }
+    // The counters of THIS boundary: the next frame's own boundary snapshot (unknown when the lock did not come free).
+    prev_valid_ = tables.SnapshotRows(prev_rows_, &prev_row_count_, &prev_epoch_);
+    if (!prev_valid_) snapshots_skipped_.fetch_add(1, std::memory_order_relaxed);
+    // What the next frame to be pushed (at the next boundary) will need from the mirror.
+    open_begin_.store(ring_count_ == 3 ? ring_[1].qpc : ring_count_ == 2 ? ring_[0].qpc : INT64_MAX,
+        std::memory_order_relaxed);
+    // Published last: whoever reads this loss sees every frame queued up to this boundary; then the boundary counts.
+    last_lost_.store(lost, std::memory_order_release);
+    boundaries_.fetch_add(1, std::memory_order_release);
+}
+
+void FrameFeed::ResetEvaluator(FeedSink& sink, Tables& tables, bool diagnostic, uint64_t baseline) noexcept {
+    evaluator_.Reset(diagnostic, baseline);
+    decision_ = Decision{};
+    sink.OnReset();
+    tables.Unpublish();
+}
+
+bool FrameFeed::Evaluate(Tables& tables, FeedSink& sink) noexcept {
+    if (evaluating_.exchange(true, std::memory_order_acquire)) return false;
+    Step(tables, sink);
+    held_hint_.store(static_cast<uint32_t>(held_count_), std::memory_order_relaxed);
+    seen_generation_hint_.store(seen_generation_, std::memory_order_relaxed);
+    seen_boundaries_hint_.store(seen_boundaries_, std::memory_order_relaxed);
+    sink.UnderGuard();
+    evaluating_.store(false, std::memory_order_release);
+    return true;
+}
+
+void FrameFeed::Step(Tables& tables, FeedSink& sink) noexcept {
+    // The loss counter of the latest boundary FIRST (acquire): every frame queued up to it is then in the queue read below, so
+    // no frame later in this or a following pull carries a loss counter below it.
+    const uint64_t boundary_lost = last_lost_.load(std::memory_order_acquire);
+    const uint64_t boundaries = boundaries_.load(std::memory_order_acquire);
+    // (the generation is read AFTER the head below: a frame in the queue never carries a generation above it)
+    // The queue into the backlog: frames of an older generation are dropped here, the frame count past kBacklog restarts the
+    // window keeping the loss baseline of the previous pull (the loss the next pull finds still poisons the retained frames).
+    uint64_t tail = tail_.load(std::memory_order_relaxed);
+    const bool full = queue_full_.exchange(false, std::memory_order_acq_rel);
+    const uint64_t head = head_.load(std::memory_order_acquire);
+    const uint64_t generation = generation_.load(std::memory_order_acquire);
+    if (full) { // the producer dropped a frame: everything queued is before the gap
+        backlog_overflows_.fetch_add(1, std::memory_order_relaxed);
+        ResetEvaluator(sink, tables, mode_ == 2, evaluator_.pull_loss());
+        held_count_ = 0;
+        tail = head;
+    }
+    // A restart discards the old generation: its held frames go BEFORE the queue is merged and its capacity checked (stale frames
+    // must not push the new generation's first frame out of the backlog), and they and the evaluator's previous edge are no part
+    // of the horizon of the pull that serves the new one (entries only they need, evicted by this pull, are not loss of the new
+    // window).
+    const bool restart = generation != seen_generation_;
+    if (restart) {
+        size_t current = 0;
+        for (size_t i = 0; i < held_count_; ++i) {
+            if (held_[i].generation < generation) continue;
+            if (current != i) held_[current] = held_[i];
+            ++current;
+        }
+        held_count_ = current;
+    }
+    for (; tail < head; ++tail) {
+        const PendingFrame& f = queue_[tail % kBacklog];
+        if (f.generation < generation) continue;
+        if (held_count_ == kBacklog) { // eight skipped pulls: a frame would be dropped, so the window restarts
+            backlog_overflows_.fetch_add(1, std::memory_order_relaxed);
+            ResetEvaluator(sink, tables, f.mode == 2, evaluator_.pull_loss());
+            held_count_ = 0;
+        }
+        held_[held_count_++] = f;
+    }
+    tail_.store(tail, std::memory_order_release); // the slots are free again
+
+    // Every boundary is followed by a pull, whether it queued a frame or not, as the inline path pulled at every Present: the
+    // cursors keep pace with the tables and a drop is seen at the boundary it happened in. Nothing new at all: no pull.
+    if (held_count_ == 0 && !restart && boundaries == seen_boundaries_) return;
+    int64_t needed = held_count_ != 0 ? held_[0].window_begin : open_begin_.load(std::memory_order_relaxed);
+    const int64_t previous_signal = restart ? 0 : evaluator_.OldestPreviousSignalQpc();
+    if (previous_signal != 0 && previous_signal < needed) needed = previous_signal;
+    reader_.SetNeededSince(needed);
+    // The mirror's overrun BEFORE this pull: a restart's baseline must not absorb what this very pull found.
+    const uint64_t overrun_before = reader_.overrun();
+    if (!reader_.Pull(tables)) return; // skipped and counted: the frames stay, the restart stays pending
+    seen_boundaries_ = boundaries;
+
+    const bool epoch_changed = reader_.epoch_changed();
+    uint64_t restart_loss = UINT64_MAX;
+    if (restart) {
+        mode_ = restart_mode_.load(std::memory_order_relaxed);
+        seen_generation_ = generation;
+        restart_loss = restart_loss_.load(std::memory_order_relaxed);
+    }
+    // Frames of an older generation or of tables that were cleared since their window began are not evaluated.
+    size_t kept = 0;
+    for (size_t i = 0; i < held_count_; ++i) {
+        if (held_[i].generation < seen_generation_ || held_[i].epoch < reader_.epoch()) continue;
+        if (kept != i) held_[kept] = held_[i];
+        ++kept;
+    }
+    held_count_ = kept;
+    if (restart || epoch_changed) {
+        // Records dropped before this point do not count against the first window: the loss counter of the restart's own
+        // boundary, never above what the first frame of the new window carries (the counter only grows), plus the overrun
+        // as of BEFORE this pull. Entries this pull overwrote (reader_.overrun() now) are loss of the retained frames: the
+        // BeginPull below sees them above the baseline and poisons the frames it resolves and the one current now.
+        const uint64_t first = kept != 0 ? held_[0].lost : boundary_lost;
+        ResetEvaluator(sink, tables, mode_ == 2, (restart_loss < first ? restart_loss : first) + overrun_before);
+    }
+    // One pull for the batch, as of the Present that pushed its last frame (no frame: as of the latest boundary), with the
+    // overrun including this pull's.
+    const uint64_t loss = (kept != 0 ? held_[kept - 1].lost : boundary_lost) + reader_.overrun();
+    evaluator_.BeginPull(loss, static_cast<uint32_t>(kept));
+    if (kept == 0) return;
+    for (size_t index = 0; index < kept; ++index) {
+        const PendingFrame& f = held_[index];
+        FrameInput input;
+        input.presenting_queue = f.presenting_queue;
+        input.scope = f.scope;
+        input.window_begin = f.window_begin;
+        input.window_end = f.window_end;
+        input.current_epoch = f.current_epoch;
+        input.keyed = f.keyed;
+        evaluator_.FillPrevious(&input, reader_.epoch()); // the previous frame's first-hop edges: Signals of the fence since them
+        FrameResult frame;
+        ResolveFrame(input, reader_.waits(), reader_.wait_count(), reader_.signals(), reader_.signal_count(), &frame);
+        const uint64_t ambiguous = evaluator_.ambiguous_frames_total(), missing = evaluator_.missing_join_frames_total(),
+            unsignalled = evaluator_.unsignalled_waits_total(), ambiguous_signals = evaluator_.ambiguous_signals_total(),
+            multi_edge = evaluator_.multi_edge_frames_total();
+        const Row* counters = f.rows_exact ? f.rows : reader_.rows();
+        const size_t counter_count = f.rows_exact ? f.row_count : reader_.row_count();
+        const bool completed = evaluator_.AddFrame(f.presenting_queue, frame, counters, counter_count, loss,
+            reader_.epoch(), f.rows_exact ? Evaluator::CountAlign::Exact : Evaluator::CountAlign::Inexact);
+        frames_.fetch_add(1, std::memory_order_relaxed);
+        ambiguous_.fetch_add(evaluator_.ambiguous_frames_total() - ambiguous, std::memory_order_relaxed);
+        multi_edge_.fetch_add(evaluator_.multi_edge_frames_total() - multi_edge, std::memory_order_relaxed);
+        missing_.fetch_add(evaluator_.missing_join_frames_total() - missing, std::memory_order_relaxed);
+        unsignalled_.fetch_add(evaluator_.unsignalled_waits_total() - unsignalled, std::memory_order_relaxed);
+        ambiguous_signals_.fetch_add(evaluator_.ambiguous_signals_total() - ambiguous_signals, std::memory_order_relaxed);
+        if (completed) {
+            windows_.fetch_add(1, std::memory_order_relaxed);
+            decision_ = evaluator_.decision();
+            // Published (bounded lock) only while the epoch it was computed for is current; a decision of an old epoch,
+            // or one that could not take the lock, is discarded and the next window publishes.
+            const uint64_t queue = f.mode == 1 && decision_.adoptable ? decision_.queue : 0;
+            if (tables.PublishDecision(decision_.epoch, queue)) {
+                sink.OnDecision(f.mode, decision_);
+            } else {
+                stale_decisions_.fetch_add(1, std::memory_order_relaxed);
+                decision_ = Decision{};
+            }
+        }
+    }
+    held_count_ = 0;
 }
 
 } // namespace gpu_queue_dependency

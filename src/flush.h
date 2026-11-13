@@ -3,7 +3,7 @@
 #include <cstdint>
 
 // Flush protocol: Flush(modules) procedure.
-// Spec §IV.6.
+// Selective flush by module flags.
 
 // Module flags for selective flush. Bits 1 (stress), 3 (damping) and 4 (the
 // old cadence PQI, replaced by PQI_FromSnapshot) are retired with their

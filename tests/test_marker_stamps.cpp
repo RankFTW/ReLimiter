@@ -507,8 +507,8 @@ namespace
         CHECK(calibration.state() == MarkerRateCalibration::State::Ready && calibration.Finished());
         CHECK(calibration.RateHz() > kTsc * 0.9999999 && calibration.RateHz() < kTsc * 1.0000001);
 
-        // A wide bracket is no pair: the worker was preempted between the reads. The pair of the
-        // review's case (a 20 ms preemption after the first QPC read) is such a bracket.
+        // A wide bracket is no pair: the worker was preempted between the reads. The pair of a
+        // 20 ms preemption after the first QPC read is such a bracket.
         MarkerRateCalibration interrupted;
         interrupted.Begin(true);
         Feed(&interrupted, kRateT0);

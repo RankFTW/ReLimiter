@@ -4,8 +4,8 @@
 #include <cmath>
 #include <limits>
 
-// The pure law of the unified pacer (spec_unified_pacer_first_build.md, 2.1 to
-// 2.6 and 4.1). No Windows, logger or config dependencies.
+// The pure law of the unified pacer. No Windows, logger or config dependencies.
+//
 
 namespace
 {

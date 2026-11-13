@@ -159,7 +159,7 @@ DriverLimiterApply NvAPI_ApplyDriverLimiter(uint32_t minimum_interval_us) noexce
 // Restores the game's parameters (RestoreGameSleepMode). Scheduler owner.
 void NvAPI_ReleaseDriverLimiter() noexcept;
 
-// Unified pacer (developer key unified_pacer, spec 4.1).
+// Unified pacer (developer key unified_pacer).
 // True while the Sleep hook runs the unified path and its self-check found the driver
 // pacing on its own (a Sleep over 200 us in at least 16 of the last 64; cleared below 3
 // of 64). Diagnosis only: nothing else reads it.

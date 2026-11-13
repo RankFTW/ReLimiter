@@ -425,7 +425,7 @@ public:
     // also resets it.
     void SetUnifiedEnabled(bool enabled, uint32_t controller_generation) noexcept;
     bool UnifiedEnabled() const noexcept { return unified_enabled_; }
-    // Resets the law (spec 2.6) at the grid's next index.
+    // Resets the law at the grid's next index.
     void ResetUnified(uint32_t controller_generation) noexcept;
     // Developer keys unified_every_frame_service / unified_queue_target_us (the invocation's
     // configuration snapshot): forwarded to the law only while unified is enabled, so the key-off
@@ -531,7 +531,7 @@ public:
 private:
     // Frame key continues the rhythm: the next frame of the newest one it paced.
     bool RhythmContinues(const PacingPlanKey& key) const noexcept;
-    // The unified branch of RunPlannedFrame (spec 4.2).
+    // The unified branch of RunPlannedFrame.
     SourceStageFrame RunUnifiedFrame(const SourceStageRequest& request, SourceStageClock* clock) noexcept;
     // Key unified_pacer, saturation rule (b): the law's used reports to the lead (exact
     // identity, each frame once) when forward_reports, and the law's report-stream liveness

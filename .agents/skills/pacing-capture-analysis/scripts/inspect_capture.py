@@ -135,16 +135,18 @@ CURRENT_PACING_HEADER = PACING_FIXED_RAW_HEADER + PACING_FIXED_DERIVED_HEADER + 
     # computable or off)
     "up_ql_base_us", "up_ql_need_us", "up_ql_service_us", "up_ql_q_us", "up_ql_p_us", "up_ql_valid_frames",
     # developer key unified_queue_upstream (1): the frame's own marker stamps (QPC; empty when the key is 0 or the stamp
-    # was not seen); the next three were the render-thread margin, offset c' and queue term of the queue law, removed
-    # with the render-thread terms: always 0 on a row the unified pacer decided (empty on every other row)
+    # was not seen); the next three (header names historical) carry the UPPER ends of the probe's empty time, boundary
+    # idle time and smallest free margin (empty = unknown or no probe record, 0 is real)
     "sim_end_marker_qpc", "render_submit_start_marker_qpc", "render_submit_end_marker_qpc",
     "up_ql_rt_margin_us", "up_ql_rt_offset_us", "up_ql_q_rt_us",
     # developer key unified_queue_upstream: the CPU time of the thread inside the frame's render-submit and
     # simulation spans in µs (empty when the span's markers were not on one thread), then the ids of the threads
     # that sent the render-submit start, simulation start, render-submit end and simulation end markers
     "render_submit_cpu_us", "sim_cpu_us", "render_submit_tid", "sim_tid", "render_submit_end_tid", "sim_end_tid",
-    # formerly the render-thread feed rule's contrast, spread and span wait; the rule was removed, the columns stay
-    # and are always 0 on a row the unified pacer decided (empty on every other row)
+    # the retired render-thread columns (header names historical; empty = unknown or no probe record, 0 is real): 187-189
+    # carry the UPPER ends of the probe's empty time, boundary idle time and smallest free margin (the gq_ scalars are
+    # the lower ends, except the margin: its scalar is the bracket-midpoint minimum), 196 the minimum of the margin
+    # brackets' lower ends, 198 the bracket error, 197 packs borrowed + 10000 * registrations
     "up_ql_rt_contrast_us", "up_ql_rt_spread_us", "up_ql_rt_wait_us",
     # developer key gpu_queue_probe: which queue the probe record describes (1 presenting, 2 frame generation
     # source, 3 render queue by dependency; empty without a probe record or when unknown)

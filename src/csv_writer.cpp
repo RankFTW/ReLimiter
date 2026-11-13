@@ -797,11 +797,14 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
     { "render_submit_end_marker_qpc", [](CsvLine* line, const PacingCsvRow& row) {
         QpcIf(line, row.joined.has_source, row.joined.source.render_submit_end_marker_qpc); } },
     { "up_ql_rt_margin_us", [](CsvLine* line, const PacingCsvRow& row) {
-        DecimalIf(line, PacingRowHasUnified(row), 0.0); } },
+        const double v = row.joined.gpu_queue.empty_hi_us;
+        DecimalIf(line, row.joined.has_gpu_queue && !std::isnan(v), v); } },
     { "up_ql_rt_offset_us", [](CsvLine* line, const PacingCsvRow& row) {
-        DecimalIf(line, PacingRowHasUnified(row), 0.0); } },
+        const double v = row.joined.gpu_queue.boundary_idle_hi_us;
+        DecimalIf(line, row.joined.has_gpu_queue && !std::isnan(v), v); } },
     { "up_ql_q_rt_us", [](CsvLine* line, const PacingCsvRow& row) {
-        DecimalIf(line, PacingRowHasUnified(row), 0.0); } },
+        const double v = row.joined.gpu_queue.min_margin_free_hi_us;
+        DecimalIf(line, row.joined.has_gpu_queue && !std::isnan(v), v); } },
     // Appended (developer key unified_queue_upstream, 1): the CPU time of the thread inside the
     // frame's render-submit and simulation spans (µs; empty when the span's markers were not on
     // one thread or a stamp is missing) and the ids of the threads that sent the markers (empty
@@ -820,15 +823,26 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
         NonZeroIf(line, row.joined.has_source, row.joined.source.render_submit_end_tid); } },
     { "sim_end_tid", [](CsvLine* line, const PacingCsvRow& row) {
         NonZeroIf(line, row.joined.has_source, row.joined.source.sim_end_tid); } },
-    // Appended (formerly the render-thread feed rule's contrast and spread and the span wait of the
-    // record that entered the window): the rule was removed, the columns stay for a stable header
-    // and are always 0 on a row the unified pacer decided (empty on every other row).
+    // Probe instrumentation (header names of columns 187-189 and 196-198 are historical): 187, 188 and
+    // 189 are the UPPER ends of the probe's empty time, boundary idle time and smallest free margin
+    // (the gq_empty_us, gq_boundary_idle_us and gq_min_margin_free_us cells are the lower ends for the
+    // first two and the bracket-midpoint minimum for the margin); 196 is the minimum of the margin
+    // brackets' lower ends and 198 the bracket error max(S - lo_min, hi_min - S) (the reported
+    // midpoint minimum S is within it of the true minimum). 3 decimals, empty when the row has no probe record or the value is unknown
+    // (NaN), 0 is a value. 197 packs min(borrowed, 9999) + 10000 * min(registrations, 9999) (the
+    // frame's submissions marked by the game's own Signal, and the worker's registrations since the
+    // previous record); empty without a probe record.
     { "up_ql_rt_contrast_us", [](CsvLine* line, const PacingCsvRow& row) {
-        DecimalIf(line, PacingRowHasUnified(row), 0.0); } },
+        const double v = row.joined.gpu_queue.min_margin_free_lo_us;
+        DecimalIf(line, row.joined.has_gpu_queue && !std::isnan(v), v); } },
     { "up_ql_rt_spread_us", [](CsvLine* line, const PacingCsvRow& row) {
-        DecimalIf(line, PacingRowHasUnified(row), 0.0); } },
+        const PacingGpuQueueRecord& q = row.joined.gpu_queue;
+        const uint64_t packed = (q.borrowed_submits < 9999u ? q.borrowed_submits : 9999u) +
+            10000ull * (q.registrations < 9999u ? q.registrations : 9999u);
+        UnsignedIf(line, row.joined.has_gpu_queue, packed); } },
     { "up_ql_rt_wait_us", [](CsvLine* line, const PacingCsvRow& row) {
-        DecimalIf(line, PacingRowHasUnified(row), 0.0); } },
+        const double v = row.joined.gpu_queue.min_margin_err_us;
+        DecimalIf(line, row.joined.has_gpu_queue && !std::isnan(v), v); } },
     // Appended (developer key gpu_queue_probe): which queue the probe record describes (1 the
     // presenting queue, 2 the frame generation source queue, 3 the render queue found by fence
     // dependencies); empty when the row has no probe record or the role is unknown.

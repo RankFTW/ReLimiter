@@ -6,7 +6,7 @@
 #include <imgui.h>
 #include <reshade.hpp>
 
-// OSD rendering via ReShade + ImGui. Spec §III.5.
+// OSD rendering via ReShade + ImGui.
 void DrawSettings(reshade::api::effect_runtime* rt);
 void DrawOSD(reshade::api::effect_runtime* rt);
 void RegisterOSD();

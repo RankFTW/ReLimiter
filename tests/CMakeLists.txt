@@ -293,6 +293,28 @@ if(MSVC)
     target_compile_options(test_gpu_queue_probe_core PRIVATE /W4 /utf-8 /permissive-)
 endif()
 
+# The callback rundown (src/runtime_lifecycle.cpp, the production unit, no stubs): per-thread slots, the Dekker handshake
+# with s_stopping, the exact examination of all counters, overflow, slot reuse and a guard left on another thread.
+# `test_runtime_lifecycle --bench` prints the cost of a guard pair (not a test).
+add_executable(test_runtime_lifecycle
+    test_runtime_lifecycle.cpp
+    ${CMAKE_SOURCE_DIR}/src/runtime_lifecycle.cpp
+)
+set_target_properties(test_runtime_lifecycle PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+target_include_directories(test_runtime_lifecycle PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_runtime_lifecycle PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+if(MSVC)
+    set_property(TARGET test_runtime_lifecycle PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(test_runtime_lifecycle PRIVATE /W4 /utf-8 /permissive-)
+endif()
+add_test(NAME runtime_lifecycle COMMAND test_runtime_lifecycle)
+set_tests_properties(runtime_lifecycle PROPERTIES TIMEOUT 300)
+
 # The pure dependency rule of the probe's source key (src/gpu_queue_dependency.cpp): tables, matching by
 # fence and value, hop limit, CPU-signalled branch end, window selection by command lists, tie to the
 # presenting queue, aged-out fences. The hooks that feed it need live validation.
@@ -310,6 +332,124 @@ if(MSVC)
     set_property(TARGET test_gpu_queue_dependency PROPERTY
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     target_compile_options(test_gpu_queue_dependency PRIVATE /W4 /utf-8 /permissive-)
+endif()
+
+# The probe's borrowing rules (src/gpu_queue_borrow.cpp: pending word, frame pattern, gate, late classification,
+# in-order merge, the one reference on the game's fence with a fake fence) and the core's two additions for them
+# (borrowed submissions per frame, InvalidateSubmission). The hooks and the completion thread need live validation.
+add_executable(test_gpu_queue_borrow
+    test_gpu_queue_borrow.cpp
+    ${CMAKE_SOURCE_DIR}/src/gpu_queue_borrow.cpp
+    ${CMAKE_SOURCE_DIR}/src/gpu_queue_probe_core.cpp
+)
+set_target_properties(test_gpu_queue_borrow PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+target_include_directories(test_gpu_queue_borrow PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(MSVC)
+    set_property(TARGET test_gpu_queue_borrow PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(test_gpu_queue_borrow PRIVATE /W4 /utf-8 /permissive-)
+endif()
+
+# Replay of the tail-stamp policy (tools/testbed/stamp_policy_replay): an executable, NOT a ctest. It drives the
+# production core and the production worker-step planner with the events recorded submission streams would produce and
+# writes one CSV row per frame record (the judge is tools/testbed/stamp_policy_sim.py). Built with the tests, both architectures.
+add_executable(stamp_policy_replay
+    ${CMAKE_SOURCE_DIR}/tools/testbed/stamp_policy_replay/replay.cpp
+    ${CMAKE_SOURCE_DIR}/src/gpu_queue_borrow.cpp
+    ${CMAKE_SOURCE_DIR}/src/gpu_queue_probe_core.cpp
+)
+set_target_properties(stamp_policy_replay PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+target_include_directories(stamp_policy_replay PRIVATE ${CMAKE_SOURCE_DIR}/src)
+if(MSVC)
+    set_property(TARGET stamp_policy_replay PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(stamp_policy_replay PRIVATE /W4 /utf-8 /permissive-)
+endif()
+
+# The REAL gpu_queue_probe glue (src/gpu_queue_probe_d3d12.cpp, src/streamline_queue_hooks.cpp with the pure core, borrow and
+# dependency units) against FAKE D3D12 queue / fence / device objects (gpu_queue_glue_support.h/.cpp: hand-written COM vtables, a
+# fake GPU thread, stubs of the glue's externals; no GPU). x64 only: the probe does not exist on Win32.
+#   test_gpu_queue_glue    ctest, functional: adoption of a render queue (role 3), borrowed markers, the Wait path, the worker's records,
+#                          a short interleaved three-thread run, a foreign Signal, the end of the session (see its header).
+#                          gpu_queue_glue adopts through the test seam (RELIMITER_GLUE_TEST_SEAM, src/gpu_queue_probe_test_seam.h);
+#                          gpu_queue_glue_rule lets the dependency rule decide and is SKIPPED (77) when it does not pick the render queue.
+#   bench_gpu_queue_hooks  NOT a ctest: nanoseconds per Execute + borrowed Signal pair and per unsatisfied Wait through the real detours.
+# The two translation units that read the clock are compiled with a counting force-include (MSVC): clock reads per call are reported.
+if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(GPU_QUEUE_GLUE_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu_queue_glue_support.cpp
+        ${CMAKE_SOURCE_DIR}/src/gpu_queue_probe_d3d12.cpp
+        ${CMAKE_SOURCE_DIR}/src/streamline_queue_hooks.cpp
+        ${CMAKE_SOURCE_DIR}/src/gpu_queue_probe_core.cpp
+        ${CMAKE_SOURCE_DIR}/src/gpu_queue_borrow.cpp
+        ${CMAKE_SOURCE_DIR}/src/gpu_queue_dependency.cpp
+    )
+    if(MSVC)
+        set_source_files_properties(
+            ${CMAKE_SOURCE_DIR}/src/gpu_queue_probe_d3d12.cpp
+            ${CMAKE_SOURCE_DIR}/src/streamline_queue_hooks.cpp
+            PROPERTIES COMPILE_OPTIONS "/FI${CMAKE_CURRENT_SOURCE_DIR}/gpu_queue_glue_qpc_counter.h")
+    endif()
+    foreach(glue_target test_gpu_queue_glue bench_gpu_queue_hooks)
+        add_executable(${glue_target} ${glue_target}.cpp ${GPU_QUEUE_GLUE_SOURCES})
+        set_target_properties(${glue_target} PROPERTIES
+            CXX_STANDARD 17
+            CXX_STANDARD_REQUIRED YES
+            CXX_EXTENSIONS NO
+        )
+        target_include_directories(${glue_target} PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_SOURCE_DIR}/deps/reshade/deps/minhook/include
+            ${CMAKE_SOURCE_DIR}/deps/reshade/include)
+        target_compile_definitions(${glue_target} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN RELIMITER_GLUE_TEST_SEAM)
+        target_link_libraries(${glue_target} PRIVATE winmm)
+        if(MSVC)
+            set_property(TARGET ${glue_target} PROPERTY
+                MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+            target_compile_options(${glue_target} PRIVATE /W4 /utf-8 /permissive-)
+        endif()
+    endforeach()
+    add_test(NAME gpu_queue_glue COMMAND test_gpu_queue_glue)
+    set_tests_properties(gpu_queue_glue PROPERTIES TIMEOUT 120)
+    add_test(NAME gpu_queue_glue_rule COMMAND test_gpu_queue_glue --rule)
+    set_tests_properties(gpu_queue_glue_rule PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    # Each ends the session in its own way, so each runs in its own process: gpu_queue_glue_rundown (a rundown that times
+    # out retains the bound game fence, the session goes dead, no bind opens) and gpu_queue_glue_covered_bind (a marker whose
+    # value the game fence had already reached is not borrowed and borrowing ends).
+    add_test(NAME gpu_queue_glue_rundown COMMAND test_gpu_queue_glue --rundown-timeout)
+    set_tests_properties(gpu_queue_glue_rundown PROPERTIES TIMEOUT 120)
+    add_test(NAME gpu_queue_glue_covered_bind COMMAND test_gpu_queue_glue --covered-bind)
+    set_tests_properties(gpu_queue_glue_covered_bind PROPERTIES TIMEOUT 120)
+    # The dependency consumers never record a zero time (production consumers called with now == 0), and the clock-read count
+    # per Signal / Wait through the detours per key state (1 with both keys on, 0 with either off). No session: it toggles the keys.
+    add_test(NAME gpu_queue_glue_dependency_clock COMMAND test_gpu_queue_glue --dependency-clock)
+    set_tests_properties(gpu_queue_glue_dependency_clock PROPERTIES TIMEOUT 60)
+    # A binder of the Signal detour held at a pause point of BindMarker (GpuQueueProbeTest_SetBindPause) while the
+    # slot of its submission is repaired and claimed again (k + 256): the lost take (point 0) must touch nothing; a successful
+    # covered binder held after its value is published (point 2) or before its Submit is pushed (point 3) must still push its own
+    # original Submit. Each in its own process.
+    add_test(NAME gpu_queue_glue_bind_race_lost_take COMMAND test_gpu_queue_glue --bind-race-lost-take)
+    set_tests_properties(gpu_queue_glue_bind_race_lost_take PROPERTIES TIMEOUT 120)
+    add_test(NAME gpu_queue_glue_bind_race_lost_take_covered COMMAND test_gpu_queue_glue --bind-race-lost-take-covered)
+    set_tests_properties(gpu_queue_glue_bind_race_lost_take_covered PROPERTIES TIMEOUT 120)
+    add_test(NAME gpu_queue_glue_bind_race_covered_2 COMMAND test_gpu_queue_glue --bind-race-covered-2)
+    set_tests_properties(gpu_queue_glue_bind_race_covered_2 PROPERTIES TIMEOUT 120)
+    add_test(NAME gpu_queue_glue_bind_race_covered_3 COMMAND test_gpu_queue_glue --bind-race-covered-3)
+    set_tests_properties(gpu_queue_glue_bind_race_covered_3 PROPERTIES TIMEOUT 120)
+    # The lock-timeout taker's Lost word after a slot lap, and the worker's tail read of a consumed marker, each in its own process.
+    add_test(NAME gpu_queue_glue_lose_word_lap COMMAND test_gpu_queue_glue --lose-word-lap)
+    set_tests_properties(gpu_queue_glue_lose_word_lap PROPERTIES TIMEOUT 120)
+    add_test(NAME gpu_queue_glue_tail_consumed COMMAND test_gpu_queue_glue --tail-consumed)
+    set_tests_properties(gpu_queue_glue_tail_consumed PROPERTIES TIMEOUT 120)
 endif()
 
 ## ── Marker stamps tests ──
@@ -483,6 +623,7 @@ add_executable(test_hook_regressions
     ${CMAKE_SOURCE_DIR}/src/pacing_resolver.cpp
     ${CMAKE_SOURCE_DIR}/src/vtable_copy.cpp
     ${CMAKE_SOURCE_DIR}/src/startup_breadcrumb.cpp
+    ${CMAKE_SOURCE_DIR}/src/module_presence.cpp
     ${CMAKE_SOURCE_DIR}/src/hooks.cpp)
 target_include_directories(test_hook_regressions PRIVATE
     ${CMAKE_SOURCE_DIR}/src
@@ -632,6 +773,7 @@ add_executable(test_feedback_device_identity
     ${CMAKE_SOURCE_DIR}/src/cadence_grid_publication.cpp
     ${CMAKE_SOURCE_DIR}/src/pacing_resolver.cpp
     ${CMAKE_SOURCE_DIR}/src/render_handoff.cpp
+    ${CMAKE_SOURCE_DIR}/src/module_presence.cpp
     ${CMAKE_SOURCE_DIR}/src/unified_pacer.cpp)
 target_link_libraries(test_feedback_device_identity PRIVATE Synchronization)
 target_include_directories(test_feedback_device_identity PRIVATE
@@ -641,6 +783,12 @@ target_compile_definitions(test_feedback_device_identity PRIVATE
     NOMINMAX WIN32_LEAN_AND_MEAN)
 add_executable(test_oled_care test_oled_care.cpp)
 add_executable(test_osd_position test_osd_position.cpp)
+add_executable(test_module_presence test_module_presence.cpp
+    ${CMAKE_SOURCE_DIR}/src/module_presence.cpp)
+target_compile_definitions(test_module_presence PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+add_executable(test_hotkey_edge test_hotkey_edge.cpp
+    ${CMAKE_SOURCE_DIR}/src/hotkey_poller.cpp)
+target_compile_definitions(test_hotkey_edge PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 add_executable(test_swapchain_selection_policy test_swapchain_selection_policy.cpp)
 add_executable(test_pacing_sleep
     test_pacing_sleep.cpp
@@ -689,7 +837,7 @@ foreach(regression_target IN ITEMS test_hook_regressions test_hook_batch test_ho
     test_config_async
     test_scheduler_cadence test_osd_cadence
     test_feedback_device_identity
-    test_oled_care test_osd_position
+    test_oled_care test_osd_position test_module_presence test_hotkey_edge
         test_shutdown_lifecycle test_swapchain_selection_policy test_pacing_sleep)
     set_target_properties(${regression_target} PROPERTIES
         CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
@@ -720,6 +868,8 @@ add_test(NAME feedback_device_identity COMMAND test_feedback_device_identity)
 set_tests_properties(feedback_device_identity PROPERTIES TIMEOUT 30)
 add_test(NAME oled_care COMMAND test_oled_care)
 add_test(NAME osd_position COMMAND test_osd_position)
+add_test(NAME module_presence COMMAND test_module_presence)
+add_test(NAME hotkey_edge COMMAND test_hotkey_edge)
 add_test(NAME hook_regressions COMMAND test_hook_regressions)
 add_test(NAME hook_batch COMMAND test_hook_batch)
 add_test(NAME hook_installer COMMAND test_hook_installer)
@@ -755,6 +905,7 @@ set_tests_properties(unified_pacer PROPERTIES TIMEOUT 120)
 add_test(NAME unified_queue_law COMMAND test_unified_queue_law)
 add_test(NAME gpu_queue_probe_core COMMAND test_gpu_queue_probe_core)
 add_test(NAME gpu_queue_dependency COMMAND test_gpu_queue_dependency)
+add_test(NAME gpu_queue_borrow COMMAND test_gpu_queue_borrow)
 add_test(NAME marker_stamps COMMAND test_marker_stamps)
 add_test(NAME lead_controller COMMAND test_lead_controller)
 add_test(NAME period_governor COMMAND test_period_governor)

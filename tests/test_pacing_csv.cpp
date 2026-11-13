@@ -214,6 +214,13 @@ PacingJoinedRow DisplayRow(bool with_latency)
         row.gpu_queue.cycle_us = 8333.25;
         row.gpu_queue.wait_idle_us = 120.75;
         row.gpu_queue.queue_role = 3;
+        row.gpu_queue.borrowed_submits = 17;
+        row.gpu_queue.empty_hi_us = 812.5;
+        row.gpu_queue.boundary_idle_hi_us = 640.25;
+        row.gpu_queue.min_margin_free_hi_us = 0.0;
+        row.gpu_queue.registrations = 3;
+        row.gpu_queue.min_margin_free_lo_us = -12.75;
+        row.gpu_queue.min_margin_err_us = 31.125;
         row.source.up_ql_valid = 1;
         row.source.up_ql_base_us = 8333.25;
         row.source.up_ql_need_us = 7100.5;
@@ -301,6 +308,7 @@ PacingJoinedRow DisplayRow(bool with_latency)
         row.gpu_queue.hold_block_us = 3.5;
         row.gpu_queue.cycle_us = 9000.0;
         row.gpu_queue.queue_role = 0; // role unknown: empty
+        row.gpu_queue.borrowed_submits = 5;
         row.gpu_queue.min_margin_free_us = 9.0; // hidden: valid bit clear
         row.gpu_queue.boundary_idle_us = 9.0;
         row.gpu_queue.wait_idle_us = 9.0;
@@ -721,16 +729,32 @@ void CheckRowsFile(const CsvFile& rows)
               rows.Cell(1, "render_submit_end_marker_qpc").empty(),
           "a stamp of 0 is an empty cell, a seen stamp prints as an integer");
 
-    // The columns of the removed render-thread terms of the queue law (margin, offset, queue term,
-    // feed contrast, spread, span wait) are always 0 on a row the unified pacer decided (rows 1 and
-    // 4) and empty on every other row (row 2: up_valid 0, row 3: no Source record).
-    for (const char* column : { "up_ql_rt_margin_us", "up_ql_rt_offset_us", "up_ql_q_rt_us",
-                                "up_ql_rt_contrast_us", "up_ql_rt_spread_us", "up_ql_rt_wait_us" }) {
-        Check(rows.Cell(0, column) == "0.000", std::string("row 1 ") + column + " is 0.000, got " + rows.Cell(0, column));
-        Check(rows.Cell(3, column) == "0.000", std::string("row 4 ") + column + " is 0.000, got " + rows.Cell(3, column));
-        Check(rows.Cell(1, column).empty(), std::string("row 2 ") + column + " is empty: up_valid 0");
-        Check(rows.Cell(2, column).empty(), std::string("row 3 ") + column + " is empty without a Source record");
+    // Columns 187-189 (historical header names): the UPPER ends of the probe's empty time, boundary
+    // idle time and smallest free margin; 196 the minimum of the free-margin brackets' lower ends and
+    // 198 the bracket error. Decimals, empty without a probe record or when NaN (unknown), 0 is a
+    // value. 197 packs min(borrowed, 9999) + 10000 * min(registrations, 9999), empty without a probe
+    // record.
+    const std::pair<const char*, const char*> tail_cells[] = {
+        { "up_ql_rt_margin_us", "812.500" }, { "up_ql_rt_offset_us", "640.250" },
+        { "up_ql_q_rt_us", "0.000" }, // a real zero is a value
+        { "up_ql_rt_contrast_us", "-12.750" }, { "up_ql_rt_wait_us", "31.125" },
+        { "up_ql_rt_spread_us", "30017" } }; // 17 + 10000 * 3
+    for (const auto& [column, expected] : tail_cells) {
+        Check(rows.Cell(0, column) == expected,
+              std::string("row 1 ") + column + " = " + expected + ", got " + rows.Cell(0, column));
+        Check(rows.Cell(2, column).empty(), std::string("row 3 ") + column + " is empty without a Source or probe record");
     }
+    // Rows 2 and 4 have a probe record with every upper end, lower end and error unknown (NaN): empty.
+    for (const char* column : { "up_ql_rt_margin_us", "up_ql_rt_offset_us", "up_ql_q_rt_us",
+                                "up_ql_rt_contrast_us", "up_ql_rt_wait_us" }) {
+        Check(rows.Cell(1, column).empty(), std::string("row 2 ") + column + " is empty: NaN");
+        Check(rows.Cell(3, column).empty(), std::string("row 4 ") + column + " is empty: NaN");
+    }
+    // No registrations: only the borrowed count prints.
+    Check(rows.Cell(1, "up_ql_rt_spread_us") == "5",
+          "row 2 up_ql_rt_spread_us = 5 (borrowed only), got " + rows.Cell(1, "up_ql_rt_spread_us"));
+    Check(rows.Cell(3, "up_ql_rt_spread_us") == "5",
+          "row 4 up_ql_rt_spread_us = 5 (the base row's record: borrowed only), got " + rows.Cell(3, "up_ql_rt_spread_us"));
 
     // The probe record's queue role: a role prints only with a probe record, 0 is empty.
     Check(rows.Cell(0, "gq_queue_role") == "3", "row 1 gq_queue_role = 3, got " + rows.Cell(0, "gq_queue_role"));

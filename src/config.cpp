@@ -279,6 +279,7 @@ void ValidateConfig() {
     g_config.gpu_queue_probe_source = Clamp(g_config.gpu_queue_probe_source, 0, kPacingGpuQueueProbeSourceMax);
     g_config.unified_queue_need_frames = Clamp(g_config.unified_queue_need_frames, 1, kPacingUnifiedQueueNeedFramesMax);
     g_config.unified_queue_upstream = Clamp(g_config.unified_queue_upstream, 0, kPacingUnifiedQueueUpstreamMax);
+    g_config.unified_queue_margin_end = Clamp(g_config.unified_queue_margin_end, 0, kPacingUnifiedQueueMarginEndMax);
     g_config.unified_queue_allow_us = Clamp(g_config.unified_queue_allow_us, 0, kPacingUnifiedQueueAllowMaxUs);
     // gpu_wait_headroom_us: the collision guard's release headroom; 0 or
     // less (or non-finite) loads as the default.
@@ -472,6 +473,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.unified_queue_rank=ReadINIInt(S,"unified_queue_rank",kPacingUnifiedQueueRankDefault,P);
     g_config.unified_queue_need_frames=ReadINIInt(S,"unified_queue_need_frames",kPacingUnifiedQueueNeedFramesDefault,P);
     g_config.unified_queue_upstream=ReadINIInt(S,"unified_queue_upstream",kPacingUnifiedQueueUpstreamDefault,P);
+    g_config.unified_queue_margin_end=ReadINIInt(S,"unified_queue_margin_end",kPacingUnifiedQueueMarginEndDefault,P);
     g_config.unified_queue_allow_us=ReadINIInt(S,"unified_queue_allow_us",kPacingUnifiedQueueAllowDefaultUs,P);
     g_config.control_file=ReadINIBool(S,"control_file",false,P);
     g_config.adaptive_cap_hold_room=ReadINIBool(S,"adaptive_cap_hold_room",true,P);
@@ -724,6 +726,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIInt(S, "unified_queue_rank", config.unified_queue_rank, P);
     WriteINIInt(S, "unified_queue_need_frames", config.unified_queue_need_frames, P);
     WriteINIInt(S, "unified_queue_upstream", config.unified_queue_upstream, P);
+    WriteINIInt(S, "unified_queue_margin_end", config.unified_queue_margin_end, P);
     WriteINIInt(S, "unified_queue_allow_us", config.unified_queue_allow_us, P);
     WriteINIBool(S, "control_file", config.control_file, P);
     WriteINIBool(S, "adaptive_cap_hold_room", config.adaptive_cap_hold_room, P);
@@ -985,6 +988,7 @@ static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
     pipeline.gpu_queue_probe_source = config.gpu_queue_probe_source;
     pipeline.unified_queue_need_frames = config.unified_queue_need_frames;
     pipeline.unified_queue_upstream = config.unified_queue_upstream;
+    pipeline.unified_queue_margin_end = config.unified_queue_margin_end;
     pipeline.unified_queue_allow_us = config.unified_queue_allow_us;
     return pipeline;
 }
@@ -1014,6 +1018,7 @@ void Config_ApplyPacingPipeline() {
     g_gpu_queue_law_feed.store(queue_law, std::memory_order_relaxed);
     g_unified_queue_upstream.store(sizeof(void*) == 8 ? g_config.unified_queue_upstream : 0, std::memory_order_relaxed);
     g_gpu_queue_probe_source.store(sizeof(void*) == 8 ? g_config.gpu_queue_probe_source : 0, std::memory_order_relaxed);
+    g_unified_queue_margin_end.store(sizeof(void*) == 8 ? g_config.unified_queue_margin_end : 0, std::memory_order_relaxed);
     g_fg_presenter_probe_us.store(g_config.fg_presenter_probe_us, std::memory_order_relaxed);
 }
 
@@ -1095,6 +1100,7 @@ constexpr Key kKeys[] = {
     {"gpu_start_probe", &SetBool<&Config::gpu_start_probe>, Publish::Pipeline},
     {"gpu_queue_probe", &SetBool<&Config::gpu_queue_probe>, Publish::Pipeline},
     {"gpu_queue_probe_source", &SetInt<&Config::gpu_queue_probe_source>, Publish::Pipeline},
+    {"unified_queue_margin_end", &SetInt<&Config::unified_queue_margin_end>, Publish::Pipeline},
     {"unified_pacer", &SetBool<&Config::unified_pacer>, Publish::Pipeline},
     {"unified_every_frame_service", &SetBool<&Config::unified_every_frame_service>, Publish::Pipeline},
     {"unified_queue_target_us", &SetDouble<&Config::unified_queue_target_us>, Publish::Pipeline},
@@ -1171,6 +1177,7 @@ int Config_DeveloperOverrides() {
         (g_config.gpu_start_probe != d.gpu_start_probe) +
         (g_config.gpu_queue_probe != d.gpu_queue_probe) +
         (g_config.gpu_queue_probe_source != d.gpu_queue_probe_source) +
+        (g_config.unified_queue_margin_end != d.unified_queue_margin_end) +
         (g_config.unified_pacer != d.unified_pacer) +
         (g_config.unified_every_frame_service != d.unified_every_frame_service) +
         (g_config.unified_queue_target_us != d.unified_queue_target_us) +
@@ -1212,6 +1219,7 @@ void Config_ResetDeveloperSettings() {
     g_config.gpu_start_probe = d.gpu_start_probe;
     g_config.gpu_queue_probe = d.gpu_queue_probe;
     g_config.gpu_queue_probe_source = d.gpu_queue_probe_source;
+    g_config.unified_queue_margin_end = d.unified_queue_margin_end;
     g_config.unified_pacer = d.unified_pacer;
     g_config.unified_every_frame_service = d.unified_every_frame_service;
     g_config.unified_queue_target_us = d.unified_queue_target_us;
@@ -1314,6 +1322,10 @@ void ApplyConfig() {
         LOG_WARN("Diagnostic GPU queue probe source %d: the probe adopts the presenting queue, not the queue "
                  "that carries the frame's rendering (effective with the probe on; 64-bit DX12)",
                  g_config.gpu_queue_probe_source);
+    if (g_config.unified_queue_margin_end != kPacingUnifiedQueueMarginEndDefault)
+        LOG_WARN("Diagnostic unified queue margin end %d: the probe's margin scalar of a frame is the minimum of the "
+                 "per-submission bracket midpoints, not of the lower ends (effective with the probe on; 64-bit DX12)",
+                 g_config.unified_queue_margin_end);
     if (g_config.unified_pacer != kPacingUnifiedPacerDefault) {
         if (g_config.unified_pacer)
             LOG_WARN("Diagnostic unified pacer: one start law (cap, VRR ceiling, game limit, GPU service time) replaces the "

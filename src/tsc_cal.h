@@ -3,7 +3,7 @@
 #include <cstdint>
 
 // TSC ↔ QPC calibration via 32 paired RDTSC/QPC samples.
-// Spec §6.3
+//
 
 struct TSCCal {
     double tsc_per_qpc = 0.0;

@@ -1,13 +1,16 @@
 // Directly tests the production accounting core of the developer probe gpu_queue_probe
 // (src/gpu_queue_probe_core.cpp): the empty / first-gap split, immediate and non-immediate
-// start stamps, margins, wait block, the monotone done chain across frames, parked and
-// out-of-order stamps, boundary collapse and tagging, incomplete frames, lateness bounds, the
-// bounded wait-free ring (overflow, loss marking, a small multi-producer push) and Reset.
+// Wait releases, margins, wait block, the monotone done chain across frames, parked and
+// out-of-order markers, boundary collapse and tagging, incomplete frames, the completion
+// INTERVALS (observations, awaited wakes, the issue floor, both ends of the record fields, the free-margin
+// scalar for both margin ends), untrusted markers breaking the done chain, parking with trust and the
+// full-table watermark, the bounded wait-free ring (overflow, loss marking, a small multi-producer push) and Reset.
 // The D3D12 side (hook, fences, completion thread) is not covered here and needs live runs.
 // The clock is scripted at 1 MHz so one tick is one microsecond.
 
 #include "gpu_queue_probe_core.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -47,12 +50,27 @@ namespace
         uint64_t wait_value = 0;
     };
 
+    // What the next Submit / Wait event carries besides its enqueue time: the item's own observation and the marker's
+    // identity (cleared after one use).
+    struct Opts {
+        bool obs = false;
+        uint64_t game_completed = 0, own_completed = 0;
+        int64_t before = 0, after = 0;
+        bool game_marker = false; // the marker is the game's fence value `game_value`
+        uint64_t game_value = 0;
+        int64_t issue = 0;        // marker_issue_qpc
+        bool untrusted = false;   // marker_trusted = 0
+        uint64_t epoch = 0;       // obs_foreign_epoch
+        uint64_t claim_epoch = 0; // the game marker's claim epoch
+    };
+
     struct H {
         std::unique_ptr<GpuQueueProbeCore> c = std::make_unique<GpuQueueProbeCore>();
         uint64_t next_value = 1;
         uint64_t index = 0;
         uint64_t wait_seq = 100;
         bool overlap_next = false; // the next Submit carries the overlap flag
+        Opts opts;                 // applied to the next Submit / Wait event
 
         H() { c->Reset(kFreq); }
 
@@ -78,6 +96,7 @@ namespace
                 s.done = next_value++;
                 e.done_value = s.done;
             }
+            ApplyOpts(&e);
             CHECK(c->Push(e));
             return s;
         }
@@ -100,8 +119,33 @@ namespace
                 w.release = next_value++;
                 e.release_value = w.release;
             }
+            ApplyOpts(&e);
             CHECK(c->Push(e));
             return w;
+        }
+
+        void ApplyOpts(GpuQueueEvent* e)
+        {
+            const Opts o = opts;
+            opts = Opts{};
+            if (o.obs) {
+                e->obs_valid = 1;
+                e->obs_game_completed = o.game_completed;
+                e->obs_own_completed = o.own_completed;
+                e->obs_before_qpc = o.before;
+                e->obs_after_qpc = o.after;
+                e->obs_foreign_epoch = o.epoch;
+            }
+            if (e->kind == GpuQueueEvent::Kind::Submit) {
+                if (o.game_marker) {
+                    e->marker_game = 1;
+                    e->marker_value = o.game_value;
+                    e->claim_epoch = o.claim_epoch;
+                    e->borrowed = 1;
+                }
+                e->marker_issue_qpc = o.issue;
+                e->marker_trusted = o.untrusted ? 0 : 1;
+            }
         }
 
         // A boundary on a dependency queue: the signalled fence value, no identity yet.
@@ -172,7 +216,17 @@ namespace
             e.overlap = 1;
             CHECK(c->Push(e));
         }
-        void Stamp(uint64_t value, int64_t qpc, double late = 0.0) { c->OnStamp(value, qpc, late); }
+        // The marker `value` found complete by an awaited wake at qpc with a latency bound `late` (the interval
+        // [qpc - late, qpc]; 0 = exact), or (late < 0) found already complete when looked at (the interval [floor, qpc]).
+        void Stamp(uint64_t value, int64_t qpc, double late = 0.0)
+        {
+            if (late >= 0.0) c->OnAwaited(value, qpc - static_cast<int64_t>(late), qpc, 0);
+            else c->OnAwaited(value, 0, qpc, 0);
+        }
+        void Observe(uint64_t game_completed, uint64_t own_completed, int64_t before, int64_t after, uint64_t epoch = 0)
+        {
+            c->OnObservation(game_completed, own_completed, before, after, epoch);
+        }
         void Drain() { c->Drain(); }
 
         void PushRaw(int64_t enq, uint64_t done_value)
@@ -332,8 +386,8 @@ namespace
         CHECK(Near(r.cycle_us, 2150.0));
     }
 
-    // A Wait already released when its fence was signalled: the release is unknown, bounded
-    // above by the Signal's issue time, which is used; the doubt shows in stamp_late.
+    // A Wait already released when its fence was signalled: the release is unknown, between the Wait's enqueue and the
+    // marker's upper bound; empty and wait_idle are the lower ends, empty_hi the upper end, the doubt shows in stamp_late.
     void TestImmediateWaitRelease()
     {
         const Rec r = Frame2(150, [](H& h) {
@@ -345,10 +399,12 @@ namespace
             h.Stamp(b.done, 1400);
         });
         CHECK(r.valid == kAll);
-        CHECK(Near(r.empty_us, 100.0 + 95.0)); // 1100-1200 and 1205-1300
-        CHECK(Near(r.wait_idle_us, 5.0));
+        // The release lies in [1200, 1210]: empty = 1100-1200 plus the stretch after the release, 90 to 100.
+        CHECK(Near(r.empty_us, 100.0 + 90.0));
+        CHECK(Near(r.empty_hi_us, 100.0 + 100.0));
+        CHECK(Near(r.wait_idle_us, 0.0));
         CHECK(Near(r.wait_block_us, 0.0));
-        CHECK(Near(r.stamp_late_us, 5.0)); // the Wait could have lasted up to issue - enq
+        CHECK(Near(r.stamp_late_us, 10.0)); // the width of the release interval
     }
 
     // guard = max(calibrated p95, 20 us), from p95 and not from the window's maximum.
@@ -356,7 +412,8 @@ namespace
     {
         auto run = [](double p95, double max_us, int64_t stamp_delta) {
             H h;
-            h.c->SetWakeLatencyUs(p95, max_us);
+            h.c->SetWakeLatencyUs(p95);
+            (void)max_us;
             h.Start(150);
             const Sub a = h.Submit(1000);
             const Wd w = h.Wait(1200, 1205);
@@ -370,15 +427,17 @@ namespace
             CHECK(r != nullptr);
             return r != nullptr ? *r : Rec{};
         };
-        const Rec at_guard = run(0.0, 0.0, 20); // guard 20: 20 <= 20, immediate
-        CHECK(Near(at_guard.wait_idle_us, 5.0));
-        CHECK(Near(at_guard.empty_us, 195.0));
+        const Rec at_guard = run(0.0, 0.0, 20); // guard 20: 20 <= 20, immediate: release in [1200, 1225]
+        CHECK(Near(at_guard.wait_idle_us, 0.0));
+        CHECK(Near(at_guard.empty_us, 100.0 + 75.0));
+        CHECK(Near(at_guard.empty_hi_us, 200.0));
         const Rec over = run(5.0, 100.0, 21);   // guard 20, not 100: 21 > 20, released at 1226
         CHECK(Near(over.wait_idle_us, 26.0));
         CHECK(Near(over.empty_us, 100.0 + 74.0));
-        const Rec wide = run(60.0, 60.0, 50);   // guard 60: 50 <= 60, immediate
-        CHECK(Near(wide.wait_idle_us, 5.0));
-        CHECK(Near(wide.empty_us, 195.0));
+        const Rec wide = run(60.0, 60.0, 50);   // guard 60: 50 <= 60, immediate: release in [1200, 1255]
+        CHECK(Near(wide.wait_idle_us, 0.0));
+        CHECK(Near(wide.empty_us, 100.0 + 45.0));
+        CHECK(Near(wide.empty_hi_us, 200.0));
     }
 
     // Several Waits in a row: the gap before each, idle while each is pending, the stretch after
@@ -1117,8 +1176,10 @@ namespace
         }
     }
 
-    // Completions made monotone, the clamp counted, and the clamped value used downstream.
-    void TestOutOfOrderStampsClamped()
+    // Completions are in queue order: the upper bound of a later submission bounds the earlier ones, whatever the
+    // order the markers were delivered in. A's awaited lower bound (450) contradicts the hard upper bound 400 it
+    // inherits from B: the empirical bound yields to the hard one (counted), nothing is made untrusted.
+    void TestOutOfOrderMarkersBoundedByLaterOnes()
     {
         H h;
         h.Start(100);
@@ -1137,8 +1198,10 @@ namespace
         CHECK(r->valid == kAll);
         CHECK(r->last_done_qpc == 500);
         CHECK(Near(r->first_gap_us, 200.0));
-        CHECK(Near(r->empty_us, 20.0)); // done(B) = max(400, 450) = 450; 470 - 450
-        CHECK(h.c->Statistics().stamps_clamped == 1);
+        // A is bounded to [300, 400] (hi 400 from B): C arrives at 470, after both: empty = 470 - 400 (the lower end), at most 470 - 300.
+        CHECK(Near(r->empty_us, 70.0));
+        CHECK(h.c->Statistics().awaited_lo_rejected >= 1);
+        CHECK(h.c->Statistics().intervals_inconsistent == 0);
     }
 
     // Stamps that arrive before their event are parked and applied at the next Drain.
@@ -1163,7 +1226,7 @@ namespace
         CHECK(r->last_done_qpc == 1400);
         CHECK(Near(r->empty_us, 200.0));
         CHECK(h.c->Statistics().stamps_orphaned == 0);
-        CHECK(h.c->Statistics().parked_overflow == 0);
+        CHECK(h.c->Statistics().parked_watermark == 0);
     }
 
     // Parking is bounded; a stamp of an already reported value is an orphan.
@@ -1171,7 +1234,7 @@ namespace
     {
         H h;
         for (uint64_t i = 0; i < GpuQueueProbeCore::kParkedCapacity + 1; ++i) h.Stamp(1000 + i, 5);
-        CHECK(h.c->Statistics().parked_overflow == 1);
+        CHECK(h.c->Statistics().parked_watermark == 1); // the oldest entry became the watermark
         CHECK(h.c->Statistics().stamps_orphaned == 0);
 
         H g;
@@ -1376,8 +1439,9 @@ namespace
         CHECK(s.frames == 3);
     }
 
-    // A frame whose stamps are missing waits, is emitted incomplete once four later frames
-    // closed, and the chain recovers behind it; a stamp for the given-up value is an orphan.
+    // A frame whose markers are missing waits, is emitted incomplete once four later frames closed, and the chain
+    // recovers behind it once later markers arrive (their upper bounds also bound the earlier submissions, but the
+    // given-up one is gone: its successor has no known predecessor); a stamp for the given-up value is an orphan.
     void TestIncompleteAfterFourLaterFrames()
     {
         H h;
@@ -1386,9 +1450,9 @@ namespace
         h.Boundary(1, 1);
         Rec r;
         int64_t enq = 200;
+        std::vector<Sub> later;
         for (uint64_t k = 2; k <= 5; ++k) {
-            const Sub s = h.Submit(enq);
-            h.Stamp(s.done, enq + 50);
+            later.push_back(h.Submit(enq));
             h.Boundary(1, k);
             enq += 100;
             h.Drain();
@@ -1399,6 +1463,12 @@ namespace
         CHECK((r.valid & Rec::kSubmits) != 0);
         CHECK((r.valid & Rec::kLastDone) == 0);
         CHECK((r.valid & Rec::kFirstStart) == 0);
+        enq = 200;
+        for (const Sub& s : later) {
+            h.Stamp(s.done, enq + 50);
+            enq += 100;
+        }
+        h.Drain();
         CHECK(h.c->PopFrame(&r)); // frame 2: its done(0) is unknown behind the given-up submission
         CHECK(r.present_sequence == 2);
         CHECK((r.valid & Rec::kLastDone) != 0);
@@ -1411,23 +1481,25 @@ namespace
         CHECK(h.c->Statistics().stamps_orphaned == 1);
     }
 
-    // Within the four-frame allowance a late stamp completes the frame, and nothing is
-    // emitted before it.
+    // Within the four-frame allowance a late marker completes the frame, and nothing is emitted before it: a later
+    // submission's marker bounds the earlier ones (queue order), and the marker of the missing one itself works too.
     void TestLateStampBeforeAllowanceCompletes()
     {
-        H h;
-        h.Start(150);
-        const Sub a = h.Submit(1000);
-        h.Boundary(1, 2);
-        const Sub b = h.Submit(1500);
-        h.Stamp(b.done, 1600);
-        h.Drain();
-        Rec r;
-        while (h.c->PopFrame(&r)) CHECK(r.present_sequence == 1);
-        h.Stamp(a.done, 1100);
-        h.Drain();
-        CHECK(h.c->PopFrame(&r));
-        CHECK(r.present_sequence == 2 && r.valid == kAll);
+        for (int route = 0; route < 2; ++route) {
+            H h;
+            h.Start(150);
+            const Sub a = h.Submit(1000);
+            h.Boundary(1, 2);
+            const Sub b = h.Submit(1500);
+            h.Drain();
+            Rec r;
+            while (h.c->PopFrame(&r)) CHECK(r.present_sequence == 1);
+            if (route == 0) h.Stamp(a.done, 1100);
+            else h.Stamp(b.done, 1600); // a is bounded by it: [1000, 1600]
+            h.Drain();
+            CHECK(h.c->PopFrame(&r));
+            CHECK(r.present_sequence == 2 && r.valid == kAll);
+        }
     }
 
     // Flush emits a frame that is still missing stamps, incomplete, without waiting.
@@ -1451,61 +1523,34 @@ namespace
         CHECK(h.c->Statistics().frames_incomplete >= 1);
     }
 
-    // Event-awaited stamps are bounded by the calibrated wake latency; a late pickup is bounded
-    // by stamp - L with L chained through the previous value.
-    void TestLateBoundAndBaseline()
+    // The width of a marker's interval is the record's stamp_late: an awaited wake is as wide as its latency bound, a
+    // marker found complete when looked at runs from its floor (the enqueue) to the look, and the chain raises lower bounds.
+    void TestIntervalWidthIsStampLate()
     {
-        // Baseline: the calibrated latency is the floor, a larger known bound wins.
-        {
+        auto one = [](double late, int64_t stamp) {
             H h;
-            h.c->SetWakeLatencyUs(30.0, 30.0);
             h.Start(150);
             const Sub a = h.Submit(1000);
-            h.Stamp(a.done, 1100, 5.0);
+            h.Stamp(a.done, stamp, late);
             h.Boundary(1, 2);
             const std::vector<Rec> all = h.PopAll();
             const Rec* r = Find(all, 2);
             CHECK(r != nullptr);
-            if (r != nullptr) {
-                CHECK((r->valid & Rec::kStampLate) != 0);
-                CHECK(Near(r->stamp_late_us, 30.0));
-            }
-        }
+            return r != nullptr ? *r : Rec{};
+        };
+        const Rec exact = one(0.0, 1100);
+        CHECK((exact.valid & Rec::kStampLate) != 0 && Near(exact.stamp_late_us, 0.0));
+        CHECK(Near(one(5.0, 1100).stamp_late_us, 5.0));
+        CHECK(Near(one(50.0, 1100).stamp_late_us, 50.0));
+        // Found complete at 5000: the floor is the enqueue, 1000.
+        CHECK(Near(one(-1.0, 5000).stamp_late_us, 4000.0));
+        // Chain: A awaited at 3000 (lower bound 2970); B enq 1500 found complete at 5000: lo = max(1500, 2970).
         {
             H h;
-            h.c->SetWakeLatencyUs(30.0, 30.0);
-            h.Start(150);
-            const Sub a = h.Submit(1000);
-            h.Stamp(a.done, 1100, 50.0);
-            h.Boundary(1, 2);
-            const std::vector<Rec> all = h.PopAll();
-            const Rec* r = Find(all, 2);
-            CHECK(r != nullptr);
-            if (r != nullptr) CHECK(Near(r->stamp_late_us, 50.0));
-        }
-        // Late pickup: found complete at 5000, the previous value (the warm done, awaited at 150)
-        // gives L = max(enq 1000, 150) = 1000.
-        {
-            H h;
-            h.c->SetWakeLatencyUs(30.0, 30.0);
-            h.Start(150);
-            const Sub a = h.Submit(1000);
-            h.Stamp(a.done, 5000, -1.0);
-            h.Boundary(1, 2);
-            const std::vector<Rec> all = h.PopAll();
-            const Rec* r = Find(all, 2);
-            CHECK(r != nullptr);
-            if (r != nullptr) CHECK(Near(r->stamp_late_us, 4000.0));
-        }
-        // Chain: A awaited at 3000 (completion lower bound 3000 - 30 = 2970); B enq 1500 found
-        // complete at 5000: L = max(1500, 2970), so the bound is 2030.
-        {
-            H h;
-            h.c->SetWakeLatencyUs(30.0, 30.0);
             h.Start(150);
             const Sub a = h.Submit(1000);
             const Sub b = h.Submit(1500);
-            h.Stamp(a.done, 3000, 0.0);
+            h.Stamp(a.done, 3000, 30.0);
             h.Stamp(b.done, 5000, -1.0);
             h.Boundary(1, 2);
             const std::vector<Rec> all = h.PopAll();
@@ -1515,27 +1560,25 @@ namespace
         }
     }
 
-    // The late-pickup bound chains completion lower bounds, never observation times.
-    void TestLatePickupClassification()
+    // The widths chain through the frames: a frame's stamp_late covers what reached its computed fields only.
+    void TestLatePickupIntervalsAcrossFrames()
     {
-        // p95 = 30 us, largest calibration sample = 100 us.
         H h;
-        h.c->SetWakeLatencyUs(30.0, 100.0);
-        h.Start(150); // warm value 1 awaited at 150: L = 50
+        h.Start(150);
         const Sub a = h.Submit(1000);
         const Sub b = h.Submit(1500);
-        h.Stamp(a.done, 3000, 0.0);   // awaited: L(a) = 3000 - 100 = 2900, not 3000
-        h.Stamp(b.done, 5000, -1.0);  // pickup: L = max(1500, 2900): bound 2100, not 2000
+        h.Stamp(a.done, 3000, 100.0); // [2900, 3000]
+        h.Stamp(b.done, 5000, -1.0);  // [max(1500, 2900), 5000]: width 2100
         h.Boundary(1, 2);
         const Sub c = h.Submit(1600);
         const Sub d = h.Submit(1700);
-        h.Stamp(c.done, 5200, 0.0);   // awaited: L(c) = 5100, never above its own stamp - max
-        h.Stamp(d.done, 6000, -1.0);  // pickup: L = max(1700, 5100): bound 900, not 800
+        h.Stamp(c.done, 5200, 100.0); // [5100, 5200]
+        h.Stamp(d.done, 6000, -1.0);  // [5100, 6000]: width 900
         h.Boundary(1, 3);
         const Sub e = h.Submit(1800);
         const Sub f = h.Submit(1900);
-        h.Stamp(e.done, 7000, 500.0); // awaited with a larger known bound: L = 7000 - 500
-        h.Stamp(f.done, 9000, -1.0);  // pickup: L = max(1900, 6500): bound 2500
+        h.Stamp(e.done, 7000, 500.0); // [6500, 7000]
+        h.Stamp(f.done, 9000, -1.0);  // [6500, 9000]: width 2500
         h.Boundary(1, 4);
         const std::vector<Rec> all = h.PopAll();
         const Rec* f2 = Find(all, 2);
@@ -1544,8 +1587,626 @@ namespace
         CHECK(f2 != nullptr && f3 != nullptr && f4 != nullptr);
         if (f2 == nullptr || f3 == nullptr || f4 == nullptr) return;
         CHECK(Near(f2->stamp_late_us, 2100.0));
-        CHECK(Near(f3->stamp_late_us, 900.0));
-        CHECK(Near(f4->stamp_late_us, 2500.0));
+        CHECK(Near(f3->stamp_late_us, 2100.0 + 900.0)); // its cycle runs from B's upper end (2100 wide) to D's (900 wide)
+        CHECK(Near(f4->stamp_late_us, 2500.0 + 900.0)); // F's 2500 and D's 900
+    }
+
+    // Observation intervals: "incomplete" raises the lower bound to the QPC before the reads, "covered" sets the upper
+    // bound to the QPC after them, the issue time is the floor, an awaited wake keeps the tighter upper bound, and
+    // nothing ever loosens a bound. A Wait in front of the first submission keeps the markers unaccounted (inspectable).
+    void TestObservationIntervals()
+    {
+        using MV = GpuQueueProbeCore::MarkerView;
+        H h;
+        h.Start(150);                  // k1 awaited at 150
+        const Wd w = h.Wait(900, 905); // k2: the Wait's release marker
+        h.opts.obs = true;
+        h.opts.own_completed = 1; // k2 not complete at 1000
+        h.opts.before = 1000;
+        h.opts.after = 1001;
+        h.opts.issue = 1010;
+        const Sub a = h.Submit(1000); // k3
+        h.opts.obs = true;
+        h.opts.own_completed = 2; // k2 complete by 1301, k3 not complete at 1300
+        h.opts.before = 1300;
+        h.opts.after = 1301;
+        h.opts.issue = 1400;
+        const Sub b = h.Submit(1300); // k4
+        h.Drain();
+        MV v;
+        CHECK(h.c->MarkerState(w.release, &v) && v.has_hi && v.hi == 1301 && v.lo == 1000);
+        // The item's own observation does not apply to its marker (issued later); the issue time is the floor.
+        CHECK(h.c->MarkerState(a.done, &v) && !v.has_hi && v.lo == 1300); // floor 1010, raised by b's observation
+        CHECK(h.c->MarkerState(b.done, &v) && !v.has_hi && v.lo == 1400); // issue 1400 above its enqueue 1300
+        // The worker's observation: a covered by 1502, b incomplete at 1500.
+        h.Observe(0, 3, 1500, 1502);
+        CHECK(h.c->MarkerState(a.done, &v) && v.has_hi && v.hi == 1502 && v.lo == 1300 && !v.awaited);
+        CHECK(h.c->MarkerState(b.done, &v) && !v.has_hi && v.lo == 1500);
+        // b covered by 1803 (and so is everything before it).
+        h.Observe(0, 4, 1800, 1803);
+        CHECK(h.c->MarkerState(b.done, &v) && v.has_hi && v.hi == 1803 && v.lo == 1500);
+        // A later observation does not loosen the upper bound; an older one does not lower the lower bound.
+        h.Observe(0, 4, 2000, 2001);
+        h.Observe(0, 0, 1200, 1201);
+        CHECK(h.c->MarkerState(b.done, &v) && v.hi == 1803 && v.lo == 1500);
+        CHECK(h.c->MarkerState(a.done, &v) && v.hi == 1502 && v.lo == 1300);
+        // An awaited wake keeps the tighter upper bound and adds its (empirical) lower bound.
+        h.Stamp(b.done, 1790, 30.0);
+        CHECK(h.c->MarkerState(b.done, &v) && v.hi == 1790 && v.lo == 1760 && v.awaited);
+        // An awaited lower bound that contradicts a hard upper bound is not used (the hard bounds stand).
+        h.Stamp(a.done, 1600, 1.0);
+        CHECK(h.c->MarkerState(a.done, &v) && v.hi == 1502 && v.lo == 1300 && !v.awaited);
+        // Everything is covered: the frame can close and be accounted from the intervals.
+        h.Boundary(1, 2);
+        const std::vector<Rec> all = h.PopAll();
+        const Rec* r = Find(all, 2);
+        CHECK(r != nullptr && r->valid == kAll);
+    }
+
+    // The walk on intervals: empty is the lower end (from the upper end of the predecessor), empty_hi the upper end;
+    // a predecessor found incomplete when the next item was enqueued gives a gap of exactly 0.
+    void TestIntervalWalkBothEnds()
+    {
+        // Predecessor awaited in [1090, 1100]: the stretch before the next arrival at 1300 is 200 to 210.
+        const Rec r = Frame2(150, [](H& h) {
+            const Sub a = h.Submit(1000);
+            const Sub b = h.Submit(1300);
+            h.Stamp(a.done, 1100, 10.0);
+            h.Stamp(b.done, 1400, 0.0);
+        });
+        CHECK(r.valid == kAll);
+        CHECK(Near(r.empty_us, 200.0) && Near(r.empty_hi_us, 210.0));
+        CHECK(Near(r.boundary_idle_us, 850.0) && Near(r.boundary_idle_hi_us, 850.0)); // exact: the warm done
+        CHECK(Near(r.stamp_late_us, 10.0));
+        CHECK(Near(r.min_margin_us, 0.0));
+
+        // The predecessor was found incomplete by the next item's own observation (1300): gap exactly 0, whatever
+        // the time it was found complete afterwards; the margin is the bracket [0, 301].
+        H h;
+        h.Start(150);
+        const Sub a = h.Submit(1000);
+        h.opts.obs = true;
+        h.opts.own_completed = 1; // only the warm marker
+        h.opts.before = 1300;
+        h.opts.after = 1301;
+        const Sub b = h.Submit(1300);
+        (void)a;
+        (void)b;
+        h.Observe(0, 3, 1600, 1601); // both complete by 1601
+        h.Boundary(1, 2);
+        const std::vector<Rec> all = h.PopAll();
+        const Rec* f2 = Find(all, 2);
+        CHECK(f2 != nullptr);
+        if (f2 == nullptr) return;
+        CHECK(f2->valid == kAll);
+        CHECK(Near(f2->empty_us, 0.0) && Near(f2->empty_hi_us, 0.0));
+        CHECK(Near(f2->stamp_late_us, 301.0)); // the margin bracket of b: start in [1300, 1601]
+        CHECK(f2->last_done_qpc == 1601);
+    }
+
+    // The free-margin scalar for both settings of the margin end. Three fed submissions whose brackets are
+    // [0, 400], [150, 170], [350, 350]: the smallest lower end (0) is not the smallest midpoint (160).
+    // lo = 0, hi = 170; the scalar is the midpoint 160 (err 160) or the lower end 0 (err 170); either is within err
+    // of the true minimum for every placement of the truth inside the brackets.
+    void TestFreeMarginScalarBothEnds()
+    {
+        auto run = [](int end) {
+            H h;
+            h.c->SetMarginEnd(end);
+            h.Boundary(1, 0);
+            const Sub w = h.Submit(100);
+            h.Stamp(w.done, 1400, 400.0); // done(0) in [1000, 1400]
+            h.Boundary(1, 1);
+            const Sub s1 = h.Submit(1000);
+            const Sub s2 = h.Submit(1300);
+            const Sub s3 = h.Submit(1350);
+            h.Stamp(s1.done, 1470, 20.0); // [1450, 1470]
+            h.Stamp(s2.done, 1700, 0.0);
+            h.Stamp(s3.done, 1800, 0.0);
+            h.Boundary(1, 2);
+            const std::vector<Rec> all = h.PopAll();
+            const Rec* r = Find(all, 2);
+            CHECK(r != nullptr);
+            return r != nullptr ? *r : Rec{};
+        };
+        const Rec mid = run(GpuQueueProbeCore::kMarginEndMidpoint);
+        const Rec low = run(GpuQueueProbeCore::kMarginEndLower);
+        CHECK((mid.valid & Rec::kMinMarginFree) != 0 && (low.valid & Rec::kMinMarginFree) != 0);
+        for (const Rec* r : {&mid, &low}) {
+            CHECK(Near(r->min_margin_free_lo_us, 0.0));
+            CHECK(Near(r->min_margin_free_hi_us, 170.0));
+            CHECK(r->stamp_late_us + 1e-9 >= r->min_margin_err_us); // the error counts in stamp_late
+            // Every placement of the truth inside the brackets: the scalar is within err of the true minimum.
+            for (double t1 = 0.0; t1 <= 400.0; t1 += 25.0)
+                for (double t2 = 150.0; t2 <= 170.0; t2 += 5.0) {
+                    const double truth = std::min(std::min(t1, t2), 350.0);
+                    CHECK(std::fabs(truth - r->min_margin_free_us) <= r->min_margin_err_us + 1e-9);
+                }
+        }
+        CHECK(Near(mid.min_margin_free_us, 160.0) && Near(mid.min_margin_err_us, 160.0));
+        CHECK(Near(low.min_margin_free_us, 0.0) && Near(low.min_margin_err_us, 170.0));
+        // The lower and the upper ends are the same whatever the key says.
+        CHECK(Near(mid.min_margin_free_lo_us, low.min_margin_free_lo_us) && Near(mid.min_margin_free_hi_us, low.min_margin_free_hi_us));
+        // The scalar of an exact frame is the margin itself, for both ends, with err 0.
+        for (int end : {0, 1}) {
+            H h;
+            h.c->SetMarginEnd(end);
+            h.Start(2000);
+            const Sub a = h.Submit(1000);
+            h.Stamp(a.done, 2300);
+            h.Boundary(1, 2);
+            const std::vector<Rec> all = h.PopAll();
+            const Rec* r = Find(all, 2);
+            CHECK(r != nullptr);
+            if (r == nullptr) continue;
+            CHECK(Near(r->min_margin_free_us, 1000.0) && Near(r->min_margin_err_us, 0.0));
+        }
+    }
+
+    // An untrusted marker invalidates its frame AND breaks the done chain: the next frame, even with correct
+    // markers of its own, has no known predecessor (no first gap, no boundary idle, no cycle) until a trusted
+    // completion re-establishes the chain; the frame after that is whole again. Whatever the marker was told
+    // (a foreign completion at 100, before it could have run), its completion is never used.
+    void TestUntrustedMarkerBreaksTheChain()
+    {
+        for (int route = 0; route < 3; ++route) {
+            H h;
+            h.Start(150);
+            if (route == 2) h.opts.untrusted = true; // untrusted at publication (marker_trusted = 0)
+            const Sub a = h.Submit(1000);
+            if (route != 0) h.Stamp(a.done, 100); // a foreign Signal completed the fence early
+            if (route == 1) h.c->OnUntrusted(a.done); // the worker found it tainted before its Submit was drained
+            if (route == 0) {
+                h.Drain(); // its Submit is in, not yet accounted: the taint finds the entry
+                h.c->OnUntrusted(a.done);
+            }
+            h.Boundary(1, 2);
+            const Sub c = h.Submit(1800);
+            h.Stamp(c.done, 2100);
+            h.Boundary(1, 3);
+            const Sub d = h.Submit(2500);
+            h.Stamp(d.done, 2600);
+            h.Boundary(1, 4);
+            const std::vector<Rec> all = h.PopAll();
+            const Rec* f2 = Find(all, 2);
+            const Rec* f3 = Find(all, 3);
+            const Rec* f4 = Find(all, 4);
+            CHECK(f2 != nullptr && f3 != nullptr && f4 != nullptr);
+            if (f2 == nullptr || f3 == nullptr || f4 == nullptr) return;
+            CHECK(f2->valid == 0);
+            CHECK((f3->valid & Rec::kLastDone) != 0 && f3->last_done_qpc == 2100); // its own completion is trusted
+            CHECK((f3->valid & (Rec::kFirstGap | Rec::kBoundaryIdle | Rec::kCycle | Rec::kEmpty | Rec::kMinMargin |
+                                Rec::kMinMarginFree | Rec::kFirstStart)) == 0);
+            CHECK(f4->valid == kAll);
+            CHECK(Near(f4->first_gap_us, 400.0)); // 2500 - 2100
+            CHECK(h.c->Statistics().markers_untrusted >= 1);
+        }
+    }
+
+    // Intervals that contradict each other (lower bound above upper bound after the order constraints) make the
+    // marker untrusted: they are counted and never clamped into a plausible value.
+    void TestInconsistentIntervalIsUntrusted()
+    {
+        H h;
+        h.Start(150);
+        const Sub a = h.Submit(1000);
+        const Sub b = h.Submit(1300);
+        (void)a;
+        (void)b;
+        h.Drain();
+        h.Observe(0, 1, 2000, 2001); // a, b incomplete at 2000
+        h.Observe(0, 3, 1400, 1500); // ... and complete by 1500: impossible
+        h.Boundary(1, 2);
+        const std::vector<Rec> all = h.PopAll();
+        const Rec* f2 = Find(all, 2);
+        CHECK(f2 != nullptr);
+        if (f2 == nullptr) return;
+        CHECK(f2->valid == 0);
+        CHECK(h.c->Statistics().intervals_inconsistent >= 1 && h.c->Statistics().markers_untrusted >= 1);
+    }
+
+    // Bounds, quality and trust of a marker whose Submit has not arrived are parked together in one entry; the
+    // submission takes all three. A full table drops the entry with the smallest k as a WATERMARK: every k at or
+    // below it that has no entry is untrusted from then on (counted), the others keep their own bounds and trust.
+    void TestParkedTrustAndWatermark()
+    {
+        using MV = GpuQueueProbeCore::MarkerView;
+        {
+            H h;
+            h.Start(150);
+            h.Drain();
+            const uint64_t k = h.next_value;
+            h.Stamp(k, 1100, 5.0);
+            MV v;
+            CHECK(h.c->MarkerState(k, &v) && v.parked && v.has_hi && v.hi == 1100 && v.awaited && !v.untrusted);
+            h.c->OnUntrusted(k); // the same entry: bounds, quality and trust together
+            CHECK(h.c->MarkerState(k, &v) && v.parked && v.has_hi && v.hi == 1100 && v.awaited && v.untrusted);
+            const Sub a = h.Submit(1000);
+            CHECK(a.done == k);
+            h.Boundary(1, 2);
+            const std::vector<Rec> all = h.PopAll();
+            const Rec* f2 = Find(all, 2);
+            CHECK(f2 != nullptr && f2->valid == 0); // the parked taint reached the frame
+            CHECK(!h.c->MarkerState(k, &v));        // consumed
+        }
+        {
+            H h;
+            h.Start(150);
+            h.Drain();
+            const uint64_t base = 1000;
+            for (uint64_t i = 0; i < GpuQueueProbeCore::kParkedCapacity; ++i) h.Stamp(base + i, 2000 + 500 * static_cast<int64_t>(i));
+            CHECK(h.c->Statistics().parked_watermark == 0);
+            h.Stamp(base + GpuQueueProbeCore::kParkedCapacity, 90000); // one more: the oldest entry goes, as the watermark
+            CHECK(h.c->Statistics().parked_watermark == 1);
+            MV v;
+            CHECK(!h.c->MarkerState(base, &v));     // its entry is gone ...
+            CHECK(h.c->MarkerState(base + 1, &v) && v.parked && v.has_hi && !v.untrusted); // ... the others are kept
+            // k = base arrives with no entry: untrusted (never silently valid); k = base + 1 keeps its own bounds.
+            h.PushRaw(1000, base);
+            h.Boundary(1, 2);
+            h.PushRaw(1500, base + 1);
+            h.Boundary(1, 3);
+            h.PushRaw(2600, base + 2);
+            h.Boundary(1, 4);
+            const std::vector<Rec> all = h.PopAll();
+            const Rec* f2 = Find(all, 2);
+            const Rec* f3 = Find(all, 3);
+            const Rec* f4 = Find(all, 4);
+            CHECK(f2 != nullptr && f3 != nullptr && f4 != nullptr);
+            if (f2 == nullptr || f3 == nullptr || f4 == nullptr) return;
+            CHECK(f2->valid == 0);                                  // the watermark marker
+            CHECK((f3->valid & Rec::kLastDone) != 0 && (f3->valid & Rec::kCycle) == 0); // trusted, but no predecessor
+            CHECK(f4->valid == kAll && Near(f4->first_gap_us, 100.0)); // 2600 - 2500
+            CHECK(h.c->Statistics().markers_untrusted >= 1);
+        }
+    }
+
+    // The frame's last marker (the boundary marker): the oldest closed frame's last submission whose marker no observation has
+    // covered yet, on whichever fence it uses; none while the frame is open, when the last submission has no marker, or
+    // when the marker is untrusted.
+    void TestOldestOpenBoundaryMarker()
+    {
+        using BM = GpuQueueProbeCore::BoundaryMarker;
+        H h;
+        h.Start(150);
+        const Sub a = h.Submit(1000);
+        h.opts.game_marker = true;
+        h.opts.game_value = 77;
+        const Sub b = h.Submit(1200); // the game's fence value 77
+        h.Drain();
+        BM m;
+        CHECK(!h.c->OldestOpenBoundaryMarker(&m)); // the frame is still open
+        h.Boundary(1, 2);
+        h.Drain();
+        CHECK(h.c->OldestOpenBoundaryMarker(&m) && m.k == b.done && m.game == 1 && m.value == 77); // the LAST submission's marker
+        const Sub c = h.Submit(1500);
+        h.Boundary(1, 3);
+        h.Drain();
+        CHECK(h.c->OldestOpenBoundaryMarker(&m) && m.k == b.done); // the oldest first
+        h.Observe(77, 0, 1600, 1601); // covers b (and a); c (own) is not complete
+        CHECK(h.c->OldestOpenBoundaryMarker(&m) && m.k == c.done && m.game == 0 && m.value == c.done);
+        h.Observe(77, c.done, 1700, 1701);
+        CHECK(!h.c->OldestOpenBoundaryMarker(&m)); // covered by observation: an observation interval, nothing to wait for
+        // A last submission without a marker, and a marker found untrusted: nothing to wait for.
+        const Sub d = h.Submit(2000, false);
+        (void)a;
+        h.Boundary(1, 4);
+        h.Drain();
+        CHECK(!h.c->OldestOpenBoundaryMarker(&m));
+        const Sub e = h.Submit(2200);
+        h.Boundary(1, 5);
+        h.Drain();
+        CHECK(h.c->OldestOpenBoundaryMarker(&m) && m.k == e.done);
+        h.c->OnUntrusted(e.done);
+        CHECK(!h.c->OldestOpenBoundaryMarker(&m));
+        (void)d;
+    }
+
+    // An armed marker is not accounted until its wake was processed: a hook's observation (carried by the next Execute) that
+    // found it complete must not close its interval before the awaited one arrives (the orphaned awaited stamps).
+    void TestArmedMarkerKeepsItsAwaitedInterval()
+    {
+        for (int armed = 0; armed < 2; ++armed) {
+            H h;
+            h.Start(150);
+            const Sub a = h.Submit(1000); // k2
+            h.opts.obs = true;
+            h.opts.own_completed = a.done; // the next Execute's observation finds a complete at 1201
+            h.opts.before = 1200;
+            h.opts.after = 1201;
+            const Sub b = h.Submit(1200);
+            if (armed != 0) h.c->SetArmed(a.done, 0);
+            h.Drain();
+            h.Stamp(a.done, 1100, 30.0); // the worker's wake: awaited [1070, 1100]
+            h.c->SetArmed(0, 0);
+            h.Stamp(b.done, 1500);
+            h.Boundary(1, 2);
+            const std::vector<Rec> all = h.PopAll();
+            const Rec* r = Find(all, 2);
+            CHECK(r != nullptr && r->valid == kAll);
+            if (r == nullptr) continue;
+            if (armed != 0) {
+                CHECK(h.c->Statistics().stamps_orphaned == 0);
+                CHECK(Near(r->empty_us, 100.0) && Near(r->empty_hi_us, 130.0)); // 1200 - 1100 .. 1200 - 1070
+                CHECK(Near(r->stamp_late_us, 30.0));
+            } else {
+                // Without the armed marker the hook's observation had closed it: the awaited stamp arrives too late (counted).
+                CHECK(h.c->Statistics().stamps_orphaned == 1);
+                CHECK(Near(r->empty_us, 0.0) && Near(r->empty_hi_us, 200.0));
+            }
+        }
+    }
+
+    // The cycle is the interval between the frames' two last completions: its width is the two widths together (in
+    // stamp_late_us), the seam carries both ends, and the frame's last marker is counted awaited or by observation.
+    void TestCycleIntervalAndBoundaryCounters()
+    {
+        H h;
+        h.Boundary(1, 0);
+        const Sub w = h.Submit(100);
+        h.Stamp(w.done, 1100, 30.0); // [1070, 1100]
+        h.Boundary(1, 1);
+        const Sub a = h.Submit(1500);
+        h.Stamp(a.done, 3000, 30.0); // [2970, 3000]
+        h.Boundary(1, 2);
+        const Sub c = h.Submit(3500);
+        h.Boundary(1, 3);
+        h.Drain();
+        h.Observe(0, c.done, 3600, 3601); // the third frame's last marker: observation only
+        h.Boundary(1, 4);
+        h.Submit(3700);
+        h.c->Flush();
+        Rec r;
+        GpuQueueProbeCore::FrameInterval seam;
+        std::vector<Rec> recs;
+        std::vector<GpuQueueProbeCore::FrameInterval> seams;
+        while (h.c->PopFrame(&r, &seam)) {
+            recs.push_back(r);
+            seams.push_back(seam);
+        }
+        const Rec* f2 = nullptr;
+        size_t i2 = 0;
+        for (size_t i = 0; i < recs.size(); ++i)
+            if (recs[i].present_sequence == 2) { f2 = &recs[i]; i2 = i; }
+        CHECK(f2 != nullptr);
+        if (f2 == nullptr) return;
+        CHECK(f2->valid == kAll && Near(f2->cycle_us, 1900.0)); // 3000 - 1100 (upper ends)
+        CHECK(seams[i2].valid && seams[i2].boundary_awaited);
+        CHECK(Near(seams[i2].cycle_lo_us, 1870.0) && Near(seams[i2].cycle_hi_us, 1930.0)); // 2970 - 1100 .. 3000 - 1070
+        CHECK(seams[i2].cycle_lo_us <= f2->cycle_us && f2->cycle_us <= seams[i2].cycle_hi_us);
+        CHECK(Near(f2->stamp_late_us, 60.0)); // the two boundary completions together
+        for (size_t i = 0; i < recs.size(); ++i)
+            if (recs[i].present_sequence == 3) CHECK(!seams[i].boundary_awaited);
+        const GpuQueueProbeCore::Counters cs = h.c->Statistics();
+        CHECK(cs.boundary_markers_awaited == 2 && cs.boundary_markers_by_observation >= 1);
+    }
+
+    // A borrowed (game-fence) marker claimed in epoch 0 is tainted when ANY observation applied to it carries another
+    // epoch (another queue signalled the bound fence after the claim): the marker is untrusted, its frame invalid, the done chain
+    // broken, and no valid record carries its completion. Three ingress routes: the worker's observation, an observation carried
+    // by a ring event, and a marker whose Submit arrives after the observation.
+    void TestForeignEpochAtTheWorkersObservation()
+    {
+        H h;
+        h.Start(150);
+        h.opts.game_marker = true;
+        h.opts.game_value = 77;
+        h.opts.issue = 1010;
+        const Sub a = h.Submit(1000); // frame 2: one borrowed marker (game fence 77), claimed in epoch 0
+        h.Boundary(1, 2);
+        const Sub c = h.Submit(1500); // seals frame 2
+        h.Drain();
+        h.Observe(0, 0, 1200, 1201, 0);  // the first observation: clean, 77 not complete
+        h.Observe(77, 0, 1300, 1301, 1); // the second: another queue signalled the fence (epoch 1), 77 reads complete
+        h.Stamp(c.done, 1600);
+        h.Boundary(1, 3);
+        const Sub d = h.Submit(2500);
+        h.Stamp(d.done, 2600);
+        h.Boundary(1, 4);
+        const Sub e = h.Submit(3500);
+        h.Stamp(e.done, 3600);
+        h.Boundary(1, 5);
+        (void)a;
+        (void)d;
+        (void)e;
+        const std::vector<Rec> all = h.PopAll();
+        const Rec* f2 = Find(all, 2);
+        const Rec* f3 = Find(all, 3);
+        const Rec* f4 = Find(all, 4);
+        CHECK(f2 != nullptr && f3 != nullptr && f4 != nullptr);
+        if (f2 == nullptr || f3 == nullptr || f4 == nullptr) return;
+        CHECK(f2->valid == 0);                                                                   // the tainted marker's frame
+        CHECK((f3->valid & (Rec::kCycle | Rec::kFirstGap | Rec::kBoundaryIdle)) == 0);          // the chain broke there
+        CHECK(f4->valid == kAll);                                                                // a trusted completion restored it
+        for (const Rec& r : all) CHECK((r.valid & Rec::kLastDone) == 0 || r.last_done_qpc != 1301); // the foreign completion is nowhere
+        CHECK(h.c->Statistics().markers_untrusted >= 1);
+    }
+
+    void TestForeignEpochInARingCarriedObservation()
+    {
+        H h;
+        h.Start(150);
+        h.opts.game_marker = true;
+        h.opts.game_value = 77;
+        h.opts.issue = 1010;
+        const Sub a = h.Submit(1000);
+        h.Boundary(1, 2);
+        // The next Execute carries an observation taken after a foreign Signal (epoch 1), 77 reads complete.
+        h.opts.obs = true;
+        h.opts.game_completed = 77;
+        h.opts.before = 1200;
+        h.opts.after = 1201;
+        h.opts.epoch = 1;
+        const Sub c = h.Submit(1500);
+        h.Stamp(c.done, 1600);
+        h.Boundary(1, 3);
+        const Sub d = h.Submit(2500);
+        h.Stamp(d.done, 2600);
+        h.Boundary(1, 4);
+        const Sub e = h.Submit(3500);
+        h.Stamp(e.done, 3600);
+        h.Boundary(1, 5);
+        (void)a;
+        (void)d;
+        (void)e;
+        const std::vector<Rec> all = h.PopAll();
+        const Rec* f2 = Find(all, 2);
+        const Rec* f3 = Find(all, 3);
+        const Rec* f4 = Find(all, 4);
+        CHECK(f2 != nullptr && f3 != nullptr && f4 != nullptr);
+        if (f2 == nullptr || f3 == nullptr || f4 == nullptr) return;
+        CHECK(f2->valid == 0);
+        CHECK((f3->valid & (Rec::kCycle | Rec::kFirstGap | Rec::kBoundaryIdle)) == 0);
+        CHECK(f4->valid == kAll);
+        for (const Rec& r : all) CHECK((r.valid & Rec::kLastDone) == 0 || r.last_done_qpc != 1201);
+        // The same observation at the claim epoch is accepted (the control).
+        H g;
+        g.Start(150);
+        g.opts.game_marker = true;
+        g.opts.game_value = 77;
+        g.opts.issue = 1010;
+        g.Submit(1000);
+        g.Boundary(1, 2);
+        g.opts.obs = true;
+        g.opts.game_completed = 77;
+        g.opts.before = 1200;
+        g.opts.after = 1201;
+        const Sub c2 = g.Submit(1500);
+        g.Stamp(c2.done, 1600);
+        g.Boundary(1, 3);
+        const std::vector<Rec> ok = g.PopAll();
+        const Rec* o2 = Find(ok, 2);
+        CHECK(o2 != nullptr && o2->valid == kAll);
+    }
+
+    void TestForeignEpochForAMarkerPublishedAfterTheSweep()
+    {
+        // The worker's observation (epoch 1) and its awaited stamp were applied while the marker's Submit was still in the
+        // binder's hands (claimed in epoch 0): the Submit arrives afterwards and the marker is untrusted at once.
+        for (int route = 0; route < 2; ++route) {
+            H h;
+            h.Start(150);
+            h.Drain();
+            h.Observe(77, 0, 1200, 1201, 1);
+            if (route == 1) h.c->OnAwaited(h.next_value, 1190, 1201, 1); // the awaited stamp of the unknown marker, parked with its epoch
+            h.opts.game_marker = true;
+            h.opts.game_value = 77;
+            h.opts.claim_epoch = 0;
+            h.opts.issue = 1010;
+            const Sub a = h.Submit(1000);
+            h.Boundary(1, 2);
+            const Sub c = h.Submit(1500);
+            h.Stamp(c.done, 1600);
+            h.Boundary(1, 3);
+            const Sub d = h.Submit(2500);
+            h.Stamp(d.done, 2600);
+            h.Boundary(1, 4);
+            const Sub e = h.Submit(3500);
+            h.Stamp(e.done, 3600);
+            h.Boundary(1, 5);
+            (void)a;
+            (void)d;
+            (void)e;
+            const std::vector<Rec> all = h.PopAll();
+            const Rec* f2 = Find(all, 2);
+            const Rec* f3 = Find(all, 3);
+            const Rec* f4 = Find(all, 4);
+            CHECK(f2 != nullptr && f3 != nullptr && f4 != nullptr);
+            if (f2 == nullptr || f3 == nullptr || f4 == nullptr) return;
+            CHECK(f2->valid == 0);
+            CHECK((f3->valid & (Rec::kCycle | Rec::kFirstGap | Rec::kBoundaryIdle)) == 0);
+            CHECK(f4->valid == kAll);
+            for (const Rec& r : all) CHECK((r.valid & Rec::kLastDone) == 0 || (r.last_done_qpc != 1201 && r.last_done_qpc != 1100));
+            CHECK(h.c->Statistics().markers_untrusted >= 1);
+        }
+        // An awaited stamp whose observation epoch differs from the marker's claim epoch (marker already in): untrusted.
+        H g;
+        g.Start(150);
+        g.opts.game_marker = true;
+        g.opts.game_value = 77;
+        const Sub a = g.Submit(1000);
+        g.Drain();
+        g.c->OnAwaited(a.done, 1070, 1100, 1);
+        g.Boundary(1, 2);
+        const Sub c = g.Submit(1500);
+        g.Stamp(c.done, 1600);
+        g.Boundary(1, 3);
+        const std::vector<Rec> all = g.PopAll();
+        const Rec* f2 = Find(all, 2);
+        CHECK(f2 != nullptr && f2->valid == 0);
+    }
+
+    // The Submit's own observation (Execute enter, before the marker's Signal) already covers the marker's value, and its
+    // after time is the clock the Submit was pushed with (= the issue time): not a zero-width completion at issue but a value
+    // reached before the marker existed: untrusted, whatever the epoch; the chain breaks, no valid record carries it. The control
+    // (value not yet reached at the enter) is a valid marker; the same holds for an own marker and for a Wait's own marker.
+    void TestMarkerCoveredByItsOwnEnterObservationIsUntrusted()
+    {
+        for (int route = 0; route < 3; ++route) { // 0 game marker, 1 own marker, 2 the Wait's release marker
+            for (int covered = 1; covered >= 0; --covered) {
+                H h;
+                h.Start(150);
+                uint64_t k = 0;
+                const uint64_t game_value = 77;
+                h.opts.obs = true;
+                h.opts.before = 1000; // = enq
+                h.opts.after = 1010;  // = issue (the shared clock)
+                h.opts.issue = 1010;
+                if (route == 0) {
+                    h.opts.game_marker = true;
+                    h.opts.game_value = game_value;
+                    h.opts.game_completed = covered != 0 ? game_value : game_value - 1;
+                } else if (route == 1) {
+                    h.opts.own_completed = covered != 0 ? h.next_value : h.next_value - 1;
+                }
+                if (route == 2) {
+                    h.opts.own_completed = covered != 0 ? h.next_value : h.next_value - 1;
+                    k = h.Wait(900, 905).release;
+                    h.Submit(1000);
+                } else {
+                    k = h.Submit(1000).done;
+                }
+                (void)k;
+                h.Boundary(1, 2);
+                const Sub c = h.Submit(1500);
+                h.Stamp(c.done, 1600);
+                h.Boundary(1, 3);
+                const Sub d = h.Submit(2500);
+                h.Stamp(d.done, 2600);
+                h.Boundary(1, 4);
+                h.Submit(3500);
+                const std::vector<Rec> all = h.PopAll();
+                const Rec* f2 = Find(all, 2);
+                CHECK(f2 != nullptr);
+                if (f2 == nullptr) continue;
+                if (covered != 0) {
+                    CHECK(f2->valid == 0);
+                    CHECK(h.c->Statistics().markers_untrusted >= 1);
+                } else {
+                    CHECK(h.c->Statistics().markers_untrusted == 0);
+                }
+            }
+        }
+    }
+
+    // A marker found complete before it was issued (another writer advanced the fence): its upper bound lies below its issue
+    // floor, the interval is inconsistent, the marker untrusted (what ClassifyMarker's Foreign did, now in the core).
+    void TestMarkerCompleteBeforeIssueIsUntrusted()
+    {
+        H h;
+        h.Start(150);
+        h.opts.game_marker = true;
+        h.opts.game_value = 77;
+        h.opts.issue = 1500;
+        const Sub a = h.Submit(1000);
+        (void)a;
+        h.Drain();
+        h.Observe(77, 0, 1100, 1101, 0); // covered by 1101, but the marker was issued at 1500
+        h.Boundary(1, 2);
+        const std::vector<Rec> all = h.PopAll();
+        const Rec* f2 = Find(all, 2);
+        CHECK(f2 != nullptr && f2->valid == 0);
+        CHECK(h.c->Statistics().intervals_inconsistent >= 1 && h.c->Statistics().markers_untrusted >= 1);
     }
 
     // A submission with overlap invalidates its own frame only; the done chain still carries.
@@ -1766,7 +2427,7 @@ namespace
         CHECK(s.dropped == 0);
         CHECK(s.pushed == static_cast<uint64_t>(kThreads * kPer + 2));
         CHECK(s.stamps_orphaned == 0); // every value found its one submission
-        CHECK(s.parked_overflow == 0);
+        CHECK(s.parked_watermark == 0);
     }
 
     void TestMultiProducerAboveCapacity()
@@ -1824,7 +2485,7 @@ int main()
     TestIrregularBoundaryInvalidatesNextFrame();
     TestWaitStampMissing();
     TestWaitOverlapInvalidatesFrames();
-    TestOutOfOrderStampsClamped();
+    TestOutOfOrderMarkersBoundedByLaterOnes();
     TestParkedStamps();
     TestParkedBoundAndOrphans();
     TestRingCapacityAndDrop();
@@ -1837,8 +2498,22 @@ int main()
     TestIncompleteAfterFourLaterFrames();
     TestLateStampBeforeAllowanceCompletes();
     TestFlushEmitsIncomplete();
-    TestLateBoundAndBaseline();
-    TestLatePickupClassification();
+    TestIntervalWidthIsStampLate();
+    TestLatePickupIntervalsAcrossFrames();
+    TestObservationIntervals();
+    TestIntervalWalkBothEnds();
+    TestFreeMarginScalarBothEnds();
+    TestUntrustedMarkerBreaksTheChain();
+    TestInconsistentIntervalIsUntrusted();
+    TestParkedTrustAndWatermark();
+    TestForeignEpochAtTheWorkersObservation();
+    TestForeignEpochInARingCarriedObservation();
+    TestForeignEpochForAMarkerPublishedAfterTheSweep();
+    TestMarkerCompleteBeforeIssueIsUntrusted();
+    TestMarkerCoveredByItsOwnEnterObservationIsUntrusted();
+    TestOldestOpenBoundaryMarker();
+    TestArmedMarkerKeepsItsAwaitedInterval();
+    TestCycleIntervalAndBoundaryCounters();
     TestSubmitOverlapInvalidatesItsFrame();
     TestBoundaryOverlapInvalidatesBothNeighbours();
     TestUnknownDoneZeroValidBits();

@@ -66,11 +66,13 @@ bool Hooks_TargetEnabled(void* target) noexcept {
 // gpu_queue_probe (its D3D12 side is not linked here; the key stays off in these tests).
 unsigned GpuQueueProbe_ExecuteEnterActive(void*) noexcept { return 0; }
 void GpuQueueProbe_ExecuteLeaveActive(unsigned) noexcept {}
-unsigned GpuQueueProbe_WaitBeginActive(void*, void*, uint64_t) noexcept { return 0; }
+unsigned GpuQueueProbe_WaitBeginActive(void*, void*, uint64_t, int64_t) noexcept { return 0; }
 void GpuQueueProbe_WaitEndActive(unsigned) noexcept {}
 void GpuQueueProbe_DependencyExecuteActive(void*, unsigned) noexcept {}
-void GpuQueueProbe_DependencySignalActive(void*, void*, uint64_t) noexcept {}
-void GpuQueueProbe_DependencyWaitActive(void*, void*, uint64_t) noexcept {}
+void GpuQueueProbe_DependencySignalActive(void*, void*, uint64_t, int64_t) noexcept {}
+void GpuQueueProbe_DependencyWaitActive(void*, void*, uint64_t, int64_t) noexcept {}
+void GpuQueueProbe_BorrowSignalActive(void*, void*, uint64_t, int64_t) noexcept {}
+void GpuQueueProbe_BorrowInterruptActive(void*) noexcept {}
 void GpuQueueProbe_OnFgInputBoundary(void*, uint64_t, const PacingFrameKey&) noexcept {}
 bool GpuPresent_RequiresReadiness() noexcept { return enabled; }
 bool GpuPresent_IsFgSupported(uint32_t controller) noexcept { return scheduler_supported && controller == 3; }

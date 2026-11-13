@@ -11,6 +11,7 @@
 #include "runtime_lifecycle.h"
 #include "background_tasks.h"
 #include "logger.h"
+#include "module_presence.h"
 #include <atomic>
 
 // ── Trampolines ──
@@ -40,6 +41,10 @@ static DWORD WINAPI InstallWorker(void* context) {
     s_on_install_worker = true;
     FgInput_BeginWorkerLifetime();
     while (!RuntimeLifecycle_IsStopping()) {
+        // Publish the presence of the modules the per-frame hooks ask about (module_presence.h)
+        // before the installs below, which can take long: a load notification or the 250 ms
+        // timeout below starts this pass, and this is its first step.
+        ModulePresence_Scan();
         // An auto-reset event retains notifications arriving during this scan.
         // The timeout retries failed installs and discovers non-LoadLibrary loads.
         HMODULE interposer = nullptr;

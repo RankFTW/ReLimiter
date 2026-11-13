@@ -2785,7 +2785,7 @@ void TestHoldRoomKeepsSteadyOffsetThroughGpuBoundStretch()
     CHECK_NEAR(waited->HoldRoomUs(1.0, 0.5, LEAD_RELEASE_HEADROOM_US), 9010.0 + 250.0 - (1010.0 - LEAD_RELEASE_HEADROOM_US));
 }
 
-// ── Carried restart (R2) ──
+// ── Carried restart ──
 
 namespace
 {
@@ -3043,7 +3043,7 @@ void TestRestartRungCarriedLeadIntoEmptyBucket()
     CHECK(mixed->Statistics().invalid_inputs == 0);
 }
 
-// ── Demand floor (R1) ──
+// ── Demand floor ──
 
 // LeadRequest::demand_floor_us: the demand is max(the bucket's lead, floor)
 // and the guard limits the demand; guard.demand_floored says the floor set

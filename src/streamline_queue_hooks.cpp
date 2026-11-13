@@ -56,6 +56,9 @@ void STDMETHODCALLTYPE ObserveExecute(ID3D12CommandQueue* queue, UINT count, ID3
     // gpu_queue_probe_source (key off: one load and a branch): command lists per queue, outermost calls only.
     if (depth == 1 && !callback.IsStopping()) GpuQueueProbe_DependencyExecute(queue, count);
     const unsigned probe = depth == 1 && !callback.IsStopping() ? GpuQueueProbe_ExecuteEnter(queue) : 0u;
+    // A nested Execute on the adopted queue (the Streamline handoff's own) interrupts a pending borrowed marker: the
+    // probe settles it with its own Signal before the call is forwarded.
+    if (depth > 1) GpuQueueProbe_BorrowInterrupt(queue);
     SetLastError(incoming);
     original_execute.load(std::memory_order_acquire)(queue, count, lists);
     const DWORD outgoing = GetLastError();
@@ -74,7 +77,13 @@ template<class Forward> HRESULT ObserveFence(ID3D12CommandQueue* queue, ID3D12Fe
     StreamlineFenceCall call;
     // gpu_queue_probe_source (key off: one load and a branch): every queue's outermost Signal goes into the
     // dependency table; the probe's own Signals and ReLimiter's own run nested (depth > 1) and are not recorded.
-    if (signal && depth == 1 && !callback.IsStopping()) GpuQueueProbe_DependencySignal(queue, fence, value);
+    // ONE clock read for this entry, shared by the dependency observer (its table entry's time) and the probe's bind
+    // (the borrowed marker's issue time); read only when a consumer can run (probe key on and source key on: with either
+    // off nothing reads the time, and the bind then reads its own).
+    const bool outermost_signal = signal && depth == 1 && !callback.IsStopping();
+    const int64_t now = outermost_signal && g_gpu_queue_probe.load(std::memory_order_relaxed) &&
+        g_gpu_queue_probe_source.load(std::memory_order_relaxed) != 0 ? GpuQueueProbe_Now() : 0;
+    if (outermost_signal) GpuQueueProbe_DependencySignal(queue, fence, value, now);
     // gpu_queue_probe (key off: one load and a branch): the first Signal of a proxy Present scope
     // that has a probe input is the real frame's source Signal; its queue is the source queue.
     if (signal && depth == 1 && !callback.IsStopping() && g_gpu_queue_probe.load(std::memory_order_relaxed))
@@ -86,6 +95,13 @@ template<class Forward> HRESULT ObserveFence(ID3D12CommandQueue* queue, ID3D12Fe
             else StreamlineHandoff_RejectQueueMethods();
         }
     }
+    // gpu_queue_probe borrowing (role 3; key off: one load and a branch): the game's own outermost Signal on the
+    // adopted queue may be the marker of the submission before it. Bound here, after the Streamline handoff's
+    // BeforeFence (whatever it enqueued natively first interrupted the pattern and settled it), and still BEFORE the
+    // Signal is forwarded. `now` is the entry's clock read above: the marker's issue time is the time this hook was
+    // entered (earlier than the forward by the handoff's own time, which is none for a fence it is not interested in):
+    // an earlier lower bound is a valid one.
+    if (signal && depth == 1 && !callback.IsStopping()) GpuQueueProbe_BorrowSignal(queue, fence, value, now);
     SetLastError(incoming);
     const HRESULT result = forward();
     const DWORD outgoing = GetLastError();
@@ -103,9 +119,13 @@ HRESULT STDMETHODCALLTYPE ObserveWait(ID3D12CommandQueue* queue, ID3D12Fence* fe
     // (the forward lambda below), like every probe Signal: outside it, it would be an outermost
     // application Signal and the handoff would take it for a repeated source Signal of the proxy Present.
     // gpu_queue_probe_source (key off: one load and a branch): every queue's Waits go into the dependency
-    // table, outside ReLimiter's own owned scopes.
-    if (depth == 0) GpuQueueProbe_DependencyWait(queue, fence, value);
-    const unsigned probe = GpuQueueProbe_WaitBegin(queue, fence, value);
+    // table, outside ReLimiter's own owned scopes. ONE clock read for this entry, shared by the dependency observer
+    // (its table entry's time) and the probe's WaitBegin (the Wait's enq and the observation's `before`); none while the
+    // probe or the source key is off (nothing consumes it; WaitBegin then reads its own when it runs).
+    const int64_t now = depth == 0 && g_gpu_queue_probe.load(std::memory_order_relaxed) &&
+        g_gpu_queue_probe_source.load(std::memory_order_relaxed) != 0 ? GpuQueueProbe_Now() : 0;
+    if (depth == 0) GpuQueueProbe_DependencyWait(queue, fence, value, now);
+    const unsigned probe = GpuQueueProbe_WaitBegin(queue, fence, value, now);
     return ObserveFence(queue, fence, value, false, [&] {
         const HRESULT result = original_wait.load(std::memory_order_acquire)(queue, fence, value);
         const DWORD error = GetLastError(); // the original's, for ObserveFence to hand back
@@ -117,6 +137,9 @@ HRESULT STDMETHODCALLTYPE ObserveWait(ID3D12CommandQueue* queue, ID3D12Fence* fe
 bool RuntimeMethods(const std::array<uint64_t, 3>& methods) noexcept {
     if (!methods[0] || !methods[1] || !methods[2] || methods[0] == methods[1] ||
         methods[0] == methods[2] || methods[1] == methods[2]) return false;
+#ifdef RELIMITER_GLUE_TEST_SEAM
+    return true; // the glue tests' fake queues (tests/gpu_queue_glue_support.h) are not methods of a D3D12 module
+#else
     HMODULE owner = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(methods[0]), &owner)) return false;
     wchar_t path[1024]{};
@@ -132,6 +155,7 @@ bool RuntimeMethods(const std::array<uint64_t, 3>& methods) noexcept {
     }
     FreeLibrary(owner);
     return valid;
+#endif
 }
 uint32_t ImageSize(HMODULE module) noexcept {
     __try {
@@ -206,6 +230,9 @@ void StreamlineQueue_SetFeatureModule(void* options, void* state) noexcept {
     if (b) FreeLibrary(b);
 }
 void StreamlineQueue_Drain(bool final) noexcept { StreamlineHandoff_Service(final); }
+StreamlineQueue_SignalFn StreamlineQueue_NativeSignal() noexcept {
+    return streamline_queue::original_signal.load(std::memory_order_acquire);
+}
 StreamlineQueueOwnedScope::StreamlineQueueOwnedScope() noexcept { ++streamline_queue::depth; }
 StreamlineQueueOwnedScope::~StreamlineQueueOwnedScope() { --streamline_queue::depth; }
 void StreamlineQueue_BlockFeature() noexcept {

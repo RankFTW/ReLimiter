@@ -31,6 +31,8 @@
 #include "ngx_hooks.h"
 #include "dlss_presets.h"
 #include "blackout.h"
+#include "hotkey_edge.h"
+#include "hotkey_poller.h"
 #include "background_tasks.h"
 #include "focus_lock.h"
 #include "logger.h"
@@ -38,6 +40,7 @@
 #include "pacing_telemetry.h"
 #include "runtime_lifecycle.h"
 #include <string>
+#include <array>
 #include <atomic>
 #include <algorithm>
 #include <cmath>
@@ -57,12 +60,13 @@ static int   s_ft_history_count = 0;
 static float s_graph_scale_min = 0.0f;
 static float s_graph_scale_max = 33.0f;
 
+// The UI's handle of one hotkey: which poller slot a binding control drives (hotkey_poller.h).
+// The edge state of the key lives with the poller.
 struct HotkeyState {
-    bool was_pressed = false;
-    bool wait_for_release = false;
+    HotkeySlot slot;
 };
-static HotkeyState s_position_hotkey;
-static HotkeyState s_oled_care_hotkey;
+static HotkeyState s_position_hotkey{ HotkeySlot::PositionCycle };
+static HotkeyState s_oled_care_hotkey{ HotkeySlot::OledCare };
 static HotkeyState* s_capturing_hotkey = nullptr;
 static int s_binding_frame = -1;
 
@@ -2434,8 +2438,7 @@ static bool DrawKeybind(const char* label, std::string* binding, HotkeyState* st
     ImGui::Text("%s:", label);
     ImGui::SameLine();
     if (s_capturing_hotkey == state) {
-        state->was_pressed = false;
-        state->wait_for_release = true;
+        Hotkeys_Rearm(state->slot);
         s_binding_frame = ImGui::GetFrameCount();
         ImGui::TextColored(ImVec4(1, 1, 0.3f, 1), "Press key...");
         ImGui::SameLine();
@@ -2463,14 +2466,12 @@ static bool DrawKeybind(const char* label, std::string* binding, HotkeyState* st
         if (ImGui::Button("Bind")) {
             s_capturing_hotkey = state;
             s_binding_frame = ImGui::GetFrameCount();
-            state->was_pressed = false;
-            state->wait_for_release = true;
+            Hotkeys_Rearm(state->slot);
         }
         if (!binding->empty()) {
             ImGui::SameLine();
             if (ImGui::Button("Clear")) {
                 binding->clear();
-                *state = {};
                 s_binding_frame = ImGui::GetFrameCount();
                 changed = true;
             }
@@ -2480,33 +2481,29 @@ static bool DrawKeybind(const char* label, std::string* binding, HotkeyState* st
     return changed;
 }
 
-static bool PollHotkey(const std::string& binding, HotkeyState* state, bool suppressed) {
+// The binding of a slot, parsed only when its string changed (strings are edited under the config
+// owner lock, which every caller holds) and handed to the poller as one word.
+static void PublishHotkeyBinding(HotkeySlot slot, const std::string& binding) {
+    struct Published {
+        std::string text;
+        bool valid = false;
+    };
+    static std::array<Published, static_cast<size_t>(HotkeySlot::Count)> published;
+    Published& last = published[static_cast<size_t>(slot)];
+    if (last.valid && last.text == binding) return;
+    last.text = binding;
+    last.valid = true;
     const ParsedKeybind kb = ParseKeybind(binding);
-    if (kb.vk == 0) {
-        *state = {};
-        return false;
-    }
-    const bool key_down = (GetAsyncKeyState(kb.vk) & 0x8000) != 0;
-    if (suppressed) {
-        state->was_pressed = false;
-        state->wait_for_release = true;
-        return false;
-    }
-    // Capture completion may precede or follow this callback. Require release
-    // of the main key as well as suppressing the entire binding frame.
-    if (state->wait_for_release) {
-        state->was_pressed = false;
-        if (!key_down) state->wait_for_release = false;
-        return false;
-    }
-    const bool ctrl = (GetAsyncKeyState(VK_LCONTROL) & 0x8000) || (GetAsyncKeyState(VK_RCONTROL) & 0x8000);
-    const bool alt = (GetAsyncKeyState(VK_LMENU) & 0x8000) || (GetAsyncKeyState(VK_RMENU) & 0x8000);
-    const bool shift = (GetAsyncKeyState(VK_LSHIFT) & 0x8000) || (GetAsyncKeyState(VK_RSHIFT) & 0x8000);
-    const bool super = (GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000);
-    const bool pressed = key_down && kb.ctrl == ctrl && kb.alt == alt && kb.shift == shift && !super;
-    const bool triggered = pressed && !state->was_pressed;
-    state->was_pressed = pressed;
-    return triggered;
+    Hotkeys_SetBinding(slot, hotkey_edge::Pack(hotkey_edge::Binding{ kb.vk, kb.ctrl, kb.alt, kb.shift }));
+}
+
+static void PublishHotkeyBindings() {
+    PublishHotkeyBinding(HotkeySlot::OsdToggle, g_config.osd_toggle_key);
+    PublishHotkeyBinding(HotkeySlot::PresetPrev, g_config.osd_preset_prev_key);
+    PublishHotkeyBinding(HotkeySlot::PresetNext, g_config.osd_preset_next_key);
+    PublishHotkeyBinding(HotkeySlot::Blackout, g_config.blackout_key);
+    PublishHotkeyBinding(HotkeySlot::PositionCycle, g_config.osd_position_cycle_key);
+    PublishHotkeyBinding(HotkeySlot::OledCare, g_config.oled_care_key);
 }
 
 static void DrawOSDImpl() {
@@ -2517,20 +2514,26 @@ static void DrawOSDImpl() {
         s_binding_frame = ImGui::GetFrameCount();
     }
     const bool suppress_hotkeys = s_capturing_hotkey != nullptr || s_binding_frame == ImGui::GetFrameCount();
-    // ── Keybind polling (runs every frame via reshade_overlay event) ──
-    // Uses GetAsyncKeyState for the main key (works regardless of UI state)
-    // and for modifiers. Edge-triggered on release→press transition to avoid
-    // repeat toggles while held.
-    {
-        static HotkeyState s_toggle_hotkey;
-        if (PollHotkey(g_config.osd_toggle_key, &s_toggle_hotkey, suppress_hotkeys))
-            g_config.osd_enabled = !g_config.osd_enabled;
-    }
+    // ── Keybind polling ──
+    // The keys are not sampled here: the hotkey poller (hotkey_poller.h, the blackout service
+    // thread) samples them every 8 ms, with or without a frame, and latches the release -> press
+    // edges. This callback runs every frame via the reshade_overlay event, whether or not the
+    // overlay is visible; it publishes the bindings, tells the poller whether a capture is
+    // drawing, and applies the latched triggers below on this thread, which owns g_config here.
+    PublishHotkeyBindings();
+    Hotkeys_SetSuppressed(suppress_hotkeys);
+    // Only when the poller thread could not be created (logged once at start-up): the old per-frame
+    // poll, here on the presenting thread. With the thread this is a load and a branch.
+    Hotkeys_PollFallback();
+    const auto hotkey_fired = [suppress_hotkeys](HotkeySlot slot) {
+        const bool fired = Hotkeys_Take(slot);  // consumed also while suppressed
+        return fired && !suppress_hotkeys;
+    };
+    if (hotkey_fired(HotkeySlot::OsdToggle))
+        g_config.osd_enabled = !g_config.osd_enabled;
 
     // ── Preset cycling keybind polling ──
     {
-        static HotkeyState s_prev_hotkey;
-        static HotkeyState s_next_hotkey;
         static int s_active_preset = -1;  // -1 = no preset selected via keybind yet
 
         // Count total presets: 3 built-in + occupied user presets
@@ -2578,12 +2581,12 @@ static void DrawOSDImpl() {
         };
 
         if (total_presets > 0) {
-            if (PollHotkey(g_config.osd_preset_prev_key, &s_prev_hotkey, suppress_hotkeys)) {
+            if (hotkey_fired(HotkeySlot::PresetPrev)) {
                 s_active_preset = (s_active_preset <= 0) ? total_presets - 1 : s_active_preset - 1;
                 LOG_INFO("OSD: Preset cycle prev -> %d/%d", s_active_preset, total_presets);
                 ApplyCyclePreset(s_active_preset);
             }
-            if (PollHotkey(g_config.osd_preset_next_key, &s_next_hotkey, suppress_hotkeys)) {
+            if (hotkey_fired(HotkeySlot::PresetNext)) {
                 s_active_preset = (s_active_preset >= total_presets - 1) ? 0 : s_active_preset + 1;
                 LOG_INFO("OSD: Preset cycle next -> %d/%d", s_active_preset, total_presets);
                 ApplyCyclePreset(s_active_preset);
@@ -2593,14 +2596,13 @@ static void DrawOSDImpl() {
 
     // ── Blackout keybind polling ──
     {
-        static HotkeyState s_blackout_hotkey;
-        if (PollHotkey(g_config.blackout_key, &s_blackout_hotkey, suppress_hotkeys))
+        if (hotkey_fired(HotkeySlot::Blackout))
             Blackout_Toggle();
     }
 
-    if (PollHotkey(g_config.osd_position_cycle_key, &s_position_hotkey, suppress_hotkeys))
+    if (hotkey_fired(HotkeySlot::PositionCycle))
         OSD_CyclePosition();
-    if (PollHotkey(g_config.oled_care_key, &s_oled_care_hotkey, suppress_hotkeys))
+    if (hotkey_fired(HotkeySlot::OledCare))
         OLEDCare_Toggle();
 
     // Read even while hidden, consuming tokens without training histories so

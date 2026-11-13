@@ -31,6 +31,12 @@ inline std::atomic<int> g_unified_queue_upstream{0};
 // Config_ApplyPacingPipeline.
 inline std::atomic<int> g_gpu_queue_probe_source{0};
 
+// Developer key unified_queue_margin_end (64-bit; 0 on Win32): 1 the probe's margin scalar is the
+// minimum of the per-submission bracket lower ends, 0 the minimum of the midpoints. Published by
+// Config_ApplyPacingPipeline (the value is the default until it first runs); read by the probe at
+// session start.
+inline std::atomic<int> g_unified_queue_margin_end{1};
+
 // The newest SetFlipConfig calls that enabled flip metering (nFramesPerBatch >
 // 0), for the pacing CSV's flip_config_qpc and flip_time_per_batch_us: a ring
 // of the newest FLIP_CONFIG_RING calls, so each row takes the newest call at or

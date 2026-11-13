@@ -116,6 +116,7 @@ struct Config {
     int unified_queue_rank = kPacingUnifiedQueueRankDefault; // developer: 1–8, default 2; with the queue law, the rank of the smallest queue margins that is used
     int unified_queue_need_frames = kPacingUnifiedQueueNeedFramesDefault; // developer: 1–16, default 4; with the queue law, how many of the newest valid records the base follows the GPU's need over
     int unified_queue_upstream = kPacingUnifiedQueueUpstreamDefault; // developer: 0–1, default 0 (off); 1 stamps the game's render markers locally as telemetry, no decision reads them (64-bit only; 0 on Win32); a saved 2 or 3 loads as 1
+    int unified_queue_margin_end = kPacingUnifiedQueueMarginEndDefault; // developer: 0–1, default 1; the queue probe's margin scalar of a frame is the minimum of the per-submission bracket lower ends (1) or of their midpoints (0, a comparison) (64-bit DX12; 0 on Win32)
     int unified_queue_allow_us = kPacingUnifiedQueueAllowDefaultUs; // developer: 0–20000 µs, default 4000; with the queue law, the queue margin M the law allows
 
     // Reflex Injection

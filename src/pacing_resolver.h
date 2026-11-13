@@ -109,6 +109,11 @@ constexpr bool kPacingGpuQueueProbeDefault = true;
 // fence dependencies from the presenting queue, 0 adopts the presenting queue.
 constexpr int kPacingGpuQueueProbeSourceDefault = 1;
 constexpr int kPacingGpuQueueProbeSourceMax = 1;
+// Developer key unified_queue_margin_end (default 1, 0..1; 64-bit, probe only): 1 the margin scalar
+// of a frame is the minimum of the per-submission bracket lower ends, 0 the minimum of the midpoints
+// (a developer comparison). Forced 0 on Win32.
+constexpr int kPacingUnifiedQueueMarginEndDefault = 1;
+constexpr int kPacingUnifiedQueueMarginEndMax = 1;
 constexpr int kPacingUnifiedQueueAllowDefaultUs = 4000;
 constexpr int kPacingUnifiedQueueAllowMaxUs = 20000;
 // Developer key gpu_wait_headroom_us: the release headroom of the GPU queue
@@ -227,6 +232,9 @@ struct PacingPipelineConfig {
     // Key unified_queue_upstream [0, kPacingUnifiedQueueUpstreamMax] (developer): ClampConfig clamps
     // it and forces 0 on Win32.
     int unified_queue_upstream = kPacingUnifiedQueueUpstreamDefault;
+    // Key unified_queue_margin_end [0, kPacingUnifiedQueueMarginEndMax] (developer): ClampConfig
+    // clamps it and forces 0 on Win32.
+    int unified_queue_margin_end = kPacingUnifiedQueueMarginEndDefault;
     int unified_queue_allow_us = kPacingUnifiedQueueAllowDefaultUs;
     double stall_inject_ms = 0.0; // 0 = off; [0, kPacingStallInjectMaxMs]
     double stall_inject_period_s = kPacingStallInjectDefaultPeriodS; // [1, 60]

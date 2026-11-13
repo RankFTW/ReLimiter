@@ -2,9 +2,6 @@
  * Unit tests for DMFG scheduler and enforcement dispatcher passthrough logic,
  * plus dispatcher marker-path routing and fallback.
  *
- * Feature: dmfg-passthrough, Task 3.3
- * Validates: Requirements 4.1, 4.2, 4.3, 5.1, 5.2
- *
  * ── Why these are integration test stubs ──
  *
  * The real OnMarker() and EnfDisp_OnPresent() are deeply coupled to Windows
@@ -24,12 +21,12 @@
  * What requires manual/integration testing:
  *   - That OnMarker still records marker-flow health (RecordEnforcementMarker,
  *     plus RecordMarkerTrigger for NvAPI/PCL marker triggers) and checks
- *     swapchain validity (IsSwapchainValid) before the DMFG check (Req 4.2)
+ *     swapchain validity (IsSwapchainValid) before the DMFG check
  *   - That every OnMarker call pushes exactly one PacingSourceRecord and that
  *     mode Off (suspended, DMFG, uncapped) suspends the cadence grid
  *   - That EnfDisp_OnPresent updates the FPS rolling window before the
- *     DMFG check (Req 5.2)
- *   - That enforcement dispatch (VkEnforce_OnPresent) is actually skipped (Req 5.1)
+ *     DMFG check
+ *   - That enforcement dispatch (VkEnforce_OnPresent) is actually skipped
  *
  * See tests/test_scheduler_passthrough.md for manual verification procedures.
  *
@@ -120,7 +117,7 @@ OnMarkerActions SimulateOnMarker(
     const SchedulerCapInputs& caps = {}) {
     OnMarkerActions actions = {};
 
-    // Marker-flow health and swapchain validity always run first (Req 4.2)
+    // Marker-flow health and swapchain validity always run first
     actions.health_checked = true;
 
     // Suspended passthrough on an invalid swapchain (not DMFG-related)
@@ -130,7 +127,7 @@ OnMarkerActions SimulateOnMarker(
         return actions;
     }
 
-    // DMFG (Req 4.1): mode Off, grid suspended. Its internal caps keep their
+    // DMFG: mode Off, grid suspended. Its internal caps keep their
     // relative sleeps (one record, not passthrough); dynamic DMFG passes through.
     if (IsDmfgActive_Pure(fg_mode, latency, dll_loaded)) {
         actions.grid_suspended = true;
@@ -187,10 +184,10 @@ struct EnfDispActions {
 EnfDispActions SimulateEnfDispOnPresent(int fg_mode, uint32_t latency, bool dll_loaded) {
     EnfDispActions actions = {};
 
-    // FPS window always updated first (Req 5.2)
+    // FPS window always updated first
     actions.fps_window_updated = true;
 
-    // DMFG passthrough: skip enforcement (Req 5.1)
+    // DMFG passthrough: skip enforcement
     if (IsDmfgActive_Pure(fg_mode, latency, dll_loaded)) {
         actions.enforcement_dispatched = false;
         return actions;
@@ -283,7 +280,7 @@ static int g_fail_count = 0;
 
 #define ASSERT_FALSE(expr, msg) ASSERT_TRUE(!(expr), msg)
 
-// ── Test: OnMarker always checks health before DMFG check (Req 4.2) ──
+// ── Test: OnMarker always checks health before DMFG check ──
 
 static void test_onmarker_health_always_checked() {
     std::printf("Test: OnMarker always runs health checks and pushes one source record\n");
@@ -323,7 +320,7 @@ static void test_onmarker_health_always_checked() {
     }
 }
 
-// ── Test: OnMarker skips pacing during DMFG (Req 4.1) ──
+// ── Test: OnMarker skips pacing during DMFG ──
 
 static void test_onmarker_skips_pacing_during_dmfg() {
     std::printf("Test: OnMarker skips sleep/pacing during DMFG passthrough\n");
@@ -359,7 +356,7 @@ static void test_onmarker_skips_pacing_during_dmfg() {
     }
 }
 
-// ── Test: EnfDisp_OnPresent always updates FPS window (Req 5.2) ──
+// ── Test: EnfDisp_OnPresent always updates FPS window ──
 
 static void test_enfdisp_fps_window_always_updated() {
     std::printf("Test: EnfDisp_OnPresent always updates FPS rolling window\n");
@@ -383,7 +380,7 @@ static void test_enfdisp_fps_window_always_updated() {
     }
 }
 
-// ── Test: EnfDisp_OnPresent skips enforcement during DMFG (Req 5.1) ──
+// ── Test: EnfDisp_OnPresent skips enforcement during DMFG ──
 
 static void test_enfdisp_skips_enforcement_during_dmfg() {
     std::printf("Test: EnfDisp_OnPresent skips enforcement dispatch during DMFG\n");

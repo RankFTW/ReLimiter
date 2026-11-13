@@ -10,7 +10,7 @@ namespace
 }
 
 GpuQueueProbeCore::GpuQueueProbeCore() noexcept
-    : inflight_(0), head_(0), dropped_(0), pushed_(0)
+    : inflight_(0), head_(0), dropped_(0)
 {
     for (Slot& s : slots_) {
         s.seq.store(0, std::memory_order_relaxed);
@@ -41,14 +41,16 @@ void GpuQueueProbeCore::ClearState() noexcept
     pend_head_ = 0;
     res_head_ = 0;
     prev_known_ = false;
-    prev_done_ = 0;
+    prev_lo_ = 0;
+    prev_hi_ = 0;
     wait_head_ = 0;
     wait_tail_ = 0;
     pending_wait_count_ = 0;
     pending_wait_overlap_ = false;
     hold_count_ = 0;
     hold_release_ = 0;
-    hold_x_ = 0;
+    hold_x_lo_ = 0;
+    hold_x_hi_ = 0;
     boundary_count_ = 0;
     tag_count_ = 0;
     recent_count_ = 0;
@@ -56,8 +58,10 @@ void GpuQueueProbeCore::ClearState() noexcept
     max_boundary_id_ = 0;
     irregular_pending_ = 0;
     hold_taken_ = true;
-    for (ValueL& v : value_l_) v = ValueL{};
+    last_obs_ = Obs{};
+    armed_[0] = armed_[1] = 0;
     parked_count_ = 0;
+    untrusted_below_ = 0;
 }
 
 void GpuQueueProbeCore::Reset(int64_t qpc_frequency) noexcept
@@ -80,7 +84,6 @@ bool GpuQueueProbeCore::Push(const GpuQueueEvent& e) noexcept
     s.ev = e;
     s.drops_at_claim = dropped_.load(std::memory_order_relaxed);
     s.seq.store(p + 1, std::memory_order_release);
-    pushed_.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -89,10 +92,14 @@ void GpuQueueProbeCore::NoteLost() noexcept
     dropped_.fetch_add(1, std::memory_order_relaxed);
 }
 
-void GpuQueueProbeCore::SetWakeLatencyUs(double calibrated_p95_us, double calibrated_max_us) noexcept
+void GpuQueueProbeCore::SetWakeLatencyUs(double calibrated_p95_us) noexcept
 {
     wake_us_ = calibrated_p95_us > 0.0 ? calibrated_p95_us : 0.0;
-    wake_max_us_ = std::max(wake_us_, calibrated_max_us);
+}
+
+void GpuQueueProbeCore::SetMarginEnd(int end) noexcept
+{
+    margin_end_ = end == kMarginEndLower ? kMarginEndLower : kMarginEndMidpoint;
 }
 
 double GpuQueueProbeCore::Us(int64_t ticks) const noexcept
@@ -108,13 +115,6 @@ int64_t GpuQueueProbeCore::UsToTicks(double us) const noexcept
 int64_t GpuQueueProbeCore::GuardTicks() const noexcept
 {
     return UsToTicks(std::max(wake_us_, kMinGuardUs));
-}
-
-int64_t GpuQueueProbeCore::LookupL(uint64_t value) const noexcept
-{
-    if (value == 0) return 0;
-    const ValueL& v = value_l_[value % kValueLCapacity];
-    return v.value == value ? v.l : 0;
 }
 
 void GpuQueueProbeCore::MarkOverlap(Frame& f) noexcept
@@ -135,7 +135,7 @@ void GpuQueueProbeCore::Drain() noexcept
         inflight_.fetch_sub(1, std::memory_order_acq_rel); // the slot is free again
         ProcessEvent(e, drops);
     }
-    RetryParked();
+    PropagateBack();
     Resolve();
 }
 
@@ -155,6 +155,7 @@ void GpuQueueProbeCore::ProcessEvent(const GpuQueueEvent& e, uint64_t drops_at_c
     case GpuQueueEvent::Kind::Hold: ProcessHold(e); break;
     case GpuQueueEvent::Kind::HoldAnnounce: ProcessHoldAnnounce(e); break;
     case GpuQueueEvent::Kind::BoundaryTag: ProcessBoundaryTag(e); break;
+    case GpuQueueEvent::Kind::Invalidate: ProcessInvalidate(); break;
     }
 }
 
@@ -164,8 +165,20 @@ void GpuQueueProbeCore::ProcessSubmit(const GpuQueueEvent& e) noexcept
         FrameAt(merge_seq_).sealed = true; // a submission followed: no later tag merges
         merge_open_ = false;
     }
+    if (e.obs_valid != 0) {
+        // The item's own observation concerns the markers issued before it (its own marker is issued later).
+        Obs o;
+        o.valid = true;
+        o.game_c = e.obs_game_completed;
+        o.own_c = e.obs_own_completed;
+        o.before = e.obs_before_qpc;
+        o.after = e.obs_after_qpc;
+        o.epoch = e.obs_foreign_epoch;
+        ApplyObs(o);
+        NoteObs(o);
+    }
     if (pend_head_ - res_head_ >= kPendingCapacity) {
-        // Stamps never arrived for the oldest submissions: give them up to keep going.
+        // Markers never arrived for the oldest submissions: give them up to keep going.
         pending_[res_head_ % kPendingCapacity].abandoned = true;
         Resolve();
     }
@@ -179,6 +192,38 @@ void GpuQueueProbeCore::ProcessSubmit(const GpuQueueEvent& e) noexcept
     en.first_in_frame = f.n == 0;
     en.gap_before = gap_pending_;
     gap_pending_ = false;
+    if (e.done_value != 0) {
+        Marker& m = en.done;
+        m.game = e.marker_game != 0 ? 1 : 0;
+        m.value = m.game != 0 ? e.marker_value : e.done_value;
+        m.lo = std::max(e.enq_qpc, e.marker_issue_qpc);
+        m.epoch = e.claim_epoch;
+        // What the worker learned about k before this Submit arrived: bounds, quality and trust together.
+        Marker parked;
+        const bool had_parked = TakeParked(e.done_value, &parked);
+        if (had_parked) {
+            if (parked.has_hi) {
+                m.hi = parked.hi;
+                m.has_hi = true;
+            }
+            if (parked.has_soft) {
+                m.soft_lo = parked.soft_lo;
+                m.has_soft = true;
+            }
+            if (parked.untrusted) m.untrusted = true;
+            // The awaited observation of a game marker was taken in another epoch than its claim: tainted.
+            if (m.game != 0 && parked.has_epoch && parked.epoch != m.epoch) MakeUntrusted(m);
+        } else if (e.done_value <= untrusted_below_) {
+            MakeUntrusted(m); // its entry was dropped from the full parked table: untrusted from then on
+        }
+        if (e.marker_trusted == 0 || (m.game != 0 && m.value == 0)) MakeUntrusted(m);
+        // The Submit's own observation (taken at the Execute's enter, BEFORE the marker's Signal was issued) already
+        // covers the marker's value: the value was reached before the marker existed (another writer advanced the fence). The
+        // observation's after time may be later than the reads (it can be the clock the Submit was pushed with, i.e. the issue
+        // time), so the upper-bound/issue-floor check alone would read this as a zero-width completion at issue: untrusted here.
+        if (e.obs_valid != 0 && m.value <= (m.game != 0 ? e.obs_game_completed : e.obs_own_completed)) MakeUntrusted(m);
+        ApplyObsTo(m, last_obs_);
+    }
     // The Waits that arrived since the previous submission are in front of this one.
     en.wait_begin = wait_head_ - pending_wait_count_;
     en.wait_count = pending_wait_count_;
@@ -191,10 +236,19 @@ void GpuQueueProbeCore::ProcessSubmit(const GpuQueueEvent& e) noexcept
     if (f.n == 0) f.first_enq = e.enq_qpc;
     f.last_enq = e.enq_qpc;
     ++f.n;
+    if (e.borrowed != 0) ++f.borrowed;
     ++f.unresolved;
     max_value_seen_ = std::max(max_value_seen_, e.done_value);
 }
 
+
+// The frame in progress and the one still open to a tag cannot be trusted (an event of the producer side whose place
+// against the boundary is unknown: another queue signalled the borrowed fence, ...): the same marks as an overlapping Wait.
+void GpuQueueProbeCore::ProcessInvalidate() noexcept
+{
+    MarkOverlap(FrameAt(frame_open_));
+    if (merge_open_) MarkOverlap(FrameAt(merge_seq_));
+}
 void GpuQueueProbeCore::ProcessWait(const GpuQueueEvent& e) noexcept
 {
     if (e.overlap != 0) {
@@ -202,6 +256,17 @@ void GpuQueueProbeCore::ProcessWait(const GpuQueueEvent& e) noexcept
         MarkOverlap(FrameAt(frame_open_));
         if (merge_open_) MarkOverlap(FrameAt(merge_seq_));
         pending_wait_overlap_ = true;
+    }
+    if (e.obs_valid != 0) {
+        Obs o;
+        o.valid = true;
+        o.game_c = e.obs_game_completed;
+        o.own_c = e.obs_own_completed;
+        o.before = e.obs_before_qpc;
+        o.after = e.obs_after_qpc;
+        o.epoch = e.obs_foreign_epoch;
+        ApplyObs(o);
+        NoteObs(o);
     }
     if (wait_head_ - wait_tail_ >= kWaitCapacity) {
         waits_dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -216,6 +281,28 @@ void GpuQueueProbeCore::ProcessWait(const GpuQueueEvent& e) noexcept
     w.release_value = e.release_value;
     w.fence_id = e.fence_id;
     w.wait_value = e.wait_value;
+    if (e.release_value != 0) {
+        Marker& m = w.rel;
+        m.game = 0;
+        m.value = e.release_value;
+        m.lo = e.enq_qpc;
+        Marker parked;
+        if (TakeParked(e.release_value, &parked)) {
+            if (parked.has_hi) {
+                m.hi = parked.hi;
+                m.has_hi = true;
+            }
+            if (parked.has_soft) {
+                m.soft_lo = parked.soft_lo;
+                m.has_soft = true;
+            }
+            if (parked.untrusted) m.untrusted = true;
+        } else if (e.release_value <= untrusted_below_) {
+            MakeUntrusted(m);
+        }
+        if (e.obs_valid != 0 && m.value <= e.obs_own_completed) MakeUntrusted(m); // reached before it was issued
+        ApplyObsTo(m, last_obs_);
+    }
     ++wait_head_;
     ++pending_wait_count_;
     max_value_seen_ = std::max(max_value_seen_, e.release_value);
@@ -281,11 +368,11 @@ void GpuQueueProbeCore::ProcessHold(const GpuQueueEvent& e) noexcept
     AddHold(h);
 }
 
-bool GpuQueueProbeCore::WaitsStamped(const Entry& e) const noexcept
+bool GpuQueueProbeCore::WaitsSettled(const Entry& e) const noexcept
 {
     for (uint32_t j = 0; j < e.wait_count; ++j) {
         const WaitRec& w = waits_[(e.wait_begin + j) % kWaitCapacity];
-        if (w.release_value != 0 && !w.has_stamp) return false;
+        if (w.release_value != 0 && !w.rel.untrusted && !w.rel.has_hi) return false;
     }
     return true;
 }
@@ -476,6 +563,11 @@ void GpuQueueProbeCore::ProcessBoundary(const GpuQueueEvent& e) noexcept
     }
     if (e.overlap != 0) MarkOverlap(f);
     f.closed = true;
+    // The frame's last submission carries the boundary marker (a Submit that arrives later belongs to the next frame).
+    if (pend_head_ > res_head_) {
+        Entry& last = pending_[(pend_head_ - 1) % kPendingCapacity];
+        if (last.frame_seq == frame_open_ && !last.abandoned) last.boundary = true;
+    }
     ApplyTag(f, e);
     if (e.boundary_id != 0) RegisterBoundary(e.boundary_id, frame_open_, HasIdentity(e));
     merge_open_ = true;
@@ -492,93 +584,268 @@ void GpuQueueProbeCore::ProcessBoundary(const GpuQueueEvent& e) noexcept
     Resolve();
 }
 
-void GpuQueueProbeCore::Bounds(uint64_t value, int64_t enq, int64_t stamp, double late_bound_us, double* late) noexcept
+// ── Intervals ─────────────────────────────────────────────────────────────────────────────────
+void GpuQueueProbeCore::ApplyObsTo(Marker& m, const Obs& o) noexcept
 {
-    int64_t l;
-    if (late_bound_us >= 0.0) {
-        // Event-awaited: the thread woke from a blocked wait, so the completion is at most
-        // max(bound, largest calibration wake latency) before the stamp. This is the value's
-        // completion lower bound, not the stamp itself.
-        l = stamp - UsToTicks(std::max(late_bound_us, wake_max_us_));
-        *late = late_bound_us;
-    } else {
-        // Late pickup: the stamp is when we looked. Only enq and the previous completion
-        // lower bound constrain when it completed.
-        l = std::max(enq, LookupL(value - 1));
-        *late = std::max(0.0, Us(stamp - l));
+    if (!o.valid || m.untrusted) return;
+    if (m.game != 0 && o.epoch != m.epoch) {
+        // Another queue signalled the bound fence between the claim and this observation: the game fence's completed value
+        // says nothing about this marker.
+        MakeUntrusted(m);
+        return;
     }
-    value_l_[value % kValueLCapacity] = ValueL{value, l};
+    const uint64_t completed = m.game != 0 ? o.game_c : o.own_c;
+    if (m.value <= completed) {
+        if (!m.has_hi || o.after < m.hi) {
+            m.hi = o.after;
+            m.has_hi = true;
+        }
+    } else if (o.before > m.lo) {
+        m.lo = o.before; // incomplete at before: it completes after
+    }
 }
 
-GpuQueueProbeCore::StampResult GpuQueueProbeCore::TryStamp(uint64_t value, int64_t stamp, double late_bound_us) noexcept
+void GpuQueueProbeCore::ApplyObs(const Obs& o) noexcept
 {
-    for (uint64_t i = wait_tail_; i != wait_head_; ++i) {
-        WaitRec& w = waits_[i % kWaitCapacity];
-        if (w.release_value != value) continue;
-        if (w.has_stamp) return StampResult::Duplicate;
-        Bounds(value, w.enq, stamp, late_bound_us, &w.late_us);
-        w.stamp = stamp;
-        w.has_stamp = true;
-        return StampResult::Applied;
-    }
     for (uint64_t i = res_head_; i != pend_head_; ++i) {
         Entry& e = pending_[i % kPendingCapacity];
-        if (e.abandoned || e.done_value != value) continue;
-        if (e.has_done_stamp) return StampResult::Duplicate;
-        Bounds(value, e.enq, stamp, late_bound_us, &e.done_late_us);
-        e.done_stamp = stamp;
-        e.has_done_stamp = true;
-        return StampResult::Applied;
+        if (e.abandoned || e.done_value == 0) continue;
+        ApplyObsTo(e.done, o);
     }
-    return StampResult::NotFound;
+    for (uint64_t i = wait_tail_; i != wait_head_; ++i) {
+        WaitRec& w = waits_[i % kWaitCapacity];
+        if (w.release_value == 0) continue;
+        ApplyObsTo(w.rel, o);
+    }
 }
 
-void GpuQueueProbeCore::OnStamp(uint64_t fence_value, int64_t stamp_qpc, double late_bound_us) noexcept
+void GpuQueueProbeCore::NoteObs(const Obs& o) noexcept
 {
-    if (fence_value == 0) {
-        stamps_orphaned_.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    switch (TryStamp(fence_value, stamp_qpc, late_bound_us)) {
-    case StampResult::Applied:
-        Resolve();
-        return;
-    case StampResult::Duplicate:
-        stamps_orphaned_.fetch_add(1, std::memory_order_relaxed);
-        return;
-    case StampResult::NotFound:
-        break;
-    }
-    if (fence_value <= max_value_seen_) {
-        // Its operation is gone (abandoned or never reported): nothing to attach it to.
-        stamps_orphaned_.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    if (parked_count_ >= kParkedCapacity) {
-        parked_overflow_.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    parked_[parked_count_++] = Parked{fence_value, stamp_qpc, late_bound_us};
+    if (!last_obs_.valid || o.after >= last_obs_.after) last_obs_ = o;
 }
 
-void GpuQueueProbeCore::RetryParked() noexcept
+// Completions are in queue order: a submission covered by an upper bound bounds every earlier submission's completion
+// by it. Only trusted markers take part (an untrusted completion says nothing about the order).
+void GpuQueueProbeCore::PropagateBack() noexcept
 {
-    size_t keep = 0;
-    for (size_t i = 0; i < parked_count_; ++i) {
-        const Parked p = parked_[i];
-        switch (TryStamp(p.value, p.stamp, p.late_bound_us)) {
-        case StampResult::Applied:
-            break;
-        case StampResult::Duplicate:
-            stamps_orphaned_.fetch_add(1, std::memory_order_relaxed);
-            break;
-        case StampResult::NotFound:
-            if (p.value <= max_value_seen_) stamps_orphaned_.fetch_add(1, std::memory_order_relaxed);
-            else parked_[keep++] = p; // its event is still to come
-            break;
+    bool have = false;
+    int64_t run = 0;
+    for (uint64_t i = pend_head_; i != res_head_;) {
+        --i;
+        Entry& e = pending_[i % kPendingCapacity];
+        if (e.abandoned || e.done_value == 0 || e.done.untrusted) continue;
+        Marker& m = e.done;
+        if (have) {
+            if (!m.has_hi) {
+                m.hi = run;
+                m.has_hi = true;
+            } else if (m.hi > run) {
+                m.hi = run;
+            }
+        }
+        if (m.has_hi) {
+            run = m.hi;
+            have = true;
         }
     }
-    parked_count_ = keep;
+}
+
+bool GpuQueueProbeCore::Effective(const Marker& m, int64_t* lo, int64_t* hi) const noexcept
+{
+    if (!m.has_hi) return false;
+    int64_t l = m.lo;
+    if (m.has_soft && m.soft_lo <= m.hi && m.soft_lo > l) l = m.soft_lo; // the empirical bound only while it agrees with the hard ones
+    *lo = l;
+    *hi = m.hi;
+    return l <= m.hi;
+}
+
+void GpuQueueProbeCore::MakeUntrusted(Marker& m) noexcept
+{
+    if (m.untrusted) return;
+    m.untrusted = true;
+    markers_untrusted_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void GpuQueueProbeCore::SetAwaited(Marker& m, int64_t lo_qpc, int64_t hi_qpc) noexcept
+{
+    if (!m.has_hi || hi_qpc < m.hi) {
+        m.hi = hi_qpc;
+        m.has_hi = true;
+    }
+    if (!m.has_soft || lo_qpc > m.soft_lo) {
+        m.soft_lo = lo_qpc;
+        m.has_soft = true;
+    }
+}
+
+GpuQueueProbeCore::Marker* GpuQueueProbeCore::FindMarker(uint64_t k, uint64_t* frame_seq, bool* is_wait) noexcept
+{
+    for (uint64_t i = res_head_; i != pend_head_; ++i) {
+        Entry& e = pending_[i % kPendingCapacity];
+        if (e.abandoned || e.done_value != k) continue;
+        if (frame_seq != nullptr) *frame_seq = e.frame_seq;
+        if (is_wait != nullptr) *is_wait = false;
+        return &e.done;
+    }
+    for (uint64_t i = wait_tail_; i != wait_head_; ++i) {
+        WaitRec& w = waits_[i % kWaitCapacity];
+        if (w.release_value != k) continue;
+        if (is_wait != nullptr) *is_wait = true;
+        return &w.rel;
+    }
+    return nullptr;
+}
+
+int GpuQueueProbeCore::FindParked(uint64_t k) const noexcept
+{
+    for (size_t i = 0; i < parked_count_; ++i)
+        if (parked_[i].k == k) return static_cast<int>(i);
+    return -1;
+}
+
+// Bounds, quality (the soft lower bound) and trust of a marker whose Submit/Wait has not arrived: ONE entry per k.
+// A full table drops the entry with the smallest k and raises the watermark to it: that marker (and every smaller k
+// without an entry) is untrusted from then on; counted.
+void GpuQueueProbeCore::Park(uint64_t k, const Marker& d) noexcept
+{
+    int i = FindParked(k);
+    if (i < 0) {
+        if (parked_count_ >= kParkedCapacity) {
+            size_t oldest = 0;
+            for (size_t j = 1; j < parked_count_; ++j)
+                if (parked_[j].k < parked_[oldest].k) oldest = j;
+            untrusted_below_ = std::max(untrusted_below_, parked_[oldest].k);
+            parked_watermark_.fetch_add(1, std::memory_order_relaxed);
+            parked_[oldest] = parked_[--parked_count_];
+            if (k <= untrusted_below_) {
+                // The new marker is itself at or below the watermark and now has no room: untrusted by the watermark.
+                return;
+            }
+        }
+        i = static_cast<int>(parked_count_++);
+        parked_[i] = ParkedMarker{};
+        parked_[i].k = k;
+    }
+    Marker& m = parked_[i].m;
+    if (d.has_hi && (!m.has_hi || d.hi < m.hi)) {
+        m.hi = d.hi;
+        m.has_hi = true;
+    }
+    if (d.has_soft && (!m.has_soft || d.soft_lo > m.soft_lo)) {
+        m.soft_lo = d.soft_lo;
+        m.has_soft = true;
+    }
+    if (d.has_epoch) {
+        if (m.has_epoch && m.epoch != d.epoch && !m.untrusted) {
+            m.untrusted = true; // two awaited observations of different epochs: it cannot be told which was clean
+            markers_untrusted_.fetch_add(1, std::memory_order_relaxed);
+        }
+        m.epoch = d.epoch;
+        m.has_epoch = true;
+    }
+    if (d.untrusted && !m.untrusted) {
+        m.untrusted = true;
+        markers_untrusted_.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+bool GpuQueueProbeCore::TakeParked(uint64_t k, Marker* m) noexcept
+{
+    const int i = FindParked(k);
+    if (i < 0) return false;
+    *m = parked_[i].m;
+    parked_[i] = parked_[--parked_count_];
+    return true;
+}
+
+void GpuQueueProbeCore::OnObservation(uint64_t game_completed, uint64_t own_completed, int64_t before_qpc,
+    int64_t after_qpc, uint64_t foreign_epoch) noexcept
+{
+    Obs o;
+    o.valid = true;
+    o.game_c = game_completed;
+    o.own_c = own_completed;
+    o.before = before_qpc;
+    o.after = after_qpc;
+    o.epoch = foreign_epoch;
+    ApplyObs(o);
+    NoteObs(o);
+    PropagateBack();
+    // Not resolved here: accounting happens at the next Drain, after the awaited markers of the same wake are in (a
+    // marker accounted from its observation interval could no longer take its tighter awaited one).
+}
+
+void GpuQueueProbeCore::OnAwaited(uint64_t k, int64_t lo_qpc, int64_t hi_qpc, uint64_t foreign_epoch) noexcept
+{
+    if (k == 0) {
+        stamps_orphaned_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (Marker* m = FindMarker(k, nullptr, nullptr)) {
+        if (m->game != 0 && !m->untrusted && foreign_epoch != m->epoch) MakeUntrusted(*m);
+        if (!m->untrusted) SetAwaited(*m, lo_qpc, hi_qpc);
+        PropagateBack();
+        return;
+    }
+    if (k <= max_value_seen_) {
+        // Its operation is gone (accounted, abandoned or never reported): nothing to attach it to.
+        stamps_orphaned_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    Marker d;
+    SetAwaited(d, lo_qpc, hi_qpc);
+    d.epoch = foreign_epoch;
+    d.has_epoch = true;
+    Park(k, d);
+}
+
+void GpuQueueProbeCore::OnUntrusted(uint64_t k) noexcept
+{
+    if (k == 0) return;
+    if (Marker* m = FindMarker(k, nullptr, nullptr)) {
+        MakeUntrusted(*m);
+        return;
+    }
+    if (k <= max_value_seen_) {
+        stamps_orphaned_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    Marker d;
+    d.untrusted = true;
+    Park(k, d);
+}
+
+bool GpuQueueProbeCore::MarkerState(uint64_t k, MarkerView* out) const noexcept
+{
+    const Marker* m = nullptr;
+    bool parked = false;
+    for (uint64_t i = res_head_; i != pend_head_ && m == nullptr; ++i) {
+        const Entry& e = pending_[i % kPendingCapacity];
+        if (!e.abandoned && e.done_value == k) m = &e.done;
+    }
+    for (uint64_t i = wait_tail_; i != wait_head_ && m == nullptr; ++i) {
+        const WaitRec& w = waits_[i % kWaitCapacity];
+        if (w.release_value == k) m = &w.rel;
+    }
+    if (m == nullptr) {
+        const int i = FindParked(k);
+        if (i < 0) return false;
+        m = &parked_[i].m;
+        parked = true;
+    }
+    if (out != nullptr) {
+        MarkerView v;
+        v.has_hi = m->has_hi;
+        v.hi = m->hi;
+        v.lo = m->lo;
+        v.untrusted = m->untrusted;
+        v.parked = parked;
+        v.awaited = m->has_soft && m->has_hi && m->soft_lo <= m->hi;
+        if (v.awaited && m->soft_lo > v.lo) v.lo = m->soft_lo;
+        *out = v;
+    }
+    return true;
 }
 
 void GpuQueueProbeCore::Resolve() noexcept
@@ -590,10 +857,11 @@ void GpuQueueProbeCore::Resolve() noexcept
             ApplyAbandoned(f);
             prev_known_ = false;
         } else {
-            if (e.done_value != 0 && !e.has_done_stamp) break; // in order: later ones wait
+            if (ArmedHeld(e)) break; // its wake has not been processed: it keeps its awaited interval
+            if (e.done_value != 0 && !e.done.untrusted && !e.done.has_hi) break; // in order: later ones wait
             if (e.wait_count > 0) {
                 if (!f.closed) break; // the Hold events of its Waits arrive before the boundary
-                if (!WaitsStamped(e)) break;
+                if (!WaitsSettled(e)) break;
                 if (!e.hold_forced && HoldPending(e)) break; // its hold's release is still to come
             }
             ApplyResolved(e, f);
@@ -602,6 +870,37 @@ void GpuQueueProbeCore::Resolve() noexcept
         if (f.unresolved > 0) --f.unresolved;
         ++res_head_;
     }
+}
+
+bool GpuQueueProbeCore::ArmedHeld(const Entry& e) const noexcept
+{
+    if (armed_[0] == 0 && armed_[1] == 0) return false;
+    const auto armed = [this](uint64_t k) { return k != 0 && (k == armed_[0] || k == armed_[1]); };
+    if (armed(e.done_value)) return true;
+    for (uint32_t j = 0; j < e.wait_count; ++j)
+        if (armed(waits_[(e.wait_begin + j) % kWaitCapacity].release_value)) return true;
+    return false;
+}
+
+void GpuQueueProbeCore::SetArmed(uint64_t k_own_registration, uint64_t k_game_registration) noexcept
+{
+    armed_[0] = k_own_registration;
+    armed_[1] = k_game_registration;
+}
+
+bool GpuQueueProbeCore::OldestOpenBoundaryMarker(BoundaryMarker* out) const noexcept
+{
+    for (uint64_t i = res_head_; i != pend_head_; ++i) {
+        const Entry& e = pending_[i % kPendingCapacity];
+        if (!e.boundary || e.abandoned || e.done_value == 0 || e.done.untrusted || e.done.has_hi) continue;
+        if (out != nullptr) {
+            out->game = e.done.game;
+            out->value = e.done.value;
+            out->k = e.done_value;
+        }
+        return true;
+    }
+    return false;
 }
 
 void GpuQueueProbeCore::ApplyAbandoned(Frame& f) noexcept
@@ -618,46 +917,90 @@ void GpuQueueProbeCore::ApplyAbandoned(Frame& f) noexcept
     f.last_done_valid = false;
 }
 
+// The accounting walk of the header, evaluated on intervals: every function below is monotone in each end of each
+// input, so the lower end of a result is computed from the matching ends of the inputs (interval arithmetic may widen,
+// never narrow). A gap is [max(0, enq - hi), max(0, enq - lo)], a margin [max(0, lo - enq), max(0, hi - enq)].
 void GpuQueueProbeCore::ApplyResolved(Entry& e, Frame& f) noexcept
 {
+    const auto pos = [](int64_t v) { return v > 0 ? v : int64_t{0}; };
     if (e.gap_before) prev_known_ = false;
     const bool known = prev_known_; // done(i-1)
-    const int64_t prev = prev_done_;
+    int64_t p_lo = prev_lo_, p_hi = prev_hi_;
     const int64_t guard = GuardTicks();
     const uint32_t m = e.wait_count;
 
+    // The submission's own completion [d_lo, d_hi]. Untrusted or inconsistent: the frame is invalid and the done chain
+    // breaks here (the successor has no known predecessor until a trusted completion).
+    int64_t d_lo = 0, d_hi = 0;
+    bool has_done = false, awaited = false;
+    if (e.done_value != 0) {
+        Marker& d = e.done;
+        if (!d.untrusted) {
+            if (d.has_soft && d.soft_lo > d.hi) awaited_lo_rejected_.fetch_add(1, std::memory_order_relaxed);
+            if (Effective(d, &d_lo, &d_hi)) {
+                if (known && d_lo < p_lo) d_lo = p_lo; // done(i) >= done(i-1)
+                if (d_lo <= d_hi) has_done = true;
+            }
+            if (!has_done) {
+                intervals_inconsistent_.fetch_add(1, std::memory_order_relaxed);
+                MakeUntrusted(d);
+            }
+        }
+        if (!has_done) MarkOverlap(f);
+        else awaited = e.done.has_soft && e.done.soft_lo <= e.done.hi;
+    }
+    if (has_done && known && p_hi > d_hi) p_hi = d_hi; // done(i-1) <= done(i) <= d_hi
+
+    // The Waits in front of it: all released markers known and trusted?
     bool waits_known = true;
+    bool used_wait = false;
     for (uint32_t j = 0; j < m; ++j) {
-        const WaitRec& w = waits_[(e.wait_begin + j) % kWaitCapacity];
-        if (w.release_value == 0 || !w.has_stamp) waits_known = false;
+        WaitRec& w = waits_[(e.wait_begin + j) % kWaitCapacity];
+        if (w.release_value == 0) {
+            waits_known = false;
+            continue;
+        }
+        if (!w.rel.untrusted) {
+            int64_t l, h;
+            if (!Effective(w.rel, &l, &h)) {
+                intervals_inconsistent_.fetch_add(1, std::memory_order_relaxed);
+                MakeUntrusted(w.rel);
+            } else {
+                used_wait = true;
+            }
+        }
+        if (w.rel.untrusted) {
+            waits_known = false;
+            MarkOverlap(f);
+        }
     }
     const bool calc_ok = known && waits_known;
     if (!calc_ok) f.incomplete = true;
 
     // Walk the Waits in front of the submission (the timeline model in the header).
-    int64_t fr = prev; // when the queue is free of everything in front so far
-    int64_t gaps = 0;  // empty time before and between the Waits
-    int64_t idle = 0;  // Waits pending with nothing queued behind them
-    double late = 0.0;
-    bool stamped = false;
+    int64_t fr_lo = p_lo, fr_hi = p_hi; // when the queue is free of everything in front so far
+    int64_t gaps_lo = 0, gaps_hi = 0;   // empty time before and between the Waits
+    int64_t idle_lo = 0;                // Waits pending with nothing queued behind them
+    int64_t late = 0;
     for (uint32_t j = 0; j < m; ++j) {
         const WaitRec& w = waits_[(e.wait_begin + j) % kWaitCapacity];
-        if (w.has_stamp) {
-            stamped = true;
-            late = std::max(late, w.late_us);
-        }
-        // Released when the fence was signalled: the release is unknown, bounded above by the
-        // Signal's issue time, which is used; the doubt is the span the Wait could have lasted.
-        const bool immediate = w.has_stamp && (w.stamp - w.issue) <= guard;
-        if (immediate) late = std::max(late, Us(std::max<int64_t>(0, w.issue - w.enq)));
-        int64_t x = 0; // when the queue reached this Wait
+        int64_t r_lo = 0, r_hi = 0;
+        int64_t x_lo = 0, x_hi = 0; // when the queue reached this Wait
         if (calc_ok) {
-            const int64_t r = immediate ? w.issue : w.stamp;
-            gaps += std::max<int64_t>(0, w.enq - fr);
-            fr = std::max(fr, w.enq);
-            x = fr;
-            idle += std::max<int64_t>(0, std::min(r, e.enq) - fr);
-            fr = std::max(fr, r);
+            Effective(w.rel, &r_lo, &r_hi);
+            // Released when the fence was signalled: the Wait passed before (or as) the Signal was issued; its release
+            // is bounded above by the marker's upper bound and below by the Wait's enqueue.
+            if ((r_hi - w.issue) <= guard) r_lo = std::min(w.enq, r_hi);
+            late = std::max(late, r_hi - r_lo);
+            gaps_lo += pos(w.enq - fr_hi);
+            gaps_hi += pos(w.enq - fr_lo);
+            fr_lo = std::max(fr_lo, w.enq);
+            fr_hi = std::max(fr_hi, w.enq);
+            x_lo = fr_lo;
+            x_hi = fr_hi;
+            idle_lo += pos(std::min(r_lo, e.enq) - x_hi);
+            fr_lo = std::max(fr_lo, r_lo);
+            fr_hi = std::max(fr_hi, r_hi);
         }
         // Is it ReLimiter's hold? Only a Wait matching an announced hold is.
         HoldRec h;
@@ -682,19 +1025,30 @@ void GpuQueueProbeCore::ApplyResolved(Entry& e, Frame& f) noexcept
             hold_release_ = 0;
         } else if (hold_known) {
             hold_release_ = h.release;
-            hold_x_ = x;
+            hold_x_lo_ = x_lo;
+            hold_x_hi_ = x_hi;
             hold_taken_ = false;
         }
     }
-    const int64_t tail = calc_ok ? std::max<int64_t>(0, e.enq - fr) : 0; // after the last Wait
-    const int64_t start = calc_ok ? std::max(e.enq, fr) : 0;
+    const int64_t tail_lo = calc_ok ? pos(e.enq - fr_hi) : 0; // after the last Wait
+    const int64_t tail_hi = calc_ok ? pos(e.enq - fr_lo) : 0;
+    const int64_t start_lo = calc_ok ? std::max(e.enq, fr_lo) : 0;
+    const int64_t start_hi = calc_ok ? std::max(e.enq, fr_hi) : 0;
+    bool stamped = has_done || used_wait;
 
     if (calc_ok) {
-        const int64_t margin = start - e.enq;
-        if (!f.has_margin || margin < f.min_margin) f.min_margin = margin;
+        stamped = true;
+        // The widths that reach a computed field: the predecessor's only through the frame's first gap / cycle (the
+        // position fields), the rest through the results they can change (an interval that lies before the enqueue
+        // changes nothing: a gap of 0 and a margin of 0 are exact).
+        if (e.first_in_frame) late = std::max(late, p_hi - p_lo);
+        late = std::max(late, start_hi - start_lo);
+        late = std::max(late, (gaps_hi + tail_hi) - (gaps_lo + tail_lo));
+        const int64_t margin_lo = start_lo - e.enq;
+        if (!f.has_margin || margin_lo < f.min_margin_lo) f.min_margin_lo = margin_lo;
         f.has_margin = true;
-        f.wait_ticks += std::max<int64_t>(0, start - std::max(e.enq, prev));
-        f.idle_ticks += idle;
+        f.wait_lo += pos(start_lo - std::max(e.enq, p_hi));
+        f.idle_lo += idle_lo;
     } else {
         f.ok_margin = false;
         if (m > 0) {
@@ -705,48 +1059,64 @@ void GpuQueueProbeCore::ApplyResolved(Entry& e, Frame& f) noexcept
 
     if (e.first_in_frame) {
         f.first_start_valid = calc_ok;
-        f.first_start = start;
+        f.first_start = start_hi;
         f.first_prev_known = known;
-        f.first_prev_done = prev;
-        if (known) f.gap_ticks += std::max<int64_t>(0, e.enq - prev);
+        f.first_prev_done = p_hi;
+        f.first_prev_lo = p_lo;
+        if (known) f.gap_lo += pos(e.enq - p_hi);
         else f.ok_gap = f.ok_empty = false;
         if (calc_ok) {
             f.boundary_valid = true;
-            f.boundary_idle_ticks = tail;
+            f.boundary_idle_lo = tail_lo;
+            f.boundary_idle_hi = tail_hi;
         }
     } else if (calc_ok) {
-        f.empty_ticks += gaps + tail;
+        f.empty_lo += gaps_lo + tail_lo;
+        f.empty_hi += gaps_hi + tail_hi;
     } else {
         f.ok_empty = false;
     }
 
     // Submissions queued behind ReLimiter's hold: after it in queue order, arriving before its
-    // release; the hold blocks nothing before the queue reached it (hold_x_).
-    const int64_t reach = std::max(e.enq, hold_x_);
-    const bool behind = hold_release_ > reach;
-    if (behind && !hold_taken_) {
-        f.hold_ticks += hold_release_ - reach;
+    // release; the hold blocks nothing before the queue reached it (hold_x).
+    const int64_t reach_lo = std::max(e.enq, hold_x_lo_);
+    const int64_t reach_hi = std::max(e.enq, hold_x_hi_);
+    const bool behind_possible = hold_release_ > reach_lo;
+    const bool behind_certain = hold_release_ > reach_hi;
+    if (behind_possible && !hold_taken_) {
+        f.hold_lo += pos(hold_release_ - reach_hi);
         hold_taken_ = true;
+        late = std::max(late, reach_hi - reach_lo);
+        stamped = true;
     }
     if (calc_ok) {
-        const int64_t ref = behind ? std::max(e.enq, hold_release_) : e.enq;
-        const int64_t free_margin = std::max<int64_t>(0, start - ref);
-        if (!f.has_free || free_margin < f.min_free) f.min_free = free_margin;
+        // The bracket of this submission's free margin: start - max(e, release) behind the hold, start - e otherwise.
+        const int64_t ref_lo = behind_certain ? std::max(e.enq, hold_release_) : e.enq;
+        const int64_t ref_hi = behind_possible ? std::max(e.enq, hold_release_) : e.enq;
+        const int64_t b_lo = pos(start_lo - ref_hi);
+        const int64_t b_hi = pos(start_hi - ref_lo);
+        if (!f.has_free) {
+            f.free_lo = b_lo;
+            f.free_hi = b_hi;
+            f.free_mid2 = b_lo + b_hi;
+        } else {
+            f.free_lo = std::min(f.free_lo, b_lo);
+            f.free_hi = std::min(f.free_hi, b_hi);
+            f.free_mid2 = std::min(f.free_mid2, b_lo + b_hi);
+        }
         f.has_free = true;
     }
 
-    if (e.done_value != 0) {
-        int64_t d = e.done_stamp;
-        if (known && d < prev) {
-            d = prev; // a completion cannot precede an earlier one on the same queue
-            stamps_clamped_.fetch_add(1, std::memory_order_relaxed);
-        }
-        prev_done_ = d;
+    if (has_done) {
+        prev_lo_ = d_lo;
+        prev_hi_ = d_hi;
         prev_known_ = true;
-        f.last_done = d;
+        f.last_done = d_hi;
+        f.last_lo = d_lo;
+        f.last_awaited = awaited;
         f.last_done_valid = true;
         stamped = true;
-        late = std::max(late, e.done_late_us);
+        late = std::max(late, d_hi - d_lo);
     } else {
         prev_known_ = false;
         f.last_done_valid = false;
@@ -754,7 +1124,7 @@ void GpuQueueProbeCore::ApplyResolved(Entry& e, Frame& f) noexcept
     }
     if (stamped) {
         f.any_stamp = true;
-        f.late_us = std::max(f.late_us, std::max(late, wake_us_));
+        f.late_ticks = std::max(f.late_ticks, late);
     }
 }
 
@@ -765,7 +1135,7 @@ void GpuQueueProbeCore::AbandonFrame(uint64_t frame_seq) noexcept
         if (e.frame_seq != frame_seq) continue;
         // Only the hold's release missing: account it, with the hold fields invalid. Anything
         // else missing: give the submission up.
-        if ((e.done_value == 0 || e.has_done_stamp) && WaitsStamped(e) && HoldPending(e)) e.hold_forced = true;
+        if ((e.done_value == 0 || e.done.untrusted || e.done.has_hi) && WaitsSettled(e) && HoldPending(e)) e.hold_forced = true;
         else e.abandoned = true;
     }
     Resolve();
@@ -778,12 +1148,14 @@ void GpuQueueProbeCore::Fill(const Frame& f, PacingGpuQueueRecord* out) const no
     out->present_sequence = f.present_sequence;
     out->key = f.key;
     out->law_hold_sequence = f.law_hold_sequence; // carried by every record, valid or not
+    out->borrowed_submits = static_cast<uint16_t>(f.borrowed > 0xFFFFu ? 0xFFFFu : f.borrowed); // like law_hold_sequence: every record
     if (f.dropped || f.overlap || f.ambiguous) return; // events are missing or ambiguous: no column can be trusted
     uint32_t v = PacingGpuQueueRecord::kSubmits | PacingGpuQueueRecord::kFirstSubmit |
                  PacingGpuQueueRecord::kLastSubmit;
     out->submits = f.n;
     out->first_submit_qpc = f.first_enq;
     out->last_submit_qpc = f.last_enq;
+    double late_us = Us(f.late_ticks);
     if (f.first_start_valid) {
         v |= PacingGpuQueueRecord::kFirstStart;
         out->first_start_qpc = f.first_start;
@@ -794,48 +1166,68 @@ void GpuQueueProbeCore::Fill(const Frame& f, PacingGpuQueueRecord* out) const no
     }
     if (f.ok_empty) {
         v |= PacingGpuQueueRecord::kEmpty;
-        out->empty_us = Us(f.empty_ticks);
+        out->empty_us = Us(f.empty_lo);
+        out->empty_hi_us = Us(f.empty_hi);
     }
     if (f.ok_gap) {
         v |= PacingGpuQueueRecord::kFirstGap;
-        out->first_gap_us = Us(f.gap_ticks);
-    }
-    if (f.any_stamp) {
-        v |= PacingGpuQueueRecord::kStampLate;
-        out->stamp_late_us = f.late_us;
+        out->first_gap_us = Us(f.gap_lo);
     }
     if (f.ok_margin && f.has_margin) {
         v |= PacingGpuQueueRecord::kMinMargin;
-        out->min_margin_us = Us(f.min_margin);
+        out->min_margin_us = Us(f.min_margin_lo);
     }
     if (f.ok_margin && f.ok_free && f.has_free) {
         v |= PacingGpuQueueRecord::kMinMarginFree;
-        out->min_margin_free_us = Us(f.min_free);
+        // The scalar the law reads (SetMarginEnd / developer key unified_queue_margin_end):
+        // the minimum of the bracket midpoints (default), or of the lower ends. The true minimum
+        // lies in [min of the lower ends, min of the upper ends]; err is how far the scalar can be from it.
+        const double lo = Us(f.free_lo);
+        const double hi = Us(f.free_hi);
+        const double mid = Us(f.free_mid2) / 2.0;
+        const double scalar = margin_end_ == kMarginEndLower ? lo : mid;
+        out->min_margin_free_us = scalar;
+        out->min_margin_free_lo_us = lo;
+        out->min_margin_free_hi_us = hi;
+        out->min_margin_err_us = std::max(scalar - lo, hi - scalar);
+        late_us = std::max(late_us, out->min_margin_err_us);
+    }
+    if (f.any_stamp) {
+        v |= PacingGpuQueueRecord::kStampLate;
+        out->stamp_late_us = late_us;
     }
     if (f.ok_wait) {
         v |= PacingGpuQueueRecord::kWaitBlock;
-        out->wait_block_us = Us(f.wait_ticks);
+        out->wait_block_us = Us(f.wait_lo);
     }
     if (f.ok_idle) {
         v |= PacingGpuQueueRecord::kWaitIdle;
-        out->wait_idle_us = Us(f.idle_ticks);
+        out->wait_idle_us = Us(f.idle_lo);
     }
     if (f.ok_hold) {
         v |= PacingGpuQueueRecord::kHoldBlock;
-        out->hold_block_us = Us(f.hold_ticks);
+        out->hold_block_us = Us(f.hold_lo);
     }
     if (f.boundary_valid) {
         v |= PacingGpuQueueRecord::kBoundaryIdle;
-        out->boundary_idle_us = Us(f.boundary_idle_ticks);
+        out->boundary_idle_us = Us(f.boundary_idle_lo);
+        out->boundary_idle_hi_us = Us(f.boundary_idle_hi);
     }
     if (f.last_done_valid && f.first_prev_known) {
         v |= PacingGpuQueueRecord::kCycle;
-        out->cycle_us = Us(f.last_done - f.first_prev_done);
+        // Both ends are upper bounds (positions): the difference errs by at most the larger of their widths. Never
+        // negative: a later upper bound that is looser than an earlier one must not make the cycle negative.
+        out->cycle_us = Us(std::max<int64_t>(0, f.last_done - f.first_prev_done));
+        // The two completions that make the cycle: its interval is as wide as both of them together.
+        const int64_t cycle_lo = std::max<int64_t>(0, f.last_lo - f.first_prev_done);
+        const int64_t cycle_hi = std::max<int64_t>(0, f.last_done - f.first_prev_lo);
+        late_us = std::max(late_us, Us(cycle_hi - cycle_lo));
+        if (f.any_stamp) out->stamp_late_us = late_us;
     }
     out->valid = v;
 }
 
-bool GpuQueueProbeCore::FinishOldest(bool force, PacingGpuQueueRecord* out, bool* produced) noexcept
+bool GpuQueueProbeCore::FinishOldest(bool force, PacingGpuQueueRecord* out, bool* produced, FrameInterval* seam) noexcept
 {
     *produced = false;
     if (frame_tail_ >= frame_open_) return false;
@@ -850,6 +1242,10 @@ bool GpuQueueProbeCore::FinishOldest(bool force, PacingGpuQueueRecord* out, bool
     if (f.unresolved > 0) AbandonFrame(frame_tail_);
     if (merge_open_ && merge_seq_ == frame_tail_) merge_open_ = false;
     frames_.fetch_add(1, std::memory_order_relaxed);
+    if (f.last_done_valid) {
+        // What the frame's last (boundary) marker got: its awaited wake, or observation intervals only.
+        (f.last_awaited ? boundary_awaited_ : boundary_observed_).fetch_add(1, std::memory_order_relaxed);
+    }
     if (f.incomplete || f.dropped || f.overlap || f.ambiguous)
         frames_incomplete_.fetch_add(1, std::memory_order_relaxed);
     if (!f.tagged) {
@@ -865,6 +1261,15 @@ bool GpuQueueProbeCore::FinishOldest(bool force, PacingGpuQueueRecord* out, bool
         NoteIdentity(f);
         if (out != nullptr) {
             Fill(f, out);
+            if (seam != nullptr) {
+                *seam = FrameInterval{};
+                seam->boundary_awaited = f.last_awaited;
+                if ((out->valid & PacingGpuQueueRecord::kCycle) != 0) {
+                    seam->valid = true;
+                    seam->cycle_lo_us = Us(std::max<int64_t>(0, f.last_lo - f.first_prev_done));
+                    seam->cycle_hi_us = Us(std::max<int64_t>(0, f.last_done - f.first_prev_lo));
+                }
+            }
             if (irregular_pending_ > 0) {
                 --irregular_pending_;
                 frames_invalidated_.fetch_add(1, std::memory_order_relaxed);
@@ -877,12 +1282,12 @@ bool GpuQueueProbeCore::FinishOldest(bool force, PacingGpuQueueRecord* out, bool
     return true;
 }
 
-bool GpuQueueProbeCore::PopFrame(PacingGpuQueueRecord* out) noexcept
+bool GpuQueueProbeCore::PopFrame(PacingGpuQueueRecord* out, FrameInterval* seam) noexcept
 {
     if (out == nullptr) return false;
     for (;;) {
         bool produced = false;
-        if (!FinishOldest(false, out, &produced)) return false;
+        if (!FinishOldest(false, out, &produced, seam)) return false;
         if (produced) return true;
     }
 }
@@ -903,14 +1308,14 @@ void GpuQueueProbeCore::Flush() noexcept
 GpuQueueProbeCore::Counters GpuQueueProbeCore::Statistics() const noexcept
 {
     Counters c{};
-    c.pushed = pushed_.load(std::memory_order_relaxed);
+    c.pushed = head_.load(std::memory_order_relaxed); // every accepted event claims one position: no separate counter
     c.dropped = dropped_.load(std::memory_order_relaxed);
     c.frames = frames_.load(std::memory_order_relaxed);
     c.frames_incomplete = frames_incomplete_.load(std::memory_order_relaxed);
     c.frames_untagged = frames_untagged_.load(std::memory_order_relaxed);
-    c.stamps_clamped = stamps_clamped_.load(std::memory_order_relaxed);
+    c.intervals_inconsistent = intervals_inconsistent_.load(std::memory_order_relaxed);
     c.stamps_orphaned = stamps_orphaned_.load(std::memory_order_relaxed);
-    c.parked_overflow = parked_overflow_.load(std::memory_order_relaxed);
+    c.parked_watermark = parked_watermark_.load(std::memory_order_relaxed);
     c.frames_overlap = frames_overlap_.load(std::memory_order_relaxed);
     c.waits_dropped = waits_dropped_.load(std::memory_order_relaxed);
     c.holds_unmatched = holds_unmatched_.load(std::memory_order_relaxed);
@@ -920,5 +1325,9 @@ GpuQueueProbeCore::Counters GpuQueueProbeCore::Statistics() const noexcept
     c.join_missing = join_missing_.load(std::memory_order_relaxed);
     c.irregular_boundary_events = irregular_events_.load(std::memory_order_relaxed);
     c.frames_invalidated_by_irregular_boundary = frames_invalidated_.load(std::memory_order_relaxed);
+    c.markers_untrusted = markers_untrusted_.load(std::memory_order_relaxed);
+    c.awaited_lo_rejected = awaited_lo_rejected_.load(std::memory_order_relaxed);
+    c.boundary_markers_awaited = boundary_awaited_.load(std::memory_order_relaxed);
+    c.boundary_markers_by_observation = boundary_observed_.load(std::memory_order_relaxed);
     return c;
 }

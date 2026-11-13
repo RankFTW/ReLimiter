@@ -612,7 +612,7 @@ void TestRuntime() {
     complete_gpu(); Poll(false);
     CHECK(retiring->ownership.load()==GpuTimestampOwnership::Free);
 
-    // gpu_start_probe (spec 8): the record belongs to the Present of its frame. A Present's end
+    // gpu_start_probe: the record belongs to the Present of its frame. A Present's end
     // queues the queue (ArmStartProbe), the frame's RENDERSUBMIT_START arms it
     // (GpuReadiness_ArmProbeForFrame, the pin moves), the first submission on the armed
     // queue stamps the frame on the record (the ReShade queue object that
@@ -740,7 +740,7 @@ void TestRuntime() {
         registered.faulted=false;
         CHECK(!s_probe_queue.load() && !s_probe_armed.load() && registered.scope_pins.load()==pins);
 
-        // An arm is immutable once claimed (spec 8, review P1): a submitter that claimed
+        // An arm is immutable once claimed: a submitter that claimed
         // frame 910 and is paused before its Signal still stamps frame 910 when a later Present
         // and marker (frame 911) come for the same queue; that arm is skipped, not written over,
         // and its pin is given back.

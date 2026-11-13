@@ -1,8 +1,5 @@
 # Manual / Integration Test Procedures: Scheduler Passthrough
 
-**Feature**: dmfg-passthrough, Task 3.3
-**Validates**: Requirements 4.1, 4.2, 4.3, 5.1, 5.2
-
 ## Why Manual Testing Is Needed
 
 The scheduler (`OnMarker`) and enforcement dispatcher (`EnfDisp_OnPresent`) are
@@ -20,7 +17,7 @@ Telemetry Logging). `source_flags` bits: 1 slept, 8 fixed refresh,
 
 ---
 
-## Test 1: OnMarker Early-Returns During DMFG (Req 4.1)
+## Test 1: OnMarker Early-Returns During DMFG
 
 **Preconditions**:
 - RTX 50-series GPU with DLSS 4.5 driver
@@ -42,7 +39,7 @@ Confirm frame times ARE clamped to the limiter target as before.
 
 ---
 
-## Test 2: OnMarker Still Runs Health and Records Every Release During DMFG (Req 4.2, 4.3)
+## Test 2: OnMarker Still Runs Health and Records Every Release During DMFG
 
 **Preconditions**: Same as Test 1
 
@@ -59,7 +56,7 @@ Confirm frame times ARE clamped to the limiter target as before.
 
 ---
 
-## Test 3: EnfDisp_OnPresent Skips Enforcement During DMFG (Req 5.1)
+## Test 3: EnfDisp_OnPresent Skips Enforcement During DMFG
 
 **Preconditions**: Same as Test 1, using a present-based enforcement path
 (DX11 game without Reflex, or DX12 game without NvAPI markers)
@@ -74,7 +71,7 @@ Confirm frame times ARE clamped to the limiter target as before.
 
 ---
 
-## Test 4: EnfDisp_OnPresent Still Updates FPS Window During DMFG (Req 5.2)
+## Test 4: EnfDisp_OnPresent Still Updates FPS Window During DMFG
 
 **Preconditions**: Same as Test 1
 
@@ -107,7 +104,7 @@ Confirm frame times ARE clamped to the limiter target as before.
 
 ---
 
-## Test 6: Telemetry Continues During DMFG Passthrough (Req 10.1)
+## Test 6: Telemetry Continues During DMFG Passthrough
 
 **Preconditions**: Same as Test 1
 
@@ -127,7 +124,7 @@ Confirm frame times ARE clamped to the limiter target as before.
 
 ---
 
-## Test 7: OSD Metrics Continue Rendering During DMFG (Req 10.2)
+## Test 7: OSD Metrics Continue Rendering During DMFG
 
 **Preconditions**: Same as Test 1, OSD enabled
 

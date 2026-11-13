@@ -11,6 +11,12 @@ void StreamlineQueue_Offer(const StreamlineComEvidence&) noexcept;
 // the same detours.
 bool StreamlineQueue_EnsureHooks(const std::array<uint64_t, 3>& methods) noexcept;
 void StreamlineQueue_SetFeatureModule(void* options, void* state) noexcept;
+// The original (native) ID3D12CommandQueue::Signal behind the shared detour; null until the hooks are installed. The
+// gpu_queue_probe's own Signals call it directly, so they never re-enter the detour (nothing observes them).
+struct ID3D12CommandQueue;
+struct ID3D12Fence;
+using StreamlineQueue_SignalFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
+StreamlineQueue_SignalFn StreamlineQueue_NativeSignal() noexcept;
 void StreamlineQueue_BlockFeature() noexcept;
 void StreamlineQueue_Drain(bool final = false) noexcept;
 // The GPU gate's own queue calls (Wait, timestamps, retirement Signal) made

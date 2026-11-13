@@ -6,6 +6,7 @@
 #include "ngx_hooks.h"
 #include "hooks.h"
 #include "loadlib_hooks.h"
+#include "module_presence.h"
 #include "config.h"
 #include "dlss_presets.h"
 #include "flush.h"
@@ -174,9 +175,13 @@ static void UpdateConfiguredFGActivity(bool configuration_changed, uint32_t mode
     }
 }
 
-static sl_Result __cdecl Detour_SetOptions(const void* vp, const void* opts) {
-    const bool runtime_stopping = RuntimeLifecycle_EnterCallback();
-    __try {
+// The lifecycle callback bracket lives in a thin wrapper that leaves its guarded
+// block by falling through. A `return` from inside a __try/__finally runs
+// _local_unwind -> RtlUnwind on every call (0.3 to 0.4 ms/s on the presenting thread,
+// profile); a normal exit runs the termination handler inline. The body
+// is out of line so the wrapper's only exit from the block is the fall-through.
+__declspec(noinline) static sl_Result SetOptionsBody(
+    const void* vp, const void* opts, bool runtime_stopping) {
     if (runtime_stopping)
         return s_orig_SetOptions.load(std::memory_order_acquire)
             ? s_orig_SetOptions.load(std::memory_order_acquire)(vp, opts) : -1;
@@ -283,15 +288,22 @@ static sl_Result __cdecl Detour_SetOptions(const void* vp, const void* opts) {
         LOG_WARN("Detour_SetOptions: SEH exception caught, skipping state read");
     }
     return result;
+}
+
+static sl_Result __cdecl Detour_SetOptions(const void* vp, const void* opts) {
+    const bool runtime_stopping = RuntimeLifecycle_EnterCallback();
+    sl_Result result = -1;
+    __try {
+        result = SetOptionsBody(vp, opts, runtime_stopping);
     }
     __finally {
         RuntimeLifecycle_LeaveCallback();
     }
+    return result;
 }
 
-static sl_Result __cdecl Detour_GetState(const void* vp, void* state, const void* options) {
-    const bool runtime_stopping = RuntimeLifecycle_EnterCallback();
-    __try {
+__declspec(noinline) static sl_Result GetStateBody(
+    const void* vp, void* state, const void* options, bool runtime_stopping) {
     if (runtime_stopping)
         return s_orig_GetState.load(std::memory_order_acquire)
             ? s_orig_GetState.load(std::memory_order_acquire)(vp, state, options) : -1;
@@ -443,10 +455,18 @@ static sl_Result __cdecl Detour_GetState(const void* vp, void* state, const void
         LOG_WARN("Detour_GetState: SEH exception caught, skipping state read");
     }
     return result;
+}
+
+static sl_Result __cdecl Detour_GetState(const void* vp, void* state, const void* options) {
+    const bool runtime_stopping = RuntimeLifecycle_EnterCallback();
+    sl_Result result = -1;
+    __try {
+        result = GetStateBody(vp, state, options, runtime_stopping);
     }
     __finally {
         RuntimeLifecycle_LeaveCallback();
     }
+    return result;
 }
 
 // ── Detour: slGetFeatureFunction — use MinHook on resolved pointers ──
@@ -456,9 +476,8 @@ static sl_Result __cdecl Detour_GetState(const void* vp, void* state, const void
 static std::atomic<uint64_t> s_captured_viewport{0};
 
 // Compat-mode SetOptions detour — only captures viewport, forwards unmodified
-static sl_Result __cdecl Detour_SetOptions_Compat(const void* vp, const void* opts) {
-    const bool runtime_stopping = RuntimeLifecycle_EnterCallback();
-    __try {
+__declspec(noinline) static sl_Result SetOptionsCompatBody(
+    const void* vp, const void* opts, bool runtime_stopping) {
     if (runtime_stopping)
         return s_orig_SetOptions.load(std::memory_order_acquire)
             ? s_orig_SetOptions.load(std::memory_order_acquire)(vp, opts) : -1;
@@ -558,10 +577,18 @@ static sl_Result __cdecl Detour_SetOptions_Compat(const void* vp, const void* op
     }
 
     return result;
+}
+
+static sl_Result __cdecl Detour_SetOptions_Compat(const void* vp, const void* opts) {
+    const bool runtime_stopping = RuntimeLifecycle_EnterCallback();
+    sl_Result result = -1;
+    __try {
+        result = SetOptionsCompatBody(vp, opts, runtime_stopping);
     }
     __finally {
         RuntimeLifecycle_LeaveCallback();
     }
+    return result;
 }
 
 bool Streamline_HasModeData() {
@@ -816,11 +843,8 @@ bool HookStreamlinePCL(HMODULE hInterposer) {
 // ── DMFG detection functions ──
 
 bool IsFGDllLoaded() {
-    if (GetModuleHandleW(L"nvngx_dlssg.dll"))  return true;
-    if (GetModuleHandleW(L"_nvngx_dlssg.dll")) return true;
-    if (GetModuleHandleW(L"sl.dlss_g.dll"))    return true;
-    if (GetModuleHandleW(L"dlss-g.dll"))       return true;
-    return false;
+    // Published by the loader scan (module_presence.h): no loader query per call.
+    return ModulePresence_FrameGenerationRuntime();
 }
 
 bool IsDmfgSession() {
@@ -839,5 +863,5 @@ bool IsDmfgActive() {
 }
 
 bool IsNvSmoothMotionActive() {
-    return GetModuleHandleW(L"nvpresent64.dll") != nullptr;
+    return ModulePresence_SmoothMotion();
 }

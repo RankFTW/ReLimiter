@@ -180,7 +180,7 @@ class ProfileTests(unittest.TestCase):
                          ["governor_step", "governor_interval_us", "plan_signal_advance_us"])
         # Q16: the gate pre-Wait time is appended after them.
         self.assertEqual(inspector.CURRENT_PACING_HEADER[PHASE3_ROW_COLUMNS:Q16_ROW_COLUMNS], ["gate_pre_wait_qpc"])
-        # Phase 4 (P4-15): the placement columns are appended after it.
+        # Phase 4: the placement columns are appended after it.
         self.assertEqual(inspector.CURRENT_PACING_HEADER[Q16_ROW_COLUMNS:PHASE4_ROW_COLUMNS],
                          ["source_placement", "pre_sleep_end_qpc", "pre_sleep_margin_us"])
         # The wait starts (gated holds, 2026-10-08) are appended after them.

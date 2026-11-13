@@ -5,6 +5,7 @@
 // means unknown. *_us fields in PacingReflexRecord hold NVIDIA driver
 // microseconds, not QPC, unless a name says otherwise.
 
+#include <cmath>
 #include <cstdint>
 
 enum class PacingIdentityDomain : uint8_t {
@@ -330,6 +331,24 @@ struct PacingGpuQueueRecord {
     // the frame generation input, 3 the render queue the presenting queue depends on (found by
     // per-frame fence dependencies). Set when the record is pushed; CSV column gq_queue_role.
     uint8_t queue_role = 0;
+    // Submissions of the frame whose completion marker was the game's own Signal (borrowed, set by
+    // the probe); 0 when the probe marked every submission itself. Low part of CSV column 197, whose
+    // header name up_ql_rt_spread_us is historical.
+    uint16_t borrowed_submits = 0;
+    // Upper ends of the probe's tail-stamp uncertainty: the existing scalar fields empty_us,
+    // boundary_idle_us and min_margin_free_us are the LOWER ends; these are the upper ends, so the
+    // true value lies in [lower, upper]. NaN = unknown; set only with the matching valid bit. CSV
+    // columns 187, 188, 189 (header names historical).
+    double empty_hi_us = NAN, boundary_idle_hi_us = NAN, min_margin_free_hi_us = NAN;
+    // Worker registrations since the previous record was popped. High part of CSV column 197.
+    uint16_t registrations = 0;
+    // Free-margin bracket summary (the scalar min_margin_free_us is the law's input): min_margin_free_us =
+    // the minimum over the fed submissions of the bracket midpoints; min_margin_free_lo_us = the minimum of
+    // the lower ends; min_margin_free_hi_us = the minimum of the upper ends; min_margin_err_us =
+    // max(S - lo_min, hi_min - S) with S = min_margin_free_us, lo_min = min_margin_free_lo_us and
+    // hi_min = min_margin_free_hi_us, so the reported scalar is within err of the true minimum.
+    // NaN = unknown; set only with kMinMarginFree. CSV columns 196 and 198.
+    double min_margin_free_lo_us = NAN, min_margin_err_us = NAN;
     // The queue law's hold identity: the sequence the law assigned to the grant of the hold this frame's work was
     // queued behind, announced with the hold (GpuQueueProbe_OnHoldAnnounce); 0 = no law hold was announced for the
     // frame. Not written to the CSV; the law's record debit names this sequence.

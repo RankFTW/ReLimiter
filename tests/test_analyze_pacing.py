@@ -385,7 +385,7 @@ class EventsTests(TemporaryDirectoryTest):
         ]
 
     def test_plan_events(self):
-        # grid_epoch, pipeline_change and stall_injected (phase2_timing_core_design.md section 5).
+        # grid_epoch, pipeline_change and stall_injected.
         def event(sequence, event_type, qpc, **cells):
             row = dict(sequence=str(sequence), capture_epoch="1", event_type=event_type,
                        event_qpc=str(qpc), qpc_frequency=str(FREQUENCY))
@@ -703,7 +703,7 @@ class Phase2AcceptanceTests(TemporaryDirectoryTest):
 
 
 class Phase3ControllerTests(TemporaryDirectoryTest):
-    """Golden controllers summary (phase3_controllers_design.md P3-14), hand-computed.
+    """Golden controllers summary, hand-computed.
     Ten source frames at 10 ms: frames 1, 2, 10 at k = 0, frames 3, 4, 7 at
     k = 1, frames 5, 6 at k = 2 (overload flag 64 on 3-7), frame 8 an ungoverned
     idle-cap plan and frame 9 passthrough. Frame 5 has a second (repeated)
@@ -796,7 +796,7 @@ class Phase3ControllerTests(TemporaryDirectoryTest):
             "available": True,
             "frames": 10,
             "governed_frames": 8,
-            # Pre-Phase-4 files keep the ladder semantics (P4-6 changed governor_step).
+            # Pre-Phase-4 files keep the ladder semantics (Phase 4 changed governor_step).
             "governor": {"available": False,
                          "reason": "pre-Phase-4 file: governor_step is the Phase 3 ladder step k in 0..10",
                          "ladder_step_frames": {"0": 3, "1": 3, "2": 2}},
@@ -912,9 +912,8 @@ class Phase3ControllerTests(TemporaryDirectoryTest):
 
 
 class Phase4PlacementTests(TemporaryDirectoryTest):
-    """Golden Phase 4 governor stretch and source-placement summary
-    (phase4_design.md P4-6, P4-15), hand-computed. Eight source frames at
-    10 ms (release r); 1 tick = 0.1 us.
+    """Golden Phase 4 governor stretch and source-placement summary,
+    hand-computed. Eight source frames at 10 ms (release r); 1 tick = 0.1 us.
     Frame 1 marker, frame 7 driver_limiter, frame 8 passthrough (none, not
     governed); frames 2-6 pre_sleep with the pre_sleep flag (2):
     (residual = marker − e, trim = release − marker, margin, wake T − L) in us:
@@ -968,7 +967,7 @@ class Phase4PlacementTests(TemporaryDirectoryTest):
                        event_qpc=str(qpc), qpc_frequency=str(FREQUENCY))
             row.update({name: str(value) for name, value in cells.items()})
             return row
-        # One governor_step event per phase transition (P4-6), not per percent.
+        # One governor_step event per phase transition, not per percent.
         events = [
             event("", "capture_start", 100_000_000, csv_row_drops=0, csv_event_drops=0),
             event(1, "governor_step", 100_000_000, value=0, reason=0),  # capture-start state
@@ -1084,7 +1083,7 @@ class InspectorTests(TemporaryDirectoryTest):
                          "relimiter_pacing_events")
 
     def test_appended_phase1_columns(self):
-        # phase1_purge_design.md section 3: append-only after the Phase 0 tables.
+        # Append-only after the Phase 0 tables.
         rows = column_names("PACING_ROW_COLUMNS")
         events = column_names("PACING_EVENT_COLUMNS")
         self.assertEqual((len(rows), len(events)), (199, 86))
@@ -1097,7 +1096,7 @@ class InspectorTests(TemporaryDirectoryTest):
         self.assertEqual(list(pacing.PCL_LOSS_COLUMNS), events[81:85])
 
     def test_appended_phase2_columns(self):
-        # phase2_timing_core_design.md section 5: append-only after the Phase 1 tables.
+        # Append-only after the Phase 1 tables.
         rows = column_names("PACING_ROW_COLUMNS")
         events = column_names("PACING_EVENT_COLUMNS")
         self.assertEqual(rows[122:129], ["grid_epoch", "grid_index", "plan_output_target_qpc", "plan_lead_us",
@@ -1106,7 +1105,7 @@ class InspectorTests(TemporaryDirectoryTest):
         self.assertEqual(tuple(pacing.PLAN_COLUMNS), ("plan_rung", "plan_status", "display_source"))
 
     def test_appended_phase3_columns(self):
-        # phase3_controllers_design.md P3-14: append-only after display_source; events unchanged.
+        # Append-only after display_source; events unchanged.
         rows = column_names("PACING_ROW_COLUMNS")
         self.assertEqual(rows[129:132], ["governor_step", "governor_interval_us", "plan_signal_advance_us"])
         self.assertEqual(rows[129:132], list(pacing.CONTROLLER_COLUMNS))
@@ -1115,7 +1114,7 @@ class InspectorTests(TemporaryDirectoryTest):
         self.assertEqual(len(column_names("PACING_EVENT_COLUMNS")), 86)
 
     def test_appended_phase4_columns(self):
-        # phase4_design.md P4-15: append-only after gate_pre_wait_qpc; events unchanged.
+        # Append-only after gate_pre_wait_qpc; events unchanged.
         rows = column_names("PACING_ROW_COLUMNS")
         self.assertEqual(rows[133:136], ["source_placement", "pre_sleep_end_qpc", "pre_sleep_margin_us"])
         self.assertEqual(rows[133:136], list(pacing.PLACEMENT_COLUMNS))

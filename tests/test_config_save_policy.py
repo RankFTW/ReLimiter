@@ -213,6 +213,7 @@ class ConfigSavePolicyTests(unittest.TestCase):
                                   "unified_every_frame_service", "unified_queue_target_us",
                                   "unified_hold_share", "unified_queue_law", "unified_queue_rank",
                                   "unified_queue_need_frames", "gpu_queue_probe_source", "unified_queue_upstream",
+                                  "unified_queue_margin_end",
                                   "unified_queue_allow_us"})
         mapping = dict(re.findall(r"\bpipeline\.(\w+)\s*=\s*config\.(\w+);",
                                   body("PacingPipelineConfigFrom")))
@@ -242,6 +243,7 @@ class ConfigSavePolicyTests(unittest.TestCase):
                                    "unified_queue_need_frames": "unified_queue_need_frames",
                                    "gpu_queue_probe_source": "gpu_queue_probe_source",
                                    "unified_queue_upstream": "unified_queue_upstream",
+                                   "unified_queue_margin_end": "unified_queue_margin_end",
                                    "unified_queue_allow_us": "unified_queue_allow_us"})
         # The OSD applies pipeline edits through the same function.
         for name, text in (("config.cpp", SOURCE), ("osd.cpp", OSD)):
@@ -270,6 +272,7 @@ class ConfigSavePolicyTests(unittest.TestCase):
         self.assertRegex(validate, r"g_config\.unified_queue_need_frames,\s*1,\s*kPacingUnifiedQueueNeedFramesMax")
         self.assertRegex(validate, r"g_config\.unified_queue_upstream,\s*0,\s*kPacingUnifiedQueueUpstreamMax")
         self.assertRegex(validate, r"g_config\.gpu_queue_probe_source,\s*0,\s*kPacingGpuQueueProbeSourceMax")
+        self.assertRegex(validate, r"g_config\.unified_queue_margin_end,\s*0,\s*kPacingUnifiedQueueMarginEndMax")
         self.assertRegex(validate, r"g_config\.unified_queue_allow_us,\s*0,\s*kPacingUnifiedQueueAllowMaxUs")
         writer = body("WriteConfigSnapshot")
         self.assertIn('"smoothing", PacingSmoothing_Text(config.smoothing)', writer)

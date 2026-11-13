@@ -350,6 +350,7 @@ namespace
         std::atomic<int> unified_queue_need_frames{ kDefaultConfig.unified_queue_need_frames };
         std::atomic<int> gpu_queue_probe_source{ kDefaultConfig.gpu_queue_probe_source };
         std::atomic<int> unified_queue_upstream{ kDefaultConfig.unified_queue_upstream };
+        std::atomic<int> unified_queue_margin_end{ kDefaultConfig.unified_queue_margin_end };
         std::atomic<int> unified_queue_allow_us{ kDefaultConfig.unified_queue_allow_us };
         std::atomic<bool> lead_spike_floor{ kDefaultConfig.lead_spike_floor };
         std::atomic<double> stall_inject_ms{ kDefaultConfig.stall_inject_ms };
@@ -390,6 +391,7 @@ namespace
         config.unified_queue_need_frames = s_config.unified_queue_need_frames.load(std::memory_order_relaxed);
         config.gpu_queue_probe_source = s_config.gpu_queue_probe_source.load(std::memory_order_relaxed);
         config.unified_queue_upstream = s_config.unified_queue_upstream.load(std::memory_order_relaxed);
+        config.unified_queue_margin_end = s_config.unified_queue_margin_end.load(std::memory_order_relaxed);
         config.unified_queue_allow_us = s_config.unified_queue_allow_us.load(std::memory_order_relaxed);
         config.lead_spike_floor = s_config.lead_spike_floor.load(std::memory_order_relaxed);
         config.stall_inject_ms = s_config.stall_inject_ms.load(std::memory_order_relaxed);
@@ -572,6 +574,7 @@ PacingPipelineConfig PacingPipeline_ClampConfig(PacingPipelineConfig config) noe
     config.unified_queue_need_frames = std::clamp(config.unified_queue_need_frames, 1, kPacingUnifiedQueueNeedFramesMax);
     config.gpu_queue_probe_source = std::clamp(config.gpu_queue_probe_source, 0, kPacingGpuQueueProbeSourceMax);
     config.unified_queue_upstream = std::clamp(config.unified_queue_upstream, 0, kPacingUnifiedQueueUpstreamMax);
+    config.unified_queue_margin_end = std::clamp(config.unified_queue_margin_end, 0, kPacingUnifiedQueueMarginEndMax);
     config.unified_queue_allow_us = std::clamp(config.unified_queue_allow_us, 0, kPacingUnifiedQueueAllowMaxUs);
     // Developer key gpu_wait_headroom_us: [500, 3000] µs; non-positive or
     // non-finite is the default.
@@ -598,6 +601,7 @@ PacingPipelineConfig PacingPipeline_ClampConfig(PacingPipelineConfig config) noe
         config.unified_queue_law = false;
         config.unified_queue_upstream = kPacingUnifiedQueueUpstreamDefault;
         config.gpu_queue_probe_source = 0;
+        config.unified_queue_margin_end = 0;
     }
     if (config.unified_pacer) {
         config.smoothing = PacingSmoothing::On;
@@ -656,6 +660,7 @@ void PacingPipeline_SetConfig(const PacingPipelineConfig& config) noexcept
     s_config.unified_queue_need_frames.store(safe_config.unified_queue_need_frames, std::memory_order_relaxed);
     s_config.gpu_queue_probe_source.store(safe_config.gpu_queue_probe_source, std::memory_order_relaxed);
     s_config.unified_queue_upstream.store(safe_config.unified_queue_upstream, std::memory_order_relaxed);
+    s_config.unified_queue_margin_end.store(safe_config.unified_queue_margin_end, std::memory_order_relaxed);
     s_config.unified_queue_allow_us.store(safe_config.unified_queue_allow_us, std::memory_order_relaxed);
     EndWrite(&s_config.sequence, claimed);
 }

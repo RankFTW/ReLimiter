@@ -145,13 +145,13 @@ bool Scheduler_PlanReflexSleep(int64_t sleep_entry_qpc, int64_t now_qpc, bool dr
 void Scheduler_EndReflexSleep(uint64_t grid_index, int64_t end_qpc) noexcept;
 void Scheduler_EndDriverSleep(int64_t start_qpc, int64_t end_qpc) noexcept;
 
-// ── Unified pacer (developer key unified_pacer; spec 4.1) ──
+// ── Unified pacer (developer key unified_pacer) ──
 // True when the published pipeline places the source at the Sleep hook: placement
 // Unified and mode Vrr, Fixed or Idle. Any thread; one snapshot read.
 bool Scheduler_UnifiedActive() noexcept;
 
-// The Sleep hook's reservation for the next grid index (spec 4.1 "Hook_Sleep under the
-// key" step 3): the start target and the interval the owner computed from the law. `token`
+// The Sleep hook's reservation for the next grid index under the unified_pacer key:
+// the start target and the interval the owner computed from the law. `token`
 // is nonzero and tags the mailbox word.
 struct SchedulerUnifiedReservation {
     uint32_t token = 0;

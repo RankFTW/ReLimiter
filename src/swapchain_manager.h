@@ -40,6 +40,11 @@ ActiveAPI  SwapMgr_GetActiveAPI();
 uint64_t   SwapMgr_GetNativeHandle();   // IDXGISwapChain* or VkSwapchainKHR
 // Returns an AddRef-owned active DXGI device; caller must Release.
 IUnknown*  SwapMgr_AcquirePresentingDevice() noexcept;
+// Publication sequence of the presenting device: every publication (also of the same device
+// again, or of none) advances it by 2, odd while one is in progress. The presenting device is
+// owned by this module while published, so a device acquired between two reads that return
+// the same even value is the one published throughout, and its address is not reused.
+uint64_t   SwapMgr_PresentingDeviceSequence() noexcept;
 bool       SwapMgr_IsPresentingDevice(IUnknown* candidate) noexcept;
 HWND       SwapMgr_GetHWND();
 bool       SwapMgr_IsValid();           // true if a swapchain is cached

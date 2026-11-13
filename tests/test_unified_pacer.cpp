@@ -634,7 +634,7 @@ namespace
 
     void TestEveryFrameServiceCycleInMiniature()
     {
-        // N.42: 40 frames wait at a spacing of 10 ms, then 40 frames at 9.5 ms in
+        // 40 frames wait at a spacing of 10 ms, then 40 frames at 9.5 ms in
         // which the GPU waited 0.8 ms each (queue wait −0.8 ms): the GPU needs 8.7 ms.
         // After k frames of the second phase the newest 32 hold 32 − k of the first.
         Driver off = OptionDriver(false);

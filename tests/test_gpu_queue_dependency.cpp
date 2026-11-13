@@ -10,6 +10,7 @@
 #include <atomic>
 #include <thread>
 #include <vector>
+#include <map>
 
 #define CHECK(value) do { if (!(value)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #value); std::abort(); } } while (false)
 
@@ -830,7 +831,7 @@ void TestLossPoisonsEveryWindowItMayBelongTo() {
     }
 }
 
-// The review's overflow case: eight skipped pulls fill the backlog, the next pull discovers a dropped extra Signal in the
+// The overflow case: eight skipped pulls fill the backlog, the next pull discovers a dropped extra Signal in the
 // newest unresolved frame. The overflow restart keeps the previous pull's loss baseline, so the retained frame and the
 // current one are inside the poison watermark and the window containing the loss does not qualify; the window after it
 // does (all this on the production bound, kBacklog = 8).
@@ -851,7 +852,7 @@ void TestBacklogOverflowKeepsTheLossBaseline() {
 }
 
 // The mirror evicting entries a pending frame needs counts as loss. Reader level: only entries at or after the needed-since
-// mark count. Production level (the review's crowded game): 300 Signals per frame, an early extra Signal of the dependency
+// mark count. Production level (a crowded game): 300 Signals per frame, an early extra Signal of the dependency
 // fence among them; each pull copies fewer than the table holds, but the 512-entry mirror loses the early part of the frame
 // being resolved. Without the mark nothing would be counted and the window would qualify with the extra Signal gone; with
 // it every window fails as lost. An uncrowded run is untouched.
@@ -1280,6 +1281,690 @@ void TestEnumTexts() {
           RoleText(Role::RenderQueueByDependency)[0] == 'r' && RoleText(Role::None)[0] == 'n');
     CHECK(ReasonText(Reason::NotQualifiedHops)[0] != '\0');
 }
+
+// ── The Execute fast path (Tables::NoteExecute: one compare-exchange on the queue's packed word, no lock) ──
+// The fast path must count exactly what the locked path counted: the same rows, lists and calls, the same drops and overflows,
+// the same epoch/clear behaviour. The reference is a plain model of the old locked path, driven by the same randomised script.
+struct Lcg {
+    uint64_t s;
+    explicit Lcg(uint64_t seed) : s(seed * 6364136223846793005ull + 1442695040888963407ull) {}
+    uint32_t Next() {
+        s = s * 6364136223846793005ull + 1442695040888963407ull;
+        return static_cast<uint32_t>(s >> 33);
+    }
+    uint32_t Below(uint32_t n) { return Next() % n; }
+};
+
+struct RowModel {
+    uint64_t lists = 0, calls = 0;
+};
+// The locked path as it was before the fast path: under the lock, a pending clear is applied first, a known queue's row is
+// added to, a new queue takes the next row, a ninth is counted as overflow; without the lock a call is dropped and counted. The
+// one thing that differs by design: a call for a KNOWN row of the current epoch needs no lock (`fast`), so it is counted even
+// while another thread holds the lock.
+struct TablesModel {
+    std::vector<uint64_t> order;
+    std::map<uint64_t, RowModel> rows;
+    bool pending_clear = false, lock_held = false;
+    uint64_t dropped = 0, overflow = 0;
+    void Sync() {
+        if (!pending_clear) return;
+        rows.clear();
+        order.clear();
+        pending_clear = false;
+    }
+    void Clear() {
+        if (lock_held) { pending_clear = true; return; }
+        rows.clear();
+        order.clear();
+        pending_clear = false;
+    }
+    bool Note(uint64_t queue, uint32_t lists) {
+        if (!queue) return false;
+        auto it = rows.find(queue);
+        if (lock_held) {
+            if (pending_clear || it == rows.end()) { ++dropped; return false; }
+            it->second.lists += lists;
+            ++it->second.calls;
+            return true;
+        }
+        Sync();
+        it = rows.find(queue);
+        if (it != rows.end()) {
+            it->second.lists += lists;
+            ++it->second.calls;
+            return true;
+        }
+        if (rows.size() < kQueueSlots) {
+            rows[queue] = RowModel{lists, 1};
+            order.push_back(queue);
+            return true;
+        }
+        ++overflow;
+        return false;
+    }
+};
+
+void CheckRowsEqualModel(const Reader& reader, const TablesModel& model) {
+    CHECK(reader.row_count() == model.rows.size() && model.order.size() == model.rows.size());
+    for (size_t i = 0; i < reader.row_count(); ++i) {
+        const Row& row = reader.rows()[i];
+        const auto it = model.rows.find(row.queue);
+        CHECK(row.queue == model.order[i] && it != model.rows.end());
+        CHECK(row.lists == it->second.lists && row.calls == it->second.calls);
+    }
+}
+
+// A single thread, a randomised script of Executes of ten queues (eight rows: two overflow), command list counts from zero to
+// 2^32-1 (the packed word's fields spill), pulls, clears, and phases with the lock held (a clear then stays pending). Every
+// result, every row after every pull and the drop and overflow counters equal the model's.
+void TestExecuteFastPathEqualsTheLockedPath() {
+    for (uint64_t seed = 1; seed <= 6; ++seed) {
+        Tables tables;
+        Reader reader;
+        TablesModel model;
+        Lcg rng(seed);
+        for (int step = 0; step < 20000; ++step) {
+            const uint32_t op = rng.Below(100);
+            if (op < 75) {
+                const uint64_t queue = 1 + rng.Below(10);
+                uint32_t lists;
+                if (model.lock_held) {
+                    // Under a held lock only calls whose outcome does not depend on the packed word's spill state: a known
+                    // row with small totals (its packed fields cannot overflow) or an unknown queue.
+                    const auto it = model.rows.find(queue);
+                    if (it != model.rows.end() && (it->second.lists >= (1u << 26) || it->second.calls >= 60000)) continue;
+                    lists = 1 + rng.Below(2);
+                } else {
+                    const uint32_t c = rng.Below(100);
+                    lists = c < 80 ? rng.Below(8) : c < 95 ? rng.Below(5000) : c < 98 ? (1u << 27) + rng.Below(1u << 27)
+                                                                                      : 0xFFFFFFFFu - rng.Below(3);
+                }
+                const bool real = tables.NoteExecute(queue, lists);
+                const bool expected = model.Note(queue, lists);
+                CHECK(real == expected);
+            } else if (op < 85) {
+                if (model.lock_held) continue;
+                CHECK(reader.Pull(tables));
+                model.Sync();
+                CheckRowsEqualModel(reader, model);
+            } else if (op < 92) {
+                tables.Clear();
+                model.Clear();
+            } else if (!model.lock_held) {
+                CHECK(tables.HoldLockForTest());
+                model.lock_held = true;
+            } else {
+                tables.ReleaseLockForTest();
+                model.lock_held = false;
+            }
+        }
+        if (model.lock_held) tables.ReleaseLockForTest();
+        model.lock_held = false;
+        CHECK(reader.Pull(tables));
+        model.Sync();
+        CheckRowsEqualModel(reader, model);
+        CHECK(tables.DroppedLists() == model.dropped && tables.RowOverflow() == model.overflow);
+        CHECK(tables.Lost() == model.dropped + model.overflow);
+    }
+}
+
+// The common case needs no lock; everything new does, and a pending clear is never bypassed.
+void TestExecuteOfAKnownRowNeedsNoLock() {
+    Tables tables;
+    Reader reader;
+    CHECK(tables.NoteExecute(kP, 3));
+    CHECK(tables.HoldLockForTest()); // another thread is inside the tables
+    CHECK(tables.NoteExecute(kP, 4) && tables.DroppedLists() == 0); // known row: one compare-exchange, no lock
+    CHECK(!tables.NoteExecute(kM, 1) && tables.DroppedLists() == 1); // a new queue needs the lock: dropped and counted
+    tables.ReleaseLockForTest();
+    CHECK(reader.Pull(tables) && reader.row_count() == 1);
+    CHECK(reader.rows()[0].queue == kP && reader.rows()[0].lists == 7 && reader.rows()[0].calls == 2);
+    // A clear that could not apply yet: the epoch moved on, the old row is not the current epoch's, so the call is not added
+    // to it (it takes the locked path, which here times out and is counted).
+    CHECK(tables.HoldLockForTest());
+    tables.Clear();
+    CHECK(!tables.NoteExecute(kP, 1) && tables.DroppedLists() == 2);
+    tables.ReleaseLockForTest();
+    CHECK(tables.NoteExecute(kP, 5)); // applies the clear first, then counts in the new epoch
+    CHECK(reader.Pull(tables) && reader.epoch_changed() && reader.row_count() == 1);
+    CHECK(reader.rows()[0].queue == kP && reader.rows()[0].lists == 5 && reader.rows()[0].calls == 1);
+}
+
+// A row's packed counters spill into exact 64-bit totals: calls past 16 bits, lists past 28 bits, one call of 2^32-1.
+void TestExecuteCountersSpillExactly() {
+    Tables tables;
+    Reader reader;
+    for (int i = 0; i < 70000; ++i) CHECK(tables.NoteExecute(kP, 1));
+    for (int i = 0; i < 3; ++i) CHECK(tables.NoteExecute(kM, 200000000u));
+    CHECK(tables.NoteExecute(kA, 0xFFFFFFFFu) && tables.NoteExecute(kA, 0xFFFFFFFFu));
+    CHECK(reader.Pull(tables) && reader.row_count() == 3);
+    for (size_t i = 0; i < 3; ++i) {
+        const Row& r = reader.rows()[i];
+        if (r.queue == kP) CHECK(r.lists == 70000 && r.calls == 70000);
+        else if (r.queue == kM) CHECK(r.lists == 600000000ull && r.calls == 3);
+        else CHECK(r.queue == kA && r.lists == 2ull * 0xFFFFFFFFull && r.calls == 2);
+    }
+    CHECK(tables.Lost() == 0);
+}
+
+// Randomly interleaved writer threads (queues, command list counts up to 2^28 so rows spill), a puller that checks every row
+// never goes down: a call that returned true is counted exactly once, so the pulled totals equal the sum of the successes.
+void TestExecuteConcurrentSumsAreExact() {
+    constexpr int kThreads = 4;
+    constexpr uint32_t kOps = 40000;
+    struct Sum {
+        uint64_t lists[7] = {}, calls[7] = {};
+    };
+    for (int round = 0; round < 3; ++round) {
+        Tables tables;
+        std::vector<Sum> sums(kThreads);
+        std::atomic<bool> stop{false}, bad{false};
+        std::thread puller([&] {
+            Reader reader;
+            uint64_t last_lists[7] = {}, last_calls[7] = {};
+            while (!stop.load()) {
+                if (!reader.Pull(tables)) continue;
+                for (size_t i = 0; i < reader.row_count(); ++i) {
+                    const Row& r = reader.rows()[i];
+                    if (r.queue < 1 || r.queue > 6 || r.lists < last_lists[r.queue] || r.calls < last_calls[r.queue]) bad.store(true);
+                    if (r.queue >= 1 && r.queue <= 6) { last_lists[r.queue] = r.lists; last_calls[r.queue] = r.calls; }
+                }
+                std::this_thread::yield();
+            }
+        });
+        std::vector<std::thread> writers;
+        for (int t = 0; t < kThreads; ++t)
+            writers.emplace_back([&, t] {
+                Lcg rng(1000 + 17 * static_cast<uint64_t>(round) + static_cast<uint64_t>(t));
+                for (uint32_t n = 0; n < kOps; ++n) {
+                    const uint64_t queue = 1 + rng.Below(6);
+                    const uint32_t c = rng.Below(100);
+                    const uint32_t lists = c < 90 ? rng.Below(8) : c < 99 ? rng.Below(100000) : (1u << 27) + rng.Below(1u << 27);
+                    if (tables.NoteExecute(queue, lists)) {
+                        sums[static_cast<size_t>(t)].lists[queue] += lists;
+                        ++sums[static_cast<size_t>(t)].calls[queue];
+                    }
+                }
+            });
+        for (std::thread& writer : writers) writer.join();
+        stop.store(true);
+        puller.join();
+        CHECK(!bad.load() && tables.RowOverflow() == 0);
+        Reader reader;
+        CHECK(reader.Pull(tables));
+        uint64_t total_calls = 0, expected_calls = 0;
+        for (uint64_t q = 1; q <= 6; ++q) {
+            uint64_t lists = 0, calls = 0;
+            for (const Sum& s : sums) { lists += s.lists[q]; calls += s.calls[q]; }
+            expected_calls += calls;
+            for (size_t i = 0; i < reader.row_count(); ++i) {
+                const Row& r = reader.rows()[i];
+                if (r.queue != q) continue;
+                CHECK(r.lists == lists && r.calls == calls);
+                total_calls += r.calls;
+            }
+        }
+        CHECK(total_calls == expected_calls);
+    }
+}
+
+// Rows are re-created after a clear (the slot of one queue becomes another's) while writers are in the middle of their
+// compare-exchange: an add of one queue must never land in another queue's row. Queue q adds exactly q command lists a call, so
+// every row must satisfy lists == calls * queue at every pull, whatever the clears did.
+void TestExecuteNeverMixesQueuesAcrossClears() {
+    Tables tables;
+    std::atomic<bool> stop{false}, bad{false};
+    std::thread clearer([&] {
+        for (int i = 0; i < 400; ++i) {
+            tables.Clear();
+            std::this_thread::yield();
+        }
+    });
+    std::thread puller([&] {
+        Reader reader;
+        while (!stop.load()) {
+            if (!reader.Pull(tables)) continue;
+            for (size_t i = 0; i < reader.row_count(); ++i) {
+                const Row& r = reader.rows()[i];
+                if (r.queue < 1 || r.queue > 4 || r.lists != r.calls * r.queue) bad.store(true);
+            }
+        }
+    });
+    std::vector<std::thread> writers;
+    for (uint64_t q = 1; q <= 4; ++q)
+        writers.emplace_back([&, q] {
+            for (int n = 0; n < 60000; ++n) tables.NoteExecute(q, static_cast<uint32_t>(q));
+        });
+    for (std::thread& writer : writers) writer.join();
+    clearer.join();
+    stop.store(true);
+    puller.join();
+    CHECK(!bad.load());
+    Reader reader;
+    CHECK(reader.Pull(tables));
+    for (size_t i = 0; i < reader.row_count(); ++i) CHECK(reader.rows()[i].lists == reader.rows()[i].calls * reader.rows()[i].queue);
+}
+
+// The identity and the counters a fast Execute uses are of ONE row incarnation. Row 0 names A; the schedule
+// rebuilds row 0 for B (a Clear and a locked Execute of B) at each point between the fast path's loads (after the word, after the
+// identity), and in the form with the Clear deferred (lock held) so the caller's epoch is already the new one. In every
+// schedule the call of A must be counted for A (in the new epoch's own row) and B's row must hold exactly B's call.
+void TestExecuteRowRebuiltBetweenTheFastPathLoads() {
+    for (int schedule = 0; schedule < 3; ++schedule) {
+        Tables tables;
+        CHECK(tables.NoteExecute(kA, 2) && tables.NoteExecute(kA, 2)); // row 0 = A, epoch 1
+        if (schedule == 2) CHECK(tables.HoldLockForTest());
+        const int point = schedule == 1 ? 1 : 0;
+        bool fired = false;
+        const auto seam = [&](int where) {
+            if (where != point || fired) return;
+            fired = true;
+            if (schedule != 2) tables.Clear(); // applied at once: the rows are emptied
+            else tables.ReleaseLockForTest();  // the deferred clear is applied by the next lock holder (B's call)
+            CHECK(tables.NoteExecute(kB, 5));  // row 0 is now B's, tagged with the new epoch
+        };
+        if (schedule == 2) tables.Clear(); // epoch advances, the tables are not reset yet (the lock is held)
+        CHECK(tables.NoteExecuteSeam(kA, 7, seam));
+        CHECK(fired);
+        Reader reader;
+        CHECK(reader.Pull(tables) && reader.row_count() == 2);
+        for (size_t i = 0; i < reader.row_count(); ++i) {
+            const Row& r = reader.rows()[i];
+            if (r.queue == kB) CHECK(r.lists == 5 && r.calls == 1);
+            else CHECK(r.queue == kA && r.lists == 7 && r.calls == 1);
+        }
+        CHECK(tables.Lost() == 0);
+    }
+    // The caller's queue is the one the NEW incarnation of row 0 names, its word the old one: the compare-exchange on the old word
+    // fails, the fresh word carries another epoch's tag, and the call is counted once, by the locked path, in the new row.
+    Tables tables;
+    CHECK(tables.NoteExecute(kA, 2));
+    bool fired = false;
+    CHECK(tables.NoteExecuteSeam(kA, 7, [&](int where) {
+        if (where != 0 || fired) return;
+        fired = true;
+        tables.Clear();
+        CHECK(tables.NoteExecute(kA, 5)); // the same queue, a new incarnation of row 0
+    }));
+    Reader reader;
+    CHECK(reader.Pull(tables) && reader.row_count() == 1 && reader.rows()[0].queue == kA && reader.rows()[0].lists == 12 &&
+          reader.rows()[0].calls == 2);
+}
+
+// ── ResolveFrame off the Present thread (FrameFeed: OnBoundary at the Present, Evaluate on another thread) ──
+// The reference is the old inline path, PullHarness above (its logic is what DependencyEvaluate ran at every Present). The
+// feed is driven with the same recorded script (the same Wait/Signal/command list events, drops and skipped pulls) and must
+// reach the same decisions; a consumer that evaluates later (every few Presents, or on another thread) must reach the same
+// decisions as one that evaluates at every Present.
+struct CollectSink final : FeedSink {
+    std::vector<Decision> decisions;
+    uint32_t resets = 0;
+    void OnReset() noexcept override { ++resets; }
+    void OnDecision(uint8_t, const Decision& d) noexcept override { decisions.push_back(d); }
+};
+
+bool SameDecision(const Decision& a, const Decision& b) {
+    if (a.valid != b.valid || a.adoptable != b.adoptable || a.role != b.role || a.reason != b.reason || a.queue != b.queue ||
+        a.fence != b.fence || a.epoch != b.epoch || a.hops != b.hops || a.frames != b.frames ||
+        a.ambiguous_frames != b.ambiguous_frames || a.multi_edge_frames != b.multi_edge_frames ||
+        a.missing_join_frames != b.missing_join_frames || a.multi_signal_frames != b.multi_signal_frames ||
+        a.lost_records != b.lost_records || a.candidate_count != b.candidate_count)
+        return false;
+    for (uint32_t i = 0; i < a.candidate_count; ++i) {
+        const CandidateReport& x = a.candidates[i];
+        const CandidateReport& y = b.candidates[i];
+        if (x.queue != y.queue || x.hops != y.hops || x.reached != y.reached || x.edge1 != y.edge1 || x.keyed != y.keyed ||
+            x.lists != y.lists)
+            return false;
+    }
+    return true;
+}
+bool SameDecisions(const std::vector<Decision>& a, const std::vector<Decision>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (!SameDecision(a[i], b[i])) return false;
+    return true;
+}
+
+// The events of PullHarness::RecordFrame (crowd 0), into any table.
+void RecordScriptFrame(Tables& tables, uint32_t frame) {
+    const uint64_t value = 100 + frame;
+    const int64_t t = 1000 * static_cast<int64_t>(frame);
+    CHECK(tables.RecordWait(E(kP, kF, value, t + 500, frame + 1)));
+    CHECK(tables.RecordSignal(E(kM, kF, value, t + 100)));
+    CHECK(tables.NoteExecute(kP, 3));
+    CHECK(tables.NoteExecute(kM, 48));
+}
+void DropScriptSignal(Tables& tables, uint32_t frame) {
+    CHECK(tables.HoldLockForTest());
+    CHECK(!tables.RecordSignal(E(kM, kF, 100 + frame, 1000 * static_cast<int64_t>(frame) + 105)));
+    tables.ReleaseLockForTest();
+}
+
+struct Script {
+    uint32_t frames = 200;
+    uint32_t drop_frame = UINT32_MAX;                 // a Signal dropped on a lock time-out in this frame
+    uint32_t skip_from = UINT32_MAX, skip_count = 0;  // Presents whose lock attempts (boundary snapshot, pull) time out
+    uint32_t clear_frame = UINT32_MAX;                // the tables are cleared here; the next Present passes restart
+};
+
+// PullHarness frame f is resolved at Present f+1 with the window [1000 f, 1000 f + 999], so Present f's boundary is at
+// 1000 f + 999 with scope f + 1 (the scope PullHarness::RecordFrame gives the Wait), and a boundary at -1 before frame 0 (taken
+// with the lock held: its counters are unknown, as the first pull of PullHarness leaves prev_valid false) makes Present f push
+// frame f - 1 from Present 1 on.
+struct FeedHarness {
+    Tables tables;
+    FrameFeed feed;
+    CollectSink sink;
+    bool restart_next = false;
+    FeedHarness() {
+        CHECK(tables.HoldLockForTest());
+        Boundary(0, -1);
+        tables.ReleaseLockForTest();
+    }
+    void Boundary(uint64_t scope, int64_t qpc) {
+        BoundaryInput in;
+        in.presenting_queue = kP;
+        in.scope = scope;
+        in.qpc = qpc;
+        in.keyed = true;
+        in.frame_counter = 10;
+        in.mode = 1;
+        in.restart = restart_next;
+        restart_next = false;
+        feed.OnBoundary(tables, in);
+    }
+    // lag 0: the consumer evaluates right after every boundary (the old inline path); otherwise after every lag-th one.
+    void Run(const Script& s, uint32_t lag) {
+        if (lag == 0) feed.Evaluate(tables, sink);
+        for (uint32_t f = 0; f < s.frames; ++f) {
+            if (f == s.drop_frame) DropScriptSignal(tables, f);
+            RecordScriptFrame(tables, f);
+            if (f == s.clear_frame) {
+                tables.Clear();
+                restart_next = true;
+            }
+            const bool skip = f >= s.skip_from && f - s.skip_from < s.skip_count;
+            if (skip) CHECK(tables.HoldLockForTest());
+            Boundary(f + 1, 1000 * static_cast<int64_t>(f) + 999);
+            if (lag == 0 || (f + 1) % lag == 0) feed.Evaluate(tables, sink);
+            if (skip) tables.ReleaseLockForTest();
+        }
+        for (int i = 0; i < 3; ++i) feed.Evaluate(tables, sink); // what is still queued or held
+    }
+};
+
+std::vector<Decision> RunPullHarness(const Script& s) {
+    PullHarness h;
+    for (uint32_t f = 0; f < s.frames; ++f) {
+        if (f == s.drop_frame) h.DropExtraSignal(f);
+        h.RecordFrame(f);
+        h.Present(f, f >= s.skip_from && f - s.skip_from < s.skip_count);
+    }
+    return h.decisions;
+}
+
+// The feed driven at every Present (evaluating on the thread that pushes: the path before the adoption) decides exactly as the
+// old inline path did on the same recorded events: no loss, a dropped Signal, skipped pulls (one, three in a row), and the
+// cases of the window boundary (a skipped pull and a drop in the first frame of the second window; a drop only).
+void TestFeedDecidesLikeTheOldInlinePath() {
+    constexpr uint32_t kSecond = kWindowFrames + 1;
+    std::vector<Script> scripts(6);
+    scripts[1].drop_frame = 30;
+    scripts[2].skip_from = 20;
+    scripts[2].skip_count = 1;
+    scripts[3].skip_from = 20;
+    scripts[3].skip_count = 3;
+    scripts[4].drop_frame = kSecond;
+    scripts[4].skip_from = kSecond;
+    scripts[4].skip_count = 1;
+    scripts[5].drop_frame = kSecond;
+    for (const Script& s : scripts) {
+        const std::vector<Decision> reference = RunPullHarness(s);
+        CHECK(reference.size() == 3);
+        FeedHarness h;
+        h.Run(s, 0);
+        CHECK(SameDecisions(h.sink.decisions, reference));
+        CHECK(h.feed.windows() == 3 && h.feed.backlog_overflows() == 0 && h.feed.PendingFrames() == 0);
+    }
+}
+
+// An evaluation that runs later (every 2, 3 or 7 Presents: a late worker, a batch of frames per pull) decides exactly as one
+// that runs at every Present: plain, a dropped Signal, skipped pulls, a clear in the middle (the frames still queued from
+// before it are discarded, the window restarts after it).
+void TestFeedDecidesTheSameWhenEvaluatedLater() {
+    std::vector<Script> scripts(5);
+    scripts[1].drop_frame = 30;
+    scripts[2].skip_from = 20;
+    scripts[2].skip_count = 1;
+    scripts[3].skip_from = 20;
+    scripts[3].skip_count = 3;
+    scripts[4].frames = 260;
+    scripts[4].clear_frame = 100;
+    for (const Script& s : scripts) {
+        FeedHarness inline_run;
+        inline_run.Run(s, 0);
+        CHECK(!inline_run.sink.decisions.empty());
+        for (const uint32_t lag : {2u, 3u, 7u}) {
+            FeedHarness later;
+            later.Run(s, lag);
+            if (lag == 7 && s.skip_count != 0) {
+                // Not an equivalence case: the one evaluation that coincides with the held lock skips its pull, so seven frames
+                // stay held and seven more arrive before the next evaluation: fourteen are past the eight-frame backlog
+                // (kBacklog, as in the inline path past eight skipped pulls), which restarts the window keeping the loss baseline.
+                CHECK(later.feed.backlog_overflows() >= 1 && later.feed.PendingFrames() == 0);
+                continue;
+            }
+            CHECK(SameDecisions(later.sink.decisions, inline_run.sink.decisions));
+            CHECK(later.feed.backlog_overflows() == 0 && later.feed.PendingFrames() == 0);
+        }
+    }
+    // The clear itself: the window in progress is gone, the first window after it is a full one of its own.
+    FeedHarness h;
+    Script s;
+    s.frames = 260;
+    s.clear_frame = 100;
+    h.Run(s, 0);
+    CHECK(h.sink.decisions.size() == 3 && h.sink.decisions[0].epoch + 1 == h.sink.decisions[1].epoch);
+    CHECK(h.sink.decisions[0].adoptable && h.sink.decisions[1].adoptable && h.sink.decisions[2].adoptable);
+    CHECK(h.sink.resets >= 2); // the first lifetime and the restart
+}
+
+// A producer that runs ahead of the consumer by more than the bounded queue drops frames and the window restarts (counted):
+// nothing is evaluated on a frame with missing entries, and the first window after the restart qualifies on its own.
+void TestFeedQueueOverflowRestartsTheWindow() {
+    FeedHarness h;
+    uint32_t f = 0;
+    for (; f < 10; ++f) {
+        RecordScriptFrame(h.tables, f);
+        h.Boundary(f + 1, 1000 * static_cast<int64_t>(f) + 999);
+        h.feed.Evaluate(h.tables, h.sink);
+    }
+    for (uint32_t n = 0; n < 3 * FrameFeed::kBacklog; ++n, ++f) { // the consumer does not run
+        RecordScriptFrame(h.tables, f);
+        h.Boundary(f + 1, 1000 * static_cast<int64_t>(f) + 999);
+    }
+    CHECK(h.feed.PendingFrames() <= FrameFeed::kBacklog);
+    for (; f < 10 + 3 * FrameFeed::kBacklog + 3 * kWindowFrames; ++f) {
+        RecordScriptFrame(h.tables, f);
+        h.Boundary(f + 1, 1000 * static_cast<int64_t>(f) + 999);
+        h.feed.Evaluate(h.tables, h.sink);
+    }
+    for (int i = 0; i < 3; ++i) h.feed.Evaluate(h.tables, h.sink);
+    CHECK(h.feed.backlog_overflows() >= 1);
+    CHECK(!h.sink.decisions.empty());
+    CHECK(h.sink.decisions.back().adoptable && h.sink.decisions.back().queue == kM && h.sink.decisions.back().lost_records == 0);
+}
+
+// A restart and the loss the SAME pull finds. The consumer does not run for three boundaries after a restart while a burst
+// past the table size is recorded, so the first pull finds overwritten entries (the mirror's overrun) while it also restarts the
+// evaluator and retains frames. The baseline of the restart must not absorb that overrun: the retained frames and the window they
+// start are evaluated from incomplete logs and must not qualify; the control (no burst) qualifies, and so does the window after.
+void TestFeedRestartPlusOverrunFoundByTheSamePullDoesNotQualify() {
+    for (int burst = 0; burst < 2; ++burst) {
+        FeedHarness h;
+        uint32_t f = 0;
+        for (; f < 10; ++f) {
+            RecordScriptFrame(h.tables, f);
+            h.Boundary(f + 1, 1000 * static_cast<int64_t>(f) + 999);
+            h.feed.Evaluate(h.tables, h.sink);
+        }
+        h.restart_next = true; // the next boundary restarts the window (a lifetime change)
+        for (uint32_t n = 0; n < 3; ++n, ++f) { // the consumer does not run
+            if (n == 0 && burst)
+                for (uint64_t i = 0; i < kLogCapacity + 100; ++i)
+                    CHECK(h.tables.RecordSignal(E(kM, kG, i, 1000 * static_cast<int64_t>(f) + 60)));
+            RecordScriptFrame(h.tables, f);
+            h.Boundary(f + 1, 1000 * static_cast<int64_t>(f) + 999);
+        }
+        for (; f < 13 + 3 * kWindowFrames; ++f) {
+            RecordScriptFrame(h.tables, f);
+            h.Boundary(f + 1, 1000 * static_cast<int64_t>(f) + 999);
+            h.feed.Evaluate(h.tables, h.sink);
+        }
+        for (int i = 0; i < 3; ++i) h.feed.Evaluate(h.tables, h.sink);
+        CHECK(h.sink.decisions.size() >= 2);
+        const Decision& first = h.sink.decisions.front();
+        if (burst) CHECK(!first.adoptable && first.reason == Reason::NotQualifiedLoss);
+        else CHECK(first.adoptable && first.queue == kM);
+        CHECK(h.sink.decisions.back().adoptable && h.sink.decisions.back().queue == kM);
+    }
+}
+
+// A mode-only restart (no clear: the tables and the mirror are untouched) whose pull evicts mirror entries that only the
+// DISCARDED generation could still need (its previous edge, 4100 here, lies below them) and that all lie before the new
+// generation's first window (from 10999): that is no loss of the new window, which must qualify. The mirror is full of other-fence
+// Signals (qpc 5500) from the old generation's time; the pull of the restart appends three new entries and evicts three of them.
+void TestFeedRestartEvictingOnlyOldGenerationEvidenceStillQualifies() {
+    FeedHarness h;
+    uint32_t f = 0;
+    for (; f < 5; ++f) {
+        RecordScriptFrame(h.tables, f);
+        h.Boundary(f + 1, 1000 * static_cast<int64_t>(f) + 999);
+        h.feed.Evaluate(h.tables, h.sink);
+    }
+    CHECK(h.feed.evaluator().OldestPreviousSignalQpc() != 0 && h.feed.evaluator().OldestPreviousSignalQpc() < 5500);
+    // Fill the mirror (each pull copies fewer than the table holds) with Signals of another fence, no frame involved.
+    for (int chunk = 0; chunk < 2; ++chunk) {
+        for (uint64_t i = 0; i < (chunk == 0 ? 400u : 200u); ++i) CHECK(h.tables.RecordSignal(E(kM, kG, i, 5500)));
+        h.Boundary(0, 5200 + 100 * chunk);
+        h.feed.Evaluate(h.tables, h.sink);
+    }
+    CHECK(h.feed.reader().signal_count() == kLogCapacity);
+    h.restart_next = true; // the new generation, tables not cleared
+    for (uint32_t n = 0; n < 3; ++n) {
+        const uint32_t g = 10 + n;
+        RecordScriptFrame(h.tables, g);
+        h.Boundary(g + 1, 1000 * static_cast<int64_t>(g) + 999);
+    }
+    const uint64_t overrun = h.feed.reader().overrun();
+    h.feed.Evaluate(h.tables, h.sink);
+    // the pull evicted three entries of the old generation's time, all before the new window: no overrun is charged
+    CHECK(h.feed.reader().overrun() == overrun);
+    CHECK(h.feed.reader().signal_count() == kLogCapacity);
+    for (f = 13; f < 13 + 3 * kWindowFrames; ++f) {
+        RecordScriptFrame(h.tables, f);
+        h.Boundary(f + 1, 1000 * static_cast<int64_t>(f) + 999);
+        h.feed.Evaluate(h.tables, h.sink);
+    }
+    for (int i = 0; i < 3; ++i) h.feed.Evaluate(h.tables, h.sink);
+    CHECK(h.sink.decisions.size() >= 2);
+    for (const Decision& d : h.sink.decisions) CHECK(d.adoptable && d.queue == kM && d.lost_records == 0);
+}
+
+// Stale held frames of the old generation do not take the room of the new one. Seven frames are held by a skipped pull
+// (the lock is held during the evaluation: the queue went into the backlog, the pull failed), then a mode-only restart and two
+// new-generation frames queue: the stale ones are dropped BEFORE the merge, so both new frames survive, no overflow is charged,
+// and the first complete post-restart window decides at the same frame, with the same decision, as a feed that never held them.
+void TestFeedStaleHeldFramesDoNotOverflowTheNewGeneration() {
+    uint32_t decided_at[2] = {};
+    std::vector<Decision> decisions[2];
+    for (int stale = 1; stale >= 0; --stale) {
+        FeedHarness h;
+        uint32_t f = 0;
+        for (; f < 3; ++f) {
+            RecordScriptFrame(h.tables, f);
+            h.Boundary(f + 1, 1000 * static_cast<int64_t>(f) + 999);
+            h.feed.Evaluate(h.tables, h.sink);
+        }
+        for (; f < 10; ++f) { // seven boundaries, each pushes a frame
+            RecordScriptFrame(h.tables, f);
+            h.Boundary(f + 1, 1000 * static_cast<int64_t>(f) + 999);
+            if (!stale) h.feed.Evaluate(h.tables, h.sink);
+        }
+        if (stale) {
+            CHECK(h.tables.HoldLockForTest());
+            h.feed.Evaluate(h.tables, h.sink); // the queue goes into the backlog, the pull is skipped
+            h.tables.ReleaseLockForTest();
+            CHECK(h.feed.PendingFrames() == 7 && h.feed.reader().pulls_skipped() == 1);
+        }
+        const uint64_t frames_before = h.feed.frames();
+        h.restart_next = true; // a mode-only restart: the tables are not cleared
+        for (; f < 14; ++f) {  // four boundaries: the third and the fourth push the new generation's first two frames
+            RecordScriptFrame(h.tables, f);
+            h.Boundary(f + 1, 1000 * static_cast<int64_t>(f) + 999);
+        }
+        h.feed.Evaluate(h.tables, h.sink);
+        CHECK(h.feed.backlog_overflows() == 0 && h.feed.PendingFrames() == 0);
+        CHECK(h.feed.frames() == frames_before + 2); // both new frames evaluated, the stale ones never
+        const int index = stale ? 1 : 0;
+        for (; f < 14 + 3 * kWindowFrames && h.sink.decisions.empty(); ++f) {
+            RecordScriptFrame(h.tables, f);
+            h.Boundary(f + 1, 1000 * static_cast<int64_t>(f) + 999);
+            h.feed.Evaluate(h.tables, h.sink);
+        }
+        CHECK(!h.sink.decisions.empty() && h.feed.backlog_overflows() == 0);
+        decided_at[index] = f;
+        decisions[index] = h.sink.decisions;
+    }
+    CHECK(decided_at[0] == decided_at[1]);
+    CHECK(SameDecisions(decisions[0], decisions[1]));
+}
+
+// The consumer on ANOTHER thread, the producer throttled so the bounded queue never overflows: the same decisions as the
+// inline run, whatever the interleaving of boundaries, pulls and evaluations (each run is a different interleaving).
+void TestFeedEvaluatedOnAnotherThreadDecidesLikeInline() {
+    Script s;
+    s.frames = 260;
+    FeedHarness reference;
+    reference.Run(s, 0);
+    CHECK(reference.sink.decisions.size() == 4);
+    for (int round = 0; round < 20; ++round) {
+        Tables tables;
+        FrameFeed feed;
+        CollectSink sink;
+        std::atomic<bool> done{false};
+        const auto boundary = [&](uint64_t scope, int64_t qpc) {
+            BoundaryInput in;
+            in.presenting_queue = kP;
+            in.scope = scope;
+            in.qpc = qpc;
+            in.keyed = true;
+            in.frame_counter = 10;
+            in.mode = 1;
+            feed.OnBoundary(tables, in);
+        };
+        CHECK(tables.HoldLockForTest());
+        boundary(0, -1);
+        tables.ReleaseLockForTest();
+        std::thread consumer([&] {
+            while (!done.load() || feed.HasWork()) {
+                feed.Evaluate(tables, sink);
+                std::this_thread::yield();
+            }
+        });
+        for (uint32_t f = 0; f < s.frames; ++f) {
+            while (feed.PendingFrames() >= FrameFeed::kBacklog - 2) std::this_thread::yield();
+            RecordScriptFrame(tables, f);
+            boundary(f + 1, 1000 * static_cast<int64_t>(f) + 999);
+        }
+        done.store(true);
+        consumer.join();
+        CHECK(feed.backlog_overflows() == 0);
+        CHECK(SameDecisions(sink.decisions, reference.sink.decisions));
+    }
+}
 } // namespace
 
 int main() {
@@ -1298,6 +1983,19 @@ int main() {
     TestSignalOncePerFrame();
     TestCandidateTiesGoToPresentingQueue();
     TestTablesUnderContentionAndClear();
+    TestExecuteFastPathEqualsTheLockedPath();
+    TestExecuteOfAKnownRowNeedsNoLock();
+    TestExecuteCountersSpillExactly();
+    TestExecuteConcurrentSumsAreExact();
+    TestExecuteNeverMixesQueuesAcrossClears();
+    TestExecuteRowRebuiltBetweenTheFastPathLoads();
+    TestFeedDecidesLikeTheOldInlinePath();
+    TestFeedDecidesTheSameWhenEvaluatedLater();
+    TestFeedQueueOverflowRestartsTheWindow();
+    TestFeedRestartPlusOverrunFoundByTheSamePullDoesNotQualify();
+    TestFeedRestartEvictingOnlyOldGenerationEvidenceStillQualifies();
+    TestFeedStaleHeldFramesDoNotOverflowTheNewGeneration();
+    TestFeedEvaluatedOnAnotherThreadDecidesLikeInline();
     TestPartialCandidateWithEqualCountsAdoptsNothing();
     TestEpochChangeRestartsTheWindow();
     TestDecisionOfAnOldEpochIsNotPublished();

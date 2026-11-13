@@ -109,7 +109,7 @@ static void VBlankThreadImpl() {
     wb.hDevice = 0;
     wb.VidPnSourceId = oa.VidPnSourceId;
 
-    // Set thread priority to TIME_CRITICAL per spec §IV.1
+    // Set thread priority to TIME_CRITICAL
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
 
     while (s_vblank_running.load(std::memory_order_relaxed)) {

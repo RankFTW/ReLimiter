@@ -142,6 +142,11 @@ public:
 };
 
 unsigned s_lifecycle_resets = 0;
+// SwapMgr link doubles' state: the presenting device (owned by the test), its publication
+// sequence and the active API. Default: no presenting device, API None (native bootstrap).
+IUnknown* s_test_presenting = nullptr;
+uint64_t s_test_presenting_sequence = 0;
+ActiveAPI s_test_api = ActiveAPI::None;
 std::atomic<unsigned> s_forwarded_markers{0};
 unsigned s_tail_markers = 0;
 int64_t s_first_tail_timestamp = 0;
@@ -193,7 +198,7 @@ unsigned s_pre_sleep_waits = 0;           // PreSleepWaitUntil calls
 int64_t s_pre_sleep_wait_target = 0;      // and its newest arguments
 bool s_pre_sleep_wait_precise = false;
 int64_t s_pre_sleep_max_ahead = 0;        // the longest wait PreSleepWaitUntil was asked for (ticks)
-// Key unified_pacer (spec 4.1): the Scheduler_Unified* stubs below, the Sleep hook's
+// Key unified_pacer: the Scheduler_Unified* stubs below, the Sleep hook's
 // PreSleepWaitUntil (spins to its target when s_pre_sleep_wait_blocks), the probe's
 // arming calls and Dynamic MFG.
 bool s_unified_active = false;                 // Scheduler_UnifiedActive
@@ -746,7 +751,7 @@ void TestPreSleepPreciseAndHoldWiring() {
 }
 
 #ifdef _WIN64
-// Key unified_pacer (spec 4.1). The key is published as ResolvePipeline publishes it, WITHOUT
+// Key unified_pacer. The key is published as ResolvePipeline publishes it, WITHOUT
 // the epoch (the scheduler bumps that later): the first hook after the publication must
 // already see the transition through NvAPI_SleepModeReconcilePending. The tuple, the hard
 // limit, the self-check and the Sleep hook are production code, the scheduler's reservation
@@ -2015,6 +2020,114 @@ void TestRealAddressReuse() {
     reused->~FakeDevice();
 }
 
+// Base cost: IsPresentingFeedbackDevice answers a repeated positive comparison of
+// the published feedback device with the presenting device from a per-thread memo, with no
+// reference taken and no QueryInterface, and only while both publications are the memoized
+// ones. Everything else (an alias pointer, a negative answer, another sequence, a recaptured
+// address, a non-DXGI API) takes the full path and gives the answer it always gave.
+void TestPresentingDeviceMemo() {
+    FakeDevice native, wrapper, other, alias;
+    wrapper.Wrap(&native);
+    alias.canonical = &native;
+    const auto queries = [&] { return native.queries + wrapper.queries + other.queries + alias.queries; };
+    const auto add_refs = [&] { return native.add_refs + wrapper.add_refs + other.add_refs + alias.add_refs; };
+    NvAPIFeedbackDevice published;
+    CHECK(NvAPI_CaptureFeedbackDevice(&wrapper, &published));
+    t_presenting_match = {};
+    s_test_presenting = &native;
+    s_test_presenting_sequence = 2;
+    s_test_api = ActiveAPI::DX12;
+
+    // First call: the full path (wrapper != native, so the identity chain is queried).
+    unsigned q = queries();
+    CHECK(IsPresentingFeedbackDevice(&wrapper));
+    CHECK(queries() > q);
+    // Then: no QueryInterface, no AddRef/Release of anything.
+    q = queries();
+    unsigned refs = add_refs();
+    for (int i = 0; i < 5; ++i) CHECK(IsPresentingFeedbackDevice(&wrapper));
+    CHECK(queries() == q && add_refs() == refs);
+
+    // The presenting device is published again (any new publication advances the sequence):
+    // compared again once, memoized again.
+    s_test_presenting_sequence = 4;
+    CHECK(IsPresentingFeedbackDevice(&wrapper));
+    CHECK(queries() > q);
+    q = queries();
+    CHECK(IsPresentingFeedbackDevice(&wrapper));
+    CHECK(queries() == q);
+
+    // Another presenting device: the answer follows it; a negative answer is never memoized.
+    s_test_presenting = &other;
+    s_test_presenting_sequence = 6;
+    CHECK(!IsPresentingFeedbackDevice(&wrapper));
+    q = queries();
+    CHECK(!IsPresentingFeedbackDevice(&wrapper));
+    CHECK(queries() > q);
+    // Sequence in progress (odd): never answered from the memo, never memoized.
+    s_test_presenting = &native;
+    s_test_presenting_sequence = 7;
+    CHECK(IsPresentingFeedbackDevice(&wrapper));
+    q = queries();
+    CHECK(IsPresentingFeedbackDevice(&wrapper));
+    CHECK(queries() > q);
+    s_test_presenting_sequence = 8;
+    CHECK(IsPresentingFeedbackDevice(&wrapper));
+    q = queries();
+    CHECK(IsPresentingFeedbackDevice(&wrapper));
+    CHECK(queries() == q);
+
+    // A pointer that is not the published one (an alias of the same identity) cannot be
+    // proven alive by our reference: the full path every call, the same answer.
+    CHECK(IsPresentingFeedbackDevice(&alias));
+    q = queries();
+    CHECK(IsPresentingFeedbackDevice(&alias));
+    CHECK(queries() > q);
+    // ... and it does not disturb the memo of the published pointer.
+    q = queries();
+    CHECK(IsPresentingFeedbackDevice(&wrapper));
+    CHECK(queries() == q);
+
+    // The feedback device is cleared and the same address published again: a new publication,
+    // so the memo of the old one is not used; one comparison, memoized again.
+    NvAPI_ClearFeedbackDevice(published);
+    NvAPIFeedbackDevice republished;
+    CHECK(NvAPI_CaptureFeedbackDevice(&wrapper, &republished));
+    CHECK(republished.publication_sequence != published.publication_sequence);
+    q = queries();
+    CHECK(IsPresentingFeedbackDevice(&wrapper));
+    CHECK(queries() > q);
+    q = queries();
+    CHECK(IsPresentingFeedbackDevice(&wrapper));
+    CHECK(queries() == q);
+
+    // Not a DXGI API: rejected whatever the memo holds.
+    s_test_api = ActiveAPI::Vulkan;
+    CHECK(!IsPresentingFeedbackDevice(&wrapper));
+    s_test_api = ActiveAPI::DX12;
+    CHECK(IsPresentingFeedbackDevice(&wrapper));
+
+    // Another thread has its own memo: its first call compares, its second does not.
+    std::thread([&] {
+        const unsigned before = queries();
+        CHECK(IsPresentingFeedbackDevice(&wrapper));
+        CHECK(queries() > before);
+        const unsigned after = queries();
+        CHECK(IsPresentingFeedbackDevice(&wrapper));
+        CHECK(queries() == after);
+    }).join();
+
+    // The feedback device cleared: nothing is published, so nothing is memoized.
+    NvAPI_ClearFeedbackDevice(republished);
+    q = queries();
+    CHECK(IsPresentingFeedbackDevice(&wrapper));
+    CHECK(queries() > q);
+    s_test_api = ActiveAPI::None;
+    s_test_presenting = nullptr;
+    s_test_presenting_sequence = 0;
+    t_presenting_match = {};
+}
+
 NvAPI_Status __cdecl ForwardMarker(IUnknown*, NV_LATENCY_MARKER_PARAMS* params) {
     ++s_forwarded_markers;
     if (s_record_call_order) s_call_order.push_back({'F', params->frameID});
@@ -2717,8 +2830,12 @@ void ReplayDawnwalker(const char* path) {
 Config g_config;
 MarkerLog g_marker_log;
 void ResetFeedbackProducerLifecycle() noexcept { ++s_lifecycle_resets; }
-IUnknown* SwapMgr_AcquirePresentingDevice() noexcept { return nullptr; }
-ActiveAPI SwapMgr_GetActiveAPI() { return ActiveAPI::None; } // native calls bootstrap feedback
+IUnknown* SwapMgr_AcquirePresentingDevice() noexcept {
+    if (s_test_presenting) s_test_presenting->AddRef();
+    return s_test_presenting;
+}
+uint64_t SwapMgr_PresentingDeviceSequence() noexcept { return s_test_presenting_sequence; }
+ActiveAPI SwapMgr_GetActiveAPI() { return s_test_api; } // default None: native calls bootstrap feedback
 void Log_Write(LogLevel, const char* fmt, ...) {
 #ifdef _WIN64
     if (fmt && std::strncmp(fmt, "NvAPI: SetFlipConfig", 20) == 0) ++s_flip_config_log_writes;
@@ -2789,7 +2906,7 @@ void Scheduler_EndDriverSleep(int64_t start_qpc, int64_t end_qpc) noexcept {
     s_driver_sleep_start_qpc = start_qpc;
     s_driver_sleep_end_qpc = end_qpc;
 }
-// Key unified_pacer (spec 4.1): the scheduler's reservation and publication, controlled by
+// Key unified_pacer: the scheduler's reservation and publication, controlled by
 // the s_unified_* stubs; the hard limit, the tuple and the Sleep hook are production code.
 bool Scheduler_UnifiedActive() noexcept { return s_unified_active; }
 SchedulerUnifiedReserve Scheduler_UnifiedReserve(int64_t arrival_qpc, SchedulerUnifiedReservation* out) noexcept {
@@ -2874,6 +2991,7 @@ int main(int argc, char** argv) {
     TestStableAliasCapture();
     TestReentrantRevalidation();
     TestRealAddressReuse();
+    TestPresentingDeviceMemo();
     TestDiagnosticAdmission();
     TestCpuLatency();
     TestMarkerForwardOrder();

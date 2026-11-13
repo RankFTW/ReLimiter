@@ -168,6 +168,7 @@ namespace
             left.unified_queue_need_frames == right.unified_queue_need_frames &&
             (sizeof(void*) != 8 || left.gpu_queue_probe_source == right.gpu_queue_probe_source) &&
             left.unified_queue_upstream == right.unified_queue_upstream &&
+            (sizeof(void*) != 8 || left.unified_queue_margin_end == right.unified_queue_margin_end) &&
             left.unified_queue_allow_us == right.unified_queue_allow_us;
     }
 
@@ -1383,6 +1384,31 @@ namespace
         CHECK(SameConfig(PacingPipeline_GetConfig(), PacingPipelineConfig{}));
     }
 
+    // Developer key unified_queue_margin_end: default 1, clamp 0..1, forced 0 on Win32, independent of
+    // the key unified_pacer and the law, and the publish round trip.
+    void TestUnifiedQueueMarginEndKey()
+    {
+        CHECK(PacingPipelineConfig{}.unified_queue_margin_end == 1 && kPacingUnifiedQueueMarginEndDefault == 1);
+        CHECK(PacingPipeline_ClampConfig(PacingPipelineConfig{}).unified_queue_margin_end ==
+              (sizeof(void*) == 8 ? 1 : 0));
+        CHECK(kPacingUnifiedQueueMarginEndMax == 1);
+        const bool wide = sizeof(void*) == 8;
+        struct Case { int value; int expected; };
+        for (const Case& test : { Case{ 0, 0 }, Case{ 1, 1 }, Case{ 2, 1 }, Case{ 1 << 30, 1 },
+                Case{ -1, 0 }, Case{ -1000, 0 } }) {
+            PacingPipelineConfig config{};
+            config.unified_queue_margin_end = test.value;
+            for (const bool key : { false, true }) {
+                config.unified_pacer = key;
+                CHECK(PacingPipeline_ClampConfig(config).unified_queue_margin_end == (wide ? test.expected : 0));
+            }
+            PacingPipeline_SetConfig(config);
+            CHECK(PacingPipeline_GetConfig().unified_queue_margin_end == (wide ? test.expected : 0));
+        }
+        PacingPipeline_SetConfig(PacingPipelineConfig{});
+        CHECK(SameConfig(PacingPipeline_GetConfig(), PacingPipelineConfig{}));
+    }
+
     // ── Text ──
 
     void TestSmoothingText()
@@ -1873,6 +1899,7 @@ int main()
     TestUnifiedQueueNeedFramesKey();
     TestUnifiedQueueUpstreamKey();
     TestGpuQueueProbeSourceKey();
+    TestUnifiedQueueMarginEndKey();
     TestSmoothingText();
     TestRungOverrideText();
     TestLabels();

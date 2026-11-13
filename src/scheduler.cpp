@@ -526,7 +526,7 @@ int64_t s_precise_wait_target_qpc = 0;   // and its committed release target
 uint32_t s_precise_wait_epoch = 0;       // and the cadence it was made under (source_stage.h)
 double s_precise_wait_interval_us = 0.0;
 PacingTimingMode s_precise_wait_mode = PacingTimingMode::Off;
-// Developer key unified_pacer (unified_pacer.h, spec 4.1 to 4.3). The mailbox word is written by
+// Developer key unified_pacer (unified_pacer.h). The mailbox word is written by
 // the Sleep hook outside the owner and consumed once by the owner at the marker. The Sleep
 // hook's hard-limit statistics travel in a few slots indexed by the reservation token: each
 // slot is a seqlock whose writer takes it with a try-acquire and only for a newer token (a
@@ -717,7 +717,7 @@ void Scheduler_LogQueueLawSummary() noexcept
     LogQueueLawSummary("process shutdown");
 }
 
-// Developer key unified_pacer: empties the law and the Sleep hook's mailbox (spec 2.6).
+// Developer key unified_pacer: empties the law and the Sleep hook's mailbox.
 // Runs where the adaptation regime resets (cap, FG divisor, DMFG, OLED, focus, lifecycle),
 // on suspension and on a regime change; one bool check with the key off.
 static void ResetUnifiedLaw() noexcept
@@ -1044,7 +1044,7 @@ static void DrainQueueLawFeed(bool law_on) noexcept
 // are judged GPU-paced (no OutputLate restart: the grid follows the start), and used reports
 // feed the lead. A toggle resets the law, the feasibility evidence, the lead buckets and the
 // pre-Sleep margin, and leaves a Sleep-mode epoch pending so the first reconcile applies the
-// new key's tuple exactly (spec 5).
+// new key's tuple exactly.
 static void ApplyUnifiedKeyTransition(const PacingPipelineConfig& config) noexcept
 {
     if (config.unified_pacer == s_up_key) return;
@@ -1366,7 +1366,7 @@ static GovernorDecision UpdatePeriodGovernor(
     const bool gpu_hold = IsGpuRung(pipeline.rung);
     ReflexFrameTimeSample sample{};
     while (ConsumeReflexFrameTimeSample(&sample)) {
-        // Developer key unified_pacer: the report's signed queue wait (spec 2.3) from the two
+        // Developer key unified_pacer: the report's signed queue wait from the two
         // raw timestamps the sample carries (gpuRenderStart − osRenderQueueStart, NAN when missing).
         if (config.unified_pacer) {
             const double queue_wait_us = sample.gpu_start_driver_us != 0 && sample.os_queue_start_driver_us != 0
@@ -1735,7 +1735,7 @@ static bool ReadUnifiedStats(uint32_t token, UnifiedStatsSnapshot* out) noexcept
     return slot.sequence.load(std::memory_order_relaxed) == before;
 }
 
-// The unified columns of the frame's source record (spec 6); empty cells stay unset.
+// The unified columns of the frame's source record; empty cells stay unset.
 static void FillUnifiedRecord(const SourceStageFrame& frame, PacingSourceRecord* record) noexcept
 {
     if (!frame.planned || !frame.unified.valid) return;
@@ -2239,7 +2239,7 @@ static SourceStageFrame RunPlanned(
     request.overload_demoted = !config.unified_pacer && s_hold_feasibility.Overloaded();
     // Developer key unified_pacer, every planned frame of the marker route (placement Unified,
     // or the Marker fallback while the game calls no Reflex Sleep; passthrough, the present
-    // route and mode Off excluded): the unified branch of the source stage plans it (spec 4.2);
+    // route and mode Off excluded): the unified branch of the source stage plans it;
     // no pre-Sleep residual, hold evidence or handoff limit.
     const bool unified = SourceStage_UnifiedPlans(pipeline, config.unified_pacer, s_source_stage.UnifiedEnabled());
     request.gpu_queue_wait_render_queue = config.gpu_queue_wait_render_queue;
@@ -2748,7 +2748,7 @@ void Scheduler_EndDriverSleep(int64_t start_qpc, int64_t end_qpc) noexcept
     s_driver_sleep_end_qpc = end_qpc;
 }
 
-// ── Unified pacer: the Sleep hook's side (spec 4.1) ──
+// ── Unified pacer: the Sleep hook's side ──
 
 bool Scheduler_UnifiedActive() noexcept
 {
@@ -2838,7 +2838,7 @@ void OnMarker(
     // requests).
     ApplyFeedbackResetRequests();
     // Developer key unified_pacer, or a toggle that has not applied yet: reconcile the one
-    // effective Sleep-mode tuple from the game thread (spec 4.1). A key load and a flag
+    // effective Sleep-mode tuple from the game thread. A key load and a flag
     // load with the key off.
     if (PacingPipeline_UnifiedPacerKey() || s_up_reconcile) {
         if (NvAPI_SleepModeReconcilePending()) NvAPI_ReconcileSleepMode();
@@ -2959,7 +2959,7 @@ void OnMarker(
     s_last_dmfg_active = dmfg_active;
     if (dmfg_changed) {
         ResetAdaptationRegime(dmfg_active ? "DMFG entered" : "DMFG exited");
-        // Developer key unified_pacer: the Sleep-mode tuple follows DMFG (spec 4.1).
+        // Developer key unified_pacer: the Sleep-mode tuple follows DMFG.
         if (config.unified_pacer) NvAPI_BumpSleepModeEpoch();
     }
     if (dmfg_active) {
@@ -3018,7 +3018,7 @@ void OnMarker(
         LOG_INFO("OLED Care scheduler cap %s", oled_care_active ? "entered" : "exited");
     }
 
-    // Background FPS cap check (§III.4). The grid's ModeChange epoch replaces
+    // Background FPS cap check. The grid's ModeChange epoch replaces
     // the old full flush on focus regain.
     if (!SwapMgr_GetHWND()) {
         static bool s_hwnd_fallback_warned = false;
@@ -3134,7 +3134,7 @@ void OnMarker(
     }
 
     // ── VRR ──
-    // Key unified_pacer: with the cap off VRR is paced at the VRR cap (Hz - Hz^2/3600), spec 2.2.
+    // Key unified_pacer: with the cap off VRR is paced at the VRR cap (Hz - Hz^2/3600).
     int vrr_target_fps = target_fps;
     if (vrr_target_fps <= 0 && config.unified_pacer) {
         vrr_target_fps = static_cast<int>(UnifiedPacer_VrrCapFps(g_ceiling_hz.load(std::memory_order_relaxed)));

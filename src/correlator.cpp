@@ -85,6 +85,16 @@ namespace
         std::atomic<uint64_t>* destination,
         IDXGISwapChain* swapchain) noexcept
     {
+        // Already published: no AddRef/Release, no writer lock, no sequence bump (this runs on every
+        // Present). The destination owns a reference to the published swapchain, so the object cannot
+        // have been destroyed and its address reused while it is published: an equal pointer is the
+        // same object, and the comparison is the result the locked path below reaches for it
+        // (previous == published, nothing to retire). A concurrent replacement or retirement is
+        // ordered after this call, as it would be behind the writer lock. A different or null
+        // pointer takes the locked path, where AddRef validates the incoming object.
+        if (swapchain &&
+            destination->load(std::memory_order_acquire) == reinterpret_cast<uint64_t>(swapchain))
+            return false;
         IDXGISwapChain* published = swapchain;
         if (published && !SafeAddRef(published)) published = nullptr;
 

@@ -31,6 +31,7 @@
 #include "unified_pacer.h"
 #include "frame_plan.h"
 #include "gpu_readiness.h"
+#include "module_presence.h"
 #include <intrin.h>
 #include <array>
 #include <atomic>
@@ -81,7 +82,7 @@ static std::atomic_flag s_game_params_lock = ATOMIC_FLAG_INIT;
 static std::atomic<bool> s_low_latency_forced_off{ false };
 static SRWLOCK s_sleep_mode_forward_lock = SRWLOCK_INIT;
 
-// Unified pacer (developer key unified_pacer, spec 4.1): the applied Sleep-mode record
+// Unified pacer (developer key unified_pacer): the applied Sleep-mode record
 // {publication, owner, low latency off, interval, epoch}, written only under
 // s_sleep_mode_forward_lock and only by a reconcile or a desired-tuple forward (key on, a
 // key toggle or a restoration owed): with the key off and settled nothing is recorded. The
@@ -281,12 +282,57 @@ static void LogMarkerRejection(
              static_cast<unsigned>(marker->markerType), marker->frameID);
 }
 
+// (g_dev, publication sequence) read as one consistent pair under the transition sequence, as
+// NvAPI_IsFeedbackDeviceCurrent reads it. False while a transition is in progress.
+static bool ReadFeedbackPublication(IUnknown** device, uint64_t* publication) noexcept {
+    const uint64_t before = s_feedback_device_transition_sequence.load(std::memory_order_acquire);
+    if ((before & 1u) != 0) return false;
+    *publication = s_feedback_device_publication_sequence.load(std::memory_order_relaxed);
+    *device = g_dev.load(std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return before == s_feedback_device_transition_sequence.load(std::memory_order_relaxed);
+}
+
+// One memoized POSITIVE answer of IsPresentingFeedbackDevice per thread (the game thread and the
+// presenting thread each send markers): the incoming device is the published feedback device
+// (g_dev, which owns a reference) of publication `feedback_publication`, and it is the same
+// device as the presenting device (which SwapMgr owns a reference to) of publication
+// `presenting_sequence`. Neither object can be destroyed, nor its address reused, while its
+// publication sequence is unchanged (a capture, replacement or clear of the feedback device
+// advances s_feedback_device_publication_sequence, a new, same or cleared presenting device
+// advances the presenting sequence), and the identity relation of two live objects is fixed:
+// so while both sequences are as memoized, an incoming pointer equal to g_dev is the same
+// answer without a reference taken or a QueryInterface. An incoming pointer that only has
+// the same identity as g_dev, a negative answer, a transition in progress and a non-DXGI API
+// all take the full path below.
+struct PresentingFeedbackMatch {
+    IUnknown* device = nullptr;
+    uint64_t feedback_publication = 0;
+    uint64_t presenting_sequence = 0;
+};
+static thread_local PresentingFeedbackMatch t_presenting_match;
+
 static bool IsPresentingFeedbackDevice(
     IUnknown* device, const NV_LATENCY_MARKER_PARAMS* marker = nullptr) noexcept {
     if (!device) {
         LogMarkerRejection(MarkerRejection::MissingIncoming, device, nullptr, marker);
         return false;
     }
+    IUnknown* published = nullptr;
+    uint64_t publication = 0;
+    const bool memoizable = ReadFeedbackPublication(&published, &publication) && published == device;
+    if (memoizable) {
+        const PresentingFeedbackMatch& memo = t_presenting_match;
+        if (memo.device == device && memo.feedback_publication == publication) {
+            const uint64_t sequence = SwapMgr_PresentingDeviceSequence();
+            const ActiveAPI memo_api = SwapMgr_GetActiveAPI();
+            if ((sequence & 1u) == 0 && sequence == memo.presenting_sequence &&
+                (memo_api == ActiveAPI::DX11 || memo_api == ActiveAPI::DX12))
+                return true;
+        }
+    }
+    const uint64_t presenting_sequence =
+        memoizable ? SwapMgr_PresentingDeviceSequence() : 1u;
     IUnknown* presenting_device = SwapMgr_AcquirePresentingDevice();
     const ActiveAPI api = SwapMgr_GetActiveAPI();
     // Before presenter discovery, native NvAPI calls may bootstrap feedback.
@@ -305,6 +351,15 @@ static bool IsPresentingFeedbackDevice(
             api == ActiveAPI::DX11 || api == ActiveAPI::DX12
                 ? MarkerRejection::SelectedIdentity : MarkerRejection::UnsupportedAPI,
             device, presenting_device, marker);
+    } else if (memoizable && (presenting_sequence & 1u) == 0) {
+        // Memoize only when neither publication moved across the comparison: the compared
+        // objects are then exactly the ones the two sequences name.
+        IUnknown* published_after = nullptr;
+        uint64_t publication_after = 0;
+        if (ReadFeedbackPublication(&published_after, &publication_after) &&
+            published_after == device && publication_after == publication &&
+            SwapMgr_PresentingDeviceSequence() == presenting_sequence)
+            t_presenting_match = { device, publication, presenting_sequence };
     }
     NvAPI_ReleaseFeedbackDevice(presenting_device);
     return matches;
@@ -612,23 +667,15 @@ public:
 // (g_last_gate_sleep_us declared in presentation_gate.h)
 
 // ── RTSS filter ──
-static std::atomic<HMODULE> g_rtss{ nullptr };
-
+// The caller is RTSS's when its return address lies in RTSSHooks64.dll's image: two compares of the
+// image range the loader scan published (module_presence.h), no loader query per marker. The range
+// is the module's own, so there is nothing per address to remember and nothing to invalidate when
+// another module is loaded or unloaded: an address cached as "not RTSS" could go stale across an
+// unload and reload into the same range, a range check cannot. RTSS itself loading or unloading
+// is seen by the scan (the worker's next pass: after a LoadLibrary notification, else at most one
+// 250 ms timeout late).
 static bool CallerIsRTSS(void* return_address) {
-    HMODULE rtss = g_rtss.load(std::memory_order_acquire);
-    if (!rtss) {
-        rtss = GetModuleHandleW(L"RTSSHooks64.dll");
-        if (rtss) {
-            g_rtss.store(rtss, std::memory_order_release);
-        }
-    }
-    if (!rtss) return false;
-
-    HMODULE caller = nullptr;
-    GetModuleHandleExW(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        reinterpret_cast<LPCWSTR>(return_address), &caller);
-    return caller == rtss;
+    return ModulePresence_AddressInRtss(return_address);
 }
 
 static NvAPI_Status SafeInvokeSetSleepMode(
@@ -1115,7 +1162,7 @@ static void UpdateLowLatencyOverride(bool bypass) noexcept {
     ReleaseSRWLockExclusive(&s_sleep_mode_forward_lock);
 }
 
-// ── Unified pacer: the Sleep-mode tuple (spec 4.1) ──
+// ── Unified pacer: the Sleep-mode tuple ──
 static const char* SleepOwnerText(UnifiedSleepOwner owner) noexcept {
     switch (owner) {
     case UnifiedSleepOwner::Unified: return "unified";
@@ -1324,7 +1371,7 @@ static NvAPI_Status ForwardDesiredSleepMode(IUnknown* device, NV_SET_SLEEP_MODE_
     return result;
 }
 
-// ── Unified pacer: the Sleep hook's start wait and self-check (spec 4.1 steps 3 to 8) ──
+// ── Unified pacer: the Sleep hook's start wait and self-check ──
 // The hard limit's wait on a change of the ready index, written against a small set of
 // primitives so a scripted clock can drive it: never a wait beyond the absolute deadline.
 // The coarse wait (WaitOnAddress) asks for whole milliseconds rounded DOWN, so it sits inside
@@ -1638,7 +1685,7 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
         // The bypass is decided once per call, before the pre-wait: the
         // pre-Sleep margin is learned separately with and without the
         // driver's Sleep after the hook.
-        // Key unified_pacer: this Sleep is the start of the frame (spec 4.1). On the
+        // Key unified_pacer: this Sleep is the start of the frame. On the
         // presenting device it replaces the pre-Sleep branch below, and the bypass is
         // not consulted: the driver's Sleep always runs. With the key off, one load and
         // a not-taken branch: the bypass first, then the presenting device, as before.
@@ -1832,7 +1879,7 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
         IsImmediateTimingMarker(marker_params.markerType) &&
         g_marker_forward_after_wait.load(std::memory_order_relaxed) &&
         // Key unified_pacer: the marker is forwarded first whatever the order option
-        // says (spec 4.1); nothing waits in this hook for the unified path.
+        // says; nothing waits in this hook for the unified path.
         !PacingPipeline_UnifiedPacerKey();
     NvAPI_Status result = NVAPI_OK;
     bool forwarded = false;

@@ -361,6 +361,8 @@ void CheckPipelineMatchesConfig() {
     CHECK(g_unified_queue_upstream.load() == (sizeof(void*) == 8 ? g_config.unified_queue_upstream : 0));
     CHECK(g_gpu_queue_probe_source.load() == (sizeof(void*) == 8 ? g_config.gpu_queue_probe_source : 0));
     CHECK(pipeline.gpu_queue_probe_source == (sizeof(void*) == 8 ? g_config.gpu_queue_probe_source : 0));
+    CHECK(pipeline.unified_queue_margin_end == (sizeof(void*) == 8 ? g_config.unified_queue_margin_end : 0));
+    CHECK(g_unified_queue_margin_end.load() == (sizeof(void*) == 8 ? g_config.unified_queue_margin_end : 0));
     CHECK(pipeline.unified_queue_allow_us == g_config.unified_queue_allow_us);
     CHECK(g_marker_forward_after_wait.load() ==
         (g_config.marker_forward_order == PacingMarkerForwardOrder::AfterWait));
@@ -404,6 +406,9 @@ void TestPacingPipelineDefaults() {
     CHECK(g_config.gpu_queue_probe_source == 1 && kPacingGpuQueueProbeSourceDefault == 1);
     CHECK(Value(local_path, "FrameLimiter", "gpu_queue_probe_source") == "1");
     CHECK(g_gpu_queue_probe_source.load() == (sizeof(void*) == 8 ? 1 : 0));
+    CHECK(g_config.unified_queue_margin_end == 1 && kPacingUnifiedQueueMarginEndDefault == 1);
+    CHECK(Value(local_path, "FrameLimiter", "unified_queue_margin_end") == "1");
+    CHECK(g_unified_queue_margin_end.load() == (sizeof(void*) == 8 ? 1 : 0));
     CHECK(g_config.unified_queue_upstream == 0 && kPacingUnifiedQueueUpstreamDefault == 0);
     CHECK(Value(local_path, "FrameLimiter", "unified_queue_upstream") == "0");
     CHECK(g_unified_queue_upstream.load() == 0);
@@ -1269,6 +1274,56 @@ void TestGpuQueueProbeSourceKey() {
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
+// unified_queue_margin_end (developer, probe only): default 1; loads, is clamped to 0..1, is saved, counts
+// as one developer override only away from 1, is a live key (an unparsable value is refused, an
+// out-of-range one clamped), reaches the pipeline snapshot and the probe's atomic (64-bit; 0 on Win32)
+// and resets to 1. An INI written by a build where the default was 0 keeps its 0 (no migration).
+void TestUnifiedQueueMarginEndKey() {
+    const bool wide = sizeof(void*) == 8;
+    struct Case { const char* value; int expected; };
+    for (const Case& test : {Case{"0", 0}, Case{"1", 1}, Case{"2", 1}, Case{"99", 1}, Case{"-1", 0}, Case{"-9", 0}}) {
+        Reset(false, false, {{"config_version", "5"}, {"unified_queue_margin_end", test.value}});
+        CHECK(g_config.unified_queue_margin_end == test.expected);
+        CheckPipelineMatchesConfig();
+        CHECK(PacingPipeline_GetConfig().unified_queue_margin_end == (wide ? test.expected : 0));
+        CHECK(g_unified_queue_margin_end.load() == (wide ? test.expected : 0));
+        CHECK(OverridesBesidesUnified() == (test.expected != 1 ? 1 : 0));
+        char saved[32] = {};
+        snprintf(saved, sizeof(saved), "%d", test.expected);
+        CHECK(Value(local_path, "FrameLimiter", "unified_queue_margin_end") == saved);
+        ReleaseStart();CHECK(OwnerShutdown());
+    }
+    Reset(false, false, {{"config_version", "5"}});
+    CHECK(g_unified_queue_margin_end.load() == (wide ? 1 : 0) && g_config.unified_queue_margin_end == 1);
+    CHECK(OverridesBesidesUnified() == 0);
+    char error[128] = {};
+    CHECK(Config_SetLiveKey("unified_queue_margin_end", "0", error, sizeof(error)) &&
+          g_config.unified_queue_margin_end == 0);
+    CHECK(g_unified_queue_margin_end.load() == 0 && OverridesBesidesUnified() == 1);
+    CHECK(Config_SetLiveKey("unified_queue_margin_end", "7", error, sizeof(error)) &&
+          g_config.unified_queue_margin_end == 1);
+    CHECK(Config_SetLiveKey("unified_queue_margin_end", "-4", error, sizeof(error)) &&
+          g_config.unified_queue_margin_end == 0);
+    CHECK(Config_SetLiveKey("unified_queue_margin_end", "1", error, sizeof(error)));
+    CheckPipelineMatchesConfig();
+    for (const char* bad : {"abc", "1x", ""}) {
+        CHECK(!Config_SetLiveKey("unified_queue_margin_end", bad, error, sizeof(error)) &&
+              g_config.unified_queue_margin_end == 1);
+    }
+    g_config.unified_queue_margin_end = 9;
+    ValidateConfig();
+    CHECK(g_config.unified_queue_margin_end == 1);
+    g_config.unified_queue_margin_end = -3;
+    ValidateConfig();
+    CHECK(g_config.unified_queue_margin_end == 0);
+    g_config.unified_queue_margin_end = 0;
+    ResetDeveloperKeepingEarlierPipeline();
+    CHECK(g_config.unified_queue_margin_end == 1 && g_unified_queue_margin_end.load() == (wide ? 1 : 0) &&
+          OverridesBesidesUnified() == 0);
+    CheckPipelineMatchesConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
 // Developer control file: Config_SetLiveKey sets one live key as the OSD does
 // (validated like an INI value, published to the cap atomics and the
 // pipeline) and queues no save; it refuses unparsable values, launch-only and
@@ -1696,6 +1751,7 @@ int main() {
     TestUnifiedQueueNeedFramesKey();
     TestUnifiedQueueUpstreamKey();
     TestGpuQueueProbeSourceKey();
+    TestUnifiedQueueMarginEndKey();
     TestFlipMeteringOffKey();
     TestLiveKeySetter();
     TestSourcePlacementParsing();

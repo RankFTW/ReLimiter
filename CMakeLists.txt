@@ -68,6 +68,8 @@ set(ADDON_SOURCES
     src/hw_monitor.cpp
     src/hw_spin.cpp
     src/loadlib_hooks.cpp
+    src/module_presence.h
+    src/module_presence.cpp
     src/marker_log.cpp
     src/marker_stamps.h
     src/marker_stamps.cpp
@@ -108,6 +110,9 @@ set(ADDON_SOURCES
     src/vtable_copy.cpp
     src/vk_enforce.cpp
     src/blackout.cpp
+    src/hotkey_edge.h
+    src/hotkey_poller.h
+    src/hotkey_poller.cpp
     src/focus_lock.cpp
     src/pacing_telemetry_types.h
     src/pacing_core_types.h
@@ -126,6 +131,8 @@ set(ADDON_SOURCES
     src/gpu_queue_probe_core.cpp
     src/gpu_queue_dependency.h
     src/gpu_queue_dependency.cpp
+    src/gpu_queue_borrow.h
+    src/gpu_queue_borrow.cpp
     src/period_governor.h
     src/period_governor.cpp
     src/source_placement.h

@@ -781,7 +781,7 @@ struct LeadRequest {
     bool collision_guard = false;
     // Spike floor (above; developer key lead_spike_floor).
     bool spike_floor = true;
-    // R1: the lead is at least this (µs; 0 none) before the collision guard
+    // The lead is at least this (µs; 0 none) before the collision guard
     // sees it: the warm lead of the rung that outputs a frame whose hold
     // rung the overload guard or an A/B block demoted. The bucket's own
     // slew state is untouched; LeadGuardOutcome::demand_floored reports it.

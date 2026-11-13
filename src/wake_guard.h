@@ -6,7 +6,7 @@
 
 // Adaptive wake guard: P99 of wake errors + 150μs.
 // Base = 800μs, requires min 4 samples before adapting.
-// Spec §4.2
+//
 
 struct AdaptiveWakeGuard {
     RollingWindow<double, 64> wake_errors; // actual_wake - requested_wake, μs
