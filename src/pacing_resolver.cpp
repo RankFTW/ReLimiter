@@ -523,21 +523,6 @@ PacingPipelineSnapshot PacingPipeline_Read() noexcept
 
 // ── Text ──
 
-const char* PacingRenderQueue_Text(PacingRenderQueue render_queue) noexcept
-{
-    switch (render_queue) {
-        case PacingRenderQueue::Keep: return "keep";
-        case PacingRenderQueue::Remove: return "remove";
-        case PacingRenderQueue::RemoveHeld: return "remove_held";
-        default: return "unknown";
-    }
-}
-
-bool PacingRenderQueue_FromText(const char* text, PacingRenderQueue* render_queue) noexcept
-{
-    return EnumFromText(text, render_queue, PacingRenderQueue_Text);
-}
-
 const char* PacingLeadCoverage_Text(PacingLeadCoverage coverage) noexcept
 {
     switch (coverage) {

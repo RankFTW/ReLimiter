@@ -367,8 +367,6 @@ bool s_logged_lead_queue = false;
 // for the previous frame).
 bool s_logged_behind_wait = false;
 bool s_logged_fg_behind_wait = false;
-PacingRoute s_last_route = PacingRoute::None;
-bool s_route_known = false;
 
 // Developer key unified_pacer (unified_pacer.h). The mailbox word is written by
 // the Sleep hook outside the owner and consumed once by the owner at the marker. The Sleep
@@ -546,13 +544,6 @@ static void ObserveCollisionGuard(double fg_divisor) noexcept
     s_logged_collision_guard = guard;
 }
 
-// Lifecycle, cap, raw FG divisor or route change: the lead slack windows
-// restart, so the slack evidence holds only frames observed after the change.
-static void ResetFeasibility() noexcept
-{
-    s_source_stage.ClearSlackEvidence();
-}
-
 // Controller lifecycle. The generation bumps only on API change,
 // identity-domain (trigger/route) change and producer-epoch change here;
 // Flush(FLUSH_ALL) bumps it for API change, full swapchain teardown and
@@ -590,7 +581,6 @@ static void ApplyLifecycle(SchedulerTrigger trigger, PacingSourceMarker marker) 
         ApplyFeedbackResetRequests();
         if (s_stage_initialized) {
             ResetAdaptationRegime("controller lifecycle");
-            ResetFeasibility();
         }
         s_stage_generation = generation;
         s_stage_initialized = true;
@@ -608,9 +598,7 @@ static void ApplyLifecycle(SchedulerTrigger trigger, PacingSourceMarker marker) 
 }
 
 // Resolves the pacing pipeline for this OnMarker and publishes it; logs once
-// per change. A route change restarts the feasibility evidence first.
-// Returns the published snapshot
-// (generation assigned).
+// per change. Returns the published snapshot (generation assigned).
 static PacingPipelineSnapshot ResolvePipeline(
     SchedulerTrigger trigger,
     const PacingPipelineConfig& config,
@@ -637,14 +625,6 @@ static PacingPipelineSnapshot ResolvePipeline(
         PacingPipeline_HasCapability(PacingCapability::FgInputRoute, generation);
     capabilities.fg_separate_presenter =
         PacingPipeline_HasCapability(PacingCapability::FgSeparatePresenter, generation);
-
-    // A Present fallback frame is a marker-flow excursion, not a route change
-    // for the evidence: it neither resets it nor becomes the tracked route.
-    if (trigger != SchedulerTrigger::PresentFallback) {
-        if (s_route_known && capabilities.route != s_last_route) ResetFeasibility();
-        s_last_route = capabilities.route;
-        s_route_known = true;
-    }
 
     // The developer key unified_pacer's transition is applied by ApplyUnifiedKeyTransition at the
     // start of the invocation (OnMarker, before the stage events are drained), never here.
@@ -703,8 +683,8 @@ static void DrainQueueLawFeed(bool law_on) noexcept
 // Key off: a late output restarts the cadence as in 9746673 (OutputLate), no unified report
 // is registered or flushed, and the law/lead/mailbox state has been reset. Key on: outputs
 // are judged GPU-paced (no OutputLate restart: the grid follows the start), and used reports
-// feed the lead. A toggle resets the law, the lead's slack evidence and its
-// buckets, and leaves a Sleep-mode epoch pending so the first reconcile applies
+// feed the lead. A toggle resets the law and the lead's buckets, and leaves a
+// Sleep-mode epoch pending so the first reconcile applies
 // the new key's tuple exactly.
 static void ApplyUnifiedKeyTransition(const PacingPipelineConfig& config) noexcept
 {
@@ -720,7 +700,6 @@ static void ApplyUnifiedKeyTransition(const PacingPipelineConfig& config) noexce
     // The waker is installed before the publication starts (frame_plan.cpp stays free of Windows).
     FramePlan_SetReadyWaker([](const void* address) noexcept { WakeByAddressAll(const_cast<void*>(address)); });
     g_up_ready_publish.store(s_up_key, std::memory_order_relaxed);
-    ResetFeasibility();
     s_source_stage.ResetBuckets();
     s_driver_sleep_index = 0;
     NvAPI_BumpSleepModeEpoch();
@@ -966,24 +945,17 @@ static void DrainReflexReports(const PacingPipelineConfig& config) noexcept
                 sample.frame_id, queue_wait_us, sample.gpu_active_us, sample.ai_frame_us);
         }
         // The release headroom's heavy-work start r − A, the queue-order
-        // test's GPU start, the lead sample behind the wait and the FG input
-        // wait's GPU need (lead_controller.h).
+        // test's GPU start and the lead sample behind the wait (lead_controller.h).
         if (sample.gpu_active_us > 0.0) {
             LeadGpuReport report{};
             report.active_us = sample.gpu_active_us;
             report.span_us = sample.gpu_render_duration_us;
-            report.work_us = sample.gpu_execution_available ? sample.gpu_service_us : 0.0;
             report.start_qpc = sample.gpu_start_qpc;
             report.first_work_streamed = sample.first_work_streamed;
             report.first_submission_delay_us = sample.first_submission_delay_us;
             s_source_stage.OnGpuReport(sample.producer_epoch, sample.frame_id, report);
         }
-        // Render handoff GPU floor (lead_controller.h):
-        // every report's GPU times and pair.
-        if (sample.gpu_end_qpc > 0) {
-            s_source_stage.OnGpuRenderEnd(sample.producer_epoch, sample.frame_id, sample.gpu_start_qpc,
-                sample.gpu_end_qpc, sample.present_end_to_gpu_end_us, sample.render_done_qpc);
-        }
+        // The first-submission delay window of the lead sample behind the wait (lead_controller.h).
         if (sample.back_pressure_known) {
             s_source_stage.OnReportPair(sample.producer_epoch, sample.frame_id, sample.back_pressure);
         }
@@ -1269,7 +1241,6 @@ static SourceStageFrame RunPlanned(
     // or the Marker fallback while the game calls no Reflex Sleep; passthrough, the present
     // route and mode Off excluded): the unified branch of the source stage plans it.
     const bool unified = SourceStage_UnifiedPlans(pipeline, config.unified, s_source_stage.UnifiedEnabled());
-    request.gpu_queue_wait_render_queue = kPacingGpuQueueWaitRenderQueue;
     // Lead spike floor (lead_controller.h).
     request.spike_floor = kPacingLeadSpikeFloor;
     // The driver's Reflex Sleep for the index this plan is expected to take,
@@ -1691,11 +1662,7 @@ void OnMarker(
             LOG_INFO("Scheduler: cap/FG change (fps %d -> %d, FG %d -> %d): grid period change",
                      s_last_target_fps, target_fps, s_last_fg_divisor_raw, fg_divisor_raw);
             ResetAdaptationRegime("cap or FG divisor change");
-            ResetFeasibility();
             s_driver_sleep_index = 0;
-            // The GPU floor's output-shaped windows belong to the old cap and
-            // FG work (lead_controller.h).
-            s_source_stage.ResetGpuFloor();
         }
         s_last_target_fps = target_fps;
         s_last_fg_divisor_raw = fg_divisor_raw;
@@ -1851,10 +1818,9 @@ void OnMarker(
 
     // ── VRR ──
     // Key unified_pacer: with the cap off VRR is paced at the VRR cap (Hz - Hz^2/3600).
-    int vrr_target_fps = target_fps;
-    if (vrr_target_fps <= 0 && config.unified) {
-        vrr_target_fps = static_cast<int>(UnifiedPacer_VrrCapFps(g_ceiling_hz.load(std::memory_order_relaxed)));
-    }
+    const int vrr_target_fps = PacingPipeline_VrrTargetFps(config.unified, target_fps, [] {
+        return UnifiedPacer_VrrCapFps(g_ceiling_hz.load(std::memory_order_relaxed));
+    });
     input.target_fps = vrr_target_fps;
     if (vrr_target_fps <= 0) {
         // No limit: pass through for minimum latency.
@@ -1880,9 +1846,9 @@ void OnMarker(
     // This frame's Reflex reports, before its plan.
     DrainReflexReports(config);
     // Key unified_pacer: no LFC multiple (the law owns the interval).
-    input.interval_us = config.unified
-        ? input.base_interval_us
-        : ApplyLfc(input.base_interval_us, input.fg_divisor);
+    input.interval_us = PacingPipeline_VrrIntervalUs(config.unified, input.base_interval_us, [&](double base) {
+        return ApplyLfc(base, input.fg_divisor);
+    });
     input.period_identity_us = VrrPeriodIdentityUs(vrr_target_fps, fg_divisor_raw);
     // This frame's reports were drained before the end-of-frame poll; keep
     // that poll's samples for the next frame's drain.

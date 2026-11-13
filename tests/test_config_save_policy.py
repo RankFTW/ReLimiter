@@ -267,8 +267,9 @@ class ConfigSavePolicyTests(unittest.TestCase):
         load = body("LoadConfig")
         # The removed settings are named once, for a non-first launch of an INI older than version 6; the version-5
         # step (the queue defaults) stays and no earlier step does.
-        self.assertRegex(load, r"if \(!s_first_launch && saved_version < 6\) \{\s*LogRemovedKeysWithValues\(S, P\);"
-                               r"\s*DropRemovedPresetKeys\(P\);\s*\}")
+        self.assertIn("if (!s_first_launch && saved_version < 6) LogRemovedKeysWithValues(S, P);", load)
+        # The preset-key clean-up is idempotent and runs at every start, outside the version gate.
+        self.assertRegex(load, r"LogRemovedKeysWithValues\(S, P\);\s*DropRemovedPresetKeys\(P\);")
         self.assertIn("saved_version < 5", load)
         self.assertEqual(sorted(set(re.findall(r"saved_version\s*<\s*(\d+)", load))), ["5", "6"])
         self.assertLess(load.index("LogRemovedKeysWithValues(S, P);"), load.index("saved_version < 5"))

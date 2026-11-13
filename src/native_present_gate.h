@@ -6,8 +6,7 @@
 
 // Native Present route: PRESENT_START -> native Present
 // attribution and qualification for every NvAPI frame, carrying the exact
-// plan key to the native Present for H2 (NativeHold, developer override) and
-// H3 (GPU queue wait). Qualification is published as
+// plan key to the native Present for H3 (GPU queue wait). Qualification is published as
 // PacingCapability::NativeRoute by NativeGate_PublishRouteCapability.
 //
 // Route mode: Marker (the initial value) and Native run the route with native
@@ -190,10 +189,10 @@ private:
 
 // Windows runtime adapter, separate from the directly tested routing policy.
 NativeGateContext NativeGate_GetContext(int64_t now_qpc) noexcept;
-// H2 executor (developer rung override `native`): holds a NativeHold plan's
-// output at the native Present (presentation_gate.h contract), after pushing
-// the NativeArrival stage event. Other plans are left untouched. Stamps
-// target_qpc, native_release_qpc and plan_status in call->trace.
+// Native Present executor: a plan on the GPU queue wait rung that the GPU gate did not
+// handle is declined here (decided without a hold, plan_status stamped in call->trace);
+// no other plan is touched. The H2 NativeHold hold no longer exists (the rung stays an
+// enumerator of the telemetry).
 void NativeGate_Execute(NativeGateCall* call, uint64_t native_swapchain) noexcept;
 // Publishes PacingCapability::NativeRoute for controller_generation when the
 // route qualification or the generation changed since the last publication.

@@ -30,34 +30,12 @@
 //   The evidence rule only helps when evidence for n arrives before frame
 //   n + 1's output runs; the floor covers that race. Lateness above slack
 //   decays by slack per frame instead of ratcheting the phase later.
-// - GPU-paced frame (PlanNext, earliest_target_qpc; developer A/B
-//   gpu_paced_cadence). A frame with an earliest target is on time by
-//   construction (the GPU set its release): its source lateness is not
-//   judged, so it never restarts the cadence, and S is max(T − L, now).
-//   When the earliest target is later than the grid's T(n), the grid
-//   follows it from n: a segment with origin at that target, without an
-//   epoch. Otherwise the grid keeps T(n), so the cadence is the later of
-//   the cap and the GPU's pace. Its output is not judged either
-//   (ObserveOutput with gpu_paced): T(n) is the early side of where such a
-//   frame is ready, and that early side lags a change from cap-bound to
-//   GPU-bound frames, so judging it restarted the cadence every few frames
-//   (Gears of War: E-Day, FG 2×) and the restarts paused the holds. The
-//   output spacing floor still spaces the next frame after it.
-// - Driver-released frame (PlanNext, driver_release_qpc; developer A/B
-//   gpu_paced_cadence, the driver's Reflex Sleep kept, so the A/B gate stays
-//   until the cutover that removes it). The driver's Sleep paces the game
-//   and holds a frame the cadence has not placed: it returns after the
-//   frame's source wake S = T(n) − L, the frame reaches PlanNext late, and
-//   judged against S that restarted the cadence and held a frame the driver
-//   had already placed (Phantom Blade Zero, FG 2× at the GPU's edge). A
-//   frame is driver-released when the Sleep returned after S and the game
-//   had reached the Sleep on time: its entry (game_arrival_qpc) is no later
-//   than the judged wake S (below) plus the late tolerance, source slack
-//   included. The driver, not the game, then set its release. It is a
-//   GPU-paced frame exactly as above when driver_earliest_target_qpc is
-//   given (the later of it and earliest_target_qpc is its earliest target);
-//   without one it is judged as any frame, but the plan still reports
-//   driver_released.
+// - GPU-paced output (ObserveOutput with gpu_paced; the unified pacer judges
+//   every output so). Its output is not judged: T(n) is the early side of
+//   where such a frame is ready, and that early side lags a change from
+//   cap-bound to GPU-bound frames, so judging it restarted the cadence every
+//   few frames (Gears of War: E-Day, FG 2×) and the restarts paused the
+//   holds. The output spacing floor still spaces the next frame after it.
 // - Lead discontinuity. A source is judged late against
 //   S = T − min(L(n), L(n − 1)), L(n − 1) the previous plan's lead: the
 //   frame's pre-wait aimed at that S. L grows by at most one slew step per
@@ -132,10 +110,9 @@ bool CadenceGrid_TargetOf(
     uint64_t grid_index,
     int64_t* target_qpc) noexcept;
 
-// Fixed-refresh snap rule, shared by PlanNext and the period
-// governor's ladder: true when `fixed` is usable and interval_ticks is within
-// 2% of k >= 1 whole refreshes. *snapped_interval_ticks (optional) receives
-// k × refresh when true.
+// Fixed-refresh snap rule of PlanNext: true when `fixed` is usable and
+// interval_ticks is within 2% of k >= 1 whole refreshes.
+// *snapped_interval_ticks (optional) receives k × refresh when true.
 bool CadenceGrid_SnapsToFixed(
     double interval_ticks,
     const CadenceGridFixedReference& fixed,
@@ -250,10 +227,6 @@ struct CadenceGridPlanInput {
     int64_t qpc_frequency = 0;
     double interval_us = 0.0;   // grid interval: source interval, FG divisor applied
     bool period_change = false; // cap, VRR ceiling, LFC or FG divisor changed I
-    // The period governor changed its step. With an interval change and
-    // no period_change it starts a GovernorStep epoch instead of a silent
-    // rebase; Lifecycle, ModeChange and PeriodChange take priority.
-    bool governor_step = false;
     double lead_us = 0.0;       // L; may exceed the interval. Negative clamps to 0
     // How much later than S a source can arrive and still make T: L minus
     // the median measured X of its rung. A source later than the judged S
@@ -263,16 +236,6 @@ struct CadenceGridPlanInput {
     // still misses T starts an OutputLate epoch. 0 (unknown) keeps the
     // tolerance alone. Negative or non-finite counts as 0.
     double source_slack_us = 0.0;
-    // GPU-paced frame (rules above): T(n) is at least this QPC and the
-    // frame's lateness is not judged; 0 = none.
-    int64_t earliest_target_qpc = 0;
-    // Driver-released frame (rules above): the QPC the driver's Reflex Sleep
-    // returned at (0 = none: the frame is not judged for it), the QPC the game
-    // entered that Sleep at (0 = unknown) and the earliest target such a
-    // frame has (0 = unknown, the lead's early side is not known yet).
-    int64_t driver_release_qpc = 0;
-    int64_t game_arrival_qpc = 0;
-    int64_t driver_earliest_target_qpc = 0;
     PacingTimingMode mode = PacingTimingMode::Vrr; // Off suspends the grid
     uint32_t controller_generation = 0;
     CadenceGridFixedReference fixed{}; // used only in Fixed mode
@@ -286,10 +249,6 @@ struct CadenceGridPlan {
     uint32_t epoch = 0;
     PacingEpochReason epoch_reason = PacingEpochReason::None; // None: no epoch started
     bool released_immediately = false; // source late within tolerance (plus slack): S_n = now
-    bool gpu_target = false; // T_n is the earliest target, later than the grid's T(n)
-    // The driver's Sleep released the frame (rules above), whether or not an
-    // earliest target was available to follow.
-    bool driver_released = false;
 };
 
 // Unified pacer plan (developer key unified_pacer; unified_pacer.h): the output
@@ -312,6 +271,8 @@ struct CadenceGridPlanAtInput {
     double display_interval_us = 0.0;
 };
 
+// GovernorStep is the last enumerator: no code produces it any more (the period governor's
+// steps are gone), but the CSV value stays, so it still sizes the per-reason counters.
 constexpr size_t kCadenceGridEpochReasonCount =
     static_cast<size_t>(PacingEpochReason::GovernorStep) + 1;
 
@@ -323,8 +284,6 @@ struct CadenceGridStatistics {
     uint64_t silent_rebases = 0;
     uint64_t released_immediately = 0;
     uint64_t snapped_plans = 0;
-    uint64_t gpu_target_plans = 0; // CadenceGridPlan::gpu_target
-    uint64_t driver_released_plans = 0; // CadenceGridPlan::driver_released
     // Outputs of GPU-paced frames later than T(n) + tol (or, for older
     // evidence, implied later than T(b) + tol) that started no epoch.
     uint64_t gpu_paced_late_outputs = 0;

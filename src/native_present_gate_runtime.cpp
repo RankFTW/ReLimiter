@@ -76,26 +76,7 @@ void NativeGate_PublishRouteCapability(uint32_t controller_generation) noexcept
     }
 }
 
-namespace {
-struct NativeHoldContext {
-    const NativeGateTrace* trace;
-    uint64_t native_swapchain;
-    uint64_t swapchain_generation;
-};
-bool IsNativeHoldCurrent(const void* value) noexcept {
-    const auto& hold = *static_cast<const NativeHoldContext*>(value);
-    if (!NativeGate_IsSettingsCurrent(hold.trace->settings_generation)) return false;
-    if (hold.trace->prediction_epoch != NativeGate_PredictionEpoch()) return false;
-    const NativeGateContext current = NativeGate_GetContext(hold.trace->native_arrival_qpc);
-    return current.supported && current.no_frame_generation &&
-        current.native_swapchain == hold.native_swapchain &&
-        current.swapchain_generation == hold.swapchain_generation &&
-        current.producer_epoch == hold.trace->producer_epoch &&
-        current.controller_generation == hold.trace->controller_generation;
-}
-}
-
-void NativeGate_Execute(NativeGateCall* call, uint64_t native_swapchain) noexcept {
+void NativeGate_Execute(NativeGateCall* call, uint64_t) noexcept {
     if (!call) return;
     const PacingPlanKey key{PacingIdentityDomain::NvApiFrame, call->trace.producer_epoch,
         call->trace.controller_generation, call->trace.source_frame_id};
@@ -114,33 +95,4 @@ void NativeGate_Execute(NativeGateCall* call, uint64_t native_swapchain) noexcep
         call->trace.plan_status = static_cast<uint8_t>(declined.status);
         return;
     }
-    // H2 plans only below; marker-route plans belong to their own executors.
-    if (plan.rung != PacingRung::NativeHold) return;
-    PacingStageEvent arrival{};
-    arrival.key = key;
-    arrival.grid_index = plan.grid_index;
-    arrival.qpc = call->trace.native_arrival_qpc;
-    arrival.kind = PacingStageEventKind::NativeArrival;
-    arrival.rung = PacingRung::NativeHold;
-    FramePlan_PushStageEvent(arrival);
-
-    PresentationGateResult result{};
-    if (call->trace.status != NativeGateStatus::Native) {
-        // The route did not select this call (unmapped, stale, nested, special
-        // or FG Present): the plan's output is decided here without a hold.
-        PresentGate_DeclineOutput(key, PacingRung::NativeHold, call->trace.native_arrival_qpc, &result);
-        call->trace.plan_status = static_cast<uint8_t>(result.status);
-        return;
-    }
-    const NativeHoldContext hold{&call->trace, native_swapchain,
-        call->trace.swapchain_generation};
-    const PresentationGateOptions options{IsNativeHoldCurrent, &hold};
-    PresentGate_Execute(key, PacingRung::NativeHold, call->trace.native_arrival_qpc, &options, &result);
-    call->trace.plan_status = static_cast<uint8_t>(result.status);
-    // Hold times only for a hold that ran; Late, Stale and Undeliverable
-    // outcomes keep the arrival stamps so no CPU hold is attributed.
-    if (!result.held) return;
-    call->trace.target_qpc = result.target_qpc;
-    call->trace.native_release_qpc = result.release_qpc;
-    if (!IsNativeHoldCurrent(&hold)) call->trace.status = NativeGateStatus::Cancelled;
 }

@@ -136,7 +136,6 @@ set(ADDON_SOURCES
     src/period_governor.h
     src/period_governor.cpp
     src/source_placement.h
-    src/source_placement.cpp
     src/render_handoff.h
     src/render_handoff.cpp
     src/rung_feasibility.h
@@ -191,8 +190,6 @@ if(RELIMITER_64BIT)
         src/gpu_readiness_d3d12_queue.cpp
         src/gpu_present_gate_d3d12.cpp
         src/gpu_queue_probe_d3d12.cpp
-        src/gpu_priority_probe.cpp
-        src/gpu_priority_probe.h
     )
 endif()
 

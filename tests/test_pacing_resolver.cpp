@@ -957,7 +957,6 @@ namespace
     {
         static_assert(kPacingLeadCoverage == PacingLeadCoverage::Q99, "the lead covers 99% of frames");
         static_assert(kPacingFgLateSpacing && kPacingLeadSpikeFloor, "the late-frame floors are on");
-        static_assert(kPacingGpuQueueWaitRenderQueue == PacingRenderQueue::Keep, "the render queue stays in the lead");
         static_assert(kPacingGpuWaitHeadroomDefaultUs == 1000.0, "the release headroom");
         static_assert(kPacingUnifiedEveryFrameServiceDefault, "the law's service estimate is every frame");
         static_assert(kPacingUnifiedQueueTargetDefaultUs == 2000.0, "the queue term target");

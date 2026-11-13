@@ -215,15 +215,6 @@ bool GpuReadinessQueue_Release(GpuReadinessQueue* queue) noexcept {
     if (completed==UINT64_MAX || queue->faulted.load() || queue->uncertain_submission.load() ||
         completed < queue->last_submitted.load())
         return false;
-    // gpu_start_probe: every Signal of the probe fence must have completed
-    // too (it is ahead of the readiness Signals in queue order, except the
-    // one of a frame whose Present has not come yet).
-    if (queue->probe_fence) {
-        uint64_t probe_done = UINT64_MAX;
-        __try { probe_done = queue->probe_fence->GetCompletedValue(); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { queue->faulted.store(true); }
-        if (probe_done == UINT64_MAX || probe_done + 1 < queue->probe_next.load()) return false;
-    }
     for(const auto& slot:queue->timestamps) {
         if(slot.ownership.load(std::memory_order_acquire)==GpuTimestampOwnership::CpuOwned ||
             (slot.ownership.load(std::memory_order_acquire)==GpuTimestampOwnership::Retired && completed<slot.retire_value))return false;
@@ -247,9 +238,6 @@ bool GpuReadinessQueue_Release(GpuReadinessQueue* queue) noexcept {
     released=Release(queue->readback) && released;
     released=Release(queue->queries) && released;
     released=Release(queue->fence) && released;
-    queue->probe_ready.store(false, std::memory_order_release);
-    released=Release(queue->probe_fence) && released;
-    queue->probe_fence = nullptr;
     released=Release(queue->queue) && released;
     queue->mapped = nullptr;
     queue->readback = nullptr;
@@ -260,90 +248,6 @@ bool GpuReadinessQueue_Release(GpuReadinessQueue* queue) noexcept {
     queue->completion_event = nullptr;
     if(!released)queue->faulted.store(true,std::memory_order_release);
     return released;
-}
-
-HRESULT GpuReadinessQueue_InitializeProbe(GpuReadinessQueue* queue) noexcept {
-    ID3D12Device* device = nullptr;
-    HRESULT result = E_FAIL;
-    __try {
-        if (SUCCEEDED(queue->queue->GetDevice(IID_PPV_ARGS(&device))) && device)
-            result = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&queue->probe_fence));
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        queue->faulted.store(true);
-        result = E_FAIL;
-    }
-    Release(device);
-    if (SUCCEEDED(result) && !queue->probe_event) {
-        queue->probe_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (!queue->probe_event) result = HRESULT_FROM_WIN32(GetLastError());
-    }
-    if (FAILED(result) && queue->probe_fence) {
-        Release(queue->probe_fence);
-        queue->probe_fence = nullptr;
-    }
-    return result;
-}
-
-HRESULT GpuReadinessQueue_ProbeSignal(GpuReadinessQueue* queue, uint64_t value) noexcept {
-    HRESULT result = E_FAIL;
-    __try {
-        result = queue->queue->Signal(queue->probe_fence, value);
-        if (SUCCEEDED(result)) result = queue->probe_fence->SetEventOnCompletion(value, queue->probe_event);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) { result = E_FAIL; }
-    return result;
-}
-
-bool GpuReadinessQueue_ProbeBegin(GpuReadinessQueue* queue, uint64_t* value) noexcept {
-    // The caller owns the arm, so it is the only submitter. An entry the
-    // sampler is inside is not reused: the probe of this frame is skipped.
-    const uint64_t next = queue->probe_next.load();
-    GpuStartProbeEntry& entry = queue->probe_ring[next % kGpuStartProbeRing];
-    uint32_t expected = 0;
-    if (!entry.busy.compare_exchange_strong(expected, 1u)) return false;
-    entry.wake_qpc.store(0);
-    entry.value.store(next);
-    queue->probe_next.store(next + 1);
-    entry.busy.store(0u);
-    *value = next;
-    return true;
-}
-
-void GpuReadinessQueue_ProbeStamp(GpuReadinessQueue* queue) noexcept {
-    if (!queue->probe_ready.load(std::memory_order_acquire) || !queue->probe_fence) return;
-    uint64_t completed = UINT64_MAX;
-    __try { completed = queue->probe_fence->GetCompletedValue(); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return; }
-    if (completed == UINT64_MAX) return;
-    // Taken after the completed value was observed, so no completion carries a
-    // time from before it happened: an upper bound of the GPU start.
-    LARGE_INTEGER observed{};
-    QueryPerformanceCounter(&observed);
-    GpuStartProbeEntry* newest = nullptr; // claimed (busy) until stored
-    for (auto& entry : queue->probe_ring) {
-        uint32_t expected = 0;
-        if (!entry.busy.compare_exchange_strong(expected, 1u)) continue; // the submitter is inside it
-        const uint64_t value = entry.value.load();
-        if (value == 0 || value > completed || entry.wake_qpc.load() != 0) {
-            entry.busy.store(0u);
-            continue;
-        }
-        if (!newest) {
-            newest = &entry;
-        } else if (newest->value.load() < value) {
-            newest->wake_qpc.store(-1);
-            newest->busy.store(0u);
-            newest = &entry;
-        } else {
-            entry.wake_qpc.store(-1);
-            entry.busy.store(0u);
-        }
-    }
-    if (newest) {
-        newest->wake_qpc.store(observed.QuadPart);
-        newest->busy.store(0u);
-    }
 }
 
 bool GpuReadinessQueue_MatchesDevice(ID3D12CommandQueue* queue, IUnknown* expected) noexcept {

@@ -1,7 +1,6 @@
 // Stage-demand computation (src/frame_time_adaptation.cpp), Reflex report
 // admission policy and the delayed-report queue. The Frame-Time Adaptation
-// controller is retired; the period
-// governor that consumes this demand has its own test (test_period_governor).
+// controller is retired.
 // Production wiring (feedback.cpp producer, scheduler consumer) is not covered.
 
 #include "frame_time_adaptation.h"
@@ -388,7 +387,7 @@ namespace
 
 
     // The previous frame's end-of-frame poll and the current frame's pre-poll
-    // both reach the governor, in source order.
+    // both reach the report drain, in source order.
     void TestPendingReportsSurviveTwoPollsInOrder()
     {
         ReflexAdaptationQueue pending;

@@ -1304,7 +1304,6 @@ GpuPresentExecution GpuPresent_Execute(NativeGateCall* native,GpuReadinessCall*,
       }
       return s_gpu_execution;
 }
-GpuPresentExecution GpuPresent_ExecutePresenterProbe(PresentTimelineSpan*) noexcept {return GpuPresentExecution::Fallback;}
 #endif
 void PacingTelemetry_PushPresent(const PacingPresentRecord& record) noexcept {
       ++s_pacing_present_records;

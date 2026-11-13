@@ -37,7 +37,7 @@ static HANDLE CreateHighResolutionTimer() noexcept {
     return timer ? timer : CreateWaitableTimerW(nullptr, FALSE, nullptr);
 }
 
-bool PreSleepWaitUntil(int64_t target_qpc, bool precise) {
+bool PreSleepWaitUntil(int64_t target_qpc) {
     if (RuntimeLifecycle_IsStopping()) return false;
     if (s_pre_sleep_busy.test_and_set(std::memory_order_acquire)) return false;
     struct BusyScope {
@@ -49,17 +49,12 @@ bool PreSleepWaitUntil(int64_t target_qpc, bool precise) {
     const double remaining_us = qpc_to_us(target_qpc - now.QuadPart);
     if (!std::isfinite(remaining_us) || remaining_us <= 0.0 || remaining_us > 500'000.0) return false;
 
-    // Timer, no spin, unless `precise` (developer key pre_sleep_precise). The
-    // exact release is the marker trim at SIMULATION_START; this wait only has
-    // to end before the margin, and the margin learns the timer's lateness
-    // from the aim. A spin here sized to that lateness burned up to 2 ms of
-    // the game thread per frame and, under load, fed its own lateness (CPU
-    // stages ran 1.5x slower at the same scene and interval). `precise` is
-    // that experiment on purpose: the timer ends PRE_SLEEP_SPIN_LEAD_US before
-    // the target and the hardware spin the marker-site wait uses (TryOwnSleep)
-    // finishes it, so the call returns at the target.
-    const double timer_us = precise ? remaining_us - PRE_SLEEP_SPIN_LEAD_US : remaining_us;
-    if (!precise || timer_us > 0.0) {
+    // The timer ends PRE_SLEEP_SPIN_LEAD_US before the target (no timer when less is left)
+    // and the hardware spin the marker-site wait uses (TryOwnSleep) finishes it, so the
+    // call returns at the target. A timer-only wait that spun not at all left the exact
+    // release to a later trim; that variant had no production caller and is gone.
+    const double timer_us = remaining_us - PRE_SLEEP_SPIN_LEAD_US;
+    if (timer_us > 0.0) {
         const HANDLE timer = s_pre_sleep_timer.load(std::memory_order_acquire);
         if (!timer) return false;
         LARGE_INTEGER due;
@@ -76,7 +71,6 @@ bool PreSleepWaitUntil(int64_t target_qpc, bool precise) {
         }
         if (result != WAIT_OBJECT_0 || RuntimeLifecycle_IsStopping()) return false;
     }
-    if (!precise) return true;
 
     // Same pin and spin as TryOwnSleep's second phase. A timer that returned
     // after the target leaves nothing to spin (HWSpin returns at once).

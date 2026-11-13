@@ -1014,9 +1014,6 @@ __declspec(noinline) static HRESULT PresentBody(
             NativeGate_Execute(&native_gate,reinterpret_cast<uint64_t>(self));
         first_attempt.native_gate=native_gate.trace;
     }
-    // Developer presenter probe (fg_presenter_probe_us): frame generation's own
-    // Presents, after ReShade's effects; a committed wait sets the output attribution.
-    if(!early_readiness && capture_first_attempt)GpuPresent_ExecutePresenterProbe(&first_attempt);
     // Pacing telemetry always brackets the native call; the Present span
     // shares the same two reads when one was allocated.
     PacingPresentAttempt pacing_attempt{override_interval, override_flags,
@@ -1175,7 +1172,6 @@ __declspec(noinline) static HRESULT Present1Body(
             NativeGate_Execute(&native_gate,reinterpret_cast<uint64_t>(self));
         attempt.native_gate=native_gate.trace;
     }
-    if(!early_readiness && capture_attempt)GpuPresent_ExecutePresenterProbe(&attempt);
     // Pacing telemetry always brackets the native call; the Present span
     // shares the same two reads when one was allocated.
     PacingPresentAttempt pacing_attempt{SyncInterval, PresentFlags,

@@ -1,10 +1,9 @@
 #pragma once
 
 // Stage-demand computation for delayed NvAPI Reflex reports (feedback.cpp).
-// The period governor (period_governor.h)
-// consumes the resulting workload demand; the Frame-Time Adaptation
-// controller that once lived here is retired. The historical file and
-// function names are kept.
+// The resulting workload demand feeds the unified law and the lead
+// (scheduler.cpp DrainReflexReports); the Frame-Time Adaptation controller that
+// once lived here is retired. The historical file and function names are kept.
 //
 // Exact source-frame controller residence is removed only from the paired CPU
 // stage containing the active limiter. GPU-active execution is authoritative

@@ -211,23 +211,17 @@ void PresentGate_OnFrameMarker(const PacingPlanKey& key, PacingStageEventKind ki
         default: return;
     }
     if (arrival_qpc <= 0) return;
-    // The render handoff limit waits for the
-    // presenting device's newest RENDERSUBMIT_START, planned or not; the FG
-    // input wait's late-frame spacing asks whether the render thread has left
-    // a frame's Present (PRESENT_END, render_handoff.h).
-    if (kind == PacingStageEventKind::RenderSubmitStart) {
-        RenderHandoff_Publish(static_cast<uint8_t>(key.identity_domain), key.producer_epoch,
-            key.frame_id, arrival_qpc);
-    } else if (kind == PacingStageEventKind::PresentEnd) {
+    // The FG input wait's late-frame spacing asks whether the render thread
+    // has left a frame's Present (PRESENT_END, render_handoff.h), planned or
+    // not.
+    if (kind == PacingStageEventKind::PresentEnd) {
         RenderHandoff_PublishPresentEnd(static_cast<uint8_t>(key.identity_domain), key.producer_epoch,
             key.frame_id, arrival_qpc);
     }
     PacingFramePlan plan{};
     if (!g_frame_plans.Find(key, &plan)) return;
     // Every planned frame: the GPU waits use them for the carried delay and the simulation
-    // → render queue (the FG input wait always, the GPU queue wait under the
-    // developer A/B key), every rung for the render handoff offset
-    // (lead_controller.h).
+    // → render queue (the FG input wait).
     PushStageEvent(plan, kind, plan.rung, PacingPlanStatus::Unknown, arrival_qpc);
     static std::atomic<bool> s_logged[3]{};
     if (!s_logged[slot].exchange(true, std::memory_order_relaxed))

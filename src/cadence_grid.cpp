@@ -528,8 +528,6 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
             StartSegment(&next, true, grid_index, origin, timing.interval_ticks);
             if (input.period_change) {
                 reason = PacingEpochReason::PeriodChange;
-            } else if (input.governor_step) {
-                reason = PacingEpochReason::GovernorStep;
             } else {
                 silent_rebase = true;
             }
@@ -542,13 +540,12 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
         return plan;
     }
 
-    // Source lateness inputs of step 3, needed here by the driver-released
-    // rule: S is judged against T − min(L, previous L) (lead discontinuity,
-    // cadence_grid.h), within the late tolerance plus the source slack: a
-    // source that still makes T keeps the cadence. Gears of War: E-Day with
-    // FG restarted it on 953 frames in 80 s, 65% of them ready before the
-    // old target, and each restart moved the grid about 4.8 ms later (6% of
-    // the frame rate).
+    // Source lateness inputs of step 3: S is judged against T − min(L,
+    // previous L) (lead discontinuity, cadence_grid.h), within the late
+    // tolerance plus the source slack: a source that still makes T keeps the
+    // cadence. Gears of War: E-Day with FG restarted it on 953 frames in
+    // 80 s, 65% of them ready before the old target, and each restart moved
+    // the grid about 4.8 ms later (6% of the frame rate).
     const int64_t judged_lead_ticks = last_lead_ticks_ > 0 && !lifecycle_change
         ? std::min(timing.lead_ticks, last_lead_ticks_)
         : timing.lead_ticks;
@@ -560,47 +557,12 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
         tolerance_ticks += static_cast<int64_t>(slack_ticks);
     }
 
-    // Driver-released frame (cadence_grid.h): the driver's Sleep returned
-    // after the grid's S of this index and the game reached that Sleep on
-    // time. Only while the developer A/B gpu_paced_cadence is on and the
-    // driver's Sleep runs does the caller pass the driver fields; with none,
-    // this changes nothing.
-    const auto usable_qpc = [](int64_t qpc) { return qpc > 0 && qpc <= kMaximumNowQpc; };
-    const bool driver_released = input.driver_release_qpc > 0 &&
-        input.driver_release_qpc > target_qpc - timing.lead_ticks &&
-        input.game_arrival_qpc > 0 &&
-        input.game_arrival_qpc <= target_qpc - judged_lead_ticks + tolerance_ticks;
-    int64_t earliest_target_qpc = usable_qpc(input.earliest_target_qpc) ? input.earliest_target_qpc : 0;
-    if (driver_released && usable_qpc(input.driver_earliest_target_qpc)) {
-        earliest_target_qpc = std::max(earliest_target_qpc, input.driver_earliest_target_qpc);
-    }
-
-    // GPU-paced frame (earliest target given): on time by construction, so
-    // its lateness is not judged and it never restarts the cadence. A later
-    // earliest target moves the grid from n without an epoch.
-    const bool gpu_paced = earliest_target_qpc > 0;
-    bool gpu_target = false;
-    if (gpu_paced && earliest_target_qpc > target_qpc) {
-        ExactQpc origin{};
-        if (!OriginAtOrAfter(next, WholeQpc(earliest_target_qpc), &origin)) {
-            ++statistics_.invalid_inputs;
-            return plan;
-        }
-        // Supersedes a step-1 or step-2 segment at the same base.
-        StartSegment(&next, true, grid_index, origin, timing.interval_ticks);
-        if (!ResolveTarget(next, grid_index, &target_qpc)) {
-            ++statistics_.invalid_inputs;
-            return plan;
-        }
-        gpu_target = true;
-    }
-
     // Step 3: source lateness against S = T - L, with L no longer than the
     // previous plan's (lead discontinuity, cadence_grid.h): the frame's
     // pre-wait aimed at that S.
     int64_t wake_qpc = target_qpc - timing.lead_ticks;
     bool released_immediately = false;
-    if (!gpu_paced && input.now_qpc > target_qpc - judged_lead_ticks + tolerance_ticks) {
+    if (input.now_qpc > target_qpc - judged_lead_ticks + tolerance_ticks) {
         ExactQpc origin{};
         if (!OriginAtOrAfter(next, now_plus_lead, &origin)) {
             ++statistics_.invalid_inputs;
@@ -615,11 +577,11 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
             return plan;
         }
         wake_qpc = target_qpc - timing.lead_ticks;
-    } else if (!gpu_paced && input.now_qpc > wake_qpc) {
+    } else if (input.now_qpc > wake_qpc) {
         released_immediately = true;
     }
-    // A snapped restart can land on an edge after now + L; otherwise, and
-    // for a GPU-paced frame, S = max(T - L, now).
+    // A snapped restart can land on an edge after now + L; otherwise
+    // S = max(T - L, now).
     wake_qpc = std::max(wake_qpc, input.now_qpc);
 
     if (reason != PacingEpochReason::None) {
@@ -638,8 +600,6 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
     if (silent_rebase) ++statistics_.silent_rebases;
     if (released_immediately) ++statistics_.released_immediately;
     if (timing.snapped) ++statistics_.snapped_plans;
-    if (gpu_target) ++statistics_.gpu_target_plans;
-    if (driver_released) ++statistics_.driver_released_plans;
 
     plan.valid = true;
     plan.grid_index = grid_index;
@@ -648,8 +608,6 @@ CadenceGridPlan CadenceGrid::PlanNext(const CadenceGridPlanInput& input) noexcep
     plan.epoch = next.epoch;
     plan.epoch_reason = reason;
     plan.released_immediately = released_immediately;
-    plan.gpu_target = gpu_target;
-    plan.driver_released = driver_released;
     return plan;
 }
 

@@ -238,17 +238,6 @@ enum class PacingStageEventKind : uint8_t {
     PresentEnd = 9         // b
 };
 
-// Developer key `gpu_queue_wait_render_queue` (A/B): whether the
-// GPU queue wait's lead sample leaves out the game's simulation → render queue
-// (lead_controller.h). The FG input wait always does. INI text: keep | remove |
-// remove_held.
-enum class PacingRenderQueue : uint8_t {
-    Keep = 0,       // default: the GPU queue wait's sample keeps the queue
-    Remove = 1,     // leaves it out, as the FG input wait does
-    RemoveHeld = 2, // leaves it out only after a frame whose GPU waited at its gate
-    Count
-};
-
 // Key `lead_coverage`: the share of frames the lead covers, L = Q_q(X) +
 // allowance (lead_controller.h). Q99 (default) leaves about 1 frame in 100
 // ready after its target; the lower values (developer A/B) leave about 1 in

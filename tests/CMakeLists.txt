@@ -565,7 +565,6 @@ endif()
 add_executable(test_period_governor
     test_period_governor.cpp
     ${CMAKE_SOURCE_DIR}/src/period_governor.cpp
-    ${CMAKE_SOURCE_DIR}/src/pacing_metrics.cpp
 )
 # The rung_feasibility event reasons (FeasibilityCause wire values and text).
 add_executable(test_rung_feasibility
@@ -578,16 +577,8 @@ add_executable(test_pacing_controller_events
     test_pacing_controller_events.cpp
     ${CMAKE_SOURCE_DIR}/src/pacing_controller_events.cpp
 )
-# Pre-Sleep placement: margin, measured
-# selection and guards. The Sleep hook, the owner guard and the driver's Sleep
-# behavior need live validation.
-add_executable(test_source_placement
-    test_source_placement.cpp
-    ${CMAKE_SOURCE_DIR}/src/source_placement.cpp
-    ${CMAKE_SOURCE_DIR}/src/pacing_metrics.cpp
-)
 foreach(controller_target IN ITEMS test_period_governor test_rung_feasibility
-    test_pacing_controller_events test_source_placement)
+    test_pacing_controller_events)
     set_target_properties(${controller_target} PROPERTIES
         CXX_STANDARD 17
         CXX_STANDARD_REQUIRED YES
@@ -958,7 +949,6 @@ add_test(NAME gpu_queue_borrow COMMAND test_gpu_queue_borrow)
 add_test(NAME marker_stamps COMMAND test_marker_stamps)
 add_test(NAME lead_controller COMMAND test_lead_controller)
 add_test(NAME period_governor COMMAND test_period_governor)
-add_test(NAME source_placement COMMAND test_source_placement)
 add_test(NAME rung_feasibility COMMAND test_rung_feasibility)
 add_test(NAME pacing_controller_events COMMAND test_pacing_controller_events)
 add_test(NAME source_stage COMMAND test_source_stage)

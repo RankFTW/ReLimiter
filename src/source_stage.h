@@ -142,9 +142,6 @@ struct SourceStageRequest {
     // gpu_wait_headroom_us), or I + Q10(C) − the release margin without
     // current Reflex GPU active times. Output override Auto only.
     bool collision_guard = false;
-    // Developer A/B (gpu_queue_wait_render_queue): whether the GPU queue wait's
-    // lead sample leaves out the simulation → render queue (lead_controller.h).
-    PacingRenderQueue gpu_queue_wait_render_queue = PacingRenderQueue::Keep;
     // Lead spike floor (lead_controller.h; developer key lead_spike_floor,
     // Output override Auto only).
     bool spike_floor = true;
@@ -207,9 +204,6 @@ public:
     void Reset(int64_t qpc_frequency) noexcept;
     // Enforcement-marker change: lead buckets only.
     void ResetBuckets() noexcept { lead_.ResetBuckets(); }
-    // Lifecycle, cap, FG divisor or route change: the lead slack windows only
-    // (LeadController::ClearSlackEvidence).
-    void ClearSlackEvidence() noexcept { lead_.ClearSlackEvidence(); }
 
     // ── Developer key unified_pacer ──
     // The law is owned here: stage events and reports feed it only while enabled
@@ -246,29 +240,17 @@ public:
         double queue_wait_us, double gpu_active_us = 0.0, double ai_frame_us = 0.0) noexcept;
     UnifiedPacer& Unified() noexcept { return unified_; }
     const UnifiedPacer& Unified() const noexcept { return unified_; }
-    // A cap or FG divisor change: the GPU floor's output-shaped windows
-    // (LeadController::ResetGpuFloor).
-    void ResetGpuFloor() noexcept { lead_.ResetGpuFloor(); }
     // A Reflex report's GPU times (LeadController::OnGpuReport).
     void OnGpuReport(uint32_t producer_epoch, uint64_t frame_id, const LeadGpuReport& report) noexcept
     {
         lead_.OnGpuReport(producer_epoch, frame_id, report);
     }
-    // A Reflex report pair (LeadController::OnReportPair): the stream proof
-    // and the GPU floor's F.
+    // A Reflex report pair (LeadController::OnReportPair): the first-submission
+    // delay window of the lead sample behind the wait.
     void OnReportPair(uint32_t producer_epoch, uint64_t frame_id,
         const HandoffBackPressureSample& sample) noexcept
     {
         lead_.OnReportPair(producer_epoch, frame_id, sample);
-    }
-    // A Reflex report's GPU start and end, PRESENT_END → GPU end gap and the
-    // later of RENDERSUBMIT_END and PRESENT_START: the GPU floor's anchor and
-    // the cap bound's evidence (LeadController::OnGpuRenderEnd).
-    void OnGpuRenderEnd(uint32_t producer_epoch, uint64_t frame_id, int64_t gpu_start_qpc,
-        int64_t gpu_end_qpc, double present_to_gpu_end_us, int64_t render_done_qpc = 0) noexcept
-    {
-        lead_.OnGpuRenderEnd(producer_epoch, frame_id, gpu_start_qpc, gpu_end_qpc, present_to_gpu_end_us,
-            render_done_qpc);
     }
     // Timing mode Off: grid suspended and published; the next plan starts a
     // ModeChange epoch.
@@ -293,7 +275,7 @@ public:
 
     // Plan fields of the frame's source record (flags, wake target, release,
     // interval, FG divisor, plan and signal advance). Identity, trigger,
-    // marker, regime and the governor fields stay with the caller.
+    // marker and regime stay with the caller.
     static void FillSourceRecord(
         const SourceStageFrame& frame,
         const PacingPipelineSnapshot& pipeline,

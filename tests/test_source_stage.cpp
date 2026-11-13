@@ -1068,70 +1068,6 @@ void TestDriverSleepStampsOnlyFillTheRecord()
     }
 }
 
-// A held output's OutputLate restart makes the held GPU floor eligible before
-// the cap held 32 frames (lead_controller.h); a cap or FG divisor change
-// (ResetGpuFloor) clears it. The restarts of outputs not held do not count:
-// after an FG change the first frame lands late on the new grid while FG is
-// not presenting yet.
-void TestOutputLateRestartsCountForTheFloor()
-{
-    std::printf("Test: an OutputLate restart of a held output makes the held GPU floor eligible\n");
-    ResetStage();
-    ScriptedClock clock;
-    const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
-    uint64_t frame_id = 5000;
-    SourceStageFrame last{};
-    // Ready 3,000 µs after each release: L = Q95 3,010 + 500.
-    const auto finish = [&](const SourceStageFrame& frame) {
-        const int64_t done = frame.release_qpc + Ticks(3'000.0);
-        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::PresentCall,
-            frame.release_qpc + Ticks(1'000.0))));
-        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady, done)));
-        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease, done,
-            PacingPlanStatus::Late)));
-        g_stage.DrainStageEvents();
-        clock.now = done;
-    };
-    for (int i = 0; i < 40; ++i) {
-        last = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
-        finish(last);
-    }
-    CHECK(!g_stage.Lead().CadenceRestartSeen(1));
-
-    // An output 8 ms past its target: OutputLate.
-    const SourceStageFrame next = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
-    CHECK(next.planned && next.epoch_started == PacingEpochReason::None);
-    const uint64_t late_before = g_stage.Statistics().output_late_epochs;
-    CHECK(FramePlan_PushStageEvent(Event(next, PacingStageEventKind::OutputRelease,
-        next.plan.output_target_qpc + Ticks(8'000.0), PacingPlanStatus::Held)));
-    g_stage.DrainStageEvents();
-    CHECK(g_stage.Statistics().output_late_epochs == late_before + 1);
-    CHECK(g_stage.Lead().CadenceRestartSeen(1));
-    g_stage.ResetGpuFloor();
-    CHECK(!g_stage.Lead().CadenceRestartSeen(1));
-
-    // Frames not held: their SourceLate and OutputLate restarts do not count.
-    finish(next);
-    const PacingPipelineSnapshot not_held = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
-    for (int i = 0; i < 4; ++i) {
-        last = g_stage.RunPlannedFrame(Request(Key(frame_id++), not_held), &clock);
-        finish(last);
-    }
-    clock.now = last.plan.output_target_qpc + Ticks(kIntervalUs) - Ticks(last.plan.lead_us) + Ticks(8'000.0);
-    const SourceStageFrame late_not_held = g_stage.RunPlannedFrame(Request(Key(frame_id++), not_held), &clock);
-    CHECK(late_not_held.planned && late_not_held.epoch_started == PacingEpochReason::SourceLate);
-    CHECK(late_not_held.plan.rung == PacingRung::SourceOnly);
-    CHECK(!g_stage.Lead().CadenceRestartSeen(1));
-    finish(late_not_held);
-    const SourceStageFrame output_not_held = g_stage.RunPlannedFrame(Request(Key(frame_id++), not_held), &clock);
-    const uint64_t not_held_before = g_stage.Statistics().output_late_epochs;
-    CHECK(FramePlan_PushStageEvent(Event(output_not_held, PacingStageEventKind::OutputRelease,
-        output_not_held.plan.output_target_qpc + Ticks(8'000.0), PacingPlanStatus::SourceOnly)));
-    g_stage.DrainStageEvents();
-    CHECK(g_stage.Statistics().output_late_epochs == not_held_before + 1);
-    CHECK(!g_stage.Lead().CadenceRestartSeen(1));
-}
-
 // ── Unified pacer (developer key unified_pacer): the unified branch of RunPlannedFrame ──
 
 UnifiedIntervalTerms CapTerms(double interval_us)
@@ -2579,7 +2515,6 @@ public:
                 g_stage.Reset(kFrequency);
                 period_.Forget();
                 if (enabled_) g_stage.ResetUnified(generation_); // ResetAdaptationRegime -> ResetUnifiedLaw
-                g_stage.ClearSlackEvidence();                    // ResetFeasibility
                 base_index_ = g_stage.Grid().NextIndex();        // rows count from the reset
                 base_epoch_ = g_stage.Grid().Snapshot().epoch;
             }
@@ -2603,8 +2538,6 @@ public:
 
         if (step.cap_change) { // cap or raw FG divisor change
             if (enabled_) g_stage.ResetUnified(generation_);
-            g_stage.ClearSlackEvidence();
-            g_stage.ResetGpuFloor();
         }
         if (enabled_) { // an idle regime change resets the law
             const bool idle = step.mode == PacingTimingMode::Idle;
@@ -2634,7 +2567,6 @@ public:
         request.fg_divisor = step.fg_divisor;
         request.period_change = period_.Observe(step.mode, step.identity_us);
         request.collision_guard = true;
-        request.gpu_queue_wait_render_queue = kPacingGpuQueueWaitRenderQueue;
         request.spike_floor = kPacingLeadSpikeFloor;
         if (marker_route) {
             request.pipeline = Pipeline(PacingTimingMode::Vrr, enabled_ ? PacingRung::SourceOnly : PacingRung::MarkerHold,
@@ -3581,7 +3513,6 @@ int main(int argc, char** argv)
     TestVBlankPhaseTrackerFeedsFixedGrid();
     TestDriverSleepStampsOnlyFillTheRecord();
     TestDriverLimiterPlacementPlansWithoutALead();
-    TestOutputLateRestartsCountForTheFloor();
     TestUnifiedBranch();
     TestUnifiedPlanningDecision();
     TestUnifiedMarkerOnlyFrames();

@@ -53,6 +53,10 @@ bool hold_io = false;
 bool entered_io = false;
 bool fail_create = false;
 bool fail_writes = false;
+// Failure injection for one file: every write to fail_path fails (an unwritable file); only the key deletions
+// (a null value) to fail_delete_path fail. Neither is cleared by Launch: a test sets and clears them itself.
+std::string fail_path;
+std::string fail_delete_path;
 bool throw_writes = false;
 unsigned creates = 0;
 unsigned closes = 0;
@@ -61,6 +65,7 @@ std::atomic<unsigned> logger_shutdowns{ 0 };
 std::atomic<unsigned> worker_logs{ 0 };
 DWORD caller_thread = 0;
 std::mutex log_mutex;
+std::vector<std::string> warn_lines; // every Warn line since the last launch
 std::vector<std::string> info_lines; // every Info line the production code logged since the last launch
 constexpr const char* local_path = "C:\\config-test\\ReLimiter.ini";
 constexpr const char* shared_path = "C:\\config-test\\Local\\RHI\\ReLimiter_Presets\\presets.ini";
@@ -103,7 +108,9 @@ BOOL WINAPI WriteProfile(LPCSTR section, LPCSTR key, LPCSTR value, LPCSTR path) 
     writes.push_back({ { path, section, key ? key : "" },
                       value ? value : "", GetCurrentThreadId() });
     if (throw_writes) throw std::runtime_error("injected profile failure");
-    if (fail_writes) {
+    const bool path_fails = (!fail_path.empty() && fail_path == path) ||
+        (!fail_delete_path.empty() && fail_delete_path == path && key && !value);
+    if (fail_writes || path_fails) {
         SetLastError(ERROR_ACCESS_DENIED);
         return FALSE;
     }
@@ -195,14 +202,14 @@ void NvAPI_PrepareUnifiedKey(bool) noexcept {}
 void Log_Write(LogLevel level, const char* format, ...) {
     CHECK(config_test::logger_alive.load());
     if (GetCurrentThreadId() != config_test::caller_thread) ++config_test::worker_logs;
-    if (level != LogLevel::Info) return;
+    if (level != LogLevel::Info && level != LogLevel::Warn) return;
     char text[4096] = {};
     va_list arguments;
     va_start(arguments, format);
     vsnprintf(text, sizeof(text), format, arguments);
     va_end(arguments);
     std::lock_guard<std::mutex> lock(config_test::log_mutex);
-    config_test::info_lines.emplace_back(text);
+    (level == LogLevel::Warn ? config_test::warn_lines : config_test::info_lines).emplace_back(text);
 }
 bool Log_Shutdown() {
     CHECK(!s_config_writer);
@@ -265,6 +272,7 @@ void Launch(bool creation_failure, bool initial_write_failure, bool keep_disk, c
     {
         std::lock_guard<std::mutex> lock(log_mutex);
         info_lines.clear();
+        warn_lines.clear();
     }
     logger_alive = true;
     logger_shutdowns = worker_logs = 0;
@@ -385,6 +393,14 @@ bool SameLoaded(const Loaded& a, const Loaded& b) {
         SamePipeline(a.pipeline, b.pipeline) && SameObserved(a.observed, b.observed);
 }
 
+// How many Warn lines of the last launch contain the text.
+size_t WarnCount(const char* needle) {
+    std::lock_guard<std::mutex> lock(log_mutex);
+    size_t count = 0;
+    for (const std::string& line : warn_lines)
+        if (line.find(needle) != std::string::npos) ++count;
+    return count;
+}
 // The info line that names the removed settings an old INI still held (empty when the launch logged none); the
 // production logger is replaced by this file's Log_Write, which keeps every Info line of the launch.
 constexpr const char* removed_info_prefix = "Config: settings that no longer exist were ignored: ";
@@ -1486,7 +1502,7 @@ void TestFirstLaunchAndDefaultValuedRemovedKeys() {
 
 // ── The preset key of the removed OSD element ──
 // The OSD_Preset_<n> sections live outside [FrameLimiter], so the start-up wipe never reached them: the version step
-// deletes show_adaptive_smoothing there (local INI and shared presets file), once, and writes nothing else.
+// deletes show_adaptive_smoothing there (local INI and shared presets file) at every start, and writes nothing else.
 // Two preset slots with the fields the loader reads; the removed key is seeded (true in slot 1, false in slot 2) or not.
 std::vector<DiskEntry> PresetSections(const char* path, bool with_removed_key) {
     struct Slot {
@@ -1597,11 +1613,15 @@ void TestRemovedPresetKeyIsDropped() {
     CHECK(PresetFields(shared_path).empty());
     ReleaseStart();CHECK(OwnerShutdown());
 
-    // (4) A version-6 INI is not touched: the migration runs once, whatever the preset sections hold.
+    // (4) The clean-up runs at every start, whatever the INI's version: a version-6 INI loses the key too, the other
+    // fields stay.
     extra_seed = PresetSections(local_path, true) + PresetSections(shared_path, true);
     Reset(false, false, {{"config_version", "6"}});
-    CHECK(PresetFields(local_path) == AsFields(PresetSections(local_path, true)));
-    CHECK(PresetFields(shared_path) == AsFields(PresetSections(shared_path, true)));
+    CheckPresetKeyGone(local_path);
+    CheckPresetKeyGone(shared_path);
+    CHECK(PresetFields(local_path) == AsFields(PresetSections(local_path, false)));
+    CHECK(PresetFields(shared_path) == AsFields(PresetSections(shared_path, false)));
+    CheckPresetsIntact();
     ReleaseStart();CHECK(OwnerShutdown());
 
     // (5) A first launch writes no preset section anywhere.
@@ -1611,6 +1631,47 @@ void TestRemovedPresetKeyIsDropped() {
     CHECK(EntriesOf(shared_path) == 0);
     ReleaseStart();CHECK(OwnerShutdown());
     CHECK(PresetFields(local_path).empty() && PresetFields(shared_path).empty());
+}
+
+// A deletion that fails is not abandoned: the key stays on disk, one warning names the file, the rest of the start
+// goes on (the INI is rewritten at version 6), and the next start removes the key once the file is writable again.
+void TestFailedPresetKeyDeletionIsRetriedAtTheNextStart() {
+    const char* const warning = "obsolete preset key";
+    // (a) The key in the shared presets file, which cannot be written at the first launch.
+    extra_seed = PresetSections(shared_path, true);
+    fail_path = shared_path;
+    Reset(false, false, {{"config_version", "5"}});
+    CHECK(WarnCount(warning) == 1 && WarnCount(shared_path) == 1);
+    CHECK(Value(shared_path, "OSD_Preset_1", "show_adaptive_smoothing") == "true");
+    CHECK(Value(shared_path, "OSD_Preset_2", "show_adaptive_smoothing") == "false");
+    CHECK(PresetFields(shared_path) == AsFields(PresetSections(shared_path, true)));
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "6");
+    CHECK(PresetFields(local_path).empty());
+    ReleaseStart();CHECK(OwnerShutdown());
+    fail_path.clear();
+    Relaunch(); // the same fake disk, the file writable now, the INI already at version 6
+    CHECK(WarnCount(warning) == 0);
+    CheckPresetKeyGone(shared_path);
+    CHECK(PresetFields(shared_path) == AsFields(PresetSections(shared_path, false)));
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    // (c) The same for the local INI: its key deletions fail (its other writes succeed), the presets still load,
+    // the next start removes the key.
+    extra_seed = PresetSections(local_path, true);
+    fail_delete_path = local_path;
+    Reset(false, false, {{"config_version", "5"}});
+    CHECK(WarnCount(warning) == 1 && WarnCount(local_path) == 1);
+    CHECK(PresetFields(local_path) == AsFields(PresetSections(local_path, true)));
+    CheckPresetsIntact();
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "6");
+    ReleaseStart();CHECK(OwnerShutdown());
+    fail_delete_path.clear();
+    Relaunch();
+    CHECK(WarnCount(warning) == 0);
+    CheckPresetKeyGone(local_path);
+    CHECK(PresetFields(local_path) == AsFields(PresetSections(local_path, false)));
+    CheckPresetsIntact();
+    ReleaseStart();CHECK(OwnerShutdown());
 }
 
 // Keys retired by the earlier reworks. An existing INI may still carry them: loading ignores them and
@@ -1901,6 +1962,7 @@ int main() {
     TestRemovedKeysAreNotLiveKeys();
     TestFirstLaunchAndDefaultValuedRemovedKeys();
     TestRemovedPresetKeyIsDropped();
+    TestFailedPresetKeyDeletionIsRetriedAtTheNextStart();
     TestRetiredKeysIgnoredAndDropped();
     TestImmutableCoalescingAndDestinations();
     TestBlockedIOTimeoutAndInFlightReplacement();

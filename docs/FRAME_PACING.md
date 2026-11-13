@@ -178,7 +178,7 @@ flowchart TD
     N -->|no| P["Wait until S = T(n) − L"]
 ```
 
-Source: `src/cadence_grid.h`, `src/cadence_grid.cpp` (`PlanNext`, `CadenceGrid_LateToleranceTicks`, `CadenceGrid_ResolveOutputTarget`), `src/pacing_core_types.h` (`PacingEpochReason`), `src/scheduler.cpp` (`VrrCapIntervalUs`, `ApplyLfc`), `src/period_governor.cpp` (`PeriodGovernor_LfcIntervalUs`, `LfcHysteresis`), `src/fg_divisor.cpp` (50 ms ramp), `src/source_stage.cpp` (slack).
+Source: `src/cadence_grid.h`, `src/cadence_grid.cpp` (`PlanNext`, `CadenceGrid_LateToleranceTicks`, `CadenceGrid_ResolveOutputTarget`), `src/pacing_core_types.h` (`PacingEpochReason`), `src/scheduler.cpp` (`VrrCapIntervalUs`, `ApplyLfc`), `src/pacing_resolver.h` (`PacingPipeline_VrrTargetFps`, `PacingPipeline_VrrIntervalUs`), `src/period_governor.cpp` (`PeriodGovernor_LfcIntervalUs`, `LfcHysteresis`), `src/fg_divisor.cpp` (50 ms ramp), `src/source_stage.cpp` (slack).
 
 ---
 
@@ -201,7 +201,7 @@ The lead controller keeps one bucket of measured samples per output point and FG
 | Output | `X` is measured to | Own holds excluded how |
 |--------|--------------------|------------------------|
 | `source_only` | PRESENT_START marker arrival `a`: `X = a − s` | Nothing is held |
-| `marker_hold`, `native_hold` | PRESENT_START (or the native Present arrival): `X = (a − s)` minus the overlap with the previous frame's CPU hold | The overlap is removed |
+| `marker_hold` | PRESENT_START: `X = (a − s)` minus the overlap with the previous frame's CPU hold | The overlap is removed |
 | `gpu_queue_wait` | The frame's GPU readiness `r`, floored at the Present call `p`: `max(p, r) − s`. When the next frame's GPU work runs behind the wait (below): `max(p, r − d) − s` | `d = max(0, f − w_c)` is how long the frame's submitted GPU work waited for the GPU to pass the previous frame's gate: `f` is when it did (that frame's readiness, or its resume when its GPU waited at the Signal), `w_c` when this frame's first GPU work reached the driver (RENDERSUBMIT_START plus the median first-submission delay, at most `p`; `p` without the marker). A frame the cap released whose own submissions set its readiness keeps `d` (below) |
 | `fg_input_wait` | The same readiness measure, with its own queue order. The lead sample is `X − q` | `d` as above. `q` is the time the finished frame waited for the game's render thread to leave the previous frame's Present (SIMULATION_END to the previous PRESENT_END, at most until RENDERSUBMIT_START) |
 

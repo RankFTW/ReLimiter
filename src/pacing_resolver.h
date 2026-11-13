@@ -97,11 +97,6 @@ constexpr double kPacingGpuWaitHeadroomDefaultUs = 1000.0;
 constexpr PacingLeadCoverage kPacingLeadCoverage = PacingLeadCoverage::Q99;      // the lead covers 99% of frames
 constexpr bool kPacingFgLateSpacing = true;                                      // the FG input wait floors the frame after a late one
 constexpr bool kPacingLeadSpikeFloor = true;                                     // a GPU wait lead covers the game's rare long simulations
-constexpr PacingRenderQueue kPacingGpuQueueWaitRenderQueue = PacingRenderQueue::Keep; // the render queue stays in the lead
-constexpr bool kPacingSleepStatusEveryFrame = false;                             // the driver's sleep status is polled once a second
-constexpr bool kPacingGpuStartProbe = false;                                     // no GPU start measurement
-constexpr bool kPacingGpuPriorityProbe = false;                                  // no priority probe queues
-constexpr int kPacingFgPresenterProbeUs = 0;                                     // no presenter probe holds
 
 // The pacing preference's levers (see PacingPipeline_ResolvePreference).
 constexpr int kPacingPreferenceLatencyRank = 4;
@@ -141,6 +136,23 @@ constexpr PacingTestMode PacingPipeline_EffectiveTestMode(PacingTestMode saved, 
 constexpr double PacingPipeline_ReportFeedbackFallbackUs(PacingTestMode mode, int cap_fps) noexcept
 {
     return mode != PacingTestMode::ReflexOnly && cap_fps > 0 ? 1000000.0 / static_cast<double>(cap_fps) : 16666.667;
+}
+
+// The VRR target the planner paces at: the cap; with the cap off the unified owner paces at the VRR cap of the display
+// ceiling (`vrr_cap_fps()`, called only then), every other owner gets 0 (pass-through for minimum latency).
+template <typename VrrCapFps>
+int PacingPipeline_VrrTargetFps(bool unified, int target_fps, VrrCapFps&& vrr_cap_fps)
+{
+    return target_fps <= 0 && unified ? static_cast<int>(vrr_cap_fps()) : target_fps;
+}
+
+// The grid interval of a VRR planned frame from I_0 (the cap interval times the frame generation divisor): the unified
+// owner plans I_0 itself (the law owns the interval, no LFC multiple); every other owner plans the LFC hysteresis of
+// it (`lfc_interval_us(base_interval_us)`, called only then: it advances the hysteresis state).
+template <typename LfcInterval>
+double PacingPipeline_VrrIntervalUs(bool unified, double base_interval_us, LfcInterval&& lfc_interval_us)
+{
+    return unified ? base_interval_us : lfc_interval_us(base_interval_us);
 }
 
 // The configuration the resolver and the source stage read: the developer keys of the queue-based pacer, the derived
@@ -295,8 +307,6 @@ PacingPipelineSnapshot PacingPipeline_Read() noexcept;
 // INI tokens. FromText is ASCII case-insensitive, returns false for null or
 // unknown text and leaves *value unchanged on failure. Text returns "unknown"
 // for values outside the enum.
-const char* PacingRenderQueue_Text(PacingRenderQueue render_queue) noexcept;
-bool PacingRenderQueue_FromText(const char* text, PacingRenderQueue* render_queue) noexcept;
 const char* PacingLeadCoverage_Text(PacingLeadCoverage coverage) noexcept;
 bool PacingLeadCoverage_FromText(const char* text, PacingLeadCoverage* coverage) noexcept;
 const char* PacingPreference_Text(PacingPreference preference) noexcept;

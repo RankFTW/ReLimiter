@@ -143,17 +143,13 @@ size_t SourceStage::DrainStageEvents() noexcept
         // frames that this frame's Present followed are not a late output.
         const int64_t gated_ticks = lead_.GatedHoldTicks(event.key, event.grid_index);
         if (gated_ticks > 0) ++statistics_.gated_outputs;
-        // A frame the GPU floor released follows the GPU at its output too
-        // (cadence_grid.h). Under the unified pacer every output is judged as a
-        // GPU-paced one: the grid follows the start and never restarts on a late output.
-        const bool gpu_paced = unified_enabled_ || lead_.GpuFloorReleased(event.key, event.grid_index);
+        // Under the unified pacer every output is judged as a GPU-paced one: the
+        // grid follows the start and never restarts on a late output (cadence_grid.h).
+        const bool gpu_paced = unified_enabled_;
         if (grid_.ObserveOutput(event.key.controller_generation, event.grid_index, event.qpc - gated_ticks,
                 gpu_paced) == PacingEpochReason::OutputLate) {
             ++statistics_.output_late_epochs;
             epoch_started = true;
-            // Only a held output's restart counts for the held GPU floor
-            // (lead_controller.h).
-            if (event.rung != PacingRung::SourceOnly) lead_.NoteCadenceRestart(event.key.producer_epoch);
         }
     }
     statistics_.stage_events += drained;
@@ -302,7 +298,6 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     // The FG input wait has no resume probes (gpu_present_gate_d3d12.cpp):
     // only the GPU queue wait may wait for a GpuResume event.
     start.gpu_resume_probe = pipeline.gpu_probes && plan.rung == PacingRung::GpuQueueWait;
-    start.render_queue = request.gpu_queue_wait_render_queue;
     lead_.OnSourceRelease(start);
     return frame;
 }
@@ -601,7 +596,6 @@ SourceStageFrame SourceStage::RunUnifiedFrame(
     lead_start.pre_wait_end_qpc = frame.pre_wait_end_qpc;
     lead_start.mode = plan.mode;
     lead_start.gpu_resume_probe = pipeline.gpu_probes && plan.rung == PacingRung::GpuQueueWait;
-    lead_start.render_queue = request.gpu_queue_wait_render_queue;
     lead_.OnSourceRelease(lead_start);
 
     // 6. The law's ring entry of this frame (producer frame id, release, and whether the GPU term

@@ -912,13 +912,11 @@ static void PublishSleepStatusAtSleepReturn(uint32_t publication_token) noexcept
 
 static void PollSleepStatus(IUnknown* device, uint32_t publication_token) noexcept {
     if (!g_config.developer_settings || !s_orig_get_sleep_status) return;
-    if (!kPacingSleepStatusEveryFrame) {
-        const ULONGLONG now = GetTickCount64();
-        ULONGLONG next = s_sleep_status_poll_ms.load(std::memory_order_relaxed);
-        if (now < next ||
-            !s_sleep_status_poll_ms.compare_exchange_strong(next, now + 1000, std::memory_order_relaxed))
-            return;
-    }
+    const ULONGLONG now = GetTickCount64();
+    ULONGLONG next = s_sleep_status_poll_ms.load(std::memory_order_relaxed);
+    if (now < next ||
+        !s_sleep_status_poll_ms.compare_exchange_strong(next, now + 1000, std::memory_order_relaxed))
+        return;
     // The token is the retained Sleep device's (passed in), not whatever publication is
     // current now: RecordSleepStatus drops the result when that lifetime has ended.
     NV_GET_SLEEP_STATUS_PARAMS status{};
@@ -1403,7 +1401,7 @@ public:
         UnifiedWaitForChange(*this, observed, deadline_qpc);
     }
     int64_t Frequency() noexcept override { return GetQPCFrequency(); }
-    void StartWait(int64_t target_qpc) noexcept override { (void)PreSleepWaitUntil(target_qpc, true); }
+    void StartWait(int64_t target_qpc) noexcept override { (void)PreSleepWaitUntil(target_qpc); }
 
 private:
     uint64_t Index() noexcept override { return g_up_ready_index.load(std::memory_order_acquire); }
@@ -1796,8 +1794,8 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
             }
         }
         // SIMULATION_END and PRESENT_END of a planned frame reach the lead
-        // (the game's simulation → render queue and the render handoff
-        // offset, lead_controller.h); the push never blocks.
+        // (the game's simulation → render queue, lead_controller.h); the push
+        // never blocks.
         if ((marker_params.markerType == SIMULATION_END || marker_params.markerType == PRESENT_END) &&
             !PCL_MarkersFlowing()) {
             PresentGate_OnFrameMarker(frame_key, marker_params.markerType == SIMULATION_END
@@ -1842,11 +1840,9 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
         return forward();
     }
     // RENDERSUBMIT_START of a planned frame is a stage event for the lead
-    // (the simulation → render queue and the render handoff offset)
-    // and is published as the render handoff (render_handoff.h), before
-    // the scheduler-owner guard: it runs on the render thread, often while
-    // the next SIMULATION_START owns the scheduler (or waits for this
-    // handoff), and neither step blocks.
+    // (the simulation → render queue), before the scheduler-owner guard: it
+    // runs on the render thread, often while the next SIMULATION_START owns
+    // the scheduler, and the push never blocks.
     if (marker_params.markerType == RENDERSUBMIT_START && !from_rtss && !PCL_MarkersFlowing()) {
         LARGE_INTEGER submit_qpc{};
         QueryPerformanceCounter(&submit_qpc);
@@ -1854,10 +1850,6 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
             marker_device.identity.producer_epoch,
             FrameTimeline_CurrentControllerGeneration(), marker_params.frameID},
             PacingStageEventKind::RenderSubmitStart, submit_qpc.QuadPart);
-        // gpu_start_probe: the frame whose first submission the probe times.
-        // A load of the developer flag and a not-taken branch with the key off.
-        if (kPacingGpuStartProbe)
-            GpuReadiness_ArmProbeForFrame(marker_device.identity.producer_epoch, marker_params.frameID);
     }
     SchedulerOwnerGuard scheduler_owner;
     if (!scheduler_owner) {
@@ -2388,14 +2380,14 @@ static SleepStatusTracker s_game_sleep_status;
 static NvAPI_Status __cdecl Hook_GetSleepStatus(IUnknown* device, NV_GET_SLEEP_STATUS_PARAMS* params) {
     void* const caller_address = _ReturnAddress();
     RuntimeCallbackGuard callback;
-    // Without the status instrumentation (developer_settings or sleep_status_every_frame)
-    // the game's call is only forwarded and logged: no feedback-device acquisition. With
+    // Without the status instrumentation (developer_settings) the game's call is only
+    // forwarded and logged: no feedback-device acquisition. With
     // it, the published feedback device and its publication token are captured before the
     // driver query: a result is the frame's sleep status only when it came from that
     // device and the publication has not changed since (RecordSleepStatus). The
     // acquisition does not wait and never drains retired references (a contended or
     // empty one drops the observation).
-    const bool observe = g_config.developer_settings || kPacingSleepStatusEveryFrame;
+    const bool observe = g_config.developer_settings;
     const NvAPIFeedbackDevice published = observe ? AcquireFeedbackDeviceImpl(false) : NvAPIFeedbackDevice{};
     const NvAPI_Status result = SafeInvokeGetSleepStatus(device, params);
     NV_GET_SLEEP_STATUS_PARAMS seen{};
