@@ -11,25 +11,15 @@ bool H3RungResolved() noexcept {
     return rung==PacingRung::GpuQueueWait || rung==PacingRung::FgInputWait;
 }
 // The resolver would select FgInputWait but the FG input route is not
-// qualified yet (auto: FgUnqualified, or FgRouteUnsupported while frame
-// generation presents from its own thread and queue; override gpu under FG:
-// SourceOnly). The FG input observers must then deliver inputs, so the gate
-// can publish PacingCapability::FgInputRoute; without this the capability and
-// the rung would each wait for the other, and an unsupported route could never
-// be judged again.
-// A demoted FG input wait (auto rung FgInputWait, resolved rung
-// lower) keeps its route qualified through the dwell: the observers keep
-// delivering inputs (their claims find another rung and hold nothing), so
-// the retry finds the route still qualified. Without this the demotion
-// turned readiness off, Streamline rejected every input (gpu_deadline_off),
-// the route lapsed and the dwell never ran (Gears of War: E-Day).
+// qualified yet (FgUnqualified, or FgRouteUnsupported while frame
+// generation presents from its own thread and queue). The FG input observers
+// must then deliver inputs, so the gate can publish PacingCapability::FgInputRoute;
+// without this the capability and the rung would each wait for the other, and an
+// unsupported route could never be judged again.
 bool FgRouteQualificationPending() noexcept {
     const auto pipeline=PacingPipeline_Read();
-    if(pipeline.reason==PacingFallbackReason::FgUnqualified ||
-       pipeline.reason==PacingFallbackReason::FgRouteUnsupported)return true;
-    if(pipeline.auto_rung==PacingRung::FgInputWait && pipeline.rung!=PacingRung::FgInputWait)return true;
-    return pipeline.reason==PacingFallbackReason::Override && pipeline.rung==PacingRung::SourceOnly &&
-        kPacingRungOverride==PacingRungOverride::Gpu;
+    return pipeline.reason==PacingFallbackReason::FgUnqualified ||
+        pipeline.reason==PacingFallbackReason::FgRouteUnsupported;
 }
 }
 

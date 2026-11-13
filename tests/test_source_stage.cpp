@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -84,13 +85,12 @@ SourceStageRequest Request(const PacingPlanKey& key, const PacingPipelineSnapsho
     return request;
 }
 
-// Scripted time: waits and stalls jump to their target. WaitUntil records
+// Scripted time: waits jump to their target. WaitUntil records
 // what an output executor on another thread could see at that moment.
 class ScriptedClock final : public SourceStageClock {
 public:
     int64_t now = kStart;
     int wait_calls = 0;
-    int stall_calls = 0;
     int64_t last_wait_target = 0;
     // Failing waits (the unified marker wait): from this WaitUntil call on (1-based, 0 = never)
     // the wait returns false without moving the clock; `stuck` returns true without moving it;
@@ -136,12 +136,6 @@ public:
         if (stuck) return true;
         if (target_qpc > now) now = target_qpc;
         return true;
-    }
-
-    void Stall(int64_t until_qpc) noexcept override
-    {
-        ++stall_calls;
-        if (until_qpc > now) now = until_qpc;
     }
 };
 
@@ -414,75 +408,6 @@ void TestSuspendThenModeChange()
     CHECK(g_cadence_grid_publication.Read(&snapshot) && snapshot.valid);
 }
 
-void TestStallInjectorUnit()
-{
-    std::printf("Test: stall injector fires once per period and re-arms when disabled\n");
-    SourceStallInjector injector;
-    const int64_t t0 = kStart;
-    CHECK(injector.Next(t0, kFrequency, 20.0, 1.0) == 0); // enabling: first stall one period later
-    CHECK(injector.TakeEnabledNotice());
-    CHECK(!injector.TakeEnabledNotice());
-    CHECK(injector.Next(t0 + kFrequency / 2, kFrequency, 20.0, 1.0) == 0);
-    CHECK(injector.Next(t0 + kFrequency, kFrequency, 20.0, 1.0) == Ticks(20'000.0));
-    CHECK(injector.Count() == 1);
-    CHECK(injector.Next(t0 + kFrequency + kFrequency / 2, kFrequency, 20.0, 1.0) == 0);
-    // Clamped to 200 ms.
-    CHECK(injector.Next(t0 + 2 * kFrequency, kFrequency, 500.0, 1.0) == Ticks(200'000.0));
-    CHECK(injector.Count() == 2);
-
-    // Disabled: nothing, and re-enabling re-arms with a fresh period and notice.
-    CHECK(injector.Next(t0 + 3 * kFrequency, kFrequency, 0.0, 1.0) == 0);
-    CHECK(!injector.TakeEnabledNotice());
-    const int64_t t1 = t0 + 10 * kFrequency;
-    CHECK(injector.Next(t1, kFrequency, 20.0, 1.0) == 0);
-    CHECK(injector.TakeEnabledNotice());
-    CHECK(injector.Next(t1 + kFrequency - 1, kFrequency, 20.0, 1.0) == 0);
-    CHECK(injector.Next(t1 + kFrequency, kFrequency, 20.0, 1.0) > 0);
-    CHECK(injector.Count() == 3);
-
-    // Period clamped to [1, 60] s.
-    SourceStallInjector fast;
-    CHECK(fast.Next(t0, kFrequency, 10.0, 0.01) == 0);
-    CHECK(fast.Next(t0 + kFrequency / 2, kFrequency, 10.0, 0.01) == 0);
-    CHECK(fast.Next(t0 + kFrequency, kFrequency, 10.0, 0.01) == Ticks(10'000.0));
-}
-
-void TestStallInjectorInStage()
-{
-    std::printf("Test: stage stalls once per period with the record flag and duration\n");
-    ResetStage();
-    ScriptedClock clock;
-    const PacingPipelineSnapshot pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
-    const uint32_t count_before = g_stage.StallInjector().Count();
-    int stalled_frames = 0;
-    int enabled_notices = 0;
-    bool durations_ok = true;
-    for (uint64_t frame_id = 100; clock.now < kStart + Ticks(2'500'000.0); ++frame_id) {
-        SourceStageRequest request = Request(Key(frame_id), pipeline);
-        request.stall_inject_ms = 20.0;
-        request.stall_inject_period_s = 1.0;
-        const SourceStageFrame frame = g_stage.RunPlannedFrame(request, &clock);
-        if (g_stage.StallInjector().TakeEnabledNotice()) ++enabled_notices;
-        PacingSourceRecord record{};
-        SourceStage::FillSourceRecord(frame, pipeline, &record);
-        if (frame.stall_injected_us != 0) {
-            ++stalled_frames;
-            durations_ok = durations_ok && frame.stall_injected_us == 20'000 &&
-                record.stall_injected_us == 20'000 &&
-                (record.flags & PACING_SOURCE_STALL_INJECTED) != 0 &&
-                frame.release_qpc >= frame.wait_end_qpc + Ticks(20'000.0);
-        } else {
-            durations_ok = durations_ok && (record.flags & PACING_SOURCE_STALL_INJECTED) == 0;
-        }
-        clock.now += Ticks(3'000.0); // game work before the next marker
-    }
-    CHECK(enabled_notices == 1);
-    CHECK(stalled_frames == 2);
-    CHECK(clock.stall_calls == 2);
-    CHECK(g_stage.StallInjector().Count() == count_before + 2);
-    CHECK(durations_ok);
-}
-
 void TestDuplicateKeyNotRepublished()
 {
     std::printf("Test: a repeated key is neither re-planned nor republished\n");
@@ -551,8 +476,6 @@ void TestStageEventDrainObservesOutput()
     CHECK(FramePlan_PushStageEvent(foreign));
     CHECK(g_stage.DrainStageEvents() == 1);
     CHECK(g_stage.Statistics().output_late_epochs == 0);
-    CHECK(!g_stage.DrainStartedOutputLate());
-    CHECK(g_stage.DrainedOutputLateCount() == 0); // another lifecycle: no entry
 
     const uint64_t unmatched = g_stage.Lead().Statistics().unmatched_events;
     const int64_t output = first.plan.output_target_qpc + Ticks(5'000.0); // tol = 2.5 ms
@@ -562,11 +485,6 @@ void TestStageEventDrainObservesOutput()
         output, PacingPlanStatus::Held)));
     CHECK(g_stage.DrainStageEvents() == 2);
     CHECK(g_stage.Statistics().output_late_epochs == 1);
-    CHECK(g_stage.DrainStartedOutputLate()); // per drain: the governor's OutputLate miss
-    CHECK(g_stage.DrainedOutputLateCount() == 1);
-    CHECK(g_stage.DrainedOutputLate(0).key == first.plan.key);
-    CHECK(g_stage.DrainedOutputLate(0).grid_index == first.plan.grid_index);
-    CHECK(Near(g_stage.DrainedOutputLate(0).lateness_us, 2'500.0, 0.01)); // 5,000 µs − tolerance
     CHECK(g_stage.Lead().Statistics().unmatched_events == unmatched);
     CadenceGridSnapshot snapshot{};
     CHECK(g_cadence_grid_publication.Read(&snapshot));
@@ -578,10 +496,8 @@ void TestStageEventDrainObservesOutput()
     CHECK(second.planned);
     CHECK(second.plan.output_target_qpc == output + Ticks(kIntervalUs));
     CHECK(second.grid_epoch_reason == PacingEpochReason::OutputLate);
-    // The next drain without a late output clears the flag.
+    // The next drain without a late output starts none.
     CHECK(g_stage.DrainStageEvents() == 0);
-    CHECK(!g_stage.DrainStartedOutputLate());
-    CHECK(g_stage.DrainedOutputLateCount() == 0);
 }
 
 void TestLockstepOutputJudgedWithoutGatedHold()
@@ -593,21 +509,16 @@ void TestLockstepOutputJudgedWithoutGatedHold()
     const SourceStageFrame first = g_stage.RunPlannedFrame(Request(Key(120), pipeline), &clock);
     CHECK(first.planned);
 
-    // Frame 2 carries its ended pre-Sleep wait (1 ms) and waits at the marker.
+    // Frame 2 waits at the marker.
     SourceStageRequest request = Request(Key(121), pipeline);
-    request.pre_wait_index = first.plan.grid_index + 1;
-    request.pre_wait_start_qpc = first.release_qpc + Ticks(500.0);
-    request.pre_wait_end_qpc = first.release_qpc + Ticks(1'500.0);
     clock.now = first.release_qpc + Ticks(2'000.0);
     const SourceStageFrame second = g_stage.RunPlannedFrame(request, &clock);
     CHECK(second.planned && second.slept);
-    CHECK(second.pre_wait_start_qpc == request.pre_wait_start_qpc);
-    CHECK(second.pre_wait_end_qpc == request.pre_wait_end_qpc);
 
     // A lockstep engine presents frame 1 just after frame 2's release: late
     // by the raw time, on time without frame 2's waits.
     const int64_t present = second.release_qpc + Ticks(100.0);
-    const int64_t gated = (second.wait_end_qpc - second.wait_start_qpc) + Ticks(1'000.0);
+    const int64_t gated = second.wait_end_qpc - second.wait_start_qpc;
     const int64_t tolerance = Ticks(2'500.0);
     CHECK(present > first.plan.output_target_qpc + tolerance);
     CHECK(present - gated <= first.plan.output_target_qpc + tolerance);
@@ -628,21 +539,11 @@ void TestLockstepOutputJudgedWithoutGatedHold()
     CHECK(g_stage.DrainStageEvents() == 2);
     CHECK(g_stage.Statistics().gated_outputs == before.gated_outputs + 1);
     CHECK(g_stage.Statistics().output_late_epochs == before.output_late_epochs + 1);
-
-    // A pre-Sleep wait predicted for another index is not the frame's.
-    request = Request(Key(122), pipeline);
-    request.pre_wait_index = 999;
-    request.pre_wait_start_qpc = late;
-    request.pre_wait_end_qpc = late + Ticks(1'000.0);
-    clock.now = late + Ticks(1'500.0);
-    const SourceStageFrame third = g_stage.RunPlannedFrame(request, &clock);
-    CHECK(third.planned);
-    CHECK(third.pre_wait_start_qpc == 0 && third.pre_wait_end_qpc == 0);
 }
 
-void TestGovernorStepPassThrough()
+void TestIntervalChangeWithoutPeriodChangeRebasesSilently()
 {
-    std::printf("Test: governor_step reaches the grid as a GovernorStep epoch\n");
+    std::printf("Test: an interval change without period_change rebases the grid silently\n");
     ResetStage();
     ScriptedClock clock;
     const PacingPipelineSnapshot pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::MarkerHold);
@@ -650,30 +551,26 @@ void TestGovernorStepPassThrough()
     const SourceStageFrame first = g_stage.RunPlannedFrame(request, &clock);
     CHECK(first.planned && first.epoch_started == PacingEpochReason::Lifecycle);
 
-    // A step without an interval change starts nothing.
+    // The same interval starts nothing.
     clock.now += Ticks(2'000.0);
     request.key = Key(401);
-    request.governor_step = true;
     const SourceStageFrame same = g_stage.RunPlannedFrame(request, &clock);
     CHECK(same.planned && same.epoch_started == PacingEpochReason::None);
 
-    // A step to I_1 = 1.05 I: a GovernorStep epoch with PeriodChange continuity.
+    // A different interval without the period_change flag is a silent rebase.
     clock.now += Ticks(2'000.0);
     request.key = Key(402);
     request.interval_us = kIntervalUs * 1.05;
     const SourceStageFrame stepped = g_stage.RunPlannedFrame(request, &clock);
-    CHECK(stepped.planned && stepped.epoch_started == PacingEpochReason::GovernorStep);
-    CHECK(stepped.grid_epoch_reason == PacingEpochReason::GovernorStep);
-    CHECK(stepped.plan.grid_epoch == first.plan.grid_epoch + 1);
-    CHECK(stepped.plan.output_target_qpc == same.plan.output_target_qpc + Ticks(kIntervalUs * 1.05));
+    CHECK(stepped.planned && stepped.epoch_started == PacingEpochReason::None);
+    CHECK(stepped.plan.grid_epoch == same.plan.grid_epoch);
 
-    // The same interval change without the flag is a silent rebase.
     clock.now += Ticks(2'000.0);
     request.key = Key(403);
-    request.governor_step = false;
     request.interval_us = kIntervalUs * 1.10;
     const SourceStageFrame rebased = g_stage.RunPlannedFrame(request, &clock);
     CHECK(rebased.planned && rebased.epoch_started == PacingEpochReason::None);
+    CHECK(rebased.plan.grid_epoch == same.plan.grid_epoch);
 }
 
 void TestLeadBudgetLimited()
@@ -745,523 +642,93 @@ void TestResumeHistoryThroughStage()
     CHECK(g_stage.Lead().Statistics().resume_waited_samples == 40);
 }
 
-// ── Overload pauses and resumes ──
+// ── Collision guard through the stage ──
 //
-// The overload guard and a not-held A/B block demote the Auto hold rung to
-// source only (reason Infeasible, auto_rung the hold rung). A demoted frame is
-// planned with the hold rung's lead, so the release phase does not move when
-// holds pause or resume: demand = max(the hold rung's lead, the warm
-// source-only lead), then the collision guard where the lead rung is the GPU
-// queue wait. A resume carries the last paused plan's lead.
-
-PacingPipelineSnapshot DemotedPipeline(PacingRung auto_rung)
-{
-    PacingPipelineSnapshot pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
-    pipeline.reason = PacingFallbackReason::Infeasible;
-    pipeline.auto_rung = auto_rung;
-    return pipeline;
-}
-
-// Scripted frames of the pause tests. A GPU queue wait or FG input wait frame
-// is ready x µs after its release, makes its Present call call_us after it and
-// is released 100 µs after its readiness (status Held: its GPU waited at the
-// gate); any other rung (a demoted frame included) reaches PRESENT_START x µs
-// after its release. With active_us the frame's Reflex report follows (D = X −
-// A). The C window of the collision guard follows call_us: its limit is
+// Scripted frames of the guard test. A GPU queue wait frame is ready x µs
+// after its release, makes its Present call call_us after it and is released
+// 100 µs after its readiness (status Held: its GPU waited at the gate). The C
+// window of the collision guard follows call_us: its limit is
 // I + Q10(C) − M, 8,510 µs at call_us 1,010 (bins are 20 µs wide, ranked at
-// their centre), and 10,510 µs at 3,000. X is at least C: a lead sample is the
-// later of the Present call and the readiness.
-struct PauseRig {
-    explicit PauseRig(uint64_t first_frame_id) : frame_id(first_frame_id) {}
+// their centre). X is at least C: a lead sample is the later of the Present
+// call and the readiness.
+struct GuardRig {
+    explicit GuardRig(uint64_t first_frame_id) : frame_id(first_frame_id) {}
 
     ScriptedClock clock;
     uint64_t frame_id;
     bool collision_guard = true; // Output override Auto
-    // Frames of a demoted pipeline are an overload pause (the warm
-    // source-only lead floors them); false: an A/B not-held block.
-    bool overload_demoted = true;
-    double fg_divisor = 1.0;
     double call_us = 1'010.0;
     const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
 
-    SourceStageFrame Run(const PacingPipelineSnapshot& pipeline, double x_us, double active_us = 0.0)
+    SourceStageFrame Run(double x_us)
     {
         const uint64_t id = frame_id++;
-        SourceStageRequest request = Request(Key(id), pipeline);
+        SourceStageRequest request = Request(Key(id), held);
         request.collision_guard = collision_guard;
-        request.overload_demoted = overload_demoted;
-        request.fg_divisor = fg_divisor;
         const SourceStageFrame frame = g_stage.RunPlannedFrame(request, &clock);
         CHECK(frame.planned);
         const int64_t done = frame.release_qpc + Ticks(x_us);
-        if (pipeline.rung == PacingRung::GpuQueueWait || pipeline.rung == PacingRung::FgInputWait) {
-            CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::PresentCall,
-                frame.release_qpc + Ticks(call_us))));
-            CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady, done)));
-            CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease,
-                done + Ticks(100.0), PacingPlanStatus::Held)));
-        } else {
-            CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::MarkerArrival, done)));
-        }
+        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::PresentCall,
+            frame.release_qpc + Ticks(call_us))));
+        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady, done)));
+        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease,
+            done + Ticks(100.0), PacingPlanStatus::Held)));
         g_stage.DrainStageEvents();
-        if (active_us > 0.0) {
-            LeadGpuReport report{};
-            report.active_us = active_us;
-            g_stage.OnGpuReport(1, id, report);
-        }
         clock.now = done;
         return frame;
     }
 
-    SourceStageFrame RunFrames(const PacingPipelineSnapshot& pipeline, int count, double x_us,
-        double active_us = 0.0)
+    SourceStageFrame RunFrames(int count, double x_us)
     {
         SourceStageFrame last{};
-        for (int frame = 0; frame < count; ++frame) last = Run(pipeline, x_us, active_us);
+        for (int frame = 0; frame < count; ++frame) last = Run(x_us);
         return last;
     }
 };
 
 constexpr double kCollisionLimitUs = kIntervalUs + 1'010.0 - LEAD_RELEASE_MARGIN_US; // call_us 1,010
 
-// Rule pinned: a frame the overload guard demoted (a pause) is planned with
-// the GPU wait's lead and, once the source-only window is warm, at least its
-// lead (it learns while the hold is demoted: an 8.05 ms lead learned while
-// loading, PRESENT_START 12.5 ms after the release in play).
-void TestDemotedGpuQueueWaitLead()
-{
-    std::printf("Test: a paused GPU queue wait plans with at least the warm source-only lead\n");
-    ResetStage();
-    PauseRig rig(900);
-    rig.call_us = 3'000.0; // collision limit 10,510 µs: nothing is guarded here
-    const PacingPipelineSnapshot demoted = DemotedPipeline(PacingRung::GpuQueueWait);
-    rig.RunFrames(rig.held, 40, 3'000.0);
-    SourceStageFrame frame = rig.Run(rig.held, 3'000.0);
-    CHECK(Near(frame.plan.lead_us, 3'510.0)); // Q95 3,010 + 500
-    // Paused with a cold source-only window: the GPU queue wait's lead.
-    frame = rig.Run(demoted, 6'000.0);
-    CHECK(Near(frame.plan.lead_us, 3'510.0));
-    CHECK(frame.plan.rung == PacingRung::SourceOnly);
-    CHECK(frame.guard_reduction_us == 0.0);
-    // The paused frames warm the source-only window (Q95 6,010): its lead,
-    // while the GPU queue wait's own lead stays.
-    rig.RunFrames(demoted, 40, 6'000.0);
-    frame = rig.Run(demoted, 6'000.0);
-    CHECK(Near(frame.plan.lead_us, 6'510.0));
-    CHECK(frame.guard_reduction_us == 0.0);
-    CHECK(Near(g_stage.Lead().BucketStatus(PacingRung::GpuQueueWait, 1.0).lead_us, 3'510.0));
-}
-
-// Rule pinned: the lead of the first held frame after demoted ones follows the
-// way the demotion ended, not a plain switch: an overload that ends carries
-// the last paused plan's lead (RestartLead with carry), a reset restarts at
-// the cold reseed target, and an A/B not-held block shares the held frames'
-// bucket, so its switch moves nothing (and never saw the source-only lead).
-void TestDemotedToHeldTransitions()
-{
-    std::printf("Test: demoted frames hand over to held ones by carry, reset or an A/B block switch\n");
-    const PacingPipelineSnapshot demoted = DemotedPipeline(PacingRung::GpuQueueWait);
-    // Overload ends: carry; reset: reseed max(old median 3,010, warm
-    // source-only Q95 6,010) + 500.
-    for (int carry = 0; carry < 2; ++carry) {
-        ResetStage();
-        PauseRig rig(2300);
-        rig.call_us = 3'000.0;
-        rig.RunFrames(rig.held, 40, 3'000.0);
-        const double paused_us = rig.RunFrames(demoted, 41, 6'000.0).plan.lead_us;
-        CHECK(Near(paused_us, 6'510.0));
-        if (carry != 0) {
-            g_stage.RestartLead(PacingRung::GpuQueueWait, paused_us, 1.0);
-        } else {
-            g_stage.RestartLead(PacingRung::GpuQueueWait);
-        }
-        const double first_held_us = rig.Run(rig.held, 3'000.0).plan.lead_us;
-        if (carry != 0) {
-            CHECK(first_held_us == paused_us);
-        } else {
-            CHECK(Near(first_held_us, 6'510.0));
-        }
-    }
-
-    // A/B not-held block: no floor while it lasts, no jump at either switch.
-    ResetStage();
-    PauseRig rig(2500);
-    rig.call_us = 3'000.0;
-    rig.overload_demoted = false;
-    const double before_us = rig.RunFrames(rig.held, 40, 3'000.0).plan.lead_us;
-    CHECK(Near(before_us, 3'510.0));
-    for (int frame = 0; frame < 40; ++frame) {
-        CHECK(rig.Run(demoted, 6'000.0).plan.lead_us == before_us);
-    }
-    CHECK(g_stage.Lead().BucketStatus(PacingRung::SourceOnly, 1.0).warm); // warm, and never used
-    CHECK(rig.Run(demoted, 6'000.0).plan.lead_us == before_us);
-    CHECK(rig.Run(rig.held, 3'000.0).plan.lead_us == before_us);
-}
-
 // Rule pinned: the collision guard is the limit applied to every frame
-// planned with the GPU queue wait's lead, a paused one included, and to the
-// demand after the source-only floor: neither the GPU wait's own lead nor a
-// warm source-only lead above the limit is exempt. Without the guard (Output
-// override GPU wait) nothing changes.
-void TestDemotedGpuQueueWaitLeadIsGuarded()
+// planned with the GPU queue wait's lead: a lead above the limit is limited
+// to it (the bucket keeps its own lead), and without the guard (Output
+// override GPU wait) nothing is limited.
+void TestGpuQueueWaitLeadIsGuarded()
 {
-    std::printf("Test: a demoted GPU queue wait frame is guarded, whichever lead sets the demand\n");
-    const PacingPipelineSnapshot demoted = DemotedPipeline(PacingRung::GpuQueueWait);
-
-    // The GPU wait's own lead (9,510) is above the limit: the held frames are
-    // limited to it and so is the paused frame, which used to keep it whole.
+    std::printf("Test: a GPU queue wait frame is limited by the collision guard\n");
     {
         ResetStage();
-        PauseRig rig(1100);
-        rig.RunFrames(rig.held, 40, 9'000.0);
-        const SourceStageFrame held = rig.Run(rig.held, 9'000.0);
+        GuardRig rig(1100);
+        rig.RunFrames(40, 9'000.0);
+        const SourceStageFrame held = rig.Run(9'000.0);
         CHECK(Near(held.plan.lead_us, kCollisionLimitUs));
         CHECK(Near(held.guard_reduction_us, 9'510.0 - kCollisionLimitUs));
         CHECK(Near(g_stage.Lead().BucketStatus(PacingRung::GpuQueueWait, 1.0).lead_us, 9'510.0));
-        const SourceStageFrame paused = rig.Run(demoted, 9'000.0);
-        CHECK(Near(paused.plan.lead_us, kCollisionLimitUs));
-        CHECK(Near(paused.guard_reduction_us, 9'510.0 - kCollisionLimitUs)); // demand − returned
-        CHECK(paused.plan.lead_us + paused.guard_reduction_us > 9'509.0);
     }
-
-    // The warm source-only lead (12,510) above the limit: the demand is the
-    // source-only lead and the guard limits it, no exemption. The cold
-    // source-only window leaves the GPU wait's lead (3,510).
-    const auto run_pause = [&](bool collision_guard, double* reductions_us) {
-        ResetStage();
-        PauseRig rig(1300);
-        rig.collision_guard = collision_guard;
-        rig.RunFrames(rig.held, 40, 3'000.0);
-        double leads[40] = {};
-        for (int frame = 0; frame < 40; ++frame) {
-            const SourceStageFrame paused = rig.Run(demoted, 12'000.0);
-            leads[frame] = paused.plan.lead_us;
-            reductions_us[frame] = paused.guard_reduction_us;
-        }
-        CHECK(Near(g_stage.Lead().BucketStatus(PacingRung::SourceOnly, 1.0).lead_us, 12'510.0));
-        return std::vector<double>(leads, leads + 40);
-    };
-    double reductions[40] = {};
-    std::vector<double> leads = run_pause(true, reductions);
-    for (int frame = 0; frame < 40; ++frame) {
-        if (frame < 32) {
-            CHECK(Near(leads[frame], 3'510.0)); // cold source-only window
-            CHECK(reductions[frame] == 0.0);
-        } else {
-            CHECK(Near(leads[frame], kCollisionLimitUs));
-            CHECK(Near(reductions[frame], 12'510.0 - kCollisionLimitUs));
-        }
-    }
-    // Output override GPU wait: no collision guard, no change.
-    leads = run_pause(false, reductions);
-    for (int frame = 0; frame < 40; ++frame) {
-        CHECK(Near(leads[frame], frame < 32 ? 3'510.0 : 12'510.0));
-        CHECK(reductions[frame] == 0.0);
-    }
-}
-
-// Rule pinned: the collision guard stays GPU-queue-wait only. A demoted
-// FG input wait or marker hold keeps its rung's lead (at least the warm
-// source-only lead) and is never guarded, even with the guard's C window warm
-// and its limit (8,510 µs) below the lead.
-void TestDemotedFgInputWaitAndMarkerHoldKeepTheirLead()
-{
-    std::printf("Test: a demoted FG input wait or marker hold keeps its lead and is never guarded\n");
-    struct Case { PacingRung rung; double fg_divisor; };
-    const Case cases[] = {
-        { PacingRung::FgInputWait, 2.0 },
-        { PacingRung::MarkerHold, 1.0 },
-    };
-    for (const Case& c : cases) {
-        ResetStage();
-        PauseRig rig(1500);
-        rig.fg_divisor = c.fg_divisor;
-        // The GPU queue wait's guard is armed for this FG divisor slot.
-        rig.RunFrames(rig.held, 40, 3'000.0);
-        CHECK(Near(rig.Run(rig.held, 3'000.0).plan.lead_us, 3'510.0));
-        const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, c.rung);
-        const PacingPipelineSnapshot demoted = DemotedPipeline(c.rung);
-        // The rung's own lead is 12,510, far above the limit.
-        rig.RunFrames(held, 40, 12'000.0);
-        const double rung_lead_us = g_stage.Lead().BucketStatus(c.rung, c.fg_divisor).lead_us;
-        CHECK(Near(rung_lead_us, 12'510.0));
-        const double limit_us = g_stage.Lead().Statistics().last_collision_limit_us;
-        CHECK(Near(limit_us, kCollisionLimitUs));
-        // Cold source-only window: the rung's lead, unguarded.
-        SourceStageFrame frame{};
-        for (int paused = 0; paused < 32; ++paused) {
-            frame = rig.Run(demoted, 14'000.0);
-            CHECK(Near(frame.plan.lead_us, 12'510.0));
-            CHECK(frame.guard_reduction_us == 0.0);
-        }
-        // Warm source-only window (Q95 14,010): its lead is the demand,
-        // still unguarded.
-        for (int paused = 0; paused < 8; ++paused) {
-            frame = rig.Run(demoted, 14'000.0);
-            CHECK(Near(frame.plan.lead_us, 14'510.0));
-            CHECK(frame.guard_reduction_us == 0.0);
-        }
-        CHECK(Near(g_stage.Lead().BucketStatus(c.rung, c.fg_divisor).lead_us, 12'510.0));
-    }
-}
-
-// Rule pinned: an A/B not-held block (rung source only + Infeasible, not
-// an overload pause: overload_demoted false) plans exactly like a held block
-// of the same rung: the rung's own lead, collision-guarded for the GPU queue
-// wait, with no source-only floor, however warm that window is. A frame the
-// overload guard demoted plans max(own lead, warm source-only lead), guarded.
-// The pipelines are what the resolver gives while the unified pacer does not own pacing and the Auto rung is the GPU
-// queue wait: gpu_queue_wait_off and hold_overloaded both give rung SourceOnly, reason Infeasible, auto_rung the hold
-// rung (the unified owner bypasses both demotions and the owner is derived, so the snapshots are written out here).
-void TestNotHeldBlockPlansLikeAHeldBlock()
-{
-    std::printf("Test: an A/B not-held block plans the same lead as a held block; an overload pause adds the source-only floor\n");
-    PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
-    held.auto_rung = PacingRung::GpuQueueWait;
-    PacingPipelineSnapshot demoted = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
-    demoted.reason = PacingFallbackReason::Infeasible;
-    demoted.auto_rung = PacingRung::GpuQueueWait;
-    PacingPipelineSnapshot variants[] = {
-        held,    // held
-        demoted, // A/B not-held block
-        demoted, // overload pause
-    };
-    CHECK(variants[0].rung == PacingRung::GpuQueueWait);
-    for (size_t variant = 1; variant < 3; ++variant) {
-        CHECK(variants[variant].rung == PacingRung::SourceOnly &&
-              variants[variant].reason == PacingFallbackReason::Infeasible);
-        CHECK(PacingPipeline_LeadRung(variants[variant]) == PacingRung::GpuQueueWait);
-    }
-    // The same quantile and allowance as the other tests' pipelines.
-    for (PacingPipelineSnapshot& variant : variants) {
-        variant.lead_quantile = 0.95;
-        variant.allowance_us = 500.0;
-    }
-    const PacingPipelineSnapshot source_only = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
-
-    // The warm source-only window's lead exceeds the GPU wait's own lead
-    // (A), and also the guard's limit (B, C: C is a guarded GPU wait lead).
-    struct History {
-        double call_us; double gpu_x_us; double source_x_us;
-        double own_lead_us; double own_reduction_us;           // held and block
-        double overload_lead_us; double overload_reduction_us; // overload pause
-    };
-    const History histories[] = {
-        { 3'000.0, 3'000.0, 6'000.0, 3'510.0, 0.0, 6'510.0, 0.0 },
-        { 3'000.0, 3'000.0, 12'000.0, 3'510.0, 0.0, 10'510.0, 2'000.0 },
-        { 1'010.0, 9'000.0, 12'000.0, kCollisionLimitUs, 9'510.0 - kCollisionLimitUs,
-          kCollisionLimitUs, 12'510.0 - kCollisionLimitUs },
-    };
-    for (const History& history : histories) {
-        double leads[3][10] = {};
-        double reductions[3][10] = {};
-        for (size_t variant = 0; variant < 3; ++variant) {
-            ResetStage();
-            PauseRig rig(1700);
-            rig.call_us = history.call_us;
-            rig.RunFrames(variants[0], 40, history.gpu_x_us);
-            rig.RunFrames(source_only, 40, history.source_x_us);
-            CHECK(g_stage.Lead().BucketStatus(PacingRung::SourceOnly, 1.0).warm);
-            rig.overload_demoted = variant == 2;
-            for (int frame = 0; frame < 10; ++frame) {
-                const SourceStageFrame planned = rig.Run(variants[variant], history.gpu_x_us);
-                leads[variant][frame] = planned.plan.lead_us;
-                reductions[variant][frame] = planned.guard_reduction_us;
-            }
-        }
-        for (int frame = 0; frame < 10; ++frame) {
-            CHECK(Near(leads[0][frame], history.own_lead_us));
-            CHECK(Near(reductions[0][frame], history.own_reduction_us));
-            CHECK(leads[1][frame] == leads[0][frame]);
-            CHECK(reductions[1][frame] == reductions[0][frame]);
-            CHECK(Near(leads[2][frame], history.overload_lead_us));
-            CHECK(Near(reductions[2][frame], history.overload_reduction_us));
-        }
-    }
-
-    // FG input wait and marker hold: demoted without an overload pause, the
-    // frame plans the rung's own lead; paused, the warm source-only lead.
-    struct Case { PacingRung rung; double fg_divisor; };
-    const Case cases[] = { { PacingRung::FgInputWait, 2.0 }, { PacingRung::MarkerHold, 1.0 } };
-    for (const Case& c : cases) {
-        double leads[2] = {};
-        for (int paused = 0; paused < 2; ++paused) {
-            ResetStage();
-            PauseRig rig(1900);
-            rig.fg_divisor = c.fg_divisor;
-            rig.RunFrames(Pipeline(PacingTimingMode::Vrr, c.rung), 40, 3'000.0);
-            rig.RunFrames(source_only, 40, 9'000.0);
-            rig.overload_demoted = paused != 0;
-            leads[paused] = rig.Run(DemotedPipeline(c.rung), 3'000.0).plan.lead_us;
-        }
-        CHECK(Near(leads[0], 3'510.0));
-        CHECK(Near(leads[1], 9'510.0));
-    }
-}
-
-// Rule pinned: when the overload ends the first held frame is planned
-// with the last paused plan's lead (RestartLead with the carried lead), then
-// the lead slews at most min(100 µs, I / 64) per frame, also at the 32nd
-// sample; a reset (no carry) keeps the old reseed.
-struct PauseResumeScript {
-    PacingRung rung = PacingRung::GpuQueueWait;
-    double fg_divisor = 1.0;
-    double call_us = 3'000.0;
-    double history_x_us = 3'000.0;
-    int paused_early = 40;     // paused frames at paused_early_x_us
-    double paused_early_x_us = 6'000.0;
-    int paused_late = 20;      // then at paused_late_x_us (the source-only lead lags its target)
-    double paused_late_x_us = 9'000.0;
-    double resumed_x_us = 9'000.0;
-};
-
-struct PauseResume {
-    double last_held_us = 0.0;
-    double last_paused_us = 0.0;
-    double resumed_us[60] = {};
-};
-
-PauseResume RunPauseResume(const PauseResumeScript& script, bool carry)
-{
-    ResetStage();
-    PauseRig rig(2000);
-    rig.call_us = script.call_us;
-    rig.fg_divisor = script.fg_divisor;
-    const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, script.rung);
-    const PacingPipelineSnapshot demoted = DemotedPipeline(script.rung);
-    PauseResume result;
-    result.last_held_us = rig.RunFrames(held, 40, script.history_x_us).plan.lead_us;
-    rig.RunFrames(demoted, script.paused_early, script.paused_early_x_us);
-    result.last_paused_us = rig.RunFrames(demoted, script.paused_late, script.paused_late_x_us).plan.lead_us;
-    if (carry) {
-        g_stage.RestartLead(script.rung, result.last_paused_us, script.fg_divisor);
-    } else {
-        g_stage.RestartLead(script.rung);
-    }
-    for (double& lead_us : result.resumed_us) {
-        lead_us = rig.Run(held, script.resumed_x_us).plan.lead_us;
-    }
-    return result;
-}
-
-void TestPauseToResumeCarriesTheLead()
-{
-    std::printf("Test: the first held frame after a pause is planned with the last paused lead\n");
-    // Unguarded, GPU queue wait and FG input wait (FG divisor 2).
-    for (const PacingRung rung : { PacingRung::GpuQueueWait, PacingRung::FgInputWait }) {
-        PauseResumeScript script;
-        script.rung = rung;
-        script.fg_divisor = rung == PacingRung::FgInputWait ? 2.0 : 1.0;
-        const PauseResume carried = RunPauseResume(script, true);
-        CHECK(Near(carried.last_held_us, 3'510.0));
-        // The paused frames' source-only lead lags its target (9,510): the
-        // lead the resume must not jump away from.
-        CHECK(carried.last_paused_us > 7'000.0 && carried.last_paused_us < 9'000.0);
-        CHECK(carried.resumed_us[0] == carried.last_paused_us);
-        const double step_us = (std::min)(LEAD_SLEW_MAX_US, kIntervalUs / 64.0);
-        for (size_t frame = 1; frame < 60; ++frame) {
-            const double change_us = carried.resumed_us[frame] - carried.resumed_us[frame - 1];
-            CHECK(change_us >= -1e-9 && change_us <= step_us + 1e-9);
-        }
-        CHECK(Near(carried.resumed_us[59], 9'510.0)); // reached the cold, then the warm target
-
-        // A reset passes no carry: the cold target at once.
-        const PauseResume reset = RunPauseResume(script, false);
-        CHECK(reset.last_paused_us == carried.last_paused_us);
-        CHECK(Near(reset.resumed_us[0], 9'510.0));
-        CHECK(reset.resumed_us[0] - reset.last_paused_us > LEAD_SLEW_MAX_US);
-        CHECK(Near(reset.resumed_us[59], 9'510.0));
-    }
-
-    // Guarded: the paused plan is at the collision limit like the held ones
-    // before it, so pause and resume do not move the lead at all.
-    PauseResumeScript guarded;
-    guarded.call_us = 1'010.0;
-    guarded.history_x_us = 9'000.0;
-    guarded.paused_early_x_us = 9'000.0;
-    guarded.paused_early = 20;
-    guarded.paused_late = 40;
-    const PauseResume result = RunPauseResume(guarded, true);
-    CHECK(Near(result.last_held_us, kCollisionLimitUs));
-    CHECK(Near(result.last_paused_us, kCollisionLimitUs));
-    CHECK(result.resumed_us[0] == result.last_paused_us);
-    for (const double lead_us : result.resumed_us) CHECK(Near(lead_us, kCollisionLimitUs));
-}
-
-// Rule pinned (G2): the demoted frames are planned with the GPU queue wait's
-// lead, so they age the heavy-work window and a Reflex report of one refreshes
-// it (LeadFrameStart::demoted_from). The guard's D limit (I + Q10(D) − H)
-// stays current through a long pause with reports and falls back to the C
-// limit once LEAD_WORK_STALE_FRAMES demoted frames passed without one.
-void TestDemotedFramesAgeAndRefreshTheWorkWindow()
-{
-    std::printf("Test: demoted frames age the work window and their Reflex reports refresh it\n");
-    const PacingPipelineSnapshot demoted = DemotedPipeline(PacingRung::GpuQueueWait);
-    // D = 9,000 − 7,990 = 1,010 (bin centre 1,010) at a lead of 9,510.
-    const double d_limit_us = kIntervalUs + 1'010.0 - Pipeline(PacingTimingMode::Vrr,
-        PacingRung::GpuQueueWait).gpu_wait_headroom_us;
-    CHECK(d_limit_us > 9'510.0 && d_limit_us > kCollisionLimitUs);
-    const auto warm = [&](PauseRig* rig) {
-        // 60 frames: the C limit (8,510) guards until D is warm, then the lead
-        // slews back up to its 9,510 at 100 µs per frame.
-        rig->RunFrames(rig->held, 60, 9'000.0, 7'990.0);
-        CHECK(g_stage.Lead().Statistics().work_samples >= LEAD_WARM_SAMPLES);
-        const SourceStageFrame frame = rig->Run(rig->held, 9'000.0, 7'990.0);
-        CHECK(g_stage.Lead().Statistics().last_guard_headroom);
-        CHECK(Near(g_stage.Lead().Statistics().last_collision_limit_us, d_limit_us));
-        CHECK(Near(frame.plan.lead_us, 9'510.0));
-    };
-
-    // A 100-frame pause with an occasional report: the D limit stays.
     {
         ResetStage();
-        PauseRig rig(2600);
-        warm(&rig);
-        SourceStageFrame frame{};
-        for (int paused = 0; paused < 100; ++paused) {
-            frame = rig.Run(demoted, 3'000.0, paused % 30 == 0 ? 5'000.0 : 0.0);
-            CHECK(Near(frame.plan.lead_us, 9'510.0));
-        }
-        CHECK(g_stage.Lead().Statistics().last_guard_headroom);
-        CHECK(Near(g_stage.Lead().Statistics().last_collision_limit_us, d_limit_us));
-    }
-
-    // Without a report the window is current for LEAD_WORK_STALE_FRAMES + 1
-    // demoted frames (each is planned before it ages the window), then stale:
-    // the C limit applies at once, and one report makes it current again.
-    {
-        ResetStage();
-        PauseRig rig(3000);
-        warm(&rig);
-        SourceStageFrame frame = rig.RunFrames(demoted, static_cast<int>(LEAD_WORK_STALE_FRAMES) + 1, 3'000.0);
-        CHECK(g_stage.Lead().Statistics().last_guard_headroom);
-        CHECK(Near(frame.plan.lead_us, 9'510.0));
-        frame = rig.Run(demoted, 3'000.0);
-        CHECK(!g_stage.Lead().Statistics().last_guard_headroom);
-        CHECK(Near(g_stage.Lead().Statistics().last_collision_limit_us, kCollisionLimitUs));
-        CHECK(Near(frame.plan.lead_us, kCollisionLimitUs));
-        rig.Run(demoted, 3'000.0, 5'000.0); // planned stale, its report refreshes
-        rig.Run(demoted, 3'000.0);
-        CHECK(g_stage.Lead().Statistics().last_guard_headroom);
-        CHECK(Near(g_stage.Lead().Statistics().last_collision_limit_us, d_limit_us));
+        GuardRig rig(1300);
+        rig.collision_guard = false;
+        rig.RunFrames(40, 9'000.0);
+        const SourceStageFrame held = rig.Run(9'000.0);
+        CHECK(Near(held.plan.lead_us, 9'510.0));
+        CHECK(held.guard_reduction_us == 0.0);
     }
 }
 
-// ── OutputLate attribution ──
+// ── OutputLate epochs ──
 //
-// DrainStageEvents lists each OutputLate epoch of the drain with its own
-// frame's key and grid index and its lateness beyond T + tolerance (the
-// overload guard's evidence); I = 10 ms, tolerance 2.5 ms.
+// DrainStageEvents counts each OutputLate epoch the grid starts; I = 10 ms,
+// tolerance 2.5 ms.
 
-// Rule pinned: the entry is the output's own frame and lateness, also when
-// the output is observed after later frames were planned; evidence older than
-// the newest epoch is carried to the epoch base like the grid judges it.
-void TestDrainedOutputLateCarriesItsOwnFrame()
+// Rule pinned: an output is judged against its own frame's target, also when
+// it is observed after later frames were planned; the tolerance edge is on
+// time; evidence older than the newest epoch is carried to the epoch base
+// like the grid judges it.
+void TestOutputLateEpochsAreCountedPerFrame()
 {
-    std::printf("Test: a drained OutputLate carries its own key, grid index and lateness\n");
+    std::printf("Test: each drained output is judged against its own frame; a late one starts an epoch\n");
     const PacingPipelineSnapshot pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
     const int64_t tolerance = Ticks(2'500.0);
-    const auto late_us = [](int64_t ticks) { return static_cast<double>(ticks) / 10.0; };
 
     // The newest frame's own output, and one at the tolerance edge.
     {
@@ -1269,26 +736,23 @@ void TestDrainedOutputLateCarriesItsOwnFrame()
         ScriptedClock clock;
         const SourceStageFrame first = g_stage.RunPlannedFrame(Request(Key(7000), pipeline), &clock);
         CHECK(first.planned);
-        CHECK(g_stage.DrainedOutputLateCount() == 0);
+        const uint64_t before = g_stage.Statistics().output_late_epochs;
         const int64_t target = first.plan.output_target_qpc;
         CHECK(FramePlan_PushStageEvent(Event(first, PacingStageEventKind::OutputRelease,
             target + tolerance, PacingPlanStatus::SourceOnly)));
         CHECK(g_stage.DrainStageEvents() == 1);
-        CHECK(g_stage.DrainedOutputLateCount() == 0 && !g_stage.DrainStartedOutputLate());
+        CHECK(g_stage.Statistics().output_late_epochs == before);
         CHECK(FramePlan_PushStageEvent(Event(first, PacingStageEventKind::OutputRelease,
             target + tolerance + 1, PacingPlanStatus::SourceOnly)));
         CHECK(g_stage.DrainStageEvents() == 1);
-        CHECK(g_stage.DrainedOutputLateCount() == 1 && g_stage.DrainStartedOutputLate());
-        CHECK(g_stage.DrainedOutputLate(0).key == first.plan.key);
-        CHECK(g_stage.DrainedOutputLate(0).grid_index == first.plan.grid_index);
-        CHECK(Near(g_stage.DrainedOutputLate(0).lateness_us, 0.1, 0.01)); // one tick
-        // The list belongs to its drain: the next one starts empty.
+        CHECK(g_stage.Statistics().output_late_epochs == before + 1);
+        // The next drain starts none.
         CHECK(g_stage.DrainStageEvents() == 0);
-        CHECK(g_stage.DrainedOutputLateCount() == 0 && !g_stage.DrainStartedOutputLate());
+        CHECK(g_stage.Statistics().output_late_epochs == before + 1);
     }
 
     // A delayed OutputLate: frame 1's output arrives after frames 2 and 3 were
-    // planned and keeps frame 1's index; lateness 5,000 − 2,500 µs.
+    // planned and is judged against frame 1's target.
     {
         ResetStage();
         ScriptedClock clock;
@@ -1297,33 +761,28 @@ void TestDrainedOutputLateCarriesItsOwnFrame()
         const SourceStageFrame third = g_stage.RunPlannedFrame(Request(Key(7102), pipeline), &clock);
         CHECK(first.planned && second.planned && third.planned);
         CHECK(third.plan.grid_index == first.plan.grid_index + 2);
+        const uint64_t before = g_stage.Statistics().output_late_epochs;
         CHECK(FramePlan_PushStageEvent(Event(first, PacingStageEventKind::OutputRelease,
             first.plan.output_target_qpc + Ticks(5'000.0), PacingPlanStatus::SourceOnly)));
         CHECK(g_stage.DrainStageEvents() == 1);
-        CHECK(g_stage.DrainedOutputLateCount() == 1);
-        CHECK(g_stage.DrainedOutputLate(0).key == first.plan.key);
-        CHECK(g_stage.DrainedOutputLate(0).grid_index == first.plan.grid_index);
-        CHECK(Near(g_stage.DrainedOutputLate(0).lateness_us, 2'500.0, 0.01));
-        CHECK(g_stage.DrainStartedOutputLate());
+        CHECK(g_stage.Statistics().output_late_epochs == before + 1);
 
-        // Two in one drain, each its own frame, in observation order; the
-        // second is late against the grid the first restarted.
+        // The second output is late against the grid the first restarted.
         const int64_t second_output = first.plan.output_target_qpc + Ticks(5'000.0) +
             Ticks(kIntervalUs) + Ticks(6'000.0);
         CHECK(FramePlan_PushStageEvent(Event(second, PacingStageEventKind::OutputRelease,
             second_output, PacingPlanStatus::SourceOnly)));
         CHECK(g_stage.DrainStageEvents() == 1);
-        CHECK(g_stage.DrainedOutputLateCount() == 1);
-        CHECK(g_stage.DrainedOutputLate(0).key == second.plan.key);
-        CHECK(g_stage.DrainedOutputLate(0).grid_index == second.plan.grid_index);
-        CHECK(Near(g_stage.DrainedOutputLate(0).lateness_us, 3'500.0, 0.01));
+        CHECK(g_stage.Statistics().output_late_epochs == before + 2);
     }
+    // Two in one drain, each against its own frame.
     {
         ResetStage();
         ScriptedClock clock;
         const SourceStageFrame first = g_stage.RunPlannedFrame(Request(Key(7200), pipeline), &clock);
         const SourceStageFrame second = g_stage.RunPlannedFrame(Request(Key(7201), pipeline), &clock);
         CHECK(first.planned && second.planned);
+        const uint64_t before = g_stage.Statistics().output_late_epochs;
         const int64_t first_output = first.plan.output_target_qpc + Ticks(5'000.0);
         const int64_t second_output = first_output + Ticks(kIntervalUs) + Ticks(6'000.0);
         CHECK(FramePlan_PushStageEvent(Event(first, PacingStageEventKind::OutputRelease, first_output,
@@ -1331,20 +790,14 @@ void TestDrainedOutputLateCarriesItsOwnFrame()
         CHECK(FramePlan_PushStageEvent(Event(second, PacingStageEventKind::OutputRelease, second_output,
             PacingPlanStatus::SourceOnly)));
         CHECK(g_stage.DrainStageEvents() == 2);
-        CHECK(g_stage.DrainedOutputLateCount() == 2);
-        CHECK(g_stage.DrainedOutputLate(0).key == first.plan.key);
-        CHECK(g_stage.DrainedOutputLate(0).grid_index == first.plan.grid_index);
-        CHECK(Near(g_stage.DrainedOutputLate(0).lateness_us, 2'500.0, 0.01));
-        CHECK(g_stage.DrainedOutputLate(1).key == second.plan.key);
-        CHECK(g_stage.DrainedOutputLate(1).grid_index == second.plan.grid_index);
-        CHECK(Near(g_stage.DrainedOutputLate(1).lateness_us, 3'500.0, 0.01));
+        CHECK(g_stage.Statistics().output_late_epochs == before + 2);
         CHECK(g_stage.DrainStageEvents() == 0);
-        CHECK(g_stage.DrainedOutputLateCount() == 0);
+        CHECK(g_stage.Statistics().output_late_epochs == before + 2);
     }
 
     // Older evidence: a SourceLate epoch started at frame 4 before frame 2's
-    // late output arrived. The output keeps frame 2's index and its lateness
-    // is judged at the epoch base: o + 2 I against T(4) + tolerance.
+    // late output arrived. The output is judged at the epoch base: o + 2 I
+    // against T(4) + tolerance.
     {
         ResetStage();
         ScriptedClock clock;
@@ -1360,16 +813,14 @@ void TestDrainedOutputLateCarriesItsOwnFrame()
         const int64_t late_ticks = output + 2 * Ticks(kIntervalUs) -
             (fourth.plan.output_target_qpc + tolerance);
         CHECK(late_ticks > 0);
+        const uint64_t before = g_stage.Statistics().output_late_epochs;
         CHECK(FramePlan_PushStageEvent(Event(frames[1], PacingStageEventKind::OutputRelease, output,
             PacingPlanStatus::SourceOnly)));
         CHECK(g_stage.DrainStageEvents() == 1);
-        CHECK(g_stage.DrainedOutputLateCount() == 1);
-        CHECK(g_stage.DrainedOutputLate(0).key == frames[1].plan.key);
-        CHECK(g_stage.DrainedOutputLate(0).grid_index == frames[1].plan.grid_index);
-        CHECK(Near(g_stage.DrainedOutputLate(0).lateness_us, late_us(late_ticks), 0.01));
+        CHECK(g_stage.Statistics().output_late_epochs == before + 1);
     }
 
-    // A frame of another lifecycle is no entry.
+    // A frame of another lifecycle starts none.
     {
         ResetStage();
         ScriptedClock clock;
@@ -1377,22 +828,22 @@ void TestDrainedOutputLateCarriesItsOwnFrame()
         PacingStageEvent foreign = Event(first, PacingStageEventKind::OutputRelease,
             first.plan.output_target_qpc + Ticks(8'000.0), PacingPlanStatus::SourceOnly);
         foreign.key.controller_generation = 99;
+        const uint64_t before = g_stage.Statistics().output_late_epochs;
         CHECK(FramePlan_PushStageEvent(foreign));
         CHECK(g_stage.DrainStageEvents() == 1);
-        CHECK(g_stage.DrainedOutputLateCount() == 0 && !g_stage.DrainStartedOutputLate());
+        CHECK(g_stage.Statistics().output_late_epochs == before);
     }
 }
 
-// Rule pinned: the list holds kMaxOutputLatePerDrain entries (the oldest of
-// the drain); the rest are counted in output_late_dropped, every epoch still
-// counts in output_late_epochs.
-void TestDrainedOutputLateOverflowIsCounted()
+// Rule pinned: every OutputLate epoch of one drain counts in
+// output_late_epochs, however many there are.
+void TestManyOutputLateEpochsInOneDrainAreCounted()
 {
-    std::printf("Test: OutputLate epochs beyond the per-drain list are counted as dropped\n");
+    std::printf("Test: every OutputLate epoch of a drain is counted\n");
     ResetStage();
     ScriptedClock clock;
     const PacingPipelineSnapshot pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
-    constexpr size_t kFrames = SourceStage::kMaxOutputLatePerDrain + 8;
+    constexpr size_t kFrames = 40;
     SourceStageFrame frames[kFrames];
     for (size_t frame = 0; frame < kFrames; ++frame) {
         frames[frame] = g_stage.RunPlannedFrame(Request(Key(8000 + frame), pipeline), &clock);
@@ -1409,17 +860,8 @@ void TestDrainedOutputLateOverflowIsCounted()
     }
     CHECK(g_stage.DrainStageEvents() == kFrames);
     CHECK(g_stage.Statistics().output_late_epochs - before.output_late_epochs == kFrames);
-    CHECK(g_stage.DrainedOutputLateCount() == SourceStage::kMaxOutputLatePerDrain);
-    CHECK(g_stage.Statistics().output_late_dropped - before.output_late_dropped ==
-          kFrames - SourceStage::kMaxOutputLatePerDrain);
-    for (size_t index = 0; index < g_stage.DrainedOutputLateCount(); ++index) {
-        CHECK(g_stage.DrainedOutputLate(index).key == frames[index].plan.key);
-        CHECK(g_stage.DrainedOutputLate(index).grid_index == frames[index].plan.grid_index);
-        CHECK(Near(g_stage.DrainedOutputLate(index).lateness_us, 3'500.0, 0.01));
-    }
-    CHECK(g_stage.DrainStartedOutputLate());
     CHECK(g_stage.DrainStageEvents() == 0);
-    CHECK(g_stage.DrainedOutputLateCount() == 0);
+    CHECK(g_stage.Statistics().output_late_epochs - before.output_late_epochs == kFrames);
 }
 
 void TestVBlankPhaseTrackerFeedsFixedGrid()
@@ -1514,342 +956,14 @@ void TestResetClearsPlans()
 
 } // namespace
 
-// Render handoff limit, frame not held: the
-// earliest release is a floor on the wait and the frame's arrival for the
-// grid. Before S it changes nothing; past S within the late tolerance (a
-// quarter interval) the grid stays and the wait runs to it; beyond, the
-// cadence restarts from it (SourceLate), as for any late source.
-void TestEarliestReleaseLimitsWait()
+// A frame of the driver limiter placement (the placement has no lead of its
+// own) plans with no lead, and a frame that arrives before its S waits to it
+// like any other.
+void TestDriverLimiterPlacementPlansWithoutALead()
 {
-    std::printf("Test: the render handoff limit floors the wait and counts as the arrival\n");
-    ResetStage();
-    ScriptedClock clock;
-    const PacingPipelineSnapshot pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
-    const SourceStageFrame first = g_stage.RunPlannedFrame(Request(Key(700), pipeline), &clock);
-    CHECK(first.planned);
-    const auto next_wake = [](const SourceStageFrame& previous) {
-        return previous.plan.output_target_qpc + Ticks(kIntervalUs) - Ticks(previous.plan.lead_us);
-    };
-
-    SourceStageRequest request = Request(Key(701), pipeline);
-    const int64_t s2 = next_wake(first);
-    request.earliest_release_qpc = s2 - Ticks(1'000.0);
-    const SourceStageFrame second = g_stage.RunPlannedFrame(request, &clock);
-    CHECK(second.plan.source_wake_qpc == s2 && second.wait_target_qpc == s2);
-    CHECK(!second.handoff_limited && second.epoch_started == PacingEpochReason::None);
-
-    request = Request(Key(702), pipeline);
-    const int64_t s3 = next_wake(second);
-    request.earliest_release_qpc = s3 + Ticks(2'000.0);
-    const SourceStageFrame third = g_stage.RunPlannedFrame(request, &clock);
-    // The same grid (T unchanged); the grid's S is the arrival, as for a
-    // late source released at once.
-    CHECK(third.epoch_started == PacingEpochReason::None);
-    CHECK(third.plan.output_target_qpc == second.plan.output_target_qpc + Ticks(kIntervalUs));
-    CHECK(third.plan.source_wake_qpc == request.earliest_release_qpc);
-    CHECK(third.handoff_limited && third.wait_target_qpc == request.earliest_release_qpc);
-    CHECK(clock.last_wait_target == third.wait_target_qpc && third.release_qpc == request.earliest_release_qpc);
-
-    request = Request(Key(703), pipeline);
-    request.earliest_release_qpc = next_wake(third) + Ticks(6'000.0);
-    const SourceStageFrame fourth = g_stage.RunPlannedFrame(request, &clock);
-    CHECK(fourth.epoch_started == PacingEpochReason::SourceLate && fourth.handoff_limited);
-    CHECK(fourth.release_qpc == request.earliest_release_qpc);
-    CHECK(fourth.plan.output_target_qpc == request.earliest_release_qpc + Ticks(fourth.plan.lead_us));
-}
-
-// Developer A/B gpu_paced_cadence: a held frame whose release the GPU floor
-// sets (the floor is the earliest release and later than its arrival) is
-// released at the floor, never judged late at its source or its output, and
-// its output target is at least its release plus the early lead: until 32
-// frames were released by the floor, the Q5 of the GPU waits' measured
-// readiness − allowance (3,000 − 500 µs here; a restarted lead keeps it),
-// and then the floor-released frames' own X (TestGpuPacedRing). Its record
-// carries the GPU-paced flag. A frame whose game entered the Reflex Sleep for
-// its index before the floor is the floor's even when its marker lands just
-// after it (released at the marker). The key off, a later render-thread term
-// and an arrival after the floor without a Sleep entry for this index are not
-// GPU-paced, and their output 8 ms past T restarts the cadence; with a cold
-// bucket the floor still releases the frame but without an early lead the
-// grid judges its source as before: 6 ms past S is a SourceLate restart.
-void TestGpuPacedCadence()
-{
-    std::printf("Test: a frame the GPU floor releases keeps the GPU's pace\n");
-    const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
-    // sleep: the game entered the Reflex Sleep for this index 8 ms before the
-    // floor (1 = this index, 2 = another index); its marker then arrives 100
-    // µs after the floor.
-    struct Case { bool key_on; bool warm; bool restarted; bool floor_binds; bool arrival_first; int sleep;
-                  bool paced; double early_us; };
-    const Case cases[] = {
-        { true, true, false, true, true, 0, true, 2'500.0 },
-        { true, true, true, true, true, 0, true, 2'500.0 },
-        { false, true, false, true, true, 0, false, 0.0 },
-        { true, true, false, false, true, 0, false, 0.0 },
-        { true, true, false, true, false, 0, false, 0.0 },
-        { true, true, false, true, false, 1, true, 2'500.0 },
-        { true, true, false, true, false, 2, false, 0.0 },
-        { true, false, false, true, true, 0, true, 0.0 },
-    };
-    for (const Case& c : cases) {
-        ResetStage();
-        ScriptedClock clock;
-        uint64_t frame_id = 1000;
-        SourceStageFrame last{};
-        // Ready 3,000 µs after each release: L = Q95 3,010 + 500.
-        for (int i = 0; i < (c.warm ? 40 : 1); ++i) {
-            last = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
-            CHECK(last.planned && !last.gpu_paced);
-            const int64_t done = last.release_qpc + Ticks(3'000.0);
-            CHECK(FramePlan_PushStageEvent(Event(last, PacingStageEventKind::PresentCall,
-                last.release_qpc + Ticks(1'000.0))));
-            CHECK(FramePlan_PushStageEvent(Event(last, PacingStageEventKind::GpuReady, done)));
-            CHECK(FramePlan_PushStageEvent(Event(last, PacingStageEventKind::OutputRelease, done,
-                PacingPlanStatus::Late)));
-            g_stage.DrainStageEvents();
-            clock.now = done;
-        }
-        if (c.restarted) g_stage.RestartLead(PacingRung::GpuQueueWait);
-        const int64_t floor = last.plan.output_target_qpc + Ticks(kIntervalUs) -
-            Ticks(last.plan.lead_us) + Ticks(6'000.0);
-        SourceStageRequest request = Request(Key(frame_id), held);
-        request.gpu_paced_cadence = c.key_on;
-        request.gpu_floor_qpc = floor;
-        request.earliest_release_qpc = c.floor_binds ? floor : floor + Ticks(500.0);
-        if (!c.arrival_first) clock.now = floor + Ticks(100.0);
-        if (c.sleep != 0) {
-            request.sleep_entry_index = g_stage.Grid().NextIndex() + (c.sleep == 1 ? 0 : 1);
-            request.sleep_entry_qpc = floor - Ticks(8'000.0);
-        }
-        const uint64_t paced_before = g_stage.Statistics().gpu_paced_frames;
-        const SourceStageFrame frame = g_stage.RunPlannedFrame(request, &clock);
-        CHECK(frame.planned);
-        CHECK(frame.gpu_paced == c.paced);
-        CHECK(g_stage.Statistics().gpu_paced_frames - paced_before == (c.paced ? 1u : 0u));
-        PacingSourceRecord record{};
-        SourceStage::FillSourceRecord(frame, held, &record);
-        CHECK(((record.flags & PACING_SOURCE_GPU_PACED) != 0) == c.paced);
-        if (c.early_us > 0.0) {
-            CHECK(frame.epoch_started == PacingEpochReason::None && frame.gpu_target);
-            CHECK(frame.release_qpc == (c.arrival_first ? floor : floor + Ticks(100.0)));
-            CHECK(frame.plan.source_wake_qpc == frame.release_qpc);
-            const int64_t target = frame.release_qpc + Ticks(c.early_us);
-            CHECK(frame.plan.output_target_qpc > target - 10 && frame.plan.output_target_qpc < target + 10);
-        } else {
-            // A late source restarts at its arrival (the earliest release or
-            // later): T = release + L.
-            CHECK(frame.epoch_started == PacingEpochReason::SourceLate && !frame.gpu_target);
-            const int64_t target = frame.release_qpc + Ticks(frame.plan.lead_us);
-            CHECK(frame.plan.output_target_qpc > target - 10 && frame.plan.output_target_qpc < target + 10);
-        }
-        // An output 8 ms past T (beyond the tolerance) restarts the cadence
-        // only for a frame the GPU floor did not release.
-        const uint64_t late_before = g_stage.Statistics().output_late_epochs;
-        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease,
-            frame.plan.output_target_qpc + Ticks(8'000.0), PacingPlanStatus::Held)));
-        g_stage.DrainStageEvents();
-        CHECK(g_stage.Statistics().output_late_epochs - late_before == (c.paced ? 0u : 1u));
-        CHECK(g_stage.DrainStartedOutputLate() == !c.paced);
-        // A frame the GPU floor released is no OutputLate entry; the others
-        // list their own frame, 8,000 − 2,500 µs beyond the tolerance.
-        CHECK(g_stage.DrainedOutputLateCount() == (c.paced ? 0u : 1u));
-        if (!c.paced) {
-            CHECK(g_stage.DrainedOutputLate(0).key == frame.plan.key);
-            CHECK(g_stage.DrainedOutputLate(0).grid_index == frame.plan.grid_index);
-            CHECK(Near(g_stage.DrainedOutputLate(0).lateness_us, 5'500.0, 0.01));
-        }
-    }
-}
-
-// Developer A/B gpu_paced_cadence, the driver's Reflex Sleep kept (the Sleep
-// is not bypassed): a frame the driver's Sleep released late is the driver's,
-// not ReLimiter's. The Sleep for its index returned after S = T − L and the
-// game entered it on time, so the frame is GPU-paced exactly as one the GPU
-// floor releases: no wait of ReLimiter's own, no SourceLate epoch, its
-// output not judged, its output target the later of the grid's T and arrival
-// + min(E, L), the lead controller told gpu_floor_release (with no floor
-// pull), the record flagged GPU-paced and carrying both stamps. Unknown E
-// (a cold bucket) still marks the frame GPU-paced, but the grid judges its
-// source. The key off, another index, no Sleep entry, a Sleep that returned
-// before S and an entry after S + tol are not driver-released; the stamps are
-// recorded whenever the index matched, key on or off.
-struct DriverSetup {
-    bool key_on = true;
-    bool warm = true;
-    bool entered = true;    // the Sleep hook's entry was recorded for this index
-    int index = 1;          // driver Sleep index: 0 none, 1 this index, 2 another
-    double entry_us = -4'000.0; // hook entry relative to S
-    double start_us = -3'000.0; // driver Sleep call start relative to S
-    double end_us = 2'000.0;    // driver Sleep return relative to S
-    double now_us = 6'000.0;    // arrival at the stage (clock) relative to S: beyond S + tol
-};
-
-struct DriverRun {
-    SourceStageFrame frame{};
-    PacingSourceRecord record{};
-    int waits = 0;
-    int64_t s = 0;
-    int64_t now = 0;
-    uint64_t gpu_paced_frames = 0;
-    uint64_t driver_released_frames = 0;
-    uint64_t floor_pulled_frames = 0;
-    bool lead_saw_floor_release = false;
-};
-
-DriverRun RunDriverFrame(const DriverSetup& setup, bool with_driver_fields)
-{
-    ResetStage();
-    ScriptedClock clock;
-    const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
-    uint64_t frame_id = 3000;
-    SourceStageFrame last{};
-    // Ready 3,000 µs after each release: L = Q95 3,010 + 500, E = 2,500.
-    for (int i = 0; i < (setup.warm ? 40 : 1); ++i) {
-        last = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
-        CHECK(last.planned && !last.gpu_paced);
-        const int64_t done = last.release_qpc + Ticks(3'000.0);
-        CHECK(FramePlan_PushStageEvent(Event(last, PacingStageEventKind::PresentCall,
-            last.release_qpc + Ticks(1'000.0))));
-        CHECK(FramePlan_PushStageEvent(Event(last, PacingStageEventKind::GpuReady, done)));
-        CHECK(FramePlan_PushStageEvent(Event(last, PacingStageEventKind::OutputRelease, done,
-            PacingPlanStatus::Late)));
-        g_stage.DrainStageEvents();
-        clock.now = done;
-    }
-    DriverRun run;
-    run.s = last.plan.output_target_qpc + Ticks(kIntervalUs) - Ticks(last.plan.lead_us);
-    SourceStageRequest request = Request(Key(frame_id), held);
-    request.gpu_paced_cadence = setup.key_on;
-    // The rhythm the scheduler would hand a held frame: a frame without a GPU
-    // floor never continues it.
-    request.gpu_paced_rhythm = GpuPacedRhythmStep::Smooth;
-    const uint64_t next = g_stage.Grid().NextIndex();
-    if (setup.entered) {
-        request.sleep_entry_index = next;
-        request.sleep_entry_qpc = run.s + Ticks(setup.entry_us);
-    }
-    if (with_driver_fields && setup.index != 0) {
-        request.driver_sleep_index = next + (setup.index == 1 ? 0 : 1);
-        request.driver_sleep_start_qpc = run.s + Ticks(setup.start_us);
-        request.driver_sleep_end_qpc = run.s + Ticks(setup.end_us);
-    }
-    clock.now = run.now = run.s + Ticks(setup.now_us);
-    const int waits_before = clock.wait_calls;
-    // The statistics are cumulative across Reset: count this frame only.
-    const SourceStageStatistics stats_before = g_stage.Statistics();
-    run.frame = g_stage.RunPlannedFrame(request, &clock);
-    run.waits = clock.wait_calls - waits_before;
-    SourceStage::FillSourceRecord(run.frame, held, &run.record);
-    const SourceStageStatistics stats_after = g_stage.Statistics();
-    run.gpu_paced_frames = stats_after.gpu_paced_frames - stats_before.gpu_paced_frames;
-    run.driver_released_frames = stats_after.driver_released_frames - stats_before.driver_released_frames;
-    run.floor_pulled_frames = stats_after.floor_pulled_frames - stats_before.floor_pulled_frames;
-    run.lead_saw_floor_release = g_stage.Lead().GpuFloorReleased(run.frame.plan.key, run.frame.plan.grid_index);
-    return run;
-}
-
-void TestDriverReleasedFrameIsGpuPaced()
-{
-    std::printf("Test: a frame the driver's Sleep released is GPU-paced and ReLimiter adds no delay\n");
-    const DriverSetup setup;
-    const DriverRun run = RunDriverFrame(setup, true);
-    const SourceStageFrame& frame = run.frame;
-    CHECK(frame.planned && frame.driver_released && frame.gpu_paced);
-    CHECK(frame.epoch_started == PacingEpochReason::None && frame.gpu_target);
-    // Nothing of ReLimiter's own: no wait, released on arrival, no floor pull.
-    CHECK(run.waits == 0 && frame.release_qpc == run.now && frame.wait_start_qpc == 0);
-    CHECK(frame.floor_pull_ticks == 0 && run.floor_pulled_frames == 0);
-    // Target: arrival + min(E, L), E = 2,500 µs.
-    CHECK(Near(frame.early_lead_us, 2'500.0, 0.01));
-    const int64_t target = run.now + Ticks(2'500.0);
-    CHECK(frame.plan.output_target_qpc > target - 10 && frame.plan.output_target_qpc < target + 10);
-    CHECK(frame.plan.source_wake_qpc == run.now);
-    // The game's arrival is the Sleep hook's entry.
-    CHECK(frame.game_arrival_qpc == run.s + Ticks(setup.entry_us));
-    // The lead controller sees a floor release (its readiness enters the GPU-paced ring).
-    CHECK(run.lead_saw_floor_release);
-    CHECK(run.gpu_paced_frames == 1 && run.driver_released_frames == 1);
-    // The record: GPU-paced flag and both stamps.
-    CHECK((run.record.flags & PACING_SOURCE_GPU_PACED) != 0);
-    CHECK(run.record.driver_sleep_start_qpc == run.s + Ticks(setup.start_us));
-    CHECK(run.record.driver_sleep_end_qpc == run.s + Ticks(setup.end_us));
-    // Its output is not judged: 8 ms past T restarts nothing.
-    const uint64_t late_before = g_stage.Statistics().output_late_epochs;
-    CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease,
-        frame.plan.output_target_qpc + Ticks(8'000.0), PacingPlanStatus::Held)));
-    g_stage.DrainStageEvents();
-    CHECK(g_stage.Statistics().output_late_epochs == late_before);
-    CHECK(!g_stage.DrainStartedOutputLate() && g_stage.DrainedOutputLateCount() == 0);
-
-    // The rhythm is not continued by it.
-    CHECK(g_stage.Statistics().gpu_paced_rhythm[static_cast<size_t>(GpuPacedRhythmStep::Smooth)] == 0);
-}
-
-// Developer key driver_limiter_hold: a frame of the Reflex driver limiter
-// placement is planned with the marker placement's lead and waits for nothing,
-// early or late; the driver's release (the Sleep fields, under
-// gpu_paced_cadence) sets its deadline as for any driver-released frame. The
-// record keeps the placement and has no wait stamps.
-void TestDriverLimiterHoldPlansWithoutAWait()
-{
-    std::printf("Test: driver_limiter_hold plans a driver-limited frame with the marker lead and no wait\n");
+    std::printf("Test: a driver limiter placement plans with no lead and an early frame waits\n");
     const PacingPipelineSnapshot hold = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait,
         PacingSourcePlacement::DriverLimiter);
-    const auto warm = [&](ScriptedClock* clock, uint64_t* frame_id, bool key) {
-        SourceStageFrame last{};
-        for (int i = 0; i < 40; ++i) {
-            SourceStageRequest request = Request(Key((*frame_id)++), hold);
-            request.driver_limiter_hold = key;
-            last = g_stage.RunPlannedFrame(request, clock);
-            CHECK(last.planned);
-            const int64_t done = last.release_qpc + Ticks(3'000.0);
-            CHECK(FramePlan_PushStageEvent(Event(last, PacingStageEventKind::PresentCall,
-                last.release_qpc + Ticks(1'000.0))));
-            CHECK(FramePlan_PushStageEvent(Event(last, PacingStageEventKind::GpuReady, done)));
-            CHECK(FramePlan_PushStageEvent(Event(last, PacingStageEventKind::OutputRelease, done,
-                PacingPlanStatus::Late)));
-            g_stage.DrainStageEvents();
-            clock->now = done;
-        }
-        return last;
-    };
-
-    // Key on: every frame arrives well before its S and is released on arrival.
-    ResetStage();
-    ScriptedClock clock;
-    uint64_t frame_id = 9000;
-    const uint64_t clamped_before = g_stage.Statistics().clamped_waits;
-    const SourceStageFrame last = warm(&clock, &frame_id, true);
-    CHECK(clock.wait_calls == 0 && !last.slept && last.wait_start_qpc == 0 && last.wait_target_qpc == 0);
-    CHECK(last.plan.rung == PacingRung::GpuQueueWait && Near(last.plan.lead_us, 3'510.0));
-    CHECK(g_stage.Statistics().clamped_waits == clamped_before);
-
-    // A frame the driver's Sleep released late: the cadence's driver-released rule.
-    const int64_t s = last.plan.output_target_qpc + Ticks(kIntervalUs) - Ticks(last.plan.lead_us);
-    SourceStageRequest request = Request(Key(frame_id), hold);
-    request.driver_limiter_hold = true;
-    request.gpu_paced_cadence = true;
-    request.sleep_entry_index = g_stage.Grid().NextIndex();
-    request.sleep_entry_qpc = s - Ticks(4'000.0);
-    request.driver_sleep_index = request.sleep_entry_index;
-    request.driver_sleep_start_qpc = s - Ticks(3'000.0);
-    request.driver_sleep_end_qpc = s + Ticks(2'000.0);
-    clock.now = s + Ticks(6'000.0);
-    const int64_t arrival = clock.now;
-    const SourceStageFrame frame = g_stage.RunPlannedFrame(request, &clock);
-    CHECK(frame.planned && frame.driver_released && frame.gpu_paced);
-    CHECK(clock.wait_calls == 0 && frame.release_qpc == arrival && frame.wait_start_qpc == 0);
-    CHECK(frame.early_lead_us > 0.0 &&
-          frame.plan.output_target_qpc == arrival + Ticks(frame.early_lead_us));
-    PacingSourceRecord record{};
-    SourceStage::FillSourceRecord(frame, hold, &record);
-    CHECK(record.source_placement == static_cast<uint8_t>(PacingSourcePlacement::DriverLimiter));
-    CHECK(record.wake_target_qpc == 0 && record.source_wait_start_qpc == 0 && record.pre_sleep_start_qpc == 0);
-    CHECK(record.driver_sleep_start_qpc == request.driver_sleep_start_qpc &&
-          record.driver_sleep_end_qpc == request.driver_sleep_end_qpc);
-    CHECK((record.flags & PACING_SOURCE_GPU_PACED) != 0 && (record.flags & PACING_SOURCE_SLEPT) == 0);
-
-    // Key off: the placement is the driver limiter's, with no lead, and an early frame waits.
     ResetStage();
     ScriptedClock plain_clock;
     SourceStageRequest first = Request(Key(9500), hold);
@@ -1861,104 +975,57 @@ void TestDriverLimiterHoldPlansWithoutAWait()
     CHECK(second_frame.planned && second_frame.slept && plain_clock.wait_calls == 1);
 }
 
-// Developer key pre_sleep_precise: the marker plan shares the precise pre-wait's
-// committed release target. The lead the plan recomputed at the marker can put S
-// after that target; a pre-wait that reached the target (end >= target) leaves
-// no wait at the marker, one that did not, another index, or no committed
-// target waits as always.
-void TestPreciseReleaseTargetIsCommitted()
+// The driver's Reflex Sleep kept (the Sleep is not bypassed): the scheduler
+// hands the stage the Sleep's index and the QPC its call started and
+// returned. The stage records them in the frame and the source record when
+// the index is the next plan's and the call ended after it started; the plan,
+// the wait and the release do not read them.
+struct DriverSetup {
+    int index = 1;              // driver Sleep index: 0 none, 1 this index, 2 another
+    double start_us = -3'000.0; // driver Sleep call start relative to S
+    double end_us = 2'000.0;    // driver Sleep return relative to S
+    double now_us = 6'000.0;    // arrival at the stage (clock) relative to S
+};
+
+struct DriverRun {
+    SourceStageFrame frame{};
+    PacingSourceRecord record{};
+    int waits = 0;
+    int64_t s = 0;
+    int64_t now = 0;
+};
+
+DriverRun RunDriverFrame(const DriverSetup& setup, bool with_driver_fields)
 {
-    std::printf("Test: a precise pre-wait that reached its committed target leaves no marker-site wait\n");
-    struct Case {
-        const char* name; bool committed; double end_us; int index_offset; bool waits;
-        int epoch_offset = 0; double interval_scale = 1.0; PacingTimingMode mode = PacingTimingMode::Vrr;
-    };
-    const Case cases[] = {
-        { "no committed target", false, -50.0, 0, true },
-        { "reached", true, -50.0, 0, false },
-        { "not reached", true, -300.0, 0, true },
-        { "another index", true, -50.0, 1, true },
-        { "cadence restarted since the commitment", true, -50.0, 0, true, -1 },
-        { "interval changed since the commitment", true, -50.0, 0, true, 0, 1.5 },
-        { "prediction interval differs from the plan's (low frame rate compensation)", true, -50.0, 0, true, 0,
-          33'333.0 / 34'722.0 },
-        { "interval moved below 1% since the commitment", true, -50.0, 0, true, 0, 1.005 },
-        { "interval equal up to numerical noise", true, -50.0, 0, false, 0, 1.0 + 1e-9 },
-        { "timing mode changed since the commitment", true, -50.0, 0, true, 0, 1.0, PacingTimingMode::Fixed },
-    };
-    for (const Case& c : cases) {
-        ResetStage();
-        ScriptedClock clock;
-        const PacingPipelineSnapshot pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
-        const SourceStageFrame first = g_stage.RunPlannedFrame(Request(Key(9700), pipeline), &clock);
-        clock.now = first.release_qpc + Ticks(3'000.0);
-        const int64_t arrival = clock.now;
-        SourceStageRequest request = Request(Key(9701), pipeline);
-        request.pre_wait_index = g_stage.Grid().NextIndex() + c.index_offset;
-        request.pre_wait_start_qpc = arrival - Ticks(900.0);
-        // The committed target lies before the marker's S, as when the lead fell.
-        const int64_t committed = arrival - Ticks(100.0);
-        request.pre_wait_end_qpc = committed + Ticks(c.end_us + 100.0);
-        request.precise_release_qpc = c.committed ? committed : 0;
-        request.precise_grid_epoch = static_cast<uint32_t>(
-            static_cast<int64_t>(g_stage.Grid().Snapshot().epoch) + c.epoch_offset);
-        request.precise_interval_us = request.interval_us * c.interval_scale;
-        request.precise_mode = c.mode;
-        const int waits = clock.wait_calls;
-        const SourceStageFrame frame = g_stage.RunPlannedFrame(request, &clock);
-        CHECK(frame.planned);
-        CHECK(clock.wait_calls == waits + (c.waits ? 1 : 0));
-        CHECK(frame.slept == c.waits);
-        if (!c.waits) CHECK(frame.release_qpc == arrival && frame.wait_start_qpc == 0);
+    ResetStage();
+    ScriptedClock clock;
+    const PacingPipelineSnapshot pipeline = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly,
+        PacingSourcePlacement::Present);
+    const SourceStageFrame last = g_stage.RunPlannedFrame(Request(Key(3000), pipeline), &clock);
+    CHECK(last.planned);
+    DriverRun run;
+    run.s = last.plan.output_target_qpc + Ticks(kIntervalUs) - Ticks(last.plan.lead_us);
+    SourceStageRequest request = Request(Key(3001), pipeline);
+    const uint64_t next = g_stage.Grid().NextIndex();
+    if (with_driver_fields && setup.index != 0) {
+        request.driver_sleep_index = next + (setup.index == 1 ? 0 : 1);
+        request.driver_sleep_start_qpc = run.s + Ticks(setup.start_us);
+        request.driver_sleep_end_qpc = run.s + Ticks(setup.end_us);
     }
+    clock.now = run.now = run.s + Ticks(setup.now_us);
+    const int waits_before = clock.wait_calls;
+    run.frame = g_stage.RunPlannedFrame(request, &clock);
+    run.waits = clock.wait_calls - waits_before;
+    SourceStage::FillSourceRecord(run.frame, pipeline, &run.record);
+    return run;
 }
 
-void TestDriverReleasedWithoutKnownEarliestTarget()
+void TestDriverSleepStampsOnlyFillTheRecord()
 {
-    std::printf("Test: a driver-released frame with E unknown is GPU-paced but judged by the grid\n");
-    DriverSetup setup;
-    setup.warm = false;
-    const DriverRun run = RunDriverFrame(setup, true);
-    CHECK(run.frame.planned && run.frame.driver_released && run.frame.gpu_paced);
-    CHECK(run.frame.early_lead_us == 0.0 && !run.frame.gpu_target);
-    // Judged as today: 6 ms past S is a SourceLate restart at the arrival.
-    CHECK(run.frame.epoch_started == PacingEpochReason::SourceLate);
-    CHECK(run.lead_saw_floor_release);
-    CHECK((run.record.flags & PACING_SOURCE_GPU_PACED) != 0);
-}
-
-void TestDriverSleepKeyOffChangesNothingButTheStamps()
-{
-    std::printf("Test: with the key off the driver Sleep fields only fill the stamps\n");
-    DriverSetup setup;
-    setup.key_on = false;
-    const DriverRun with = RunDriverFrame(setup, true);
-    const DriverRun without = RunDriverFrame(setup, false);
-    CHECK(with.frame.planned && without.frame.planned);
-    CHECK(!with.frame.driver_released && !with.frame.gpu_paced && !with.frame.gpu_target);
-    CHECK(with.frame.epoch_started == PacingEpochReason::SourceLate);
-    CHECK(with.frame.epoch_started == without.frame.epoch_started);
-    CHECK(with.frame.plan.output_target_qpc == without.frame.plan.output_target_qpc);
-    CHECK(with.frame.plan.source_wake_qpc == without.frame.plan.source_wake_qpc);
-    CHECK(with.frame.release_qpc == without.frame.release_qpc && with.waits == without.waits);
-    CHECK(with.frame.gpu_paced == without.frame.gpu_paced && with.frame.gpu_target == without.frame.gpu_target);
-    CHECK(with.frame.early_lead_us == without.frame.early_lead_us && with.frame.floor_pull_ticks == 0);
-    CHECK(with.frame.game_arrival_qpc == without.frame.game_arrival_qpc);
-    CHECK(with.lead_saw_floor_release == without.lead_saw_floor_release && !with.lead_saw_floor_release);
-    CHECK(with.gpu_paced_frames == without.gpu_paced_frames && with.driver_released_frames == 0);
-    CHECK(with.record.flags == without.record.flags);
-    CHECK(with.record.wake_target_qpc == without.record.wake_target_qpc);
-    // The stamps are recorded all the same.
-    CHECK(with.record.driver_sleep_start_qpc == with.s + Ticks(setup.start_us));
-    CHECK(with.record.driver_sleep_end_qpc == with.s + Ticks(setup.end_us));
-    CHECK(without.record.driver_sleep_start_qpc == 0 && without.record.driver_sleep_end_qpc == 0);
-}
-
-void TestDriverReleaseNeedsAMatchingSleep()
-{
-    std::printf("Test: no driver release without a matching index, entry, return after S or an on-time entry\n");
+    std::printf("Test: the driver Sleep fields only fill the record's stamps\n");
     struct Case { const char* name; DriverSetup setup; bool stamps; };
     std::vector<Case> cases;
+    cases.push_back({ "matching Sleep", DriverSetup{}, true });
     {
         DriverSetup c; c.index = 2;
         cases.push_back({ "another index", c, false });
@@ -1968,293 +1035,47 @@ void TestDriverReleaseNeedsAMatchingSleep()
         cases.push_back({ "no driver Sleep", c, false });
     }
     {
-        DriverSetup c; c.entered = false;
-        cases.push_back({ "no Sleep entry for this index", c, true });
-    }
-    {
         DriverSetup c; c.start_us = 2'000.0; c.end_us = 2'000.0; // end not after start
         cases.push_back({ "empty Sleep interval", c, false });
     }
     {
-        DriverSetup c; c.end_us = 0.0; // returned at S, not after
+        DriverSetup c; c.end_us = 0.0; // returned at S
         cases.push_back({ "returned at S", c, true });
     }
     {
-        DriverSetup c; c.end_us = -500.0; c.start_us = -3'000.0;
+        DriverSetup c; c.end_us = -500.0; c.start_us = -3'000.0; // returned before S
         cases.push_back({ "returned before S", c, true });
     }
-    {
-        DriverSetup c; c.entry_us = 3'100.0; // beyond S + tolerance (2,500 + about 500 µs of slack)
-        cases.push_back({ "entered late", c, true });
-    }
     for (const Case& c : cases) {
-        const DriverRun run = RunDriverFrame(c.setup, true);
         std::printf("  %s\n", c.name);
-        CHECK(run.frame.planned && !run.frame.driver_released && !run.frame.gpu_paced);
-        CHECK(run.frame.epoch_started == PacingEpochReason::SourceLate && !run.frame.gpu_target);
-        CHECK(!run.lead_saw_floor_release && run.driver_released_frames == 0 && run.gpu_paced_frames == 0);
-        CHECK((run.record.flags & PACING_SOURCE_GPU_PACED) == 0);
-        CHECK((run.record.driver_sleep_start_qpc != 0) == c.stamps);
-        CHECK((run.record.driver_sleep_end_qpc != 0) == c.stamps);
+        const DriverRun with = RunDriverFrame(c.setup, true);
+        const DriverRun without = RunDriverFrame(c.setup, false);
+        CHECK(with.frame.planned && without.frame.planned);
+        CHECK(with.frame.epoch_started == without.frame.epoch_started);
+        CHECK(with.frame.plan.output_target_qpc == without.frame.plan.output_target_qpc);
+        CHECK(with.frame.plan.source_wake_qpc == without.frame.plan.source_wake_qpc);
+        CHECK(with.frame.release_qpc == without.frame.release_qpc && with.waits == without.waits);
+        CHECK(with.frame.game_arrival_qpc == with.now && without.frame.game_arrival_qpc == without.now);
+        CHECK(with.record.flags == without.record.flags);
+        CHECK(with.record.wake_target_qpc == without.record.wake_target_qpc);
+        CHECK((with.record.driver_sleep_start_qpc != 0) == c.stamps);
+        CHECK((with.record.driver_sleep_end_qpc != 0) == c.stamps);
+        if (c.stamps) {
+            CHECK(with.record.driver_sleep_start_qpc == with.s + Ticks(c.setup.start_us));
+            CHECK(with.record.driver_sleep_end_qpc == with.s + Ticks(c.setup.end_us));
+        }
+        CHECK(without.record.driver_sleep_start_qpc == 0 && without.record.driver_sleep_end_qpc == 0);
     }
-    // An entry inside the tolerance is on time (the boundary itself is the
-    // grid's: test_cadence_grid.cpp).
-    DriverSetup edge;
-    edge.entry_us = 2'400.0;
-    const DriverRun on_time = RunDriverFrame(edge, true);
-    CHECK(on_time.frame.driver_released && on_time.frame.gpu_paced);
 }
 
-// Developer A/B gpu_paced_cadence: once 32 frames were released by the GPU
-// floor, the early lead is the low side of their own X (ready 5,000 µs after
-// the floor here: 5,000 − 500 µs), not of every GPU wait frame's readiness
-// (3,000 µs). No frame the floor releases restarts the cadence, however far
-// its floor lies past S. The early lead never exceeds the frame's lead L.
-void TestGpuPacedRing()
+// A held output's OutputLate restart makes the held GPU floor eligible before
+// the cap held 32 frames (lead_controller.h); a cap or FG divisor change
+// (ResetGpuFloor) clears it. The restarts of outputs not held do not count:
+// after an FG change the first frame lands late on the new grid while FG is
+// not presenting yet.
+void TestOutputLateRestartsCountForTheFloor()
 {
-    std::printf("Test: the GPU-paced target follows the X of frames the floor released\n");
-    ResetStage();
-    ScriptedClock clock;
-    const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
-    uint64_t frame_id = 2000;
-    SourceStageFrame last{};
-    const auto finish = [&](const SourceStageFrame& frame, double x_us) {
-        const int64_t done = frame.release_qpc + Ticks(x_us);
-        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::PresentCall,
-            frame.release_qpc + Ticks(1'000.0))));
-        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady, done)));
-        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease, done,
-            PacingPlanStatus::Late)));
-        g_stage.DrainStageEvents();
-        clock.now = done;
-    };
-    for (int i = 0; i < 40; ++i) {
-        last = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
-        finish(last, 3'000.0);
-    }
-    for (int i = 0; i < 40; ++i) {
-        // The floor lies 6 ms past the grid's S of this frame.
-        const int64_t floor = last.plan.output_target_qpc + Ticks(kIntervalUs) -
-            Ticks(last.plan.lead_us) + Ticks(6'000.0);
-        SourceStageRequest request = Request(Key(frame_id++), held);
-        request.gpu_paced_cadence = true;
-        request.gpu_floor_qpc = floor;
-        request.earliest_release_qpc = floor;
-        const SourceStageFrame frame = g_stage.RunPlannedFrame(request, &clock);
-        CHECK(frame.planned && frame.gpu_paced && frame.release_qpc == floor);
-        CHECK(frame.epoch_started == PacingEpochReason::None);
-        const double early_us = static_cast<double>(frame.plan.output_target_qpc - floor) / 10.0;
-        // 32 floor-released samples precede frame i = 32.
-        if (i == 0) CHECK(early_us > 2'499.0 && early_us < 2'501.0);
-        if (i >= 32) CHECK(early_us > 4'499.0 && early_us < 4'501.0);
-        finish(frame, 5'000.0);
-        last = frame;
-    }
-
-    // E above L: a restart leaves the bucket cold at its old median (3,010 +
-    // 500 µs) while the ring keeps 4,500 µs. The earliest target is the
-    // release + L, never past it, so S = T − L stays at the release.
-    for (int i = 0; i < 40; ++i) {
-        last = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
-        finish(last, 3'000.0);
-    }
-    g_stage.RestartLead(PacingRung::GpuQueueWait);
-    const int64_t floor = last.plan.output_target_qpc + Ticks(kIntervalUs) -
-        Ticks(last.plan.lead_us) + Ticks(6'000.0);
-    SourceStageRequest request = Request(Key(frame_id++), held);
-    request.gpu_paced_cadence = true;
-    request.gpu_floor_qpc = floor;
-    request.earliest_release_qpc = floor;
-    const SourceStageFrame clamped = g_stage.RunPlannedFrame(request, &clock);
-    CHECK(clamped.planned && clamped.gpu_paced && clamped.release_qpc == floor);
-    CHECK(clamped.plan.lead_us > 3'509.0 && clamped.plan.lead_us < 3'511.0);
-    const double clamped_us = static_cast<double>(clamped.plan.output_target_qpc - floor) / 10.0;
-    CHECK(clamped_us > 3'509.0 && clamped_us < 3'511.0);
-}
-
-// Developer A/B gpu_paced_cadence: the GPU-paced rhythm (source_stage.h).
-// After a frame it paced, the next consecutive frame's release is the
-// previous release plus the mean of the newest five GPU periods: never later
-// than its floor (Late: the floor), else pulled a quarter of the way to the
-// floor, never earlier than the floor minus half the median period
-// (EarlyBound). Without a previous paced frame, after a frame gap or in
-// another controller generation: the floor (Start); without a floor: None.
-// The frame's output target follows its release, and a frame the rhythm did
-// not pace restarts it.
-void TestGpuPacedRhythm()
-{
-    std::printf("Test: the GPU-paced rhythm smooths releases between the GPU floor and half a period before it\n");
-    ResetStage();
-    ScriptedClock clock;
-    const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
-    uint64_t frame_id = 4000;
-    SourceStageFrame last{};
-    const auto finish = [&](const SourceStageFrame& frame, double x_us) {
-        const int64_t done = frame.release_qpc + Ticks(x_us);
-        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::PresentCall,
-            frame.release_qpc + Ticks(1'000.0))));
-        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady, done)));
-        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease, done,
-            PacingPlanStatus::Late)));
-        g_stage.DrainStageEvents();
-        clock.now = done;
-    };
-    // Warm lead: ready 3,000 µs after each release (early side 2,500 µs). The
-    // frames are not held, so their reports give GPU periods: 17,000 µs
-    // (median bin 17,010), 250 µs idle before each.
-    for (int i = 0; i < 40; ++i) {
-        last = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
-        finish(last, 3'000.0);
-        const int64_t end = kStart + Ticks(17'000.0 * static_cast<double>(i));
-        g_stage.OnGpuRenderEnd(1, frame_id - 1, end - Ticks(17'000.0 - 250.0), end, 14'000.0);
-    }
-    CHECK(g_stage.Lead().RecentGpuPeriodUs() == 17'000.0);
-    const auto run = [&](int64_t floor, const GpuPacedRhythmRelease& rhythm) {
-        SourceStageRequest request = Request(Key(frame_id++), held);
-        request.gpu_paced_cadence = true;
-        request.gpu_floor_qpc = floor;
-        request.earliest_release_qpc = rhythm.release_qpc;
-        request.gpu_paced_rhythm = rhythm.step;
-        return g_stage.RunPlannedFrame(request, &clock);
-    };
-    const auto steps = [](GpuPacedRhythmStep step) {
-        return g_stage.Statistics().gpu_paced_rhythm[static_cast<size_t>(step)];
-    };
-
-    // No previous paced frame: the floor (6 ms past the grid's S).
-    const int64_t floor0 = last.plan.output_target_qpc + Ticks(kIntervalUs) - Ticks(last.plan.lead_us) +
-        Ticks(6'000.0);
-    const GpuPacedRhythmRelease start = g_stage.GpuPacedRhythm(Key(frame_id), floor0);
-    CHECK(start.step == GpuPacedRhythmStep::Start && start.release_qpc == floor0);
-    const uint64_t starts = steps(GpuPacedRhythmStep::Start);
-    const SourceStageFrame first = run(floor0, start);
-    CHECK(first.planned && first.gpu_paced && first.release_qpc == floor0);
-    CHECK(steps(GpuPacedRhythmStep::Start) == starts + 1);
-    finish(first, 5'000.0);
-
-    // The next frame: candidate = release + 17,000 µs.
-    const int64_t candidate = first.release_qpc + Ticks(17'000.0);
-    const PacingPlanKey next = Key(frame_id);
-    const GpuPacedRhythmRelease late = g_stage.GpuPacedRhythm(next, candidate - Ticks(1'000.0));
-    CHECK(late.step == GpuPacedRhythmStep::Late && late.release_qpc == candidate - Ticks(1'000.0));
-    const GpuPacedRhythmRelease smooth = g_stage.GpuPacedRhythm(next, candidate + Ticks(2'000.0));
-    CHECK(smooth.step == GpuPacedRhythmStep::Smooth && smooth.release_qpc == candidate + Ticks(500.0));
-    // 12 ms before the floor: held at floor − 17,010 / 2.
-    const GpuPacedRhythmRelease bounded = g_stage.GpuPacedRhythm(next, candidate + Ticks(12'000.0));
-    CHECK(bounded.step == GpuPacedRhythmStep::EarlyBound &&
-        bounded.release_qpc == candidate + Ticks(12'000.0) - Ticks(8'505.0));
-    CHECK(g_stage.GpuPacedRhythm(Key(frame_id + 1), candidate).step == GpuPacedRhythmStep::Start);
-    CHECK(g_stage.GpuPacedRhythm(Key(frame_id, 2), candidate).step == GpuPacedRhythmStep::Start);
-    const GpuPacedRhythmRelease none = g_stage.GpuPacedRhythm(next, 0);
-    CHECK(none.step == GpuPacedRhythmStep::None && none.release_qpc == 0);
-
-    // Released on the rhythm; its target follows the release, not the floor.
-    const uint64_t smooths = steps(GpuPacedRhythmStep::Smooth);
-    const SourceStageFrame second = run(candidate + Ticks(2'000.0), smooth);
-    CHECK(second.planned && second.gpu_paced && second.release_qpc == candidate + Ticks(500.0));
-    CHECK(second.epoch_started == PacingEpochReason::None);
-    const int64_t target = second.release_qpc + Ticks(2'500.0);
-    CHECK(second.plan.output_target_qpc > target - 10 && second.plan.output_target_qpc < target + 10);
-    CHECK(steps(GpuPacedRhythmStep::Smooth) == smooths + 1);
-    finish(second, 5'000.0);
-    CHECK(g_stage.GpuPacedRhythm(Key(frame_id), second.release_qpc + Ticks(17'000.0)).step ==
-        GpuPacedRhythmStep::Late);
-
-    // The game arrives after its floor: not paced, the rhythm restarts.
-    const int64_t floor2 = second.release_qpc + Ticks(17'000.0);
-    const GpuPacedRhythmRelease third_rhythm = g_stage.GpuPacedRhythm(Key(frame_id), floor2);
-    clock.now = floor2 + Ticks(100.0);
-    const SourceStageFrame third = run(floor2, third_rhythm);
-    CHECK(third.planned && !third.gpu_paced);
-    CHECK(g_stage.GpuPacedRhythm(Key(frame_id), floor2 + Ticks(17'000.0)).step == GpuPacedRhythmStep::Start);
-}
-
-// Render coupling (lead_controller.h): a held frame whose release floor lies
-// before the GPU's release is released at the grid's S (its T − L) or, later,
-// at its arrival. It stays the GPU's frame otherwise: no lateness judged
-// (GpuFloorReleased), its target the GPU's release + min(E, L), and the
-// rhythm continuing from the GPU's release. A release floor at or after the
-// GPU's release changes nothing.
-void TestReleaseFloorAtCapRelease()
-{
-    std::printf("Test: a release floor before the GPU's release releases the frame at the cap's S\n");
-    ResetStage();
-    ScriptedClock clock;
-    const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
-    uint64_t frame_id = 6000;
-    SourceStageFrame last{};
-    const auto finish = [&](const SourceStageFrame& frame, int64_t ready_qpc) {
-        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::PresentCall,
-            frame.release_qpc + Ticks(1'000.0))));
-        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady, ready_qpc)));
-        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease, ready_qpc,
-            PacingPlanStatus::Late)));
-        g_stage.DrainStageEvents();
-        clock.now = ready_qpc;
-    };
-    // Warm lead (ready 3,000 µs after each release: early side 2,500 µs) and
-    // GPU periods of 17,000 µs from frames not held.
-    for (int i = 0; i < 40; ++i) {
-        last = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
-        finish(last, last.release_qpc + Ticks(3'000.0));
-        const int64_t end = kStart + Ticks(17'000.0 * static_cast<double>(i));
-        g_stage.OnGpuRenderEnd(1, frame_id - 1, end - Ticks(17'000.0 - 250.0), end, 14'000.0);
-    }
-    const auto request_for = [&](int64_t floor, int64_t release_floor) {
-        SourceStageRequest request = Request(Key(frame_id++), held);
-        request.gpu_paced_cadence = true;
-        request.gpu_floor_qpc = floor;
-        request.earliest_release_qpc = floor;
-        request.release_floor_qpc = release_floor;
-        request.gpu_paced_rhythm = GpuPacedRhythmStep::Start;
-        return request;
-    };
-    const auto s_after = [&](const SourceStageFrame& frame) {
-        return frame.plan.output_target_qpc + Ticks(kIntervalUs) - Ticks(frame.plan.lead_us);
-    };
-
-    // The floor 6 ms past the grid's S, the release floor 1 ms before it:
-    // T = floor + 2,500 and the frame released at T − L, before the floor.
-    const uint64_t pulled = g_stage.Statistics().floor_pulled_frames;
-    int64_t floor = s_after(last) + Ticks(6'000.0);
-    const SourceStageFrame first = g_stage.RunPlannedFrame(request_for(floor, s_after(last) - Ticks(1'000.0)), &clock);
-    CHECK(first.planned && first.gpu_paced && first.epoch_started == PacingEpochReason::None);
-    CHECK(g_stage.Lead().GpuFloorReleased(first.plan.key, first.plan.grid_index));
-    CHECK(first.plan.output_target_qpc > floor + Ticks(2'499.0) && first.plan.output_target_qpc < floor + Ticks(2'501.0));
-    CHECK(first.release_qpc == first.plan.source_wake_qpc && first.release_qpc < floor);
-    CHECK(std::llabs(first.release_qpc - (first.plan.output_target_qpc - Ticks(first.plan.lead_us))) <= 1);
-    CHECK(first.floor_pull_ticks == floor - first.release_qpc);
-    CHECK(g_stage.Statistics().floor_pulled_frames == pulled + 1);
-    // The rhythm continues from the floor: 17,000 µs on is not earlier than
-    // a floor 500 µs before that (Late), which a rhythm from the earlier
-    // release would have pulled toward it (Smooth).
-    CHECK(g_stage.GpuPacedRhythm(Key(frame_id), floor + Ticks(16'500.0)).step == GpuPacedRhythmStep::Late);
-    finish(first, floor + Ticks(3'000.0));
-
-    // The game arrives after the grid's S: released at its arrival.
-    floor = s_after(first) + Ticks(6'000.0);
-    clock.now = floor - Ticks(300.0);
-    const SourceStageFrame arrived = g_stage.RunPlannedFrame(request_for(floor, s_after(first) - Ticks(1'000.0)), &clock);
-    CHECK(arrived.planned && arrived.gpu_paced && arrived.release_qpc == floor - Ticks(300.0));
-    CHECK(arrived.floor_pull_ticks == Ticks(300.0));
-    finish(arrived, floor + Ticks(3'000.0));
-
-    // A release floor at or after the floor: released at the floor.
-    floor = s_after(arrived) + Ticks(6'000.0);
-    const SourceStageFrame kept = g_stage.RunPlannedFrame(request_for(floor, floor + Ticks(1'000.0)), &clock);
-    CHECK(kept.planned && kept.gpu_paced && kept.release_qpc == floor && kept.floor_pull_ticks == 0);
-    CHECK(g_stage.Statistics().floor_pulled_frames == pulled + 2);
-}
-
-// The held GPU floor applies before the cap held 32 frames only after a
-// cadence restart of a held frame in the producer epoch (lead_controller.h):
-// a SourceLate restart at the plan and an OutputLate restart from the stage
-// events count; a cap or FG divisor change (ResetGpuFloor) clears it. The
-// restarts of frames not held do not count: after an FG change the first
-// frame lands late on the new grid while FG is not presenting yet.
-void TestCadenceRestartsCountForTheFloor()
-{
-    std::printf("Test: SourceLate and OutputLate restarts of held frames make the held GPU floor eligible\n");
+    std::printf("Test: an OutputLate restart of a held output makes the held GPU floor eligible\n");
     ResetStage();
     ScriptedClock clock;
     const PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
@@ -2277,15 +1098,6 @@ void TestCadenceRestartsCountForTheFloor()
     }
     CHECK(!g_stage.Lead().CadenceRestartSeen(1));
 
-    // The game reaches the next release 8 ms after its S: SourceLate.
-    clock.now = last.plan.output_target_qpc + Ticks(kIntervalUs) - Ticks(last.plan.lead_us) + Ticks(8'000.0);
-    const SourceStageFrame late = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
-    CHECK(late.planned && late.epoch_started == PacingEpochReason::SourceLate);
-    CHECK(g_stage.Lead().CadenceRestartSeen(1) && !g_stage.Lead().CadenceRestartSeen(2));
-    g_stage.ResetGpuFloor();
-    CHECK(!g_stage.Lead().CadenceRestartSeen(1));
-    finish(late);
-
     // An output 8 ms past its target: OutputLate.
     const SourceStageFrame next = g_stage.RunPlannedFrame(Request(Key(frame_id++), held), &clock);
     CHECK(next.planned && next.epoch_started == PacingEpochReason::None);
@@ -2295,9 +1107,10 @@ void TestCadenceRestartsCountForTheFloor()
     g_stage.DrainStageEvents();
     CHECK(g_stage.Statistics().output_late_epochs == late_before + 1);
     CHECK(g_stage.Lead().CadenceRestartSeen(1));
+    g_stage.ResetGpuFloor();
+    CHECK(!g_stage.Lead().CadenceRestartSeen(1));
 
     // Frames not held: their SourceLate and OutputLate restarts do not count.
-    g_stage.ResetGpuFloor();
     finish(next);
     const PacingPipelineSnapshot not_held = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
     for (int i = 0; i < 4; ++i) {
@@ -2433,7 +1246,6 @@ void TestUnifiedBranch()
     FramePlan_PushStageEvent(Event(fifth, PacingStageEventKind::OutputRelease,
         fifth.plan.output_target_qpc + Ticks(20'000.0), PacingPlanStatus::Held));
     g_stage.DrainStageEvents();
-    CHECK(!g_stage.DrainStartedOutputLate());
     CHECK(g_stage.Grid().Snapshot().epoch == epoch);
 
     // Key off: the unified branch is not entered, whatever the request carries.
@@ -2949,7 +1761,7 @@ void TestKeyTransitionBeforeTheDrain()
             const uint32_t epoch = g_stage.Grid().Snapshot().epoch;
             const uint64_t before = g_stage.Statistics().output_late_epochs;
             g_stage.DrainStageEvents();
-            CHECK(!g_stage.DrainStartedOutputLate() && g_stage.Statistics().output_late_epochs == before);
+            CHECK(g_stage.Statistics().output_late_epochs == before);
             CHECK(g_stage.Grid().Snapshot().epoch == epoch);
         }
         // Production order: the transition, then the drain: the legacy restart.
@@ -2962,7 +1774,6 @@ void TestKeyTransitionBeforeTheDrain()
         const uint64_t before = g_stage.Statistics().output_late_epochs;
         g_stage.DrainStageEventsUnderKey(false, 1);
         CHECK(!g_stage.UnifiedEnabled());
-        CHECK(g_stage.DrainStartedOutputLate() && g_stage.DrainedOutputLateCount() == 1);
         CHECK(g_stage.Statistics().output_late_epochs == before + 1);
         CHECK(g_stage.Grid().Snapshot().epoch == epoch + 1);
         // The key off the whole time: the same entry changes nothing.
@@ -2984,7 +1795,6 @@ void TestKeyTransitionBeforeTheDrain()
         const uint64_t before = g_stage.Statistics().output_late_epochs;
         g_stage.DrainStageEventsUnderKey(true, 1);
         CHECK(g_stage.UnifiedEnabled());
-        CHECK(!g_stage.DrainStartedOutputLate() && g_stage.DrainedOutputLateCount() == 0);
         CHECK(g_stage.Statistics().output_late_epochs == before);
         CHECK(g_stage.Grid().Snapshot().epoch == epoch);
         g_stage.SetUnifiedEnabled(false, 1);
@@ -3590,8 +2400,1167 @@ void TestUnifiedQueueLawPacedFrames()
     g_stage.SetUnifiedEnabled(false, 1);
 }
 
-int main()
+// ═══════════════════════════════════════════════════════════════════════════
+// Present route characterization (the baseline kept through the present-route cut)
+//
+// Every test below drives the real SourceStage::RunPlannedFrame and the drain of the stage's events as
+// scheduler.cpp OnMarker -> RunPlanned drives them for a SchedulerTrigger::PresentFallback frame
+// (route PresentBased, placement Present, rung SourceOnly), under BOTH architecture policies of that route:
+//   policy 0 "stage not enabled" (32-bit): DrainStageEvents, output-late epochs as the grid judges them;
+//   policy 1 "stage enabled" (64-bit unified owner): SetUnifiedEnabled(true), DrainStageEventsUnderKey(true),
+//     the display-floor clear before PlanNext, outputs judged GPU-paced (no OutputLate epoch), the unified
+//     lines of the drain (SyncUnifiedLead). Both policies run in both architectures' executables.
+// The expected values are the ones the source produced when the tables were frozen (run with
+// --print-present to print them in the form kPresentExpected takes). Epoch and grid index are relative to the
+// grid's counters at the start of a case (they are monotonic across Reset).
+// ═══════════════════════════════════════════════════════════════════════════
+namespace {
+
+constexpr double kPresentLeadUs = 150.0; // LEAD_PRESENT_PLACEMENT_US, the present placement's lead
+constexpr double kPresentLagUs = 120.0;  // the native Present follows the source release by this
+constexpr double kMarkerLagUs = 1'000.0;
+constexpr double kNoLate = -1.0;
+bool g_print_present = false;
+
+enum class PresentRoute { Present, Marker };
+
+struct PresentStep {
+    PresentRoute route = PresentRoute::Present;
+    PacingTimingMode mode = PacingTimingMode::Vrr;
+    double interval_us = kIntervalUs; // the interval the scheduler hands RunPlanned (FG divisor, governor, LFC applied)
+    double fg_divisor = 1.0;          // the ramped divisor of the plan
+    double identity_us = kIntervalUs; // SourceStagePeriodTracker input (input.period_identity_us)
+    double cpu_us = 4'000.0;          // the game's work between the previous Present and this arrival
+    double late_source_us = kNoLate;  // >= 0: arrives this long after this frame's S on the previous grid
+    double output_late_us = 0.0;      // > 0: the frame's output is this long after its target
+    double arrival_us = kNoLate;      // >= 0: the arrival, µs after kStart (decouples it from the previous route's frames)
+    bool row = true;                  // false: planned and checked, no row pinned (warm-up frames)
+    uint8_t extra_flags = 0;          // PlannedFrameInput::extra_flags
+    bool cap_change = false;          // cap or raw FG divisor change: the scheduler's resets before the plan
+    bool suspend_before = false;      // a pass-through frame in between (SourceStage::Suspend)
+    bool observe_lifecycle = true;    // ApplyLifecycle runs (a domain change then resets the stage)
+    bool pin_off = true;              // the row is pinned under policy 0
+    bool pin_on = true;               // the row is pinned under policy 1
+};
+
+struct PresentRow {
+    uint64_t grid_index;  // relative: 1 = the case's first plan
+    uint32_t epoch;       // relative
+    int started;          // PacingEpochReason of the epoch this plan started
+    int64_t target;       // output target T_n - kStart
+    int64_t wake;         // S_n - kStart
+    int64_t wait;         // wait target - kStart, 0 = no wait
+    int64_t release;      // s_n - kStart
+    int slept;
+    unsigned flags;       // the source record's flags
+    int late;             // OutputLate epochs of the drain before the plan
+    int64_t floor_ticks;  // the grid's current segment's display-side floor
+    double interval_us;   // the record's
+    double fg_divisor;
+};
+
+struct PresentTail {
+    bool valid;
+    uint32_t epoch;
+    int epoch_reason;
+    uint64_t epoch_base;
+    uint32_t segments;
+    int snapped;
+    uint64_t late_epochs;     // stage output_late_epochs, from the case's start
+    uint64_t observations;    // stage output_observations
+    uint64_t immediate;       // grid released_immediately
+    uint64_t rebases;         // grid silent_rebases
+    uint64_t gpu_paced_late;  // grid gpu_paced_late_outputs
+    uint64_t ignored;         // grid ignored_output_observations
+    uint64_t samples;         // the lead's samples
+    int64_t median_x_ns;      // the lead's median X of the source-only bucket
+    int64_t published_floor;  // the published grid copy's current floor
+};
+
+struct PresentResult {
+    std::vector<PresentRow> rows;
+    PresentTail tail{};
+};
+
+struct PresentExpectedCase {
+    const char* name;
+    std::vector<PresentRow> off_rows;
+    std::vector<PresentRow> on_rows; // empty = the same rows as off_rows
+    PresentTail off_tail;
+    PresentTail on_tail;
+};
+
+PacingPlanKey PresentKey(uint64_t frame_id, uint32_t generation)
 {
+    PacingPlanKey key{};
+    key.identity_domain = PacingIdentityDomain::SyntheticPresentFrame;
+    key.producer_epoch = 1;
+    key.controller_generation = generation;
+    key.frame_id = frame_id;
+    return key;
+}
+
+// The snapshot scheduler.cpp ResolvePipeline publishes for a PresentFallback frame (the Resolve of the
+// capabilities it builds); the generation is the published one's stand-in.
+PacingPipelineSnapshot ResolvedPresentPipeline(PacingTimingMode mode)
+{
+    PacingCapabilities capabilities{};
+#ifdef _WIN64
+    capabilities.x64 = true;
+#endif
+    capabilities.api = PacingApi::DX12;
+    capabilities.route = PacingRoute::PresentBased;
+    PacingRuntimeState runtime{};
+    runtime.swapchain_valid = true;
+    runtime.vrr = mode != PacingTimingMode::Fixed;
+    runtime.idle_cap = mode == PacingTimingMode::Idle;
+    PacingPipelineSnapshot pipeline = PacingPipeline_Resolve(PacingPipelineConfig{}, capabilities, runtime);
+    CHECK(pipeline.mode == mode && pipeline.route == PacingRoute::PresentBased);
+    CHECK(pipeline.placement == PacingSourcePlacement::Present && pipeline.rung == PacingRung::SourceOnly);
+    CHECK(pipeline.auto_rung == PacingRung::SourceOnly);
+    pipeline.generation = 9;
+    return pipeline;
+}
+
+bool SamePresentRow(const PresentRow& left, const PresentRow& right)
+{
+    return left.grid_index == right.grid_index && left.epoch == right.epoch && left.started == right.started &&
+        left.target == right.target && left.wake == right.wake && left.wait == right.wait &&
+        left.release == right.release && left.slept == right.slept && left.flags == right.flags &&
+        left.late == right.late && left.floor_ticks == right.floor_ticks &&
+        left.interval_us == right.interval_us && left.fg_divisor == right.fg_divisor;
+}
+
+bool SamePresentTail(const PresentTail& left, const PresentTail& right)
+{
+    return left.valid == right.valid && left.epoch == right.epoch && left.epoch_reason == right.epoch_reason &&
+        left.epoch_base == right.epoch_base && left.segments == right.segments && left.snapped == right.snapped &&
+        left.late_epochs == right.late_epochs && left.observations == right.observations &&
+        left.immediate == right.immediate && left.rebases == right.rebases &&
+        left.gpu_paced_late == right.gpu_paced_late && left.ignored == right.ignored &&
+        left.samples == right.samples && left.median_x_ns == right.median_x_ns &&
+        left.published_floor == right.published_floor;
+}
+
+// One scheduler owner for a case: the lifecycle, the drain under the policy's key, the cap/FG/regime resets and
+// RunPlanned's request, in OnMarker's order (scheduler.cpp: ApplyLifecycle 875, the configuration snapshot and
+// drain 2896, the cap/FG change 2988, the idle regime 3083, RunPlanned 2217).
+class PresentRig {
+public:
+    PresentRig(bool stage_enabled, const CadenceGridFixedReference& fixed)
+        : enabled_(stage_enabled), fixed_(fixed)
+    {
+        g_stage.SetUnifiedEnabled(false, 1);
+        ResetStage();
+        if (enabled_) g_stage.SetUnifiedEnabled(true, generation_);
+        base_index_ = g_stage.Grid().NextIndex();
+        base_epoch_ = g_stage.Grid().Snapshot().epoch;
+        stage_before_ = g_stage.Statistics();
+        grid_before_ = g_stage.Grid().Statistics();
+        vrr_ = ResolvedPresentPipeline(PacingTimingMode::Vrr);
+        fixed_pipeline_ = ResolvedPresentPipeline(PacingTimingMode::Fixed);
+        idle_ = ResolvedPresentPipeline(PacingTimingMode::Idle);
+    }
+    ~PresentRig() { g_stage.SetUnifiedEnabled(false, 1); }
+
+    void Run(const PresentStep& step)
+    {
+        const bool marker_route = step.route == PresentRoute::Marker;
+        if (step.suspend_before) {
+            g_stage.Suspend(); // RunPassthrough
+            CadenceGridSnapshot published{};
+            CHECK(g_cadence_grid_publication.Read(&published) && !published.valid);
+        }
+        if (step.observe_lifecycle) { // ApplyLifecycle
+            const SourceStageLifecycle lifecycle{ PacingApi::DX12,
+                marker_route ? PacingIdentityDomain::NvApiFrame : PacingIdentityDomain::SyntheticPresentFrame, 1 };
+            if (lifecycle_.Observe(lifecycle)) {
+                ++generation_;
+                g_stage.Reset(kFrequency);
+                period_.Forget();
+                if (enabled_) g_stage.ResetUnified(generation_); // ResetAdaptationRegime -> ResetUnifiedLaw
+                g_stage.ClearSlackEvidence();                    // ResetFeasibility
+                base_index_ = g_stage.Grid().NextIndex();        // rows count from the reset
+                base_epoch_ = g_stage.Grid().Snapshot().epoch;
+            }
+        }
+        const PacingSourceMarker marker = marker_route ? PacingSourceMarker::SimulationStart : PacingSourceMarker::Unknown;
+        if (marker_known_ && marker != last_marker_) g_stage.ResetBuckets();
+        last_marker_ = marker;
+        marker_known_ = true;
+
+        const uint64_t late_before = g_stage.Statistics().output_late_epochs;
+        if (enabled_) { // the keyed branch
+            const PacingPipelineConfig config = PacingPipeline_ClampConfig(PacingPipelineConfig{});
+            g_stage.SetUnifiedOptions(kPacingUnifiedEveryFrameServiceDefault, kPacingUnifiedQueueTargetDefaultUs,
+                config.unified_hold_share, config.unified_queue_law, config.unified_queue_rank,
+                config.unified_queue_allow_us, config.unified_queue_need_frames);
+            g_stage.DrainStageEventsUnderKey(true, generation_);
+        } else {
+            g_stage.DrainStageEvents();
+        }
+        const int late = static_cast<int>(g_stage.Statistics().output_late_epochs - late_before);
+
+        if (step.cap_change) { // cap or raw FG divisor change
+            if (enabled_) g_stage.ResetUnified(generation_);
+            g_stage.ClearSlackEvidence();
+            g_stage.ResetGpuFloor();
+        }
+        if (enabled_) { // an idle regime change resets the law
+            const bool idle = step.mode == PacingTimingMode::Idle;
+            if (idle != idle_regime_) g_stage.ResetUnified(generation_);
+            idle_regime_ = idle;
+        }
+
+        int64_t arrival = kStart;
+        if (step.arrival_us != kNoLate) {
+            arrival = (std::max)(kStart + Ticks(step.arrival_us), clock_.now);
+        } else if (have_last_) {
+            arrival = step.late_source_us != kNoLate
+                ? last_.plan.output_target_qpc + Ticks(step.interval_us) - Ticks(kPresentLeadUs) + Ticks(step.late_source_us)
+                : last_present_qpc_ + Ticks(step.cpu_us);
+            if (arrival < clock_.now) arrival = clock_.now;
+        }
+
+        const PacingPipelineSnapshot& pipeline = step.mode == PacingTimingMode::Fixed ? fixed_pipeline_
+            : step.mode == PacingTimingMode::Idle ? idle_ : vrr_;
+        const PacingPlanKey key = marker_route ? Key(frame_id_, generation_) : PresentKey(frame_id_, generation_);
+        ++frame_id_;
+        SourceStageRequest request{};
+        request.key = key;
+        request.marker = marker;
+        request.qpc_frequency = kFrequency;
+        request.interval_us = step.interval_us;
+        request.fg_divisor = step.fg_divisor;
+        request.period_change = period_.Observe(step.mode, step.identity_us);
+        request.collision_guard = true;
+        request.gpu_queue_wait_render_queue = kPacingGpuQueueWaitRenderQueue;
+        request.spike_floor = kPacingLeadSpikeFloor;
+        if (marker_route) {
+            request.pipeline = Pipeline(PacingTimingMode::Vrr, enabled_ ? PacingRung::SourceOnly : PacingRung::MarkerHold,
+                PacingSourcePlacement::Marker);
+            if (enabled_) { // SourceStage_UnifiedPlans: the marker route's unified branch
+                CHECK(SourceStage_UnifiedPlans(request.pipeline, true, true));
+                request.unified.active = true;
+                request.unified.terms = CapTerms(step.interval_us);
+                request.unified.raw_fg_divisor = 1;
+                request.unified.mailbox = &mailbox_;
+            }
+        } else {
+            request.pipeline = pipeline;
+            if (pipeline.mode == PacingTimingMode::Fixed) request.fixed = fixed_;
+            CHECK(!SourceStage_UnifiedPlans(pipeline, true, enabled_)); // the present route never takes the unified branch
+        }
+
+        clock_.now = arrival;
+        clock_.expected_key = key;
+        const int waits_before = clock_.wait_calls;
+        const SourceStageFrame frame = g_stage.RunPlannedFrame(request, &clock_);
+        const bool pinned = enabled_ ? step.pin_on : step.pin_off;
+        CHECK(frame.planned || !pinned); // an unpinned frame belongs to a branch the policy does not ship
+        if (!frame.planned) return;
+        CHECK(frame.plan_published);
+        if (!marker_route && clock_.wait_calls > waits_before) { // the unified branch waits before it publishes
+            CHECK(clock_.plan_visible_at_wait && clock_.grid_visible_at_wait);
+            CHECK(clock_.plan_at_wait.grid_index == frame.plan.grid_index);
+            CHECK(clock_.last_wait_target == frame.wait_target_qpc);
+        }
+
+        PacingSourceRecord record{};
+        record.flags = step.extra_flags;
+        SourceStage::FillSourceRecord(frame, request.pipeline, &record);
+        if (!marker_route) {
+            CHECK(!frame.unified.valid && frame.game_arrival_qpc == arrival);
+            CHECK(frame.plan.lead_us == kPresentLeadUs && frame.plan.rung == PacingRung::SourceOnly);
+            CHECK(frame.plan.mode == step.mode && frame.plan.marker == PacingSourceMarker::Unknown);
+            CHECK(frame.plan.key == key && frame.plan.pipeline_generation == pipeline.generation);
+            CHECK(frame.plan.interval_us == step.interval_us && frame.plan.fg_divisor == step.fg_divisor);
+            CHECK(!frame.lead_budget_limited && frame.guard_reduction_us == 0.0);
+            CHECK(frame.pre_wait_start_qpc == 0 && frame.pre_wait_end_qpc == 0);
+            CHECK(frame.driver_sleep_start_qpc == 0 && frame.driver_sleep_end_qpc == 0);
+            CHECK(record.source_placement == static_cast<uint8_t>(PacingSourcePlacement::Present));
+            CHECK(record.fallback_reason == static_cast<uint8_t>(
+                step.mode == PacingTimingMode::Idle ? PacingFallbackReason::IdleCap : PacingFallbackReason::PresentRoute));
+            CHECK(record.pipeline_generation == pipeline.generation && record.plan_rung == static_cast<uint8_t>(PacingRung::SourceOnly));
+            CHECK(record.plan_lead_us == kPresentLeadUs);
+            CHECK(((record.flags & PACING_SOURCE_SLEPT) != 0) == frame.slept);
+            CHECK(((record.flags & PACING_SOURCE_FIXED_REFRESH) != 0) ==
+                (step.mode == PacingTimingMode::Fixed || (step.extra_flags & PACING_SOURCE_FIXED_REFRESH) != 0));
+            CHECK((record.flags & PACING_SOURCE_GPU_PACED) == 0 && (record.flags & PACING_SOURCE_STALL_INJECTED) == 0);
+        }
+        CHECK(record.wake_target_qpc == frame.wait_target_qpc && record.source_wait_start_qpc == frame.wait_start_qpc);
+        CHECK(record.release_qpc == frame.release_qpc && record.interval_us == frame.plan.interval_us);
+        CHECK(record.fg_divisor == frame.plan.fg_divisor && record.grid_epoch == frame.plan.grid_epoch);
+        CHECK(record.grid_index == frame.plan.grid_index && record.plan_output_target_qpc == frame.plan.output_target_qpc);
+        CHECK(record.epoch_reason == static_cast<uint8_t>(frame.grid_epoch_reason));
+
+        PresentRow row{};
+        row.grid_index = frame.plan.grid_index - base_index_ + 1;
+        row.epoch = frame.plan.grid_epoch - base_epoch_;
+        row.started = static_cast<int>(frame.epoch_started);
+        row.target = frame.plan.output_target_qpc - kStart;
+        row.wake = frame.plan.source_wake_qpc - kStart;
+        row.wait = frame.wait_target_qpc != 0 ? frame.wait_target_qpc - kStart : 0;
+        row.release = frame.release_qpc - kStart;
+        row.slept = frame.slept ? 1 : 0;
+        row.flags = record.flags;
+        row.late = late;
+        row.floor_ticks = std::llround(g_stage.Grid().Snapshot().current.floor_interval_ticks);
+        row.interval_us = record.interval_us;
+        row.fg_divisor = record.fg_divisor;
+        if (!step.row) {
+        } else if (enabled_ ? step.pin_on : step.pin_off) {
+            result_.rows.push_back(row);
+        } else {
+            all_pinned_ = false;
+        }
+
+        // The frame's present and its output, drained at the next frame (H0 on the present route; a held
+        // output on the marker route).
+        const int64_t present_at = frame.release_qpc + Ticks(marker_route ? kMarkerLagUs : kPresentLagUs);
+        int64_t output_qpc = marker_route ? frame.plan.output_target_qpc : present_at;
+        if (step.output_late_us > 0.0) output_qpc = frame.plan.output_target_qpc + Ticks(step.output_late_us);
+        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::MarkerArrival, present_at)));
+        CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::OutputRelease, output_qpc,
+            marker_route ? PacingPlanStatus::Held : PacingPlanStatus::SourceOnly)));
+        last_ = frame;
+        last_present_qpc_ = present_at;
+        last_fg_ = step.fg_divisor;
+        have_last_ = true;
+    }
+
+    PresentResult Finish()
+    {
+        const CadenceGridSnapshot& snapshot = g_stage.Grid().Snapshot();
+        const SourceStageStatistics stage = g_stage.Statistics();
+        const CadenceGridStatistics grid = g_stage.Grid().Statistics();
+        CadenceGridSnapshot published{};
+        CHECK(g_cadence_grid_publication.Read(&published));
+        PresentTail& tail = result_.tail;
+        tail.valid = all_pinned_;
+        tail.epoch = snapshot.epoch - base_epoch_;
+        tail.epoch_reason = static_cast<int>(snapshot.epoch_reason);
+        tail.epoch_base = snapshot.epoch_base_index - base_index_ + 1;
+        tail.segments = snapshot.segment_count;
+        tail.snapped = snapshot.snapped ? 1 : 0;
+        tail.late_epochs = stage.output_late_epochs - stage_before_.output_late_epochs;
+        tail.observations = stage.output_observations - stage_before_.output_observations;
+        tail.immediate = grid.released_immediately - grid_before_.released_immediately;
+        tail.rebases = grid.silent_rebases - grid_before_.silent_rebases;
+        tail.gpu_paced_late = grid.gpu_paced_late_outputs - grid_before_.gpu_paced_late_outputs;
+        tail.ignored = grid.ignored_output_observations - grid_before_.ignored_output_observations;
+        tail.samples = g_stage.Lead().Statistics().samples;
+        tail.median_x_ns = std::llround(g_stage.Lead().MedianSampleUs(PacingRung::SourceOnly, last_fg_) * 1000.0);
+        tail.published_floor = std::llround(published.current.floor_interval_ticks);
+        if (!all_pinned_) tail = PresentTail{};
+        return result_;
+    }
+
+private:
+    bool enabled_;
+    CadenceGridFixedReference fixed_;
+    uint32_t generation_ = 1;
+    uint64_t frame_id_ = 5000;
+    ScriptedClock clock_;
+    std::atomic<uint64_t> mailbox_{0};
+    SourceStagePeriodTracker period_;
+    SourceStageLifecycleTracker lifecycle_;
+    PacingSourceMarker last_marker_ = PacingSourceMarker::Unknown;
+    bool marker_known_ = false;
+    bool idle_regime_ = false;
+    PacingPipelineSnapshot vrr_{};
+    PacingPipelineSnapshot fixed_pipeline_{};
+    PacingPipelineSnapshot idle_{};
+    uint64_t base_index_ = 0;
+    uint32_t base_epoch_ = 0;
+    SourceStageStatistics stage_before_{};
+    CadenceGridStatistics grid_before_{};
+    SourceStageFrame last_{};
+    int64_t last_present_qpc_ = 0;
+    double last_fg_ = 1.0;
+    bool have_last_ = false;
+    bool all_pinned_ = true;
+    PresentResult result_{};
+};
+
+// ── Expected tables (frozen from the source) ──
+
+const PresentExpectedCase kPresentExpected[] = {
+    { "cap_vrr",
+        { // policy 0, the stage not enabled
+            { 1, 1, 1, 1500, 0, 0, 0, 0, 0, 0, 0, 10000, 1 },
+            { 2, 1, 0, 101500, 100000, 100000, 100000, 1, 1, 0, 0, 10000, 1 },
+            { 3, 1, 0, 201500, 200000, 200000, 200000, 1, 1, 0, 0, 10000, 1 },
+            { 4, 1, 0, 301500, 300000, 300000, 300000, 1, 1, 0, 0, 10000, 1 },
+            { 5, 1, 0, 401500, 400000, 400000, 400000, 1, 1, 0, 0, 10000, 1 },
+            { 6, 1, 0, 501500, 500000, 500000, 500000, 1, 1, 0, 0, 10000, 1 },
+            { 7, 1, 0, 601500, 600000, 600000, 600000, 1, 1, 0, 0, 10000, 1 },
+            { 8, 1, 0, 701500, 700000, 700000, 700000, 1, 1, 0, 0, 10000, 1 },
+            { 9, 2, 3, 868167, 866667, 866667, 866667, 1, 1, 0, 0, 16666.666666666668, 1 },
+            { 10, 2, 0, 1034833, 1033333, 1033333, 1033333, 1, 1, 0, 0, 16666.666666666668, 1 },
+            { 11, 2, 0, 1201500, 1200000, 1200000, 1200000, 1, 1, 0, 0, 16666.666666666668, 1 },
+            { 12, 2, 0, 1368167, 1366667, 1366667, 1366667, 1, 1, 0, 0, 16666.666666666668, 1 },
+            { 13, 2, 0, 1534833, 1533333, 1533333, 1533333, 1, 1, 0, 0, 16666.666666666668, 1 },
+            { 14, 2, 0, 1701500, 1700000, 1700000, 1700000, 1, 1, 0, 0, 16666.666666666668, 1 },
+        },
+        { // policy 1, the stage enabled (same rows)
+        },
+        { 1, 2, 3, 9, 2, 0, 0, 13, 0, 0, 0, 0, 13, 0, 0 },
+        { 1, 2, 3, 9, 2, 0, 0, 13, 0, 0, 0, 0, 13, 0, 0 },
+    },
+    { "cap_zero_vrr_term",
+        { // policy 0, the stage not enabled
+            { 1, 1, 1, 1500, 0, 0, 0, 0, 0, 0, 0, 7246.376811594203, 1 },
+            { 2, 1, 0, 73964, 72464, 72464, 72464, 1, 1, 0, 0, 7246.376811594203, 1 },
+            { 3, 1, 0, 146428, 144928, 144928, 144928, 1, 1, 0, 0, 7246.376811594203, 1 },
+            { 4, 1, 0, 218891, 217391, 217391, 217391, 1, 1, 0, 0, 7246.376811594203, 1 },
+            { 5, 1, 0, 291355, 289855, 289855, 289855, 1, 1, 0, 0, 7246.376811594203, 1 },
+            { 6, 1, 0, 363819, 362319, 362319, 362319, 1, 1, 0, 0, 7246.376811594203, 1 },
+            { 7, 1, 0, 436283, 434783, 434783, 434783, 1, 1, 0, 0, 7246.376811594203, 1 },
+            { 8, 1, 0, 508746, 507246, 507246, 507246, 1, 1, 0, 0, 7246.376811594203, 1 },
+            { 9, 2, 3, 553389, 551889, 551889, 551889, 1, 1, 0, 0, 4464.2857142857147, 1 },
+            { 10, 2, 0, 598032, 596532, 596532, 596532, 1, 1, 0, 0, 4464.2857142857147, 1 },
+            { 11, 2, 0, 642675, 641175, 641175, 641175, 1, 1, 0, 0, 4464.2857142857147, 1 },
+            { 12, 2, 0, 687318, 685818, 685818, 685818, 1, 1, 0, 0, 4464.2857142857147, 1 },
+        },
+        { // policy 1, the stage enabled (same rows)
+        },
+        { 1, 2, 3, 9, 2, 0, 0, 11, 0, 0, 0, 0, 11, 0, 0 },
+        { 1, 2, 3, 9, 2, 0, 0, 11, 0, 0, 0, 0, 11, 0, 0 },
+    },
+    { "lfc_multiple",
+        { // policy 0, the stage not enabled
+            { 1, 1, 1, 1500, 0, 0, 0, 0, 0, 0, 0, 34722.222222222219, 1 },
+            { 2, 1, 0, 348722, 347222, 347222, 347222, 1, 1, 0, 0, 34722.222222222219, 1 },
+            { 3, 1, 0, 695944, 694444, 694444, 694444, 1, 1, 0, 0, 34722.222222222219, 1 },
+            { 4, 1, 0, 1043167, 1041667, 1041667, 1041667, 1, 1, 0, 0, 34722.222222222219, 1 },
+            { 5, 1, 0, 1390389, 1388889, 1388889, 1388889, 1, 1, 0, 0, 34722.222222222219, 1 },
+            { 6, 1, 0, 1737611, 1736111, 1736111, 1736111, 1, 1, 0, 0, 34722.222222222219, 1 },
+            { 7, 2, 3, 2070944, 2069444, 2069444, 2069444, 1, 1, 0, 0, 33333.333333333336, 1 },
+            { 8, 2, 0, 2404278, 2402778, 2402778, 2402778, 1, 1, 0, 0, 33333.333333333336, 1 },
+            { 9, 2, 0, 2737611, 2736111, 2736111, 2736111, 1, 1, 0, 0, 33333.333333333336, 1 },
+            { 10, 2, 0, 3070944, 3069444, 3069444, 3069444, 1, 1, 0, 0, 33333.333333333336, 1 },
+            { 11, 2, 0, 3404278, 3402778, 3402778, 3402778, 1, 1, 0, 0, 33333.333333333336, 1 },
+            { 12, 2, 0, 3737611, 3736111, 3736111, 3736111, 1, 1, 0, 0, 33333.333333333336, 1 },
+        },
+        { // policy 1, the stage enabled (same rows)
+        },
+        { 1, 2, 3, 7, 2, 0, 0, 11, 0, 0, 0, 0, 11, 0, 0 },
+        { 1, 2, 3, 7, 2, 0, 0, 11, 0, 0, 0, 0, 11, 0, 0 },
+    },
+    { "fixed_snapped",
+        { // policy 0, the stage not enabled
+            { 1, 1, 1, 166665, 165165, 165165, 165165, 1, 9, 0, 0, 33333.333333333336, 1 },
+            { 2, 1, 0, 499998, 498498, 498498, 498498, 1, 9, 0, 0, 33333.333333333336, 1 },
+            { 3, 1, 0, 833332, 831832, 831832, 831832, 1, 9, 0, 0, 33333.333333333336, 1 },
+            { 4, 1, 0, 1166665, 1165165, 1165165, 1165165, 1, 9, 0, 0, 33333.333333333336, 1 },
+            { 5, 1, 0, 1499998, 1498498, 1498498, 1498498, 1, 9, 0, 0, 33333.333333333336, 1 },
+            { 6, 1, 0, 1833332, 1831832, 1831832, 1831832, 1, 9, 0, 0, 33333.333333333336, 1 },
+            { 7, 1, 0, 2166665, 2165165, 2165165, 2165165, 1, 9, 0, 0, 33333.333333333336, 1 },
+            { 8, 1, 0, 2499998, 2498498, 2498498, 2498498, 1, 9, 0, 0, 33333.333333333336, 1 },
+            { 9, 1, 0, 2833332, 2831832, 2831832, 2831832, 1, 9, 0, 0, 33333.333333333336, 1 },
+            { 10, 1, 0, 3166665, 3165165, 3165165, 3165165, 1, 9, 0, 0, 33333.333333333336, 1 },
+            { 11, 1, 0, 3499998, 3498498, 3498498, 3498498, 1, 9, 0, 0, 33333.333333333336, 1 },
+            { 12, 1, 0, 3833332, 3831832, 3831832, 3831832, 1, 9, 0, 0, 33333.333333333336, 1 },
+        },
+        { // policy 1, the stage enabled (same rows)
+        },
+        { 1, 1, 1, 1, 1, 1, 0, 11, 0, 0, 0, 0, 11, 0, 0 },
+        { 1, 1, 1, 1, 1, 1, 0, 11, 0, 0, 0, 0, 11, 0, 0 },
+    },
+    { "fixed_unsnapped",
+        { // policy 0, the stage not enabled
+            { 1, 1, 1, 1500, 0, 0, 0, 0, 8, 0, 0, 20000, 1 },
+            { 2, 1, 0, 201500, 200000, 200000, 200000, 1, 9, 0, 0, 20000, 1 },
+            { 3, 1, 0, 401500, 400000, 400000, 400000, 1, 9, 0, 0, 20000, 1 },
+            { 4, 1, 0, 601500, 600000, 600000, 600000, 1, 9, 0, 0, 20000, 1 },
+            { 5, 1, 0, 801500, 800000, 800000, 800000, 1, 9, 0, 0, 20000, 1 },
+            { 6, 1, 0, 1001500, 1000000, 1000000, 1000000, 1, 9, 0, 0, 20000, 1 },
+            { 7, 1, 0, 1201500, 1200000, 1200000, 1200000, 1, 9, 0, 0, 20000, 1 },
+            { 8, 1, 0, 1401500, 1400000, 1400000, 1400000, 1, 9, 0, 0, 20000, 1 },
+            { 9, 1, 0, 1601500, 1600000, 1600000, 1600000, 1, 9, 0, 0, 20000, 1 },
+            { 10, 1, 0, 1801500, 1800000, 1800000, 1800000, 1, 9, 0, 0, 20000, 1 },
+            { 11, 1, 0, 2001500, 2000000, 2000000, 2000000, 1, 9, 0, 0, 20000, 1 },
+            { 12, 1, 0, 2201500, 2200000, 2200000, 2200000, 1, 9, 0, 0, 20000, 1 },
+        },
+        { // policy 1, the stage enabled (same rows)
+        },
+        { 1, 1, 1, 1, 1, 0, 0, 11, 0, 0, 0, 0, 11, 0, 0 },
+        { 1, 1, 1, 1, 1, 0, 0, 11, 0, 0, 0, 0, 11, 0, 0 },
+    },
+    { "fixed_cap_change",
+        { // policy 0, the stage not enabled
+            { 1, 1, 1, 1500, 0, 0, 0, 0, 8, 0, 0, 20000, 1 },
+            { 2, 1, 0, 201500, 200000, 200000, 200000, 1, 9, 0, 0, 20000, 1 },
+            { 3, 1, 0, 401500, 400000, 400000, 400000, 1, 9, 0, 0, 20000, 1 },
+            { 4, 1, 0, 601500, 600000, 600000, 600000, 1, 9, 0, 0, 20000, 1 },
+            { 5, 1, 0, 801500, 800000, 800000, 800000, 1, 9, 0, 0, 20000, 1 },
+            { 6, 1, 0, 1001500, 1000000, 1000000, 1000000, 1, 9, 0, 0, 20000, 1 },
+            { 7, 2, 3, 1333332, 1331832, 1331832, 1331832, 1, 9, 0, 0, 33333.333333333336, 1 },
+            { 8, 2, 0, 1666665, 1665165, 1665165, 1665165, 1, 9, 0, 0, 33333.333333333336, 1 },
+            { 9, 2, 0, 1999998, 1998498, 1998498, 1998498, 1, 9, 0, 0, 33333.333333333336, 1 },
+            { 10, 2, 0, 2333332, 2331832, 2331832, 2331832, 1, 9, 0, 0, 33333.333333333336, 1 },
+            { 11, 2, 0, 2666665, 2665165, 2665165, 2665165, 1, 9, 0, 0, 33333.333333333336, 1 },
+            { 12, 2, 0, 2999998, 2998498, 2998498, 2998498, 1, 9, 0, 0, 33333.333333333336, 1 },
+        },
+        { // policy 1, the stage enabled (same rows)
+        },
+        { 1, 2, 3, 7, 2, 1, 0, 11, 0, 0, 0, 0, 11, 0, 0 },
+        { 1, 2, 3, 7, 2, 1, 0, 11, 0, 0, 0, 0, 11, 0, 0 },
+    },
+    { "idle_cap",
+        { // policy 0, the stage not enabled
+            { 1, 1, 1, 1500, 0, 0, 0, 0, 16, 0, 0, 33333.333333333336, 1 },
+            { 2, 1, 0, 334833, 333333, 333333, 333333, 1, 17, 0, 0, 33333.333333333336, 1 },
+            { 3, 1, 0, 668167, 666667, 666667, 666667, 1, 17, 0, 0, 33333.333333333336, 1 },
+            { 4, 1, 0, 1001500, 1000000, 1000000, 1000000, 1, 17, 0, 0, 33333.333333333336, 1 },
+            { 5, 1, 0, 1334833, 1333333, 1333333, 1333333, 1, 17, 0, 0, 33333.333333333336, 1 },
+            { 6, 1, 0, 1668167, 1666667, 1666667, 1666667, 1, 17, 0, 0, 33333.333333333336, 1 },
+            { 7, 1, 0, 2001500, 2000000, 2000000, 2000000, 1, 17, 0, 0, 33333.333333333336, 1 },
+            { 8, 1, 0, 2334833, 2333333, 2333333, 2333333, 1, 17, 0, 0, 33333.333333333336, 1 },
+            { 9, 1, 0, 2668167, 2666667, 2666667, 2666667, 1, 17, 0, 0, 33333.333333333336, 1 },
+            { 10, 1, 0, 3001500, 3000000, 3000000, 3000000, 1, 17, 0, 0, 33333.333333333336, 1 },
+            { 11, 2, 2, 3042700, 3041200, 0, 3041200, 0, 0, 0, 0, 10000, 1 },
+            { 12, 2, 0, 3142700, 3141200, 3141200, 3141200, 1, 1, 0, 0, 10000, 1 },
+            { 13, 2, 0, 3242700, 3241200, 3241200, 3241200, 1, 1, 0, 0, 10000, 1 },
+            { 14, 2, 0, 3342700, 3341200, 3341200, 3341200, 1, 1, 0, 0, 10000, 1 },
+        },
+        { // policy 1, the stage enabled (same rows)
+        },
+        { 1, 2, 2, 11, 2, 0, 0, 13, 0, 0, 0, 10, 3, 0, 0 },
+        { 1, 2, 2, 11, 2, 0, 0, 13, 0, 0, 0, 10, 3, 0, 0 },
+    },
+    { "late_output",
+        { // policy 0, the stage not enabled
+            { 1, 1, 1, 1500, 0, 0, 0, 0, 0, 0, 0, 10000, 1 },
+            { 2, 1, 0, 101500, 100000, 100000, 100000, 1, 1, 0, 0, 10000, 1 },
+            { 3, 1, 0, 201500, 200000, 200000, 200000, 1, 1, 0, 0, 10000, 1 },
+            { 4, 1, 0, 301500, 300000, 300000, 300000, 1, 1, 0, 0, 10000, 1 },
+            { 5, 1, 0, 401500, 400000, 400000, 400000, 1, 1, 0, 0, 10000, 1 },
+            { 6, 1, 0, 501500, 500000, 500000, 500000, 1, 1, 0, 0, 10000, 1 },
+            { 7, 2, 0, 681500, 680000, 680000, 680000, 1, 1, 1, 0, 10000, 1 },
+            { 8, 2, 0, 781500, 780000, 780000, 780000, 1, 1, 0, 0, 10000, 1 },
+            { 9, 2, 0, 881500, 880000, 880000, 880000, 1, 1, 0, 0, 10000, 1 },
+            { 10, 2, 0, 981500, 980000, 980000, 980000, 1, 1, 0, 0, 10000, 1 },
+            { 11, 2, 0, 1081500, 1080000, 1080000, 1080000, 1, 1, 0, 0, 10000, 1 },
+            { 12, 2, 0, 1181500, 1180000, 1180000, 1180000, 1, 1, 0, 0, 10000, 1 },
+            { 13, 2, 0, 1281500, 1280000, 1280000, 1280000, 1, 1, 0, 0, 10000, 1 },
+            { 14, 3, 0, 1441500, 1440000, 1440000, 1440000, 1, 1, 1, 0, 10000, 1 },
+            { 15, 3, 0, 1541500, 1540000, 1540000, 1540000, 1, 1, 0, 0, 10000, 1 },
+            { 16, 3, 0, 1641500, 1640000, 1640000, 1640000, 1, 1, 0, 0, 10000, 1 },
+        },
+        { // policy 1, the stage enabled
+            { 1, 1, 1, 1500, 0, 0, 0, 0, 0, 0, 0, 10000, 1 },
+            { 2, 1, 0, 101500, 100000, 100000, 100000, 1, 1, 0, 0, 10000, 1 },
+            { 3, 1, 0, 201500, 200000, 200000, 200000, 1, 1, 0, 0, 10000, 1 },
+            { 4, 1, 0, 301500, 300000, 300000, 300000, 1, 1, 0, 0, 10000, 1 },
+            { 5, 1, 0, 401500, 400000, 400000, 400000, 1, 1, 0, 0, 10000, 1 },
+            { 6, 1, 0, 501500, 500000, 500000, 500000, 1, 1, 0, 0, 10000, 1 },
+            { 7, 1, 0, 601500, 600000, 600000, 600000, 1, 1, 0, 0, 10000, 1 },
+            { 8, 1, 0, 701500, 700000, 700000, 700000, 1, 1, 0, 0, 10000, 1 },
+            { 9, 1, 0, 801500, 800000, 800000, 800000, 1, 1, 0, 0, 10000, 1 },
+            { 10, 1, 0, 901500, 900000, 900000, 900000, 1, 1, 0, 0, 10000, 1 },
+            { 11, 1, 0, 1001500, 1000000, 1000000, 1000000, 1, 1, 0, 0, 10000, 1 },
+            { 12, 1, 0, 1101500, 1100000, 1100000, 1100000, 1, 1, 0, 0, 10000, 1 },
+            { 13, 1, 0, 1201500, 1200000, 1200000, 1200000, 1, 1, 0, 0, 10000, 1 },
+            { 14, 1, 0, 1301500, 1300000, 1300000, 1300000, 1, 1, 0, 0, 10000, 1 },
+            { 15, 1, 0, 1401500, 1400000, 1400000, 1400000, 1, 1, 0, 0, 10000, 1 },
+            { 16, 1, 0, 1501500, 1500000, 1500000, 1500000, 1, 1, 0, 0, 10000, 1 },
+        },
+        { 1, 3, 5, 13, 3, 0, 2, 15, 0, 0, 0, 0, 15, 0, 0 },
+        { 1, 1, 1, 1, 1, 0, 0, 15, 0, 0, 2, 0, 15, 0, 0 },
+    },
+    { "late_source",
+        { // policy 0, the stage not enabled
+            { 1, 1, 1, 1500, 0, 0, 0, 0, 0, 0, 0, 10000, 1 },
+            { 2, 1, 0, 101500, 100000, 100000, 100000, 1, 1, 0, 0, 10000, 1 },
+            { 3, 1, 0, 201500, 200000, 200000, 200000, 1, 1, 0, 0, 10000, 1 },
+            { 4, 1, 0, 301500, 300000, 300000, 300000, 1, 1, 0, 0, 10000, 1 },
+            { 5, 1, 0, 401500, 400000, 400000, 400000, 1, 1, 0, 0, 10000, 1 },
+            { 6, 1, 0, 501500, 515000, 0, 515000, 0, 0, 0, 0, 10000, 1 },
+            { 7, 1, 0, 601500, 600000, 600000, 600000, 1, 1, 0, 0, 10000, 1 },
+            { 8, 1, 0, 701500, 700000, 700000, 700000, 1, 1, 0, 0, 10000, 1 },
+            { 9, 2, 4, 881500, 880000, 0, 880000, 0, 0, 0, 0, 10000, 1 },
+            { 10, 2, 0, 981500, 980000, 980000, 980000, 1, 1, 0, 0, 10000, 1 },
+            { 11, 2, 0, 1081500, 1080000, 1080000, 1080000, 1, 1, 0, 0, 10000, 1 },
+            { 12, 2, 0, 1181500, 1180000, 1180000, 1180000, 1, 1, 0, 0, 10000, 1 },
+            { 13, 2, 0, 1281500, 1280000, 1280000, 1280000, 1, 1, 0, 0, 10000, 1 },
+            { 14, 2, 0, 1381500, 1380000, 1380000, 1380000, 1, 1, 0, 0, 10000, 1 },
+        },
+        { // policy 1, the stage enabled (same rows)
+        },
+        { 1, 2, 4, 9, 2, 0, 0, 13, 1, 0, 0, 0, 13, 0, 0 },
+        { 1, 2, 4, 9, 2, 0, 0, 13, 1, 0, 0, 0, 13, 0, 0 },
+    },
+    { "warm_source_slack",
+        { // policy 0, the stage not enabled
+            { 34, 1, 0, 3301500, 3300000, 3300000, 3300000, 1, 1, 0, 0, 10000, 1 },
+            { 35, 1, 0, 3401500, 3400000, 3400000, 3400000, 1, 1, 0, 0, 10000, 1 },
+            { 36, 1, 0, 3501500, 3500000, 3500000, 3500000, 1, 1, 0, 0, 10000, 1 },
+            { 37, 1, 0, 3601500, 3625200, 0, 3625200, 0, 0, 0, 0, 10000, 1 },
+            { 38, 1, 0, 3701500, 3700000, 3700000, 3700000, 1, 1, 0, 0, 10000, 1 },
+            { 39, 1, 0, 3801500, 3800000, 3800000, 3800000, 1, 1, 0, 0, 10000, 1 },
+            { 40, 1, 0, 3901500, 3900000, 3900000, 3900000, 1, 1, 0, 0, 10000, 1 },
+            { 41, 2, 4, 4027100, 4025600, 0, 4025600, 0, 0, 0, 0, 10000, 1 },
+            { 42, 2, 0, 4127100, 4125600, 4125600, 4125600, 1, 1, 0, 0, 10000, 1 },
+            { 43, 2, 0, 4227100, 4225600, 4225600, 4225600, 1, 1, 0, 0, 10000, 1 },
+            { 44, 2, 0, 4327100, 4325600, 4325600, 4325600, 1, 1, 0, 0, 10000, 1 },
+        },
+        { // policy 1, the stage enabled (same rows)
+        },
+        { 1, 2, 4, 41, 2, 0, 0, 43, 1, 0, 0, 0, 43, 130000, 0 },
+        { 1, 2, 4, 41, 2, 0, 0, 43, 1, 0, 0, 0, 43, 130000, 0 },
+    },
+    { "fg_divisor_steps",
+        { // policy 0, the stage not enabled
+            { 1, 1, 1, 1500, 0, 0, 0, 0, 0, 0, 0, 10000, 1 },
+            { 2, 1, 0, 101500, 100000, 100000, 100000, 1, 1, 0, 0, 10000, 1 },
+            { 3, 1, 0, 201500, 200000, 200000, 200000, 1, 1, 0, 0, 10000, 1 },
+            { 4, 1, 0, 301500, 300000, 300000, 300000, 1, 1, 0, 0, 10000, 1 },
+            { 5, 1, 0, 401500, 400000, 400000, 400000, 1, 1, 0, 0, 10000, 1 },
+            { 6, 2, 3, 601500, 600000, 600000, 600000, 1, 1, 0, 0, 20000, 2 },
+            { 7, 2, 0, 801500, 800000, 800000, 800000, 1, 1, 0, 0, 20000, 2 },
+            { 8, 2, 0, 1001500, 1000000, 1000000, 1000000, 1, 1, 0, 0, 20000, 2 },
+            { 9, 2, 0, 1201500, 1200000, 1200000, 1200000, 1, 1, 0, 0, 20000, 2 },
+            { 10, 2, 0, 1401500, 1400000, 1400000, 1400000, 1, 1, 0, 0, 20000, 2 },
+            { 11, 3, 3, 1701500, 1700000, 1700000, 1700000, 1, 1, 0, 0, 30000, 3 },
+            { 12, 3, 0, 2001500, 2000000, 2000000, 2000000, 1, 1, 0, 0, 30000, 3 },
+            { 13, 3, 0, 2301500, 2300000, 2300000, 2300000, 1, 1, 0, 0, 30000, 3 },
+            { 14, 3, 0, 2601500, 2600000, 2600000, 2600000, 1, 1, 0, 0, 30000, 3 },
+            { 15, 3, 0, 2901500, 2900000, 2900000, 2900000, 1, 1, 0, 0, 30000, 3 },
+        },
+        { // policy 1, the stage enabled (same rows)
+        },
+        { 1, 3, 3, 11, 3, 0, 0, 14, 0, 0, 0, 0, 14, 0, 0 },
+        { 1, 3, 3, 11, 3, 0, 0, 14, 0, 0, 0, 0, 14, 0, 0 },
+    },
+    { "fg_divisor_ramp",
+        { // policy 0, the stage not enabled
+            { 1, 1, 1, 1500, 0, 0, 0, 0, 0, 0, 0, 10000, 1 },
+            { 2, 1, 0, 101500, 100000, 100000, 100000, 1, 1, 0, 0, 10000, 1 },
+            { 3, 1, 0, 201500, 200000, 200000, 200000, 1, 1, 0, 0, 10000, 1 },
+            { 4, 1, 0, 301500, 300000, 300000, 300000, 1, 1, 0, 0, 10000, 1 },
+            { 5, 2, 3, 426500, 425000, 425000, 425000, 1, 1, 0, 0, 12500, 1.25 },
+            { 6, 2, 0, 576500, 575000, 575000, 575000, 1, 1, 0, 0, 15000, 1.5 },
+            { 7, 2, 0, 751500, 750000, 750000, 750000, 1, 1, 0, 0, 17500, 1.75 },
+            { 8, 2, 0, 951500, 950000, 950000, 950000, 1, 1, 0, 0, 20000, 2 },
+            { 9, 2, 0, 1151500, 1150000, 1150000, 1150000, 1, 1, 0, 0, 20000, 2 },
+            { 10, 2, 0, 1351500, 1350000, 1350000, 1350000, 1, 1, 0, 0, 20000, 2 },
+            { 11, 2, 0, 1551500, 1550000, 1550000, 1550000, 1, 1, 0, 0, 20000, 2 },
+            { 12, 2, 0, 1751500, 1750000, 1750000, 1750000, 1, 1, 0, 0, 20000, 2 },
+            { 13, 3, 3, 1926500, 1925000, 1925000, 1925000, 1, 1, 0, 0, 17500, 1.75 },
+            { 14, 3, 0, 2076500, 2075000, 2075000, 2075000, 1, 1, 0, 0, 15000, 1.5 },
+            { 15, 3, 0, 2201500, 2200000, 2200000, 2200000, 1, 1, 0, 0, 12500, 1.25 },
+            { 16, 3, 0, 2301500, 2300000, 2300000, 2300000, 1, 1, 0, 0, 10000, 1 },
+        },
+        { // policy 1, the stage enabled (same rows)
+        },
+        { 1, 3, 3, 13, 8, 0, 0, 15, 0, 6, 0, 0, 15, 0, 0 },
+        { 1, 3, 3, 13, 8, 0, 0, 15, 0, 6, 0, 0, 15, 0, 0 },
+    },
+    { "marker_to_present",
+        { // policy 0, the stage not enabled
+            { 1, 1, 1, 1001500, 1000000, 0, 1000000, 0, 0, 0, 0, 10000, 1 },
+            { 2, 1, 0, 1101500, 1100000, 1100000, 1100000, 1, 1, 0, 0, 10000, 1 },
+            { 3, 1, 0, 1201500, 1200000, 1200000, 1200000, 1, 1, 0, 0, 10000, 1 },
+            { 4, 1, 0, 1301500, 1300000, 1300000, 1300000, 1, 1, 0, 0, 10000, 1 },
+            { 5, 1, 0, 1401500, 1400000, 1400000, 1400000, 1, 1, 0, 0, 10000, 1 },
+            { 6, 1, 0, 1501500, 1500000, 1500000, 1500000, 1, 1, 0, 0, 10000, 1 },
+        },
+        { // policy 1, the stage enabled
+            { 1, 1, 1, 50000, 0, 0, 0, 0, 0, 0, 100000, 10000, 1 },
+            { 2, 1, 0, 150000, 100000, 100000, 100000, 1, 1, 0, 100000, 10000, 1 },
+            { 3, 1, 0, 250000, 200000, 200000, 200000, 1, 1, 0, 100000, 10000, 1 },
+            { 4, 1, 0, 350000, 300000, 300000, 300000, 1, 1, 0, 100000, 10000, 1 },
+            { 5, 1, 0, 450000, 400000, 400000, 400000, 1, 1, 0, 100000, 10000, 1 },
+            { 6, 1, 0, 550000, 500000, 500000, 500000, 1, 1, 0, 100000, 10000, 1 },
+            { 1, 1, 1, 1001500, 1000000, 0, 1000000, 0, 0, 0, 0, 10000, 1 },
+            { 2, 1, 0, 1101500, 1100000, 1100000, 1100000, 1, 1, 0, 0, 10000, 1 },
+            { 3, 1, 0, 1201500, 1200000, 1200000, 1200000, 1, 1, 0, 0, 10000, 1 },
+            { 4, 1, 0, 1301500, 1300000, 1300000, 1300000, 1, 1, 0, 0, 10000, 1 },
+            { 5, 1, 0, 1401500, 1400000, 1400000, 1400000, 1, 1, 0, 0, 10000, 1 },
+            { 6, 1, 0, 1501500, 1500000, 1500000, 1500000, 1, 1, 0, 0, 10000, 1 },
+        },
+        { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        { 1, 1, 1, 1, 1, 0, 0, 11, 0, 0, 0, 1, 5, 0, 0 },
+    },
+    { "present_to_marker",
+        { // policy 0, the stage not enabled
+            { 1, 1, 1, 1500, 0, 0, 0, 0, 0, 0, 0, 10000, 1 },
+            { 2, 1, 0, 101500, 100000, 100000, 100000, 1, 1, 0, 0, 10000, 1 },
+            { 3, 1, 0, 201500, 200000, 200000, 200000, 1, 1, 0, 0, 10000, 1 },
+            { 4, 1, 0, 301500, 300000, 300000, 300000, 1, 1, 0, 0, 10000, 1 },
+            { 5, 1, 0, 401500, 400000, 400000, 400000, 1, 1, 0, 0, 10000, 1 },
+            { 6, 1, 0, 501500, 500000, 500000, 500000, 1, 1, 0, 0, 10000, 1 },
+        },
+        { // policy 1, the stage enabled
+            { 1, 1, 1, 1500, 0, 0, 0, 0, 0, 0, 0, 10000, 1 },
+            { 2, 1, 0, 101500, 100000, 100000, 100000, 1, 1, 0, 0, 10000, 1 },
+            { 3, 1, 0, 201500, 200000, 200000, 200000, 1, 1, 0, 0, 10000, 1 },
+            { 4, 1, 0, 301500, 300000, 300000, 300000, 1, 1, 0, 0, 10000, 1 },
+            { 5, 1, 0, 401500, 400000, 400000, 400000, 1, 1, 0, 0, 10000, 1 },
+            { 6, 1, 0, 501500, 500000, 500000, 500000, 1, 1, 0, 0, 10000, 1 },
+            { 1, 1, 1, 591200, 541200, 0, 541200, 0, 0, 0, 100000, 10000, 1 },
+            { 2, 1, 0, 691200, 641200, 641200, 641200, 1, 1, 0, 100000, 10000, 1 },
+            { 3, 1, 0, 791200, 741200, 741200, 741200, 1, 1, 0, 100000, 10000, 1 },
+            { 4, 1, 0, 891200, 841200, 841200, 841200, 1, 1, 0, 100000, 10000, 1 },
+            { 5, 1, 0, 991200, 941200, 941200, 941200, 1, 1, 0, 100000, 10000, 1 },
+            { 6, 1, 0, 1091200, 1041200, 1041200, 1041200, 1, 1, 0, 100000, 10000, 1 },
+        },
+        { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        { 1, 1, 1, 1, 6, 0, 0, 11, 0, 0, 0, 1, 5, 0, 100000 },
+    },
+    { "marker_to_present_no_reset",
+        { // policy 0, the stage not enabled
+        },
+        { // policy 1, the stage enabled
+            { 1, 1, 1, 50000, 0, 0, 0, 0, 0, 0, 100000, 10000, 1 },
+            { 2, 1, 0, 150000, 100000, 100000, 100000, 1, 1, 0, 100000, 10000, 1 },
+            { 3, 1, 0, 250000, 200000, 200000, 200000, 1, 1, 0, 100000, 10000, 1 },
+            { 4, 1, 0, 350000, 300000, 300000, 300000, 1, 1, 0, 100000, 10000, 1 },
+            { 5, 1, 0, 450000, 400000, 400000, 400000, 1, 1, 0, 100000, 10000, 1 },
+            { 6, 1, 0, 550000, 500000, 500000, 500000, 1, 1, 0, 100000, 10000, 1 },
+            { 7, 1, 0, 650000, 648500, 648500, 648500, 1, 1, 0, 0, 10000, 1 },
+            { 8, 1, 0, 750000, 748500, 748500, 748500, 1, 1, 0, 0, 10000, 1 },
+            { 9, 1, 0, 850000, 848500, 848500, 848500, 1, 1, 0, 0, 10000, 1 },
+            { 10, 1, 0, 950000, 948500, 948500, 948500, 1, 1, 0, 0, 10000, 1 },
+            { 11, 1, 0, 1050000, 1048500, 1048500, 1048500, 1, 1, 0, 0, 10000, 1 },
+            { 12, 1, 0, 1150000, 1148500, 1148500, 1148500, 1, 1, 0, 0, 10000, 1 },
+        },
+        { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        { 1, 1, 1, 1, 6, 0, 0, 11, 0, 0, 0, 0, 10, 0, 0 },
+    },
+    { "present_to_marker_no_reset",
+        { // policy 0, the stage not enabled
+        },
+        { // policy 1, the stage enabled
+            { 1, 1, 1, 1500, 0, 0, 0, 0, 0, 0, 0, 10000, 1 },
+            { 2, 1, 0, 101500, 100000, 100000, 100000, 1, 1, 0, 0, 10000, 1 },
+            { 3, 1, 0, 201500, 200000, 200000, 200000, 1, 1, 0, 0, 10000, 1 },
+            { 4, 1, 0, 301500, 300000, 300000, 300000, 1, 1, 0, 0, 10000, 1 },
+            { 5, 1, 0, 401500, 400000, 400000, 400000, 1, 1, 0, 0, 10000, 1 },
+            { 6, 1, 0, 501500, 500000, 500000, 500000, 1, 1, 0, 0, 10000, 1 },
+            { 7, 1, 0, 591200, 541200, 0, 541200, 0, 0, 0, 100000, 10000, 1 },
+            { 8, 1, 0, 691200, 641200, 641200, 641200, 1, 1, 0, 100000, 10000, 1 },
+            { 9, 1, 0, 791200, 741200, 741200, 741200, 1, 1, 0, 100000, 10000, 1 },
+            { 10, 1, 0, 891200, 841200, 841200, 841200, 1, 1, 0, 100000, 10000, 1 },
+            { 11, 1, 0, 991200, 941200, 941200, 941200, 1, 1, 0, 100000, 10000, 1 },
+            { 12, 1, 0, 1091200, 1041200, 1041200, 1041200, 1, 1, 0, 100000, 10000, 1 },
+        },
+        { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+        { 1, 1, 1, 1, 7, 0, 0, 11, 0, 0, 0, 0, 10, 0, 100000 },
+    },
+    { "suspend_resume",
+        { // policy 0, the stage not enabled
+            { 1, 1, 1, 1500, 0, 0, 0, 0, 0, 0, 0, 10000, 1 },
+            { 2, 1, 0, 101500, 100000, 100000, 100000, 1, 1, 0, 0, 10000, 1 },
+            { 3, 1, 0, 201500, 200000, 200000, 200000, 1, 1, 0, 0, 10000, 1 },
+            { 4, 1, 0, 301500, 300000, 300000, 300000, 1, 1, 0, 0, 10000, 1 },
+            { 5, 1, 0, 401500, 400000, 400000, 400000, 1, 1, 0, 0, 10000, 1 },
+            { 6, 1, 0, 501500, 500000, 500000, 500000, 1, 1, 0, 0, 10000, 1 },
+            { 7, 2, 2, 902700, 901200, 0, 901200, 0, 0, 0, 0, 10000, 1 },
+            { 8, 2, 0, 1002700, 1001200, 1001200, 1001200, 1, 1, 0, 0, 10000, 1 },
+            { 9, 2, 0, 1102700, 1101200, 1101200, 1101200, 1, 1, 0, 0, 10000, 1 },
+            { 10, 2, 0, 1202700, 1201200, 1201200, 1201200, 1, 1, 0, 0, 10000, 1 },
+            { 11, 2, 0, 1302700, 1301200, 1301200, 1301200, 1, 1, 0, 0, 10000, 1 },
+            { 12, 2, 0, 1402700, 1401200, 1401200, 1401200, 1, 1, 0, 0, 10000, 1 },
+        },
+        { // policy 1, the stage enabled (same rows)
+        },
+        { 1, 2, 2, 7, 2, 0, 0, 11, 0, 0, 0, 1, 11, 0, 0 },
+        { 1, 2, 2, 7, 2, 0, 0, 11, 0, 0, 0, 1, 11, 0, 0 },
+    },
+};
+
+const PresentExpectedCase* FindPresentExpected(const char* name)
+{
+    for (const PresentExpectedCase& expected : kPresentExpected) {
+        if (std::strcmp(expected.name, name) == 0) return &expected;
+    }
+    return nullptr;
+}
+
+void PrintPresentRows(const std::vector<PresentRow>& rows)
+{
+    for (const PresentRow& row : rows) {
+        std::printf("            { %llu, %u, %d, %lld, %lld, %lld, %lld, %d, %u, %d, %lld, %.17g, %.17g },\n",
+            static_cast<unsigned long long>(row.grid_index), row.epoch, row.started,
+            static_cast<long long>(row.target), static_cast<long long>(row.wake), static_cast<long long>(row.wait),
+            static_cast<long long>(row.release), row.slept, row.flags, row.late,
+            static_cast<long long>(row.floor_ticks), row.interval_us, row.fg_divisor);
+    }
+}
+
+void PrintPresentTail(const PresentTail& tail)
+{
+    std::printf("        { %d, %u, %d, %llu, %u, %d, %llu, %llu, %llu, %llu, %llu, %llu, %llu, %lld, %lld },\n",
+        tail.valid ? 1 : 0, tail.epoch, tail.epoch_reason, static_cast<unsigned long long>(tail.epoch_base),
+        tail.segments, tail.snapped, static_cast<unsigned long long>(tail.late_epochs),
+        static_cast<unsigned long long>(tail.observations), static_cast<unsigned long long>(tail.immediate),
+        static_cast<unsigned long long>(tail.rebases), static_cast<unsigned long long>(tail.gpu_paced_late),
+        static_cast<unsigned long long>(tail.ignored), static_cast<unsigned long long>(tail.samples),
+        static_cast<long long>(tail.median_x_ns), static_cast<long long>(tail.published_floor));
+}
+
+void PrintPresentCase(const char* name, const PresentResult (&result)[2])
+{
+    bool same_rows = result[0].rows.size() == result[1].rows.size();
+    for (size_t index = 0; same_rows && index < result[0].rows.size(); ++index) {
+        same_rows = SamePresentRow(result[0].rows[index], result[1].rows[index]);
+    }
+    std::printf("//TABLE\n    { \"%s\",\n        { // policy 0, the stage not enabled\n", name);
+    PrintPresentRows(result[0].rows);
+    std::printf("        },\n        { // policy 1, the stage enabled%s\n", same_rows ? " (same rows)" : "");
+    if (!same_rows) PrintPresentRows(result[1].rows);
+    std::printf("        },\n");
+    PrintPresentTail(result[0].tail);
+    PrintPresentTail(result[1].tail);
+    std::printf("    },\n//END\n");
+}
+
+// Runs the case under both policies and compares it with the frozen table (or prints it).
+std::vector<PresentResult> CheckPresentCase(const char* name, const std::vector<PresentStep>& steps,
+    const CadenceGridFixedReference& fixed = CadenceGridFixedReference{})
+{
+    PresentResult result[2];
+    for (int policy = 0; policy < 2; ++policy) {
+        PresentRig rig(policy == 1, fixed);
+        for (const PresentStep& step : steps) rig.Run(step);
+        result[policy] = rig.Finish();
+    }
+    if (g_print_present) {
+        PrintPresentCase(name, result);
+        return { result[0], result[1] };
+    }
+    const PresentExpectedCase* expected = FindPresentExpected(name);
+    CHECK(expected != nullptr);
+    if (expected == nullptr) return { result[0], result[1] };
+    for (int policy = 0; policy < 2; ++policy) {
+        const std::vector<PresentRow>& want = policy == 1 && !expected->on_rows.empty()
+            ? expected->on_rows : expected->off_rows;
+        const std::vector<PresentRow>& got = result[policy].rows;
+        CHECK(got.size() == want.size());
+        for (size_t index = 0; index < got.size() && index < want.size(); ++index) {
+            if (!SamePresentRow(got[index], want[index])) {
+                CHECK(false);
+                std::printf("  %s policy %d row %zu: grid %llu epoch %u started %d target %lld wake %lld wait %lld "
+                            "release %lld slept %d flags %u late %d floor %lld interval %.17g fg %.17g\n",
+                    name, policy, index, static_cast<unsigned long long>(got[index].grid_index), got[index].epoch,
+                    got[index].started, static_cast<long long>(got[index].target),
+                    static_cast<long long>(got[index].wake), static_cast<long long>(got[index].wait),
+                    static_cast<long long>(got[index].release), got[index].slept, got[index].flags, got[index].late,
+                    static_cast<long long>(got[index].floor_ticks), got[index].interval_us, got[index].fg_divisor);
+            }
+        }
+        const PresentTail& want_tail = policy == 1 ? expected->on_tail : expected->off_tail;
+        CHECK(SamePresentTail(result[policy].tail, want_tail));
+    }
+    return { result[0], result[1] };
+}
+
+// ── Scheduler inputs of the present route ──
+
+double VrrIntervalUs(int fps, double fg_divisor) { return (1000000.0 / static_cast<double>(fps)) * fg_divisor; }
+
+PresentStep VrrStep(double interval_us, double cpu_us = 4'000.0, double fg = 1.0, double identity_us = 0.0)
+{
+    PresentStep step;
+    step.interval_us = interval_us;
+    step.fg_divisor = fg;
+    step.identity_us = identity_us > 0.0 ? identity_us : interval_us;
+    step.cpu_us = cpu_us;
+    return step;
+}
+
+CadenceGridFixedReference Fixed60Hz()
+{
+    CadenceGridFixedReference reference{};
+    reference.refresh_ticks = static_cast<double>(kFrequency) / 60.0;
+    reference.edge_qpc = kStart - 833'335;
+    return reference;
+}
+
+// ── Tests ──
+
+// Case 1, cap > 0: a VRR cap of 100 FPS, then a cap change to 60 (period_change, the scheduler's resets).
+void TestPresentRouteCapVrr()
+{
+    std::printf("Test: present route, VRR cap 100 then 60 FPS (both stage policies)\n");
+    std::vector<PresentStep> steps;
+    for (int index = 0; index < 14; ++index) {
+        const double interval = index < 8 ? kIntervalUs : 1'000'000.0 / 60.0;
+        PresentStep step = VrrStep(interval);
+        step.cap_change = index == 8;
+        steps.push_back(step);
+    }
+    const std::vector<PresentResult> result = CheckPresentCase("cap_vrr", steps);
+    CHECK(result[0].rows.size() == 14 && result[1].rows.size() == 14);
+}
+
+// Case 1, cap 0: the 64-bit owner paces the VRR cap term (scheduler.cpp OnMarker, the VRR branch:
+// vrr_target_fps = int(UnifiedPacer_VrrCapFps(ceiling Hz)), interval = 1e6 / fps). What the stage is handed is a positive
+// interval; the cap-0 uncapped pass-through of the 32-bit policy is the scheduler's own. A ceiling change moves the
+// period identity (period_change) without a cap change.
+void TestPresentRouteCapZeroVrrTerm()
+{
+    std::printf("Test: present route, cap 0 as the VRR cap term (144 then 240 Hz ceiling)\n");
+    const int fps144 = static_cast<int>(UnifiedPacer_VrrCapFps(144.0));
+    const int fps240 = static_cast<int>(UnifiedPacer_VrrCapFps(240.0));
+    CHECK(fps144 == 138 && fps240 == 224);
+    std::vector<PresentStep> steps;
+    for (int index = 0; index < 12; ++index) {
+        steps.push_back(VrrStep(VrrIntervalUs(index < 8 ? fps144 : fps240, 1.0), 3'000.0));
+    }
+    CheckPresentCase("cap_zero_vrr_term", steps);
+}
+
+// LFC (32-bit policy only in production: the 64-bit owner takes no LFC multiple): the interval the scheduler hands
+// the stage switches between the cap and a whole multiple of the VRR ceiling interval, the period identity with it.
+void TestPresentRouteLfcMultiple()
+{
+    std::printf("Test: present route, LFC multiple of the ceiling interval and back\n");
+    const double ceiling_us = 1'000'000.0 / 144.0;
+    const double cap_us = VrrIntervalUs(30, 1.0);
+    const double lfc_us = ceiling_us * std::ceil(cap_us / ceiling_us);
+    std::vector<PresentStep> steps;
+    for (int index = 0; index < 12; ++index) steps.push_back(VrrStep(index < 6 ? lfc_us : cap_us, 6'000.0));
+    CheckPresentCase("lfc_multiple", steps);
+}
+
+// Case 2, fixed refresh with a vblank reference: a cap of 30 FPS on 60 Hz (two refreshes, snapped), and 50 FPS
+// (20 ms, not within 2% of a whole refresh: unsnapped).
+void TestPresentRouteFixedRefresh()
+{
+    std::printf("Test: present route, fixed refresh snapped (30 FPS) and unsnapped (50 FPS) on 60 Hz\n");
+    const auto fixed_step = [](double interval_us) {
+        PresentStep step = VrrStep(interval_us, 6'000.0);
+        step.mode = PacingTimingMode::Fixed;
+        step.extra_flags = PACING_SOURCE_FIXED_REFRESH;
+        return step;
+    };
+    std::vector<PresentStep> snapped;
+    for (int index = 0; index < 12; ++index) snapped.push_back(fixed_step(1'000'000.0 / 30.0));
+    const std::vector<PresentResult> snapped_result = CheckPresentCase("fixed_snapped", snapped, Fixed60Hz());
+    CHECK(snapped_result[0].tail.snapped == 1 || g_print_present);
+    std::vector<PresentStep> unsnapped;
+    for (int index = 0; index < 12; ++index) unsnapped.push_back(fixed_step(1'000'000.0 / 50.0));
+    CheckPresentCase("fixed_unsnapped", unsnapped, Fixed60Hz());
+    // A cap change on a fixed refresh (50 -> 30 FPS): the snap starts with a PeriodChange epoch.
+    std::vector<PresentStep> change;
+    for (int index = 0; index < 12; ++index) {
+        PresentStep step = fixed_step(index < 6 ? 1'000'000.0 / 50.0 : 1'000'000.0 / 30.0);
+        step.cap_change = index == 6;
+        change.push_back(step);
+    }
+    CheckPresentCase("fixed_cap_change", change, Fixed60Hz());
+}
+
+// Case 3, idle caps (background 30 FPS): mode Idle, L = 0 of the present placement's seed, output evidence ignored
+// (late outputs start no epoch in either policy), then the foreground VRR cap returns (a ModeChange epoch).
+void TestPresentRouteIdleCap()
+{
+    std::printf("Test: present route, idle cap ignores output evidence; back to the VRR cap\n");
+    std::vector<PresentStep> steps;
+    for (int index = 0; index < 14; ++index) {
+        PresentStep step = index < 10 ? VrrStep(1'000'000.0 / 30.0, 5'000.0) : VrrStep(kIntervalUs);
+        if (index < 10) {
+            step.mode = PacingTimingMode::Idle;
+            step.extra_flags = PACING_SOURCE_BACKGROUND;
+        }
+        if (index == 3 || index == 6) step.output_late_us = 20'000.0;
+        steps.push_back(step);
+    }
+    const std::vector<PresentResult> result = CheckPresentCase("idle_cap", steps);
+    CHECK(result[0].tail.late_epochs == 0 && result[1].tail.late_epochs == 0);
+}
+
+// Case 4, a late output: an OutputLate event drained before the next plan restarts the epoch in policy 0 (T_n+1 =
+// o + I) and is suppressed in policy 1 (outputs judged GPU-paced); an output inside the tolerance changes nothing.
+void TestPresentRouteLateOutput()
+{
+    std::printf("Test: present route, a late output restarts the epoch (stage off) or is suppressed (stage on)\n");
+    std::vector<PresentStep> steps;
+    for (int index = 0; index < 16; ++index) {
+        PresentStep step = VrrStep(kIntervalUs);
+        if (index == 5) step.output_late_us = 8'000.0;
+        if (index == 9) step.output_late_us = 1'800.0;
+        if (index == 12) step.output_late_us = 6'000.0;
+        steps.push_back(step);
+    }
+    const std::vector<PresentResult> result = CheckPresentCase("late_output", steps);
+    CHECK(result[0].tail.late_epochs == 2 && result[1].tail.late_epochs == 0);
+}
+
+// Case 4, a late source: the game arrives after S_n by the late tolerance plus the source slack (SourceLate, in
+// both policies), or within it (released immediately on the same grid).
+void TestPresentRouteLateSource()
+{
+    std::printf("Test: present route, a late source restarts the cadence (SourceLate) or is released at once\n");
+    std::vector<PresentStep> steps;
+    for (int index = 0; index < 14; ++index) {
+        PresentStep step = VrrStep(kIntervalUs);
+        if (index == 5) step.late_source_us = 1'500.0;
+        if (index == 8) step.late_source_us = 8'000.0;
+        steps.push_back(step);
+    }
+    CheckPresentCase("late_source", steps);
+}
+
+// Case 5, a frame generation divisor change as the scheduler hands it over: 1 -> 2 -> 3 as steps (interval and
+// period identity both scale by the raw divisor, period_change and the cap/FG resets at each).
+void TestPresentRouteFgDivisorSteps()
+{
+    std::printf("Test: present route, FG divisor 1 -> 2 -> 3 (steps)\n");
+    std::vector<PresentStep> steps;
+    for (int index = 0; index < 15; ++index) {
+        const double divisor = index < 5 ? 1.0 : index < 10 ? 2.0 : 3.0;
+        PresentStep step = VrrStep(kIntervalUs * divisor, 4'000.0, divisor);
+        step.cap_change = index == 5 || index == 10;
+        steps.push_back(step);
+    }
+    CheckPresentCase("fg_divisor_steps", steps);
+}
+
+// Case 5, the ramped divisor: 1 -> 2 moves the grid interval over four frames (silent rebases; only the first has
+// period_change, the identity uses the raw divisor), then 2 -> 1 the same way down.
+void TestPresentRouteFgDivisorRamp()
+{
+    std::printf("Test: present route, FG divisor ramps 1 -> 2 -> 1\n");
+    std::vector<PresentStep> steps;
+    const double divisors[16] = { 1.0, 1.0, 1.0, 1.0, 1.25, 1.5, 1.75, 2.0, 2.0, 2.0, 2.0, 2.0, 1.75, 1.5, 1.25, 1.0 };
+    for (int index = 0; index < 16; ++index) {
+        const double raw = index >= 4 && index < 12 ? 2.0 : 1.0;
+        PresentStep step = VrrStep(kIntervalUs * divisors[index], 4'000.0, divisors[index], kIntervalUs * raw);
+        step.cap_change = index == 4 || index == 12;
+        steps.push_back(step);
+    }
+    CheckPresentCase("fg_divisor_ramp", steps);
+}
+
+// Case 6, marker route -> present route: planned marker frames (the unified branch under policy 1, the generic
+// marker body under policy 0), then present frames. The route's domain differs, so ApplyLifecycle begins a new
+// controller generation and resets the stage: the first present frame starts a Lifecycle epoch. The policy-0 marker
+// rows belong to the generic marker body and are not pinned.
+void TestPresentRouteAfterMarkerRoute()
+{
+    std::printf("Test: marker route -> present route, with the lifecycle reset\n");
+    std::vector<PresentStep> steps;
+    for (int index = 0; index < 12; ++index) {
+        PresentStep step = VrrStep(kIntervalUs);
+        if (index == 6) step.arrival_us = 100'000.0; // the first present frame does not depend on the marker frames' release
+        if (index < 6) {
+            step.route = PresentRoute::Marker;
+            step.pin_off = false;
+        }
+        steps.push_back(step);
+    }
+    CheckPresentCase("marker_to_present", steps);
+}
+
+// Case 6, present route -> marker route (the first marker frame after the reset starts a Lifecycle epoch under
+// the unified branch, policy 1; policy 0 has no marker route in a shipped configuration: not pinned).
+void TestMarkerRouteAfterPresentRoute()
+{
+    std::printf("Test: present route -> marker route, with the lifecycle reset\n");
+    std::vector<PresentStep> steps;
+    for (int index = 0; index < 12; ++index) {
+        PresentStep step = VrrStep(kIntervalUs);
+        if (index >= 6) {
+            step.route = PresentRoute::Marker;
+            step.pin_off = false;
+        }
+        steps.push_back(step);
+    }
+    CheckPresentCase("present_to_marker", steps);
+}
+
+// Case 6 on one stage object without a lifecycle reset (the stage's own handling of a route change inside one
+// controller generation): the display floor of the unified branch's segment is cleared by the first present
+// frame under policy 1, and the grid continues from the marker route's plan.
+void TestPresentRouteAfterMarkerRouteWithoutReset()
+{
+    std::printf("Test: marker route -> present route on one lifecycle (display floor cleared, grid continues)\n");
+    std::vector<PresentStep> steps;
+    for (int index = 0; index < 12; ++index) {
+        PresentStep step = VrrStep(kIntervalUs);
+        step.observe_lifecycle = false;
+        step.pin_off = false; // policy 0 has no marker route: its frames after a marker frame are not a shipped path
+        if (index < 6) {
+            step.route = PresentRoute::Marker;
+            step.pin_off = false;
+        }
+        steps.push_back(step);
+    }
+    const std::vector<PresentResult> result = CheckPresentCase("marker_to_present_no_reset", steps);
+    if (!g_print_present) {
+        CHECK(result[1].rows.size() == 12 && result[1].rows[5].floor_ticks > 0);
+        CHECK(result[1].rows[6].floor_ticks == 0 && result[1].tail.published_floor == 0);
+    }
+}
+
+// Case 6, the other direction on one lifecycle: present frames, then the unified branch plans on the grid the
+// present route left (PlanAt on an existing grid).
+void TestMarkerRouteAfterPresentRouteWithoutReset()
+{
+    std::printf("Test: present route -> marker route on one lifecycle\n");
+    std::vector<PresentStep> steps;
+    for (int index = 0; index < 12; ++index) {
+        PresentStep step = VrrStep(kIntervalUs);
+        step.observe_lifecycle = false;
+        step.pin_off = false;
+        if (index >= 6) {
+            step.route = PresentRoute::Marker;
+            step.pin_off = false;
+        }
+        steps.push_back(step);
+    }
+    CheckPresentCase("present_to_marker_no_reset", steps);
+}
+
+// Case 4, a late source against a warm window: after LEAD_WARM_SAMPLES samples (X = 130 µs as the lead measures it
+// for a Present 120 µs after the release) the source slack (L - median X = 20 µs) widens the late tolerance (2.5 ms): a
+// source 2.52 ms after S is released at once, 2.56 ms
+// after S restarts the cadence. The lead's median X and the sample count are in the tail.
+void TestPresentRouteWarmSourceSlack()
+{
+    std::printf("Test: present route, the warm source slack widens the late tolerance\n");
+    std::vector<PresentStep> steps;
+    for (int index = 0; index < 44; ++index) {
+        PresentStep step = VrrStep(kIntervalUs);
+        step.row = index >= 33;
+        if (index == 36) step.late_source_us = 2'520.0;
+        if (index == 40) step.late_source_us = 2'560.0;
+        steps.push_back(step);
+    }
+    const std::vector<PresentResult> result = CheckPresentCase("warm_source_slack", steps);
+    if (!g_print_present) {
+        CHECK(result[0].tail.median_x_ns == 130'000 && result[1].tail.median_x_ns == 130'000);
+        CHECK(result[0].tail.immediate == 1 && result[1].tail.immediate == 1);
+    }
+}
+
+// Pass-through in between (RunPassthrough -> Suspend): the next present plan starts a ModeChange epoch, the grid's
+// publication is invalid meanwhile.
+void TestPresentRouteSuspendResume()
+{
+    std::printf("Test: present route, pass-through suspends the grid; the next plan starts ModeChange\n");
+    std::vector<PresentStep> steps;
+    for (int index = 0; index < 12; ++index) {
+        PresentStep step = VrrStep(kIntervalUs);
+        step.suspend_before = index == 6;
+        step.cpu_us = index == 6 ? 40'000.0 : 4'000.0;
+        steps.push_back(step);
+    }
+    CheckPresentCase("suspend_resume", steps);
+}
+
+} // namespace
+
+int main(int argc, char** argv)
+{
+    for (int index = 1; index < argc; ++index) {
+        if (std::strcmp(argv[index], "--print-present") == 0) g_print_present = true;
+    }
     std::printf("=== Source stage tests ===\n");
     TestPlanPublishedBeforeWaitAndLeadFed();
     TestFillSourceRecord();
@@ -3599,32 +3568,20 @@ int main()
     TestLifecycleTracker();
     TestIdlePlanHasZeroLead();
     TestSuspendThenModeChange();
-    TestStallInjectorUnit();
-    TestStallInjectorInStage();
     TestDuplicateKeyNotRepublished();
     TestWaitClamp();
     TestStageEventDrainObservesOutput();
     TestLockstepOutputJudgedWithoutGatedHold();
-    TestGovernorStepPassThrough();
+    TestIntervalChangeWithoutPeriodChangeRebasesSilently();
     TestLeadBudgetLimited();
     TestResumeHistoryThroughStage();
-    TestDemotedGpuQueueWaitLead();
-    TestDemotedToHeldTransitions();
-    TestDemotedGpuQueueWaitLeadIsGuarded();
-    TestDemotedFgInputWaitAndMarkerHoldKeepTheirLead();
-    TestNotHeldBlockPlansLikeAHeldBlock();
-    TestPauseToResumeCarriesTheLead();
-    TestDemotedFramesAgeAndRefreshTheWorkWindow();
-    TestDrainedOutputLateCarriesItsOwnFrame();
-    TestDrainedOutputLateOverflowIsCounted();
+    TestGpuQueueWaitLeadIsGuarded();
+    TestOutputLateEpochsAreCountedPerFrame();
+    TestManyOutputLateEpochsInOneDrainAreCounted();
     TestVBlankPhaseTrackerFeedsFixedGrid();
-    TestEarliestReleaseLimitsWait();
-    TestGpuPacedCadence();
-    TestDriverReleasedFrameIsGpuPaced();
-    TestDriverReleasedWithoutKnownEarliestTarget();
-    TestDriverSleepKeyOffChangesNothingButTheStamps();
-    TestDriverReleaseNeedsAMatchingSleep();
-    TestPreciseReleaseTargetIsCommitted();
+    TestDriverSleepStampsOnlyFillTheRecord();
+    TestDriverLimiterPlacementPlansWithoutALead();
+    TestOutputLateRestartsCountForTheFloor();
     TestUnifiedBranch();
     TestUnifiedPlanningDecision();
     TestUnifiedMarkerOnlyFrames();
@@ -3641,12 +3598,22 @@ int main()
     TestUnifiedHoldSharePlumbed();
     TestUnifiedQueueLawPlumbed();
     TestUnifiedQueueLawPacedFrames();
-    TestDriverLimiterHoldPlansWithoutAWait();
-    TestGpuPacedRing();
-    TestGpuPacedRhythm();
-    TestReleaseFloorAtCapRelease();
-    TestCadenceRestartsCountForTheFloor();
     TestResetClearsPlans();
+    TestPresentRouteCapVrr();
+    TestPresentRouteCapZeroVrrTerm();
+    TestPresentRouteLfcMultiple();
+    TestPresentRouteFixedRefresh();
+    TestPresentRouteIdleCap();
+    TestPresentRouteLateOutput();
+    TestPresentRouteLateSource();
+    TestPresentRouteWarmSourceSlack();
+    TestPresentRouteFgDivisorSteps();
+    TestPresentRouteFgDivisorRamp();
+    TestPresentRouteAfterMarkerRoute();
+    TestMarkerRouteAfterPresentRoute();
+    TestPresentRouteAfterMarkerRouteWithoutReset();
+    TestMarkerRouteAfterPresentRouteWithoutReset();
+    TestPresentRouteSuspendResume();
     std::printf("=== %d checks, %d failures ===\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }

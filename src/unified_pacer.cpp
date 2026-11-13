@@ -138,16 +138,8 @@ UnifiedSleepModeTuple UnifiedPacer_SleepModeDesired(const UnifiedSleepModeInputs
     }
     if (inputs.limiter_interval_us != 0) {
         tuple.owner = UnifiedSleepOwner::Limiter;
-        tuple.low_latency_off = inputs.driver_low_latency_off;
+        tuple.low_latency_off = false;
         tuple.interval_us = inputs.limiter_interval_us;
-        return tuple;
-    }
-    const bool override_wanted = inputs.bypass ? inputs.bypass_low_latency_off
-                                               : inputs.driver_low_latency_off;
-    if (override_wanted) {
-        tuple.owner = UnifiedSleepOwner::LowLatencyOff;
-        tuple.low_latency_off = true;
-        tuple.interval_us = inputs.game_interval_us;
         return tuple;
     }
     tuple.owner = UnifiedSleepOwner::Game;

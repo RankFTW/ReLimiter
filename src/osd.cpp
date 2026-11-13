@@ -24,8 +24,6 @@
 #include "reflex_inject.h"
 #include "presentation_gate.h"
 #include "flip_model.h"
-#include "period_governor.h"
-#include "rung_feasibility.h"
 #include "hw_monitor.h"
 #include "feedback.h"
 #include "ngx_hooks.h"
@@ -190,20 +188,8 @@ static void DrawPacingPipelineStatus() {
         PacingFallbackReason_Text(pipeline.reason));
     SchedulerPacingStatus status;
     const bool has_status = Scheduler_ReadPacingStatus(&status);
-    // Overload guard: the hold stepped aside.
-    if (has_status && status.hold_overloaded)
-        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Hold off: overload (needs %.0f s without restarts)",
-            MISS_WINDOW_S);
     // Source placement.
-    if (pipeline.placement == PacingSourcePlacement::PreSleep && has_status) {
-        if (status.pre_sleep_samples > 0)
-            ImGui::TextDisabled("Placement: pre-Sleep | margin %.2f ms | residual p50 %.2f / p99 %.2f ms",
-                status.pre_sleep_margin_us / 1000.0, status.pre_sleep_residual_p50_us / 1000.0,
-                status.pre_sleep_residual_p99_us / 1000.0);
-        else
-            ImGui::TextDisabled("Placement: pre-Sleep | margin %.2f ms (measuring)",
-                status.pre_sleep_margin_us / 1000.0);
-    } else if (pipeline.placement == PacingSourcePlacement::DriverLimiter) {
+    if (pipeline.placement == PacingSourcePlacement::DriverLimiter) {
         if (has_status && status.driver_limiter_interval_us > 0)
             ImGui::TextDisabled("Placement: Reflex driver limiter (%.2f ms)",
                 status.driver_limiter_interval_us / 1000.0);
@@ -212,18 +198,6 @@ static void DrawPacingPipelineStatus() {
     } else {
         ImGui::TextDisabled("Placement: %s", PacingSourcePlacement_Text(pipeline.placement));
     }
-    // Render handoff limit: frames not held with the Reflex Sleep bypassed.
-    if (has_status && status.render_handoff == 1 && status.render_handoff_gpu_floor)
-        ImGui::TextDisabled("Render handoff limit: +%.2f ms after the render thread takes the previous frame, "
-            "render thread no earlier than %.2f ms before the GPU finishes it | %u frames delayed | %u stalls",
-            status.render_handoff_offset_us / 1000.0, status.render_handoff_gpu_lead_us / 1000.0,
-            status.render_handoff_limited, status.render_handoff_stalls);
-    else if (has_status && status.render_handoff == 1)
-        ImGui::TextDisabled("Render handoff limit: +%.2f ms after the render thread takes the previous frame | %u frames delayed | %u stalls",
-            status.render_handoff_offset_us / 1000.0, status.render_handoff_limited, status.render_handoff_stalls);
-    else if (has_status && status.render_handoff == 2)
-        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
-            "Render handoff limit: off (the render thread may wait for the next release; waiting for evidence)");
     if (has_status && status.valid) {
         ImGui::TextDisabled("Lead: %.2f ms (%s, %u samples%s) | Grid epoch: %u",
             status.lead_us / 1000.0, status.lead_warm ? "warm" : "warming",
@@ -281,14 +255,7 @@ static void DrawPacingPipelineStatus() {
         "ready. The headroom is 1 ms. Without Reflex GPU times, 'Release margin' does the same against the "
         "next frame's Present call instead (2.5 ms). 'guarded' is the share of leads the limit lowered, "
         "'late' the waited GPU resumes more than 1 ms after the release among those measured; nothing acts "
-        "on them. 'Hold off' "
-        "means ReLimiter stopped holding frames on its own (reason 'infeasible'): under overload, when more "
-        "than 10% of frames restarted the cadence within 2 s where ReLimiter's holds or the render handoff "
-        "limit could act; holds resume after 2 s without such restarts. "
-        "Placement pre-Sleep means most of the source wait happens before "
-        "the driver's Reflex Sleep "
-        "and the game is released exactly at SIMULATION_START; the margin covers the wait's late wake-up, the "
-        "driver Sleep and the game's work up to the marker.");
+        "on them.");
 }
 
 // Plain-language pacing state for the main view; the technical lines are in
@@ -306,11 +273,12 @@ static void DrawPacingSummaryLine(const PacingPipelineSnapshot& pipeline, bool h
         return;
     }
     if (test_mode == PacingTestMode::DriverLimiter && pipeline.reason != PacingFallbackReason::DriverLimiterUnavailable) {
-        ImGui::TextColored(gray, "Test mode driver_limiter: the NVIDIA limiter holds the cap (ReLimiter holds nothing)");
-        return;
-    }
-    if (has_status && status.hold_overloaded) {
-        ImGui::TextColored(amber, "Paused: the game can't reach the cap right now (resumes on its own)");
+        // The limiter holds the cap only while the resolved placement is the driver limiter; every other state of the
+        // mode is a pass-through that claims no cap.
+        if (pipeline.placement == PacingSourcePlacement::DriverLimiter)
+            ImGui::TextColored(gray, "Test mode driver_limiter: the NVIDIA limiter holds the cap (ReLimiter holds nothing)");
+        else
+            ImGui::TextColored(gray, "Test mode driver_limiter: not applied right now (the game runs as it is)");
         return;
     }
     switch (pipeline.reason) {

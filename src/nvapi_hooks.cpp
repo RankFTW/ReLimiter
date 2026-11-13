@@ -7,7 +7,6 @@
 #include "marker_cycles.h"
 #include "scheduler.h"
 #include "pacing_sleep.h"
-#include "render_handoff.h"
 #include "correlator.h"
 #include "config.h"
 #include "health.h"
@@ -72,13 +71,13 @@ static NV_SET_SLEEP_MODE_PARAMS s_game_original_params = {};
 static NvAPIFeedbackDevice s_game_params_identity = {};
 static bool s_game_params_captured = false;
 static std::atomic_flag s_game_params_lock = ATOMIC_FLAG_INIT;
-// bypass_low_latency_off: true while ReLimiter has turned the driver's low
-// latency mode off through SetSleepMode (UpdateLowLatencyOverride). Cleared
-// whenever the game's parameters reach the driver again. The forward lock
-// serializes a transition (driver call and state change) with the forwarding
-// of the game's own SetSleepMode calls, so a game call can neither land
-// between the two nor undo the override; concurrent Sleep calls that find it
-// taken skip the transition and retry on their next Sleep.
+// s_low_latency_forced_off: true while the driver has the Unified tuple's low latency off
+// (set with the applied tuple, cleared whenever the game's parameters, or the limiter's
+// interval with the game's low latency, reach the driver); only the transition log reads it
+// (PreviousSleepMode). The forward lock serializes a transition (driver call and state
+// change) with the forwarding of the game's own SetSleepMode calls, so a game call can
+// neither land between the two nor read a state that does not match the driver; a
+// reconcile that finds it taken skips and retries on its next Sleep.
 static std::atomic<bool> s_low_latency_forced_off{ false };
 static SRWLOCK s_sleep_mode_forward_lock = SRWLOCK_INIT;
 
@@ -1130,44 +1129,11 @@ static DriverLimiterApply ApplyCapturedSleepMode(
     return result;
 }
 
-// Moves the driver's low latency mode with the Reflex Sleep: off while it is
-// bypassed with bypass_low_latency_off, off while it is forwarded with
-// driver_low_latency_off, the game's own otherwise. Called from Hook_Sleep on
-// the presenting device. The state changes only after a successful driver
-// call; a thread that loses the try-lock, a missing game parameter set and a
-// failed call all retry on a later Sleep (so a key switched at run time
-// re-applies the mode at the next Sleep). A state that already matches costs a
-// few atomic loads. The call carries the Reflex driver limiter's interval while
-// it is applied: the limiter must survive the change.
-static void UpdateLowLatencyOverride(bool bypass) noexcept {
-    const bool want = bypass ? kPacingBypassLowLatencyOff
-                             : kPacingDriverLowLatencyOff;
-    if (want == s_low_latency_forced_off.load(std::memory_order_acquire)) return;
-    if (!TryAcquireSRWLockExclusive(&s_sleep_mode_forward_lock)) return;
-    if (want != s_low_latency_forced_off.load(std::memory_order_acquire)) {
-        NV_SET_SLEEP_MODE_PARAMS game{};
-        uint32_t limiter_us = g_driver_limiter_interval_us.load(std::memory_order_relaxed);
-        if (ApplyCapturedSleepMode(limiter_us != 0 ? &limiter_us : nullptr, want, &game) ==
-            DriverLimiterApply::Applied) {
-            s_low_latency_forced_off.store(want, std::memory_order_release);
-            if (want)
-                LOG_INFO("NvAPI: driver low latency mode off while the Reflex Sleep is %s "
-                         "(game requested low_latency=%u boost=%u)", bypass ? "bypassed" : "forwarded",
-                    game.bLowLatencyMode ? 1u : 0u, game.bLowLatencyBoost ? 1u : 0u);
-            else
-                LOG_INFO("NvAPI: driver low latency mode back to the game's (low_latency=%u boost=%u)",
-                    game.bLowLatencyMode ? 1u : 0u, game.bLowLatencyBoost ? 1u : 0u);
-        }
-    }
-    ReleaseSRWLockExclusive(&s_sleep_mode_forward_lock);
-}
-
 // ── Unified pacer: the Sleep-mode tuple ──
 static const char* SleepOwnerText(UnifiedSleepOwner owner) noexcept {
     switch (owner) {
     case UnifiedSleepOwner::Unified: return "unified";
     case UnifiedSleepOwner::Limiter: return "limiter";
-    case UnifiedSleepOwner::LowLatencyOff: return "low_latency_off";
     default: return "game";
     }
 }
@@ -1182,23 +1148,12 @@ static bool SleepSourcePaced() noexcept {
         PacingPipeline_Read().placement == PacingSourcePlacement::Unified;
 }
 
-// The Sleep bypass state, for the callers without a Sleep in hand (OnMarker). The key-on
-// rows of the tuple ignore it, so it is not read then.
-static bool CurrentSleepBypass() noexcept {
-    if (PacingPipeline_Unified()) return false;
-    return NvAPI_ShouldBypassSleep(PacingPipeline_SleepBypass(),
-        g_user_target_fps.load(std::memory_order_relaxed), SleepSourcePaced());
-}
-
 // The desired tuple (UnifiedPacer_SleepModeDesired) for these game parameters, under this key.
 static UnifiedSleepModeTuple DesiredSleepMode(
-    bool key, bool bypass, uint64_t publication, uint32_t game_interval_us) noexcept {
+    bool key, uint64_t publication, uint32_t game_interval_us) noexcept {
     UnifiedSleepModeInputs inputs;
     inputs.key = key;
     inputs.dmfg = key && IsDmfgActive(); // only the key-on rows depend on it
-    inputs.bypass = bypass;
-    inputs.bypass_low_latency_off = kPacingBypassLowLatencyOff;
-    inputs.driver_low_latency_off = kPacingDriverLowLatencyOff;
     inputs.limiter_interval_us = g_driver_limiter_interval_us.load(std::memory_order_relaxed);
     inputs.game_interval_us = game_interval_us;
     inputs.publication = publication;
@@ -1227,7 +1182,7 @@ static void LogSleepModeTransition(const UnifiedSleepModeTuple& before,
 // The desired tuple for the game parameters captured now (nothing captured: publication 0),
 // under the key published now. One attempt at the captured parameters: false on contention
 // (the reconcile stays pending, the caller never spins).
-static bool DesiredForCapturedParams(bool bypass, UnifiedSleepModeTuple* desired, bool* key,
+static bool DesiredForCapturedParams(UnifiedSleepModeTuple* desired, bool* key,
     uint32_t* generation) noexcept {
     // The generation before the key: the publication advances it before it exposes the key.
     *generation = s_key_generation.load(std::memory_order_acquire);
@@ -1246,7 +1201,7 @@ static bool DesiredForCapturedParams(bool bypass, UnifiedSleepModeTuple* desired
     // it differs from the published one a transition is in flight and nothing is forwarded
     // for either side of it. The reconcile stays pending.
     if (((s_transition_state.load(std::memory_order_acquire) & kTransitionKey) != 0) != *key) return false;
-    *desired = DesiredSleepMode(*key, bypass, publication, game_interval_us);
+    *desired = DesiredSleepMode(*key, publication, game_interval_us);
     return true;
 }
 
@@ -1293,11 +1248,11 @@ static void ReconcileSleepModeLocked(const UnifiedSleepModeTuple& desired, bool 
 
 // Never blocks: a held forward lock or captured parameters held by another thread leave it
 // pending for the next call.
-static void ReconcileSleepMode(bool bypass) noexcept {
+static void ReconcileSleepMode() noexcept {
     UnifiedSleepModeTuple desired;
     bool key = false;
     uint32_t generation = 0;
-    if (!DesiredForCapturedParams(bypass, &desired, &key, &generation)) return;
+    if (!DesiredForCapturedParams(&desired, &key, &generation)) return;
     // Nothing to do (the usual case under the key): no lock.
     if (AppliedSleepModeMatches(desired, key, generation)) return;
     if (!TryAcquireSRWLockExclusive(&s_sleep_mode_forward_lock)) return;
@@ -1333,7 +1288,7 @@ bool NvAPI_SleepModeReconcilePending() noexcept {
 }
 
 void NvAPI_ReconcileSleepMode() noexcept {
-    ReconcileSleepMode(CurrentSleepBypass());
+    ReconcileSleepMode();
 }
 
 // Hook_SetSleepMode under the forward lock, key on or an epoch pending: the desired tuple
@@ -1344,7 +1299,7 @@ static NvAPI_Status ForwardDesiredSleepMode(IUnknown* device, NV_SET_SLEEP_MODE_
     const uint32_t generation = s_key_generation.load(std::memory_order_acquire);
     const bool key = PacingPipeline_Unified();
     const UnifiedSleepModeTuple desired = DesiredSleepMode(
-        key, CurrentSleepBypass(), identity.publication_sequence, snapshot.minimumIntervalUs);
+        key, identity.publication_sequence, snapshot.minimumIntervalUs);
     NvAPI_Status result = NVAPI_OK;
     // As in the reconcile: owed from the moment the tuple may reach the driver.
     if (key && desired.owner != UnifiedSleepOwner::Game)
@@ -1548,7 +1503,7 @@ static void UnifiedSleepSelfCheck(int64_t duration_ticks) noexcept {
     }
 }
 
-// ── Hook: SetSleepMode — capture game params, forward them (limiter interval and low latency override on a copy) ──
+// ── Hook: SetSleepMode — capture game params, forward them (the limiter's interval on a copy) ──
 static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_PARAMS* params) {
     void* const caller_address = _ReturnAddress();
     RuntimeCallbackGuard callback;
@@ -1628,36 +1583,21 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
         }
     }
 
-    // Forwarding is serialized with override transitions (above).
+    // Forwarding is serialized with the Sleep-mode transitions (above).
     AcquireSRWLockExclusive(&s_sleep_mode_forward_lock);
     NvAPI_Status result = NVAPI_OK;
     // While the Reflex driver limiter is applied, the game's own call
     // would clear it: forward a copy with ReLimiter's interval instead. The
     // game's parameters above stay captured for the restore.
     const uint32_t limiter_us = g_driver_limiter_interval_us.load(std::memory_order_relaxed);
-    const bool low_latency_off = s_low_latency_forced_off.load(std::memory_order_acquire);
     if (params_valid && params_device.identity.device && NvAPI_SleepModeReconcilePending()) {
         // Key unified_pacer or a pending epoch: the desired tuple, built from the
-        // game's new parameters, replaces the three branches below.
+        // game's new parameters, replaces the two branches below.
         result = ForwardDesiredSleepMode(pDev, params, params_snapshot, params_device.identity);
     } else if (limiter_us != 0 && params_valid && params_device.identity.device) {
         NV_SET_SLEEP_MODE_PARAMS limited = params_snapshot;
         limited.minimumIntervalUs = limiter_us;
-        // driver_low_latency_off: the limiter's copy carries the override too.
-        if (low_latency_off) {
-            limited.bLowLatencyMode = 0;
-            limited.bLowLatencyBoost = 0;
-        }
         result = SafeInvokeSetSleepMode(pDev, &limited);
-    } else if (params_valid && params_device.identity.device && low_latency_off) {
-        // The low latency override (bypass_low_latency_off or
-        // driver_low_latency_off) is applied to the driver: the game's own
-        // call, which may carry low latency on every frame, must not undo it.
-        // The captured game parameters stay the game's.
-        NV_SET_SLEEP_MODE_PARAMS forced = params_snapshot;
-        forced.bLowLatencyMode = 0;
-        forced.bLowLatencyBoost = 0;
-        result = SafeInvokeSetSleepMode(pDev, &forced);
     } else {
         // Forward game's params unmodified.
         result = SafeInvokeSetSleepMode(pDev, params);
@@ -1682,11 +1622,9 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
     if (IsNvSmoothMotionActive()) return NVAPI_OK;
 
     if (s_orig_sleep) {
-        // The bypass is decided once per call, before the pre-wait: the
-        // pre-Sleep margin is learned separately with and without the
-        // driver's Sleep after the hook.
+        // The bypass is decided once per call, before the start wait.
         // Key unified_pacer: this Sleep is the start of the frame. On the
-        // presenting device it replaces the pre-Sleep branch below, and the bypass is
+        // presenting device it runs the unified start wait, and the bypass is
         // not consulted: the driver's Sleep always runs. With the key off, one load and
         // a not-taken branch: the bypass first, then the presenting device, as before.
         bool bypass = false;
@@ -1703,67 +1641,17 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
                 g_user_target_fps.load(std::memory_order_relaxed), SleepSourcePaced());
             presenting_at_entry = IsPresentingFeedbackDevice(pDev);
         }
-        // Pre-Sleep placement: record the Sleep on the presenting
-        // device, then wait toward the next source target before the driver
-        // Sleep. The owner is held only to plan and to record the wait end,
-        // not during the waits. A busy owner skips the wait; the
-        // SIMULATION_START trim still paces the frame.
+        // Record the Sleep on the presenting device; with the key the unified start wait
+        // runs here, before the driver's Sleep.
         if (presenting_at_entry) {
             ObserveReflexSleep();
-            // The Sleep-mode tuple (key on, or an epoch pending), else
-            // bypass_low_latency_off: the driver's low latency mode follows
-            // the bypass, before the pre-Sleep wait.
-            if (NvAPI_SleepModeReconcilePending()) ReconcileSleepMode(bypass);
-            else UpdateLowLatencyOverride(bypass);
+            // The Sleep-mode tuple (key on, or an epoch pending).
+            if (NvAPI_SleepModeReconcilePending()) ReconcileSleepMode();
             LARGE_INTEGER sleep_entry{};
             QueryPerformanceCounter(&sleep_entry);
             Scheduler_RecordReflexSleep(sleep_entry.QuadPart);
             if (unified) {
                 UnifiedSleepStart(sleep_entry.QuadPart);
-            } else if (Scheduler_PreSleepPlacementActive()) {
-                // Render handoff limit: with
-                // the Sleep bypassed, a frame that is not held waits here,
-                // before the game reads input, until the render thread has
-                // taken the newest released frame.
-                int64_t handoff_qpc = 0;
-                int64_t plan_qpc = sleep_entry.QuadPart;
-                uint8_t handoff_domain = 0;
-                uint32_t handoff_epoch = 0;
-                uint64_t handoff_frame = 0;
-                if (bypass && Scheduler_RenderHandoffFrame(&handoff_domain, &handoff_epoch, &handoff_frame)) {
-                    const double interval_us = g_effective_interval_us.load(std::memory_order_relaxed);
-                    const RenderHandoffWait waited = RenderHandoff_WaitFor(handoff_domain, handoff_epoch,
-                        handoff_frame, us_to_qpc(RENDER_HANDOFF_STALL_INTERVALS * interval_us), &handoff_qpc);
-                    if (waited == RenderHandoffWait::Deadline) Scheduler_RenderHandoffStalled();
-                    if (waited != RenderHandoffWait::Ready) handoff_qpc = 0;
-                    LARGE_INTEGER handoff_end{};
-                    QueryPerformanceCounter(&handoff_end);
-                    plan_qpc = handoff_end.QuadPart;
-                }
-                int64_t pre_sleep_target = 0;
-                uint64_t pre_sleep_index = 0;
-                bool pre_sleep_precise = false;
-                bool planned = false;
-                {
-                    SchedulerOwnerGuard scheduler_owner;
-                    planned = scheduler_owner && Scheduler_PlanReflexSleep(sleep_entry.QuadPart, plan_qpc,
-                        !bypass, handoff_qpc, &pre_sleep_target, &pre_sleep_index, &pre_sleep_precise);
-                }
-                if (planned) {
-                    // pre_sleep_precise: the wait ends at the target with the
-                    // hardware spin, inside this call, before the driver's Sleep.
-                    PreSleepWaitUntil(pre_sleep_target, pre_sleep_precise);
-                    LARGE_INTEGER wait_end{};
-                    QueryPerformanceCounter(&wait_end);
-                    SchedulerOwnerGuard scheduler_owner;
-                    if (scheduler_owner) Scheduler_EndReflexSleep(pre_sleep_index, wait_end.QuadPart);
-                }
-            } else if (Scheduler_DriverLimiterHoldActive()) {
-                // driver_limiter_hold: no wait of ReLimiter's own, the driver's
-                // Sleep releases the frame. Only the entry is recorded, the
-                // moment the game reached ReLimiter for the next grid index.
-                SchedulerOwnerGuard scheduler_owner;
-                if (scheduler_owner) Scheduler_RecordReflexSleepEntry(sleep_entry.QuadPart);
             }
         }
         if (bypass) {
@@ -1784,10 +1672,8 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
             return result;
         }
         // The driver's Sleep for the next grid index: its start and return go
-        // to the scheduler, which records them for the frame and, under the
-        // developer A/B gpu_paced_cadence, judges whether the driver released
-        // it (cadence_grid.h). A busy owner skips it, like the pre-wait's end.
-        // The call itself is unchanged.
+        // to the scheduler, which records them for the frame. A busy owner
+        // skips it. The call itself is unchanged.
         if (presenting_at_entry) {
             SchedulerOwnerGuard scheduler_owner;
             if (scheduler_owner) Scheduler_EndDriverSleep(t0.QuadPart, t1.QuadPart);
@@ -1872,15 +1758,6 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
     // Forward to driver FIRST — Reflex's JIT pacing depends on accurate
     // marker timing. Any work we do before forwarding shifts the driver's
     // perception of pipeline stage boundaries and degrades latency.
-    // marker_forward_order=after_wait instead forwards direct
-    // immediate markers on exit, after any source wait, as the PCL path does:
-    // the driver (and frame generation) then sees the paced release.
-    const bool forward_after_wait = !from_rtss &&
-        IsImmediateTimingMarker(marker_params.markerType) &&
-        kPacingMarkerForwardOrder == PacingMarkerForwardOrder::AfterWait &&
-        // The unified owner forwards the marker first whatever the order says; nothing waits in this hook for the
-        // unified path.
-        !PacingPipeline_Unified();
     NvAPI_Status result = NVAPI_OK;
     bool forwarded = false;
     // Every path returns through forward(): exactly one driver call per marker.
@@ -1891,7 +1768,7 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
         }
         return result;
     };
-    if (!forward_after_wait) forward();
+    forward();
     if (!from_rtss) ObserveLatencyMarkerThread(static_cast<uint32_t>(marker_params.markerType));
     // Never relabel a marker from A with B's epoch after the driver returns.
     // Failed admission still forwards exactly once with the original pointer.
@@ -2597,19 +2474,15 @@ void RestoreGameSleepMode() {
 }
 
 DriverLimiterApply NvAPI_ApplyDriverLimiter(uint32_t minimum_interval_us) noexcept {
-    // The limiter applies while the Sleep is forwarded: driver_low_latency_off
-    // decides whether the call carries the game's low latency settings or the
-    // override (bypass_low_latency_off needs the bypass, which excludes the limiter).
-    // The driver call and the flag that records it are one operation under the
-    // forward lock, like UpdateLowLatencyOverride: a concurrent SetSleepMode
-    // can neither land between the two nor read a flag that does not match
-    // the driver. Nonblocking admission: a held lock leaves the operation
-    // pending (Busy), repaired by the next OnMarker's call.
+    // The limiter applies while the Sleep is forwarded, with the game's own low latency
+    // settings. The driver call and the flag that records it are one operation under the
+    // forward lock: a concurrent SetSleepMode can neither land between the two nor read a
+    // flag that does not match the driver. Nonblocking admission: a held lock leaves the
+    // operation pending (Busy), repaired by the next OnMarker's call.
     if (!TryAcquireSRWLockExclusive(&s_sleep_mode_forward_lock)) return DriverLimiterApply::Busy;
-    const bool low_latency_off = kPacingDriverLowLatencyOff;
-    const DriverLimiterApply result = ApplyCapturedSleepMode(&minimum_interval_us, low_latency_off);
+    const DriverLimiterApply result = ApplyCapturedSleepMode(&minimum_interval_us, false);
     if (result == DriverLimiterApply::Applied) {
-        s_low_latency_forced_off.store(low_latency_off, std::memory_order_release);
+        s_low_latency_forced_off.store(false, std::memory_order_release);
         // Only while a reconcile is pending (the key on, or one to settle): the record
         // no longer describes the driver. Settled and key off: nothing is recorded.
         if (NvAPI_SleepModeReconcilePending()) InvalidateAppliedSleepMode();

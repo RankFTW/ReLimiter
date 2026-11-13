@@ -19,12 +19,11 @@ bool StreamlineHandoff_IsCurrent(uint64_t) noexcept { return generic_binding_cur
 #define CHECK(x) do{if(!(x)){std::fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x);std::abort();}}while(false)
 
 // ── Shared gate surface (both architectures) ──
-void PublishRung(PacingRung rung,PacingFallbackReason reason=PacingFallbackReason::None,
-    PacingRung auto_rung=PacingRung::Count) {
+void PublishRung(PacingRung rung,PacingFallbackReason reason=PacingFallbackReason::None) {
     PacingPipelineSnapshot snapshot;
     snapshot.mode=PacingTimingMode::Vrr;snapshot.route=PacingRoute::NvApiMarkers;
     snapshot.rung=rung;snapshot.reason=reason;
-    snapshot.auto_rung=auto_rung==PacingRung::Count?rung:auto_rung;
+    snapshot.auto_rung=rung;
     PacingPipeline_Publish(snapshot);
 }
 // The owner of pacing is derived (PacingPipeline_ClampConfig): `unified` is true on 64-bit while the test mode is Off.
@@ -75,14 +74,7 @@ void TestConfigWord() {
     CHECK(GpuPresent_RequiresReadiness());
     PublishRung(PacingRung::SourceOnly,PacingFallbackReason::Override);
     CHECK(!GpuPresent_RequiresReadiness());
-    // The output override (rung_override=gpu) is a constant now (kPacingRungOverride = Auto): its readiness case is gone.
     PublishRung(PacingRung::MarkerHold,PacingFallbackReason::NoGpuQueue);
-    CHECK(!GpuPresent_RequiresReadiness());
-    // R12b: a C3-demoted FG input wait keeps the route qualified through the
-    // dwell; a demoted GPU queue wait does not need readiness.
-    PublishRung(PacingRung::SourceOnly,PacingFallbackReason::Infeasible,PacingRung::FgInputWait);
-    CHECK(GpuPresent_RequiresReadiness());
-    PublishRung(PacingRung::MarkerHold,PacingFallbackReason::Infeasible,PacingRung::GpuQueueWait);
     CHECK(!GpuPresent_RequiresReadiness());
     // Support reads the generation-tagged capabilities.
     CHECK(!GpuPresent_IsSupported(7) && !GpuPresent_IsFgSupported(7));

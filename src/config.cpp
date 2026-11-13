@@ -289,6 +289,22 @@ static void LoadPacingPipelineKeys(const char* S, const char* P) {
     }
 }
 
+// The preset key of the removed Adaptive cap OSD line, in every preset section of the
+// local INI and of the shared presets file, deleted once at the version step through the checked writer. The other
+// preset fields stay as they are; only a key that exists is written, and a file that does not exist is not created.
+static void DropRemovedPresetKeys(const char* local_path) {
+    const char* const paths[] = { local_path, s_shared_presets_path };
+    for (const char* path : paths) {
+        if (path == nullptr || path[0] == '\0' || GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) continue;
+        for (int slot = 0; slot < OSD_MAX_PRESET_SLOTS; ++slot) {
+            char section[32];
+            snprintf(section, sizeof(section), "OSD_Preset_%d", slot + 1);
+            if (!ReadINIString(section, "show_adaptive_smoothing", "", path).empty())
+                WriteINIString(section, "show_adaptive_smoothing", nullptr, path);
+        }
+    }
+}
+
 bool Config_IsFirstLaunch() { return s_first_launch; }
 
 void LoadConfig(HMODULE hModule) {
@@ -387,7 +403,10 @@ void LoadConfig(HMODULE hModule) {
     // Defaults changed by kConfigVersion: an existing INI written before them
     // moves to them once; its other values stay.
     const int saved_version = ReadINIInt(S, "config_version", 1, P);
-    if (!s_first_launch && saved_version < 6) LogRemovedKeysWithValues(S, P);
+    if (!s_first_launch && saved_version < 6) {
+        LogRemovedKeysWithValues(S, P);
+        DropRemovedPresetKeys(P);
+    }
     if (!s_first_launch && saved_version < 5 &&
         (g_config.unified_queue_law != kPacingUnifiedQueueLawDefault ||
          g_config.gpu_queue_probe != kPacingGpuQueueProbeDefault ||

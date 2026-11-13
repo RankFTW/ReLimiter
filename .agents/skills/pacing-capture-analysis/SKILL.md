@@ -37,6 +37,8 @@ Choose one primary question before selecting metrics:
 - Native PC Latency
 - ReLimiter PC Latency or display timing versus FrameView
 
+Builds from 2026-11-13 no longer produce the signals behind the overload, Adaptive cap (period governor), pre-Sleep and render handoff items above, or the governor, overload, injected-stall, A/B and pre-Sleep splits under segmentation: the period governor's decisions, the overload guard and A/B blocks, the pre-Sleep placement, the render handoff limit, the GPU-paced cadence and the stall injector are gone. The columns `governor_step`, `governor_interval_us`, `governor_cause`, `pre_sleep_margin_us` and `stall_injected_us`, the `source_flags` bits 4, 64 and 128, and the `governor_step`, `rung_feasibility` and `stall_injected` events stay in the schema and read empty. Use those items only on captures of older builds; [telemetry semantics](./references/telemetry-semantics.md) lists what each carries.
+
 State whether the dependent signal is source release (`source_release_qpc`), API Present (`p_qpc`/`e_qpc`), displayed output (`display_qpc`), or latency. Do not call source release cadence or Reflex cadence “display pacing.”
 
 ### 2. Preserve and identify the evidence

@@ -275,18 +275,14 @@ UnifiedLimitResult UnifiedHardLimit(const UnifiedLimitInput& input, UnifiedLimit
 // ── Sleep-mode tuple ──
 
 enum class UnifiedSleepOwner : uint8_t {
-    Game = 0,          // the game's parameters
-    Unified = 1,       // low latency off, interval 0
-    Limiter = 2,       // the Reflex driver limiter's interval
-    LowLatencyOff = 3, // the low-latency override with the game's interval
+    Game = 0,    // the game's parameters
+    Unified = 1, // low latency off, interval 0
+    Limiter = 2, // the Reflex driver limiter's interval, the game's low latency
 };
 
 struct UnifiedSleepModeInputs {
     bool key = false;                    // unified_pacer
     bool dmfg = false;                   // IsDmfgActive()
-    bool bypass = false;                 // the Sleep bypass state
-    bool bypass_low_latency_off = false;
-    bool driver_low_latency_off = false;
     uint32_t limiter_interval_us = 0;    // g_driver_limiter_interval_us
     uint32_t game_interval_us = 0;       // the captured game parameters' interval
     uint64_t publication = 0;            // s_game_params_identity publication
@@ -315,11 +311,9 @@ constexpr bool operator!=(const UnifiedSleepModeTuple& left, const UnifiedSleepM
 // The desired tuple:
 //   key on, DMFG off:                 Unified, low latency off, interval 0
 //   key on, DMFG on:                  Game, the game's low latency and interval
-//   key off, limiter interval ≠ 0:    Limiter, off iff driver_low_latency_off, the limiter's interval
-//   key off, override wanted
-//     (bypass ? bypass_low_latency_off : driver_low_latency_off): LowLatencyOff, off, the game's interval
+//   key off, limiter interval ≠ 0:    Limiter, the game's low latency, the limiter's interval
 //   key off otherwise:                Game
-// interval_us is the game's captured interval for Game and LowLatencyOff.
+// interval_us is the game's captured interval for Game.
 UnifiedSleepModeTuple UnifiedPacer_SleepModeDesired(const UnifiedSleepModeInputs& inputs) noexcept;
 
 // ── The law ──

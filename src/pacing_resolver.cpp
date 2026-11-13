@@ -11,26 +11,11 @@ namespace
 {
     // ── Resolution ──
 
-    struct LeadParameters {
-        double quantile;
-        double allowance_us;
-    };
-
-    // Lead parameters of every rung, indexed by PacingSmoothing. H0 uses
-    // the same table: its lead only
-    // places the virtual output target, and a median lead would make half of
-    // all frames late against it and start OutputLate epochs. Smoothing Off
-    // (always H0) has no allowance; its quantile is an unused
-    // placeholder. On is the former Medium.
-    constexpr LeadParameters kLead[] = {
-        { 0.95, 0.0 },   // Off
-        { 0.95, 500.0 }, // On: the former Medium
-    };
-    static_assert(sizeof(kLead) / sizeof(kLead[0]) ==
-            static_cast<size_t>(PacingSmoothing::Count),
-        "one lead entry per smoothing level");
-    // lead_coverage sets the lead's quantile only; the render handoff offset
-    // keeps the table's, whatever the coverage.
+    // The lead's allowance (fixed; the Smoothing setting is gone). The same lead serves H0: it only places the
+    // virtual output target, and a median lead would make half of all frames late against it and start OutputLate
+    // epochs.
+    constexpr double kLeadAllowanceUs = 500.0;
+    // lead_coverage sets the lead's quantile.
     constexpr double kLeadCoverageQuantile[] = { 0.50, 0.75, 0.90, 0.95, 0.99 };
     static_assert(sizeof(kLeadCoverageQuantile) / sizeof(kLeadCoverageQuantile[0]) ==
             static_cast<size_t>(PacingLeadCoverage::Count),
@@ -83,36 +68,6 @@ namespace
         return PacingFallbackReason::None;
     }
 
-    // The requested rung when its requirements hold, else the next
-    // rung down (H3 → H1, H2 → H1, H1 → H0). An unqualified FG input wait
-    // falls back to H0, not H1: FG without its input route holds nothing.
-    PacingRung OverrideRung(
-        PacingRungOverride rung_override,
-        const PacingCapabilities& capabilities,
-        const PacingRuntimeState& runtime) noexcept
-    {
-        const PacingRung marker_rung = IsMarkerRoute(capabilities.route)
-            ? PacingRung::MarkerHold
-            : PacingRung::SourceOnly;
-        switch (rung_override) {
-            case PacingRungOverride::Marker:
-                return marker_rung;
-            case PacingRungOverride::Native:
-                return IsNativeRouteQualified(capabilities) ? PacingRung::NativeHold : marker_rung;
-            case PacingRungOverride::Gpu:
-                if (runtime.fg_presenting) {
-                    return FgInputBlocker(capabilities) == PacingFallbackReason::None
-                        ? PacingRung::FgInputWait
-                        : PacingRung::SourceOnly;
-                }
-                return GpuQueueBlocker(capabilities, runtime) == PacingFallbackReason::None
-                    ? PacingRung::GpuQueueWait
-                    : marker_rung;
-            default:
-                return PacingRung::SourceOnly;
-        }
-    }
-
     // The Auto rung.
     RungDecision AutoRung(
         const PacingCapabilities& capabilities,
@@ -134,41 +89,15 @@ namespace
         return { PacingRung::MarkerHold, blocker };
     }
 
-    // The rung for a routed, capped pipeline outside the idle caps. *is_auto
-    // is true when the Auto rule chose the rung.
+    // The rung for a routed, capped pipeline outside the idle caps.
     RungDecision ResolveRung(
         const PacingCapabilities& capabilities,
-        const PacingRuntimeState& runtime,
-        bool* is_auto) noexcept
+        const PacingRuntimeState& runtime) noexcept
     {
-        *is_auto = false;
         if (capabilities.route == PacingRoute::PresentBased) {
             return { PacingRung::SourceOnly, PacingFallbackReason::PresentRoute };
         }
-        if (kPacingSmoothing == PacingSmoothing::Off) {
-            return { PacingRung::SourceOnly, PacingFallbackReason::SmoothingOff };
-        }
-        if (kPacingRungOverride != PacingRungOverride::Auto) {
-            return {
-                OverrideRung(kPacingRungOverride, capabilities, runtime),
-                PacingFallbackReason::Override
-            };
-        }
-        *is_auto = true;
         return AutoRung(capabilities, runtime);
-    }
-
-    // Overload guard and GPU queue wait demotion, Auto rung only:
-    // overload demotes every hold rung, a
-    // not-held A/B block demotes the GPU queue wait, both to source only with
-    // reason Infeasible.
-    RungDecision ApplyHoldFeasibility(RungDecision decision, const PacingRuntimeState& runtime) noexcept
-    {
-        if ((decision.rung != PacingRung::SourceOnly && runtime.hold_overloaded) ||
-            (decision.rung == PacingRung::GpuQueueWait && runtime.gpu_queue_wait_off)) {
-            return { PacingRung::SourceOnly, PacingFallbackReason::Infeasible };
-        }
-        return decision;
     }
 
     // The driver limiter needs the NvAPI route (x64) and a game that calls the Reflex Sleep, and the limiter not
@@ -181,33 +110,19 @@ namespace
             runtime.pre_sleep_available && !runtime.driver_limiter_unavailable;
     }
 
-    // Marker-route placement. The driver limiter needs the NvAPI
-    // route (x64) and a game that calls the Reflex Sleep; pre-Sleep needs the
-    // Sleep. Otherwise the source waits at the marker.
+    // Marker-route placement: Unified while the game calls the Reflex Sleep, else the marker (the unified pacer owns
+    // every marker route outside a test mode); test mode driver_limiter hands the source to the driver limiter, the
+    // caller (PacingPipeline_Resolve) having checked the eligibility.
     PacingSourcePlacement MarkerRoutePlacement(
         const PacingPipelineConfig& config,
-        const PacingCapabilities& capabilities,
         const PacingRuntimeState& runtime) noexcept
     {
-        // Unified while the game calls the Reflex Sleep, else the marker; never the driver limiter.
         if (config.unified) {
             return runtime.pre_sleep_available ? PacingSourcePlacement::Unified
                                                : PacingSourcePlacement::Marker;
         }
-        // Test mode driver_limiter: the caller (PacingPipeline_Resolve) has checked the eligibility.
         if (config.test_mode == PacingTestMode::DriverLimiter) return PacingSourcePlacement::DriverLimiter;
-        switch (kPacingPlacementOverride) {
-            case PacingPlacementOverride::Driver:
-                return DriverLimiterEligible(capabilities, runtime)
-                    ? PacingSourcePlacement::DriverLimiter
-                    : PacingSourcePlacement::Marker;
-            case PacingPlacementOverride::PreSleep:
-                return runtime.pre_sleep_available
-                    ? PacingSourcePlacement::PreSleep
-                    : PacingSourcePlacement::Marker;
-            default:
-                return PacingSourcePlacement::Marker;
-        }
+        return PacingSourcePlacement::Marker;
     }
 
     double ClampFinite(double value, double fallback, double minimum, double maximum) noexcept
@@ -289,7 +204,6 @@ namespace
         std::atomic<PacingFallbackReason> reason{ kInitialSnapshot.reason };
         std::atomic<double> lead_quantile{ kInitialSnapshot.lead_quantile };
         std::atomic<double> allowance_us{ kInitialSnapshot.allowance_us };
-        std::atomic<double> handoff_quantile{ kInitialSnapshot.handoff_quantile };
         std::atomic<bool> gpu_probes{ kInitialSnapshot.gpu_probes };
         std::atomic<double> gpu_wait_headroom_us{ kInitialSnapshot.gpu_wait_headroom_us };
     };
@@ -307,7 +221,6 @@ namespace
         snapshot.reason = s_pipeline.reason.load(std::memory_order_relaxed);
         snapshot.lead_quantile = s_pipeline.lead_quantile.load(std::memory_order_relaxed);
         snapshot.allowance_us = s_pipeline.allowance_us.load(std::memory_order_relaxed);
-        snapshot.handoff_quantile = s_pipeline.handoff_quantile.load(std::memory_order_relaxed);
         snapshot.gpu_probes = s_pipeline.gpu_probes.load(std::memory_order_relaxed);
         snapshot.gpu_wait_headroom_us = s_pipeline.gpu_wait_headroom_us.load(std::memory_order_relaxed);
         return snapshot;
@@ -324,7 +237,6 @@ namespace
         s_pipeline.reason.store(snapshot.reason, std::memory_order_relaxed);
         s_pipeline.lead_quantile.store(snapshot.lead_quantile, std::memory_order_relaxed);
         s_pipeline.allowance_us.store(snapshot.allowance_us, std::memory_order_relaxed);
-        s_pipeline.handoff_quantile.store(snapshot.handoff_quantile, std::memory_order_relaxed);
         s_pipeline.gpu_probes.store(snapshot.gpu_probes, std::memory_order_relaxed);
         s_pipeline.gpu_wait_headroom_us.store(snapshot.gpu_wait_headroom_us, std::memory_order_relaxed);
     }
@@ -459,37 +371,28 @@ PacingPipelineSnapshot PacingPipeline_Resolve(
             // The unified pacer paces the idle cap by the same law (I_idle), so the placement stays Unified while
             // the game calls the Reflex Sleep.
             if (safe_config.unified && !present_route) {
-                result.placement = MarkerRoutePlacement(safe_config, capabilities, runtime);
+                result.placement = MarkerRoutePlacement(safe_config, runtime);
             }
         } else {
             result.mode = runtime.vrr ? PacingTimingMode::Vrr : PacingTimingMode::Fixed;
             if (!present_route) {
-                result.placement = MarkerRoutePlacement(safe_config, capabilities, runtime);
+                result.placement = MarkerRoutePlacement(safe_config, runtime);
             }
-            if (result.placement == PacingSourcePlacement::DriverLimiter && !kPacingDriverLimiterHold) {
+            if (result.placement == PacingSourcePlacement::DriverLimiter) {
                 // One clock: the driver paces the source, nothing is held.
                 decision = { PacingRung::SourceOnly, PacingFallbackReason::Override };
-                result.auto_rung = decision.rung;
             } else {
-                // Also the driver limiter with a hold: the source side stays the driver's, the output rung is the
-                // one the other placements get, with their fallbacks.
-                bool is_auto = false;
-                decision = ResolveRung(capabilities, runtime, &is_auto);
-                result.auto_rung = decision.rung;
-                // The unified pacer bypasses the performance demotions (the law limits the unfinished frames
-                // itself); the physical blockers stay.
-                if (is_auto && !safe_config.unified) decision = ApplyHoldFeasibility(decision, runtime);
+                decision = ResolveRung(capabilities, runtime);
             }
+            result.auto_rung = decision.rung;
         }
     }
 
     // Off and Idle resolve source only; auto_rung keeps its source-only default.
     result.rung = decision.rung;
     result.reason = decision.reason;
-    const LeadParameters lead = kLead[static_cast<size_t>(kPacingSmoothing)];
     result.lead_quantile = kLeadCoverageQuantile[static_cast<size_t>(kPacingLeadCoverage)];
-    result.allowance_us = lead.allowance_us;
-    result.handoff_quantile = lead.quantile;
+    result.allowance_us = kLeadAllowanceUs;
     result.gpu_wait_headroom_us = kPacingGpuWaitHeadroomDefaultUs;
     return result;
 }
@@ -506,7 +409,6 @@ bool PacingPipeline_SameResult(
         left.reason == right.reason &&
         left.lead_quantile == right.lead_quantile &&
         left.allowance_us == right.allowance_us &&
-        left.handoff_quantile == right.handoff_quantile &&
         left.gpu_probes == right.gpu_probes &&
         left.gpu_wait_headroom_us == right.gpu_wait_headroom_us;
 }
@@ -621,59 +523,6 @@ PacingPipelineSnapshot PacingPipeline_Read() noexcept
 
 // ── Text ──
 
-const char* PacingSmoothing_Text(PacingSmoothing smoothing) noexcept
-{
-    switch (smoothing) {
-        case PacingSmoothing::Off: return "off";
-        case PacingSmoothing::On: return "on";
-        default: return "unknown";
-    }
-}
-
-bool PacingSmoothing_FromText(const char* text, PacingSmoothing* smoothing) noexcept
-{
-    if (EnumFromText(text, smoothing, PacingSmoothing_Text)) return true;
-    if (text == nullptr || smoothing == nullptr) return false;
-    // The earlier levels low | medium | high load as on.
-    if (EqualsIgnoreCase(text, "low") || EqualsIgnoreCase(text, "medium") ||
-        EqualsIgnoreCase(text, "high")) {
-        *smoothing = PacingSmoothing::On;
-        return true;
-    }
-    return false;
-}
-
-const char* PacingRungOverride_Text(PacingRungOverride rung_override) noexcept
-{
-    switch (rung_override) {
-        case PacingRungOverride::Auto: return "auto";
-        case PacingRungOverride::SourceOnly: return "source";
-        case PacingRungOverride::Marker: return "marker";
-        case PacingRungOverride::Native: return "native";
-        case PacingRungOverride::Gpu: return "gpu";
-        default: return "unknown";
-    }
-}
-
-bool PacingRungOverride_FromText(const char* text, PacingRungOverride* rung_override) noexcept
-{
-    return EnumFromText(text, rung_override, PacingRungOverride_Text);
-}
-
-const char* PacingMarkerForwardOrder_Text(PacingMarkerForwardOrder order) noexcept
-{
-    switch (order) {
-        case PacingMarkerForwardOrder::BeforeWait: return "before_wait";
-        case PacingMarkerForwardOrder::AfterWait: return "after_wait";
-        default: return "unknown";
-    }
-}
-
-bool PacingMarkerForwardOrder_FromText(const char* text, PacingMarkerForwardOrder* order) noexcept
-{
-    return EnumFromText(text, order, PacingMarkerForwardOrder_Text);
-}
-
 const char* PacingRenderQueue_Text(PacingRenderQueue render_queue) noexcept
 {
     switch (render_queue) {
@@ -704,27 +553,6 @@ const char* PacingLeadCoverage_Text(PacingLeadCoverage coverage) noexcept
 bool PacingLeadCoverage_FromText(const char* text, PacingLeadCoverage* coverage) noexcept
 {
     return EnumFromText(text, coverage, PacingLeadCoverage_Text);
-}
-
-const char* PacingPlacementOverride_Text(PacingPlacementOverride placement) noexcept
-{
-    switch (placement) {
-        case PacingPlacementOverride::Marker: return "marker";
-        case PacingPlacementOverride::PreSleep: return "pre_sleep";
-        case PacingPlacementOverride::Driver: return "driver";
-        default: return "unknown";
-    }
-}
-
-bool PacingPlacementOverride_FromText(const char* text, PacingPlacementOverride* placement) noexcept
-{
-    // `auto` (pre-Sleep that disengaged itself) is gone; it reads as the
-    // new default, marker.
-    if (text != nullptr && placement != nullptr && EqualsIgnoreCase(text, "auto")) {
-        *placement = PacingPlacementOverride::Marker;
-        return true;
-    }
-    return EnumFromText(text, placement, PacingPlacementOverride_Text);
 }
 
 const char* PacingPreference_Text(PacingPreference preference) noexcept

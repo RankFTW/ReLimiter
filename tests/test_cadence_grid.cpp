@@ -13,9 +13,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <limits>
 #include <thread>
+#include <vector>
 
 namespace
 {
@@ -2610,10 +2612,616 @@ namespace
             CHECK(!floored);
         }
     }
+
+    // ═══ Present route characterization (the baseline kept through the present-route cut) ═══
+    //
+    // The grid inputs the source stage hands PlanNext for a present-route frame (scheduler.cpp RunPlanned ->
+    // SourceStage::RunPlannedFrame: lead 150 µs of the present placement, the source slack of a warm window, period
+    // change as the period tracker reports it, the 60 Hz reference in Fixed mode) and the output evidence of H0 outputs
+    // (ObserveOutput), under both policies of the route: policy 0 (32-bit, the stage not enabled): evidence is judged
+    // by the grid (gpu_paced false); policy 1 (64-bit unified owner): ClearDisplayFloor before each PlanNext
+    // (SourceStage::RunPlannedFrame) and every output observed gpu_paced (SourceStage::DrainStageEvents). The expected
+    // tables are the values the grid produced when frozen; run with --print-present to print them. Offsets are in
+    // QPC ticks from kStartQpc (10 MHz).
+    bool s_print_present = false;
+    constexpr double kPresentLeadUs = 150.0;
+
+    struct PresentStep {
+        PacingTimingMode mode = PacingTimingMode::Vrr;
+        double interval_us = 10000.0;
+        double slack_us = 20.0;
+        bool period_change = false;
+        bool fixed = false;             // the 60 Hz vblank reference (Fixed mode)
+        double cpu_us = 4000.0;         // arrival after the previous target
+        double late_source_us = -1.0;   // >= 0: arrival this long after the frame's S on the previous grid
+        double output_late_us = 0.0;    // > 0: the output is this long after T, else 30 µs before it
+        bool plan_at = false;           // a unified plan (PlanAt) of the marker route, before the present route
+        double display_us = 0.0;        // PlanAt's display-side interval
+        bool policy1_only = false;      // not run under policy 0
+    };
+
+    struct PresentRow {
+        uint64_t index;
+        uint32_t epoch;
+        int reason;           // PacingEpochReason of the plan
+        int64_t target;
+        int64_t wake;
+        int immediate;
+        int observed;         // PacingEpochReason of the frame's output evidence
+        int64_t late_ticks;   // ObserveOutput's lateness beyond the tolerance
+        int64_t floor_ticks;  // the current segment's display-side floor after the plan
+        int64_t resolved[3];  // CadenceGrid_ResolveOutputTarget: {no display floor, display floor, display floor with D = 2}
+        int floored;          // bit i: resolved[i] was floored
+    };
+
+    struct PresentTail {
+        uint32_t epoch;
+        int epoch_reason;
+        uint64_t epoch_base;
+        uint32_t segments;
+        int snapped;
+        uint64_t plans;
+        uint64_t rebases;
+        uint64_t immediate;
+        uint64_t gpu_paced_late;
+        uint64_t ignored;
+        uint64_t snapped_plans;
+        uint64_t epochs[7];   // by PacingEpochReason
+        int cleared;          // ClearDisplayFloor calls that cleared a floor
+        int64_t published_floor;
+    };
+
+    struct PresentResult {
+        std::vector<PresentRow> rows;
+        PresentTail tail{};
+    };
+
+    struct PresentExpected {
+        const char* name;
+        std::vector<PresentRow> off_rows;
+        std::vector<PresentRow> on_rows; // empty = the same as off_rows
+        PresentTail off_tail;
+        PresentTail on_tail;
+    };
+
+    bool SameRow(const PresentRow& left, const PresentRow& right)
+    {
+        return left.index == right.index && left.epoch == right.epoch && left.reason == right.reason &&
+            left.target == right.target && left.wake == right.wake && left.immediate == right.immediate &&
+            left.observed == right.observed && left.late_ticks == right.late_ticks &&
+            left.floor_ticks == right.floor_ticks && left.resolved[0] == right.resolved[0] &&
+            left.resolved[1] == right.resolved[1] && left.resolved[2] == right.resolved[2] &&
+            left.floored == right.floored;
+    }
+
+    bool SameTail(const PresentTail& left, const PresentTail& right)
+    {
+        if (left.epoch != right.epoch || left.epoch_reason != right.epoch_reason ||
+            left.epoch_base != right.epoch_base || left.segments != right.segments || left.snapped != right.snapped ||
+            left.plans != right.plans || left.rebases != right.rebases || left.immediate != right.immediate ||
+            left.gpu_paced_late != right.gpu_paced_late || left.ignored != right.ignored ||
+            left.snapped_plans != right.snapped_plans || left.cleared != right.cleared ||
+            left.published_floor != right.published_floor) {
+            return false;
+        }
+        for (size_t index = 0; index < 7; ++index) {
+            if (left.epochs[index] != right.epochs[index]) return false;
+        }
+        return true;
+    }
+
+    PresentResult RunPresentGrid(bool policy1, const std::vector<PresentStep>& steps)
+    {
+        PresentResult result;
+        CadenceGrid grid;
+        CadenceGridOutputTracker tracker;
+        int64_t previous_target = 0;
+        bool have_previous = false;
+        int cleared = 0;
+        const int64_t lead_ticks = RoundTicks(Ticks(kPresentLeadUs));
+        for (const PresentStep& step : steps) {
+            if (step.policy1_only && !policy1) continue;
+            const int64_t interval_ticks = RoundTicks(Ticks(step.interval_us));
+            int64_t now = kStartQpc;
+            if (have_previous) {
+                now = step.late_source_us >= 0.0
+                    ? previous_target + interval_ticks - lead_ticks + RoundTicks(Ticks(step.late_source_us))
+                    : previous_target + RoundTicks(Ticks(step.cpu_us));
+            }
+            CadenceGridPlan plan{};
+            if (step.plan_at) {
+                CadenceGridPlanAtInput at = AtInput(now, step.interval_us, now + lead_ticks, 0.0, now, step.mode,
+                    kGeneration, step.period_change);
+                at.display_interval_us = step.display_us;
+                plan = grid.PlanAt(at);
+            } else {
+                if (policy1 && grid.ClearDisplayFloor()) ++cleared; // SourceStage::RunPlannedFrame, key on
+                CadenceGridPlanInput input = Input(now, step.interval_us, kPresentLeadUs, step.mode);
+                input.source_slack_us = step.slack_us;
+                input.period_change = step.period_change;
+                if (step.fixed) input.fixed = Reference60Hz();
+                plan = grid.PlanNext(input);
+            }
+            CHECK(plan.valid);
+            if (!plan.valid) return result;
+            PresentRow row{};
+            row.index = plan.grid_index;
+            row.epoch = plan.epoch;
+            row.reason = static_cast<int>(plan.epoch_reason);
+            row.target = plan.output_target_qpc - kStartQpc;
+            row.wake = plan.source_wake_qpc - kStartQpc;
+            row.immediate = plan.released_immediately ? 1 : 0;
+            row.floor_ticks = std::llround(grid.Snapshot().current.floor_interval_ticks);
+            const struct { bool display_floor; double divisor; } probes[3] = { { false, 1.0 }, { true, 1.0 }, { true, 2.0 } };
+            for (int probe = 0; probe < 3; ++probe) {
+                int64_t resolved = 0;
+                bool floored = false;
+                CHECK(CadenceGrid_ResolveOutputTarget(grid.Snapshot(), kGeneration, plan.grid_index, tracker, &resolved,
+                    &floored, probes[probe].divisor, probes[probe].display_floor, 0.0));
+                row.resolved[probe] = resolved - kStartQpc;
+                if (floored) row.floored |= 1 << probe;
+            }
+            const int64_t output = step.output_late_us > 0.0
+                ? plan.output_target_qpc + RoundTicks(Ticks(step.output_late_us))
+                : plan.output_target_qpc - 300;
+            int64_t late_ticks = 0;
+            row.observed = static_cast<int>(grid.ObserveOutput(kGeneration, plan.grid_index, output, policy1, &late_ticks));
+            row.late_ticks = late_ticks;
+            CHECK(tracker.Record(kGeneration, plan.grid_index, output));
+            result.rows.push_back(row);
+            previous_target = plan.output_target_qpc;
+            have_previous = true;
+        }
+        const CadenceGridSnapshot& snapshot = grid.Snapshot();
+        const CadenceGridStatistics statistics = grid.Statistics();
+        PresentTail& tail = result.tail;
+        tail.epoch = snapshot.epoch;
+        tail.epoch_reason = static_cast<int>(snapshot.epoch_reason);
+        tail.epoch_base = snapshot.epoch_base_index;
+        tail.segments = snapshot.segment_count;
+        tail.snapped = snapshot.snapped ? 1 : 0;
+        tail.plans = statistics.plans;
+        tail.rebases = statistics.silent_rebases;
+        tail.immediate = statistics.released_immediately;
+        tail.gpu_paced_late = statistics.gpu_paced_late_outputs;
+        tail.ignored = statistics.ignored_output_observations;
+        tail.snapped_plans = statistics.snapped_plans;
+        for (size_t index = 0; index < 7; ++index) tail.epochs[index] = statistics.epochs_by_reason[index];
+        tail.cleared = cleared;
+        tail.published_floor = std::llround(snapshot.current.floor_interval_ticks);
+        return result;
+    }
+
+    // ── Expected tables (frozen from the grid) ──
+
+    const PresentExpected kPresentExpected[] = {
+        { "vrr_fraction_period_change",
+            { // policy 0, the stage not enabled
+                { 1, 1, 1, 1500, 0, 0, 0, 0, 0, { 1500, 1500, 1500 }, 0 },
+                { 2, 1, 0, 73964, 72464, 0, 0, 0, 0, { 73964, 73964, 73964 }, 0 },
+                { 3, 1, 0, 146428, 144928, 0, 0, 0, 0, { 146428, 146428, 146428 }, 0 },
+                { 4, 1, 0, 218891, 217391, 0, 0, 0, 0, { 218891, 218891, 218891 }, 0 },
+                { 5, 1, 0, 291355, 289855, 0, 0, 0, 0, { 291355, 291355, 291355 }, 0 },
+                { 6, 1, 0, 363819, 362319, 0, 0, 0, 0, { 363819, 363819, 363819 }, 0 },
+                { 7, 2, 3, 408462, 406962, 0, 0, 0, 0, { 408462, 408462, 408462 }, 0 },
+                { 8, 2, 0, 453105, 451605, 0, 0, 0, 0, { 453105, 453105, 453105 }, 0 },
+                { 9, 2, 0, 497747, 496247, 0, 0, 0, 0, { 497747, 497747, 497747 }, 0 },
+                { 10, 2, 0, 542390, 540890, 0, 0, 0, 0, { 542390, 542390, 542390 }, 0 },
+                { 11, 2, 0, 587033, 585533, 0, 0, 0, 0, { 587033, 587033, 587033 }, 0 },
+                { 12, 2, 0, 631676, 630176, 0, 0, 0, 0, { 631676, 631676, 631676 }, 0 },
+            },
+            { // policy 1, the stage enabled (same rows)
+            },
+            { 2, 3, 7, 2, 0, 12, 0, 0, 0, 0, 0, { 0, 1, 0, 1, 0, 0, 0 }, 0, 0 },
+            { 2, 3, 7, 2, 0, 12, 0, 0, 0, 0, 0, { 0, 1, 0, 1, 0, 0, 0 }, 0, 0 },
+        },
+        { "fixed_snapped_output_late",
+            { // policy 0, the stage not enabled
+                { 1, 1, 1, 154322, 152822, 0, 0, 0, 0, { 154322, 154322, 154322 }, 0 },
+                { 2, 1, 0, 487655, 486155, 0, 0, 0, 0, { 487655, 487655, 487655 }, 0 },
+                { 3, 1, 0, 820988, 819488, 0, 0, 0, 0, { 820988, 820988, 820988 }, 0 },
+                { 4, 1, 0, 1154322, 1152822, 0, 0, 0, 0, { 1154322, 1154322, 1154322 }, 0 },
+                { 5, 1, 0, 1487655, 1486155, 0, 0, 0, 0, { 1487655, 1487655, 1487655 }, 0 },
+                { 6, 1, 0, 1820988, 1819488, 0, 5, 116667, 0, { 1820988, 1820988, 1820988 }, 0 },
+                { 7, 2, 0, 2487655, 2486155, 0, 0, 0, 0, { 2487655, 2487655, 2487655 }, 0 },
+                { 8, 2, 0, 2820988, 2819488, 0, 0, 0, 0, { 2820988, 2820988, 2820988 }, 0 },
+                { 9, 2, 0, 3154322, 3152822, 0, 0, 0, 0, { 3154322, 3154322, 3154322 }, 0 },
+                { 10, 2, 0, 3487655, 3486155, 0, 0, 0, 0, { 3487655, 3487655, 3487655 }, 0 },
+            },
+            { // policy 1, the stage enabled
+                { 1, 1, 1, 154322, 152822, 0, 0, 0, 0, { 154322, 154322, 154322 }, 0 },
+                { 2, 1, 0, 487655, 486155, 0, 0, 0, 0, { 487655, 487655, 487655 }, 0 },
+                { 3, 1, 0, 820988, 819488, 0, 0, 0, 0, { 820988, 820988, 820988 }, 0 },
+                { 4, 1, 0, 1154322, 1152822, 0, 0, 0, 0, { 1154322, 1154322, 1154322 }, 0 },
+                { 5, 1, 0, 1487655, 1486155, 0, 0, 0, 0, { 1487655, 1487655, 1487655 }, 0 },
+                { 6, 1, 0, 1820988, 1819488, 0, 0, 0, 0, { 1820988, 1820988, 1820988 }, 0 },
+                { 7, 1, 0, 2154322, 2152822, 0, 0, 0, 0, { 2320988, 2320988, 2487655 }, 7 },
+                { 8, 1, 0, 2487655, 2486155, 0, 0, 0, 0, { 2487655, 2487655, 2487655 }, 0 },
+                { 9, 1, 0, 2820988, 2819488, 0, 0, 0, 0, { 2820988, 2820988, 2820988 }, 0 },
+                { 10, 1, 0, 3154322, 3152822, 0, 0, 0, 0, { 3154322, 3154322, 3154322 }, 0 },
+            },
+            { 2, 5, 6, 2, 1, 10, 0, 0, 0, 0, 10, { 0, 1, 0, 0, 0, 1, 0 }, 0, 0 },
+            { 1, 1, 1, 1, 1, 10, 0, 0, 1, 0, 10, { 0, 1, 0, 0, 0, 0, 0 }, 0, 0 },
+        },
+        { "fixed_unsnapped_output_late",
+            { // policy 0, the stage not enabled
+                { 1, 1, 1, 1500, 0, 0, 0, 0, 0, { 1500, 1500, 1500 }, 0 },
+                { 2, 1, 0, 201500, 200000, 0, 0, 0, 0, { 201500, 201500, 201500 }, 0 },
+                { 3, 1, 0, 401500, 400000, 0, 0, 0, 0, { 401500, 401500, 401500 }, 0 },
+                { 4, 1, 0, 601500, 600000, 0, 0, 0, 0, { 601500, 601500, 601500 }, 0 },
+                { 5, 1, 0, 801500, 800000, 0, 0, 0, 0, { 801500, 801500, 801500 }, 0 },
+                { 6, 1, 0, 1001500, 1000000, 0, 5, 150000, 0, { 1001500, 1001500, 1001500 }, 0 },
+                { 7, 2, 0, 1401500, 1400000, 0, 0, 0, 0, { 1401500, 1401500, 1401500 }, 0 },
+                { 8, 2, 0, 1601500, 1600000, 0, 0, 0, 0, { 1601500, 1601500, 1601500 }, 0 },
+                { 9, 2, 0, 1801500, 1800000, 0, 0, 0, 0, { 1801500, 1801500, 1801500 }, 0 },
+                { 10, 2, 0, 2001500, 2000000, 0, 0, 0, 0, { 2001500, 2001500, 2001500 }, 0 },
+            },
+            { // policy 1, the stage enabled
+                { 1, 1, 1, 1500, 0, 0, 0, 0, 0, { 1500, 1500, 1500 }, 0 },
+                { 2, 1, 0, 201500, 200000, 0, 0, 0, 0, { 201500, 201500, 201500 }, 0 },
+                { 3, 1, 0, 401500, 400000, 0, 0, 0, 0, { 401500, 401500, 401500 }, 0 },
+                { 4, 1, 0, 601500, 600000, 0, 0, 0, 0, { 601500, 601500, 601500 }, 0 },
+                { 5, 1, 0, 801500, 800000, 0, 0, 0, 0, { 801500, 801500, 801500 }, 0 },
+                { 6, 1, 0, 1001500, 1000000, 0, 0, 0, 0, { 1001500, 1001500, 1001500 }, 0 },
+                { 7, 1, 0, 1201500, 1200000, 0, 0, 0, 0, { 1376500, 1376500, 1389000 }, 7 },
+                { 8, 1, 0, 1401500, 1400000, 0, 0, 0, 0, { 1401500, 1401500, 1401500 }, 0 },
+                { 9, 1, 0, 1601500, 1600000, 0, 0, 0, 0, { 1601500, 1601500, 1601500 }, 0 },
+                { 10, 1, 0, 1801500, 1800000, 0, 0, 0, 0, { 1801500, 1801500, 1801500 }, 0 },
+            },
+            { 2, 5, 6, 2, 0, 10, 0, 0, 0, 0, 0, { 0, 1, 0, 0, 0, 1, 0 }, 0, 0 },
+            { 1, 1, 1, 1, 0, 10, 0, 0, 1, 0, 0, { 0, 1, 0, 0, 0, 0, 0 }, 0, 0 },
+        },
+        { "idle_ignores_outputs",
+            { // policy 0, the stage not enabled
+                { 1, 1, 1, 1500, 0, 0, 0, 0, 0, { 1500, 1500, 1500 }, 0 },
+                { 2, 1, 0, 334833, 333333, 0, 0, 0, 0, { 334833, 334833, 334833 }, 0 },
+                { 3, 1, 0, 668167, 666667, 0, 0, 0, 0, { 668167, 668167, 668167 }, 0 },
+                { 4, 1, 0, 1001500, 1000000, 0, 0, 0, 0, { 1001500, 1001500, 1001500 }, 0 },
+                { 5, 1, 0, 1334833, 1333333, 0, 0, 0, 0, { 1493167, 1493167, 1514000 }, 7 },
+                { 6, 1, 0, 1668167, 1666667, 0, 0, 0, 0, { 1668167, 1668167, 1668167 }, 0 },
+                { 7, 1, 0, 2001500, 2000000, 0, 0, 0, 0, { 2001500, 2001500, 2001500 }, 0 },
+                { 8, 1, 0, 2334833, 2333333, 0, 0, 0, 0, { 2493167, 2493167, 2514000 }, 7 },
+                { 9, 1, 0, 2668167, 2666667, 0, 0, 0, 0, { 2668167, 2668167, 2668167 }, 0 },
+                { 10, 1, 0, 3001500, 3000000, 0, 0, 0, 0, { 3001500, 3001500, 3001500 }, 0 },
+            },
+            { // policy 1, the stage enabled (same rows)
+            },
+            { 1, 1, 1, 1, 0, 10, 0, 0, 0, 10, 0, { 0, 1, 0, 0, 0, 0, 0 }, 0, 0 },
+            { 1, 1, 1, 1, 0, 10, 0, 0, 0, 10, 0, { 0, 1, 0, 0, 0, 0, 0 }, 0, 0 },
+        },
+        { "late_output",
+            { // policy 0, the stage not enabled
+                { 1, 1, 1, 1500, 0, 0, 0, 0, 0, { 1500, 1500, 1500 }, 0 },
+                { 2, 1, 0, 101500, 100000, 0, 0, 0, 0, { 101500, 101500, 101500 }, 0 },
+                { 3, 1, 0, 201500, 200000, 0, 0, 0, 0, { 201500, 201500, 201500 }, 0 },
+                { 4, 1, 0, 301500, 300000, 0, 0, 0, 0, { 301500, 301500, 301500 }, 0 },
+                { 5, 1, 0, 401500, 400000, 0, 0, 0, 0, { 401500, 401500, 401500 }, 0 },
+                { 6, 1, 0, 501500, 500000, 0, 5, 55000, 0, { 501500, 501500, 501500 }, 0 },
+                { 7, 2, 0, 681500, 680000, 0, 0, 0, 0, { 681500, 681500, 681500 }, 0 },
+                { 8, 2, 0, 781500, 780000, 0, 0, 0, 0, { 781500, 781500, 781500 }, 0 },
+                { 9, 2, 0, 881500, 880000, 0, 0, 0, 0, { 881500, 881500, 881500 }, 0 },
+                { 10, 2, 0, 981500, 980000, 0, 0, 0, 0, { 981500, 981500, 981500 }, 0 },
+                { 11, 2, 0, 1081500, 1080000, 0, 0, 0, 0, { 1087000, 1087000, 1093250 }, 7 },
+                { 12, 2, 0, 1181500, 1180000, 0, 0, 0, 0, { 1181500, 1181500, 1181500 }, 0 },
+                { 13, 2, 0, 1281500, 1280000, 0, 5, 35000, 0, { 1281500, 1281500, 1281500 }, 0 },
+                { 14, 3, 0, 1441500, 1440000, 0, 0, 0, 0, { 1441500, 1441500, 1441500 }, 0 },
+                { 15, 3, 0, 1541500, 1540000, 0, 0, 0, 0, { 1541500, 1541500, 1541500 }, 0 },
+                { 16, 3, 0, 1641500, 1640000, 0, 0, 0, 0, { 1641500, 1641500, 1641500 }, 0 },
+            },
+            { // policy 1, the stage enabled
+                { 1, 1, 1, 1500, 0, 0, 0, 0, 0, { 1500, 1500, 1500 }, 0 },
+                { 2, 1, 0, 101500, 100000, 0, 0, 0, 0, { 101500, 101500, 101500 }, 0 },
+                { 3, 1, 0, 201500, 200000, 0, 0, 0, 0, { 201500, 201500, 201500 }, 0 },
+                { 4, 1, 0, 301500, 300000, 0, 0, 0, 0, { 301500, 301500, 301500 }, 0 },
+                { 5, 1, 0, 401500, 400000, 0, 0, 0, 0, { 401500, 401500, 401500 }, 0 },
+                { 6, 1, 0, 501500, 500000, 0, 0, 0, 0, { 501500, 501500, 501500 }, 0 },
+                { 7, 1, 0, 601500, 600000, 0, 0, 0, 0, { 669000, 669000, 675250 }, 7 },
+                { 8, 1, 0, 701500, 700000, 0, 0, 0, 0, { 701500, 701500, 701500 }, 0 },
+                { 9, 1, 0, 801500, 800000, 0, 0, 0, 0, { 801500, 801500, 801500 }, 0 },
+                { 10, 1, 0, 901500, 900000, 0, 0, 0, 0, { 901500, 901500, 901500 }, 0 },
+                { 11, 1, 0, 1001500, 1000000, 0, 0, 0, 0, { 1007000, 1007000, 1013250 }, 7 },
+                { 12, 1, 0, 1101500, 1100000, 0, 0, 0, 0, { 1101500, 1101500, 1101500 }, 0 },
+                { 13, 1, 0, 1201500, 1200000, 0, 0, 0, 0, { 1201500, 1201500, 1201500 }, 0 },
+                { 14, 1, 0, 1301500, 1300000, 0, 0, 0, 0, { 1349000, 1349000, 1355250 }, 7 },
+                { 15, 1, 0, 1401500, 1400000, 0, 0, 0, 0, { 1401500, 1401500, 1401500 }, 0 },
+                { 16, 1, 0, 1501500, 1500000, 0, 0, 0, 0, { 1501500, 1501500, 1501500 }, 0 },
+            },
+            { 3, 5, 13, 3, 0, 16, 0, 0, 0, 0, 0, { 0, 1, 0, 0, 0, 2, 0 }, 0, 0 },
+            { 1, 1, 1, 1, 0, 16, 0, 0, 2, 0, 0, { 0, 1, 0, 0, 0, 0, 0 }, 0, 0 },
+        },
+        { "late_source",
+            { // policy 0, the stage not enabled
+                { 1, 1, 1, 1500, 0, 0, 0, 0, 0, { 1500, 1500, 1500 }, 0 },
+                { 2, 1, 0, 101500, 100000, 0, 0, 0, 0, { 101500, 101500, 101500 }, 0 },
+                { 3, 1, 0, 201500, 200000, 0, 0, 0, 0, { 201500, 201500, 201500 }, 0 },
+                { 4, 1, 0, 301500, 300000, 0, 0, 0, 0, { 301500, 301500, 301500 }, 0 },
+                { 5, 1, 0, 401500, 415000, 1, 0, 0, 0, { 401500, 401500, 401500 }, 0 },
+                { 6, 1, 0, 501500, 500000, 0, 0, 0, 0, { 501500, 501500, 501500 }, 0 },
+                { 7, 1, 0, 601500, 600000, 0, 0, 0, 0, { 601500, 601500, 601500 }, 0 },
+                { 8, 1, 0, 701500, 725200, 1, 0, 0, 0, { 701500, 701500, 701500 }, 0 },
+                { 9, 1, 0, 801500, 800000, 0, 0, 0, 0, { 801500, 801500, 801500 }, 0 },
+                { 10, 1, 0, 901500, 900000, 0, 0, 0, 0, { 901500, 901500, 901500 }, 0 },
+                { 11, 2, 4, 1027100, 1025600, 0, 0, 0, 0, { 1027100, 1027100, 1027100 }, 0 },
+                { 12, 2, 0, 1127100, 1125600, 0, 0, 0, 0, { 1127100, 1127100, 1127100 }, 0 },
+                { 13, 2, 0, 1227100, 1225600, 0, 0, 0, 0, { 1227100, 1227100, 1227100 }, 0 },
+                { 14, 2, 0, 1327100, 1325600, 0, 0, 0, 0, { 1327100, 1327100, 1327100 }, 0 },
+            },
+            { // policy 1, the stage enabled (same rows)
+            },
+            { 2, 4, 11, 2, 0, 14, 0, 2, 0, 0, 0, { 0, 1, 0, 0, 1, 0, 0 }, 0, 0 },
+            { 2, 4, 11, 2, 0, 14, 0, 2, 0, 0, 0, { 0, 1, 0, 0, 1, 0, 0 }, 0, 0 },
+        },
+        { "fg_divisor_steps",
+            { // policy 0, the stage not enabled
+                { 1, 1, 1, 1500, 0, 0, 0, 0, 0, { 1500, 1500, 1500 }, 0 },
+                { 2, 1, 0, 101500, 100000, 0, 0, 0, 0, { 101500, 101500, 101500 }, 0 },
+                { 3, 1, 0, 201500, 200000, 0, 0, 0, 0, { 201500, 201500, 201500 }, 0 },
+                { 4, 1, 0, 301500, 300000, 0, 0, 0, 0, { 301500, 301500, 301500 }, 0 },
+                { 5, 1, 0, 401500, 400000, 0, 0, 0, 0, { 401500, 401500, 401500 }, 0 },
+                { 6, 2, 3, 601500, 600000, 0, 0, 0, 0, { 601500, 601500, 601500 }, 0 },
+                { 7, 2, 0, 801500, 800000, 0, 0, 0, 0, { 801500, 801500, 801500 }, 0 },
+                { 8, 2, 0, 1001500, 1000000, 0, 0, 0, 0, { 1001500, 1001500, 1001500 }, 0 },
+                { 9, 2, 0, 1201500, 1200000, 0, 0, 0, 0, { 1201500, 1201500, 1201500 }, 0 },
+                { 10, 2, 0, 1401500, 1400000, 0, 0, 0, 0, { 1401500, 1401500, 1401500 }, 0 },
+                { 11, 3, 3, 1701500, 1700000, 0, 0, 0, 0, { 1701500, 1701500, 1701500 }, 0 },
+                { 12, 3, 0, 2001500, 2000000, 0, 0, 0, 0, { 2001500, 2001500, 2001500 }, 0 },
+                { 13, 3, 0, 2301500, 2300000, 0, 0, 0, 0, { 2301500, 2301500, 2301500 }, 0 },
+                { 14, 3, 0, 2601500, 2600000, 0, 0, 0, 0, { 2601500, 2601500, 2601500 }, 0 },
+                { 15, 3, 0, 2901500, 2900000, 0, 0, 0, 0, { 2901500, 2901500, 2901500 }, 0 },
+            },
+            { // policy 1, the stage enabled (same rows)
+            },
+            { 3, 3, 11, 3, 0, 15, 0, 0, 0, 0, 0, { 0, 1, 0, 2, 0, 0, 0 }, 0, 0 },
+            { 3, 3, 11, 3, 0, 15, 0, 0, 0, 0, 0, { 0, 1, 0, 2, 0, 0, 0 }, 0, 0 },
+        },
+        { "fg_divisor_ramp",
+            { // policy 0, the stage not enabled
+                { 1, 1, 1, 1500, 0, 0, 0, 0, 0, { 1500, 1500, 1500 }, 0 },
+                { 2, 1, 0, 101500, 100000, 0, 0, 0, 0, { 101500, 101500, 101500 }, 0 },
+                { 3, 1, 0, 201500, 200000, 0, 0, 0, 0, { 201500, 201500, 201500 }, 0 },
+                { 4, 2, 3, 326500, 325000, 0, 0, 0, 0, { 326500, 326500, 326500 }, 0 },
+                { 5, 2, 0, 476500, 475000, 0, 0, 0, 0, { 476500, 476500, 476500 }, 0 },
+                { 6, 2, 0, 651500, 650000, 0, 0, 0, 0, { 651500, 651500, 651500 }, 0 },
+                { 7, 2, 0, 851500, 850000, 0, 0, 0, 0, { 851500, 851500, 851500 }, 0 },
+                { 8, 2, 0, 1051500, 1050000, 0, 0, 0, 0, { 1051500, 1051500, 1051500 }, 0 },
+                { 9, 2, 0, 1251500, 1250000, 0, 0, 0, 0, { 1251500, 1251500, 1251500 }, 0 },
+                { 10, 3, 3, 1426500, 1425000, 0, 0, 0, 0, { 1426500, 1426500, 1426500 }, 0 },
+                { 11, 3, 0, 1576500, 1575000, 0, 0, 0, 0, { 1576500, 1576500, 1576500 }, 0 },
+                { 12, 3, 0, 1701500, 1700000, 0, 0, 0, 0, { 1701500, 1701500, 1701500 }, 0 },
+            },
+            { // policy 1, the stage enabled (same rows)
+            },
+            { 3, 3, 10, 8, 0, 12, 5, 0, 0, 0, 0, { 0, 1, 0, 2, 0, 0, 0 }, 0, 0 },
+            { 3, 3, 10, 8, 0, 12, 5, 0, 0, 0, 0, { 0, 1, 0, 2, 0, 0, 0 }, 0, 0 },
+        },
+        { "display_floor_cleared",
+            { // policy 0, the stage not enabled
+                { 1, 1, 1, 1500, 0, 0, 0, 0, 0, { 1500, 1500, 1500 }, 0 },
+                { 2, 1, 0, 101500, 100000, 0, 0, 0, 0, { 101500, 101500, 101500 }, 0 },
+                { 3, 1, 0, 201500, 200000, 0, 0, 0, 0, { 201500, 201500, 201500 }, 0 },
+                { 4, 1, 0, 301500, 300000, 0, 0, 0, 0, { 301500, 301500, 301500 }, 0 },
+                { 5, 1, 0, 401500, 400000, 0, 0, 0, 0, { 401500, 401500, 401500 }, 0 },
+                { 6, 1, 0, 501500, 500000, 0, 0, 0, 0, { 501500, 501500, 501500 }, 0 },
+            },
+            { // policy 1, the stage enabled
+                { 1, 1, 1, 1500, 0, 1, 0, 0, 80000, { 1500, 1500, 1500 }, 0 },
+                { 2, 1, 0, 43000, 41500, 1, 0, 0, 80000, { 88700, 71200, 76200 }, 7 },
+                { 3, 1, 0, 84500, 83000, 1, 0, 0, 80000, { 130200, 112700, 117700 }, 7 },
+                { 4, 1, 0, 184500, 183000, 0, 0, 0, 0, { 184500, 184500, 184500 }, 0 },
+                { 5, 1, 0, 284500, 283000, 0, 0, 0, 0, { 284500, 284500, 284500 }, 0 },
+                { 6, 1, 0, 384500, 383000, 0, 0, 0, 0, { 384500, 384500, 384500 }, 0 },
+                { 7, 1, 0, 484500, 483000, 0, 0, 0, 0, { 484500, 484500, 484500 }, 0 },
+                { 8, 1, 0, 584500, 583000, 0, 0, 0, 0, { 584500, 584500, 584500 }, 0 },
+                { 9, 1, 0, 684500, 683000, 0, 0, 0, 0, { 684500, 684500, 684500 }, 0 },
+            },
+            { 1, 1, 1, 1, 0, 6, 0, 0, 0, 0, 0, { 0, 1, 0, 0, 0, 0, 0 }, 0, 0 },
+            { 1, 1, 1, 3, 0, 9, 0, 0, 0, 0, 0, { 0, 1, 0, 0, 0, 0, 0 }, 1, 0 },
+        },
+    };
+
+    void PrintRows(const std::vector<PresentRow>& rows)
+    {
+        for (const PresentRow& row : rows) {
+            std::printf("            { %llu, %u, %d, %lld, %lld, %d, %d, %lld, %lld, { %lld, %lld, %lld }, %d },\n",
+                static_cast<unsigned long long>(row.index), row.epoch, row.reason, static_cast<long long>(row.target),
+                static_cast<long long>(row.wake), row.immediate, row.observed, static_cast<long long>(row.late_ticks),
+                static_cast<long long>(row.floor_ticks), static_cast<long long>(row.resolved[0]),
+                static_cast<long long>(row.resolved[1]), static_cast<long long>(row.resolved[2]), row.floored);
+        }
+    }
+
+    void PrintTail(const PresentTail& tail)
+    {
+        std::printf("        { %u, %d, %llu, %u, %d, %llu, %llu, %llu, %llu, %llu, %llu, { %llu, %llu, %llu, %llu, %llu, %llu, %llu }, %d, %lld },\n",
+            tail.epoch, tail.epoch_reason, static_cast<unsigned long long>(tail.epoch_base), tail.segments, tail.snapped,
+            static_cast<unsigned long long>(tail.plans), static_cast<unsigned long long>(tail.rebases),
+            static_cast<unsigned long long>(tail.immediate), static_cast<unsigned long long>(tail.gpu_paced_late),
+            static_cast<unsigned long long>(tail.ignored), static_cast<unsigned long long>(tail.snapped_plans),
+            static_cast<unsigned long long>(tail.epochs[0]), static_cast<unsigned long long>(tail.epochs[1]),
+            static_cast<unsigned long long>(tail.epochs[2]), static_cast<unsigned long long>(tail.epochs[3]),
+            static_cast<unsigned long long>(tail.epochs[4]), static_cast<unsigned long long>(tail.epochs[5]),
+            static_cast<unsigned long long>(tail.epochs[6]), tail.cleared, static_cast<long long>(tail.published_floor));
+    }
+
+    std::vector<PresentResult> CheckPresentGrid(const char* name, const std::vector<PresentStep>& steps)
+    {
+        const PresentResult result[2] = { RunPresentGrid(false, steps), RunPresentGrid(true, steps) };
+        if (s_print_present) {
+            bool same = result[0].rows.size() == result[1].rows.size();
+            for (size_t index = 0; same && index < result[0].rows.size(); ++index) {
+                same = SameRow(result[0].rows[index], result[1].rows[index]);
+            }
+            std::printf("//TABLE\n    { \"%s\",\n        { // policy 0, the stage not enabled\n", name);
+            PrintRows(result[0].rows);
+            std::printf("        },\n        { // policy 1, the stage enabled%s\n", same ? " (same rows)" : "");
+            if (!same) PrintRows(result[1].rows);
+            std::printf("        },\n");
+            PrintTail(result[0].tail);
+            PrintTail(result[1].tail);
+            std::printf("    },\n//END\n");
+            return { result[0], result[1] };
+        }
+        const PresentExpected* expected = nullptr;
+        for (const PresentExpected& candidate : kPresentExpected) {
+            if (std::strcmp(candidate.name, name) == 0) expected = &candidate;
+        }
+        CHECK(expected != nullptr);
+        if (expected == nullptr) return { result[0], result[1] };
+        for (int policy = 0; policy < 2; ++policy) {
+            const std::vector<PresentRow>& want = policy == 1 && !expected->on_rows.empty()
+                ? expected->on_rows : expected->off_rows;
+            const std::vector<PresentRow>& got = result[policy].rows;
+            CHECK(got.size() == want.size());
+            for (size_t index = 0; index < got.size() && index < want.size(); ++index) {
+                if (!SameRow(got[index], want[index])) {
+                    CHECK(false);
+                    std::fprintf(stderr, "  %s policy %d row %zu\n", name, policy, index);
+                    PrintRows({ got[index] });
+                }
+            }
+            CHECK(SameTail(result[policy].tail, policy == 1 ? expected->on_tail : expected->off_tail));
+        }
+        return { result[0], result[1] };
+    }
+
+    PresentStep Plan(double interval_us, double cpu_us = 4000.0)
+    {
+        PresentStep step;
+        step.interval_us = interval_us;
+        step.cpu_us = cpu_us;
+        return step;
+    }
+
+    // VRR cap with fractional ticks (138 FPS: the cap-0 VRR term of a 144 Hz ceiling) and a ceiling change to 224 FPS
+    // (240 Hz): period_change, the fraction carried across the new segment.
+    void TestPresentGridVrrFractionAndPeriodChange()
+    {
+        std::vector<PresentStep> steps;
+        for (int index = 0; index < 12; ++index) {
+            PresentStep step = Plan(index < 6 ? 1000000.0 / 138.0 : 1000000.0 / 224.0, 3000.0);
+            step.period_change = index == 6;
+            steps.push_back(step);
+        }
+        CheckPresentGrid("vrr_fraction_period_change", steps);
+    }
+
+    // Fixed refresh with the 60 Hz reference: 30 FPS (two refreshes) snaps every target and restart origin to an edge;
+    // 50 FPS (20 ms) does not. A late output restarts a snapped cadence at the first edge at or after the evidence
+    // (policy 0); policy 1 never restarts on an output.
+    void TestPresentGridFixedRefresh()
+    {
+        for (const double interval_us : { 1000000.0 / 30.0, 1000000.0 / 50.0 }) {
+            std::vector<PresentStep> steps;
+            for (int index = 0; index < 10; ++index) {
+                PresentStep step = Plan(interval_us, 6000.0);
+                step.mode = PacingTimingMode::Fixed;
+                step.fixed = true;
+                if (index == 5) step.output_late_us = 20000.0;
+                steps.push_back(step);
+            }
+            const bool snapped = interval_us > 30000.0;
+            const std::vector<PresentResult> result =
+                CheckPresentGrid(snapped ? "fixed_snapped_output_late" : "fixed_unsnapped_output_late", steps);
+            if (!s_print_present) CHECK(result[0].tail.snapped == (snapped ? 1 : 0));
+        }
+    }
+
+    // The idle cap (Idle mode, the present placement's 150 µs lead): output evidence is ignored under both policies.
+    void TestPresentGridIdleIgnoresOutputs()
+    {
+        std::vector<PresentStep> steps;
+        for (int index = 0; index < 10; ++index) {
+            PresentStep step = Plan(1000000.0 / 30.0, 5000.0);
+            step.mode = PacingTimingMode::Idle;
+            if (index == 3 || index == 6) step.output_late_us = 20000.0;
+            steps.push_back(step);
+        }
+        const std::vector<PresentResult> result = CheckPresentGrid("idle_ignores_outputs", steps);
+        if (!s_print_present) CHECK(result[0].tail.epoch == 1 && result[1].tail.epoch == 1);
+    }
+
+    // A late output: the evidence restarts the epoch with origin o (T_n+1 = o + I) under policy 0, is counted as a
+    // GPU-paced late output under policy 1; an output inside the tolerance changes nothing.
+    void TestPresentGridLateOutput()
+    {
+        std::vector<PresentStep> steps;
+        for (int index = 0; index < 16; ++index) {
+            PresentStep step = Plan(10000.0);
+            if (index == 5) step.output_late_us = 8000.0;
+            if (index == 9) step.output_late_us = 1800.0;
+            if (index == 12) step.output_late_us = 6000.0;
+            steps.push_back(step);
+        }
+        const std::vector<PresentResult> result = CheckPresentGrid("late_output", steps);
+        if (!s_print_present) CHECK(result[0].tail.epochs[5] == 2 && result[1].tail.epochs[5] == 0);
+    }
+
+    // A late source: within the late tolerance plus the source slack the frame is released at once (S_n = now); beyond
+    // it the cadence restarts at the arrival (SourceLate), whatever the policy.
+    void TestPresentGridLateSource()
+    {
+        std::vector<PresentStep> steps;
+        for (int index = 0; index < 14; ++index) {
+            PresentStep step = Plan(10000.0);
+            if (index == 4) step.late_source_us = 1500.0;
+            if (index == 7) step.late_source_us = 2520.0;
+            if (index == 10) step.late_source_us = 2560.0;
+            steps.push_back(step);
+        }
+        CheckPresentGrid("late_source", steps);
+    }
+
+    // A frame generation divisor change: steps (1 -> 2 -> 3, period_change at each), then the ramp 1 -> 2 as silent
+    // rebases (period_change on the first frame only).
+    void TestPresentGridFgDivisor()
+    {
+        std::vector<PresentStep> steps;
+        for (int index = 0; index < 15; ++index) {
+            PresentStep step = Plan(10000.0 * (index < 5 ? 1.0 : index < 10 ? 2.0 : 3.0));
+            step.period_change = index == 5 || index == 10;
+            steps.push_back(step);
+        }
+        CheckPresentGrid("fg_divisor_steps", steps);
+        std::vector<PresentStep> ramp;
+        const double divisors[12] = { 1.0, 1.0, 1.0, 1.25, 1.5, 1.75, 2.0, 2.0, 2.0, 1.75, 1.5, 1.25 };
+        for (int index = 0; index < 12; ++index) {
+            PresentStep step = Plan(10000.0 * divisors[index]);
+            step.period_change = index == 3 || index == 9;
+            ramp.push_back(step);
+        }
+        CheckPresentGrid("fg_divisor_ramp", ramp);
+    }
+
+    // The marker route's unified plans (PlanAt, a display-side floor of 8 ms on a 10 ms cap) followed by present frames:
+    // policy 1 clears the segment's floor before the first present plan and the grid continues from the unified plan's
+    // segment; policy 0 never had a floor. The output targets resolve with and without the display floor (hold advance
+    // 0) and with D = 2.
+    void TestPresentGridDisplayFloorClearedBeforePlanNext()
+    {
+        std::vector<PresentStep> steps;
+        for (int index = 0; index < 9; ++index) {
+            PresentStep step = Plan(10000.0);
+            if (index < 3) {
+                step.plan_at = true;
+                step.display_us = 8000.0;
+                step.policy1_only = true;
+            }
+            steps.push_back(step);
+        }
+        const std::vector<PresentResult> result = CheckPresentGrid("display_floor_cleared", steps);
+        if (!s_print_present) {
+            CHECK(result[1].rows.size() == 9 && result[1].rows[2].floor_ticks > 0 && result[1].rows[3].floor_ticks == 0);
+            CHECK(result[1].tail.cleared == 1 && result[1].tail.published_floor == 0);
+        }
+    }
+
 }
 
-int main()
+int main(int argc, char** argv)
 {
+    for (int index = 1; index < argc; ++index) {
+        if (std::strcmp(argv[index], "--print-present") == 0) s_print_present = true;
+    }
     TestRoundingWithoutDrift();
     TestPlanAtEpochsAndSegments();
     TestPlanAtOutputFloor();
@@ -2654,6 +3262,13 @@ int main()
     TestStallRecoveryWithExecutors();
     TestPublicationDefaults();
     TestPublicationUnderConcurrentWriter();
+    TestPresentGridVrrFractionAndPeriodChange();
+    TestPresentGridFixedRefresh();
+    TestPresentGridIdleIgnoresOutputs();
+    TestPresentGridLateOutput();
+    TestPresentGridLateSource();
+    TestPresentGridFgDivisor();
+    TestPresentGridDisplayFloorClearedBeforePlanNext();
 
     if (s_failures != 0) {
         std::fprintf(stderr, "%d cadence grid checks failed\n", s_failures);

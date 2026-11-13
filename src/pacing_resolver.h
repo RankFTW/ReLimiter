@@ -20,41 +20,6 @@
 
 // ── Configuration ──
 
-// Lead headroom of the output rungs (fixed: kPacingSmoothing; the setting is gone). Text: off | on.
-enum class PacingSmoothing : uint8_t {
-    Off = 0, // no output hold (H0)
-    On = 1,  // the fixed value
-    Count
-};
-
-// Output rung override (fixed: kPacingRungOverride, Auto; the setting is gone). Text: auto | source | marker | native | gpu.
-enum class PacingRungOverride : uint8_t {
-    Auto = 0,
-    SourceOnly = 1, // H0
-    Marker = 2,     // H1
-    Native = 3,     // H2
-    Gpu = 4,        // H3: GPU queue wait, or FG input wait while FG presents
-    Count
-};
-
-// When the enforcement marker reaches the driver relative to the source wait (x64 NvAPI marker path only; fixed:
-// kPacingMarkerForwardOrder, BeforeWait; the setting is gone). Text: before_wait | after_wait. The PCL path always
-// forwards after it.
-enum class PacingMarkerForwardOrder : uint8_t {
-    BeforeWait = 0, // the driver sees the unpaced arrival
-    AfterWait = 1,  // the driver sees the paced release
-    Count
-};
-
-// Where the source stage waits on marker routes outside the unified pacer (fixed: kPacingPlacementOverride, PreSleep; the
-// setting is gone). Text: marker | pre_sleep | driver (legacy `auto` reads as marker).
-enum class PacingPlacementOverride : uint8_t {
-    Marker = 0,   // at the enforcement marker
-    PreSleep = 1, // before the Reflex Sleep while the game calls it, else the marker
-    Driver = 2,   // hand the source cadence to the Reflex driver limiter
-    Count
-};
-
 // User key `pacing_preference`: one setting with three positions that trade latency for even frames in the
 // queue-based pacer (64-bit DirectX 12). INI text: latency | balanced | smooth (default balanced, today's
 // behaviour). PacingPipeline_ResolvePreference turns the position into the queue law's rank and hold share.
@@ -76,11 +41,6 @@ enum class PacingTestMode : uint8_t {
     Count
 };
 
-// Stall injector ranges (the injector in source_stage.cpp; its settings are gone, kPacingStallInjectMs).
-constexpr double kPacingStallInjectMaxMs = 200.0;
-constexpr double kPacingStallInjectMinPeriodS = 1.0;
-constexpr double kPacingStallInjectMaxPeriodS = 60.0;
-constexpr double kPacingStallInjectDefaultPeriodS = 5.0;
 // The owner of pacing is derived, never configured: `unified` is 64-bit with the effective test mode Off
 // (PacingPipeline_ClampConfig). Before the first publication the resolver runs the earlier pipeline (unified false);
 // the ownership transition applies at publication.
@@ -129,49 +89,16 @@ constexpr int kPacingUnifiedQueueAllowMaxUs = 20000;
 // the next frame's heavy GPU work (lead_controller.h LEAD_RELEASE_HEADROOM_US). Fixed: no setting changes it.
 constexpr double kPacingGpuWaitHeadroomDefaultUs = 1000.0;
 
-// The Adaptive cap fit tiers and their nearest-tier rule: the share of recent frames the Adaptive cap's governed
-// interval fits (75, 90 or 99). The Adaptive cap is not configurable (kPacingAdaptiveCap); the rule stays with the
-// governor.
-constexpr int kAdaptiveCapFitTiers[] = {75, 90, 99};
-constexpr int kAdaptiveCapPercentileDefault = 75;
-
-// The tier nearest to percentile: up to 82 is 75, 83 to 94 is 90, 95 and above is 99.
-constexpr int PacingPipeline_AdaptiveCapFitTier(int percentile) noexcept
-{
-    int best = kAdaptiveCapFitTiers[0];
-    for (const int tier : kAdaptiveCapFitTiers) {
-        const int distance = tier > percentile ? tier - percentile : percentile - tier;
-        const int best_distance = best > percentile ? best - percentile : percentile - best;
-        if (distance < best_distance) best = tier;
-    }
-    return best;
-}
-
 // ── Constants of the removed pacing settings ──
 // Each fixes the value of a setting that no longer exists. Under the unified pacer it is what
-// PacingPipeline_ClampConfig forced while the setting existed; elsewhere it is the configuration default. The two are
-// equal for every constant below (the Adaptive cap's hold room is the one setting whose default, on, was forced off
-// under the unified pacer: it is inert without the Adaptive cap, and the constant is off). The earlier names of the
-// ones that already had a default constant stay: kAdaptiveCapPercentileDefault, kPacingGpuWaitHeadroomDefaultUs,
-// kPacingStallInjectDefaultPeriodS, kPacingUnifiedEveryFrameServiceDefault, kPacingUnifiedQueueTargetDefaultUs.
-constexpr PacingSmoothing kPacingSmoothing = PacingSmoothing::On;                // the lead table's On row
-constexpr PacingRungOverride kPacingRungOverride = PacingRungOverride::Auto;     // the output rung is resolved, never overridden
-constexpr PacingPlacementOverride kPacingPlacementOverride = PacingPlacementOverride::PreSleep; // marker placement outside the unified pacer
-constexpr bool kPacingAdaptiveCap = false;                                       // no Adaptive cap: the cap interval is the interval
-constexpr bool kPacingAdaptiveCapHoldRoom = false;                               // inert without the Adaptive cap
-constexpr bool kPacingGpuPacedCadence = false;                                   // no GPU-paced cadence
-constexpr bool kPacingDriverLimiterHold = false;                                 // the driver limiter releases, nothing is held
-constexpr bool kPacingPreSleepPrecise = false;                                   // the pre-Sleep wait keeps its learned margin
-constexpr double kPacingGpuWaitInterleaveS = 0.0;                                // no held / not-held A/B blocks
-constexpr double kPacingStallInjectMs = 0.0;                                     // no injected stalls
+// PacingPipeline_ClampConfig forced while the setting existed; elsewhere it is the configuration default. The
+// earlier names of the ones that already had a default constant stay: kPacingGpuWaitHeadroomDefaultUs,
+// kPacingUnifiedEveryFrameServiceDefault, kPacingUnifiedQueueTargetDefaultUs.
 constexpr PacingLeadCoverage kPacingLeadCoverage = PacingLeadCoverage::Q99;      // the lead covers 99% of frames
 constexpr bool kPacingFgLateSpacing = true;                                      // the FG input wait floors the frame after a late one
 constexpr bool kPacingLeadSpikeFloor = true;                                     // a GPU wait lead covers the game's rare long simulations
 constexpr PacingRenderQueue kPacingGpuQueueWaitRenderQueue = PacingRenderQueue::Keep; // the render queue stays in the lead
-constexpr PacingMarkerForwardOrder kPacingMarkerForwardOrder = PacingMarkerForwardOrder::BeforeWait; // markers reach the driver before any wait
 constexpr bool kPacingSleepStatusEveryFrame = false;                             // the driver's sleep status is polled once a second
-constexpr bool kPacingBypassLowLatencyOff = false;                               // the driver's low latency mode is left alone while bypassed
-constexpr bool kPacingDriverLowLatencyOff = false;                               // the driver's low latency mode is left alone with the game's Sleep
 constexpr bool kPacingGpuStartProbe = false;                                     // no GPU start measurement
 constexpr bool kPacingGpuPriorityProbe = false;                                  // no priority probe queues
 constexpr int kPacingFgPresenterProbeUs = 0;                                     // no presenter probe holds
@@ -286,14 +213,12 @@ struct PacingRuntimeState {
     bool vrr = true;       // display pacing mode; false = fixed refresh
     bool fg_presenting = false;
     // The game called the Reflex Sleep on the presenting device within the
-    // last second. Needed for PreSleep and DriverLimiter.
+    // last second. Needed for the unified placement and DriverLimiter.
     bool pre_sleep_available = false;
     // The Reflex driver limiter cannot be applied now (failed recently, no
-    // game sleep-mode parameters, or the Reflex Sleep bypass): the Driver
-    // placement override resolves the marker placement instead.
+    // game sleep-mode parameters, or the Reflex Sleep bypass): test mode
+    // driver_limiter resolves to pass-through with reason DriverLimiterUnavailable.
     bool driver_limiter_unavailable = false;
-    bool hold_overloaded = false;       // overload guard: every Auto hold rung resolves source only
-    bool gpu_queue_wait_off = false;    // a not-held A/B interleave block: the Auto GPU queue wait resolves source only
 };
 
 // ── Result ──
@@ -304,42 +229,14 @@ struct PacingPipelineSnapshot {
     PacingRoute route = PacingRoute::None;
     PacingSourcePlacement placement = PacingSourcePlacement::None;
     PacingRung rung = PacingRung::SourceOnly;
-    // The resolved rung before the overload guard (the override or
-    // fallback rung when not Auto). Differs from `rung` only while the guard
-    // demotes an Auto hold (reason Infeasible); the FG route qualification
-    // check, the guard's judged frames, the lead rung of the demoted frames
-    // (PacingPipeline_LeadRung) and telemetry read it.
+    // The resolved rung before any demotion; equals `rung` (the overload guard that demoted an Auto hold is gone).
     PacingRung auto_rung = PacingRung::SourceOnly;
     PacingFallbackReason reason = PacingFallbackReason::Passthrough;
     double lead_quantile = 0.99; // q of the lead controller: L = Q_q(X) + allowance (lead_coverage, default 99)
     double allowance_us = 500.0; // defaults: On, so the initial snapshot equals default passthrough
-    // q of the render handoff offset, d = Q_{1−q}(h) − allowance: the Smoothing
-    // quantile, whatever lead_coverage says.
-    double handoff_quantile = 0.95;
     bool gpu_probes = true;
     double gpu_wait_headroom_us = kPacingGpuWaitHeadroomDefaultUs; // the collision guard's release headroom
 };
-
-// The rung whose lead plans the frame: the Auto hold rung (GPU queue wait, FG
-// input wait, marker hold or native hold) while the overload guard or a
-// not-held A/B block demotes it (rung SourceOnly, reason Infeasible,
-// auto_rung the hold rung), else the rung. The demoted frames then keep the
-// held frames' release phase: a demotion only takes the hold away, never the
-// lead. The source-only lead targets the Present call and is about 4.5 ms
-// shorter, and switching between the two moved the release by that much in
-// one frame (11.8-13.2 ms display intervals at every held -> not-held
-// switch); paused frames planned with the GPU queue wait's unguarded lead
-// moved it 3-5 ms the other way at every resume. The source stage plans such
-// a frame with at least the warm lead of the rung that outputs it, the only
-// one of the two windows still learning, and applies the collision guard to
-// that demand where the lead rung is the GPU queue wait (source_stage.cpp).
-constexpr PacingRung PacingPipeline_LeadRung(const PacingPipelineSnapshot& pipeline) noexcept
-{
-    return pipeline.rung == PacingRung::SourceOnly &&
-            pipeline.reason == PacingFallbackReason::Infeasible
-        ? pipeline.auto_rung
-        : pipeline.rung;
-}
 
 // ── Resolution (pure) ──
 
@@ -398,18 +295,10 @@ PacingPipelineSnapshot PacingPipeline_Read() noexcept;
 // INI tokens. FromText is ASCII case-insensitive, returns false for null or
 // unknown text and leaves *value unchanged on failure. Text returns "unknown"
 // for values outside the enum.
-const char* PacingSmoothing_Text(PacingSmoothing smoothing) noexcept;
-bool PacingSmoothing_FromText(const char* text, PacingSmoothing* smoothing) noexcept;
-const char* PacingRungOverride_Text(PacingRungOverride rung_override) noexcept;
-bool PacingRungOverride_FromText(const char* text, PacingRungOverride* rung_override) noexcept;
-const char* PacingMarkerForwardOrder_Text(PacingMarkerForwardOrder order) noexcept;
-bool PacingMarkerForwardOrder_FromText(const char* text, PacingMarkerForwardOrder* order) noexcept;
 const char* PacingRenderQueue_Text(PacingRenderQueue render_queue) noexcept;
 bool PacingRenderQueue_FromText(const char* text, PacingRenderQueue* render_queue) noexcept;
 const char* PacingLeadCoverage_Text(PacingLeadCoverage coverage) noexcept;
 bool PacingLeadCoverage_FromText(const char* text, PacingLeadCoverage* coverage) noexcept;
-const char* PacingPlacementOverride_Text(PacingPlacementOverride placement) noexcept;
-bool PacingPlacementOverride_FromText(const char* text, PacingPlacementOverride* placement) noexcept;
 const char* PacingPreference_Text(PacingPreference preference) noexcept;
 bool PacingPreference_FromText(const char* text, PacingPreference* preference) noexcept;
 const char* PacingTestMode_Text(PacingTestMode mode) noexcept;

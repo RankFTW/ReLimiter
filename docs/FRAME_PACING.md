@@ -2,7 +2,7 @@
 
 This document explains how ReLimiter's frame pacing works, with diagrams. It is written for technically interested users, testers and new contributors. It describes current behavior only; the [User Guide](USER_GUIDE.md) covers what a player needs to know and the [Developer Reference](DEVELOPER_REFERENCE.md) covers developer settings, Details lines and log lines.
 
-Nobody is expected to tune any of this. ReLimiter has no pacing settings besides the frame-rate caps and the Pacing preference: smoothing is always on, the output point is always chosen automatically, the Reflex Sleep is replaced by ReLimiter's own wait while it paces a cap, and pre-Sleep placement is used. Every number below is a built-in value, not a setting.
+Nobody is expected to tune any of this. ReLimiter has no pacing settings besides the frame-rate caps and the Pacing preference: smoothing is always on, the output point is always chosen automatically, the Reflex Sleep is replaced by ReLimiter's own wait while it paces a cap, and the source wait runs inside the Reflex Sleep call. Every number below is a built-in value, not a setting.
 
 Each section ends with the source files it describes. Diagrams that use numbers say so; those numbers only illustrate the shape of the timing.
 
@@ -55,7 +55,7 @@ Three rules hold everywhere:
 
 - **Late frames are never held.** A frame that misses its target passes on at once; the cadence is restarted when it is clearly late.
 - **No catch-up burst.** After a late frame the next targets are not squeezed together to make up the time.
-- **No mode switching on thresholds.** ReLimiter picks the best output point the game supports and keeps it; the overload guard only steps aside temporarily.
+- **No mode switching on thresholds.** ReLimiter picks the best output point the game supports and keeps it.
 
 The pieces that decide the details:
 
@@ -66,7 +66,7 @@ The pieces that decide the details:
 | Source stage | Plans each frame, waits until `S`, releases the game | [Frame Plans and the Lead](#frame-plans-and-the-lead) |
 | Pipeline resolver | Chooses the output point and where the source waits | [Output Points](#output-points) |
 | Output executors | Hold or pass on each finished frame | [Output Points](#output-points) |
-| Protections | Collision-aware release, overload guard, render handoff limit | [Protecting Pacing Under Load](#protecting-pacing-under-load) |
+| Protections | Collision-aware release | [Protecting Pacing Under Load](#protecting-pacing-under-load) |
 
 Source: `src/scheduler.cpp` (`OnMarker`, `RunPlanned`), `src/source_stage.h`, `src/cadence_grid.h`, `src/pacing_resolver.h`.
 
@@ -205,22 +205,20 @@ The lead controller keeps one bucket of measured samples per output point and FG
 | `gpu_queue_wait` | The frame's GPU readiness `r`, floored at the Present call `p`: `max(p, r) − s`. When the next frame's GPU work runs behind the wait (below): `max(p, r − d) − s` | `d = max(0, f − w_c)` is how long the frame's submitted GPU work waited for the GPU to pass the previous frame's gate: `f` is when it did (that frame's readiness, or its resume when its GPU waited at the Signal), `w_c` when this frame's first GPU work reached the driver (RENDERSUBMIT_START plus the median first-submission delay, at most `p`; `p` without the marker). A frame the cap released whose own submissions set its readiness keeps `d` (below) |
 | `fg_input_wait` | The same readiness measure, with its own queue order. The lead sample is `X − q` | `d` as above. `q` is the time the finished frame waited for the game's render thread to leave the previous frame's Present (SIMULATION_END to the previous PRESENT_END, at most until RENDERSUBMIT_START) |
 
-**Queue order of the GPU waits.** Each GPU wait pairs a release whose GPU waited at it with the next frame's GPU start (from the Reflex report): when the next frame had begun submitting before the release but its GPU work started only after it, that work runs behind the wait. After 32 such pairs with none concurrent, and while Reflex reports keep arriving, the wait's verdict is *behind the wait*; one pair whose next frame's GPU work started more than 0.1 ms before the release ends it at once. Behind the wait, a frame's readiness follows ReLimiter's own release of the previous frame (`r_n = o_{n−1} + P_n`), so the measured `X` is `L + P_n − I` and moves with the lead itself: in CONTROL Resonant with FG 2× at 130 FPS the lead rose from 20 to 39–43 ms after one heavier second and stayed there after the load fell, at about 20 ms more PC latency. Leaving out `d` gives each frame's own work, which the lead can fall back to. The previous frame's frame generation after its gate stays in `X`. A frame whose own late submissions set its readiness keeps `X`, because its readiness then follows its own release, not the previous frame's: the frame's Reflex report shows its GPU waited 1 ms or more inside its work for its submissions while its first work reached the driver early in its render submission, and the cap (not the GPU floor) released it. In Gears of War: E-Day with FG 2× at 120 FPS, such frames were ready 28–31 ms after their release; leaving out `d` there settled the lead at 29 ms with half of them ready after their targets. Starvation alone is not enough: with a long lead Gears' first work reached the driver only when the previous frame's Signal came, the GPU then caught up with the held submissions, and keeping `X` for those frames held the lead at 45 ms. Their sample therefore waits for the frame's report (about two intervals); a frame that closes without one leaves `d` out. Where the GPU starts the next frame's work beside the wait (Deep Rock Galactic: Rogue Core, most pairs concurrent), or while the order is unknown, `X` is the measured readiness. A frame's slack, its lateness evidence, always takes the measured readiness at once: a frame the GPU cannot finish by its target is late.
+**Queue order of the GPU waits.** Each GPU wait pairs a release whose GPU waited at it with the next frame's GPU start (from the Reflex report): when the next frame had begun submitting before the release but its GPU work started only after it, that work runs behind the wait. After 32 such pairs with none concurrent, and while Reflex reports keep arriving, the wait's verdict is *behind the wait*; one pair whose next frame's GPU work started more than 0.1 ms before the release ends it at once. Behind the wait, a frame's readiness follows ReLimiter's own release of the previous frame (`r_n = o_{n−1} + P_n`), so the measured `X` is `L + P_n − I` and moves with the lead itself: in CONTROL Resonant with FG 2× at 130 FPS the lead rose from 20 to 39–43 ms after one heavier second and stayed there after the load fell, at about 20 ms more PC latency. Leaving out `d` gives each frame's own work, which the lead can fall back to. The previous frame's frame generation after its gate stays in `X`. A frame whose own late submissions set its readiness keeps `X`, because its readiness then follows its own release, not the previous frame's: the frame's Reflex report shows its GPU waited 1 ms or more inside its work for its submissions while its first work reached the driver early in its render submission, and the cap released it. In Gears of War: E-Day with FG 2× at 120 FPS, such frames were ready 28–31 ms after their release; leaving out `d` there settled the lead at 29 ms with half of them ready after their targets. Starvation alone is not enough: with a long lead Gears' first work reached the driver only when the previous frame's Signal came, the GPU then caught up with the held submissions, and keeping `X` for those frames held the lead at 45 ms. Their sample therefore waits for the frame's report (about two intervals); a frame that closes without one leaves `d` out. Where the GPU starts the next frame's work beside the wait (Deep Rock Galactic: Rogue Core, most pairs concurrent), or while the order is unknown, `X` is the measured readiness. A frame's slack, its lateness evidence, always takes the measured readiness at once: a frame the GPU cannot finish by its target is late.
 
 The lead for the next frame comes from the bucket's samples:
 
 - **Window.** The newest 256 samples. A sample longer than 3 `I` is left out of the lead (it still counts as a missed target).
-- **Warm and warming.** With fewer than 32 samples the bucket is *warming* and the lead is a starting estimate: `I / 2` limited to 1–8 ms. After a hold resumes from an overload pause the bucket starts at the lead its last paused frame was planned with, whether or not it has samples yet, and moves by one lead slew step per frame toward the old median plus the allowance (at least the warm `source_only` lead) until 32 new samples arrive; from 32 samples it moves by the same step toward the warm target. A reset by the cap, the FG multiplier, a new lifecycle or a route change carries no lead and starts from its own estimate. From 32 samples the bucket is *warm*.
-- **Quantile plus allowance.** The warm target is the 99th percentile of the window plus an allowance of 0.5 ms. About 99 of 100 frames are then finished before their target, and the rest are late and never held. The render handoff offset uses the 95th percentile.
+- **Warm and warming.** With fewer than 32 samples the bucket is *warming* and the lead is a starting estimate: `I / 2` limited to 1–8 ms. From 32 samples it moves by one lead slew step per frame toward the warm target. A reset by the cap, the FG multiplier, a new lifecycle or a route change carries no lead and starts from its own estimate. From 32 samples the bucket is *warm*.
+- **Quantile plus allowance.** The warm target is the 99th percentile of the window plus an allowance of 0.5 ms. About 99 of 100 frames are then finished before their target, and the rest are late and never held.
 - **Spike floor.** While a GPU wait's queue order is *behind the wait* (below), the warm target is at least `Q_tail(a) + Γ`. `a` is how long after its release a frame's first GPU work reached the driver, without the time its finished simulation waited for the render thread: `(w − s − q) + F_n`, `F_n` the frame's own RENDERSUBMIT_START → first driver submission, from frames whose first work streamed and whose render thread did not take them only at the previous frame's Signal. `Q_tail` is the second-largest of the maxima of the newest 32 blocks of 64 arrivals, so every arrival of about the last 31 seconds but the longest is covered, and `Γ` the median GPU start → readiness time of the newest 32 frames. The lead's own percentile leaves a game's rare long simulations out, and while the GPU runs back to back a frame whose work arrives that late leaves the GPU idle; every later frame inherits the lost time. The floor gives those frames room at the cost of latency in such scenes. Where the arrival tail is short (lighter scenes, or games whose render thread starts before the simulation ends) it lies below the lead and changes nothing, and it never counts toward the budget below.
 - **Slew.** After the first warm lead, the lead moves toward its target by at most `min(100 µs, I / 64)` per planned frame.
 - **Budget.** The lead is limited to `[0, 3 I]`. Details marks `, at budget` when the wanted lead was longer, so those frames are likely to miss their targets.
 - **Output-specific limits.** On `gpu_queue_wait` the collision-aware release can lower the lead further (see [Protecting Pacing Under Load](#protecting-pacing-under-load)). Nothing else limits the GPU wait's lead.
 - **Other placements.** Present-based pacing uses a fixed 150 µs lead; idle mode and passthrough use 0.
 
-**Frames the overload guard steps aside.** While the overload guard steps an Auto hold aside (the GPU queue wait, the FG input wait, the marker hold or the native hold), the stepped-aside frames are still planned with that hold's lead, never less than the warm `source_only` lead (this floor applies only to frames the guard demoted). Where the lead's hold is the GPU queue wait the collision-aware release limits that demand as it limits held frames. A resume starts from the lead of the last paused frame and moves toward the restarted target one lead slew step per frame. Resets by the cap, the FG multiplier, a new lifecycle or a route change carry nothing.
-
-**Games that wait for the next release.** Some engines finish frame `n`'s Present only after ReLimiter has released frame `n + 1`. ReLimiter's waits for later frames are not that game's time, so the late-output check, and the slack evidence judge such a frame without them. The lead keeps the measured `X`, because such a frame cannot be ready before the release it waits for. In a pipelined engine the next frame's pre-Sleep wait overlaps the previous frame's render submission, so on the GPU waits this credit also covers lateness from the GPU's own throughput: in Gears of War: E-Day with FG 2× at 120 FPS it was 11–12.5 ms on most frames, and of the 12–28% of frames ready after their targets 0.2–1.4% counted, with the GPU running back to back. Counting those frames (crediting only the GPU's idle inside the frame) changed no display measure in Gears or CONTROL Resonant beyond the run-to-run spread and only lengthened the interval about 3%, so the full credit stays.
+**Games that wait for the next release.** Some engines finish frame `n`'s Present only after ReLimiter has released frame `n + 1`. ReLimiter's waits for later frames are not that game's time, so the late-output check, and the slack evidence judge such a frame without them. The lead keeps the measured `X`, because such a frame cannot be ready before the release it waits for. In a pipelined engine the next frame's wait overlaps the previous frame's render submission, so on the GPU waits this credit also covers lateness from the GPU's own throughput: in Gears of War: E-Day with FG 2× at 120 FPS it was 11–12.5 ms on most frames, and of the 12–28% of frames ready after their targets 0.2–1.4% counted, with the GPU running back to back. Counting those frames (crediting only the GPU's idle inside the frame) changed no display measure in Gears or CONTROL Resonant beyond the run-to-run spread and only lengthened the interval about 3%, so the full credit stays.
 
 ### One planned frame
 
@@ -256,25 +254,15 @@ Source: `src/source_stage.h`, `src/source_stage.cpp` (`RunPlannedFrame`, `DrainS
 
 ## Where the Source Wait Happens
 
-The source wait can sit in two places on marker routes (games with NVIDIA Reflex markers or Streamline PCL markers). Present-based pacing, which has no markers, waits at the Present call.
+The source wait can sit in two places on marker routes (games with NVIDIA Reflex markers or Streamline PCL markers): inside the Reflex Sleep call or in the marker call. Present-based pacing, which has no markers, waits at the Present call.
 
 **Marker placement.** The wait runs inside the game's call for the *enforcement marker*, normally SIMULATION_START. The game's thread is blocked in that call until `S`. If a game never sends SIMULATION_START (no admitted one after 200 direct markers while RENDERSUBMIT_START is seen), the enforcement marker falls back to RENDERSUBMIT_START, and returns to SIMULATION_START after 8 consecutive direct SIMULATION_START markers.
 
-**Pre-Sleep placement.** When the game has called the Reflex Sleep within the last second and the enforcement marker is SIMULATION_START, ReLimiter does most of the wait inside the Reflex Sleep call, before the game reads input for the next frame. The marker call then only *trims* what is left, so the game is still released at the exact `S`. The wait aims at the predicted next release minus a *margin*:
-
-```
-pre-wait target = T(next) − L − margin
-```
-
-where `T(next)` is the previous target plus the shorter of the previous interval and the current cap interval (so raising the cap cannot make the wait end late).
-
-The margin covers what happens between the end of the pre-wait and the moment the frame is ready for its marker wait: the timer's overshoot, the driver's own Sleep when it runs, the game's work up to the marker and the marker hook's processing. That time is measured per frame (the *residual*) and the margin is the 99th percentile of the newest 128 residuals plus 150 µs, at least 150 µs; it is 500 µs until 16 residuals exist. A margin larger than the time left only shortens the pre-wait.
-
-A frame gets no pre-wait when the grid cannot predict its release, when the newest plan is older than 2 intervals, when the wait would be shorter than 200 µs (too close, but the residual is still measured) or longer than 2 intervals, or when a pre-wait for that frame already ran. The marker trim paces such a frame. The margin window starts over whenever the driver's Sleep starts or stops running after the hook, because the residual differs between the two.
+**Reflex Sleep wait.** When the game has called the Reflex Sleep within the last second, ReLimiter does the source wait inside that Sleep call, before the game reads input for the next frame; the Details line reads `Placement: unified`. The unified pacer's start law sets when the Sleep returns: the previous release plus the interval, never earlier than the display, the game's own Sleep-mode interval and the GPU's frame time allow, with a bound on the frames the GPU has not finished (see the Developer Reference, *Unified pacer*). Idle caps use the same wait. A game that does not call the Reflex Sleep, and NVIDIA Smooth Motion, wait in the marker call instead.
 
 ### Reflex Sleep bypass
 
-ReLimiter's own wait replaces the driver's Sleep. After the pre-wait (or at once, when there is none) the Sleep hook returns without calling the driver; Reflex markers and the game's Reflex mode still reach the driver. The reason is a single pacer: the driver's Sleep otherwise adds a wait of its own after ReLimiter's, and the two would then pace the game independently.
+ReLimiter's own wait replaces the driver's Sleep. After ReLimiter's wait the Sleep hook returns without calling the driver; Reflex markers and the game's Reflex mode still reach the driver. The reason is a single pacer: the driver's Sleep otherwise adds a wait of its own after ReLimiter's, and the two would then pace the game independently.
 
 The driver's Sleep still runs when ReLimiter is not pacing the source: with no FPS cap, in Dynamic MFG passthrough, without a presenting swapchain, or in the developer test modes (`pacing_test_mode`, see the Developer Reference), where the game's own Sleep runs and ReLimiter either plans nothing or leaves the pacing to the Reflex driver limiter. NVIDIA Smooth Motion skips the Reflex Sleep entirely.
 
@@ -286,16 +274,10 @@ sequenceDiagram
     participant Hook as Reflex Sleep hook
     participant Sched as Scheduler
     participant Driver as Driver Sleep
-    participant Marker as Marker hook
     Game->>Hook: Sleep for frame n
-    Hook->>Sched: record the Sleep and plan the pre-wait
-    opt render handoff limit applies, frame not held, bypass on
-        Hook->>Hook: wait until the render thread took the previous frame
-    end
-    opt pre-wait planned
-        Hook->>Hook: wait until S_next minus margin
-        Hook->>Sched: report the end of the pre-wait
-    end
+    Hook->>Sched: record the Sleep
+    Hook->>Hook: wait until the frame's start target
+    Hook->>Sched: report the end of the wait
     alt bypass on
         Hook-->>Game: return at once
     else driver Sleep runs
@@ -303,12 +285,9 @@ sequenceDiagram
         Driver-->>Hook: returns
         Hook-->>Game: return
     end
-    Game->>Marker: SIMULATION_START of frame n
-    Marker->>Marker: trim the remaining wait to S_n
-    Marker-->>Game: release
 ```
 
-Source: `src/source_placement.h`, `src/source_placement.cpp` (`Decide`), `src/scheduler.cpp` (`Scheduler_PlanReflexSleep`, `PreSleepPredictedIntervalUs`, `DriverSleepRuns`), `src/nvapi_hooks.cpp` (`Hook_Sleep`, enforcement marker fallback), `src/nvapi_hooks.h` (`NvAPI_ShouldBypassSleep`), `src/pacing_resolver.cpp` (`MarkerRoutePlacement`).
+Source: `src/unified_pacer.h`, `src/unified_pacer.cpp`, `src/scheduler.cpp` (`DriverSleepRuns`), `src/nvapi_hooks.cpp` (`Hook_Sleep`, enforcement marker fallback), `src/nvapi_hooks.h` (`NvAPI_ShouldBypassSleep`), `src/pacing_resolver.cpp` (`MarkerRoutePlacement`).
 
 ---
 
@@ -321,7 +300,7 @@ An *output point* (the *rung* in the code) is where the finished frame is held t
 | `gpu_queue_wait` | The GPU's present queue waits for `T` before it runs the frame's present work. A worker thread signals the time fence at `T`; the game's threads are not blocked | 64-bit, DX12, native Reflex (NvAPI) markers with the native Present route qualified, the present queue ready, VRR, no frame generation | A target more than `clamp(3 I, 2 ms, 100 ms)` ahead is *undeliverable* and the frame is presented unheld |
 | `fg_input_wait` | The GPU waits for `T` in front of each *real* frame's entry to frame generation. One wait per real frame, not per generated frame | 64-bit, DX12, native Reflex (NvAPI) markers, frame generation presenting, the FG input route qualified (an FG input reached an FG-ready queue) | Streamline frame generation of 1 to 3 generated frames per real frame (2× to 4×) |
 | `marker_hold` | The CPU holds at the game's PRESENT_START marker until `T` | A marker route (Reflex or Streamline PCL markers) | A hold longer than 1.5 intervals is not performed (undeliverable) |
-| `source_only` | Nothing after the source wait. The frame passes at PRESENT_START | None | Used by Present-based pacing, idle caps, passthrough, unqualified FG and the overload pause |
+| `source_only` | Nothing after the source wait. The frame passes at PRESENT_START | None | Used by Present-based pacing, idle caps, passthrough and unqualified FG |
 
 All executors follow the same contract. They claim the frame's plan, resolve `T` from the grid including the output spacing floor, and: if the target has already passed the frame is *late* and passes at once; if the target lies beyond the executor's limit it is *undeliverable* and passes unheld; otherwise it is *held* until `T`. Each executor records the frame's effective output time, which feeds the grid's output-late rule and the spacing floor.
 
@@ -348,11 +327,6 @@ flowchart TD
     H -->|no| J{"First unmet GPU queue wait requirement"}
     J -->|none| GQ["gpu_queue_wait, reason none"]
     J -->|one unmet| MH["marker_hold, reason architecture, api, fixed_refresh, no_native_route or no_gpu_queue"]
-    FG --> K{"Overload guard active?"}
-    GQ --> K
-    MH --> K
-    K -->|yes| DEM["source_only, reason infeasible"]
-    K -->|no| KEEP["Keep the output and reason"]
 ```
 
 The GPU queue wait requirements are checked in this order, and the first one that fails gives the reason: 64-bit addon (`architecture`), DX12 (`api`), VRR (`fixed_refresh`), native Present route qualified (`no_native_route`), present queue ready (`no_gpu_queue`). They do not mean pacing has failed; the frame is held by `marker_hold` meanwhile.
@@ -375,12 +349,12 @@ Every executor checks the clock against `T` before it holds anything. A frame th
 
 On `gpu_queue_wait`, a late resume happens when the work after the wait becomes ready while the game's next frame already runs a long command buffer on the same GPU engine: the GPU does not interrupt it, so the resume waits. The release headroom limits the lead so the release does not land in that window. The lead is `L = min(Q_q(X) + allowance, I + Q10(D) − H)`, at most `3 I`:
 
-- **Release headroom `H`.** The limit is `I + Q10(D) − H`, where `D` is a frame's time from source release to the start of its heavy GPU work (GPU ready time minus the GPU active render time from its Reflex latency report) and `Q10` is the 10th percentile of the newest 256 values. A frame adds a `D` sample only when the frame before it was a GPU wait frame whose GPU waited at its gate: only a waited release can collide with the next frame's heavy work. While that verdict is pending (the readback probe of that frame's resume has not arrived yet) the sample is deferred and added when the verdict is known; readiness decides only when no probe time is available. A frame after one that was not waited for, was stepped aside by the overload guard, or belongs to another lifecycle or FG multiplier adds none. `H` is a fixed 1.0 ms.
+- **Release headroom `H`.** The limit is `I + Q10(D) − H`, where `D` is a frame's time from source release to the start of its heavy GPU work (GPU ready time minus the GPU active render time from its Reflex latency report) and `Q10` is the 10th percentile of the newest 256 values. A frame adds a `D` sample only when the frame before it was a GPU wait frame whose GPU waited at its gate: only a waited release can collide with the next frame's heavy work. While that verdict is pending (the readback probe of that frame's resume has not arrived yet) the sample is deferred and added when the verdict is known; readiness decides only when no probe time is available. A frame after one that was not waited for, or that belongs to another lifecycle or FG multiplier, adds none. `H` is a fixed 1.0 ms.
 - **Release margin `M`.** Without current Reflex GPU active times (none within the newest 64 frames planned with the GPU wait's lead), the same guard uses the time to the next frame's Present call: at most `I + Q10(C) − M`, with `C` the release-to-Present-call time (every GPU wait frame adds one). `M` is fixed at 2.5 ms.
 - Either limit applies once 32 samples exist. Nothing widens or narrows `H` or `M`. Late resumes (more than 1 ms after the release) are measured and shown on the OSD and in telemetry, but nothing acts on them. In about 1.35 million waited GPU resumes with probes and Reflex GPU times in Deep Rock Galactic: Rogue Core, late resumes were 0.00–0.05% per 250 µs distance bin from 1 ms on, and 99.2% of them were closer than 1 ms. A headroom that was learned from late resumes had widened to 1.75 ms from 10 of 123 resumes at a session's start and could not narrow again, because the guard keeps releases out of the region it would have to measure.
 - **A relaxing limit does not jump the lead.** A tighter limit applies at once. When it relaxes, or the guard stands aside, the lead returns to the unguarded lead at the lead slew (`min(100 µs, I / 64)` per planned frame), never in one step. The frames the slew still holds back count as the guard's own reduction.
 - **Frames that need more lead** reach their gate after the release and are shown when they are ready. Their slack is judged against the lead before the limit.
-- **Standing aside.** Some games run the next frame's GPU work behind the wait (one queue, in order); the wait cannot delay it there. For each waited release whose next frame had begun submitting, the guard compares the next frame's GPU start with the release. It stands aside only while at least 32 such pairs exist, none of the newest 64 began more than 100 µs before the release, and the heavy-work window is current (a Reflex GPU active time arrived within the newest 64 frames planned with the GPU wait's lead). Every such frame ages the window, whether it was held or stepped aside by the overload guard, and any Reflex report of one resets the age, with or without a new `D` sample; the age is not tied to `D` samples. Without current Reflex reports the Present-call margin guard applies until a report arrives. One pair that did begin earlier restores the guard at once. The pairs are kept across resets; after a lifecycle reset the guard waits for a warm heavy-work window (32 frames) before standing aside again. No GPU load, timer or mode switch is involved.
+- **Standing aside.** Some games run the next frame's GPU work behind the wait (one queue, in order); the wait cannot delay it there. For each waited release whose next frame had begun submitting, the guard compares the next frame's GPU start with the release. It stands aside only while at least 32 such pairs exist, none of the newest 64 began more than 100 µs before the release, and the heavy-work window is current (a Reflex GPU active time arrived within the newest 64 frames planned with the GPU wait's lead). Every such frame ages the window, whether it was held, and any Reflex report of one resets the age, with or without a new `D` sample; the age is not tied to `D` samples. Without current Reflex reports the Present-call margin guard applies until a report arrives. One pair that did begin earlier restores the guard at once. The pairs are kept across resets; after a lifecycle reset the guard waits for a warm heavy-work window (32 frames) before standing aside again. No GPU load, timer or mode switch is involved.
 
 ```mermaid
 flowchart TD
@@ -397,75 +371,9 @@ flowchart TD
     G --> H
 ```
 
-### Overload guard
-
-When the game cannot reach the cap, holding frames costs more than it gains, but only where ReLimiter's own waits or the render handoff limit can change anything. The overload guard watches every planned VRR or fixed-refresh frame whose Auto output is a hold (`marker_hold`, `gpu_queue_wait` or `fg_input_wait`). A *restart* is an `OutputLate` epoch or a `SourceLate` epoch that the pre-Sleep wait itself did not cause, attributed to the frame whose output or source it was (a frame with both counts once).
-
-- **Evidence per frame.** Each judged frame keeps a record until its own output has been observed and its hold verdict is known, however many frames have been planned since, so a delayed `OutputLate` stays on its own frame. A pending verdict waits too. The 32-entry record ring is the only bound: when it is full the oldest record resolves as unknown, which counts as held, with only the restarts already known. A reset drops the records, and a later `OutputLate` of a dropped frame is ignored.
-- **What counts toward the pause.** A restart counts only if some frame since the previous restart (that restart frame included) was held by ReLimiter's own waits (the pre-Sleep or source wait, a GPU wait whose GPU waited at its gate, a CPU hold released after it began), would have been held by the render handoff limit, or has no verdict (the slot expired or was discarded, or the record was dropped from a full ring: counts as held). The restart frame opens the next segment. In a GPU-bound stretch of a game that runs its frames one after another, none of ReLimiter's waits acts and the frames reach ReLimiter later than planned only by the GPU's back-pressure: such restarts do not count toward the pause, because taking the holds away would change nothing. Holds stay on there, at about +1 ms of PC latency while the GPU is the limit. A cap the game truly cannot reach still pauses: the render handoff limit then acts on its frames, and its restarts count.
-- **Lateness ReLimiter chose.** An `OutputLate` restart whose output is no later than the target plus the late tolerance plus the frame's own collision-aware reduction counts neither toward the pause nor against its end.
-- **Pause.** More than 10% of the frames in a window of at least 1 s were counted restarts. Every Auto hold then resolves to `source_only` with reason `infeasible`.
-- **Resume.** The first whole 2 s window without any restart other than a guard-chosen `OutputLate`. While paused no frame is held, so restarts that would not count toward the pause still keep it. The paused hold's lead is the first lead after the resume, and it then moves one lead slew step per frame toward the restarted target (see [How the lead is learned](#how-the-lead-is-learned)). The FG input wait and the CPU holds resume the same way.
-- ReLimiter keeps pacing the source during the pause and the Sleep stays bypassed, so the guard judges the same pacing it resumes into. The paused hold's frames are planned with its lead (the paragraph *Frames the overload guard steps aside* under [How the lead is learned](#how-the-lead-is-learned)).
-- Lifecycle, cap, FG multiplier and route changes end a pause and carry no lead.
-
-```mermaid
-stateDiagram-v2
-    [*] --> Holding
-    Holding --> Paused : over 10 percent of frames in a window of 1 s or more were counted restarts
-    Paused --> Holding : first whole 2 s window without a restart other than guard-chosen OutputLate lateness
-    Paused --> Holding : reset by a lifecycle, cap, FG multiplier or route change
-    Holding : Auto output point is active
-    Paused : every Auto hold is source_only with reason infeasible
-```
-
-### Render handoff limit
-
-During an overload pause (and anywhere a frame is not held), nothing else stops a game that simulates ahead of its render thread from queueing finished frames when the cap cannot be held. The render handoff limit releases such a frame no earlier than
-
-```
-A(n) = max( w(n−1) + d, Ĝ(n−1) − (P/2 + F + σ) )
-```
-
-where `w(n−1)` is RENDERSUBMIT_START of the newest released frame, the moment the render thread took it, and `d` is learned from the frames' own timing. `d` comes from samples `h = (b(n−1) − w(n−1)) − (e(n) − s(n))`: how much later frame `n` could have been released and still have ended its simulation (`e`, SIMULATION_END) before the render thread left the previous frame's Present (`b`, PRESENT_END). It is the 5th percentile of the newest 256 samples (`1 − 0.95`) minus the 0.5 ms allowance, never below 0, and 0 until 16 samples exist. A serial engine (render after simulation) gives `h < 0` and `d = 0`, so the limit never binds there.
-
-The second part, the **GPU floor**, covers a render thread that the GPU holds back inside its own window, where `h` cannot see it. Gears of War: E-Day does this at 120 FPS with FG 2× in the overload pause, where it is GPU-bound: when its render thread starts frame `n` more than about 11 ms before the GPU finishes frame `n − 1`, almost nothing of frame `n` often reaches the driver until the GPU nears that end, and the run of held-back frames that follows starts with a stretched GPU frame (a stutter). The driver's Reflex Sleep releases the game at the GPU's own rate (simulation starts 17.12 ms apart, varying by only 0.7 ms, for a GPU frame period of 17.09 ms) and starts the render thread 9.4 ms before the previous GPU end; it never sees the render thread held back. The GPU floor does the same from measurements:
-
-- `Ĝ(n−1)` is when the GPU will finish frame `n − 1`: the later of the newest NVIDIA Reflex report's GPU end (`gpuRenderEndTime`) plus `P` for each frame in between (reports reach ReLimiter about two frames after the GPU end, so this looks about four frames ahead), and the render thread's newest PRESENT_END, seen as it happens, plus the 5th percentile of the reports' PRESENT_END → GPU end gap plus `P` per frame in between. The second sees a frame whose GPU frame stretched two frames before its report does.
-- `P` is the GPU's frame period: the median time between the GPU ends of consecutive frames the GPU did not wait for (it started them at most 1 ms after the previous end).
-- `F` is the game's own delay from RENDERSUBMIT_START to the frame's first work reaching the driver: the median over frames whose first work came in the first half of the render thread's window.
-- `σ` is the time from a release to RENDERSUBMIT_START: the median over frames that are not held.
-
-All are medians of the newest 256 values and apply once 32 exist. The frame's render thread then starts `P/2 + F` before the GPU finishes the previous frame, so its first work reaches the driver half a GPU frame before then: midway between none of the frame queued ahead of the GPU (the GPU would wait) and all of it (a frame ahead). For Gears that is 17.09 / 2 + 0.85 = 9.4 ms, the driver's position. The floor only ever delays a release: a game whose render thread starts later than that against the GPU (CONTROL Resonant 3.9 ms, Deep Rock Galactic: Rogue Core 4.4 ms) is never held by it, and a game whose GPU waits for its frames has no `P` and no floor. Nothing is learned from frames that went wrong: a rule that moved the release later after each held-back frame had to find the edge by hitting it, and each run of held-back frames starts with a stutter. A free-running cadence at `P` would follow GPU changes only through reports two frames old; in a model it fell 2–4 ms further toward the edge after a 0.5 ms GPU change than releases anchored to the newest GPU end.
-
-With an offset from `w(n−1)` alone, Gears in that pause had 80% of frames held back, 36 long displayed frames and 184 jumps above 4 ms per 1,000 and a real-frame PC latency of 46 ms; with the driver's Reflex Sleep none were held back, no displayed frame was long and the latency was 40 ms.
-
-- **Applies to** frames that are not held (`source_only`), in VRR or fixed mode, released at SIMULATION_START by marker or pre-Sleep placement, while the driver's Sleep does not run. Held frames are not limited: on held frames the render-thread part moved CONTROL Resonant's simulation into its render thread's submission.
-- **Where the wait runs.** With pre-Sleep placement inside the Reflex Sleep hook, before the game reads input; with marker placement in the marker hook. The grid sees `A` as the frame's arrival, so a limit beyond `S` restarts the cadence like any late source, and the overload guard still sees the overload.
-- **The stall rule.** A wait ends when the render thread took no frame for 3 of its own frame times (the median of the newest 32 intervals between its handoffs of consecutive frames, without handoffs that came after a stalled wait for them; at least 3 intervals); the frame is then released. Seeing the render thread take a frame before the next frame's release (checked at every frame, limited or not, and by every handoff sample) shows that it does not wait for that release; from then on, within the producer epoch, a stall is a hitch and the limit stays on. Before that, 2 stalled waits in a row turn the limit off: a render thread that waits for the next release stalls every wait. It stays off until the render thread is seen taking a frame before the next release or the next lifecycle, cap, FG multiplier or route change. A handoff older than 1 s counts as no stream and no limit applies.
-
 **The driver's in-Present pacing.** With DLSS Frame Generation and the Reflex Sleep bypassed, the NVIDIA driver still paces the game: it sleeps the thread that calls the game's Present inside `NvAPI_D3D12_SetAsyncFrameMarker` (Streamline's `sl.dlss_g`, through `sl.common`). Which thread that is decides the result. In CONTROL Resonant it is the render thread that starts the next frame, so the sleep is benign and pacing is good. In Gears of War: E-Day it is the engine's RHI submission thread, held about 0.6 ms after the render thread has already started the next frame: that frame's GPU work is submitted late in one burst and the GPU idles (6.3 ms per stalled frame in the trace). Returning to the driver's Sleep fixes Gears and makes CONTROL much worse. ReLimiter only times the marker call (the `async_marker_wait_us` column); it never suppresses, delays or alters it.
 
-```mermaid
-sequenceDiagram
-    participant Sim as Game simulation thread
-    participant RL as ReLimiter
-    participant Render as Game render thread
-    Render->>RL: RENDERSUBMIT_START of frame n−1, the handoff w
-    Note over RL: A = max(w plus d, GPU floor) (d from h, the floor from Reflex reports)
-    Sim->>RL: frame n reaches its release
-    alt handoff of frame n−1 not yet seen
-        RL->>RL: wait for the handoff, up to 3 render-thread frame times
-    end
-    alt S is at or after A
-        RL-->>Sim: release at S
-    else S is before A
-        RL-->>Sim: release at A, the grid sees a late source
-    end
-    Note over RL,Sim: after 3 render-thread frame times without a handoff the frame is released anyway
-```
-
-Source: `src/rung_feasibility.h`, `src/rung_feasibility.cpp` (`HoldFeasibility`), `src/lead_controller.h`, `src/lead_controller.cpp` (`CollisionGuardedLeadUs`, `CollisionOffsetUs`, `HandoffOffsetUs`, `RecordHandoff`), `src/scheduler.cpp` (`HandoffLimitApplies`, `HandoffEarliestRelease`, `RenderHandoffStalled`, `RecordGovernorMiss`), `src/render_handoff.h`, `src/nvapi_hooks.cpp` (`Hook_Sleep`), `src/gpu_present_gate.cpp` (`GpuPresent_HorizonTicks`), `src/presentation_gate.cpp` (`PresentGate_Execute`).
+Source: `src/lead_controller.h`, `src/lead_controller.cpp` (`CollisionGuardedLeadUs`, `CollisionOffsetUs`), `src/nvapi_hooks.cpp` (`Hook_Sleep`), `src/gpu_present_gate.cpp` (`GpuPresent_HorizonTicks`), `src/presentation_gate.cpp` (`PresentGate_Execute`).
 
 ### Pacing preference
 
@@ -483,7 +391,7 @@ I = (1 / cap) × FG divisor
 
 At a 120 FPS cap with 2× FG, real frames are `I = 16.7 ms` apart and the display shows two frames per interval.
 
-**The FG divisor.** The divisor is 1 without FG and 2 or more once FG is confirmed active, taken from the sources in this order: NVIDIA Smooth Motion, the driver profile override, the actual multiplier from the FG state, the configured Streamline state, and finally positive Reflex AI frame evidence when Streamline has not reported FG off. The scheduler resolves it once per frame and the OSD and frame splitting read that same value. A change of the raw divisor is a `PeriodChange` epoch and resets the overload guard and the pre-Sleep margin window. The grid interval follows a linear ramp over 50 ms after a toggle; those frames are silent rebases.
+**The FG divisor.** The divisor is 1 without FG and 2 or more once FG is confirmed active, taken from the sources in this order: NVIDIA Smooth Motion, the driver profile override, the actual multiplier from the FG state, the configured Streamline state, and finally positive Reflex AI frame evidence when Streamline has not reported FG off. The scheduler resolves it once per frame and the OSD and frame splitting read that same value. A change of the raw divisor is a `PeriodChange` epoch. The grid interval follows a linear ramp over 50 ms after a toggle; those frames are silent rebases.
 
 **Pacing real frames.** With FG presenting, Auto uses `fg_input_wait` once its route has qualified: the GPU waits in front of each real frame's entry to frame generation, so real frames enter FG on the cadence. Until it qualifies, nothing is held (`source_only`, reason `fg_unqualified`); FG without its route is not held at a marker. Frame generation that presents from its own thread and queue cannot qualify (`source_only`, reason `fg_route_unsupported`): without hardware flip metering, DLSS Frame Generation presents each group after its worker has released the game's queue, so no Present belongs to the worker's cycle. Where the FG input wait cannot run (the 32-bit addon, an API other than DX12, or markers from Streamline PCL), the reason names that requirement instead (`architecture`, `api`, `no_native_route`). The lead of `fg_input_wait` leaves out the game's simulation to render queue time `q`, because a pipelined game's finished frame otherwise waits there and the lead would learn that wait as part of its pipeline.
 
@@ -565,8 +473,3 @@ Source: `src/feedback.cpp`, `src/feedback.h`, `src/reflex_clock_map.h`, `src/pac
 | `w` | RENDERSUBMIT_START: the moment the game's render thread takes a frame. |
 | `e`, `b` | SIMULATION_END and PRESENT_END markers of a frame. |
 | `q` | The time a finished frame waited for the render thread to leave the previous Present; left out of the `fg_input_wait` lead. |
-| `h` | One render handoff sample: `(b(n−1) − w(n−1)) − (e(n) − s(n))`. |
-| `d` | The render handoff offset: the 5th percentile of `h` minus the allowance, at least 0. |
-| `P`, `F`, `σ` | The render handoff GPU floor's measurements: the GPU frame period of consecutive frames the GPU did not wait for, the delay from RENDERSUBMIT_START to the frame's first work reaching the driver when the work streams, and the time from a release to RENDERSUBMIT_START of frames not held; medians of the newest 256, used from 32. |
-| `Ĝ` | The predicted GPU end of the newest released frame: the later of the newest Reflex report's GPU end and the render thread's newest PRESENT_END plus the low end of its gap to the GPU end, each plus `P` per frame in between. |
-| `A` | The earliest release of the render handoff limit: `A(n) = max(w(n−1) + d, Ĝ(n−1) − (P/2 + F + σ))`. |

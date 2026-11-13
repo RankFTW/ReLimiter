@@ -720,7 +720,7 @@ struct LeadFrameStart {
     bool gpu_target = false;
     // The Auto hold rung that planned this frame's lead while the overload
     // guard or a not-held A/B block demoted the frame to `rung` (source
-    // only; PacingPipeline_LeadRung); SourceOnly when the frame was not
+    // only; the resolver no longer demotes, stage B2 removes the field); SourceOnly when the frame was not
     // demoted. A frame planned with the GPU queue wait's lead ages and
     // refreshes the heavy-work window like a held one (above).
     PacingRung demoted_from = PacingRung::SourceOnly;

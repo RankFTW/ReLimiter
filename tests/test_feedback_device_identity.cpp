@@ -21,6 +21,7 @@ void FgInput_RecordMarker(uint64_t, uint32_t, uint32_t, int64_t) noexcept {}
 #include "frame_plan.h"
 #include "pacing_resolver.h"
 #include "presentation_gate.h"
+#include "render_handoff.h"
 #include "runtime_lifecycle.h"
 #include "scheduler.h"
 #include "streamline_hooks.h"
@@ -47,19 +48,17 @@ void FgInput_RecordMarker(uint64_t, uint32_t, uint32_t, int64_t) noexcept {}
 #include "pacing_resolver.h"
 #include <atomic>
 std::atomic<bool> g_reflex_sleep_bypass{false};
-std::atomic<bool> g_bypass_low_latency_off{false};
-std::atomic<bool> g_driver_low_latency_off{false};
 std::atomic<bool> g_sleep_status_every_frame{false};
-std::atomic<bool> g_marker_forward_after_wait{false};
 std::atomic<bool> g_gpu_start_probe{false};
-#define PacingPipeline_SleepBypass() (g_reflex_sleep_bypass.load(std::memory_order_relaxed))
-#define kPacingBypassLowLatencyOff (g_bypass_low_latency_off.load(std::memory_order_relaxed))
-#define kPacingDriverLowLatencyOff (g_driver_low_latency_off.load(std::memory_order_relaxed))
+// The bypass tests below (TestSleepBypassDecision) pin the real contract instead: with g_sleep_bypass_from_test_mode
+// set, PacingPipeline_SleepBypass() is the production inline (RealPacingPipelineSleepBypass: the published test mode is Off).
+inline bool RealPacingPipelineSleepBypass() noexcept { return PacingPipeline_SleepBypass(); }
+std::atomic<bool> g_sleep_bypass_from_test_mode{false};
+#define PacingPipeline_SleepBypass() \
+    (g_sleep_bypass_from_test_mode.load(std::memory_order_relaxed) ? RealPacingPipelineSleepBypass() \
+                                                                   : g_reflex_sleep_bypass.load(std::memory_order_relaxed))
 #define kPacingSleepStatusEveryFrame (g_sleep_status_every_frame.load(std::memory_order_relaxed))
 #define kPacingGpuStartProbe (g_gpu_start_probe.load(std::memory_order_relaxed))
-#define kPacingMarkerForwardOrder \
-    (g_marker_forward_after_wait.load(std::memory_order_relaxed) ? PacingMarkerForwardOrder::AfterWait \
-                                                                 : PacingMarkerForwardOrder::BeforeWait)
 
 #include "../src/nvapi_hooks.cpp"
 
@@ -200,23 +199,15 @@ uint64_t s_native_swapchain_generation = 1;
 bool s_smooth_motion = false;
 unsigned s_sleep_calls = 0;
 bool s_paces_source = true; // Scheduler_PacesSource
-// Render handoff limit in the Sleep hook (Scheduler_* stubs below).
-bool s_pre_sleep_active = false;
-uint64_t s_handoff_frame = 0;      // Scheduler_RenderHandoffFrame; 0 = not limited
-unsigned s_handoff_stalls = 0;     // Scheduler_RenderHandoffStalled calls
-int64_t s_planned_handoff_qpc = -1; // handoff_qpc of the newest Scheduler_PlanReflexSleep
-int64_t s_planned_sleep_entry_qpc = -1; // sleep_entry_qpc of the newest Scheduler_PlanReflexSleep
-int64_t s_planned_now_qpc = -1;         // now_qpc of the newest Scheduler_PlanReflexSleep
+// When set, the Scheduler_PacesSource / UnifiedActive stubs answer from the published pipeline exactly as
+// scheduler.cpp does, instead of from the flags of the other tests.
+bool s_scheduler_from_pipeline = false;
+unsigned s_record_sleep_calls = 0;   // Scheduler_RecordReflexSleep calls
+int64_t s_recorded_sleep_qpc = 0;    // and its newest argument
 unsigned s_driver_sleep_calls = 0;       // Scheduler_EndDriverSleep calls
 int64_t s_driver_sleep_start_qpc = 0;    // its newest stamps
 int64_t s_driver_sleep_end_qpc = 0;
-bool s_driver_hold_active = false;        // Scheduler_DriverLimiterHoldActive
-unsigned s_sleep_entry_records = 0;       // Scheduler_RecordReflexSleepEntry calls
-int64_t s_recorded_entry_qpc = 0;         // and its newest argument
-bool s_plan_waits = false;                // Scheduler_PlanReflexSleep plans a pre-wait
-bool s_plan_precise = false;              // and reports the developer key pre_sleep_precise
-unsigned s_plan_calls = 0;                // Scheduler_PlanReflexSleep calls
-unsigned s_pre_sleep_waits = 0;           // PreSleepWaitUntil calls
+unsigned s_pre_sleep_waits = 0;           // PreSleepWaitUntil calls (the unified start wait)
 int64_t s_pre_sleep_wait_target = 0;      // and its newest arguments
 bool s_pre_sleep_wait_precise = false;
 int64_t s_pre_sleep_max_ahead = 0;        // the longest wait PreSleepWaitUntil was asked for (ticks)
@@ -302,102 +293,6 @@ void TestReflexCallForwarding() {
     CHECK(Hook_Sleep(&device)==-7 && s_sleep_calls==bypass_calls+2);
     g_reflex_sleep_bypass=false;
 
-    // Render handoff limit: a bypassed Sleep
-    // waits until the render thread has taken the newest released frame, then
-    // plans the pre-wait with that handoff, before the game reads input.
-    g_reflex_sleep_bypass=true;g_user_target_fps=157;
-    s_pre_sleep_active=true;
-    // Stall span 3 I = 60 ms: each Sleep below can overrun by a whole 15.6 ms
-    // timer tick.
-    g_effective_interval_us=20000.0;
-    RenderHandoff_Publish(1, 7, 41, RealQpc());
-    s_handoff_frame=42;
-    std::atomic<int64_t> published_qpc{0};
-    const int64_t wait_start=RealQpc();
-    std::thread render_thread([&published_qpc] {
-        Sleep(3);
-        const int64_t qpc = RealQpc();
-        published_qpc = qpc;
-        RenderHandoff_Publish(1, 7, 42, qpc);
-    });
-    CHECK(Hook_Sleep(&device)==NVAPI_OK);
-    render_thread.join();
-    CHECK(s_planned_handoff_qpc==published_qpc.load() && s_planned_handoff_qpc>wait_start);
-    CHECK(s_handoff_stalls==0);
-    // The game reached ReLimiter at the hook's entry, before the handoff
-    // wait; the pre-wait is planned from after it.
-    CHECK(s_planned_sleep_entry_qpc>0 && s_planned_sleep_entry_qpc<=wait_start+us_to_qpc(1000.0));
-    CHECK(s_planned_now_qpc>=published_qpc.load());
-    // Frames 43 and 44 are still queued ahead of frame 45: each handoff is
-    // progress, so the wait outlives the 60 ms span and ends at frame 45.
-    s_handoff_frame=45;
-    const int64_t drain_start=RealQpc();
-    std::thread draining_thread([&published_qpc] {
-        for (uint64_t frame = 43; frame <= 45; ++frame) {
-            Sleep(30);
-            const int64_t qpc = RealQpc();
-            published_qpc = qpc;
-            RenderHandoff_Publish(1, 7, frame, qpc);
-        }
-    });
-    CHECK(Hook_Sleep(&device)==NVAPI_OK);
-    draining_thread.join();
-    CHECK(s_planned_handoff_qpc==published_qpc.load() && s_handoff_stalls==0);
-    CHECK(s_planned_handoff_qpc-drain_start>=us_to_qpc(80000.0));
-    // The render thread takes no frame: the wait ends after 3 I, is
-    // reported, and the pre-wait is planned without a handoff.
-    s_handoff_frame=46;
-    const int64_t stall_start=RealQpc();
-    CHECK(Hook_Sleep(&device)==NVAPI_OK);
-    CHECK(s_handoff_stalls==1 && s_planned_handoff_qpc==0);
-    CHECK(RealQpc()-stall_start>=us_to_qpc(55000.0));
-    // Another producer's handoff ends the wait at once without a stall.
-    RenderHandoff_Publish(1, 8, 1, RealQpc());
-    CHECK(Hook_Sleep(&device)==NVAPI_OK && s_handoff_stalls==1 && s_planned_handoff_qpc==0);
-    // The stall span follows the render thread's own frame time: 17
-    // consecutive handoffs 30 ms apart set it to 30 ms, so a wait with a 1 ms
-    // floor ends only after three of those frame times. A frame gap is not an
-    // interval, and another stream has no frame time.
-    {
-        const int64_t now = RealQpc();
-        for (uint64_t frame = 1; frame <= 17; ++frame) {
-            RenderHandoff_Publish(1, 9, frame, now - us_to_qpc(30000.0 * static_cast<double>(17 - frame)));
-        }
-        const int64_t cycle = RenderHandoff_CycleTicks(1, 9);
-        CHECK(cycle >= us_to_qpc(30000.0) - 1 && cycle <= us_to_qpc(30000.0) + 1);
-        CHECK(RenderHandoff_CycleTicks(1, 7) == 0);
-        RenderHandoff_Publish(1, 9, 19, now + us_to_qpc(1000.0));
-        CHECK(RenderHandoff_CycleTicks(1, 9) == cycle);
-        int64_t handoff_qpc = 0;
-        const int64_t start = RealQpc();
-        CHECK(RenderHandoff_WaitFor(1, 9, 20, us_to_qpc(1000.0), &handoff_qpc) == RenderHandoffWait::Deadline);
-        CHECK(RealQpc() - start >= us_to_qpc(85000.0));
-        // A render thread that takes each frame only after its wait stalled
-        // (200 ms apart here) leaves the frame time unchanged, so its stall
-        // span does not grow with its own stalls.
-        for (uint64_t frame = 20; frame <= 40; ++frame) {
-            if (frame > 20) {
-                CHECK(RenderHandoff_WaitFor(1, 9, frame, 0, &handoff_qpc) == RenderHandoffWait::Deadline);
-            }
-            RenderHandoff_Publish(1, 9, frame, now + us_to_qpc(1000.0 + 200000.0 * static_cast<double>(frame - 19)));
-        }
-        CHECK(RenderHandoff_CycleTicks(1, 9) == cycle);
-        // Frames no wait stalled for count again: 20 intervals of 200 ms are
-        // most of the window.
-        for (uint64_t frame = 41; frame <= 60; ++frame) {
-            RenderHandoff_Publish(1, 9, frame, now + us_to_qpc(1000.0 + 200000.0 * static_cast<double>(frame - 19)));
-        }
-        const int64_t slow_cycle = RenderHandoff_CycleTicks(1, 9);
-        CHECK(slow_cycle >= us_to_qpc(200000.0) - 1 && slow_cycle <= us_to_qpc(200000.0) + 1);
-    }
-    // The driver's Sleep runs (bypass off): no handoff wait.
-    g_reflex_sleep_bypass=false;
-    s_planned_handoff_qpc=-1;
-    CHECK(Hook_Sleep(&device)==-7 && s_planned_handoff_qpc==0);
-    s_handoff_frame=0;
-    s_pre_sleep_active=false;
-    g_user_target_fps=0;
-
     // 0 forward, 2 device cleared during Sleep, 4 native fault,
     // 5 Smooth Motion bypass (x64 only), 6 no original trampoline.
     for (int scenario : {0, 2, 4, 5, 6}) {
@@ -439,6 +334,44 @@ void TestReflexCallForwarding() {
     NvAPI_ClearFeedbackDevice();
 }
 
+// The render handoff's stall span follows the render thread's own frame time: 17 consecutive
+// handoffs 30 ms apart set it to 30 ms, so a wait with a 1 ms floor ends only after three of
+// those frame times. A frame gap is not an interval, and another stream has no frame time.
+// (The Sleep hook no longer waits on the handoff; render_handoff.cpp keeps these functions
+// until stage B2.)
+void TestRenderHandoffStallSpan() {
+    const int64_t now = RealQpc();
+    for (uint64_t frame = 1; frame <= 17; ++frame) {
+        RenderHandoff_Publish(1, 9, frame, now - us_to_qpc(30000.0 * static_cast<double>(17 - frame)));
+    }
+    const int64_t cycle = RenderHandoff_CycleTicks(1, 9);
+    CHECK(cycle >= us_to_qpc(30000.0) - 1 && cycle <= us_to_qpc(30000.0) + 1);
+    CHECK(RenderHandoff_CycleTicks(1, 7) == 0);
+    RenderHandoff_Publish(1, 9, 19, now + us_to_qpc(1000.0));
+    CHECK(RenderHandoff_CycleTicks(1, 9) == cycle);
+    int64_t handoff_qpc = 0;
+    const int64_t start = RealQpc();
+    CHECK(RenderHandoff_WaitFor(1, 9, 20, us_to_qpc(1000.0), &handoff_qpc) == RenderHandoffWait::Deadline);
+    CHECK(RealQpc() - start >= us_to_qpc(85000.0));
+    // A render thread that takes each frame only after its wait stalled
+    // (200 ms apart here) leaves the frame time unchanged, so its stall
+    // span does not grow with its own stalls.
+    for (uint64_t frame = 20; frame <= 40; ++frame) {
+        if (frame > 20) {
+            CHECK(RenderHandoff_WaitFor(1, 9, frame, 0, &handoff_qpc) == RenderHandoffWait::Deadline);
+        }
+        RenderHandoff_Publish(1, 9, frame, now + us_to_qpc(1000.0 + 200000.0 * static_cast<double>(frame - 19)));
+    }
+    CHECK(RenderHandoff_CycleTicks(1, 9) == cycle);
+    // Frames no wait stalled for count again: 20 intervals of 200 ms are
+    // most of the window.
+    for (uint64_t frame = 41; frame <= 60; ++frame) {
+        RenderHandoff_Publish(1, 9, frame, now + us_to_qpc(1000.0 + 200000.0 * static_cast<double>(frame - 19)));
+    }
+    const int64_t slow_cycle = RenderHandoff_CycleTicks(1, 9);
+    CHECK(slow_cycle >= us_to_qpc(200000.0) - 1 && slow_cycle <= us_to_qpc(200000.0) + 1);
+}
+
 bool SameModeExceptLowLatency(const NV_SET_SLEEP_MODE_PARAMS& a, const NV_SET_SLEEP_MODE_PARAMS& b) {
     return a.version == b.version && a.minimumIntervalUs == b.minimumIntervalUs &&
         a.bUseMarkersToOptimize == b.bUseMarkersToOptimize && a.bUseMinQueueTime == b.bUseMinQueueTime &&
@@ -448,144 +381,14 @@ bool SameMode(const NV_SET_SLEEP_MODE_PARAMS& a, const NV_SET_SLEEP_MODE_PARAMS&
     return SameModeExceptLowLatency(a, b) && a.bLowLatencyMode == b.bLowLatencyMode &&
         a.bLowLatencyBoost == b.bLowLatencyBoost;
 }
-bool IsLowLatencyOffCopy(const NV_SET_SLEEP_MODE_PARAMS& forwarded, const NV_SET_SLEEP_MODE_PARAMS& game) {
-    return forwarded.bLowLatencyMode == 0 && forwarded.bLowLatencyBoost == 0 &&
-        SameModeExceptLowLatency(forwarded, game);
-}
 
-// Developer A/B bypass_low_latency_off: while the Sleep is bypassed the
-// driver's low latency mode is turned off through SetSleepMode, once per
-// transition, and the game's own SetSleepMode calls cannot undo it; leaving
-// the bypass (or the key) sends the game's newest parameters exactly.
-void TestBypassLowLatencyOff() {
-    FakeDevice device;
-    CHECK(NvAPI_CaptureFeedbackDevice(&device));
-    const auto old_sleep = s_orig_sleep;
-    const auto old_mode = s_orig_sleep_mode;
-    s_orig_sleep = FakeDriverSleep;
-    s_orig_sleep_mode = FakeSleepMode;
-    s_expected_mode_params = nullptr;
-    s_mode_result = NVAPI_OK;
-    s_record_modes = true;
-    s_forwarded_modes.clear();
-    g_reflex_sleep_bypass = true;
-    g_user_target_fps = 157;
-    s_paces_source = true;
-    g_bypass_low_latency_off = true;
-
-    // No game parameters captured yet: nothing to apply, the state stays off.
-    CHECK(Hook_Sleep(&device) == NVAPI_OK && s_forwarded_modes.empty());
-    CHECK(!s_low_latency_forced_off.load());
-
-    NV_SET_SLEEP_MODE_PARAMS game{};
-    game.version = NV_SLEEP_PARAMS_VER;
-    game.bLowLatencyMode = game.bLowLatencyBoost = 1;
-    game.minimumIntervalUs = 4321;
-    game.bUseMarkersToOptimize = game.bUseMinQueueTime = 1;
-    game.rsvd[3] = 9;
-    game.rsvd[29] = 7;
-    // The game's call before any override is forwarded as it is.
-    CHECK(Hook_SetSleepMode(&device, &game) == NVAPI_OK);
-    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], game));
-    s_forwarded_modes.clear();
-
-#ifdef _WIN64
-    // Smooth Motion returns before the transition.
-    s_smooth_motion = true;
-    CHECK(Hook_Sleep(&device) == NVAPI_OK && s_forwarded_modes.empty() && !s_low_latency_forced_off.load());
-    s_smooth_motion = false;
-#endif
-
-    // (a) Key on and bypass on: the first Sleep forwards one SetSleepMode with
-    // low latency and boost off and every other field the game's.
-    const unsigned driver_sleeps = s_sleep_calls;
-    CHECK(Hook_Sleep(&device) == NVAPI_OK && s_sleep_calls == driver_sleeps);
-    CHECK(s_forwarded_modes.size() == 1 && IsLowLatencyOffCopy(s_forwarded_modes[0], game));
-    CHECK(s_low_latency_forced_off.load());
-    // The captured game parameters, and the game's own struct, stay the game's.
-    CHECK(s_game_original_params.bLowLatencyMode == 1 && s_game_original_params.bLowLatencyBoost == 1);
-    CHECK(game.bLowLatencyMode == 1 && game.bLowLatencyBoost == 1);
-
-    // (b) The same state: no further SetSleepMode.
-    s_forwarded_modes.clear();
-    CHECK(Hook_Sleep(&device) == NVAPI_OK && Hook_Sleep(&device) == NVAPI_OK && s_forwarded_modes.empty());
-
-    // (c) A game call with low latency on, while applied, goes out with it off;
-    // the captured parameters take the game's newest values.
-    NV_SET_SLEEP_MODE_PARAMS again = game;
-    again.minimumIntervalUs = 2222;
-    CHECK(Hook_SetSleepMode(&device, &again) == NVAPI_OK);
-    CHECK(s_forwarded_modes.size() == 1 && IsLowLatencyOffCopy(s_forwarded_modes[0], again));
-    CHECK(again.bLowLatencyMode == 1 && again.bLowLatencyBoost == 1);
-    CHECK(s_game_original_params.minimumIntervalUs == 2222 && s_game_original_params.bLowLatencyMode == 1);
-    s_forwarded_modes.clear();
-
-    // (d) Bypass off: the next Sleep restores the game's newest parameters
-    // exactly, once, and the driver's Sleep runs again.
-    g_reflex_sleep_bypass = false;
-    CHECK(Hook_Sleep(&device) == -7 && s_sleep_calls == driver_sleeps + 1);
-    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], again));
-    CHECK(!s_low_latency_forced_off.load());
-    s_forwarded_modes.clear();
-    CHECK(Hook_Sleep(&device) == -7 && s_forwarded_modes.empty());
-    // Not applied: the game's call is forwarded as it is.
-    CHECK(Hook_SetSleepMode(&device, &again) == NVAPI_OK);
-    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], again));
-    s_forwarded_modes.clear();
-
-    // Bypass on again re-applies; the key off then restores, once.
-    g_reflex_sleep_bypass = true;
-    CHECK(Hook_Sleep(&device) == NVAPI_OK);
-    CHECK(s_forwarded_modes.size() == 1 && IsLowLatencyOffCopy(s_forwarded_modes[0], again));
-    s_forwarded_modes.clear();
-    g_bypass_low_latency_off = false;
-    CHECK(Hook_Sleep(&device) == NVAPI_OK);
-    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], again));
-    CHECK(!s_low_latency_forced_off.load());
-    s_forwarded_modes.clear();
-
-    // (e) Key off: Sleep makes no extra call and the game's call is unmodified.
-    CHECK(Hook_Sleep(&device) == NVAPI_OK && s_forwarded_modes.empty());
-    CHECK(Hook_SetSleepMode(&device, &game) == NVAPI_OK);
-    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], game));
-    s_forwarded_modes.clear();
-
-    // A failed driver call leaves the state off; a later Sleep retries it.
-    g_bypass_low_latency_off = true;
-    s_mode_result = -9;
-    CHECK(Hook_Sleep(&device) == NVAPI_OK && s_forwarded_modes.size() == 1 && !s_low_latency_forced_off.load());
-    CHECK(Hook_Sleep(&device) == NVAPI_OK && s_forwarded_modes.size() == 2 && !s_low_latency_forced_off.load());
-    s_mode_result = NVAPI_OK;
-    s_forwarded_modes.clear();
-    CHECK(Hook_Sleep(&device) == NVAPI_OK && s_forwarded_modes.size() == 1 && s_low_latency_forced_off.load());
-    CHECK(IsLowLatencyOffCopy(s_forwarded_modes[0], game));
-    s_forwarded_modes.clear();
-
-    // The shutdown restore sends the game's parameters exactly and clears the state.
-    RestoreGameSleepMode();
-    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], game));
-    CHECK(!s_low_latency_forced_off.load());
-    s_forwarded_modes.clear();
-
-    // Global state back to what later tests expect.
-    g_bypass_low_latency_off = false;
-    g_reflex_sleep_bypass = false;
-    g_user_target_fps = 0;
-    s_record_modes = false;
-    s_mode_result = -9;
-    s_forwarded_modes.clear();
-    s_orig_sleep = old_sleep;
-    s_orig_sleep_mode = old_mode;
-    NvAPI_ClearFeedbackDevice();
-}
-
-// Developer A/B driver_low_latency_off: while the game's Sleep is forwarded the
-// driver's low latency mode is off (low latency and boost 0, every other
-// field the game's, minimumIntervalUs whatever the limiter or the game
-// passes), once per transition, the game's own SetSleepMode calls cannot undo
-// it, the bypassed case is bypass_low_latency_off's alone, and a key switched
-// at run time re-applies the mode at the next Sleep.
-void TestDriverLowLatencyOff() {
+// The Reflex driver limiter's SetSleepMode (key off, nothing pending): its interval goes out
+// on a copy of the game's parameters with the game's own low latency, from the limiter's
+// application and from every game call while it is applied; a held forward lock leaves the
+// application pending; the Sleep, forwarded or bypassed, sends no SetSleepMode (nothing
+// changes the driver's low latency mode with the key off); the shutdown restore sends the
+// game's parameters exactly.
+void TestDriverLimiterSleepMode() {
     FakeDevice device;
     CHECK(NvAPI_CaptureFeedbackDevice(&device));
     const auto old_sleep = s_orig_sleep;
@@ -599,8 +402,6 @@ void TestDriverLowLatencyOff() {
     g_reflex_sleep_bypass = false;
     g_user_target_fps = 157;
     s_paces_source = false;
-    g_driver_low_latency_off = false;
-    g_bypass_low_latency_off = false;
 
     NV_SET_SLEEP_MODE_PARAMS game{};
     game.version = NV_SLEEP_PARAMS_VER;
@@ -609,93 +410,58 @@ void TestDriverLowLatencyOff() {
     game.bUseMarkersToOptimize = game.bUseMinQueueTime = 1;
     game.rsvd[3] = 9;
     CHECK(Hook_SetSleepMode(&device, &game) == NVAPI_OK);
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], game));
     s_forwarded_modes.clear();
 
-    // Key off: the forwarded Sleep makes no SetSleepMode call.
+    // The forwarded Sleep makes no SetSleepMode call and leaves the driver's low latency alone.
     const unsigned driver_sleeps = s_sleep_calls;
     CHECK(Hook_Sleep(&device) == -7 && s_sleep_calls == driver_sleeps + 1 && s_forwarded_modes.empty());
     CHECK(!s_low_latency_forced_off.load());
+    // So does a bypassed one.
+    g_reflex_sleep_bypass = true;
+    s_paces_source = true;
+    CHECK(Hook_Sleep(&device) == NVAPI_OK && s_sleep_calls == driver_sleeps + 1 && s_forwarded_modes.empty());
+    CHECK(!s_low_latency_forced_off.load());
+    g_reflex_sleep_bypass = false;
+    s_paces_source = false;
 
-    // Key on: the Sleep sends one copy with low latency and boost off, then the driver's Sleep runs.
-    g_driver_low_latency_off = true;
-    CHECK(Hook_Sleep(&device) == -7 && s_sleep_calls == driver_sleeps + 2);
-    CHECK(s_forwarded_modes.size() == 1 && IsLowLatencyOffCopy(s_forwarded_modes[0], game));
-    CHECK(s_low_latency_forced_off.load());
-    CHECK(s_game_original_params.bLowLatencyMode == 1 && game.bLowLatencyMode == 1);
-    s_forwarded_modes.clear();
-    CHECK(Hook_Sleep(&device) == -7 && Hook_Sleep(&device) == -7 && s_forwarded_modes.empty()); // once per transition
-
-    // The game's own call, with low latency on, goes out with it off.
+    // The game's own call, with low latency on, is forwarded as it is.
     NV_SET_SLEEP_MODE_PARAMS again = game;
     again.minimumIntervalUs = 2222;
     CHECK(Hook_SetSleepMode(&device, &again) == NVAPI_OK);
-    CHECK(s_forwarded_modes.size() == 1 && IsLowLatencyOffCopy(s_forwarded_modes[0], again));
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], again));
     CHECK(again.bLowLatencyMode == 1 && s_game_original_params.minimumIntervalUs == 2222);
     s_forwarded_modes.clear();
 
-    // With the Reflex driver limiter applied its interval stays in every copy.
+    // With the Reflex driver limiter applied its interval stays in every copy, low latency is the game's.
     NV_SET_SLEEP_MODE_PARAMS limited = again;
     limited.minimumIntervalUs = 8000;
     g_driver_limiter_interval_us = 8000;
     CHECK(Hook_SetSleepMode(&device, &again) == NVAPI_OK);
-    CHECK(s_forwarded_modes.size() == 1 && IsLowLatencyOffCopy(s_forwarded_modes[0], limited));
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], limited));
     s_forwarded_modes.clear();
     // The forward lock held (a SetSleepMode or a transition in flight): nothing is sent, the
     // flag is untouched, the operation stays pending for the next call.
     AcquireSRWLockExclusive(&s_sleep_mode_forward_lock);
     CHECK(NvAPI_ApplyDriverLimiter(7000) == DriverLimiterApply::Busy);
     ReleaseSRWLockExclusive(&s_sleep_mode_forward_lock);
-    CHECK(s_forwarded_modes.empty() && s_low_latency_forced_off.load());
+    CHECK(s_forwarded_modes.empty() && !s_low_latency_forced_off.load());
     CHECK(NvAPI_ApplyDriverLimiter(6000) == DriverLimiterApply::Applied);
     limited.minimumIntervalUs = 6000;
-    CHECK(s_forwarded_modes.size() == 1 && IsLowLatencyOffCopy(s_forwarded_modes[0], limited));
-    CHECK(s_low_latency_forced_off.load());
+    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], limited));
+    CHECK(!s_low_latency_forced_off.load());
     s_forwarded_modes.clear();
-    // The key off at run time: the next Sleep restores the game's low latency, keeping the limiter's interval.
+    // The Sleep with the limiter applied still sends nothing.
     g_driver_limiter_interval_us = 6000;
-    g_driver_low_latency_off = false;
-    CHECK(Hook_Sleep(&device) == -7);
-    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], limited));
-    CHECK(!s_low_latency_forced_off.load());
-    s_forwarded_modes.clear();
-    CHECK(NvAPI_ApplyDriverLimiter(5000) == DriverLimiterApply::Applied); // key off: the game's low latency
-    limited.minimumIntervalUs = 5000;
-    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], limited));
-    CHECK(!s_low_latency_forced_off.load());
-    s_forwarded_modes.clear();
+    CHECK(Hook_Sleep(&device) == -7 && s_forwarded_modes.empty());
     g_driver_limiter_interval_us = 0;
 
-    // Key back on without the limiter: the game's interval, low latency off.
-    g_driver_low_latency_off = true;
-    CHECK(Hook_Sleep(&device) == -7);
-    CHECK(s_forwarded_modes.size() == 1 && IsLowLatencyOffCopy(s_forwarded_modes[0], again));
-    s_forwarded_modes.clear();
-
-    // Bypassed Sleep: the key does not apply, only bypass_low_latency_off does.
-    g_reflex_sleep_bypass = true;
-    s_paces_source = true;
-    CHECK(Hook_Sleep(&device) == NVAPI_OK);
-    CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], again));
-    CHECK(!s_low_latency_forced_off.load());
-    s_forwarded_modes.clear();
-    g_bypass_low_latency_off = true;
-    CHECK(Hook_Sleep(&device) == NVAPI_OK);
-    CHECK(s_forwarded_modes.size() == 1 && IsLowLatencyOffCopy(s_forwarded_modes[0], again));
-    CHECK(s_low_latency_forced_off.load());
-    s_forwarded_modes.clear();
-    // Forwarded again with the key still on: the state already matches, no call.
-    g_reflex_sleep_bypass = false;
-    s_paces_source = false;
-    CHECK(Hook_Sleep(&device) == -7 && s_forwarded_modes.empty() && s_low_latency_forced_off.load());
-    g_bypass_low_latency_off = false;
-
-    // The shutdown restore sends the game's parameters exactly and clears the state.
+    // The shutdown restore sends the game's parameters exactly.
     RestoreGameSleepMode();
     CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], again));
     CHECK(!s_low_latency_forced_off.load());
     s_forwarded_modes.clear();
 
-    g_driver_low_latency_off = false;
     g_driver_limiter_interval_us = 0;
     g_reflex_sleep_bypass = false;
     g_user_target_fps = 0;
@@ -708,12 +474,9 @@ void TestDriverLowLatencyOff() {
     NvAPI_ClearFeedbackDevice();
 }
 
-// Hook_Sleep: the pre-Sleep wait runs with the scheduler's `precise` flag
-// (developer key pre_sleep_precise), bypassed or not; with the driver limiter
-// hold ReLimiter plans and waits for nothing and only records the Sleep's
-// entry; and the newest sleep status is left for the next Source record when
-// the Sleep returns.
-void TestPreSleepPreciseAndHoldWiring() {
+// Hook_Sleep: the newest sleep status is left for the next Source record when the Sleep
+// returns, forwarded or bypassed.
+void TestSleepStatusAtSleepReturn() {
     FakeDevice device;
     CHECK(NvAPI_CaptureFeedbackDevice(&device));
     const auto old_sleep = s_orig_sleep;
@@ -721,36 +484,6 @@ void TestPreSleepPreciseAndHoldWiring() {
     g_reflex_sleep_bypass = false;
     g_user_target_fps = 157;
     s_paces_source = false;
-
-    s_pre_sleep_active = true;
-    s_plan_waits = true;
-    s_plan_precise = true;
-    unsigned waits = s_pre_sleep_waits;
-    CHECK(Hook_Sleep(&device) == -7);
-    CHECK(s_pre_sleep_waits == waits + 1 && s_pre_sleep_wait_target == 12345 && s_pre_sleep_wait_precise);
-    s_plan_precise = false;
-    CHECK(Hook_Sleep(&device) == -7);
-    CHECK(s_pre_sleep_waits == waits + 2 && !s_pre_sleep_wait_precise);
-    g_reflex_sleep_bypass = true;
-    s_paces_source = true;
-    s_plan_precise = true;
-    CHECK(Hook_Sleep(&device) == NVAPI_OK);
-    CHECK(s_pre_sleep_waits == waits + 3 && s_pre_sleep_wait_precise);
-    s_plan_waits = false;
-
-    // The driver limiter hold: no plan, no wait, only the entry.
-    s_pre_sleep_active = false;
-    s_driver_hold_active = true;
-    g_reflex_sleep_bypass = false;
-    s_paces_source = false;
-    waits = s_pre_sleep_waits;
-    const unsigned plans = s_plan_calls;
-    const unsigned records = s_sleep_entry_records;
-    CHECK(Hook_Sleep(&device) == -7);
-    CHECK(s_plan_calls == plans && s_pre_sleep_waits == waits && s_sleep_entry_records == records + 1 &&
-          s_recorded_entry_qpc > 0);
-    s_driver_hold_active = false;
-    CHECK(Hook_Sleep(&device) == -7 && s_sleep_entry_records == records + 1 && s_plan_calls == plans);
 
     // The sleep status the next Source record carries: the newest result when the Sleep returned.
     g_sleep_status_newest = CurrentStatusWord(6500, true);
@@ -804,8 +537,8 @@ bool IsTuple(const NV_SET_SLEEP_MODE_PARAMS& forwarded, const NV_SET_SLEEP_MODE_
 }
 
 // The Sleep-mode tuple: with the key off nothing is recorded; entering from the driver
-// limiter clears the interval; leaving with driver_low_latency_off restores the game's
-// interval at the FIRST hook after the key publication (no epoch bump); Dynamic MFG gives
+// limiter clears the interval; leaving the key restores the game's interval and low latency
+// at the FIRST hook after the key publication (no epoch bump); Dynamic MFG gives
 // the game's parameters back; a game call while the boolean already matches still forwards
 // the full tuple; a busy lock, captured parameters held by another thread and a failed
 // call leave the reconcile pending (no backoff, no spin).
@@ -894,16 +627,16 @@ void TestUnifiedSleepModeTuple() {
     CHECK(s_low_latency_forced_off.load());
     s_forwarded_modes.clear();
 
-    // Leaving the key with driver_low_latency_off, through the real pending check: the key
-    // publication alone makes the next Sleep reconcile (the epoch is bumped much later, or
-    // never in this test). The boolean already says off, the interval is the game's again;
-    // settled afterwards, nothing recorded.
-    g_driver_low_latency_off = true;
+    // Leaving the key, through the real pending check: the key publication alone makes the
+    // next Sleep reconcile (the epoch is bumped much later, or never in this test). The
+    // driver still has low latency off, the interval is the game's again and so is low
+    // latency; settled afterwards, nothing recorded.
     SetUnifiedKey(false);
     CHECK(NvAPI_SleepModeReconcilePending() && s_low_latency_forced_off.load());
     CHECK(Hook_Sleep(&device) == -7);
-    CHECK(s_forwarded_modes.size() == 1 && IsTuple(s_forwarded_modes[0], dmfg_call, 3333, true));
+    CHECK(s_forwarded_modes.size() == 1 && IsTuple(s_forwarded_modes[0], dmfg_call, 3333, false));
     CHECK(!NvAPI_SleepModeReconcilePending() && !s_applied_sleep_valid && !s_applied_key.load());
+    CHECK(!s_low_latency_forced_off.load());
     s_forwarded_modes.clear();
     CHECK(Hook_Sleep(&device) == -7 && s_forwarded_modes.empty()); // the key-off path, nothing to do
     // The scheduler's bump for the same transition arrives later (ResolvePipeline): it is
@@ -920,12 +653,11 @@ void TestUnifiedSleepModeTuple() {
     g_driver_limiter_interval_us = 6000;
     SetUnifiedKey(false);
     CHECK(Hook_Sleep(&device) == -7);
-    CHECK(s_forwarded_modes.size() == 1 && IsTuple(s_forwarded_modes[0], dmfg_call, 6000, true));
+    CHECK(s_forwarded_modes.size() == 1 && IsTuple(s_forwarded_modes[0], dmfg_call, 6000, false));
     CHECK(!NvAPI_SleepModeReconcilePending());
     s_forwarded_modes.clear();
-    // Limiter released and the override off: the key-off path restores the game's parameters.
+    // Limiter released: the key-off path restores the game's parameters.
     g_driver_limiter_interval_us = 0;
-    g_driver_low_latency_off = false;
     NvAPI_ReleaseDriverLimiter();
     CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], dmfg_call));
     CHECK(!s_low_latency_forced_off.load() && !NvAPI_SleepModeReconcilePending());
@@ -963,7 +695,6 @@ void TestUnifiedSleepModeTuple() {
     CHECK(!NvAPI_SleepModeReconcilePending() && !s_applied_sleep_valid);
 
     PacingPipeline_SetConfig(old_config);
-    g_driver_low_latency_off = false;
     g_driver_limiter_interval_us = 0;
     s_record_modes = false;
     s_mode_result = -9;
@@ -1002,7 +733,6 @@ void TestUnifiedKeyTransitions() {
     s_forwarded_modes.clear();
     g_reflex_sleep_bypass = false;
     g_user_target_fps = 0;
-    g_driver_low_latency_off = false;
     g_driver_limiter_interval_us = 0;
     s_unified_active = false;
     CHECK(!NvAPI_SleepModeReconcilePending() && !s_game_params_captured);
@@ -1097,11 +827,11 @@ void TestUnifiedKeyTransitions() {
     CHECK(Hook_Sleep(&device) == -7 && s_forwarded_modes.size() == 1 && !NvAPI_SleepModeReconcilePending());
 
     // An off/on key pair the scheduler never observed (no bump), Dynamic MFG active: with the key
-    // on the game's own tuple is recorded and nothing is owed; with the key off a legacy
-    // override (driver_low_latency_off) turns the driver's low latency off and records nothing;
-    // the key on again must NOT accept the old record: the key generation moved, so the game's
-    // parameters are forwarded again and low latency is restored. (Without the generation the
-    // epoch and the tuple are unchanged and the old record matches: no forward.)
+    // on the game's own tuple is recorded and nothing is owed; with the key off the driver limiter
+    // (a key-off path) changes the driver's interval and records nothing; the key on again must
+    // NOT accept the old record: the key generation moved, so the game's parameters are forwarded
+    // again and the interval is restored. (Without the generation the epoch and the tuple are
+    // unchanged and the old record matches: no forward.)
     s_forwarded_modes.clear();
     s_dmfg_active = true;
     SetUnifiedKey(true);
@@ -1113,10 +843,9 @@ void TestUnifiedKeyTransitions() {
     const uint32_t epoch_at_pair = s_sleep_mode_epoch.load();
     SetUnifiedKey(false);
     CHECK(!NvAPI_SleepModeReconcilePending()); // nothing owed: settled without a forward
-    g_driver_low_latency_off = true;
-    CHECK(Hook_Sleep(&device) == -7);
-    CHECK(s_forwarded_modes.size() == 1 && IsTuple(s_forwarded_modes[0], game, 4321, true) &&
-          s_low_latency_forced_off.load());
+    CHECK(NvAPI_ApplyDriverLimiter(8000) == DriverLimiterApply::Applied);
+    CHECK(s_forwarded_modes.size() == 1 && IsTuple(s_forwarded_modes[0], game, 8000, false));
+    CHECK(!NvAPI_SleepModeReconcilePending());
     s_forwarded_modes.clear();
     SetUnifiedKey(true);
     CHECK(s_sleep_mode_epoch.load() == epoch_at_pair); // the scheduler saw neither toggle
@@ -1124,7 +853,6 @@ void TestUnifiedKeyTransitions() {
     CHECK(s_forwarded_modes.size() == 1 && SameMode(s_forwarded_modes[0], game));
     CHECK(!s_low_latency_forced_off.load());
     s_forwarded_modes.clear();
-    g_driver_low_latency_off = false;
     s_dmfg_active = false;
     SetUnifiedKey(false);
     CHECK(!NvAPI_SleepModeReconcilePending() && Hook_Sleep(&device) == -7 && s_forwarded_modes.empty());
@@ -1262,10 +990,9 @@ void TestUnifiedSleepHook() {
     reservation.lifecycle_base = 1;
     reservation.interval_ticks = frequency / 100; // I = 10 ms
     s_unified_reserve_result = SchedulerUnifiedReserve::Reserved;
-    const unsigned plans = s_plan_calls;
 
     // Completed: the start wait ran to T; the genuine Sleep ran (the bypass is not consulted,
-    // so its NVAPI_OK would be the bypass's), no pre-Sleep plan, the Sleep-mode forwarded nothing.
+    // so its NVAPI_OK would be the bypass's), the Sleep-mode forwarded nothing.
     s_pre_sleep_wait_blocks = true;
     reservation.target_qpc = RealQpc() + 3 * frequency / 1000;
     s_unified_reservation = reservation;
@@ -1285,7 +1012,7 @@ void TestUnifiedSleepHook() {
     CHECK((s_pre_sleep_waits == waits + 1 && s_pre_sleep_wait_target == reservation.target_qpc &&
            s_pre_sleep_wait_precise && s_unified_outcome == UnifiedSleepOutcome::Completed) ||
           (s_pre_sleep_waits == waits && s_unified_outcome == UnifiedSleepOutcome::Late));
-    CHECK(s_sleep_calls == driver_sleeps + 1 && s_driver_sleep_calls == end_reports + 1 && s_plan_calls == plans);
+    CHECK(s_sleep_calls == driver_sleeps + 1 && s_driver_sleep_calls == end_reports + 1);
     CHECK(s_unified_release_qpc >= reservation.target_qpc && s_unified_arrival_qpc == s_unified_reserve_arrival &&
           s_unified_arrival_qpc <= s_unified_release_qpc);
     CHECK(s_unified_limit.outstanding == 0 && s_unified_limit.flags == 0);
@@ -1519,6 +1246,230 @@ void TestUnifiedSleepHook() {
     s_forwarded_modes.clear();
     s_orig_sleep = old_sleep;
     s_orig_sleep_mode = old_mode;
+    NvAPI_ClearFeedbackDevice();
+}
+// The Reflex Sleep bypass decision of Hook_Sleep, pinned to what the code does now: the owner is unified (published test
+// mode Off) or a test mode; the published pipeline is what PacingPipeline_Resolve gives for the inputs the scheduler
+// builds (route, runtime.pre_sleep_available = marker route && enforcement marker SimulationStart && a Reflex Sleep seen
+// within the last second, runtime.uncapped); Scheduler_PacesSource / UnifiedActive answer from that pipeline like
+// scheduler.cpp; the test mode in force is the real PacingPipeline_SleepBypass. A bypassed Sleep returns NVAPI_OK without
+// the driver's Sleep, resets the Sleep latency to 0 and reports nothing to Scheduler_EndDriverSleep; the driver's Sleep
+// returns the fake's -7 and is reported. Every Sleep on the presenting device is observed and recorded either way.
+PacingCapabilities SleepCapabilities(PacingRoute route) {
+    PacingCapabilities capabilities{};
+    capabilities.x64 = true;
+    capabilities.api = PacingApi::DX12;
+    capabilities.route = route;
+    return capabilities;
+}
+PacingRuntimeState SleepRuntime(bool pre_sleep_available, bool uncapped) {
+    PacingRuntimeState runtime{};
+    runtime.swapchain_valid = true;
+    runtime.vrr = true;
+    runtime.uncapped = uncapped;
+    runtime.pre_sleep_available = pre_sleep_available;
+    return runtime;
+}
+PacingPipelineSnapshot PublishResolvedPipeline(PacingRoute route, bool pre_sleep_available, bool uncapped) {
+    const PacingPipelineSnapshot snapshot = PacingPipeline_Resolve(
+        PacingPipeline_GetConfig(), SleepCapabilities(route), SleepRuntime(pre_sleep_available, uncapped));
+    PacingPipeline_Publish(snapshot);
+    return snapshot;
+}
+void SetSleepTestMode(PacingTestMode mode) {
+    PacingPipelineConfig config = PacingPipeline_GetConfig();
+    config.test_mode = mode;
+    NvAPI_PrepareUnifiedKey(PacingPipeline_ClampConfig(config).unified);
+    PacingPipeline_SetConfig(config);
+    NvAPI_ReconcileSleepMode();
+    // Key on: the reconcile stays pending (the key bit; no game parameters are captured here); key off: settled.
+    CHECK(NvAPI_SleepModeReconcilePending() == (mode == PacingTestMode::Off));
+    CHECK(PacingPipeline_TestMode() == mode && PacingPipeline_Unified() == (mode == PacingTestMode::Off));
+    CHECK(RealPacingPipelineSleepBypass() == (mode == PacingTestMode::Off));
+}
+struct SleepEffects {
+    NvAPI_Status result;
+    unsigned driver_sleeps, end_reports, recorded, observed, reserves;
+    double latency_us;
+    int64_t recorded_qpc;
+};
+SleepEffects CallSleep(FakeDevice* device) {
+    g_pacer_latency_us = 500.0; // a stale duration: the bypass resets it, the driver's Sleep smooths it
+    const unsigned driver_sleeps = s_sleep_calls, end_reports = s_driver_sleep_calls, recorded = s_record_sleep_calls;
+    const uint64_t observed = s_reflex_threads.sleep_calls.load();
+    const unsigned reserves = s_unified_reserve_calls;
+    SleepEffects effects{};
+    effects.result = Hook_Sleep(device);
+    effects.driver_sleeps = s_sleep_calls - driver_sleeps;
+    effects.end_reports = s_driver_sleep_calls - end_reports;
+    effects.recorded = s_record_sleep_calls - recorded;
+    effects.observed = static_cast<unsigned>(s_reflex_threads.sleep_calls.load() - observed);
+    effects.reserves = s_unified_reserve_calls - reserves;
+    effects.latency_us = g_pacer_latency_us.load();
+    effects.recorded_qpc = s_recorded_sleep_qpc;
+    return effects;
+}
+// Bypassed: the game's Sleep returns at once.
+void CheckSleepBypassed(const SleepEffects& effects) {
+    CHECK(effects.result == NVAPI_OK && effects.driver_sleeps == 0 && effects.end_reports == 0);
+    CHECK(effects.latency_us == 0.0);
+    CHECK(effects.recorded == 1 && effects.observed == 1 && effects.recorded_qpc > 0);
+    CHECK(effects.reserves == 0);
+}
+// Not bypassed, not the unified start path: the driver's Sleep runs and is reported.
+void CheckSleepForwarded(const SleepEffects& effects) {
+    CHECK(effects.result == -7 && effects.driver_sleeps == 1 && effects.end_reports == 1);
+    CHECK(effects.latency_us > 0.0);
+    CHECK(effects.recorded == 1 && effects.observed == 1 && effects.recorded_qpc > 0);
+    CHECK(effects.reserves == 0);
+}
+// The unified start path: reserved first (Inactive here: no start wait), then the driver's Sleep runs and is reported.
+void CheckSleepUnified(const SleepEffects& effects) {
+    CHECK(effects.result == -7 && effects.driver_sleeps == 1 && effects.end_reports == 1);
+    CHECK(effects.latency_us > 0.0);
+    CHECK(effects.recorded == 1 && effects.observed == 1 && effects.recorded_qpc > 0);
+    CHECK(effects.reserves == 1);
+}
+void TestSleepBypassDecision() {
+    FakeDevice device;
+    CHECK(NvAPI_CaptureFeedbackDevice(&device));
+    const auto old_sleep = s_orig_sleep;
+    const auto old_mode = s_orig_sleep_mode;
+    const PacingPipelineConfig old_config = CurrentConfig();
+    const PacingPipelineSnapshot old_pipeline = PacingPipeline_Read();
+    s_orig_sleep = FakeDriverSleep;
+    s_orig_sleep_mode = FakeSleepMode;
+    s_expected_mode_params = nullptr;
+    s_mode_result = NVAPI_OK;
+    s_record_modes = false;
+    s_scheduler_from_pipeline = true;
+    g_sleep_bypass_from_test_mode.store(true);
+    s_unified_reserve_result = SchedulerUnifiedReserve::Inactive;
+    s_smooth_motion = false;
+    s_dmfg_active = false;
+    s_sleep_action = 0;
+
+    // The owner is unified: the published test mode is Off.
+    SetSleepTestMode(PacingTestMode::Off);
+    CHECK(RealPacingPipelineSleepBypass());
+    g_user_target_fps = 157;
+
+    // (a) The first Sleep after the start, and the first after more than a second without one: no Sleep is seen
+    // (runtime.pre_sleep_available false), the placement is Marker, ReLimiter paces the source: bypassed.
+    for (int round = 0; round < 2; ++round) {
+        const PacingPipelineSnapshot marker = PublishResolvedPipeline(PacingRoute::NvApiMarkers, false, false);
+        CHECK(marker.placement == PacingSourcePlacement::Marker && marker.mode == PacingTimingMode::Vrr);
+        CHECK(Scheduler_PacesSource() && !Scheduler_UnifiedActive());
+        CheckSleepBypassed(CallSleep(&device));
+    }
+    // (b) An enforcement marker other than SIMULATION_START: pre_sleep_available is false on every frame
+    // (scheduler.cpp requires the marker to be SIMULATION_START), so the placement is Marker on every frame and every
+    // Sleep is bypassed.
+    for (int frame = 0; frame < 4; ++frame) {
+        PublishResolvedPipeline(PacingRoute::NvApiMarkers, false, false);
+        CheckSleepBypassed(CallSleep(&device));
+        CheckSleepBypassed(CallSleep(&device)); // two Sleeps in one frame: both
+    }
+    // The same for the Streamline PCL marker route.
+    const PacingPipelineSnapshot pcl = PublishResolvedPipeline(PacingRoute::PclMarkers, false, false);
+    CHECK(pcl.placement == PacingSourcePlacement::Marker && Scheduler_PacesSource());
+    CheckSleepBypassed(CallSleep(&device));
+    // (c) The published placement is Present (the present route): bypassed.
+    const PacingPipelineSnapshot present = PublishResolvedPipeline(PacingRoute::PresentBased, false, false);
+    CHECK(present.placement == PacingSourcePlacement::Present && present.mode == PacingTimingMode::Vrr);
+    CHECK(Scheduler_PacesSource() && !Scheduler_UnifiedActive());
+    CheckSleepBypassed(CallSleep(&device));
+    // (d) A Reflex Sleep was seen within the last second and the enforcement marker is SIMULATION_START
+    // (pre_sleep_available): the placement is Unified, the unified start path runs and the driver's Sleep is called.
+    const PacingPipelineSnapshot unified = PublishResolvedPipeline(PacingRoute::NvApiMarkers, true, false);
+    CHECK(unified.placement == PacingSourcePlacement::Unified && unified.mode == PacingTimingMode::Vrr);
+    CHECK(Scheduler_PacesSource() && Scheduler_UnifiedActive());
+    CheckSleepUnified(CallSleep(&device));
+    CheckSleepUnified(CallSleep(&device));
+    // The idle cap (background, FG off) under the unified owner is Unified too while the game calls the Sleep.
+    {
+        PacingRuntimeState idle = SleepRuntime(true, false);
+        idle.idle_cap = true;
+        const PacingPipelineSnapshot idle_pipeline = PacingPipeline_Resolve(
+            PacingPipeline_GetConfig(), SleepCapabilities(PacingRoute::NvApiMarkers), idle);
+        PacingPipeline_Publish(idle_pipeline);
+        CHECK(idle_pipeline.placement == PacingSourcePlacement::Unified && idle_pipeline.mode == PacingTimingMode::Idle);
+        CHECK(Scheduler_UnifiedActive());
+        CheckSleepUnified(CallSleep(&device));
+    }
+    // ... and back: no Sleep within the last second again, the first Sleep is bypassed.
+    PublishResolvedPipeline(PacingRoute::NvApiMarkers, false, false);
+    CheckSleepBypassed(CallSleep(&device));
+
+    // (e) No cap (g_user_target_fps 0): never bypassed, whatever the placement of a, b and c.
+    g_user_target_fps = 0;
+    PublishResolvedPipeline(PacingRoute::NvApiMarkers, false, false); // a, b
+    CheckSleepForwarded(CallSleep(&device));
+    PublishResolvedPipeline(PacingRoute::PclMarkers, false, false);
+    CheckSleepForwarded(CallSleep(&device));
+    PublishResolvedPipeline(PacingRoute::PresentBased, false, false); // c
+    CheckSleepForwarded(CallSleep(&device));
+    // The resolver's own uncapped pipeline (mode Off, placement None) is not bypassed either, with a cap of 0 or not.
+    const PacingPipelineSnapshot uncapped = PublishResolvedPipeline(PacingRoute::NvApiMarkers, true, true);
+    CHECK(uncapped.mode == PacingTimingMode::Off && uncapped.placement == PacingSourcePlacement::None);
+    CHECK(!Scheduler_PacesSource() && !Scheduler_UnifiedActive());
+    CheckSleepForwarded(CallSleep(&device));
+    g_user_target_fps = 157;
+    CheckSleepForwarded(CallSleep(&device));
+
+    // (f) The test modes: never bypassed, with or without a cap, whatever the published placement.
+    for (const PacingTestMode mode : {PacingTestMode::ReflexOnly, PacingTestMode::DriverLimiter}) {
+        SetSleepTestMode(mode);
+        CHECK(!RealPacingPipelineSleepBypass());
+        for (const int cap : {157, 0}) {
+            g_user_target_fps = cap;
+            for (const PacingRoute route : {PacingRoute::NvApiMarkers, PacingRoute::PclMarkers, PacingRoute::PresentBased}) {
+                // What the resolver gives in this mode.
+                const PacingPipelineSnapshot resolved = PublishResolvedPipeline(route, true, false);
+                if (mode == PacingTestMode::ReflexOnly)
+                    CHECK(resolved.mode == PacingTimingMode::Off && resolved.placement == PacingSourcePlacement::None);
+                CheckSleepForwarded(CallSleep(&device));
+            }
+            // A placement that would be paced by ReLimiter, published by hand: still not bypassed.
+            for (const PacingSourcePlacement placement : {PacingSourcePlacement::Marker, PacingSourcePlacement::Present,
+                     PacingSourcePlacement::PreSleep, PacingSourcePlacement::Unified}) {
+                PacingPipelineSnapshot forced{};
+                forced.mode = PacingTimingMode::Vrr;
+                forced.route = placement == PacingSourcePlacement::Present ? PacingRoute::PresentBased : PacingRoute::NvApiMarkers;
+                forced.placement = placement;
+                forced.rung = PacingRung::SourceOnly;
+                forced.reason = PacingFallbackReason::None;
+                PacingPipeline_Publish(forced);
+                CHECK(Scheduler_PacesSource() == (placement != PacingSourcePlacement::PreSleep));
+                const SleepEffects effects = CallSleep(&device);
+                // The driver's Sleep still runs, whatever the placement.
+                CHECK(effects.result == -7 && effects.driver_sleeps == 1 && effects.end_reports == 1);
+                CHECK(effects.recorded == 1 && effects.observed == 1 && effects.reserves == 0);
+            }
+        }
+    }
+    // The driver limiter's resolved placement: the driver paces the source, nothing is held, no entry is recorded.
+    SetSleepTestMode(PacingTestMode::DriverLimiter);
+    g_user_target_fps = 157;
+    const PacingPipelineSnapshot limiter = PublishResolvedPipeline(PacingRoute::NvApiMarkers, true, false);
+    CHECK(limiter.placement == PacingSourcePlacement::DriverLimiter && limiter.mode == PacingTimingMode::Vrr);
+    CHECK(!Scheduler_PacesSource() && !Scheduler_UnifiedActive());
+    CheckSleepForwarded(CallSleep(&device));
+
+    SetSleepTestMode(PacingTestMode::Off);
+    CHECK(RealPacingPipelineSleepBypass());
+    NvAPI_PrepareUnifiedKey(PacingPipeline_ClampConfig(old_config).unified);
+    PacingPipeline_SetConfig(old_config);
+    NvAPI_ReconcileSleepMode();
+    CHECK(!NvAPI_SleepModeReconcilePending());
+    PacingPipeline_Publish(old_pipeline);
+    g_user_target_fps = 0;
+    g_pacer_latency_us = 0.0;
+    g_sleep_bypass_from_test_mode.store(false);
+    s_scheduler_from_pipeline = false;
+    s_orig_sleep = old_sleep;
+    s_orig_sleep_mode = old_mode;
+    s_mode_result = -9;
     NvAPI_ClearFeedbackDevice();
 }
 #endif
@@ -2244,10 +2195,9 @@ void TestCpuLatency() {
     NvAPI_ClearFeedbackDevice();
 }
 
-// marker_forward_order. before_wait forwards the enforcement marker on
-// entry and publishes the wait as controller residence; after_wait forwards it
-// after OnMarker (the source wait) with zero residence. Every marker, enforced
-// or not, reaches the driver exactly once and returns the driver's status.
+// The enforcement marker is forwarded on entry and the wait is published as controller
+// residence. Every marker, enforced or not, reaches the driver exactly once and returns the
+// driver's status.
 void TestMarkerForwardOrder() {
     FakeDevice device;
     CHECK(NvAPI_CaptureFeedbackDevice(&device));
@@ -2255,40 +2205,34 @@ void TestMarkerForwardOrder() {
     s_record_call_order = true;
     s_on_marker_sleep_ms = 2;
     using Order = std::vector<std::pair<char, uint64_t>>;
-    for (const bool after_wait : {false, true}) {
-        g_marker_forward_after_wait.store(after_wait);
-        const uint64_t frame = after_wait ? 1201 : 1101;
-        const unsigned residences_before = s_residence_publications;
+    const uint64_t frame = 1101;
+    const unsigned residences_before = s_residence_publications;
 
-        s_call_order.clear();
-        SendMarker(&device, frame, SIMULATION_START);
-        CHECK(s_call_order == (after_wait ? Order{{'O', frame}, {'F', frame}}
-                                          : Order{{'F', frame}, {'O', frame}}));
-        CHECK(s_residence_publications == residences_before + 1);
-        CHECK(after_wait ? s_last_residence_us == 0.0 : s_last_residence_us > 0.0);
+    s_call_order.clear();
+    SendMarker(&device, frame, SIMULATION_START);
+    CHECK(s_call_order == (Order{{'F', frame}, {'O', frame}}));
+    CHECK(s_residence_publications == residences_before + 1);
+    CHECK(s_last_residence_us > 0.0);
 
-        // A repeated source is never paced twice but is still forwarded once.
-        s_call_order.clear();
-        SendMarker(&device, frame, SIMULATION_START);
-        CHECK(s_call_order == (Order{{'F', frame}}));
-        // Non-enforcement immediate and tail markers: one forward, no wait.
-        s_call_order.clear();
-        SendMarker(&device, frame, RENDERSUBMIT_START);
-        SendMarker(&device, frame, RENDERSUBMIT_END);
-        CHECK(s_call_order == (Order{{'F', frame}, {'F', frame}}));
-        CHECK(s_residence_publications == residences_before + 1);
-    }
-    g_marker_forward_after_wait.store(false);
+    // A repeated source is never paced twice but is still forwarded once.
+    s_call_order.clear();
+    SendMarker(&device, frame, SIMULATION_START);
+    CHECK(s_call_order == (Order{{'F', frame}}));
+    // Non-enforcement immediate and tail markers: one forward, no wait.
+    s_call_order.clear();
+    SendMarker(&device, frame, RENDERSUBMIT_START);
+    SendMarker(&device, frame, RENDERSUBMIT_END);
+    CHECK(s_call_order == (Order{{'F', frame}, {'F', frame}}));
+    CHECK(s_residence_publications == residences_before + 1);
     s_on_marker_sleep_ms = 0;
     s_record_call_order = false;
     NvAPI_ClearFeedbackDevice();
 }
 
 #ifdef _WIN64
-// The unified owner: markers are forwarded first whatever the marker forward order says (nothing
-// waits in the hook for the unified path), and the enforcement marker's wait is still
-// published as controller residence. Key off keeps the option. The RENDERSUBMIT_START of the
-// presenting device arms the gpu_start_probe for that frame; no other marker does.
+// Markers are forwarded first, with the key on or off (nothing waits in the hook), and the
+// enforcement marker's wait is still published as controller residence. The RENDERSUBMIT_START
+// of the presenting device arms the gpu_start_probe for that frame; no other marker does.
 void TestUnifiedMarkerForwardAndProbeArm() {
     FakeDevice device;
     CHECK(NvAPI_CaptureFeedbackDevice(&device));
@@ -2296,13 +2240,12 @@ void TestUnifiedMarkerForwardAndProbeArm() {
     s_orig_set_latency_marker = ForwardMarker;
     s_record_call_order = true;
     s_on_marker_sleep_ms = 2;
-    g_marker_forward_after_wait.store(true);
     using Order = std::vector<std::pair<char, uint64_t>>;
 
     s_call_order.clear();
     SendMarker(&device, 1301, SIMULATION_START);
-    CHECK(s_call_order == (Order{{'O', 1301}, {'F', 1301}})); // key off: after the wait, as ordered
-    CHECK(s_last_residence_us == 0.0);
+    CHECK(s_call_order == (Order{{'F', 1301}, {'O', 1301}})); // key off
+    CHECK(s_last_residence_us > 0.0);
 
     SetUnifiedKey(true);
     s_call_order.clear();
@@ -2317,7 +2260,7 @@ void TestUnifiedMarkerForwardAndProbeArm() {
     SetUnifiedKey(false);
     s_call_order.clear();
     SendMarker(&device, 1303, SIMULATION_START);
-    CHECK(s_call_order == (Order{{'O', 1303}, {'F', 1303}})); // key off again
+    CHECK(s_call_order == (Order{{'F', 1303}, {'O', 1303}})); // key off again
 
     // The probe flag off (the default): RENDERSUBMIT_START never calls the arm.
     const unsigned arms = s_probe_arm_calls;
@@ -2338,7 +2281,6 @@ void TestUnifiedMarkerForwardAndProbeArm() {
     PacingPipeline_SetConfig(old_config);
     // The key was published on and off without a reconcile (no game parameters): settled.
     CHECK(!NvAPI_SleepModeReconcilePending());
-    g_marker_forward_after_wait.store(false);
     s_on_marker_sleep_ms = 0;
     s_record_call_order = false;
     NvAPI_ClearFeedbackDevice();
@@ -2898,39 +2840,18 @@ void OnMarker(uint64_t frame_id, int64_t, SchedulerTrigger, PacingSourceMarker) 
     if (s_record_call_order) s_call_order.push_back({'O', frame_id});
     if (s_on_marker_sleep_ms) Sleep(s_on_marker_sleep_ms); // stands in for the source wait
 }
-// Hook_Sleep's pre-Sleep placement and render handoff limit (scheduler.cpp,
-// sleep.cpp are not linked): controlled by the s_pre_sleep_active and
-// s_handoff_frame stubs; no pre-wait is ever planned.
-void Scheduler_RecordReflexSleep(int64_t) noexcept {}
-bool Scheduler_PreSleepPlacementActive() noexcept { return s_pre_sleep_active; }
-bool Scheduler_PacesSource() noexcept { return s_paces_source; }
-bool Scheduler_RenderHandoffFrame(uint8_t* domain, uint32_t* producer_epoch, uint64_t* frame_id) noexcept {
-    if (s_handoff_frame == 0) return false;
-    *domain = 1;
-    *producer_epoch = 7;
-    *frame_id = s_handoff_frame;
-    return true;
+// Hook_Sleep's scheduler calls (scheduler.cpp and sleep.cpp are not linked).
+void Scheduler_RecordReflexSleep(int64_t qpc) noexcept {
+    ++s_record_sleep_calls;
+    s_recorded_sleep_qpc = qpc;
 }
-void Scheduler_RenderHandoffStalled() noexcept { ++s_handoff_stalls; }
-bool Scheduler_PlanReflexSleep(int64_t sleep_entry_qpc, int64_t now_qpc, bool, int64_t handoff_qpc,
-    int64_t* target_qpc, uint64_t* grid_index, bool* precise) noexcept {
-    ++s_plan_calls;
-    s_planned_sleep_entry_qpc = sleep_entry_qpc;
-    s_planned_now_qpc = now_qpc;
-    s_planned_handoff_qpc = handoff_qpc;
-    if (!s_plan_waits) return false;
-    *target_qpc = 12345;
-    *grid_index = 7;
-    *precise = s_plan_precise;
-    return true;
+// With s_scheduler_from_pipeline the next answer as scheduler.cpp does, from the published pipeline.
+bool Scheduler_PacesSource() noexcept {
+    if (!s_scheduler_from_pipeline) return s_paces_source;
+    const PacingSourcePlacement placement = PacingPipeline_Read().placement;
+    return placement == PacingSourcePlacement::Marker || placement == PacingSourcePlacement::Unified ||
+        placement == PacingSourcePlacement::Present;
 }
-bool Scheduler_DriverLimiterHoldActive() noexcept { return s_driver_hold_active; }
-void Scheduler_RecordReflexSleepEntry(int64_t sleep_entry_qpc) noexcept {
-    ++s_sleep_entry_records;
-    s_recorded_entry_qpc = sleep_entry_qpc;
-}
-std::atomic<double> g_effective_interval_us{0.0};
-void Scheduler_EndReflexSleep(uint64_t, int64_t) noexcept {}
 void Scheduler_EndDriverSleep(int64_t start_qpc, int64_t end_qpc) noexcept {
     ++s_driver_sleep_calls;
     s_driver_sleep_start_qpc = start_qpc;
@@ -2938,7 +2859,13 @@ void Scheduler_EndDriverSleep(int64_t start_qpc, int64_t end_qpc) noexcept {
 }
 // The unified owner: the scheduler's reservation and publication, controlled by
 // the s_unified_* stubs; the hard limit, the tuple and the Sleep hook are production code.
-bool Scheduler_UnifiedActive() noexcept { return s_unified_active; }
+bool Scheduler_UnifiedActive() noexcept {
+    if (!s_scheduler_from_pipeline) return s_unified_active;
+    const PacingPipelineSnapshot pipeline = PacingPipeline_Read();
+    return pipeline.placement == PacingSourcePlacement::Unified &&
+        (pipeline.mode == PacingTimingMode::Vrr || pipeline.mode == PacingTimingMode::Fixed ||
+         pipeline.mode == PacingTimingMode::Idle);
+}
 SchedulerUnifiedReserve Scheduler_UnifiedReserve(int64_t arrival_qpc, SchedulerUnifiedReservation* out) noexcept {
     ++s_unified_reserve_calls;
     s_unified_reserve_arrival = arrival_qpc;
@@ -3032,13 +2959,14 @@ int main(int argc, char** argv) {
     TestFrameMarkerStageEvents();
     TestNativeEndpointCancellation();
     TestReflexCallForwarding();
-    TestBypassLowLatencyOff();
-    TestDriverLowLatencyOff();
-    TestPreSleepPreciseAndHoldWiring();
+    TestRenderHandoffStallSpan();
+    TestDriverLimiterSleepMode();
+    TestSleepStatusAtSleepReturn();
 #ifdef _WIN64
     TestUnifiedSleepModeTuple();
     TestUnifiedKeyTransitions();
     TestUnifiedSleepHook();
+    TestSleepBypassDecision();
     TestUnifiedMarkerForwardAndProbeArm();
 #endif
 #ifdef _WIN64

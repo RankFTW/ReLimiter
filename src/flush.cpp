@@ -19,9 +19,10 @@ void Flush(uint32_t modules) {
 
     // These APIs only publish atomic invalidation/reset requests. Keep them
     // immediate so stale gate and feedback identities fail open before the
-    // admitted scheduler owner reaches the next frame. The period governor
-    // resets on the scheduler owner only: lifecycle (below), cap, raw
-    // FG divisor, DMFG, OLED Care and focus; a correlator-only flush keeps it.
+    // admitted scheduler owner reaches the next frame. The adaptation regime
+    // (cadence readout, LFC, unified law) resets on the scheduler owner only:
+    // lifecycle (below), cap, raw FG divisor, DMFG, OLED Care and focus; a
+    // correlator-only flush keeps it.
     Scheduler_ResetSmoothness();
     if (modules & FLUSH_PREDICTOR) {
         // Lifecycle: every FLUSH_ALL caller is an API change, a full

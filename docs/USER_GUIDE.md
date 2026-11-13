@@ -144,7 +144,7 @@ For how the cadence, the lead and the output points work, with diagrams, see [Fr
 | `gpu_queue_wait` | The GPU queue waits for the target before the frame is presented | 64-bit, DX12, native Reflex (NvAPI) markers, VRR, no frame generation, once the GPU wait has qualified |
 | `fg_input_wait` | The GPU waits for the target before each real frame enters frame generation | 64-bit, DX12, native Reflex (NvAPI) markers, frame generation presenting, once the FG input route has qualified |
 | `marker_hold` | ReLimiter holds the CPU at the game's Present marker | Other marker routes without frame generation, for example DX11 with Reflex, Vulkan with Streamline PCL, or DX12 before the GPU wait qualifies |
-| `source_only` | Nothing is held after the source wait | Present-based pacing, idle caps, frame generation without a qualified FG input route, passthrough and while the [overload pause](#overload-pause) is active |
+| `source_only` | Nothing is held after the source wait | Present-based pacing, idle caps, frame generation without a qualified FG input route, and passthrough |
 
 Frame generation without a qualified FG input route uses `source_only`, not a marker hold.
 
@@ -175,7 +175,6 @@ The main view shows one plain line under the FPS controls:
 | `Smooth: frames are held to an even cadence` | Green | Another output hold (`marker_hold`) is holding frames to the cap cadence. |
 | `Learning the game's frame timing...` | Amber | A hold is active but its lead is still warming up. It clears by itself after a few moments. |
 | `Getting ready...` | Amber | The GPU wait output has not qualified yet and nothing is held. Normal after starting the game, toggling FG or changing settings. |
-| `Paused: the game can't reach the cap right now (resumes on its own)` | Amber | The [overload pause](#overload-pause) has stopped holding frames. |
 | `Capped: smooth pacing needs NVIDIA Reflex in the game` | Grey | The game is paced at Present calls without Reflex markers; the cap applies but frames are not held. |
 | `Capped: frame generation paces its own frames here (frames are not held)` | Grey | Frame generation presents its frames itself, from its own thread and queue, as DLSS Frame Generation does when hardware flip metering is not in use. ReLimiter cannot hold them there; the cap still applies. |
 | `Idle cap active (background, FG-Off Cap or OLED Care)` | Grey | An idle cap is active; frames follow the cadence without an output hold. |
@@ -193,9 +192,7 @@ The technical lines are under **Details**, a collapsed node below the status lin
 | **Mode** | `vrr` or `fixed` from the display, `idle` while an idle cap is active, or `off` when ReLimiter is not pacing. |
 | **Output** | The output point from the table above. |
 | **Reason** | Why that output was chosen; see the reason table below. |
-| **Hold off** | Orange, shown only during the [overload pause](#overload-pause). |
-| **Placement** | Where the source wait happens: `marker`, `present`, `pre-Sleep` (see [Pre-Sleep Placement](#pre-sleep-placement); it also shows its margin and residual) or `none`. |
-| **Render handoff limit** | Shown while frames are not held and the game's Reflex Sleep is bypassed: ReLimiter keeps the game from queueing finished frames ahead of its render thread. An orange `off` means it is waiting for evidence; it needs no action. |
+| **Placement** | Where the source wait happens: `unified` (inside the game's Reflex Sleep call), `marker`, `present`, `Reflex driver limiter` (developer test mode) or `none`. |
 | **Lead** | How far ahead of each target the game is released, whether it is still `warming` or `warm`, and how many frames it is based on. `, at budget` means the wanted lead was clamped to three frame intervals, so those frames are likely to miss their targets. |
 | **Grid epoch** | Counts cadence restarts (after a cap or mode change, a new swapchain or a late frame). An occasional increase is normal; a counter that climbs steadily means frames keep missing their targets. |
 | **Release headroom** / **Release margin** | Shown on `gpu_queue_wait`: how much room ReLimiter leaves before the game's next frame starts heavy GPU work (headroom) or its next Present call (margin). A `guard off` note means the room is not needed in this game. |
@@ -216,24 +213,17 @@ Below the status line itself (not under **Details**), `Dynamic frame generation:
 | `no_gpu_queue` | The GPU queue wait is not ready yet. |
 | `fg_unqualified` | Frame generation is presenting on DX12 with native Reflex markers, but its FG input route has not qualified yet; nothing is held. |
 | `fg_route_unsupported` | Frame generation presents its frames from its own thread and queue (DLSS Frame Generation without hardware flip metering), so the FG input wait cannot hold them; the cap applies and nothing is held. |
-| `infeasible` | The [overload pause](#overload-pause) stopped holding frames. |
 | `override`, `driver_limiter_unavailable` | The developer test mode `driver_limiter` is set: `override` while the NVIDIA driver's Reflex limiter holds the cap, `driver_limiter_unavailable` where it cannot apply and the game runs as it is. See [Developer Settings](#developer-settings). |
 
 Reasons from `architecture` to `no_gpu_queue` come with `marker_hold`: they name the first requirement of the GPU queue wait that is not met. They do not mean pacing has failed. Brief warm-up after starting the game, toggling FG or changing settings is normal.
 
-### Pre-Sleep Placement
+### Reflex Sleep Wait
 
-In the 64-bit addon, for games that use NVIDIA Reflex markers and call the Reflex Sleep, ReLimiter does most of its waiting inside that Sleep call, before the game reads input for the next frame; the game is still released at the exact planned time. The Details line reads `Placement: pre-Sleep`. This needs no setup. ReLimiter's own wait replaces the driver's Reflex Sleep while it paces the game; Reflex markers and the game's Reflex mode are still passed to the driver, and the driver's Sleep is used again whenever ReLimiter is not pacing the game (for example with the cap off, or in Dynamic MFG passthrough).
+In the 64-bit addon, for games that use NVIDIA Reflex markers and call the Reflex Sleep, ReLimiter paces the game inside that Sleep call, before the game reads input for the next frame. The Details line reads `Placement: unified`. This needs no setup. ReLimiter's own wait replaces the driver's Reflex Sleep while it paces the game; Reflex markers and the game's Reflex mode are still passed to the driver, and the driver's Sleep is used again whenever ReLimiter is not pacing the game (for example with the cap off, or in Dynamic MFG passthrough).
 
 While it waits, ReLimiter asks Windows for its finest system timer resolution (usually 0.5 ms) for the game's process, and releases it when the game closes. This does not change the timer resolution of other programs on Windows 10 2004 and later.
 
-Games that do not call the Reflex Sleep, idle caps, NVIDIA Smooth Motion and the 32-bit addon wait only at the marker or Present call. Present-based pacing is unaffected.
-
-### Overload Pause
-
-When the game cannot reach the cap, holding frames makes things worse, so ReLimiter pauses its holds on its own. It pauses only when its own waits or the render handoff limit can make a difference: while the graphics card itself is the limit and ReLimiter's holds change nothing, the holds stay on (at the cost of about 1 ms of PC latency while that lasts). During a pause the status line reads `Paused: the game can't reach the cap right now`, the output becomes `source_only` with the reason `infeasible`, and **Details** shows an orange `Hold off: overload` line. ReLimiter keeps pacing the game while the holds are paused, and they resume by themselves after about two seconds without late frames that point to overload. The holds resume from the timing they were using during the pause and move to their new target a little at a time.
-
-What you can do: lower the cap.
+Games that do not call the Reflex Sleep and NVIDIA Smooth Motion wait only at the marker call, and Present-based pacing and the 32-bit addon wait at the Present call.
 
 ### Pacing preference
 
@@ -432,7 +422,7 @@ It does not turn on merely because FG is detected. Qualification repeats after r
 
 A real frame that arrives after its target passes without a wait, and the cadence restarts from it without a catch-up burst. This does not eliminate game stalls, and even a held real frame does not guarantee smooth displayed-frame spacing.
 
-In games that call the Reflex Sleep, the source wait uses [pre-Sleep placement](#pre-sleep-placement) by default, with or without frame generation.
+In games that call the Reflex Sleep, the source wait runs inside the Reflex Sleep call (see [Reflex Sleep Wait](#reflex-sleep-wait)), with or without frame generation.
 
 The log reports `Streamline GPU: qualified` when binding succeeds; this alone is not proof that a GPU wait was queued. Check **Output** in **Details**. Other add-ons that hook the DXGI factory or Streamline's swap chain are accommodated automatically.
 
@@ -555,7 +545,7 @@ If scripts are blocked on a managed computer, follow your organization's policy.
 
 ### Advanced Logging
 
-At the default level (`log_level=warn`) `relimiter_<GameName>.log` in the game directory records only warnings and errors: something failed, data was lost, an INI value was invalid, or a developer setting is on. Enable **Advanced Logging** (`info`) before reproducing a problem to also record what ReLimiter decided along the way: device and swapchain changes, the pacing route, overload pauses and similar events. Logging preferences are saved; turn detailed logging off when it is no longer needed.
+At the default level (`log_level=warn`) `relimiter_<GameName>.log` in the game directory records only warnings and errors: something failed, data was lost, an INI value was invalid, or a developer setting is on. Enable **Advanced Logging** (`info`) before reproducing a problem to also record what ReLimiter decided along the way: device and swapchain changes, the pacing route and similar events. Logging preferences are saved; turn detailed logging off when it is no longer needed.
 
 Each launch starts a new log. The previous launch's log is kept as `relimiter_<GameName>.prev.log` in the same folder (an older `.prev.log` is replaced), so the log of a launch that froze or crashed is still there after the next start. ReLimiter also keeps a small file, `relimiter_<GameName>.crumb`, next to the log that records how far start-up got. If the previous launch ended before it was running normally and without a clean shutdown (for example it froze while loading and was closed from Task Manager), the next launch's log, at any log level, starts with a warning: `the previous launch ended during start-up; last stage: <stage>`. Include that line, the `.prev.log` and the current log in a report. The warning appears only for launches that stopped during start-up, not after a game that ran and was closed normally.
 
@@ -652,7 +642,7 @@ Open **Details** under the pacing status line and check **Output** and **Reason*
 
 1. Use a cap inside your display's VRR range. Smoothing is always on; the status line says whether frames are being held.
 2. Check for another active limiter in the game, RTSS or driver settings.
-3. If **Grid epoch** climbs steadily, frames keep missing their targets: try a lower cap. If the status line reads **Paused: the game can't reach the cap right now**, ReLimiter has stopped holding frames because of overload and resumes on its own; see [Overload Pause](#overload-pause).
+3. If **Grid epoch** climbs steadily, frames keep missing their targets: try a lower cap.
 4. Compare VSync Game, Off and On. Change one option at a time.
 5. If an amber line says developer settings are changed from the defaults, press its **Reset** button.
 

@@ -2965,13 +2965,12 @@ namespace
         // Entering from DL (limiter interval) clears the interval.
         UnifiedSleepModeInputs limiter{};
         limiter.limiter_interval_us = 8333;
-        limiter.driver_low_latency_off = true;
         limiter.game_interval_us = 16667;
         limiter.publication = 7;
         limiter.epoch = 2;
         const UnifiedSleepModeTuple dl = UnifiedPacer_SleepModeDesired(limiter);
         CHECK(dl.owner == UnifiedSleepOwner::Limiter);
-        CHECK(dl.low_latency_off);
+        CHECK(!dl.low_latency_off); // the limiter's interval with low latency left to the game
         CHECK(dl.interval_us == 8333);
         UnifiedSleepModeInputs entering = limiter;
         entering.key = true;
@@ -2984,40 +2983,16 @@ namespace
         entering.epoch = 2;
         CHECK(UnifiedPacer_SleepModeDesired(entering) != dl);
 
-        // Leaving with driver_low_latency_off true restores the game's interval.
+        // Leaving the key without a limiter: the game's parameters and interval.
         UnifiedSleepModeInputs leaving{};
-        leaving.driver_low_latency_off = true;
         leaving.game_interval_us = 16667;
         leaving.publication = 7;
         leaving.epoch = 4;
         tuple = UnifiedPacer_SleepModeDesired(leaving);
-        CHECK(tuple.owner == UnifiedSleepOwner::LowLatencyOff);
-        CHECK(tuple.low_latency_off);
-        CHECK(tuple.interval_us == 16667);
-        CHECK(tuple != unified);
-
-        // Leaving otherwise: the game's parameters.
-        leaving.driver_low_latency_off = false;
-        tuple = UnifiedPacer_SleepModeDesired(leaving);
         CHECK(tuple.owner == UnifiedSleepOwner::Game);
         CHECK(!tuple.low_latency_off);
         CHECK(tuple.interval_us == 16667);
-
-        // The bypass state selects the override boolean.
-        leaving.driver_low_latency_off = true;
-        leaving.bypass = true;
-        leaving.bypass_low_latency_off = false;
-        CHECK(UnifiedPacer_SleepModeDesired(leaving).owner == UnifiedSleepOwner::Game);
-        leaving.bypass_low_latency_off = true;
-        leaving.driver_low_latency_off = false;
-        CHECK(UnifiedPacer_SleepModeDesired(leaving).owner == UnifiedSleepOwner::LowLatencyOff);
-
-        // The limiter's interval with low latency left to the game.
-        limiter.driver_low_latency_off = false;
-        tuple = UnifiedPacer_SleepModeDesired(limiter);
-        CHECK(tuple.owner == UnifiedSleepOwner::Limiter);
-        CHECK(!tuple.low_latency_off);
-        CHECK(tuple.interval_us == 8333);
+        CHECK(tuple != unified);
 
         // DMFG changes nothing with the key off.
         UnifiedSleepModeInputs dmfg_off{};

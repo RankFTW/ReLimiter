@@ -15,8 +15,8 @@
 // It also pins the decision table over (architecture policy x test mode x route x timing mode), so the resolver keeps
 // every decision byte for byte. Published observer state is covered in test_config_async.cpp; the scheduler's dispatch
 // of the resolved mode (OnMarker), the Sleep hook and the driver need live validation: scheduler.cpp links the whole
-// hook stack and no seam runs it, so the dispatch is covered by construction instead (the driver limiter hold is a
-// constant false, asserted below, and the resolver never resolves a planning rung for the driver limiter placement).
+// hook stack and no seam runs it, so the dispatch is covered by construction instead (the resolver never resolves a
+// planning rung for the driver limiter placement).
 
 #include "nvapi_hooks.h"
 #include "pacing_resolver.h"
@@ -39,9 +39,6 @@ namespace
             ++s_failures;                                                       \
         }                                                                       \
     } while (false)
-
-    // The driver limiter never carries a planning rung: its hold is a constant false in every owner state.
-    static_assert(!kPacingDriverLimiterHold, "the driver limiter placement must never plan");
 
     constexpr PacingRoute kRoutes[] = { PacingRoute::None, PacingRoute::NvApiMarkers, PacingRoute::PclMarkers,
         PacingRoute::PresentBased };
@@ -210,25 +207,20 @@ namespace
 
     // Nothing in the resolved state can select a planning path for the driver limiter placement: whenever the
     // placement is the driver limiter, the rung is source only with reason override, in every capability and runtime
-    // state and with every other owner state; only the test mode driver_limiter ever resolves that placement.
+    // state; only the test mode driver_limiter ever resolves that placement.
     void TestDriverLimiterNeverPlans()
     {
         int limited_rows = 0;
         for (const PacingTestMode test_mode : { PacingTestMode::Off, PacingTestMode::ReflexOnly,
                  PacingTestMode::DriverLimiter }) {
             ForEachRow([&](const Row& row) {
-                PacingRuntimeState runtime = Runtime(row);
-                for (int overloaded = 0; overloaded < 2; ++overloaded) {
-                    runtime.hold_overloaded = overloaded != 0;
-                    runtime.gpu_queue_wait_off = overloaded != 0;
-                    const PacingPipelineSnapshot result = PacingPipeline_Resolve(ModeConfig(test_mode),
-                        Capabilities(row.route, row.x64, row.qualified), runtime);
-                    if (result.placement != PacingSourcePlacement::DriverLimiter) continue;
-                    CHECK(test_mode == PacingTestMode::DriverLimiter);
-                    CHECK(result.rung == PacingRung::SourceOnly && result.auto_rung == PacingRung::SourceOnly);
-                    CHECK(result.reason == PacingFallbackReason::Override);
-                    ++limited_rows;
-                }
+                const PacingPipelineSnapshot result = PacingPipeline_Resolve(ModeConfig(test_mode),
+                    Capabilities(row.route, row.x64, row.qualified), Runtime(row));
+                if (result.placement != PacingSourcePlacement::DriverLimiter) return;
+                CHECK(test_mode == PacingTestMode::DriverLimiter);
+                CHECK(result.rung == PacingRung::SourceOnly && result.auto_rung == PacingRung::SourceOnly);
+                CHECK(result.reason == PacingFallbackReason::Override);
+                ++limited_rows;
             });
         }
         CHECK(limited_rows > 0);
@@ -292,25 +284,19 @@ namespace
 
     // ── The Sleep policy of each mode ──
 
-    // The inputs the hooks build: the removed low latency switches are constants (off).
-    UnifiedSleepModeInputs SleepInputs(bool key, bool bypass, uint32_t limiter_us, uint32_t game_us, bool dmfg)
-    {
-        UnifiedSleepModeInputs inputs{};
-        inputs.key = key;
-        inputs.dmfg = dmfg;
-        inputs.bypass = bypass;
-        inputs.bypass_low_latency_off = kPacingBypassLowLatencyOff;
-        inputs.driver_low_latency_off = kPacingDriverLowLatencyOff;
-        inputs.limiter_interval_us = limiter_us;
-        inputs.game_interval_us = game_us;
-        inputs.publication = 7;
-        inputs.epoch = 3;
-        return inputs;
-    }
-
     void TestSleepPolicyOfEachMode()
     {
-        static_assert(!kPacingBypassLowLatencyOff && !kPacingDriverLowLatencyOff, "the low latency switches are off");
+        // The inputs the hooks build: the unified key, Dynamic MFG, the limiter and the game's interval.
+        const auto inputs_of = [](bool key, uint32_t limiter_us, uint32_t game_us, bool dmfg) {
+            UnifiedSleepModeInputs inputs{};
+            inputs.key = key;
+            inputs.dmfg = dmfg;
+            inputs.limiter_interval_us = limiter_us;
+            inputs.game_interval_us = game_us;
+            inputs.publication = 7;
+            inputs.epoch = 3;
+            return inputs;
+        };
         const bool is64 = sizeof(void*) == 8;
         int rows = 0;
         for (const PacingTestMode mode : { PacingTestMode::Off, PacingTestMode::ReflexOnly,
@@ -327,15 +313,16 @@ namespace
             for (const uint32_t game_us : { 0u, 16667u })
             for (int dmfg = 0; dmfg < 2; ++dmfg) {
                 const bool bypass = NvAPI_ShouldBypassSleep(PacingPipeline_SleepBypass(), saved_cap, paced != 0);
-                const UnifiedSleepModeTuple tuple = UnifiedPacer_SleepModeDesired(
-                    SleepInputs(key, bypass, limiter_us, game_us, dmfg != 0));
+                const UnifiedSleepModeTuple tuple =
+                    UnifiedPacer_SleepModeDesired(inputs_of(key, limiter_us, game_us, dmfg != 0));
                 if (mode == PacingTestMode::ReflexOnly) {
                     // No placement, so no limiter interval: the game's own Sleep mode reaches the driver.
                     CHECK(!bypass);
-                    const UnifiedSleepModeTuple game = UnifiedPacer_SleepModeDesired(
-                        SleepInputs(false, false, 0, game_us, dmfg != 0));
+                    const UnifiedSleepModeTuple game =
+                        UnifiedPacer_SleepModeDesired(inputs_of(false, 0, game_us, dmfg != 0));
                     CHECK(game.owner == UnifiedSleepOwner::Game && !game.low_latency_off && game.interval_us == game_us);
-                    CHECK(UnifiedPacer_SleepModeDesired(SleepInputs(key, bypass, 0, game_us, dmfg != 0)) == game);
+                    // The same inputs without a limiter interval (the key is off in the mode): the game's tuple.
+                    CHECK(UnifiedPacer_SleepModeDesired(inputs_of(key, 0, game_us, dmfg != 0)) == game);
                 } else if (mode == PacingTestMode::DriverLimiter) {
                     CHECK(!bypass);
                     if (limiter_us != 0) {
@@ -442,7 +429,11 @@ namespace
     // The table of this build's architecture (the 32-bit build derives no unified owner). The rows with x64=0 (the
     // capability, not the build) and a marker route (1, 2) are pass-through because marker routes exist only in a
     // 64-bit process: no route resolves there, so for those rows mode off, driver_limiter idle/vrr/fixed resolve
-    // pass-through with reason passthrough. Every other row is unchanged from the table the old keys produced.
+    // pass-through with reason passthrough. The 32-bit build's rows "x64=1 off route=1 vrr", "x64=1 off route=1
+    // fixed", "x64=1 off route=2 vrr" and "x64=1 off route=2 fixed" (a marker route with the game calling the Reflex
+    // Sleep, outside the unified pacer) changed their placement from pre_sleep to marker: the marker placement
+    // outside the unified pacer (the pre-Sleep / marker / driver override) is gone, so a non-unified marker route
+    // waits at the marker; the rung, auto rung and reason columns are unchanged. The 64-bit table is unchanged.
     const char* const kPinnedTable =
 #ifdef _WIN64
         "x64=0 off route=0 uncapped -> off none source_only source_only passthrough\n"
@@ -596,12 +587,12 @@ namespace
         "x64=1 off route=0 fixed -> off none source_only source_only passthrough\n"
         "x64=1 off route=1 uncapped -> off none source_only source_only passthrough\n"
         "x64=1 off route=1 idle -> idle marker source_only source_only idle_cap\n"
-        "x64=1 off route=1 vrr -> vrr pre_sleep gpu_queue_wait gpu_queue_wait none\n"
-        "x64=1 off route=1 fixed -> fixed pre_sleep marker_hold marker_hold fixed_refresh\n"
+        "x64=1 off route=1 vrr -> vrr marker gpu_queue_wait gpu_queue_wait none\n"
+        "x64=1 off route=1 fixed -> fixed marker marker_hold marker_hold fixed_refresh\n"
         "x64=1 off route=2 uncapped -> off none source_only source_only passthrough\n"
         "x64=1 off route=2 idle -> idle marker source_only source_only idle_cap\n"
-        "x64=1 off route=2 vrr -> vrr pre_sleep marker_hold marker_hold api\n"
-        "x64=1 off route=2 fixed -> fixed pre_sleep marker_hold marker_hold api\n"
+        "x64=1 off route=2 vrr -> vrr marker marker_hold marker_hold api\n"
+        "x64=1 off route=2 fixed -> fixed marker marker_hold marker_hold api\n"
         "x64=1 off route=3 uncapped -> off none source_only source_only passthrough\n"
         "x64=1 off route=3 idle -> idle present source_only source_only idle_cap\n"
         "x64=1 off route=3 vrr -> vrr present source_only source_only present_route\n"

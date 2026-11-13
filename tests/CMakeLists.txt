@@ -567,12 +567,10 @@ add_executable(test_period_governor
     ${CMAKE_SOURCE_DIR}/src/period_governor.cpp
     ${CMAKE_SOURCE_DIR}/src/pacing_metrics.cpp
 )
-# The retry test drives the production lead controller's slack window.
+# The rung_feasibility event reasons (FeasibilityCause wire values and text).
 add_executable(test_rung_feasibility
     test_rung_feasibility.cpp
     ${CMAKE_SOURCE_DIR}/src/rung_feasibility.cpp
-    ${CMAKE_SOURCE_DIR}/src/lead_controller.cpp
-    ${CMAKE_SOURCE_DIR}/src/pacing_metrics.cpp
 )
 # Governor-step and rung-feasibility event derivation of the telemetry worker.
 # The worker thread and CSV rows need live capture validation.

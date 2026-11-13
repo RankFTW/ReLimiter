@@ -234,6 +234,8 @@ class ConfigSavePolicyTests(unittest.TestCase):
 
     def test_removed_pacing_settings_are_constants_not_keys(self):
         table, outside = removed_table(SOURCE)
+        # The one place that may name the preset key is the migration that deletes it from the preset sections.
+        outside = outside.replace(body("DropRemovedPresetKeys"), "")
         # The table lists exactly the removed keys; the preset key belongs to the OSD preset sections.
         listed = re.findall(r'\{"(\w+)", "[^"]*"\}', table)
         self.assertEqual(len(listed), len(set(listed)))
@@ -265,11 +267,20 @@ class ConfigSavePolicyTests(unittest.TestCase):
         load = body("LoadConfig")
         # The removed settings are named once, for a non-first launch of an INI older than version 6; the version-5
         # step (the queue defaults) stays and no earlier step does.
-        self.assertIn("if (!s_first_launch && saved_version < 6) LogRemovedKeysWithValues(S, P);", load)
+        self.assertRegex(load, r"if \(!s_first_launch && saved_version < 6\) \{\s*LogRemovedKeysWithValues\(S, P\);"
+                               r"\s*DropRemovedPresetKeys\(P\);\s*\}")
         self.assertIn("saved_version < 5", load)
         self.assertEqual(sorted(set(re.findall(r"saved_version\s*<\s*(\d+)", load))), ["5", "6"])
         self.assertLess(load.index("LogRemovedKeysWithValues(S, P);"), load.index("saved_version < 5"))
-        self.assertIn("settings that no longer exist were ignored", body("LogRemovedKeysWithValues"))
+        # The obsolete preset key is dropped from every preset section of both storage modes through the checked writer.
+        drop = body("DropRemovedPresetKeys")
+        self.assertIn("s_shared_presets_path", drop)
+        self.assertIn('WriteINIString(section, "show_adaptive_smoothing", nullptr, path);', drop)
+        # The line is an info-level log naming each key with its saved value; nothing of it is pinned as prose.
+        names = body("LogRemovedKeysWithValues")
+        self.assertIn("LOG_INFO(", names)
+        self.assertRegex(names, r"names \+= key\.name;\s*names \+= '=';\s*names \+= value;")
+        self.assertRegex(names, r"if \(value\.empty\(\) \|\| SameAsDefault\(value, key\.default_text\)\) continue;")
         # The migrated defaults of version 5 are exactly the queue law, the probe and its source.
         self.assertEqual(
             sorted(set(re.findall(r"g_config\.(\w+) = kPacing\w+Default;", load))),

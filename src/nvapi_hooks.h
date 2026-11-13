@@ -152,9 +152,9 @@ inline std::atomic<bool> g_unified_driver_pacing{false};
 
 // The Sleep-mode tuple: one applied record {publication, owner, low latency off, interval,
 // epoch} under the forward lock, against the desired tuple (UnifiedPacer_SleepModeDesired:
-// the key, Dynamic MFG, the bypass state, the developer low-latency overrides, the
-// limiter interval and the game's captured parameters). The record is kept only while the
-// key is on (or a reconcile is pending): with the key off and settled nothing is recorded
+// the key, Dynamic MFG, the limiter interval and the game's captured parameters). The
+// record is kept only while the key is on (or a reconcile is pending): with the key off
+// and settled nothing is recorded
 // and every key-off path is as before. The epoch is bumped on key toggles and Dynamic MFG
 // transitions; it matters only inside the key-on tuple. The bump also restarts the Sleep
 // self-check. Scheduler owner.

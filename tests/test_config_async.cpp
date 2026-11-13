@@ -114,8 +114,10 @@ BOOL WINAPI WriteProfile(LPCSTR section, LPCSTR key, LPCSTR value, LPCSTR path) 
             else
                 ++it;
         }
+    } else if (!value) {
+        disk.erase(Key{ path, section, key }); // a null value deletes the key, as the real API does
     } else {
-        disk[{ path, section, key }] = value ? value : "";
+        disk[{ path, section, key }] = value;
     }
     return TRUE;
 }
@@ -222,6 +224,15 @@ struct IniEntry {
     const char* key;
     const char* value;
 };
+// One key of any file and section seeded into the fake disk by the next fresh launch (Reset), then forgotten:
+// the OSD_Preset_<n> sections of the local INI and the shared presets file.
+struct DiskEntry {
+    const char* path;
+    const char* section;
+    const char* key;
+    const char* value;
+};
+std::vector<DiskEntry> extra_seed;
 // One launch of the configuration on the fake disk. keep_disk false seeds the fake INI from `ini` first (a launch
 // without any key on the disk is a first launch); keep_disk true loads the file the previous launch left behind.
 void Launch(bool creation_failure, bool initial_write_failure, bool keep_disk, const std::vector<IniEntry>& ini) {
@@ -239,6 +250,8 @@ void Launch(bool creation_failure, bool initial_write_failure, bool keep_disk, c
         if (!keep_disk) {
             disk.clear();
             for (const auto& entry : ini) disk[{ local_path, "FrameLimiter", entry.key }] = entry.value;
+            for (const auto& entry : extra_seed) disk[{ entry.path, entry.section, entry.key }] = entry.value;
+            extra_seed.clear();
         }
         writes.clear();
         hold_start = true;
@@ -1471,6 +1484,135 @@ void TestFirstLaunchAndDefaultValuedRemovedKeys() {
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
+// ── The preset key of the removed OSD element ──
+// The OSD_Preset_<n> sections live outside [FrameLimiter], so the start-up wipe never reached them: the version step
+// deletes show_adaptive_smoothing there (local INI and shared presets file), once, and writes nothing else.
+// Two preset slots with the fields the loader reads; the removed key is seeded (true in slot 1, false in slot 2) or not.
+std::vector<DiskEntry> PresetSections(const char* path, bool with_removed_key) {
+    struct Slot {
+        const char* section; const char* name; const char* x; const char* y; const char* scale; const char* opacity;
+        const char* fps; const char* frametime; const char* removed;
+    };
+    const Slot slots[] = {
+        {"OSD_Preset_1", "Alpha", "0.25", "0.5", "1.5", "0.75", "true", "false", "true"},
+        {"OSD_Preset_2", "Beta", "0.125", "0.0625", "0.5", "0.25", "false", "true", "false"}};
+    std::vector<DiskEntry> entries;
+    for (const Slot& slot : slots) {
+        entries.push_back({path, slot.section, "name", slot.name});
+        entries.push_back({path, slot.section, "osd_x", slot.x});
+        entries.push_back({path, slot.section, "osd_y", slot.y});
+        entries.push_back({path, slot.section, "osd_scale", slot.scale});
+        entries.push_back({path, slot.section, "osd_opacity", slot.opacity});
+        entries.push_back({path, slot.section, "show_fps", slot.fps});
+        entries.push_back({path, slot.section, "show_frametime", slot.frametime});
+        if (with_removed_key) entries.push_back({path, slot.section, "show_adaptive_smoothing", slot.removed});
+    }
+    return entries;
+}
+std::vector<DiskEntry> operator+(std::vector<DiskEntry> a, const std::vector<DiskEntry>& b) {
+    a.insert(a.end(), b.begin(), b.end());
+    return a;
+}
+std::map<Key, std::string> AsFields(const std::vector<DiskEntry>& entries) {
+    std::map<Key, std::string> fields;
+    for (const DiskEntry& entry : entries) fields[Key{ entry.path, entry.section, entry.key }] = entry.value;
+    return fields;
+}
+// Every OSD_Preset_<n> key of one file on the fake disk.
+std::map<Key, std::string> PresetFields(const char* path) {
+    std::lock_guard<std::mutex> lock(mutex);
+    std::map<Key, std::string> fields;
+    for (const auto& entry : disk)
+        if (std::get<0>(entry.first) == path && std::get<1>(entry.first).rfind("OSD_Preset_", 0) == 0)
+            fields.insert(entry);
+    return fields;
+}
+size_t EntriesOf(const char* path) {
+    std::lock_guard<std::mutex> lock(mutex);
+    size_t count = 0;
+    for (const auto& entry : disk)
+        if (std::get<0>(entry.first) == path) ++count;
+    return count;
+}
+// The loaded presets are the two seeded slots, intact.
+void CheckPresetsIntact() {
+    const OSDPreset& alpha = OSDPreset_GetSlot(0);
+    CHECK(alpha.occupied && std::strcmp(alpha.name, "Alpha") == 0);
+    CHECK(alpha.osd_x == 0.25f && alpha.osd_y == 0.5f && alpha.osd_scale == 1.5f && alpha.osd_opacity == 0.75f);
+    CHECK(alpha.show_fps && !alpha.show_frametime);
+    const OSDPreset& beta = OSDPreset_GetSlot(1);
+    CHECK(beta.occupied && std::strcmp(beta.name, "Beta") == 0);
+    CHECK(beta.osd_x == 0.125f && beta.osd_y == 0.0625f && beta.osd_scale == 0.5f && beta.osd_opacity == 0.25f);
+    CHECK(!beta.show_fps && beta.show_frametime);
+}
+void CheckPresetKeyGone(const char* path) {
+    CHECK(Value(path, "OSD_Preset_1", "show_adaptive_smoothing").empty());
+    CHECK(Value(path, "OSD_Preset_2", "show_adaptive_smoothing").empty());
+}
+
+void TestRemovedPresetKeyIsDropped() {
+    // (1) Version-5 local INI: the key is gone from both sections, every other preset field is as it was, the
+    // presets load intact; the shared presets file was never seeded and is not created.
+    extra_seed = PresetSections(local_path, true);
+    Reset(false, false, {{"config_version", "5"}, {"target_fps", "60"}});
+    CHECK(!Config_IsFirstLaunch());
+    CheckPresetKeyGone(local_path);
+    CHECK(PresetFields(local_path) == AsFields(PresetSections(local_path, false)));
+    CheckPresetsIntact();
+    CHECK(EntriesOf(shared_path) == 0);
+    ReleaseStart();CHECK(OwnerShutdown());
+    CHECK(PresetFields(local_path) == AsFields(PresetSections(local_path, false)));
+    CHECK(Value(local_path, "FrameLimiter", "config_version") == "6");
+
+    // (2) shared_presets on, the key in the SHARED presets file (and none in the local INI): gone there, the other
+    // fields unchanged, the shared presets loaded intact.
+    extra_seed = PresetSections(shared_path, true);
+    Reset(false, false, {{"config_version", "5"}, {"shared_presets", "true"}});
+    CheckPresetKeyGone(shared_path);
+    CHECK(PresetFields(shared_path) == AsFields(PresetSections(shared_path, false)));
+    CHECK(PresetFields(local_path).empty());
+    CheckPresetsIntact();
+    ReleaseStart();CHECK(OwnerShutdown());
+    CHECK(PresetFields(shared_path) == AsFields(PresetSections(shared_path, false)));
+
+    // (2b) The key in both files, shared_presets off: both are cleaned, nothing else changes.
+    extra_seed = PresetSections(local_path, true) + PresetSections(shared_path, true);
+    Reset(false, false, {{"config_version", "5"}});
+    CheckPresetKeyGone(local_path);
+    CheckPresetKeyGone(shared_path);
+    CHECK(PresetFields(local_path) == AsFields(PresetSections(local_path, false)));
+    CHECK(PresetFields(shared_path) == AsFields(PresetSections(shared_path, false)));
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    // (3) A shared presets file that does not exist is not created by the migration; with shared_presets on the
+    // start-up save writes only its [Presets] section there, never a preset section.
+    extra_seed = PresetSections(local_path, true);
+    Reset(false, false, {{"config_version", "5"}});
+    CheckPresetKeyGone(local_path);
+    CHECK(EntriesOf(shared_path) == 0);
+    ReleaseStart();CHECK(OwnerShutdown());
+    extra_seed = PresetSections(local_path, true);
+    Reset(false, false, {{"config_version", "5"}, {"shared_presets", "true"}});
+    CheckPresetKeyGone(local_path);
+    CHECK(PresetFields(shared_path).empty());
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    // (4) A version-6 INI is not touched: the migration runs once, whatever the preset sections hold.
+    extra_seed = PresetSections(local_path, true) + PresetSections(shared_path, true);
+    Reset(false, false, {{"config_version", "6"}});
+    CHECK(PresetFields(local_path) == AsFields(PresetSections(local_path, true)));
+    CHECK(PresetFields(shared_path) == AsFields(PresetSections(shared_path, true)));
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    // (5) A first launch writes no preset section anywhere.
+    Reset();
+    CHECK(Config_IsFirstLaunch());
+    CHECK(PresetFields(local_path).empty() && PresetFields(shared_path).empty());
+    CHECK(EntriesOf(shared_path) == 0);
+    ReleaseStart();CHECK(OwnerShutdown());
+    CHECK(PresetFields(local_path).empty() && PresetFields(shared_path).empty());
+}
+
 // Keys retired by the earlier reworks. An existing INI may still carry them: loading ignores them and
 // LoadConfig's clean rewrite drops them, so the pipeline matches a fresh INI.
 constexpr const char* retired_keys[] = {
@@ -1758,6 +1900,7 @@ int main() {
     TestSaveNeverResurrectsRemovedKeys();
     TestRemovedKeysAreNotLiveKeys();
     TestFirstLaunchAndDefaultValuedRemovedKeys();
+    TestRemovedPresetKeyIsDropped();
     TestRetiredKeysIgnoredAndDropped();
     TestImmutableCoalescingAndDestinations();
     TestBlockedIOTimeoutAndInFlightReplacement();
