@@ -340,8 +340,11 @@ void CheckPipelineMatchesConfig() {
     CHECK(pipeline.unified_every_frame_service == (g_config.unified_every_frame_service && sizeof(void*) == 8));
     CHECK(pipeline.unified_queue_target_us ==
         (sizeof(void*) == 8 ? g_config.unified_queue_target_us : kPacingUnifiedQueueTargetDefaultUs));
-    // Key unified_hold_share: 64-bit only, forced to the default (0) on Win32.
-    CHECK(pipeline.unified_hold_share == (sizeof(void*) == 8 ? g_config.unified_hold_share : 0.0));
+    // Keys unified_hold_share and unified_queue_rank reach the pipeline as the effective pair the pacing preference resolves
+    // with them (g_config keeps the raw values); the hold share is 64-bit only, forced to the default (0) on Win32.
+    const PacingPreferenceResolution effective = PacingPipeline_ResolvePreference(
+        g_config.pacing_preference, g_config.unified_queue_rank, g_config.unified_hold_share);
+    CHECK(pipeline.unified_hold_share == (sizeof(void*) == 8 ? effective.hold_share : 0.0));
     CHECK(pipeline.pre_sleep_precise == (forced ? false : g_config.pre_sleep_precise));
     CHECK(pipeline.driver_limiter_hold == (forced ? false : g_config.driver_limiter_hold));
     CHECK(g_driver_low_latency_off.load() == g_config.driver_low_latency_off);
@@ -354,7 +357,7 @@ void CheckPipelineMatchesConfig() {
     CHECK(g_gpu_queue_probe.load() == ((g_config.gpu_queue_probe && is64) || law_in_use));
     CHECK(g_gpu_queue_law_feed.load() == law_in_use);
     CHECK(pipeline.unified_queue_law == (g_config.unified_queue_law && is64));
-    CHECK(pipeline.unified_queue_rank == g_config.unified_queue_rank);
+    CHECK(pipeline.unified_queue_rank == effective.queue_rank);
     CHECK(pipeline.unified_queue_need_frames == g_config.unified_queue_need_frames);
     // The upstream stamping key: 64-bit only (0 on Win32), in the pipeline snapshot and the hook gate.
     CHECK(pipeline.unified_queue_upstream == (sizeof(void*) == 8 ? g_config.unified_queue_upstream : 0));
@@ -1418,6 +1421,91 @@ void TestAdaptiveCapPercentile() {
     }
 }
 
+// pacing_preference (user key): loads each text (case-insensitive), an invalid or empty text resets to balanced, saves
+// canonical text; the pipeline carries the effective rank and hold share while g_config and the INI keep the raw developer
+// keys; a developer key that differs from its default decides its own value, one at its default inherits the preference,
+// and the two levers are independent; the live key; not a developer setting, and the developer reset leaves it alone.
+void TestPacingPreference() {
+    struct Case { const char* text; PacingPreference expected; };
+    for (const Case& test : {Case{nullptr, PacingPreference::Balanced}, Case{"balanced", PacingPreference::Balanced},
+            Case{"latency", PacingPreference::Latency}, Case{"SMOOTH", PacingPreference::Smooth},
+            Case{"fast", PacingPreference::Balanced}, Case{"", PacingPreference::Balanced}}) {
+        std::vector<IniEntry> ini;
+        if (test.text) ini.push_back({"pacing_preference", test.text});
+        Reset(false, false, ini);
+        CHECK(g_config.pacing_preference == test.expected);
+        CheckPipelineMatchesConfig();
+        CHECK(Value(local_path, "FrameLimiter", "pacing_preference") == PacingPreference_Text(test.expected));
+        // The effective pair is the preference's; the developer keys and the INI keep their raw values.
+        CHECK(g_config.unified_queue_rank == kPacingUnifiedQueueRankDefault);
+        CHECK(g_config.unified_hold_share == kPacingUnifiedHoldShareDefault);
+        CHECK(std::stoi(Value(local_path, "FrameLimiter", "unified_queue_rank")) == kPacingUnifiedQueueRankDefault);
+        CHECK(std::stod(Value(local_path, "FrameLimiter", "unified_hold_share")) == kPacingUnifiedHoldShareDefault);
+        const PacingPipelineConfig pipeline = PacingPipeline_GetConfig();
+        CHECK(pipeline.unified_queue_rank ==
+            (test.expected == PacingPreference::Latency ? kPacingPreferenceLatencyRank : kPacingUnifiedQueueRankDefault));
+        CHECK(pipeline.unified_hold_share ==
+            (test.expected == PacingPreference::Smooth && sizeof(void*) == 8 ? kPacingPreferenceSmoothHoldShare
+                                                                              : kPacingUnifiedHoldShareDefault));
+        CHECK(OverridesBesidesUnified() == 0); // a user setting, not a developer override
+        ReleaseStart();CHECK(OwnerShutdown());
+    }
+
+    // Live key, precedence, independence and the developer reset.
+    Reset(false, false, {{"config_version", "4"}});
+    char error[128] = {};
+    CHECK(Config_SetLiveKey("pacing_preference", "Smooth", error, sizeof(error)) && error[0] == '\0');
+    CHECK(g_config.pacing_preference == PacingPreference::Smooth);
+    CheckPipelineMatchesConfig();
+    CHECK(PacingPipeline_GetConfig().unified_queue_rank == kPacingUnifiedQueueRankDefault); // Smooth moves only the share
+    CHECK(!Config_SetLiveKey("pacing_preference", "turbo", error, sizeof(error)) && error[0] != '\0');
+    CHECK(g_config.pacing_preference == PacingPreference::Smooth);
+    CHECK(Config_SetLiveKey("pacing_preference", "latency", error, sizeof(error)));
+    CheckPipelineMatchesConfig();
+    CHECK(PacingPipeline_GetConfig().unified_queue_rank == kPacingPreferenceLatencyRank);
+    CHECK(PacingPipeline_GetConfig().unified_hold_share == kPacingUnifiedHoldShareDefault); // Latency moves only the rank
+    // A developer key away from its default decides its own value whatever the preference.
+    CHECK(Config_SetLiveKey("unified_queue_rank", "3", error, sizeof(error)));
+    CHECK(PacingPipeline_GetConfig().unified_queue_rank == 3 && g_config.unified_queue_rank == 3);
+    CHECK(Config_SetLiveKey("pacing_preference", "smooth", error, sizeof(error)));
+    CHECK(PacingPipeline_GetConfig().unified_queue_rank == 3); // Smooth does not touch the rank
+    CHECK(Config_SetLiveKey("unified_hold_share", "0.0625", error, sizeof(error)));
+    CheckPipelineMatchesConfig();
+    CHECK(g_config.unified_hold_share == 0.0625);
+    if (sizeof(void*) == 8) CHECK(PacingPipeline_GetConfig().unified_hold_share == 0.0625);
+    CHECK(OverridesBesidesUnified() == 2); // the two developer keys, not the preference
+    // The developer reset returns the developer keys and leaves the preference.
+    ResetDeveloperKeepingEarlierPipeline();
+    CHECK(OverridesBesidesUnified() == 0);
+    CHECK(g_config.pacing_preference == PacingPreference::Smooth);
+    CheckPipelineMatchesConfig();
+    CHECK(PacingPipeline_GetConfig().unified_hold_share ==
+        (sizeof(void*) == 8 ? kPacingPreferenceSmoothHoldShare : kPacingUnifiedHoldShareDefault));
+    // A developer key explicitly at its default inherits the preference (to force the exact pair, select balanced first).
+    CHECK(Config_SetLiveKey("unified_queue_rank", "2", error, sizeof(error)));
+    CHECK(Config_SetLiveKey("pacing_preference", "latency", error, sizeof(error)));
+    CHECK(PacingPipeline_GetConfig().unified_queue_rank == kPacingPreferenceLatencyRank);
+    CHECK(Config_SetLiveKey("pacing_preference", "balanced", error, sizeof(error)));
+    CHECK(PacingPipeline_GetConfig().unified_queue_rank == kPacingUnifiedQueueRankDefault);
+    CheckPipelineMatchesConfig();
+
+    // Save round trip: the preference is saved as text, the raw developer keys stay raw.
+    g_config.pacing_preference = PacingPreference::Latency;
+    Config_ApplyPacingPipeline();
+    RequestSaveConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+    CheckWorkerWrites();
+    CHECK(Value(local_path, "FrameLimiter", "pacing_preference") == "latency");
+    CHECK(std::stoi(Value(local_path, "FrameLimiter", "unified_queue_rank")) == kPacingUnifiedQueueRankDefault);
+
+    // An out-of-range value in memory is reset with a warning on validation.
+    Reset();
+    g_config.pacing_preference = static_cast<PacingPreference>(9);
+    ValidateConfig();
+    CHECK(g_config.pacing_preference == PacingPreference::Balanced);
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
 void TestDeveloperKeysClamped() {
     struct Case { const char* ms; const char* period; double expected_ms; double expected_period; };
     for (const Case& test : {Case{"12.5", "2", 12.5, 2.0}, Case{"500", "120", 200.0, 60.0},
@@ -1758,6 +1846,7 @@ int main() {
     TestPacingMethodMigration();
     TestAdaptiveCapMigration();
     TestAdaptiveCapPercentile();
+    TestPacingPreference();
     TestDeveloperKeysClamped();
     TestGpuWaitInterleaveKey();
     TestRetiredKeysIgnoredAndDropped();

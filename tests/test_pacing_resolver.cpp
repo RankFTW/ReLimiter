@@ -1863,6 +1863,53 @@ namespace
         PacingPipeline_SetConfig(PacingPipelineConfig{});
         CHECK(SameConfig(PacingPipeline_GetConfig(), PacingPipelineConfig{}));
     }
+
+    // The pacing preference resolves to the queue-based pacer's rank and hold share. Each lever moves only for its own
+    // position and only while its developer key is at the default: a developer value that differs from its own default wins,
+    // and the two levers are independent. The texts round-trip.
+    void TestPacingPreferenceMapping()
+    {
+        const int rank_default = kPacingUnifiedQueueRankDefault;
+        const double share_default = kPacingUnifiedHoldShareDefault;
+        const auto resolve = [](PacingPreference preference, int rank, double share) {
+            return PacingPipeline_ResolvePreference(preference, rank, share);
+        };
+        // The three positions with the developer keys at their defaults.
+        CHECK(resolve(PacingPreference::Balanced, rank_default, share_default).queue_rank == rank_default);
+        CHECK(resolve(PacingPreference::Balanced, rank_default, share_default).hold_share == share_default);
+        CHECK(resolve(PacingPreference::Latency, rank_default, share_default).queue_rank == kPacingPreferenceLatencyRank);
+        CHECK(resolve(PacingPreference::Latency, rank_default, share_default).hold_share == share_default);
+        CHECK(resolve(PacingPreference::Smooth, rank_default, share_default).queue_rank == rank_default);
+        CHECK(resolve(PacingPreference::Smooth, rank_default, share_default).hold_share == kPacingPreferenceSmoothHoldShare);
+        CHECK(kPacingPreferenceLatencyRank == 4 && kPacingPreferenceSmoothHoldShare == 1.0 / 32.0);
+        CHECK(kPacingPreferenceSmoothHoldShare <= kPacingUnifiedHoldShareMax);
+        // A developer key that differs from its default wins over every position.
+        for (const PacingPreference preference : {PacingPreference::Latency, PacingPreference::Balanced, PacingPreference::Smooth}) {
+            CHECK(resolve(preference, 3, share_default).queue_rank == 3);
+            CHECK(resolve(preference, 6, 0.0625).queue_rank == 6);
+            CHECK(resolve(preference, rank_default, 0.0625).hold_share == 0.0625);
+            CHECK(resolve(preference, 6, 0.0625).hold_share == 0.0625);
+        }
+        // The levers are independent: Latency leaves a developer share, Smooth leaves a developer rank, and a
+        // developer rank does not stop Smooth's share (nor a developer share Latency's rank).
+        CHECK(resolve(PacingPreference::Latency, rank_default, 0.0625).queue_rank == kPacingPreferenceLatencyRank);
+        CHECK(resolve(PacingPreference::Latency, rank_default, 0.0625).hold_share == 0.0625);
+        CHECK(resolve(PacingPreference::Smooth, 6, share_default).queue_rank == 6);
+        CHECK(resolve(PacingPreference::Smooth, 6, share_default).hold_share == kPacingPreferenceSmoothHoldShare);
+        CHECK(resolve(PacingPreference::Latency, 6, share_default).queue_rank == 6);
+        // A value out of the enum behaves as the default position.
+        CHECK(resolve(static_cast<PacingPreference>(9), rank_default, share_default).queue_rank == rank_default);
+        CHECK(resolve(static_cast<PacingPreference>(9), rank_default, share_default).hold_share == share_default);
+
+        PacingPreference parsed = PacingPreference::Balanced;
+        for (const PacingPreference preference : {PacingPreference::Latency, PacingPreference::Balanced, PacingPreference::Smooth}) {
+            parsed = static_cast<PacingPreference>(7);
+            CHECK(PacingPreference_FromText(PacingPreference_Text(preference), &parsed) && parsed == preference);
+        }
+        CHECK(PacingPreference_FromText("SMOOTH", &parsed) && parsed == PacingPreference::Smooth);
+        parsed = PacingPreference::Smooth;
+        CHECK(!PacingPreference_FromText("fast", &parsed) && parsed == PacingPreference::Smooth);
+    }
 }
 
 int main()
@@ -1886,6 +1933,7 @@ int main()
     TestLeadCoverage();
     TestProbesCopied();
     TestSameResult();
+    TestPacingPreferenceMapping();
     TestPublishGeneration();
     TestCapabilities();
     TestSourcePlacement();

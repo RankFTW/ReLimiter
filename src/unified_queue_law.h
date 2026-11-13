@@ -35,7 +35,8 @@
 //       the mean cycle by more than the GPU's deficit to the cap. result.bound_active when the
 //       bound is strictly the smaller side; P (p_us) stays B's correction, so I_gpu may be below
 //       B + P.
-//   refill (per arrived valid sample, while in use) = max(0, J - S^) + min(sigma*S^, max(0, S^ - J))
+//   refill (per arrived valid sample, while in use) = max(0, J - S^) + min(sigma*S^, max(0, S^ - J)); the pacer bounds
+//       the second (share) term by the median frame generation time A of the used reports (UnifiedPacer::OnQueueRecord).
 //   debit (per arrived valid sample) = the sample's hold block.
 // B already contains the hold blocking the frames realized (the cycle includes the time a frame
 // waited behind ReLimiter's hold), so I_gpu never adds the mean hold: a hold that starts moves B
@@ -100,7 +101,9 @@ struct UnifiedQueueResult {
     double p_us = 0.0;          // P after the clamp
     double guard_us = 0.0;
     double gpu_interval_us = 0.0; // I_gpu = B + P
-    double refill_us = 0.0;     // the credit's refill per arrived valid sample under the law
+    double refill_us = 0.0;     // the credit's refill per arrived valid sample under the law: refill_slack_us + refill_share_us
+    double refill_slack_us = 0.0; // max(0, J - S^): the slack the cap leaves
+    double refill_share_us = 0.0; // min(sigma * S^, max(0, S^ - J)): the share part; the pacer bounds it by the frame generation time A
 };
 
 // The real frame a record measured: its key when valid, else unknown.

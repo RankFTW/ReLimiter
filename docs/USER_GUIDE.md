@@ -65,7 +65,7 @@ Open the ReShade overlay, normally with **Home**, and find ReLimiter's settings 
 3. Leave **Adaptive cap** off initially. Try it if heavy scenes or areas drop the frame rate below the cap.
 4. Open **OSD** and enable the readings you want to see.
 
-The FPS controls are at the top, followed by the pacing status (with its **Details**) and **Adaptive cap**. **OSD** and **Screen** follow. **Enable advanced settings** reveals compatibility options and the **Adaptive cap fit** choice; most users can leave it unchecked.
+The FPS controls are at the top, followed by the pacing status (with its **Details**), **Pacing preference** (64-bit) and **Adaptive cap**. **OSD** and **Screen** follow. **Enable advanced settings** reveals compatibility options and the **Adaptive cap fit** choice; most users can leave it unchecked.
 
 ReLimiter ships the recommended defaults and you are not expected to tune pacing: smoothing is always on, the output point is chosen automatically, and there is no separate setup for frame generation. Settings save automatically. Existing caps and compatible preferences are carried forward when upgrading; see [Removed and migrated keys](#removed-and-migrated-keys).
 
@@ -236,6 +236,24 @@ Games that do not call the Reflex Sleep, idle caps, NVIDIA Smooth Motion and the
 When the game cannot reach the cap, holding frames makes things worse, so ReLimiter pauses its holds on its own. It pauses only when its own waits or the render handoff limit can make a difference: while the graphics card itself is the limit and ReLimiter's holds change nothing, the holds stay on (at the cost of about 1 ms of PC latency while that lasts). During a pause the status line reads `Paused: the game can't reach the cap right now`, the output becomes `source_only` with the reason `infeasible`, and **Details** shows an orange `Hold off: overload` line. ReLimiter keeps pacing the game while the holds are paused, and they resume by themselves after about two seconds without late frames that point to overload. The holds resume from the timing they were using during the pause and move to their new target a little at a time.
 
 What you can do: lower the cap, or turn on [Adaptive cap](#adaptive-cap), which lengthens the interval first so holds usually stay on.
+
+### Pacing preference
+
+**Pacing preference** (main view, below the pacing status, 64-bit addon) lets you lean the pacer one way: give up a little frame rate for more even frames, or a little evenness for lower latency. It applies to 64-bit DirectX 12 games, where ReLimiter's queue-based pacer is on. It has no effect in 32-bit games or other graphics APIs, and the control is hidden while Dynamic MFG controls the frame rate. A change applies at once and is saved.
+
+| Choice | What it does |
+|--------|--------------|
+| **Balanced** (default) | The recommended behaviour. |
+| **Smoother** | With DLSS frame generation 2x and no cap the GPU can hold, gives up about 3% frame rate for more even frames and fewer hitches. No effect with a cap the GPU can hold, or without frame generation. |
+| **Lower latency** | Keeps less work waiting for the GPU. In testing up to about 2 ms lower latency; in some games a slightly lower frame rate and less even frames. |
+
+When to use which:
+
+- Stay on **Balanced** unless something bothers you.
+- Try **Smoother** with frame generation when the game cannot hold your cap (or you play without a cap) and frames still hitch.
+- Try **Lower latency** when input delay matters more to you than the last bit of evenness.
+
+The INI key is `pacing_preference` under `[FrameLimiter]`: `latency`, `balanced` (default) or `smooth`. With `developer_settings=true`, a developer key set away from its default decides its own value and the panel then says that a developer setting overrides the selected position.
 
 ---
 
@@ -578,6 +596,7 @@ Most settings can be changed through the overlay. For manual changes, close the 
 | `target_fps` | 0 | 0 disables the normal cap; 30–1000 FPS via INI. Use the overlay to choose VRR Cap or a custom target. |
 | `adaptive_cap` | false | Enable **Adaptive cap**: lengthens the cap interval, up to +60%, while frames are late and the cap can't be held, and shortens it again when they are not. See [Adaptive cap](#adaptive-cap). |
 | `adaptive_cap_percentile` | 75 | **Adaptive cap fit** (Advanced): `75`, `90` or `99`, the share of recent frames the lengthened interval plans for. Other values move to the nearest of the three (up to 82 → 75, 83–94 → 90, 95 and above → 99). |
+| `pacing_preference` | balanced | **Pacing preference** (64-bit DirectX 12): `latency` (**Lower latency**), `balanced` or `smooth` (**Smoother**). Any other value loads as `balanced`. |
 | `advanced_settings` | false | Show advanced user controls |
 | `developer_settings` | false | INI-only. Shows the developer settings in the Advanced section; see [Developer Settings](#developer-settings). |
 | `config_version` | 5 | Written by ReLimiter; do not edit. Records which defaults the file was written with; see [Removed and migrated keys](#removed-and-migrated-keys). |

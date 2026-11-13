@@ -249,6 +249,10 @@ void ValidateConfig() {
                  g_config.adaptive_cap_percentile, fit_tier);
         g_config.adaptive_cap_percentile = fit_tier;
     }
+    if (static_cast<unsigned>(g_config.pacing_preference) >= static_cast<unsigned>(PacingPreference::Count)) {
+        LOG_WARN("Config: invalid pacing_preference, resetting to 'balanced'");
+        g_config.pacing_preference = PacingPreference::Balanced;
+    }
     if (!std::isfinite(g_config.stall_inject_period_s)) {
         LOG_WARN("Config: non-finite stall_inject_period_s, resetting to %.0f",
                  kPacingStallInjectDefaultPeriodS);
@@ -373,6 +377,11 @@ static void LoadPacingPipelineKeys(const char* S, const char* P) {
         S, "adaptive_cap", ReadINIBool(S, "adaptive_smoothing", false, P), P);
     g_config.adaptive_cap_percentile = ReadINIInt(
         S, "adaptive_cap_percentile", kAdaptiveCapPercentileDefault, P);
+    const std::string preference = ReadINIString(S, "pacing_preference", PacingPreference_Text(PacingPreference::Balanced), P);
+    if (!PacingPreference_FromText(preference.c_str(), &g_config.pacing_preference)) {
+        LOG_WARN("Config: invalid pacing_preference '%s', resetting to 'balanced'", preference.c_str());
+        g_config.pacing_preference = PacingPreference::Balanced;
+    }
 }
 
 bool Config_IsFirstLaunch() { return s_first_launch; }
@@ -694,6 +703,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIString(S, "smoothing", PacingSmoothing_Text(config.smoothing), P);
     WriteINIBool(S, "adaptive_cap", config.adaptive_cap, P);
     WriteINIInt(S, "adaptive_cap_percentile", config.adaptive_cap_percentile, P);
+    WriteINIString(S, "pacing_preference", PacingPreference_Text(config.pacing_preference), P);
     WriteINIBool(S, "advanced_settings", config.advanced_settings, P);
     WriteINIBool(S, "developer_settings", config.developer_settings, P);
     WriteINIInt(S, "config_version", kConfigVersion, P);
@@ -999,7 +1009,13 @@ void Config_ApplyPacingPipeline() {
     // The key the clamp will publish is noted for the Sleep-mode reconcile BEFORE the
     // pipeline exposes it, so a hook that can see the new key already sees the reconcile
     // pending (an unchanged key is one load and a branch).
-    const PacingPipelineConfig pipeline = PacingPipelineConfigFrom(g_config);
+    PacingPipelineConfig pipeline = PacingPipelineConfigFrom(g_config);
+    // The pacing preference meets the developer keys here, once: the pipeline carries only the effective rank and hold share
+    // (g_config and the INI keep the raw values; the clamp and the 32-bit forcing run on the effective pair).
+    const PacingPreferenceResolution effective = PacingPipeline_ResolvePreference(
+        g_config.pacing_preference, g_config.unified_queue_rank, g_config.unified_hold_share);
+    pipeline.unified_queue_rank = effective.queue_rank;
+    pipeline.unified_hold_share = effective.hold_share;
     NvAPI_PrepareUnifiedKey(PacingPipeline_ClampConfig(pipeline).unified_pacer);
     PacingPipeline_SetConfig(pipeline);
     g_marker_forward_after_wait.store(
@@ -1081,6 +1097,8 @@ constexpr Key kKeys[] = {
         PacingPlacementOverride_FromText>, Publish::Pipeline},
     {"adaptive_cap", &SetBool<&Config::adaptive_cap>, Publish::Pipeline},
     {"adaptive_cap_percentile", &SetInt<&Config::adaptive_cap_percentile>, Publish::Pipeline},
+    {"pacing_preference", &SetEnum<PacingPreference, &Config::pacing_preference, PacingPreference_FromText>,
+        Publish::Pipeline},
     {"adaptive_cap_hold_room", &SetBool<&Config::adaptive_cap_hold_room>, Publish::Pipeline},
     {"gpu_present_gate_probes", &SetBool<&Config::gpu_present_gate_probes>, Publish::Pipeline},
     {"gpu_wait_headroom_us", &SetDouble<&Config::gpu_wait_headroom_us>, Publish::Pipeline},
@@ -1254,12 +1272,14 @@ void ApplyConfig() {
     if (g_config.marker_forward_order != PacingMarkerForwardOrder::BeforeWait)
         LOG_WARN("Diagnostic NvAPI marker forward order: %s (driver sees the paced release)",
             PacingMarkerForwardOrder_Text(g_config.marker_forward_order));
-    LOG_INFO("Pacing pipeline: smoothing=%s adaptive_cap=%u adaptive_cap_percentile=%d output_rung=%s source_placement=%s probes=%u gpu_wait_headroom_us=%.0f",
+    const PacingPipelineConfig applied = PacingPipeline_GetConfig();
+    LOG_INFO("Pacing pipeline: smoothing=%s adaptive_cap=%u adaptive_cap_percentile=%d output_rung=%s source_placement=%s probes=%u gpu_wait_headroom_us=%.0f pacing_preference=%s queue_rank=%d hold_share=%.5f",
         PacingSmoothing_Text(g_config.smoothing), g_config.adaptive_cap ? 1u : 0u,
         g_config.adaptive_cap_percentile,
         PacingRungOverride_Text(g_config.output_rung),
         PacingPlacementOverride_Text(g_config.source_placement),
-        g_config.gpu_present_gate_probes ? 1u : 0u, g_config.gpu_wait_headroom_us);
+        g_config.gpu_present_gate_probes ? 1u : 0u, g_config.gpu_wait_headroom_us,
+        PacingPreference_Text(g_config.pacing_preference), applied.unified_queue_rank, applied.unified_hold_share);
     if (g_config.stall_inject_ms > 0.0)
         LOG_WARN("Pacing pipeline: diagnostic stall injector %.1f ms every %.1f s",
             g_config.stall_inject_ms, g_config.stall_inject_period_s);

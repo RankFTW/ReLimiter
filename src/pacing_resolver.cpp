@@ -838,6 +838,21 @@ bool PacingPlacementOverride_FromText(const char* text, PacingPlacementOverride*
     return EnumFromText(text, placement, PacingPlacementOverride_Text);
 }
 
+const char* PacingPreference_Text(PacingPreference preference) noexcept
+{
+    switch (preference) {
+        case PacingPreference::Latency: return "latency";
+        case PacingPreference::Balanced: return "balanced";
+        case PacingPreference::Smooth: return "smooth";
+        default: return "unknown";
+    }
+}
+
+bool PacingPreference_FromText(const char* text, PacingPreference* preference) noexcept
+{
+    return EnumFromText(text, preference, PacingPreference_Text);
+}
+
 const char* PacingSourcePlacement_Text(PacingSourcePlacement placement) noexcept
 {
     switch (placement) {

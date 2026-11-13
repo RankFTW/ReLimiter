@@ -58,6 +58,16 @@ enum class PacingPlacementOverride : uint8_t {
     Count
 };
 
+// User key `pacing_preference`: one setting with three positions that trade latency for even frames in the
+// queue-based pacer (64-bit DirectX 12). INI text: latency | balanced | smooth (default balanced, today's
+// behaviour). PacingPipeline_ResolvePreference turns the position into the queue law's rank and hold share.
+enum class PacingPreference : uint8_t {
+    Latency = 0,  // the queue law regulates a smaller margin (rank kPacingPreferenceLatencyRank): less work waits for the GPU
+    Balanced = 1, // the defaults: rank kPacingUnifiedQueueRankDefault, hold share kPacingUnifiedHoldShareDefault
+    Smooth = 2,   // holds without a cap: hold share kPacingPreferenceSmoothHoldShare (acts only with frame generation)
+    Count
+};
+
 // Stall injector ranges.
 constexpr double kPacingStallInjectMaxMs = 200.0;
 constexpr double kPacingStallInjectMinPeriodS = 1.0;
@@ -151,6 +161,29 @@ constexpr int PacingPipeline_AdaptiveCapFitTier(int percentile) noexcept
         if (distance < best_distance) best = tier;
     }
     return best;
+}
+
+// The pacing preference's levers (see PacingPipeline_ResolvePreference).
+constexpr int kPacingPreferenceLatencyRank = 4;
+constexpr double kPacingPreferenceSmoothHoldShare = 1.0 / 32.0;
+
+struct PacingPreferenceResolution {
+    int queue_rank;
+    double hold_share;
+};
+
+// The queue law's rank and hold share the pipeline carries. A developer key that differs from its own default
+// decides its own value whatever the preference; a developer key at its default inherits the preference. The two
+// levers are independent: Latency changes only the rank, Smooth only the share, Balanced neither.
+constexpr PacingPreferenceResolution PacingPipeline_ResolvePreference(PacingPreference preference,
+    int developer_rank, double developer_hold_share) noexcept
+{
+    PacingPreferenceResolution resolved{ developer_rank, developer_hold_share };
+    if (preference == PacingPreference::Latency && developer_rank == kPacingUnifiedQueueRankDefault)
+        resolved.queue_rank = kPacingPreferenceLatencyRank;
+    if (preference == PacingPreference::Smooth && developer_hold_share == kPacingUnifiedHoldShareDefault)
+        resolved.hold_share = kPacingPreferenceSmoothHoldShare;
+    return resolved;
 }
 
 struct PacingPipelineConfig {
@@ -399,6 +432,8 @@ const char* PacingLeadCoverage_Text(PacingLeadCoverage coverage) noexcept;
 bool PacingLeadCoverage_FromText(const char* text, PacingLeadCoverage* coverage) noexcept;
 const char* PacingPlacementOverride_Text(PacingPlacementOverride placement) noexcept;
 bool PacingPlacementOverride_FromText(const char* text, PacingPlacementOverride* placement) noexcept;
+const char* PacingPreference_Text(PacingPreference preference) noexcept;
+bool PacingPreference_FromText(const char* text, PacingPreference* preference) noexcept;
 
 // Log and OSD labels.
 const char* PacingRung_Text(PacingRung rung) noexcept;

@@ -696,12 +696,12 @@ namespace
             return grant;
         }
 
-        void Evidence(const Planned& frame, double active_us, double hold_us = 0.0)
+        void Evidence(const Planned& frame, double active_us, double hold_us = 0.0, double ai_frame_us = 0.0)
         {
             ready += Ticks(10000.0);
             pacer.OnReady(frame.grid, frame.key, ready);
             pacer.OnOutput(frame.grid, frame.key, ready + Ticks(hold_us), hold_us > 0.0);
-            pacer.OnReport(frame.key, 3000.0, active_us);
+            pacer.OnReport(frame.key, 3000.0, active_us, ai_frame_us);
         }
 
         void Records(const PacingGpuQueueRecord& record, int count)
@@ -803,6 +803,165 @@ namespace
         bank.Plan(&frame);
         bank.Records(Record(1000.0, 0.0, 500.0), 60); // N^ = 1000: refill 9000 each
         CHECK(Near(bank.Plan(&frame).credit_us, kBank));
+    }
+
+    // The share part of the law's refill, min(sigma * S^, max(0, S^ - J)), funds holds that frame generation overlaps: the pacer
+    // bounds it by the median frame generation time A of the used reports (the bound of the report-based rule). A = 0 (no frame
+    // generation: reports carry none) refills nothing; A at least the share term leaves the law's own refill; the slack part
+    // max(0, J - S^) is never bounded.
+    void TestLawShareRefillIsBoundedByFrameGenerationTime()
+    {
+        constexpr double kSigma = 1.0 / 32.0;
+        // 14 ms frames against a 10 ms interval: S^ = 14 ms, no slack, share term min(sigma * 14 ms, 4 ms) = 437.5 us.
+        const auto credit_gained_by_records = [](double generation_us, int records) {
+            Rig rig(true, kSigma);
+            Rig::Planned frame;
+            for (int i = 0; i < 20; ++i) { // enough used reports for the window's medians (kUnifiedMinPairs)
+                rig.Plan(&frame);
+                rig.Evidence(frame, kJ, 0.0, generation_us); // active = J: the report rule's own refill is its allowance only
+            }
+            const double before = rig.Plan(&frame).credit_us;
+            rig.Records(Record(14000.0, 0.0, 500.0), records);
+            CHECK(rig.pacer.QueueLawInUse());
+            return rig.Plan(&frame).credit_us - before;
+        };
+        // The law is in use from the 12th record: 16 records refill five times.
+        CHECK(Near(credit_gained_by_records(0.0, 16), 0.0));                 // no frame generation: the share refills nothing
+        CHECK(Near(credit_gained_by_records(300.0, 16), 5 * 300.0));         // A below the share term bounds it
+        CHECK(Near(credit_gained_by_records(437.5, 16), 5 * 437.5));         // A equal to it: the law's own refill
+        CHECK(Near(credit_gained_by_records(1700.0, 16), 5 * 437.5, 1e-9));  // A above it (the measured sizes): unchanged
+        // The slack part is untouched by A: 8 ms frames leave 2 ms of slack each time whatever the report says.
+        for (const double generation_us : {0.0, 300.0, 2000.0}) {
+            Rig rig(true, kSigma);
+            Rig::Planned frame;
+            for (int i = 0; i < 20; ++i) {
+                rig.Plan(&frame);
+                rig.Evidence(frame, kJ, 0.0, generation_us);
+            }
+            const double before = rig.Plan(&frame).credit_us;
+            rig.Records(Record(8000.0, 0.0, 500.0), 16);
+            CHECK(Near(rig.Plan(&frame).credit_us - before, 5 * 2000.0));
+        }
+        // With the share 0 nothing changes either (the default: the bound is not evaluated).
+        {
+            Rig rig(true, 0.0);
+            Rig::Planned frame;
+            rig.Plan(&frame);
+            rig.Records(Record(14000.0, 0.0, 500.0), 16);
+            CHECK(Near(rig.Plan(&frame).credit_us, 0.0));
+        }
+    }
+
+    // The frame generation time A that bounds the share refill counts only while the report stream is live at the planned
+    // index (the rule of Status and the credit's bank: QueueWaitLive). Queue records keep arriving while the reports stop:
+    // once the reports are expired A is 0 and the share stops refilling (the status reports the evidence expired); when
+    // reports return it refills again.
+    void TestShareRefillStopsWhenTheReportsExpire()
+    {
+        constexpr double kSigma = 1.0 / 32.0;
+        constexpr double kShareTerm = 437.5; // 14 ms frames against J = 10 ms: min(sigma * 14 ms, 4 ms)
+        const PacingGpuQueueRecord record = Record(14000.0, 0.0, 500.0);
+        Rig rig(true, kSigma);
+        Rig::Planned frame;
+        for (int i = 0; i < 20; ++i) {
+            rig.Plan(&frame);
+            rig.Evidence(frame, kJ, 0.0, 1700.0); // A = 1.7 ms, above the share term
+        }
+        rig.Plan(&frame);
+        rig.Records(record, 16);
+        CHECK(rig.pacer.QueueLawInUse());
+        double credit = rig.Plan(&frame).credit_us;
+        rig.Records(record, 1);
+        CHECK(Near(rig.Plan(&frame).credit_us - credit, kShareTerm)); // live reports: the law's own refill
+
+        // The reports stop; the records go on, one per planned frame. While the newest used report is no older than
+        // kUnifiedExpireAge frames the share still refills; beyond it nothing does.
+        for (uint32_t i = 0; i < kUnifiedExpireAge + 2; ++i) {
+            rig.Plan(&frame);
+            rig.Records(record, 1);
+        }
+        rig.Plan(&frame);
+        CHECK((rig.last_status.flags & kUpExpired) != 0 && rig.pacer.QueueLawInUse());
+        credit = rig.Plan(&frame).credit_us;
+        for (int i = 0; i < 5; ++i) {
+            rig.Records(record, 1);
+            CHECK(Near(rig.Plan(&frame).credit_us, credit)); // no share refill, no slack: the credit stays
+        }
+
+        // Reports return: the share refills again.
+        for (int i = 0; i < 3; ++i) {
+            rig.Plan(&frame);
+            rig.Evidence(frame, kJ, 0.0, 1700.0);
+            rig.Records(record, 1);
+        }
+        credit = rig.Plan(&frame).credit_us;
+        CHECK((rig.last_status.flags & kUpExpired) == 0);
+        rig.Records(record, 1);
+        CHECK(Near(rig.Plan(&frame).credit_us - credit, kShareTerm));
+    }
+
+    // A live decrease of the hold share drops the banked surplus: credit = min(credit, 0). A debt, the outstanding grants and
+    // their later debits stay; an increase and a rank change reset nothing.
+    void TestShareDecreaseDropsTheBankedSurplus()
+    {
+        const auto with_share = [](UnifiedPacer* pacer, double share, int rank = 2) {
+            UnifiedOptions options = pacer->Options();
+            options.hold_share = share;
+            options.queue_rank = rank;
+            pacer->SetOptions(options);
+        };
+        // A positive credit: 16 records of 8 ms leave 2 ms of slack each, five refills after the law is in use.
+        const auto banked = [](Rig* rig, Rig::Planned* frame) {
+            rig->Plan(frame);
+            rig->Records(Record(8000.0, 0.0, 500.0), 16);
+            CHECK(rig->pacer.QueueLawInUse());
+        };
+        Rig::Planned frame;
+        {
+            Rig rig(true, 1.0 / 32.0);
+            banked(&rig, &frame);
+            CHECK(Near(rig.Plan(&frame).credit_us, 5 * 2000.0));
+            with_share(&rig.pacer, 1.0 / 32.0, 4); // a rank change alone: nothing resets
+            CHECK(Near(rig.Plan(&frame).credit_us, 5 * 2000.0));
+            with_share(&rig.pacer, 0.0625, 4);     // an increase: nothing resets
+            CHECK(Near(rig.Plan(&frame).credit_us, 5 * 2000.0));
+            with_share(&rig.pacer, 0.0625, 4);     // the same share again: nothing resets
+            CHECK(Near(rig.Plan(&frame).credit_us, 5 * 2000.0));
+            with_share(&rig.pacer, 1.0 / 32.0, 4); // a decrease: the surplus is gone
+            CHECK(Near(rig.Plan(&frame).credit_us, 0.0));
+            rig.Records(Record(8000.0, 0.0, 500.0), 1); // the credit refills from 0 afterwards
+            CHECK(Near(rig.Plan(&frame).credit_us, 2000.0));
+        }
+        {
+            Rig rig(true, 1.0 / 32.0); // to 0: the share is off
+            banked(&rig, &frame);
+            with_share(&rig.pacer, 0.0);
+            CHECK(Near(rig.Plan(&frame).credit_us, 0.0));
+        }
+        {
+            // A debt stays: the decrease only caps a positive credit at 0.
+            Rig rig(true, 1.0 / 32.0);
+            banked(&rig, &frame);
+            const UnifiedHoldGrant grant = rig.Plan(&frame);
+            CHECK(grant.law_sequence != 0);
+            rig.pacer.OnQueueRecord(Named(Record(8000.0, 0.0, 500.0, 50000.0), grant.law_sequence));
+            CHECK(Near(rig.Plan(&frame).credit_us, -kJ));
+            with_share(&rig.pacer, 0.0);
+            CHECK(Near(rig.Plan(&frame).credit_us, -kJ));
+        }
+        {
+            // An outstanding grant is still debited by its record after the decrease, from the credit that remains.
+            Rig rig(true, 1.0 / 32.0);
+            banked(&rig, &frame);
+            const UnifiedHoldGrant grant = rig.Plan(&frame);
+            CHECK(grant.law_sequence != 0 && Near(grant.credit_us, 5 * 2000.0));
+            with_share(&rig.pacer, 0.0);
+            rig.pacer.OnQueueRecord(Named(Record(8000.0, 0.0, 500.0, 1500.0), grant.law_sequence));
+            // From 0 after the decrease: the record refills about 2 ms (J - N^) and its 1.5 ms hold is debited, so the credit is
+            // small and positive, never the 10 ms banked before.
+            const double credit = rig.Plan(&frame).credit_us;
+            CHECK(credit > 0.0 && credit < 1000.0);
+        }
     }
 
     void TestLawLivesWithoutReports()
@@ -1979,6 +2138,9 @@ int main()
     TestCreditContinuousAcrossRuleSwitches();
     TestLawHoldSpendsComeFromRecords();
     TestRecordDebitAndBounds();
+    TestLawShareRefillIsBoundedByFrameGenerationTime();
+    TestShareRefillStopsWhenTheReportsExpire();
+    TestShareDecreaseDropsTheBankedSurplus();
     TestLawLivesWithoutReports();
     TestKeyOffAndNotInUseAreIdentical();
     TestStatusFlagsAndStatistics();

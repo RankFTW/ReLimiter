@@ -217,6 +217,8 @@ UnifiedQueueResult UnifiedQueueWindow::Compute(double j_us, const UnifiedQueuePa
     // The credit's slack and allowance both use the service S^ (the frames' work without the
     // queue's own empty time): a 3.6 ms starve inside a frame is 3.6 ms of slack, not need. N^
     // (empty time counted as need) is kept for analysis only.
-    result.refill_us = std::max(0.0, j - service_us) + std::min(sigma * service_us, std::max(0.0, service_us - j));
+    result.refill_slack_us = std::max(0.0, j - service_us);
+    result.refill_share_us = std::min(sigma * service_us, std::max(0.0, service_us - j));
+    result.refill_us = result.refill_slack_us + result.refill_share_us;
     return result;
 }

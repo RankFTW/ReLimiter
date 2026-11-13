@@ -439,6 +439,34 @@ static void DrawAdaptiveCapControl(bool* config_dirty) {
     HelpTip("Show the Adaptive cap on the OSD.");
 }
 
+#ifdef _WIN64
+// Pacing preference: one combo for the queue-based pacer's trade between latency and even frames (64-bit).
+static void DrawPacingPreferenceControl(bool* config_dirty) {
+    static const char* const kPreferenceLabels[] = {"Lower latency", "Balanced", "Smoother"};
+    static_assert(IM_ARRAYSIZE(kPreferenceLabels) == static_cast<int>(PacingPreference::Count),
+        "one label per pacing preference");
+    int selected = static_cast<int>(g_config.pacing_preference);
+    if (ImGui::Combo("Pacing preference", &selected, kPreferenceLabels, IM_ARRAYSIZE(kPreferenceLabels))) {
+        g_config.pacing_preference = static_cast<PacingPreference>(selected);
+        Config_ApplyPacingPipeline();
+        LOG_INFO("OSD: pacing preference -> %s", PacingPreference_Text(g_config.pacing_preference));
+        *config_dirty = true;
+    }
+    HelpTip("Smoother: with DLSS frame generation 2x and no cap the GPU can hold, gives up about 3% frame rate for "
+        "more even frames; no effect with a cap the GPU can hold or without frame generation. Lower latency: "
+        "keeps less work waiting for the GPU; in testing up to about 2 ms lower latency, in some games a "
+        "slightly lower frame rate and less even frames. Balanced is the default. Applies to 64-bit "
+        "DirectX 12 games.");
+    // A developer key that differs from its default decides its own value: the selected position is then not what runs.
+    const PacingPreferenceResolution position = PacingPipeline_ResolvePreference(g_config.pacing_preference,
+        kPacingUnifiedQueueRankDefault, kPacingUnifiedHoldShareDefault);
+    const PacingPreferenceResolution effective = PacingPipeline_ResolvePreference(g_config.pacing_preference,
+        g_config.unified_queue_rank, g_config.unified_hold_share);
+    if (position.queue_rank != effective.queue_rank || position.hold_share != effective.hold_share)
+        ImGui::TextDisabled("A developer setting overrides the selected position.");
+}
+#endif
+
 // Advanced: how much of the recent load the Adaptive cap plans for, one of
 // three tiers.
 static void DrawAdaptiveCapTuning(bool* config_dirty) {
@@ -944,6 +972,10 @@ static void DrawSettingsImpl() {
     ImGui::Separator();
     DrawPacingSummary(&config_dirty);
     if (dmfg_dynamic_active) ImGui::TextDisabled("Dynamic frame generation: pacing passthrough");
+#ifdef _WIN64
+    if (!dmfg_dynamic_active)
+        DrawPacingPreferenceControl(&config_dirty);
+#endif
     // The period governor runs on every route: missed frames everywhere,
     // Reflex workload reports where NvAPI provides them.
     if (!dmfg_dynamic_active)

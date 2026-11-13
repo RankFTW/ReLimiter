@@ -227,7 +227,7 @@ UnifiedQueuePosition UnifiedPacer::PlannedPosition() const noexcept
     UnifiedQueuePosition position{};
     if (!last_plan_valid_)
         return position;
-    const uint64_t index = queue_planned_index_ > last_plan_grid_ ? queue_planned_index_ : last_plan_grid_;
+    const uint64_t index = PlannedIndex();
     position.valid = true;
     position.domain = last_plan_key_.identity_domain;
     position.producer_epoch = last_plan_key_.producer_epoch;
@@ -754,8 +754,17 @@ void UnifiedPacer::OnQueueRecord(const PacingGpuQueueRecord& record) noexcept
         return;
     if (sample.valid && in_use) {
         const UnifiedQueueResult law = queue_window_.Compute(credit_j_us_, QueueLawParams(options_), PlannedPosition());
+        // The share part of the refill funds holds that frame generation overlaps: it is bounded by the median frame
+        // generation time A of the used reports, the bound of the report-based rule's allowance (NoRoomAllowance). A counts
+        // only while the report stream is live at the planned index (QueueWaitLive, the rule of Status and the credit's
+        // bank): with the reports expired it is 0, as in the status. A = 0 (no frame generation, too few reports, expired
+        // reports) refills nothing. The slack part is the cap's headroom and is not bounded. With A at least the share
+        // term and the reports live the refill is the law's own.
+        double share_us = law.refill_share_us;
+        if (share_us > 0.0)
+            share_us = QueueWaitLive(PlannedIndex()) ? std::min(share_us, MeasureWindow().generation_us) : 0.0;
         const double bank_us = static_cast<double>(kUnifiedExpireAge) * credit_j_us_;
-        credit_us_ = std::max(-credit_j_us_, std::min(bank_us, credit_us_ + law.refill_us));
+        credit_us_ = std::max(-credit_j_us_, std::min(bank_us, credit_us_ + (law.refill_slack_us + share_us)));
     }
     if (debit_us > 0.0)
         credit_us_ = std::max(-credit_j_us_, credit_us_ - debit_us);
@@ -861,6 +870,11 @@ void UnifiedPacer::SetOptions(const UnifiedOptions& options) noexcept
         queue_paced_frame_ = false;
         queue_role_ = 0;
     }
+    // A decrease of the hold share (a live switch away from the share) drops the banked surplus: the holds it funded
+    // must not keep acting. A debt, the outstanding grants and their later debits stay; an increase or a rank change
+    // resets nothing.
+    if (next.hold_share < options_.hold_share)
+        credit_us_ = std::min(credit_us_, 0.0);
     options_ = next;
     status_valid_ = false;
     ++version_;

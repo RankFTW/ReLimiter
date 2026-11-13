@@ -140,6 +140,10 @@ struct Config {
     // the share of recent frames the lengthened interval must fit. Separate
     // from Smoothing.
     int adaptive_cap_percentile = kAdaptiveCapPercentileDefault;
+    // Pacing preference (user key pacing_preference: latency | balanced | smooth, default balanced): the queue-based pacer's trade
+    // between latency and even frames. Raw here and in the INI; Config_ApplyPacingPipeline resolves it with the developer keys
+    // unified_queue_rank and unified_hold_share into the rank and share the pipeline carries (PacingPipeline_ResolvePreference).
+    PacingPreference pacing_preference = PacingPreference::Balanced;
 
     // OSD: Adaptive cap HUD line (historical key name)
     bool osd_show_adaptive_smoothing = false;
@@ -312,7 +316,8 @@ void ApplyConfig();
 // marker_forward_order, reflex_sleep_bypass, bypass_low_latency_off, driver_low_latency_off,
 // sleep_status_every_frame, gpu_start_probe, gpu_queue_probe, unified_pacer, unified_every_frame_service,
 // unified_queue_target_us, unified_hold_share, unified_queue_law, unified_queue_rank,
-// unified_queue_allow_us) to the resolver (which carries
+// unified_queue_allow_us) to the resolver, with pacing_preference resolved against unified_queue_rank and
+// unified_hold_share into the pipeline's effective rank and share (which carries
 // adaptive_cap to the period governor) and the NvAPI hooks. Part of
 // ApplyConfig; the OSD calls it after editing those fields.
 void Config_ApplyPacingPipeline();

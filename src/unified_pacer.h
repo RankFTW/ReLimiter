@@ -397,13 +397,15 @@ struct UnifiedOptions {
     // cap gives room (J − median active < a, a = min(share × C, A), C the median
     // completion spacing and A the median frame-generation time of the window, a = 0
     // without frame generation): then every used report refills a and the credit's
-    // upper bound is W × a. See UnifiedPacer::TryUseReport.
+    // upper bound is W × a. See UnifiedPacer::TryUseReport. A decrease of the share (SetOptions)
+    // drops a positive credit to 0: the surplus the old share banked does not keep acting.
     double hold_share = 0.0;
     // The queue law (keys unified_queue_law, unified_queue_rank, unified_queue_allow_us; default
     // off). On, and in use (unified_queue_law.h): I_gpu and the hold credit's rule come from the
-    // presenting queue probe's records fed to OnQueueRecord, hold_share is the law's sigma, and
-    // the report-based refill and debit are skipped. Off: the window stays empty and nothing of
-    // this runs. SetOptions clamps rank to [1, 8] and allow to [0, 20000] µs.
+    // presenting queue probe's records fed to OnQueueRecord, hold_share is the law's sigma (the
+    // share part of its refill is bounded by A, 0 without frame generation), and the report-based
+    // refill and debit are skipped. Off: the window stays empty and nothing of this runs.
+    // SetOptions clamps rank to [1, 8] and allow to [0, 20000] µs.
     bool queue_law = false;
     int queue_rank = 2;
     double queue_allow_us = 4000.0;
@@ -671,6 +673,9 @@ private:
     // The position of the frame the law last counted as planned (queue_planned_index_), from the
     // newest planned key and its grid index; invalid before the first plan.
     UnifiedQueuePosition PlannedPosition() const noexcept;
+    // The grid index of the frame being planned: the newer of the index the law last counted (queue_planned_index_) and
+    // the newest plan's grid index.
+    uint64_t PlannedIndex() const noexcept { return queue_planned_index_ > last_plan_grid_ ? queue_planned_index_ : last_plan_grid_; }
     const Entry* Predecessor(const Entry& entry) const noexcept;
     void RefreshHold(Entry* entry) noexcept;
     void SettleOrphanedLawHolds() noexcept;

@@ -133,7 +133,7 @@ class ConfigSavePolicyTests(unittest.TestCase):
         config = HEADER.split("struct Config {", 1)[1].split("};", 1)[0]
         fields = set(re.findall(
             r"\b(?:bool|int|double|float|std::string|PacingSmoothing|PacingRungOverride|"
-            r"PacingMarkerForwardOrder|PacingRenderQueue|PacingLeadCoverage|PacingPlacementOverride)\s+(\w+)\s*=",
+            r"PacingMarkerForwardOrder|PacingRenderQueue|PacingLeadCoverage|PacingPlacementOverride|PacingPreference)\s+(\w+)\s*=",
             config))
         self.assertTrue({"smoothing", "adaptive_cap", "output_rung", "stall_inject_ms",
                          "stall_inject_period_s", "gpu_present_gate_probes",
@@ -283,6 +283,15 @@ class ConfigSavePolicyTests(unittest.TestCase):
         self.assertIn("PacingMarkerForwardOrder_FromText(forward_order.c_str(), "
                       "&g_config.marker_forward_order)", loader)
         self.assertIn("PacingMarkerForwardOrder::Count", validate)
+        # The pacing preference is validated text, saved canonically, and resolved once into the pipeline;
+        # g_config and the INI keep the raw developer rank and share.
+        self.assertIn("PacingPreference_FromText(", loader)
+        self.assertIn('"pacing_preference", PacingPreference_Text(config.pacing_preference)', writer)
+        self.assertIn("PacingPreference::Count", validate)
+        apply = body("Config_ApplyPacingPipeline")
+        self.assertEqual(apply.count("PacingPipeline_ResolvePreference("), 1)
+        self.assertRegex(apply, r"pipeline\.unified_queue_rank\s*=\s*\w+\.queue_rank;")
+        self.assertRegex(apply, r"pipeline\.unified_hold_share\s*=\s*\w+\.hold_share;")
         self.assertRegex(writer, r'"marker_forward_order",\s*'
                                  r'PacingMarkerForwardOrder_Text\(config\.marker_forward_order\)')
         self.assertRegex(body("Config_ApplyPacingPipeline"),

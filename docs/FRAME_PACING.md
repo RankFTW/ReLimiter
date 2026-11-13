@@ -519,6 +519,10 @@ stateDiagram-v2
 
 Source: `src/rung_feasibility.h`, `src/rung_feasibility.cpp` (`HoldFeasibility`), `src/lead_controller.h`, `src/lead_controller.cpp` (`CollisionGuardedLeadUs`, `CollisionOffsetUs`, `HoldRoomUs`, `HandoffOffsetUs`, `RecordHandoff`), `src/scheduler.cpp` (`HandoffLimitApplies`, `HandoffEarliestRelease`, `RenderHandoffStalled`, `RecordGovernorMiss`), `src/render_handoff.h`, `src/nvapi_hooks.cpp` (`Hook_Sleep`), `src/period_governor.h`, `src/period_governor.cpp` (`Track`), `src/gpu_present_gate.cpp` (`GpuPresent_HorizonTicks`), `src/presentation_gate.cpp` (`PresentGate_Execute`).
 
+### Pacing preference
+
+In 64-bit DirectX 12 games the queue-based pacer sets the frame interval from what the game's GPU queue does each frame. The **Pacing preference** setting moves two of its parameters. **Smoother** gives the credit that pays for holds a small share (1/32) of the frame's service time, never more than the frame generation time of recent frames; it therefore does nothing without frame generation or where the cap leaves slack. **Lower latency** plans from the fourth smallest queue margin of the newest 16 frames instead of the second smallest, so less work waits for the GPU. **Balanced** leaves both at their defaults. Both are fixed values: nothing is learned.
+
 ---
 
 ## Frame Generation and Dynamic MFG
