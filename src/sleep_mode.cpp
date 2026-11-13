@@ -1,5 +1,6 @@
 #include "sleep_mode.h"
 #include "nvapi_hooks.h"
+#include "pacing_resolver.h"
 #include "logger.h"
 
 #include <Windows.h>
@@ -36,7 +37,7 @@ uint32_t ReflexDriverLimiter_AppliedUs() noexcept
 bool ReflexDriverLimiter_Unavailable() noexcept
 {
     // The limiter lives in the driver's Sleep, which the bypass skips.
-    if (g_reflex_sleep_bypass.load(std::memory_order_relaxed)) return true;
+    if (PacingPipeline_SleepBypass()) return true;
     return s_applied_us == 0 && s_failed_tick_ms != 0 &&
         GetTickCount64() - s_failed_tick_ms < kRetryAfterFailureMs;
 }

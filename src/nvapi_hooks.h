@@ -11,18 +11,6 @@ extern PFN_NvAPI_D3D_SetLatencyMarker  s_orig_set_latency_marker;
 // AddRef-owned device publication captured from NvAPI calls. Consumers still
 // dereference only through NvAPI_AcquireFeedbackDevice for generation safety.
 extern std::atomic<IUnknown*> g_dev;
-inline std::atomic<bool> g_reflex_sleep_bypass{false};
-// Developer A/B bypass_low_latency_off: while the Sleep is bypassed, Hook_Sleep
-// has the driver's low latency mode turned off (SetSleepMode forwarded with
-// bLowLatencyMode and bLowLatencyBoost 0) so ReLimiter is the only pacer.
-inline std::atomic<bool> g_bypass_low_latency_off{false};
-// Developer A/B driver_low_latency_off: while the game's Reflex Sleep is
-// forwarded to the driver, SetSleepMode reaches the driver with bLowLatencyMode
-// and bLowLatencyBoost 0 (the game and Streamline keep their own setting).
-inline std::atomic<bool> g_driver_low_latency_off{false};
-// Developer key sleep_status_every_frame: the poll of the driver's sleep status
-// in Hook_Sleep (developer_settings) runs at every Sleep, not once per second.
-inline std::atomic<bool> g_sleep_status_every_frame{false};
 // The driver's sleep status as the pacing CSV's driver_sleep_interval_us and
 // driver_use_game_sleep columns: bit 63 set = a result, bits 40..62 = the
 // feedback-device publication the result belongs to (SleepStatusToken), bit 32 =
@@ -48,9 +36,6 @@ constexpr uint32_t SleepStatusToken(uint64_t word) noexcept {
 inline std::atomic<uint32_t> g_sleep_status_token{0};
 inline std::atomic<uint64_t> g_sleep_status_newest{0};
 inline std::atomic<uint64_t> g_sleep_status_at_sleep_return{0};
-// marker_forward_order == after_wait: direct SIMULATION_START/RENDERSUBMIT_START
-// reach the driver after the source wait instead of on hook entry.
-inline std::atomic<bool> g_marker_forward_after_wait{false};
 
 // OSD readouts, EMA-smoothed (µs). CPU latency: SIM_START → RENDERSUBMIT_END
 // of the same frame, written by the marker hooks. Pacer latency: time spent in
@@ -159,7 +144,7 @@ DriverLimiterApply NvAPI_ApplyDriverLimiter(uint32_t minimum_interval_us) noexce
 // Restores the game's parameters (RestoreGameSleepMode). Scheduler owner.
 void NvAPI_ReleaseDriverLimiter() noexcept;
 
-// Unified pacer (developer key unified_pacer).
+// Unified pacer (the derived owner: 64-bit, no test mode).
 // True while the Sleep hook runs the unified path and its self-check found the driver
 // pacing on its own (a Sleep over 200 us in at least 16 of the last 64; cleared below 3
 // of 64). Diagnosis only: nothing else reads it.

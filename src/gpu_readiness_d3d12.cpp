@@ -10,6 +10,7 @@
 #include "pacing_telemetry.h"
 #include "frame_plan.h"
 #include "instrumentation_state.h"
+#include "pacing_resolver.h"
 #include "gpu_queue_probe.h"
 #include <array>
 #include <atomic>
@@ -271,7 +272,7 @@ void FinishScope(bool valid) noexcept {
 // (Worker). Nothing here blocks or allocates on the game's thread; a failed Signal
 // ends the probe for the session.
 bool ProbeActive() noexcept {
-    return g_gpu_start_probe.load(std::memory_order_relaxed) && !s_probe_dead.load(std::memory_order_relaxed) &&
+    return kPacingGpuStartProbe && !s_probe_dead.load(std::memory_order_relaxed) &&
         !s_stopping.load(std::memory_order_acquire);
 }
 // Both pointers hold one pin each; whoever removes a pointer releases its pin. With the
@@ -309,7 +310,7 @@ void ProbeDisable(const char* what, HRESULT result) noexcept {
 // scope's pin keeps the queue alive until the queue slot holds its own). A queue
 // that is already queued is replaced and loses its pin.
 void ArmStartProbe() noexcept {
-    if (!g_gpu_start_probe.load(std::memory_order_relaxed)) return; // the probe off: nothing else runs
+    if (!kPacingGpuStartProbe) return; // the probe off: nothing else runs
     QueueSlot* queue = s_scope.queue;
     if (!queue || s_scope.depth != 0 || !ProbeActive() || !queue->probe_ready.load(std::memory_order_acquire) ||
         queue->retired.load() || queue->faulted.load() || queue->uncertain_submission.load()) return;
@@ -765,7 +766,7 @@ GpuReadinessCall::GpuReadinessCall(const PresentTimelineSpan* span, bool before_
     // gpu_start_probe: with the developer flag off, as before (the pending-record word is
     // cleared per sample, nothing else); on, the record is taken below, once the sample
     // knows its frame.
-    const bool probe_flag = g_gpu_start_probe.load(std::memory_order_relaxed);
+    const bool probe_flag = kPacingGpuStartProbe;
     if (!probe_flag) queue->probe_state.exchange(0, std::memory_order_acq_rel);
     slot->probe_value = 0;
     slot->probe_first_submit_qpc = 0;

@@ -2,6 +2,8 @@
 
 ReLimiter is a frame limiter and pacing tool for NVIDIA G-Sync/VRR displays. It runs as a ReShade addon and is configured through the in-game ReShade overlay.
 
+64-bit DirectX 12 with NVIDIA Reflex is the supported and tested configuration; other APIs with Reflex run the same pacer untested; games without Reflex and all 32-bit games get a plain frame-rate cap.
+
 ---
 
 ## Table of Contents
@@ -13,20 +15,19 @@ ReLimiter is a frame limiter and pacing tool for NVIDIA G-Sync/VRR displays. It 
 5. [FG-Off FPS Cap](#fg-off-fps-cap)
 6. [VSync Override](#vsync-override)
 7. [Smoothing and Output](#smoothing-and-output)
-8. [Adaptive cap](#adaptive-cap)
-9. [On-Screen Display (OSD)](#on-screen-display-osd)
-10. [OSD Presets](#osd-presets)
-11. [Screen & Window Management](#screen--window-management)
-12. [Monitor Blackout](#monitor-blackout)
-13. [Frame Generation Support](#frame-generation-support)
-14. [Dynamic MFG (DLSS 4.5)](#dynamic-mfg-dlss-45)
-15. [Advanced Settings](#advanced-settings)
-16. [Reflex Injection](#reflex-injection)
-17. [Flip Model Override (DX11)](#flip-model-override-dx11)
-18. [Streamline Compatibility](#streamline-compatibility)
-19. [Telemetry & Logging](#telemetry--logging)
-20. [INI Configuration Reference](#ini-configuration-reference)
-21. [Troubleshooting](#troubleshooting)
+8. [On-Screen Display (OSD)](#on-screen-display-osd)
+9. [OSD Presets](#osd-presets)
+10. [Screen & Window Management](#screen--window-management)
+11. [Monitor Blackout](#monitor-blackout)
+12. [Frame Generation Support](#frame-generation-support)
+13. [Dynamic MFG (DLSS 4.5)](#dynamic-mfg-dlss-45)
+14. [Advanced Settings](#advanced-settings)
+15. [Reflex Injection](#reflex-injection)
+16. [Flip Model Override (DX11)](#flip-model-override-dx11)
+17. [Streamline Compatibility](#streamline-compatibility)
+18. [Telemetry & Logging](#telemetry--logging)
+19. [INI Configuration Reference](#ini-configuration-reference)
+20. [Troubleshooting](#troubleshooting)
 
 Developer-only settings, status lines and log lines are in the [Developer Reference](DEVELOPER_REFERENCE.md).
 
@@ -62,10 +63,9 @@ Open the ReShade overlay, normally with **Home**, and find ReLimiter's settings 
 
 1. Choose **VRR Cap**, or set a **Custom** FPS cap.
 2. Read the one-line status below the FPS controls. ReLimiter always paces for an even cadence and chooses how to hold each frame by itself; the line says what it is doing, for example `Smooth: frames are held on the GPU to an even cadence`. Open **Details** under it for the technical lines.
-3. Leave **Adaptive cap** off initially. Try it if heavy scenes or areas drop the frame rate below the cap.
-4. Open **OSD** and enable the readings you want to see.
+3. Open **OSD** and enable the readings you want to see.
 
-The FPS controls are at the top, followed by the pacing status (with its **Details**), **Pacing preference** (64-bit) and **Adaptive cap**. **OSD** and **Screen** follow. **Enable advanced settings** reveals compatibility options and the **Adaptive cap fit** choice; most users can leave it unchecked.
+The FPS controls are at the top, followed by the pacing status (with its **Details**) and **Pacing preference** (64-bit). **OSD** and **Screen** follow. **Enable advanced settings** reveals compatibility options; most users can leave it unchecked.
 
 ReLimiter ships the recommended defaults and you are not expected to tune pacing: smoothing is always on, the output point is chosen automatically, and there is no separate setup for frame generation. Settings save automatically. Existing caps and compatible preferences are carried forward when upgrading; see [Removed and migrated keys](#removed-and-migrated-keys).
 
@@ -144,9 +144,9 @@ For how the cadence, the lead and the output points work, with diagrams, see [Fr
 | `gpu_queue_wait` | The GPU queue waits for the target before the frame is presented | 64-bit, DX12, native Reflex (NvAPI) markers, VRR, no frame generation, once the GPU wait has qualified |
 | `fg_input_wait` | The GPU waits for the target before each real frame enters frame generation | 64-bit, DX12, native Reflex (NvAPI) markers, frame generation presenting, once the FG input route has qualified |
 | `marker_hold` | ReLimiter holds the CPU at the game's Present marker | Other marker routes without frame generation, for example DX11 with Reflex, Vulkan with Streamline PCL, or DX12 before the GPU wait qualifies |
-| `source_only` | Nothing is held after the source wait | Present-based pacing, idle caps, frame generation without a qualified FG input route, passthrough, while the [overload pause](#overload-pause) is active, and when a developer setting turns holding off |
+| `source_only` | Nothing is held after the source wait | Present-based pacing, idle caps, frame generation without a qualified FG input route, passthrough and while the [overload pause](#overload-pause) is active |
 
-A `native_hold` output exists but can only be selected with a developer setting. Frame generation without a qualified FG input route uses `source_only`, not a marker hold.
+Frame generation without a qualified FG input route uses `source_only`, not a marker hold.
 
 ### API Support
 
@@ -172,10 +172,10 @@ The main view shows one plain line under the FPS controls:
 | Status line | Colour | Meaning |
 |-------------|--------|---------|
 | `Smooth: frames are held on the GPU to an even cadence` | Green | A GPU wait (`gpu_queue_wait` or `fg_input_wait`) is holding frames to the cap cadence. |
-| `Smooth: frames are held to an even cadence` | Green | Another output hold (`marker_hold` or `native_hold`) is holding frames to the cap cadence. |
+| `Smooth: frames are held to an even cadence` | Green | Another output hold (`marker_hold`) is holding frames to the cap cadence. |
 | `Learning the game's frame timing...` | Amber | A hold is active but its lead is still warming up. It clears by itself after a few moments. |
 | `Getting ready...` | Amber | The GPU wait output has not qualified yet and nothing is held. Normal after starting the game, toggling FG or changing settings. |
-| `Paused: the game can't reach the cap right now (Adaptive cap can help)` | Amber | The [overload pause](#overload-pause) has stopped holding frames. With **Adaptive cap** on, it reads `(resumes on its own)` instead. |
+| `Paused: the game can't reach the cap right now (resumes on its own)` | Amber | The [overload pause](#overload-pause) has stopped holding frames. |
 | `Capped: smooth pacing needs NVIDIA Reflex in the game` | Grey | The game is paced at Present calls without Reflex markers; the cap applies but frames are not held. |
 | `Capped: frame generation paces its own frames here (frames are not held)` | Grey | Frame generation presents its frames itself, from its own thread and queue, as DLSS Frame Generation does when hardware flip metering is not in use. ReLimiter cannot hold them there; the cap still applies. |
 | `Idle cap active (background, FG-Off Cap or OLED Care)` | Grey | An idle cap is active; frames follow the cadence without an output hold. |
@@ -200,8 +200,6 @@ The technical lines are under **Details**, a collapsed node below the status lin
 | **Grid epoch** | Counts cadence restarts (after a cap or mode change, a new swapchain or a late frame). An occasional increase is normal; a counter that climbs steadily means frames keep missing their targets. |
 | **Release headroom** / **Release margin** | Shown on `gpu_queue_wait`: how much room ReLimiter leaves before the game's next frame starts heavy GPU work (headroom) or its next Present call (margin). A `guard off` note means the room is not needed in this game. |
 | **Driver Sleep** | Average time the game's Reflex Sleep call spends in the driver, shown while a GPU wait is the output. A readout only. |
-| **Adaptive cap** | Shown with [Adaptive cap](#adaptive-cap) on: how much longer the interval is than the cap, its phase and the last cause. |
-| **A/B interleave** | Orange, shown only while a developer test setting alternates held and not-held blocks. |
 
 Below the status line itself (not under **Details**), `Dynamic frame generation: pacing passthrough` is shown while frame pacing is left to the driver.
 
@@ -219,13 +217,13 @@ Below the status line itself (not under **Details**), `Dynamic frame generation:
 | `fg_unqualified` | Frame generation is presenting on DX12 with native Reflex markers, but its FG input route has not qualified yet; nothing is held. |
 | `fg_route_unsupported` | Frame generation presents its frames from its own thread and queue (DLSS Frame Generation without hardware flip metering), so the FG input wait cannot hold them; the cap applies and nothing is held. |
 | `infeasible` | The [overload pause](#overload-pause) stopped holding frames. |
-| `smoothing_off`, `override` | A developer setting changed the output; see [Developer Settings](#developer-settings). |
+| `override`, `driver_limiter_unavailable` | The developer test mode `driver_limiter` is set: `override` while the NVIDIA driver's Reflex limiter holds the cap, `driver_limiter_unavailable` where it cannot apply and the game runs as it is. See [Developer Settings](#developer-settings). |
 
 Reasons from `architecture` to `no_gpu_queue` come with `marker_hold`: they name the first requirement of the GPU queue wait that is not met. They do not mean pacing has failed. Brief warm-up after starting the game, toggling FG or changing settings is normal.
 
 ### Pre-Sleep Placement
 
-In the 64-bit addon, for games that use NVIDIA Reflex markers and call the Reflex Sleep, ReLimiter does most of its waiting inside that Sleep call, before the game reads input for the next frame; the game is still released at the exact planned time. The Details line reads `Placement: pre-Sleep`. This is the default and needs no setup. By default ReLimiter's own wait replaces the driver's Reflex Sleep while it paces the game; Reflex markers and the game's Reflex mode are still passed to the driver, and the driver's Sleep is used again whenever ReLimiter is not pacing the game (for example with the cap off, or in Dynamic MFG passthrough).
+In the 64-bit addon, for games that use NVIDIA Reflex markers and call the Reflex Sleep, ReLimiter does most of its waiting inside that Sleep call, before the game reads input for the next frame; the game is still released at the exact planned time. The Details line reads `Placement: pre-Sleep`. This needs no setup. ReLimiter's own wait replaces the driver's Reflex Sleep while it paces the game; Reflex markers and the game's Reflex mode are still passed to the driver, and the driver's Sleep is used again whenever ReLimiter is not pacing the game (for example with the cap off, or in Dynamic MFG passthrough).
 
 While it waits, ReLimiter asks Windows for its finest system timer resolution (usually 0.5 ms) for the game's process, and releases it when the game closes. This does not change the timer resolution of other programs on Windows 10 2004 and later.
 
@@ -235,7 +233,7 @@ Games that do not call the Reflex Sleep, idle caps, NVIDIA Smooth Motion and the
 
 When the game cannot reach the cap, holding frames makes things worse, so ReLimiter pauses its holds on its own. It pauses only when its own waits or the render handoff limit can make a difference: while the graphics card itself is the limit and ReLimiter's holds change nothing, the holds stay on (at the cost of about 1 ms of PC latency while that lasts). During a pause the status line reads `Paused: the game can't reach the cap right now`, the output becomes `source_only` with the reason `infeasible`, and **Details** shows an orange `Hold off: overload` line. ReLimiter keeps pacing the game while the holds are paused, and they resume by themselves after about two seconds without late frames that point to overload. The holds resume from the timing they were using during the pause and move to their new target a little at a time.
 
-What you can do: lower the cap, or turn on [Adaptive cap](#adaptive-cap), which lengthens the interval first so holds usually stay on.
+What you can do: lower the cap.
 
 ### Pacing preference
 
@@ -257,40 +255,6 @@ The INI key is `pacing_preference` under `[FrameLimiter]`: `latency`, `balanced`
 
 ---
 
-## Adaptive cap
-
-**Adaptive cap** lengthens the frame interval while the game cannot hold the cap, and shortens it again once it can. An overloaded game then runs at a slightly lower but steady rate that follows what it can sustain, instead of missing frames at random. The interval rises only when frames are actually late; an isolated hitch does not lengthen it.
-
-It is **disabled by default**. The checkbox appears on every API and pacing route, including Present-based pacing without Reflex, while Dynamic MFG is not controlling the target. It does not apply to idle caps (Background FPS, FG-Off Cap, OLED Care) or while ReLimiter is not pacing.
-
-| Setting | Default | What it does |
-|---------|---------|--------------|
-| **Adaptive cap** | Off | Main view. Turns the adaptive interval on or off. Turning it off returns to the cap immediately. Next to the checkbox, `(at the cap)` (green) or `(N% below the cap)` (yellow) shows how far the frame rate is below the cap. |
-| **Adaptive cap fit** | 75% | Under **Advanced** (**Enable advanced settings**), shown only while Adaptive cap is on. The share of recent frames the lengthened interval plans for: **75%** (the most frame rate), **90%** or **99%** (the smoothest). Higher gives more even pacing at a lower frame rate. Lower keeps more frame rate: the slowest frames of heavy moments then arrive late, which VRR shows as longer frames. In a test with frame generation near the GPU's limit, 99% removed most stutter for about 5% less frame rate. |
-| **Show on OSD** | Off | Main view, under the checkbox, shown once Adaptive cap is on. Adds the **Adaptive cap** line to the OSD. |
-
-What to expect:
-
-- **Range.** The interval stays between the cap interval and 60% longer, so the frame rate drops by at most about 38%. With frame generation it is the rendered-frame interval, so the output frame rate drops by the same proportion.
-- **VRR.** Interval changes happen without restarting the cadence.
-- **Fixed refresh.** On a cap that matches whole refreshes the interval is rounded up to whole refreshes, and each change of the whole-refresh count restarts the cadence once.
-- **Resets.** A cap or FG multiplier change, Dynamic MFG, OLED Care, regaining focus, a new graphics API or swapchain, and turning Adaptive cap off all return to the cap immediately.
-- **OSD.** With **Show on OSD**, the OSD shows `Adaptive cap: +x.x% (x.xx ms)`, the lengthening and the lengthened interval. It is green at the cap and yellow above.
-- **Details.** `Adaptive cap: interval +x.x% | <phase> | last: <cause>` shows the lengthening, the phase (`idle` at the cap, `rising`, `holding` or `falling`) and why the latest change started.
-
-It cannot remove shader-compilation, loading or other isolated game stalls, and it does not guarantee that every frame meets its target. When Adaptive cap is off, or at its +60% limit, sustained trouble makes automatic holds pause instead; see [Overload Pause](#overload-pause).
-
-### When to Use It
-
-- Try it when moving through heavy areas or scenes drops the frame rate below the cap: the interval then follows what the game can sustain instead of missing frames.
-- Leave it off if you already maintain your cap comfortably and prefer a fixed target.
-- Try it when the GPU is busy most of each frame interval and display jitter stays high with the GPU wait output: it trades a few percent of frame rate for frames the GPU wait can hold.
-- Disable it if its frame-rate changes are unwanted in a particular game.
-
-Adaptive cap works with every output point and with static frame generation without separate setup.
-
----
-
 ## On-Screen Display (OSD)
 
 Enable **Show OSD** in the OSD section. The default visibility key is **PageUp**, and keybinds can include Ctrl, Alt or Shift.
@@ -302,7 +266,7 @@ Enable **Show OSD** in the OSD section. The default visibility key is **PageUp**
 | **Performance** | FPS, 1% Low, 0.1% Low, Frametime and Frametime Graph |
 | **Quality** | PQI and its Breakdown, Smoothness, Display Pacing |
 | **Latency** | CPU Latency, GPU Render, Frame Cost, FG Time, PC Latency and its Breakdown |
-| **Pipeline** | Frame Generation, Limiter, Adaptive cap (percentage and lengthened interval) |
+| **Pipeline** | Frame Generation, Limiter |
 | **Hardware** | GPU temperature, clock, usage and VRAM; CPU and RAM usage |
 | **DLSS Info** | Quality level, active features, render/output resolution, presets and component versions |
 
@@ -488,11 +452,23 @@ There is no separate Dynamic MFG output-cap slider in ReLimiter's panel, and the
 
 Check **Enable advanced settings** below the pacing controls to reveal additional options. Start with the defaults and change one setting at a time.
 
-Advanced includes the **Adaptive cap fit** choice (while Adaptive cap is on), Reflex injection, flip-model compatibility, telemetry and logging, DLSS information controls and Streamline compatibility. Some controls are only available in the 64-bit addon. The output points and supported frame generation do not require separate tuning controls.
+Advanced includes Reflex injection, flip-model compatibility, telemetry and logging, DLSS information controls and Streamline compatibility. Some controls are only available in the 64-bit addon. The output points and supported frame generation do not require separate tuning controls.
 
 ### Developer Settings
 
-ReLimiter also has developer settings for A/B testing: forcing an output point, switching smoothing off, changing the GPU wait release headroom, the Reflex Sleep bypass and the source placement, and a stall injector. They are hidden unless `developer_settings=true` is set under `[FrameLimiter]` in `relimiter.ini`, and they can make pacing worse on purpose. While any of them differs from its default, the main view shows an amber `N developer setting(s) changed from the defaults` line with a **Reset** button, even when the settings are hidden. Details of every setting are in the [Developer Reference](DEVELOPER_REFERENCE.md#developer-diagnostics).
+ReLimiter also has a few developer settings for comparison captures: the pacing test mode, the GPU wait probes, flip metering and the queue measurement keys. They are hidden unless `developer_settings=true` is set under `[FrameLimiter]` in `relimiter.ini`, and they can make pacing worse on purpose. While any of them differs from its default, the main view shows an amber `N developer setting(s) changed from the defaults` line with a **Reset** button, even when the settings are hidden. Details of every setting are in the [Developer Reference](DEVELOPER_REFERENCE.md#developer-diagnostics).
+
+#### Pacing test mode
+
+`pacing_test_mode` (**Pacing owner (test)** in the developer diagnostics) says who paces, so a capture can be compared with the game's own Reflex. It counts only while `developer_settings=true`; without it the saved value stays in the INI but is ignored and ReLimiter paces as usual. Nothing in an old INI and no other setting ever turns it on.
+
+| Value | What happens |
+|-------|--------------|
+| `off` (default) | ReLimiter paces. |
+| `reflex_only` | ReLimiter paces nothing: the game's own Reflex calls run as they are and ReLimiter applies no cap. The saved cap stays in the INI. |
+| `driver_limiter` | The cap goes to the NVIDIA driver's own Reflex limiter and ReLimiter holds nothing. Where the limiter cannot apply (the game does not call the Reflex Sleep, a Present-based or Streamline PCL route, an idle cap, the driver refuses it, or the 32-bit addon) the game runs as it is: ReLimiter does not fall back to pacing, and the pacing state shows the reason `driver_limiter_unavailable`. |
+
+While a test mode is on, the main view names it instead of the usual pacing line (`Test mode reflex_only: ...`, `Test mode driver_limiter: ...`, and for an unavailable limiter that the game runs as it is).
 
 ---
 
@@ -537,8 +513,8 @@ Recording starts off on every game launch. Each time it is turned on, a new capt
 
 | File prefix | Contents |
 |-------------|----------|
-| `relimiter_pacing_` | One row per displayed frame, or per Present call when no display time is available: ReLimiter's release and frame plan, the game's Present call, GPU wait and readiness timing, Reflex timing, the display time and its source (ETW or DXGI), Display Pacing measurements, the Adaptive cap value and PC Latency when PC latency collection is on. Rows are written only for DXGI games (DX10, DX11, DX12); in Vulkan, OpenGL and DX9 games the file has only its header |
-| `relimiter_pacing_events_` | Capture start and end, pipeline changes, cadence restarts, Adaptive cap and hold changes, injected stalls, measurement loss, PC latency status changes and Display Pacing snapshots |
+| `relimiter_pacing_` | One row per displayed frame, or per Present call when no display time is available: ReLimiter's release and frame plan, the game's Present call, GPU wait and readiness timing, Reflex timing, the display time and its source (ETW or DXGI), Display Pacing measurements and PC Latency when PC latency collection is on. Rows are written only for DXGI games (DX10, DX11, DX12); in Vulkan, OpenGL and DX9 games the file has only its header |
+| `relimiter_pacing_events_` | Capture start and end, pipeline changes, cadence restarts, hold changes, measurement loss, PC latency status changes and Display Pacing snapshots |
 
 Display times come from [PC latency collection](#optional-pc-latency-measurement) or, on DX11 and DX12 without it, from DXGI frame statistics. PC Latency needs PC latency collection. Without display times, rows still record releases, Present calls and the available GPU and Reflex timing, but the display columns stay empty. An empty cell means the value was unavailable, not zero. Not every game supplies every measurement. Release and Present times describe ReLimiter's pacing, not what reached the display, especially with frame generation. Column-level detail is in the [Developer Reference](DEVELOPER_REFERENCE.md#capture-files).
 
@@ -594,29 +570,33 @@ Most settings can be changed through the overlay. For manual changes, close the 
 | Key | Default | Values / purpose |
 |-----|---------|------------------|
 | `target_fps` | 0 | 0 disables the normal cap; 30–1000 FPS via INI. Use the overlay to choose VRR Cap or a custom target. |
-| `adaptive_cap` | false | Enable **Adaptive cap**: lengthens the cap interval, up to +60%, while frames are late and the cap can't be held, and shortens it again when they are not. See [Adaptive cap](#adaptive-cap). |
-| `adaptive_cap_percentile` | 75 | **Adaptive cap fit** (Advanced): `75`, `90` or `99`, the share of recent frames the lengthened interval plans for. Other values move to the nearest of the three (up to 82 → 75, 83–94 → 90, 95 and above → 99). |
 | `pacing_preference` | balanced | **Pacing preference** (64-bit DirectX 12): `latency` (**Lower latency**), `balanced` or `smooth` (**Smoother**). Any other value loads as `balanced`. |
 | `advanced_settings` | false | Show advanced user controls |
 | `developer_settings` | false | INI-only. Shows the developer settings in the Advanced section; see [Developer Settings](#developer-settings). |
-| `config_version` | 5 | Written by ReLimiter; do not edit. Records which defaults the file was written with; see [Removed and migrated keys](#removed-and-migrated-keys). |
+| `pacing_test_mode` | off | Developer, counts only with `developer_settings=true`: `off`, `reflex_only` or `driver_limiter`; see [Pacing test mode](#pacing-test-mode). |
+| `config_version` | 6 | Written by ReLimiter; do not edit. Records which defaults the file was written with; see [Removed and migrated keys](#removed-and-migrated-keys). |
 | `background_fps` | 30 | 0 is uncapped; otherwise 20–60 FPS |
 | `fg_off_fps` | 0 | 0 disables the override; otherwise 30–360 FPS via INI |
 | `vsync_mode` | game | `game`, `off`, `on` |
 | `dynamic_mfg_passthrough` | false | Manual Dynamic MFG compatibility option |
 
-The developer keys (`smoothing`, `output_rung`, `gpu_wait_headroom_us`, `reflex_sleep_bypass`, `source_placement` and others) are listed in the [Developer Reference](DEVELOPER_REFERENCE.md#developer-ini-keys). Leave them at their defaults for normal play.
+The developer keys (the queue measurement and flip metering keys and `pacing_test_mode`) are listed in the [Developer Reference](DEVELOPER_REFERENCE.md#developer-ini-keys). Leave them at their defaults for normal play.
 
 #### Removed and migrated keys
 
-Older configurations are updated automatically at the next launch, when ReLimiter rewrites `relimiter.ini`:
+A `relimiter.ini` written by an earlier version (a `config_version` below 6) is read once at the next launch: the settings listed below no longer exist and are ignored, and ReLimiter rewrites the file without them and with `config_version=6`. Your caps (`target_fps`, `background_fps`, `fg_off_fps`), `pacing_preference` and every other setting that still exists are kept. Nothing in an old file enters a test mode: `pacing_test_mode` is never set by the rewrite. When a removed setting held a value other than its old default (for most users only `adaptive_cap=true`), the log names those keys with their values in one line at the `info` level (`Config: settings that no longer exist were ignored: ...`); nothing is logged for settings that held their defaults.
 
-- `pacing_method=marker` becomes `output_rung=marker` if `output_rung` is not set; `automatic`, `native` and other values become `auto`. Note that this carries a Reflex / Marker preference forward as a developer override; set **Output override** back to **Auto** (it is shown with `developer_settings=true`) to let ReLimiter choose.
-- `adaptive_smoothing` becomes `adaptive_cap` if `adaptive_cap` is not set.
-- `smoothing=low`, `medium` and `high` become `smoothing=on`. Smoothing is always on for users; only On and Off remain, and Off is a developer key.
-- A `relimiter.ini` without `config_version`, written by an older version that saved every key including the old defaults, is moved once to `reflex_sleep_bypass=true` and `source_placement=pre_sleep`; every other value is kept, and ReLimiter then writes `config_version=5`. An INI that already has `config_version=2` or later keeps those two settings, so set `reflex_sleep_bypass=false` or `source_placement=marker` there to stay on the older behavior. An INI saved by a 4.0 test build also moves once to the new defaults `lead_coverage=99` (from `config_version=2`) and `fg_late_spacing=true` (from `config_version` 2 or 3). An INI saved before `config_version=5` also moves once to the new defaults `unified_queue_law=true`, `gpu_queue_probe=true` and `gpu_queue_probe_source=1` (the queue-based pacer, which only does anything in 64-bit DirectX 12 games); set them to `false`, `false` and `0` in an INI that already has `config_version=5` to keep the report-based pacing. A new INI starts with the recommended defaults.
+These keys no longer exist. ReLimiter always behaves as its defaults did, and drops the keys when it rewrites the INI:
 
-The following keys have been removed. ReLimiter ignores them and drops them when it rewrites the INI: `pacing_method`, `adaptive_smoothing`, `smoothing_percentile`, `smoothing_window`, `smoothing_release_speed`, `smoothing_bias_us`, `gpu_present_gate_mode`, `gpu_present_gate_slack_us`, `gpu_present_gate_max_delay_us`, `estimator_a_mode`, `estimator_a_fixed_reserve_us`, `native_arrival_predictor_mode`, `presentation_gate_location`, `adaptive_deadline_reserve_mode`, `gpu_readiness_observer`, and from earlier versions `reflex_pre_sleep_pacing`, `reflex_gpu_combined`, `gpu_present_gate_phase_controller`, `gpu_present_gate_hold`, `marker_gate_bypass`, `adaptive_cycle_trial`, `ready_present_*` and `readiness_phase_*`. `dmfg_output_cap` is removed as well: it was read but never applied. `gpu_wait_budget_us` is removed too: the GPU queue wait no longer has a cap for it to size, and `gpu_wait_headroom_us` is a different, developer-only setting. The developer keys `gpu_paced_hold_margin` and `gpu_paced_release_smoothing` from 4.0 test builds are removed as well. `reflex_pre_sleep_pacing` has no replacement key; [pre-Sleep placement](#pre-sleep-placement) is automatic and controlled by the developer key `source_placement`.
+- Adaptive cap: `adaptive_cap`, `adaptive_cap_percentile`, `adaptive_cap_hold_room`, `osd_show_adaptive_smoothing` (also the `show_adaptive_smoothing` entry of the OSD presets) and its old name `adaptive_smoothing`. The interval is always the cap's interval.
+- Smoothing and output: `smoothing`, `output_rung`, `lead_coverage`, `lead_spike_floor`, `fg_late_spacing`, `gpu_queue_wait_render_queue` and `gpu_wait_headroom_us`. Smoothing is always on and ReLimiter always chooses the output point.
+- Reflex Sleep and source placement: `reflex_sleep_bypass`, `source_placement`, `bypass_low_latency_off`, `driver_low_latency_off`, `driver_limiter_hold`, `pre_sleep_precise` and `marker_forward_order`. A saved `reflex_sleep_bypass=false` or `source_placement=driver` does not select the driver's limiter or Sleep any more; use the developer test mode `driver_limiter` instead.
+- GPU cadence and A/B switches: `gpu_paced_cadence`, `gpu_wait_interleave_s`, `stall_inject_ms` and `stall_inject_period_s`.
+- Measurement experiments: `sleep_status_every_frame`, `gpu_start_probe`, `gpu_priority_probe` and `fg_presenter_probe_us`.
+- Pacer switches: `unified_pacer`, `unified_every_frame_service` and `unified_queue_target_us`. The pacer is on in 64-bit games unless a developer test mode takes over.
+- An INI saved before `config_version=5` also moved once to the defaults `unified_queue_law=true`, `gpu_queue_probe=true` and `gpu_queue_probe_source=1` (the queue-based pacer, which only does anything in 64-bit DirectX 12 games); those developer keys still exist, so set them to `false`, `false` and `0` to keep the report-based pacing.
+
+Keys removed by earlier versions are dropped the same way: `pacing_method`, `smoothing_percentile`, `smoothing_window`, `smoothing_release_speed`, `smoothing_bias_us`, `gpu_present_gate_mode`, `gpu_present_gate_slack_us`, `gpu_present_gate_max_delay_us`, `estimator_a_mode`, `estimator_a_fixed_reserve_us`, `native_arrival_predictor_mode`, `presentation_gate_location`, `adaptive_deadline_reserve_mode`, `gpu_readiness_observer`, `reflex_pre_sleep_pacing`, `reflex_gpu_combined`, `gpu_present_gate_phase_controller`, `gpu_present_gate_hold`, `marker_gate_bypass`, `adaptive_cycle_trial`, `ready_present_*`, `readiness_phase_*`, `gpu_paced_hold_margin` and `gpu_paced_release_smoothing`. `dmfg_output_cap` was read but never applied, and `gpu_wait_budget_us` has no cap left to size. [Pre-Sleep placement](#pre-sleep-placement) is automatic.
 
 ### Screen and Compatibility
 
@@ -666,16 +646,15 @@ Individual OSD readings have `osd_show_*` keys. Use the OSD checkboxes or preset
 
 ### The GPU wait is not used
 
-Open **Details** under the pacing status line and check **Output** and **Reason**; the [reason table](#reading-the-status) names the first requirement that is not met. The GPU waits require the 64-bit addon, a DX12 game with native Reflex markers and, without frame generation, a VRR display. They also need a few moments to qualify after startup or a change. DX11, Vulkan and other paths use `marker_hold` or `source_only`. Recording telemetry or enabling PC latency does not unlock the GPU waits, except in cross-thread games (see [Optional PC Latency Measurement](#optional-pc-latency-measurement)). If the reason shows `override`, a developer setting is choosing the output (for example after migrating `pacing_method=marker`); see [Developer Settings](#developer-settings).
+Open **Details** under the pacing status line and check **Output** and **Reason**; the [reason table](#reading-the-status) names the first requirement that is not met. The GPU waits require the 64-bit addon, a DX12 game with native Reflex markers and, without frame generation, a VRR display. They also need a few moments to qualify after startup or a change. DX11, Vulkan and other paths use `marker_hold` or `source_only`. Recording telemetry or enabling PC latency does not unlock the GPU waits, except in cross-thread games (see [Optional PC Latency Measurement](#optional-pc-latency-measurement)). If the reason shows `override` or `driver_limiter_unavailable`, the developer test mode `driver_limiter` is set; see [Developer Settings](#developer-settings).
 
 ### Stuttering or inconsistent pacing
 
 1. Use a cap inside your display's VRR range. Smoothing is always on; the status line says whether frames are being held.
 2. Check for another active limiter in the game, RTSS or driver settings.
 3. If **Grid epoch** climbs steadily, frames keep missing their targets: try a lower cap. If the status line reads **Paused: the game can't reach the cap right now**, ReLimiter has stopped holding frames because of overload and resumes on its own; see [Overload Pause](#overload-pause).
-4. Try **Adaptive cap** if heavy areas or scenes drop the frame rate below the cap, or turn it off if its frame-rate changes are undesirable.
-5. Compare VSync Game, Off and On. Change one option at a time.
-6. If an amber line says developer settings are changed from the defaults, press its **Reset** button; this also stops a running stall injector.
+4. Compare VSync Game, Off and On. Change one option at a time.
+5. If an amber line says developer settings are changed from the defaults, press its **Reset** button.
 
 Shader compilation, loading and other game stalls may remain regardless of limiter settings.
 
@@ -690,7 +669,7 @@ Shader compilation, loading and other game stalls may remain regardless of limit
 
 1. Disable optional **Flip Model Override** or **Reflex Injection** if enabled, then restart.
 2. Restore the previous **Proactive Streamline Hooks** setting if the problem began after changing it.
-3. In `relimiter.ini` (game closed), try `reflex_sleep_bypass=false` and `source_placement=marker` to return to the driver's own Sleep, or `smoothing=off` to hold nothing after the source wait. Set `developer_settings=true` to see these controls in the overlay; see the [Developer Reference](DEVELOPER_REFERENCE.md#developer-ini-keys).
+3. To check whether ReLimiter's pacing is involved, set `developer_settings=true` and `pacing_test_mode=reflex_only` in `relimiter.ini` (game closed): ReLimiter then paces nothing and the game's own Reflex runs. See [Pacing test mode](#pacing-test-mode) and the [Developer Reference](DEVELOPER_REFERENCE.md#developer-ini-keys).
 4. For DLSS-related problems, try disabling **DLSS Info Hooks** and restart.
 5. Keep the ReLimiter log and any crash report for troubleshooting.
 

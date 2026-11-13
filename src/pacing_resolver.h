@@ -20,16 +20,14 @@
 
 // ── Configuration ──
 
-// User setting `smoothing`: lead headroom of the output rungs.
-// INI text: off | on; the earlier levels low | medium | high load as on (the
-// levels changed latency, not display jitter).
+// Lead headroom of the output rungs (fixed: kPacingSmoothing; the setting is gone). Text: off | on.
 enum class PacingSmoothing : uint8_t {
     Off = 0, // no output hold (H0)
-    On = 1,  // default
+    On = 1,  // the fixed value
     Count
 };
 
-// Developer key `output_rung`. INI text: auto | source | marker | native | gpu.
+// Output rung override (fixed: kPacingRungOverride, Auto; the setting is gone). Text: auto | source | marker | native | gpu.
 enum class PacingRungOverride : uint8_t {
     Auto = 0,
     SourceOnly = 1, // H0
@@ -39,20 +37,19 @@ enum class PacingRungOverride : uint8_t {
     Count
 };
 
-// Developer key `marker_forward_order` (x64 NvAPI marker path only):
-// when the enforcement marker reaches the driver relative to the source wait.
-// INI text: before_wait | after_wait. The PCL path always forwards after it.
+// When the enforcement marker reaches the driver relative to the source wait (x64 NvAPI marker path only; fixed:
+// kPacingMarkerForwardOrder, BeforeWait; the setting is gone). Text: before_wait | after_wait. The PCL path always
+// forwards after it.
 enum class PacingMarkerForwardOrder : uint8_t {
-    BeforeWait = 0, // default: the driver sees the unpaced arrival
+    BeforeWait = 0, // the driver sees the unpaced arrival
     AfterWait = 1,  // the driver sees the paced release
     Count
 };
 
-// Key `source_placement`: where the source
-// stage waits on marker routes. The user's choice; ReLimiter never switches
-// it. INI text: marker | pre_sleep | driver (legacy `auto` reads as marker).
+// Where the source stage waits on marker routes outside the unified pacer (fixed: kPacingPlacementOverride, PreSleep; the
+// setting is gone). Text: marker | pre_sleep | driver (legacy `auto` reads as marker).
 enum class PacingPlacementOverride : uint8_t {
-    Marker = 0,   // at the enforcement marker (default)
+    Marker = 0,   // at the enforcement marker
     PreSleep = 1, // before the Reflex Sleep while the game calls it, else the marker
     Driver = 2,   // hand the source cadence to the Reflex driver limiter
     Count
@@ -79,34 +76,25 @@ enum class PacingTestMode : uint8_t {
     Count
 };
 
-// Stall injector ranges.
+// Stall injector ranges (the injector in source_stage.cpp; its settings are gone, kPacingStallInjectMs).
 constexpr double kPacingStallInjectMaxMs = 200.0;
 constexpr double kPacingStallInjectMinPeriodS = 1.0;
 constexpr double kPacingStallInjectMaxPeriodS = 60.0;
 constexpr double kPacingStallInjectDefaultPeriodS = 5.0;
-// Key unified_pacer: the user-configuration default (Config::unified_pacer, its INI fallback,
-// the developer-override baseline and the startup warning all read it; reverting the default is
-// this one line). PacingPipelineConfig{} below stays false on purpose: many resolver, source
-// stage and scheduler tests construct a default pipeline, and the runtime value comes from Config
-// through Config_ApplyPacingPipeline. Before the first publication the resolver runs the earlier
-// pipeline; the key's ordinary transition applies at publication, the same path as ticking the
-// checkbox. 64-bit only: PacingPipeline_ClampConfig forces the key false on Win32.
-constexpr bool kPacingUnifiedPacerDefault = true;
-// Developer keys unified_every_frame_service (default on) and unified_queue_target_us (default
-// 2000 µs), only read under unified_pacer: the queue term's target of the unified law's GPU
-// interval, [0, kPacingUnifiedQueueTargetMaxUs]. The defaults equal UnifiedOptions' and
-// kUnifiedQueueTargetUs (unified_pacer.h; the law has no config dependency, source_stage.cpp
-// asserts the equality). The earlier law is false with 4000.
+// The owner of pacing is derived, never configured: `unified` is 64-bit with the effective test mode Off
+// (PacingPipeline_ClampConfig). Before the first publication the resolver runs the earlier pipeline (unified false);
+// the ownership transition applies at publication.
+// Queue term target and the law's service estimate (fixed, no setting): the defaults equal UnifiedOptions' and
+// kUnifiedQueueTargetUs (unified_pacer.h; the law has no config dependency, source_stage.cpp asserts the equality).
 constexpr bool kPacingUnifiedEveryFrameServiceDefault = true;
 constexpr double kPacingUnifiedQueueTargetDefaultUs = 2000.0;
-constexpr double kPacingUnifiedQueueTargetMaxUs = 20000.0;
-// Developer key unified_hold_share (default 0 = off, only read under unified_pacer): the share of
+// Developer key unified_hold_share (default 0 = off, only read under the unified owner): the share of
 // the measured completion spacing the hold credit's refill of a used report is at least;
 // [0, kPacingUnifiedHoldShareMax]. The default equals UnifiedOptions' (source_stage.cpp asserts it).
 constexpr double kPacingUnifiedHoldShareDefault = 0.0;
 constexpr double kPacingUnifiedHoldShareMax = 0.25;
 // Developer keys unified_queue_law, unified_queue_rank and unified_queue_allow_us (defaults on, 2,
-// 4000 µs; only read under unified_pacer, 64-bit only): the queue law on the presenting queue
+// 4000 µs; only read under the unified owner, 64-bit only): the queue law on the presenting queue
 // probe's signals; the rank (1..kPacingUnifiedQueueRankMax) of the queue margin statistic and the
 // margin M in µs (0..kPacingUnifiedQueueAllowMaxUs) the law allows. The law falls back to the
 // report-based interval whenever the probe's records are not valid, so a game without a Direct3D 12
@@ -137,32 +125,17 @@ constexpr int kPacingUnifiedQueueMarginEndDefault = 1;
 constexpr int kPacingUnifiedQueueMarginEndMax = 1;
 constexpr int kPacingUnifiedQueueAllowDefaultUs = 4000;
 constexpr int kPacingUnifiedQueueAllowMaxUs = 20000;
-// Developer key gpu_wait_headroom_us: the release headroom of the GPU queue
-// wait's collision-aware release, the fixed distance between a release and
-// the next frame's heavy GPU work (lead_controller.h LEAD_RELEASE_HEADROOM_US).
-// For reproducing a report without a rebuild; users never tune it.
-// Non-positive or non-finite values load as the default.
-constexpr double kPacingGpuWaitHeadroomMinUs = 500.0;
-constexpr double kPacingGpuWaitHeadroomMaxUs = 3000.0;
+// The release headroom of the GPU queue wait's collision-aware release, the fixed distance between a release and
+// the next frame's heavy GPU work (lead_controller.h LEAD_RELEASE_HEADROOM_US). Fixed: no setting changes it.
 constexpr double kPacingGpuWaitHeadroomDefaultUs = 1000.0;
-// Developer key gpu_wait_interleave_s: with Output override Auto,
-// the GPU queue wait alternates held and not held in blocks of about this many
-// seconds for unbiased A/B captures (rung_feasibility.h HoldInterleave). 0 is
-// off; other values are clamped to [1, 10] s; negative or non-finite is off.
-constexpr double kPacingGpuWaitInterleaveMinS = 1.0;
-constexpr double kPacingGpuWaitInterleaveMaxS = 10.0;
 
-// Adaptive cap fit (user key adaptive_cap_percentile): the share of recent
-// frames whose measured need the governed interval must fit. Three tiers:
-// 75 (default, the most frame rate), 90 and 99 (the most even pacing at the
-// lowest frame rate; with frame generation near the GPU's limit it removed
-// most display spikes for about 5% less frame rate). Separate from the
-// Smoothing lead quantile.
+// The Adaptive cap fit tiers and their nearest-tier rule: the share of recent frames the Adaptive cap's governed
+// interval fits (75, 90 or 99). The Adaptive cap is not configurable (kPacingAdaptiveCap); the rule stays with the
+// governor.
 constexpr int kAdaptiveCapFitTiers[] = {75, 90, 99};
 constexpr int kAdaptiveCapPercentileDefault = 75;
 
-// The tier nearest to percentile (other values from older versions and hand
-// edits): up to 82 is 75, 83 to 94 is 90, 95 and above is 99.
+// The tier nearest to percentile: up to 82 is 75, 83 to 94 is 90, 95 and above is 99.
 constexpr int PacingPipeline_AdaptiveCapFitTier(int percentile) noexcept
 {
     int best = kAdaptiveCapFitTiers[0];
@@ -173,6 +146,35 @@ constexpr int PacingPipeline_AdaptiveCapFitTier(int percentile) noexcept
     }
     return best;
 }
+
+// ── Constants of the removed pacing settings ──
+// Each fixes the value of a setting that no longer exists. Under the unified pacer it is what
+// PacingPipeline_ClampConfig forced while the setting existed; elsewhere it is the configuration default. The two are
+// equal for every constant below (the Adaptive cap's hold room is the one setting whose default, on, was forced off
+// under the unified pacer: it is inert without the Adaptive cap, and the constant is off). The earlier names of the
+// ones that already had a default constant stay: kAdaptiveCapPercentileDefault, kPacingGpuWaitHeadroomDefaultUs,
+// kPacingStallInjectDefaultPeriodS, kPacingUnifiedEveryFrameServiceDefault, kPacingUnifiedQueueTargetDefaultUs.
+constexpr PacingSmoothing kPacingSmoothing = PacingSmoothing::On;                // the lead table's On row
+constexpr PacingRungOverride kPacingRungOverride = PacingRungOverride::Auto;     // the output rung is resolved, never overridden
+constexpr PacingPlacementOverride kPacingPlacementOverride = PacingPlacementOverride::PreSleep; // marker placement outside the unified pacer
+constexpr bool kPacingAdaptiveCap = false;                                       // no Adaptive cap: the cap interval is the interval
+constexpr bool kPacingAdaptiveCapHoldRoom = false;                               // inert without the Adaptive cap
+constexpr bool kPacingGpuPacedCadence = false;                                   // no GPU-paced cadence
+constexpr bool kPacingDriverLimiterHold = false;                                 // the driver limiter releases, nothing is held
+constexpr bool kPacingPreSleepPrecise = false;                                   // the pre-Sleep wait keeps its learned margin
+constexpr double kPacingGpuWaitInterleaveS = 0.0;                                // no held / not-held A/B blocks
+constexpr double kPacingStallInjectMs = 0.0;                                     // no injected stalls
+constexpr PacingLeadCoverage kPacingLeadCoverage = PacingLeadCoverage::Q99;      // the lead covers 99% of frames
+constexpr bool kPacingFgLateSpacing = true;                                      // the FG input wait floors the frame after a late one
+constexpr bool kPacingLeadSpikeFloor = true;                                     // a GPU wait lead covers the game's rare long simulations
+constexpr PacingRenderQueue kPacingGpuQueueWaitRenderQueue = PacingRenderQueue::Keep; // the render queue stays in the lead
+constexpr PacingMarkerForwardOrder kPacingMarkerForwardOrder = PacingMarkerForwardOrder::BeforeWait; // markers reach the driver before any wait
+constexpr bool kPacingSleepStatusEveryFrame = false;                             // the driver's sleep status is polled once a second
+constexpr bool kPacingBypassLowLatencyOff = false;                               // the driver's low latency mode is left alone while bypassed
+constexpr bool kPacingDriverLowLatencyOff = false;                               // the driver's low latency mode is left alone with the game's Sleep
+constexpr bool kPacingGpuStartProbe = false;                                     // no GPU start measurement
+constexpr bool kPacingGpuPriorityProbe = false;                                  // no priority probe queues
+constexpr int kPacingFgPresenterProbeUs = 0;                                     // no presenter probe holds
 
 // The pacing preference's levers (see PacingPipeline_ResolvePreference).
 constexpr int kPacingPreferenceLatencyRank = 4;
@@ -206,64 +208,22 @@ constexpr PacingTestMode PacingPipeline_EffectiveTestMode(PacingTestMode saved, 
         : PacingTestMode::Off;
 }
 
-// The Reflex Sleep bypass the hooks apply: the setting while ReLimiter owns pacing (test mode Off); a test mode never
-// skips the driver's Sleep, so the game's Sleep or the driver's limiter runs with the cap saved or not.
-constexpr bool PacingPipeline_EffectiveSleepBypass(bool configured, PacingTestMode effective_mode) noexcept
+// The interval a Reflex report poll clamps its stage samples against while no effective interval is known: the cap's,
+// else 60 FPS. Test mode reflex_only reads no cap (its frames are uncapped pass-through, the saved cap stays untouched),
+// so it gets the uncapped fallback.
+constexpr double PacingPipeline_ReportFeedbackFallbackUs(PacingTestMode mode, int cap_fps) noexcept
 {
-    return configured && effective_mode == PacingTestMode::Off;
+    return mode != PacingTestMode::ReflexOnly && cap_fps > 0 ? 1000000.0 / static_cast<double>(cap_fps) : 16666.667;
 }
 
+// The configuration the resolver and the source stage read: the developer keys of the queue-based pacer, the derived
+// owner of pacing and the effective test mode. Every other pacing setting is a constant (kPacing* above).
 struct PacingPipelineConfig {
-    PacingSmoothing smoothing = PacingSmoothing::On;
-    PacingRungOverride rung_override = PacingRungOverride::Auto;
-    bool adaptive_cap = false;    // user key adaptive_cap: the period governor
-    int adaptive_cap_percentile = kAdaptiveCapPercentileDefault; // user key; a tier of kAdaptiveCapFitTiers
-    PacingPlacementOverride placement_override = PacingPlacementOverride::PreSleep; // key source_placement
     bool gpu_probes = true;       // developer key gpu_present_gate_probes
-    double gpu_wait_headroom_us = kPacingGpuWaitHeadroomDefaultUs; // developer key gpu_wait_headroom_us: [500, 3000]
-    double gpu_wait_interleave_s = 0.0; // developer key gpu_wait_interleave_s: 0 = off, else [1, 10]
-    PacingRenderQueue gpu_queue_wait_render_queue = PacingRenderQueue::Keep; // developer key (A/B)
-    PacingLeadCoverage lead_coverage = PacingLeadCoverage::Q99; // key lead_coverage; below 99 is the developer A/B
-    // Key fg_late_spacing (default on; off is the developer A/B): the FG input
-    // wait records a frame that reached its wait after the Signal at its
-    // readiness and floors the next frame's Signal on it (cadence_grid.h,
-    // output tracker).
-    bool fg_late_spacing = true;
-    // Key gpu_paced_cadence (default off; developer A/B): held frames are
-    // released no earlier than the render handoff GPU floor too, and a frame
-    // whose release that floor sets gets an output target at least the floor
-    // plus the early side of its lead, so the cadence follows the GPU instead
-    // of holding the frame (cadence_grid.h, source_stage.h).
-    bool gpu_paced_cadence = false;
-    // Key adaptive_cap_hold_room (default on; developer A/B): with Adaptive
-    // cap and Output override Auto, the interval is kept at least at the
-    // hold room of the GPU queue wait (lead_controller.h HoldRoomUs) or,
-    // with gpu_paced_cadence, of the FG input wait (GpuNeedQuantileUs);
-    // period_governor.h.
-    bool adaptive_cap_hold_room = true;
-    // Key lead_spike_floor (default on; developer A/B): with Output override
-    // Auto, a GPU wait lead behind the wait is at least the arrival tail plus
-    // the GPU's start → readiness time (lead_controller.h, spike floor).
-    bool lead_spike_floor = true;
-    // Key pre_sleep_precise (default off; developer A/B): the pre-Sleep wait
-    // aims at the release target itself (no learned margin) and ends with the
-    // hardware spin, so the game thread returns from ReLimiter's wait at the
-    // target (source_placement.h PreSleepRequest::precise).
-    bool pre_sleep_precise = false;
-    // Key driver_limiter_hold (default off; developer A/B): with the Reflex
-    // driver limiter placement the output rung resolves as for the other
-    // placements and ReLimiter plans each frame without a start wait. Takes
-    // effect with gpu_paced_cadence only (PacingPipeline_DriverLimiterHold).
-    bool driver_limiter_hold = false;
-    // Key unified_pacer (default off; developer, 64-bit only): the first build of
-    // the unified pacer (unified_pacer.h). PacingPipeline_ClampConfig forces the
-    // values the law replaces (smoothing On, Auto rung, no Adaptive cap, no
-    // GPU-paced cadence, no driver limiter hold, no precise pre-wait, no
-    // interleave, no stall injection, lead coverage Q99, fg_late_spacing and
-    // lead_spike_floor on, GPU queue wait render queue Keep, the placement
-    // override ignored) while the key is on, and false on Win32. In the published configuration this is the
-    // derived owner (the key, 64-bit and test_mode Off): PacingPipeline_ClampConfig clears it while a test mode is on.
-    bool unified_pacer = false;
+    // The derived owner of pacing, `unified`: 64-bit and test_mode Off. PacingPipeline_ClampConfig sets it whatever the
+    // caller passes, so the published value is the only one every reader sees. The default is false: many resolver,
+    // source stage and scheduler tests construct a default pipeline.
+    bool unified = false;
     // The effective pacing_test_mode (Config_ApplyPacingPipeline applies the developer_settings gate). A mode other
     // than Off takes the ownership from the unified pacer and, on the resolver's side, from every other policy:
     // ReflexOnly resolves to pass-through (mode Off, placement None, reason Passthrough) whatever the cap and the
@@ -271,23 +231,14 @@ struct PacingPipelineConfig {
     // foreground, the game calling the Reflex Sleep, an NvAPI marker route on 64-bit) and to pass-through with the
     // reason DriverLimiterUnavailable elsewhere, idle caps included. Never forced on Win32: it resolves there too.
     PacingTestMode test_mode = PacingTestMode::Off;
-    // Key unified_every_frame_service (default on; developer, only read under unified_pacer):
-    // the law's service estimate takes a sample from every reported frame, the GPU wait taken
-    // out, not only from saturated pairs (unified_pacer.h UnifiedOptions); false is the earlier
-    // estimator. ClampConfig forces it false on Win32 (the unified pacer is 64-bit only).
-    bool unified_every_frame_service = kPacingUnifiedEveryFrameServiceDefault;
-    // Key unified_queue_target_us (developer, only read under unified_pacer): the queue term's
-    // target in µs. ClampConfig: non-finite = kPacingUnifiedQueueTargetDefaultUs, otherwise
-    // [0, kPacingUnifiedQueueTargetMaxUs]; the default on Win32.
-    double unified_queue_target_us = kPacingUnifiedQueueTargetDefaultUs;
-    // Key unified_hold_share (developer, only read under unified_pacer): share in [0, 0.25] of the
+    // Key unified_hold_share (developer, only read under unified): share in [0, 0.25] of the
     // measured completion spacing that a used report refills the hold credit with at least;
     // 0 = off. ClampConfig: non-finite = kPacingUnifiedHoldShareDefault, otherwise
     // [0, kPacingUnifiedHoldShareMax]; forced to the default on Win32.
     double unified_hold_share = kPacingUnifiedHoldShareDefault;
-    // Keys unified_queue_law (default off), unified_queue_rank [1, kPacingUnifiedQueueRankMax] and
+    // Keys unified_queue_law (default on), unified_queue_rank [1, kPacingUnifiedQueueRankMax] and
     // unified_queue_allow_us [0, kPacingUnifiedQueueAllowMaxUs] (developer, only read under
-    // unified_pacer): ClampConfig clamps both numbers and forces the law off on Win32 (the
+    // unified): ClampConfig clamps both numbers and forces the law off on Win32 (the
     // numbers are not forced: they have no effect without the law).
     bool unified_queue_law = kPacingUnifiedQueueLawDefault;
     int unified_queue_rank = kPacingUnifiedQueueRankDefault;
@@ -304,18 +255,7 @@ struct PacingPipelineConfig {
     // clamps it and forces 0 on Win32.
     int unified_queue_margin_end = kPacingUnifiedQueueMarginEndDefault;
     int unified_queue_allow_us = kPacingUnifiedQueueAllowDefaultUs;
-    double stall_inject_ms = 0.0; // 0 = off; [0, kPacingStallInjectMaxMs]
-    double stall_inject_period_s = kPacingStallInjectDefaultPeriodS; // [1, 60]
 };
-
-// The driver limiter placement keeps its output hold: the frame's deadline
-// comes from the cadence planning of driver-released frames, which the grid
-// reaches only under gpu_paced_cadence (source_stage.cpp driver_sleep), so
-// the key needs it. Pure function of the configuration.
-constexpr bool PacingPipeline_DriverLimiterHold(const PacingPipelineConfig& config) noexcept
-{
-    return config.driver_limiter_hold && config.gpu_paced_cadence;
-}
 
 // ── Inputs ──
 
@@ -424,15 +364,15 @@ PacingPipelineConfig PacingPipeline_ClampConfig(PacingPipelineConfig config) noe
 // Control plane. Stores the clamped configuration.
 void PacingPipeline_SetConfig(const PacingPipelineConfig& config) noexcept;
 PacingPipelineConfig PacingPipeline_GetConfig() noexcept;
-// Single atomic loads (no consistent-read retry) for the Sleep planning path:
-// pre_sleep_precise, and PacingPipeline_DriverLimiterHold of the published config.
-bool PacingPipeline_PreSleepPrecise() noexcept;
-bool PacingPipeline_DriverLimiterHoldKey() noexcept;
-// One atomic load: the derived owner of the published configuration: the key unified_pacer, on 64-bit, with the
-// effective test mode Off (false on Win32 and in every test mode).
-bool PacingPipeline_UnifiedPacerKey() noexcept;
+// One atomic load: the derived owner of the published configuration, `unified`: 64-bit with the effective test mode
+// Off (false on Win32 and in every test mode).
+bool PacingPipeline_Unified() noexcept;
 // One atomic load: the effective pacing_test_mode of the published configuration.
 PacingTestMode PacingPipeline_TestMode() noexcept;
+// The Reflex Sleep bypass the hooks apply: skip the driver's Sleep while ReLimiter paces a positive cap. It applies
+// while ReLimiter owns pacing (test mode Off); a test mode never skips the driver's Sleep, so the game's Sleep or the
+// driver's limiter runs with the cap saved or not.
+inline bool PacingPipeline_SleepBypass() noexcept { return PacingPipeline_TestMode() == PacingTestMode::Off; }
 
 // A capability published for one controller generation answers true only for
 // that generation, so a lifecycle change invalidates it without a clear call.

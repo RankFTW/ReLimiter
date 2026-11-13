@@ -1,17 +1,22 @@
-// The developer key pacing_test_mode (reflex_only | driver_limiter) against the old-key arms it replaces:
-//   reflex_only    = unified_pacer=false, reflex_sleep_bypass=true, target_fps=0
-//   driver_limiter = unified_pacer=false, source_placement=driver, reflex_sleep_bypass=false
-// Directly tests the production resolver and the Sleep-mode tuple (src/pacing_resolver.cpp,
-// src/unified_pacer.cpp) over an enumeration of capabilities and runtime states: each test mode resolves to the pipeline
-// decision of its arm and selects the Sleep-mode tuple of its arm, except the named differences, which are asserted
-// row by row (never skipped):
-//   - driver_limiter where the driver's limiter cannot apply resolves to pass-through with the reason
-//     driver_limiter_unavailable (the arm falls back to pacing at the marker or the present route);
-//   - an idle cap (background, FG-off cap, OLED Care) in either mode resolves to pass-through (the arms pace it at the
-//     marker): reflex_only with reason passthrough, driver_limiter with driver_limiter_unavailable.
-// It also pins the decision table over (architecture policy x test mode x route x timing mode) so the removal of the
-// old keys keeps every decision byte for byte. Published observer state is covered in test_config_async.cpp; the
-// scheduler's dispatch of the resolved mode, the Sleep hook and the driver need live validation.
+// The developer key pacing_test_mode (reflex_only | driver_limiter): pinned expectations of each mode, over an
+// enumeration of capabilities and runtime states, against the production resolver (src/pacing_resolver.cpp), the
+// Sleep-mode tuple (src/unified_pacer.cpp) and the report-feedback fallback:
+//   reflex_only    resolves to pass-through (mode Off, placement None, reason passthrough) in every row: ReLimiter
+//                  paces nothing whatever the saved cap and the timing regime, and the Sleep-mode tuple is the game's;
+//   driver_limiter resolves to the driver limiter placement (source only, reason override) where the driver's limiter
+//                  can apply, and to pass-through with reason driver_limiter_unavailable where it cannot (idle caps, a
+//                  route that is not NvAPI markers, no Reflex Sleep from the game, the limiter refused, 32-bit).
+// The rows where a test mode passes through although the owner ReLimiter paces (mode off) are the named differences,
+// counted and asserted row by row (never skipped):
+//   1. idle caps (background, FG-off cap, OLED Care): both modes pass through;
+//   2. fixed refresh with a cap: reflex_only passes through (the cap is not read, the frame goes through at the
+//      refresh interval the game runs); driver_limiter hands the cap to the driver where it can apply;
+//   3. driver_limiter where the limiter cannot apply: pass-through with reason driver_limiter_unavailable.
+// It also pins the decision table over (architecture policy x test mode x route x timing mode), so the resolver keeps
+// every decision byte for byte. Published observer state is covered in test_config_async.cpp; the scheduler's dispatch
+// of the resolved mode (OnMarker), the Sleep hook and the driver need live validation: scheduler.cpp links the whole
+// hook stack and no seam runs it, so the dispatch is covered by construction instead (the driver limiter hold is a
+// constant false, asserted below, and the resolver never resolves a planning rung for the driver limiter placement).
 
 #include "nvapi_hooks.h"
 #include "pacing_resolver.h"
@@ -34,6 +39,9 @@ namespace
             ++s_failures;                                                       \
         }                                                                       \
     } while (false)
+
+    // The driver limiter never carries a planning rung: its hold is a constant false in every owner state.
+    static_assert(!kPacingDriverLimiterHold, "the driver limiter placement must never plan");
 
     constexpr PacingRoute kRoutes[] = { PacingRoute::None, PacingRoute::NvApiMarkers, PacingRoute::PclMarkers,
         PacingRoute::PresentBased };
@@ -59,47 +67,11 @@ namespace
         return capabilities;
     }
 
-    // The shipped default of the old key (on): the test mode must take the ownership from it.
-    PacingPipelineConfig UnifiedKeyConfig()
+    PacingPipelineConfig ModeConfig(PacingTestMode mode)
     {
         PacingPipelineConfig config{};
-        config.unified_pacer = true;
+        config.test_mode = mode;
         return config;
-    }
-
-    PacingPipelineConfig ReflexOnlyConfig()
-    {
-        PacingPipelineConfig config = UnifiedKeyConfig();
-        config.test_mode = PacingTestMode::ReflexOnly;
-        return config;
-    }
-
-    PacingPipelineConfig DriverLimiterConfig()
-    {
-        PacingPipelineConfig config = UnifiedKeyConfig();
-        config.test_mode = PacingTestMode::DriverLimiter;
-        return config;
-    }
-
-    // The old arms, expressed through the old keys.
-    PacingPipelineConfig ReflexOnlyArm()
-    {
-        PacingPipelineConfig config{};
-        config.unified_pacer = false; // reflex_sleep_bypass=true, target_fps=0: the cap enters through runtime.uncapped
-        return config;
-    }
-
-    PacingPipelineConfig DriverLimiterArm()
-    {
-        PacingPipelineConfig config{};
-        config.unified_pacer = false;
-        config.placement_override = PacingPlacementOverride::Driver; // reflex_sleep_bypass=false
-        return config;
-    }
-
-    bool SameDecision(const PacingPipelineSnapshot& left, const PacingPipelineSnapshot& right)
-    {
-        return PacingPipeline_SameResult(left, right);
     }
 
     bool IsPassthrough(const PacingPipelineSnapshot& result, PacingFallbackReason reason)
@@ -142,12 +114,12 @@ namespace
                 limiter_unavailable != 0, idle != 0, uncapped != 0, dmfg != 0, vrr != 0, fg != 0 });
     }
 
-    PacingRuntimeState Runtime(const Row& row, bool uncapped)
+    PacingRuntimeState Runtime(const Row& row)
     {
         PacingRuntimeState runtime{};
         runtime.swapchain_valid = row.swapchain_valid;
         runtime.dmfg_passthrough = row.dmfg;
-        runtime.uncapped = uncapped;
+        runtime.uncapped = row.uncapped;
         runtime.idle_cap = row.idle;
         runtime.vrr = row.vrr;
         runtime.fg_presenting = row.fg;
@@ -156,119 +128,139 @@ namespace
         return runtime;
     }
 
-    // ── The pipeline decision of each mode against its arm ──
-
-    struct Tally {
-        int equal = 0;
-        int named_idle = 0;
-        int named_unavailable = 0;
-        int passthrough_equal = 0;
-        int driver_limiter = 0;
-    };
-
-    void TestReflexOnlyEqualsItsArm()
+    // Marker routes exist only in a 64-bit process: elsewhere a marker route is no route.
+    bool Routed(const Row& row)
     {
-        Tally tally;
-        ForEachRow([&](const Row& row) {
-            const PacingCapabilities capabilities = Capabilities(row.route, row.x64, row.qualified);
-            // The mode resolves from the saved cap (uncapped or not) and the timing regime of the row; its arm has
-            // cap 0, which the scheduler passes as uncapped outside the idle regime.
-            const PacingPipelineSnapshot mode =
-                PacingPipeline_Resolve(ReflexOnlyConfig(), capabilities, Runtime(row, row.uncapped));
-            const PacingPipelineSnapshot arm = PacingPipeline_Resolve(
-                ReflexOnlyArm(), capabilities, Runtime(row, row.idle ? row.uncapped : true));
-            // Whatever the saved cap and regime: mode Off, placement None, reason Passthrough.
-            CHECK(IsPassthrough(mode, PacingFallbackReason::Passthrough));
-            const bool routed = row.route != PacingRoute::None;
-            const bool arm_paces_idle = row.idle && row.swapchain_valid && !row.dmfg && !row.uncapped && routed;
-            if (arm_paces_idle) {
-                // Named difference: the arm paces an idle cap through the generic marker body.
-                CHECK(arm.mode == PacingTimingMode::Idle && arm.reason == PacingFallbackReason::IdleCap);
-                CHECK(!SameDecision(mode, arm));
-                ++tally.named_idle;
-            } else {
-                CHECK(IsPassthrough(arm, PacingFallbackReason::Passthrough));
-                CHECK(SameDecision(mode, arm));
-                ++tally.equal;
-            }
-        });
-        CHECK(tally.equal > 0 && tally.named_idle > 0);
+        return row.route == PacingRoute::PresentBased ||
+            ((row.route == PacingRoute::NvApiMarkers || row.route == PacingRoute::PclMarkers) && row.x64);
     }
 
-    void TestDriverLimiterEqualsItsArm()
+    // ── The pipeline decision of each mode ──
+
+    void TestReflexOnlyPassesThrough()
     {
-        Tally tally;
+        int equal = 0;
+        int named_idle = 0;
+        int named_fixed_refresh = 0;
+        int cap_ignored_vrr = 0;
         ForEachRow([&](const Row& row) {
             const PacingCapabilities capabilities = Capabilities(row.route, row.x64, row.qualified);
-            const PacingRuntimeState runtime = Runtime(row, row.uncapped);
-            const PacingPipelineSnapshot mode = PacingPipeline_Resolve(DriverLimiterConfig(), capabilities, runtime);
-            const PacingPipelineSnapshot arm = PacingPipeline_Resolve(DriverLimiterArm(), capabilities, runtime);
+            const PacingRuntimeState runtime = Runtime(row);
+            const PacingPipelineSnapshot mode =
+                PacingPipeline_Resolve(ModeConfig(PacingTestMode::ReflexOnly), capabilities, runtime);
+            const PacingPipelineSnapshot owner =
+                PacingPipeline_Resolve(ModeConfig(PacingTestMode::Off), capabilities, runtime);
+            // Whatever the saved cap and the regime: mode Off, placement None, reason Passthrough.
+            CHECK(IsPassthrough(mode, PacingFallbackReason::Passthrough));
+            if (owner.mode == PacingTimingMode::Off) {
+                ++equal; // ReLimiter passes the row through too
+            } else if (row.idle) {
+                // Named difference 1: ReLimiter paces an idle cap; the mode passes it through.
+                CHECK(owner.mode == PacingTimingMode::Idle && owner.reason == PacingFallbackReason::IdleCap);
+                ++named_idle;
+            } else if (!row.vrr) {
+                // Named difference 2: ReLimiter paces fixed refresh with the saved cap; the mode passes the frame
+                // through at the refresh interval the game runs (the cap is not read).
+                CHECK(owner.mode == PacingTimingMode::Fixed);
+                ++named_fixed_refresh;
+            } else {
+                // VRR: the saved cap is not read; the frame passes through like an uncapped one.
+                CHECK(owner.mode == PacingTimingMode::Vrr);
+                ++cap_ignored_vrr;
+            }
+        });
+        CHECK(equal > 0 && named_idle > 0 && named_fixed_refresh > 0 && cap_ignored_vrr > 0);
+    }
 
-            const bool routed = row.route != PacingRoute::None;
-            const bool off = !row.swapchain_valid || row.dmfg || row.uncapped || !routed;
+    void TestDriverLimiterDecision()
+    {
+        int passthrough = 0;
+        int named_idle = 0;
+        int named_unavailable = 0;
+        int limited = 0;
+        ForEachRow([&](const Row& row) {
+            const PacingCapabilities capabilities = Capabilities(row.route, row.x64, row.qualified);
+            const PacingRuntimeState runtime = Runtime(row);
+            const PacingPipelineSnapshot mode =
+                PacingPipeline_Resolve(ModeConfig(PacingTestMode::DriverLimiter), capabilities, runtime);
+            const bool off = !row.swapchain_valid || row.dmfg || row.uncapped || !Routed(row);
             // The eligibility of the driver's limiter, written out here independently of the resolver.
             const bool eligible = row.x64 && row.route == PacingRoute::NvApiMarkers && row.sleep_available &&
                 !row.limiter_unavailable;
             if (off) {
                 CHECK(IsPassthrough(mode, PacingFallbackReason::Passthrough));
-                CHECK(IsPassthrough(arm, PacingFallbackReason::Passthrough));
-                CHECK(SameDecision(mode, arm));
-                ++tally.passthrough_equal;
+                ++passthrough;
             } else if (row.idle) {
-                // Named difference (idle): the arm paces the idle cap at the marker or Present.
+                // Named difference 1: an idle cap passes through with the mode's own reason.
                 CHECK(IsPassthrough(mode, PacingFallbackReason::DriverLimiterUnavailable));
-                CHECK(arm.mode == PacingTimingMode::Idle && arm.reason == PacingFallbackReason::IdleCap);
-                CHECK(!SameDecision(mode, arm));
-                ++tally.named_idle;
+                ++named_idle;
             } else if (!eligible) {
-                // Named difference (driver's limiter cannot apply): the arm falls back to pacing at the marker (or
-                // Present); the mode restores the game's behaviour with its own reason.
+                // Named difference 3: the driver's limiter cannot apply: the game's behaviour with its own reason.
                 CHECK(IsPassthrough(mode, PacingFallbackReason::DriverLimiterUnavailable));
-                CHECK(arm.mode == (row.vrr ? PacingTimingMode::Vrr : PacingTimingMode::Fixed));
-                CHECK(arm.placement == (row.route == PacingRoute::PresentBased ? PacingSourcePlacement::Present
-                                                                               : PacingSourcePlacement::Marker));
-                CHECK(!SameDecision(mode, arm));
-                ++tally.named_unavailable;
+                ++named_unavailable;
             } else {
                 CHECK(mode.placement == PacingSourcePlacement::DriverLimiter);
                 CHECK(mode.mode == (row.vrr ? PacingTimingMode::Vrr : PacingTimingMode::Fixed));
                 CHECK(mode.rung == PacingRung::SourceOnly && mode.reason == PacingFallbackReason::Override);
-                CHECK(SameDecision(mode, arm));
-                ++tally.equal;
-                ++tally.driver_limiter;
+                ++limited;
             }
         });
-        CHECK(tally.equal > 0 && tally.passthrough_equal > 0 && tally.named_idle > 0 && tally.named_unavailable > 0);
-        CHECK(tally.driver_limiter == tally.equal);
+        CHECK(passthrough > 0 && named_idle > 0 && named_unavailable > 0 && limited > 0);
     }
 
-    // The mode takes the ownership from the key: the derived `unified` is false in every test mode and follows the
-    // key, 64-bit and no test mode otherwise; an out-of-range mode is off.
+    // Nothing in the resolved state can select a planning path for the driver limiter placement: whenever the
+    // placement is the driver limiter, the rung is source only with reason override, in every capability and runtime
+    // state and with every other owner state; only the test mode driver_limiter ever resolves that placement.
+    void TestDriverLimiterNeverPlans()
+    {
+        int limited_rows = 0;
+        for (const PacingTestMode test_mode : { PacingTestMode::Off, PacingTestMode::ReflexOnly,
+                 PacingTestMode::DriverLimiter }) {
+            ForEachRow([&](const Row& row) {
+                PacingRuntimeState runtime = Runtime(row);
+                for (int overloaded = 0; overloaded < 2; ++overloaded) {
+                    runtime.hold_overloaded = overloaded != 0;
+                    runtime.gpu_queue_wait_off = overloaded != 0;
+                    const PacingPipelineSnapshot result = PacingPipeline_Resolve(ModeConfig(test_mode),
+                        Capabilities(row.route, row.x64, row.qualified), runtime);
+                    if (result.placement != PacingSourcePlacement::DriverLimiter) continue;
+                    CHECK(test_mode == PacingTestMode::DriverLimiter);
+                    CHECK(result.rung == PacingRung::SourceOnly && result.auto_rung == PacingRung::SourceOnly);
+                    CHECK(result.reason == PacingFallbackReason::Override);
+                    ++limited_rows;
+                }
+            });
+        }
+        CHECK(limited_rows > 0);
+    }
+
+    // The mode takes the ownership: the derived `unified` is false in every test mode and true on 64-bit with no test
+    // mode, whatever the caller passes in `unified`; an out-of-range mode is off.
     void TestOwnershipIsDerivedFromTheEffectiveMode()
     {
-        PacingPipelineConfig config = UnifiedKeyConfig();
+        PacingPipelineConfig config{};
         const bool is64 = sizeof(void*) == 8;
-        CHECK(PacingPipeline_ClampConfig(config).unified_pacer == is64);
+        CHECK(PacingPipeline_ClampConfig(config).unified == is64);
+        config.unified = !is64; // an input value changes nothing
+        CHECK(PacingPipeline_ClampConfig(config).unified == is64);
         config.test_mode = PacingTestMode::ReflexOnly;
-        CHECK(!PacingPipeline_ClampConfig(config).unified_pacer);
+        config.unified = true;
+        CHECK(!PacingPipeline_ClampConfig(config).unified);
         config.test_mode = PacingTestMode::DriverLimiter;
-        CHECK(!PacingPipeline_ClampConfig(config).unified_pacer);
+        CHECK(!PacingPipeline_ClampConfig(config).unified);
         config.test_mode = static_cast<PacingTestMode>(9);
         CHECK(PacingPipeline_ClampConfig(config).test_mode == PacingTestMode::Off);
-        CHECK(PacingPipeline_ClampConfig(config).unified_pacer == is64);
-        config.test_mode = PacingTestMode::Off;
-        config.unified_pacer = false;
-        CHECK(!PacingPipeline_ClampConfig(config).unified_pacer); // the key off stays off
+        CHECK(PacingPipeline_ClampConfig(config).unified == is64);
 
-        // The published state is the clamped one: the readers of the key see the derived owner.
-        config = ReflexOnlyConfig();
+        // The published state is the clamped one: the readers see the derived owner.
+        config = ModeConfig(PacingTestMode::ReflexOnly);
         PacingPipeline_SetConfig(config);
-        CHECK(!PacingPipeline_UnifiedPacerKey() && PacingPipeline_TestMode() == PacingTestMode::ReflexOnly);
+        CHECK(!PacingPipeline_Unified() && PacingPipeline_TestMode() == PacingTestMode::ReflexOnly);
         CHECK(PacingPipeline_GetConfig().test_mode == PacingTestMode::ReflexOnly);
-        CHECK(!PacingPipeline_GetConfig().unified_pacer);
+        CHECK(!PacingPipeline_GetConfig().unified);
         config.test_mode = PacingTestMode::Off;
         PacingPipeline_SetConfig(config);
-        CHECK(PacingPipeline_UnifiedPacerKey() == is64 && PacingPipeline_TestMode() == PacingTestMode::Off);
+        CHECK(PacingPipeline_Unified() == is64 && PacingPipeline_TestMode() == PacingTestMode::Off);
         PacingPipeline_SetConfig(PacingPipelineConfig{});
 
         // The developer_settings gate: the saved value counts only with it.
@@ -298,17 +290,17 @@ namespace
         CHECK(static_cast<int>(PacingFallbackReason::DriverLimiterUnavailable) == 14);
     }
 
-    // ── The Sleep-policy selection of each mode against its arm ──
+    // ── The Sleep policy of each mode ──
 
-    UnifiedSleepModeInputs SleepInputs(bool key, bool bypass, bool bypass_off, bool driver_off, uint32_t limiter_us,
-        uint32_t game_us, bool dmfg)
+    // The inputs the hooks build: the removed low latency switches are constants (off).
+    UnifiedSleepModeInputs SleepInputs(bool key, bool bypass, uint32_t limiter_us, uint32_t game_us, bool dmfg)
     {
         UnifiedSleepModeInputs inputs{};
         inputs.key = key;
         inputs.dmfg = dmfg;
         inputs.bypass = bypass;
-        inputs.bypass_low_latency_off = bypass_off;
-        inputs.driver_low_latency_off = driver_off;
+        inputs.bypass_low_latency_off = kPacingBypassLowLatencyOff;
+        inputs.driver_low_latency_off = kPacingDriverLowLatencyOff;
         inputs.limiter_interval_us = limiter_us;
         inputs.game_interval_us = game_us;
         inputs.publication = 7;
@@ -316,57 +308,76 @@ namespace
         return inputs;
     }
 
-    void TestSleepPolicyEqualsItsArm()
+    void TestSleepPolicyOfEachMode()
     {
+        static_assert(!kPacingBypassLowLatencyOff && !kPacingDriverLowLatencyOff, "the low latency switches are off");
+        const bool is64 = sizeof(void*) == 8;
         int rows = 0;
-        for (int configured = 0; configured < 2; ++configured)
-        for (const int saved_cap : { 0, 60 })
-        for (int paced = 0; paced < 2; ++paced)
-        for (int bypass_off = 0; bypass_off < 2; ++bypass_off)
-        for (int driver_off = 0; driver_off < 2; ++driver_off)
-        for (const uint32_t limiter_us : { 0u, 8333u })
-        for (const uint32_t game_us : { 0u, 16667u })
-        for (int dmfg = 0; dmfg < 2; ++dmfg) {
-            // The mode's bypass is the effective one (off in a test mode); the cap is the saved one.
-            const bool reflex_mode_bypass = NvAPI_ShouldBypassSleep(
-                PacingPipeline_EffectiveSleepBypass(configured != 0, PacingTestMode::ReflexOnly), saved_cap, paced != 0);
-            const bool limiter_mode_bypass = NvAPI_ShouldBypassSleep(
-                PacingPipeline_EffectiveSleepBypass(configured != 0, PacingTestMode::DriverLimiter), saved_cap, paced != 0);
-            CHECK(!reflex_mode_bypass && !limiter_mode_bypass);
-            // The key the hooks read is the derived owner: false in a test mode.
-            PacingPipelineConfig reflex = ReflexOnlyConfig();
-            PacingPipelineConfig limiter = DriverLimiterConfig();
-            const bool reflex_key = PacingPipeline_ClampConfig(reflex).unified_pacer;
-            const bool limiter_key = PacingPipeline_ClampConfig(limiter).unified_pacer;
-            CHECK(!reflex_key && !limiter_key);
-
-            // reflex_only: no placement, so no limiter interval; its arm (bypass on, cap 0) bypasses nothing.
-            const UnifiedSleepModeTuple reflex_tuple = UnifiedPacer_SleepModeDesired(SleepInputs(
-                reflex_key, reflex_mode_bypass, bypass_off != 0, driver_off != 0, 0, game_us, dmfg != 0));
-            const UnifiedSleepModeTuple reflex_arm = UnifiedPacer_SleepModeDesired(SleepInputs(
-                false, NvAPI_ShouldBypassSleep(true, 0, paced != 0), bypass_off != 0, driver_off != 0, 0, game_us, dmfg != 0));
-            CHECK(reflex_tuple == reflex_arm);
-
-            // driver_limiter: the arm has the bypass off and the same cap, limiter interval and game parameters.
-            const UnifiedSleepModeTuple limiter_tuple = UnifiedPacer_SleepModeDesired(SleepInputs(
-                limiter_key, limiter_mode_bypass, bypass_off != 0, driver_off != 0, limiter_us, game_us, dmfg != 0));
-            const UnifiedSleepModeTuple limiter_arm = UnifiedPacer_SleepModeDesired(SleepInputs(
-                false, NvAPI_ShouldBypassSleep(false, saved_cap, paced != 0), bypass_off != 0, driver_off != 0, limiter_us,
-                game_us, dmfg != 0));
-            CHECK(limiter_tuple == limiter_arm);
-            if (limiter_us != 0) CHECK(limiter_tuple.owner == UnifiedSleepOwner::Limiter && limiter_tuple.interval_us == limiter_us);
-            ++rows;
+        for (const PacingTestMode mode : { PacingTestMode::Off, PacingTestMode::ReflexOnly,
+                 PacingTestMode::DriverLimiter }) {
+            PacingPipeline_SetConfig(ModeConfig(mode));
+            // The bypass the hooks apply: ReLimiter's own (test mode Off) only; a test mode never skips the driver's
+            // Sleep, with the cap saved or not and the source paced or not.
+            CHECK(PacingPipeline_SleepBypass() == (mode == PacingTestMode::Off));
+            const bool key = PacingPipeline_Unified();
+            CHECK(key == (is64 && mode == PacingTestMode::Off));
+            for (const int saved_cap : { 0, 60 })
+            for (int paced = 0; paced < 2; ++paced)
+            for (const uint32_t limiter_us : { 0u, 8333u })
+            for (const uint32_t game_us : { 0u, 16667u })
+            for (int dmfg = 0; dmfg < 2; ++dmfg) {
+                const bool bypass = NvAPI_ShouldBypassSleep(PacingPipeline_SleepBypass(), saved_cap, paced != 0);
+                const UnifiedSleepModeTuple tuple = UnifiedPacer_SleepModeDesired(
+                    SleepInputs(key, bypass, limiter_us, game_us, dmfg != 0));
+                if (mode == PacingTestMode::ReflexOnly) {
+                    // No placement, so no limiter interval: the game's own Sleep mode reaches the driver.
+                    CHECK(!bypass);
+                    const UnifiedSleepModeTuple game = UnifiedPacer_SleepModeDesired(
+                        SleepInputs(false, false, 0, game_us, dmfg != 0));
+                    CHECK(game.owner == UnifiedSleepOwner::Game && !game.low_latency_off && game.interval_us == game_us);
+                    CHECK(UnifiedPacer_SleepModeDesired(SleepInputs(key, bypass, 0, game_us, dmfg != 0)) == game);
+                } else if (mode == PacingTestMode::DriverLimiter) {
+                    CHECK(!bypass);
+                    if (limiter_us != 0) {
+                        CHECK(tuple.owner == UnifiedSleepOwner::Limiter && tuple.interval_us == limiter_us);
+                        CHECK(!tuple.low_latency_off);
+                    } else {
+                        CHECK(tuple.owner == UnifiedSleepOwner::Game && tuple.interval_us == game_us);
+                    }
+                } else if (is64) {
+                    // The unified owner: the game's own tuple in dynamic frame generation, else ReLimiter's.
+                    if (dmfg != 0) {
+                        CHECK(tuple.owner == UnifiedSleepOwner::Game && tuple.interval_us == game_us);
+                    } else {
+                        CHECK(tuple.owner == UnifiedSleepOwner::Unified && tuple.low_latency_off && tuple.interval_us == 0);
+                    }
+                }
+                ++rows;
+            }
         }
-        CHECK(rows == 2 * 2 * 2 * 2 * 2 * 2 * 2 * 2);
-        // Test mode off keeps the setting.
-        for (int configured = 0; configured < 2; ++configured)
-            CHECK(PacingPipeline_EffectiveSleepBypass(configured != 0, PacingTestMode::Off) == (configured != 0));
+        PacingPipeline_SetConfig(PacingPipelineConfig{});
+        CHECK(rows == 3 * 2 * 2 * 2 * 2 * 2);
+    }
+
+    // The report-feedback fallback interval: reflex_only reads no cap (the saved cap is kept, its frames are uncapped
+    // pass-through), so a saved cap of 120 gives it the uncapped fallback, not an 8.33 ms interval that would reject a
+    // valid 30 ms report.
+    void TestReportFeedbackFallback()
+    {
+        constexpr double kUncapped = 16666.667;
+        for (const int cap : { 0, 30, 60, 120, 240 }) {
+            CHECK(PacingPipeline_ReportFeedbackFallbackUs(PacingTestMode::ReflexOnly, cap) == kUncapped);
+            const double capped = cap > 0 ? 1000000.0 / cap : kUncapped;
+            CHECK(PacingPipeline_ReportFeedbackFallbackUs(PacingTestMode::Off, cap) == capped);
+            CHECK(PacingPipeline_ReportFeedbackFallbackUs(PacingTestMode::DriverLimiter, cap) == capped);
+        }
+        CHECK(PacingPipeline_ReportFeedbackFallbackUs(PacingTestMode::Off, 120) < 9000.0);
+        CHECK(PacingPipeline_ReportFeedbackFallbackUs(PacingTestMode::ReflexOnly, 120) * 1.5 > 30000.0 * 0.8);
     }
 
     // ── The decision table: (architecture policy x test mode x route x timing mode) ──
     // One line per row: the resolved mode, placement, rung, auto rung and reason. The capabilities are qualified, the
-    // game calls the Reflex Sleep and the driver's limiter is available; the shipped default of the old key is on. The
-    // table of a build is pinned below; the removal of the old keys leaves it unchanged.
+    // game calls the Reflex Sleep and the driver's limiter is available. The table of a build is pinned below.
 
     std::string DecisionTable()
     {
@@ -382,8 +393,7 @@ namespace
         for (const auto& mode : kModes)
         for (const PacingRoute route : kRoutes)
         for (const Timing& timing : kTimings) {
-            PacingPipelineConfig config = UnifiedKeyConfig();
-            config.test_mode = mode.mode;
+            PacingPipelineConfig config = ModeConfig(mode.mode);
             PacingRuntimeState runtime{};
             runtime.swapchain_valid = true;
             runtime.uncapped = timing.uncapped;
@@ -411,11 +421,13 @@ int main(int argc, char** argv)
         std::fputs(DecisionTable().c_str(), stdout);
         return 0;
     }
-    TestReflexOnlyEqualsItsArm();
-    TestDriverLimiterEqualsItsArm();
+    TestReflexOnlyPassesThrough();
+    TestDriverLimiterDecision();
+    TestDriverLimiterNeverPlans();
     TestOwnershipIsDerivedFromTheEffectiveMode();
     TestTextRoundTrip();
-    TestSleepPolicyEqualsItsArm();
+    TestSleepPolicyOfEachMode();
+    TestReportFeedbackFallback();
     TestDecisionTableIsPinned();
     if (s_failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", s_failures);
@@ -427,7 +439,10 @@ int main(int argc, char** argv)
 
 namespace
 {
-    // The table of this build's architecture (the 32-bit build clamps the key off).
+    // The table of this build's architecture (the 32-bit build derives no unified owner). The rows with x64=0 (the
+    // capability, not the build) and a marker route (1, 2) are pass-through because marker routes exist only in a
+    // 64-bit process: no route resolves there, so for those rows mode off, driver_limiter idle/vrr/fixed resolve
+    // pass-through with reason passthrough. Every other row is unchanged from the table the old keys produced.
     const char* const kPinnedTable =
 #ifdef _WIN64
         "x64=0 off route=0 uncapped -> off none source_only source_only passthrough\n"
@@ -435,13 +450,13 @@ namespace
         "x64=0 off route=0 vrr -> off none source_only source_only passthrough\n"
         "x64=0 off route=0 fixed -> off none source_only source_only passthrough\n"
         "x64=0 off route=1 uncapped -> off none source_only source_only passthrough\n"
-        "x64=0 off route=1 idle -> idle unified source_only source_only idle_cap\n"
-        "x64=0 off route=1 vrr -> vrr unified marker_hold marker_hold architecture\n"
-        "x64=0 off route=1 fixed -> fixed unified marker_hold marker_hold architecture\n"
+        "x64=0 off route=1 idle -> off none source_only source_only passthrough\n"
+        "x64=0 off route=1 vrr -> off none source_only source_only passthrough\n"
+        "x64=0 off route=1 fixed -> off none source_only source_only passthrough\n"
         "x64=0 off route=2 uncapped -> off none source_only source_only passthrough\n"
-        "x64=0 off route=2 idle -> idle unified source_only source_only idle_cap\n"
-        "x64=0 off route=2 vrr -> vrr unified marker_hold marker_hold architecture\n"
-        "x64=0 off route=2 fixed -> fixed unified marker_hold marker_hold architecture\n"
+        "x64=0 off route=2 idle -> off none source_only source_only passthrough\n"
+        "x64=0 off route=2 vrr -> off none source_only source_only passthrough\n"
+        "x64=0 off route=2 fixed -> off none source_only source_only passthrough\n"
         "x64=0 off route=3 uncapped -> off none source_only source_only passthrough\n"
         "x64=0 off route=3 idle -> idle present source_only source_only idle_cap\n"
         "x64=0 off route=3 vrr -> vrr present source_only source_only present_route\n"
@@ -467,13 +482,13 @@ namespace
         "x64=0 driver_limiter route=0 vrr -> off none source_only source_only passthrough\n"
         "x64=0 driver_limiter route=0 fixed -> off none source_only source_only passthrough\n"
         "x64=0 driver_limiter route=1 uncapped -> off none source_only source_only passthrough\n"
-        "x64=0 driver_limiter route=1 idle -> off none source_only source_only driver_limiter_unavailable\n"
-        "x64=0 driver_limiter route=1 vrr -> off none source_only source_only driver_limiter_unavailable\n"
-        "x64=0 driver_limiter route=1 fixed -> off none source_only source_only driver_limiter_unavailable\n"
+        "x64=0 driver_limiter route=1 idle -> off none source_only source_only passthrough\n"
+        "x64=0 driver_limiter route=1 vrr -> off none source_only source_only passthrough\n"
+        "x64=0 driver_limiter route=1 fixed -> off none source_only source_only passthrough\n"
         "x64=0 driver_limiter route=2 uncapped -> off none source_only source_only passthrough\n"
-        "x64=0 driver_limiter route=2 idle -> off none source_only source_only driver_limiter_unavailable\n"
-        "x64=0 driver_limiter route=2 vrr -> off none source_only source_only driver_limiter_unavailable\n"
-        "x64=0 driver_limiter route=2 fixed -> off none source_only source_only driver_limiter_unavailable\n"
+        "x64=0 driver_limiter route=2 idle -> off none source_only source_only passthrough\n"
+        "x64=0 driver_limiter route=2 vrr -> off none source_only source_only passthrough\n"
+        "x64=0 driver_limiter route=2 fixed -> off none source_only source_only passthrough\n"
         "x64=0 driver_limiter route=3 uncapped -> off none source_only source_only passthrough\n"
         "x64=0 driver_limiter route=3 idle -> off none source_only source_only driver_limiter_unavailable\n"
         "x64=0 driver_limiter route=3 vrr -> off none source_only source_only driver_limiter_unavailable\n"
@@ -532,13 +547,13 @@ namespace
         "x64=0 off route=0 vrr -> off none source_only source_only passthrough\n"
         "x64=0 off route=0 fixed -> off none source_only source_only passthrough\n"
         "x64=0 off route=1 uncapped -> off none source_only source_only passthrough\n"
-        "x64=0 off route=1 idle -> idle marker source_only source_only idle_cap\n"
-        "x64=0 off route=1 vrr -> vrr pre_sleep marker_hold marker_hold architecture\n"
-        "x64=0 off route=1 fixed -> fixed pre_sleep marker_hold marker_hold architecture\n"
+        "x64=0 off route=1 idle -> off none source_only source_only passthrough\n"
+        "x64=0 off route=1 vrr -> off none source_only source_only passthrough\n"
+        "x64=0 off route=1 fixed -> off none source_only source_only passthrough\n"
         "x64=0 off route=2 uncapped -> off none source_only source_only passthrough\n"
-        "x64=0 off route=2 idle -> idle marker source_only source_only idle_cap\n"
-        "x64=0 off route=2 vrr -> vrr pre_sleep marker_hold marker_hold architecture\n"
-        "x64=0 off route=2 fixed -> fixed pre_sleep marker_hold marker_hold architecture\n"
+        "x64=0 off route=2 idle -> off none source_only source_only passthrough\n"
+        "x64=0 off route=2 vrr -> off none source_only source_only passthrough\n"
+        "x64=0 off route=2 fixed -> off none source_only source_only passthrough\n"
         "x64=0 off route=3 uncapped -> off none source_only source_only passthrough\n"
         "x64=0 off route=3 idle -> idle present source_only source_only idle_cap\n"
         "x64=0 off route=3 vrr -> vrr present source_only source_only present_route\n"
@@ -564,13 +579,13 @@ namespace
         "x64=0 driver_limiter route=0 vrr -> off none source_only source_only passthrough\n"
         "x64=0 driver_limiter route=0 fixed -> off none source_only source_only passthrough\n"
         "x64=0 driver_limiter route=1 uncapped -> off none source_only source_only passthrough\n"
-        "x64=0 driver_limiter route=1 idle -> off none source_only source_only driver_limiter_unavailable\n"
-        "x64=0 driver_limiter route=1 vrr -> off none source_only source_only driver_limiter_unavailable\n"
-        "x64=0 driver_limiter route=1 fixed -> off none source_only source_only driver_limiter_unavailable\n"
+        "x64=0 driver_limiter route=1 idle -> off none source_only source_only passthrough\n"
+        "x64=0 driver_limiter route=1 vrr -> off none source_only source_only passthrough\n"
+        "x64=0 driver_limiter route=1 fixed -> off none source_only source_only passthrough\n"
         "x64=0 driver_limiter route=2 uncapped -> off none source_only source_only passthrough\n"
-        "x64=0 driver_limiter route=2 idle -> off none source_only source_only driver_limiter_unavailable\n"
-        "x64=0 driver_limiter route=2 vrr -> off none source_only source_only driver_limiter_unavailable\n"
-        "x64=0 driver_limiter route=2 fixed -> off none source_only source_only driver_limiter_unavailable\n"
+        "x64=0 driver_limiter route=2 idle -> off none source_only source_only passthrough\n"
+        "x64=0 driver_limiter route=2 vrr -> off none source_only source_only passthrough\n"
+        "x64=0 driver_limiter route=2 fixed -> off none source_only source_only passthrough\n"
         "x64=0 driver_limiter route=3 uncapped -> off none source_only source_only passthrough\n"
         "x64=0 driver_limiter route=3 idle -> off none source_only source_only driver_limiter_unavailable\n"
         "x64=0 driver_limiter route=3 vrr -> off none source_only source_only driver_limiter_unavailable\n"

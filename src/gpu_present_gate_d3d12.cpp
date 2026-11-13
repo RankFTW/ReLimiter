@@ -424,7 +424,7 @@ bool RungResolved(PacingRung rung) noexcept {return PacingPipeline_Read().rung==
 // Developer presenter probe: on, and frame generation presenting its own
 // frames is what the resolver reports (never the metered worker-local route).
 bool PresenterProbeActive() noexcept {
-    return g_fg_presenter_probe_us.load(std::memory_order_relaxed)>0 &&
+    return kPacingFgPresenterProbeUs>0 &&
         PacingPipeline_Read().reason==PacingFallbackReason::FgRouteUnsupported;
 }
 bool Current(const Ticket& ticket,const char* stage="worker_current") noexcept {
@@ -573,7 +573,7 @@ bool Idle() noexcept;
 // its readiness, where it actually passed (cadence_grid.h, output tracker).
 void DrainFgReadback(Queue& queue,int64_t* next,bool before_signal) noexcept {
     if(!queue.fg_ready.load(std::memory_order_acquire))return;
-    const bool late_spacing=PacingPipeline_GetConfig().fg_late_spacing;
+    const bool late_spacing=kPacingFgLateSpacing;
     for(size_t pass=0;pass<kTicketsPerQueue;++pass) {
         FgMeasurement* oldest=nullptr;
         bool preparing=false;
@@ -631,7 +631,7 @@ void FloorAfterLatePass(Queue& queue,Ticket& ticket,int64_t* next) noexcept {
     DrainFgReadback(queue,next,true);
     CadenceGridSnapshot snapshot;
     int64_t target=0;
-    const bool key=PacingPipeline_UnifiedPacerKey();
+    const bool key=PacingPipeline_Unified();
     if(!g_cadence_grid_publication.Read(&snapshot) ||
         !CadenceGrid_ResolveOutputTarget(snapshot,generation,index,g_cadence_output_tracker,&target,nullptr,
             ticket.fg_divisor,key,key?ticket.hold_advance_us:0.0) ||
@@ -689,7 +689,7 @@ int64_t Service() noexcept {
                 // fg_late_spacing: the render-thread check at T(n), then the
                 // late-pass floor when the (possibly moved) Signal is due.
                 const bool spacing=!ticket.signalled && current && ticket.fg && ticket.floor_base_qpc>0 &&
-                    PacingPipeline_GetConfig().fg_late_spacing;
+                    kPacingFgLateSpacing;
                 if(spacing && !ticket.floor_checked && now>=ticket.floor_base_qpc)CheckRenderThread(ticket,now);
                 if(spacing && !ticket.floor_blocked && now>=ticket.trace.target_qpc)FloorAfterLatePass(queue,ticket,&next);
                 if(!ticket.signalled && (!current || now>=ticket.trace.target_qpc)) {
@@ -1090,7 +1090,7 @@ OutputDecision Decide(const PacingFramePlan& plan,int64_t now,bool displayed_sla
     OutputDecision decision;
     CadenceGridSnapshot snapshot;
     bool floored=false;
-    const bool key=PacingPipeline_UnifiedPacerKey();
+    const bool key=PacingPipeline_Unified();
     if(!g_cadence_grid_publication.Read(&snapshot) ||
         !CadenceGrid_ResolveOutputTarget(snapshot,plan.key.controller_generation,plan.grid_index,
             g_cadence_output_tracker,&decision.target,&floored,displayed_slack?plan.fg_divisor:1.0,
@@ -1388,7 +1388,7 @@ GpuPresentExecution GpuPresent_Execute(NativeGateCall* native,GpuReadinessCall* 
 // operations.
 GpuPresentExecution GpuPresent_ExecutePresenterProbe(PresentTimelineSpan* span) noexcept {
     using namespace gpu_present;
-    const int hold_us=g_fg_presenter_probe_us.load(std::memory_order_relaxed);
+    const int hold_us=kPacingFgPresenterProbeUs;
     if(hold_us<=0 || !span || (span->present_flags&9u) || frequency<=0)return GpuPresentExecution::Fallback;
     const auto begin=Qpc();
     if(((begin/(4*frequency))&1) || !PresenterProbeActive())return GpuPresentExecution::Fallback;
@@ -1527,7 +1527,7 @@ bool GpuPresent_BeginFgInput(uint64_t native,const GpuPresentFgInput& input) noe
     }
     fg_pending_queue=queue;fg_pending_measurement=measurement;fg_pending_transaction=input.transaction;
     Leave(); // pin remains held through the original input callback
-    const bool late_spacing=PacingPipeline_GetConfig().fg_late_spacing;
+    const bool late_spacing=kPacingFgLateSpacing;
     const auto decision=Decide(plan,Qpc(),late_spacing);
     ApplyDecision(decision,&trace);
     auto outcome=decision.status;

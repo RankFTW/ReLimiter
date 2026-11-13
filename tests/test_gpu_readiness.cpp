@@ -182,6 +182,13 @@ void TestBounds() {
 #ifdef _WIN64
 // Include actual runtime control flow. Only driver and host boundaries are
 // faked; no real GPU, ReShade lifecycle, or queue/frame attribution is proved.
+// gpu_start_probe is a constant of the production code (kPacingGpuStartProbe = false), not a setting. The probe's code is
+// still compiled and the tests below drive it, so the seam of this test replaces the constant, in the included
+// source only, by a flag the test sets: the setting that used to be g_gpu_start_probe, with its old default (off).
+#include "pacing_resolver.h"
+#include <atomic>
+std::atomic<bool> g_gpu_start_probe{false};
+#define kPacingGpuStartProbe (g_gpu_start_probe.load(std::memory_order_relaxed))
 #include "../src/gpu_readiness_d3d12.cpp"
 namespace {
 std::atomic<bool> s_test_stop{false};

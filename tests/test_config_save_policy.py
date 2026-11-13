@@ -37,10 +37,38 @@ RETIRED_KEYS = (
     "gpu_readiness_observer",
     # Retired with the GPU-paced cadence's GPU-set filters (no hold margin or release smoothing).
     "gpu_paced_hold_margin", "gpu_paced_release_smoothing",
+    # Legacy method key: it was migrated to output_rung once; nothing reads it any more.
+    "pacing_method",
 )
 
-# Keys read once for migration (pacing_method, adaptive_smoothing) and never saved.
-MIGRATED_KEYS = ("pacing_method", "adaptive_smoothing")
+# The pacing settings removed by config_version 6 (they are constants now), exactly the kRemovedKeys table of
+# config.cpp, plus the preset key of the removed OSD element. They are never read, stored or written.
+REMOVED_KEYS = (
+    "adaptive_cap", "adaptive_cap_percentile", "adaptive_cap_hold_room", "osd_show_adaptive_smoothing",
+    "adaptive_smoothing", "smoothing", "output_rung", "source_placement", "reflex_sleep_bypass",
+    "bypass_low_latency_off", "driver_low_latency_off", "driver_limiter_hold", "pre_sleep_precise",
+    "gpu_paced_cadence", "lead_coverage", "lead_spike_floor", "fg_late_spacing",
+    "gpu_queue_wait_render_queue", "gpu_wait_interleave_s", "stall_inject_ms", "stall_inject_period_s",
+    "marker_forward_order", "sleep_status_every_frame", "gpu_start_probe", "gpu_priority_probe",
+    "fg_presenter_probe_us", "unified_pacer", "unified_every_frame_service", "unified_queue_target_us",
+    "gpu_wait_headroom_us",
+)
+REMOVED_PRESET_KEY = "show_adaptive_smoothing"
+
+# The developer fields Config_DeveloperOverrides counts and Config_ResetDeveloperSettings resets.
+DEVELOPER_FIELDS = {
+    "gpu_present_gate_probes", "flip_metering_off", "control_file", "gpu_queue_probe", "gpu_queue_probe_source",
+    "unified_queue_margin_end", "pacing_test_mode", "unified_hold_share", "unified_queue_law",
+    "unified_queue_rank", "unified_queue_need_frames", "unified_queue_upstream", "unified_queue_allow_us",
+}
+
+# The keys Config_SetLiveKey accepts.
+LIVE_KEYS = {
+    "target_fps", "background_fps", "fg_off_fps", "pacing_preference", "gpu_present_gate_probes",
+    "gpu_queue_probe", "gpu_queue_probe_source", "unified_queue_margin_end", "unified_hold_share",
+    "pacing_test_mode", "unified_queue_law", "unified_queue_rank", "unified_queue_need_frames",
+    "unified_queue_upstream", "unified_queue_allow_us",
+}
 
 # Setters of retired pacing features. Most are deleted; NativeGate_SetMode and
 # GpuReadiness_SetEnabled remain for tests and diagnostics. Config and OSD must
@@ -53,6 +81,21 @@ RETIRED_SETTERS = (
 )
 
 RESOLVER = (ROOT / "src/pacing_resolver.h").read_text(encoding="utf-8-sig")
+
+
+def strip_comments(text):
+    """text without // and /* */ comments (string literals here never hold either)."""
+    return re.sub(r"//[^\n]*|/\*.*?\*/", "", text, flags=re.DOTALL)
+
+
+def removed_table(source):
+    """(comment block + struct + kRemovedKeys table, source without them)."""
+    match = re.search(
+        r"(?:^//[^\n]*\n)+struct RemovedKey \{.*?^static const RemovedKey kRemovedKeys\[\] = \{.*?^\};\n",
+        source, re.DOTALL | re.MULTILINE)
+    if match is None:
+        raise AssertionError("Missing the kRemovedKeys table of config.cpp")
+    return match.group(), source[:match.start()] + source[match.end():]
 
 
 def call_arguments(source, name):
@@ -132,17 +175,21 @@ class ConfigSavePolicyTests(unittest.TestCase):
     def test_serializer_preserves_existing_config_field_coverage(self):
         config = HEADER.split("struct Config {", 1)[1].split("};", 1)[0]
         fields = set(re.findall(
-            r"\b(?:bool|int|double|float|std::string|PacingSmoothing|PacingRungOverride|"
-            r"PacingMarkerForwardOrder|PacingRenderQueue|PacingLeadCoverage|PacingPlacementOverride|PacingPreference|PacingTestMode)\s+(\w+)\s*=",
+            r"\b(?:bool|int|double|float|std::string|PacingPreference|PacingTestMode)\s+(\w+)\s*=",
             config))
-        self.assertTrue({"smoothing", "adaptive_cap", "output_rung", "stall_inject_ms",
-                         "stall_inject_period_s", "gpu_present_gate_probes",
-                         "gpu_wait_headroom_us", "marker_forward_order",
-                         "gpu_queue_wait_render_queue", "lead_coverage", "source_placement"} <= fields)
+        self.assertTrue({"target_fps", "background_fps", "fg_off_fps", "pacing_preference", "pacing_test_mode",
+                         "developer_settings", "gpu_present_gate_probes", "flip_metering_off", "control_file",
+                         "gpu_queue_probe", "gpu_queue_probe_source", "unified_hold_share",
+                         "unified_queue_law", "unified_queue_rank", "unified_queue_need_frames",
+                         "unified_queue_upstream", "unified_queue_margin_end",
+                         "unified_queue_allow_us"} <= fields)
         saved = set(re.findall(r"\bconfig\.(\w+)", body("WriteConfigSnapshot")))
         # Every Config field is saved: the section clear before the startup
         # rewrite erases any key the writer omits.
         self.assertEqual(fields, saved)
+        # No removed setting is a field, and none is saved.
+        self.assertEqual(fields & set(REMOVED_KEYS), set())
+        self.assertEqual(saved & set(REMOVED_KEYS), set())
         self.assertIn('"csv_enabled", config.csv_enabled', body("WriteConfigSnapshot"))
 
     def test_osd_element_toggles_cover_load_and_every_preset_path(self):
@@ -151,6 +198,7 @@ class ConfigSavePolicyTests(unittest.TestCase):
         preset = HEADER.split("struct OSDPreset {", 1)[1].split("\n};", 1)[0]
         toggles = set(re.findall(r"\bbool\s+(show_\w+)\s*=", preset))
         self.assertIn("show_pacing_quality", toggles)
+        self.assertNotIn(REMOVED_PRESET_KEY, toggles)
         # Every Config OSD element flag has exactly one preset mirror.
         self.assertEqual({f"osd_{name}" for name in toggles},
                          set(re.findall(r"\bbool\s+(osd_show_\w+)\s*=", config)))
@@ -171,14 +219,10 @@ class ConfigSavePolicyTests(unittest.TestCase):
             with self.subTest(key=key):
                 for name, text in (("config.h", HEADER), ("config.cpp", SOURCE), ("osd.cpp", OSD)):
                     self.assertNotRegex(text, rf"\b{key}\b", name)
-        # Migrated keys are read only by the pacing loader, never stored or saved.
+        # The pacing loader reads the two kept pacing keys and nothing else: no migration reads a retired key.
         pacing_loader = body("LoadPacingPipelineKeys")
-        for key in MIGRATED_KEYS:
-            with self.subTest(key=key):
-                self.assertRegex(pacing_loader, rf'ReadINI\w+\(S, "{key}"')
-                self.assertEqual(len(re.findall(rf'"{key}"', SOURCE)), 1)
-                self.assertNotRegex(HEADER, rf"\b{key}\b")
-                self.assertNotRegex(OSD, rf"\b{key}\b")
+        self.assertEqual(re.findall(r'ReadINI\w+\(S, "(\w+)"', pacing_loader),
+                         ["pacing_preference", "pacing_test_mode"])
         self.assertIn("LoadPacingPipelineKeys(S, P);", body("LoadConfig"))
         # LoadConfig clears the whole section before its initial synchronous
         # save, so stale keys from an existing INI do not survive the rewrite.
@@ -188,55 +232,80 @@ class ConfigSavePolicyTests(unittest.TestCase):
         self.assertLess(last_read, clear)
         self.assertLess(clear, re.search(r"\bSaveConfig\(\);", load).start())
 
+    def test_removed_pacing_settings_are_constants_not_keys(self):
+        table, outside = removed_table(SOURCE)
+        # The table lists exactly the removed keys; the preset key belongs to the OSD preset sections.
+        listed = re.findall(r'\{"(\w+)", "[^"]*"\}', table)
+        self.assertEqual(len(listed), len(set(listed)))
+        self.assertEqual(set(listed), set(REMOVED_KEYS))
+        # Outside the table and the comments written for it, config.cpp (code, strings and comments) never names
+        # a removed key, and neither does config.h (Config and OSDPreset included).
+        for key in (*REMOVED_KEYS, REMOVED_PRESET_KEY):
+            with self.subTest(key=key):
+                self.assertNotRegex(outside, rf"\b{key}\b", "config.cpp outside kRemovedKeys")
+                self.assertNotRegex(strip_comments(outside), rf"\b{key}\b", "config.cpp code")
+                self.assertNotRegex(HEADER, rf"\b{key}\b", "config.h")
+        # The table is read only to name what an old INI held: by the logging helper, never by a setter.
+        for function in ("LoadConfig", "ValidateConfig", "ApplyConfig", "Config_ApplyPacingPipeline",
+                         "Config_SetLiveKey", "WriteConfigSnapshot", "PacingPipelineConfigFrom"):
+            with self.subTest(function=function):
+                self.assertNotRegex(body(function), r"\bkRemovedKeys\b")
+        self.assertRegex(body("LogRemovedKeysWithValues"), r"for \(const RemovedKey& key : kRemovedKeys\)")
+        self.assertEqual(re.findall(r"\bReadINI\w+\(", body("LogRemovedKeysWithValues")), ["ReadINIString("])
+        # The removed settings are neither written nor loaded as values: no WriteINI* call of the writer names one,
+        # and the preset readers/writers carry no preset key for them either.
+        for function in ("WriteConfigSnapshot", "WritePresetToINI", "ReadPresetFromINI", "LoadConfig"):
+            with self.subTest(function=function):
+                self.assertNotRegex(body(function),
+                                    r'"(?:%s)"' % "|".join(REMOVED_KEYS + (REMOVED_PRESET_KEY,)))
+
+    def test_config_version_six_rewrites_the_ini_and_names_what_it_drops(self):
+        self.assertIn("static constexpr int kConfigVersion = 6;", SOURCE)
+        self.assertRegex(body("WriteConfigSnapshot"), r'WriteINIInt\(S, "config_version", kConfigVersion, P\)')
+        load = body("LoadConfig")
+        # The removed settings are named once, for a non-first launch of an INI older than version 6; the version-5
+        # step (the queue defaults) stays and no earlier step does.
+        self.assertIn("if (!s_first_launch && saved_version < 6) LogRemovedKeysWithValues(S, P);", load)
+        self.assertIn("saved_version < 5", load)
+        self.assertEqual(sorted(set(re.findall(r"saved_version\s*<\s*(\d+)", load))), ["5", "6"])
+        self.assertLess(load.index("LogRemovedKeysWithValues(S, P);"), load.index("saved_version < 5"))
+        self.assertIn("settings that no longer exist were ignored", body("LogRemovedKeysWithValues"))
+        # The migrated defaults of version 5 are exactly the queue law, the probe and its source.
+        self.assertEqual(
+            sorted(set(re.findall(r"g_config\.(\w+) = kPacing\w+Default;", load))),
+            ["gpu_queue_probe", "gpu_queue_probe_source", "unified_queue_law"])
+
+    def test_live_keys_and_developer_fields_are_the_kept_ones(self):
+        live_table = SOURCE.split("constexpr Key kKeys[] = {", 1)[1].split("\n};", 1)[0]
+        live = re.findall(r'\{"(\w+)", &Set', live_table)
+        self.assertEqual(len(live), len(set(live)))
+        self.assertEqual(set(live), LIVE_KEYS)
+        self.assertEqual(set(live) & set(REMOVED_KEYS), set())
+        counted = set(re.findall(r"g_config\.(\w+) != d\.\1", body("Config_DeveloperOverrides")))
+        reset = set(re.findall(r"g_config\.(\w+) = d\.\1;", body("Config_ResetDeveloperSettings")))
+        self.assertEqual(counted, DEVELOPER_FIELDS)
+        self.assertEqual(reset, DEVELOPER_FIELDS)
+
     def test_apply_config_configures_the_pacing_pipeline(self):
         self.assertIn("Config_ApplyPacingPipeline();", body("ApplyConfig"))
         pipeline = body("Config_ApplyPacingPipeline")
         self.assertIn("PacingPipelineConfigFrom(g_config)", pipeline)
         # The key is noted for the Sleep-mode reconcile before the pipeline publishes it.
         self.assertLess(pipeline.index("NvAPI_PrepareUnifiedKey("), pipeline.index("PacingPipeline_SetConfig("))
-        # adaptive_cap (the only switch) reaches the period
-        # governor through the published pipeline configuration; the retired
-        # Frame-Time Adaptation setter is gone.
         self.assertEqual(call_arguments(pipeline, "PacingPipeline_SetConfig"), [["pipeline"]])
         self.assertEqual(call_arguments(pipeline, "SetConfig"), [])
-        # Every PacingPipelineConfig field comes from its Config field.
+        # Every PacingPipelineConfig field is a kept developer key or the derived owner and effective test mode:
+        # no field exists for a removed setting (the resolver reads its constants).
         resolver_config = RESOLVER.split("struct PacingPipelineConfig {", 1)[1].split("\n};", 1)[0]
         fields = set(re.findall(r"^\s*[\w:]+\s+(\w+)\s*=", resolver_config, re.MULTILINE))
-        self.assertEqual(fields, {"smoothing", "rung_override", "adaptive_cap",
-                                  "adaptive_cap_percentile", "gpu_probes", "gpu_wait_headroom_us",
-                                  "gpu_wait_interleave_s", "gpu_queue_wait_render_queue",
-                                  "lead_coverage", "fg_late_spacing", "gpu_paced_cadence",
-                                  "adaptive_cap_hold_room", "lead_spike_floor",
-                                  "pre_sleep_precise", "driver_limiter_hold",
-                                  "placement_override", "stall_inject_ms",
-                                  "stall_inject_period_s", "unified_pacer", "test_mode",
-                                  "unified_every_frame_service", "unified_queue_target_us",
-                                  "unified_hold_share", "unified_queue_law", "unified_queue_rank",
-                                  "unified_queue_need_frames", "gpu_queue_probe_source", "unified_queue_upstream",
-                                  "unified_queue_margin_end",
-                                  "unified_queue_allow_us"})
+        self.assertEqual(fields, {"gpu_probes", "unified", "test_mode", "unified_hold_share",
+                                  "unified_queue_law", "unified_queue_rank", "unified_queue_need_frames",
+                                  "gpu_queue_probe_source", "unified_queue_upstream",
+                                  "unified_queue_margin_end", "unified_queue_allow_us"})
+        # The derived owner and the effective test mode are set where the pipeline is applied, never copied from a key.
         mapping = dict(re.findall(r"\bpipeline\.(\w+)\s*=\s*config\.(\w+);",
                                   body("PacingPipelineConfigFrom")))
-        self.assertEqual(mapping, {"smoothing": "smoothing", "rung_override": "output_rung",
-                                   "adaptive_cap": "adaptive_cap",
-                                   "adaptive_cap_percentile": "adaptive_cap_percentile",
-                                   "placement_override": "source_placement",
-                                   "gpu_probes": "gpu_present_gate_probes",
-                                   "stall_inject_ms": "stall_inject_ms",
-                                   "stall_inject_period_s": "stall_inject_period_s",
-                                   "gpu_wait_headroom_us": "gpu_wait_headroom_us",
-                                   "gpu_wait_interleave_s": "gpu_wait_interleave_s",
-                                   "gpu_queue_wait_render_queue": "gpu_queue_wait_render_queue",
-                                   "lead_coverage": "lead_coverage",
-                                   "fg_late_spacing": "fg_late_spacing",
-                                   "gpu_paced_cadence": "gpu_paced_cadence",
-                                   "adaptive_cap_hold_room": "adaptive_cap_hold_room",
-                                   "lead_spike_floor": "lead_spike_floor",
-                                   "pre_sleep_precise": "pre_sleep_precise",
-                                   "driver_limiter_hold": "driver_limiter_hold",
-                                   "unified_pacer": "unified_pacer",
-                                   "unified_every_frame_service": "unified_every_frame_service",
-                                   "unified_queue_target_us": "unified_queue_target_us",
+        self.assertEqual(mapping, {"gpu_probes": "gpu_present_gate_probes",
                                    "unified_hold_share": "unified_hold_share",
                                    "unified_queue_law": "unified_queue_law",
                                    "unified_queue_rank": "unified_queue_rank",
@@ -245,6 +314,7 @@ class ConfigSavePolicyTests(unittest.TestCase):
                                    "unified_queue_upstream": "unified_queue_upstream",
                                    "unified_queue_margin_end": "unified_queue_margin_end",
                                    "unified_queue_allow_us": "unified_queue_allow_us"})
+        self.assertEqual(sorted(set(mapping) | {"unified", "test_mode"}), sorted(fields))
         # The OSD applies pipeline edits through the same function.
         for name, text in (("config.cpp", SOURCE), ("osd.cpp", OSD)):
             self.assertNotRegex(text, r"\bg_frame_time_adaptation\b", name)
@@ -257,16 +327,7 @@ class ConfigSavePolicyTests(unittest.TestCase):
 
     def test_pacing_keys_validate_and_save_canonical_text(self):
         loader = body("LoadPacingPipelineKeys")
-        self.assertIn("PacingSmoothing_FromText(smoothing.c_str(), &g_config.smoothing)", loader)
-        self.assertIn("PacingRungOverride_FromText(output_rung.c_str(), &g_config.output_rung)", loader)
-        self.assertRegex(loader, r'legacy_method == "marker"\s*\?\s*PacingRungOverride::Marker\s*:\s*'
-                                 r'PacingRungOverride::Auto')
-        self.assertRegex(loader, r'ReadINIBool\(\s*S, "adaptive_cap", ReadINIBool\(S, "adaptive_smoothing"')
         validate = body("ValidateConfig")
-        self.assertIn("g_config.stall_inject_ms, 0.0, kPacingStallInjectMaxMs", validate)
-        self.assertRegex(validate, r"g_config\.stall_inject_period_s,\s*kPacingStallInjectMinPeriodS,"
-                                   r"\s*kPacingStallInjectMaxPeriodS")
-        self.assertRegex(validate, r"g_config\.unified_queue_target_us,\s*0\.0,\s*kPacingUnifiedQueueTargetMaxUs")
         self.assertRegex(validate, r"g_config\.unified_hold_share,\s*0\.0,\s*kPacingUnifiedHoldShareMax")
         self.assertRegex(validate, r"g_config\.unified_queue_rank,\s*1,\s*kPacingUnifiedQueueRankMax")
         self.assertRegex(validate, r"g_config\.unified_queue_need_frames,\s*1,\s*kPacingUnifiedQueueNeedFramesMax")
@@ -275,14 +336,6 @@ class ConfigSavePolicyTests(unittest.TestCase):
         self.assertRegex(validate, r"g_config\.unified_queue_margin_end,\s*0,\s*kPacingUnifiedQueueMarginEndMax")
         self.assertRegex(validate, r"g_config\.unified_queue_allow_us,\s*0,\s*kPacingUnifiedQueueAllowMaxUs")
         writer = body("WriteConfigSnapshot")
-        self.assertIn('"smoothing", PacingSmoothing_Text(config.smoothing)', writer)
-        self.assertIn('"output_rung", PacingRungOverride_Text(config.output_rung)', writer)
-        self.assertIn('"adaptive_cap", config.adaptive_cap', writer)
-        # The forward order is validated text, saved canonically and
-        # applied to the marker hook with the rest of the pipeline.
-        self.assertIn("PacingMarkerForwardOrder_FromText(forward_order.c_str(), "
-                      "&g_config.marker_forward_order)", loader)
-        self.assertIn("PacingMarkerForwardOrder::Count", validate)
         # The pacing preference is validated text, saved canonically, and resolved once into the pipeline;
         # g_config and the INI keep the raw developer rank and share.
         self.assertIn("PacingPreference_FromText(", loader)
@@ -290,20 +343,20 @@ class ConfigSavePolicyTests(unittest.TestCase):
         self.assertIn("PacingPreference::Count", validate)
         apply = body("Config_ApplyPacingPipeline")
         # The test mode is validated text, saved canonically, gated by developer_settings where the configuration
-        # becomes the pipeline configuration, and recorded on the status line.
+        # becomes the pipeline configuration; the one derived owner and the Sleep bypass follow it from the
+        # published configuration (no separate atomic or key).
         self.assertIn("PacingTestMode_FromText(", loader)
         self.assertIn('"pacing_test_mode", PacingTestMode_Text(config.pacing_test_mode)', writer)
         self.assertIn("PacingTestMode::Count", validate)
         self.assertRegex(apply, r"pipeline\.test_mode\s*=\s*PacingPipeline_EffectiveTestMode\(\s*g_config\.pacing_test_mode,\s*g_config\.developer_settings\)")
-        self.assertIn("PacingPipeline_EffectiveSleepBypass(g_config.reflex_sleep_bypass, pipeline.test_mode)", apply)
+        self.assertIn("const bool unified = PacingPipeline_ClampConfig(pipeline).unified;", apply)
+        self.assertIn("const bool queue_law = g_config.unified_queue_law && unified;", apply)
+        self.assertRegex(apply, r"g_gpu_queue_law_feed\.store\(queue_law,")
+        self.assertNotIn("EffectiveSleepBypass", SOURCE)
+        self.assertNotIn("g_reflex_sleep_bypass", SOURCE)
         self.assertEqual(apply.count("PacingPipeline_ResolvePreference("), 1)
         self.assertRegex(apply, r"pipeline\.unified_queue_rank\s*=\s*\w+\.queue_rank;")
         self.assertRegex(apply, r"pipeline\.unified_hold_share\s*=\s*\w+\.hold_share;")
-        self.assertRegex(writer, r'"marker_forward_order",\s*'
-                                 r'PacingMarkerForwardOrder_Text\(config\.marker_forward_order\)')
-        self.assertRegex(body("Config_ApplyPacingPipeline"),
-                         r"g_marker_forward_after_wait\.store\(\s*g_config\.marker_forward_order"
-                         r" == PacingMarkerForwardOrder::AfterWait")
 
     def test_mailboxes_are_bounded_and_destination_specific(self):
         self.assertIn("std::optional<ConfigSaveSnapshot> config", SOURCE)

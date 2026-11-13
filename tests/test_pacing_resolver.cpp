@@ -1,7 +1,8 @@
 // Directly tests the production pacing pipeline resolver:
-// every rule and fallback reason with its precedence, the override step-downs,
-// the smoothing table, generation publication, capability generation tags,
-// configuration clamping and text, and untorn reads under a concurrent writer.
+// every rule and fallback reason with its precedence, the Auto rung selection per route, capability and frame
+// generation state, the constants that replaced the removed pacing settings (lead parameters, rung, placement), the
+// derived owner of pacing (`unified`) and the test modes, the Reflex driver limiter's placement invariant, generation
+// publication, capability generation tags, configuration clamping and text, and untorn reads under a concurrent writer.
 // Production wiring (scheduler owner, executors, ApplyConfig) is not covered.
 
 #include "pacing_resolver.h"
@@ -67,9 +68,29 @@ namespace
         CHECK((result).allowance_us == (allowance));                             \
     } while (false)
 
-    // The default lead coverage (99) replaces the Smoothing table's lead
-    // quantile (0.95); the allowance stays the table's.
+    // The lead's quantile is the constant kPacingLeadCoverage (Q99); the allowance (500 µs) and the render handoff
+    // quantile (0.95) are the constant kPacingSmoothing's (On) row.
     constexpr double kDefaultLeadQuantile = 0.99;
+
+    // The owner of pacing is derived (PacingPipeline_ClampConfig): the unified pacer on 64-bit, the earlier pipeline
+    // elsewhere. The earlier pipeline places a marker route that sees the game's Reflex Sleep before the Sleep
+    // (kPacingPlacementOverride) and demotes Auto hold rungs under overload; the unified pacer does neither.
+    const bool kWide = sizeof(void*) == 8;
+
+    PacingSourcePlacement SleepPlacement()
+    {
+        return kWide ? PacingSourcePlacement::Unified : PacingSourcePlacement::PreSleep;
+    }
+
+    PacingSourcePlacement IdleSleepPlacement()
+    {
+        // Only the unified pacer paces the idle cap by the Sleep; the earlier pipeline waits at the marker.
+        return kWide ? PacingSourcePlacement::Unified : PacingSourcePlacement::Marker;
+    }
+
+#define CHECK_RESULT_PLACED(result, mode, placement, rung, reason)              \
+    CheckResult((result), Expected{ PacingTimingMode::mode, (placement),          \
+        PacingRung::rung, PacingFallbackReason::reason }, __LINE__)
 
     PacingCapabilities QualifiedDx12()
     {
@@ -114,20 +135,6 @@ namespace
         return runtime;
     }
 
-    PacingPipelineConfig WithOverride(PacingRungOverride rung_override)
-    {
-        PacingPipelineConfig config{};
-        config.rung_override = rung_override;
-        return config;
-    }
-
-    PacingPipelineConfig WithSmoothing(PacingSmoothing smoothing)
-    {
-        PacingPipelineConfig config{};
-        config.smoothing = smoothing;
-        return config;
-    }
-
     PacingPipelineSnapshot Resolve(
         const PacingPipelineConfig& config,
         const PacingCapabilities& capabilities,
@@ -136,30 +143,12 @@ namespace
         return PacingPipeline_Resolve(config, capabilities, runtime);
     }
 
+    // `unified` is derived by PacingPipeline_ClampConfig, so it is not compared here; the tests that publish a
+    // configuration check it against the derivation.
     bool SameConfig(const PacingPipelineConfig& left, const PacingPipelineConfig& right)
     {
-        return left.smoothing == right.smoothing &&
-            left.rung_override == right.rung_override &&
-            left.adaptive_cap == right.adaptive_cap &&
-            left.adaptive_cap_percentile == right.adaptive_cap_percentile &&
-            left.placement_override == right.placement_override &&
-            left.gpu_probes == right.gpu_probes &&
-            left.gpu_wait_headroom_us == right.gpu_wait_headroom_us &&
-            left.gpu_wait_interleave_s == right.gpu_wait_interleave_s &&
-            left.gpu_queue_wait_render_queue == right.gpu_queue_wait_render_queue &&
-            left.lead_coverage == right.lead_coverage &&
-            left.fg_late_spacing == right.fg_late_spacing &&
-            left.gpu_paced_cadence == right.gpu_paced_cadence &&
-            left.adaptive_cap_hold_room == right.adaptive_cap_hold_room &&
-            left.lead_spike_floor == right.lead_spike_floor &&
-            left.pre_sleep_precise == right.pre_sleep_precise &&
-            left.driver_limiter_hold == right.driver_limiter_hold &&
-            left.stall_inject_ms == right.stall_inject_ms &&
-            left.stall_inject_period_s == right.stall_inject_period_s &&
-            // Win32 clamps the every-frame key false (the unified pacer is 64-bit only), whereas the
-            // initial publication and the defaults carry true: compared on 64-bit only.
-            (sizeof(void*) != 8 || left.unified_every_frame_service == right.unified_every_frame_service) &&
-            left.unified_queue_target_us == right.unified_queue_target_us &&
+        return left.gpu_probes == right.gpu_probes &&
+            left.test_mode == right.test_mode &&
             left.unified_hold_share == right.unified_hold_share &&
             // Win32 forces the law off and the probe source to 0, whereas the defaults carry on and 1:
             // compared on 64-bit only.
@@ -172,6 +161,24 @@ namespace
             left.unified_queue_allow_us == right.unified_queue_allow_us;
     }
 
+    // An Auto hold rung under overload or a not-held block (a marker route, no game Sleep): the earlier pipeline
+    // (Win32) demotes it to source only with the reason Infeasible; the unified pacer bypasses the demotion and
+    // keeps the rung with its own reason. Either way auto_rung and the lead rung stay the hold rung.
+    void CheckHoldDemotion(const PacingPipelineSnapshot& result, PacingTimingMode mode, PacingRung hold_rung,
+        PacingFallbackReason hold_reason, int line)
+    {
+        Expected expected{ mode, PacingSourcePlacement::Marker, hold_rung, hold_reason };
+        if (!kWide) expected = Expected{ mode, PacingSourcePlacement::Marker, PacingRung::SourceOnly,
+            PacingFallbackReason::Infeasible };
+        CheckResult(result, expected, line);
+        CHECK(result.auto_rung == hold_rung);
+        CHECK(PacingPipeline_LeadRung(result) == hold_rung);
+    }
+
+#define CHECK_HOLD_DEMOTION(result, mode, hold_rung, hold_reason)               \
+    CheckHoldDemotion((result), PacingTimingMode::mode, PacingRung::hold_rung,    \
+        PacingFallbackReason::hold_reason, __LINE__)
+
     // ── Initial publication (must run first) ──
 
     void TestInitialPublication()
@@ -180,6 +187,9 @@ namespace
         CHECK(initial.generation == 0);
         CHECK(PacingPipeline_SameResult(initial, PacingPipelineSnapshot{}));
         CHECK(SameConfig(PacingPipeline_GetConfig(), PacingPipelineConfig{}));
+        // Nothing derived the owner yet: the initial publication is the default configuration.
+        CHECK(!PacingPipeline_GetConfig().unified && !PacingPipeline_Unified());
+        CHECK(PacingPipeline_TestMode() == PacingTestMode::Off && PacingPipeline_SleepBypass());
         for (uint32_t index = 0; index < static_cast<uint32_t>(PacingCapability::Count); ++index) {
             const PacingCapability capability = static_cast<PacingCapability>(index);
             CHECK(!PacingPipeline_HasCapability(capability, 0));
@@ -220,21 +230,31 @@ namespace
         CHECK(result.route == PacingRoute::None);
 
         // Passthrough beats every later rule.
-        PacingPipelineConfig later_rules{};
-        later_rules.smoothing = PacingSmoothing::Off;
-        later_rules.rung_override = PacingRungOverride::Gpu;
         runtime = ActiveFg();
         runtime.uncapped = true;
         runtime.idle_cap = true;
         runtime.vrr = false;
-        CHECK_RESULT(Resolve(later_rules, PresentBased(), runtime), Off, None, SourceOnly, Passthrough);
-        CHECK_RESULT(Resolve(later_rules, QualifiedDx12(), runtime), Off, None, SourceOnly, Passthrough);
+        CHECK_RESULT(Resolve(config, PresentBased(), runtime), Off, None, SourceOnly, Passthrough);
+        CHECK_RESULT(Resolve(config, QualifiedDx12(), runtime), Off, None, SourceOnly, Passthrough);
         runtime.uncapped = false;
         runtime.swapchain_valid = false;
-        CHECK_RESULT(Resolve(later_rules, QualifiedDx12(), runtime), Off, None, SourceOnly, Passthrough);
+        CHECK_RESULT(Resolve(config, QualifiedDx12(), runtime), Off, None, SourceOnly, Passthrough);
         runtime.swapchain_valid = true;
         runtime.dmfg_passthrough = true;
-        CHECK_RESULT(Resolve(later_rules, QualifiedDx12(), runtime), Off, None, SourceOnly, Passthrough);
+        CHECK_RESULT(Resolve(config, QualifiedDx12(), runtime), Off, None, SourceOnly, Passthrough);
+
+        // Test mode reflex_only passes through whatever the cap and the timing regime say.
+        PacingPipelineConfig reflex_only{};
+        reflex_only.test_mode = PacingTestMode::ReflexOnly;
+        PacingRuntimeState idle = ActiveVrr();
+        idle.idle_cap = true;
+        PacingRuntimeState fixed = ActiveVrr();
+        fixed.vrr = false;
+        for (const PacingRuntimeState& state : { ActiveVrr(), ActiveFg(), idle, fixed }) {
+            CHECK_RESULT(Resolve(reflex_only, QualifiedDx12(), state), Off, None, SourceOnly, Passthrough);
+            CHECK_RESULT(Resolve(reflex_only, VulkanPcl(), state), Off, None, SourceOnly, Passthrough);
+            CHECK_RESULT(Resolve(reflex_only, PresentBased(), state), Off, None, SourceOnly, Passthrough);
+        }
     }
 
     // ── Rule 2: idle caps ──
@@ -251,16 +271,21 @@ namespace
         CHECK_RESULT(result, Idle, Present, SourceOnly, IdleCap);
         CHECK(result.route == PacingRoute::PresentBased);
 
-        // Idle beats smoothing off, overrides, FG and fixed refresh.
-        CHECK_RESULT(Resolve(WithSmoothing(PacingSmoothing::Off), QualifiedDx12(), runtime),
-            Idle, Marker, SourceOnly, IdleCap);
-        CHECK_RESULT(Resolve(WithOverride(PacingRungOverride::Gpu), QualifiedDx12(), runtime),
-            Idle, Marker, SourceOnly, IdleCap);
-        CHECK_RESULT(Resolve(WithOverride(PacingRungOverride::Marker), QualifiedDx12(), runtime),
-            Idle, Marker, SourceOnly, IdleCap);
+        // Idle beats FG and fixed refresh.
         runtime.fg_presenting = true;
         runtime.vrr = false;
         CHECK_RESULT(Resolve(PacingPipelineConfig{}, QualifiedDx12(), runtime), Idle, Marker, SourceOnly, IdleCap);
+
+        // While the game calls the Reflex Sleep the unified pacer paces the idle cap by the same law (placement
+        // Unified); the earlier pipeline waits at the marker. A present route keeps its placement.
+        PacingRuntimeState sleeping_idle = ActiveVrr();
+        sleeping_idle.idle_cap = true;
+        sleeping_idle.pre_sleep_available = true;
+        CHECK_RESULT_PLACED(Resolve(PacingPipelineConfig{}, QualifiedDx12(), sleeping_idle), Idle,
+            IdleSleepPlacement(), SourceOnly, IdleCap);
+        CHECK_RESULT_PLACED(Resolve(PacingPipelineConfig{}, VulkanPcl(), sleeping_idle), Idle,
+            IdleSleepPlacement(), SourceOnly, IdleCap);
+        CHECK_RESULT(Resolve(PacingPipelineConfig{}, PresentBased(), sleeping_idle), Idle, Present, SourceOnly, IdleCap);
     }
 
     // ── Rule 3: present-based route ──
@@ -276,132 +301,66 @@ namespace
         runtime.vrr = false;
         CHECK_RESULT(Resolve(PacingPipelineConfig{}, PresentBased(), runtime), Fixed, Present, SourceOnly, PresentRoute);
 
-        // Present route beats smoothing off, overrides and FG.
-        CHECK_RESULT(Resolve(WithSmoothing(PacingSmoothing::Off), PresentBased(), ActiveVrr()),
-            Vrr, Present, SourceOnly, PresentRoute);
-        CHECK_RESULT(Resolve(WithOverride(PacingRungOverride::Marker), PresentBased(), ActiveVrr()),
-            Vrr, Present, SourceOnly, PresentRoute);
-        CHECK_RESULT(Resolve(WithOverride(PacingRungOverride::Gpu), PresentBased(), ActiveFg()),
-            Vrr, Present, SourceOnly, PresentRoute);
+        // The present route beats FG.
+        CHECK_RESULT(Resolve(PacingPipelineConfig{}, PresentBased(), ActiveFg()), Vrr, Present, SourceOnly, PresentRoute);
     }
 
-    // ── Rule 4: smoothing off ──
-
-    void TestSmoothingOff()
+    // Marker routes (NvAPI markers, PCL markers) exist only in a 64-bit process: without capabilities.x64 a marker route
+    // is no route and resolves as passthrough; the present route and x64 marker routes are unaffected.
+    void TestMarkerRoutesNeedX64()
     {
-        const PacingPipelineConfig off = WithSmoothing(PacingSmoothing::Off);
-        PacingPipelineSnapshot result = Resolve(off, QualifiedDx12(), ActiveVrr());
-        CHECK_RESULT(result, Vrr, Marker, SourceOnly, SmoothingOff);
-        CHECK_LEAD(result, kDefaultLeadQuantile, 0.0);
-        CHECK_RESULT(Resolve(off, VulkanPcl(), ActiveVrr()), Vrr, Marker, SourceOnly, SmoothingOff);
+        const PacingPipelineConfig config{};
+        PacingRuntimeState idle = ActiveVrr();
+        idle.idle_cap = true;
+        PacingRuntimeState fixed = ActiveVrr();
+        fixed.vrr = false;
+        PacingRuntimeState sleeping = ActiveVrr();
+        sleeping.pre_sleep_available = true;
+        const PacingRuntimeState states[] = { ActiveVrr(), ActiveFg(), idle, fixed, sleeping };
 
-        PacingRuntimeState runtime = ActiveVrr();
-        runtime.vrr = false;
-        CHECK_RESULT(Resolve(off, QualifiedDx12(), runtime), Fixed, Marker, SourceOnly, SmoothingOff);
+        for (const PacingRoute route : { PacingRoute::NvApiMarkers, PacingRoute::PclMarkers }) {
+            PacingCapabilities capabilities = QualifiedDx12();
+            capabilities.route = route;
 
-        // Smoothing off beats overrides and FG.
-        PacingPipelineConfig off_with_override = off;
-        off_with_override.rung_override = PacingRungOverride::Gpu;
-        CHECK_RESULT(Resolve(off_with_override, QualifiedDx12(), ActiveVrr()),
-            Vrr, Marker, SourceOnly, SmoothingOff);
-        off_with_override.rung_override = PacingRungOverride::Marker;
-        CHECK_RESULT(Resolve(off_with_override, QualifiedDx12(), ActiveFg()),
-            Vrr, Marker, SourceOnly, SmoothingOff);
-        CHECK_RESULT(Resolve(off, QualifiedDx12(), ActiveFg()), Vrr, Marker, SourceOnly, SmoothingOff);
+            // x64: routed as before.
+            PacingPipelineSnapshot routed = Resolve(config, capabilities, ActiveVrr());
+            CHECK(routed.route == route);
+            CHECK(routed.mode == PacingTimingMode::Vrr && routed.placement == PacingSourcePlacement::Marker);
+            CHECK(routed.reason != PacingFallbackReason::Passthrough);
+
+            // Not x64: no route, whatever the runtime state.
+            capabilities.x64 = false;
+            for (const PacingRuntimeState& state : states) {
+                const PacingPipelineSnapshot result = Resolve(config, capabilities, state);
+                CHECK_RESULT(result, Off, None, SourceOnly, Passthrough);
+                CHECK(result.route == PacingRoute::None);
+                CHECK(result.auto_rung == PacingRung::SourceOnly);
+                CHECK_LEAD(result, kDefaultLeadQuantile, 500.0);
+            }
+        }
+
+        // x64 values of the rung selection are unchanged.
+        CHECK_RESULT(Resolve(config, QualifiedDx12(), ActiveVrr()), Vrr, Marker, GpuQueueWait, None);
+        CHECK_RESULT(Resolve(config, VulkanPcl(), ActiveVrr()), Vrr, Marker, MarkerHold, Api);
+
+        // The present route needs no x64.
+        PacingCapabilities present = PresentBased();
+        present.x64 = false;
+        PacingPipelineSnapshot present_result = Resolve(config, present, ActiveVrr());
+        CHECK_RESULT(present_result, Vrr, Present, SourceOnly, PresentRoute);
+        CHECK(present_result.route == PacingRoute::PresentBased);
+        CHECK_RESULT(Resolve(config, present, fixed), Fixed, Present, SourceOnly, PresentRoute);
+        CHECK_RESULT(Resolve(config, present, idle), Idle, Present, SourceOnly, IdleCap);
+        CHECK_RESULT(Resolve(config, present, ActiveFg()), Vrr, Present, SourceOnly, PresentRoute);
+
+        // The same under the test modes: a marker route without x64 passes through (not driver_limiter_unavailable).
+        PacingPipelineConfig limiter{};
+        limiter.test_mode = PacingTestMode::DriverLimiter;
+        PacingCapabilities no_x64 = QualifiedDx12();
+        no_x64.x64 = false;
+        CHECK_RESULT(Resolve(limiter, no_x64, sleeping), Off, None, SourceOnly, Passthrough);
     }
 
-    // ── Rule 5: developer rung override ──
-
-    void TestOverrideSourceAndMarker()
-    {
-        const PacingPipelineConfig source = WithOverride(PacingRungOverride::SourceOnly);
-        PacingPipelineSnapshot result = Resolve(source, QualifiedDx12(), ActiveVrr());
-        CHECK_RESULT(result, Vrr, Marker, SourceOnly, Override);
-        CHECK_LEAD(result, kDefaultLeadQuantile, 500.0);
-        CHECK_RESULT(Resolve(source, QualifiedDx12(), ActiveFg()), Vrr, Marker, SourceOnly, Override);
-
-        const PacingPipelineConfig marker = WithOverride(PacingRungOverride::Marker);
-        CHECK_RESULT(Resolve(marker, QualifiedDx12(), ActiveVrr()), Vrr, Marker, MarkerHold, Override);
-        CHECK_RESULT(Resolve(marker, VulkanPcl(), ActiveVrr()), Vrr, Marker, MarkerHold, Override);
-        // An explicit marker override holds under FG too.
-        CHECK_RESULT(Resolve(marker, QualifiedDx12(), ActiveFg()), Vrr, Marker, MarkerHold, Override);
-        PacingCapabilities win32 = QualifiedDx12();
-        win32.x64 = false;
-        CHECK_RESULT(Resolve(marker, win32, ActiveVrr()), Vrr, Marker, MarkerHold, Override);
-    }
-
-    void TestOverrideNative()
-    {
-        const PacingPipelineConfig native = WithOverride(PacingRungOverride::Native);
-        CHECK_RESULT(Resolve(native, QualifiedDx12(), ActiveVrr()), Vrr, Marker, NativeHold, Override);
-
-        PacingRuntimeState runtime = ActiveVrr();
-        runtime.vrr = false;
-        CHECK_RESULT(Resolve(native, QualifiedDx12(), runtime), Fixed, Marker, NativeHold, Override);
-
-        PacingCapabilities capabilities = QualifiedDx12();
-        capabilities.native_route_qualified = false;
-        CHECK_RESULT(Resolve(native, capabilities, ActiveVrr()), Vrr, Marker, MarkerHold, Override);
-
-        // The native route exists only on NvAPI markers.
-        capabilities = VulkanPcl();
-        capabilities.native_route_qualified = true;
-        CHECK_RESULT(Resolve(native, capabilities, ActiveVrr()), Vrr, Marker, MarkerHold, Override);
-    }
-
-    void TestOverrideGpu()
-    {
-        const PacingPipelineConfig gpu = WithOverride(PacingRungOverride::Gpu);
-        CHECK_RESULT(Resolve(gpu, QualifiedDx12(), ActiveVrr()), Vrr, Marker, GpuQueueWait, Override);
-
-        // Each rule-7 requirement steps H3 down to H1.
-        PacingCapabilities capabilities = QualifiedDx12();
-        capabilities.x64 = false;
-        CHECK_RESULT(Resolve(gpu, capabilities, ActiveVrr()), Vrr, Marker, MarkerHold, Override);
-        capabilities = QualifiedDx12();
-        capabilities.api = PacingApi::DX11;
-        CHECK_RESULT(Resolve(gpu, capabilities, ActiveVrr()), Vrr, Marker, MarkerHold, Override);
-        capabilities = QualifiedDx12();
-        capabilities.native_route_qualified = false;
-        CHECK_RESULT(Resolve(gpu, capabilities, ActiveVrr()), Vrr, Marker, MarkerHold, Override);
-        capabilities = QualifiedDx12();
-        capabilities.gpu_queue_ready = false;
-        CHECK_RESULT(Resolve(gpu, capabilities, ActiveVrr()), Vrr, Marker, MarkerHold, Override);
-        PacingRuntimeState runtime = ActiveVrr();
-        runtime.vrr = false;
-        CHECK_RESULT(Resolve(gpu, QualifiedDx12(), runtime), Fixed, Marker, MarkerHold, Override);
-        CHECK_RESULT(Resolve(gpu, VulkanPcl(), ActiveVrr()), Vrr, Marker, MarkerHold, Override);
-
-        // While FG presents, the GPU override is the FG input wait (rule-6
-        // requirements) and an unqualified one holds nothing.
-        CHECK_RESULT(Resolve(gpu, QualifiedDx12(), ActiveFg()), Vrr, Marker, FgInputWait, Override);
-        capabilities = QualifiedDx12();
-        capabilities.fg_input_route_ready = false;
-        CHECK_RESULT(Resolve(gpu, capabilities, ActiveFg()), Vrr, Marker, SourceOnly, Override);
-        capabilities = QualifiedDx12();
-        capabilities.x64 = false;
-        CHECK_RESULT(Resolve(gpu, capabilities, ActiveFg()), Vrr, Marker, SourceOnly, Override);
-        capabilities = QualifiedDx12();
-        capabilities.api = PacingApi::DX11;
-        CHECK_RESULT(Resolve(gpu, capabilities, ActiveFg()), Vrr, Marker, SourceOnly, Override);
-        CHECK_RESULT(Resolve(gpu, VulkanPcl(), ActiveFg()), Vrr, Marker, SourceOnly, Override);
-        // The FG input route needs neither VRR nor the native route.
-        capabilities = QualifiedDx12();
-        capabilities.native_route_qualified = false;
-        capabilities.gpu_queue_ready = false;
-        runtime = ActiveFg();
-        runtime.vrr = false;
-        CHECK_RESULT(Resolve(gpu, capabilities, runtime), Fixed, Marker, FgInputWait, Override);
-    }
-
-    void TestOverrideAutoAndUnknown()
-    {
-        CHECK_RESULT(Resolve(WithOverride(PacingRungOverride::Auto), QualifiedDx12(), ActiveVrr()),
-            Vrr, Marker, GpuQueueWait, None);
-        // Unknown override values clamp to auto.
-        CHECK_RESULT(Resolve(WithOverride(static_cast<PacingRungOverride>(7)), QualifiedDx12(), ActiveVrr()),
-            Vrr, Marker, GpuQueueWait, None);
-    }
 
     // ── Rule 6: frame generation ──
 
@@ -417,9 +376,11 @@ namespace
         CHECK_RESULT(Resolve(config, QualifiedDx12(), runtime), Fixed, Marker, FgInputWait, None);
 
         PacingCapabilities capabilities = QualifiedDx12();
+        // A marker route outside a 64-bit process is no route: pass-through (the Architecture blocker of the FG
+        // input wait cannot be reached through the resolver).
         capabilities.x64 = false;
         result = Resolve(config, capabilities, ActiveFg());
-        CHECK_RESULT(result, Vrr, Marker, SourceOnly, Architecture);
+        CHECK_RESULT(result, Off, None, SourceOnly, Passthrough);
         CHECK_LEAD(result, kDefaultLeadQuantile, 500.0);
         capabilities = QualifiedDx12();
         capabilities.api = PacingApi::DX11;
@@ -452,12 +413,11 @@ namespace
 
         // First failing requirement, in order.
         PacingCapabilities capabilities{};
+        capabilities.x64 = true;
         capabilities.route = PacingRoute::NvApiMarkers;
         capabilities.api = PacingApi::DX11;
         PacingRuntimeState runtime = ActiveVrr();
         runtime.vrr = false;
-        CHECK_RESULT(Resolve(config, capabilities, runtime), Fixed, Marker, MarkerHold, Architecture);
-        capabilities.x64 = true;
         CHECK_RESULT(Resolve(config, capabilities, runtime), Fixed, Marker, MarkerHold, Api);
         capabilities.api = PacingApi::DX12;
         CHECK_RESULT(Resolve(config, capabilities, runtime), Fixed, Marker, MarkerHold, FixedRefresh);
@@ -468,11 +428,11 @@ namespace
         capabilities.gpu_queue_ready = true;
         CHECK_RESULT(Resolve(config, capabilities, runtime), Vrr, Marker, GpuQueueWait, None);
 
-        // Win32: every capability ready, still no GPU rung.
+        // Win32: a marker route is no route (TestMarkerRoutesNeedX64), so there is no GPU rung either.
         capabilities = QualifiedDx12();
         capabilities.x64 = false;
         result = Resolve(config, capabilities, ActiveVrr());
-        CHECK_RESULT(result, Vrr, Marker, MarkerHold, Architecture);
+        CHECK_RESULT(result, Off, None, SourceOnly, Passthrough);
         CHECK_LEAD(result, kDefaultLeadQuantile, 500.0);
 
         // Vulkan PCL markers.
@@ -481,7 +441,7 @@ namespace
         CHECK(result.route == PacingRoute::PclMarkers);
         capabilities = VulkanPcl();
         capabilities.x64 = false;
-        CHECK_RESULT(Resolve(config, capabilities, ActiveVrr()), Vrr, Marker, MarkerHold, Architecture);
+        CHECK_RESULT(Resolve(config, capabilities, ActiveVrr()), Off, None, SourceOnly, Passthrough);
 
         // DX11 NvAPI markers.
         capabilities = QualifiedDx12();
@@ -494,110 +454,91 @@ namespace
         CHECK_RESULT(Resolve(config, capabilities, ActiveVrr()), Vrr, Marker, MarkerHold, NoNativeRoute);
     }
 
-    // ── Smoothing table and probes ──
+    // ── Lead parameters and probes ──
 
-    void TestSmoothingTable()
+    // The lead's quantile (kPacingLeadCoverage, Q99), the allowance (500 µs), the render handoff quantile (0.95) and the
+    // collision guard's headroom (1000 µs) are constants now: every resolution carries them, whatever the route,
+    // rung, owner or test mode, and the initial snapshot equals the default passthrough.
+    void TestLeadParameters()
     {
-        struct Row {
-            PacingSmoothing smoothing;
-            double quantile;
-            double allowance_us;
+        static_assert(kPacingSmoothing == PacingSmoothing::On, "the allowance row is On's");
+        static_assert(kPacingLeadCoverage == PacingLeadCoverage::Q99, "the lead covers 99% of frames");
+        static_assert(kPacingGpuWaitHeadroomDefaultUs == 1000.0, "the collision guard's release headroom");
+
+        const PacingPipelineConfig config{};
+        PacingPipelineConfig reflex_only{};
+        reflex_only.test_mode = PacingTestMode::ReflexOnly;
+        PacingPipelineConfig limiter{};
+        limiter.test_mode = PacingTestMode::DriverLimiter;
+        PacingCapabilities unqualified_fg = QualifiedDx12();
+        unqualified_fg.fg_input_route_ready = false;
+        PacingCapabilities win32 = QualifiedDx12();
+        win32.x64 = false;
+        PacingRuntimeState sleeping = ActiveVrr();
+        sleeping.pre_sleep_available = true;
+        PacingRuntimeState idle = ActiveVrr();
+        idle.idle_cap = true;
+        PacingRuntimeState fixed = ActiveVrr();
+        fixed.vrr = false;
+        PacingRuntimeState uncapped = ActiveVrr();
+        uncapped.uncapped = true;
+        PacingRuntimeState invalid = ActiveVrr();
+        invalid.swapchain_valid = false;
+        PacingRuntimeState overloaded = ActiveVrr();
+        overloaded.hold_overloaded = true;
+
+        const PacingPipelineSnapshot results[] = {
+            Resolve(config, QualifiedDx12(), ActiveVrr()),     // GPU queue wait
+            Resolve(config, QualifiedDx12(), ActiveFg()),      // FG input wait
+            Resolve(config, QualifiedDx12(), sleeping),
+            Resolve(config, QualifiedDx12(), fixed),
+            Resolve(config, QualifiedDx12(), overloaded),
+            Resolve(config, VulkanPcl(), ActiveVrr()),         // marker hold
+            Resolve(config, unqualified_fg, ActiveFg()),       // source only, a blocker
+            Resolve(config, PresentBased(), ActiveVrr()),
+            Resolve(config, QualifiedDx12(), idle),
+            Resolve(config, QualifiedDx12(), uncapped),
+            Resolve(config, QualifiedDx12(), invalid),
+            Resolve(config, win32, ActiveVrr()),               // no route
+            Resolve(reflex_only, QualifiedDx12(), ActiveVrr()),
+            Resolve(limiter, QualifiedDx12(), sleeping),
+            Resolve(limiter, VulkanPcl(), sleeping),           // driver_limiter_unavailable
         };
-        const Row rows[] = {
-            { PacingSmoothing::On, kDefaultLeadQuantile, 500.0 },
-        };
-        for (const Row& row : rows) {
-            PacingPipelineConfig config = WithSmoothing(row.smoothing);
-            PacingPipelineSnapshot result = Resolve(config, QualifiedDx12(), ActiveVrr());
-            CHECK(result.rung == PacingRung::GpuQueueWait);
-            CHECK_LEAD(result, row.quantile, row.allowance_us);
-            result = Resolve(config, QualifiedDx12(), ActiveFg());
-            CHECK(result.rung == PacingRung::FgInputWait);
-            CHECK_LEAD(result, row.quantile, row.allowance_us);
-            result = Resolve(config, VulkanPcl(), ActiveVrr());
-            CHECK(result.rung == PacingRung::MarkerHold);
-            CHECK_LEAD(result, row.quantile, row.allowance_us);
-
-            config.rung_override = PacingRungOverride::Native;
-            result = Resolve(config, QualifiedDx12(), ActiveVrr());
-            CHECK(result.rung == PacingRung::NativeHold);
-            CHECK_LEAD(result, row.quantile, row.allowance_us);
-            config.rung_override = PacingRungOverride::Marker;
-            result = Resolve(config, QualifiedDx12(), ActiveVrr());
-            CHECK(result.rung == PacingRung::MarkerHold);
-            CHECK_LEAD(result, row.quantile, row.allowance_us);
-
-            // Source-only results use the same smoothing table, whatever the reason.
-            config.rung_override = PacingRungOverride::SourceOnly;
-            CHECK_LEAD(Resolve(config, QualifiedDx12(), ActiveVrr()), row.quantile, row.allowance_us);
-            config.rung_override = PacingRungOverride::Gpu;
-            PacingCapabilities unqualified_fg = QualifiedDx12();
-            unqualified_fg.fg_input_route_ready = false;
-            CHECK_LEAD(Resolve(config, unqualified_fg, ActiveFg()), row.quantile, row.allowance_us);
-            config.rung_override = PacingRungOverride::Auto;
-            CHECK_LEAD(Resolve(config, unqualified_fg, ActiveFg()), row.quantile, row.allowance_us);
-            CHECK_LEAD(Resolve(config, PresentBased(), ActiveVrr()), row.quantile, row.allowance_us);
-            PacingRuntimeState runtime = ActiveVrr();
-            runtime.idle_cap = true;
-            CHECK_LEAD(Resolve(config, QualifiedDx12(), runtime), row.quantile, row.allowance_us);
-            runtime = ActiveVrr();
-            runtime.uncapped = true;
-            CHECK_LEAD(Resolve(config, QualifiedDx12(), runtime), row.quantile, row.allowance_us);
-        }
-
-        CHECK_LEAD(Resolve(WithSmoothing(PacingSmoothing::Off), QualifiedDx12(), ActiveVrr()), kDefaultLeadQuantile, 0.0);
-        // Default and unknown smoothing are On.
-        CHECK_LEAD(Resolve(PacingPipelineConfig{}, QualifiedDx12(), ActiveVrr()), kDefaultLeadQuantile, 500.0);
-        const PacingPipelineSnapshot unknown =
-            Resolve(WithSmoothing(static_cast<PacingSmoothing>(9)), QualifiedDx12(), ActiveVrr());
-        CHECK(unknown.rung == PacingRung::GpuQueueWait);
-        CHECK_LEAD(unknown, kDefaultLeadQuantile, 500.0);
-    }
-
-    // lead_coverage sets only the lead's quantile, on every rung and
-    // smoothing level: 0.99 by default, the key's percentile otherwise. The
-    // allowance and the render handoff quantile stay the Smoothing table's.
-    void TestLeadCoverage()
-    {
-        PacingPipelineConfig config{};
-        CHECK(config.lead_coverage == PacingLeadCoverage::Q99);
-        PacingPipelineSnapshot result = Resolve(config, QualifiedDx12(), ActiveFg());
-        CHECK(result.rung == PacingRung::FgInputWait);
-        CHECK_LEAD(result, 0.99, 500.0);
-        CHECK(result.handoff_quantile == 0.95);
-        config.lead_coverage = PacingLeadCoverage::Q95;
-        result = Resolve(config, QualifiedDx12(), ActiveFg());
-        CHECK_LEAD(result, 0.95, 500.0);
-        CHECK(result.handoff_quantile == 0.95);
-        result = Resolve(config, QualifiedDx12(), ActiveVrr());
-        CHECK(result.rung == PacingRung::GpuQueueWait);
-        CHECK_LEAD(result, 0.95, 500.0);
-        config.smoothing = PacingSmoothing::Off;
-        result = Resolve(config, QualifiedDx12(), ActiveVrr());
-        CHECK_LEAD(result, 0.95, 0.0);
-        CHECK(result.handoff_quantile == 0.95);
-        const struct { PacingLeadCoverage coverage; double quantile; const char* text; } lower[] = {
-            { PacingLeadCoverage::Q50, 0.50, "50" }, { PacingLeadCoverage::Q75, 0.75, "75" },
-            { PacingLeadCoverage::Q90, 0.90, "90" },
-        };
-        config.smoothing = PacingSmoothing::On;
-        for (const auto& entry : lower) {
-            config.lead_coverage = entry.coverage;
-            result = Resolve(config, QualifiedDx12(), ActiveFg());
-            CHECK_LEAD(result, entry.quantile, 500.0);
+        for (const PacingPipelineSnapshot& result : results) {
+            CHECK_LEAD(result, kDefaultLeadQuantile, 500.0);
             CHECK(result.handoff_quantile == 0.95);
-            PacingLeadCoverage text_value = PacingLeadCoverage::Q99;
-            CHECK(PacingLeadCoverage_FromText(entry.text, &text_value) && text_value == entry.coverage);
+            CHECK(result.gpu_wait_headroom_us == kPacingGpuWaitHeadroomDefaultUs);
+            CHECK(result.gpu_wait_headroom_us == 1000.0);
         }
 
-        PacingPipelineConfig invalid{};
-        invalid.lead_coverage = static_cast<PacingLeadCoverage>(9);
-        CHECK(PacingPipeline_ClampConfig(invalid).lead_coverage == PacingLeadCoverage::Q99);
-        CHECK_LEAD(Resolve(invalid, QualifiedDx12(), ActiveVrr()), 0.99, 500.0);
-        PacingLeadCoverage parsed = PacingLeadCoverage::Q99;
-        CHECK(PacingLeadCoverage_FromText("95", &parsed) && parsed == PacingLeadCoverage::Q95);
-        CHECK(!PacingLeadCoverage_FromText("97", &parsed) && parsed == PacingLeadCoverage::Q95);
+        // The initial snapshot equals the default passthrough.
+        const PacingPipelineSnapshot initial{};
+        CHECK_LEAD(initial, kDefaultLeadQuantile, 500.0);
+        CHECK(initial.handoff_quantile == 0.95 && initial.gpu_wait_headroom_us == 1000.0);
+        CHECK(PacingPipeline_SameResult(initial, Resolve(config, PacingCapabilities{}, PacingRuntimeState{})));
     }
+
+    // The lead coverage's text tokens (the enum remains; the setting is a constant).
+    void TestLeadCoverageText()
+    {
+        const struct { PacingLeadCoverage coverage; const char* text; } entries[] = {
+            { PacingLeadCoverage::Q50, "50" }, { PacingLeadCoverage::Q75, "75" },
+            { PacingLeadCoverage::Q90, "90" }, { PacingLeadCoverage::Q95, "95" },
+            { PacingLeadCoverage::Q99, "99" },
+        };
+        for (const auto& entry : entries) {
+            PacingLeadCoverage parsed = PacingLeadCoverage::Count;
+            CHECK(PacingLeadCoverage_FromText(entry.text, &parsed) && parsed == entry.coverage);
+            parsed = PacingLeadCoverage::Count;
+            CHECK(PacingLeadCoverage_FromText(PacingLeadCoverage_Text(entry.coverage), &parsed) &&
+                  parsed == entry.coverage);
+        }
+        PacingLeadCoverage parsed = PacingLeadCoverage::Q95;
+        CHECK(!PacingLeadCoverage_FromText("97", &parsed) && parsed == PacingLeadCoverage::Q95);
+        CHECK(!PacingLeadCoverage_FromText(nullptr, &parsed) && parsed == PacingLeadCoverage::Q95);
+        CHECK(std::strcmp(PacingLeadCoverage_Text(PacingLeadCoverage::Count), "unknown") == 0);
+    }
+
 
     void TestProbesCopied()
     {
@@ -653,6 +594,9 @@ namespace
         CHECK(!PacingPipeline_SameResult(base, other));
         other = base;
         other.gpu_probes = !base.gpu_probes;
+        CHECK(!PacingPipeline_SameResult(base, other));
+        other = base;
+        other.gpu_wait_headroom_us = 1500.0;
         CHECK(!PacingPipeline_SameResult(base, other));
     }
 
@@ -746,8 +690,6 @@ namespace
         CHECK(!PacingPipeline_HasCapability(PacingCapability::NativeRoute, 5));
     }
 
-    // ── Configuration ──
-
     // ── Source placement ──
 
     void TestSourcePlacement()
@@ -756,46 +698,28 @@ namespace
         sleeping.pre_sleep_available = true;
         PacingPipelineConfig config{};
 
-        // Default: pre-Sleep while the game calls the Reflex
-        // Sleep, marker without it; the rung is unchanged.
-        CHECK(config.placement_override == PacingPlacementOverride::PreSleep);
-        CHECK_RESULT(Resolve(config, QualifiedDx12(), sleeping), Vrr, PreSleep, GpuQueueWait, None);
+        // Default: while the game calls the Reflex Sleep the placement is the unified pacer's (64-bit) or pre-Sleep
+        // (Win32, kPacingPlacementOverride), marker without it; the rung is unchanged.
+        static_assert(kPacingPlacementOverride == PacingPlacementOverride::PreSleep, "the earlier pipeline's placement");
+        CHECK_RESULT_PLACED(Resolve(config, QualifiedDx12(), sleeping), Vrr, SleepPlacement(), GpuQueueWait, None);
         CHECK_RESULT(Resolve(config, QualifiedDx12(), ActiveVrr()), Vrr, Marker, GpuQueueWait, None);
-        CHECK_RESULT(Resolve(config, VulkanPcl(), sleeping), Vrr, PreSleep, MarkerHold, Api);
+        CHECK_RESULT_PLACED(Resolve(config, VulkanPcl(), sleeping), Vrr, SleepPlacement(), MarkerHold, Api);
         PacingRuntimeState fg_sleeping = ActiveFg();
         fg_sleeping.pre_sleep_available = true;
-        CHECK_RESULT(Resolve(config, QualifiedDx12(), fg_sleeping), Vrr, PreSleep, FgInputWait, None);
-        // Present routes keep present placement; idle caps keep the marker.
+        CHECK_RESULT_PLACED(Resolve(config, QualifiedDx12(), fg_sleeping), Vrr, SleepPlacement(), FgInputWait, None);
+        // Present routes keep present placement.
         CHECK_RESULT(Resolve(config, PresentBased(), sleeping), Vrr, Present, SourceOnly, PresentRoute);
+        // Idle caps: the unified pacer keeps its placement, the earlier pipeline the marker.
         PacingRuntimeState idle = sleeping;
         idle.idle_cap = true;
-        CHECK_RESULT(Resolve(config, QualifiedDx12(), idle), Idle, Marker, SourceOnly, IdleCap);
+        CHECK_RESULT_PLACED(Resolve(config, QualifiedDx12(), idle), Idle, IdleSleepPlacement(), SourceOnly, IdleCap);
+        // Neither owner ever resolves the driver limiter without the test mode.
+        CHECK(Resolve(config, QualifiedDx12(), sleeping).placement != PacingSourcePlacement::DriverLimiter);
 
-        // Marker override.
-        config.placement_override = PacingPlacementOverride::Marker;
-        CHECK_RESULT(Resolve(config, QualifiedDx12(), sleeping), Vrr, Marker, GpuQueueWait, None);
-
-        // Driver limiter: NvAPI route, x64, Sleep seen; nothing is held.
-        config.placement_override = PacingPlacementOverride::Driver;
-        PacingPipelineSnapshot driver = Resolve(config, QualifiedDx12(), fg_sleeping);
-        CHECK_RESULT(driver, Vrr, DriverLimiter, SourceOnly, Override);
-        CHECK(driver.auto_rung == PacingRung::SourceOnly);
-        CHECK_RESULT(Resolve(config, QualifiedDx12(), ActiveVrr()), Vrr, Marker, GpuQueueWait, None);
-        CHECK_RESULT(Resolve(config, VulkanPcl(), sleeping), Vrr, Marker, MarkerHold, Api);
-        PacingCapabilities win32 = QualifiedDx12();
-        win32.x64 = false;
-        CHECK_RESULT(Resolve(config, win32, sleeping), Vrr, Marker, MarkerHold, Architecture);
-        // A limiter that cannot be applied keeps the marker placement.
-        PacingRuntimeState unavailable = sleeping;
-        unavailable.driver_limiter_unavailable = true;
-        CHECK_RESULT(Resolve(config, QualifiedDx12(), unavailable), Vrr, Marker, GpuQueueWait, None);
-
-        // Clamp and text.
+        // Text.
         PacingPipelineConfig invalid{};
-        invalid.placement_override = static_cast<PacingPlacementOverride>(9);
-        CHECK(PacingPipeline_ClampConfig(invalid).placement_override == PacingPlacementOverride::PreSleep);
-        invalid.gpu_queue_wait_render_queue = static_cast<PacingRenderQueue>(9);
-        CHECK(PacingPipeline_ClampConfig(invalid).gpu_queue_wait_render_queue == PacingRenderQueue::Keep);
+        invalid.test_mode = static_cast<PacingTestMode>(9);
+        CHECK(PacingPipeline_ClampConfig(invalid).test_mode == PacingTestMode::Off);
         // Legacy `auto` (the former self-disengaging pre-Sleep) reads as marker.
         PacingPlacementOverride legacy = PacingPlacementOverride::Driver;
         CHECK(PacingPlacementOverride_FromText("AUTO", &legacy) && legacy == PacingPlacementOverride::Marker);
@@ -817,197 +741,249 @@ namespace
         CHECK(!PacingSourcePlacement_WaitsAtMarker(PacingSourcePlacement::DriverLimiter));
     }
 
-    // Developer key driver_limiter_hold: the Reflex driver limiter keeps the
-    // source side, the output rung resolves as for the other placements. It
-    // needs gpu_paced_cadence (the cadence planning of driver-released frames);
-    // without it, and with either key off, nothing changes.
-    void TestDriverLimiterHold()
+    // ── Test mode driver_limiter ──
+
+    // The Reflex driver limiter paces the source at the cap's interval and nothing is held (kPacingDriverLimiterHold is
+    // false): the placement is DriverLimiter with rung SourceOnly and the reason Override, where the limiter cannot
+    // apply the game's own behaviour runs with the reason DriverLimiterUnavailable.
+    void TestDriverLimiterTestMode()
     {
+        static_assert(!kPacingDriverLimiterHold, "the driver limiter holds nothing");
         PacingRuntimeState sleeping = ActiveVrr();
         sleeping.pre_sleep_available = true;
         PacingRuntimeState fg_sleeping = ActiveFg();
         fg_sleeping.pre_sleep_available = true;
-        PacingPipelineConfig config{};
-        config.placement_override = PacingPlacementOverride::Driver;
+        PacingPipelineConfig limiter{};
+        limiter.test_mode = PacingTestMode::DriverLimiter;
 
-        // Off by default: the driver limiter holds nothing (reason override).
-        CHECK(!config.driver_limiter_hold && !config.pre_sleep_precise);
-        CHECK(!PacingPipeline_DriverLimiterHold(config));
-        CHECK_RESULT(Resolve(config, QualifiedDx12(), sleeping), Vrr, DriverLimiter, SourceOnly, Override);
-        // The key alone, without gpu_paced_cadence, changes nothing; so does gpu_paced_cadence alone.
-        config.driver_limiter_hold = true;
-        CHECK(!PacingPipeline_DriverLimiterHold(config));
-        CHECK_RESULT(Resolve(config, QualifiedDx12(), sleeping), Vrr, DriverLimiter, SourceOnly, Override);
-        config.driver_limiter_hold = false;
-        config.gpu_paced_cadence = true;
-        CHECK(!PacingPipeline_DriverLimiterHold(config));
-        CHECK_RESULT(Resolve(config, QualifiedDx12(), sleeping), Vrr, DriverLimiter, SourceOnly, Override);
-
-        // Both on: the rung of the other placements, with the driver as the source.
-        config.driver_limiter_hold = true;
-        CHECK(PacingPipeline_DriverLimiterHold(config));
-        PacingPipelineSnapshot hold = Resolve(config, QualifiedDx12(), sleeping);
-        CHECK_RESULT(hold, Vrr, DriverLimiter, GpuQueueWait, None);
-        CHECK(hold.auto_rung == PacingRung::GpuQueueWait);
-        CHECK_RESULT(Resolve(config, QualifiedDx12(), fg_sleeping), Vrr, DriverLimiter, FgInputWait, None);
-        // The same fallbacks and reasons as the other placements.
-        PacingCapabilities no_queue = QualifiedDx12();
-        no_queue.gpu_queue_ready = false;
-        CHECK_RESULT(Resolve(config, no_queue, sleeping), Vrr, DriverLimiter, MarkerHold, NoGpuQueue);
-        PacingCapabilities no_fg_route = QualifiedDx12();
-        no_fg_route.fg_input_route_ready = false;
-        CHECK_RESULT(Resolve(config, no_fg_route, fg_sleeping), Vrr, DriverLimiter, SourceOnly, FgUnqualified);
-        PacingRuntimeState overloaded = sleeping;
-        overloaded.hold_overloaded = true;
-        PacingPipelineSnapshot demoted = Resolve(config, QualifiedDx12(), overloaded);
-        CHECK_RESULT(demoted, Vrr, DriverLimiter, SourceOnly, Infeasible);
-        CHECK(demoted.auto_rung == PacingRung::GpuQueueWait);
-        CHECK(PacingPipeline_LeadRung(demoted) == PacingRung::GpuQueueWait);
-        PacingPipelineConfig source_only = config;
-        source_only.rung_override = PacingRungOverride::SourceOnly;
-        CHECK_RESULT(Resolve(source_only, QualifiedDx12(), sleeping), Vrr, DriverLimiter, SourceOnly, Override);
-        PacingPipelineConfig gpu = config;
-        gpu.rung_override = PacingRungOverride::Gpu;
-        CHECK_RESULT(Resolve(gpu, QualifiedDx12(), sleeping), Vrr, DriverLimiter, GpuQueueWait, Override);
-        PacingPipelineConfig smoothing_off = config;
-        smoothing_off.smoothing = PacingSmoothing::Off;
-        CHECK_RESULT(Resolve(smoothing_off, QualifiedDx12(), sleeping), Vrr, DriverLimiter, SourceOnly, SmoothingOff);
-        PacingRuntimeState idle = sleeping;
-        idle.idle_cap = true;
-        CHECK_RESULT(Resolve(config, QualifiedDx12(), idle), Idle, Marker, SourceOnly, IdleCap);
+        PacingPipelineSnapshot driver = Resolve(limiter, QualifiedDx12(), sleeping);
+        CHECK_RESULT(driver, Vrr, DriverLimiter, SourceOnly, Override);
+        CHECK(driver.auto_rung == PacingRung::SourceOnly);
+        CHECK(driver.route == PacingRoute::NvApiMarkers);
+        CHECK_LEAD(driver, kDefaultLeadQuantile, 500.0);
+        // No hold with FG, fixed refresh or an overloaded runtime either.
+        CHECK_RESULT(Resolve(limiter, QualifiedDx12(), fg_sleeping), Vrr, DriverLimiter, SourceOnly, Override);
         PacingRuntimeState fixed = sleeping;
         fixed.vrr = false;
-        CHECK_RESULT(Resolve(config, QualifiedDx12(), fixed), Fixed, DriverLimiter, MarkerHold, FixedRefresh);
+        CHECK_RESULT(Resolve(limiter, QualifiedDx12(), fixed), Fixed, DriverLimiter, SourceOnly, Override);
+        PacingRuntimeState overloaded = sleeping;
+        overloaded.hold_overloaded = true;
+        overloaded.gpu_queue_wait_off = true;
+        driver = Resolve(limiter, QualifiedDx12(), overloaded);
+        CHECK_RESULT(driver, Vrr, DriverLimiter, SourceOnly, Override);
+        CHECK(driver.auto_rung == PacingRung::SourceOnly);
+        CHECK(PacingPipeline_LeadRung(driver) == PacingRung::SourceOnly);
+        // Not the unified owner and not the Reflex Sleep bypass.
+        CHECK(!PacingPipeline_ClampConfig(limiter).unified);
 
-        // The placement itself is unchanged: a limiter that cannot be applied
-        // and routes without the driver limiter keep the marker placement, and
-        // the other placements do not see the key.
-        PacingRuntimeState unavailable = sleeping;
-        unavailable.driver_limiter_unavailable = true;
-        CHECK_RESULT(Resolve(config, QualifiedDx12(), unavailable), Vrr, Marker, GpuQueueWait, None);
-        CHECK_RESULT(Resolve(config, VulkanPcl(), sleeping), Vrr, Marker, MarkerHold, Api);
-        config.placement_override = PacingPlacementOverride::PreSleep;
-        CHECK_RESULT(Resolve(config, QualifiedDx12(), sleeping), Vrr, PreSleep, GpuQueueWait, None);
-        config.placement_override = PacingPlacementOverride::Marker;
-        CHECK_RESULT(Resolve(config, QualifiedDx12(), sleeping), Vrr, Marker, GpuQueueWait, None);
-
-        // A Source record of the pipeline: planned frames show their plan rung, an
-        // unplanned one under the hold waits for the first planned frame, an
-        // unplanned one of the plain driver limiter shows source only.
-        const auto record_of = [](const PacingPipelineSnapshot& pipeline, uint64_t grid_index) {
-            PacingSourceRecord record{};
-            record.pipeline_generation = 7;
-            record.grid_index = grid_index;
-            record.plan_rung = static_cast<uint8_t>(pipeline.rung);
-            record.fallback_reason = static_cast<uint8_t>(pipeline.reason);
-            record.source_placement = static_cast<uint8_t>(pipeline.placement);
-            return record;
-        };
-        uint32_t rung = 99;
-        CHECK(PacingSourceRecord_PipelineRung(record_of(hold, 12), &rung) &&
-              rung == static_cast<uint32_t>(PacingRung::GpuQueueWait));
-        rung = 99;
-        CHECK(!PacingSourceRecord_PipelineRung(record_of(hold, 0), &rung) && rung == 99);
-        PacingPipelineConfig plain{};
-        plain.placement_override = PacingPlacementOverride::Driver;
-        CHECK(PacingSourceRecord_PipelineRung(record_of(Resolve(plain, QualifiedDx12(), sleeping), 0), &rung) &&
-              rung == static_cast<uint32_t>(PacingRung::SourceOnly));
+        // Where the limiter cannot apply: the game's own behaviour, reason unavailable.
+        CHECK_RESULT(Resolve(limiter, QualifiedDx12(), ActiveVrr()), Off, None, SourceOnly, DriverLimiterUnavailable);
+        PacingRuntimeState refused = sleeping;
+        refused.driver_limiter_unavailable = true;
+        CHECK_RESULT(Resolve(limiter, QualifiedDx12(), refused), Off, None, SourceOnly, DriverLimiterUnavailable);
+        CHECK_RESULT(Resolve(limiter, VulkanPcl(), sleeping), Off, None, SourceOnly, DriverLimiterUnavailable);
+        CHECK_RESULT(Resolve(limiter, PresentBased(), sleeping), Off, None, SourceOnly, DriverLimiterUnavailable);
+        PacingRuntimeState idle = sleeping;
+        idle.idle_cap = true;
+        CHECK_RESULT(Resolve(limiter, QualifiedDx12(), idle), Off, None, SourceOnly, DriverLimiterUnavailable);
+        // Earlier rules still win: passthrough states and no route.
+        PacingRuntimeState uncapped = sleeping;
+        uncapped.uncapped = true;
+        CHECK_RESULT(Resolve(limiter, QualifiedDx12(), uncapped), Off, None, SourceOnly, Passthrough);
+        PacingRuntimeState invalid = sleeping;
+        invalid.swapchain_valid = false;
+        CHECK_RESULT(Resolve(limiter, QualifiedDx12(), invalid), Off, None, SourceOnly, Passthrough);
+        PacingRuntimeState dmfg = sleeping;
+        dmfg.dmfg_passthrough = true;
+        CHECK_RESULT(Resolve(limiter, QualifiedDx12(), dmfg), Off, None, SourceOnly, Passthrough);
+        PacingCapabilities no_route = QualifiedDx12();
+        no_route.route = PacingRoute::None;
+        CHECK_RESULT(Resolve(limiter, no_route, sleeping), Off, None, SourceOnly, Passthrough);
     }
 
-    // ── Developer key unified_pacer ──
+    // Regression: whatever the capabilities and the runtime state, with test mode driver_limiter a DriverLimiter
+    // placement always carries rung SourceOnly, auto_rung SourceOnly and reason Override (never a planning rung), it
+    // is resolved exactly where the limiter can apply, and with test mode Off or ReflexOnly the placement is never
+    // DriverLimiter.
+    void TestDriverLimiterPlacementInvariant()
+    {
+        static_assert(!kPacingDriverLimiterHold, "the driver limiter holds nothing");
+        const PacingApi apis[] = { PacingApi::DX11, PacingApi::DX12, PacingApi::Vulkan };
+        const PacingRoute routes[] = { PacingRoute::None, PacingRoute::NvApiMarkers, PacingRoute::PclMarkers,
+            PacingRoute::PresentBased };
+        const PacingTestMode modes[] = { PacingTestMode::Off, PacingTestMode::ReflexOnly, PacingTestMode::DriverLimiter };
 
-    // 64-bit only: the clamp forces the replaced mechanisms off, the placement follows the
-    // Sleep (never the driver limiter), the performance demotions are bypassed and the
-    // physical blockers stay.
-    void TestUnifiedPacerKey()
+        uint64_t resolved = 0;
+        uint64_t limiter_placements = 0;
+        uint64_t violations = 0;
+        for (const PacingTestMode mode : modes) {
+            PacingPipelineConfig config{};
+            config.test_mode = mode;
+            for (const PacingApi api : apis) {
+                for (const PacingRoute route : routes) {
+                    for (uint32_t cap_bits = 0; cap_bits < 32; ++cap_bits) {
+                        PacingCapabilities capabilities{};
+                        capabilities.api = api;
+                        capabilities.route = route;
+                        capabilities.x64 = (cap_bits & 1u) != 0;
+                        capabilities.native_route_qualified = (cap_bits & 2u) != 0;
+                        capabilities.gpu_queue_ready = (cap_bits & 4u) != 0;
+                        capabilities.fg_input_route_ready = (cap_bits & 8u) != 0;
+                        capabilities.fg_separate_presenter = (cap_bits & 16u) != 0;
+                        for (uint32_t state_bits = 0; state_bits < 1024; ++state_bits) {
+                            PacingRuntimeState runtime{};
+                            runtime.swapchain_valid = (state_bits & 1u) != 0;
+                            runtime.dmfg_passthrough = (state_bits & 2u) != 0;
+                            runtime.uncapped = (state_bits & 4u) != 0;
+                            runtime.idle_cap = (state_bits & 8u) != 0;
+                            runtime.vrr = (state_bits & 16u) != 0;
+                            runtime.fg_presenting = (state_bits & 32u) != 0;
+                            runtime.pre_sleep_available = (state_bits & 64u) != 0;
+                            runtime.driver_limiter_unavailable = (state_bits & 128u) != 0;
+                            runtime.hold_overloaded = (state_bits & 256u) != 0;
+                            runtime.gpu_queue_wait_off = (state_bits & 512u) != 0;
+
+                            const PacingPipelineSnapshot result = Resolve(config, capabilities, runtime);
+                            ++resolved;
+                            const bool is_limiter = result.placement == PacingSourcePlacement::DriverLimiter;
+                            bool ok = true;
+                            if (mode == PacingTestMode::DriverLimiter) {
+                                // The limiter applies in the foreground on an x64 NvAPI marker route while the game
+                                // calls the Reflex Sleep and the driver has not refused it.
+                                const bool applies = runtime.swapchain_valid && !runtime.dmfg_passthrough &&
+                                    !runtime.uncapped && !runtime.idle_cap && capabilities.x64 &&
+                                    capabilities.route == PacingRoute::NvApiMarkers &&
+                                    runtime.pre_sleep_available && !runtime.driver_limiter_unavailable;
+                                ok = is_limiter == applies;
+                                if (is_limiter) {
+                                    ++limiter_placements;
+                                    ok = ok && result.rung == PacingRung::SourceOnly &&
+                                        result.auto_rung == PacingRung::SourceOnly &&
+                                        result.reason == PacingFallbackReason::Override &&
+                                        PacingPipeline_LeadRung(result) == PacingRung::SourceOnly;
+                                }
+                            } else {
+                                ok = !is_limiter;
+                            }
+                            if (!ok) {
+                                if (violations == 0) {
+                                    std::fprintf(stderr,
+                                        "FAIL %s:%d: mode=%s api=%d route=%d cap_bits=%u state_bits=%u: placement=%d "
+                                        "rung=%s auto_rung=%s reason=%s\n",
+                                        __FILE__, __LINE__, PacingTestMode_Text(mode), static_cast<int>(api),
+                                        static_cast<int>(route), cap_bits, state_bits,
+                                        static_cast<int>(result.placement), PacingRung_Text(result.rung),
+                                        PacingRung_Text(result.auto_rung), PacingFallbackReason_Text(result.reason));
+                                }
+                                ++violations;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        CHECK(violations == 0);
+        CHECK(limiter_placements > 0);
+        CHECK(resolved == 3u * 3u * 4u * 32u * 1024u);
+    }
+
+    // ── Derived owner ──
+
+    // `unified` is derived by PacingPipeline_ClampConfig (64-bit with the effective test mode Off) whatever the caller
+    // passes; the published configuration carries the derived value and the accessors read it.
+    void TestUnifiedOwnerDerivation()
+    {
+        CHECK(!PacingPipelineConfig{}.unified);
+        const PacingTestMode modes[] = { PacingTestMode::Off, PacingTestMode::ReflexOnly, PacingTestMode::DriverLimiter,
+            static_cast<PacingTestMode>(9) };
+        for (const bool input : { false, true }) {
+            for (const PacingTestMode mode : modes) {
+                PacingPipelineConfig config{};
+                config.unified = input;
+                config.test_mode = mode;
+                const PacingTestMode effective =
+                    static_cast<uint32_t>(mode) < static_cast<uint32_t>(PacingTestMode::Count) ? mode : PacingTestMode::Off;
+                const PacingPipelineConfig clamped = PacingPipeline_ClampConfig(config);
+                CHECK(clamped.test_mode == effective);
+                CHECK(clamped.unified == (kWide && effective == PacingTestMode::Off));
+            }
+        }
+
+        for (const PacingTestMode mode : modes) {
+            PacingPipelineConfig config{};
+            config.test_mode = mode;
+            PacingPipeline_SetConfig(config);
+            const PacingTestMode effective =
+                static_cast<uint32_t>(mode) < static_cast<uint32_t>(PacingTestMode::Count) ? mode : PacingTestMode::Off;
+            const bool unified = kWide && effective == PacingTestMode::Off;
+            CHECK(PacingPipeline_GetConfig().unified == unified);
+            CHECK(PacingPipeline_GetConfig().test_mode == effective);
+            CHECK(PacingPipeline_Unified() == unified);
+            CHECK(PacingPipeline_TestMode() == effective);
+            CHECK(PacingPipeline_SleepBypass() == (effective == PacingTestMode::Off));
+        }
+        PacingPipeline_SetConfig(PacingPipelineConfig{});
+        CHECK(PacingPipeline_Unified() == kWide);
+        CHECK(PacingPipeline_GetConfig().unified == kWide);
+        CHECK(PacingPipeline_TestMode() == PacingTestMode::Off && PacingPipeline_SleepBypass());
+    }
+
+    // The owner's effect on the resolution: the placement follows the Sleep (never the driver limiter), the
+    // performance demotions (overload guard, not-held block) exist only in the earlier pipeline (Win32) and the
+    // physical blockers stay in both.
+    void TestUnifiedOwner()
     {
         PacingRuntimeState sleeping = ActiveVrr();
         sleeping.pre_sleep_available = true;
         PacingRuntimeState fg_sleeping = ActiveFg();
         fg_sleeping.pre_sleep_available = true;
-        PacingPipelineConfig key{};
-        key.unified_pacer = true;
-        if (sizeof(void*) != 8) {
-            CHECK(!PacingPipeline_ClampConfig(key).unified_pacer);
-            CHECK_RESULT(Resolve(key, QualifiedDx12(), sleeping), Vrr, PreSleep, GpuQueueWait, None);
-            return;
-        }
-        CHECK(!PacingPipelineConfig{}.unified_pacer);
+        const PacingPipelineConfig config{};
 
-        PacingPipelineConfig user = key;
-        user.smoothing = PacingSmoothing::Off;
-        user.rung_override = PacingRungOverride::Native;
-        user.adaptive_cap = true;
-        user.adaptive_cap_hold_room = true;
-        user.gpu_paced_cadence = true;
-        user.driver_limiter_hold = true;
-        user.pre_sleep_precise = true;
-        user.gpu_wait_interleave_s = 5.0;
-        user.stall_inject_ms = 100.0;
-        user.lead_coverage = PacingLeadCoverage::Q50;
-        user.fg_late_spacing = false;
-        user.lead_spike_floor = false;
-        user.gpu_queue_wait_render_queue = PacingRenderQueue::Remove;
-        user.placement_override = PacingPlacementOverride::Driver;
-        const PacingPipelineConfig forced = PacingPipeline_ClampConfig(user);
-        CHECK(forced.unified_pacer);
-        CHECK(forced.smoothing == PacingSmoothing::On && forced.rung_override == PacingRungOverride::Auto);
-        CHECK(!forced.adaptive_cap && !forced.adaptive_cap_hold_room && !forced.gpu_paced_cadence);
-        CHECK(!forced.driver_limiter_hold && !forced.pre_sleep_precise);
-        CHECK(forced.gpu_wait_interleave_s == 0.0 && forced.stall_inject_ms == 0.0);
-        CHECK(forced.lead_coverage == PacingLeadCoverage::Q99 && forced.fg_late_spacing && forced.lead_spike_floor);
-        CHECK(forced.gpu_queue_wait_render_queue == PacingRenderQueue::Keep);
-        CHECK(forced.placement_override == PacingPlacementOverride::Driver); // ignored, not forced
-        // The same values without the key are untouched.
-        user.unified_pacer = false;
-        CHECK(PacingPipeline_ClampConfig(user).smoothing == PacingSmoothing::Off);
-
-        // Placement follows the Sleep; the driver limiter is never chosen.
-        user.unified_pacer = true;
-        CHECK_RESULT(Resolve(user, QualifiedDx12(), sleeping), Vrr, Unified, GpuQueueWait, None);
-        CHECK_RESULT(Resolve(key, QualifiedDx12(), sleeping), Vrr, Unified, GpuQueueWait, None);
-        CHECK_RESULT(Resolve(key, QualifiedDx12(), ActiveVrr()), Vrr, Marker, GpuQueueWait, None);
-        CHECK_RESULT(Resolve(key, QualifiedDx12(), fg_sleeping), Vrr, Unified, FgInputWait, None);
+        CHECK_RESULT_PLACED(Resolve(config, QualifiedDx12(), sleeping), Vrr, SleepPlacement(), GpuQueueWait, None);
+        CHECK_RESULT(Resolve(config, QualifiedDx12(), ActiveVrr()), Vrr, Marker, GpuQueueWait, None);
+        CHECK_RESULT_PLACED(Resolve(config, QualifiedDx12(), fg_sleeping), Vrr, SleepPlacement(), FgInputWait, None);
         CHECK(std::strcmp(PacingSourcePlacement_Text(PacingSourcePlacement::Unified), "unified") == 0);
         CHECK(!PacingSourcePlacement_WaitsAtMarker(PacingSourcePlacement::Unified));
 
-        // The performance demotions are bypassed: the GPU rung stays with reason none.
         PacingRuntimeState overloaded = sleeping;
         overloaded.hold_overloaded = true;
-        CHECK_RESULT(Resolve(key, QualifiedDx12(), overloaded), Vrr, Unified, GpuQueueWait, None);
         PacingRuntimeState paused = sleeping;
         paused.gpu_queue_wait_off = true;
-        CHECK_RESULT(Resolve(key, QualifiedDx12(), paused), Vrr, Unified, GpuQueueWait, None);
         PacingRuntimeState fg_overloaded = fg_sleeping;
         fg_overloaded.hold_overloaded = true;
-        CHECK_RESULT(Resolve(key, QualifiedDx12(), fg_overloaded), Vrr, Unified, FgInputWait, None);
-        // Key off: the same runtime still demotes (unchanged).
-        CHECK_RESULT(Resolve(PacingPipelineConfig{}, QualifiedDx12(), overloaded), Vrr, PreSleep, SourceOnly, Infeasible);
+        if (kWide) {
+            // The performance demotions are bypassed: the hold rung stays with reason none.
+            CHECK_RESULT(Resolve(config, QualifiedDx12(), overloaded), Vrr, Unified, GpuQueueWait, None);
+            CHECK_RESULT(Resolve(config, QualifiedDx12(), paused), Vrr, Unified, GpuQueueWait, None);
+            CHECK_RESULT(Resolve(config, QualifiedDx12(), fg_overloaded), Vrr, Unified, FgInputWait, None);
+        } else {
+            // Win32 (the earlier pipeline): the same runtime states demote the Auto hold rung.
+            CHECK_RESULT(Resolve(config, QualifiedDx12(), overloaded), Vrr, PreSleep, SourceOnly, Infeasible);
+            CHECK_RESULT(Resolve(config, QualifiedDx12(), paused), Vrr, PreSleep, SourceOnly, Infeasible);
+            CHECK_RESULT(Resolve(config, QualifiedDx12(), fg_overloaded), Vrr, PreSleep, SourceOnly, Infeasible);
+        }
 
         // The physical blockers stay.
         PacingCapabilities no_queue = QualifiedDx12();
         no_queue.gpu_queue_ready = false;
-        CHECK_RESULT(Resolve(key, no_queue, sleeping), Vrr, Unified, MarkerHold, NoGpuQueue);
+        CHECK_RESULT_PLACED(Resolve(config, no_queue, sleeping), Vrr, SleepPlacement(), MarkerHold, NoGpuQueue);
         PacingCapabilities no_native = QualifiedDx12();
         no_native.native_route_qualified = false;
-        CHECK_RESULT(Resolve(key, no_native, sleeping), Vrr, Unified, MarkerHold, NoNativeRoute);
+        CHECK_RESULT_PLACED(Resolve(config, no_native, sleeping), Vrr, SleepPlacement(), MarkerHold, NoNativeRoute);
         PacingCapabilities no_fg_route = QualifiedDx12();
         no_fg_route.fg_input_route_ready = false;
-        CHECK_RESULT(Resolve(key, no_fg_route, fg_sleeping), Vrr, Unified, SourceOnly, FgUnqualified);
-        PacingCapabilities win32 = QualifiedDx12();
-        win32.x64 = false;
-        CHECK_RESULT(Resolve(key, win32, sleeping), Vrr, Unified, MarkerHold, Architecture);
+        CHECK_RESULT_PLACED(Resolve(config, no_fg_route, fg_sleeping), Vrr, SleepPlacement(), SourceOnly, FgUnqualified);
         PacingRuntimeState fixed = sleeping;
         fixed.vrr = false;
-        CHECK_RESULT(Resolve(key, QualifiedDx12(), fixed), Fixed, Unified, MarkerHold, FixedRefresh);
+        CHECK_RESULT_PLACED(Resolve(config, QualifiedDx12(), fixed), Fixed, SleepPlacement(), MarkerHold, FixedRefresh);
         // Idle and passthrough rules; a present route keeps its placement.
         PacingRuntimeState idle = sleeping;
         idle.idle_cap = true;
-        CHECK_RESULT(Resolve(key, QualifiedDx12(), idle), Idle, Unified, SourceOnly, IdleCap);
+        CHECK_RESULT_PLACED(Resolve(config, QualifiedDx12(), idle), Idle, IdleSleepPlacement(), SourceOnly, IdleCap);
         PacingRuntimeState uncapped = sleeping;
         uncapped.uncapped = true;
-        CHECK_RESULT(Resolve(key, QualifiedDx12(), uncapped), Off, None, SourceOnly, Passthrough);
-        CHECK_RESULT(Resolve(key, PresentBased(), sleeping), Vrr, Present, SourceOnly, PresentRoute);
+        CHECK_RESULT(Resolve(config, QualifiedDx12(), uncapped), Off, None, SourceOnly, Passthrough);
+        CHECK_RESULT(Resolve(config, PresentBased(), sleeping), Vrr, Present, SourceOnly, PresentRoute);
     }
 
     // The rung a Source record shows for its pipeline (the telemetry's
@@ -1044,7 +1020,7 @@ namespace
         CHECK(PacingSourceRecord_PipelineRung(record_of(Resolve(config, QualifiedDx12(), uncapped), 0), &rung) &&
               rung == static_cast<uint32_t>(PacingRung::SourceOnly));
 
-        config.placement_override = PacingPlacementOverride::Driver;
+        config.test_mode = PacingTestMode::DriverLimiter;
         const PacingPipelineSnapshot driver = Resolve(config, QualifiedDx12(), sleeping);
         CHECK(driver.placement == PacingSourcePlacement::DriverLimiter);
         rung = 99;
@@ -1052,196 +1028,96 @@ namespace
               rung == static_cast<uint32_t>(PacingRung::SourceOnly));
     }
 
+    // The constants that replaced the removed pacing settings, and the developer-key defaults that stayed.
+    void TestRemovedSettingConstants()
+    {
+        static_assert(kPacingSmoothing == PacingSmoothing::On, "smoothing is On");
+        static_assert(kPacingRungOverride == PacingRungOverride::Auto, "the rung is resolved");
+        static_assert(kPacingPlacementOverride == PacingPlacementOverride::PreSleep, "the earlier pipeline's placement");
+        static_assert(!kPacingAdaptiveCap && !kPacingAdaptiveCapHoldRoom, "no Adaptive cap, no hold room");
+        static_assert(kAdaptiveCapPercentileDefault == 75, "the Adaptive cap tier default");
+        static_assert(!kPacingGpuPacedCadence && !kPacingDriverLimiterHold && !kPacingPreSleepPrecise,
+            "the removed switches are off");
+        static_assert(kPacingGpuWaitInterleaveS == 0.0 && kPacingStallInjectMs == 0.0, "no interleave, no stall injection");
+        static_assert(kPacingStallInjectDefaultPeriodS == 5.0 && kPacingStallInjectMinPeriodS == 1.0 &&
+                kPacingStallInjectMaxPeriodS == 60.0 && kPacingStallInjectMaxMs == 200.0,
+            "the stall injector's ranges");
+        static_assert(kPacingLeadCoverage == PacingLeadCoverage::Q99, "the lead covers 99% of frames");
+        static_assert(kPacingFgLateSpacing && kPacingLeadSpikeFloor, "the late-frame floors are on");
+        static_assert(kPacingGpuQueueWaitRenderQueue == PacingRenderQueue::Keep, "the render queue stays in the lead");
+        static_assert(kPacingGpuWaitHeadroomDefaultUs == 1000.0, "the release headroom");
+        static_assert(kPacingUnifiedEveryFrameServiceDefault, "the law's service estimate is every frame");
+        static_assert(kPacingUnifiedQueueTargetDefaultUs == 2000.0, "the queue term target");
+        CHECK(kPacingUnifiedQueueAllowDefaultUs == 4000);
+    }
+
+    // The Adaptive cap's fit tier of a percentile is a pure function of the governor; the nearest of 75, 90 and 99.
+    void TestAdaptiveCapFitTier()
+    {
+        static_assert(PacingPipeline_AdaptiveCapFitTier(kAdaptiveCapPercentileDefault) == 75, "the default is a tier");
+        struct Case { int percentile; int tier; };
+        for (const Case& test : { Case{ -5, 75 }, Case{ 10, 75 }, Case{ 75, 75 }, Case{ 82, 75 }, Case{ 83, 90 },
+                Case{ 85, 90 }, Case{ 90, 90 }, Case{ 94, 90 }, Case{ 95, 99 }, Case{ 99, 99 }, Case{ 120, 99 } }) {
+            CHECK(PacingPipeline_AdaptiveCapFitTier(test.percentile) == test.tier);
+        }
+    }
+
     void TestConfigClamp()
     {
         const PacingPipelineConfig defaults{};
         CHECK(SameConfig(PacingPipeline_ClampConfig(defaults), defaults));
+        CHECK(PacingPipeline_ClampConfig(defaults).unified == kWide);
 
-        const double nan = std::numeric_limits<double>::quiet_NaN();
-        const double infinity = std::numeric_limits<double>::infinity();
         PacingPipelineConfig config{};
-        config.stall_inject_ms = nan;
-        config.stall_inject_period_s = nan;
-        PacingPipelineConfig clamped = PacingPipeline_ClampConfig(config);
-        CHECK(clamped.stall_inject_ms == 0.0);
-        CHECK(clamped.stall_inject_period_s == 5.0);
-        config.stall_inject_ms = infinity;
-        config.stall_inject_period_s = -infinity;
-        clamped = PacingPipeline_ClampConfig(config);
-        CHECK(clamped.stall_inject_ms == 0.0);
-        CHECK(clamped.stall_inject_period_s == 5.0);
-
-        config.stall_inject_ms = -5.0;
-        config.stall_inject_period_s = 0.5;
-        clamped = PacingPipeline_ClampConfig(config);
-        CHECK(clamped.stall_inject_ms == 0.0);
-        CHECK(clamped.stall_inject_period_s == 1.0);
-        config.stall_inject_ms = 500.0;
-        config.stall_inject_period_s = 120.0;
-        clamped = PacingPipeline_ClampConfig(config);
-        CHECK(clamped.stall_inject_ms == 200.0);
-        CHECK(clamped.stall_inject_period_s == 60.0);
-        config.stall_inject_ms = 50.0;
-        config.stall_inject_period_s = 30.0;
-        clamped = PacingPipeline_ClampConfig(config);
-        CHECK(clamped.stall_inject_ms == 50.0);
-        CHECK(clamped.stall_inject_period_s == 30.0);
-
-        config = PacingPipelineConfig{};
-        config.smoothing = static_cast<PacingSmoothing>(4);
-        config.rung_override = static_cast<PacingRungOverride>(5);
         config.gpu_probes = false;
-        clamped = PacingPipeline_ClampConfig(config);
-        CHECK(clamped.smoothing == PacingSmoothing::On);
-        CHECK(clamped.rung_override == PacingRungOverride::Auto);
-        CHECK(!clamped.gpu_probes);
-        config.smoothing = PacingSmoothing::Off;
-        config.rung_override = PacingRungOverride::Native;
-        clamped = PacingPipeline_ClampConfig(config);
-        CHECK(clamped.smoothing == PacingSmoothing::Off);
-        CHECK(clamped.rung_override == PacingRungOverride::Native);
+        CHECK(!PacingPipeline_ClampConfig(config).gpu_probes);
+        // An out-of-range test mode is Off; a valid one is kept.
+        config.test_mode = static_cast<PacingTestMode>(7);
+        CHECK(PacingPipeline_ClampConfig(config).test_mode == PacingTestMode::Off);
+        for (const PacingTestMode mode : { PacingTestMode::Off, PacingTestMode::ReflexOnly, PacingTestMode::DriverLimiter }) {
+            config.test_mode = mode;
+            CHECK(PacingPipeline_ClampConfig(config).test_mode == mode);
+        }
 
         // SetConfig stores the clamped configuration.
+        const double nan = std::numeric_limits<double>::quiet_NaN();
         config = PacingPipelineConfig{};
-        config.smoothing = static_cast<PacingSmoothing>(200);
-        config.rung_override = PacingRungOverride::Marker;
-        config.stall_inject_ms = 1e9;
-        config.stall_inject_period_s = nan;
+        config.test_mode = static_cast<PacingTestMode>(200);
+        config.gpu_probes = false;
+        config.unified_queue_rank = 100;
+        config.unified_queue_allow_us = -5;
+        config.unified_hold_share = nan;
         PacingPipeline_SetConfig(config);
         const PacingPipelineConfig stored = PacingPipeline_GetConfig();
-        CHECK(stored.smoothing == PacingSmoothing::On);
-        CHECK(stored.rung_override == PacingRungOverride::Marker);
-        CHECK(stored.stall_inject_ms == 200.0);
-        CHECK(stored.stall_inject_period_s == 5.0);
+        CHECK(stored.test_mode == PacingTestMode::Off);
+        CHECK(stored.unified == kWide);
+        CHECK(!stored.gpu_probes);
+        CHECK(stored.unified_queue_rank == kPacingUnifiedQueueRankMax);
+        CHECK(stored.unified_queue_allow_us == 0);
+        CHECK(stored.unified_hold_share == 0.0);
 
+        // The kept fields round-trip through the seqlock; a test mode takes the owner from the unified pacer.
         config = PacingPipelineConfig{};
-        config.smoothing = PacingSmoothing::Off;
-        config.adaptive_cap = true;
-        config.adaptive_cap_percentile = 90;
         config.gpu_probes = false;
-        config.stall_inject_ms = 50.0;
-        config.stall_inject_period_s = 10.0;
-        config.gpu_queue_wait_render_queue = PacingRenderQueue::RemoveHeld;
-        config.lead_coverage = PacingLeadCoverage::Q95;
-        config.fg_late_spacing = false;
-        config.gpu_paced_cadence = true;
-        config.adaptive_cap_hold_room = false;
+        config.test_mode = PacingTestMode::DriverLimiter;
+        config.unified_queue_rank = 3;
+        config.unified_queue_need_frames = 7;
+        config.unified_queue_allow_us = 1500;
         PacingPipeline_SetConfig(config);
         CHECK(SameConfig(PacingPipeline_GetConfig(), config));
-        CHECK(PacingPipeline_GetConfig().adaptive_cap);
-        CHECK(PacingPipeline_GetConfig().adaptive_cap_percentile == 90);
-        // The Adaptive cap fit is one of the tiers 75, 90 and 99; other
-        // values snap to the nearest.
-        CHECK(PacingPipelineConfig{}.adaptive_cap_percentile == kAdaptiveCapPercentileDefault);
-        config.adaptive_cap_percentile = 10;
-        CHECK(PacingPipeline_ClampConfig(config).adaptive_cap_percentile == 75);
-        config.adaptive_cap_percentile = 85;
-        CHECK(PacingPipeline_ClampConfig(config).adaptive_cap_percentile == 90);
-        config.adaptive_cap_percentile = 120;
+        CHECK(!PacingPipeline_GetConfig().unified);
+        config.test_mode = PacingTestMode::Off;
         PacingPipeline_SetConfig(config);
-        CHECK(PacingPipeline_GetConfig().adaptive_cap_percentile == 99);
+        CHECK(SameConfig(PacingPipeline_GetConfig(), config));
+        CHECK(PacingPipeline_GetConfig().unified == kWide);
 
-        // gpu_wait_headroom_us: [500, 3000] µs, default 1000; non-positive or
-        // non-finite values are the default.
-        struct HeadroomCase { double input; double expected; };
-        const HeadroomCase headroom_cases[] = {
-            { -5.0, 1000.0 }, { nan, 1000.0 }, { 0.0, 1000.0 }, { 200.0, 500.0 },
-            { 1500.0, 1500.0 }, { 9000.0, 3000.0 },
-            { std::numeric_limits<double>::infinity(), 1000.0 },
-        };
-        for (const HeadroomCase& test : headroom_cases) {
-            PacingPipelineConfig headroom{};
-            headroom.gpu_wait_headroom_us = test.input;
-            CHECK(PacingPipeline_ClampConfig(headroom).gpu_wait_headroom_us == test.expected);
-            CHECK(Resolve(headroom, QualifiedDx12(), ActiveVrr()).gpu_wait_headroom_us == test.expected);
-        }
-        CHECK(PacingPipelineConfig{}.gpu_wait_headroom_us == kPacingGpuWaitHeadroomDefaultUs);
-        PacingPipelineConfig headroom{};
-        headroom.gpu_wait_headroom_us = 1500.0;
-        const PacingPipelineSnapshot without = Resolve(PacingPipelineConfig{}, QualifiedDx12(), ActiveVrr());
-        CHECK(!PacingPipeline_SameResult(Resolve(headroom, QualifiedDx12(), ActiveVrr()), without));
-        PacingPipeline_SetConfig(headroom);
-        CHECK(PacingPipeline_GetConfig().gpu_wait_headroom_us == 1500.0);
         PacingPipeline_SetConfig(PacingPipelineConfig{});
         CHECK(SameConfig(PacingPipeline_GetConfig(), PacingPipelineConfig{}));
-
-        // gpu_wait_interleave_s: off by default; 0, negative or non-finite is
-        // off, otherwise [1, 10] s.
-        struct InterleaveCase { double input; double expected; };
-        const InterleaveCase interleave_cases[] = {
-            { 0.0, 0.0 }, { -2.0, 0.0 }, { nan, 0.0 }, { std::numeric_limits<double>::infinity(), 0.0 },
-            { 0.4, 1.0 }, { 2.0, 2.0 }, { 25.0, 10.0 },
-        };
-        for (const InterleaveCase& test : interleave_cases) {
-            PacingPipelineConfig interleave{};
-            interleave.gpu_wait_interleave_s = test.input;
-            CHECK(PacingPipeline_ClampConfig(interleave).gpu_wait_interleave_s == test.expected);
-            PacingPipeline_SetConfig(interleave);
-            CHECK(PacingPipeline_GetConfig().gpu_wait_interleave_s == test.expected);
-        }
-        CHECK(PacingPipelineConfig{}.gpu_wait_interleave_s == 0.0);
-        PacingPipeline_SetConfig(PacingPipelineConfig{});
-    }
-
-    // Developer keys unified_every_frame_service and unified_queue_target_us: defaults (on, 2000;
-    // the earlier law is off with 4000), the clamp (non-finite = the default, otherwise [0, 20000];
-    // Win32 yields false and 2000), the key unified_pacer does not gate them, and the publish round trip.
-    void TestUnifiedLawOptionKeys()
-    {
-        const PacingPipelineConfig defaults{};
-        CHECK(defaults.unified_every_frame_service && kPacingUnifiedEveryFrameServiceDefault);
-        CHECK(defaults.unified_queue_target_us == 2000.0 &&
-              defaults.unified_queue_target_us == kPacingUnifiedQueueTargetDefaultUs);
-        CHECK(kPacingUnifiedQueueTargetMaxUs == 20000.0);
-
-        const double nan = std::numeric_limits<double>::quiet_NaN();
-        const double infinity = std::numeric_limits<double>::infinity();
-        const bool wide = sizeof(void*) == 8;
-        struct Case { double value; double expected; };
-        for (const Case& test : { Case{ 0.0, 0.0 }, Case{ 1500.0, 1500.0 }, Case{ 4000.0, 4000.0 },
-                Case{ 20000.0, 20000.0 }, Case{ 20000.5, 20000.0 }, Case{ 1e12, 20000.0 }, Case{ -0.5, 0.0 },
-                Case{ -1e9, 0.0 }, Case{ nan, 2000.0 }, Case{ infinity, 2000.0 }, Case{ -infinity, 2000.0 } }) {
-            PacingPipelineConfig config{};
-            config.unified_queue_target_us = test.value;
-            // Independent of the unified_pacer key: the clamp reads only its own field.
-            for (const bool key : { false, true }) {
-                config.unified_pacer = key;
-                const PacingPipelineConfig clamped = PacingPipeline_ClampConfig(config);
-                CHECK(clamped.unified_queue_target_us == (wide ? test.expected : 2000.0));
-            }
-            PacingPipeline_SetConfig(config);
-            CHECK(PacingPipeline_GetConfig().unified_queue_target_us == (wide ? test.expected : 2000.0));
-        }
-
-        // The default is on: 64-bit keeps it (the key unified_pacer does not gate it), Win32 forces false.
-        PacingPipelineConfig flags{};
-        CHECK(PacingPipeline_ClampConfig(flags).unified_every_frame_service == wide);
-        flags.unified_pacer = true;
-        CHECK(PacingPipeline_ClampConfig(flags).unified_every_frame_service == wide);
-        PacingPipeline_SetConfig(flags);
-        CHECK(PacingPipeline_GetConfig().unified_every_frame_service == wide);
-        // The earlier estimator, explicit, is kept on both.
-        flags.unified_every_frame_service = false;
-        CHECK(!PacingPipeline_ClampConfig(flags).unified_every_frame_service);
-        PacingPipeline_SetConfig(flags);
-        CHECK(!PacingPipeline_GetConfig().unified_every_frame_service);
-
-        // Neither option changes a resolution (the placement and rung come from the key alone).
-        PacingPipelineConfig plain{};
-        plain.unified_pacer = true;
-        PacingPipelineConfig tuned = plain;
-        tuned.unified_every_frame_service = false;
-        tuned.unified_queue_target_us = 9000.0;
-        PacingRuntimeState sleeping = ActiveVrr();
-        sleeping.pre_sleep_available = true;
-        CHECK(PacingPipeline_SameResult(Resolve(plain, QualifiedDx12(), sleeping),
-                                        Resolve(tuned, QualifiedDx12(), sleeping)));
-        PacingPipeline_SetConfig(PacingPipelineConfig{});
-        CHECK(SameConfig(PacingPipeline_GetConfig(), PacingPipelineConfig{}));
+        CHECK(PacingPipeline_GetConfig().unified == kWide);
     }
 
     // Developer key unified_hold_share: default 0, the clamp (non-finite = 0, otherwise [0, 0.25]; 0
-    // on Win32), independent of the key unified_pacer, and the publish round trip.
+    // on Win32), independent of the input `unified`, and the publish round trip.
     void TestUnifiedHoldShareKey()
     {
         CHECK(PacingPipelineConfig{}.unified_hold_share == 0.0 && kPacingUnifiedHoldShareDefault == 0.0);
@@ -1256,7 +1132,7 @@ namespace
             PacingPipelineConfig config{};
             config.unified_hold_share = test.value;
             for (const bool key : { false, true }) {
-                config.unified_pacer = key;
+                config.unified = key;
                 CHECK(PacingPipeline_ClampConfig(config).unified_hold_share == (wide ? test.expected : 0.0));
             }
             PacingPipeline_SetConfig(config);
@@ -1268,7 +1144,7 @@ namespace
 
     // Developer keys unified_queue_law, unified_queue_rank, unified_queue_allow_us: defaults (on, 2,
     // 4000), the clamp (rank 1..8, allowance 0..20000; the law off on Win32), independence from
-    // the key unified_pacer, and the publish round trip.
+    // the input `unified`, and the publish round trip.
     void TestUnifiedQueueLawKeys()
     {
         const PacingPipelineConfig defaults{};
@@ -1283,7 +1159,7 @@ namespace
             PacingPipelineConfig config{};
             config.unified_queue_rank = test.value;
             for (const bool key : { false, true }) {
-                config.unified_pacer = key;
+                config.unified = key;
                 CHECK(PacingPipeline_ClampConfig(config).unified_queue_rank == test.expected);
             }
             PacingPipeline_SetConfig(config);
@@ -1297,11 +1173,11 @@ namespace
             PacingPipeline_SetConfig(config);
             CHECK(PacingPipeline_GetConfig().unified_queue_allow_us == test.expected);
         }
-        // The law is forced off on Win32 and kept on 64-bit, with or without the key unified_pacer.
+        // The law is forced off on Win32 and kept on 64-bit, with or without the input `unified`.
         PacingPipelineConfig law{};
         law.unified_queue_law = true;
         for (const bool key : { false, true }) {
-            law.unified_pacer = key;
+            law.unified = key;
             CHECK(PacingPipeline_ClampConfig(law).unified_queue_law == wide);
         }
         PacingPipeline_SetConfig(law);
@@ -1314,7 +1190,7 @@ namespace
     }
 
     // Developer key unified_queue_need_frames: default 4, clamp 1..16 (a number with no effect without
-    // the law, so not forced on Win32), independence from unified_pacer and the publish round trip.
+    // the law, so not forced on Win32), independence from the input `unified` and the publish round trip.
     void TestUnifiedQueueNeedFramesKey()
     {
         CHECK(PacingPipelineConfig{}.unified_queue_need_frames == 4 && kPacingUnifiedQueueNeedFramesDefault == 4);
@@ -1325,7 +1201,7 @@ namespace
             PacingPipelineConfig config{};
             config.unified_queue_need_frames = test.value;
             for (const bool key : { false, true }) {
-                config.unified_pacer = key;
+                config.unified = key;
                 CHECK(PacingPipeline_ClampConfig(config).unified_queue_need_frames == test.expected);
             }
             PacingPipeline_SetConfig(config);
@@ -1336,7 +1212,7 @@ namespace
     }
 
     // Developer key unified_queue_upstream: default 0, clamp 0..1 (the removed modes 2 and 3 clamp to 1),
-    // forced 0 on Win32, independent of the key unified_pacer and the law, and the publish round trip.
+    // forced 0 on Win32, independent of the input `unified` and the law, and the publish round trip.
     void TestUnifiedQueueUpstreamKey()
     {
         CHECK(PacingPipelineConfig{}.unified_queue_upstream == 0 && kPacingUnifiedQueueUpstreamDefault == 0);
@@ -1348,7 +1224,7 @@ namespace
             PacingPipelineConfig config{};
             config.unified_queue_upstream = test.value;
             for (const bool key : { false, true }) {
-                config.unified_pacer = key;
+                config.unified = key;
                 CHECK(PacingPipeline_ClampConfig(config).unified_queue_upstream == (wide ? test.expected : 0));
             }
             PacingPipeline_SetConfig(config);
@@ -1359,7 +1235,7 @@ namespace
     }
 
     // Developer key gpu_queue_probe_source: default 1, clamp 0..1, forced 0 on Win32, independent of
-    // the key unified_pacer and the law, and the publish round trip.
+    // the input `unified` and the law, and the publish round trip.
     void TestGpuQueueProbeSourceKey()
     {
         CHECK(PacingPipelineConfig{}.gpu_queue_probe_source == 1 && kPacingGpuQueueProbeSourceDefault == 1);
@@ -1374,7 +1250,7 @@ namespace
             PacingPipelineConfig config{};
             config.gpu_queue_probe_source = test.value;
             for (const bool key : { false, true }) {
-                config.unified_pacer = key;
+                config.unified = key;
                 CHECK(PacingPipeline_ClampConfig(config).gpu_queue_probe_source == (wide ? test.expected : 0));
             }
             PacingPipeline_SetConfig(config);
@@ -1385,7 +1261,7 @@ namespace
     }
 
     // Developer key unified_queue_margin_end: default 1, clamp 0..1, forced 0 on Win32, independent of
-    // the key unified_pacer and the law, and the publish round trip.
+    // the input `unified` and the law, and the publish round trip.
     void TestUnifiedQueueMarginEndKey()
     {
         CHECK(PacingPipelineConfig{}.unified_queue_margin_end == 1 && kPacingUnifiedQueueMarginEndDefault == 1);
@@ -1399,7 +1275,7 @@ namespace
             PacingPipelineConfig config{};
             config.unified_queue_margin_end = test.value;
             for (const bool key : { false, true }) {
-                config.unified_pacer = key;
+                config.unified = key;
                 CHECK(PacingPipeline_ClampConfig(config).unified_queue_margin_end == (wide ? test.expected : 0));
             }
             PacingPipeline_SetConfig(config);
@@ -1490,18 +1366,13 @@ namespace
         fixed.vrr = false;
         CHECK(Resolve(config, QualifiedDx12(), fixed).auto_rung == PacingRung::MarkerHold);
 
-        // Not demoted, overrides, rules 1–4: equal to the resolved rung.
+        // Not demoted: equal to the resolved rung.
         const PacingRuntimeState plain[] = { ActiveVrr(), ActiveFg() };
         for (const PacingRuntimeState& runtime : plain) {
             const PacingPipelineSnapshot auto_result = Resolve(config, QualifiedDx12(), runtime);
             CHECK(auto_result.auto_rung == auto_result.rung);
         }
-        const PacingPipelineSnapshot overridden =
-            Resolve(WithOverride(PacingRungOverride::Native), QualifiedDx12(), ActiveVrr());
-        CHECK(overridden.rung == PacingRung::NativeHold && overridden.auto_rung == PacingRung::NativeHold);
-        const PacingPipelineSnapshot smoothing_off =
-            Resolve(WithSmoothing(PacingSmoothing::Off), QualifiedDx12(), ActiveVrr());
-        CHECK(smoothing_off.auto_rung == PacingRung::SourceOnly);
+        // Rules 1-3 (passthrough, idle, present route): source only.
         CHECK(Resolve(config, PresentBased(), ActiveVrr()).auto_rung == PacingRung::SourceOnly);
         PacingRuntimeState idle = ActiveVrr();
         idle.idle_cap = true;
@@ -1511,34 +1382,34 @@ namespace
         CHECK(Resolve(config, QualifiedDx12(), uncapped).auto_rung == PacingRung::SourceOnly);
 
         // Published and read back through the seqlock.
-        PacingPipeline_Publish(overridden);
+        const PacingPipelineSnapshot held = Resolve(config, QualifiedDx12(), ActiveFg());
+        CHECK(held.rung == PacingRung::FgInputWait && held.auto_rung == PacingRung::FgInputWait);
+        PacingPipeline_Publish(held);
         const PacingPipelineSnapshot read = PacingPipeline_Read();
-        CHECK(read.rung == PacingRung::NativeHold && read.auto_rung == PacingRung::NativeHold);
-        CHECK(PacingPipeline_SameResult(read, overridden));
+        CHECK(read.rung == PacingRung::FgInputWait && read.auto_rung == PacingRung::FgInputWait);
+        CHECK(PacingPipeline_SameResult(read, held));
     }
 
-    // Overload guard and the not-held A/B interleave block:
-    // Auto rules 6–8 only.
+    // Overload guard and the not-held A/B interleave block: Auto rules 6-8 only, and only in the earlier pipeline
+    // (Win32): the unified pacer bypasses them (the law limits the unfinished frames itself), so on 64-bit the same
+    // runtime states keep the hold rung (CheckHoldDemotion).
     void TestHoldFeasibility()
     {
         const PacingPipelineConfig config{};
         PacingRuntimeState overloaded = ActiveVrr();
         overloaded.hold_overloaded = true;
         PacingPipelineSnapshot result = Resolve(config, QualifiedDx12(), overloaded);
-        CHECK_RESULT(result, Vrr, Marker, SourceOnly, Infeasible);
-        CHECK(result.auto_rung == PacingRung::GpuQueueWait);
+        CHECK_HOLD_DEMOTION(result, Vrr, GpuQueueWait, None);
         CHECK_LEAD(result, kDefaultLeadQuantile, 500.0);
         overloaded = ActiveFg();
         overloaded.hold_overloaded = true;
-        result = Resolve(config, QualifiedDx12(), overloaded);
-        CHECK_RESULT(result, Vrr, Marker, SourceOnly, Infeasible);
-        CHECK(result.auto_rung == PacingRung::FgInputWait);
+        CHECK_HOLD_DEMOTION(Resolve(config, QualifiedDx12(), overloaded), Vrr, FgInputWait, None);
         overloaded = ActiveVrr();
         overloaded.hold_overloaded = true;
         result = Resolve(config, VulkanPcl(), overloaded);
-        CHECK_RESULT(result, Vrr, Marker, SourceOnly, Infeasible);
-        CHECK(result.auto_rung == PacingRung::MarkerHold);
-        CHECK(!PacingPipeline_SameResult(result, Resolve(config, VulkanPcl(), ActiveVrr())));
+        CHECK_HOLD_DEMOTION(result, Vrr, MarkerHold, Api);
+        // The demotion is a change of result only where it exists.
+        CHECK(PacingPipeline_SameResult(result, Resolve(config, VulkanPcl(), ActiveVrr())) == kWide);
         // Nothing to demote: an unqualified FG stays fg_unqualified.
         PacingCapabilities unqualified = QualifiedDx12();
         unqualified.fg_input_route_ready = false;
@@ -1549,23 +1420,17 @@ namespace
         // A not-held A/B block demotes the GPU queue wait only.
         PacingRuntimeState paused = ActiveVrr();
         paused.gpu_queue_wait_off = true;
-        result = Resolve(config, QualifiedDx12(), paused);
-        CHECK_RESULT(result, Vrr, Marker, SourceOnly, Infeasible);
-        CHECK(result.auto_rung == PacingRung::GpuQueueWait);
+        CHECK_HOLD_DEMOTION(Resolve(config, QualifiedDx12(), paused), Vrr, GpuQueueWait, None);
         PacingRuntimeState fg_paused = ActiveFg();
         fg_paused.gpu_queue_wait_off = true;
         CHECK_RESULT(Resolve(config, QualifiedDx12(), fg_paused), Vrr, Marker, FgInputWait, None);
         CHECK_RESULT(Resolve(config, VulkanPcl(), paused), Vrr, Marker, MarkerHold, Api);
 
-        // Overrides, Smoothing Off and the earlier rules are never changed.
+        // Both flags: the earlier rules are never changed.
         PacingRuntimeState both = ActiveVrr();
         both.hold_overloaded = true;
         both.gpu_queue_wait_off = true;
-        result = Resolve(WithOverride(PacingRungOverride::Gpu), QualifiedDx12(), both);
-        CHECK_RESULT(result, Vrr, Marker, GpuQueueWait, Override);
-        CHECK(result.auto_rung == PacingRung::GpuQueueWait);
-        CHECK_RESULT(Resolve(WithSmoothing(PacingSmoothing::Off), QualifiedDx12(), both),
-            Vrr, Marker, SourceOnly, SmoothingOff);
+        CHECK_HOLD_DEMOTION(Resolve(config, QualifiedDx12(), both), Vrr, GpuQueueWait, None);
         CHECK_RESULT(Resolve(config, PresentBased(), both), Vrr, Present, SourceOnly, PresentRoute);
         both.idle_cap = true;
         CHECK_RESULT(Resolve(config, QualifiedDx12(), both), Idle, Marker, SourceOnly, IdleCap);
@@ -1573,7 +1438,8 @@ namespace
 
     // PacingPipeline_LeadRung: the rung whose lead plans the frame. Only a
     // demoted Auto hold rung (rung SourceOnly, reason Infeasible) plans with
-    // its auto_rung; everything else plans with the rung itself.
+    // its auto_rung; everything else plans with the rung itself. The resolver demotes only in the earlier
+    // pipeline (Win32); the unified pacer keeps the rung, which then leads itself (CheckHoldDemotion).
     void TestLeadRungOfDemotedAutoRungs()
     {
         const PacingPipelineConfig config{};
@@ -1582,24 +1448,24 @@ namespace
         PacingRuntimeState overloaded = ActiveVrr();
         overloaded.hold_overloaded = true;
         PacingPipelineSnapshot result = Resolve(config, QualifiedDx12(), overloaded);
-        CHECK_RESULT(result, Vrr, Marker, SourceOnly, Infeasible);
+        CHECK_HOLD_DEMOTION(result, Vrr, GpuQueueWait, None);
         CHECK(PacingPipeline_LeadRung(result) == PacingRung::GpuQueueWait);
 
         PacingRuntimeState fg_overloaded = ActiveFg();
         fg_overloaded.hold_overloaded = true;
         result = Resolve(config, QualifiedDx12(), fg_overloaded);
-        CHECK_RESULT(result, Vrr, Marker, SourceOnly, Infeasible);
+        CHECK_HOLD_DEMOTION(result, Vrr, FgInputWait, None);
         CHECK(PacingPipeline_LeadRung(result) == PacingRung::FgInputWait);
 
         result = Resolve(config, VulkanPcl(), overloaded);
-        CHECK_RESULT(result, Vrr, Marker, SourceOnly, Infeasible);
+        CHECK_HOLD_DEMOTION(result, Vrr, MarkerHold, Api);
         CHECK(PacingPipeline_LeadRung(result) == PacingRung::MarkerHold);
 
         // Fixed refresh, NvAPI route: the Auto rung is the marker hold too.
         PacingRuntimeState fixed_overloaded = overloaded;
         fixed_overloaded.vrr = false;
         result = Resolve(config, QualifiedDx12(), fixed_overloaded);
-        CHECK_RESULT(result, Fixed, Marker, SourceOnly, Infeasible);
+        CHECK_HOLD_DEMOTION(result, Fixed, MarkerHold, FixedRefresh);
         CHECK(PacingPipeline_LeadRung(result) == PacingRung::MarkerHold);
 
         // A not-held A/B block (gpu_queue_wait_off) demotes the GPU queue wait
@@ -1607,7 +1473,7 @@ namespace
         PacingRuntimeState not_held_block = ActiveVrr();
         not_held_block.gpu_queue_wait_off = true;
         result = Resolve(config, QualifiedDx12(), not_held_block);
-        CHECK_RESULT(result, Vrr, Marker, SourceOnly, Infeasible);
+        CHECK_HOLD_DEMOTION(result, Vrr, GpuQueueWait, None);
         CHECK(PacingPipeline_LeadRung(result) == PacingRung::GpuQueueWait);
 
         // The resolver never demotes the Auto rung to native hold, but the
@@ -1643,39 +1509,11 @@ namespace
         CHECK(PacingPipeline_LeadRung(Resolve(config, VulkanPcl(), paused)) ==
               PacingRung::MarkerHold);
 
-        // Output overrides are never demoted (reason Override, never Infeasible),
-        // not even under overload plus an A/B block.
+        // Idle cap, passthrough, uncapped and the present route are source only
+        // with their own reasons, under overload too.
         PacingRuntimeState both = ActiveVrr();
         both.hold_overloaded = true;
         both.gpu_queue_wait_off = true;
-        struct Override {
-            PacingRungOverride value;
-            PacingRung rung;
-        };
-        const Override overrides[] = {
-            { PacingRungOverride::Gpu, PacingRung::GpuQueueWait },
-            { PacingRungOverride::Native, PacingRung::NativeHold },
-            { PacingRungOverride::Marker, PacingRung::MarkerHold },
-        };
-        for (const Override& entry : overrides) {
-            result = Resolve(WithOverride(entry.value), QualifiedDx12(), both);
-            CHECK(result.rung == entry.rung);
-            CHECK(result.reason == PacingFallbackReason::Override);
-            CHECK(PacingPipeline_LeadRung(result) == entry.rung);
-        }
-        PacingRuntimeState fg_both = ActiveFg();
-        fg_both.hold_overloaded = true;
-        fg_both.gpu_queue_wait_off = true;
-        result = Resolve(WithOverride(PacingRungOverride::Gpu), QualifiedDx12(), fg_both);
-        CHECK_RESULT(result, Vrr, Marker, FgInputWait, Override);
-        CHECK(PacingPipeline_LeadRung(result) == PacingRung::FgInputWait);
-        // An override resolving to source only stays source only.
-        result = Resolve(WithOverride(PacingRungOverride::SourceOnly), QualifiedDx12(), both);
-        CHECK(result.rung == PacingRung::SourceOnly && result.reason == PacingFallbackReason::Override);
-        CHECK(PacingPipeline_LeadRung(result) == PacingRung::SourceOnly);
-
-        // Idle cap, passthrough, uncapped, Smoothing Off and the present route
-        // are source only with their own reasons, under overload too.
         PacingRuntimeState idle = both;
         idle.idle_cap = true;
         result = Resolve(config, QualifiedDx12(), idle);
@@ -1690,9 +1528,6 @@ namespace
         uncapped.uncapped = true;
         CHECK(PacingPipeline_LeadRung(Resolve(config, QualifiedDx12(), uncapped)) ==
               PacingRung::SourceOnly);
-        result = Resolve(WithSmoothing(PacingSmoothing::Off), QualifiedDx12(), both);
-        CHECK(result.reason == PacingFallbackReason::SmoothingOff);
-        CHECK(PacingPipeline_LeadRung(result) == PacingRung::SourceOnly);
         result = Resolve(config, PresentBased(), both);
         CHECK(result.reason == PacingFallbackReason::PresentRoute);
         CHECK(PacingPipeline_LeadRung(result) == PacingRung::SourceOnly);
@@ -1712,9 +1547,17 @@ namespace
         // rung even when auto_rung names a hold rung.
         PacingPipelineSnapshot other_reason{};
         other_reason.rung = PacingRung::SourceOnly;
-        other_reason.reason = PacingFallbackReason::SmoothingOff;
+        other_reason.reason = PacingFallbackReason::IdleCap;
         other_reason.auto_rung = PacingRung::GpuQueueWait;
         CHECK(PacingPipeline_LeadRung(other_reason) == PacingRung::SourceOnly);
+        other_reason.reason = PacingFallbackReason::Override;
+        CHECK(PacingPipeline_LeadRung(other_reason) == PacingRung::SourceOnly);
+        // The Reflex driver limiter (rung SourceOnly, reason Override) plans with source only.
+        PacingPipelineConfig limiter{};
+        limiter.test_mode = PacingTestMode::DriverLimiter;
+        PacingRuntimeState sleeping = ActiveVrr();
+        sleeping.pre_sleep_available = true;
+        CHECK(PacingPipeline_LeadRung(Resolve(limiter, QualifiedDx12(), sleeping)) == PacingRung::SourceOnly);
     }
 
     template <typename Enum, typename TextOf>
@@ -1818,20 +1661,19 @@ namespace
 
     void TestConcurrentConfig()
     {
+        // Fields every build keeps unforced, so a published read equals its source (SameConfig).
         PacingPipelineConfig first{};
-        first.smoothing = PacingSmoothing::On;
-        first.rung_override = PacingRungOverride::Marker;
         first.gpu_probes = true;
-        first.stall_inject_ms = 10.0;
-        first.stall_inject_period_s = 2.0;
+        first.test_mode = PacingTestMode::Off;
+        first.unified_queue_rank = 2;
+        first.unified_queue_need_frames = 4;
+        first.unified_queue_allow_us = 1000;
         PacingPipelineConfig second{};
-        second.smoothing = PacingSmoothing::Off;
-        second.rung_override = PacingRungOverride::Gpu;
-        second.adaptive_cap = true;
         second.gpu_probes = false;
-        second.stall_inject_ms = 150.0;
-        second.stall_inject_period_s = 30.0;
-        second.gpu_queue_wait_render_queue = PacingRenderQueue::Remove;
+        second.test_mode = PacingTestMode::DriverLimiter;
+        second.unified_queue_rank = 6;
+        second.unified_queue_need_frames = 9;
+        second.unified_queue_allow_us = 12000;
         PacingPipeline_SetConfig(first);
 
         std::atomic<bool> done{ false };
@@ -1842,6 +1684,10 @@ namespace
                 while (!done.load(std::memory_order_acquire)) {
                     const PacingPipelineConfig read = PacingPipeline_GetConfig();
                     if (!SameConfig(read, first) && !SameConfig(read, second)) {
+                        torn.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    // The derived owner is written with the test mode: a read never mixes the two.
+                    if (read.unified != (kWide && read.test_mode == PacingTestMode::Off)) {
                         torn.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
@@ -1919,30 +1765,29 @@ int main()
     TestPassthrough();
     TestIdleCap();
     TestPresentRoute();
-    TestSmoothingOff();
-    TestOverrideSourceAndMarker();
-    TestOverrideNative();
-    TestOverrideGpu();
-    TestOverrideAutoAndUnknown();
+    TestMarkerRoutesNeedX64();
     TestFrameGeneration();
     TestGpuQueueRule();
     TestAutoRung();
     TestHoldFeasibility();
     TestLeadRungOfDemotedAutoRungs();
     TestLeadRungOfRungsThatAreNotDemoted();
-    TestSmoothingTable();
-    TestLeadCoverage();
+    TestLeadParameters();
+    TestLeadCoverageText();
     TestProbesCopied();
     TestSameResult();
     TestPacingPreferenceMapping();
     TestPublishGeneration();
     TestCapabilities();
     TestSourcePlacement();
-    TestDriverLimiterHold();
-    TestUnifiedPacerKey();
+    TestDriverLimiterTestMode();
+    TestDriverLimiterPlacementInvariant();
+    TestUnifiedOwnerDerivation();
+    TestUnifiedOwner();
     TestPipelineRungOfRecords();
+    TestRemovedSettingConstants();
+    TestAdaptiveCapFitTier();
     TestConfigClamp();
-    TestUnifiedLawOptionKeys();
     TestUnifiedHoldShareKey();
     TestUnifiedQueueLawKeys();
     TestUnifiedQueueNeedFramesKey();

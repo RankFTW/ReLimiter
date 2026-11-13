@@ -174,30 +174,11 @@ static void EnforceStickyMonitor() {
 
 // ── Pacing pipeline controls ──
 
-// Combo labels in enum order.
-static const char* const kRungOverrideLabels[] = {
-    "Auto", "Source only (no hold)", "Marker hold", "Native Present hold", "GPU wait"};
-static_assert(IM_ARRAYSIZE(kRungOverrideLabels) == static_cast<int>(PacingRungOverride::Count));
-
 static const char* PacingRouteLabel() {
     const auto path = EnfDisp_GetActivePath();
     if (path == EnforcementPath::NvAPIMarkers || path == EnforcementPath::PCLMarkers) return "Reflex markers";
     if (path == EnforcementPath::PresentBased) return "Present-based";
     return "waiting for a presenting swapchain";
-}
-
-// Developer diagnostics only: users always pace with Smoothing on.
-static void DrawSmoothingControl(bool* config_dirty) {
-    bool smoothing = g_config.smoothing == PacingSmoothing::On;
-    if (ImGui::Checkbox("Smoothing", &smoothing)) {
-        g_config.smoothing = smoothing ? PacingSmoothing::On : PacingSmoothing::Off;
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: smoothing -> %s", PacingSmoothing_Text(g_config.smoothing));
-        *config_dirty = true;
-    }
-    HelpTip("Developer. On (default) holds each frame's output to the cap cadence at the best available "
-        "output point (GPU wait, marker hold) and releases the game early enough for 95% of recent frames "
-        "plus 0.5 ms. Off holds nothing after the source wait.");
 }
 
 // Resolved pipeline (resolver publication) and the source stage's lead and grid.
@@ -213,10 +194,6 @@ static void DrawPacingPipelineStatus() {
     if (has_status && status.hold_overloaded)
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Hold off: overload (needs %.0f s without restarts)",
             MISS_WINDOW_S);
-    // Developer A/B interleave (gpu_wait_interleave_s): the running block.
-    if (has_status && status.hold_interleave != 0)
-        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "A/B interleave: %s block (%.1f s left)",
-            status.hold_interleave == 1 ? "held" : "not-held", status.hold_interleave_remaining_s);
     // Source placement.
     if (pipeline.placement == PacingSourcePlacement::PreSleep && has_status) {
         if (status.pre_sleep_samples > 0)
@@ -247,16 +224,6 @@ static void DrawPacingPipelineStatus() {
     else if (has_status && status.render_handoff == 2)
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
             "Render handoff limit: off (the render thread may wait for the next release; waiting for evidence)");
-    // Developer A/B gpu_paced_cadence: the switch is on and the GPU floor is known.
-    if (has_status && status.gpu_paced_cadence) {
-        ImGui::TextDisabled("GPU-paced cadence: %u of the newest 128 frames released by the GPU floor | %u frames | "
-            "%u cadence moves",
-            status.gpu_paced_recent, status.gpu_paced_frames, status.gpu_paced_moves);
-        ImGui::TextDisabled("GPU-paced rhythm: %u smooth | %u late | %u early bound | %u restarts | "
-            "GPU end from readiness %u of %u",
-            status.rhythm_smooth, status.rhythm_late, status.rhythm_early_bound, status.rhythm_start,
-            status.floor_from_ready, status.floor_frames);
-    }
     if (has_status && status.valid) {
         ImGui::TextDisabled("Lead: %.2f ms (%s, %u samples%s) | Grid epoch: %u",
             status.lead_us / 1000.0, status.lead_warm ? "warm" : "warming",
@@ -303,10 +270,10 @@ static void DrawPacingPipelineStatus() {
     if (gpu_rung)
         ImGui::TextDisabled("Driver Sleep: %.2f ms",
             g_pacer_latency_us.load(std::memory_order_relaxed) / 1000.0);
-    HelpTip("Mode, output point and fallback reason resolved from Smoothing, the pacing route and the display. "
+    HelpTip("Mode, output point and fallback reason resolved from the pacing route and the display. "
         "Lead is how far ahead of each output target the game is released; 'at budget' means it is clamped "
-        "to three frame intervals. A grid epoch starts on a cap, LFC or FG divisor change, a fixed-refresh "
-        "Adaptive cap step, or after a late frame; the cadence never catches up. 'Release headroom' keeps "
+        "to three frame intervals. A grid epoch starts on a cap, LFC or FG divisor change, or after a late "
+        "frame; the cadence never catches up. 'Release headroom' keeps "
         "the release at least this long before the next frame's heavy GPU work starts (its GPU ready time "
         "minus its Reflex GPU active time): the GPU does not interrupt that work for the frame being "
         "released, so the lead is limited to one interval plus the game's short release-to-GPU-work time "
@@ -317,19 +284,11 @@ static void DrawPacingPipelineStatus() {
         "on them. 'Hold off' "
         "means ReLimiter stopped holding frames on its own (reason 'infeasible'): under overload, when more "
         "than 10% of frames restarted the cadence within 2 s where ReLimiter's holds or the render handoff "
-        "limit could act, and the Adaptive cap could not lengthen the interval; holds resume after 2 s "
-        "without such restarts. "
-        "Output override is never changed. Placement pre-Sleep means most of the source wait happens before "
+        "limit could act; holds resume after 2 s without such restarts. "
+        "Placement pre-Sleep means most of the source wait happens before "
         "the driver's Reflex Sleep "
         "and the game is released exactly at SIMULATION_START; the margin covers the wait's late wake-up, the "
         "driver Sleep and the game's work up to the marker.");
-}
-
-// Interval lengthening of the governed interval, in percent of I_0 (the
-// paced interval: whole refreshes in snapped fixed refresh).
-static double GovernorStretchPercent(const SchedulerPacingStatus& status) {
-    if (!(status.governor_base_interval_us > 0.0) || !(status.governor_interval_us > 0.0)) return 0.0;
-    return (status.governor_interval_us / status.governor_base_interval_us - 1.0) * 100.0;
 }
 
 // Plain-language pacing state for the main view; the technical lines are in
@@ -341,10 +300,17 @@ static void DrawPacingSummaryLine(const PacingPipelineSnapshot& pipeline, bool h
     const ImVec4 amber(1.0f, 0.7f, 0.3f, 1.0f);
     const bool holding = pipeline.rung != PacingRung::SourceOnly;
     const bool gpu = pipeline.rung == PacingRung::GpuQueueWait || pipeline.rung == PacingRung::FgInputWait;
+    const PacingTestMode test_mode = PacingPipeline_TestMode();
+    if (test_mode == PacingTestMode::ReflexOnly) {
+        ImGui::TextColored(gray, "Test mode reflex_only: ReLimiter paces nothing (the game's own Reflex runs)");
+        return;
+    }
+    if (test_mode == PacingTestMode::DriverLimiter && pipeline.reason != PacingFallbackReason::DriverLimiterUnavailable) {
+        ImGui::TextColored(gray, "Test mode driver_limiter: the NVIDIA limiter holds the cap (ReLimiter holds nothing)");
+        return;
+    }
     if (has_status && status.hold_overloaded) {
-        ImGui::TextColored(amber, g_config.adaptive_cap
-            ? "Paused: the game can't reach the cap right now (resumes on its own)"
-            : "Paused: the game can't reach the cap right now (Adaptive cap can help)");
+        ImGui::TextColored(amber, "Paused: the game can't reach the cap right now (resumes on its own)");
         return;
     }
     switch (pipeline.reason) {
@@ -405,41 +371,8 @@ static void DrawPacingSummary(bool* config_dirty) {
     }
     if (ImGui::TreeNode("Details##pacing")) {
         DrawPacingPipelineStatus();
-        if (g_config.adaptive_cap && has_status && status.governor_enabled) {
-            const GovernorCause cause = static_cast<GovernorCause>(status.governor_last_cause);
-            ImGui::TextDisabled("Adaptive cap: interval +%.1f%% | %s | last: %s", GovernorStretchPercent(status),
-                GovernorPhase_Text(static_cast<GovernorPhase>(status.governor_phase)),
-                cause == GovernorCause::None ? "-" : GovernorCause_Text(cause));
-        }
         ImGui::TreePop();
     }
-}
-
-// Adaptive cap: the period governor stretches the cap interval.
-static void DrawAdaptiveCapControl(bool* config_dirty) {
-    if (ImGui::Checkbox("Adaptive cap", &g_config.adaptive_cap)) {
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: adaptive cap -> %s", g_config.adaptive_cap ? "on" : "off");
-        *config_dirty = true;
-    }
-    SchedulerPacingStatus status;
-    if (g_config.adaptive_cap && Scheduler_ReadPacingStatus(&status) && status.governor_enabled) {
-        // The interval is (1 + p) times the cap's: the frame rate is p / (1 + p) below it.
-        const double percent = GovernorStretchPercent(status);
-        const double below = 100.0 * percent / (100.0 + percent);
-        ImGui::SameLine();
-        if (below < 0.5)
-            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "(at the cap)");
-        else
-            ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.2f, 1.0f), "(%.0f%% below the cap)", below);
-    }
-    HelpTip("When the game can't keep up with your cap, lowers the frame rate a little (at most about "
-        "38% below it) so frames stay evenly spaced, and returns to the cap once the game can hold it "
-        "again. Off keeps the cap and lets heavy moments run unevenly.");
-    if (!g_config.adaptive_cap) return;
-    if (ImGui::Checkbox("Show on OSD##adaptive", &g_config.osd_show_adaptive_smoothing))
-        *config_dirty = true;
-    HelpTip("Show the Adaptive cap on the OSD.");
 }
 
 #ifdef _WIN64
@@ -470,31 +403,8 @@ static void DrawPacingPreferenceControl(bool* config_dirty) {
 }
 #endif
 
-// Advanced: how much of the recent load the Adaptive cap plans for, one of
-// three tiers.
-static void DrawAdaptiveCapTuning(bool* config_dirty) {
-    if (!g_config.adaptive_cap) return;
-    static const char* const kFitLabels[] = {"75% (most frame rate)", "90%", "99% (smoothest)"};
-    static_assert(IM_ARRAYSIZE(kFitLabels) == IM_ARRAYSIZE(kAdaptiveCapFitTiers), "one label per tier");
-    int selected = 0;
-    for (int i = 0; i < IM_ARRAYSIZE(kAdaptiveCapFitTiers); ++i)
-        if (kAdaptiveCapFitTiers[i] == g_config.adaptive_cap_percentile) selected = i;
-    if (ImGui::Combo("Adaptive cap fit##adaptive", &selected, kFitLabels, IM_ARRAYSIZE(kFitLabels))) {
-        g_config.adaptive_cap_percentile = kAdaptiveCapFitTiers[selected];
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: adaptive cap percentile -> %d", g_config.adaptive_cap_percentile);
-        *config_dirty = true;
-    }
-    HelpTip("The share of recent frames the Adaptive cap plans for (default 75%). Higher keeps heavy "
-        "moments evenest at a lower frame rate; lower keeps more frame rate and lets the slowest frames "
-        "arrive a little late. In a test with frame generation near the GPU's limit, 99% removed most "
-        "stutter for about 5% less frame rate.");
-}
-
-// Advanced → Developer diagnostics (developer_settings=true in the INI):
-// Smoothing, rung override, GPU wait probes and budget, stall injector, the
-// Reflex Sleep bypass, marker forward order, render queue and source
-// placement. For A/B captures; each control can make pacing worse on purpose.
+// Advanced → Developer diagnostics (developer_settings=true in the INI): the pacing owner for comparison captures
+// (pacing_test_mode), the GPU wait probes and flip metering. Each control can make pacing worse on purpose.
 static void DrawPacingDiagnostics(bool* config_dirty) {
     ImGui::Spacing();
     ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Developer diagnostics");
@@ -505,17 +415,22 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
     }
     HelpTip("Shown because developer_settings=true in relimiter.ini. For comparison captures; each "
         "control can make pacing worse on purpose. Reset returns all of them to the recommended defaults.");
-    DrawSmoothingControl(config_dirty);
-    int rung = static_cast<int>(g_config.output_rung);
-    if (ImGui::Combo("Output override", &rung, kRungOverrideLabels, IM_ARRAYSIZE(kRungOverrideLabels))) {
-        g_config.output_rung = static_cast<PacingRungOverride>(rung);
+    static const char* const kOwnerLabels[] = {"ReLimiter (default)", "Reflex only (ReLimiter paces nothing)",
+        "Reflex driver limiter"};
+    static_assert(IM_ARRAYSIZE(kOwnerLabels) == static_cast<int>(PacingTestMode::Count),
+        "one label per pacing test mode");
+    int owner = static_cast<int>(g_config.pacing_test_mode);
+    if (ImGui::Combo("Pacing owner (test)", &owner, kOwnerLabels, IM_ARRAYSIZE(kOwnerLabels))) {
+        g_config.pacing_test_mode = static_cast<PacingTestMode>(owner);
         Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: output rung override -> %s", PacingRungOverride_Text(g_config.output_rung));
+        LOG_INFO("OSD: pacing test mode -> %s", PacingTestMode_Text(g_config.pacing_test_mode));
         *config_dirty = true;
     }
-    HelpTip("Diagnostic. Auto uses the resolved output point. An override whose requirements are not met "
-        "falls back one step (GPU wait or native hold to marker hold, marker hold to source only) with "
-        "reason 'override'. Smoothing Off, idle caps and Present-based routes still take precedence.");
+    HelpTip("Diagnostic, 64-bit Reflex games. ReLimiter (default) paces. Reflex only: ReLimiter paces nothing and "
+        "the game's own Reflex calls run as they are, with the saved cap kept. Reflex driver limiter: the cap "
+        "goes to the NVIDIA driver's own limiter as its minimum interval and ReLimiter holds nothing; where the "
+        "limiter cannot apply (idle caps, no Reflex Sleep from the game, Present-based routes, 32-bit) the game "
+        "runs as it is and the pacing state says so. The saved choice is kept in relimiter.ini.");
 #ifdef _WIN64
     if (ImGui::Checkbox("GPU Wait Probes", &g_config.gpu_present_gate_probes)) {
         Config_ApplyPacingPipeline();
@@ -526,84 +441,6 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         "The times are exported as gate_pre_wait_qpc and gate_post_wait_qpc in the pacing CSV, refine "
         "the lead and measure the late GPU resumes shown on the Details lines. Off removes two command "
         "lists and two fence signals per frame from the game's queue.");
-    float headroom = static_cast<float>(g_config.gpu_wait_headroom_us);
-    ImGui::SliderFloat("GPU wait release headroom", &headroom, static_cast<float>(kPacingGpuWaitHeadroomMinUs),
-        static_cast<float>(kPacingGpuWaitHeadroomMaxUs), "%.0f us", ImGuiSliderFlags_AlwaysClamp);
-    if (ImGui::IsItemEdited())
-        g_config.gpu_wait_headroom_us = static_cast<double>(headroom);
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: GPU wait release headroom -> %.0f us", g_config.gpu_wait_headroom_us);
-        *config_dirty = true;
-    }
-    HelpTip("Diagnostic, GPU wait output with Output override Auto. How long before the next frame's heavy "
-        "GPU work a held frame is released (default 1000 us), so its resume does not queue behind that work. "
-        "It also sets the Adaptive cap hold room. For reproducing a report; leave it at the default.");
-    float interleave_s = static_cast<float>(g_config.gpu_wait_interleave_s);
-    ImGui::SliderFloat("GPU wait A/B blocks", &interleave_s, 0.0f,
-        static_cast<float>(kPacingGpuWaitInterleaveMaxS), interleave_s > 0.0f ? "%.1f s" : "Off",
-        ImGuiSliderFlags_AlwaysClamp);
-    if (ImGui::IsItemEdited())
-        g_config.gpu_wait_interleave_s = interleave_s < 0.5f ? 0.0
-            : (std::max)(static_cast<double>(interleave_s), kPacingGpuWaitInterleaveMinS);
-    if (ImGui::IsItemDeactivatedAfterEdit()) {
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: GPU wait A/B blocks -> %.1f s (0 = off)", g_config.gpu_wait_interleave_s);
-        *config_dirty = true;
-    }
-    HelpTip("Diagnostic for A/B captures, Output override Auto only. The GPU queue wait alternates held "
-        "and not-held blocks of 0.75-1.25 x this length, so both outputs are measured at the same loads. "
-        "Pacing switches every block on purpose. Off for normal "
-        "play.");
-#endif
-
-    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Diagnostic only: the stall injector hitches the game on purpose.");
-    float stall_ms = static_cast<float>(g_config.stall_inject_ms);
-    ImGui::SliderFloat("Stall injector", &stall_ms, 0.0f, static_cast<float>(kPacingStallInjectMaxMs),
-        stall_ms > 0.0f ? "%.1f ms" : "Off", ImGuiSliderFlags_AlwaysClamp);
-    if (ImGui::IsItemEdited()) g_config.stall_inject_ms = static_cast<double>(stall_ms);
-    const bool stall_edited = ImGui::IsItemDeactivatedAfterEdit();
-    HelpTip("Diagnostic. Sleeps this long after the source wait once per period to test stall recovery "
-        "(stall_injected in the pacing CSV). 0 = off. Leave off for normal play.");
-    float period_s = static_cast<float>(g_config.stall_inject_period_s);
-    ImGui::SliderFloat("Stall period", &period_s, static_cast<float>(kPacingStallInjectMinPeriodS),
-        static_cast<float>(kPacingStallInjectMaxPeriodS), "%.0f s", ImGuiSliderFlags_AlwaysClamp);
-    if (ImGui::IsItemEdited()) g_config.stall_inject_period_s = static_cast<double>(period_s);
-    const bool period_edited = ImGui::IsItemDeactivatedAfterEdit();
-    if (stall_edited || period_edited) {
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: stall injector -> %.1f ms every %.0f s",
-                 g_config.stall_inject_ms, g_config.stall_inject_period_s);
-        *config_dirty = true;
-    }
-    SchedulerPacingStatus status;
-    if (g_config.stall_inject_ms > 0.0 && Scheduler_ReadPacingStatus(&status) && status.valid)
-        ImGui::TextDisabled("Stalls injected: %u", status.stalls_injected);
-
-#ifdef _WIN64
-    if (ImGui::Checkbox("Bypass Reflex Sleep", &g_config.reflex_sleep_bypass)) {
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: Reflex Sleep bypass -> %s (applies while ReLimiter paces a positive cap)",
-            g_config.reflex_sleep_bypass ? "on" : "off");
-        *config_dirty = true;
-    }
-    HelpTip("On (default) skips the driver's NvAPI Sleep while ReLimiter paces a cap, holding frames or "
-        "not; ReLimiter's pre-Sleep wait paces the game instead (CONTROL with FG 2x: 10x fewer long frames "
-        "at the same PC latency; Rogue Core unchanged). Frames that are not held wait until the game's "
-        "render thread has taken the previous frame (render handoff limit), so the game cannot run ahead. "
-        "Leaves markers and the game's SleepMode parameters unchanged. Off returns to the driver's Sleep. "
-        "With the cap off or in passthrough (Dynamic MFG) the Sleep always reaches the driver.");
-
-    if (ImGui::Checkbox("Driver low latency off while bypassed", &g_config.bypass_low_latency_off)) {
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: driver low latency off while bypassed -> %s",
-            g_config.bypass_low_latency_off ? "on" : "off");
-        *config_dirty = true;
-    }
-    HelpTip("Diagnostic A/B, Reflex games with the Reflex Sleep bypass on. On, the driver's low latency mode "
-        "is turned off while ReLimiter bypasses the Reflex Sleep, so the driver stops pacing inside the "
-        "game's Present and ReLimiter is the only pacer. The game's own setting is restored when the "
-        "bypass stops. Compare jitter, long frames and PC Latency; one setting per capture.");
 
     if (ImGui::Checkbox("Flip metering off (next launch)", &g_config.flip_metering_off)) {
         LOG_INFO("OSD: flip metering off -> %s (applies from the next launch)",
@@ -611,143 +448,9 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
         *config_dirty = true;
     }
     HelpTip("Diagnostic, DLSS Frame Generation on GPUs with hardware flip metering (RTX 50). On hides "
-        "NvAPI_D3D12_SetFlipConfig from the game, so frame generation runs as on a GPU without flip "
+        "NvAPI_D3D12_SetFlipConfig from the game, so frame generation runs as on a GPU without hardware flip "
         "metering: the display engine no longer spaces the generated frames. Takes effect at the next "
         "game launch. Leave off with Smooth Motion, which needs flip metering.");
-
-    static const char* const kMarkerForwardOrderLabels[] = {"Before wait", "After wait"};
-    static_assert(IM_ARRAYSIZE(kMarkerForwardOrderLabels) ==
-        static_cast<int>(PacingMarkerForwardOrder::Count));
-    int forward_order = static_cast<int>(g_config.marker_forward_order);
-    if (ImGui::Combo("Marker forward order", &forward_order, kMarkerForwardOrderLabels,
-            IM_ARRAYSIZE(kMarkerForwardOrderLabels))) {
-        g_config.marker_forward_order = static_cast<PacingMarkerForwardOrder>(forward_order);
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: NvAPI marker forward order -> %s",
-            PacingMarkerForwardOrder_Text(g_config.marker_forward_order));
-        *config_dirty = true;
-    }
-    HelpTip("Diagnostic, NvAPI marker games only. Before wait (default) passes SIMULATION_START to the "
-        "driver when the game sends it, then waits. After wait passes it after ReLimiter's source wait, "
-        "so the driver, Frame Generation and PC Latency see the paced frame start. Compare both in one session.");
-
-    static const char* const kRenderQueueLabels[] = {"Keep", "Remove", "Remove after held"};
-    static_assert(IM_ARRAYSIZE(kRenderQueueLabels) == static_cast<int>(PacingRenderQueue::Count));
-    int render_queue = static_cast<int>(g_config.gpu_queue_wait_render_queue);
-    if (ImGui::Combo("GPU queue wait render queue", &render_queue, kRenderQueueLabels,
-            IM_ARRAYSIZE(kRenderQueueLabels))) {
-        g_config.gpu_queue_wait_render_queue = static_cast<PacingRenderQueue>(render_queue);
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: GPU queue wait render queue -> %s",
-            PacingRenderQueue_Text(g_config.gpu_queue_wait_render_queue));
-        *config_dirty = true;
-    }
-    HelpTip("Diagnostic A/B, GPU queue wait only. Keep (default) learns the lead with the time a finished "
-        "frame waits for the game's render thread to leave the previous Present. Remove leaves that queue "
-        "out, as the FG input wait does, so the lead and latency can shrink; Remove after held does so only "
-        "after a frame whose GPU waited at ReLimiter's gate. Watch late GPU resumes, grid restarts and "
-        "PC Latency; one setting per capture.");
-
-    static const char* const kLeadCoverageLabels[] = {"50%", "75%", "90%", "95%", "99% (default)"};
-    static_assert(IM_ARRAYSIZE(kLeadCoverageLabels) == static_cast<int>(PacingLeadCoverage::Count));
-    int lead_coverage = static_cast<int>(g_config.lead_coverage);
-    if (ImGui::Combo("Lead coverage", &lead_coverage, kLeadCoverageLabels, IM_ARRAYSIZE(kLeadCoverageLabels))) {
-        g_config.lead_coverage = static_cast<PacingLeadCoverage>(lead_coverage);
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: lead coverage -> %s%%", PacingLeadCoverage_Text(g_config.lead_coverage));
-        *config_dirty = true;
-    }
-    HelpTip("Diagnostic A/B. The share of frames the lead releases early enough to be held. 99% (default) "
-        "leaves about 1 frame in 100 ready after its target; 95%, 90%, 75% and 50% about 1 in 20, 10, 4 and 2, "
-        "each for a shorter lead and less latency. Late frames are shown when ready, and with frame generation "
-        "each moves two or more displayed frames. The lead spike floor still applies unless it is off. Frames "
-        "late because the GPU or the game's render thread was still busy with the previous frame are not "
-        "helped. Watch long frames, jitter and PC Latency; one setting per capture.");
-
-    if (ImGui::Checkbox("FG late-frame spacing", &g_config.fg_late_spacing)) {
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: FG late-frame spacing -> %s", g_config.fg_late_spacing ? "on" : "off");
-        *config_dirty = true;
-    }
-    HelpTip("Diagnostic A/B, FG input wait only; on by default. When a real frame reaches the wait after its "
-        "release time, it enters frame generation when it is ready. On, the next real frame is then released "
-        "no sooner than about one frame interval after that, as after a late frame on the other outputs; off, "
-        "it is released on its original time, which shortens the displayed interval after the late one. A "
-        "frame is never held past its original time while the game's render thread is still inside that "
-        "frame's Present, because the next frame would wait too. Watch jitter and long frames; one setting "
-        "per capture.");
-
-    if (ImGui::Checkbox("GPU-paced cadence", &g_config.gpu_paced_cadence)) {
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: GPU-paced cadence -> %s", g_config.gpu_paced_cadence ? "on" : "off");
-        *config_dirty = true;
-    }
-    HelpTip("Diagnostic A/B, Reflex games with the Reflex Sleep bypass on. On, held frames are released no "
-        "earlier than about the render handoff GPU floor too (about half a GPU frame plus the submission delay "
-        "before the GPU finishes the previous frame), on a steady rhythm that follows the GPU's average frame "
-        "time rather than each frame's floor. When that floor sets a frame's release, the GPU is the "
-        "limit: the frame's output target becomes the time such a frame is ready at the earliest, and the "
-        "cadence continues from there instead of holding the frame to the cap's cadence, which would leave "
-        "the GPU idle. A held frame's floor never goes past the cap's own release of it by more than how late "
-        "the GPU finished the previous frame, so ReLimiter's holds never move it. Frames the GPU finishes early are "
-        "still held to the cap. With "
-        "Adaptive cap on, the FG input wait's hold room follows the GPU's recent frame need at the Adaptive cap "
-        "fit. Watch long frames, jitter, GPU idle gaps and PC Latency; one setting per capture.");
-
-    if (ImGui::Checkbox("Adaptive cap hold room", &g_config.adaptive_cap_hold_room)) {
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: Adaptive cap hold room -> %s", g_config.adaptive_cap_hold_room ? "on" : "off");
-        *config_dirty = true;
-    }
-    HelpTip("Diagnostic A/B, with Adaptive cap and Output override on Auto. On (default), the interval is kept "
-        "long enough for the GPU wait to hold frames: on the GPU queue wait the GPU's work for a frame plus the "
-        "release headroom, on the FG input wait (with GPU-paced cadence) the GPU's recent frame need at the "
-        "Adaptive cap fit. When the GPU is the limit this can lower the frame rate by about 20%. Off, the "
-        "interval follows only late frames and the game's workload reports. Compare one setting per capture, in "
-        "the same scene.");
-
-    if (ImGui::Checkbox("Lead spike floor", &g_config.lead_spike_floor)) {
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: lead spike floor -> %s", g_config.lead_spike_floor ? "on" : "off");
-        *config_dirty = true;
-    }
-    HelpTip("Diagnostic A/B, GPU waits with Output override on Auto. On (default), while the game's next frame "
-        "waits behind the GPU wait, the lead also covers the game's rare long simulation frames, so a slow frame "
-        "on the CPU does not leave the GPU waiting. In CONTROL Resonant at a cap the GPU could only just hold "
-        "this costs a few ms of latency in heavy scenes; light scenes keep their lead. Off, the lead covers only "
-        "the usual frame. Compare one setting per capture, in the same scene.");
-
-    static const char* const kSourcePlacementLabels[] = {"Marker", "Pre-Sleep", "Reflex driver limiter"};
-    static_assert(IM_ARRAYSIZE(kSourcePlacementLabels) ==
-        static_cast<int>(PacingPlacementOverride::Count));
-    int placement = static_cast<int>(g_config.source_placement);
-    if (ImGui::Combo("Source placement", &placement, kSourcePlacementLabels,
-            IM_ARRAYSIZE(kSourcePlacementLabels))) {
-        g_config.source_placement = static_cast<PacingPlacementOverride>(placement);
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: source placement -> %s",
-            PacingPlacementOverride_Text(g_config.source_placement));
-        *config_dirty = true;
-    }
-    HelpTip("Reflex games. Pre-Sleep (default) waits before the driver's Reflex Sleep (where the game "
-        "has not read input yet) and releases the game exactly at SIMULATION_START; it uses Marker while "
-        "the game does not call the Reflex Sleep. Marker waits at SIMULATION_START. Reflex driver limiter "
-        "hands the frame cap to the driver's own limiter (NvAPI minimumIntervalUs, needs the Reflex Sleep "
-        "bypass off) and ReLimiter holds nothing. ReLimiter never changes this setting itself.");
-
-    if (ImGui::Checkbox("Unified pacer", &g_config.unified_pacer)) {
-        Config_ApplyPacingPipeline();
-        LOG_INFO("OSD: unified pacer -> %s", g_config.unified_pacer ? "on" : "off");
-        *config_dirty = true;
-    }
-    HelpTip("Diagnostic A/B, 64-bit Reflex games. On, one start law replaces the other pacing mechanisms: "
-        "the Reflex Sleep releases each frame at its start target (the largest of the cap, the display's "
-        "limit, the game's own limit and the GPU's frame time) and the output follows the start. While it "
-        "is on, smoothing, the output override, the Adaptive cap, GPU-paced cadence, the driver limiter "
-        "hold, pre-Sleep precise, the A/B blocks, the stall injector, lead coverage, FG late-frame "
-        "spacing, the lead spike floor, the GPU queue wait render queue and the source placement are "
-        "overridden (the settings keep their values and return when it is off). ReLimiter also manages "
-        "the Sleep-mode parameters the driver sees. One setting per capture.");
 #endif
     ImGui::Spacing();
 }
@@ -979,10 +682,6 @@ static void DrawSettingsImpl() {
     if (!dmfg_dynamic_active)
         DrawPacingPreferenceControl(&config_dirty);
 #endif
-    // The period governor runs on every route: missed frames everywhere,
-    // Reflex workload reports where NvAPI provides them.
-    if (!dmfg_dynamic_active)
-        DrawAdaptiveCapControl(&config_dirty);
     if (ImGui::Checkbox("Enable advanced settings", &g_config.advanced_settings)) config_dirty = true;
 
     // SECTION 2: OSD (collapsible)
@@ -1074,7 +773,6 @@ static void DrawSettingsImpl() {
             p.show_pacing_quality = true;
             p.show_fg = true;
             p.show_limiter = true;
-            p.show_adaptive_smoothing = true;
             p.show_gpu_temp = true;
             p.show_gpu_clock = true;
             p.show_gpu_usage = true;
@@ -1225,7 +923,7 @@ static void DrawSettingsImpl() {
                     p.show_total_frame_cost = true; p.show_fg_time = true;
                     p.show_pqi = true; p.show_pqi_breakdown = true;
                     p.show_smoothness = true; p.show_pacing_quality = true; p.show_fg = true; p.show_limiter = true;
-                    p.show_adaptive_smoothing = true; p.show_gpu_temp = true;
+                    p.show_gpu_temp = true;
                     p.show_gpu_clock = true; p.show_gpu_usage = true; p.show_vram = true;
                     p.show_cpu_usage = true; p.show_ram = true;
                     p.show_dlss_quality = true; p.show_dlss_features = true;
@@ -1800,9 +1498,7 @@ static void DrawSettingsImpl() {
         ImGui::Spacing();
 #endif // _WIN64
 
-        // Adaptive cap tuning (only while it is on), then the developer
-        // diagnostics, shown only with developer_settings=true in the INI.
-        DrawAdaptiveCapTuning(&config_dirty);
+        // Developer diagnostics, shown only with developer_settings=true in the INI.
         if (g_config.developer_settings) DrawPacingDiagnostics(&config_dirty);
 
         // Telemetry Logging toggle
@@ -2597,7 +2293,7 @@ static void DrawOSDImpl() {
                 p.show_total_frame_cost = true; p.show_fg_time = true;
                 p.show_pqi = true; p.show_pqi_breakdown = true;
                 p.show_smoothness = true; p.show_pacing_quality = true; p.show_fg = true; p.show_limiter = true;
-                p.show_adaptive_smoothing = true; p.show_gpu_temp = true;
+                p.show_gpu_temp = true;
                 p.show_gpu_clock = true; p.show_gpu_usage = true; p.show_vram = true;
                 p.show_cpu_usage = true; p.show_ram = true;
                 p.show_dlss_quality = true; p.show_dlss_features = true;
@@ -3016,26 +2712,6 @@ static void DrawOSDImpl() {
         }
 
 #endif // _WIN64 (Pipeline section: FG, Limiter)
-
-        // Adaptive cap (period governor): stretch and governed interval (before LFC).
-        if (g_config.osd_show_adaptive_smoothing && g_config.adaptive_cap && !IsDmfgActive()) {
-            SchedulerPacingStatus governor_status;
-            if (Scheduler_ReadPacingStatus(&governor_status) && governor_status.governor_enabled) {
-                char buf[96];
-                const double percent = GovernorStretchPercent(governor_status);
-                if (governor_status.governor_interval_us > 0.0) {
-                    snprintf(buf, sizeof(buf), "Adaptive cap: +%.1f%% (%.2f ms)", percent,
-                             governor_status.governor_interval_us / 1000.0);
-                } else {
-                    snprintf(buf, sizeof(buf), "Adaptive cap: +%.1f%%", percent);
-                }
-                float b = g_config.osd_text_brightness;
-                ImVec4 col = percent < 0.05
-                    ? ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f)
-                    : ImVec4(0.9f*b, 0.9f*b, 0.2f*b, 1.0f);
-                OSDTextColored(col, buf);
-            }
-        }
 
         // ═══════════════════════════════════
         // DLSS (green — NGX feature info)

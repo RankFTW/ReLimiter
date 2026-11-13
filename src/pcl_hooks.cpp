@@ -15,6 +15,7 @@
 #include "wake_guard.h"
 #include "gpu_readiness.h"
 #include "instrumentation_state.h"
+#include "pacing_resolver.h"
 #include "logger.h"
 
 #include <Windows.h>
@@ -240,7 +241,7 @@ static int32_t Hooked_slPCLSetMarker(
         // gpu_start_probe: the frame whose first submission the probe times, by the
         // PCL identity (the producer epoch of the PCL domain, Streamline's token).
         // A load of the developer flag and a not-taken branch with the probe off.
-        if (type == RENDERSUBMIT_START && g_gpu_start_probe.load(std::memory_order_relaxed))
+        if (type == RENDERSUBMIT_START && kPacingGpuStartProbe)
             GpuReadiness_ArmProbeForFrame(
                 FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::PclFrame), frameID);
     }

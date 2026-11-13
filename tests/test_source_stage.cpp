@@ -1010,29 +1010,21 @@ void TestDemotedFgInputWaitAndMarkerHoldKeepTheirLead()
 // of the same rung: the rung's own lead, collision-guarded for the GPU queue
 // wait, with no source-only floor, however warm that window is. A frame the
 // overload guard demoted plans max(own lead, warm source-only lead), guarded.
-// The pipelines are resolved the way the scheduler does it: gpu_queue_wait_off
-// and hold_overloaded both give rung SourceOnly, reason Infeasible.
+// The pipelines are what the resolver gives while the unified pacer does not own pacing and the Auto rung is the GPU
+// queue wait: gpu_queue_wait_off and hold_overloaded both give rung SourceOnly, reason Infeasible, auto_rung the hold
+// rung (the unified owner bypasses both demotions and the owner is derived, so the snapshots are written out here).
 void TestNotHeldBlockPlansLikeAHeldBlock()
 {
     std::printf("Test: an A/B not-held block plans the same lead as a held block; an overload pause adds the source-only floor\n");
-    PacingCapabilities capabilities{};
-    capabilities.x64 = true;
-    capabilities.api = PacingApi::DX12;
-    capabilities.route = PacingRoute::NvApiMarkers;
-    capabilities.native_route_qualified = true;
-    capabilities.gpu_queue_ready = true;
-    PacingRuntimeState runtime{};
-    runtime.swapchain_valid = true;
-    runtime.vrr = true;
-    const PacingPipelineConfig config{};
-    PacingRuntimeState block = runtime;
-    block.gpu_queue_wait_off = true;
-    PacingRuntimeState overload = runtime;
-    overload.hold_overloaded = true;
+    PacingPipelineSnapshot held = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
+    held.auto_rung = PacingRung::GpuQueueWait;
+    PacingPipelineSnapshot demoted = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
+    demoted.reason = PacingFallbackReason::Infeasible;
+    demoted.auto_rung = PacingRung::GpuQueueWait;
     PacingPipelineSnapshot variants[] = {
-        PacingPipeline_Resolve(config, capabilities, runtime),  // held
-        PacingPipeline_Resolve(config, capabilities, block),    // A/B not-held block
-        PacingPipeline_Resolve(config, capabilities, overload), // overload pause
+        held,    // held
+        demoted, // A/B not-held block
+        demoted, // overload pause
     };
     CHECK(variants[0].rung == PacingRung::GpuQueueWait);
     for (size_t variant = 1; variant < 3; ++variant) {

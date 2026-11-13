@@ -791,9 +791,9 @@ static void ApplyHoldTransition(const HoldFeasibilityTransition& transition) noe
 }
 
 // The developer A/B interleave runs with Output override Auto and the key set.
-static bool InterleaveActive(const PacingPipelineConfig& config) noexcept
+static bool InterleaveActive() noexcept
 {
-    return config.rung_override == PacingRungOverride::Auto && config.gpu_wait_interleave_s > 0.0;
+    return kPacingRungOverride == PacingRungOverride::Auto && kPacingGpuWaitInterleaveS > 0.0;
 }
 
 // A new A/B block: its cause goes on the following Source records, so the
@@ -968,26 +968,26 @@ static PacingPipelineSnapshot ResolvePipeline(
 
     // Overload guard: Auto only. The developer A/B interleave turns the Auto
     // GPU queue wait off in its not-held blocks.
-    const bool interleave = InterleaveActive(config);
+    const bool interleave = InterleaveActive();
     if (interleave != s_interleave_active) {
         ResetHoldFeasibility(interleave ? "A/B interleave on" : "A/B interleave off");
         s_hold_interleave.Reset();
         s_interleave_active = interleave;
         if (interleave) {
             LOG_INFO("GPU wait A/B interleave on: held and not-held blocks of about %.1f s alternate",
-                     config.gpu_wait_interleave_s);
+                     kPacingGpuWaitInterleaveS);
         } else {
             LOG_INFO("GPU wait A/B interleave off");
         }
     }
-    if (config.rung_override != PacingRungOverride::Auto) ResetHoldFeasibility("output override");
+    if (kPacingRungOverride != PacingRungOverride::Auto) ResetHoldFeasibility("output override");
     if (interleave) {
         ApplyInterleaveTransition(
-            s_hold_interleave.Decide(s_clock.Now(), GetQPCFrequency(), config.gpu_wait_interleave_s));
+            s_hold_interleave.Decide(s_clock.Now(), GetQPCFrequency(), kPacingGpuWaitInterleaveS));
     }
-    // Key unified_pacer: the performance demotions are bypassed (the law limits the unfinished frames itself).
-    runtime.hold_overloaded = !config.unified_pacer && s_hold_feasibility.Overloaded();
-    runtime.gpu_queue_wait_off = !config.unified_pacer && interleave && !s_hold_interleave.Holding();
+    // The unified owner bypasses the performance demotions (the law limits the unfinished frames itself).
+    runtime.hold_overloaded = !config.unified && s_hold_feasibility.Overloaded();
+    runtime.gpu_queue_wait_off = !config.unified && interleave && !s_hold_interleave.Holding();
 
     const PacingPipelineSnapshot resolved =
         PacingPipeline_Resolve(config, capabilities, runtime);
@@ -1048,9 +1048,9 @@ static void DrainQueueLawFeed(bool law_on) noexcept
 // new key's tuple exactly.
 static void ApplyUnifiedKeyTransition(const PacingPipelineConfig& config) noexcept
 {
-    const bool key_changed = config.unified_pacer != s_up_key;
+    const bool key_changed = config.unified != s_up_key;
     if (!key_changed && config.test_mode == s_up_test_mode) return;
-    s_up_key = config.unified_pacer;
+    s_up_key = config.unified;
     s_up_law_feed_active = false; // the next keyed drain discards what the ring holds
     s_up_reconcile = true;
     if (key_changed && !s_up_key) LogQueueLawSummary("unified pacer off"); // s_up_key is the new value: the key went off
@@ -1144,7 +1144,7 @@ static void FillControllerStatus(SchedulerPacingStatus* status) noexcept
     status->render_handoff_gpu_floor = status->render_handoff_gpu_lead_us > 0.0;
     status->render_handoff_limited = static_cast<uint32_t>(s_handoff_limited_frames);
     status->render_handoff_stalls = static_cast<uint32_t>(s_handoff_stalls);
-    status->gpu_paced_cadence = PacingPipeline_GetConfig().gpu_paced_cadence && status->render_handoff_gpu_floor;
+    status->gpu_paced_cadence = kPacingGpuPacedCadence && status->render_handoff_gpu_floor;
     status->gpu_paced_recent = s_gpu_paced_window_count;
     status->gpu_paced_frames = static_cast<uint32_t>(
         std::min<uint64_t>(s_source_stage.Statistics().gpu_paced_frames, UINT32_MAX));
@@ -1346,12 +1346,12 @@ static bool IsGpuRung(PacingRung rung) noexcept
     return rung == PacingRung::GpuQueueWait || rung == PacingRung::FgInputWait;
 }
 
-// adaptive_cap is the only switch. Configure resets on a toggle.
+// The governor is off (kPacingAdaptiveCap). Configure resets on a toggle.
 static void ConfigurePeriodGovernor(bool enabled) noexcept
 {
     if (enabled == s_period_governor.Enabled()) return;
     s_period_governor.Configure(enabled);
-    LOG_INFO("Period governor %s (adaptive_cap)", enabled ? "enabled" : "disabled");
+    LOG_INFO("Period governor %s", enabled ? "enabled" : "disabled");
 }
 
 // Consumes each delayed NvAPI demand report once, then decides this frame's
@@ -1368,13 +1368,13 @@ static GovernorDecision UpdatePeriodGovernor(
     const PacingPipelineConfig& config,
     double fg_divisor) noexcept
 {
-    ConfigurePeriodGovernor(config.adaptive_cap);
+    ConfigurePeriodGovernor(kPacingAdaptiveCap);
     const bool gpu_hold = IsGpuRung(pipeline.rung);
     ReflexFrameTimeSample sample{};
     while (ConsumeReflexFrameTimeSample(&sample)) {
         // Developer key unified_pacer: the report's signed queue wait from the two
         // raw timestamps the sample carries (gpuRenderStart − osRenderQueueStart, NAN when missing).
-        if (config.unified_pacer) {
+        if (config.unified) {
             const double queue_wait_us = sample.gpu_start_driver_us != 0 && sample.os_queue_start_driver_us != 0
                 ? static_cast<double>(static_cast<int64_t>(sample.gpu_start_driver_us - sample.os_queue_start_driver_us))
                 : std::numeric_limits<double>::quiet_NaN();
@@ -1417,7 +1417,7 @@ static GovernorDecision UpdatePeriodGovernor(
     frame.qpc = QpcNow();
     frame.qpc_frequency = GetQPCFrequency();
     // The Adaptive cap percentile, not the Smoothing lead quantile.
-    frame.quantile = static_cast<double>(config.adaptive_cap_percentile) / 100.0;
+    frame.quantile = static_cast<double>(kAdaptiveCapPercentileDefault) / 100.0;
     frame.missed = s_governor_miss_pending;
     s_governor_miss_pending = false;
     TakeLeadOutputs(&frame.outputs, &frame.late_outputs);
@@ -1428,12 +1428,12 @@ static GovernorDecision UpdatePeriodGovernor(
     // developer A/B gpu_paced_cadence) the fit quantile of the GPU execution
     // time per real frame, which ReLimiter's cadence does not move
     // (lead_controller.h).
-    if (config.adaptive_cap_hold_room && config.rung_override == PacingRungOverride::Auto) {
+    if (kPacingAdaptiveCapHoldRoom && kPacingRungOverride == PacingRungOverride::Auto) {
         const PacingRung lead_rung = PacingPipeline_LeadRung(pipeline);
         if (lead_rung == PacingRung::GpuQueueWait) {
             frame.room_us = s_source_stage.Lead().HoldRoomUs(fg_divisor, frame.quantile,
                 pipeline.gpu_wait_headroom_us);
-        } else if (lead_rung == PacingRung::FgInputWait && config.gpu_paced_cadence) {
+        } else if (lead_rung == PacingRung::FgInputWait && kPacingGpuPacedCadence) {
             frame.room_us = s_source_stage.Lead().GpuNeedQuantileUs(frame.quantile, fg_divisor);
         }
     }
@@ -1503,8 +1503,8 @@ static double ReportFeedbackIntervalUs() noexcept
 {
     const double effective_us = g_effective_interval_us.load(std::memory_order_relaxed);
     if (effective_us > 0.0) return effective_us;
-    const int target_fps = g_user_target_fps.load(std::memory_order_relaxed);
-    return target_fps > 0 ? 1000000.0 / static_cast<double>(target_fps) : 16666.667;
+    return PacingPipeline_ReportFeedbackFallbackUs(
+        PacingPipeline_TestMode(), g_user_target_fps.load(std::memory_order_relaxed));
 }
 
 // VRR cap interval before the governor and LFC (I_0 = cap × FG divisor).
@@ -1604,10 +1604,10 @@ static bool PreSleepAvailable() noexcept;
 // ReLimiter, so with a cap the bypass applies whenever it is on.
 static bool DriverSleepRuns(int target_fps) noexcept
 {
-    // Key unified_pacer: the Sleep is never bypassed.
-    if (PacingPipeline_UnifiedPacerKey()) return PreSleepAvailable();
+    // The unified owner never bypasses the Sleep.
+    if (PacingPipeline_Unified()) return PreSleepAvailable();
     return PreSleepAvailable() &&
-        !NvAPI_ShouldBypassSleep(g_reflex_sleep_bypass.load(std::memory_order_relaxed), target_fps, true);
+        !NvAPI_ShouldBypassSleep(PacingPipeline_SleepBypass(), target_fps, true);
 }
 
 static uint32_t HandoffStreamOf(const PacingPlanKey& key) noexcept
@@ -1620,7 +1620,7 @@ static uint32_t HandoffStreamOf(const PacingPlanKey& key) noexcept
 // placement while the driver's Sleep does not run.
 static bool HandoffLimitPossible(const PlannedFrameInput& input, const PacingPipelineSnapshot& pipeline) noexcept
 {
-    return !PacingPipeline_UnifiedPacerKey() &&
+    return !PacingPipeline_Unified() &&
         (pipeline.mode == PacingTimingMode::Vrr || pipeline.mode == PacingTimingMode::Fixed) &&
         PacingSourcePlacement_WaitsAtMarker(pipeline.placement) &&
         (input.trigger == SchedulerTrigger::NvApiMarker || input.trigger == SchedulerTrigger::PclMarker) &&
@@ -1652,10 +1652,9 @@ static bool HandoffLimitApplies(const PacingPlanKey& key, const PlannedFrameInpu
 // than its GPU floor (GpuFloorQpc, lead_controller.h). The render-thread
 // offset (w + d) and its stall block stay with frames not held
 // (HandoffLimitApplies): the floor waits for no event.
-static bool GpuPacedHeldFloorApplies(const PlannedFrameInput& input, const PacingPipelineSnapshot& pipeline,
-    const PacingPipelineConfig& config) noexcept
+static bool GpuPacedHeldFloorApplies(const PlannedFrameInput& input, const PacingPipelineSnapshot& pipeline) noexcept
 {
-    return config.gpu_paced_cadence &&
+    return kPacingGpuPacedCadence &&
         pipeline.rung != PacingRung::SourceOnly &&
         (pipeline.mode == PacingTimingMode::Vrr || pipeline.mode == PacingTimingMode::Fixed) &&
         PacingSourcePlacement_WaitsAtMarker(pipeline.placement) &&
@@ -1874,7 +1873,7 @@ static GpuFloorEstimate GpuFloor(const PacingPlanKey& key, const GpuFloorCap& ca
         present_end_qpc = 0;
     }
     return s_source_stage.Lead().GpuFloor(key, present_end_frame, present_end_qpc,
-        PacingPipeline_GetConfig().gpu_paced_cadence, cap);
+        kPacingGpuPacedCadence, cap);
 }
 
 static int64_t GpuFloorQpc(const PacingPlanKey& key) noexcept
@@ -2235,23 +2234,23 @@ static SourceStageFrame RunPlanned(
         input.period_identity_us > 0.0 ? input.period_identity_us : input.base_interval_us);
     request.governor_step = input.governed && input.governor.valid && input.governor.epoch;
     if (pipeline.mode == PacingTimingMode::Fixed) request.fixed = input.fixed;
-    request.stall_inject_ms = config.stall_inject_ms;
-    request.stall_inject_period_s = config.stall_inject_period_s;
+    request.stall_inject_ms = kPacingStallInjectMs;
+    request.stall_inject_period_s = kPacingStallInjectDefaultPeriodS;
     // Collision-aware release: Auto only, so the GPU wait output override
     // keeps its earlier behavior.
-    request.collision_guard = config.rung_override == PacingRungOverride::Auto;
+    request.collision_guard = kPacingRungOverride == PacingRungOverride::Auto;
     // The pipeline of this frame was resolved with the overload guard's state:
     // a pause (not an A/B not-held block) floors the demoted lead.
-    request.overload_demoted = !config.unified_pacer && s_hold_feasibility.Overloaded();
+    request.overload_demoted = !config.unified && s_hold_feasibility.Overloaded();
     // Developer key unified_pacer, every planned frame of the marker route (placement Unified,
     // or the Marker fallback while the game calls no Reflex Sleep; passthrough, the present
     // route and mode Off excluded): the unified branch of the source stage plans it;
     // no pre-Sleep residual, hold evidence or handoff limit.
-    const bool unified = SourceStage_UnifiedPlans(pipeline, config.unified_pacer, s_source_stage.UnifiedEnabled());
-    request.gpu_queue_wait_render_queue = config.gpu_queue_wait_render_queue;
+    const bool unified = SourceStage_UnifiedPlans(pipeline, config.unified, s_source_stage.UnifiedEnabled());
+    request.gpu_queue_wait_render_queue = kPacingGpuQueueWaitRenderQueue;
     // Lead spike floor (lead_controller.h): Auto only, like the collision
     // guard, so the GPU wait output override keeps its earlier behavior.
-    request.spike_floor = config.lead_spike_floor && config.rung_override == PacingRungOverride::Auto;
+    request.spike_floor = kPacingLeadSpikeFloor && kPacingRungOverride == PacingRungOverride::Auto;
     // An ended pre-Sleep wait gates earlier frames of a lockstep engine like
     // the source wait (lead_controller.h).
     s_pre_sleep.EndedWait(&request.pre_wait_index, &request.pre_wait_start_qpc, &request.pre_wait_end_qpc);
@@ -2275,7 +2274,7 @@ static SourceStageFrame RunPlanned(
     const bool handoff_limit = HandoffLimitApplies(key, input, pipeline);
     const HandoffSnapshot handoff_snapshot =
         TakeHandoffSnapshot(key, input, pipeline, handoff_known, handoff_frame, handoff_qpc);
-    const bool held_floor = GpuPacedHeldFloorApplies(input, pipeline, config);
+    const bool held_floor = GpuPacedHeldFloorApplies(input, pipeline);
     if (handoff_limit) {
         request.earliest_release_qpc = HandoffEarliestRelease(key, input.interval_us, pipeline);
     } else if (held_floor) {
@@ -2329,8 +2328,8 @@ static SourceStageFrame RunPlanned(
     // GPU-paced cadence: the GPU floor term of the earliest release, so the
     // source stage knows when the GPU, not the render thread's handoff, sets
     // it (held frames: set above).
-    request.gpu_paced_cadence = config.gpu_paced_cadence;
-    if (config.gpu_paced_cadence && !held_floor && request.earliest_release_qpc > 0) {
+    request.gpu_paced_cadence = kPacingGpuPacedCadence;
+    if (kPacingGpuPacedCadence && !held_floor && request.earliest_release_qpc > 0) {
         request.gpu_floor_qpc = GpuFloorQpc(key);
     }
 
@@ -2354,13 +2353,13 @@ static SourceStageFrame RunPlanned(
             PopCount64(s_gpu_paced_window[0]) + PopCount64(s_gpu_paced_window[1]));
     }
     PublishRenderHandoff(key, frame, handoff_limit, held_floor);
-    if (config.gpu_paced_cadence && frame.planned) {
+    if (kPacingGpuPacedCadence && frame.planned) {
         LogCapBoundMode(key.frame_id);
         LogGpuPacedRhythm(frame.release_qpc);
     }
     if (s_source_stage.StallInjector().TakeEnabledNotice()) {
         LOG_INFO("Stall injector enabled: %.1f ms every %.1f s",
-                 config.stall_inject_ms, config.stall_inject_period_s);
+                 kPacingStallInjectMs, kPacingStallInjectDefaultPeriodS);
     }
     const int64_t release = frame.planned ? frame.release_qpc : QpcNow();
 
@@ -2429,9 +2428,9 @@ static SourceStageFrame RunPlanned(
         const bool source_restart = RecordGovernorMiss(frame, input.governor, pre_sleep_late);
         // Overload guard: judged while the pre-guard Auto rung holds. The
         // plan's record resolves when its own verdict is known (O1).
-        const bool judged = frame.planned && !config.unified_pacer &&
+        const bool judged = frame.planned && !config.unified &&
             (pipeline.mode == PacingTimingMode::Vrr || pipeline.mode == PacingTimingMode::Fixed) &&
-            config.rung_override == PacingRungOverride::Auto &&
+            kPacingRungOverride == PacingRungOverride::Auto &&
             pipeline.auto_rung != PacingRung::SourceOnly;
         if (judged) {
             HoldEvidencePlan evidence{};
@@ -2592,7 +2591,7 @@ bool Scheduler_DriverLimiterHoldActive() noexcept
     const PacingPipelineSnapshot pipeline = PacingPipeline_Read();
     return pipeline.placement == PacingSourcePlacement::DriverLimiter &&
         (pipeline.mode == PacingTimingMode::Vrr || pipeline.mode == PacingTimingMode::Fixed) &&
-        PacingPipeline_DriverLimiterHoldKey();
+        kPacingDriverLimiterHold;
 }
 
 // The hook's entry as the moment the game reached ReLimiter for the next grid
@@ -2721,7 +2720,7 @@ bool Scheduler_PlanReflexSleep(int64_t sleep_entry_qpc, int64_t now_qpc, bool dr
     request.interval_us = s_last_plan_interval_us;
     request.last_release_qpc = s_last_plan_release_qpc;
     request.driver_sleep = driver_sleep;
-    request.precise = PacingPipeline_PreSleepPrecise();
+    request.precise = kPacingPreSleepPrecise;
     const PreSleepDecision decision = s_pre_sleep.Decide(request);
     if (!decision.wait) return false;
     s_pre_sleep_wait_index = request.next_index;
@@ -2846,7 +2845,7 @@ void OnMarker(
     // Developer key unified_pacer, or a toggle that has not applied yet: reconcile the one
     // effective Sleep-mode tuple from the game thread. A key load and a flag
     // load with the key off.
-    if (PacingPipeline_UnifiedPacerKey() || s_up_reconcile) {
+    if (PacingPipeline_Unified() || s_up_reconcile) {
         if (NvAPI_SleepModeReconcilePending()) NvAPI_ReconcileSleepMode();
         else s_up_reconcile = false;
     }
@@ -2893,7 +2892,7 @@ void OnMarker(
     // OutputLate handling, so the drain, the resolve, the governor and the plan run under one
     // value of the key.
     const PacingPipelineConfig config = [&]() noexcept -> PacingPipelineConfig {
-        if (s_up_key || PacingPipeline_UnifiedPacerKey()) {
+        if (s_up_key || PacingPipeline_Unified()) {
             PacingPipelineConfig snapshot = PacingPipeline_GetConfig();
             ApplyUnifiedKeyTransition(snapshot);
             // Developer keys unified_every_frame_service / unified_queue_target_us: this
@@ -2901,8 +2900,8 @@ void OnMarker(
             // value. Keyed branch only; the settled key-off branch never reaches the law.
             if (s_source_stage.Unified().Options().queue_law && !snapshot.unified_queue_law)
                 LogQueueLawSummary("law off");
-            s_source_stage.SetUnifiedOptions(snapshot.unified_every_frame_service,
-                snapshot.unified_queue_target_us, snapshot.unified_hold_share,
+            s_source_stage.SetUnifiedOptions(kPacingUnifiedEveryFrameServiceDefault,
+                kPacingUnifiedQueueTargetDefaultUs, snapshot.unified_hold_share,
                 snapshot.unified_queue_law, snapshot.unified_queue_rank, snapshot.unified_queue_allow_us,
                 snapshot.unified_queue_need_frames);
             DrainQueueLawFeed(snapshot.unified_queue_law);
@@ -2913,7 +2912,7 @@ void OnMarker(
         s_source_stage.DrainStageEvents();
         NoteDrainedOutputLate();
         PacingPipelineConfig snapshot = PacingPipeline_GetConfig();
-        if (snapshot.unified_pacer != s_up_key || snapshot.test_mode != s_up_test_mode) ApplyUnifiedKeyTransition(snapshot);
+        if (snapshot.unified != s_up_key || snapshot.test_mode != s_up_test_mode) ApplyUnifiedKeyTransition(snapshot);
         return snapshot;
     }();
     // Vblank edges feed the fixed-refresh phase tracker on the owner only.
@@ -2966,7 +2965,7 @@ void OnMarker(
     if (dmfg_changed) {
         ResetAdaptationRegime(dmfg_active ? "DMFG entered" : "DMFG exited");
         // Developer key unified_pacer: the Sleep-mode tuple follows DMFG.
-        if (config.unified_pacer) NvAPI_BumpSleepModeEpoch();
+        if (config.unified) NvAPI_BumpSleepModeEpoch();
     }
     if (dmfg_active) {
         NativeGate_PublishNoFrameGeneration(false, 0);
@@ -3082,7 +3081,7 @@ void OnMarker(
     }
     // Developer key unified_pacer: the idle interval for the next reservation, and a regime
     // change (idle against not) resets the law.
-    if (config.unified_pacer) {
+    if (config.unified) {
         const bool unified_idle = idle_interval_us > 0.0;
         s_up_idle_interval_us = idle_interval_us;
         if (unified_idle != s_up_idle_regime) ResetUnifiedLaw();
@@ -3155,7 +3154,7 @@ void OnMarker(
                 driver_limiter.interval_us = DriverLimiterIntervalUs(input);
                 // driver_limiter_hold: the driver still releases the frame,
                 // ReLimiter plans it (no wait) so the output rung holds it.
-                if (PacingPipeline_DriverLimiterHold(config)) RunPlanned(input, pipeline, config);
+                if (kPacingDriverLimiterHold) RunPlanned(input, pipeline, config);
                 else RunDriverLimited(input, pipeline);
                 return;
             }
@@ -3173,7 +3172,7 @@ void OnMarker(
     // ── VRR ──
     // Key unified_pacer: with the cap off VRR is paced at the VRR cap (Hz - Hz^2/3600).
     int vrr_target_fps = target_fps;
-    if (vrr_target_fps <= 0 && config.unified_pacer) {
+    if (vrr_target_fps <= 0 && config.unified) {
         vrr_target_fps = static_cast<int>(UnifiedPacer_VrrCapFps(g_ceiling_hz.load(std::memory_order_relaxed)));
     }
     input.target_fps = vrr_target_fps;
@@ -3205,7 +3204,7 @@ void OnMarker(
         GovernorLadder(input.base_interval_us, GovernorFixedRefresh{}, LfcQuantumUs(input.fg_divisor)),
         pipeline, config, input.fg_divisor);
     // Key unified_pacer: no LFC multiple (the law owns the interval).
-    input.interval_us = config.unified_pacer
+    input.interval_us = config.unified
         ? GovernedIntervalUs(input.governor, input.base_interval_us)
         : ApplyLfc(GovernedIntervalUs(input.governor, input.base_interval_us), input.fg_divisor);
     input.period_identity_us = VrrPeriodIdentityUs(vrr_target_fps, fg_divisor_raw);
@@ -3216,7 +3215,7 @@ void OnMarker(
         if (ApplyDriverLimiter(DriverLimiterIntervalUs(input))) {
             driver_limiter.active = true;
             driver_limiter.interval_us = DriverLimiterIntervalUs(input);
-            if (PacingPipeline_DriverLimiterHold(config)) RunPlanned(input, pipeline, config);
+            if (kPacingDriverLimiterHold) RunPlanned(input, pipeline, config);
             else RunDriverLimited(input, pipeline);
             PollReflexLatencyReport(input.interval_us);
             return;

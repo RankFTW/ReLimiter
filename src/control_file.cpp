@@ -149,7 +149,7 @@ void WriteStatus(const Result* last, int64_t now) noexcept
         "capture=%d\ncapture_epoch=%u\ntarget_fps=%d\n"
         "mode=%s\nrung=%s\nauto_rung=%s\nreason=%s\nplacement=%s\npipeline_generation=%u\n"
         "fg_presenting=%d\nfg_multiplier=%d\nnvapi_markers=%d\ncross_thread_verified=%d\n"
-        "unified_pacer=%d\nunified_driver_pacing=%d\npacing_test_mode=%s\n",
+        "unified_driver_pacing=%d\npacing_test_mode=%s\n",
         GetCurrentProcessId(), static_cast<long long>(now), static_cast<long long>(s_frequency),
         static_cast<unsigned long long>(s_presents.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(s_queued_seq),
@@ -162,7 +162,7 @@ void WriteStatus(const Result* last, int64_t now) noexcept
         pipeline.generation, g_fg_presenting.load(std::memory_order_relaxed) ? 1 : 0,
         g_fg_multiplier.load(std::memory_order_relaxed), AreNvAPIMarkersFlowing() ? 1 : 0,
         NativeGate_CrossThreadVerified() ? 1 : 0,
-        PacingPipeline_UnifiedPacerKey() ? 1 : 0, g_unified_driver_pacing.load(std::memory_order_relaxed) ? 1 : 0,
+        g_unified_driver_pacing.load(std::memory_order_relaxed) ? 1 : 0,
         PacingTestMode_Text(PacingPipeline_TestMode()));
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(text)) return;
     const HANDLE file = CreateFileW(s_status_temp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,

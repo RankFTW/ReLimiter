@@ -39,6 +39,28 @@ void FgInput_RecordMarker(uint64_t, uint32_t, uint32_t, int64_t) noexcept {}
 #include <string>
 #include <algorithm>
 
+// The pacing switches the hooks read are constants of the production code now (kPacing*, pacing_resolver.h) and
+// the Reflex Sleep bypass follows the published test mode (PacingPipeline_SleepBypass); they are not settings. This
+// file drives the hooks' branches under each value, and a published test mode also takes the key from the unified
+// pacer, so the seam of this test replaces them, in the included source only, by flags the test sets: the former
+// atomics, with their old default (off). The key (PacingPipeline_Unified) stays the real published one.
+#include "pacing_resolver.h"
+#include <atomic>
+std::atomic<bool> g_reflex_sleep_bypass{false};
+std::atomic<bool> g_bypass_low_latency_off{false};
+std::atomic<bool> g_driver_low_latency_off{false};
+std::atomic<bool> g_sleep_status_every_frame{false};
+std::atomic<bool> g_marker_forward_after_wait{false};
+std::atomic<bool> g_gpu_start_probe{false};
+#define PacingPipeline_SleepBypass() (g_reflex_sleep_bypass.load(std::memory_order_relaxed))
+#define kPacingBypassLowLatencyOff (g_bypass_low_latency_off.load(std::memory_order_relaxed))
+#define kPacingDriverLowLatencyOff (g_driver_low_latency_off.load(std::memory_order_relaxed))
+#define kPacingSleepStatusEveryFrame (g_sleep_status_every_frame.load(std::memory_order_relaxed))
+#define kPacingGpuStartProbe (g_gpu_start_probe.load(std::memory_order_relaxed))
+#define kPacingMarkerForwardOrder \
+    (g_marker_forward_after_wait.load(std::memory_order_relaxed) ? PacingMarkerForwardOrder::AfterWait \
+                                                                 : PacingMarkerForwardOrder::BeforeWait)
+
 #include "../src/nvapi_hooks.cpp"
 
 // Gate code uses a controlled QPC/Spin boundary, not real waiting. Keep native
@@ -198,7 +220,7 @@ unsigned s_pre_sleep_waits = 0;           // PreSleepWaitUntil calls
 int64_t s_pre_sleep_wait_target = 0;      // and its newest arguments
 bool s_pre_sleep_wait_precise = false;
 int64_t s_pre_sleep_max_ahead = 0;        // the longest wait PreSleepWaitUntil was asked for (ticks)
-// Key unified_pacer: the Scheduler_Unified* stubs below, the Sleep hook's
+// The unified owner: the Scheduler_Unified* stubs below, the Sleep hook's
 // PreSleepWaitUntil (spins to its target when s_pre_sleep_wait_blocks), the probe's
 // arming calls and Dynamic MFG.
 bool s_unified_active = false;                 // Scheduler_UnifiedActive
@@ -751,18 +773,26 @@ void TestPreSleepPreciseAndHoldWiring() {
 }
 
 #ifdef _WIN64
-// Key unified_pacer. The key is published as ResolvePipeline publishes it, WITHOUT
+// The unified owner (the key). The key is published as ResolvePipeline publishes it, WITHOUT
 // the epoch (the scheduler bumps that later): the first hook after the publication must
 // already see the transition through NvAPI_SleepModeReconcilePending. The tuple, the hard
 // limit, the self-check and the Sleep hook are production code, the scheduler's reservation
 // and publication are stubs.
+// The owner is derived (PacingPipeline_ClampConfig): `unified` is true on 64-bit while the test mode is Off, so
+// the key off is published as the test mode ReflexOnly. Nothing in this file reads the mode (the Sleep bypass is
+// this test's flag above).
+PacingPipelineConfig WithKey(PacingPipelineConfig config, bool on) {
+    config.test_mode = on ? PacingTestMode::Off : PacingTestMode::ReflexOnly;
+    return config;
+}
+// The published configuration with its key carried through the derivation, to restore it afterwards.
+PacingPipelineConfig CurrentConfig() { return WithKey(PacingPipeline_GetConfig(), PacingPipeline_Unified()); }
 void SetUnifiedKey(bool on) {
-    PacingPipelineConfig config = PacingPipeline_GetConfig();
-    config.unified_pacer = on;
+    const PacingPipelineConfig config = WithKey(PacingPipeline_GetConfig(), on);
     // The order Config_ApplyPacingPipeline uses: the clamped key is noted FIRST, then published.
-    NvAPI_PrepareUnifiedKey(PacingPipeline_ClampConfig(config).unified_pacer);
+    NvAPI_PrepareUnifiedKey(PacingPipeline_ClampConfig(config).unified);
     PacingPipeline_SetConfig(config);
-    CHECK(PacingPipeline_UnifiedPacerKey() == on);
+    CHECK(PacingPipeline_Unified() == on);
 }
 // The forward is the game's parameters with this interval, low latency and boost off when asked.
 bool IsTuple(const NV_SET_SLEEP_MODE_PARAMS& forwarded, const NV_SET_SLEEP_MODE_PARAMS& game,
@@ -784,7 +814,7 @@ void TestUnifiedSleepModeTuple() {
     CHECK(NvAPI_CaptureFeedbackDevice(&device));
     const auto old_sleep = s_orig_sleep;
     const auto old_mode = s_orig_sleep_mode;
-    const PacingPipelineConfig old_config = PacingPipeline_GetConfig();
+    const PacingPipelineConfig old_config = CurrentConfig();
     s_orig_sleep = FakeDriverSleep;
     s_orig_sleep_mode = FakeSleepMode;
     s_expected_mode_params = nullptr;
@@ -963,7 +993,7 @@ void TestUnifiedKeyTransitions() {
     CHECK(NvAPI_CaptureFeedbackDevice(&device));
     const auto old_sleep = s_orig_sleep;
     const auto old_mode = s_orig_sleep_mode;
-    const PacingPipelineConfig old_config = PacingPipeline_GetConfig();
+    const PacingPipelineConfig old_config = CurrentConfig();
     s_orig_sleep = FakeDriverSleep;
     s_orig_sleep_mode = FakeSleepMode;
     s_expected_mode_params = nullptr;
@@ -989,7 +1019,7 @@ void TestUnifiedKeyTransitions() {
     // flight, the reconcile has nothing to apply, and the key going off settles at once with
     // no forward (nothing was applied, nothing is owed).
     NvAPI_PrepareUnifiedKey(true);
-    CHECK(NvAPI_SleepModeReconcilePending() && !PacingPipeline_UnifiedPacerKey());
+    CHECK(NvAPI_SleepModeReconcilePending() && !PacingPipeline_Unified());
     NvAPI_ReconcileSleepMode();
     CHECK(Hook_Sleep(&device) == -7 && s_forwarded_modes.empty());
     SetUnifiedKey(true);
@@ -1017,7 +1047,7 @@ void TestUnifiedKeyTransitions() {
     // still published on; in that window nothing is forwarded. Then the key is published and
     // the first hook restores the game's parameters, once.
     NvAPI_PrepareUnifiedKey(false);
-    CHECK(NvAPI_SleepModeReconcilePending() && PacingPipeline_UnifiedPacerKey());
+    CHECK(NvAPI_SleepModeReconcilePending() && PacingPipeline_Unified());
     NvAPI_ReconcileSleepMode();
     CHECK(Hook_Sleep(&device) == -7 && s_forwarded_modes.empty());
     SetUnifiedKey(false);
@@ -1101,7 +1131,7 @@ void TestUnifiedKeyTransitions() {
 
     s_on_mode_forward = nullptr;
     PacingPipeline_SetConfig(old_config);
-    NvAPI_PrepareUnifiedKey(PacingPipeline_UnifiedPacerKey());
+    NvAPI_PrepareUnifiedKey(PacingPipeline_Unified());
     CHECK(!NvAPI_SleepModeReconcilePending());
     s_record_modes = false;
     s_mode_result = -9;
@@ -1203,7 +1233,7 @@ void TestUnifiedSleepHook() {
     CHECK(NvAPI_CaptureFeedbackDevice(&device));
     const auto old_sleep = s_orig_sleep;
     const auto old_mode = s_orig_sleep_mode;
-    const PacingPipelineConfig old_config = PacingPipeline_GetConfig();
+    const PacingPipelineConfig old_config = CurrentConfig();
     LARGE_INTEGER frequency_value{};
     QueryPerformanceFrequency(&frequency_value);
     const int64_t frequency = frequency_value.QuadPart;
@@ -2255,14 +2285,14 @@ void TestMarkerForwardOrder() {
 }
 
 #ifdef _WIN64
-// Key unified_pacer: markers are forwarded first whatever marker_forward_order says (nothing
+// The unified owner: markers are forwarded first whatever the marker forward order says (nothing
 // waits in the hook for the unified path), and the enforcement marker's wait is still
 // published as controller residence. Key off keeps the option. The RENDERSUBMIT_START of the
 // presenting device arms the gpu_start_probe for that frame; no other marker does.
 void TestUnifiedMarkerForwardAndProbeArm() {
     FakeDevice device;
     CHECK(NvAPI_CaptureFeedbackDevice(&device));
-    const PacingPipelineConfig old_config = PacingPipeline_GetConfig();
+    const PacingPipelineConfig old_config = CurrentConfig();
     s_orig_set_latency_marker = ForwardMarker;
     s_record_call_order = true;
     s_on_marker_sleep_ms = 2;
@@ -2906,7 +2936,7 @@ void Scheduler_EndDriverSleep(int64_t start_qpc, int64_t end_qpc) noexcept {
     s_driver_sleep_start_qpc = start_qpc;
     s_driver_sleep_end_qpc = end_qpc;
 }
-// Key unified_pacer: the scheduler's reservation and publication, controlled by
+// The unified owner: the scheduler's reservation and publication, controlled by
 // the s_unified_* stubs; the hard limit, the tuple and the Sleep hook are production code.
 bool Scheduler_UnifiedActive() noexcept { return s_unified_active; }
 SchedulerUnifiedReserve Scheduler_UnifiedReserve(int64_t arrival_qpc, SchedulerUnifiedReservation* out) noexcept {

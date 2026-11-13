@@ -7,10 +7,6 @@
 #include <atomic>
 #include <cstdint>
 
-// Developer key gpu_start_probe: when the GPU starts a frame (gpu_readiness_d3d12.cpp).
-// Published by Config_ApplyPacingPipeline; read on the game's thread.
-inline std::atomic<bool> g_gpu_start_probe{false};
-
 // Developer key gpu_queue_probe: what the presenting queue does per frame (gpu_queue_probe.h).
 // Published by Config_ApplyPacingPipeline; read on the game's thread.
 inline std::atomic<bool> g_gpu_queue_probe{false};

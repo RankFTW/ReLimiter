@@ -139,7 +139,7 @@ void PresentGate_Execute(const PacingPlanKey& key, PacingRung rung,
 
     CadenceGridSnapshot snapshot{};
     int64_t target_qpc = 0;
-    const bool key_on = PacingPipeline_UnifiedPacerKey();
+    const bool key_on = PacingPipeline_Unified();
     const bool resolved = g_cadence_grid_publication.Read(&snapshot) &&
         CadenceGrid_ResolveOutputTarget(snapshot, key.controller_generation, plan.grid_index,
             g_cadence_output_tracker, &target_qpc, nullptr, 1.0, key_on,

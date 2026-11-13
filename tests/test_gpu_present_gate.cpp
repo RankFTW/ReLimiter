@@ -27,8 +27,15 @@ void PublishRung(PacingRung rung,PacingFallbackReason reason=PacingFallbackReaso
     snapshot.auto_rung=auto_rung==PacingRung::Count?rung:auto_rung;
     PacingPipeline_Publish(snapshot);
 }
+// The owner of pacing is derived (PacingPipeline_ClampConfig): `unified` is true on 64-bit while the test mode is Off.
+// These tests run the earlier owner (key off) except in the keyed blocks, which turn it on through WithOwner, so
+// every published configuration carries the test mode ReflexOnly (a test mode takes the ownership from the unified pacer).
+PacingPipelineConfig WithOwner(PacingPipelineConfig config,bool unified) {
+    config.test_mode=unified?PacingTestMode::Off:PacingTestMode::ReflexOnly;
+    return config;
+}
 void SetProbes(bool probes) {
-    auto config=PacingPipeline_GetConfig();config.gpu_probes=probes;PacingPipeline_SetConfig(config);
+    auto config=PacingPipeline_GetConfig();config.gpu_probes=probes;PacingPipeline_SetConfig(WithOwner(config,false));
 }
 // clamp(3 I, 2 ms, 100 ms) in ticks (GPU_PRESENT_HORIZON_INTERVALS).
 void TestHorizon() {
@@ -68,9 +75,7 @@ void TestConfigWord() {
     CHECK(GpuPresent_RequiresReadiness());
     PublishRung(PacingRung::SourceOnly,PacingFallbackReason::Override);
     CHECK(!GpuPresent_RequiresReadiness());
-    auto pipeline=PacingPipeline_GetConfig();pipeline.rung_override=PacingRungOverride::Gpu;PacingPipeline_SetConfig(pipeline);
-    CHECK(GpuPresent_RequiresReadiness());
-    pipeline.rung_override=PacingRungOverride::Auto;PacingPipeline_SetConfig(pipeline);
+    // The output override (rung_override=gpu) is a constant now (kPacingRungOverride = Auto): its readiness case is gone.
     PublishRung(PacingRung::MarkerHold,PacingFallbackReason::NoGpuQueue);
     CHECK(!GpuPresent_RequiresReadiness());
     // R12b: a C3-demoted FG input wait keeps the route qualified through the
@@ -189,7 +194,6 @@ BOOL FakeQpc(LARGE_INTEGER* value) {value->QuadPart=fake_clock;return TRUE;}
 
 bool RuntimeLifecycle_IsStopping() noexcept {return false;}
 std::atomic<int> g_fg_multiplier{1};
-std::atomic<int> g_fg_presenter_probe_us{0};
 StreamlineQueueOwnedScope::StreamlineQueueOwnedScope() noexcept {}
 StreamlineQueueOwnedScope::~StreamlineQueueOwnedScope() {}
 // gpu_queue_probe (the D3D12 side is not linked here; the key stays off in these tests).
@@ -753,7 +757,7 @@ void TestExecutor() {
     {
         const auto saved_pipeline=PacingPipeline_GetConfig();
         const auto set_key=[&](bool on) {
-            auto pipeline=saved_pipeline;pipeline.unified_pacer=on;PacingPipeline_SetConfig(pipeline);
+            PacingPipeline_SetConfig(WithOwner(saved_pipeline,on));
         };
         PacingFramePlan plan;
         plan.key=PlanKey(45);plan.grid_index=45;plan.interval_us=kInterval;plan.rung=PacingRung::FgInputWait;
@@ -815,7 +819,7 @@ void TestExecutor() {
     // ReadTimestamp, needs a real device and is never driven: the measurement is dropped unread).
     {
         const auto saved_pipeline=PacingPipeline_GetConfig();
-        auto keyed=saved_pipeline;keyed.unified_pacer=true;PacingPipeline_SetConfig(keyed);
+        PacingPipeline_SetConfig(WithOwner(saved_pipeline,true));
         const auto generation_now=FrameTimeline_CurrentControllerGeneration();
         const auto find_ticket=[&](const PacingPlanKey& key)->Ticket* {
             for(auto& candidate:queue.tickets)
@@ -882,8 +886,6 @@ void TestExecutor() {
     // the move stays. (The ticket is admitted on the GPU queue wait, then
     // given the FG input's identity.)
     {
-        const auto saved_pipeline=PacingPipeline_GetConfig();
-        auto pipeline=saved_pipeline;pipeline.fg_late_spacing=true;PacingPipeline_SetConfig(pipeline);
         const auto domain=static_cast<uint8_t>(PacingIdentityDomain::NvApiFrame);
         const auto generation_now=FrameTimeline_CurrentControllerGeneration();
         for(const bool left:{false,true}) {
@@ -924,7 +926,6 @@ void TestExecutor() {
         const auto epoch=PlanKey(52).producer_epoch;
         CHECK(RenderHandoff_LeftPresent(domain,epoch,51) && RenderHandoff_LeftPresent(domain,epoch,52));
         CHECK(!RenderHandoff_LeftPresent(domain,epoch,53) && !RenderHandoff_LeftPresent(domain,epoch+1,52));
-        PacingPipeline_SetConfig(saved_pipeline);
     }
 
     // A CPU Signal that fails keeps its obligation (retried; the Wait stays undischarged). A fence that reports

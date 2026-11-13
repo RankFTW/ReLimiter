@@ -277,7 +277,7 @@ DWORD WINAPI Worker(void*) {
 }
 
 bool GpuPriorityProbe_Start() noexcept {
-    if (!g_config.gpu_priority_probe || s_thread) return true;
+    if (!kPacingGpuPriorityProbe || s_thread) return true;
     s_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!s_stop) return false;
     s_stopping.store(false, std::memory_order_release);

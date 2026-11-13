@@ -11,11 +11,7 @@
 // Loaded in AddonInit outside loader lock, exposed as a global struct.
 
 struct Config {
-    // Pacing pipeline
-    PacingSmoothing smoothing = PacingSmoothing::On;              // developer: on | off (always on for users)
-    PacingRungOverride output_rung = PacingRungOverride::Auto;    // developer: auto | source | marker | native | gpu
-    double stall_inject_ms = 0.0;                                 // developer: 0 = off, 0–200
-    double stall_inject_period_s = kPacingStallInjectDefaultPeriodS; // developer: 1–60
+    // Pacing pipeline: the pacing settings that used to be configured here are constants (pacing_resolver.h, kPacing*).
     bool advanced_settings = false;
     // INI-only: shows Advanced → Developer diagnostics (the A/B and test keys
     // below marked developer). Normal users never need them.
@@ -82,38 +78,13 @@ struct Config {
     bool native_pcl_enabled = false;
     // Pacing diagnostics (x64). Change one at a time for A/B captures.
     bool gpu_present_gate_probes = true;              // developer: GPU queue-wait pre/post timestamp bracket
-    double gpu_wait_headroom_us = kPacingGpuWaitHeadroomDefaultUs; // developer: GPU queue wait release headroom, 500–3000 µs
-    double gpu_wait_interleave_s = 0.0; // developer: held / not-held A/B blocks of the Auto GPU queue wait; 0 = off, 1–10 s
-    // Skip the driver's Reflex Sleep while a cap is set; ReLimiter's own
-    // pre-Sleep wait paces instead (default on: far fewer long frames at the
-    // same PC latency in testing).
-    bool reflex_sleep_bypass = true; // developer
-    PacingMarkerForwardOrder marker_forward_order = PacingMarkerForwardOrder::BeforeWait; // developer: before_wait | after_wait
-    PacingRenderQueue gpu_queue_wait_render_queue = PacingRenderQueue::Keep; // developer A/B: keep | remove | remove_held
-    PacingLeadCoverage lead_coverage = PacingLeadCoverage::Q99; // developer A/B: 50 | 75 | 90 | 95 | 99 (default; share of frames the lead covers)
-    bool fg_late_spacing = true; // developer A/B: on (default) | off; FG input wait floors the next real frame on a late frame's readiness
-    bool gpu_paced_cadence = false; // developer A/B: off (default) | on; frames whose release the GPU floor sets keep the GPU's pace (held frames get the floor too)
-    bool bypass_low_latency_off = false; // developer A/B: off (default) | on; the driver's low latency mode is turned off while the Reflex Sleep is bypassed (64-bit)
     bool flip_metering_off = false; // developer: off (default) | on; NvAPI_D3D12_SetFlipConfig is hidden from the game, so frame generation runs without hardware flip metering, as on GPUs without it (64-bit, from the next launch)
-    int fg_presenter_probe_us = 0; // developer experiment: 0 (default, off) | 1–10000; DLSS-G presenting its own frames: each native Present held on its present queue to call + this many µs, in alternating 4 s held / not-held blocks (64-bit)
-    bool gpu_priority_probe = false; // developer experiment: off (default) | on; two DIRECT queues of ReLimiter's own (high and normal priority) measure how long a released queue's work waits for the GPU (64-bit, from the next launch)
     bool control_file = false; // developer: off (default) | on; a test harness drives ReLimiter through relimiter_control.txt next to the INI (control_file.h) (from the next launch)
-    bool adaptive_cap_hold_room = true; // developer A/B: on (default) | off; with Adaptive cap and Output override Auto the interval is kept at least at the hold room of the GPU queue wait or (with gpu_paced_cadence) the FG input wait
-    bool lead_spike_floor = true; // developer A/B: on (default) | off; with Output override Auto a GPU wait lead behind the wait covers the game's rare long simulations (lead_controller.h)
-    PacingPlacementOverride source_placement = PacingPlacementOverride::PreSleep; // developer: marker | pre_sleep | driver (pre_sleep is the default)
-    bool pre_sleep_precise = false; // developer A/B: off (default) | on; the pre-Sleep wait aims at the release target itself and ends with the hardware spin, so the game thread returns from ReLimiter's wait at the target (64-bit, source_placement=pre_sleep)
-    bool driver_low_latency_off = false; // developer A/B: off (default) | on; the driver's low latency mode is turned off while the game's Reflex Sleep is forwarded (64-bit)
-    bool driver_limiter_hold = false; // developer A/B: off (default) | on; with source_placement=driver and gpu_paced_cadence ReLimiter holds the output on the cadence the driver's Sleep sets, without any start wait (64-bit)
-    bool sleep_status_every_frame = false; // developer: off (default) | on; the driver's sleep status is polled at every Reflex Sleep instead of once per second (64-bit)
-    bool gpu_start_probe = false; // developer experiment: off (default) | on; a Signal in front of the first submission of each frame measures when the GPU starts it (64-bit DX12, frames with a readiness sample)
     bool gpu_queue_probe = kPacingGpuQueueProbeDefault; // developer measurement: on (default) | off; 64-bit DX12; per frame the presenting queue's submissions, empty time and margins (pacing CSV gq_*); nothing runs without a Direct3D 12 presenting queue
     int gpu_queue_probe_source = kPacingGpuQueueProbeSourceDefault; // developer: 0–1, default 1; 1 lets the queue probe adopt the queue that carries the frame's rendering by following per-frame fence dependencies from the presenting queue (64-bit DX12; effective only with the probe on; 0 on Win32)
-    bool unified_pacer = kPacingUnifiedPacerDefault; // developer: on (default) | off; the unified pacer replaces the pacing mechanisms with one start law (64-bit only; forced off on Win32); false is the earlier pipeline
-    PacingTestMode pacing_test_mode = PacingTestMode::Off; // developer, honoured only with developer_settings: off (default) | reflex_only | driver_limiter; who owns pacing: ReLimiter, the game's own Reflex alone, or the Reflex driver limiter at the cap's interval; the pipeline carries the effective mode and derives unified_pacer from it
-    bool unified_every_frame_service = kPacingUnifiedEveryFrameServiceDefault; // developer: on (default) | off; with unified_pacer, on: the law's service estimate takes a sample from every reported frame, the GPU wait taken out; off: the earlier estimator, saturated pairs only (use with unified_queue_target_us=4000) (64-bit only; forced off on Win32)
-    double unified_queue_target_us = kPacingUnifiedQueueTargetDefaultUs; // developer: 0–20000 µs, default 2000 (the earlier law: 4000); with unified_pacer, the queue term's target (64-bit only; the default on Win32)
-    double unified_hold_share = kPacingUnifiedHoldShareDefault; // developer: 0–0.25, default 0 (off); with unified_pacer, the share of the measured completion spacing a used report refills the hold credit with at least (64-bit only; 0 on Win32)
-    bool unified_queue_law = kPacingUnifiedQueueLawDefault; // developer: on (default) | off; with unified_pacer, the queue law on the presenting queue probe's signals sets the GPU interval and the hold credit's refill; forces the probe on (64-bit DX12 only; off on Win32)
+    PacingTestMode pacing_test_mode = PacingTestMode::Off; // developer, honoured only with developer_settings: off (default) | reflex_only | driver_limiter; who owns pacing: ReLimiter, the game's own Reflex alone, or the Reflex driver limiter at the cap's interval; the pipeline carries the effective mode and derives `unified` from it
+    double unified_hold_share = kPacingUnifiedHoldShareDefault; // developer: 0–0.25, default 0 (off); under unified, the share of the measured completion spacing a used report refills the hold credit with at least (64-bit only; 0 on Win32)
+    bool unified_queue_law = kPacingUnifiedQueueLawDefault; // developer: on (default) | off; under unified, the queue law on the presenting queue probe's signals sets the GPU interval and the hold credit's refill; forces the probe on (64-bit DX12 only; off on Win32)
     int unified_queue_rank = kPacingUnifiedQueueRankDefault; // developer: 1–8, default 2; with the queue law, the rank of the smallest queue margins that is used
     int unified_queue_need_frames = kPacingUnifiedQueueNeedFramesDefault; // developer: 1–16, default 4; with the queue law, how many of the newest valid records the base follows the GPU's need over
     int unified_queue_upstream = kPacingUnifiedQueueUpstreamDefault; // developer: 0–1, default 0 (off); 1 stamps the game's render markers locally as telemetry, no decision reads them (64-bit only; 0 on Win32); a saved 2 or 3 loads as 1
@@ -132,22 +103,10 @@ struct Config {
     // Dynamic MFG Passthrough — disable pacing when DLSS 4.5 Dynamic MFG is active
     bool dynamic_mfg_passthrough = false;
 
-    // Adaptive cap: the period governor stretches the cap interval
-    // continuously (VRR) or in whole refreshes (fixed refresh) when stage
-    // demand or missed frames show the cap cannot be held. Migrates
-    // the legacy Frame-Time Adaptation switch.
-    bool adaptive_cap = false;
-    // Adaptive cap fit, one of the tiers 75, 90, 99 (kAdaptiveCapFitTiers):
-    // the share of recent frames the lengthened interval must fit. Separate
-    // from Smoothing.
-    int adaptive_cap_percentile = kAdaptiveCapPercentileDefault;
     // Pacing preference (user key pacing_preference: latency | balanced | smooth, default balanced): the queue-based pacer's trade
     // between latency and even frames. Raw here and in the INI; Config_ApplyPacingPipeline resolves it with the developer keys
     // unified_queue_rank and unified_hold_share into the rank and share the pipeline carries (PacingPipeline_ResolvePreference).
     PacingPreference pacing_preference = PacingPreference::Balanced;
-
-    // OSD: Adaptive cap HUD line (historical key name)
-    bool osd_show_adaptive_smoothing = false;
 
     // OSD: Hardware monitoring
     bool osd_show_0_1pct_low = false;
@@ -199,8 +158,6 @@ struct Config {
 };
 
 extern Config g_config;
-// fg_presenter_probe_us as applied (Config_ApplyPacingPipeline); read by the GPU gate.
-extern std::atomic<int> g_fg_presenter_probe_us;
 
 // ── OSD Presets ──
 static constexpr int OSD_INITIAL_PRESET_SLOTS = 3;
@@ -227,7 +184,6 @@ struct OSDPreset {
     bool show_1pct_low = false;
     bool show_smoothness = false;
     bool show_pacing_quality = false;
-    bool show_adaptive_smoothing = false;
     bool show_0_1pct_low = false;
     bool show_gpu_render_time = false;
     bool show_total_frame_cost = false;
@@ -312,15 +268,12 @@ bool Config_Shutdown(DWORD timeout_ms = 5000);
 // Apply loaded config values to module globals.
 void ApplyConfig();
 
-// Apply only the pacing pipeline fields (smoothing, adaptive_cap, output_rung,
-// source_placement, gpu_present_gate_probes, stall injector,
-// marker_forward_order, reflex_sleep_bypass, bypass_low_latency_off, driver_low_latency_off,
-// sleep_status_every_frame, gpu_start_probe, gpu_queue_probe, unified_pacer, unified_every_frame_service,
-// unified_queue_target_us, unified_hold_share, unified_queue_law, unified_queue_rank,
-// unified_queue_allow_us) to the resolver, with pacing_preference resolved against unified_queue_rank and
-// unified_hold_share into the pipeline's effective rank and share (which carries
-// adaptive_cap to the period governor) and the NvAPI hooks. Part of
-// ApplyConfig; the OSD calls it after editing those fields.
+// Apply the pacing pipeline fields (gpu_present_gate_probes, gpu_queue_probe and its source, margin end and stamps,
+// unified_hold_share, unified_queue_law, unified_queue_rank, unified_queue_need_frames, unified_queue_allow_us,
+// pacing_test_mode) to the resolver and the probe's published state. pacing_test_mode counts only with
+// developer_settings (PacingPipeline_EffectiveTestMode) and the clamp derives the one `unified` state from it;
+// pacing_preference is resolved against unified_queue_rank and unified_hold_share into the pipeline's effective rank
+// and share. Part of ApplyConfig; the OSD calls it after editing those fields.
 void Config_ApplyPacingPipeline();
 
 // Developer control file (control_file.h): sets one live key the way the OSD

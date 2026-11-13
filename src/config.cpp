@@ -27,21 +27,15 @@
 #include <ShlObj.h>
 
 Config g_config;
-std::atomic<int> g_fg_presenter_probe_us{0};
 
 // Recommended defaults, for the developer diagnostics count and reset.
 static const Config s_default_config{};
 
-// INI layout version. 2: the Reflex Sleep bypass and pre-Sleep
-// placement became the defaults. Earlier builds saved every key, so an INI
-// without this version carries the old defaults of those two keys. 3: lead
-// coverage 99 became the default; test builds since the key existed saved
-// lead_coverage=95. 4: FG late-frame spacing became the default; test builds
-// since the key existed saved fg_late_spacing=false. 5: the queue law, the
-// queue probe and the probe's source key (queue that carries the rendering)
-// became the defaults; earlier builds saved unified_queue_law=false,
-// gpu_queue_probe=false and gpu_queue_probe_source=0.
-static constexpr int kConfigVersion = 5;
+// INI layout version. 5: the queue law, the queue probe and the probe's source key (queue that carries the rendering)
+// became the defaults; earlier builds saved unified_queue_law=false, gpu_queue_probe=false and
+// gpu_queue_probe_source=0. 6: the pacing settings listed in kRemovedKeys no longer exist; a file written before
+// carries them, they are neither read nor written, and the startup rewrite drops them.
+static constexpr int kConfigVersion = 6;
 
 static char s_ini_path[MAX_PATH] = {};
 static bool s_first_launch = false;
@@ -195,9 +189,6 @@ void ValidateConfig() {
     if (g_config.fg_off_fps != 0)
         g_config.fg_off_fps = Clamp(g_config.fg_off_fps, 30, 360);
 
-    // ── Presenter probe (developer experiment) ──
-    g_config.fg_presenter_probe_us = Clamp(g_config.fg_presenter_probe_us, 0, 10000);
-
     // ── VSync ──
     static const char* vsync_modes[] = {"game", "off", "on"};
     ValidateEnum(g_config.vsync_mode, vsync_modes, 3, "game");
@@ -207,48 +198,6 @@ void ValidateConfig() {
     ValidateEnum(g_config.log_level, log_levels, 4, "warn");
 
     // ── Pacing pipeline ──
-    if (static_cast<unsigned>(g_config.smoothing) >=
-        static_cast<unsigned>(PacingSmoothing::Count)) {
-        LOG_WARN("Config: invalid smoothing, resetting to 'on'");
-        g_config.smoothing = PacingSmoothing::On;
-    }
-    if (static_cast<unsigned>(g_config.output_rung) >=
-        static_cast<unsigned>(PacingRungOverride::Count)) {
-        LOG_WARN("Config: invalid output_rung, resetting to 'auto'");
-        g_config.output_rung = PacingRungOverride::Auto;
-    }
-    if (static_cast<unsigned>(g_config.marker_forward_order) >=
-        static_cast<unsigned>(PacingMarkerForwardOrder::Count)) {
-        LOG_WARN("Config: invalid marker_forward_order, resetting to 'before_wait'");
-        g_config.marker_forward_order = PacingMarkerForwardOrder::BeforeWait;
-    }
-    if (static_cast<unsigned>(g_config.gpu_queue_wait_render_queue) >=
-        static_cast<unsigned>(PacingRenderQueue::Count)) {
-        LOG_WARN("Config: invalid gpu_queue_wait_render_queue, resetting to 'keep'");
-        g_config.gpu_queue_wait_render_queue = PacingRenderQueue::Keep;
-    }
-    if (static_cast<unsigned>(g_config.lead_coverage) >=
-        static_cast<unsigned>(PacingLeadCoverage::Count)) {
-        LOG_WARN("Config: invalid lead_coverage, resetting to '99'");
-        g_config.lead_coverage = PacingLeadCoverage::Q99;
-    }
-    if (static_cast<unsigned>(g_config.source_placement) >=
-        static_cast<unsigned>(PacingPlacementOverride::Count)) {
-        LOG_WARN("Config: invalid source_placement, resetting to 'pre_sleep'");
-        g_config.source_placement = PacingPlacementOverride::PreSleep;
-    }
-    if (!std::isfinite(g_config.stall_inject_ms)) {
-        LOG_WARN("Config: non-finite stall_inject_ms, resetting to 0 (off)");
-        g_config.stall_inject_ms = 0.0;
-    }
-    g_config.stall_inject_ms = Clamp(
-        g_config.stall_inject_ms, 0.0, kPacingStallInjectMaxMs);
-    const int fit_tier = PacingPipeline_AdaptiveCapFitTier(g_config.adaptive_cap_percentile);
-    if (fit_tier != g_config.adaptive_cap_percentile) {
-        LOG_WARN("Config: adaptive_cap_percentile %d is not a tier (75, 90 or 99), using %d",
-                 g_config.adaptive_cap_percentile, fit_tier);
-        g_config.adaptive_cap_percentile = fit_tier;
-    }
     if (static_cast<unsigned>(g_config.pacing_preference) >= static_cast<unsigned>(PacingPreference::Count)) {
         LOG_WARN("Config: invalid pacing_preference, resetting to 'balanced'");
         g_config.pacing_preference = PacingPreference::Balanced;
@@ -257,25 +206,7 @@ void ValidateConfig() {
         LOG_WARN("Config: invalid pacing_test_mode, resetting to 'off'");
         g_config.pacing_test_mode = PacingTestMode::Off;
     }
-    if (!std::isfinite(g_config.stall_inject_period_s)) {
-        LOG_WARN("Config: non-finite stall_inject_period_s, resetting to %.0f",
-                 kPacingStallInjectDefaultPeriodS);
-        g_config.stall_inject_period_s = kPacingStallInjectDefaultPeriodS;
-    }
-    g_config.stall_inject_period_s = Clamp(
-        g_config.stall_inject_period_s,
-        kPacingStallInjectMinPeriodS,
-        kPacingStallInjectMaxPeriodS);
-    // unified_queue_target_us (developer, only read under unified_pacer): non-finite loads as the
-    // default, otherwise [0, kPacingUnifiedQueueTargetMaxUs].
-    if (!std::isfinite(g_config.unified_queue_target_us)) {
-        LOG_WARN("Config: non-finite unified_queue_target_us, resetting to %.0f",
-                 kPacingUnifiedQueueTargetDefaultUs);
-        g_config.unified_queue_target_us = kPacingUnifiedQueueTargetDefaultUs;
-    }
-    g_config.unified_queue_target_us = Clamp(
-        g_config.unified_queue_target_us, 0.0, kPacingUnifiedQueueTargetMaxUs);
-    // unified_hold_share (developer, only read under unified_pacer): non-finite loads as the default,
+    // unified_hold_share (developer, only read under unified): non-finite loads as the default,
     // otherwise [0, kPacingUnifiedHoldShareMax].
     if (!std::isfinite(g_config.unified_hold_share)) {
         LOG_WARN("Config: non-finite unified_hold_share, resetting to %.0f", kPacingUnifiedHoldShareDefault);
@@ -289,98 +220,63 @@ void ValidateConfig() {
     g_config.unified_queue_upstream = Clamp(g_config.unified_queue_upstream, 0, kPacingUnifiedQueueUpstreamMax);
     g_config.unified_queue_margin_end = Clamp(g_config.unified_queue_margin_end, 0, kPacingUnifiedQueueMarginEndMax);
     g_config.unified_queue_allow_us = Clamp(g_config.unified_queue_allow_us, 0, kPacingUnifiedQueueAllowMaxUs);
-    // gpu_wait_headroom_us: the collision guard's release headroom; 0 or
-    // less (or non-finite) loads as the default.
-    if (!std::isfinite(g_config.gpu_wait_headroom_us) || g_config.gpu_wait_headroom_us <= 0.0) {
-        g_config.gpu_wait_headroom_us = kPacingGpuWaitHeadroomDefaultUs;
-    } else {
-        const double headroom_us = Clamp(
-            g_config.gpu_wait_headroom_us, kPacingGpuWaitHeadroomMinUs, kPacingGpuWaitHeadroomMaxUs);
-        if (headroom_us != g_config.gpu_wait_headroom_us)
-            LOG_WARN("Config: gpu_wait_headroom_us %.0f outside [500, 3000], clamped",
-                     g_config.gpu_wait_headroom_us);
-        g_config.gpu_wait_headroom_us = headroom_us;
-    }
-    // gpu_wait_interleave_s: 0 (or less, or non-finite) is off; else [1, 10] s.
-    if (!std::isfinite(g_config.gpu_wait_interleave_s) || g_config.gpu_wait_interleave_s <= 0.0) {
-        g_config.gpu_wait_interleave_s = 0.0;
-    } else {
-        const double block_s = Clamp(g_config.gpu_wait_interleave_s,
-            kPacingGpuWaitInterleaveMinS, kPacingGpuWaitInterleaveMaxS);
-        if (block_s != g_config.gpu_wait_interleave_s)
-            LOG_WARN("Config: gpu_wait_interleave_s %.2f outside [1, 10], clamped",
-                     g_config.gpu_wait_interleave_s);
-        g_config.gpu_wait_interleave_s = block_s;
-    }
 
     // ── Monitor Selection ──
     g_config.selected_monitor = Clamp(g_config.selected_monitor, 0, 8);
 }
 
 // ── Pacing pipeline keys ──
-// Retired pacing keys (Estimator A, native predictor, gate location, GPU gate
-// mode/slack/max delay, adaptive reserve, smoothing tuning, readiness observer)
-// are never read; pacing_method and adaptive_smoothing are read only to migrate
-// an INI without the replacement key. The startup rewrite drops all of them.
+// The pacing settings that no longer exist. An INI written before configuration version 6 carries them: they are
+// neither read nor written, and the startup rewrite drops them (nothing resurrects a key). Each is listed with the
+// value it had by default, to name in one info line those that held something else (for a user mostly
+// adaptive_cap=true); nothing is logged for defaults. A saved value never enters a pacing_test_mode.
+struct RemovedKey {
+    const char* name;
+    const char* default_text;
+};
+static const RemovedKey kRemovedKeys[] = {
+    {"adaptive_cap", "false"}, {"adaptive_cap_percentile", "75"}, {"adaptive_cap_hold_room", "true"},
+    {"osd_show_adaptive_smoothing", "false"}, {"adaptive_smoothing", "false"}, {"smoothing", "on"},
+    {"output_rung", "auto"}, {"source_placement", "pre_sleep"}, {"reflex_sleep_bypass", "true"},
+    {"bypass_low_latency_off", "false"}, {"driver_low_latency_off", "false"}, {"driver_limiter_hold", "false"},
+    {"pre_sleep_precise", "false"}, {"gpu_paced_cadence", "false"}, {"lead_coverage", "99"},
+    {"lead_spike_floor", "true"}, {"fg_late_spacing", "true"}, {"gpu_queue_wait_render_queue", "keep"},
+    {"gpu_wait_interleave_s", "0"}, {"stall_inject_ms", "0"}, {"stall_inject_period_s", "5"},
+    {"marker_forward_order", "before_wait"}, {"sleep_status_every_frame", "false"}, {"gpu_start_probe", "false"},
+    {"gpu_priority_probe", "false"}, {"fg_presenter_probe_us", "0"}, {"unified_pacer", "true"},
+    {"unified_every_frame_service", "true"}, {"unified_queue_target_us", "2000"}, {"gpu_wait_headroom_us", "1000"},
+};
+
+// True when a saved value reads as the default the way the key was read: booleans as ReadINIBool does, numbers by
+// value, other text without case.
+static bool SameAsDefault(const std::string& value, const char* default_text) {
+    const bool default_is_true = std::strcmp(default_text, "true") == 0;
+    if (default_is_true || std::strcmp(default_text, "false") == 0)
+        return (value == "true" || value == "1" || value == "yes") == default_is_true;
+    char* saved_end = nullptr;
+    char* default_end = nullptr;
+    const double saved_number = std::strtod(value.c_str(), &saved_end);
+    const double default_number = std::strtod(default_text, &default_end);
+    if (saved_end != value.c_str() && *saved_end == '\0' && default_end != default_text && *default_end == '\0')
+        return saved_number == default_number;
+    return _stricmp(value.c_str(), default_text) == 0;
+}
+
+static void LogRemovedKeysWithValues(const char* S, const char* P) {
+    std::string names;
+    for (const RemovedKey& key : kRemovedKeys) {
+        const std::string value = ReadINIString(S, key.name, "", P);
+        if (value.empty() || SameAsDefault(value, key.default_text)) continue;
+        if (!names.empty()) names += ", ";
+        names += key.name;
+        names += '=';
+        names += value;
+    }
+    if (!names.empty())
+        LOG_INFO("Config: settings that no longer exist were ignored: %s", names.c_str());
+}
+
 static void LoadPacingPipelineKeys(const char* S, const char* P) {
-    const std::string smoothing = ReadINIString(S, "smoothing", "on", P);
-    if (!PacingSmoothing_FromText(smoothing.c_str(), &g_config.smoothing)) {
-        LOG_WARN("Config: invalid smoothing '%s', resetting to 'on'", smoothing.c_str());
-        g_config.smoothing = PacingSmoothing::On;
-    }
-
-    // Marker pacing becomes the marker rung override; automatic, native
-    // and invalid methods resolve automatically.
-    const std::string output_rung = ReadINIString(S, "output_rung", "", P);
-    if (output_rung.empty()) {
-        const std::string legacy_method = ReadINIString(S, "pacing_method", "", P);
-        g_config.output_rung = legacy_method == "marker"
-            ? PacingRungOverride::Marker : PacingRungOverride::Auto;
-        if (!legacy_method.empty())
-            LOG_INFO("Config: migrated pacing_method=%s to output_rung=%s",
-                     legacy_method.c_str(), PacingRungOverride_Text(g_config.output_rung));
-    } else if (!PacingRungOverride_FromText(output_rung.c_str(), &g_config.output_rung)) {
-        LOG_WARN("Config: invalid output_rung '%s', resetting to 'auto'", output_rung.c_str());
-        g_config.output_rung = PacingRungOverride::Auto;
-    }
-
-    const std::string forward_order = ReadINIString(S, "marker_forward_order", "before_wait", P);
-    if (!PacingMarkerForwardOrder_FromText(forward_order.c_str(), &g_config.marker_forward_order)) {
-        LOG_WARN("Config: invalid marker_forward_order '%s', resetting to 'before_wait'",
-                 forward_order.c_str());
-        g_config.marker_forward_order = PacingMarkerForwardOrder::BeforeWait;
-    }
-
-    const std::string render_queue = ReadINIString(S, "gpu_queue_wait_render_queue", "keep", P);
-    if (!PacingRenderQueue_FromText(render_queue.c_str(), &g_config.gpu_queue_wait_render_queue)) {
-        LOG_WARN("Config: invalid gpu_queue_wait_render_queue '%s', resetting to 'keep'",
-                 render_queue.c_str());
-        g_config.gpu_queue_wait_render_queue = PacingRenderQueue::Keep;
-    }
-
-    const std::string lead_coverage = ReadINIString(S, "lead_coverage", "99", P);
-    if (!PacingLeadCoverage_FromText(lead_coverage.c_str(), &g_config.lead_coverage)) {
-        LOG_WARN("Config: invalid lead_coverage '%s', resetting to '99'", lead_coverage.c_str());
-        g_config.lead_coverage = PacingLeadCoverage::Q99;
-    }
-
-    const std::string placement = ReadINIString(S, "source_placement", "pre_sleep", P);
-    if (!PacingPlacementOverride_FromText(placement.c_str(), &g_config.source_placement)) {
-        LOG_WARN("Config: invalid source_placement '%s', resetting to 'pre_sleep'", placement.c_str());
-        g_config.source_placement = PacingPlacementOverride::PreSleep;
-    }
-
-    g_config.stall_inject_ms = ReadINIDouble(S, "stall_inject_ms", 0.0, P);
-    g_config.stall_inject_period_s = ReadINIDouble(
-        S, "stall_inject_period_s", kPacingStallInjectDefaultPeriodS, P);
-    g_config.gpu_wait_headroom_us = ReadINIDouble(S, "gpu_wait_headroom_us", kPacingGpuWaitHeadroomDefaultUs, P);
-    g_config.gpu_wait_interleave_s = ReadINIDouble(S, "gpu_wait_interleave_s", 0.0, P);
-
-    // adaptive_cap replaces adaptive_smoothing; the legacy value is its default.
-    g_config.adaptive_cap = ReadINIBool(
-        S, "adaptive_cap", ReadINIBool(S, "adaptive_smoothing", false, P), P);
-    g_config.adaptive_cap_percentile = ReadINIInt(
-        S, "adaptive_cap_percentile", kAdaptiveCapPercentileDefault, P);
     const std::string preference = ReadINIString(S, "pacing_preference", PacingPreference_Text(PacingPreference::Balanced), P);
     if (!PacingPreference_FromText(preference.c_str(), &g_config.pacing_preference)) {
         LOG_WARN("Config: invalid pacing_preference '%s', resetting to 'balanced'", preference.c_str());
@@ -470,22 +366,9 @@ void LoadConfig(HMODULE hModule) {
     g_config.csv_enabled             = ReadINIBool(S, "csv_enabled", false, P);
     g_config.native_pcl_enabled      = ReadINIBool(S, "native_pcl_enabled", false, P);
     g_config.gpu_present_gate_probes=ReadINIBool(S,"gpu_present_gate_probes",true,P);
-    g_config.fg_late_spacing=ReadINIBool(S,"fg_late_spacing",true,P);
-    g_config.gpu_paced_cadence=ReadINIBool(S,"gpu_paced_cadence",false,P);
-    g_config.bypass_low_latency_off=ReadINIBool(S,"bypass_low_latency_off",false,P);
-    g_config.driver_low_latency_off=ReadINIBool(S,"driver_low_latency_off",false,P);
     g_config.flip_metering_off=ReadINIBool(S,"flip_metering_off",false,P);
-    g_config.fg_presenter_probe_us=ReadINIInt(S,"fg_presenter_probe_us",0,P);
-    g_config.gpu_priority_probe=ReadINIBool(S,"gpu_priority_probe",false,P);
-    g_config.pre_sleep_precise=ReadINIBool(S,"pre_sleep_precise",false,P);
-    g_config.driver_limiter_hold=ReadINIBool(S,"driver_limiter_hold",false,P);
-    g_config.sleep_status_every_frame=ReadINIBool(S,"sleep_status_every_frame",false,P);
-    g_config.gpu_start_probe=ReadINIBool(S,"gpu_start_probe",false,P);
     g_config.gpu_queue_probe=ReadINIBool(S,"gpu_queue_probe",kPacingGpuQueueProbeDefault,P);
     g_config.gpu_queue_probe_source=ReadINIInt(S,"gpu_queue_probe_source",kPacingGpuQueueProbeSourceDefault,P);
-    g_config.unified_pacer=ReadINIBool(S,"unified_pacer",kPacingUnifiedPacerDefault,P);
-    g_config.unified_every_frame_service=ReadINIBool(S,"unified_every_frame_service",kPacingUnifiedEveryFrameServiceDefault,P);
-    g_config.unified_queue_target_us=ReadINIDouble(S,"unified_queue_target_us",kPacingUnifiedQueueTargetDefaultUs,P);
     g_config.unified_hold_share=ReadINIDouble(S,"unified_hold_share",kPacingUnifiedHoldShareDefault,P);
     g_config.unified_queue_law=ReadINIBool(S,"unified_queue_law",kPacingUnifiedQueueLawDefault,P);
     g_config.unified_queue_rank=ReadINIInt(S,"unified_queue_rank",kPacingUnifiedQueueRankDefault,P);
@@ -494,9 +377,6 @@ void LoadConfig(HMODULE hModule) {
     g_config.unified_queue_margin_end=ReadINIInt(S,"unified_queue_margin_end",kPacingUnifiedQueueMarginEndDefault,P);
     g_config.unified_queue_allow_us=ReadINIInt(S,"unified_queue_allow_us",kPacingUnifiedQueueAllowDefaultUs,P);
     g_config.control_file=ReadINIBool(S,"control_file",false,P);
-    g_config.adaptive_cap_hold_room=ReadINIBool(S,"adaptive_cap_hold_room",true,P);
-    g_config.lead_spike_floor=ReadINIBool(S,"lead_spike_floor",true,P);
-    g_config.reflex_sleep_bypass=ReadINIBool(S,"reflex_sleep_bypass",true,P);
     g_config.reflex_inject           = ReadINIBool(S, "reflex_inject", false, P);
     g_config.flip_model_override     = ReadINIBool(S, "flip_model_override", false, P);
     g_config.shared_presets          = ReadINIBool(S, "shared_presets", false, P);
@@ -507,22 +387,7 @@ void LoadConfig(HMODULE hModule) {
     // Defaults changed by kConfigVersion: an existing INI written before them
     // moves to them once; its other values stay.
     const int saved_version = ReadINIInt(S, "config_version", 1, P);
-    if (!s_first_launch && saved_version < 2 &&
-        (!g_config.reflex_sleep_bypass || g_config.source_placement != PacingPlacementOverride::PreSleep)) {
-        LOG_INFO("Config: moved to the recommended defaults reflex_sleep_bypass=true source_placement=pre_sleep "
-                 "(was %s, %s)", g_config.reflex_sleep_bypass ? "true" : "false",
-                 PacingPlacementOverride_Text(g_config.source_placement));
-        g_config.reflex_sleep_bypass = true;
-        g_config.source_placement = PacingPlacementOverride::PreSleep;
-    }
-    if (!s_first_launch && saved_version < 3 && g_config.lead_coverage == PacingLeadCoverage::Q95) {
-        LOG_INFO("Config: moved to the recommended default lead_coverage=99 (was 95)");
-        g_config.lead_coverage = PacingLeadCoverage::Q99;
-    }
-    if (!s_first_launch && saved_version < 4 && !g_config.fg_late_spacing) {
-        LOG_INFO("Config: moved to the recommended default fg_late_spacing=true (was false)");
-        g_config.fg_late_spacing = true;
-    }
+    if (!s_first_launch && saved_version < 6) LogRemovedKeysWithValues(S, P);
     if (!s_first_launch && saved_version < 5 &&
         (g_config.unified_queue_law != kPacingUnifiedQueueLawDefault ||
          g_config.gpu_queue_probe != kPacingGpuQueueProbeDefault ||
@@ -534,7 +399,6 @@ void LoadConfig(HMODULE hModule) {
         g_config.gpu_queue_probe = kPacingGpuQueueProbeDefault;
         g_config.gpu_queue_probe_source = kPacingGpuQueueProbeSourceDefault;
     }
-    g_config.osd_show_adaptive_smoothing = ReadINIBool(S, "osd_show_adaptive_smoothing", false, P);
     g_config.osd_show_0_1pct_low     = ReadINIBool(S, "osd_show_0_1pct_low", false, P);
     g_config.osd_show_gpu_render_time = ReadINIBool(S, "osd_show_gpu_render_time", false, P);
     g_config.osd_show_total_frame_cost = ReadINIBool(S, "osd_show_total_frame_cost", false, P);
@@ -680,7 +544,6 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIBool(S, "osd_show_pacing_quality", config.osd_show_pacing_quality, P);
     WriteINIBool(S, "osd_show_fg", config.osd_show_fg, P);
     WriteINIBool(S, "osd_show_limiter", config.osd_show_limiter, P);
-    WriteINIBool(S, "osd_show_adaptive_smoothing", config.osd_show_adaptive_smoothing, P);
     WriteINIBool(S, "osd_show_gpu_temp", config.osd_show_gpu_temp, P);
     WriteINIBool(S, "osd_show_gpu_clock", config.osd_show_gpu_clock, P);
     WriteINIBool(S, "osd_show_gpu_usage", config.osd_show_gpu_usage, P);
@@ -709,38 +572,16 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     }
 
     // ── Pacing pipeline ──
-    WriteINIString(S, "smoothing", PacingSmoothing_Text(config.smoothing), P);
-    WriteINIBool(S, "adaptive_cap", config.adaptive_cap, P);
-    WriteINIInt(S, "adaptive_cap_percentile", config.adaptive_cap_percentile, P);
     WriteINIString(S, "pacing_preference", PacingPreference_Text(config.pacing_preference), P);
     WriteINIBool(S, "advanced_settings", config.advanced_settings, P);
     WriteINIBool(S, "developer_settings", config.developer_settings, P);
     WriteINIInt(S, "config_version", kConfigVersion, P);
 
     // ── Pacing pipeline (developer) ──
-    WriteINIString(S, "output_rung", PacingRungOverride_Text(config.output_rung), P);
-    WriteINIString(S, "marker_forward_order",
-        PacingMarkerForwardOrder_Text(config.marker_forward_order), P);
-    WriteINIString(S, "gpu_queue_wait_render_queue",
-        PacingRenderQueue_Text(config.gpu_queue_wait_render_queue), P);
-    WriteINIString(S, "lead_coverage", PacingLeadCoverage_Text(config.lead_coverage), P);
-    WriteINIBool(S, "fg_late_spacing", config.fg_late_spacing, P);
-    WriteINIBool(S, "gpu_paced_cadence", config.gpu_paced_cadence, P);
-    WriteINIBool(S, "bypass_low_latency_off", config.bypass_low_latency_off, P);
-    WriteINIBool(S, "driver_low_latency_off", config.driver_low_latency_off, P);
     WriteINIBool(S, "flip_metering_off", config.flip_metering_off, P);
-    WriteINIInt(S, "fg_presenter_probe_us", config.fg_presenter_probe_us, P);
-    WriteINIBool(S, "gpu_priority_probe", config.gpu_priority_probe, P);
-    WriteINIBool(S, "pre_sleep_precise", config.pre_sleep_precise, P);
-    WriteINIBool(S, "driver_limiter_hold", config.driver_limiter_hold, P);
-    WriteINIBool(S, "sleep_status_every_frame", config.sleep_status_every_frame, P);
-    WriteINIBool(S, "gpu_start_probe", config.gpu_start_probe, P);
     WriteINIBool(S, "gpu_queue_probe", config.gpu_queue_probe, P);
     WriteINIInt(S, "gpu_queue_probe_source", config.gpu_queue_probe_source, P);
-    WriteINIBool(S, "unified_pacer", config.unified_pacer, P);
     WriteINIString(S, "pacing_test_mode", PacingTestMode_Text(config.pacing_test_mode), P);
-    WriteINIBool(S, "unified_every_frame_service", config.unified_every_frame_service, P);
-    WriteINIDouble(S, "unified_queue_target_us", config.unified_queue_target_us, P);
     WriteINIDouble(S, "unified_hold_share", config.unified_hold_share, P);
     WriteINIBool(S, "unified_queue_law", config.unified_queue_law, P);
     WriteINIInt(S, "unified_queue_rank", config.unified_queue_rank, P);
@@ -749,14 +590,6 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIInt(S, "unified_queue_margin_end", config.unified_queue_margin_end, P);
     WriteINIInt(S, "unified_queue_allow_us", config.unified_queue_allow_us, P);
     WriteINIBool(S, "control_file", config.control_file, P);
-    WriteINIBool(S, "adaptive_cap_hold_room", config.adaptive_cap_hold_room, P);
-    WriteINIBool(S, "lead_spike_floor", config.lead_spike_floor, P);
-    WriteINIString(S, "source_placement",
-        PacingPlacementOverride_Text(config.source_placement), P);
-    WriteINIDouble(S, "stall_inject_ms", config.stall_inject_ms, P);
-    WriteINIDouble(S, "stall_inject_period_s", config.stall_inject_period_s, P);
-    WriteINIDouble(S, "gpu_wait_headroom_us", config.gpu_wait_headroom_us, P);
-    WriteINIDouble(S, "gpu_wait_interleave_s", config.gpu_wait_interleave_s, P);
 
     // ── Frame Generation ──
     WriteINIBool(S, "dynamic_mfg_passthrough", config.dynamic_mfg_passthrough, P);
@@ -768,7 +601,6 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIBool(S, "csv_enabled", config.csv_enabled, P);
     WriteINIBool(S, "native_pcl_enabled", config.native_pcl_enabled, P);
     WriteINIBool(S,"gpu_present_gate_probes",config.gpu_present_gate_probes,P);
-    WriteINIBool(S,"reflex_sleep_bypass",config.reflex_sleep_bypass,P);
     WriteINIBool(S, "dlss_info_hooks", config.dlss_info_hooks, P);
     WriteINIBool(S, "hook_installer_thread", config.hook_installer_thread, P);
     if (!config.streamline_compat)
@@ -981,27 +813,7 @@ void SaveConfig() {
 // Pipeline configuration of the resolver and the source stage.
 static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
     PacingPipelineConfig pipeline;
-    pipeline.smoothing = config.smoothing;
-    pipeline.rung_override = config.output_rung;
-    pipeline.adaptive_cap = config.adaptive_cap;
-    pipeline.adaptive_cap_percentile = config.adaptive_cap_percentile;
-    pipeline.placement_override = config.source_placement;
     pipeline.gpu_probes = config.gpu_present_gate_probes;
-    pipeline.stall_inject_ms = config.stall_inject_ms;
-    pipeline.stall_inject_period_s = config.stall_inject_period_s;
-    pipeline.gpu_wait_headroom_us = config.gpu_wait_headroom_us;
-    pipeline.gpu_wait_interleave_s = config.gpu_wait_interleave_s;
-    pipeline.gpu_queue_wait_render_queue = config.gpu_queue_wait_render_queue;
-    pipeline.lead_coverage = config.lead_coverage;
-    pipeline.fg_late_spacing = config.fg_late_spacing;
-    pipeline.gpu_paced_cadence = config.gpu_paced_cadence;
-    pipeline.adaptive_cap_hold_room = config.adaptive_cap_hold_room;
-    pipeline.lead_spike_floor = config.lead_spike_floor;
-    pipeline.pre_sleep_precise = config.pre_sleep_precise;
-    pipeline.driver_limiter_hold = config.driver_limiter_hold;
-    pipeline.unified_pacer = config.unified_pacer;
-    pipeline.unified_every_frame_service = config.unified_every_frame_service;
-    pipeline.unified_queue_target_us = config.unified_queue_target_us;
     pipeline.unified_hold_share = config.unified_hold_share;
     pipeline.unified_queue_law = config.unified_queue_law;
     pipeline.unified_queue_rank = config.unified_queue_rank;
@@ -1014,11 +826,6 @@ static PacingPipelineConfig PacingPipelineConfigFrom(const Config& config) {
 }
 
 void Config_ApplyPacingPipeline() {
-    // adaptive_cap reaches the period governor through the
-    // pipeline configuration; the scheduler owner applies it each frame.
-    // The key the clamp will publish is noted for the Sleep-mode reconcile BEFORE the
-    // pipeline exposes it, so a hook that can see the new key already sees the reconcile
-    // pending (an unchanged key is one load and a branch).
     PacingPipelineConfig pipeline = PacingPipelineConfigFrom(g_config);
     // The pacing preference meets the developer keys here, once: the pipeline carries only the effective rank and hold share
     // (g_config and the INI keep the raw values; the clamp and the 32-bit forcing run on the effective pair).
@@ -1027,30 +834,23 @@ void Config_ApplyPacingPipeline() {
     pipeline.unified_queue_rank = effective.queue_rank;
     pipeline.unified_hold_share = effective.hold_share;
     // The owner of pacing is resolved here, once: the saved test mode counts only with developer_settings, and the
-    // clamp below derives the one `unified` state from it (the key, 64-bit and no test mode). The Sleep bypass and the
-    // observers the key gates (the queue law's probe and feed) follow the same effective state.
+    // clamp below derives the one `unified` state from it (64-bit and no test mode). The observers it gates (the
+    // queue law's probe and feed) follow the same state. It is noted for the Sleep-mode reconcile BEFORE the
+    // pipeline exposes it, so a hook that can see the new owner already sees the reconcile pending (an unchanged
+    // owner is one load and a branch).
     pipeline.test_mode = PacingPipeline_EffectiveTestMode(g_config.pacing_test_mode, g_config.developer_settings);
-    NvAPI_PrepareUnifiedKey(PacingPipeline_ClampConfig(pipeline).unified_pacer);
+    const bool unified = PacingPipeline_ClampConfig(pipeline).unified;
+    NvAPI_PrepareUnifiedKey(unified);
     PacingPipeline_SetConfig(pipeline);
-    g_marker_forward_after_wait.store(
-        g_config.marker_forward_order == PacingMarkerForwardOrder::AfterWait,
-        std::memory_order_relaxed);
-    g_reflex_sleep_bypass.store(
-        PacingPipeline_EffectiveSleepBypass(g_config.reflex_sleep_bypass, pipeline.test_mode), std::memory_order_relaxed);
-    g_bypass_low_latency_off.store(g_config.bypass_low_latency_off, std::memory_order_relaxed);
-    g_driver_low_latency_off.store(g_config.driver_low_latency_off, std::memory_order_relaxed);
-    g_sleep_status_every_frame.store(g_config.sleep_status_every_frame, std::memory_order_relaxed);
-    g_gpu_start_probe.store(g_config.gpu_start_probe, std::memory_order_relaxed);
-    // The queue law forces the probe on (64-bit, with the unified pacer, the law's only user) and
+    // The queue law forces the probe on (64-bit, under the unified pacer, the law's only user) and
     // feeds it to the law. The probe itself is a 64-bit, Direct3D 12 measurement: on Win32 nothing
     // starts it.
-    const bool queue_law = g_config.unified_queue_law && PacingPipeline_ClampConfig(pipeline).unified_pacer;
+    const bool queue_law = g_config.unified_queue_law && unified;
     g_gpu_queue_probe.store((g_config.gpu_queue_probe && sizeof(void*) == 8) || queue_law, std::memory_order_relaxed);
     g_gpu_queue_law_feed.store(queue_law, std::memory_order_relaxed);
     g_unified_queue_upstream.store(sizeof(void*) == 8 ? g_config.unified_queue_upstream : 0, std::memory_order_relaxed);
     g_gpu_queue_probe_source.store(sizeof(void*) == 8 ? g_config.gpu_queue_probe_source : 0, std::memory_order_relaxed);
     g_unified_queue_margin_end.store(sizeof(void*) == 8 ? g_config.unified_queue_margin_end : 0, std::memory_order_relaxed);
-    g_fg_presenter_probe_us.store(g_config.fg_presenter_probe_us, std::memory_order_relaxed);
 }
 
 // ── Live keys (developer control file) ──
@@ -1099,44 +899,12 @@ constexpr Key kKeys[] = {
     {"target_fps", &SetInt<&Config::target_fps>, Publish::TargetFps},
     {"background_fps", &SetInt<&Config::background_fps>, Publish::BackgroundFps},
     {"fg_off_fps", &SetInt<&Config::fg_off_fps>, Publish::FgOffFps},
-    {"smoothing", &SetEnum<PacingSmoothing, &Config::smoothing, PacingSmoothing_FromText>, Publish::Pipeline},
-    {"output_rung", &SetEnum<PacingRungOverride, &Config::output_rung, PacingRungOverride_FromText>,
-        Publish::Pipeline},
-    {"marker_forward_order", &SetEnum<PacingMarkerForwardOrder, &Config::marker_forward_order,
-        PacingMarkerForwardOrder_FromText>, Publish::Pipeline},
-    {"gpu_queue_wait_render_queue", &SetEnum<PacingRenderQueue, &Config::gpu_queue_wait_render_queue,
-        PacingRenderQueue_FromText>, Publish::Pipeline},
-    {"lead_coverage", &SetEnum<PacingLeadCoverage, &Config::lead_coverage, PacingLeadCoverage_FromText>,
-        Publish::Pipeline},
-    {"source_placement", &SetEnum<PacingPlacementOverride, &Config::source_placement,
-        PacingPlacementOverride_FromText>, Publish::Pipeline},
-    {"adaptive_cap", &SetBool<&Config::adaptive_cap>, Publish::Pipeline},
-    {"adaptive_cap_percentile", &SetInt<&Config::adaptive_cap_percentile>, Publish::Pipeline},
     {"pacing_preference", &SetEnum<PacingPreference, &Config::pacing_preference, PacingPreference_FromText>,
         Publish::Pipeline},
-    {"adaptive_cap_hold_room", &SetBool<&Config::adaptive_cap_hold_room>, Publish::Pipeline},
     {"gpu_present_gate_probes", &SetBool<&Config::gpu_present_gate_probes>, Publish::Pipeline},
-    {"gpu_wait_headroom_us", &SetDouble<&Config::gpu_wait_headroom_us>, Publish::Pipeline},
-    {"gpu_wait_interleave_s", &SetDouble<&Config::gpu_wait_interleave_s>, Publish::Pipeline},
-    {"stall_inject_ms", &SetDouble<&Config::stall_inject_ms>, Publish::Pipeline},
-    {"stall_inject_period_s", &SetDouble<&Config::stall_inject_period_s>, Publish::Pipeline},
-    {"reflex_sleep_bypass", &SetBool<&Config::reflex_sleep_bypass>, Publish::Pipeline},
-    {"bypass_low_latency_off", &SetBool<&Config::bypass_low_latency_off>, Publish::Pipeline},
-    {"driver_low_latency_off", &SetBool<&Config::driver_low_latency_off>, Publish::Pipeline},
-    {"fg_late_spacing", &SetBool<&Config::fg_late_spacing>, Publish::Pipeline},
-    {"gpu_paced_cadence", &SetBool<&Config::gpu_paced_cadence>, Publish::Pipeline},
-    {"lead_spike_floor", &SetBool<&Config::lead_spike_floor>, Publish::Pipeline},
-    {"fg_presenter_probe_us", &SetInt<&Config::fg_presenter_probe_us>, Publish::Pipeline},
-    {"pre_sleep_precise", &SetBool<&Config::pre_sleep_precise>, Publish::Pipeline},
-    {"driver_limiter_hold", &SetBool<&Config::driver_limiter_hold>, Publish::Pipeline},
-    {"sleep_status_every_frame", &SetBool<&Config::sleep_status_every_frame>, Publish::Pipeline},
-    {"gpu_start_probe", &SetBool<&Config::gpu_start_probe>, Publish::Pipeline},
     {"gpu_queue_probe", &SetBool<&Config::gpu_queue_probe>, Publish::Pipeline},
     {"gpu_queue_probe_source", &SetInt<&Config::gpu_queue_probe_source>, Publish::Pipeline},
     {"unified_queue_margin_end", &SetInt<&Config::unified_queue_margin_end>, Publish::Pipeline},
-    {"unified_pacer", &SetBool<&Config::unified_pacer>, Publish::Pipeline},
-    {"unified_every_frame_service", &SetBool<&Config::unified_every_frame_service>, Publish::Pipeline},
-    {"unified_queue_target_us", &SetDouble<&Config::unified_queue_target_us>, Publish::Pipeline},
     {"unified_hold_share", &SetDouble<&Config::unified_hold_share>, Publish::Pipeline},
     {"pacing_test_mode", &SetEnum<PacingTestMode, &Config::pacing_test_mode, PacingTestMode_FromText>, Publish::Pipeline},
     {"unified_queue_law", &SetBool<&Config::unified_queue_law>, Publish::Pipeline},
@@ -1184,38 +952,13 @@ bool Config_SetLiveKey(const char* key, const char* value, char* error, size_t e
 
 int Config_DeveloperOverrides() {
     const Config& d = s_default_config;
-    return (g_config.smoothing != d.smoothing) + (g_config.output_rung != d.output_rung) +
-        (g_config.gpu_present_gate_probes != d.gpu_present_gate_probes) +
-        (g_config.gpu_wait_headroom_us != d.gpu_wait_headroom_us) +
-        (g_config.gpu_wait_interleave_s != d.gpu_wait_interleave_s) +
-        (g_config.stall_inject_ms != d.stall_inject_ms) +
-        (g_config.stall_inject_period_s != d.stall_inject_period_s) +
-        (g_config.reflex_sleep_bypass != d.reflex_sleep_bypass) +
-        (g_config.marker_forward_order != d.marker_forward_order) +
-        (g_config.gpu_queue_wait_render_queue != d.gpu_queue_wait_render_queue) +
-        (g_config.lead_coverage != d.lead_coverage) +
-        (g_config.fg_late_spacing != d.fg_late_spacing) +
-        (g_config.gpu_paced_cadence != d.gpu_paced_cadence) +
-        (g_config.bypass_low_latency_off != d.bypass_low_latency_off) +
-        (g_config.driver_low_latency_off != d.driver_low_latency_off) +
+    return (g_config.gpu_present_gate_probes != d.gpu_present_gate_probes) +
         (g_config.flip_metering_off != d.flip_metering_off) +
-        (g_config.fg_presenter_probe_us != d.fg_presenter_probe_us) +
-        (g_config.gpu_priority_probe != d.gpu_priority_probe) +
         (g_config.control_file != d.control_file) +
-        (g_config.adaptive_cap_hold_room != d.adaptive_cap_hold_room) +
-        (g_config.lead_spike_floor != d.lead_spike_floor) +
-        (g_config.source_placement != d.source_placement) +
-        (g_config.pre_sleep_precise != d.pre_sleep_precise) +
-        (g_config.driver_limiter_hold != d.driver_limiter_hold) +
-        (g_config.sleep_status_every_frame != d.sleep_status_every_frame) +
-        (g_config.gpu_start_probe != d.gpu_start_probe) +
         (g_config.gpu_queue_probe != d.gpu_queue_probe) +
         (g_config.gpu_queue_probe_source != d.gpu_queue_probe_source) +
         (g_config.unified_queue_margin_end != d.unified_queue_margin_end) +
-        (g_config.unified_pacer != d.unified_pacer) +
         (g_config.pacing_test_mode != d.pacing_test_mode) +
-        (g_config.unified_every_frame_service != d.unified_every_frame_service) +
-        (g_config.unified_queue_target_us != d.unified_queue_target_us) +
         (g_config.unified_hold_share != d.unified_hold_share) +
         (g_config.unified_queue_law != d.unified_queue_law) +
         (g_config.unified_queue_rank != d.unified_queue_rank) +
@@ -1226,39 +969,13 @@ int Config_DeveloperOverrides() {
 
 void Config_ResetDeveloperSettings() {
     const Config& d = s_default_config;
-    g_config.smoothing = d.smoothing;
-    g_config.output_rung = d.output_rung;
     g_config.gpu_present_gate_probes = d.gpu_present_gate_probes;
-    g_config.gpu_wait_headroom_us = d.gpu_wait_headroom_us;
-    g_config.gpu_wait_interleave_s = d.gpu_wait_interleave_s;
-    g_config.stall_inject_ms = d.stall_inject_ms;
-    g_config.stall_inject_period_s = d.stall_inject_period_s;
-    g_config.reflex_sleep_bypass = d.reflex_sleep_bypass;
-    g_config.marker_forward_order = d.marker_forward_order;
-    g_config.gpu_queue_wait_render_queue = d.gpu_queue_wait_render_queue;
-    g_config.lead_coverage = d.lead_coverage;
-    g_config.fg_late_spacing = d.fg_late_spacing;
-    g_config.gpu_paced_cadence = d.gpu_paced_cadence;
-    g_config.bypass_low_latency_off = d.bypass_low_latency_off;
-    g_config.driver_low_latency_off = d.driver_low_latency_off;
     g_config.flip_metering_off = d.flip_metering_off;
-    g_config.fg_presenter_probe_us = d.fg_presenter_probe_us;
-    g_config.gpu_priority_probe = d.gpu_priority_probe;
     g_config.control_file = d.control_file;
-    g_config.adaptive_cap_hold_room = d.adaptive_cap_hold_room;
-    g_config.lead_spike_floor = d.lead_spike_floor;
-    g_config.source_placement = d.source_placement;
-    g_config.pre_sleep_precise = d.pre_sleep_precise;
-    g_config.driver_limiter_hold = d.driver_limiter_hold;
-    g_config.sleep_status_every_frame = d.sleep_status_every_frame;
-    g_config.gpu_start_probe = d.gpu_start_probe;
     g_config.gpu_queue_probe = d.gpu_queue_probe;
     g_config.gpu_queue_probe_source = d.gpu_queue_probe_source;
     g_config.unified_queue_margin_end = d.unified_queue_margin_end;
-    g_config.unified_pacer = d.unified_pacer;
     g_config.pacing_test_mode = d.pacing_test_mode;
-    g_config.unified_every_frame_service = d.unified_every_frame_service;
-    g_config.unified_queue_target_us = d.unified_queue_target_us;
     g_config.unified_hold_share = d.unified_hold_share;
     g_config.unified_queue_law = d.unified_queue_law;
     g_config.unified_queue_rank = d.unified_queue_rank;
@@ -1286,17 +1003,10 @@ void ApplyConfig() {
 
     Config_ApplyPacingPipeline();
     LOG_INFO("Reflex Sleep bypass: %s (applies while ReLimiter paces a positive cap; render handoff limit for frames not held)",
-        g_config.reflex_sleep_bypass?"on":"off");
-    if (g_config.marker_forward_order != PacingMarkerForwardOrder::BeforeWait)
-        LOG_WARN("Diagnostic NvAPI marker forward order: %s (driver sees the paced release)",
-            PacingMarkerForwardOrder_Text(g_config.marker_forward_order));
+        PacingPipeline_SleepBypass()?"on":"off");
     const PacingPipelineConfig applied = PacingPipeline_GetConfig();
-    LOG_INFO("Pacing pipeline: smoothing=%s adaptive_cap=%u adaptive_cap_percentile=%d output_rung=%s source_placement=%s probes=%u gpu_wait_headroom_us=%.0f pacing_preference=%s queue_rank=%d hold_share=%.5f pacing_test_mode=%s",
-        PacingSmoothing_Text(g_config.smoothing), g_config.adaptive_cap ? 1u : 0u,
-        g_config.adaptive_cap_percentile,
-        PacingRungOverride_Text(g_config.output_rung),
-        PacingPlacementOverride_Text(g_config.source_placement),
-        g_config.gpu_present_gate_probes ? 1u : 0u, g_config.gpu_wait_headroom_us,
+    LOG_INFO("Pacing pipeline: probes=%u pacing_preference=%s queue_rank=%d hold_share=%.5f pacing_test_mode=%s",
+        g_config.gpu_present_gate_probes ? 1u : 0u,
         PacingPreference_Text(g_config.pacing_preference), applied.unified_queue_rank, applied.unified_hold_share,
         PacingTestMode_Text(applied.test_mode));
     if (applied.test_mode != PacingTestMode::Off)
@@ -1307,61 +1017,9 @@ void ApplyConfig() {
     else if (g_config.pacing_test_mode != PacingTestMode::Off)
         LOG_WARN("Config: pacing_test_mode=%s ignored without developer_settings=true",
             PacingTestMode_Text(g_config.pacing_test_mode));
-    if (g_config.stall_inject_ms > 0.0)
-        LOG_WARN("Pacing pipeline: diagnostic stall injector %.1f ms every %.1f s",
-            g_config.stall_inject_ms, g_config.stall_inject_period_s);
-    if (g_config.gpu_wait_interleave_s > 0.0)
-        LOG_WARN("Pacing pipeline: diagnostic GPU wait A/B interleave, held / not-held blocks of about %.1f s",
-                 g_config.gpu_wait_interleave_s);
-    if (g_config.gpu_queue_wait_render_queue != PacingRenderQueue::Keep)
-        LOG_WARN("Pacing pipeline: diagnostic GPU queue wait render queue: %s (the lead leaves out the "
-                 "simulation -> render queue%s)", PacingRenderQueue_Text(g_config.gpu_queue_wait_render_queue),
-                 g_config.gpu_queue_wait_render_queue == PacingRenderQueue::RemoveHeld
-                     ? " after frames whose GPU waited at the gate" : "");
-    if (g_config.lead_coverage != PacingLeadCoverage::Q99)
-        LOG_WARN("Pacing pipeline: diagnostic lead coverage %s%% (the lead covers that share of frames, default 99%%; "
-                 "the render handoff limit keeps 95%%)", PacingLeadCoverage_Text(g_config.lead_coverage));
-    if (!g_config.fg_late_spacing)
-        LOG_WARN("Pacing pipeline: diagnostic FG late-frame spacing off (the next real frame after one that "
-                 "reached its FG input late is released on its original target)");
-    if (!g_config.adaptive_cap_hold_room)
-        LOG_WARN("Pacing pipeline: diagnostic Adaptive cap hold room off (the interval follows only late frames "
-                 "and the workload reports, not the interval the GPU queue wait needs to hold frames)");
-    if (!g_config.lead_spike_floor)
-        LOG_WARN("Pacing pipeline: diagnostic lead spike floor off (a GPU wait lead behind the wait covers only "
-                 "its own-work quantile, not the game's rare long simulations)");
-    if (g_config.gpu_paced_cadence)
-        LOG_WARN("Pacing pipeline: diagnostic GPU-paced cadence on (held frames are released no earlier than "
-                 "the render handoff GPU floor, bounded by the cap's own release plus the GPU's lateness, and "
-                 "a frame whose release that floor sets keeps the GPU's pace instead of being held to the cap's "
-                 "cadence)");
-    if (g_config.bypass_low_latency_off)
-        LOG_WARN("Diagnostic driver low latency off while bypassed: NvAPI SetSleepMode forwarded with low latency "
-                 "mode off while the Reflex Sleep is bypassed");
     if (g_config.flip_metering_off)
         LOG_WARN("Diagnostic flip metering off: NvAPI_D3D12_SetFlipConfig is hidden from later NvAPI requests, so "
                  "frame generation that asks for it afterwards runs without hardware flip metering (set at launch)");
-    if (g_config.fg_presenter_probe_us > 0)
-        LOG_WARN("Diagnostic presenter probe: while frame generation presents its own frames, each native Present "
-                 "is held on its present queue until %d us after the call, in alternating 4 s held / not-held blocks",
-                 g_config.fg_presenter_probe_us);
-    if (g_config.gpu_priority_probe)
-        LOG_WARN("Diagnostic GPU priority probe: two DIRECT queues of ReLimiter's own (high and normal priority) "
-                 "measure how long a released queue's work waits for the GPU (set at launch)");
-    if (g_config.pre_sleep_precise)
-        LOG_WARN("Diagnostic precise pre-Sleep wait: the wait before the game's Reflex Sleep aims at the release "
-                 "target itself and ends with the hardware spin (source_placement=pre_sleep)");
-    if (g_config.driver_low_latency_off)
-        LOG_WARN("Diagnostic driver low latency off while forwarded: NvAPI SetSleepMode reaches the driver with low "
-                 "latency mode and boost off while the game's Reflex Sleep is forwarded");
-    if (g_config.driver_limiter_hold)
-        LOG_WARN("Diagnostic driver limiter hold: with source_placement=driver and gpu_paced_cadence ReLimiter holds "
-                 "the output on the cadence the driver's Sleep sets, with no start wait of its own");
-    if (g_config.sleep_status_every_frame)
-        LOG_WARN("Diagnostic sleep status poll: the driver's sleep status is read at every Reflex Sleep");
-    if (g_config.gpu_start_probe)
-        LOG_WARN("Diagnostic GPU start probe: a Signal of ReLimiter's own in front of the first submission of each "
-                 "frame on the presenting queue measures when the GPU starts it");
     if (g_config.gpu_queue_probe != kPacingGpuQueueProbeDefault)
         LOG_WARN("Diagnostic GPU queue probe off: the presenting queue's submissions are not measured "
                  "(gpu_queue_probe=false; the queue law needs it and forces it on)");
@@ -1373,25 +1031,12 @@ void ApplyConfig() {
         LOG_WARN("Diagnostic unified queue margin end %d: the probe's margin scalar of a frame is the minimum of the "
                  "per-submission bracket midpoints, not of the lower ends (effective with the probe on; 64-bit DX12)",
                  g_config.unified_queue_margin_end);
-    if (g_config.unified_pacer != kPacingUnifiedPacerDefault) {
-        if (g_config.unified_pacer)
-            LOG_WARN("Diagnostic unified pacer: one start law (cap, VRR ceiling, game limit, GPU service time) replaces the "
-                     "pacing mechanisms; 64-bit only");
-        else
-            LOG_WARN("Diagnostic unified pacer off: the earlier pacing mechanisms run (unified_pacer=false)");
-    }
-    if (g_config.unified_every_frame_service != kPacingUnifiedEveryFrameServiceDefault)
-        LOG_WARN("Diagnostic unified every-frame service off: the unified pacer's service estimate takes a sample "
-                 "only from saturated pairs, the earlier estimator (needs unified_pacer)");
-    if (g_config.unified_queue_target_us != kPacingUnifiedQueueTargetDefaultUs)
-        LOG_WARN("Diagnostic unified queue target: %.0f us instead of %.0f us (needs unified_pacer)",
-                 g_config.unified_queue_target_us, kPacingUnifiedQueueTargetDefaultUs);
     if (g_config.unified_hold_share > 0.0)
         LOG_WARN("Diagnostic unified hold share: a used report refills the hold credit with at least %.3f of the "
-                 "measured completion spacing (needs unified_pacer)", g_config.unified_hold_share);
+                 "measured completion spacing (64-bit only)", g_config.unified_hold_share);
     if (g_config.unified_queue_law != kPacingUnifiedQueueLawDefault)
         LOG_WARN("Diagnostic unified queue law off: the GPU interval and the hold credit's refill come from the "
-                 "reports (unified_queue_law=false; needs unified_pacer; 64-bit DX12)");
+                 "reports (unified_queue_law=false; 64-bit DX12)");
     if (g_config.unified_queue_upstream != 0)
         LOG_WARN("Diagnostic unified queue upstream %d: the game's render markers are stamped locally "
                  "(64-bit DX12)", g_config.unified_queue_upstream);
@@ -1435,7 +1080,6 @@ OSDPreset OSDPreset_FromConfig() {
     p.show_1pct_low         = g_config.osd_show_1pct_low;
     p.show_smoothness       = g_config.osd_show_smoothness;
     p.show_pacing_quality   = g_config.osd_show_pacing_quality;
-    p.show_adaptive_smoothing = g_config.osd_show_adaptive_smoothing;
     p.show_0_1pct_low       = g_config.osd_show_0_1pct_low;
     p.show_gpu_render_time  = g_config.osd_show_gpu_render_time;
     p.show_total_frame_cost = g_config.osd_show_total_frame_cost;
@@ -1473,7 +1117,6 @@ void OSDPreset_ApplyToConfig(const OSDPreset& p) {
     g_config.osd_show_1pct_low         = p.show_1pct_low;
     g_config.osd_show_smoothness       = p.show_smoothness;
     g_config.osd_show_pacing_quality   = p.show_pacing_quality;
-    g_config.osd_show_adaptive_smoothing = p.show_adaptive_smoothing;
     g_config.osd_show_0_1pct_low       = p.show_0_1pct_low;
     g_config.osd_show_gpu_render_time  = p.show_gpu_render_time;
     g_config.osd_show_total_frame_cost = p.show_total_frame_cost;
@@ -1505,7 +1148,6 @@ void OSDPreset_ApplyTogglesOnly(const OSDPreset& p) {
     g_config.osd_show_1pct_low         = p.show_1pct_low;
     g_config.osd_show_smoothness       = p.show_smoothness;
     g_config.osd_show_pacing_quality   = p.show_pacing_quality;
-    g_config.osd_show_adaptive_smoothing = p.show_adaptive_smoothing;
     g_config.osd_show_0_1pct_low       = p.show_0_1pct_low;
     g_config.osd_show_gpu_render_time  = p.show_gpu_render_time;
     g_config.osd_show_total_frame_cost = p.show_total_frame_cost;
@@ -1574,7 +1216,6 @@ static void ReadPresetFromINI(int i, const char* P) {
     p.show_1pct_low         = ReadINIBool(S, "show_1pct_low", false, P);
     p.show_smoothness       = ReadINIBool(S, "show_smoothness", false, P);
     p.show_pacing_quality   = ReadINIBool(S, "show_pacing_quality", false, P);
-    p.show_adaptive_smoothing = ReadINIBool(S, "show_adaptive_smoothing", false, P);
     p.show_0_1pct_low       = ReadINIBool(S, "show_0_1pct_low", false, P);
     p.show_gpu_render_time  = ReadINIBool(S, "show_gpu_render_time", false, P);
     p.show_total_frame_cost = ReadINIBool(S, "show_total_frame_cost", false, P);
@@ -1659,7 +1300,6 @@ static void WritePresetToINI(int slot, const OSDPreset& p, const char* P) {
     WriteINIBool(S, "show_1pct_low", p.show_1pct_low, P);
     WriteINIBool(S, "show_smoothness", p.show_smoothness, P);
     WriteINIBool(S, "show_pacing_quality", p.show_pacing_quality, P);
-    WriteINIBool(S, "show_adaptive_smoothing", p.show_adaptive_smoothing, P);
     WriteINIBool(S, "show_0_1pct_low", p.show_0_1pct_low, P);
     WriteINIBool(S, "show_gpu_render_time", p.show_gpu_render_time, P);
     WriteINIBool(S, "show_total_frame_cost", p.show_total_frame_cost, P);

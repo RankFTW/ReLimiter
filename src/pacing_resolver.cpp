@@ -137,7 +137,6 @@ namespace
     // The rung for a routed, capped pipeline outside the idle caps. *is_auto
     // is true when the Auto rule chose the rung.
     RungDecision ResolveRung(
-        const PacingPipelineConfig& config,
         const PacingCapabilities& capabilities,
         const PacingRuntimeState& runtime,
         bool* is_auto) noexcept
@@ -146,12 +145,12 @@ namespace
         if (capabilities.route == PacingRoute::PresentBased) {
             return { PacingRung::SourceOnly, PacingFallbackReason::PresentRoute };
         }
-        if (config.smoothing == PacingSmoothing::Off) {
+        if (kPacingSmoothing == PacingSmoothing::Off) {
             return { PacingRung::SourceOnly, PacingFallbackReason::SmoothingOff };
         }
-        if (config.rung_override != PacingRungOverride::Auto) {
+        if (kPacingRungOverride != PacingRungOverride::Auto) {
             return {
-                OverrideRung(config.rung_override, capabilities, runtime),
+                OverrideRung(kPacingRungOverride, capabilities, runtime),
                 PacingFallbackReason::Override
             };
         }
@@ -190,15 +189,14 @@ namespace
         const PacingCapabilities& capabilities,
         const PacingRuntimeState& runtime) noexcept
     {
-        // Key unified_pacer: Unified while the game calls the Reflex Sleep, else
-        // the marker; never the driver limiter. placement_override is ignored.
-        if (config.unified_pacer) {
+        // Unified while the game calls the Reflex Sleep, else the marker; never the driver limiter.
+        if (config.unified) {
             return runtime.pre_sleep_available ? PacingSourcePlacement::Unified
                                                : PacingSourcePlacement::Marker;
         }
         // Test mode driver_limiter: the caller (PacingPipeline_Resolve) has checked the eligibility.
         if (config.test_mode == PacingTestMode::DriverLimiter) return PacingSourcePlacement::DriverLimiter;
-        switch (config.placement_override) {
+        switch (kPacingPlacementOverride) {
             case PacingPlacementOverride::Driver:
                 return DriverLimiterEligible(capabilities, runtime)
                     ? PacingSourcePlacement::DriverLimiter
@@ -337,25 +335,9 @@ namespace
 
     struct ConfigPublication {
         std::atomic<uint32_t> sequence{ 0 };
-        std::atomic<PacingSmoothing> smoothing{ kDefaultConfig.smoothing };
-        std::atomic<PacingRungOverride> rung_override{ kDefaultConfig.rung_override };
-        std::atomic<bool> adaptive_cap{ kDefaultConfig.adaptive_cap };
-        std::atomic<int> adaptive_cap_percentile{ kDefaultConfig.adaptive_cap_percentile };
-        std::atomic<PacingPlacementOverride> placement_override{ kDefaultConfig.placement_override };
         std::atomic<bool> gpu_probes{ kDefaultConfig.gpu_probes };
-        std::atomic<double> gpu_wait_headroom_us{ kDefaultConfig.gpu_wait_headroom_us };
-        std::atomic<double> gpu_wait_interleave_s{ kDefaultConfig.gpu_wait_interleave_s };
-        std::atomic<PacingRenderQueue> gpu_queue_wait_render_queue{ kDefaultConfig.gpu_queue_wait_render_queue };
-        std::atomic<PacingLeadCoverage> lead_coverage{ kDefaultConfig.lead_coverage };
-        std::atomic<bool> pre_sleep_precise{ kDefaultConfig.pre_sleep_precise };
-        std::atomic<bool> driver_limiter_hold{ kDefaultConfig.driver_limiter_hold };
-        std::atomic<bool> fg_late_spacing{ kDefaultConfig.fg_late_spacing };
-        std::atomic<bool> gpu_paced_cadence{ kDefaultConfig.gpu_paced_cadence };
-        std::atomic<bool> adaptive_cap_hold_room{ kDefaultConfig.adaptive_cap_hold_room };
-        std::atomic<bool> unified_pacer{ kDefaultConfig.unified_pacer };
+        std::atomic<bool> unified{ kDefaultConfig.unified };
         std::atomic<PacingTestMode> test_mode{ kDefaultConfig.test_mode };
-        std::atomic<bool> unified_every_frame_service{ kDefaultConfig.unified_every_frame_service };
-        std::atomic<double> unified_queue_target_us{ kDefaultConfig.unified_queue_target_us };
         std::atomic<double> unified_hold_share{ kDefaultConfig.unified_hold_share };
         std::atomic<bool> unified_queue_law{ kDefaultConfig.unified_queue_law };
         std::atomic<int> unified_queue_rank{ kDefaultConfig.unified_queue_rank };
@@ -364,39 +346,15 @@ namespace
         std::atomic<int> unified_queue_upstream{ kDefaultConfig.unified_queue_upstream };
         std::atomic<int> unified_queue_margin_end{ kDefaultConfig.unified_queue_margin_end };
         std::atomic<int> unified_queue_allow_us{ kDefaultConfig.unified_queue_allow_us };
-        std::atomic<bool> lead_spike_floor{ kDefaultConfig.lead_spike_floor };
-        std::atomic<double> stall_inject_ms{ kDefaultConfig.stall_inject_ms };
-        std::atomic<double> stall_inject_period_s{ kDefaultConfig.stall_inject_period_s };
     };
     ConfigPublication s_config;
 
     PacingPipelineConfig LoadConfigFields() noexcept
     {
         PacingPipelineConfig config{};
-        config.smoothing = s_config.smoothing.load(std::memory_order_relaxed);
-        config.rung_override = s_config.rung_override.load(std::memory_order_relaxed);
-        config.adaptive_cap = s_config.adaptive_cap.load(std::memory_order_relaxed);
-        config.adaptive_cap_percentile =
-            s_config.adaptive_cap_percentile.load(std::memory_order_relaxed);
-        config.placement_override = s_config.placement_override.load(std::memory_order_relaxed);
         config.gpu_probes = s_config.gpu_probes.load(std::memory_order_relaxed);
-        config.gpu_wait_headroom_us = s_config.gpu_wait_headroom_us.load(std::memory_order_relaxed);
-        config.gpu_wait_interleave_s = s_config.gpu_wait_interleave_s.load(std::memory_order_relaxed);
-        config.gpu_queue_wait_render_queue =
-            s_config.gpu_queue_wait_render_queue.load(std::memory_order_relaxed);
-        config.lead_coverage = s_config.lead_coverage.load(std::memory_order_relaxed);
-        config.fg_late_spacing = s_config.fg_late_spacing.load(std::memory_order_relaxed);
-        config.gpu_paced_cadence = s_config.gpu_paced_cadence.load(std::memory_order_relaxed);
-        config.adaptive_cap_hold_room =
-            s_config.adaptive_cap_hold_room.load(std::memory_order_relaxed);
-        config.pre_sleep_precise = s_config.pre_sleep_precise.load(std::memory_order_relaxed);
-        config.driver_limiter_hold = s_config.driver_limiter_hold.load(std::memory_order_relaxed);
-        config.unified_pacer = s_config.unified_pacer.load(std::memory_order_relaxed);
+        config.unified = s_config.unified.load(std::memory_order_relaxed);
         config.test_mode = s_config.test_mode.load(std::memory_order_relaxed);
-        config.unified_every_frame_service =
-            s_config.unified_every_frame_service.load(std::memory_order_relaxed);
-        config.unified_queue_target_us =
-            s_config.unified_queue_target_us.load(std::memory_order_relaxed);
         config.unified_hold_share =
             s_config.unified_hold_share.load(std::memory_order_relaxed);
         config.unified_queue_law = s_config.unified_queue_law.load(std::memory_order_relaxed);
@@ -406,10 +364,6 @@ namespace
         config.unified_queue_upstream = s_config.unified_queue_upstream.load(std::memory_order_relaxed);
         config.unified_queue_margin_end = s_config.unified_queue_margin_end.load(std::memory_order_relaxed);
         config.unified_queue_allow_us = s_config.unified_queue_allow_us.load(std::memory_order_relaxed);
-        config.lead_spike_floor = s_config.lead_spike_floor.load(std::memory_order_relaxed);
-        config.stall_inject_ms = s_config.stall_inject_ms.load(std::memory_order_relaxed);
-        config.stall_inject_period_s =
-            s_config.stall_inject_period_s.load(std::memory_order_relaxed);
         return config;
     }
 
@@ -474,7 +428,9 @@ PacingPipelineSnapshot PacingPipeline_Resolve(
 {
     const PacingPipelineConfig safe_config = PacingPipeline_ClampConfig(config);
     const bool present_route = capabilities.route == PacingRoute::PresentBased;
-    const bool routed = present_route || IsMarkerRoute(capabilities.route);
+    // Marker routes (NvAPI latency markers, Streamline PCL markers) exist only in a 64-bit process: elsewhere a marker
+    // route is no route (the dispatcher never selects one there).
+    const bool routed = present_route || (IsMarkerRoute(capabilities.route) && capabilities.x64);
 
     PacingPipelineSnapshot result{};
     result.gpu_probes = safe_config.gpu_probes;
@@ -500,9 +456,9 @@ PacingPipelineSnapshot PacingPipeline_Resolve(
         if (runtime.idle_cap) {
             result.mode = PacingTimingMode::Idle;
             decision = { PacingRung::SourceOnly, PacingFallbackReason::IdleCap };
-            // Key unified_pacer: the idle cap is paced by the same law (I_idle), so the
-            // placement stays Unified while the game calls the Reflex Sleep.
-            if (safe_config.unified_pacer && !present_route) {
+            // The unified pacer paces the idle cap by the same law (I_idle), so the placement stays Unified while
+            // the game calls the Reflex Sleep.
+            if (safe_config.unified && !present_route) {
                 result.placement = MarkerRoutePlacement(safe_config, capabilities, runtime);
             }
         } else {
@@ -510,21 +466,19 @@ PacingPipelineSnapshot PacingPipeline_Resolve(
             if (!present_route) {
                 result.placement = MarkerRoutePlacement(safe_config, capabilities, runtime);
             }
-            if (result.placement == PacingSourcePlacement::DriverLimiter &&
-                !PacingPipeline_DriverLimiterHold(safe_config)) {
+            if (result.placement == PacingSourcePlacement::DriverLimiter && !kPacingDriverLimiterHold) {
                 // One clock: the driver paces the source, nothing is held.
                 decision = { PacingRung::SourceOnly, PacingFallbackReason::Override };
                 result.auto_rung = decision.rung;
             } else {
-                // Also the driver limiter with driver_limiter_hold: the
-                // source side stays the driver's, the output rung is the
+                // Also the driver limiter with a hold: the source side stays the driver's, the output rung is the
                 // one the other placements get, with their fallbacks.
                 bool is_auto = false;
-                decision = ResolveRung(safe_config, capabilities, runtime, &is_auto);
+                decision = ResolveRung(capabilities, runtime, &is_auto);
                 result.auto_rung = decision.rung;
-                // Key unified_pacer: the performance demotions are bypassed (the law
-                // limits the unfinished frames itself); the physical blockers stay.
-                if (is_auto && !safe_config.unified_pacer) decision = ApplyHoldFeasibility(decision, runtime);
+                // The unified pacer bypasses the performance demotions (the law limits the unfinished frames
+                // itself); the physical blockers stay.
+                if (is_auto && !safe_config.unified) decision = ApplyHoldFeasibility(decision, runtime);
             }
         }
     }
@@ -532,11 +486,11 @@ PacingPipelineSnapshot PacingPipeline_Resolve(
     // Off and Idle resolve source only; auto_rung keeps its source-only default.
     result.rung = decision.rung;
     result.reason = decision.reason;
-    const LeadParameters lead = kLead[static_cast<size_t>(safe_config.smoothing)];
-    result.lead_quantile = kLeadCoverageQuantile[static_cast<size_t>(safe_config.lead_coverage)];
+    const LeadParameters lead = kLead[static_cast<size_t>(kPacingSmoothing)];
+    result.lead_quantile = kLeadCoverageQuantile[static_cast<size_t>(kPacingLeadCoverage)];
     result.allowance_us = lead.allowance_us;
     result.handoff_quantile = lead.quantile;
-    result.gpu_wait_headroom_us = safe_config.gpu_wait_headroom_us;
+    result.gpu_wait_headroom_us = kPacingGpuWaitHeadroomDefaultUs;
     return result;
 }
 
@@ -559,35 +513,6 @@ bool PacingPipeline_SameResult(
 
 PacingPipelineConfig PacingPipeline_ClampConfig(PacingPipelineConfig config) noexcept
 {
-    if (static_cast<uint32_t>(config.smoothing) >=
-        static_cast<uint32_t>(PacingSmoothing::Count)) {
-        config.smoothing = kDefaultConfig.smoothing;
-    }
-    if (static_cast<uint32_t>(config.rung_override) >=
-        static_cast<uint32_t>(PacingRungOverride::Count)) {
-        config.rung_override = kDefaultConfig.rung_override;
-    }
-    if (static_cast<uint32_t>(config.placement_override) >=
-        static_cast<uint32_t>(PacingPlacementOverride::Count)) {
-        config.placement_override = kDefaultConfig.placement_override;
-    }
-    if (static_cast<uint32_t>(config.gpu_queue_wait_render_queue) >=
-        static_cast<uint32_t>(PacingRenderQueue::Count)) {
-        config.gpu_queue_wait_render_queue = kDefaultConfig.gpu_queue_wait_render_queue;
-    }
-    if (static_cast<uint32_t>(config.lead_coverage) >=
-        static_cast<uint32_t>(PacingLeadCoverage::Count)) {
-        config.lead_coverage = kDefaultConfig.lead_coverage;
-    }
-    config.adaptive_cap_percentile = PacingPipeline_AdaptiveCapFitTier(config.adaptive_cap_percentile);
-    config.stall_inject_ms = ClampFinite(config.stall_inject_ms,
-        kDefaultConfig.stall_inject_ms, 0.0, kPacingStallInjectMaxMs);
-    config.stall_inject_period_s = ClampFinite(config.stall_inject_period_s,
-        kDefaultConfig.stall_inject_period_s,
-        kPacingStallInjectMinPeriodS, kPacingStallInjectMaxPeriodS);
-    // Developer key unified_queue_target_us: non-finite is the default, otherwise [0, 20000] µs.
-    config.unified_queue_target_us = ClampFinite(config.unified_queue_target_us,
-        kPacingUnifiedQueueTargetDefaultUs, 0.0, kPacingUnifiedQueueTargetMaxUs);
     // Developer key unified_hold_share: non-finite is the default (0), otherwise [0, 0.25].
     config.unified_hold_share = ClampFinite(config.unified_hold_share,
         kPacingUnifiedHoldShareDefault, 0.0, kPacingUnifiedHoldShareMax);
@@ -598,54 +523,20 @@ PacingPipelineConfig PacingPipeline_ClampConfig(PacingPipelineConfig config) noe
     config.unified_queue_upstream = std::clamp(config.unified_queue_upstream, 0, kPacingUnifiedQueueUpstreamMax);
     config.unified_queue_margin_end = std::clamp(config.unified_queue_margin_end, 0, kPacingUnifiedQueueMarginEndMax);
     config.unified_queue_allow_us = std::clamp(config.unified_queue_allow_us, 0, kPacingUnifiedQueueAllowMaxUs);
-    // Developer key gpu_wait_headroom_us: [500, 3000] µs; non-positive or
-    // non-finite is the default.
-    config.gpu_wait_headroom_us = !std::isfinite(config.gpu_wait_headroom_us) ||
-            config.gpu_wait_headroom_us <= 0.0
-        ? kPacingGpuWaitHeadroomDefaultUs
-        : (std::clamp)(config.gpu_wait_headroom_us,
-            kPacingGpuWaitHeadroomMinUs, kPacingGpuWaitHeadroomMaxUs);
-    // Developer key gpu_wait_interleave_s: 0, negative or non-finite is off;
-    // otherwise [1, 10] s.
-    config.gpu_wait_interleave_s = !std::isfinite(config.gpu_wait_interleave_s) ||
-            config.gpu_wait_interleave_s <= 0.0
-        ? 0.0
-        : (std::clamp)(config.gpu_wait_interleave_s,
-            kPacingGpuWaitInterleaveMinS, kPacingGpuWaitInterleaveMaxS);
-    // Key unified_pacer: the law replaces these mechanisms, so their
-    // configuration is forced (g_config keeps the user's values, switching the key
-    // off restores them). 64-bit only.
+    // The queue law, its probe source, the stamps and the margin end are 64-bit only.
     if (sizeof(void*) != 8) {
-        config.unified_pacer = false;
-        config.unified_every_frame_service = false;
-        config.unified_queue_target_us = kPacingUnifiedQueueTargetDefaultUs;
         config.unified_hold_share = kPacingUnifiedHoldShareDefault;
         config.unified_queue_law = false;
         config.unified_queue_upstream = kPacingUnifiedQueueUpstreamDefault;
         config.gpu_queue_probe_source = 0;
         config.unified_queue_margin_end = 0;
     }
-    // The test mode takes the ownership from the unified pacer whatever the key says: the published
-    // unified_pacer is the owner (the key, 64-bit and no test mode).
+    // The owner of pacing is derived here, once, whatever the caller passes: the unified pacer owns it on 64-bit
+    // while no test mode is on; a test mode (or an out-of-range value, which is Off) takes it.
     if (static_cast<uint32_t>(config.test_mode) >= static_cast<uint32_t>(PacingTestMode::Count)) {
         config.test_mode = PacingTestMode::Off;
     }
-    if (config.test_mode != PacingTestMode::Off) config.unified_pacer = false;
-    if (config.unified_pacer) {
-        config.smoothing = PacingSmoothing::On;
-        config.rung_override = PacingRungOverride::Auto;
-        config.adaptive_cap = false;
-        config.adaptive_cap_hold_room = false;
-        config.gpu_paced_cadence = false;
-        config.driver_limiter_hold = false;
-        config.pre_sleep_precise = false;
-        config.gpu_wait_interleave_s = 0.0;
-        config.stall_inject_ms = 0.0;
-        config.lead_coverage = PacingLeadCoverage::Q99;
-        config.fg_late_spacing = true;
-        config.lead_spike_floor = true;
-        config.gpu_queue_wait_render_queue = PacingRenderQueue::Keep;
-    }
+    config.unified = sizeof(void*) == 8 && config.test_mode == PacingTestMode::Off;
     return config;
 }
 
@@ -655,33 +546,9 @@ void PacingPipeline_SetConfig(const PacingPipelineConfig& config) noexcept
 {
     const PacingPipelineConfig safe_config = PacingPipeline_ClampConfig(config);
     const uint32_t claimed = BeginWrite(&s_config.sequence);
-    s_config.smoothing.store(safe_config.smoothing, std::memory_order_relaxed);
-    s_config.rung_override.store(safe_config.rung_override, std::memory_order_relaxed);
-    s_config.adaptive_cap.store(safe_config.adaptive_cap, std::memory_order_relaxed);
-    s_config.adaptive_cap_percentile.store(
-        safe_config.adaptive_cap_percentile, std::memory_order_relaxed);
-    s_config.placement_override.store(safe_config.placement_override, std::memory_order_relaxed);
     s_config.gpu_probes.store(safe_config.gpu_probes, std::memory_order_relaxed);
-    s_config.gpu_wait_headroom_us.store(safe_config.gpu_wait_headroom_us, std::memory_order_relaxed);
-    s_config.gpu_wait_interleave_s.store(safe_config.gpu_wait_interleave_s, std::memory_order_relaxed);
-    s_config.gpu_queue_wait_render_queue.store(
-        safe_config.gpu_queue_wait_render_queue, std::memory_order_relaxed);
-    s_config.lead_coverage.store(safe_config.lead_coverage, std::memory_order_relaxed);
-    s_config.fg_late_spacing.store(safe_config.fg_late_spacing, std::memory_order_relaxed);
-    s_config.gpu_paced_cadence.store(safe_config.gpu_paced_cadence, std::memory_order_relaxed);
-    s_config.adaptive_cap_hold_room.store(safe_config.adaptive_cap_hold_room, std::memory_order_relaxed);
-    s_config.lead_spike_floor.store(safe_config.lead_spike_floor, std::memory_order_relaxed);
-    s_config.stall_inject_ms.store(safe_config.stall_inject_ms, std::memory_order_relaxed);
-    s_config.stall_inject_period_s.store(
-        safe_config.stall_inject_period_s, std::memory_order_relaxed);
-    s_config.pre_sleep_precise.store(safe_config.pre_sleep_precise, std::memory_order_relaxed);
-    s_config.driver_limiter_hold.store(safe_config.driver_limiter_hold, std::memory_order_relaxed);
-    s_config.unified_pacer.store(safe_config.unified_pacer, std::memory_order_relaxed);
+    s_config.unified.store(safe_config.unified, std::memory_order_relaxed);
     s_config.test_mode.store(safe_config.test_mode, std::memory_order_relaxed);
-    s_config.unified_every_frame_service.store(
-        safe_config.unified_every_frame_service, std::memory_order_relaxed);
-    s_config.unified_queue_target_us.store(
-        safe_config.unified_queue_target_us, std::memory_order_relaxed);
     s_config.unified_hold_share.store(
         safe_config.unified_hold_share, std::memory_order_relaxed);
     s_config.unified_queue_law.store(safe_config.unified_queue_law, std::memory_order_relaxed);
@@ -699,23 +566,11 @@ PacingPipelineConfig PacingPipeline_GetConfig() noexcept
     return ReadConsistent<PacingPipelineConfig>(s_config.sequence, LoadConfigFields);
 }
 
-// Single-field reads of the published configuration for the Sleep planning path:
-// one relaxed atomic load each, no sequence and no retry. A switch read while the
-// configuration is being written answers with the old or the new value.
-bool PacingPipeline_PreSleepPrecise() noexcept
+// Single-field reads of the published configuration for the Sleep planning path: one relaxed atomic load each, no
+// sequence and no retry. A switch read while the configuration is being written answers with the old or the new value.
+bool PacingPipeline_Unified() noexcept
 {
-    return s_config.pre_sleep_precise.load(std::memory_order_relaxed);
-}
-
-bool PacingPipeline_DriverLimiterHoldKey() noexcept
-{
-    return s_config.driver_limiter_hold.load(std::memory_order_relaxed) &&
-        s_config.gpu_paced_cadence.load(std::memory_order_relaxed);
-}
-
-bool PacingPipeline_UnifiedPacerKey() noexcept
-{
-    return s_config.unified_pacer.load(std::memory_order_relaxed);
+    return s_config.unified.load(std::memory_order_relaxed);
 }
 
 PacingTestMode PacingPipeline_TestMode() noexcept

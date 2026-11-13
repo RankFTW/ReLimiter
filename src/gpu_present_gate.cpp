@@ -29,7 +29,7 @@ bool FgRouteQualificationPending() noexcept {
        pipeline.reason==PacingFallbackReason::FgRouteUnsupported)return true;
     if(pipeline.auto_rung==PacingRung::FgInputWait && pipeline.rung!=PacingRung::FgInputWait)return true;
     return pipeline.reason==PacingFallbackReason::Override && pipeline.rung==PacingRung::SourceOnly &&
-        PacingPipeline_GetConfig().rung_override==PacingRungOverride::Gpu;
+        kPacingRungOverride==PacingRungOverride::Gpu;
 }
 }
 
