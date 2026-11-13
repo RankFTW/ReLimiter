@@ -48,7 +48,7 @@ inline std::atomic<double> g_pacer_latency_us{0.0};
 void NvAPI_RecordCpuLatency(uint64_t frame_id, int64_t render_submit_end_qpc) noexcept;
 // Reflex Sleep bypass: skip the driver's Sleep while a cap is set and
 // ReLimiter's own wait paces the game (Scheduler_PacesSource), held or not,
-// so one pacer runs through the overload pause. In passthrough (Dynamic MFG,
+// so one pacer runs. In passthrough (Dynamic MFG,
 // uncapped, no presenting swapchain) and
 // for the Reflex driver limiter the driver paces the game, so its Sleep runs.
 inline bool NvAPI_ShouldBypassSleep(bool enabled,int target_fps,bool source_paced) noexcept {

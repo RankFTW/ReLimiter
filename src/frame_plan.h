@@ -122,7 +122,7 @@ bool FramePlan_PushStageEvent(const PacingStageEvent& event) noexcept;
 bool FramePlan_PopStageEvent(PacingStageEvent* event) noexcept;
 uint64_t FramePlan_DroppedStageEvents() noexcept;
 
-// Developer key unified_pacer, hard limit (unified_pacer.h): two independent monotone maxima,
+// Unified owner, hard limit (unified_pacer.h): two independent monotone maxima,
 // each raised by a compare-exchange loop that only ever stores a larger value, so a producer
 // that loses a race stops and never leaves an older value behind; nothing waits for another
 // producer. g_up_ready_index is the highest grid index whose GpuReady stage event was pushed (a

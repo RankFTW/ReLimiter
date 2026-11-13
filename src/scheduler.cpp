@@ -368,7 +368,7 @@ bool s_logged_lead_queue = false;
 bool s_logged_behind_wait = false;
 bool s_logged_fg_behind_wait = false;
 
-// Developer key unified_pacer (unified_pacer.h). The mailbox word is written by
+// Unified owner (unified_pacer.h). The mailbox word is written by
 // the Sleep hook outside the owner and consumed once by the owner at the marker. The Sleep
 // hook's hard-limit statistics travel in a few slots indexed by the reservation token: each
 // slot is a seqlock whose writer takes it with a try-acquire and only for a newer token (a
@@ -475,7 +475,7 @@ void Scheduler_LogQueueLawSummary() noexcept
     LogQueueLawSummary("process shutdown");
 }
 
-// Developer key unified_pacer: empties the law and the Sleep hook's mailbox.
+// Unified owner: empties the law and the Sleep hook's mailbox.
 // Runs where the adaptation regime resets (cap, FG divisor, DMFG, OLED, focus, lifecycle),
 // on suspension and on a regime change; one bool check with the key off.
 static void ResetUnifiedLaw() noexcept
@@ -626,7 +626,7 @@ static PacingPipelineSnapshot ResolvePipeline(
     capabilities.fg_separate_presenter =
         PacingPipeline_HasCapability(PacingCapability::FgSeparatePresenter, generation);
 
-    // The developer key unified_pacer's transition is applied by ApplyUnifiedKeyTransition at the
+    // The unified owner's transition is applied by ApplyUnifiedKeyTransition at the
     // start of the invocation (OnMarker, before the stage events are drained), never here.
 
     const PacingPipelineSnapshot resolved =
@@ -675,7 +675,7 @@ static void DrainQueueLawFeed(bool law_on) noexcept
         s_source_stage.OnQueueRecord(record);
 }
 
-// Developer key unified_pacer: the owner's transition to the key of THIS invocation's
+// Unified owner: the owner's transition to the key of THIS invocation's
 // configuration snapshot. It runs once per transition, at the start of OnMarker, BEFORE the
 // stage events are drained, so that one invocation (drain, resolve, plan) runs under
 // ONE value of the key. The rule, for both directions: the events drained by an invocation
@@ -927,15 +927,15 @@ static void RunDmfg(
 // ── Reflex report drain (VRR and fixed refresh) ──
 
 // Consumes each delayed NvAPI Reflex report once and hands it to the stage's
-// models: the unified law (under the key), the lead's GPU report, the render
-// handoff GPU floor's GPU times and the report pair (lead_controller.h).
+// models: the unified law (under the key), the lead's GPU report and the
+// report pair (lead_controller.h).
 // Called once per planned frame, before its plan, at the two interval sites of
 // OnMarker.
 static void DrainReflexReports(const PacingPipelineConfig& config) noexcept
 {
     ReflexFrameTimeSample sample{};
     while (ConsumeReflexFrameTimeSample(&sample)) {
-        // Developer key unified_pacer: the report's signed queue wait from the two
+        // Unified owner: the report's signed queue wait from the two
         // raw timestamps the sample carries (gpuRenderStart − osRenderQueueStart, NAN when missing).
         if (config.unified) {
             const double queue_wait_us = sample.gpu_start_driver_us != 0 && sample.os_queue_start_driver_us != 0
@@ -1041,7 +1041,7 @@ static bool DriverSleepRuns(int target_fps) noexcept
         !NvAPI_ShouldBypassSleep(PacingPipeline_SleepBypass(), target_fps, true);
 }
 
-// Developer key unified_pacer: the interval terms of I(n) (unified_pacer.h) from the cap,
+// Unified owner: the interval terms of I(n) (unified_pacer.h) from the cap,
 // the raw frame generation factor N (never the ramped divisor), the VRR ceiling, the game's
 // own limit and the idle regime. Owner only. The VRR cap with the cap off is the Reflex VRR
 // cap; a fixed refresh with the cap off has no cap term (passthrough upstream).
@@ -1237,7 +1237,7 @@ static SourceStageFrame RunPlanned(
     if (pipeline.mode == PacingTimingMode::Fixed) request.fixed = input.fixed;
     // Collision-aware release.
     request.collision_guard = true;
-    // Developer key unified_pacer, every planned frame of the marker route (placement Unified,
+    // Unified owner, every planned frame of the marker route (placement Unified,
     // or the Marker fallback while the game calls no Reflex Sleep; passthrough, the present
     // route and mode Off excluded): the unified branch of the source stage plans it.
     const bool unified = SourceStage_UnifiedPlans(pipeline, config.unified, s_source_stage.UnifiedEnabled());
@@ -1409,7 +1409,7 @@ static bool PreSleepAvailable() noexcept
 
 bool Scheduler_PacesSource() noexcept
 {
-    // Unified (key unified_pacer) paces the source at the Sleep hook; the placement can still be
+    // Unified (unified owner) paces the source at the Sleep hook; the placement can still be
     // published as Unified for the first Sleep after a key-off, before ResolvePipeline republishes.
     const PacingSourcePlacement placement = PacingPipeline_Read().placement;
     return placement == PacingSourcePlacement::Marker ||
@@ -1504,7 +1504,7 @@ void OnMarker(
     // any scheduler-owned model is read or mutated for this frame (Flush
     // requests).
     ApplyFeedbackResetRequests();
-    // Developer key unified_pacer, or a toggle that has not applied yet: reconcile the one
+    // Unified owner, or a toggle that has not applied yet: reconcile the one
     // effective Sleep-mode tuple from the game thread. A key load and a flag
     // load with the key off.
     if (PacingPipeline_Unified() || s_up_reconcile) {
@@ -1622,7 +1622,7 @@ void OnMarker(
     s_last_dmfg_active = dmfg_active;
     if (dmfg_changed) {
         ResetAdaptationRegime(dmfg_active ? "DMFG entered" : "DMFG exited");
-        // Developer key unified_pacer: the Sleep-mode tuple follows DMFG.
+        // Unified owner: the Sleep-mode tuple follows DMFG.
         if (config.unified) NvAPI_BumpSleepModeEpoch();
     }
     if (dmfg_active) {
@@ -1731,7 +1731,7 @@ void OnMarker(
         input.fg_divisor = 1.0;
         idle_interval_us = 1000000.0 / static_cast<double>(fg_off_cap);
     }
-    // Developer key unified_pacer: the idle interval for the next reservation, and a regime
+    // Unified owner: the idle interval for the next reservation, and a regime
     // change (idle against not) resets the law.
     if (config.unified) {
         const bool unified_idle = idle_interval_us > 0.0;
@@ -1817,7 +1817,7 @@ void OnMarker(
     }
 
     // ── VRR ──
-    // Key unified_pacer: with the cap off VRR is paced at the VRR cap (Hz - Hz^2/3600).
+    // Unified owner: with the cap off VRR is paced at the VRR cap (Hz - Hz^2/3600).
     const int vrr_target_fps = PacingPipeline_VrrTargetFps(config.unified, target_fps, [] {
         return UnifiedPacer_VrrCapFps(g_ceiling_hz.load(std::memory_order_relaxed));
     });
@@ -1845,7 +1845,7 @@ void OnMarker(
     input.base_interval_us = VrrCapIntervalUs(vrr_target_fps, input.fg_divisor);
     // This frame's Reflex reports, before its plan.
     DrainReflexReports(config);
-    // Key unified_pacer: no LFC multiple (the law owns the interval).
+    // Unified owner: no LFC multiple (the law owns the interval).
     input.interval_us = PacingPipeline_VrrIntervalUs(config.unified, input.base_interval_us, [&](double base) {
         return ApplyLfc(base, input.fg_divisor);
     });

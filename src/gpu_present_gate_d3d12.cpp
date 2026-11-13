@@ -53,7 +53,7 @@ struct Ticket {
     bool fg=false;
     int fg_multiplier=0;
     double fg_divisor=1.0; // the plan's: displayed frames per grid frame
-    // Hold credit (key unified_pacer): the plan's hold advance in us (>= 0), one float copied at
+    // Hold credit (unified owner): the plan's hold advance in us (>= 0), one float copied at
     // admission. Read only by FloorAfterLatePass, as the resolver's advance_us, which ignores it
     // with the key off (display_floor false); without it the late pass would undo the advance.
     float hold_advance_us=0.0f;

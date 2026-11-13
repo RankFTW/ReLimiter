@@ -65,7 +65,7 @@ struct CadenceGridSegment {
     int64_t origin_qpc = 0;
     double origin_fraction = 0.0; // [0, 1)
     double interval_ticks = 0.0;
-    // Developer key unified_pacer: the display-side interval the output spacing floor uses
+    // Unified owner: the display-side interval the output spacing floor uses
     // (CadenceGrid_ResolveOutputTarget: o(n - 1) + I_disp - slack, slack from I_disp / D);
     // 0 = none, the floor then uses interval_ticks. T(n) and the nominal target always keep
     // interval_ticks. Set only by CadenceGrid::PlanAt.
@@ -129,7 +129,7 @@ int64_t CadenceGrid_LateToleranceTicks(
 // Recent effective outputs by grid index, feeding the spacing floor.
 // Executor contract: every output executor that resolved a target calls
 // Record once for that plan with its effective output time:
-//   - CPU hold (H1, H2): the hold release time;
+//   - CPU hold (H1): the hold release time;
 //   - Late or Undeliverable: the time that outcome was decided;
 //   - GPU queue wait (H3, FG input): max(target, now) at enqueue.
 // Record before the next frame's executor can resolve (for a CPU hold,
@@ -197,7 +197,7 @@ extern CadenceGridOutputTracker g_cadence_output_tracker;
 // floor when unknown. D > 1 serves frame generation, where a real frame's
 // error lands mostly on one displayed interval of I / D, so the floor
 // allows the same share of the displayed interval as without it.
-// display_floor (developer key unified_pacer; the executors pass the live key): the
+// display_floor (unified owner; the executors pass the live key): the
 // segment's display-side floor interval (CadenceGridSegment::floor_interval_ticks) replaces I
 // in both terms when it is set; false (the default) ignores it, whatever the snapshot holds,
 // so a snapshot copied under the key never reaches the key-off path.
@@ -251,7 +251,7 @@ struct CadenceGridPlan {
     bool released_immediately = false; // source late within tolerance (plus slack): S_n = now
 };
 
-// Unified pacer plan (developer key unified_pacer; unified_pacer.h): the output
+// Unified pacer plan (unified owner; unified_pacer.h): the output
 // target H is given, derived from the frame's own release R(n) (H = B + L), so
 // the grid follows the start and never judges lateness.
 struct CadenceGridPlanAtInput {

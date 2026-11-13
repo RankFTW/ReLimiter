@@ -12,7 +12,6 @@
 #include "native_pcl_measurement.h"
 #include "marker_stamps.h"
 #include "native_present_gate.h"
-#include "pacing_controller_events.h"
 #include "pacing_core_types.h"
 #include "pacing_join.h"
 #include "pacing_metrics.h"
@@ -156,7 +155,6 @@ namespace
         KnownValue pipeline_generation;   // Source records with pipeline_generation != 0
         uint32_t pipeline_rung = 0;       // plan_rung of the record that showed pipeline_generation
         uint8_t pipeline_reason = 0;      // PacingFallbackReason of pipeline_generation
-        PacingControllerEventState controllers{}; // governor_step and rung_feasibility
         bool loss_window_active = false;
         uint64_t loss_window_swapchain = 0;
         PacingClockMapStatus clock_map_status = PacingClockMapStatus::Unknown;
@@ -277,19 +275,6 @@ namespace
         PushEvent(type, event_qpc, event);
     }
 
-    // governor_step and rung_feasibility rows, from the pure derivation.
-    void PushControllerEvents(const PacingControllerEvents& events, int64_t event_qpc) noexcept
-    {
-        const std::pair<PacingCsvEventType, const PacingControllerEvent*> rows[] = {
-            { PacingCsvEventType::GovernorStep, &events.governor },
-            { PacingCsvEventType::RungFeasibility, &events.feasibility } };
-        for (const auto& [type, derived] : rows) {
-            if (!derived->emit) continue;
-            const KnownValue previous{ derived->has_previous, derived->previous_value };
-            PushValueEvent(type, event_qpc, previous, derived->value, derived->reason);
-        }
-    }
-
     void PushStatisticsEvents(int64_t now_qpc) noexcept
     {
         PacingCsvEvent drops{};
@@ -350,7 +335,6 @@ namespace
             PushValueEvent(PacingCsvEventType::PipelineChange, now_qpc, none,
                 s_state.pipeline_rung, s_state.pipeline_reason);
         }
-        PushControllerEvents(PacingControllerEvents_Snapshot(s_state.controllers), now_qpc);
         if (s_state.loss_window_active) PushLossWindowEvent(true, now_qpc);
         if (s_state.clock_map_status != PacingClockMapStatus::Unknown) {
             PushClockMapEvent(false, PacingClockMapStatus::Unknown, now_qpc);
@@ -378,9 +362,8 @@ namespace
         known = { true, status };
     }
 
-    // Grid-epoch, pipeline-change and stall events and the governor-step,
-    // rung-feasibility and gpu-wait-cap events (pacing_controller_events.h), derived
-    // from Source record fields like the producer-epoch and controller-generation events.
+    // Grid-epoch and pipeline-change events, derived from Source record fields like the
+    // producer-epoch and controller-generation events.
     // A pipeline generation is reported by the first record that shows its
     // rung (PacingSourceRecord_PipelineRung).
     void TrackPlan(const PacingSourceRecord& record, int64_t event_qpc) noexcept
@@ -406,12 +389,6 @@ namespace
             s_state.pipeline_rung = rung;
             s_state.pipeline_reason = record.fallback_reason;
         }
-        if (record.stall_injected_us != 0) {
-            PacingCsvEvent event{};
-            event.value = record.stall_injected_us;
-            PushEvent(PacingCsvEventType::StallInjected, event_qpc, event);
-        }
-        PushControllerEvents(PacingControllerEvents_Observe(&s_state.controllers, record), event_qpc);
     }
 
     void TrackSource(const PacingSourceRecord& record, int64_t now_qpc) noexcept

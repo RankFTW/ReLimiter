@@ -5,11 +5,11 @@
 #include <cstdint>
 #include <atomic>
 
-// CPU output executors: H1 (MarkerHold) at PRESENT_START, H2
-// (NativeHold) at the native Present, and the H0 (SourceOnly) release at
-// PRESENT_START. Every call reads only the exact-key plan, the published
-// cadence grid and the output tracker; it never needs the scheduler owner
-// and never reads the scheduler's deadline or effective interval.
+// CPU output executors: H1 (MarkerHold) at PRESENT_START and the H0
+// (SourceOnly) release at PRESENT_START. Every call reads only the
+// exact-key plan, the published cadence grid and the output tracker; it never
+// needs the scheduler owner and never reads the scheduler's deadline or
+// effective interval.
 //
 // Sequence: ClaimOutput(key, rung). OtherRung does nothing; Missing and
 // Duplicate report the status without a hold or an output. A claimed plan
@@ -22,13 +22,6 @@
 
 // CPU holds longer than this many grid intervals are not performed.
 constexpr double kPresentationGateMaximumHoldIntervals = 1.5;
-
-// Synchronous hold cancellation (H2 route/lifetime revalidation). The caller
-// keeps options and context alive through the call.
-struct PresentationGateOptions {
-    bool (*is_current)(const void*) noexcept = nullptr;
-    const void* context = nullptr;
-};
 
 // Outcome of one executor call. claimed is true when this call owned the
 // plan's output; held when the thread spun to target_qpc. release_qpc is the
@@ -44,11 +37,10 @@ struct PresentationGateResult {
     int64_t release_qpc = 0;
 };
 
-// Executor for a CPU hold rung (MarkerHold or NativeHold). arrival_qpc is the
-// hook's arrival, before any hold; it is only used for the gate-sleep readout.
+// Executor for the CPU hold rung (MarkerHold). arrival_qpc is the hook's
+// arrival, before any hold; it is only used for the gate-sleep readout.
 void PresentGate_Execute(const PacingPlanKey& key, PacingRung rung,
                          int64_t arrival_qpc,
-                         const PresentationGateOptions* options,
                          PresentationGateResult* result);
 
 // H0 at PRESENT_START: claims a SourceOnly plan and releases it at
@@ -56,8 +48,8 @@ void PresentGate_Execute(const PacingPlanKey& key, PacingRung rung,
 void PresentGate_ReleaseSourceOnly(const PacingPlanKey& key, int64_t arrival_qpc,
                                    PresentationGateResult* result);
 
-// A CPU hold rung reached whose hold cannot run for this call (H2 at a native
-// Present the route did not select): claims the plan and reports
+// A plan whose rung executes elsewhere and cannot run for this call (a GPU queue
+// wait plan at a native Present the GPU gate did not take): claims the plan and reports
 // Undeliverable at decision_qpc without a hold (tracker record and
 // OutputRelease). OtherRung, Missing and Duplicate as in PresentGate_Execute.
 void PresentGate_DeclineOutput(const PacingPlanKey& key, PacingRung rung, int64_t decision_qpc,
@@ -65,7 +57,7 @@ void PresentGate_DeclineOutput(const PacingPlanKey& key, PacingRung rung, int64_
 
 // PRESENT_START dispatch shared by the NvAPI and PCL hooks: pushes the
 // MarkerArrival event for a planned frame, then runs the rung's PRESENT_START
-// executor (H0 release or H1 hold). Plans for H2 and H3 are left to their
+// executor (H0 release or H1 hold). Plans for H3 are left to their
 // executors (result status Unknown). *plan_rung (optional) receives the plan's
 // rung; *planned whether a plan exists for the exact key.
 void PresentGate_OnPresentStart(const PacingPlanKey& key, int64_t arrival_qpc,

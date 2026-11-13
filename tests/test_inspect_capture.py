@@ -39,7 +39,11 @@ QUEUE_LAW_ROW_COLUMNS = 183     # + the queue law inputs gq_hold_block_us .. gq_
 UPSTREAM_ROW_COLUMNS = 189      # + the marker stamps and the render-thread queue law columns
 CPU_ROW_COLUMNS = 195           # + the span CPU times and the marker thread ids
 FEED_ROW_COLUMNS = 198          # + the render-thread feed contrast, spread and wait
-ROLE_ROW_COLUMNS = 199          # + the probe record's queue role (current)
+ROLE_ROW_COLUMNS = 199          # + the probe record's queue role (the pre-removal header)
+CURRENT_ROW_COLUMNS = 192       # the pre-removal header without the seven removed columns
+REMOVED_ROW_COLUMNS = ["predicted_render_us", "governor_step", "governor_interval_us", "plan_signal_advance_us",
+                       "pre_sleep_margin_us", "gpu_first_submit_qpc", "gpu_start_qpc"]
+OLD = inspector.PRE_REMOVAL_PACING_HEADER  # every historical prefix length is a prefix of it
 PHASE3_EVENT_COLUMNS = 86  # unchanged since Phase 2: new event kinds only
 LEGACY_SCHEDULER_HEADER = ["frame_id", "timestamp_us", "actual_frame_time_us"]
 FRAMEVIEW_HEADER = [
@@ -56,11 +60,12 @@ def write_csv(path, header, rows):
     return path
 
 
-def pacing_row(sequence, **values):
-    row = dict.fromkeys(inspector.CURRENT_PACING_HEADER, "")
+def pacing_row(sequence, header=None, **values):
+    header = inspector.CURRENT_PACING_HEADER if header is None else header
+    row = dict.fromkeys(header, "")
     row.update(row_kind="1", sequence=str(sequence), capture_epoch="1", qpc_frequency="10000000")
     row.update(values)
-    return [row[name] for name in inspector.CURRENT_PACING_HEADER]
+    return [row[name] for name in header]
 
 
 def event_row(sequence, event_type):
@@ -90,76 +95,73 @@ class ProfileTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 self.assertEqual(inspector.detect_kind(header), kind)
                 self.assertEqual(inspector.schema_profile(kind, header), f"current-source-{len(header)}")
-        self.assertEqual(len(inspector.CURRENT_PACING_HEADER), ROLE_ROW_COLUMNS)
+        self.assertEqual(len(inspector.CURRENT_PACING_HEADER), CURRENT_ROW_COLUMNS)
         self.assertEqual(len(inspector.CURRENT_PACING_EVENTS_HEADER), PHASE3_EVENT_COLUMNS)
         self.assertEqual(inspector.schema_profile("relimiter_pacing", inspector.CURRENT_PACING_HEADER),
-                         "current-source-199")
+                         "current-source-192")
         self.assertEqual(inspector.schema_profile("relimiter_pacing_events",
                                                   inspector.CURRENT_PACING_EVENTS_HEADER), "current-source-86")
 
+    def test_pre_removal_header_is_its_own_profile(self):
+        self.assertEqual(len(OLD), ROLE_ROW_COLUMNS)
+        self.assertEqual(inspector.detect_kind(OLD), "relimiter_pacing")
+        self.assertEqual(inspector.schema_profile("relimiter_pacing", OLD), "pre-removal-source-199")
+        self.assertNotEqual(inspector.schema_profile("relimiter_pacing", OLD),
+                            inspector.schema_profile("relimiter_pacing", inspector.CURRENT_PACING_HEADER))
+
+    def test_current_header_is_the_old_header_without_the_removed_columns(self):
+        self.assertEqual(list(inspector.REMOVED_PACING_COLUMNS), REMOVED_ROW_COLUMNS)
+        self.assertTrue(set(REMOVED_ROW_COLUMNS) <= set(OLD))
+        self.assertEqual(inspector.CURRENT_PACING_HEADER, [name for name in OLD if name not in REMOVED_ROW_COLUMNS])
+        self.assertFalse(set(REMOVED_ROW_COLUMNS) & set(inspector.CURRENT_PACING_HEADER))
+        self.assertEqual(len(set(inspector.CURRENT_PACING_HEADER)), CURRENT_ROW_COLUMNS)
+
     def test_historical_prefixes(self):
         cases = [
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:PHASE0_ROW_COLUMNS], "historical-source-111"),
+            ("relimiter_pacing", OLD[:PHASE0_ROW_COLUMNS], "historical-source-111"),
             ("relimiter_pacing_events", inspector.CURRENT_PACING_EVENTS_HEADER[:PHASE0_EVENT_COLUMNS],
              "historical-source-81"),
             ("relimiter_pacing_events", inspector.CURRENT_PACING_EVENTS_HEADER[:50], "historical-source-50"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:PHASE1_ROW_COLUMNS], "historical-source-122"),
+            ("relimiter_pacing", OLD[:PHASE1_ROW_COLUMNS], "historical-source-122"),
             ("relimiter_pacing_events", inspector.CURRENT_PACING_EVENTS_HEADER[:PHASE1_EVENT_COLUMNS],
              "historical-source-85"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:PHASE2_ROW_COLUMNS], "historical-source-129"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:PHASE3_ROW_COLUMNS], "historical-source-132"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:Q16_ROW_COLUMNS], "historical-source-133"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:PHASE4_ROW_COLUMNS], "historical-source-136"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:WAIT_START_ROW_COLUMNS], "historical-source-138"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:WAIT_ROW_COLUMNS], "historical-source-140"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:DRIVER_SLEEP_ROW_COLUMNS],
-             "historical-source-142"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:PROBE_ROW_COLUMNS], "historical-source-148"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:UNIFIED_ROW_COLUMNS], "historical-source-158"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:HOLD_BUDGET_ROW_COLUMNS], "historical-source-159"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:SERVICE_ROW_COLUMNS], "historical-source-161"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:CYCLE_ROW_COLUMNS], "historical-source-162"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:GPU_QUEUE_ROW_COLUMNS],
-             "historical-source-172"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:GPU_QUEUE_ROW_COLUMNS + 1],
-             "historical-or-unknown"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:QUEUE_LAW_ROW_COLUMNS],
-             "historical-source-183"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:QUEUE_LAW_ROW_COLUMNS + 1],
-             "historical-or-unknown"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:UPSTREAM_ROW_COLUMNS],
-             "historical-source-189"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:UPSTREAM_ROW_COLUMNS + 1],
-             "historical-or-unknown"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:CPU_ROW_COLUMNS],
-             "historical-source-195"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:CPU_ROW_COLUMNS + 1],
-             "historical-or-unknown"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:FEED_ROW_COLUMNS],
-             "historical-source-198"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:CYCLE_ROW_COLUMNS + 1],
-             "historical-or-unknown"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:SERVICE_ROW_COLUMNS - 1],
-             "historical-or-unknown"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:HOLD_BUDGET_ROW_COLUMNS + 1],
-             "historical-or-unknown"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:UNIFIED_ROW_COLUMNS - 1],
-             "historical-or-unknown"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:PROBE_ROW_COLUMNS + 1],
-             "historical-or-unknown"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:DRIVER_SLEEP_ROW_COLUMNS + 1],
-             "historical-or-unknown"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:WAIT_ROW_COLUMNS + 1],
-             "historical-or-unknown"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:WAIT_START_ROW_COLUMNS + 1],
-             "historical-or-unknown"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:Q16_ROW_COLUMNS + 1], "historical-or-unknown"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:PHASE4_ROW_COLUMNS + 1], "historical-or-unknown"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:PHASE3_ROW_COLUMNS - 1],
-             "historical-or-unknown"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:PHASE2_ROW_COLUMNS + 1], "historical-or-unknown"),
-            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:PHASE0_ROW_COLUMNS + 1], "historical-or-unknown"),
+            ("relimiter_pacing", OLD[:PHASE2_ROW_COLUMNS], "historical-source-129"),
+            ("relimiter_pacing", OLD[:PHASE3_ROW_COLUMNS], "historical-source-132"),
+            ("relimiter_pacing", OLD[:Q16_ROW_COLUMNS], "historical-source-133"),
+            ("relimiter_pacing", OLD[:PHASE4_ROW_COLUMNS], "historical-source-136"),
+            ("relimiter_pacing", OLD[:WAIT_START_ROW_COLUMNS], "historical-source-138"),
+            ("relimiter_pacing", OLD[:WAIT_ROW_COLUMNS], "historical-source-140"),
+            ("relimiter_pacing", OLD[:DRIVER_SLEEP_ROW_COLUMNS], "historical-source-142"),
+            ("relimiter_pacing", OLD[:PROBE_ROW_COLUMNS], "historical-source-148"),
+            ("relimiter_pacing", OLD[:UNIFIED_ROW_COLUMNS], "historical-source-158"),
+            ("relimiter_pacing", OLD[:HOLD_BUDGET_ROW_COLUMNS], "historical-source-159"),
+            ("relimiter_pacing", OLD[:SERVICE_ROW_COLUMNS], "historical-source-161"),
+            ("relimiter_pacing", OLD[:CYCLE_ROW_COLUMNS], "historical-source-162"),
+            ("relimiter_pacing", OLD[:GPU_QUEUE_ROW_COLUMNS], "historical-source-172"),
+            ("relimiter_pacing", OLD[:GPU_QUEUE_ROW_COLUMNS + 1], "historical-or-unknown"),
+            ("relimiter_pacing", OLD[:QUEUE_LAW_ROW_COLUMNS], "historical-source-183"),
+            ("relimiter_pacing", OLD[:QUEUE_LAW_ROW_COLUMNS + 1], "historical-or-unknown"),
+            ("relimiter_pacing", OLD[:UPSTREAM_ROW_COLUMNS], "historical-source-189"),
+            ("relimiter_pacing", OLD[:UPSTREAM_ROW_COLUMNS + 1], "historical-or-unknown"),
+            ("relimiter_pacing", OLD[:CPU_ROW_COLUMNS], "historical-source-195"),
+            ("relimiter_pacing", OLD[:CPU_ROW_COLUMNS + 1], "historical-or-unknown"),
+            ("relimiter_pacing", OLD[:FEED_ROW_COLUMNS], "historical-source-198"),
+            ("relimiter_pacing", OLD[:CYCLE_ROW_COLUMNS + 1], "historical-or-unknown"),
+            ("relimiter_pacing", OLD[:SERVICE_ROW_COLUMNS - 1], "historical-or-unknown"),
+            ("relimiter_pacing", OLD[:HOLD_BUDGET_ROW_COLUMNS + 1], "historical-or-unknown"),
+            ("relimiter_pacing", OLD[:UNIFIED_ROW_COLUMNS - 1], "historical-or-unknown"),
+            ("relimiter_pacing", OLD[:PROBE_ROW_COLUMNS + 1], "historical-or-unknown"),
+            ("relimiter_pacing", OLD[:DRIVER_SLEEP_ROW_COLUMNS + 1], "historical-or-unknown"),
+            ("relimiter_pacing", OLD[:WAIT_ROW_COLUMNS + 1], "historical-or-unknown"),
+            ("relimiter_pacing", OLD[:WAIT_START_ROW_COLUMNS + 1], "historical-or-unknown"),
+            ("relimiter_pacing", OLD[:Q16_ROW_COLUMNS + 1], "historical-or-unknown"),
+            ("relimiter_pacing", OLD[:PHASE4_ROW_COLUMNS + 1], "historical-or-unknown"),
+            ("relimiter_pacing", OLD[:PHASE3_ROW_COLUMNS - 1], "historical-or-unknown"),
+            ("relimiter_pacing", OLD[:PHASE2_ROW_COLUMNS + 1], "historical-or-unknown"),
+            ("relimiter_pacing", OLD[:PHASE0_ROW_COLUMNS + 1], "historical-or-unknown"),
             ("relimiter_pacing", inspector.PACING_FIXED_RAW_HEADER, "historical-or-unknown"),
+            # A prefix of the current header is not a historical profile: the lengths are the old header's.
+            ("relimiter_pacing", inspector.CURRENT_PACING_HEADER[:PHASE0_ROW_COLUMNS + 20], "historical-or-unknown"),
         ]
         for kind, header, profile in cases:
             with self.subTest(kind=kind, columns=len(header)):
@@ -168,56 +170,57 @@ class ProfileTests(unittest.TestCase):
 
     def test_phase0_boundaries_stay_prefixes(self):
         # Phase 1 columns are appended after the last Phase 0 column of each family.
-        self.assertEqual(inspector.CURRENT_PACING_HEADER[PHASE0_ROW_COLUMNS - 1], "clock_map_offset_us")
+        self.assertEqual(OLD[PHASE0_ROW_COLUMNS - 1], "clock_map_offset_us")
         self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER[PHASE0_EVENT_COLUMNS - 1], "snapshot_dropped_records")
         # Phase 2 columns are appended after the last Phase 1 column of each family.
-        self.assertEqual(inspector.CURRENT_PACING_HEADER[PHASE1_ROW_COLUMNS - 1], "pcl_simulation_fallback")
-        self.assertEqual(inspector.CURRENT_PACING_HEADER[PHASE1_ROW_COLUMNS:PHASE2_ROW_COLUMNS],
+        self.assertEqual(OLD[PHASE1_ROW_COLUMNS - 1], "pcl_simulation_fallback")
+        self.assertEqual(OLD[PHASE1_ROW_COLUMNS:PHASE2_ROW_COLUMNS],
                          ["grid_epoch", "grid_index", "plan_output_target_qpc", "plan_lead_us",
                           "plan_rung", "plan_status", "display_source"])
         # Phase 3 columns are appended after display_source.
-        self.assertEqual(inspector.CURRENT_PACING_HEADER[PHASE2_ROW_COLUMNS:PHASE3_ROW_COLUMNS],
+        self.assertEqual(OLD[PHASE2_ROW_COLUMNS:PHASE3_ROW_COLUMNS],
                          ["governor_step", "governor_interval_us", "plan_signal_advance_us"])
         # Q16: the gate pre-Wait time is appended after them.
-        self.assertEqual(inspector.CURRENT_PACING_HEADER[PHASE3_ROW_COLUMNS:Q16_ROW_COLUMNS], ["gate_pre_wait_qpc"])
+        self.assertEqual(OLD[PHASE3_ROW_COLUMNS:Q16_ROW_COLUMNS], ["gate_pre_wait_qpc"])
         # Phase 4: the placement columns are appended after it.
-        self.assertEqual(inspector.CURRENT_PACING_HEADER[Q16_ROW_COLUMNS:PHASE4_ROW_COLUMNS],
+        self.assertEqual(OLD[Q16_ROW_COLUMNS:PHASE4_ROW_COLUMNS],
                          ["source_placement", "pre_sleep_end_qpc", "pre_sleep_margin_us"])
         # The wait starts (gated holds, 2026-10-08) are appended after them.
-        self.assertEqual(inspector.CURRENT_PACING_HEADER[PHASE4_ROW_COLUMNS:WAIT_START_ROW_COLUMNS],
+        self.assertEqual(OLD[PHASE4_ROW_COLUMNS:WAIT_START_ROW_COLUMNS],
                          ["source_wait_start_qpc", "pre_sleep_start_qpc"])
         # The async marker waits are appended after them.
-        self.assertEqual(inspector.CURRENT_PACING_HEADER[WAIT_START_ROW_COLUMNS:WAIT_ROW_COLUMNS],
+        self.assertEqual(OLD[WAIT_START_ROW_COLUMNS:WAIT_ROW_COLUMNS],
                          ["async_marker_wait_us", "async_marker_wait_type"])
         # The driver's Reflex Sleep stamps (2026-11-10), then the sleep status, the flip config and
         # the GPU start probe columns, then the unified pacer columns, which are the last ones.
-        self.assertEqual(inspector.CURRENT_PACING_HEADER[WAIT_ROW_COLUMNS:DRIVER_SLEEP_ROW_COLUMNS],
+        self.assertEqual(OLD[WAIT_ROW_COLUMNS:DRIVER_SLEEP_ROW_COLUMNS],
                          ["driver_sleep_start_qpc", "driver_sleep_end_qpc"])
-        self.assertEqual(inspector.CURRENT_PACING_HEADER[DRIVER_SLEEP_ROW_COLUMNS:PROBE_ROW_COLUMNS],
+        self.assertEqual(OLD[DRIVER_SLEEP_ROW_COLUMNS:PROBE_ROW_COLUMNS],
                          ["driver_sleep_interval_us", "driver_use_game_sleep",
                           "flip_config_qpc", "flip_time_per_batch_us",
                           "gpu_first_submit_qpc", "gpu_start_qpc"])
-        # The unified pacer columns (developer key unified_pacer) are the last ones.
-        self.assertEqual(inspector.CURRENT_PACING_HEADER[PROBE_ROW_COLUMNS:],
-                         ["up_grid_target_qpc", "up_interval_us", "up_gpu_interval_us", "up_gpu_service_us",
-                          "up_queue_wait_raw_us", "up_queue_wait_us", "up_outstanding", "up_limit_wait_us",
-                          "up_ready_age_us", "up_flags", "up_hold_budget_us",
-                          "up_service_sample_us", "up_gpu_wait_us", "up_cycle_us",
-                          "gq_submits", "gq_first_submit_qpc", "gq_first_start_qpc", "gq_last_submit_qpc",
-                          "gq_last_done_qpc", "gq_empty_us", "gq_first_gap_us", "gq_stamp_late_us",
-                          "gq_min_margin_us", "gq_wait_block_us",
-                          "gq_hold_block_us", "gq_min_margin_free_us", "gq_boundary_idle_us", "gq_cycle_us",
-                          "gq_wait_idle_us", "up_ql_base_us", "up_ql_need_us", "up_ql_service_us",
-                          "up_ql_q_us", "up_ql_p_us", "up_ql_valid_frames",
-                          "sim_end_marker_qpc", "render_submit_start_marker_qpc",
-                          "render_submit_end_marker_qpc", "up_ql_rt_margin_us", "up_ql_rt_offset_us",
-                          "up_ql_q_rt_us", "render_submit_cpu_us", "sim_cpu_us", "render_submit_tid",
-                          "sim_tid", "render_submit_end_tid", "sim_end_tid", "up_ql_rt_contrast_us",
-                          "up_ql_rt_spread_us", "up_ql_rt_wait_us", "gq_queue_role"])
+        # The unified pacer columns are the last ones, in the old and the current header alike.
+        unified_columns = ["up_grid_target_qpc", "up_interval_us", "up_gpu_interval_us", "up_gpu_service_us",
+                           "up_queue_wait_raw_us", "up_queue_wait_us", "up_outstanding", "up_limit_wait_us",
+                           "up_ready_age_us", "up_flags", "up_hold_budget_us",
+                           "up_service_sample_us", "up_gpu_wait_us", "up_cycle_us",
+                           "gq_submits", "gq_first_submit_qpc", "gq_first_start_qpc", "gq_last_submit_qpc",
+                           "gq_last_done_qpc", "gq_empty_us", "gq_first_gap_us", "gq_stamp_late_us",
+                           "gq_min_margin_us", "gq_wait_block_us",
+                           "gq_hold_block_us", "gq_min_margin_free_us", "gq_boundary_idle_us", "gq_cycle_us",
+                           "gq_wait_idle_us", "up_ql_base_us", "up_ql_need_us", "up_ql_service_us",
+                           "up_ql_q_us", "up_ql_p_us", "up_ql_valid_frames",
+                           "sim_end_marker_qpc", "render_submit_start_marker_qpc",
+                           "render_submit_end_marker_qpc", "up_ql_rt_margin_us", "up_ql_rt_offset_us",
+                           "up_ql_q_rt_us", "render_submit_cpu_us", "sim_cpu_us", "render_submit_tid",
+                           "sim_tid", "render_submit_end_tid", "sim_end_tid", "up_ql_rt_contrast_us",
+                           "up_ql_rt_spread_us", "up_ql_rt_wait_us", "gq_queue_role"]
+        self.assertEqual(OLD[PROBE_ROW_COLUMNS:], unified_columns)
+        self.assertEqual(inspector.CURRENT_PACING_HEADER[-len(unified_columns):], unified_columns)
         self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER[PHASE1_EVENT_COLUMNS - 1],
                          "overflowed_present_count")
         self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER[PHASE1_EVENT_COLUMNS:], ["reason"])
-        self.assertIn("pcl_total_us", inspector.CURRENT_PACING_HEADER[PHASE0_ROW_COLUMNS:])
+        self.assertIn("pcl_total_us", OLD[PHASE0_ROW_COLUMNS:])
         self.assertIn("etw_events_lost", inspector.CURRENT_PACING_EVENTS_HEADER[PHASE0_EVENT_COLUMNS:])
 
     def test_frameview_is_recognized_and_legacy_headers_are_not(self):
@@ -300,13 +303,32 @@ class ContinuityTests(TemporaryDirectoryTest):
         self.assertTrue(has_warning(summary, "event ring drops"))
 
     def test_phase0_file_is_an_earlier_schema(self):
-        header = inspector.CURRENT_PACING_HEADER[:PHASE0_ROW_COLUMNS]
+        header = OLD[:PHASE0_ROW_COLUMNS]
         path = write_csv(self.directory / f"relimiter_pacing_{SUFFIX}.csv", header,
-                         [pacing_row(1)[:PHASE0_ROW_COLUMNS]])
+                         [pacing_row(1, OLD)[:PHASE0_ROW_COLUMNS]])
         summary = inspector.summarize_capture(path)
         self.assertEqual(summary["schema_profile"], "historical-source-111")
         self.assertNotIn("pcl_total_us", summary["metric_availability"])
         self.assertTrue(has_warning(summary, "earlier append-only schema"))
+
+    def test_pre_removal_file_keeps_its_removed_columns_and_a_current_file_has_none(self):
+        old = write_csv(self.directory / f"relimiter_pacing_{SUFFIX}.csv", OLD,
+                        [pacing_row(1, OLD, governor_interval_us="7692.308", pre_sleep_margin_us="")])
+        summary = inspector.summarize_capture(old)
+        self.assertEqual(summary["schema_profile"], "pre-removal-source-199")
+        self.assertEqual(summary["metric_availability"]["governor_interval_us"],
+                         {"valid": 1, "nonzero": 1, "missing_or_invalid": 0})
+        self.assertEqual(summary["metric_availability"]["pre_sleep_margin_us"]["missing_or_invalid"], 1)
+        self.assertTrue(has_warning(summary, "pre-removal schema"))
+        self.assertFalse(has_warning(summary, "earlier append-only schema"))
+
+        current = write_csv(self.directory / f"relimiter_pacing_{SUFFIX}_2.csv", inspector.CURRENT_PACING_HEADER,
+                            [pacing_row(1)])
+        summary = inspector.summarize_capture(current)
+        self.assertEqual(summary["schema_profile"], "current-source-192")
+        for column in REMOVED_ROW_COLUMNS:
+            self.assertNotIn(column, summary["metric_availability"])  # absent, not a zero
+        self.assertFalse(has_warning(summary, "pre-removal schema"))
 
     def test_frameview_missing_values_and_time_order(self):
         rows = [

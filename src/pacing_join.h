@@ -78,7 +78,7 @@ inline uint8_t PacingJoin_DisplaySource(const PacingDisplaySample& sample) noexc
 }
 
 // Source and Present records are carried whole: the plan fields of the Source
-// record (grid_epoch ... stall_injected_us) and the Present record's
+// record (grid_epoch ... fallback_reason) and the Present record's
 // plan_status follow the existing join rules unchanged.
 struct PacingJoinedRow {
     uint8_t row_kind = 0; // 1 display sample, 2 unjoined Present

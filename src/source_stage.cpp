@@ -110,11 +110,11 @@ size_t SourceStage::DrainStageEvents() noexcept
     size_t drained = 0;
     bool epoch_started = false;
     PacingStageEvent event{};
-    // Key unified_pacer: the lead's queue-wait liveness is the law's before the drain.
+    // Unified owner: the lead's queue-wait liveness is the law's before the drain.
     if (unified_enabled_) SyncUnifiedLead(false);
     while (drained < kMaxStageEventsPerCall && FramePlan_PopStageEvent(&event)) {
         ++drained;
-        // Developer key unified_pacer: the law's evidence (readiness before any hold, the actual
+        // Unified owner: the law's evidence (readiness before any hold, the actual
         // output and whether it was held) comes BEFORE the lead sees the event, and a deferred
         // sample is emitted only AFTER it. Order, per event: law OnReady/OnOutput (it resolves
         // the reports this event makes usable) -> SyncUnifiedLead (REGISTER the used reports,
@@ -179,7 +179,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
         ++statistics_.duplicate_keys;
         return frame;
     }
-    // Developer key unified_pacer: the unified branch replaces the plan and the wait.
+    // Unified owner: the unified branch replaces the plan and the wait.
     if (request.unified.active && unified_enabled_) return RunUnifiedFrame(request, clock);
 
     // The frame is planned with the lead of its rung. The collision guard
@@ -221,7 +221,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     input.mode = pipeline.mode;
     input.controller_generation = request.key.controller_generation;
     if (pipeline.mode == PacingTimingMode::Fixed) input.fixed = request.fixed;
-    // Key unified_pacer: a frame the unified branch does not plan (e.g. the present route) must
+    // Unified owner: a frame the unified branch does not plan (e.g. the present route) must
     // not inherit a segment's display-side floor; PlanNext keeps the current segment while the
     // source is on time. Key-on only.
     if (unified_enabled_) grid_.ClearDisplayFloor();
@@ -311,7 +311,6 @@ void SourceStage::FillSourceRecord(
     record->fallback_reason = static_cast<uint8_t>(pipeline.reason);
     record->pipeline_generation = pipeline.generation;
     record->source_placement = static_cast<uint8_t>(pipeline.placement);
-    record->predicted_render_us = 0.0;
     if (!frame.planned) return;
     const PacingFramePlan& plan = frame.plan;
     if (frame.slept) record->flags |= PACING_SOURCE_SLEPT;
@@ -333,7 +332,7 @@ void SourceStage::FillSourceRecord(
     record->pipeline_generation = plan.pipeline_generation;
 }
 
-// ── Unified pacer (developer key unified_pacer; unified_pacer.h) ──
+// ── Unified pacer (unified owner; unified_pacer.h) ──
 
 void SourceStage::SetUnifiedOptions(bool every_frame_service, double queue_target_us,
     double hold_share, bool queue_law, int queue_rank, int queue_allow_us, int queue_need_frames) noexcept
@@ -376,7 +375,7 @@ void SourceStage::SetUnifiedEnabled(bool enabled, uint32_t controller_generation
     if (!enabled && grid_.ClearDisplayFloor()) g_cadence_grid_publication.Publish(grid_.Snapshot());
 }
 
-// Key unified_pacer, saturation rule (b): the lead sample of a frame is today's sample minus the
+// Unified owner, saturation rule (b): the lead sample of a frame is today's sample minus the
 // queue wait the law USED for it, so the lead learns the path without the hold's own queueing.
 // The law's used reports (each frame at most once) are REGISTERED with the lead by exact
 // identity (stored, nothing finalized or emitted: the caller flushes after the lead has the

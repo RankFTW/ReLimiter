@@ -2,7 +2,6 @@
 #include "frame_timeline.h"
 #include "logger.h"
 #include "nvapi_marker_census.h"
-#include "pacing_controller_events.h"
 #include "instrumentation_state.h"
 
 #include <Windows.h>
@@ -264,13 +263,6 @@ static bool PacingRowHasPlan(const PacingCsvRow& row)
     return row.joined.has_source && row.joined.source.grid_index != 0;
 }
 
-// Governor cells are empty unless the period governor ran for the joined
-// Source record (PacingControllerEvents_IsGoverned).
-static bool PacingRowIsGoverned(const PacingCsvRow& row)
-{
-    return row.joined.has_source && PacingControllerEvents_IsGoverned(row.joined.source);
-}
-
 // Unified pacer cells are empty unless the joined Source record carries the
 // start law's decision (up_valid).
 static bool PacingRowHasUnified(const PacingCsvRow& row)
@@ -526,12 +518,6 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
         DecimalIf(line, row.joined.has_reflex &&
             row.joined.reflex.clock_map_status != PacingClockMapStatus::Unknown,
             row.joined.reflex.clock_map_offset_us); } },
-    // Appended: the retired predictor's release to PRESENT_START estimate.
-    // The source stage records 0, so the cell stays empty; the column keeps
-    // its position.
-    { "predicted_render_us", [](CsvLine* line, const PacingCsvRow& row) {
-        DecimalIf(line, row.joined.has_source && row.joined.source.predicted_render_us != 0.0,
-            row.joined.source.predicted_render_us); } },
     // Appended: PC Latency of the display instance (native PCL collector)
     { "pcl_status", [](CsvLine* line, const PacingCsvRow& row) {
         UnsignedIf(line, PacingRowHasPcl(row), row.joined.display.pcl_status); } },
@@ -570,17 +556,6 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
         NonZeroIf(line, row.joined.has_present, row.joined.present.plan_status); } },
     { "display_source", [](CsvLine* line, const PacingCsvRow& row) {
         NonZeroIf(line, row.joined.has_display, row.joined.display_source); } },
-    // Appended: period governor of the
-    // joined Source record (empty when the governor did not run: idle cap,
-    // uncapped, passthrough, DMFG) and a reserved plan cell (empty without a
-    // plan, like the other plan cells)
-    { "governor_step", [](CsvLine* line, const PacingCsvRow& row) {
-        UnsignedIf(line, PacingRowIsGoverned(row), row.joined.source.governor_step); } },
-    { "governor_interval_us", [](CsvLine* line, const PacingCsvRow& row) {
-        DecimalIf(line, PacingRowIsGoverned(row), row.joined.source.governor_interval_us); } },
-    // reserved: the GPU release advance was withdrawn; always 0
-    { "plan_signal_advance_us", [](CsvLine* line, const PacingCsvRow& row) {
-        DecimalIf(line, PacingRowHasPlan(row), 0.0); } },
     // Appended: the pre-Wait GPU timestamp of the GPU queue wait mapped
     // to QPC (the GpuResume stage event's gpu_wait_qpc); empty when unknown
     { "gate_pre_wait_qpc", [](CsvLine* line, const PacingCsvRow& row) {
@@ -591,13 +566,9 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
         UnsignedIf(line, row.joined.has_source, row.joined.source.source_placement); } },
     { "pre_sleep_end_qpc", [](CsvLine* line, const PacingCsvRow& row) {
         QpcIf(line, row.joined.has_source, row.joined.source.pre_sleep_end_qpc); } },
-    { "pre_sleep_margin_us", [](CsvLine* line, const PacingCsvRow& row) {
-        DecimalIf(line, row.joined.has_source && row.joined.source.pre_sleep_margin_us != 0.0,
-            row.joined.source.pre_sleep_margin_us); } },
     // Appended (gated holds in lockstep engines): the starts of
-    // ReLimiter's source wait (ends at source_release_qpc, less any injected
-    // stall) and of its pre-Sleep wait (ends at pre_sleep_end_qpc); empty
-    // when there was none
+    // ReLimiter's source wait (ends at source_release_qpc) and of its
+    // pre-Sleep wait (ends at pre_sleep_end_qpc); empty when there was none
     { "source_wait_start_qpc", [](CsvLine* line, const PacingCsvRow& row) {
         QpcIf(line, row.joined.has_source, row.joined.source.source_wait_start_qpc); } },
     { "pre_sleep_start_qpc", [](CsvLine* line, const PacingCsvRow& row) {
@@ -638,16 +609,7 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
     { "flip_time_per_batch_us", [](CsvLine* line, const PacingCsvRow& row) {
         UnsignedIf(line, row.flip_config_valid != 0 && row.flip_time_per_batch_us != 0,
             row.flip_time_per_batch_us); } },
-    // Appended (developer key gpu_start_probe): the QPC of the first
-    // ExecuteCommandLists after the previous Present on the presenting queue
-    // (read before the call was forwarded) and the QPC at which the
-    // completion of ReLimiter's Signal enqueued in front of that submission
-    // was observed (the sampler's wake); both empty without a probe sample.
-    { "gpu_first_submit_qpc", [](CsvLine* line, const PacingCsvRow& row) {
-        QpcIf(line, row.joined.has_ready, row.joined.ready.gpu_first_submit_qpc); } },
-    { "gpu_start_qpc", [](CsvLine* line, const PacingCsvRow& row) {
-        QpcIf(line, row.joined.has_ready, row.joined.ready.gpu_start_qpc); } },
-    // Appended (developer key unified_pacer): the start law's decision for
+    // Appended (unified owner): the start law's decision for
     // the frame (PacingSourceRecord::up_*). Every cell is empty when the
     // Source record is absent or up_valid is 0; each column also has its own
     // rule: no T, no bindable I_gpu, fewer than 16 pairs, no used report,
@@ -682,14 +644,14 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
             row.joined.source.up_ready_age_us); } },
     { "up_flags", [](CsvLine* line, const PacingCsvRow& row) {
         UnsignedIf(line, PacingRowHasUnified(row), row.joined.source.up_flags); } },
-    // Appended (developer key unified_pacer): the signed hold credit at the
+    // Appended (unified owner): the signed hold credit at the
     // frame's plan in µs. Positive = spare GPU time banked over the report
     // window; 0.000 = none; negative = debt (the executors release the frame's
     // targets earlier by the debt). Empty = key off or the report stream not live.
     { "up_hold_budget_us", [](CsvLine* line, const PacingCsvRow& row) {
         DecimalIf(line, PacingRowHasUnified(row) && row.joined.source.up_hold_budget_valid != 0,
             row.joined.source.up_hold_budget_us); } },
-    // Appended (developer key unified_pacer): the service sample the law used
+    // Appended (unified owner): the service sample the law used
     // for the newest used report (completion spacing minus the GPU's wait for
     // the frame's work, after the active-time rule) and that wait,
     // max(0, -queue wait), in µs; empty when none or the key is off.
@@ -823,13 +785,13 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
         NonZeroIf(line, row.joined.has_source, row.joined.source.render_submit_end_tid); } },
     { "sim_end_tid", [](CsvLine* line, const PacingCsvRow& row) {
         NonZeroIf(line, row.joined.has_source, row.joined.source.sim_end_tid); } },
-    // Probe instrumentation (header names of columns 187-189 and 196-198 are historical): 187, 188 and
-    // 189 are the UPPER ends of the probe's empty time, boundary idle time and smallest free margin
+    // Probe instrumentation (header names of columns 180-182 and 189-191 are historical): 180, 181 and
+    // 182 are the UPPER ends of the probe's empty time, boundary idle time and smallest free margin
     // (the gq_empty_us, gq_boundary_idle_us and gq_min_margin_free_us cells are the lower ends for the
-    // first two and the bracket-midpoint minimum for the margin); 196 is the minimum of the margin
-    // brackets' lower ends and 198 the bracket error max(S - lo_min, hi_min - S) (the reported
+    // first two and the bracket-midpoint minimum for the margin); 189 is the minimum of the margin
+    // brackets' lower ends and 191 the bracket error max(S - lo_min, hi_min - S) (the reported
     // midpoint minimum S is within it of the true minimum). 3 decimals, empty when the row has no probe record or the value is unknown
-    // (NaN), 0 is a value. 197 packs min(borrowed, 9999) + 10000 * min(registrations, 9999) (the
+    // (NaN), 0 is a value. 190 packs min(borrowed, 9999) + 10000 * min(registrations, 9999) (the
     // frame's submissions marked by the game's own Signal, and the worker's registrations since the
     // previous record); empty without a probe record.
     { "up_ql_rt_contrast_us", [](CsvLine* line, const PacingCsvRow& row) {
@@ -868,9 +830,6 @@ static const char* PacingEventTypeText(PacingCsvEventType type)
     case PacingCsvEventType::PclStatus: return "pcl_status";
     case PacingCsvEventType::GridEpoch: return "grid_epoch";
     case PacingCsvEventType::PipelineChange: return "pipeline_change";
-    case PacingCsvEventType::StallInjected: return "stall_injected";
-    case PacingCsvEventType::GovernorStep: return "governor_step";
-    case PacingCsvEventType::RungFeasibility: return "rung_feasibility";
     }
     return "unknown";
 }
@@ -887,9 +846,6 @@ static bool PacingEventHasValue(const PacingCsvEvent& event)
     case PacingCsvEventType::PclStatus:
     case PacingCsvEventType::GridEpoch:
     case PacingCsvEventType::PipelineChange:
-    case PacingCsvEventType::StallInjected:
-    case PacingCsvEventType::GovernorStep:
-    case PacingCsvEventType::RungFeasibility:
         return true;
     default:
         return false;
@@ -897,14 +853,11 @@ static bool PacingEventHasValue(const PacingCsvEvent& event)
 }
 
 // Grid-epoch rows carry the PacingEpochReason, pipeline-change rows the
-// PacingFallbackReason, governor-step rows the GovernorCause and
-// rung-feasibility rows the FeasibilityCause.
+// PacingFallbackReason.
 static bool PacingEventHasReason(const PacingCsvEvent& event)
 {
     return event.type == PacingCsvEventType::GridEpoch ||
-        event.type == PacingCsvEventType::PipelineChange ||
-        event.type == PacingCsvEventType::GovernorStep ||
-        event.type == PacingCsvEventType::RungFeasibility;
+        event.type == PacingCsvEventType::PipelineChange;
 }
 
 static bool PacingEventIsLossWindow(const PacingCsvEvent& event)

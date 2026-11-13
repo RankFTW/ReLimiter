@@ -22,7 +22,8 @@ SWAPCHAIN = 0x12345678
 SWAPCHAIN_B = 0x9ABC
 FREQUENCY = 10_000_000
 GOLDEN_TOLERANCE_US = 0.0005  # tests/test_pacing_metrics.cpp MatchValue
-PHASE3_HEADER = inspector.CURRENT_PACING_HEADER[:133]  # Phase 3 after Q16, before the Phase 4 columns
+OLD = inspector.PRE_REMOVAL_PACING_HEADER  # the rows header of the builds before the column removal
+PHASE3_HEADER = OLD[:133]  # Phase 3 after Q16, before the Phase 4 columns
 
 
 def read_csv(path):
@@ -423,6 +424,12 @@ class EventsTests(TemporaryDirectoryTest):
         old = write_csv(self.directory / "old_events.csv", inspector.CURRENT_PACING_EVENTS_HEADER[:85],
                         [dict(row) for row in self.events_rows()])
         self.assertEqual(pacing.summarize_events(old)["grid_epochs"]["count"], 0)
+        # A capture whose build writes none of the removed event types reports them unavailable, not 0.
+        current = pacing.summarize_events(path, retired_events=False)
+        self.assertEqual(current["grid_epochs"]["count"], 3)
+        self.assertIsNone(current["stalls_injected"])
+        for key in ("governor_steps", "rung_feasibility", "gpu_wait_cap"):
+            self.assertIsNone(current[key], key)
 
     def test_events_summary(self):
         path = write_csv(self.directory / "relimiter_pacing_events_Game_7_8_capture_1.csv",
@@ -638,7 +645,7 @@ class Phase2AcceptanceTests(TemporaryDirectoryTest):
     def test_golden_files_use_the_phase2_schema(self):
         # The rows file stays a Phase 2 (129-column) capture, so these tests also
         # prove the Phase 2 analysis on a historical schema; the events header is unchanged.
-        self.assertEqual(pacing.read_header(self.STALL_ROWS), inspector.CURRENT_PACING_HEADER[:129])
+        self.assertEqual(pacing.read_header(self.STALL_ROWS), OLD[:129])
         self.assertEqual(self.report()["input"]["schema_profile"], "historical-source-129")
         self.assertEqual(pacing.read_header(self.STALL_EVENTS), inspector.CURRENT_PACING_EVENTS_HEADER)
         self.assertEqual(self.report()["controllers"],
@@ -678,7 +685,7 @@ class Phase2AcceptanceTests(TemporaryDirectoryTest):
     def test_stall_recovery_needs_the_following_intervals(self):
         # Rows ending two intervals after the second stall's long interval cannot prove recovery.
         rows = read_csv(self.STALL_ROWS)[:52]
-        path = write_csv(self.directory / "short.csv", inspector.CURRENT_PACING_HEADER, rows)
+        path = write_csv(self.directory / "short.csv", OLD, rows)
         self.assertTrue(pacing.analyze_capture(path, events_path=self.STALL_EVENTS)["controllers"]["available"])
         stall = pacing.analyze_capture(path, events_path=self.STALL_EVENTS)["stall_recovery"]
         self.assertEqual((stall["evaluated"], stall["passed"], stall["status"]), (1, 1, "pass"))
@@ -686,7 +693,7 @@ class Phase2AcceptanceTests(TemporaryDirectoryTest):
         # A chain break inside the tail stops the check instead of bridging it.
         rows = read_csv(self.STALL_ROWS)
         rows[25]["loss_window"] = "1"
-        path = write_csv(self.directory / "loss.csv", inspector.CURRENT_PACING_HEADER, rows)
+        path = write_csv(self.directory / "loss.csv", OLD, rows)
         stall = pacing.analyze_capture(path, events_path=self.STALL_EVENTS)["stall_recovery"]
         self.assertEqual(stall["results"][0]["status"], "insufficient_intervals")
         # tol has a 500 us floor: a 1 ms T_out still accepts 500 us.
@@ -881,7 +888,7 @@ class Phase3ControllerTests(TemporaryDirectoryTest):
         # A 132-column file (Phase 3 before Q16) keeps the controllers summary
         # but has no resume block.
         rows_path, _ = self.capture()
-        old = write_csv(self.directory / "phase3_132.csv", inspector.CURRENT_PACING_HEADER[:132],
+        old = write_csv(self.directory / "phase3_132.csv", OLD[:132],
                         read_csv(rows_path))
         report = analyze(old)
         self.assertEqual(report["input"]["schema_profile"], "historical-source-132")
@@ -902,7 +909,7 @@ class Phase3ControllerTests(TemporaryDirectoryTest):
         self.assertIn("governor steps (events): unavailable", lines)
         self.assertIn("GPU wait cap (events): unavailable", lines)
         # A Phase 2 prefix of the same rows has no controllers summary.
-        old = write_csv(self.directory / "phase2.csv", inspector.CURRENT_PACING_HEADER[:129],
+        old = write_csv(self.directory / "phase2.csv", OLD[:129],
                         read_csv(rows_path))
         report = analyze(old)
         self.assertEqual(report["input"]["schema_profile"], "historical-source-129")
@@ -938,7 +945,7 @@ class Phase4PlacementTests(TemporaryDirectoryTest):
         8: (0, 32, "", None, 0, "", None),
     }
 
-    def capture(self):
+    def capture(self, header=OLD):
         rows = []
         for frame, (placement, flags, step, residual, trim, margin, lead) in self.FRAMES.items():
             release = 100_000_000 + 100_000 * frame
@@ -960,7 +967,7 @@ class Phase4PlacementTests(TemporaryDirectoryTest):
         rows.append(display_row(len(rows) + 1, "", "", row_kind=2, native_swapchain="", observer_epoch="",
                                 p_qpc=102_000_000, present_native_swapchain=SWAPCHAIN))
         rows_path = write_csv(self.directory / "relimiter_pacing_Game_7_8_capture_1.csv",
-                              inspector.CURRENT_PACING_HEADER, rows)
+                              header, rows)
 
         def event(sequence, event_type, qpc, **cells):
             row = dict(sequence=str(sequence), capture_epoch="1", event_type=event_type,
@@ -983,7 +990,7 @@ class Phase4PlacementTests(TemporaryDirectoryTest):
     def test_governor_stretch_and_placement(self):
         rows_path, events_path = self.capture()
         report = pacing.analyze_capture(rows_path, events_path=events_path)
-        self.assertEqual(report["input"]["schema_profile"], "current-source-199")
+        self.assertEqual(report["input"]["schema_profile"], "pre-removal-source-199")
         controllers = report["controllers"]
         self.assertEqual((controllers["frames"], controllers["governed_frames"]), (8, 7))
         self.assertEqual(controllers["governor"], {
@@ -1036,6 +1043,76 @@ class Phase4PlacementTests(TemporaryDirectoryTest):
                          {"0": 3, "1": 1, "12": 1, "20": 1, "5": 1})
         self.assertFalse(report["placement"]["available"])
 
+    def test_current_profile_reports_the_removed_readers_unavailable(self):
+        # The same frames in the 192-column header: the governor, signal advance and pre-wait margin readers and
+        # the removed event types are unavailable (None), never zero, even when the events file holds a
+        # governor_step row; the placement block and the resume block keep their columns.
+        rows_path, events_path = self.capture(inspector.CURRENT_PACING_HEADER)
+        report = pacing.analyze_capture(rows_path, events_path=events_path)
+        self.assertEqual(report["input"]["schema_profile"], "current-source-192")
+        self.assertFalse(report["input"]["pre_removal_columns"])
+        controllers = report["controllers"]
+        self.assertTrue(controllers["available"])
+        for key in ("frames", "governed_frames", "overload_frames", "overload_share", "signal_advance",
+                    "governor_steps", "demotions", "gpu_wait_cap"):
+            self.assertIsNone(controllers[key], key)
+        self.assertFalse(controllers["governor"]["available"])
+        self.assertNotIn("ladder_step_frames", controllers["governor"])
+        self.assertTrue(controllers["resume"]["available"])
+        self.assertEqual(controllers["resume"]["frames"], 0)
+        for key in ("stalls_injected", "governor_steps", "rung_feasibility", "gpu_wait_cap"):
+            self.assertIsNone(report["events"][key], key)
+        self.assertFalse(report["stall_recovery"]["available"])
+        placement = report["placement"]
+        self.assertTrue(placement["available"])
+        self.assertEqual(placement["frames"], 8)
+        self.assertEqual(placement["frames_by_placement"],
+                         {"driver_limiter": 1, "marker": 1, "none": 1, "pre_sleep": 5})
+        pre_sleep = placement["pre_sleep"]
+        self.assertEqual(pre_sleep["residual_us"]["p50_us"], 200.0)
+        self.assertEqual(pre_sleep["marker_after_wake"], {"frames": 3, "count": 1, "share": 1 / 3})
+        self.assertIsNone(pre_sleep["margin_p50_us"])
+        self.assertIsNone(pre_sleep["wake_late_us"])
+        text = pacing.format_report(report)
+        self.assertIn("Controllers:", text)
+        self.assertIn("Source placement: 8 source frames", text)
+
+
+class PreRemovalFixtureTests(unittest.TestCase):
+    """tests/data/pacing_pre_removal_rows.csv and pacing_pre_removal_events.csv: the 199-column header of the
+    builds before the column removal, eight source frames (the Phase 4 placement frames) and an events file with
+    the removed event types (stall_injected, governor_step, rung_feasibility). Such captures keep every reader of
+    a removed column."""
+
+    ROWS_FILE = ROOT / "tests/data/pacing_pre_removal_rows.csv"
+    EVENTS_FILE = ROOT / "tests/data/pacing_pre_removal_events.csv"
+
+    def report(self):
+        return pacing.analyze_capture(self.ROWS_FILE, events_path=self.EVENTS_FILE)
+
+    def test_fixture_is_the_pre_removal_profile(self):
+        self.assertEqual(pacing.read_header(self.ROWS_FILE), OLD)
+        report = self.report()
+        self.assertEqual(report["input"]["schema_profile"], "pre-removal-source-199")
+        self.assertEqual(report["input"]["column_count"], 199)
+        self.assertTrue(report["input"]["pre_removal_columns"])
+
+    def test_removed_column_and_event_readers_apply(self):
+        report = self.report()
+        controllers = report["controllers"]
+        self.assertEqual((controllers["frames"], controllers["governed_frames"], controllers["overload_frames"]),
+                         (8, 7, 2))
+        self.assertEqual(controllers["governor"]["stretch_percent"], {"count": 6, "p50": 0, "p99": 12, "max": 20})
+        self.assertEqual(controllers["signal_advance"]["planned_frames"], 7)
+        self.assertEqual(controllers["governor_steps"], {"count": 1, "by_cause": {"demand": 1}})
+        self.assertEqual(controllers["demotions"], {"count": 1, "by_cause": {"overload": 1}, "restorations": 1,
+                                                    "restorations_by_cause": {"retry": 1}})
+        self.assertEqual(report["placement"]["pre_sleep"]["margin_p50_us"], 500.0)
+        self.assertEqual(report["placement"]["pre_sleep"]["wake_late_us"]["count"], 3)
+        stalls = report["events"]["stalls_injected"]
+        self.assertEqual((stalls["count"], stalls["events"][0]["stall_us"]), (1, 20_000))
+        self.assertTrue(report["stall_recovery"]["available"])
+
 
 class InspectorTests(TemporaryDirectoryTest):
     def test_headers_match_production_column_tables(self):
@@ -1049,26 +1126,27 @@ class InspectorTests(TemporaryDirectoryTest):
 
     def test_kind_detection_and_profiles(self):
         cases = [
-            (inspector.CURRENT_PACING_HEADER, "relimiter_pacing", "current-source-199"),
+            (inspector.CURRENT_PACING_HEADER, "relimiter_pacing", "current-source-192"),
+            (OLD, "relimiter_pacing", "pre-removal-source-199"),
             (inspector.CURRENT_PACING_EVENTS_HEADER, "relimiter_pacing_events", "current-source-86"),
-            (inspector.CURRENT_PACING_HEADER[:148], "relimiter_pacing", "historical-source-148"),
-            (inspector.CURRENT_PACING_HEADER[:189], "relimiter_pacing", "historical-source-189"),
-            (inspector.CURRENT_PACING_HEADER[:195], "relimiter_pacing", "historical-source-195"),
-            (inspector.CURRENT_PACING_HEADER[:198], "relimiter_pacing", "historical-source-198"),
-            (inspector.CURRENT_PACING_HEADER[:158], "relimiter_pacing", "historical-source-158"),
-            (inspector.CURRENT_PACING_HEADER[:159], "relimiter_pacing", "historical-source-159"),
-            (inspector.CURRENT_PACING_HEADER[:161], "relimiter_pacing", "historical-source-161"),
-            (inspector.CURRENT_PACING_HEADER[:162], "relimiter_pacing", "historical-source-162"),
-            (inspector.CURRENT_PACING_HEADER[:183], "relimiter_pacing", "historical-source-183"),
-            (inspector.CURRENT_PACING_HEADER[:172], "relimiter_pacing", "historical-source-172"),
-            (inspector.CURRENT_PACING_HEADER[:142], "relimiter_pacing", "historical-source-142"),
-            (inspector.CURRENT_PACING_HEADER[:140], "relimiter_pacing", "historical-source-140"),
-            (inspector.CURRENT_PACING_HEADER[:138], "relimiter_pacing", "historical-source-138"),
-            (inspector.CURRENT_PACING_HEADER[:136], "relimiter_pacing", "historical-source-136"),
+            (OLD[:148], "relimiter_pacing", "historical-source-148"),
+            (OLD[:189], "relimiter_pacing", "historical-source-189"),
+            (OLD[:195], "relimiter_pacing", "historical-source-195"),
+            (OLD[:198], "relimiter_pacing", "historical-source-198"),
+            (OLD[:158], "relimiter_pacing", "historical-source-158"),
+            (OLD[:159], "relimiter_pacing", "historical-source-159"),
+            (OLD[:161], "relimiter_pacing", "historical-source-161"),
+            (OLD[:162], "relimiter_pacing", "historical-source-162"),
+            (OLD[:183], "relimiter_pacing", "historical-source-183"),
+            (OLD[:172], "relimiter_pacing", "historical-source-172"),
+            (OLD[:142], "relimiter_pacing", "historical-source-142"),
+            (OLD[:140], "relimiter_pacing", "historical-source-140"),
+            (OLD[:138], "relimiter_pacing", "historical-source-138"),
+            (OLD[:136], "relimiter_pacing", "historical-source-136"),
             (PHASE3_HEADER, "relimiter_pacing", "historical-source-133"),
-            (inspector.CURRENT_PACING_HEADER[:132], "relimiter_pacing", "historical-source-132"),
-            (inspector.CURRENT_PACING_HEADER[:129], "relimiter_pacing", "historical-source-129"),
-            (inspector.CURRENT_PACING_HEADER[:122], "relimiter_pacing", "historical-source-122"),
+            (OLD[:132], "relimiter_pacing", "historical-source-132"),
+            (OLD[:129], "relimiter_pacing", "historical-source-129"),
+            (OLD[:122], "relimiter_pacing", "historical-source-122"),
             (inspector.CURRENT_PACING_EVENTS_HEADER[:85], "relimiter_pacing_events", "historical-source-85"),
             (inspector.CURRENT_PACING_EVENTS_HEADER[:50], "relimiter_pacing_events", "historical-source-50"),
             (inspector.PACING_FIXED_RAW_HEADER, "relimiter_pacing", "historical-or-unknown"),
@@ -1078,73 +1156,32 @@ class InspectorTests(TemporaryDirectoryTest):
                 self.assertEqual(inspector.detect_kind(header), kind)
                 self.assertEqual(inspector.schema_profile(kind, header), profile)
         # Phase 0 files (before the appended PC Latency and loss columns) stay pacing families.
-        self.assertEqual(inspector.detect_kind(inspector.CURRENT_PACING_HEADER[:111]), "relimiter_pacing")
+        self.assertEqual(inspector.detect_kind(OLD[:111]), "relimiter_pacing")
         self.assertEqual(inspector.detect_kind(inspector.CURRENT_PACING_EVENTS_HEADER[:81]),
                          "relimiter_pacing_events")
 
-    def test_appended_phase1_columns(self):
-        # Append-only after the Phase 0 tables.
+    def test_analysis_column_groups_match_the_headers(self):
+        # The writer's tables are the current headers; the readers of removed columns name them by the old header.
         rows = column_names("PACING_ROW_COLUMNS")
         events = column_names("PACING_EVENT_COLUMNS")
-        self.assertEqual((len(rows), len(events)), (199, 86))
-        self.assertEqual(rows[110:122], [
-            "clock_map_offset_us", "predicted_render_us", "pcl_status", "pcl_input_ping_qpc",
-            "pcl_effective_sim_start_qpc", "pcl_i2fs_us", "pcl_fs2p_us", "pcl_p2d_us", "pcl_total_us",
-            "pcl_dropped_accumulation_us", "pcl_dropped_frame_count", "pcl_simulation_fallback"])
+        self.assertEqual((len(rows), len(events)), (192, 86))
+        self.assertEqual(rows, [name for name in OLD if name not in inspector.REMOVED_PACING_COLUMNS])
+        self.assertFalse(set(inspector.REMOVED_PACING_COLUMNS) & set(rows))
+        # What the analysis reads on current files is still written.
+        for group in (pacing.PLAN_COLUMNS, pacing.PLACEMENT_COLUMNS, (pacing.RESUME_COLUMN,)):
+            self.assertTrue(set(group) <= set(rows), group)
+        self.assertEqual(tuple(pacing.PLAN_COLUMNS), ("plan_rung", "plan_status", "display_source"))
+        # Positions in the historical header, where the removed-column readers apply.
+        self.assertEqual(OLD[129:132], list(pacing.CONTROLLER_COLUMNS))
+        self.assertEqual(OLD[132:133], [pacing.RESUME_COLUMN])
+        self.assertEqual(OLD[133:136], [*pacing.PLACEMENT_COLUMNS, pacing.PRE_SLEEP_MARGIN_COLUMN])
+        self.assertTrue(set(pacing.CONTROLLER_COLUMNS + (pacing.PRE_SLEEP_MARGIN_COLUMN,))
+                        <= set(inspector.REMOVED_PACING_COLUMNS))
+        # The events table is unchanged.
         self.assertEqual(events[80:85], ["snapshot_dropped_records", "etw_events_lost", "etw_buffers_lost",
                                          "lost_present_count", "overflowed_present_count"])
         self.assertEqual(list(pacing.PCL_LOSS_COLUMNS), events[81:85])
-
-    def test_appended_phase2_columns(self):
-        # Append-only after the Phase 1 tables.
-        rows = column_names("PACING_ROW_COLUMNS")
-        events = column_names("PACING_EVENT_COLUMNS")
-        self.assertEqual(rows[122:129], ["grid_epoch", "grid_index", "plan_output_target_qpc", "plan_lead_us",
-                                         "plan_rung", "plan_status", "display_source"])
         self.assertEqual(events[85:], ["reason"])
-        self.assertEqual(tuple(pacing.PLAN_COLUMNS), ("plan_rung", "plan_status", "display_source"))
-
-    def test_appended_phase3_columns(self):
-        # Append-only after display_source; events unchanged.
-        rows = column_names("PACING_ROW_COLUMNS")
-        self.assertEqual(rows[129:132], ["governor_step", "governor_interval_us", "plan_signal_advance_us"])
-        self.assertEqual(rows[129:132], list(pacing.CONTROLLER_COLUMNS))
-        # Q16: the gate pre-Wait time after the controller columns.
-        self.assertEqual(rows[132:133], [pacing.RESUME_COLUMN])
-        self.assertEqual(len(column_names("PACING_EVENT_COLUMNS")), 86)
-
-    def test_appended_phase4_columns(self):
-        # Append-only after gate_pre_wait_qpc; events unchanged.
-        rows = column_names("PACING_ROW_COLUMNS")
-        self.assertEqual(rows[133:136], ["source_placement", "pre_sleep_end_qpc", "pre_sleep_margin_us"])
-        self.assertEqual(rows[133:136], list(pacing.PLACEMENT_COLUMNS))
-        # Gated holds (2026-10-08): the wait starts after the placement columns.
-        self.assertEqual(rows[136:138], ["source_wait_start_qpc", "pre_sleep_start_qpc"])
-        # The driver's in-Present pacing (2026-10-12).
-        self.assertEqual(rows[138:140], ["async_marker_wait_us", "async_marker_wait_type"])
-        # The driver's Reflex Sleep stamps (2026-11-10).
-        self.assertEqual(rows[140:142], ["driver_sleep_start_qpc", "driver_sleep_end_qpc"])
-        # The driver's sleep status, the flip config and the GPU start probe (current).
-        self.assertEqual(rows[142:], ["driver_sleep_interval_us", "driver_use_game_sleep",
-                                      "flip_config_qpc", "flip_time_per_batch_us",
-                                      "gpu_first_submit_qpc", "gpu_start_qpc",
-                                      "up_grid_target_qpc", "up_interval_us", "up_gpu_interval_us",
-                                      "up_gpu_service_us", "up_queue_wait_raw_us", "up_queue_wait_us",
-                                      "up_outstanding", "up_limit_wait_us", "up_ready_age_us", "up_flags",
-                                      "up_hold_budget_us", "up_service_sample_us", "up_gpu_wait_us",
-                                      "up_cycle_us", "gq_submits", "gq_first_submit_qpc",
-                                      "gq_first_start_qpc", "gq_last_submit_qpc", "gq_last_done_qpc",
-                                      "gq_empty_us", "gq_first_gap_us", "gq_stamp_late_us",
-                                      "gq_min_margin_us", "gq_wait_block_us", "gq_hold_block_us",
-                                      "gq_min_margin_free_us", "gq_boundary_idle_us", "gq_cycle_us",
-                                      "gq_wait_idle_us", "up_ql_base_us", "up_ql_need_us",
-                                      "up_ql_service_us", "up_ql_q_us", "up_ql_p_us", "up_ql_valid_frames",
-                                      "sim_end_marker_qpc", "render_submit_start_marker_qpc",
-                                      "render_submit_end_marker_qpc", "up_ql_rt_margin_us",
-                                      "up_ql_rt_offset_us", "up_ql_q_rt_us", "render_submit_cpu_us",
-                                      "sim_cpu_us", "render_submit_tid", "sim_tid", "render_submit_end_tid",
-                                      "sim_end_tid", "up_ql_rt_contrast_us", "up_ql_rt_spread_us",
-                                      "up_ql_rt_wait_us", "gq_queue_role"])
 
     def test_enum_tables_match_production(self):
         # C++ and Python share these enum values; the names follow src/pacing_core_types.h.
@@ -1164,12 +1201,12 @@ class InspectorTests(TemporaryDirectoryTest):
             with self.subTest(enum=enum):
                 self.assertEqual({value: snake(name) for value, name in values(enum).items()}, table)
         event_types = (ROOT / "src/csv_writer.h").read_text(encoding="utf-8")
-        for name, value in (("GridEpoch", 13), ("PipelineChange", 14), ("StallInjected", 15),
-                            ("GovernorStep", 16), ("RungFeasibility", 17)):
+        for name, value in (("GridEpoch", 13), ("PipelineChange", 14)):
             self.assertIn(f"{name} = {value}", event_types)
-        for text in ('"grid_epoch"', '"pipeline_change"', '"stall_injected"', '"governor_step"',
-                     '"rung_feasibility"'):
+        for text in ('"grid_epoch"', '"pipeline_change"'):
             self.assertIn(f"return {text};", SOURCE)
+        # Event types 15 stall_injected, 16 governor_step, 17 rung_feasibility and 18 gpu_wait_cap are no longer
+        # written; the analyzer reads them by name from older files.
 
     def test_controller_cause_tables_match_production(self):
         # The analyzer names are the production *_Text strings of each enum value.
@@ -1186,11 +1223,14 @@ class InspectorTests(TemporaryDirectoryTest):
                                         (ROOT / source).read_text(encoding="utf-8")))
                 self.assertEqual({values[name]: text for name, text in texts.items()}, table)
         telemetry = (ROOT / "src/pacing_telemetry_types.h").read_text(encoding="utf-8")
-        self.assertIn(f"PACING_SOURCE_OVERLOAD = 1u << {pacing.SOURCE_FLAG_OVERLOAD.bit_length() - 1}", telemetry)
-        # Every PacingSourceFlags bit has the analyzer's name.
         body = telemetry.split("enum PacingSourceFlags : uint8_t {", 1)[1].split("};", 1)[0]
         flags = {1 << int(bit): name.lower() for name, bit in re.findall(r"PACING_SOURCE_(\w+) = 1u << (\d)", body)}
-        self.assertEqual(flags, pacing.SOURCE_FLAG_NAMES)
+        # Every flag the build defines has the analyzer's name; the analyzer also keeps the names of the bits no
+        # build sets any more (4 gpu_paced, 64 overload, 128 stall_injected) for older captures.
+        self.assertEqual({bit: pacing.SOURCE_FLAG_NAMES[bit] for bit in flags}, flags)
+        self.assertEqual({bit: pacing.SOURCE_FLAG_NAMES[bit] for bit in (4, 64, 128)},
+                         {4: "gpu_paced", 64: "overload", 128: "stall_injected"})
+        self.assertEqual(pacing.SOURCE_FLAG_OVERLOAD, 64)
         self.assertEqual(pacing.SOURCE_FLAG_NAMES[pacing.SOURCE_FLAG_PRE_SLEEP], "pre_sleep")
         self.assertEqual(pacing.SOURCE_FLAG_NAMES[pacing.SOURCE_FLAG_FIXED_REFRESH], "fixed_refresh")
 

@@ -28,6 +28,9 @@ ROW_COLUMNS = [
 ]
 EVENT_COLUMNS = ["event_type", "event_qpc", "value", "previous_value", "reason"]
 WAIT_COLUMNS = ["async_marker_wait_us", "async_marker_wait_type"]
+# Columns of the pre-removal profile: a capture that has any may carry rung_feasibility events (hold pauses);
+# without them the pauses are unavailable.
+PRE_REMOVAL_COLUMNS = ["governor_step", "governor_interval_us", "plan_signal_advance_us"]
 
 
 def ticks(ms):
@@ -114,7 +117,7 @@ class TimelineTests(unittest.TestCase):
             {"event_type": "rung_feasibility", "event_qpc": pause_end, "value": 0, "previous_value": 1, "reason": 3},
         ]
         with tempfile.TemporaryDirectory() as directory:
-            path = write(directory, rows, events, columns=ROW_COLUMNS + WAIT_COLUMNS)
+            path = write(directory, rows, events, columns=ROW_COLUMNS + WAIT_COLUMNS + PRE_REMOVAL_COLUMNS)
             report = pipeline.analyze(path, settle_s=0.05)
         held = report["segments"]["held"]["waits_ms"]
         not_held = report["segments"]["not_held"]["waits_ms"]
@@ -140,12 +143,22 @@ class SegmentationTests(unittest.TestCase):
             {"event_type": "rung_feasibility", "event_qpc": pause_end, "value": 0, "previous_value": 1, "reason": 3},
         ]
         with tempfile.TemporaryDirectory() as directory:
-            report = pipeline.analyze(write(directory, rows, events), settle_s=0.05)
+            report = pipeline.analyze(write(directory, rows, events, columns=ROW_COLUMNS + PRE_REMOVAL_COLUMNS),
+                                      settle_s=0.05)
         self.assertEqual(len(report["pauses_s"]), 1)
         # 50 ms settle: frames 21-25 and 31-35 are excluded (released 0.5-40.5 ms after a transition).
         self.assertEqual(report["segments"]["not_held"]["frames"], 5)
         self.assertEqual(report["segments"]["held"]["frames"], 45)
         self.assertEqual(report["segments"]["not_held"]["rungs"], {"source_only": 5})
+
+    def test_pauses_are_unavailable_without_the_pre_removal_columns(self):
+        rows = [frame_row(k, sim_ms=5.0) for k in range(1, 41)]
+        with tempfile.TemporaryDirectory() as directory:
+            current = pipeline.analyze(write(directory, rows))
+            pre_removal = pipeline.analyze(write(directory, rows, columns=ROW_COLUMNS + PRE_REMOVAL_COLUMNS))
+        self.assertIsNone(current["pauses_s"])  # the build has no hold feasibility guard: not "none"
+        self.assertEqual(pre_removal["pauses_s"], [])
+        pipeline.format_report(current)
 
 
 class ReplayTests(unittest.TestCase):

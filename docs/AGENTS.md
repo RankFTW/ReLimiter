@@ -6,6 +6,7 @@ This file adds documentation rules under `docs/`.
 - `FRAME_PACING.md` explains the mechanisms with diagrams, kept current with source like the developer reference.
 - The user guide holds user-facing behavior only: what a feature does, when to use it, its control and default, prerequisites, limitations and what the user sees. Evidence (capture IDs, measurements, build dates, history of earlier behavior) goes to `CHANGELOG.md` and `project-docs/`, and developer settings go to `docs/DEVELOPER_REFERENCE.md`.
 - Keep feature names, defaults, ranges, INI keys, OSD labels, API support, and 32/64-bit availability synchronized with current source and CMake guards.
+- State support scope with the support sentence at the top of `USER_GUIDE.md`, verbatim (`README.md` and the unreleased `CHANGELOG.md` section carry the same sentence), and claim no support or testing beyond it.
 - Write for end users: state prerequisites, restart requirements, risks, fallbacks, and known limitations without exposing unnecessary implementation detail.
 - Files named as reports, plans, or prior analyses are historical technical records unless a task explicitly promotes or updates them. Preserve their original context and dates; do not silently rewrite them as current specifications.
 - Distinguish confirmed behavior from hypotheses, planned work, and unperformed validation. Do not claim a build, game, API, or GPU path was tested unless it was actually tested.

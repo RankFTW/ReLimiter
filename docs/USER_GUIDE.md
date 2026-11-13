@@ -14,7 +14,7 @@ ReLimiter is a frame limiter and pacing tool for NVIDIA G-Sync/VRR displays. It 
 4. [Background FPS Cap](#background-fps-cap)
 5. [FG-Off FPS Cap](#fg-off-fps-cap)
 6. [VSync Override](#vsync-override)
-7. [Smoothing and Output](#smoothing-and-output)
+7. [Pacing and Output](#pacing-and-output)
 8. [On-Screen Display (OSD)](#on-screen-display-osd)
 9. [OSD Presets](#osd-presets)
 10. [Screen & Window Management](#screen--window-management)
@@ -67,7 +67,7 @@ Open the ReShade overlay, normally with **Home**, and find ReLimiter's settings 
 
 The FPS controls are at the top, followed by the pacing status (with its **Details**) and **Pacing preference** (64-bit). **OSD** and **Screen** follow. **Enable advanced settings** reveals compatibility options; most users can leave it unchecked.
 
-ReLimiter ships the recommended defaults and you are not expected to tune pacing: smoothing is always on, the output point is chosen automatically, and there is no separate setup for frame generation. Settings save automatically. Existing caps and compatible preferences are carried forward when upgrading; see [Removed and migrated keys](#removed-and-migrated-keys).
+ReLimiter ships the recommended defaults and you are not expected to tune pacing: the output point is chosen automatically, and there is no separate setup for frame generation. Settings save automatically. Existing caps and compatible preferences are carried forward when upgrading; see [Removed and migrated keys](#removed-and-migrated-keys).
 
 ---
 
@@ -84,6 +84,8 @@ Use the FPS limiter to keep your frame rate within your monitor's VRR range or t
 Choose a target your game can sustain in the scenes you play. Avoid running several frame limiters at once unless you have a specific reason to do so.
 
 With supported static frame generation enabled, the target accounts for the detected multiplier. For example, 160 FPS with 4× generation corresponds to a render target of approximately 40 FPS.
+
+On a VRR display, a target below the display's VRR range is paced with low framerate compensation: the driver repeats frames, and ReLimiter paces each displayed frame a whole number of refreshes apart.
 
 ---
 
@@ -125,11 +127,11 @@ Available for DX11, DX12 and OpenGL. Driver settings and the game's presentation
 
 ---
 
-## Smoothing and Output
+## Pacing and Output
 
 ReLimiter paces every capped frame against one shared cadence: a row of targets spaced at the cap interval. For each frame it decides when to release the game (the *source wait*) and where the finished frame is held until its target (the *output point*). It chooses the output point itself from the game, graphics API, display mode, frame-generation state and what has qualified at runtime.
 
-Smoothing is always on. There is no pacing-method setting and nothing to choose in the normal settings.
+There is no pacing-method setting and nothing to choose in the normal settings.
 
 - **What you notice.** ReLimiter releases the game slightly early, so most frames are finished in time and wait briefly at the output point. That short wait is the small latency cost of an even cadence. ReLimiter learns how early to release from recent frames (the *lead*).
 - **Late frames.** A frame that misses its target is never held. If it is clearly late, the cadence restarts from that frame instead of catching up with a burst of short frames.
@@ -150,18 +152,18 @@ Frame generation without a qualified FG input route uses `source_only`, not a ma
 
 ### API Support
 
-| Game/API | Pacing route | Output |
-|----------|--------------|--------|
-| **DX12 with native Reflex** | Reflex markers | `gpu_queue_wait` (VRR, no FG) or `fg_input_wait` (FG) once qualified; otherwise `marker_hold` without FG or `source_only` with FG. 64-bit addon |
-| **DX12 without supported markers** | Present-based | `source_only` |
-| **DX11 with native Reflex** | Reflex markers (64-bit addon) | `marker_hold` |
-| **DX11 without Reflex / DX10 / DX9** | Present-based | `source_only` |
-| **Vulkan** | Streamline PCL markers when available (64-bit addon), otherwise Present-based | `marker_hold` or `source_only` |
-| **OpenGL** | Present-based | `source_only` |
+| Game | Pacing route | Output | Status |
+|------|--------------|--------|--------|
+| **64-bit DX12 with native Reflex** | Reflex markers | `gpu_queue_wait` (VRR, no FG) or `fg_input_wait` (FG) once qualified; otherwise `marker_hold` without FG or `source_only` with FG | Supported and tested |
+| **64-bit DX11 with native Reflex** | Reflex markers | `marker_hold` | The same pacer, untested |
+| **64-bit Vulkan with Streamline PCL markers** | Streamline PCL markers | `marker_hold` without FG, `source_only` with FG | The same pacer, untested |
+| **Games without Reflex markers, and every 32-bit game** (DX12 without markers, DX11, DX10, DX9, Vulkan, OpenGL) | Present-based | `source_only` | A plain frame-rate cap |
+
+The Present-based route is the fallback. It is retained and covered by unit tests but has not yet been validated in a game, and nothing validates DirectX 11, Vulkan, OpenGL, DirectX 9 or 32-bit pacing.
 
 A DX11 or DX12 game moves to marker pacing once its Reflex markers arrive. When markers pause, for example in menus or loading screens, or the game does not send the marker ReLimiter paces on, Present-based pacing fills in until marker pacing resumes. The choice is made again when the game changes graphics API or creates a new swapchain; a resize keeps it.
 
-Both GPU waits need the 64-bit addon, DX12 and native Reflex markers, so they are not available on DX11, Vulkan or in the 32-bit addon. The GPU queue wait without frame generation also needs VRR; on a fixed-refresh display those games use `marker_hold`. A GPU wait holds a frame for at most 3 frame intervals (between 2 ms and 100 ms); a frame whose target is further ahead is presented without the GPU wait. Compatibility can vary between games, particularly older Vulkan titles.
+Both GPU waits need the 64-bit addon, DX12 and native Reflex markers, so they are not available on DX11, Vulkan or in the 32-bit addon. The GPU queue wait without frame generation also needs VRR; on a fixed-refresh display those games use `marker_hold`. A GPU wait holds a frame for at most 3 frame intervals (between 2 ms and 100 ms); a frame whose target is further ahead is presented without the GPU wait.
 
 Background FPS, FG-Off Cap and OLED Care run on the same cadence without an output hold (mode `idle`). Dynamic MFG passthrough keeps its own handling; see [Dynamic MFG](#dynamic-mfg-dlss-45).
 
@@ -194,6 +196,7 @@ The technical lines are under **Details**, a collapsed node below the status lin
 | **Reason** | Why that output was chosen; see the reason table below. |
 | **Placement** | Where the source wait happens: `unified` (inside the game's Reflex Sleep call), `marker`, `present`, `Reflex driver limiter` (developer test mode) or `none`. |
 | **Lead** | How far ahead of each target the game is released, whether it is still `warming` or `warm`, and how many frames it is based on. `, at budget` means the wanted lead was clamped to three frame intervals, so those frames are likely to miss their targets. |
+| **Lead spike floor** | Shown while the floor applies: the lowest lead that still covers a game's rare long simulation frames (arrival tail plus GPU time) against the lead's own quantile. `sets the lead` means the floor, not the quantile, is what sets the lead. A readout only. |
 | **Grid epoch** | Counts cadence restarts (after a cap or mode change, a new swapchain or a late frame). An occasional increase is normal; a counter that climbs steadily means frames keep missing their targets. |
 | **Release headroom** / **Release margin** | Shown on `gpu_queue_wait`: how much room ReLimiter leaves before the game's next frame starts heavy GPU work (headroom) or its next Present call (margin). A `guard off` note means the room is not needed in this game. |
 | **Driver Sleep** | Average time the game's Reflex Sleep call spends in the driver, shown while a GPU wait is the output. A readout only. |
@@ -203,7 +206,7 @@ Below the status line itself (not under **Details**), `Dynamic frame generation:
 | Reason | Meaning |
 |--------|---------|
 | `none` | The preferred output for this configuration is active. |
-| `passthrough` | ReLimiter is not pacing: no cap is in effect (FPS limiter Off, or Background FPS 0 while alt-tabbed), Dynamic MFG passthrough is active, or no presenting swapchain or pacing route is available yet. |
+| `passthrough` | ReLimiter is not pacing: no cap is in effect (FPS limiter Off, or Background FPS 0 while alt-tabbed), Dynamic MFG passthrough is active, the developer test mode `reflex_only` is on, or no presenting swapchain or pacing route is available yet. |
 | `idle_cap` | Background FPS, FG-Off Cap or OLED Care is active. |
 | `present_route` | The game is paced at Present calls (no markers); nothing is held after the source wait. |
 | `architecture` | The GPU wait needs the 64-bit addon. |
@@ -504,7 +507,7 @@ Recording starts off on every game launch. Each time it is turned on, a new capt
 | File prefix | Contents |
 |-------------|----------|
 | `relimiter_pacing_` | One row per displayed frame, or per Present call when no display time is available: ReLimiter's release and frame plan, the game's Present call, GPU wait and readiness timing, Reflex timing, the display time and its source (ETW or DXGI), Display Pacing measurements and PC Latency when PC latency collection is on. Rows are written only for DXGI games (DX10, DX11, DX12); in Vulkan, OpenGL and DX9 games the file has only its header |
-| `relimiter_pacing_events_` | Capture start and end, pipeline changes, cadence restarts, hold changes, measurement loss, PC latency status changes and Display Pacing snapshots |
+| `relimiter_pacing_events_` | Capture start and end, pipeline changes, cadence restarts, measurement loss, PC latency status changes and Display Pacing snapshots |
 
 Display times come from [PC latency collection](#optional-pc-latency-measurement) or, on DX11 and DX12 without it, from DXGI frame statistics. PC Latency needs PC latency collection. Without display times, rows still record releases, Present calls and the available GPU and Reflex timing, but the display columns stay empty. An empty cell means the value was unavailable, not zero. Not every game supplies every measurement. Release and Present times describe ReLimiter's pacing, not what reached the display, especially with frame generation. Column-level detail is in the [Developer Reference](DEVELOPER_REFERENCE.md#capture-files).
 
@@ -555,7 +558,7 @@ Each launch starts a new log. The previous launch's log is kept as `relimiter_<G
 
 Most settings can be changed through the overlay. For manual changes, close the game first and edit `relimiter.ini` next to the addon. Settings belong under `[FrameLimiter]`.
 
-### Pacing and Adaptation
+### Pacing
 
 | Key | Default | Values / purpose |
 |-----|---------|------------------|
@@ -579,14 +582,14 @@ A `relimiter.ini` written by an earlier version (a `config_version` below 6) is 
 These keys no longer exist. ReLimiter always behaves as its defaults did, and drops the keys when it rewrites the INI:
 
 - Adaptive cap: `adaptive_cap`, `adaptive_cap_percentile`, `adaptive_cap_hold_room`, `osd_show_adaptive_smoothing` (also the `show_adaptive_smoothing` entry of the OSD presets) and its old name `adaptive_smoothing`. The interval is always the cap's interval.
-- Smoothing and output: `smoothing`, `output_rung`, `lead_coverage`, `lead_spike_floor`, `fg_late_spacing`, `gpu_queue_wait_render_queue` and `gpu_wait_headroom_us`. Smoothing is always on and ReLimiter always chooses the output point.
+- Smoothing and output: `smoothing`, `output_rung`, `lead_coverage`, `lead_spike_floor`, `fg_late_spacing`, `gpu_queue_wait_render_queue` and `gpu_wait_headroom_us`. ReLimiter always chooses the output point and the lead covers 99% of recent frames.
 - Reflex Sleep and source placement: `reflex_sleep_bypass`, `source_placement`, `bypass_low_latency_off`, `driver_low_latency_off`, `driver_limiter_hold`, `pre_sleep_precise` and `marker_forward_order`. A saved `reflex_sleep_bypass=false` or `source_placement=driver` does not select the driver's limiter or Sleep any more; use the developer test mode `driver_limiter` instead.
 - GPU cadence and A/B switches: `gpu_paced_cadence`, `gpu_wait_interleave_s`, `stall_inject_ms` and `stall_inject_period_s`.
 - Measurement experiments: `sleep_status_every_frame`, `gpu_start_probe`, `gpu_priority_probe` and `fg_presenter_probe_us`.
 - Pacer switches: `unified_pacer`, `unified_every_frame_service` and `unified_queue_target_us`. The pacer is on in 64-bit games unless a developer test mode takes over.
 - An INI saved before `config_version=5` also moved once to the defaults `unified_queue_law=true`, `gpu_queue_probe=true` and `gpu_queue_probe_source=1` (the queue-based pacer, which only does anything in 64-bit DirectX 12 games); those developer keys still exist, so set them to `false`, `false` and `0` to keep the report-based pacing.
 
-Keys removed by earlier versions are dropped the same way: `pacing_method`, `smoothing_percentile`, `smoothing_window`, `smoothing_release_speed`, `smoothing_bias_us`, `gpu_present_gate_mode`, `gpu_present_gate_slack_us`, `gpu_present_gate_max_delay_us`, `estimator_a_mode`, `estimator_a_fixed_reserve_us`, `native_arrival_predictor_mode`, `presentation_gate_location`, `adaptive_deadline_reserve_mode`, `gpu_readiness_observer`, `reflex_pre_sleep_pacing`, `reflex_gpu_combined`, `gpu_present_gate_phase_controller`, `gpu_present_gate_hold`, `marker_gate_bypass`, `adaptive_cycle_trial`, `ready_present_*`, `readiness_phase_*`, `gpu_paced_hold_margin` and `gpu_paced_release_smoothing`. `dmfg_output_cap` was read but never applied, and `gpu_wait_budget_us` has no cap left to size. [Pre-Sleep placement](#pre-sleep-placement) is automatic.
+Keys removed by earlier versions are dropped the same way: `pacing_method`, `smoothing_percentile`, `smoothing_window`, `smoothing_release_speed`, `smoothing_bias_us`, `gpu_present_gate_mode`, `gpu_present_gate_slack_us`, `gpu_present_gate_max_delay_us`, `estimator_a_mode`, `estimator_a_fixed_reserve_us`, `native_arrival_predictor_mode`, `presentation_gate_location`, `adaptive_deadline_reserve_mode`, `gpu_readiness_observer`, `reflex_pre_sleep_pacing`, `reflex_gpu_combined`, `gpu_present_gate_phase_controller`, `gpu_present_gate_hold`, `marker_gate_bypass`, `adaptive_cycle_trial`, `ready_present_*`, `readiness_phase_*`, `gpu_paced_hold_margin`, `gpu_paced_release_smoothing` and `dmfg_output_cap`.
 
 ### Screen and Compatibility
 
@@ -640,7 +643,7 @@ Open **Details** under the pacing status line and check **Output** and **Reason*
 
 ### Stuttering or inconsistent pacing
 
-1. Use a cap inside your display's VRR range. Smoothing is always on; the status line says whether frames are being held.
+1. Use a cap inside your display's VRR range; the status line says whether frames are being held.
 2. Check for another active limiter in the game, RTSS or driver settings.
 3. If **Grid epoch** climbs steadily, frames keep missing their targets: try a lower cap.
 4. Compare VSync Game, Off and On. Change one option at a time.

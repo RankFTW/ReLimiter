@@ -33,6 +33,7 @@ from inspect_capture import (
     PACING_FILE_PREFIX,
     PACING_FIXED_RAW_HEADER,
     detect_kind,
+    has_removed_columns,
     header_sha256,
     is_missing,
     schema_profile,
@@ -165,6 +166,9 @@ STALL_LONG_SEARCH_CHANGES = 8
 SIGNAL_CLEARANCE_WINDOW_US = 1000.0
 
 # ── Phase 3 controllers (src/period_governor.h, src/rung_feasibility.h, phase3_controllers_design.md P3-14) ──
+# The period governor, the feasibility guard and the stall injection no longer exist: their columns
+# (inspect_capture.REMOVED_PACING_COLUMNS) and event types are read from captures that carry them (the
+# pre-removal profile) and reported as unavailable on every other capture. The name tables stay.
 
 # GovernorCause (GovernorCause_Text): governor_step event reasons. base (7)
 # since Phase 4 (phase4_design.md P4-6): the fall reached the cap interval.
@@ -203,15 +207,17 @@ FEASIBILITY_CAUSE_NAMES = {0: "none", 1: "lead_infeasible", 2: "resume_spread", 
 GPU_WAIT_CAP_CAUSE_NAMES = {0: "none", 1: "late_resumes", 2: "trial_failed", 3: "calm", 4: "reset",
                             5: "opened", 6: "closed"}
 GPU_WAIT_CAP_OPEN = 255
-# Appended row columns; absent from earlier files.
+# Pre-removal rows columns (absent from files of the current profile and from files written before Phase 3):
+# the governor and signal advance summaries need all three.
 CONTROLLER_COLUMNS = ("governor_step", "governor_interval_us", "plan_signal_advance_us")
 # Q16 (appended after CONTROLLER_COLUMNS; absent from 132-column files): the
 # GPU queue wait's pre-Wait GPU time mapped to QPC.
 RESUME_COLUMN = "gate_pre_wait_qpc"
-SOURCE_FLAG_OVERLOAD = 64  # PACING_SOURCE_OVERLOAD: set while the governor stretches the interval
+SOURCE_FLAG_OVERLOAD = 64  # PACING_SOURCE_OVERLOAD: set while the governor stretched the interval (no current build sets it)
 # PacingSourceFlags names by bit value (src/pacing_telemetry_types.h). Bit 1 was
 # the retired, never-set pre_reflex_paced before Phase 4; bit 4 was the retired,
-# never-set predictor_warm until gpu_paced (developer A/B gpu_paced_cadence).
+# never-set predictor_warm until gpu_paced (developer A/B gpu_paced_cadence). Bits 4 (gpu_paced), 64 (overload)
+# and 128 (stall_injected) are set by no current build; the names stay for older captures.
 SOURCE_FLAG_NAMES = {1: "slept", 2: "pre_sleep", 4: "gpu_paced", 8: "fixed_refresh", 16: "background",
                      32: "passthrough", 64: "overload", 128: "stall_injected"}
 SOURCE_FLAG_PRE_SLEEP = 2       # PACING_SOURCE_PRE_SLEEP: a pre-Sleep wait preceded the frame's marker
@@ -223,8 +229,10 @@ GOVERNOR_LADDER_MAX_STEP = 10
 
 # PacingSourcePlacement (PacingSourcePlacement_Text): source_placement cells.
 PLACEMENT_NAMES = {0: "none", 1: "marker", 2: "present", 3: "pre_sleep", 4: "driver_limiter", 5: "unified"}
-# Appended after RESUME_COLUMN; absent from 133-column and earlier files.
-PLACEMENT_COLUMNS = ("source_placement", "pre_sleep_end_qpc", "pre_sleep_margin_us")
+# Appended after RESUME_COLUMN; absent from 133-column and earlier files. pre_sleep_end_qpc and source_placement
+# are written by the unified Sleep wait; the pre-wait margin is a pre-removal column (PRE_SLEEP_MARGIN_COLUMN).
+PLACEMENT_COLUMNS = ("source_placement", "pre_sleep_end_qpc")
+PRE_SLEEP_MARGIN_COLUMN = "pre_sleep_margin_us"
 
 
 # ── Cell parsing ──
@@ -344,8 +352,8 @@ class PacingRow:
         self.plan_rung = _integer(cells, "plan_rung")
         self.plan_status = _integer(cells, "plan_status")
         self.display_source = _integer(cells, "display_source")
-        # Phase 3 (appended; None for earlier files and for Source records the
-        # governor did not run on or without a plan).
+        # Phase 3 (appended; None for earlier files, for files of the current profile (the governor columns
+        # were removed) and for Source records the governor did not run on or without a plan).
         self.source_flags = _integer(cells, "source_flags") if release > 0 else None
         self.governor_step = _integer(cells, "governor_step")
         self.governor_interval_us = _decimal(cells, "governor_interval_us")
@@ -1046,9 +1054,12 @@ def _loss_windows(rows: list[dict[str, str]], clock: _EventClock, context_qpc: i
             "unmatched_ends": unmatched_ends, "windows": windows[:REPORTED_EVENTS]}
 
 
-def summarize_events(path: Path, time_origin_qpc: int | None = None) -> dict[str, Any]:
+def summarize_events(path: Path, time_origin_qpc: int | None = None,
+                     retired_events: bool = True) -> dict[str, Any]:
     """Capture boundaries, epoch changes, loss windows, drops, native PCL loss and
-    status, and join statistics."""
+    status, and join statistics. retired_events False states that the capture's
+    build does not write the stall_injected, governor_step, rung_feasibility and
+    gpu_wait_cap event types: their summaries are None (unavailable), never a count of 0."""
     with path.open(encoding="utf-8-sig", newline="") as stream:
         reader = csv.DictReader(stream)
         header = list(reader.fieldnames or [])
@@ -1125,8 +1136,8 @@ def summarize_events(path: Path, time_origin_qpc: int | None = None) -> dict[str
                  "previous": _enum_label(previous, PCL_STATUS_NAMES, "empty"),
                  "value": _enum_label(_event_int(row, "value"), PCL_STATUS_NAMES, "empty")}
         (pcl_initial if previous is None else pcl_changes).append(entry)
-    plan_events = _plan_events(by_type, clock)
-    controller_events = _controller_events(by_type, clock)
+    plan_events = _plan_events(by_type, clock, retired_events)
+    controller_events = _controller_events(by_type, clock, retired_events)
 
     if len(starts) != 1 or len(ends) != 1:
         warnings.append(f"The events file has {len(starts)} capture_start and {len(ends)} capture_end rows; "
@@ -1184,7 +1195,8 @@ def summarize_events(path: Path, time_origin_qpc: int | None = None) -> dict[str
     }
 
 
-def _plan_events(by_type: dict[str, list[dict[str, str]]], clock: _EventClock) -> dict[str, Any]:
+def _plan_events(by_type: dict[str, list[dict[str, str]]], clock: _EventClock,
+                 retired_events: bool) -> dict[str, Any]:
     """grid_epoch, pipeline_change and stall_injected events (Phase 2, derived by
     the worker from Source records). previous_value is empty for the first
     observation or the capture-start state; those rows are not counted as changes."""
@@ -1205,24 +1217,28 @@ def _plan_events(by_type: dict[str, list[dict[str, str]]], clock: _EventClock) -
                  "value": _enum_label(_event_int(row, "value"), RUNG_NAMES, "empty"),
                  "reason": _enum_label(_event_int(row, "reason"), FALLBACK_REASON_NAMES, "empty")}
         (pipeline_initial if previous is None else pipeline_changes).append(entry)
-    stalls = [{"event_qpc": _event_int(row, "event_qpc"),
-               "relative_s": clock.seconds(_event_int(row, "event_qpc")),
-               "stall_us": _event_int(row, "value")}
-              for row in by_type.get("stall_injected", [])]
+    stalls = ([{"event_qpc": _event_int(row, "event_qpc"),
+                "relative_s": clock.seconds(_event_int(row, "event_qpc")),
+                "stall_us": _event_int(row, "value")}
+               for row in by_type.get("stall_injected", [])] if retired_events else None)
     return {
         "grid_epochs": {"count": len(epoch_changes),
                         "by_reason": dict(Counter(entry["reason"] for entry in epoch_changes)),
                         "changes": epoch_changes[:REPORTED_EVENTS], "initial": epoch_initial[:REPORTED_EVENTS]},
         "pipeline_changes": {"count": len(pipeline_changes), "changes": pipeline_changes[:REPORTED_EVENTS],
                              "initial": pipeline_initial[:REPORTED_EVENTS]},
-        "stalls_injected": {"count": len(stalls), "events": stalls},
+        "stalls_injected": None if stalls is None else {"count": len(stalls), "events": stalls},
     }
 
 
-def _controller_events(by_type: dict[str, list[dict[str, str]]], clock: _EventClock) -> dict[str, Any]:
+def _controller_events(by_type: dict[str, list[dict[str, str]]], clock: _EventClock,
+                       retired_events: bool) -> dict[str, Any]:
     """governor_step, rung_feasibility and gpu_wait_cap events (Phase 3, derived by the worker
     from Source records). Rows with an empty previous_value are the first
-    observation or the capture-start state and are not counted as changes."""
+    observation or the capture-start state and are not counted as changes. All three are None
+    (unavailable) for a capture whose build writes none of them."""
+    if not retired_events:
+        return {"governor_steps": None, "rung_feasibility": None, "gpu_wait_cap": None}
     def split(event_type: str, names: dict[int, str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         changes: list[dict[str, Any]] = []
         initial: list[dict[str, Any]] = []
@@ -1693,14 +1709,14 @@ def _resolve_events(path: Path, events_path: Path | None, discover_events: bool)
     return None, "none"
 
 
-def _capture_events(events_path: Path | None, source: str,
-                    selection: RowSelection, warnings: list[str]) -> dict[str, Any] | None:
+def _capture_events(events_path: Path | None, source: str, selection: RowSelection,
+                    warnings: list[str], retired_events: bool) -> dict[str, Any] | None:
     """Events summary on the rows' time origin, cross-checked against the rows."""
     if events_path is None:
         warnings.append("No relimiter_pacing_events file was given or found; capture boundaries, loss windows, "
                         "queue drops and join statistics are unavailable.")
         return None
-    events = summarize_events(events_path, selection.time_origin_qpc)
+    events = summarize_events(events_path, selection.time_origin_qpc, retired_events)
     events["source"] = source
     warnings.extend(events.pop("warnings"))
     row_epochs = sorted(selection.capture_epochs)
@@ -1909,10 +1925,12 @@ def _percent_distribution(values: Iterable[int]) -> dict[str, Any]:
 
 
 class ControllerSummary:
-    """Per-frame governor step, overload flag and GPU release advance of the
-    analyzed rows, plus the Q16 resume block (ResumeSummary). A Source record
-    joined to several rows (FG outputs, repeated displays) counts once, keyed
-    by frame key and source release time.
+    """The Q16 resume block (ResumeSummary, files with gate_pre_wait_qpc) and, for files that carry the
+    pre-removal governor columns, the per-frame governor step, overload flag and GPU release advance of the
+    analyzed rows. The governor, the overload guard and the signal advance no longer exist: without their
+    columns every one of those fields is None (not applicable, never a measured zero). A Source record
+    joined to several rows (FG outputs, repeated displays) counts once, keyed by frame key and source
+    release time.
     governor_step semantics depend on the file (phase4_design.md P4-6): on
     Phase 4 files (136 columns and more) it is the stretch in whole percent of I_0 on VRR (and
     unsnapped fixed refresh) and whole refreshes above the base on a snapped
@@ -1920,10 +1938,10 @@ class ControllerSummary:
     grid was snapped); on earlier Phase 3 files it is the ladder step k in
     0..10, reported per step only.
     plan_signal_advance_us is reserved since Q15 (the advance was withdrawn)
-    and always 0, so current captures report 0 advanced frames; only captures
+    and always 0, so such captures report 0 advanced frames; only captures
     of builds A01AA79D and 66890A2C can carry non-zero values."""
 
-    def __init__(self, resume_column: bool, stretch_semantics: bool) -> None:
+    def __init__(self, resume_column: bool, governor_columns: bool, stretch_semantics: bool) -> None:
         self.frames: set[tuple[tuple[int, int, int], int]] = set()
         self.step_frames: Counter[int] = Counter()
         self.stretch_percent: list[int] = []        # governed frames without the fixed_refresh flag
@@ -1932,13 +1950,14 @@ class ControllerSummary:
         self.planned_frames = 0
         self.advance_us = array("d")
         self.resume_column = resume_column
+        self.governor_columns = governor_columns
         self.stretch_semantics = stretch_semantics
         self.resume = ResumeSummary()
 
     def add(self, row: PacingRow) -> None:
         if self.resume_column:
             self.resume.add(row)
-        if row.source_release_qpc <= 0:
+        if not self.governor_columns or row.source_release_qpc <= 0:
             return
         frame = (row.key, row.source_release_qpc)
         if frame in self.frames:
@@ -1958,6 +1977,9 @@ class ControllerSummary:
                 self.advance_us.append(row.signal_advance_us)
 
     def _governor(self) -> dict[str, Any]:
+        if not self.governor_columns:
+            return {"available": False,
+                    "reason": "not applicable: the file has no governor columns (current profile or before Phase 3)"}
         # Keys are the step value as text (JSON object keys); frames without a governor run are not counted.
         steps = {str(step): count for step, count in sorted(self.step_frames.items())}
         if not self.stretch_semantics:
@@ -1979,12 +2001,17 @@ class ControllerSummary:
                                           for step, count in sorted(self.fixed_step_frames.items())},
         }
 
-    def result(self, available: bool, events: dict[str, Any] | None) -> dict[str, Any]:
-        if not available:
+    def result(self, events: dict[str, Any] | None) -> dict[str, Any]:
+        if not self.resume_column and not self.governor_columns:
             return {"available": False, "reason": "the file predates the Phase 3 columns"}
+        resume = self.resume.result(self.resume_column)
+        if not self.governor_columns:
+            return {"available": True, "frames": None, "governed_frames": None, "governor": self._governor(),
+                    "overload_frames": None, "overload_share": None, "signal_advance": None,
+                    "resume": resume, "governor_steps": None, "demotions": None, "gpu_wait_cap": None}
         frames = len(self.frames)
         advance = distribution(self.advance_us)
-        feasibility = None if events is None else events["rung_feasibility"]
+        feasibility = None if events is None or events["rung_feasibility"] is None else events["rung_feasibility"]
         return {
             "available": True,
             "frames": frames,
@@ -1996,7 +2023,7 @@ class ControllerSummary:
                                "advanced_frames": advance["count"],
                                "share": advance["count"] / self.planned_frames if self.planned_frames else None,
                                "p50_us": advance["p50_us"]},
-            "resume": self.resume.result(self.resume_column),
+            "resume": resume,
             # From the events file (None without one): changes only, capture-start state excluded.
             # Since Phase 4 one event per governor phase transition (P4-6).
             "governor_steps": (None if events is None else
@@ -2072,7 +2099,7 @@ class PlacementSummary:
                 aim_qpc = wake_qpc - row.pre_sleep_margin_us * frequency / 1_000_000.0
                 self.wake_late_us.append(ticks_to_us(row.pre_sleep_end_qpc - aim_qpc, frequency))
 
-    def result(self, available: bool) -> dict[str, Any]:
+    def result(self, available: bool, margin_column: bool) -> dict[str, Any]:
         if not available:
             return {"available": False, "reason": "the file predates the Phase 4 placement columns"}
         trim = distribution(self.trim_us)
@@ -2088,10 +2115,11 @@ class PlacementSummary:
                 "residual_us": distribution_p90(self.residual_us),         # marker − pre-wait end
                 "trim_us": {"count": trim["count"], "p50_us": trim["p50_us"],
                             "p99_us": trim["p99_us"]},                     # release − marker
-                "margin_p50_us": lower_quantile(sorted(self.margin_us), 0.50),
+                # The pre-wait margin is a pre-removal column: None (unavailable) without it.
+                "margin_p50_us": (lower_quantile(sorted(self.margin_us), 0.50) if margin_column else None),
                 "marker_after_wake": {"frames": self.wake_frames, "count": self.after_wake,
                                       "share": self.after_wake / self.wake_frames if self.wake_frames else None},
-                "wake_late_us": distribution_p90(self.wake_late_us),       # pre-wait end − aim
+                "wake_late_us": distribution_p90(self.wake_late_us) if margin_column else None,  # end − aim
             },
         }
 
@@ -2105,11 +2133,15 @@ def analyze_capture(path: Path, events_path: Path | None = None,
                         if name in header}
     derived_columns = tuple(name for name in COMPARED_METRICS if name in header)
     phase2_columns = all(name in header for name in PLAN_COLUMNS)
-    phase3_columns = all(name in header for name in CONTROLLER_COLUMNS)
+    governor_columns = all(name in header for name in CONTROLLER_COLUMNS)
+    # Any removed column: the build may have written the removed mechanisms' events (a Phase 2 file has no
+    # governor columns but stall_injected events); none: they are unavailable.
+    retired_events = has_removed_columns(header)
     phase4_columns = all(name in header for name in PLACEMENT_COLUMNS)
+    margin_column = PRE_SLEEP_MARGIN_COLUMN in header
     stall_recovery = StallRecovery()
     signal_clearance = SignalClearance()
-    controllers = ControllerSummary(RESUME_COLUMN in header, phase4_columns)
+    controllers = ControllerSummary(RESUME_COLUMN in header, governor_columns, phase4_columns)
     placement = PlacementSummary()
 
     events_path, events_source = _resolve_events(path, events_path, discover_events)
@@ -2135,18 +2167,21 @@ def analyze_capture(path: Path, events_path: Path | None = None,
         if phase2_columns:
             stall_recovery.add(row, derived)
             signal_clearance.add(row)
-        if phase3_columns:
-            controllers.add(row)
+        controllers.add(row)
         if phase4_columns:
             placement.add(row)
 
     profile = schema_profile(kind, header)
     warnings = _row_warnings(selection, overall, profile, optional_columns)
-    events = _capture_events(events_path, events_source, selection, warnings)
+    events = _capture_events(events_path, events_source, selection, warnings, retired_events)
     if not phase2_columns:
         stall_result: dict[str, Any] = {"available": False, "reason": "the file predates the Phase 2 columns"}
     elif events is None:
         stall_result = {"available": False, "reason": "no events file"}
+    elif events["stalls_injected"] is None:
+        stall_result = {"available": False,
+                        "reason": "not applicable: the file has none of the removed columns, so its build "
+                                  "injects no stalls and writes no stall_injected events"}
     else:
         stall_result = stall_recovery.evaluate(events["stalls_injected"]["events"])
     snapshot_result = (snapshots.result() if snapshots is not None else
@@ -2169,6 +2204,9 @@ def analyze_capture(path: Path, events_path: Path | None = None,
             "column_count": len(header),
             "ordered_header_sha256": header_sha256(header),
             "runtime_derived_columns": list(derived_columns),
+            # True: the file carries a removed column, so the stall, governor and feasibility event readers
+            # apply; False: they are unavailable (not zero).
+            "pre_removal_columns": retired_events,
         },
         "filters": {**filters.describe(),
                     "applied_before_chain_construction": True,
@@ -2194,8 +2232,8 @@ def analyze_capture(path: Path, events_path: Path | None = None,
         "events": events,
         "stall_recovery": stall_result,
         "signal_clearance": signal_clearance.result(phase2_columns),
-        "controllers": controllers.result(phase3_columns, events),
-        "placement": placement.result(phase4_columns),
+        "controllers": controllers.result(events),
+        "placement": placement.result(phase4_columns, margin_column),
         "warnings": warnings,
         "method": ("Derived metrics recomputed per phase0_measurement_design.md section 4 and "
                    "src/pacing_metrics.cpp; integer QPC differences converted once to microseconds. "
@@ -2267,7 +2305,7 @@ def _plan_event_lines(events: dict[str, Any]) -> list[str]:
         f"  grid epochs: initial {initial_epoch}, changes {epochs['count']} by reason "
         f"{_counts(epochs['by_reason'])}",
         f"  pipeline: initial {initial_pipeline}, changes {pipeline['count']}" + (f" [{shown}]" if shown else ""),
-        f"  stalls injected: {stalls['count']}",
+        "  stalls injected: " + ("unavailable (not recorded by this build)" if stalls is None else str(stalls["count"])),
     ]
 
 
@@ -2309,8 +2347,9 @@ def _percent(share: float | None) -> str:
 
 def _governor_lines(governor: dict[str, Any]) -> list[str]:
     if not governor["available"]:
-        ladder = ", ".join(f"k={step} {count}" for step, count in governor["ladder_step_frames"].items())
-        return [f"  governor stretch: unavailable ({governor['reason']}); ladder step frames: {ladder or 'none'}"]
+        ladder = ", ".join(f"k={step} {count}" for step, count in governor.get("ladder_step_frames", {}).items())
+        return [f"  governor stretch: unavailable ({governor['reason']})"
+                + (f"; ladder step frames: {ladder}" if "ladder_step_frames" in governor else "")]
     stretch = governor["stretch_percent"]
     fixed = ", ".join(f"+{step}: {count}" for step, count in governor["fixed_refresh_step_frames"].items())
     return [
@@ -2332,6 +2371,9 @@ def _gpu_wait_cap_line(cap: dict[str, Any] | None) -> str:
 def _controller_lines(controllers: dict[str, Any]) -> list[str]:
     if not controllers["available"]:
         return [f"Controllers: unavailable ({controllers['reason']})"]
+    if controllers["frames"] is None:
+        return [f"Controllers: governor, overload and signal advance not applicable ({controllers['governor']['reason']})",
+                _resume_line(controllers["resume"])]
     advance = controllers["signal_advance"]
     steps = controllers["governor_steps"]
     demotions = controllers["demotions"]
@@ -2359,16 +2401,18 @@ def _placement_lines(placement: dict[str, Any]) -> list[str]:
     residual = pre_sleep["residual_us"]
     trim = pre_sleep["trim_us"]
     wake = pre_sleep["marker_after_wake"]
+    wake_late = pre_sleep["wake_late_us"]
     return [
         f"Source placement: {placement['frames']} source frames ({_counts(placement['frames_by_placement'])})",
         f"  pre-Sleep frames: {pre_sleep['frames']} of {pre_sleep['flagged_frames']} flagged "
         f"({pre_sleep['frames_without_end']} without a pre-wait end), margin p50 "
-        f"{_number(pre_sleep['margin_p50_us'])} us",
+        f"{_number(pre_sleep['margin_p50_us']) + ' us' if pre_sleep['margin_p50_us'] is not None else 'unavailable'}",
         f"  residual (marker - pre-wait end): {_quantiles(residual)}",
         f"  trim (release - marker): p50 {_number(trim['p50_us'])} / p99 {_number(trim['p99_us'])} us",
         f"  marker after the plan's source wake: {wake['count']} of {wake['frames']} frames "
         f"({_percent(wake['share'])})",
-        f"  pre-wait end after its aim (approx. T - L - margin): {_quantiles(pre_sleep['wake_late_us'])}",
+        "  pre-wait end after its aim (approx. T - L - margin): "
+        + ("unavailable (no pre_sleep_margin_us column)" if wake_late is None else _quantiles(wake_late)),
     ]
 
 

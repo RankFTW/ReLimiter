@@ -52,12 +52,10 @@ namespace
             : 0.0;
     }
 
-    // The plan's lifecycle is still current and the caller's route (H2) has
-    // not been cancelled.
-    bool IsHoldCurrent(const PacingPlanKey& key, const PresentationGateOptions* options) noexcept
+    // The plan's lifecycle is still current.
+    bool IsHoldCurrent(const PacingPlanKey& key) noexcept
     {
         if (RuntimeLifecycle_IsStopping()) return false;
-        if (options && options->is_current && !options->is_current(options->context)) return false;
         return key.controller_generation == FrameTimeline_CurrentControllerGeneration() &&
             key.producer_epoch == FrameTimeline_CurrentProducerEpoch(
                 static_cast<FrameIdentityDomain>(key.identity_domain));
@@ -67,13 +65,13 @@ namespace
     // chunks. *release_qpc receives the last QPC read. True when the target
     // was reached; false when the hold was cancelled.
     bool SpinToTarget(int64_t target_qpc, int64_t qpc_frequency, const PacingPlanKey& key,
-                      const PresentationGateOptions* options, int64_t* release_qpc) noexcept
+                      int64_t* release_qpc) noexcept
     {
         const int64_t check_interval_qpc = (std::max)(int64_t{1}, static_cast<int64_t>(
             static_cast<double>(qpc_frequency) * kIdentityCheckIntervalUs / 1'000'000.0));
         for (;;) {
             *release_qpc = NowQpc();
-            if (!IsHoldCurrent(key, options)) return false;
+            if (!IsHoldCurrent(key)) return false;
             if (*release_qpc >= target_qpc) return true;
             HWSpin((std::min)(target_qpc, *release_qpc + check_interval_qpc));
         }
@@ -127,7 +125,6 @@ namespace
 
 void PresentGate_Execute(const PacingPlanKey& key, PacingRung rung,
                          int64_t arrival_qpc,
-                         const PresentationGateOptions* options,
                          PresentationGateResult* result) {
     PresentationGateResult local{};
     PresentationGateResult* outcome = result ? result : &local;
@@ -163,8 +160,8 @@ void PresentGate_Execute(const PacingPlanKey& key, PacingRung rung,
     }
 
     int64_t release_qpc = decision_qpc;
-    const bool completed = SpinToTarget(target_qpc, snapshot.qpc_frequency, key, options, &release_qpc);
-    // A cancelled hold (lifecycle or route change) reports Stale at its release.
+    const bool completed = SpinToTarget(target_qpc, snapshot.qpc_frequency, key, &release_qpc);
+    // A cancelled hold (lifecycle change) reports Stale at its release.
     FinishClaim(plan, rung, completed ? PacingPlanStatus::Held : PacingPlanStatus::Stale,
         release_qpc, outcome);
     outcome->held = release_qpc > decision_qpc;
@@ -257,10 +254,10 @@ void PresentGate_OnPresentStart(const PacingPlanKey& key, int64_t arrival_qpc,
             PresentGate_ReleaseSourceOnly(key, arrival_qpc, outcome);
             break;
         case PacingRung::MarkerHold:
-            PresentGate_Execute(key, PacingRung::MarkerHold, arrival_qpc, nullptr, outcome);
+            PresentGate_Execute(key, PacingRung::MarkerHold, arrival_qpc, outcome);
             break;
         default:
-            // H2 and H3 plans are output at the native Present or by the GPU gate.
+            // H3 plans are output by the GPU gate or declined at the native Present.
             g_last_gate_sleep_us.store(0.0, std::memory_order_relaxed);
             break;
     }

@@ -5,6 +5,7 @@ import copy
 import csv
 import json
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -57,6 +58,11 @@ class DecisionTests(unittest.TestCase):
     def plan(self):
         plan = json.loads(TEMPLATE.read_text(encoding="utf-8"))
         plan["scenes"] = [{"id": "light", "class": "light"}, {"id": "heavy", "class": "heavy"}]
+        plan["runs"] = []
+        # The fallback check is generic (a comparison without the mechanism under test against the judged
+        # rule's baseline); the template has none, older plans do.
+        plan["decision"]["fallback"] = {"comparison": "pacer_vs_driver_limiter", "judged": "pacer_default"}
+        compare.validate_plan(plan)
         return plan
 
     def comparisons(self, light, heavy, raw_heavy):
@@ -64,8 +70,8 @@ class DecisionTests(unittest.TestCase):
             return {"id": identifier, "scenes": [
                 {"scene": scene, "class": scene, "status": "compared", "metrics": entries}
                 for scene, entries in scenes.items()]}
-        return [comparison("hold_vs_release", {"light": light, "heavy": heavy}),
-                comparison("raw_hold_vs_release", {"light": light, "heavy": raw_heavy})]
+        return [comparison("pacer_vs_reflex_only", {"light": light, "heavy": heavy}),
+                comparison("pacer_vs_driver_limiter", {"light": light, "heavy": raw_heavy})]
 
     def test_supported_rejected_and_inconclusive(self):
         plan = self.plan()
@@ -74,37 +80,37 @@ class DecisionTests(unittest.TestCase):
         worse = {self.PRIMARY[0]: "worse", self.PRIMARY[1]: "no_difference"}
         decided = compare.decide(plan, self.comparisons(metrics(**better, latency=900.0),
                                                         metrics(**same), metrics(**worse)))
-        self.assertEqual(decided["rules"]["hold_default"]["status"], "supported")
+        self.assertEqual(decided["rules"]["pacer_default"]["status"], "supported")
         self.assertEqual(decided["fallback"], {"heavy": "needed"})
 
-        # The hold is worse in a heavy scene: rejected even when light scenes improve.
+        # The candidate is worse in a heavy scene: rejected even when light scenes improve.
         decided = compare.decide(plan, self.comparisons(metrics(**better), metrics(**worse), metrics(**worse)))
-        self.assertEqual(decided["rules"]["hold_default"]["status"], "rejected")
+        self.assertEqual(decided["rules"]["pacer_default"]["status"], "rejected")
         self.assertEqual(decided["fallback"], {"heavy": "inconclusive"})
 
         # A latency increase never decides: the rule stays supported and reports the change.
         decided = compare.decide(plan, self.comparisons(metrics(**better, latency=2500.0),
                                                         metrics(**same), metrics(**same)))
-        self.assertEqual(decided["rules"]["hold_default"]["status"], "supported")
-        self.assertEqual(decided["rules"]["hold_default"]["latency"]["light"]["delta"], 2500.0)
+        self.assertEqual(decided["rules"]["pacer_default"]["status"], "supported")
+        self.assertEqual(decided["rules"]["pacer_default"]["latency"]["light"]["delta"], 2500.0)
         self.assertEqual(decided["fallback"], {"heavy": "not_needed"})
 
         # No detectable improvement in a light scene is not support.
         decided = compare.decide(plan, self.comparisons(metrics(**same), metrics(**same), metrics(**same)))
-        self.assertEqual(decided["rules"]["hold_default"]["status"], "inconclusive")
+        self.assertEqual(decided["rules"]["pacer_default"]["status"], "inconclusive")
 
         # Unreplicated heavy-scene arms decide nothing: not support.
         unreplicated = dict.fromkeys(self.PRIMARY, "no_replicate")
         decided = compare.decide(plan, self.comparisons(metrics(**better), metrics(**unreplicated),
                                                         metrics(**unreplicated)))
-        self.assertEqual(decided["rules"]["hold_default"]["status"], "inconclusive")
+        self.assertEqual(decided["rules"]["pacer_default"]["status"], "inconclusive")
         self.assertEqual(decided["fallback"], {"heavy": "inconclusive"})
 
     def test_rules_judge_their_own_comparison_without_fallback(self):
-        # A plan whose question is not the hold: two rules, no fallback check.
+        # A plan whose question is not the pacer against Reflex alone: two rules, no fallback check.
         plan = self.plan()
-        plan["decision"]["judge"] = [{"id": "first", "comparison": "hold_vs_release"},
-                                     {"id": "second", "comparison": "raw_hold_vs_release"}]
+        plan["decision"]["judge"] = [{"id": "first", "comparison": "pacer_vs_reflex_only"},
+                                     {"id": "second", "comparison": "pacer_vs_driver_limiter"}]
         del plan["decision"]["fallback"]
         plan["runs"] = []
         compare.validate_plan(plan)
@@ -119,11 +125,11 @@ class DecisionTests(unittest.TestCase):
 
 
 class EndToEndTests(unittest.TestCase):
-    """Two release-only (A) and two hold (B) runs of one light scene at T_out
-    10 ms. A alternates 10 ms +/- 1.5 ms (+/- 1.4 ms in its second run): every
+    """Two Reflex-only (R0) and two pacer (B) runs of one light scene at T_out
+    10 ms. R0 alternates 10 ms +/- 1.5 ms (+/- 1.4 ms in its second run): every
     adjacent jitter is about 3 ms and every interval deviates more than 1 ms.
-    B alternates +/- 50 us. PC Latency is 1 ms higher with the hold. A fifth
-    run labelled B ran with Smoothing off and must be excluded."""
+    B alternates +/- 50 us. PC Latency is 1 ms higher with the pacer. A fifth
+    run labelled B ran as Reflex only (passthrough) and must be excluded."""
 
     FRAMES = 3000  # 30 s
 
@@ -134,10 +140,13 @@ class EndToEndTests(unittest.TestCase):
     def tearDown(self):
         self._directory.cleanup()
 
-    def capture(self, epoch, swing_us, rung, reason, latency_us, interval_us=None, lead_us=None):
+    def capture(self, epoch, swing_us, rung, reason, latency_us, interval_us=None, lead_us=None,
+                legacy_feasibility=None):
         """latency_us: a number, or a function of the frame index. interval_us and
         lead_us (display minus Present start), functions of the frame index,
-        replace the alternating 10 ms +/- swing and the 5 ms lead."""
+        replace the alternating 10 ms +/- swing and the 5 ms lead. The source placement follows the rung
+        (none without a hold, unified with one). legacy_feasibility (a list of (value, tick offset) rung_feasibility
+        events) makes the capture one of the pre-removal profile."""
         rows = []
         display = 1_000_000_000
         for frame in range(self.FRAMES):
@@ -152,19 +161,24 @@ class EndToEndTests(unittest.TestCase):
                 display_index="0", display_count="1", frame_type="1", frame_classification="0",
                 final_state="1", loss_window="0", join_rule="1", identity_domain="1", producer_epoch="1",
                 frame_id=str(frame + 1), source_release_qpc=str(display - 150_000), interval_us="10000.000",
-                fg_divisor="1.000", plan_rung=str(rung), source_placement="1", pcl_status="3",
+                fg_divisor="1.000", plan_rung=str(rung), source_placement="5" if rung else "0", pcl_status="3",
                 pcl_total_us=f"{latency:.3f}"))
         suffix = f"Game_1_2_capture_{epoch}.csv"
-        rows_path = write_csv(self.directory / f"relimiter_pacing_{suffix}", inspector.CURRENT_PACING_HEADER, rows)
+        header = inspector.PRE_REMOVAL_PACING_HEADER if legacy_feasibility is not None else inspector.CURRENT_PACING_HEADER
+        rows_path = write_csv(self.directory / f"relimiter_pacing_{suffix}", header, rows)
 
         def event(sequence, event_type, qpc, **cells):
             row = dict(sequence=str(sequence), capture_epoch=str(epoch), event_type=event_type,
                        event_qpc=str(qpc), qpc_frequency=str(FREQUENCY))
             row.update({name: str(value) for name, value in cells.items()})
             return row
+        feasibility = [event(2 + index, "rung_feasibility", 1_000_000_000 + offset, value=value,
+                             **({} if index == 0 else {"previous_value": 1 - value}))
+                       for index, (value, offset) in enumerate(legacy_feasibility or [])]
         write_csv(self.directory / f"relimiter_pacing_events_{suffix}", inspector.CURRENT_PACING_EVENTS_HEADER, [
             event("", "capture_start", 1_000_000_000, csv_row_drops=0, csv_event_drops=0),
             event(1, "pipeline_change", 1_000_000_000, value=rung, reason=reason),
+            *feasibility,
             event("", "capture_end", display, csv_row_drops=0, csv_event_drops=0)])
         return rows_path.name
 
@@ -174,19 +188,19 @@ class EndToEndTests(unittest.TestCase):
         plan["protocol"].update(warmup_seconds=0, min_display_intervals=1000)
         plan["analysis"].update(bootstrap_iterations=40, block_seconds=5.0)
         plan["decision"].update(primary_metrics=["jitter_p99_us", "dev_share_over_1000us"])
-        smoothing_off, none = 3, 0
+        passthrough, none = 1, 0
         plan["runs"] = [
-            {"scene": "light", "arm": "A", "order": 1, "capture": self.capture(1, 1500, 0, smoothing_off, 20_000)},
+            {"scene": "light", "arm": "R0", "order": 1, "capture": self.capture(1, 1500, 0, passthrough, 20_000)},
             {"scene": "light", "arm": "B", "order": 2, "capture": self.capture(2, 50, 3, none, 21_000)},
-            {"scene": "light", "arm": "A", "order": 3, "capture": self.capture(3, 1400, 0, smoothing_off, 20_000)},
+            {"scene": "light", "arm": "R0", "order": 3, "capture": self.capture(3, 1400, 0, passthrough, 20_000)},
             {"scene": "light", "arm": "B", "order": 4, "capture": self.capture(4, 60, 3, none, 21_000)},
-            {"scene": "light", "arm": "B", "order": 5, "capture": self.capture(5, 1500, 0, smoothing_off, 20_000)},
+            {"scene": "light", "arm": "B", "order": 5, "capture": self.capture(5, 1500, 0, passthrough, 20_000)},
         ]
         path = self.directory / "plan.json"
         path.write_text(json.dumps(plan), encoding="utf-8")
         return path
 
-    def test_hold_beats_release_and_mislabelled_run_is_excluded(self):
+    def test_pacer_beats_reflex_only_and_mislabelled_run_is_excluded(self):
         report = compare.evaluate(self.plan())
         runs = report["runs"]
         self.assertTrue(all(run["status"] == "analyzed" for run in runs))
@@ -197,8 +211,8 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(runs[1]["metrics"]["dev_share_over_1000us"], 0.0)
         self.assertEqual(runs[1]["hold"]["held_share"], 1.0)
 
-        hold = next(entry for entry in report["comparisons"] if entry["id"] == "hold_vs_release")
-        scene = hold["scenes"][0]
+        pacer = next(entry for entry in report["comparisons"] if entry["id"] == "pacer_vs_reflex_only")
+        scene = pacer["scenes"][0]
         self.assertEqual((scene["candidate_runs"], scene["baseline_runs"]), (2, 2))
         jitter = scene["metrics"]["jitter_p99_us"]
         self.assertAlmostEqual(jitter["delta"], (100.0 + 120.0) / 2 - (3000.0 + 2800.0) / 2, places=3)
@@ -207,7 +221,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(scene["metrics"]["dev_share_over_1000us"]["verdict"], "better")
         self.assertEqual(scene["metrics"]["dev_share_over_2000us"]["verdict"], "no_difference")
         self.assertAlmostEqual(scene["metrics"]["pc_latency_p50_us"]["delta"], 1000.0, places=3)
-        rule = report["decision"]["rules"]["hold_default"]
+        rule = report["decision"]["rules"]["pacer_default"]
         self.assertEqual(rule["status"], "supported")
         self.assertAlmostEqual(rule["latency"]["light"]["delta"], 1000.0, places=3)
 
@@ -235,13 +249,13 @@ class EndToEndTests(unittest.TestCase):
         # cannot see the 1 ms; route pairing compares like with like.
         def route(offset_us):
             return {"latency_us": lambda frame: 30_000.0 + 30_000.0 * ((frame // 500) % 2) + offset_us}
-        smoothing_off, none = 3, 0
-        plan, report = self.route_report([("A", 1, 0, smoothing_off, route(0.0)), ("B", 2, 3, none, route(1000.0)),
-                                          ("A", 3, 0, smoothing_off, route(0.0)), ("B", 4, 3, none, route(1000.0))])
+        passthrough, none = 1, 0
+        plan, report = self.route_report([("R0", 1, 0, passthrough, route(0.0)), ("B", 2, 3, none, route(1000.0)),
+                                          ("R0", 3, 0, passthrough, route(0.0)), ("B", 4, 3, none, route(1000.0))])
 
         def latency(report):
-            hold = next(entry for entry in report["comparisons"] if entry["id"] == "hold_vs_release")
-            return hold["scenes"][0]["metrics"]["pc_latency_p50_us"]
+            pacer = next(entry for entry in report["comparisons"] if entry["id"] == "pacer_vs_reflex_only")
+            return pacer["scenes"][0]["metrics"]["pc_latency_p50_us"]
 
         paired = latency(report)
         self.assertGreater(paired["interval"][0], 0.0)
@@ -257,23 +271,23 @@ class EndToEndTests(unittest.TestCase):
     def test_route_run_with_another_window_length_is_excluded(self):
         # Half a window would pair the candidate's first half against the
         # baseline's whole route.
-        smoothing_off, none, flat = 3, 0, {"latency_us": 30_000.0}
-        _, report = self.route_report([("A", 1, 0, smoothing_off, flat), ("B", 2, 3, none, flat),
-                                       ("A", 3, 0, smoothing_off, flat), ("B", 4, 3, none, flat)],
+        passthrough, none, flat = 1, 0, {"latency_us": 30_000.0}
+        _, report = self.route_report([("R0", 1, 0, passthrough, flat), ("B", 2, 3, none, flat),
+                                       ("R0", 3, 0, passthrough, flat), ("B", 4, 3, none, flat)],
                                       windows={4: 15})
         flags = next(run for run in report["runs"] if run["order"] == 4)["flags"]
         self.assertTrue(any(flag.startswith("route_window_mismatch") for flag in flags))
-        hold = next(entry for entry in report["comparisons"] if entry["id"] == "hold_vs_release")
-        self.assertEqual(hold["scenes"][0]["candidate_runs"], 1)
+        pacer = next(entry for entry in report["comparisons"] if entry["id"] == "pacer_vs_reflex_only")
+        self.assertEqual(pacer["scenes"][0]["candidate_runs"], 1)
 
     def test_route_keeps_the_final_partial_block(self):
         # A 27 s route in 5 s blocks ends in a 2 s block; the candidate's
         # jitter happens only there and must reach its metrics.
         def last_stretch(frame):
             return 10_000 + ((2_000 if frame % 2 else -2_000) if 2_500 <= frame < 2_700 else 0)
-        smoothing_off, none = 3, 0
+        passthrough, none = 1, 0
         flat, spiky = {"latency_us": 30_000.0}, {"latency_us": 30_000.0, "interval_us": last_stretch}
-        _, report = self.route_report([("A", 1, 0, smoothing_off, flat), ("B", 2, 3, none, spiky)],
+        _, report = self.route_report([("R0", 1, 0, passthrough, flat), ("B", 2, 3, none, spiky)],
                                       route_seconds=27)
         candidate = next(run for run in report["runs"] if run["order"] == 2)
         self.assertGreater(candidate["metrics"]["jitter_p99_us"], 1_000.0)
@@ -283,9 +297,9 @@ class EndToEndTests(unittest.TestCase):
         # after 27 s is not part of the route: its jitter must not count.
         def after_the_route(frame):
             return 10_000 + ((2_000 if frame % 2 else -2_000) if 2_700 <= frame < 2_800 else 0)
-        smoothing_off, none = 3, 0
+        passthrough, none = 1, 0
         flat, spiky = {"latency_us": 30_000.0}, {"latency_us": 30_000.0, "interval_us": after_the_route}
-        _, report = self.route_report([("A", 1, 0, smoothing_off, flat), ("B", 2, 3, none, spiky)],
+        _, report = self.route_report([("R0", 1, 0, passthrough, flat), ("B", 2, 3, none, spiky)],
                                       route_seconds=27, windows={2: 28})
         candidate = next(run for run in report["runs"] if run["order"] == 2)
         self.assertFalse(any(flag.startswith("route_window_mismatch") for flag in candidate["flags"]))
@@ -296,8 +310,8 @@ class EndToEndTests(unittest.TestCase):
         # empty blocks are not the same route stretch as another run's.
         def pause(frame):
             return 10_000_000 if frame == 1_000 else 10_000
-        smoothing_off = 3
-        _, report = self.route_report([("A", 1, 0, smoothing_off, {"latency_us": 30_000.0, "interval_us": pause})])
+        passthrough = 1
+        _, report = self.route_report([("R0", 1, 0, passthrough, {"latency_us": 30_000.0, "interval_us": pause})])
         self.assertTrue(any(flag.startswith("incomplete_route_coverage") for flag in report["runs"][0]["flags"]))
 
     def test_route_blocks_use_the_present_time_the_window_selects_on(self):
@@ -307,12 +321,34 @@ class EndToEndTests(unittest.TestCase):
             return 80_000 if frame == 2_999 else 10_000
         def lead(frame):
             return 75_000 if frame == 2_999 else 5_000
-        smoothing_off = 3
-        _, report = self.route_report([("A", 1, 0, smoothing_off,
+        passthrough = 1
+        _, report = self.route_report([("R0", 1, 0, passthrough,
                                         {"latency_us": 30_000.0, "interval_us": interval, "lead_us": lead})])
         run = report["runs"][0]
         self.assertEqual(run["intervals"], self.FRAMES - 1)
         self.assertGreater(run["metrics"]["long_frame_share"], 0.0)
+
+    def test_hold_off_share_needs_a_capture_that_could_record_it(self):
+        # The hold feasibility guard no longer exists: a current capture reports its hold-off share unavailable,
+        # a pre-removal capture reports what its events say (a measured zero without a demotion).
+        plan = json.loads(TEMPLATE.read_text(encoding="utf-8"))
+        plan["scenes"] = [{"id": "light", "class": "light"}]
+        plan["protocol"].update(warmup_seconds=0, min_display_intervals=1000)
+        plan["analysis"].update(bootstrap_iterations=20, block_seconds=5.0)
+        demoted = [(1, 100_000_000), (0, 200_000_000)]
+        plan["runs"] = [
+            {"scene": "light", "arm": "B", "order": 1, "capture": self.capture(1, 50, 3, 0, 21_000)},
+            {"scene": "light", "arm": "B", "order": 2,
+             "capture": self.capture(2, 50, 3, 0, 21_000, legacy_feasibility=demoted)},
+            {"scene": "light", "arm": "B", "order": 3,
+             "capture": self.capture(3, 50, 3, 0, 21_000, legacy_feasibility=[])},
+        ]
+        path = self.directory / "plan.json"
+        path.write_text(json.dumps(plan), encoding="utf-8")
+        current, with_demotion, without = (run["hold"]["hold_off_share"] for run in compare.evaluate(path)["runs"])
+        self.assertIsNone(current)
+        self.assertAlmostEqual(with_demotion, 1 / 3, places=3)
+        self.assertEqual(without, 0.0)
 
 
 class PlanTests(unittest.TestCase):
@@ -332,6 +368,8 @@ class PlanTests(unittest.TestCase):
         with self.assertRaises(compare.PlanError):
             compare.validate_plan(broken)
         broken = copy.deepcopy(plan)
+        broken["decision"]["fallback"] = {"comparison": "pacer_vs_driver_limiter", "judged": "pacer_default"}
+        compare.validate_plan(broken)  # older plans carry a fallback check and stay readable
         broken["decision"]["fallback"]["judged"] = "no_such_rule"
         with self.assertRaises(compare.PlanError):
             compare.validate_plan(broken)
@@ -347,6 +385,84 @@ class PlanTests(unittest.TestCase):
         broken["decision"]["latency_budget_us"] = 2000
         with self.assertRaises(compare.PlanError):
             compare.validate_plan(broken)
+
+    def test_an_older_plan_with_removed_settings_stays_readable(self):
+        # A plan written for the removed mechanisms (arm settings that no longer exist, a marker placement
+        # expectation, a fallback check) validates and verifies its arms: the reader keeps supporting it.
+        plan = json.loads(TEMPLATE.read_text(encoding="utf-8"))
+        plan["arms"] = {
+            "A": {"label": "release only", "settings": {"smoothing": "off", "output_rung": "auto"},
+                  "expect": {"reasons": ["smoothing_off"], "rungs": ["source_only"], "placement": "marker"}},
+            "B": {"label": "hold", "settings": {"smoothing": "on", "source_placement": "marker"},
+                  "expect": {"reasons": ["none", "infeasible"], "placement": "marker"}},
+        }
+        plan["scenes"] = [{"id": "light", "class": "light"}]
+        plan["protocol"]["run_order"] = ["A", "B"]
+        plan["comparisons"] = [{"id": "hold_vs_release", "candidate": "B", "baseline": "A"}]
+        plan["decision"] = {"primary_metrics": ["jitter_p99_us"], "latency_metric": "pc_latency_p50_us",
+                            "judge": [{"id": "hold_default", "comparison": "hold_vs_release"}],
+                            "fallback": {"comparison": "hold_vs_release", "judged": "hold_default"}}
+        plan["runs"] = [{"scene": "light", "arm": "A", "order": 1, "capture": None}]
+        compare.validate_plan(plan)
+        self.assertEqual(compare.verify_arm(plan["arms"]["A"]["expect"], {"source_only"}, {"smoothing_off"},
+                                            compare.Counter({"source_only": 5}), compare.Counter({"marker": 5})), [])
+        self.assertTrue(compare.verify_arm(plan["arms"]["B"]["expect"], {"source_only"}, {"smoothing_off"},
+                                           compare.Counter(), compare.Counter({"marker": 5})))
+
+    REMOVED_KEYS = {
+        "adaptive_cap", "adaptive_cap_percentile", "adaptive_cap_hold_room", "adaptive_smoothing", "smoothing",
+        "output_rung", "source_placement", "reflex_sleep_bypass", "marker_forward_order", "stall_inject_ms",
+        "stall_inject_period_s", "gpu_paced_cadence", "lead_coverage", "gpu_wait_interleave_s",
+        "gpu_wait_headroom_us", "unified_pacer", "gpu_start_probe",
+    }
+
+    def test_template_compares_the_pacer_and_the_two_test_modes_with_keys_of_this_build(self):
+        plan = json.loads(TEMPLATE.read_text(encoding="utf-8"))
+        compare.validate_plan(plan)
+        settings = [plan["common_settings"], *(arm["settings"] for arm in plan["arms"].values())]
+        for values in settings:
+            self.assertFalse(self.REMOVED_KEYS & set(values), values)
+        test_modes = {arm["settings"]["pacing_test_mode"] for arm in plan["arms"].values()}
+        self.assertEqual(test_modes, {"off", "reflex_only", "driver_limiter"})
+        preferences = {arm["settings"]["pacing_preference"] for arm in plan["arms"].values()
+                       if "pacing_preference" in arm["settings"]}
+        self.assertEqual(preferences, {"latency", "balanced", "smooth"})
+        self.assertLessEqual({"R0", "R0u", "D"}, set(plan["arms"]))
+        self.assertEqual(plan["arms"]["R0"]["settings"]["pacing_test_mode"], "reflex_only")
+        self.assertEqual(plan["arms"]["R0u"]["settings"]["pacing_test_mode"], "reflex_only")
+        self.assertEqual(plan["arms"]["R0u"]["settings"]["target_fps"], "0")
+        self.assertEqual(plan["arms"]["D"]["settings"]["pacing_test_mode"], "driver_limiter")
+        self.assertEqual(plan["arms"]["D"]["expect"]["placement"], "driver_limiter")
+        self.assertIn("present_route_light", {scene["id"] for scene in plan["scenes"]})
+        # Every arm of a run, comparison and the protocol exists; every comparison has runs for both arms.
+        run_arms = {(run["scene"], run["arm"]) for run in plan["runs"]}
+        for comparison in plan["comparisons"]:
+            scenes = {scene for scene, arm in run_arms if arm == comparison["candidate"]} & \
+                     {scene for scene, arm in run_arms if arm == comparison["baseline"]}
+            self.assertTrue(scenes, comparison["id"])
+
+    def test_write_ini_and_schedule_follow_the_plan(self):
+        plan = json.loads(TEMPLATE.read_text(encoding="utf-8"))
+
+        def settings(path):
+            return dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines()
+                        if line and not line.startswith((";", "[")))
+        with tempfile.TemporaryDirectory(prefix="relimiter-compare-ini-test-") as name:
+            directory = Path(name) / "ini"
+            written = compare.write_ini(plan, directory)
+            self.assertEqual(sorted(path.name for path in written),
+                             sorted(["common.ini", *(f"arm_{arm}.ini" for arm in plan["arms"])]))
+            self.assertEqual(settings(directory / "common.ini"), plan["common_settings"])
+            for arm_id, arm in plan["arms"].items():
+                self.assertEqual(settings(directory / f"arm_{arm_id}.ini"), arm["settings"])
+        # A scene's runs name its arms and their order.
+        text = compare.format_schedule(plan)
+        blocks = text.split("Scene ")[1:]
+        for scene, block in zip(plan["scenes"], blocks):
+            listed = re.findall(r"^  \d+\. (\w+) \(", block, re.M)
+            expected = [run["arm"] for run in sorted((r for r in plan["runs"] if r["scene"] == scene["id"]),
+                                                     key=lambda run: run["order"])]
+            self.assertEqual(listed, expected, scene["id"])
 
 
 if __name__ == "__main__":

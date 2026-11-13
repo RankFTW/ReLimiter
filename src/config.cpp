@@ -1027,7 +1027,7 @@ void ApplyConfig() {
         g_fg_mode.store(2, std::memory_order_relaxed);
 
     Config_ApplyPacingPipeline();
-    LOG_INFO("Reflex Sleep bypass: %s (applies while ReLimiter paces a positive cap; render handoff limit for frames not held)",
+    LOG_INFO("Reflex Sleep bypass: %s (applies while ReLimiter paces a positive cap)",
         PacingPipeline_SleepBypass()?"on":"off");
     const PacingPipelineConfig applied = PacingPipeline_GetConfig();
     LOG_INFO("Pacing pipeline: probes=%u pacing_preference=%s queue_rank=%d hold_share=%.5f pacing_test_mode=%s",

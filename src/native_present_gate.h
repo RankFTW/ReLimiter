@@ -53,8 +53,8 @@ struct NativeGateTrace {
     uint64_t settings_generation = 0;
     uint64_t swapchain_generation = 0;
     uint64_t prediction_epoch = 0;
-    // PacingPlanStatus of the native-Present executor for this call (H2, or
-    // the H3 decline when the GPU gate did not take it); 0 when none ran.
+    // PacingPlanStatus of the native-Present executor for this call (the H3
+    // decline when the GPU gate did not take it); 0 when none ran.
     uint8_t plan_status = 0;
     uint32_t present_flags = 0; // DXGI Present flags of this call (NativeGateCall)
     // The key came from another thread's PRESENT_START (cross-thread hand-off);

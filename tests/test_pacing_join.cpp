@@ -593,11 +593,11 @@ namespace
             "a repeated row gets no FG input-wait residence") && ok;
     }
 
-    // GPU start probe on a frame generation row: the keyed FG prefix Ready
-    // record is the row's readiness (its timestamp stays), the probe pair of
-    // the unkeyed observer sample joins through the Present's (swapchain
-    // generation, present sequence), and a row without a probe stays empty.
-    bool TestProbePairJoinsFrameGenerationRow()
+    // Readiness on a frame generation row: the keyed FG prefix Ready record is the
+    // row's readiness even when an unkeyed record of the same Present exists; without
+    // a keyed record the Present's (swapchain generation, present sequence) joins, and
+    // another Present's record is not joined.
+    bool TestReadyKeyedBeforeIdentityJoin()
     {
         g_joiner.Reset(kFrequency);
         const PacingFrameKey key = Key(70);
@@ -616,31 +616,37 @@ namespace
         prefix.valid = 1;
         prefix.before_gate = 1;
         g_joiner.AddReady(prefix, Ms(104));
-        PacingReadyRecord probe{};
-        probe.swapchain_generation = 7;
-        probe.present_sequence = 905;
-        probe.gpu_first_submit_qpc = Ms(92);
-        probe.gpu_start_qpc = Ms(94);
-        g_joiner.AddReady(probe, Ms(105));
+        PacingReadyRecord unkeyed{};
+        unkeyed.swapchain_generation = 7;
+        unkeyed.present_sequence = 905;
+        unkeyed.submit_qpc = Ms(92);
+        unkeyed.ready_qpc = Ms(99);
+        unkeyed.valid = 1;
+        g_joiner.AddReady(unkeyed, Ms(105));
         g_joiner.AddDisplay(Display(Ms(100) + kMillisecond / 2, Ms(116), 70), Ms(150));
         PacingJoinedRow rows[4];
         bool ok = Check(TakeRows(Ms(400), false, rows, 4) == 1, "the FG row is emitted");
         ok = Check(rows[0].has_ready && rows[0].ready.ready_qpc == Ms(103) && rows[0].ready.valid == 1 &&
             rows[0].ready.before_gate == 1,
-            "the keyed prefix record keeps the readiness timestamp") && ok;
-        ok = Check(rows[0].ready.gpu_first_submit_qpc == Ms(92) && rows[0].ready.gpu_start_qpc == Ms(94),
-            "the probe pair joins through the Present identity") && ok;
+            "the keyed prefix record is the row's readiness") && ok;
 
         g_joiner.Reset(kFrequency);
         g_joiner.AddSource(source, Ms(90));
         g_joiner.AddPresent(present, Ms(101));
-        g_joiner.AddReady(prefix, Ms(104));
-        probe.present_sequence = 906; // another Present's sample
-        g_joiner.AddReady(probe, Ms(105));
+        g_joiner.AddReady(unkeyed, Ms(105));
         g_joiner.AddDisplay(Display(Ms(100) + kMillisecond / 2, Ms(116), 70), Ms(150));
         ok = Check(TakeRows(Ms(400), false, rows, 4) == 1 && rows[0].has_ready &&
-            rows[0].ready.gpu_first_submit_qpc == 0 && rows[0].ready.gpu_start_qpc == 0,
-            "another Present's probe is not joined") && ok;
+            rows[0].ready.ready_qpc == Ms(99),
+            "without a keyed record the Present identity joins the readiness record") && ok;
+
+        g_joiner.Reset(kFrequency);
+        g_joiner.AddSource(source, Ms(90));
+        g_joiner.AddPresent(present, Ms(101));
+        unkeyed.present_sequence = 906; // another Present's record
+        g_joiner.AddReady(unkeyed, Ms(105));
+        g_joiner.AddDisplay(Display(Ms(100) + kMillisecond / 2, Ms(116), 70), Ms(150));
+        ok = Check(TakeRows(Ms(400), false, rows, 4) == 1 && !rows[0].has_ready,
+            "another Present's readiness record is not joined") && ok;
         return ok;
     }
 
@@ -770,8 +776,6 @@ namespace
         source.plan_rung = 3; // GpuQueueWait
         source.pipeline_generation = 9;
         source.fallback_reason = 0;
-        source.stall_injected_us = 50'000;
-        source.flags = PACING_SOURCE_STALL_INJECTED;
         g_joiner.AddSource(source, Ms(90));
         PacingPresentRecord present = Present(Ms(100), Ms(101), key);
         present.plan_status = 2; // Held
@@ -792,8 +796,7 @@ namespace
         ok = Check(rows[0].has_source && rows[0].source.grid_epoch == 4 &&
             rows[0].source.grid_index == 1234 && rows[0].source.epoch_reason == 3 &&
             rows[0].source.plan_output_target_qpc == Ms(110) && rows[0].source.plan_lead_us == 8'500.25 &&
-            rows[0].source.plan_rung == 3 && rows[0].source.pipeline_generation == 9 &&
-            rows[0].source.stall_injected_us == 50'000,
+            rows[0].source.plan_rung == 3 && rows[0].source.pipeline_generation == 9,
             "the joined Source record carries its plan fields") && ok;
         ok = Check(rows[0].has_present && rows[0].present.plan_status == 2 &&
             rows[0].display_source == PACING_ROW_DISPLAY_SOURCE_ETW,
@@ -895,7 +898,7 @@ int main()
     ok = TestGateReadyReflexJoins() && ok;
     ok = TestFgInputResidence() && ok;
     ok = TestGpuQueueKeyFirstJoin() && ok;
-    ok = TestProbePairJoinsFrameGenerationRow() && ok;
+    ok = TestReadyKeyedBeforeIdentityJoin() && ok;
     ok = TestRetentionEviction() && ok;
     ok = TestProducerEpochChange() && ok;
     ok = TestFinalDrainAndLimits() && ok;

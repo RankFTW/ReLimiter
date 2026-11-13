@@ -12,8 +12,9 @@ the passthrough gating decision by modeling the control flow as pure functions.
 The procedures below verify the **actual runtime behavior** in a live game session.
 
 Telemetry below refers to the pacing capture (`relimiter_pacing_*.csv`,
-Telemetry Logging). `source_flags` bits: 1 slept, 8 fixed refresh,
-16 background, 32 passthrough, 128 stall injected (2, 4 and 64 are retired).
+Telemetry Logging). `source_flags` bits: 1 slept, 2 the unified Sleep wait ran,
+8 fixed refresh, 16 background, 32 passthrough; 4, 64 and 128 are retired and
+never set by this build.
 
 ---
 
@@ -58,8 +59,8 @@ Confirm frame times ARE clamped to the limiter target as before.
 
 ## Test 3: EnfDisp_OnPresent Skips Enforcement During DMFG
 
-**Preconditions**: Same as Test 1, using a present-based enforcement path
-(DX11 game without Reflex, or DX12 game without NvAPI markers)
+**Preconditions**: Same as Test 1, using the Present-based route (a game
+without NvAPI Reflex markers)
 
 **Steps**:
 1. With DMFG active, observe frame pacing behavior
@@ -100,7 +101,7 @@ Confirm frame times ARE clamped to the limiter target as before.
 - Transition is seamless within 1-2 frames
 - No crashes, hangs, or visual artifacts during transition
 - Pacing resumes after DMFG deactivation: the grid starts a ModeChange epoch
-  (`grid_epoch` event) and the lead buckets stay warm
+  (`grid_epoch` event)
 
 ---
 
@@ -119,8 +120,8 @@ Confirm frame times ARE clamped to the limiter target as before.
 - `frame_id` increases monotonically within a `producer_epoch`
 - `source_release_qpc` values are valid and increasing
 - `fg_divisor` reflects the DMFG multiplier (3–6)
-- `source_flags` carries the passthrough bit (32) and never the slept (1)
-  or overload (64) bits for DMFG passthrough frames
+- `source_flags` carries the passthrough bit (32) and never the slept bit (1)
+  for Dynamic MFG passthrough frames
 
 ---
 
@@ -138,3 +139,27 @@ Confirm frame times ARE clamped to the limiter target as before.
 - Frame time display continues updating
 - FG status shows "FG: Dynamic"
 - No OSD elements freeze or disappear during passthrough
+
+---
+
+## Test 8: Test Modes Pass Frames Through
+
+**Preconditions**: 64-bit DirectX 12 game with NVIDIA Reflex, `developer_settings=true`,
+a foreground frame limiter target set, Telemetry Logging on
+
+**Steps**:
+1. Set `pacing_test_mode=reflex_only` (INI and restart, or `set pacing_test_mode reflex_only`
+   in the control file, `control_file=true`) and play for 30+ seconds
+2. Set `pacing_test_mode=driver_limiter` and play for 30+ seconds
+3. Set `pacing_test_mode=off`
+
+**Expected**:
+- `reflex_only`: the log line `Pacing pipeline N: mode=off placement=none ... reason=passthrough`;
+  rows carry the passthrough bit (32) and never the slept bit (1); the limiter target
+  is not applied and frame times follow the game's own Reflex
+- `driver_limiter`: where the driver's limiter can apply the log line shows
+  `placement=driver_limiter`, rows carry bit 32 and not bit 1, and the cap is held
+  by the driver, not by ReLimiter; where it cannot (idle caps, no Reflex Sleep from
+  the game) the line shows `reason=driver_limiter_unavailable` and frames pass through
+- `off`: ReLimiter paces again (rows without bit 32, bit 1 set on frames that waited)
+- Without `developer_settings` the saved `pacing_test_mode` is ignored

@@ -217,12 +217,8 @@ static void DrawPacingPipelineStatus() {
         // Collision-aware release: the release headroom (to the next frame's
         // heavy GPU work) or, without current Reflex GPU active times, the
         // release margin (to the next Present call); the newest limit, the
-        // share of leads it lowered and the late resumes measured (Output
-        // override Auto only).
-        if (pipeline.reason == PacingFallbackReason::Override) {
-            ImGui::TextDisabled("Release headroom %.2f ms, margin %.2f ms | guard off (output override)",
-                status.release_headroom_us / 1000.0, status.release_margin_us / 1000.0);
-        } else if (status.collision_behind_wait) {
+        // share of leads it lowered and the late resumes measured.
+        if (status.collision_behind_wait) {
             ImGui::TextDisabled("Release headroom %.2f ms | guard off (next frame's GPU work waits behind the gate, %u pairs)",
                 status.release_headroom_us / 1000.0, status.queue_order_pairs);
         } else if (status.collision_checked > 0 && status.collision_headroom) {

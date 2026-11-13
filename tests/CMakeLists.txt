@@ -571,14 +571,7 @@ add_executable(test_rung_feasibility
     test_rung_feasibility.cpp
     ${CMAKE_SOURCE_DIR}/src/rung_feasibility.cpp
 )
-# Governor-step and rung-feasibility event derivation of the telemetry worker.
-# The worker thread and CSV rows need live capture validation.
-add_executable(test_pacing_controller_events
-    test_pacing_controller_events.cpp
-    ${CMAKE_SOURCE_DIR}/src/pacing_controller_events.cpp
-)
-foreach(controller_target IN ITEMS test_period_governor test_rung_feasibility
-    test_pacing_controller_events)
+foreach(controller_target IN ITEMS test_period_governor test_rung_feasibility)
     set_target_properties(${controller_target} PROPERTIES
         CXX_STANDARD 17
         CXX_STANDARD_REQUIRED YES
@@ -950,7 +943,6 @@ add_test(NAME marker_stamps COMMAND test_marker_stamps)
 add_test(NAME lead_controller COMMAND test_lead_controller)
 add_test(NAME period_governor COMMAND test_period_governor)
 add_test(NAME rung_feasibility COMMAND test_rung_feasibility)
-add_test(NAME pacing_controller_events COMMAND test_pacing_controller_events)
 add_test(NAME source_stage COMMAND test_source_stage)
 add_test(NAME frame_plan COMMAND test_frame_plan)
 set_tests_properties(frame_plan PROPERTIES TIMEOUT 60)

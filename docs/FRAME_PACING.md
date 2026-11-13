@@ -2,7 +2,9 @@
 
 This document explains how ReLimiter's frame pacing works, with diagrams. It is written for technically interested users, testers and new contributors. It describes current behavior only; the [User Guide](USER_GUIDE.md) covers what a player needs to know and the [Developer Reference](DEVELOPER_REFERENCE.md) covers developer settings, Details lines and log lines.
 
-Nobody is expected to tune any of this. ReLimiter has no pacing settings besides the frame-rate caps and the Pacing preference: smoothing is always on, the output point is always chosen automatically, the Reflex Sleep is replaced by ReLimiter's own wait while it paces a cap, and the source wait runs inside the Reflex Sleep call. Every number below is a built-in value, not a setting.
+**Scope.** 64-bit DirectX 12 with NVIDIA Reflex is the supported and tested configuration; other APIs with Reflex run the same pacer untested; games without Reflex and all 32-bit games get a plain frame-rate cap. The Present route that caps those games (see [Who Paces](#who-paces)) is retained and covered by unit tests; it has not been validated in a game, and nothing validates DirectX 11, Vulkan or 32-bit pacing.
+
+Nobody is expected to tune any of this. ReLimiter has no pacing settings besides the frame-rate caps and the Pacing preference: the output point is always chosen automatically and the source wait runs inside the Reflex Sleep call. Every number below is a built-in value, not a setting.
 
 Each section ends with the source files it describes. Diagrams that use numbers say so; those numbers only illustrate the shape of the timing.
 
@@ -11,14 +13,17 @@ Each section ends with the source files it describes. Diagrams that use numbers 
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [The Cadence Grid](#the-cadence-grid)
-3. [Frame Plans and the Lead](#frame-plans-and-the-lead)
-4. [Where the Source Wait Happens](#where-the-source-wait-happens)
-5. [Output Points](#output-points)
-6. [Protecting Pacing Under Load](#protecting-pacing-under-load)
-7. [Frame Generation and Dynamic MFG](#frame-generation-and-dynamic-mfg)
-8. [Measurement and Feedback](#measurement-and-feedback)
-9. [Glossary](#glossary)
+2. [Who Paces](#who-paces)
+3. [The Unified Pacer](#the-unified-pacer)
+4. [The Cadence Grid](#the-cadence-grid)
+5. [Frame Plans and the Lead](#frame-plans-and-the-lead)
+6. [Where the Source Wait Happens](#where-the-source-wait-happens)
+7. [Output Points](#output-points)
+8. [Protecting Pacing Under Load](#protecting-pacing-under-load)
+9. [Pacing Preference](#pacing-preference)
+10. [Frame Generation and Dynamic MFG](#frame-generation-and-dynamic-mfg)
+11. [Measurement and Feedback](#measurement-and-feedback)
+12. [Glossary](#glossary)
 
 ---
 
@@ -28,10 +33,10 @@ A game does not finish its frames at an even rate. Each frame passes through sim
 
 ReLimiter uses two stages that share one clock, the cadence grid:
 
-1. **Release the game on a cadence (the source wait).** Every frame has an output target `T`. ReLimiter releases the game at `S = T − L`, where the *lead* `L` is how long recent frames needed from release to being finished, with a little extra. Most frames are then finished a little before `T`.
+1. **Release the game on a cadence (the source wait).** ReLimiter releases the game at a start time `S`. Every frame has an output target `T = S + L`, where the *lead* `L` is how long recent frames needed from release to being finished, with a little extra. Most frames are then finished a little before `T`. The unified pacer chooses `S` first, from its interval and start law, and derives `T` from the release; the Present route chooses `T` first from the cadence grid and releases at `S = T − L`.
 2. **Hold the finished frame to its target (the output point).** A frame that is ready early waits until `T` before it passes on, so the display sees frames at an even spacing. A frame that is not ready by `T` is never held.
 
-The small wait at the output point is the latency cost of an even cadence. The grid supplies the targets for both stages, so release and output always agree on the same row of times.
+The small wait at the output point is the latency cost of an even cadence. The grid holds the row of targets, so release and output always agree on the same times.
 
 ```mermaid
 flowchart LR
@@ -49,11 +54,11 @@ flowchart LR
     class SW,OUT acts
 ```
 
-The two highlighted steps are where ReLimiter acts. Where exactly the output point sits depends on the output: a CPU hold at the game's Present marker, a GPU wait on the present queue or a GPU wait in front of the frame-generation input (see [Output Points](#output-points)). The source wait happens either in the game's frame-start marker call or earlier, inside the Reflex Sleep call (see [Where the Source Wait Happens](#where-the-source-wait-happens)).
+The two highlighted steps are where ReLimiter acts. Where exactly the output point sits depends on the output: a CPU hold at the game's Present marker, a GPU wait on the present queue or a GPU wait in front of the frame-generation input (see [Output Points](#output-points)). The source wait happens inside the game's Reflex Sleep call, in its frame-start marker call or, without Reflex markers, at the Present call (see [Where the Source Wait Happens](#where-the-source-wait-happens)).
 
 Three rules hold everywhere:
 
-- **Late frames are never held.** A frame that misses its target passes on at once; the cadence is restarted when it is clearly late.
+- **Late frames are never held.** A frame that misses its target passes on at once.
 - **No catch-up burst.** After a late frame the next targets are not squeezed together to make up the time.
 - **No mode switching on thresholds.** ReLimiter picks the best output point the game supports and keeps it.
 
@@ -61,20 +66,93 @@ The pieces that decide the details:
 
 | Piece | Role | Section |
 |-------|------|---------|
+| Unified pacer | Places each release: the interval, the start target, the hard limit, the hold credit | [The Unified Pacer](#the-unified-pacer) |
 | Cadence grid | The row of targets `T(n)`, restarted in epochs | [The Cadence Grid](#the-cadence-grid) |
 | Lead controller | Learns `L` from measured frames | [Frame Plans and the Lead](#frame-plans-and-the-lead) |
-| Source stage | Plans each frame, waits until `S`, releases the game | [Frame Plans and the Lead](#frame-plans-and-the-lead) |
-| Pipeline resolver | Chooses the output point and where the source waits | [Output Points](#output-points) |
+| Source stage | Plans each frame, waits until `S` on the Present route, releases the game | [Frame Plans and the Lead](#frame-plans-and-the-lead) |
+| Pipeline resolver | Chooses who paces, the output point and where the source waits | [Who Paces](#who-paces), [Output Points](#output-points) |
 | Output executors | Hold or pass on each finished frame | [Output Points](#output-points) |
 | Protections | Collision-aware release | [Protecting Pacing Under Load](#protecting-pacing-under-load) |
 
-Source: `src/scheduler.cpp` (`OnMarker`, `RunPlanned`), `src/source_stage.h`, `src/cadence_grid.h`, `src/pacing_resolver.h`.
+Source: `src/scheduler.cpp` (`OnMarker`, `RunPlanned`), `src/source_stage.h`, `src/unified_pacer.h`, `src/cadence_grid.h`, `src/pacing_resolver.h`.
+
+---
+
+## Who Paces
+
+One owner paces each frame. It is resolved from the game's route, the process architecture and the developer test mode:
+
+| Situation | Owner | Source wait | Output |
+|-----------|-------|-------------|--------|
+| 64-bit game that sends Reflex markers (NvAPI or Streamline PCL) | The unified pacer | In the game's Reflex Sleep call; in the frame-start marker call when the game does not call the Reflex Sleep | Resolved automatically: `gpu_queue_wait`, `fg_input_wait`, `marker_hold` or `source_only` ([Output Points](#output-points)) |
+| Game without Reflex markers, and every 32-bit game | The Present route | At the Present call | `source_only`: nothing is held |
+| Dynamic MFG; no cap on a VRR display of a 32-bit game, where cap 0 means uncapped; Background FPS 0 while alt-tabbed; no presenting swapchain; test mode `reflex_only` | Pass-through: the game's own Reflex runs | None | None |
+| Test mode `driver_limiter` (developer only) | The Reflex driver limiter | The driver paces, ReLimiter plans nothing | `source_only` |
+
+Background FPS, FG-Off Cap and OLED Care are paced by the same owner with the idle interval, a lead of 0 and no output hold.
+
+**Supported configuration.** 64-bit DirectX 12 with NVIDIA Reflex is the supported and tested configuration. Another API that sends Reflex markers runs the same pacer without the GPU queue measurement (its GPU term comes from the Reflex reports, see [The Unified Pacer](#the-unified-pacer)), untested.
+
+**The Present route** is the generic fallback: the cap is held by a source wait at the Present call, on a VRR or fixed-refresh display, with a fixed lead of 150 µs and nothing held after it. It is retained and covered by unit tests of the source stage, the cadence grid and the resolver; it has not been validated in a game. It has two particulars by architecture:
+
+- **64-bit:** with the limiter off on a VRR display the VRR cap is the cap; there is no LFC multiple, and a late output does not restart the cadence.
+- **32-bit:** cap 0 on a VRR display means uncapped; LFC applies and a late output restarts the cadence.
+
+A marker route cannot occur in a 32-bit process: such a game resolves to the Present route.
+
+**Test modes** (`pacing_test_mode`, developer only, see the Developer Reference) exist for comparison captures: `reflex_only` passes every frame through and `driver_limiter` hands the cap to the Reflex driver limiter where it can apply.
+
+Source: `src/pacing_resolver.cpp` (`PacingPipeline_Resolve`, `PacingPipeline_ClampConfig`, `MarkerRoutePlacement`), `src/scheduler.cpp` (`OnMarker`), `src/enforcement_dispatcher.cpp`.
+
+---
+
+## The Unified Pacer
+
+The unified pacer places the game's release itself and derives the output target from it. It paces 64-bit games with Reflex markers; every quantity below belongs to one real frame `n`. The start target is written `T_start(n)` to keep it apart from the output target `T(n)`.
+
+**The interval.** `I(n)` is the largest of four terms, each multiplied by the frame generation factor `N` (the raw factor, never the ramped divisor):
+
+| Term | Meaning |
+|------|---------|
+| `I_cap` | `1 / cap`. With the limiter off on a VRR display it is the display's VRR cap, `floor(Hz − Hz²/3600)`. Under an idle cap (Background FPS, FG-Off Cap, OLED Care) the idle interval replaces it. |
+| `I_vrr` | The same VRR cap as a floor on the interval; VRR displays only, and left out under an idle cap. |
+| `I_game` | The game's own Sleep-mode interval; absent when the game sets none. Kept under an idle cap. |
+| `I_gpu` | The interval the GPU needs to finish frames; absent until it is known and under an idle cap. In DirectX 12 the queue law computes it from what the game's presenting queue did each frame (the per-frame records of the GPU queue probe). Where fewer than 12 of the newest 16 records are valid or the newest valid one is stale, and in other APIs, the report-based rule decides: the GPU's service time from the Reflex reports plus a correction that steers the queue wait toward 2 ms. |
+
+`I_disp`, the largest of `I_cap` (or the idle interval), `I_vrr` and `I_game` and never `I_gpu`, is the interval the display sees. The output spacing floor uses it, so a GPU-bound interval does not stretch the displayed cadence.
+
+**The start target.** `T_start(n) = O(n − 1) + I(n)`, where the origin `O(n) = max(T_start(n), R(n))` and `R(n)` is the release actually committed. A late release is therefore never caught up: the next target builds on the later of the target and the release. A new lifecycle, a gap of more than 250 ms between frames or a change between idle and normal caps starts a new origin.
+
+**The start wait.** The game's Reflex Sleep call reserves the start, waits to `T_start(n)` and commits the release `R(n)`. The marker hook then finds the committed release and plans the frame. Where the Sleep did not reserve (the game does not call the Reflex Sleep, or SIMULATION_START is not the enforcement marker) the marker hook plans the start itself and waits in the marker call. See [Where the Source Wait Happens](#where-the-source-wait-happens).
+
+**The hard limit.** After the start wait reached `T_start(n)` the pacer counts the earlier frames the GPU has not finished. With fewer than four there is no wait. With four or more and fresh completion evidence the release waits until fewer than four are unfinished, at most until one interval after the later of `T_start(n)` and the moment the limit was evaluated, and is then released anyway. The limit is inactive when no completion has been seen yet or the newest one is older than two intervals: missing completions never stall a frame.
+
+**The output target.** `T(n) = B(n) + L`. `B(n)` is the release `R(n)`; with frame generation factor `N` above 1 it is the previous release plus one `N`-th of the release spacing. The grid follows the start: it never judges a source or an output as late and never snaps, and an epoch starts only for a new lifecycle, a mode change or a change of the interval.
+
+**The hold credit.** A hold delays the game's next GPU work, so it may only spend the GPU's spare time. The credit is refilled by the spare time between the display-side interval and the GPU's work per frame (from the Reflex reports; under the queue law, from the probe's records), and each hold spends its actual length. The credit is bounded between one display-side interval of debt and 32 intervals banked. A debt is repaid by releasing the next frames' targets earlier by the debt, which shortens or removes their holds. While no reports arrive the credit is 0. With no reachable cap the display-side interval is shorter than the GPU's own frame time, so the credit never fills and nothing is held; the Pacing preference *Smoother* adds a small refill ([Pacing Preference](#pacing-preference)).
+
+**The driver's Sleep.** While the unified pacer paces, ReLimiter sets the Sleep mode the driver sees to low latency off with interval 0 (with Dynamic MFG the game's own), so the driver's Sleep that follows the start wait adds no wait of its own. A self-check on that Sleep's duration reports when the driver still paces (`unified_driver_pacing`, `up_flags` bit 2048). See [Reflex Sleep bypass](#reflex-sleep-bypass).
+
+```mermaid
+flowchart TD
+    A["Game calls the Reflex Sleep for frame n"] --> B["I(n) = max of the cap, VRR, game and GPU terms"]
+    B --> C["T_start(n) = O(n−1) + I(n)"]
+    C --> D["Start wait until T_start(n)"]
+    D --> E{"Four or more earlier frames unfinished, completions fresh?"}
+    E -->|yes| F["Hard limit: wait for fewer than four, at most one interval"]
+    E -->|no| G["Release at R(n)"]
+    F --> G
+    G --> H["O(n) = max(T_start(n), R(n))"]
+    G --> I["Output target T(n) = B(n) + L, B = R(n) or its frame generation share"]
+```
+
+Source: `src/unified_pacer.h`, `src/unified_pacer.cpp`, `src/unified_queue_law.h`, `src/source_stage.cpp` (`RunUnifiedFrame`), `src/cadence_grid.cpp` (`PlanAt`), `src/scheduler.cpp` (`BuildUnifiedTerms`, `Scheduler_UnifiedReserve`), `src/nvapi_hooks.cpp` (`Hook_Sleep`, `UnifiedSleepStart`).
 
 ---
 
 ## The Cadence Grid
 
-There is one grid per swapchain, owned by the scheduler. Every real frame gets the next grid index `n` and an output target `T(n)`. Every stage takes its target from the grid: the source stage plans from it and the output executors re-resolve `T(n)` from the grid's newest published snapshot, so a restart moves targets of frames that have not been output yet.
+There is one grid per swapchain, owned by the scheduler. Every real frame gets the next grid index `n` and an output target `T(n)`. Every stage takes its target from the grid: the source stage plans from it and the output executors re-resolve `T(n)` from the grid's newest published snapshot, so a restart moves targets of frames that have not been output yet. The unified pacer plans the grid from the release it committed (`T(n) = R(n) + L`, see [The Unified Pacer](#the-unified-pacer)); the Present route plans the release from the grid (`S = T − L`). The rules below say which route they belong to.
 
 The grid is a row of linear segments:
 
@@ -90,10 +168,10 @@ A new segment starts whenever the interval changes or the cadence restarts. The 
 
 | Contribution | Effect on `I` |
 |--------------|---------------|
-| FPS cap | `1 / cap`. This is the interval before anything else. |
+| FPS cap | `1 / cap`. This is the interval before anything else; the unified pacer then takes the largest of its terms ([The Unified Pacer](#the-unified-pacer)). |
 | Frame generation | Multiplied by the FG divisor (2× FG: `I` is two output intervals, because the cap is the *output* frame rate and the grid paces *real* frames). |
-| LFC | While the display gets fewer frames per second than its VRR range, `I` is rounded up so that each displayed frame lasts a whole number of VRR ceiling intervals: a whole multiple of `D` ceiling intervals, `D` the FG divisor. It is judged on the displayed interval `I / D`, so frame generation's real-frame rate below the range does not count. LFC turns on after 10 consecutive frames below the range and off after 10 consecutive frames at or above it. |
-| Fixed refresh | On a fixed-refresh display the grid snaps `I` to `k` whole refreshes when it is within 2% of that, and snaps targets to vblank edges. |
+| LFC | Present route of a 32-bit game only. While the display gets fewer frames per second than its VRR range, `I` is rounded up so that each displayed frame lasts a whole number of VRR ceiling intervals: a whole multiple of `D` ceiling intervals, `D` the FG divisor. It is judged on the displayed interval `I / D`, so frame generation's real-frame rate below the range does not count. LFC turns on after 10 consecutive frames below the range and off after 10 consecutive frames at or above it. The unified pacer and the 64-bit Present route have no LFC multiple. |
+| Fixed refresh | On the Present route of a fixed-refresh display the grid snaps `I` to `k` whole refreshes when it is within 2% of that, and snaps targets to vblank edges. |
 | Idle caps | Background FPS, FG-Off Cap and OLED Care run the grid in *idle* mode: lead 0 and no output hold. |
 
 ### Epochs
@@ -105,8 +183,8 @@ An *epoch* is a stretch of the grid with one phase. A restart starts a new epoch
 | `Lifecycle` | First plan of a lifecycle: graphics API change, full swapchain teardown, producer change or route change | `T(n) = now + L` |
 | `ModeChange` | Timing mode changed between off, VRR, fixed and idle (for example focus lost or regained) | `T(n) = now + L` |
 | `PeriodChange` | Cap, VRR ceiling, LFC multiple, raw FG divisor or idle cap changed `I` | Continues from the previous target: `T(n) = T(n−1) + I_new` |
-| `SourceLate` | The game reached its source wait later than `S` plus the late tolerance plus its slack | `T(n) = now + L`, released at once |
-| `OutputLate` | A frame's output came later than `T(n)` plus the late tolerance | `T(n+1) = o + I`, `o` being that output time |
+| `SourceLate` | Present route: the game reached its source wait later than `S` plus the late tolerance plus its slack | `T(n) = now + L`, released at once |
+| `OutputLate` | Present route of a 32-bit game: a frame's output came later than `T(n)` plus the late tolerance (the unified pacer and the 64-bit Present route do not judge outputs) | `T(n+1) = o + I`, `o` being that output time |
 
 Interval changes that are not one of these (the 50 ms FG divisor ramp) are *silent rebases*: the grid continues from `T(n−1) + I_new` and no epoch is counted.
 
@@ -114,15 +192,15 @@ The **Grid epoch** counter in Details counts epochs. An occasional increase is n
 
 ### Late tolerance and slack
 
-The late tolerance is `tol = max(I / 4, 500 µs)`.
+The late tolerance is `tol = max(I / 4, 500 µs)`. The source and output rules below judge frames on the Present route; the unified pacer judges nothing as late and uses `tol` only inside the output spacing floor.
 
 - **Output late.** A finished frame whose output time `o` is later than `T(n) + tol` starts an `OutputLate` epoch. Output evidence that arrives for a frame older than the epoch's base is converted to the equivalent output of the base frame first (`o + (b − n) · I`), so a pipelined game whose next source was already planned does not get a short display interval.
-- **Source late.** A source that arrives after `S` is released at once on the same grid when it is within `tol` plus its *slack*. The slack is `L` minus the median measured `X` of the rung (never more than `L`); a source that still makes `T` does not restart the cadence. Later than that, the grid restarts (`SourceLate`). The `S` it is judged against uses the shorter of this frame's lead and the previous frame's: the game's wait before the marker aimed at the previous frame's lead, and ReLimiter switches the lead at once when the output changes (another output's lead, a restarted lead). Judged against the new lead, the first frame after the FG input wait took over restarted the cadence and moved the targets 4.4–10.5 ms later (CONTROL Resonant, FG 2× at 130, lead 17.15 → 21.65 ms).
+- **Source late.** A source that arrives after `S` is released at once on the same grid when it is within `tol` plus its *slack*. The slack is `L` minus the median measured `X` of the rung (never more than `L`); a source that still makes `T` does not restart the cadence. Later than that, the grid restarts (`SourceLate`). The `S` it is judged against uses the shorter of this frame's lead and the previous frame's: the game's wait before the marker aimed at the previous frame's lead, and ReLimiter switches the lead at once when the output changes (another output's lead, a restarted lead).
 - **Idle mode** ignores output evidence: its lead is 0 and nothing is held, so late evidence would only stretch the cap.
 
 ### No catch-up burst
 
-An output executor holds frame `n` until `max(T(n), o(n−1) + I − slack)` with `slack = tol / 2` and `o(n−1)` the recorded output time of the previous frame (no floor when it is not known). A frame that came out late therefore spaces the next one a full interval after it, minus half a tolerance. Lateness beyond that half tolerance shrinks by half a tolerance per frame instead of pushing the whole cadence later or releasing a burst of short frames.
+An output executor holds frame `n` until `max(T(n), o(n−1) + I − slack)` with `slack = tol / 2` and `o(n−1)` the recorded output time of the previous frame (no floor when it is not known); under the unified pacer `I` here is the display-side interval `I_disp`. A frame that came out late therefore spaces the next one a full interval after it, minus half a tolerance. Lateness beyond that half tolerance shrinks by half a tolerance per frame instead of pushing the whole cadence later or releasing a burst of short frames.
 
 On the GPU waits the recorded output is the target or the time the frame was decided late, taken on the CPU when the wait is queued. A real frame that reaches the FG input wait after its Signal passes when its GPU work finishes, later than that record, so the floor alone does not see it. DLSS Frame Generation shows a generated frame a fixed time after the previous real frame and the real frame when it is ready, so a real frame's timing error lands mostly on one displayed interval. **FG late-frame spacing** therefore raises such a frame's record to its GPU readiness when it is read back, resolves the next real frame's floor again just before its Signal, and takes the floor's slack from the displayed interval `T_out = I / D` (`slack = max(T_out / 4, 500 µs) / 2`, `D` the frame's FG divisor). A real frame then enters frame generation no sooner than `I − slack` after the previous one, so each displayed interval is shortened by at most about that slack, as without frame generation. The target only moves later, within the GPU wait horizon; a move beyond `tol` restarts the cadence like any late output.
 
@@ -130,7 +208,7 @@ A floor move is never made while the game's render thread is still inside the fr
 
 ### Illustration
 
-The chart below uses invented round numbers (`I = 16 ms`, `L = 6 ms`, times in ms on an arbitrary axis) to show the shape of a restart. Frames 1 and 2 are released at `S = T − L`, finish early and wait to their target. The game reaches the marker of frame 3 more than a tolerance and its slack after `S`, so the cadence restarts: the target becomes `now + L`, the frame is released at once and held to the new target. Frame 4 follows one interval later; no frame is shortened to catch up.
+The chart below uses invented round numbers (`I = 16 ms`, `L = 6 ms`, times in ms on an arbitrary axis) to show the shape of a restart on the Present route (which uses a fixed 150 µs lead; the longer one only makes the shape visible). Frames 1 and 2 are released at `S = T − L`, finish early and wait to their target. The game reaches the marker of frame 3 more than a tolerance and its slack after `S`, so the cadence restarts: the target becomes `now + L`, the frame is released at once and held to the new target. Frame 4 follows one interval later; no frame is shortened to catch up.
 
 ```mermaid
 gantt
@@ -156,7 +234,7 @@ gantt
     Target T4 is T3 plus I :milestone, m4, 1072, 0ms
 ```
 
-How the grid plans one frame:
+How the Present route plans one frame:
 
 ```mermaid
 flowchart TD
@@ -178,7 +256,7 @@ flowchart TD
     N -->|no| P["Wait until S = T(n) − L"]
 ```
 
-Source: `src/cadence_grid.h`, `src/cadence_grid.cpp` (`PlanNext`, `CadenceGrid_LateToleranceTicks`, `CadenceGrid_ResolveOutputTarget`), `src/pacing_core_types.h` (`PacingEpochReason`), `src/scheduler.cpp` (`VrrCapIntervalUs`, `ApplyLfc`), `src/pacing_resolver.h` (`PacingPipeline_VrrTargetFps`, `PacingPipeline_VrrIntervalUs`), `src/period_governor.cpp` (`PeriodGovernor_LfcIntervalUs`, `LfcHysteresis`), `src/fg_divisor.cpp` (50 ms ramp), `src/source_stage.cpp` (slack).
+Source: `src/cadence_grid.h`, `src/cadence_grid.cpp` (`PlanNext`, `PlanAt`, `CadenceGrid_LateToleranceTicks`, `CadenceGrid_ResolveOutputTarget`), `src/pacing_core_types.h` (`PacingEpochReason`), `src/scheduler.cpp` (`VrrCapIntervalUs`, `ApplyLfc`), `src/pacing_resolver.h` (`PacingPipeline_VrrTargetFps`, `PacingPipeline_VrrIntervalUs`), `src/period_governor.cpp` (`PeriodGovernor_LfcIntervalUs`, `LfcHysteresis`), `src/fg_divisor.cpp` (50 ms ramp), `src/source_stage.cpp` (slack).
 
 ---
 
@@ -186,13 +264,15 @@ Source: `src/cadence_grid.h`, `src/cadence_grid.cpp` (`PlanNext`, `CadenceGrid_L
 
 ### The frame plan
 
-When the game reaches its enforcement marker, the source stage asks the grid for the next index, which gives the frame's target `T`, and computes the source wake time:
+When the game reaches its enforcement marker, the source stage plans the frame. On the Present route it asks the grid for the next index, which gives the frame's target `T`, and computes the source wake time:
 
 ```
 S = T − L
 ```
 
-It then publishes a *frame plan* (index, epoch, target, wake time, lead, interval, FG divisor, output point) under the frame's exact key, before it starts waiting. The output executors later look the plan up by that same key and claim it exactly once; a plan that belongs to another output point is never substituted. A source wait is clamped to two grid intervals so a bad target cannot hang the game.
+Under the unified pacer the release is already decided (the Reflex Sleep call waited for its start target, or the marker plans the start itself) and the target follows from it, `T = R + L` ([The Unified Pacer](#the-unified-pacer)).
+
+The stage publishes a *frame plan* (index, epoch, target, wake time, lead, interval, FG divisor, output point) under the frame's exact key; on the Present route that happens before the source wait starts. The output executors later look the plan up by that same key and claim it exactly once; a plan that belongs to another output point is never substituted. A source wait in the marker call or at the Present call is clamped to two grid intervals so a bad target cannot hang the game.
 
 ### How the lead is learned
 
@@ -220,7 +300,7 @@ The lead for the next frame comes from the bucket's samples:
 
 **Games that wait for the next release.** Some engines finish frame `n`'s Present only after ReLimiter has released frame `n + 1`. ReLimiter's waits for later frames are not that game's time, so the late-output check, and the slack evidence judge such a frame without them. The lead keeps the measured `X`, because such a frame cannot be ready before the release it waits for. In a pipelined engine the next frame's wait overlaps the previous frame's render submission, so on the GPU waits this credit also covers lateness from the GPU's own throughput: in Gears of War: E-Day with FG 2× at 120 FPS it was 11–12.5 ms on most frames, and of the 12–28% of frames ready after their targets 0.2–1.4% counted, with the GPU running back to back. Counting those frames (crediting only the GPU's idle inside the frame) changed no display measure in Gears or CONTROL Resonant beyond the run-to-run spread and only lengthened the interval about 3%, so the full credit stays.
 
-### One planned frame
+### One planned frame (Present route)
 
 ```mermaid
 sequenceDiagram
@@ -248,6 +328,8 @@ sequenceDiagram
     Hook->>Grid: observe output, restart if o is later than T plus tol
 ```
 
+Under the unified pacer the first steps run the other way round: the Reflex Sleep call waits for the start target first and the plan's target is the release plus the lead. The output executors and the lead measurement are the same.
+
 Source: `src/source_stage.h`, `src/source_stage.cpp` (`RunPlannedFrame`, `DrainStageEvents`), `src/frame_plan.h`, `src/lead_controller.h`, `src/lead_controller.cpp` (`NextLeadUs`, `SampleUs`, `QueueUs`, `EmitSample`), `src/pacing_resolver.cpp` (lead parameters), `src/pacing_core_types.h` (`PacingFramePlan`).
 
 ---
@@ -256,17 +338,20 @@ Source: `src/source_stage.h`, `src/source_stage.cpp` (`RunPlannedFrame`, `DrainS
 
 The source wait can sit in two places on marker routes (games with NVIDIA Reflex markers or Streamline PCL markers): inside the Reflex Sleep call or in the marker call. Present-based pacing, which has no markers, waits at the Present call.
 
-**Marker placement.** The wait runs inside the game's call for the *enforcement marker*, normally SIMULATION_START. The game's thread is blocked in that call until `S`. If a game never sends SIMULATION_START (no admitted one after 200 direct markers while RENDERSUBMIT_START is seen), the enforcement marker falls back to RENDERSUBMIT_START, and returns to SIMULATION_START after 8 consecutive direct SIMULATION_START markers.
+**Marker placement.** The wait runs inside the game's call for the *enforcement marker*, normally SIMULATION_START. The game's thread is blocked in that call until `S` (under the unified pacer, until its start target). If a game never sends SIMULATION_START (no admitted one after 200 direct markers while RENDERSUBMIT_START is seen), the enforcement marker falls back to RENDERSUBMIT_START, and returns to SIMULATION_START after 8 consecutive direct SIMULATION_START markers.
 
-**Reflex Sleep wait.** When the game has called the Reflex Sleep within the last second, ReLimiter does the source wait inside that Sleep call, before the game reads input for the next frame; the Details line reads `Placement: unified`. The unified pacer's start law sets when the Sleep returns: the previous release plus the interval, never earlier than the display, the game's own Sleep-mode interval and the GPU's frame time allow, with a bound on the frames the GPU has not finished (see the Developer Reference, *Unified pacer*). Idle caps use the same wait. A game that does not call the Reflex Sleep, and NVIDIA Smooth Motion, wait in the marker call instead.
+**Reflex Sleep wait.** When the game has called the Reflex Sleep within the last second, ReLimiter does the source wait inside that Sleep call, before the game reads input for the next frame; the Details line reads `Placement: unified`. The unified pacer's start law sets when the Sleep returns: the previous release plus the interval, never earlier than the display, the game's own Sleep-mode interval and the GPU's frame time allow, with a bound on the frames the GPU has not finished ([The Unified Pacer](#the-unified-pacer)). Idle caps use the same wait. A game that does not call the Reflex Sleep, and NVIDIA Smooth Motion, wait in the marker call instead.
 
 ### Reflex Sleep bypass
 
-ReLimiter's own wait replaces the driver's Sleep. After ReLimiter's wait the Sleep hook returns without calling the driver; Reflex markers and the game's Reflex mode still reach the driver. The reason is a single pacer: the driver's Sleep otherwise adds a wait of its own after ReLimiter's, and the two would then pace the game independently.
+ReLimiter's wait and the driver's Sleep must not both pace the game. Two parts keep it to one pacer:
 
-The driver's Sleep still runs when ReLimiter is not pacing the source: with no FPS cap, in Dynamic MFG passthrough, without a presenting swapchain, or in the developer test modes (`pacing_test_mode`, see the Developer Reference), where the game's own Sleep runs and ReLimiter either plans nothing or leaves the pacing to the Reflex driver limiter. NVIDIA Smooth Motion skips the Reflex Sleep entirely.
+- **The unified start wait is followed by the driver's Sleep.** The Sleep hook waits to the start target and then forwards to the driver's Sleep. The Sleep mode the driver sees is low latency off with interval 0 (the game's own with Dynamic MFG), so that Sleep adds no wait of its own; Reflex markers and the game's Reflex mode reach the driver as usual. A self-check on the Sleep's duration shows when the driver still paces.
+- **Any other Sleep is bypassed while ReLimiter paces a positive cap:** it returns without calling the driver. These are the first Sleep after start or after a second without one, every Sleep when the frame-start marker is not SIMULATION_START (the plan then runs at the marker), and a Sleep while the placement is `present`. Without the bypass the driver's Sleep would add a wait after ReLimiter's own.
 
-While the driver's Sleep runs (ReLimiter is not pacing, or a developer test mode) the Sleep hook also times it for the presenting device (`driver_sleep_start_qpc` and `driver_sleep_end_qpc` of the pacing rows).
+The driver's Sleep always runs when ReLimiter is not pacing the source: with no FPS cap, in Dynamic MFG passthrough, without a presenting swapchain, or in the developer test modes (`pacing_test_mode`, see the Developer Reference), where the game's own Sleep runs and ReLimiter either plans nothing or leaves the pacing to the Reflex driver limiter. NVIDIA Smooth Motion skips the Reflex Sleep entirely.
+
+Whenever the driver's Sleep runs, the Sleep hook also times it for the presenting device (`driver_sleep_start_qpc` and `driver_sleep_end_qpc` of the pacing rows).
 
 ```mermaid
 sequenceDiagram
@@ -276,9 +361,13 @@ sequenceDiagram
     participant Driver as Driver Sleep
     Game->>Hook: Sleep for frame n
     Hook->>Sched: record the Sleep
-    Hook->>Hook: wait until the frame's start target
-    Hook->>Sched: report the end of the wait
-    alt bypass on
+    alt unified start wait
+        Hook->>Hook: wait until the frame's start target
+        Hook->>Sched: report the end of the wait
+        Hook->>Driver: Sleep, which adds no wait
+        Driver-->>Hook: returns
+        Hook-->>Game: return
+    else bypass on
         Hook-->>Game: return at once
     else driver Sleep runs
         Hook->>Driver: Sleep
@@ -287,7 +376,7 @@ sequenceDiagram
     end
 ```
 
-Source: `src/unified_pacer.h`, `src/unified_pacer.cpp`, `src/scheduler.cpp` (`DriverSleepRuns`), `src/nvapi_hooks.cpp` (`Hook_Sleep`, enforcement marker fallback), `src/nvapi_hooks.h` (`NvAPI_ShouldBypassSleep`), `src/pacing_resolver.cpp` (`MarkerRoutePlacement`).
+Source: `src/unified_pacer.h`, `src/unified_pacer.cpp`, `src/scheduler.cpp` (`DriverSleepRuns`), `src/nvapi_hooks.cpp` (`Hook_Sleep`, `UnifiedSleepSelfCheck`, enforcement marker fallback), `src/nvapi_hooks.h` (`NvAPI_ShouldBypassSleep`), `src/pacing_resolver.cpp` (`MarkerRoutePlacement`).
 
 ---
 
@@ -333,17 +422,17 @@ The GPU queue wait requirements are checked in this order, and the first one tha
 
 The full reason list is in the Developer Reference ([Fallback Reasons](DEVELOPER_REFERENCE.md#fallback-reasons)).
 
-Source: `src/pacing_resolver.cpp` (`PacingPipeline_Resolve`, `AutoRung`, `GpuQueueBlocker`, `ApplyHoldFeasibility`), `src/presentation_gate.h`, `src/presentation_gate.cpp` (CPU holds), `src/gpu_present_gate.h`, `src/gpu_present_gate_d3d12.cpp` (`Decide`, `Enqueue`, `GpuPresent_Execute`, `GpuPresent_BeginFgInput`), `src/gpu_present_gate.cpp` (`GpuPresent_HorizonTicks`).
+Source: `src/pacing_resolver.cpp` (`PacingPipeline_Resolve`, `AutoRung`, `GpuQueueBlocker`), `src/presentation_gate.h`, `src/presentation_gate.cpp` (CPU holds), `src/gpu_present_gate.h`, `src/gpu_present_gate_d3d12.cpp` (`Decide`, `Enqueue`, `GpuPresent_Execute`, `GpuPresent_BeginFgInput`), `src/gpu_present_gate.cpp` (`GpuPresent_HorizonTicks`).
 
 ---
 
 ## Protecting Pacing Under Load
 
-A hold only helps while the game can keep up with its cadence. The mechanisms below keep a held or planned frame from making things worse.
+A hold only helps while the game can keep up with its cadence. The mechanisms below keep a held or planned frame from making things worse; the unified pacer's hard limit and hold credit ([The Unified Pacer](#the-unified-pacer)) bound its start and its holds.
 
 ### Late frames are never held
 
-Every executor checks the clock against `T` before it holds anything. A frame that is already late passes on unchanged, the cadence restarts when the lateness exceeds the tolerance, and the output spacing floor keeps the frames after it from being squeezed (see [No catch-up burst](#no-catch-up-burst)). A hold that is implausibly long, or a GPU wait target beyond the horizon, is declined rather than performed.
+Every executor checks the clock against `T` before it holds anything. A frame that is already late passes on unchanged, the output spacing floor keeps the frames after it from being squeezed (see [No catch-up burst](#no-catch-up-burst)), and the grid restarts only where its rules say so ([Epochs](#epochs)). A hold that is implausibly long, or a GPU wait target beyond the horizon, is declined rather than performed.
 
 ### Collision-aware release
 
@@ -351,7 +440,7 @@ On `gpu_queue_wait`, a late resume happens when the work after the wait becomes 
 
 - **Release headroom `H`.** The limit is `I + Q10(D) − H`, where `D` is a frame's time from source release to the start of its heavy GPU work (GPU ready time minus the GPU active render time from its Reflex latency report) and `Q10` is the 10th percentile of the newest 256 values. A frame adds a `D` sample only when the frame before it was a GPU wait frame whose GPU waited at its gate: only a waited release can collide with the next frame's heavy work. While that verdict is pending (the readback probe of that frame's resume has not arrived yet) the sample is deferred and added when the verdict is known; readiness decides only when no probe time is available. A frame after one that was not waited for, or that belongs to another lifecycle or FG multiplier, adds none. `H` is a fixed 1.0 ms.
 - **Release margin `M`.** Without current Reflex GPU active times (none within the newest 64 frames planned with the GPU wait's lead), the same guard uses the time to the next frame's Present call: at most `I + Q10(C) − M`, with `C` the release-to-Present-call time (every GPU wait frame adds one). `M` is fixed at 2.5 ms.
-- Either limit applies once 32 samples exist. Nothing widens or narrows `H` or `M`. Late resumes (more than 1 ms after the release) are measured and shown on the OSD and in telemetry, but nothing acts on them. In about 1.35 million waited GPU resumes with probes and Reflex GPU times in Deep Rock Galactic: Rogue Core, late resumes were 0.00–0.05% per 250 µs distance bin from 1 ms on, and 99.2% of them were closer than 1 ms. A headroom that was learned from late resumes had widened to 1.75 ms from 10 of 123 resumes at a session's start and could not narrow again, because the guard keeps releases out of the region it would have to measure.
+- Either limit applies once 32 samples exist. Nothing widens or narrows `H` or `M`. Late resumes (more than 1 ms after the release) are measured and shown on the OSD and in telemetry, but nothing acts on them. In about 1.35 million waited GPU resumes with probes and Reflex GPU times in Deep Rock Galactic: Rogue Core, late resumes were 0.00–0.05% per 250 µs distance bin from 1 ms on, and 99.2% of them were closer than 1 ms.
 - **A relaxing limit does not jump the lead.** A tighter limit applies at once. When it relaxes, or the guard stands aside, the lead returns to the unguarded lead at the lead slew (`min(100 µs, I / 64)` per planned frame), never in one step. The frames the slew still holds back count as the guard's own reduction.
 - **Frames that need more lead** reach their gate after the release and are shown when they are ready. Their slack is judged against the lead before the limit.
 - **Standing aside.** Some games run the next frame's GPU work behind the wait (one queue, in order); the wait cannot delay it there. For each waited release whose next frame had begun submitting, the guard compares the next frame's GPU start with the release. It stands aside only while at least 32 such pairs exist, none of the newest 64 began more than 100 µs before the release, and the heavy-work window is current (a Reflex GPU active time arrived within the newest 64 frames planned with the GPU wait's lead). Every such frame ages the window, whether it was held, and any Reflex report of one resets the age, with or without a new `D` sample; the age is not tied to `D` samples. Without current Reflex reports the Present-call margin guard applies until a report arrives. One pair that did begin earlier restores the guard at once. The pairs are kept across resets; after a lifecycle reset the guard waits for a warm heavy-work window (32 frames) before standing aside again. No GPU load, timer or mode switch is involved.
@@ -371,13 +460,15 @@ flowchart TD
     G --> H
 ```
 
-**The driver's in-Present pacing.** With DLSS Frame Generation and the Reflex Sleep bypassed, the NVIDIA driver still paces the game: it sleeps the thread that calls the game's Present inside `NvAPI_D3D12_SetAsyncFrameMarker` (Streamline's `sl.dlss_g`, through `sl.common`). Which thread that is decides the result. In CONTROL Resonant it is the render thread that starts the next frame, so the sleep is benign and pacing is good. In Gears of War: E-Day it is the engine's RHI submission thread, held about 0.6 ms after the render thread has already started the next frame: that frame's GPU work is submitted late in one burst and the GPU idles (6.3 ms per stalled frame in the trace). Returning to the driver's Sleep fixes Gears and makes CONTROL much worse. ReLimiter only times the marker call (the `async_marker_wait_us` column); it never suppresses, delays or alters it.
+**The driver's in-Present pacing.** With DLSS Frame Generation the NVIDIA driver can pace the game from inside `NvAPI_D3D12_SetAsyncFrameMarker` (Streamline's `sl.dlss_g`, through `sl.common`): captures with the driver's Sleep bypassed show it sleeping the thread that calls the game's Present. Which thread that is decides the effect. In CONTROL Resonant it is the render thread that starts the next frame, so the sleep is benign. In Gears of War: E-Day it is the engine's RHI submission thread, held about 0.6 ms after the render thread has already started the next frame: that frame's GPU work is submitted late in one burst and the GPU idles (6.3 ms per stalled frame in the trace). ReLimiter only times the marker call (the `async_marker_wait_us` column); it never suppresses, delays or alters it.
 
 Source: `src/lead_controller.h`, `src/lead_controller.cpp` (`CollisionGuardedLeadUs`, `CollisionOffsetUs`), `src/nvapi_hooks.cpp` (`Hook_Sleep`), `src/gpu_present_gate.cpp` (`GpuPresent_HorizonTicks`), `src/presentation_gate.cpp` (`PresentGate_Execute`).
 
-### Pacing preference
+---
 
-In 64-bit DirectX 12 games the queue-based pacer sets the frame interval from what the game's GPU queue does each frame. The **Pacing preference** setting moves two of its parameters. **Smoother** gives the credit that pays for holds a small share (1/32) of the frame's service time, never more than the frame generation time of recent frames; it therefore does nothing without frame generation or where the cap leaves slack. **Lower latency** plans from the fourth smallest queue margin of the newest 16 frames instead of the second smallest, so less work waits for the GPU. **Balanced** leaves both at their defaults. Both are fixed values: nothing is learned.
+## Pacing Preference
+
+In 64-bit DirectX 12 games the queue-based pacer sets the frame interval from what the game's GPU queue does each frame. The **Pacing preference** setting moves two of its parameters. **Smoother** gives the credit that pays for holds a small share (1/32) of the frame's service time, never more than the frame generation time of recent frames; it therefore does nothing without frame generation or where the cap leaves slack. **Lower latency** plans from the fourth smallest queue margin of the newest 16 frames instead of the second smallest, so less work waits for the GPU. **Balanced** leaves both at their defaults. Both are fixed values: nothing is learned. A developer key that differs from its default decides its own value whatever the preference ([Developer Reference](DEVELOPER_REFERENCE.md#pacing-preference)).
 
 ---
 
@@ -395,7 +486,7 @@ At a 120 FPS cap with 2× FG, real frames are `I = 16.7 ms` apart and the displa
 
 **Pacing real frames.** With FG presenting, Auto uses `fg_input_wait` once its route has qualified: the GPU waits in front of each real frame's entry to frame generation, so real frames enter FG on the cadence. Until it qualifies, nothing is held (`source_only`, reason `fg_unqualified`); FG without its route is not held at a marker. Frame generation that presents from its own thread and queue cannot qualify (`source_only`, reason `fg_route_unsupported`): without hardware flip metering, DLSS Frame Generation presents each group after its worker has released the game's queue, so no Present belongs to the worker's cycle. Where the FG input wait cannot run (the 32-bit addon, an API other than DX12, or markers from Streamline PCL), the reason names that requirement instead (`architecture`, `api`, `no_native_route`). The lead of `fg_input_wait` leaves out the game's simulation to render queue time `q`, because a pipelined game's finished frame otherwise waits there and the lead would learn that wait as part of its pipeline.
 
-What ReLimiter times is when each real frame enters frame generation. With DLSS-G the generated frame between real frames n − 1 and n is shown as soon as frame generation has computed it, right after real frame n enters it, and real frame n is shown about half an interval later. The driver sets that delay. In captures under the Reflex Sleep bypass it followed half of frame n's simulation-start interval, so a frame-start rhythm that differs from the GPU's frame-to-frame rhythm misplaces the real frames between the generated ones. Telemetry from builds before this was found has the two labels swapped under DLSS-G.
+What ReLimiter times is when each real frame enters frame generation. With DLSS-G the generated frame between real frames n − 1 and n is shown as soon as frame generation has computed it, right after real frame n enters it, and real frame n is shown about half an interval later. The driver sets that delay. In captures with the driver's Sleep bypassed it followed half of frame n's simulation-start interval, so a frame-start rhythm that differs from the GPU's frame-to-frame rhythm misplaces the real frames between the generated ones.
 
 ```mermaid
 sequenceDiagram
@@ -421,7 +512,7 @@ Source: `src/fg_divisor.h`, `src/fg_divisor.cpp`, `src/scheduler.cpp` (`OnMarker
 
 ReLimiter measures its own pacing, and some of the measurements feed back into it.
 
-**Reflex reports.** On NVIDIA Reflex games, ReLimiter reads the driver's latency report for each frame (about 2 to 3 frames after the frame). Its GPU active render time and GPU render start feed the collision-aware release and its queue-order test. A report's times are on the driver's clock.
+**Reflex reports.** On NVIDIA Reflex games, ReLimiter reads the driver's latency report for each frame (about 2 to 3 frames after the frame). Its GPU active render time and GPU render start feed the collision-aware release and its queue-order test, and the unified pacer's report-based GPU term and hold credit. A report's times are on the driver's clock.
 
 **The clock map.** To compare driver times with its own QPC times, ReLimiter pairs each report with the QPC time its PRESENT_START hook recorded for the same frame, and keeps the offset between the two clocks over the newest 128 matched frames. The map is *stable* once 32 frames exist and the trimmed spread (about the 3rd to 97th percentile) is under 100 µs. The driver's GPU render start, which the queue-order test of the collision-aware release uses, is mapped to QPC only while the map is stable.
 
@@ -439,7 +530,7 @@ flowchart LR
     RFX --> LEAD["Lead inputs"]
 ```
 
-**What you see.** The OSD's **Display Pacing** shows, over the last 5 seconds, refreshed four times per second: the display interval, jitter (the change from one display interval to the next), long and short frame counts, animation error (the difference between how far apart ReLimiter released two rendered frames and how far apart they were displayed), release to display, GPU residence and CPU hold. Display times come from PC latency collection (ETW) when it is collecting, otherwise from DXGI frame statistics. A capture (Telemetry Logging) records one joined row per displayed frame plus an events file with pipeline changes, cadence restarts and controller transitions; see [Capture Files](DEVELOPER_REFERENCE.md#capture-files).
+**What you see.** The OSD's **Display Pacing** shows, over the last 5 seconds, refreshed four times per second: the display interval, jitter (the change from one display interval to the next), long and short frame counts, animation error (the difference between how far apart ReLimiter released two rendered frames and how far apart they were displayed), release to display, GPU residence and CPU hold. Display times come from PC latency collection (ETW) when it is collecting, otherwise from DXGI frame statistics. A capture (Telemetry Logging) records one joined row per displayed frame plus an events file with pipeline changes, cadence restarts and measurement status changes; see [Capture Files](DEVELOPER_REFERENCE.md#capture-files).
 
 **Analysis.** A capture's rows hold each frame's plan, release, output and display times, so pacing can be compared offline; the [Developer Reference](DEVELOPER_REFERENCE.md#capture-files) lists the columns and events.
 
@@ -452,10 +543,14 @@ Source: `src/feedback.cpp`, `src/feedback.h`, `src/reflex_clock_map.h`, `src/pac
 | Term | Meaning |
 |------|---------|
 | `n` | Grid index of a real frame within a lifecycle. |
-| `I` | The grid interval between real frames: the cap interval times the FG divisor, rounded by LFC or the fixed refresh. |
+| `I` | The grid interval between real frames: `I(n)` of the unified pacer, or on the Present route the cap interval times the FG divisor, rounded by LFC or the fixed refresh. |
 | `T` | A frame's output target `T(n)`, from the grid. |
 | `S` | The source wake time `S = T − L`: when the game is released. |
 | `s` | The time the game was actually released (after the wait). |
+| `R` | The release the unified pacer committed for a frame; `s` is the same instant. |
+| `T_start` | The unified pacer's start target: the time the Reflex Sleep call waits to. |
+| `I_cap`, `I_vrr`, `I_game`, `I_gpu` | The terms of the unified pacer's interval `I(n)`: cap, VRR ceiling, the game's own Sleep-mode interval and the GPU term (see [The Unified Pacer](#the-unified-pacer)). |
+| `I_disp` | The display-side interval: the largest of `I_cap` (or the idle interval), `I_vrr` and `I_game`. |
 | `L` | The lead: how long before `T` the game is released. |
 | `X` | A measured sample: time from source release `s` to the output point's reference time, without ReLimiter's own holds. The lead is learned from `X`. |
 | `o` | A frame's effective output time: when the hold ended, or when it was passed on or declined. |

@@ -437,7 +437,8 @@ try {
             marker_source = Ini-String $ini 'enforcement_marker'
             reflex_state = $null
             target_fps = Ini-Number $ini 'target_fps'
-            pacing_mode = $null
+            pacing_preference = Ini-String $ini 'pacing_preference'
+            pacing_test_mode = Ini-String $ini 'pacing_test_mode'
             wake_guard_us = Ini-Number $ini 'initial_wake_guard_us'
             background_fps = Ini-Number $ini 'background_fps'
             fg_off_fps = Ini-Number $ini 'fg_off_fps'
@@ -446,20 +447,11 @@ try {
             fg_detected_multiplier = $null
             dmfg_mode = Ini-Boolean $ini 'dynamic_mfg_passthrough'
             dmfg_driver_target_fps = $null
-            adaptive_enabled = Ini-Boolean $ini 'adaptive_smoothing'
-            adaptive_percentile = Ini-Number $ini 'smoothing_percentile'
-            adaptive_window = Ini-String $ini 'smoothing_window'
-            adaptive_release_speed = Ini-Number $ini 'smoothing_release_speed'
-            adaptive_bias_us = Ini-Number $ini 'smoothing_bias_us'
-            adaptive_deadline_reserve_mode = Ini-String $ini 'adaptive_deadline_reserve_mode'
-            estimator_a_mode = Ini-String $ini 'estimator_a_mode'
-            estimator_a_fixed_reserve_us = Ini-Number $ini 'estimator_a_fixed_reserve_us'
-            presentation_gate_location = Ini-String $ini 'presentation_gate_location'
-            native_arrival_predictor_mode = Ini-String $ini 'native_arrival_predictor_mode'
-            gpu_readiness_observer = Ini-Boolean $ini 'gpu_readiness_observer'
-            gpu_present_gate_mode = Ini-String $ini 'gpu_present_gate_mode'
-            gpu_present_gate_slack_us = Ini-Number $ini 'gpu_present_gate_slack_us'
-            gpu_present_gate_max_delay_us = Ini-Number $ini 'gpu_present_gate_max_delay_us'
+            developer_settings = Ini-Boolean $ini 'developer_settings'
+            config_version = Ini-Number $ini 'config_version'
+            gpu_present_gate_probes = Ini-Boolean $ini 'gpu_present_gate_probes'
+            gpu_queue_probe = Ini-Boolean $ini 'gpu_queue_probe'
+            flip_metering_off = Ini-Boolean $ini 'flip_metering_off'
             native_pcl_enabled = Ini-Boolean $ini 'native_pcl_enabled'
             native_pcl_status = $null
         }

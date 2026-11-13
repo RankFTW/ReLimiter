@@ -45,14 +45,10 @@ enum class PacingCsvEventType : uint8_t {
     PclStatus = 12,   // native PCL snapshot status change; value is NativePclStatus
     // Derived from Source records
     GridEpoch = 13,      // value epoch, previous_value previous epoch, reason PacingEpochReason
-    PipelineChange = 14, // pipeline_generation changed: value plan_rung, previous_value previous rung,
+    PipelineChange = 14  // pipeline_generation changed: value plan_rung, previous_value previous rung,
                          // reason PacingFallbackReason
-    StallInjected = 15,  // value stall_injected_us
-    // Derived from Source records
-    GovernorStep = 16,   // governor phase transition: value governor step, previous_value the
-                         // previous governed record's step, reason GovernorCause
-    RungFeasibility = 17 // value 1 demoted / 0 not, previous_value previous state, reason FeasibilityCause
-    // 18 was gpu_wait_cap (the GPU wait cap ladder, removed 2026-10-20); older files carry it.
+    // 15 stall_injected, 16 governor_step, 17 rung_feasibility and 18 gpu_wait_cap were retired:
+    // never written by this build, older files carry them.
 };
 
 // Cumulative pacing telemetry producer drops (full queue or worker stopped).
@@ -112,8 +108,7 @@ struct PacingCsvEvent {
     uint64_t previous_value = 0;
     uint64_t value = 0;
     uint64_t native_swapchain = 0;     // loss-window rows; selected swapchain of snapshot rows
-    uint8_t reason = 0;                // grid-epoch rows: PacingEpochReason; pipeline-change rows: PacingFallbackReason;
-                                       // governor-step rows: GovernorCause; rung-feasibility rows: FeasibilityCause
+    uint8_t reason = 0;                // grid-epoch rows: PacingEpochReason; pipeline-change rows: PacingFallbackReason
     double clock_map_offset_us = 0.0;  // clock-map rows
     PacingQueueDrops drops{};          // queue-drop rows
     PacingJoinStatistics join{};       // join-statistics rows

@@ -81,7 +81,7 @@ static std::atomic_flag s_game_params_lock = ATOMIC_FLAG_INIT;
 static std::atomic<bool> s_low_latency_forced_off{ false };
 static SRWLOCK s_sleep_mode_forward_lock = SRWLOCK_INIT;
 
-// Unified pacer (developer key unified_pacer): the applied Sleep-mode record
+// Unified pacer (unified owner): the applied Sleep-mode record
 // {publication, owner, low latency off, interval, epoch}, written only under
 // s_sleep_mode_forward_lock and only by a reconcile or a desired-tuple forward (key on, a
 // key toggle or a restoration owed): with the key off and settled nothing is recorded. The
@@ -874,9 +874,7 @@ static void LogSleepStatus(const char* source, NvAPI_Status status, const NV_GET
 // The driver's own sleep status, read by ReLimiter at most once per second from
 // Hook_Sleep (the presenting device, under developer_settings), through the
 // trampoline: the game's hook never sees it. The only driver call this
-// observation adds. The developer key sleep_status_every_frame reads it at
-// every Sleep instead, so the pacing CSV's driver_sleep_interval_us follows the
-// driver's interval frame by frame.
+// observation adds; the status poll reads it once a second.
 static constexpr uint32_t kPolledSleepStatusLogLimit = 64;
 static SleepStatusTracker s_polled_sleep_status;
 static std::atomic<ULONGLONG> s_sleep_status_poll_ms{0};
@@ -1589,7 +1587,7 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
     // game's parameters above stay captured for the restore.
     const uint32_t limiter_us = g_driver_limiter_interval_us.load(std::memory_order_relaxed);
     if (params_valid && params_device.identity.device && NvAPI_SleepModeReconcilePending()) {
-        // Key unified_pacer or a pending epoch: the desired tuple, built from the
+        // Unified owner or a pending epoch: the desired tuple, built from the
         // game's new parameters, replaces the two branches below.
         result = ForwardDesiredSleepMode(pDev, params, params_snapshot, params_device.identity);
     } else if (limiter_us != 0 && params_valid && params_device.identity.device) {
@@ -1621,7 +1619,7 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
 
     if (s_orig_sleep) {
         // The bypass is decided once per call, before the start wait.
-        // Key unified_pacer: this Sleep is the start of the frame. On the
+        // Unified owner: this Sleep is the start of the frame. On the
         // presenting device it runs the unified start wait, and the bypass is
         // not consulted: the driver's Sleep always runs. With the key off, one load and
         // a not-taken branch: the bypass first, then the presenting device, as before.
@@ -1817,10 +1815,10 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
             }
             // Every NvAPI frame feeds the native route, whatever the plan's
             // rung, so the route qualifies and carries this key to the native
-            // Present for H2 and H3.
+            // Present for H3.
             NativeGate_OnMarker(NativeGate_GetContext(captured_qpc.QuadPart), frame_key);
             NativeGate_PublishRouteCapability(frame_key.controller_generation);
-            // H0 releases here; H1 holds here; H2/H3 plans output later.
+            // H0 releases here; H1 holds here; H3 plans output later.
             PresentationGateResult gate_result{};
             PresentGate_OnPresentStart(frame_key, captured_qpc.QuadPart, &gate_result);
             LARGE_INTEGER release{};
@@ -2009,7 +2007,7 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
             ts.QuadPart,
             SchedulerTrigger::NvApiMarker,
             source_marker);
-        // After-wait order: the driver's stage starts at the paced release.
+        // A marker forwarded before the wait leaves the wait inside the driver's stage.
         const bool stage_contains_wait = forwarded;
         forward();
         LARGE_INTEGER controller_end_qpc{};
@@ -2019,8 +2017,8 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
             return forward();
         }
         // The residence is the ReLimiter time inside the driver's source
-        // stage; the stage-demand computation subtracts it from that stage. With
-        // after-wait forwarding the wait precedes the stage, so it is zero.
+        // stage; the stage-demand computation subtracts it from that stage. A
+        // marker not forwarded before the wait leaves the wait outside it: zero.
         PublishReflexControllerResidence(
             marker_params.frameID,
             marker_device.identity.producer_epoch,
@@ -2484,7 +2482,7 @@ DriverLimiterApply NvAPI_ApplyDriverLimiter(uint32_t minimum_interval_us) noexce
 }
 
 void NvAPI_ReleaseDriverLimiter() noexcept {
-    // Key unified_pacer or a pending epoch: the tuple's own reconcile applies the row
+    // Unified owner or a pending epoch: the tuple's own reconcile applies the row
     // that holds now (the limiter interval is already 0 here). Otherwise the game's
     // parameters, as before.
     if (NvAPI_SleepModeReconcilePending()) {

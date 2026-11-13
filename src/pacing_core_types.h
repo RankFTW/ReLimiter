@@ -75,7 +75,7 @@ constexpr double PacingQpc_ElapsedSeconds(int64_t from_qpc, int64_t to_qpc, int6
 enum class PacingRung : uint8_t {
     SourceOnly = 0,   // H0: no output hold
     MarkerHold = 1,   // H1: CPU hold at PRESENT_START
-    NativeHold = 2,   // H2: CPU hold at the native Present
+    NativeHold = 2,   // H2: historical, no longer produced (CPU hold at the native Present, removed); kept for telemetry output_kind 3 and the rung column
     GpuQueueWait = 3, // H3: GPU time-fence wait on the present queue
     FgInputWait = 4,  // H3 on the frame-generation input fence
     Count
@@ -133,7 +133,7 @@ enum class PacingEpochReason : uint8_t {
     PeriodChange = 3, // cap, VRR ceiling, LFC or FG divisor changed the interval
     SourceLate = 4,   // source arrived later than S_n + tolerance
     OutputLate = 5,   // output released later than T_n + tolerance
-    GovernorStep = 6  // the period governor changed its ladder step
+    GovernorStep = 6  // historical: the period governor's ladder step; no code produces it
 };
 
 // Output-stage outcome for one frame. CSV: plan_status.
@@ -163,7 +163,7 @@ enum class PacingFallbackReason : uint8_t {
     NoNativeRoute = 9, // native Present attribution not qualified
     NoGpuQueue = 10,   // GPU queue not ready
     FgUnqualified = 11, // FG presenting without a qualified FG input route
-    Infeasible = 12,    // the overload guard demoted the Auto rung (older builds: the resume spread switch-off)
+    Infeasible = 12,    // historical: the overload guard demoted the Auto rung; no code produces it
     FgRouteUnsupported = 13, // FG presents its own frames on another thread and queue: no FG input wait
     DriverLimiterUnavailable = 14 // test mode driver_limiter where the driver's limiter cannot apply: pass-through
 };
@@ -209,7 +209,7 @@ struct PacingFramePlan {
     PacingRung rung = PacingRung::SourceOnly;
     PacingTimingMode mode = PacingTimingMode::Off;
     PacingSourceMarker marker = PacingSourceMarker::Unknown;
-    // Developer key unified_pacer, hold credit (unified_pacer.h): the ADVANCE in µs the executors
+    // Unified owner, hold credit (unified_pacer.h): the ADVANCE in µs the executors
     // subtract from the resolved targets (nominal or floored) under the live key; >= 0, 0 = none
     // (key off, a report stream that is not live, no debt). A debt in the credit is repaid by
     // releasing the next frames earlier by it. Fits the padding after the enums.
@@ -225,7 +225,7 @@ struct PacingFramePlan {
 enum class PacingStageEventKind : uint8_t {
     None = 0,
     MarkerArrival = 1, // a: PRESENT_START arrival, before any hold
-    NativeArrival = 2, // native Present arrival before an H2 hold
+    NativeArrival = 2, // historical, no longer published (native Present arrival before the removed H2 hold)
     PresentCall = 3,   // p: native Present entry (FG: FG input begin)
     OutputRelease = 4, // o: hold end, Signal, or the time a Late/Undeliverable outcome was decided
     GpuReady = 5,      // r: GPU completion before any hold, mapped to QPC

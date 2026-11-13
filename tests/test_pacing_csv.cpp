@@ -1,15 +1,12 @@
 // Directly tests the production CSV writer (src/csv_writer.cpp) for the two
-// pacing families: header names and order of the appended columns,
-// PC Latency and predicted-render cells,
-// native PCL loss counters on capture and queue-drop rows, the pcl_status
-// event, the frame-plan columns, display source, reason column and
-// grid_epoch / pipeline_change / stall_injected events,
-// the controller columns and governor_step / rung_feasibility
-// events, the source-placement columns, and the appended driver sleep status,
-// flip config and GPU start probe columns.
+// pacing families: header names and order of the appended columns (192 row
+// columns), the PC Latency cells, native PCL loss counters on capture and
+// queue-drop rows, the pcl_status event, the frame-plan columns, display
+// source, reason column and grid_epoch / pipeline_change events (the retired
+// event types are never written), the source-placement columns, the readiness
+// cells, and the appended driver sleep status and flip config columns.
 // The logger and the native PCL snapshot are stubs; the telemetry
-// worker that produces these records is not exercised here (its controller
-// event derivation is tested by test_pacing_controller_events).
+// worker that produces these records is not exercised here.
 
 #include "csv_writer.h"
 #include "instrumentation_state.h"
@@ -17,6 +14,7 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -138,23 +136,16 @@ PacingJoinedRow DisplayRow(bool with_latency)
         row.source.key = { PacingIdentityDomain::NvApiFrame, 3, 77 };
         row.source.release_qpc = 800;
         row.source.interval_us = 10000.0;
-        row.source.predicted_render_us = 4321.5;
         // Frame plan
         row.source.grid_epoch = 3;
         row.source.grid_index = 42;
         row.source.plan_output_target_qpc = 1900;
         row.source.plan_lead_us = 1234.5;
         row.source.plan_rung = 3; // PacingRung::GpuQueueWait
-        // Controllers
-        row.source.governor_step = 2;
-        row.source.governor_interval_us = 11025.0;
-        row.source.governor_cause = 2;      // events only: never a row cell
-        row.source.feasibility_demoted = 1; // events only: never a row cell
         // Pre-Sleep placement
         row.source.flags = PACING_SOURCE_PRE_SLEEP;
         row.source.source_placement = 3; // PacingSourcePlacement::PreSleep
         row.source.pre_sleep_end_qpc = 780;
-        row.source.pre_sleep_margin_us = 450.25;
         // Gated holds: where the waits started.
         row.source.pre_sleep_start_qpc = 610;
         row.source.source_wait_start_qpc = 800;
@@ -165,10 +156,12 @@ PacingJoinedRow DisplayRow(bool with_latency)
         row.source.driver_sleep_status_valid = 1;
         row.source.driver_sleep_interval_us = 8333;
         row.source.driver_use_game_sleep = 1;
-        // GPU start probe of the frame's readiness sample.
+        // Readiness sample of the frame.
         row.has_ready = true;
-        row.ready.gpu_first_submit_qpc = 1100;
-        row.ready.gpu_start_qpc = 1150;
+        row.ready.valid = 1;
+        row.ready.submit_qpc = 1050;
+        row.ready.ready_qpc = 1100;
+        row.ready.before_gate = 1;
         // The unified pacer's decision for the frame (developer key unified_pacer).
         row.source.up_valid = 1;
         row.source.up_grid_target_qpc = 123456789;
@@ -265,7 +258,6 @@ PacingJoinedRow DisplayRow(bool with_latency)
         row.source.plan_output_target_qpc = 1950;
         row.source.plan_lead_us = 99.0;
         row.source.plan_rung = 1;
-        row.source.governor_step = 3;        // hidden: the governor did not run (interval 0)
         row.source.source_placement = 1;     // PacingSourcePlacement::Marker, no pre-Sleep wait
         // A status the Sleep hook never published stays hidden behind its valid flag.
         row.source.driver_sleep_interval_us = 999;
@@ -287,9 +279,10 @@ PacingJoinedRow DisplayRow(bool with_latency)
         row.source.up_gpu_wait_us = 7.0;
         row.source.up_cycle_valid = 1;
         row.source.up_cycle_us = 15.0;
-        // A probe whose Signal completion was not observed has a first submit only.
+        // A readiness sample that is not valid keeps its timestamp hidden.
         row.has_ready = true;
-        row.ready.gpu_first_submit_qpc = 1200;
+        row.ready.submit_qpc = 1200;
+        row.ready.ready_qpc = 1250;
         // The queue probe saw part of the frame: only the fields whose valid bit is set print.
         row.has_gpu_queue = true;
         row.gpu_queue.valid = PacingGpuQueueRecord::kSubmits | PacingGpuQueueRecord::kFirstSubmit |
@@ -473,21 +466,19 @@ void CheckFlipConfigRing()
 }
 void CheckRowsFile(const CsvFile& rows)
 {
-    const Cells appended{ "clock_map_offset_us", "predicted_render_us", "pcl_status",
+    const Cells appended{ "clock_map_offset_us", "pcl_status",
         "pcl_input_ping_qpc", "pcl_effective_sim_start_qpc", "pcl_i2fs_us", "pcl_fs2p_us",
         "pcl_p2d_us", "pcl_total_us", "pcl_dropped_accumulation_us", "pcl_dropped_frame_count",
         "pcl_simulation_fallback" };
     const Cells plan_columns{ "grid_epoch", "grid_index", "plan_output_target_qpc", "plan_lead_us",
         "plan_rung", "plan_status", "display_source" };
-    // Controller columns, the gate pre-Wait column, the
-    // placement columns and the wait starts after them.
-    const Cells controller_columns{ "governor_step", "governor_interval_us", "plan_signal_advance_us",
-        "gate_pre_wait_qpc", "source_placement", "pre_sleep_end_qpc", "pre_sleep_margin_us",
+    // The gate pre-Wait column, the placement columns and the wait starts after them.
+    const Cells placement_columns{ "gate_pre_wait_qpc", "source_placement", "pre_sleep_end_qpc",
         "source_wait_start_qpc", "pre_sleep_start_qpc" };
     const Cells wait_columns{ "async_marker_wait_us", "async_marker_wait_type" };
     const Cells driver_columns{ "driver_sleep_start_qpc", "driver_sleep_end_qpc" };
     const Cells measurement_columns{ "driver_sleep_interval_us", "driver_use_game_sleep", "flip_config_qpc",
-        "flip_time_per_batch_us", "gpu_first_submit_qpc", "gpu_start_qpc" };
+        "flip_time_per_batch_us" };
     const Cells unified_columns{ "up_grid_target_qpc", "up_interval_us", "up_gpu_interval_us",
         "up_gpu_service_us", "up_queue_wait_raw_us", "up_queue_wait_us", "up_outstanding",
         "up_limit_wait_us", "up_ready_age_us", "up_flags", "up_hold_budget_us", "up_service_sample_us",
@@ -506,19 +497,24 @@ void CheckRowsFile(const CsvFile& rows)
     const size_t last = wait_columns.size() + driver_columns.size() + measurement_columns.size() +
         unified_columns.size() + gpu_queue_columns.size() + queue_law_columns.size() + upstream_columns.size() +
         queue_role_columns.size();
-    const size_t tail = plan_columns.size() + controller_columns.size() + last;
+    const size_t tail = plan_columns.size() + placement_columns.size() + last;
     // `count` columns that end `from_end` columns before the end of the header.
     const auto slice = [&rows](size_t from_end, size_t count) {
         if (rows.header.size() < from_end || from_end < count) return Cells{};
         return Cells(rows.header.end() - from_end, rows.header.end() - from_end + count);
     };
-    Check(rows.header.size() == 199, "pacing rows have 199 columns, got " + std::to_string(rows.header.size()));
+    Check(rows.header.size() == 192, "pacing rows have 192 columns, got " + std::to_string(rows.header.size()));
+    for (const char* removed : { "predicted_render_us", "governor_step", "governor_interval_us",
+             "plan_signal_advance_us", "pre_sleep_margin_us", "gpu_first_submit_qpc", "gpu_start_qpc" }) {
+        Check(std::find(rows.header.begin(), rows.header.end(), removed) == rows.header.end(),
+              std::string("the header no longer carries ") + removed);
+    }
     Check(slice(tail + appended.size(), appended.size()) == appended,
-          "PC Latency and predicted-render columns are appended in order after clock_map_offset_us");
+          "PC Latency columns are appended in order after clock_map_offset_us");
     Check(slice(tail, plan_columns.size()) == plan_columns,
           "frame-plan columns are appended in order after pcl_simulation_fallback");
-    Check(slice(controller_columns.size() + last, controller_columns.size()) == controller_columns,
-          "controller, gate pre-Wait, placement and wait-start columns are appended in order after display_source");
+    Check(slice(placement_columns.size() + last, placement_columns.size()) == placement_columns,
+          "gate pre-Wait, placement and wait-start columns are appended in order after display_source");
     Check(slice(last, wait_columns.size()) == wait_columns,
           "async marker wait columns follow the wait-start columns");
     Check(slice(driver_columns.size() + measurement_columns.size() + unified_columns.size() +
@@ -529,11 +525,11 @@ void CheckRowsFile(const CsvFile& rows)
     Check(slice(measurement_columns.size() + unified_columns.size() + gpu_queue_columns.size() +
                     queue_law_columns.size() + upstream_columns.size() + queue_role_columns.size(),
                 measurement_columns.size()) == measurement_columns,
-          "driver sleep status, flip config and GPU start probe columns follow the driver Sleep columns");
+          "driver sleep status and flip config columns follow the driver Sleep columns");
     Check(slice(unified_columns.size() + gpu_queue_columns.size() + queue_law_columns.size() +
                     upstream_columns.size() + queue_role_columns.size(),
                 unified_columns.size()) == unified_columns,
-          "the unified pacer columns follow the GPU start probe columns");
+          "the unified pacer columns follow the driver sleep status and flip config columns");
     Check(slice(gpu_queue_columns.size() + queue_law_columns.size() + upstream_columns.size() +
                     queue_role_columns.size(),
                 gpu_queue_columns.size()) == gpu_queue_columns,
@@ -551,10 +547,9 @@ void CheckRowsFile(const CsvFile& rows)
     const std::pair<const char*, const char*> plan_cells[] = {
         { "grid_epoch", "3" }, { "grid_index", "42" }, { "plan_output_target_qpc", "1900" },
         { "plan_lead_us", "1234.500" }, { "plan_rung", "3" }, { "plan_status", "2" },
-        { "display_source", "1" }, { "governor_step", "2" }, { "governor_interval_us", "11025.000" },
-        { "plan_signal_advance_us", "0.000" }, // reserved: always 0 on planned rows
+        { "display_source", "1" },
         { "gate_post_wait_qpc", "1960" }, { "gate_pre_wait_qpc", "1850" }, { "source_flags", "2" },
-        { "source_placement", "3" }, { "pre_sleep_end_qpc", "780" }, { "pre_sleep_margin_us", "450.250" },
+        { "source_placement", "3" }, { "pre_sleep_end_qpc", "780" },
         { "source_wait_start_qpc", "800" }, { "pre_sleep_start_qpc", "610" } };
     const std::pair<const char*, const char*> wait_cells[] = {
         { "async_marker_wait_us", "5500.250" }, { "async_marker_wait_type", "11" } };
@@ -572,7 +567,7 @@ void CheckRowsFile(const CsvFile& rows)
           "a Source record without a matched driver Sleep has empty stamps");
     Check(rows.Cell(2, "driver_sleep_start_qpc").empty() && rows.Cell(2, "driver_sleep_end_qpc").empty(),
           "rows without a Source record have empty driver Sleep cells");
-    // Driver sleep status, flip config (recorded between the rows) and GPU start probe.
+    // Driver sleep status and flip config (recorded between the rows).
     Check(rows.Cell(0, "driver_sleep_interval_us") == "8333" && rows.Cell(0, "driver_use_game_sleep") == "1",
           "a Source record with a sleep status carries both cells");
     Check(rows.Cell(1, "driver_sleep_interval_us").empty() && rows.Cell(1, "driver_use_game_sleep").empty(),
@@ -585,19 +580,22 @@ void CheckRowsFile(const CsvFile& rows)
           "a row carries the newest metering call at or before its present start (500, not the later 1500 or 5000)");
     Check(rows.Cell(2, "flip_config_qpc") == "1500" && rows.Cell(2, "flip_time_per_batch_us").empty(),
           "an unjoined Present row uses the Present's entry as its start; a call without a batch time leaves the microseconds empty");
-    Check(rows.Cell(0, "gpu_first_submit_qpc") == "1100" && rows.Cell(0, "gpu_start_qpc") == "1150",
-          "a readiness sample with a GPU start probe carries both stamps");
-    Check(rows.Cell(1, "gpu_first_submit_qpc") == "1200" && rows.Cell(1, "gpu_start_qpc").empty(),
-          "a probe whose completion was not observed has the first submit only");
-    Check(rows.Cell(2, "gpu_first_submit_qpc").empty() && rows.Cell(2, "gpu_start_qpc").empty(),
-          "rows without a readiness record have empty probe cells");
+    // Readiness sample: the cells come from the record's valid flag, never from the timestamp alone.
+    Check(rows.Cell(0, "ready_valid") == "1" && rows.Cell(0, "ready_submit_qpc") == "1050" &&
+              rows.Cell(0, "ready_gpu_qpc") == "1100" && rows.Cell(0, "ready_before_gate") == "1",
+          "a valid readiness sample carries its submit and ready stamps");
+    Check(rows.Cell(1, "ready_valid") == "0" && rows.Cell(1, "ready_submit_qpc") == "1200" &&
+              rows.Cell(1, "ready_gpu_qpc").empty(),
+          "a readiness sample that is not valid keeps its ready stamp empty");
+    Check(rows.Cell(2, "ready_valid").empty() && rows.Cell(2, "ready_submit_qpc").empty() &&
+              rows.Cell(2, "ready_gpu_qpc").empty(),
+          "rows without a readiness record have empty readiness cells");
     for (const auto& [column, expected] : plan_cells) {
         Check(rows.Cell(0, column) == expected,
               std::string("row 1 ") + column + " = " + expected + ", got " + rows.Cell(0, column));
     }
     for (const char* column : { "grid_epoch", "grid_index", "plan_output_target_qpc", "plan_lead_us",
-             "plan_rung", "plan_status", "governor_step", "governor_interval_us", "plan_signal_advance_us",
-             "gate_pre_wait_qpc" }) {
+             "plan_rung", "plan_status", "gate_pre_wait_qpc" }) {
         Check(rows.Cell(1, column).empty(),
               std::string("row 2 ") + column + " is empty without a plan or plan status");
     }
@@ -607,14 +605,12 @@ void CheckRowsFile(const CsvFile& rows)
     Check(rows.Cell(2, "display_source").empty(), "unjoined Present rows have no display source");
     Check(rows.Cell(2, "plan_status") == "3", "unjoined Present rows keep the Present plan status");
     Check(rows.Cell(2, "grid_index").empty(), "unjoined Present rows without a Source record have no plan");
-    Check(rows.Cell(2, "governor_step").empty() && rows.Cell(2, "plan_signal_advance_us").empty(),
-          "unjoined Present rows without a Source record have no controller cells");
     Check(rows.Cell(1, "source_placement") == "1" && rows.Cell(1, "pre_sleep_end_qpc").empty() &&
-              rows.Cell(1, "pre_sleep_margin_us").empty() && rows.Cell(1, "pre_sleep_start_qpc").empty() &&
+              rows.Cell(1, "pre_sleep_start_qpc").empty() &&
               rows.Cell(1, "source_wait_start_qpc").empty(),
           "a Source record without a pre-Sleep or source wait has its placement and empty wait cells");
     Check(rows.Cell(2, "source_placement").empty() && rows.Cell(2, "pre_sleep_end_qpc").empty() &&
-              rows.Cell(2, "pre_sleep_margin_us").empty() && rows.Cell(2, "source_wait_start_qpc").empty(),
+              rows.Cell(2, "source_wait_start_qpc").empty(),
           "unjoined Present rows without a Source record have no placement or wait cells");
     for (const auto& row : rows.rows) Check(row.size() == rows.header.size(), "every row has one cell per column");
 
@@ -729,10 +725,10 @@ void CheckRowsFile(const CsvFile& rows)
               rows.Cell(1, "render_submit_end_marker_qpc").empty(),
           "a stamp of 0 is an empty cell, a seen stamp prints as an integer");
 
-    // Columns 187-189 (historical header names): the UPPER ends of the probe's empty time, boundary
-    // idle time and smallest free margin; 196 the minimum of the free-margin brackets' lower ends and
-    // 198 the bracket error. Decimals, empty without a probe record or when NaN (unknown), 0 is a
-    // value. 197 packs min(borrowed, 9999) + 10000 * min(registrations, 9999), empty without a probe
+    // Columns 180-182 (historical header names): the UPPER ends of the probe's empty time, boundary
+    // idle time and smallest free margin; 189 the minimum of the free-margin brackets' lower ends and
+    // 191 the bracket error. Decimals, empty without a probe record or when NaN (unknown), 0 is a
+    // value. 190 packs min(borrowed, 9999) + 10000 * min(registrations, 9999), empty without a probe
     // record.
     const std::pair<const char*, const char*> tail_cells[] = {
         { "up_ql_rt_margin_us", "812.500" }, { "up_ql_rt_offset_us", "640.250" },
@@ -781,7 +777,7 @@ void CheckRowsFile(const CsvFile& rows)
           "a cross-thread span has an empty CPU time with both thread ids shown, an unseen marker an empty id");
 
     const std::pair<const char*, const char*> latency_cells[] = {
-        { "predicted_render_us", "4321.500" }, { "pcl_status", "3" }, { "pcl_input_ping_qpc", "900" },
+        { "pcl_status", "3" }, { "pcl_input_ping_qpc", "900" },
         { "pcl_effective_sim_start_qpc", "950" }, { "pcl_i2fs_us", "3000.250" }, { "pcl_fs2p_us", "7000.500" },
         { "pcl_p2d_us", "4999.250" }, { "pcl_total_us", "15000.000" },
         { "pcl_dropped_accumulation_us", "1250.000" }, { "pcl_dropped_frame_count", "2" },
@@ -851,34 +847,22 @@ void CheckEventsFile(const CsvFile& events)
     // Source-record events
     const size_t epoch = RowOfEvent(events, "grid_epoch");
     const size_t pipeline = RowOfEvent(events, "pipeline_change");
-    const size_t stall = RowOfEvent(events, "stall_injected");
-    Check(epoch < events.rows.size() && pipeline < events.rows.size() && stall < events.rows.size(),
-          "grid_epoch, pipeline_change and stall_injected events are written");
-    if (epoch >= events.rows.size() || pipeline >= events.rows.size() || stall >= events.rows.size()) return;
+    Check(epoch < events.rows.size() && pipeline < events.rows.size(),
+          "grid_epoch and pipeline_change events are written");
+    if (epoch >= events.rows.size() || pipeline >= events.rows.size()) return;
     Check(events.Cell(epoch, "previous_value") == "4" && events.Cell(epoch, "value") == "5" &&
               events.Cell(epoch, "reason") == "4",
           "grid_epoch carries previous and current epoch and the PacingEpochReason");
     Check(events.Cell(pipeline, "previous_value").empty() && events.Cell(pipeline, "value") == "3" &&
               events.Cell(pipeline, "reason") == "0",
           "a capture-start pipeline_change has the rung, the fallback reason and no previous rung");
-    Check(events.Cell(stall, "value") == "50000" && events.Cell(stall, "previous_value").empty() &&
-              events.Cell(stall, "reason").empty() && events.Cell(stall, "event_qpc") == "10000",
-          "stall_injected carries the stall length in microseconds");
-
-    // Controller events
-    const size_t governor = RowOfEvent(events, "governor_step");
-    const size_t feasibility = RowOfEvent(events, "rung_feasibility");
-    Check(governor < events.rows.size() && feasibility < events.rows.size(),
-          "governor_step and rung_feasibility events are written");
-    if (governor >= events.rows.size() || feasibility >= events.rows.size()) return;
-    Check(events.Cell(governor, "previous_value") == "1" && events.Cell(governor, "value") == "2" &&
-              events.Cell(governor, "reason") == "2" && events.Cell(governor, "event_qpc") == "11000",
-          "governor_step carries the previous record's step, the new step and the GovernorCause");
-    Check(events.Cell(feasibility, "previous_value").empty() && events.Cell(feasibility, "value") == "1" &&
-              events.Cell(feasibility, "reason") == "1",
-          "a capture-start rung_feasibility has the demoted state, the FeasibilityCause and no previous value");
-    Check(events.Cell(governor, "clock_map_offset_us").empty() && events.Cell(governor, "source_drops").empty(),
-          "controller events leave unrelated columns empty");
+    Check(events.Cell(pipeline, "clock_map_offset_us").empty() && events.Cell(pipeline, "source_drops").empty(),
+          "Source-record events leave unrelated columns empty");
+    for (size_t row = 0; row < events.rows.size(); ++row) {
+        const std::string type = events.Cell(row, "event_type");
+        Check(type != "stall_injected" && type != "governor_step" && type != "rung_feasibility",
+              "retired event types are never written: " + type);
+    }
 }
 } // namespace
 
@@ -945,29 +929,6 @@ int main()
     pipeline.value = 3;  // PacingRung::GpuQueueWait
     pipeline.reason = 0; // PacingFallbackReason::None
     CSV_PushPacingEvent(pipeline);
-
-    PacingCsvEvent stall{};
-    stall.type = PacingCsvEventType::StallInjected;
-    stall.event_qpc = 10000;
-    stall.value = 50000;
-    stall.reason = 9; // not a reason row: never written
-    CSV_PushPacingEvent(stall);
-
-    PacingCsvEvent governor{};
-    governor.type = PacingCsvEventType::GovernorStep;
-    governor.event_qpc = 11000;
-    governor.has_previous = true;
-    governor.previous_value = 1;
-    governor.value = 2;
-    governor.reason = 2; // GovernorCause::Misses
-    CSV_PushPacingEvent(governor);
-
-    PacingCsvEvent feasibility{};
-    feasibility.type = PacingCsvEventType::RungFeasibility;
-    feasibility.event_qpc = 12000;
-    feasibility.value = 1;  // demoted
-    feasibility.reason = 1; // FeasibilityCause::LeadInfeasible
-    CSV_PushPacingEvent(feasibility);
 
     CSV_SetEnabled(false);
     Check(CSV_Shutdown(), "writer stops");

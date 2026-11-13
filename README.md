@@ -1,6 +1,6 @@
 # ReLimiter
 
-A ReShade addon for frame pacing and FPS limiting on NVIDIA G-Sync / VRR displays. Works with DX12, DX11, Vulkan and OpenGL games, and with 32-bit DX9, DX10 and DX11 games through the 32-bit addon.
+A ReShade addon for frame pacing and FPS limiting on NVIDIA G-Sync / VRR displays.
 
 64-bit DirectX 12 with NVIDIA Reflex is the supported and tested configuration; other APIs with Reflex run the same pacer untested; games without Reflex and all 32-bit games get a plain frame-rate cap.
 
@@ -22,9 +22,9 @@ Install via [RHI (ReShade HDR Installer)](https://github.com/RankFTW/RHI) for th
 
 ## Frame Pacing
 
-ReLimiter paces every capped frame against one shared cadence. For each rendered frame it plans when the game is released and when the finished frame should be passed on, and it picks the output point itself from the game, API, display mode and frame-generation state: a GPU queue wait on 64-bit DX12 with native Reflex on VRR, a GPU wait on real frames with frame generation once that route qualifies, a CPU hold at the game's Present marker on other marker routes, or no hold on Present-based routes. It keeps that output point and adjusts it only from measurements. The GPU queue wait lowers how long it may wait on the GPU, in steps down to half of a 1.5 ms budget, while more than 5% of recent GPU resumes are late (it needs GPU Wait Probes and raises the limit again after 30 calm seconds). It also limits how early each frame is released, so that the frame's Present call lands at least a learned margin (about 2.5 ms) after the previous frame's GPU wait release: a Present call closer than that collides with the GPU's resume. A frame that would need an earlier release is shown a little late instead (the panel shows `Release margin`). Every automatic hold steps aside during sustained overload, when more than 10% of frames restart the cadence. The panel then shows `Hold off: overload`, and the holds resume after 2 s without restarts. In 64-bit Reflex games that call the Reflex Sleep, most of the wait happens inside that Sleep call, before the game reads input for the next frame (pre-Sleep placement, the default), and ReLimiter's wait replaces the driver's Reflex Sleep while it paces the game. The panel shows the resolved mode, output point, reason, placement, lead and cadence epoch.
+ReLimiter paces every capped frame against one shared cadence. For each rendered frame it plans when the game is released and when the finished frame is passed on, and it chooses where the frame is held itself, from the game, API, display mode and frame-generation state: a GPU queue wait on 64-bit DX12 with native Reflex on VRR, a GPU wait on real frames with frame generation once that route qualifies, a CPU hold at the game's Present marker on other marker routes, or no hold on Present-based routes. In 64-bit Reflex games that call the Reflex Sleep, most of the wait happens inside that Sleep call, before the game reads input for the next frame, and ReLimiter's wait replaces the driver's Reflex Sleep while it paces the game. The GPU waits release each frame a fixed distance ahead of the next frame's heavy GPU work (or, without NVIDIA Reflex latency reports, its next Present call), so the frame's resume does not queue behind that work. Each frame is released early enough for 99% of recent frames plus 0.5 ms to reach their hold on time, trading a little latency for headroom against uneven frames. Late frames are never held, and after a stall the cadence restarts from the late frame instead of catching up with a burst.
 
-**Smoothing** is always on: each frame's output is held to the cap cadence and the game is released early enough for 99% of recent frames plus 0.5 ms, trading a little latency for headroom against uneven frames. Late frames are never held, and after a stall the cadence restarts from the late frame instead of catching up with a burst.
+The settings panel shows one plain pacing line and, under **Details**, the resolved mode, output point, reason, placement, lead and cadence epoch. **Pacing preference** (64-bit DX12) leans the pacer toward lower latency or more even frames; the default, **Balanced**, is the recommended behaviour.
 
 ## FPS Limiting
 
@@ -34,7 +34,7 @@ Set a target FPS in the settings panel. **VRR Cap** automatically calculates the
 
 ## VSync Override
 
-Force VSync off (recommended when using the frame limiter), force it on, or leave it at whatever the game sets. Works on DX11, DX12, and OpenGL.
+Force VSync off (recommended when using the frame limiter), force it on, or leave it at whatever the game sets. Applies to DX11, DX12 and OpenGL games.
 
 ## Frame Generation
 
@@ -68,23 +68,21 @@ Move the game window between monitors, switch between windowed/borderless/fullsc
 
 ## Advanced
 
-- **Inject Reflex Markers** — Synthesizes NVIDIA Reflex markers for non-Reflex games, enabling driver-side pacing and GPU clock boost.
+- **Inject Reflex Markers** — Synthesizes NVIDIA Reflex markers for non-Reflex games (64-bit addon), enabling driver-side pacing and GPU clock boost.
 - **Flip Model Override** — Forces DX11 games from bitblt to flip model presentation for true VRR operation. May break some games. Requires restart.
 - **Pacing diagnostics** — Developer controls for comparison captures, shown only with `developer_settings=true`: the pacing test mode (`reflex_only` paces nothing and leaves the game's own Reflex running; `driver_limiter` hands the cap to the Reflex driver limiter where it can apply, otherwise the game runs as it is), GPU Wait Probes and flip metering. Leave them at their defaults for normal play.
 - **Telemetry Logging** — Records a per-frame pacing CSV (`relimiter_pacing_*`) and a pacing event CSV (`relimiter_pacing_events_*`) for offline analysis, including each frame's plan, output point and display time. PC Latency is included when native PC Latency measurement is enabled.
 - **Advanced Logging** — Switches the log file to info-level for troubleshooting.
 
-## Supported APIs
+## Supported Configurations
 
-| API | Pacing route | Output point | Notes |
-|---|---|---|---|
-| DX12 | Reflex markers, or Present-based without markers | GPU queue wait (64-bit, VRR, no FG) or FG input wait (64-bit, FG) once qualified; otherwise marker hold (no FG) or none (FG) | Full feature set including Reflex diagnostics |
-| DX11 | Reflex markers (Reflex games, 64-bit) or Present-based | Marker hold, or none on Present-based | Flip Model Override available |
-| DX10 / DX9 | Present-based | None | 32-bit games use `relimiter.addon32` |
-| Vulkan | Streamline PCL markers or Present-based | Marker hold; none with frame generation or on Present-based | |
-| OpenGL | Present-based | None | VSync override may not work in all games |
+| Game | What paces | Status |
+|---|---|---|
+| 64-bit DirectX 12 with NVIDIA Reflex | The queue-based pacer: the Reflex Sleep wait, the GPU queue wait (VRR, no frame generation) or the FG input wait (static frame generation) once qualified | Supported and tested |
+| 64-bit, another API with Reflex markers (DX11 with Reflex, Vulkan with Streamline PCL markers) | The same pacer without the queue-based law; a CPU hold at the Present marker, nothing held with frame generation | Untested |
+| 64-bit without Reflex markers, and every 32-bit game (`relimiter.addon32`) | A plain frame-rate cap at the Present call; nothing is held after it | Fallback: retained and covered by unit tests, not yet validated in a game |
 
-The 32-bit addon paces at Present calls only: no Reflex hooks, frame generation or GPU waits.
+Nothing validates DirectX 11, Vulkan, OpenGL, DirectX 9 or 32-bit pacing. The 32-bit addon paces at Present calls only: no Reflex hooks, frame generation or GPU waits.
 
 ## DLSS Info on OSD
 
@@ -100,12 +98,11 @@ Replacing the game's DLSS DLLs with newer versions (e.g. dropping an updated `nv
 ## Known Limitations
 
 - GPU hardware monitoring (temp, clock, usage, VRAM) is NVIDIA only
-- The GPU queue wait and FG input wait require the 64-bit addon, DX12 and native Reflex markers; other games use a CPU marker hold or no output hold
+- The GPU queue wait and FG input wait require the 64-bit addon, DX12 and native Reflex markers, and the GPU queue wait without frame generation also needs a VRR display; other games use a CPU marker hold or no output hold
+- Only 64-bit DX12 with Reflex has been tested live with the 4.0 pacing core. Not tested: the Present-based fallback (games without Reflex, all 32-bit games), DX11, Vulkan and OpenGL games, fixed-refresh (non-VRR) displays and Dynamic MFG
 - With frame generation on Vulkan, frames are not held after the cap's source wait (the FG input wait needs DX12)
-- Not tested live with the 4.0 pacing core: OpenGL, the 32-bit addon, DX11 games with Reflex, fixed-refresh (non-VRR) displays and Dynamic MFG. DX11 without Reflex and Vulkan were tested in one game each
 - Global DLSS DLL overrides (via NVCP/NVPI) may not be read correctly — replace DLLs in the game folder instead
 - Global DLSS preset overrides won't appear on the OSD — set presets per-game in the NVIDIA App or Profile Inspector
-- Some older Vulkan titles may not work
 - Telemetry Logging writes frame rows only in DXGI games (DX10, DX11, DX12)
 - OpenGL VSync override depends on how the game manages swap intervals
 

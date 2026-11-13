@@ -26,7 +26,9 @@ from typing import Any, Iterable, Iterator
 
 # The first 47 row names (36 raw, 11 derived) are fixed by project-docs/
 # 002_unified_pacing_timing/phase0_measurement_design.md section 5. Both
-# families are append-only after them.
+# families are append-only after them, until the removal of 2026-11-13
+# (REMOVED_PACING_COLUMNS), which deleted seven rows columns of the
+# pre-removal header and changed nothing else.
 PACING_FIXED_RAW_HEADER = [
     "row_kind", "sequence", "capture_epoch", "qpc_frequency",
     "observer_epoch", "native_swapchain", "thread_id", "present_start_qpc",
@@ -44,7 +46,10 @@ PACING_FIXED_DERIVED_HEADER = [
     "display_interval_us", "adjacent_jitter_us", "deviation_us", "real_frame",
     "animation_error_us", "latency_us", "gpu_residence_us", "cpu_hold_us",
 ]
-CURRENT_PACING_HEADER = PACING_FIXED_RAW_HEADER + PACING_FIXED_DERIVED_HEADER + [
+# The rows header of the builds before the removal (199 columns, profile
+# pre-removal-source-199). Every historical prefix length below is a prefix of
+# this header; the columns of REMOVED_PACING_COLUMNS exist only here.
+PRE_REMOVAL_PACING_HEADER = PACING_FIXED_RAW_HEADER + PACING_FIXED_DERIVED_HEADER + [
     "long_frame", "short_frame", "chain_break_reason", "present_candidates",
     "present_end_qpc", "etw_ready_qpc", "pcl_sim_start_qpc", "pcl_present_start_qpc",
     "presentation_mode", "supports_tearing", "display_sync_interval",
@@ -153,6 +158,22 @@ CURRENT_PACING_HEADER = PACING_FIXED_RAW_HEADER + PACING_FIXED_DERIVED_HEADER + 
     "gq_queue_role",
 ]
 
+# Rows columns the writer no longer produces (their producers were removed with
+# the period governor, the pre-Sleep placement and the GPU start probe): empty,
+# constant or per-run constant values in the last builds that wrote them.
+REMOVED_PACING_COLUMNS = (
+    "predicted_render_us", "governor_step", "governor_interval_us", "plan_signal_advance_us",
+    "pre_sleep_margin_us", "gpu_first_submit_qpc", "gpu_start_qpc",
+)
+
+# Profile name of the full pre-removal rows header: pre-removal-source-199.
+PRE_REMOVAL_PROFILE_PREFIX = "pre-removal-source"
+
+# The current rows header (192 columns, profile current-source-192): the
+# pre-removal header without REMOVED_PACING_COLUMNS, the order of the others
+# unchanged.
+CURRENT_PACING_HEADER = [name for name in PRE_REMOVAL_PACING_HEADER if name not in REMOVED_PACING_COLUMNS]
+
 CURRENT_PACING_EVENTS_HEADER = [
     "sequence", "capture_epoch", "event_type", "event_qpc", "qpc_frequency",
     "identity_domain", "previous_value", "value", "native_swapchain",
@@ -186,13 +207,15 @@ CURRENT_PACING_EVENTS_HEADER = [
     "etw_events_lost", "etw_buffers_lost", "lost_present_count", "overflowed_present_count",
     # Phase 2: grid_epoch (PacingEpochReason) and pipeline_change (PacingFallbackReason) rows;
     # Phase 3: governor_step (GovernorCause), rung_feasibility (FeasibilityCause) and, in files
-    # from builds of 2026-10-04 to 2026-10-20, gpu_wait_cap (GpuWaitCapCause) rows
+    # from builds of 2026-10-04 to 2026-10-20, gpu_wait_cap (GpuWaitCapCause) rows (the governor_step,
+    # rung_feasibility and stall_injected types are no longer written; their numbers stay);
     "reason",
 ]
 
-# Earlier files carry a prefix of the current header of these lengths. The
-# events header did not change in Phase 3 or 4 (new event kinds only), so a
-# Phase 2 events file is current-source-86.
+# Earlier rows files carry a prefix of PRE_REMOVAL_PACING_HEADER of these
+# lengths (the lengths count the pre-removal columns, so they stay valid for
+# the old header only). The events header did not change in Phase 3 or 4 (new
+# event kinds only), so a Phase 2 events file is current-source-86.
 HISTORICAL_PACING_HEADER_LENGTHS = (198, 195, 189, 183, 172, 162, 161, 159, 158, 148, 142, 140, 138, 136, 133, 132, 129, 122, 111)  # before the queue role column;
                                                                                                                                       # before the render-thread feed columns;
                                                                                                                                 # before the CPU time and thread id columns;
@@ -254,6 +277,9 @@ UNSEQUENCED_EVENT_TYPES = frozenset({"capture_start", "capture_end"})
 # (unjoined Present rows are emitted later), so only FrameView time is checked.
 TIMESTAMP_COLUMNS = {"frameview": "TimeInSeconds"}
 
+# Only the columns present in the header are counted: the removed columns listed here (predicted_render_us,
+# governor_interval_us, plan_signal_advance_us, pre_sleep_margin_us) appear in pre-removal files and are
+# absent, not zero, in current ones.
 METRIC_COLUMNS = {
     "relimiter_pacing": [
         "target_output_interval_us", "display_interval_us", "adjacent_jitter_us",
@@ -374,17 +400,30 @@ def detect_kind(header: list[str]) -> str:
     return "unknown"
 
 
+def has_removed_columns(header: Iterable[str]) -> bool:
+    """True when the header carries any column of REMOVED_PACING_COLUMNS: a file of the pre-removal profile or
+    of a historical prefix that reaches one (Phase 1 on). Such a file's build may have written the removed
+    mechanisms' events (stall_injected, governor_step, rung_feasibility); every other header names a build that
+    wrote none of them or predates them, so their summaries are unavailable, never a count of zero."""
+    columns = set(header or ())
+    return any(name in columns for name in REMOVED_PACING_COLUMNS)
+
+
 def schema_profile(kind: str, header: list[str]) -> str:
+    # (current header, header the historical lengths are prefixes of, profile of that full header)
     profiles = {
-        "relimiter_pacing": (CURRENT_PACING_HEADER, HISTORICAL_PACING_HEADER_LENGTHS),
-        "relimiter_pacing_events": (CURRENT_PACING_EVENTS_HEADER, HISTORICAL_PACING_EVENTS_HEADER_LENGTHS),
+        "relimiter_pacing": (CURRENT_PACING_HEADER, PRE_REMOVAL_PACING_HEADER, HISTORICAL_PACING_HEADER_LENGTHS),
+        "relimiter_pacing_events": (CURRENT_PACING_EVENTS_HEADER, CURRENT_PACING_EVENTS_HEADER,
+                                    HISTORICAL_PACING_EVENTS_HEADER_LENGTHS),
     }
     if kind in profiles:
-        current, historical_lengths = profiles[kind]
+        current, historical, historical_lengths = profiles[kind]
         if header == current:
             return f"current-source-{len(current)}"
+        if historical is not current and header == historical:
+            return f"{PRE_REMOVAL_PROFILE_PREFIX}-{len(historical)}"
         for length in historical_lengths:
-            if header == current[:length]:
+            if header == historical[:length]:
                 return f"historical-source-{length}"
         return "historical-or-unknown"
     if kind == "frameview":
@@ -529,6 +568,10 @@ def _family_warnings(result: dict[str, Any], file_name: str) -> list[str]:
     if profile == "historical-or-unknown":
         warnings.append("The ordered header differs from the bundled current-source profile; "
                         "verify every field against its producing source revision.")
+    elif profile.startswith(f"{PRE_REMOVAL_PROFILE_PREFIX}-"):
+        warnings.append("The header is the pre-removal schema: the columns " + ", ".join(REMOVED_PACING_COLUMNS) +
+                        " exist and carry the removed mechanisms' values, which are empty, constant or zero in "
+                        "the last builds that wrote them; later builds do not write them.")
     elif profile.startswith("historical-source-"):
         warnings.append("The header is an earlier append-only schema: columns appended since are absent, "
                         "not zero.")

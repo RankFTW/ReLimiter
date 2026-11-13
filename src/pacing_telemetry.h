@@ -91,7 +91,7 @@ struct PacingPresentAttribution {
     int64_t marker_hold_target_qpc = 0;
     int64_t marker_hold_release_qpc = 0;
     // PacingPlanStatus of the PRESENT_START executor (H0 or H1); 0 when it
-    // reported nothing (e.g. the plan belongs to H2 or H3).
+    // reported nothing (e.g. the plan belongs to H3).
     uint8_t plan_status = 0;
 };
 

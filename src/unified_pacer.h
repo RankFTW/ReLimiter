@@ -1,6 +1,6 @@
 #pragma once
 
-// Unified pacer (developer live key unified_pacer): the pure law. One start
+// Unified pacer (developer unified owner): the pure law. One start
 // target per real frame from the frame's own origin, an interval built from the
 // cap, the VRR ceiling, the game's limit, the idle cap and the GPU's service
 // time, a hard limit on unfinished frames, and the decisions around the Sleep

@@ -72,7 +72,7 @@ private:
 
 // ── Planned frame ──
 
-// ── Unified pacer (developer key unified_pacer; unified_pacer.h) ──
+// ── Unified pacer (unified owner; unified_pacer.h) ──
 
 // The marker-site start wait of the unified branch runs in chunks of at most this long (the
 // production waiter and PreSleepWaitUntil reject waits over 500 ms; the law accepts any I).
@@ -153,7 +153,7 @@ struct SourceStageRequest {
     uint64_t driver_sleep_index = 0;
     int64_t driver_sleep_start_qpc = 0;
     int64_t driver_sleep_end_qpc = 0;
-    // Developer key unified_pacer: the unified branch (above).
+    // Unified owner: the unified branch (above).
     SourceStageUnifiedRequest unified{};
 };
 
@@ -180,7 +180,7 @@ struct SourceStageFrame {
     // none), for the source record.
     int64_t driver_sleep_start_qpc = 0;
     int64_t driver_sleep_end_qpc = 0;
-    // Developer key unified_pacer: set by the unified branch.
+    // Unified owner: set by the unified branch.
     SourceStageUnifiedFrame unified{};
 };
 
@@ -205,7 +205,7 @@ public:
     // Enforcement-marker change: lead buckets only.
     void ResetBuckets() noexcept { lead_.ResetBuckets(); }
 
-    // ── Developer key unified_pacer ──
+    // ── Unified owner ──
     // The law is owned here: stage events and reports feed it only while enabled
     // (the key on), so the key-off stage is untouched. SetUnifiedEnabled(false)
     // also resets it.
@@ -288,7 +288,7 @@ public:
 private:
     // The unified branch of RunPlannedFrame.
     SourceStageFrame RunUnifiedFrame(const SourceStageRequest& request, SourceStageClock* clock) noexcept;
-    // Key unified_pacer, saturation rule (b): the law's used reports to the lead (exact
+    // Unified owner, saturation rule (b): the law's used reports to the lead (exact
     // identity, each frame once) when forward_reports, and the law's report-stream liveness
     // (QueueWaitLive at the grid's next index) to the lead. Only with the key on.
     void SyncUnifiedLead(bool forward_reports) noexcept;

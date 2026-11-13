@@ -5,8 +5,9 @@ Rebuilds each real frame's Reflex marker timeline in the local QPC domain
 (reflex_local_present_start_qpc anchors the Reflex microsecond timestamps of
 the same report) and relates it to ReLimiter's plan: the source release s, the
 planned release S = T - L and the output target T. Frames are split into held
-(plan_rung > 0) and not held (plan_rung 0) segments; every hold feasibility
-(rung_feasibility) and pipeline change starts a settle window that is excluded
+(plan_rung > 0) and not held (plan_rung 0) segments; every pipeline change
+(and, in captures of the pre-removal profile, every hold feasibility
+rung_feasibility event) starts a settle window that is excluded
 from both. Per segment it reports:
 
 - stages: simulation (SIMULATION_START -> SIMULATION_END), the queue in front
@@ -97,7 +98,7 @@ from pathlib import Path
 from typing import Any
 
 from analyze_pacing import events_sibling, lower_quantile
-from inspect_capture import is_missing
+from inspect_capture import has_removed_columns, is_missing
 
 RUNG_NAMES = {0: "source_only", 1: "marker_hold", 2: "native_hold", 3: "gpu_queue_wait", 4: "fg_input_wait"}
 EPOCH_REASONS = {1: "lifecycle", 2: "mode_change", 3: "period_change", 4: "source_late", 5: "output_late",
@@ -172,6 +173,9 @@ class Capture:
     transitions: list[float] = field(default_factory=list)              # ms
     epochs: list[tuple[float, int]] = field(default_factory=list)       # (ms, reason)
     pauses: list[tuple[float, float | None]] = field(default_factory=list)
+    # False: the capture's build has no hold feasibility guard (its rows header has none of the removed
+    # columns), so pauses are unavailable, not empty.
+    feasibility_events: bool = True
 
 
 def load(path: Path, events_path: Path | None = None) -> Capture:
@@ -179,7 +183,9 @@ def load(path: Path, events_path: Path | None = None) -> Capture:
     displays = []
     frequency = 0.0
     with path.open(encoding="utf-8-sig", newline="") as stream:
-        for row in csv.DictReader(stream):
+        reader = csv.DictReader(stream)
+        feasibility_events = has_removed_columns(reader.fieldnames or [])
+        for row in reader:
             freq = _float(row, "qpc_frequency")
             if not freq:
                 continue
@@ -225,7 +231,7 @@ def load(path: Path, events_path: Path | None = None) -> Capture:
     for frame in frames:
         unique.setdefault(frame.frame_id, frame)  # FG outputs repeat a real frame's row
     capture = Capture(path, frequency, sorted(unique.values(), key=lambda f: f.frame_id),
-                      sorted(displays, key=lambda d: d[0]))
+                      sorted(displays, key=lambda d: d[0]), feasibility_events=feasibility_events)
     events = events_path or events_sibling(path)
     if events is not None and events.exists() and frequency:
         _load_events(capture, events)
@@ -674,8 +680,9 @@ def analyze(path: Path, events_path: Path | None = None, settle_s: float = 2.0, 
     origin = capture.frames[0].s if capture.frames else 0.0
     report: dict[str, Any] = {
         "path": str(path), "real_frames": len(capture.frames),
-        "pauses_s": [(round((a - origin) / 1000.0, 3), None if b is None else round((b - origin) / 1000.0, 3))
-                     for a, b in capture.pauses],
+        "pauses_s": (None if not capture.feasibility_events else
+                     [(round((a - origin) / 1000.0, 3), None if b is None else round((b - origin) / 1000.0, 3))
+                      for a, b in capture.pauses]),
         "settle_s": settle_s,
         "segments": {seg: segment_report(capture, segmenter, seg, quantile, allowance_us / 1000.0)
                      for seg in ("held", "not_held")},
@@ -715,8 +722,10 @@ def _qtext(entry: dict[str, Any]) -> str:
 
 
 def format_report(report: dict[str, Any]) -> str:
+    pauses = ("unavailable (no hold feasibility guard in this capture's build)" if report["pauses_s"] is None
+              else report["pauses_s"] or "none")
     lines = [f"Capture: {report['path']}", f"  real frames {report['real_frames']}, pauses (s, QPC clock) "
-             f"{report['pauses_s'] or 'none'}, settle {report['settle_s']} s after each transition"]
+             f"{pauses}, settle {report['settle_s']} s after each transition"]
     for name, seg in report["segments"].items():
         if not seg.get("frames"):
             lines.append(f"  [{name}] no frames")
@@ -807,7 +816,8 @@ def main() -> int:
     parser.add_argument("captures", type=Path, nargs="+", help="relimiter_pacing_*.csv rows files")
     parser.add_argument("--events", type=Path, help="events file (single capture only; default: the sibling)")
     parser.add_argument("--settle-seconds", type=float, default=2.0,
-                        help="excluded after each rung_feasibility or pipeline change (default 2)")
+                        help="excluded after each pipeline change and, in pre-removal captures, each "
+                             "rung_feasibility event (default 2)")
     parser.add_argument("--quantile", type=float, default=0.95, help="Smoothing lead quantile q for d (default 0.95)")
     parser.add_argument("--allowance-us", type=float, default=500.0, help="Smoothing allowance for d (default 500)")
     parser.add_argument("--replay-floor", type=parse_floor, action="append", default=[],

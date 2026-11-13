@@ -148,8 +148,6 @@ set(ADDON_SOURCES
     src/source_stage.cpp
     src/pacing_telemetry.h
     src/pacing_telemetry.cpp
-    src/pacing_controller_events.h
-    src/pacing_controller_events.cpp
     src/pacing_metrics.h
     src/pacing_metrics.cpp
     src/pacing_join.h

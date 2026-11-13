@@ -1,6 +1,6 @@
 // Production-linked Windows/MSVC C++17 tests, not a copied publication model.
 // Includes nvapi_hooks.cpp and presentation_gate.cpp to exercise the actual
-// private detour and the CPU output executors (H0/H1, and the H2 core) with the
+// private detour and the CPU output executors (H0/H1) with the
 // production frame plans, cadence grid, output tracker and pipeline publication.
 // The unrelated hook/scheduler services below are test
 // doubles: these tests do NOT validate driver forwarding, pacing or live hooks.
@@ -2432,52 +2432,36 @@ void TestPresentStartExecutors() {
     CHECK(attribution.plan_status == Status(PacingPlanStatus::Duplicate));
     CHECK(attribution.marker_output == PacingOutputKind::None && events.output_releases == 0);
 
-    // H2 and H3 plans: PRESENT_START reports the arrival only; OtherRung
-    // calls do nothing and never consume the plan.
-    for (PacingRung later : {PacingRung::NativeHold, PacingRung::GpuQueueWait}) {
-        const uint64_t id = later == PacingRung::NativeHold ? 807 : 808;
-        const auto later_plan = PublishPlan(Key(id), later, 5'000.0);
-        attribution = SendPresentStart(&device, id);
+    // H3 plan: PRESENT_START reports the arrival only; OtherRung calls do
+    // nothing and never consume the plan.
+    {
+        const auto later_plan = PublishPlan(Key(808), PacingRung::GpuQueueWait, 5'000.0);
+        attribution = SendPresentStart(&device, 808);
         events = DrainStageEvents();
         CHECK(attribution.plan_status == Status(PacingPlanStatus::Unknown));
         CHECK(attribution.marker_output == PacingOutputKind::None);
         CHECK(events.marker_arrivals == 1 && events.output_releases == 0);
         PresentationGateResult other{};
         s_gate_qpc = 0;
-        PresentGate_Execute(later_plan.key, PacingRung::MarkerHold, RealQpc(), nullptr, &other);
+        PresentGate_Execute(later_plan.key, PacingRung::MarkerHold, RealQpc(), &other);
         CHECK(!other.claimed && !other.held && other.status == PacingPlanStatus::Unknown);
-        CHECK(DrainStageEvents().output_releases == 0);
-        if (later != PacingRung::NativeHold) continue;
-        // H2 core of the executor (no production caller passes NativeHold any more; the native Present
-        // only declines GpuQueueWait plans): the NativeHold claim holds once, then reports Duplicate.
-        PresentationGateResult native{};
-        s_gate_qpc = 0;
-        PresentGate_Execute(later_plan.key, PacingRung::NativeHold, RealQpc(), nullptr, &native);
-        events = DrainStageEvents();
-        CHECK(native.claimed && native.held && native.status == PacingPlanStatus::Held);
-        CHECK(native.target_qpc == later_plan.output_target_qpc && native.release_qpc >= native.target_qpc);
-        CHECK(events.output_releases == 1 && events.release.rung == PacingRung::NativeHold);
-        CHECK(TrackedOutput(later_plan) == native.release_qpc);
-        s_gate_qpc = 0;
-        PresentGate_Execute(later_plan.key, PacingRung::NativeHold, RealQpc(), nullptr, &native);
-        CHECK(!native.claimed && native.status == PacingPlanStatus::Duplicate);
         CHECK(DrainStageEvents().output_releases == 0);
     }
 
-    // H2 decline of the executor (PresentGate_DeclineOutput): the NativeHold plan is
+    // Decline of the executor (PresentGate_DeclineOutput): the GpuQueueWait plan is
     // claimed and reported Undeliverable at the decision time, never held.
-    const auto declined_plan = PublishPlan(Key(809), PacingRung::NativeHold, 5'000.0);
+    const auto declined_plan = PublishPlan(Key(809), PacingRung::GpuQueueWait, 5'000.0);
     PresentationGateResult declined{};
     PresentGate_DeclineOutput(declined_plan.key, PacingRung::MarkerHold, RealQpc(), &declined);
     CHECK(!declined.claimed && declined.status == PacingPlanStatus::Unknown); // OtherRung
     const int64_t decision_qpc = RealQpc();
-    PresentGate_DeclineOutput(declined_plan.key, PacingRung::NativeHold, decision_qpc, &declined);
+    PresentGate_DeclineOutput(declined_plan.key, PacingRung::GpuQueueWait, decision_qpc, &declined);
     events = DrainStageEvents();
     CHECK(declined.claimed && !declined.held && declined.status == PacingPlanStatus::Undeliverable);
     CHECK(events.output_releases == 1 && events.release.qpc == decision_qpc &&
         events.release.status == PacingPlanStatus::Undeliverable);
     CHECK(TrackedOutput(declined_plan) == decision_qpc);
-    PresentGate_DeclineOutput(declined_plan.key, PacingRung::NativeHold, decision_qpc, &declined);
+    PresentGate_DeclineOutput(declined_plan.key, PacingRung::GpuQueueWait, decision_qpc, &declined);
     CHECK(!declined.claimed && declined.status == PacingPlanStatus::Duplicate);
     CHECK(DrainStageEvents().output_releases == 0);
     NvAPI_ClearFeedbackDevice();
@@ -2552,7 +2536,7 @@ void TestNativeRouteFromEveryMarker() {
         const uint64_t variant = frame % 4;
         if (variant != 3) {
             const PacingRung rung = variant == 0 ? PacingRung::SourceOnly :
-                variant == 1 ? PacingRung::MarkerHold : PacingRung::NativeHold;
+                variant == 1 ? PacingRung::MarkerHold : PacingRung::GpuQueueWait;
             PublishPlan(Key(frame), rung, 2'000.0);
         }
         s_clock_map_frame_id = 0;
@@ -2637,42 +2621,6 @@ void TestFrameMarkerStageEvents() {
     CHECK(drain(&event) == 0);
     CHECK(s_forwarded_markers - forwarded_before == 12);
     NvAPI_ClearFeedbackDevice();
-}
-
-void TestNativeEndpointCancellation() {
-    // H2 core with route revalidation (PresentationGateOptions; no production caller remains): the hold never
-    // needs the owner and a revoked route cancels it (Stale) with its partial residence retained.
-    const auto plan = PublishPlan(Key(500), PacingRung::NativeHold, 8'000.0);
-    DrainStageEvents();
-    s_gate_entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    s_gate_continue = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    CHECK(s_gate_entered && s_gate_continue);
-    std::atomic<bool> current{true};
-    const PresentationGateOptions options{
-        [](const void* value) noexcept { return static_cast<const std::atomic<bool>*>(value)->load(); },
-        &current};
-    s_pause_gate = true;
-    const unsigned holds_before = s_gate_hold_publications;
-    PresentationGateResult result{};
-    std::thread render([&] {
-        s_gate_qpc = 0;
-        PresentGate_Execute(plan.key, PacingRung::NativeHold, RealQpc(), &options, &result);
-    });
-    CHECK(WaitForSingleObject(s_gate_entered, 5000) == WAIT_OBJECT_0);
-    { SchedulerOwnerGuard owner; CHECK(static_cast<bool>(owner)); }
-    current = false; // settings/swapchain/FG token revoked while the native hold spins
-    SetEvent(s_gate_continue);
-    render.join();
-    const auto events = DrainStageEvents();
-    CHECK(result.claimed && result.held && result.status == PacingPlanStatus::Stale);
-    CHECK(result.release_qpc < result.target_qpc);
-    CHECK(s_gate_hold_publications == holds_before + 1); // partial owned residence retained
-    CHECK(events.output_releases == 1 && events.release.status == PacingPlanStatus::Stale &&
-        events.release.rung == PacingRung::NativeHold);
-    CHECK(TrackedOutput(plan) == result.release_qpc);
-    CloseHandle(s_gate_entered);
-    CloseHandle(s_gate_continue);
-    s_gate_entered = s_gate_continue = nullptr;
 }
 
 void ReplayDawnwalker(const char* path) {
@@ -2870,7 +2818,6 @@ int main(int argc, char** argv) {
     TestEnforcementDuringGateAndCancellation();
     TestNativeRouteFromEveryMarker();
     TestFrameMarkerStageEvents();
-    TestNativeEndpointCancellation();
     TestReflexCallForwarding();
     TestDriverLimiterSleepMode();
     TestSleepStatusAtSleepReturn();

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare the arms of a ReLimiter pacing-mechanism evaluation and apply its decision rule.
+"""Compare the arms of a ReLimiter pacing evaluation (preferences, test modes, routes) and apply its decision rule.
 
 Input is an evaluation plan (assets/pacing-evaluation-plan.json): arms (the
 settings of each setup), scenes (light or heavy), the capture protocol, the
@@ -11,9 +11,9 @@ quantiles) on its primary swapchain, the one with the most display changes.
 Per run: adjacent display jitter p50/p90/p99, the share of display intervals
 deviating from T_out by more than each threshold, the long-frame share
 (> 1.5 T_out), |animation error| p99 of real frames, native PC Latency p50,
-the hold state (plan rungs, time with the hold stepped aside) and the arm it
-actually ran (pipeline reasons, plan rungs, source placement), checked against
-the arm's expectation.
+the hold state (plan rungs; pre-removal captures only: the time with the hold feasibility guard stepped
+aside, unavailable on current captures) and the arm it actually ran (pipeline reasons, plan rungs, source
+placement), checked against the arm's expectation.
 
 Per scene and comparison: candidate - baseline of the run means, a 95%
 block-bootstrap interval (time blocks resampled within each run), and the
@@ -52,6 +52,8 @@ import analyze_pacing as pacing
 
 PLAN_SCHEMA = "relimiter-pacing-evaluation/2"
 SCENE_CLASSES = ("light", "heavy")
+# The rung_feasibility event was written by the hold feasibility guard, which no longer exists: captures that carry
+# the governor columns (pre-removal profile) may hold it, every other capture reports the hold-off share unavailable.
 FEASIBILITY_EVENT = "rung_feasibility"
 PIPELINE_EVENT = "pipeline_change"
 
@@ -331,7 +333,8 @@ def pipeline_states(events: list[dict[str, str]]) -> tuple[set[str], set[str]]:
 def hold_off_share(events: list[dict[str, str]]) -> float | None:
     """Share of the capture with the hold feasibility guard demoting (rung_feasibility value 1: overload or a
     not-held A/B block; the GPU queue wait's saturation fallback in 2026-10-05/06 builds, the slow-resume pause
-    or scorecard in interim builds)."""
+    or scorecard in interim builds). Meaningful only for a capture whose build wrote the event (the pre-removal
+    profile; the caller passes None otherwise): without an event it is 0.0 there, a measured zero."""
     starts = [_int(row, "event_qpc") for row in events if row.get("event_type") == "capture_start"]
     ends = [_int(row, "event_qpc") for row in events if row.get("event_type") == "capture_end"]
     if not starts or not ends or starts[0] is None or ends[-1] is None or ends[-1] <= starts[0]:
@@ -445,7 +448,7 @@ def analyze_run(index: int, run: dict[str, Any], plan: dict[str, Any], base: Pat
                    "plan_rung_rows": dict(row_rungs), "placement_rows": dict(placements),
                    "held_share": (None if not planned else
                                   1.0 - row_rungs.get("source_only", 0) / planned),
-                   "hold_off_share": hold_off_share(events)}
+                   "hold_off_share": hold_off_share(events) if report["input"]["pre_removal_columns"] else None}
 
     if series is None or not series.intervals:
         result.flags.append("no_display_intervals: native PC Latency collection or display rows missing")
@@ -644,11 +647,11 @@ def judge_rule(plan: dict[str, Any], comparisons: list[dict[str, Any]], rule: di
 def decide(plan: dict[str, Any], comparisons: list[dict[str, Any]]) -> dict[str, Any]:
     """The plan's decision rules (decision.judge, see judge_rule) and the
     optional fallback check (decision.fallback: a comparison without the
-    mechanism under test, here the hold without its overload fallback, against
-    the same baseline as the rule it names in 'judged'), per heavy scene:
-    'needed' when that comparison is 'worse' on a primary metric while the
-    judged rule's is not; 'not_needed' when it is not worse on any; else
-    'inconclusive'."""
+    mechanism under test, against the same baseline as the rule it names in
+    'judged'; older plans use it for the hold without its overload fallback),
+    per heavy scene: 'needed' when that comparison is 'worse' on a primary
+    metric while the judged rule's is not; 'not_needed' when it is not worse
+    on any; else 'inconclusive'."""
     decision = plan["decision"]
     rules = {rule["id"]: judge_rule(plan, comparisons, rule) for rule in decision["judge"]}
     fallback = {}
@@ -785,9 +788,15 @@ def format_schedule(plan: dict[str, Any]) -> str:
     lines.extend(f"  {key}={value}" for key, value in plan.get("common_settings", {}).items())
     lines.append("")
     for scene in plan["scenes"]:
-        lines.append(f"Scene {scene['id']} ({scene['class']}): {scene.get('description', '')}")
+        cap = scene.get("target_fps")
+        lines.append(f"Scene {scene['id']} ({scene['class']}): {scene.get('description', '')}"
+                     + (f" Cap: target_fps={cap} unless the arm sets its own." if cap else ""))
         lines.append("  One game session; hold the scene, camera and cap constant. For each run:")
-        for order, arm_id in enumerate(protocol.get("run_order", []), start=1):
+        # The scene's runs in the plan name its arms and their order; a scene without runs uses the protocol's.
+        scene_runs = sorted((run for run in plan["runs"] if run["scene"] == scene["id"]),
+                            key=lambda run: run.get("order") or 0)
+        arm_order = [run["arm"] for run in scene_runs] or protocol.get("run_order", [])
+        for order, arm_id in enumerate(arm_order, start=1):
             arm = plan["arms"][arm_id]
             lines.append(f"  {order}. {arm_id} ({arm.get('label', '')}): {arm.get('osd', '')}; wait "
                          f"{protocol.get('settle_seconds', 0)} s, turn Telemetry Logging on, capture "

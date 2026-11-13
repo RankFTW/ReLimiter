@@ -235,11 +235,10 @@ void TestFillSourceRecord()
     CHECK(frame.planned && frame.slept);
 
     PacingSourceRecord record{};
-    record.predicted_render_us = 123.0;
     SourceStage::FillSourceRecord(frame, pipeline, &record);
     CHECK((record.flags & PACING_SOURCE_SLEPT) != 0);
     CHECK((record.flags & PACING_SOURCE_FIXED_REFRESH) == 0);
-    CHECK((record.flags & PACING_SOURCE_STALL_INJECTED) == 0);
+    CHECK((record.flags & 0xC4) == 0); // bits 2, 6, 7: retired, never set by this build
     CHECK((record.flags & PACING_SOURCE_PASSTHROUGH) == 0);
     CHECK(record.wake_target_qpc == frame.wait_target_qpc);
     CHECK(record.wake_target_qpc == frame.plan.source_wake_qpc);
@@ -254,19 +253,15 @@ void TestFillSourceRecord()
     CHECK(record.plan_rung == static_cast<uint8_t>(PacingRung::MarkerHold));
     CHECK(record.pipeline_generation == 7);
     CHECK(record.fallback_reason == static_cast<uint8_t>(PacingFallbackReason::None));
-    CHECK(record.predicted_render_us == 0.0);
-    CHECK(record.stall_injected_us == 0);
 
     // No plan (passthrough): pipeline fields only.
     PacingSourceRecord passthrough{};
     passthrough.flags = PACING_SOURCE_PASSTHROUGH;
-    passthrough.predicted_render_us = 5.0;
     const PacingPipelineSnapshot off = Pipeline(PacingTimingMode::Off, PacingRung::SourceOnly);
     SourceStage::FillSourceRecord({}, off, &passthrough);
     CHECK(passthrough.flags == PACING_SOURCE_PASSTHROUGH);
     CHECK(passthrough.grid_index == 0 && passthrough.grid_epoch == 0);
     CHECK(passthrough.plan_output_target_qpc == 0);
-    CHECK(passthrough.predicted_render_us == 0.0);
     CHECK(passthrough.pipeline_generation == 7);
 }
 
@@ -2618,7 +2613,7 @@ public:
             CHECK(((record.flags & PACING_SOURCE_SLEPT) != 0) == frame.slept);
             CHECK(((record.flags & PACING_SOURCE_FIXED_REFRESH) != 0) ==
                 (step.mode == PacingTimingMode::Fixed || (step.extra_flags & PACING_SOURCE_FIXED_REFRESH) != 0));
-            CHECK((record.flags & PACING_SOURCE_GPU_PACED) == 0 && (record.flags & PACING_SOURCE_STALL_INJECTED) == 0);
+            CHECK((record.flags & 0xC4) == 0); // bits 2, 6, 7: retired, never set by this build
         }
         CHECK(record.wake_target_qpc == frame.wait_target_qpc && record.source_wait_start_qpc == frame.wait_start_qpc);
         CHECK(record.release_qpc == frame.release_qpc && record.interval_us == frame.plan.interval_us);

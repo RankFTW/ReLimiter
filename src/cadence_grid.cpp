@@ -380,7 +380,7 @@ bool ResolveOutputTargetImpl(
     }
     // TargetOf succeeded, so a segment resolves grid_index.
     // Spacing floor o(n - 1) + I_floor - slack. I_floor is the segment's display-side interval
-    // (key unified_pacer: I_disp, never the GPU term) ONLY when the caller passes display_floor
+    // (unified owner: I_disp, never the GPU term) ONLY when the caller passes display_floor
     // (the executors pass the live key), else the commanded I: a snapshot copied or published
     // under the key and resolved after it was turned off must not apply the floor, whatever its
     // segments still hold. The slack comes from the displayed interval I_floor / D. The start
@@ -427,7 +427,7 @@ bool CadenceGrid_ResolveOutputTarget(
             floored, display_divisor, display_floor)) {
         return false;
     }
-    // Hold credit (key unified_pacer): a debt is repaid by releasing the frame earlier by the
+    // Hold credit (unified owner): a debt is repaid by releasing the frame earlier by the
     // advance, applied to the resolved target (nominal or floored alike). Only under the live
     // key (display_floor); the existing late path releases a target that is already due.
     if (display_floor && std::isfinite(advance_us) && advance_us > 0.0 && snapshot.qpc_frequency > 0) {
@@ -653,7 +653,7 @@ CadenceGridPlan CadenceGrid::PlanAt(const CadenceGridPlanAtInput& input) noexcep
     ExactQpc origin{};
     origin.whole = input.origin_qpc;
     origin.fraction = input.origin_fraction;
-    // Key unified_pacer: the display-side floor interval (0 or an unusable value = none).
+    // Unified owner: the display-side floor interval (0 or an unusable value = none).
     const double floor_interval_ticks = std::isfinite(input.display_interval_us) &&
             input.display_interval_us > 0.0 &&
             input.display_interval_us * ticks_per_us <= kMaximumSpanTicks

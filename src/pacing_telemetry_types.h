@@ -55,16 +55,12 @@ enum PacingSourceFlags : uint8_t {
     // marker. Reuses the bit of the retired pre-Reflex pacing, which
     // had the same meaning.
     PACING_SOURCE_PRE_SLEEP = 1u << 1,
-    // The GPU floor released this frame (developer A/B gpu_paced_cadence,
-    // SourceStageFrame::gpu_paced), or the driver's Reflex Sleep did (the
-    // Sleep kept, same key; SourceStageFrame::driver_released). Reuses the
-    // bit of the retired predictor, which no build after Phase 0 set.
-    PACING_SOURCE_GPU_PACED = 1u << 2,
+    // bit 2: retired, never set by this build
     PACING_SOURCE_FIXED_REFRESH = 1u << 3,
     PACING_SOURCE_BACKGROUND = 1u << 4,
-    PACING_SOURCE_PASSTHROUGH = 1u << 5, // no pacing decision for this frame
-    PACING_SOURCE_OVERLOAD = 1u << 6,    // period governor stretches the cap interval
-    PACING_SOURCE_STALL_INJECTED = 1u << 7 // developer stall injector delayed this release
+    PACING_SOURCE_PASSTHROUGH = 1u << 5 // no pacing decision for this frame
+    // bit 6: retired, never set by this build
+    // bit 7: retired, never set by this build
 };
 
 // Scheduler owner thread, once per OnMarker call, after the source wait.
@@ -78,10 +74,9 @@ struct PacingSourceRecord {
     int64_t marker_qpc = 0;      // timestamp passed to OnMarker
     int64_t wake_target_qpc = 0; // requested source wake; 0 when no wait was planned
     int64_t release_qpc = 0;     // s_n: control returns toward the game
-    double interval_us = 0.0;    // effective source interval: governor step and LFC applied
+    double interval_us = 0.0;    // effective source interval
     double fg_divisor = 1.0;
     int32_t target_fps = 0;
-    double predicted_render_us = 0.0; // retired legacy predictor; always 0
 
     // Frame plan. Meaningful
     // only when grid_index != 0; passthrough frames have no plan.
@@ -93,26 +88,10 @@ struct PacingSourceRecord {
     uint8_t plan_rung = 0;               // PacingRung
     uint32_t pipeline_generation = 0;    // PacingPipelineSnapshot::generation
     uint8_t fallback_reason = 0;         // PacingFallbackReason of the resolved pipeline
-    uint32_t stall_injected_us = 0;      // developer stall injector; 0 = none
-
-    // Controller fields. The first
-    // two are CSV row columns (the third controller column,
-    // plan_signal_advance_us, is a constant); the causes and the overload
-    // guard state feed the governor_step and rung_feasibility events.
-    // governor_step: VRR, the stretch in whole percent of I_0; snapped
-    // fixed refresh, whole refreshes above the base; 0 when not governed.
-    uint8_t governor_step = 0;
-    double governor_interval_us = 0.0;   // governed interval before LFC; 0 when the governor did not run
-    uint8_t governor_cause = 0;          // GovernorCause of a transition on this frame; 0 otherwise
-    uint8_t feasibility_demoted = 0;     // 1 while the overload guard or a not-held A/B interleave block
-                                         // keeps an Auto hold off
-    uint8_t feasibility_cause = 0;       // FeasibilityCause of the newest transition (4 = overload, 3 = retry,
-                                         // 10/11 = A/B interleave; 1/2, 5..9 and 12..14 only from older builds)
 
     // Source placement. CSV row columns.
     uint8_t source_placement = 0;        // PacingSourcePlacement of the resolved pipeline
     int64_t pre_sleep_end_qpc = 0;       // end of this frame's pre-Sleep wait; 0 = none
-    double pre_sleep_margin_us = 0.0;    // margin of that pre-wait; 0 = none
     // Gated holds (lead_controller.h): where ReLimiter's waits for
     // this frame started, so analysis can rebuild the gated hold of earlier
     // frames. CSV row columns.
@@ -135,7 +114,7 @@ struct PacingSourceRecord {
     uint8_t driver_use_game_sleep = 0;
     uint32_t driver_sleep_interval_us = 0;
 
-    // Developer key unified_pacer (src/unified_pacer.h): the
+    // Unified owner (src/unified_pacer.h): the
     // start law's decision for this frame, filled in RunPlanned. up_valid 0
     // (key off, passthrough, DMFG): every up_ CSV cell is empty. Each *_valid
     // byte gates its own cell; up_grid_target_qpc 0 and up_outstanding -1 are
@@ -267,13 +246,6 @@ struct PacingReadyRecord {
     int64_t ready_qpc = 0; // mapped GPU timestamp; 0 when invalid
     uint8_t valid = 0;
     uint8_t before_gate = 0; // 1 when the query was submitted before any ReLimiter hold
-    // Developer key gpu_start_probe: the QPC of the frame's first
-    // ExecuteCommandLists on the presenting queue, read before the call was
-    // forwarded, and the QPC at which the completion of ReLimiter's Signal in
-    // front of that submission was observed (the sampler's wake). 0 = none
-    // (probe off or failed, frame boundary unknown, completion not observed).
-    int64_t gpu_first_submit_qpc = 0;
-    int64_t gpu_start_qpc = 0;
 };
 
 // Developer key gpu_queue_probe (gpu_queue_probe_core.h): what the presenting queue did for one
@@ -338,16 +310,16 @@ struct PacingGpuQueueRecord {
     // Upper ends of the probe's tail-stamp uncertainty: the existing scalar fields empty_us,
     // boundary_idle_us and min_margin_free_us are the LOWER ends; these are the upper ends, so the
     // true value lies in [lower, upper]. NaN = unknown; set only with the matching valid bit. CSV
-    // columns 187, 188, 189 (header names historical).
+    // columns 180, 181, 182 (header names historical; 187-189 in the 199-column header).
     double empty_hi_us = NAN, boundary_idle_hi_us = NAN, min_margin_free_hi_us = NAN;
-    // Worker registrations since the previous record was popped. High part of CSV column 197.
+    // Worker registrations since the previous record was popped. High part of CSV column 190.
     uint16_t registrations = 0;
     // Free-margin bracket summary (the scalar min_margin_free_us is the law's input): min_margin_free_us =
     // the minimum over the fed submissions of the bracket midpoints; min_margin_free_lo_us = the minimum of
     // the lower ends; min_margin_free_hi_us = the minimum of the upper ends; min_margin_err_us =
     // max(S - lo_min, hi_min - S) with S = min_margin_free_us, lo_min = min_margin_free_lo_us and
     // hi_min = min_margin_free_hi_us, so the reported scalar is within err of the true minimum.
-    // NaN = unknown; set only with kMinMarginFree. CSV columns 196 and 198.
+    // NaN = unknown; set only with kMinMarginFree. CSV columns 189 and 191.
     double min_margin_free_lo_us = NAN, min_margin_err_us = NAN;
     // The queue law's hold identity: the sequence the law assigned to the grant of the hold this frame's work was
     // queued behind, announced with the hold (GpuQueueProbe_OnHoldAnnounce); 0 = no law hold was announced for the
