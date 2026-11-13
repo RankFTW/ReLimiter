@@ -68,6 +68,17 @@ enum class PacingPreference : uint8_t {
     Count
 };
 
+// Developer key `pacing_test_mode` (honoured only with developer_settings; the pipeline carries the effective mode):
+// who owns pacing. Off (default): ReLimiter paces (the unified pacer on 64-bit, the present route elsewhere). ReflexOnly
+// ("Reflex alone"): ReLimiter paces nothing, the game's own Reflex runs untouched. DriverLimiter ("NVIDIA's limiter"):
+// the Reflex driver limiter paces the source at the cap's interval, ReLimiter plans nothing.
+enum class PacingTestMode : uint8_t {
+    Off = 0,
+    ReflexOnly = 1,
+    DriverLimiter = 2,
+    Count
+};
+
 // Stall injector ranges.
 constexpr double kPacingStallInjectMaxMs = 200.0;
 constexpr double kPacingStallInjectMinPeriodS = 1.0;
@@ -186,6 +197,22 @@ constexpr PacingPreferenceResolution PacingPipeline_ResolvePreference(PacingPref
     return resolved;
 }
 
+// The pacing_test_mode the pipeline carries: the saved value only while developer_settings is on, else Off whatever the
+// INI says. An out-of-range value is Off.
+constexpr PacingTestMode PacingPipeline_EffectiveTestMode(PacingTestMode saved, bool developer_settings) noexcept
+{
+    return developer_settings && static_cast<uint32_t>(saved) < static_cast<uint32_t>(PacingTestMode::Count)
+        ? saved
+        : PacingTestMode::Off;
+}
+
+// The Reflex Sleep bypass the hooks apply: the setting while ReLimiter owns pacing (test mode Off); a test mode never
+// skips the driver's Sleep, so the game's Sleep or the driver's limiter runs with the cap saved or not.
+constexpr bool PacingPipeline_EffectiveSleepBypass(bool configured, PacingTestMode effective_mode) noexcept
+{
+    return configured && effective_mode == PacingTestMode::Off;
+}
+
 struct PacingPipelineConfig {
     PacingSmoothing smoothing = PacingSmoothing::On;
     PacingRungOverride rung_override = PacingRungOverride::Auto;
@@ -234,8 +261,16 @@ struct PacingPipelineConfig {
     // GPU-paced cadence, no driver limiter hold, no precise pre-wait, no
     // interleave, no stall injection, lead coverage Q99, fg_late_spacing and
     // lead_spike_floor on, GPU queue wait render queue Keep, the placement
-    // override ignored) while the key is on, and false on Win32.
+    // override ignored) while the key is on, and false on Win32. In the published configuration this is the
+    // derived owner (the key, 64-bit and test_mode Off): PacingPipeline_ClampConfig clears it while a test mode is on.
     bool unified_pacer = false;
+    // The effective pacing_test_mode (Config_ApplyPacingPipeline applies the developer_settings gate). A mode other
+    // than Off takes the ownership from the unified pacer and, on the resolver's side, from every other policy:
+    // ReflexOnly resolves to pass-through (mode Off, placement None, reason Passthrough) whatever the cap and the
+    // timing regime; DriverLimiter resolves to the Reflex driver limiter where it can apply (a positive cap in the
+    // foreground, the game calling the Reflex Sleep, an NvAPI marker route on 64-bit) and to pass-through with the
+    // reason DriverLimiterUnavailable elsewhere, idle caps included. Never forced on Win32: it resolves there too.
+    PacingTestMode test_mode = PacingTestMode::Off;
     // Key unified_every_frame_service (default on; developer, only read under unified_pacer):
     // the law's service estimate takes a sample from every reported frame, the GPU wait taken
     // out, not only from saturated pairs (unified_pacer.h UnifiedOptions); false is the earlier
@@ -393,8 +428,11 @@ PacingPipelineConfig PacingPipeline_GetConfig() noexcept;
 // pre_sleep_precise, and PacingPipeline_DriverLimiterHold of the published config.
 bool PacingPipeline_PreSleepPrecise() noexcept;
 bool PacingPipeline_DriverLimiterHoldKey() noexcept;
-// One atomic load: the key unified_pacer of the published configuration (false on Win32).
+// One atomic load: the derived owner of the published configuration: the key unified_pacer, on 64-bit, with the
+// effective test mode Off (false on Win32 and in every test mode).
 bool PacingPipeline_UnifiedPacerKey() noexcept;
+// One atomic load: the effective pacing_test_mode of the published configuration.
+PacingTestMode PacingPipeline_TestMode() noexcept;
 
 // A capability published for one controller generation answers true only for
 // that generation, so a lifecycle change invalidates it without a clear call.
@@ -434,6 +472,8 @@ const char* PacingPlacementOverride_Text(PacingPlacementOverride placement) noex
 bool PacingPlacementOverride_FromText(const char* text, PacingPlacementOverride* placement) noexcept;
 const char* PacingPreference_Text(PacingPreference preference) noexcept;
 bool PacingPreference_FromText(const char* text, PacingPreference* preference) noexcept;
+const char* PacingTestMode_Text(PacingTestMode mode) noexcept;
+bool PacingTestMode_FromText(const char* text, PacingTestMode* mode) noexcept;
 
 // Log and OSD labels.
 const char* PacingRung_Text(PacingRung rung) noexcept;

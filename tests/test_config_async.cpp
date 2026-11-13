@@ -316,7 +316,10 @@ void CheckPipelineMatchesConfig() {
     const PacingPipelineConfig pipeline = PacingPipeline_GetConfig();
     // Key unified_pacer (64-bit) forces the mechanisms the law replaces (PacingPipeline_ClampConfig);
     // g_config keeps the user's values and the pipeline holds the forced ones.
-    const bool forced = g_config.unified_pacer && sizeof(void*) == 8;
+    // The owner is derived from the effective test mode (developer_settings gate) too: a test mode takes it from the key.
+    const PacingTestMode mode = PacingPipeline_EffectiveTestMode(g_config.pacing_test_mode, g_config.developer_settings);
+    CHECK(pipeline.test_mode == mode);
+    const bool forced = g_config.unified_pacer && sizeof(void*) == 8 && mode == PacingTestMode::Off;
     CHECK(pipeline.smoothing == (forced ? PacingSmoothing::On : g_config.smoothing));
     CHECK(pipeline.rung_override == (forced ? PacingRungOverride::Auto : g_config.output_rung));
     CHECK(pipeline.adaptive_cap == (forced ? false : g_config.adaptive_cap));
@@ -333,8 +336,9 @@ void CheckPipelineMatchesConfig() {
     CHECK(pipeline.gpu_paced_cadence == (forced ? false : g_config.gpu_paced_cadence));
     // Key unified_pacer forces the hold room off (config clamp), the user's value stays in g_config.
     CHECK(pipeline.adaptive_cap_hold_room ==
-        (g_config.adaptive_cap_hold_room && !(g_config.unified_pacer && sizeof(void*) == 8)));
-    CHECK(pipeline.unified_pacer == (g_config.unified_pacer && sizeof(void*) == 8));
+        (g_config.adaptive_cap_hold_room && !forced));
+    CHECK(pipeline.unified_pacer == forced);
+    CHECK(g_reflex_sleep_bypass.load() == PacingPipeline_EffectiveSleepBypass(g_config.reflex_sleep_bypass, mode));
     // Keys unified_every_frame_service and unified_queue_target_us: 64-bit only, the clamp forces
     // them off / to the default on Win32; the user's values stay in g_config.
     CHECK(pipeline.unified_every_frame_service == (g_config.unified_every_frame_service && sizeof(void*) == 8));
@@ -1506,6 +1510,152 @@ void TestPacingPreference() {
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
+// The state every observer of the key is in: the queue probe's gate and its law feed, the probe source, the marker
+// stamps, the margin end, readiness and gate probes, the other published developer flags, and the pipeline's pacer
+// numbers. A test mode must leave all of it as its old-key arm does.
+struct Observed {
+    bool gpu_queue_probe, law_feed, start_probe, sleep_status_every_frame, bypass_low_latency_off, driver_low_latency_off,
+        marker_forward_after_wait;
+    int upstream, probe_source, margin_end, presenter_probe_us;
+    bool gpu_probes, queue_law, every_frame_service;
+    int queue_rank, need_frames, allow_us;
+    double hold_share, queue_target_us;
+    bool unified;
+};
+Observed Observe() {
+    const PacingPipelineConfig pipeline = PacingPipeline_GetConfig();
+    return Observed{ g_gpu_queue_probe.load(), g_gpu_queue_law_feed.load(), g_gpu_start_probe.load(),
+        g_sleep_status_every_frame.load(), g_bypass_low_latency_off.load(), g_driver_low_latency_off.load(),
+        g_marker_forward_after_wait.load(), g_unified_queue_upstream.load(), g_gpu_queue_probe_source.load(),
+        g_unified_queue_margin_end.load(), g_fg_presenter_probe_us.load(), pipeline.gpu_probes, pipeline.unified_queue_law,
+        pipeline.unified_every_frame_service, pipeline.unified_queue_rank, pipeline.unified_queue_need_frames,
+        pipeline.unified_queue_allow_us, pipeline.unified_hold_share, pipeline.unified_queue_target_us,
+        pipeline.unified_pacer };
+}
+bool SameObserved(const Observed& a, const Observed& b) {
+    return a.gpu_queue_probe == b.gpu_queue_probe && a.law_feed == b.law_feed && a.start_probe == b.start_probe &&
+        a.sleep_status_every_frame == b.sleep_status_every_frame && a.bypass_low_latency_off == b.bypass_low_latency_off &&
+        a.driver_low_latency_off == b.driver_low_latency_off && a.marker_forward_after_wait == b.marker_forward_after_wait &&
+        a.upstream == b.upstream && a.probe_source == b.probe_source && a.margin_end == b.margin_end &&
+        a.presenter_probe_us == b.presenter_probe_us && a.gpu_probes == b.gpu_probes && a.queue_law == b.queue_law &&
+        a.every_frame_service == b.every_frame_service && a.queue_rank == b.queue_rank &&
+        a.need_frames == b.need_frames && a.allow_us == b.allow_us && a.hold_share == b.hold_share &&
+        a.queue_target_us == b.queue_target_us && a.unified == b.unified;
+}
+
+// pacing_test_mode (developer key): loads each text (case-insensitive), an invalid or empty text resets to off, saves
+// canonical text, honoured only with developer_settings (the raw value stays in g_config and the INI), a live key,
+// counted in the developer overrides and reset by the developer reset; the effective mode takes the ownership from
+// unified_pacer, and each mode leaves every published observer in the state of its old-key arm.
+void TestPacingTestMode() {
+    struct Case { const char* text; PacingTestMode expected; };
+    for (const Case& test : {Case{nullptr, PacingTestMode::Off}, Case{"off", PacingTestMode::Off},
+            Case{"reflex_only", PacingTestMode::ReflexOnly}, Case{"DRIVER_LIMITER", PacingTestMode::DriverLimiter},
+            Case{"reflex", PacingTestMode::Off}, Case{"", PacingTestMode::Off}}) {
+        std::vector<IniEntry> ini{{"developer_settings", "true"}, {"unified_pacer", "true"}};
+        if (test.text) ini.push_back({"pacing_test_mode", test.text});
+        Reset(false, false, ini);
+        CHECK(g_config.pacing_test_mode == test.expected);
+        CheckPipelineMatchesConfig();
+        CHECK(PacingPipeline_TestMode() == test.expected);
+        CHECK(PacingPipeline_UnifiedPacerKey() == (sizeof(void*) == 8 && test.expected == PacingTestMode::Off));
+        CHECK(Value(local_path, "FrameLimiter", "pacing_test_mode") == PacingTestMode_Text(test.expected));
+        CHECK(OverridesBesidesUnified() == (test.expected == PacingTestMode::Off ? 0 : 1));
+        ReleaseStart();CHECK(OwnerShutdown());
+    }
+
+    // The gate: without developer_settings the saved mode is not honoured and the raw value stays.
+    Reset(false, false, {{"unified_pacer", "true"}, {"pacing_test_mode", "reflex_only"}});
+    CHECK(!g_config.developer_settings && g_config.pacing_test_mode == PacingTestMode::ReflexOnly);
+    CheckPipelineMatchesConfig();
+    CHECK(PacingPipeline_TestMode() == PacingTestMode::Off);
+    CHECK(PacingPipeline_UnifiedPacerKey() == (sizeof(void*) == 8));
+    CHECK(g_reflex_sleep_bypass.load() == g_config.reflex_sleep_bypass);
+    CHECK(Value(local_path, "FrameLimiter", "pacing_test_mode") == "reflex_only");
+    {
+        const Observed ignored = Observe();
+        char error[128] = {};
+        CHECK(Config_SetLiveKey("pacing_test_mode", "off", error, sizeof(error)));
+        CHECK(SameObserved(ignored, Observe()));
+    }
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    // The live key, the override count and the developer reset.
+    Reset(false, false, {{"developer_settings", "true"}, {"unified_pacer", "true"}});
+    char error[128] = {};
+    CHECK(Config_SetLiveKey("pacing_test_mode", "Driver_Limiter", error, sizeof(error)) && error[0] == '\0');
+    CHECK(g_config.pacing_test_mode == PacingTestMode::DriverLimiter && PacingPipeline_TestMode() == PacingTestMode::DriverLimiter);
+    CheckPipelineMatchesConfig();
+    CHECK(!PacingPipeline_UnifiedPacerKey());
+    CHECK(!Config_SetLiveKey("pacing_test_mode", "turbo", error, sizeof(error)) && error[0] != '\0');
+    CHECK(g_config.pacing_test_mode == PacingTestMode::DriverLimiter);
+    CHECK(OverridesBesidesUnified() == 1);
+    ResetDeveloperKeepingEarlierPipeline();
+    CHECK(OverridesBesidesUnified() == 0 && g_config.pacing_test_mode == PacingTestMode::Off);
+    CHECK(PacingPipeline_TestMode() == PacingTestMode::Off);
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    // Save round trip.
+    Reset(false, false, {{"developer_settings", "true"}});
+    g_config.pacing_test_mode = PacingTestMode::ReflexOnly;
+    Config_ApplyPacingPipeline();
+    RequestSaveConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+    CheckWorkerWrites();
+    CHECK(Value(local_path, "FrameLimiter", "pacing_test_mode") == "reflex_only");
+    Reset();
+    g_config.pacing_test_mode = static_cast<PacingTestMode>(9);
+    ValidateConfig();
+    CHECK(g_config.pacing_test_mode == PacingTestMode::Off);
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    // Observers: each mode, with the same remaining keys, leaves them as its arm does. The production default (the
+    // key on, the law, the probe and every other developer key at its default) is the reference that the arms differ from.
+    const std::vector<IniEntry> shared{{"config_version", "5"}, {"developer_settings", "true"}, {"gpu_queue_probe", "false"},
+        {"unified_hold_share", "0.0625"}, {"unified_queue_rank", "3"}, {"unified_queue_need_frames", "6"},
+        {"unified_queue_allow_us", "3000"}, {"gpu_present_gate_probes", "true"}, {"unified_queue_upstream", "1"},
+        {"sleep_status_every_frame", "true"}, {"gpu_start_probe", "true"}, {"fg_presenter_probe_us", "500"}};
+    const auto with = [&](std::vector<IniEntry> extra) {
+        std::vector<IniEntry> ini = shared;
+        ini.insert(ini.end(), extra.begin(), extra.end());
+        return ini;
+    };
+    Reset(false, false, with({{"unified_pacer", "true"}, {"target_fps", "60"}}));
+    const Observed production = Observe();
+    CHECK(production.unified == (sizeof(void*) == 8));
+    CHECK(production.law_feed == (sizeof(void*) == 8)); // the law's feed follows the owner
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    // reflex_only against its arm (unified_pacer=false, reflex_sleep_bypass=true, target_fps=0).
+    Reset(false, false, with({{"unified_pacer", "true"}, {"pacing_test_mode", "reflex_only"}, {"target_fps", "60"}}));
+    const Observed reflex_mode = Observe();
+    const bool reflex_mode_bypass = g_reflex_sleep_bypass.load();
+    ReleaseStart();CHECK(OwnerShutdown());
+    Reset(false, false, with({{"unified_pacer", "false"}, {"reflex_sleep_bypass", "true"}, {"target_fps", "0"}}));
+    const Observed reflex_arm = Observe();
+    const bool reflex_arm_bypass = g_reflex_sleep_bypass.load();
+    ReleaseStart();CHECK(OwnerShutdown());
+    CHECK(SameObserved(reflex_mode, reflex_arm));
+    CHECK(!reflex_mode.unified && !reflex_mode.law_feed);
+    CHECK(!reflex_mode_bypass && reflex_arm_bypass); // the bypass is off in effect (the arm's is inert at cap 0)
+
+    // driver_limiter against its arm (unified_pacer=false, source_placement=driver, reflex_sleep_bypass=false).
+    Reset(false, false, with({{"unified_pacer", "true"}, {"pacing_test_mode", "driver_limiter"}, {"target_fps", "60"}}));
+    const Observed limiter_mode = Observe();
+    const bool limiter_mode_bypass = g_reflex_sleep_bypass.load();
+    ReleaseStart();CHECK(OwnerShutdown());
+    Reset(false, false, with({{"unified_pacer", "false"}, {"source_placement", "driver"},
+        {"reflex_sleep_bypass", "false"}, {"target_fps", "60"}}));
+    const Observed limiter_arm = Observe();
+    const bool limiter_arm_bypass = g_reflex_sleep_bypass.load();
+    ReleaseStart();CHECK(OwnerShutdown());
+    CHECK(SameObserved(limiter_mode, limiter_arm));
+    CHECK(!limiter_mode.unified && !limiter_mode.law_feed);
+    CHECK(!limiter_mode_bypass && !limiter_arm_bypass);
+    // And both differ from the production owner exactly where the key gates observers (the law's feed).
+    CHECK(production.law_feed != limiter_mode.law_feed || sizeof(void*) != 8);
+}
+
 void TestDeveloperKeysClamped() {
     struct Case { const char* ms; const char* period; double expected_ms; double expected_period; };
     for (const Case& test : {Case{"12.5", "2", 12.5, 2.0}, Case{"500", "120", 200.0, 60.0},
@@ -1847,6 +1997,7 @@ int main() {
     TestAdaptiveCapMigration();
     TestAdaptiveCapPercentile();
     TestPacingPreference();
+    TestPacingTestMode();
     TestDeveloperKeysClamped();
     TestGpuWaitInterleaveKey();
     TestRetiredKeysIgnoredAndDropped();

@@ -253,6 +253,10 @@ void ValidateConfig() {
         LOG_WARN("Config: invalid pacing_preference, resetting to 'balanced'");
         g_config.pacing_preference = PacingPreference::Balanced;
     }
+    if (static_cast<unsigned>(g_config.pacing_test_mode) >= static_cast<unsigned>(PacingTestMode::Count)) {
+        LOG_WARN("Config: invalid pacing_test_mode, resetting to 'off'");
+        g_config.pacing_test_mode = PacingTestMode::Off;
+    }
     if (!std::isfinite(g_config.stall_inject_period_s)) {
         LOG_WARN("Config: non-finite stall_inject_period_s, resetting to %.0f",
                  kPacingStallInjectDefaultPeriodS);
@@ -381,6 +385,11 @@ static void LoadPacingPipelineKeys(const char* S, const char* P) {
     if (!PacingPreference_FromText(preference.c_str(), &g_config.pacing_preference)) {
         LOG_WARN("Config: invalid pacing_preference '%s', resetting to 'balanced'", preference.c_str());
         g_config.pacing_preference = PacingPreference::Balanced;
+    }
+    const std::string test_mode = ReadINIString(S, "pacing_test_mode", PacingTestMode_Text(PacingTestMode::Off), P);
+    if (!PacingTestMode_FromText(test_mode.c_str(), &g_config.pacing_test_mode)) {
+        LOG_WARN("Config: invalid pacing_test_mode '%s', resetting to 'off'", test_mode.c_str());
+        g_config.pacing_test_mode = PacingTestMode::Off;
     }
 }
 
@@ -729,6 +738,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIBool(S, "gpu_queue_probe", config.gpu_queue_probe, P);
     WriteINIInt(S, "gpu_queue_probe_source", config.gpu_queue_probe_source, P);
     WriteINIBool(S, "unified_pacer", config.unified_pacer, P);
+    WriteINIString(S, "pacing_test_mode", PacingTestMode_Text(config.pacing_test_mode), P);
     WriteINIBool(S, "unified_every_frame_service", config.unified_every_frame_service, P);
     WriteINIDouble(S, "unified_queue_target_us", config.unified_queue_target_us, P);
     WriteINIDouble(S, "unified_hold_share", config.unified_hold_share, P);
@@ -1016,12 +1026,17 @@ void Config_ApplyPacingPipeline() {
         g_config.pacing_preference, g_config.unified_queue_rank, g_config.unified_hold_share);
     pipeline.unified_queue_rank = effective.queue_rank;
     pipeline.unified_hold_share = effective.hold_share;
+    // The owner of pacing is resolved here, once: the saved test mode counts only with developer_settings, and the
+    // clamp below derives the one `unified` state from it (the key, 64-bit and no test mode). The Sleep bypass and the
+    // observers the key gates (the queue law's probe and feed) follow the same effective state.
+    pipeline.test_mode = PacingPipeline_EffectiveTestMode(g_config.pacing_test_mode, g_config.developer_settings);
     NvAPI_PrepareUnifiedKey(PacingPipeline_ClampConfig(pipeline).unified_pacer);
     PacingPipeline_SetConfig(pipeline);
     g_marker_forward_after_wait.store(
         g_config.marker_forward_order == PacingMarkerForwardOrder::AfterWait,
         std::memory_order_relaxed);
-    g_reflex_sleep_bypass.store(g_config.reflex_sleep_bypass, std::memory_order_relaxed);
+    g_reflex_sleep_bypass.store(
+        PacingPipeline_EffectiveSleepBypass(g_config.reflex_sleep_bypass, pipeline.test_mode), std::memory_order_relaxed);
     g_bypass_low_latency_off.store(g_config.bypass_low_latency_off, std::memory_order_relaxed);
     g_driver_low_latency_off.store(g_config.driver_low_latency_off, std::memory_order_relaxed);
     g_sleep_status_every_frame.store(g_config.sleep_status_every_frame, std::memory_order_relaxed);
@@ -1123,6 +1138,7 @@ constexpr Key kKeys[] = {
     {"unified_every_frame_service", &SetBool<&Config::unified_every_frame_service>, Publish::Pipeline},
     {"unified_queue_target_us", &SetDouble<&Config::unified_queue_target_us>, Publish::Pipeline},
     {"unified_hold_share", &SetDouble<&Config::unified_hold_share>, Publish::Pipeline},
+    {"pacing_test_mode", &SetEnum<PacingTestMode, &Config::pacing_test_mode, PacingTestMode_FromText>, Publish::Pipeline},
     {"unified_queue_law", &SetBool<&Config::unified_queue_law>, Publish::Pipeline},
     {"unified_queue_rank", &SetInt<&Config::unified_queue_rank>, Publish::Pipeline},
     {"unified_queue_need_frames", &SetInt<&Config::unified_queue_need_frames>, Publish::Pipeline},
@@ -1197,6 +1213,7 @@ int Config_DeveloperOverrides() {
         (g_config.gpu_queue_probe_source != d.gpu_queue_probe_source) +
         (g_config.unified_queue_margin_end != d.unified_queue_margin_end) +
         (g_config.unified_pacer != d.unified_pacer) +
+        (g_config.pacing_test_mode != d.pacing_test_mode) +
         (g_config.unified_every_frame_service != d.unified_every_frame_service) +
         (g_config.unified_queue_target_us != d.unified_queue_target_us) +
         (g_config.unified_hold_share != d.unified_hold_share) +
@@ -1239,6 +1256,7 @@ void Config_ResetDeveloperSettings() {
     g_config.gpu_queue_probe_source = d.gpu_queue_probe_source;
     g_config.unified_queue_margin_end = d.unified_queue_margin_end;
     g_config.unified_pacer = d.unified_pacer;
+    g_config.pacing_test_mode = d.pacing_test_mode;
     g_config.unified_every_frame_service = d.unified_every_frame_service;
     g_config.unified_queue_target_us = d.unified_queue_target_us;
     g_config.unified_hold_share = d.unified_hold_share;
@@ -1273,13 +1291,22 @@ void ApplyConfig() {
         LOG_WARN("Diagnostic NvAPI marker forward order: %s (driver sees the paced release)",
             PacingMarkerForwardOrder_Text(g_config.marker_forward_order));
     const PacingPipelineConfig applied = PacingPipeline_GetConfig();
-    LOG_INFO("Pacing pipeline: smoothing=%s adaptive_cap=%u adaptive_cap_percentile=%d output_rung=%s source_placement=%s probes=%u gpu_wait_headroom_us=%.0f pacing_preference=%s queue_rank=%d hold_share=%.5f",
+    LOG_INFO("Pacing pipeline: smoothing=%s adaptive_cap=%u adaptive_cap_percentile=%d output_rung=%s source_placement=%s probes=%u gpu_wait_headroom_us=%.0f pacing_preference=%s queue_rank=%d hold_share=%.5f pacing_test_mode=%s",
         PacingSmoothing_Text(g_config.smoothing), g_config.adaptive_cap ? 1u : 0u,
         g_config.adaptive_cap_percentile,
         PacingRungOverride_Text(g_config.output_rung),
         PacingPlacementOverride_Text(g_config.source_placement),
         g_config.gpu_present_gate_probes ? 1u : 0u, g_config.gpu_wait_headroom_us,
-        PacingPreference_Text(g_config.pacing_preference), applied.unified_queue_rank, applied.unified_hold_share);
+        PacingPreference_Text(g_config.pacing_preference), applied.unified_queue_rank, applied.unified_hold_share,
+        PacingTestMode_Text(applied.test_mode));
+    if (applied.test_mode != PacingTestMode::Off)
+        LOG_WARN("Diagnostic pacing test mode %s: ReLimiter %s", PacingTestMode_Text(applied.test_mode),
+            applied.test_mode == PacingTestMode::ReflexOnly
+                ? "paces nothing, the game's own Reflex runs"
+                : "hands the cap to the Reflex driver limiter where it can apply and paces nothing");
+    else if (g_config.pacing_test_mode != PacingTestMode::Off)
+        LOG_WARN("Config: pacing_test_mode=%s ignored without developer_settings=true",
+            PacingTestMode_Text(g_config.pacing_test_mode));
     if (g_config.stall_inject_ms > 0.0)
         LOG_WARN("Pacing pipeline: diagnostic stall injector %.1f ms every %.1f s",
             g_config.stall_inject_ms, g_config.stall_inject_period_s);

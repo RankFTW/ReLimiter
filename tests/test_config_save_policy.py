@@ -133,7 +133,7 @@ class ConfigSavePolicyTests(unittest.TestCase):
         config = HEADER.split("struct Config {", 1)[1].split("};", 1)[0]
         fields = set(re.findall(
             r"\b(?:bool|int|double|float|std::string|PacingSmoothing|PacingRungOverride|"
-            r"PacingMarkerForwardOrder|PacingRenderQueue|PacingLeadCoverage|PacingPlacementOverride|PacingPreference)\s+(\w+)\s*=",
+            r"PacingMarkerForwardOrder|PacingRenderQueue|PacingLeadCoverage|PacingPlacementOverride|PacingPreference|PacingTestMode)\s+(\w+)\s*=",
             config))
         self.assertTrue({"smoothing", "adaptive_cap", "output_rung", "stall_inject_ms",
                          "stall_inject_period_s", "gpu_present_gate_probes",
@@ -209,7 +209,7 @@ class ConfigSavePolicyTests(unittest.TestCase):
                                   "adaptive_cap_hold_room", "lead_spike_floor",
                                   "pre_sleep_precise", "driver_limiter_hold",
                                   "placement_override", "stall_inject_ms",
-                                  "stall_inject_period_s", "unified_pacer",
+                                  "stall_inject_period_s", "unified_pacer", "test_mode",
                                   "unified_every_frame_service", "unified_queue_target_us",
                                   "unified_hold_share", "unified_queue_law", "unified_queue_rank",
                                   "unified_queue_need_frames", "gpu_queue_probe_source", "unified_queue_upstream",
@@ -289,6 +289,13 @@ class ConfigSavePolicyTests(unittest.TestCase):
         self.assertIn('"pacing_preference", PacingPreference_Text(config.pacing_preference)', writer)
         self.assertIn("PacingPreference::Count", validate)
         apply = body("Config_ApplyPacingPipeline")
+        # The test mode is validated text, saved canonically, gated by developer_settings where the configuration
+        # becomes the pipeline configuration, and recorded on the status line.
+        self.assertIn("PacingTestMode_FromText(", loader)
+        self.assertIn('"pacing_test_mode", PacingTestMode_Text(config.pacing_test_mode)', writer)
+        self.assertIn("PacingTestMode::Count", validate)
+        self.assertRegex(apply, r"pipeline\.test_mode\s*=\s*PacingPipeline_EffectiveTestMode\(\s*g_config\.pacing_test_mode,\s*g_config\.developer_settings\)")
+        self.assertIn("PacingPipeline_EffectiveSleepBypass(g_config.reflex_sleep_bypass, pipeline.test_mode)", apply)
         self.assertEqual(apply.count("PacingPipeline_ResolvePreference("), 1)
         self.assertRegex(apply, r"pipeline\.unified_queue_rank\s*=\s*\w+\.queue_rank;")
         self.assertRegex(apply, r"pipeline\.unified_hold_share\s*=\s*\w+\.hold_share;")

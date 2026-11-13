@@ -21,6 +21,10 @@
 #include <MinHook.h>
 #include <atomic>
 
+// The Streamline PCL marker hook is a 64-bit source (CMakeLists.txt); on Win32 pcl_hooks.h stubs it out, so a 32-bit
+// process never hooks, enforces on or dispatches by PCL markers (enforcement_dispatcher.cpp keeps the route 64-bit too).
+static_assert(sizeof(void*) == 8, "pcl_hooks.cpp is a 64-bit source");
+
 // ── Minimal Streamline types (from public sl_pcl.h / sl_core_types.h, MIT) ──
 namespace sl {
     constexpr uint32_t kFeaturePCL = 4;

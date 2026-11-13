@@ -34,21 +34,30 @@ static std::atomic_flag s_present_telemetry_owner = ATOMIC_FLAG_INIT;
 
 // ── Path selection logic ──
 
+// Marker routes (NvAPI latency markers, Streamline PCL markers) are a 64-bit route: NvAPI is compiled out of the
+// 32-bit add-on and pcl_hooks.cpp is a 64-bit source, and the route selection says so too, so a 32-bit process can only
+// take the present route whatever a stub or a future change reports about markers.
+static constexpr bool kMarkerRoutesAvailable = sizeof(void*) == 8;
+
 static EnforcementPath SelectPath(ActiveAPI api) {
     switch (api) {
         case ActiveAPI::DX12:
         case ActiveAPI::DX11:
             // DXGI APIs prefer NvAPI marker hooks for enforcement (Reflex
             // games); the marker path is sticky (see s_ever_seen_nvapi).
-            if (AreNvAPIMarkersFlowing())
-                s_ever_seen_nvapi.store(true, std::memory_order_release);
-            if (s_ever_seen_nvapi.load(std::memory_order_acquire))
-                return EnforcementPath::NvAPIMarkers;
+            if constexpr (kMarkerRoutesAvailable) {
+                if (AreNvAPIMarkersFlowing())
+                    s_ever_seen_nvapi.store(true, std::memory_order_release);
+                if (s_ever_seen_nvapi.load(std::memory_order_acquire))
+                    return EnforcementPath::NvAPIMarkers;
+            }
             return EnforcementPath::PresentBased;
 
         case ActiveAPI::Vulkan:
-            if (PCL_MarkersFlowing())
-                return EnforcementPath::PCLMarkers;
+            if constexpr (kMarkerRoutesAvailable) {
+                if (PCL_MarkersFlowing())
+                    return EnforcementPath::PCLMarkers;
+            }
             return EnforcementPath::PresentBased;
 
         case ActiveAPI::DX9:

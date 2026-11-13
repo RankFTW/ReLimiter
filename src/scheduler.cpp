@@ -545,6 +545,7 @@ struct UnifiedSleepStats {
 };
 UnifiedSleepStats s_up_stats[kUpStatsSlots];
 bool s_up_key = false;             // the key as ResolvePipeline last saw it
+PacingTestMode s_up_test_mode = PacingTestMode::Off; // the effective test mode as the ownership transition last saw it
 bool s_up_reconcile = false;       // OnMarker reconciles the Sleep-mode tuple: the key is on, or its toggle is not applied yet
 bool s_up_idle_regime = false;     // the idle regime as OnMarker last saw it (key on)
 double s_up_idle_interval_us = 0.0; // I_idle of the newest OnMarker (0 = not idle; key on)
@@ -1047,11 +1048,12 @@ static void DrainQueueLawFeed(bool law_on) noexcept
 // new key's tuple exactly.
 static void ApplyUnifiedKeyTransition(const PacingPipelineConfig& config) noexcept
 {
-    if (config.unified_pacer == s_up_key) return;
+    const bool key_changed = config.unified_pacer != s_up_key;
+    if (!key_changed && config.test_mode == s_up_test_mode) return;
     s_up_key = config.unified_pacer;
     s_up_law_feed_active = false; // the next keyed drain discards what the ring holds
     s_up_reconcile = true;
-    if (!s_up_key) LogQueueLawSummary("unified pacer off"); // s_up_key is the new value: the key went off
+    if (key_changed && !s_up_key) LogQueueLawSummary("unified pacer off"); // s_up_key is the new value: the key went off
     s_source_stage.SetUnifiedEnabled(s_up_key, FrameTimeline_CurrentControllerGeneration());
     s_up_mailbox.store(0, std::memory_order_release);
     s_up_pending_flags.store(0, std::memory_order_relaxed);
@@ -1064,7 +1066,11 @@ static void ApplyUnifiedKeyTransition(const PacingPipelineConfig& config) noexce
     s_sleep_entry_index = 0;
     s_driver_sleep_index = 0;
     NvAPI_BumpSleepModeEpoch();
-    LOG_INFO("Unified pacer %s", s_up_key ? "on" : "off");
+    if (key_changed) LOG_INFO("Unified pacer %s", s_up_key ? "on" : "off");
+    if (config.test_mode != s_up_test_mode) {
+        s_up_test_mode = config.test_mode;
+        LOG_INFO("Pacing test mode %s", PacingTestMode_Text(s_up_test_mode));
+    }
 }
 
 // Exactly one source record per OnMarker call, pushed after its release, just
@@ -2907,7 +2913,7 @@ void OnMarker(
         s_source_stage.DrainStageEvents();
         NoteDrainedOutputLate();
         PacingPipelineConfig snapshot = PacingPipeline_GetConfig();
-        if (snapshot.unified_pacer != s_up_key) ApplyUnifiedKeyTransition(snapshot);
+        if (snapshot.unified_pacer != s_up_key || snapshot.test_mode != s_up_test_mode) ApplyUnifiedKeyTransition(snapshot);
         return snapshot;
     }();
     // Vblank edges feed the fixed-refresh phase tracker on the owner only.
@@ -3041,6 +3047,14 @@ void OnMarker(
     input.trigger = trigger;
     input.marker = marker;
     input.fg_divisor = static_cast<double>(fg_divisor_raw);
+    // A test mode's pass-through exit (reflex_only; driver_limiter where the driver's limiter cannot apply; idle caps
+    // in either mode): the frame goes through untouched as at an uncapped VRR frame, its reports polled once.
+    const auto run_test_passthrough = [&](SchedulerCadenceRegime regime, int cap_fps, uint8_t extra_flags,
+                                           double fg_divisor, const PacingPipelineSnapshot& pipeline) noexcept {
+        RunPassthrough(GetCadenceContext(Scheduler_MakePlanKey(frameID, trigger), trigger, marker, regime, cap_fps),
+            pipeline, extra_flags, fg_divisor);
+        if (fg_loaded && !polled_before_routing) PollReflexLatencyReport(ReportFeedbackIntervalUs());
+    };
 
     // ── Idle caps: OLED Care, background, FG-off (grid in Idle mode, L = 0) ──
     const int background_fps = g_background_fps.load(std::memory_order_relaxed);
@@ -3077,6 +3091,11 @@ void OnMarker(
     if (idle_interval_us > 0.0) {
         runtime.idle_cap = true;
         const PacingPipelineSnapshot pipeline = ResolvePipeline(trigger, config, runtime);
+        // A test mode is a foreground instrument: its idle caps resolve to pass-through and run as such.
+        if (config.test_mode != PacingTestMode::Off) {
+            run_test_passthrough(input.regime, input.target_fps, input.extra_flags, input.fg_divisor, pipeline);
+            return;
+        }
         input.base_interval_us = idle_interval_us;
         input.interval_us = idle_interval_us;
         RunPlanned(input, pipeline, config);
@@ -3087,6 +3106,15 @@ void OnMarker(
             marker, input.regime, input.target_fps), ResolvePipeline(trigger, config, runtime),
             input.extra_flags, input.fg_divisor);
         if (fg_loaded && !polled_before_routing) PollReflexLatencyReport(ReportFeedbackIntervalUs());
+        return;
+    }
+    // Test mode reflex_only: ReLimiter paces nothing whatever the saved cap and the timing regime (the cap is not
+    // overwritten); the frame goes through and the game's own Reflex runs.
+    if (config.test_mode == PacingTestMode::ReflexOnly) {
+        runtime.uncapped = true;
+        input.fg_divisor = ComputeFGDivisor(); // one call per frame: it advances a ramp
+        run_test_passthrough(SchedulerCadenceRegime::Uncapped, target_fps,
+            runtime.vrr ? 0 : PACING_SOURCE_FIXED_REFRESH, input.fg_divisor, ResolvePipeline(trigger, config, runtime));
         return;
     }
 
@@ -3107,6 +3135,11 @@ void OnMarker(
             return;
         }
         PacingPipelineSnapshot pipeline = ResolvePipeline(trigger, config, runtime);
+        // Test mode driver_limiter where the driver's limiter cannot apply: pass-through, never a pacing path.
+        if (config.test_mode != PacingTestMode::Off && pipeline.mode == PacingTimingMode::Off) {
+            run_test_passthrough(SchedulerCadenceRegime::Uncapped, target_fps, PACING_SOURCE_FIXED_REFRESH, input.fg_divisor, pipeline);
+            return;
+        }
         // I_0 → governor (whole-refresh ladder when the grid snaps I_0) → grid.
         input.fixed = g_vblank_phase.Reference();
         input.base_interval_us = interval_us;
@@ -3128,6 +3161,10 @@ void OnMarker(
             }
             runtime.driver_limiter_unavailable = true;
             pipeline = ResolvePipeline(trigger, config, runtime);
+            if (config.test_mode != PacingTestMode::Off && pipeline.mode == PacingTimingMode::Off) {
+                run_test_passthrough(SchedulerCadenceRegime::Uncapped, target_fps, PACING_SOURCE_FIXED_REFRESH, input.fg_divisor, pipeline);
+                return;
+            }
         }
         RunPlanned(input, pipeline, config);
         return;
@@ -3154,6 +3191,11 @@ void OnMarker(
     input.regime = SchedulerCadenceRegime::Vrr;
     PacingPipelineSnapshot pipeline = ResolvePipeline(trigger, config, runtime);
     input.fg_divisor = ComputeFGDivisor(); // one call per frame: it advances a ramp
+    // Test mode driver_limiter where the driver's limiter cannot apply: pass-through, never a pacing path.
+    if (config.test_mode != PacingTestMode::Off && pipeline.mode == PacingTimingMode::Off) {
+        run_test_passthrough(SchedulerCadenceRegime::Uncapped, target_fps, 0, input.fg_divisor, pipeline);
+        return;
+    }
     // I_0 (no LFC) → governor I_k → LFC hysteresis on I_k → grid interval.
     input.base_interval_us = VrrCapIntervalUs(vrr_target_fps, input.fg_divisor);
     input.governed = true;
@@ -3181,6 +3223,11 @@ void OnMarker(
         }
         runtime.driver_limiter_unavailable = true;
         pipeline = ResolvePipeline(trigger, config, runtime);
+        if (config.test_mode != PacingTestMode::Off && pipeline.mode == PacingTimingMode::Off) {
+            pending_feedback.retain_for_governor = false; // the governor's samples are not consumed this frame
+            run_test_passthrough(SchedulerCadenceRegime::Uncapped, target_fps, 0, input.fg_divisor, pipeline);
+            return;
+        }
     }
     RunPlanned(input, pipeline, config);
     PollReflexLatencyReport(input.interval_us);

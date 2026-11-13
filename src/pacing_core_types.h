@@ -164,7 +164,8 @@ enum class PacingFallbackReason : uint8_t {
     NoGpuQueue = 10,   // GPU queue not ready
     FgUnqualified = 11, // FG presenting without a qualified FG input route
     Infeasible = 12,    // the overload guard demoted the Auto rung (older builds: the resume spread switch-off)
-    FgRouteUnsupported = 13 // FG presents its own frames on another thread and queue: no FG input wait
+    FgRouteUnsupported = 13, // FG presents its own frames on another thread and queue: no FG input wait
+    DriverLimiterUnavailable = 14 // test mode driver_limiter where the driver's limiter cannot apply: pass-through
 };
 
 // The rung a Source record shows for its pipeline generation (the

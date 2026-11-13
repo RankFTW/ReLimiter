@@ -1734,7 +1734,8 @@ namespace
     void TestLabels()
     {
         CheckLabels(static_cast<uint32_t>(PacingRung::Count), PacingRung_Text, PacingRung::Count);
-        CheckLabels(14u, PacingFallbackReason_Text, static_cast<PacingFallbackReason>(14));
+        CheckLabels(15u, PacingFallbackReason_Text, static_cast<PacingFallbackReason>(15));
+        CheckLabels(static_cast<uint32_t>(PacingTestMode::Count), PacingTestMode_Text, PacingTestMode::Count);
         CheckLabels(4u, PacingTimingMode_Text, static_cast<PacingTimingMode>(4));
         CHECK(std::strcmp(PacingRung_Text(PacingRung::GpuQueueWait), "gpu_queue_wait") == 0);
         CHECK(std::strcmp(PacingFallbackReason_Text(PacingFallbackReason::FgUnqualified), "fg_unqualified") == 0);

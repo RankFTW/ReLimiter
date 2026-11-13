@@ -172,6 +172,16 @@ namespace
         return decision;
     }
 
+    // The driver limiter needs the NvAPI route (x64) and a game that calls the Reflex Sleep, and the limiter not
+    // refused by the driver.
+    bool DriverLimiterEligible(
+        const PacingCapabilities& capabilities,
+        const PacingRuntimeState& runtime) noexcept
+    {
+        return capabilities.x64 && capabilities.route == PacingRoute::NvApiMarkers &&
+            runtime.pre_sleep_available && !runtime.driver_limiter_unavailable;
+    }
+
     // Marker-route placement. The driver limiter needs the NvAPI
     // route (x64) and a game that calls the Reflex Sleep; pre-Sleep needs the
     // Sleep. Otherwise the source waits at the marker.
@@ -186,10 +196,11 @@ namespace
             return runtime.pre_sleep_available ? PacingSourcePlacement::Unified
                                                : PacingSourcePlacement::Marker;
         }
+        // Test mode driver_limiter: the caller (PacingPipeline_Resolve) has checked the eligibility.
+        if (config.test_mode == PacingTestMode::DriverLimiter) return PacingSourcePlacement::DriverLimiter;
         switch (config.placement_override) {
             case PacingPlacementOverride::Driver:
-                return capabilities.x64 && capabilities.route == PacingRoute::NvApiMarkers &&
-                        runtime.pre_sleep_available && !runtime.driver_limiter_unavailable
+                return DriverLimiterEligible(capabilities, runtime)
                     ? PacingSourcePlacement::DriverLimiter
                     : PacingSourcePlacement::Marker;
             case PacingPlacementOverride::PreSleep:
@@ -342,6 +353,7 @@ namespace
         std::atomic<bool> gpu_paced_cadence{ kDefaultConfig.gpu_paced_cadence };
         std::atomic<bool> adaptive_cap_hold_room{ kDefaultConfig.adaptive_cap_hold_room };
         std::atomic<bool> unified_pacer{ kDefaultConfig.unified_pacer };
+        std::atomic<PacingTestMode> test_mode{ kDefaultConfig.test_mode };
         std::atomic<bool> unified_every_frame_service{ kDefaultConfig.unified_every_frame_service };
         std::atomic<double> unified_queue_target_us{ kDefaultConfig.unified_queue_target_us };
         std::atomic<double> unified_hold_share{ kDefaultConfig.unified_hold_share };
@@ -380,6 +392,7 @@ namespace
         config.pre_sleep_precise = s_config.pre_sleep_precise.load(std::memory_order_relaxed);
         config.driver_limiter_hold = s_config.driver_limiter_hold.load(std::memory_order_relaxed);
         config.unified_pacer = s_config.unified_pacer.load(std::memory_order_relaxed);
+        config.test_mode = s_config.test_mode.load(std::memory_order_relaxed);
         config.unified_every_frame_service =
             s_config.unified_every_frame_service.load(std::memory_order_relaxed);
         config.unified_queue_target_us =
@@ -468,9 +481,18 @@ PacingPipelineSnapshot PacingPipeline_Resolve(
     result.route = routed ? capabilities.route : PacingRoute::None;
 
     RungDecision decision{ PacingRung::SourceOnly, PacingFallbackReason::Passthrough };
-    if (!runtime.swapchain_valid || runtime.dmfg_passthrough || runtime.uncapped || !routed) {
+    if (!runtime.swapchain_valid || runtime.dmfg_passthrough || runtime.uncapped || !routed ||
+        safe_config.test_mode == PacingTestMode::ReflexOnly) {
         result.mode = PacingTimingMode::Off;
         result.placement = PacingSourcePlacement::None;
+    } else if (safe_config.test_mode == PacingTestMode::DriverLimiter &&
+        (runtime.idle_cap || present_route || !DriverLimiterEligible(capabilities, runtime))) {
+        // A test mode is a foreground instrument: where the driver's limiter cannot apply (an idle cap, a route that
+        // is not NvAPI markers, no Reflex Sleep from the game, the limiter refused, 32-bit) the game's own behaviour
+        // runs and the mode is reported unavailable. It never falls into a pacing path.
+        result.mode = PacingTimingMode::Off;
+        result.placement = PacingSourcePlacement::None;
+        decision = { PacingRung::SourceOnly, PacingFallbackReason::DriverLimiterUnavailable };
     } else {
         result.placement = present_route
             ? PacingSourcePlacement::Present
@@ -603,6 +625,12 @@ PacingPipelineConfig PacingPipeline_ClampConfig(PacingPipelineConfig config) noe
         config.gpu_queue_probe_source = 0;
         config.unified_queue_margin_end = 0;
     }
+    // The test mode takes the ownership from the unified pacer whatever the key says: the published
+    // unified_pacer is the owner (the key, 64-bit and no test mode).
+    if (static_cast<uint32_t>(config.test_mode) >= static_cast<uint32_t>(PacingTestMode::Count)) {
+        config.test_mode = PacingTestMode::Off;
+    }
+    if (config.test_mode != PacingTestMode::Off) config.unified_pacer = false;
     if (config.unified_pacer) {
         config.smoothing = PacingSmoothing::On;
         config.rung_override = PacingRungOverride::Auto;
@@ -649,6 +677,7 @@ void PacingPipeline_SetConfig(const PacingPipelineConfig& config) noexcept
     s_config.pre_sleep_precise.store(safe_config.pre_sleep_precise, std::memory_order_relaxed);
     s_config.driver_limiter_hold.store(safe_config.driver_limiter_hold, std::memory_order_relaxed);
     s_config.unified_pacer.store(safe_config.unified_pacer, std::memory_order_relaxed);
+    s_config.test_mode.store(safe_config.test_mode, std::memory_order_relaxed);
     s_config.unified_every_frame_service.store(
         safe_config.unified_every_frame_service, std::memory_order_relaxed);
     s_config.unified_queue_target_us.store(
@@ -687,6 +716,11 @@ bool PacingPipeline_DriverLimiterHoldKey() noexcept
 bool PacingPipeline_UnifiedPacerKey() noexcept
 {
     return s_config.unified_pacer.load(std::memory_order_relaxed);
+}
+
+PacingTestMode PacingPipeline_TestMode() noexcept
+{
+    return s_config.test_mode.load(std::memory_order_relaxed);
 }
 
 void PacingPipeline_PublishCapability(
@@ -853,6 +887,21 @@ bool PacingPreference_FromText(const char* text, PacingPreference* preference) n
     return EnumFromText(text, preference, PacingPreference_Text);
 }
 
+const char* PacingTestMode_Text(PacingTestMode mode) noexcept
+{
+    switch (mode) {
+        case PacingTestMode::Off: return "off";
+        case PacingTestMode::ReflexOnly: return "reflex_only";
+        case PacingTestMode::DriverLimiter: return "driver_limiter";
+        default: return "unknown";
+    }
+}
+
+bool PacingTestMode_FromText(const char* text, PacingTestMode* mode) noexcept
+{
+    return EnumFromText(text, mode, PacingTestMode_Text);
+}
+
 const char* PacingSourcePlacement_Text(PacingSourcePlacement placement) noexcept
 {
     switch (placement) {
@@ -895,6 +944,7 @@ const char* PacingFallbackReason_Text(PacingFallbackReason reason) noexcept
         case PacingFallbackReason::FgUnqualified: return "fg_unqualified";
         case PacingFallbackReason::Infeasible: return "infeasible";
         case PacingFallbackReason::FgRouteUnsupported: return "fg_route_unsupported";
+        case PacingFallbackReason::DriverLimiterUnavailable: return "driver_limiter_unavailable";
         default: return "unknown";
     }
 }

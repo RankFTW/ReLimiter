@@ -278,8 +278,9 @@ static void NotifySubsystemsInit(uint64_t native_handle, ActiveAPI api, HWND hwn
     UpdateVBlankThreadForMode(
         g_pacing_mode.load(std::memory_order_acquire));
 
-    // Attempt PCL hooks for Vulkan+Streamline games
-    if (api == ActiveAPI::Vulkan) {
+    // Attempt PCL hooks for Vulkan+Streamline games. Streamline PCL markers are a 64-bit route (the dispatcher
+    // selects it only there; pcl_hooks.h stubs the hook out on Win32): a 32-bit process is never hooked.
+    if (api == ActiveAPI::Vulkan && sizeof(void*) == 8) {
         InstallPCLHooks();
     }
 }

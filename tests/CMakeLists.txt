@@ -261,12 +261,61 @@ set_target_properties(test_unified_queue_law PROPERTIES
     CXX_STANDARD_REQUIRED YES
     CXX_EXTENSIONS NO
 )
+
 target_include_directories(test_unified_queue_law PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 if(MSVC)
     set_property(TARGET test_unified_queue_law PROPERTY
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     target_compile_options(test_unified_queue_law PRIVATE /W4 /utf-8 /permissive-)
+endif()
+
+## ── Pacing test mode tests ──
+# The developer key pacing_test_mode against the old-key arms it replaces: the resolver's pipeline
+# decision and the Sleep-mode tuple over an enumeration of capabilities and runtime states, the named
+# differences, and the pinned decision table. The scheduler's dispatch, the Sleep hook and the driver
+# need live validation.
+
+add_executable(test_pacing_test_mode
+    test_pacing_test_mode.cpp
+    ${CMAKE_SOURCE_DIR}/src/pacing_resolver.cpp
+    ${CMAKE_SOURCE_DIR}/src/unified_pacer.cpp
+    ${CMAKE_SOURCE_DIR}/src/unified_queue_law.cpp
+)
+set_target_properties(test_pacing_test_mode PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+target_include_directories(test_pacing_test_mode PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+if(MSVC)
+    set_property(TARGET test_pacing_test_mode PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(test_pacing_test_mode PRIVATE /W4 /utf-8 /permissive-)
+endif()
+
+## ── Enforcement route tests ──
+# The dispatcher's route selection with the marker state scripted: marker routes are a 64-bit route, so a 32-bit
+# process takes the present route whatever the marker state says. The hooks and the scheduler need live validation.
+
+add_executable(test_enforcement_route
+    test_enforcement_route.cpp
+    ${CMAKE_SOURCE_DIR}/src/enforcement_dispatcher.cpp
+)
+set_target_properties(test_enforcement_route PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+target_include_directories(test_enforcement_route PRIVATE
+    ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/deps/reshade/include)
+target_compile_definitions(test_enforcement_route PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+
+if(MSVC)
+    set_property(TARGET test_enforcement_route PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(test_enforcement_route PRIVATE /W4 /utf-8 /permissive-)
 endif()
 
 ## ── GPU queue probe core tests ──
@@ -902,6 +951,8 @@ add_test(NAME cadence_grid COMMAND test_cadence_grid)
 set_tests_properties(cadence_grid PROPERTIES TIMEOUT 60)
 add_test(NAME unified_pacer COMMAND test_unified_pacer)
 set_tests_properties(unified_pacer PROPERTIES TIMEOUT 120)
+add_test(NAME pacing_test_mode COMMAND test_pacing_test_mode)
+add_test(NAME enforcement_route COMMAND test_enforcement_route)
 add_test(NAME unified_queue_law COMMAND test_unified_queue_law)
 add_test(NAME gpu_queue_probe_core COMMAND test_gpu_queue_probe_core)
 add_test(NAME gpu_queue_dependency COMMAND test_gpu_queue_dependency)

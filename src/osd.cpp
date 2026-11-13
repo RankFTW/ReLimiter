@@ -354,6 +354,9 @@ static void DrawPacingSummaryLine(const PacingPipelineSnapshot& pipeline, bool h
     case PacingFallbackReason::IdleCap:
         ImGui::TextColored(gray, "Idle cap active (background, FG-Off Cap or OLED Care)");
         return;
+    case PacingFallbackReason::DriverLimiterUnavailable:
+        ImGui::TextColored(gray, "Test mode driver_limiter: the NVIDIA limiter can't apply here (the game runs as it is)");
+        return;
     case PacingFallbackReason::PresentRoute:
         ImGui::TextColored(gray, "Capped: smooth pacing needs NVIDIA Reflex in the game");
         return;
