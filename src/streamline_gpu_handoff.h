@@ -44,6 +44,8 @@ public:
     GpuPresentFgInput probe_input{};      // gpu_queue_probe: this Present's real-frame input (marker of this thread)
     bool probe_pending = false;           // ... until the first queue Signal of the scope delivers its boundary
     unsigned successful_source_fences = 0; // owning thread only; Signal/Wait results
+    void* order_queue = nullptr;          // fg_present_order: the queue of this scope's first outermost Signal
+    bool order_done = false;              // ... and whether its Wait on that queue has been followed
 private:
     static thread_local StreamlineInputScope* current_;
     StreamlineInputScope* previous_ = nullptr;

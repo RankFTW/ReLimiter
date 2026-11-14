@@ -13,6 +13,7 @@
 #include "wake_guard.h"
 #include "vtable_copy.h"
 #include "logger.h"
+#include "fg_present_order.h"
 #include <dxgi1_2.h>
 #include <array>
 #include <atomic>
@@ -1138,7 +1139,9 @@ __declspec(noinline) static HRESULT PresentEntry(
     NativeGate_NoteEntry(kind == PresentEntryKind::Inline ? NativeGateEntry::TypedPresent : NativeGateEntry::VtablePresent);
     if (kind == PresentEntryKind::Vtable) s_vtable_entries.fetch_add(1, std::memory_order_relaxed);
     if (callback.IsStopping()) return InvokePresent(original, self, SyncInterval, Flags);
-    return PresentOutermost(original, kind == PresentEntryKind::Vtable, Slot, caller, self, SyncInterval, Flags);
+    const HRESULT result = PresentOutermost(original, kind == PresentEntryKind::Vtable, Slot, caller, self, SyncInterval, Flags);
+    FgPresentOrder_AfterNativePresent(); // fg_present_order: this Present's packets are on the GPU's queue
+    return result;
 }
 
 template <size_t Slot>
@@ -1248,8 +1251,10 @@ __declspec(noinline) static HRESULT Present1Entry(
     if (callback.IsStopping())
         return InvokePresent1(
             original, self, SyncInterval, PresentFlags, PresentParameters);
-    return Present1Outermost(original, kind == PresentEntryKind::Vtable, Slot, caller, self, SyncInterval,
-                             PresentFlags, PresentParameters);
+    const HRESULT result = Present1Outermost(original, kind == PresentEntryKind::Vtable, Slot, caller, self, SyncInterval,
+                                             PresentFlags, PresentParameters);
+    FgPresentOrder_AfterNativePresent(); // fg_present_order: this Present's packets are on the GPU's queue
+    return result;
 }
 
 template <size_t Slot>

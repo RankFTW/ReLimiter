@@ -10,6 +10,7 @@
 #include "pacing_resolver.h"
 #include "reflex_inject.h"
 #include "logger.h"
+#include "fg_present_order.h"
 #include <Windows.h>
 #include <cerrno>
 #include <climits>
@@ -395,6 +396,9 @@ void LoadConfig(HMODULE hModule) {
     g_config.flip_metering_off=ReadINIBool(S,"flip_metering_off",false,P);
     g_config.gpu_queue_probe=ReadINIBool(S,"gpu_queue_probe",kPacingGpuQueueProbeDefault,P);
     g_config.gpu_queue_probe_source=ReadINIInt(S,"gpu_queue_probe_source",kPacingGpuQueueProbeSourceDefault,P);
+    g_config.fg_present_order=ReadINIBool(S,"fg_present_order",false,P);
+    g_config.fg_output_wait_us=Clamp(ReadINIInt(S,"fg_output_wait_us",0,P),0,5000);
+    g_config.lead_deadband_us=Clamp(ReadINIInt(S,"lead_deadband_us",0,P),0,5000);
     g_config.unified_hold_share=ReadINIDouble(S,"unified_hold_share",kPacingUnifiedHoldShareDefault,P);
     g_config.unified_queue_law=ReadINIBool(S,"unified_queue_law",kPacingUnifiedQueueLawDefault,P);
     g_config.unified_queue_rank=ReadINIInt(S,"unified_queue_rank",kPacingUnifiedQueueRankDefault,P);
@@ -885,6 +889,9 @@ void Config_ApplyPacingPipeline() {
     g_unified_queue_upstream.store(sizeof(void*) == 8 ? g_config.unified_queue_upstream : 0, std::memory_order_relaxed);
     g_gpu_queue_probe_source.store(sizeof(void*) == 8 ? g_config.gpu_queue_probe_source : 0, std::memory_order_relaxed);
     g_unified_queue_margin_end.store(sizeof(void*) == 8 ? g_config.unified_queue_margin_end : 0, std::memory_order_relaxed);
+    g_fg_present_order.store(sizeof(void*) == 8 && g_config.fg_present_order, std::memory_order_relaxed);
+    g_fg_output_wait_us.store(sizeof(void*) == 8 ? Clamp(g_config.fg_output_wait_us, 0, 5000) : 0, std::memory_order_relaxed);
+    g_lead_deadband_us.store(Clamp(g_config.lead_deadband_us, 0, 5000), std::memory_order_relaxed);
 }
 
 // ── Live keys (developer control file) ──
@@ -938,6 +945,9 @@ constexpr Key kKeys[] = {
     {"gpu_present_gate_probes", &SetBool<&Config::gpu_present_gate_probes>, Publish::Pipeline},
     {"gpu_queue_probe", &SetBool<&Config::gpu_queue_probe>, Publish::Pipeline},
     {"gpu_queue_probe_source", &SetInt<&Config::gpu_queue_probe_source>, Publish::Pipeline},
+    {"fg_present_order", &SetBool<&Config::fg_present_order>, Publish::Pipeline},
+    {"fg_output_wait_us", &SetInt<&Config::fg_output_wait_us>, Publish::Pipeline},
+    {"lead_deadband_us", &SetInt<&Config::lead_deadband_us>, Publish::Pipeline},
     {"unified_queue_margin_end", &SetInt<&Config::unified_queue_margin_end>, Publish::Pipeline},
     {"unified_hold_share", &SetDouble<&Config::unified_hold_share>, Publish::Pipeline},
     {"pacing_test_mode", &SetEnum<PacingTestMode, &Config::pacing_test_mode, PacingTestMode_FromText>, Publish::Pipeline},

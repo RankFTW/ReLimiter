@@ -194,6 +194,8 @@ if(RELIMITER_64BIT)
         src/gpu_readiness_d3d12_queue.cpp
         src/gpu_present_gate_d3d12.cpp
         src/gpu_queue_probe_d3d12.cpp
+        src/fg_present_order.cpp
+        src/fg_present_order.h
     )
 endif()
 
