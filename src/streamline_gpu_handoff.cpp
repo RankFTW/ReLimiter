@@ -21,6 +21,10 @@
 namespace streamline_handoff {
 constexpr unsigned RequiredCycles = 4;
 std::atomic<uint64_t> epoch{1}, authorized{0}, sequence{0};
+// The source queue whose fence-chain proof the authorized binding's hold stands on (a separate presenter's binding,
+// see Authorize), or null when it stands on none (a worker-local Present). Stored before `authorized`, read only
+// behind it.
+std::atomic<const void*> authorized_proof{nullptr};
 std::atomic<unsigned> pins{0};
 std::atomic<bool> tracking{false};
 std::atomic<bool> faulted{false};
@@ -233,7 +237,7 @@ struct SeparatePresenter {
     std::atomic<bool> evident{false};
     bool published = false; // installer worker only
 } separate;
-void RecordChainPresenter(uint64_t queue) noexcept; // dependency diagnostic, below
+void RecordChainPresenter(uint64_t queue) noexcept; // fence chain, below
 // Lock-free: a native Present outside any source scope.
 void RecordSeparatePresent(const StreamlineBoundaryEvidence& evidence) noexcept {
     constexpr auto relaxed = std::memory_order_relaxed;
@@ -248,21 +252,22 @@ void RecordSeparatePresent(const StreamlineBoundaryEvidence& evidence) noexcept 
     separate.seen_cycle.store(cycle, relaxed);
     RecordChainPresenter(evidence.queue);
 }
-// Dependency diagnostic, counts only (no authority, no rejection): which fences the
-// FG worker's queue and the separate presenter's queue signal and wait on, and for a
-// wait on a fence the other side signals, whether the waited value is at, below or
-// above that side's newest Signal so far. It answers, before a hold is designed for
-// frame generation that presents its own frames, whether the presenter's queue is the
-// game's source queue and how its Presents depend on the worker's work.
+// Fence chain: which fences the FG worker's queue and the separate presenter's queue signal and wait on, and for a
+// wait on a fence the other side signals, whether the waited value is at, below or above that side's newest Signal
+// so far. The counts are the report lines'. The facts are also the one proof a hold on a separate presenter's route
+// stands on (ReportChain, ChainProven, Authorize): the presenter's queue is not the game's source queue, and its
+// Presents depend on the worker's work.
 // Only the installer worker publishes the two queues, from observation records; the
 // hooks push records for published queues only. Destroying any queue advances one
 // epoch; every record carries the epoch it read before the queues. The installer
 // worker aggregates in push order: older-epoch records are dropped, and a newer epoch
 // reports, resets and unpublishes both sides until observations of that epoch
 // publish them again. So a Wait is judged only against Signals of its own epoch
-// pushed before it, and nothing crosses a queue's destruction. A side also restarts,
-// after being reported, when its queue changes. The tables keep the first 8 fences
-// per queue and direction.
+// pushed before it, and nothing crosses a queue's destruction. A record the queue
+// dropped and a native call that failed advance the same epoch (VoidChain): what the
+// hooks saw is then incomplete or untrue, and nothing before it counts. A side also
+// restarts, after being reported, when its queue changes. The tables keep the first 8
+// fences per queue and direction.
 struct ChainRecord {
     enum class Kind : uint8_t { WorkerSignal, WorkerWait, PresenterSignal, PresenterWait, WorkerSeen, PresenterSeen };
     Kind kind = Kind::WorkerSignal;
@@ -272,17 +277,26 @@ struct ChainRecord {
     uint64_t value = 0, epoch = 0;
 };
 struct ChainDiagnostic {
-    // Queues: written by the installer worker only. Epoch: advanced by any queue destroy.
+    // Queues: written by the installer worker only. Epoch: advanced by any queue destroy, lost record or failed call (VoidChain).
     std::atomic<ID3D12CommandQueue*> worker_queue{nullptr}, presenter_queue{nullptr}, source_queue{nullptr};
     std::atomic<uint64_t> epoch{1};
     std::atomic<ID3D12Fence*> forward_fence{nullptr}, back_fence{nullptr};
     std::atomic<DWORD> presenter_thread{0};
-    // Installer worker: the source queue the fence-chain proof holds for at present, or null (ReportChain).
+    // Installer worker: the fence-chain proof of its last pass (ReportChain): the source queue it holds for, or null,
+    // and the epoch of the aggregate it was computed from. Read through ChainProven only.
     std::atomic<const void*> proof_source{nullptr};
+    std::atomic<uint64_t> proof_epoch{0};
     relimiter::BoundedMpscQueue<ChainRecord, 1024> records;
 } chain;
 // Installer worker only.
-struct ChainTally { const void* fence = nullptr; uint64_t calls = 0, last = 0, at = 0, below = 0, above = 0; };
+struct ChainTally {
+    const void* fence = nullptr;
+    uint64_t calls = 0, last = 0, at = 0, below = 0, above = 0;
+    // A presenter wait entry's evidence of the current report pass (ReportChain): its waits at or above, and below,
+    // the worker's newest Signal. `proves` is what the last pass that saw a wait on it decided.
+    uint64_t pass_ok = 0, pass_below = 0;
+    bool proves = false;
+};
 struct ChainTable {
     std::array<ChainTally, 8> entries{};
     uint64_t overflow = 0;
@@ -362,8 +376,19 @@ void AggregateChain(const ChainRecord& record) noexcept {
     ++entry->calls;
     entry->last = record.value;
     if (signal) return;
-    if (const auto* signalled = (worker ? a.presenter : a.worker).signals.Find(record.fence))
-        ++(record.value == signalled->last ? entry->at : record.value < signalled->last ? entry->below : entry->above);
+    if (const auto* signalled = (worker ? a.presenter : a.worker).signals.Find(record.fence)) {
+        const bool below = record.value < signalled->last;
+        ++(record.value == signalled->last ? entry->at : below ? entry->below : entry->above);
+        if (!worker) ++(below ? entry->pass_below : entry->pass_ok); // the presenter's evidence of this pass
+    }
+}
+// Nothing recorded so far counts. A destroyed queue's address can be reused by a later queue, and a record the queue
+// dropped or a call that failed leaves what the hooks saw incomplete or untrue. The proof is void at once
+// (ChainProven reads this epoch); the installer worker drops the history at its next pass.
+void VoidChain() noexcept { chain.epoch.fetch_add(1, std::memory_order_acq_rel); }
+// Every record goes through here: a lost one voids the chain.
+void PushChain(const ChainRecord& record) noexcept {
+    if (!chain.records.Push(record)) VoidChain();
 }
 void PushChainSeen(ChainRecord::Kind kind, const void* queue, bool presenter_is_source) noexcept {
     ChainRecord record;
@@ -371,7 +396,7 @@ void PushChainSeen(ChainRecord::Kind kind, const void* queue, bool presenter_is_
     record.queue = queue;
     record.presenter_is_source = presenter_is_source;
     record.epoch = chain.epoch.load(std::memory_order_acquire);
-    chain.records.Push(record);
+    PushChain(record);
 }
 // A separate-presenter Present passed RecordSeparatePresent's checks.
 void RecordChainPresenter(uint64_t queue) noexcept {
@@ -379,18 +404,43 @@ void RecordChainPresenter(uint64_t queue) noexcept {
     chain.presenter_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
     PushChainSeen(ChainRecord::Kind::PresenterSeen, presenter, presenter == chain.source_queue.load(std::memory_order_acquire));
 }
-// Any destroyed queue's address can be reused by a later queue.
-void RecordChainDestroyed() noexcept { chain.epoch.fetch_add(1, std::memory_order_acq_rel); }
+// Installer worker: publishes the proof of this pass (null source: none) with the epoch of the aggregate it was
+// computed from. ChainProven loads the epoch, then the source, then the chain's epoch; so the source is retracted
+// before the epoch changes and published after it, and a reader can only match a pair published together.
+void PublishChainProof(uint64_t aggregate_epoch, const void* source) noexcept {
+    if (chain.proof_epoch.load(std::memory_order_relaxed) == aggregate_epoch &&
+        chain.proof_source.load(std::memory_order_relaxed) == source) return;
+    chain.proof_source.store(nullptr, std::memory_order_release);
+    chain.proof_epoch.store(aggregate_epoch, std::memory_order_release);
+    chain.proof_source.store(source, std::memory_order_release);
+}
+// Any thread, no lock: the fence-chain proof holds for `source` now. A proof holds only in the epoch of the aggregate
+// it was computed from, so a queue destroy, a lost record or a failed call (VoidChain) ends it before the installer
+// worker's next pass.
+bool ChainProven(const void* source) noexcept {
+    const uint64_t proved = chain.proof_epoch.load(std::memory_order_acquire);
+    return source && chain.proof_source.load(std::memory_order_acquire) == source &&
+        chain.epoch.load(std::memory_order_acquire) == proved;
+}
 void ReportChain(bool final) noexcept {
     auto& a = aggregate;
     ChainRecord record;
     for (unsigned i = 0; i < 4096 && chain.records.Pop(&record); ++i) AggregateChain(record);
     // A destroy without records since: unpublish now, so no reused address is matched.
     if (const uint64_t epoch = chain.epoch.load(std::memory_order_acquire); epoch > a.epoch) AdvanceChainEpoch(epoch);
+    // The presenter's waits of this pass, per entry: waits only at or above the worker's newest Signal prove it, a
+    // wait below it unproves it, and a pass that saw none changes nothing. The cumulative counts stay for the report
+    // lines. The records are in the order the threads pushed them, not the order of the GPU's work, so one late
+    // record (a wait pushed behind the worker's next Signal) voids the proof for its pass, not for the epoch.
+    for (auto& wait : a.presenter.waits.entries) {
+        if (wait.pass_below) wait.proves = false;
+        else if (wait.pass_ok) wait.proves = true;
+        wait.pass_ok = wait.pass_below = 0;
+    }
     // The fence-chain proof a hold on a separate presenter's route stands on: in this epoch the presenter's queue
-    // is neither the game's source queue nor the worker's, and it waits on a fence the worker's queue signals,
-    // never at a value below the worker's newest Signal. One wait below it voids the proof until a queue is
-    // destroyed or the presenter's queue changes.
+    // is neither the game's source queue nor the worker's, and it waits on a fence the worker's queue signals, at or
+    // above the worker's newest Signal as of the last pass that saw a wait on it. It is published with the epoch of
+    // this aggregate, so a destroy after the epoch read above (or a lost record, or a failed call) voids it at once.
     {
         const void* source = chain.source_queue.load(std::memory_order_acquire);
         bool proven = source && a.presenter.queue && a.worker.queue && a.presenter.queue != source &&
@@ -398,9 +448,9 @@ void ReportChain(bool final) noexcept {
         if (proven) {
             proven = false;
             for (const auto& wait : a.presenter.waits.entries)
-                if (wait.fence && (wait.at || wait.above) && !wait.below && a.worker.signals.Find(wait.fence)) { proven = true; break; }
+                if (wait.fence && wait.proves && a.worker.signals.Find(wait.fence)) { proven = true; break; }
         }
-        chain.proof_source.store(proven ? source : nullptr, std::memory_order_release);
+        PublishChainProof(a.epoch, proven ? source : nullptr);
     }
     const auto context = NativeGate_GetContext(Now());
     if (a.version == a.reported || (!final && (context.qpc_frequency <= 0 ||
@@ -547,11 +597,11 @@ const char* WorkerSignalRejection(ID3D12CommandQueue* queue, uint64_t site) noex
     if (route.cycle.begun & 8) return "worker_signal_repeated";
     if (!route.cycle.executions) return "worker_signal_before_execute";
     // No worker-local Present. With a separate presenter that is the rule. Its cycle stands while present-first
-    // ordering holds this source queue for the presenter's Present (fg_present_order.h); the binding is authorized
-    // only with the fence-chain proof as well (Authorize). Otherwise the cycle fails, and the failure names a
-    // separate presenter on positive evidence only: a Present of another thread and queue inside this cycle, or
-    // the ordering unit's (which does not depend on a Present falling into a cycle's span, a matter of the phase
-    // between two threads).
+    // ordering holds this source queue for the presenter's Present (fg_present_order.h); the binding is first
+    // authorized only with the fence-chain proof as well, and holds only while it holds (Authorize). Otherwise the
+    // cycle fails, and the failure names a separate presenter on positive evidence only: a Present of another
+    // thread and queue inside this cycle, or the ordering unit's (which does not depend on a Present falling into
+    // a cycle's span, a matter of the phase between two threads).
     if (!route.cycle.callbacks && !FgPresentOrder_ProvesSeparatePresenter(route.source))
         return (separate.seen_cycle.load(std::memory_order_relaxed) == separate.cycle.load(std::memory_order_relaxed) &&
                 separate.worker_queue.load(std::memory_order_relaxed) == route.worker) ||
@@ -575,15 +625,18 @@ const char* WorkerPresentRejection(const StreamlineBoundaryEvidence& evidence) n
     if (route.cycle.begun & 8) return "worker_present_after_back_signal";
     return nullptr;
 }
-// Caller holds the lock. A binding with a separate presenter is authorized only while the fence chain is proven for
+// Caller holds the lock. A binding with a separate presenter is first authorized while the fence chain is proven for
 // its source queue (ReportChain): the presenter's queue is not the source queue, which the hold blocks, and waits
 // on a fence the worker's queue signals. Until then its cycles complete without the hold, which keeps the binding
-// tracked so that the presenter's Presents and waits are recorded; a proof lost afterwards ends the binding.
+// tracked so that the presenter's Presents and waits are recorded. Once authorized, the proof is enforced where a
+// hold is admitted and validated (StreamlineHandoff_IsCurrent, through authorized_proof): a proof lost afterwards
+// (a queue destroy, a wait below the worker's newest Signal, a lost record, a failed call) pauses the hold and ends
+// nothing; the hold resumes when the chain is proven again.
 void Authorize() noexcept {
     if (route.successes < RequiredCycles || !route.device_checked) return;
-    if (!route.separate || chain.proof_source.load(std::memory_order_acquire) == route.source)
-        authorized.store(route.epoch, std::memory_order_release);
-    else if (authorized.load(std::memory_order_acquire) == route.epoch) Reject(nullptr, "separate_chain_unproven");
+    if (route.separate && authorized.load(std::memory_order_acquire) != route.epoch && !ChainProven(route.source)) return;
+    authorized_proof.store(route.separate ? route.source : nullptr, std::memory_order_release);
+    authorized.store(route.epoch, std::memory_order_release);
 }
 void CompleteCycle(const char* validated_reason = nullptr, bool validated = false) noexcept {
     auto& cycle = route.cycle;
@@ -650,8 +703,13 @@ StreamlineHandoffStatus StreamlineHandoff_ReadStatus() noexcept {
         tracking.load(std::memory_order_acquire), rejection.load(std::memory_order_acquire)};
 }
 bool StreamlineHandoff_IsCurrent(uint64_t value) noexcept {
-    return value && value == streamline_handoff::epoch.load(std::memory_order_acquire) &&
-        value == streamline_handoff::authorized.load(std::memory_order_acquire) && streamline_handoff::Enabled();
+    using namespace streamline_handoff;
+    if (!value || value != epoch.load(std::memory_order_acquire) || value != authorized.load(std::memory_order_acquire) ||
+        !Enabled()) return false;
+    // A separate presenter's binding holds only while the fence chain is proven for its source queue (Authorize
+    // stored it before `authorized`); while it is not, the hold is paused, not ended.
+    const void* proof = authorized_proof.load(std::memory_order_acquire);
+    return !proof || ChainProven(proof);
 }
 bool StreamlineHandoff_Tracking() noexcept { return streamline_handoff::tracking.load(std::memory_order_acquire); }
 bool StreamlineHandoff_ClaimsInput() noexcept {
@@ -908,7 +966,7 @@ void StreamlineHandoff_Execute(ID3D12CommandQueue* queue) noexcept {
 void StreamlineHandoff_Boundary(const StreamlineBoundaryEvidence& evidence) noexcept {
     using namespace streamline_handoff;
     if (evidence.stage != StreamlineBoundaryStage::Present) {
-        if (evidence.stage == StreamlineBoundaryStage::DestroyQueue) RecordChainDestroyed();
+        if (evidence.stage == StreamlineBoundaryStage::DestroyQueue) VoidChain();
         if (evidence.stage == StreamlineBoundaryStage::DestroyQueue) {
             Lock lock("queue_lifecycle_lock_busy");
             if (!lock.held) return;
@@ -946,6 +1004,8 @@ void StreamlineHandoff_Service(bool final) noexcept {
             invalidation.epoch, invalidation.reason, invalidation.qpc, invalidation.thread, invalidation.object,
             maintenance_deferrals.load(), callback_contentions.load(), invalidations.DroppedValues());
     }
+    // fg_present_order: its binding stands only while frame generation presents at one multiplier.
+    FgPresentOrder_Service(g_fg_presenting.load(std::memory_order_acquire), g_fg_multiplier.load(std::memory_order_acquire));
     PublishSeparatePresenter();
     ReportChain(final);
     ReportAdmission(final); // no formatting or I/O from marker/Present/queue callbacks
@@ -1042,5 +1102,13 @@ void StreamlineHandoff_RecordQueueFence(ID3D12CommandQueue* queue, ID3D12Fence* 
     record.fence = fence;
     record.value = value;
     record.epoch = epoch;
-    chain.records.Push(record);
+    PushChain(record);
+}
+// The native Signal or Wait the hooks forwarded for `queue` (an outermost call) failed: its record, pushed before the
+// call, is no evidence. If `queue` is the chain's worker or presenter queue, the proof and its history are void from
+// this call on (VoidChain).
+void StreamlineHandoff_ChainCallFailed(ID3D12CommandQueue* queue) noexcept {
+    using namespace streamline_handoff;
+    if (queue && (queue == chain.worker_queue.load(std::memory_order_acquire) ||
+                  queue == chain.presenter_queue.load(std::memory_order_acquire))) VoidChain();
 }

@@ -588,6 +588,7 @@ void StreamlineHandoff_Execute(ID3D12CommandQueue*) noexcept {}
 bool StreamlineHandoff_Interested(ID3D12Fence*) noexcept { return false; }
 void StreamlineHandoff_RejectQueueMethods() noexcept {}
 void StreamlineHandoff_RecordQueueFence(ID3D12CommandQueue*, ID3D12Fence*, uint64_t, bool) noexcept {}
+void StreamlineHandoff_ChainCallFailed(ID3D12CommandQueue*) noexcept {}
 void StreamlineHandoff_ProbeSourceSignal(ID3D12CommandQueue*) noexcept {}
 
 bool GpuReadinessQueue_Retain(ID3D12CommandQueue* queue) noexcept {

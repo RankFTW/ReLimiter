@@ -62,9 +62,13 @@ void StreamlineHandoff_Execute(ID3D12CommandQueue*) noexcept;
 bool StreamlineHandoff_Tracking() noexcept;
 bool StreamlineHandoff_Interested(ID3D12Fence*) noexcept;
 void StreamlineHandoff_RejectQueueMethods() noexcept;
-// Dependency diagnostic (counts only): every queue Signal/Wait from the queue hooks;
-// records only calls on the FG worker's queue and the separate presenter's queue.
+// Fence chain (the counts, and the proof a hold on a separate presenter's route stands on): every queue Signal/Wait
+// from the queue hooks, before the native call runs; records only calls on the FG worker's queue and the separate
+// presenter's queue.
 void StreamlineHandoff_RecordQueueFence(ID3D12CommandQueue*, ID3D12Fence*, uint64_t value, bool signal) noexcept;
+// The native Signal or Wait the hooks just forwarded for this queue (an outermost call) failed: its record is no
+// evidence. If the queue is the chain's worker or presenter queue, the proof and its history are void from this call on.
+void StreamlineHandoff_ChainCallFailed(ID3D12CommandQueue*) noexcept;
 // gpu_queue_probe: called by the queue hooks for a Signal (key on): the first Signal of an outermost
 // proxy Present scope that has a probe input delivers the real frame's boundary on its queue.
 void StreamlineHandoff_ProbeSourceSignal(ID3D12CommandQueue*) noexcept;

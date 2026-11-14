@@ -1073,6 +1073,9 @@ __declspec(noinline) static HRESULT PresentBody(
     native_gate.Complete(hr == S_OK, retried);
     readiness.Complete(hr == S_OK, retried);
     PushPacingPresent(reinterpret_cast<uint64_t>(self), pacing_attempt, native_gate.trace, replaced);
+    // fg_present_order: this Present's packets are on the GPU's queue. Only the selected swapchain's outermost call
+    // that presented counts: a nested entry, another swapchain, a test Present or a failed one queues nothing.
+    if (hr == S_OK && !(Flags & DXGI_PRESENT_TEST)) FgPresentOrder_AfterNativePresent();
     return hr;
 }
 
@@ -1139,9 +1142,7 @@ __declspec(noinline) static HRESULT PresentEntry(
     NativeGate_NoteEntry(kind == PresentEntryKind::Inline ? NativeGateEntry::TypedPresent : NativeGateEntry::VtablePresent);
     if (kind == PresentEntryKind::Vtable) s_vtable_entries.fetch_add(1, std::memory_order_relaxed);
     if (callback.IsStopping()) return InvokePresent(original, self, SyncInterval, Flags);
-    const HRESULT result = PresentOutermost(original, kind == PresentEntryKind::Vtable, Slot, caller, self, SyncInterval, Flags);
-    FgPresentOrder_AfterNativePresent(); // fg_present_order: this Present's packets are on the GPU's queue
-    return result;
+    return PresentOutermost(original, kind == PresentEntryKind::Vtable, Slot, caller, self, SyncInterval, Flags);
 }
 
 template <size_t Slot>
@@ -1213,6 +1214,8 @@ __declspec(noinline) static HRESULT Present1Body(
     native_gate.Complete(result == S_OK, false);
     readiness.Complete(result == S_OK, false);
     PushPacingPresent(reinterpret_cast<uint64_t>(self), pacing_attempt, native_gate.trace, replaced);
+    // fg_present_order: as in PresentBody.
+    if (result == S_OK && !(PresentFlags & DXGI_PRESENT_TEST)) FgPresentOrder_AfterNativePresent();
     return result;
 }
 
@@ -1251,10 +1254,8 @@ __declspec(noinline) static HRESULT Present1Entry(
     if (callback.IsStopping())
         return InvokePresent1(
             original, self, SyncInterval, PresentFlags, PresentParameters);
-    const HRESULT result = Present1Outermost(original, kind == PresentEntryKind::Vtable, Slot, caller, self, SyncInterval,
-                                             PresentFlags, PresentParameters);
-    FgPresentOrder_AfterNativePresent(); // fg_present_order: this Present's packets are on the GPU's queue
-    return result;
+    return Present1Outermost(original, kind == PresentEntryKind::Vtable, Slot, caller, self, SyncInterval,
+                             PresentFlags, PresentParameters);
 }
 
 template <size_t Slot>

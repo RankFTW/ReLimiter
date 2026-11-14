@@ -553,13 +553,15 @@ int main() {
     g_fg_presenting = false; StreamlineHandoff_Service(); CHECK(!separate_published);
     g_fg_presenting = true; StreamlineHandoff_Service(); Reset();
     // A separate presenter's route. Its cycles have no worker-local Present; they stand while present-first
-    // ordering holds the source queue (fg_present_order.h), and the binding is authorized only with the fence
+    // ordering holds the source queue (fg_present_order.h), and the binding is first authorized with the fence
     // chain proven as well: the presenter's queue is not the source queue and waits on a fence the worker's
     // queue signals. The presenter's Presents need not fall inside a cycle. Without the ordering the cycle fails
     // as before, and the ordering alone names the separate presenter. A worker-local Present in such a binding is
-    // a change of kind; a presenter's wait below the worker's newest Signal voids the chain proof.
+    // a change of kind. Once authorized, losing the proof (a queue destroy, a presenter's wait below the worker's
+    // newest Signal, a failed native call, a lost record) pauses the hold and ends nothing: it resumes when the
+    // chain is proven again. A binding with a worker-local Present never stood on the chain.
     enum class Presenter { Outside, Presents, Waits, WaitsBehind };
-    const auto separate_cycle = [](Presenter presenter_does) {
+    const auto separate_cycle = [](Presenter presenter_does, bool worker_present = false) {
         const auto value = Source();
         std::thread worker([=] {
             CHECK(Fence(&b,&forward_fence,value,0x130,false) == S_OK);
@@ -573,6 +575,7 @@ int main() {
                 });
                 presenter.join();
             }
+            if (worker_present) StreamlineHandoff_Boundary({StreamlineBoundaryStage::Present,0x1000,reinterpret_cast<uint64_t>(&b),0,1});
             CHECK(Fence(&b,&back_fence,value+10000,0x140,true) == S_OK);
         });
         worker.join();
@@ -583,14 +586,14 @@ int main() {
     };
     {
         auto* const source = As<ID3D12CommandQueue>(&a);
-        g_fg_present_order_queue.store(source); g_fg_separate_presenter_hold.store(true);
+        g_fg_present_order.store(true); g_fg_present_order_queue.store(source); g_fg_separate_presenter_hold.store(true);
         // Ordering without the fence chain: the cycles complete, the binding is not authorized, nothing is held.
         auto previous_begins = begins;
         for (unsigned i = 0; i < 6; ++i) separate_cycle(Presenter::Presents);
         CHECK(!StreamlineHandoff_IsCurrent(h::epoch) && h::route.separate && h::route.successes == h::RequiredCycles);
-        CHECK(!h::chain.proof_source.load() && separate_published && begins == previous_begins);
+        CHECK(!h::ChainProven(source) && separate_published && begins == previous_begins);
         // The presenter's wait on the worker's fence proves the chain; the next completed cycle authorizes.
-        separate_cycle(Presenter::Waits); CHECK(h::chain.proof_source.load() == source);
+        separate_cycle(Presenter::Waits); CHECK(h::ChainProven(source));
         separate_cycle(Presenter::Waits); CHECK(StreamlineHandoff_IsCurrent(h::epoch) && begins == previous_begins);
         separate_cycle(Presenter::Waits); CHECK(begins == previous_begins + 1);
         separate_cycle(Presenter::Outside); CHECK(StreamlineHandoff_IsCurrent(h::epoch) && begins == previous_begins + 2);
@@ -611,9 +614,81 @@ int main() {
         Reset();
         for (unsigned i = 0; i < 4; ++i) separate_cycle(Presenter::Waits);
         CHECK(StreamlineHandoff_IsCurrent(h::epoch));
-        separate_cycle(Presenter::WaitsBehind); CHECK(!h::chain.proof_source.load());
-        separate_cycle(Presenter::Outside); CHECK(rejected("separate_chain_unproven"));
-        g_fg_present_order_queue.store(nullptr);
+        const auto binding = h::epoch.load();
+        // Cycles with the presenter waiting at the worker's newest Signal bring a lost proof back (a few cycles: the
+        // installer pass publishes the queues first, and the waits are recorded for published queues only).
+        const auto reprove = [&](bool worker_present = false) {
+            for (unsigned i = 0; i < 8 && !h::ChainProven(source); ++i) separate_cycle(Presenter::Waits,worker_present);
+            CHECK(h::ChainProven(source));
+        };
+        // More records than the chain's queue holds, with no installer pass in between: the surplus is lost.
+        const auto lose_a_record = [&] {
+            const auto dropped = h::chain.records.DroppedValues();
+            for (unsigned i = 0; i < 1100; ++i)
+                StreamlineHandoff_RecordQueueFence(As<ID3D12CommandQueue>(&b),As<ID3D12Fence>(&out_fence),1,true);
+            CHECK(h::chain.records.DroppedValues() > dropped);
+        };
+        auto held = begins;
+        separate_cycle(Presenter::Waits); CHECK(begins == held + 1);
+        // A queue destroy unrelated to the route voids the proof at once, before any installer pass. Nothing is
+        // held until the chain is proven anew, and the binding is not rejected.
+        held = begins;
+        StreamlineHandoff_Boundary({StreamlineBoundaryStage::DestroyQueue,0,0x9999});
+        CHECK(h::epoch == binding && !h::ChainProven(source) && !StreamlineHandoff_IsCurrent(binding));
+        for (unsigned i = 0; i < 8 && !StreamlineHandoff_IsCurrent(binding); ++i) {
+            separate_cycle(Presenter::Waits);
+            CHECK(h::epoch == binding && begins == held);
+        }
+        CHECK(StreamlineHandoff_IsCurrent(binding));
+        separate_cycle(Presenter::Waits); CHECK(begins == held + 1);
+        // A presenter's wait below the worker's newest Signal voids the proof for its pass only: the next pass of
+        // waits at the newest Signal proves it again.
+        held = begins;
+        separate_cycle(Presenter::WaitsBehind);
+        CHECK(begins == held + 1 && h::epoch == binding && !h::ChainProven(source) && !StreamlineHandoff_IsCurrent(binding));
+        separate_cycle(Presenter::Waits);
+        CHECK(begins == held + 1 && h::epoch == binding && StreamlineHandoff_IsCurrent(binding));
+        separate_cycle(Presenter::Waits); CHECK(begins == held + 2);
+        // A failed native call on the presenter's or the worker's queue voids the proof and its history; on another
+        // queue it says nothing about the chain.
+        StreamlineHandoff_ChainCallFailed(As<ID3D12CommandQueue>(&a));
+        StreamlineHandoff_ChainCallFailed(reinterpret_cast<ID3D12CommandQueue*>(0x9999));
+        StreamlineHandoff_ChainCallFailed(nullptr);
+        CHECK(h::ChainProven(source) && StreamlineHandoff_IsCurrent(binding));
+        for (auto* queue : {&c,&b}) {
+            StreamlineHandoff_ChainCallFailed(As<ID3D12CommandQueue>(queue));
+            CHECK(h::epoch == binding && !h::ChainProven(source) && !StreamlineHandoff_IsCurrent(binding));
+            // The history went with it: a pass without the presenter's waits does not bring the proof back.
+            separate_cycle(Presenter::Outside); CHECK(h::epoch == binding && !h::ChainProven(source));
+            reprove(); CHECK(StreamlineHandoff_IsCurrent(binding));
+        }
+        // A record the chain's queue dropped voids the proof the same way.
+        lose_a_record();
+        CHECK(h::epoch == binding && !h::ChainProven(source) && !StreamlineHandoff_IsCurrent(binding));
+        reprove(); CHECK(StreamlineHandoff_IsCurrent(binding));
+        held = begins;
+        separate_cycle(Presenter::Waits); CHECK(begins == held + 1);
+        // A binding with a worker-local Present never stood on the chain: none of the above touches its hold.
+        Reset();
+        for (unsigned i = 0; i < 4; ++i) separate_cycle(Presenter::Waits,true);
+        const auto local = h::epoch.load();
+        CHECK(StreamlineHandoff_IsCurrent(local) && !h::route.separate && h::ChainProven(source));
+        held = begins;
+        separate_cycle(Presenter::WaitsBehind,true);
+        CHECK(begins == held + 1 && h::epoch == local && !h::ChainProven(source) && StreamlineHandoff_IsCurrent(local));
+        reprove(true); held = begins;
+        StreamlineHandoff_Boundary({StreamlineBoundaryStage::DestroyQueue,0,0x9999});
+        CHECK(h::epoch == local && !h::ChainProven(source) && StreamlineHandoff_IsCurrent(local));
+        separate_cycle(Presenter::Waits,true); CHECK(begins == held + 1);
+        reprove(true); held = begins;
+        StreamlineHandoff_ChainCallFailed(As<ID3D12CommandQueue>(&c)); StreamlineHandoff_ChainCallFailed(As<ID3D12CommandQueue>(&b));
+        CHECK(h::epoch == local && !h::ChainProven(source) && StreamlineHandoff_IsCurrent(local));
+        separate_cycle(Presenter::Waits,true); CHECK(begins == held + 1);
+        reprove(true); held = begins;
+        lose_a_record();
+        CHECK(h::epoch == local && !h::ChainProven(source) && StreamlineHandoff_IsCurrent(local));
+        separate_cycle(Presenter::Waits,true); CHECK(begins == held + 1 && h::epoch == local);
+        g_fg_present_order_queue.store(nullptr); g_fg_present_order.store(false);
         Reset();
         g_fg_separate_presenter_hold.store(false);
     }

@@ -14,17 +14,20 @@
 // Mechanism. Right behind DLSS-G's Wait on the render queue this unit enqueues a Signal of its own marker fence and a
 // Wait on its own order fence. The marker completes when frame generation is done; the order fence is signalled from
 // the CPU when the first native Present after that has returned (its packets are then on the GPU's queue), or by a
-// watchdog `kFgPresentOrderWaitMs` after the marker completed. So the next frame's work starts behind the generated
-// frame's present, not in front of it. The two fences are this unit's own, created on the render queue's native
-// device and released when that queue is destroyed and at shutdown; nothing of the game or of Streamline is retained.
+// watchdog a share of the frame time after the marker completed (an eighth, between 0.5 and 2 ms). So the next
+// frame's work starts behind the generated frame's present, not in front of it. The fences are this unit's own,
+// created on the render queue's native device and released when that queue is destroyed, when the key is turned off,
+// when frame generation stops presenting or changes its multiplier (FgPresentOrder_Service) and at shutdown; nothing
+// of the game or of Streamline is retained.
 //
 // The render queue is the one that receives the first outermost Signal inside a proxy Present scope
 // (StreamlineInputScope), and the Wait followed is the first outermost Wait on that queue in the same scope: the
 // pattern the Streamline handoff qualifies as source Signal and source Wait. The queue waits only on evidence
-// (fg_present_order_rule.h): until sixteen markers in a row were released by a native Present of another thread than
-// DLSS-G's worker inside the watchdog's bound, only the marker is enqueued; sixteen watchdog releases in a row stop
-// the unit for 240 frames, after which it probes again. With hardware flip metering the worker presents before its
-// return Signal, so the unit never makes the queue wait and enqueues a marker in one frame of sixteen.
+// (fg_present_order_rule.h), judged in blocks of sixteen markers: only the marker is enqueued until a block in which
+// at most two were left to the watchdog (the rest released by a native Present of another thread than DLSS-G's
+// worker inside the bound); a block with more than eight left to the watchdog stops the unit for 240 frames, after
+// which it probes again. With hardware flip metering the worker presents before its return Signal, so the unit
+// never makes the queue wait and enqueues a marker in one frame of sixteen.
 //
 // Cost with the key on. A game without Streamline's proxy Present: one load and a compare per outermost queue Signal
 // and Wait. Frame generation, ordering: per frame one queue Signal, one queue Wait, one event registration on the
@@ -45,8 +48,11 @@ inline std::atomic<uint64_t> g_fg_present_order_issued{0}, g_fg_present_order_re
 // less even, N.102), the ground on which such a presenter's cycles stand without a worker-local Present.
 inline std::atomic<void*> g_fg_present_order_queue{nullptr};
 inline std::atomic<bool> g_fg_separate_presenter_hold{false};
+// The render queue is ordered only while the key is on: the qualification stays published when the key is turned
+// off, so every reader takes the key with it.
 inline bool FgPresentOrder_Orders(const void* queue) noexcept {
-    return queue && g_fg_present_order_queue.load(std::memory_order_acquire) == queue;
+    return queue && g_fg_present_order.load(std::memory_order_relaxed) &&
+        g_fg_present_order_queue.load(std::memory_order_acquire) == queue;
 }
 inline bool FgPresentOrder_ProvesSeparatePresenter(const void* queue) noexcept {
     return g_fg_separate_presenter_hold.load(std::memory_order_relaxed) && FgPresentOrder_Orders(queue);
@@ -55,18 +61,17 @@ inline bool FgPresentOrder_ProvesSeparatePresenter(const void* queue) noexcept {
 // front of a submission the ordered render queue signals a fence and waits for that value, so the GPU is handed
 // nothing past that point until it has reached it and a waiting Present of DLSS-G's thread gets the GPU there
 // (fg_present_order.cpp). `fg_render_break_window` says which submissions: -1 (default) those around the one the
-// GPU is at when the real frame's Present returns, as wide as fg_break_window_rule.h makes it; 0 every n-th of the
-// whole frame; above 0 that half-width.
+// GPU is at when each of frame generation's later Presents of the frame returns (2x: the real frame's), as wide as
+// fg_break_window_rule.h makes them; 0 every n-th of the whole frame; above 0 that half-width.
 inline std::atomic<int> g_fg_render_break_every{0};
 inline std::atomic<int> g_fg_render_break_window{-1};
-// The marker value whose real frame's Present is awaited to place the window, 0 when none is.
+// The marker value whose frame's later Presents are awaited to place its windows, 0 when none is.
 inline std::atomic<uint64_t> g_fg_present_order_real_awaited{0};
 
 #if defined(_WIN64) && defined(RELIMITER_FG_PRESENT_ORDER)
 #include <Windows.h>
 struct ID3D12CommandQueue;
 struct ID3D12Fence;
-constexpr unsigned long kFgPresentOrderWaitMs = 2;
 using FgPresentOrder_FenceFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
 
 void FgPresentOrder_NoteSignalActive(void* queue, void* fence) noexcept;
@@ -75,6 +80,9 @@ void FgPresentOrder_AfterWaitActive(ID3D12CommandQueue* queue, ID3D12Fence* fenc
 void FgPresentOrder_ReleaseActive(bool watchdog) noexcept;
 void FgPresentOrder_OnQueueDestroy(void* native_queue) noexcept;
 bool FgPresentOrder_Shutdown(unsigned long timeout_ms) noexcept;
+// The installer's worker, on every pass: whether frame generation presents, and at which multiplier. A binding made
+// under other conditions, or left behind by a key turned off, is withdrawn here.
+void FgPresentOrder_Service(bool fg_presenting, int fg_multiplier) noexcept;
 void FgPresentOrder_BeforeExecuteActive(ID3D12CommandQueue* queue, FgPresentOrder_FenceFn native_signal,
     FgPresentOrder_FenceFn native_wait) noexcept;
 
@@ -92,6 +100,7 @@ inline void FgPresentOrder_AfterWait(ID3D12CommandQueue* queue, ID3D12Fence* fen
 inline void FgPresentOrder_BeforeExecute(ID3D12CommandQueue* queue, FgPresentOrder_FenceFn native_signal,
     FgPresentOrder_FenceFn native_wait) noexcept {
     if (g_fg_render_break_every.load(std::memory_order_relaxed) > 0 &&
+        g_fg_present_order.load(std::memory_order_relaxed) &&
         g_fg_present_order_queue.load(std::memory_order_relaxed) == queue)
         FgPresentOrder_BeforeExecuteActive(queue, native_signal, native_wait);
 }
@@ -108,4 +117,5 @@ template <class... Arguments> inline void FgPresentOrder_BeforeExecute(Arguments
 inline void FgPresentOrder_AfterNativePresent() noexcept {}
 inline void FgPresentOrder_OnQueueDestroy(void*) noexcept {}
 inline bool FgPresentOrder_Shutdown(unsigned long) noexcept { return true; }
+inline void FgPresentOrder_Service(bool, int) noexcept {}
 #endif

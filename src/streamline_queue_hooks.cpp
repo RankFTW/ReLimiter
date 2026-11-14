@@ -57,11 +57,6 @@ void STDMETHODCALLTYPE ObserveExecute(ID3D12CommandQueue* queue, UINT count, ID3
     const DWORD incoming = GetLastError();
     RuntimeCallbackGuard callback;
     Depth nested;
-    // fg_render_break_every (key off: one load and a branch): in front of a submission the ordered render queue gets
-    // a break, through the originals (no detour sees it).
-    if (depth == 1 && !callback.IsStopping())
-        FgPresentOrder_BeforeExecute(queue, original_signal.load(std::memory_order_acquire),
-            original_wait.load(std::memory_order_acquire));
     // gpu_queue_probe (key off: one load and a branch): enq before the call and the done Signal right after it, only
     // for the outermost call.
     // gpu_queue_probe_source (key off: one load and a branch): command lists per queue, outermost calls only.
@@ -70,6 +65,12 @@ void STDMETHODCALLTYPE ObserveExecute(ID3D12CommandQueue* queue, UINT count, ID3
     // A nested Execute on the adopted queue (the Streamline handoff's own) interrupts a pending borrowed marker: the
     // probe settles it with its own Signal before the call is forwarded.
     if (depth > 1) GpuQueueProbe_BorrowInterrupt(queue);
+    // fg_render_break_every (key off: one load and a branch): in front of a submission the ordered render queue gets
+    // a break, through the originals (no detour sees it). Behind the probe's entry: a borrowed marker of the
+    // submission before is settled first, so the break's time is never read as that submission's.
+    if (depth == 1 && !callback.IsStopping())
+        FgPresentOrder_BeforeExecute(queue, original_signal.load(std::memory_order_acquire),
+            original_wait.load(std::memory_order_acquire));
     SetLastError(incoming);
     original_execute.load(std::memory_order_acquire)(queue, count, lists);
     const DWORD outgoing = GetLastError();
@@ -101,8 +102,10 @@ template<class Forward> HRESULT ObserveFence(ID3D12CommandQueue* queue, ID3D12Fe
         StreamlineHandoff_ProbeSourceSignal(queue);
     // fg_present_order (key off: one load and a branch): the queue of a proxy Present scope's first outermost Signal.
     if (outermost_signal) FgPresentOrder_NoteSignal(queue, fence);
+    bool recorded = false; // this call was recorded as chain evidence (it is retracted if the native call fails)
     if (!callback.IsStopping() && depth == 1 && streamline_ready.load(std::memory_order_acquire)) {
         StreamlineHandoff_RecordQueueFence(queue, fence, value, signal);
+        recorded = true;
         if (StreamlineHandoff_Interested(fence)) {
             if (MatchesQueue(queue)) call = StreamlineHandoff_BeforeFence(queue, fence, value, PluginSite(), signal);
             else StreamlineHandoff_RejectQueueMethods();
@@ -118,6 +121,8 @@ template<class Forward> HRESULT ObserveFence(ID3D12CommandQueue* queue, ID3D12Fe
     SetLastError(incoming);
     const HRESULT result = forward();
     const DWORD outgoing = GetLastError();
+    // The record above was made before the native call: a call that failed is no evidence about the queue.
+    if (recorded && result != S_OK) StreamlineHandoff_ChainCallFailed(queue);
     StreamlineHandoff_AfterFence(call, result);
     SetLastError(outgoing);
     return result;
