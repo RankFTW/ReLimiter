@@ -15,7 +15,7 @@
 //               without the starvation inside the frame (N counts that empty time as need).
 // Over the W = 16 newest valid samples (UnifiedQueueWindow::Compute):
 //   B = mean over the newest F valid samples of need(j) = (cycle - starve)
-//       + mean over the 16 of (starve(j) if paced(j) else 0)
+//       + mean over the 16 of (min(starve(j), start wait(j)) if paced(j) else 0)
 //       (F = need_frames, key unified_queue_need_frames, 1..16; with fewer valid samples, what
 //       is there). paced(j): the start of the frame the record describes was held by the pacer to
 //       a time set by the GPU term (the hardware term was binding at its plan and the start wait
@@ -23,7 +23,11 @@
 //       follows the GPU within F frames; starvation counts only where the GPU term caused it
 //       (it cancels the ratchet of the interval), never where the cap, the display or game term,
 //       or the game's own lateness set the start (counted there it would make I_gpu echo that
-//       term's interval). F = 16 is the 16-frame mean cycle exactly, no gating.
+//       term's interval), and never beyond the time the start was held (paced_wait_us): a wait
+//       of w delays the frame's work by w and cannot have emptied the queue for longer. What a
+//       paced frame's own threads add (a 43 ms simulation on a frame held for 1 ms: Rogue Core,
+//       N.107) is the game's, and counted it raised B by 2.5 ms and held it there for seconds.
+//       F = 16 is the 16-frame mean cycle exactly, no gating.
 //   N^ = mean N (analysis only), S^ = mean S (the credit's slack and allowance; 16 frames)
 //   q = max(rank-th smallest s', median s' - M)          M = allow_us
 //   guard = max(0, min(s' of the newest 4) - 2M) / 8
@@ -74,6 +78,7 @@ struct UnifiedQueueSample {
     double service_us = 0.0;       // S = max(0, N - empty)
     double s_prime_us = 0.0;       // -starve when starve > 0, else margin_free
     bool paced = false;            // the GPU term paced this frame's start (set by the pacer; never by FromRecord)
+    double paced_wait_us = 0.0;    // ... and held it this long: the most of starve_us the base counts
 };
 
 // valid iff kCycle, kEmpty, kBoundaryIdle, kHoldBlock and kWaitIdle are set, every value is

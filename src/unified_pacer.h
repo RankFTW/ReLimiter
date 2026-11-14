@@ -530,9 +530,15 @@ public:
     // pairs and the hold subtraction address frames by producer frame id).
     // gpu_paced: the start of this frame was held to a time set by the GPU term (the hardware term
     // was the binding one at its plan, kUpBoundGpu, and the start wait ran to that plan: the frame
-    // did not arrive after its planned start). The queue law counts the starvation of the frame's
-    // probe record in its base only then (UnifiedQueueSample::paced); stored in the frame's entry.
-    void OnPlan(uint64_t grid_index, const PacingPlanKey& key, int64_t release_qpc, bool gpu_paced = false) noexcept;
+    // did not arrive after its planned start). The queue law counts starvation of the frame's
+    // probe record in its base only then (UnifiedQueueSample::paced), and no more of it than
+    // start_wait_us, the time the start was held: a wait of w delays the frame's work by w and
+    // cannot have emptied the queue for longer, so what the game's own threads added (a simulation
+    // spike on a paced frame) stays out of the base. Both are stored in the frame's entry. The
+    // default counts the whole starvation (a caller that knows only that the frame was paced).
+    static constexpr double kStartWaitWhole = 1e18;
+    void OnPlan(uint64_t grid_index, const PacingPlanKey& key, int64_t release_qpc, bool gpu_paced = false,
+        double start_wait_us = kStartWaitWhole) noexcept;
 
     // ── Evidence (stage events and reports) ──
 
@@ -648,6 +654,7 @@ private:
         bool granted = false;        // planned live under the key: its hold spends the credit
         bool granted_by_law = false; // ... and the grant was made while the queue law was in use: the probe record spends it
         bool gpu_paced = false;      // the GPU term paced the frame's start (OnPlan)
+        double gpu_paced_wait_us = 0.0; // ... and held it this long (OnPlan's start_wait_us)
         bool hold_debited = false;   // its hold was spent once (by RefreshHold, or by the record that names its sequence)
         uint64_t law_hold_sequence = 0; // the sequence given at a law grant (0 = a report-rule grant or none)
         bool hold_unpaid_counted = false; // counted in the summary as never debited

@@ -431,13 +431,52 @@ namespace
         }
     }
 
-    // A valid sample of a frame the GPU term paced (or not).
-    UnifiedQueueSample PacedSample(const PacingGpuQueueRecord& record, bool paced)
+    // A valid sample of a frame the GPU term paced (or not). A paced frame's start wait is as long as its
+    // starvation unless the test says otherwise: the wait then caused all of it.
+    UnifiedQueueSample PacedSample(const PacingGpuQueueRecord& record, bool paced, double wait_us = -1.0)
     {
         UnifiedQueueSample sample = UnifiedQueueSample_FromRecord(record);
         sample.paced = paced;
+        sample.paced_wait_us = !paced ? 0.0 : wait_us >= 0.0 ? wait_us : sample.starve_us;
         return sample;
     }
+
+    // The base counts a paced frame's starvation only as far as its start wait can have caused it. Rogue Core
+    // with the game and render threads in series (N.107): the GPU term paced every frame at 7.96 ms over a need
+    // of 7.7 ms, one frame was held for 1.05 ms and then simulated for 43 ms, and its queue sat empty for
+    // 39.85 ms. Counted whole, that frame raised the base by 39.85 / 16 = 2.49 ms and the interval with it.
+    void TestPacedStarvationCountsOnlyUpToTheStartWait()
+    {
+        const auto steady = [] { return PacedSample(Record(7960.0, 260.0, 0.0, 0.0, 0.0, 0.0, false), true); };
+        UnifiedQueueWindow window;
+        for (int i = 0; i < 40; ++i)
+            window.Push(steady());
+        const double before = window.Compute(7692.0, Params(2, 4000.0, 0.0, 4)).base_us;
+        CHECK(Near(before, 7960.0));
+        // The spike frame, then two ordinary ones (the need's four frames then hold one spike frame).
+        window.Push(PacedSample(Record(47350.0, 39850.0, 0.0, 0.0, 0.0, 0.0, false), true, 1050.0));
+        window.Push(steady());
+        window.Push(steady());
+        const UnifiedQueueResult bounded = window.Compute(7692.0, Params(2, 4000.0, 0.0, 4));
+        // need 7.5 ms from the spike frame and 7.7 ms from the others; counted starvation 1.05 ms and 0.26 ms.
+        const double need = (7500.0 + 3.0 * 7700.0) / 4.0;
+        CHECK(Near(bounded.base_us, need + (1050.0 + 15.0 * 260.0) / 16.0));
+        CHECK(bounded.base_us < before);
+        // The same frame with a start wait as long as its starvation is the pacer's own doing and counts whole.
+        UnifiedQueueWindow whole;
+        for (int i = 0; i < 40; ++i)
+            whole.Push(steady());
+        whole.Push(PacedSample(Record(47350.0, 39850.0, 0.0, 0.0, 0.0, 0.0, false), true));
+        whole.Push(steady());
+        whole.Push(steady());
+        CHECK(Near(whole.Compute(7692.0, Params(2, 4000.0, 0.0, 4)).base_us, need + (39850.0 + 15.0 * 260.0) / 16.0));
+        // A paced frame that was not held at all counts nothing.
+        UnifiedQueueWindow unheld;
+        for (int i = 0; i < 40; ++i)
+            unheld.Push(PacedSample(Record(7960.0, 260.0, 0.0, 0.0, 0.0, 0.0, false), true, 0.0));
+        CHECK(Near(unheld.Compute(7692.0, Params(2, 4000.0, 0.0, 4)).base_us, 7700.0));
+    }
+
 
     void TestUnpacedStarvationIsNotInTheBase()
     {
@@ -2129,6 +2168,7 @@ int main()
     TestAllowanceUsesStarvationFreeService();
     TestHoldStepRaisesTheIntervalOnceAndStops();
     TestUnpacedStarvationIsNotInTheBase();
+    TestPacedStarvationCountsOnlyUpToTheStartWait();
     TestCapRemovedReachesTheNeedWithinFFrames();
     TestPacedNeedFallIsFollowedWithinFFrames();
     TestNeedMeanIsUnbiasedWhenGpuPaced();

@@ -141,7 +141,7 @@ UnifiedQueueResult UnifiedQueueWindow::Compute(double j_us, const UnifiedQueuePa
         sorted[age] = sample.s_prime_us;
         cycle_sum_us += sample.cycle_us;
         if (sample.paced)
-            paced_starve_sum_us += sample.starve_us;
+            paced_starve_sum_us += std::min(sample.starve_us, sample.paced_wait_us);
         // (the need's part of B is summed below, once the slack is known)
         need_sum_us += sample.need_us;
         service_sum_us += sample.service_us;
@@ -162,8 +162,9 @@ UnifiedQueueResult UnifiedQueueWindow::Compute(double j_us, const UnifiedQueuePa
         base_need_sum_us += sample.cycle_us - sample.starve_us - std::min(sample.hold_block_us, slack_us);
     }
     // B: the need follows the GPU within F frames (the hold blocking beyond the cap's slack
-    // included); the starvation of the frames the GPU term paced is kept at its 16-frame mean (it
-    // cancels the interval's ratchet), the starvation of any other frame is not B's to carry.
+    // included); the starvation of the frames the GPU term paced, as far as their start wait can
+    // have caused it, is kept at its 16-frame mean (it cancels the interval's ratchet), the
+    // starvation of any other frame, and a paced frame's beyond its wait, is not B's to carry.
     // F = 16 is the 16-frame mean cycle exactly (no gating, no hold term: the first build's base).
     const double base_us = need_frames_param >= kWindow
         ? cycle_sum_us / static_cast<double>(count)

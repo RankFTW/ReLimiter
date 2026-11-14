@@ -615,7 +615,13 @@ SourceStageFrame SourceStage::RunUnifiedFrame(
         : frame.wait_start_qpc != 0 && frame.slept && release_qpc >= UnifiedPacer_TargetTicks(start.target);
     const bool gpu_paced = (start.flags & kUpBoundGpu) != 0 && !start.release_now && !wait_failed &&
         wait_ran_to_target;
-    unified_.OnPlan(n, plan.key, release_qpc, gpu_paced);
+    // How long the start was held: the Sleep hook's wait the branch consumed and the marker's own. The queue
+    // law counts no more of the frame's starvation than this (UnifiedPacer::OnPlan).
+    const int64_t held_ticks = std::max<int64_t>(0, frame.pre_wait_end_qpc - frame.pre_wait_start_qpc) +
+        std::max<int64_t>(0, frame.wait_end_qpc - frame.wait_start_qpc);
+    const double start_wait_us = gpu_paced && qpc_frequency_ > 0
+        ? static_cast<double>(held_ticks) * 1'000'000.0 / static_cast<double>(qpc_frequency_) : 0.0;
+    unified_.OnPlan(n, plan.key, release_qpc, gpu_paced, start_wait_us);
 
     frame.unified.valid = true;
     frame.unified.kind = resolution.kind;

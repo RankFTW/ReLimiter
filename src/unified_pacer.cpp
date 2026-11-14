@@ -545,7 +545,7 @@ void UnifiedPacer::Reset(uint64_t lifecycle_base, uint32_t controller_generation
 // ── Evidence ──
 
 void UnifiedPacer::OnPlan(uint64_t grid_index, const PacingPlanKey& key, int64_t release_qpc,
-    bool gpu_paced) noexcept
+    bool gpu_paced, double start_wait_us) noexcept
 {
     Entry* entry = Touch(grid_index);
     if (!entry)
@@ -553,6 +553,7 @@ void UnifiedPacer::OnPlan(uint64_t grid_index, const PacingPlanKey& key, int64_t
     entry->key = key;
     entry->key_valid = true;
     entry->gpu_paced = gpu_paced;
+    entry->gpu_paced_wait_us = gpu_paced && start_wait_us > 0.0 ? start_wait_us : 0.0;
     if (release_qpc != 0)
         entry->release_qpc = release_qpc;
     if (key.identity_domain != PacingIdentityDomain::Unknown && key.producer_epoch != 0 &&
@@ -700,6 +701,7 @@ void UnifiedPacer::OnQueueRecord(const PacingGpuQueueRecord& record) noexcept
     if (sample.valid && PacingFrameKey_IsValid(record.key)) {
         const Entry* own = FindByFrame(record.key.domain, record.key.producer_epoch, record.key.frame_id);
         sample.paced = own && own->gpu_paced;
+        sample.paced_wait_us = sample.paced ? own->gpu_paced_wait_us : 0.0;
     }
     if (sample.valid && sample.paced)
         queue_paced_pending_ = true;
