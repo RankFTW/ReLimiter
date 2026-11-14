@@ -3711,6 +3711,104 @@ void TestSaturationReportLifetime()
     CHECK(legacy->Statistics().samples == 2);
 }
 
+// Late state (developer key gpu_wait_late_guard). With the heavy-work window warm and current, 64 consecutive
+// planned frames that all arrived late and 64 reported D set the limit to I + least lateness + least D − H;
+// 63 do not. One frame on time restores the heavy-work limit in that plan. The key off or a gap in the plans
+// never forms it, and a bucket reset clears its rings. A frame planned in the state gives its successor no
+// sample in the heavy-work window.
+void TestLateStateGuard()
+{
+    constexpr double kLateUs = 2000.0;
+    auto controller = MakeController();
+    // 41 waited frames: X = 10,000, D = 4,000 (window: 4,010); the heavy-work limit at I = 7,000 is 10,010.
+    for (uint64_t frame = 1; frame <= 41; ++frame) FeedWorkFrame(controller.get(), frame, 6000.0);
+    const uint64_t window_samples = controller->Statistics().work_samples;
+    LeadRequest request = Request(PacingRung::GpuQueueWait, 500.0, 7000.0);
+    request.collision_guard = true;
+    request.late_guard = true;
+    LeadGuardOutcome guard{};
+    // One plan and then its frame, so a plan sees the frames before it. Not waited unless asked: nothing is
+    // held in a late run.
+    const auto plan = [&](uint64_t index, double late_us, bool waited = false) {
+        request.late_index = index;
+        request.late_us = late_us;
+        const double lead_us = controller->NextLeadUs(request, nullptr, &guard);
+        FeedWorkFrame(controller.get(), index, 6000.0, waited);
+        return lead_us;
+    };
+    uint64_t index = 41;
+    // 63 late frames: the heavy-work limit.
+    for (size_t frame = 0; frame + 1 < LEAD_LATE_FRAMES; ++frame) {
+        CHECK(std::fabs(plan(++index, kLateUs) - 10010.0) <= 20.0 && !guard.late_state);
+    }
+    CHECK(std::fabs(guard.offset_us - 3010.0) <= 20.0 && std::fabs(guard.release_limit_us - 10010.0) <= 20.0);
+    // The 64th (later than the rest: the least counts): 7,000 + 2,000 + 4,000 − 1,000 = 12,000. The lead
+    // climbs towards the bucket's 10,510 at the slew, not in one step.
+    CHECK(std::fabs(plan(++index, kLateUs + 500.0) - 10110.0) <= 20.0);
+    CHECK(guard.late_state && std::fabs(guard.offset_us - 5000.0) <= 1.0 &&
+        std::fabs(guard.release_limit_us - 12000.0) <= 1.0);
+    for (int frame = 0; frame < 6; ++frame) plan(++index, kLateUs);
+    CHECK(guard.late_state && std::fabs(plan(++index, kLateUs) - 10510.0) <= 20.0);
+    // No late frame waited, so the window took one sample only: the first late frame's, after the waited frame 41.
+    CHECK(controller->Statistics().work_samples == window_samples + 1);
+
+    // One frame on time: the heavy-work limit again, in that plan.
+    CHECK(std::fabs(plan(++index, 0.0) - 10010.0) <= 20.0 && !guard.late_state);
+    CHECK(std::fabs(guard.release_limit_us - 10010.0) <= 20.0);
+    // Late again: 63 are not enough, the 64th is.
+    for (size_t frame = 0; frame + 1 < LEAD_LATE_FRAMES; ++frame) plan(++index, kLateUs);
+    CHECK(!guard.late_state);
+    plan(++index, kLateUs);
+    CHECK(guard.late_state);
+    // A gap in the plans starts the count over.
+    index += 2;
+    plan(index, kLateUs);
+    CHECK(!guard.late_state);
+    for (size_t frame = 0; frame + 1 < LEAD_LATE_FRAMES; ++frame) plan(++index, kLateUs);
+    CHECK(guard.late_state);
+
+    // The key off: the heavy-work limit, and no limit for the executor.
+    request.late_guard = false;
+    plan(++index, kLateUs);
+    CHECK(guard.judged && !guard.late_state && !guard.late_seen && guard.release_limit_us == 0.0 &&
+        std::fabs(guard.offset_us - 3010.0) <= 20.0);
+    // Observed only (the off period of the interleave): the verdict, the same limit.
+    request.late_observe = true;
+    plan(++index, kLateUs);
+    CHECK(guard.judged && !guard.late_state && guard.late_seen && guard.release_limit_us == 0.0 &&
+        std::fabs(guard.offset_us - 3010.0) <= 20.0);
+    request.late_guard = true;
+    plan(++index, kLateUs);
+    CHECK(guard.late_state && !guard.late_seen);
+    request.late_observe = false;
+
+    // A bucket reset clears the rings with the windows: 45 late waited frames warm the heavy-work window
+    // again, and the state does not form before 64 of them.
+    controller->ResetBuckets();
+    for (int frame = 0; frame < 45; ++frame) plan(++index, kLateUs, true);
+    CHECK(guard.judged && !guard.late_state);
+    for (int frame = 45; frame < static_cast<int>(LEAD_LATE_FRAMES) + 4; ++frame) plan(++index, kLateUs, true);
+    CHECK(guard.late_state);
+
+    // A frame planned in the late state that waited at its gate gives its successor no window sample.
+    auto veto = MakeController();
+    FeedWorkFrame(veto.get(), 1, 6000.0);
+    FeedWorkFrame(veto.get(), 2, 6000.0);
+    CHECK(veto->Statistics().work_samples == 1); // frame 2 follows the waited frame 1
+    LeadFrameStart late_start = Start(3, PacingRung::GpuQueueWait, 3.0 * kInterval);
+    late_start.guard.late_state = true;
+    veto->OnSourceRelease(late_start);
+    veto->OnStageEvent(Event(3, Kind::PresentCall, 3.0 * kInterval + 5000.0));
+    veto->OnStageEvent(Event(3, Kind::GpuReady, 3.0 * kInterval + 10000.0));
+    veto->OnStageEvent(Event(3, Kind::OutputRelease, 3.0 * kInterval + 10500.0));
+    FeedGpuActive(veto.get(), 3, 6000.0);
+    CHECK(veto->Statistics().work_samples == 2); // frame 3 itself follows the waited frame 2
+    FeedWorkFrame(veto.get(), 4, 6000.0);
+    CHECK(veto->Statistics().work_samples == 2); // frame 4 follows a frame held in the late state
+    FeedWorkFrame(veto.get(), 5, 6000.0);
+    CHECK(veto->Statistics().work_samples == 3); // frame 5 follows frame 4, planned as built
+}
+
 int main()
 {
     std::printf("sizeof(LeadController) = %zu bytes\n", sizeof(LeadController));
@@ -3774,6 +3872,7 @@ int main()
     TestSaturationGuardInPhysicalTerms();
     TestSaturationRegisterFlushOrder();
     TestSaturationReportLifetime();
+    TestLateStateGuard();
 
     if (s_failures != 0) {
         std::fprintf(stderr, "%d lead controller checks failed\n", s_failures);

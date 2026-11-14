@@ -742,6 +742,25 @@ void TestExecutor() {
         CHECK(decision.status==PacingPlanStatus::Held && decision.target==GridTarget(41)+3000-694);
         CHECK(decision.grid_target==GridTarget(41));
     }
+    // Developer key gpu_wait_late_guard, Decide level: the collision guard's limit on the release -> target
+    // distance (PacingFramePlan::lead_limit_us) bounds the floored target. 0 (the key off) and a limit beyond
+    // the floor change nothing; a limit below the nominal target never moves it earlier. Frame 40 came out
+    // 3,000 ticks late, so the floor lifts frame 41's target by 3,000 - 1,388 = 1,612; the release is 9,000
+    // ticks before the nominal target (1 tick = 1 us here).
+    {
+        PacingFramePlan plan;
+        plan.key=PlanKey(41);plan.grid_index=41;plan.interval_us=kInterval;plan.rung=PacingRung::GpuQueueWait;
+        plan.mode=PacingTimingMode::Vrr;plan.output_target_qpc=GridTarget(41);plan.source_wake_qpc=GridTarget(41)-9000;
+        const auto now=GridTarget(41)-5000;
+        const auto lifted=[&](float limit_us) {
+            plan.lead_limit_us=limit_us;
+            return Decide(plan,now,false).target-GridTarget(41);
+        };
+        CHECK(lifted(0.0f)==1612);
+        CHECK(lifted(12000.0f)==1612);
+        CHECK(lifted(9500.0f)==500);
+        CHECK(lifted(8000.0f)==0);
+    }
     // Hold credit, Decide level: the plan's hold advance moves the resolved target (here the
     // floored one) earlier by exactly that under the live key; 0 and the key off resolve as today.
     // Frame 44 came out 3,000 ticks late, so the floor moves frame 45 later (slack 1,388 from I,

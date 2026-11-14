@@ -139,6 +139,8 @@ void LeadController::Reset(int64_t qpc_frequency) noexcept
     for (LeadSampleWindow& calls : call_windows_) calls.Reset();
     for (LeadSampleWindow& work : work_windows_) work.Reset();
     work_age_frames_.fill(0);
+    for (LateWindow& late : late_arrivals_) late.Reset();
+    for (LateWindow& late : late_work_) late.Reset();
     first_submission_window_.Reset();
     fg_report_age_frames_.fill(LEAD_WORK_STALE_FRAMES + 1);
     lifecycle_known_ = false;
@@ -157,6 +159,8 @@ void LeadController::ResetBuckets() noexcept
     for (LeadSampleWindow& calls : call_windows_) calls.Reset();
     for (LeadSampleWindow& work : work_windows_) work.Reset();
     work_age_frames_.fill(0);
+    for (LateWindow& late : late_arrivals_) late.Reset();
+    for (LateWindow& late : late_work_) late.Reset();
     first_submission_window_.Reset();
     fg_report_age_frames_.fill(LEAD_WORK_STALE_FRAMES + 1);
     ResetSpikeFloor();
@@ -168,6 +172,7 @@ void LeadController::ResetBuckets() noexcept
         frame.lead_sampled = true;
         frame.call_recorded = true;
         frame.work_recorded = true;
+        frame.late_work_recorded = true;
         frame.spike_recorded = true;
         frame.spike_gpu_recorded = true;
     }
@@ -370,13 +375,31 @@ double LeadController::CollisionGuardedLeadUs(const LeadRequest& request, size_t
     const size_t divisor = bucket_index % LEAD_DIVISOR_BUCKETS;
     double returned_us = lead_us;
     bool judged = false;
+    // Late state (lead_controller.h): the arrival lateness of every planned GPU queue wait frame, in plan order.
+    if (request.rung == PacingRung::GpuQueueWait) {
+        late_arrivals_[divisor].PushConsecutive(request.late_index,
+            std::isfinite(request.late_us) && request.late_us > 0.0 ? request.late_us : 0.0);
+    }
     if (request.rung == PacingRung::GpuQueueWait && request.collision_guard &&
         !BehindWait(PacingRung::GpuQueueWait, divisor)) {
         double offset_us = 0.0;
         bool headroom = false;
         if (CollisionOffsetUs(divisor, request.release_headroom_us, &offset_us, &headroom)) {
             judged = true;
+            // Late state: only where the heavy-work guard would otherwise apply (its window warm and current).
+            // A request that only observes gets the verdict, not the limit.
+            bool late_state = false;
+            bool late_seen = false;
+            if (headroom && (request.late_guard || request.late_observe)) {
+                double late_offset_us = offset_us;
+                if (LateOffsetUs(divisor, request, &late_offset_us)) {
+                    late_state = request.late_guard;
+                    late_seen = !request.late_guard;
+                    if (late_state) offset_us = late_offset_us;
+                }
+            }
             double limit_us = request.interval_us + offset_us;
+            const double release_limit_us = limit_us;
             // Physical terms (lead_controller.h, anchor_offset_us): H − R =
             // L − delta is what the guard limits, so delta joins the limit.
             if (request.anchor_offset_us > 0.0) limit_us += request.anchor_offset_us;
@@ -387,6 +410,9 @@ double LeadController::CollisionGuardedLeadUs(const LeadRequest& request, size_t
             if (guard != nullptr) {
                 guard->judged = true;
                 guard->offset_us = offset_us;
+                guard->late_state = late_state;
+                guard->late_seen = late_seen;
+                guard->release_limit_us = request.late_guard && release_limit_us > 0.0 ? release_limit_us : 0.0;
             }
             returned_us = std::min(returned_us, std::max(0.0, limit_us));
         }
@@ -425,6 +451,23 @@ bool LeadController::CollisionOffsetUs(size_t divisor, double headroom_us, doubl
         return true;
     }
     return false;
+}
+
+bool LeadController::LateOffsetUs(size_t divisor, const LeadRequest& request, double* offset_us) const noexcept
+{
+    const LateWindow& arrivals = late_arrivals_[divisor];
+    const LateWindow& work = late_work_[divisor];
+    if (!arrivals.Full() || !work.Full()) return false;
+    // D no older than twice the horizon: the reports of the newest frames, a few frames behind the plans.
+    if (request.late_index < work.OldestIndex() || request.late_index - work.OldestIndex() > 2 * LEAD_LATE_FRAMES) {
+        return false;
+    }
+    const double late_us = arrivals.Min();
+    if (!(late_us > LEAD_LATE_ARRIVAL_US)) return false;
+    const double distance_us = IsPositiveFinite(request.release_headroom_us)
+        ? request.release_headroom_us : LEAD_RELEASE_HEADROOM_US;
+    *offset_us = late_us + work.Min() - distance_us;
+    return true;
 }
 
 double LeadController::MedianSampleUs(PacingRung rung, double fg_divisor) const noexcept
@@ -536,6 +579,7 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
         slot.pre_wait_end_qpc = frame.pre_wait_end_qpc;
     }
     slot.gpu_resume_probe = frame.gpu_resume_probe;
+    slot.late_state = frame.guard.late_state;
     // Lead anchor (lead_controller.h, unified pacer only): the owner sets
     // frame.anchored only there, so with the key off this is one not-taken
     // branch on a bool and the slot keeps its zero from the whole-struct
@@ -950,18 +994,28 @@ void LeadController::RecordWorkStart(PendingFrame* frame) noexcept
         return;
     }
     const size_t divisor = frame->bucket % LEAD_DIVISOR_BUCKETS;
+    const double work_us = MicrosecondsBetween(frame->qpc[FieldSource], frame->qpc[FieldGpuReady]) -
+        frame->gpu_active_us;
+    const bool in_range = std::isfinite(work_us) && work_us <= LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us;
+    // Late state (lead_controller.h): the D of every reported frame, whatever its predecessor.
+    if (!frame->late_work_recorded) {
+        frame->late_work_recorded = true;
+        if (in_range) late_work_[divisor].Push(frame->grid_index, std::max(0.0, work_us));
+    }
     const PendingFrame* previous = Previous(*frame);
     LeadGate verdict = LeadGate::NotHeld;
+    bool previous_late_state = false;
     if (previous != nullptr && previous->rung == PacingRung::GpuQueueWait && previous->sampled &&
         previous->bucket % LEAD_DIVISOR_BUCKETS == divisor) {
         verdict = previous->started ? GpuGateVerdict(*previous) : LeadGate::Pending;
         if (verdict == LeadGate::Pending) return;
+        previous_late_state = previous->late_state;
     }
     frame->work_recorded = true;
-    if (verdict != LeadGate::Held) return;
-    const double work_us = MicrosecondsBetween(frame->qpc[FieldSource], frame->qpc[FieldGpuReady]) -
-        frame->gpu_active_us;
-    if (!std::isfinite(work_us) || work_us > LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us) return;
+    // A predecessor planned in the late state was held under that state's limit: no sample here, so the
+    // window stays what on-time frames taught it.
+    if (verdict != LeadGate::Held || previous_late_state) return;
+    if (!in_range) return;
     work_windows_[divisor].Add(std::max(0.0, work_us));
     ++statistics_.work_samples;
 }

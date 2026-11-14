@@ -220,6 +220,11 @@ struct PacingFramePlan {
     // (GpuQueueProbe_OnHoldAnnounce); the probe attaches it to the frame record the hold delayed
     // (PacingGpuQueueRecord::law_hold_sequence), and the law's record debit names it.
     uint64_t law_hold_sequence = 0;
+    // Developer key gpu_wait_late_guard (lead_controller.h, late state): the collision guard's limit on the
+    // release → target distance in µs (LeadGuardOutcome::release_limit_us), which the GPU queue wait's executor
+    // resolves no target past: the spacing floor may otherwise lift a target past the limit when the lead
+    // drops by more than the floor's slack in one plan. 0 = none (key off, or no limit judged).
+    float lead_limit_us = 0.0f;
 };
 
 enum class PacingStageEventKind : uint8_t {

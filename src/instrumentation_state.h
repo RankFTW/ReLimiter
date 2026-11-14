@@ -33,6 +33,16 @@ inline std::atomic<int> g_gpu_queue_probe_source{0};
 // session start.
 inline std::atomic<int> g_unified_queue_margin_end{1};
 
+// Developer A/B switch gpu_wait_late_guard (default off; lead_controller.h, late state): the lead's collision
+// guard follows a game that has arrived late for its slot 64 frames running, and the GPU queue wait's executor
+// resolves no target past the guard's limit. Published by Config_ApplyPacingPipeline; read by the scheduler
+// owner at each plan.
+inline std::atomic<bool> g_gpu_wait_late_guard{false};
+// Developer key gpu_wait_late_guard_interleave_s (default 0 = none): with gpu_wait_late_guard on, the late state
+// sets the limit only in alternate periods of this many seconds (the even ones of the QPC time), and in the
+// other periods the frames that meet its condition are flagged (up_flags 0x100000): an A/B inside one capture.
+inline std::atomic<int> g_gpu_wait_late_guard_interleave_s{0};
+
 // The newest SetFlipConfig calls that enabled flip metering (nFramesPerBatch >
 // 0), for the pacing CSV's flip_config_qpc and flip_time_per_batch_us: a ring
 // of the newest FLIP_CONFIG_RING calls, so each row takes the newest call at or

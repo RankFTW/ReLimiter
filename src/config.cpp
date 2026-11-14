@@ -398,6 +398,8 @@ void LoadConfig(HMODULE hModule) {
     g_config.gpu_queue_probe_source=ReadINIInt(S,"gpu_queue_probe_source",kPacingGpuQueueProbeSourceDefault,P);
     g_config.fg_present_order=ReadINIBool(S,"fg_present_order",true,P);
     g_config.fg_separate_presenter_hold=ReadINIBool(S,"fg_separate_presenter_hold",false,P);
+    g_config.gpu_wait_late_guard=ReadINIBool(S,"gpu_wait_late_guard",false,P);
+    g_config.gpu_wait_late_guard_interleave_s=ReadINIInt(S,"gpu_wait_late_guard_interleave_s",0,P);
     g_config.fg_render_break_every=ReadINIInt(S,"fg_render_break_every",0,P);
     g_config.fg_render_break_window=ReadINIInt(S,"fg_render_break_window",-1,P);
     g_config.unified_hold_share=ReadINIDouble(S,"unified_hold_share",kPacingUnifiedHoldShareDefault,P);
@@ -892,6 +894,8 @@ void Config_ApplyPacingPipeline() {
     g_unified_queue_margin_end.store(sizeof(void*) == 8 ? g_config.unified_queue_margin_end : 0, std::memory_order_relaxed);
     g_fg_present_order.store(sizeof(void*) == 8 && g_config.fg_present_order, std::memory_order_relaxed);
     g_fg_separate_presenter_hold.store(g_config.fg_separate_presenter_hold, std::memory_order_relaxed);
+    g_gpu_wait_late_guard.store(g_config.gpu_wait_late_guard, std::memory_order_relaxed);
+    g_gpu_wait_late_guard_interleave_s.store(std::clamp(g_config.gpu_wait_late_guard_interleave_s, 0, 600), std::memory_order_relaxed);
     g_fg_render_break_every.store(sizeof(void*) == 8 ? std::clamp(g_config.fg_render_break_every, 0, 64) : 0, std::memory_order_relaxed);
     g_fg_render_break_window.store(std::clamp(g_config.fg_render_break_window, -1, 32), std::memory_order_relaxed);
 }
@@ -949,6 +953,8 @@ constexpr Key kKeys[] = {
     {"gpu_queue_probe_source", &SetInt<&Config::gpu_queue_probe_source>, Publish::Pipeline},
     {"fg_present_order", &SetBool<&Config::fg_present_order>, Publish::Pipeline},
     {"fg_separate_presenter_hold", &SetBool<&Config::fg_separate_presenter_hold>, Publish::Pipeline},
+    {"gpu_wait_late_guard", &SetBool<&Config::gpu_wait_late_guard>, Publish::Pipeline},
+    {"gpu_wait_late_guard_interleave_s", &SetInt<&Config::gpu_wait_late_guard_interleave_s>, Publish::Pipeline},
     {"fg_render_break_every", &SetInt<&Config::fg_render_break_every>, Publish::Pipeline},
     {"fg_render_break_window", &SetInt<&Config::fg_render_break_window>, Publish::Pipeline},
     {"unified_queue_margin_end", &SetInt<&Config::unified_queue_margin_end>, Publish::Pipeline},

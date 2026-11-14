@@ -151,6 +151,36 @@ constexpr double LEAD_WORK_QUANTILE = 0.10;        // low quantile of D
 // (Reflex stopped) ends it, and the Present-call guard applies.
 constexpr uint32_t LEAD_WORK_STALE_FRAMES = 64;
 
+// Late state (developer key gpu_wait_late_guard, default off). The collision
+// guard assumes the next frame is released one interval after this one. A game
+// that is slower than its slot for CPU reasons arrives after its planned start:
+// its frames are released I + lateness apart, and since none of them is held
+// the heavy-work window receives no sample and keeps limiting the lead with
+// what it learned at the cap (Rogue Core with the game and render threads in
+// series: the limit stayed at 10.33 ms for 110 s while frames were ready 14 to
+// 17 ms after their release and the GPU idled 1.5 to 4.5 ms before the next
+// frame's heavy work). While each of the newest LEAD_LATE_FRAMES planned GPU
+// queue wait frames arrived more than LEAD_LATE_ARRIVAL_US after its planned
+// start, the heavy-work window is warm and current and the guard applies, the
+// limit is
+//   L <= I + (their least arrival lateness)
+//          + (the least D of the newest LEAD_LATE_FRAMES reported frames,
+//             whatever their predecessor) − H:
+// the form and the headroom of the heavy-work guard, with the interval
+// corrected by what was measured and D taken from evidence that exists in this
+// state. A minimum is set by the least delayed sample, so the D of a frame that
+// queued behind its predecessor's GPU work (larger) does not raise it; if all
+// are delayed the limit falls to about the fastest recent readiness minus H and
+// nothing is held. The lateness is the game's arrival against its planned
+// start, not the release (the hard limit's wait and a late wake do not count),
+// and the frames must be consecutive plans. One frame on time ends the state in
+// that plan. A frame planned in the state gives its successor no sample in the
+// heavy-work window, which so stays what on-time frames taught it.
+// LEAD_LATE_FRAMES is the horizon after which the guard calls its evidence
+// stale; a D that old does not count either.
+constexpr size_t LEAD_LATE_FRAMES = LEAD_WORK_STALE_FRAMES;
+constexpr double LEAD_LATE_ARRIVAL_US = 100.0; // kUnifiedLateReleaseUs
+
 // Queue order. Both guards assume the next frame's GPU work can
 // run while frame n's GPU waits at its gate, so it can occupy the engine when
 // the Signal comes. Some games run it behind the wait instead (one queue, in
@@ -329,6 +359,16 @@ struct LeadGuardOutcome {
     // guard's limit, and after the limit relaxed, the lead slewing back up
     // to it.
     double reduction_us = 0.0;
+    // Late state (above): the limit came from the newest frames' lateness and
+    // heavy-work starts.
+    bool late_state = false;
+    // Its condition was met while the request only observed it (LeadRequest::late_observe): the limit is the
+    // built one.
+    bool late_seen = false;
+    // When judged: the limit on the release → target distance, I + offset in
+    // µs (the anchor's delta is not in it). With the developer key
+    // gpu_wait_late_guard the executor resolves no target past it; 0 otherwise.
+    double release_limit_us = 0.0;
 };
 
 // One Reflex latency report's GPU times for a frame (LeadController::OnGpuReport).
@@ -416,6 +456,16 @@ struct LeadRequest {
     // positive, so the capped target is the same R-relative one for any
     // anchor. Not validated or counted otherwise.
     double anchor_offset_us = 0.0;
+    // Late state (above; developer key gpu_wait_late_guard): the planned
+    // frame's grid index, how late the game arrived for its planned start in µs
+    // (0 on time), and whether the state may set the limit. The two rings are
+    // kept with the key off too; only the limit reads the key.
+    uint64_t late_index = 0;
+    double late_us = 0.0;
+    bool late_guard = false;
+    // Judge the state's condition without applying it (the off period of developer key
+    // gpu_wait_late_guard_interleave_s): LeadGuardOutcome::late_seen.
+    bool late_observe = false;
 };
 
 struct LeadBucketStatus {
@@ -750,6 +800,49 @@ private:
         bool spike_recorded = false;     // its spike floor arrival was decided (added or left out)
         bool spike_gpu_recorded = false; // its r − g was decided
         bool gpu_wait_lead = false;      // planned with the GPU queue wait's lead (held)
+        bool late_state = false;         // planned in the late state: its successor adds no D to the work window
+        bool late_work_recorded = false; // its D entered the late state's ring, or was given up
+    };
+
+    // Late state: the newest LEAD_LATE_FRAMES values with the grid index each belongs to.
+    struct LateWindow {
+        std::array<float, LEAD_LATE_FRAMES> values{};
+        std::array<uint64_t, LEAD_LATE_FRAMES> indices{};
+        uint32_t head = 0;
+        uint32_t count = 0;
+
+        void Reset() noexcept { head = 0; count = 0; }
+        bool Full() const noexcept { return count == LEAD_LATE_FRAMES; }
+        void Push(uint64_t index, double value) noexcept
+        {
+            values[head] = static_cast<float>(value);
+            indices[head] = index;
+            head = (head + 1) % static_cast<uint32_t>(LEAD_LATE_FRAMES);
+            if (count < LEAD_LATE_FRAMES) ++count;
+        }
+        // The entries must be consecutive plans: another index than the newest + 1 starts over.
+        void PushConsecutive(uint64_t index, double value) noexcept
+        {
+            if (count > 0) {
+                const uint32_t newest = (head + static_cast<uint32_t>(LEAD_LATE_FRAMES) - 1) %
+                    static_cast<uint32_t>(LEAD_LATE_FRAMES);
+                if (index != indices[newest] + 1) Reset();
+            }
+            Push(index, value);
+        }
+        double Min() const noexcept
+        {
+            float least = std::numeric_limits<float>::infinity();
+            for (uint32_t entry = 0; entry < count; ++entry) {
+                if (values[entry] < least) least = values[entry];
+            }
+            return static_cast<double>(least);
+        }
+        // The grid index of the oldest entry held (count > 0).
+        uint64_t OldestIndex() const noexcept
+        {
+            return indices[count < LEAD_LATE_FRAMES ? 0 : head];
+        }
     };
 
     struct Bucket {
@@ -798,6 +891,9 @@ private:
     // when neither is.
     bool CollisionOffsetUs(size_t divisor, double headroom_us, double* offset_us, bool* headroom) const noexcept;
     bool WorkCurrent(size_t divisor) const noexcept;
+    // Late state (above): true with *offset_us = least arrival lateness + least D − H while the newest
+    // LEAD_LATE_FRAMES planned frames all arrived late and as many current D exist; else false, *offset_us kept.
+    bool LateOffsetUs(size_t divisor, const LeadRequest& request, double* offset_us) const noexcept;
     bool BehindWait(PacingRung rung, size_t divisor) const noexcept;
     // F, the median first submission − RENDERSUBMIT_START of the report pairs
     // that stream (above); 0 until LEAD_WARM_SAMPLES.
@@ -884,6 +980,10 @@ private:
     std::array<LeadSampleWindow, LEAD_DIVISOR_BUCKETS> call_windows_{};
     std::array<LeadSampleWindow, LEAD_DIVISOR_BUCKETS> work_windows_{};
     std::array<uint32_t, LEAD_DIVISOR_BUCKETS> work_age_frames_{};
+    // Late state (above), per FG divisor: the arrival lateness of the newest
+    // planned GPU queue wait frames and the D of the newest reported ones.
+    std::array<LateWindow, LEAD_DIVISOR_BUCKETS> late_arrivals_{};
+    std::array<LateWindow, LEAD_DIVISOR_BUCKETS> late_work_{};
     // First-submission delays F (first submission − RENDERSUBMIT_START, µs) of
     // the report pairs that stream.
     LeadSampleWindow first_submission_window_{};

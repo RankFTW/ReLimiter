@@ -62,6 +62,7 @@ namespace
         plan.marker = static_cast<PacingSourceMarker>(counter % 3);
         plan.hold_advance_us = counter % 3 == 0 ? 0.0f : static_cast<float>(counter) * 0.5f;
         plan.law_hold_sequence = counter % 2 == 0 ? 0 : 1'000'000'000'000ull + counter; // a 64-bit identity
+        plan.lead_limit_us = counter % 4 == 0 ? 0.0f : 9000.0f + static_cast<float>(counter) * 0.25f;
         return plan;
     }
 
@@ -90,7 +91,8 @@ namespace
             left.mode == right.mode &&
             left.marker == right.marker &&
             left.hold_advance_us == right.hold_advance_us &&
-            left.law_hold_sequence == right.law_hold_sequence;
+            left.law_hold_sequence == right.law_hold_sequence &&
+            left.lead_limit_us == right.lead_limit_us;
     }
 
     bool PlanMatchesCounter(const PacingFramePlan& plan, const PacingPlanKey& key)
@@ -821,7 +823,7 @@ int main()
 {
     std::printf("sizeof(FramePlanRegistry) = %zu bytes, sizeof(PacingStageEventQueue) = %zu bytes\n",
         sizeof(FramePlanRegistry), sizeof(PacingStageEventQueue));
-    CHECK(sizeof(FramePlanRegistry) == FramePlanRegistry::kCapacity * 104);
+    CHECK(sizeof(FramePlanRegistry) == FramePlanRegistry::kCapacity * 112); // 104 before PacingFramePlan::lead_limit_us
 
     TestExactKeyFind();
     TestInvalidKeyRejected();

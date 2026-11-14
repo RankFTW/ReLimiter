@@ -495,6 +495,16 @@ SourceStageFrame SourceStage::RunUnifiedFrame(
     lead_request.collision_guard = request.collision_guard;
     lead_request.spike_floor = request.spike_floor;
     lead_request.anchor_offset_us = lead_anchor.delta_us;
+    // Late state (lead_controller.h): how late the game arrived for its planned start. The arrival, not the
+    // release, so a wait of ReLimiter's own never counts; a frame the law restarted at has no planned start.
+    static_assert(LEAD_LATE_ARRIVAL_US == kUnifiedLateReleaseUs, "the late state counts what the law flags as late");
+    const int64_t planned_start_qpc = UnifiedPacer_TargetTicks(start.target);
+    lead_request.late_index = n;
+    lead_request.late_us = start.release_now && !wait_failed && (start.flags & kUpReset) == 0 &&
+            start.arrival_qpc > planned_start_qpc
+        ? static_cast<double>(start.arrival_qpc - planned_start_qpc) / ticks_per_us : 0.0;
+    lead_request.late_guard = request.late_guard;
+    lead_request.late_observe = request.late_observe;
     bool budget_limited = false;
     LeadGuardOutcome guard{};
     const double lead_us = lead_.NextLeadUs(lead_request, &budget_limited, &guard);
@@ -546,6 +556,8 @@ SourceStageFrame SourceStage::RunUnifiedFrame(
     // The grant's identity (a law grant only) goes with the plan: the GPU gate announces it with the
     // hold Wait and the probe record of the frame the hold delayed names it back.
     plan.law_hold_sequence = hold_grant.live ? hold_grant.law_sequence : 0;
+    // Developer key gpu_wait_late_guard: the executor resolves no target past the guard's limit.
+    plan.lead_limit_us = request.late_guard && guard.judged ? static_cast<float>(guard.release_limit_us) : 0.0f;
     frame.planned = true;
     frame.game_arrival_qpc = start.arrival_qpc;
     frame.lead_budget_limited = budget_limited;
@@ -626,7 +638,9 @@ SourceStageFrame SourceStage::RunUnifiedFrame(
     frame.unified.valid = true;
     frame.unified.kind = resolution.kind;
     frame.unified.start = start;
-    frame.unified.flags = SourceStage_ApplyCorrectionRefusal(start.flags | commit_flags, law_status);
+    frame.unified.flags = SourceStage_ApplyCorrectionRefusal(start.flags | commit_flags, law_status) |
+        (guard.late_state ? static_cast<uint32_t>(kUpLateGuard) : 0u) |
+        (guard.late_seen ? static_cast<uint32_t>(kUpLateSeen) : 0u);
     frame.unified.delta_us = lead_anchor.delta_us;
     frame.unified.anchor_qpc = anchor.b_qpc;
     frame.unified.status = law_status;

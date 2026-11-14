@@ -1078,6 +1078,15 @@ OutputDecision Decide(const PacingFramePlan& plan,int64_t now,bool displayed_sla
     }
     // Resolved, so TargetOf resolves the same index.
     CadenceGrid_TargetOf(snapshot,plan.key.controller_generation,plan.grid_index,&decision.grid_target);
+    // Developer key gpu_wait_late_guard (PacingFramePlan::lead_limit_us, 0 with the key off): the collision
+    // guard's limit bounds the resolved target too. The spacing floor lifts a target past it when the lead
+    // drops by more than the floor's slack in one plan (the end of a late state), and a hold that ends past
+    // the limit ends in the next frame's heavy GPU work. Never below the nominal target.
+    if(floored && plan.lead_limit_us>0.0f && plan.source_wake_qpc>0) {
+        const auto limit=plan.source_wake_qpc+static_cast<int64_t>(std::llround(
+            static_cast<double>(plan.lead_limit_us)*static_cast<double>(frequency)/1e6));
+        if(decision.target>limit)decision.target=(std::max)(limit,decision.grid_target);
+    }
     if(now>=decision.target) {decision.status=PacingPlanStatus::Late;decision.gate=GpuPresentStatus::Late;return decision;}
     if(decision.target-now>GpuPresent_HorizonTicks(plan.interval_us,frequency)) {
         decision.status=PacingPlanStatus::Undeliverable;decision.gate=GpuPresentStatus::Budget;return decision;

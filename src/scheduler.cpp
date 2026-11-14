@@ -2,6 +2,7 @@
 #include "source_stage.h"
 #include "marker_stamps.h"
 #include "pacing_resolver.h"
+#include "instrumentation_state.h"
 #include "fg_divisor.h"
 #include "display_state.h"
 #include "vblank_thread.h"
@@ -1243,6 +1244,18 @@ static SourceStageFrame RunPlanned(
     const bool unified = SourceStage_UnifiedPlans(pipeline, config.unified, s_source_stage.UnifiedEnabled());
     // Lead spike floor (lead_controller.h).
     request.spike_floor = kPacingLeadSpikeFloor;
+    // Late state of the collision guard (lead_controller.h; developer A/B switch gpu_wait_late_guard).
+    // With the interleave key the state sets the limit in the even periods of the QPC time only; in the odd
+    // ones the frames that meet its condition are flagged, nothing else.
+    request.late_guard = g_gpu_wait_late_guard.load(std::memory_order_relaxed);
+    if (request.late_guard) {
+        const int64_t period_qpc = static_cast<int64_t>(g_gpu_wait_late_guard_interleave_s.load(
+            std::memory_order_relaxed)) * request.qpc_frequency;
+        if (period_qpc > 0) {
+            request.late_observe = true;
+            request.late_guard = ((QpcNow() / period_qpc) & 1) == 0;
+        }
+    }
     // The driver's Reflex Sleep for the index this plan is expected to take,
     // while it runs (the bypass off). The source stage records it for every
     // such frame (source_stage.h).

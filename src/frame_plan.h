@@ -82,6 +82,7 @@ private:
         std::atomic<uint32_t> packed_enums{ 0 };
         std::atomic<float> hold_advance_us{ 0.0f }; // PacingFramePlan::hold_advance_us (the slot's padding)
         std::atomic<uint64_t> law_hold_sequence{ 0 }; // PacingFramePlan::law_hold_sequence
+        std::atomic<float> lead_limit_us{ 0.0f };     // PacingFramePlan::lead_limit_us
     };
 
     static size_t SlotIndex(uint64_t frame_id) noexcept;
