@@ -2082,6 +2082,7 @@ const IniKey non_default_ini[] = {
     {"osd_preset_prev_key", "F1", "F1"}, {"osd_preset_next_key", "F2", "F2"}, {"blackout_key", "F3", "F3"},
     {"pacing_preference", "smooth", "smooth"}, {"advanced_settings", "true", "true"},
     {"developer_settings", "true", "true"}, {"config_version", "6", "6"}, {"flip_metering_off", "true", "true"},
+    {"gpu_wait_late_guard", "true", "true"}, {"gpu_wait_late_guard_interleave_s", "30", "30"},
     {"gpu_queue_probe", "false", "false"}, {"gpu_queue_probe_source", "0", "0"},
     {"pacing_test_mode", "driver_limiter", "driver_limiter"}, {"unified_hold_share", "0.125", "0.125000"},
     {"unified_queue_law", "false", "false"}, {"unified_queue_rank", "3", "3"}, {"unified_queue_need_frames", "6", "6"},
@@ -2094,7 +2095,7 @@ const IniKey non_default_ini[] = {
     {"hang_report", "true", "true"}, {"hang_report_dump", "false", "false"}, {"hang_report_test_after_s", "30", "30"},
     {"streamline_compat", "force_false", "force_false"}};
 constexpr size_t non_default_ini_count = sizeof(non_default_ini) / sizeof(non_default_ini[0]);
-static_assert(non_default_ini_count == 55, "the contract lists 55 further keys");
+static_assert(non_default_ini_count == 57, "the contract lists 57 further keys");
 bool IsKeybindKey(const std::string& key) {
     return key == "osd_preset_prev_key" || key == "osd_preset_next_key" || key == "blackout_key";
 }
@@ -2280,8 +2281,9 @@ const LiveKey live_keys[] = {
     {"gpu_present_gate_probes", "off"}, {"gpu_queue_probe", "off"}, {"gpu_queue_probe_source", "0"},
     {"unified_queue_margin_end", "0"}, {"unified_hold_share", "0.1"}, {"pacing_test_mode", "reflex_only"},
     {"unified_queue_law", "off"}, {"unified_queue_rank", "3"}, {"unified_queue_need_frames", "6"},
+    {"gpu_wait_late_guard", "on"}, {"gpu_wait_late_guard_interleave_s", "30"},
     {"unified_queue_upstream", "1"}, {"unified_queue_allow_us", "2500"}};
-static_assert(sizeof(live_keys) / sizeof(live_keys[0]) == 15, "the contract lists 15 live keys");
+static_assert(sizeof(live_keys) / sizeof(live_keys[0]) == 17, "the contract lists 17 live keys");
 bool IsLiveKey(const std::string& key) {
     for (const LiveKey& live : live_keys)
         if (key == live.key) return true;
@@ -2306,7 +2308,7 @@ void TestOnlyTheListedKeysAreLive() {
         CHECK(std::strstr(unknown, "not a live key") != nullptr);
         ++refused;
     }
-    CHECK(refused == 83 - 15);
+    CHECK(refused == 85 - 17);
     SaveConfig();
     CHECK(SectionFields(local_path, "FrameLimiter") == before); // nothing a refused key named changed
     ReleaseStart();CHECK(OwnerShutdown());
@@ -2323,6 +2325,8 @@ struct DeveloperField {
 const DeveloperField developer_fields[] = {
     {"gpu_present_gate_probes", [] { g_config.gpu_present_gate_probes = false; }, [] { return g_config.gpu_present_gate_probes; }},
     {"flip_metering_off", [] { g_config.flip_metering_off = true; }, [] { return !g_config.flip_metering_off; }},
+    {"gpu_wait_late_guard", [] { g_config.gpu_wait_late_guard = true; }, [] { return !g_config.gpu_wait_late_guard; }},
+    {"gpu_wait_late_guard_interleave_s", [] { g_config.gpu_wait_late_guard_interleave_s = 30; }, [] { return g_config.gpu_wait_late_guard_interleave_s == 0; }},
     {"control_file", [] { g_config.control_file = true; }, [] { return !g_config.control_file; }},
     {"gpu_queue_probe", [] { g_config.gpu_queue_probe = false; }, [] { return g_config.gpu_queue_probe; }},
     {"gpu_queue_probe_source", [] { g_config.gpu_queue_probe_source = 0; }, [] { return g_config.gpu_queue_probe_source == 1; }},
@@ -2337,7 +2341,7 @@ const DeveloperField developer_fields[] = {
     {"unified_queue_allow_us", [] { g_config.unified_queue_allow_us = 2500; }, [] { return g_config.unified_queue_allow_us == 4000; }},
     {"hang_report_dump", [] { g_config.hang_report_dump = false; }, [] { return g_config.hang_report_dump; }},
     {"hang_report_test_after_s", [] { g_config.hang_report_test_after_s = 30; }, [] { return g_config.hang_report_test_after_s == 0; }}};
-static_assert(sizeof(developer_fields) / sizeof(developer_fields[0]) == 15, "the contract lists 15 developer fields");
+static_assert(sizeof(developer_fields) / sizeof(developer_fields[0]) == 17, "the contract lists 17 developer fields");
 void TestDeveloperFieldsAreCountedAndResetOneByOne() {
     Reset();
     CHECK(Config_DeveloperOverrides() == 0);

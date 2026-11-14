@@ -617,6 +617,8 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
 
     // ── Pacing pipeline (developer) ──
     WriteINIBool(S, "flip_metering_off", config.flip_metering_off, P);
+    WriteINIBool(S, "gpu_wait_late_guard", config.gpu_wait_late_guard, P);
+    WriteINIInt(S, "gpu_wait_late_guard_interleave_s", config.gpu_wait_late_guard_interleave_s, P);
     WriteINIBool(S, "gpu_queue_probe", config.gpu_queue_probe, P);
     WriteINIInt(S, "gpu_queue_probe_source", config.gpu_queue_probe_source, P);
     WriteINIString(S, "pacing_test_mode", PacingTestMode_Text(config.pacing_test_mode), P);
@@ -1007,6 +1009,8 @@ int Config_DeveloperOverrides() {
     const Config& d = s_default_config;
     return (g_config.gpu_present_gate_probes != d.gpu_present_gate_probes) +
         (g_config.flip_metering_off != d.flip_metering_off) +
+        (g_config.gpu_wait_late_guard != d.gpu_wait_late_guard) +
+        (g_config.gpu_wait_late_guard_interleave_s != d.gpu_wait_late_guard_interleave_s) +
         (g_config.control_file != d.control_file) +
         (g_config.gpu_queue_probe != d.gpu_queue_probe) +
         (g_config.gpu_queue_probe_source != d.gpu_queue_probe_source) +
@@ -1026,6 +1030,8 @@ void Config_ResetDeveloperSettings() {
     const Config& d = s_default_config;
     g_config.gpu_present_gate_probes = d.gpu_present_gate_probes;
     g_config.flip_metering_off = d.flip_metering_off;
+    g_config.gpu_wait_late_guard = d.gpu_wait_late_guard;
+    g_config.gpu_wait_late_guard_interleave_s = d.gpu_wait_late_guard_interleave_s;
     g_config.control_file = d.control_file;
     g_config.gpu_queue_probe = d.gpu_queue_probe;
     g_config.gpu_queue_probe_source = d.gpu_queue_probe_source;
@@ -1077,6 +1083,10 @@ void ApplyConfig() {
     if (g_config.flip_metering_off)
         LOG_WARN("Diagnostic flip metering off: NvAPI_D3D12_SetFlipConfig is hidden from later NvAPI requests, so "
                  "frame generation that asks for it afterwards runs without hardware flip metering (set at launch)");
+    if (g_config.gpu_wait_late_guard)
+        LOG_WARN("Diagnostic GPU wait late guard on: while the newest 64 frames all arrived late for their slot, "
+                 "the limit on the GPU queue wait's lead follows their lateness and earliest heavy GPU work "
+                 "(gpu_wait_late_guard=true, interleave %d s)", g_config.gpu_wait_late_guard_interleave_s);
     if (g_config.gpu_queue_probe != kPacingGpuQueueProbeDefault)
         LOG_WARN("Diagnostic GPU queue probe off: the presenting queue's submissions are not measured "
                  "(gpu_queue_probe=false; the queue law needs it and forces it on)");
