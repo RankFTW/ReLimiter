@@ -1,6 +1,7 @@
 #pragma once
-// Present-first ordering under DLSS Frame Generation (developer live key `fg_present_order`, default off; 64-bit
-// Direct3D 12).
+// Present-first ordering under DLSS Frame Generation (key `fg_present_order`, default on; 64-bit Direct3D 12). It
+// acts only where frame generation presents from its own thread after its return Signal, which is the case without
+// hardware flip metering.
 //
 // What it answers. Inside the game's Present, DLSS-G signals the frame to its worker on the game's render queue and
 // then makes that queue wait for the worker's return Signal (frame generation is done). The same return Signal lets
@@ -19,10 +20,15 @@
 //
 // The render queue is the one that receives the first outermost Signal inside a proxy Present scope
 // (StreamlineInputScope), and the Wait followed is the first outermost Wait on that queue in the same scope: the
-// pattern the Streamline handoff qualifies as source Signal and source Wait. The queue waits only on evidence: until
-// sixteen markers in a row were followed by a native Present of another thread than DLSS-G's worker inside the
-// watchdog's bound, only the marker is enqueued; sixteen watchdog releases in a row take the qualification away.
-// With hardware flip metering the worker presents before its return Signal and the unit never makes the queue wait.
+// pattern the Streamline handoff qualifies as source Signal and source Wait. The queue waits only on evidence
+// (fg_present_order_rule.h): until sixteen markers in a row were released by a native Present of another thread than
+// DLSS-G's worker inside the watchdog's bound, only the marker is enqueued; sixteen watchdog releases in a row stop
+// the unit for 240 frames, after which it probes again. With hardware flip metering the worker presents before its
+// return Signal, so the unit never makes the queue wait and enqueues a marker in one frame of sixteen.
+//
+// Cost with the key on. A game without Streamline's proxy Present: one load and a compare per outermost queue Signal
+// and Wait. Frame generation, ordering: per frame one queue Signal, one queue Wait, one event registration on the
+// game's Present thread and one fence Signal on DLSS-G's presenting thread.
 //
 // The unit is part of the add-on only (RELIMITER_FG_PRESENT_ORDER, set for the add-on target): every other target
 // that compiles a caller gets the no-op forms below.
@@ -32,6 +38,25 @@
 inline std::atomic<bool> g_fg_present_order{false};
 // Order waits enqueued and released so far (the release side runs only while they differ).
 inline std::atomic<uint64_t> g_fg_present_order_issued{0}, g_fg_present_order_released{0};
+// The render queue that is made to wait at present (identity only), null while none is. It is set only after the
+// evidence of the rule: frame generation's completion on that queue is followed by a native Present of another
+// thread than DLSS-G's worker. To the Streamline handoff that is the evidence of a separate presenter on that source
+// queue, and, with the developer A/B switch `fg_separate_presenter_hold` (default off: alone the hold made the display
+// less even, N.102), the ground on which such a presenter's cycles stand without a worker-local Present.
+inline std::atomic<void*> g_fg_present_order_queue{nullptr};
+inline std::atomic<bool> g_fg_separate_presenter_hold{false};
+inline bool FgPresentOrder_Orders(const void* queue) noexcept {
+    return queue && g_fg_present_order_queue.load(std::memory_order_acquire) == queue;
+}
+inline bool FgPresentOrder_ProvesSeparatePresenter(const void* queue) noexcept {
+    return g_fg_separate_presenter_hold.load(std::memory_order_relaxed) && FgPresentOrder_Orders(queue);
+}
+// Experiment (developer live key `fg_real_yield`, default off): in front of one submission of each frame the ordered
+// render queue waits for the real frame's Present (fg_present_order.cpp). The marker value whose real frame's
+// Present is awaited, 0 when none is.
+inline std::atomic<bool> g_fg_real_yield{false};
+inline std::atomic<int> g_fg_real_yield_early_us{1000};
+inline std::atomic<uint64_t> g_fg_present_order_real_awaited{0};
 
 #if defined(_WIN64) && defined(RELIMITER_FG_PRESENT_ORDER)
 #include <Windows.h>
@@ -46,6 +71,8 @@ void FgPresentOrder_AfterWaitActive(ID3D12CommandQueue* queue, ID3D12Fence* fenc
 void FgPresentOrder_ReleaseActive(bool watchdog) noexcept;
 void FgPresentOrder_OnQueueDestroy(void* native_queue) noexcept;
 bool FgPresentOrder_Shutdown(unsigned long timeout_ms) noexcept;
+void FgPresentOrder_BeforeExecuteActive(ID3D12CommandQueue* queue, FgPresentOrder_FenceFn native_signal,
+    FgPresentOrder_FenceFn native_wait) noexcept;
 
 // Queue Signal detour, outermost calls only (key off: one load and a branch).
 inline void FgPresentOrder_NoteSignal(void* queue, void* fence) noexcept {
@@ -57,14 +84,23 @@ inline void FgPresentOrder_AfterWait(ID3D12CommandQueue* queue, ID3D12Fence* fen
     if (g_fg_present_order.load(std::memory_order_relaxed))
         FgPresentOrder_AfterWaitActive(queue, fence, native_signal, native_wait);
 }
-// Native Present entries, after the native call returned (nothing pending: two loads and a branch).
+// Queue Execute detour, in front of the native call, outermost calls only (key off: one load and a branch).
+inline void FgPresentOrder_BeforeExecute(ID3D12CommandQueue* queue, FgPresentOrder_FenceFn native_signal,
+    FgPresentOrder_FenceFn native_wait) noexcept {
+    if (g_fg_real_yield.load(std::memory_order_relaxed) &&
+        g_fg_present_order_queue.load(std::memory_order_relaxed) == queue)
+        FgPresentOrder_BeforeExecuteActive(queue, native_signal, native_wait);
+}
+// Native Present entries, after the native call returned (nothing pending: three loads and a branch).
 inline void FgPresentOrder_AfterNativePresent() noexcept {
     if (g_fg_present_order_issued.load(std::memory_order_relaxed) !=
-        g_fg_present_order_released.load(std::memory_order_relaxed)) FgPresentOrder_ReleaseActive(false);
+            g_fg_present_order_released.load(std::memory_order_relaxed) ||
+        g_fg_present_order_real_awaited.load(std::memory_order_relaxed) != 0) FgPresentOrder_ReleaseActive(false);
 }
 #else
 inline void FgPresentOrder_NoteSignal(void*, void*) noexcept {}
 template <class... Arguments> inline void FgPresentOrder_AfterWait(Arguments&&...) noexcept {}
+template <class... Arguments> inline void FgPresentOrder_BeforeExecute(Arguments&&...) noexcept {}
 inline void FgPresentOrder_AfterNativePresent() noexcept {}
 inline void FgPresentOrder_OnQueueDestroy(void*) noexcept {}
 inline bool FgPresentOrder_Shutdown(unsigned long) noexcept { return true; }

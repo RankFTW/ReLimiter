@@ -1,35 +1,53 @@
 #include "fg_present_order.h"
-#ifdef _WIN64
+#if defined(_WIN64) && defined(RELIMITER_FG_PRESENT_ORDER)
+#include "fg_present_order_rule.h"
 #include "streamline_gpu_handoff.h"
+#include "gpu_queue_probe.h"
 #include "runtime_lifecycle.h"
 #include "logger.h"
 #include <d3d12.h>
 
-// See fg_present_order.h. Threads: the game's Present thread enqueues (AfterWaitActive), DLSS-G's presenting thread and
-// this unit's watchdog release (ReleaseActive), the thread that destroys the queue and the shutdown let go.
-// `lock` shared: the fences are read; exclusive: they are created or released. No path holds it across a blocking call.
+// See fg_present_order.h. Threads: the game's Present thread enqueues (AfterWaitActive), the thread that submits the
+// render queue's work enqueues the yield (BeforeExecuteActive), DLSS-G's presenting thread and this unit's two
+// watchdogs release (ReleaseActive, YieldRelease), the thread that destroys the queue and the shutdown let go.
+// `lock` shared: the fences and the events are read; exclusive: they are created or released. `release_lock`
+// (always taken inside `lock`): one releaser at a time, and the rules' state. No path holds either across a blocking
+// call or a log line.
 namespace fg_present_order {
-constexpr unsigned kMissLimit = 16;
+using Rule = FgPresentOrderRule;
 SRWLOCK lock = SRWLOCK_INIT;
-SRWLOCK release_lock = SRWLOCK_INIT;          // one releaser at a time: a fence's CPU Signals must not go backwards
+SRWLOCK release_lock = SRWLOCK_INIT;
 ID3D12CommandQueue* bound = nullptr;          // identity of the render queue the fences belong to (never dereferenced)
 ID3D12Fence* marker = nullptr;                // completes when the render queue has passed DLSS-G's Wait
 ID3D12Fence* order = nullptr;                 // CPU-signalled: lets the render queue go on
+Rule rule;                                    // under release_lock
 std::atomic<bool> issuing{false};
-// Evidence before the queue is made to wait. Until `kQualifyRun` markers in a row were followed by a native Present
-// inside the watchdog's bound, only the marker is enqueued (nothing waits); `kMissLimit` watchdog releases in a row
-// take the qualification away again. With hardware flip metering DLSS-G presents before its return Signal, no Present
-// follows the marker, and the unit never makes the queue wait.
-constexpr unsigned kQualifyRun = 16;
-std::atomic<bool> qualified{false};
-std::atomic<unsigned> watchdog_run{0}, present_run{0};
 std::atomic<uint64_t> by_present{0}, by_watchdog{0}, enqueue_failures{0};
-// Why a Wait was not followed (diagnostic, logged once after the first 4096 outermost Waits with the key on).
-std::atomic<uint64_t> seen_signals{0}, seen_scope_signals{0}, seen_waits{0}, waits_without_scope{0}, waits_other_queue{0},
-    waits_without_signal{0}, waits_repeated{0}, bind_failures{0};
-std::atomic<bool> diagnosed{false};
+std::atomic<bool> bind_failure_logged{false};
 HANDLE thread = nullptr, stop_event = nullptr, marker_event = nullptr, released_event = nullptr;
 int64_t frequency = 0;
+
+// ── Experiment: a yield for the real frame (developer live key `fg_real_yield`, default off) ──
+// With ordering the generated frame's Present is prompt. The real frame's, which DLSS-G times on the CPU half a batch
+// later, still lands in the middle of the render queue's work and waits until that queue next blocks (N.102). In
+// front of one submission of each frame the render queue therefore waits (`yorder`) until the real frame's Present of
+// the frame before has returned, or a watchdog `kYieldWaitMs` after the queue got there. Which submission: the one
+// the queue reaches last before that Present. It is found from events alone: a Present that returned before the
+// queue got there moves the point one submission earlier; a queue that had been there for longer than the early
+// bound (developer key `fg_real_yield_early_us`) or ran into the watchdog moves it one later. The evidence rule of
+// the order wait decides here too whether the queue waits at all: until sixteen real Presents in a row came inside
+// the watchdog's bound only the point's marker is enqueued.
+constexpr unsigned long kYieldWaitMs = 3;
+ID3D12Fence* ymarker = nullptr;               // completes when the render queue has reached the yield point
+ID3D12Fence* yorder = nullptr;                // CPU-signalled: the real frame's Present has returned
+Rule yield_rule;                              // under release_lock
+std::atomic<uint64_t> y_issued{0}, y_released{0};
+std::atomic<uint64_t> frame_value{0};         // the newest frame's marker value: the yield of the work that follows it
+std::atomic<unsigned> executes{0}, previous_executes{0}, yield_at{0};
+std::atomic<int64_t> y_reach_qpc{0};          // when the yield watchdog saw the queue at the point ...
+std::atomic<uint64_t> y_reach_value{0};       // ... of this value
+std::atomic<uint64_t> y_in_time{0}, y_late{0}, y_watchdog{0}, y_wait_us_sum{0}, y_wait_us_max{0};
+HANDLE ythread = nullptr, ymarker_event = nullptr, yreleased_event = nullptr;
 
 int64_t Qpc() noexcept { LARGE_INTEGER value{}; QueryPerformanceCounter(&value); return value.QuadPart; }
 HRESULT QueueCall(FgPresentOrder_FenceFn call, ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t value) noexcept {
@@ -49,26 +67,25 @@ HRESULT RegisterEvent(ID3D12Fence* fence, uint64_t value, HANDLE event) noexcept
     __try { return fence->SetEventOnCompletion(value, event); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return E_FAIL; }
 }
-// Diagnostic of a failed bind: 1 events or thread, 2 GetDevice, 3 first fence, 4 second fence, 5 a structured exception.
-std::atomic<int> bind_stage{0};
-std::atomic<long> bind_result{0};
-bool CreateFences(ID3D12CommandQueue* queue, ID3D12Fence** first, ID3D12Fence** second) noexcept {
+// A failed bind: 1 events or threads, 2 GetDevice, 3 first fence, 4 second fence, 5 a structured exception.
+struct BindFailure { int stage = 0; long result = 0; };
+bool CreateFences(ID3D12CommandQueue* queue, ID3D12Fence** first, ID3D12Fence** second, BindFailure* failure) noexcept {
     ID3D12Device* device = nullptr;
     bool created = false;
     __try {
         HRESULT result = queue->GetDevice(IID_PPV_ARGS(&device));
-        if (FAILED(result) || !device) { bind_stage.store(2, std::memory_order_relaxed); bind_result.store(result, std::memory_order_relaxed); }
+        if (FAILED(result) || !device) *failure = {2, result};
         else {
             result = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(first));
-            if (FAILED(result) || !*first) { bind_stage.store(3, std::memory_order_relaxed); bind_result.store(result, std::memory_order_relaxed); }
+            if (FAILED(result) || !*first) *failure = {3, result};
             else {
                 result = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(second));
-                if (FAILED(result) || !*second) { bind_stage.store(4, std::memory_order_relaxed); bind_result.store(result, std::memory_order_relaxed); }
+                if (FAILED(result) || !*second) *failure = {4, result};
                 else created = true;
             }
             device->Release();
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) { created = false; bind_stage.store(5, std::memory_order_relaxed); }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { created = false; *failure = {5, 0}; }
     return created;
 }
 void ReleaseFence(ID3D12Fence** fence) noexcept {
@@ -76,44 +93,73 @@ void ReleaseFence(ID3D12Fence** fence) noexcept {
     __except (EXCEPTION_EXECUTE_HANDLER) {}
     *fence = nullptr;
 }
-// Exclusive lock held: every wait enqueued so far is released, then the fences are let go.
+// Exclusive lock held: every wait enqueued so far is released, then the fences are let go and the rules start again.
 void DropLocked() noexcept {
+    AcquireSRWLockExclusive(&release_lock);
     if (order) {
         const uint64_t issued = g_fg_present_order_issued.load(std::memory_order_acquire);
-        AcquireSRWLockExclusive(&release_lock);
         if (issued > g_fg_present_order_released.load(std::memory_order_relaxed)) CpuSignal(order, issued);
-        ReleaseSRWLockExclusive(&release_lock);
     }
+    if (yorder) {
+        const uint64_t issued = y_issued.load(std::memory_order_acquire);
+        if (issued > y_released.load(std::memory_order_relaxed)) CpuSignal(yorder, issued);
+    }
+    rule.Reset();
+    yield_rule.Reset();
+    g_fg_present_order_queue.store(nullptr, std::memory_order_release);
+    g_fg_present_order_real_awaited.store(0, std::memory_order_relaxed);
+    ReleaseSRWLockExclusive(&release_lock);
     ReleaseFence(&marker);
     ReleaseFence(&order);
+    ReleaseFence(&ymarker);
+    ReleaseFence(&yorder);
     bound = nullptr;
     g_fg_present_order_released.store(0, std::memory_order_relaxed);
     g_fg_present_order_issued.store(0, std::memory_order_release);
+    y_released.store(0, std::memory_order_relaxed);
+    y_issued.store(0, std::memory_order_release);
+    y_reach_value.store(0, std::memory_order_relaxed);
+    frame_value.store(0, std::memory_order_relaxed);
+    executes.store(0, std::memory_order_relaxed);
+    yield_at.store(0, std::memory_order_relaxed);
 }
 DWORD WINAPI Watchdog(void*) noexcept;
-// Exclusive lock held. The worker and its events are created once and live until shutdown.
-bool BindLocked(ID3D12CommandQueue* queue) noexcept {
-    if (bound == queue && marker && order) return true;
+DWORD WINAPI YieldWatchdog(void*) noexcept;
+// Exclusive lock held. The workers and their events are created once and live until shutdown.
+bool BindLocked(ID3D12CommandQueue* queue, BindFailure* failure) noexcept {
     DropLocked();
+    // Workers that ended after a shutdown that did not wait for them are replaced.
+    if (thread && WaitForSingleObject(thread, 0) == WAIT_OBJECT_0 &&
+        (!ythread || WaitForSingleObject(ythread, 0) == WAIT_OBJECT_0)) {
+        CloseHandle(thread);
+        thread = nullptr;
+        if (ythread) CloseHandle(ythread);
+        ythread = nullptr;
+        if (stop_event) ResetEvent(stop_event);
+    }
     if (!thread) {
         LARGE_INTEGER value{};
         QueryPerformanceFrequency(&value);
         frequency = value.QuadPart;
-        stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        marker_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        released_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (stop_event && marker_event && released_event) thread = CreateThread(nullptr, 0, &Watchdog, nullptr, 0, nullptr);
-        if (!thread) { bind_stage.store(1, std::memory_order_relaxed); bind_result.store(static_cast<long>(GetLastError()), std::memory_order_relaxed); return false; }
+        if (!stop_event) stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!marker_event) marker_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!released_event) released_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!ymarker_event) ymarker_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!yreleased_event) yreleased_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (stop_event && marker_event && released_event && ymarker_event && yreleased_event) {
+            thread = CreateThread(nullptr, 0, &Watchdog, nullptr, 0, nullptr);
+            if (thread) ythread = CreateThread(nullptr, 0, &YieldWatchdog, nullptr, 0, nullptr);
+        }
+        if (!thread || !ythread) { *failure = {1, static_cast<long>(GetLastError())}; return false; }
     }
-    if (!CreateFences(queue, &marker, &order)) { ReleaseFence(&marker); ReleaseFence(&order); return false; }
+    if (!CreateFences(queue, &marker, &order, failure) || !CreateFences(queue, &ymarker, &yorder, failure)) {
+        ReleaseFence(&marker); ReleaseFence(&order); ReleaseFence(&ymarker); ReleaseFence(&yorder);
+        return false;
+    }
     bound = queue;
-    qualified.store(false, std::memory_order_relaxed);
-    watchdog_run.store(0, std::memory_order_relaxed);
-    present_run.store(0, std::memory_order_relaxed);
-    LOG_INFO("FG present order: observing render queue %p", queue);
     return true;
 }
-// What the render queue has reached and not been released for: 0 when nothing is to release.
+// Shared lock held. What the render queue has reached and not been released for: 0 when nothing is to release.
 uint64_t ReleasableShared() noexcept {
     if (!marker || !order) return 0;
     uint64_t reached = Completed(marker);
@@ -127,15 +173,31 @@ bool Pending() noexcept {
     ReleaseSRWLockShared(&lock);
     return pending;
 }
+// Waits for `released` until the deadline. A high-resolution timer: the default timer resolution would make a bound
+// of a few milliseconds sixteen.
+void WaitUntil(HANDLE timer, HANDLE released, int64_t now, int64_t deadline) noexcept {
+    if (timer) {
+        LARGE_INTEGER due{};
+        due.QuadPart = -((deadline - now) * 10'000'000 / frequency + 1);
+        SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
+        HANDLE either[2] = {released, timer};
+        WaitForMultipleObjects(2, either, FALSE, 50);
+    } else {
+        WaitForSingleObject(released, static_cast<DWORD>((deadline - now) * 1000 / frequency) + 1);
+    }
+}
+// The watchdogs bound the render queue's waits, so they run at the priority of the other timing workers.
 DWORD WINAPI Watchdog(void*) noexcept {
+    SetThreadDescription(GetCurrentThread(), L"ReLimiter FG present order");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     HANDLE handles[2] = {stop_event, marker_event};
     HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     int64_t last_report = Qpc();
     uint64_t reported_present = 0, reported_watchdog = 0;
-    double lag_sum = 0.0, lag_max = 0.0;
-    uint64_t lag_count = 0;
+    double wait_sum = 0.0, wait_max = 0.0;
+    uint64_t wait_count = 0;
     for (;;) {
-        // Outstanding waits are re-checked every few milliseconds even without the marker's event (a registration
+        // Outstanding markers are re-checked every few milliseconds even without the marker's event (a registration
         // that failed must not leave the queue waiting).
         const bool outstanding = g_fg_present_order_issued.load(std::memory_order_relaxed) !=
             g_fg_present_order_released.load(std::memory_order_relaxed);
@@ -145,145 +207,292 @@ DWORD WINAPI Watchdog(void*) noexcept {
         // The render queue has passed DLSS-G's Wait (frame generation is done): the Present has until the deadline.
         const int64_t woke = Qpc();
         const int64_t deadline = woke + frequency * kFgPresentOrderWaitMs / 1000;
+        const bool waited = g_fg_present_order_queue.load(std::memory_order_relaxed) != nullptr;
         for (;;) {
             if (!Pending()) break;
             const int64_t now = Qpc();
             if (now >= deadline) { FgPresentOrder_ReleaseActive(true); break; }
-            // A high-resolution timer: the default timer resolution would make a 2 ms bound 16 ms.
-            if (timer) {
-                LARGE_INTEGER due{};
-                due.QuadPart = -((deadline - now) * 10'000'000 / frequency + 1);
-                SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
-                HANDLE either[2] = {released_event, timer};
-                WaitForMultipleObjects(2, either, FALSE, 50);
-            } else {
-                WaitForSingleObject(released_event, static_cast<DWORD>((deadline - now) * 1000 / frequency) + 1);
-            }
+            WaitUntil(timer, released_event, now, deadline);
         }
         const int64_t done = Qpc();
-        const double lag = static_cast<double>(done - woke) * 1e6 / static_cast<double>(frequency);
-        lag_sum += lag; ++lag_count;
-        if (lag > lag_max) lag_max = lag;
-        if (done - last_report >= frequency * 10) {
+        if (waited) {
+            const double wait = static_cast<double>(done - woke) * 1e6 / static_cast<double>(frequency);
+            wait_sum += wait; ++wait_count;
+            if (wait > wait_max) wait_max = wait;
+        }
+        if (wait_count && done - last_report >= frequency * 10) {
             const uint64_t present = by_present.load(std::memory_order_relaxed);
             const uint64_t watchdog = by_watchdog.load(std::memory_order_relaxed);
-            LOG_INFO("FG present order: in 10 s %llu waits released by a Present, %llu by the watchdog; the render queue "
-                     "waited %.0f us on average, %.0f us at most, after frame generation was done",
+            LOG_INFO("FG present order: in 10 s %llu markers released by a Present, %llu by the watchdog; the render "
+                     "queue waited %.0f us on average, %.0f us at most, after frame generation was done",
                 static_cast<unsigned long long>(present - reported_present),
                 static_cast<unsigned long long>(watchdog - reported_watchdog),
-                lag_count ? lag_sum / static_cast<double>(lag_count) : 0.0, lag_max);
+                wait_sum / static_cast<double>(wait_count), wait_max);
             reported_present = present; reported_watchdog = watchdog;
-            lag_sum = 0.0; lag_max = 0.0; lag_count = 0; last_report = done;
+            wait_sum = 0.0; wait_max = 0.0; wait_count = 0; last_report = done;
         }
     }
     if (timer) CloseHandle(timer);
     return 0;
-}
 }
 
 // The render queue and the fence of DLSS-G's Wait on it, learned inside a proxy Present scope (identity only, never
 // dereferenced). Outside a scope a Wait with this identity is the same Wait. Cleared when that queue is destroyed.
 // The thread that signals that fence is DLSS-G's worker: with hardware flip metering it also presents, before its
 // return Signal, and its Presents are no evidence and release nothing.
-namespace fg_present_order {
 std::atomic<void*> learned_queue{nullptr}, learned_fence{nullptr};
 std::atomic<DWORD> worker_thread{0};
+
+// Shared lock held. The yield of `value` ends: by the real frame's Present, or by the watchdog. Moves the point.
+Rule::Change YieldReleaseShared(uint64_t value, bool by_watchdog) noexcept {
+    if (!ymarker || !yorder) return Rule::Change::None;
+    Rule::Change change = Rule::Change::None;
+    AcquireSRWLockExclusive(&release_lock);
+    if (value > y_released.load(std::memory_order_relaxed)) {
+        const bool enqueued = y_issued.load(std::memory_order_acquire) >= value;
+        const uint64_t completed = Completed(ymarker);
+        const bool reached = enqueued && completed != UINT64_MAX && completed >= value;
+        CpuSignal(yorder, value);
+        y_released.store(value, std::memory_order_release);
+        if (enqueued) {
+            unsigned at = yield_at.load(std::memory_order_relaxed);
+            if (by_watchdog) {
+                ++at;
+                y_watchdog.fetch_add(1, std::memory_order_relaxed);
+                change = yield_rule.OnWatchdog();
+            } else if (!reached) {
+                if (at > 1) --at;
+                y_late.fetch_add(1, std::memory_order_relaxed);
+                change = yield_rule.OnPresent();
+            } else {
+                const int64_t since = y_reach_value.load(std::memory_order_acquire) >= value
+                    ? Qpc() - y_reach_qpc.load(std::memory_order_relaxed) : 0;
+                const uint64_t waited_us = since > 0 ? static_cast<uint64_t>(since * 1'000'000 / frequency) : 0;
+                if (static_cast<int64_t>(waited_us) > g_fg_real_yield_early_us.load(std::memory_order_relaxed)) ++at;
+                y_in_time.fetch_add(1, std::memory_order_relaxed);
+                y_wait_us_sum.fetch_add(waited_us, std::memory_order_relaxed);
+                if (waited_us > y_wait_us_max.load(std::memory_order_relaxed))
+                    y_wait_us_max.store(waited_us, std::memory_order_relaxed);
+                change = yield_rule.OnPresent();
+            }
+            const unsigned most = previous_executes.load(std::memory_order_relaxed);
+            if (most && at > most) at = most;
+            yield_at.store(at ? at : 1, std::memory_order_relaxed);
+        }
+    }
+    ReleaseSRWLockExclusive(&release_lock);
+    if (yreleased_event) SetEvent(yreleased_event);
+    return change;
 }
+void LogYieldChange(Rule::Change change) noexcept {
+    if (change == Rule::Change::Ordering)
+        LOG_INFO("FG real-frame yield: %u real frames' Presents in a row came inside the bound; the render queue now "
+                 "waits for them in front of one submission", Rule::kRun);
+    else if (change == Rule::Change::Rest)
+        LOG_INFO("FG real-frame yield: %u yields in a row ended by the watchdog; nothing is enqueued for the next %u "
+                 "frames", Rule::kRun, Rule::kRest);
+}
+DWORD WINAPI YieldWatchdog(void*) noexcept {
+    SetThreadDescription(GetCurrentThread(), L"ReLimiter FG real-frame yield");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    HANDLE handles[2] = {stop_event, ymarker_event};
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    int64_t last_report = Qpc();
+    uint64_t reported_in_time = 0, reported_late = 0, reported_watchdog = 0;
+    for (;;) {
+        const bool outstanding = y_issued.load(std::memory_order_relaxed) != y_released.load(std::memory_order_relaxed);
+        const DWORD woken = WaitForMultipleObjects(2, handles, FALSE, outstanding ? 4 : INFINITE);
+        if (woken != WAIT_OBJECT_0 + 1 && woken != WAIT_TIMEOUT) break;
+        // How far the render queue has got with its yield points.
+        AcquireSRWLockShared(&lock);
+        uint64_t reached = ymarker ? Completed(ymarker) : 0;
+        ReleaseSRWLockShared(&lock);
+        const uint64_t issued = y_issued.load(std::memory_order_acquire);
+        if (reached > issued) reached = issued;
+        if (reached && reached > y_released.load(std::memory_order_acquire)) {
+            if (y_reach_value.load(std::memory_order_relaxed) != reached) {
+                y_reach_qpc.store(Qpc(), std::memory_order_relaxed);
+                y_reach_value.store(reached, std::memory_order_release);
+            }
+            const int64_t deadline = y_reach_qpc.load(std::memory_order_relaxed) + frequency * kYieldWaitMs / 1000;
+            for (;;) {
+                if (y_released.load(std::memory_order_acquire) >= reached) break;
+                const int64_t now = Qpc();
+                if (now >= deadline) {
+                    AcquireSRWLockShared(&lock);
+                    const Rule::Change change = YieldReleaseShared(reached, true);
+                    ReleaseSRWLockShared(&lock);
+                    LogYieldChange(change);
+                    break;
+                }
+                WaitUntil(timer, yreleased_event, now, deadline);
+            }
+        }
+        const int64_t now = Qpc();
+        const uint64_t in_time = y_in_time.load(std::memory_order_relaxed), late = y_late.load(std::memory_order_relaxed);
+        const uint64_t watchdog = y_watchdog.load(std::memory_order_relaxed);
+        if (now - last_report >= frequency * 10 && in_time + late + watchdog != reported_in_time + reported_late + reported_watchdog) {
+            const uint64_t count = in_time - reported_in_time;
+            LOG_INFO("FG real-frame yield: in 10 s the queue was at the point before the real frame's Present %llu times "
+                     "(there for %llu us on average, %llu at most), after it %llu times, %llu watchdog releases; the "
+                     "point is submission %u of %u; the queue %s",
+                static_cast<unsigned long long>(count),
+                static_cast<unsigned long long>(count ? y_wait_us_sum.exchange(0, std::memory_order_relaxed) / count : 0),
+                static_cast<unsigned long long>(y_wait_us_max.exchange(0, std::memory_order_relaxed)),
+                static_cast<unsigned long long>(late - reported_late),
+                static_cast<unsigned long long>(watchdog - reported_watchdog),
+                yield_at.load(std::memory_order_relaxed), previous_executes.load(std::memory_order_relaxed),
+                yield_rule.state == Rule::State::Ordering ? "waits" : "does not wait");
+            reported_in_time = in_time; reported_late = late; reported_watchdog = watchdog; last_report = now;
+        }
+    }
+    if (timer) CloseHandle(timer);
+    return 0;
+}
+} // namespace fg_present_order
+
 void FgPresentOrder_NoteSignalActive(void* queue, void* fence) noexcept {
     using namespace fg_present_order;
-    seen_signals.fetch_add(1, std::memory_order_relaxed);
-    if (fence && fence == learned_fence.load(std::memory_order_relaxed))
-        worker_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
-    auto* scope = StreamlineInputScope::Current();
-    if (!scope) return;
-    seen_scope_signals.fetch_add(1, std::memory_order_relaxed);
-    if (!scope->order_queue) scope->order_queue = queue;
+    if (fence && fence == learned_fence.load(std::memory_order_relaxed)) {
+        const DWORD thread_id = GetCurrentThreadId();
+        if (worker_thread.load(std::memory_order_relaxed) != thread_id)
+            worker_thread.store(thread_id, std::memory_order_relaxed);
+    }
+    if (auto* scope = StreamlineInputScope::Current(); scope && !scope->order_queue) scope->order_queue = queue;
 }
 
 void FgPresentOrder_AfterWaitActive(ID3D12CommandQueue* queue, ID3D12Fence* fence, FgPresentOrder_FenceFn native_signal,
     FgPresentOrder_FenceFn native_wait) noexcept {
     using namespace fg_present_order;
-    auto* scope = StreamlineInputScope::Current();
-    if (seen_waits.fetch_add(1, std::memory_order_relaxed) + 1 == 4096 && !diagnosed.exchange(true, std::memory_order_relaxed)) {
-        const auto u = [](const std::atomic<uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-        LOG_INFO("FG present order: of 4096 queue Waits %llu not the followed one, %llu on another queue than the "
-                 "Present's first Signal, %llu in a Present without a Signal, %llu repeated; %llu queue Signals, %llu "
-                 "inside a proxy Present; %llu bind failures (stage %d, result 0x%08lX); bound queue %p",
-            u(waits_without_scope), u(waits_other_queue), u(waits_without_signal), u(waits_repeated), u(seen_signals),
-            u(seen_scope_signals), u(bind_failures), bind_stage.load(std::memory_order_relaxed),
-            static_cast<unsigned long>(bind_result.load(std::memory_order_relaxed)), static_cast<void*>(bound));
-    }
-    if (scope) {
-        if (scope->order_done) { waits_repeated.fetch_add(1, std::memory_order_relaxed); return; }
-        if (!scope->order_queue) { waits_without_signal.fetch_add(1, std::memory_order_relaxed); return; }
-        if (scope->order_queue != queue) { waits_other_queue.fetch_add(1, std::memory_order_relaxed); return; }
+    if (auto* scope = StreamlineInputScope::Current()) {
+        if (scope->order_done || scope->order_queue != queue) return;
         scope->order_done = true;
         learned_queue.store(queue, std::memory_order_relaxed);
         learned_fence.store(fence, std::memory_order_relaxed);
     } else if (!fence || queue != learned_queue.load(std::memory_order_relaxed) ||
         fence != learned_fence.load(std::memory_order_relaxed)) {
-        waits_without_scope.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     if (!native_signal || !native_wait || RuntimeLifecycle_IsStopping()) return;
     if (issuing.exchange(true, std::memory_order_acquire)) return;
+    BindFailure failure;
+    bool bound_now = false;
     AcquireSRWLockShared(&lock);
     bool ready = bound == queue && marker && order;
     if (!ready) {
         ReleaseSRWLockShared(&lock);
         AcquireSRWLockExclusive(&lock);
-        ready = BindLocked(queue);
+        if (!(bound == queue && marker && order)) bound_now = BindLocked(queue, &failure);
         ReleaseSRWLockExclusive(&lock);
         AcquireSRWLockShared(&lock);
-        ready = ready && bound == queue && marker && order;
-        if (!ready) bind_failures.fetch_add(1, std::memory_order_relaxed);
+        ready = bound == queue && marker && order;
     }
     if (ready) {
-        const uint64_t value = g_fg_present_order_issued.load(std::memory_order_relaxed) + 1;
-        // The marker first: it completes when the queue has passed the Wait this call follows.
-        if (SUCCEEDED(QueueCall(native_signal, queue, marker, value))) {
-            // Without the Wait the queue is not blocked; the release then only moves the order fence along.
-            if (qualified.load(std::memory_order_relaxed) && FAILED(QueueCall(native_wait, queue, order, value)))
+        AcquireSRWLockExclusive(&release_lock);
+        const Rule::Enqueue enqueue = rule.OnWait();
+        ReleaseSRWLockExclusive(&release_lock);
+        if (enqueue != Rule::Enqueue::Nothing) {
+            const uint64_t value = g_fg_present_order_issued.load(std::memory_order_relaxed) + 1;
+            // The marker first: it completes when the queue has passed the Wait this call follows.
+            if (SUCCEEDED(QueueCall(native_signal, queue, marker, value))) {
+                // Without the Wait the queue is not blocked; the release then only moves the order fence along.
+                if (enqueue == Rule::Enqueue::MarkerAndWait && FAILED(QueueCall(native_wait, queue, order, value)))
+                    enqueue_failures.fetch_add(1, std::memory_order_relaxed);
+                g_fg_present_order_issued.store(value, std::memory_order_release);
+                if (FAILED(RegisterEvent(marker, value, marker_event))) SetEvent(marker_event);
+                // The work submitted from here on is the next frame's: its yield point is counted from here.
+                const unsigned count = executes.exchange(0, std::memory_order_relaxed);
+                if (count) previous_executes.store(count, std::memory_order_relaxed);
+                const unsigned at = yield_at.load(std::memory_order_relaxed);
+                if (count && (!at || at > count)) yield_at.store(at ? count : (count > 1 ? count / 2 : 1), std::memory_order_relaxed);
+                frame_value.store(value, std::memory_order_release);
+            } else {
                 enqueue_failures.fetch_add(1, std::memory_order_relaxed);
-            g_fg_present_order_issued.store(value, std::memory_order_release);
-            if (FAILED(RegisterEvent(marker, value, marker_event))) SetEvent(marker_event);
-        } else {
-            enqueue_failures.fetch_add(1, std::memory_order_relaxed);
+            }
         }
     }
     ReleaseSRWLockShared(&lock);
     issuing.store(false, std::memory_order_release);
+    if (bound_now) LOG_INFO("FG present order: observing render queue %p", static_cast<void*>(queue));
+    else if (!ready && failure.stage != 0 && !bind_failure_logged.exchange(true, std::memory_order_relaxed))
+        LOG_WARN("FG present order: the fences for render queue %p could not be created (stage %d, result 0x%08lX); "
+                 "ordering stays off for it", static_cast<void*>(queue), failure.stage,
+            static_cast<unsigned long>(failure.result));
+}
+
+void FgPresentOrder_BeforeExecuteActive(ID3D12CommandQueue* queue, FgPresentOrder_FenceFn native_signal,
+    FgPresentOrder_FenceFn native_wait) noexcept {
+    using namespace fg_present_order;
+    const unsigned index = executes.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (index != yield_at.load(std::memory_order_relaxed) || !native_signal || !native_wait ||
+        RuntimeLifecycle_IsStopping()) return;
+    const uint64_t value = frame_value.load(std::memory_order_acquire);
+    if (!value || value <= y_issued.load(std::memory_order_relaxed)) return;
+    if (!TryAcquireSRWLockShared(&lock)) return;
+    if (bound == queue && ymarker && yorder) {
+        AcquireSRWLockExclusive(&release_lock);
+        const Rule::Enqueue enqueue = yield_rule.OnWait();
+        ReleaseSRWLockExclusive(&release_lock);
+        if (enqueue != Rule::Enqueue::Nothing && SUCCEEDED(QueueCall(native_signal, queue, ymarker, value))) {
+            y_issued.store(value, std::memory_order_release);
+            if (FAILED(RegisterEvent(ymarker, value, ymarker_event))) SetEvent(ymarker_event);
+            if (enqueue == Rule::Enqueue::MarkerAndWait) {
+                // Shown to the queue probe as the queue Wait it is, so the time the queue spends here is not read as
+                // a queue without work.
+                const unsigned probe = GpuQueueProbe_WaitBegin(queue, yorder, value, 0);
+                if (FAILED(QueueCall(native_wait, queue, yorder, value)))
+                    enqueue_failures.fetch_add(1, std::memory_order_relaxed);
+                GpuQueueProbe_WaitEnd(probe);
+            }
+        }
+    }
+    ReleaseSRWLockShared(&lock);
 }
 
 void FgPresentOrder_ReleaseActive(bool watchdog) noexcept {
     using namespace fg_present_order;
     if (!watchdog && GetCurrentThreadId() == worker_thread.load(std::memory_order_relaxed)) return;
     if (!TryAcquireSRWLockShared(&lock)) return;
-    if (ReleasableShared() != 0 && TryAcquireSRWLockExclusive(&release_lock)) {
-        const uint64_t reached = ReleasableShared();
-        if (reached != 0) {
-            CpuSignal(order, reached);
-            g_fg_present_order_released.store(reached, std::memory_order_release);
-            if (watchdog) {
-                by_watchdog.fetch_add(1, std::memory_order_relaxed);
-                present_run.store(0, std::memory_order_relaxed);
-                if (watchdog_run.fetch_add(1, std::memory_order_relaxed) + 1 == kMissLimit &&
-                    qualified.exchange(false, std::memory_order_relaxed))
-                    LOG_INFO("FG present order: %u markers in a row were not followed by a Present; the render queue "
-                             "no longer waits", kMissLimit);
-            } else {
-                by_present.fetch_add(1, std::memory_order_relaxed);
-                watchdog_run.store(0, std::memory_order_relaxed);
-                if (present_run.fetch_add(1, std::memory_order_relaxed) + 1 == kQualifyRun &&
-                    !qualified.exchange(true, std::memory_order_relaxed))
-                    LOG_INFO("FG present order: %u markers in a row were followed by a Present; the render queue now "
-                             "waits for the generated frame's Present", kQualifyRun);
+    Rule::Change change = Rule::Change::None, yield_change = Rule::Change::None;
+    bool was_ordering = false;
+    uint64_t reached = ReleasableShared();
+    if (reached != 0) {
+        if (TryAcquireSRWLockExclusive(&release_lock)) {
+            reached = ReleasableShared();
+            if (reached != 0) {
+                CpuSignal(order, reached);
+                g_fg_present_order_released.store(reached, std::memory_order_release);
+                (watchdog ? by_watchdog : by_present).fetch_add(1, std::memory_order_relaxed);
+                was_ordering = g_fg_present_order_queue.load(std::memory_order_relaxed) != nullptr;
+                change = watchdog ? rule.OnWatchdog() : rule.OnPresent();
+                if (change != Rule::Change::None)
+                    g_fg_present_order_queue.store(change == Rule::Change::Ordering ? bound : nullptr,
+                        std::memory_order_release);
+                // This Present was the generated frame's: the next one of another thread than the worker is the
+                // real frame's, which the yield of the work that follows this marker waits for.
+                if (!watchdog && g_fg_real_yield.load(std::memory_order_relaxed))
+                    g_fg_present_order_real_awaited.store(reached, std::memory_order_release);
             }
+            ReleaseSRWLockExclusive(&release_lock);
+            if (reached != 0 && released_event) SetEvent(released_event);
         }
-        ReleaseSRWLockExclusive(&release_lock);
-        if (reached != 0 && released_event) SetEvent(released_event);
+    } else if (!watchdog) {
+        if (const uint64_t awaited = g_fg_present_order_real_awaited.exchange(0, std::memory_order_acq_rel))
+            yield_change = YieldReleaseShared(awaited, false);
     }
     ReleaseSRWLockShared(&lock);
+    if (change == Rule::Change::Ordering)
+        LOG_INFO("FG present order: %u markers in a row were followed by a Present; the render queue now waits for "
+                 "the generated frame's Present", Rule::kRun);
+    else if (change == Rule::Change::Rest) {
+        // Where no Present ever follows (hardware flip metering) this happens every few seconds: said once.
+        static std::atomic<bool> said{false};
+        if (was_ordering || !said.exchange(true, std::memory_order_relaxed))
+            LOG_INFO("FG present order: %u markers in a row were not followed by a Present; nothing is enqueued for "
+                     "the next %u frames%s", Rule::kRun, Rule::kRest,
+                was_ordering ? " and the render queue no longer waits" : " (said once)");
+    }
+    LogYieldChange(yield_change);
 }
 
 void FgPresentOrder_OnQueueDestroy(void* native_queue) noexcept {
@@ -293,27 +502,32 @@ void FgPresentOrder_OnQueueDestroy(void* native_queue) noexcept {
     if (learned_queue.compare_exchange_strong(expected, nullptr, std::memory_order_relaxed))
         learned_fence.store(nullptr, std::memory_order_relaxed);
     AcquireSRWLockExclusive(&lock);
-    if (bound == native_queue) {
-        DropLocked();
-        LOG_INFO("FG present order: render queue %p destroyed, fences released", native_queue);
-    }
+    const bool dropped = bound == native_queue;
+    if (dropped) DropLocked();
     ReleaseSRWLockExclusive(&lock);
+    if (dropped) LOG_INFO("FG present order: render queue %p destroyed, fences released", native_queue);
 }
 
 bool FgPresentOrder_Shutdown(unsigned long timeout_ms) noexcept {
     using namespace fg_present_order;
     g_fg_present_order.store(false, std::memory_order_relaxed);
     AcquireSRWLockExclusive(&lock);
-    LOG_INFO("FG present order: shutdown (worker %s)", thread ? "running" : "not started");
     DropLocked();
+    HANDLE workers[2] = {thread, ythread};
     ReleaseSRWLockExclusive(&lock);
-    if (!thread) return true;
+    if (!workers[0]) return true;
     SetEvent(stop_event);
-    if (WaitForSingleObject(thread, timeout_ms) != WAIT_OBJECT_0) return false;
+    if (WaitForMultipleObjects(workers[1] ? 2 : 1, workers, TRUE, timeout_ms) == WAIT_TIMEOUT) return false;
+    // The events go under the exclusive lock: a release that is still running reads them under the shared one.
+    AcquireSRWLockExclusive(&lock);
     CloseHandle(thread); thread = nullptr;
+    if (ythread) CloseHandle(ythread);
+    ythread = nullptr;
     CloseHandle(stop_event); CloseHandle(marker_event); CloseHandle(released_event);
-    stop_event = marker_event = released_event = nullptr;
-    LOG_INFO("FG present order: %llu waits released by a Present, %llu by the watchdog, %llu enqueue failures",
+    CloseHandle(ymarker_event); CloseHandle(yreleased_event);
+    stop_event = marker_event = released_event = ymarker_event = yreleased_event = nullptr;
+    ReleaseSRWLockExclusive(&lock);
+    LOG_INFO("FG present order: stopped; %llu markers released by a Present, %llu by the watchdog, %llu enqueue failures",
         static_cast<unsigned long long>(by_present.load()), static_cast<unsigned long long>(by_watchdog.load()),
         static_cast<unsigned long long>(enqueue_failures.load()));
     return true;

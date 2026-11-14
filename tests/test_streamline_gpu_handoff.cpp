@@ -107,6 +107,8 @@ struct Object { void** table; std::atomic<unsigned> refs{1}; };
 static std::array<void*,41> device_table{}, queue_table{}, fence_table{}, proxy_table{};
 static Object device{device_table.data()}, a{queue_table.data()}, b{queue_table.data()}, forward_fence{fence_table.data()},
     back_fence{fence_table.data()}, own_fence{fence_table.data()}, proxy{proxy_table.data()};
+// A separate presenter's queue and the fence it waits on, which the worker's queue signals.
+static Object c{queue_table.data()}, out_fence{fence_table.data()};
 template<class T> static T* As(Object* object) { return reinterpret_cast<T*>(object); }
 static ULONG STDMETHODCALLTYPE AddRef(IUnknown* object) { return ++reinterpret_cast<Object*>(object)->refs; }
 static ULONG STDMETHODCALLTYPE Release(IUnknown* object) { CHECK(reinterpret_cast<Object*>(object)->refs > 1); return --reinterpret_cast<Object*>(object)->refs; }
@@ -550,6 +552,71 @@ int main() {
     Reset(); self_paced(other_queue,"worker_present_on_other_queue"); CHECK(separate_published);
     g_fg_presenting = false; StreamlineHandoff_Service(); CHECK(!separate_published);
     g_fg_presenting = true; StreamlineHandoff_Service(); Reset();
+    // A separate presenter's route. Its cycles have no worker-local Present; they stand while present-first
+    // ordering holds the source queue (fg_present_order.h), and the binding is authorized only with the fence
+    // chain proven as well: the presenter's queue is not the source queue and waits on a fence the worker's
+    // queue signals. The presenter's Presents need not fall inside a cycle. Without the ordering the cycle fails
+    // as before, and the ordering alone names the separate presenter. A worker-local Present in such a binding is
+    // a change of kind; a presenter's wait below the worker's newest Signal voids the chain proof.
+    enum class Presenter { Outside, Presents, Waits, WaitsBehind };
+    const auto separate_cycle = [](Presenter presenter_does) {
+        const auto value = Source();
+        std::thread worker([=] {
+            CHECK(Fence(&b,&forward_fence,value,0x130,false) == S_OK);
+            q::ObserveExecute(As<ID3D12CommandQueue>(&b),7,reinterpret_cast<ID3D12CommandList* const*>(1));
+            CHECK(Fence(&b,&out_fence,value,0x150,true) == S_OK);
+            if (presenter_does != Presenter::Outside) {
+                std::thread presenter([=] {
+                    if (presenter_does != Presenter::Presents)
+                        CHECK(Fence(&c,&out_fence,presenter_does == Presenter::Waits ? value : value-1,0x160,false) == S_OK);
+                    StreamlineHandoff_Boundary({StreamlineBoundaryStage::Present,0x1000,reinterpret_cast<uint64_t>(&c),0,1});
+                });
+                presenter.join();
+            }
+            CHECK(Fence(&b,&back_fence,value+10000,0x140,true) == S_OK);
+        });
+        worker.join();
+        StreamlineHandoff_Service();
+    };
+    const auto rejected = [](const char* reason) {
+        return std::strcmp(h::rejection.load(),reason) == 0 && !StreamlineHandoff_IsCurrent(h::epoch);
+    };
+    {
+        auto* const source = As<ID3D12CommandQueue>(&a);
+        g_fg_present_order_queue.store(source); g_fg_separate_presenter_hold.store(true);
+        // Ordering without the fence chain: the cycles complete, the binding is not authorized, nothing is held.
+        auto previous_begins = begins;
+        for (unsigned i = 0; i < 6; ++i) separate_cycle(Presenter::Presents);
+        CHECK(!StreamlineHandoff_IsCurrent(h::epoch) && h::route.separate && h::route.successes == h::RequiredCycles);
+        CHECK(!h::chain.proof_source.load() && separate_published && begins == previous_begins);
+        // The presenter's wait on the worker's fence proves the chain; the next completed cycle authorizes.
+        separate_cycle(Presenter::Waits); CHECK(h::chain.proof_source.load() == source);
+        separate_cycle(Presenter::Waits); CHECK(StreamlineHandoff_IsCurrent(h::epoch) && begins == previous_begins);
+        separate_cycle(Presenter::Waits); CHECK(begins == previous_begins + 1);
+        separate_cycle(Presenter::Outside); CHECK(StreamlineHandoff_IsCurrent(h::epoch) && begins == previous_begins + 2);
+        // Without the ordering the cycle fails as it did; with no Present inside it, without naming a presenter.
+        g_fg_present_order_queue.store(nullptr);
+        separate_cycle(Presenter::Outside); CHECK(rejected("worker_signal_before_present"));
+        Reset();
+        // The developer switch off: the ordering still names the separate presenter, nothing stands on it.
+        g_fg_present_order_queue.store(source); g_fg_separate_presenter_hold.store(false);
+        separate_cycle(Presenter::Outside); CHECK(rejected("worker_present_on_other_queue") && separate_published);
+        g_fg_separate_presenter_hold.store(true);
+        Reset();
+        for (unsigned i = 0; i < 4; ++i) separate_cycle(Presenter::Waits);
+        CHECK(StreamlineHandoff_IsCurrent(h::epoch));
+        const auto value = Source();
+        std::thread worker([=]{Worker(value);}); worker.join();
+        CHECK(rejected("cycle_presenter_changed"));
+        Reset();
+        for (unsigned i = 0; i < 4; ++i) separate_cycle(Presenter::Waits);
+        CHECK(StreamlineHandoff_IsCurrent(h::epoch));
+        separate_cycle(Presenter::WaitsBehind); CHECK(!h::chain.proof_source.load());
+        separate_cycle(Presenter::Outside); CHECK(rejected("separate_chain_unproven"));
+        g_fg_present_order_queue.store(nullptr);
+        Reset();
+        g_fg_separate_presenter_hold.store(false);
+    }
     // Actual shared Present/Present1 wrappers, not just directly constructed
     // scopes: all documented intervals 0..4 preserve arguments and qualify only
     // after the same four source/worker rounds. GPU Begin precedes host Signal.

@@ -8,6 +8,7 @@
 #include "swapchain_manager.h"
 #include "runtime_lifecycle.h"
 #include "gpu_queue_probe.h"
+#include "fg_present_order.h"
 #include "logger.h"
 #include "pacing_resolver.h"
 #include "bounded_mpsc_queue.h"
@@ -48,6 +49,9 @@ struct Cycle {
     std::array<uint64_t, 4> sites{};
     unsigned begun = 0, finished = 0, executions = 0, callbacks = 0;
     bool outer_done = false, complete = false;
+    // The back Signal came without a worker-local Present: frame generation presents from its own thread, and
+    // present-first ordering holds the source queue for that Present (fg_present_order.h).
+    bool separate = false;
     uint32_t worker_thread = 0;
 };
 struct Route {
@@ -63,6 +67,7 @@ struct Route {
     std::array<uint64_t, 4> sites{};
     unsigned successes = 0;
     bool device_checked = false;
+    bool separate = false; // the kind of the binding's completed cycles (Cycle::separate); one kind per binding
     Cycle cycle{};
 } route;
 struct Marker { GpuPresentFgInput input{}; int64_t release = 0; };
@@ -272,6 +277,8 @@ struct ChainDiagnostic {
     std::atomic<uint64_t> epoch{1};
     std::atomic<ID3D12Fence*> forward_fence{nullptr}, back_fence{nullptr};
     std::atomic<DWORD> presenter_thread{0};
+    // Installer worker: the source queue the fence-chain proof holds for at present, or null (ReportChain).
+    std::atomic<const void*> proof_source{nullptr};
     relimiter::BoundedMpscQueue<ChainRecord, 1024> records;
 } chain;
 // Installer worker only.
@@ -380,6 +387,21 @@ void ReportChain(bool final) noexcept {
     for (unsigned i = 0; i < 4096 && chain.records.Pop(&record); ++i) AggregateChain(record);
     // A destroy without records since: unpublish now, so no reused address is matched.
     if (const uint64_t epoch = chain.epoch.load(std::memory_order_acquire); epoch > a.epoch) AdvanceChainEpoch(epoch);
+    // The fence-chain proof a hold on a separate presenter's route stands on: in this epoch the presenter's queue
+    // is neither the game's source queue nor the worker's, and it waits on a fence the worker's queue signals,
+    // never at a value below the worker's newest Signal. One wait below it voids the proof until a queue is
+    // destroyed or the presenter's queue changes.
+    {
+        const void* source = chain.source_queue.load(std::memory_order_acquire);
+        bool proven = source && a.presenter.queue && a.worker.queue && a.presenter.queue != source &&
+            a.presenter.queue != a.worker.queue;
+        if (proven) {
+            proven = false;
+            for (const auto& wait : a.presenter.waits.entries)
+                if (wait.fence && (wait.at || wait.above) && !wait.below && a.worker.signals.Find(wait.fence)) { proven = true; break; }
+        }
+        chain.proof_source.store(proven ? source : nullptr, std::memory_order_release);
+    }
     const auto context = NativeGate_GetContext(Now());
     if (a.version == a.reported || (!final && (context.qpc_frequency <= 0 ||
         context.now_qpc - a.last_report < context.qpc_frequency * 5))) return;
@@ -426,21 +448,25 @@ void Reject(StreamlineInputScope* scope, const char* reason) noexcept {
     if (scope) scope->invalid = true;
     StreamlineHandoff_Invalidate(reason);
 }
-// A structural reason marks this route identity unsupported. Caller holds the lock.
+// The route's identity as a separate presenter's. Caller holds the lock.
+void TagSeparate() noexcept {
+    constexpr auto relaxed = std::memory_order_relaxed;
+    const auto& input = route.cycle.input;
+    separate.tag_native.store(input.native, relaxed); separate.tag_generation.store(input.swapchain, relaxed);
+    separate.tag_producer.store(input.producer, relaxed); separate.tag_controller.store(input.controller, relaxed);
+    separate.tag_multiplier.store(route.multiplier, relaxed);
+    separate.evident.store(true, std::memory_order_release);
+}
+// A structural reason marks this route identity as a separate presenter's. Caller holds the lock.
 void RejectRoute(const char* reason) noexcept {
-    if (reason == OtherQueuePresentReason || reason == PresentQueueNotWorkerReason) {
-        constexpr auto relaxed = std::memory_order_relaxed;
-        const auto& input = route.cycle.input;
-        separate.tag_native.store(input.native, relaxed); separate.tag_generation.store(input.swapchain, relaxed);
-        separate.tag_producer.store(input.producer, relaxed); separate.tag_controller.store(input.controller, relaxed);
-        separate.tag_multiplier.store(route.multiplier, relaxed);
-        separate.evident.store(true, std::memory_order_release);
-    }
+    if (reason == OtherQueuePresentReason || reason == PresentQueueNotWorkerReason) TagSeparate();
     Reject(nullptr, reason);
 }
 // Installer worker: the separate-presenter capability for the current controller,
 // while the evidence matches the current route identity and FG presents. Cleared
-// by a completed cycle or a worker-local Present, never by time.
+// by a cycle completed with a worker-local Present or by such a Present, never by time.
+// The route still qualifies while present-first ordering holds the source queue for the
+// presenter (Cycle::separate); the resolver reads the capability only while it does not.
 void PublishSeparatePresenter() noexcept {
     constexpr auto relaxed = std::memory_order_relaxed;
     const auto context = NativeGate_GetContext(Now());
@@ -460,7 +486,8 @@ void PublishSeparatePresenter() noexcept {
     s.published = evident;
     if (evident)
         LOG_INFO("Streamline GPU: frame generation presents from its own thread and queue (no hardware flip metering); "
-                 "the FG input wait cannot hold it, the cap applies at the source (fg_route_unsupported)");
+                 "the FG input wait holds it while present-first ordering is established, otherwise the cap applies "
+                 "at the source (fg_route_unsupported)");
     else
         LOG_INFO("Streamline GPU: the separate presenter is no longer current; the FG input route is judged again");
 }
@@ -519,9 +546,16 @@ const char* WorkerSignalRejection(ID3D12CommandQueue* queue, uint64_t site) noex
     if (worker_scope.queue != route.worker || queue != route.worker) return "worker_signal_queue_changed";
     if (route.cycle.begun & 8) return "worker_signal_repeated";
     if (!route.cycle.executions) return "worker_signal_before_execute";
-    if (!route.cycle.callbacks)
-        return separate.seen_cycle.load(std::memory_order_relaxed) == separate.cycle.load(std::memory_order_relaxed) &&
-            separate.worker_queue.load(std::memory_order_relaxed) == route.worker
+    // No worker-local Present. With a separate presenter that is the rule. Its cycle stands while present-first
+    // ordering holds this source queue for the presenter's Present (fg_present_order.h); the binding is authorized
+    // only with the fence-chain proof as well (Authorize). Otherwise the cycle fails, and the failure names a
+    // separate presenter on positive evidence only: a Present of another thread and queue inside this cycle, or
+    // the ordering unit's (which does not depend on a Present falling into a cycle's span, a matter of the phase
+    // between two threads).
+    if (!route.cycle.callbacks && !FgPresentOrder_ProvesSeparatePresenter(route.source))
+        return (separate.seen_cycle.load(std::memory_order_relaxed) == separate.cycle.load(std::memory_order_relaxed) &&
+                separate.worker_queue.load(std::memory_order_relaxed) == route.worker) ||
+            FgPresentOrder_Orders(route.source)
             ? OtherQueuePresentReason : "worker_signal_before_present";
     return nullptr;
 }
@@ -541,36 +575,50 @@ const char* WorkerPresentRejection(const StreamlineBoundaryEvidence& evidence) n
     if (route.cycle.begun & 8) return "worker_present_after_back_signal";
     return nullptr;
 }
+// Caller holds the lock. A binding with a separate presenter is authorized only while the fence chain is proven for
+// its source queue (ReportChain): the presenter's queue is not the source queue, which the hold blocks, and waits
+// on a fence the worker's queue signals. Until then its cycles complete without the hold, which keeps the binding
+// tracked so that the presenter's Presents and waits are recorded; a proof lost afterwards ends the binding.
+void Authorize() noexcept {
+    if (route.successes < RequiredCycles || !route.device_checked) return;
+    if (!route.separate || chain.proof_source.load(std::memory_order_acquire) == route.source)
+        authorized.store(route.epoch, std::memory_order_release);
+    else if (authorized.load(std::memory_order_acquire) == route.epoch) Reject(nullptr, "separate_chain_unproven");
+}
 void CompleteCycle(const char* validated_reason = nullptr, bool validated = false) noexcept {
     auto& cycle = route.cycle;
     if (!cycle.outer_done && cycle.input.transaction &&
         completed_source_transaction.load(std::memory_order_acquire) == cycle.input.transaction)
         cycle.outer_done = true;
     if (cycle.complete || !cycle.outer_done || cycle.finished != 15 || cycle.begun != 15 ||
-        !cycle.executions || !cycle.callbacks || route.epoch != epoch.load(std::memory_order_acquire)) return;
+        !cycle.executions || (!cycle.callbacks && !cycle.separate) || route.epoch != epoch.load(std::memory_order_acquire)) return;
     if (const auto* reason = validated ? validated_reason : InputRejection(cycle.input)) { Reject(nullptr, reason); return; }
-    if (!route.successes) route.sites = cycle.sites;
+    if (!route.successes) { route.sites = cycle.sites; route.separate = cycle.separate; }
     else if (route.sites != cycle.sites) { Reject(nullptr, "cycle_sites_changed"); return; }
+    else if (route.separate != cycle.separate) { Reject(nullptr, "cycle_presenter_changed"); return; }
     // Distinct input and consumer sites are learned from exact fence edges,
     // not fixed RVAs, signal ordinals, thread/FPS ratios or module ownership alone.
     if (cycle.sites[0] == cycle.sites[3] || cycle.sites[1] == cycle.sites[2]) { Reject(nullptr, "cycle_sites_not_distinct"); return; }
     cycle.complete = true;
-    separate.evident.store(false, std::memory_order_relaxed); // a completed cycle proves the worker-local route
+    if (cycle.separate) TagSeparate();
+    else separate.evident.store(false, std::memory_order_relaxed); // a completed cycle proves the worker-local route
     route.previous_frame = cycle.input.source;
     route.previous_forward = cycle.forward;
     route.previous_back = cycle.back;
     if (route.successes < RequiredCycles) ++route.successes;
-    if (route.successes >= RequiredCycles && route.device_checked)
-        authorized.store(route.epoch, std::memory_order_release);
+    Authorize();
 }
-bool CheckDevices() noexcept {
+// `separate_route`: the worker does not present, so a compute queue is accepted for it.
+bool CheckDevices(bool separate_route) noexcept {
     auto* expected = SwapMgr_AcquirePresentingDevice();
     if (!expected) return false;
     bool valid = true;
     IUnknown* devices[5]{};
     __try {
+        const auto worker_type = route.worker->GetDesc().Type;
         valid = route.source->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT &&
-            route.worker->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT &&
+            (worker_type == D3D12_COMMAND_LIST_TYPE_DIRECT ||
+                (separate_route && worker_type == D3D12_COMMAND_LIST_TYPE_COMPUTE)) &&
             SUCCEEDED(route.source->GetDevice(IID_PPV_ARGS(&devices[0]))) &&
             SUCCEEDED(route.worker->GetDevice(IID_PPV_ARGS(&devices[1]))) &&
             SUCCEEDED(route.forward->GetDevice(IID_PPV_ARGS(&devices[2]))) &&
@@ -803,6 +851,7 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
             worker_scope = {route.epoch, route.cycle.input.transaction, queue}; role = 3;
         } else if (signal && fence == route.back && value == route.cycle.back) {
             if (const auto* reason = WorkerSignalRejection(queue, site)) { RejectRoute(reason); return {}; }
+            route.cycle.separate = !route.cycle.callbacks;
             role = 4;
         } else { Reject(nullptr, UnexpectedFenceRejection(fence, signal)); return {}; }
     }
@@ -944,15 +993,16 @@ void StreamlineHandoff_Service(bool final) noexcept {
     }
     if (route.cycle.complete && !route.device_checked) {
         const auto checked_epoch = route.epoch;
+        const bool separate_route = route.separate;
         pins.fetch_add(1, std::memory_order_acq_rel);
         lock.Unlock();
-        const bool valid = CheckDevices(); // retained interfaces, installer worker only
+        const bool valid = CheckDevices(separate_route); // retained interfaces, installer worker only
         Lock publish(nullptr); // retained pins survive a deferred device-check publication
         if (publish.held && route.epoch == checked_epoch && checked_epoch == epoch.load(std::memory_order_acquire)) {
             if (!valid) Reject(nullptr, "device_validation_failed");
             else {
                 route.device_checked = true;
-                if (route.successes >= RequiredCycles) authorized.store(checked_epoch, std::memory_order_release);
+                Authorize();
             }
         }
         pins.fetch_sub(1, std::memory_order_release);
@@ -964,8 +1014,9 @@ void StreamlineHandoff_Service(bool final) noexcept {
         reported = accepted;
         const auto snapshot = route; // scalar diagnostics only after unlocking; never dereference copied pointers
         lock.Unlock();
-        LOG_INFO("Streamline GPU: qualified epoch=%llu cycles=%u source=%p worker=%p native=%llu generation=%llu sync=%u; deadline before input Signal",
-            accepted, snapshot.successes, snapshot.source, snapshot.worker, snapshot.cycle.input.native, snapshot.cycle.input.swapchain, snapshot.sync_interval);
+        LOG_INFO("Streamline GPU: qualified epoch=%llu cycles=%u source=%p worker=%p native=%llu generation=%llu sync=%u presenter=%s; deadline before input Signal",
+            accepted, snapshot.successes, snapshot.source, snapshot.worker, snapshot.cycle.input.native, snapshot.cycle.input.swapchain, snapshot.sync_interval,
+            snapshot.separate ? "separate" : "worker");
     }
 }
 bool StreamlineHandoff_ReleaseAfterRundown() noexcept {
