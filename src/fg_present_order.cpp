@@ -60,6 +60,22 @@ HANDLE ythread = nullptr, ymarker_event = nullptr, yreleased_event = nullptr;
 ID3D12Fence* breaker = nullptr;
 std::atomic<uint64_t> break_value{0}, breaks{0};
 std::atomic<bool> breaking{false};
+// A window for the breaks (developer live key `fg_render_break_window`, 0 = the whole frame): the real frame's Present
+// arrives while the GPU is at about the same submission of the frame every time (N.104: within 4 of the last frames'
+// median in 83% of frames), so only the submissions within `window` of that one get a break. The centre follows the
+// GPU: when the real frame's Present has returned, the newest break the GPU has reached says at which submission of
+// that frame it was; inside the window the centre moves one submission towards it, outside (no break of the frame
+// reached yet, or its last one passed) by half the window. A frame's window is fixed at its first submission.
+// `window_lock` guards the frames' records and is held for a few loads and stores only.
+struct BreakFrame {
+    uint64_t frame = 0;            // the marker value the frame's work follows
+    uint64_t first = 0, last = 0;  // the break values enqueued for it so far (0: none yet)
+    unsigned first_index = 0, lo = 0, hi = 0, every = 1;
+};
+SRWLOCK window_lock = SRWLOCK_INIT;
+BreakFrame window_frames[4];
+std::atomic<unsigned> break_centre{0}, window_lo{0}, window_hi{0};
+std::atomic<uint64_t> window_before{0}, window_inside{0}, window_after{0};
 
 int64_t Qpc() noexcept { LARGE_INTEGER value{}; QueryPerformanceCounter(&value); return value.QuadPart; }
 HRESULT QueueCall(FgPresentOrder_FenceFn call, ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t value) noexcept {
@@ -78,6 +94,55 @@ uint64_t Completed(ID3D12Fence* fence) noexcept {
 HRESULT RegisterEvent(ID3D12Fence* fence, uint64_t value, HANDLE event) noexcept {
     __try { return fence->SetEventOnCompletion(value, event); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return E_FAIL; }
+}
+// The frame's first submission: its window is fixed here.
+void BreakWindowStart(uint64_t frame, unsigned window, unsigned every) noexcept {
+    unsigned centre = break_centre.load(std::memory_order_relaxed);
+    if (!centre) {
+        // Not placed yet: the middle of the last frame's submissions; the Presents move it from there.
+        const unsigned count = previous_executes.load(std::memory_order_relaxed);
+        centre = count > 3 ? count / 2 : 2;
+        break_centre.store(centre, std::memory_order_relaxed);
+    }
+    const unsigned lo = centre > window ? centre - window : 1, hi = centre + window;
+    AcquireSRWLockExclusive(&window_lock);
+    window_frames[frame & 3] = BreakFrame{frame, 0, 0, 0, lo, hi, every};
+    ReleaseSRWLockExclusive(&window_lock);
+    window_lo.store(lo, std::memory_order_relaxed);
+    window_hi.store(hi, std::memory_order_relaxed);
+}
+// Shared lock held. The real frame's Present of the frame whose work follows marker `frame` has returned: where in
+// that frame's window was the GPU?
+void BreakWindowObserveShared(uint64_t frame) noexcept {
+    const int window = g_fg_render_break_window.load(std::memory_order_relaxed);
+    if (window <= 0 || !breaker) return;
+    const uint64_t completed = Completed(breaker);
+    if (completed == UINT64_MAX) return;
+    AcquireSRWLockShared(&window_lock);
+    const BreakFrame record = window_frames[frame & 3];
+    ReleaseSRWLockShared(&window_lock);
+    unsigned centre = break_centre.load(std::memory_order_relaxed);
+    if (record.frame != frame || !record.hi || !centre) return;
+    const unsigned step = (static_cast<unsigned>(window) + 1) / 2;
+    if (!record.first || completed < record.first) {
+        centre = centre > step + 1 ? centre - step : 2;
+        window_before.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        const uint64_t reached = completed < record.last ? completed : record.last;
+        const unsigned at = record.first_index + static_cast<unsigned>(reached - record.first) * record.every;
+        const unsigned last_break = record.lo + (record.hi - record.lo) / record.every * record.every;
+        if (at >= last_break) {
+            centre += step;
+            window_after.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            if (at > centre) ++centre;
+            else if (at < centre && centre > 2) --centre;
+            window_inside.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    const unsigned count = previous_executes.load(std::memory_order_relaxed);
+    if (count > 2 && centre > count) centre = count;
+    break_centre.store(centre, std::memory_order_relaxed);
 }
 // A failed bind: 1 events or threads, 2 GetDevice, 3 first fence, 4 second fence, 5 a structured exception.
 struct BindFailure { int stage = 0; long result = 0; };
@@ -142,6 +207,12 @@ void DropLocked() noexcept {
     ReleaseFence(&yorder);
     ReleaseFence(&breaker);
     break_value.store(0, std::memory_order_relaxed);
+    break_centre.store(0, std::memory_order_relaxed);
+    window_lo.store(0, std::memory_order_relaxed);
+    window_hi.store(0, std::memory_order_relaxed);
+    AcquireSRWLockExclusive(&window_lock);
+    for (BreakFrame& record : window_frames) record = BreakFrame{};
+    ReleaseSRWLockExclusive(&window_lock);
     bound = nullptr;
     g_fg_present_order_released.store(0, std::memory_order_relaxed);
     g_fg_present_order_issued.store(0, std::memory_order_release);
@@ -224,7 +295,7 @@ DWORD WINAPI Watchdog(void*) noexcept {
     HANDLE handles[2] = {stop_event, marker_event};
     HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     int64_t last_report = Qpc();
-    uint64_t reported_present = 0, reported_watchdog = 0, reported_breaks = 0;
+    uint64_t reported_present = 0, reported_watchdog = 0, reported_breaks = 0, reported_window[3] = {};
     double wait_sum = 0.0, wait_max = 0.0;
     uint64_t wait_count = 0;
     for (;;) {
@@ -261,8 +332,18 @@ DWORD WINAPI Watchdog(void*) noexcept {
                 wait_sum / static_cast<double>(wait_count), wait_max);
             reported_present = present; reported_watchdog = watchdog;
             if (const uint64_t broke = breaks.load(std::memory_order_relaxed); broke != reported_breaks) {
-                LOG_INFO("FG render breaks: %llu in 10 s", static_cast<unsigned long long>(broke - reported_breaks));
+                const uint64_t before = window_before.load(std::memory_order_relaxed);
+                const uint64_t inside = window_inside.load(std::memory_order_relaxed);
+                const uint64_t after = window_after.load(std::memory_order_relaxed);
+                LOG_INFO("FG render breaks: %llu in 10 s; window centre %u, the real frame's Present found the GPU "
+                         "before / inside / after the window %llu / %llu / %llu times",
+                    static_cast<unsigned long long>(broke - reported_breaks),
+                    break_centre.load(std::memory_order_relaxed),
+                    static_cast<unsigned long long>(before - reported_window[0]),
+                    static_cast<unsigned long long>(inside - reported_window[1]),
+                    static_cast<unsigned long long>(after - reported_window[2]));
                 reported_breaks = broke;
+                reported_window[0] = before; reported_window[1] = inside; reported_window[2] = after;
             }
             wait_sum = 0.0; wait_max = 0.0; wait_count = 0; last_report = done;
         }
@@ -461,8 +542,14 @@ void FgPresentOrder_BeforeExecuteActive(ID3D12CommandQueue* queue, FgPresentOrde
     const unsigned index = executes.fetch_add(1, std::memory_order_relaxed) + 1;
     if (!native_signal || !native_wait || RuntimeLifecycle_IsStopping()) return;
     const int every = g_fg_render_break_every.load(std::memory_order_relaxed);
-    const bool at_break = every > 0 && index % static_cast<unsigned>(every) == 0;
+    const int window = every > 0 ? g_fg_render_break_window.load(std::memory_order_relaxed) : 0;
     const uint64_t value = frame_value.load(std::memory_order_acquire);
+    bool at_break = every > 0 && index % static_cast<unsigned>(every) == 0;
+    if (window > 0) {
+        if (index == 1 && value) BreakWindowStart(value, static_cast<unsigned>(window), static_cast<unsigned>(every));
+        const unsigned lo = window_lo.load(std::memory_order_relaxed), hi = window_hi.load(std::memory_order_relaxed);
+        at_break = hi != 0 && index >= lo && index <= hi && (index - lo) % static_cast<unsigned>(every) == 0;
+    }
     const bool at_yield = g_fg_real_yield.load(std::memory_order_relaxed) &&
         index == yield_at.load(std::memory_order_relaxed) && value && value > y_issued.load(std::memory_order_relaxed);
     if (!at_break && !at_yield) return;
@@ -473,6 +560,15 @@ void FgPresentOrder_BeforeExecuteActive(ID3D12CommandQueue* queue, FgPresentOrde
             // The Wait only behind its own Signal: a Wait without one would hold the queue for good.
             if (SUCCEEDED(QueueCall(native_signal, queue, breaker, point))) {
                 break_value.store(point, std::memory_order_relaxed);
+                if (window > 0) {
+                    AcquireSRWLockExclusive(&window_lock);
+                    BreakFrame& record = window_frames[value & 3];
+                    if (record.frame == value) {
+                        if (!record.first) { record.first = point; record.first_index = index; }
+                        record.last = point;
+                    }
+                    ReleaseSRWLockExclusive(&window_lock);
+                }
                 if (FAILED(QueueCall(native_wait, queue, breaker, point)))
                     enqueue_failures.fetch_add(1, std::memory_order_relaxed);
                 breaks.fetch_add(1, std::memory_order_relaxed);
@@ -522,16 +618,20 @@ void FgPresentOrder_ReleaseActive(bool watchdog) noexcept {
                     g_fg_present_order_queue.store(change == Rule::Change::Ordering ? bound : nullptr,
                         std::memory_order_release);
                 // This Present was the generated frame's: the next one of another thread than the worker is the
-                // real frame's, which the yield of the work that follows this marker waits for.
-                if (!watchdog && g_fg_real_yield.load(std::memory_order_relaxed))
+                // real frame's, which the yield of the work that follows this marker waits for and the breaks' window
+                // is placed by.
+                if (!watchdog && (g_fg_real_yield.load(std::memory_order_relaxed) ||
+                        g_fg_render_break_window.load(std::memory_order_relaxed) > 0))
                     g_fg_present_order_real_awaited.store(reached, std::memory_order_release);
             }
             ReleaseSRWLockExclusive(&release_lock);
             if (reached != 0 && released_event) SetEvent(released_event);
         }
     } else if (!watchdog) {
-        if (const uint64_t awaited = g_fg_present_order_real_awaited.exchange(0, std::memory_order_acq_rel))
+        if (const uint64_t awaited = g_fg_present_order_real_awaited.exchange(0, std::memory_order_acq_rel)) {
             yield_change = YieldReleaseShared(awaited, false);
+            BreakWindowObserveShared(awaited);
+        }
     }
     ReleaseSRWLockShared(&lock);
     if (change == Rule::Change::Ordering)

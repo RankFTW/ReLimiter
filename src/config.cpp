@@ -401,6 +401,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.fg_real_yield=ReadINIBool(S,"fg_real_yield",false,P);
     g_config.fg_real_yield_early_us=ReadINIInt(S,"fg_real_yield_early_us",1000,P);
     g_config.fg_render_break_every=ReadINIInt(S,"fg_render_break_every",0,P);
+    g_config.fg_render_break_window=ReadINIInt(S,"fg_render_break_window",0,P);
     g_config.unified_hold_share=ReadINIDouble(S,"unified_hold_share",kPacingUnifiedHoldShareDefault,P);
     g_config.unified_queue_law=ReadINIBool(S,"unified_queue_law",kPacingUnifiedQueueLawDefault,P);
     g_config.unified_queue_rank=ReadINIInt(S,"unified_queue_rank",kPacingUnifiedQueueRankDefault,P);
@@ -896,6 +897,7 @@ void Config_ApplyPacingPipeline() {
     g_fg_real_yield.store(sizeof(void*) == 8 && g_config.fg_real_yield, std::memory_order_relaxed);
     g_fg_real_yield_early_us.store(std::clamp(g_config.fg_real_yield_early_us, 0, 2500), std::memory_order_relaxed);
     g_fg_render_break_every.store(sizeof(void*) == 8 ? std::clamp(g_config.fg_render_break_every, 0, 64) : 0, std::memory_order_relaxed);
+    g_fg_render_break_window.store(std::clamp(g_config.fg_render_break_window, 0, 32), std::memory_order_relaxed);
 }
 
 // ── Live keys (developer control file) ──
@@ -954,6 +956,7 @@ constexpr Key kKeys[] = {
     {"fg_real_yield", &SetBool<&Config::fg_real_yield>, Publish::Pipeline},
     {"fg_real_yield_early_us", &SetInt<&Config::fg_real_yield_early_us>, Publish::Pipeline},
     {"fg_render_break_every", &SetInt<&Config::fg_render_break_every>, Publish::Pipeline},
+    {"fg_render_break_window", &SetInt<&Config::fg_render_break_window>, Publish::Pipeline},
     {"unified_queue_margin_end", &SetInt<&Config::unified_queue_margin_end>, Publish::Pipeline},
     {"unified_hold_share", &SetDouble<&Config::unified_hold_share>, Publish::Pipeline},
     {"pacing_test_mode", &SetEnum<PacingTestMode, &Config::pacing_test_mode, PacingTestMode_FromText>, Publish::Pipeline},
