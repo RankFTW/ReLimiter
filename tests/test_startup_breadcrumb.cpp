@@ -374,9 +374,188 @@ void TestConcurrentMarks() {
     Remove(path);
 }
 
+// The trail (the ring in the crumb page): every mark appends once (first-wins stages once, batch stages each time),
+// also after Running, in order with the thread and time, and the single record at offset 0 is not touched by it.
+bool ReadPage(const std::string& path, std::vector<unsigned char>* page) {
+    const HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    page->assign(kBreadcrumbFileSize, 0);
+    DWORD got = 0;
+    const bool ok = ReadFile(file, page->data(), static_cast<DWORD>(page->size()), &got, nullptr) && got == page->size();
+    CloseHandle(file);
+    return ok;
+}
+
+void TestTrail() {
+    const std::string path = TempPath("trail");
+    Remove(path);
+    CHECK(!Breadcrumb_Attach(path.c_str()).report);
+    TrailEntry entries[kTrailCapacity];
+    CHECK(Breadcrumb_TrailSnapshot(entries, kTrailCapacity) == 0);  // attach alone is not a mark
+
+    Breadcrumb_Mark(StartupStage::InitBegun);
+    Breadcrumb_Mark(StartupStage::InitBegun);  // first-wins: not a second entry
+    Breadcrumb_Mark(StartupStage::BatchApplyEntered, 0x83);
+    Breadcrumb_Mark(StartupStage::BatchApplyLeft, 0x83);
+    Breadcrumb_Mark(StartupStage::BatchApplyEntered, 0x83);  // batch stages are recorded every time
+    size_t count = Breadcrumb_TrailSnapshot(entries, kTrailCapacity);
+    CHECK(count == 4);
+    CHECK(entries[0].kind == static_cast<uint8_t>(TrailKind::Stage) &&
+          entries[0].site == static_cast<uint8_t>(StartupStage::InitBegun));
+    CHECK(entries[1].site == static_cast<uint8_t>(StartupStage::BatchApplyEntered) && entries[1].aux == 0x83);
+    CHECK(entries[2].site == static_cast<uint8_t>(StartupStage::BatchApplyLeft));
+    CHECK(entries[3].site == static_cast<uint8_t>(StartupStage::BatchApplyEntered));
+    for (size_t i = 0; i < count; ++i) {
+        CHECK(entries[i].thread_id == GetCurrentThreadId());
+        CHECK(entries[i].qpc != 0);
+        CHECK(i == 0 || entries[i].qpc >= entries[i - 1].qpc);
+    }
+    // The single record is the last stored mark and is valid.
+    CHECK(StageIs(path, StartupStage::BatchApplyEntered, 0x83));
+
+    // A trail-only kind does not touch the record.
+    Breadcrumb_Trail(TrailKind::FreezeEnter, 4, 0, 1);
+    CHECK(StageIs(path, StartupStage::BatchApplyEntered, 0x83));
+    count = Breadcrumb_TrailSnapshot(entries, kTrailCapacity);
+    CHECK(count == 5 && entries[4].kind == static_cast<uint8_t>(TrailKind::FreezeEnter) && entries[4].site == 4 &&
+          entries[4].aux == 1);
+    // Kind 0 and a kind past the last are refused, nothing is appended.
+    Breadcrumb_Trail(TrailKind::None);
+    Breadcrumb_Trail(static_cast<TrailKind>(kTrailKindLast + 1));
+    CHECK(Breadcrumb_TrailSnapshot(entries, kTrailCapacity) == 5);
+
+    // After Running the record stops (only Closed follows) and the trail keeps recording, a first-wins stage once.
+    Breadcrumb_Mark(StartupStage::FirstPresentEvent);
+    for (int i = 0; i < 40; ++i) Breadcrumb_PresentCompleted();
+    CHECK(StageIs(path, StartupStage::Running));
+    const size_t before = Breadcrumb_TrailSnapshot(entries, kTrailCapacity);
+    Breadcrumb_Mark(StartupStage::FirstGateSignal);
+    Breadcrumb_Mark(StartupStage::FirstGateSignal);
+    Breadcrumb_Mark(StartupStage::BatchApplyEntered, 0x03);
+    CHECK(StageIs(path, StartupStage::Running));
+    count = Breadcrumb_TrailSnapshot(entries, kTrailCapacity);
+    CHECK(count == before + 2);
+    CHECK(entries[count - 2].site == static_cast<uint8_t>(StartupStage::FirstGateSignal));
+    CHECK(entries[count - 1].site == static_cast<uint8_t>(StartupStage::BatchApplyEntered) && entries[count - 1].aux == 0x03);
+    bool running_in_trail = false;
+    for (size_t i = 0; i < count; ++i) running_in_trail = running_in_trail || entries[i].site == static_cast<uint8_t>(StartupStage::Running);
+    CHECK(running_in_trail);
+    Breadcrumb_Mark(StartupStage::Closed);
+    CHECK(StageIs(path, StartupStage::Closed));
+    CHECK(Breadcrumb_TrailSnapshot(entries, kTrailCapacity) == count + 1);
+
+    // The same entries from a copy of the file (what an analyst's tool reads back after a kill).
+    std::vector<unsigned char> page;
+    CHECK(ReadPage(path, &page));
+    TrailEntry from_file[kTrailCapacity];
+    const size_t file_count = Breadcrumb_TrailParse(page.data(), page.size(), from_file, kTrailCapacity);
+    CHECK(file_count == count + 1);
+    for (size_t i = 0; i < count; ++i) {  // field by field: the structs have padding
+        CHECK(from_file[i].qpc == entries[i].qpc && from_file[i].thread_id == entries[i].thread_id &&
+              from_file[i].extra == entries[i].extra && from_file[i].kind == entries[i].kind &&
+              from_file[i].site == entries[i].site && from_file[i].aux == entries[i].aux);
+    }
+    // A page without the header is not a trail; a short one neither.
+    std::vector<unsigned char> blank(kBreadcrumbFileSize, 0);
+    CHECK(Breadcrumb_TrailParse(blank.data(), blank.size(), from_file, kTrailCapacity) == 0);
+    CHECK(Breadcrumb_TrailParse(page.data(), 100, from_file, kTrailCapacity) == 0);
+    // The record at offset 0 is a valid record next to the trail.
+    BreadcrumbRecord record;
+    std::memcpy(&record, page.data(), sizeof(record));
+    CHECK(record.magic == kBreadcrumbMagic && record.seq_begin == record.seq_end && (record.seq_begin & 1u) == 0);
+
+    // A reload in the same process resets the trail with the record.
+    CHECK(!Breadcrumb_Attach(path.c_str()).report);  // Closed: no report
+    CHECK(Breadcrumb_TrailSnapshot(entries, kTrailCapacity) == 0);
+    Breadcrumb_Mark(StartupStage::InitBegun);
+    CHECK(Breadcrumb_TrailSnapshot(entries, kTrailCapacity) == 1);
+    Breadcrumb_Detach();
+    CHECK(Breadcrumb_TrailSnapshot(entries, kTrailCapacity) == 0);
+    Remove(path);
+}
+
+void TestTrailWrapAndThreads() {
+    const std::string path = TempPath("wrap");
+    Remove(path);
+    CHECK(!Breadcrumb_Attach(path.c_str()).report);
+    TrailEntry entries[kTrailCapacity];
+
+    // Wrap: the newest 96 of 250 appends, oldest first, consecutive.
+    for (uint32_t i = 0; i < 250; ++i) Breadcrumb_Trail(TrailKind::QueueOfferEnter, 0, i);
+    size_t count = Breadcrumb_TrailSnapshot(entries, kTrailCapacity);
+    CHECK(count == kTrailCapacity);
+    for (size_t i = 0; i < count; ++i) CHECK(entries[i].extra == 250 - kTrailCapacity + i);
+    // A smaller buffer gets the newest entries.
+    TrailEntry few[10];
+    CHECK(Breadcrumb_TrailSnapshot(few, 10) == 10);
+    for (size_t i = 0; i < 10; ++i) CHECK(few[i].extra == 240 + i);
+
+    // An entry from a second thread carries that thread's id.
+    DWORD other_id = 0;
+    std::thread other([&] {
+        other_id = GetCurrentThreadId();
+        Breadcrumb_Trail(TrailKind::FirstReflexSleep, 7, 0xABCD1234u, 9);
+    });
+    other.join();
+    count = Breadcrumb_TrailSnapshot(entries, kTrailCapacity);
+    CHECK(entries[count - 1].thread_id == other_id && other_id != GetCurrentThreadId());
+    CHECK(entries[count - 1].kind == static_cast<uint8_t>(TrailKind::FirstReflexSleep) && entries[count - 1].site == 7 &&
+          entries[count - 1].extra == 0xABCD1234u && entries[count - 1].aux == 9);
+
+    // Writers racing readers: every complete slot a reader takes holds one writer's whole entry (the site is the
+    // writer's number, the extra's top byte too), and the record at offset 0 is not disturbed.
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> writers;
+    for (uint32_t t = 1; t <= 4; ++t) {
+        writers.emplace_back([t, &stop] {
+            uint32_t i = 0;
+            while (!stop.load(std::memory_order_relaxed) && i < 200000)
+                Breadcrumb_Trail(TrailKind::FreezeLeave, static_cast<uint8_t>(t), (t << 24) | (i++ & 0xFFFFFF), static_cast<uint16_t>(t));
+        });
+    }
+    for (int round = 0; round < 3000; ++round) {
+        count = Breadcrumb_TrailSnapshot(entries, kTrailCapacity);
+        for (size_t i = 0; i < count; ++i) {
+            CHECK(entries[i].kind != 0 && entries[i].kind <= kTrailKindLast);
+            if (entries[i].kind == static_cast<uint8_t>(TrailKind::FreezeLeave)) {
+                CHECK(entries[i].site == (entries[i].extra >> 24) && entries[i].aux == entries[i].site);
+            }
+        }
+    }
+    stop.store(true);
+    for (auto& writer : writers) writer.join();
+    BreadcrumbRecord record;
+    CHECK(ReadRecord(path, &record));
+    CHECK(record.stage == static_cast<uint8_t>(StartupStage::None) && record.seq_begin == record.seq_end);
+    Breadcrumb_Detach();
+    Remove(path);
+}
+
 } // namespace
 
+// The report off (hang_report_state.h, the default): the start-up record keeps working, the trail records nothing.
+void TestTrailOffIsInert() {
+    CHECK(!HangReport_Active());
+    const std::string path = TempPath("trailoff");
+    Remove(path);
+    CHECK(!Breadcrumb_Attach(path.c_str()).report);
+    Breadcrumb_Mark(StartupStage::InitBegun);
+    Breadcrumb_Mark(StartupStage::BatchApplyEntered, 1);
+    Breadcrumb_Trail(TrailKind::FreezeEnter, 4, 0, 1);
+    std::atomic<bool> first{false};
+    Breadcrumb_TrailFirst(first, TrailKind::FirstReflexSleep);
+    CHECK(!first.load());   // the site's own flag is never stored while the report is off
+    TrailEntry entries[kTrailCapacity];
+    CHECK(Breadcrumb_TrailSnapshot(entries, kTrailCapacity) == 0);
+    CHECK(StageIs(path, StartupStage::BatchApplyEntered, 1));   // the record itself is unaffected
+    Breadcrumb_Detach();
+    Remove(path);
+}
+
 int main() {
+    TestTrailOffIsInert();
+    HangReport_SetActive(true);   // the trail tests below run with the report on
     TestJudge();
     TestDescribe();
     TestWriteKillRead();
@@ -386,6 +565,8 @@ int main() {
     TestUnusableRecords();
     TestUnusablePaths();
     TestConcurrentMarks();
+    TestTrail();
+    TestTrailWrapAndThreads();
     std::puts("test_startup_breadcrumb: all tests passed");
     return 0;
 }

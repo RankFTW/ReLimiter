@@ -47,15 +47,35 @@ static std::atomic<bool>       s_valid{false};            // true when a swapcha
 static std::atomic<uint64_t>   s_owner_device_native{0};  // API-typed, including non-COM devices
 static SwapchainSelectionPolicy s_selection;
 static SRWLOCK s_selection_lock = SRWLOCK_INIT;
+// Who holds s_selection_lock and who waits for it (the stall report, hang_report.h).
+static LockOwnerDiag s_selection_diag;
 
 // Lifecycle callbacks may wait for the admitted Present to finish; Present
-// itself only tries the lock and never waits on another callback.
+// itself only tries the lock and never waits on another callback. The waiter and the
+// holder are published for the stall report; the lock order is unchanged.
 class SwapchainLifecycleGuard {
 public:
-    SwapchainLifecycleGuard() { AcquireSRWLockExclusive(&s_selection_lock); }
-    ~SwapchainLifecycleGuard() { ReleaseSRWLockExclusive(&s_selection_lock); }
+    explicit SwapchainLifecycleGuard(SelectionLockUser what) : what_(static_cast<uint8_t>(what)) {
+        const uint32_t thread = GetCurrentThreadId();
+        s_selection_diag.NoteWaiting(thread, what_, NowQpc());
+        AcquireSRWLockExclusive(&s_selection_lock);
+        s_selection_diag.NoteHoldingAfterWait(thread, what_, NowQpc());
+    }
+    ~SwapchainLifecycleGuard() {
+        s_selection_diag.NoteReleased();
+        ReleaseSRWLockExclusive(&s_selection_lock);
+    }
     SwapchainLifecycleGuard(const SwapchainLifecycleGuard&) = delete;
     SwapchainLifecycleGuard& operator=(const SwapchainLifecycleGuard&) = delete;
+private:
+    uint8_t what_;
+    // The report's clock: 0 (no read) while the stall report is off.
+    static uint64_t NowQpc() noexcept {
+        if (!HangReport_Active()) return 0;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        return static_cast<uint64_t>(now.QuadPart);
+    }
 };
 
 static bool SafeAddRef(IUnknown* object) noexcept {
@@ -422,7 +442,7 @@ static void DeactivateSwapchain(bool resize) {
 
 void SwapMgr_OnInitSwapchain(reshade::api::swapchain* sc, bool resize) {
     if (!sc) return;
-    SwapchainLifecycleGuard lifecycle;
+    SwapchainLifecycleGuard lifecycle(SelectionLockUser::InitSwapchain);
     reshade::api::device* dev = sc->get_device();
     const ActiveAPI api = DetectAPI(dev);
     const SwapchainSelectionIdentity identity{sc->get_native(), static_cast<uint8_t>(api)};
@@ -439,7 +459,7 @@ void SwapMgr_OnInitSwapchain(reshade::api::swapchain* sc, bool resize) {
 
 void SwapMgr_OnDestroySwapchain(reshade::api::swapchain* sc, bool resize) {
     if (!sc) return;
-    SwapchainLifecycleGuard lifecycle;
+    SwapchainLifecycleGuard lifecycle(SelectionLockUser::DestroySwapchain);
     const ActiveAPI api = DetectAPI(sc->get_device());
     const SwapchainSelectionIdentity identity{sc->get_native(), static_cast<uint8_t>(api)};
     if (api == ActiveAPI::DX11 || api == ActiveAPI::DX12) {
@@ -454,6 +474,9 @@ void SwapMgr_OnDestroySwapchain(reshade::api::swapchain* sc, bool resize) {
 
 SwapchainPresentGuard::SwapchainPresentGuard(reshade::api::swapchain* sc) {
     if (!sc || !TryAcquireSRWLockExclusive(&s_selection_lock)) return;
+    // Who holds the lock, for the stall report: one store here and one before the release (none while it is off).
+    if (HangReport_Active())
+        s_selection_diag.NoteHolding(GetCurrentThreadId(), static_cast<uint8_t>(SelectionLockUser::PresentEvent));
     try {
         const ActiveAPI api = DetectAPI(sc->get_device());
         SwapchainPresentObservation observation;
@@ -486,14 +509,25 @@ SwapchainPresentGuard::SwapchainPresentGuard(reshade::api::swapchain* sc) {
             admitted_ = true;
         }
     } catch (...) {
+        s_selection_diag.NoteReleased();
         ReleaseSRWLockExclusive(&s_selection_lock);
         throw;
     }
-    if (!admitted_) ReleaseSRWLockExclusive(&s_selection_lock);
+    if (!admitted_) {
+        s_selection_diag.NoteReleased();
+        ReleaseSRWLockExclusive(&s_selection_lock);
+    }
 }
 
 SwapchainPresentGuard::~SwapchainPresentGuard() {
-    if (admitted_) ReleaseSRWLockExclusive(&s_selection_lock);
+    if (admitted_) {
+        s_selection_diag.NoteReleased();
+        ReleaseSRWLockExclusive(&s_selection_lock);
+    }
+}
+
+void SwapMgr_SelectionLockSnapshot(LockOwnerSnapshot* out) noexcept {
+    *out = s_selection_diag.Read();
 }
 
 void SwapMgr_OnInitDevice(reshade::api::device* device) {
@@ -502,7 +536,7 @@ void SwapMgr_OnInitDevice(reshade::api::device* device) {
     // decided from a value, BEFORE the selection lock: this callback runs under ReShade's device lock (inside
     // D3D12CreateDevice), and the lock is held by the Present event for a whole frame.
     if (!DeviceInitMayChangeSelection(s_owner_device_native.load(std::memory_order_relaxed))) return;
-    SwapchainLifecycleGuard lifecycle;
+    SwapchainLifecycleGuard lifecycle(SelectionLockUser::InitDevice);
     ActiveAPI api = DetectAPI(device);
 
     // Re-checked under the lock: a swapchain may have been selected meanwhile. Preserve the selected API/device even
@@ -540,7 +574,7 @@ void SwapMgr_OnDestroyDevice(reshade::api::device* device, uint64_t identity) {
     // the selection lock: this callback runs under ReShade's device lock, and the lock is held by the Present event
     // for a whole frame. An unrelated device returns here. No device proxy is touched, no reference taken.
     if (ClassifyDestroy(device, identity) == DeviceDestroyRelation::Unrelated) return;
-    SwapchainLifecycleGuard lifecycle;
+    SwapchainLifecycleGuard lifecycle(SelectionLockUser::DestroyDevice);
 
     // Again under the lock: the selection may have been torn down or replaced while this thread waited.
     switch (ClassifyDestroy(device, identity)) {
@@ -560,7 +594,7 @@ void SwapMgr_OnDestroyDevice(reshade::api::device* device, uint64_t identity) {
 }
 
 void SwapMgr_ReleaseRuntimeReferences() noexcept {
-    SwapchainLifecycleGuard lifecycle;
+    SwapchainLifecycleGuard lifecycle(SelectionLockUser::ReleaseRuntimeReferences);
     s_selection.Reset();
     s_recapture_flag.store(false, std::memory_order_relaxed);
     s_valid.store(false, std::memory_order_release);

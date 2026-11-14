@@ -20,6 +20,8 @@ std::atomic<uint8_t> s_terminal{0};
 std::atomic<uint32_t> s_presents{0};
 // At most one writer at a time (the record is a seqlock); a contending mark is dropped.
 std::atomic<bool> s_writer{false};
+// Bit per stage whose first mark is in the trail (every batch mark is, so those bits stay clear).
+std::atomic<uint32_t> s_trail_seen{0};
 
 constexpr uint32_t kRunningPresents = 32;
 
@@ -74,6 +76,76 @@ void CopyRecord(BreadcrumbRecord& out, const BreadcrumbRecord* in) noexcept {
     for (size_t i = 0; i < sizeof(BreadcrumbRecord); ++i) destination[i] = source[i];
 }
 
+TrailHeader* TrailHeaderOf(BreadcrumbRecord* record) noexcept {
+    return reinterpret_cast<TrailHeader*>(reinterpret_cast<uint8_t*>(record) + kTrailOffset);
+}
+
+// The ring starts empty for this launch. A late detour of the previous session may still append while this runs:
+// it writes its own slot at worst, which the next reset or the wrap overwrites.
+void ResetTrail(BreadcrumbRecord* record) noexcept {
+    TrailHeader* header = TrailHeaderOf(record);
+    volatile TrailHeader* h = header;
+    h->magic = 0;
+    std::atomic_thread_fence(std::memory_order_release);
+    std::memset(header + 1, 0, kTrailCapacity * sizeof(TrailEntry));
+    h->version = kTrailVersion;
+    h->entry_size = static_cast<uint16_t>(sizeof(TrailEntry));
+    h->capacity = kTrailCapacity;
+    InterlockedExchange(reinterpret_cast<volatile LONG*>(&header->write_index), 0);
+    std::atomic_thread_fence(std::memory_order_release);
+    h->magic = kTrailMagic;
+}
+
+// One append: a time, the thread and the kind. The slot is claimed by one interlocked increment; its time is cleared
+// first and stored last, so a reader never takes a half-written slot for a whole one (a writer overtaken by 96 later
+// appends can still mix two entries of one slot, which only costs that slot).
+void TrailAppend(BreadcrumbRecord* record, TrailKind kind, uint8_t site, uint32_t extra, uint16_t aux) noexcept {
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    TrailHeader* header = TrailHeaderOf(record);
+    const uint32_t index = static_cast<uint32_t>(
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&header->write_index))) - 1u;
+    volatile TrailEntry* slot = reinterpret_cast<volatile TrailEntry*>(header + 1) + (index % kTrailCapacity);
+    slot->qpc = 0;
+    std::atomic_thread_fence(std::memory_order_release);
+    slot->thread_id = GetCurrentThreadId();
+    slot->extra = extra;
+    slot->kind = static_cast<uint8_t>(kind);
+    slot->site = site;
+    slot->aux = aux;
+    std::atomic_thread_fence(std::memory_order_release);
+    slot->qpc = static_cast<uint64_t>(qpc.QuadPart);
+}
+
+// The newest `capacity` complete slots, oldest first, from a page (the live mapping or a copy of the file).
+size_t ParseTrail(const volatile uint8_t* page, size_t page_size, TrailEntry* out, size_t capacity) noexcept {
+    if (!out || capacity == 0 || page_size < kTrailOffset + sizeof(TrailHeader) + kTrailCapacity * sizeof(TrailEntry)) return 0;
+    const volatile TrailHeader* header = reinterpret_cast<const volatile TrailHeader*>(page + kTrailOffset);
+    if (header->magic != kTrailMagic || header->version != kTrailVersion ||
+        header->entry_size != sizeof(TrailEntry) || header->capacity != kTrailCapacity) return 0;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const uint32_t written = header->write_index;
+    const uint32_t available = written < kTrailCapacity ? written : kTrailCapacity;
+    const uint32_t wanted = available < capacity ? available : static_cast<uint32_t>(capacity);
+    const volatile TrailEntry* slots = reinterpret_cast<const volatile TrailEntry*>(header + 1);
+    size_t count = 0;
+    for (uint32_t i = written - wanted; i != written; ++i) {
+        const volatile TrailEntry* slot = slots + (i % kTrailCapacity);
+        TrailEntry entry;
+        entry.qpc = slot->qpc;
+        entry.thread_id = slot->thread_id;
+        entry.extra = slot->extra;
+        entry.kind = slot->kind;
+        entry.site = slot->site;
+        entry.aux = slot->aux;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        // The time again: a slot that was cleared or rewritten while it was read is not taken (its time changed).
+        if (entry.qpc == 0 || slot->qpc != entry.qpc || entry.kind == 0 || entry.kind > kTrailKindLast) continue;
+        out[count++] = entry;
+    }
+    return count;
+}
+
 // Starts this launch's record at stage None. Waits a bounded time for a writer left over from the previous
 // session (a late detour); gives up without a record change otherwise.
 bool ResetForLaunch(BreadcrumbRecord* record) noexcept {
@@ -83,6 +155,8 @@ bool ResetForLaunch(BreadcrumbRecord* record) noexcept {
             s_seen.store(0, std::memory_order_relaxed);
             s_terminal.store(0, std::memory_order_relaxed);
             s_presents.store(0, std::memory_order_relaxed);
+            s_trail_seen.store(0, std::memory_order_relaxed);
+            ResetTrail(record);
             StoreRecord(record, StartupStage::None, 0, true);
             return true;
         }
@@ -124,16 +198,97 @@ const char* SiteName(StartupStage stage, uint8_t site) noexcept {
 
 } // namespace
 
+void Breadcrumb_Trail(TrailKind kind, uint8_t site, uint32_t extra, uint16_t aux) noexcept {
+    if (!HangReport_Active()) return;
+    BreadcrumbRecord* record = s_record.load(std::memory_order_acquire);
+    if (!record) return;
+    const uint8_t index = static_cast<uint8_t>(kind);
+    if (index == 0 || index > kTrailKindLast) return;
+    TrailAppend(record, kind, site, extra, aux);
+}
+
+size_t Breadcrumb_TrailSnapshot(TrailEntry* out, size_t capacity) noexcept {
+    const BreadcrumbRecord* record = s_record.load(std::memory_order_acquire);
+    if (!record) return 0;
+    return ParseTrail(reinterpret_cast<const volatile uint8_t*>(record), kBreadcrumbFileSize, out, capacity);
+}
+
+size_t Breadcrumb_TrailParse(const void* page, size_t page_size, TrailEntry* out, size_t capacity) noexcept {
+    if (!page) return 0;
+    return ParseTrail(static_cast<const volatile uint8_t*>(page), page_size, out, capacity);
+}
+
+const char* Breadcrumb_TrailKindName(uint8_t kind) noexcept {
+    switch (static_cast<TrailKind>(kind)) {
+    case TrailKind::None: return "None";
+    case TrailKind::Stage: return "Stage";
+    case TrailKind::FreezeEnter: return "FreezeEnter";
+    case TrailKind::FreezeLeave: return "FreezeLeave";
+    case TrailKind::InitDeviceEnter: return "InitDeviceEnter";
+    case TrailKind::InitDeviceLeave: return "InitDeviceLeave";
+    case TrailKind::DestroyDeviceEnter: return "DestroyDeviceEnter";
+    case TrailKind::DestroyDeviceLeave: return "DestroyDeviceLeave";
+    case TrailKind::InitSwapchainEnter: return "InitSwapchainEnter";
+    case TrailKind::InitSwapchainLeave: return "InitSwapchainLeave";
+    case TrailKind::DestroySwapchainEnter: return "DestroySwapchainEnter";
+    case TrailKind::DestroySwapchainLeave: return "DestroySwapchainLeave";
+    case TrailKind::DestroyQueueEnter: return "DestroyQueueEnter";
+    case TrailKind::DestroyQueueLeave: return "DestroyQueueLeave";
+    case TrailKind::FirstReflexSleep: return "FirstReflexSleep";
+    case TrailKind::FirstLatencyMarker: return "FirstLatencyMarker";
+    case TrailKind::FirstQueueExecute: return "FirstQueueExecute";
+    case TrailKind::FirstQueueSignal: return "FirstQueueSignal";
+    case TrailKind::FirstQueueWait: return "FirstQueueWait";
+    case TrailKind::QueueEnsureHooksEnter: return "QueueEnsureHooksEnter";
+    case TrailKind::QueueEnsureHooksLeave: return "QueueEnsureHooksLeave";
+    case TrailKind::QueueOfferEnter: return "QueueOfferEnter";
+    case TrailKind::QueueOfferLeave: return "QueueOfferLeave";
+    case TrailKind::ProbeSessionStart: return "ProbeSessionStart";
+    case TrailKind::ProbeSessionEnd: return "ProbeSessionEnd";
+    }
+    return "Unknown";
+}
+
+const char* Breadcrumb_StageText(uint8_t stage) noexcept {
+    return StageName(static_cast<StartupStage>(stage));
+}
+
+const char* Breadcrumb_BatchSiteText(uint8_t site) noexcept {
+    const char* name = SiteName(StartupStage::BatchApplyEntered, static_cast<uint8_t>(site & kBreadcrumbSiteMask));
+    return name ? name : "";
+}
+
+const char* Breadcrumb_TrailApiName(uint8_t api) noexcept {
+    switch (static_cast<TrailApi>(api)) {
+    case TrailApi::Unknown: return "unknown";
+    case TrailApi::D3D9: return "d3d9";
+    case TrailApi::D3D10: return "d3d10";
+    case TrailApi::D3D11: return "d3d11";
+    case TrailApi::D3D12: return "d3d12";
+    case TrailApi::OpenGL: return "opengl";
+    case TrailApi::Vulkan: return "vulkan";
+    }
+    return "unknown";
+}
+
 void Breadcrumb_Mark(StartupStage stage, uint8_t site) noexcept {
     BreadcrumbRecord* record = s_record.load(std::memory_order_acquire);
     if (!record) return;
     const uint8_t index = static_cast<uint8_t>(stage);
     if (index == 0 || index > kStartupStageLast) return;
+    const uint32_t bit = 1u << index;
+    const bool first_wins = !IsBatchStage(stage);
+    // The trail records every batch mark and the first mark of every other stage, also after Running (which stops
+    // the record, not the trail). Once a first-wins stage is in the trail a call is this one relaxed load and a
+    // branch (FirstPresentEvent is called at every present event).
+    // With the stall report off none of this runs: one relaxed load of the report's flag.
+    if (HangReport_Active() && (!first_wins || !(s_trail_seen.load(std::memory_order_relaxed) & bit))) {
+        if (!first_wins || !(s_trail_seen.fetch_or(bit, std::memory_order_relaxed) & bit))
+            TrailAppend(record, TrailKind::Stage, index, 0, site);
+    }
     const uint8_t terminal = s_terminal.load(std::memory_order_relaxed);
     if (terminal == static_cast<uint8_t>(StartupStage::Closed)) return;
     if (terminal != 0 && stage != StartupStage::Closed) return;
-    const uint32_t bit = 1u << index;
-    const bool first_wins = !IsBatchStage(stage);
     if (first_wins && (s_seen.load(std::memory_order_relaxed) & bit)) return;
 
     WriterClaim claim;
@@ -256,4 +411,5 @@ void Breadcrumb_Detach() noexcept {
     s_seen.store(0, std::memory_order_relaxed);
     s_terminal.store(0, std::memory_order_relaxed);
     s_presents.store(0, std::memory_order_relaxed);
+    s_trail_seen.store(0, std::memory_order_relaxed);
 }

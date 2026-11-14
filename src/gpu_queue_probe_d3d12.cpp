@@ -6,6 +6,7 @@
 #include "streamline_queue_hooks.h"
 #include "gpu_queue_law_feed.h"
 #include "logger.h"
+#include "startup_breadcrumb.h"
 #include "pacing_telemetry.h"
 #include "runtime_lifecycle.h"
 #include <d3d12.h>
@@ -1517,6 +1518,7 @@ void ClassifyEvents(const Thread& t, bool caught_up) noexcept {
 
 // Finish a session: accounting first, then the references.
 void EndSession(Thread& t, bool initialised) noexcept {
+    Breadcrumb_Trail(TrailKind::ProbeSessionEnd, 0, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(g.queue)));
     g.active.store(nullptr, std::memory_order_seq_cst);
     SetEvent(g.stop_event); // ends the calibration helper (and any wait of this thread)
     bool detour_left = true;
@@ -1821,6 +1823,8 @@ void Adopt(ID3D12CommandQueue* queue, const char* site, uint32_t role, AdoptionT
         g.queue = nullptr;
         g.device = nullptr;
         g.phase.store(kDead, std::memory_order_release);
+    } else {
+        Breadcrumb_Trail(TrailKind::ProbeSessionStart, static_cast<uint8_t>(role), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(queue)));
     }
 }
 }

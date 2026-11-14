@@ -3,6 +3,7 @@
 #include "streamline_com_evidence.h"
 #include "hooks.h"
 #include "logger.h"
+#include "startup_breadcrumb.h"
 #include "gpu_queue_probe.h"
 #include "runtime_lifecycle.h"
 #include <d3d12.h>
@@ -22,6 +23,9 @@ std::array<uint64_t, 3> targets{};
 // the second, so with the probe off nothing of Streamline's behaviour depends on the first.
 std::atomic<bool> hooks_installed{false};
 std::atomic<bool> streamline_ready{false};
+// The first call through each detour goes into the trail (startup_breadcrumb.h): one relaxed load and a branch not taken
+// per call once stored.
+std::atomic<bool> first_execute{false}, first_signal{false}, first_wait{false};
 bool targets_set = false;                 // install guard only
 std::atomic<bool> install_status_valid{false}; // the three InstallHook calls were made (statuses below are valid)
 std::array<MH_STATUS, 3> install_status{};
@@ -48,6 +52,7 @@ uint64_t PluginSite() noexcept {
     return 0; // missing/truncated stack is never an authorization
 }
 void STDMETHODCALLTYPE ObserveExecute(ID3D12CommandQueue* queue, UINT count, ID3D12CommandList* const* lists) {
+    Breadcrumb_TrailFirst(first_execute, TrailKind::FirstQueueExecute, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(queue)));
     const DWORD incoming = GetLastError();
     RuntimeCallbackGuard callback;
     Depth nested;
@@ -110,9 +115,11 @@ template<class Forward> HRESULT ObserveFence(ID3D12CommandQueue* queue, ID3D12Fe
     return result;
 }
 HRESULT STDMETHODCALLTYPE ObserveSignal(ID3D12CommandQueue* queue, ID3D12Fence* fence, UINT64 value) {
+    Breadcrumb_TrailFirst(first_signal, TrailKind::FirstQueueSignal, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(queue)));
     return ObserveFence(queue, fence, value, true, [&] { return original_signal.load(std::memory_order_acquire)(queue, fence, value); });
 }
 HRESULT STDMETHODCALLTYPE ObserveWait(ID3D12CommandQueue* queue, ID3D12Fence* fence, UINT64 value) {
+    Breadcrumb_TrailFirst(first_wait, TrailKind::FirstQueueWait, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(queue)));
     // gpu_queue_probe (key off: one load and a branch): a Wait on a fence value not yet reached is on
     // the queue once the native call has returned; the probe tracks it in flight meanwhile and signals
     // its release fence right after the call. That Signal must run inside ObserveFence's depth guard
@@ -172,7 +179,7 @@ uint32_t ImageSize(HMODULE module) noexcept {
 // targets already installed answer true without touching MinHook; other targets answer false
 // (logged once). The Streamline observation is enabled separately (streamline_ready, set by
 // StreamlineQueue_Offer); the gpu_queue_probe adopts the same detours through this function.
-bool StreamlineQueue_EnsureHooks(const std::array<uint64_t, 3>& methods) noexcept {
+static bool EnsureHooksImpl(const std::array<uint64_t, 3>& methods) noexcept {
     using namespace streamline_queue;
     HookInstallGuard install;
     if (!install || RuntimeLifecycle_IsStopping()) return false;
@@ -199,11 +206,24 @@ bool StreamlineQueue_EnsureHooks(const std::array<uint64_t, 3>& methods) noexcep
         std::memory_order_release);
     return hooks_installed.load(std::memory_order_acquire);
 }
+// The public entry with the trail around it: an enter without a leave on a thread is a thread inside the install (the
+// install guard, the freeze).
+bool StreamlineQueue_EnsureHooks(const std::array<uint64_t, 3>& methods) noexcept {
+    Breadcrumb_Trail(TrailKind::QueueEnsureHooksEnter);
+    const bool installed = EnsureHooksImpl(methods);
+    Breadcrumb_Trail(TrailKind::QueueEnsureHooksLeave, installed ? 1 : 0);
+    return installed;
+}
 void StreamlineQueue_Offer(const StreamlineComEvidence& evidence) noexcept {
     using namespace streamline_queue;
     static bool attempted = false;
     if (attempted || !evidence.entries[6] || !evidence.entries[7] || !evidence.entries[8] || RuntimeLifecycle_IsStopping()) return;
     attempted = true;
+    // The trail (startup_breadcrumb.h): a thread inside the offer is an enter without a leave.
+    struct OfferTrail {
+        OfferTrail() noexcept { Breadcrumb_Trail(TrailKind::QueueOfferEnter); }
+        ~OfferTrail() { Breadcrumb_Trail(TrailKind::QueueOfferLeave); }
+    } offer_trail;
     const std::array<uint64_t, 3> methods{evidence.entries[6], evidence.entries[7], evidence.entries[8]};
     if (!RuntimeMethods(methods)) { LOG_WARN("Streamline GPU: unsupported standard queue methods"); return; }
     const bool installed = StreamlineQueue_EnsureHooks(methods);

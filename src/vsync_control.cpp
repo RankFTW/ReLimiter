@@ -1,5 +1,6 @@
 #include "vsync_control.h"
 #include "startup_breadcrumb.h"
+#include "hang_progress.h"
 #include "swapchain_manager.h"
 #include "config.h"
 #include "hooks.h"
@@ -1097,12 +1098,28 @@ static std::atomic<bool> s_breadcrumb_present_entered{false};
 static std::atomic<bool> s_breadcrumb_present_returned{false};
 struct FirstNativePresentBreadcrumb {
     FirstNativePresentBreadcrumb() noexcept {
+        // Progress for the stall report (hang_progress.h): the count and the time of every entry (none while it is off).
+        if (HangReport_Active()) {
+            HangProgress& progress = g_hang_progress;
+            LARGE_INTEGER entered_qpc;
+            QueryPerformanceCounter(&entered_qpc);
+            progress.native_entered_qpc.store(static_cast<uint64_t>(entered_qpc.QuadPart), std::memory_order_relaxed);
+            HangProgress_Bump(progress.native_entered);
+        }
         if (!s_breadcrumb_present_entered.load(std::memory_order_relaxed)) {
             s_breadcrumb_present_entered.store(true, std::memory_order_relaxed);
             Breadcrumb_Mark(StartupStage::FirstNativePresentEntered);
         }
     }
     ~FirstNativePresentBreadcrumb() {
+        // Progress for the stall report (hang_progress.h): the count and the time of every return (none while it is off).
+        if (HangReport_Active()) {
+            HangProgress& progress = g_hang_progress;
+            LARGE_INTEGER returned_qpc;
+            QueryPerformanceCounter(&returned_qpc);
+            progress.native_returned_qpc.store(static_cast<uint64_t>(returned_qpc.QuadPart), std::memory_order_relaxed);
+            HangProgress_Bump(progress.native_returned);
+        }
         if (!s_breadcrumb_present_returned.load(std::memory_order_relaxed)) {
             s_breadcrumb_present_returned.store(true, std::memory_order_relaxed);
             Breadcrumb_Mark(StartupStage::FirstNativePresentReturned);

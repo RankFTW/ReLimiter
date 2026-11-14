@@ -25,6 +25,8 @@
 #include "runtime_lifecycle.h"
 #include "wake_guard.h"
 #include "logger.h"
+#include "startup_breadcrumb.h"
+#include "hang_progress.h"
 #include "instrumentation_state.h"
 #include "pacing_resolver.h"
 #include "unified_pacer.h"
@@ -1733,6 +1735,25 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
     return result;
 }
 
+// The Reflex Sleep hook's progress for the stall report (hang_progress.h): entered, left (every way out of the hook),
+// and the time and thread of the last entry. A thread that entered and never left is inside the hook.
+struct SleepProgressScope {
+    SleepProgressScope() noexcept {
+        if (!HangReport_Active()) return;
+        HangProgress& progress = g_hang_progress;
+        LARGE_INTEGER entry;
+        QueryPerformanceCounter(&entry);
+        progress.sleep_entry_qpc.store(static_cast<uint64_t>(entry.QuadPart), std::memory_order_relaxed);
+        progress.sleep_entry_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        HangProgress_Bump(progress.sleep_entered);
+        static std::atomic<bool> s_trail_first_sleep{false};
+        Breadcrumb_TrailFirst(s_trail_first_sleep, TrailKind::FirstReflexSleep);
+    }
+    ~SleepProgressScope() { HangProgress_Bump(g_hang_progress.sleep_left); }
+    SleepProgressScope(const SleepProgressScope&) = delete;
+    SleepProgressScope& operator=(const SleepProgressScope&) = delete;
+};
+
 // ── Hook: Sleep — forward to driver for Reflex queue management. ──
 // The driver's Sleep call handles internal timing synchronization even
 // with minimumIntervalUs=0. Forwarding at the game's natural call point
@@ -1740,6 +1761,7 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
 static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
     RuntimeCallbackGuard callback;
     if (callback.IsStopping()) return SafeInvokeSleep(pDev);
+    const SleepProgressScope hang_progress_scope;
     IncomingDevice sleep_device;
     ResolveIncomingDevice(pDev, nullptr, &sleep_device, /*published_first=*/true);
     const uint32_t sleep_token = PublicationToken(sleep_device.identity);
@@ -1832,6 +1854,14 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
     if (!SafeCopyLatencyMarkerParams(params, &marker_params))
         return SafeInvokeLatencyMarker(dev, params);
     LARGE_INTEGER census_entry{};QueryPerformanceCounter(&census_entry);
+    // Progress for the stall report (hang_progress.h), the entry time already read above: two stores, none while the
+    // report is off.
+    if (HangReport_Active()) {
+        g_hang_progress.marker_qpc.store(static_cast<uint64_t>(census_entry.QuadPart), std::memory_order_relaxed);
+        HangProgress_Bump(g_hang_progress.marker_count);
+        static std::atomic<bool> s_trail_first_marker{false};
+        Breadcrumb_TrailFirst(s_trail_first_marker, TrailKind::FirstLatencyMarker);
+    }
     // Developer key unified_queue_upstream: freeze the lifetime (reset generation, producer epoch)
     // and the sample before any admission step below that could be descheduled across a change.
     const MarkerStampCapture stamp_capture = MarkerStamps_Capture(

@@ -164,6 +164,8 @@ void Log_Write(LogLevel level, const char* format, ...) {
     std::fputc('\n', stderr);
 }
 
+void Breadcrumb_Trail(TrailKind, uint8_t, uint32_t, uint16_t) noexcept {}
+
 void Breadcrumb_Mark(StartupStage, uint8_t) noexcept {}
 
 int main(int argc, char** argv) {

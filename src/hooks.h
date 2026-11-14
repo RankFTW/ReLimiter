@@ -4,6 +4,7 @@
 #include <MinHook.h>
 #include <atomic>
 #include <cstdint>
+#include "lock_owner_diag.h"
 
 // MinHook wrappers for hook installation and management.
 // All trampolines stored as typed function pointers by the caller.
@@ -185,3 +186,32 @@ public:
 // (OpenThread for THREAD_SUSPEND_RESUME on the thread's own id must fail with access denied). Set before
 // Hooks_StartInstallerThread; production never calls it.
 void Hooks_SetInstallerSelfCheckForTest(bool (*protected_check)() noexcept) noexcept;
+
+// ── Evidence for the stall report (hang_report.h) ──
+
+// The security descriptor of the threads other engines must not suspend: the process token's default DACL behind one
+// deny ACE for Everyone (THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT); nothing else is granted or
+// removed. `attributes` points at `descriptor` and `descriptor` at `acl`: build it in place, keep the object alive
+// until the CreateThread call returned, never copy it.
+struct HookThreadSecurity {
+    SECURITY_ATTRIBUTES attributes;
+    SECURITY_DESCRIPTOR descriptor;
+    alignas(8) BYTE acl[2048];
+};
+// False: the descriptor could not be built (GetLastError says why); the caller creates its thread without it.
+bool Hooks_BuildProtectedThreadSecurity(HookThreadSecurity* out) noexcept;
+
+// What the install lock and the installer thread are doing, from plain atomics (no lock, safe from a watchdog).
+struct HookDiagSnapshot {
+    LockOwnerSnapshot install_lock;      // InstallLockUser values
+    HookInstallerState installer_state = HookInstallerState::None;
+    uint32_t installer_thread_id = 0;    // 0 until the thread has started
+    bool minhook_unusable = false;
+    uint8_t job_state = 0;               // 0 idle, 1 posted, 2 taken, 3 done
+    uint8_t job_op = 0;                  // Hooks_DiagOpName
+    uint32_t job_requester_thread = 0;
+    uint64_t job_posted_qpc = 0, job_taken_qpc = 0, job_done_qpc = 0;
+};
+void Hooks_DiagSnapshot(HookDiagSnapshot* out) noexcept;
+const char* Hooks_DiagOpName(uint8_t op) noexcept;
+const char* Hooks_DiagJobStateName(uint8_t state) noexcept;

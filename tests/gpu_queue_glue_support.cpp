@@ -10,6 +10,7 @@
 #include "hooks.h"
 #include "instrumentation_state.h"
 #include "logger.h"
+#include "startup_breadcrumb.h"
 #include "pacing_telemetry.h"
 #include "runtime_lifecycle.h"
 #include "streamline_gpu_handoff.h"
@@ -548,6 +549,9 @@ BOOL GlueCountedQpc(LARGE_INTEGER* value) noexcept {
 }
 
 // ── Stubs of the externals the glue calls (tests/AGENTS.md: update with the contract they stand for) ──
+// The trail (startup_breadcrumb.h): the glue marks session start and end, the queue hook entry and the first call of
+// each detour; nothing here records them.
+void Breadcrumb_Trail(TrailKind, uint8_t, uint32_t, uint16_t) noexcept {}
 void Log_Write(LogLevel, const char* fmt, ...) {
     char buffer[1024];
     va_list args;

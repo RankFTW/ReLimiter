@@ -93,6 +93,12 @@ set(ADDON_SOURCES
     src/logger.cpp
     src/startup_breadcrumb.h
     src/startup_breadcrumb.cpp
+    src/hang_progress.h
+    src/lock_owner_diag.h
+    src/hang_report.h
+    src/hang_report.cpp
+    src/hang_report_policy.h
+    src/hang_report_policy.cpp
     src/csv_writer.cpp
     src/pqi.cpp
     src/presentation_gate.cpp

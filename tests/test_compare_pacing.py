@@ -348,6 +348,39 @@ class EndToEndTests(unittest.TestCase):
                 self.assertEqual(worse["verdict"], "worse")
                 self.assertEqual(rule_worse["status"], "rejected")
 
+    def test_an_unset_effect_size_outranks_a_worse_metric_of_the_same_rule(self):
+        # The pacer's frames spike (worse on jitter p99 and on interval spread). Jitter p99 has an effect size in the
+        # plan; interval spread has none: the rule is inconclusive, however clear the other metric is. With both set the
+        # same captures reject it, as before.
+        def spikes(frame):
+            return 14_000 if frame % 20 == 0 else 10_000
+
+        def rule(name, spread_effect):
+            plan = json.loads(self.plan(scene_cap=0).read_text(encoding="utf-8"))
+            plan["runs"] = [
+                {"scene": "light", "arm": "R0", "order": 1, "capture": self.capture(1, 0, 0, 1, 20_000)},
+                {"scene": "light", "arm": "B", "order": 2, "capture": self.capture(2, 50, 3, 0, 21_000, spikes)},
+                {"scene": "light", "arm": "R0", "order": 3, "capture": self.capture(3, 0, 0, 1, 20_000)},
+                {"scene": "light", "arm": "B", "order": 4, "capture": self.capture(4, 60, 3, 0, 21_000, spikes)},
+            ]
+            plan["decision"]["uncapped_primary_metrics"] = ["jitter_p99_us", "interval_spread_us"]
+            plan["analysis"]["min_effect"]["interval_spread_us"] = spread_effect
+            path = self.directory / f"{name}.json"
+            path.write_text(json.dumps(plan), encoding="utf-8")
+            report = compare.evaluate(path)
+            pacer = next(entry for entry in report["comparisons"] if entry["id"] == "pacer_vs_reflex_only")
+            metrics = pacer["scenes"][0]["metrics"]
+            return metrics, report["decision"]["rules"]["pacer_default"]["status"]
+
+        metrics, status = rule("spread_unset", None)
+        self.assertEqual(metrics["jitter_p99_us"]["verdict"], "worse")
+        self.assertEqual(metrics["interval_spread_us"]["verdict"], "effect_size_not_set")
+        self.assertEqual(status, "inconclusive")
+        metrics, status = rule("spread_set", 50)
+        self.assertEqual(metrics["jitter_p99_us"]["verdict"], "worse")
+        self.assertEqual(metrics["interval_spread_us"]["verdict"], "worse")
+        self.assertEqual(status, "rejected")
+
     def test_hitches_one_percent_low_and_interval_spread(self):
         # One 40 ms interval in 50 (frames 50, 100, ... 2950: 59 of the 2999 intervals) among 10 ms ones.
         def hitching(frame):

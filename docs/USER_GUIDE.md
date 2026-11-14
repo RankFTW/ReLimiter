@@ -607,6 +607,9 @@ Keys removed by earlier versions are dropped the same way: `pacing_method`, `smo
 | `flip_model_override` | false | DX11 flip-model compatibility; restart required |
 | `dlss_info_hooks` | true on 64-bit | DLSS information for the OSD; restart required |
 | `hook_installer_thread` | true | Compatibility switch, not a tuning option: ReLimiter patches the game's functions from one helper thread that other tools cannot pause, so a hook installation cannot freeze up against another injector. `false` patches from the calling thread instead; restart required |
+| `hang_report` | false | A watchdog writes `relimiter_<exe>.hang.txt` and `.hang.dmp` next to the log when no frame has been presented for 20 s (and again at 90 s, at most three per launch); send both files (see [The game stops responding](#the-game-stops-responding)). The report header says whether the game's window is responding, minimised or in the foreground, and how much CPU the process used in the last second, so a hang can be told from a pause (minimised, alt-tab, loading). While it is on, the log is kept at least at `info` for the first 120 s after start-up; a level you pick in the overlay meanwhile is kept and takes effect afterwards. While it is off, none of this runs. Restart required |
+| `hang_report_dump` | true | Developer: `false` writes the text report only and never loads dbghelp or writes the `.hang.dmp` |
+| `hang_report_test_after_s` | 0 (off) | Developer: writes one report that many seconds after the first presented frame, to prove the report works in a launch that is not hung |
 | `streamline_compat` | true, with per-game adjustments | Normal compatibility preference; `force_false` enables proactive hooks |
 
 ### OSD and Recording
@@ -667,6 +670,16 @@ Shader compilation, loading and other game stalls may remain regardless of limit
 5. Keep the ReLimiter log and any crash report for troubleshooting.
 
 If the game cannot reach the overlay, close it and make the corresponding changes in `relimiter.ini`.
+
+### The game stops responding
+
+If the game stops responding at launch or while you play, ReLimiter can write a report of where it is stuck:
+
+1. Close the game and set `hang_report=true` in `relimiter.ini`.
+2. Start the game and reproduce the problem. After 20 seconds without a presented frame ReLimiter writes `relimiter_<exe>.hang.txt` and `relimiter_<exe>.hang.dmp` next to the log (`relimiter_<exe>.log`), and writes another report 90 seconds in if the game is still stuck.
+3. Send `relimiter_<exe>.hang.txt`, `relimiter_<exe>.hang.dmp`, `relimiter_<exe>.log` and the `ReShade.log` from the game folder.
+
+The text file lists the names of the loaded modules and the stack of each thread; the `.dmp` file is a minidump of the game process, which can contain the game's memory. Nothing is sent anywhere, and ReLimiter takes no screenshots. Set `hang_report` back to `false` afterwards: while it is off, the report costs nothing.
 
 ### OSD is not showing
 

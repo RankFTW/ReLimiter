@@ -532,6 +532,9 @@ config_key native_pcl_enabled
 config_key gpu_present_gate_probes
 config_key dlss_info_hooks
 config_key hook_installer_thread
+config_key hang_report
+config_key hang_report_dump
+config_key hang_report_test_after_s
 config_key streamline_compat
 config_key osd_show_fps
 config_key osd_show_frametime

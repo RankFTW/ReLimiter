@@ -196,6 +196,8 @@ void ValidateConfig() {
     // ── Logging ──
     static const char* log_levels[] = {"error", "warn", "info", "debug"};
     ValidateEnum(g_config.log_level, log_levels, 4, "warn");
+    if (g_config.hang_report_test_after_s < 0) g_config.hang_report_test_after_s = 0;
+    if (g_config.hang_report_test_after_s > 3600) g_config.hang_report_test_after_s = 3600;
 
     // ── Pacing pipeline ──
     if (static_cast<unsigned>(g_config.pacing_preference) >= static_cast<unsigned>(PacingPreference::Count)) {
@@ -465,6 +467,10 @@ void LoadConfig(HMODULE hModule) {
 #endif
     // Compatibility switch of the hook installer thread (hooks.h), read once at initialisation; both addons.
     g_config.hook_installer_thread   = ReadINIBool(S, "hook_installer_thread", true, P);
+    // The stall report (hang_report.h), off by default; read once at initialisation.
+    g_config.hang_report             = ReadINIBool(S, "hang_report", false, P);
+    g_config.hang_report_dump        = ReadINIBool(S, "hang_report_dump", true, P);
+    g_config.hang_report_test_after_s = ReadINIInt(S, "hang_report_test_after_s", 0, P);
 
     LOG_INFO("Config: values read, calling ApplyConfig...");
     ValidateConfig();
@@ -628,6 +634,9 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIBool(S,"gpu_present_gate_probes",config.gpu_present_gate_probes,P);
     WriteINIBool(S, "dlss_info_hooks", config.dlss_info_hooks, P);
     WriteINIBool(S, "hook_installer_thread", config.hook_installer_thread, P);
+    WriteINIBool(S, "hang_report", config.hang_report, P);
+    WriteINIBool(S, "hang_report_dump", config.hang_report_dump, P);
+    WriteINIInt(S, "hang_report_test_after_s", config.hang_report_test_after_s, P);
     if (!config.streamline_compat)
         WriteINIString(S, "streamline_compat", "force_false", P);
     else
@@ -989,7 +998,9 @@ int Config_DeveloperOverrides() {
         (g_config.unified_queue_rank != d.unified_queue_rank) +
         (g_config.unified_queue_need_frames != d.unified_queue_need_frames) +
         (g_config.unified_queue_upstream != d.unified_queue_upstream) +
-        (g_config.unified_queue_allow_us != d.unified_queue_allow_us);
+        (g_config.unified_queue_allow_us != d.unified_queue_allow_us) +
+        (g_config.hang_report_test_after_s != d.hang_report_test_after_s) +
+        (g_config.hang_report_dump != d.hang_report_dump);
 }
 
 void Config_ResetDeveloperSettings() {
@@ -1007,6 +1018,8 @@ void Config_ResetDeveloperSettings() {
     g_config.unified_queue_need_frames = d.unified_queue_need_frames;
     g_config.unified_queue_upstream = d.unified_queue_upstream;
     g_config.unified_queue_allow_us = d.unified_queue_allow_us;
+    g_config.hang_report_test_after_s = d.hang_report_test_after_s;
+    g_config.hang_report_dump = d.hang_report_dump;
     Config_ApplyPacingPipeline();
     LOG_INFO("Config: developer diagnostics reset to the recommended defaults");
 }

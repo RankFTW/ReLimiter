@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <Windows.h>
 #include <Unknwn.h>
+#include "lock_owner_diag.h"
 
 // Centralized swapchain lifecycle and state management.
 // Sole owner of swapchain state — all other modules query through these accessors.
@@ -12,6 +13,9 @@
 enum class ActiveAPI : uint8_t { None, DX9, DX11, DX12, Vulkan, OpenGL };
 
 // ── Lifecycle — called from ReShade event callbacks in dllmain.cpp ──
+
+// Who holds the selection lock and who waits for it (SelectionLockUser), for the stall report. Plain atomics.
+void SwapMgr_SelectionLockSnapshot(LockOwnerSnapshot* out) noexcept;
 
 void SwapMgr_OnInitSwapchain(reshade::api::swapchain* sc, bool resize);
 void SwapMgr_OnDestroySwapchain(reshade::api::swapchain* sc, bool resize);

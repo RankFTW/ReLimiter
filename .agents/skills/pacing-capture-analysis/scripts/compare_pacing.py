@@ -85,7 +85,8 @@ INI_KEYS = frozenset({
     "unified_hold_share", "unified_queue_law", "unified_queue_rank", "unified_queue_need_frames",
     "unified_queue_upstream", "unified_queue_margin_end", "unified_queue_allow_us", "control_file",
     "dynamic_mfg_passthrough", "reflex_inject", "flip_model_override", "log_level", "csv_enabled",
-    "native_pcl_enabled", "gpu_present_gate_probes", "dlss_info_hooks", "hook_installer_thread", "streamline_compat",
+    "native_pcl_enabled", "gpu_present_gate_probes", "dlss_info_hooks", "hook_installer_thread", "hang_report", "hang_report_dump",
+    "hang_report_test_after_s", "streamline_compat",
     "osd_show_fps", "osd_show_frametime", "osd_show_frametime_graph", "osd_show_fg", "osd_show_limiter",
     "osd_show_pqi", "osd_show_cpu_latency", "osd_show_native_pcl", "osd_show_native_pcl_breakdown",
     "osd_show_pqi_breakdown", "osd_show_1pct_low", "osd_show_smoothness", "osd_show_pacing_quality",
@@ -720,6 +721,7 @@ def judge_rule(plan: dict[str, Any], comparisons: list[dict[str, Any]], rule: di
     latency: dict[str, dict[str, Any]] = {}
     rejected = False
     supported = True
+    effect_unset = False   # a primary metric of this rule has no effect size, in any scene
     for scene in plan["scenes"]:
         entry = _scene_entry(comparisons, name, scene["id"])
         if entry is None or entry["status"] != "compared":
@@ -743,6 +745,7 @@ def judge_rule(plan: dict[str, Any], comparisons: list[dict[str, Any]], rule: di
             elif outcome == "effect_size_not_set":
                 # Neither supported nor refuted: the plan has no effect size for this metric yet.
                 supported = False
+                effect_unset = True
                 reasons.append(f"{scene['id']} ({scene['class']}): effect size not set for {metric}")
             elif scene["class"] == "light" and outcome != "better":
                 supported = False
@@ -753,7 +756,9 @@ def judge_rule(plan: dict[str, Any], comparisons: list[dict[str, Any]], rule: di
         change = entry["metrics"][latency_metric]
         latency[scene["id"]] = {"metric": latency_metric, "delta": change.get("delta"),
                                 "interval": change.get("interval"), "verdict": change.get("verdict")}
-    status = "rejected" if rejected else "supported" if supported else "inconclusive"
+    # An unset primary effect size makes the whole rule inconclusive, whatever another metric or scene says.
+    status = ("inconclusive" if effect_unset else "rejected" if rejected else "supported" if supported
+              else "inconclusive")
     return {"label": rule.get("label", rule["id"]), "comparison": name, "status": status, "reasons": reasons,
             "latency": latency}
 

@@ -271,8 +271,10 @@ class PreRemovalEqualityTests(unittest.TestCase):
         self.for_each_capture(check)
 
     def run_compare(self, rows, events):
+        # The scene declares its cap: the deviation-share and long-frame metrics take their target from the plan, so
+        # without one they would be unavailable on both sides and their equality vacuous.
         plan = {"protocol": {}, "analysis": {"deviation_thresholds_us": [500, 2000], "block_seconds": 0.5},
-                "arms": {"B": {"expect": {}}}}
+                "arms": {"B": {"expect": {}}}, "scenes": [{"id": "s", "class": "light", "target_fps": 100}]}
         run = {"scene": "s", "arm": "B", "order": 1, "capture": "rows.csv", "events": "events.csv"}
         # analyze_run reads the capture and its events relative to one directory; each run gets its own, with
         # the same file names, so the result's capture field is equal by construction.
@@ -291,6 +293,10 @@ class PreRemovalEqualityTests(unittest.TestCase):
             self.assertEqual(old_result.status, "analyzed")
             self.assertEqual(current_result.status, "analyzed")
             old_public, current_public = old_result.public(), current_result.public()
+            # The plan's scene cap gives the target: these are measured on both sides, so their equality is not vacuous.
+            for public in (old_public, current_public):
+                for metric in ("dev_share_over_500us", "dev_share_over_2000us", "long_frame_share"):
+                    self.assertIsNotNone(get(public, ("metrics", metric)), metric)
             paths = [*COMPARE_IDENTITY, *COMPARE_RETIRED_READERS]
             self.assertEqual(without(old_public, paths), without(current_public, paths))
             self.assertEqual(old_result.draws, current_result.draws)

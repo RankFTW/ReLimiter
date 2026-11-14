@@ -725,6 +725,53 @@ if(MSVC)
     target_compile_options(test_startup_breadcrumb PRIVATE /W4 /utf-8 /permissive-)
 endif()
 
+# The stall report's decision rules (src/hang_report_policy.cpp: armed, 20 s, 90 s, re-arm, the cap of three, the forced
+# test, the key off), the progress counters and the lock-owner publication (src/lock_owner_diag.h, a real lock and two
+# threads). Builds for both architectures. The live publication sites need live validation.
+add_executable(test_hang_report_policy
+    test_hang_report_policy.cpp
+    ${CMAKE_SOURCE_DIR}/src/hang_report_policy.cpp
+)
+set_target_properties(test_hang_report_policy PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+target_include_directories(test_hang_report_policy PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_hang_report_policy PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+if(MSVC)
+    set_property(TARGET test_hang_report_policy PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(test_hang_report_policy PRIVATE /W4 /utf-8 /permissive-)
+endif()
+
+# The stall report writer for real (src/hang_report.cpp with the real hooks.cpp, the real MinHook and the real crumb
+# trail; the logger is a stub): a report and a dump written from inside this process with parked and suspended threads,
+# then the watchdog thread's own forced-test report and its log-level delay, and the earlier-report warning.
+# `test_hang_report --keep <folder>` leaves the files (the dump opens with cdb). Builds for both architectures.
+add_executable(test_hang_report
+    test_hang_report.cpp
+    ${CMAKE_SOURCE_DIR}/src/hang_report.cpp
+    ${CMAKE_SOURCE_DIR}/src/hang_report_policy.cpp
+    ${CMAKE_SOURCE_DIR}/src/startup_breadcrumb.cpp
+    ${CMAKE_SOURCE_DIR}/src/hooks.cpp
+)
+set_target_properties(test_hang_report PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+target_include_directories(test_hang_report PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/deps/reshade/deps/minhook/include)
+target_compile_definitions(test_hang_report PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_link_libraries(test_hang_report PRIVATE minhook_static)
+if(MSVC)
+    set_property(TARGET test_hang_report PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(test_hang_report PRIVATE /W4 /utf-8 /permissive-)
+endif()
+
 # The pure rules of the native route's private vtable copy (src/vtable_copy.cpp): the copy extent on a synthetic
 # vtable, the forwarding records (immutable, the chain after a replacement), the verdict on a changed vptr,
 # the thread-local dedup record, the teardown rules. Builds for both architectures. The install, the detours and
@@ -930,6 +977,9 @@ add_test(NAME hook_installer_stress COMMAND test_hook_installer_stress)
 set_tests_properties(hook_installer_stress PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
 add_test(NAME vtable_copy COMMAND test_vtable_copy)
 add_test(NAME startup_breadcrumb COMMAND test_startup_breadcrumb)
+add_test(NAME hang_report_policy COMMAND test_hang_report_policy)
+add_test(NAME hang_report COMMAND test_hang_report)
+set_tests_properties(hang_report PROPERTIES TIMEOUT 300)
 add_test(NAME shutdown_lifecycle COMMAND test_shutdown_lifecycle)
 add_test(NAME swapchain_selection_policy COMMAND test_swapchain_selection_policy)
 add_test(NAME pacing_sleep COMMAND test_pacing_sleep)

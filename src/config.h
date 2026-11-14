@@ -155,6 +155,17 @@ struct Config {
     // engines cannot suspend (hooks.h). false runs every call on the thread that asks, as before. Read once at
     // initialisation, before the thread is created (restart required); 64- and 32-bit.
     bool hook_installer_thread = true;
+
+    // Stall report (hang_report.h): a watchdog writes relimiter_<exe>.hang.txt and .hang.dmp next to the log when the
+    // present events stop. Off by default; while it is off nothing of it runs (no thread, no log-level window, no marks
+    // on the hook paths). Read once at initialisation (restart required).
+    bool hang_report = false;
+    // false: the stall report is the text file only; dbghelp is never loaded and no dump is written (an in-process
+    // dump can block on a loader or heap lock that a stuck process holds). Developer override: the default is true.
+    bool hang_report_dump = true;
+    // Developer: forces one report this many seconds after the first completed present event, so the writer can be
+    // proven in a process that is not hung. 0 = off (default).
+    int hang_report_test_after_s = 0;
 };
 
 extern Config g_config;

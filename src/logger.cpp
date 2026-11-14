@@ -1,6 +1,7 @@
 #include "logger.h"
 #include "shutdown_admission.h"
 #include "startup_breadcrumb.h"
+#include "log_level_state.h"
 #include <reshade.hpp>
 #include <cstdio>
 #include <cstring>
@@ -8,7 +9,9 @@
 #include <atomic>
 
 static HANDLE s_hfile = INVALID_HANDLE_VALUE;
-static std::atomic<LogLevel> s_level{LogLevel::Info};
+// The requested level and a temporary floor of it in one atomic word (log_level_state.h): Log_Write's rejected path
+// is one load.
+static LogLevelState s_levels{static_cast<uint8_t>(LogLevel::Info)};
 // Lifecycle operations never run on logging producers or under loader lock.
 static std::mutex s_lifecycle_mutex;
 static std::mutex s_mutex;
@@ -29,6 +32,7 @@ static LARGE_INTEGER s_start_qpc;
 static double s_qpc_freq_inv = 0.0;
 static std::atomic<bool> s_init_phase{true};
 static char s_process_name[MAX_PATH] = "unknown";
+static char s_log_path[MAX_PATH] = "";
 
 // ── Buffered logging ──
 // Log messages are appended to a ring buffer. A background thread flushes
@@ -169,7 +173,7 @@ static bool InitLocked(HMODULE hModule, LogLevel level, BreadcrumbVerdict* previ
     std::lock_guard<std::mutex> file_lock(s_mutex);
     if (s_hfile != INVALID_HANDLE_VALUE) return false; // already initialized
 
-    s_level.store(level, std::memory_order_release);
+    s_levels.Reset(static_cast<uint8_t>(level));
     s_init_phase.store(true, std::memory_order_release);
 
     LARGE_INTEGER freq;
@@ -224,6 +228,8 @@ static bool InitLocked(HMODULE hModule, LogLevel level, BreadcrumbVerdict* previ
     return false;
 
 opened:
+    strncpy(s_log_path, path, MAX_PATH - 1);
+    s_log_path[MAX_PATH - 1] = '\0';
     {
         char header[512];
         int n = snprintf(header, sizeof(header),
@@ -281,7 +287,7 @@ bool Log_Shutdown() {
 }
 
 void Log_Write(LogLevel level, const char* fmt, ...) {
-    if (level > s_level.load(std::memory_order_acquire)) return;
+    if (static_cast<uint8_t>(level) > s_levels.Effective()) return;
     LogWriteGuard writer;
     if (!writer.IsAdmitted()) return;
 
@@ -319,8 +325,17 @@ void Log_Write(LogLevel level, const char* fmt, ...) {
 
 void Log_SetLevel(LogLevel level) {
     if (s_init_phase.load(std::memory_order_acquire) &&
-        level < s_level.load(std::memory_order_acquire)) return;
-    s_level.store(level, std::memory_order_release);
+        level < static_cast<LogLevel>(s_levels.Effective())) return;
+    // The request is stored whatever a temporary floor says; the floor only decides what is effective now.
+    s_levels.Request(static_cast<uint8_t>(level));
+}
+
+void Log_BeginLevelFloor(LogLevel level) {
+    s_levels.BeginFloor(static_cast<uint8_t>(level));
+}
+
+void Log_EndLevelFloor() {
+    s_levels.EndFloor();
 }
 
 LogLevel Log_ParseLevel(const char* str) {
@@ -344,4 +359,8 @@ void Log_EndInitPhase() {
 
 const char* Log_GetProcessName() {
     return s_process_name;
+}
+
+const char* Log_GetFilePath() {
+    return s_log_path;
 }

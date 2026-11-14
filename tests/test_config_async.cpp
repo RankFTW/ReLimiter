@@ -580,7 +580,7 @@ void TestQueueDefaultsMigration() {
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
-// developer_settings is read and saved; every developer key away from its default is counted (the 13 developer
+// developer_settings is read and saved; every developer key away from its default is counted (the 15 developer
 // fields), and Reset returns exactly those keys to the defaults and applies them, leaving the user's settings alone.
 void TestDeveloperSettingsReset() {
     const bool is64 = sizeof(void*) == 8;
@@ -589,10 +589,11 @@ void TestDeveloperSettingsReset() {
         {"control_file", "true"}, {"gpu_queue_probe", "false"}, {"gpu_queue_probe_source", "0"},
         {"unified_queue_margin_end", "0"}, {"pacing_test_mode", "driver_limiter"}, {"unified_hold_share", "0.1"},
         {"unified_queue_law", "false"}, {"unified_queue_rank", "3"}, {"unified_queue_need_frames", "6"},
-        {"unified_queue_upstream", "1"}, {"unified_queue_allow_us", "2500"}});
+        {"unified_queue_upstream", "1"}, {"unified_queue_allow_us", "2500"}, {"hang_report_dump", "false"},
+        {"hang_report_test_after_s", "30"}});
     CHECK(g_config.developer_settings);
     CHECK(Value(local_path, "FrameLimiter", "developer_settings") == "true");
-    CHECK(Config_DeveloperOverrides() == 13);
+    CHECK(Config_DeveloperOverrides() == 15);
     CHECK(PacingPipeline_TestMode() == PacingTestMode::DriverLimiter && !PacingPipeline_Unified());
     CheckPipelineMatchesConfig();
     Config_ResetDeveloperSettings();
@@ -639,6 +640,48 @@ void TestFlipMeteringOffKey() {
     CHECK(Config_DeveloperOverrides() == 1);
     Config_ResetDeveloperSettings();
     CHECK(!g_config.flip_metering_off);
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// Stall report keys: hang_report (a normal switch, off by default, not a developer override), hang_report_dump (on by
+// default) and the developer hang_report_test_after_s (0 = off): each loads, is saved at its default too, the last two
+// count as developer overrides and the developer reset returns them to their defaults. None is a live key.
+void TestHangReportKeys() {
+    Reset(false, false, {{"config_version", "4"}});
+    CHECK(!g_config.hang_report && g_config.hang_report_dump && g_config.hang_report_test_after_s == 0);
+    CHECK(Config_DeveloperOverrides() == 0);
+    CHECK(Value(local_path, "FrameLimiter", "hang_report") == "false");
+    CHECK(Value(local_path, "FrameLimiter", "hang_report_dump") == "true");
+    CHECK(Value(local_path, "FrameLimiter", "hang_report_test_after_s") == "0");
+    ReleaseStart();CHECK(OwnerShutdown());
+    Reset(false, false, {{"config_version", "4"}, {"hang_report", "true"}});
+    CHECK(g_config.hang_report && Config_DeveloperOverrides() == 0);
+    CHECK(Value(local_path, "FrameLimiter", "hang_report") == "true");
+    Config_ResetDeveloperSettings();
+    CHECK(g_config.hang_report);   // the switch is the user's, the developer reset leaves it
+    ReleaseStart();CHECK(OwnerShutdown());
+    Reset(false, false, {{"config_version", "4"}, {"hang_report_test_after_s", "30"}});
+    CHECK(g_config.hang_report_test_after_s == 30);
+    CHECK(Value(local_path, "FrameLimiter", "hang_report_test_after_s") == "30");
+    CHECK(Config_DeveloperOverrides() == 1);
+    Config_ResetDeveloperSettings();
+    CHECK(g_config.hang_report_test_after_s == 0 && Config_DeveloperOverrides() == 0);
+    ReleaseStart();CHECK(OwnerShutdown());
+    for (const char* value : {"-5", "100000"}) {
+        Reset(false, false, {{"config_version", "4"}, {"hang_report_test_after_s", value}});
+        CHECK(g_config.hang_report_test_after_s == (value[0] == '-' ? 0 : 3600));
+        ReleaseStart();CHECK(OwnerShutdown());
+    }
+    Reset(false, false, {{"config_version", "4"}, {"hang_report_dump", "false"}});
+    CHECK(!g_config.hang_report_dump);
+    CHECK(Value(local_path, "FrameLimiter", "hang_report_dump") == "false");
+    CHECK(Config_DeveloperOverrides() == 1);
+    Config_ResetDeveloperSettings();
+    CHECK(g_config.hang_report_dump && Config_DeveloperOverrides() == 0);
+    // Launch-only keys: none is a live key.
+    char error[128] = {};
+    for (const char* key : {"hang_report", "hang_report_dump", "hang_report_test_after_s"})
+        CHECK(!Config_SetLiveKey(key, "1", error, sizeof(error)));
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
@@ -2017,7 +2060,7 @@ const OsdToggle osd_toggles[] = {
 constexpr size_t osd_toggle_count = sizeof(osd_toggles) / sizeof(osd_toggles[0]);
 static_assert(osd_toggle_count == 28, "the contract lists 28 OSD element toggles");
 
-// The 52 keys of the [FrameLimiter] section that are not OSD element toggles (80 with the 28 toggles), each with a value
+// The 55 keys of the [FrameLimiter] section that are not OSD element toggles (83 with the 28 toggles), each with a value
 // away from its default as an earlier launch left it, and the value the clean rewrite saves back. The keybind keys are
 // written to the local INI only while the presets are not shared. Derived by running the writer, then pinned. Which keys
 // exist is not decided here: ExpectedIniKeys reads the config_key lines of the shared fixture.
@@ -2048,9 +2091,10 @@ const IniKey non_default_ini[] = {
     {"csv_enabled", "true", "false"}, // telemetry needs an explicit activation each launch
     {"native_pcl_enabled", "true", "true"}, {"gpu_present_gate_probes", "false", "false"},
     {"dlss_info_hooks", "false", "false"}, {"hook_installer_thread", "false", "false"},
+    {"hang_report", "true", "true"}, {"hang_report_dump", "false", "false"}, {"hang_report_test_after_s", "30", "30"},
     {"streamline_compat", "force_false", "force_false"}};
 constexpr size_t non_default_ini_count = sizeof(non_default_ini) / sizeof(non_default_ini[0]);
-static_assert(non_default_ini_count == 52, "the contract lists 52 further keys");
+static_assert(non_default_ini_count == 55, "the contract lists 55 further keys");
 bool IsKeybindKey(const std::string& key) {
     return key == "osd_preset_prev_key" || key == "osd_preset_next_key" || key == "blackout_key";
 }
@@ -2262,14 +2306,14 @@ void TestOnlyTheListedKeysAreLive() {
         CHECK(std::strstr(unknown, "not a live key") != nullptr);
         ++refused;
     }
-    CHECK(refused == 80 - 15);
+    CHECK(refused == 83 - 15);
     SaveConfig();
     CHECK(SectionFields(local_path, "FrameLimiter") == before); // nothing a refused key named changed
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
 // The developer fields Config_DeveloperOverrides counts and Config_ResetDeveloperSettings returns to their defaults are
-// these 13 (a name and the way to move the field away from its default and test that it is back); nothing else counts, and
+// these 15 (a name and the way to move the field away from its default and test that it is back); nothing else counts, and
 // the user's settings stay through the reset.
 struct DeveloperField {
     const char* name;
@@ -2290,8 +2334,10 @@ const DeveloperField developer_fields[] = {
     {"unified_queue_rank", [] { g_config.unified_queue_rank = 3; }, [] { return g_config.unified_queue_rank == 2; }},
     {"unified_queue_need_frames", [] { g_config.unified_queue_need_frames = 6; }, [] { return g_config.unified_queue_need_frames == 4; }},
     {"unified_queue_upstream", [] { g_config.unified_queue_upstream = 1; }, [] { return g_config.unified_queue_upstream == 0; }},
-    {"unified_queue_allow_us", [] { g_config.unified_queue_allow_us = 2500; }, [] { return g_config.unified_queue_allow_us == 4000; }}};
-static_assert(sizeof(developer_fields) / sizeof(developer_fields[0]) == 13, "the contract lists 13 developer fields");
+    {"unified_queue_allow_us", [] { g_config.unified_queue_allow_us = 2500; }, [] { return g_config.unified_queue_allow_us == 4000; }},
+    {"hang_report_dump", [] { g_config.hang_report_dump = false; }, [] { return g_config.hang_report_dump; }},
+    {"hang_report_test_after_s", [] { g_config.hang_report_test_after_s = 30; }, [] { return g_config.hang_report_test_after_s == 0; }}};
+static_assert(sizeof(developer_fields) / sizeof(developer_fields[0]) == 15, "the contract lists 15 developer fields");
 void TestDeveloperFieldsAreCountedAndResetOneByOne() {
     Reset();
     CHECK(Config_DeveloperOverrides() == 0);
@@ -2517,6 +2563,7 @@ int main() {
     TestGpuQueueProbeSourceKey();
     TestUnifiedQueueMarginEndKey();
     TestFlipMeteringOffKey();
+    TestHangReportKeys();
     TestLiveKeySetter();
     TestPacingPreference();
     TestPacingTestMode();

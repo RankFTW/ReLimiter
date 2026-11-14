@@ -479,6 +479,8 @@ void Log_Write(LogLevel level, const char*, ...) {
     if (level == LogLevel::Error) ++g_errors;
 }
 
+void Breadcrumb_Trail(TrailKind, uint8_t, uint32_t, uint16_t) noexcept {}
+
 void Breadcrumb_Mark(StartupStage stage, uint8_t site) noexcept {
     g_marks.emplace_back(stage, site);
 }

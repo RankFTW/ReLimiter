@@ -16,6 +16,36 @@ namespace
     std::array<HMODULE, 256> s_target_module_pins{};
     SRWLOCK s_target_module_pin_lock = SRWLOCK_INIT;
 
+    // Who holds the install lock and who waits for it, for the stall report (lock_owner_diag.h). A try-acquire
+    // that succeeds publishes only the holder; a thread that must block publishes itself as the waiter first.
+    LockOwnerDiag s_install_diag;
+
+    // The report's clock: 0 (no read) while the stall report is off.
+    uint64_t NowQpc() noexcept
+    {
+        if (!HangReport_Active()) return 0;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        return static_cast<uint64_t>(now.QuadPart);
+    }
+
+    void AcquireInstallLock(InstallLockUser what) noexcept
+    {
+        const uint32_t thread = GetCurrentThreadId();
+        const uint8_t user = static_cast<uint8_t>(what);
+        if (!TryAcquireSRWLockExclusive(&s_hook_install_lock)) {
+            s_install_diag.NoteWaiting(thread, user, NowQpc());
+            AcquireSRWLockExclusive(&s_hook_install_lock);
+        }
+        s_install_diag.NoteHoldingAfterWait(thread, user, NowQpc());
+    }
+
+    void ReleaseInstallLock() noexcept
+    {
+        s_install_diag.NoteReleased();
+        ReleaseSRWLockExclusive(&s_hook_install_lock);
+    }
+
     // What this file knows of a target's enable. Created: the hook exists and is not enabled (or not known to be);
     // Queued: MH_QueueEnableHook succeeded inside a batch that has not applied yet; Enabled: the enable succeeded.
     // Only a collecting batch leaves a target Queued, and every apply settles each Queued target to Enabled or
@@ -120,6 +150,14 @@ namespace
         InstallerOp op = InstallerOp::Exit;
         void* target = nullptr;
         MH_STATUS status = MH_OK;
+        // What the stall report reads (Hooks_DiagSnapshot): the thread's id, and the job in the slot with its
+        // requester and the times of the post, the take and the finish.
+        std::atomic<uint32_t> thread_id{0};
+        std::atomic<uint32_t> requester{0};
+        std::atomic<uint8_t> diag_op{0};
+        std::atomic<uint64_t> posted_qpc{0};
+        std::atomic<uint64_t> taken_qpc{0};
+        std::atomic<uint64_t> done_qpc{0};
     };
     std::atomic<InstallerContext*> s_installer{nullptr};
     SRWLOCK s_installer_job_lock = SRWLOCK_INIT;
@@ -170,6 +208,7 @@ namespace
     DWORD WINAPI InstallerThreadMain(void* parameter)
     {
         InstallerContext* const ctx = static_cast<InstallerContext*>(parameter);
+        ctx->thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
         const bool is_protected = InstallerIsProtected();
         HookInstallerState expected = HookInstallerState::Starting;
         // Ready only after the check. A Stop that came first (state Stopped) ends the thread without a job.
@@ -183,7 +222,9 @@ namespace
             if (!ctx->job.compare_exchange_strong(posted, kJobTaken, std::memory_order_acq_rel)) continue;
             const InstallerOp op = ctx->op;
             if (op == InstallerOp::Exit) return 0;
+            ctx->taken_qpc.store(NowQpc(), std::memory_order_relaxed);
             ctx->status = RunMinHook(op, ctx->target);
+            ctx->done_qpc.store(NowQpc(), std::memory_order_relaxed);
             ctx->job.store(kJobDone, std::memory_order_release);
             SetEvent(ctx->done_event);
         }
@@ -200,7 +241,7 @@ namespace
     // One freezing MinHook call: on the installer thread when it serves and the caller may wait for it, on the
     // calling thread otherwise. The caller holds the install lock (or the teardown's own hold); the job lock
     // keeps the single slot to one job. Waits for the job's completion or the thread's end, no timeout.
-    MH_STATUS RunFreezing(InstallerOp op, void* target) noexcept
+    MH_STATUS RunFreezingCore(InstallerOp op, void* target, bool* ran_on_installer) noexcept
     {
         if (s_minhook_unusable.load(std::memory_order_acquire)) return MH_ERROR_DISABLED;
         InstallerContext* const ctx = s_installer.load(std::memory_order_acquire);
@@ -220,6 +261,11 @@ namespace
         }
         ctx->op = op;
         ctx->target = target;
+        ctx->diag_op.store(static_cast<uint8_t>(op), std::memory_order_relaxed);
+        ctx->requester.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        ctx->taken_qpc.store(0, std::memory_order_relaxed);
+        ctx->done_qpc.store(0, std::memory_order_relaxed);
+        ctx->posted_qpc.store(NowQpc(), std::memory_order_relaxed);
         ctx->job.store(kJobPosted, std::memory_order_release);
         SetEvent(ctx->job_event);
         const HANDLE waits[2] = { ctx->done_event, ctx->thread };
@@ -227,6 +273,7 @@ namespace
         MH_STATUS status = MH_ERROR_DISABLED;
         if (woke == WAIT_OBJECT_0) {
             status = ctx->status;
+            *ran_on_installer = true;
             ctx->job.store(kJobIdle, std::memory_order_release);
         } else {
             // The thread ended (the done event is the lower index: a finished job is never read as a death).
@@ -242,6 +289,23 @@ namespace
             }
         }
         ReleaseSRWLockExclusive(&s_installer_job_lock);
+        return status;
+    }
+
+    // RunFreezingCore with the trail around it (startup_breadcrumb.h): the entry says whether the call goes to the
+    // installer thread, the leave says whether it ran there and how MinHook answered. A freeze that never comes back
+    // shows as an enter without a leave on the requester's thread.
+    MH_STATUS RunFreezing(InstallerOp op, void* target) noexcept
+    {
+        InstallerContext* const planned = s_installer.load(std::memory_order_acquire);
+        const bool to_installer = planned && s_inline_only_depth == 0 &&
+            planned->state.load(std::memory_order_acquire) == HookInstallerState::Ready &&
+            !s_minhook_unusable.load(std::memory_order_acquire);
+        Breadcrumb_Trail(TrailKind::FreezeEnter, static_cast<uint8_t>(op), 0, to_installer ? 1 : 0);
+        bool ran_on_installer = false;
+        const MH_STATUS status = RunFreezingCore(op, target, &ran_on_installer);
+        Breadcrumb_Trail(TrailKind::FreezeLeave, static_cast<uint8_t>(op),
+                         static_cast<uint32_t>(static_cast<int32_t>(status)), ran_on_installer ? 1 : 0);
         return status;
     }
 
@@ -336,16 +400,16 @@ HookInstallGuard::HookInstallGuard() noexcept
     // Some subsystem installers hold admission around several InstallHook
     // calls. Nest only on this thread; competing transactions are exclusive.
     if (s_install_depth++ == 0)
-        AcquireSRWLockExclusive(&s_hook_install_lock);
+        AcquireInstallLock(InstallLockUser::InstallGuard);
     admitted_ = s_install_admission.load(std::memory_order_acquire);
     if (!admitted_ && --s_install_depth == 0)
-        ReleaseSRWLockExclusive(&s_hook_install_lock);
+        ReleaseInstallLock();
 }
 
 HookInstallGuard::~HookInstallGuard()
 {
     if (admitted_ && --s_install_depth == 0)
-        ReleaseSRWLockExclusive(&s_hook_install_lock);
+        ReleaseInstallLock();
 }
 
 HookBatch::HookBatch(HookBatchSite site) noexcept
@@ -427,22 +491,22 @@ void Hooks_ForgetTarget(void* target) noexcept
     // Also during shutdown (no admission needed): the caller removes hooks while the installers are closed out.
     // On an installing thread the lock is already held; otherwise it is taken for the update.
     const bool held = s_install_depth > 0;
-    if (!held) AcquireSRWLockExclusive(&s_hook_install_lock);
+    if (!held) AcquireInstallLock(InstallLockUser::ForgetTarget);
     for (TrackedTarget& entry : s_tracked_targets) {
         if (entry.target.load(std::memory_order_relaxed) != target) continue;
         entry.state.store(kCreated, std::memory_order_relaxed);
         entry.target.store(nullptr, std::memory_order_release);
     }
-    if (!held) ReleaseSRWLockExclusive(&s_hook_install_lock);
+    if (!held) ReleaseInstallLock();
 }
 
 void Hooks_ResetInstallAdmission() noexcept
 {
-    AcquireSRWLockExclusive(&s_hook_install_lock);
+    AcquireInstallLock(InstallLockUser::ResetAdmission);
     // A dead installer thread left MinHook unusable: admission stays closed for the rest of the process.
     if (!s_minhook_unusable.load(std::memory_order_acquire))
         s_install_admission.store(true, std::memory_order_release);
-    ReleaseSRWLockExclusive(&s_hook_install_lock);
+    ReleaseInstallLock();
 }
 
 void Hooks_BeginShutdown() noexcept
@@ -450,8 +514,8 @@ void Hooks_BeginShutdown() noexcept
     s_install_admission.store(false, std::memory_order_release);
     // The exclusive round trip is the installer barrier: once it returns, no
     // pre-shutdown installer can still create or enable a hook.
-    AcquireSRWLockExclusive(&s_hook_install_lock);
-    ReleaseSRWLockExclusive(&s_hook_install_lock);
+    AcquireInstallLock(InstallLockUser::ShutdownBarrier);
+    ReleaseInstallLock();
 }
 
 bool Hooks_PinTargetModule(void* target) noexcept
@@ -559,7 +623,7 @@ MH_STATUS EnableAllHooks()
 MH_STATUS DisableAllHooks()
 {
     Hooks_BeginShutdown();
-    AcquireSRWLockExclusive(&s_hook_install_lock);
+    AcquireInstallLock(InstallLockUser::TeardownDisable);
     const MH_STATUS status = RunFreezing(InstallerOp::DisableAll, nullptr);
     // A failed disable leaves the states as they were (an enabled hook may remain, so none is reported disabled).
     if (status == MH_OK) {
@@ -567,14 +631,14 @@ MH_STATUS DisableAllHooks()
             state.store(kCreated, std::memory_order_release);
         });
     }
-    ReleaseSRWLockExclusive(&s_hook_install_lock);
+    ReleaseInstallLock();
     return status;
 }
 
 MH_STATUS DisableAllHooksExcept(void* const* keep_enabled, size_t count)
 {
     Hooks_BeginShutdown();
-    AcquireSRWLockExclusive(&s_hook_install_lock);
+    AcquireInstallLock(InstallLockUser::TeardownDisable);
     // MinHook's queue is the only way to leave a hook out of a disable-all: every hook is queued for
     // disabling, the kept targets are queued enabled again (they already are: no write happens for them),
     // and one apply performs the rest under a single thread freeze, as MH_DisableHook(MH_ALL_HOOKS) does.
@@ -593,7 +657,7 @@ MH_STATUS DisableAllHooksExcept(void* const* keep_enabled, size_t count)
             state.store(kept ? kEnabled : kCreated, std::memory_order_release);
         });
     }
-    ReleaseSRWLockExclusive(&s_hook_install_lock);
+    ReleaseInstallLock();
     return status;
 }
 
@@ -608,26 +672,17 @@ MH_STATUS Hooks_DisableHook(void* target) noexcept
     return status;
 }
 
-bool Hooks_StartInstallerThread(bool enabled) noexcept
+bool Hooks_BuildProtectedThreadSecurity(HookThreadSecurity* out) noexcept
 {
-    if (!enabled || s_minhook_unusable.load(std::memory_order_acquire)) return false;
-    if (InstallerContext* previous = s_installer.load(std::memory_order_acquire)) {
-        const HookInstallerState state = previous->state.load(std::memory_order_acquire);
-        if (state == HookInstallerState::Starting || state == HookInstallerState::Ready) return true;
-        if (state == HookInstallerState::Unprotected) return false;  // a stop and a new start try again
-    }
-
-    // The descriptor at creation, so there is no interval in which another engine can open the thread with
-    // suspend rights and keep that handle: the process token's default DACL behind one deny ACE for Everyone
-    // (THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT). Nothing else is granted or removed.
+    // The process token's default DACL behind one deny ACE for Everyone (THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+    // THREAD_SET_CONTEXT). Nothing else is granted or removed.
     constexpr DWORD kDeniedRights = 0x1A;
     alignas(8) BYTE default_dacl_buffer[2048];
-    alignas(8) BYTE acl_buffer[2048];
     BYTE everyone[SECURITY_MAX_SID_SIZE];
     DWORD everyone_size = sizeof(everyone);
-    ACL* const acl = reinterpret_cast<ACL*>(acl_buffer);
+    ACL* const acl = reinterpret_cast<ACL*>(out->acl);
     bool ok = CreateWellKnownSid(WinWorldSid, nullptr, everyone, &everyone_size) &&
-        InitializeAcl(acl, sizeof(acl_buffer), ACL_REVISION) &&
+        InitializeAcl(acl, sizeof(out->acl), ACL_REVISION) &&
         AddAccessDeniedAce(acl, ACL_REVISION, kDeniedRights, everyone);
     HANDLE token = nullptr;
     ok = ok && OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token);
@@ -652,17 +707,74 @@ bool Hooks_StartInstallerThread(bool enabled) noexcept
         }
     }
     if (token) CloseHandle(token);
-    SECURITY_DESCRIPTOR descriptor;
-    ok = ok && InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) &&
-        SetSecurityDescriptorDacl(&descriptor, TRUE, acl, FALSE);
-    if (!ok) {
+    ok = ok && InitializeSecurityDescriptor(&out->descriptor, SECURITY_DESCRIPTOR_REVISION) &&
+        SetSecurityDescriptorDacl(&out->descriptor, TRUE, acl, FALSE);
+    if (!ok) return false;
+    out->attributes = SECURITY_ATTRIBUTES{};
+    out->attributes.nLength = sizeof(out->attributes);
+    out->attributes.lpSecurityDescriptor = &out->descriptor;
+    return true;
+}
+
+void Hooks_DiagSnapshot(HookDiagSnapshot* out) noexcept
+{
+    *out = HookDiagSnapshot{};
+    out->install_lock = s_install_diag.Read();
+    out->minhook_unusable = s_minhook_unusable.load(std::memory_order_acquire);
+    InstallerContext* const ctx = s_installer.load(std::memory_order_acquire);
+    if (!ctx) return;
+    out->installer_state = ctx->state.load(std::memory_order_acquire);
+    out->installer_thread_id = ctx->thread_id.load(std::memory_order_relaxed);
+    out->job_state = static_cast<uint8_t>(ctx->job.load(std::memory_order_acquire));
+    out->job_op = ctx->diag_op.load(std::memory_order_relaxed);
+    out->job_requester_thread = ctx->requester.load(std::memory_order_relaxed);
+    out->job_posted_qpc = ctx->posted_qpc.load(std::memory_order_relaxed);
+    out->job_taken_qpc = ctx->taken_qpc.load(std::memory_order_relaxed);
+    out->job_done_qpc = ctx->done_qpc.load(std::memory_order_relaxed);
+}
+
+const char* Hooks_DiagOpName(uint8_t op) noexcept
+{
+    switch (static_cast<InstallerOp>(op)) {
+    case InstallerOp::Enable: return "Enable";
+    case InstallerOp::Disable: return "Disable";
+    case InstallerOp::EnableAll: return "EnableAll";
+    case InstallerOp::DisableAll: return "DisableAll";
+    case InstallerOp::ApplyQueued: return "ApplyQueued";
+    case InstallerOp::Exit: return "Exit";
+    }
+    return "unknown";
+}
+
+const char* Hooks_DiagJobStateName(uint8_t state) noexcept
+{
+    switch (state) {
+    case kJobIdle: return "idle";
+    case kJobPosted: return "posted";
+    case kJobTaken: return "taken";
+    case kJobDone: return "done";
+    }
+    return "unknown";
+}
+
+bool Hooks_StartInstallerThread(bool enabled) noexcept
+{
+    if (!enabled || s_minhook_unusable.load(std::memory_order_acquire)) return false;
+    if (InstallerContext* previous = s_installer.load(std::memory_order_acquire)) {
+        const HookInstallerState state = previous->state.load(std::memory_order_acquire);
+        if (state == HookInstallerState::Starting || state == HookInstallerState::Ready) return true;
+        if (state == HookInstallerState::Unprotected) return false;  // a stop and a new start try again
+    }
+
+    // The descriptor at creation, so there is no interval in which another engine can open the thread with
+    // suspend rights and keep that handle (Hooks_BuildProtectedThreadSecurity).
+    HookThreadSecurity security;
+    if (!Hooks_BuildProtectedThreadSecurity(&security)) {
         LOG_WARN("Hooks: the installer thread's security descriptor could not be built (error %lu); freezing "
                  "calls run on the calling thread", GetLastError());
         return false;
     }
-    SECURITY_ATTRIBUTES attributes{};
-    attributes.nLength = sizeof(attributes);
-    attributes.lpSecurityDescriptor = &descriptor;
+    SECURITY_ATTRIBUTES& attributes = security.attributes;
 
     InstallerContext* const ctx = new (std::nothrow) InstallerContext;
     if (!ctx) return false;

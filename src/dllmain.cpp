@@ -36,6 +36,7 @@
 #include "config.h"
 #include "logger.h"
 #include "startup_breadcrumb.h"
+#include "hang_report.h"
 #include "csv_writer.h"
 #include "pacing_telemetry.h"
 #include "swapchain_manager.h"
@@ -130,9 +131,45 @@ static void TraceSwapchainLifecycle(const char* stage, reshade::api::device_api 
              SwapMgr_GetNativeHandle(), resize, window);
 }
 
+// The trail of a lifecycle callback (startup_breadcrumb.h): the enter before its body and the leave on every way out
+// (an enter without a leave is a thread inside the callback). The native pointer's low 32 bits tell two devices or
+// swapchains apart.
+static uint8_t TrailApiOf(reshade::api::device_api api) noexcept {
+    switch (api) {
+    case reshade::api::device_api::d3d9: return static_cast<uint8_t>(TrailApi::D3D9);
+    case reshade::api::device_api::d3d10: return static_cast<uint8_t>(TrailApi::D3D10);
+    case reshade::api::device_api::d3d11: return static_cast<uint8_t>(TrailApi::D3D11);
+    case reshade::api::device_api::d3d12: return static_cast<uint8_t>(TrailApi::D3D12);
+    case reshade::api::device_api::opengl: return static_cast<uint8_t>(TrailApi::OpenGL);
+    case reshade::api::device_api::vulkan: return static_cast<uint8_t>(TrailApi::Vulkan);
+    }
+    return static_cast<uint8_t>(TrailApi::Unknown);
+}
+struct LifecycleTrail {
+    LifecycleTrail(bool active, TrailKind enter, TrailKind leave, uint8_t api, uint64_t native, uint16_t aux = 0) noexcept
+        : active_(active), leave_(leave), api_(api), native_(static_cast<uint32_t>(native)), aux_(aux) {
+        if (active_) Breadcrumb_Trail(enter, api_, native_, aux_);
+    }
+    LifecycleTrail(TrailKind enter, TrailKind leave, uint8_t api, uint64_t native, uint16_t aux = 0) noexcept
+        : LifecycleTrail(true, enter, leave, api, native, aux) {}
+    ~LifecycleTrail() {
+        if (active_) Breadcrumb_Trail(leave_, api_, native_, aux_);
+    }
+    LifecycleTrail(const LifecycleTrail&) = delete;
+    LifecycleTrail& operator=(const LifecycleTrail&) = delete;
+private:
+    bool active_;
+    TrailKind leave_;
+    uint8_t api_;
+    uint32_t native_;
+    uint16_t aux_;
+};
+
 static void on_init_device(reshade::api::device* device) {
     RuntimeCallbackGuard callback;
     if (callback.IsStopping()) return;
+    LifecycleTrail trail(TrailKind::InitDeviceEnter, TrailKind::InitDeviceLeave,
+        device ? TrailApiOf(device->get_api()) : 0, device ? device->get_native() : 0);
     try {
         SwapMgr_OnInitDevice(device);
         if (device && device->get_api() == reshade::api::device_api::d3d12)
@@ -146,6 +183,8 @@ static void on_init_device(reshade::api::device* device) {
 static void on_destroy_device(reshade::api::device* device) {
     RuntimeCallbackGuard callback;
     if (callback.IsStopping()) return;
+    LifecycleTrail trail(TrailKind::DestroyDeviceEnter, TrailKind::DestroyDeviceLeave,
+        device ? TrailApiOf(device->get_api()) : 0, device ? device->get_native() : 0);
     try {
     // This callback runs under ReShade's process-wide device lock (inside the Release of a device proxy). It makes no
     // call on any device proxy: every value it compares was stored earlier, or comes from get_native() through calls
@@ -168,6 +207,14 @@ static void on_destroy_device(reshade::api::device* device) {
 static void on_init_swapchain(reshade::api::swapchain* sc, bool resize) {
     RuntimeCallbackGuard callback;
     if (callback.IsStopping()) return;
+    if (HangReport_Active()) {
+        LARGE_INTEGER init_qpc;
+        QueryPerformanceCounter(&init_qpc);
+        HangProgress_SwapchainInit(static_cast<uint64_t>(init_qpc.QuadPart));
+    }
+    const bool init_has_device = sc && sc->get_device();
+    LifecycleTrail trail(TrailKind::InitSwapchainEnter, TrailKind::InitSwapchainLeave,
+        init_has_device ? TrailApiOf(sc->get_device()->get_api()) : 0, sc ? sc->get_native() : 0, resize ? 1 : 0);
     try {
     SwapMgr_OnInitSwapchain(sc, resize);
     if (sc && sc->get_device() && sc->get_device()->get_api() == reshade::api::device_api::d3d12) {
@@ -197,6 +244,9 @@ static void on_init_swapchain(reshade::api::swapchain* sc, bool resize) {
 static void on_destroy_swapchain(reshade::api::swapchain* sc, bool resize) {
     RuntimeCallbackGuard callback;
     if (callback.IsStopping()) return;
+    const bool destroy_has_device = sc && sc->get_device();
+    LifecycleTrail trail(TrailKind::DestroySwapchainEnter, TrailKind::DestroySwapchainLeave,
+        destroy_has_device ? TrailApiOf(sc->get_device()->get_api()) : 0, sc ? sc->get_native() : 0, resize ? 1 : 0);
     try {
         if (sc && sc->get_device() && sc->get_device()->get_api() == reshade::api::device_api::d3d12) {
             StreamlineDiscovery_RecordBoundary({StreamlineBoundaryStage::DestroySwapchain,
@@ -289,11 +339,13 @@ static void on_present_impl(reshade::api::command_queue* queue,
     // Init is provisional; only the selected presenter may recapture global
     // state or pace. The try-only guard also handles late load and subsequent
     // destroy/recreate lifetimes without a permanent late-init barrier.
+    HangProgress_Bump(g_hang_progress.present_entered);
     NativeGate_NoteEntry(NativeGateEntry::OnPresent);
     // Diagnostics (one relaxed load): who calls ReShade's Present, captured at the first present event after each tick.
     if (VSync_StackCaptureArmed()) VSync_NoteOnPresentStack(sc ? static_cast<uint64_t>(sc->get_native()) : 0);
     SwapchainPresentGuard presenter(sc);
     if (!presenter) return;
+    HangProgress_Bump(g_hang_progress.present_admitted);
     Breadcrumb_Mark(StartupStage::FirstPresentEvent);  // first-wins
 
     // MMCSS registration for the present thread (once)
@@ -420,10 +472,16 @@ static void on_present_impl(reshade::api::command_queue* queue,
     }
     // Start-up breadcrumb: a completed present of the selected swapchain (the 32nd marks Running).
     Breadcrumb_PresentCompleted();
+    if (HangReport_Active()) {
+        LARGE_INTEGER completed_qpc;
+        QueryPerformanceCounter(&completed_qpc);
+        HangProgress_PresentCompleted(static_cast<uint64_t>(completed_qpc.QuadPart));
+    }
 }
 
 static void on_finish_present(reshade::api::command_queue*, reshade::api::swapchain* sc) {
     RuntimeCallbackGuard callback;
+    HangProgress_Bump(g_hang_progress.finish_present);
     if (callback.IsStopping() || !sc) return;
     GpuReadiness_OnFinishPresent(sc);
     const uint64_t native = sc->get_native();
@@ -437,6 +495,10 @@ static void on_finish_present(reshade::api::command_queue*, reshade::api::swapch
 
 static void on_destroy_command_queue(reshade::api::command_queue* queue) {
     RuntimeCallbackGuard callback;
+    const bool queue_has_device = queue && queue->get_device();
+    LifecycleTrail trail(!callback.IsStopping(), TrailKind::DestroyQueueEnter, TrailKind::DestroyQueueLeave,
+        queue_has_device ? TrailApiOf(queue->get_device()->get_api()) : 0,
+        queue ? queue->get_native() : 0);
     if (!callback.IsStopping() && queue && queue->get_device() &&
         queue->get_device()->get_api() == reshade::api::device_api::d3d12) {
         StreamlineDiscovery_RecordBoundary({StreamlineBoundaryStage::DestroyQueue,
@@ -485,6 +547,11 @@ static void on_present(reshade::api::command_queue* queue,
     }
 }
 
+// The swap manager's window for the stall report's header (lock-free read).
+static void* HangReportWindow() {
+    return SwapMgr_GetHWND();
+}
+
 // ── Core initialization (always outside the loader lock) ──
 static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
     if (s_addon_initialised) return true;   // already done
@@ -527,6 +594,8 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
     LOG_INFO("ReShade addon registered (hModule=%p)", hModule);
 
     LoadConfig(hModule);
+    // The stall report's flag, once, before any hook or callback that could run one of its marks (hang_report_state.h).
+    HangReport_SetActive(g_config.hang_report);
     // Set desired state only. ETW starts lazily after the first valid present.
     NativePcl_SetEnabled(g_config.native_pcl_enabled);
     LOG_INFO("Config loaded: target_fps=%d", g_config.target_fps);
@@ -656,7 +725,21 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
 
     LOG_INFO("Initialization complete");
     Log_EndInitPhase();
-    Log_SetLevel(Log_ParseLevel(g_config.log_level.c_str()));
+    {
+        // The stall watchdog (hang_report.h) begins a diagnostic floor under the log level (at least info) that it ends
+        // 120 s after this line. The configured level is requested right here either way, so a level changed meanwhile
+        // (the overlay's logging switch) is never overwritten: when the floor ends the latest request is effective.
+        HangReportOptions hang;
+        hang.enabled = g_config.hang_report;
+        hang.dump_enabled = g_config.hang_report_dump;
+        hang.test_after_s = static_cast<uint32_t>(g_config.hang_report_test_after_s);
+        hang.log_path = Log_GetFilePath();
+        hang.process_name = Log_GetProcessName();
+        hang.selection_lock_source = &SwapMgr_SelectionLockSnapshot;
+        hang.window_source = &HangReportWindow;
+        HangReport_Start(hang);   // the floor first, so there is no moment below info
+        Log_SetLevel(Log_ParseLevel(g_config.log_level.c_str()));
+    }
     s_addon_initialised = true;
     Breadcrumb_Mark(StartupStage::InitEnded);
     return true;
@@ -704,6 +787,8 @@ static bool StopOwnedProducers() {
     if (s_display_poll_started)
         auxiliary_workers_stopped =
             StopDisplayPollThread() && auxiliary_workers_stopped;
+    // The stall watchdog (hang_report.h): stop event and a bounded join, with the other workers.
+    auxiliary_workers_stopped = HangReport_Stop() && auxiliary_workers_stopped;
     return auxiliary_workers_stopped;
 }
 

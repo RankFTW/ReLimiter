@@ -45,6 +45,7 @@ RuntimeCallbackGuard::~RuntimeCallbackGuard() {}
 HookInstallGuard::HookInstallGuard() noexcept { admitted_ = !stopping; }
 HookInstallGuard::~HookInstallGuard() {}
 bool Hooks_PinTargetModule(void*) noexcept { return pin_ok; }
+void Breadcrumb_Trail(TrailKind, uint8_t, uint32_t, uint16_t) noexcept {}  // the trail marks of streamline_queue_hooks.cpp
 void Log_Write(LogLevel, const char*, ...) {
     if (check_log_unlocked) {
         CHECK(TryAcquireSRWLockExclusive(&h::mutex));

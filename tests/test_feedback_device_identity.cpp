@@ -15,6 +15,7 @@ void FgInput_RecordMarker(uint64_t, uint32_t, uint32_t, int64_t) noexcept {}
 #include "hooks.h"
 #include "health.h"
 #include "logger.h"
+#include "startup_breadcrumb.h"
 #include "marker_log.h"
 #include "pcl_hooks.h"
 #include "cadence_grid.h"
@@ -3049,6 +3050,8 @@ uint64_t SwapMgr_PresentingDeviceIdentity(uint64_t* sequence) noexcept {
     return (s_test_presenting_sequence & 1u) == 0 ? reinterpret_cast<uint64_t>(s_test_presenting) : 0;
 }
 ActiveAPI SwapMgr_GetActiveAPI() { return s_test_api; } // default None: native calls bootstrap feedback
+// The trail (startup_breadcrumb.h): the Reflex Sleep and latency marker hooks mark their first call; nothing records it here.
+void Breadcrumb_Trail(TrailKind, uint8_t, uint32_t, uint16_t) noexcept {}
 void Log_Write(LogLevel, const char* fmt, ...) {
 #ifdef _WIN64
     if (fmt && std::strncmp(fmt, "NvAPI: SetFlipConfig", 20) == 0) ++s_flip_config_log_writes;
