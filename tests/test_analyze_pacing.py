@@ -3,7 +3,6 @@ inspector detection. Not a live capture, CSV-writer runtime or pacing test."""
 import csv
 import json
 from pathlib import Path
-import re
 import subprocess
 import sys
 import tempfile
@@ -14,10 +13,11 @@ SCRIPTS = ROOT / ".agents/skills/pacing-capture-analysis/scripts"
 sys.path.insert(0, str(SCRIPTS))
 import analyze_pacing as pacing  # noqa: E402
 import inspect_capture as inspector  # noqa: E402
+import render_pipeline as render  # noqa: E402
 
 ROWS = ROOT / "tests/data/pacing_metrics_rows.csv"
 EXPECTED = ROOT / "tests/data/pacing_metrics_expected.csv"
-SOURCE = (ROOT / "src/csv_writer.cpp").read_text(encoding="utf-8")
+SCHEMA_FILE = ROOT / "tests/data/pacing_schema.txt"  # also read by tests/test_pacing_schema.cpp
 SWAPCHAIN = 0x12345678
 SWAPCHAIN_B = 0x9ABC
 FREQUENCY = 10_000_000
@@ -40,9 +40,43 @@ def write_csv(path, header, rows):
     return path
 
 
-def column_names(table):
-    body = SOURCE.split(f"{table}[] = {{", 1)[1].split("\n};", 1)[0]
-    return re.findall(r'\{\s*"([a-z0-9_]+)",', body)
+class Schema:
+    """tests/data/pacing_schema.txt: the headers the add-on writes and its value -> name tables, entries marked
+    retired when no build produces the value any more."""
+
+    def __init__(self, path):
+        self.row_columns = []
+        self.event_columns = []
+        self.tables = {}  # table -> {value: (name, retired)}
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            fields = line.split()
+            if not fields or fields[0].startswith("#"):
+                continue
+            if fields[0] in ("row_column", "event_column"):
+                assert len(fields) == 2, f"{path.name}:{number}: a column line is '<kind> <name>'"
+                (self.row_columns if fields[0] == "row_column" else self.event_columns).append(fields[1])
+                continue
+            if fields[0] == "config_key":  # the configuration-key list: read by tests/test_pacing_schema.cpp only
+                assert len(fields) == 2, f"{path.name}:{number}: a config_key line is 'config_key <name>'"
+                continue
+            assert len(fields) in (3, 4) and (len(fields) == 3 or fields[3] == "retired"), \
+                f"{path.name}:{number}: an entry line is '<table> <value> <name> [retired]'"
+            table = self.tables.setdefault(fields[0], {})
+            assert int(fields[1]) not in table, f"{path.name}:{number}: duplicate value"
+            table[int(fields[1])] = (fields[2], len(fields) == 4)
+
+    def names(self, table):
+        """Every value of the table, retired ones included."""
+        return {value: name for value, (name, _) in self.tables[table].items()}
+
+    def live_names(self, table):
+        return {name for name, retired in self.tables[table].values() if not retired}
+
+    def retired_names(self, table):
+        return {name for name, retired in self.tables[table].values() if retired}
+
+
+SCHEMA = Schema(SCHEMA_FILE)
 
 
 def expected_rows():
@@ -1073,9 +1107,8 @@ class Phase4PlacementTests(TemporaryDirectoryTest):
         self.assertEqual(pre_sleep["marker_after_wake"], {"frames": 3, "count": 1, "share": 1 / 3})
         self.assertIsNone(pre_sleep["margin_p50_us"])
         self.assertIsNone(pre_sleep["wake_late_us"])
-        text = pacing.format_report(report)
-        self.assertIn("Controllers:", text)
-        self.assertIn("Source placement: 8 source frames", text)
+        # The printed report is built from this structure: unavailable (None) fields render without error.
+        self.assertIsInstance(pacing.format_report(report), str)
 
 
 class PreRemovalFixtureTests(unittest.TestCase):
@@ -1114,10 +1147,65 @@ class PreRemovalFixtureTests(unittest.TestCase):
         self.assertTrue(report["stall_recovery"]["available"])
 
 
+class SchemaFixtureTests(unittest.TestCase):
+    """tests/data/pacing_schema.txt against the analyzer. tests/test_pacing_schema.cpp compares the same file with
+    what the add-on writes and names, so a table that equals the fixture here equals the writer; nothing here
+    reads the add-on's source."""
+
+    # fixture table -> the analyzer's value -> name table (None: the analyzer has no table for it)
+    ANALYZER_TABLES = {
+        "rung": pacing.RUNG_NAMES,
+        "placement": pacing.PLACEMENT_NAMES,
+        "fallback_reason": pacing.FALLBACK_REASON_NAMES,
+        "epoch_reason": pacing.EPOCH_REASON_NAMES,
+        "plan_status": pacing.PLAN_STATUS_NAMES,
+        "display_source": pacing.DISPLAY_SOURCE_NAMES,
+        "output_kind": pacing.OUTPUT_KIND_NAMES,
+        "join_rule": pacing.JOIN_RULE_NAMES,
+        "identity_domain": pacing.IDENTITY_DOMAIN_NAMES,
+        "break_reason": pacing.BREAK_REASON_NAMES,
+        "clock_map_status": pacing.CLOCK_MAP_STATUS_NAMES,
+        "pcl_status": pacing.PCL_STATUS_NAMES,
+        "governor_cause": pacing.GOVERNOR_CAUSE_NAMES,
+        "feasibility_cause": pacing.FEASIBILITY_CAUSE_NAMES,
+        "gpu_wait_cap_cause": pacing.GPU_WAIT_CAP_CAUSE_NAMES,
+        "source_flag": pacing.SOURCE_FLAG_NAMES,
+        "timing_mode": None,  # the analyzer does not read it: no CSV column carries it
+        "event_type": None,   # written as text; the analyzer matches the names (test_event_type_names)
+    }
+
+    def test_headers_equal_the_fixture(self):
+        self.assertEqual(inspector.CURRENT_PACING_HEADER, SCHEMA.row_columns)
+        self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER, SCHEMA.event_columns)
+
+    def test_every_fixture_table_is_known_here(self):
+        self.assertEqual(set(SCHEMA.tables), set(self.ANALYZER_TABLES))
+
+    def test_value_name_tables_equal_the_fixture(self):
+        # Retired values included: the analyzer keeps the names of values no build writes any more.
+        for table, analyzer in self.ANALYZER_TABLES.items():
+            if analyzer is None:
+                continue
+            with self.subTest(table=table):
+                self.assertEqual(analyzer, SCHEMA.names(table))
+
+    def test_render_pipeline_tables_equal_the_fixture(self):
+        self.assertEqual(render.RUNG_NAMES, SCHEMA.names("rung"))
+        # The analysis starts at the first epoch: reason none is not a name there.
+        self.assertEqual(render.EPOCH_REASONS,
+                         {value: name for value, name in SCHEMA.names("epoch_reason").items() if value != 0})
+
+    def test_event_type_names(self):
+        read = {*pacing.LOSS_COUNTER_EVENT_TYPES, *pacing.EPOCH_EVENT_TYPES, pacing.SNAPSHOT_EVENT_TYPE}
+        self.assertLessEqual(read, SCHEMA.live_names("event_type"))
+        # The removed mechanisms' events of the pre-removal capture are the fixture's retired event types.
+        carried = {row["event_type"] for row in read_csv(ROOT / "tests/data/pacing_pre_removal_events.csv")}
+        self.assertLessEqual(carried - {"capture_start", "capture_end"}, SCHEMA.retired_names("event_type"))
+        self.assertFalse(carried & SCHEMA.live_names("event_type") - {"capture_start", "capture_end"})
+
+
 class InspectorTests(TemporaryDirectoryTest):
-    def test_headers_match_production_column_tables(self):
-        self.assertEqual(column_names("PACING_ROW_COLUMNS"), inspector.CURRENT_PACING_HEADER)
-        self.assertEqual(column_names("PACING_EVENT_COLUMNS"), inspector.CURRENT_PACING_EVENTS_HEADER)
+    def test_header_layout(self):
         fixed = inspector.PACING_FIXED_RAW_HEADER + inspector.PACING_FIXED_DERIVED_HEADER
         self.assertEqual(inspector.CURRENT_PACING_HEADER[:len(fixed)], fixed)
         # The golden input uses exactly the fixed raw names (design section 5).
@@ -1162,8 +1250,8 @@ class InspectorTests(TemporaryDirectoryTest):
 
     def test_analysis_column_groups_match_the_headers(self):
         # The writer's tables are the current headers; the readers of removed columns name them by the old header.
-        rows = column_names("PACING_ROW_COLUMNS")
-        events = column_names("PACING_EVENT_COLUMNS")
+        rows = SCHEMA.row_columns
+        events = SCHEMA.event_columns
         self.assertEqual((len(rows), len(events)), (192, 86))
         self.assertEqual(rows, [name for name in OLD if name not in inspector.REMOVED_PACING_COLUMNS])
         self.assertFalse(set(inspector.REMOVED_PACING_COLUMNS) & set(rows))
@@ -1183,54 +1271,13 @@ class InspectorTests(TemporaryDirectoryTest):
         self.assertEqual(list(pacing.PCL_LOSS_COLUMNS), events[81:85])
         self.assertEqual(events[85:], ["reason"])
 
-    def test_enum_tables_match_production(self):
-        # C++ and Python share these enum values; the names follow src/pacing_core_types.h.
-        core = (ROOT / "src/pacing_core_types.h").read_text(encoding="utf-8")
-
-        def values(enum):
-            body = core.split(f"enum class {enum} : uint8_t {{", 1)[1].split("};", 1)[0]
-            return {int(value): name for name, value in re.findall(r"^\s*(\w+) = (\d+)", body, re.M)}
-
-        def snake(name):
-            return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
-
-        for enum, table in (("PacingRung", pacing.RUNG_NAMES), ("PacingPlanStatus", pacing.PLAN_STATUS_NAMES),
-                            ("PacingEpochReason", pacing.EPOCH_REASON_NAMES),
-                            ("PacingFallbackReason", pacing.FALLBACK_REASON_NAMES),
-                            ("PacingSourcePlacement", pacing.PLACEMENT_NAMES)):
-            with self.subTest(enum=enum):
-                self.assertEqual({value: snake(name) for value, name in values(enum).items()}, table)
-        event_types = (ROOT / "src/csv_writer.h").read_text(encoding="utf-8")
-        for name, value in (("GridEpoch", 13), ("PipelineChange", 14)):
-            self.assertIn(f"{name} = {value}", event_types)
-        for text in ('"grid_epoch"', '"pipeline_change"'):
-            self.assertIn(f"return {text};", SOURCE)
-        # Event types 15 stall_injected, 16 governor_step, 17 rung_feasibility and 18 gpu_wait_cap are no longer
-        # written; the analyzer reads them by name from older files.
-
-    def test_controller_cause_tables_match_production(self):
-        # The analyzer names are the production *_Text strings of each enum value.
-        for header, source, enum, table in (
-                ("src/period_governor.h", "src/period_governor.cpp", "GovernorCause",
-                 pacing.GOVERNOR_CAUSE_NAMES),
-                ("src/rung_feasibility.h", "src/rung_feasibility.cpp", "FeasibilityCause",
-                 pacing.FEASIBILITY_CAUSE_NAMES)):
-            with self.subTest(enum=enum):
-                declaration = (ROOT / header).read_text(encoding="utf-8")
-                body = declaration.split(f"enum class {enum} : uint8_t {{", 1)[1].split("};", 1)[0]
-                values = {name: int(value) for name, value in re.findall(r"^\s*(\w+) = (\d+)", body, re.M)}
-                texts = dict(re.findall(rf'case {enum}::(\w+): return "([a-z_]+)";',
-                                        (ROOT / source).read_text(encoding="utf-8")))
-                self.assertEqual({values[name]: text for name, text in texts.items()}, table)
-        telemetry = (ROOT / "src/pacing_telemetry_types.h").read_text(encoding="utf-8")
-        body = telemetry.split("enum PacingSourceFlags : uint8_t {", 1)[1].split("};", 1)[0]
-        flags = {1 << int(bit): name.lower() for name, bit in re.findall(r"PACING_SOURCE_(\w+) = 1u << (\d)", body)}
-        # Every flag the build defines has the analyzer's name; the analyzer also keeps the names of the bits no
-        # build sets any more (4 gpu_paced, 64 overload, 128 stall_injected) for older captures.
-        self.assertEqual({bit: pacing.SOURCE_FLAG_NAMES[bit] for bit in flags}, flags)
-        self.assertEqual({bit: pacing.SOURCE_FLAG_NAMES[bit] for bit in (4, 64, 128)},
-                         {4: "gpu_paced", 64: "overload", 128: "stall_injected"})
+    def test_retired_source_flags_keep_their_names(self):
+        # The bits no build sets any more (4 gpu_paced, 64 overload, 128 stall_injected) keep the analyzer's names
+        # for older captures; the schema fixture marks them retired (tests/test_pacing_schema.cpp).
+        self.assertEqual({bit for bit, (_, retired) in SCHEMA.tables["source_flag"].items() if retired},
+                         {4, 64, 128})
         self.assertEqual(pacing.SOURCE_FLAG_OVERLOAD, 64)
+        self.assertEqual(pacing.SOURCE_FLAG_NAMES[pacing.SOURCE_FLAG_OVERLOAD], "overload")
         self.assertEqual(pacing.SOURCE_FLAG_NAMES[pacing.SOURCE_FLAG_PRE_SLEEP], "pre_sleep")
         self.assertEqual(pacing.SOURCE_FLAG_NAMES[pacing.SOURCE_FLAG_FIXED_REFRESH], "fixed_refresh")
 

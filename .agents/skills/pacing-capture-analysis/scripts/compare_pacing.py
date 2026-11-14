@@ -8,12 +8,25 @@ naming its scene, arm and relimiter_pacing_*.csv capture. Each run is
 recomputed with analyze_pacing.py (same chains, filters and lower-index
 quantiles) on its primary swapchain, the one with the most display changes.
 
-Per run: adjacent display jitter p50/p90/p99, the share of display intervals
-deviating from T_out by more than each threshold, the long-frame share
-(> 1.5 T_out), |animation error| p99 of real frames, native PC Latency p50,
+Per run: adjacent display jitter p50/p90/p99, the display-interval spread (p99 - p50), the 1% low (the p99
+display interval), the hitch share (intervals above 1.5 times the run's own median interval), the share of
+display intervals deviating from the scene's target interval by more than each threshold, the long-frame share
+(> 1.5 times that target), |animation error| p99 of real frames, native PC Latency p50,
 the hold state (plan rungs; pre-removal captures only: the time with the hold feasibility guard stepped
 aside, unavailable on current captures) and the arm it actually ran (pipeline reasons, plan rungs, source
 placement), checked against the arm's expectation.
+
+The comparison target comes from the plan, never from a capture. A scene's target_fps (the frame rate cap, an output
+rate with or without frame generation) gives one target interval, 1e6 / target_fps, that every run of the scene
+is measured against whatever its arm: the deviation and long-frame metrics say how well a run holds that target.
+A capture's own T_out cannot be the common one: the test mode reflex_only runs every frame through
+RunPassthrough (src/scheduler.cpp), which publishes interval_us 0, so such a capture has no T_out at all. A
+scene that declares no target_fps leaves those two metrics unavailable (never 0, and a decision rule that needs
+them cannot be supported); a scene with target_fps 0 is uncapped, and its decision rules use the target-free
+metrics (decision.uncapped_primary_metrics: jitter, interval spread, 1% low, hitch share; their analysis.min_effect
+entries are null until an effect size is measured, and a rule whose primary metric has none is inconclusive). The reflex_only arms
+ignore ReLimiter's saved cap: a capped arm against them is the pacer at a cap against the game's own Reflex, an
+equal-cap comparison only when the game or driver holds a cap that the run records.
 
 Per scene and comparison: candidate - baseline of the run means, a 95%
 block-bootstrap interval (time blocks resampled within each run), and the
@@ -57,6 +70,33 @@ SCENE_CLASSES = ("light", "heavy")
 FEASIBILITY_EVENT = "rung_feasibility"
 PIPELINE_EVENT = "pipeline_change"
 
+# Every key of relimiter.ini's [FrameLimiter] section that the current build reads and writes: the one list the
+# writers of settings (--write-ini, --schedule) check against. tests/test_pacing_schedule.py compares it with the
+# config_key lines of tests/data/pacing_schema.txt, and tests/test_config_async.cpp compares those with the keys a
+# first launch of the build writes. A plan written for an older build may name keys that no longer exist: the reader
+# keeps it so its captures stay analysable, the writers refuse it.
+INI_KEYS = frozenset({
+    "target_fps", "background_fps", "fg_off_fps", "vsync_mode", "enforcement_marker", "initial_wake_guard_us",
+    "window_mode", "fake_fullscreen", "selected_monitor", "focus_lock", "oled_care_key", "oled_care_all_monitors",
+    "oled_care_idle_minutes", "osd_enabled", "osd_x", "osd_y", "osd_opacity", "osd_scale", "osd_drop_shadow",
+    "osd_text_brightness", "osd_toggle_key", "osd_position_cycle_key", "shared_presets", "osd_preset_prev_key",
+    "osd_preset_next_key", "blackout_key", "pacing_preference", "advanced_settings", "developer_settings",
+    "config_version", "flip_metering_off", "gpu_queue_probe", "gpu_queue_probe_source", "pacing_test_mode",
+    "unified_hold_share", "unified_queue_law", "unified_queue_rank", "unified_queue_need_frames",
+    "unified_queue_upstream", "unified_queue_margin_end", "unified_queue_allow_us", "control_file",
+    "dynamic_mfg_passthrough", "reflex_inject", "flip_model_override", "log_level", "csv_enabled",
+    "native_pcl_enabled", "gpu_present_gate_probes", "dlss_info_hooks", "hook_installer_thread", "streamline_compat",
+    "osd_show_fps", "osd_show_frametime", "osd_show_frametime_graph", "osd_show_fg", "osd_show_limiter",
+    "osd_show_pqi", "osd_show_cpu_latency", "osd_show_native_pcl", "osd_show_native_pcl_breakdown",
+    "osd_show_pqi_breakdown", "osd_show_1pct_low", "osd_show_smoothness", "osd_show_pacing_quality",
+    "osd_show_0_1pct_low", "osd_show_gpu_render_time", "osd_show_total_frame_cost", "osd_show_fg_time",
+    "osd_show_gpu_temp", "osd_show_gpu_clock", "osd_show_gpu_usage", "osd_show_vram", "osd_show_cpu_usage",
+    "osd_show_ram", "osd_show_dlss_quality", "osd_show_dlss_features", "osd_show_dlss_resolution",
+    "osd_show_dlss_presets", "osd_show_dlss_versions",
+})
+# An arm's target_fps naming the scene's cap (the arm leaves the cap as the scene sets it).
+SCENE_CAP = "scene"
+
 # Run flags that exclude a run from the comparisons unless --include-flagged.
 EXCLUDING_FLAGS = ("arm_mismatch", "too_few_intervals", "no_display_intervals", "route_window_mismatch",
                    "incomplete_route_coverage")
@@ -67,10 +107,33 @@ def route_tolerance_s(route_seconds: float) -> float:
     return max(1.0, 0.03 * route_seconds)
 
 
+# The metrics that need the target interval of the plan (the scene's cap); the others are target-free.
+def target_dependent(metric: str) -> bool:
+    return metric.startswith("dev_share_over_") or metric == "long_frame_share"
+
+
 def metric_names(thresholds_us: list[float]) -> list[str]:
     return ["jitter_p50_us", "jitter_p90_us", "jitter_p99_us",
             *[f"dev_share_over_{int(threshold)}us" for threshold in thresholds_us],
-            "long_frame_share", "abs_animation_error_p99_us", "pc_latency_p50_us"]
+            "long_frame_share", "abs_animation_error_p99_us", "pc_latency_p50_us",
+            "interval_spread_us", "low_1pct_interval_us", "hitch_share"]
+
+
+def scene_cap_fps(scene: dict[str, Any]) -> int | None:
+    """The scene's declared frame rate cap: 0 uncapped, None not declared. The comparison target of every run of
+    the scene is derived from it (see the module docstring)."""
+    cap = scene.get("target_fps")
+    return None if cap is None else int(cap)
+
+
+def scene_primary_metrics(decision: dict[str, Any], scene: dict[str, Any]) -> list[str]:
+    """The metrics a decision rule judges a scene on: the plan's primary metrics, or, for a scene declared uncapped
+    (target_fps 0, no target interval), its target-free ones."""
+    primary = list(decision["primary_metrics"])
+    if scene_cap_fps(scene) != 0:
+        return primary
+    listed = decision.get("uncapped_primary_metrics")
+    return list(listed) if listed else [metric for metric in primary if not target_dependent(metric)]
 
 
 # ── Plan ──
@@ -101,6 +164,9 @@ def validate_plan(plan: dict[str, Any]) -> None:
     for scene in plan["scenes"]:
         if scene.get("class") not in SCENE_CLASSES:
             raise PlanError(f"scene {scene['id']!r}: class must be one of {SCENE_CLASSES}")
+        cap = scene.get("target_fps")
+        if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int) or cap < 0):
+            raise PlanError(f"scene {scene['id']!r}: target_fps must be a frame rate (0: uncapped) or null (not set)")
     for arm_id, arm in arms.items():
         if "settings" not in arm or "expect" not in arm:
             raise PlanError(f"arm {arm_id!r} needs settings and expect")
@@ -135,6 +201,9 @@ def validate_plan(plan: dict[str, Any]) -> None:
     for metric in [*decision.get("primary_metrics", []), decision.get("latency_metric")]:
         if metric not in names:
             raise PlanError(f"decision metric {metric!r} is not one of {names}")
+    for metric in decision.get("uncapped_primary_metrics", []):
+        if metric not in names or target_dependent(metric):
+            raise PlanError(f"decision.uncapped_primary_metrics: {metric!r} must be a target-free metric of {names}")
     for run in plan["runs"]:
         if run.get("scene") not in scenes or run.get("arm") not in arms:
             raise PlanError(f"run {run!r} names an unknown scene or arm")
@@ -160,6 +229,9 @@ def validate_plan(plan: dict[str, Any]) -> None:
 @dataclass
 class Block:
     jitter: list[float] = field(default_factory=list)
+    interval: list[float] = field(default_factory=list)
+    hitch_known: int = 0
+    hitches: int = 0
     deviation_known: int = 0
     deviation_over: list[int] = field(default_factory=list)
     long_known: int = 0
@@ -170,10 +242,11 @@ class Block:
 
 @dataclass
 class ChainSeries:
-    """Display-change samples of one native swapchain: (seconds, kind, value)."""
+    """Display-change samples of one native swapchain: (seconds, kind, value). intervals holds (seconds, adjacent
+    jitter or None, display interval); the metrics against a target are derived from them with the plan's."""
     display_changes: int = 0
     frequency: int = 0
-    intervals: list[tuple[float, float | None, float | None, int | None]] = field(default_factory=list)
+    intervals: list[tuple[float, float | None, float]] = field(default_factory=list)
     animation_error: list[tuple[float, float]] = field(default_factory=list)
     pc_latency: list[tuple[float, float]] = field(default_factory=list)
 
@@ -200,9 +273,7 @@ def collect_series(path: Path, filters: Any, route_time: bool = False
         series.frequency = row.qpc_frequency
         seconds = (row.row_time_qpc if route_time else row.display_qpc) / row.qpc_frequency
         if derived["display_interval_us"] is not None:
-            deviation = derived["deviation_us"]
-            series.intervals.append((seconds, derived["adjacent_jitter_us"],
-                                     None if deviation is None else abs(deviation), derived["long_frame"]))
+            series.intervals.append((seconds, derived["adjacent_jitter_us"], derived["display_interval_us"]))
         if derived["animation_error_us"] is not None:
             series.animation_error.append((seconds, abs(derived["animation_error_us"])))
         if row.pcl_status == pacing.PCL_STATUS_NATIVE and row.pcl_total_us is not None:
@@ -213,12 +284,20 @@ def collect_series(path: Path, filters: Any, route_time: bool = False
     return primary, rungs, placements
 
 
+def reference_interval_us(intervals: list[tuple[float, float | None, float]]) -> float | None:
+    """The run's own median display interval: what a hitch is measured against (no target needed)."""
+    return pacing.lower_quantile(sorted(sample[2] for sample in intervals), 0.50)
+
+
 def build_blocks(series: ChainSeries, block_s: float, thresholds_us: list[float],
-                 origin_s: float | None = None, count: int | None = None) -> list[Block]:
+                 origin_s: float | None = None, count: int | None = None,
+                 target_us: float | None = None, hitch_reference_us: float | None = None) -> list[Block]:
     """Time blocks of block_s from the run's first sample, or, for a route-paired
     run, exactly count blocks from origin_s (the route start), empty ones
     included, so that block k of every run of the scene is the same stretch of
-    the route; samples outside them are dropped."""
+    the route; samples outside them are dropped. target_us (the plan's, None:
+    not declared) decides the deviation and long-frame counts, which stay empty
+    without it; hitch_reference_us decides the hitch count."""
     times = ([sample[0] for sample in series.intervals] + [sample[0] for sample in series.animation_error] +
              [sample[0] for sample in series.pc_latency])
     if not times and count is None:
@@ -235,20 +314,24 @@ def build_blocks(series: ChainSeries, block_s: float, thresholds_us: list[float]
             found = blocks[index] = Block(deviation_over=[0] * len(thresholds_us))
         return found
 
-    for seconds, jitter, deviation, long_frame in series.intervals:
+    for seconds, jitter, interval in series.intervals:
         target = block(seconds)
         if target is None:
             continue
         if jitter is not None:
             target.jitter.append(jitter)
-        if deviation is not None:
+        target.interval.append(interval)
+        if hitch_reference_us is not None:
+            target.hitch_known += 1
+            target.hitches += int(interval > pacing.LONG_FRAME_MULTIPLE * hitch_reference_us)
+        if target_us is not None:
+            deviation = abs(interval - target_us)
             target.deviation_known += 1
             for index, threshold in enumerate(thresholds_us):
                 if deviation > threshold:
                     target.deviation_over[index] += 1
-        if long_frame is not None:
             target.long_known += 1
-            target.long_frames += long_frame
+            target.long_frames += int(interval > pacing.LONG_FRAME_MULTIPLE * target_us)
     for seconds, value in series.animation_error:
         target = block(seconds)
         if target is not None:
@@ -264,10 +347,13 @@ def build_blocks(series: ChainSeries, block_s: float, thresholds_us: list[float]
 
 def block_metrics(blocks: list[Block], thresholds_us: list[float]) -> dict[str, float | None]:
     jitter = sorted(chain.from_iterable(block.jitter for block in blocks))
+    interval = sorted(chain.from_iterable(block.interval for block in blocks))
     animation_error = sorted(chain.from_iterable(block.animation_error for block in blocks))
     pc_latency = sorted(chain.from_iterable(block.pc_latency for block in blocks))
     deviation_known = sum(block.deviation_known for block in blocks)
     long_known = sum(block.long_known for block in blocks)
+    hitch_known = sum(block.hitch_known for block in blocks)
+    interval_p50, interval_p99 = pacing.lower_quantile(interval, 0.50), pacing.lower_quantile(interval, 0.99)
     metrics: dict[str, float | None] = {
         "jitter_p50_us": pacing.lower_quantile(jitter, 0.50),
         "jitter_p90_us": pacing.lower_quantile(jitter, 0.90),
@@ -280,6 +366,10 @@ def block_metrics(blocks: list[Block], thresholds_us: list[float]) -> dict[str, 
                                    if long_known else None)
     metrics["abs_animation_error_p99_us"] = pacing.lower_quantile(animation_error, 0.99)
     metrics["pc_latency_p50_us"] = pacing.lower_quantile(pc_latency, 0.50)
+    metrics["interval_spread_us"] = (None if interval_p50 is None or interval_p99 is None
+                                     else interval_p99 - interval_p50)
+    metrics["low_1pct_interval_us"] = interval_p99
+    metrics["hitch_share"] = sum(block.hitches for block in blocks) / hitch_known if hitch_known else None
     return metrics
 
 
@@ -394,6 +484,8 @@ class RunResult:
     draws: dict[str, list[float | None]] = field(default_factory=dict)
     hold: dict[str, Any] = field(default_factory=dict)
     integrity: dict[str, Any] = field(default_factory=dict)
+    cap_fps: int | None = None         # the scene's declared cap (None: not declared)
+    target_us: float | None = None     # the comparison target interval derived from it
 
     def included(self, include_flagged: bool) -> bool:
         if self.status != "analyzed":
@@ -404,7 +496,8 @@ class RunResult:
         return {"index": self.index, "scene": self.scene, "arm": self.arm, "order": self.order,
                 "capture": self.capture, "status": self.status, "flags": self.flags, "notes": self.notes,
                 "intervals": self.intervals, "duration_s": self.duration_s, "metrics": self.metrics,
-                "hold": self.hold, "integrity": self.integrity}
+                "hold": self.hold, "integrity": self.integrity, "cap_fps": self.cap_fps,
+                "target_us": self.target_us}
 
 
 def analyze_run(index: int, run: dict[str, Any], plan: dict[str, Any], base: Path,
@@ -435,6 +528,9 @@ def analyze_run(index: int, run: dict[str, Any], plan: dict[str, Any], base: Pat
     result.status = "analyzed"
     result.integrity = {"sha256": report["input"]["sha256"], "schema_profile": report["input"]["schema_profile"],
                         "attrition": report["attrition"], "warnings": report["warnings"]}
+    scene = next((scene for scene in plan.get("scenes", []) if scene["id"] == run["scene"]), {})
+    result.cap_fps = scene_cap_fps(scene)
+    result.target_us = 1_000_000.0 / result.cap_fps if result.cap_fps else None
     if report["warnings"]:
         result.flags.append(f"integrity_warnings: {len(report['warnings'])}")
 
@@ -481,12 +577,14 @@ def analyze_run(index: int, run: dict[str, Any], plan: dict[str, Any], base: Pat
             result.flags.append(f"incomplete_route_coverage: no display interval for {gap:.1f} s from "
                                 f"{at:.1f} s of the {route_s:.1f} s route")
         count = math.ceil(route_s / block_s - 1e-9)  # the last block may be partial
-        blocks = build_blocks(route_series, block_s, thresholds, start_s, count)
+        blocks = build_blocks(route_series, block_s, thresholds, start_s, count, result.target_us,
+                              reference_interval_us(route_series.intervals))
         analyzed = route_series.intervals
         draw_seed = f"{seed}:route:{run['scene']}"
     else:
         analyzed = series.intervals
-        blocks = build_blocks(series, block_s, thresholds)
+        blocks = build_blocks(series, block_s, thresholds, target_us=result.target_us,
+                              hitch_reference_us=reference_interval_us(series.intervals))
         draw_seed = f"{seed}:{index}:{run['capture']}"
     result.intervals = len(analyzed)
     result.duration_s = analyzed[-1][0] - analyzed[0][0] if analyzed else 0.0
@@ -534,11 +632,15 @@ def difference_interval(candidate: list[RunResult], baseline: list[RunResult], m
 
 
 def verdict(delta: float | None, low: float | None, high: float | None,
-            noise: float | None, min_effect: float) -> str:
+            noise: float | None, min_effect: float | None) -> str:
     """Lower is better. 'better'/'worse' need an interval excluding zero and a
-    difference beyond both the same-arm noise floor and the minimum effect."""
+    difference beyond both the same-arm noise floor and the minimum effect.
+    A metric with no minimum effect set (null or absent in analysis.min_effect)
+    is never judged: 'effect_size_not_set'."""
     if delta is None or low is None or high is None:
         return "unavailable"
+    if min_effect is None:
+        return "effect_size_not_set"
     if noise is None:
         return "no_replicate"
     margin = max(noise, min_effect)
@@ -578,10 +680,10 @@ def compare(plan: dict[str, Any], runs: list[RunResult], include_flagged: bool) 
                 low, high = difference_interval(candidate, baseline, metric, confidence)
                 spreads = [spread for spread in (candidate_spread, baseline_spread) if spread is not None]
                 noise = max(spreads) if len(spreads) == 2 else None
+                effect = None if min_effect.get(metric) is None else float(min_effect[metric])
                 metrics[metric] = {"candidate": candidate_value, "baseline": baseline_value, "delta": delta,
                                    "interval": [low, high], "noise": noise,
-                                   "min_effect": float(min_effect.get(metric, 0.0)),
-                                   "verdict": verdict(delta, low, high, noise, float(min_effect.get(metric, 0.0)))}
+                                   "min_effect": effect, "verdict": verdict(delta, low, high, noise, effect)}
             entry["metrics"] = metrics
             scenes.append(entry)
         results.append({**comparison, "scenes": scenes})
@@ -612,7 +714,6 @@ def judge_rule(plan: dict[str, Any], comparisons: list[dict[str, Any]], rule: di
     budget.
     """
     decision = plan["decision"]
-    primary = decision["primary_metrics"]
     latency_metric = decision["latency_metric"]
     name = rule["comparison"]
     reasons: list[str] = []
@@ -625,11 +726,24 @@ def judge_rule(plan: dict[str, Any], comparisons: list[dict[str, Any]], rule: di
             supported = False
             reasons.append(f"{scene['id']}: {name} has no runs for one arm")
             continue
+        primary = scene_primary_metrics(decision, scene)
+        if not primary:
+            supported = False
+            reasons.append(f"{scene['id']}: the plan names no target-free primary metric for this uncapped scene")
         for metric in primary:
             outcome = entry["metrics"][metric]["verdict"]
             if outcome == "worse":
                 rejected = True
                 reasons.append(f"{scene['id']} ({scene['class']}): the candidate is worse on {metric}")
+            elif outcome == "unavailable":
+                # Never a zero: a metric without samples (a target metric of a scene that declares no target_fps,
+                # a capture without the measurement) decides nothing.
+                supported = False
+                reasons.append(f"{scene['id']} ({scene['class']}): {metric} is unavailable in one arm")
+            elif outcome == "effect_size_not_set":
+                # Neither supported nor refuted: the plan has no effect size for this metric yet.
+                supported = False
+                reasons.append(f"{scene['id']} ({scene['class']}): effect size not set for {metric}")
             elif scene["class"] == "light" and outcome != "better":
                 supported = False
                 reasons.append(f"{scene['id']} (light): the candidate is {outcome} on {metric}, not better")
@@ -734,12 +848,15 @@ def format_report(report: dict[str, Any]) -> str:
         held = hold.get("held_share")
         off = hold.get("hold_off_share")
         lines.append(
-            f"{head}  {run['intervals']} intervals"
+            f"{head}  {run['intervals']} intervals  target {_format(run.get('target_us'), '')} us"
             f"  jitter p50/p90/p99 {_format(metrics.get('jitter_p50_us'), '')}/"
             f"{_format(metrics.get('jitter_p90_us'), '')}/{_format(metrics.get('jitter_p99_us'), '')} us"
             + "".join(f"  {name.removeprefix('dev_share_')} {_format(value, name)}"
                       for name, value in metrics.items() if name.startswith("dev_share_"))
             + f"  long {_format(metrics.get('long_frame_share'), '_share')}"
+            f"  spread {_format(metrics.get('interval_spread_us'), '')}"
+            f"  1% low {_format(metrics.get('low_1pct_interval_us'), '')}"
+            f"  hitch {_format(metrics.get('hitch_share'), '_share')}"
             f"  AE p99 {_format(metrics.get('abs_animation_error_p99_us'), '')}"
             f"  PCL p50 {_format(metrics.get('pc_latency_p50_us'), '')}"
             f"  held {_format(held, '_share')}  hold off {_format(off, '_share')}")
@@ -781,26 +898,91 @@ def format_report(report: dict[str, Any]) -> str:
 
 # ── Capture kit ──
 
-def format_schedule(plan: dict[str, Any]) -> str:
+def check_writable(plan: dict[str, Any]) -> None:
+    """Refuse to write a setting the current build does not read (INI_KEYS). The plan reader keeps older plans so
+    their captures stay analysable; writing their settings (--write-ini, --schedule) would deploy removed keys."""
+    groups = [("common_settings", plan.get("common_settings", {})),
+              *((f"arm {arm_id!r}", arm["settings"]) for arm_id, arm in plan["arms"].items())]
+    for where, settings in groups:
+        for key, value in settings.items():
+            if key not in INI_KEYS:
+                raise PlanError(f"{where} sets {key!r}, which this build does not read: a plan written for an older "
+                                "build can be analysed but not deployed; remove the setting")
+            if value == SCENE_CAP and (key != "target_fps" or where == "common_settings"):
+                raise PlanError(f"{where}: {SCENE_CAP!r} is only a value of an arm's target_fps")
+
+
+def schedule_steps(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """The capture schedule as data, one entry per scene: its launch settings and, per run in order, the settings
+    to change from the previous run (the first: from the launch settings) and the cap the run holds. Derived from
+    the arms' settings alone, so an instruction cannot disagree with them: every arm states its target_fps (an
+    override, or SCENE_CAP for the scene's cap), the cap is restored after an arm that set its own, and an arm
+    that states no target_fps is refused (its runs would keep whatever cap an earlier arm left)."""
+    check_writable(plan)
+    common = {key: str(value) for key, value in plan.get("common_settings", {}).items()}
     protocol = plan["protocol"]
-    lines = [f"Pacing evaluation capture schedule: {plan.get('question', '')}", "",
-             "Before launching the game, set in relimiter.ini [FrameLimiter] (see --write-ini):"]
-    lines.extend(f"  {key}={value}" for key, value in plan.get("common_settings", {}).items())
-    lines.append("")
+    steps = []
     for scene in plan["scenes"]:
-        cap = scene.get("target_fps")
-        lines.append(f"Scene {scene['id']} ({scene['class']}): {scene.get('description', '')}"
-                     + (f" Cap: target_fps={cap} unless the arm sets its own." if cap else ""))
-        lines.append("  One game session; hold the scene, camera and cap constant. For each run:")
+        scene_cap = scene_cap_fps(scene)
         # The scene's runs in the plan name its arms and their order; a scene without runs uses the protocol's.
         scene_runs = sorted((run for run in plan["runs"] if run["scene"] == scene["id"]),
                             key=lambda run: run.get("order") or 0)
         arm_order = [run["arm"] for run in scene_runs] or protocol.get("run_order", [])
+        state = dict(common)
+        if scene_cap is not None:
+            state["target_fps"] = str(scene_cap)
+        launch = dict(state)
+        runs = []
         for order, arm_id in enumerate(arm_order, start=1):
-            arm = plan["arms"][arm_id]
-            lines.append(f"  {order}. {arm_id} ({arm.get('label', '')}): {arm.get('osd', '')}; wait "
-                         f"{protocol.get('settle_seconds', 0)} s, turn Telemetry Logging on, capture "
-                         f"{protocol.get('capture_seconds', 0)} s, turn it off.")
+            needed = {key: str(value) for key, value in plan["arms"][arm_id]["settings"].items()}
+            if "target_fps" not in needed:
+                raise PlanError(f"arm {arm_id!r} does not state target_fps ({SCENE_CAP!r}: the scene's cap): a run "
+                                "after an arm that sets its own cap would keep it")
+            if needed["target_fps"] == SCENE_CAP:
+                if scene_cap is None:
+                    raise PlanError(f"scene {scene['id']!r} declares no target_fps (0: uncapped): its runs have no cap")
+                needed["target_fps"] = str(scene_cap)
+            try:
+                cap = int(needed["target_fps"])
+            except ValueError as error:
+                raise PlanError(f"arm {arm_id!r}: target_fps {needed['target_fps']!r} is not a frame rate") from error
+            apply = {key: value for key, value in needed.items() if state.get(key) != value}
+            state.update(apply)
+            runs.append({"order": order, "arm": arm_id, "cap_fps": cap, "apply": apply})
+        steps.append({"scene": scene["id"], "launch": launch, "runs": runs})
+    return steps
+
+
+def _instruction(key: str, value: str, controls: dict[str, Any]) -> str:
+    control = controls.get(key)
+    if not control:
+        return f"{key}={value}"
+    return f"{key}={value} (OSD: {control.get('control', key)}: {control.get('values', {}).get(value, value)})"
+
+
+def format_schedule(plan: dict[str, Any]) -> str:
+    steps = schedule_steps(plan)
+    protocol = plan["protocol"]
+    controls = plan.get("osd_controls", {})
+    lines = [f"Pacing evaluation capture schedule: {plan.get('question', '')}", "",
+             "Before launching the game, set in relimiter.ini [FrameLimiter] (see --write-ini):"]
+    lines.extend(f"  {key}={value}" for key, value in plan.get("common_settings", {}).items())
+    lines.append("")
+    scenes = {scene["id"]: scene for scene in plan["scenes"]}
+    for step in steps:
+        scene = scenes[step["scene"]]
+        cap = step["launch"].get("target_fps")
+        lines.append(f"Scene {scene['id']} ({scene['class']}): {scene.get('description', '')}"
+                     + (f" Launch cap: target_fps={cap}." if cap is not None else ""))
+        lines.append("  One game session; hold the scene and camera constant. Each run lists every setting to change "
+                     "from the previous run (the first: from the launch settings) and the ReLimiter cap it holds:")
+        for run in step["runs"]:
+            arm = plan["arms"][run["arm"]]
+            change = "; ".join(_instruction(key, value, controls) for key, value in run["apply"].items())
+            lines.append(f"  {run['order']}. {run['arm']} ({arm.get('label', '')}): "
+                         f"{'set ' + change if change else 'no setting changes'}; cap {run['cap_fps']} FPS"
+                         f"{' (off)' if run['cap_fps'] == 0 else ''}; wait {protocol.get('settle_seconds', 0)} s, "
+                         f"turn Telemetry Logging on, capture {protocol.get('capture_seconds', 0)} s, turn it off.")
         lines.append("  Then exit the game and archive every capture of the session (archive_capture.ps1 "
                      "-CaptureSelection All); enter each capture path in the plan's runs.")
         lines.append("")
@@ -808,6 +990,7 @@ def format_schedule(plan: dict[str, Any]) -> str:
 
 
 def write_ini(plan: dict[str, Any], directory: Path) -> list[Path]:
+    check_writable(plan)
     directory.mkdir(parents=True, exist_ok=True)
     written = []
 
@@ -819,9 +1002,15 @@ def write_ini(plan: dict[str, Any], directory: Path) -> list[Path]:
 
     write("common.ini", plan.get("common_settings", {}),
           "Launch settings for every run; merge into relimiter.ini before starting the game.")
+    for scene in plan["scenes"]:
+        cap = scene_cap_fps(scene)
+        if cap is not None:
+            write(f"scene_{scene['id']}.ini", {"target_fps": cap},
+                  f"Scene {scene['id']}: the cap an arm that states target_fps={SCENE_CAP} holds.")
     for arm_id, arm in plan["arms"].items():
-        write(f"arm_{arm_id}.ini", arm["settings"],
-              f"Arm {arm_id} ({arm.get('label', '')}). In-session: {arm.get('osd', '')}")
+        write(f"arm_{arm_id}.ini", {key: value for key, value in arm["settings"].items()
+                                    if value != SCENE_CAP},
+              f"Arm {arm_id} ({arm.get('label', '')}). target_fps={SCENE_CAP} is not written: the scene file holds it.")
     return written
 
 
@@ -843,12 +1032,15 @@ def main() -> int:
         plan = load_plan(args.plan)
     except PlanError as error:
         parser.error(str(error))
-    if args.schedule:
-        print(format_schedule(plan))
-        return 0
-    if args.write_ini is not None:
-        for path in write_ini(plan, args.write_ini):
-            print(path)
+    if args.schedule or args.write_ini is not None:
+        try:
+            if args.schedule:
+                print(format_schedule(plan))
+            else:
+                for path in write_ini(plan, args.write_ini):
+                    print(path)
+        except PlanError as error:
+            parser.error(str(error))
         return 0
     if args.iterations is not None and args.iterations < 1:
         parser.error("--iterations must be positive")

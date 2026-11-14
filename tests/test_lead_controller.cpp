@@ -248,25 +248,6 @@ void TestMarkerHoldOverlap()
     CHECK(statistics.incomplete_dropped == 0);
 }
 
-void TestNativeHoldOverlap()
-{
-    auto controller = MakeController();
-    controller->OnSourceRelease(Start(1, PacingRung::NativeHold, 10000.0));
-    controller->OnStageEvent(Event(1, Kind::MarkerArrival, 11000.0));
-    CHECK(controller->Statistics().samples == 0); // H2 needs the native arrival
-    controller->OnStageEvent(Event(1, Kind::NativeArrival, 15000.0));
-    controller->OnStageEvent(Event(1, Kind::OutputRelease, 18000.0));
-    CHECK_NEAR(controller->Statistics().last_sample_us, 5000.0);
-
-    // [16000, 22000] minus the native hold [15000, 18000].
-    controller->OnSourceRelease(Start(2, PacingRung::NativeHold, 16000.0));
-    controller->OnStageEvent(Event(2, Kind::MarkerArrival, 17000.0));
-    controller->OnStageEvent(Event(2, Kind::NativeArrival, 22000.0));
-    CHECK(controller->Statistics().samples == 2);
-    CHECK_NEAR(controller->Statistics().last_sample_us, 4000.0);
-    CHECK(controller->BucketStatus(PacingRung::NativeHold, 1.0).samples == 2);
-}
-
 // GPU queue wait sample with the queue order unknown (no Reflex reports):
 // the measured readiness, floored at the Present call, whatever the previous
 // frame's GPU did. A frame after one that promised a probe still waits for
@@ -492,16 +473,6 @@ void TestRungTransitions()
     controller->OnStageEvent(Event(3, Kind::GpuReady, 26000.0));
     CHECK(controller->Statistics().samples == 3);
     CHECK_NEAR(controller->Statistics().last_sample_us, 8000.0);
-
-    // H2 after H1: the marker hold [32000, 36000] is removed.
-    controller->OnSourceRelease(Start(4, PacingRung::MarkerHold, 30000.0));
-    controller->OnStageEvent(Event(4, Kind::MarkerArrival, 32000.0));
-    controller->OnStageEvent(Event(4, Kind::OutputRelease, 36000.0));
-    CHECK_NEAR(controller->Statistics().last_sample_us, 2000.0);
-    controller->OnSourceRelease(Start(5, PacingRung::NativeHold, 34000.0));
-    controller->OnStageEvent(Event(5, Kind::NativeArrival, 40000.0));
-    CHECK(controller->Statistics().samples == 5);
-    CHECK_NEAR(controller->Statistics().last_sample_us, 4000.0);
 }
 
 void TestLongSampleExclusion()
@@ -854,7 +825,7 @@ void TestKeyMismatch()
     }
     controller->OnStageEvent(Event(5, Kind::MarkerArrival, 51000.0)); // slot reused by frame 37
     CHECK(controller->Statistics().unmatched_events == 6);
-    controller->OnStageEvent(Event(33, Kind::NativeArrival, 331000.0)); // closed, still matched
+    controller->OnStageEvent(Event(33, Kind::MarkerArrival, 331000.0)); // closed, still matched
     CHECK(controller->Statistics().unmatched_events == 6);
     CHECK(controller->Statistics().samples == 40);
 }
@@ -3750,7 +3721,6 @@ int main()
 
     TestSourceOnlySample();
     TestMarkerHoldOverlap();
-    TestNativeHoldOverlap();
     TestGpuQueueSample();
     TestGpuRungBuckets();
     TestSimulationRenderQueue();

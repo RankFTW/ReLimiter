@@ -2532,7 +2532,8 @@ void TestNativeRouteFromEveryMarker() {
     s_native_context_enabled = true;
     const unsigned publications_before = s_route_capability_publications;
     for (uint64_t frame = 2000; frame < 2034; ++frame) {
-        // Every rung (and no plan at all) feeds the route.
+        // Source only, marker hold and GPU queue wait (the FG input wait is not enumerated) and
+        // a frame with no plan at all feed the route.
         const uint64_t variant = frame % 4;
         if (variant != 3) {
             const PacingRung rung = variant == 0 ? PacingRung::SourceOnly :

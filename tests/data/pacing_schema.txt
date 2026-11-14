@@ -1,0 +1,563 @@
+# Pacing capture schema: the contract between the add-on's CSV writer and the capture analyzer.
+#
+# One checked-in fixture, read by two tests:
+#   tests/test_pacing_schema.cpp  compares it with what the production code writes and names (the real CSV
+#                                 writer's headers and event_type text, the *_Text functions, the enumerators).
+#   tests/test_analyze_pacing.py  compares it with the analyzer's headers and value -> name tables.
+#   tests/test_config_async.cpp   (config_key) compares it with the keys a first launch writes to relimiter.ini.
+#   tests/test_pacing_schedule.py (config_key) compares it with the keys compare_pacing.py may write into settings.
+# A change to the schema (a column, an enumerator, a name) must change this file; both tests fail until it does.
+#
+# Lines (blank lines and lines starting with '#' are ignored; fields are separated by spaces):
+#   row_column <name>                   next column of the pacing rows header, in order
+#   event_column <name>                 next column of the pacing events header, in order
+#   <table> <value> <name> [retired]    value -> name of one enumeration (source_flag: the bit value)
+#   config_key <name>                   one key of the [FrameLimiter] section of relimiter.ini that this build reads and writes
+# retired: the build produces no such value any more; older captures carry it and the analyzer keeps its name.
+#   The C++ test accepts a retired value only if the build names it exactly like this file or names it not at all.
+#   A value the build names that this file lacks, and a non-retired entry the build names differently, fail.
+#
+# Tables bound to a *_Text function: rung, placement, fallback_reason, timing_mode, governor_cause,
+# feasibility_cause, event_type (checked through the writer's event_type cell). Tables the build has no text for
+# (epoch_reason, plan_status, display_source, output_kind, join_rule, identity_domain, break_reason,
+# clock_map_status, pcl_status, source_flag) are bound to the enumerators: the C++ test lists every enumerator of
+# the enum and fails to compile when one is added. gpu_wait_cap_cause has no enumeration in the build at all:
+# all of it is retired.
+
+row_column row_kind
+row_column sequence
+row_column capture_epoch
+row_column qpc_frequency
+row_column observer_epoch
+row_column native_swapchain
+row_column thread_id
+row_column present_start_qpc
+row_column display_qpc
+row_column display_index
+row_column display_count
+row_column frame_type
+row_column frame_classification
+row_column final_state
+row_column loss_window
+row_column pcl_frame_id
+row_column join_rule
+row_column late_display
+row_column identity_domain
+row_column producer_epoch
+row_column frame_id
+row_column source_flags
+row_column source_release_qpc
+row_column interval_us
+row_column fg_divisor
+row_column p_qpc
+row_column e_qpc
+row_column output_kind
+row_column output_target_qpc
+row_column output_arrival_qpc
+row_column output_release_qpc
+row_column gpu_ticket
+row_column gate_signal_before_qpc
+row_column gate_fg
+row_column ready_gpu_qpc
+row_column ready_before_gate
+row_column target_output_interval_us
+row_column display_change
+row_column chain_break
+row_column display_interval_us
+row_column adjacent_jitter_us
+row_column deviation_us
+row_column real_frame
+row_column animation_error_us
+row_column latency_us
+row_column gpu_residence_us
+row_column cpu_hold_us
+row_column long_frame
+row_column short_frame
+row_column chain_break_reason
+row_column present_candidates
+row_column present_end_qpc
+row_column etw_ready_qpc
+row_column pcl_sim_start_qpc
+row_column pcl_present_start_qpc
+row_column presentation_mode
+row_column supports_tearing
+row_column display_sync_interval
+row_column display_present_flags
+row_column flip_delay_qpc
+row_column display_report_qpc
+row_column controller_generation
+row_column trigger
+row_column marker
+row_column regime
+row_column source_marker_qpc
+row_column wake_target_qpc
+row_column target_fps
+row_column present_native_swapchain
+row_column present_thread_id
+row_column sync_interval
+row_column present_flags
+row_column present_result
+row_column present_identity_domain
+row_column present_producer_epoch
+row_column present_frame_id
+row_column present_marker_qpc
+row_column swapchain_generation
+row_column present_sequence
+row_column present_gate_status
+row_column gate_ticket
+row_column gate_status
+row_column gate_native_queue
+row_column gate_target_qpc
+row_column gate_signal_after_qpc
+row_column gate_post_wait_qpc
+row_column gate_swapchain_generation
+row_column gate_present_sequence
+row_column ready_valid
+row_column ready_submit_qpc
+row_column ready_swapchain_generation
+row_column ready_present_sequence
+row_column reflex_report_qpc
+row_column reflex_sim_start_us
+row_column reflex_sim_end_us
+row_column reflex_render_submit_start_us
+row_column reflex_render_submit_end_us
+row_column reflex_present_start_us
+row_column reflex_present_end_us
+row_column reflex_driver_start_us
+row_column reflex_driver_end_us
+row_column reflex_os_render_queue_start_us
+row_column reflex_os_render_queue_end_us
+row_column reflex_gpu_render_start_us
+row_column reflex_gpu_render_end_us
+row_column reflex_gpu_active_render_us
+row_column reflex_gpu_frame_time_us
+row_column reflex_ai_frame_time_us
+row_column reflex_local_present_start_qpc
+row_column clock_map_status
+row_column clock_map_offset_us
+row_column pcl_status
+row_column pcl_input_ping_qpc
+row_column pcl_effective_sim_start_qpc
+row_column pcl_i2fs_us
+row_column pcl_fs2p_us
+row_column pcl_p2d_us
+row_column pcl_total_us
+row_column pcl_dropped_accumulation_us
+row_column pcl_dropped_frame_count
+row_column pcl_simulation_fallback
+row_column grid_epoch
+row_column grid_index
+row_column plan_output_target_qpc
+row_column plan_lead_us
+row_column plan_rung
+row_column plan_status
+row_column display_source
+row_column gate_pre_wait_qpc
+row_column source_placement
+row_column pre_sleep_end_qpc
+row_column source_wait_start_qpc
+row_column pre_sleep_start_qpc
+row_column async_marker_wait_us
+row_column async_marker_wait_type
+row_column driver_sleep_start_qpc
+row_column driver_sleep_end_qpc
+row_column driver_sleep_interval_us
+row_column driver_use_game_sleep
+row_column flip_config_qpc
+row_column flip_time_per_batch_us
+row_column up_grid_target_qpc
+row_column up_interval_us
+row_column up_gpu_interval_us
+row_column up_gpu_service_us
+row_column up_queue_wait_raw_us
+row_column up_queue_wait_us
+row_column up_outstanding
+row_column up_limit_wait_us
+row_column up_ready_age_us
+row_column up_flags
+row_column up_hold_budget_us
+row_column up_service_sample_us
+row_column up_gpu_wait_us
+row_column up_cycle_us
+row_column gq_submits
+row_column gq_first_submit_qpc
+row_column gq_first_start_qpc
+row_column gq_last_submit_qpc
+row_column gq_last_done_qpc
+row_column gq_empty_us
+row_column gq_first_gap_us
+row_column gq_stamp_late_us
+row_column gq_min_margin_us
+row_column gq_wait_block_us
+row_column gq_hold_block_us
+row_column gq_min_margin_free_us
+row_column gq_boundary_idle_us
+row_column gq_cycle_us
+row_column gq_wait_idle_us
+row_column up_ql_base_us
+row_column up_ql_need_us
+row_column up_ql_service_us
+row_column up_ql_q_us
+row_column up_ql_p_us
+row_column up_ql_valid_frames
+row_column sim_end_marker_qpc
+row_column render_submit_start_marker_qpc
+row_column render_submit_end_marker_qpc
+row_column up_ql_rt_margin_us
+row_column up_ql_rt_offset_us
+row_column up_ql_q_rt_us
+row_column render_submit_cpu_us
+row_column sim_cpu_us
+row_column render_submit_tid
+row_column sim_tid
+row_column render_submit_end_tid
+row_column sim_end_tid
+row_column up_ql_rt_contrast_us
+row_column up_ql_rt_spread_us
+row_column up_ql_rt_wait_us
+row_column gq_queue_role
+
+event_column sequence
+event_column capture_epoch
+event_column event_type
+event_column event_qpc
+event_column qpc_frequency
+event_column identity_domain
+event_column previous_value
+event_column value
+event_column native_swapchain
+event_column clock_map_offset_us
+event_column source_drops
+event_column present_drops
+event_column gate_drops
+event_column ready_drops
+event_column reflex_drops
+event_column display_drops
+event_column csv_row_drops
+event_column csv_event_drops
+event_column display_samples
+event_column join_rule_present_attribution
+event_column join_rule_pcl_frame_id
+event_column join_rule_none
+event_column present_unique
+event_column present_ambiguous
+event_column present_not_found
+event_column clock_mismatches
+event_column source_missing
+event_column gate_joined
+event_column ready_joined
+event_column reflex_joined
+event_column unjoined_presents
+event_column late_display_joins
+event_column unjoined_present_drops
+event_column pending_display_forced
+event_column pending_display_drops
+event_column invalid_records
+event_column present_capacity_evictions
+event_column source_capacity_evictions
+event_column gate_capacity_evictions
+event_column ready_capacity_evictions
+event_column reflex_capacity_evictions
+event_column display_changes
+event_column display_intervals
+event_column observer_epoch_breaks
+event_column loss_window_breaks
+event_column out_of_order_breaks
+event_column gap_breaks
+event_column real_frames
+event_column animation_samples
+event_column chain_replacements
+event_column snapshot_sequence
+event_column window_first_row_sequence
+event_column window_last_row_sequence
+event_column snapshot_display_source
+event_column snapshot_loss_window
+event_column snapshot_target_output_interval_us
+event_column window_display_changes
+event_column window_display_interval_count
+event_column window_display_interval_p50_us
+event_column window_display_interval_p99_us
+event_column window_adjacent_jitter_count
+event_column window_adjacent_jitter_p50_us
+event_column window_adjacent_jitter_p99_us
+event_column window_abs_deviation_count
+event_column window_abs_deviation_p50_us
+event_column window_abs_deviation_p99_us
+event_column window_abs_animation_error_count
+event_column window_abs_animation_error_p50_us
+event_column window_abs_animation_error_p99_us
+event_column window_latency_count
+event_column window_latency_p50_us
+event_column window_latency_p99_us
+event_column window_gpu_residence_count
+event_column window_gpu_residence_p50_us
+event_column window_gpu_residence_p99_us
+event_column window_cpu_hold_count
+event_column window_cpu_hold_p50_us
+event_column window_cpu_hold_p99_us
+event_column window_long_frames
+event_column window_short_frames
+event_column snapshot_dropped_records
+event_column etw_events_lost
+event_column etw_buffers_lost
+event_column lost_present_count
+event_column overflowed_present_count
+event_column reason
+
+# rung
+rung 0 source_only
+rung 1 marker_hold
+rung 2 native_hold retired
+rung 3 gpu_queue_wait
+rung 4 fg_input_wait
+
+# timing_mode
+timing_mode 0 off
+timing_mode 1 vrr
+timing_mode 2 fixed
+timing_mode 3 idle
+
+# placement
+placement 0 none
+placement 1 marker
+placement 2 present
+placement 3 pre_sleep retired
+placement 4 driver_limiter
+placement 5 unified
+
+# fallback_reason
+fallback_reason 0 none
+fallback_reason 1 passthrough
+fallback_reason 2 idle_cap
+fallback_reason 3 smoothing_off retired
+fallback_reason 4 override
+fallback_reason 5 present_route
+fallback_reason 6 architecture
+fallback_reason 7 api
+fallback_reason 8 fixed_refresh
+fallback_reason 9 no_native_route
+fallback_reason 10 no_gpu_queue
+fallback_reason 11 fg_unqualified
+fallback_reason 12 infeasible retired
+fallback_reason 13 fg_route_unsupported
+fallback_reason 14 driver_limiter_unavailable
+
+# epoch_reason
+epoch_reason 0 none
+epoch_reason 1 lifecycle
+epoch_reason 2 mode_change
+epoch_reason 3 period_change
+epoch_reason 4 source_late
+epoch_reason 5 output_late
+epoch_reason 6 governor_step retired
+
+# plan_status
+plan_status 0 unknown
+plan_status 1 source_only
+plan_status 2 held
+plan_status 3 late
+plan_status 4 missing
+plan_status 5 stale
+plan_status 6 duplicate
+plan_status 7 undeliverable
+plan_status 8 passthrough
+
+# display_source
+display_source 1 etw
+display_source 2 dxgi
+
+# output_kind
+output_kind 0 unknown
+output_kind 1 none
+output_kind 2 marker_cpu_hold
+output_kind 3 native_cpu_hold retired
+output_kind 4 gpu_queue_wait
+output_kind 5 gpu_cpu_present retired
+output_kind 6 fg_input_wait
+
+# join_rule
+join_rule 0 none
+join_rule 1 present_attribution
+join_rule 2 pcl_frame_id
+join_rule 3 pcl_simulation_start
+
+# identity_domain
+identity_domain 0 unknown
+identity_domain 1 nvapi_frame
+identity_domain 2 pcl_frame
+identity_domain 3 synthetic_present_frame
+
+# break_reason
+break_reason 1 observer_epoch
+break_reason 2 loss_window
+break_reason 3 out_of_order
+break_reason 4 gap
+
+# clock_map_status
+clock_map_status 0 unknown
+clock_map_status 1 warming
+clock_map_status 2 stable
+clock_map_status 3 unstable
+
+# pcl_status
+pcl_status 0 disabled
+pcl_status 1 starting
+pcl_status 2 warming
+pcl_status 3 native
+pcl_status 4 no_pclstats
+pcl_status 5 etw_access_denied
+pcl_status 6 stale
+pcl_status 7 event_loss
+pcl_status 8 low_fps_unreliable
+pcl_status 9 start_failed
+pcl_status 10 stopped
+
+# governor_cause
+governor_cause 0 none
+governor_cause 1 demand retired
+governor_cause 2 misses retired
+governor_cause 3 release retired
+governor_cause 4 probe retired
+governor_cause 5 probe_failed retired
+governor_cause 6 reset retired
+governor_cause 7 base retired
+governor_cause 8 room retired
+governor_cause 9 release_failed retired
+
+# feasibility_cause
+feasibility_cause 0 none retired
+feasibility_cause 1 lead_infeasible retired
+feasibility_cause 2 resume_spread retired
+feasibility_cause 3 retry retired
+feasibility_cause 4 overload retired
+feasibility_cause 5 slow_resumes retired
+feasibility_cause 6 score_not_held retired
+feasibility_cause 7 score_held retired
+feasibility_cause 8 probe_not_held retired
+feasibility_cause 9 probe_held retired
+feasibility_cause 10 ab_held retired
+feasibility_cause 11 ab_not_held retired
+feasibility_cause 12 saturated retired
+feasibility_cause 13 load_dropped retired
+feasibility_cause 14 recheck retired
+
+# gpu_wait_cap_cause
+gpu_wait_cap_cause 0 none retired
+gpu_wait_cap_cause 1 late_resumes retired
+gpu_wait_cap_cause 2 trial_failed retired
+gpu_wait_cap_cause 3 calm retired
+gpu_wait_cap_cause 4 reset retired
+gpu_wait_cap_cause 5 opened retired
+gpu_wait_cap_cause 6 closed retired
+
+# source_flag
+source_flag 1 slept
+source_flag 2 pre_sleep
+source_flag 4 gpu_paced retired
+source_flag 8 fixed_refresh
+source_flag 16 background
+source_flag 32 passthrough
+source_flag 64 overload retired
+source_flag 128 stall_injected retired
+
+# event_type
+event_type 1 capture_start
+event_type 2 capture_end
+event_type 3 observer_epoch
+event_type 4 producer_epoch
+event_type 5 controller_generation
+event_type 6 loss_window_begin
+event_type 7 loss_window_end
+event_type 8 queue_drops
+event_type 9 join_statistics
+event_type 10 clock_map_status
+event_type 11 snapshot
+event_type 12 pcl_status
+event_type 13 grid_epoch
+event_type 14 pipeline_change
+event_type 15 stall_injected retired
+event_type 16 governor_step retired
+event_type 17 rung_feasibility retired
+event_type 18 gpu_wait_cap retired
+
+# The 80 keys of the [FrameLimiter] section (retired keys are not listed: the build neither reads nor writes them).
+config_key target_fps
+config_key background_fps
+config_key fg_off_fps
+config_key vsync_mode
+config_key enforcement_marker
+config_key initial_wake_guard_us
+config_key window_mode
+config_key fake_fullscreen
+config_key selected_monitor
+config_key focus_lock
+config_key oled_care_key
+config_key oled_care_all_monitors
+config_key oled_care_idle_minutes
+config_key osd_enabled
+config_key osd_x
+config_key osd_y
+config_key osd_opacity
+config_key osd_scale
+config_key osd_drop_shadow
+config_key osd_text_brightness
+config_key osd_toggle_key
+config_key osd_position_cycle_key
+config_key shared_presets
+config_key osd_preset_prev_key
+config_key osd_preset_next_key
+config_key blackout_key
+config_key pacing_preference
+config_key advanced_settings
+config_key developer_settings
+config_key config_version
+config_key flip_metering_off
+config_key gpu_queue_probe
+config_key gpu_queue_probe_source
+config_key pacing_test_mode
+config_key unified_hold_share
+config_key unified_queue_law
+config_key unified_queue_rank
+config_key unified_queue_need_frames
+config_key unified_queue_upstream
+config_key unified_queue_margin_end
+config_key unified_queue_allow_us
+config_key control_file
+config_key dynamic_mfg_passthrough
+config_key reflex_inject
+config_key flip_model_override
+config_key log_level
+config_key csv_enabled
+config_key native_pcl_enabled
+config_key gpu_present_gate_probes
+config_key dlss_info_hooks
+config_key hook_installer_thread
+config_key streamline_compat
+config_key osd_show_fps
+config_key osd_show_frametime
+config_key osd_show_frametime_graph
+config_key osd_show_fg
+config_key osd_show_limiter
+config_key osd_show_pqi
+config_key osd_show_cpu_latency
+config_key osd_show_native_pcl
+config_key osd_show_native_pcl_breakdown
+config_key osd_show_pqi_breakdown
+config_key osd_show_1pct_low
+config_key osd_show_smoothness
+config_key osd_show_pacing_quality
+config_key osd_show_0_1pct_low
+config_key osd_show_gpu_render_time
+config_key osd_show_total_frame_cost
+config_key osd_show_fg_time
+config_key osd_show_gpu_temp
+config_key osd_show_gpu_clock
+config_key osd_show_gpu_usage
+config_key osd_show_vram
+config_key osd_show_cpu_usage
+config_key osd_show_ram
+config_key osd_show_dlss_quality
+config_key osd_show_dlss_features
+config_key osd_show_dlss_resolution
+config_key osd_show_dlss_presets
+config_key osd_show_dlss_versions

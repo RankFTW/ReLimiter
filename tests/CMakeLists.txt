@@ -859,6 +859,23 @@ if(MSVC)
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     target_compile_options(test_pacing_csv PRIVATE /W4 /utf-8 /permissive-)
 endif()
+# The pacing schema fixture (data/pacing_schema.txt) against the production CSV writer and name functions.
+add_executable(test_pacing_schema test_pacing_schema.cpp
+    ${CMAKE_SOURCE_DIR}/src/csv_writer.cpp
+    ${CMAKE_SOURCE_DIR}/src/frame_timeline.cpp
+    ${CMAKE_SOURCE_DIR}/src/pacing_resolver.cpp
+    ${CMAKE_SOURCE_DIR}/src/period_governor.cpp
+    ${CMAKE_SOURCE_DIR}/src/rung_feasibility.cpp)
+set_target_properties(test_pacing_schema PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+target_include_directories(test_pacing_schema PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_definitions(test_pacing_schema PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
+    PACING_SCHEMA_FIXTURE="${CMAKE_SOURCE_DIR}/tests/data/pacing_schema.txt")
+if(MSVC)
+    set_property(TARGET test_pacing_schema PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(test_pacing_schema PRIVATE /W4 /utf-8 /permissive-)
+endif()
 foreach(regression_target IN ITEMS test_hook_regressions test_hook_batch test_hook_installer test_hook_installer_stress
     test_pacing_metrics test_pacing_join test_reflex_clock_map test_native_pcl_loss_window
     test_native_present_gate test_cross_thread_slot
@@ -919,6 +936,7 @@ add_test(NAME reflex_clock_map COMMAND test_reflex_clock_map)
 add_test(NAME native_pcl_loss_window COMMAND test_native_pcl_loss_window)
 add_test(NAME native_pcl_display_latency COMMAND test_native_pcl_display_latency)
 add_test(NAME pacing_csv COMMAND test_pacing_csv)
+add_test(NAME pacing_schema COMMAND test_pacing_schema)
 add_test(NAME addon_exports
     COMMAND test_addon_exports $<TARGET_FILE:relimiter>)
 add_test(NAME dmfg_detection_properties COMMAND test_dmfg_detection)

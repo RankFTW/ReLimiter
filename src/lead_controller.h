@@ -196,8 +196,8 @@ constexpr double LEAD_CONCURRENCY_TOLERANCE_US = 100.0;
 // frame n + 1 (the next release gates the previous frame's Present), so
 // frame n's Present follows ReLimiter's waits for later frames. Those waits
 // are not the game's time. A later frame k gated frame n when it was
-// released no later than frame n's Present-side time (PRESENT_START, the
-// native arrival or the Present call); its waits (the source wait and a
+// released no later than frame n's Present-side time (PRESENT_START or the
+// Present call); its waits (the source wait and a
 // pre-Sleep wait) inside [s_n, that time] are frame n's gated hold. The
 // late-output check (source_stage.cpp) judges frame n without it; the lead
 // keeps the measured X, because a lockstep
@@ -228,7 +228,7 @@ constexpr double LEAD_CONCURRENCY_TOLERANCE_US = 100.0;
 //   sits right after it. With q removed, the late-output check's gated-hold
 //   forgiveness shrank (p50 29.1 / 19.6 → 7.3 ms) and the grid restarted 292
 //   times per 1,000 frames, against none with q kept in X.
-// - H1 and H2 already remove ReLimiter's own CPU hold (the overlap rule), so
+// - H1 already removes ReLimiter's own CPU hold (the overlap rule), so
 //   the queue left over is the game's as well.
 // - On the GPU queue wait (CONTROL with FG off), late resumes concentrated on
 //   queued frames (38.5% against 4.8%); that output keeps X.
@@ -692,7 +692,7 @@ private:
     enum Field : uint8_t {
         FieldSource = 0,
         FieldMarkerArrival,
-        FieldNativeArrival,
+        FieldNativeArrival, // reserved: the historical NativeArrival stage event (no producer); keeps the field layout
         FieldPresentCall,
         FieldOutputRelease,
         FieldGpuReady,
@@ -848,8 +848,8 @@ private:
     void ResetSpikeFloor() noexcept;
     // Lockstep engines: waits of later frames that gated this one, in ticks.
     int64_t GatedHoldTicks(const PendingFrame& frame) const noexcept;
-    // The frame's CPU Present-side event: PRESENT_START (H0, H1), the native
-    // arrival (H2) or the Present call (GPU rungs).
+    // The frame's CPU Present-side event: PRESENT_START (H0, H1) or the
+    // Present call (GPU rungs).
     static Field PresentSideField(PacingRung rung) noexcept;
     bool PreviousCpuHold(const PendingFrame* previous, int64_t origin_qpc,
         double* begin_us, double* end_us) const noexcept;

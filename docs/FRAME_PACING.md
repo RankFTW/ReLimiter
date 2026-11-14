@@ -4,7 +4,7 @@ This document explains how ReLimiter's frame pacing works, with diagrams. It is 
 
 **Scope.** 64-bit DirectX 12 with NVIDIA Reflex is the supported and tested configuration; other APIs with Reflex run the same pacer untested; games without Reflex and all 32-bit games get a plain frame-rate cap. The Present route that caps those games (see [Who Paces](#who-paces)) is retained and covered by unit tests; it has not been validated in a game, and nothing validates DirectX 11, Vulkan or 32-bit pacing.
 
-Nobody is expected to tune any of this. ReLimiter has no pacing settings besides the frame-rate caps and the Pacing preference: the output point is always chosen automatically and the source wait runs inside the Reflex Sleep call. Every number below is a built-in value, not a setting.
+Nobody is expected to tune any of this. ReLimiter has no pacing settings besides the frame-rate caps and the Pacing preference: the output point is always chosen automatically, and where a game calls the Reflex Sleep the source wait runs inside that call; otherwise it runs in the enforcement marker call, or at the Present call on the Present route ([Where the Source Wait Happens](#where-the-source-wait-happens)). Every number below is a built-in value, not a setting.
 
 Each section ends with the source files it describes. Diagrams that use numbers say so; those numbers only illustrate the shape of the timing.
 
@@ -95,8 +95,10 @@ Background FPS, FG-Off Cap and OLED Care are paced by the same owner with the id
 
 **The Present route** is the generic fallback: the cap is held by a source wait at the Present call, on a VRR or fixed-refresh display, with a fixed lead of 150 µs and nothing held after it. It is retained and covered by unit tests of the source stage, the cadence grid and the resolver; it has not been validated in a game. It has two particulars by architecture:
 
-- **64-bit:** with the limiter off on a VRR display the VRR cap is the cap; there is no LFC multiple, and a late output does not restart the cadence.
-- **32-bit:** cap 0 on a VRR display means uncapped; LFC applies and a late output restarts the cadence.
+- **64-bit:** with the limiter off on a VRR display the VRR cap is the cap; there is no LFC multiple.
+- **32-bit:** cap 0 on a VRR display means uncapped; LFC applies.
+
+No output executor runs on this route, so no output time reaches the cadence grid and a late output never restarts it; only a source that arrives late does (`SourceLate`).
 
 A marker route cannot occur in a 32-bit process: such a game resolves to the Present route.
 
@@ -110,7 +112,7 @@ Source: `src/pacing_resolver.cpp` (`PacingPipeline_Resolve`, `PacingPipeline_Cla
 
 The unified pacer places the game's release itself and derives the output target from it. It paces 64-bit games with Reflex markers; every quantity below belongs to one real frame `n`. The start target is written `T_start(n)` to keep it apart from the output target `T(n)`.
 
-**The interval.** `I(n)` is the largest of four terms, each multiplied by the frame generation factor `N` (the raw factor, never the ramped divisor):
+**The interval.** `I(n)` is the largest of four terms. `BuildUnifiedTerms` multiplies the cap, VRR and game terms by the frame generation factor `N` (the raw factor, never the ramped divisor); an idle interval replaces the cap term as it is, and the GPU term is already an interval per real frame, so it is not multiplied. `UnifiedPacer::BuildStart` takes the larger of that base and the GPU term:
 
 | Term | Meaning |
 |------|---------|
@@ -184,7 +186,7 @@ An *epoch* is a stretch of the grid with one phase. A restart starts a new epoch
 | `ModeChange` | Timing mode changed between off, VRR, fixed and idle (for example focus lost or regained) | `T(n) = now + L` |
 | `PeriodChange` | Cap, VRR ceiling, LFC multiple, raw FG divisor or idle cap changed `I` | Continues from the previous target: `T(n) = T(n−1) + I_new` |
 | `SourceLate` | Present route: the game reached its source wait later than `S` plus the late tolerance plus its slack | `T(n) = now + L`, released at once |
-| `OutputLate` | Present route of a 32-bit game: a frame's output came later than `T(n)` plus the late tolerance (the unified pacer and the 64-bit Present route do not judge outputs) | `T(n+1) = o + I`, `o` being that output time |
+| `OutputLate` | A frame's output came later than `T(n)` plus the late tolerance; the grid's rule for an output that is not GPU-paced (the unified pacer does not judge outputs and the Present route observes none) | `T(n+1) = o + I`, `o` being that output time |
 
 Interval changes that are not one of these (the 50 ms FG divisor ramp) are *silent rebases*: the grid continues from `T(n−1) + I_new` and no epoch is counted.
 
@@ -305,32 +307,30 @@ The lead for the next frame comes from the bucket's samples:
 ```mermaid
 sequenceDiagram
     participant Game
-    participant Hook as Marker hook and source stage
+    participant Hook as Present hook and source stage
     participant Grid as Cadence grid
-    participant Exec as Output executor
     participant Disp as Display
-    Game->>Hook: SIMULATION_START marker of frame n
+    Game->>Hook: ReShade present event of real frame n, before the native Present
+    Note over Hook: frame generation's extra presents are skipped
     Hook->>Grid: plan next index
-    Grid-->>Hook: T(n) and S = T(n) − L
+    Grid-->>Hook: T(n) and S = T(n) − 150 µs
     Hook->>Hook: publish frame plan under the exact key
-    Hook->>Hook: source wait until S
+    Hook->>Hook: source wait at the Present call until S, at most two intervals
     Hook-->>Game: release at s
-    Game->>Game: simulation and render work
-    Game->>Exec: PRESENT_START or Present call
-    Exec->>Grid: resolve T(n) with the output spacing floor
-    alt now is at or after T
-        Exec-->>Disp: pass on at once, Late, never held
-    else target still ahead
-        Exec->>Exec: hold the frame until T
-        Exec-->>Disp: pass on at T
+    Game->>Disp: native Present, nothing held after it
+    Note over Hook,Grid: no output executor runs, so no output time reaches the grid
+    Game->>Hook: present event of frame n + 1
+    Hook->>Grid: plan next index
+    alt the call came later than S plus the late tolerance and slack
+        Grid-->>Hook: SourceLate epoch, T = now + L, released at once
+    else
+        Grid-->>Hook: T and S on the same grid
     end
-    Exec-->>Hook: OutputRelease event with the output time o
-    Hook->>Grid: observe output, restart if o is later than T plus tol
 ```
 
-Under the unified pacer the first steps run the other way round: the Reflex Sleep call waits for the start target first and the plan's target is the release plus the lead. The output executors and the lead measurement are the same.
+A marker route plans differently: the unified pacer's start wait comes first, the plan's target is the release plus the lead, and an output executor holds or passes the frame at `T` ([The Unified Pacer](#the-unified-pacer), [Output Points](#output-points)).
 
-Source: `src/source_stage.h`, `src/source_stage.cpp` (`RunPlannedFrame`, `DrainStageEvents`), `src/frame_plan.h`, `src/lead_controller.h`, `src/lead_controller.cpp` (`NextLeadUs`, `SampleUs`, `QueueUs`, `EmitSample`), `src/pacing_resolver.cpp` (lead parameters), `src/pacing_core_types.h` (`PacingFramePlan`).
+Source: `src/source_stage.h`, `src/source_stage.cpp` (`RunPlannedFrame`, `DrainStageEvents`), `src/frame_plan.h`, `src/lead_controller.h`, `src/lead_controller.cpp` (`NextLeadUs`, `SampleUs`, `QueueUs`, `EmitSample`), `src/pacing_resolver.cpp` (lead parameters, `PacingPipeline_Resolve`), `src/pacing_core_types.h` (`PacingFramePlan`), `src/vk_enforce.cpp` (`VkEnforce_OnPresent`, the Present route's frame), `src/enforcement_dispatcher.cpp` (`EnfDisp_OnPresent`).
 
 ---
 
@@ -436,7 +436,7 @@ Every executor checks the clock against `T` before it holds anything. A frame th
 
 ### Collision-aware release
 
-On `gpu_queue_wait`, a late resume happens when the work after the wait becomes ready while the game's next frame already runs a long command buffer on the same GPU engine: the GPU does not interrupt it, so the resume waits. The release headroom limits the lead so the release does not land in that window. The lead is `L = min(Q_q(X) + allowance, I + Q10(D) − H)`, at most `3 I`:
+On `gpu_queue_wait`, a late resume happens when the work after the wait becomes ready while the game's next frame already runs a long command buffer on the same GPU engine: the GPU does not interrupt it, so the resume waits. The release headroom limits the lead so the release is kept clear of that window. The lead is `L = min(Q_q(X) + allowance, I + Q10(D) − H)`, at most `3 I`:
 
 - **Release headroom `H`.** The limit is `I + Q10(D) − H`, where `D` is a frame's time from source release to the start of its heavy GPU work (GPU ready time minus the GPU active render time from its Reflex latency report) and `Q10` is the 10th percentile of the newest 256 values. A frame adds a `D` sample only when the frame before it was a GPU wait frame whose GPU waited at its gate: only a waited release can collide with the next frame's heavy work. While that verdict is pending (the readback probe of that frame's resume has not arrived yet) the sample is deferred and added when the verdict is known; readiness decides only when no probe time is available. A frame after one that was not waited for, or that belongs to another lifecycle or FG multiplier, adds none. `H` is a fixed 1.0 ms.
 - **Release margin `M`.** Without current Reflex GPU active times (none within the newest 64 frames planned with the GPU wait's lead), the same guard uses the time to the next frame's Present call: at most `I + Q10(C) − M`, with `C` the release-to-Present-call time (every GPU wait frame adds one). `M` is fixed at 2.5 ms.
@@ -563,8 +563,8 @@ Source: `src/feedback.cpp`, `src/feedback.h`, `src/reflex_clock_map.h`, `src/pac
 | `tol` | Late tolerance: `max(I / 4, 500 µs)`. |
 | slack | `L` minus the median `X` of the rung; how much later than `S` a source can arrive and still make `T`. |
 | `C`, `D` | Release-to-Present-call time and release-to-heavy-GPU-work time of a GPU wait frame. |
-| `H` | Release headroom: how long before the next frame's heavy GPU work the GPU wait is released (fixed, 1.0 ms). |
-| `M` | Release margin: the same distance to the next Present call (fixed, 2.5 ms). Used without Reflex GPU times. |
+| `H` | Release headroom: the fixed 1.0 ms that the GPU queue wait's lead limit keeps between the release and the next frame's heavy GPU work (its 10th-percentile time). |
+| `M` | Release margin: the fixed 2.5 ms the same limit keeps before the next frame's Present call (its 10th-percentile time). Used without Reflex GPU times. |
 | `w` | RENDERSUBMIT_START: the moment the game's render thread takes a frame. |
 | `e`, `b` | SIMULATION_END and PRESENT_END markers of a frame. |
 | `q` | The time a finished frame waited for the render thread to leave the previous Present; left out of the `fg_input_wait` lead. |

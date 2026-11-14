@@ -85,7 +85,7 @@ Choose a target your game can sustain in the scenes you play. Avoid running seve
 
 With supported static frame generation enabled, the target accounts for the detected multiplier. For example, 160 FPS with 4× generation corresponds to a render target of approximately 40 FPS.
 
-On a VRR display, a target below the display's VRR range is paced with low framerate compensation: the driver repeats frames, and ReLimiter paces each displayed frame a whole number of refreshes apart.
+In a 32-bit game on a VRR display, a target below the display's VRR range is paced with low framerate compensation: the driver repeats frames, and ReLimiter paces each displayed frame a whole number of refreshes apart. The 64-bit pacer does not round the target to whole refreshes; the developer-only `driver_limiter` test mode applies the same rounding to the driver's cap.
 
 ---
 
@@ -198,7 +198,7 @@ The technical lines are under **Details**, a collapsed node below the status lin
 | **Lead** | How far ahead of each target the game is released, whether it is still `warming` or `warm`, and how many frames it is based on. `, at budget` means the wanted lead was clamped to three frame intervals, so those frames are likely to miss their targets. |
 | **Lead spike floor** | Shown while the floor applies: the lowest lead that still covers a game's rare long simulation frames (arrival tail plus GPU time) against the lead's own quantile. `sets the lead` means the floor, not the quantile, is what sets the lead. A readout only. |
 | **Grid epoch** | Counts cadence restarts (after a cap or mode change, a new swapchain or a late frame). An occasional increase is normal; a counter that climbs steadily means frames keep missing their targets. |
-| **Release headroom** / **Release margin** | Shown on `gpu_queue_wait`: how much room ReLimiter leaves before the game's next frame starts heavy GPU work (headroom) or its next Present call (margin). A `guard off` note means the room is not needed in this game. |
+| **Release headroom** / **Release margin** | Shown on `gpu_queue_wait`: the room the release limit keeps before the game's next frame starts heavy GPU work (headroom) or reaches its next Present call (margin). A `guard off` note means the room is not needed in this game. |
 | **Driver Sleep** | Average time the game's Reflex Sleep call spends in the driver, shown while a GPU wait is the output. A readout only. |
 
 Below the status line itself (not under **Details**), `Dynamic frame generation: pacing passthrough` is shown while frame pacing is left to the driver.

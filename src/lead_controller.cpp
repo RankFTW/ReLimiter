@@ -779,8 +779,6 @@ LeadController::Field LeadController::PresentSideField(PacingRung rung) noexcept
     case PacingRung::SourceOnly:
     case PacingRung::MarkerHold:
         return FieldMarkerArrival;
-    case PacingRung::NativeHold:
-        return FieldNativeArrival;
     default:
         return FieldPresentCall;
     }
@@ -1101,24 +1099,21 @@ uint16_t LeadController::OwnFieldMask(PacingRung rung) noexcept
     case PacingRung::SourceOnly:
     case PacingRung::MarkerHold:
         return static_cast<uint16_t>(FieldBit(FieldSource) | FieldBit(FieldMarkerArrival));
-    case PacingRung::NativeHold:
-        return static_cast<uint16_t>(FieldBit(FieldSource) | FieldBit(FieldNativeArrival));
     case PacingRung::GpuQueueWait:
     case PacingRung::FgInputWait:
         return static_cast<uint16_t>(FieldBit(FieldSource) | FieldBit(FieldPresentCall) |
             FieldBit(FieldGpuReady));
+    case PacingRung::NativeHold: // historical rung: no build plans it
     case PacingRung::Count:
         break;
     }
     return 0xFFFF; // unreachable: releases with an invalid rung are rejected
 }
 
-// A CPU hold starts at the marker arrival (H1) or the native arrival (H2);
-// other rungs hold no CPU thread.
+// A CPU hold starts at the marker arrival (H1); other rungs hold no CPU thread.
 bool LeadController::CpuHoldStartField(PacingRung rung, Field* field) noexcept
 {
     if (rung == PacingRung::MarkerHold) *field = FieldMarkerArrival;
-    else if (rung == PacingRung::NativeHold) *field = FieldNativeArrival;
     else return false;
     return true;
 }
@@ -1287,8 +1282,7 @@ void LeadController::EmitLeadSample(PendingFrame* frame) noexcept
 }
 
 // X relative to the frame's source release s:
-//   H0: a − s.   H1/H2: (a − s) − overlap([s, a], previous CPU hold), with the
-//   native arrival for H2.
+//   H0: a − s.   H1: (a − s) − overlap([s, a], previous CPU hold).
 //   H3 and FG input wait: the measured max(p, r) − s.
 double LeadController::MeasuredUs(const PendingFrame& frame, const PendingFrame* previous) const noexcept
 {
@@ -1296,10 +1290,8 @@ double LeadController::MeasuredUs(const PendingFrame& frame, const PendingFrame*
     switch (frame.rung) {
     case PacingRung::SourceOnly:
         return MicrosecondsBetween(source, frame.qpc[FieldMarkerArrival]);
-    case PacingRung::MarkerHold:
-    case PacingRung::NativeHold: {
-        const Field arrival = frame.rung == PacingRung::MarkerHold ? FieldMarkerArrival : FieldNativeArrival;
-        const double arrival_us = MicrosecondsBetween(source, frame.qpc[arrival]);
+    case PacingRung::MarkerHold: {
+        const double arrival_us = MicrosecondsBetween(source, frame.qpc[FieldMarkerArrival]);
         double hold_begin_us = 0.0;
         double hold_end_us = 0.0;
         return PreviousCpuHold(previous, source, &hold_begin_us, &hold_end_us)
@@ -1310,6 +1302,7 @@ double LeadController::MeasuredUs(const PendingFrame& frame, const PendingFrame*
     case PacingRung::FgInputWait:
         return std::max(MicrosecondsBetween(source, frame.qpc[FieldPresentCall]),
             MicrosecondsBetween(source, frame.qpc[FieldGpuReady]));
+    case PacingRung::NativeHold: // historical rung: no build plans it
     case PacingRung::Count:
         break;
     }

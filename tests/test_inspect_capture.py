@@ -319,8 +319,10 @@ class ContinuityTests(TemporaryDirectoryTest):
         self.assertEqual(summary["metric_availability"]["governor_interval_us"],
                          {"valid": 1, "nonzero": 1, "missing_or_invalid": 0})
         self.assertEqual(summary["metric_availability"]["pre_sleep_margin_us"]["missing_or_invalid"], 1)
-        self.assertTrue(has_warning(summary, "pre-removal schema"))
-        self.assertFalse(has_warning(summary, "earlier append-only schema"))
+        # A pre-removal header is the one file the removed columns' readers apply to; the profile (not the
+        # warning text) says so, and it is the file's only warning: not a historical prefix.
+        self.assertTrue(inspector.has_removed_columns(summary["header"]))
+        self.assertEqual(len(summary["warnings"]), 1)
 
         current = write_csv(self.directory / f"relimiter_pacing_{SUFFIX}_2.csv", inspector.CURRENT_PACING_HEADER,
                             [pacing_row(1)])
@@ -328,7 +330,8 @@ class ContinuityTests(TemporaryDirectoryTest):
         self.assertEqual(summary["schema_profile"], "current-source-192")
         for column in REMOVED_ROW_COLUMNS:
             self.assertNotIn(column, summary["metric_availability"])  # absent, not a zero
-        self.assertFalse(has_warning(summary, "pre-removal schema"))
+        self.assertFalse(inspector.has_removed_columns(summary["header"]))
+        self.assertEqual(summary["warnings"], [])
 
     def test_frameview_missing_values_and_time_order(self):
         rows = [

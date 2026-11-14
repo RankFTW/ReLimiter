@@ -161,5 +161,8 @@ a foreground frame limiter target set, Telemetry Logging on
   `placement=driver_limiter`, rows carry bit 32 and not bit 1, and the cap is held
   by the driver, not by ReLimiter; where it cannot (idle caps, no Reflex Sleep from
   the game) the line shows `reason=driver_limiter_unavailable` and frames pass through
-- `off`: ReLimiter paces again (rows without bit 32, bit 1 set on frames that waited)
+- `off`: ReLimiter paces again: rows without bit 32. A frame whose start wait ran inside the
+  game's Reflex Sleep call carries bit 2 and not bit 1; a frame that ReLimiter itself held in
+  the marker call (the Sleep did not reserve the start, for example a game that does not call
+  the Reflex Sleep) carries bit 1. A frame that needed no wait carries neither
 - Without `developer_settings` the saved `pacing_test_mode` is ignored

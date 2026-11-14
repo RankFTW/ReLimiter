@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -60,6 +61,8 @@ std::string fail_delete_path;
 bool throw_writes = false;
 unsigned creates = 0;
 unsigned closes = 0;
+unsigned reads = 0; // every profile read the production code made (counted under `mutex`)
+std::atomic<int> applied_log_level{ -1 }; // the LogLevel the production code last applied (-1: none since launch)
 std::atomic<bool> logger_alive{ true };
 std::atomic<unsigned> logger_shutdowns{ 0 };
 std::atomic<unsigned> worker_logs{ 0 };
@@ -88,6 +91,7 @@ int WINAPI Directory(HWND, LPCSTR, const SECURITY_ATTRIBUTES*) { return ERROR_SU
 DWORD WINAPI Read(LPCSTR section, LPCSTR key, LPCSTR fallback,
                   LPSTR out, DWORD size, LPCSTR path) {
     std::lock_guard<std::mutex> lock(mutex);
+    ++reads;
     const auto found = disk.find({ path, section, key });
     const char* value = found == disk.end() ? fallback : found->second.c_str();
     const int length = snprintf(out, size, "%s", value ? value : "");
@@ -194,8 +198,14 @@ void VSync_ApplyOpenGL() {}
 #ifdef _WIN64
 void ReflexInject_SetEnabled(bool) noexcept {}
 #endif
-void Log_SetLevel(LogLevel) {}
-LogLevel Log_ParseLevel(const char*) { return LogLevel::Warn; }
+void Log_SetLevel(LogLevel level) { config_test::applied_log_level = static_cast<int>(level); }
+LogLevel Log_ParseLevel(const char* text) {
+    for (const LogLevel level : { LogLevel::Error, LogLevel::Warn, LogLevel::Info, LogLevel::Debug }) {
+        static const char* const names[] = { "error", "warn", "info", "debug" };
+        if (std::strcmp(text, names[static_cast<int>(level)]) == 0) return level;
+    }
+    return LogLevel::Warn;
+}
 const char* Log_GetProcessName() { return "config-test"; }
 // The Sleep-mode reconcile's key note (nvapi_hooks.cpp is not linked here).
 void NvAPI_PrepareUnifiedKey(bool) noexcept {}
@@ -275,6 +285,7 @@ void Launch(bool creation_failure, bool initial_write_failure, bool keep_disk, c
         warn_lines.clear();
     }
     logger_alive = true;
+    applied_log_level = -1;
     logger_shutdowns = worker_logs = 0;
     g_config = {};
     PacingPipelineConfig stale{};
@@ -1224,35 +1235,29 @@ void TestPacingTestMode() {
 }
 
 // ── Removal of the selectable pacing settings (config_version 6) ──
-// A non-default value of every setting kRemovedKeys lists: what an earlier build wrote when the user had touched it.
+// The 30 settings config_version 6 removed, written once here as the fixture of the contract (nothing reads the production
+// table): the value an earlier build wrote when the user had touched the key, and the value it had by default (a
+// default is not reported as a loss).
 struct RemovedSetting {
     const char* key;
     const char* value;
+    const char* old_default;
 };
 constexpr RemovedSetting removed_settings[] = {
-    {"adaptive_cap", "true"}, {"adaptive_cap_percentile", "99"}, {"adaptive_cap_hold_room", "false"},
-    {"osd_show_adaptive_smoothing", "true"}, {"adaptive_smoothing", "true"}, {"smoothing", "off"},
-    {"output_rung", "gpu"}, {"source_placement", "driver"}, {"reflex_sleep_bypass", "false"},
-    {"bypass_low_latency_off", "true"}, {"driver_low_latency_off", "true"}, {"driver_limiter_hold", "true"},
-    {"pre_sleep_precise", "true"}, {"gpu_paced_cadence", "true"}, {"lead_coverage", "95"},
-    {"lead_spike_floor", "false"}, {"fg_late_spacing", "false"}, {"gpu_queue_wait_render_queue", "remove"},
-    {"gpu_wait_interleave_s", "2.5"}, {"stall_inject_ms", "12.5"}, {"stall_inject_period_s", "2"},
-    {"marker_forward_order", "after_wait"}, {"sleep_status_every_frame", "true"}, {"gpu_start_probe", "true"},
-    {"gpu_priority_probe", "true"}, {"fg_presenter_probe_us", "500"}, {"unified_pacer", "false"},
-    {"unified_every_frame_service", "false"}, {"unified_queue_target_us", "4000"}, {"gpu_wait_headroom_us", "2000"}};
+    {"adaptive_cap", "true", "false"}, {"adaptive_cap_percentile", "99", "75"}, {"adaptive_cap_hold_room", "false", "true"},
+    {"osd_show_adaptive_smoothing", "true", "false"}, {"adaptive_smoothing", "true", "false"}, {"smoothing", "off", "on"},
+    {"output_rung", "gpu", "auto"}, {"source_placement", "driver", "pre_sleep"}, {"reflex_sleep_bypass", "false", "true"},
+    {"bypass_low_latency_off", "true", "false"}, {"driver_low_latency_off", "true", "false"},
+    {"driver_limiter_hold", "true", "false"}, {"pre_sleep_precise", "true", "false"}, {"gpu_paced_cadence", "true", "false"},
+    {"lead_coverage", "95", "99"}, {"lead_spike_floor", "false", "true"}, {"fg_late_spacing", "false", "true"},
+    {"gpu_queue_wait_render_queue", "remove", "keep"}, {"gpu_wait_interleave_s", "2.5", "0"},
+    {"stall_inject_ms", "12.5", "0"}, {"stall_inject_period_s", "2", "5"}, {"marker_forward_order", "after_wait", "before_wait"},
+    {"sleep_status_every_frame", "true", "false"}, {"gpu_start_probe", "true", "false"},
+    {"gpu_priority_probe", "true", "false"}, {"fg_presenter_probe_us", "500", "0"}, {"unified_pacer", "false", "true"},
+    {"unified_every_frame_service", "false", "true"}, {"unified_queue_target_us", "4000", "2000"},
+    {"gpu_wait_headroom_us", "2000", "1000"}};
+static_assert(sizeof(removed_settings) / sizeof(removed_settings[0]) == 30, "the contract lists 30 removed settings");
 
-// The list above is exactly production's table, and every value in it is away from the key's old default.
-void CheckRemovedSettingsCoverTheTable() {
-    constexpr size_t count = sizeof(removed_settings) / sizeof(removed_settings[0]);
-    CHECK(count == sizeof(kRemovedKeys) / sizeof(kRemovedKeys[0]));
-    for (const RemovedSetting& setting : removed_settings) {
-        const RemovedKey* match = nullptr;
-        for (const RemovedKey& key : kRemovedKeys)
-            if (std::strcmp(key.name, setting.key) == 0) match = &key;
-        CHECK(match != nullptr);
-        CHECK(!SameAsDefault(setting.value, match->default_text));
-    }
-}
 // No removed key is on the fake disk, in any section of the INI, and the INI is at version 6.
 void CheckNoRemovedKeysOnDisk() {
     {
@@ -1326,7 +1331,6 @@ void RunMigrationMatrix(const char* developer_settings, const char* test_mode, P
 // reflex_sleep_bypass=false, adaptive_cap=true, ...) it is still no test mode; only an explicit pacing_test_mode
 // enters one, and only with developer_settings.
 void TestRemovedKeysMigrationMatrix() {
-    CheckRemovedSettingsCoverTheTable();
     RunMigrationMatrix("false", nullptr, PacingTestMode::Off);
     RunMigrationMatrix("true", nullptr, PacingTestMode::Off);
     RunMigrationMatrix("true", "reflex_only", PacingTestMode::ReflexOnly);
@@ -1461,7 +1465,7 @@ void TestFirstLaunchAndDefaultValuedRemovedKeys() {
     ReleaseStart();CHECK(OwnerShutdown());
 
     std::vector<IniEntry> old_defaults{{"config_version", "5"}};
-    for (const RemovedKey& key : kRemovedKeys) old_defaults.push_back({key.name, key.default_text});
+    for (const RemovedSetting& setting : removed_settings) old_defaults.push_back({setting.key, setting.old_default});
     Reset(false, false, old_defaults);
     CHECK(!Config_IsFirstLaunch());
     CHECK(RemovedInfoLine().empty()); // nothing is logged for defaults
@@ -1703,11 +1707,12 @@ void TestRetiredKeysIgnoredAndDropped() {
         {"smoothing_bias_us", "1000"}, {"smoothing_percentile", "0.5"},
         {"gpu_readiness_observer", "true"},
         {"dmfg_output_cap", "144"}, {"gpu_paced_hold_margin", "75"},
-        {"gpu_paced_release_smoothing", "true"}});
+        {"gpu_paced_release_smoothing", "true"}, {"zz_never_a_key", "1"}});
     // None of them takes effect; the pipeline matches a fresh INI.
     CHECK(g_config.gpu_present_gate_probes);
     CheckProductionDefaults();
     for (const char* key : retired_keys) CHECK(Value(local_path, "FrameLimiter", key).empty());
+    CHECK(Value(local_path, "FrameLimiter", "zz_never_a_key").empty()); // the clean rewrite drops any key it does not write
     RequestSaveConfig();ReleaseStart();CHECK(OwnerShutdown());
     CheckWorkerWrites();
     for (const char* key : retired_keys) CHECK(Value(local_path, "FrameLimiter", key).empty());
@@ -1938,6 +1943,564 @@ void TestCreationFailureAndExplicitQuiescentFlush() {
     CHECK(OwnerShutdown());
     CHECK(closes == 0 && logger_shutdowns == 1);
 }
+
+// ── Save policy: the INI is rewritten clean, key by key ──
+using Fields = std::map<std::string, std::string>;
+// Every key and value of one section of one file on the fake disk.
+Fields SectionFields(const char* path, const char* section) {
+    std::lock_guard<std::mutex> lock(mutex);
+    Fields fields;
+    for (const auto& entry : disk)
+        if (std::get<0>(entry.first) == path && std::get<1>(entry.first) == section)
+            fields[std::get<2>(entry.first)] = entry.second;
+    return fields;
+}
+// True when the section holds exactly these keys, no more and no fewer (the differences are named on stderr).
+bool HasExactlyKeys(const Fields& fields, const std::vector<std::string>& keys) {
+    Fields expected;
+    for (const std::string& key : keys) expected[key] = "";
+    bool same = expected.size() == keys.size(); // the literal list has no duplicate
+    for (const auto& entry : fields)
+        if (!expected.count(entry.first)) {
+            std::fprintf(stderr, "unexpected key: %s\n", entry.first.c_str());
+            same = false;
+        }
+    for (const auto& entry : expected)
+        if (!fields.count(entry.first)) {
+            std::fprintf(stderr, "missing key: %s\n", entry.first.c_str());
+            same = false;
+        }
+    return same;
+}
+bool FieldIs(const Fields& fields, const std::string& key, const std::string& value) {
+    const auto found = fields.find(key);
+    if (found != fields.end() && found->second == value) return true;
+    std::fprintf(stderr, "key %s: expected '%s', found '%s'\n", key.c_str(), value.c_str(),
+                 found == fields.end() ? "<absent>" : found->second.c_str());
+    return false;
+}
+size_t WriteCount() {
+    std::lock_guard<std::mutex> lock(mutex);
+    return writes.size();
+}
+unsigned ReadCount() {
+    std::lock_guard<std::mutex> lock(mutex);
+    return reads;
+}
+// The values written to one key of any file, in order.
+std::vector<std::string> WrittenValues(const char* key) {
+    std::lock_guard<std::mutex> lock(mutex);
+    std::vector<std::string> values;
+    for (const auto& write : writes)
+        if (std::get<2>(write.key) == key) values.push_back(write.value);
+    return values;
+}
+
+// The 28 OSD element toggles of the live config and of a preset, written once here as the fixture of the contract:
+// the INI key of the config flag, the key of the preset section, and the two fields.
+struct OsdToggle {
+    const char* config_key;
+    const char* preset_key;
+    bool Config::* config_field;
+    bool OSDPreset::* preset_field;
+};
+#define OSD_TOGGLE(name) { "osd_show_" #name, "show_" #name, &Config::osd_show_##name, &OSDPreset::show_##name }
+const OsdToggle osd_toggles[] = {
+    OSD_TOGGLE(fps), OSD_TOGGLE(frametime), OSD_TOGGLE(frametime_graph), OSD_TOGGLE(fg), OSD_TOGGLE(limiter),
+    OSD_TOGGLE(pqi), OSD_TOGGLE(cpu_latency), OSD_TOGGLE(native_pcl), OSD_TOGGLE(native_pcl_breakdown),
+    OSD_TOGGLE(pqi_breakdown), OSD_TOGGLE(1pct_low), OSD_TOGGLE(smoothness), OSD_TOGGLE(pacing_quality),
+    OSD_TOGGLE(0_1pct_low), OSD_TOGGLE(gpu_render_time), OSD_TOGGLE(total_frame_cost), OSD_TOGGLE(fg_time),
+    OSD_TOGGLE(gpu_temp), OSD_TOGGLE(gpu_clock), OSD_TOGGLE(gpu_usage), OSD_TOGGLE(vram), OSD_TOGGLE(cpu_usage),
+    OSD_TOGGLE(ram), OSD_TOGGLE(dlss_quality), OSD_TOGGLE(dlss_features), OSD_TOGGLE(dlss_resolution),
+    OSD_TOGGLE(dlss_presets), OSD_TOGGLE(dlss_versions)};
+#undef OSD_TOGGLE
+constexpr size_t osd_toggle_count = sizeof(osd_toggles) / sizeof(osd_toggles[0]);
+static_assert(osd_toggle_count == 28, "the contract lists 28 OSD element toggles");
+
+// The 52 keys of the [FrameLimiter] section that are not OSD element toggles (80 with the 28 toggles), each with a value
+// away from its default as an earlier launch left it, and the value the clean rewrite saves back. The keybind keys are
+// written to the local INI only while the presets are not shared. Derived by running the writer, then pinned. Which keys
+// exist is not decided here: ExpectedIniKeys reads the config_key lines of the shared fixture.
+struct IniKey {
+    const char* key;
+    const char* seeded;
+    const char* written;
+};
+const IniKey non_default_ini[] = {
+    {"target_fps", "90", "90"}, {"background_fps", "45", "45"}, {"fg_off_fps", "60", "60"},
+    {"vsync_mode", "on", "on"}, {"enforcement_marker", "Present", "Present"},
+    {"initial_wake_guard_us", "1200", "1200.000000"}, {"window_mode", "borderless", "borderless"},
+    {"fake_fullscreen", "true", "true"}, {"selected_monitor", "2", "2"}, {"focus_lock", "true", "true"},
+    {"oled_care_key", "F11", "F11"}, {"oled_care_all_monitors", "false", "false"}, {"oled_care_idle_minutes", "5", "5"},
+    {"osd_enabled", "true", "true"}, {"osd_x", "0.25", "0.250000"}, {"osd_y", "0.75", "0.750000"},
+    {"osd_opacity", "0.5", "0.500000"}, {"osd_scale", "1.5", "1.500000"}, {"osd_drop_shadow", "false", "false"},
+    {"osd_text_brightness", "0.5", "0.500000"}, {"osd_toggle_key", "F9", "F9"}, {"osd_position_cycle_key", "F10", "F10"},
+    {"shared_presets", "false", "false"}, // true is the shared-file variant below
+    {"osd_preset_prev_key", "F1", "F1"}, {"osd_preset_next_key", "F2", "F2"}, {"blackout_key", "F3", "F3"},
+    {"pacing_preference", "smooth", "smooth"}, {"advanced_settings", "true", "true"},
+    {"developer_settings", "true", "true"}, {"config_version", "6", "6"}, {"flip_metering_off", "true", "true"},
+    {"gpu_queue_probe", "false", "false"}, {"gpu_queue_probe_source", "0", "0"},
+    {"pacing_test_mode", "driver_limiter", "driver_limiter"}, {"unified_hold_share", "0.125", "0.125000"},
+    {"unified_queue_law", "false", "false"}, {"unified_queue_rank", "3", "3"}, {"unified_queue_need_frames", "6", "6"},
+    {"unified_queue_upstream", "1", "1"}, {"unified_queue_margin_end", "0", "0"}, {"unified_queue_allow_us", "2500", "2500"},
+    {"control_file", "true", "true"}, {"dynamic_mfg_passthrough", "true", "true"}, {"reflex_inject", "true", "true"},
+    {"flip_model_override", "true", "true"}, {"log_level", "debug", "debug"},
+    {"csv_enabled", "true", "false"}, // telemetry needs an explicit activation each launch
+    {"native_pcl_enabled", "true", "true"}, {"gpu_present_gate_probes", "false", "false"},
+    {"dlss_info_hooks", "false", "false"}, {"hook_installer_thread", "false", "false"},
+    {"streamline_compat", "force_false", "force_false"}};
+constexpr size_t non_default_ini_count = sizeof(non_default_ini) / sizeof(non_default_ini[0]);
+static_assert(non_default_ini_count == 52, "the contract lists 52 further keys");
+bool IsKeybindKey(const std::string& key) {
+    return key == "osd_preset_prev_key" || key == "osd_preset_next_key" || key == "blackout_key";
+}
+// The keys of the [FrameLimiter] section the build reads and writes: the config_key lines of
+// tests/data/pacing_schema.txt (next to this file), which tests/test_pacing_schedule.py compares with the settings the
+// capture kit may write. A first launch writes exactly these; a key added to or removed from the build fails this test
+// until the fixture follows.
+std::vector<std::string> FixtureIniKeys() {
+    std::string path = __FILE__;
+    path.erase(path.find_last_of("/\\") + 1);
+    std::ifstream file(path + "data/pacing_schema.txt");
+    CHECK(file.is_open());
+    std::vector<std::string> keys;
+    const std::string prefix = "config_key ";
+    for (std::string line; std::getline(file, line);) {
+        if (line.compare(0, prefix.size(), prefix) != 0) continue;
+        std::string key = line.substr(prefix.size());
+        while (!key.empty() && (key.back() == '\r' || key.back() == ' ')) key.pop_back();
+        keys.push_back(key);
+    }
+    CHECK(!keys.empty());
+    return keys;
+}
+// Every key the clean rewrite writes to the [FrameLimiter] section.
+std::vector<std::string> ExpectedIniKeys(bool shared_presets) {
+    std::vector<std::string> keys;
+    for (const std::string& key : FixtureIniKeys())
+        if (!(shared_presets && IsKeybindKey(key))) keys.push_back(key);
+    return keys;
+}
+
+// A first launch writes every key at its default and nothing else; every key set away from its default loads, is
+// written back as loaded (a key the writer omitted would be erased by the clean rewrite), and a second launch of
+// the rewritten file changes nothing; an unknown key does not survive; the telemetry switch is never carried over.
+void TestIniWritesExactlyTheKeysThatExist() {
+    Reset();
+    CHECK(Config_IsFirstLaunch());
+    CHECK(HasExactlyKeys(SectionFields(local_path, "FrameLimiter"), ExpectedIniKeys(false)));
+    ReleaseStart();CHECK(OwnerShutdown());
+    CHECK(HasExactlyKeys(SectionFields(local_path, "FrameLimiter"), ExpectedIniKeys(false)));
+
+    std::vector<IniEntry> seed;
+    for (const IniKey& entry : non_default_ini) seed.push_back({entry.key, entry.seeded});
+    for (const OsdToggle& toggle : osd_toggles)
+        seed.push_back({toggle.config_key, std::strcmp(toggle.config_key, "osd_show_fps") == 0 ? "false" : "true"});
+    seed.push_back({"zz_never_a_key", "1"});
+    const auto check_written = [](const Fields& fields) {
+        CHECK(HasExactlyKeys(fields, ExpectedIniKeys(false)));
+        for (const IniKey& entry : non_default_ini) CHECK(FieldIs(fields, entry.key, entry.written));
+        for (const OsdToggle& toggle : osd_toggles)
+            CHECK(FieldIs(fields, toggle.config_key, std::strcmp(toggle.config_key, "osd_show_fps") == 0 ? "false" : "true"));
+    };
+    Reset(false, false, seed);
+    CHECK(!Config_IsFirstLaunch());
+    check_written(SectionFields(local_path, "FrameLimiter"));
+    CHECK(Value(local_path, "FrameLimiter", "zz_never_a_key").empty());
+    // What the loaded config holds, key by key.
+    CHECK(g_config.target_fps == 90 && g_config.background_fps == 45 && g_config.fg_off_fps == 60);
+    CHECK(g_config.vsync_mode == "on" && g_config.enforcement_marker == "Present" && g_config.window_mode == "borderless");
+    CHECK(g_config.initial_wake_guard_us == 1200.0 && g_config.selected_monitor == 2 && g_config.oled_care_idle_minutes == 5);
+    CHECK(g_config.fake_fullscreen && g_config.focus_lock && !g_config.oled_care_all_monitors && g_config.osd_enabled);
+    CHECK(g_config.osd_x == 0.25f && g_config.osd_y == 0.75f && g_config.osd_opacity == 0.5f && g_config.osd_scale == 1.5f);
+    CHECK(!g_config.osd_drop_shadow && g_config.osd_text_brightness == 0.5f);
+    CHECK(g_config.osd_toggle_key == "F9" && g_config.osd_position_cycle_key == "F10" && g_config.oled_care_key == "F11");
+    CHECK(g_config.osd_preset_prev_key == "F1" && g_config.osd_preset_next_key == "F2" && g_config.blackout_key == "F3");
+    CHECK(!g_config.shared_presets && g_config.advanced_settings && g_config.developer_settings);
+    CHECK(g_config.pacing_preference == PacingPreference::Smooth && g_config.pacing_test_mode == PacingTestMode::DriverLimiter);
+    CHECK(g_config.flip_metering_off && g_config.control_file && !g_config.gpu_present_gate_probes);
+    CHECK(!g_config.gpu_queue_probe && g_config.gpu_queue_probe_source == 0 && g_config.unified_queue_margin_end == 0);
+    CHECK(g_config.unified_hold_share == 0.125 && !g_config.unified_queue_law && g_config.unified_queue_rank == 3);
+    CHECK(g_config.unified_queue_need_frames == 6 && g_config.unified_queue_upstream == 1 && g_config.unified_queue_allow_us == 2500);
+    CHECK(g_config.dynamic_mfg_passthrough && g_config.reflex_inject && g_config.flip_model_override);
+    CHECK(g_config.log_level == "debug" && g_config.native_pcl_enabled && !g_config.csv_enabled);
+    CHECK(!g_config.dlss_info_hooks && !g_config.hook_installer_thread && !g_config.streamline_compat);
+    for (const OsdToggle& toggle : osd_toggles)
+        CHECK(g_config.*(toggle.config_field) == (std::strcmp(toggle.config_key, "osd_show_fps") != 0));
+#ifdef _WIN64
+    g_fg_mode.store(0); // dynamic_mfg_passthrough took the mode over
+#endif
+    ReleaseStart();CHECK(OwnerShutdown());
+    const Fields saved = SectionFields(local_path, "FrameLimiter");
+    check_written(saved);
+    // The rewritten file loads to the same file.
+    Relaunch();
+    CHECK(SectionFields(local_path, "FrameLimiter") == saved);
+#ifdef _WIN64
+    g_fg_mode.store(0);
+#endif
+    ReleaseStart();CHECK(OwnerShutdown());
+    CHECK(SectionFields(local_path, "FrameLimiter") == saved);
+}
+
+// With shared presets the keybinds (preset cycling, blackout) live in the shared file's [Presets] section: they are loaded
+// from it over the local INI's copy, never written to the local INI, and changes go to the shared file; with the presets
+// local the keys are in the local INI and the shared file is not touched.
+void TestSharedPresetsKeepTheKeybindsInTheSharedFile() {
+    const Fields seeded_shared{{"prev_key", "F1"}, {"next_key", "F2"}, {"blackout_key", "F3"}};
+    const std::vector<DiskEntry> shared_keys{{shared_path, "Presets", "prev_key", "F1"},
+        {shared_path, "Presets", "next_key", "F2"}, {shared_path, "Presets", "blackout_key", "F3"}};
+    extra_seed = shared_keys;
+    Reset(false, false, {{"config_version", "6"}, {"shared_presets", "true"}, {"osd_preset_prev_key", "stale"},
+        {"osd_preset_next_key", "stale"}, {"blackout_key", "stale"}});
+    CHECK(g_config.osd_preset_prev_key == "F1" && g_config.osd_preset_next_key == "F2" && g_config.blackout_key == "F3");
+    CHECK(HasExactlyKeys(SectionFields(local_path, "FrameLimiter"), ExpectedIniKeys(true)));
+    CHECK(FieldIs(SectionFields(local_path, "FrameLimiter"), "shared_presets", "true"));
+    CHECK(SectionFields(shared_path, "Presets") == seeded_shared);
+    g_config.osd_preset_prev_key = "F5";
+    RequestSaveConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+    CheckWorkerWrites();
+    CHECK(Value(shared_path, "Presets", "prev_key") == "F5");
+    CHECK(Value(shared_path, "Presets", "next_key") == "F2" && Value(shared_path, "Presets", "blackout_key") == "F3");
+    CHECK(HasExactlyKeys(SectionFields(local_path, "FrameLimiter"), ExpectedIniKeys(true)));
+
+    extra_seed = shared_keys;
+    Reset(false, false, {{"config_version", "6"}, {"osd_preset_prev_key", "L1"}, {"osd_preset_next_key", "L2"},
+        {"blackout_key", "L3"}});
+    CHECK(g_config.osd_preset_prev_key == "L1" && g_config.osd_preset_next_key == "L2" && g_config.blackout_key == "L3");
+    CHECK(HasExactlyKeys(SectionFields(local_path, "FrameLimiter"), ExpectedIniKeys(false)));
+    CHECK(Value(local_path, "FrameLimiter", "osd_preset_prev_key") == "L1");
+    CHECK(Value(local_path, "FrameLimiter", "osd_preset_next_key") == "L2");
+    CHECK(Value(local_path, "FrameLimiter", "blackout_key") == "L3");
+    CHECK(SectionFields(shared_path, "Presets") == seeded_shared);
+    ReleaseStart();CHECK(OwnerShutdown());
+    CHECK(SectionFields(shared_path, "Presets") == seeded_shared);
+}
+
+// The log level of the INI is kept at start and applied; the telemetry (CSV) switch is never carried over a start, but a
+// change made while running is saved.
+void TestStartupKeepsLogLevelAndDisablesCsv() {
+    Reset(false, false, {{"config_version", "6"}, {"log_level", "debug"}, {"csv_enabled", "true"}});
+    CHECK(g_config.log_level == "debug" && applied_log_level == static_cast<int>(LogLevel::Debug));
+    CHECK(!g_config.csv_enabled);
+    CHECK(Value(local_path, "FrameLimiter", "log_level") == "debug");
+    CHECK(Value(local_path, "FrameLimiter", "csv_enabled") == "false");
+    g_config.csv_enabled = true; // the OSD switch
+    RequestSaveConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+    CHECK(Value(local_path, "FrameLimiter", "csv_enabled") == "true");
+    Relaunch();
+    CHECK(!g_config.csv_enabled && g_config.log_level == "debug" && applied_log_level == static_cast<int>(LogLevel::Debug));
+    CHECK(Value(local_path, "FrameLimiter", "csv_enabled") == "false");
+    ReleaseStart();CHECK(OwnerShutdown());
+    // An unknown level is reset to warn and applied as such.
+    Reset(false, false, {{"config_version", "6"}, {"log_level", "verbose"}});
+    CHECK(g_config.log_level == "warn" && applied_log_level == static_cast<int>(LogLevel::Warn));
+    CHECK(Value(local_path, "FrameLimiter", "log_level") == "warn");
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// Each removed setting alone in an old INI: it is named as lost, absent from the rewritten INI (the whole section equals a
+// first launch's), changes nothing the config or the pipeline holds, and a later save never writes it.
+void TestEachRemovedKeyAloneIsDroppedAndNeverSaved() {
+    Reset();
+    const Fields fresh_fields = SectionFields(local_path, "FrameLimiter");
+    const Loaded fresh = Capture();
+    ReleaseStart();CHECK(OwnerShutdown());
+    for (const RemovedSetting& setting : removed_settings) {
+        Reset(false, false, {{"config_version", "5"}, {setting.key, setting.value}});
+        CHECK(!Config_IsFirstLaunch());
+        CHECK(RemovedInfoLine() == std::string(removed_info_prefix) + setting.key + "=" + setting.value);
+        CHECK(Value(local_path, "FrameLimiter", setting.key).empty());
+        CHECK(SectionFields(local_path, "FrameLimiter") == fresh_fields);
+        CHECK(SameLoaded(fresh, Capture()));
+        g_config.target_fps = 77;
+        RequestSaveConfig();
+        ReleaseStart();CHECK(OwnerShutdown());
+        CheckWorkerWrites();
+        CHECK(Value(local_path, "FrameLimiter", "target_fps") == "77");
+        CHECK(Value(local_path, "FrameLimiter", setting.key).empty());
+        CHECK(WrittenValues(setting.key).empty());
+    }
+}
+
+// The live keys are the 15 below, written once here as the fixture of the contract: each is accepted with a value of its
+// own, is a key the INI carries, and every other key the INI carries is refused as not live and changes nothing.
+struct LiveKey {
+    const char* key;
+    const char* value;
+};
+const LiveKey live_keys[] = {
+    {"target_fps", "60"}, {"background_fps", "45"}, {"fg_off_fps", "48"}, {"pacing_preference", "smooth"},
+    {"gpu_present_gate_probes", "off"}, {"gpu_queue_probe", "off"}, {"gpu_queue_probe_source", "0"},
+    {"unified_queue_margin_end", "0"}, {"unified_hold_share", "0.1"}, {"pacing_test_mode", "reflex_only"},
+    {"unified_queue_law", "off"}, {"unified_queue_rank", "3"}, {"unified_queue_need_frames", "6"},
+    {"unified_queue_upstream", "1"}, {"unified_queue_allow_us", "2500"}};
+static_assert(sizeof(live_keys) / sizeof(live_keys[0]) == 15, "the contract lists 15 live keys");
+bool IsLiveKey(const std::string& key) {
+    for (const LiveKey& live : live_keys)
+        if (key == live.key) return true;
+    return false;
+}
+void TestOnlyTheListedKeysAreLive() {
+    Reset(false, false, {{"config_version", "6"}, {"developer_settings", "true"}});
+    char error[128] = {};
+    for (const LiveKey& live : live_keys) {
+        CHECK(Config_SetLiveKey(live.key, live.value, error, sizeof(error)) && error[0] == '\0');
+        CHECK(!Config_SetLiveKey(live.key, "not-a-value", error, sizeof(error)) && error[0] != '\0');
+    }
+    SaveConfig(); // the INI now carries every live key as set
+    const Fields before = SectionFields(local_path, "FrameLimiter");
+    CHECK(HasExactlyKeys(before, ExpectedIniKeys(false)));
+    for (const LiveKey& live : live_keys) CHECK(before.count(live.key) == 1);
+    size_t refused = 0;
+    for (const auto& entry : before) {
+        if (IsLiveKey(entry.first)) continue;
+        char unknown[128] = {};
+        CHECK(!Config_SetLiveKey(entry.first.c_str(), "1", unknown, sizeof(unknown)));
+        CHECK(std::strstr(unknown, "not a live key") != nullptr);
+        ++refused;
+    }
+    CHECK(refused == 80 - 15);
+    SaveConfig();
+    CHECK(SectionFields(local_path, "FrameLimiter") == before); // nothing a refused key named changed
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// The developer fields Config_DeveloperOverrides counts and Config_ResetDeveloperSettings returns to their defaults are
+// these 13 (a name and the way to move the field away from its default and test that it is back); nothing else counts, and
+// the user's settings stay through the reset.
+struct DeveloperField {
+    const char* name;
+    void (*move_away)();
+    bool (*at_default)();
+};
+const DeveloperField developer_fields[] = {
+    {"gpu_present_gate_probes", [] { g_config.gpu_present_gate_probes = false; }, [] { return g_config.gpu_present_gate_probes; }},
+    {"flip_metering_off", [] { g_config.flip_metering_off = true; }, [] { return !g_config.flip_metering_off; }},
+    {"control_file", [] { g_config.control_file = true; }, [] { return !g_config.control_file; }},
+    {"gpu_queue_probe", [] { g_config.gpu_queue_probe = false; }, [] { return g_config.gpu_queue_probe; }},
+    {"gpu_queue_probe_source", [] { g_config.gpu_queue_probe_source = 0; }, [] { return g_config.gpu_queue_probe_source == 1; }},
+    {"unified_queue_margin_end", [] { g_config.unified_queue_margin_end = 0; }, [] { return g_config.unified_queue_margin_end == 1; }},
+    {"pacing_test_mode", [] { g_config.pacing_test_mode = PacingTestMode::ReflexOnly; },
+        [] { return g_config.pacing_test_mode == PacingTestMode::Off; }},
+    {"unified_hold_share", [] { g_config.unified_hold_share = 0.1; }, [] { return g_config.unified_hold_share == 0.0; }},
+    {"unified_queue_law", [] { g_config.unified_queue_law = false; }, [] { return g_config.unified_queue_law; }},
+    {"unified_queue_rank", [] { g_config.unified_queue_rank = 3; }, [] { return g_config.unified_queue_rank == 2; }},
+    {"unified_queue_need_frames", [] { g_config.unified_queue_need_frames = 6; }, [] { return g_config.unified_queue_need_frames == 4; }},
+    {"unified_queue_upstream", [] { g_config.unified_queue_upstream = 1; }, [] { return g_config.unified_queue_upstream == 0; }},
+    {"unified_queue_allow_us", [] { g_config.unified_queue_allow_us = 2500; }, [] { return g_config.unified_queue_allow_us == 4000; }}};
+static_assert(sizeof(developer_fields) / sizeof(developer_fields[0]) == 13, "the contract lists 13 developer fields");
+void TestDeveloperFieldsAreCountedAndResetOneByOne() {
+    Reset();
+    CHECK(Config_DeveloperOverrides() == 0);
+    for (const DeveloperField& field : developer_fields) {
+        field.move_away();
+        CHECK(!field.at_default());
+        CHECK(Config_DeveloperOverrides() == 1);
+        Config_ResetDeveloperSettings();
+        CHECK(field.at_default() && Config_DeveloperOverrides() == 0);
+        CheckPipelineMatchesConfig();
+    }
+    // The user's settings are not developer overrides and the reset leaves them.
+    g_config.target_fps = 90;
+    g_config.pacing_preference = PacingPreference::Smooth;
+    g_config.developer_settings = true;
+    g_config.advanced_settings = true;
+    g_config.csv_enabled = true;
+    g_config.log_level = "debug";
+    g_config.osd_enabled = true;
+    g_config.reflex_inject = true;
+    CHECK(Config_DeveloperOverrides() == 0);
+    Config_ResetDeveloperSettings();
+    CHECK(g_config.target_fps == 90 && g_config.pacing_preference == PacingPreference::Smooth);
+    CHECK(g_config.developer_settings && g_config.advanced_settings && g_config.csv_enabled);
+    CHECK(g_config.log_level == "debug" && g_config.osd_enabled && g_config.reflex_inject);
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// Every OSD element toggle is carried by the config, by a preset made from it, by each way of applying a preset (all
+// fields, toggles only), by the INI (load and save) and by the preset sections (load and save): one toggle at a time, so a
+// swapped or missing key shows.
+void TestOsdElementTogglesCoverLoadSaveAndEveryPresetPath() {
+    const auto only_config = [](size_t k) {
+        for (size_t i = 0; i < osd_toggle_count; ++i)
+            if (g_config.*(osd_toggles[i].config_field) != (i == k)) return false;
+        return true;
+    };
+    const auto only_preset = [](const OSDPreset& p, size_t k) {
+        for (size_t i = 0; i < osd_toggle_count; ++i)
+            if (p.*(osd_toggles[i].preset_field) != (i == k)) return false;
+        return true;
+    };
+    const auto set_all = [](bool value) {
+        for (const OsdToggle& toggle : osd_toggles) g_config.*(toggle.config_field) = value;
+    };
+    Reset();
+    for (size_t k = 0; k < osd_toggle_count; ++k) {
+        set_all(false);
+        g_config.*(osd_toggles[k].config_field) = true;
+        OSDPreset preset = OSDPreset_FromConfig();
+        CHECK(preset.occupied && only_preset(preset, k));
+        preset.osd_x = 0.25f; preset.osd_y = 0.75f; preset.osd_scale = 1.5f; preset.osd_opacity = 0.5f;
+        // Toggles only: the position, scale and opacity stay.
+        set_all(true);
+        g_config.osd_x = 0.5f; g_config.osd_y = 0.5f; g_config.osd_scale = 1.0f; g_config.osd_opacity = 0.6f;
+        OSDPreset_ApplyTogglesOnly(preset);
+        CHECK(only_config(k));
+        CHECK(g_config.osd_x == 0.5f && g_config.osd_y == 0.5f && g_config.osd_scale == 1.0f && g_config.osd_opacity == 0.6f);
+        // All fields: the position, scale and opacity follow too.
+        set_all(true);
+        OSDPreset_ApplyToConfig(preset);
+        CHECK(only_config(k));
+        CHECK(g_config.osd_x == 0.25f && g_config.osd_y == 0.75f && g_config.osd_scale == 1.5f && g_config.osd_opacity == 0.5f);
+    }
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    // Through the INI and the preset section of the disk.
+    std::vector<std::string> preset_keys{"name", "osd_x", "osd_y", "osd_scale", "osd_opacity"};
+    for (const OsdToggle& toggle : osd_toggles) preset_keys.push_back(toggle.preset_key);
+    for (size_t k = 0; k < osd_toggle_count; ++k) {
+        std::vector<IniEntry> ini{{"config_version", "6"}};
+        for (size_t i = 0; i < osd_toggle_count; ++i) ini.push_back({osd_toggles[i].config_key, i == k ? "true" : "false"});
+        extra_seed = {{local_path, "OSD_Preset_1", "name", "One"}, {local_path, "OSD_Preset_1", osd_toggles[k].preset_key, "true"}};
+        Reset(false, false, ini);
+        CHECK(only_config(k));
+        const OSDPreset& loaded = OSDPreset_GetSlot(0);
+        CHECK(loaded.occupied && std::strcmp(loaded.name, "One") == 0 && only_preset(loaded, k));
+        OSDPreset_SaveSlot(0);
+        ReleaseStart();CHECK(OwnerShutdown());
+        const Fields app = SectionFields(local_path, "FrameLimiter");
+        for (size_t i = 0; i < osd_toggle_count; ++i) CHECK(FieldIs(app, osd_toggles[i].config_key, i == k ? "true" : "false"));
+        const Fields preset = SectionFields(local_path, "OSD_Preset_1");
+        CHECK(HasExactlyKeys(preset, preset_keys));
+        for (size_t i = 0; i < osd_toggle_count; ++i) CHECK(FieldIs(preset, osd_toggles[i].preset_key, i == k ? "true" : "false"));
+        CHECK(SectionFields(local_path, "OSD_Preset_2").empty());
+    }
+}
+
+// Deleting a preset compacts the slots (the ones after it move down), keeps at least the initial slots, and clears the
+// sections that no longer hold a preset, so a deleted preset does not come back from a stale section; the shared and the
+// local presets are separate destinations.
+void TestPresetDeleteCompactsAndClearsTheTail() {
+    Reset();
+    ReleaseStart();
+    const auto name_slot = [](int slot, const char* name) {
+        OSDPreset& preset = OSDPreset_GetSlot(slot);
+        preset.occupied = true;
+        std::snprintf(preset.name, sizeof(preset.name), "%s", name);
+    };
+    name_slot(0, "A");
+    name_slot(1, "B");
+    name_slot(2, "C");
+    const int added = OSDPreset_AddSlot();
+    CHECK(added == 3);
+    name_slot(added, "D");
+    OSDPreset_SaveSlot(0);
+    CHECK(Config_FlushPending());
+    CHECK(Value(local_path, "OSD_Preset_1", "name") == "A" && Value(local_path, "OSD_Preset_2", "name") == "B");
+    CHECK(Value(local_path, "OSD_Preset_3", "name") == "C" && Value(local_path, "OSD_Preset_4", "name") == "D");
+
+    OSDPreset_DeleteSlot(1);
+    CHECK(OSDPreset_GetCount() == 3 && std::strcmp(OSDPreset_GetSlot(1).name, "C") == 0);
+    CHECK(Config_FlushPending());
+    CHECK(Value(local_path, "OSD_Preset_1", "name") == "A" && Value(local_path, "OSD_Preset_2", "name") == "C");
+    CHECK(Value(local_path, "OSD_Preset_3", "name") == "D");
+    CHECK(SectionFields(local_path, "OSD_Preset_4").empty());
+
+    OSDPreset_DeleteSlot(0);
+    OSDPreset_DeleteSlot(0);
+    CHECK(OSDPreset_GetCount() == 3 && OSDPreset_GetSlot(0).occupied && std::strcmp(OSDPreset_GetSlot(0).name, "D") == 0);
+    CHECK(!OSDPreset_GetSlot(1).occupied && !OSDPreset_GetSlot(2).occupied);
+    CHECK(Config_FlushPending());
+    CHECK(Value(local_path, "OSD_Preset_1", "name") == "D");
+    CHECK(SectionFields(local_path, "OSD_Preset_2").empty() && SectionFields(local_path, "OSD_Preset_3").empty());
+
+    // Shared presets: the image goes to the shared file and the local file keeps what it had.
+    g_config.shared_presets = true;
+    OSDPreset_SaveSlot(0);
+    CHECK(Config_FlushPending());
+    CHECK(Value(shared_path, "OSD_Preset_1", "name") == "D");
+    OSDPreset_DeleteSlot(0);
+    CHECK(Config_FlushPending());
+    CHECK(SectionFields(shared_path, "OSD_Preset_1").empty());
+    CHECK(Value(local_path, "OSD_Preset_1", "name") == "D");
+    CHECK(OwnerShutdown());
+}
+
+// The producers a UI thread calls (a settings or preset request, adding and deleting a slot, the destination switch) do no
+// profile read, no profile write and create no thread: the disk is the worker's alone.
+void TestUiRequestsDoNoCallerIo() {
+    Reset(); // the worker is held before its first batch
+    const unsigned reads_before = ReadCount();
+    g_config.target_fps = 61;
+    RequestSaveConfig();
+    OSDPreset_GetSlot(0).occupied = true;
+    std::snprintf(OSDPreset_GetSlot(0).name, sizeof(OSDPreset_GetSlot(0).name), "%s", "ui");
+    OSDPreset_SaveSlot(0);
+    const int added = OSDPreset_AddSlot();
+    CHECK(added >= 0);
+    OSDPreset_DeleteSlot(added);
+    g_config.shared_presets = true;
+    OSDPreset_SaveSlot(0);
+    CHECK(WriteCount() == 0 && ReadCount() == reads_before && creates == 1);
+    ReleaseStart();CHECK(OwnerShutdown());
+    CheckWorkerWrites();
+    CHECK(Value(local_path, "FrameLimiter", "target_fps") == "61");
+    CHECK(Value(shared_path, "OSD_Preset_1", "name") == "ui");
+}
+
+// A synchronous save and a preset reload first drain what is queued, so an older request never overwrites a newer save
+// and a queued preset is not replaced by a stale disk image (no worker here: the drain is the caller's, before the stop).
+void TestSyncSaveAndReloadDrainQueuedWritesFirst() {
+    Reset(true);
+    g_config.target_fps = 70;
+    RequestSaveConfig();
+    g_config.target_fps = 80;
+    SaveConfig();
+    const std::vector<std::string> targets = WrittenValues("target_fps");
+    CHECK(targets.size() == 2 && targets[0] == "70" && targets[1] == "80");
+    CHECK(Value(local_path, "FrameLimiter", "target_fps") == "80");
+    CHECK(s_pending_save.Empty() && s_failed_save.Empty());
+
+    OSDPreset_GetSlot(0).occupied = true;
+    std::snprintf(OSDPreset_GetSlot(0).name, sizeof(OSDPreset_GetSlot(0).name), "%s", "queued");
+    OSDPreset_SaveSlot(0);
+    CHECK(Value(local_path, "OSD_Preset_1", "name").empty());
+    OSDPreset_LoadAll();
+    CHECK(OSDPreset_GetSlot(0).occupied && std::strcmp(OSDPreset_GetSlot(0).name, "queued") == 0);
+    CHECK(Value(local_path, "OSD_Preset_1", "name") == "queued");
+    CHECK(OwnerShutdown());
+}
+
+// After the stop the synchronous entry points do no I/O at all; a request made then stays queued and unwritten; a new start
+// after a clean stop works again.
+void TestStoppedEntryPointsDoNoIo() {
+    Reset();
+    ReleaseStart();
+    CHECK(Config_Shutdown());
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        writes.clear();
+    }
+    const unsigned reads_before = ReadCount();
+    g_config.target_fps = 99;
+    SaveConfig();
+    OSDPreset_LoadAll();
+    CHECK(WriteCount() == 0 && ReadCount() == reads_before);
+    CHECK(Config_FlushPending()); // nothing queued: drained, still no I/O
+    RequestSaveConfig();
+    CHECK(!Config_FlushPending()); // queued, and not written after the stop
+    CHECK(!Config_Shutdown(0));
+    CHECK(WriteCount() == 0 && Value(local_path, "FrameLimiter", "target_fps") != "99");
+    // The next start (after the fixture discards the retained request) opens I/O again.
+    Relaunch();
+    g_config.target_fps = 98;
+    RequestSaveConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+    CHECK(Value(local_path, "FrameLimiter", "target_fps") == "98");
+}
 } // namespace config_test
 
 int main() {
@@ -1964,6 +2527,17 @@ int main() {
     TestRemovedPresetKeyIsDropped();
     TestFailedPresetKeyDeletionIsRetriedAtTheNextStart();
     TestRetiredKeysIgnoredAndDropped();
+    TestIniWritesExactlyTheKeysThatExist();
+    TestSharedPresetsKeepTheKeybindsInTheSharedFile();
+    TestStartupKeepsLogLevelAndDisablesCsv();
+    TestEachRemovedKeyAloneIsDroppedAndNeverSaved();
+    TestOnlyTheListedKeysAreLive();
+    TestDeveloperFieldsAreCountedAndResetOneByOne();
+    TestOsdElementTogglesCoverLoadSaveAndEveryPresetPath();
+    TestPresetDeleteCompactsAndClearsTheTail();
+    TestUiRequestsDoNoCallerIo();
+    TestSyncSaveAndReloadDrainQueuedWritesFirst();
+    TestStoppedEntryPointsDoNoIo();
     TestImmutableCoalescingAndDestinations();
     TestBlockedIOTimeoutAndInFlightReplacement();
     TestFailedOnlyRetry(true, false);
