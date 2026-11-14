@@ -16,7 +16,10 @@ enum class ActiveAPI : uint8_t { None, DX9, DX11, DX12, Vulkan, OpenGL };
 void SwapMgr_OnInitSwapchain(reshade::api::swapchain* sc, bool resize);
 void SwapMgr_OnDestroySwapchain(reshade::api::swapchain* sc, bool resize);
 void SwapMgr_OnInitDevice(reshade::api::device* device);
-void SwapMgr_OnDestroyDevice(reshade::api::device* device);
+// destroy_device: `identity` is the canonical identity of the destroyed device's native object
+// (DeviceIdentity_OfNative(get_native()), 0 for a non-COM API). The callback decides from values; an unrelated device
+// returns before the selection lock. It makes no call on a device proxy.
+void SwapMgr_OnDestroyDevice(reshade::api::device* device, uint64_t identity);
 void SwapMgr_ReleaseRuntimeReferences() noexcept;
 
 // Try-only admission: rejects auxiliary/reentrant/concurrent Presents without
@@ -38,14 +41,17 @@ private:
 
 ActiveAPI  SwapMgr_GetActiveAPI();
 uint64_t   SwapMgr_GetNativeHandle();   // IDXGISwapChain* or VkSwapchainKHR
-// Returns an AddRef-owned active DXGI device; caller must Release.
+// Returns an AddRef-owned active DXGI device (its canonical identity, a NATIVE object: QueryInterface(IUnknown) on
+// the native device, so releasing it never enters ReShade); caller must Release.
 IUnknown*  SwapMgr_AcquirePresentingDevice() noexcept;
 // Publication sequence of the presenting device: every publication (also of the same device
 // again, or of none) advances it by 2, odd while one is in progress. The presenting device is
 // owned by this module while published, so a device acquired between two reads that return
 // the same even value is the one published throughout, and its address is not reused.
 uint64_t   SwapMgr_PresentingDeviceSequence() noexcept;
-bool       SwapMgr_IsPresentingDevice(IUnknown* candidate) noexcept;
+// The presenting device's canonical identity as a VALUE, and the publication sequence read with it. No reference, no
+// COM call. 0: none published, a publication in progress or one that moved across the read.
+uint64_t   SwapMgr_PresentingDeviceIdentity(uint64_t* sequence) noexcept;
 HWND       SwapMgr_GetHWND();
 bool       SwapMgr_IsValid();           // true if a swapchain is cached
 uint64_t   SwapMgr_GetVkDevice();       // VkDevice handle (Vulkan only)

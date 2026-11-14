@@ -1608,7 +1608,7 @@ static void DrawSettingsImpl() {
 
 #ifdef _WIN64
         bool native_reflex =
-            (g_dev.load(std::memory_order_acquire) != nullptr) ||
+            NvAPI_HasFeedbackDevice() ||
             AreNvAPIMarkersFlowing();
         bool pcl_markers = PCL_MarkersFlowing();
         const char* reflex_str = "None";

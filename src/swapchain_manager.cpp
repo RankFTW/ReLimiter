@@ -17,6 +17,7 @@
 #include "logger.h"
 #include "vsync_control.h"
 #include <dxgi.h>
+#include "feedback_device_identity.h"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -104,28 +105,6 @@ static void RetirePresentingDevice(IUnknown* device) noexcept {
     TryDrainRetiredPresentingDevices();
 }
 
-static bool SameComIdentity(IUnknown* left, IUnknown* right) noexcept {
-    if (!left || !right) return false;
-    if (left == right) return true;
-    IUnknown* left_identity = nullptr;
-    IUnknown* right_identity = nullptr;
-    __try {
-        left->QueryInterface(
-            __uuidof(IUnknown), reinterpret_cast<void**>(&left_identity));
-        right->QueryInterface(
-            __uuidof(IUnknown), reinterpret_cast<void**>(&right_identity));
-    }
-    __except(EXCEPTION_EXECUTE_HANDLER) {
-        SafeRelease(left_identity);
-        SafeRelease(right_identity);
-        return false;
-    }
-    const bool same = left_identity && left_identity == right_identity;
-    SafeRelease(left_identity);
-    SafeRelease(right_identity);
-    return same;
-}
-
 static uint64_t BeginPresentingDeviceWrite() noexcept {
     uint64_t sequence =
         s_presenting_device_sequence.load(std::memory_order_acquire);
@@ -145,9 +124,11 @@ static uint64_t BeginPresentingDeviceWrite() noexcept {
     }
 }
 
-static void PublishPresentingDevice(IUnknown* device) noexcept {
-    IUnknown* published = device;
-    if (published && !SafeAddRef(published)) published = nullptr;
+// `native` is the NATIVE device (get_native()). What is owned and published is its canonical identity
+// (QueryInterface(IUnknown) on the native object, which takes no ReShade lock): the same value the feedback
+// publication holds for the same device, so the two compare by value.
+static void PublishPresentingDevice(IUnknown* native) noexcept {
+    IUnknown* published = native ? DeviceIdentity_AcquireCanonicalOfNative(native) : nullptr;
     const uint64_t write_sequence = BeginPresentingDeviceWrite();
     IUnknown* previous = reinterpret_cast<IUnknown*>(
         s_presenting_device_native.exchange(
@@ -517,12 +498,16 @@ SwapchainPresentGuard::~SwapchainPresentGuard() {
 
 void SwapMgr_OnInitDevice(reshade::api::device* device) {
     if (!device) return;
+    // A device init is not a presenting swapchain selection: with a device selected it changes nothing. That is
+    // decided from a value, BEFORE the selection lock: this callback runs under ReShade's device lock (inside
+    // D3D12CreateDevice), and the lock is held by the Present event for a whole frame.
+    if (!DeviceInitMayChangeSelection(s_owner_device_native.load(std::memory_order_relaxed))) return;
     SwapchainLifecycleGuard lifecycle;
     ActiveAPI api = DetectAPI(device);
 
-    // A device init is not a presenting swapchain selection. Preserve the
-    // selected API/device even across its resize gap; no sticky API ranking.
-    if (s_owner_device_native.load(std::memory_order_relaxed) != 0) return;
+    // Re-checked under the lock: a swapchain may have been selected meanwhile. Preserve the selected API/device even
+    // across its resize gap; no sticky API ranking.
+    if (!DeviceInitMayChangeSelection(s_owner_device_native.load(std::memory_order_relaxed))) return;
 
     s_active_api.store(api, std::memory_order_relaxed);
     s_vk_device.store(api == ActiveAPI::Vulkan ? device->get_native() : 0,
@@ -535,31 +520,43 @@ void SwapMgr_OnInitDevice(reshade::api::device* device) {
     }
 }
 
-void SwapMgr_OnDestroyDevice(reshade::api::device* device) {
+static DeviceDestroyRelation ClassifyDestroy(reshade::api::device* device, uint64_t identity) noexcept {
+    const ActiveAPI api = DetectAPI(device);
+    const bool com_api = api == ActiveAPI::DX11 || api == ActiveAPI::DX12;
+    uint64_t presenting_identity = 0;
+    const uint64_t owner = s_owner_device_native.load(std::memory_order_relaxed);
+    if (com_api && owner != 0 && device->get_native() != owner) {
+        uint64_t sequence = 0;
+        presenting_identity = SwapMgr_PresentingDeviceIdentity(&sequence);
+    }
+    return ClassifyDestroyedDevice(api == s_active_api.load(std::memory_order_relaxed), com_api, owner,
+                                   device->get_native(), identity, presenting_identity);
+}
+
+void SwapMgr_OnDestroyDevice(reshade::api::device* device, uint64_t identity) {
     if (!device) return;
+    // The relation of the destroyed device to the selection is decided from values (the owner's native handle, the
+    // presenting device's canonical identity against the identity the callback computed from get_native()), BEFORE
+    // the selection lock: this callback runs under ReShade's device lock, and the lock is held by the Present event
+    // for a whole frame. An unrelated device returns here. No device proxy is touched, no reference taken.
+    if (ClassifyDestroy(device, identity) == DeviceDestroyRelation::Unrelated) return;
     SwapchainLifecycleGuard lifecycle;
 
-    const ActiveAPI api = DetectAPI(device);
-    if (api != s_active_api.load(std::memory_order_relaxed)) return;
-    const uint64_t owner = s_owner_device_native.load(std::memory_order_relaxed);
-    if (owner == 0) {
+    // Again under the lock: the selection may have been torn down or replaced while this thread waited.
+    switch (ClassifyDestroy(device, identity)) {
+    case DeviceDestroyRelation::Unrelated:
+        return;
+    case DeviceDestroyRelation::NoSelection:
         // No selected swapchain resources exist yet.
         s_active_api.store(ActiveAPI::None, std::memory_order_relaxed);
         s_vk_device.store(0, std::memory_order_relaxed);
         return;
+    case DeviceDestroyRelation::Selected:
+        // Vulkan/OpenGL/DX9 never enter DXGI COM identity handling. Raw device identity is API-scoped; an unrelated
+        // same-API device cannot tear down us.
+        DeactivateSwapchain(/*resize=*/false);
+        return;
     }
-
-    bool owns_presenting_lifetime = device->get_native() == owner;
-    if (!owns_presenting_lifetime && (api == ActiveAPI::DX11 || api == ActiveAPI::DX12)) {
-        IUnknown* presenting_device = SwapMgr_AcquirePresentingDevice();
-        owns_presenting_lifetime = SameComIdentity(
-            reinterpret_cast<IUnknown*>(device->get_native()), presenting_device);
-        SafeRelease(presenting_device);
-    }
-    // Vulkan/OpenGL/DX9 never enter DXGI COM identity handling. Raw device
-    // identity is API-scoped; an unrelated same-API device cannot tear down us.
-    if (!owns_presenting_lifetime) return;
-    DeactivateSwapchain(/*resize=*/false);
 }
 
 void SwapMgr_ReleaseRuntimeReferences() noexcept {
@@ -617,13 +614,14 @@ uint64_t SwapMgr_PresentingDeviceSequence() noexcept {
     return s_presenting_device_sequence.load(std::memory_order_acquire);
 }
 
-bool SwapMgr_IsPresentingDevice(IUnknown* candidate) noexcept {
-    if (!candidate) return false;
-    IUnknown* presenting = SwapMgr_AcquirePresentingDevice();
-    if (!presenting) return false;
-    const bool same = SameComIdentity(candidate, presenting);
-    SafeRelease(presenting);
-    return same;
+uint64_t SwapMgr_PresentingDeviceIdentity(uint64_t* sequence) noexcept {
+    const uint64_t before = s_presenting_device_sequence.load(std::memory_order_acquire);
+    const uint64_t value = s_presenting_device_native.load(std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const uint64_t after = s_presenting_device_sequence.load(std::memory_order_relaxed);
+    if (sequence) *sequence = after;
+    // A publication in progress or one that moved across the read: no identity (the caller treats it as unavailable).
+    return (before == after && (after & 1u) == 0) ? value : 0;
 }
 
 HWND SwapMgr_GetHWND() {

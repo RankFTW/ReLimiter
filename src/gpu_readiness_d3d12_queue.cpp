@@ -230,11 +230,9 @@ bool GpuReadinessQueue_Release(GpuReadinessQueue* queue) noexcept {
         slot.commands = nullptr;
         slot.allocator = nullptr;
     }
-    if (queue->mapped && queue->readback) {
-        const D3D12_RANGE no_writes{0, 0};
-        __try { queue->readback->Unmap(0, &no_writes); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {released=false;}
-    }
+    // The read-back buffer is mapped once at creation and is not unmapped here: a D3D12 resource may be released while
+    // mapped, and an Unmap is a call into a method ReShade can hook. This release runs in add-on unload, which can
+    // run under ReShade's device lock (game exit), where foreign code must not be entered.
     released=Release(queue->readback) && released;
     released=Release(queue->queries) && released;
     released=Release(queue->fence) && released;

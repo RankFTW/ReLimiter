@@ -8,7 +8,49 @@
 
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x); std::abort(); } } while(false)
 
+// A D3D12 resource may be released while mapped: the unload path (which can run under ReShade's device lock) must
+// not call into the resource only to unmap it. A resource whose Unmap is counted, and no device at all.
+class CountingResource final : public ID3D12Resource {
+public:
+    ULONG refs = 1;
+    unsigned unmaps = 0;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** result) override {
+        if (!result) return E_POINTER;
+        *result = nullptr;
+        if (!IsEqualIID(iid, __uuidof(IUnknown)) && !IsEqualIID(iid, __uuidof(ID3D12Resource))) return E_NOINTERFACE;
+        *result = static_cast<ID3D12Resource*>(this);
+        ++refs;
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+    ULONG STDMETHODCALLTYPE Release() override { return --refs; }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID, void**) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE Map(UINT, const D3D12_RANGE*, void**) override { return E_NOTIMPL; }
+    void STDMETHODCALLTYPE Unmap(UINT, const D3D12_RANGE*) override { ++unmaps; }
+    D3D12_RESOURCE_DESC STDMETHODCALLTYPE GetDesc() override { return {}; }
+    D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return 0; }
+    HRESULT STDMETHODCALLTYPE WriteToSubresource(UINT, const D3D12_BOX*, const void*, UINT, UINT) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE ReadFromSubresource(void*, UINT, UINT, UINT, const D3D12_BOX*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetHeapProperties(D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS*) override { return E_NOTIMPL; }
+};
+
+void TestReleaseDoesNotUnmap() {
+    CountingResource readback;
+    uint64_t mapped_storage[kGpuTimestampCapacity] = {};
+    GpuReadinessQueue queue;
+    queue.readback = &readback;   // owned by the queue (one reference)
+    queue.mapped = mapped_storage; // as after GpuReadinessQueue_Initialize: mapped once, for the queue's lifetime
+    CHECK(GpuReadinessQueue_Release(&queue));
+    CHECK(readback.unmaps == 0);
+    CHECK(readback.refs == 0 && !queue.readback && !queue.mapped);
+}
+
 int main() {
+    TestReleaseDoesNotUnmap();
     IDXGIFactory4* factory=nullptr;
     if(FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 77;
     IDXGIAdapter* adapter=nullptr;

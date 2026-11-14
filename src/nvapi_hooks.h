@@ -8,9 +8,8 @@ extern PFN_NvAPI_D3D_SetSleepMode      s_orig_sleep_mode;
 extern PFN_NvAPI_D3D_Sleep             s_orig_sleep;
 extern PFN_NvAPI_D3D_SetLatencyMarker  s_orig_set_latency_marker;
 
-// AddRef-owned device publication captured from NvAPI calls. Consumers still
-// dereference only through NvAPI_AcquireFeedbackDevice for generation safety.
-extern std::atomic<IUnknown*> g_dev;
+// The feedback-device publication captured from NvAPI calls is an owned NATIVE device (nvapi_hooks.cpp): consumers
+// reach it only through NvAPI_AcquireFeedbackDevice (generation safety) or NvAPI_HasFeedbackDevice (a value).
 // The driver's sleep status as the pacing CSV's driver_sleep_interval_us and
 // driver_use_game_sleep columns: bit 63 set = a result, bits 40..62 = the
 // feedback-device publication the result belongs to (SleepStatusToken), bit 32 =
@@ -55,6 +54,10 @@ inline bool NvAPI_ShouldBypassSleep(bool enabled,int target_fps,bool source_pace
 	return enabled && target_fps>0 && source_paced;
 }
 
+// A feedback-device publication token. `device` is the published device's canonical identity: a NATIVE Direct3D
+// device object, owned by the publication (one reference, held while it is published). A token obtained from
+// NvAPI_AcquireFeedbackDevice carries one more reference of its own, which the caller releases
+// (NvAPI_ReleaseFeedbackDevice); every other token is a value only and must never be dereferenced.
 struct NvAPIFeedbackDevice {
 	IUnknown* device = nullptr;
 	uint32_t producer_epoch = 0;
@@ -75,25 +78,38 @@ inline bool NvAPI_IsSameFeedbackPublication(
 		expected.publication_sequence == current.publication_sequence;
 }
 
-// Both arguments must be COM devices (never Vulkan/OpenGL/DX9 native handles).
-// Compares IUnknown identity after bounded, explicit ReShade unwrap only.
-// Releases all temporary QueryInterface references; never compares adapter LUIDs.
-bool NvAPI_IsSameDevice(IUnknown* left, IUnknown* right) noexcept;
+// A device is published as the feedback device by its NATIVE identity. ReLimiter never calls AddRef, Release or
+// QueryInterface (other than IID_UnwrappedObject) on a device pointer that a game or plugin passed in: that pointer
+// can be a ReShade device proxy whose reference count takes ReShade's process-wide device lock (src/AGENTS.md,
+// "ReShade's device lock"). An incoming pointer is unwrapped once to the native device it wraps
+// (feedback_device_identity.h) or compared by value as the publication's alias.
+//
+// True when something is published (a value read, no reference).
+bool NvAPI_HasFeedbackDevice() noexcept;
 
-// published_device receives an identity token for the owned global
-// publication; the token itself does not carry an additional COM reference.
-// Only a new publication returns true/sets the token. Equivalent aliases leave
-// the original callable device, epoch, sequence and restoration state untouched.
+// Publishes the native device behind `device` (an incoming pointer: the game's own, a proxy, a wrapper) when it is not
+// the published one. published_device receives an identity token for the owned global publication; the token itself
+// does not carry an additional COM reference. Only a new publication returns true/sets the token. An equivalent alias
+// (the same native device) leaves the original publication, epoch, sequence and restoration state untouched.
 bool NvAPI_CaptureFeedbackDevice(
 	IUnknown* device,
 	NvAPIFeedbackDevice* published_device = nullptr) noexcept;
+// The published native device with its own reference (release with NvAPI_ReleaseFeedbackDevice), for ReLimiter's own
+// NvAPI calls. The reference is on a native object. Empty when nothing is published or a transition keeps moving.
 NvAPIFeedbackDevice NvAPI_AcquireFeedbackDevice() noexcept;
 bool NvAPI_IsFeedbackDeviceCurrent(
 	const NvAPIFeedbackDevice& feedback_device) noexcept;
+// Releases a reference on a NATIVE object (ReLimiter owns no other kind).
 void NvAPI_ReleaseFeedbackDevice(IUnknown* device) noexcept;
 void NvAPI_ClearFeedbackDevice(
 	const NvAPIFeedbackDevice& expected_device) noexcept;
+// `expected_device` names the publication by the pointer it was captured with (the native device or the alias).
 void NvAPI_ClearFeedbackDevice(IUnknown* expected_device = nullptr) noexcept;
+// destroy_device: clears the publication when `identity` (the canonical identity of the destroyed device's native
+// object, DeviceIdentity_OfNative(get_native())) is the published device; a value check otherwise, with no writer
+// section, no reference and no COM call. Runs under ReShade's device lock: it never touches a device proxy. The
+// publication's own reference (on the native) is released at once, or retired to the next drain.
+void NvAPI_OnDeviceDestroyed(uint64_t identity) noexcept;
 
 // Game's requested sleep interval (from SetSleepMode)
 extern std::atomic<uint32_t> g_game_requested_interval;

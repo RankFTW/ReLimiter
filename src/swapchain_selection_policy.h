@@ -110,3 +110,36 @@ private:
     bool has_presented_ = false;
     int64_t last_present_qpc_ = 0;
 };
+
+// ── Device events (init_device / destroy_device) ──
+//
+// Both run under ReShade's process-wide device lock (inside D3D12CreateDevice and inside the Release of a device
+// proxy), while the Present event holds the selection lock for a whole frame. A device event that cannot change the
+// selection must therefore return from VALUES, before it takes the selection lock. Pure and platform-free so the
+// decision is tested without the manager.
+
+// init_device records the API only while no swapchain's device is selected (owner == 0); with one selected it
+// changes nothing. The caller re-checks under the lock.
+inline bool DeviceInitMayChangeSelection(uint64_t owner_device_native) noexcept {
+    return owner_device_native == 0;
+}
+
+enum class DeviceDestroyRelation : uint8_t {
+    Unrelated,    // another API, or another device than the selected one: nothing to do, no lock
+    NoSelection,  // the active API's device, with no swapchain's device selected yet: the API record is reset
+    Selected      // the selected swapchain's device: the selection is torn down
+};
+
+// `api_is_active`: the destroyed device's API is the active API. `com_api`: Direct3D 11/12 (DXGI), whose devices
+// compare by canonical identity. `owner_native`: the selected swapchain's device, as get_native() reported it.
+// `raw_native`: the destroyed device's get_native(). `identity`: the canonical identity of that native
+// (DeviceIdentity_OfNative), `presenting_identity`: the presenting device's published canonical identity (0: none).
+inline DeviceDestroyRelation ClassifyDestroyedDevice(bool api_is_active, bool com_api, uint64_t owner_native,
+                                                     uint64_t raw_native, uint64_t identity,
+                                                     uint64_t presenting_identity) noexcept {
+    if (!api_is_active) return DeviceDestroyRelation::Unrelated;
+    if (owner_native == 0) return DeviceDestroyRelation::NoSelection;
+    if (raw_native == owner_native) return DeviceDestroyRelation::Selected;
+    if (com_api && identity != 0 && identity == presenting_identity) return DeviceDestroyRelation::Selected;
+    return DeviceDestroyRelation::Unrelated;
+}

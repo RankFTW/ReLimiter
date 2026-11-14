@@ -914,6 +914,10 @@ add_test(NAME scheduler_cadence COMMAND test_scheduler_cadence)
 add_test(NAME osd_cadence COMMAND test_osd_cadence)
 add_test(NAME feedback_device_identity COMMAND test_feedback_device_identity)
 set_tests_properties(feedback_device_identity PROPERTIES TIMEOUT 30)
+# The fake ReShade device lock must fail AT ONCE (not hang) on a proxy call made while the thread holds it.
+add_test(NAME feedback_device_lock_fixture COMMAND test_feedback_device_identity --proxy-call-under-lock)
+set_tests_properties(feedback_device_lock_fixture PROPERTIES TIMEOUT 30
+    PASS_REGULAR_EXPRESSION "FAIL line [0-9]+: owner.load\\(\\) != self")
 add_test(NAME oled_care COMMAND test_oled_care)
 add_test(NAME osd_position COMMAND test_osd_position)
 add_test(NAME module_presence COMMAND test_module_presence)

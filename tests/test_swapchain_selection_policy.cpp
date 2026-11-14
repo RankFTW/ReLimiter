@@ -195,6 +195,36 @@ void TestConservativeWindowAndClockHandling() {
     Accept(&policy, Present(B, 2100), SwapchainPresentSelection::Activate);
 }
 
+// The device events run under ReShade's process-wide device lock while a Present event holds the selection lock
+// for a whole frame: an event that cannot change the selection must be decided from values (here), so the manager
+// returns before it takes that lock. This tests the decision, not that the manager asks it before the lock.
+void TestDeviceEventsDecideFromValues() {
+    constexpr uint64_t kOwner = 0xA000, kOther = 0xB000, kOtherIdentity = 0xB010, kOwnerIdentity = 0xA010;
+    // init_device: only while no swapchain's device is selected.
+    CHECK(DeviceInitMayChangeSelection(0));
+    CHECK(!DeviceInitMayChangeSelection(kOwner));
+
+    // destroy_device of another API than the active one: unrelated, whatever the rest says.
+    CHECK(ClassifyDestroyedDevice(false, true, kOwner, kOwner, kOwnerIdentity, kOwnerIdentity) ==
+          DeviceDestroyRelation::Unrelated);
+    // Nothing selected yet: the API record is reset (under the lock), for any device of the active API.
+    CHECK(ClassifyDestroyedDevice(true, true, 0, kOther, kOtherIdentity, 0) == DeviceDestroyRelation::NoSelection);
+    // The selected swapchain's own device, by its native handle.
+    CHECK(ClassifyDestroyedDevice(true, true, kOwner, kOwner, 0, 0) == DeviceDestroyRelation::Selected);
+    CHECK(ClassifyDestroyedDevice(true, false, kOwner, kOwner, 0, 0) == DeviceDestroyRelation::Selected);
+    // The same device by its canonical identity (another native handle for it): COM APIs only, never an empty one.
+    CHECK(ClassifyDestroyedDevice(true, true, kOwner, kOther, kOwnerIdentity, kOwnerIdentity) ==
+          DeviceDestroyRelation::Selected);
+    CHECK(ClassifyDestroyedDevice(true, false, kOwner, kOther, kOwnerIdentity, kOwnerIdentity) ==
+          DeviceDestroyRelation::Unrelated);
+    CHECK(ClassifyDestroyedDevice(true, true, kOwner, kOther, 0, 0) == DeviceDestroyRelation::Unrelated);
+    // A second adapter's device (the launch hang's device): another handle, another identity, or no presenting
+    // identity published: unrelated, so no selection lock is taken.
+    CHECK(ClassifyDestroyedDevice(true, true, kOwner, kOther, kOtherIdentity, kOwnerIdentity) ==
+          DeviceDestroyRelation::Unrelated);
+    CHECK(ClassifyDestroyedDevice(true, true, kOwner, kOther, kOtherIdentity, 0) == DeviceDestroyRelation::Unrelated);
+}
+
 } // namespace
 
 int main() {
@@ -207,6 +237,7 @@ int main() {
     TestPrimaryFastPathPreservesWindowAndClock();
     TestSameWindowStaleLauncherTransition();
     TestConservativeWindowAndClockHandling();
+    TestDeviceEventsDecideFromValues();
     std::cout << "Swapchain selection policy tests passed\n";
     return 0;
 }

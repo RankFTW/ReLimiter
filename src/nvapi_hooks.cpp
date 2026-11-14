@@ -54,7 +54,12 @@ static PFN_NvAPI_D3D12_SetAsyncFrameMarker s_orig_set_async_frame_marker = nullp
 static PFN_NvAPI_D3D_GetSleepStatus s_orig_get_sleep_status = nullptr;
 
 // ── Shared state ──
-std::atomic<IUnknown*> g_dev{ nullptr };
+// The feedback-device publication. `s_feedback_native`: the owned canonical NATIVE device (one reference, held for the
+// published lifetime). `s_feedback_alias`: the incoming pointer it was captured with when that pointer is the ReShade
+// proxy bound to it; BORROWED, never dereferenced, compared by value only. Both are written only inside the
+// transition section (BeginFeedbackDeviceTransition .. End) and cleared together.
+static std::atomic<IUnknown*> s_feedback_native{ nullptr };
+static std::atomic<IUnknown*> s_feedback_alias{ nullptr };
 static std::atomic<uint32_t> s_feedback_device_acquire_readers{ 0 };
 // Writer exclusion/snapshot validation is independent of the identity handed
 // to consumers. Rejected/no-op transitions advance only the writer sequence.
@@ -235,9 +240,6 @@ static void ResetGameSleepParams() noexcept {
     s_low_latency_forced_off.store(false, std::memory_order_release);
 }
 
-bool NvAPI_IsSameDevice(IUnknown* left, IUnknown* right) noexcept {
-    return FeedbackDeviceIdentity_IsSame(left, right);
-}
 
 enum class MarkerRejection : uint32_t {
     MissingIncoming,
@@ -281,87 +283,181 @@ static void LogMarkerRejection(
              static_cast<unsigned>(marker->markerType), marker->frameID);
 }
 
-// (g_dev, publication sequence) read as one consistent pair under the transition sequence, as
-// NvAPI_IsFeedbackDeviceCurrent reads it. False while a transition is in progress.
-static bool ReadFeedbackPublication(IUnknown** device, uint64_t* publication) noexcept {
+// The feedback-device publication, read as one consistent view under the transition sequence (as
+// NvAPI_IsFeedbackDeviceCurrent reads it). Values only: nothing here is dereferenced.
+struct FeedbackView {
+    IUnknown* native = nullptr;   // the owned canonical native (null: nothing published)
+    IUnknown* alias = nullptr;    // the incoming pointer it was captured with, when bound to it (borrowed; never dereferenced)
+    uint64_t publication = 0;
+    uint32_t epoch = 0;
+    uint64_t transition = 0;      // the transition sequence the view was read under (even)
+};
+
+// False while a transition is in progress or when one ran across the read.
+static bool ReadFeedbackView(FeedbackView* view) noexcept {
     const uint64_t before = s_feedback_device_transition_sequence.load(std::memory_order_acquire);
     if ((before & 1u) != 0) return false;
-    *publication = s_feedback_device_publication_sequence.load(std::memory_order_relaxed);
-    *device = g_dev.load(std::memory_order_relaxed);
+    view->publication = s_feedback_device_publication_sequence.load(std::memory_order_relaxed);
+    view->native = s_feedback_native.load(std::memory_order_relaxed);
+    view->alias = s_feedback_alias.load(std::memory_order_relaxed);
+    view->epoch = FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::NvApiFrame);
+    view->transition = before;
     std::atomic_thread_fence(std::memory_order_acquire);
     return before == s_feedback_device_transition_sequence.load(std::memory_order_relaxed);
 }
 
-// One memoized POSITIVE answer of IsPresentingFeedbackDevice per thread (the game thread and the
-// presenting thread each send markers): the incoming device is the published feedback device
-// (g_dev, which owns a reference) of publication `feedback_publication`, and it is the same
-// device as the presenting device (which SwapMgr owns a reference to) of publication
-// `presenting_sequence`. Neither object can be destroyed, nor its address reused, while its
-// publication sequence is unchanged (a capture, replacement or clear of the feedback device
-// advances s_feedback_device_publication_sequence, a new, same or cleared presenting device
-// advances the presenting sequence), and the identity relation of two live objects is fixed:
-// so while both sequences are as memoized, an incoming pointer equal to g_dev is the same
-// answer without a reference taken or a QueryInterface. An incoming pointer that only has
-// the same identity as g_dev, a negative answer, a transition in progress and a non-DXGI API
-// all take the full path below.
-struct PresentingFeedbackMatch {
-    IUnknown* device = nullptr;
-    uint64_t feedback_publication = 0;
-    uint64_t presenting_sequence = 0;
-};
-static thread_local PresentingFeedbackMatch t_presenting_match;
+// The incoming pointer is the publication's device by VALUE: its native, or the alias captured with it.
+static bool IncomingIsPublished(IUnknown* incoming, const FeedbackView& view) noexcept {
+    return view.native && (incoming == view.native || (view.alias && incoming == view.alias));
+}
 
-static bool IsPresentingFeedbackDevice(
-    IUnknown* device, const NV_LATENCY_MARKER_PARAMS* marker = nullptr) noexcept {
-    if (!device) {
-        LogMarkerRejection(MarkerRejection::MissingIncoming, device, nullptr, marker);
-        return false;
+// The presenting device (SwapMgr) as a canonical native identity VALUE. False: none, or a publication in progress.
+static bool PresentingIdentity(uint64_t* identity) noexcept {
+    uint64_t sequence = 0;
+    *identity = SwapMgr_PresentingDeviceIdentity(&sequence);
+    return *identity != 0;
+}
+
+// What a hook learns from one look at an incoming device pointer (the game's or a plugin's: possibly a ReShade
+// device proxy, which is never AddRef'd, Released or queried here).
+//   presenting: the device is the presenting device (or, before any presenter is known, none contradicts it).
+//   identity:   the publication token when the device is the published feedback device (a value, no reference).
+//   capture:    an OWNED native device (released by the destructor unless taken) when the device is presenting
+//               but not published yet.
+struct IncomingDevice {
+    bool presenting = false;
+    NvAPIFeedbackDevice identity{};
+    IUnknown* capture = nullptr;
+    IncomingDevice() = default;
+    IncomingDevice(const IncomingDevice&) = delete;
+    IncomingDevice& operator=(const IncomingDevice&) = delete;
+    ~IncomingDevice() noexcept { NvAPI_ReleaseFeedbackDevice(capture); }
+};
+
+// One log line the first time an incoming device is the published one by identity but not by value (a wrapper):
+// that device takes one unwrap per call. The observable for the alias rule.
+static void LogUnaliasedIncoming(IUnknown* incoming, IUnknown* native) noexcept {
+    static std::atomic<bool> logged{ false };
+    if (logged.exchange(true, std::memory_order_relaxed)) return;
+    LOG_INFO("NvAPI: incoming device %p is the published device %p by identity only; it is resolved per call",
+             static_cast<void*>(incoming), static_cast<void*>(native));
+}
+
+// Resolves an incoming device pointer. A pointer equal to the publication's native or alias is answered from values
+// (no COM call, no lock, no interlocked operation). Any other pointer is unwrapped ONCE (IID_UnwrappedObject, which
+// ReShade answers without its device lock) to its native device. The relation to the presenting device is a value
+// comparison of canonical native identities. `published_first`: a device that is not the published one is rejected
+// before the presenting device is consulted (the Sleep hook's order).
+static void ResolveIncomingDevice(
+    IUnknown* incoming, const NV_LATENCY_MARKER_PARAMS* marker, IncomingDevice* out,
+    bool published_first = false) noexcept {
+    if (!incoming) {
+        LogMarkerRejection(MarkerRejection::MissingIncoming, incoming, nullptr, marker);
+        return;
     }
-    IUnknown* published = nullptr;
-    uint64_t publication = 0;
-    const bool memoizable = ReadFeedbackPublication(&published, &publication) && published == device;
-    if (memoizable) {
-        const PresentingFeedbackMatch& memo = t_presenting_match;
-        if (memo.device == device && memo.feedback_publication == publication) {
-            const uint64_t sequence = SwapMgr_PresentingDeviceSequence();
-            const ActiveAPI memo_api = SwapMgr_GetActiveAPI();
-            if ((sequence & 1u) == 0 && sequence == memo.presenting_sequence &&
-                (memo_api == ActiveAPI::DX11 || memo_api == ActiveAPI::DX12))
-                return true;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        FeedbackView view;
+        if (!ReadFeedbackView(&view)) continue;
+        IUnknown* owned = nullptr;
+        IUnknown* identity = view.native;
+        bool published = IncomingIsPublished(incoming, view);
+        if (!published) {
+            if (published_first && !view.native) {
+                LogMarkerRejection(MarkerRejection::FeedbackIdentity, incoming, nullptr, marker);
+                return;
+            }
+            owned = DeviceIdentity_AcquireNative(incoming);
+            if (!owned) {
+                LogMarkerRejection(MarkerRejection::FeedbackIdentity, incoming, nullptr, marker);
+                return;
+            }
+            identity = owned;
+            if (view.native && owned == view.native) {
+                LogUnaliasedIncoming(incoming, view.native);
+                published = true;
+                NvAPI_ReleaseFeedbackDevice(owned);
+                owned = nullptr;
+            } else if (published_first) {
+                NvAPI_ReleaseFeedbackDevice(owned);
+                LogMarkerRejection(MarkerRejection::FeedbackIdentity, incoming, nullptr, marker);
+                return;
+            }
         }
+        const ActiveAPI api = SwapMgr_GetActiveAPI();
+        uint64_t presenting_identity = 0;
+        bool presenting = false;
+        if (!PresentingIdentity(&presenting_identity)) {
+            // Before presenter discovery, native NvAPI calls may bootstrap feedback. An empty publication is NOT
+            // permission to bypass an already active presenter. A failed/contended read with an active API is
+            // conservatively rejected.
+            if (api != ActiveAPI::None)
+                LogMarkerRejection(MarkerRejection::SelectedUnavailable, incoming, nullptr, marker);
+            presenting = api == ActiveAPI::None;
+        } else {
+            const bool com_api = api == ActiveAPI::DX11 || api == ActiveAPI::DX12;
+            presenting = com_api && reinterpret_cast<uint64_t>(identity) == presenting_identity;
+            if (!presenting)
+                LogMarkerRejection(
+                    com_api ? MarkerRejection::SelectedIdentity : MarkerRejection::UnsupportedAPI,
+                    incoming, reinterpret_cast<IUnknown*>(presenting_identity), marker);
+        }
+        if (!presenting) {
+            NvAPI_ReleaseFeedbackDevice(owned);
+            return;
+        }
+        // Nothing may have been published or cleared since the view: the token and the presenting relation then
+        // describe the same publication.
+        if (s_feedback_device_transition_sequence.load(std::memory_order_acquire) != view.transition) {
+            NvAPI_ReleaseFeedbackDevice(owned);
+            continue;
+        }
+        out->presenting = true;
+        if (published) out->identity = { view.native, view.epoch, view.publication };
+        else out->capture = owned;
+        return;
     }
-    const uint64_t presenting_sequence =
-        memoizable ? SwapMgr_PresentingDeviceSequence() : 1u;
-    IUnknown* presenting_device = SwapMgr_AcquirePresentingDevice();
+    LogMarkerRejection(MarkerRejection::GuardStaleToken, incoming, nullptr, marker);
+}
+
+// The incoming pointer is the published device: its token, with no presenting requirement (the sleep-status
+// observer). False: not the published device, or the publication kept moving.
+static bool ResolvePublishedToken(IUnknown* incoming, NvAPIFeedbackDevice* token) noexcept {
+    if (!incoming) return false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        FeedbackView view;
+        if (!ReadFeedbackView(&view)) continue;
+        if (!view.native) return false;
+        if (!IncomingIsPublished(incoming, view)) {
+            IUnknown* owned = DeviceIdentity_AcquireNative(incoming);
+            const bool same = owned == view.native;
+            NvAPI_ReleaseFeedbackDevice(owned);
+            if (!same) return false;
+        }
+        if (s_feedback_device_transition_sequence.load(std::memory_order_acquire) != view.transition) continue;
+        *token = { view.native, view.epoch, view.publication };
+        return true;
+    }
+    return false;
+}
+
+// Is the device of this publication token the presenting device? Values only: no incoming pointer is involved. The
+// token's device is a canonical native identity, compared with the presenting device's.
+static bool FeedbackIsPresenting(
+    const NvAPIFeedbackDevice& token, const NV_LATENCY_MARKER_PARAMS* marker = nullptr) noexcept {
     const ActiveAPI api = SwapMgr_GetActiveAPI();
-    // Before presenter discovery, native NvAPI calls may bootstrap feedback.
-    // An empty g_dev is NOT permission to bypass an already active presenter.
-    // Failed/contended acquisition with an active API is conservatively rejected.
-    if (!presenting_device) {
+    uint64_t presenting_identity = 0;
+    if (!PresentingIdentity(&presenting_identity)) {
         if (api != ActiveAPI::None)
-            LogMarkerRejection(MarkerRejection::SelectedUnavailable, device, nullptr, marker);
+            LogMarkerRejection(MarkerRejection::SelectedUnavailable, token.device, nullptr, marker);
         return api == ActiveAPI::None;
     }
-    const bool matches =
-        (api == ActiveAPI::DX11 || api == ActiveAPI::DX12) &&
-        NvAPI_IsSameDevice(device, presenting_device);
-    if (!matches) {
+    const bool com_api = api == ActiveAPI::DX11 || api == ActiveAPI::DX12;
+    const bool presenting = com_api && reinterpret_cast<uint64_t>(token.device) == presenting_identity;
+    if (!presenting)
         LogMarkerRejection(
-            api == ActiveAPI::DX11 || api == ActiveAPI::DX12
-                ? MarkerRejection::SelectedIdentity : MarkerRejection::UnsupportedAPI,
-            device, presenting_device, marker);
-    } else if (memoizable && (presenting_sequence & 1u) == 0) {
-        // Memoize only when neither publication moved across the comparison: the compared
-        // objects are then exactly the ones the two sequences name.
-        IUnknown* published_after = nullptr;
-        uint64_t publication_after = 0;
-        if (ReadFeedbackPublication(&published_after, &publication_after) &&
-            published_after == device && publication_after == publication &&
-            SwapMgr_PresentingDeviceSequence() == presenting_sequence)
-            t_presenting_match = { device, publication, presenting_sequence };
-    }
-    NvAPI_ReleaseFeedbackDevice(presenting_device);
-    return matches;
+            com_api ? MarkerRejection::SelectedIdentity : MarkerRejection::UnsupportedAPI,
+            token.device, reinterpret_cast<IUnknown*>(presenting_identity), marker);
+    return presenting;
 }
 
 static uint64_t BeginFeedbackDeviceTransition() noexcept {
@@ -439,73 +535,72 @@ static void RetireFeedbackDevice(IUnknown* device) noexcept {
     TryDrainRetiredFeedbackDevices();
 }
 
-bool NvAPI_CaptureFeedbackDevice(
-    IUnknown* device,
-    NvAPIFeedbackDevice* published_device) noexcept {
-    if (published_device) *published_device = {};
-    if (!device) return false;
-    if (g_dev.load(std::memory_order_acquire) == device) return false;
-    if (!AddRefFeedbackDevice(device)) return false;
+bool NvAPI_HasFeedbackDevice() noexcept {
+    return s_feedback_native.load(std::memory_order_acquire) != nullptr;
+}
 
+// The alias of a new publication: the incoming pointer it was captured with, when that pointer is provably bound to
+// this native device, that is the ReShade device proxy the native names in its private data. Anything else (a
+// Streamline wrapper, an unknown layer) is not an alias and is unwrapped at every call. The native itself needs no
+// alias: it is compared as the native. Never dereferenced afterwards.
+static IUnknown* ProxyAliasFor(IUnknown* incoming, IUnknown* native) noexcept {
+    if (!incoming || incoming == native) return nullptr;
+    return DeviceIdentity_ReShadeProxyOf(native) == incoming ? incoming : nullptr;
+}
+
+// Publishes `native` (an owned canonical native device, consumed: published or released) as the feedback device.
+// `incoming` is the pointer it was resolved from (alias candidate). False: it already is the published device (the
+// original publication, token and restore state are preserved), or the publication kept moving.
+static bool CaptureFeedbackNative(
+    IUnknown* incoming, IUnknown* native, NvAPIFeedbackDevice* published_device) noexcept {
+    IUnknown* const alias = ProxyAliasFor(incoming, native);
     for (int attempt = 0; attempt < 3; ++attempt) {
-        const uint64_t before = s_feedback_device_transition_sequence.load(
-            std::memory_order_acquire);
-        if ((before & 1u) != 0) continue;
-        const NvAPIFeedbackDevice snapshot = NvAPI_AcquireFeedbackDevice();
-        // A null snapshot may be acquisition failure rather than an empty
-        // publication. Never use it as permission to replace a live device.
-        if (before != s_feedback_device_transition_sequence.load(
-                std::memory_order_acquire) ||
-            (!snapshot.device && g_dev.load(std::memory_order_acquire))) {
-            NvAPI_ReleaseFeedbackDevice(snapshot.device);
-            continue;
-        }
-        // Foreign COM may reenter ReLimiter. Compare only with a retained
-        // snapshot and OUTSIDE writer exclusion (including all QI releases).
-        const bool same_device = NvAPI_IsSameDevice(snapshot.device, device);
-        if (same_device) {
-            // A no-op needs no writer lock. Verify the exact compared lifetime
-            // before preserving it, just as the raw-pointer fast path does.
-            const bool unchanged = before == s_feedback_device_transition_sequence.load(
-                std::memory_order_acquire) && NvAPI_IsFeedbackDeviceCurrent(snapshot);
-            NvAPI_ReleaseFeedbackDevice(snapshot.device);
-            if (!unchanged) continue;
-            NvAPI_ReleaseFeedbackDevice(device);
-            return false; // Preserve the original callable pointer AND token.
+        FeedbackView view;
+        if (!ReadFeedbackView(&view)) continue;
+        if (view.native == native) {
+            // A no-op needs no writer section.
+            NvAPI_ReleaseFeedbackDevice(native);
+            return false; // Preserve the original publication AND token.
         }
         const uint64_t write_sequence = BeginFeedbackDeviceTransition();
-        IUnknown* previous = g_dev.load(std::memory_order_relaxed);
-        const bool unchanged = write_sequence == before + 1 &&
-            (snapshot.device ? NvAPI_IsSameFeedbackPublication(snapshot, {
-                previous,
-                FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::NvApiFrame),
-                s_feedback_device_publication_sequence.load(std::memory_order_relaxed)
-            }) : previous == nullptr);
-        if (!unchanged) {
+        if (write_sequence != view.transition + 1) {
+            // A writer ran since the view: the publication it compared may have moved.
             EndFeedbackDeviceTransition(write_sequence);
-            NvAPI_ReleaseFeedbackDevice(snapshot.device);
             continue;
         }
+        IUnknown* previous = s_feedback_native.load(std::memory_order_relaxed);
         FrameTimeline_BeginProducerEpoch(FrameIdentityDomain::NvApiFrame);
         ResetFeedbackProducerLifecycle();
         ResetGameSleepParams();
-        g_dev.store(device, std::memory_order_relaxed);
+        s_feedback_native.store(native, std::memory_order_relaxed);
+        s_feedback_alias.store(alias, std::memory_order_relaxed);
         if (published_device) {
             *published_device = {
-                device,
+                native,
                 FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::NvApiFrame),
                 s_feedback_device_publication_sequence.load(
                     std::memory_order_relaxed) + 2
             };
         }
         EndFeedbackDeviceTransition(write_sequence, true);
-        NvAPI_ReleaseFeedbackDevice(snapshot.device);
-        // g_dev owns exactly one reference for the published lifetime.
+        // s_feedback_native owns exactly one reference (on the native) for the published lifetime.
         RetireFeedbackDevice(previous);
         return true;
     }
-    NvAPI_ReleaseFeedbackDevice(device);
+    NvAPI_ReleaseFeedbackDevice(native);
     return false; // Bounded retry under publication churn; caller may retry.
+}
+
+bool NvAPI_CaptureFeedbackDevice(
+    IUnknown* device,
+    NvAPIFeedbackDevice* published_device) noexcept {
+    if (published_device) *published_device = {};
+    if (!device) return false;
+    FeedbackView view;
+    if (ReadFeedbackView(&view) && IncomingIsPublished(device, view)) return false;
+    IUnknown* native = DeviceIdentity_AcquireNative(device);
+    if (!native) return false;
+    return CaptureFeedbackNative(device, native, published_device);
 }
 
 // `drain` false is the measurement observer's snapshot (Hook_GetSleepStatus): the
@@ -531,7 +626,7 @@ static NvAPIFeedbackDevice AcquireFeedbackDeviceImpl(bool drain) noexcept {
             if (drain) TryDrainRetiredFeedbackDevices();
             continue;
         }
-        IUnknown* device = g_dev.load(std::memory_order_relaxed);
+        IUnknown* device = s_feedback_native.load(std::memory_order_relaxed);
         const uint32_t producer_epoch =
             FrameTimeline_CurrentProducerEpoch(
                 FrameIdentityDomain::NvApiFrame);
@@ -570,7 +665,7 @@ bool NvAPI_IsFeedbackDeviceCurrent(
     if ((before & 1u) != 0) return false;
     const uint64_t publication_sequence =
         s_feedback_device_publication_sequence.load(std::memory_order_relaxed);
-    IUnknown* device = g_dev.load(std::memory_order_relaxed);
+    IUnknown* device = s_feedback_native.load(std::memory_order_relaxed);
     const uint32_t producer_epoch =
         FrameTimeline_CurrentProducerEpoch(
             FrameIdentityDomain::NvApiFrame);
@@ -597,15 +692,16 @@ void NvAPI_ClearFeedbackDevice(
     }
     const uint64_t write_sequence = BeginFeedbackDeviceTransition();
     if (!NvAPI_IsSameFeedbackPublication(expected_device, {
-            g_dev.load(std::memory_order_relaxed),
+            s_feedback_native.load(std::memory_order_relaxed),
             FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::NvApiFrame),
             s_feedback_device_publication_sequence.load(std::memory_order_relaxed)
         })) {
         EndFeedbackDeviceTransition(write_sequence);
         return;
     }
-    IUnknown* cleared_device = g_dev.load(std::memory_order_relaxed);
-    g_dev.store(nullptr, std::memory_order_relaxed);
+    IUnknown* cleared_device = s_feedback_native.load(std::memory_order_relaxed);
+    s_feedback_native.store(nullptr, std::memory_order_relaxed);
+    s_feedback_alias.store(nullptr, std::memory_order_relaxed);
     ResetGameSleepParams();
     FrameTimeline_BeginProducerEpoch(FrameIdentityDomain::NvApiFrame);
     ResetFeedbackProducerLifecycle();
@@ -614,19 +710,25 @@ void NvAPI_ClearFeedbackDevice(
 }
 
 void NvAPI_ClearFeedbackDevice(IUnknown* expected_device) noexcept {
+    // `expected_device` names the publication by the pointer it was captured with: the native or the alias.
+    const auto names_publication = [expected_device](IUnknown* native, IUnknown* alias) noexcept {
+        return !expected_device || expected_device == native || (alias && expected_device == alias);
+    };
     if (expected_device &&
-        g_dev.load(std::memory_order_acquire) != expected_device) {
+        !names_publication(s_feedback_native.load(std::memory_order_acquire),
+                           s_feedback_alias.load(std::memory_order_acquire))) {
         return;
     }
     const uint64_t write_sequence = BeginFeedbackDeviceTransition();
-    IUnknown* cleared_device = g_dev.load(std::memory_order_relaxed);
+    IUnknown* cleared_device = s_feedback_native.load(std::memory_order_relaxed);
     if (!cleared_device ||
-        (expected_device && cleared_device != expected_device)) {
+        !names_publication(cleared_device, s_feedback_alias.load(std::memory_order_relaxed))) {
         EndFeedbackDeviceTransition(write_sequence);
         return;
     }
 
-    g_dev.store(nullptr, std::memory_order_relaxed);
+    s_feedback_native.store(nullptr, std::memory_order_relaxed);
+    s_feedback_alias.store(nullptr, std::memory_order_relaxed);
     ResetGameSleepParams();
     FrameTimeline_BeginProducerEpoch(FrameIdentityDomain::NvApiFrame);
     ResetFeedbackProducerLifecycle();
@@ -634,33 +736,59 @@ void NvAPI_ClearFeedbackDevice(IUnknown* expected_device) noexcept {
     RetireFeedbackDevice(cleared_device);
 }
 
-// Retain the validated publication across native forwarding and every local
-// early return. This owns a COM reference, not the feedback writer lock.
-class FeedbackDeviceGuard final {
-public:
-    explicit FeedbackDeviceGuard(
-        IUnknown* device, const NV_LATENCY_MARKER_PARAMS* marker = nullptr) noexcept
-        : identity(NvAPI_AcquireFeedbackDevice()) {
-        if (!NvAPI_IsSameDevice(identity.device, device)) {
-            LogMarkerRejection(MarkerRejection::FeedbackIdentity, device, nullptr, marker);
-        } else if (!IsPresentingFeedbackDevice(device, marker)) {
-            // The selected-device check records its own precise rejection.
-        } else if (!NvAPI_IsFeedbackDeviceCurrent(identity)) {
-            LogMarkerRejection(MarkerRejection::GuardStaleToken, device, nullptr, marker);
-        } else {
-            return;
-        }
-        NvAPI_ReleaseFeedbackDevice(identity.device);
-        identity = {};
+// destroy_device. Runs under ReShade's process-wide device lock, inside the Release of a device proxy: it makes no
+// COM call at all. `identity` is the canonical identity of the destroyed device's native object. Another device (the
+// common case: a second adapter's device, a launcher's, a probe's): a value comparison, no writer section. The
+// published device: the publication is cleared exactly as NvAPI_ClearFeedbackDevice clears it, and its reference
+// (on the native) is released, or retired to the next drain when a reader is inside its window. That release is on a
+// native object, which takes no ReShade lock.
+void NvAPI_OnDeviceDestroyed(uint64_t identity) noexcept {
+    if (identity == 0) return;
+    for (;;) {
+        FeedbackView view;
+        // A writer section is a few atomic operations and never calls COM: wait it out.
+        if (!ReadFeedbackView(&view)) { SwitchToThread(); continue; }
+        if (reinterpret_cast<uint64_t>(view.native) != identity) return;
+        break;
     }
-    ~FeedbackDeviceGuard() noexcept {
-        NvAPI_ReleaseFeedbackDevice(identity.device);
+    const uint64_t write_sequence = BeginFeedbackDeviceTransition();
+    IUnknown* const cleared_device = s_feedback_native.load(std::memory_order_relaxed);
+    if (reinterpret_cast<uint64_t>(cleared_device) != identity) {
+        EndFeedbackDeviceTransition(write_sequence);
+        return;
     }
-    FeedbackDeviceGuard(const FeedbackDeviceGuard&) = delete;
-    FeedbackDeviceGuard& operator=(const FeedbackDeviceGuard&) = delete;
+    s_feedback_native.store(nullptr, std::memory_order_relaxed);
+    s_feedback_alias.store(nullptr, std::memory_order_relaxed);
+    ResetGameSleepParams();
+    FrameTimeline_BeginProducerEpoch(FrameIdentityDomain::NvApiFrame);
+    ResetFeedbackProducerLifecycle();
+    EndFeedbackDeviceTransition(write_sequence, true);
+    RetireFeedbackDevice(cleared_device);
+}
 
-    NvAPIFeedbackDevice identity;
-};
+// The capture step of Hook_SetSleepMode and Hook_SetLatencyMarker. `resolved` is the result of ResolveIncomingDevice
+// for `incoming`: when it handed over an unpublished presenting device, that native device is published now. On
+// return `resolved->identity` is the token of the publication that names `incoming` (empty when none does: another
+// device is published and this one could not be, or churn). True when this call made a new publication.
+static bool CaptureResolvedDevice(
+    IUnknown* incoming, IncomingDevice* resolved, const NV_LATENCY_MARKER_PARAMS* marker) noexcept {
+    bool captured = false;
+    if (IUnknown* native = resolved->capture) {
+        resolved->capture = nullptr;
+        NvAPIFeedbackDevice published{};
+        captured = CaptureFeedbackNative(incoming, native, &published);
+        if (captured) resolved->identity = published;
+    }
+    if (!resolved->identity.device) {
+        // Published meanwhile by another thread, or not at all: read the publication again.
+        IncomingDevice again;
+        ResolveIncomingDevice(incoming, marker, &again);
+        resolved->identity = again.identity;
+        if (!resolved->identity.device)
+            LogMarkerRejection(MarkerRejection::FeedbackIdentity, incoming, nullptr, marker);
+    }
+    return captured;
+}
 
 // PRESENT_START gate timing — now owned by presentation_gate.cpp
 // (g_last_gate_sleep_us declared in presentation_gate.h)
@@ -1505,14 +1633,18 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
     RuntimeCallbackGuard callback;
     if (callback.IsStopping())
         return SafeInvokeSetSleepMode(pDev, params);
-    if (!IsPresentingFeedbackDevice(pDev))
+    // One resolve answers "is this the presenting device" and "is it the published feedback device" from values
+    // (or one unwrap); the token it yields is the one the restore state below binds to.
+    IncomingDevice params_device;
+    ResolveIncomingDevice(pDev, nullptr, &params_device);
+    if (!params_device.presenting)
         return SafeInvokeSetSleepMode(pDev, params);
 
     NV_SET_SLEEP_MODE_PARAMS params_snapshot{};
     const bool params_valid =
         SafeCopySleepModeParams(params, &params_snapshot);
 
-    if (NvAPI_CaptureFeedbackDevice(pDev)) {
+    if (CaptureResolvedDevice(pDev, &params_device, nullptr)) {
         static std::atomic<bool> s_logged_device_capture{ false };
         if (!s_logged_device_capture.exchange(true, std::memory_order_relaxed)) {
             LOG_INFO(
@@ -1554,7 +1686,6 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
     // Bind the original settings only to the exact current feedback device.
     // Auxiliary device calls are still forwarded but cannot overwrite restore
     // state for the presenting game device.
-    const FeedbackDeviceGuard params_device(pDev);
     if (params_valid && params_device.identity.device) {
         GameParamsGuard params_lock;
         // A may have waited here while B replaced/reset the restoration state.
@@ -1609,7 +1740,8 @@ static NvAPI_Status __cdecl Hook_SetSleepMode(IUnknown* pDev, NV_SET_SLEEP_MODE_
 static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
     RuntimeCallbackGuard callback;
     if (callback.IsStopping()) return SafeInvokeSleep(pDev);
-    const FeedbackDeviceGuard sleep_device(pDev);
+    IncomingDevice sleep_device;
+    ResolveIncomingDevice(pDev, nullptr, &sleep_device, /*published_first=*/true);
     const uint32_t sleep_token = PublicationToken(sleep_device.identity);
     if (!sleep_device.identity.device) return SafeInvokeSleep(pDev);
 
@@ -1627,7 +1759,7 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
         bool presenting_at_entry = false;
         bool unified = false;
         if (PacingPipeline_Unified()) {
-            presenting_at_entry = IsPresentingFeedbackDevice(pDev);
+            presenting_at_entry = FeedbackIsPresenting(sleep_device.identity);
             unified = presenting_at_entry && Scheduler_UnifiedActive();
             bypass = !unified && NvAPI_ShouldBypassSleep(
                 PacingPipeline_SleepBypass(),
@@ -1635,7 +1767,7 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
         } else {
             bypass = NvAPI_ShouldBypassSleep(PacingPipeline_SleepBypass(),
                 g_user_target_fps.load(std::memory_order_relaxed), SleepSourcePaced());
-            presenting_at_entry = IsPresentingFeedbackDevice(pDev);
+            presenting_at_entry = FeedbackIsPresenting(sleep_device.identity);
         }
         // Record the Sleep on the presenting device; with the key the unified start wait
         // runs here, before the driver's Sleep.
@@ -1664,7 +1796,7 @@ static NvAPI_Status __cdecl Hook_Sleep(IUnknown* pDev) {
         QueryPerformanceCounter(&t1);
         if (unified) UnifiedSleepSelfCheck(t1.QuadPart - t0.QuadPart);
         if (!NvAPI_IsFeedbackDeviceCurrent(sleep_device.identity) ||
-            !IsPresentingFeedbackDevice(pDev)) {
+            !FeedbackIsPresenting(sleep_device.identity)) {
             return result;
         }
         // The driver's Sleep for the next grid index: its start and return go
@@ -1712,7 +1844,9 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
     g_nvapi_marker_census.Record(static_cast<uint32_t>(marker_params.markerType),MarkerCensusStage::Entry,
         {marker_params.frameID,reinterpret_cast<uint64_t>(dev),census_caller,census_entry.QuadPart,
         GetCurrentThreadId(),0,0,0});
-    if (!IsPresentingFeedbackDevice(dev, &marker_params))
+    IncomingDevice marker_device;
+    ResolveIncomingDevice(dev, &marker_params, &marker_device);
+    if (!marker_device.presenting)
         return SafeInvokeLatencyMarker(dev, params);
 
     void* return_address = _ReturnAddress();
@@ -1737,13 +1871,11 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
                  from_rtss ? "RTSS" : "direct");
     }
 
-    // Capture device for GetLatency if not already set.
-    // Some games (Streamline/DLSS-G) never call SetSleepMode through NvAPI,
-    // so g_dev stays null. The marker hook always receives the device.
-    if (NvAPI_CaptureFeedbackDevice(dev)) {
+    // Capture device for GetLatency if not already set. Some games call
+    // SetLatencyMarker on a different device than SetSleepMode, or only the marker
+    // hook sees the presenting device first. The marker hook always receives the device.
+    if (CaptureResolvedDevice(dev, &marker_device, &marker_params))
         LOG_INFO("NvAPI: presenting device captured/replaced from SetLatencyMarker");
-    }
-    const FeedbackDeviceGuard marker_device(dev, &marker_params);
 
     // Clock map: the local QPC closest to the driver's presentStartTime
     // is read immediately before forwarding; it is recorded only after the
@@ -1773,7 +1905,7 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
         LogMarkerRejection(MarkerRejection::ForwardStaleToken, dev, nullptr, &marker_params);
         return forward();
     }
-    if (!IsPresentingFeedbackDevice(dev, &marker_params)) return forward();
+    if (!FeedbackIsPresenting(marker_device.identity, &marker_params)) return forward();
     if (!IsImmediateTimingMarker(marker_params.markerType)) {
         // RTSS tail markers were never eligible. Keep that filter before the
         // queue; only direct, validated current-device observations enter it.
@@ -2379,26 +2511,21 @@ static NvAPI_Status __cdecl Hook_GetSleepStatus(IUnknown* device, NV_GET_SLEEP_S
     void* const caller_address = _ReturnAddress();
     RuntimeCallbackGuard callback;
     // Without the status instrumentation (developer_settings) the game's call is only
-    // forwarded and logged: no feedback-device acquisition. With
-    // it, the published feedback device and its publication token are captured before the
-    // driver query: a result is the frame's sleep status only when it came from that
-    // device and the publication has not changed since (RecordSleepStatus). The
-    // acquisition does not wait and never drains retired references (a contended or
-    // empty one drops the observation).
+    // forwarded and logged: no feedback-device lookup. With it, the publication token of the
+    // published feedback device is read before the driver query (the incoming pointer is the
+    // publication's alias, or unwrapped once; no reference is taken and no ReShade lock is
+    // entered): a result is the frame's sleep status only when it came from that device and the
+    // publication has not changed since (RecordSleepStatus). The lookup does not wait and never
+    // drains retired references.
     const bool observe = g_config.developer_settings;
-    const NvAPIFeedbackDevice published = observe ? AcquireFeedbackDeviceImpl(false) : NvAPIFeedbackDevice{};
+    NvAPIFeedbackDevice published{};
+    if (observe) ResolvePublishedToken(device, &published);
     const NvAPI_Status result = SafeInvokeGetSleepStatus(device, params);
     NV_GET_SLEEP_STATUS_PARAMS seen{};
     // The driver's answer, read after the call.
-    if (callback.IsStopping() || !params || !SafeCopySleepStatus(params, &seen)) {
-        NvAPI_ReleaseFeedbackDevice(published.device);
-        return result;
-    }
-    if (published.device) {
-        if (NvAPI_IsSameDevice(device, published.device))
-            RecordSleepStatus(result, seen, static_cast<uint32_t>((published.publication_sequence >> 1) & kSleepStatusTokenMask));
-        NvAPI_ReleaseFeedbackDevice(published.device);
-    }
+    if (callback.IsStopping() || !params || !SafeCopySleepStatus(params, &seen)) return result;
+    if (published.device)
+        RecordSleepStatus(result, seen, PublicationToken(published));
     if (!s_game_sleep_status.Changed(result, seen) ||
         !ReflexObserveBudget(s_game_sleep_status.lines, kGameSleepStatusLogLimit, "GetSleepStatus changed again"))
         return result;

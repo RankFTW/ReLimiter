@@ -41,6 +41,7 @@ void FgInput_RecordMarker(uint64_t, uint32_t, uint32_t, int64_t) noexcept {}
 #include <string>
 #include <algorithm>
 
+#include <d3d12.h>
 #include "../src/nvapi_hooks.cpp"
 
 // Gate code uses a controlled QPC/Spin boundary, not real waiting. Keep native
@@ -61,9 +62,11 @@ static BOOL WINAPI GateQueryQpc(LARGE_INTEGER* value) {
 
 std::atomic<int> g_user_target_fps{0};
 namespace {
+bool s_expect_check_failure = false; // the lock-fixture control: a failed CHECK is the expected outcome
 void Check(bool passed, const char* expression, int line) {
     if (passed) return;
     std::fprintf(stderr, "FAIL line %d: %s\n", line, expression);
+    if (s_expect_check_failure) std::exit(0);
     std::abort();
 }
 #define CHECK(expression) Check(!!(expression), #expression, __LINE__)
@@ -215,7 +218,9 @@ bool s_record_modes = false;
 NvAPI_Status s_mode_result = -9;
 void (*s_on_mode_forward)() = nullptr; // an interleaving point inside the driver's SetSleepMode
 
-NvAPI_Status __cdecl FakeSleepMode(IUnknown*, NV_SET_SLEEP_MODE_PARAMS* params) {
+IUnknown* s_last_driver_device = nullptr; // the device the newest fake driver call received
+NvAPI_Status __cdecl FakeSleepMode(IUnknown* device, NV_SET_SLEEP_MODE_PARAMS* params) {
+    s_last_driver_device = device;
     if (s_expected_mode_params) CHECK(params == s_expected_mode_params); // unchanged original pointer
     ++s_mode_calls;
     if (s_record_modes) s_forwarded_modes.push_back(*params);
@@ -225,6 +230,7 @@ NvAPI_Status __cdecl FakeSleepMode(IUnknown*, NV_SET_SLEEP_MODE_PARAMS* params) 
 // Actions: 2 clears the feedback device during Sleep, 4 faults natively, 8 lasts about a
 // millisecond (a driver that paces).
 NvAPI_Status __cdecl FakeDriverSleep(IUnknown* device) {
+    s_last_driver_device = device;
     ++s_sleep_calls;
     if (s_sleep_action == 2) NvAPI_ClearFeedbackDevice(device);
     if (s_sleep_action == 4) RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
@@ -313,7 +319,7 @@ void TestReflexCallForwarding() {
     // 0 forward, 2 device cleared during Sleep, 4 native fault,
     // 5 Smooth Motion bypass (x64 only), 6 no original trampoline.
     for (int scenario : {0, 2, 4, 5, 6}) {
-        if (!g_dev.load()) CHECK(NvAPI_CaptureFeedbackDevice(&device));
+        if (!NvAPI_HasFeedbackDevice()) CHECK(NvAPI_CaptureFeedbackDevice(&device));
         if (scenario == 6) s_orig_sleep = nullptr;
         s_sleep_action = scenario < 5 ? scenario : 0;
 #ifdef _WIN64
@@ -1766,42 +1772,191 @@ void TestReflexObservation() {
 }
 #endif
 
+// Fixtures of ReShade's device lock. Independently pinned to deps/reshade/source/d3d12/d3d12_device.cpp: a device
+// proxy's AddRef/Release and its QueryInterface for its own interfaces or IUnknown take ONE process-wide,
+// NON-recursive lock (g_d3d12_adapter_mutex); IID_UnwrappedObject and any other IID do not. The proxy registers
+// itself in the native device's private data under its class GUID.
+constexpr GUID kProxyClassD3D12 = {
+    0x2523AFF4, 0x978B, 0x4939, { 0xBA, 0x16, 0x8E, 0xE8, 0x76, 0xA4, 0xCB, 0x2A }
+};
+
+class FakeReShadeLock {
+public:
+    std::atomic<DWORD> owner{0};
+    std::atomic<unsigned> proxy_calls{0}; // proxy AddRef/Release/own-interface QueryInterface calls made
+    std::atomic<bool> strict{false};      // strict: ANY such call fails the test
+    void EnterProxyCall() {
+        CHECK(!strict.load());
+        ++proxy_calls;
+        Enter();
+    }
+    // The thread that already holds the lock would wait for itself forever (the launch hang): fail at once.
+    void Enter() {
+        const DWORD self = GetCurrentThreadId();
+        CHECK(owner.load() != self);
+        DWORD expected = 0;
+        while (!owner.compare_exchange_weak(expected, self)) { expected = 0; Sleep(0); }
+    }
+    void Leave() { owner.store(0); }
+};
+
+// ReShade running an event (init_device, destroy_device, unload_addons) under its lock.
+class HeldLock {
+public:
+    explicit HeldLock(FakeReShadeLock& lock) : lock_(lock) { lock_.Enter(); }
+    ~HeldLock() { lock_.Leave(); }
+    HeldLock(const HeldLock&) = delete;
+    HeldLock& operator=(const HeldLock&) = delete;
+private:
+    FakeReShadeLock& lock_;
+};
+
+// A native Direct3D 12 device object: no ReShade lock; names its ReShade proxy in its private data.
+class FakeNative12 final : public ID3D12Object {
+public:
+    IUnknown* proxy = nullptr;
+    std::atomic<ULONG> references{1}; // the stack fixture owns the initial reference
+    std::atomic<unsigned> queries{0}, add_refs{0}, releases{0};
+    // Armed for one thread: its next AddRef parks here (a reader between loading the publication and referencing it).
+    HANDLE park_entered = nullptr, park_release = nullptr;
+    std::atomic<DWORD> park_thread{0};
+
+    ~FakeNative12() {
+        CHECK(references == 1);
+        CHECK(add_refs == releases);
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** result) override {
+        if (!result) return E_POINTER;
+        *result = nullptr;
+        ++queries;
+        if (!IsEqualIID(iid, __uuidof(IUnknown)) && !IsEqualIID(iid, __uuidof(ID3D12Object))) return E_NOINTERFACE;
+        *result = static_cast<ID3D12Object*>(this);
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        if (park_thread.load() == GetCurrentThreadId()) {
+            park_thread.store(0);
+            SetEvent(park_entered);
+            CHECK(WaitForSingleObject(park_release, 10000) == WAIT_OBJECT_0);
+        }
+        ++add_refs;
+        return ++references;
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        CHECK(references > 1);
+        ++releases;
+        return --references;
+    }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, UINT* size, void* data) override {
+        if (!proxy || !IsEqualGUID(guid, kProxyClassD3D12) || !size || !data || *size < sizeof(void*)) return E_FAIL;
+        *static_cast<void**>(data) = proxy;
+        *size = sizeof(void*);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR) override { return E_NOTIMPL; }
+};
+
+// ReShade's device proxy over a native device. A stack fixture owns the initial reference.
+class FakeProxy12 final : public IUnknown {
+public:
+    FakeProxy12(FakeNative12* native_device, FakeReShadeLock* device_lock) : native(native_device), lock(device_lock) {}
+    FakeNative12* native;
+    FakeReShadeLock* lock;
+    ULONG refs = 1;
+    std::atomic<unsigned> unwrap_queries{0};
+
+    ~FakeProxy12() { CHECK(refs == 1); }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** result) override {
+        if (!result) return E_POINTER;
+        *result = nullptr;
+        if (IsEqualIID(iid, kUnwrappedObject)) { // no lock
+            ++unwrap_queries;
+            native->AddRef();
+            *result = static_cast<IUnknown*>(native);
+            return S_OK;
+        }
+        if (IsEqualIID(iid, __uuidof(IUnknown))) { // AddRef under the lock
+            lock->EnterProxyCall();
+            ++refs;
+            native->AddRef();
+            lock->Leave();
+            *result = this;
+            return S_OK;
+        }
+        return native->QueryInterface(iid, result); // any other IID goes to the native object
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        lock->EnterProxyCall();
+        const ULONG count = ++refs;
+        native->AddRef();
+        lock->Leave();
+        return count;
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        lock->EnterProxyCall();
+        CHECK(refs > 1);
+        const ULONG count = --refs;
+        native->Release();
+        lock->Leave();
+        return count;
+    }
+};
+
+// ctest feedback_device_lock_fixture: the fixture must fail AT ONCE on the old behaviour, a proxy AddRef from inside
+// a ReShade event (expected output: "FAIL line N: owner.load() != self", not a hang).
+void RunProxyCallUnderLockControl() {
+    FakeReShadeLock lock;
+    FakeNative12 native;
+    FakeProxy12 proxy(&native, &lock);
+    HeldLock held(lock);
+    proxy.AddRef();
+}
+
 void TestIdentityNormalization() {
     FakeDevice native, unrelated, alias, wrapper, nested, sibling;
     alias.canonical = &native;
     wrapper.Wrap(&native);
     nested.Wrap(&wrapper);
     sibling.Wrap(&native);
-    CHECK(!NvAPI_IsSameDevice(nullptr, nullptr));
-    CHECK(!NvAPI_IsSameDevice(&native, nullptr));
-    CHECK(!NvAPI_IsSameDevice(nullptr, &native));
-    CHECK(NvAPI_IsSameDevice(&native, &native));
-    CHECK(NvAPI_IsSameDevice(&alias, &native));
-    CHECK(NvAPI_IsSameDevice(&native, &alias));
-    CHECK(NvAPI_IsSameDevice(&wrapper, &native));
-    CHECK(NvAPI_IsSameDevice(&native, &nested));
-    CHECK(NvAPI_IsSameDevice(&nested, &sibling));
-    CHECK(!NvAPI_IsSameDevice(&native, &unrelated));
-    CHECK(!NvAPI_IsSameDevice(&nested, &unrelated));
+    CHECK(!FeedbackDeviceIdentity_IsSame(nullptr, nullptr));
+    CHECK(!FeedbackDeviceIdentity_IsSame(&native, nullptr));
+    CHECK(!FeedbackDeviceIdentity_IsSame(nullptr, &native));
+    CHECK(FeedbackDeviceIdentity_IsSame(&native, &native));
+    CHECK(FeedbackDeviceIdentity_IsSame(&alias, &native));
+    CHECK(FeedbackDeviceIdentity_IsSame(&native, &alias));
+    CHECK(FeedbackDeviceIdentity_IsSame(&wrapper, &native));
+    CHECK(FeedbackDeviceIdentity_IsSame(&native, &nested));
+    CHECK(FeedbackDeviceIdentity_IsSame(&nested, &sibling));
+    CHECK(!FeedbackDeviceIdentity_IsSame(&native, &unrelated));
+    CHECK(!FeedbackDeviceIdentity_IsSame(&nested, &unrelated));
     CHECK(FeedbackDeviceIdentity_IsSame(&nested, &alias));
+    // Only the terminal object is asked for its identity, once; a layer that answered the unwrap query is never
+    // asked for IUnknown, AddRef'd or Released by the resolution (the incoming pointer is borrowed).
+    IUnknown* const resolved = DeviceIdentity_AcquireNative(&nested);
+    CHECK(resolved == &native);
+    NvAPI_ReleaseFeedbackDevice(resolved);
+    CHECK(nested.add_refs == 0 && nested.releases == 0);
 }
 
 void TestCyclesAndBounds() {
     FakeDevice native, self, self_alias, first, second;
     self.Wrap(&self);
     self_alias.Wrap(&self);
-    CHECK(NvAPI_IsSameDevice(&self, &self_alias));
-    CHECK(!NvAPI_IsSameDevice(&self, &native));
+    CHECK(FeedbackDeviceIdentity_IsSame(&self, &self_alias));
+    CHECK(!FeedbackDeviceIdentity_IsSame(&self, &native));
     first.Wrap(&second);
     second.Wrap(&first);
-    CHECK(!NvAPI_IsSameDevice(&first, &native));
-    CHECK(!NvAPI_IsSameDevice(&first, &second));
+    CHECK(!FeedbackDeviceIdentity_IsSame(&first, &native));
+    CHECK(!FeedbackDeviceIdentity_IsSame(&first, &second));
     CHECK(first.queries + second.queries < 32);
 
     std::array<FakeDevice, 12> deep;
     for (size_t i = 0; i + 1 < deep.size(); ++i) deep[i].Wrap(&deep[i + 1]);
     deep.back().Wrap(&native);
-    CHECK(!NvAPI_IsSameDevice(&deep.front(), &native));
+    CHECK(!FeedbackDeviceIdentity_IsSame(&deep.front(), &native));
     unsigned queries = 0;
     for (const auto& device : deep) queries += device.queries;
     CHECK(queries <= 16); // Fixed eight-layer production bound, not a loop hang.
@@ -1811,19 +1966,30 @@ void TestFailedQueries() {
     FakeDevice native, wrapper;
     wrapper.Wrap(&native);
     wrapper.unwrap_status = E_FAIL; // Nonconforming failure WITH an owned output.
-    CHECK(!NvAPI_IsSameDevice(&wrapper, &native));
+    CHECK(!FeedbackDeviceIdentity_IsSame(&wrapper, &native));
     CHECK(native.references == 1);
     wrapper.unwrap_status = S_OK;
     wrapper.unwrapped = nullptr; // Nonconforming success WITHOUT an output.
-    CHECK(!NvAPI_IsSameDevice(&wrapper, &native));
+    CHECK(!FeedbackDeviceIdentity_IsSame(&wrapper, &native));
     wrapper.fault_unwrap = true;
-    CHECK(!NvAPI_IsSameDevice(&wrapper, &native));
+    CHECK(!FeedbackDeviceIdentity_IsSame(&wrapper, &native));
     wrapper.fault_unwrap = false;
+    wrapper.Wrap(&native);
+    // The layer that answered the unwrap query is never asked for its own identity: failures there are not seen.
     wrapper.identity_status = E_FAIL;
-    CHECK(!NvAPI_IsSameDevice(&wrapper, &native));
-    wrapper.identity_status = S_OK;
     wrapper.null_identity = true;
-    CHECK(!NvAPI_IsSameDevice(&wrapper, &native));
+    CHECK(FeedbackDeviceIdentity_IsSame(&wrapper, &native));
+    CHECK(wrapper.add_refs == 0 && wrapper.releases == 0);
+    wrapper.identity_status = S_OK;
+    wrapper.null_identity = false;
+    // The terminal object's own identity failing fails closed.
+    native.identity_status = E_FAIL;
+    CHECK(!FeedbackDeviceIdentity_IsSame(&wrapper, &native));
+    native.identity_status = S_OK;
+    native.null_identity = true;
+    CHECK(!FeedbackDeviceIdentity_IsSame(&wrapper, &native));
+    native.null_identity = false;
+    CHECK(native.references == 1);
 }
 
 void TestStableAliasCapture() {
@@ -1832,8 +1998,9 @@ void TestStableAliasCapture() {
     alias.canonical = &native;
     NvAPIFeedbackDevice original;
     CHECK(NvAPI_CaptureFeedbackDevice(&wrapper, &original));
-    CHECK(original.device == &wrapper);
-    CHECK(wrapper.references == 2);
+    CHECK(original.device == &native); // The publication names the NATIVE device, not the pointer it came in by.
+    CHECK(native.references == 2);     // Its one reference is on the native.
+    CHECK(wrapper.add_refs == 0);      // The incoming pointer was never AddRef'd.
     const unsigned resets = s_lifecycle_resets;
     g_game_requested_interval.store(1234);
     for (IUnknown* candidate : { static_cast<IUnknown*>(&native),
@@ -1843,17 +2010,17 @@ void TestStableAliasCapture() {
         CHECK(!no_publication.device); // No ownership token granted for a no-op.
         const NvAPIFeedbackDevice current = NvAPI_AcquireFeedbackDevice();
         CHECK(NvAPI_IsSameFeedbackPublication(original, current));
-        CHECK(current.device == &wrapper); // Original callable pointer retained.
+        CHECK(current.device == &native); // Original publication and token retained.
         NvAPI_ReleaseFeedbackDevice(current.device);
         CHECK(NvAPI_IsFeedbackDeviceCurrent(original));
         CHECK(g_game_requested_interval.load() == 1234);
         CHECK(s_lifecycle_resets == resets);
     }
-    CHECK(native.references == 1 && alias.references == 1);
-    NvAPIFeedbackDevice alias_token = original;
-    alias_token.device = &native;
-    CHECK(!NvAPI_IsSameFeedbackPublication(alias_token, original));
-    NvAPI_ClearFeedbackDevice(alias_token); // Identity is NOT publication authority.
+    CHECK(native.references == 2 && alias.references == 1);
+    CHECK(wrapper.add_refs == 0 && wrapper.releases == 0);
+    NvAPIFeedbackDevice stale_token = original;
+    stale_token.publication_sequence += 2;
+    NvAPI_ClearFeedbackDevice(stale_token); // A token of another publication is not authority.
     CHECK(NvAPI_IsFeedbackDeviceCurrent(original));
 
     NvAPIFeedbackDevice replacement;
@@ -1863,7 +2030,7 @@ void TestStableAliasCapture() {
     CHECK(replacement.publication_sequence == original.publication_sequence + 2);
     CHECK(g_game_requested_interval.load() == 0);
     CHECK(s_lifecycle_resets == resets + 1);
-    CHECK(wrapper.references == 1);
+    CHECK(native.references == 1);
     NvAPI_ClearFeedbackDevice(original);
     CHECK(NvAPI_IsFeedbackDeviceCurrent(replacement));
     NvAPI_ClearFeedbackDevice(replacement);
@@ -1873,50 +2040,51 @@ void TestStableAliasCapture() {
     CHECK(NvAPI_CaptureFeedbackDevice(&native, &original));
     CHECK(!NvAPI_CaptureFeedbackDevice(&wrapper));
     CHECK(NvAPI_IsFeedbackDeviceCurrent(original));
-    // Same public identity + exact-token clear pattern as on_destroy_device.
-    const auto destruction_snapshot = NvAPI_AcquireFeedbackDevice();
-    CHECK(NvAPI_IsSameDevice(destruction_snapshot.device, &wrapper));
-    NvAPI_ClearFeedbackDevice(destruction_snapshot);
-    NvAPI_ReleaseFeedbackDevice(destruction_snapshot.device);
+    // The destroy event names the device by the canonical identity of its native object (as on_destroy_device).
+    NvAPI_OnDeviceDestroyed(DeviceIdentity_OfNative(reinterpret_cast<uint64_t>(static_cast<IUnknown*>(&native))));
+    CHECK(!NvAPI_IsFeedbackDeviceCurrent(original) && !NvAPI_HasFeedbackDevice());
+    CHECK(native.references == 1);
 }
 
+// The identity comparison made while the incoming pointer's unwrap query runs is outside the writer section: a
+// republication during it (the incoming pointer is a probe whose query clears and republishes) must be revalidated.
 void TestReentrantRevalidation() {
-    FakeDevice native, wrapper, unrelated;
-    wrapper.Wrap(&native);
-    CHECK(NvAPI_CaptureFeedbackDevice(&wrapper, &s_reentrant_expected));
+    FakeDevice native, probe, unrelated, probe_unrelated;
+    probe.Wrap(&native);
+    probe_unrelated.Wrap(&unrelated);
+    CHECK(NvAPI_CaptureFeedbackDevice(&native, &s_reentrant_expected));
     const auto original = s_reentrant_expected;
-    // Clear and republish the SAME pointer during slow QI. Exact transition
-    // and token revalidation must reject the old snapshot, despite equivalence.
-    s_reentrant_device = &wrapper;
-    wrapper.on_unwrap = RepublishDuringQuery;
-    CHECK(!NvAPI_CaptureFeedbackDevice(&native));
+    // Clear and republish the SAME device during the unwrap. Exact transition and token revalidation must reject the
+    // old snapshot, despite equivalence.
+    s_reentrant_device = &native;
+    probe.on_unwrap = RepublishDuringQuery;
+    CHECK(!NvAPI_CaptureFeedbackDevice(&probe));
     CHECK(!NvAPI_IsFeedbackDeviceCurrent(original));
     CHECK(NvAPI_IsFeedbackDeviceCurrent(s_reentrant_publication));
     CHECK(s_reentrant_publication.publication_sequence == original.publication_sequence + 4);
     NvAPI_ClearFeedbackDevice(original);
     CHECK(NvAPI_IsFeedbackDeviceCurrent(s_reentrant_publication));
 
-    // The same stale comparison must not suppress replacement of an unrelated
-    // publication that appeared while QI was running.
+    // The same stale comparison must not suppress replacement of an unrelated publication that appeared while the
+    // unwrap was running.
     s_reentrant_expected = s_reentrant_publication;
     s_reentrant_device = &unrelated;
-    wrapper.on_unwrap = RepublishDuringQuery;
+    probe.on_unwrap = RepublishDuringQuery;
     NvAPIFeedbackDevice final_publication;
-    CHECK(NvAPI_CaptureFeedbackDevice(&native, &final_publication));
+    CHECK(NvAPI_CaptureFeedbackDevice(&probe, &final_publication));
     CHECK(final_publication.device == &native);
     CHECK(!NvAPI_IsFeedbackDeviceCurrent(s_reentrant_publication));
     CHECK(NvAPI_IsFeedbackDeviceCurrent(final_publication));
     NvAPI_ClearFeedbackDevice(final_publication);
 
-    // An UNEQUAL comparison also becomes stale: the callback has already
-    // published our candidate. Revalidate under writer exclusion rather than
-    // overwrite it, reset again, or grant its token to this no-op capture.
-    CHECK(NvAPI_CaptureFeedbackDevice(&wrapper, &s_reentrant_expected));
+    // An UNEQUAL comparison also becomes stale: the callback has already published our candidate. Revalidate under
+    // writer exclusion rather than overwrite it, reset again, or grant its token to this no-op capture.
+    CHECK(NvAPI_CaptureFeedbackDevice(&native, &s_reentrant_expected));
     const auto before_unequal_query = s_reentrant_expected;
     s_reentrant_device = &unrelated;
-    wrapper.on_unwrap = RepublishDuringQuery;
+    probe_unrelated.on_unwrap = RepublishDuringQuery;
     NvAPIFeedbackDevice no_publication;
-    CHECK(!NvAPI_CaptureFeedbackDevice(&unrelated, &no_publication));
+    CHECK(!NvAPI_CaptureFeedbackDevice(&probe_unrelated, &no_publication));
     CHECK(!no_publication.device);
     CHECK(NvAPI_IsFeedbackDeviceCurrent(s_reentrant_publication));
     CHECK(s_reentrant_publication.publication_sequence ==
@@ -1925,11 +2093,15 @@ void TestReentrantRevalidation() {
     s_reentrant_device = nullptr;
 }
 
+// While a device is published, the publication owns a reference on its native object, so the object cannot be freed
+// and its address reused; after the clear the address can be reused, and the old token and an unrelated device's
+// destroy event must not touch the new publication.
 void TestRealAddressReuse() {
     alignas(FakeDevice) unsigned char storage[sizeof(FakeDevice)];
     FakeDevice* first = new (storage) FakeDevice;
     NvAPIFeedbackDevice stale;
     CHECK(NvAPI_CaptureFeedbackDevice(first, &stale));
+    CHECK(first->references == 2); // Held by the publication: not freeable while published.
     NvAPI_ClearFeedbackDevice(stale);
     first->~FakeDevice();
     FakeDevice* reused = new (storage) FakeDevice;
@@ -1940,119 +2112,15 @@ void TestRealAddressReuse() {
     CHECK(!NvAPI_IsSameFeedbackPublication(stale, current));
     NvAPI_ClearFeedbackDevice(stale);
     CHECK(NvAPI_IsFeedbackDeviceCurrent(current));
+    FakeDevice other;
+    NvAPI_OnDeviceDestroyed(DeviceIdentity_OfNative(reinterpret_cast<uint64_t>(static_cast<IUnknown*>(&other))));
+    CHECK(NvAPI_IsFeedbackDeviceCurrent(current));
     NvAPI_ClearFeedbackDevice(current);
     reused->~FakeDevice();
 }
 
-// Base cost: IsPresentingFeedbackDevice answers a repeated positive comparison of
-// the published feedback device with the presenting device from a per-thread memo, with no
-// reference taken and no QueryInterface, and only while both publications are the memoized
-// ones. Everything else (an alias pointer, a negative answer, another sequence, a recaptured
-// address, a non-DXGI API) takes the full path and gives the answer it always gave.
-void TestPresentingDeviceMemo() {
-    FakeDevice native, wrapper, other, alias;
-    wrapper.Wrap(&native);
-    alias.canonical = &native;
-    const auto queries = [&] { return native.queries + wrapper.queries + other.queries + alias.queries; };
-    const auto add_refs = [&] { return native.add_refs + wrapper.add_refs + other.add_refs + alias.add_refs; };
-    NvAPIFeedbackDevice published;
-    CHECK(NvAPI_CaptureFeedbackDevice(&wrapper, &published));
-    t_presenting_match = {};
-    s_test_presenting = &native;
-    s_test_presenting_sequence = 2;
-    s_test_api = ActiveAPI::DX12;
-
-    // First call: the full path (wrapper != native, so the identity chain is queried).
-    unsigned q = queries();
-    CHECK(IsPresentingFeedbackDevice(&wrapper));
-    CHECK(queries() > q);
-    // Then: no QueryInterface, no AddRef/Release of anything.
-    q = queries();
-    unsigned refs = add_refs();
-    for (int i = 0; i < 5; ++i) CHECK(IsPresentingFeedbackDevice(&wrapper));
-    CHECK(queries() == q && add_refs() == refs);
-
-    // The presenting device is published again (any new publication advances the sequence):
-    // compared again once, memoized again.
-    s_test_presenting_sequence = 4;
-    CHECK(IsPresentingFeedbackDevice(&wrapper));
-    CHECK(queries() > q);
-    q = queries();
-    CHECK(IsPresentingFeedbackDevice(&wrapper));
-    CHECK(queries() == q);
-
-    // Another presenting device: the answer follows it; a negative answer is never memoized.
-    s_test_presenting = &other;
-    s_test_presenting_sequence = 6;
-    CHECK(!IsPresentingFeedbackDevice(&wrapper));
-    q = queries();
-    CHECK(!IsPresentingFeedbackDevice(&wrapper));
-    CHECK(queries() > q);
-    // Sequence in progress (odd): never answered from the memo, never memoized.
-    s_test_presenting = &native;
-    s_test_presenting_sequence = 7;
-    CHECK(IsPresentingFeedbackDevice(&wrapper));
-    q = queries();
-    CHECK(IsPresentingFeedbackDevice(&wrapper));
-    CHECK(queries() > q);
-    s_test_presenting_sequence = 8;
-    CHECK(IsPresentingFeedbackDevice(&wrapper));
-    q = queries();
-    CHECK(IsPresentingFeedbackDevice(&wrapper));
-    CHECK(queries() == q);
-
-    // A pointer that is not the published one (an alias of the same identity) cannot be
-    // proven alive by our reference: the full path every call, the same answer.
-    CHECK(IsPresentingFeedbackDevice(&alias));
-    q = queries();
-    CHECK(IsPresentingFeedbackDevice(&alias));
-    CHECK(queries() > q);
-    // ... and it does not disturb the memo of the published pointer.
-    q = queries();
-    CHECK(IsPresentingFeedbackDevice(&wrapper));
-    CHECK(queries() == q);
-
-    // The feedback device is cleared and the same address published again: a new publication,
-    // so the memo of the old one is not used; one comparison, memoized again.
-    NvAPI_ClearFeedbackDevice(published);
-    NvAPIFeedbackDevice republished;
-    CHECK(NvAPI_CaptureFeedbackDevice(&wrapper, &republished));
-    CHECK(republished.publication_sequence != published.publication_sequence);
-    q = queries();
-    CHECK(IsPresentingFeedbackDevice(&wrapper));
-    CHECK(queries() > q);
-    q = queries();
-    CHECK(IsPresentingFeedbackDevice(&wrapper));
-    CHECK(queries() == q);
-
-    // Not a DXGI API: rejected whatever the memo holds.
-    s_test_api = ActiveAPI::Vulkan;
-    CHECK(!IsPresentingFeedbackDevice(&wrapper));
-    s_test_api = ActiveAPI::DX12;
-    CHECK(IsPresentingFeedbackDevice(&wrapper));
-
-    // Another thread has its own memo: its first call compares, its second does not.
-    std::thread([&] {
-        const unsigned before = queries();
-        CHECK(IsPresentingFeedbackDevice(&wrapper));
-        CHECK(queries() > before);
-        const unsigned after = queries();
-        CHECK(IsPresentingFeedbackDevice(&wrapper));
-        CHECK(queries() == after);
-    }).join();
-
-    // The feedback device cleared: nothing is published, so nothing is memoized.
-    NvAPI_ClearFeedbackDevice(republished);
-    q = queries();
-    CHECK(IsPresentingFeedbackDevice(&wrapper));
-    CHECK(queries() > q);
-    s_test_api = ActiveAPI::None;
-    s_test_presenting = nullptr;
-    s_test_presenting_sequence = 0;
-    t_presenting_match = {};
-}
-
-NvAPI_Status __cdecl ForwardMarker(IUnknown*, NV_LATENCY_MARKER_PARAMS* params) {
+NvAPI_Status __cdecl ForwardMarker(IUnknown* device, NV_LATENCY_MARKER_PARAMS* params) {
+    s_last_driver_device = device;
     ++s_forwarded_markers;
     if (s_record_call_order) s_call_order.push_back({'F', params->frameID});
     return 77;
@@ -2063,6 +2131,307 @@ void SendMarker(IUnknown* device, uint64_t id, NV_LATENCY_MARKER_TYPE type) {
     params.frameID = id;
     params.markerType = type;
     CHECK(Hook_SetLatencyMarker(device, &params) == 77);
+}
+
+void SetPresenting(IUnknown* device, uint64_t sequence, ActiveAPI api) {
+    s_test_presenting = device;
+    s_test_presenting_sequence = sequence;
+    s_test_api = api;
+}
+void ClearPresenting() { SetPresenting(nullptr, 0, ActiveAPI::None); }
+IUnknown* Canonical(FakeNative12& native) { return static_cast<IUnknown*>(&native); }
+
+// ResolveIncomingDevice, the one look every hook takes at an incoming device pointer: the game's pointer (the
+// ReShade proxy, recorded as the publication's alias) and the native device are answered from values, with no call
+// on any object; any other pointer is unwrapped once to its native device. The proxy fixture is in strict mode: any
+// AddRef/Release/own-interface query on it fails the test.
+void TestResolveIncomingDevice() {
+    FakeReShadeLock lock;
+    lock.strict.store(true);
+    FakeNative12 native, other_native;
+    FakeProxy12 proxy(&native, &lock), other_proxy(&other_native, &lock);
+    native.proxy = &proxy;
+    other_native.proxy = &other_proxy;
+    IUnknown* const canonical = Canonical(native);
+    FakeDevice wrapper;   // a foreign wrapper above the native device (it answers the unwrap query)
+    wrapper.Wrap(&native);
+    FakeDevice swallower; // a wrapper that swallows the unwrap query: terminal, its own identity
+    FakeDevice aggregate; // swallows the unwrap query but answers IUnknown with the native's identity
+    aggregate.canonical = canonical;
+    const auto traffic = [&] { return native.queries + native.add_refs + proxy.unwrap_queries + wrapper.queries; };
+
+    NvAPIFeedbackDevice published;
+    CHECK(NvAPI_CaptureFeedbackDevice(&proxy, &published));
+    CHECK(published.device == canonical);
+    SetPresenting(canonical, 2, ActiveAPI::DX12);
+
+    // The game's pointer and the native itself: values only, no COM call of any kind.
+    for (IUnknown* incoming : { static_cast<IUnknown*>(&proxy), canonical }) {
+        const unsigned before = traffic();
+        for (int i = 0; i < 5; ++i) {
+            IncomingDevice resolved;
+            ResolveIncomingDevice(incoming, nullptr, &resolved);
+            CHECK(resolved.presenting && !resolved.capture);
+            CHECK(NvAPI_IsSameFeedbackPublication(published, resolved.identity));
+            CHECK(FeedbackIsPresenting(resolved.identity));
+        }
+        CHECK(traffic() == before);
+    }
+
+    // A foreign wrapper is never the alias: unwrapped on every call, with no reference taken on the wrapper.
+    for (int i = 0; i < 3; ++i) {
+        const unsigned before = wrapper.queries;
+        IncomingDevice resolved;
+        ResolveIncomingDevice(&wrapper, nullptr, &resolved);
+        CHECK(resolved.presenting && resolved.identity.device == canonical && !resolved.capture);
+        CHECK(wrapper.queries > before);
+        CHECK(wrapper.add_refs == 0 && wrapper.releases == 0);
+    }
+    // A wrapper that swallows the unwrap query is its own identity, never the presenting device's: not captured.
+    {
+        IncomingDevice resolved;
+        ResolveIncomingDevice(&swallower, nullptr, &resolved);
+        CHECK(!resolved.presenting && !resolved.capture && !resolved.identity.device);
+    }
+    // ... unless its canonical identity IS the presenting device's: it names the published native device.
+    {
+        IncomingDevice resolved;
+        ResolveIncomingDevice(&aggregate, nullptr, &resolved);
+        CHECK(resolved.presenting && resolved.identity.device == canonical && !resolved.capture);
+    }
+
+    // Another presenting device while this one is published: not presenting, nothing handed over.
+    SetPresenting(Canonical(other_native), 2, ActiveAPI::DX12);
+    {
+        IncomingDevice resolved;
+        ResolveIncomingDevice(&proxy, nullptr, &resolved);
+        CHECK(!resolved.presenting && !resolved.identity.device && !resolved.capture);
+        CHECK(!FeedbackIsPresenting(published));
+    }
+    // The presenting device, not published yet: handed over as an owned native, after one unwrap.
+    {
+        const unsigned before = other_proxy.unwrap_queries;
+        IncomingDevice resolved;
+        ResolveIncomingDevice(&other_proxy, nullptr, &resolved);
+        CHECK(resolved.presenting && resolved.capture == Canonical(other_native) && !resolved.identity.device);
+        CHECK(other_proxy.unwrap_queries == before + 1);
+        CHECK(other_native.references == 2);
+    }
+    CHECK(other_native.references == 1); // the destructor released the unconsumed hand-over
+    // Captured: published by its native identity, the proxy recorded as the alias, then answered from values.
+    {
+        IncomingDevice resolved;
+        ResolveIncomingDevice(&other_proxy, nullptr, &resolved);
+        CHECK(CaptureResolvedDevice(&other_proxy, &resolved, nullptr));
+        CHECK(resolved.identity.device == Canonical(other_native));
+        CHECK(!NvAPI_IsFeedbackDeviceCurrent(published));
+        const unsigned before = other_proxy.unwrap_queries + other_native.queries + other_native.add_refs;
+        IncomingDevice again;
+        ResolveIncomingDevice(&other_proxy, nullptr, &again);
+        CHECK(again.presenting && !again.capture && again.identity.device == resolved.identity.device);
+        CHECK(other_proxy.unwrap_queries + other_native.queries + other_native.add_refs == before);
+    }
+    CHECK(native.references == 1);
+
+    // A presenting publication in progress (odd sequence): unavailable; with an API active, rejected.
+    SetPresenting(Canonical(other_native), 3, ActiveAPI::DX12);
+    {
+        IncomingDevice resolved;
+        ResolveIncomingDevice(&other_proxy, nullptr, &resolved);
+        CHECK(!resolved.presenting && !resolved.capture && !resolved.identity.device);
+    }
+    // Not a DXGI API: rejected.
+    SetPresenting(Canonical(other_native), 4, ActiveAPI::Vulkan);
+    {
+        IncomingDevice resolved;
+        ResolveIncomingDevice(&other_proxy, nullptr, &resolved);
+        CHECK(!resolved.presenting && !resolved.capture && !resolved.identity.device);
+    }
+    // No presenter and no API yet: native calls bootstrap feedback (the published device and an unpublished one).
+    ClearPresenting();
+    {
+        IncomingDevice resolved;
+        ResolveIncomingDevice(&other_proxy, nullptr, &resolved);
+        CHECK(resolved.presenting && !resolved.capture && resolved.identity.device == Canonical(other_native));
+    }
+    NvAPI_ClearFeedbackDevice();
+    CHECK(!NvAPI_HasFeedbackDevice());
+    {
+        IncomingDevice resolved;
+        ResolveIncomingDevice(&proxy, nullptr, &resolved);
+        CHECK(resolved.presenting && resolved.capture == canonical && !resolved.identity.device);
+    }
+    // The sleep-status observer: the published device's token from values, no presenting requirement.
+    CHECK(NvAPI_CaptureFeedbackDevice(&proxy, &published));
+    {
+        const unsigned before = traffic();
+        NvAPIFeedbackDevice token;
+        CHECK(ResolvePublishedToken(&proxy, &token) && NvAPI_IsSameFeedbackPublication(published, token));
+        CHECK(traffic() == before);
+        CHECK(!ResolvePublishedToken(&other_proxy, &token)); // another device: unwrapped once, not the published one
+    }
+    NvAPI_ClearFeedbackDevice();
+    CHECK(native.references == 1 && other_native.references == 1);
+    CHECK(lock.proxy_calls == 0 && proxy.refs == 1 && other_proxy.refs == 1);
+    ClearPresenting();
+}
+
+// The launch hang. ReShade runs destroy_device (and add-on unload) while holding its process-wide, non-recursive
+// device lock, and that lock is also taken by every AddRef/Release of a device proxy: a callback that touches the
+// proxy of the device being destroyed waits for itself. Two devices A (published) and B (unrelated) with a fake
+// process-wide lock held for the whole event, proxies in strict mode: the production destroy path (the canonical
+// identity of the destroyed native, NvAPI_OnDeviceDestroyed) makes no proxy call, leaves an unrelated device's
+// publication alone and clears the published one's. Not covered here: the glue in dllmain.cpp that calls these two
+// functions (it is not linked), and the selection side (swapchain_selection_policy).
+void TestReShadeLockCycle() {
+    for (const bool proxy_first : { true, false }) {
+        FakeReShadeLock lock;
+        FakeNative12 native_a, native_b;
+        FakeProxy12 proxy_a(&native_a, &lock), proxy_b(&native_b, &lock);
+        native_a.proxy = &proxy_a;
+        native_b.proxy = &proxy_b;
+        lock.strict.store(true);
+        NvAPIFeedbackDevice token;
+        CHECK(NvAPI_CaptureFeedbackDevice(
+            proxy_first ? static_cast<IUnknown*>(&proxy_a) : Canonical(native_a), &token));
+        CHECK(token.device == Canonical(native_a));
+        CHECK(native_a.references == 2 && proxy_a.refs == 1); // the publication's reference is on the native
+        {
+            HeldLock held(lock); // the whole event runs inside ReShade's lock
+            // B: a second adapter's device, a launcher's, a probe's. Unrelated: nothing is cleared.
+            NvAPI_OnDeviceDestroyed(DeviceIdentity_OfNative(reinterpret_cast<uint64_t>(Canonical(native_b))));
+            CHECK(NvAPI_IsFeedbackDeviceCurrent(token) && NvAPI_HasFeedbackDevice());
+            CHECK(native_a.references == 2);
+            // A's device: the publication is cleared and its reference released, on the native.
+            const uint64_t identity_a = DeviceIdentity_OfNative(reinterpret_cast<uint64_t>(Canonical(native_a)));
+            CHECK(identity_a == reinterpret_cast<uint64_t>(token.device));
+            NvAPI_OnDeviceDestroyed(identity_a);
+            CHECK(!NvAPI_IsFeedbackDeviceCurrent(token) && !NvAPI_HasFeedbackDevice());
+            CHECK(native_a.references == 1);
+            NvAPI_OnDeviceDestroyed(identity_a);   // a second event, and an empty identity: nothing
+            NvAPI_OnDeviceDestroyed(0);
+        }
+        CHECK(lock.proxy_calls == 0 && proxy_a.refs == 1 && proxy_b.refs == 1);
+    }
+}
+
+// A reader parked between loading the publication and taking its reference (inside the native's AddRef) while the
+// related device is destroyed under the fake lock: the callback returns (it never waits for the reader), the
+// publication's reference is retired, and the reader's own drain releases it exactly once.
+void TestReaderInFlight() {
+    FakeReShadeLock lock;
+    FakeNative12 native;
+    FakeProxy12 proxy(&native, &lock);
+    native.proxy = &proxy;
+    NvAPIFeedbackDevice token;
+    CHECK(NvAPI_CaptureFeedbackDevice(&proxy, &token));
+    native.park_entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    native.park_release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    CHECK(native.park_entered && native.park_release);
+    NvAPIFeedbackDevice reader_result;
+    reader_result.device = &proxy; // overwritten by the reader
+    std::thread reader([&] {
+        native.park_thread.store(GetCurrentThreadId());
+        reader_result = NvAPI_AcquireFeedbackDevice();
+    });
+    CHECK(WaitForSingleObject(native.park_entered, 10000) == WAIT_OBJECT_0);
+    lock.strict.store(true);
+    {
+        HeldLock held(lock);
+        NvAPI_OnDeviceDestroyed(DeviceIdentity_OfNative(reinterpret_cast<uint64_t>(Canonical(native))));
+    }
+    CHECK(!NvAPI_HasFeedbackDevice() && !NvAPI_IsFeedbackDeviceCurrent(token));
+    CHECK(native.references == 2); // retired, not released: the reader is inside its window
+    SetEvent(native.park_release);
+    reader.join();
+    CHECK(!reader_result.device);  // the reader never got the cleared publication
+    CHECK(native.references == 1); // released exactly once, by the next drain
+    CHECK(lock.proxy_calls == 0 && proxy.refs == 1);
+    CloseHandle(native.park_entered);
+    CloseHandle(native.park_release);
+    native.park_entered = native.park_release = nullptr;
+}
+
+// Add-on unload can run at game exit under the same lock (destroy_device, then unload_addons). The unload path's
+// reference release (NvAPI_ClearFeedbackDevice) and the restore of the game's sleep mode make no proxy call, and the
+// restore's driver call is ReLimiter's own: it receives the native device.
+void TestUnloadUnderLock() {
+    FakeReShadeLock lock;
+    FakeNative12 native;
+    FakeProxy12 proxy(&native, &lock);
+    native.proxy = &proxy;
+    const auto old_mode = s_orig_sleep_mode;
+    s_orig_sleep_mode = FakeSleepMode;
+    s_expected_mode_params = nullptr;
+    lock.strict.store(true);
+    CHECK(NvAPI_CaptureFeedbackDevice(&proxy));
+    SetPresenting(Canonical(native), 2, ActiveAPI::DX12);
+    NV_SET_SLEEP_MODE_PARAMS params{};
+    params.version = NV_SLEEP_PARAMS_VER;
+    params.minimumIntervalUs = 2222;
+    CHECK(Hook_SetSleepMode(&proxy, &params) == -9);
+    CHECK(s_last_driver_device == &proxy); // the game's own call keeps the game's pointer
+    {
+        HeldLock held(lock);
+        s_last_driver_device = nullptr;
+        RestoreGameSleepMode();
+        CHECK(s_last_driver_device == Canonical(native));
+        NvAPI_ClearFeedbackDevice();
+    }
+    CHECK(!NvAPI_HasFeedbackDevice());
+    CHECK(native.references == 1 && proxy.refs == 1 && lock.proxy_calls == 0);
+    s_orig_sleep_mode = old_mode;
+    ClearPresenting();
+}
+
+// The hooks' common case on the game's own pointer (the proxy), in strict mode: SetSleepMode, Sleep and a latency
+// marker make no COM call on anything, the driver receives the game's pointer for the game's call, and the
+// sleep-status observer's lookup is a value read too.
+void TestHotPathTouchesNoProxy() {
+    FakeReShadeLock lock;
+    FakeNative12 native;
+    FakeProxy12 proxy(&native, &lock);
+    native.proxy = &proxy;
+    const auto old_sleep = s_orig_sleep;
+    const auto old_mode = s_orig_sleep_mode;
+    const auto old_marker = s_orig_set_latency_marker;
+    s_orig_sleep = FakeDriverSleep;
+    s_orig_sleep_mode = FakeSleepMode;
+    s_orig_set_latency_marker = ForwardMarker;
+    s_expected_mode_params = nullptr;
+    lock.strict.store(true);
+    CHECK(NvAPI_CaptureFeedbackDevice(&proxy));
+    SetPresenting(Canonical(native), 2, ActiveAPI::DX12);
+    const auto traffic = [&] { return native.queries + native.add_refs + native.releases + proxy.unwrap_queries; };
+    NV_SET_SLEEP_MODE_PARAMS params{};
+    params.version = NV_SLEEP_PARAMS_VER;
+    params.minimumIntervalUs = 4321;
+    for (int round = 0; round < 3; ++round) {
+        const unsigned before = traffic();
+        s_last_driver_device = nullptr;
+        CHECK(Hook_SetSleepMode(&proxy, &params) == -9);
+        CHECK(s_last_driver_device == &proxy);
+        s_last_driver_device = nullptr;
+        CHECK(Hook_Sleep(&proxy) == -7);
+        CHECK(s_last_driver_device == &proxy);
+        s_last_driver_device = nullptr;
+        SendMarker(&proxy, 700 + round, SIMULATION_START);
+        CHECK(s_last_driver_device == &proxy);
+        NvAPIFeedbackDevice token;
+        CHECK(ResolvePublishedToken(&proxy, &token));
+        CHECK(traffic() == before); // not one query, AddRef or Release on anything
+    }
+    CHECK(lock.proxy_calls == 0 && proxy.refs == 1);
+    // ReLimiter's own driver call (restore) passes the native device.
+    s_last_driver_device = nullptr;
+    RestoreGameSleepMode();
+    CHECK(s_last_driver_device == Canonical(native));
+    NvAPI_ClearFeedbackDevice();
+    CHECK(native.references == 1 && lock.proxy_calls == 0);
+    s_orig_sleep = old_sleep;
+    s_orig_sleep_mode = old_mode;
+    s_orig_set_latency_marker = old_marker;
+    ClearPresenting();
 }
 
 void TestDiagnosticAdmission() {
@@ -2675,6 +3044,10 @@ IUnknown* SwapMgr_AcquirePresentingDevice() noexcept {
     return s_test_presenting;
 }
 uint64_t SwapMgr_PresentingDeviceSequence() noexcept { return s_test_presenting_sequence; }
+uint64_t SwapMgr_PresentingDeviceIdentity(uint64_t* sequence) noexcept {
+    if (sequence) *sequence = s_test_presenting_sequence;
+    return (s_test_presenting_sequence & 1u) == 0 ? reinterpret_cast<uint64_t>(s_test_presenting) : 0;
+}
 ActiveAPI SwapMgr_GetActiveAPI() { return s_test_api; } // default None: native calls bootstrap feedback
 void Log_Write(LogLevel, const char* fmt, ...) {
 #ifdef _WIN64
@@ -2804,13 +3177,18 @@ bool IsDmfgActive() { return s_dmfg_active; }
 #endif
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--proxy-call-under-lock") == 0) {
+        s_expect_check_failure = true; // the control passes when the fixture's CHECK fires
+        RunProxyCallUnderLockControl();
+        std::puts("the fixture did not detect a proxy call under the lock");
+        return 1;
+    }
     TestIdentityNormalization();
     TestCyclesAndBounds();
     TestFailedQueries();
     TestStableAliasCapture();
     TestReentrantRevalidation();
     TestRealAddressReuse();
-    TestPresentingDeviceMemo();
     TestDiagnosticAdmission();
     TestCpuLatency();
     TestMarkerForwardOrder();
@@ -2855,8 +3233,13 @@ int main(int argc, char** argv) {
     CHECK(!NativeGate_HasNoFrameGeneration(controller));
     NativeGate_PublishNoFrameGeneration(true,controller);
     CHECK(NativeGate_HasNoFrameGeneration(controller));
+    TestResolveIncomingDevice();
+    TestReShadeLockCycle();
+    TestReaderInFlight();
+    TestUnloadUnderLock();
+    TestHotPathTouchesNoProxy();
     if (argc == 2) ReplayDawnwalker(argv[1]);
-    CHECK(g_dev.load() == nullptr);
+    CHECK(!NvAPI_HasFeedbackDevice());
     std::puts("feedback device identity/publication tests passed (production-linked; no live driver)");
     return 0;
 }

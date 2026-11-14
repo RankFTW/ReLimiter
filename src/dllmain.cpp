@@ -14,6 +14,7 @@
 #include "hooks.h"
 #include "health.h"
 #include "nvapi_hooks.h"
+#include "feedback_device_identity.h"
 #include "reflex_inject.h"
 #include "pcl_hooks.h"
 #include "loadlib_hooks.h"
@@ -146,26 +147,19 @@ static void on_destroy_device(reshade::api::device* device) {
     RuntimeCallbackGuard callback;
     if (callback.IsStopping()) return;
     try {
-    // Clear only the exact D3D device being destroyed. Launcher or auxiliary
-    // device teardown must not invalidate a newer game's feedback producer.
+    // This callback runs under ReShade's process-wide device lock (inside the Release of a device proxy). It makes no
+    // call on any device proxy: every value it compares was stored earlier, or comes from get_native() through calls
+    // on the native object only (src/AGENTS.md, "ReShade's device lock").
+    //
+    // Clear only the exact D3D device being destroyed. Launcher or auxiliary device teardown must not invalidate a
+    // newer game's feedback producer. The device is named by the canonical identity of its native object (one native
+    // QueryInterface, no ReShade involvement), compared with the published feedback device's by value.
     const bool is_dxgi = device != nullptr &&
         (device->get_api() == reshade::api::device_api::d3d11 ||
          device->get_api() == reshade::api::device_api::d3d12);
-    IUnknown* expected_device = is_dxgi
-        ? reinterpret_cast<IUnknown*>(device->get_native())
-        : nullptr;
-    if (expected_device != nullptr) {
-        const NvAPIFeedbackDevice feedback_device =
-            NvAPI_AcquireFeedbackDevice();
-        // Match the acquired publication to the destroyed COM device, not a
-        // separately sampled presenter. A concurrent A -> B publication makes
-        // this exact-token clear a no-op, even if COM pointer values recur.
-        if (NvAPI_IsSameDevice(feedback_device.device, expected_device)) {
-            NvAPI_ClearFeedbackDevice(feedback_device);
-        }
-        NvAPI_ReleaseFeedbackDevice(feedback_device.device);
-    }
-    SwapMgr_OnDestroyDevice(device);
+    const uint64_t identity = is_dxgi ? DeviceIdentity_OfNative(device->get_native()) : 0;
+    if (identity != 0) NvAPI_OnDeviceDestroyed(identity);
+    SwapMgr_OnDestroyDevice(device, identity);
     }
     catch (...) {
         OutputDebugStringA("ReLimiter: destroy_device callback rejected an exception.\n");

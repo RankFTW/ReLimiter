@@ -25,6 +25,8 @@ static const IID IID_ID3D11Device = {
 // ── Internal state ──
 static IUnknown*  s_inject_dev   = nullptr;
 static NvAPIFeedbackDevice s_inject_published_device = {};
+// The publication the injection device is bound to (a value; no reference).
+static NvAPIFeedbackDevice s_inject_token = {};
 static std::atomic<bool> s_active{false};
 static bool       s_sleep_mode_set = false;
 static std::atomic<bool> s_requested{false};
@@ -83,6 +85,7 @@ static void ReleaseInjectionDevice() noexcept {
     NvAPI_ReleaseFeedbackDevice(s_inject_dev);
     s_inject_dev = nullptr;
     s_inject_published_device = {};
+    s_inject_token = {};
 }
 
 // ── Sleep mode configuration ──
@@ -134,6 +137,16 @@ static void UpdateActiveState() {
         return;
     }
 
+    // The injection device is a native device this module holds a reference on. When the publication it was bound to
+    // is gone (its device was destroyed, or another device was published), the reference must not outlive the
+    // device: release it, deactivate, and acquire again below.
+    if (s_inject_dev && s_inject_token.device && !NvAPI_IsFeedbackDeviceCurrent(s_inject_token)) {
+        s_active.store(false, std::memory_order_release);
+        ReleaseInjectionDevice();
+        s_sleep_mode_set = false;
+        LOG_INFO("ReflexInject: injection device released (its feedback publication ended)");
+    }
+
     if (AreNvAPIMarkersFlowing()) {
         if (s_active.load(std::memory_order_acquire)) {
             ConfigureSleepMode(false);
@@ -153,12 +166,20 @@ static void UpdateActiveState() {
         const NvAPIFeedbackDevice feedback_device =
             NvAPI_AcquireFeedbackDevice();
         s_inject_dev = feedback_device.device;
+        s_inject_token = feedback_device;
         if (!s_inject_dev) {
             s_inject_dev = AcquireDeviceFromSwapchain();
             if (s_inject_dev) {
                 NvAPI_CaptureFeedbackDevice(
                     s_inject_dev,
                     &s_inject_published_device);
+                s_inject_token = s_inject_published_device;
+                if (!s_inject_token.device) {
+                    // Already published (as the same native device): the injection device is bound to that publication.
+                    const NvAPIFeedbackDevice current = NvAPI_AcquireFeedbackDevice();
+                    s_inject_token = current;
+                    NvAPI_ReleaseFeedbackDevice(current.device);
+                }
             }
         }
         if (!s_inject_dev) return;
