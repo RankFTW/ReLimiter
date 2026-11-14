@@ -401,7 +401,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.fg_real_yield=ReadINIBool(S,"fg_real_yield",false,P);
     g_config.fg_real_yield_early_us=ReadINIInt(S,"fg_real_yield_early_us",1000,P);
     g_config.fg_render_break_every=ReadINIInt(S,"fg_render_break_every",0,P);
-    g_config.fg_render_break_window=ReadINIInt(S,"fg_render_break_window",0,P);
+    g_config.fg_render_break_window=ReadINIInt(S,"fg_render_break_window",4,P);
     g_config.unified_hold_share=ReadINIDouble(S,"unified_hold_share",kPacingUnifiedHoldShareDefault,P);
     g_config.unified_queue_law=ReadINIBool(S,"unified_queue_law",kPacingUnifiedQueueLawDefault,P);
     g_config.unified_queue_rank=ReadINIInt(S,"unified_queue_rank",kPacingUnifiedQueueRankDefault,P);

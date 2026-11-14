@@ -61,9 +61,9 @@ inline std::atomic<uint64_t> g_fg_present_order_real_awaited{0};
 // ordered render queue signals a fence and waits for that value, so the GPU is handed nothing past that point until
 // it has reached it and a waiting Present of DLSS-G's thread gets the GPU there (fg_present_order.cpp).
 inline std::atomic<int> g_fg_render_break_every{0};
-// With `fg_render_break_window` above 0 only the submissions within that many of the one the GPU is at when the real
-// frame's Present returns get a break; 0: the whole frame.
-inline std::atomic<int> g_fg_render_break_window{0};
+// With `fg_render_break_window` above 0 (default 4) only the submissions within that many of the one the GPU is at
+// when the real frame's Present returns get a break; 0: the whole frame.
+inline std::atomic<int> g_fg_render_break_window{4};
 
 #if defined(_WIN64) && defined(RELIMITER_FG_PRESENT_ORDER)
 #include <Windows.h>

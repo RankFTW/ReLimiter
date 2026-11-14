@@ -619,9 +619,10 @@ void FgPresentOrder_ReleaseActive(bool watchdog) noexcept {
                         std::memory_order_release);
                 // This Present was the generated frame's: the next one of another thread than the worker is the
                 // real frame's, which the yield of the work that follows this marker waits for and the breaks' window
-                // is placed by.
+                // is placed by. Neither in use: nothing is awaited and the next Present does no work here.
                 if (!watchdog && (g_fg_real_yield.load(std::memory_order_relaxed) ||
-                        g_fg_render_break_window.load(std::memory_order_relaxed) > 0))
+                        (g_fg_render_break_every.load(std::memory_order_relaxed) > 0 &&
+                            g_fg_render_break_window.load(std::memory_order_relaxed) > 0)))
                     g_fg_present_order_real_awaited.store(reached, std::memory_order_release);
             }
             ReleaseSRWLockExclusive(&release_lock);
