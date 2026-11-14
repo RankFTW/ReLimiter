@@ -57,8 +57,8 @@ void STDMETHODCALLTYPE ObserveExecute(ID3D12CommandQueue* queue, UINT count, ID3
     const DWORD incoming = GetLastError();
     RuntimeCallbackGuard callback;
     Depth nested;
-    // fg_real_yield (key off: one load and a branch): in front of one submission of the frame the ordered render
-    // queue waits for the real frame's Present, through the originals (no detour sees it).
+    // fg_render_break_every (key off: one load and a branch): in front of a submission the ordered render queue gets
+    // a break, through the originals (no detour sees it).
     if (depth == 1 && !callback.IsStopping())
         FgPresentOrder_BeforeExecute(queue, original_signal.load(std::memory_order_acquire),
             original_wait.load(std::memory_order_acquire));

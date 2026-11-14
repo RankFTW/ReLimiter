@@ -398,10 +398,8 @@ void LoadConfig(HMODULE hModule) {
     g_config.gpu_queue_probe_source=ReadINIInt(S,"gpu_queue_probe_source",kPacingGpuQueueProbeSourceDefault,P);
     g_config.fg_present_order=ReadINIBool(S,"fg_present_order",true,P);
     g_config.fg_separate_presenter_hold=ReadINIBool(S,"fg_separate_presenter_hold",false,P);
-    g_config.fg_real_yield=ReadINIBool(S,"fg_real_yield",false,P);
-    g_config.fg_real_yield_early_us=ReadINIInt(S,"fg_real_yield_early_us",1000,P);
     g_config.fg_render_break_every=ReadINIInt(S,"fg_render_break_every",0,P);
-    g_config.fg_render_break_window=ReadINIInt(S,"fg_render_break_window",4,P);
+    g_config.fg_render_break_window=ReadINIInt(S,"fg_render_break_window",-1,P);
     g_config.unified_hold_share=ReadINIDouble(S,"unified_hold_share",kPacingUnifiedHoldShareDefault,P);
     g_config.unified_queue_law=ReadINIBool(S,"unified_queue_law",kPacingUnifiedQueueLawDefault,P);
     g_config.unified_queue_rank=ReadINIInt(S,"unified_queue_rank",kPacingUnifiedQueueRankDefault,P);
@@ -894,10 +892,8 @@ void Config_ApplyPacingPipeline() {
     g_unified_queue_margin_end.store(sizeof(void*) == 8 ? g_config.unified_queue_margin_end : 0, std::memory_order_relaxed);
     g_fg_present_order.store(sizeof(void*) == 8 && g_config.fg_present_order, std::memory_order_relaxed);
     g_fg_separate_presenter_hold.store(g_config.fg_separate_presenter_hold, std::memory_order_relaxed);
-    g_fg_real_yield.store(sizeof(void*) == 8 && g_config.fg_real_yield, std::memory_order_relaxed);
-    g_fg_real_yield_early_us.store(std::clamp(g_config.fg_real_yield_early_us, 0, 2500), std::memory_order_relaxed);
     g_fg_render_break_every.store(sizeof(void*) == 8 ? std::clamp(g_config.fg_render_break_every, 0, 64) : 0, std::memory_order_relaxed);
-    g_fg_render_break_window.store(std::clamp(g_config.fg_render_break_window, 0, 32), std::memory_order_relaxed);
+    g_fg_render_break_window.store(std::clamp(g_config.fg_render_break_window, -1, 32), std::memory_order_relaxed);
 }
 
 // ── Live keys (developer control file) ──
@@ -953,8 +949,6 @@ constexpr Key kKeys[] = {
     {"gpu_queue_probe_source", &SetInt<&Config::gpu_queue_probe_source>, Publish::Pipeline},
     {"fg_present_order", &SetBool<&Config::fg_present_order>, Publish::Pipeline},
     {"fg_separate_presenter_hold", &SetBool<&Config::fg_separate_presenter_hold>, Publish::Pipeline},
-    {"fg_real_yield", &SetBool<&Config::fg_real_yield>, Publish::Pipeline},
-    {"fg_real_yield_early_us", &SetInt<&Config::fg_real_yield_early_us>, Publish::Pipeline},
     {"fg_render_break_every", &SetInt<&Config::fg_render_break_every>, Publish::Pipeline},
     {"fg_render_break_window", &SetInt<&Config::fg_render_break_window>, Publish::Pipeline},
     {"unified_queue_margin_end", &SetInt<&Config::unified_queue_margin_end>, Publish::Pipeline},

@@ -51,19 +51,16 @@ inline bool FgPresentOrder_Orders(const void* queue) noexcept {
 inline bool FgPresentOrder_ProvesSeparatePresenter(const void* queue) noexcept {
     return g_fg_separate_presenter_hold.load(std::memory_order_relaxed) && FgPresentOrder_Orders(queue);
 }
-// Experiment (developer live key `fg_real_yield`, default off): in front of one submission of each frame the ordered
-// render queue waits for the real frame's Present (fg_present_order.cpp). The marker value whose real frame's
-// Present is awaited, 0 when none is.
-inline std::atomic<bool> g_fg_real_yield{false};
-inline std::atomic<int> g_fg_real_yield_early_us{1000};
-inline std::atomic<uint64_t> g_fg_present_order_real_awaited{0};
-// Experiment (developer live key `fg_render_break_every`, default 0 = off): in front of every n-th submission the
-// ordered render queue signals a fence and waits for that value, so the GPU is handed nothing past that point until
-// it has reached it and a waiting Present of DLSS-G's thread gets the GPU there (fg_present_order.cpp).
+// Breaks in the render queue's committed work (developer live key `fg_render_break_every`, default 0 = off): in
+// front of a submission the ordered render queue signals a fence and waits for that value, so the GPU is handed
+// nothing past that point until it has reached it and a waiting Present of DLSS-G's thread gets the GPU there
+// (fg_present_order.cpp). `fg_render_break_window` says which submissions: -1 (default) those around the one the
+// GPU is at when the real frame's Present returns, as wide as fg_break_window_rule.h makes it; 0 every n-th of the
+// whole frame; above 0 that half-width.
 inline std::atomic<int> g_fg_render_break_every{0};
-// With `fg_render_break_window` above 0 (default 4) only the submissions within that many of the one the GPU is at
-// when the real frame's Present returns get a break; 0: the whole frame.
-inline std::atomic<int> g_fg_render_break_window{4};
+inline std::atomic<int> g_fg_render_break_window{-1};
+// The marker value whose real frame's Present is awaited to place the window, 0 when none is.
+inline std::atomic<uint64_t> g_fg_present_order_real_awaited{0};
 
 #if defined(_WIN64) && defined(RELIMITER_FG_PRESENT_ORDER)
 #include <Windows.h>
@@ -94,8 +91,7 @@ inline void FgPresentOrder_AfterWait(ID3D12CommandQueue* queue, ID3D12Fence* fen
 // Queue Execute detour, in front of the native call, outermost calls only (key off: one load and a branch).
 inline void FgPresentOrder_BeforeExecute(ID3D12CommandQueue* queue, FgPresentOrder_FenceFn native_signal,
     FgPresentOrder_FenceFn native_wait) noexcept {
-    if ((g_fg_real_yield.load(std::memory_order_relaxed) ||
-            g_fg_render_break_every.load(std::memory_order_relaxed) > 0) &&
+    if (g_fg_render_break_every.load(std::memory_order_relaxed) > 0 &&
         g_fg_present_order_queue.load(std::memory_order_relaxed) == queue)
         FgPresentOrder_BeforeExecuteActive(queue, native_signal, native_wait);
 }
