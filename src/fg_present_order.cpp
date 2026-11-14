@@ -29,7 +29,7 @@ int64_t frequency = 0;
 
 // ── Experiment: a yield for the real frame (developer live key `fg_real_yield`, default off) ──
 // With ordering the generated frame's Present is prompt. The real frame's, which DLSS-G times on the CPU half a batch
-// later, still lands in the middle of the render queue's work and waits until that queue next blocks (N.102). In
+// later, still lands in the middle of the render queue's work and gets the GPU 1 to 2 ms later (N.102, N.103). In
 // front of one submission of each frame the render queue therefore waits (`yorder`) until the real frame's Present of
 // the frame before has returned, or a watchdog `kYieldWaitMs` after the queue got there. Which submission: the one
 // the queue reaches last before that Present. It is found from events alone: a Present that returned before the
@@ -48,6 +48,18 @@ std::atomic<int64_t> y_reach_qpc{0};          // when the yield watchdog saw the
 std::atomic<uint64_t> y_reach_value{0};       // ... of this value
 std::atomic<uint64_t> y_in_time{0}, y_late{0}, y_watchdog{0}, y_wait_us_sum{0}, y_wait_us_max{0};
 HANDLE ythread = nullptr, ymarker_event = nullptr, yreleased_event = nullptr;
+
+// ── Experiment: breaks in the render queue's committed work (developer live key `fg_render_break_every`, default 0) ──
+// The GPU is handed the render queue's work up to twelve submissions ahead, and a Present of DLSS-G's own thread that
+// arrives meanwhile gets the GPU 1 to 2 ms later at the median, 2 to 5 ms at the 90th percentile, although its queue
+// has the higher priority; where the render queue has nothing committed it runs at once (N.103). In front of every
+// n-th submission the render queue therefore signals `breaker` and waits for that value: the GPU is handed nothing
+// past that point until it has reached it, releases the Wait itself there, and takes a waiting Present first. No
+// thread and no watchdog: each Wait follows its own Signal in the same queue. One submitter at a time enqueues a
+// pair, so the values rise in queue order (a pair out of order would leave a Wait above the fence's value).
+ID3D12Fence* breaker = nullptr;
+std::atomic<uint64_t> break_value{0}, breaks{0};
+std::atomic<bool> breaking{false};
 
 int64_t Qpc() noexcept { LARGE_INTEGER value{}; QueryPerformanceCounter(&value); return value.QuadPart; }
 HRESULT QueueCall(FgPresentOrder_FenceFn call, ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t value) noexcept {
@@ -88,6 +100,21 @@ bool CreateFences(ID3D12CommandQueue* queue, ID3D12Fence** first, ID3D12Fence** 
     } __except (EXCEPTION_EXECUTE_HANDLER) { created = false; *failure = {5, 0}; }
     return created;
 }
+bool CreateBreakFence(ID3D12CommandQueue* queue, ID3D12Fence** fence, BindFailure* failure) noexcept {
+    ID3D12Device* device = nullptr;
+    bool created = false;
+    __try {
+        HRESULT result = queue->GetDevice(IID_PPV_ARGS(&device));
+        if (FAILED(result) || !device) *failure = {2, result};
+        else {
+            result = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(fence));
+            if (FAILED(result) || !*fence) *failure = {3, result};
+            else created = true;
+            device->Release();
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { created = false; *failure = {5, 0}; }
+    return created;
+}
 void ReleaseFence(ID3D12Fence** fence) noexcept {
     __try { if (*fence) (*fence)->Release(); }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -113,6 +140,8 @@ void DropLocked() noexcept {
     ReleaseFence(&order);
     ReleaseFence(&ymarker);
     ReleaseFence(&yorder);
+    ReleaseFence(&breaker);
+    break_value.store(0, std::memory_order_relaxed);
     bound = nullptr;
     g_fg_present_order_released.store(0, std::memory_order_relaxed);
     g_fg_present_order_issued.store(0, std::memory_order_release);
@@ -152,8 +181,10 @@ bool BindLocked(ID3D12CommandQueue* queue, BindFailure* failure) noexcept {
         }
         if (!thread || !ythread) { *failure = {1, static_cast<long>(GetLastError())}; return false; }
     }
-    if (!CreateFences(queue, &marker, &order, failure) || !CreateFences(queue, &ymarker, &yorder, failure)) {
+    if (!CreateFences(queue, &marker, &order, failure) || !CreateFences(queue, &ymarker, &yorder, failure) ||
+        !CreateBreakFence(queue, &breaker, failure)) {
         ReleaseFence(&marker); ReleaseFence(&order); ReleaseFence(&ymarker); ReleaseFence(&yorder);
+        ReleaseFence(&breaker);
         return false;
     }
     bound = queue;
@@ -193,7 +224,7 @@ DWORD WINAPI Watchdog(void*) noexcept {
     HANDLE handles[2] = {stop_event, marker_event};
     HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     int64_t last_report = Qpc();
-    uint64_t reported_present = 0, reported_watchdog = 0;
+    uint64_t reported_present = 0, reported_watchdog = 0, reported_breaks = 0;
     double wait_sum = 0.0, wait_max = 0.0;
     uint64_t wait_count = 0;
     for (;;) {
@@ -229,6 +260,10 @@ DWORD WINAPI Watchdog(void*) noexcept {
                 static_cast<unsigned long long>(watchdog - reported_watchdog),
                 wait_sum / static_cast<double>(wait_count), wait_max);
             reported_present = present; reported_watchdog = watchdog;
+            if (const uint64_t broke = breaks.load(std::memory_order_relaxed); broke != reported_breaks) {
+                LOG_INFO("FG render breaks: %llu in 10 s", static_cast<unsigned long long>(broke - reported_breaks));
+                reported_breaks = broke;
+            }
             wait_sum = 0.0; wait_max = 0.0; wait_count = 0; last_report = done;
         }
     }
@@ -424,25 +459,43 @@ void FgPresentOrder_BeforeExecuteActive(ID3D12CommandQueue* queue, FgPresentOrde
     FgPresentOrder_FenceFn native_wait) noexcept {
     using namespace fg_present_order;
     const unsigned index = executes.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (index != yield_at.load(std::memory_order_relaxed) || !native_signal || !native_wait ||
-        RuntimeLifecycle_IsStopping()) return;
+    if (!native_signal || !native_wait || RuntimeLifecycle_IsStopping()) return;
+    const int every = g_fg_render_break_every.load(std::memory_order_relaxed);
+    const bool at_break = every > 0 && index % static_cast<unsigned>(every) == 0;
     const uint64_t value = frame_value.load(std::memory_order_acquire);
-    if (!value || value <= y_issued.load(std::memory_order_relaxed)) return;
+    const bool at_yield = g_fg_real_yield.load(std::memory_order_relaxed) &&
+        index == yield_at.load(std::memory_order_relaxed) && value && value > y_issued.load(std::memory_order_relaxed);
+    if (!at_break && !at_yield) return;
     if (!TryAcquireSRWLockShared(&lock)) return;
-    if (bound == queue && ymarker && yorder) {
-        AcquireSRWLockExclusive(&release_lock);
-        const Rule::Enqueue enqueue = yield_rule.OnWait();
-        ReleaseSRWLockExclusive(&release_lock);
-        if (enqueue != Rule::Enqueue::Nothing && SUCCEEDED(QueueCall(native_signal, queue, ymarker, value))) {
-            y_issued.store(value, std::memory_order_release);
-            if (FAILED(RegisterEvent(ymarker, value, ymarker_event))) SetEvent(ymarker_event);
-            if (enqueue == Rule::Enqueue::MarkerAndWait) {
-                // Shown to the queue probe as the queue Wait it is, so the time the queue spends here is not read as
-                // a queue without work.
-                const unsigned probe = GpuQueueProbe_WaitBegin(queue, yorder, value, 0);
-                if (FAILED(QueueCall(native_wait, queue, yorder, value)))
+    if (bound == queue) {
+        if (at_break && breaker && !breaking.exchange(true, std::memory_order_acquire)) {
+            const uint64_t point = break_value.load(std::memory_order_relaxed) + 1;
+            // The Wait only behind its own Signal: a Wait without one would hold the queue for good.
+            if (SUCCEEDED(QueueCall(native_signal, queue, breaker, point))) {
+                break_value.store(point, std::memory_order_relaxed);
+                if (FAILED(QueueCall(native_wait, queue, breaker, point)))
                     enqueue_failures.fetch_add(1, std::memory_order_relaxed);
-                GpuQueueProbe_WaitEnd(probe);
+                breaks.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                enqueue_failures.fetch_add(1, std::memory_order_relaxed);
+            }
+            breaking.store(false, std::memory_order_release);
+        }
+        if (at_yield && ymarker && yorder) {
+            AcquireSRWLockExclusive(&release_lock);
+            const Rule::Enqueue enqueue = yield_rule.OnWait();
+            ReleaseSRWLockExclusive(&release_lock);
+            if (enqueue != Rule::Enqueue::Nothing && SUCCEEDED(QueueCall(native_signal, queue, ymarker, value))) {
+                y_issued.store(value, std::memory_order_release);
+                if (FAILED(RegisterEvent(ymarker, value, ymarker_event))) SetEvent(ymarker_event);
+                if (enqueue == Rule::Enqueue::MarkerAndWait) {
+                    // Shown to the queue probe as the queue Wait it is, so the time the queue spends here is not read
+                    // as a queue without work.
+                    const unsigned probe = GpuQueueProbe_WaitBegin(queue, yorder, value, 0);
+                    if (FAILED(QueueCall(native_wait, queue, yorder, value)))
+                        enqueue_failures.fetch_add(1, std::memory_order_relaxed);
+                    GpuQueueProbe_WaitEnd(probe);
+                }
             }
         }
     }

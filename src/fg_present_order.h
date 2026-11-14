@@ -57,6 +57,10 @@ inline bool FgPresentOrder_ProvesSeparatePresenter(const void* queue) noexcept {
 inline std::atomic<bool> g_fg_real_yield{false};
 inline std::atomic<int> g_fg_real_yield_early_us{1000};
 inline std::atomic<uint64_t> g_fg_present_order_real_awaited{0};
+// Experiment (developer live key `fg_render_break_every`, default 0 = off): in front of every n-th submission the
+// ordered render queue signals a fence and waits for that value, so the GPU is handed nothing past that point until
+// it has reached it and a waiting Present of DLSS-G's thread gets the GPU there (fg_present_order.cpp).
+inline std::atomic<int> g_fg_render_break_every{0};
 
 #if defined(_WIN64) && defined(RELIMITER_FG_PRESENT_ORDER)
 #include <Windows.h>
@@ -87,7 +91,8 @@ inline void FgPresentOrder_AfterWait(ID3D12CommandQueue* queue, ID3D12Fence* fen
 // Queue Execute detour, in front of the native call, outermost calls only (key off: one load and a branch).
 inline void FgPresentOrder_BeforeExecute(ID3D12CommandQueue* queue, FgPresentOrder_FenceFn native_signal,
     FgPresentOrder_FenceFn native_wait) noexcept {
-    if (g_fg_real_yield.load(std::memory_order_relaxed) &&
+    if ((g_fg_real_yield.load(std::memory_order_relaxed) ||
+            g_fg_render_break_every.load(std::memory_order_relaxed) > 0) &&
         g_fg_present_order_queue.load(std::memory_order_relaxed) == queue)
         FgPresentOrder_BeforeExecuteActive(queue, native_signal, native_wait);
 }
