@@ -71,11 +71,6 @@ void STDMETHODCALLTYPE ObserveExecute(ID3D12CommandQueue* queue, UINT count, ID3
     // The probe's done Signal goes first, directly behind the game's call: whatever the
     // Streamline handoff enqueues after it belongs to what follows.
     GpuQueueProbe_ExecuteLeave(probe);
-#ifndef RELIMITER_GLUE_TEST_SEAM
-    // fg_output_wait_us (key off: one load and a branch): behind the worker's first Execute after its Wait on the
-    // source fence (frame generation), this unit's gate Wait, through the original.
-    if (depth == 1 && !callback.IsStopping()) FgOutputWait_AfterExecute(queue, original_wait.load(std::memory_order_acquire));
-#endif
     if (!callback.IsStopping() && depth == 1 && streamline_ready.load(std::memory_order_acquire))
         StreamlineHandoff_Execute(queue);
     SetLastError(outgoing);
@@ -99,10 +94,8 @@ template<class Forward> HRESULT ObserveFence(ID3D12CommandQueue* queue, ID3D12Fe
     // that has a probe input is the real frame's source Signal; its queue is the source queue.
     if (signal && depth == 1 && !callback.IsStopping() && g_gpu_queue_probe.load(std::memory_order_relaxed))
         StreamlineHandoff_ProbeSourceSignal(queue);
-#ifndef RELIMITER_GLUE_TEST_SEAM
     // fg_present_order (key off: one load and a branch): the queue of a proxy Present scope's first outermost Signal.
     if (outermost_signal) FgPresentOrder_NoteSignal(queue, fence);
-#endif
     if (!callback.IsStopping() && depth == 1 && streamline_ready.load(std::memory_order_acquire)) {
         StreamlineHandoff_RecordQueueFence(queue, fence, value, signal);
         if (StreamlineHandoff_Interested(fence)) {
@@ -146,17 +139,12 @@ HRESULT STDMETHODCALLTYPE ObserveWait(ID3D12CommandQueue* queue, ID3D12Fence* fe
     return ObserveFence(queue, fence, value, false, [&] {
         const HRESULT result = original_wait.load(std::memory_order_acquire)(queue, fence, value);
         const DWORD error = GetLastError(); // the original's, for ObserveFence to hand back
-#ifndef RELIMITER_GLUE_TEST_SEAM
         // fg_present_order (key off: one load and a branch): behind DLSS-G's Wait on the render queue, this unit's
         // marker Signal and order Wait, through the originals (no detour sees them) and in front of the probe's
         // release Signal, so the probe reads the two Waits as one.
-        if (result == S_OK && depth == 1) {
+        if (result == S_OK && depth == 1)
             FgPresentOrder_AfterWait(queue, fence, original_signal.load(std::memory_order_acquire),
                 original_wait.load(std::memory_order_acquire));
-            // fg_output_wait_us (key off: one load and a branch): the marker behind the worker's Wait on the source fence.
-            FgOutputWait_AfterWait(queue, fence, original_signal.load(std::memory_order_acquire));
-        }
-#endif
         GpuQueueProbe_WaitEnd(probe);
         SetLastError(error);
         return result;

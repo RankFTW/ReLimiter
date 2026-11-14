@@ -510,7 +510,6 @@ static void on_destroy_command_queue(reshade::api::command_queue* queue) {
         if (queue && queue->get_device() && queue->get_device()->get_api() == reshade::api::device_api::d3d12) {
             GpuQueueProbe_OnQueueDestroy(reinterpret_cast<void*>(static_cast<uintptr_t>(queue->get_native())));
             FgPresentOrder_OnQueueDestroy(reinterpret_cast<void*>(static_cast<uintptr_t>(queue->get_native())));
-            FgOutputWait_OnQueueDestroy(reinterpret_cast<void*>(static_cast<uintptr_t>(queue->get_native())));
         }
     }
 }
@@ -776,7 +775,6 @@ static bool StopOwnedProducers() {
     Scheduler_LogQueueLawSummary();
     auxiliary_workers_stopped = GpuQueueProbe_Shutdown(5000) && auxiliary_workers_stopped;
     auxiliary_workers_stopped = FgPresentOrder_Shutdown(2000) && auxiliary_workers_stopped;
-    auxiliary_workers_stopped = FgOutputWait_Shutdown(2000) && auxiliary_workers_stopped;
     auxiliary_workers_stopped = ControlFile_Stop() && auxiliary_workers_stopped;
     auxiliary_workers_stopped =
         NGXHooks_BeginShutdown() && auxiliary_workers_stopped;

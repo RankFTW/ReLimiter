@@ -33,11 +33,6 @@ inline std::atomic<int> g_gpu_queue_probe_source{0};
 // session start.
 inline std::atomic<int> g_unified_queue_margin_end{1};
 
-// Experiment `lead_deadband_us` (developer live key, default 0 = off): the GPU wait's lead stays where it is while its
-// target is within this many microseconds, and slews to the target once it is further away (lead_controller.cpp). The
-// hold's deadline is the frame start plus the lead, so every lead step is a step of the batch's time on screen.
-inline std::atomic<int> g_lead_deadband_us{0};
-
 // The newest SetFlipConfig calls that enabled flip metering (nFramesPerBatch >
 // 0), for the pacing CSV's flip_config_qpc and flip_time_per_batch_us: a ring
 // of the newest FLIP_CONFIG_RING calls, so each row takes the newest call at or

@@ -189,7 +189,6 @@ namespace fg_present_order {
 std::atomic<void*> learned_queue{nullptr}, learned_fence{nullptr};
 std::atomic<DWORD> worker_thread{0};
 }
-namespace fg_output_wait { void NoteSignal(void* fence, bool first_in_scope) noexcept; }
 void FgPresentOrder_NoteSignalActive(void* queue, void* fence) noexcept {
     using namespace fg_present_order;
     seen_signals.fetch_add(1, std::memory_order_relaxed);
@@ -198,7 +197,7 @@ void FgPresentOrder_NoteSignalActive(void* queue, void* fence) noexcept {
     auto* scope = StreamlineInputScope::Current();
     if (!scope) return;
     seen_scope_signals.fetch_add(1, std::memory_order_relaxed);
-    if (!scope->order_queue) { scope->order_queue = queue; fg_output_wait::NoteSignal(fence, true); }
+    if (!scope->order_queue) scope->order_queue = queue;
 }
 
 void FgPresentOrder_AfterWaitActive(ID3D12CommandQueue* queue, ID3D12Fence* fence, FgPresentOrder_FenceFn native_signal,
@@ -317,174 +316,6 @@ bool FgPresentOrder_Shutdown(unsigned long timeout_ms) noexcept {
     LOG_INFO("FG present order: %llu waits released by a Present, %llu by the watchdog, %llu enqueue failures",
         static_cast<unsigned long long>(by_present.load()), static_cast<unsigned long long>(by_watchdog.load()),
         static_cast<unsigned long long>(enqueue_failures.load()));
-    return true;
-}
-
-// ── Experiment: a wait behind frame generation (developer live key `fg_output_wait_us`, default 0 = off) ──
-// With hardware flip metering DLSS-G's worker generates and presents on one queue, behind its Wait on the game's source
-// Signal; ReLimiter's hold sits in front of that Signal. So the time frame generation takes (1.65 ms at the median in
-// Phantom Blade Zero, 2.0 at the 90th percentile, 2.7 at the 99th) passes into the time both frames of the batch reach
-// the screen: 70% of the batch-to-batch steps over 1 ms at a cap (slice N.101). This unit enqueues, on the worker's
-// queue, a marker Signal right behind the worker's Wait on the source fence and a Wait on its own gate fence right
-// behind the worker's first ExecuteCommandLists (frame generation); a thread of its own signals the gate
-// `fg_output_wait_us` after the marker completed (the hold was released). The presents then start a fixed time after
-// the hold's release whatever frame generation took, as long as it took less. Cost: the difference in latency.
-namespace fg_output_wait {
-using fg_present_order::QueueCall; using fg_present_order::CpuSignal; using fg_present_order::Completed;
-using fg_present_order::RegisterEvent; using fg_present_order::CreateFences; using fg_present_order::ReleaseFence;
-using fg_present_order::Qpc;
-SRWLOCK lock = SRWLOCK_INIT;                  // shared: the fences are read; exclusive: created or released
-ID3D12CommandQueue* bound = nullptr;          // identity of the worker's queue
-ID3D12Fence* ready = nullptr;                 // completes when the worker's queue has passed its Wait on the source fence
-ID3D12Fence* gate = nullptr;                  // CPU-signalled at the deadline
-std::atomic<void*> forward{nullptr};          // the source fence (the first outermost Signal inside a proxy Present)
-std::atomic<uint64_t> marked{0}, released{0}, waits{0}, late{0};
-HANDLE thread = nullptr, stop_event = nullptr, ready_event = nullptr;
-int64_t frequency = 0;
-thread_local void* t_cycle_queue = nullptr;   // the worker's queue between its Wait on the source fence and its first Execute
-thread_local uint64_t t_cycle_value = 0;
-
-void NoteSignal(void* fence, bool first_in_scope) noexcept {
-    if (first_in_scope && fence) forward.store(fence, std::memory_order_relaxed);
-}
-void DropLocked() noexcept {
-    if (gate) {
-        const uint64_t all = marked.load(std::memory_order_acquire);
-        if (all > released.load(std::memory_order_relaxed)) CpuSignal(gate, all);
-    }
-    ReleaseFence(&ready); ReleaseFence(&gate);
-    bound = nullptr;
-    released.store(0, std::memory_order_relaxed); marked.store(0, std::memory_order_release);
-}
-DWORD WINAPI Timer(void*) noexcept {
-    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    HANDLE handles[2] = {stop_event, ready_event};
-    int64_t last_report = Qpc();
-    for (;;) {
-        const bool outstanding = marked.load(std::memory_order_relaxed) != released.load(std::memory_order_relaxed);
-        const DWORD woken = WaitForMultipleObjects(2, handles, FALSE, outstanding ? 4 : INFINITE);
-        if (woken != WAIT_OBJECT_0 + 1 && woken != WAIT_TIMEOUT) break;
-        const int64_t woke = Qpc();
-        const int64_t wait_us = g_fg_output_wait_us.load(std::memory_order_relaxed);
-        int64_t now = woke;
-        // The marker's event: the release is timed (sleep to 200 us before the deadline, then spin; the release is
-        // the batch's time on screen). A timeout wake only releases what is already reached (an event that was
-        // missed), without a timed wait that would delay the next marker's release.
-        if (woken == WAIT_OBJECT_0 + 1) {
-            const int64_t deadline = woke + frequency * wait_us / 1'000'000;
-            const int64_t coarse = deadline - frequency / 5000;
-            if (timer && coarse > now) {
-                LARGE_INTEGER due{};
-                due.QuadPart = -((coarse - now) * 10'000'000 / frequency);
-                SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE);
-                HANDLE either[2] = {stop_event, timer};
-                WaitForMultipleObjects(2, either, FALSE, 50);
-            }
-            while ((now = Qpc()) < deadline) YieldProcessor();
-        }
-        AcquireSRWLockShared(&lock);
-        if (ready && gate) {
-            uint64_t reached = Completed(ready);
-            const uint64_t all = marked.load(std::memory_order_acquire);
-            if (reached > all) reached = all;
-            if (reached > released.load(std::memory_order_relaxed)) {
-                CpuSignal(gate, reached);
-                released.store(reached, std::memory_order_release);
-            }
-        }
-        ReleaseSRWLockShared(&lock);
-        if (now - last_report >= frequency * 10) {
-            LOG_INFO("FG output wait: %llu waits behind frame generation so far (%lld us after the hold's release)",
-                static_cast<unsigned long long>(waits.load(std::memory_order_relaxed)), static_cast<long long>(wait_us));
-            last_report = now;
-        }
-    }
-    if (timer) CloseHandle(timer);
-    return 0;
-}
-bool BindLocked(ID3D12CommandQueue* queue) noexcept {
-    if (bound == queue && ready && gate) return true;
-    DropLocked();
-    if (!thread) {
-        LARGE_INTEGER value{};
-        QueryPerformanceFrequency(&value);
-        frequency = value.QuadPart;
-        stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        ready_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (stop_event && ready_event) thread = CreateThread(nullptr, 0, &Timer, nullptr, 0, nullptr);
-        if (!thread) return false;
-        SetThreadPriority(thread, THREAD_PRIORITY_TIME_CRITICAL);
-    }
-    if (!CreateFences(queue, &ready, &gate)) { ReleaseFence(&ready); ReleaseFence(&gate); return false; }
-    bound = queue;
-    LOG_INFO("FG output wait: worker queue %p (the presents of a batch wait behind frame generation)", queue);
-    return true;
-}
-}
-
-// Queue Wait detour, after the native Wait returned: the worker's Wait on the source fence (another thread than the
-// game's Present).
-void FgOutputWait_AfterWaitActive(ID3D12CommandQueue* queue, ID3D12Fence* fence, FgPresentOrder_FenceFn native_signal) noexcept {
-    using namespace fg_output_wait;
-    if (!fence || fence != forward.load(std::memory_order_relaxed) || StreamlineInputScope::Current() ||
-        !native_signal || RuntimeLifecycle_IsStopping()) return;
-    t_cycle_queue = nullptr;
-    AcquireSRWLockShared(&lock);
-    bool is_bound = bound == queue && ready && gate;
-    if (!is_bound) {
-        ReleaseSRWLockShared(&lock);
-        AcquireSRWLockExclusive(&lock);
-        BindLocked(queue);
-        ReleaseSRWLockExclusive(&lock);
-        AcquireSRWLockShared(&lock);
-        is_bound = bound == queue && ready && gate;
-    }
-    if (is_bound) {
-        const uint64_t value = marked.load(std::memory_order_relaxed) + 1;
-        if (SUCCEEDED(QueueCall(native_signal, queue, ready, value))) {
-            marked.store(value, std::memory_order_release);
-            if (FAILED(RegisterEvent(ready, value, ready_event))) SetEvent(ready_event);
-            t_cycle_queue = queue; t_cycle_value = value;
-        }
-    }
-    ReleaseSRWLockShared(&lock);
-}
-
-// Queue Execute detour, after the native call: the worker's first Execute behind that Wait is frame generation.
-void FgOutputWait_AfterExecuteActive(ID3D12CommandQueue* queue, FgPresentOrder_FenceFn native_wait) noexcept {
-    using namespace fg_output_wait;
-    if (t_cycle_queue != queue) return;
-    t_cycle_queue = nullptr;
-    if (!native_wait || RuntimeLifecycle_IsStopping()) return;
-    AcquireSRWLockShared(&lock);
-    if (bound == queue && gate && t_cycle_value <= marked.load(std::memory_order_relaxed) &&
-        t_cycle_value > released.load(std::memory_order_relaxed)) {
-        if (SUCCEEDED(QueueCall(native_wait, queue, gate, t_cycle_value))) waits.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        late.fetch_add(1, std::memory_order_relaxed);
-    }
-    ReleaseSRWLockShared(&lock);
-}
-
-void FgOutputWait_OnQueueDestroy(void* native_queue) noexcept {
-    using namespace fg_output_wait;
-    AcquireSRWLockExclusive(&lock);
-    if (native_queue && bound == native_queue) DropLocked();
-    ReleaseSRWLockExclusive(&lock);
-}
-
-bool FgOutputWait_Shutdown(unsigned long timeout_ms) noexcept {
-    using namespace fg_output_wait;
-    g_fg_output_wait_us.store(0, std::memory_order_relaxed);
-    AcquireSRWLockExclusive(&lock);
-    DropLocked();
-    ReleaseSRWLockExclusive(&lock);
-    if (!thread) return true;
-    SetEvent(stop_event);
-    if (WaitForSingleObject(thread, timeout_ms) != WAIT_OBJECT_0) return false;
-    CloseHandle(thread); thread = nullptr;
-    CloseHandle(stop_event); CloseHandle(ready_event);
-    stop_event = ready_event = nullptr;
     return true;
 }
 #endif

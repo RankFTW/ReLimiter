@@ -310,6 +310,7 @@ target_compile_definitions(relimiter PRIVATE
     _CRT_SECURE_NO_WARNINGS
     VK_NO_PROTOTYPES
     $<$<NOT:$<BOOL:${RELIMITER_64BIT}>>:RELIMITER_32BIT>
+    $<$<BOOL:${RELIMITER_64BIT}>:RELIMITER_FG_PRESENT_ORDER>
 )
 
 # ImGui symbols resolved at runtime by ReShade — no force-include needed

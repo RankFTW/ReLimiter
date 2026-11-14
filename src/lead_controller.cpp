@@ -1,5 +1,4 @@
 #include "lead_controller.h"
-#include "instrumentation_state.h"
 
 #include <algorithm>
 #include <cmath>
@@ -350,18 +349,7 @@ double LeadController::NextLeadUs(const LeadRequest& request, bool* budget_limit
         bucket.lead_started = true;
     } else {
         const double step_us = std::min(LEAD_SLEW_MAX_US, interval_us / kIntervalSlewDivisor);
-        const double deadband_us = static_cast<double>(g_lead_deadband_us.load(std::memory_order_relaxed));
-        const double error_us = bucket.target_us - bucket.lead_us;
-        if (deadband_us <= 0.0) {
-            bucket.lead_us += std::clamp(error_us, -step_us, step_us);
-        } else {
-            // Experiment: follow the target only once it is further away than the band, then all the way.
-            if (!bucket.slewing && std::abs(error_us) > deadband_us) bucket.slewing = true;
-            if (bucket.slewing) {
-                bucket.lead_us += std::clamp(error_us, -step_us, step_us);
-                if (std::abs(bucket.target_us - bucket.lead_us) < 1.0) bucket.slewing = false;
-            }
-        }
+        bucket.lead_us += std::clamp(bucket.target_us - bucket.lead_us, -step_us, step_us);
     }
     bucket.lead_us = std::clamp(bucket.lead_us, 0.0, max_lead_us);
     return CollisionGuardedLeadUs(request, bucket_index, bucket.lead_us, guard);
@@ -749,7 +737,6 @@ void LeadController::ResetBucket(Bucket* bucket) noexcept
     bucket->held_back = false;
     bucket->budget_us = 0.0;
     bucket->lead_started = false;
-    bucket->slewing = false;
     bucket->budget_limited = false;
 }
 

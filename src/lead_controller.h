@@ -764,7 +764,6 @@ private:
         bool lead_started = false; // lead_us holds a lead to slew from (a warm bucket)
         bool budget_limited = false;
         bool spike_floor_limited = false; // the spike floor set the last warm target
-        bool slewing = false; // lead_deadband_us: the lead left its band and is on its way to the target
     };
 
     static bool FindBucketIndex(PacingRung rung, double fg_divisor, size_t* index) noexcept;
