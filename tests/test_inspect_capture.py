@@ -40,7 +40,8 @@ UPSTREAM_ROW_COLUMNS = 189      # + the marker stamps and the render-thread queu
 CPU_ROW_COLUMNS = 195           # + the span CPU times and the marker thread ids
 FEED_ROW_COLUMNS = 198          # + the render-thread feed contrast, spread and wait
 ROLE_ROW_COLUMNS = 199          # + the probe record's queue role (the pre-removal header)
-CURRENT_ROW_COLUMNS = 192       # the pre-removal header without the seven removed columns
+PRE_PLAN_ORDERED_ROW_COLUMNS = 192  # the pre-removal header without the seven removed columns
+CURRENT_ROW_COLUMNS = 193           # + plan_ordered, appended after the removal (the current header)
 REMOVED_ROW_COLUMNS = ["predicted_render_us", "governor_step", "governor_interval_us", "plan_signal_advance_us",
                        "pre_sleep_margin_us", "gpu_first_submit_qpc", "gpu_start_qpc"]
 OLD = inspector.PRE_REMOVAL_PACING_HEADER  # every historical prefix length is a prefix of it
@@ -98,7 +99,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(len(inspector.CURRENT_PACING_HEADER), CURRENT_ROW_COLUMNS)
         self.assertEqual(len(inspector.CURRENT_PACING_EVENTS_HEADER), PHASE3_EVENT_COLUMNS)
         self.assertEqual(inspector.schema_profile("relimiter_pacing", inspector.CURRENT_PACING_HEADER),
-                         "current-source-192")
+                         "current-source-193")
         self.assertEqual(inspector.schema_profile("relimiter_pacing_events",
                                                   inspector.CURRENT_PACING_EVENTS_HEADER), "current-source-86")
 
@@ -109,10 +110,26 @@ class ProfileTests(unittest.TestCase):
         self.assertNotEqual(inspector.schema_profile("relimiter_pacing", OLD),
                             inspector.schema_profile("relimiter_pacing", inspector.CURRENT_PACING_HEADER))
 
-    def test_current_header_is_the_old_header_without_the_removed_columns(self):
+    def test_header_before_plan_ordered_is_its_own_profile(self):
+        # The builds between the removal and the plan_ordered column wrote the current header without its last
+        # column: a prefix of it, a profile of its own (never historical-or-unknown) and the only prefix of the
+        # current header that is one.
+        before = inspector.PRE_PLAN_ORDERED_PACING_HEADER
+        self.assertEqual(len(before), PRE_PLAN_ORDERED_ROW_COLUMNS)
+        self.assertEqual(before, inspector.CURRENT_PACING_HEADER[:-1])
+        self.assertEqual(before, [name for name in OLD if name not in REMOVED_ROW_COLUMNS])
+        self.assertEqual(inspector.CURRENT_PACING_HEADER[-1], "plan_ordered")
+        self.assertEqual(inspector.detect_kind(before), "relimiter_pacing")
+        self.assertEqual(inspector.schema_profile("relimiter_pacing", before), "pre-plan-ordered-source-192")
+        self.assertNotEqual(inspector.schema_profile("relimiter_pacing", before),
+                            inspector.schema_profile("relimiter_pacing", inspector.CURRENT_PACING_HEADER))
+        self.assertEqual(inspector.schema_profile("relimiter_pacing", before[:-1]), "historical-or-unknown")
+
+    def test_current_header_is_the_old_header_without_the_removed_columns_and_with_the_appended_ones(self):
         self.assertEqual(list(inspector.REMOVED_PACING_COLUMNS), REMOVED_ROW_COLUMNS)
         self.assertTrue(set(REMOVED_ROW_COLUMNS) <= set(OLD))
-        self.assertEqual(inspector.CURRENT_PACING_HEADER, [name for name in OLD if name not in REMOVED_ROW_COLUMNS])
+        self.assertEqual(inspector.CURRENT_PACING_HEADER,
+                         [name for name in OLD if name not in REMOVED_ROW_COLUMNS] + ["plan_ordered"])
         self.assertFalse(set(REMOVED_ROW_COLUMNS) & set(inspector.CURRENT_PACING_HEADER))
         self.assertEqual(len(set(inspector.CURRENT_PACING_HEADER)), CURRENT_ROW_COLUMNS)
 
@@ -199,7 +216,8 @@ class ProfileTests(unittest.TestCase):
                          ["driver_sleep_interval_us", "driver_use_game_sleep",
                           "flip_config_qpc", "flip_time_per_batch_us",
                           "gpu_first_submit_qpc", "gpu_start_qpc"])
-        # The unified pacer columns are the last ones, in the old and the current header alike.
+        # The unified pacer columns are the last ones of the old header, and of the current one up to the column
+        # appended after the removal.
         unified_columns = ["up_grid_target_qpc", "up_interval_us", "up_gpu_interval_us", "up_gpu_service_us",
                            "up_queue_wait_raw_us", "up_queue_wait_us", "up_outstanding", "up_limit_wait_us",
                            "up_ready_age_us", "up_flags", "up_hold_budget_us",
@@ -216,7 +234,8 @@ class ProfileTests(unittest.TestCase):
                            "sim_tid", "render_submit_end_tid", "sim_end_tid", "up_ql_rt_contrast_us",
                            "up_ql_rt_spread_us", "up_ql_rt_wait_us", "gq_queue_role"]
         self.assertEqual(OLD[PROBE_ROW_COLUMNS:], unified_columns)
-        self.assertEqual(inspector.CURRENT_PACING_HEADER[-len(unified_columns):], unified_columns)
+        self.assertEqual(inspector.CURRENT_PACING_HEADER[-len(unified_columns) - 1:-1], unified_columns)
+        self.assertEqual(inspector.CURRENT_PACING_HEADER[-1:], list(inspector.APPENDED_AFTER_REMOVAL_PACING_COLUMNS))
         self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER[PHASE1_EVENT_COLUMNS - 1],
                          "overflowed_present_count")
         self.assertEqual(inspector.CURRENT_PACING_EVENTS_HEADER[PHASE1_EVENT_COLUMNS:], ["reason"])
@@ -327,11 +346,18 @@ class ContinuityTests(TemporaryDirectoryTest):
         current = write_csv(self.directory / f"relimiter_pacing_{SUFFIX}_2.csv", inspector.CURRENT_PACING_HEADER,
                             [pacing_row(1)])
         summary = inspector.summarize_capture(current)
-        self.assertEqual(summary["schema_profile"], "current-source-192")
+        self.assertEqual(summary["schema_profile"], "current-source-193")
         for column in REMOVED_ROW_COLUMNS:
             self.assertNotIn(column, summary["metric_availability"])  # absent, not a zero
         self.assertFalse(inspector.has_removed_columns(summary["header"]))
         self.assertEqual(summary["warnings"], [])
+
+        before = write_csv(self.directory / f"relimiter_pacing_{SUFFIX}_3.csv", inspector.PRE_PLAN_ORDERED_PACING_HEADER,
+                           [pacing_row(1, inspector.PRE_PLAN_ORDERED_PACING_HEADER)])
+        summary = inspector.summarize_capture(before)
+        self.assertEqual(summary["schema_profile"], "pre-plan-ordered-source-192")
+        self.assertNotIn("plan_ordered", summary["header"])
+        self.assertEqual(len(summary["warnings"]), 1)  # no removed column, and not an unknown profile
 
     def test_frameview_missing_values_and_time_order(self):
         rows = [

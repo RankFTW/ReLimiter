@@ -296,7 +296,7 @@ class PacingRow:
         "present_swapchain", "p_qpc", "gate_signal_after_qpc", "plan_rung", "plan_status", "display_source",
         "source_flags", "governor_step", "governor_interval_us", "signal_advance_us",
         "gate_post_wait_qpc", "gate_pre_wait_qpc",
-        "source_marker_qpc", "plan_output_target_qpc", "plan_lead_us",
+        "source_marker_qpc", "plan_output_target_qpc", "plan_lead_us", "plan_ordered",
         "source_placement", "pre_sleep_end_qpc", "pre_sleep_margin_us",
         "runtime", "restart_all", "restart_chain",
     )
@@ -366,6 +366,9 @@ class PacingRow:
         self.source_marker_qpc = _integer(cells, "source_marker_qpc") or 0
         self.plan_output_target_qpc = _integer(cells, "plan_output_target_qpc") or 0
         self.plan_lead_us = _decimal(cells, "plan_lead_us")
+        # Appended after the column removal (present-first ordering): 1 when the frame's plan was ordered. An
+        # empty cell, or a file of an earlier build without the column, is 0: those builds never ordered a frame.
+        self.plan_ordered = 1 if (_integer(cells, "plan_ordered") or 0) != 0 else 0
         # Phase 4 (appended; None or 0 for earlier files, rows without a Source
         # record and frames without a pre-Sleep wait).
         self.source_placement = _integer(cells, "source_placement") if release > 0 else None
@@ -763,9 +766,11 @@ class PacingSummary:
         self.plan_rungs: Counter[str] = Counter()
         self.plan_statuses: Counter[str] = Counter()
         self.display_sources: Counter[str] = Counter()
+        self.plan_ordered_rows = 0
 
     def add(self, row: PacingRow, derived: dict[str, Any]) -> None:
         self.rows += 1
+        self.plan_ordered_rows += row.plan_ordered
         self.plan_rungs[_enum_label(row.plan_rung, RUNG_NAMES, "no_plan")] += 1
         self.plan_statuses[_enum_label(row.plan_status, PLAN_STATUS_NAMES, "empty")] += 1
         self.display_sources[_enum_label(row.display_source, DISPLAY_SOURCE_NAMES, "none")] += 1
@@ -821,6 +826,8 @@ class PacingSummary:
             "plan_rung": dict(self.plan_rungs) if "plan_rung" in optional_columns else None,
             "plan_status": dict(self.plan_statuses) if "plan_status" in optional_columns else None,
             "display_source": dict(self.display_sources) if "display_source" in optional_columns else None,
+            # Rows of frames whose plan was made on present-first ordering (0 in a file without the column).
+            "plan_ordered_rows": self.plan_ordered_rows,
         }
 
 
@@ -2289,7 +2296,8 @@ def _summary_lines(title: str, summary: dict[str, Any]) -> list[str]:
     if summary["plan_rung"] is not None:
         lines += [f"  plan rung rows: {_counts(summary['plan_rung'])}",
                   f"  plan status rows: {_counts(summary['plan_status'])}",
-                  f"  display source rows: {_counts(summary['display_source'])}"]
+                  f"  display source rows: {_counts(summary['display_source'])}",
+                  f"  ordered plan rows: {summary['plan_ordered_rows']}"]
     return lines
 
 

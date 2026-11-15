@@ -225,6 +225,11 @@ struct PacingFramePlan {
     // resolves no target past: the spacing floor may otherwise lift a target past the limit when the lead
     // drops by more than the floor's slack in one plan. 0 = none (key off, or no limit judged).
     float lead_limit_us = 0.0f;
+    // Developer key gpu_wait_present_first (gpu_hold_order.h): this frame's plan was made on the word that the
+    // render queue's next frame waits for this frame's Present (LeadRequest::ordered). The GPU queue wait's
+    // executor hands it to the unit with the hold it commits, so a frame is ordered in the queue hooks exactly
+    // when its plan said so.
+    bool ordered = false;
 };
 
 enum class PacingStageEventKind : uint8_t {

@@ -24,9 +24,6 @@ static_assert(static_cast<double>(kPacingUnifiedQueueAllowDefaultUs) == UnifiedO
 static_assert(kPacingUnifiedQueueNeedFramesDefault == UnifiedOptions{}.queue_need_frames &&
     kPacingUnifiedQueueNeedFramesMax == kUnifiedQueueNeedFramesMax,
     "unified_queue_need_frames default and maximum must equal the law's");
-// The idle-GPU evidence (lead_controller.h) admits on the guard's own release headroom.
-static_assert(LEAD_RELEASE_HEADROOM_US == kPacingGpuWaitHeadroomDefaultUs,
-    "the lead controller's release headroom must equal the configuration's");
 
 namespace {
 // Waits to target_qpc in chunks of at most chunk_ticks, so a wait the production waiter would
@@ -201,6 +198,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     lead_request.release_headroom_us = pipeline.gpu_wait_headroom_us;
     lead_request.collision_guard = request.collision_guard;
     lead_request.spike_floor = request.spike_floor;
+    lead_request.ordered = request.ordered;
     bool budget_limited = false;
     LeadGuardOutcome guard{};
     const double lead_us = lead_.NextLeadUs(lead_request, &budget_limited, &guard);
@@ -246,6 +244,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     plan.rung = pipeline.rung;
     plan.mode = pipeline.mode;
     plan.marker = request.marker;
+    plan.ordered = guard.ordered; // exactly when the lead was planned on that word (lead_controller.h)
     frame.planned = true;
     frame.game_arrival_qpc = arrival_qpc;
     frame.lead_budget_limited = budget_limited;
@@ -332,6 +331,7 @@ void SourceStage::FillSourceRecord(
     record->plan_output_target_qpc = plan.output_target_qpc;
     record->plan_lead_us = plan.lead_us;
     record->plan_rung = static_cast<uint8_t>(plan.rung);
+    record->plan_ordered = static_cast<uint8_t>(plan.ordered);
     record->pipeline_generation = plan.pipeline_generation;
 }
 
@@ -508,7 +508,7 @@ SourceStageFrame SourceStage::RunUnifiedFrame(
         ? static_cast<double>(start.arrival_qpc - planned_start_qpc) / ticks_per_us : 0.0;
     lead_request.late_guard = request.late_guard;
     lead_request.late_observe = request.late_observe;
-    lead_request.idle_evidence = request.idle_evidence;
+    lead_request.ordered = request.ordered;
     bool budget_limited = false;
     LeadGuardOutcome guard{};
     const double lead_us = lead_.NextLeadUs(lead_request, &budget_limited, &guard);
@@ -562,6 +562,9 @@ SourceStageFrame SourceStage::RunUnifiedFrame(
     plan.law_hold_sequence = hold_grant.live ? hold_grant.law_sequence : 0;
     // Developer key gpu_wait_late_guard: the executor resolves no target past the guard's limit.
     plan.lead_limit_us = request.late_guard && guard.judged ? static_cast<float>(guard.release_limit_us) : 0.0f;
+    // Developer key gpu_wait_present_first: the lead was planned on the word that the render queue's next frame
+    // waits for this frame's Present, and the executor hands it to the unit with the hold it commits.
+    plan.ordered = guard.ordered;
     frame.planned = true;
     frame.game_arrival_qpc = start.arrival_qpc;
     frame.lead_budget_limited = budget_limited;

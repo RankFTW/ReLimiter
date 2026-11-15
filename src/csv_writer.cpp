@@ -810,6 +810,12 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
     // dependencies); empty when the row has no probe record or the role is unknown.
     { "gq_queue_role", [](CsvLine* line, const PacingCsvRow& row) {
         NonZeroIf(line, row.joined.has_gpu_queue, row.joined.gpu_queue.queue_role); } },
+    // Appended (developer key gpu_wait_present_first): 1 when the joined Source record's plan was made on
+    // present-first ordering (PacingFramePlan::ordered: the render queue's next frame waits for the frame's
+    // Present), empty otherwise and for a row without a plan. Files of earlier builds lack the column: a
+    // missing cell is 0, those builds never ordered a frame.
+    { "plan_ordered", [](CsvLine* line, const PacingCsvRow& row) {
+        NonZeroIf(line, PacingRowHasPlan(row), row.joined.source.plan_ordered); } },
 };
 
 static const char* PacingEventTypeText(PacingCsvEventType type)

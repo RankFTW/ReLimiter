@@ -9,10 +9,9 @@
 // dependencies. Owned and called only by the scheduler owner; not thread-safe.
 //
 // Storage is fixed and nothing allocates. sizeof(LeadController) is about
-// 190 KB (20 buckets of a 256-sample ring and a 2,048-bin histogram, four
-// release → Present call windows, eight release → heavy GPU work windows (the
-// built rule's and the idle-GPU evidence's) and the first-submission window of
-// the same shape, plus the pending-frame table):
+// 165 KB (20 buckets of a 256-sample ring and a 2,048-bin histogram, four
+// release → Present call windows, four release → heavy GPU work windows and
+// the first-submission window of the same shape, plus the pending-frame table):
 // keep the instance in static storage or on the heap, never on a thread stack.
 
 #include "pacing_core_types.h"
@@ -166,17 +165,22 @@ constexpr uint32_t LEAD_WORK_STALE_FRAMES = 64;
 // limit is
 //   L <= I + (their least arrival lateness)
 //          + (the least D of the newest LEAD_LATE_FRAMES reported frames,
-//             whatever their predecessor) − H:
+//             whatever their predecessor but an ordered one) − H:
 // the form and the headroom of the heavy-work guard, with the interval
 // corrected by what was measured and D taken from evidence that exists in this
 // state. A minimum is set by the least delayed sample, so the D of a frame that
 // queued behind its predecessor's GPU work (larger) does not raise it; if all
 // are delayed the limit falls to about the fastest recent readiness minus H and
-// nothing is held. The lateness is the game's arrival against its planned
+// nothing is held. A frame after a predecessor planned with present-first
+// ordering (below) adds none: its heavy work waited for that Present, so its D
+// carries the order's delay (every D of an ordered stretch does, and so does
+// their minimum), and a limit built from it would be looser than the heavy
+// work allows. The ring is kept per regime like the heavy-work window. The
+// lateness is the game's arrival against its planned
 // start, not the release (the hard limit's wait and a late wake do not count),
 // and the frames must be consecutive plans. One frame on time ends the state in
-// that plan. A frame planned in the state does not count as a waited predecessor
-// for the heavy-work windows, which so stay what on-time frames taught them.
+// that plan. A frame planned in the state gives its successor no sample in the
+// heavy-work window, which so stays what on-time frames taught it.
 // LEAD_LATE_FRAMES is the horizon after which the guard calls its evidence
 // stale; a D that old does not count either.
 constexpr size_t LEAD_LATE_FRAMES = LEAD_WORK_STALE_FRAMES;
@@ -221,6 +225,39 @@ constexpr size_t LEAD_CONCURRENCY_SAMPLES = 64;
 // Clock map spread (about 6 µs) and probe mapping; Rogue Core's concurrent
 // pairs start p50 0.7-0.9 ms before the Signal.
 constexpr double LEAD_CONCURRENCY_TOLERANCE_US = 100.0;
+
+// Present-first ordering (developer key gpu_wait_present_first, default off; gpu_hold_order.h; design in
+// project-docs/002_unified_pacing_timing/foundation/design_present_first_hold.md). The queue order above is
+// inferred from the pairs, and a game whose render queue is not its presenting queue (Rogue Core through
+// Streamline's proxy) fails it: the next frame's heavy work runs beside the hold, a hold that ends inside
+// that work is displayed late, and no limit on the lead separates safe holds from unsafe ones, because when
+// that work starts depends on when frame n was ready. The unit imposes the order instead: the render
+// queue's next frame waits until a held frame's Present has become runnable. Whether it does for a frame is
+// that frame's plan (LeadRequest::ordered, carried as LeadGuardOutcome::ordered and PendingFrame::ordered),
+// and it is a fact about the next frame's work: frame n + 1's heavy work runs behind frame n's gate wait
+// exactly when frame n was ordered. So the readers at plan time (the guard, the spike floor, the
+// diagnostics) take the plan being made, and the readers at frame time that ask whether a frame's work ran
+// behind its predecessor's gate wait (the lead sample's carried wait, SampleUs, and the wait for the frame's
+// report, LeadSampleWaitsForReport) take the predecessor's plan, whatever the frame's own says: at a flip of
+// the interleave's periods or of the unit's able word a frame is judged by the regime of the work it ran
+// behind.
+// For an ordered plan BehindWait is true while the Reflex reports are current (one has arrived since the last
+// reset, work_report_seen_, because the age reads 0 there, which is no report, and the work age is within
+// LEAD_WORK_STALE_FRAMES; the heavy-work window need not be warm, the order is imposed, not learned) and the
+// pairs of ordered frames show no concurrent one (an empty window does not veto): the guard stands aside and
+// the next frame's lead sample leaves out the wait carried from this gate, as in every game that runs behind
+// the wait. A concurrent pair among ordered frames brings the guard back at once and keeps it until that pair
+// leaves the newest LEAD_CONCURRENCY_SAMPLES, as for the built pairs. Evidence is kept per regime: the pair
+// (o_n, g_{n+1}) belongs to frame n, the frame whose gate wait the next frame's GPU start is compared with,
+// and goes to the ordered window when frame n's plan was ordered, to the built one otherwise; a D measured
+// after an ordered predecessor is no sample of the heavy-work window and none of the late state's ring. So
+// the built guard in the periods without ordering is what it is alone, and clean ordered pairs cannot put it
+// aside where no order is imposed. Known and accepted for the first build: the carried wait is measured to
+// the gate's pass, not to the order's release, so the lead may learn up to the Present's service time (0.3
+// to 0.75 ms) too much. Reset and ResetBuckets clear the ordered pairs with the windows, and nothing else
+// does: a window left clean by an earlier regime cannot put the guard aside by itself, because a plan is
+// ordered only while the unit is able to order (g_gpu_hold_order_able), and a concurrent ordered pair vetoes
+// it until that pair leaves the newest LEAD_CONCURRENCY_SAMPLES.
 
 // Lockstep engines (CONTROL Resonant): the game finishes
 // frame n's render submission and Present only after ReLimiter releases
@@ -366,9 +403,9 @@ struct LeadGuardOutcome {
     // Its condition was met while the request only observed it (LeadRequest::late_observe): the limit is the
     // built one.
     bool late_seen = false;
-    // Idle-GPU evidence (LeadRequest::idle_evidence): the plan asked for it. Kept with the frame: its
-    // successor's D is the evidence window's, not the built one's.
-    bool idle_evidence = false;
+    // Present-first ordering (LeadRequest::ordered): the plan was made on it. Kept with the frame
+    // (PendingFrame::ordered): its pair, its successor's D and its successor's lead sample take that regime.
+    bool ordered = false;
     // When judged: the limit on the release → target distance, I + offset in
     // µs (the anchor's delta is not in it). With the developer key
     // gpu_wait_late_guard the executor resolves no target past it; 0 otherwise.
@@ -470,17 +507,14 @@ struct LeadRequest {
     // Judge the state's condition without applying it (the off period of developer key
     // gpu_wait_ab_interleave_s): LeadGuardOutcome::late_seen.
     bool late_observe = false;
-    // Idle-GPU evidence (developer key gpu_wait_idle_evidence, default off). The built heavy-work window
-    // takes a frame's D only after a predecessor the GPU waited in, so a limit that has fallen below the
-    // frames' readiness holds nothing and is never corrected (Rogue Core, 2026-11-14: the limit stood 1.6
-    // to 3.6 ms short for whole sessions). A second window also takes the D of a frame whose heavy work
-    // began at least LEAD_RELEASE_HEADROOM_US after its predecessor's readiness: the GPU idled in front of
-    // it, so that start was the frame's own, whatever the predecessor's gate did. With this set the limit
-    // reads that window once it is warm (WorkWindow). Each window takes D only after a predecessor planned
-    // with its own rule, so each is what its rule alone learned (the periods of gpu_wait_ab_interleave_s);
-    // with the key off the second window is never fed. Readers at frame time (the lead sample's queue
-    // order) take the frame's own plan, PendingFrame::idle_evidence.
-    bool idle_evidence = false;
+    // Present-first ordering (developer key gpu_wait_present_first, default off; above): the render queue's
+    // next frame waits for this frame's Present. The owner sets it from the key, the interleave's period and
+    // the unit's able word (g_gpu_hold_order_able) and hands the same word to the gate as the plan's
+    // (PacingFramePlan::ordered). On the GPU queue wait the collision guard then stands aside while the Reflex
+    // reports are current and the pairs of ordered frames show none concurrent, whatever the built evidence
+    // says. Readers at frame time (the lead sample's queue order) take the predecessor's plan,
+    // PendingFrame::ordered of frame n − 1; no other rung reads it.
+    bool ordered = false;
 };
 
 struct LeadBucketStatus {
@@ -524,8 +558,6 @@ struct LeadStatistics {
     uint64_t unmatched_gpu_active = 0;
     uint64_t headroom_samples = 0;
     uint64_t headroom_late_samples = 0;
-    // D samples of the idle-GPU evidence window (LeadRequest::idle_evidence).
-    uint64_t idle_work_samples = 0;
     // Queue order (above), GPU queue wait and FG input wait: waited releases
     // paired with the next frame's GPU start, those whose next frame's GPU
     // work started before the release (concurrent), and the newest
@@ -536,6 +568,11 @@ struct LeadStatistics {
     uint64_t fg_concurrency_samples = 0;
     uint64_t fg_concurrent_samples = 0;
     double last_fg_concurrency_us = 0.0;
+    // Present-first ordering (above), GPU queue wait: the same pairs of the frames planned ordered, which the
+    // GPU queue wait's counts above leave out.
+    uint64_t ordered_concurrency_samples = 0;
+    uint64_t ordered_concurrent_samples = 0;
+    double last_ordered_concurrency_us = 0.0;
     uint64_t incomplete_dropped = 0; // planned frames closed without their own stage times
     uint64_t unmatched_events = 0;   // stage events without a matching planned frame
     uint64_t missing_ready = 0;      // H3 frames closed without r
@@ -620,10 +657,12 @@ private:
 class LeadController {
 public:
     // Lifecycle change: buckets, pending frames, resume history and
-    // statistics cleared.
+    // statistics cleared, and the pairs of ordered frames (present-first
+    // ordering, above); the built queue-order pairs stay.
     // A non-positive frequency is counted and disables sampling until the next Reset.
     void Reset(int64_t qpc_frequency) noexcept;
-    // Enforcement marker change: buckets, C, D, F and the spike floor cleared.
+    // Enforcement marker change: buckets, C, D, F, the pairs of ordered
+    // frames and the spike floor cleared.
     // Frames already released produce no sample but still decontaminate the
     // next frame; their later events add nothing to C or D (measured from the
     // old release point). F still takes the reports that arrive afterwards.
@@ -636,12 +675,14 @@ public:
     // leads are never budget-limited. With request.collision_guard, a GPU
     // queue wait lead is at most I + Q10(D) − H once 32 current D samples
     // exist, else I + Q10(C) − M once 32 C samples exist, unless the queue
-    // order shows the next frame's GPU work behind the wait (not judged); the
-    // bucket's slew continues from the unguarded lead, and *guard (optional)
-    // receives the guard's verdict: whether it judged the lead, its limit
-    // minus I and how much it lowered the lead: the lead it returns slews up
-    // to the bucket's lead once the limit relaxed (the reduction is lead −
-    // returned).
+    // order shows the next frame's GPU work behind the wait (not judged; for
+    // a request that is ordered, present-first ordering above: the Reflex
+    // reports are current and no concurrent pair among the ordered frames);
+    // the bucket's slew continues from the unguarded lead, and *guard
+    // (optional) receives the guard's verdict: whether it judged the lead, its
+    // limit minus I and how much it lowered the lead (the lead it returns
+    // slews up to the bucket's lead once the limit relaxed; the reduction is
+    // lead − returned), and request.ordered of a GPU queue wait plan.
     double NextLeadUs(const LeadRequest& request, bool* budget_limited = nullptr,
         LeadGuardOutcome* guard = nullptr) noexcept;
     void OnSourceRelease(const LeadFrameStart& frame) noexcept;
@@ -746,10 +787,17 @@ public:
     // current. Behind the wait the GPU queue wait's guards stand aside and the
     // output's lead samples leave out the frame's wait for the previous
     // frame. The pairs are kept across Reset: they describe the game's GPU
-    // submission, not the lifecycle.
+    // submission, not the lifecycle. For the GPU queue wait the verdict is the
+    // regime of the newest plan (present-first ordering, above): the pairs of
+    // its ordered frames with the reports seen since the last reset and the
+    // work age, or the built pairs.
     bool NextGpuWorkBehindWait(PacingRung rung, double fg_divisor) const noexcept;
     size_t ConcurrencyPairs(PacingRung rung) const noexcept;
     size_t ConcurrentPairs(PacingRung rung) const noexcept;
+    // Present-first ordering (above): the GPU queue wait's pairs of frames planned ordered, and those of
+    // them concurrent. ConcurrencyPairs and ConcurrentPairs count the others.
+    size_t OrderedConcurrencyPairs() const noexcept;
+    size_t OrderedConcurrentPairs() const noexcept;
 
 private:
     static constexpr size_t kBucketCount =
@@ -818,7 +866,7 @@ private:
         bool spike_gpu_recorded = false; // its r − g was decided
         bool gpu_wait_lead = false;      // planned with the GPU queue wait's lead (held)
         bool late_state = false;         // planned in the late state: its successor adds no D to the work window
-        bool idle_evidence = false;      // planned with the idle-GPU evidence: its successor's D is that window's
+        bool ordered = false;            // planned ordered: its pair, its successor's D and sample are that regime's
         bool late_work_recorded = false; // its D entered the late state's ring, or was given up
     };
 
@@ -904,20 +952,24 @@ private:
     double CollisionGuardedLeadUs(const LeadRequest& request, size_t bucket_index, double lead_us,
         LeadGuardOutcome* guard) noexcept;
     // The guard's limit minus I for an FG divisor slot: Q10(D) − headroom_us
-    // while a heavy-work window is warm and current (*headroom true), else
+    // while the heavy-work window is warm and current (*headroom true), else
     // Q10(C) − LEAD_RELEASE_MARGIN_US while the call window is warm; false
     // when neither is.
     bool CollisionOffsetUs(size_t divisor, double headroom_us, double* offset_us, bool* headroom) const noexcept;
-    // The heavy-work window a limit reads: the idle-GPU evidence one when asked for and warm, else the
-    // built one when warm; nullptr when neither is or the Reflex reports are stale.
-    const LeadSampleWindow* WorkWindow(size_t divisor, bool idle_evidence) const noexcept;
-    bool WorkCurrent(size_t divisor, bool idle_evidence) const noexcept;
+    // The heavy-work window is warm (LEAD_WARM_SAMPLES D samples) and the Reflex reports of frames planned with
+    // the GPU queue wait's lead are current (the work age, LEAD_WORK_STALE_FRAMES).
+    bool WorkCurrent(size_t divisor) const noexcept;
     // Late state (above): true with *offset_us = least arrival lateness + least D − H while the newest
     // LEAD_LATE_FRAMES planned frames all arrived late and as many current D exist; else false, *offset_us kept.
     bool LateOffsetUs(size_t divisor, const LeadRequest& request, double* offset_us) const noexcept;
-    // The two-argument form reads the newest GPU queue wait plan's rule (idle_evidence_).
+    // Queue order (above) of a GPU output. The two-argument form takes the regime of the newest GPU queue wait
+    // plan (ordered_), the plan-time readers' (the guard, the spike floor, the diagnostics); the
+    // three-argument form the regime the caller names. SampleBehindWait is the frame-time readers': the
+    // frame's lead sample and its wait for its report take the regime of its predecessor, the plan whose gate
+    // wait the frame's GPU work ran behind (PendingFrame::ordered of frame n − 1; built without one).
     bool BehindWait(PacingRung rung, size_t divisor) const noexcept;
-    bool BehindWait(PacingRung rung, size_t divisor, bool idle_evidence) const noexcept;
+    bool BehindWait(PacingRung rung, size_t divisor, bool ordered) const noexcept;
+    bool SampleBehindWait(const PendingFrame& frame, const PendingFrame* previous) const noexcept;
     // F, the median first submission − RENDERSUBMIT_START of the report pairs
     // that stream (above); 0 until LEAD_WARM_SAMPLES.
     double FirstSubmissionUs() const noexcept;
@@ -1002,13 +1054,15 @@ private:
     // of one (the work window's age, LEAD_WORK_STALE_FRAMES).
     std::array<LeadSampleWindow, LEAD_DIVISOR_BUCKETS> call_windows_{};
     std::array<LeadSampleWindow, LEAD_DIVISOR_BUCKETS> work_windows_{};
-    // Idle-GPU evidence (LeadRequest::idle_evidence): its window, and whether the newest GPU queue wait
-    // plan asked for it.
-    std::array<LeadSampleWindow, LEAD_DIVISOR_BUCKETS> idle_work_windows_{};
-    bool idle_evidence_ = false;
     std::array<uint32_t, LEAD_DIVISOR_BUCKETS> work_age_frames_{};
+    // Whether a Reflex report of a frame planned with the GPU queue wait's lead has arrived since the last reset
+    // (Reset, ResetBuckets), per FG divisor. The age above reads 0 after a reset, which is no report: the built
+    // verdict also needs a warm heavy-work window, but an ordered plan's does not (BehindWait), so it asks for a
+    // report actually seen.
+    std::array<bool, LEAD_DIVISOR_BUCKETS> work_report_seen_{};
     // Late state (above), per FG divisor: the arrival lateness of the newest
-    // planned GPU queue wait frames and the D of the newest reported ones.
+    // planned GPU queue wait frames and the D of the newest reported ones
+    // (none after an ordered predecessor).
     std::array<LateWindow, LEAD_DIVISOR_BUCKETS> late_arrivals_{};
     std::array<LateWindow, LEAD_DIVISOR_BUCKETS> late_work_{};
     // First-submission delays F (first submission − RENDERSUBMIT_START, µs) of
@@ -1023,6 +1077,11 @@ private:
         size_t concurrent = 0;
     };
     std::array<QueueOrderWindow, 2> queue_order_{};
+    // Present-first ordering (above): the pairs of the GPU queue wait's frames planned ordered, kept apart from
+    // queue_order_[0], and whether the newest GPU queue wait plan was ordered (what BehindWait's two-argument
+    // form and so the plan-time readers take).
+    QueueOrderWindow ordered_order_{};
+    bool ordered_ = false;
     // FG input wait frames since the newest Reflex report of one, per FG
     // divisor slot (LEAD_WORK_STALE_FRAMES + 1 after a reset: stale).
     std::array<uint32_t, LEAD_DIVISOR_BUCKETS> fg_report_age_frames_{};

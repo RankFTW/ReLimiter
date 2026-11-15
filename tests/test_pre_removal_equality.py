@@ -2,10 +2,11 @@
 removed rows columns. Two pre-removal captures (the 199-column rows header of the builds before the removal)
 run through every analysis that takes a rows file (analyze_pacing.analyze_capture, compare_pacing.analyze_run
 and its series, render_pipeline.analyze) twice: as written, and with the seven columns deleted by name from the
-same rows (the 192-column header of the current profile). Every result is deep-compared after removing the keys
-that belong to the removed columns' own readers (RETIRED_READERS); those readers differ only by reporting
-unavailable (None / available false), never zero, which is asserted for the current-profile run. Offline
-arithmetic on synthetic and fixture files; not a live capture or pacing test."""
+same rows (the 193-column header of the current profile: the retained columns, then plan_ordered, empty).
+Every result is deep-compared after removing the keys that belong to the removed columns' own readers
+(RETIRED_READERS); those readers differ only by reporting unavailable (None / available false), never zero,
+which is asserted for the current-profile run. Offline arithmetic on synthetic and fixture files; not a live
+capture or pacing test."""
 import copy
 import csv
 from pathlib import Path
@@ -26,6 +27,9 @@ FIXTURE_EVENTS = ROOT / "tests/data/pacing_pre_removal_events.csv"
 # The columns the removal deleted from the rows header, by name.
 SEVEN = ["predicted_render_us", "governor_step", "governor_interval_us", "plan_signal_advance_us",
          "pre_sleep_margin_us", "gpu_first_submit_qpc", "gpu_start_qpc"]
+# The column appended after the removal. These captures come from builds that never ordered a frame, so their
+# current variant carries it empty, which the readers take as 0 exactly as they take a missing column.
+APPENDED = ["plan_ordered"]
 # The events header is unchanged. A build of the current profile writes none of these event types; only the
 # pre-removal variant of an events file carries them.
 RETIRED_EVENT_TYPES = ("stall_injected", "governor_step", "rung_feasibility", "gpu_wait_cap")
@@ -106,12 +110,14 @@ def write_table(path, header, records):
     return path
 
 
-def drop_columns(source, target, names):
-    """The same rows as source without the named columns, in the order of the others."""
+def drop_columns(source, target, names, appended=()):
+    """The same rows as source without the named columns, in the order of the others, then the appended columns
+    with empty cells."""
     header, records = read_table(source)
     keep = [index for index, name in enumerate(header) if name not in names]
     assert len(keep) == len(header) - len(names)
-    return write_table(target, [header[i] for i in keep], [[record[i] for i in keep] for record in records])
+    return write_table(target, [header[i] for i in keep] + list(appended),
+                       [[record[i] for i in keep] + [""] * len(appended) for record in records])
 
 
 def drop_event_types(source, target, types):
@@ -174,7 +180,7 @@ class PreRemovalEqualityTests(unittest.TestCase):
         # current_events for the file of a current build.
         cls.captures = {}
         for name, rows in (("fixture", FIXTURE_ROWS), ("synthetic", synthetic)):
-            current = drop_columns(rows, root / f"{name}_current_rows.csv", SEVEN)
+            current = drop_columns(rows, root / f"{name}_current_rows.csv", SEVEN, APPENDED)
             cls.captures[name] = (rows, current)
         cls.events = FIXTURE_EVENTS
         cls.current_events = drop_event_types(FIXTURE_EVENTS, root / "current_events.csv", RETIRED_EVENT_TYPES)
@@ -186,18 +192,19 @@ class PreRemovalEqualityTests(unittest.TestCase):
             with self.subTest(capture=name):
                 check(old, current)
 
-    def test_the_two_headers_are_the_199_and_the_192_column_profiles(self):
+    def test_the_two_headers_are_the_199_and_the_193_column_profiles(self):
         def check(old, current):
             old_header, current_header = pacing.read_header(old), pacing.read_header(current)
-            self.assertEqual((len(old_header), len(current_header)), (199, 192))
-            self.assertEqual(current_header, [name for name in old_header if name not in SEVEN])
+            self.assertEqual((len(old_header), len(current_header)), (199, 193))
+            self.assertEqual(current_header, [name for name in old_header if name not in SEVEN] + APPENDED)
             self.assertEqual(current_header, inspector.CURRENT_PACING_HEADER)
             self.assertEqual(old_header, inspector.PRE_REMOVAL_PACING_HEADER)
-            # Same rows: every retained cell of the two files is equal.
+            # Same rows: every retained cell of the two files is equal, and the appended cells are empty.
             _, old_records = read_table(old)
             _, current_records = read_table(current)
             keep = [index for index, name in enumerate(old_header) if name not in SEVEN]
-            self.assertEqual([[record[i] for i in keep] for record in old_records], current_records)
+            self.assertEqual([[record[i] for i in keep] + [""] * len(APPENDED) for record in old_records],
+                             current_records)
         self.for_each_capture(check)
         # The events header is the same in both variants; the current variant lacks only the retired types.
         old_events_header, old_events = read_table(self.events)
@@ -241,7 +248,7 @@ class PreRemovalEqualityTests(unittest.TestCase):
         self.for_each_capture(check)
 
     def test_analyzer_ignores_retired_events_on_the_current_profile(self):
-        # The same events file with the retired rows in it: the 192-column header says the build wrote none of
+        # The same events file with the retired rows in it: the 193-column header says the build wrote none of
         # them, so their summaries stay unavailable, and nothing else changes (events identity included).
         def check(old, current):
             old_report = pacing.analyze_capture(old, events_path=self.events)
@@ -255,7 +262,7 @@ class PreRemovalEqualityTests(unittest.TestCase):
         def check(old, current):
             for events in (self.events, self.current_events):
                 report = pacing.analyze_capture(current, events_path=events)
-                self.assertEqual(report["input"]["schema_profile"], "current-source-192")
+                self.assertEqual(report["input"]["schema_profile"], "current-source-193")
                 self.assertFalse(report["input"]["pre_removal_columns"])
                 for path in ANALYZER_UNAVAILABLE_NONE:
                     self.assertIsNone(get(report, path), path)

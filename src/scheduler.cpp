@@ -368,6 +368,9 @@ bool s_logged_lead_queue = false;
 // for the previous frame).
 bool s_logged_behind_wait = false;
 bool s_logged_fg_behind_wait = false;
+// The same verdict for frames planned with present-first ordering (lead_controller.h): they are judged by
+// their own evidence, so it is logged apart and the periods of the interleave do not log each other's flips.
+bool s_logged_ordered_behind_wait = false;
 
 // Unified owner (unified_pacer.h). The mailbox word is written by
 // the Sleep hook outside the owner and consumed once by the owner at the marker. The Sleep
@@ -501,8 +504,10 @@ static void ResetAdaptationRegime(const char* reason) noexcept
 // Logs each switch between the headroom guard and the Present-call margin
 // (collision-aware release), each change of the GPU queue wait's and the FG
 // input wait's queue-order verdict for the frame's FG divisor, and the first
-// lead sample that left out the game's simulation → render queue.
-static void ObserveCollisionGuard(double fg_divisor) noexcept
+// lead sample that left out the game's simulation → render queue. The GPU queue wait's verdict is the one of
+// the frame's own regime: a frame planned with present-first ordering (lead_controller.h) is judged by the
+// pairs of ordered frames and logged apart.
+static void ObserveCollisionGuard(double fg_divisor, bool ordered) noexcept
 {
     const LeadController& lead = s_source_stage.Lead();
     const LeadStatistics statistics = lead.Statistics();
@@ -513,7 +518,21 @@ static void ObserveCollisionGuard(double fg_divisor) noexcept
         s_logged_lead_queue = true;
     }
     const bool behind_wait = lead.NextGpuWorkBehindWait(PacingRung::GpuQueueWait, fg_divisor);
-    if (behind_wait != s_logged_behind_wait) {
+    if (ordered) {
+        if (behind_wait != s_logged_ordered_behind_wait) {
+            if (behind_wait) {
+                LOG_INFO("Collision guard: stands aside for ordered frames (the render queue's next frame waits "
+                         "for the held frame's Present; %zu waited releases checked, none with the next frame's "
+                         "GPU work started before the release)", lead.OrderedConcurrencyPairs());
+            } else {
+                LOG_INFO("Collision guard: back for ordered frames (%zu of %zu waited releases had the next "
+                         "frame's GPU work start before the release, newest %+.0f us, or Reflex reports stopped)",
+                         lead.OrderedConcurrentPairs(), lead.OrderedConcurrencyPairs(),
+                         statistics.last_ordered_concurrency_us);
+            }
+            s_logged_ordered_behind_wait = behind_wait;
+        }
+    } else if (behind_wait != s_logged_behind_wait) {
         if (behind_wait) {
             LOG_INFO("Collision guard: stands aside (in the newest %zu waited releases the next frame's GPU work, "
                      "submitting before the release, started only after it: it runs behind the wait; newest %+.0f us)",
@@ -1245,22 +1264,24 @@ static SourceStageFrame RunPlanned(
     // Lead spike floor (lead_controller.h).
     request.spike_floor = kPacingLeadSpikeFloor;
     // Developer A/B switches of the collision guard (lead_controller.h): the late state (gpu_wait_late_guard)
-    // and the idle-GPU evidence (gpu_wait_idle_evidence). With the interleave key they act in the even
-    // periods of the QPC time only; in the odd ones the plan is the built one and the frames that meet the
-    // late state's condition are flagged, nothing else.
+    // and present-first ordering (gpu_wait_present_first; gpu_hold_order.h). With the interleave key they act
+    // in the even periods of the QPC time only; in the odd ones the plan is the built one and the frames that
+    // meet the late state's condition are flagged, nothing else. A plan is ordered only while the unit says it
+    // can order (g_gpu_hold_order_able), so the queue hooks order a frame exactly when its plan said so.
     request.late_guard = g_gpu_wait_late_guard.load(std::memory_order_relaxed);
-    request.idle_evidence = g_gpu_wait_idle_evidence.load(std::memory_order_relaxed);
-    if (request.late_guard || request.idle_evidence) {
+    request.ordered = g_gpu_wait_present_first.load(std::memory_order_relaxed);
+    if (request.late_guard || request.ordered) {
         const int64_t period_qpc = static_cast<int64_t>(g_gpu_wait_ab_interleave_s.load(
             std::memory_order_relaxed)) * request.qpc_frequency;
         if (period_qpc > 0) {
             request.late_observe = request.late_guard;
             if (((QpcNow() / period_qpc) & 1) != 0) {
                 request.late_guard = false;
-                request.idle_evidence = false;
+                request.ordered = false;
             }
         }
     }
+    if (request.ordered && !g_gpu_hold_order_able.load(std::memory_order_relaxed)) request.ordered = false;
     // The driver's Reflex Sleep for the index this plan is expected to take,
     // while it runs (the bypass off). The source stage records it for every
     // such frame (source_stage.h).
@@ -1315,7 +1336,8 @@ static SourceStageFrame RunPlanned(
     s_prev_enforcement_ts = release;
     PublishCadence(cadence_context, release);
 
-    ObserveCollisionGuard(unified && frame.planned ? frame.plan.fg_divisor : input.fg_divisor);
+    ObserveCollisionGuard(unified && frame.planned ? frame.plan.fg_divisor : input.fg_divisor,
+        frame.planned && frame.plan.ordered);
 
     PacingSourceRecord source{};
     source.flags = input.extra_flags;

@@ -151,10 +151,11 @@ struct SourceStageRequest {
     // Developer key gpu_wait_ab_interleave_s: also judge the state's condition while late_guard is
     // false, for the flag only (kUpLateSeen).
     bool late_observe = false;
-    // Idle-GPU evidence of the collision guard (lead_controller.h, LeadRequest::idle_evidence; developer key
-    // gpu_wait_idle_evidence, default off): the guard's limit reads the window that also learns from frames
-    // whose predecessor was not held.
-    bool idle_evidence = false;
+    // Present-first ordering of the collision guard (lead_controller.h, LeadRequest::ordered; developer key
+    // gpu_wait_present_first, default off): the render queue's next frame waits for this frame's Present. Both
+    // planning branches hand it to the lead, and the plan carries what the lead was planned on
+    // (PacingFramePlan::ordered), so the queue hooks order a frame exactly when its plan said so.
+    bool ordered = false;
     // The driver's Reflex Sleep for grid index driver_sleep_index (0 = none;
     // Scheduler_EndDriverSleep, Hook_Sleep): the QPC its call started and
     // returned. The scheduler fills them while the driver's Sleep runs (the

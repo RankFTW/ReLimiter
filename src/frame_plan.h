@@ -31,7 +31,7 @@ enum class FramePlanClaim : uint8_t {
 // sequence value; 64-bit, never reused). The claim word stores the newest
 // publication number whose output was claimed and only ever increases, so a
 // claim taken from a stale copy can never mark or unmark a newer plan in the
-// same slot. sizeof(FramePlanRegistry) is 256 * 104 = 26,624 bytes on x64 and
+// same slot. sizeof(FramePlanRegistry) is 256 * 112 = 28,672 bytes on x64 and
 // Win32.
 class FramePlanRegistry {
 public:
@@ -83,6 +83,7 @@ private:
         std::atomic<float> hold_advance_us{ 0.0f }; // PacingFramePlan::hold_advance_us (the slot's padding)
         std::atomic<uint64_t> law_hold_sequence{ 0 }; // PacingFramePlan::law_hold_sequence
         std::atomic<float> lead_limit_us{ 0.0f };     // PacingFramePlan::lead_limit_us
+        std::atomic<bool> ordered{ false };           // PacingFramePlan::ordered (the slot's padding)
     };
 
     static size_t SlotIndex(uint64_t frame_id) noexcept;

@@ -28,7 +28,8 @@ from typing import Any, Iterable, Iterator
 # 002_unified_pacing_timing/phase0_measurement_design.md section 5. Both
 # families are append-only after them, until the removal of 2026-11-13
 # (REMOVED_PACING_COLUMNS), which deleted seven rows columns of the
-# pre-removal header and changed nothing else.
+# pre-removal header and changed nothing else; the rows header has grown
+# by APPENDED_AFTER_REMOVAL_PACING_COLUMNS since.
 PACING_FIXED_RAW_HEADER = [
     "row_kind", "sequence", "capture_epoch", "qpc_frequency",
     "observer_epoch", "native_swapchain", "thread_id", "present_start_qpc",
@@ -169,10 +170,21 @@ REMOVED_PACING_COLUMNS = (
 # Profile name of the full pre-removal rows header: pre-removal-source-199.
 PRE_REMOVAL_PROFILE_PREFIX = "pre-removal-source"
 
-# The current rows header (192 columns, profile current-source-192): the
+# Rows columns appended after the removal, in order (the writer's last columns). A file of an earlier build lacks
+# them: plan_ordered (developer key gpu_wait_present_first; 1 when the frame's plan was made on present-first
+# ordering, empty otherwise) is read as 0 there, since those builds never ordered a frame.
+APPENDED_AFTER_REMOVAL_PACING_COLUMNS = ("plan_ordered",)
+
+# The current rows header (193 columns, profile current-source-193): the
 # pre-removal header without REMOVED_PACING_COLUMNS, the order of the others
-# unchanged.
-CURRENT_PACING_HEADER = [name for name in PRE_REMOVAL_PACING_HEADER if name not in REMOVED_PACING_COLUMNS]
+# unchanged, then APPENDED_AFTER_REMOVAL_PACING_COLUMNS.
+CURRENT_PACING_HEADER = [name for name in PRE_REMOVAL_PACING_HEADER if name not in REMOVED_PACING_COLUMNS] + \
+    list(APPENDED_AFTER_REMOVAL_PACING_COLUMNS)
+
+# The rows header of the builds between the removal and the plan_ordered column (192 columns): a prefix of the
+# current header, profile pre-plan-ordered-source-192.
+PRE_PLAN_ORDERED_PROFILE_PREFIX = "pre-plan-ordered-source"
+PRE_PLAN_ORDERED_PACING_HEADER = CURRENT_PACING_HEADER[:-1]
 
 CURRENT_PACING_EVENTS_HEADER = [
     "sequence", "capture_epoch", "event_type", "event_qpc", "qpc_frequency",
@@ -420,6 +432,8 @@ def schema_profile(kind: str, header: list[str]) -> str:
         current, historical, historical_lengths = profiles[kind]
         if header == current:
             return f"current-source-{len(current)}"
+        if kind == "relimiter_pacing" and header == PRE_PLAN_ORDERED_PACING_HEADER:
+            return f"{PRE_PLAN_ORDERED_PROFILE_PREFIX}-{len(header)}"
         if historical is not current and header == historical:
             return f"{PRE_REMOVAL_PROFILE_PREFIX}-{len(historical)}"
         for length in historical_lengths:
@@ -572,6 +586,9 @@ def _family_warnings(result: dict[str, Any], file_name: str) -> list[str]:
         warnings.append("The header is the pre-removal schema: the columns " + ", ".join(REMOVED_PACING_COLUMNS) +
                         " exist and carry the removed mechanisms' values, which are empty, constant or zero in "
                         "the last builds that wrote them; later builds do not write them.")
+    elif profile.startswith(f"{PRE_PLAN_ORDERED_PROFILE_PREFIX}-"):
+        warnings.append("The header is the schema before the plan_ordered column: the column is absent and read "
+                        "as 0 (builds before it never ordered a frame); no other column differs.")
     elif profile.startswith("historical-source-"):
         warnings.append("The header is an earlier append-only schema: columns appended since are absent, "
                         "not zero.")

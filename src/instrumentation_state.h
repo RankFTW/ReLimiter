@@ -38,10 +38,15 @@ inline std::atomic<int> g_unified_queue_margin_end{1};
 // resolves no target past the guard's limit. Published by Config_ApplyPacingPipeline; read by the scheduler
 // owner at each plan.
 inline std::atomic<bool> g_gpu_wait_late_guard{false};
-// Developer A/B switch gpu_wait_idle_evidence (default off; lead_controller.h, LeadRequest::idle_evidence):
-// the collision guard's limit reads the heavy-work window that also learns from frames in front of whose
-// heavy work the GPU idled, whatever their predecessor's gate did. Published and read as the switch above.
-inline std::atomic<bool> g_gpu_wait_idle_evidence{false};
+// Developer A/B switch gpu_wait_present_first (default off; gpu_hold_order.h): in a game whose render queue is
+// not its presenting queue, the render queue's next frame waits until a held frame's Present has become
+// runnable, and the collision guard stands aside for the frames so ordered (LeadRequest::ordered). Published
+// and read as the switch above.
+inline std::atomic<bool> g_gpu_wait_present_first{false};
+// The present-first unit can impose that order on the bound queues (its rule is in Ordering). Written by the
+// unit (gpu_hold_order.cpp, any thread); read by the scheduler owner at each plan, which orders a frame only
+// while this holds. False wherever the unit is not built.
+inline std::atomic<bool> g_gpu_hold_order_able{false};
 // Developer key gpu_wait_ab_interleave_s (default 0 = none): the two switches above act only in alternate
 // periods of this many seconds (the even ones of the QPC time); in the other periods the plan is the built
 // one and the frames that meet the late state's condition are flagged (up_flags 0x100000): an A/B inside

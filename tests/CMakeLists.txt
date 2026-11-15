@@ -573,6 +573,23 @@ if(MSVC)
     target_compile_options(test_fg_present_order_rule PRIVATE /W4 /utf-8 /permissive-)
 endif()
 
+## ── Present-first ordering for held frames: the rule and the books ──
+add_executable(test_gpu_hold_order_rule
+    test_gpu_hold_order_rule.cpp
+)
+set_target_properties(test_gpu_hold_order_rule PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+target_include_directories(test_gpu_hold_order_rule PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+if(MSVC)
+    set_property(TARGET test_gpu_hold_order_rule PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(test_gpu_hold_order_rule PRIVATE /W4 /utf-8 /permissive-)
+endif()
+
 ## ── Render breaks: the placement rule ──
 add_executable(test_fg_break_window_rule
     test_fg_break_window_rule.cpp
@@ -1048,6 +1065,7 @@ add_test(NAME gpu_queue_borrow COMMAND test_gpu_queue_borrow)
 add_test(NAME marker_stamps COMMAND test_marker_stamps)
 add_test(NAME lead_controller COMMAND test_lead_controller)
 add_test(NAME fg_present_order_rule COMMAND test_fg_present_order_rule)
+add_test(NAME gpu_hold_order_rule COMMAND test_gpu_hold_order_rule)
 add_test(NAME fg_break_window_rule COMMAND test_fg_break_window_rule)
 add_test(NAME period_governor COMMAND test_period_governor)
 add_test(NAME rung_feasibility COMMAND test_rung_feasibility)

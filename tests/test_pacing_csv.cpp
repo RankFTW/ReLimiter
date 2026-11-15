@@ -1,5 +1,5 @@
 // Directly tests the production CSV writer (src/csv_writer.cpp) for the two
-// pacing families: header names and order of the appended columns (192 row
+// pacing families: header names and order of the appended columns (193 row
 // columns), the PC Latency cells, native PCL loss counters on capture and
 // queue-drop rows, the pcl_status event, the frame-plan columns, display
 // source, reason column and grid_epoch / pipeline_change events (the retired
@@ -142,6 +142,7 @@ PacingJoinedRow DisplayRow(bool with_latency)
         row.source.plan_output_target_qpc = 1900;
         row.source.plan_lead_us = 1234.5;
         row.source.plan_rung = 3; // PacingRung::GpuQueueWait
+        row.source.plan_ordered = 1;      // present-first ordering: plan_ordered prints 1
         // Pre-Sleep placement
         row.source.flags = PACING_SOURCE_PRE_SLEEP;
         row.source.source_placement = 3; // PacingSourcePlacement::PreSleep
@@ -258,6 +259,7 @@ PacingJoinedRow DisplayRow(bool with_latency)
         row.source.plan_output_target_qpc = 1950;
         row.source.plan_lead_us = 99.0;
         row.source.plan_rung = 1;
+        row.source.plan_ordered = 1;         // hidden with the rest of the plan: no plan_ordered cell
         row.source.source_placement = 1;     // PacingSourcePlacement::Marker, no pre-Sleep wait
         // A status the Sleep hook never published stays hidden behind its valid flag.
         row.source.driver_sleep_interval_us = 999;
@@ -386,6 +388,15 @@ PacingJoinedRow UnifiedDebtRow()
     return row;
 }
 
+// A planned frame whose plan was not made on present-first ordering (DisplayRow(true) was): the plan cells
+// print and plan_ordered is empty.
+PacingJoinedRow UnorderedPlanRow()
+{
+    PacingJoinedRow row = DisplayRow(true);
+    row.source.plan_ordered = 0;
+    return row;
+}
+
 // Unjoined Present row: no display sample, so display_source is empty.
 PacingJoinedRow UnjoinedPresentRow()
 {
@@ -494,16 +505,19 @@ void CheckRowsFile(const CsvFile& rows)
         "render_submit_cpu_us", "sim_cpu_us", "render_submit_tid", "sim_tid", "render_submit_end_tid",
         "sim_end_tid", "up_ql_rt_contrast_us", "up_ql_rt_spread_us", "up_ql_rt_wait_us" };
     const Cells queue_role_columns{ "gq_queue_role" };
+    // The regime of the frame's plan (developer key gpu_wait_present_first): the last column.
+    const Cells ordered_columns{ "plan_ordered" };
+    const size_t trailing = queue_role_columns.size() + ordered_columns.size();
     const size_t last = wait_columns.size() + driver_columns.size() + measurement_columns.size() +
         unified_columns.size() + gpu_queue_columns.size() + queue_law_columns.size() + upstream_columns.size() +
-        queue_role_columns.size();
+        trailing;
     const size_t tail = plan_columns.size() + placement_columns.size() + last;
     // `count` columns that end `from_end` columns before the end of the header.
     const auto slice = [&rows](size_t from_end, size_t count) {
         if (rows.header.size() < from_end || from_end < count) return Cells{};
         return Cells(rows.header.end() - from_end, rows.header.end() - from_end + count);
     };
-    Check(rows.header.size() == 192, "pacing rows have 192 columns, got " + std::to_string(rows.header.size()));
+    Check(rows.header.size() == 193, "pacing rows have 193 columns, got " + std::to_string(rows.header.size()));
     for (const char* removed : { "predicted_render_us", "governor_step", "governor_interval_us",
              "plan_signal_advance_us", "pre_sleep_margin_us", "gpu_first_submit_qpc", "gpu_start_qpc" }) {
         Check(std::find(rows.header.begin(), rows.header.end(), removed) == rows.header.end(),
@@ -518,36 +532,36 @@ void CheckRowsFile(const CsvFile& rows)
     Check(slice(last, wait_columns.size()) == wait_columns,
           "async marker wait columns follow the wait-start columns");
     Check(slice(driver_columns.size() + measurement_columns.size() + unified_columns.size() +
-                    gpu_queue_columns.size() + queue_law_columns.size() + upstream_columns.size() +
-                    queue_role_columns.size(),
+                    gpu_queue_columns.size() + queue_law_columns.size() + upstream_columns.size() + trailing,
                 driver_columns.size()) == driver_columns,
           "driver Sleep columns follow the async marker wait columns");
     Check(slice(measurement_columns.size() + unified_columns.size() + gpu_queue_columns.size() +
-                    queue_law_columns.size() + upstream_columns.size() + queue_role_columns.size(),
+                    queue_law_columns.size() + upstream_columns.size() + trailing,
                 measurement_columns.size()) == measurement_columns,
           "driver sleep status and flip config columns follow the driver Sleep columns");
     Check(slice(unified_columns.size() + gpu_queue_columns.size() + queue_law_columns.size() +
-                    upstream_columns.size() + queue_role_columns.size(),
+                    upstream_columns.size() + trailing,
                 unified_columns.size()) == unified_columns,
           "the unified pacer columns follow the driver sleep status and flip config columns");
-    Check(slice(gpu_queue_columns.size() + queue_law_columns.size() + upstream_columns.size() +
-                    queue_role_columns.size(),
+    Check(slice(gpu_queue_columns.size() + queue_law_columns.size() + upstream_columns.size() + trailing,
                 gpu_queue_columns.size()) == gpu_queue_columns,
           "the GPU queue probe columns follow the unified pacer columns");
-    Check(slice(queue_law_columns.size() + upstream_columns.size() + queue_role_columns.size(),
+    Check(slice(queue_law_columns.size() + upstream_columns.size() + trailing,
                 queue_law_columns.size()) == queue_law_columns,
           "the queue law input and statistics columns follow the GPU queue probe columns");
-    Check(slice(queue_role_columns.size(), queue_role_columns.size()) == queue_role_columns,
-          "the probe queue role column is the last column");
-    Check(slice(queue_role_columns.size() + upstream_columns.size(), upstream_columns.size()) == upstream_columns,
+    Check(slice(ordered_columns.size(), ordered_columns.size()) == ordered_columns,
+          "the plan_ordered column is the last column");
+    Check(slice(trailing, queue_role_columns.size()) == queue_role_columns,
+          "the probe queue role column precedes the plan_ordered column");
+    Check(slice(trailing + upstream_columns.size(), upstream_columns.size()) == upstream_columns,
           "the marker stamp and render-thread queue law columns precede the queue role column");
-    Check(rows.rows.size() == 6, "every pacing row is written");
-    if (rows.rows.size() != 6) return;
+    Check(rows.rows.size() == 7, "every pacing row is written");
+    if (rows.rows.size() != 7) return;
 
     const std::pair<const char*, const char*> plan_cells[] = {
         { "grid_epoch", "3" }, { "grid_index", "42" }, { "plan_output_target_qpc", "1900" },
         { "plan_lead_us", "1234.500" }, { "plan_rung", "3" }, { "plan_status", "2" },
-        { "display_source", "1" },
+        { "display_source", "1" }, { "plan_ordered", "1" },
         { "gate_post_wait_qpc", "1960" }, { "gate_pre_wait_qpc", "1850" }, { "source_flags", "2" },
         { "source_placement", "3" }, { "pre_sleep_end_qpc", "780" },
         { "source_wait_start_qpc", "800" }, { "pre_sleep_start_qpc", "610" } };
@@ -595,7 +609,7 @@ void CheckRowsFile(const CsvFile& rows)
               std::string("row 1 ") + column + " = " + expected + ", got " + rows.Cell(0, column));
     }
     for (const char* column : { "grid_epoch", "grid_index", "plan_output_target_qpc", "plan_lead_us",
-             "plan_rung", "plan_status", "gate_pre_wait_qpc" }) {
+             "plan_rung", "plan_status", "plan_ordered", "gate_pre_wait_qpc" }) {
         Check(rows.Cell(1, column).empty(),
               std::string("row 2 ") + column + " is empty without a plan or plan status");
     }
@@ -605,6 +619,9 @@ void CheckRowsFile(const CsvFile& rows)
     Check(rows.Cell(2, "display_source").empty(), "unjoined Present rows have no display source");
     Check(rows.Cell(2, "plan_status") == "3", "unjoined Present rows keep the Present plan status");
     Check(rows.Cell(2, "grid_index").empty(), "unjoined Present rows without a Source record have no plan");
+    Check(rows.Cell(2, "plan_ordered").empty(), "unjoined Present rows without a Source record are not ordered");
+    Check(rows.Cell(6, "plan_rung") == "3" && rows.Cell(6, "plan_ordered").empty(),
+          "a planned frame whose plan was not ordered has an empty plan_ordered cell");
     Check(rows.Cell(1, "source_placement") == "1" && rows.Cell(1, "pre_sleep_end_qpc").empty() &&
               rows.Cell(1, "pre_sleep_start_qpc").empty() &&
               rows.Cell(1, "source_wait_start_qpc").empty(),
@@ -892,6 +909,7 @@ int main()
     CSV_PushPacingRow(4, UnifiedEmptyRuleRow(), PacingDerivedMetrics{});
     CSV_PushPacingRow(5, UnifiedZeroBudgetRow(), PacingDerivedMetrics{});
     CSV_PushPacingRow(6, UnifiedDebtRow(), PacingDerivedMetrics{});
+    CSV_PushPacingRow(7, UnorderedPlanRow(), PacingDerivedMetrics{});
 
     PacingCsvEvent status{};
     status.type = PacingCsvEventType::PclStatus;

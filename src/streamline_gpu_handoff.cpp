@@ -9,6 +9,7 @@
 #include "runtime_lifecycle.h"
 #include "gpu_queue_probe.h"
 #include "fg_present_order.h"
+#include "gpu_hold_order.h"
 #include "logger.h"
 #include "pacing_resolver.h"
 #include "bounded_mpsc_queue.h"
@@ -1006,6 +1007,9 @@ void StreamlineHandoff_Service(bool final) noexcept {
     }
     // fg_present_order: its binding stands only while frame generation presents at one multiplier.
     FgPresentOrder_Service(g_fg_presenting.load(std::memory_order_acquire), g_fg_multiplier.load(std::memory_order_acquire));
+    // gpu_hold_order: its binding stands while the key is on, frame generation does not present and the rung is the
+    // GPU queue wait; the same pass says its ten-second line.
+    GpuHoldOrder_Service(g_fg_presenting.load(std::memory_order_acquire));
     PublishSeparatePresenter();
     ReportChain(final);
     ReportAdmission(final); // no formatting or I/O from marker/Present/queue callbacks

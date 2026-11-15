@@ -6,6 +6,7 @@
 #include "startup_breadcrumb.h"
 #include "gpu_queue_probe.h"
 #include "fg_present_order.h"
+#include "gpu_hold_order.h"
 #include "runtime_lifecycle.h"
 #include <d3d12.h>
 #include <atomic>
@@ -61,6 +62,11 @@ void STDMETHODCALLTYPE ObserveExecute(ID3D12CommandQueue* queue, UINT count, ID3
     // for the outermost call.
     // gpu_queue_probe_source (key off: one load and a branch): command lists per queue, outermost calls only.
     if (depth == 1 && !callback.IsStopping()) GpuQueueProbe_DependencyExecute(queue, count);
+    // gpu_hold_order (key off: one load and a branch): the Execute is counted for the queues whose Signals the unit
+    // follows, and a held frame whose edge is due on this queue is judged BEFORE it is counted; the order Wait of a
+    // frame that qualifies goes on the queue here, through the originals (no detour sees it) and in front of the
+    // probe's entry, which would otherwise mark this Execute as overlapped by the Wait.
+    if (depth == 1 && !callback.IsStopping()) GpuHoldOrder_BeforeExecute(queue, count, original_signal, original_wait);
     const unsigned probe = depth == 1 && !callback.IsStopping() ? GpuQueueProbe_ExecuteEnter(queue) : 0u;
     // A nested Execute on the adopted queue (the Streamline handoff's own) interrupts a pending borrowed marker: the
     // probe settles it with its own Signal before the call is forwarded.
@@ -118,12 +124,19 @@ template<class Forward> HRESULT ObserveFence(ID3D12CommandQueue* queue, ID3D12Fe
     // entered (earlier than the forward by the handoff's own time, which is none for a fence it is not interested in):
     // an earlier lower bound is a valid one.
     if (signal && depth == 1 && !callback.IsStopping()) GpuQueueProbe_BorrowSignal(queue, fence, value, now);
+    // gpu_hold_order (key off: one load and a branch): R's Execute count of the fence's history, read in front of the
+    // native Signal and handed to AfterSignal below, so an Execute another thread counts while the Signal is being
+    // enqueued is behind it in the history.
+    const uint64_t hold_mark = outermost_signal ? GpuHoldOrder_BeforeSignal(queue, fence) : UINT64_MAX;
     SetLastError(incoming);
     const HRESULT result = forward();
     const DWORD outgoing = GetLastError();
     // The record above was made before the native call: a call that failed is no evidence about the queue.
     if (recorded && result != S_OK) StreamlineHandoff_ChainCallFailed(queue);
     StreamlineHandoff_AfterFence(call, result);
+    // gpu_hold_order (key off: one load and a branch): an outermost Signal that went on its queue, for the fences the
+    // presenting queue waits for.
+    if (outermost_signal && result == S_OK) GpuHoldOrder_AfterSignal(queue, fence, value, hold_mark);
     SetLastError(outgoing);
     return result;
 }
@@ -155,6 +168,9 @@ HRESULT STDMETHODCALLTYPE ObserveWait(ID3D12CommandQueue* queue, ID3D12Fence* fe
         if (result == S_OK && depth == 1)
             FgPresentOrder_AfterWait(queue, fence, original_signal.load(std::memory_order_acquire),
                 original_wait.load(std::memory_order_acquire));
+        // gpu_hold_order (key off: one load and a branch): an outermost Wait that went on the queue, for the
+        // presenting queue's Waits (the dependency of the Present in progress).
+        if (result == S_OK && depth == 1) GpuHoldOrder_AfterWait(queue, fence, value);
         GpuQueueProbe_WaitEnd(probe);
         SetLastError(error);
         return result;

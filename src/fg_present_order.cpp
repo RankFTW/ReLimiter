@@ -3,6 +3,7 @@
 #include "fg_present_order_rule.h"
 #include "fg_break_window_rule.h"
 #include "streamline_gpu_handoff.h"
+#include "gpu_hold_order.h"
 #include "runtime_lifecycle.h"
 #include "logger.h"
 #include <d3d12.h>
@@ -258,7 +259,9 @@ DWORD WINAPI Watchdog(void*) noexcept;
 // bind that raced the shutdown or a key turned off finds that here.
 bool BindLocked(ID3D12CommandQueue* queue, BindFailure* failure) noexcept {
     DropLocked();
-    if (RuntimeLifecycle_IsStopping() || !g_fg_present_order.load(relaxed) || !presenting.load(relaxed)) return false;
+    // A queue the present-first unit for held frames holds (gpu_hold_order.h) is not ordered here as well.
+    if (RuntimeLifecycle_IsStopping() || !g_fg_present_order.load(relaxed) || !presenting.load(relaxed) ||
+        GpuHoldOrder_Holds(queue)) return false;
     if (thread && (WaitForSingleObject(thread, 0) == WAIT_OBJECT_0 || !watchdog_running.load(relaxed))) {
         // It ended (after a shutdown that did not wait for it, or on its own) and is replaced. One that is still on
         // its way out is not waited for under the lock: the next followed Wait binds.

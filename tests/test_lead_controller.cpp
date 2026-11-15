@@ -51,7 +51,7 @@ namespace
         return kBaseQpc + static_cast<int64_t>(std::llround(us * 10.0));
     }
 
-    // The controller is about 190 KB: tests keep it on the heap.
+    // The controller is about 165 KB: tests keep it on the heap.
     std::unique_ptr<LeadController> MakeController()
     {
         auto controller = std::make_unique<LeadController>();
@@ -1489,11 +1489,16 @@ namespace
     // active_us > 0, a Reflex GPU active time: C = 5,000 and D = r − A − s.
     // waited: the GPU waited at its gate (released held 500 µs after its
     // readiness), so the next frame's D is sampled; otherwise it is released
-    // at its readiness, and the next frame adds C but no D.
-    void FeedWorkFrame(LeadController* controller, uint64_t grid_index, double active_us, bool waited = true)
+    // at its readiness, and the next frame adds C but no D. ordered: the frame
+    // was planned with present-first ordering, so the next frame's D is that
+    // regime's.
+    void FeedWorkFrame(LeadController* controller, uint64_t grid_index, double active_us, bool waited = true,
+        bool ordered = false)
     {
         const double source_us = static_cast<double>(grid_index) * kInterval;
-        controller->OnSourceRelease(Start(grid_index, PacingRung::GpuQueueWait, source_us));
+        LeadFrameStart start = Start(grid_index, PacingRung::GpuQueueWait, source_us);
+        start.guard.ordered = ordered;
+        controller->OnSourceRelease(start);
         controller->OnStageEvent(Event(grid_index, Kind::PresentCall, source_us + 5000.0));
         controller->OnStageEvent(Event(grid_index, Kind::GpuReady, source_us + 10000.0));
         controller->OnStageEvent(Event(grid_index, Kind::OutputRelease, source_us + (waited ? 10500.0 : 10000.0)));
@@ -3809,102 +3814,237 @@ void TestLateStateGuard()
     CHECK(veto->Statistics().work_samples == 3); // frame 5 follows frame 4, planned as built
 }
 
-// Idle-GPU evidence (developer key gpu_wait_idle_evidence). After a predecessor planned as built, the built
-// window takes a D when that predecessor waited. After a predecessor planned with the evidence, the evidence
-// window takes it then too, and also when the heavy work began at least H after the predecessor's readiness.
-// A request that asks for the evidence reads its window once warm, any other the built one; a bucket reset
-// clears both.
-void TestIdleEvidence()
+// Present-first ordering (developer key gpu_wait_present_first). The plan says per frame whether the render
+// queue's next frame waits for its Present (LeadRequest::ordered, kept as PendingFrame::ordered). For an ordered
+// plan the collision guard stands aside while the Reflex reports are current (one seen since the last reset)
+// and the pairs of ordered frames show none concurrent (an empty window does not veto), where the built
+// evidence needs 32 clean pairs of its own. The pairs of ordered frames and of the others are kept apart, each
+// going to the regime of the frame whose gate wait it compares, and a D measured after an ordered predecessor
+// is no sample of the built heavy-work window or of the late state's ring: clean ordered pairs do not put the
+// guard aside for a request that is not ordered, and a concurrent built pair does not bring it back for an
+// ordered one. A concurrent ordered pair brings it back for ordered requests until it leaves the newest 64,
+// stale reports end the stand-aside too, and a frame's lead sample (and its wait for its report) follows the
+// plan of its predecessor, whose gate wait its work ran behind: at a regime change a frame is judged by the
+// other regime's evidence, in both directions. A lifecycle or a bucket reset clears the ordered pairs and the
+// reports seen; the built pairs outlive both.
+void TestPresentFirstOrder()
 {
     auto controller = MakeController();
-    const auto built = [&] { return controller->Statistics().work_samples; };
-    const auto idle = [&] { return controller->Statistics().idle_work_samples; };
-    // One GPU queue wait frame: Present call 5,000 µs after its release, ready ready_us after it, its gate
-    // released 500 µs after the readiness when waited (else at it), Reflex GPU active time active_us; planned
-    // with the evidence or in the late state when asked. X = ready_us, D = ready_us − active_us, and with
-    // the predecessor ready 10,000 µs after its own release the GPU idled D in front of the heavy work.
-    uint64_t index = 0;
-    const auto feed = [&](double active_us, bool waited, bool idle_plan, bool late_plan = false,
-            double ready_us = 10000.0) {
-        const double source_us = static_cast<double>(++index) * kInterval;
-        LeadFrameStart start = Start(index, PacingRung::GpuQueueWait, source_us);
-        start.guard.idle_evidence = idle_plan;
-        start.guard.late_state = late_plan;
-        controller->OnSourceRelease(start);
-        controller->OnStageEvent(Event(index, Kind::PresentCall, source_us + 5000.0));
-        controller->OnStageEvent(Event(index, Kind::GpuReady, source_us + ready_us));
-        controller->OnStageEvent(Event(index, Kind::OutputRelease, source_us + ready_us + (waited ? 500.0 : 0.0)));
-        FeedGpuActive(controller.get(), index, active_us);
-    };
+    // 41 waited frames planned as built warm X, C and D (TestHeadroomGuardLimitsLead): the built evidence has
+    // no pair, and the guard's limit at I = 7,000 is 7,000 + 4,010 − 1,000 = 10,010 against the bucket's 10,510.
+    for (uint64_t frame = 0; frame < 41; ++frame) FeedWorkFrame(controller.get(), 1 + frame, 6000.0);
+    CHECK(controller->Statistics().work_samples == 40);
     LeadRequest request = Request(PacingRung::GpuQueueWait, 500.0, 7000.0);
     request.collision_guard = true;
     LeadGuardOutcome guard{};
-    const auto lead = [&](bool ask) {
-        request.idle_evidence = ask;
+    const auto plan = [&](bool ordered) {
+        request.ordered = ordered;
         return controller->NextLeadUs(request, nullptr, &guard);
     };
+    // One queue-order pair (TestCollisionGuardQueueOrder): frame n's GPU waits at its gate (o = s + 6,000, the
+    // probe 100 µs later) and frame n + 1, released at s + 4,000 and submitting from s + 5,000, starts its GPU
+    // work gpu_start_us after s: 6,050 is 50 µs behind the release (clean), 5,000 is 1 ms before it
+    // (concurrent). ordered_n and ordered_next are the two plans' words. True when frame n + 1's lead sample
+    // waited for its report, that is when the report emitted it.
+    uint64_t index = 201;
+    const auto pair = [&](bool ordered_n, bool ordered_next, double gpu_start_us) {
+        const double s = static_cast<double>(index) * kInterval;
+        LeadFrameStart first = Start(index, PacingRung::GpuQueueWait, s);
+        first.guard.ordered = ordered_n;
+        controller->OnSourceRelease(first);
+        controller->OnStageEvent(Event(index, Kind::PresentCall, s + 1000.0));
+        controller->OnStageEvent(Event(index, Kind::GpuReady, s + 2000.0));
+        controller->OnStageEvent(Event(index, Kind::OutputRelease, s + 6000.0));
+        controller->OnStageEvent(Resume(index, s + 6100.0, s + 5500.0));
+        const uint64_t next = index + 1;
+        LeadFrameStart second = Start(next, PacingRung::GpuQueueWait, s + 4000.0);
+        second.guard.ordered = ordered_next;
+        controller->OnSourceRelease(second);
+        controller->OnStageEvent(Event(next, Kind::RenderSubmitStart, s + 5000.0));
+        controller->OnStageEvent(Event(next, Kind::PresentCall, s + 9000.0));
+        controller->OnStageEvent(Event(next, Kind::GpuReady, s + 14000.0));
+        controller->OnStageEvent(Event(next, Kind::OutputRelease, s + 14000.0, PacingPlanStatus::Late));
+        const uint64_t samples = controller->Statistics().samples;
+        Report(controller.get(), Key(next).producer_epoch, Key(next).frame_id, 6000.0, Qpc(s + gpu_start_us), 6000.0);
+        index += 2;
+        return controller->Statistics().samples == samples + 1;
+    };
+    const auto steady = [&](bool ordered, double gpu_start_us) { return pair(ordered, ordered, gpu_start_us); };
 
-    // 41 waited frames planned as built in a light scene: D = 2,000 (window: 2,010), 40 samples in the built
-    // window, none in the evidence window. The limit at I = 7,000 is 7,000 + 2,010 − 1,000 = 8,010, also for
-    // a request that asks for the evidence while its window is cold.
-    for (int frame = 0; frame < 41; ++frame) feed(8000.0, true, false);
-    CHECK(built() == 40 && idle() == 0);
-    CHECK(std::fabs(lead(false) - 8010.0) <= 20.0 && !guard.idle_evidence);
-    CHECK(std::fabs(lead(true) - 8010.0) <= 20.0 && guard.idle_evidence && std::fabs(guard.offset_us - 1010.0) <= 20.0);
+    // An ordered request puts the guard aside where the built evidence (no pair yet) keeps it, and says so; the
+    // lead is the bucket's, reached at the slew from the guarded 10,010. A request that is not ordered is judged
+    // at once: the plan's word is not sticky.
+    plan(false);
+    CHECK(guard.judged && !guard.ordered && std::fabs(guard.offset_us - 3010.0) <= 20.0);
+    CHECK(std::fabs(plan(true) - 10110.0) <= 20.0);
+    CHECK(!guard.judged && guard.ordered);
+    CHECK(controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
+    plan(false);
+    CHECK(guard.judged && !guard.ordered);
+    CHECK(!controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
 
-    // The scene gets heavier: none waited, D = 4,000 behind a GPU that idled 4,000 µs. Planned as built, the
-    // built window takes the first only (it follows the waited frame 41) and its limit stays.
-    for (int frame = 0; frame < 300; ++frame) feed(6000.0, false, false);
-    CHECK(built() == 41 && idle() == 0);
-    CHECK(std::fabs(lead(false) - 8010.0) <= 20.0);
-    // The same frames planned with the evidence: its window takes all but the first (whose predecessor was
-    // planned as built). Asked for: 7,000 + 4,010 − 1,000 = 10,010, reached at the lead slew (100 µs a frame).
-    for (int frame = 0; frame < 300; ++frame) feed(6000.0, false, true);
-    CHECK(built() == 41 && idle() == 299);
-    CHECK(std::fabs(lead(true) - 8110.0) <= 20.0 && guard.idle_evidence);
-    CHECK(guard.judged && std::fabs(guard.offset_us - 3010.0) <= 20.0);
-    for (int frame = 0; frame < 24; ++frame) lead(true);
-    CHECK(std::fabs(lead(true) - 10010.0) <= 20.0);
-    // Not asked for: the built limit again, at once.
-    CHECK(std::fabs(lead(false) - 8010.0) <= 20.0 && !guard.idle_evidence);
-    CHECK(std::fabs(guard.offset_us - 1010.0) <= 20.0);
+    // Clean pairs of ordered frames fill the ordered window, not the built one, and their D is no sample of the
+    // built heavy-work window. The built evidence still has nothing: a request that is not ordered keeps the
+    // guard, an ordered one stands aside. The next frame's lead sample leaves out the wait carried from the
+    // previous gate (8,900 of 10,000, 1,100 µs) and waited for its report.
+    for (int n = 0; n < 40; ++n) CHECK(steady(true, 6050.0));
+    CHECK(controller->OrderedConcurrencyPairs() == 40 && controller->OrderedConcurrentPairs() == 0);
+    CHECK(controller->ConcurrencyPairs(PacingRung::GpuQueueWait) == 0);
+    CHECK(controller->Statistics().ordered_concurrency_samples == 40);
+    CHECK(controller->Statistics().concurrency_samples == 0);
+    CHECK(controller->Statistics().work_samples == 40);
+    CHECK_NEAR(controller->Statistics().last_sample_us, 8900.0);
+    CHECK_NEAR(controller->Statistics().last_predecessor_wait_us, 1100.0);
+    plan(false);
+    CHECK(guard.judged && !guard.ordered && std::fabs(guard.offset_us - 3010.0) <= 20.0);
+    plan(true);
+    CHECK(!guard.judged && guard.ordered);
 
-    // Heavy work 500 µs after the predecessor's readiness (A = 9,500): the GPU did not idle H in front of
-    // it. After a not-waited predecessor no window takes it; after a waited one, the window of that
-    // predecessor's plan.
-    feed(9500.0, false, true);
-    feed(9500.0, true, true);
-    CHECK(built() == 41 && idle() == 299);
-    feed(9500.0, true, false);
-    CHECK(built() == 41 && idle() == 300); // follows a waited frame planned with the evidence
-    feed(9500.0, false, true);
-    CHECK(built() == 42 && idle() == 300); // follows a waited frame planned as built
+    // A concurrent pair among ordered frames (frame n + 1's GPU work started 1 ms before the release): the guard
+    // is back for ordered requests at once, and the frame's lead sample keeps the measured readiness (the pair
+    // is recorded before the sample). The built evidence is as it was, and the veto stays until the pair leaves
+    // the newest 64.
+    CHECK(steady(true, 5000.0));
+    CHECK(controller->OrderedConcurrentPairs() == 1 && controller->ConcurrentPairs(PacingRung::GpuQueueWait) == 0);
+    CHECK(controller->Statistics().ordered_concurrent_samples == 1);
+    CHECK_NEAR(controller->Statistics().last_ordered_concurrency_us, -1000.0);
+    CHECK_NEAR(controller->Statistics().last_sample_us, 10000.0);
+    plan(true);
+    CHECK(guard.judged && guard.ordered);
+    CHECK(!controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
+    for (size_t n = 0; n + 1 < LEAD_CONCURRENCY_SAMPLES; ++n) steady(true, 6050.0);
+    plan(true);
+    CHECK(guard.judged && controller->OrderedConcurrentPairs() == 1);
+    steady(true, 6050.0);
+    plan(true);
+    CHECK(!guard.judged && controller->OrderedConcurrentPairs() == 0);
+    CHECK(controller->Statistics().work_samples == 40);
 
-    // A waited frame planned in the late state is not a waited predecessor: its successor's D counts only
-    // behind an idle GPU.
-    feed(9500.0, true, true, true);
-    feed(9500.0, false, true);
-    CHECK(built() == 42 && idle() == 300);
-    feed(9500.0, true, true, true);
-    feed(6000.0, false, true);
-    CHECK(built() == 42 && idle() == 301);
+    // The pairs of frames planned as built are the built window's, and their D is a sample of the built
+    // heavy-work window as ever. A request that is not ordered keeps the guard until the built evidence has 32
+    // clean pairs of its own (the ordered window, full of clean pairs, lends it none); a built frame's lead
+    // sample keeps the measured readiness although the ordered evidence is clean.
+    CHECK(!steady(false, 6050.0));
+    CHECK(controller->ConcurrencyPairs(PacingRung::GpuQueueWait) == 1 && controller->Statistics().work_samples == 41);
+    CHECK_NEAR(controller->Statistics().last_sample_us, 10000.0);
+    plan(false);
+    CHECK(guard.judged);
+    for (uint32_t n = 1; n < LEAD_WARM_SAMPLES; ++n) steady(false, 6050.0);
+    CHECK(controller->ConcurrencyPairs(PacingRung::GpuQueueWait) == LEAD_WARM_SAMPLES);
+    CHECK(controller->Statistics().work_samples == 40 + LEAD_WARM_SAMPLES);
+    plan(false);
+    CHECK(!guard.judged && !guard.ordered);
+    CHECK(controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0));
 
-    // A frame whose GPU work outlasted its readiness span (A = 12,000 against X = 10,000) counts as D = 0,
-    // and its heavy work began 2,000 µs before its release: at the predecessor's readiness, not behind an
-    // idle GPU, although the release itself came 2,000 µs after that readiness. The predecessor (ready
-    // 8,000 µs after its release, D = 2,000 behind a GPU that idled 2,000 µs) is a sample itself.
-    feed(6000.0, false, true, false, 8000.0);
-    CHECK(built() == 42 && idle() == 302);
-    feed(12000.0, false, true);
-    CHECK(built() == 42 && idle() == 302);
+    // Regime change, built to ordered. A concurrent pair of a frame planned as built is the built window's: it
+    // brings the built guard back and leaves the ordered evidence alone, so an ordered request stands aside
+    // still. The next frame, planned ordered, ran behind a built frame's gate wait and is judged by that
+    // regime, not by its own: it waited for its report while the built evidence said behind the wait, and its
+    // sample is the measured readiness (the pair recorded at the report ended that verdict) although the
+    // ordered evidence is clean.
+    CHECK(pair(false, true, 5000.0));
+    CHECK(controller->ConcurrentPairs(PacingRung::GpuQueueWait) == 1 && controller->OrderedConcurrentPairs() == 0);
+    CHECK_NEAR(controller->Statistics().last_sample_us, 10000.0);
+    CHECK(controller->Statistics().work_samples == 41 + LEAD_WARM_SAMPLES); // follows a built, waited frame
+    plan(false);
+    CHECK(guard.judged);
+    plan(true);
+    CHECK(!guard.judged);
 
-    // A bucket reset clears both windows: 41 frames that neither waited nor had an idle GPU in front leave
-    // them empty, and the guard judges by the Present call (7,000 + 5,010 − 2,500).
+    // Regime change, ordered to built. The next frame, planned as built, ran behind an ordered frame's gate
+    // wait: its sample leaves out the carried wait (8,900 of 10,000) although the built evidence says it is not
+    // behind the wait, and it waited for its report. Its D is no sample of the heavy-work window.
+    CHECK(pair(true, false, 6050.0));
+    CHECK_NEAR(controller->Statistics().last_sample_us, 8900.0);
+    CHECK_NEAR(controller->Statistics().last_predecessor_wait_us, 1100.0);
+    CHECK(controller->Statistics().work_samples == 41 + LEAD_WARM_SAMPLES);
+    CHECK(controller->OrderedConcurrentPairs() == 0 && controller->ConcurrentPairs(PacingRung::GpuQueueWait) == 1);
+
+    // Regime change, built to ordered, with the built evidence already saying no (the concurrent pair above):
+    // the frame's sample is the measured readiness whatever the clean ordered evidence says, and it waits for no
+    // report.
+    CHECK(!pair(false, true, 6050.0));
+    CHECK_NEAR(controller->Statistics().last_sample_us, 10000.0);
+    CHECK(controller->OrderedConcurrentPairs() == 0 && controller->ConcurrentPairs(PacingRung::GpuQueueWait) == 1);
+
+    // Without Reflex reports for 65 GPU queue wait releases the ordered request's guard is back too (the
+    // Present-call margin) until one arrives: the order is imposed, but its currency is the reports'.
+    for (uint64_t frame = 0; frame < 65; ++frame) FeedWorkFrame(controller.get(), index + frame, 0.0);
+    plan(true);
+    CHECK(guard.judged && guard.ordered && !controller->Statistics().last_guard_headroom);
+    FeedWorkFrame(controller.get(), index + 65, 6000.0);
+    plan(true);
+    CHECK(!guard.judged);
+    index += 66;
+
+    // A concurrent pair of an ordered frame whose next frame was planned as built is the ordered window's: the
+    // ordered guard is back. The built frame waited for its report (the ordered evidence of its predecessor was
+    // clean until that pair was recorded) and its sample keeps the measured readiness; its D is no built
+    // sample (its predecessor was ordered).
+    const uint64_t work = controller->Statistics().work_samples;
+    CHECK(pair(true, false, 5000.0));
+    CHECK(controller->OrderedConcurrentPairs() == 1 && controller->ConcurrentPairs(PacingRung::GpuQueueWait) == 1);
+    CHECK(controller->Statistics().work_samples == work);
+    CHECK_NEAR(controller->Statistics().last_sample_us, 10000.0);
+    plan(true);
+    CHECK(guard.judged && guard.ordered);
+
+    // A lifecycle reset clears the ordered pairs with the windows, a bucket reset too; the built pairs outlive
+    // both.
+    const size_t built_pairs = controller->ConcurrencyPairs(PacingRung::GpuQueueWait);
+    CHECK(built_pairs == LEAD_WARM_SAMPLES + 2); // the pair of the concurrent frame, and the clean one after it
+    controller->Reset(kFrequency);
+    CHECK(controller->OrderedConcurrencyPairs() == 0 && controller->OrderedConcurrentPairs() == 0);
+    CHECK(controller->Statistics().ordered_concurrency_samples == 0);
+    CHECK(controller->ConcurrencyPairs(PacingRung::GpuQueueWait) == built_pairs);
+
+    // The work age reads 0 after a reset, which is no report: an ordered request does not stand aside on it
+    // however many releases come without one, and does from the first report with a GPU active time (the
+    // ordered window is empty, so nothing else vetoes it). A bucket reset starts that wait again; it leaves
+    // the plan's own word alone.
+    const auto stands_aside = [&]() { return controller->NextGpuWorkBehindWait(PacingRung::GpuQueueWait, 1.0); };
+    plan(true);
+    CHECK(!stands_aside());
+    for (uint64_t frame = 0; frame < 3; ++frame) FeedWorkFrame(controller.get(), index + frame, 0.0);
+    CHECK(!stands_aside());
+    FeedWorkFrame(controller.get(), index + 3, 6000.0);
+    CHECK(stands_aside());
+    index += 4;
+
+    steady(true, 5000.0);
+    CHECK(controller->OrderedConcurrencyPairs() == 1 && controller->OrderedConcurrentPairs() == 1);
     controller->ResetBuckets();
-    for (int frame = 0; frame < 41; ++frame) feed(9500.0, false, true);
-    CHECK(built() == 42 && idle() == 302);
-    lead(true);
-    CHECK(guard.judged && std::fabs(guard.offset_us - 2510.0) <= 20.0);
+    CHECK(controller->OrderedConcurrencyPairs() == 0 && controller->OrderedConcurrentPairs() == 0);
+    CHECK(controller->ConcurrencyPairs(PacingRung::GpuQueueWait) == built_pairs);
+    CHECK(!stands_aside());
+    FeedWorkFrame(controller.get(), index, 6000.0);
+    CHECK(stands_aside());
+    index += 1;
+
+    // The word is the GPU queue wait's: another rung's request leaves it out of the outcome.
+    LeadRequest fg_request = Request(PacingRung::FgInputWait, 500.0, kInterval, 2.0);
+    fg_request.ordered = true;
+    controller->NextLeadUs(fg_request, nullptr, &guard);
+    CHECK(!guard.ordered);
+
+    // The late state's ring of D is kept per regime too: a frame after an ordered predecessor adds none, so 64
+    // late frames that each follow an ordered one never fill it and the state does not form, where the same
+    // frames after built ones form it (TestLateStateGuard).
+    for (const bool after_ordered : { false, true }) {
+        auto late_controller = MakeController();
+        for (uint64_t frame = 1; frame <= 41; ++frame) FeedWorkFrame(late_controller.get(), frame, 6000.0);
+        LeadRequest late_request = Request(PacingRung::GpuQueueWait, 500.0, 7000.0);
+        late_request.collision_guard = true;
+        late_request.late_guard = true;
+        LeadGuardOutcome late_guard{};
+        for (uint64_t frame = 42; frame < 42 + LEAD_LATE_FRAMES + 6; ++frame) {
+            late_request.late_index = frame;
+            late_request.late_us = 2000.0;
+            late_controller->NextLeadUs(late_request, nullptr, &late_guard);
+            FeedWorkFrame(late_controller.get(), frame, 6000.0, false, after_ordered);
+        }
+        CHECK(late_guard.judged && late_guard.late_state == !after_ordered);
+    }
 }
 
 int main()
@@ -3971,7 +4111,7 @@ int main()
     TestSaturationRegisterFlushOrder();
     TestSaturationReportLifetime();
     TestLateStateGuard();
-    TestIdleEvidence();
+    TestPresentFirstOrder();
 
     if (s_failures != 0) {
         std::fprintf(stderr, "%d lead controller checks failed\n", s_failures);

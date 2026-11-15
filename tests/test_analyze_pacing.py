@@ -691,9 +691,11 @@ class Phase2AcceptanceTests(TemporaryDirectoryTest):
         self.assertEqual(overall["plan_status"], {"held": 68, "late": 2, "undeliverable": 1})
         self.assertEqual(overall["display_source"], {"etw": 70, "none": 1})
         self.assertEqual(overall["long_frames"], 2)
+        self.assertEqual(overall["plan_ordered_rows"], 0)  # a Phase 2 file has no such column: read as 0
         # Files without the Phase 2 columns report them unavailable, not empty.
         old = analyze(ROWS)
         self.assertIsNone(old["summary"]["overall"]["plan_rung"])
+        self.assertEqual(old["summary"]["overall"]["plan_ordered_rows"], 0)  # not unavailable: no build ordered
         self.assertFalse(old["stall_recovery"]["available"])
         self.assertFalse(old["signal_clearance"]["available"])
 
@@ -1078,12 +1080,12 @@ class Phase4PlacementTests(TemporaryDirectoryTest):
         self.assertFalse(report["placement"]["available"])
 
     def test_current_profile_reports_the_removed_readers_unavailable(self):
-        # The same frames in the 192-column header: the governor, signal advance and pre-wait margin readers and
+        # The same frames in the 193-column header: the governor, signal advance and pre-wait margin readers and
         # the removed event types are unavailable (None), never zero, even when the events file holds a
         # governor_step row; the placement block and the resume block keep their columns.
         rows_path, events_path = self.capture(inspector.CURRENT_PACING_HEADER)
         report = pacing.analyze_capture(rows_path, events_path=events_path)
-        self.assertEqual(report["input"]["schema_profile"], "current-source-192")
+        self.assertEqual(report["input"]["schema_profile"], "current-source-193")
         self.assertFalse(report["input"]["pre_removal_columns"])
         controllers = report["controllers"]
         self.assertTrue(controllers["available"])
@@ -1109,6 +1111,35 @@ class Phase4PlacementTests(TemporaryDirectoryTest):
         self.assertIsNone(pre_sleep["wake_late_us"])
         # The printed report is built from this structure: unavailable (None) fields render without error.
         self.assertIsInstance(pacing.format_report(report), str)
+
+
+class PlanOrderedTests(TemporaryDirectoryTest):
+    """plan_ordered (present-first ordering; the column appended after the removal): 1 for a frame whose plan was
+    made on it, empty otherwise, and no column at all in a file of an earlier build. Every reader takes a missing
+    cell as 0: those builds never ordered a frame."""
+
+    def frames(self, flags):
+        return [display_row(index + 1, 1_000_000 + 100_000 * index, 900_000 + 100_000 * index, plan_rung=3,
+                            plan_status=2, display_source=1, **({} if flag is None else {"plan_ordered": flag}))
+                for index, flag in enumerate(flags)]
+
+    def report(self, header, flags):
+        path = write_csv(self.directory / "relimiter_pacing_Game_7_8_capture_1.csv", header, self.frames(flags))
+        return analyze(path)
+
+    def test_rows_of_ordered_plans_are_counted(self):
+        report = self.report(inspector.CURRENT_PACING_HEADER, ["1", None, "1", "", "1"])
+        overall = report["summary"]["overall"]
+        self.assertEqual(overall["plan_ordered_rows"], 3)
+        self.assertEqual(overall["plan_rung"], {"gpu_queue_wait": 5})  # the other plan cells read as before
+
+    def test_a_file_without_the_column_reads_zero(self):
+        # The header of the builds before the column: the same rows, no cell to read.
+        report = self.report(inspector.PRE_PLAN_ORDERED_PACING_HEADER, [None] * 4)
+        self.assertEqual(report["input"]["schema_profile"], "pre-plan-ordered-source-192")
+        overall = report["summary"]["overall"]
+        self.assertEqual(overall["plan_ordered_rows"], 0)
+        self.assertEqual(overall["plan_rung"], {"gpu_queue_wait": 4})
 
 
 class PreRemovalFixtureTests(unittest.TestCase):
@@ -1214,7 +1245,8 @@ class InspectorTests(TemporaryDirectoryTest):
 
     def test_kind_detection_and_profiles(self):
         cases = [
-            (inspector.CURRENT_PACING_HEADER, "relimiter_pacing", "current-source-192"),
+            (inspector.CURRENT_PACING_HEADER, "relimiter_pacing", "current-source-193"),
+            (inspector.PRE_PLAN_ORDERED_PACING_HEADER, "relimiter_pacing", "pre-plan-ordered-source-192"),
             (OLD, "relimiter_pacing", "pre-removal-source-199"),
             (inspector.CURRENT_PACING_EVENTS_HEADER, "relimiter_pacing_events", "current-source-86"),
             (OLD[:148], "relimiter_pacing", "historical-source-148"),
@@ -1252,8 +1284,9 @@ class InspectorTests(TemporaryDirectoryTest):
         # The writer's tables are the current headers; the readers of removed columns name them by the old header.
         rows = SCHEMA.row_columns
         events = SCHEMA.event_columns
-        self.assertEqual((len(rows), len(events)), (192, 86))
-        self.assertEqual(rows, [name for name in OLD if name not in inspector.REMOVED_PACING_COLUMNS])
+        self.assertEqual((len(rows), len(events)), (193, 86))
+        self.assertEqual(rows, [name for name in OLD if name not in inspector.REMOVED_PACING_COLUMNS] +
+                         ["plan_ordered"])
         self.assertFalse(set(inspector.REMOVED_PACING_COLUMNS) & set(rows))
         # What the analysis reads on current files is still written.
         for group in (pacing.PLAN_COLUMNS, pacing.PLACEMENT_COLUMNS, (pacing.RESUME_COLUMN,)):

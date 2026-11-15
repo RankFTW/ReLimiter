@@ -774,6 +774,7 @@ namespace
         source.plan_output_target_qpc = Ms(110);
         source.plan_lead_us = 8'500.25;
         source.plan_rung = 3; // GpuQueueWait
+        source.plan_ordered = 1; // present-first ordering
         source.pipeline_generation = 9;
         source.fallback_reason = 0;
         g_joiner.AddSource(source, Ms(90));
@@ -796,7 +797,7 @@ namespace
         ok = Check(rows[0].has_source && rows[0].source.grid_epoch == 4 &&
             rows[0].source.grid_index == 1234 && rows[0].source.epoch_reason == 3 &&
             rows[0].source.plan_output_target_qpc == Ms(110) && rows[0].source.plan_lead_us == 8'500.25 &&
-            rows[0].source.plan_rung == 3 && rows[0].source.pipeline_generation == 9,
+            rows[0].source.plan_rung == 3 && rows[0].source.plan_ordered == 1 && rows[0].source.pipeline_generation == 9,
             "the joined Source record carries its plan fields") && ok;
         ok = Check(rows[0].has_present && rows[0].present.plan_status == 2 &&
             rows[0].display_source == PACING_ROW_DISPLAY_SOURCE_ETW,

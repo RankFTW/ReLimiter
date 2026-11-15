@@ -216,6 +216,7 @@ row_column up_ql_rt_contrast_us
 row_column up_ql_rt_spread_us
 row_column up_ql_rt_wait_us
 row_column gq_queue_role
+row_column plan_ordered
 
 event_column sequence
 event_column capture_epoch
@@ -513,7 +514,7 @@ config_key developer_settings
 config_key config_version
 config_key flip_metering_off
 config_key gpu_wait_late_guard
-config_key gpu_wait_idle_evidence
+config_key gpu_wait_present_first
 config_key gpu_wait_ab_interleave_s
 config_key gpu_queue_probe
 config_key gpu_queue_probe_source

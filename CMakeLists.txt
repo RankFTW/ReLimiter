@@ -196,6 +196,8 @@ if(RELIMITER_64BIT)
         src/gpu_queue_probe_d3d12.cpp
         src/fg_present_order.cpp
         src/fg_present_order.h
+        src/gpu_hold_order.cpp
+        src/gpu_hold_order.h
     )
 endif()
 
@@ -311,6 +313,7 @@ target_compile_definitions(relimiter PRIVATE
     VK_NO_PROTOTYPES
     $<$<NOT:$<BOOL:${RELIMITER_64BIT}>>:RELIMITER_32BIT>
     $<$<BOOL:${RELIMITER_64BIT}>:RELIMITER_FG_PRESENT_ORDER>
+    $<$<BOOL:${RELIMITER_64BIT}>:RELIMITER_GPU_HOLD_ORDER>
 )
 
 # ImGui symbols resolved at runtime by ReShade — no force-include needed

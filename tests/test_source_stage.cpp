@@ -1262,6 +1262,69 @@ void TestUnifiedMarkerOnlyFrames()
     g_stage.SetUnifiedEnabled(false, 1);
 }
 
+// Present-first ordering (developer key gpu_wait_present_first, lead_controller.h): both planning branches hand
+// the request's word to the lead, and the plan carries it exactly when the lead was planned on it: on the GPU
+// queue wait rung only, whatever another rung's request says. The registry's copy, which the output gate
+// reads, is the plan's.
+void TestPlanCarriesOrdered()
+{
+    std::printf("Test: the plan says ordered exactly when the lead was planned on that word\n");
+    const PacingPipelineSnapshot gpu = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
+    const auto published_ordered = [](const SourceStageFrame& frame) {
+        PacingFramePlan copy{};
+        CHECK(frame.plan_published && g_frame_plans.Find(frame.plan.key, &copy));
+        return copy.ordered;
+    };
+    // The Source record of the frame, which the CSV row joins (column plan_ordered).
+    const auto record_ordered = [](const SourceStageFrame& frame, const PacingPipelineSnapshot& pipeline) {
+        PacingSourceRecord record{};
+        SourceStage::FillSourceRecord(frame, pipeline, &record);
+        return record.plan_ordered;
+    };
+    {   // The existing branch.
+        ResetStage();
+        ScriptedClock clock;
+        uint64_t frame_id = 1500;
+        for (const bool ordered : { true, false, true }) {
+            SourceStageRequest request = Request(Key(frame_id++), gpu);
+            request.ordered = ordered;
+            const SourceStageFrame frame = g_stage.RunPlannedFrame(request, &clock);
+            CHECK(frame.planned && frame.plan.ordered == ordered && published_ordered(frame) == ordered);
+            CHECK(record_ordered(frame, gpu) == (ordered ? 1 : 0));
+            clock.now = frame.release_qpc + Ticks(4'000.0);
+        }
+        const PacingPipelineSnapshot source_only = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
+        SourceStageRequest other = Request(Key(frame_id++), source_only);
+        other.ordered = true;
+        const SourceStageFrame frame = g_stage.RunPlannedFrame(other, &clock);
+        CHECK(frame.planned && !frame.plan.ordered && !published_ordered(frame));
+        CHECK(record_ordered(frame, source_only) == 0);
+    }
+    {   // The unified branch.
+        ResetStage();
+        g_stage.SetUnifiedEnabled(true, 1);
+        std::atomic<uint64_t> mailbox{0};
+        ScriptedClock clock;
+        uint64_t frame_id = 1600;
+        for (const bool ordered : { true, false, true }) {
+            SourceStageRequest request = UnifiedMarkerRequest(Key(frame_id++), &mailbox);
+            request.pipeline = gpu;
+            request.ordered = ordered;
+            const SourceStageFrame frame = g_stage.RunPlannedFrame(request, &clock);
+            CHECK(frame.planned && frame.unified.valid && frame.plan.ordered == ordered &&
+                  published_ordered(frame) == ordered);
+            CHECK(record_ordered(frame, gpu) == (ordered ? 1 : 0));
+            clock.now = frame.release_qpc + Ticks(4'000.0);
+        }
+        SourceStageRequest other = UnifiedMarkerRequest(Key(frame_id++), &mailbox); // the source only rung
+        other.ordered = true;
+        const SourceStageFrame frame = g_stage.RunPlannedFrame(other, &clock);
+        CHECK(frame.planned && frame.unified.valid && !frame.plan.ordered && !published_ordered(frame));
+        CHECK(record_ordered(frame, other.pipeline) == 0);
+        g_stage.SetUnifiedEnabled(false, 1);
+    }
+}
+
 // The marker-site wait never commits a release before T(n).
 void TestUnifiedFailedMarkerWait()
 {
@@ -3511,6 +3574,7 @@ int main(int argc, char** argv)
     TestUnifiedBranch();
     TestUnifiedPlanningDecision();
     TestUnifiedMarkerOnlyFrames();
+    TestPlanCarriesOrdered();
     TestUnifiedFailedMarkerWait();
     TestUnifiedRawDivisorAndDriverSleep();
     TestUnifiedUsedReportReachesTheLead();

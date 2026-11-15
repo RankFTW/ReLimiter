@@ -86,6 +86,7 @@ struct PacingSourceRecord {
     int64_t plan_output_target_qpc = 0;  // T_n at planning; executors may resolve a later target
     double plan_lead_us = 0.0;           // L
     uint8_t plan_rung = 0;               // PacingRung
+    uint8_t plan_ordered = 0;            // PacingFramePlan::ordered: present-first ordering (1) or not (0); CSV plan_ordered
     uint32_t pipeline_generation = 0;    // PacingPipelineSnapshot::generation
     uint8_t fallback_reason = 0;         // PacingFallbackReason of the resolved pipeline
 

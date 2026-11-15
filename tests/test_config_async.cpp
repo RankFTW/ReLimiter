@@ -2082,7 +2082,7 @@ const IniKey non_default_ini[] = {
     {"osd_preset_prev_key", "F1", "F1"}, {"osd_preset_next_key", "F2", "F2"}, {"blackout_key", "F3", "F3"},
     {"pacing_preference", "smooth", "smooth"}, {"advanced_settings", "true", "true"},
     {"developer_settings", "true", "true"}, {"config_version", "6", "6"}, {"flip_metering_off", "true", "true"},
-    {"gpu_wait_late_guard", "true", "true"}, {"gpu_wait_idle_evidence", "true", "true"},
+    {"gpu_wait_late_guard", "true", "true"}, {"gpu_wait_present_first", "true", "true"},
     {"gpu_wait_ab_interleave_s", "30", "30"},
     {"gpu_queue_probe", "false", "false"}, {"gpu_queue_probe_source", "0", "0"},
     {"pacing_test_mode", "driver_limiter", "driver_limiter"}, {"unified_hold_share", "0.125", "0.125000"},
@@ -2282,7 +2282,7 @@ const LiveKey live_keys[] = {
     {"gpu_present_gate_probes", "off"}, {"gpu_queue_probe", "off"}, {"gpu_queue_probe_source", "0"},
     {"unified_queue_margin_end", "0"}, {"unified_hold_share", "0.1"}, {"pacing_test_mode", "reflex_only"},
     {"unified_queue_law", "off"}, {"unified_queue_rank", "3"}, {"unified_queue_need_frames", "6"},
-    {"gpu_wait_late_guard", "on"}, {"gpu_wait_idle_evidence", "on"}, {"gpu_wait_ab_interleave_s", "30"},
+    {"gpu_wait_late_guard", "on"}, {"gpu_wait_present_first", "on"}, {"gpu_wait_ab_interleave_s", "30"},
     {"unified_queue_upstream", "1"}, {"unified_queue_allow_us", "2500"}};
 static_assert(sizeof(live_keys) / sizeof(live_keys[0]) == 18, "the contract lists 18 live keys");
 bool IsLiveKey(const std::string& key) {
@@ -2327,7 +2327,7 @@ const DeveloperField developer_fields[] = {
     {"gpu_present_gate_probes", [] { g_config.gpu_present_gate_probes = false; }, [] { return g_config.gpu_present_gate_probes; }},
     {"flip_metering_off", [] { g_config.flip_metering_off = true; }, [] { return !g_config.flip_metering_off; }},
     {"gpu_wait_late_guard", [] { g_config.gpu_wait_late_guard = true; }, [] { return !g_config.gpu_wait_late_guard; }},
-    {"gpu_wait_idle_evidence", [] { g_config.gpu_wait_idle_evidence = true; }, [] { return !g_config.gpu_wait_idle_evidence; }},
+    {"gpu_wait_present_first", [] { g_config.gpu_wait_present_first = true; }, [] { return !g_config.gpu_wait_present_first; }},
     {"gpu_wait_ab_interleave_s", [] { g_config.gpu_wait_ab_interleave_s = 30; }, [] { return g_config.gpu_wait_ab_interleave_s == 0; }},
     {"control_file", [] { g_config.control_file = true; }, [] { return !g_config.control_file; }},
     {"gpu_queue_probe", [] { g_config.gpu_queue_probe = false; }, [] { return g_config.gpu_queue_probe; }},

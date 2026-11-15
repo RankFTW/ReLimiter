@@ -65,6 +65,7 @@ void FramePlanRegistry::WriteSlot(Slot* slot, const PacingFramePlan& plan) noexc
     slot->hold_advance_us.store(plan.hold_advance_us, std::memory_order_relaxed);
     slot->law_hold_sequence.store(plan.law_hold_sequence, std::memory_order_relaxed);
     slot->lead_limit_us.store(plan.lead_limit_us, std::memory_order_relaxed);
+    slot->ordered.store(plan.ordered, std::memory_order_relaxed);
 
     slot->sequence.store(sequence + 2, std::memory_order_release);
 }
@@ -97,6 +98,7 @@ bool FramePlanRegistry::TryReadSlot(
     copy.hold_advance_us = slot.hold_advance_us.load(std::memory_order_relaxed);
     copy.law_hold_sequence = slot.law_hold_sequence.load(std::memory_order_relaxed);
     copy.lead_limit_us = slot.lead_limit_us.load(std::memory_order_relaxed);
+    copy.ordered = slot.ordered.load(std::memory_order_relaxed);
 
     std::atomic_thread_fence(std::memory_order_acquire);
     if (slot.sequence.load(std::memory_order_relaxed) != before) return false;

@@ -21,6 +21,7 @@
 #include "pacing_telemetry.h"
 #include "render_handoff.h"
 #include "gpu_queue_probe.h"
+#include "gpu_hold_order.h"
 #include "instrumentation_state.h"
 #include <d3d12.h>
 #include <avrt.h>
@@ -700,6 +701,11 @@ int64_t Service() noexcept {
                     if(ticket.signalled && g_gpu_queue_probe.load(std::memory_order_relaxed) && ticket.probe_enq_qpc>0)
                         GpuQueueProbe_OnHoldRelease(queue.native,ticket.time,ticket.trace.ticket,ticket.probe_enq_qpc,
                             ticket.trace.signal_before_qpc);
+                    // gpu_hold_order (key off: one load and a branch): the same release, told for a hold the unit
+                    // follows (a no-FG hold only), so the order Wait it announced on the render queue is released for
+                    // the probe at the gate's own release and not at the Present's.
+                    if(ticket.signalled && !ticket.fg)
+                        GpuHoldOrder_OnGateRelease(ticket.time,ticket.trace.ticket,ticket.trace.signal_before_qpc);
                     ticket.trace.status=ticket.signalled?(current?GpuPresentStatus::Released:GpuPresentStatus::Drained):GpuPresentStatus::Failed;
                     if(!ticket.signalled)Fail("CPU fence Signal",ticket.trace.signal_result);
                     // OutputRelease o of a queued wait: the Signal time, status Held
@@ -898,6 +904,7 @@ struct EnqueueRequest {
     double fg_divisor=1.0; // the plan's
     float hold_advance_us=0.0f; // the plan's (Ticket::hold_advance_us)
     uint64_t law_hold_sequence=0; // the plan's (Ticket::law_hold_sequence)
+    bool ordered=false; // the plan's (PacingFramePlan::ordered): present-first ordering was assumed for this frame
     int64_t floor_base_qpc=0; // fg_late_spacing: T(n) without the floor (Ticket)
     uint64_t fg_binding=0;
 };
@@ -1031,6 +1038,10 @@ bool Enqueue(const EnqueueRequest& request,GpuPresentTrace* trace) noexcept {
         // Start-up breadcrumb, once: the first Wait is on the queue.
         static std::atomic<bool> wait_marked{false};
         if(!wait_marked.load(std::memory_order_relaxed)) {wait_marked.store(true,std::memory_order_relaxed);Breadcrumb_Mark(StartupStage::FirstGateWaitEnqueued);}
+        // gpu_hold_order (key off: one load and a branch): the hold is on the queue; the unit learns it on this thread,
+        // ordered or not (its rule judges every held frame), and takes it over at the native Present that follows.
+        if(!request.fg)GpuHoldOrder_OnHold(queue->native,ticket.time,trace->ticket,trace->target_qpc,trace->interval_qpc,
+            ticket.law_hold_sequence,request.ordered,trace->swapchain);
     }
     if(ticket.post_slot && SUCCEEDED(trace->wait_result) && SUCCEEDED(ticket.pre_sample.signal_result)) {
         prepare_sample(&ticket.post_sample,trace->ticket*2+1);
@@ -1350,6 +1361,7 @@ GpuPresentExecution GpuPresent_Execute(NativeGateCall* native,GpuReadinessCall* 
             current.swapchain_generation==span->key.swapchain_generation;
         EnqueueRequest request;request.native=queue_identity;request.context=context;request.span=span;request.key=plan.key;
         request.hold_advance_us=plan.hold_advance_us;request.law_hold_sequence=plan.law_hold_sequence;
+        request.ordered=plan.ordered;
         if(!eligible)trace.status=GpuPresentStatus::Unsupported;
         if(eligible && Enqueue(request,&trace))execution=GpuPresentExecution::WaitCommitted;
         else outcome=AdmissionOutcome(trace);

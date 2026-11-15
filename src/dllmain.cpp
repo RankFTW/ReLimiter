@@ -53,6 +53,7 @@
 #include "control_file.h"
 #include "gpu_queue_probe.h"
 #include "fg_present_order.h"
+#include "gpu_hold_order.h"
 #include "scheduler.h"
 #include "gpu_readiness.h"
 
@@ -510,6 +511,7 @@ static void on_destroy_command_queue(reshade::api::command_queue* queue) {
         if (queue && queue->get_device() && queue->get_device()->get_api() == reshade::api::device_api::d3d12) {
             GpuQueueProbe_OnQueueDestroy(reinterpret_cast<void*>(static_cast<uintptr_t>(queue->get_native())));
             FgPresentOrder_OnQueueDestroy(reinterpret_cast<void*>(static_cast<uintptr_t>(queue->get_native())));
+            GpuHoldOrder_OnQueueDestroy(reinterpret_cast<void*>(static_cast<uintptr_t>(queue->get_native())));
         }
     }
 }
@@ -773,6 +775,9 @@ static bool StopOwnedProducers() {
     // hooks are disabled and before the telemetry worker stops.
     // The queue law's session summary (a line, only with unified_queue_law on), before the probe stops.
     Scheduler_LogQueueLawSummary();
+    // gpu_hold_order: every Wait it enqueued on a render queue is released and its thread ends, before the probe it
+    // tells the release of its holds stops. Starts again with the next bind (config publishes its key again).
+    auxiliary_workers_stopped = GpuHoldOrder_Shutdown(2000) && auxiliary_workers_stopped;
     auxiliary_workers_stopped = GpuQueueProbe_Shutdown(5000) && auxiliary_workers_stopped;
     auxiliary_workers_stopped = FgPresentOrder_Shutdown(2000) && auxiliary_workers_stopped;
     auxiliary_workers_stopped = ControlFile_Stop() && auxiliary_workers_stopped;
