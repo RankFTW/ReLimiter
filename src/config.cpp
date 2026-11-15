@@ -399,7 +399,8 @@ void LoadConfig(HMODULE hModule) {
     g_config.fg_present_order=ReadINIBool(S,"fg_present_order",true,P);
     g_config.fg_separate_presenter_hold=ReadINIBool(S,"fg_separate_presenter_hold",false,P);
     g_config.gpu_wait_late_guard=ReadINIBool(S,"gpu_wait_late_guard",false,P);
-    g_config.gpu_wait_late_guard_interleave_s=ReadINIInt(S,"gpu_wait_late_guard_interleave_s",0,P);
+    g_config.gpu_wait_idle_evidence=ReadINIBool(S,"gpu_wait_idle_evidence",false,P);
+    g_config.gpu_wait_ab_interleave_s=ReadINIInt(S,"gpu_wait_ab_interleave_s",0,P);
     g_config.fg_render_break_every=ReadINIInt(S,"fg_render_break_every",0,P);
     g_config.fg_render_break_window=ReadINIInt(S,"fg_render_break_window",-1,P);
     g_config.unified_hold_share=ReadINIDouble(S,"unified_hold_share",kPacingUnifiedHoldShareDefault,P);
@@ -618,7 +619,8 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     // ── Pacing pipeline (developer) ──
     WriteINIBool(S, "flip_metering_off", config.flip_metering_off, P);
     WriteINIBool(S, "gpu_wait_late_guard", config.gpu_wait_late_guard, P);
-    WriteINIInt(S, "gpu_wait_late_guard_interleave_s", config.gpu_wait_late_guard_interleave_s, P);
+    WriteINIBool(S, "gpu_wait_idle_evidence", config.gpu_wait_idle_evidence, P);
+    WriteINIInt(S, "gpu_wait_ab_interleave_s", config.gpu_wait_ab_interleave_s, P);
     WriteINIBool(S, "gpu_queue_probe", config.gpu_queue_probe, P);
     WriteINIInt(S, "gpu_queue_probe_source", config.gpu_queue_probe_source, P);
     WriteINIString(S, "pacing_test_mode", PacingTestMode_Text(config.pacing_test_mode), P);
@@ -897,7 +899,8 @@ void Config_ApplyPacingPipeline() {
     g_fg_present_order.store(sizeof(void*) == 8 && g_config.fg_present_order, std::memory_order_relaxed);
     g_fg_separate_presenter_hold.store(g_config.fg_separate_presenter_hold, std::memory_order_relaxed);
     g_gpu_wait_late_guard.store(g_config.gpu_wait_late_guard, std::memory_order_relaxed);
-    g_gpu_wait_late_guard_interleave_s.store(std::clamp(g_config.gpu_wait_late_guard_interleave_s, 0, 600), std::memory_order_relaxed);
+    g_gpu_wait_idle_evidence.store(g_config.gpu_wait_idle_evidence, std::memory_order_relaxed);
+    g_gpu_wait_ab_interleave_s.store(std::clamp(g_config.gpu_wait_ab_interleave_s, 0, 600), std::memory_order_relaxed);
     g_fg_render_break_every.store(sizeof(void*) == 8 ? std::clamp(g_config.fg_render_break_every, 0, 64) : 0, std::memory_order_relaxed);
     g_fg_render_break_window.store(std::clamp(g_config.fg_render_break_window, -1, 32), std::memory_order_relaxed);
 }
@@ -956,7 +959,8 @@ constexpr Key kKeys[] = {
     {"fg_present_order", &SetBool<&Config::fg_present_order>, Publish::Pipeline},
     {"fg_separate_presenter_hold", &SetBool<&Config::fg_separate_presenter_hold>, Publish::Pipeline},
     {"gpu_wait_late_guard", &SetBool<&Config::gpu_wait_late_guard>, Publish::Pipeline},
-    {"gpu_wait_late_guard_interleave_s", &SetInt<&Config::gpu_wait_late_guard_interleave_s>, Publish::Pipeline},
+    {"gpu_wait_idle_evidence", &SetBool<&Config::gpu_wait_idle_evidence>, Publish::Pipeline},
+    {"gpu_wait_ab_interleave_s", &SetInt<&Config::gpu_wait_ab_interleave_s>, Publish::Pipeline},
     {"fg_render_break_every", &SetInt<&Config::fg_render_break_every>, Publish::Pipeline},
     {"fg_render_break_window", &SetInt<&Config::fg_render_break_window>, Publish::Pipeline},
     {"unified_queue_margin_end", &SetInt<&Config::unified_queue_margin_end>, Publish::Pipeline},
@@ -1010,7 +1014,8 @@ int Config_DeveloperOverrides() {
     return (g_config.gpu_present_gate_probes != d.gpu_present_gate_probes) +
         (g_config.flip_metering_off != d.flip_metering_off) +
         (g_config.gpu_wait_late_guard != d.gpu_wait_late_guard) +
-        (g_config.gpu_wait_late_guard_interleave_s != d.gpu_wait_late_guard_interleave_s) +
+        (g_config.gpu_wait_idle_evidence != d.gpu_wait_idle_evidence) +
+        (g_config.gpu_wait_ab_interleave_s != d.gpu_wait_ab_interleave_s) +
         (g_config.control_file != d.control_file) +
         (g_config.gpu_queue_probe != d.gpu_queue_probe) +
         (g_config.gpu_queue_probe_source != d.gpu_queue_probe_source) +
@@ -1031,7 +1036,8 @@ void Config_ResetDeveloperSettings() {
     g_config.gpu_present_gate_probes = d.gpu_present_gate_probes;
     g_config.flip_metering_off = d.flip_metering_off;
     g_config.gpu_wait_late_guard = d.gpu_wait_late_guard;
-    g_config.gpu_wait_late_guard_interleave_s = d.gpu_wait_late_guard_interleave_s;
+    g_config.gpu_wait_idle_evidence = d.gpu_wait_idle_evidence;
+    g_config.gpu_wait_ab_interleave_s = d.gpu_wait_ab_interleave_s;
     g_config.control_file = d.control_file;
     g_config.gpu_queue_probe = d.gpu_queue_probe;
     g_config.gpu_queue_probe_source = d.gpu_queue_probe_source;
@@ -1086,7 +1092,11 @@ void ApplyConfig() {
     if (g_config.gpu_wait_late_guard)
         LOG_WARN("Diagnostic GPU wait late guard on: while the newest 64 frames all arrived late for their slot, "
                  "the limit on the GPU queue wait's lead follows their lateness and earliest heavy GPU work "
-                 "(gpu_wait_late_guard=true, interleave %d s)", g_config.gpu_wait_late_guard_interleave_s);
+                 "(gpu_wait_late_guard=true, interleave %d s)", g_config.gpu_wait_ab_interleave_s);
+    if (g_config.gpu_wait_idle_evidence)
+        LOG_WARN("Diagnostic GPU wait idle evidence on: the limit on the GPU queue wait's lead also learns from "
+                 "frames in front of whose heavy GPU work the GPU idled, held predecessor or not "
+                 "(gpu_wait_idle_evidence=true, interleave %d s)", g_config.gpu_wait_ab_interleave_s);
     if (g_config.gpu_queue_probe != kPacingGpuQueueProbeDefault)
         LOG_WARN("Diagnostic GPU queue probe off: the presenting queue's submissions are not measured "
                  "(gpu_queue_probe=false; the queue law needs it and forces it on)");

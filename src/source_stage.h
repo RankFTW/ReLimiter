@@ -148,9 +148,13 @@ struct SourceStageRequest {
     // Late state of the collision guard (lead_controller.h; developer key gpu_wait_late_guard, default off):
     // the unified branch lets a run of late arrivals set the lead's limit and passes the limit to the executor.
     bool late_guard = false;
-    // Developer key gpu_wait_late_guard_interleave_s: also judge the state's condition while late_guard is
+    // Developer key gpu_wait_ab_interleave_s: also judge the state's condition while late_guard is
     // false, for the flag only (kUpLateSeen).
     bool late_observe = false;
+    // Idle-GPU evidence of the collision guard (lead_controller.h, LeadRequest::idle_evidence; developer key
+    // gpu_wait_idle_evidence, default off): the guard's limit reads the window that also learns from frames
+    // whose predecessor was not held.
+    bool idle_evidence = false;
     // The driver's Reflex Sleep for grid index driver_sleep_index (0 = none;
     // Scheduler_EndDriverSleep, Hook_Sleep): the QPC its call started and
     // returned. The scheduler fills them while the driver's Sleep runs (the

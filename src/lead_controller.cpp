@@ -138,6 +138,8 @@ void LeadController::Reset(int64_t qpc_frequency) noexcept
     resume_delay_count_ = 0;
     for (LeadSampleWindow& calls : call_windows_) calls.Reset();
     for (LeadSampleWindow& work : work_windows_) work.Reset();
+    for (LeadSampleWindow& work : idle_work_windows_) work.Reset();
+    idle_evidence_ = false;
     work_age_frames_.fill(0);
     for (LateWindow& late : late_arrivals_) late.Reset();
     for (LateWindow& late : late_work_) late.Reset();
@@ -158,6 +160,7 @@ void LeadController::ResetBuckets() noexcept
     for (Bucket& bucket : buckets_) ResetBucket(&bucket);
     for (LeadSampleWindow& calls : call_windows_) calls.Reset();
     for (LeadSampleWindow& work : work_windows_) work.Reset();
+    for (LeadSampleWindow& work : idle_work_windows_) work.Reset();
     work_age_frames_.fill(0);
     for (LateWindow& late : late_arrivals_) late.Reset();
     for (LateWindow& late : late_work_) late.Reset();
@@ -327,6 +330,12 @@ double LeadController::NextLeadUs(const LeadRequest& request, bool* budget_limit
     }
 
     Bucket& bucket = buckets_[bucket_index];
+    // Idle-GPU evidence (lead_controller.h): the heavy-work window this plan reads, selected before anything
+    // that asks WorkCurrent (the spike floor's BehindWait, the guard).
+    if (request.rung == PacingRung::GpuQueueWait) {
+        idle_evidence_ = request.idle_evidence;
+        if (guard != nullptr) guard->idle_evidence = request.idle_evidence;
+    }
     const double interval_us = request.interval_us;
     const double max_lead_us = LEAD_BUDGET_INTERVALS * interval_us;
     bucket.quantile_us = bucket.window.Quantile(ValidQuantile(request.quantile));
@@ -430,18 +439,26 @@ double LeadController::CollisionGuardedLeadUs(const LeadRequest& request, size_t
     return returned_us;
 }
 
-bool LeadController::WorkCurrent(size_t divisor) const noexcept
+const LeadSampleWindow* LeadController::WorkWindow(size_t divisor, bool idle_evidence) const noexcept
 {
-    return work_windows_[divisor].Count() >= LEAD_WARM_SAMPLES &&
-        work_age_frames_[divisor] <= LEAD_WORK_STALE_FRAMES;
+    if (work_age_frames_[divisor] > LEAD_WORK_STALE_FRAMES) return nullptr;
+    if (idle_evidence && idle_work_windows_[divisor].Count() >= LEAD_WARM_SAMPLES) {
+        return &idle_work_windows_[divisor];
+    }
+    return work_windows_[divisor].Count() >= LEAD_WARM_SAMPLES ? &work_windows_[divisor] : nullptr;
+}
+
+bool LeadController::WorkCurrent(size_t divisor, bool idle_evidence) const noexcept
+{
+    return WorkWindow(divisor, idle_evidence) != nullptr;
 }
 
 bool LeadController::CollisionOffsetUs(size_t divisor, double headroom_us, double* offset_us,
     bool* headroom) const noexcept
 {
-    if (WorkCurrent(divisor)) {
+    if (const LeadSampleWindow* work = WorkWindow(divisor, idle_evidence_)) {
         const double distance_us = IsPositiveFinite(headroom_us) ? headroom_us : LEAD_RELEASE_HEADROOM_US;
-        *offset_us = work_windows_[divisor].Quantile(LEAD_WORK_QUANTILE) - distance_us;
+        *offset_us = work->Quantile(LEAD_WORK_QUANTILE) - distance_us;
         *headroom = true;
         return true;
     }
@@ -580,6 +597,7 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
     }
     slot.gpu_resume_probe = frame.gpu_resume_probe;
     slot.late_state = frame.guard.late_state;
+    slot.idle_evidence = frame.guard.idle_evidence;
     // Lead anchor (lead_controller.h, unified pacer only): the owner sets
     // frame.anchored only there, so with the key off this is one not-taken
     // branch on a bool and the slot keeps its zero from the whole-struct
@@ -980,12 +998,16 @@ void LeadController::RecordReleaseMargin(PendingFrame* frame) noexcept
 
 // D = r − A − s of a sampled GPU queue wait frame with its readiness and a
 // Reflex GPU active time: the source release → heavy GPU work time, at most
-// 3 I. A frame whose GPU work outlasted its readiness span counts as 0. Only
-// after a predecessor whose GPU waited at its gate (lead_controller.h): the
-// predecessor's verdict may arrive after the frame's own evidence, and the
-// sample is added when it does (OnStageEvent revisits the successor). No
-// sample when the predecessor is missing, of another lifecycle, producer
-// epoch or FG divisor, or planned without the GPU queue wait.
+// 3 I. A frame whose GPU work outlasted its readiness span counts as 0. After
+// a predecessor planned as built, the built window takes it when that
+// predecessor's GPU waited at its gate (lead_controller.h): the verdict may
+// arrive after the frame's own evidence, and the sample is added when it does
+// (OnStageEvent revisits the successor). After a predecessor planned with the
+// idle-GPU evidence (LeadRequest::idle_evidence), that evidence's window takes
+// it then too, and also when the heavy work began at least H after the
+// predecessor's readiness. No sample when the predecessor is missing, of
+// another lifecycle, producer epoch or FG divisor, or planned without the
+// GPU queue wait.
 void LeadController::RecordWorkStart(PendingFrame* frame) noexcept
 {
     if (frame == nullptr || frame->work_recorded || !frame->started || !frame->sampled ||
@@ -1005,17 +1027,36 @@ void LeadController::RecordWorkStart(PendingFrame* frame) noexcept
     const PendingFrame* previous = Previous(*frame);
     LeadGate verdict = LeadGate::NotHeld;
     bool previous_late_state = false;
+    bool previous_idle_evidence = false;
+    double idle_us = -1.0; // the GPU's idle time in front of this frame's heavy work, where known
     if (previous != nullptr && previous->rung == PacingRung::GpuQueueWait && previous->sampled &&
         previous->bucket % LEAD_DIVISOR_BUCKETS == divisor) {
         verdict = previous->started ? GpuGateVerdict(*previous) : LeadGate::Pending;
         if (verdict == LeadGate::Pending) return;
         previous_late_state = previous->late_state;
+        previous_idle_evidence = previous->idle_evidence;
+        // The heavy work's start against the predecessor's readiness, D not clamped: a frame whose GPU work
+        // began before its own release did not start behind an idle GPU. The predecessor's readiness
+        // precedes this frame's own in the event stream; a predecessor that never got one gives no sample.
+        if (HasField(*previous, FieldGpuReady)) {
+            idle_us = MicrosecondsBetween(previous->qpc[FieldGpuReady], frame->qpc[FieldGpuReady]) -
+                frame->gpu_active_us;
+        }
     }
     frame->work_recorded = true;
-    // A predecessor planned in the late state was held under that state's limit: no sample here, so the
-    // window stays what on-time frames taught it.
-    if (verdict != LeadGate::Held || previous_late_state) return;
     if (!in_range) return;
+    // A predecessor planned in the late state was held under that state's limit: not a waited predecessor
+    // here, so the windows stay what on-time frames taught them.
+    const bool waited = verdict == LeadGate::Held && !previous_late_state;
+    // Each window takes D only after a predecessor planned with its own rule, so each stays what its rule
+    // alone learned (lead_controller.h, LeadRequest::idle_evidence).
+    if (previous_idle_evidence) {
+        if (!waited && !(idle_us >= LEAD_RELEASE_HEADROOM_US)) return;
+        idle_work_windows_[divisor].Add(std::max(0.0, work_us));
+        ++statistics_.idle_work_samples;
+        return;
+    }
+    if (!waited) return;
     work_windows_[divisor].Add(std::max(0.0, work_us));
     ++statistics_.work_samples;
 }
@@ -1094,11 +1135,16 @@ void LeadController::RecordConcurrency(PendingFrame* frame) noexcept
 
 bool LeadController::BehindWait(PacingRung rung, size_t divisor) const noexcept
 {
+    return BehindWait(rung, divisor, idle_evidence_);
+}
+
+bool LeadController::BehindWait(PacingRung rung, size_t divisor, bool idle_evidence) const noexcept
+{
     if (!IsGpuRung(rung)) return false;
     const bool fg = rung == PacingRung::FgInputWait;
     const QueueOrderWindow& window = queue_order_[fg ? 1 : 0];
     if (window.count < LEAD_WARM_SAMPLES || window.concurrent != 0) return false;
-    return fg ? fg_report_age_frames_[divisor] <= LEAD_WORK_STALE_FRAMES : WorkCurrent(divisor);
+    return fg ? fg_report_age_frames_[divisor] <= LEAD_WORK_STALE_FRAMES : WorkCurrent(divisor, idle_evidence);
 }
 
 bool LeadController::NextGpuWorkBehindWait(PacingRung rung, double fg_divisor) const noexcept
@@ -1253,7 +1299,7 @@ void LeadController::ForceFinalize(PendingFrame* frame) noexcept
 bool LeadController::LeadSampleWaitsForReport(const PendingFrame& frame) const noexcept
 {
     return IsGpuRung(frame.rung) && !(frame.gpu_active_us > 0.0) &&
-        BehindWait(frame.rung, frame.bucket % LEAD_DIVISOR_BUCKETS);
+        BehindWait(frame.rung, frame.bucket % LEAD_DIVISOR_BUCKETS, frame.idle_evidence);
 }
 
 bool LeadController::GpuIdleInSpanUs(const PendingFrame& frame, double* idle_us) const noexcept
@@ -1416,7 +1462,7 @@ double LeadController::SampleUs(const PendingFrame& frame, const PendingFrame* p
     if (predecessor_wait_us != nullptr) *predecessor_wait_us = 0.0;
     if (kept_wait_us != nullptr) *kept_wait_us = 0.0;
     if (!IsGpuRung(frame.rung) || previous == nullptr || !previous->started || !IsGpuRung(previous->rung) ||
-        !BehindWait(frame.rung, frame.bucket % LEAD_DIVISOR_BUCKETS)) {
+        !BehindWait(frame.rung, frame.bucket % LEAD_DIVISOR_BUCKETS, frame.idle_evidence)) {
         return raw_us;
     }
     const int64_t source = frame.qpc[FieldSource];

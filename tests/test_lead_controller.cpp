@@ -51,7 +51,7 @@ namespace
         return kBaseQpc + static_cast<int64_t>(std::llround(us * 10.0));
     }
 
-    // The controller is about 165 KB: tests keep it on the heap.
+    // The controller is about 190 KB: tests keep it on the heap.
     std::unique_ptr<LeadController> MakeController()
     {
         auto controller = std::make_unique<LeadController>();
@@ -3809,6 +3809,104 @@ void TestLateStateGuard()
     CHECK(veto->Statistics().work_samples == 3); // frame 5 follows frame 4, planned as built
 }
 
+// Idle-GPU evidence (developer key gpu_wait_idle_evidence). After a predecessor planned as built, the built
+// window takes a D when that predecessor waited. After a predecessor planned with the evidence, the evidence
+// window takes it then too, and also when the heavy work began at least H after the predecessor's readiness.
+// A request that asks for the evidence reads its window once warm, any other the built one; a bucket reset
+// clears both.
+void TestIdleEvidence()
+{
+    auto controller = MakeController();
+    const auto built = [&] { return controller->Statistics().work_samples; };
+    const auto idle = [&] { return controller->Statistics().idle_work_samples; };
+    // One GPU queue wait frame: Present call 5,000 µs after its release, ready ready_us after it, its gate
+    // released 500 µs after the readiness when waited (else at it), Reflex GPU active time active_us; planned
+    // with the evidence or in the late state when asked. X = ready_us, D = ready_us − active_us, and with
+    // the predecessor ready 10,000 µs after its own release the GPU idled D in front of the heavy work.
+    uint64_t index = 0;
+    const auto feed = [&](double active_us, bool waited, bool idle_plan, bool late_plan = false,
+            double ready_us = 10000.0) {
+        const double source_us = static_cast<double>(++index) * kInterval;
+        LeadFrameStart start = Start(index, PacingRung::GpuQueueWait, source_us);
+        start.guard.idle_evidence = idle_plan;
+        start.guard.late_state = late_plan;
+        controller->OnSourceRelease(start);
+        controller->OnStageEvent(Event(index, Kind::PresentCall, source_us + 5000.0));
+        controller->OnStageEvent(Event(index, Kind::GpuReady, source_us + ready_us));
+        controller->OnStageEvent(Event(index, Kind::OutputRelease, source_us + ready_us + (waited ? 500.0 : 0.0)));
+        FeedGpuActive(controller.get(), index, active_us);
+    };
+    LeadRequest request = Request(PacingRung::GpuQueueWait, 500.0, 7000.0);
+    request.collision_guard = true;
+    LeadGuardOutcome guard{};
+    const auto lead = [&](bool ask) {
+        request.idle_evidence = ask;
+        return controller->NextLeadUs(request, nullptr, &guard);
+    };
+
+    // 41 waited frames planned as built in a light scene: D = 2,000 (window: 2,010), 40 samples in the built
+    // window, none in the evidence window. The limit at I = 7,000 is 7,000 + 2,010 − 1,000 = 8,010, also for
+    // a request that asks for the evidence while its window is cold.
+    for (int frame = 0; frame < 41; ++frame) feed(8000.0, true, false);
+    CHECK(built() == 40 && idle() == 0);
+    CHECK(std::fabs(lead(false) - 8010.0) <= 20.0 && !guard.idle_evidence);
+    CHECK(std::fabs(lead(true) - 8010.0) <= 20.0 && guard.idle_evidence && std::fabs(guard.offset_us - 1010.0) <= 20.0);
+
+    // The scene gets heavier: none waited, D = 4,000 behind a GPU that idled 4,000 µs. Planned as built, the
+    // built window takes the first only (it follows the waited frame 41) and its limit stays.
+    for (int frame = 0; frame < 300; ++frame) feed(6000.0, false, false);
+    CHECK(built() == 41 && idle() == 0);
+    CHECK(std::fabs(lead(false) - 8010.0) <= 20.0);
+    // The same frames planned with the evidence: its window takes all but the first (whose predecessor was
+    // planned as built). Asked for: 7,000 + 4,010 − 1,000 = 10,010, reached at the lead slew (100 µs a frame).
+    for (int frame = 0; frame < 300; ++frame) feed(6000.0, false, true);
+    CHECK(built() == 41 && idle() == 299);
+    CHECK(std::fabs(lead(true) - 8110.0) <= 20.0 && guard.idle_evidence);
+    CHECK(guard.judged && std::fabs(guard.offset_us - 3010.0) <= 20.0);
+    for (int frame = 0; frame < 24; ++frame) lead(true);
+    CHECK(std::fabs(lead(true) - 10010.0) <= 20.0);
+    // Not asked for: the built limit again, at once.
+    CHECK(std::fabs(lead(false) - 8010.0) <= 20.0 && !guard.idle_evidence);
+    CHECK(std::fabs(guard.offset_us - 1010.0) <= 20.0);
+
+    // Heavy work 500 µs after the predecessor's readiness (A = 9,500): the GPU did not idle H in front of
+    // it. After a not-waited predecessor no window takes it; after a waited one, the window of that
+    // predecessor's plan.
+    feed(9500.0, false, true);
+    feed(9500.0, true, true);
+    CHECK(built() == 41 && idle() == 299);
+    feed(9500.0, true, false);
+    CHECK(built() == 41 && idle() == 300); // follows a waited frame planned with the evidence
+    feed(9500.0, false, true);
+    CHECK(built() == 42 && idle() == 300); // follows a waited frame planned as built
+
+    // A waited frame planned in the late state is not a waited predecessor: its successor's D counts only
+    // behind an idle GPU.
+    feed(9500.0, true, true, true);
+    feed(9500.0, false, true);
+    CHECK(built() == 42 && idle() == 300);
+    feed(9500.0, true, true, true);
+    feed(6000.0, false, true);
+    CHECK(built() == 42 && idle() == 301);
+
+    // A frame whose GPU work outlasted its readiness span (A = 12,000 against X = 10,000) counts as D = 0,
+    // and its heavy work began 2,000 µs before its release: at the predecessor's readiness, not behind an
+    // idle GPU, although the release itself came 2,000 µs after that readiness. The predecessor (ready
+    // 8,000 µs after its release, D = 2,000 behind a GPU that idled 2,000 µs) is a sample itself.
+    feed(6000.0, false, true, false, 8000.0);
+    CHECK(built() == 42 && idle() == 302);
+    feed(12000.0, false, true);
+    CHECK(built() == 42 && idle() == 302);
+
+    // A bucket reset clears both windows: 41 frames that neither waited nor had an idle GPU in front leave
+    // them empty, and the guard judges by the Present call (7,000 + 5,010 − 2,500).
+    controller->ResetBuckets();
+    for (int frame = 0; frame < 41; ++frame) feed(9500.0, false, true);
+    CHECK(built() == 42 && idle() == 302);
+    lead(true);
+    CHECK(guard.judged && std::fabs(guard.offset_us - 2510.0) <= 20.0);
+}
+
 int main()
 {
     std::printf("sizeof(LeadController) = %zu bytes\n", sizeof(LeadController));
@@ -3873,6 +3971,7 @@ int main()
     TestSaturationRegisterFlushOrder();
     TestSaturationReportLifetime();
     TestLateStateGuard();
+    TestIdleEvidence();
 
     if (s_failures != 0) {
         std::fprintf(stderr, "%d lead controller checks failed\n", s_failures);

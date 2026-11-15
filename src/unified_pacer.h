@@ -101,7 +101,7 @@ enum UnifiedFlag : uint32_t {
     // raw-margin flags of the removed render-stage rules: reserved, never reused.
     kUpQueueLawNoHoldCredit = 0x20000000, // the law is in use but the newest record's queue is a render queue by dependency (role 3): the credit and the holds follow the report-based rule, no hold is granted by the law
     kUpLateGuard = 0x80000000,   // the lead's limit came from the late state (developer key gpu_wait_late_guard; lead_controller.h)
-    kUpLateSeen = 0x100000,      // the late state's condition was met and not applied (the off period of developer key gpu_wait_late_guard_interleave_s)
+    kUpLateSeen = 0x100000,      // the late state's condition was met and not applied (the off period of developer key gpu_wait_ab_interleave_s)
 };
 
 // ── Exact time ──

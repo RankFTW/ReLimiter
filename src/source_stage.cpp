@@ -24,6 +24,9 @@ static_assert(static_cast<double>(kPacingUnifiedQueueAllowDefaultUs) == UnifiedO
 static_assert(kPacingUnifiedQueueNeedFramesDefault == UnifiedOptions{}.queue_need_frames &&
     kPacingUnifiedQueueNeedFramesMax == kUnifiedQueueNeedFramesMax,
     "unified_queue_need_frames default and maximum must equal the law's");
+// The idle-GPU evidence (lead_controller.h) admits on the guard's own release headroom.
+static_assert(LEAD_RELEASE_HEADROOM_US == kPacingGpuWaitHeadroomDefaultUs,
+    "the lead controller's release headroom must equal the configuration's");
 
 namespace {
 // Waits to target_qpc in chunks of at most chunk_ticks, so a wait the production waiter would
@@ -505,6 +508,7 @@ SourceStageFrame SourceStage::RunUnifiedFrame(
         ? static_cast<double>(start.arrival_qpc - planned_start_qpc) / ticks_per_us : 0.0;
     lead_request.late_guard = request.late_guard;
     lead_request.late_observe = request.late_observe;
+    lead_request.idle_evidence = request.idle_evidence;
     bool budget_limited = false;
     LeadGuardOutcome guard{};
     const double lead_us = lead_.NextLeadUs(lead_request, &budget_limited, &guard);

@@ -1244,16 +1244,21 @@ static SourceStageFrame RunPlanned(
     const bool unified = SourceStage_UnifiedPlans(pipeline, config.unified, s_source_stage.UnifiedEnabled());
     // Lead spike floor (lead_controller.h).
     request.spike_floor = kPacingLeadSpikeFloor;
-    // Late state of the collision guard (lead_controller.h; developer A/B switch gpu_wait_late_guard).
-    // With the interleave key the state sets the limit in the even periods of the QPC time only; in the odd
-    // ones the frames that meet its condition are flagged, nothing else.
+    // Developer A/B switches of the collision guard (lead_controller.h): the late state (gpu_wait_late_guard)
+    // and the idle-GPU evidence (gpu_wait_idle_evidence). With the interleave key they act in the even
+    // periods of the QPC time only; in the odd ones the plan is the built one and the frames that meet the
+    // late state's condition are flagged, nothing else.
     request.late_guard = g_gpu_wait_late_guard.load(std::memory_order_relaxed);
-    if (request.late_guard) {
-        const int64_t period_qpc = static_cast<int64_t>(g_gpu_wait_late_guard_interleave_s.load(
+    request.idle_evidence = g_gpu_wait_idle_evidence.load(std::memory_order_relaxed);
+    if (request.late_guard || request.idle_evidence) {
+        const int64_t period_qpc = static_cast<int64_t>(g_gpu_wait_ab_interleave_s.load(
             std::memory_order_relaxed)) * request.qpc_frequency;
         if (period_qpc > 0) {
-            request.late_observe = true;
-            request.late_guard = ((QpcNow() / period_qpc) & 1) == 0;
+            request.late_observe = request.late_guard;
+            if (((QpcNow() / period_qpc) & 1) != 0) {
+                request.late_guard = false;
+                request.idle_evidence = false;
+            }
         }
     }
     // The driver's Reflex Sleep for the index this plan is expected to take,

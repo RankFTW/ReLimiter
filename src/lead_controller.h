@@ -9,9 +9,10 @@
 // dependencies. Owned and called only by the scheduler owner; not thread-safe.
 //
 // Storage is fixed and nothing allocates. sizeof(LeadController) is about
-// 165 KB (20 buckets of a 256-sample ring and a 2,048-bin histogram, four
-// release → Present call windows, four release → heavy GPU work windows and
-// the first-submission window of the same shape, plus the pending-frame table):
+// 190 KB (20 buckets of a 256-sample ring and a 2,048-bin histogram, four
+// release → Present call windows, eight release → heavy GPU work windows (the
+// built rule's and the idle-GPU evidence's) and the first-submission window of
+// the same shape, plus the pending-frame table):
 // keep the instance in static storage or on the heap, never on a thread stack.
 
 #include "pacing_core_types.h"
@@ -174,8 +175,8 @@ constexpr uint32_t LEAD_WORK_STALE_FRAMES = 64;
 // nothing is held. The lateness is the game's arrival against its planned
 // start, not the release (the hard limit's wait and a late wake do not count),
 // and the frames must be consecutive plans. One frame on time ends the state in
-// that plan. A frame planned in the state gives its successor no sample in the
-// heavy-work window, which so stays what on-time frames taught it.
+// that plan. A frame planned in the state does not count as a waited predecessor
+// for the heavy-work windows, which so stay what on-time frames taught them.
 // LEAD_LATE_FRAMES is the horizon after which the guard calls its evidence
 // stale; a D that old does not count either.
 constexpr size_t LEAD_LATE_FRAMES = LEAD_WORK_STALE_FRAMES;
@@ -365,6 +366,9 @@ struct LeadGuardOutcome {
     // Its condition was met while the request only observed it (LeadRequest::late_observe): the limit is the
     // built one.
     bool late_seen = false;
+    // Idle-GPU evidence (LeadRequest::idle_evidence): the plan asked for it. Kept with the frame: its
+    // successor's D is the evidence window's, not the built one's.
+    bool idle_evidence = false;
     // When judged: the limit on the release → target distance, I + offset in
     // µs (the anchor's delta is not in it). With the developer key
     // gpu_wait_late_guard the executor resolves no target past it; 0 otherwise.
@@ -464,8 +468,19 @@ struct LeadRequest {
     double late_us = 0.0;
     bool late_guard = false;
     // Judge the state's condition without applying it (the off period of developer key
-    // gpu_wait_late_guard_interleave_s): LeadGuardOutcome::late_seen.
+    // gpu_wait_ab_interleave_s): LeadGuardOutcome::late_seen.
     bool late_observe = false;
+    // Idle-GPU evidence (developer key gpu_wait_idle_evidence, default off). The built heavy-work window
+    // takes a frame's D only after a predecessor the GPU waited in, so a limit that has fallen below the
+    // frames' readiness holds nothing and is never corrected (Rogue Core, 2026-11-14: the limit stood 1.6
+    // to 3.6 ms short for whole sessions). A second window also takes the D of a frame whose heavy work
+    // began at least LEAD_RELEASE_HEADROOM_US after its predecessor's readiness: the GPU idled in front of
+    // it, so that start was the frame's own, whatever the predecessor's gate did. With this set the limit
+    // reads that window once it is warm (WorkWindow). Each window takes D only after a predecessor planned
+    // with its own rule, so each is what its rule alone learned (the periods of gpu_wait_ab_interleave_s);
+    // with the key off the second window is never fed. Readers at frame time (the lead sample's queue
+    // order) take the frame's own plan, PendingFrame::idle_evidence.
+    bool idle_evidence = false;
 };
 
 struct LeadBucketStatus {
@@ -509,6 +524,8 @@ struct LeadStatistics {
     uint64_t unmatched_gpu_active = 0;
     uint64_t headroom_samples = 0;
     uint64_t headroom_late_samples = 0;
+    // D samples of the idle-GPU evidence window (LeadRequest::idle_evidence).
+    uint64_t idle_work_samples = 0;
     // Queue order (above), GPU queue wait and FG input wait: waited releases
     // paired with the next frame's GPU start, those whose next frame's GPU
     // work started before the release (concurrent), and the newest
@@ -801,6 +818,7 @@ private:
         bool spike_gpu_recorded = false; // its r − g was decided
         bool gpu_wait_lead = false;      // planned with the GPU queue wait's lead (held)
         bool late_state = false;         // planned in the late state: its successor adds no D to the work window
+        bool idle_evidence = false;      // planned with the idle-GPU evidence: its successor's D is that window's
         bool late_work_recorded = false; // its D entered the late state's ring, or was given up
     };
 
@@ -886,15 +904,20 @@ private:
     double CollisionGuardedLeadUs(const LeadRequest& request, size_t bucket_index, double lead_us,
         LeadGuardOutcome* guard) noexcept;
     // The guard's limit minus I for an FG divisor slot: Q10(D) − headroom_us
-    // while the heavy-work window is warm and current (*headroom true), else
+    // while a heavy-work window is warm and current (*headroom true), else
     // Q10(C) − LEAD_RELEASE_MARGIN_US while the call window is warm; false
     // when neither is.
     bool CollisionOffsetUs(size_t divisor, double headroom_us, double* offset_us, bool* headroom) const noexcept;
-    bool WorkCurrent(size_t divisor) const noexcept;
+    // The heavy-work window a limit reads: the idle-GPU evidence one when asked for and warm, else the
+    // built one when warm; nullptr when neither is or the Reflex reports are stale.
+    const LeadSampleWindow* WorkWindow(size_t divisor, bool idle_evidence) const noexcept;
+    bool WorkCurrent(size_t divisor, bool idle_evidence) const noexcept;
     // Late state (above): true with *offset_us = least arrival lateness + least D − H while the newest
     // LEAD_LATE_FRAMES planned frames all arrived late and as many current D exist; else false, *offset_us kept.
     bool LateOffsetUs(size_t divisor, const LeadRequest& request, double* offset_us) const noexcept;
+    // The two-argument form reads the newest GPU queue wait plan's rule (idle_evidence_).
     bool BehindWait(PacingRung rung, size_t divisor) const noexcept;
+    bool BehindWait(PacingRung rung, size_t divisor, bool idle_evidence) const noexcept;
     // F, the median first submission − RENDERSUBMIT_START of the report pairs
     // that stream (above); 0 until LEAD_WARM_SAMPLES.
     double FirstSubmissionUs() const noexcept;
@@ -979,6 +1002,10 @@ private:
     // of one (the work window's age, LEAD_WORK_STALE_FRAMES).
     std::array<LeadSampleWindow, LEAD_DIVISOR_BUCKETS> call_windows_{};
     std::array<LeadSampleWindow, LEAD_DIVISOR_BUCKETS> work_windows_{};
+    // Idle-GPU evidence (LeadRequest::idle_evidence): its window, and whether the newest GPU queue wait
+    // plan asked for it.
+    std::array<LeadSampleWindow, LEAD_DIVISOR_BUCKETS> idle_work_windows_{};
+    bool idle_evidence_ = false;
     std::array<uint32_t, LEAD_DIVISOR_BUCKETS> work_age_frames_{};
     // Late state (above), per FG divisor: the arrival lateness of the newest
     // planned GPU queue wait frames and the D of the newest reported ones.

@@ -513,7 +513,8 @@ config_key developer_settings
 config_key config_version
 config_key flip_metering_off
 config_key gpu_wait_late_guard
-config_key gpu_wait_late_guard_interleave_s
+config_key gpu_wait_idle_evidence
+config_key gpu_wait_ab_interleave_s
 config_key gpu_queue_probe
 config_key gpu_queue_probe_source
 config_key pacing_test_mode

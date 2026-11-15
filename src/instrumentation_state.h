@@ -38,10 +38,15 @@ inline std::atomic<int> g_unified_queue_margin_end{1};
 // resolves no target past the guard's limit. Published by Config_ApplyPacingPipeline; read by the scheduler
 // owner at each plan.
 inline std::atomic<bool> g_gpu_wait_late_guard{false};
-// Developer key gpu_wait_late_guard_interleave_s (default 0 = none): with gpu_wait_late_guard on, the late state
-// sets the limit only in alternate periods of this many seconds (the even ones of the QPC time), and in the
-// other periods the frames that meet its condition are flagged (up_flags 0x100000): an A/B inside one capture.
-inline std::atomic<int> g_gpu_wait_late_guard_interleave_s{0};
+// Developer A/B switch gpu_wait_idle_evidence (default off; lead_controller.h, LeadRequest::idle_evidence):
+// the collision guard's limit reads the heavy-work window that also learns from frames in front of whose
+// heavy work the GPU idled, whatever their predecessor's gate did. Published and read as the switch above.
+inline std::atomic<bool> g_gpu_wait_idle_evidence{false};
+// Developer key gpu_wait_ab_interleave_s (default 0 = none): the two switches above act only in alternate
+// periods of this many seconds (the even ones of the QPC time); in the other periods the plan is the built
+// one and the frames that meet the late state's condition are flagged (up_flags 0x100000): an A/B inside
+// one capture.
+inline std::atomic<int> g_gpu_wait_ab_interleave_s{0};
 
 // The newest SetFlipConfig calls that enabled flip metering (nFramesPerBatch >
 // 0), for the pacing CSV's flip_config_qpc and flip_time_per_batch_us: a ring
