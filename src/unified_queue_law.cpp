@@ -37,8 +37,14 @@ UnifiedQueueSample UnifiedQueueSample_FromRecord(const PacingGpuQueueRecord& rec
     sample.valid = true;
     sample.starve_us = starve_us;
     sample.margin_free_us = has_margin ? record.min_margin_free_us : 0.0;
-    sample.cycle_us = record.cycle_us;
-    sample.hold_block_us = record.hold_block_us;
+    // The render queue found by dependency: its hold block is ReLimiter's own order Wait (the gate's hold is on
+    // the presenting queue), time the queue sat blocked by the pacer's choice and never the GPU's need. Under the
+    // order a target-bound frame is held I - Delta whatever the lead is, so a base that kept the block followed
+    // the interval it caused (gain 1); it is taken out of the cycle here (the invariant in unified_queue_law.h).
+    // N and S below are computed from the record as it is and do not change.
+    const bool order_block = record.queue_role == kUnifiedQueueRoleRenderQueue;
+    sample.cycle_us = order_block ? std::max(0.0, record.cycle_us - record.hold_block_us) : record.cycle_us;
+    sample.hold_block_us = order_block ? 0.0 : record.hold_block_us;
     sample.boundary_idle_us = record.boundary_idle_us;
     sample.wait_idle_us = record.wait_idle_us;
     const double raw_need_us =
@@ -152,6 +158,11 @@ UnifiedQueueResult UnifiedQueueWindow::Compute(double j_us, const UnifiedQueuePa
     // (S^ the 16-frame service). A hold up to that slack is paid by the cap's headroom, not by the
     // GPU, so it drops out of the base; the part of a hold above the slack stays (no cap, or a cap
     // the GPU cannot reach: S^ >= J, slack 0, and the base is cycle - starve exactly).
+    // That is a hold on the presenting queue, which the credit and the advance bound. The render queue's order
+    // block never gets here: UnifiedQueueSample_FromRecord took it out of the cycle (under the order a
+    // target-bound frame is held I - Delta whatever the lead is, and whatever the credit is while its debt is
+    // constant; a changing debt moves the hold one for one, h = I - Delta - the change of the advance. A base
+    // that kept the block would follow the interval it caused).
     const double j = std::isfinite(j_us) && j_us > 0.0 ? j_us : 0.0;
     const double service_us = service_sum_us / static_cast<double>(count);
     const double slack_us = std::max(0.0, j - service_us);
@@ -161,8 +172,8 @@ UnifiedQueueResult UnifiedQueueWindow::Compute(double j_us, const UnifiedQueuePa
         // need_free + held = (cycle - starve - hold) + max(0, hold - slack)
         base_need_sum_us += sample.cycle_us - sample.starve_us - std::min(sample.hold_block_us, slack_us);
     }
-    // B: the need follows the GPU within F frames (the hold blocking beyond the cap's slack
-    // included); the starvation of the frames the GPU term paced, as far as their start wait can
+    // B: the need follows the GPU within F frames (the presenting queue's hold blocking beyond the cap's
+    // slack included); the starvation of the frames the GPU term paced, as far as their start wait can
     // have caused it, is kept at its 16-frame mean (it cancels the interval's ratchet), the
     // starvation of any other frame, and a paced frame's beyond its wait, is not B's to carry.
     // F = 16 is the 16-frame mean cycle exactly (no gating, no hold term: the first build's base).

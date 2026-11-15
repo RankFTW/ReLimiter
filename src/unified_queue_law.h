@@ -13,6 +13,10 @@
 //   N(k)      = cycle - hold block - boundary idle - wait idle (>= 0): the time the frame needed.
 //   S(k)      = cycle - hold block - boundary idle - wait idle - empty (>= 0): the service need
 //               without the starvation inside the frame (N counts that empty time as need).
+//   Render queue found by dependency (kUnifiedQueueRoleRenderQueue): the hold block of its records is
+//   ReLimiter's own order Wait, no part of it the GPU's; the sample takes it out of the cycle (cycle' =
+//   max(0, cycle - hold block), hold block' = 0) and N and S above are those of the record itself (see
+//   the invariant below).
 // Over the W = 16 newest valid samples (UnifiedQueueWindow::Compute):
 //   B = mean over the newest F valid samples of need(j) = (cycle - starve)
 //       + mean over the 16 of (min(starve(j), start wait(j)) if paced(j) else 0)
@@ -42,9 +46,21 @@
 //   refill (per arrived valid sample, while in use) = max(0, J - S^) + min(sigma*S^, max(0, S^ - J)); the pacer bounds
 //       the second (share) term by the median frame generation time A of the used reports (UnifiedPacer::OnQueueRecord).
 //   debit (per arrived valid sample) = the sample's hold block.
-// B already contains the hold blocking the frames realized (the cycle includes the time a frame
-// waited behind ReLimiter's hold), so I_gpu never adds the mean hold: a hold that starts moves B
-// by its length as the F-frame need mean catches up (F arrivals), no sooner and no further.
+// B already contains the hold blocking the frames realized on the presenting queue (the cycle includes
+// the time a frame waited behind ReLimiter's hold), so I_gpu never adds the mean hold: a hold that starts
+// moves B by its length as the F-frame need mean catches up (F arrivals), no sooner and no further.
+// Invariant: the interval holds no time the render queue was MEASURED blocked by ReLimiter's own order
+// Wait, because under the order a target-bound frame is held I - Delta whatever the lead is (Delta: the
+// render queue's time from the Present's release to the frame's readiness) and a base that contained that
+// block had gain 1 on itself, so any interval was a fixed point and late frames only raised it (Rogue Core
+// at a cap the GPU cannot reach, slack 0: 11.4 ms against a need of 8.4 ms, N.122). The hold block of a
+// record of the render queue found by dependency is that Wait and no other (the gate's hold is on the
+// presenting queue), so UnifiedQueueSample_FromRecord takes it out of the cycle. The probe sees the block
+// only beyond a stamp lag: with the render thread ahead, the cycle less the hold block is the stamp of the
+// render queue's last completion minus the gate's release, so a held frame's block is max(0, h - lag),
+// h = I - Delta the hold and lag the lag between the gate's readiness and that stamp (0.25 to 0.3 ms in
+// Rogue Core, N.123). A block shorter than the lag is not seen and keeps gain 1: the interval settles in
+// [Delta, Delta + lag] (late frames take it to the top) and above that band the base has no gain on it.
 // The median of an even count is its lower middle value (index (n - 1) / 2), as everywhere in
 // the pacer.
 //
@@ -66,15 +82,20 @@
 #include <cstddef>
 #include <cstdint>
 
+// PacingGpuQueueRecord::queue_role of the render queue found by dependency (gpu_queue_dependency.h,
+// Role::RenderQueueByDependency): the probe follows the queue that carries the rendering, which is not the
+// presenting queue. The pacer's credit rule (UnifiedPacer::CreditByLaw) and the sample builder below read it.
+constexpr uint8_t kUnifiedQueueRoleRenderQueue = 3;
+
 struct UnifiedQueueSample {
     bool valid = false;
     double starve_us = 0.0;        // empty + boundary idle
     double margin_free_us = 0.0;   // gq_min_margin_free_us (0 when the record has none)
-    double cycle_us = 0.0;
-    double hold_block_us = 0.0;
+    double cycle_us = 0.0;         // the record's cycle; the render queue's order block is out of it (FromRecord)
+    double hold_block_us = 0.0;    // ReLimiter's hold on the presenting queue that blocked the frame; 0 for the render queue
     double boundary_idle_us = 0.0;
     double wait_idle_us = 0.0;
-    double need_us = 0.0;          // N = max(0, cycle - hold block - boundary idle - wait idle)
+    double need_us = 0.0;          // N = max(0, cycle - hold block - boundary idle - wait idle) of the record itself
     double service_us = 0.0;       // S = max(0, N - empty)
     double s_prime_us = 0.0;       // -starve when starve > 0, else margin_free
     bool paced = false;            // the GPU term paced this frame's start (set by the pacer; never by FromRecord)
@@ -82,7 +103,10 @@ struct UnifiedQueueSample {
 };
 
 // valid iff kCycle, kEmpty, kBoundaryIdle, kHoldBlock and kWaitIdle are set, every value is
-// finite and non-negative, and (starve > 0 or kMinMarginFree is set).
+// finite and non-negative, and (starve > 0 or kMinMarginFree is set). N and S come from the record
+// as it is. A record whose queue_role is kUnifiedQueueRoleRenderQueue enters with cycle' = max(0,
+// cycle - hold block) and hold block' = 0 (the invariant in the header); every other role, and a
+// record without the role, enters as it is.
 UnifiedQueueSample UnifiedQueueSample_FromRecord(const PacingGpuQueueRecord& record) noexcept;
 
 struct UnifiedQueueParams {

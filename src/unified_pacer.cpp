@@ -277,7 +277,7 @@ void UnifiedPacer::RefreshHold(Entry* entry) noexcept
 }
 
 // A probe session was retired (re-adoption) or the newest record's queue became a render queue by
-// dependency (role 3, whose hold block reads 0): no record will pay the holds the law granted before.
+// dependency (role 3, whose hold block is the order Wait, no grant's hold): no record will pay the holds the law granted before.
 // Each such law-granted frame whose hold is not yet spent is marked orphaned and, when its hold is
 // already measured, settled now from the measured hold; an unmeasured one is settled by RefreshHold when
 // its measurement arrives. hold_debited is shared with the record path, so a record that does arrive
@@ -691,7 +691,7 @@ void UnifiedPacer::OnQueueRecord(const PacingGpuQueueRecord& record) noexcept
         queue_role_ != kUnifiedQueueRoleRenderQueue;
     queue_role_ = record.queue_role;
     if (entered_role3)
-        SettleOrphanedLawHolds(); // role 3 records carry no hold block: they will not pay the law's grants
+        SettleOrphanedLawHolds(); // a role 3 record's hold block is the order Wait, no grant's hold: they will not pay the law's grants
     UnifiedQueueSample sample = UnifiedQueueSample_FromRecord(record);
     if (sample.valid)
         ++summary_.records_valid;
@@ -716,9 +716,9 @@ void UnifiedPacer::OnQueueRecord(const PacingGpuQueueRecord& record) noexcept
     queue_window_.Push(sample, arrived);
     ++version_;
     // The credit rule: the law's only while the law is in use and the record's queue is not a render
-    // queue found by dependency (role 3: its hold block reads 0 and its service is not the presenting
-    // queue's). Switching role keeps the one credit state; a hold granted under one rule is debited by
-    // that rule only.
+    // queue found by dependency (role 3: its hold block is the order Wait, no grant's hold, and its
+    // service is not the presenting queue's). Switching role keeps the one credit state; a hold granted
+    // under one rule is debited by that rule only.
     const bool in_use = CreditByLaw();
 
     double debit_us = 0.0;
@@ -727,7 +727,7 @@ void UnifiedPacer::OnQueueRecord(const PacingGpuQueueRecord& record) noexcept
     // grant is marked paid, so neither the later measurement (RefreshHold) nor an eviction settles it
     // again, whichever of the record and the measurement arrives first. A record with sequence 0, one
     // naming a sequence that is unknown (never granted, already paid, or settled and gone from the ring)
-    // and a role-3 record (its hold block reads 0: the queue is not the presenting one) debit nothing.
+    // and a role-3 record (its hold block, when it has one, is the order Wait on the render queue, no grant's hold) debit nothing.
     if (record.law_hold_sequence != 0 && record.queue_role != kUnifiedQueueRoleRenderQueue &&
         (record.valid & PacingGpuQueueRecord::kHoldBlock) != 0 && std::isfinite(record.hold_block_us) &&
         record.hold_block_us >= 0.0) {

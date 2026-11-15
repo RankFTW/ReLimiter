@@ -51,7 +51,6 @@ constexpr double kUnifiedHoldShareMax = 0.25;  // upper bound of the hold share 
 constexpr int kUnifiedQueueRankMax = 8;            // upper bound of the queue law's rank option
 constexpr double kUnifiedQueueAllowMaxUs = 20000.0; // upper bound of the queue law's M option
 constexpr int kUnifiedQueueNeedFramesMax = 16;      // upper bound of the queue law's need-mean frames (the window)
-constexpr uint8_t kUnifiedQueueRoleRenderQueue = 3; // PacingGpuQueueRecord::queue_role of a render queue found by dependency (not the presenting one)
 constexpr double kUnifiedClampFraction = 0.125; // of the service time
 constexpr double kUnifiedSaturatedUs = 500.0;
 constexpr uint32_t kUnifiedWindow = 32;          // real frames
@@ -591,8 +590,9 @@ public:
     // the law last counted as planned).
     bool QueueLawInUse() const noexcept;
     // The credit rule is the law's: the law is in use AND the newest record's queue is not a render
-    // queue found by dependency (role 3: its hold block reads 0, so the law's credit would inflate; the
-    // report-based rule then governs the credit and the holds).
+    // queue found by dependency (role 3, kUnifiedQueueRoleRenderQueue in unified_queue_law.h: its hold
+    // block is the order Wait, no grant's hold, so no record pays a law grant and the law's refill would
+    // inflate the credit; the report-based rule then governs the credit and the holds).
     bool CreditByLaw() const noexcept;
     // The counters of the queue law (the holds still unpaid in the ring included); the scheduler
     // logs them and clears them at a transition.

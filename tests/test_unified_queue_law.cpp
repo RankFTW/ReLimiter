@@ -1639,9 +1639,143 @@ namespace
         return out;
     }
 
+    // The order's block on the render queue found by dependency is ReLimiter's own idle, never the GPU's need: the
+    // base of such a record's samples holds none of it (unified_queue_law.h, the invariant). The capture that
+    // broke it: Rogue Core at a cap of 130 (J = 7.69 ms), the GPU's service above the cap so no slack, every frame
+    // held to its target.
+    void TestRenderQueueOrderBlockIsNotNeed()
+    {
+        const double j = 7690.0;
+        const UnifiedQueueParams params = Params(2, 4000.0, 0.0, 4); // the law's own F
+        // `steady` records of cycle `steady_cycle` / hold block `steady_hold`, then `blocked` of 11.4 ms / 3.0 ms
+        // of block; no starve, a margin of 0.3 ms.
+        const auto compute = [&](uint8_t role, int steady, double steady_cycle, double steady_hold, int blocked) {
+            UnifiedQueueWindow window;
+            for (int i = 0; i < steady; ++i)
+                window.Push(UnifiedQueueSample_FromRecord(RoleRecord(Record(steady_cycle, 0.0, 300.0, steady_hold), role)));
+            for (int i = 0; i < blocked; ++i)
+                window.Push(UnifiedQueueSample_FromRecord(RoleRecord(Record(11400.0, 0.0, 300.0, 3000.0), role)));
+            return window.Compute(j, params);
+        };
+
+        // 16 records of 11.4 ms with 3.0 ms of order block: the base is the need, 8.4 ms, not the cycle.
+        const UnifiedQueueResult render = compute(kUnifiedQueueRoleRenderQueue, 0, 0.0, 0.0, 16);
+        CHECK(render.computable);
+        CHECK(Near(render.base_us, 8400.0) && Near(render.need_us, 8400.0) && Near(render.service_us, 8400.0));
+        CHECK(render.service_us > j); // the cap leaves no slack: the removal is the role's, not the slack's
+        CHECK(Near(render.gpu_interval_us, 8400.0 + 300.0 / 32.0)); // P is the margin term, as before
+        // The same records of a queue with no role, the presenting queue and the frame generation's input: the
+        // hold stays in the base, 11.4 ms.
+        for (const uint8_t role : {uint8_t{0}, uint8_t{1}, uint8_t{2}}) {
+            const UnifiedQueueResult held = compute(role, 0, 0.0, 0.0, 16);
+            CHECK(Near(held.base_us, 11400.0) && Near(held.need_us, 8400.0) && Near(held.service_us, 8400.0));
+        }
+
+        // 12 records of 8.4 ms, then 4 of 11.4 ms / 3.0 ms: the render queue's base stays at 8.4 ms (the block is
+        // the order's), the presenting queue's follows the cycle to 11.4 ms.
+        CHECK(Near(compute(kUnifiedQueueRoleRenderQueue, 12, 8400.0, 0.0, 4).base_us, 8400.0));
+        CHECK(Near(compute(1, 12, 8400.0, 0.0, 4).base_us, 11400.0));
+
+        // The sample: the block is out of the cycle and the sample carries none; need, service and the starve
+        // terms are the record's own.
+        const PacingGpuQueueRecord record = Record(11400.0, 0.0, 300.0, 3000.0, 100.0, 200.0);
+        const UnifiedQueueSample taken = UnifiedQueueSample_FromRecord(RoleRecord(record, kUnifiedQueueRoleRenderQueue));
+        const UnifiedQueueSample kept = UnifiedQueueSample_FromRecord(RoleRecord(record, 1));
+        CHECK(taken.valid && kept.valid);
+        CHECK(Near(taken.cycle_us, 8400.0) && taken.hold_block_us == 0.0);
+        CHECK(Near(kept.cycle_us, 11400.0) && Near(kept.hold_block_us, 3000.0));
+        CHECK(taken.need_us == kept.need_us && taken.service_us == kept.service_us && Near(taken.need_us, 8100.0));
+        CHECK(taken.starve_us == kept.starve_us && taken.s_prime_us == kept.s_prime_us &&
+            taken.margin_free_us == kept.margin_free_us);
+        // A block longer than the cycle it was measured in (an interval's error) leaves a cycle of 0, never a
+        // negative one.
+        const UnifiedQueueSample clamped =
+            UnifiedQueueSample_FromRecord(RoleRecord(Record(1000.0, 0.0, 10.0, 5000.0), kUnifiedQueueRoleRenderQueue));
+        CHECK(clamped.valid && clamped.cycle_us == 0.0 && clamped.hold_block_us == 0.0 && clamped.need_us == 0.0);
+
+        // A cap with headroom (J = 12.0 ms: a slack of 3.6 ms): the block leaves the render queue's base once, in the
+        // sample, not again through the slack (that would be 5.4 ms); the presenting queue's 3.0 ms is the cap's.
+        const auto sixteen_blocked = [](uint8_t role) {
+            UnifiedQueueWindow window;
+            for (int i = 0; i < 16; ++i)
+                window.Push(UnifiedQueueSample_FromRecord(RoleRecord(Record(11400.0, 0.0, 300.0, 3000.0), role)));
+            return window;
+        };
+        const UnifiedQueueWindow render_window = sixteen_blocked(kUnifiedQueueRoleRenderQueue);
+        const UnifiedQueueWindow presenting_window = sixteen_blocked(1);
+        CHECK(Near(render_window.Compute(12000.0, params).base_us, 8400.0));
+        CHECK(Near(presenting_window.Compute(12000.0, params).base_us, 8400.0));
+        // F = 16 is the mean cycle exactly, as the law takes it: 8.4 ms for the render queue (its hold block is not in
+        // the cycle), 11.4 ms for the presenting queue, and the short-window bound is not evaluated.
+        const UnifiedQueueResult render16 = render_window.Compute(j, Params(2, 4000.0, 0.0, 16));
+        CHECK(Near(render16.base_us, 8400.0) && !render16.bound_active);
+        CHECK(Near(presenting_window.Compute(j, Params(2, 4000.0, 0.0, 16)).base_us, 11400.0));
+    }
+
+    // The capture's loop, closed (Rogue Core, cap 130: J = 7.69 ms, the GPU's service above it, no slack). Every
+    // frame is held to its target, so a frame's cycle is the interval planned for it and that interval is the base
+    // the law computed before it (P is small and not in the base). The order holds a frame h = cycle - Delta, Delta
+    // = 7.67 ms being the render queue's time from the Present's release to the next frame's readiness. The probe
+    // does not see all of it: with the render thread ahead, the cycle less its hold block is the stamp of the render
+    // queue's last completion minus the gate's release, so the block it sees is max(0, h - lag), lag = 0.3 ms the
+    // fixed lag between the gate's readiness and that stamp. A block shorter than the lag is not seen and has gain 1:
+    // the interval has a neutral band [Delta, Delta + lag], the cycle the law takes is min(cycle, Delta + lag), and
+    // from a latched interval above the band the base is at the top of it after the first full window and stays
+    // there. The test pins that bound above the band (the block has no gain there), not a convergence to Delta. The
+    // presenting queue's sample keeps its block (the cap's own hold): a base that holds the block repeats the cycle it
+    // was made from and stays where it started, which is what the render queue's did before the block left its sample.
+    void TestRenderQueueBaseHasNoGainOnItsOwnOrderBlock()
+    {
+        const double j = 7690.0;
+        const double delta = 7670.0;
+        const double lag = 300.0;
+        struct Settled {
+            double first = 0.0; // the base after the first full window
+            double last = 0.0;  // the base after 64 records
+            double low = 0.0;   // the lowest and the highest base from the first one on
+            double high = 0.0;
+        };
+        const auto settle = [&](uint8_t role, double start) {
+            UnifiedQueueWindow window;
+            Settled out;
+            bool computed = false;
+            double cycle = start;
+            for (int i = 0; i < 64; ++i) {
+                const double block = std::max(0.0, cycle - delta - lag);
+                window.Push(UnifiedQueueSample_FromRecord(RoleRecord(Record(cycle, 0.0, 300.0, block), role)));
+                const UnifiedQueueResult law = window.Compute(j, Params(2, 4000.0, 0.0, 4));
+                if (!law.computable)
+                    continue; // fewer than four samples: no base yet, the interval stays
+                if (!computed) {
+                    out.first = out.low = out.high = law.base_us;
+                    computed = true;
+                }
+                out.last = law.base_us;
+                out.low = std::min(out.low, law.base_us);
+                out.high = std::max(out.high, law.base_us);
+                cycle = law.base_us; // the next frame is planned at this base and, target-bound, has it as its cycle
+            }
+            return out;
+        };
+
+        // From the capture's latched 11.4 ms: the first full window puts the base at the top of the band, 7.97 ms,
+        // it stays exactly there and never leaves the band.
+        const Settled latched = settle(kUnifiedQueueRoleRenderQueue, 11400.0);
+        CHECK(Near(latched.first, delta + lag, 1e-9) && Near(latched.last, delta + lag, 1e-9));
+        CHECK(latched.low >= delta - 1e-9 && latched.high <= delta + lag + 1e-9);
+        // Started inside the band no block is seen: the interval has gain 1 on itself and stays where it is (the
+        // neutral band).
+        const Settled inside = settle(kUnifiedQueueRoleRenderQueue, 7800.0);
+        CHECK(Near(inside.first, 7800.0, 1e-9) && Near(inside.last, 7800.0, 1e-9));
+        CHECK(inside.low >= delta - 1e-9 && inside.high <= delta + lag + 1e-9);
+        // The presenting queue from the same latch: its base holds the block and stays at 11.4 ms.
+        const Settled presenting = settle(1, 11400.0);
+        CHECK(Near(presenting.first, 11400.0, 1e-9) && Near(presenting.last, 11400.0, 1e-9));
+    }
+
     void TestRole3CreditFollowsTheReportRule()
     {
-        // Role 3 (the adopted queue is a render queue found by dependency, its hold block reads 0): the
+        // Role 3 (the adopted queue is a render queue found by dependency, its hold block the order Wait: 0 here): the
         // law is in use (I_gpu, base, q as usual) but the credit and the holds follow the report-based
         // rule: with the hold share 0 the credit and the grants are those of the same stream with the
         // law in fallback (law off here: only the reports), no hold is granted or debited by the law,
@@ -1694,8 +1828,8 @@ namespace
         }
 
         // Switching role: the credit stays continuous and no hold is spent twice. A hold granted by the
-        // law (role 0) is not debited by the report rule, and the role-3 record that follows carries no
-        // hold block, so no record will ever pay it: the measured hold (3000) settles it ONCE from the
+        // law (role 0) is not debited by the report rule, and a role-3 record pays no grant (its hold block,
+        // when it has one, is the order Wait), so no record will ever pay it: the measured hold (3000) settles it ONCE from the
         // report side at the switch (SettleOrphanedLawHolds), and the next grant (by the report rule)
         // sees the credit lower by exactly that hold. The role-3 record itself neither refills nor
         // debits.
@@ -1725,7 +1859,7 @@ namespace
     {
         // A law grant holds 3 ms and its measured hold is known, but its successor record never
         // comes: the probe session was retired by a re-adoption (or the newest record's queue became a
-        // render queue by dependency, whose hold block reads 0). The measured hold settles it once,
+        // render queue by dependency, whose hold block is the order Wait, no grant's). The measured hold settles it once,
         // from the report side; the record path cannot spend it again; a late record of the retired
         // session is dropped (counted) and does neither.
         const auto prepare = [](Rig* rig, uint64_t session, Rig::Planned* first, UnifiedHoldGrant* grant) {
@@ -2199,6 +2333,8 @@ int main()
     TestNonFrameGenerationRecordsTakeTheAttributionKey();
     TestQueueLawSummaryCounters();
     TestBaseCarriesHoldsOnlyBeyondTheCapsSlack();
+    TestRenderQueueOrderBlockIsNotNeed();
+    TestRenderQueueBaseHasNoGainOnItsOwnOrderBlock();
     TestRetiredSessionAndRole3HoldsAreSettledOnce();
     TestLawHoldIdentity();
     TestLateRecordNamingASettledGrantDoesNothing();
