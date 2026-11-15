@@ -1,7 +1,7 @@
 #pragma once
-// Present-first ordering for held frames (developer A/B switch `gpu_wait_present_first`, default off; 64-bit
-// Direct3D 12). Design: project-docs/002_unified_pacing_timing/foundation/design_present_first_hold.md; the rule and
-// the books it keeps: gpu_hold_order_rule.h, tested in tests/test_gpu_hold_order_rule.cpp.
+// Present-first ordering for held frames (developer switch `gpu_wait_present_first`, default on since 2026-11-15;
+// 64-bit Direct3D 12). Design: project-docs/002_unified_pacing_timing/foundation/design_present_first_hold.md;
+// the rule and the books it keeps: gpu_hold_order_rule.h, tested in tests/test_gpu_hold_order_rule.cpp.
 //
 // What it answers. In a game whose render queue R is not its presenting queue P (Rogue Core through Streamline's
 // proxy, no frame generation) the next frame's render work runs beside the gate's hold, and a hold that ends inside

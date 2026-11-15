@@ -399,7 +399,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.fg_present_order=ReadINIBool(S,"fg_present_order",true,P);
     g_config.fg_separate_presenter_hold=ReadINIBool(S,"fg_separate_presenter_hold",false,P);
     g_config.gpu_wait_late_guard=ReadINIBool(S,"gpu_wait_late_guard",false,P);
-    g_config.gpu_wait_present_first=ReadINIBool(S,"gpu_wait_present_first",false,P);
+    g_config.gpu_wait_present_first=ReadINIBool(S,"gpu_wait_present_first",kPacingGpuWaitPresentFirstDefault,P);
     g_config.gpu_wait_ab_interleave_s=ReadINIInt(S,"gpu_wait_ab_interleave_s",0,P);
     g_config.fg_render_break_every=ReadINIInt(S,"fg_render_break_every",0,P);
     g_config.fg_render_break_window=ReadINIInt(S,"fg_render_break_window",-1,P);
@@ -1093,12 +1093,17 @@ void ApplyConfig() {
         LOG_WARN("Diagnostic GPU wait late guard on: while the newest 64 frames all arrived late for their slot, "
                  "the limit on the GPU queue wait's lead follows their lateness and earliest heavy GPU work "
                  "(gpu_wait_late_guard=true, interleave %d s)", g_config.gpu_wait_ab_interleave_s);
-    if (g_config.gpu_wait_present_first)
-        LOG_WARN("Diagnostic GPU wait present first on: in a game whose render queue is not its presenting queue, "
-                 "the render queue's next frame waits until a held frame's Present is runnable, and the limit on "
-                 "the GPU queue wait's lead stands aside for those frames "
-                 "(gpu_wait_present_first=true, interleave %d s; 64-bit Direct3D 12)",
-                 g_config.gpu_wait_ab_interleave_s);
+    // Present-first ordering is on by default: a line only when it is off and, with it on, when the interleave
+    // switches it off in alternate periods (the period the scheduler reads: published clamped to 0-600).
+    if (g_config.gpu_wait_present_first != kPacingGpuWaitPresentFirstDefault)
+        LOG_WARN("Diagnostic GPU wait present first off: the render queue's next frame does not wait for a held "
+                 "frame's Present, and the collision guard's limit on the GPU queue wait's lead applies alone "
+                 "(gpu_wait_present_first=false; 64-bit Direct3D 12)");
+    const int interleave_s = std::clamp(g_config.gpu_wait_ab_interleave_s, 0, 600);
+    if (g_config.gpu_wait_present_first && interleave_s != 0)
+        LOG_WARN("Diagnostic GPU wait present first interleaved: present-first ordering acts only in alternate "
+                 "periods of %d s, and the plan is made without it in the others "
+                 "(gpu_wait_ab_interleave_s=%d; 64-bit Direct3D 12)", interleave_s, interleave_s);
     if (g_config.gpu_queue_probe != kPacingGpuQueueProbeDefault)
         LOG_WARN("Diagnostic GPU queue probe off: the presenting queue's submissions are not measured "
                  "(gpu_queue_probe=false; the queue law needs it and forces it on)");

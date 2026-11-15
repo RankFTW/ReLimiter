@@ -88,6 +88,10 @@ constexpr int kPacingUnifiedQueueAllowMaxUs = 20000;
 // The release headroom of the GPU queue wait's collision-aware release, the fixed distance between a release and
 // the next frame's heavy GPU work (lead_controller.h LEAD_RELEASE_HEADROOM_US). Fixed: no setting changes it.
 constexpr double kPacingGpuWaitHeadroomDefaultUs = 1000.0;
+// Developer key gpu_wait_present_first (default on since 2026-11-15: N.118 Rogue Core, N.119 Phantom Blade Zero;
+// 64-bit Direct3D 12): the unit orders only where its own evidence qualifies (the render queue is not the
+// presenting queue, no frame generation presents, the rung is the GPU queue wait); elsewhere the key does nothing.
+constexpr bool kPacingGpuWaitPresentFirstDefault = true;
 
 // ── Constants of the removed pacing settings ──
 // Each fixes the value of a setting that no longer exists. Under the unified pacer it is what

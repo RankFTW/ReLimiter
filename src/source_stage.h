@@ -152,7 +152,7 @@ struct SourceStageRequest {
     // false, for the flag only (kUpLateSeen).
     bool late_observe = false;
     // Present-first ordering of the collision guard (lead_controller.h, LeadRequest::ordered; developer key
-    // gpu_wait_present_first, default off): the render queue's next frame waits for this frame's Present. Both
+    // gpu_wait_present_first, default on): the render queue's next frame waits for this frame's Present. Both
     // planning branches hand it to the lead, and the plan carries what the lead was planned on
     // (PacingFramePlan::ordered), so the queue hooks order a frame exactly when its plan said so.
     bool ordered = false;

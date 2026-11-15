@@ -514,6 +514,9 @@ void TestPacingPipelineDefaults() {
     CHECK(g_unified_queue_upstream.load() == 0);
     CHECK(g_gpu_queue_law_feed.load() == is64 && g_gpu_queue_probe.load() == is64);
     CHECK(Value(local_path, "FrameLimiter", "gpu_queue_probe") == "true");
+    // Present-first ordering is on by default (one constant); the published switch follows the configuration.
+    CHECK(g_config.gpu_wait_present_first && kPacingGpuWaitPresentFirstDefault && g_gpu_wait_present_first.load());
+    CHECK(Value(local_path, "FrameLimiter", "gpu_wait_present_first") == "true");
     CheckProductionDefaults();
     // The startup rewrite saves every key, including the developer keys.
     CHECK(Value(local_path, "FrameLimiter", "flip_metering_off") == "false");
@@ -628,6 +631,46 @@ void TestGpuPresentGateProbesKey() {
     Config_ResetDeveloperSettings();
     CHECK(g_config.gpu_present_gate_probes && PacingPipeline_GetConfig().gpu_probes);
     CheckPipelineMatchesConfig();
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// Developer gpu_wait_present_first is on by default (kPacingGpuWaitPresentFirstDefault): a launch without the key
+// publishes it and logs nothing about it; false loads, is saved, is published, is a live key, counts as the one
+// developer override and logs one Warn line; with it on, an interleave logs one more (the interleave switches a
+// default behaviour off in alternate periods), and with it off the interleave adds none. The lines are counted,
+// not read.
+void TestGpuWaitPresentFirstIsOnByDefault() {
+    const auto launch = [](const std::vector<IniEntry>& extra) {
+        std::vector<IniEntry> ini{{"config_version", "6"}};
+        ini.insert(ini.end(), extra.begin(), extra.end());
+        Reset(false, false, ini);
+        return WarnCount("");
+    };
+    const size_t quiet = launch({});
+    CHECK(g_config.gpu_wait_present_first && g_gpu_wait_present_first.load() && Config_DeveloperOverrides() == 0);
+    CHECK(Value(local_path, "FrameLimiter", "gpu_wait_present_first") == "true");
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    CHECK(launch({{"gpu_wait_present_first", "false"}}) == quiet + 1);
+    CHECK(!g_config.gpu_wait_present_first && !g_gpu_wait_present_first.load());
+    CHECK(Value(local_path, "FrameLimiter", "gpu_wait_present_first") == "false");
+    CHECK(Config_DeveloperOverrides() == 1);
+    char error[128] = {};
+    CHECK(Config_SetLiveKey("gpu_wait_present_first", "on", error, sizeof(error)) && g_config.gpu_wait_present_first);
+    CHECK(g_gpu_wait_present_first.load() && Config_DeveloperOverrides() == 0);
+    CHECK(Config_SetLiveKey("gpu_wait_present_first", "off", error, sizeof(error)) && !g_config.gpu_wait_present_first);
+    CHECK(!g_gpu_wait_present_first.load() && Config_DeveloperOverrides() == 1);
+    Config_ResetDeveloperSettings();
+    CHECK(g_config.gpu_wait_present_first && g_gpu_wait_present_first.load() && Config_DeveloperOverrides() == 0);
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    CHECK(launch({{"gpu_wait_ab_interleave_s", "30"}}) == quiet + 1);
+    CHECK(g_config.gpu_wait_present_first && g_gpu_wait_present_first.load());
+    CHECK(g_gpu_wait_ab_interleave_s.load() == 30 && Config_DeveloperOverrides() == 1);
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    CHECK(launch({{"gpu_wait_present_first", "false"}, {"gpu_wait_ab_interleave_s", "30"}}) == quiet + 1);
+    CHECK(!g_gpu_wait_present_first.load() && Config_DeveloperOverrides() == 2);
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
@@ -2082,7 +2125,7 @@ const IniKey non_default_ini[] = {
     {"osd_preset_prev_key", "F1", "F1"}, {"osd_preset_next_key", "F2", "F2"}, {"blackout_key", "F3", "F3"},
     {"pacing_preference", "smooth", "smooth"}, {"advanced_settings", "true", "true"},
     {"developer_settings", "true", "true"}, {"config_version", "6", "6"}, {"flip_metering_off", "true", "true"},
-    {"gpu_wait_late_guard", "true", "true"}, {"gpu_wait_present_first", "true", "true"},
+    {"gpu_wait_late_guard", "true", "true"}, {"gpu_wait_present_first", "false", "false"},
     {"gpu_wait_ab_interleave_s", "30", "30"},
     {"gpu_queue_probe", "false", "false"}, {"gpu_queue_probe_source", "0", "0"},
     {"pacing_test_mode", "driver_limiter", "driver_limiter"}, {"unified_hold_share", "0.125", "0.125000"},
@@ -2165,6 +2208,8 @@ void TestIniWritesExactlyTheKeysThatExist() {
     CHECK(!g_config.shared_presets && g_config.advanced_settings && g_config.developer_settings);
     CHECK(g_config.pacing_preference == PacingPreference::Smooth && g_config.pacing_test_mode == PacingTestMode::DriverLimiter);
     CHECK(g_config.flip_metering_off && g_config.control_file && !g_config.gpu_present_gate_probes);
+    CHECK(g_config.gpu_wait_late_guard && !g_config.gpu_wait_present_first && g_config.gpu_wait_ab_interleave_s == 30);
+    CHECK(!g_gpu_wait_present_first.load());
     CHECK(!g_config.gpu_queue_probe && g_config.gpu_queue_probe_source == 0 && g_config.unified_queue_margin_end == 0);
     CHECK(g_config.unified_hold_share == 0.125 && !g_config.unified_queue_law && g_config.unified_queue_rank == 3);
     CHECK(g_config.unified_queue_need_frames == 6 && g_config.unified_queue_upstream == 1 && g_config.unified_queue_allow_us == 2500);
@@ -2282,7 +2327,7 @@ const LiveKey live_keys[] = {
     {"gpu_present_gate_probes", "off"}, {"gpu_queue_probe", "off"}, {"gpu_queue_probe_source", "0"},
     {"unified_queue_margin_end", "0"}, {"unified_hold_share", "0.1"}, {"pacing_test_mode", "reflex_only"},
     {"unified_queue_law", "off"}, {"unified_queue_rank", "3"}, {"unified_queue_need_frames", "6"},
-    {"gpu_wait_late_guard", "on"}, {"gpu_wait_present_first", "on"}, {"gpu_wait_ab_interleave_s", "30"},
+    {"gpu_wait_late_guard", "on"}, {"gpu_wait_present_first", "off"}, {"gpu_wait_ab_interleave_s", "30"},
     {"unified_queue_upstream", "1"}, {"unified_queue_allow_us", "2500"}};
 static_assert(sizeof(live_keys) / sizeof(live_keys[0]) == 18, "the contract lists 18 live keys");
 bool IsLiveKey(const std::string& key) {
@@ -2327,7 +2372,7 @@ const DeveloperField developer_fields[] = {
     {"gpu_present_gate_probes", [] { g_config.gpu_present_gate_probes = false; }, [] { return g_config.gpu_present_gate_probes; }},
     {"flip_metering_off", [] { g_config.flip_metering_off = true; }, [] { return !g_config.flip_metering_off; }},
     {"gpu_wait_late_guard", [] { g_config.gpu_wait_late_guard = true; }, [] { return !g_config.gpu_wait_late_guard; }},
-    {"gpu_wait_present_first", [] { g_config.gpu_wait_present_first = true; }, [] { return !g_config.gpu_wait_present_first; }},
+    {"gpu_wait_present_first", [] { g_config.gpu_wait_present_first = false; }, [] { return g_config.gpu_wait_present_first; }},
     {"gpu_wait_ab_interleave_s", [] { g_config.gpu_wait_ab_interleave_s = 30; }, [] { return g_config.gpu_wait_ab_interleave_s == 0; }},
     {"control_file", [] { g_config.control_file = true; }, [] { return !g_config.control_file; }},
     {"gpu_queue_probe", [] { g_config.gpu_queue_probe = false; }, [] { return g_config.gpu_queue_probe; }},
@@ -2562,6 +2607,7 @@ int main() {
     TestQueueDefaultsMigration();
     TestDeveloperSettingsReset();
     TestGpuPresentGateProbesKey();
+    TestGpuWaitPresentFirstIsOnByDefault();
     TestUnifiedHoldShareKey();
     TestUnifiedQueueLawKeys();
     TestUnifiedQueueNeedFramesKey();

@@ -234,7 +234,7 @@ constexpr size_t LEAD_CONCURRENCY_SAMPLES = 64;
 // pairs start p50 0.7-0.9 ms before the Signal.
 constexpr double LEAD_CONCURRENCY_TOLERANCE_US = 100.0;
 
-// Present-first ordering (developer key gpu_wait_present_first, default off; gpu_hold_order.h; design in
+// Present-first ordering (developer key gpu_wait_present_first, default on; gpu_hold_order.h; design in
 // project-docs/002_unified_pacing_timing/foundation/design_present_first_hold.md). The queue order above is
 // inferred from the pairs, and a game whose render queue is not its presenting queue (Rogue Core through
 // Streamline's proxy) fails it: the next frame's heavy work runs beside the hold, a hold that ends inside
@@ -518,7 +518,7 @@ struct LeadRequest {
     // Judge the state's condition without applying it (the off period of developer key
     // gpu_wait_ab_interleave_s): LeadGuardOutcome::late_seen.
     bool late_observe = false;
-    // Present-first ordering (developer key gpu_wait_present_first, default off; above): the render queue's
+    // Present-first ordering (developer key gpu_wait_present_first, default on; above): the render queue's
     // next frame waits for this frame's Present. The owner sets it from the key, the interleave's period and
     // the unit's able word (g_gpu_hold_order_able) and hands the same word to the gate as the plan's
     // (PacingFramePlan::ordered). On the GPU queue wait the collision guard then stands aside while the Reflex

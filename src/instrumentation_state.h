@@ -38,10 +38,11 @@ inline std::atomic<int> g_unified_queue_margin_end{1};
 // resolves no target past the guard's limit. Published by Config_ApplyPacingPipeline; read by the scheduler
 // owner at each plan.
 inline std::atomic<bool> g_gpu_wait_late_guard{false};
-// Developer A/B switch gpu_wait_present_first (default off; gpu_hold_order.h): in a game whose render queue is
-// not its presenting queue, the render queue's next frame waits until a held frame's Present has become
-// runnable, and the collision guard stands aside for the frames so ordered (LeadRequest::ordered). Published
-// and read as the switch above.
+// Developer switch gpu_wait_present_first (default on, kPacingGpuWaitPresentFirstDefault; gpu_hold_order.h): in a
+// game whose render queue is not its presenting queue, the render queue's next frame waits until a held frame's
+// Present has become runnable, and the collision guard stands aside for the frames so ordered
+// (LeadRequest::ordered). Published and read as the switch above. Its own initial value stays false: nothing is
+// ordered before the configuration is published.
 inline std::atomic<bool> g_gpu_wait_present_first{false};
 // The present-first unit can impose that order on the bound queues (its rule is in Ordering). Written by the
 // unit (gpu_hold_order.cpp, any thread); read by the scheduler owner at each plan, which orders a frame only
