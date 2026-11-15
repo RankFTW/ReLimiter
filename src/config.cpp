@@ -398,6 +398,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.gpu_queue_probe_source=ReadINIInt(S,"gpu_queue_probe_source",kPacingGpuQueueProbeSourceDefault,P);
     g_config.fg_present_order=ReadINIBool(S,"fg_present_order",true,P);
     g_config.fg_separate_presenter_hold=ReadINIBool(S,"fg_separate_presenter_hold",false,P);
+    g_config.fg_present_order_trailing=ReadINIBool(S,"fg_present_order_trailing",false,P);
     g_config.gpu_wait_late_guard=ReadINIBool(S,"gpu_wait_late_guard",false,P);
     g_config.gpu_wait_present_first=ReadINIBool(S,"gpu_wait_present_first",kPacingGpuWaitPresentFirstDefault,P);
     g_config.gpu_wait_ab_interleave_s=ReadINIInt(S,"gpu_wait_ab_interleave_s",0,P);
@@ -898,6 +899,7 @@ void Config_ApplyPacingPipeline() {
     g_unified_queue_margin_end.store(sizeof(void*) == 8 ? g_config.unified_queue_margin_end : 0, std::memory_order_relaxed);
     g_fg_present_order.store(sizeof(void*) == 8 && g_config.fg_present_order, std::memory_order_relaxed);
     g_fg_separate_presenter_hold.store(g_config.fg_separate_presenter_hold, std::memory_order_relaxed);
+    g_fg_present_order_trailing.store(sizeof(void*) == 8 && g_config.fg_present_order_trailing, std::memory_order_relaxed);
     g_gpu_wait_late_guard.store(g_config.gpu_wait_late_guard, std::memory_order_relaxed);
     g_gpu_wait_present_first.store(g_config.gpu_wait_present_first, std::memory_order_relaxed);
     g_gpu_wait_ab_interleave_s.store(std::clamp(g_config.gpu_wait_ab_interleave_s, 0, 600), std::memory_order_relaxed);
@@ -906,9 +908,9 @@ void Config_ApplyPacingPipeline() {
 }
 
 // ── Live keys (developer control file) ──
-// The keys the OSD changes at runtime, parsed strictly (an INI read falls
-// back to a default instead). Each writes its g_config field only when the
-// text parses.
+// The keys the OSD changes at runtime and the developer A/B switches, parsed
+// strictly (an INI read falls back to a default instead). Each writes its
+// g_config field only when the text parses.
 namespace live_key {
 bool ParseBool(const char* text, bool* value) {
     static const char* const kTrue[] = {"true", "1", "yes", "on"};
@@ -958,6 +960,7 @@ constexpr Key kKeys[] = {
     {"gpu_queue_probe_source", &SetInt<&Config::gpu_queue_probe_source>, Publish::Pipeline},
     {"fg_present_order", &SetBool<&Config::fg_present_order>, Publish::Pipeline},
     {"fg_separate_presenter_hold", &SetBool<&Config::fg_separate_presenter_hold>, Publish::Pipeline},
+    {"fg_present_order_trailing", &SetBool<&Config::fg_present_order_trailing>, Publish::Pipeline},
     {"gpu_wait_late_guard", &SetBool<&Config::gpu_wait_late_guard>, Publish::Pipeline},
     {"gpu_wait_present_first", &SetBool<&Config::gpu_wait_present_first>, Publish::Pipeline},
     {"gpu_wait_ab_interleave_s", &SetInt<&Config::gpu_wait_ab_interleave_s>, Publish::Pipeline},

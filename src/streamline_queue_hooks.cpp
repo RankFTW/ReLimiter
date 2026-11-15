@@ -83,6 +83,10 @@ void STDMETHODCALLTYPE ObserveExecute(ID3D12CommandQueue* queue, UINT count, ID3
     // The probe's done Signal goes first, directly behind the game's call: whatever the
     // Streamline handoff enqueues after it belongs to what follows.
     GpuQueueProbe_ExecuteLeave(probe);
+    // fg_present_order_trailing (key off: one load and a branch): the outermost submission that went on its queue. It
+    // is the anchor when it is the presenting thread's first after a Present: the unit's own Signal then goes directly
+    // behind it (and the probe's done Signal), through the original (no detour sees it).
+    if (depth == 1 && !callback.IsStopping()) FgPresentOrder_AfterExecute(queue, count, original_signal);
     if (!callback.IsStopping() && depth == 1 && streamline_ready.load(std::memory_order_acquire))
         StreamlineHandoff_Execute(queue);
     SetLastError(outgoing);

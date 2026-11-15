@@ -2316,8 +2316,9 @@ void TestEachRemovedKeyAloneIsDroppedAndNeverSaved() {
     }
 }
 
-// The live keys are the 15 below, written once here as the fixture of the contract: each is accepted with a value of its
-// own, is a key the INI carries, and every other key the INI carries is refused as not live and changes nothing.
+// The live keys the INI carries are the ones below, written once here as the fixture of the contract: each is accepted
+// with a value of its own, and every other key the INI carries is refused as not live and changes nothing. (The frame
+// generation ordering switches are live too; the INI only reads them, so they are not part of this list.)
 struct LiveKey {
     const char* key;
     const char* value;

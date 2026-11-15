@@ -33,6 +33,44 @@
 // and Wait. Frame generation, ordering: per frame one queue Signal, one queue Wait, one event registration on the
 // game's Present thread and one fence Signal on DLSS-G's presenting thread.
 //
+// Trailing release (developer A/B switch `fg_present_order_trailing`, default off; design:
+// project-docs/002_unified_pacing_timing/foundation/design_fg_order_trailing_release.md). The release above is made
+// when the generated frame's native Present has returned, and DLSS-G's presenting thread then submits one more packet
+// and queues two Signals on its presenting queue (36 to 56 µs later in 97% of the frames of Phantom Blade Zero), which
+// land behind the render queue's batch that the release has just let go. With the switch on, while the unit orders and
+// after the evidence of the rule (fg_present_order_rule.h, FgPresentOrderTrailingRule), the release is deferred: the
+// Present's return remembers it (the marker value, the time, its thread), and that thread's first outermost submission
+// on a queue after the Present is the anchor (FgPresentOrder_AfterExecute, in the Execute detour directly behind the
+// native call). Behind the anchor, on its queue, the unit enqueues a Signal of its own fence `trailed` with the
+// marker's value; it completes on the GPU when the queue has finished what the thread submitted, and the unit's
+// thread, woken by the fence's event, signals the order fence from the CPU as the watchdog does. A bare Signal of the
+// thread is no anchor: a presenter that only signals after its Present would qualify and pay for nothing.
+// Evidence: while the rule observes the release is made at the return as before, and a Present counts as followed when
+// its anchor came before the deadline the watchdog applies to that marker (its wake for the marker plus the bound),
+// on a queue that suits; fourteen of sixteen, all on one queue, enter. While it defers, a release the watchdog has to
+// make is missing (no anchor before the deadline, or its Signal could not be enqueued) or late (the anchor came and
+// the Signal was enqueued, but had not completed); at the third of either in a block of sixteen the rule leaves: for
+// Stopped when the late ones alone are three (a queue whose work waits for the render queue shows only here, and
+// observing it would enter again for good), or when it is the third leave in a row, one more than the tolerance of two,
+// with no block of sixteen that went well between (a presenter whose anchor comes in time while the render queue runs
+// and not while it is held would observe, defer, lose three and observe again, for ever); else to observing. Stopped
+// releases at the return
+// until the binding, the presenting queue or the key changes, not for a new stretch of the ordering.
+// One writer per fence: `trailed` is written by queue Signals of one queue only (a queue Signal sets a fence even
+// downwards, so a second writer could set it back), with rising values, each taken and enqueued as one step, and a
+// new queue only once everything signalled so far has completed; the order fence by the CPU only, under the release
+// lock. The queue is the one the anchor arrived on, never the render queue (its Signal would stand behind the unit's
+// own Wait for good) and only a queue of the render queue's device, read from the queue at every anchor, once per
+// frame, and never remembered (a native queue's destruction does not always reach the unit; `trailed` is created on
+// that device). The watchdog's bound is unchanged and it takes its locks at the deadline: with the key on it is the
+// only releaser of what no anchor's Signal releases. While a release is deferred no Present releases anything (at 3x
+// and 4x, not yet
+// seen in a trace, the thread may present more than once before it submits its work), but one that returns meanwhile
+// is still told to the breaks. Key off: the release is made as before, byte for byte, nothing more is made at the
+// bind, and each outermost Execute pays one relaxed load and a branch. Key on: a thread-id compare there; per frame
+// one clock read at the Present's return, one queue Signal and one event registration on the presenting thread, and
+// one more wake of the unit's thread.
+//
 // The unit is part of the add-on only (RELIMITER_FG_PRESENT_ORDER, set for the add-on target): every other target
 // that compiles a caller gets the no-op forms below.
 #include <atomic>
@@ -48,6 +86,9 @@ inline std::atomic<uint64_t> g_fg_present_order_issued{0}, g_fg_present_order_re
 // less even, N.102), the ground on which such a presenter's cycles stand without a worker-local Present.
 inline std::atomic<void*> g_fg_present_order_queue{nullptr};
 inline std::atomic<bool> g_fg_separate_presenter_hold{false};
+// Developer A/B switch `fg_present_order_trailing` (default off; published by the configuration, 64-bit only): the
+// release is deferred behind the work the presenting thread queues after the Present (see Trailing release above).
+inline std::atomic<bool> g_fg_present_order_trailing{false};
 // The render queue is ordered only while the key is on: the qualification stays published when the key is turned
 // off, so every reader takes the key with it.
 inline bool FgPresentOrder_Orders(const void* queue) noexcept {
@@ -75,6 +116,8 @@ struct ID3D12Fence;
 using FgPresentOrder_FenceFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
 
 void FgPresentOrder_NoteSignalActive(void* queue, void* fence) noexcept;
+void FgPresentOrder_AfterExecuteActive(ID3D12CommandQueue* queue, unsigned lists,
+    FgPresentOrder_FenceFn native_signal) noexcept;
 void FgPresentOrder_AfterWaitActive(ID3D12CommandQueue* queue, ID3D12Fence* fence, FgPresentOrder_FenceFn native_signal,
     FgPresentOrder_FenceFn native_wait) noexcept;
 void FgPresentOrder_ReleaseActive(bool watchdog) noexcept;
@@ -104,6 +147,15 @@ inline void FgPresentOrder_BeforeExecute(ID3D12CommandQueue* queue, FgPresentOrd
         g_fg_present_order_queue.load(std::memory_order_relaxed) == queue)
         FgPresentOrder_BeforeExecuteActive(queue, native_signal, native_wait);
 }
+// Queue Execute detour, after the native call returned and the probe's done Signal went on, outermost calls only (key
+// off: one load and a branch). `native_signal` is the detour's atomic slot of the native Signal, read only with the
+// key on. The presenting thread's first submission after a Present is the anchor the trailing release waits behind.
+template <class SignalSlot>
+inline void FgPresentOrder_AfterExecute(ID3D12CommandQueue* queue, unsigned lists,
+    const SignalSlot& native_signal) noexcept {
+    if (g_fg_present_order_trailing.load(std::memory_order_relaxed))
+        FgPresentOrder_AfterExecuteActive(queue, lists, native_signal.load(std::memory_order_acquire));
+}
 // Native Present entries, after the native call returned (nothing pending: three loads and a branch).
 inline void FgPresentOrder_AfterNativePresent() noexcept {
     if (g_fg_present_order_issued.load(std::memory_order_relaxed) !=
@@ -112,6 +164,7 @@ inline void FgPresentOrder_AfterNativePresent() noexcept {
 }
 #else
 inline void FgPresentOrder_NoteSignal(void*, void*) noexcept {}
+template <class... Arguments> inline void FgPresentOrder_AfterExecute(Arguments&&...) noexcept {}
 template <class... Arguments> inline void FgPresentOrder_AfterWait(Arguments&&...) noexcept {}
 template <class... Arguments> inline void FgPresentOrder_BeforeExecute(Arguments&&...) noexcept {}
 inline void FgPresentOrder_AfterNativePresent() noexcept {}
