@@ -709,6 +709,9 @@ void LeadController::OnGpuReport(uint32_t producer_epoch, uint64_t frame_id, con
         frame.gpu_span_us = report.span_us;
         frame.first_work_streamed = report.first_work_streamed;
         frame.gpu_start_qpc = report.start_qpc > 0 ? report.start_qpc : 0;
+        // A start and no end: the driver lost this frame's completion, so the start it stamps on the next frame
+        // is not that frame's work (RecordConcurrency).
+        frame.gpu_end_missing = report.start_qpc > 0 && report.end_qpc <= 0;
         // Any report of a frame planned with the GPU queue wait's lead keeps
         // the work window current, whether or not it adds a D sample, and is
         // the report an ordered plan's stand-aside waits for after a reset.
@@ -1083,7 +1086,10 @@ void LeadController::RecordReleaseHeadroom(PendingFrame* frame) noexcept
 // wait the next frame's GPU start is compared with: it goes to the window of
 // n's own regime (present-first ordering, lead_controller.h), whatever frame
 // n + 1's plan said, as the lead sample of frame n + 1 takes n's regime too
-// (SampleBehindWait).
+// (SampleBehindWait). No pair when frame n's own report has a GPU start and no
+// GPU render end: the driver lost its completion, and the start it stamps on
+// frame n + 1 is then not that frame's work. Such a pair is counted and enters
+// no window; a frame n without any report is judged as before.
 void LeadController::RecordConcurrency(PendingFrame* frame) noexcept
 {
     if (frame == nullptr || frame->concurrency_recorded || !IsGpuRung(frame->rung)) return;
@@ -1102,6 +1108,13 @@ void LeadController::RecordConcurrency(PendingFrame* frame) noexcept
     // release that could have run beside the wait: no pair.
     if (next->gpu_start_qpc <= 0 || !HasField(*next, FieldRenderSubmit) ||
         next->qpc[FieldRenderSubmit] > release_qpc) {
+        return;
+    }
+    // The driver lost frame n's completion (its report has a GPU start and no GPU render end): the start it
+    // stamps on frame n + 1 is then not a measurement of that frame's work, so the pair is no sample of any
+    // window. Counted, so that the log can say how many were left out.
+    if (frame->gpu_end_missing) {
+        ++statistics_.concurrency_end_missing;
         return;
     }
     const double start_us = MicrosecondsBetween(release_qpc, next->gpu_start_qpc);

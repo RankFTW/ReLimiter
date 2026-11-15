@@ -212,6 +212,14 @@ constexpr double LEAD_LATE_ARRIVAL_US = 100.0; // kUnifiedLateReleaseUs
 // need a pair on every frame: a pair needs a waited frame whose next frame
 // had begun submitting by the release, and frames without one cannot collide
 // (CONTROL Resonant: gaps of up to 362 GPU queue wait frames between pairs).
+// A pair whose frame n has a GPU start and no GPU render end in its own report is no pair: the driver lost
+// that frame's completion, and the start it then stamps on frame n + 1 is not a measurement of that frame's
+// work. In ordered runs (11 runs, 40 pairs that brought the guard back) it was so for 38: the next frame's
+// reported start lay 1 to 6 ms before the release, the held frame's own readiness, where the queue probe saw
+// that frame's first start 0.5 to 3.3 ms after it (the two others were at hitches); about 0.2% of reports
+// lack the end, and where they are complete the next frame's start is 0.27 to 0.47 ms after the release,
+// never before. Such a pair enters no window, of either output or regime, and is counted
+// (LeadStatistics::concurrency_end_missing); the missing end is the mark, no limit on a time decides it.
 // Behind the wait the GPU queue wait's guards stand aside, and on both GPU
 // outputs the lead sample leaves out the frame's wait for the GPU to finish
 // frame n − 1 (LeadController::SampleUs), except for a frame the cap released
@@ -417,6 +425,9 @@ struct LeadGpuReport {
     double active_us = 0.0; // gpuActiveRenderTimeUs: the frame's GPU busy time A (> 0)
     double span_us = 0.0;   // gpuRenderEndTime − gpuRenderStartTime on the driver's clock; 0 unknown
     int64_t start_qpc = 0;  // gpuRenderStartTime as QPC through the stable clock map; 0 unknown
+    // gpuRenderEndTime as QPC through the stable clock map; 0 unknown. A report that has a start and no end is
+    // a frame whose completion the driver lost (OnGpuReport, RecordConcurrency).
+    int64_t end_qpc = 0;
     // The frame's first work reached the driver in the first half of its
     // render submission (HandoffFirstWorkStreams on its own driverStartTime
     // and RENDERSUBMIT_START/END); false when unknown.
@@ -573,6 +584,9 @@ struct LeadStatistics {
     uint64_t ordered_concurrency_samples = 0;
     uint64_t ordered_concurrent_samples = 0;
     double last_ordered_concurrency_us = 0.0;
+    // Pairs left out because the waited frame's own report had a GPU start and no GPU render end (the driver
+    // lost its completion): in no window, of either output or regime (RecordConcurrency).
+    uint64_t concurrency_end_missing = 0;
     uint64_t incomplete_dropped = 0; // planned frames closed without their own stage times
     uint64_t unmatched_events = 0;   // stage events without a matching planned frame
     uint64_t missing_ready = 0;      // H3 frames closed without r
@@ -868,6 +882,7 @@ private:
         bool late_state = false;         // planned in the late state: its successor adds no D to the work window
         bool ordered = false;            // planned ordered: its pair, its successor's D and sample are that regime's
         bool late_work_recorded = false; // its D entered the late state's ring, or was given up
+        bool gpu_end_missing = false;    // its report had a GPU start and no GPU render end (LeadGpuReport::end_qpc)
     };
 
     // Late state: the newest LEAD_LATE_FRAMES values with the grid index each belongs to.

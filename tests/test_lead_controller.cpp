@@ -91,14 +91,20 @@ namespace
 
     // The Reflex report of frame (epoch, frame_id): GPU active time A, GPU
     // start and span (by default A: the GPU did not idle inside the frame),
-    // and whether its first work streamed.
+    // and whether its first work streamed. A report that has a start has its
+    // GPU render end too, span_us after it, unless end_reported is false: the
+    // driver lost the frame's completion, so the report has a start and no end.
     void Report(LeadController* controller, uint32_t producer_epoch, uint64_t frame_id, double active_us,
-        int64_t start_qpc = 0, double span_us = -1.0, bool streamed = true)
+        int64_t start_qpc = 0, double span_us = -1.0, bool streamed = true, bool end_reported = true)
     {
         LeadGpuReport report{};
         report.active_us = active_us;
         report.span_us = span_us < 0.0 ? active_us : span_us;
         report.start_qpc = start_qpc;
+        if (start_qpc > 0 && end_reported) {
+            report.end_qpc = start_qpc +
+                (std::isfinite(report.span_us) ? static_cast<int64_t>(std::llround(report.span_us * 10.0)) : 0);
+        }
         report.first_work_streamed = streamed;
         controller->OnGpuReport(producer_epoch, frame_id, report);
     }
@@ -2779,6 +2785,7 @@ namespace
             report.active_us = 7000.0;
             report.span_us = 7000.0;
             report.start_qpc = Qpc(gpu_start);
+            report.end_qpc = Qpc(gpu_start + 7000.0);
             report.first_work_streamed = streamed;
             report.first_submission_delay_us = 500.0;
             controller->OnGpuReport(Key(n).producer_epoch, Key(n).frame_id, report);
@@ -2990,6 +2997,7 @@ namespace
             report.active_us = 7000.0;
             report.span_us = 7000.0;
             report.start_qpc = Qpc(gpu_start);
+            report.end_qpc = Qpc(gpu_start + 7000.0);
             report.first_work_streamed = true;
             report.first_submission_delay_us = 500.0;
             controller->OnGpuReport(Key(n).producer_epoch, Key(n).frame_id, report);
@@ -4047,6 +4055,91 @@ void TestPresentFirstOrder()
     }
 }
 
+// A queue-order pair whose waited frame n has a Reflex report with a GPU start and no GPU render end is no pair:
+// the driver lost frame n's completion, and the start it stamps on frame n + 1 is then not that frame's work (it
+// lies before the release, which reads as concurrent work). It enters no window, for the built behind-wait
+// case and for the ordered one, does not bring the guard back and is counted; the next complete pair counts as
+// before.
+void TestPairNeedsRenderEnd()
+{
+    auto controller = MakeController();
+    uint64_t index = 201;
+    // One pair as in TestPresentFirstOrder: frame n's GPU waits at its gate (o = s + 6,000, the probe 500 µs
+    // before it) and frame n + 1, released at s + 4,000 and submitting from s + 5,000, starts its GPU work
+    // gpu_start_us after s (6,050 is clean, 5,000 is 1 ms before the release: concurrent). Frame n's own report
+    // has its GPU start 1,500 µs after s and, unless the driver lost its completion (end_n false), its end.
+    const auto pair = [&](bool ordered, double gpu_start_us, bool end_n) {
+        const double s = static_cast<double>(index) * kInterval;
+        LeadFrameStart first = Start(index, PacingRung::GpuQueueWait, s);
+        first.guard.ordered = ordered;
+        controller->OnSourceRelease(first);
+        controller->OnStageEvent(Event(index, Kind::PresentCall, s + 1000.0));
+        controller->OnStageEvent(Event(index, Kind::GpuReady, s + 2000.0));
+        controller->OnStageEvent(Event(index, Kind::OutputRelease, s + 6000.0));
+        controller->OnStageEvent(Resume(index, s + 6100.0, s + 5500.0));
+        Report(controller.get(), Key(index).producer_epoch, Key(index).frame_id, 1000.0, Qpc(s + 1500.0), 1000.0,
+            true, end_n);
+        const uint64_t next = index + 1;
+        LeadFrameStart second = Start(next, PacingRung::GpuQueueWait, s + 4000.0);
+        second.guard.ordered = ordered;
+        controller->OnSourceRelease(second);
+        controller->OnStageEvent(Event(next, Kind::RenderSubmitStart, s + 5000.0));
+        controller->OnStageEvent(Event(next, Kind::PresentCall, s + 9000.0));
+        controller->OnStageEvent(Event(next, Kind::GpuReady, s + 14000.0));
+        controller->OnStageEvent(Event(next, Kind::OutputRelease, s + 14000.0, PacingPlanStatus::Late));
+        Report(controller.get(), Key(next).producer_epoch, Key(next).frame_id, 6000.0, Qpc(s + gpu_start_us), 6000.0);
+        index += 2;
+    };
+    // 41 waited frames planned as built warm X, C and D (TestHeadroomGuardLimitsLead), with their reports.
+    const auto warm = [&]() {
+        for (uint64_t frame = 0; frame < 41; ++frame) FeedWorkFrame(controller.get(), 1 + frame, 6000.0);
+    };
+    const PacingRung rung = PacingRung::GpuQueueWait;
+
+    // Built: 32 clean pairs of frames with complete reports make the verdict. A pair that looks concurrent but
+    // whose frame n has no GPU render end is left out: the verdict stands, nothing enters the window, the pair
+    // is counted. The next complete concurrent pair counts as before and brings the guard back.
+    warm();
+    for (uint32_t n = 0; n < LEAD_WARM_SAMPLES; ++n) pair(false, 6050.0, true);
+    CHECK(controller->ConcurrencyPairs(rung) == LEAD_WARM_SAMPLES && controller->ConcurrentPairs(rung) == 0);
+    CHECK(controller->Statistics().concurrency_end_missing == 0);
+    CHECK(controller->NextGpuWorkBehindWait(rung, 1.0));
+    pair(false, 5000.0, false);
+    CHECK(controller->ConcurrencyPairs(rung) == LEAD_WARM_SAMPLES && controller->ConcurrentPairs(rung) == 0);
+    CHECK(controller->Statistics().concurrency_samples == LEAD_WARM_SAMPLES);
+    CHECK(controller->Statistics().concurrent_samples == 0 && controller->Statistics().concurrency_end_missing == 1);
+    CHECK_NEAR(controller->Statistics().last_concurrency_us, 50.0); // the newest recorded pair is still a clean one
+    CHECK(controller->NextGpuWorkBehindWait(rung, 1.0));
+    pair(false, 5000.0, true);
+    CHECK(controller->ConcurrencyPairs(rung) == LEAD_WARM_SAMPLES + 1 && controller->ConcurrentPairs(rung) == 1);
+    CHECK_NEAR(controller->Statistics().last_concurrency_us, -1000.0);
+    CHECK(controller->Statistics().concurrency_end_missing == 1);
+    CHECK(!controller->NextGpuWorkBehindWait(rung, 1.0));
+
+    // Ordered: the ordered request stands aside on an empty ordered window; the pair of frames planned ordered
+    // that lost its end enters no window and does not bring the guard back, the complete one does.
+    controller = MakeController();
+    warm();
+    LeadRequest request = Request(rung, 500.0, 7000.0);
+    request.collision_guard = true;
+    request.ordered = true;
+    LeadGuardOutcome guard{};
+    controller->NextLeadUs(request, nullptr, &guard);
+    CHECK(controller->NextGpuWorkBehindWait(rung, 1.0));
+    pair(true, 5000.0, false);
+    CHECK(controller->OrderedConcurrencyPairs() == 0 && controller->OrderedConcurrentPairs() == 0);
+    CHECK(controller->Statistics().ordered_concurrency_samples == 0 && controller->ConcurrencyPairs(rung) == 0);
+    CHECK(controller->Statistics().concurrency_end_missing == 1);
+    CHECK(controller->NextGpuWorkBehindWait(rung, 1.0));
+    pair(true, 5000.0, true);
+    CHECK(controller->OrderedConcurrencyPairs() == 1 && controller->OrderedConcurrentPairs() == 1);
+    CHECK_NEAR(controller->Statistics().last_ordered_concurrency_us, -1000.0);
+    CHECK(controller->Statistics().concurrency_end_missing == 1);
+    CHECK(!controller->NextGpuWorkBehindWait(rung, 1.0));
+    pair(true, 6050.0, true);
+    CHECK(controller->OrderedConcurrencyPairs() == 2 && controller->OrderedConcurrentPairs() == 1);
+}
+
 int main()
 {
     std::printf("sizeof(LeadController) = %zu bytes\n", sizeof(LeadController));
@@ -4112,6 +4205,7 @@ int main()
     TestSaturationReportLifetime();
     TestLateStateGuard();
     TestPresentFirstOrder();
+    TestPairNeedsRenderEnd();
 
     if (s_failures != 0) {
         std::fprintf(stderr, "%d lead controller checks failed\n", s_failures);

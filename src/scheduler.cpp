@@ -965,12 +965,13 @@ static void DrainReflexReports(const PacingPipelineConfig& config) noexcept
                 sample.frame_id, queue_wait_us, sample.gpu_active_us, sample.ai_frame_us);
         }
         // The release headroom's heavy-work start r − A, the queue-order
-        // test's GPU start and the lead sample behind the wait (lead_controller.h).
+        // test's GPU start and end and the lead sample behind the wait (lead_controller.h).
         if (sample.gpu_active_us > 0.0) {
             LeadGpuReport report{};
             report.active_us = sample.gpu_active_us;
             report.span_us = sample.gpu_render_duration_us;
             report.start_qpc = sample.gpu_start_qpc;
+            report.end_qpc = sample.gpu_end_qpc;
             report.first_work_streamed = sample.first_work_streamed;
             report.first_submission_delay_us = sample.first_submission_delay_us;
             s_source_stage.OnGpuReport(sample.producer_epoch, sample.frame_id, report);
