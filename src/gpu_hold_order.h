@@ -22,9 +22,13 @@
 // Present is runnable); at once when the frame's hold is over (its target has come) while R has not reached its Wait,
 // or has none yet, since a frame that is late for its slot has no hold left to protect and must not pay for the order;
 // and a bound after R stood at the Wait (the watchdog: for what the check cannot see, a dependency through a third
-// queue or a CPU-signalled fence). Three watchdog releases, in any state of the rule, stop the unit for the binding
-// (gpu_hold_order_rule.h). A Signal that fails to free the Waits of a dropped binding keeps the order fence, and the
-// release thread, until it goes through.
+// queue or a CPU-signalled fence). A watchdog release is a trip only when the gate had released the hold: while its
+// release is not recorded the Present could not run whatever R did (the runtime can hold up the gate's own Signal of
+// its time fence for tens of milliseconds), so the Wait is let go, counted and said, and the rule is told nothing.
+// Three trips stop the unit for the binding, unless GpuHoldOrderRule::kForgive ordered frames released by their
+// Present came after one of them (gpu_hold_order_rule.h): a cycle the check cannot see stalls at every entry into
+// Ordering, a hitch does not. A Signal that fails to free the Waits of a dropped binding keeps the order fence, and
+// the release thread, until it goes through.
 //
 // Evidence. Every held frame the gate commits is told to the unit while the key is on, ordered or not, and judged at
 // its edge: qualified, or not. The unit publishes `able` (g_gpu_hold_order_able) once sixteen in a row qualified;
@@ -100,8 +104,9 @@ inline void GpuHoldOrder_OnHold(ID3D12CommandQueue* present_queue, const void* h
             ordered, swapchain_generation);
 }
 // The gate's worker, right after it released a hold (beside GpuQueueProbe_OnHoldRelease): the release is recorded in a
-// lock-free table (the probe is told its time, the watchdog's line says it) and the release thread woken; nothing
-// here waits for a lock of the unit.
+// lock-free table (the probe is told its time; the watchdog tells the gate's delay from a trip by it: a hold whose
+// release is not recorded is one the gate has not released) and the release thread woken; nothing here waits for a
+// lock of the unit.
 inline void GpuHoldOrder_OnGateRelease(const void* hold_fence, uint64_t hold_ticket, int64_t release_qpc) noexcept {
     if (g_gpu_wait_present_first.load(std::memory_order_relaxed))
         GpuHoldOrder_OnGateReleaseActive(hold_fence, hold_ticket, release_qpc);

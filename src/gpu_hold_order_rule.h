@@ -10,35 +10,50 @@
 //   Probe     Nothing is able. A block of kRun held frames that all qualified leads to Ordering; a frame that did
 //             not qualify starts the block again.
 //   Ordering  The unit is able: plans may be ordered and the render queue waits for each ordered frame's Present.
-//             A frame that does not qualify leads back to Probe (nothing was paid). A watchdog release (the
-//             Present did not become runnable within the bound although its hold was over and the render queue
-//             stood at the Wait) is a trip in every state but Off: it leads back to Probe (or stays there) and the
-//             kTrips-th trip leads to Off.
+//             A frame that does not qualify leads back to Probe (nothing was paid). A trip leads back to Probe (or
+//             stays there) and the kTrips-th trip leads to Off.
 //   Off       Nothing is enqueued until the caller resets the rule (a new binding, the key, a restart). It does
 //             not come back by itself: a game whose order cannot be imposed must not pay a late frame every few
 //             seconds.
 //
+// A trip is a watchdog release of a Wait whose hold the gate had released: the Present did not become runnable
+// within the bound although its hold was over and the render queue stood at the Wait, and the Wait may be what held
+// it up. It counts in every state but Off (a Wait enqueued in Ordering may be released after the rule fell back to
+// Probe and stalled the render queue all the same). A watchdog release while the gate's own release of the hold is
+// still outstanding is not told to the rule: the runtime can hold the gate's Signal of its time fence for tens of
+// milliseconds, the Present could not run whatever the render queue did, and the order is not what stalled.
+//
+// Trips are forgiven by clean running. A cycle the boundary check cannot see recurs with the frames: every entry
+// into Ordering stalls at once, with no ordered frame released by its Present in between, so its trips follow each
+// other within a few blocks of kRun frames. A hitch does not recur like that: ordered frames are released by their
+// Present after it. OnReleased() is told for every ordered frame's Wait that its Present released (not for a late
+// frame's release, not for the watchdog's); kForgive of them in a row, with no trip between, take the trips back.
+// kTrips trips with fewer than kForgive such releases after each of them turn the rule Off; a long session of
+// ordinary hitches does not.
+//
 // Able() is what the scheduler reads: Ordering. Orders() is what the hooks obey for a frame whose plan was already
 // made ordered: a plan is made before the edge of the frame before it is judged, so a frame can be planned ordered
 // (and the collision guard stand aside for it) just as the rule falls back to Probe. The hooks keep to the plan, and
-// the frame's own boundary check keeps it safe, until a watchdog release or Off says the order itself is not to be
-// trusted; a whole block of qualified frames (Ordering again) trusts it anew.
+// the frame's own boundary check keeps it safe, until a trip or Off says the order itself is not to be trusted; a
+// whole block of qualified frames (Ordering again) trusts it anew.
 //
 // The bound is a share of the interval, so the most a failed order costs a frame is the same share at every frame
-// rate, and over a binding it costs at most kTrips frames.
+// rate. A cycle the check cannot see costs at most kTrips of them over a binding; a stall that comes less often than
+// once in kForgive ordered frames costs one of them each time, and does not turn the rule Off.
 #include <cstdint>
 
 struct GpuHoldOrderRule {
     static constexpr unsigned kRun = 16;
     static constexpr unsigned kTrips = 3;
+    static constexpr unsigned kForgive = 256;     // ordered frames released by their Present in a row that forgive the trips
     static constexpr unsigned kBoundShare = 4;    // the bound is a quarter of the interval
     static constexpr unsigned kBoundLeastUs = 1000, kBoundMostUs = 4000;
     enum class State : uint8_t { Probe, Ordering, Off };
     enum class Change : uint8_t { None, Ordering, Probe, Off };
 
     State state = State::Probe;
-    unsigned qualified = 0, trips = 0;
-    bool tripped = false;   // a watchdog release since the rule last entered Ordering
+    unsigned qualified = 0, trips = 0, clean = 0;   // clean: releases by the Present since the last trip
+    bool tripped = false;   // a trip since the rule last entered Ordering
 
     void Reset() noexcept { *this = GpuHoldOrderRule{}; }
 
@@ -68,16 +83,28 @@ struct GpuHoldOrderRule {
         state = State::Probe;
         return Change::Probe;
     }
-    // The watchdog released an ordered frame's Wait: the Wait was enqueued while the rule orders, but it may be
-    // released after the rule fell back to Probe, and it stalled the render queue all the same.
+    // A trip: the watchdog released an ordered frame's Wait whose hold the gate had released. The Wait was enqueued
+    // while the rule orders, but it may be released after the rule fell back to Probe, and it stalled the render queue
+    // all the same. The count of clean releases starts again.
     Change OnWatchdog() noexcept {
         if (state == State::Off) return Change::None;
         qualified = 0;
+        clean = 0;
         tripped = true;
         if (++trips >= kTrips) { state = State::Off; return Change::Off; }
         if (state != State::Ordering) return Change::None;
         state = State::Probe;
         return Change::Probe;
+    }
+    // An ordered frame's Wait was released by its Present (not at its hold, not by the watchdog): the order cost what
+    // it should. kForgive of them in a row, with no trip between, take the trips back. Counted in Probe too (a Wait
+    // enqueued in Ordering is released after the rule fell back) and across such a fall: only a trip starts the count
+    // again. Off stays Off.
+    void OnReleased() noexcept {
+        if (state == State::Off) return;
+        if (++clean < kForgive) return;
+        clean = 0;
+        trips = 0;
     }
 };
 

@@ -1,7 +1,7 @@
 // The rule, the books and the evidence of present-first ordering for held frames (src/gpu_hold_order_rule.h): when
-// the unit becomes able, what takes that away, when it stops for good, which values the watchdog may release, which
-// values a late frame lets go, how many Executes followed the Signal a Wait of the Present needs, and the probe's
-// one release per announce.
+// the unit becomes able, what takes that away, when it stops for good (and what forgives the trips that lead there),
+// which values the watchdog may release, which values a late frame lets go, how many Executes followed the Signal a
+// Wait of the Present needs, and the probe's one release per announce.
 // Directly tests the production rule; the fences, the hooks and the resulting pacing need live verification.
 
 #include "gpu_hold_order_rule.h"
@@ -147,6 +147,73 @@ namespace
         CHECK(!rule.Orders() && !rule.Able());
         rule.Reset();
         CHECK(rule.Orders() && !rule.tripped && rule.trips == 0);
+    }
+
+    // Trips are forgiven by clean running. A cycle the boundary check cannot see stalls at every entry into Ordering,
+    // with no ordered frame released by its Present in between, so its trips add up and turn the rule Off; a hitch is
+    // followed by frames their Present released, and kForgive of them in a row take the trips back. Only a release by
+    // the Present counts: the unit never tells the rule of a late frame's release, and the watchdog's is a trip, which
+    // starts the count again.
+    void TestCleanRunningForgivesTrips()
+    {
+        // A cycle: three trips with fewer than kForgive clean releases after each of the first two. The releases
+        // before a trip do not carry over to those after it, and the trip itself is not one of them.
+        Rule cycle;
+        CHECK(Qualify(cycle) == Change::Ordering);
+        CHECK(cycle.OnWatchdog() == Change::Probe && cycle.trips == 1 && cycle.clean == 0);
+        CHECK(Qualify(cycle) == Change::Ordering);
+        for (unsigned i = 0; i + 1 < Rule::kForgive; ++i) cycle.OnReleased();
+        CHECK(cycle.trips == 1 && cycle.clean == Rule::kForgive - 1);       // one short of forgiven
+        CHECK(cycle.OnWatchdog() == Change::Probe && cycle.trips == 2 && cycle.clean == 0);
+        CHECK(Qualify(cycle) == Change::Ordering);
+        for (unsigned i = 0; i + 1 < Rule::kForgive; ++i) cycle.OnReleased();
+        CHECK(cycle.trips == 2 && cycle.clean == Rule::kForgive - 1);       // not 2 * (kForgive - 1) in a row
+        CHECK(cycle.OnWatchdog() == Change::Off && cycle.trips == Rule::kTrips && cycle.clean == 0);
+        // Off stays Off: no clean running brings it back.
+        for (unsigned i = 0; i < 2 * Rule::kForgive; ++i) cycle.OnReleased();
+        CHECK(cycle.state == State::Off && cycle.trips == Rule::kTrips && cycle.clean == 0 && !cycle.Orders());
+
+        // A hitch: a trip, then kForgive clean releases, then two more trips do not turn the rule Off.
+        Rule hitch;
+        CHECK(Qualify(hitch) == Change::Ordering);
+        CHECK(hitch.OnWatchdog() == Change::Probe && hitch.trips == 1);
+        CHECK(Qualify(hitch) == Change::Ordering);
+        for (unsigned i = 0; i < Rule::kForgive; ++i) {
+            CHECK(hitch.trips == 1);                                       // forgiven by the last one, not before
+            hitch.OnReleased();
+        }
+        CHECK(hitch.trips == 0 && hitch.clean == 0);
+        CHECK(hitch.OnWatchdog() == Change::Probe && hitch.trips == 1);
+        CHECK(Qualify(hitch) == Change::Ordering);
+        CHECK(hitch.OnWatchdog() == Change::Probe && hitch.trips == 2);
+        CHECK(hitch.state == State::Probe && !hitch.Orders());             // a trip still stops the orders for now
+        CHECK(Qualify(hitch) == Change::Ordering);
+        CHECK(hitch.Able() && hitch.Orders());
+
+        // Clean releases are counted across a fall to Probe and back (a frame that did not qualify is no trip, and a
+        // Wait enqueued in Ordering is released by its Present in Probe too): only a trip starts the count again.
+        const unsigned half = Rule::kForgive / 2, quarter = Rule::kForgive / 4;
+        Rule across;
+        CHECK(Qualify(across) == Change::Ordering);
+        CHECK(across.OnWatchdog() == Change::Probe && across.trips == 1);
+        CHECK(Qualify(across) == Change::Ordering);
+        for (unsigned i = 0; i < half; ++i) across.OnReleased();
+        CHECK(across.OnUnqualified() == Change::Probe);
+        CHECK(across.clean == half && across.trips == 1);
+        for (unsigned i = 0; i < quarter; ++i) across.OnReleased();
+        CHECK(across.state == State::Probe && across.clean == half + quarter);
+        CHECK(Qualify(across) == Change::Ordering);
+        CHECK(across.clean == half + quarter && across.trips == 1);
+        for (unsigned i = half + quarter; i + 1 < Rule::kForgive; ++i) across.OnReleased();
+        CHECK(across.trips == 1 && across.clean == Rule::kForgive - 1);
+        across.OnReleased();
+        CHECK(across.trips == 0 && across.clean == 0);
+
+        // A rule that never tripped has nothing to forgive: clean releases change nothing else.
+        Rule quiet;
+        CHECK(Qualify(quiet) == Change::Ordering);
+        for (unsigned i = 0; i < 3 * Rule::kForgive; ++i) quiet.OnReleased();
+        CHECK(quiet.state == State::Ordering && quiet.trips == 0 && quiet.Able() && quiet.Orders());
     }
 
     // The bound is a quarter of the interval between 1 and 4 ms, and the most while the interval is unknown.
@@ -443,6 +510,7 @@ int main()
     TestWatchdogTripsOff();
     TestWatchdogCountsInProbeToo();
     TestOrdersKeepsThePlanUntilATrip();
+    TestCleanRunningForgivesTrips();
     TestBound();
     TestBook();
     TestBookLate();

@@ -27,7 +27,10 @@
 //      are looked at (a frame one of them passed in front of the Wait is `raced`, and does not count as qualified).
 //   4. The release thread signals `order` when `issued` has reached the value (the Present is runnable), at once for a
 //      value whose hold is over (its target has come) while R has not reached its Wait (a frame that is late for its
-//      slot pays nothing for the order), and at the deadline (the watchdog) for what the check cannot see.
+//      slot pays nothing for the order), and at the deadline (the watchdog) for what the check cannot see. A watchdog
+//      release while the gate has not released the hold is the gate's own delay (the runtime can hold up its Signal of
+//      the time fence): the Wait is let go, the release is counted and said, and the rule is told nothing. Every Wait
+//      its Present released tells the rule (OnReleased), and enough of them in a row forgive its trips.
 // Locks. `lock` guards the binding, the rule, the books, the edges and the values' side data; it is held for loads and
 // stores and for the CPU side of the unit's own fences, never across a native queue call, a call into the probe or a
 // log line. `track_lock` guards the Signal histories and Execute counts of the followed fences: the Signal and Execute
@@ -59,6 +62,7 @@ constexpr unsigned kGateReleases = 32;        // the gate's releases of its hold
 constexpr DWORD kPollMs = 4;                  // outstanding values are looked at this often even without an event
 constexpr int64_t kServedMs = 50;             // no Wait is enqueued unless the release thread served this recently
 constexpr int64_t kReportSeconds = 10;
+constexpr unsigned kGateLateLines = 4;        // watchdog releases with the gate late said at info level per binding
 constexpr uint64_t kReleaseAll = 1ull << 63;  // above every value the unit ever signals
 
 // What the ten-second line says. Relaxed atomics: no lock is taken to count or to report.
@@ -77,6 +81,7 @@ struct Counters {
     std::atomic<uint64_t> edge_since[4]{};   // ... of the others, by Executes on R since the latest such Signal: 0, 1, 2, 3 or more
     std::atomic<uint64_t> raced{0};          // ordered, but an Execute of another thread passed in front of the Wait
     std::atomic<uint64_t> by_issued{0}, by_watchdog{0}, late{0};   // waited values released, by how
+    std::atomic<uint64_t> gate_late{0};      // ... of by_watchdog: the gate had not released the hold (no trip)
     std::atomic<uint64_t> wait_count{0}, wait_sum_us{0}, wait_max_us{0}; // reached -> release
     std::atomic<uint64_t> enqueue_failures{0}, issue_failures{0}, release_failures{0};
     std::atomic<uint64_t> dropped{0}, lost_edges{0};
@@ -147,8 +152,10 @@ bool CreateFences(ID3D12CommandQueue* queue, ID3D12Fence** fences, int count, in
 
 // ── The gate's releases of its holds: written by the gate's worker without any lock ──
 // One slot per release, a sequence counter per slot (odd while it is written), read by whoever needs the release time
-// of a hold: the probe is told it, and the watchdog's line says it. The worker never waits for the unit, and a release
-// the unit cannot find (the slot was reused) is told at the unit's own time instead.
+// of a hold: the probe is told it, and the watchdog's line says it. A hold with no recorded release is one the gate has
+// not released (a slot is reused only after kGateReleases later releases, which the bound is far too short for): that
+// is how the watchdog tells the gate's own delay from a trip. The worker never waits for the unit, and a release the
+// unit cannot find is told at the unit's own time instead.
 struct GateRelease {
     std::atomic<uint32_t> sequence{0};
     std::atomic<const void*> fence{nullptr};
@@ -299,6 +306,7 @@ std::atomic<bool> order_owed{false};
 uint64_t generation_counter = 0;             // advances at every bind and every drop: a value in flight carries its own
 Rule rule;
 Book book;
+unsigned gate_late_said = 0;                 // watchdog lines for the gate's delays said at info level this binding
 uint64_t next_value = 0;                     // the newest value issued (rising)
 uint64_t reached_last = 0;                   // the newest value `reached` was signalled for (rising)
 uint64_t order_signalled = 0;                // the newest value `order` was signalled to (rising)
@@ -420,8 +428,11 @@ bool ReleaseOrderLocked(uint64_t value) noexcept {
 }
 // How the order Wait of a value was released.
 enum class How { Issued, Late, Watchdog };
-// Lock held. The values up to `value` leave the books, their order Waits released first.
-bool ReleaseThroughLocked(uint64_t value, How how, int64_t now, ProbeReleases* probe) noexcept {
+// Lock held. The values up to `value` leave the books, their order Waits released first; `waited_out` gets how many of
+// them had a Wait. Each Wait its Present released tells the rule (OnReleased: enough of them in a row forgive its
+// trips); a late release proves nothing about the order, and the watchdog's is for the caller to judge.
+bool ReleaseThroughLocked(uint64_t value, How how, int64_t now, ProbeReleases* probe,
+    uint64_t* waited_out = nullptr) noexcept {
     if (!ReleaseOrderLocked(value)) return false;
     uint64_t waited = 0;
     for (unsigned i = 0; i < book.count && book.entries[i].value <= value; ++i) {
@@ -429,7 +440,9 @@ bool ReleaseThroughLocked(uint64_t value, How how, int64_t now, ProbeReleases* p
         if (!entry.waited) continue;
         ++waited;
         if (entry.reached) RecordWait(now - entry.reached);
+        if (how == How::Issued) rule.OnReleased();
     }
+    if (waited_out) *waited_out = waited;
     book.ReleaseThrough(value);
     (how == How::Issued ? counters.by_issued : how == How::Late ? counters.late : counters.by_watchdog)
         .fetch_add(waited, relaxed);
@@ -501,7 +514,9 @@ void ReportChange(Rule::Change change) noexcept {
         LOG_DEBUG("GPU hold order: a frame did not qualify or a Wait was released by the watchdog; nothing waits until "
                   "%u qualify in a row", Rule::kRun);
     } else if (change == Rule::Change::Off) {
-        LOG_INFO("GPU hold order: %u watchdog releases; nothing is enqueued until the next binding", Rule::kTrips);
+        LOG_INFO("GPU hold order: %u watchdog trips, the earlier ones not forgiven (fewer than %u ordered frames "
+                 "released by their Present after each); nothing is enqueued until the next binding",
+            Rule::kTrips, Rule::kForgive);
     }
 }
 
@@ -529,27 +544,33 @@ bool EnsureThreadLocked(DWORD* error) noexcept {
     if (!thread) { *error = GetLastError(); return false; }
     return true;
 }
-// What a capture needs to tell a real cycle from a slow presenting queue, read when the watchdog releases a value.
+// What a capture needs to tell a real cycle from a slow presenting queue or a slow gate, read when the watchdog
+// releases a value.
 struct WatchdogNote {
     bool valid = false;
+    bool counted = false;   // a trip; else the gate had not released the hold
+    bool loud = true;       // said at info level
     uint64_t value = 0, issued = 0;
     int64_t target = 0, reached = 0, now = 0, gate_release = 0;
     unsigned trip = 0;
 };
-// One line per watchdog release, and a release is a trip (the rule counts one in every state but Off, and the line is
-// said only for those): at most Rule::kTrips lines per binding.
+// One line per watchdog release the rule counted (a trip: at most Rule::kTrips lines per binding, the rule being Off
+// after that) and one per release while the gate had not released the hold: the first kGateLateLines of a binding at
+// info level, the rest at debug level, so a game whose gate the runtime holds up often does not fill the log.
 void SayWatchdog(const WatchdogNote& note) noexcept {
     const double us = 1e6 / static_cast<double>(Frequency());
-    char gate[96];
+    char gate[96], verdict[64];
     if (note.gate_release)
         std::snprintf(gate, sizeof gate, "released the hold %.0f us after its target",
             static_cast<double>(note.gate_release - note.target) * us);
     else std::snprintf(gate, sizeof gate, "had not released the hold");
-    LOG_INFO("GPU hold order: the watchdog released value %llu (trip %u of %u): the render queue stood at its Wait for "
-             "%.0f us, %.0f us after the hold's target; the gate %s; issued had reached %llu",
-        static_cast<unsigned long long>(note.value), note.trip, Rule::kTrips,
-        static_cast<double>(note.now - note.reached) * us, static_cast<double>(note.now - note.target) * us, gate,
-        static_cast<unsigned long long>(note.issued));
+    if (note.counted) std::snprintf(verdict, sizeof verdict, "trip %u of %u", note.trip, Rule::kTrips);
+    else std::snprintf(verdict, sizeof verdict, "not counted: the gate had not released the hold");
+    Log_Write(note.loud ? LogLevel::Info : LogLevel::Debug,
+        "GPU hold order: the watchdog released value %llu (%s): the render queue stood at its Wait for %.0f us, "
+        "%.0f us after the hold's target; the gate %s; issued had reached %llu",
+        static_cast<unsigned long long>(note.value), verdict, static_cast<double>(note.now - note.reached) * us,
+        static_cast<double>(note.now - note.target) * us, gate, static_cast<unsigned long long>(note.issued));
 }
 // One pass of the release thread. False when there is nothing left to serve (no binding, no order fence owed) and the
 // thread is to end (decided under the lock, so a bind that finds the thread running finds one that goes on).
@@ -605,13 +626,27 @@ bool Pass(int64_t now, int64_t* next_deadline, bool* outstanding) noexcept {
                     seen.now = now;
                     if (meta) seen.gate_release = GateReleaseOf(meta->hold_fence, meta->hold_ticket);
                 }
-                const bool counts = rule.state != Rule::State::Off;
-                if (ReleaseThroughLocked(overdue, How::Watchdog, now, &probe)) {
-                    change = rule.OnWatchdog();
-                    if (counts && have) {
+                // The Present waits for its hold, and the gate's worker releases the hold: while that release is not
+                // recorded the Present could not run whatever the render queue did (the runtime can hold the worker's
+                // Signal of the time fence for tens of milliseconds). The Wait is let go all the same, since R must not
+                // stand at it past the bound, but the order is not what stalled: no trip, no fall to Probe, and the rule
+                // is told nothing. A value with no side data cannot be shown to be the gate's delay and stays a trip.
+                const bool gate_late = meta && !seen.gate_release;
+                const bool counts = !gate_late && rule.state != Rule::State::Off;
+                uint64_t released = 0;
+                if (ReleaseThroughLocked(overdue, How::Watchdog, now, &probe, &released)) {
+                    if (gate_late) {
+                        counters.gate_late.fetch_add(released, relaxed);
+                        seen.loud = gate_late_said < kGateLateLines;
+                        if (seen.loud) ++gate_late_said;
+                    } else {
+                        change = rule.OnWatchdog();
+                        seen.counted = true;
+                        seen.trip = rule.trips;
+                    }
+                    if (have && (gate_late || counts)) {
                         note = seen;
                         note.valid = true;
-                        note.trip = rule.trips;
                     }
                 }
             }
@@ -690,7 +725,7 @@ struct Snapshot {
     uint64_t held = 0, ordered = 0, no_dependency = 0, no_signal = 0, behind = 0, books_full = 0, not_able = 0, runnable = 0,
         unasked = 0;
     uint64_t edges = 0, edge_no_signal = 0, since[4] = {}, raced = 0;
-    uint64_t by_issued = 0, by_watchdog = 0, late = 0, wait_count = 0, wait_sum_us = 0;
+    uint64_t by_issued = 0, by_watchdog = 0, gate_late = 0, late = 0, wait_count = 0, wait_sum_us = 0;
     uint64_t enqueue_failures = 0, issue_failures = 0, release_failures = 0, dropped = 0, lost_edges = 0;
 };
 Snapshot Take() noexcept {
@@ -704,6 +739,7 @@ Snapshot Take() noexcept {
     for (unsigned i = 0; i < 4; ++i) s.since[i] = counters.edge_since[i].load(relaxed);
     s.raced = counters.raced.load(relaxed);
     s.by_issued = counters.by_issued.load(relaxed); s.by_watchdog = counters.by_watchdog.load(relaxed);
+    s.gate_late = counters.gate_late.load(relaxed);
     s.late = counters.late.load(relaxed);
     s.wait_count = counters.wait_count.load(relaxed); s.wait_sum_us = counters.wait_sum_us.load(relaxed);
     s.enqueue_failures = counters.enqueue_failures.load(relaxed); s.issue_failures = counters.issue_failures.load(relaxed);
@@ -739,9 +775,9 @@ void Report(int64_t now) noexcept {
                      "%llu books full, %llu not able, %llu not asked by the plan, %llu value already released at the "
                      "edge; %llu edges judged, with 0/1/2/3 or more Executes behind the latest such Signal "
                      "%llu/%llu/%llu/%llu, %llu without such a Signal; %llu raced (an Execute of another thread "
-                     "passed in front of the Wait); released %llu by the Present, %llu by the watchdog, %llu late "
-                     "(bound %u us); the render queue waited %.0f us on average, %.0f us at most, from reaching the "
-                     "Wait to its release; %s%s, %u watchdog trips; "
+                     "passed in front of the Wait); released %llu by the Present, %llu by the watchdog, %llu of them "
+                     "with the gate late, %llu late (bound %u us); the render queue waited %.0f us on average, %.0f us "
+                     "at most, from reaching the Wait to its release; %s%s, %u watchdog trips; "
                      "enqueue/issue/release failures %llu/%llu/%llu; holds dropped %llu, edges lost %llu",
                 static_cast<long long>(kReportSeconds), n(c.held - p.held), n(c.ordered - p.ordered),
                 n(c.no_dependency - p.no_dependency), n(c.no_signal - p.no_signal), n(c.behind - p.behind),
@@ -749,11 +785,11 @@ void Report(int64_t now) noexcept {
                 n(c.runnable - p.runnable), n(c.edges - p.edges), n(c.since[0] - p.since[0]),
                 n(c.since[1] - p.since[1]), n(c.since[2] - p.since[2]), n(c.since[3] - p.since[3]),
                 n(c.edge_no_signal - p.edge_no_signal), n(c.raced - p.raced),
-                n(c.by_issued - p.by_issued), n(c.by_watchdog - p.by_watchdog), n(c.late - p.late),
-                Rule::BoundUs(last_interval_us.load(relaxed)), mean, most, StateName(state), bound ? "" : " (not bound)",
-                trips, n(c.enqueue_failures - p.enqueue_failures), n(c.issue_failures - p.issue_failures),
-                n(c.release_failures - p.release_failures), n(c.dropped - p.dropped),
-                n(c.lost_edges - p.lost_edges));
+                n(c.by_issued - p.by_issued), n(c.by_watchdog - p.by_watchdog), n(c.gate_late - p.gate_late),
+                n(c.late - p.late), Rule::BoundUs(last_interval_us.load(relaxed)), mean, most, StateName(state),
+                bound ? "" : " (not bound)", trips, n(c.enqueue_failures - p.enqueue_failures),
+                n(c.issue_failures - p.issue_failures), n(c.release_failures - p.release_failures),
+                n(c.dropped - p.dropped), n(c.lost_edges - p.lost_edges));
         } else {
             counters.wait_max_us.store(0, relaxed);
         }
@@ -824,6 +860,7 @@ BindOutcome EnsureBound(ID3D12CommandQueue* present, const void* render, const v
         binding.order = fences[2];
         binding.generation = ++generation_counter;
         ordering_said.store(false, relaxed);
+        gate_late_said = 0;
         bound_live.store(true, relaxed);
         PublishLocked();
         outcome.generation = binding.generation;
@@ -1426,11 +1463,12 @@ bool GpuHoldOrder_Shutdown(unsigned long timeout_ms) noexcept {
     ReleaseSRWLockExclusive(&lock);
     Flush(rest);
     LOG_INFO("GPU hold order: stopped; %llu held frames, %llu ordered, %llu released by the Present, %llu by the "
-             "watchdog, %llu late, %llu raced, %llu enqueue failures, %llu release failures",
+             "watchdog (%llu of them with the gate late), %llu late, %llu raced, %llu enqueue failures, %llu release "
+             "failures",
         static_cast<unsigned long long>(counters.held.load()), static_cast<unsigned long long>(counters.ordered.load()),
         static_cast<unsigned long long>(counters.by_issued.load()), static_cast<unsigned long long>(counters.by_watchdog.load()),
-        static_cast<unsigned long long>(counters.late.load()), static_cast<unsigned long long>(counters.raced.load()),
-        static_cast<unsigned long long>(counters.enqueue_failures.load()),
+        static_cast<unsigned long long>(counters.gate_late.load()), static_cast<unsigned long long>(counters.late.load()),
+        static_cast<unsigned long long>(counters.raced.load()), static_cast<unsigned long long>(counters.enqueue_failures.load()),
         static_cast<unsigned long long>(counters.release_failures.load()));
     return true;
 }
