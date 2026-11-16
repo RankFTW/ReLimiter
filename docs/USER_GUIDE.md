@@ -521,11 +521,11 @@ PC latency collection is disabled by default and has no user-interface toggle. I
 
 This requires suitable NVIDIA PCL markers from the game and Windows tracing permissions. In most games it does not change pacing.
 
-**Exception: cross-thread games.** Some games send their frame-start marker on one thread and present the frame on another. Gears of War: E-Day does this, and the log shows `NativeGate: PRESENT_START and Present run on different threads`. These games need PC latency collection to use the GPU queue wait and the FG input wait:
+**Exception: cross-thread games.** Some games send their frame-start marker on one thread and present the frame on another. Gears of War: E-Day does this, and the log shows `NativeGate: PRESENT_START and Present run on different threads`.
 
-- ReLimiter pairs each marker with its Present, but uses the pairing only after ETW frame IDs confirm it. Confirmation takes 64 matching frames and is logged as `hand-off verified by ETW frame IDs`.
-- Without collection, these games stay on the marker hold, or on source pacing with frame generation.
-- Confirmation needs frames without frame generation. With frame generation, start with it off, wait for the verification line, then turn it on.
+- With frame generation, the FG input wait needs no PC latency collection. ReLimiter pairs each real frame's Present with its marker by the frame number the driver states for that Present, and a Present it cannot match is not used.
+- Without frame generation, the GPU queue wait needs collection. ReLimiter pairs each marker with its Present, but uses the pairing only after ETW frame IDs confirm it. Confirmation takes 64 matching frames and is logged as `hand-off verified by ETW frame IDs`.
+- Without collection, these games stay on the marker hold when frame generation is off.
 
 While collection is running, Display Pacing uses its ETW display times instead of DXGI. While **Telemetry Logging** is on, display times and PC Latency are also written to the `relimiter_pacing_` file. To disable collection, close the game and set the value back to `false`.
 

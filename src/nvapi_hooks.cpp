@@ -12,6 +12,7 @@
 #include "health.h"
 #include "pcl_hooks.h"
 #include "streamline_hooks.h"
+#include "streamline_gpu_handoff.h"
 #include "swapchain_manager.h"
 #include "frame_timeline.h"
 #include "nvapi_marker_policy.h"
@@ -2233,6 +2234,12 @@ static NvAPI_Status __cdecl Hook_SetAsyncFrameMarker(IUnknown* queue, NV_ASYNC_F
     LARGE_INTEGER call_exit{};
     QueryPerformanceCounter(&call_exit);
     if (!known) return result;
+
+    // The frame id this call states for the frame being presented (PRESENT_START names the frame the Present of this
+    // thread is running for): the frame generation route pairs that Present's marker by it, in a game that presents on
+    // another thread than its markers (streamline_gpu_handoff.h). After the call has returned; it touches neither the
+    // marker nor its result.
+    StreamlineHandoff_RecordInbandFrame(marker_type, frame_id);
 
     ObserveAsyncMarkerThread(marker_type, queue);
     // The first call of each marker type (types above 31 are not logged).

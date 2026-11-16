@@ -101,7 +101,6 @@ void PacingPipeline_PublishCapability(PacingCapability capability, bool availabl
     if (capability != PacingCapability::FgSeparatePresenter) return;
     separate_published = available; separate_controller = controller;
 }
-bool NativeGate_CrossThreadVerified() noexcept { return false; }
 
 struct Object { void** table; std::atomic<unsigned> refs{1}; };
 static std::array<void*,41> device_table{}, queue_table{}, fence_table{}, proxy_table{};
@@ -390,6 +389,220 @@ static void TestMaintenanceInvalidationInFlight() {
     Reset();
 }
 
+// A game that records its markers on one thread and presents on another (Gears): the markers are recorded on a thread
+// of their own and the caller, the Present's thread, has none. The proxy Present claims the marker of the frame the
+// in-band PRESENT_START of its thread names (StreamlineHandoff_RecordInbandFrame), and only that one.
+static uint64_t MarkerElsewhere(unsigned count = 1) { // the frame id of the first marker recorded
+    const uint64_t first = frame + 1;
+    std::thread([count] { for (unsigned i = 0; i < count; ++i) Marker(); }).join();
+    return first;
+}
+static uint64_t PresentFrame(uint64_t id, bool complete = true) {
+    StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+    CHECK(scope.pending && !scope.input.source && !scope.claimed_frame);
+    StreamlineHandoff_RecordInbandFrame(4,id);
+    CHECK(!scope.pending && scope.claimed_frame == id && scope.input.source == id && scope.input.transaction);
+    CHECK(Fence(&a,&forward_fence,id,0x110,true) == S_OK);
+    CHECK(Fence(&a,&back_fence,id+10000,0x120,false) == S_OK);
+    if (complete) scope.Complete(S_OK);
+    return id;
+}
+// Two Presents that each run a frame behind: when the first presents, the next frame's marker is already recorded.
+static void CycleBehind() {
+    const auto first = MarkerElsewhere(2);
+    for (const auto id : {first,first + 1}) {
+        PresentFrame(id);
+        std::thread worker([=]{Worker(id);}); worker.join();
+        StreamlineHandoff_Service();
+    }
+}
+static uint64_t Seen() { return h::present_admission.seen.load(); }
+static bool LastFailure(const char* reason) { return std::strcmp(h::present_admission.last_failure.load(),reason) == 0; }
+static void TestInbandFrameClaim() {
+    // The route qualifies on markers recorded elsewhere, each claimed by its own frame id, however far the Present
+    // runs behind the marker thread; the ETW flag is not consulted (it is not even linked here).
+    auto claims = h::inband_claims.load();
+    const auto unknown_start = h::inband_unknown.load(), late_start = h::inband_late.load(), absent_start = h::inband_absent.load();
+    CycleBehind(); CycleBehind();
+    CHECK(StreamlineHandoff_IsCurrent(h::epoch) && h::inband_claims == claims + 4);
+    CHECK(h::inband_unknown == unknown_start && h::inband_late == late_start && h::inband_absent == absent_start);
+    const auto binding = h::epoch.load();
+    const auto before_begins = begins;
+    CycleBehind();
+    CHECK(begins == before_begins + 2 && h::epoch == binding);
+
+    // A Present claims the marker of the frame its id names, not the newest one (CycleBehind). An id also consumes
+    // the older markers with it: once the newer frame has been presented, the older id finds nothing (the Present has
+    // moved on, and a marker is never claimed twice).
+    const auto second = MarkerElsewhere(2);
+    PresentFrame(second + 1);
+    { std::thread worker([=]{Worker(second + 1);}); worker.join(); }
+    StreamlineHandoff_Service();
+    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+        const auto unknown_before = h::inband_unknown.load();
+        StreamlineHandoff_RecordInbandFrame(4,second);               // consumed with the newer frame: fails closed
+        CHECK(!scope.input.transaction && h::inband_unknown == unknown_before + 1);
+        scope.Complete(S_OK); }
+    Reset();
+
+    // Absent, unknown and ignored ids. Every Present is recorded in present_admission once. The route is not tracking
+    // yet, so a failed Present rejects no binding and the marker an unknown id left in the ring is still there.
+    const auto value = MarkerElsewhere(1);
+    auto seen = Seen();
+    const auto absent = h::inband_absent.load();
+    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+        CHECK(scope.pending && !scope.input.transaction);
+        scope.Complete(S_OK); }
+    CHECK(h::inband_absent == absent + 1 && LastFailure("inband_frame_absent") && Seen() == seen + 1);
+    seen = Seen();
+    claims = h::inband_claims.load();
+    const auto unknown = h::inband_unknown.load();
+    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+        StreamlineHandoff_RecordInbandFrame(4,0);                    // no identity yet (the first calls state 0)
+        StreamlineHandoff_RecordInbandFrame(11,0);
+        for (const uint32_t type : {0u,1u,2u,3u,5u,6u,9u,10u,12u})   // not a PRESENT_START: no claim
+            StreamlineHandoff_RecordInbandFrame(type,value);
+        CHECK(scope.pending && !scope.claimed_frame && h::inband_claims == claims && h::inband_unknown == unknown);
+        StreamlineHandoff_RecordInbandFrame(4,value + 1000);         // no marker of that frame was ever recorded
+        CHECK(!scope.pending && h::inband_unknown == unknown + 1 && LastFailure("inband_frame_unknown"));
+        StreamlineHandoff_RecordInbandFrame(4,value);                // judged: a later id claims nothing
+        CHECK(!scope.input.transaction && !scope.claimed_frame && h::inband_claims == claims);
+        scope.Complete(S_OK); }
+    CHECK(Seen() == seen + 1);
+    // The unknown id consumed nothing: the next Present takes the frame. Out-of-band PRESENT_START (11) claims too.
+    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+        StreamlineHandoff_RecordInbandFrame(11,value);
+        CHECK(scope.input.source == value && scope.input.transaction && h::inband_claims == claims + 1);
+        scope.Complete(S_OK); }
+    // A marker the context rejected is a tombstone: it withdraws no older marker, and its own frame is no marker.
+    const auto kept = MarkerElsewhere(1);
+    context_observable = false; scheduler_supported = false;
+    const auto rejected = MarkerElsewhere(1);
+    context_observable = true; scheduler_supported = true;
+    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+        const auto unknown_before = h::inband_unknown.load();
+        StreamlineHandoff_RecordInbandFrame(4,rejected);
+        CHECK(!scope.input.transaction && h::inband_unknown == unknown_before + 1);
+        scope.Complete(S_OK); }
+    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+        StreamlineHandoff_RecordInbandFrame(4,kept);
+        CHECK(scope.input.source == kept && scope.input.transaction);
+        scope.Complete(S_OK); }
+    // The ring is a bounded try-lock: a hand-off lost to contention fails closed and consumes nothing.
+    const auto contended = MarkerElsewhere(1);
+    CHECK(h::marker_slot.HoldLockForTest());
+    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+        const auto unknown_before = h::inband_unknown.load();
+        StreamlineHandoff_RecordInbandFrame(4,contended);
+        CHECK(!scope.input.transaction && h::inband_unknown == unknown_before + 1);
+        scope.Complete(S_OK); }
+    h::marker_slot.ReleaseLockForTest();
+    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+        StreamlineHandoff_RecordInbandFrame(4,contended);
+        CHECK(scope.input.source == contended && scope.input.transaction);
+        scope.Complete(S_OK); }
+    // The id comes after the Present's first fence call: late, whether or not a binding is tracked (none is here). The
+    // call reaches the handoff all the same, so the id that follows claims nothing. It does not consume the marker it
+    // names either: that marker stays in the ring, and a Present whose id comes before its first fence call claims it.
+    CHECK(!h::tracking);
+    const auto idle_marker = MarkerElsewhere(1);
+    seen = Seen();
+    claims = h::inband_claims.load();
+    const auto idle_late = h::inband_late.load();
+    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+        CHECK(scope.pending);
+        Fence(&a,&forward_fence,idle_marker,0x110,true);
+        CHECK(!scope.pending && h::inband_late == idle_late + 1 && LastFailure("inband_frame_late"));
+        StreamlineHandoff_RecordInbandFrame(4,idle_marker);
+        CHECK(!scope.input.transaction && !scope.claimed_frame && h::inband_claims == claims && h::inband_late == idle_late + 1);
+        scope.Complete(S_OK); }
+    CHECK(Seen() == seen + 1 && LastFailure("inband_frame_late"));  // recorded once, as late
+    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+        StreamlineHandoff_RecordInbandFrame(4,idle_marker);
+        CHECK(scope.input.source == idle_marker && scope.input.transaction && h::inband_claims == claims + 1);
+        scope.Complete(S_OK); }
+    // The first fence call can also land on a queue whose methods the hooks do not match. It never reaches BeforeFence
+    // there; it is late all the same, and the queue rejects the binding as it does for any scope.
+    const auto skew_marker = MarkerElsewhere(1);
+    seen = Seen();
+    claims = h::inband_claims.load();
+    const auto skew_late = h::inband_late.load();
+    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+        CHECK(scope.pending);
+        queue_table[15] = reinterpret_cast<void*>(&Signal);
+        Fence(&a,&forward_fence,skew_marker,0x110,true);
+        queue_table[15] = reinterpret_cast<void*>(&Wait);
+        CHECK(std::strcmp(h::fence_admission.last_failure.load(),"queue_vtable_methods_mismatch") == 0);
+        CHECK(!scope.pending && h::inband_late == skew_late + 1 && LastFailure("inband_frame_late"));
+        StreamlineHandoff_RecordInbandFrame(4,skew_marker);
+        CHECK(!scope.input.transaction && !scope.claimed_frame && h::inband_claims == claims);
+        scope.Complete(S_OK); }
+    CHECK(Seen() == seen + 1);
+    Reset();
+
+    // The same with a tracked binding: the route is qualified first, and the late call also rejects the binding. The
+    // call is then handled as that of a scope without an input, and the id that follows claims nothing.
+    Warm();
+    const auto late_marker = MarkerElsewhere(1);
+    seen = Seen();
+    claims = h::inband_claims.load();
+    const auto late = h::inband_late.load();
+    const auto live_binding = h::epoch.load();
+    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+        CHECK(scope.pending);
+        Fence(&a,&forward_fence,late_marker,0x110,true);
+        CHECK(!scope.pending && h::inband_late == late + 1 && LastFailure("inband_frame_late"));
+        StreamlineHandoff_RecordInbandFrame(4,late_marker);
+        CHECK(!scope.input.transaction && !scope.claimed_frame && h::inband_claims == claims);
+        CHECK(h::epoch != live_binding && !StreamlineHandoff_ClaimsInput());
+        scope.Complete(S_OK); }
+    CHECK(Seen() == seen + 1);
+    Reset();
+
+    // A same-thread marker is claimed by sequence, exactly as before; later in-band ids only count: the frame id
+    // that equals the claimed frame (any marker type), and one that does not. Nothing a claim has is changed.
+    Warm();
+    Marker(); const auto own = frame;
+    const auto match = h::inband_match.load(), mismatch = h::inband_mismatch.load();
+    claims = h::inband_claims.load();
+    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),source_sync,0);
+        CHECK(!scope.pending && scope.claimed_frame == own && scope.input.source == own && scope.input.transaction);
+        StreamlineHandoff_RecordInbandFrame(4,0);                    // ignored
+        StreamlineHandoff_RecordInbandFrame(4,own);
+        StreamlineHandoff_RecordInbandFrame(5,own);
+        StreamlineHandoff_RecordInbandFrame(5,own + 1);
+        CHECK(h::inband_match == match + 2 && h::inband_mismatch == mismatch + 1 && h::inband_claims == claims);
+        CHECK(scope.input.source == own && scope.input.transaction && !scope.invalid);
+        CHECK(Fence(&a,&forward_fence,own,0x110,true) == S_OK);
+        CHECK(Fence(&a,&back_fence,own + 10000,0x120,false) == S_OK);
+        scope.Complete(S_OK); }
+    std::thread own_worker([=]{Worker(own);}); own_worker.join();
+    CHECK(h::route.cycle.complete && StreamlineHandoff_IsCurrent(h::epoch));
+    // An in-band id with no Present of ours on the thread changes nothing.
+    StreamlineHandoff_RecordInbandFrame(4,own);
+    CHECK(h::inband_match == match + 2 && h::inband_mismatch == mismatch + 1 && h::inband_claims == claims);
+    Reset();
+
+    // What already fails is not pending: object, interval, flags and policy answer as they did, here without a marker
+    // of the thread's own. A markerless nested Present ends its pending parent, once.
+    seen = Seen();
+    { StreamlineInputScope scope(0,0,0); CHECK(!scope.pending && LastFailure("proxy_vtable_mismatch")); }
+    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),5,0); CHECK(!scope.pending && LastFailure("invalid_sync_interval")); }
+    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,DXGI_PRESENT_TEST); CHECK(!scope.pending && LastFailure("special_present_flags")); }
+    { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,DXGI_PRESENT_DO_NOT_WAIT); CHECK(!scope.pending && LastFailure("special_present_flags")); }
+    g_fg_mode = 2; { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0); CHECK(!scope.pending && !scope.input.transaction); }
+    g_fg_mode = 1;
+    CHECK(Seen() == seen + 5);
+    { StreamlineInputScope outer(reinterpret_cast<uint64_t>(&proxy),0,0);
+        CHECK(outer.pending);
+        StreamlineInputScope inner(reinterpret_cast<uint64_t>(&proxy),0,0);
+        CHECK(outer.invalid && !outer.pending && !inner.pending && !inner.input.transaction);
+        StreamlineHandoff_RecordInbandFrame(4,1);                    // the nested scope is current: nothing to claim
+        CHECK(!outer.claimed_frame && !inner.claimed_frame); }
+    CHECK(Seen() == seen + 7);                                       // the nested Present and its parent, once each
+    Reset();
+}
+
 static unsigned presents = 0;
 static UINT expected_sync = 2, expected_flags = 4;
 static bool submit_from_present = false;
@@ -443,8 +656,9 @@ int main() {
         CHECK(!h::marker.input.source && std::strcmp(h::marker_admission.last_failure.load(),"fg_context_not_observable") == 0);
         scheduler_supported = true; context_observable = true;
         { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0);
-            CHECK(!scope.input.transaction && std::strcmp(h::present_admission.last_failure.load(),"missing_same_thread_marker") == 0);
+            CHECK(!scope.input.transaction && scope.pending); // no marker of its own: it waits for the in-band frame id
             Marker(); CHECK(!h::marker.input.source && std::strcmp(h::marker_admission.last_failure.load(),"marker_inside_proxy_scope") == 0); }
+        CHECK(std::strcmp(h::present_admission.last_failure.load(),"inband_frame_absent") == 0); // and none came
         Marker(); { StreamlineInputScope scope(0,0,0); CHECK(!scope.input.transaction && std::strcmp(h::present_admission.last_failure.load(),"proxy_vtable_mismatch") == 0); }
         Marker(); { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),5,0); CHECK(!scope.input.transaction && std::strcmp(h::present_admission.last_failure.load(),"invalid_sync_interval") == 0); }
         Marker(); { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0);
@@ -469,6 +683,7 @@ int main() {
     TestMaintenanceFenceOverlap();
     TestMaintenanceWorkerOverlap();
     TestMaintenanceInvalidationInFlight();
+    TestInbandFrameClaim();
     // Diagnostic snapshots and opportunistic maintenance never revoke a healthy
     // binding merely because they cannot acquire its observation lock.
     Warm(); const auto stable_binding = h::epoch.load();

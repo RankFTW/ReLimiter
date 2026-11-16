@@ -23,6 +23,12 @@ bool StreamlineHandoff_IsCurrent(uint64_t epoch) noexcept;
 bool StreamlineHandoff_ClaimsInput() noexcept;
 void StreamlineHandoff_SuppressInput() noexcept;
 void StreamlineHandoff_RecordMarker(uint64_t frame, uint32_t producer, uint32_t controller, int64_t release) noexcept;
+// The frame id NvAPI_D3D12_SetAsyncFrameMarker states for a marker of `marker_type` (the NV_LATENCY_MARKER_TYPE
+// numbering), called on the thread that made the call, after the call returned. In an outermost proxy Present scope
+// that has no marker of its own, a PRESENT_START (4) or OUT_OF_BAND_PRESENT_START (11) names the frame being
+// presented: the scope claims that frame's marker (recorded on another thread) by the id, or fails closed. Once a
+// scope has claimed a marker, any frame id counts as a match or a mismatch of the claimed frame (counters only).
+void StreamlineHandoff_RecordInbandFrame(uint32_t marker_type, uint64_t frame_id) noexcept;
 void StreamlineHandoff_Boundary(const StreamlineBoundaryEvidence&) noexcept;
 void StreamlineHandoff_Service(bool final = false) noexcept;
 bool StreamlineHandoff_ReleaseAfterRundown() noexcept;
@@ -41,6 +47,12 @@ public:
     uint64_t config = 0;
     const UINT sync_interval;
     bool owns_cycle = false, handoff = false, invalid = false;
+    // An outermost Present with no marker of its own on this thread (Gears sends PRESENT_START on another thread)
+    // is pending until the in-band frame id of this thread (StreamlineHandoff_RecordInbandFrame) names its marker,
+    // or until it is resolved as failed. `claimed_frame` is the frame id of the marker an outermost scope claimed, its
+    // own thread's or the one the in-band id named; 0 while none.
+    bool pending = false;
+    uint64_t claimed_frame = 0;
     GpuPresentFgInput probe_input{};      // gpu_queue_probe: this Present's real-frame input (marker of this thread)
     bool probe_pending = false;           // ... until the first queue Signal of the scope delivers its boundary
     unsigned successful_source_fences = 0; // owning thread only; Signal/Wait results
@@ -77,6 +89,7 @@ inline void StreamlineHandoff_Invalidate(const char* = "explicit_invalidation", 
 inline StreamlineHandoffStatus StreamlineHandoff_ReadStatus() noexcept { return {}; }
 inline bool StreamlineHandoff_IsCurrent(uint64_t) noexcept { return false; }
 inline void StreamlineHandoff_RecordMarker(uint64_t, uint32_t, uint32_t, int64_t) noexcept {}
+inline void StreamlineHandoff_RecordInbandFrame(uint32_t, uint64_t) noexcept {}
 inline void StreamlineHandoff_Boundary(const StreamlineBoundaryEvidence&) noexcept {}
 inline void StreamlineHandoff_Service(bool = false) noexcept {}
 inline bool StreamlineHandoff_ReleaseAfterRundown() noexcept { return true; }

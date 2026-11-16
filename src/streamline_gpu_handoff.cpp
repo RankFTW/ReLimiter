@@ -82,13 +82,13 @@ thread_local GpuPresentFgInput last_marker;
 // probe measures the source queue whenever its key is on). Validated like an input (frame, producer,
 // controller, frame generation observed, producer epoch and controller of the current context)
 // except the gate's policy and binding epoch; and, for a Present on another thread than the marker's
-// (Gears), through its own hand-off slot (cross_thread_slot.h: the newest marker, taken exactly once
-// by the game's own outermost proxy Present, which frame generation never calls) WITHOUT the gate's
-// NativeGate_CrossThreadVerified, which is lost while frame generation is on. What that leaves
-// unverified is what the gate verifies with ETW frame ids: that Present(n) takes marker n and not
-// n - 1. The probe's key is the one the Present's pacing row takes from the same newest marker
+// (Gears), through its own hand-off slot (cross_thread_slot.h CrossThreadSlot: the newest marker, taken
+// exactly once by the game's own outermost proxy Present, which frame generation never calls). That slot
+// keeps its latest-wins hand-off, unlike the route's (marker_slot below, taken by frame id), because the
+// probe is telemetry: its key is the one the Present's pacing row takes from the same newest marker
 // (PacingTelemetry_TakePresentAttribution), so a frame is attributed to the row the pipeline itself
-// attributes that Present to.
+// attributes that Present to. What that leaves unverified is what the native gate verifies with ETW frame
+// ids: that Present(n) takes marker n and not n - 1.
 thread_local Marker probe_marker;
 thread_local uint64_t probe_sequence = 0;
 thread_local uint64_t probe_last_frame = 0;
@@ -124,16 +124,27 @@ void ProbeRecordMarker(uint64_t frame, uint32_t producer, uint32_t controller, i
     // The newest marker (an empty one withdraws the previous) for a Present on another thread.
     probe_sequence = probe_slot.Publish(probe_marker, valid);
 }
-// Cross-thread hand-off (cross_thread_slot.h): the newest marker (empty
-// when rejected) for a proxy Present on another thread. Taken only by the
-// game's own outermost proxy Present, which frame generation never calls,
-// so a generated-frame Present cannot take a real frame's marker, and only
-// once ETW frame IDs have verified this game's cross-thread mapping on the
-// native route (NativeGate_CrossThreadVerified): interleaving alone cannot
-// tell Present(n) from a Present(n - 1) running a frame behind.
-CrossThreadSlot<Marker> marker_slot;
+// Cross-thread hand-off of the route's markers (cross_thread_slot.h): the newest eight, each under its frame id
+// (Marker::input.source). A proxy Present on a thread without a marker of its own (Gears sends PRESENT_START on the
+// render thread and presents on another) claims a marker only by identity: the frame id that an async PRESENT_START
+// states on that thread, inside that outermost scope and before the scope's first source fence call
+// (StreamlineHandoff_RecordInbandFrame; Streamline's NvAPI_D3D12_SetAsyncFrameMarker names the frame being
+// presented, in the game's own NvAPI frame-id domain). No identity, no claim. "The newest marker" is not an
+// identity: while a scene loads about one Present in five begins after the next frame's marker, and the newest
+// marker is then the wrong frame; the ETW check that used to guard that (NativeGate_CrossThreadVerified) comes late
+// and cannot see frames with frame generation on, so the route no longer consults it. A rejected marker leaves a
+// tombstone that withdraws no older marker. The probe's own slot (probe_slot) keeps its latest-wins hand-off.
+CrossThreadRing<Marker> marker_slot;
 thread_local uint64_t marker_sequence = 0;
-std::atomic<uint64_t> cross_thread_takes{0};
+// The in-band claims, for the admission report and the qualified line (relaxed counters, formatted by the installer
+// worker only). claims: a marker claimed by the in-band frame id of a Present without a marker of its own. unknown:
+// such a Present whose id no marker in the ring has (never recorded, rejected, evicted, consumed, or lost to
+// contention). late: one that reached a fence call of the handoff before its id. absent: one that ended without any.
+// match, mismatch: for a Present that has claimed a marker (this thread's own or by id), a later in-band frame id of
+// the same Present that equals the claimed frame or not (counters only: a claim is never changed by them).
+std::atomic<uint64_t> inband_claims{0}, inband_unknown{0}, inband_late{0}, inband_absent{0}, inband_match{0},
+    inband_mismatch{0};
+unsigned long long Counted(const std::atomic<uint64_t>& counter) noexcept { return counter.load(std::memory_order_relaxed); }
 struct WorkerScope { uint64_t epoch = 0, transaction = 0; ID3D12CommandQueue* queue = nullptr; };
 thread_local WorkerScope worker_scope;
 // Independent cumulative stage snapshots, not per-frame correlations. Producers
@@ -195,12 +206,15 @@ void ReportAdmission(bool final) noexcept {
     LOG_INFO("Streamline GPU: admission policy=%s native_mode=%u context_supported=%d fg_observable=%d fg_flags=%u scheduler_fg=%d binding=%llu authorized=%llu last_rejection=%s cross_thread_markers=%llu",
         policy ? policy : "eligible", unsigned(NativeGate_GetMode()), context.supported, context.observe_frame_generation,
         context.fg_diagnostic_flags, GpuPresent_IsFgSupported(context.controller_generation), epoch.load(), authorized.load(), rejection.load(),
-        static_cast<unsigned long long>(cross_thread_takes.load(std::memory_order_relaxed)));
+        Counted(inband_claims));
     const auto route = GpuPresent_FgRouteDiagnostics();
     LOG_INFO("Streamline GPU: FG route inputs seen=%llu pending=%llu invalid=%llu stale_binding=%llu queue_missing=%llu "
              "queue_unready=%llu fg_queue_unready=%llu identity=%llu",
         route.seen, route.pending, route.invalid_input, route.stale_binding, route.queue_missing,
         route.queue_unready, route.fg_unready, route.identity);
+    LOG_INFO("Streamline GPU: in-band frame claims=%llu unknown=%llu late=%llu absent=%llu match=%llu mismatch=%llu",
+        Counted(inband_claims), Counted(inband_unknown), Counted(inband_late), Counted(inband_absent),
+        Counted(inband_match), Counted(inband_mismatch));
     const char* names[] = {"marker", "present", "fence_attribution"};
     AdmissionStage* stages[] = {&marker_admission, &present_admission, &fence_admission};
     for (unsigned i = 0; i < 3; ++i) {
@@ -730,7 +744,9 @@ void StreamlineHandoff_SuppressInput() noexcept {
 }
 bool StreamlineHandoff_Interested(ID3D12Fence* fence) noexcept {
     const auto* scope = StreamlineInputScope::Current();
-    if (scope && scope->input.transaction && !scope->invalid) return true;
+    // A Present still waiting for its frame id is interested in its first fence call, tracked or not: that call is where
+    // it is judged (BeforeFence, RejectQueueMethods), so an id that comes after it claims nothing.
+    if (scope && (scope->pending || (scope->input.transaction && !scope->invalid))) return true;
     return fence && streamline_handoff::tracking.load(std::memory_order_acquire) &&
         (fence == streamline_handoff::forward_filter.load(std::memory_order_acquire) ||
          fence == streamline_handoff::back_filter.load(std::memory_order_acquire));
@@ -742,9 +758,10 @@ void StreamlineHandoff_RecordMarker(uint64_t frame, uint32_t producer, uint32_t 
     // Publish the outcome on every exit: a rejected marker withdraws the
     // previous one, so a Present elsewhere never takes an older frame.
     struct PublishOnExit {
+        uint64_t frame; // the key: the marker's frame id, also for a tombstone
         bool skip = false; // a duplicate of the accepted frame keeps it published
-        ~PublishOnExit() { if (!skip) marker_sequence = marker_slot.Publish(marker, marker.input.source != 0); }
-    } publish;
+        ~PublishOnExit() { if (!skip) marker_sequence = marker_slot.Publish(marker, frame, marker.input.source != 0); }
+    } publish{frame};
     if (const auto* reason = PolicyRejection()) { marker_admission.Record(reason); return; }
     if (StreamlineInputScope::Current()) { marker_admission.Record("marker_inside_proxy_scope"); return; }
     const auto context = NativeGate_GetContext(release);
@@ -760,6 +777,71 @@ void StreamlineHandoff_RecordMarker(uint64_t frame, uint32_t producer, uint32_t 
     last_marker = input;
     marker = {input, release};
     marker_admission.Record(nullptr);
+}
+namespace streamline_handoff {
+// The admission of a proxy Present that has a source marker, whichever thread recorded it: the stale-release window,
+// the input's validity, the transaction and the multiplier, and the checks under the lock. The constructor runs it for
+// the marker of its own thread, StreamlineHandoff_RecordInbandFrame for the marker an in-band frame id claimed.
+// Records the Present in present_admission, once.
+void AdmitSource(StreamlineInputScope& scope, const Marker& source, uint64_t object) noexcept {
+    const auto context = NativeGate_GetContext(Now());
+    const char* failure = "stale_marker_release";
+    if (source.release > 0 && context.now_qpc >= source.release && context.qpc_frequency > 0 &&
+        context.now_qpc - source.release <= context.qpc_frequency / 4) {
+        failure = InputRejection(source.input);
+        if (!failure) {
+            scope.input = source.input; scope.input.transaction = sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+            scope.proxy = object; scope.config = GpuPresent_GetConfig().word;
+            scope.multiplier = g_fg_multiplier.load(std::memory_order_acquire);
+            if (scope.multiplier < 1 || scope.multiplier > 3 || !scope.input.transaction) {
+                failure = !scope.input.transaction ? "transaction_exhausted" : "unsupported_multiplier"; scope.input = {};
+            }
+        }
+    }
+    if (scope.input.transaction && tracking.load(std::memory_order_acquire)) {
+        Lock lock("source_scope_lock_busy");
+        if (!lock.held) { failure = "qualification_busy"; scope.invalid = true; }
+        else if (route.epoch != scope.input.binding) { failure = "binding_epoch_changed"; scope.invalid = true; }
+        else if (route.sync_interval != scope.sync_interval) {
+            failure = "sync_interval_changed";
+            Reject(&scope, failure); // cancels old tickets even if this Present submits no fence
+        }
+    }
+    if (failure) scope.input = {};
+    present_admission.Record(failure);
+    if (!scope.input.transaction && !scope.invalid && tracking.load(std::memory_order_acquire)) Reject(nullptr, failure);
+}
+// A pending scope's Present fails without a claim: recorded once, as the constructor records a Present without a
+// marker, and the binding is rejected while it is tracked (unless the caller has rejected it for its own cause).
+void ResolveFailed(StreamlineInputScope& scope, const char* reason, bool reject = true) noexcept {
+    scope.pending = false;
+    present_admission.Record(reason);
+    if (reject && tracking.load(std::memory_order_acquire)) Reject(nullptr, "ineligible_present");
+}
+// NV_LATENCY_MARKER_TYPE (nvapi_types.h): the markers whose frame id names the frame being presented.
+constexpr uint32_t kPresentStart = 4, kOutOfBandPresentStart = 11;
+}
+void StreamlineHandoff_RecordInbandFrame(uint32_t marker_type, uint64_t frame_id) noexcept {
+    using namespace streamline_handoff;
+    auto* scope = StreamlineInputScope::Current();
+    if (!scope || !frame_id) return; // no Present of ours on this thread, or no identity yet (the first calls state 0)
+    if (scope->claimed_frame) {
+        (frame_id == scope->claimed_frame ? inband_match : inband_mismatch).fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (!scope->pending || (marker_type != kPresentStart && marker_type != kOutOfBandPresentStart)) return;
+    const DWORD error = GetLastError();
+    Marker taken;
+    if (marker_slot.TakeKey(frame_id, &taken)) {
+        scope->pending = false;
+        scope->claimed_frame = frame_id;
+        inband_claims.fetch_add(1, std::memory_order_relaxed);
+        AdmitSource(*scope, taken, scope->proxy);
+    } else {
+        inband_unknown.fetch_add(1, std::memory_order_relaxed);
+        ResolveFailed(*scope, "inband_frame_unknown");
+    }
+    SetLastError(error);
 }
 thread_local StreamlineInputScope* StreamlineInputScope::current_ = nullptr;
 StreamlineInputScope::StreamlineInputScope(uint64_t object, UINT sync, UINT flags) noexcept : sync_interval(sync), previous_(current_) {
@@ -786,15 +868,27 @@ StreamlineInputScope::StreamlineInputScope(uint64_t object, UINT sync, UINT flag
     }
     if (source.input.source) {
         marker_slot.Claim(marker_sequence); // same-thread marker
-    } else if (!previous_ && NativeGate_CrossThreadVerified() && marker_slot.Take(&source)) {
-        cross_thread_takes.fetch_add(1, std::memory_order_relaxed); // marker from another thread
+        if (!previous_) claimed_frame = source.input.source; // a nested scope is rejected below and counts nothing
     }
     last_sync.store(sync, std::memory_order_relaxed); last_flags.store(flags, std::memory_order_relaxed);
-    if (previous_) { present_admission.Record("nested_present"); Reject(previous_, "nested_present"); SetLastError(error); return; }
+    if (previous_) {
+        present_admission.Record("nested_present");
+        // A parent still waiting for its frame id ends here: its Present is recorded once, with this cause.
+        if (previous_->pending) { previous_->pending = false; present_admission.Record("nested_present"); }
+        Reject(previous_, "nested_present"); SetLastError(error); return;
+    }
     const auto* policy = PolicyRejection();
     // This is the outer Streamline request, not the downstream output Present.
     // DXGI accepts intervals 0..4; GPU ordering comes from the qualified fences,
     // not from forcing this argument to zero. The wrapper forwards it unchanged.
+    // Without a marker of this thread's own, and with nothing else against it, the Present waits for the frame id
+    // that an in-band PRESENT_START states on this thread (StreamlineHandoff_RecordInbandFrame) and claims that
+    // frame's marker by it; no id, no claim. It is judged when the id comes, at its first fence call that reaches the
+    // handoff, or when it ends (BeforeFence, RejectQueueMethods, the destructor).
+    if (!source.input.source && object && sync <= 4 && !(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_WAIT)) && !policy) {
+        proxy = object; pending = true;
+        SetLastError(error); return;
+    }
     if (!object || sync > 4 || (flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_WAIT)) || !source.input.source || policy) {
         present_admission.Record(!object ? "proxy_vtable_mismatch" : sync > 4 ? "invalid_sync_interval" :
             (flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_WAIT)) ? "special_present_flags" :
@@ -802,37 +896,14 @@ StreamlineInputScope::StreamlineInputScope(uint64_t object, UINT sync, UINT flag
         if (tracking.load(std::memory_order_acquire)) Reject(nullptr, "ineligible_present");
         SetLastError(error); return;
     }
-    const auto context = NativeGate_GetContext(Now());
-    const char* failure = "stale_marker_release";
-    if (source.release > 0 && context.now_qpc >= source.release && context.qpc_frequency > 0 &&
-        context.now_qpc - source.release <= context.qpc_frequency / 4) {
-        failure = InputRejection(source.input);
-        if (!failure) {
-            input = source.input; input.transaction = sequence.fetch_add(1, std::memory_order_relaxed) + 1;
-            proxy = object; config = GpuPresent_GetConfig().word;
-            multiplier = g_fg_multiplier.load(std::memory_order_acquire);
-            if (multiplier < 1 || multiplier > 3 || !input.transaction) {
-                failure = !input.transaction ? "transaction_exhausted" : "unsupported_multiplier"; input = {};
-            }
-        }
-    }
-    if (input.transaction && tracking.load(std::memory_order_acquire)) {
-        Lock lock("source_scope_lock_busy");
-        if (!lock.held) { failure = "qualification_busy"; invalid = true; }
-        else if (route.epoch != input.binding) { failure = "binding_epoch_changed"; invalid = true; }
-        else if (route.sync_interval != sync_interval) {
-            failure = "sync_interval_changed";
-            Reject(this, failure); // cancels old tickets even if this Present submits no fence
-        }
-    }
-    if (failure) input = {};
-    present_admission.Record(failure);
-    if (!input.transaction && !invalid && tracking.load(std::memory_order_acquire)) Reject(nullptr, failure);
+    AdmitSource(*this, source, object);
     SetLastError(error);
 }
 StreamlineInputScope::~StreamlineInputScope() {
     using namespace streamline_handoff;
     const DWORD error = GetLastError();
+    // A Present that ends still waiting for its in-band frame id is recorded as failed, once.
+    if (pending) { inband_absent.fetch_add(1, std::memory_order_relaxed); ResolveFailed(*this, "inband_frame_absent"); }
     const char* failure = result_ != S_OK ? "present_failed" : invalid ? "input_invalidated" :
         !input.transaction ? "input_missing" : streamline_handoff::InputRejection(input);
     if (!failure && (config != GpuPresent_GetConfig().word || multiplier != g_fg_multiplier.load(std::memory_order_acquire)))
@@ -858,6 +929,9 @@ StreamlineFenceCall StreamlineHandoff_BeforeFence(ID3D12CommandQueue* queue, ID3
     uint64_t value, uint64_t site, bool signal) noexcept {
     using namespace streamline_handoff;
     auto* scope = StreamlineInputScope::Current();
+    // A Present still waiting for its in-band frame id reaches a fence call without it: late. The call is then handled
+    // as any call of a scope that has no input.
+    if (scope && scope->pending) { inband_late.fetch_add(1, std::memory_order_relaxed); ResolveFailed(*scope, "inband_frame_late"); }
     const bool source = scope && scope->input.transaction && !scope->invalid;
     if (!source && !StreamlineHandoff_Interested(fence)) return {};
     fence_admission.Record(site ? nullptr : "selected_plugin_site_missing");
@@ -1084,9 +1158,10 @@ void StreamlineHandoff_Service(bool final) noexcept {
         reported = accepted;
         const auto snapshot = route; // scalar diagnostics only after unlocking; never dereference copied pointers
         lock.Unlock();
-        LOG_INFO("Streamline GPU: qualified epoch=%llu cycles=%u source=%p worker=%p native=%llu generation=%llu sync=%u presenter=%s; deadline before input Signal",
+        LOG_INFO("Streamline GPU: qualified epoch=%llu cycles=%u source=%p worker=%p native=%llu generation=%llu sync=%u presenter=%s; deadline before input Signal inband=%llu/%llu/%llu/%llu/%llu/%llu",
             accepted, snapshot.successes, snapshot.source, snapshot.worker, snapshot.cycle.input.native, snapshot.cycle.input.swapchain, snapshot.sync_interval,
-            snapshot.separate ? "separate" : "worker");
+            snapshot.separate ? "separate" : "worker", Counted(inband_claims), Counted(inband_unknown), Counted(inband_late),
+            Counted(inband_absent), Counted(inband_match), Counted(inband_mismatch));
     }
 }
 bool StreamlineHandoff_ReleaseAfterRundown() noexcept {
@@ -1097,6 +1172,13 @@ bool StreamlineHandoff_ReleaseAfterRundown() noexcept {
 void StreamlineHandoff_RejectQueueMethods() noexcept {
     streamline_handoff::fence_admission.Record("queue_vtable_methods_mismatch");
     streamline_handoff::Reject(nullptr, "queue_vtable_methods_mismatch");
+    // A Present still waiting for its frame id has reached its first fence call here, which never reaches
+    // StreamlineHandoff_BeforeFence: late, as there. The binding is rejected above already.
+    auto* scope = StreamlineInputScope::Current();
+    if (scope && scope->pending) {
+        streamline_handoff::inband_late.fetch_add(1, std::memory_order_relaxed);
+        streamline_handoff::ResolveFailed(*scope, "inband_frame_late", false);
+    }
 }
 void StreamlineHandoff_RecordQueueFence(ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t value, bool signal) noexcept {
     using namespace streamline_handoff;
