@@ -14,11 +14,14 @@
 // Mechanism. Right behind DLSS-G's Wait on the render queue this unit enqueues a Signal of its own marker fence and a
 // Wait on its own order fence. The marker completes when frame generation is done; the order fence is signalled from
 // the CPU when the first native Present after that has returned (its packets are then on the GPU's queue), or by a
-// watchdog a share of the frame time after the marker completed (an eighth, between 0.5 and 2 ms). So the next
-// frame's work starts behind the generated frame's present, not in front of it. The fences are this unit's own,
-// created on the render queue's native device and released when that queue is destroyed, when the key is turned off,
-// when frame generation stops presenting or changes its multiplier (FgPresentOrder_Service) and at shutdown; nothing
-// of the game or of Streamline is retained.
+// watchdog at a deadline a share of the frame time after its own wake for the marker (an eighth, between 0.5 and
+// 2 ms: counted from that wake, not from the GPU's completion of the marker). So the next frame's work starts behind
+// the generated frame's present, not in front of it. The fences are this unit's own, created on the render queue's
+// native device and released when that queue is destroyed, when the key is turned off, when frame generation stops
+// presenting or changes its multiplier (FgPresentOrder_Service) and at shutdown; nothing of the game or of Streamline
+// is retained. That release is not instant: FgPresentOrder_Service runs once per pass of the installer's worker, which
+// waits up to about 250 ms between passes, so after frame generation stops an established binding can stay up to about
+// that long, and the trailing release and the breaks still act on it meanwhile.
 //
 // The render queue is the one that receives the first outermost Signal inside a proxy Present scope
 // (StreamlineInputScope), and the Wait followed is the first outermost Wait on that queue in the same scope: the
@@ -30,8 +33,9 @@
 // never makes the queue wait and enqueues a marker in one frame of sixteen.
 //
 // Cost with the key on. A game without Streamline's proxy Present: one load and a compare per outermost queue Signal
-// and Wait. Frame generation, ordering: per frame one queue Signal, one queue Wait, one event registration on the
-// game's Present thread and one fence Signal on DLSS-G's presenting thread.
+// and Wait, and one relaxed load and a branch at each of the two Execute gates below (in front of an outermost Execute
+// and behind it). Frame generation, ordering: per frame one queue Signal, one queue Wait, one event registration on
+// the game's Present thread and one fence Signal on DLSS-G's presenting thread.
 //
 // Trailing release (developer A/B switch `fg_present_order_trailing`, default on). The release above is made
 // when the generated frame's native Present has returned, and DLSS-G's presenting thread then submits one more packet
@@ -66,8 +70,8 @@
 // and 4x, not yet
 // seen in a trace, the thread may present more than once before it submits its work), but one that returns meanwhile
 // is still told to the breaks. Key off: the release is made as before, byte for byte, nothing more is made at the
-// bind, and each outermost Execute pays one relaxed load and a branch (two where the unit orders: its queue is tested
-// first). Key on: the same at each outermost Execute while the unit does not order; while it orders a call and a
+// bind, and the gate behind each outermost Execute pays one relaxed load and a branch (two where the unit orders: its
+// queue is tested first). Key on: the same at that gate while the unit does not order; while it orders a call and a
 // thread-id compare there, and per frame one clock read at the Present's return, one queue Signal and one event
 // registration on the presenting thread, and one more wake of the unit's thread.
 //
@@ -77,11 +81,15 @@
 // (FgPresentOrder_BeforeExecute), the hold is read only for a cycle without a worker-local Present
 // (FgPresentOrder_ProvesSeparatePresenter, which needs FgPresentOrder_Orders), and a release is deferred and an anchor
 // awaited only while the unit orders (PlanTrailingLocked, StartObservation). With hardware flip metering the worker
-// presents, so the ordering never establishes, and without frame generation nothing binds (FgPresentOrder_Service),
-// so in either case the three do nothing. What they cost there: one relaxed load and a branch at each outermost
-// Execute, as with the keys off (both Execute gates test the ordering's queue first); and for the trailing release one
-// more fence at each bind, on the game's thread inside the proxy Present (and an event, the first time), and on the
-// unit's own thread a deadline published at each marker wake and a wait for its locks at the deadline instead of a try.
+// presents, so the ordering never establishes and the three never enqueue a break, a hold or an ordering Wait; they
+// still cost something there, because the unit binds and probes (a marker in 16 of every 256 frames, by default): the
+// two Execute gates, one relaxed load and a branch each (in front of an outermost Execute and behind it; both test
+// the ordering's queue first); at each bind the trailing fence, and its event the first time, on the game's thread
+// inside the proxy Present; for each probe marker BreakFrameStart on that thread (the settings read, window_lock, the
+// frame's and its windows' records, window_live); and on the unit's own thread the deadline's publication, the
+// trailing planning and, at the deadline, a wait for the locks instead of a try. Without frame generation or without
+// Streamline's proxy Present nothing binds (FgPresentOrder_Service), and nothing is paid beyond the two gate loads
+// (the loads at the Signal and Wait detours are older).
 //
 // The unit is part of the add-on only (RELIMITER_FG_PRESENT_ORDER, set for the add-on target): every other target
 // that compiles a caller gets the no-op forms below.
@@ -155,7 +163,7 @@ inline void FgPresentOrder_AfterWait(ID3D12CommandQueue* queue, ID3D12Fence* fen
         FgPresentOrder_AfterWaitActive(queue, fence, native_signal, native_wait);
 }
 // Queue Execute detour, in front of the native call, outermost calls only. The ordering's queue is tested first, so
-// where the unit does not order (hardware flip metering, no frame generation) this is one load and a branch.
+// where the unit does not order (hardware flip metering, no frame generation) this gate is one load and a branch.
 inline void FgPresentOrder_BeforeExecute(ID3D12CommandQueue* queue, FgPresentOrder_FenceFn native_signal,
     FgPresentOrder_FenceFn native_wait) noexcept {
     if (g_fg_present_order_queue.load(std::memory_order_relaxed) == queue &&
@@ -165,9 +173,9 @@ inline void FgPresentOrder_BeforeExecute(ID3D12CommandQueue* queue, FgPresentOrd
 }
 // Queue Execute detour, after the native call returned and the probe's done Signal went on, outermost calls only. The
 // ordering's queue is tested first, so where the unit does not order (hardware flip metering, no frame generation)
-// this is one load and a branch. `native_signal` is the detour's atomic slot of the native Signal, read only when the
-// call is made. The presenting thread's first submission after a Present is the anchor the trailing release waits
-// behind, and a Present's release leaves one only while the unit orders.
+// this gate is one load and a branch. `native_signal` is the detour's atomic slot of the native Signal, read only
+// when the call is made. The presenting thread's first submission after a Present is the anchor the trailing
+// release waits behind, and a Present's release leaves one only while the unit orders.
 template <class SignalSlot>
 inline void FgPresentOrder_AfterExecute(ID3D12CommandQueue* queue, unsigned lists,
     const SignalSlot& native_signal) noexcept {

@@ -37,8 +37,9 @@ struct FgPresentOrderRule {
 
     void Reset() noexcept { *this = FgPresentOrderRule{}; }
 
-    // How long the render queue waits for the Present after frame generation is done. `frame_us`: the markers'
-    // interval, 0 while unknown (the most then).
+    // How long the watchdog lets the render queue wait for the Present: from its own wake for the marker (frame
+    // generation is done), not from the GPU's completion of it. `frame_us`: the markers' interval, 0 while unknown
+    // (the most then).
     static unsigned BoundUs(unsigned frame_us) noexcept {
         if (!frame_us) return kBoundMostUs;
         const unsigned share = frame_us / kBoundShare;
