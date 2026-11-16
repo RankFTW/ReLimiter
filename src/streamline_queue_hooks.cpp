@@ -71,9 +71,10 @@ void STDMETHODCALLTYPE ObserveExecute(ID3D12CommandQueue* queue, UINT count, ID3
     // A nested Execute on the adopted queue (the Streamline handoff's own) interrupts a pending borrowed marker: the
     // probe settles it with its own Signal before the call is forwarded.
     if (depth > 1) GpuQueueProbe_BorrowInterrupt(queue);
-    // fg_render_break_every (key off: one load and a branch): in front of a submission the ordered render queue gets
-    // a break, through the originals (no detour sees it). Behind the probe's entry: a borrowed marker of the
-    // submission before is settled first, so the break's time is never read as that submission's.
+    // fg_render_break_every (one load and a branch where the unit does not order): in front of a submission the
+    // ordered render queue gets a break, through the originals (no detour sees it). Behind the probe's entry: a
+    // borrowed marker of the submission before is settled first, so the break's time is never read as that
+    // submission's.
     if (depth == 1 && !callback.IsStopping())
         FgPresentOrder_BeforeExecute(queue, original_signal.load(std::memory_order_acquire),
             original_wait.load(std::memory_order_acquire));
@@ -83,9 +84,9 @@ void STDMETHODCALLTYPE ObserveExecute(ID3D12CommandQueue* queue, UINT count, ID3
     // The probe's done Signal goes first, directly behind the game's call: whatever the
     // Streamline handoff enqueues after it belongs to what follows.
     GpuQueueProbe_ExecuteLeave(probe);
-    // fg_present_order_trailing (key off: one load and a branch): the outermost submission that went on its queue. It
-    // is the anchor when it is the presenting thread's first after a Present: the unit's own Signal then goes directly
-    // behind it (and the probe's done Signal), through the original (no detour sees it).
+    // fg_present_order_trailing (one load and a branch where the unit does not order): the outermost submission that
+    // went on its queue. It is the anchor when it is the presenting thread's first after a Present: the unit's own
+    // Signal then goes directly behind it (and the probe's done Signal), through the original (no detour sees it).
     if (depth == 1 && !callback.IsStopping()) FgPresentOrder_AfterExecute(queue, count, original_signal);
     if (!callback.IsStopping() && depth == 1 && streamline_ready.load(std::memory_order_acquire))
         StreamlineHandoff_Execute(queue);

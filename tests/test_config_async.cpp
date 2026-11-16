@@ -523,6 +523,20 @@ void TestPacingPipelineDefaults() {
     // The lead queue correction is on by default too (one constant); the published switch follows the configuration.
     CHECK(g_config.lead_queue_correction && kPacingLeadQueueCorrectionDefault && g_lead_queue_correction.load());
     CHECK(Value(local_path, "FrameLimiter", "lead_queue_correction") == "true");
+    // The frame generation ordering is on by default: the switch, the trailing release, the hold on the separate
+    // presenter's route and the breaks. The INI only reads them (never saves them), and the published switches follow the
+    // configuration; the trailing release and the breaks never publish on in a 32-bit process.
+    CHECK(g_config.fg_present_order && g_config.fg_present_order_trailing && g_config.fg_separate_presenter_hold);
+    CHECK(g_config.fg_render_break_every == 1 && g_config.fg_render_break_window == -1);
+    CHECK(g_fg_present_order.load() == is64 && g_fg_present_order_trailing.load() == is64);
+    CHECK(g_fg_render_break_every.load() == (is64 ? 1 : 0) && g_fg_render_break_window.load() == -1);
+    CHECK(g_fg_separate_presenter_hold.load());
+    for (const char* key : {"fg_present_order", "fg_present_order_trailing", "fg_separate_presenter_hold",
+                            "fg_render_break_every", "fg_render_break_window"})
+        CHECK(Value(local_path, "FrameLimiter", key).empty());
+    const Config recommended{}; // the struct's own initializers agree with the INI read defaults above
+    CHECK(recommended.fg_present_order && recommended.fg_present_order_trailing && recommended.fg_separate_presenter_hold);
+    CHECK(recommended.fg_render_break_every == 1 && recommended.fg_render_break_window == -1);
     CheckProductionDefaults();
     // The startup rewrite saves every key, including the developer keys.
     CHECK(Value(local_path, "FrameLimiter", "flip_metering_off") == "false");
@@ -748,6 +762,53 @@ void TestLeadQueueCorrectionIsOnByDefault() {
     CHECK(!g_lead_queue_correction.load() && Config_DeveloperOverrides() == 1);
     Config_ResetDeveloperSettings();
     CHECK(g_config.lead_queue_correction && g_lead_queue_correction.load() && Config_DeveloperOverrides() == 0);
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// The frame generation ordering switches that became defaults (fg_present_order_trailing, fg_render_break_every 1,
+// fg_separate_presenter_hold) are on by default and are not developer overrides: the INI only reads them. A launch
+// without them publishes them and logs nothing about them; one that is off (the breaks also at a value other than 1)
+// loads, is published, is a live key and logs one Warn line. The lines are counted, not read.
+void TestFgOrderingSwitchesAreOnByDefault() {
+    const bool is64 = sizeof(void*) == 8;
+    const auto launch = [](const std::vector<IniEntry>& extra) {
+        std::vector<IniEntry> ini{{"config_version", "6"}};
+        ini.insert(ini.end(), extra.begin(), extra.end());
+        Reset(false, false, ini);
+        return WarnCount("");
+    };
+    const size_t quiet = launch({});
+    CHECK(g_config.fg_present_order_trailing && g_config.fg_separate_presenter_hold && g_config.fg_render_break_every == 1);
+    CHECK(g_fg_present_order_trailing.load() == is64 && g_fg_render_break_every.load() == (is64 ? 1 : 0));
+    CHECK(g_fg_separate_presenter_hold.load() && Config_DeveloperOverrides() == 0);
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    CHECK(launch({{"fg_present_order_trailing", "false"}}) == quiet + 1);
+    CHECK(!g_config.fg_present_order_trailing && !g_fg_present_order_trailing.load() && Config_DeveloperOverrides() == 0);
+    char error[128] = {};
+    CHECK(Config_SetLiveKey("fg_present_order_trailing", "on", error, sizeof(error)) && g_config.fg_present_order_trailing);
+    CHECK(g_fg_present_order_trailing.load() == is64);
+    CHECK(Config_SetLiveKey("fg_present_order_trailing", "off", error, sizeof(error)) && !g_fg_present_order_trailing.load());
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    CHECK(launch({{"fg_render_break_every", "0"}}) == quiet + 1);
+    CHECK(g_config.fg_render_break_every == 0 && g_fg_render_break_every.load() == 0 && Config_DeveloperOverrides() == 0);
+    CHECK(Config_SetLiveKey("fg_render_break_every", "1", error, sizeof(error)) && g_config.fg_render_break_every == 1);
+    CHECK(g_fg_render_break_every.load() == (is64 ? 1 : 0));
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    CHECK(launch({{"fg_render_break_every", "2"}}) == quiet + 1);
+    CHECK(g_config.fg_render_break_every == 2 && g_fg_render_break_every.load() == (is64 ? 2 : 0));
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    CHECK(launch({{"fg_separate_presenter_hold", "false"}}) == quiet + 1);
+    CHECK(!g_config.fg_separate_presenter_hold && !g_fg_separate_presenter_hold.load() && Config_DeveloperOverrides() == 0);
+    CHECK(Config_SetLiveKey("fg_separate_presenter_hold", "on", error, sizeof(error)) && g_fg_separate_presenter_hold.load());
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    CHECK(launch({{"fg_present_order_trailing", "false"}, {"fg_render_break_every", "0"},
+                  {"fg_separate_presenter_hold", "false"}}) == quiet + 3);
+    CHECK(!g_fg_present_order_trailing.load() && g_fg_render_break_every.load() == 0 && !g_fg_separate_presenter_hold.load());
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
@@ -2695,6 +2756,7 @@ int main() {
     TestGpuWaitPresentFirstIsOnByDefault();
     TestGpuWaitStartLimitIsOnByDefault();
     TestLeadQueueCorrectionIsOnByDefault();
+    TestFgOrderingSwitchesAreOnByDefault();
     TestUnifiedHoldShareKey();
     TestUnifiedQueueLawKeys();
     TestUnifiedQueueNeedFramesKey();

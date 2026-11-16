@@ -516,8 +516,8 @@ void RejectRoute(const char* reason) noexcept {
 // Installer worker: the separate-presenter capability for the current controller,
 // while the evidence matches the current route identity and FG presents. Cleared
 // by a cycle completed with a worker-local Present or by such a Present, never by time.
-// The route still qualifies while present-first ordering holds the source queue for the
-// presenter (Cycle::separate); the resolver reads the capability only while it does not.
+// The route still qualifies while present-first ordering holds the source queue for the presenter (Cycle::separate;
+// the developer switch fg_separate_presenter_hold, on by default); the resolver reads the capability only while it does not.
 void PublishSeparatePresenter() noexcept {
     constexpr auto relaxed = std::memory_order_relaxed;
     const auto context = NativeGate_GetContext(Now());
@@ -535,12 +535,18 @@ void PublishSeparatePresenter() noexcept {
     PacingPipeline_PublishCapability(PacingCapability::FgSeparatePresenter, evident, context.controller_generation);
     if (evident == s.published) return;
     s.published = evident;
-    if (evident)
-        LOG_INFO("Streamline GPU: frame generation presents from its own thread and queue (no hardware flip metering); "
-                 "the FG input wait holds it while present-first ordering is established, otherwise the cap applies "
-                 "at the source (fg_route_unsupported)");
-    else
+    if (evident) {
+        if (g_fg_separate_presenter_hold.load(relaxed))
+            LOG_INFO("Streamline GPU: frame generation presents from its own thread and queue (no hardware flip "
+                     "metering); the FG input wait holds it while present-first ordering is established, otherwise "
+                     "the cap applies at the source (fg_route_unsupported)");
+        else
+            LOG_INFO("Streamline GPU: frame generation presents from its own thread and queue (no hardware flip "
+                     "metering); fg_separate_presenter_hold is off, so the FG input wait does not hold it and the cap "
+                     "applies at the source (fg_route_unsupported)");
+    } else {
         LOG_INFO("Streamline GPU: the separate presenter is no longer current; the FG input route is judged again");
+    }
 }
 bool SamePolicy(const StreamlineInputScope& scope) noexcept {
     const auto& a = route.cycle.input;

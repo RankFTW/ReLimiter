@@ -397,14 +397,14 @@ void LoadConfig(HMODULE hModule) {
     g_config.gpu_queue_probe=ReadINIBool(S,"gpu_queue_probe",kPacingGpuQueueProbeDefault,P);
     g_config.gpu_queue_probe_source=ReadINIInt(S,"gpu_queue_probe_source",kPacingGpuQueueProbeSourceDefault,P);
     g_config.fg_present_order=ReadINIBool(S,"fg_present_order",true,P);
-    g_config.fg_separate_presenter_hold=ReadINIBool(S,"fg_separate_presenter_hold",false,P);
-    g_config.fg_present_order_trailing=ReadINIBool(S,"fg_present_order_trailing",false,P);
+    g_config.fg_separate_presenter_hold=ReadINIBool(S,"fg_separate_presenter_hold",true,P);
+    g_config.fg_present_order_trailing=ReadINIBool(S,"fg_present_order_trailing",true,P);
     g_config.gpu_wait_late_guard=ReadINIBool(S,"gpu_wait_late_guard",false,P);
     g_config.gpu_wait_present_first=ReadINIBool(S,"gpu_wait_present_first",kPacingGpuWaitPresentFirstDefault,P);
     g_config.gpu_wait_start_limit=ReadINIBool(S,"gpu_wait_start_limit",kPacingGpuWaitStartLimitDefault,P);
     g_config.lead_queue_correction=ReadINIBool(S,"lead_queue_correction",kPacingLeadQueueCorrectionDefault,P);
     g_config.gpu_wait_ab_interleave_s=ReadINIInt(S,"gpu_wait_ab_interleave_s",0,P);
-    g_config.fg_render_break_every=ReadINIInt(S,"fg_render_break_every",0,P);
+    g_config.fg_render_break_every=ReadINIInt(S,"fg_render_break_every",1,P);
     g_config.fg_render_break_window=ReadINIInt(S,"fg_render_break_window",-1,P);
     g_config.unified_hold_share=ReadINIDouble(S,"unified_hold_share",kPacingUnifiedHoldShareDefault,P);
     g_config.unified_queue_law=ReadINIBool(S,"unified_queue_law",kPacingUnifiedQueueLawDefault,P);
@@ -1132,6 +1132,24 @@ void ApplyConfig() {
         LOG_WARN("Diagnostic lead queue correction off: the GPU queue wait's lead samples keep the time a finished "
                  "frame waited for the game's render thread, and under present-first ordering that wait follows "
                  "the lead (lead_queue_correction=false; 64-bit Direct3D 12)");
+    // The frame generation ordering switches are on by default (the INI only reads them and never saves them; they
+    // act only where frame generation presents from its own thread, once present-first ordering is established): a
+    // line only when one is off.
+    if (!g_config.fg_present_order_trailing)
+        LOG_WARN("Diagnostic FG trailing release off: the render queue is released when the generated frame's Present "
+                 "returns, not behind the presenting thread's next submission (fg_present_order_trailing=false; "
+                 "64-bit Direct3D 12)");
+    if (g_config.fg_render_break_every <= 0)
+        LOG_WARN("Diagnostic FG render breaks off: the render queue gets no breaks that give frame generation's Present "
+                 "room on the GPU (fg_render_break_every=%d; 64-bit Direct3D 12)", g_config.fg_render_break_every);
+    else if (g_config.fg_render_break_every != 1)
+        LOG_WARN("Diagnostic FG render breaks every %d submissions: the recommended setting breaks in front of each "
+                 "submission of a window (fg_render_break_every=%d; 64-bit Direct3D 12)",
+            g_config.fg_render_break_every, g_config.fg_render_break_every);
+    if (!g_config.fg_separate_presenter_hold)
+        LOG_WARN("Diagnostic FG separate presenter hold off: the FG input wait does not hold frame generation that "
+                 "presents from its own thread, and the cap applies at the source "
+                 "(fg_separate_presenter_hold=false; 64-bit Direct3D 12)");
     if (g_config.gpu_queue_probe != kPacingGpuQueueProbeDefault)
         LOG_WARN("Diagnostic GPU queue probe off: the presenting queue's submissions are not measured "
                  "(gpu_queue_probe=false; the queue law needs it and forces it on)");

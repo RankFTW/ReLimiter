@@ -33,8 +33,7 @@
 // and Wait. Frame generation, ordering: per frame one queue Signal, one queue Wait, one event registration on the
 // game's Present thread and one fence Signal on DLSS-G's presenting thread.
 //
-// Trailing release (developer A/B switch `fg_present_order_trailing`, default off; design:
-// project-docs/002_unified_pacing_timing/foundation/design_fg_order_trailing_release.md). The release above is made
+// Trailing release (developer A/B switch `fg_present_order_trailing`, default on). The release above is made
 // when the generated frame's native Present has returned, and DLSS-G's presenting thread then submits one more packet
 // and queues two Signals on its presenting queue (36 to 56 µs later in 97% of the frames of Phantom Blade Zero), which
 // land behind the render queue's batch that the release has just let go. With the switch on, while the unit orders and
@@ -67,9 +66,22 @@
 // and 4x, not yet
 // seen in a trace, the thread may present more than once before it submits its work), but one that returns meanwhile
 // is still told to the breaks. Key off: the release is made as before, byte for byte, nothing more is made at the
-// bind, and each outermost Execute pays one relaxed load and a branch. Key on: a thread-id compare there; per frame
-// one clock read at the Present's return, one queue Signal and one event registration on the presenting thread, and
-// one more wake of the unit's thread.
+// bind, and each outermost Execute pays one relaxed load and a branch (two where the unit orders: its queue is tested
+// first). Key on: the same at each outermost Execute while the unit does not order; while it orders a call and a
+// thread-id compare there, and per frame one clock read at the Present's return, one queue Signal and one event
+// registration on the presenting thread, and one more wake of the unit's thread.
+//
+// Defaults. The trailing release, the breaks below and the hold on the separate presenter's route are on by default
+// (measured at 2x in Phantom Blade Zero and Gears of War; not at 3x and 4x or in another game), and each acts only once
+// this unit has established the ordering (g_fg_present_order_queue): the breaks are enqueued only on that queue
+// (FgPresentOrder_BeforeExecute), the hold is read only for a cycle without a worker-local Present
+// (FgPresentOrder_ProvesSeparatePresenter, which needs FgPresentOrder_Orders), and a release is deferred and an anchor
+// awaited only while the unit orders (PlanTrailingLocked, StartObservation). With hardware flip metering the worker
+// presents, so the ordering never establishes, and without frame generation nothing binds (FgPresentOrder_Service),
+// so in either case the three do nothing. What they cost there: one relaxed load and a branch at each outermost
+// Execute, as with the keys off (both Execute gates test the ordering's queue first); and for the trailing release one
+// more fence at each bind, on the game's thread inside the proxy Present (and an event, the first time), and on the
+// unit's own thread a deadline published at each marker wake and a wait for its locks at the deadline instead of a try.
 //
 // The unit is part of the add-on only (RELIMITER_FG_PRESENT_ORDER, set for the add-on target): every other target
 // that compiles a caller gets the no-op forms below.
@@ -82,11 +94,14 @@ inline std::atomic<uint64_t> g_fg_present_order_issued{0}, g_fg_present_order_re
 // The render queue that is made to wait at present (identity only), null while none is. It is set only after the
 // evidence of the rule: frame generation's completion on that queue is followed by a native Present of another
 // thread than DLSS-G's worker. To the Streamline handoff that is the evidence of a separate presenter on that source
-// queue, and, with the developer A/B switch `fg_separate_presenter_hold` (default off: alone the hold made the display
-// less even, N.102), the ground on which such a presenter's cycles stand without a worker-local Present.
+// queue, and, with the developer A/B switch `fg_separate_presenter_hold` (default on, together with the breaks: alone
+// the hold made the display less even, and the breaks and the trailing release without it made a cap worse), the
+// ground on which such a presenter's cycles stand without a worker-local Present.
 inline std::atomic<void*> g_fg_present_order_queue{nullptr};
+// The hold below, the trailing release after it and the breaks further down are on by default and published by the
+// configuration; their own initial values stay off until it publishes them, so nothing acts before.
 inline std::atomic<bool> g_fg_separate_presenter_hold{false};
-// Developer A/B switch `fg_present_order_trailing` (default off; published by the configuration, 64-bit only): the
+// Developer A/B switch `fg_present_order_trailing` (default on; published by the configuration, 64-bit only): the
 // release is deferred behind the work the presenting thread queues after the Present (see Trailing release above).
 inline std::atomic<bool> g_fg_present_order_trailing{false};
 // The render queue is ordered only while the key is on: the qualification stays published when the key is turned
@@ -98,7 +113,7 @@ inline bool FgPresentOrder_Orders(const void* queue) noexcept {
 inline bool FgPresentOrder_ProvesSeparatePresenter(const void* queue) noexcept {
     return g_fg_separate_presenter_hold.load(std::memory_order_relaxed) && FgPresentOrder_Orders(queue);
 }
-// Breaks in the render queue's committed work (developer live key `fg_render_break_every`, default 0 = off): in
+// Breaks in the render queue's committed work (developer live key `fg_render_break_every`, default 1 = on): in
 // front of a submission the ordered render queue signals a fence and waits for that value, so the GPU is handed
 // nothing past that point until it has reached it and a waiting Present of DLSS-G's thread gets the GPU there
 // (fg_present_order.cpp). `fg_render_break_window` says which submissions: -1 (default) those around the one the
@@ -139,21 +154,25 @@ inline void FgPresentOrder_AfterWait(ID3D12CommandQueue* queue, ID3D12Fence* fen
     if (g_fg_present_order.load(std::memory_order_relaxed))
         FgPresentOrder_AfterWaitActive(queue, fence, native_signal, native_wait);
 }
-// Queue Execute detour, in front of the native call, outermost calls only (key off: one load and a branch).
+// Queue Execute detour, in front of the native call, outermost calls only. The ordering's queue is tested first, so
+// where the unit does not order (hardware flip metering, no frame generation) this is one load and a branch.
 inline void FgPresentOrder_BeforeExecute(ID3D12CommandQueue* queue, FgPresentOrder_FenceFn native_signal,
     FgPresentOrder_FenceFn native_wait) noexcept {
-    if (g_fg_render_break_every.load(std::memory_order_relaxed) > 0 &&
-        g_fg_present_order.load(std::memory_order_relaxed) &&
-        g_fg_present_order_queue.load(std::memory_order_relaxed) == queue)
+    if (g_fg_present_order_queue.load(std::memory_order_relaxed) == queue &&
+        g_fg_render_break_every.load(std::memory_order_relaxed) > 0 &&
+        g_fg_present_order.load(std::memory_order_relaxed))
         FgPresentOrder_BeforeExecuteActive(queue, native_signal, native_wait);
 }
-// Queue Execute detour, after the native call returned and the probe's done Signal went on, outermost calls only (key
-// off: one load and a branch). `native_signal` is the detour's atomic slot of the native Signal, read only with the
-// key on. The presenting thread's first submission after a Present is the anchor the trailing release waits behind.
+// Queue Execute detour, after the native call returned and the probe's done Signal went on, outermost calls only. The
+// ordering's queue is tested first, so where the unit does not order (hardware flip metering, no frame generation)
+// this is one load and a branch. `native_signal` is the detour's atomic slot of the native Signal, read only when the
+// call is made. The presenting thread's first submission after a Present is the anchor the trailing release waits
+// behind, and a Present's release leaves one only while the unit orders.
 template <class SignalSlot>
 inline void FgPresentOrder_AfterExecute(ID3D12CommandQueue* queue, unsigned lists,
     const SignalSlot& native_signal) noexcept {
-    if (g_fg_present_order_trailing.load(std::memory_order_relaxed))
+    if (g_fg_present_order_queue.load(std::memory_order_relaxed) != nullptr &&
+        g_fg_present_order_trailing.load(std::memory_order_relaxed))
         FgPresentOrder_AfterExecuteActive(queue, lists, native_signal.load(std::memory_order_acquire));
 }
 // Native Present entries, after the native call returned (nothing pending: three loads and a branch).

@@ -88,10 +88,10 @@ std::atomic<void*> failed_queue{nullptr};
 std::atomic<int64_t> frame_qpc{0};            // when the newest marker was enqueued
 std::atomic<unsigned> frame_us{0};            // the markers' interval, smoothed over eight
 
-// ── Breaks in the render queue's committed work (developer live key `fg_render_break_every`, default 0 = off) ──
+// ── Breaks in the render queue's committed work (developer live key `fg_render_break_every`, default 1 = on) ──
 // The GPU is handed the render queue's work up to twelve submissions ahead, and a Present of DLSS-G's own thread that
 // arrives meanwhile gets the GPU 1 to 2 ms later at the median, 2 to 5 ms at the 90th percentile, although its queue
-// has the higher priority; where the render queue has nothing committed it runs at once (N.103). In front of a
+// has the higher priority; where the render queue has nothing committed it runs at once. In front of a
 // submission the render queue therefore signals `breaker` and waits for that value: the GPU is handed nothing past
 // that point until it has reached it, releases the Wait itself there, and takes a waiting Present first. No thread
 // and no watchdog: each Wait follows its own Signal in the same queue. One submitter at a time enqueues a pair, so

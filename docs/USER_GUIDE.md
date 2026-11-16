@@ -178,7 +178,7 @@ The main view shows one plain line under the FPS controls:
 | `Learning the game's frame timing...` | Amber | A hold is active but its lead is still warming up. It clears by itself after a few moments. |
 | `Getting ready...` | Amber | The GPU wait output has not qualified yet and nothing is held. Normal after starting the game, toggling FG or changing settings. |
 | `Capped: smooth pacing needs NVIDIA Reflex in the game` | Grey | The game is paced at Present calls without Reflex markers; the cap applies but frames are not held. |
-| `Capped: frame generation paces its own frames here (frames are not held)` | Grey | Frame generation presents its frames itself, from its own thread and queue, as DLSS Frame Generation does when hardware flip metering is not in use. ReLimiter cannot hold them there; the cap still applies. |
+| `Capped: frame generation paces its own frames here (frames are not held)` | Grey | Frame generation presents its frames itself, from its own thread and queue, as DLSS Frame Generation does when hardware flip metering is not in use. ReLimiter holds the real frames there only once its own checks show that it can order the game's render queue behind the generated frame's Present, a moment after frame generation starts presenting; until then, or where it cannot, nothing is held and the cap still applies. |
 | `Idle cap active (background, FG-Off Cap or OLED Care)` | Grey | An idle cap is active; frames follow the cadence without an output hold. |
 | `No FPS cap set` | Grey | The FPS limiter has no cap for ReLimiter to pace. |
 | `Not pacing right now` | Grey | A cap is set but ReLimiter is not pacing, for example during Dynamic MFG passthrough or before a presenting swapchain exists. |
@@ -215,7 +215,7 @@ Below the status line itself (not under **Details**), `Dynamic frame generation:
 | `no_native_route` | The GPU wait route has not qualified yet, or the markers come from Streamline PCL rather than native Reflex. |
 | `no_gpu_queue` | The GPU queue wait is not ready yet. |
 | `fg_unqualified` | Frame generation is presenting on DX12 with native Reflex markers, but its FG input route has not qualified yet; nothing is held. |
-| `fg_route_unsupported` | Frame generation presents its frames from its own thread and queue (DLSS Frame Generation without hardware flip metering), so the FG input wait cannot hold them; the cap applies and nothing is held. |
+| `fg_route_unsupported` | Frame generation presents its frames from its own thread and queue (DLSS Frame Generation without hardware flip metering), so the FG input wait cannot hold them until ReLimiter has ordered the game's render queue behind the generated frame's Present; until then, or where it cannot, the cap applies and nothing is held. |
 | `override`, `driver_limiter_unavailable` | The developer test mode `driver_limiter` is set: `override` while the NVIDIA driver's Reflex limiter holds the cap, `driver_limiter_unavailable` where it cannot apply and the game runs as it is. See [Developer Settings](#developer-settings). |
 
 Reasons from `architecture` to `no_gpu_queue` come with `marker_hold`: they name the first requirement of the GPU queue wait that is not met. They do not mean pacing has failed. Brief warm-up after starting the game, toggling FG or changing settings is normal.
@@ -411,7 +411,7 @@ The panel and OSD can show the detected multiplier and the corresponding render 
 | **Dynamic MFG** | Leaves pacing to the driver; see the next section. |
 | **NVIDIA Smooth Motion** | Supports detection and the normal cap, without an FG input wait. |
 
-Detection and the FG input wait are separate. Until the FG input route qualifies, frame generation runs with `source_only` and the reason `fg_unqualified`: the cap cadence still applies, but nothing is held after the source wait. Where frame generation presents its frames from its own thread and queue, as DLSS Frame Generation does when hardware flip metering is not in use, the route cannot qualify: the reason is `fg_route_unsupported` and the main view reads **Capped: frame generation paces its own frames here (frames are not held)**. Where the FG input wait cannot run at all, the reason names the missing requirement instead, for example `api` on Vulkan.
+Detection and the FG input wait are separate. Until the FG input route qualifies, frame generation runs with `source_only` and the reason `fg_unqualified`: the cap cadence still applies, but nothing is held after the source wait. Where frame generation presents its frames from its own thread and queue, as DLSS Frame Generation does when hardware flip metering is not in use, the route qualifies only once ReLimiter has ordered the game's render queue behind the generated frame's Present, a moment after frame generation starts presenting; until then the reason is `fg_route_unsupported` and the main view reads **Capped: frame generation paces its own frames here (frames are not held)**. Where the FG input wait cannot run at all, the reason names the missing requirement instead, for example `api` on Vulkan.
 
 ### FG Input Wait Requirements
 
