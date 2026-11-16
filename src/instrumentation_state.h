@@ -39,9 +39,10 @@ inline std::atomic<int> g_unified_queue_margin_end{1};
 // owner at each plan.
 inline std::atomic<bool> g_gpu_wait_late_guard{false};
 // Developer key gpu_wait_start_limit (default on, kPacingGpuWaitStartLimitDefault; lead_controller.h, the start
-// term): the collision guard's second limit on the GPU queue wait's lead, and the executor resolves no target past
-// it. Published by Config_ApplyPacingPipeline; read by the scheduler owner at each plan. Its own initial value
-// stays false as the present-first switch's does: nothing is limited before the configuration is published.
+// term): the collision guard's second limit on the lead of the GPU queue wait plans made on present-first ordering,
+// and the executor resolves no target past it. Published by Config_ApplyPacingPipeline; read by the scheduler owner
+// at each plan. Its own initial value stays false as the present-first switch's does: nothing is limited before
+// the configuration is published.
 inline std::atomic<bool> g_gpu_wait_start_limit{false};
 // Developer switch gpu_wait_present_first (default on, kPacingGpuWaitPresentFirstDefault; gpu_hold_order.h): in a
 // game whose render queue is not its presenting queue, the render queue's next frame waits until a held frame's

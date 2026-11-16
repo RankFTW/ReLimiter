@@ -1373,9 +1373,9 @@ void TestCollisionGuardSwitches()
 
 // The start term (developer key gpu_wait_start_limit, lead_controller.h): both planning branches hand the request's
 // switches to the lead, and the plan carries the limit the lead applied to the executor (lead_limit_us, in the
-// registry's copy too); the frame and the source record say what the term found and whether it was applied. On a
-// lead that has seen nothing the limit is 2 I less the release headroom (1,000 µs): there is no service and no
-// turnaround yet.
+// registry's copy too); the frame and the source record say what the term found and whether it was applied. The term
+// is for plans made on present-first ordering: a plan that is not ordered gets none. On a lead that has seen nothing
+// the limit is 2 I less the release headroom (1,000 µs): there is no wait, service or turnaround yet.
 void TestPlanCarriesStartLimit()
 {
     std::printf("Test: the plan carries the start limit exactly when the lead applied it\n");
@@ -1394,13 +1394,15 @@ void TestPlanCarriesStartLimit()
         ScriptedClock clock;
         uint64_t frame_id = unified ? 2'100 : 2'000;
         // One plan with the given switches: the frame, the registry's copy of the plan and the frame's source record.
-        const auto plan = [&](const PacingPipelineSnapshot& pipeline, bool guard, bool limit, bool observe) {
+        const auto plan = [&](const PacingPipelineSnapshot& pipeline, bool guard, bool limit, bool observe,
+                              bool ordered) {
             SourceStageRequest request = unified ? UnifiedMarkerRequest(Key(frame_id++), &mailbox)
                                                  : Request(Key(frame_id++), pipeline);
             request.pipeline = pipeline;
             request.collision_guard = guard;
             request.start_limit = limit;
             request.start_observe = observe;
+            request.ordered = ordered;
             Planned planned{};
             planned.frame = g_stage.RunPlannedFrame(request, &clock);
             CHECK(planned.frame.planned && planned.frame.plan_published);
@@ -1410,21 +1412,25 @@ void TestPlanCarriesStartLimit()
             return planned;
         };
         // Applied: the plan, the registry's copy, the frame and the record all carry the limit.
-        const Planned applied = plan(gpu, true, true, false);
+        const Planned applied = plan(gpu, true, true, false, true);
+        CHECK(applied.frame.plan.ordered && applied.published.ordered);
         CHECK(Near(applied.frame.plan.lead_limit_us, limit_us, 0.01));
         CHECK(Near(applied.published.lead_limit_us, limit_us, 0.01));
         CHECK(applied.frame.start_applied && Near(applied.frame.start_limit_us, limit_us, 0.01));
         CHECK(applied.record.plan_start_applied == 1 && Near(applied.record.plan_start_limit_us, limit_us, 0.01));
         // Only observed (the interleave's odd periods): the limit is found and reported, nothing is limited.
-        const Planned observed = plan(gpu, true, false, true);
+        const Planned observed = plan(gpu, true, false, true, true);
         CHECK(observed.frame.plan.lead_limit_us == 0.0f && observed.published.lead_limit_us == 0.0f);
         CHECK(!observed.frame.start_applied && Near(observed.frame.start_limit_us, limit_us, 0.01));
         CHECK(observed.record.plan_start_applied == 0 && Near(observed.record.plan_start_limit_us, limit_us, 0.01));
-        // Neither switch, the guard off, or another rung: the term does not run.
-        const Planned off = plan(gpu, true, false, false);
-        const Planned unguarded = plan(gpu, false, true, true);
-        const Planned other = plan(source_only, true, true, true);
-        for (const Planned* planned : { &off, &unguarded, &other }) {
+        // Neither switch, the guard off, another rung, or a plan that is not ordered (applying and observing both
+        // asked for): the term does not run.
+        const Planned off = plan(gpu, true, false, false, true);
+        const Planned unguarded = plan(gpu, false, true, true, true);
+        const Planned other = plan(source_only, true, true, true, true);
+        const Planned unordered = plan(gpu, true, true, true, false);
+        CHECK(!unordered.frame.plan.ordered && !unordered.published.ordered);
+        for (const Planned* planned : { &off, &unguarded, &other, &unordered }) {
             CHECK(planned->frame.plan.lead_limit_us == 0.0f && planned->published.lead_limit_us == 0.0f);
             CHECK(!planned->frame.start_applied && planned->frame.start_limit_us == 0.0);
             CHECK(planned->record.plan_start_applied == 0 && planned->record.plan_start_limit_us == 0.0);

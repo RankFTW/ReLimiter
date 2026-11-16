@@ -9,9 +9,9 @@
 // dependencies. Owned and called only by the scheduler owner; not thread-safe.
 //
 // Storage is fixed and nothing allocates. sizeof(LeadController) is about
-// 176 KB (20 buckets of a 256-sample ring and a 2,048-bin histogram, four
+// 181 KB (20 buckets of a 256-sample ring and a 2,048-bin histogram, four
 // release → Present call windows, four release → heavy GPU work windows, the
-// first-submission window and the start term's two windows of the same shape,
+// first-submission window and the start term's three windows of the same shape,
 // plus the pending-frame table): keep the instance in static storage or on the
 // heap, never on a thread stack.
 
@@ -271,43 +271,52 @@ constexpr double LEAD_CONCURRENCY_TOLERANCE_US = 100.0;
 // Start term (developer key gpu_wait_start_limit, default on; design in
 // project-docs/002_unified_pacing_timing/foundation/design_start_gate.md). The built guard above keeps a hold
 // from ending in the next frame's heavy GPU work; it says nothing about the game's own flow control, and where it
-// stands aside (ordered plans, games whose next GPU work runs behind the wait) nothing did. The game's Present
-// does not end (b_{n+1}, the PRESENT_END marker) before the presenting queue has processed the previous frame's
-// Present (x_n), and the game asks for its next frame right behind that end (a_{n+2} − b_{n+1}, its arrival at
-// ReLimiter). So the start of frame n + 2 cannot come before o_n plus the Present's service (x_n − max(o_n, r_n))
-// plus that turnaround, while its start target is s_n + 2 I: a lead above 2 I less those two times makes the game
-// late for frame n + 2, and the start law never catches a late release up. A hold that does this on every second
-// frame is a saw-tooth in the frame-time graph (Rogue Core at a cap, with the ordered plans' lead at the
-// controller's own). The term is a second limit of the same guard, in the same function, through the same slew back
-// and the same channel to the executor (PacingFramePlan::lead_limit_us), for every GPU queue wait plan with the
-// guard on, ordered or not, whether or not the built guard judged it:
-//   limit = 2 I − (S99 + G99),   L <= limit + the plan's anchor delta (the built limit adds it the same way).
-// S99 is the 99th percentile of the newest LEAD_WINDOW_CAPACITY Present services x − max(o, r) of held frames: x is
-// the hold order unit's stamp (PacingStageEventKind::PresentProcessed) for every held frame it follows, whatever the
-// lead. G99 is that of the newest turnarounds a_{n+1} − b_n of every frame, held or not; 0 while there is none. Both
-// are measured on frames the limit does not remove, so neither can go stale behind its own effect; the direct sample
-// a_{n+2} − o_n could, because a limit built from it removes the frames it learns from (the latch the release
-// headroom above records). Samples above LEAD_LONG_SAMPLE_INTERVALS intervals are in neither window, and a service
-// below 0 is none. S99 is used once LEAD_WARM_SAMPLES services exist and one arrived among the newest
-// LEAD_WORK_STALE_FRAMES frames planned with the GPU queue wait's lead; until then, and where nothing stamps
-// services (the key off, Win32, one queue), the release headroom H (LeadRequest::release_headroom_us) stands in:
-// the fallback, named so in the statistics and the log.
+// stands aside (ordered plans, games whose next GPU work runs behind the wait) nothing did. Under present-first
+// ordering the render queue's next frame waits for a held frame's Present, and the game's own frame sync ties its
+// next frames to the render queue: its PRESENT_END (b_{n+1}) comes with the render queue's next start, the release
+// of the order's Wait, which follows the hold's release o_n, and it asks for its next frame right behind that end
+// (a_{n+2} − b_{n+1}, its arrival at ReLimiter). So the start of frame n + 2 cannot come before o_n plus the game's
+// wait after the release (b_{n+1} − o_n) plus that turnaround, while its start target is s_n + 2 I: a lead above 2 I
+// less those two times makes the game late for frame n + 2, and the start law never catches a late release up. A hold
+// that does this on every second frame is a saw-tooth in the frame-time graph (Rogue Core at a cap, with the ordered
+// plans' lead at the controller's own). The term is a second limit of the same guard, in the same function, through
+// the same slew back and the same channel to the executor (PacingFramePlan::lead_limit_us), for the GPU queue wait
+// plans made on present-first ordering (LeadRequest::ordered) with the guard on, whether or not the built guard
+// judged them:
+//   limit = 2 I − (W99 + G99),   L <= limit + the plan's anchor delta (the built limit adds it the same way).
+// A plan that is not ordered gets no term at all (no limit, no verdict, no count): without the order a hold on the
+// presenting queue does not block the render queue, no capture shows a delayed start there, and the built limit is
+// that plan's own. W99 is the game's wait after the release, from the best measure there is (LeadStartSource):
+// - GameWait: the 99th percentile of the newest LEAD_WINDOW_CAPACITY samples b_{n+1} − o_n of the telling pairs that
+//   are not free (below), the direct measure of what the game does after a hold. Used once LEAD_WARM_SAMPLES of them
+//   exist and one arrived among the newest LEAD_WORK_STALE_FRAMES frames planned with the GPU queue wait's lead.
+// - Service: else the 99th percentile of the newest Present services x − max(o, r) of held frames, under the same two
+//   conditions. x is the hold order unit's stamp (PacingStageEventKind::PresentProcessed) of the frame's Present
+//   processed by the presenting queue. It reads low by the order's release chain, so it only stands in while the
+//   direct measure cannot be seen: a telling pair needs the next Present to arrive before the release, so a limit that
+//   keeps holds ending before it leaves no pair to sample, and the direct window goes stale behind its own effect.
+// - Headroom: else the release headroom H (LeadRequest::release_headroom_us), the fallback.
+// G99 is that of the newest turnarounds a_{n+1} − b_n of every frame, held or not; 0 while there is none. Samples
+// above LEAD_LONG_SAMPLE_INTERVALS intervals are in no window, and a service below 0 is none. The statistics and the
+// log name the measure in use.
 // 2 I is exact from below at a cap (the interval cannot fall under the cap's). Where the GPU term sets the interval
 // it moves from frame to frame and one start can be late by what it fell, which is one late start, not the
 // alternation; the limit follows the plan's own interval, so it moves at once when the interval does. When frame
 // n + 1 is itself late the limit is stricter than needed, which is safe.
-// The term stands aside while the game's own times contradict either link of that chain:
-// - A free pair: a frame n with status Held and o_n > p_{n+1} (the next frame's native Present arrived before the
-//   release; only such a pair can tell), with b_{n+1} < o_n: the game's Present ended while the frame before was
-//   still held, so the game does not wait for a held Present. One among the newest LEAD_START_EVIDENCE_FRAMES telling
-//   pairs.
+// The term stands aside while the game's own times contradict the chain:
+// - A free pair: a frame n with status Held whose Present the hold order unit saw processed (x_n: the order was in
+//   effect for that edge) and o_n > p_{n+1} (the next frame's native Present arrived before the release; only such a
+//   pair can tell), with b_{n+1} < o_n: the game's Present ended while the frame before was still held, so the game
+//   does not wait for a held Present. One among the newest LEAD_START_EVIDENCE_FRAMES telling pairs. A frame without
+//   x gives no pair, telling or free: a hold the order did not release behind its Present says nothing of the
+//   order's chain. A telling pair that is not free adds b_{n+1} − o_n to the game's wait window.
 // - An untied start: a_{n+1} < b_n in one of the newest LEAD_START_EVIDENCE_FRAMES frames: the game asks for a frame
 //   before its previous Present ended (a game thread running a frame ahead), so the frame a hold reaches is a later
 //   one and the term does not describe it.
 // Without evidence the term applies: its limit is reached only by a lead already 1.8 intervals long, a game that does
 // not wait lifts the term by its own pairs as soon as its lead passes I + C, and a game that does wait is protected
-// from its first frame. A tighter limit applies at once, a relaxed one (the evidence returned, the interval grew) is
-// returned to at the lead slew, the built limit's rule.
+// from its first frame. A tighter limit applies at once, a relaxed one (the evidence returned, the interval grew, a
+// better measure came) is returned to at the lead slew, the built limit's rule.
 // Each sample and pair is judged once, by whichever callback completes it (the release of the later frame or a stage
 // event, in either order), between frames of one lifecycle with consecutive grid indices, both planned with the GPU
 // queue wait's rung, one FG divisor and a mode that samples; no pair bridges a gap. A pair and a service need the
@@ -315,16 +324,24 @@ constexpr double LEAD_CONCURRENCY_TOLERANCE_US = 100.0;
 // unit follows the frames the executor held. a is the arrival the owner passes with the release (LeadFrameStart::
 // arrival_qpc), b the PresentEnd event of the frame, o and p its OutputRelease and PresentCall events. Reset and
 // ResetBuckets clear the windows and rings and fence the frames released before them, so evidence that arrives later
-// adds nothing to the new ones. The windows and rings are fed with the key off too; only the limit reads it.
-constexpr double LEAD_START_QUANTILE = 0.99;      // S99 and G99
+// adds nothing to the new ones. The windows and rings are fed whatever the plans' words and with the key off too;
+// only the limit reads them.
+constexpr double LEAD_START_QUANTILE = 0.99;      // W99 and G99
 constexpr size_t LEAD_START_EVIDENCE_FRAMES = 64; // newest telling pairs and newest frames the stand-aside reads
 // The smallest limit the start term hands the executor. In LeadGuardOutcome::release_limit_us and
-// PacingFramePlan::lead_limit_us 0 means no limit, and a limit that reaches 0 (S99 + G99 at or above 2 I) must still
+// PacingFramePlan::lead_limit_us 0 means no limit, and a limit that reaches 0 (W99 + G99 at or above 2 I) must still
 // bind: the lead is then 0, but a lead of 0 does not guarantee no hold, because the previous output can lift the
 // spacing floor above this frame's release, and a Present that arrives before that floored target would be held
 // past the applied bound if the executor read the limit as none. With 1 µs Decide resolves max(s + 1 µs, the
 // nominal target), the nominal target. The row's limit and the lead's own bound keep the true value.
 constexpr double LEAD_START_EXECUTOR_MIN_US = 1.0;
+// Which measure the start term's limit takes for the game's wait after the release (above), the better measured last:
+// a move up this list is an improvement and a move down a fall back (the log tells only the first).
+enum class LeadStartSource : uint8_t {
+    Headroom = 0, // the release headroom: no measure is warm and current
+    Service = 1,  // the hold order unit's Present service x − max(o, r)
+    GameWait = 2  // the game's own wait after the release, b_{n+1} − o_n of the telling pairs that are not free
+};
 
 // Lockstep engines (CONTROL Resonant): the game finishes
 // frame n's render submission and Present only after ReLimiter releases
@@ -479,17 +496,19 @@ struct LeadGuardOutcome {
     // 0 when neither. An applied start limit below 1 µs (the lead is 0) is carried as LEAD_START_EXECUTOR_MIN_US,
     // never as 0, which the plan and the executor read as no limit.
     double release_limit_us = 0.0;
-    // Start term (above), GPU queue wait plans with the guard on and LeadRequest::start_limit or start_observe:
-    // the limit computed for the plan, 2 I − (S + G) in µs on the release → target distance (the anchor's delta not
-    // in it), at least 0; 0 where the term stood aside or was not computed.
+    // Start term (above), GPU queue wait plans made on present-first ordering with the guard on and
+    // LeadRequest::start_limit or start_observe: the limit computed for the plan, 2 I − (W + G) in µs on the
+    // release → target distance (the anchor's delta not in it), at least 0; 0 where the term stood aside or was not
+    // computed (a plan that is not ordered gets none).
     double start_limit_us = 0.0;
     // The term ruled the plan (LeadRequest::start_limit, not standing aside): the returned lead is at most
     // start_limit_us plus the anchor's delta. With a limit of 0 it means a limit clamped at 0.
     bool start_applied = false;
     // The term stood aside for the plan: a free pair or an untied start among the newest evidence.
     bool start_aside = false;
-    // The service in the limit is the measured S99; false: the release headroom, the fallback.
-    bool start_measured = false;
+    // The measure of the game's wait in the limit (LeadStartSource): the game's own wait, the unit's Present service,
+    // or the release headroom, the fallback; Headroom where the term did not run.
+    LeadStartSource start_source = LeadStartSource::Headroom;
 };
 
 // One Reflex latency report's GPU times for a frame (LeadController::OnGpuReport).
@@ -605,7 +624,8 @@ struct LeadRequest {
     // PendingFrame::ordered of frame n − 1; no other rung reads it.
     bool ordered = false;
     // Start term (above; developer key gpu_wait_start_limit): whether the term may set the limit on the GPU queue
-    // wait's lead with the guard on. start_observe computes the limit and the verdict and reports them
+    // wait's lead with the guard on, for a plan made on present-first ordering (`ordered`, above): a plan that is
+    // not ordered gets no term whatever these say. start_observe computes the limit and the verdict and reports them
     // (LeadGuardOutcome::start_limit_us, start_aside) without lowering the lead (the off periods of developer key
     // gpu_wait_ab_interleave_s); start_limit wins when both are set. With neither the term does not run.
     bool start_limit = false;
@@ -715,14 +735,17 @@ struct LeadStatistics {
     uint64_t queue_wait_samples = 0;
     uint64_t queue_wait_dropped = 0;
     double last_queue_wait_removed_us = 0.0;
-    // Start term (above), GPU queue wait plans with the guard on and the term's key on or observing: plans it
-    // computed a limit for, those among them it stood aside for or ran on the fallback service (the release
-    // headroom), and the plans it applied to whose returned lead its limit lowered (the limit below the lead the
-    // built guard left); the changes from applying to standing aside and back; the telling pairs, free pairs and
-    // untied starts judged (each once), and the Present services and turnarounds added to the windows or left out.
+    // Start term (above), plans made on present-first ordering with the guard on and the term's key on or
+    // observing: plans it computed a limit for, those among them it stood aside for, and those by the measure of the
+    // game's wait in the limit (the release headroom, the Present's service, the game's own wait); the plans it
+    // applied to whose returned lead its limit lowered (the limit below the lead the built guard left); the changes
+    // from applying to standing aside and back; the telling pairs, free pairs and untied starts judged (each once),
+    // and the Present services, game waits and turnarounds added to the windows or left out.
     uint64_t start_checked_frames = 0;
     uint64_t start_aside_frames = 0;
-    uint64_t start_fallback_frames = 0;
+    uint64_t start_fallback_frames = 0; // on the release headroom
+    uint64_t start_service_frames = 0;  // on the Present's service
+    uint64_t start_wait_frames = 0;     // on the game's own wait
     uint64_t start_lowered_frames = 0;
     uint64_t start_stood_aside = 0;
     uint64_t start_came_back = 0;
@@ -731,25 +754,32 @@ struct LeadStatistics {
     uint64_t start_untied_starts = 0;
     uint64_t start_service_samples = 0;
     uint64_t start_service_excluded = 0;    // a service below 0 or above 3 I
+    uint64_t start_wait_samples = 0;
+    uint64_t start_wait_excluded = 0;       // a game wait above 3 I
     uint64_t start_turnaround_samples = 0;
     uint64_t start_turnaround_excluded = 0; // a turnaround above 3 I (a negative one is an untied start)
-    // The newest computed plan: its limit (also while standing aside), the service and turnaround in it, whether
-    // the service was measured and whether it stood aside.
+    // The newest computed plan: its limit (also while standing aside), the game's wait term in it and the measure it
+    // came from, the turnaround in it, and whether it stood aside.
     double last_start_limit_us = 0.0;
-    double last_start_service_us = 0.0;
+    double last_start_wait_us = 0.0;
     double last_start_turnaround_us = 0.0;
-    bool last_start_measured = false;
+    LeadStartSource last_start_source = LeadStartSource::Headroom;
     bool last_start_aside = false;
 };
 
-// The start term's evidence now (above): the windows' sample counts, S99 and G99 as they stand (0 while a window is
-// empty), whether the service is the measured one, and the counts of the newest telling pairs and frames.
+// The start term's evidence now (above): the windows' sample counts, W99 of each measure and G99 as they stand (0
+// while a window is empty), whether the Present service and the game's wait are warm and current, the measure the term
+// would take now, and the counts of the newest telling pairs and frames.
 struct LeadStartEvidence {
     uint32_t service_samples = 0;
+    uint32_t wait_samples = 0;
     uint32_t turnaround_samples = 0;
     double service_us = 0.0;
+    double wait_us = 0.0;
     double turnaround_us = 0.0;
     bool service_measured = false;
+    bool wait_measured = false;
+    LeadStartSource source = LeadStartSource::Headroom;
     size_t telling_pairs = 0; // newest telling pairs held, at most LEAD_START_EVIDENCE_FRAMES
     size_t free_pairs = 0;    // of them, free
     size_t frames = 0;        // newest frames judged for an untied start, at most LEAD_START_EVIDENCE_FRAMES
@@ -1106,17 +1136,23 @@ private:
     void RecordReleaseHeadroom(PendingFrame* frame) noexcept;
     // One queue-order pair (o_n, g_{n+1}) of a waited GPU-rung frame n.
     void RecordConcurrency(PendingFrame* frame) noexcept;
-    // Start term (above). A held frame's Present service x − max(o, r), its pair with the next frame (telling, free)
-    // and the turnaround a_{n+1} − b_n with the sign of an untied start: each judged once, by whichever release or
-    // stage event completes it, so every callback that may have asks.
+    // Start term (above). A held frame's Present service x − max(o, r), its pair with the next frame (telling, free,
+    // and for a telling pair that is not free the game's wait b_{n+1} − o_n) and the turnaround a_{n+1} − b_n with
+    // the sign of an untied start: each judged once, by whichever release or stage event completes it, so every
+    // callback that may have asks.
     void RecordStartService(PendingFrame* frame) noexcept;
     void RecordStartPair(PendingFrame* frame) noexcept;
-    // S99 is in use: LEAD_WARM_SAMPLES services and one among the newest LEAD_WORK_STALE_FRAMES frames planned with
-    // the GPU queue wait's lead; else the release headroom stands in.
+    // The Present services, or the game's waits, are in use: LEAD_WARM_SAMPLES of them and one among the newest
+    // LEAD_WORK_STALE_FRAMES frames planned with the GPU queue wait's lead.
     bool StartServiceMeasured() const noexcept;
-    // The term for a GPU queue wait plan (collision guard on, LeadRequest::start_limit or start_observe): computes
-    // the limit and the verdict, reports them in *guard (optional) and the statistics, and returns true with
-    // *bound_us, the limit plus the anchor's delta, when the term limits the plan (start_limit, not standing aside).
+    bool StartWaitMeasured() const noexcept;
+    // The measure the term takes now: the game's wait if it is in use, else the Present's service if that is, else
+    // the release headroom.
+    LeadStartSource StartSource() const noexcept;
+    // The term for a GPU queue wait plan made on present-first ordering (collision guard on, LeadRequest::start_limit
+    // or start_observe): computes the limit and the verdict, reports them in *guard (optional) and the statistics, and
+    // returns true with *bound_us, the limit plus the anchor's delta, when the term limits the plan (start_limit, not
+    // standing aside).
     bool StartTerm(const LeadRequest& request, LeadGuardOutcome* guard, double* bound_us) noexcept;
     void ResetStartTerm() noexcept;
     double CollisionGuardedLeadUs(const LeadRequest& request, size_t bucket_index, double lead_us,
@@ -1252,10 +1288,11 @@ private:
     // form and so the plan-time readers take).
     QueueOrderWindow ordered_order_{};
     bool ordered_ = false;
-    // Start term (above): the Present services of held frames and the turnarounds of every frame, the frames planned
-    // with the GPU queue wait's lead since the newest service (their age, current within LEAD_WORK_STALE_FRAMES),
-    // the newest telling pairs (1 = free), the newest frames judged for an untied start (1 = untied), and whether
-    // the newest computed plan stood aside (the changes are counted).
+    // Start term (above): the Present services of held frames, the game's waits of the telling pairs that are not
+    // free and the turnarounds of every frame, the frames planned with the GPU queue wait's lead since the newest
+    // service and since the newest game wait (their ages, current within LEAD_WORK_STALE_FRAMES), the newest telling
+    // pairs (1 = free), the newest frames judged for an untied start (1 = untied), and whether the newest computed
+    // plan stood aside (the changes are counted).
     struct EvidenceRing {
         std::array<uint8_t, LEAD_START_EVIDENCE_FRAMES> flags{};
         size_t head = 0;
@@ -1274,8 +1311,10 @@ private:
         }
     };
     LeadSampleWindow start_service_window_{};
+    LeadSampleWindow start_wait_window_{};
     LeadSampleWindow start_turnaround_window_{};
     uint32_t start_service_age_frames_ = LEAD_WORK_STALE_FRAMES + 1;
+    uint32_t start_wait_age_frames_ = LEAD_WORK_STALE_FRAMES + 1;
     EvidenceRing start_pairs_{};
     EvidenceRing start_untied_{};
     bool start_aside_ = false;

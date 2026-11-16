@@ -41,7 +41,10 @@
 // unit's Signal behind the frame's Present: the Present was processed) is reported once, after the unit's lock, as the
 // stage event PresentProcessed of the plan the gate gave with the hold (its key and grid index, rung GPU queue wait,
 // status Unknown), stamped by a clock read the release thread takes behind its read of `issued`, so never before the
-// completion it reports: the collision guard's start term (lead_controller.h) takes the Present's service from it.
+// completion it reports. The collision guard's start term (lead_controller.h) reads it two ways: as the word that the
+// order was in effect for that frame (only such a frame gives it a pair), and as the Present's service, its stand-in
+// while the game's own wait after the release cannot be seen. It is not when the game resumes: the game resumes when
+// the render queue has passed the order's Wait, after this thread signalled the order.
 // Nothing is reported for a value let go late, by the watchdog, by a drop or by a removed device (the Present was not
 // seen processed then), for a hold whose plan gave no identity, or for a frame the plan did not order: only an ordered
 // frame is given a value and a Signal behind its Present.

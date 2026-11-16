@@ -186,8 +186,10 @@ struct SourceStageRequest {
     // false, for the flag only (kUpLateSeen).
     bool late_observe = false;
     // Start term of the collision guard (lead_controller.h; developer key gpu_wait_start_limit, default on): the GPU
-    // queue wait lead is also limited to 2 I less the Present's service and the game's turnaround, and the plan
-    // carries the limit to the executor (PacingFramePlan::lead_limit_us). Both planning branches hand it to the lead.
+    // queue wait lead of a plan made on present-first ordering (`ordered`, below) is also limited to 2 I less the
+    // game's wait after the hold's release and its turnaround, and the plan carries the limit to the executor
+    // (PacingFramePlan::lead_limit_us). Both planning branches hand it to the lead; a plan that is not ordered gets
+    // no term.
     bool start_limit = false;
     // Developer key gpu_wait_ab_interleave_s: compute and report the term while start_limit is false (its off
     // periods): the source record shows the limit and plan_start_applied 0.
