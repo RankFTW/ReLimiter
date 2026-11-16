@@ -379,9 +379,26 @@ enum class LeadStartSource : uint8_t {
 // on the grid. Time after b_{n−1} stays in X (a lockstep frame waits there
 // for a later release, above), and the wait for frame n − 1 behind the wait
 // (SampleUs) starts at w or later.
-// FG input wait only. The FG input wait's back-pressure comes from its own
+// The FG input wait learns X − q whatever the plan says. Its back-pressure comes from its own
 // GPU gate, and its output point lies a GPU frame after the Present call.
-// Other rungs keep X:
+// The GPU queue wait learns it on present-first ordering with developer key lead_queue_correction (default off, an
+// A/B switch until captures decide), for a frame whose predecessor was planned ordered and whose sample is judged
+// behind the wait (QueueUs: the regime SampleUs judges d by). The order puts the hold in front of the render thread:
+// the render queue's next frame waits for the held frame's Present and the game's own frame sync ties its Present's
+// return to the render queue (the start term, above), so a finished frame waits behind the hold, q grows with the
+// lead and the lead that covers it learns it again, the one-frame-deep queue above. Nothing stops that where the
+// collision guard stands aside under the order and the start term does too (a game whose starts are untied): the lead
+// is the bucket's own Q99(X) + allowance. Phantom Blade Zero, no frame generation, present-first ordering, a cap of
+// 72 on a scene the game runs at 70 fps: lead 30.6, 35.0 and 37.6 ms in three runs of one launch, with excursions to
+// the 3 I budget; q above 0.5 ms on 63–83% of frames (p50 4.0–8.2 ms) and following the lead (the render submission
+// started 7.2, 10.1 and 12.6 ms after the release), the slope of X on the lead 0.86–0.94, of X − q 0.10–0.21. The
+// extra lead bought nothing: PC latency rose 0.6 ms for every ms of lead (40.7 to 46.5 ms across nine ordered runs),
+// the displayed frame-to-frame change stayed 0.75–0.88 ms from 30.6 ms up and the share of frames ready by their
+// target 43–45%; at 24 ms the change was 1.26–1.31 ms, so the lead has to cover the frame's own work and not less.
+// Replayed with q taken out of every sample the lead is 28.9–29.9 ms in all three runs (own work p50 19.6–19.9 ms,
+// p99 30–32 ms), and unchanged at a cap of 60, where the render thread is free and q stands on 5–14% of frames.
+// Rogue Core, a serial engine: q is 0 on every frame (123,817 frames), so nothing changes there. Live result pending.
+// Other cases keep X:
 // - On source only (FG unqualified) q was the game's own pipeline
 //   depth (p50 16 ms on half the frames), and the PRESENT_START output point
 //   sits right after it. With q removed, the late-output check's gated-hold
@@ -389,8 +406,8 @@ enum class LeadStartSource : uint8_t {
 //   times per 1,000 frames, against none with q kept in X.
 // - H1 already removes ReLimiter's own CPU hold (the overlap rule), so
 //   the queue left over is the game's as well.
-// - On the GPU queue wait (CONTROL with FG off), late resumes concentrated on
-//   queued frames (38.5% against 4.8%); that output keeps X.
+// - On the GPU queue wait without the order (CONTROL with FG off), late resumes concentrated on queued frames (38.5%
+//   against 4.8%); that output keeps X, and the collision guard limits its lead.
 
 // Spike floor (developer key lead_spike_floor, default on). Behind the wait
 // (queue order, above) the lead covers Q_q of each frame's own work, and a
@@ -497,6 +514,10 @@ struct LeadGuardOutcome {
     // Present-first ordering (LeadRequest::ordered): the plan was made on it. Kept with the frame
     // (PendingFrame::ordered): its pair, its successor's D and its successor's lead sample take that regime.
     bool ordered = false;
+    // Developer key lead_queue_correction (LeadRequest::queue_correction): the plan's word on the game's simulation →
+    // render queue (above), set for GPU queue wait plans only. Kept with the frame (PendingFrame::queue_correction),
+    // so its lead sample is decided at its plan, whatever the key says when the sample is judged.
+    bool queue_correction = false;
     // The limit on the release → target distance, in µs with the anchor's delta not in it, that the executor
     // resolves no target past (PacingFramePlan::lead_limit_us): the lower of the built guard's, I + offset when
     // judged, while developer key gpu_wait_late_guard is on, and the start term's while it was applied (below);
@@ -603,6 +624,10 @@ struct LeadRequest {
     bool collision_guard = false;
     // Spike floor (above; developer key lead_spike_floor).
     bool spike_floor = true;
+    // Developer key lead_queue_correction (default off; above): the GPU queue wait's lead sample of this frame leaves
+    // out the game's simulation → render queue when its predecessor was planned ordered and the sample is judged
+    // behind the wait. The FG input wait leaves it out always; no other rung reads this.
+    bool queue_correction = false;
     // Lead anchor (above): the planned frame's own delta = (s − B) in µs, 0
     // none (always 0 with the unified pacer off). L itself is learned from
     // the slots' samples, which carry their own deltas; the one place the
@@ -720,8 +745,8 @@ struct LeadStatistics {
     uint64_t kept_wait_samples = 0;
     double last_kept_wait_us = 0.0;
     uint64_t report_missing_samples = 0;
-    // Lead samples shortened by the game's simulation → render queue q
-    // (above: FG input wait), and the newest such q.
+    // Lead samples shortened by the game's simulation → render queue q (above: the FG input wait, and the GPU queue
+    // wait with developer key lead_queue_correction), and the newest such q.
     uint64_t queued_samples = 0;
     double last_queue_us = 0.0;
     double last_sample_us = 0.0;     // newest sample added to a bucket
@@ -1057,6 +1082,9 @@ private:
         bool resume_recorded = false;
         bool pair_recorded = false;
         bool turnaround_recorded = false;
+        // The plan's word of developer key lead_queue_correction (LeadGuardOutcome::queue_correction): its lead
+        // sample leaves out q (QueueUs). Placed with the bools above, in the padding.
+        bool queue_correction = false;
     };
 
     // Late state: the newest LEAD_LATE_FRAMES values with the grid index each belongs to.
@@ -1212,8 +1240,9 @@ private:
     double MeasuredUs(const PendingFrame& frame, const PendingFrame* previous) const noexcept;
     double SampleUs(const PendingFrame& frame, const PendingFrame* previous, double raw_us,
         double* predecessor_wait_us = nullptr, double* kept_wait_us = nullptr) const noexcept;
-    // The game's simulation → render queue q (above), in µs: FG input wait; 0
-    // for other rungs or without e, w, p and the previous frame's b.
+    // The game's simulation → render queue q (above), in µs: the FG input wait; the GPU queue wait of a frame planned
+    // with developer key lead_queue_correction whose predecessor was ordered and whose sample is judged behind the
+    // wait (SampleBehindWait); 0 for other rungs and cases, or without e, w, p and the previous frame's b.
     double QueueUs(const PendingFrame& frame, const PendingFrame* previous) const noexcept;
     // q itself.
     double RenderQueueWaitUs(const PendingFrame& frame, const PendingFrame& previous) const noexcept;

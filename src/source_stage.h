@@ -179,6 +179,10 @@ struct SourceStageRequest {
     // Lead spike floor (lead_controller.h; developer key lead_spike_floor,
     // Output override Auto only).
     bool spike_floor = true;
+    // Developer key lead_queue_correction (lead_controller.h; default off): the GPU queue wait's lead samples of
+    // frames planned on present-first ordering (`ordered`, below) leave out the game's simulation → render queue.
+    // Both planning branches hand it to the lead.
+    bool queue_correction = false;
     // Late state of the collision guard (lead_controller.h; developer key gpu_wait_late_guard, default off):
     // the unified branch lets a run of late arrivals set the lead's limit and passes the limit to the executor.
     bool late_guard = false;

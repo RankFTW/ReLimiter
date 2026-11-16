@@ -349,10 +349,14 @@ double LeadController::NextLeadUs(const LeadRequest& request, bool* budget_limit
 
     Bucket& bucket = buckets_[bucket_index];
     // Present-first ordering (lead_controller.h): the regime this plan is made in, set before anything that asks
-    // BehindWait (the spike floor, the guard).
+    // BehindWait (the spike floor, the guard). The plan's word on the game's simulation → render queue goes with it
+    // (LeadGuardOutcome::queue_correction), kept with the frame for its lead sample.
     if (request.rung == PacingRung::GpuQueueWait) {
         ordered_ = request.ordered;
-        if (guard != nullptr) guard->ordered = request.ordered;
+        if (guard != nullptr) {
+            guard->ordered = request.ordered;
+            guard->queue_correction = request.queue_correction;
+        }
     }
     const double interval_us = request.interval_us;
     const double max_lead_us = LEAD_BUDGET_INTERVALS * interval_us;
@@ -705,6 +709,7 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
     slot.gpu_resume_probe = frame.gpu_resume_probe;
     slot.late_state = frame.guard.late_state;
     slot.ordered = frame.guard.ordered;
+    slot.queue_correction = frame.guard.queue_correction;
     // Start term (lead_controller.h): the game's arrival; one later than the release is none.
     slot.arrival_qpc = frame.arrival_qpc > 0 && frame.arrival_qpc <= frame.source_release_qpc ? frame.arrival_qpc : 0;
     // Lead anchor (lead_controller.h, unified pacer only): the owner sets
@@ -1599,8 +1604,8 @@ void LeadController::EmitLeadSample(PendingFrame* frame) noexcept
         ++statistics_.kept_wait_samples;
         statistics_.last_kept_wait_us = kept_wait_us;
     }
-    // FG input wait (lead_controller.h): the lead learns X without the time the
-    // finished frame waited for the render thread to leave the previous Present.
+    // The lead learns X without the time the finished frame waited for the render thread to leave the previous
+    // Present (QueueUs: the FG input wait, and the GPU queue wait on present-first ordering with the key).
     const double queue_us = QueueUs(*frame, previous);
     if (queue_us > 0.0) {
         ++statistics_.queued_samples;
@@ -1758,12 +1763,21 @@ double LeadController::SampleUs(const PendingFrame& frame, const PendingFrame* p
 // The game's simulation → render queue (lead_controller.h):
 // q = max(0, min(w, b_{n−1}) − max(s, e)), with w clamped to [s, p] as in
 // SampleUs. A render thread already free before the frame finished
-// (b_{n−1} <= e) or one that took it at once (w = e) gives 0. Only on the FG
-// input wait; never on the GPU queue wait or the CPU rungs.
+// (b_{n−1} <= e) or one that took it at once (w = e) gives 0. On the FG input
+// wait; on the GPU queue wait only for a frame planned with developer key
+// lead_queue_correction whose predecessor was planned ordered and whose sample is judged behind the wait
+// (SampleBehindWait, the regime SampleUs judges d by): the order is what puts the hold in front of the render thread.
+// Never on the CPU rungs, and on the GPU queue wait otherwise the sample keeps X (lead_controller.h gives the
+// reasons).
 double LeadController::QueueUs(const PendingFrame& frame, const PendingFrame* previous) const noexcept
 {
-    if (previous == nullptr || frame.rung != PacingRung::FgInputWait) return 0.0;
-    return RenderQueueWaitUs(frame, *previous);
+    if (previous == nullptr) return 0.0;
+    if (frame.rung == PacingRung::FgInputWait) return RenderQueueWaitUs(frame, *previous);
+    if (frame.rung == PacingRung::GpuQueueWait && frame.queue_correction && previous->ordered &&
+        SampleBehindWait(frame, previous)) {
+        return RenderQueueWaitUs(frame, *previous);
+    }
+    return 0.0;
 }
 
 double LeadController::RenderQueueWaitUs(const PendingFrame& frame, const PendingFrame& previous) const noexcept

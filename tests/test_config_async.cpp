@@ -719,6 +719,36 @@ void TestGpuWaitStartLimitIsOnByDefault() {
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
+// Developer lead_queue_correction is off by default (kPacingLeadQueueCorrectionDefault, an A/B switch): a launch
+// without the key publishes false and logs nothing about it; true loads, is saved, is published, is a live key,
+// counts as one developer override and logs one Warn line. The lines are counted, not read.
+void TestLeadQueueCorrectionIsOffByDefault() {
+    const auto launch = [](const std::vector<IniEntry>& extra) {
+        std::vector<IniEntry> ini{{"config_version", "6"}};
+        ini.insert(ini.end(), extra.begin(), extra.end());
+        Reset(false, false, ini);
+        return WarnCount("");
+    };
+    const size_t quiet = launch({});
+    CHECK(g_config.lead_queue_correction == kPacingLeadQueueCorrectionDefault && !kPacingLeadQueueCorrectionDefault);
+    CHECK(!g_lead_queue_correction.load() && Config_DeveloperOverrides() == 0);
+    CHECK(Value(local_path, "FrameLimiter", "lead_queue_correction") == "false");
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    CHECK(launch({{"lead_queue_correction", "true"}}) == quiet + 1);
+    CHECK(g_config.lead_queue_correction && g_lead_queue_correction.load());
+    CHECK(Value(local_path, "FrameLimiter", "lead_queue_correction") == "true");
+    CHECK(Config_DeveloperOverrides() == 1);
+    char error[128] = {};
+    CHECK(Config_SetLiveKey("lead_queue_correction", "off", error, sizeof(error)) && !g_config.lead_queue_correction);
+    CHECK(!g_lead_queue_correction.load() && Config_DeveloperOverrides() == 0);
+    CHECK(Config_SetLiveKey("lead_queue_correction", "on", error, sizeof(error)) && g_config.lead_queue_correction);
+    CHECK(g_lead_queue_correction.load() && Config_DeveloperOverrides() == 1);
+    Config_ResetDeveloperSettings();
+    CHECK(!g_config.lead_queue_correction && !g_lead_queue_correction.load() && Config_DeveloperOverrides() == 0);
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
 // Developer flip_metering_off: true loads, is saved, counts as a developer
 // override and resets to false (the block itself is installed at init only).
 void TestFlipMeteringOffKey() {
@@ -2148,7 +2178,7 @@ const OsdToggle osd_toggles[] = {
 constexpr size_t osd_toggle_count = sizeof(osd_toggles) / sizeof(osd_toggles[0]);
 static_assert(osd_toggle_count == 28, "the contract lists 28 OSD element toggles");
 
-// The 59 keys of the [FrameLimiter] section that are not OSD element toggles (87 with the 28 toggles), each with a value
+// The 60 keys of the [FrameLimiter] section that are not OSD element toggles (88 with the 28 toggles), each with a value
 // away from its default as an earlier launch left it, and the value the clean rewrite saves back. The keybind keys are
 // written to the local INI only while the presets are not shared. Derived by running the writer, then pinned. Which keys
 // exist is not decided here: ExpectedIniKeys reads the config_key lines of the shared fixture.
@@ -2172,6 +2202,7 @@ const IniKey non_default_ini[] = {
     {"developer_settings", "true", "true"}, {"config_version", "6", "6"}, {"flip_metering_off", "true", "true"},
     {"gpu_wait_late_guard", "true", "true"}, {"gpu_wait_present_first", "false", "false"},
     {"gpu_wait_start_limit", "false", "false"},
+    {"lead_queue_correction", "true", "true"},
     {"gpu_wait_ab_interleave_s", "30", "30"},
     {"gpu_queue_probe", "false", "false"}, {"gpu_queue_probe_source", "0", "0"},
     {"pacing_test_mode", "driver_limiter", "driver_limiter"}, {"unified_hold_share", "0.125", "0.125000"},
@@ -2185,7 +2216,7 @@ const IniKey non_default_ini[] = {
     {"hang_report", "true", "true"}, {"hang_report_dump", "false", "false"}, {"hang_report_test_after_s", "30", "30"},
     {"streamline_compat", "force_false", "force_false"}};
 constexpr size_t non_default_ini_count = sizeof(non_default_ini) / sizeof(non_default_ini[0]);
-static_assert(non_default_ini_count == 59, "the contract lists 59 further keys");
+static_assert(non_default_ini_count == 60, "the contract lists 60 further keys");
 bool IsKeybindKey(const std::string& key) {
     return key == "osd_preset_prev_key" || key == "osd_preset_next_key" || key == "blackout_key";
 }
@@ -2256,6 +2287,7 @@ void TestIniWritesExactlyTheKeysThatExist() {
     CHECK(g_config.flip_metering_off && g_config.control_file && !g_config.gpu_present_gate_probes);
     CHECK(g_config.gpu_wait_late_guard && !g_config.gpu_wait_present_first && g_config.gpu_wait_ab_interleave_s == 30);
     CHECK(!g_gpu_wait_present_first.load());
+    CHECK(g_config.lead_queue_correction && g_lead_queue_correction.load());
     CHECK(!g_config.gpu_queue_probe && g_config.gpu_queue_probe_source == 0 && g_config.unified_queue_margin_end == 0);
     CHECK(g_config.unified_hold_share == 0.125 && !g_config.unified_queue_law && g_config.unified_queue_rank == 3);
     CHECK(g_config.unified_queue_need_frames == 6 && g_config.unified_queue_upstream == 1 && g_config.unified_queue_allow_us == 2500);
@@ -2375,9 +2407,10 @@ const LiveKey live_keys[] = {
     {"unified_queue_margin_end", "0"}, {"unified_hold_share", "0.1"}, {"pacing_test_mode", "reflex_only"},
     {"unified_queue_law", "off"}, {"unified_queue_rank", "3"}, {"unified_queue_need_frames", "6"},
     {"gpu_wait_late_guard", "on"}, {"gpu_wait_present_first", "off"}, {"gpu_wait_start_limit", "off"},
+    {"lead_queue_correction", "on"},
     {"gpu_wait_ab_interleave_s", "30"},
     {"unified_queue_upstream", "1"}, {"unified_queue_allow_us", "2500"}};
-static_assert(sizeof(live_keys) / sizeof(live_keys[0]) == 19, "the contract lists 19 live keys");
+static_assert(sizeof(live_keys) / sizeof(live_keys[0]) == 20, "the contract lists 20 live keys");
 bool IsLiveKey(const std::string& key) {
     for (const LiveKey& live : live_keys)
         if (key == live.key) return true;
@@ -2402,14 +2435,14 @@ void TestOnlyTheListedKeysAreLive() {
         CHECK(std::strstr(unknown, "not a live key") != nullptr);
         ++refused;
     }
-    CHECK(refused == 87 - 19);
+    CHECK(refused == 88 - 20);
     SaveConfig();
     CHECK(SectionFields(local_path, "FrameLimiter") == before); // nothing a refused key named changed
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
 // The developer fields Config_DeveloperOverrides counts and Config_ResetDeveloperSettings returns to their defaults are
-// these 19 (a name and the way to move the field away from its default and test that it is back); nothing else counts, and
+// these 20 (a name and the way to move the field away from its default and test that it is back); nothing else counts, and
 // the user's settings stay through the reset.
 struct DeveloperField {
     const char* name;
@@ -2422,6 +2455,7 @@ const DeveloperField developer_fields[] = {
     {"gpu_wait_late_guard", [] { g_config.gpu_wait_late_guard = true; }, [] { return !g_config.gpu_wait_late_guard; }},
     {"gpu_wait_present_first", [] { g_config.gpu_wait_present_first = false; }, [] { return g_config.gpu_wait_present_first; }},
     {"gpu_wait_start_limit", [] { g_config.gpu_wait_start_limit = false; }, [] { return g_config.gpu_wait_start_limit; }},
+    {"lead_queue_correction", [] { g_config.lead_queue_correction = true; }, [] { return !g_config.lead_queue_correction; }},
     {"gpu_wait_ab_interleave_s", [] { g_config.gpu_wait_ab_interleave_s = 30; }, [] { return g_config.gpu_wait_ab_interleave_s == 0; }},
     {"control_file", [] { g_config.control_file = true; }, [] { return !g_config.control_file; }},
     {"gpu_queue_probe", [] { g_config.gpu_queue_probe = false; }, [] { return g_config.gpu_queue_probe; }},
@@ -2437,7 +2471,7 @@ const DeveloperField developer_fields[] = {
     {"unified_queue_allow_us", [] { g_config.unified_queue_allow_us = 2500; }, [] { return g_config.unified_queue_allow_us == 4000; }},
     {"hang_report_dump", [] { g_config.hang_report_dump = false; }, [] { return g_config.hang_report_dump; }},
     {"hang_report_test_after_s", [] { g_config.hang_report_test_after_s = 30; }, [] { return g_config.hang_report_test_after_s == 0; }}};
-static_assert(sizeof(developer_fields) / sizeof(developer_fields[0]) == 19, "the contract lists 19 developer fields");
+static_assert(sizeof(developer_fields) / sizeof(developer_fields[0]) == 20, "the contract lists 20 developer fields");
 void TestDeveloperFieldsAreCountedAndResetOneByOne() {
     Reset();
     CHECK(Config_DeveloperOverrides() == 0);
@@ -2658,6 +2692,7 @@ int main() {
     TestGpuPresentGateProbesKey();
     TestGpuWaitPresentFirstIsOnByDefault();
     TestGpuWaitStartLimitIsOnByDefault();
+    TestLeadQueueCorrectionIsOffByDefault();
     TestUnifiedHoldShareKey();
     TestUnifiedQueueLawKeys();
     TestUnifiedQueueNeedFramesKey();

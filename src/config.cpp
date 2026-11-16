@@ -402,6 +402,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.gpu_wait_late_guard=ReadINIBool(S,"gpu_wait_late_guard",false,P);
     g_config.gpu_wait_present_first=ReadINIBool(S,"gpu_wait_present_first",kPacingGpuWaitPresentFirstDefault,P);
     g_config.gpu_wait_start_limit=ReadINIBool(S,"gpu_wait_start_limit",kPacingGpuWaitStartLimitDefault,P);
+    g_config.lead_queue_correction=ReadINIBool(S,"lead_queue_correction",kPacingLeadQueueCorrectionDefault,P);
     g_config.gpu_wait_ab_interleave_s=ReadINIInt(S,"gpu_wait_ab_interleave_s",0,P);
     g_config.fg_render_break_every=ReadINIInt(S,"fg_render_break_every",0,P);
     g_config.fg_render_break_window=ReadINIInt(S,"fg_render_break_window",-1,P);
@@ -623,6 +624,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIBool(S, "gpu_wait_late_guard", config.gpu_wait_late_guard, P);
     WriteINIBool(S, "gpu_wait_present_first", config.gpu_wait_present_first, P);
     WriteINIBool(S, "gpu_wait_start_limit", config.gpu_wait_start_limit, P);
+    WriteINIBool(S, "lead_queue_correction", config.lead_queue_correction, P);
     WriteINIInt(S, "gpu_wait_ab_interleave_s", config.gpu_wait_ab_interleave_s, P);
     WriteINIBool(S, "gpu_queue_probe", config.gpu_queue_probe, P);
     WriteINIInt(S, "gpu_queue_probe_source", config.gpu_queue_probe_source, P);
@@ -905,6 +907,7 @@ void Config_ApplyPacingPipeline() {
     g_gpu_wait_late_guard.store(g_config.gpu_wait_late_guard, std::memory_order_relaxed);
     g_gpu_wait_present_first.store(g_config.gpu_wait_present_first, std::memory_order_relaxed);
     g_gpu_wait_start_limit.store(g_config.gpu_wait_start_limit, std::memory_order_relaxed);
+    g_lead_queue_correction.store(g_config.lead_queue_correction, std::memory_order_relaxed);
     g_gpu_wait_ab_interleave_s.store(std::clamp(g_config.gpu_wait_ab_interleave_s, 0, 600), std::memory_order_relaxed);
     g_fg_render_break_every.store(sizeof(void*) == 8 ? std::clamp(g_config.fg_render_break_every, 0, 64) : 0, std::memory_order_relaxed);
     g_fg_render_break_window.store(std::clamp(g_config.fg_render_break_window, -1, 32), std::memory_order_relaxed);
@@ -967,6 +970,7 @@ constexpr Key kKeys[] = {
     {"gpu_wait_late_guard", &SetBool<&Config::gpu_wait_late_guard>, Publish::Pipeline},
     {"gpu_wait_present_first", &SetBool<&Config::gpu_wait_present_first>, Publish::Pipeline},
     {"gpu_wait_start_limit", &SetBool<&Config::gpu_wait_start_limit>, Publish::Pipeline},
+    {"lead_queue_correction", &SetBool<&Config::lead_queue_correction>, Publish::Pipeline},
     {"gpu_wait_ab_interleave_s", &SetInt<&Config::gpu_wait_ab_interleave_s>, Publish::Pipeline},
     {"fg_render_break_every", &SetInt<&Config::fg_render_break_every>, Publish::Pipeline},
     {"fg_render_break_window", &SetInt<&Config::fg_render_break_window>, Publish::Pipeline},
@@ -1023,6 +1027,7 @@ int Config_DeveloperOverrides() {
         (g_config.gpu_wait_late_guard != d.gpu_wait_late_guard) +
         (g_config.gpu_wait_present_first != d.gpu_wait_present_first) +
         (g_config.gpu_wait_start_limit != d.gpu_wait_start_limit) +
+        (g_config.lead_queue_correction != d.lead_queue_correction) +
         (g_config.gpu_wait_ab_interleave_s != d.gpu_wait_ab_interleave_s) +
         (g_config.control_file != d.control_file) +
         (g_config.gpu_queue_probe != d.gpu_queue_probe) +
@@ -1046,6 +1051,7 @@ void Config_ResetDeveloperSettings() {
     g_config.gpu_wait_late_guard = d.gpu_wait_late_guard;
     g_config.gpu_wait_present_first = d.gpu_wait_present_first;
     g_config.gpu_wait_start_limit = d.gpu_wait_start_limit;
+    g_config.lead_queue_correction = d.lead_queue_correction;
     g_config.gpu_wait_ab_interleave_s = d.gpu_wait_ab_interleave_s;
     g_config.control_file = d.control_file;
     g_config.gpu_queue_probe = d.gpu_queue_probe;
@@ -1121,6 +1127,10 @@ void ApplyConfig() {
         LOG_WARN("Diagnostic GPU wait present first interleaved: present-first ordering acts only in alternate "
                  "periods of %d s, and the plan is made without it in the others "
                  "(gpu_wait_ab_interleave_s=%d; 64-bit Direct3D 12)", interleave_s, interleave_s);
+    if (g_config.lead_queue_correction != kPacingLeadQueueCorrectionDefault)
+        LOG_WARN("Diagnostic lead queue correction on: on present-first ordering the GPU queue wait's lead samples "
+                 "leave out the time a finished frame waited for the game's render thread "
+                 "(lead_queue_correction=true; 64-bit Direct3D 12)");
     if (g_config.gpu_queue_probe != kPacingGpuQueueProbeDefault)
         LOG_WARN("Diagnostic GPU queue probe off: the presenting queue's submissions are not measured "
                  "(gpu_queue_probe=false; the queue law needs it and forces it on)");

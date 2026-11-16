@@ -198,6 +198,7 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     lead_request.release_headroom_us = pipeline.gpu_wait_headroom_us;
     lead_request.collision_guard = request.collision_guard;
     lead_request.spike_floor = request.spike_floor;
+    lead_request.queue_correction = request.queue_correction;
     lead_request.ordered = request.ordered;
     lead_request.start_limit = request.start_limit;
     lead_request.start_observe = request.start_observe;
@@ -509,6 +510,7 @@ SourceStageFrame SourceStage::RunUnifiedFrame(
     lead_request.release_headroom_us = pipeline.gpu_wait_headroom_us;
     lead_request.collision_guard = request.collision_guard;
     lead_request.spike_floor = request.spike_floor;
+    lead_request.queue_correction = request.queue_correction;
     lead_request.anchor_offset_us = lead_anchor.delta_us;
     // Late state (lead_controller.h): how late the game arrived for its planned start. The arrival, not the
     // release, so a wait of ReLimiter's own never counts; a frame the law restarted at has no planned start.

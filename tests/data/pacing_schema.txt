@@ -483,7 +483,7 @@ event_type 16 governor_step retired
 event_type 17 rung_feasibility retired
 event_type 18 gpu_wait_cap retired
 
-# The 80 keys of the [FrameLimiter] section (retired keys are not listed: the build neither reads nor writes them).
+# The 88 keys of the [FrameLimiter] section (retired keys are not listed: the build neither reads nor writes them).
 config_key target_fps
 config_key background_fps
 config_key fg_off_fps
@@ -518,6 +518,7 @@ config_key flip_metering_off
 config_key gpu_wait_late_guard
 config_key gpu_wait_present_first
 config_key gpu_wait_start_limit
+config_key lead_queue_correction
 config_key gpu_wait_ab_interleave_s
 config_key gpu_queue_probe
 config_key gpu_queue_probe_source

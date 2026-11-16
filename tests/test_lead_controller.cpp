@@ -409,6 +409,165 @@ void TestSimulationRenderQueue()
     CHECK(controller->Statistics().unmatched_events == 0);
 }
 
+// The same queue on the GPU queue wait (developer key lead_queue_correction, default off). Under present-first
+// ordering the render thread stays inside the previous Present until the hold is released, so a finished frame waits
+// behind the hold and the lead learned that wait again. With the key a frame's sample leaves q out when the frame was
+// planned with the key on, its predecessor was planned ordered and the sample is judged behind the wait (Reflex
+// reports current, no concurrent pair among the ordered frames). Every other GPU queue wait sample keeps X: the key
+// off, a predecessor planned as built (whatever the frame's own plan says), a sample not behind the wait. The FG
+// input wait leaves q out whatever the key says. Frame 2 finished its simulation at 22,000 and the render thread took
+// it at 26,500, after frame 1's Present returned at 26,000: q = 4,000 of its X = 17,000 (frame 1's GPU work was
+// done long before frame 2's began, so the wait for it takes nothing from X).
+namespace
+{
+    // Frames 1 and 2 planned on the GPU queue wait as the requests say: the plan's word reaches the frame through
+    // the guard outcome. Frame 1's Reflex report comes before frame 2's release, or never (the sample is then not
+    // judged behind the wait).
+    std::unique_ptr<LeadController> PlayQueuedPair(bool key, bool first_ordered, bool second_ordered,
+        bool first_report = true)
+    {
+        auto controller = MakeController();
+        const PacingRung gpu = PacingRung::GpuQueueWait;
+        const auto release = [&](uint64_t index, double source_us, bool ordered) {
+            LeadRequest request = Request(gpu);
+            request.ordered = ordered;
+            request.queue_correction = key;
+            LeadFrameStart start = Start(index, gpu, source_us);
+            SetLead(&start, 20000.0);
+            controller->NextLeadUs(request, nullptr, &start.guard);
+            controller->OnSourceRelease(start);
+        };
+        const auto stages = [&](uint64_t index, double end, double submit, double present, double ready) {
+            controller->OnStageEvent(Event(index, Kind::SimulationEnd, end));
+            controller->OnStageEvent(Event(index, Kind::RenderSubmitStart, submit));
+            controller->OnStageEvent(Event(index, Kind::PresentCall, present));
+            controller->OnStageEvent(Event(index, Kind::GpuReady, ready));
+            controller->OnStageEvent(Event(index, Kind::OutputRelease, ready, PacingPlanStatus::Late));
+        };
+        release(1, 10000.0, first_ordered);
+        stages(1, 12000.0, 12100.0, 18000.0, 21000.0);
+        controller->OnStageEvent(Event(1, Kind::PresentEnd, 26000.0));
+        if (first_report) Report(controller.get(), Key(1).producer_epoch, Key(1).frame_id, 6000.0);
+        release(2, 20000.0, second_ordered);
+        stages(2, 22000.0, 26500.0, 32000.0, 37000.0);
+        Report(controller.get(), Key(2).producer_epoch, Key(2).frame_id, 6000.0);
+        return controller;
+    }
+
+    // The bucket's quantile after 40 frames like frame 2, 100 ms apart, all planned ordered with the key as given.
+    double QueuedQuantileUs(bool key)
+    {
+        auto controller = MakeController();
+        const PacingRung gpu = PacingRung::GpuQueueWait;
+        LeadRequest request = Request(gpu);
+        request.ordered = true;
+        request.queue_correction = key;
+        for (uint64_t index = 1; index <= 40; ++index) {
+            const double source_us = 100000.0 * static_cast<double>(index);
+            LeadFrameStart start = Start(index, gpu, source_us);
+            SetLead(&start, 20000.0);
+            controller->NextLeadUs(request, nullptr, &start.guard);
+            controller->OnSourceRelease(start);
+            if (index > 1) controller->OnStageEvent(Event(index - 1, Kind::PresentEnd, source_us + 6000.0));
+            controller->OnStageEvent(Event(index, Kind::SimulationEnd, source_us + 2000.0));
+            controller->OnStageEvent(Event(index, Kind::RenderSubmitStart, source_us + 6500.0));
+            controller->OnStageEvent(Event(index, Kind::PresentCall, source_us + 12000.0));
+            controller->OnStageEvent(Event(index, Kind::GpuReady, source_us + 17000.0));
+            controller->OnStageEvent(Event(index, Kind::OutputRelease, source_us + 17000.0, PacingPlanStatus::Late));
+            Report(controller.get(), Key(index).producer_epoch, Key(index).frame_id, 6000.0);
+        }
+        controller->NextLeadUs(request);
+        return controller->BucketStatus(gpu, 1.0).quantile_us;
+    }
+}
+
+void TestGpuQueueWaitRenderQueueCorrection()
+{
+    // The key on, both frames ordered, frame 1's report seen: the window's sample is X − q.
+    {
+        const auto controller = PlayQueuedPair(true, true, true);
+        const LeadStatistics statistics = controller->Statistics();
+        CHECK(statistics.samples == 2 && statistics.queued_samples == 1);
+        CHECK_NEAR(statistics.last_sample_us, 13000.0);
+        CHECK_NEAR(statistics.last_queue_us, 4000.0);
+        CHECK(statistics.invalid_inputs == 0);
+    }
+    // The same frames with the key off: X.
+    {
+        const auto controller = PlayQueuedPair(false, true, true);
+        const LeadStatistics statistics = controller->Statistics();
+        CHECK(statistics.samples == 2 && statistics.queued_samples == 0);
+        CHECK_NEAR(statistics.last_sample_us, 17000.0);
+    }
+    // The key on, a predecessor planned as built: X, whatever frame 2's own plan says.
+    for (const bool second_ordered : { false, true }) {
+        const auto controller = PlayQueuedPair(true, false, second_ordered);
+        CHECK(controller->Statistics().samples == 2 && controller->Statistics().queued_samples == 0);
+        CHECK_NEAR(controller->Statistics().last_sample_us, 17000.0);
+    }
+    // The predecessor's regime decides and the frame's own plan does not: an ordered predecessor corrects a frame
+    // planned as built (with the key on, its word).
+    {
+        const auto controller = PlayQueuedPair(true, true, false);
+        CHECK(controller->Statistics().queued_samples == 1);
+        CHECK_NEAR(controller->Statistics().last_sample_us, 13000.0);
+    }
+    // The key on, an ordered predecessor, a sample not behind the wait (no Reflex report seen yet): X.
+    {
+        const auto controller = PlayQueuedPair(true, true, true, false);
+        CHECK(controller->Statistics().samples == 2 && controller->Statistics().queued_samples == 0);
+        CHECK_NEAR(controller->Statistics().last_sample_us, 17000.0);
+    }
+
+    // The FG input wait leaves q out whatever the key says: the same frames on it give X − q either way.
+    for (const bool key : { false, true }) {
+        auto controller = MakeController();
+        const PacingRung fg = PacingRung::FgInputWait;
+        const auto frame = [&](uint64_t index, double source_us, double end, double submit, double present,
+            double ready) {
+            LeadRequest request = Request(fg);
+            request.queue_correction = key;
+            LeadFrameStart start = Start(index, fg, source_us);
+            SetLead(&start, 20000.0);
+            controller->NextLeadUs(request, nullptr, &start.guard);
+            controller->OnSourceRelease(start);
+            controller->OnStageEvent(Event(index, Kind::SimulationEnd, end));
+            controller->OnStageEvent(Event(index, Kind::RenderSubmitStart, submit));
+            controller->OnStageEvent(Event(index, Kind::PresentCall, present));
+            controller->OnStageEvent(Event(index, Kind::GpuReady, ready));
+            controller->OnStageEvent(Event(index, Kind::OutputRelease, ready, PacingPlanStatus::Late));
+        };
+        frame(1, 10000.0, 12000.0, 12100.0, 18000.0, 21000.0);
+        controller->OnStageEvent(Event(1, Kind::PresentEnd, 26000.0));
+        frame(2, 20000.0, 22000.0, 26500.0, 32000.0, 37000.0);
+        CHECK(controller->Statistics().queued_samples == 1);
+        CHECK_NEAR(controller->Statistics().last_sample_us, 13000.0);
+    }
+
+    // The plan's word is the guard outcome's, for GPU queue wait plans only.
+    {
+        auto controller = MakeController();
+        LeadRequest request = Request(PacingRung::GpuQueueWait);
+        request.queue_correction = true;
+        LeadGuardOutcome guard{};
+        controller->NextLeadUs(request, nullptr, &guard);
+        CHECK(guard.queue_correction);
+        request.queue_correction = false;
+        controller->NextLeadUs(request, nullptr, &guard);
+        CHECK(!guard.queue_correction);
+        LeadRequest fg_request = Request(PacingRung::FgInputWait);
+        fg_request.queue_correction = true;
+        LeadGuardOutcome fg_guard{};
+        controller->NextLeadUs(fg_request, nullptr, &fg_guard);
+        CHECK(!fg_guard.queue_correction);
+    }
+
+    // The window the lead is learned from holds the corrected samples: the 95th percentile of 40 frames like frame
+    // 2 is X − q with the key on and X with it off.
+    CHECK(std::fabs(QueuedQuantileUs(true) - 13000.0) <= 20.0);
+    CHECK(std::fabs(QueuedQuantileUs(false) - 17000.0) <= 20.0);
+}
+
 // Rogue Core capture: the game's release-to-ready time X
 // does not depend on the previous frame's GPU hold (archived light captures:
 // slope dX_n/dhold_{n-1} about 0), RENDERSUBMIT_START comes early (s + 500)
@@ -5221,6 +5380,7 @@ int main()
     TestGpuQueueSample();
     TestGpuRungBuckets();
     TestSimulationRenderQueue();
+    TestGpuQueueWaitRenderQueueCorrection();
     TestCpuFedGpuQueueLeadCoversReadiness();
     TestRungTransitions();
     TestLongSampleExclusion();

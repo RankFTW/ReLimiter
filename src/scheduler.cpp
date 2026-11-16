@@ -1299,6 +1299,8 @@ static SourceStageFrame RunPlanned(
     const bool unified = SourceStage_UnifiedPlans(pipeline, config.unified, s_source_stage.UnifiedEnabled());
     // Lead spike floor (lead_controller.h).
     request.spike_floor = kPacingLeadSpikeFloor;
+    // Developer key lead_queue_correction (lead_controller.h): read once per plan, kept by the lead with the frame.
+    request.queue_correction = g_lead_queue_correction.load(std::memory_order_relaxed);
     // Developer A/B switches of the collision guard (lead_controller.h): the late state (gpu_wait_late_guard), the
     // start limit (gpu_wait_start_limit) and present-first ordering (gpu_wait_present_first; gpu_hold_order.h), with
     // the interleave key gpu_wait_ab_interleave_s (the periods and what each period does: SourceStage_Switches,
