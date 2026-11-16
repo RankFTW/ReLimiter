@@ -1,5 +1,5 @@
 // Directly tests the production CSV writer (src/csv_writer.cpp) for the two
-// pacing families: header names and order of the appended columns (193 row
+// pacing families: header names and order of the appended columns (195 row
 // columns), the PC Latency cells, native PCL loss counters on capture and
 // queue-drop rows, the pcl_status event, the frame-plan columns, display
 // source, reason column and grid_epoch / pipeline_change events (the retired
@@ -143,6 +143,8 @@ PacingJoinedRow DisplayRow(bool with_latency)
         row.source.plan_lead_us = 1234.5;
         row.source.plan_rung = 3; // PacingRung::GpuQueueWait
         row.source.plan_ordered = 1;      // present-first ordering: plan_ordered prints 1
+        row.source.plan_start_limit_us = 14321.5; // the start term's limit: plan_start_limit_us prints it
+        row.source.plan_start_applied = 1;        // and plan_start_applied prints 1
         // Pre-Sleep placement
         row.source.flags = PACING_SOURCE_PRE_SLEEP;
         row.source.source_placement = 3; // PacingSourcePlacement::PreSleep
@@ -260,6 +262,8 @@ PacingJoinedRow DisplayRow(bool with_latency)
         row.source.plan_lead_us = 99.0;
         row.source.plan_rung = 1;
         row.source.plan_ordered = 1;         // hidden with the rest of the plan: no plan_ordered cell
+        row.source.plan_start_limit_us = 99.0;      // hidden with the rest of the plan: no start limit cells
+        row.source.plan_start_applied = 1;
         row.source.source_placement = 1;     // PacingSourcePlacement::Marker, no pre-Sleep wait
         // A status the Sleep hook never published stays hidden behind its valid flag.
         row.source.driver_sleep_interval_us = 999;
@@ -388,12 +392,23 @@ PacingJoinedRow UnifiedDebtRow()
     return row;
 }
 
-// A planned frame whose plan was not made on present-first ordering (DisplayRow(true) was): the plan cells
-// print and plan_ordered is empty.
+// A planned frame whose plan was not made on present-first ordering (DisplayRow(true) was) and whose start term
+// stood aside or was not computed: the plan cells print, plan_ordered and both start limit cells are empty.
 PacingJoinedRow UnorderedPlanRow()
 {
     PacingJoinedRow row = DisplayRow(true);
     row.source.plan_ordered = 0;
+    row.source.plan_start_limit_us = 0.0;
+    row.source.plan_start_applied = 0;
+    return row;
+}
+
+// A planned frame whose start limit was computed and only observed (the off period of the interleave): the limit
+// prints and plan_start_applied is empty.
+PacingJoinedRow ObservedStartLimitRow()
+{
+    PacingJoinedRow row = DisplayRow(true);
+    row.source.plan_start_applied = 0;
     return row;
 }
 
@@ -505,9 +520,11 @@ void CheckRowsFile(const CsvFile& rows)
         "render_submit_cpu_us", "sim_cpu_us", "render_submit_tid", "sim_tid", "render_submit_end_tid",
         "sim_end_tid", "up_ql_rt_contrast_us", "up_ql_rt_spread_us", "up_ql_rt_wait_us" };
     const Cells queue_role_columns{ "gq_queue_role" };
-    // The regime of the frame's plan (developer key gpu_wait_present_first): the last column.
+    // The regime of the frame's plan (developer key gpu_wait_present_first), then the collision guard's start term
+    // for it (developer key gpu_wait_start_limit): the last three columns.
     const Cells ordered_columns{ "plan_ordered" };
-    const size_t trailing = queue_role_columns.size() + ordered_columns.size();
+    const Cells start_limit_columns{ "plan_start_limit_us", "plan_start_applied" };
+    const size_t trailing = queue_role_columns.size() + ordered_columns.size() + start_limit_columns.size();
     const size_t last = wait_columns.size() + driver_columns.size() + measurement_columns.size() +
         unified_columns.size() + gpu_queue_columns.size() + queue_law_columns.size() + upstream_columns.size() +
         trailing;
@@ -517,7 +534,7 @@ void CheckRowsFile(const CsvFile& rows)
         if (rows.header.size() < from_end || from_end < count) return Cells{};
         return Cells(rows.header.end() - from_end, rows.header.end() - from_end + count);
     };
-    Check(rows.header.size() == 193, "pacing rows have 193 columns, got " + std::to_string(rows.header.size()));
+    Check(rows.header.size() == 195, "pacing rows have 195 columns, got " + std::to_string(rows.header.size()));
     for (const char* removed : { "predicted_render_us", "governor_step", "governor_interval_us",
              "plan_signal_advance_us", "pre_sleep_margin_us", "gpu_first_submit_qpc", "gpu_start_qpc" }) {
         Check(std::find(rows.header.begin(), rows.header.end(), removed) == rows.header.end(),
@@ -549,19 +566,22 @@ void CheckRowsFile(const CsvFile& rows)
     Check(slice(queue_law_columns.size() + upstream_columns.size() + trailing,
                 queue_law_columns.size()) == queue_law_columns,
           "the queue law input and statistics columns follow the GPU queue probe columns");
-    Check(slice(ordered_columns.size(), ordered_columns.size()) == ordered_columns,
-          "the plan_ordered column is the last column");
+    Check(slice(start_limit_columns.size(), start_limit_columns.size()) == start_limit_columns,
+          "the plan_start_limit_us and plan_start_applied columns are the last two columns");
+    Check(slice(start_limit_columns.size() + ordered_columns.size(), ordered_columns.size()) == ordered_columns,
+          "the plan_ordered column precedes the start limit columns");
     Check(slice(trailing, queue_role_columns.size()) == queue_role_columns,
           "the probe queue role column precedes the plan_ordered column");
     Check(slice(trailing + upstream_columns.size(), upstream_columns.size()) == upstream_columns,
           "the marker stamp and render-thread queue law columns precede the queue role column");
-    Check(rows.rows.size() == 7, "every pacing row is written");
-    if (rows.rows.size() != 7) return;
+    Check(rows.rows.size() == 8, "every pacing row is written");
+    if (rows.rows.size() != 8) return;
 
     const std::pair<const char*, const char*> plan_cells[] = {
         { "grid_epoch", "3" }, { "grid_index", "42" }, { "plan_output_target_qpc", "1900" },
         { "plan_lead_us", "1234.500" }, { "plan_rung", "3" }, { "plan_status", "2" },
         { "display_source", "1" }, { "plan_ordered", "1" },
+        { "plan_start_limit_us", "14321.500" }, { "plan_start_applied", "1" },
         { "gate_post_wait_qpc", "1960" }, { "gate_pre_wait_qpc", "1850" }, { "source_flags", "2" },
         { "source_placement", "3" }, { "pre_sleep_end_qpc", "780" },
         { "source_wait_start_qpc", "800" }, { "pre_sleep_start_qpc", "610" } };
@@ -609,7 +629,8 @@ void CheckRowsFile(const CsvFile& rows)
               std::string("row 1 ") + column + " = " + expected + ", got " + rows.Cell(0, column));
     }
     for (const char* column : { "grid_epoch", "grid_index", "plan_output_target_qpc", "plan_lead_us",
-             "plan_rung", "plan_status", "plan_ordered", "gate_pre_wait_qpc" }) {
+             "plan_rung", "plan_status", "plan_ordered", "plan_start_limit_us", "plan_start_applied",
+             "gate_pre_wait_qpc" }) {
         Check(rows.Cell(1, column).empty(),
               std::string("row 2 ") + column + " is empty without a plan or plan status");
     }
@@ -622,6 +643,12 @@ void CheckRowsFile(const CsvFile& rows)
     Check(rows.Cell(2, "plan_ordered").empty(), "unjoined Present rows without a Source record are not ordered");
     Check(rows.Cell(6, "plan_rung") == "3" && rows.Cell(6, "plan_ordered").empty(),
           "a planned frame whose plan was not ordered has an empty plan_ordered cell");
+    Check(rows.Cell(2, "plan_start_limit_us").empty() && rows.Cell(2, "plan_start_applied").empty(),
+          "unjoined Present rows without a Source record have no start limit cells");
+    Check(rows.Cell(6, "plan_start_limit_us").empty() && rows.Cell(6, "plan_start_applied").empty(),
+          "a plan whose start term stood aside or was not computed has empty start limit cells");
+    Check(rows.Cell(7, "plan_start_limit_us") == "14321.500" && rows.Cell(7, "plan_start_applied").empty(),
+          "a limit that was only observed prints the limit and leaves plan_start_applied empty");
     Check(rows.Cell(1, "source_placement") == "1" && rows.Cell(1, "pre_sleep_end_qpc").empty() &&
               rows.Cell(1, "pre_sleep_start_qpc").empty() &&
               rows.Cell(1, "source_wait_start_qpc").empty(),
@@ -910,6 +937,7 @@ int main()
     CSV_PushPacingRow(5, UnifiedZeroBudgetRow(), PacingDerivedMetrics{});
     CSV_PushPacingRow(6, UnifiedDebtRow(), PacingDerivedMetrics{});
     CSV_PushPacingRow(7, UnorderedPlanRow(), PacingDerivedMetrics{});
+    CSV_PushPacingRow(8, ObservedStartLimitRow(), PacingDerivedMetrics{});
 
     PacingCsvEvent status{};
     status.type = PacingCsvEventType::PclStatus;

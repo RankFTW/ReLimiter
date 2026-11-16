@@ -37,6 +37,15 @@
 // the rule trips or stops (GpuHoldOrderRule::Orders), not until the next unqualified edge, and each frame's own
 // boundary check keeps it safe.
 //
+// What the pacer is told. A value the release thread lets go because `issued` reached it (the presenting queue ran the
+// unit's Signal behind the frame's Present: the Present was processed) is reported once, after the unit's lock, as the
+// stage event PresentProcessed of the plan the gate gave with the hold (its key and grid index, rung GPU queue wait,
+// status Unknown), stamped by a clock read the release thread takes behind its read of `issued`, so never before the
+// completion it reports: the collision guard's start term (lead_controller.h) takes the Present's service from it.
+// Nothing is reported for a value let go late, by the watchdog, by a drop or by a removed device (the Present was not
+// seen processed then), for a hold whose plan gave no identity, or for a frame the plan did not order: only an ordered
+// frame is given a value and a Signal behind its Present.
+//
 // Threads and locks. The Present thread (OnHold, AfterNativePresent, AfterWait), the threads that submit to R
 // (BeforeSignal, AfterSignal, BeforeExecute), the gate's worker (OnGateRelease), the release thread, the installer's
 // worker (Service) and whichever thread destroys a queue or shuts down (OnQueueDestroy, Shutdown). One lock guards the
@@ -50,6 +59,7 @@
 // add-on only (RELIMITER_GPU_HOLD_ORDER, set for the add-on target next to RELIMITER_FG_PRESENT_ORDER): every
 // other target that compiles a caller gets the no-op forms below.
 #include "instrumentation_state.h"
+#include "pacing_core_types.h"
 #include <atomic>
 #include <cstdint>
 
@@ -71,7 +81,7 @@ using GpuHoldOrder_FenceFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID
 
 void GpuHoldOrder_OnHoldActive(ID3D12CommandQueue* present_queue, const void* hold_fence, uint64_t hold_ticket,
     int64_t target_qpc, int64_t interval_qpc, uint64_t law_hold_sequence, bool ordered,
-    uint64_t swapchain_generation) noexcept;
+    uint64_t swapchain_generation, const PacingPlanKey& key, uint64_t grid_index) noexcept;
 void GpuHoldOrder_OnGateReleaseActive(const void* hold_fence, uint64_t hold_ticket, int64_t release_qpc) noexcept;
 void GpuHoldOrder_AfterNativePresentActive(bool presented, uint64_t gate_ticket) noexcept;
 uint64_t GpuHoldOrder_BeforeSignalActive(const void* queue, const void* fence) noexcept;
@@ -94,14 +104,15 @@ void GpuHoldOrder_Service(bool fg_presenting) noexcept;
 
 // The gate's Enqueue, on the Present thread, after a hold's Wait went on the queue (not for a frame generation
 // input's hold): the native presenting queue, the hold's fence and ticket (its own identity), its target and the
-// frame interval (QPC ticks), the plan's law hold sequence, whether the plan ordered the frame and the swapchain's
-// generation.
+// frame interval (QPC ticks), the plan's law hold sequence, whether the plan ordered the frame, the swapchain's
+// generation and the plan's identity (key and grid index), which the unit keeps with the hold and reports when that
+// hold's Present was seen processed (What the pacer is told, above).
 inline void GpuHoldOrder_OnHold(ID3D12CommandQueue* present_queue, const void* hold_fence, uint64_t hold_ticket,
     int64_t target_qpc, int64_t interval_qpc, uint64_t law_hold_sequence, bool ordered,
-    uint64_t swapchain_generation) noexcept {
+    uint64_t swapchain_generation, const PacingPlanKey& key, uint64_t grid_index) noexcept {
     if (g_gpu_wait_present_first.load(std::memory_order_relaxed))
         GpuHoldOrder_OnHoldActive(present_queue, hold_fence, hold_ticket, target_qpc, interval_qpc, law_hold_sequence,
-            ordered, swapchain_generation);
+            ordered, swapchain_generation, key, grid_index);
 }
 // The gate's worker, right after it released a hold (beside GpuQueueProbe_OnHoldRelease): the release is recorded in a
 // lock-free table (the probe is told its time; the watchdog tells the gate's delay from a trip by it: a hold whose
@@ -144,7 +155,8 @@ inline void GpuHoldOrder_BeforeExecute(ID3D12CommandQueue* queue, unsigned lists
             native_wait.load(std::memory_order_acquire));
 }
 #else
-inline void GpuHoldOrder_OnHold(void*, const void*, uint64_t, int64_t, int64_t, uint64_t, bool, uint64_t) noexcept {}
+inline void GpuHoldOrder_OnHold(void*, const void*, uint64_t, int64_t, int64_t, uint64_t, bool, uint64_t,
+    const PacingPlanKey&, uint64_t) noexcept {}
 inline void GpuHoldOrder_OnGateRelease(const void*, uint64_t, int64_t) noexcept {}
 inline void GpuHoldOrder_AfterNativePresent(bool, uint64_t) noexcept {}
 inline uint64_t GpuHoldOrder_BeforeSignal(const void*, const void*) noexcept { return UINT64_MAX; }

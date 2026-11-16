@@ -105,6 +105,11 @@ void GpuPresent_DrainDiagnostics() noexcept;
 // its D3D12 queue so the GpuQueue capability can be published before any H3
 // plan exists. Nonblocking; the worker creates the fences.
 void GpuPresent_ObservePresentQueue(uint64_t native_queue,uint64_t native_swapchain) noexcept;
+struct PacingPlanKey;
+// The hold order unit's release thread (gpu_hold_order.h) saw a held frame's Present processed by the presenting
+// queue: one stage event PresentProcessed on the GPU queue wait rung for the frame of that plan, stamped with `qpc`.
+// Any thread, no lock; nothing is pushed for an identity that is not valid or a time that is not positive.
+void GpuPresent_PushPresentProcessed(const PacingPlanKey& key, uint64_t grid_index, int64_t qpc) noexcept;
 // A Streamline FG binding on native_queue retired. The queue stays
 // registered; the worker re-reads the FG swapchain identity when it is idle.
 // Nonblocking (shared registration lock only).

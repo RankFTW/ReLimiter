@@ -517,6 +517,9 @@ void TestPacingPipelineDefaults() {
     // Present-first ordering is on by default (one constant); the published switch follows the configuration.
     CHECK(g_config.gpu_wait_present_first && kPacingGpuWaitPresentFirstDefault && g_gpu_wait_present_first.load());
     CHECK(Value(local_path, "FrameLimiter", "gpu_wait_present_first") == "true");
+    // The start limit is on by default as well (one constant); the published switch follows the configuration.
+    CHECK(g_config.gpu_wait_start_limit && kPacingGpuWaitStartLimitDefault && g_gpu_wait_start_limit.load());
+    CHECK(Value(local_path, "FrameLimiter", "gpu_wait_start_limit") == "true");
     CheckProductionDefaults();
     // The startup rewrite saves every key, including the developer keys.
     CHECK(Value(local_path, "FrameLimiter", "flip_metering_off") == "false");
@@ -636,9 +639,10 @@ void TestGpuPresentGateProbesKey() {
 
 // Developer gpu_wait_present_first is on by default (kPacingGpuWaitPresentFirstDefault): a launch without the key
 // publishes it and logs nothing about it; false loads, is saved, is published, is a live key, counts as the one
-// developer override and logs one Warn line; with it on, an interleave logs one more (the interleave switches a
-// default behaviour off in alternate periods), and with it off the interleave adds none. The lines are counted,
-// not read.
+// developer override and logs one Warn line. An interleave logs one line more whichever way this key is set: with
+// the start limit on (its default) the interleave alternates the start limit, not this key, so the line is the start
+// limit's (TestGpuWaitStartLimitIsOnByDefault has the case with the start limit off). The lines are counted, not
+// read.
 void TestGpuWaitPresentFirstIsOnByDefault() {
     const auto launch = [](const std::vector<IniEntry>& extra) {
         std::vector<IniEntry> ini{{"config_version", "6"}};
@@ -669,8 +673,49 @@ void TestGpuWaitPresentFirstIsOnByDefault() {
     CHECK(g_gpu_wait_ab_interleave_s.load() == 30 && Config_DeveloperOverrides() == 1);
     ReleaseStart();CHECK(OwnerShutdown());
 
-    CHECK(launch({{"gpu_wait_present_first", "false"}, {"gpu_wait_ab_interleave_s", "30"}}) == quiet + 1);
+    CHECK(launch({{"gpu_wait_present_first", "false"}, {"gpu_wait_ab_interleave_s", "30"}}) == quiet + 2);
     CHECK(!g_gpu_wait_present_first.load() && Config_DeveloperOverrides() == 2);
+    ReleaseStart();CHECK(OwnerShutdown());
+}
+
+// Developer gpu_wait_start_limit is on by default (kPacingGpuWaitStartLimitDefault): a launch without the key
+// publishes it and logs nothing about it; false loads, is saved, is published, is a live key, counts as one developer
+// override and logs one Warn line. With it on, an interleave logs one line of its own (it alternates the start limit
+// and leaves present-first on its key); with it off the interleave alternates present-first, as it did before the
+// start limit existed, and logs that line besides the key's own. The lines are counted, not read.
+void TestGpuWaitStartLimitIsOnByDefault() {
+    const auto launch = [](const std::vector<IniEntry>& extra) {
+        std::vector<IniEntry> ini{{"config_version", "6"}};
+        ini.insert(ini.end(), extra.begin(), extra.end());
+        Reset(false, false, ini);
+        return WarnCount("");
+    };
+    const size_t quiet = launch({});
+    CHECK(g_config.gpu_wait_start_limit && g_gpu_wait_start_limit.load() && Config_DeveloperOverrides() == 0);
+    CHECK(Value(local_path, "FrameLimiter", "gpu_wait_start_limit") == "true");
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    CHECK(launch({{"gpu_wait_start_limit", "false"}}) == quiet + 1);
+    CHECK(!g_config.gpu_wait_start_limit && !g_gpu_wait_start_limit.load());
+    CHECK(Value(local_path, "FrameLimiter", "gpu_wait_start_limit") == "false");
+    CHECK(Config_DeveloperOverrides() == 1);
+    char error[128] = {};
+    CHECK(Config_SetLiveKey("gpu_wait_start_limit", "on", error, sizeof(error)) && g_config.gpu_wait_start_limit);
+    CHECK(g_gpu_wait_start_limit.load() && Config_DeveloperOverrides() == 0);
+    CHECK(Config_SetLiveKey("gpu_wait_start_limit", "off", error, sizeof(error)) && !g_config.gpu_wait_start_limit);
+    CHECK(!g_gpu_wait_start_limit.load() && Config_DeveloperOverrides() == 1);
+    Config_ResetDeveloperSettings();
+    CHECK(g_config.gpu_wait_start_limit && g_gpu_wait_start_limit.load() && Config_DeveloperOverrides() == 0);
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    // The interleave with the key on alternates the start limit: one line, present-first untouched.
+    CHECK(launch({{"gpu_wait_ab_interleave_s", "30"}}) == quiet + 1);
+    CHECK(g_gpu_wait_start_limit.load() && g_gpu_wait_present_first.load() && g_gpu_wait_ab_interleave_s.load() == 30);
+    ReleaseStart();CHECK(OwnerShutdown());
+
+    // With the key off the interleave alternates present-first: the key's own line and the interleave's.
+    CHECK(launch({{"gpu_wait_start_limit", "false"}, {"gpu_wait_ab_interleave_s", "30"}}) == quiet + 2);
+    CHECK(!g_gpu_wait_start_limit.load() && g_gpu_wait_present_first.load() && g_gpu_wait_ab_interleave_s.load() == 30);
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
@@ -2103,7 +2148,7 @@ const OsdToggle osd_toggles[] = {
 constexpr size_t osd_toggle_count = sizeof(osd_toggles) / sizeof(osd_toggles[0]);
 static_assert(osd_toggle_count == 28, "the contract lists 28 OSD element toggles");
 
-// The 55 keys of the [FrameLimiter] section that are not OSD element toggles (83 with the 28 toggles), each with a value
+// The 59 keys of the [FrameLimiter] section that are not OSD element toggles (87 with the 28 toggles), each with a value
 // away from its default as an earlier launch left it, and the value the clean rewrite saves back. The keybind keys are
 // written to the local INI only while the presets are not shared. Derived by running the writer, then pinned. Which keys
 // exist is not decided here: ExpectedIniKeys reads the config_key lines of the shared fixture.
@@ -2126,6 +2171,7 @@ const IniKey non_default_ini[] = {
     {"pacing_preference", "smooth", "smooth"}, {"advanced_settings", "true", "true"},
     {"developer_settings", "true", "true"}, {"config_version", "6", "6"}, {"flip_metering_off", "true", "true"},
     {"gpu_wait_late_guard", "true", "true"}, {"gpu_wait_present_first", "false", "false"},
+    {"gpu_wait_start_limit", "false", "false"},
     {"gpu_wait_ab_interleave_s", "30", "30"},
     {"gpu_queue_probe", "false", "false"}, {"gpu_queue_probe_source", "0", "0"},
     {"pacing_test_mode", "driver_limiter", "driver_limiter"}, {"unified_hold_share", "0.125", "0.125000"},
@@ -2139,7 +2185,7 @@ const IniKey non_default_ini[] = {
     {"hang_report", "true", "true"}, {"hang_report_dump", "false", "false"}, {"hang_report_test_after_s", "30", "30"},
     {"streamline_compat", "force_false", "force_false"}};
 constexpr size_t non_default_ini_count = sizeof(non_default_ini) / sizeof(non_default_ini[0]);
-static_assert(non_default_ini_count == 58, "the contract lists 58 further keys");
+static_assert(non_default_ini_count == 59, "the contract lists 59 further keys");
 bool IsKeybindKey(const std::string& key) {
     return key == "osd_preset_prev_key" || key == "osd_preset_next_key" || key == "blackout_key";
 }
@@ -2328,9 +2374,10 @@ const LiveKey live_keys[] = {
     {"gpu_present_gate_probes", "off"}, {"gpu_queue_probe", "off"}, {"gpu_queue_probe_source", "0"},
     {"unified_queue_margin_end", "0"}, {"unified_hold_share", "0.1"}, {"pacing_test_mode", "reflex_only"},
     {"unified_queue_law", "off"}, {"unified_queue_rank", "3"}, {"unified_queue_need_frames", "6"},
-    {"gpu_wait_late_guard", "on"}, {"gpu_wait_present_first", "off"}, {"gpu_wait_ab_interleave_s", "30"},
+    {"gpu_wait_late_guard", "on"}, {"gpu_wait_present_first", "off"}, {"gpu_wait_start_limit", "off"},
+    {"gpu_wait_ab_interleave_s", "30"},
     {"unified_queue_upstream", "1"}, {"unified_queue_allow_us", "2500"}};
-static_assert(sizeof(live_keys) / sizeof(live_keys[0]) == 18, "the contract lists 18 live keys");
+static_assert(sizeof(live_keys) / sizeof(live_keys[0]) == 19, "the contract lists 19 live keys");
 bool IsLiveKey(const std::string& key) {
     for (const LiveKey& live : live_keys)
         if (key == live.key) return true;
@@ -2355,14 +2402,14 @@ void TestOnlyTheListedKeysAreLive() {
         CHECK(std::strstr(unknown, "not a live key") != nullptr);
         ++refused;
     }
-    CHECK(refused == 86 - 18);
+    CHECK(refused == 87 - 19);
     SaveConfig();
     CHECK(SectionFields(local_path, "FrameLimiter") == before); // nothing a refused key named changed
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
 // The developer fields Config_DeveloperOverrides counts and Config_ResetDeveloperSettings returns to their defaults are
-// these 15 (a name and the way to move the field away from its default and test that it is back); nothing else counts, and
+// these 19 (a name and the way to move the field away from its default and test that it is back); nothing else counts, and
 // the user's settings stay through the reset.
 struct DeveloperField {
     const char* name;
@@ -2374,6 +2421,7 @@ const DeveloperField developer_fields[] = {
     {"flip_metering_off", [] { g_config.flip_metering_off = true; }, [] { return !g_config.flip_metering_off; }},
     {"gpu_wait_late_guard", [] { g_config.gpu_wait_late_guard = true; }, [] { return !g_config.gpu_wait_late_guard; }},
     {"gpu_wait_present_first", [] { g_config.gpu_wait_present_first = false; }, [] { return g_config.gpu_wait_present_first; }},
+    {"gpu_wait_start_limit", [] { g_config.gpu_wait_start_limit = false; }, [] { return g_config.gpu_wait_start_limit; }},
     {"gpu_wait_ab_interleave_s", [] { g_config.gpu_wait_ab_interleave_s = 30; }, [] { return g_config.gpu_wait_ab_interleave_s == 0; }},
     {"control_file", [] { g_config.control_file = true; }, [] { return !g_config.control_file; }},
     {"gpu_queue_probe", [] { g_config.gpu_queue_probe = false; }, [] { return g_config.gpu_queue_probe; }},
@@ -2389,7 +2437,7 @@ const DeveloperField developer_fields[] = {
     {"unified_queue_allow_us", [] { g_config.unified_queue_allow_us = 2500; }, [] { return g_config.unified_queue_allow_us == 4000; }},
     {"hang_report_dump", [] { g_config.hang_report_dump = false; }, [] { return g_config.hang_report_dump; }},
     {"hang_report_test_after_s", [] { g_config.hang_report_test_after_s = 30; }, [] { return g_config.hang_report_test_after_s == 0; }}};
-static_assert(sizeof(developer_fields) / sizeof(developer_fields[0]) == 18, "the contract lists 18 developer fields");
+static_assert(sizeof(developer_fields) / sizeof(developer_fields[0]) == 19, "the contract lists 19 developer fields");
 void TestDeveloperFieldsAreCountedAndResetOneByOne() {
     Reset();
     CHECK(Config_DeveloperOverrides() == 0);
@@ -2609,6 +2657,7 @@ int main() {
     TestDeveloperSettingsReset();
     TestGpuPresentGateProbesKey();
     TestGpuWaitPresentFirstIsOnByDefault();
+    TestGpuWaitStartLimitIsOnByDefault();
     TestUnifiedHoldShareKey();
     TestUnifiedQueueLawKeys();
     TestUnifiedQueueNeedFramesKey();

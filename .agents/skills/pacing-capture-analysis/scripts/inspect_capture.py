@@ -172,19 +172,26 @@ PRE_REMOVAL_PROFILE_PREFIX = "pre-removal-source"
 
 # Rows columns appended after the removal, in order (the writer's last columns). A file of an earlier build lacks
 # them: plan_ordered (developer key gpu_wait_present_first; 1 when the frame's plan was made on present-first
-# ordering, empty otherwise) is read as 0 there, since those builds never ordered a frame.
-APPENDED_AFTER_REMOVAL_PACING_COLUMNS = ("plan_ordered",)
+# ordering, empty otherwise) is read as 0 there, since those builds never ordered a frame; plan_start_limit_us and
+# plan_start_applied (developer key gpu_wait_start_limit; the collision guard's start term: the limit in
+# microseconds, 1 when it limited the plan) are read as 0 there, since those builds had no start limit.
+APPENDED_AFTER_REMOVAL_PACING_COLUMNS = ("plan_ordered", "plan_start_limit_us", "plan_start_applied")
 
-# The current rows header (193 columns, profile current-source-193): the
+# The current rows header (195 columns, profile current-source-195): the
 # pre-removal header without REMOVED_PACING_COLUMNS, the order of the others
 # unchanged, then APPENDED_AFTER_REMOVAL_PACING_COLUMNS.
 CURRENT_PACING_HEADER = [name for name in PRE_REMOVAL_PACING_HEADER if name not in REMOVED_PACING_COLUMNS] + \
     list(APPENDED_AFTER_REMOVAL_PACING_COLUMNS)
 
+# The rows header of the builds between the plan_ordered column and the start limit columns (193 columns): a
+# prefix of the current header, profile pre-start-limit-source-193.
+PRE_START_LIMIT_PROFILE_PREFIX = "pre-start-limit-source"
+PRE_START_LIMIT_PACING_HEADER = CURRENT_PACING_HEADER[:-2]
+
 # The rows header of the builds between the removal and the plan_ordered column (192 columns): a prefix of the
 # current header, profile pre-plan-ordered-source-192.
 PRE_PLAN_ORDERED_PROFILE_PREFIX = "pre-plan-ordered-source"
-PRE_PLAN_ORDERED_PACING_HEADER = CURRENT_PACING_HEADER[:-1]
+PRE_PLAN_ORDERED_PACING_HEADER = CURRENT_PACING_HEADER[:-3]
 
 CURRENT_PACING_EVENTS_HEADER = [
     "sequence", "capture_epoch", "event_type", "event_qpc", "qpc_frequency",
@@ -432,6 +439,8 @@ def schema_profile(kind: str, header: list[str]) -> str:
         current, historical, historical_lengths = profiles[kind]
         if header == current:
             return f"current-source-{len(current)}"
+        if kind == "relimiter_pacing" and header == PRE_START_LIMIT_PACING_HEADER:
+            return f"{PRE_START_LIMIT_PROFILE_PREFIX}-{len(header)}"
         if kind == "relimiter_pacing" and header == PRE_PLAN_ORDERED_PACING_HEADER:
             return f"{PRE_PLAN_ORDERED_PROFILE_PREFIX}-{len(header)}"
         if historical is not current and header == historical:
@@ -586,6 +595,10 @@ def _family_warnings(result: dict[str, Any], file_name: str) -> list[str]:
         warnings.append("The header is the pre-removal schema: the columns " + ", ".join(REMOVED_PACING_COLUMNS) +
                         " exist and carry the removed mechanisms' values, which are empty, constant or zero in "
                         "the last builds that wrote them; later builds do not write them.")
+    elif profile.startswith(f"{PRE_START_LIMIT_PROFILE_PREFIX}-"):
+        warnings.append("The header is the schema before the plan_start_limit_us and plan_start_applied columns: "
+                        "both are absent and read as 0 (builds before them had no start limit); no other column "
+                        "differs.")
     elif profile.startswith(f"{PRE_PLAN_ORDERED_PROFILE_PREFIX}-"):
         warnings.append("The header is the schema before the plan_ordered column: the column is absent and read "
                         "as 0 (builds before it never ordered a frame); no other column differs.")

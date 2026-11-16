@@ -1325,6 +1325,151 @@ void TestPlanCarriesOrdered()
     }
 }
 
+// The developer A/B switches of the collision guard (source_stage.h) as the scheduler's interleave supplies them: the
+// three keys, whether an interleave period is set and whether the plan is in an odd period. The scheduler is not
+// compiled into any test, so the period logic is this pure function.
+void TestCollisionGuardSwitches()
+{
+    std::printf("Test: the collision guard's switches, with and without the interleave\n");
+    // No interleave: every key applies in every plan and nothing is only observed; the odd flag means nothing then.
+    for (const bool odd : { false, true }) {
+        const SourceStageSwitches all = SourceStage_Switches(true, true, true, false, odd);
+        CHECK(all.late_guard && all.start_limit && all.ordered && !all.late_observe && !all.start_observe);
+        const SourceStageSwitches none = SourceStage_Switches(false, false, false, false, odd);
+        CHECK(!none.late_guard && !none.start_limit && !none.ordered && !none.late_observe && !none.start_observe);
+        const SourceStageSwitches start_only = SourceStage_Switches(false, true, false, false, odd);
+        CHECK(!start_only.late_guard && start_only.start_limit && !start_only.ordered && !start_only.start_observe);
+    }
+    // The interleave with the start limit on: the late state and the start limit act in the even periods and are
+    // only observed in the odd ones (the limit computed and reported, not applied); present-first ordering keeps
+    // its own key in both.
+    const SourceStageSwitches even = SourceStage_Switches(true, true, true, true, false);
+    CHECK(even.late_guard && even.late_observe && even.start_limit && even.start_observe && even.ordered);
+    const SourceStageSwitches odd = SourceStage_Switches(true, true, true, true, true);
+    CHECK(!odd.late_guard && odd.late_observe && !odd.start_limit && odd.start_observe && odd.ordered);
+    CHECK(!SourceStage_Switches(true, true, false, true, false).ordered);
+    CHECK(!SourceStage_Switches(true, true, false, true, true).ordered);
+    // The late key off: the late state is neither applied nor observed in any period; the start limit alternates.
+    const SourceStageSwitches no_late_even = SourceStage_Switches(false, true, true, true, false);
+    CHECK(!no_late_even.late_guard && !no_late_even.late_observe && no_late_even.start_limit &&
+          no_late_even.start_observe);
+    const SourceStageSwitches no_late_odd = SourceStage_Switches(false, true, true, true, true);
+    CHECK(!no_late_odd.late_guard && !no_late_odd.late_observe && !no_late_odd.start_limit &&
+          no_late_odd.start_observe && no_late_odd.ordered);
+    // The start limit's key off: it is neither applied nor observed, and present-first ordering alternates with the
+    // late state, as the interleave did before the start limit existed.
+    const SourceStageSwitches no_start_even = SourceStage_Switches(true, false, true, true, false);
+    CHECK(no_start_even.late_guard && no_start_even.late_observe && !no_start_even.start_limit &&
+          !no_start_even.start_observe && no_start_even.ordered);
+    const SourceStageSwitches no_start_odd = SourceStage_Switches(true, false, true, true, true);
+    CHECK(!no_start_odd.late_guard && no_start_odd.late_observe && !no_start_odd.start_limit &&
+          !no_start_odd.start_observe && !no_start_odd.ordered);
+    // Every key off: nothing, in any period.
+    for (const bool odd_period : { false, true }) {
+        const SourceStageSwitches none = SourceStage_Switches(false, false, false, true, odd_period);
+        CHECK(!none.late_guard && !none.late_observe && !none.start_limit && !none.start_observe && !none.ordered);
+    }
+}
+
+// The start term (developer key gpu_wait_start_limit, lead_controller.h): both planning branches hand the request's
+// switches to the lead, and the plan carries the limit the lead applied to the executor (lead_limit_us, in the
+// registry's copy too); the frame and the source record say what the term found and whether it was applied. On a
+// lead that has seen nothing the limit is 2 I less the release headroom (1,000 µs): there is no service and no
+// turnaround yet.
+void TestPlanCarriesStartLimit()
+{
+    std::printf("Test: the plan carries the start limit exactly when the lead applied it\n");
+    const PacingPipelineSnapshot gpu = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
+    const PacingPipelineSnapshot source_only = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
+    const double limit_us = 2.0 * kIntervalUs - 1'000.0;
+    struct Planned {
+        SourceStageFrame frame{};
+        PacingFramePlan published{};
+        PacingSourceRecord record{};
+    };
+    for (const bool unified : { false, true }) {
+        ResetStage();
+        if (unified) g_stage.SetUnifiedEnabled(true, 1);
+        std::atomic<uint64_t> mailbox{0};
+        ScriptedClock clock;
+        uint64_t frame_id = unified ? 2'100 : 2'000;
+        // One plan with the given switches: the frame, the registry's copy of the plan and the frame's source record.
+        const auto plan = [&](const PacingPipelineSnapshot& pipeline, bool guard, bool limit, bool observe) {
+            SourceStageRequest request = unified ? UnifiedMarkerRequest(Key(frame_id++), &mailbox)
+                                                 : Request(Key(frame_id++), pipeline);
+            request.pipeline = pipeline;
+            request.collision_guard = guard;
+            request.start_limit = limit;
+            request.start_observe = observe;
+            Planned planned{};
+            planned.frame = g_stage.RunPlannedFrame(request, &clock);
+            CHECK(planned.frame.planned && planned.frame.plan_published);
+            CHECK(g_frame_plans.Find(planned.frame.plan.key, &planned.published));
+            SourceStage::FillSourceRecord(planned.frame, pipeline, &planned.record);
+            clock.now = planned.frame.release_qpc + Ticks(4'000.0);
+            return planned;
+        };
+        // Applied: the plan, the registry's copy, the frame and the record all carry the limit.
+        const Planned applied = plan(gpu, true, true, false);
+        CHECK(Near(applied.frame.plan.lead_limit_us, limit_us, 0.01));
+        CHECK(Near(applied.published.lead_limit_us, limit_us, 0.01));
+        CHECK(applied.frame.start_applied && Near(applied.frame.start_limit_us, limit_us, 0.01));
+        CHECK(applied.record.plan_start_applied == 1 && Near(applied.record.plan_start_limit_us, limit_us, 0.01));
+        // Only observed (the interleave's odd periods): the limit is found and reported, nothing is limited.
+        const Planned observed = plan(gpu, true, false, true);
+        CHECK(observed.frame.plan.lead_limit_us == 0.0f && observed.published.lead_limit_us == 0.0f);
+        CHECK(!observed.frame.start_applied && Near(observed.frame.start_limit_us, limit_us, 0.01));
+        CHECK(observed.record.plan_start_applied == 0 && Near(observed.record.plan_start_limit_us, limit_us, 0.01));
+        // Neither switch, the guard off, or another rung: the term does not run.
+        const Planned off = plan(gpu, true, false, false);
+        const Planned unguarded = plan(gpu, false, true, true);
+        const Planned other = plan(source_only, true, true, true);
+        for (const Planned* planned : { &off, &unguarded, &other }) {
+            CHECK(planned->frame.plan.lead_limit_us == 0.0f && planned->published.lead_limit_us == 0.0f);
+            CHECK(!planned->frame.start_applied && planned->frame.start_limit_us == 0.0);
+            CHECK(planned->record.plan_start_applied == 0 && planned->record.plan_start_limit_us == 0.0);
+        }
+    }
+    g_stage.SetUnifiedEnabled(false, 1);
+}
+
+// The start term's turnaround is the game's arrival after its previous Present's PRESENT_END, not the release of
+// ReLimiter's own wait: each planning branch gives the lead the arrival it knows (the planning site's time in the
+// existing branch, the marker's or the Sleep hook's arrival in the unified one). The second frame arrives 150 µs
+// after the first one's PRESENT_END and is held to its grid start, so its release is nearly 4 ms later.
+void TestPlanGivesTheLeadTheGamesArrival()
+{
+    std::printf("Test: the lead's turnaround is measured from the game's arrival, not from the release\n");
+    const PacingPipelineSnapshot gpu = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
+    for (const bool unified : { false, true }) {
+        ResetStage();
+        if (unified) g_stage.SetUnifiedEnabled(true, 1);
+        std::atomic<uint64_t> mailbox{0};
+        ScriptedClock clock;
+        uint64_t frame_id = unified ? 2'300 : 2'200;
+        const auto request_of = [&]() {
+            SourceStageRequest request = unified ? UnifiedMarkerRequest(Key(frame_id++), &mailbox)
+                                                 : Request(Key(frame_id++), gpu);
+            request.pipeline = gpu;
+            request.collision_guard = true;
+            request.start_limit = true;
+            return request;
+        };
+        const SourceStageFrame first = g_stage.RunPlannedFrame(request_of(), &clock);
+        CHECK(first.planned && first.release_qpc == kStart);
+        const int64_t present_end = first.release_qpc + Ticks(6'000.0);
+        CHECK(FramePlan_PushStageEvent(Event(first, PacingStageEventKind::PresentEnd, present_end)));
+        CHECK(g_stage.DrainStageEvents() == 1);
+        CHECK(g_stage.Lead().StartEvidence().turnaround_samples == 0);
+        clock.now = present_end + Ticks(150.0);
+        const SourceStageFrame second = g_stage.RunPlannedFrame(request_of(), &clock);
+        CHECK(second.planned && second.release_qpc > present_end + Ticks(1'000.0));
+        const LeadStartEvidence evidence = g_stage.Lead().StartEvidence();
+        CHECK(evidence.turnaround_samples == 1 && Near(evidence.turnaround_us, 150.0, 20.0));
+    }
+    g_stage.SetUnifiedEnabled(false, 1);
+}
+
 // The marker-site wait never commits a release before T(n).
 void TestUnifiedFailedMarkerWait()
 {
@@ -3575,6 +3720,9 @@ int main(int argc, char** argv)
     TestUnifiedPlanningDecision();
     TestUnifiedMarkerOnlyFrames();
     TestPlanCarriesOrdered();
+    TestCollisionGuardSwitches();
+    TestPlanCarriesStartLimit();
+    TestPlanGivesTheLeadTheGamesArrival();
     TestUnifiedFailedMarkerWait();
     TestUnifiedRawDivisorAndDriverSleep();
     TestUnifiedUsedReportReachesTheLead();

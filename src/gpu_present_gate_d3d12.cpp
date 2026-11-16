@@ -1039,9 +1039,10 @@ bool Enqueue(const EnqueueRequest& request,GpuPresentTrace* trace) noexcept {
         static std::atomic<bool> wait_marked{false};
         if(!wait_marked.load(std::memory_order_relaxed)) {wait_marked.store(true,std::memory_order_relaxed);Breadcrumb_Mark(StartupStage::FirstGateWaitEnqueued);}
         // gpu_hold_order (key off: one load and a branch): the hold is on the queue; the unit learns it on this thread,
-        // ordered or not (its rule judges every held frame), and takes it over at the native Present that follows.
+        // ordered or not (its rule judges every held frame), and takes it over at the native Present that follows. The
+        // plan's identity goes with it: the unit reports the frame's Present as processed under it (PresentProcessed).
         if(!request.fg)GpuHoldOrder_OnHold(queue->native,ticket.time,trace->ticket,trace->target_qpc,trace->interval_qpc,
-            ticket.law_hold_sequence,request.ordered,trace->swapchain);
+            ticket.law_hold_sequence,request.ordered,trace->swapchain,ticket.key,trace->grid_index);
     }
     if(ticket.post_slot && SUCCEEDED(trace->wait_result) && SUCCEEDED(ticket.pre_sample.signal_result)) {
         prepare_sample(&ticket.post_sample,trace->ticket*2+1);
@@ -1089,10 +1090,11 @@ OutputDecision Decide(const PacingFramePlan& plan,int64_t now,bool displayed_sla
     }
     // Resolved, so TargetOf resolves the same index.
     CadenceGrid_TargetOf(snapshot,plan.key.controller_generation,plan.grid_index,&decision.grid_target);
-    // Developer key gpu_wait_late_guard (PacingFramePlan::lead_limit_us, 0 with the key off): the collision
-    // guard's limit bounds the resolved target too. The spacing floor lifts a target past it when the lead
-    // drops by more than the floor's slack in one plan (the end of a late state), and a hold that ends past
-    // the limit ends in the next frame's heavy GPU work. Never below the nominal target.
+    // PacingFramePlan::lead_limit_us is the collision guard's limit on the lead (the late state's, key gpu_wait_late_guard,
+    // or the start term's, lead_controller.h), filled whenever the guard has one (0 when it has none): it bounds the
+    // resolved target too. The spacing floor lifts a target past it when the lead drops by more than the floor's slack
+    // in one plan (the end of a late state, the start term tightening), and a hold that ends past the limit ends in the
+    // next frame's heavy GPU work or makes the game late for the frame after it. Never below the nominal target.
     if(floored && plan.lead_limit_us>0.0f && plan.source_wake_qpc>0) {
         const auto limit=plan.source_wake_qpc+static_cast<int64_t>(std::llround(
             static_cast<double>(plan.lead_limit_us)*static_cast<double>(frequency)/1e6));
@@ -1319,6 +1321,13 @@ void GpuPresent_ObservePresentQueue(uint64_t native_queue,uint64_t native_swapch
     present_queue.store(native_queue,std::memory_order_release);
     DiscoverQueue(native_queue);
     PublishGpuQueueCapability();
+}
+// The hold order unit's release thread saw a held frame's Present processed by the presenting queue (gpu_hold_order.h):
+// the stage event of that frame's plan, stamped with the unit's clock read. Any thread, no lock; an identity that is not
+// valid pushes nothing (PushStage).
+void GpuPresent_PushPresentProcessed(const PacingPlanKey& key,uint64_t grid_index,int64_t qpc) noexcept {
+    using namespace gpu_present;
+    PushStage(key,grid_index,PacingStageEventKind::PresentProcessed,PacingRung::GpuQueueWait,qpc);
 }
 // H3 on the native Present (no FG): claim the exact plan, resolve T, queue
 // the time-fence wait or report Late/Undeliverable/Stale. Never holds the CPU.

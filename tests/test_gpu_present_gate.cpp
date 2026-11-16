@@ -140,6 +140,7 @@ void TestStatusIdentity() {
 #include <atomic>
 #include <deque>
 #include <mutex>
+#include <thread>
 #include <vector>
 namespace {
 // Atomic: the live-worker lifecycle test reads these while the worker thread
@@ -1017,6 +1018,26 @@ void TestQueueDiscoveryAfterCleanup() {
     for(size_t i=1;i<queues.size();++i)queues[i].state=QueueState::Failed; // fixture: exhaust lifetime capacity
     CHECK(!FindOrRequest(address+1,&trace) && trace.status==GpuPresentStatus::RegistryFull);
 }
+// The hold order unit's report that a held frame's Present was processed (gpu_hold_order.h): one PresentProcessed event
+// for the plan's frame on the GPU queue wait rung, status Unknown, with the unit's stamp, from any thread; nothing for
+// an identity that is not valid or a time that is not positive.
+void TestPresentProcessed() {
+    FrameTimeline_BeginProducerEpoch(FrameIdentityDomain::NvApiFrame);FrameTimeline_BeginControllerGeneration();
+    CHECK(PacingPlanKey_IsValid(PlanKey(1)));
+    PacingStageEvent drained;while(FramePlan_PopStageEvent(&drained)) {}
+    GpuPresent_PushPresentProcessed(PlanKey(7),7,fake_clock+25);
+    ExpectStage(7,7,PacingStageEventKind::PresentProcessed,fake_clock+25);
+    ExpectNoStage();
+    GpuPresent_PushPresentProcessed(PlanKey(8),0,fake_clock+25);       // no grid index
+    GpuPresent_PushPresentProcessed(PacingPlanKey{},9,fake_clock+25);  // no key
+    GpuPresent_PushPresentProcessed(PlanKey(10),10,0);                 // no time
+    ExpectNoStage();
+    // The unit's release thread is not the Present thread: the queue takes the push from another thread.
+    const auto key=PlanKey(11);
+    std::thread([&] {GpuPresent_PushPresentProcessed(key,11,fake_clock+3);}).join();
+    ExpectStage(11,11,PacingStageEventKind::PresentProcessed,fake_clock+3);
+    ExpectNoStage();
+}
 #endif
 int main() {
     TestHorizon();
@@ -1031,6 +1052,7 @@ int main() {
     TestWorkerModeLifecycle();
     TestQueueReclamation();
     TestExecutor();
+    TestPresentProcessed();
     TestQueueDiscoveryAfterCleanup();
 #endif
     std::puts("GPU Present gate tests passed; driver fakes, not displayed pacing proof.");

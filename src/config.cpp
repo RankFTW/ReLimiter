@@ -401,6 +401,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.fg_present_order_trailing=ReadINIBool(S,"fg_present_order_trailing",false,P);
     g_config.gpu_wait_late_guard=ReadINIBool(S,"gpu_wait_late_guard",false,P);
     g_config.gpu_wait_present_first=ReadINIBool(S,"gpu_wait_present_first",kPacingGpuWaitPresentFirstDefault,P);
+    g_config.gpu_wait_start_limit=ReadINIBool(S,"gpu_wait_start_limit",kPacingGpuWaitStartLimitDefault,P);
     g_config.gpu_wait_ab_interleave_s=ReadINIInt(S,"gpu_wait_ab_interleave_s",0,P);
     g_config.fg_render_break_every=ReadINIInt(S,"fg_render_break_every",0,P);
     g_config.fg_render_break_window=ReadINIInt(S,"fg_render_break_window",-1,P);
@@ -621,6 +622,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIBool(S, "flip_metering_off", config.flip_metering_off, P);
     WriteINIBool(S, "gpu_wait_late_guard", config.gpu_wait_late_guard, P);
     WriteINIBool(S, "gpu_wait_present_first", config.gpu_wait_present_first, P);
+    WriteINIBool(S, "gpu_wait_start_limit", config.gpu_wait_start_limit, P);
     WriteINIInt(S, "gpu_wait_ab_interleave_s", config.gpu_wait_ab_interleave_s, P);
     WriteINIBool(S, "gpu_queue_probe", config.gpu_queue_probe, P);
     WriteINIInt(S, "gpu_queue_probe_source", config.gpu_queue_probe_source, P);
@@ -902,6 +904,7 @@ void Config_ApplyPacingPipeline() {
     g_fg_present_order_trailing.store(sizeof(void*) == 8 && g_config.fg_present_order_trailing, std::memory_order_relaxed);
     g_gpu_wait_late_guard.store(g_config.gpu_wait_late_guard, std::memory_order_relaxed);
     g_gpu_wait_present_first.store(g_config.gpu_wait_present_first, std::memory_order_relaxed);
+    g_gpu_wait_start_limit.store(g_config.gpu_wait_start_limit, std::memory_order_relaxed);
     g_gpu_wait_ab_interleave_s.store(std::clamp(g_config.gpu_wait_ab_interleave_s, 0, 600), std::memory_order_relaxed);
     g_fg_render_break_every.store(sizeof(void*) == 8 ? std::clamp(g_config.fg_render_break_every, 0, 64) : 0, std::memory_order_relaxed);
     g_fg_render_break_window.store(std::clamp(g_config.fg_render_break_window, -1, 32), std::memory_order_relaxed);
@@ -963,6 +966,7 @@ constexpr Key kKeys[] = {
     {"fg_present_order_trailing", &SetBool<&Config::fg_present_order_trailing>, Publish::Pipeline},
     {"gpu_wait_late_guard", &SetBool<&Config::gpu_wait_late_guard>, Publish::Pipeline},
     {"gpu_wait_present_first", &SetBool<&Config::gpu_wait_present_first>, Publish::Pipeline},
+    {"gpu_wait_start_limit", &SetBool<&Config::gpu_wait_start_limit>, Publish::Pipeline},
     {"gpu_wait_ab_interleave_s", &SetInt<&Config::gpu_wait_ab_interleave_s>, Publish::Pipeline},
     {"fg_render_break_every", &SetInt<&Config::fg_render_break_every>, Publish::Pipeline},
     {"fg_render_break_window", &SetInt<&Config::fg_render_break_window>, Publish::Pipeline},
@@ -1018,6 +1022,7 @@ int Config_DeveloperOverrides() {
         (g_config.flip_metering_off != d.flip_metering_off) +
         (g_config.gpu_wait_late_guard != d.gpu_wait_late_guard) +
         (g_config.gpu_wait_present_first != d.gpu_wait_present_first) +
+        (g_config.gpu_wait_start_limit != d.gpu_wait_start_limit) +
         (g_config.gpu_wait_ab_interleave_s != d.gpu_wait_ab_interleave_s) +
         (g_config.control_file != d.control_file) +
         (g_config.gpu_queue_probe != d.gpu_queue_probe) +
@@ -1040,6 +1045,7 @@ void Config_ResetDeveloperSettings() {
     g_config.flip_metering_off = d.flip_metering_off;
     g_config.gpu_wait_late_guard = d.gpu_wait_late_guard;
     g_config.gpu_wait_present_first = d.gpu_wait_present_first;
+    g_config.gpu_wait_start_limit = d.gpu_wait_start_limit;
     g_config.gpu_wait_ab_interleave_s = d.gpu_wait_ab_interleave_s;
     g_config.control_file = d.control_file;
     g_config.gpu_queue_probe = d.gpu_queue_probe;
@@ -1096,14 +1102,22 @@ void ApplyConfig() {
         LOG_WARN("Diagnostic GPU wait late guard on: while the newest 64 frames all arrived late for their slot, "
                  "the limit on the GPU queue wait's lead follows their lateness and earliest heavy GPU work "
                  "(gpu_wait_late_guard=true, interleave %d s)", g_config.gpu_wait_ab_interleave_s);
-    // Present-first ordering is on by default: a line only when it is off and, with it on, when the interleave
-    // switches it off in alternate periods (the period the scheduler reads: published clamped to 0-600).
+    // Present-first ordering and the start limit are on by default: a line only when one is off and, with it on,
+    // when the interleave alternates it (the period the scheduler reads: published clamped to 0-600). The
+    // interleave alternates the start limit while that key is on, and present-first only while it is off.
     if (g_config.gpu_wait_present_first != kPacingGpuWaitPresentFirstDefault)
         LOG_WARN("Diagnostic GPU wait present first off: the render queue's next frame does not wait for a held "
                  "frame's Present, and the collision guard's limit on the GPU queue wait's lead applies alone "
                  "(gpu_wait_present_first=false; 64-bit Direct3D 12)");
+    if (g_config.gpu_wait_start_limit != kPacingGpuWaitStartLimitDefault)
+        LOG_WARN("Diagnostic GPU wait start limit off: the collision guard does not keep a held frame from ending "
+                 "after the start the game needs for the frame two ahead (gpu_wait_start_limit=false)");
     const int interleave_s = std::clamp(g_config.gpu_wait_ab_interleave_s, 0, 600);
-    if (g_config.gpu_wait_present_first && interleave_s != 0)
+    if (g_config.gpu_wait_start_limit && interleave_s != 0)
+        LOG_WARN("Diagnostic GPU wait start limit interleaved: the start limit acts only in alternate periods of %d s "
+                 "and is computed and reported, not applied, in the others; present-first ordering follows its own "
+                 "key in every period (gpu_wait_ab_interleave_s=%d)", interleave_s, interleave_s);
+    else if (g_config.gpu_wait_present_first && interleave_s != 0)
         LOG_WARN("Diagnostic GPU wait present first interleaved: present-first ordering acts only in alternate "
                  "periods of %d s, and the plan is made without it in the others "
                  "(gpu_wait_ab_interleave_s=%d; 64-bit Direct3D 12)", interleave_s, interleave_s);

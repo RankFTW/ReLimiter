@@ -38,6 +38,11 @@ inline std::atomic<int> g_unified_queue_margin_end{1};
 // resolves no target past the guard's limit. Published by Config_ApplyPacingPipeline; read by the scheduler
 // owner at each plan.
 inline std::atomic<bool> g_gpu_wait_late_guard{false};
+// Developer key gpu_wait_start_limit (default on, kPacingGpuWaitStartLimitDefault; lead_controller.h, the start
+// term): the collision guard's second limit on the GPU queue wait's lead, and the executor resolves no target past
+// it. Published by Config_ApplyPacingPipeline; read by the scheduler owner at each plan. Its own initial value
+// stays false as the present-first switch's does: nothing is limited before the configuration is published.
+inline std::atomic<bool> g_gpu_wait_start_limit{false};
 // Developer switch gpu_wait_present_first (default on, kPacingGpuWaitPresentFirstDefault; gpu_hold_order.h): in a
 // game whose render queue is not its presenting queue, the render queue's next frame waits until a held frame's
 // Present has become runnable, and the collision guard stands aside for the frames so ordered
@@ -48,10 +53,12 @@ inline std::atomic<bool> g_gpu_wait_present_first{false};
 // unit (gpu_hold_order.cpp, any thread); read by the scheduler owner at each plan, which orders a frame only
 // while this holds. False wherever the unit is not built.
 inline std::atomic<bool> g_gpu_hold_order_able{false};
-// Developer key gpu_wait_ab_interleave_s (default 0 = none): the two switches above act only in alternate
-// periods of this many seconds (the even ones of the QPC time); in the other periods the plan is the built
-// one and the frames that meet the late state's condition are flagged (up_flags 0x100000): an A/B inside
-// one capture.
+// Developer key gpu_wait_ab_interleave_s (default 0 = none): the late guard acts only in alternate periods of
+// this many seconds (the even ones of the QPC time), and so does the start limit while its key is on: the odd
+// periods compute and report it (the rows' plan_start_limit_us and plan_start_applied) without applying it.
+// Present-first ordering then follows its own key in every period; with the start limit's key off it
+// alternates as the late guard does. In the odd periods the plan is the built one and the frames that meet the
+// late state's condition are flagged (up_flags 0x100000): an A/B inside one capture.
 inline std::atomic<int> g_gpu_wait_ab_interleave_s{0};
 
 // The newest SetFlipConfig calls that enabled flip metering (nFramesPerBatch >

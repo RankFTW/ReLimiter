@@ -92,6 +92,10 @@ constexpr double kPacingGpuWaitHeadroomDefaultUs = 1000.0;
 // 64-bit Direct3D 12): the unit orders only where its own evidence qualifies (the render queue is not the
 // presenting queue, no frame generation presents, the rung is the GPU queue wait); elsewhere the key does nothing.
 constexpr bool kPacingGpuWaitPresentFirstDefault = true;
+// Developer key gpu_wait_start_limit (default on; lead_controller.h, the start term): the collision guard's second
+// limit on the GPU queue wait's lead, 2 I less the Present's service and the game's turnaround, which keeps a hold
+// from ending after the start the game needs for the frame two ahead. It stands aside by the game's own times.
+constexpr bool kPacingGpuWaitStartLimitDefault = true;
 
 // ── Constants of the removed pacing settings ──
 // Each fixes the value of a setting that no longer exists. Under the unified pacer it is what

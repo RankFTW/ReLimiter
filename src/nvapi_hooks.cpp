@@ -1954,13 +1954,17 @@ static NvAPI_Status __cdecl Hook_SetLatencyMarker(IUnknown* dev, NV_LATENCY_MARK
             }
         }
         // SIMULATION_END and PRESENT_END of a planned frame reach the lead
-        // (the game's simulation → render queue, lead_controller.h); the push
-        // never blocks.
+        // (the game's simulation → render queue and the start term's two
+        // sign tests, lead_controller.h); the push never blocks. Stamped at
+        // the hook's entry, as the PCL hook stamps them: the time after the
+        // driver call can lie behind the game's next arrival when this
+        // thread is descheduled inside it, and the start term would read
+        // that as a game asking for a frame before its Present ended.
         if ((marker_params.markerType == SIMULATION_END || marker_params.markerType == PRESENT_END) &&
             !PCL_MarkersFlowing()) {
             PresentGate_OnFrameMarker(frame_key, marker_params.markerType == SIMULATION_END
                 ? PacingStageEventKind::SimulationEnd : PacingStageEventKind::PresentEnd,
-                captured_qpc.QuadPart);
+                census_entry.QuadPart);
         }
         if (marker_params.markerType == PRESENT_START && !PCL_MarkersFlowing()) {
             // Gate N may overlap SimulationStart(N+1) on a different thread.

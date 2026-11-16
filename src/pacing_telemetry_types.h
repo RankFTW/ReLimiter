@@ -87,6 +87,11 @@ struct PacingSourceRecord {
     double plan_lead_us = 0.0;           // L
     uint8_t plan_rung = 0;               // PacingRung
     uint8_t plan_ordered = 0;            // PacingFramePlan::ordered: present-first ordering (1) or not (0); CSV plan_ordered
+    // The collision guard's start term for the plan (LeadGuardOutcome::start_limit_us and start_applied, lead_controller.h):
+    // the limit it computed in µs on the release → target distance, 0 where it stood aside or was not computed, and
+    // whether the plan was limited by it. CSV plan_start_limit_us (empty at 0) and plan_start_applied (1 or empty).
+    double plan_start_limit_us = 0.0;
+    uint8_t plan_start_applied = 0;
     uint32_t pipeline_generation = 0;    // PacingPipelineSnapshot::generation
     uint8_t fallback_reason = 0;         // PacingFallbackReason of the resolved pipeline
 

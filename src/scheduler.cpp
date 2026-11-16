@@ -359,6 +359,11 @@ int s_last_fg_divisor_raw = 0;
 // Collision-aware release: the guard of the newest judged lead last logged
 // (-1 none, 0 margin, 1 headroom).
 int s_logged_collision_guard = -1;
+// The start term's state last logged (lead_controller.h): -1 none, 0 applies and the Present's service was measured
+// when the line was said, 1 applies on the release headroom (no measured service then), 2 stands aside. Only applies
+// and stands aside are told: a later fall back from a measured service to the headroom is not a line, because a
+// stretch where almost nothing is held leaves the service window stale for 64 plans at a time and the state stays 0.
+int s_logged_start_limit = -1;
 // The first lead sample that left out the game's simulation → render queue
 // (lead_controller.h) has been logged. Once per process.
 bool s_logged_lead_queue = false;
@@ -506,7 +511,8 @@ static void ResetAdaptationRegime(const char* reason) noexcept
 // input wait's queue-order verdict for the frame's FG divisor, and the first
 // lead sample that left out the game's simulation → render queue. The GPU queue wait's verdict is the one of
 // the frame's own regime: a frame planned with present-first ordering (lead_controller.h) is judged by the
-// pairs of ordered frames and logged apart.
+// pairs of ordered frames and logged apart. The start term's verdict (applies on the measured service, applies
+// on the fallback, stands aside) is logged on a change too, whichever of its periods the plan was made in.
 static void ObserveCollisionGuard(double fg_divisor, bool ordered) noexcept
 {
     const LeadController& lead = s_source_stage.Lead();
@@ -554,6 +560,31 @@ static void ObserveCollisionGuard(double fg_divisor, bool ordered) noexcept
                      "ran beside the wait, Reflex reports stopped, or frame generation is off)");
         }
         s_logged_fg_behind_wait = fg_behind_wait;
+    }
+    if (statistics.start_checked_frames != 0) {
+        // The state to tell: stands aside, or applies. The wording of an applies line says whether the service was
+        // measured at that moment, and it is said when the term begins to apply (the first time, or after standing
+        // aside) and when the service is measured for the first time after a line that said the headroom.
+        int start = s_logged_start_limit;
+        if (statistics.last_start_aside) start = 2;
+        else if (start < 0 || start == 2) start = statistics.last_start_measured ? 0 : 1;
+        else if (start == 1 && statistics.last_start_measured) start = 0;
+        if (start != s_logged_start_limit) {
+            const LeadStartEvidence evidence = lead.StartEvidence();
+            if (start == 2) {
+                LOG_INFO("Start limit: stands aside (%zu of the newest %zu telling pairs: the game's Present ended "
+                         "before the held frame's release; %zu of the newest %zu frames: the game asked for a frame "
+                         "before its previous Present ended)",
+                         evidence.free_pairs, evidence.telling_pairs, evidence.untied_starts, evidence.frames);
+            } else {
+                LOG_INFO("Start limit: applies, %.2f ms (two intervals less the Present's service %.2f ms, %s, and "
+                         "the game's turnaround %.2f ms)",
+                         statistics.last_start_limit_us / 1000.0, statistics.last_start_service_us / 1000.0,
+                         start == 0 ? "measured" : "the release headroom: no measured service",
+                         statistics.last_start_turnaround_us / 1000.0);
+            }
+            s_logged_start_limit = start;
+        }
     }
     if (statistics.collision_checked_frames == 0) return;
     const int guard = statistics.last_guard_headroom ? 1 : 0;
@@ -1264,25 +1295,28 @@ static SourceStageFrame RunPlanned(
     const bool unified = SourceStage_UnifiedPlans(pipeline, config.unified, s_source_stage.UnifiedEnabled());
     // Lead spike floor (lead_controller.h).
     request.spike_floor = kPacingLeadSpikeFloor;
-    // Developer A/B switches of the collision guard (lead_controller.h): the late state (gpu_wait_late_guard)
-    // and present-first ordering (gpu_wait_present_first; gpu_hold_order.h). With the interleave key they act
-    // in the even periods of the QPC time only; in the odd ones the plan is the built one and the frames that
-    // meet the late state's condition are flagged, nothing else. A plan is ordered only while the unit says it
-    // can order (g_gpu_hold_order_able), so the queue hooks order a frame exactly when its plan said so.
-    request.late_guard = g_gpu_wait_late_guard.load(std::memory_order_relaxed);
-    request.ordered = g_gpu_wait_present_first.load(std::memory_order_relaxed);
-    if (request.late_guard || request.ordered) {
-        const int64_t period_qpc = static_cast<int64_t>(g_gpu_wait_ab_interleave_s.load(
+    // Developer A/B switches of the collision guard (lead_controller.h): the late state (gpu_wait_late_guard), the
+    // start limit (gpu_wait_start_limit) and present-first ordering (gpu_wait_present_first; gpu_hold_order.h), with
+    // the interleave key gpu_wait_ab_interleave_s (the periods and what each period does: SourceStage_Switches,
+    // source_stage.h). A plan is ordered only while the unit says it can order (g_gpu_hold_order_able), so the queue
+    // hooks order a frame exactly when its plan said so. The clock is read only when a key and a period call for it.
+    const bool late_key = g_gpu_wait_late_guard.load(std::memory_order_relaxed);
+    const bool start_key = g_gpu_wait_start_limit.load(std::memory_order_relaxed);
+    const bool ordered_key = g_gpu_wait_present_first.load(std::memory_order_relaxed);
+    int64_t period_qpc = 0;
+    bool odd_period = false;
+    if (late_key || start_key || ordered_key) {
+        period_qpc = static_cast<int64_t>(g_gpu_wait_ab_interleave_s.load(
             std::memory_order_relaxed)) * request.qpc_frequency;
-        if (period_qpc > 0) {
-            request.late_observe = request.late_guard;
-            if (((QpcNow() / period_qpc) & 1) != 0) {
-                request.late_guard = false;
-                request.ordered = false;
-            }
-        }
+        if (period_qpc > 0) odd_period = ((QpcNow() / period_qpc) & 1) != 0;
     }
-    if (request.ordered && !g_gpu_hold_order_able.load(std::memory_order_relaxed)) request.ordered = false;
+    const SourceStageSwitches switches = SourceStage_Switches(late_key, start_key, ordered_key,
+        period_qpc > 0, odd_period);
+    request.late_guard = switches.late_guard;
+    request.late_observe = switches.late_observe;
+    request.start_limit = switches.start_limit;
+    request.start_observe = switches.start_observe;
+    request.ordered = switches.ordered && g_gpu_hold_order_able.load(std::memory_order_relaxed);
     // The driver's Reflex Sleep for the index this plan is expected to take,
     // while it runs (the bypass off). The source stage records it for every
     // such frame (source_stage.h).

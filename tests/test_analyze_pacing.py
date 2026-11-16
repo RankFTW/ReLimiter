@@ -1080,12 +1080,12 @@ class Phase4PlacementTests(TemporaryDirectoryTest):
         self.assertFalse(report["placement"]["available"])
 
     def test_current_profile_reports_the_removed_readers_unavailable(self):
-        # The same frames in the 193-column header: the governor, signal advance and pre-wait margin readers and
+        # The same frames in the 195-column header: the governor, signal advance and pre-wait margin readers and
         # the removed event types are unavailable (None), never zero, even when the events file holds a
         # governor_step row; the placement block and the resume block keep their columns.
         rows_path, events_path = self.capture(inspector.CURRENT_PACING_HEADER)
         report = pacing.analyze_capture(rows_path, events_path=events_path)
-        self.assertEqual(report["input"]["schema_profile"], "current-source-193")
+        self.assertEqual(report["input"]["schema_profile"], "current-source-195")
         self.assertFalse(report["input"]["pre_removal_columns"])
         controllers = report["controllers"]
         self.assertTrue(controllers["available"])
@@ -1140,6 +1140,14 @@ class PlanOrderedTests(TemporaryDirectoryTest):
         overall = report["summary"]["overall"]
         self.assertEqual(overall["plan_ordered_rows"], 0)
         self.assertEqual(overall["plan_rung"], {"gpu_queue_wait": 4})
+
+    def test_a_file_before_the_start_limit_columns_keeps_its_plan_ordered_cells(self):
+        # The 193-column header: plan_ordered is there, the two start limit columns are not and nothing reads them.
+        report = self.report(inspector.PRE_START_LIMIT_PACING_HEADER, ["1", None, "1", "", "1"])
+        self.assertEqual(report["input"]["schema_profile"], "pre-start-limit-source-193")
+        overall = report["summary"]["overall"]
+        self.assertEqual(overall["plan_ordered_rows"], 3)
+        self.assertEqual(overall["plan_rung"], {"gpu_queue_wait": 5})
 
 
 class PreRemovalFixtureTests(unittest.TestCase):
@@ -1245,7 +1253,8 @@ class InspectorTests(TemporaryDirectoryTest):
 
     def test_kind_detection_and_profiles(self):
         cases = [
-            (inspector.CURRENT_PACING_HEADER, "relimiter_pacing", "current-source-193"),
+            (inspector.CURRENT_PACING_HEADER, "relimiter_pacing", "current-source-195"),
+            (inspector.PRE_START_LIMIT_PACING_HEADER, "relimiter_pacing", "pre-start-limit-source-193"),
             (inspector.PRE_PLAN_ORDERED_PACING_HEADER, "relimiter_pacing", "pre-plan-ordered-source-192"),
             (OLD, "relimiter_pacing", "pre-removal-source-199"),
             (inspector.CURRENT_PACING_EVENTS_HEADER, "relimiter_pacing_events", "current-source-86"),
@@ -1284,9 +1293,9 @@ class InspectorTests(TemporaryDirectoryTest):
         # The writer's tables are the current headers; the readers of removed columns name them by the old header.
         rows = SCHEMA.row_columns
         events = SCHEMA.event_columns
-        self.assertEqual((len(rows), len(events)), (193, 86))
+        self.assertEqual((len(rows), len(events)), (195, 86))
         self.assertEqual(rows, [name for name in OLD if name not in inspector.REMOVED_PACING_COLUMNS] +
-                         ["plan_ordered"])
+                         ["plan_ordered", "plan_start_limit_us", "plan_start_applied"])
         self.assertFalse(set(inspector.REMOVED_PACING_COLUMNS) & set(rows))
         # What the analysis reads on current files is still written.
         for group in (pacing.PLAN_COLUMNS, pacing.PLACEMENT_COLUMNS, (pacing.RESUME_COLUMN,)):

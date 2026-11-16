@@ -220,10 +220,11 @@ struct PacingFramePlan {
     // (GpuQueueProbe_OnHoldAnnounce); the probe attaches it to the frame record the hold delayed
     // (PacingGpuQueueRecord::law_hold_sequence), and the law's record debit names it.
     uint64_t law_hold_sequence = 0;
-    // Developer key gpu_wait_late_guard (lead_controller.h, late state): the collision guard's limit on the
-    // release → target distance in µs (LeadGuardOutcome::release_limit_us), which the GPU queue wait's executor
-    // resolves no target past: the spacing floor may otherwise lift a target past the limit when the lead
-    // drops by more than the floor's slack in one plan. 0 = none (key off, or no limit judged).
+    // The collision guard's limit on the release → target distance in µs (LeadGuardOutcome::release_limit_us),
+    // which the GPU queue wait's executor resolves no target past: the spacing floor may otherwise lift a target
+    // past the limit when the lead drops by more than the floor's slack in one plan. The lower of the late
+    // state's limit (developer key gpu_wait_late_guard) and the start term's (developer key gpu_wait_start_limit,
+    // lead_controller.h), each only while it was applied; 0 = none (neither applied).
     float lead_limit_us = 0.0f;
     // Developer key gpu_wait_present_first (gpu_hold_order.h): this frame's plan was made on the word that the
     // render queue's next frame waits for this frame's Present (LeadRequest::ordered). The GPU queue wait's
@@ -245,7 +246,12 @@ enum class PacingStageEventKind : uint8_t {
     // PRESENT_END on the GPU waits (the simulation → render queue).
     RenderSubmitStart = 7, // w
     SimulationEnd = 8,     // e
-    PresentEnd = 9         // b
+    PresentEnd = 9,        // b
+    // x: the hold order unit's release thread saw this held frame's Present processed by the presenting queue
+    // (lead_controller.h, the start term). Local QPC, pushed with the plan's key and grid index, rung GPU queue
+    // wait, status Unknown, from the unit's thread, once per held frame the unit follows (never for a frame the
+    // gate did not hold).
+    PresentProcessed = 10  // x
 };
 
 // Key `lead_coverage`: the share of frames the lead covers, L = Q_q(X) +

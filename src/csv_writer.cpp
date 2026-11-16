@@ -816,6 +816,17 @@ static const PacingRowColumn PACING_ROW_COLUMNS[] = {
     // missing cell is 0, those builds never ordered a frame.
     { "plan_ordered", [](CsvLine* line, const PacingCsvRow& row) {
         NonZeroIf(line, PacingRowHasPlan(row), row.joined.source.plan_ordered); } },
+    // Appended (developer key gpu_wait_start_limit): the collision guard's start term for the joined Source record's
+    // plan (LeadGuardOutcome::start_limit_us, start_applied): the limit it computed in µs on the release → target
+    // distance, empty where it stood aside, was not computed or the row has no plan; and 1 when the plan was limited
+    // by it, empty otherwise. A limit empty with plan_start_applied 1 is a limit clamped at 0. Files of earlier
+    // builds lack both columns: a missing cell is 0, those builds had no start term. Tools split the keyed arms of
+    // gpu_wait_ab_interleave_s by plan_start_applied, never by the period's parity.
+    { "plan_start_limit_us", [](CsvLine* line, const PacingCsvRow& row) {
+        const double limit_us = row.joined.source.plan_start_limit_us;
+        DecimalIf(line, PacingRowHasPlan(row) && limit_us > 0.0, limit_us); } },
+    { "plan_start_applied", [](CsvLine* line, const PacingCsvRow& row) {
+        NonZeroIf(line, PacingRowHasPlan(row), row.joined.source.plan_start_applied); } },
 };
 
 static const char* PacingEventTypeText(PacingCsvEventType type)

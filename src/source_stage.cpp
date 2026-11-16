@@ -199,6 +199,8 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     lead_request.collision_guard = request.collision_guard;
     lead_request.spike_floor = request.spike_floor;
     lead_request.ordered = request.ordered;
+    lead_request.start_limit = request.start_limit;
+    lead_request.start_observe = request.start_observe;
     bool budget_limited = false;
     LeadGuardOutcome guard{};
     const double lead_us = lead_.NextLeadUs(lead_request, &budget_limited, &guard);
@@ -245,10 +247,15 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     plan.mode = pipeline.mode;
     plan.marker = request.marker;
     plan.ordered = guard.ordered; // exactly when the lead was planned on that word (lead_controller.h)
+    // The executor resolves no target past the guard's limit; here only the start term's (the legacy branch plans no
+    // late state): LeadGuardOutcome::release_limit_us, 0 = none.
+    plan.lead_limit_us = guard.release_limit_us > 0.0 ? static_cast<float>(guard.release_limit_us) : 0.0f;
     frame.planned = true;
     frame.game_arrival_qpc = arrival_qpc;
     frame.lead_budget_limited = budget_limited;
     frame.guard_reduction_us = guard.reduction_us;
+    frame.start_limit_us = guard.start_limit_us;
+    frame.start_applied = guard.start_applied;
     frame.epoch_started = grid_plan.epoch_reason;
     frame.grid_epoch_reason = snapshot.epoch_reason;
     if (driver_sleep_matched) {
@@ -297,6 +304,9 @@ SourceStageFrame SourceStage::RunPlannedFrame(
     start.pre_wait_start_qpc = frame.pre_wait_start_qpc;
     start.pre_wait_end_qpc = frame.pre_wait_end_qpc;
     start.mode = plan.mode;
+    // The game's arrival for the start term's turnaround (lead_controller.h): this branch has only its planning
+    // site's time, the marker's arrival plus what the plan took up to the clock read above.
+    start.arrival_qpc = frame.game_arrival_qpc;
     // The FG input wait has no resume probes (gpu_present_gate_d3d12.cpp):
     // only the GPU queue wait may wait for a GpuResume event.
     start.gpu_resume_probe = pipeline.gpu_probes && plan.rung == PacingRung::GpuQueueWait;
@@ -332,6 +342,8 @@ void SourceStage::FillSourceRecord(
     record->plan_lead_us = plan.lead_us;
     record->plan_rung = static_cast<uint8_t>(plan.rung);
     record->plan_ordered = static_cast<uint8_t>(plan.ordered);
+    record->plan_start_limit_us = frame.start_limit_us;
+    record->plan_start_applied = static_cast<uint8_t>(frame.start_applied);
     record->pipeline_generation = plan.pipeline_generation;
 }
 
@@ -509,6 +521,8 @@ SourceStageFrame SourceStage::RunUnifiedFrame(
     lead_request.late_guard = request.late_guard;
     lead_request.late_observe = request.late_observe;
     lead_request.ordered = request.ordered;
+    lead_request.start_limit = request.start_limit;
+    lead_request.start_observe = request.start_observe;
     bool budget_limited = false;
     LeadGuardOutcome guard{};
     const double lead_us = lead_.NextLeadUs(lead_request, &budget_limited, &guard);
@@ -560,8 +574,10 @@ SourceStageFrame SourceStage::RunUnifiedFrame(
     // The grant's identity (a law grant only) goes with the plan: the GPU gate announces it with the
     // hold Wait and the probe record of the frame the hold delayed names it back.
     plan.law_hold_sequence = hold_grant.live ? hold_grant.law_sequence : 0;
-    // Developer key gpu_wait_late_guard: the executor resolves no target past the guard's limit.
-    plan.lead_limit_us = request.late_guard && guard.judged ? static_cast<float>(guard.release_limit_us) : 0.0f;
+    // The executor resolves no target past the guard's limit: the lower of the late state's (developer key
+    // gpu_wait_late_guard) and the start term's (developer key gpu_wait_start_limit), each only while applied
+    // (LeadGuardOutcome::release_limit_us, 0 = none).
+    plan.lead_limit_us = guard.release_limit_us > 0.0 ? static_cast<float>(guard.release_limit_us) : 0.0f;
     // Developer key gpu_wait_present_first: the lead was planned on the word that the render queue's next frame
     // waits for this frame's Present, and the executor hands it to the unit with the hold it commits.
     plan.ordered = guard.ordered;
@@ -569,6 +585,8 @@ SourceStageFrame SourceStage::RunUnifiedFrame(
     frame.game_arrival_qpc = start.arrival_qpc;
     frame.lead_budget_limited = budget_limited;
     frame.guard_reduction_us = guard.reduction_us;
+    frame.start_limit_us = guard.start_limit_us;
+    frame.start_applied = guard.start_applied;
     frame.epoch_started = grid_plan.epoch_reason;
     frame.grid_epoch_reason = snapshot.epoch_reason;
 
@@ -613,6 +631,8 @@ SourceStageFrame SourceStage::RunUnifiedFrame(
     lead_start.pre_wait_start_qpc = frame.pre_wait_start_qpc;
     lead_start.pre_wait_end_qpc = frame.pre_wait_end_qpc;
     lead_start.mode = plan.mode;
+    // A(n): the Sleep hook's arrival of a consumed reservation, else the marker's (the start term's turnaround).
+    lead_start.arrival_qpc = start.arrival_qpc;
     lead_start.gpu_resume_probe = pipeline.gpu_probes && plan.rung == PacingRung::GpuQueueWait;
     lead_.OnSourceRelease(lead_start);
 

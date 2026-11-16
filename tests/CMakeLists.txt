@@ -26,6 +26,15 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     target_link_libraries(test_fg_input_observer PRIVATE advapi32)
     set_property(TARGET test_fg_input_observer PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     add_test(NAME fg_input_observer COMMAND test_fg_input_observer)
+    # The REAL present-first unit (src/gpu_hold_order.cpp, included by the test) against fake fences, on one thread: what its
+    # release thread tells the pacer when a held frame's Present was processed. Stubs stand for the probe, the pacer's
+    # queue and the logger.
+    add_executable(test_gpu_hold_order test_gpu_hold_order.cpp)
+    target_compile_features(test_gpu_hold_order PRIVATE cxx_std_17)
+    target_include_directories(test_gpu_hold_order PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(test_gpu_hold_order PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    set_property(TARGET test_gpu_hold_order PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    add_test(NAME gpu_hold_order COMMAND test_gpu_hold_order)
 endif()
 
 

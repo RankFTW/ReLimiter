@@ -101,6 +101,40 @@ inline bool SourceStage_UnifiedPlans(const PacingPipelineSnapshot& pipeline, boo
          pipeline.placement == PacingSourcePlacement::Marker);
 }
 
+// The developer A/B switches of the collision guard for one plan (lead_controller.h): the late state
+// (gpu_wait_late_guard), the start limit (gpu_wait_start_limit) and present-first ordering
+// (gpu_wait_present_first), with the interleave (gpu_wait_ab_interleave_s). Without it every key applies in every
+// plan. With it the late state and the start limit act in the even periods only: in the odd ones the late state is
+// observed (flagged) and the start limit is computed and reported, not applied. Present-first ordering follows its
+// own key in every period while the start limit's key is on, and alternates as the others do only while that key
+// is off, which is how the interleave behaved before the start limit existed. Pure, so a test reads every case;
+// the scheduler supplies the keys, whether an interleave period is set and whether the plan is in an odd one.
+struct SourceStageSwitches {
+    bool late_guard = false;
+    bool late_observe = false;
+    bool start_limit = false;
+    bool start_observe = false;
+    bool ordered = false;
+};
+
+inline SourceStageSwitches SourceStage_Switches(bool late_key, bool start_key, bool ordered_key,
+    bool interleaved, bool odd_period) noexcept
+{
+    SourceStageSwitches switches{};
+    switches.late_guard = late_key;
+    switches.start_limit = start_key;
+    switches.ordered = ordered_key;
+    if (!interleaved) return switches;
+    switches.late_observe = late_key;
+    switches.start_observe = start_key;
+    if (odd_period) {
+        switches.late_guard = false;
+        switches.start_limit = false;
+        if (!start_key) switches.ordered = false;
+    }
+    return switches;
+}
+
 // What the owner gives the unified branch of RunPlannedFrame. `active` false (the
 // key off, or a frame the branch does not plan: SourceStage_UnifiedPlans) leaves the
 // frame to the existing branch.
@@ -151,6 +185,13 @@ struct SourceStageRequest {
     // Developer key gpu_wait_ab_interleave_s: also judge the state's condition while late_guard is
     // false, for the flag only (kUpLateSeen).
     bool late_observe = false;
+    // Start term of the collision guard (lead_controller.h; developer key gpu_wait_start_limit, default on): the GPU
+    // queue wait lead is also limited to 2 I less the Present's service and the game's turnaround, and the plan
+    // carries the limit to the executor (PacingFramePlan::lead_limit_us). Both planning branches hand it to the lead.
+    bool start_limit = false;
+    // Developer key gpu_wait_ab_interleave_s: compute and report the term while start_limit is false (its off
+    // periods): the source record shows the limit and plan_start_applied 0.
+    bool start_observe = false;
     // Present-first ordering of the collision guard (lead_controller.h, LeadRequest::ordered; developer key
     // gpu_wait_present_first, default on): the render queue's next frame waits for this frame's Present. Both
     // planning branches hand it to the lead, and the plan carries what the lead was planned on
@@ -187,6 +228,10 @@ struct SourceStageFrame {
     // The collision guard's reduction of the plan's lead, demand − returned
     // (LeadGuardOutcome::reduction_us); 0 when it did not act.
     double guard_reduction_us = 0.0;
+    // The collision guard's start term for this plan (LeadGuardOutcome::start_limit_us and start_applied): the
+    // source record's plan_start_limit_us and plan_start_applied.
+    double start_limit_us = 0.0;
+    bool start_applied = false;
     // The driver's Sleep that matched the plan's index (request fields; 0 =
     // none), for the source record.
     int64_t driver_sleep_start_qpc = 0;
