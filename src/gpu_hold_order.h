@@ -37,21 +37,24 @@
 // the rule trips or stops (GpuHoldOrderRule::Orders), not until the next unqualified edge, and each frame's own
 // boundary check keeps it safe.
 //
-// What the pacer is told. The unit does not tell the pacer itself. For a frame the order was in effect for it gives the
-// probe the plan the gate handed with the hold (its key and grid index) with the release of the frame's order Wait,
-// which the probe is told anyway (GpuQueueProbe_OnHoldRelease, from the release thread, after the unit's lock). The
-// probe's completion thread resolves when the render queue passed that Wait (gpu_queue_probe_core.h: the upper end of
-// the Wait's release interval) and reports it once, as the stage event OrderPassed of that plan (rung GPU queue wait,
-// status Unknown). The collision guard's start term (lead_controller.h) reads it as the word that the order was in
-// effect for the frame (only such a frame gives it a pair) and as the moment the render queue's next work could start.
-// A frame the order was in effect for: its order Wait went on R's queue, the check after it found no Execute of another
-// thread in front of it, and R stood at the Wait (its `reached` fence got there) until this Present released it
-// (`issued` reached the value). Nothing is given for a frame whose edge was rejected or never judged, whose Wait R had
-// not reached, or that was raced (a release that comes before the check of the race gives nothing either), for a value
-// let go late, by the watchdog, by a drop or by a removed device, for a hold whose plan gave no identity, or for a frame
-// the plan did not order: only an ordered frame is given a value and a Signal behind its Present. The probe reports only
-// what it resolved (with it off, with another queue adopted than R, or for a frame its accounting cannot trust there is
-// no report), and not at the release: when the frame's first submission behind the Wait has been accounted.
+// What the pacer is told, twice, for a frame the order was in effect for: its order Wait went on R's queue, the check
+// after it found no Execute of another thread in front of it, and R stood at the Wait (its `reached` fence got there)
+// until this Present released it (`issued` reached the value).
+// The unit's own word: the release thread pushes the stage event PresentProcessed of the plan the gate handed with the
+// hold (its key and grid index; rung GPU queue wait, status Unknown), once and after the unit's lock, stamped by a clock
+// read behind its read of `issued`. It says that the order was in effect for the frame, and it needs no probe: the
+// collision guard's start term (lead_controller.h) gives a frame a pair only with it. Its time is no measure.
+// The probe's measure: the same plan's identity goes to the probe with the release of the frame's order Wait, which the
+// probe is told anyway (GpuQueueProbe_OnHoldRelease, from the release thread, after the unit's lock). The probe's
+// completion thread resolves when the render queue passed that Wait (gpu_queue_probe_core.h: the upper end of the
+// Wait's release interval) and reports it once, as the stage event OrderPassed of that plan, which the start term reads
+// as the render queue's resume. It is reported only if the probe is on with R adopted and its accounting trusts the
+// frame, and not at the release: when the frame's first submission behind the Wait has been accounted.
+// Nothing is told for a frame whose edge was rejected or never judged, whose Wait R had not reached, or that was raced
+// (a release that comes before the check of the race tells nothing either), for a value let go late, by the watchdog, by
+// a drop or by a removed device, for a hold whose plan gave no identity, or for a frame the plan did not order: only an
+// ordered frame is given a value and a Signal behind its Present. A Wait that stands is told to the probe by its release
+// only (also when the gate released the hold before it was enqueued), so the identity can go with it.
 //
 // Threads and locks. The Present thread (OnHold, AfterNativePresent, AfterWait), the threads that submit to R
 // (BeforeSignal, AfterSignal, BeforeExecute), the gate's worker (OnGateRelease), the release thread, the installer's
@@ -112,8 +115,8 @@ void GpuHoldOrder_Service(bool fg_presenting) noexcept;
 // The gate's Enqueue, on the Present thread, after a hold's Wait went on the queue (not for a frame generation
 // input's hold): the native presenting queue, the hold's fence and ticket (its own identity), its target and the
 // frame interval (QPC ticks), the plan's law hold sequence, whether the plan ordered the frame, the swapchain's
-// generation and the plan's identity (key and grid index), which the unit keeps with the hold and gives the probe with
-// the release of its order Wait when the order was in effect for the frame (What the pacer is told, above).
+// generation and the plan's identity (key and grid index), which the unit keeps with the hold, pushes as PresentProcessed
+// and gives the probe with the release of its order Wait when the order was in effect (What the pacer is told, above).
 inline void GpuHoldOrder_OnHold(ID3D12CommandQueue* present_queue, const void* hold_fence, uint64_t hold_ticket,
     int64_t target_qpc, int64_t interval_qpc, uint64_t law_hold_sequence, bool ordered,
     uint64_t swapchain_generation, const PacingPlanKey& key, uint64_t grid_index) noexcept {

@@ -1040,8 +1040,8 @@ bool Enqueue(const EnqueueRequest& request,GpuPresentTrace* trace) noexcept {
         if(!wait_marked.load(std::memory_order_relaxed)) {wait_marked.store(true,std::memory_order_relaxed);Breadcrumb_Mark(StartupStage::FirstGateWaitEnqueued);}
         // gpu_hold_order (key off: one load and a branch): the hold is on the queue; the unit learns it on this thread,
         // ordered or not (its rule judges every held frame), and takes it over at the native Present that follows. The
-        // plan's identity goes with it: the unit hands it to the probe with the release of its order Wait, for a frame
-        // the order was in effect for, and the probe reports the Wait passed (OrderPassed).
+        // plan's identity goes with it: for a frame the order was in effect for the unit pushes PresentProcessed under
+        // it and hands it to the probe with the release of its order Wait, which reports the Wait passed (OrderPassed).
         if(!request.fg)GpuHoldOrder_OnHold(queue->native,ticket.time,trace->ticket,trace->target_qpc,trace->interval_qpc,
             ticket.law_hold_sequence,request.ordered,trace->swapchain,ticket.key,trace->grid_index);
     }
@@ -1322,6 +1322,13 @@ void GpuPresent_ObservePresentQueue(uint64_t native_queue,uint64_t native_swapch
     present_queue.store(native_queue,std::memory_order_release);
     DiscoverQueue(native_queue);
     PublishGpuQueueCapability();
+}
+// The hold order unit's release thread saw a held frame's Present processed by the presenting queue, with the order in
+// effect for that frame (gpu_hold_order.h): the stage event of that frame's plan, stamped with the unit's clock read.
+// Any thread, no lock; an identity that is not valid pushes nothing (PushStage).
+void GpuPresent_PushPresentProcessed(const PacingPlanKey& key,uint64_t grid_index,int64_t qpc) noexcept {
+    using namespace gpu_present;
+    PushStage(key,grid_index,PacingStageEventKind::PresentProcessed,PacingRung::GpuQueueWait,qpc);
 }
 // The probe's completion thread resolved the release of a held frame's order Wait (gpu_hold_order.h, gpu_queue_probe.h):
 // the stage event of that frame's plan, stamped with the upper end of the Wait's release interval. Any thread, no lock;

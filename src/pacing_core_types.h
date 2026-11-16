@@ -248,13 +248,20 @@ enum class PacingStageEventKind : uint8_t {
     RenderSubmitStart = 7, // w
     SimulationEnd = 8,     // e
     PresentEnd = 9,        // b
+    // x: the hold order unit's word that the order was in effect for this held frame (lead_controller.h, the start
+    // term): its Wait went on the render queue with nothing of another thread in front of it, the render queue stood at
+    // it, and the Present's `issued` released it. Local QPC: a clock read behind the unit's read of `issued`; no measure
+    // takes it (the word is its presence). Pushed with the plan's key and grid index, rung GPU queue wait, status
+    // Unknown, from the unit's release thread, once per such frame, with no probe needed (never for a frame the gate
+    // did not hold, whose edge was rejected, whose Wait the render queue had not reached or was raced).
+    PresentProcessed = 10, // x
     // y: the render queue passed the order Wait the hold order unit put behind this held frame's Present
     // (gpu_hold_order.h; lead_controller.h, the start term). Local QPC: the upper end of the probe's interval for that
     // Wait's release (gpu_queue_probe_core.h). Pushed with the plan's key and grid index, rung GPU queue wait, status
     // Unknown, from the probe's completion thread, once per held frame the order was in effect for (never for a frame
     // the gate did not hold, whose edge was rejected, whose Wait the render queue had not reached or was raced, nor
-    // when the probe could not resolve the Wait's release).
-    OrderPassed = 10  // y
+    // when the probe is off, has another queue adopted or could not resolve the Wait's release).
+    OrderPassed = 11  // y
 };
 
 // Key `lead_coverage`: the share of frames the lead covers, L = Q_q(X) +

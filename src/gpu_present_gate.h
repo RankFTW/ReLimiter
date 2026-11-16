@@ -106,11 +106,17 @@ void GpuPresent_DrainDiagnostics() noexcept;
 // plan exists. Nonblocking; the worker creates the fences.
 void GpuPresent_ObservePresentQueue(uint64_t native_queue,uint64_t native_swapchain) noexcept;
 struct PacingPlanKey;
+// The hold order unit's release thread (gpu_hold_order.h) saw a held frame's Present processed by the presenting
+// queue, with the order in effect for that frame: one stage event PresentProcessed on the GPU queue wait rung for the
+// frame of that plan, stamped with `qpc`, the unit's clock read behind its read of `issued`. The word that the order
+// was in effect; no measure takes its time. Any thread, no lock; nothing is pushed for an identity that is not valid
+// or a time that is not positive.
+void GpuPresent_PushPresentProcessed(const PacingPlanKey& key, uint64_t grid_index, int64_t qpc) noexcept;
 // The probe's completion thread (gpu_queue_probe_core.h) resolved the release of the order Wait the hold order unit
 // (gpu_hold_order.h) put on the render queue behind a held frame's Present: the render queue passed it at or before
 // `qpc`, the upper end of the Wait's release interval. One stage event OrderPassed on the GPU queue wait rung for the
-// frame of that plan. Any thread, no lock; nothing is pushed for an identity that is not valid or a time that is not
-// positive.
+// frame of that plan: the measure of the render queue's resume. Any thread, no lock; nothing is pushed for an identity
+// that is not valid or a time that is not positive.
 void GpuPresent_PushOrderPassed(const PacingPlanKey& key, uint64_t grid_index, int64_t qpc) noexcept;
 // A Streamline FG binding on native_queue retired. The queue stays
 // registered; the worker re-reads the FG swapchain identity when it is idle.

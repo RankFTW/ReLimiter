@@ -285,12 +285,14 @@ struct GpuHoldOrderTold {
         return true;
     }
     void Announcing() noexcept { announcing = true; }
-    // The Wait's enqueue finished. True: tell the release now, because no Wait went on the queue, or the value was
-    // released while it was being enqueued, or the gate had released the hold before.
-    bool Announced(bool waited, bool gate_released) noexcept {
+    // The Wait's enqueue finished. True: tell the release now, because no Wait went on the queue or the value was
+    // released while it was being enqueued. A Wait that stands is told by its release, also when the gate had released
+    // the hold before it was enqueued: that release carries the plan's identity when the order was in effect for the
+    // frame, which is not known before the Present's release.
+    bool Announced(bool waited) noexcept {
         announcing = false;
         announced = true;
-        return (!waited || released || gate_released) && Tell();
+        return (!waited || released) && Tell();
     }
     // The order was signalled up to this value. True: tell the release now.
     bool Released() noexcept {

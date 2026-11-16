@@ -454,7 +454,7 @@ namespace
         Told told;
         told.Announcing();
         CHECK(!told.Done());
-        CHECK(!told.Announced(true, false));                  // nothing is told while the Wait stands
+        CHECK(!told.Announced(true));                         // nothing is told while the Wait stands
         CHECK(!told.Done());
         CHECK(told.Released());                               // told now
         CHECK(told.Done());
@@ -465,30 +465,31 @@ namespace
         early.Announcing();
         CHECK(!early.Released());                             // not announced yet: nothing to tell
         CHECK(!early.Done());                                 // still announcing
-        CHECK(early.Announced(true, false));                  // told now
+        CHECK(early.Announced(true));                         // told now
         CHECK(early.Done());
 
         // A Wait that never went on the queue is told at the end of the announce, and the value goes with its release.
         Told failed;
         failed.Announcing();
-        CHECK(failed.Announced(false, false));
+        CHECK(failed.Announced(false));
         CHECK(!failed.Done());
         CHECK(!failed.Released());
         CHECK(failed.Done());
 
-        // The gate released the hold before the announce ended: told at the end of it, not again at the release.
-        Told gate;
-        gate.Announcing();
-        CHECK(gate.Announced(true, true));
-        CHECK(!gate.Done());
-        CHECK(!gate.Released());
-        CHECK(gate.Done());
+        // A Wait that stands is told by its release alone: the gate having released the hold before the announce ended
+        // does not tell it earlier (the release carries the plan's identity, which is not known before it).
+        Told stands;
+        stands.Announcing();
+        CHECK(!stands.Announced(true));
+        CHECK(!stands.Done());
+        CHECK(stands.Released());
+        CHECK(stands.Done());
 
         // A drop of an announced value tells it, once; a drop while it is being announced tells nothing here (its
         // hook finds the value gone and tells it), and the value is not Done until then.
         Told dropped;
         dropped.Announcing();
-        CHECK(!dropped.Announced(true, false));              // the Wait stands: nothing is told yet
+        CHECK(!dropped.Announced(true));                     // the Wait stands: nothing is told yet
         CHECK(dropped.Dropped());
         CHECK(!dropped.Dropped() && !dropped.Released());
         Told announcing;

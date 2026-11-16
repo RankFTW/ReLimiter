@@ -62,7 +62,6 @@ void GpuQueueProbeCore::ClearState() noexcept
     armed_[0] = armed_[1] = 0;
     parked_count_ = 0;
     untrusted_below_ = 0;
-    order_report_head_ = order_report_tail_ = 0;
 }
 
 void GpuQueueProbeCore::Reset(int64_t qpc_frequency) noexcept
@@ -355,6 +354,7 @@ void GpuQueueProbeCore::ProcessHold(const GpuQueueEvent& e) noexcept
     if (e.fence_id == 0) return;
     // The plan to report the Wait passed under travels with the release: an identity that is not complete is none.
     const bool reports = e.order_grid_index != 0 && PacingPlanKey_IsValid(e.order_key);
+    if (reports) order_identities_.fetch_add(1, std::memory_order_relaxed);
     const int i = FindHold(e.fence_id, e.wait_value);
     if (i >= 0) {
         holds_[i].release = e.release_qpc;
@@ -1043,9 +1043,9 @@ void GpuQueueProbeCore::ApplyResolved(Entry& e, Frame& f) noexcept
             hold_x_hi_ = x_hi;
             hold_taken_ = false;
             // The walk is calculable and this Wait's release is a trusted interval (calc_ok): the queue passed the Wait at
-            // or before its upper end. Told once, to whoever gave the hold a plan's identity; a frame whose events are not
-            // whole (lost, overlapping producers) says nothing.
-            if (h.order_grid_index != 0 && frame_ok) PushOrderPassed(h, r_hi);
+            // or before its upper end. Reported once, to the sink, for a hold that has a plan's identity; a frame whose
+            // events are not whole (lost, overlapping producers) says nothing.
+            if (h.order_grid_index != 0 && frame_ok) ReportOrderPassed(h, r_hi);
         }
     }
     const int64_t tail_lo = calc_ok ? pos(e.enq - fr_hi) : 0; // after the last Wait
@@ -1323,27 +1323,17 @@ void GpuQueueProbeCore::Flush() noexcept
     }
 }
 
-void GpuQueueProbeCore::PushOrderPassed(const HoldRec& h, int64_t qpc) noexcept
+void GpuQueueProbeCore::SetOrderPassedSink(OrderPassedSink sink, void* context) noexcept
 {
-    if (qpc <= 0) return; // a stage event needs a time
-    if (order_report_head_ - order_report_tail_ >= kOrderReportCapacity) {
-        order_passed_dropped_.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    OrderPassed& r = order_reports_[order_report_head_ % kOrderReportCapacity];
-    r.key = h.order_key;
-    r.grid_index = h.order_grid_index;
-    r.qpc = qpc;
-    ++order_report_head_;
-    order_passed_reported_.fetch_add(1, std::memory_order_relaxed);
+    order_sink_ = sink;
+    order_sink_context_ = context;
 }
 
-bool GpuQueueProbeCore::PopOrderPassed(OrderPassed* out) noexcept
+void GpuQueueProbeCore::ReportOrderPassed(const HoldRec& h, int64_t qpc) noexcept
 {
-    if (out == nullptr || order_report_tail_ == order_report_head_) return false;
-    *out = order_reports_[order_report_tail_ % kOrderReportCapacity];
-    ++order_report_tail_;
-    return true;
+    if (qpc <= 0) return; // a stage event needs a time
+    order_passed_reported_.fetch_add(1, std::memory_order_relaxed);
+    if (order_sink_ != nullptr) order_sink_(order_sink_context_, h.order_key, h.order_grid_index, qpc);
 }
 
 GpuQueueProbeCore::Counters GpuQueueProbeCore::Statistics() const noexcept
@@ -1371,6 +1361,6 @@ GpuQueueProbeCore::Counters GpuQueueProbeCore::Statistics() const noexcept
     c.boundary_markers_awaited = boundary_awaited_.load(std::memory_order_relaxed);
     c.boundary_markers_by_observation = boundary_observed_.load(std::memory_order_relaxed);
     c.order_passed_reported = order_passed_reported_.load(std::memory_order_relaxed);
-    c.order_passed_dropped = order_passed_dropped_.load(std::memory_order_relaxed);
+    c.order_identities = order_identities_.load(std::memory_order_relaxed);
     return c;
 }

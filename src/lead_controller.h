@@ -292,27 +292,32 @@ constexpr double LEAD_CONCURRENCY_TOLERANCE_US = 100.0;
 // (PacingStageEventKind::OrderPassed) of the render queue passing the order's Wait behind that frame's Present, the
 // upper end of the GPU queue probe's interval for the Wait's release. It is counted from the release alone: what the
 // game waits for is the render queue, and when the GPU finishes a frame after its release that wait is longer by the
-// lateness, which the limit has to see. The unit gives y only for a frame the order was in effect for and only once
-// the probe resolved the Wait, so it arrives after the release, typically within the next frame; a frame without it
-// gives no sample and no pair (below). A sample below 0 or above LEAD_LONG_SAMPLE_INTERVALS intervals is counted and
-// left out. W99 is the 99th percentile of the newest LEAD_WINDOW_CAPACITY samples, in use (LeadStartSource::Resume)
-// while LEAD_WARM_SAMPLES of them exist and one arrived among the newest LEAD_WORK_STALE_FRAMES frames planned with
-// the GPU queue wait's lead; else it is the release headroom H (LeadRequest::release_headroom_us), the fallback
-// (LeadStartSource::Headroom). The sample is taken from every such frame, whether or not the game's next Present
-// arrived before the release: where holds end before it, which is where a limit puts them, there is no telling pair
-// (below), and a measure taken from the pairs would go stale behind its own effect. G99 is that of the newest
-// turnarounds a_{n+1} − b_n of every frame, held or not; 0 while there is none. A turnaround above
-// LEAD_LONG_SAMPLE_INTERVALS intervals is in no window. The statistics and the log name the measure in use.
+// lateness, which the limit has to see. The probe reports y under the identity the hold order unit gave it for a
+// frame the order was in effect for, and only once it resolved the Wait, so it arrives after the release, typically
+// within the next frame, and only while the probe reports at all (it has to have adopted the render queue); a frame
+// without it gives no sample, and while none comes W is the headroom. A sample below 0 or above
+// LEAD_LONG_SAMPLE_INTERVALS intervals is counted and left out. W99 is the 99th percentile of the newest
+// LEAD_WINDOW_CAPACITY samples, in use (LeadStartSource::Resume) while LEAD_WARM_SAMPLES of them exist and one arrived
+// among the newest LEAD_WORK_STALE_FRAMES frames planned with the GPU queue wait's lead; else it is the release
+// headroom H (LeadRequest::release_headroom_us), the fallback (LeadStartSource::Headroom). The sample is taken from
+// every such frame, whether or not the game's next Present arrived before the release: where holds end before it,
+// which is where a limit puts them, there is no telling pair (below), and a measure taken from the pairs would go
+// stale behind its own effect. G99 is that of the newest turnarounds a_{n+1} − b_n of every frame, held or not; 0
+// while there is none. A turnaround above LEAD_LONG_SAMPLE_INTERVALS intervals is in no window. The statistics and
+// the log name the measure in use.
 // 2 I is exact from below at a cap (the interval cannot fall under the cap's). Where the GPU term sets the interval
 // it moves from frame to frame and one start can be late by what it fell, which is one late start, not the
 // alternation; the limit follows the plan's own interval, so it moves at once when the interval does. When frame
 // n + 1 is itself late the limit is stricter than needed, which is safe.
 // The term stands aside while the game's own times contradict the chain:
-// - A free pair: a frame n with status Held whose order was in effect (the unit gave y_n) and o_n > p_{n+1} (the
-//   next frame's native Present arrived before the release; only such a pair can tell), with b_{n+1} < o_n: the
-//   game's Present ended while the frame before was still held, so the game does not wait for a held Present. One
-//   among the newest LEAD_START_EVIDENCE_FRAMES telling pairs. A frame without y gives no pair, telling or free: a
-//   hold the order did not release behind its Present says nothing of the order's chain.
+// - A free pair: a frame n with status Held for which the hold order unit gave its word that the order was in effect
+//   (x_n, PacingStageEventKind::PresentProcessed; its time is no measure) and o_n > p_{n+1} (the next frame's native
+//   Present arrived before the release; only such a pair can tell), with b_{n+1} < o_n: the game's Present ended while
+//   the frame before was still held, so the game does not wait for a held Present. One among the newest
+//   LEAD_START_EVIDENCE_FRAMES telling pairs. A frame without x gives no pair, telling or free: a hold the order did
+//   not release behind its Present says nothing of the order's chain. The pair needs x and not y, so it comes without
+//   the probe: while the probe does not report, the term applies on the headroom and still stands aside on a free
+//   pair or an untied start.
 // - An untied start: a_{n+1} < b_n in one of the newest LEAD_START_EVIDENCE_FRAMES frames: the game asks for a frame
 //   before its previous Present ended (a game thread running a frame ahead), so the frame a hold reaches is a later
 //   one and the term does not describe it.
@@ -976,7 +981,7 @@ private:
     static constexpr size_t kBucketCount =
         static_cast<size_t>(PacingRung::Count) * LEAD_DIVISOR_BUCKETS;
 
-    // Stage times of a pending frame; 1..10 match PacingStageEventKind.
+    // Stage times of a pending frame; 1..11 match PacingStageEventKind.
     enum Field : uint8_t {
         FieldSource = 0,
         FieldMarkerArrival,
@@ -986,9 +991,10 @@ private:
         FieldGpuReady,
         FieldGpuResume,
         FieldRenderSubmit,
-        FieldSimulationEnd, // e: GPU waits
-        FieldPresentEnd,    // b: GPU waits
-        FieldOrderPassed,   // y: the render queue passed the order Wait behind the held frame's Present (GPU queue wait)
+        FieldSimulationEnd,    // e: GPU waits
+        FieldPresentEnd,       // b: GPU waits
+        FieldPresentProcessed, // x: the unit's word that the order was in effect for the held frame (GPU queue wait)
+        FieldOrderPassed,      // y: the render queue passed the order Wait behind the frame's Present (GPU queue wait)
         FieldCount
     };
 

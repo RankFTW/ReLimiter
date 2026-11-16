@@ -5,7 +5,7 @@
 // INTERVALS (observations, awaited wakes, the issue floor, both ends of the record fields, the free-margin
 // scalar for both margin ends), untrusted markers breaking the done chain, parking with trust and the
 // full-table watermark, the bounded wait-free ring (overflow, loss marking, a small multi-producer push), the
-// OrderPassed reports (identity, the Wait's upper release bound, the frames that give none, the bounded queue) and
+// OrderPassed reports (identity, the Wait's upper release bound, the frames that give none, a drain that accounts many) and
 // Reset. The D3D12 side (hook, fences, completion thread) is not covered here and needs live runs.
 // The clock is scripted at 1 MHz so one tick is one microsecond.
 
@@ -56,6 +56,13 @@ namespace
         uint64_t wait_value = 0;
     };
 
+    // One order report the core handed to its sink: the plan's identity and the upper end of the Wait's release interval.
+    struct Report {
+        PacingPlanKey key{};
+        uint64_t grid_index = 0;
+        int64_t qpc = 0;
+    };
+
     // What the next Submit / Wait event carries besides its enqueue time: the item's own observation and the marker's
     // identity (cleared after one use).
     struct Opts {
@@ -78,7 +85,19 @@ namespace
         bool overlap_next = false; // the next Submit carries the overlap flag
         Opts opts;                 // applied to the next Submit / Wait event
 
-        H() { c->Reset(kFreq); }
+        // What the core's sink was told, oldest first. The sink is called from inside Drain / Flush, on this thread.
+        std::vector<Report> reports;
+
+        H()
+        {
+            c->Reset(kFreq);
+            c->SetOrderPassedSink(&H::Collect, this);
+        }
+
+        static void Collect(void* context, const PacingPlanKey& key, uint64_t grid_index, int64_t qpc) noexcept
+        {
+            static_cast<H*>(context)->reports.push_back(Report{key, grid_index, qpc});
+        }
 
         static GpuQueueEvent BoundaryEvent(uint64_t gen, uint64_t seq)
         {
@@ -187,12 +206,11 @@ namespace
             return out;
         }
 
-        // The OrderPassed reports queued so far, oldest first (consumer side: after Drain / Flush).
-        std::vector<GpuQueueProbeCore::OrderPassed> Reports()
+        // The order reports the core made since the last call (taken out), oldest first.
+        std::vector<Report> Reports()
         {
-            std::vector<GpuQueueProbeCore::OrderPassed> out;
-            GpuQueueProbeCore::OrderPassed r;
-            while (c->PopOrderPassed(&r)) out.push_back(r);
+            std::vector<Report> out;
+            out.swap(reports);
             return out;
         }
 
@@ -728,14 +746,14 @@ namespace
         h.Stamp(a.done, 2300);
         h.Boundary(1, 2);
         h.Drain();
-        std::vector<GpuQueueProbeCore::OrderPassed> reports = h.Reports();
+        std::vector<Report> reports = h.Reports();
         CHECK(reports.size() == 1);
         if (reports.size() == 1) {
             CHECK(reports[0].key == PlanKey(21) && reports[0].grid_index == 210 && reports[0].qpc == 2000);
         }
         CHECK(h.Reports().empty()); // told once
         const GpuQueueProbeCore::Counters s = h.c->Statistics();
-        CHECK(s.order_passed_reported == 1 && s.order_passed_dropped == 0);
+        CHECK(s.order_identities == 1 && s.order_passed_reported == 1);
         const std::vector<Rec> all = h.PopAll();
         const Rec* f2 = Find(all, 2);
         CHECK(f2 != nullptr);
@@ -780,7 +798,7 @@ namespace
         h.Stamp(b.done, 4300);
         h.Boundary(1, 3);
         h.Drain();
-        const std::vector<GpuQueueProbeCore::OrderPassed> reports = h.Reports();
+        const std::vector<Report> reports = h.Reports();
         CHECK(reports.size() == 2);
         if (reports.size() == 2) {
             CHECK(reports[0].key == PlanKey(21) && reports[0].grid_index == 210 && reports[0].qpc == 2050);
@@ -804,7 +822,7 @@ namespace
         CHECK(h.Reports().empty());
         h.HoldEvent(7, w.wait_value, 500, 2000, PlanKey(21), 210);
         h.Drain();
-        const std::vector<GpuQueueProbeCore::OrderPassed> reports = h.Reports();
+        const std::vector<Report> reports = h.Reports();
         CHECK(reports.size() == 1);
         if (reports.size() == 1) CHECK(reports[0].grid_index == 210 && reports[0].qpc == 2000);
     }
@@ -886,7 +904,7 @@ namespace
         h.Stamp(c.done, 4200);
         h.Boundary(1, 4);
         h.Drain();
-        const std::vector<GpuQueueProbeCore::OrderPassed> reports = h.Reports();
+        const std::vector<Report> reports = h.Reports();
         CHECK(reports.size() == 1);
         if (reports.size() == 1) CHECK(reports[0].key == PlanKey(41) && reports[0].grid_index == 410 && reports[0].qpc == 4000);
         CHECK(h.c->Statistics().markers_untrusted >= 1);
@@ -906,36 +924,39 @@ namespace
         h.Boundary(1, 1 + n);
     }
 
-    // The reports wait for the consumer in a queue of kOrderReportCapacity: a full queue drops the new report and counts
-    // it, popping makes room, and Reset empties the queue.
-    void TestOrderPassedQueueBound()
+    // A drain that accounts many frames reports every one of them as it goes: the reports wait in no queue for a
+    // consumer, so none is lost however many a single drain makes (here 12 in one drain, 48 in all). Reset keeps the sink.
+    void TestOrderPassedManyInOneDrain()
     {
-        constexpr uint64_t kExtra = 3;
-        constexpr uint64_t kFrames = GpuQueueProbeCore::kOrderReportCapacity + kExtra;
+        constexpr uint64_t kRounds = 4, kPerRound = 12;
         H h;
         h.Start(150);
-        for (uint64_t n = 1; n <= kFrames; ++n) {
-            HeldFrame(h, n);
-            h.Ready(); // the frames are taken, the reports stay
+        uint64_t n = 0;
+        for (uint64_t round = 0; round < kRounds; ++round) {
+            for (uint64_t k = 0; k < kPerRound; ++k) HeldFrame(h, ++n); // events only: nothing is drained yet
+            h.Drain();
+            const std::vector<Report> reports = h.Reports();
+            CHECK(reports.size() == kPerRound);
+            for (size_t i = 0; i < reports.size(); ++i) {
+                const uint64_t m = round * kPerRound + static_cast<uint64_t>(i) + 1;
+                CHECK(reports[i].key == PlanKey(m) && reports[i].grid_index == 100 + m);
+                CHECK(reports[i].qpc == 10000 * static_cast<int64_t>(m) + 2000);
+            }
+            h.Ready(); // the frames are taken
         }
         const GpuQueueProbeCore::Counters s = h.c->Statistics();
-        CHECK(s.order_passed_reported == GpuQueueProbeCore::kOrderReportCapacity && s.order_passed_dropped == kExtra);
-        std::vector<GpuQueueProbeCore::OrderPassed> reports = h.Reports();
-        CHECK(reports.size() == GpuQueueProbeCore::kOrderReportCapacity);
-        for (size_t i = 0; i < reports.size(); ++i) {
-            const uint64_t n = static_cast<uint64_t>(i) + 1;
-            CHECK(reports[i].key == PlanKey(n) && reports[i].grid_index == 100 + n);
-            CHECK(reports[i].qpc == 10000 * static_cast<int64_t>(n) + 2000);
-        }
-        CHECK(h.Reports().empty());
-        HeldFrame(h, kFrames + 1); // room again
-        h.Ready();
-        reports = h.Reports();
-        CHECK(reports.size() == 1 && reports[0].grid_index == 100 + kFrames + 1);
-        HeldFrame(h, kFrames + 2);
-        h.Ready();
+        CHECK(s.order_identities == kRounds * kPerRound && s.order_passed_reported == kRounds * kPerRound);
+
         h.c->Reset(kFreq);
-        CHECK(h.Reports().empty());
+        h.Boundary(1, 200);
+        const Sub warm = h.Submit(100);
+        h.Stamp(warm.done, 150);
+        h.Boundary(1, 201);
+        HeldFrame(h, 201); // its boundary is (1, 202)
+        h.Drain();
+        const std::vector<Report> after = h.Reports();
+        CHECK(after.size() == 1);
+        if (after.size() == 1) CHECK(after[0].key == PlanKey(201) && after[0].grid_index == 301);
     }
 
     // The queue law's hold sequence travels with the announce to the record of the frame queued behind that hold.
@@ -2727,7 +2748,7 @@ int main()
     TestOrderPassedNeedsAnIdentity();
     TestOrderPassedNeedsAWholeFrame();
     TestOrderPassedNeedsAKnownPredecessor();
-    TestOrderPassedQueueBound();
+    TestOrderPassedManyInOneDrain();
     TestAnnouncedHoldWithoutWait();
     TestHoldBoundedByWhenQueueReachedIt();
     TestWaitReleaseUnknown();

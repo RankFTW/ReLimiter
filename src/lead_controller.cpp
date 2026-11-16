@@ -755,6 +755,7 @@ void LeadController::OnStageEvent(const PacingStageEvent& event) noexcept
         static_cast<int>(PacingStageEventKind::RenderSubmitStart) == FieldRenderSubmit &&
         static_cast<int>(PacingStageEventKind::SimulationEnd) == FieldSimulationEnd &&
         static_cast<int>(PacingStageEventKind::PresentEnd) == FieldPresentEnd &&
+        static_cast<int>(PacingStageEventKind::PresentProcessed) == FieldPresentProcessed &&
         static_cast<int>(PacingStageEventKind::OrderPassed) == FieldOrderPassed,
         "Field values must match PacingStageEventKind");
     static_assert(FieldCount <= 16, "field_mask holds one bit per Field");
@@ -808,7 +809,7 @@ void LeadController::OnStageEvent(const PacingStageEvent& event) noexcept
     RecordConcurrency(frame);
     if (index > 0) RecordConcurrency(Find(index - 1));
     // Start term (lead_controller.h): this event may complete the frame's resume, or its pair with the next frame
-    // or with the one before (p, b and a of the later frame, o and y of the earlier).
+    // or with the one before (p, b and a of the later frame, o and x of the earlier).
     RecordStartResume(frame);
     RecordStartPair(frame);
     if (index > 0) RecordStartPair(Find(index - 1));
@@ -1274,8 +1275,9 @@ void LeadController::RecordConcurrency(PendingFrame* frame) noexcept
 // frame's Present, o the frame's release. It is counted from the release alone, whatever the frame's GPU readiness:
 // the game waits for the render queue, and a frame the GPU finished after its release makes that wait longer by the
 // lateness. Only a frame the executor held has one: a frame with another status is decided at its release, and an
-// Unknown status is no evidence here. A sample outside [0, 3 I] is counted and not added. Judged once, when the
-// later of o and y is known.
+// Unknown status is no evidence here. The unit's word x is not needed: the probe reports y only under the identity
+// the unit gave for a frame the order was in effect for. A sample outside [0, 3 I] is counted and not added. Judged
+// once, when the later of o and y is known.
 void LeadController::RecordStartResume(PendingFrame* frame) noexcept
 {
     if (frame == nullptr || frame->resume_recorded || !frame->started || !frame->sampled ||
@@ -1301,12 +1303,12 @@ void LeadController::RecordStartResume(PendingFrame* frame) noexcept
 // A frame n and its successor n + 1 (the start term, lead_controller.h): the turnaround a_{n+1} − b_n, one sample
 // per frame whether or not anything is held, with the sign of an untied start (a_{n+1} < b_n: the game asked for the
 // frame before its previous Present ended; a negative turnaround is no sample), and the pair (o_n, p_{n+1}, b_{n+1})
-// of a Held frame n that has y_n (the probe saw the render queue pass the order's Wait behind its
-// Present: the order was in effect for that edge; a frame without it gives no pair): telling when the release came
-// after the next frame's native Present arrived, free when the next Present also ended before the release. Both
-// frames must be of one lifecycle, consecutive, released, and of one GPU queue wait bucket in a mode that samples: a
-// rung, divisor or mode change between them decides both at once as no evidence. Each is judged once, when the last
-// of its stamps is known.
+// of a Held frame n that has x_n (the hold order unit's word that the order was in effect for that edge; a frame
+// without it gives no pair): telling when the release came after the next frame's native Present arrived, free when
+// the next Present also ended before the release. The pair needs x and not the probe's y, so it comes without the
+// probe's report. Both frames must be of one lifecycle, consecutive, released, and of one GPU queue wait bucket in a
+// mode that samples: a rung, divisor or mode change between them decides both at once as no evidence. Each is
+// judged once, when the last of its stamps is known.
 void LeadController::RecordStartPair(PendingFrame* frame) noexcept
 {
     if (frame == nullptr || (frame->pair_recorded && frame->turnaround_recorded) || !frame->started ||
@@ -1347,8 +1349,8 @@ void LeadController::RecordStartPair(PendingFrame* frame) noexcept
         frame->pair_recorded = true; // the next Present arrived after the release: this pair tells nothing
         return;
     }
-    // Only a hold the order released behind its Present gives a pair: without y the pair never completes.
-    if (!HasField(*next, FieldPresentEnd) || !HasField(*frame, FieldOrderPassed)) return;
+    // Only a hold the order released behind its Present gives a pair: without x the pair never completes.
+    if (!HasField(*next, FieldPresentEnd) || !HasField(*frame, FieldPresentProcessed)) return;
     frame->pair_recorded = true;
     const bool free_pair = next->qpc[FieldPresentEnd] < release_qpc;
     start_pairs_.Push(free_pair);

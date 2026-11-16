@@ -930,7 +930,7 @@ void TestInvalidInputs()
     PacingStageEvent event = Event(1, Kind::MarkerArrival, 11000.0);
     event.kind = Kind::None;
     controller->OnStageEvent(event);
-    event.kind = static_cast<Kind>(11); // past OrderPassed
+    event.kind = static_cast<Kind>(12); // past OrderPassed
     controller->OnStageEvent(event);
     event = Event(1, Kind::MarkerArrival, 11000.0);
     event.qpc = 0;
@@ -4145,14 +4145,15 @@ void TestPairNeedsRenderEnd()
 //
 // The scripts are games whose stamps follow the chain the term rests on (design_start_gate.md): the game's arrival
 // a is its release s, the native Present arrives at p = s + 5,000, the GPU is ready at r = s + R, the hold is
-// released at o = s + 17,000, the render queue passes the order's Wait at y = o + 810 µs (the hold order unit's
-// stamp), and the game's PRESENT_END is b = p + 310, no earlier than 400 µs after the previous frame's y for a game
-// whose next start waits for the order's release of the held Present. The next arrival is b + 150 µs. The
-// resume (810) and the turnaround (150) sit in the middle of a 20 µs bin, so the percentiles are exact. In a game
-// that waits the pairs alternate (every second one tells: the hold ends after the next Present's arrival) and none
-// is free. An oracle reads the same stamps and says what every window, pair and verdict has to be, so a test does not
-// repeat the controller's arithmetic by hand; the numbers asserted outright (the limit, the lead) are the design's:
-// 2 I − (W99 + G99) and the lead of 21,510 µs the warm-up frames teach.
+// released at o = s + 17,000, the hold order unit says at x = max(o, r) + 300 µs that the order was in effect for the
+// frame (its word, the covered one: its time is no measure), the render queue passes the order's Wait at y = o + 810 µs
+// (the probe's stamp, the measure), and the game's PRESENT_END is b = p + 310, no earlier than 400 µs after the
+// previous frame's y for a game whose next start waits for the order's release of the held Present. The next arrival
+// is b + 150 µs. The resume (810) and the turnaround (150) sit in the middle of a 20 µs bin, so the percentiles are
+// exact. In a game that waits the pairs alternate (every second one tells: the hold ends after the next Present's
+// arrival) and none is free. An oracle reads the same stamps and says what every window, pair and verdict has to be,
+// so a test does not repeat the controller's arithmetic by hand; the numbers asserted outright (the limit, the lead)
+// are the design's: 2 I − (W99 + G99) and the lead of 21,510 µs the warm-up frames teach.
 namespace
 {
     constexpr double kStartResume = 810.0;     // y − o of the scripted games: the render queue's resume
@@ -4167,6 +4168,7 @@ namespace
         double present_us = 0.0;    // p
         double ready_us = 0.0;      // r
         double output_us = 0.0;     // o
+        double processed_us = -1.0; // x
         double passed_us = -1.0;    // y
         double end_us = -1.0;       // b
         PacingPlanStatus status = PacingPlanStatus::Held;
@@ -4182,6 +4184,7 @@ namespace
         double ready_us = 8000.0;      // R = r − s
         double lead_us = 17000.0;      // L = o − s
         double resume_us = kStartResume; // y − o
+        double cover_us = 300.0;       // x − max(o, r)
         double end_gap_us = 310.0;     // b − p
         double hold_gap_us = 400.0;    // b − the previous y, of a game that waits
         double turnaround_us = kStartTurnaround;
@@ -4206,6 +4209,7 @@ namespace
             frame.present_us = arrival_us + shape.call_us;
             frame.ready_us = arrival_us + shape.ready_us;
             frame.output_us = arrival_us + shape.lead_us;
+            frame.processed_us = std::max(frame.output_us, frame.ready_us) + shape.cover_us;
             frame.passed_us = frame.output_us + shape.resume_us;
             frame.end_us = frame.present_us + shape.end_gap_us;
             if (shape.waits && previous_passed_us >= 0.0) {
@@ -4218,7 +4222,7 @@ namespace
         return frames;
     }
 
-    // Frames 100 ms apart without any evidence of the term (no arrival, no PRESENT_END, no y): their lead sample
+    // Frames 100 ms apart without any evidence of the term (no arrival, no PRESENT_END, no x, no y): their lead sample
     // is R, so 40 of them warm the lead at 21,510 µs and teach the term nothing.
     std::vector<StartFrame> WarmFrames(uint64_t first, size_t count, double ready_us = 21000.0)
     {
@@ -4248,7 +4252,7 @@ namespace
     void ShiftFrame(StartFrame* frame, double us)
     {
         for (double* time : { &frame->arrival_us, &frame->release_us, &frame->present_us, &frame->ready_us,
-                              &frame->output_us, &frame->passed_us, &frame->end_us }) {
+                              &frame->output_us, &frame->processed_us, &frame->passed_us, &frame->end_us }) {
             if (*time >= 0.0) *time += us;
         }
     }
@@ -4282,6 +4286,7 @@ namespace
             add(Kind::PresentCall, frame.present_us);
             add(Kind::GpuReady, frame.ready_us);
             add(Kind::OutputRelease, frame.output_us);
+            add(Kind::PresentProcessed, frame.processed_us);
             add(Kind::OrderPassed, frame.passed_us);
             add(Kind::PresentEnd, frame.end_us);
             if (reports) {
@@ -4456,13 +4461,13 @@ namespace
                     ++oracle.turnarounds;
                 }
             }
-            // A pair needs the unit's stamp y of frame n as well: a hold the order did not release behind its
-            // Present gives none, telling or free.
-            if (frame.status == PacingPlanStatus::Held && frame.passed_us >= 0.0 &&
+            // A pair needs the unit's word x on frame n (the order was in effect for it) and not the probe's y: a hold
+            // the order did not release behind its Present gives none, telling or free.
+            if (frame.status == PacingPlanStatus::Held && frame.processed_us >= 0.0 &&
                 frame.output_us > next.present_us && next.end_us >= 0.0) {
                 const bool free_pair = next.end_us < frame.output_us;
                 oracle.pairs.push_back({ std::max({ frame.output_us, next.present_us, next.end_us,
-                                                    frame.passed_us }), free_pair });
+                                                    frame.processed_us }), free_pair });
                 ++oracle.telling;
                 if (free_pair) ++oracle.free_pairs;
             }
@@ -4591,13 +4596,13 @@ void TestStartTermLimit()
     CHECK_NEAR(statistics.last_start_turnaround_us, kStartTurnaround);
     CHECK(statistics.collision_checked_frames == 0 && statistics.collision_guarded_frames == 0);
 
-    // No y: no unit stamp, so neither a resume sample nor a pair; the release headroom H (1,000 µs; here also
-    // 1,500 µs) takes the place.
+    // No y: the probe reports nothing, so no resume sample, but the unit's word x still gives the pairs; the release
+    // headroom H (1,000 µs; here also 1,500 µs) takes the place of W.
     std::vector<StartFrame> blind = WarmedGame(60);
     for (StartFrame& frame : blind) frame.passed_us = -1.0;
     auto fallback = StartPlayed(blind);
     CHECK(!fallback->StartEvidence().resume_measured && fallback->StartEvidence().resume_samples == 0);
-    CHECK(fallback->StartEvidence().telling_pairs == 0 && fallback->StartEvidence().source == LeadStartSource::Headroom);
+    CHECK(fallback->StartEvidence().telling_pairs == 30 && fallback->StartEvidence().source == LeadStartSource::Headroom);
     LeadRequest blind_request = StartRequest();
     LeadGuardOutcome blind_guard{};
     fallback->NextLeadUs(blind_request, nullptr, &blind_guard);
@@ -4610,11 +4615,12 @@ void TestStartTermLimit()
     fallback->NextLeadUs(blind_request, nullptr, &blind_guard);
     CHECK_NEAR(blind_guard.start_limit_us, 2.0 * kInterval - (1500.0 + kStartTurnaround));
 
-    // No arrival, no PRESENT_END and no y: no evidence at all, and the term applies on H alone.
+    // No arrival, no PRESENT_END, no x and no y: no evidence at all, and the term applies on H alone.
     std::vector<StartFrame> bare = WarmedGame(60);
     for (StartFrame& frame : bare) {
         frame.arrival_us = -1.0;
         frame.end_us = -1.0;
+        frame.processed_us = -1.0;
         frame.passed_us = -1.0;
     }
     auto none = StartPlayed(bare);
@@ -4665,7 +4671,7 @@ void TestStartTermWindows()
     CHECK_NEAR(evidence.turnaround_us, kStartTurnaround);
 }
 
-// A free pair: frame n is held and the order was in effect for it (the unit gave y), its release comes after frame
+// A free pair: frame n is held and the order was in effect for it (the unit gave x), its release comes after frame
 // n + 1's native Present arrived, and frame n + 1's Present ended before that release: the game does not wait for a
 // held Present, and the term stands aside. The lead returns at the slew (100 µs a plan), not in one step; when the
 // free pair leaves the newest 64 telling pairs the term is back, and a tighter limit applies at once. The render
@@ -4722,30 +4728,83 @@ void TestStartTermUntiedStart()
     CHECK(evidence.untied_starts == 0 && evidence.frames == LEAD_START_EVIDENCE_FRAMES);
 }
 
-// A pair needs the hold order unit's stamp y of the frame (the render queue passed the order's Wait behind its
-// Present): the order was in effect for that edge. The capture's case: a held frame whose successor's PRESENT_END
-// came before the hold's release, and for which the unit gave no event, is no evidence, telling or free, and the term
-// keeps applying on every plan; the same pair with the event stands it aside (TestStartTermFreePair).
-void TestStartTermNeedsPassed()
+// A pair needs the hold order unit's word x for the frame (the order was in effect for that edge) and not the probe's
+// y. The capture's case: a held frame whose successor's PRESENT_END came before the hold's release, and for which the
+// unit gave no word, is no evidence, telling or free, and the term keeps applying on every plan; its resume sample
+// still comes, since the probe gave y. The same pair with the word and without y is a pair and gives no sample: the
+// term stands aside on it (TestStartTermStandsAsideWithoutTheProbe has no y at all).
+void TestStartTermNeedsProcessed()
+{
+    constexpr size_t kWarm = 40;
+    {
+        std::vector<StartFrame> frames = WarmedGame(230);
+        const size_t at = kWarm + 50; // an even game position: its pair with the next frame tells
+        CHECK(frames[at].output_us > frames[at + 1].present_us);
+        frames[at + 1].end_us = frames[at].output_us - 200.0;
+        frames[at].processed_us = -1.0;
+
+        auto controller = MakeController();
+        const std::vector<StartPlan> plans = StartPlanned(controller.get(), frames, kWarm, StartRequest());
+        const StartOracle oracle = BuildOracle(frames);
+        CHECK(oracle.free_pairs == 0 && oracle.telling == 114 && oracle.untied == 0); // 115 telling positions less one
+        CheckStartMatches(*controller, oracle);
+        CHECK(controller->Statistics().start_resume_samples == 230); // y without x: a sample, no pair
+        for (const StartPlan& plan : plans) CHECK(plan.guard.start_applied && !plan.guard.start_aside);
+        const LeadStatistics statistics = controller->Statistics();
+        CHECK(statistics.start_checked_frames == plans.size() && statistics.start_aside_frames == 0);
+        CHECK(statistics.start_stood_aside == 0 && statistics.start_free_pairs == 0);
+        CHECK(controller->StartEvidence().free_pairs == 0);
+    }
+    {
+        std::vector<StartFrame> frames = WarmedGame(230);
+        const size_t at = kWarm + 50;
+        CHECK(frames[at].output_us > frames[at + 1].present_us);
+        frames[at + 1].end_us = frames[at].output_us - 200.0;
+        frames[at].passed_us = -1.0;
+
+        auto controller = MakeController();
+        const std::vector<StartPlan> plans = StartPlanned(controller.get(), frames, kWarm, StartRequest());
+        const StartOracle oracle = BuildOracle(frames);
+        CHECK(oracle.free_pairs == 1 && oracle.telling == 115 && oracle.resumes == 229);
+        CheckStartMatches(*controller, oracle);
+        CHECK(controller->Statistics().start_resume_samples == 229 && controller->Statistics().start_free_pairs == 1);
+        const AsideCounts counts = CheckAsidePlans(plans, oracle, 45);
+        CHECK(counts.stood_aside == 1 && counts.came_back == 1 && counts.aside_plans > 20);
+    }
+}
+
+// The probe does not report (not adopted yet, another queue adopted, off): no frame has y, so no resume sample and
+// the term applies on the release headroom; the pairs come from the unit's word x all the same, so the term still
+// stands aside on a free pair (at the slew, as ever) and is back when the pair leaves the newest 64, on the
+// headroom's limit 2 I − (H + G99). A game that does not wait for a held Present is not held to the limit for lack of
+// the probe.
+void TestStartTermStandsAsideWithoutTheProbe()
 {
     constexpr size_t kWarm = 40;
     std::vector<StartFrame> frames = WarmedGame(230);
-    const size_t at = kWarm + 50; // an even game position: its pair with the next frame tells
-    CHECK(frames[at].output_us > frames[at + 1].present_us);
+    for (StartFrame& frame : frames) frame.passed_us = -1.0;
+    size_t at = kWarm + 50;
+    while (at + 1 < frames.size() && !(frames[at].output_us > frames[at + 1].present_us)) ++at;
+    CHECK(at + 1 < frames.size());
+    if (at + 1 >= frames.size()) return;
     frames[at + 1].end_us = frames[at].output_us - 200.0;
-    frames[at].passed_us = -1.0;
 
     auto controller = MakeController();
     const std::vector<StartPlan> plans = StartPlanned(controller.get(), frames, kWarm, StartRequest());
     const StartOracle oracle = BuildOracle(frames);
-    CHECK(oracle.free_pairs == 0 && oracle.telling == 114 && oracle.untied == 0); // 115 telling positions less one
+    CHECK(oracle.resumes == 0 && oracle.free_pairs == 1 && oracle.untied == 0);
     CheckStartMatches(*controller, oracle);
-    CHECK(controller->Statistics().start_resume_samples == 229); // 230 game frames, one without y: no sample
-    for (const StartPlan& plan : plans) CHECK(plan.guard.start_applied && !plan.guard.start_aside);
+    const AsideCounts counts = CheckAsidePlans(plans, oracle, 5);
+    CHECK(counts.stood_aside == 1 && counts.came_back == 1 && counts.aside_plans > 20);
     const LeadStatistics statistics = controller->Statistics();
-    CHECK(statistics.start_checked_frames == plans.size() && statistics.start_aside_frames == 0);
-    CHECK(statistics.start_stood_aside == 0 && statistics.start_free_pairs == 0);
-    CHECK(controller->StartEvidence().free_pairs == 0);
+    CHECK(statistics.start_resume_samples == 0 && statistics.start_resume_frames == 0);
+    CHECK(statistics.start_checked_frames == plans.size() && statistics.start_fallback_frames == plans.size());
+    CHECK(statistics.start_stood_aside == 1 && statistics.start_came_back == 1);
+    CHECK(!plans.back().guard.start_aside && plans.back().guard.start_applied);
+    CHECK(plans.back().guard.start_source == LeadStartSource::Headroom);
+    CHECK_NEAR(plans.back().returned_us, 2.0 * kInterval - (LEAD_RELEASE_HEADROOM_US + kStartTurnaround));
+    const LeadStartEvidence evidence = controller->StartEvidence();
+    CHECK(!evidence.resume_measured && evidence.free_pairs == 0 && evidence.telling_pairs == LEAD_START_EVIDENCE_FRAMES);
 }
 
 // Only a frame the executor held gives a resume or a pair: Unknown, SourceOnly, Late, Missing, Stale, Duplicate,
@@ -4775,8 +4834,8 @@ void TestStartTermNeedsHeld()
 // Each pair and sample is judged once, by whichever callback completes it, so the order of delivery does not matter:
 // a script played in time order and in the reverse order (within a chunk of eight frames every pair is completed by
 // an event, not a release) gives the same windows and rings, and both give what the stamps say. The script holds a
-// free pair, an untied start, three frames not held (Late), one with an Unknown status and one for which the unit
-// gave no y.
+// free pair, an untied start, three frames not held (Late), one with an Unknown status, one for which the unit gave no
+// word x (no pair) and one for which the probe gave no y (no sample).
 void TestStartTermDeliveryOrder()
 {
     std::vector<StartFrame> frames = MakeGame(1, 65);
@@ -4788,7 +4847,8 @@ void TestStartTermDeliveryOrder()
     frames[31].arrival_us = frames[30].end_us - 500.0;
     for (size_t i = 40; i < 43; ++i) frames[i].status = PacingPlanStatus::Late;
     frames[45].status = PacingPlanStatus::Unknown;
-    frames[50].passed_us = -1.0;
+    frames[50].processed_us = -1.0;
+    frames[52].passed_us = -1.0;
     const StartOracle oracle = BuildOracle(frames);
     CHECK(oracle.free_pairs == 1 && oracle.untied == 1 && oracle.telling > 5);
 
@@ -4852,7 +4912,7 @@ void TestStartTermReset()
     PlayNatural(controller.get(), std::vector<StartFrame>(game.begin(), game.begin() + 20), nullptr, false);
     CHECK(controller->StartEvidence().resume_samples == 20 && controller->StartEvidence().turnaround_samples > 0);
 
-    // Frame 21 (position 20) is released and its p, r and o are in; its y and PRESENT_END are not.
+    // Frame 21 (position 20) is released and its p, r and o are in; its x, y and PRESENT_END are not.
     const std::vector<StartPiece> pieces = PiecesOf(game, false);
     const auto frame_21 = [&](bool late_events) {
         for (const StartPiece& piece : pieces) {
@@ -4861,7 +4921,8 @@ void TestStartTermReset()
                 if (!late_events) StartDeliver(controller.get(), game, piece);
                 continue;
             }
-            const bool late = piece.event.kind == Kind::OrderPassed || piece.event.kind == Kind::PresentEnd;
+            const bool late = piece.event.kind == Kind::PresentProcessed || piece.event.kind == Kind::OrderPassed ||
+                piece.event.kind == Kind::PresentEnd;
             if (late == late_events) StartDeliver(controller.get(), game, piece);
         }
     };
@@ -4874,7 +4935,7 @@ void TestStartTermReset()
     };
     CHECK(empty(controller->StartEvidence()));
     const LeadStatistics before = controller->Statistics();
-    frame_21(true); // y and PRESENT_END of a frame released before the reset
+    frame_21(true); // x, y and PRESENT_END of a frame released before the reset
     CHECK(empty(controller->StartEvidence()));
     CHECK(controller->Statistics().start_resume_samples == before.start_resume_samples);
     CHECK(controller->Statistics().start_turnaround_samples == before.start_turnaround_samples);
@@ -5217,7 +5278,8 @@ int main()
     TestStartTermWindows();
     TestStartTermFreePair();
     TestStartTermUntiedStart();
-    TestStartTermNeedsPassed();
+    TestStartTermNeedsProcessed();
+    TestStartTermStandsAsideWithoutTheProbe();
     TestStartTermNeedsHeld();
     TestStartTermDeliveryOrder();
     TestStartTermNeverBridgesAGap();

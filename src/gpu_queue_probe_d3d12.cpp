@@ -947,7 +947,7 @@ void LogCosts(const char* reason, const Thread* t) noexcept {
         "overlap %llu, incomplete %llu, untagged (never emitted) %llu, lost events %llu; "
         "blocked wake latency p95 %.1f us max %.1f us (%llu calibration timeouts, %llu values skipped); core pushed=%llu "
         "intervals_inconsistent=%llu orphaned=%llu parked_watermark=%llu markers_untrusted=%llu awaited_lo_rejected=%llu "
-        "waits_dropped=%llu holds_unmatched=%llu",
+        "waits_dropped=%llu holds_unmatched=%llu order_identities=%llu order_reports=%llu",
         reason, u(frames), u(submissions), frames ? static_cast<double>(submissions) / static_cast<double>(frames) : 0.0,
         u(g.contended.load()), u(g.fences_done.load() + g.fences_wait.load()), u(g.fences_done.load()),
         u(g.fences_wait.load()),
@@ -960,20 +960,20 @@ void LogCosts(const char* reason, const Thread* t) noexcept {
         t ? t->p95_us : g.cal_p95_us.load(), t ? t->max_us : g.cal_max_us.load(),
         u(t ? t->calibration_timeouts : 0), u(t ? t->skipped : 0), u(counters.pushed), u(counters.intervals_inconsistent),
         u(counters.stamps_orphaned), u(counters.parked_watermark), u(counters.markers_untrusted),
-        u(counters.awaited_lo_rejected), u(counters.waits_dropped), u(counters.holds_unmatched));
+        u(counters.awaited_lo_rejected), u(counters.waits_dropped), u(counters.holds_unmatched), u(counters.order_identities),
+        u(counters.order_passed_reported));
     g.summary_logged.store(true, std::memory_order_relaxed);
 }
 
-// The reports that the render queue passed an order Wait (the core queues one per hold whose release carried a plan's
-// identity, when it accounts that Wait): handed to the gate, which pushes the stage event OrderPassed. The completion
-// thread only (the core's consumer side); no lock of the probe is held, and none is taken.
-void PopOrderPassed() noexcept {
-    GpuQueueProbeCore::OrderPassed report;
-    while (g_core.PopOrderPassed(&report)) GpuPresent_PushOrderPassed(report.key, report.grid_index, report.qpc);
+// The core's order reports (it makes one per hold whose release carried a plan's identity, when it accounts that Wait),
+// handed to the gate as they are made: it pushes the stage event OrderPassed. On the thread that drains the core (the
+// completion thread), from inside Drain / Flush, so a drain that accounts many frames loses none; no lock of the probe
+// is held, and none is taken.
+void ForwardOrderPassed(void*, const PacingPlanKey& key, uint64_t grid_index, int64_t qpc) noexcept {
+    GpuPresent_PushOrderPassed(key, grid_index, qpc);
 }
 
 void PopFrames() noexcept {
-    PopOrderPassed(); // the reports of what the last Drain accounted, whether or not a frame record is ready
     constexpr size_t kPopBatch = GpuQueueProbeCore::kFrameCapacity;
     for (;;) {
         PacingGpuQueueRecord batch[kPopBatch];
@@ -1695,6 +1695,7 @@ DWORD WINAPI Worker(void*) noexcept {
             break;
         }
         g_core.Reset(g.frequency);
+        g_core.SetOrderPassedSink(&ForwardOrderPassed, nullptr);
         g_core.SetMarginEnd(g_unified_queue_margin_end.load(std::memory_order_relaxed)); // developer A/B key, read at session start
         g_core.SetWakeLatencyUs(t.p95_us);
         g.next_value.store(0, std::memory_order_relaxed);
