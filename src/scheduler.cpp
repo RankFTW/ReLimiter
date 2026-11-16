@@ -360,10 +360,10 @@ int s_last_fg_divisor_raw = 0;
 // (-1 none, 0 margin, 1 headroom).
 int s_logged_collision_guard = -1;
 // The start term's state last logged (lead_controller.h): -1 none, 0 applies on the release headroom, 1 applies on
-// the Present's service, 2 applies on the game's own wait (the numbers of LeadStartSource), 3 stands aside. A change
-// to or from standing aside is always told; among the applying states only a move to a better measured source is
-// (headroom, then the service, then the game's wait): a fall back is silent, because a stretch where the GPU is the
-// limit and almost nothing is held leaves the windows stale for 64 plans at a time, and the state stays where it was.
+// the render queue's resume after the release (the numbers of LeadStartSource), 2 stands aside. A change to or from
+// standing aside is always told; among the applying states only the move from the headroom to the measured resume is
+// told: a fall back is silent, because a stretch where the GPU is the limit and almost nothing is held leaves the
+// resume window stale for 64 plans at a time, and the state stays where it was.
 int s_logged_start_limit = -1;
 // The first lead sample that left out the game's simulation → render queue
 // (lead_controller.h) has been logged. Once per process.
@@ -563,33 +563,28 @@ static void ObserveCollisionGuard(double fg_divisor, bool ordered) noexcept
         s_logged_fg_behind_wait = fg_behind_wait;
     }
     if (statistics.start_checked_frames != 0) {
-        // The state to tell: stands aside (3), or applies on the best source seen since the term began to apply. The
+        // The state to tell: stands aside (2), or applies on the best source seen since the term began to apply. The
         // wording of an applies line names the source in use when it is said.
         const int source = static_cast<int>(statistics.last_start_source);
         int start = s_logged_start_limit;
-        if (statistics.last_start_aside) start = 3;
-        else if (start < 0 || start == 3 || source > start) start = source;
+        if (statistics.last_start_aside) start = 2;
+        else if (start < 0 || start == 2 || source > start) start = source;
         if (start != s_logged_start_limit) {
             const LeadStartEvidence evidence = lead.StartEvidence();
-            if (start == 3) {
+            if (start == 2) {
                 LOG_INFO("Start limit: stands aside (%zu of the newest %zu telling pairs: the game's Present ended "
                          "before the held frame's release; %zu of the newest %zu frames: the game asked for a frame "
                          "before its previous Present ended)",
                          evidence.free_pairs, evidence.telling_pairs, evidence.untied_starts, evidence.frames);
-            } else if (start == 2) {
-                LOG_INFO("Start limit: applies, %.2f ms (two intervals less the game's wait after the release "
-                         "%.2f ms, measured, and the game's turnaround %.2f ms)",
-                         statistics.last_start_limit_us / 1000.0, statistics.last_start_wait_us / 1000.0,
-                         statistics.last_start_turnaround_us / 1000.0);
             } else if (start == 1) {
-                LOG_INFO("Start limit: applies, %.2f ms (two intervals less the Present's service %.2f ms (the "
-                         "game's wait not seen yet), and the game's turnaround %.2f ms)",
-                         statistics.last_start_limit_us / 1000.0, statistics.last_start_wait_us / 1000.0,
+                LOG_INFO("Start limit: applies, %.2f ms (two intervals less the render queue's resume after the "
+                         "release %.2f ms, measured, and the game's turnaround %.2f ms)",
+                         statistics.last_start_limit_us / 1000.0, statistics.last_start_resume_us / 1000.0,
                          statistics.last_start_turnaround_us / 1000.0);
             } else {
-                LOG_INFO("Start limit: applies, %.2f ms (two intervals less the release headroom %.2f ms, and the "
-                         "game's turnaround %.2f ms)",
-                         statistics.last_start_limit_us / 1000.0, statistics.last_start_wait_us / 1000.0,
+                LOG_INFO("Start limit: applies, %.2f ms (two intervals less the release headroom %.2f ms (the "
+                         "render queue's resume not measured yet), and the game's turnaround %.2f ms)",
+                         statistics.last_start_limit_us / 1000.0, statistics.last_start_resume_us / 1000.0,
                          statistics.last_start_turnaround_us / 1000.0);
             }
             s_logged_start_limit = start;

@@ -62,6 +62,7 @@ void GpuQueueProbeCore::ClearState() noexcept
     armed_[0] = armed_[1] = 0;
     parked_count_ = 0;
     untrusted_below_ = 0;
+    order_report_head_ = order_report_tail_ = 0;
 }
 
 void GpuQueueProbeCore::Reset(int64_t qpc_frequency) noexcept
@@ -352,11 +353,17 @@ void GpuQueueProbeCore::ProcessHoldAnnounce(const GpuQueueEvent& e) noexcept
 void GpuQueueProbeCore::ProcessHold(const GpuQueueEvent& e) noexcept
 {
     if (e.fence_id == 0) return;
+    // The plan to report the Wait passed under travels with the release: an identity that is not complete is none.
+    const bool reports = e.order_grid_index != 0 && PacingPlanKey_IsValid(e.order_key);
     const int i = FindHold(e.fence_id, e.wait_value);
     if (i >= 0) {
         holds_[i].release = e.release_qpc;
         holds_[i].has_release = true;
         if (e.enq_qpc != 0) holds_[i].enq = e.enq_qpc;
+        if (reports) {
+            holds_[i].order_key = e.order_key;
+            holds_[i].order_grid_index = e.order_grid_index;
+        }
         return;
     }
     HoldRec h;
@@ -365,6 +372,10 @@ void GpuQueueProbeCore::ProcessHold(const GpuQueueEvent& e) noexcept
     h.enq = e.enq_qpc;
     h.release = e.release_qpc;
     h.has_release = true;
+    if (reports) {
+        h.order_key = e.order_key;
+        h.order_grid_index = e.order_grid_index;
+    }
     AddHold(h);
 }
 
@@ -928,6 +939,9 @@ void GpuQueueProbeCore::ApplyResolved(Entry& e, Frame& f) noexcept
     int64_t p_lo = prev_lo_, p_hi = prev_hi_;
     const int64_t guard = GuardTicks();
     const uint32_t m = e.wait_count;
+    // The frame's events are whole and unambiguous (no overlap, nothing lost), judged before this entry's own markers
+    // can mark it: a Wait's release interval does not depend on its submission's done marker.
+    const bool frame_ok = !f.dropped && !f.overlap;
 
     // The submission's own completion [d_lo, d_hi]. Untrusted or inconsistent: the frame is invalid and the done chain
     // breaks here (the successor has no known predecessor until a trusted completion).
@@ -1028,6 +1042,10 @@ void GpuQueueProbeCore::ApplyResolved(Entry& e, Frame& f) noexcept
             hold_x_lo_ = x_lo;
             hold_x_hi_ = x_hi;
             hold_taken_ = false;
+            // The walk is calculable and this Wait's release is a trusted interval (calc_ok): the queue passed the Wait at
+            // or before its upper end. Told once, to whoever gave the hold a plan's identity; a frame whose events are not
+            // whole (lost, overlapping producers) says nothing.
+            if (h.order_grid_index != 0 && frame_ok) PushOrderPassed(h, r_hi);
         }
     }
     const int64_t tail_lo = calc_ok ? pos(e.enq - fr_hi) : 0; // after the last Wait
@@ -1305,6 +1323,29 @@ void GpuQueueProbeCore::Flush() noexcept
     }
 }
 
+void GpuQueueProbeCore::PushOrderPassed(const HoldRec& h, int64_t qpc) noexcept
+{
+    if (qpc <= 0) return; // a stage event needs a time
+    if (order_report_head_ - order_report_tail_ >= kOrderReportCapacity) {
+        order_passed_dropped_.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    OrderPassed& r = order_reports_[order_report_head_ % kOrderReportCapacity];
+    r.key = h.order_key;
+    r.grid_index = h.order_grid_index;
+    r.qpc = qpc;
+    ++order_report_head_;
+    order_passed_reported_.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool GpuQueueProbeCore::PopOrderPassed(OrderPassed* out) noexcept
+{
+    if (out == nullptr || order_report_tail_ == order_report_head_) return false;
+    *out = order_reports_[order_report_tail_ % kOrderReportCapacity];
+    ++order_report_tail_;
+    return true;
+}
+
 GpuQueueProbeCore::Counters GpuQueueProbeCore::Statistics() const noexcept
 {
     Counters c{};
@@ -1329,5 +1370,7 @@ GpuQueueProbeCore::Counters GpuQueueProbeCore::Statistics() const noexcept
     c.awaited_lo_rejected = awaited_lo_rejected_.load(std::memory_order_relaxed);
     c.boundary_markers_awaited = boundary_awaited_.load(std::memory_order_relaxed);
     c.boundary_markers_by_observation = boundary_observed_.load(std::memory_order_relaxed);
+    c.order_passed_reported = order_passed_reported_.load(std::memory_order_relaxed);
+    c.order_passed_dropped = order_passed_dropped_.load(std::memory_order_relaxed);
     return c;
 }

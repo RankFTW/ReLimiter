@@ -1375,7 +1375,7 @@ void TestCollisionGuardSwitches()
 // switches to the lead, and the plan carries the limit the lead applied to the executor (lead_limit_us, in the
 // registry's copy too); the frame and the source record say what the term found and whether it was applied. The term
 // is for plans made on present-first ordering: a plan that is not ordered gets none. On a lead that has seen nothing
-// the limit is 2 I less the release headroom (1,000 µs): there is no wait, service or turnaround yet.
+// the limit is 2 I less the release headroom (1,000 µs): there is no resume or turnaround yet.
 void TestPlanCarriesStartLimit()
 {
     std::printf("Test: the plan carries the start limit exactly when the lead applied it\n");

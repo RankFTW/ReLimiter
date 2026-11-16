@@ -183,7 +183,7 @@ void LeadController::ResetBuckets() noexcept
         frame.spike_recorded = true;
         frame.spike_gpu_recorded = true;
         // The start term's windows were cleared: evidence of a frame released before this reset is not theirs.
-        frame.service_recorded = true;
+        frame.resume_recorded = true;
         frame.pair_recorded = true;
         frame.turnaround_recorded = true;
     }
@@ -201,11 +201,9 @@ void LeadController::ResetSpikeFloor() noexcept
 
 void LeadController::ResetStartTerm() noexcept
 {
-    start_service_window_.Reset();
-    start_wait_window_.Reset();
+    start_resume_window_.Reset();
     start_turnaround_window_.Reset();
-    start_service_age_frames_ = LEAD_WORK_STALE_FRAMES + 1;
-    start_wait_age_frames_ = LEAD_WORK_STALE_FRAMES + 1;
+    start_resume_age_frames_ = LEAD_WORK_STALE_FRAMES + 1;
     start_pairs_.Reset();
     start_untied_.Reset();
     start_aside_ = false;
@@ -518,53 +516,40 @@ bool LeadController::LateOffsetUs(size_t divisor, const LeadRequest& request, do
     return true;
 }
 
-bool LeadController::StartServiceMeasured() const noexcept
+bool LeadController::StartResumeMeasured() const noexcept
 {
-    return start_service_window_.Count() >= LEAD_WARM_SAMPLES && start_service_age_frames_ <= LEAD_WORK_STALE_FRAMES;
-}
-
-bool LeadController::StartWaitMeasured() const noexcept
-{
-    return start_wait_window_.Count() >= LEAD_WARM_SAMPLES && start_wait_age_frames_ <= LEAD_WORK_STALE_FRAMES;
+    return start_resume_window_.Count() >= LEAD_WARM_SAMPLES && start_resume_age_frames_ <= LEAD_WORK_STALE_FRAMES;
 }
 
 LeadStartSource LeadController::StartSource() const noexcept
 {
-    if (StartWaitMeasured()) return LeadStartSource::GameWait;
-    return StartServiceMeasured() ? LeadStartSource::Service : LeadStartSource::Headroom;
+    return StartResumeMeasured() ? LeadStartSource::Resume : LeadStartSource::Headroom;
 }
 
 // The start term (lead_controller.h) of a GPU queue wait plan made on present-first ordering with the guard on:
-// limit = 2 I − (W99 + G99) on the release → target distance. W99 is the game's wait after the release from the best
-// measure there is: its own, b_{n+1} − o_n of the telling pairs that are not free; else the Present's service where
-// that is measured; else the release headroom (the fallback). G99 is the turnaround, 0 while there is none. The term
-// stands aside while the game's own times show a free pair or an untied start among the newest evidence. The verdict
-// is reported whether the plan applies the term or only observes it (LeadRequest::start_observe); only an applied
-// limit reaches *bound_us, the limit plus the anchor's delta that bounds the lead, and the executor's limit
-// (LeadGuardOutcome::release_limit_us). A limit below 0 is 0 for the lead and the rows, but never for the executor: 0
-// means no limit there, and a lead of 0 does not guarantee no hold (the previous output can lift the spacing floor
-// above this frame's release, and a Present that arrives before that floored target would be held past the applied
-// bound), so the executor is given at least LEAD_START_EXECUTOR_MIN_US, and Decide then resolves the nominal target.
+// limit = 2 I − (W99 + G99) on the release → target distance. W99 is the render queue's resume after the release
+// where that is measured (y_n − o_n of the held frames the order was in effect for), else the release
+// headroom (the fallback). G99 is the turnaround, 0 while there is none. The term stands aside while the game's own
+// times show a free pair or an untied start among the newest evidence. The verdict is reported whether the plan
+// applies the term or only observes it (LeadRequest::start_observe); only an applied limit reaches *bound_us, the
+// limit plus the anchor's delta that bounds the lead, and the executor's limit (LeadGuardOutcome::release_limit_us).
+// A limit below 0 is 0 for the lead and the rows, but never for the executor: 0 means no limit there, and a lead of
+// 0 does not guarantee no hold (the previous output can lift the spacing floor above this frame's release, and a
+// Present that arrives before that floored target would be held past the applied bound), so the executor is given at
+// least LEAD_START_EXECUTOR_MIN_US, and Decide then resolves the nominal target.
 bool LeadController::StartTerm(const LeadRequest& request, LeadGuardOutcome* guard, double* bound_us) noexcept
 {
     const LeadStartSource source = StartSource();
-    double wait_us = 0.0;
-    if (source == LeadStartSource::GameWait) {
-        wait_us = start_wait_window_.Quantile(LEAD_START_QUANTILE);
-    } else if (source == LeadStartSource::Service) {
-        wait_us = start_service_window_.Quantile(LEAD_START_QUANTILE);
-    } else {
-        wait_us = IsPositiveFinite(request.release_headroom_us) ? request.release_headroom_us
-                                                                : LEAD_RELEASE_HEADROOM_US;
-    }
+    const double resume_us = source == LeadStartSource::Resume
+        ? start_resume_window_.Quantile(LEAD_START_QUANTILE)
+        : (IsPositiveFinite(request.release_headroom_us) ? request.release_headroom_us : LEAD_RELEASE_HEADROOM_US);
     const double turnaround_us = start_turnaround_window_.Quantile(LEAD_START_QUANTILE);
-    const double limit_us = std::max(0.0, 2.0 * request.interval_us - (wait_us + turnaround_us));
+    const double limit_us = std::max(0.0, 2.0 * request.interval_us - (resume_us + turnaround_us));
     const bool aside = start_pairs_.set != 0 || start_untied_.set != 0;
     const bool applied = request.start_limit && !aside;
 
     ++statistics_.start_checked_frames;
-    if (source == LeadStartSource::GameWait) ++statistics_.start_wait_frames;
-    else if (source == LeadStartSource::Service) ++statistics_.start_service_frames;
+    if (source == LeadStartSource::Resume) ++statistics_.start_resume_frames;
     else ++statistics_.start_fallback_frames;
     if (aside) ++statistics_.start_aside_frames;
     if (aside != start_aside_) {
@@ -573,7 +558,7 @@ bool LeadController::StartTerm(const LeadRequest& request, LeadGuardOutcome* gua
         start_aside_ = aside;
     }
     statistics_.last_start_limit_us = limit_us;
-    statistics_.last_start_wait_us = wait_us;
+    statistics_.last_start_resume_us = resume_us;
     statistics_.last_start_turnaround_us = turnaround_us;
     statistics_.last_start_source = source;
     statistics_.last_start_aside = aside;
@@ -596,14 +581,11 @@ bool LeadController::StartTerm(const LeadRequest& request, LeadGuardOutcome* gua
 LeadStartEvidence LeadController::StartEvidence() const noexcept
 {
     LeadStartEvidence evidence{};
-    evidence.service_samples = start_service_window_.Count();
-    evidence.wait_samples = start_wait_window_.Count();
+    evidence.resume_samples = start_resume_window_.Count();
     evidence.turnaround_samples = start_turnaround_window_.Count();
-    evidence.service_us = start_service_window_.Quantile(LEAD_START_QUANTILE);
-    evidence.wait_us = start_wait_window_.Quantile(LEAD_START_QUANTILE);
+    evidence.resume_us = start_resume_window_.Quantile(LEAD_START_QUANTILE);
     evidence.turnaround_us = start_turnaround_window_.Quantile(LEAD_START_QUANTILE);
-    evidence.service_measured = StartServiceMeasured();
-    evidence.wait_measured = StartWaitMeasured();
+    evidence.resume_measured = StartResumeMeasured();
     evidence.source = StartSource();
     evidence.telling_pairs = start_pairs_.count;
     evidence.free_pairs = start_pairs_.set;
@@ -747,18 +729,15 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
             : fg_report_age_frames_[slot.bucket % LEAD_DIVISOR_BUCKETS];
         if (age < UINT32_MAX) ++age;
     }
-    // The Present services' and the game's waits' ages count the same frames (the start term, lead_controller.h).
-    if (slot.gpu_wait_lead) {
-        if (start_service_age_frames_ < UINT32_MAX) ++start_service_age_frames_;
-        if (start_wait_age_frames_ < UINT32_MAX) ++start_wait_age_frames_;
-    }
+    // The resume window's age counts the same frames (the start term, lead_controller.h).
+    if (slot.gpu_wait_lead && start_resume_age_frames_ < UINT32_MAX) ++start_resume_age_frames_;
     RecordCallTime(&slot);
     RecordWorkStart(&slot);
     RecordWorkStart(Find(index + 1));
     if (index > 0) RecordReleaseHeadroom(Find(index - 1));
     // Start term: this release gives the frame before it the arrival of its turnaround, and may complete what came
-    // ahead of it (the service and the pair of events stored before the release).
-    RecordStartService(&slot);
+    // ahead of it (the resume and the pair of events stored before the release).
+    RecordStartResume(&slot);
     RecordStartPair(&slot);
     if (index > 0) RecordStartPair(Find(index - 1));
     TryFinalize(&slot);
@@ -776,7 +755,7 @@ void LeadController::OnStageEvent(const PacingStageEvent& event) noexcept
         static_cast<int>(PacingStageEventKind::RenderSubmitStart) == FieldRenderSubmit &&
         static_cast<int>(PacingStageEventKind::SimulationEnd) == FieldSimulationEnd &&
         static_cast<int>(PacingStageEventKind::PresentEnd) == FieldPresentEnd &&
-        static_cast<int>(PacingStageEventKind::PresentProcessed) == FieldPresentProcessed,
+        static_cast<int>(PacingStageEventKind::OrderPassed) == FieldOrderPassed,
         "Field values must match PacingStageEventKind");
     static_assert(FieldCount <= 16, "field_mask holds one bit per Field");
 
@@ -828,9 +807,9 @@ void LeadController::OnStageEvent(const PacingStageEvent& event) noexcept
     // g_{n+1} − o_n: this frame's resume, or the next frame's submission start.
     RecordConcurrency(frame);
     if (index > 0) RecordConcurrency(Find(index - 1));
-    // Start term (lead_controller.h): this event may complete the frame's service, or its pair with the next frame
-    // or with the one before (p, b and a of the later frame, o and x and r of the earlier).
-    RecordStartService(frame);
+    // Start term (lead_controller.h): this event may complete the frame's resume, or its pair with the next frame
+    // or with the one before (p, b and a of the later frame, o and y of the earlier).
+    RecordStartResume(frame);
     RecordStartPair(frame);
     if (index > 0) RecordStartPair(Find(index - 1));
     TryFinalize(frame);
@@ -1290,42 +1269,44 @@ void LeadController::RecordConcurrency(PendingFrame* frame) noexcept
     }
 }
 
-// The Present service x − max(o, r) of a held GPU queue wait frame (the start term, lead_controller.h): x is the hold
-// order unit's stamp of the frame's Present processed, o its release, r its GPU readiness. Only a frame the executor
-// held has one: a frame with another status is decided at its release, and an Unknown status is no evidence here. A
-// sample outside [0, 3 I] is counted and not added. Judged once, when the last of o, r and x is known.
-void LeadController::RecordStartService(PendingFrame* frame) noexcept
+// The render queue's resume y − o after the release of a held GPU queue wait frame (the start term,
+// lead_controller.h): y is the hold order unit's stamp of the render queue passing the order's Wait behind the
+// frame's Present, o the frame's release. It is counted from the release alone, whatever the frame's GPU readiness:
+// the game waits for the render queue, and a frame the GPU finished after its release makes that wait longer by the
+// lateness. Only a frame the executor held has one: a frame with another status is decided at its release, and an
+// Unknown status is no evidence here. A sample outside [0, 3 I] is counted and not added. Judged once, when the
+// later of o and y is known.
+void LeadController::RecordStartResume(PendingFrame* frame) noexcept
 {
-    if (frame == nullptr || frame->service_recorded || !frame->started || !frame->sampled ||
+    if (frame == nullptr || frame->resume_recorded || !frame->started || !frame->sampled ||
         frame->rung != PacingRung::GpuQueueWait || !HasField(*frame, FieldOutputRelease)) {
         return;
     }
     if (frame->output_status != PacingPlanStatus::Held) {
-        frame->service_recorded = true;
+        frame->resume_recorded = true;
         return;
     }
-    if (!HasField(*frame, FieldGpuReady) || !HasField(*frame, FieldPresentProcessed)) return;
-    frame->service_recorded = true;
-    const double service_us = MicrosecondsBetween(
-        std::max(frame->qpc[FieldOutputRelease], frame->qpc[FieldGpuReady]), frame->qpc[FieldPresentProcessed]);
-    if (!std::isfinite(service_us) || service_us < 0.0 || service_us > LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us) {
-        ++statistics_.start_service_excluded;
+    if (!HasField(*frame, FieldOrderPassed)) return;
+    frame->resume_recorded = true;
+    const double resume_us = MicrosecondsBetween(frame->qpc[FieldOutputRelease], frame->qpc[FieldOrderPassed]);
+    if (!std::isfinite(resume_us) || resume_us < 0.0 || resume_us > LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us) {
+        ++statistics_.start_resume_excluded;
         return;
     }
-    start_service_window_.Add(service_us);
-    ++statistics_.start_service_samples;
-    start_service_age_frames_ = 0;
+    start_resume_window_.Add(resume_us);
+    ++statistics_.start_resume_samples;
+    start_resume_age_frames_ = 0;
 }
 
 // A frame n and its successor n + 1 (the start term, lead_controller.h): the turnaround a_{n+1} − b_n, one sample
 // per frame whether or not anything is held, with the sign of an untied start (a_{n+1} < b_n: the game asked for the
 // frame before its previous Present ended; a negative turnaround is no sample), and the pair (o_n, p_{n+1}, b_{n+1})
-// of a Held frame n whose Present the hold order unit saw processed (x_n: the order was in effect for that edge; a
-// frame without it gives no pair): telling when the release came after the next frame's native Present arrived, free
-// when the next Present also ended before the release. A telling pair that is not free adds the game's wait
-// b_{n+1} − o_n to its window (not above 3 I). Both frames must be of one lifecycle, consecutive, released, and of one
-// GPU queue wait bucket in a mode that samples: a rung, divisor or mode change between them decides both at once as
-// no evidence. Each is judged once, when the last of its stamps is known.
+// of a Held frame n for which the hold order unit gave y_n (the render queue passed the order's Wait behind its
+// Present: the order was in effect for that edge; a frame without it gives no pair): telling when the release came
+// after the next frame's native Present arrived, free when the next Present also ended before the release. Both
+// frames must be of one lifecycle, consecutive, released, and of one GPU queue wait bucket in a mode that samples: a
+// rung, divisor or mode change between them decides both at once as no evidence. Each is judged once, when the last
+// of its stamps is known.
 void LeadController::RecordStartPair(PendingFrame* frame) noexcept
 {
     if (frame == nullptr || (frame->pair_recorded && frame->turnaround_recorded) || !frame->started ||
@@ -1366,25 +1347,13 @@ void LeadController::RecordStartPair(PendingFrame* frame) noexcept
         frame->pair_recorded = true; // the next Present arrived after the release: this pair tells nothing
         return;
     }
-    // Only a hold the order released behind its Present gives a pair: without x the pair never completes.
-    if (!HasField(*next, FieldPresentEnd) || !HasField(*frame, FieldPresentProcessed)) return;
+    // Only a hold the order released behind its Present gives a pair: without y the pair never completes.
+    if (!HasField(*next, FieldPresentEnd) || !HasField(*frame, FieldOrderPassed)) return;
     frame->pair_recorded = true;
     const bool free_pair = next->qpc[FieldPresentEnd] < release_qpc;
     start_pairs_.Push(free_pair);
     ++statistics_.start_telling_pairs;
-    if (free_pair) {
-        ++statistics_.start_free_pairs;
-        return;
-    }
-    // The game's own wait after the release: what its Present end followed the hold by.
-    const double wait_us = MicrosecondsBetween(release_qpc, next->qpc[FieldPresentEnd]);
-    if (!std::isfinite(wait_us) || wait_us < 0.0 || wait_us > LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us) {
-        ++statistics_.start_wait_excluded;
-        return;
-    }
-    start_wait_window_.Add(wait_us);
-    ++statistics_.start_wait_samples;
-    start_wait_age_frames_ = 0;
+    if (free_pair) ++statistics_.start_free_pairs;
 }
 
 bool LeadController::BehindWait(PacingRung rung, size_t divisor) const noexcept

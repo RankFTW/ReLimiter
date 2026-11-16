@@ -4,8 +4,9 @@
 // out-of-order markers, boundary collapse and tagging, incomplete frames, the completion
 // INTERVALS (observations, awaited wakes, the issue floor, both ends of the record fields, the free-margin
 // scalar for both margin ends), untrusted markers breaking the done chain, parking with trust and the
-// full-table watermark, the bounded wait-free ring (overflow, loss marking, a small multi-producer push) and Reset.
-// The D3D12 side (hook, fences, completion thread) is not covered here and needs live runs.
+// full-table watermark, the bounded wait-free ring (overflow, loss marking, a small multi-producer push), the
+// OrderPassed reports (identity, the Wait's upper release bound, the frames that give none, the bounded queue) and
+// Reset. The D3D12 side (hook, fences, completion thread) is not covered here and needs live runs.
 // The clock is scripted at 1 MHz so one tick is one microsecond.
 
 #include "gpu_queue_probe_core.h"
@@ -39,6 +40,11 @@ namespace
     bool Near(double a, double b, double eps = 1e-9)
     {
         return std::fabs(a - b) <= eps;
+    }
+
+    PacingPlanKey PlanKey(uint64_t frame)
+    {
+        return PacingPlanKey{PacingIdentityDomain::NvApiFrame, 5, 7, frame};
     }
 
     struct Sub {
@@ -181,6 +187,15 @@ namespace
             return out;
         }
 
+        // The OrderPassed reports queued so far, oldest first (consumer side: after Drain / Flush).
+        std::vector<GpuQueueProbeCore::OrderPassed> Reports()
+        {
+            std::vector<GpuQueueProbeCore::OrderPassed> out;
+            GpuQueueProbeCore::OrderPassed r;
+            while (c->PopOrderPassed(&r)) out.push_back(r);
+            return out;
+        }
+
         void HoldAnnounce(uint64_t fence, uint64_t wait_value, int64_t enq, uint64_t law_hold_sequence = 0)
         {
             GpuQueueEvent e;
@@ -192,7 +207,10 @@ namespace
             CHECK(c->Push(e));
         }
 
-        void HoldEvent(uint64_t fence, uint64_t wait_value, int64_t enq, int64_t release)
+        // The hold's release; `order_key` and `order_grid_index` are the plan the present-first unit gave with it (grid
+        // index 0 = none).
+        void HoldEvent(uint64_t fence, uint64_t wait_value, int64_t enq, int64_t release,
+                       const PacingPlanKey& order_key = PacingPlanKey{}, uint64_t order_grid_index = 0)
         {
             GpuQueueEvent e;
             e.kind = GpuQueueEvent::Kind::Hold;
@@ -200,6 +218,8 @@ namespace
             e.wait_value = wait_value;
             e.enq_qpc = enq;
             e.release_qpc = release;
+            e.order_key = order_key;
+            e.order_grid_index = order_grid_index;
             CHECK(c->Push(e));
         }
 
@@ -690,6 +710,232 @@ namespace
         for (uint64_t i = 0; i < GpuQueueProbeCore::kHoldCapacity + 2; ++i) h.HoldAnnounce(7, 100 + i, 500);
         h.Drain();
         CHECK(h.c->Statistics().holds_unmatched == 2);
+    }
+
+    // The identity the present-first unit gives with a hold's release comes back as ONE OrderPassed report when the Wait
+    // that matches the hold is accounted: the key and grid index as given, the time the UPPER end of the Wait's release
+    // interval (the queue passed the Wait at or before it), not the hold's release and not the lower end.
+    void TestOrderPassedReport()
+    {
+        // An exact release stamp: the time is that stamp, and the frame's accounting is the usual one.
+        H h;
+        h.Start(150);
+        h.HoldAnnounce(7, h.wait_seq + 1, 500, 41);
+        const Wd w = h.Wait(500, 505, true, 7);
+        const Sub a = h.Submit(1000);
+        h.HoldEvent(7, w.wait_value, 500, 2000, PlanKey(21), 210);
+        h.Stamp(w.release, 2000);
+        h.Stamp(a.done, 2300);
+        h.Boundary(1, 2);
+        h.Drain();
+        std::vector<GpuQueueProbeCore::OrderPassed> reports = h.Reports();
+        CHECK(reports.size() == 1);
+        if (reports.size() == 1) {
+            CHECK(reports[0].key == PlanKey(21) && reports[0].grid_index == 210 && reports[0].qpc == 2000);
+        }
+        CHECK(h.Reports().empty()); // told once
+        const GpuQueueProbeCore::Counters s = h.c->Statistics();
+        CHECK(s.order_passed_reported == 1 && s.order_passed_dropped == 0);
+        const std::vector<Rec> all = h.PopAll();
+        const Rec* f2 = Find(all, 2);
+        CHECK(f2 != nullptr);
+        if (f2 != nullptr) CHECK(f2->valid == kAll && f2->law_hold_sequence == 41 && Near(f2->hold_block_us, 1000.0));
+        CHECK(h.Reports().empty()); // the flush does not tell it again
+
+        // A release known only to lie in [2000, 2100]: the upper end.
+        H g;
+        g.Start(150);
+        g.HoldAnnounce(7, g.wait_seq + 1, 500);
+        const Wd w2 = g.Wait(500, 505, true, 7);
+        const Sub a2 = g.Submit(1000);
+        g.HoldEvent(7, w2.wait_value, 500, 2000, PlanKey(22), 220);
+        g.Stamp(w2.release, 2100, 100.0);
+        g.Stamp(a2.done, 2300);
+        g.Boundary(1, 2);
+        g.Drain();
+        reports = g.Reports();
+        CHECK(reports.size() == 1);
+        if (reports.size() == 1) {
+            CHECK(reports[0].key == PlanKey(22) && reports[0].grid_index == 220 && reports[0].qpc == 2100);
+        }
+    }
+
+    // Two held frames: two reports, in the order the frames are accounted, each with its own plan and time.
+    void TestOrderPassedTwoHolds()
+    {
+        H h;
+        h.Start(150);
+        h.HoldAnnounce(7, h.wait_seq + 1, 500);
+        const Wd w1 = h.Wait(500, 505, true, 7);
+        const Sub a = h.Submit(1000);
+        h.HoldEvent(7, w1.wait_value, 500, 2000, PlanKey(21), 210);
+        h.Stamp(w1.release, 2050, 50.0);
+        h.Stamp(a.done, 2300);
+        h.Boundary(1, 2);
+        h.HoldAnnounce(7, h.wait_seq + 1, 2500);
+        const Wd w2 = h.Wait(2500, 2505, true, 7);
+        const Sub b = h.Submit(3000);
+        h.HoldEvent(7, w2.wait_value, 2500, 4000, PlanKey(22), 220);
+        h.Stamp(w2.release, 4000);
+        h.Stamp(b.done, 4300);
+        h.Boundary(1, 3);
+        h.Drain();
+        const std::vector<GpuQueueProbeCore::OrderPassed> reports = h.Reports();
+        CHECK(reports.size() == 2);
+        if (reports.size() == 2) {
+            CHECK(reports[0].key == PlanKey(21) && reports[0].grid_index == 210 && reports[0].qpc == 2050);
+            CHECK(reports[1].key == PlanKey(22) && reports[1].grid_index == 220 && reports[1].qpc == 4000);
+        }
+    }
+
+    // The identity travels with the hold's release event: until that event is in, the frame waits and nothing is
+    // reported; the report comes with the accounting that follows it.
+    void TestOrderPassedWaitsForTheHoldEvent()
+    {
+        H h;
+        h.Start(150);
+        h.HoldAnnounce(7, h.wait_seq + 1, 500);
+        const Wd w = h.Wait(500, 505, true, 7);
+        const Sub a = h.Submit(1000);
+        h.Stamp(w.release, 2000);
+        h.Stamp(a.done, 2300);
+        h.Boundary(1, 2);
+        h.Drain();
+        CHECK(h.Reports().empty());
+        h.HoldEvent(7, w.wait_value, 500, 2000, PlanKey(21), 210);
+        h.Drain();
+        const std::vector<GpuQueueProbeCore::OrderPassed> reports = h.Reports();
+        CHECK(reports.size() == 1);
+        if (reports.size() == 1) CHECK(reports[0].grid_index == 210 && reports[0].qpc == 2000);
+    }
+
+    // A hold without a complete identity (the unit gave none: the order was not in effect for the frame) reports nothing,
+    // its Wait accounted as usual.
+    void TestOrderPassedNeedsAnIdentity()
+    {
+        const PacingPlanKey no_epoch{PacingIdentityDomain::NvApiFrame, 0, 7, 4};
+        for (int variant = 0; variant < 4; ++variant) {
+            H h;
+            h.Start(150);
+            h.HoldAnnounce(7, h.wait_seq + 1, 500);
+            const Wd w = h.Wait(500, 505, true, 7);
+            const Sub a = h.Submit(1000);
+            if (variant == 0) h.HoldEvent(7, w.wait_value, 500, 2000);                         // none at all
+            else if (variant == 1) h.HoldEvent(7, w.wait_value, 500, 2000, PlanKey(21), 0);    // no grid index
+            else if (variant == 2) h.HoldEvent(7, w.wait_value, 500, 2000, no_epoch, 210);     // a key that is not valid
+            else h.HoldEvent(7, w.wait_value, 500, 2000, PacingPlanKey{}, 210);                // no key
+            h.Stamp(w.release, 2000);
+            h.Stamp(a.done, 2300);
+            h.Boundary(1, 2);
+            const std::vector<Rec> all = h.PopAll();
+            const Rec* f2 = Find(all, 2);
+            CHECK(f2 != nullptr);
+            if (f2 != nullptr) CHECK(f2->valid == kAll);
+            CHECK(h.Reports().empty() && h.c->Statistics().order_passed_reported == 0);
+        }
+    }
+
+    // The report needs the Wait's release interval, trusted, and a frame whose events are whole: no release marker (the
+    // Signal behind the Wait failed), overlapping producers, a lost event, a marker found tainted, or a hold whose release
+    // never arrived leave it out.
+    void TestOrderPassedNeedsAWholeFrame()
+    {
+        for (int variant = 0; variant < 5; ++variant) {
+            H h;
+            h.Start(150);
+            h.HoldAnnounce(7, h.wait_seq + 1, 500);
+            const Wd w = h.Wait(500, 505, variant != 0, 7);     // 0: no release marker
+            if (variant == 1) h.overlap_next = true;            // 1: producers overlapped
+            if (variant == 2) h.c->NoteLost();                  // 2: an event was lost
+            const Sub a = h.Submit(1000);
+            if (variant != 4) h.HoldEvent(7, w.wait_value, 500, 2000, PlanKey(21), 210); // 4: the release never arrives
+            if (variant != 0) h.Stamp(w.release, 2000);
+            h.Stamp(a.done, 2300);
+            if (variant == 3) {                                 // 3: the Wait's marker was found tainted
+                h.Drain();
+                h.c->OnUntrusted(w.release);
+            }
+            h.Boundary(1, 2);
+            h.PopAll(); // the flush gives up on a hold whose release is still missing
+            CHECK(h.Reports().empty() && h.c->Statistics().order_passed_reported == 0);
+        }
+    }
+
+    // The Wait's submission needs a known predecessor: frame 2's done marker is untrusted, so the done chain breaks and
+    // frame 3 (whole, its own markers fine) reports nothing; frame 4, after a trusted completion, does.
+    void TestOrderPassedNeedsAKnownPredecessor()
+    {
+        H h;
+        h.Start(150);
+        h.opts.untrusted = true; // frame 2's marker is untrusted at publication
+        const Sub a = h.Submit(1000);
+        h.Stamp(a.done, 100);
+        h.Boundary(1, 2);
+        h.HoldAnnounce(7, h.wait_seq + 1, 1500);
+        const Wd w3 = h.Wait(1500, 1505, true, 7);
+        const Sub b = h.Submit(2000);
+        h.HoldEvent(7, w3.wait_value, 1500, 2500, PlanKey(31), 310);
+        h.Stamp(w3.release, 2500);
+        h.Stamp(b.done, 2700);
+        h.Boundary(1, 3);
+        h.HoldAnnounce(7, h.wait_seq + 1, 3000);
+        const Wd w4 = h.Wait(3000, 3005, true, 7);
+        const Sub c = h.Submit(3500);
+        h.HoldEvent(7, w4.wait_value, 3000, 4000, PlanKey(41), 410);
+        h.Stamp(w4.release, 4000);
+        h.Stamp(c.done, 4200);
+        h.Boundary(1, 4);
+        h.Drain();
+        const std::vector<GpuQueueProbeCore::OrderPassed> reports = h.Reports();
+        CHECK(reports.size() == 1);
+        if (reports.size() == 1) CHECK(reports[0].key == PlanKey(41) && reports[0].grid_index == 410 && reports[0].qpc == 4000);
+        CHECK(h.c->Statistics().markers_untrusted >= 1);
+    }
+
+    // One held frame behind Start()'s warm-up, the n-th (n from 1): its hold carries the plan {PlanKey(n), 100 + n}, its
+    // Wait's release is stamped 10000 n + 2000.
+    void HeldFrame(H& h, uint64_t n)
+    {
+        const int64_t base = 10000 * static_cast<int64_t>(n);
+        h.HoldAnnounce(7, h.wait_seq + 1, base + 500);
+        const Wd w = h.Wait(base + 500, base + 505, true, 7);
+        const Sub a = h.Submit(base + 1000);
+        h.HoldEvent(7, w.wait_value, base + 500, base + 2000, PlanKey(n), 100 + n);
+        h.Stamp(w.release, base + 2000);
+        h.Stamp(a.done, base + 2300);
+        h.Boundary(1, 1 + n);
+    }
+
+    // The reports wait for the consumer in a queue of kOrderReportCapacity: a full queue drops the new report and counts
+    // it, popping makes room, and Reset empties the queue.
+    void TestOrderPassedQueueBound()
+    {
+        constexpr uint64_t kExtra = 3;
+        constexpr uint64_t kFrames = GpuQueueProbeCore::kOrderReportCapacity + kExtra;
+        H h;
+        h.Start(150);
+        for (uint64_t n = 1; n <= kFrames; ++n) {
+            HeldFrame(h, n);
+            h.Ready(); // the frames are taken, the reports stay
+        }
+        const GpuQueueProbeCore::Counters s = h.c->Statistics();
+        CHECK(s.order_passed_reported == GpuQueueProbeCore::kOrderReportCapacity && s.order_passed_dropped == kExtra);
+        std::vector<GpuQueueProbeCore::OrderPassed> reports = h.Reports();
+        CHECK(reports.size() == GpuQueueProbeCore::kOrderReportCapacity);
+        for (size_t i = 0; i < reports.size(); ++i) {
+            const uint64_t n = static_cast<uint64_t>(i) + 1;
+            CHECK(reports[i].key == PlanKey(n) && reports[i].grid_index == 100 + n);
+            CHECK(reports[i].qpc == 10000 * static_cast<int64_t>(n) + 2000);
+        }
+        CHECK(h.Reports().empty());
+        HeldFrame(h, kFrames + 1); // room again
+        h.Ready();
+        reports = h.Reports();
+        CHECK(reports.size() == 1 && reports[0].grid_index == 100 + kFrames + 1);
+        HeldFrame(h, kFrames + 2);
+        h.Ready();
+        h.c->Reset(kFreq);
+        CHECK(h.Reports().empty());
     }
 
     // The queue law's hold sequence travels with the announce to the record of the frame queued behind that hold.
@@ -2475,6 +2721,13 @@ int main()
     TestHoldReleaseArrivesAfterCompletion();
     TestLawHoldSequenceReachesTheFrameRecord();
     TestHoldReleaseNeverArrives();
+    TestOrderPassedReport();
+    TestOrderPassedTwoHolds();
+    TestOrderPassedWaitsForTheHoldEvent();
+    TestOrderPassedNeedsAnIdentity();
+    TestOrderPassedNeedsAWholeFrame();
+    TestOrderPassedNeedsAKnownPredecessor();
+    TestOrderPassedQueueBound();
     TestAnnouncedHoldWithoutWait();
     TestHoldBoundedByWhenQueueReachedIt();
     TestWaitReleaseUnknown();

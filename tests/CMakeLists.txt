@@ -26,9 +26,9 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     target_link_libraries(test_fg_input_observer PRIVATE advapi32)
     set_property(TARGET test_fg_input_observer PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     add_test(NAME fg_input_observer COMMAND test_fg_input_observer)
-    # The REAL present-first unit (src/gpu_hold_order.cpp, included by the test) against fake fences, on one thread: what its
-    # release thread tells the pacer when a held frame's Present was processed. Stubs stand for the probe, the pacer's
-    # queue and the logger.
+    # The REAL present-first unit (src/gpu_hold_order.cpp, included by the test) against fake fences, on one thread: which
+    # of its releases carry a held frame's plan identity for the probe (which reports the order Wait passed). Stubs stand
+    # for the probe and the logger.
     add_executable(test_gpu_hold_order test_gpu_hold_order.cpp)
     target_compile_features(test_gpu_hold_order PRIVATE cxx_std_17)
     target_include_directories(test_gpu_hold_order PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -435,8 +435,9 @@ endif()
 # The REAL gpu_queue_probe glue (src/gpu_queue_probe_d3d12.cpp, src/streamline_queue_hooks.cpp with the pure core, borrow and
 # dependency units) against FAKE D3D12 queue / fence / device objects (gpu_queue_glue_support.h/.cpp: hand-written COM vtables, a
 # fake GPU thread, stubs of the glue's externals; no GPU). x64 only: the probe does not exist on Win32.
-#   test_gpu_queue_glue    ctest, functional: adoption of a render queue (role 3), borrowed markers, the Wait path, the worker's records,
-#                          a short interleaved three-thread run, a foreign Signal, the end of the session (see its header).
+#   test_gpu_queue_glue    ctest, functional: adoption of a render queue (role 3), borrowed markers, the Wait path, the report that the
+#                          queue passed a hold's order Wait, the worker's records, a short interleaved three-thread run, a foreign
+#                          Signal, the end of the session (see its header).
 #                          gpu_queue_glue adopts through the test seam (RELIMITER_GLUE_TEST_SEAM, src/gpu_queue_probe_test_seam.h);
 #                          gpu_queue_glue_rule lets the dependency rule decide and is SKIPPED (77) when it does not pick the render queue.
 #   bench_gpu_queue_hooks  NOT a ctest: nanoseconds per Execute + borrowed Signal pair and per unsatisfied Wait through the real detours.

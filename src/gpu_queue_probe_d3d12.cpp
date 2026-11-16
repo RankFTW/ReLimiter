@@ -5,6 +5,7 @@
 #include "gpu_readiness_d3d12_queue.h"
 #include "streamline_queue_hooks.h"
 #include "gpu_queue_law_feed.h"
+#include "gpu_present_gate.h"
 #include "logger.h"
 #include "startup_breadcrumb.h"
 #include "pacing_telemetry.h"
@@ -963,7 +964,16 @@ void LogCosts(const char* reason, const Thread* t) noexcept {
     g.summary_logged.store(true, std::memory_order_relaxed);
 }
 
+// The reports that the render queue passed an order Wait (the core queues one per hold whose release carried a plan's
+// identity, when it accounts that Wait): handed to the gate, which pushes the stage event OrderPassed. The completion
+// thread only (the core's consumer side); no lock of the probe is held, and none is taken.
+void PopOrderPassed() noexcept {
+    GpuQueueProbeCore::OrderPassed report;
+    while (g_core.PopOrderPassed(&report)) GpuPresent_PushOrderPassed(report.key, report.grid_index, report.qpc);
+}
+
 void PopFrames() noexcept {
+    PopOrderPassed(); // the reports of what the last Drain accounted, whether or not a frame record is ready
     constexpr size_t kPopBatch = GpuQueueProbeCore::kFrameCapacity;
     for (;;) {
         PacingGpuQueueRecord batch[kPopBatch];
@@ -2252,10 +2262,12 @@ void GpuQueueProbe_OnFgPresentSiteActive(void* presenting_queue, uint64_t swapch
     DependencyEvaluateAfterBoundary(nullptr);
 }
 
-// ReLimiter's own hold Wait released (the gate's CPU Signal of the time fence): the Hold event pairs
-// with the Wait event of the same (fence, value). Admitted into the session like every boundary callback.
+// ReLimiter's own hold Wait released (the gate's CPU Signal of the time fence, or the present-first unit's order Signal): the
+// Hold event pairs with the Wait event of the same (fence, value) and carries the plan identity the unit gave for a frame
+// its order was in effect for (the core reports the Wait passed under it). Admitted into the session like every boundary
+// callback.
 void GpuQueueProbe_OnHoldRelease(void* native_queue, const void* fence, uint64_t wait_value, int64_t wait_enq_qpc,
-    int64_t release_qpc) noexcept {
+    int64_t release_qpc, const PacingPlanKey& order_key, uint64_t order_grid_index) noexcept {
     if (!g_gpu_queue_probe.load(std::memory_order_relaxed)) return;
     if (g.identity.load(std::memory_order_acquire) != static_cast<ID3D12CommandQueue*>(native_queue)) return;
     const uint32_t generation = g.session_generation.load(std::memory_order_acquire);
@@ -2269,6 +2281,10 @@ void GpuQueueProbe_OnHoldRelease(void* native_queue, const void* fence, uint64_t
         event.wait_value = wait_value;
         event.enq_qpc = wait_enq_qpc;
         event.release_qpc = release_qpc;
+        if (order_grid_index != 0 && PacingPlanKey_IsValid(order_key)) { // the plan to report the Wait passed under
+            event.order_key = order_key;
+            event.order_grid_index = order_grid_index;
+        }
         g_core.Push(event);
     }
     g.callbacks_inflight.fetch_sub(1);

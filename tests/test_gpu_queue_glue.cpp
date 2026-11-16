@@ -14,6 +14,9 @@
 //   3. records reach the pop with valid frames: identity (swapchain generation, present sequence, key), submit counts equal
 //      to the frame's real submissions, borrowed_submits > 0, a done time;
 //   4. unsatisfied Waits on the adopted queue produce one own probe Signal each, satisfied Waits none;
+//   4b. a hold announced, its order Wait on the adopted queue (an unsatisfied Wait) and its release carrying a plan's identity:
+//      the worker accounts the frame and the glue hands one report per frame to the gate's push (GpuPresent_PushOrderPassed),
+//      with that identity and a time between the Wait's enqueue and the end of the run;
 //   5. a short interleaved three-thread run (render thread, Present thread, a second submitter racing every tenth frame's
 //      boundary on the adopted queue): no valid record has a wrong submit count, no identity is duplicated, and the
 //      submissions of the racing pair of frames are conserved when both are valid (in-flight
@@ -46,6 +49,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -93,6 +97,14 @@ void CheckIdentity(const Game& game, const Record& r) {
     CHECK(r.queue_role == 3);
     CHECK(r.session_generation != 0);
 }
+
+int64_t NowQpc() {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart;
+}
+// The plan a held frame carries (the present-first unit's: a valid key, a grid index).
+PacingPlanKey HeldKey(uint64_t sequence) { return PacingPlanKey{PacingIdentityDomain::NvApiFrame, 5, 7, sequence}; }
 
 // ── 1/2/3: the borrowed steady state ──
 void PhaseBorrowed(Game& game) {
@@ -174,6 +186,70 @@ void PhaseWaits(Game& game) {
         CHECKM(r.submits == Game::Submissions(r.present_sequence), "wait frame %llu has %u submissions", static_cast<unsigned long long>(r.present_sequence), r.submits);
     }
     std::printf("ok: Waits: %u unsatisfied -> %u own Signals, 4 satisfied -> 0\n", kWaitFrames, kWaitFrames);
+}
+
+// ── 4b: the report that the queue passed a held frame's order Wait ──
+// A frame the present-first unit ordered, as the probe sees it: the hold announced (before the order Wait goes on the queue), an
+// unsatisfied Wait of the gate fence on the adopted queue (the order Wait: the probe's own Signal behind it is the Wait's release
+// marker), the hold's release carrying the plan's identity, the gate fence advanced (the queue passes the Wait), the frame's
+// boundary. The worker accounts a frame once its markers have completed and the glue hands the core's report to the gate's push:
+// at most one report per frame, with the identity the release gave and a time at or after the Wait's enqueue (the upper end of
+// the Wait's release interval: the queue passed the Wait at or before it). A frame the accounting cannot trust gives none, so,
+// as for the records of the borrowed steady state, half of the frames are required.
+void PhaseOrderPassed(Game& game) {
+    constexpr unsigned kFrames = 24;
+    constexpr uint64_t kGridBase = 1000;
+    const size_t reports0 = glue::OrderReports().size();
+    const uint64_t first = game.frame + 1;
+    std::map<uint64_t, int64_t> enqueued; // frame -> the order Wait's enqueue time
+    for (unsigned f = 0; f < kFrames; ++f) {
+        const uint64_t sequence = game.frame + 1;
+        const uint64_t value = game.gate_value.load(std::memory_order_relaxed) + 1; // what WaitUnsatisfied takes next
+        GpuQueueProbe_OnHoldAnnounce(glue::Com(game.render), glue::Com(game.gate), value, NowQpc(), 0);
+        for (unsigned i = 0, n = Game::Submissions(sequence); i < n; ++i) {
+            game.Submit();
+            if (i != 1) continue;
+            enqueued[sequence] = NowQpc();
+            CHECK(game.WaitUnsatisfied() == value);
+            GpuQueueProbe_OnHoldRelease(glue::Com(game.render), glue::Com(game.gate), value, enqueued[sequence], NowQpc(),
+                HeldKey(sequence), kGridBase + sequence);
+            game.gate->Advance(value); // the queue passes the Wait
+        }
+        game.BoundarySignal(sequence);
+        game.PresentSide(sequence);
+        game.frame = sequence;
+        Sleep(1);
+    }
+    const uint64_t last = game.frame;
+    game.PlayFrame();
+    Sleep(1);
+    WaitRecords(last, "ordered frames");
+    // The reports leave with the accounting of the frames, ahead of the records popped with it.
+    std::vector<glue::OrderReport> reports;
+    for (int i = 0; i < 2500; ++i) {
+        reports = glue::OrderReports();
+        if (reports.size() - reports0 >= kFrames / 2) break;
+        Sleep(2);
+    }
+    const int64_t end = NowQpc();
+    CHECKM(reports.size() - reports0 >= kFrames / 2, "%zu of %u ordered frames were reported passed", reports.size() - reports0,
+        kFrames);
+    std::set<uint64_t> seen;
+    for (size_t i = reports0; i < reports.size(); ++i) {
+        const glue::OrderReport& report = reports[i];
+        const uint64_t sequence = report.key.frame_id;
+        CHECKM(sequence >= first && sequence <= last && enqueued.count(sequence) == 1, "a report for frame %llu, which the test did not order",
+            static_cast<unsigned long long>(sequence));
+        CHECKM(report.key == HeldKey(sequence) && report.grid_index == kGridBase + sequence,
+            "the report of frame %llu carries another identity (grid index %llu)", static_cast<unsigned long long>(sequence),
+            static_cast<unsigned long long>(report.grid_index));
+        CHECKM(seen.insert(sequence).second, "frame %llu was reported twice", static_cast<unsigned long long>(sequence));
+        CHECKM(report.qpc >= enqueued[sequence] && report.qpc <= end, "the report of frame %llu is at %lld, outside [%lld, %lld]",
+            static_cast<unsigned long long>(sequence), static_cast<long long>(report.qpc), static_cast<long long>(enqueued[sequence]),
+            static_cast<long long>(end));
+    }
+    std::printf("ok: order passed: %zu of %u ordered frames reported once each, with the release's identity and a time after the Wait's enqueue\n",
+        reports.size() - reports0, kFrames);
 }
 
 // ── 5: three threads ──
@@ -1082,6 +1158,7 @@ int main(int argc, char** argv) {
     } else {
         PhaseBorrowed(game);
         PhaseWaits(game);
+        PhaseOrderPassed(game);
         PhaseRace(game);
         PhaseForeign(game);
         PhaseShutdown(game);

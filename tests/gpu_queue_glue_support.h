@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "pacing_core_types.h"
 #include "pacing_telemetry_types.h"
 
 // The production detours (src/streamline_queue_hooks.cpp, external linkage in that namespace).
@@ -133,6 +134,14 @@ bool VerifyVtableLayout(std::string* detail);
 bool LogContains(const char* text);
 void DumpLog(std::FILE* out, size_t last_lines);
 std::vector<PacingGpuQueueRecord> Records(); // every record the worker popped so far, in pop order
+// What the glue handed to the gate's GpuPresent_PushOrderPassed (the probe's reports that the queue passed a hold's order
+// Wait), in push order.
+struct OrderReport {
+    PacingPlanKey key;
+    uint64_t grid_index;
+    int64_t qpc;
+};
+std::vector<OrderReport> OrderReports();
 // Waits until a record with present_sequence >= sequence was popped.
 bool WaitForRecordSequence(uint64_t sequence, DWORD timeout_ms);
 

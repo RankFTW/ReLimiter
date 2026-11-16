@@ -5,6 +5,7 @@
 
 #include "gpu_queue_law_feed.h"
 #include "gpu_queue_probe.h"
+#include "gpu_present_gate.h"
 #include "gpu_queue_probe_test_seam.h"
 #include "gpu_readiness_d3d12_queue.h"
 #include "hooks.h"
@@ -241,6 +242,8 @@ std::mutex g_log_lock;
 std::vector<std::string> g_log;
 std::mutex g_records_lock;
 std::vector<PacingGpuQueueRecord> g_records;
+std::mutex g_order_lock;
+std::vector<OrderReport> g_order_reports;
 bool g_log_echo = GetEnvironmentVariableA("GLUE_LOG", nullptr, 0) > 0;
 
 } // namespace
@@ -412,6 +415,10 @@ void DumpLog(std::FILE* out, size_t last_lines) {
 std::vector<PacingGpuQueueRecord> Records() {
     std::lock_guard<std::mutex> guard(g_records_lock);
     return g_records;
+}
+std::vector<OrderReport> OrderReports() {
+    std::lock_guard<std::mutex> guard(g_order_lock);
+    return g_order_reports;
 }
 bool WaitForRecordSequence(uint64_t sequence, DWORD timeout_ms) {
     const ULONGLONG deadline = GetTickCount64() + timeout_ms;
@@ -601,4 +608,9 @@ void PacingTelemetry_PushGpuQueue(const PacingGpuQueueRecord& record) noexcept {
     glue::g_records.push_back(record);
 }
 void GpuQueueLawFeed_Push(const PacingGpuQueueRecord&) noexcept {}
+// The glue hands the probe's OrderPassed reports to the gate's push: the tests read what it was given.
+void GpuPresent_PushOrderPassed(const PacingPlanKey& key, uint64_t grid_index, int64_t qpc) noexcept {
+    std::lock_guard<std::mutex> guard(glue::g_order_lock);
+    glue::g_order_reports.push_back({key, grid_index, qpc});
+}
 void GpuQueueLawFeed_RetireSession(uint32_t) noexcept {}

@@ -67,12 +67,19 @@ void GpuQueueProbe_OnGateEnqueue(void* native_queue) noexcept;
 void GpuQueueProbe_OnHoldAnnounce(void* native_queue, const void* fence, uint64_t wait_value,
     int64_t wait_enq_qpc, uint64_t law_hold_sequence) noexcept;
 // ReLimiter's own hold Wait was released (the gate's CPU Signal of the time fence, on the gate's
-// worker thread; also the frame generation input tickets): the Hold event that pairs with the Wait
-// event of the same (fence, wait value). wait_enq_qpc: when the hold's Wait was enqueued;
-// release_qpc: the gate's release (signal_before_qpc). Key off: one relaxed load and a branch at the
-// call site; the call is a no-op for any other queue.
+// worker thread; also the frame generation input tickets; or the order Wait of the present-first unit, gpu_hold_order.h,
+// on its release thread): the Hold event that pairs with the Wait event of the same (fence, wait value). wait_enq_qpc:
+// when the hold's Wait was enqueued; release_qpc: the release's own time (the gate's, or the unit's pass). Key off: one
+// relaxed load and a branch at the call site; the call is a no-op for any other queue.
+// order_key / order_grid_index: the plan identity of the held frame whose order Wait this releases, given by the unit
+// for a frame the order was in effect for (its Wait on the render queue, nothing passed in front of it, the render
+// queue stood at it) and by nobody else (the gate's own releases pass an empty key and 0: none). The probe reports it
+// as OrderPassed (GpuPresent_PushOrderPassed, from its completion thread) when its accounting resolves the release of
+// that Wait with a trusted interval: the render queue passed the Wait at or before the interval's upper end. A frame
+// whose Wait it cannot resolve is not reported.
+struct PacingPlanKey;
 void GpuQueueProbe_OnHoldRelease(void* native_queue, const void* fence, uint64_t wait_value, int64_t wait_enq_qpc,
-    int64_t release_qpc) noexcept;
+    int64_t release_qpc, const PacingPlanKey& order_key, uint64_t order_grid_index) noexcept;
 // The queue was destroyed (any thread): the probe lets go of it once its thread acknowledges.
 void GpuQueueProbe_OnQueueDestroy(void* native_queue) noexcept;
 // Stops and joins the completion thread (bounded) and releases the COM references. False when

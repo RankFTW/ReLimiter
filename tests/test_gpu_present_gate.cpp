@@ -192,7 +192,7 @@ StreamlineQueueOwnedScope::~StreamlineQueueOwnedScope() {}
 // gpu_queue_probe (the D3D12 side is not linked here; the key stays off in these tests).
 void GpuQueueProbe_OnGateEnqueue(void*) noexcept {}
 void GpuQueueProbe_OnFgInputBoundary(void*,uint64_t,const PacingFrameKey&) noexcept {}
-void GpuQueueProbe_OnHoldRelease(void*,const void*,uint64_t,int64_t,int64_t) noexcept {}
+void GpuQueueProbe_OnHoldRelease(void*,const void*,uint64_t,int64_t,int64_t,const PacingPlanKey&,uint64_t) noexcept {}
 void GpuQueueProbe_OnHoldAnnounce(void*,const void*,uint64_t,int64_t,uint64_t) noexcept {}
 IUnknown* SwapMgr_AcquirePresentingDevice() noexcept {return nullptr;}
 void HWSpin(int64_t target) {fake_clock=(std::max)(fake_clock,target);}
@@ -1019,24 +1019,24 @@ void TestQueueDiscoveryAfterCleanup() {
     for(size_t i=1;i<queues.size();++i)queues[i].state=QueueState::Failed; // fixture: exhaust lifetime capacity
     CHECK(!FindOrRequest(address+1,&trace) && trace.status==GpuPresentStatus::RegistryFull);
 }
-// The hold order unit's report that a held frame's Present was processed (gpu_hold_order.h): one PresentProcessed event
-// for the plan's frame on the GPU queue wait rung, status Unknown, with the unit's stamp, from any thread; nothing for
-// an identity that is not valid or a time that is not positive.
-void TestPresentProcessed() {
+// The probe's report that the render queue passed a held frame's order Wait (gpu_queue_probe_core.h, gpu_hold_order.h):
+// one OrderPassed event for the plan's frame on the GPU queue wait rung, status Unknown, with the probe's stamp, from any
+// thread; nothing for an identity that is not valid or a time that is not positive.
+void TestOrderPassed() {
     FrameTimeline_BeginProducerEpoch(FrameIdentityDomain::NvApiFrame);FrameTimeline_BeginControllerGeneration();
     CHECK(PacingPlanKey_IsValid(PlanKey(1)));
     PacingStageEvent drained;while(FramePlan_PopStageEvent(&drained)) {}
-    GpuPresent_PushPresentProcessed(PlanKey(7),7,fake_clock+25);
-    ExpectStage(7,7,PacingStageEventKind::PresentProcessed,fake_clock+25);
+    GpuPresent_PushOrderPassed(PlanKey(7),7,fake_clock+25);
+    ExpectStage(7,7,PacingStageEventKind::OrderPassed,fake_clock+25);
     ExpectNoStage();
-    GpuPresent_PushPresentProcessed(PlanKey(8),0,fake_clock+25);       // no grid index
-    GpuPresent_PushPresentProcessed(PacingPlanKey{},9,fake_clock+25);  // no key
-    GpuPresent_PushPresentProcessed(PlanKey(10),10,0);                 // no time
+    GpuPresent_PushOrderPassed(PlanKey(8),0,fake_clock+25);       // no grid index
+    GpuPresent_PushOrderPassed(PacingPlanKey{},9,fake_clock+25);  // no key
+    GpuPresent_PushOrderPassed(PlanKey(10),10,0);                 // no time
     ExpectNoStage();
-    // The unit's release thread is not the Present thread: the queue takes the push from another thread.
+    // The probe's completion thread is not the Present thread: the queue takes the push from another thread.
     const auto key=PlanKey(11);
-    std::thread([&] {GpuPresent_PushPresentProcessed(key,11,fake_clock+3);}).join();
-    ExpectStage(11,11,PacingStageEventKind::PresentProcessed,fake_clock+3);
+    std::thread([&] {GpuPresent_PushOrderPassed(key,11,fake_clock+3);}).join();
+    ExpectStage(11,11,PacingStageEventKind::OrderPassed,fake_clock+3);
     ExpectNoStage();
 }
 #endif
@@ -1053,7 +1053,7 @@ int main() {
     TestWorkerModeLifecycle();
     TestQueueReclamation();
     TestExecutor();
-    TestPresentProcessed();
+    TestOrderPassed();
     TestQueueDiscoveryAfterCleanup();
 #endif
     std::puts("GPU Present gate tests passed; driver fakes, not displayed pacing proof.");

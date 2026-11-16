@@ -3,7 +3,6 @@
 #include "gpu_hold_order_rule.h"
 #include "fg_present_order.h"
 #include "gpu_queue_probe.h"
-#include "gpu_present_gate.h"
 #include "pacing_resolver.h"
 #include "runtime_lifecycle.h"
 #include "streamline_hooks.h"
@@ -32,10 +31,10 @@
 //      release while the gate has not released the hold is the gate's own delay (the runtime can hold up its Signal of
 //      the time fence): the Wait is let go, the release is counted and said, and the rule is told nothing. Every Wait
 //      its Present released tells the rule (OnReleased), and enough of them in a row forgive its trips.
-//      A value let go because `issued` reached it is also reported to the pacer when the order was in effect for its
-//      frame's edge (its Wait went on R's queue with nothing of another thread in front of it, and R stood at it): the
-//      stage event PresentProcessed of the plan its hold belongs to, once and after the lock, stamped by a clock read
-//      behind the pass's read of `issued` (ReleaseThroughLocked, Pass, FlushProcessed).
+//      A value let go because `issued` reached it, when the order was in effect for its frame's edge (its Wait went on
+//      R's queue with nothing of another thread in front of it, and R stood at it), gives the probe the plan's identity
+//      with the release the probe is told anyway (ReleaseThroughLocked, TellRelease, Flush): the probe reports the Wait
+//      passed, as the stage event OrderPassed, once it has resolved when the render queue passed it.
 // Locks. `lock` guards the binding, the rule, the books, the edges and the values' side data; it is held for loads and
 // stores and for the CPU side of the unit's own fences, never across a native queue call, a call into the probe or a
 // log line. `track_lock` guards the Signal histories and Execute counts of the followed fences: the Signal and Execute
@@ -90,7 +89,7 @@ struct Counters {
     std::atomic<uint64_t> wait_count{0}, wait_sum_us{0}, wait_max_us{0}; // reached -> release
     std::atomic<uint64_t> enqueue_failures{0}, issue_failures{0}, release_failures{0};
     std::atomic<uint64_t> dropped{0}, lost_edges{0};
-    std::atomic<uint64_t> processed{0};      // held frames' Presents told to the pacer as processed (PresentProcessed)
+    std::atomic<uint64_t> processed{0};      // releases that gave the probe a plan's identity (it reports OrderPassed)
 };
 Counters counters;
 
@@ -281,7 +280,7 @@ struct Pending {
     const void* hold_fence = nullptr;        // the gate's time fence and ticket: this hold's identity
     uint64_t hold_ticket = 0, law_sequence = 0, swapchain = 0;
     int64_t target = 0, interval = 0;
-    PacingPlanKey key{};                     // the plan's identity, for the stage event PresentProcessed
+    PacingPlanKey key{};                     // the plan's identity, given to the probe when the order was in effect
     uint64_t grid_index = 0;
     WaitSeen deps[kWaitsSeen];               // the Waits of P this Present depends on, the newest first
     unsigned dep_count = 0;
@@ -333,12 +332,14 @@ struct Meta {
     uint64_t value = 0;                      // 0 = free
     const void* hold_fence = nullptr;
     uint64_t hold_ticket = 0, law_sequence = 0;
-    PacingPlanKey key{};                     // the plan's identity, reported when the Present was processed
+    PacingPlanKey key{};                     // the plan's identity: the probe gets it when the order was in effect
     uint64_t grid_index = 0;
     void* render = nullptr;                  // the queue and fence of the order Wait, as announced
     const void* order = nullptr;
     int64_t enqueued = 0;                    // the announce's time
     bool clean = false;                      // the check after the Wait found no Execute of another thread in front of it
+    bool report = false;                     // its Present released it with R standing at it and nothing in front: the
+                                             // release the probe is told carries the plan's identity
     Told told;
 };
 Meta metas[kMetas];
@@ -356,40 +357,27 @@ std::atomic<bool> thread_running{false}, thread_idle{false};
 std::atomic<int64_t> served_qpc{0};
 
 // ── Probe releases are collected under the lock and told after it ──
-struct ProbeRelease { void* render; const void* order; uint64_t value; int64_t enqueued, release; };
+// A release carries the plan's identity (`grid_index` 0 = none) when the order was in effect for its frame: the probe
+// reports the Wait passed under it once it has resolved the Wait's release (gpu_queue_probe.h). The queue takes any
+// thread; no lock of the unit is held while it is told.
+struct ProbeRelease { void* render; const void* order; uint64_t value; int64_t enqueued, release; PacingPlanKey key; uint64_t grid_index; };
 struct ProbeReleases {
     ProbeRelease items[kMetas];
     unsigned count = 0;
-    void Add(void* render, const void* order, uint64_t value, int64_t enqueued, int64_t release_qpc) noexcept {
-        if (count < kMetas) items[count++] = {render, order, value, enqueued, release_qpc};
+    void Add(void* render, const void* order, uint64_t value, int64_t enqueued, int64_t release_qpc,
+        const PacingPlanKey& key = PacingPlanKey{}, uint64_t grid_index = 0) noexcept {
+        if (count < kMetas) items[count++] = {render, order, value, enqueued, release_qpc, key, grid_index};
     }
 };
 void Flush(const ProbeReleases& list) noexcept {
-    for (unsigned i = 0; i < list.count; ++i)
-        GpuQueueProbe_OnHoldRelease(list.items[i].render, list.items[i].order, list.items[i].value,
-            list.items[i].enqueued, list.items[i].release);
-}
-
-// ── The pacer is told, after the lock, which held frames' Presents were processed ──
-// Collected under the lock (ReleaseThroughLocked, How::Issued) and told after it, like the probe's releases. A hold is
-// reported only when the order was in effect for its frame's edge (`clean`: nothing of another thread passed in front
-// of its Wait; the caller has seen R stand at it) and its plan gave an identity. The queue takes any thread; no lock of
-// the unit is held while it is told. `stamp`: the clock read the pass took behind its read of `issued` (Pass), the one
-// stamp of every report of the pass.
-struct ProcessedReport { PacingPlanKey key{}; uint64_t grid_index = 0; };
-struct ProcessedReports {
-    ProcessedReport items[kMetas];
-    unsigned count = 0;
-    void Add(const Meta& meta) noexcept {
-        if (count < kMetas && meta.clean && meta.grid_index != 0 && PacingPlanKey_IsValid(meta.key))
-            items[count++] = {meta.key, meta.grid_index};
+    uint64_t given = 0;
+    for (unsigned i = 0; i < list.count; ++i) {
+        const ProbeRelease& item = list.items[i];
+        GpuQueueProbe_OnHoldRelease(item.render, item.order, item.value, item.enqueued, item.release, item.key,
+            item.grid_index);
+        if (item.grid_index != 0) ++given;
     }
-};
-void FlushProcessed(const ProcessedReports& list, int64_t stamp) noexcept {
-    if (!list.count) return;
-    for (unsigned i = 0; i < list.count; ++i)
-        GpuPresent_PushPresentProcessed(list.items[i].key, list.items[i].grid_index, stamp);
-    counters.processed.fetch_add(list.count, relaxed);
+    if (given) counters.processed.fetch_add(given, relaxed);
 }
 
 Meta* FindMeta(uint64_t value) noexcept {
@@ -408,9 +396,14 @@ int64_t ReleaseQpc(const Meta& meta, int64_t now) noexcept {
     const int64_t gate = GateReleaseOf(meta.hold_fence, meta.hold_ticket);
     return gate ? (std::max)(gate, meta.enqueued) : now;
 }
-// A release the value's Told state says to tell, collected for after the lock.
+// A release the value's Told state says to tell, collected for after the lock; a frame the order was in effect for
+// (`report`, set when its Present released the Wait) gives the plan's identity with it.
 void TellRelease(bool tell, const Meta& meta, int64_t now, ProbeReleases* probe) noexcept {
-    if (tell) probe->Add(meta.render, meta.order, meta.value, meta.enqueued, ReleaseQpc(meta, now));
+    if (!tell) return;
+    if (meta.report)
+        probe->Add(meta.render, meta.order, meta.value, meta.enqueued, ReleaseQpc(meta, now), meta.key, meta.grid_index);
+    else
+        probe->Add(meta.render, meta.order, meta.value, meta.enqueued, ReleaseQpc(meta, now));
 }
 void FreeIfDone(Meta& meta) noexcept {
     if (!meta.value || !meta.told.Done()) return;
@@ -464,13 +457,13 @@ enum class How { Issued, Late, Watchdog };
 // Lock held. The values up to `value` leave the books, their order Waits released first; `waited_out` gets how many of
 // them had a Wait. Each Wait its Present released tells the rule (OnReleased: enough of them in a row forgive its
 // trips); a late release proves nothing about the order, and the watchdog's is for the caller to judge. A release
-// because `issued` reached the value (How::Issued) says its Present was processed, and the pacer is told so for a frame
-// the order was in effect for: its Wait went on R's queue, nothing of another thread passed in front of it (`clean`) and
-// R stood at it (the entry's `reached`) until this release. Those identities go to `processed`, each once (the entry
-// leaves the books here), to be told after the lock. A frame whose edge was rejected, whose Wait R had not reached or
-// that was raced is not told, nor one let go late or by the watchdog (its Present may still be to run): the pacer would
+// because `issued` reached the value (How::Issued) of a frame the order was in effect for (its Wait went on R's queue,
+// nothing of another thread passed in front of it (`clean`) and R stood at it, the entry's `reached`, until this
+// release) marks its side data `report`: the release the probe is told below carries the plan's identity, and the probe
+// reports the Wait passed once it has resolved it. A frame whose edge was rejected, whose Wait R had not reached or that
+// was raced is not marked, nor one let go late or by the watchdog (its Present may still be to run): the pacer would
 // take the game's own Present time for a wait of the order.
-bool ReleaseThroughLocked(uint64_t value, How how, int64_t now, ProbeReleases* probe, ProcessedReports* processed,
+bool ReleaseThroughLocked(uint64_t value, How how, int64_t now, ProbeReleases* probe,
     uint64_t* waited_out = nullptr) noexcept {
     if (!ReleaseOrderLocked(value)) return false;
     uint64_t waited = 0;
@@ -482,7 +475,8 @@ bool ReleaseThroughLocked(uint64_t value, How how, int64_t now, ProbeReleases* p
         if (how == How::Issued) {
             rule.OnReleased();
             if (entry.reached)
-                if (const Meta* meta = FindMeta(entry.value)) processed->Add(*meta);
+                if (Meta* meta = FindMeta(entry.value))
+                    meta->report = meta->clean && meta->grid_index != 0 && PacingPlanKey_IsValid(meta->key);
         }
     }
     if (waited_out) *waited_out = waited;
@@ -620,13 +614,9 @@ void SayWatchdog(const WatchdogNote& note) noexcept {
 // `next_deadline`: the next moment to look again (the earliest watchdog deadline, or target of a value R has not
 // reached), 0 when none; `outstanding`: values are held (or a Signal is owed), so the thread polls.
 // `now`: the thread's clock read at the top of its iteration, after its wake and in front of this pass's reads of the
-// fences: the pass's time for everything it does (the books' times, the probe's releases, the deadlines). The report
-// to the pacer that a Present was processed takes a clock read of its own, once, behind the read of `issued`
-// (`processed_at`), so it is never before the completion it reports.
+// fences: the pass's time for everything it does (the books' times, the probe's releases, the deadlines).
 bool Pass(int64_t now, int64_t* next_deadline, bool* outstanding) noexcept {
     ProbeReleases probe;
-    ProcessedReports processed;
-    int64_t processed_at = 0;   // the reports' stamp: read behind the read of `issued`, when values are let go by it
     Rule::Change change = Rule::Change::None;
     WatchdogNote note;
     bool alive = true, removed = false;
@@ -657,15 +647,10 @@ bool Pass(int64_t now, int64_t* next_deadline, bool* outstanding) noexcept {
             // The Present is runnable: the values up to the newest issued one it completed are let go.
             uint64_t through = 0;
             for (unsigned i = 0; i < book.count && book.entries[i].value <= issued; ++i) through = book.entries[i].value;
-            if (through) {
-                // The reports' stamp is read here, behind the read of `issued` that showed the Present processed, so
-                // it is never before that completion. Every other use of `now` in this pass stays the pass's own.
-                processed_at = Qpc();
-                ReleaseThroughLocked(through, How::Issued, now, &probe, &processed);
-            }
+            if (through) ReleaseThroughLocked(through, How::Issued, now, &probe);
             // A frame whose hold is over while R has not reached its Wait (or has none yet) has nothing left to
             // protect: it pays nothing for the order. A value R already stands at keeps waiting for its Present.
-            if (const uint64_t late = book.Late(reached, now)) ReleaseThroughLocked(late, How::Late, now, &probe, &processed);
+            if (const uint64_t late = book.Late(reached, now)) ReleaseThroughLocked(late, How::Late, now, &probe);
             if (const uint64_t overdue = book.Overdue(now)) {
                 // Read before the value leaves the books.
                 const Book::Entry* entry = book.Find(overdue);
@@ -688,7 +673,7 @@ bool Pass(int64_t now, int64_t* next_deadline, bool* outstanding) noexcept {
                 const bool gate_late = meta && !seen.gate_release;
                 const bool counts = !gate_late && rule.state != Rule::State::Off;
                 uint64_t released = 0;
-                if (ReleaseThroughLocked(overdue, How::Watchdog, now, &probe, &processed, &released)) {
+                if (ReleaseThroughLocked(overdue, How::Watchdog, now, &probe, &released)) {
                     if (gate_late) {
                         counters.gate_late.fetch_add(released, relaxed);
                         seen.loud = gate_late_said < kGateLateLines;
@@ -713,8 +698,7 @@ bool Pass(int64_t now, int64_t* next_deadline, bool* outstanding) noexcept {
         }
     }
     ReleaseSRWLockExclusive(&lock);
-    // The pacer's events first, then the probe's releases: neither is made under the lock.
-    FlushProcessed(processed, processed_at);
+    // The probe's releases (some carry a plan's identity) are told after the lock, never under it.
     Flush(probe);
     if (removed) LOG_INFO("GPU hold order: the device was removed; the binding is let go");
     if (note.valid) SayWatchdog(note);
@@ -1197,8 +1181,8 @@ Evidence EvidenceOf(const Edge& edge, const void* queue, uint64_t* since, const 
 // After an order Wait went on R's queue: an Execute another thread counted since the judgement (its hook counts in
 // front of the native call) may have landed in front of the Wait. The Wait stays, and is released like any other, but
 // the frame did not qualify after all: it is counted as raced and the rule is told. A Wait nothing passed in front of
-// is marked clean, and only such a frame is told to the pacer when its Present was processed (ReleaseThroughLocked): a
-// release that comes before this check is not told either.
+// is marked clean, and only such a frame gives the probe the plan's identity when its Present releases the Wait
+// (ReleaseThroughLocked): a release that comes before this check gives none either.
 void CheckRaced(uint64_t value, uint64_t generation, const void* queue, const void* witness,
     uint64_t witness_executes) noexcept {
     bool moved = true;   // a track that is gone cannot show that nothing passed

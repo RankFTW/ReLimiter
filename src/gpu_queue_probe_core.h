@@ -59,6 +59,14 @@
 // whose Wait matches the hold takes that sequence into its record (PacingGpuQueueRecord::law_hold_sequence, the same
 // hold that gives hold_block), 0 when no hold matched or the hold had none. The sequence is carried by every record of
 // the frame, whatever its valid bits (an invalid or irregular frame still names its hold, so the law can settle it).
+// A hold may also carry the identity of the plan of the held frame it belongs to (the Hold event's order_key and
+// order_grid_index: the present-first unit gives it, with the release of its order Wait on the adopted queue, for a
+// frame the order was in effect for). When the Wait that matches such a hold is accounted with its release interval
+// known and trusted (the walk is calculable: a known predecessor and every Wait of the submission trusted) in a frame
+// that is neither dropped nor overlapped, the core queues ONE OrderPassed report {key, grid index, r_hi}, r_hi the UPPER
+// end of the Wait's release interval: the queue passed the Wait at or before it. The consumer pops them
+// (PopOrderPassed). Nothing is queued for a hold without an identity, whose release never arrived or whose Wait cannot
+// be trusted: the hold fields of its frame are then invalid, and so is this.
 //
 // Late tags. A Boundary on a dependency queue is pushed at that queue's Signal with a
 // boundary_id (the signalled fence value) and no identity; the identity comes later as a
@@ -162,6 +170,7 @@
 #include <cstdint>
 
 #include "pacing_telemetry_types.h"
+#include "pacing_core_types.h"
 
 struct GpuQueueEvent {
     // Submit:   an ExecuteCommandLists call: index (1-based call order), enq_qpc, done_value (the probe's sequence value k
@@ -175,7 +184,8 @@ struct GpuQueueEvent {
     // HoldAnnounce: ReLimiter's own hold, announced before its Wait is enqueued: fence_id +
     //           wait_value (the same pair as its Wait event), enq_qpc (when the Wait is enqueued),
     //           law_hold_sequence (the queue law's sequence for the grant of this hold; 0 = none).
-    // Hold:     the hold's release: fence_id + wait_value, enq_qpc, release_qpc (the gate's release).
+    // Hold:     the hold's release: fence_id + wait_value, enq_qpc, release_qpc (the gate's release, or the unit's pass), and
+    //           order_key + order_grid_index, the plan to report the Wait passed under (order_grid_index 0 = none).
     // BoundaryTag: a late identity for the boundary with the same boundary_id.
     // Invalidate: the frame in progress (and the one still open to a tag) cannot be trusted; no other field is used.
     enum class Kind : uint8_t { Submit, Boundary, Wait, Hold, HoldAnnounce, BoundaryTag, Invalidate } kind = Kind::Submit;
@@ -199,6 +209,10 @@ struct GpuQueueEvent {
     uint64_t boundary_id = 0;
     // HoldAnnounce: the queue law's hold sequence for the grant of this hold (0 = not a law hold).
     uint64_t law_hold_sequence = 0;
+    // Hold: the plan identity of the held frame whose order Wait this releases (the present-first unit gives it for a
+    // frame the order was in effect for): the core reports it as OrderPassed when it resolves that Wait. Empty / 0 = none.
+    PacingPlanKey order_key{};
+    uint64_t order_grid_index = 0;
     // Submit: the done marker is a Signal of the game's own (bound by gpu_queue_borrow): counted per frame
     // (PacingGpuQueueRecord::borrowed_submits). 0 = the probe's own Signal marks it.
     uint8_t borrowed = 0;
@@ -245,6 +259,7 @@ public:
     static constexpr size_t kWaitCapacity = 512;
     static constexpr size_t kHoldCapacity = 32;
     static constexpr size_t kFrameCapacity = 16;
+    static constexpr size_t kOrderReportCapacity = 32; // OrderPassed reports the consumer has not popped yet
     static constexpr size_t kParkedCapacity = 64; // markers whose Submit/Wait has not arrived yet (bounds + trust together)
     static constexpr uint32_t kIncompleteAfterFrames = 4;
     static constexpr double kMinGuardUs = 20.0;
@@ -352,6 +367,17 @@ public:
     // frame in progress is kept.
     void Flush() noexcept;
 
+    // One report that the render queue passed the order Wait of a held frame (the Hold event carried the plan's
+    // identity): `qpc` the upper end of the Wait's release interval, the QPC at or before which the queue was past
+    // it. Consumer side (the completion thread only), like PopFrame; call after Drain / Flush. A full queue drops the
+    // new report and counts it (order_passed_dropped); Reset clears it.
+    struct OrderPassed {
+        PacingPlanKey key{};
+        uint64_t grid_index = 0;
+        int64_t qpc = 0;
+    };
+    bool PopOrderPassed(OrderPassed* out) noexcept;
+
     struct Counters {
         uint64_t pushed, dropped, frames, frames_incomplete, frames_untagged, intervals_inconsistent,
             stamps_orphaned, parked_watermark, frames_overlap, waits_dropped, holds_unmatched,
@@ -359,7 +385,9 @@ public:
             irregular_boundary_events, frames_invalidated_by_irregular_boundary,
             markers_untrusted, awaited_lo_rejected,
             boundary_markers_awaited,        // frames whose last marker was accounted from its awaited wake
-            boundary_markers_by_observation; // ... from observation intervals only
+            boundary_markers_by_observation, // ... from observation intervals only
+            order_passed_reported,           // OrderPassed reports queued
+            order_passed_dropped;            // ... lost because the queue was full
     };
     Counters Statistics() const noexcept;
 
@@ -417,6 +445,8 @@ private:
         int64_t release = 0;
         bool has_release = false; // announced holds wait for their release event
         uint64_t law_hold_sequence = 0; // from the announce
+        PacingPlanKey order_key{};      // from the release event: the plan to report the Wait passed under
+        uint64_t order_grid_index = 0;  // 0 = none
     };
 
     struct Frame {
@@ -539,6 +569,7 @@ private:
     void ApplyTag(Frame& f, const GpuQueueEvent& e) noexcept;
     int FindHold(uint64_t fence_id, uint64_t wait_value) const noexcept;
     void AddHold(const HoldRec& h) noexcept;
+    void PushOrderPassed(const HoldRec& h, int64_t qpc) noexcept;
     void RemoveHold(size_t index) noexcept;
     bool WaitsSettled(const Entry& e) const noexcept;
     bool HoldPending(const Entry& e) const noexcept;
@@ -606,6 +637,8 @@ private:
     int64_t hold_release_ = 0; // the latest matched hold, while accounting in queue order
     int64_t hold_x_lo_ = 0, hold_x_hi_ = 0; // when the queue reached that hold (both ends): it can block nothing before
     bool hold_taken_ = true;
+    OrderPassed order_reports_[kOrderReportCapacity]; // reports not popped yet: queued and popped by the consumer
+    uint64_t order_report_head_ = 0, order_report_tail_ = 0;
 
     Obs last_obs_;                       // the newest observation (worker's or an event's), applied to late arrivals
     ParkedMarker parked_[kParkedCapacity];
@@ -632,6 +665,8 @@ private:
     std::atomic<uint64_t> awaited_lo_rejected_{0};
     std::atomic<uint64_t> boundary_awaited_{0};
     std::atomic<uint64_t> boundary_observed_{0};
+    std::atomic<uint64_t> order_passed_reported_{0};
+    std::atomic<uint64_t> order_passed_dropped_{0};
 
 public:
     // True when the ring's writer groups start on cache lines of their own (see the layout comment at the members).

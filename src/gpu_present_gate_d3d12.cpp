@@ -700,7 +700,7 @@ int64_t Service() noexcept {
                     // The enqueue stamp stays until the ticket is freed (Enqueue still reads it for the announce).
                     if(ticket.signalled && g_gpu_queue_probe.load(std::memory_order_relaxed) && ticket.probe_enq_qpc>0)
                         GpuQueueProbe_OnHoldRelease(queue.native,ticket.time,ticket.trace.ticket,ticket.probe_enq_qpc,
-                            ticket.trace.signal_before_qpc);
+                            ticket.trace.signal_before_qpc,PacingPlanKey{},0);
                     // gpu_hold_order (key off: one load and a branch): the same release, told for a hold the unit
                     // follows (a no-FG hold only), so the order Wait it announced on the render queue is released for
                     // the probe at the gate's own release and not at the Present's.
@@ -1040,7 +1040,8 @@ bool Enqueue(const EnqueueRequest& request,GpuPresentTrace* trace) noexcept {
         if(!wait_marked.load(std::memory_order_relaxed)) {wait_marked.store(true,std::memory_order_relaxed);Breadcrumb_Mark(StartupStage::FirstGateWaitEnqueued);}
         // gpu_hold_order (key off: one load and a branch): the hold is on the queue; the unit learns it on this thread,
         // ordered or not (its rule judges every held frame), and takes it over at the native Present that follows. The
-        // plan's identity goes with it: the unit reports the frame's Present as processed under it (PresentProcessed).
+        // plan's identity goes with it: the unit hands it to the probe with the release of its order Wait, for a frame
+        // the order was in effect for, and the probe reports the Wait passed (OrderPassed).
         if(!request.fg)GpuHoldOrder_OnHold(queue->native,ticket.time,trace->ticket,trace->target_qpc,trace->interval_qpc,
             ticket.law_hold_sequence,request.ordered,trace->swapchain,ticket.key,trace->grid_index);
     }
@@ -1322,12 +1323,12 @@ void GpuPresent_ObservePresentQueue(uint64_t native_queue,uint64_t native_swapch
     DiscoverQueue(native_queue);
     PublishGpuQueueCapability();
 }
-// The hold order unit's release thread saw a held frame's Present processed by the presenting queue (gpu_hold_order.h):
-// the stage event of that frame's plan, stamped with the unit's clock read. Any thread, no lock; an identity that is not
-// valid pushes nothing (PushStage).
-void GpuPresent_PushPresentProcessed(const PacingPlanKey& key,uint64_t grid_index,int64_t qpc) noexcept {
+// The probe's completion thread resolved the release of a held frame's order Wait (gpu_hold_order.h, gpu_queue_probe.h):
+// the stage event of that frame's plan, stamped with the upper end of the Wait's release interval. Any thread, no lock;
+// an identity that is not valid pushes nothing (PushStage).
+void GpuPresent_PushOrderPassed(const PacingPlanKey& key,uint64_t grid_index,int64_t qpc) noexcept {
     using namespace gpu_present;
-    PushStage(key,grid_index,PacingStageEventKind::PresentProcessed,PacingRung::GpuQueueWait,qpc);
+    PushStage(key,grid_index,PacingStageEventKind::OrderPassed,PacingRung::GpuQueueWait,qpc);
 }
 // H3 on the native Present (no FG): claim the exact plan, resolve T, queue
 // the time-fence wait or report Late/Undeliverable/Stale. Never holds the CPU.

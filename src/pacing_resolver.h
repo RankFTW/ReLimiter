@@ -93,9 +93,9 @@ constexpr double kPacingGpuWaitHeadroomDefaultUs = 1000.0;
 // presenting queue, no frame generation presents, the rung is the GPU queue wait); elsewhere the key does nothing.
 constexpr bool kPacingGpuWaitPresentFirstDefault = true;
 // Developer key gpu_wait_start_limit (default on; lead_controller.h, the start term): the collision guard's second
-// limit on the lead of the GPU queue wait plans made on present-first ordering, 2 I less the game's wait after the
-// hold's release and the game's turnaround, which keeps a hold from ending after the start the game needs for the
-// frame two ahead. It stands aside by the game's own times.
+// limit on the lead of the GPU queue wait plans made on present-first ordering, 2 I less the render queue's resume
+// after the hold's release and the game's turnaround, which keeps a hold from ending after the start the game
+// needs for the frame two ahead. It stands aside by the game's own times.
 constexpr bool kPacingGpuWaitStartLimitDefault = true;
 
 // ── Constants of the removed pacing settings ──

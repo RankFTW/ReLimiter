@@ -52,7 +52,7 @@ namespace
         return kBaseQpc + static_cast<int64_t>(std::llround(us * 10.0));
     }
 
-    // The controller is about 181 KB: tests keep it on the heap.
+    // The controller is about 176 KB: tests keep it on the heap.
     std::unique_ptr<LeadController> MakeController()
     {
         auto controller = std::make_unique<LeadController>();
@@ -930,7 +930,7 @@ void TestInvalidInputs()
     PacingStageEvent event = Event(1, Kind::MarkerArrival, 11000.0);
     event.kind = Kind::None;
     controller->OnStageEvent(event);
-    event.kind = static_cast<Kind>(11); // past PresentProcessed
+    event.kind = static_cast<Kind>(11); // past OrderPassed
     controller->OnStageEvent(event);
     event = Event(1, Kind::MarkerArrival, 11000.0);
     event.qpc = 0;
@@ -4145,18 +4145,17 @@ void TestPairNeedsRenderEnd()
 //
 // The scripts are games whose stamps follow the chain the term rests on (design_start_gate.md): the game's arrival
 // a is its release s, the native Present arrives at p = s + 5,000, the GPU is ready at r = s + R, the hold is
-// released at o = s + 17,000, the hold order unit sees the Present processed at x = max(o, r) + 810 µs, and the game's
-// PRESENT_END is b = p + 310, no earlier than 400 µs after the previous frame's x for a game whose next start waits
-// for the order's release of the held Present. The next arrival is b + 150 µs. The service (810), the game's wait
-// after the release (b − o of a telling pair: 1,210) and the turnaround (150) sit in the middle of a 20 µs bin, so
-// the percentiles are exact. In a game that waits the pairs alternate (every second one tells: the hold ends after
-// the next Present's arrival) and none is free. An oracle reads the same stamps and says what every window, pair and
-// verdict has to be, so a test does not repeat the controller's arithmetic by hand; the numbers asserted outright
-// (the limit, the lead) are the design's: 2 I − (W99 + G99) and the lead of 21,510 µs the warm-up frames teach.
+// released at o = s + 17,000, the render queue passes the order's Wait at y = o + 810 µs (the hold order unit's
+// stamp), and the game's PRESENT_END is b = p + 310, no earlier than 400 µs after the previous frame's y for a game
+// whose next start waits for the order's release of the held Present. The next arrival is b + 150 µs. The
+// resume (810) and the turnaround (150) sit in the middle of a 20 µs bin, so the percentiles are exact. In a game
+// that waits the pairs alternate (every second one tells: the hold ends after the next Present's arrival) and none
+// is free. An oracle reads the same stamps and says what every window, pair and verdict has to be, so a test does not
+// repeat the controller's arithmetic by hand; the numbers asserted outright (the limit, the lead) are the design's:
+// 2 I − (W99 + G99) and the lead of 21,510 µs the warm-up frames teach.
 namespace
 {
-    constexpr double kStartService = 810.0;    // x − max(o, r) of the scripted games
-    constexpr double kStartWait = 1210.0;      // b(n + 1) − o(n) of their telling pairs: the game's wait after the release
+    constexpr double kStartResume = 810.0;     // y − o of the scripted games: the render queue's resume
     constexpr double kStartTurnaround = 150.0; // a(n + 1) − b(n) of the scripted games
 
     // One GPU queue wait frame, in µs of the test clock; a field below 0 is a stamp the owner never gave.
@@ -4168,7 +4167,7 @@ namespace
         double present_us = 0.0;    // p
         double ready_us = 0.0;      // r
         double output_us = 0.0;     // o
-        double processed_us = -1.0; // x
+        double passed_us = -1.0;    // y
         double end_us = -1.0;       // b
         PacingPlanStatus status = PacingPlanStatus::Held;
         PacingRung rung = PacingRung::GpuQueueWait;
@@ -4182,9 +4181,9 @@ namespace
         double call_us = 5000.0;       // C = p − s
         double ready_us = 8000.0;      // R = r − s
         double lead_us = 17000.0;      // L = o − s
-        double service_us = kStartService;
+        double resume_us = kStartResume; // y − o
         double end_gap_us = 310.0;     // b − p
-        double hold_gap_us = 400.0;    // b − the previous x, of a game that waits
+        double hold_gap_us = 400.0;    // b − the previous y, of a game that waits
         double turnaround_us = kStartTurnaround;
         bool waits = true;
     };
@@ -4197,7 +4196,7 @@ namespace
         std::vector<StartFrame> frames;
         frames.reserve(count);
         double arrival_us = first_us;
-        double previous_processed_us = -1.0;
+        double previous_passed_us = -1.0;
         for (size_t i = 0; i < count; ++i) {
             StartFrame frame;
             frame.index = first + i;
@@ -4207,19 +4206,19 @@ namespace
             frame.present_us = arrival_us + shape.call_us;
             frame.ready_us = arrival_us + shape.ready_us;
             frame.output_us = arrival_us + shape.lead_us;
-            frame.processed_us = std::max(frame.output_us, frame.ready_us) + shape.service_us;
+            frame.passed_us = frame.output_us + shape.resume_us;
             frame.end_us = frame.present_us + shape.end_gap_us;
-            if (shape.waits && previous_processed_us >= 0.0) {
-                frame.end_us = std::max(frame.end_us, previous_processed_us + shape.hold_gap_us);
+            if (shape.waits && previous_passed_us >= 0.0) {
+                frame.end_us = std::max(frame.end_us, previous_passed_us + shape.hold_gap_us);
             }
-            previous_processed_us = frame.processed_us;
+            previous_passed_us = frame.passed_us;
             arrival_us = frame.end_us + shape.turnaround_us;
             frames.push_back(frame);
         }
         return frames;
     }
 
-    // Frames 100 ms apart without any evidence of the term (no arrival, no PRESENT_END, no x): their lead sample
+    // Frames 100 ms apart without any evidence of the term (no arrival, no PRESENT_END, no y): their lead sample
     // is R, so 40 of them warm the lead at 21,510 µs and teach the term nothing.
     std::vector<StartFrame> WarmFrames(uint64_t first, size_t count, double ready_us = 21000.0)
     {
@@ -4249,7 +4248,7 @@ namespace
     void ShiftFrame(StartFrame* frame, double us)
     {
         for (double* time : { &frame->arrival_us, &frame->release_us, &frame->present_us, &frame->ready_us,
-                              &frame->output_us, &frame->processed_us, &frame->end_us }) {
+                              &frame->output_us, &frame->passed_us, &frame->end_us }) {
             if (*time >= 0.0) *time += us;
         }
     }
@@ -4283,7 +4282,7 @@ namespace
             add(Kind::PresentCall, frame.present_us);
             add(Kind::GpuReady, frame.ready_us);
             add(Kind::OutputRelease, frame.output_us);
-            add(Kind::PresentProcessed, frame.processed_us);
+            add(Kind::OrderPassed, frame.passed_us);
             add(Kind::PresentEnd, frame.end_us);
             if (reports) {
                 StartPiece report;
@@ -4375,20 +4374,17 @@ namespace
         bool flag = false;
     };
 
-    // What the stamps say: the samples in the three windows, the pairs, the turnarounds judged, and the verdict at a
+    // What the stamps say: the samples in the two windows, the pairs, the turnarounds judged, and the verdict at a
     // time.
     struct StartOracle {
-        size_t services = 0;
-        size_t service_excluded = 0;
-        size_t waits = 0;
-        size_t wait_excluded = 0;
+        size_t resumes = 0;
+        size_t resume_excluded = 0;
         size_t turnarounds = 0;
         size_t turnaround_excluded = 0;
         size_t untied = 0;
         size_t telling = 0;
         size_t free_pairs = 0;
-        double service_us = 0.0;
-        double wait_us = 0.0;
+        double resume_us = 0.0;
         double turnaround_us = 0.0;
         std::vector<StartJudged> pairs;  // the telling pairs, flag: free
         std::vector<StartJudged> judged; // the turnarounds judged, flag: untied
@@ -4428,19 +4424,18 @@ namespace
     StartOracle BuildOracle(const std::vector<StartFrame>& frames)
     {
         StartOracle oracle;
-        std::vector<double> services;
-        std::vector<double> waits;
+        std::vector<double> resumes;
         std::vector<double> turnarounds;
         for (size_t i = 0; i < frames.size(); ++i) {
             const StartFrame& frame = frames[i];
             const bool sampled = frame.rung == PacingRung::GpuQueueWait && frame.mode == PacingTimingMode::Vrr;
-            if (sampled && frame.status == PacingPlanStatus::Held && frame.processed_us >= 0.0) {
-                const double service_us = frame.processed_us - std::max(frame.output_us, frame.ready_us);
-                if (service_us < 0.0 || service_us > LEAD_LONG_SAMPLE_INTERVALS * frame.interval_us) {
-                    ++oracle.service_excluded;
+            if (sampled && frame.status == PacingPlanStatus::Held && frame.passed_us >= 0.0) {
+                const double resume_us = frame.passed_us - frame.output_us;
+                if (resume_us < 0.0 || resume_us > LEAD_LONG_SAMPLE_INTERVALS * frame.interval_us) {
+                    ++oracle.resume_excluded;
                 } else {
-                    services.push_back(service_us);
-                    ++oracle.services;
+                    resumes.push_back(resume_us);
+                    ++oracle.resumes;
                 }
             }
             if (!sampled || i + 1 == frames.size()) continue;
@@ -4461,29 +4456,18 @@ namespace
                     ++oracle.turnarounds;
                 }
             }
-            // A pair needs the unit's stamp x of frame n as well: a hold the order did not release behind its
+            // A pair needs the unit's stamp y of frame n as well: a hold the order did not release behind its
             // Present gives none, telling or free.
-            if (frame.status == PacingPlanStatus::Held && frame.processed_us >= 0.0 &&
+            if (frame.status == PacingPlanStatus::Held && frame.passed_us >= 0.0 &&
                 frame.output_us > next.present_us && next.end_us >= 0.0) {
                 const bool free_pair = next.end_us < frame.output_us;
                 oracle.pairs.push_back({ std::max({ frame.output_us, next.present_us, next.end_us,
-                                                    frame.processed_us }), free_pair });
+                                                    frame.passed_us }), free_pair });
                 ++oracle.telling;
-                if (free_pair) {
-                    ++oracle.free_pairs;
-                } else {
-                    const double wait_us = next.end_us - frame.output_us; // the game's wait after the release
-                    if (wait_us > LEAD_LONG_SAMPLE_INTERVALS * frame.interval_us) {
-                        ++oracle.wait_excluded;
-                    } else {
-                        waits.push_back(wait_us);
-                        ++oracle.waits;
-                    }
-                }
+                if (free_pair) ++oracle.free_pairs;
             }
         }
-        oracle.service_us = BinnedQuantile(services, LEAD_START_QUANTILE);
-        oracle.wait_us = BinnedQuantile(waits, LEAD_START_QUANTILE);
+        oracle.resume_us = BinnedQuantile(resumes, LEAD_START_QUANTILE);
         oracle.turnaround_us = BinnedQuantile(turnarounds, LEAD_START_QUANTILE);
         return oracle;
     }
@@ -4492,17 +4476,14 @@ namespace
     {
         const LeadStatistics statistics = controller.Statistics();
         const LeadStartEvidence evidence = controller.StartEvidence();
-        CHECK(statistics.start_service_samples == expect.services);
-        CHECK(statistics.start_service_excluded == expect.service_excluded);
-        CHECK(statistics.start_wait_samples == expect.waits);
-        CHECK(statistics.start_wait_excluded == expect.wait_excluded);
+        CHECK(statistics.start_resume_samples == expect.resumes);
+        CHECK(statistics.start_resume_excluded == expect.resume_excluded);
         CHECK(statistics.start_turnaround_samples == expect.turnarounds);
         CHECK(statistics.start_turnaround_excluded == expect.turnaround_excluded);
         CHECK(statistics.start_untied_starts == expect.untied);
         CHECK(statistics.start_telling_pairs == expect.telling);
         CHECK(statistics.start_free_pairs == expect.free_pairs);
-        CHECK_NEAR(evidence.service_us, expect.service_us);
-        CHECK_NEAR(evidence.wait_us, expect.wait_us);
+        CHECK_NEAR(evidence.resume_us, expect.resume_us);
         CHECK_NEAR(evidence.turnaround_us, expect.turnaround_us);
     }
 
@@ -4534,7 +4515,7 @@ namespace
         size_t aside_plans = 0;
     };
 
-    // Every plan against the oracle: its verdict, the limit it reports and, from plan `settled` on (the service is
+    // Every plan against the oracle: its verdict, the limit it reports and, from plan `settled` on (the resume is
     // measured by then), the lead it returned: never above the limit while the term applies, at the limit at once
     // when it comes back, and climbing by the slew (100 µs a plan) while it stands aside.
     AsideCounts CheckAsidePlans(const std::vector<StartPlan>& plans, const StartOracle& oracle, size_t settled)
@@ -4570,24 +4551,21 @@ namespace
     }
 }
 
-// The limit is 2 I − (W99 + G99): W99 the game's wait after the release, from the best measure there is, G99 the
-// turnaround of the game's next arrival after its PRESENT_END, 0 until one is measured. The measures, best first: the
-// game's own wait (b − o of the telling pairs that are not free) once 32 of them exist; else the hold order unit's
-// Present service; else the release headroom H, the fallback; with no evidence at all the term applies on H and no
-// turnaround. It cuts the lead at once and leaves the bucket's own lead alone, and the built guard's counters keep
-// their meaning.
+// The limit is 2 I − (W99 + G99): W99 the render queue's resume after the release (y − o of the held frames the order
+// was in effect for), G99 the turnaround of the game's next arrival after its PRESENT_END, 0 until one is
+// measured. Until the resume window is warm and current the release headroom H stands in, the fallback; with no
+// evidence at all the term applies on H and no turnaround. It cuts the lead at once and leaves the bucket's own lead
+// alone, and the built guard's counters keep their meaning.
 void TestStartTermLimit()
 {
-    // 60 frames: 30 telling pairs, fewer than the 32 the game's wait needs, so the unit's Present service (810 µs)
-    // is the measure in use.
+    // 60 frames: 60 resumes (810 µs), 59 turnarounds (150 µs) and 30 telling pairs, none free.
     std::vector<StartFrame> frames = WarmedGame(60);
     auto controller = StartPlayed(frames);
     CheckStartMatches(*controller, BuildOracle(frames));
     const LeadStartEvidence evidence = controller->StartEvidence();
-    CHECK(evidence.service_measured && evidence.service_samples == 60 && evidence.turnaround_samples == 59);
-    CHECK(!evidence.wait_measured && evidence.wait_samples == 30 && evidence.source == LeadStartSource::Service);
-    CHECK_NEAR(evidence.service_us, kStartService);
-    CHECK_NEAR(evidence.wait_us, kStartWait);
+    CHECK(evidence.resume_measured && evidence.resume_samples == 60 && evidence.turnaround_samples == 59);
+    CHECK(evidence.source == LeadStartSource::Resume);
+    CHECK_NEAR(evidence.resume_us, kStartResume);
     CHECK_NEAR(evidence.turnaround_us, kStartTurnaround);
     CHECK(evidence.telling_pairs == 30 && evidence.free_pairs == 0 && evidence.untied_starts == 0);
 
@@ -4597,70 +4575,52 @@ void TestStartTermLimit()
     const double own_lead_us = controller->BucketStatus(PacingRung::GpuQueueWait, 1.0).lead_us;
     CHECK_NEAR(own_lead_us, 21510.0);
     CHECK(!guard.judged && guard.ordered && guard.start_applied && !guard.start_aside);
-    CHECK(guard.start_source == LeadStartSource::Service);
-    CHECK_NEAR(guard.start_limit_us, 2.0 * kInterval - (kStartService + kStartTurnaround));
+    CHECK(guard.start_source == LeadStartSource::Resume);
+    CHECK_NEAR(guard.start_limit_us, 2.0 * kInterval - (kStartResume + kStartTurnaround));
     CHECK_NEAR(guard.start_limit_us, 19040.0);
     CHECK_NEAR(guard.release_limit_us, 19040.0);
     CHECK_NEAR(returned_us, 19040.0);
     CHECK_NEAR(guard.reduction_us, own_lead_us - 19040.0);
     const LeadStatistics statistics = controller->Statistics();
     CHECK(statistics.start_checked_frames == 1 && statistics.start_lowered_frames == 1);
-    CHECK(statistics.start_service_frames == 1 && statistics.start_wait_frames == 0 &&
-          statistics.start_fallback_frames == 0 && statistics.start_aside_frames == 0);
-    CHECK(statistics.last_start_source == LeadStartSource::Service && !statistics.last_start_aside);
+    CHECK(statistics.start_resume_frames == 1 && statistics.start_fallback_frames == 0 &&
+          statistics.start_aside_frames == 0);
+    CHECK(statistics.last_start_source == LeadStartSource::Resume && !statistics.last_start_aside);
     CHECK_NEAR(statistics.last_start_limit_us, 19040.0);
-    CHECK_NEAR(statistics.last_start_wait_us, kStartService);
+    CHECK_NEAR(statistics.last_start_resume_us, kStartResume);
     CHECK_NEAR(statistics.last_start_turnaround_us, kStartTurnaround);
     CHECK(statistics.collision_checked_frames == 0 && statistics.collision_guarded_frames == 0);
 
-    // 100 frames: 50 telling pairs, so the game's own wait after the release (1,210 µs: its Present ends 400 µs after
-    // the unit saw the held Present processed) is the measure, and the limit is tighter than the service gives.
-    std::vector<StartFrame> longer = WarmedGame(100);
-    auto waited = StartPlayed(longer);
-    CheckStartMatches(*waited, BuildOracle(longer));
-    const LeadStartEvidence waits = waited->StartEvidence();
-    CHECK(waits.wait_measured && waits.wait_samples == 50 && waits.source == LeadStartSource::GameWait);
-    CHECK_NEAR(waits.wait_us, kStartWait);
-    LeadGuardOutcome waited_guard{};
-    const double waited_returned_us = waited->NextLeadUs(request, nullptr, &waited_guard);
-    CHECK(waited_guard.start_applied && waited_guard.start_source == LeadStartSource::GameWait);
-    CHECK_NEAR(waited_guard.start_limit_us, 2.0 * kInterval - (kStartWait + kStartTurnaround));
-    CHECK_NEAR(waited_guard.start_limit_us, 18640.0);
-    CHECK_NEAR(waited_guard.release_limit_us, 18640.0);
-    CHECK_NEAR(waited_returned_us, 18640.0);
-    CHECK(waited->Statistics().start_wait_frames == 1 && waited->Statistics().start_service_frames == 0);
-    CHECK(waited->Statistics().last_start_source == LeadStartSource::GameWait);
-    CHECK_NEAR(waited->Statistics().last_start_wait_us, kStartWait);
-
-    // No x: no unit stamp, so neither a Present service nor a pair; the release headroom H (1,000 µs; here also
+    // No y: no unit stamp, so neither a resume sample nor a pair; the release headroom H (1,000 µs; here also
     // 1,500 µs) takes the place.
     std::vector<StartFrame> blind = WarmedGame(60);
-    for (StartFrame& frame : blind) frame.processed_us = -1.0;
+    for (StartFrame& frame : blind) frame.passed_us = -1.0;
     auto fallback = StartPlayed(blind);
-    CHECK(!fallback->StartEvidence().service_measured && fallback->StartEvidence().service_samples == 0);
-    CHECK(fallback->StartEvidence().wait_samples == 0 && fallback->StartEvidence().source == LeadStartSource::Headroom);
+    CHECK(!fallback->StartEvidence().resume_measured && fallback->StartEvidence().resume_samples == 0);
+    CHECK(fallback->StartEvidence().telling_pairs == 0 && fallback->StartEvidence().source == LeadStartSource::Headroom);
     LeadRequest blind_request = StartRequest();
     LeadGuardOutcome blind_guard{};
     fallback->NextLeadUs(blind_request, nullptr, &blind_guard);
     CHECK(blind_guard.start_applied && blind_guard.start_source == LeadStartSource::Headroom);
     CHECK_NEAR(blind_guard.start_limit_us, 2.0 * kInterval - (LEAD_RELEASE_HEADROOM_US + kStartTurnaround));
-    CHECK(fallback->Statistics().start_fallback_frames == 1);
+    CHECK(fallback->Statistics().start_fallback_frames == 1 && fallback->Statistics().start_resume_frames == 0);
     CHECK(fallback->Statistics().last_start_source == LeadStartSource::Headroom);
+    CHECK_NEAR(fallback->Statistics().last_start_resume_us, LEAD_RELEASE_HEADROOM_US);
     blind_request.release_headroom_us = 1500.0;
     fallback->NextLeadUs(blind_request, nullptr, &blind_guard);
     CHECK_NEAR(blind_guard.start_limit_us, 2.0 * kInterval - (1500.0 + kStartTurnaround));
 
-    // No arrival, no PRESENT_END and no x: no evidence at all, and the term applies on H alone.
+    // No arrival, no PRESENT_END and no y: no evidence at all, and the term applies on H alone.
     std::vector<StartFrame> bare = WarmedGame(60);
     for (StartFrame& frame : bare) {
         frame.arrival_us = -1.0;
         frame.end_us = -1.0;
-        frame.processed_us = -1.0;
+        frame.passed_us = -1.0;
     }
     auto none = StartPlayed(bare);
     const LeadStartEvidence nothing = none->StartEvidence();
-    CHECK(nothing.service_samples == 0 && nothing.wait_samples == 0 && nothing.turnaround_samples == 0 &&
-          nothing.telling_pairs == 0 && nothing.frames == 0);
+    CHECK(nothing.resume_samples == 0 && nothing.turnaround_samples == 0 && nothing.telling_pairs == 0 &&
+          nothing.frames == 0);
     LeadGuardOutcome none_guard{};
     none->NextLeadUs(request, nullptr, &none_guard);
     CHECK(none_guard.start_applied && !none_guard.start_aside && none_guard.start_source == LeadStartSource::Headroom);
@@ -4675,48 +4635,41 @@ void TestStartTermLimit()
     CHECK(cold->Statistics().start_lowered_frames == 0);
 }
 
-// The windows: the newest 256 Present services of held frames, the newest 256 game waits (b − o of the telling pairs
-// that are not free) and the newest 256 turnarounds, the percentile in 20 µs bins, a sample above three intervals in
-// no window, a service below 0 none.
+// The windows: the newest 256 resumes of held frames (y − o) and the newest 256 turnarounds, the percentile
+// in 20 µs bins, a sample above three intervals in no window, a resume below 0 (y before the release) none.
 void TestStartTermWindows()
 {
     std::vector<StartFrame> frames = MakeGame(1, 300);
     for (size_t i = 0; i < frames.size(); ++i) {
-        frames[i].processed_us = std::max(frames[i].output_us, frames[i].ready_us) + 410.0 + 10.0 * static_cast<double>(i);
+        frames[i].passed_us = frames[i].output_us + 410.0 + 10.0 * static_cast<double>(i);
     }
-    // A service above 3 I (frame at position 49) and one below 0 (59), a turnaround above 3 I (the game paused 31 ms
-    // between the frames at positions 69 and 70) and a game wait above 3 I (the Present of the frame at position
-    // 121 ended 31 ms after the hold of the frame at 120 was released, and everything after it with it).
-    frames[49].processed_us = std::max(frames[49].output_us, frames[49].ready_us) + 31000.0;
-    frames[59].processed_us = std::max(frames[59].output_us, frames[59].ready_us) - 100.0;
+    // A resume above 3 I (frame at position 49) and one below 0 (59: y 100 µs before the release), and a turnaround
+    // above 3 I (the game paused 31 ms between the frames at positions 69 and 70).
+    frames[49].passed_us = frames[49].output_us + 31000.0;
+    frames[59].passed_us = frames[59].output_us - 100.0;
     for (size_t i = 70; i < frames.size(); ++i) ShiftFrame(&frames[i], 31000.0);
-    frames[121].end_us += 31000.0;
-    for (size_t i = 122; i < frames.size(); ++i) ShiftFrame(&frames[i], 31000.0);
 
     const StartOracle oracle = BuildOracle(frames);
-    CHECK(oracle.service_excluded == 2 && oracle.turnaround_excluded == 1 && oracle.services == 298);
-    CHECK(oracle.telling == 150 && oracle.free_pairs == 0 && oracle.wait_excluded == 1 && oracle.waits == 149);
+    CHECK(oracle.resume_excluded == 2 && oracle.turnaround_excluded == 1 && oracle.resumes == 298);
+    CHECK(oracle.telling == 150 && oracle.free_pairs == 0);
     auto controller = StartPlayed(frames, false);
     CheckStartMatches(*controller, oracle);
     const LeadStatistics statistics = controller->Statistics();
-    CHECK(statistics.start_service_samples == 298 && statistics.start_turnaround_samples == 298);
-    CHECK(statistics.start_wait_samples == 149 && statistics.start_wait_excluded == 1);
+    CHECK(statistics.start_resume_samples == 298 && statistics.start_resume_excluded == 2);
+    CHECK(statistics.start_turnaround_samples == 298 && statistics.start_turnaround_excluded == 1);
     const LeadStartEvidence evidence = controller->StartEvidence();
-    CHECK(evidence.service_samples == LEAD_WINDOW_CAPACITY && evidence.turnaround_samples == LEAD_WINDOW_CAPACITY);
-    CHECK(evidence.wait_samples == 149);
-    // The service of position i is 410 + 10 i: the largest four of the window are positions 299 to 296, and S99
-    // (rank floor(0.99 × 255) of 256) is the fourth, 3,370 µs. Every game wait is 1,210 µs and every turnaround
-    // 150 µs.
-    CHECK_NEAR(evidence.service_us, 3370.0);
-    CHECK_NEAR(evidence.wait_us, kStartWait);
+    CHECK(evidence.resume_samples == LEAD_WINDOW_CAPACITY && evidence.turnaround_samples == LEAD_WINDOW_CAPACITY);
+    // The resume of position i is 410 + 10 i: the largest four of the window are positions 299 to 296, and W99
+    // (rank floor(0.99 × 255) of 256) is the fourth, 3,370 µs. Every turnaround is 150 µs.
+    CHECK_NEAR(evidence.resume_us, 3370.0);
     CHECK_NEAR(evidence.turnaround_us, kStartTurnaround);
 }
 
-// A free pair: frame n is held and the unit saw its Present processed (x), its release comes after frame n + 1's
-// native Present arrived, and frame n + 1's Present ended before that release: the game does not wait for a held
-// Present, and the term stands aside. The lead returns at the slew (100 µs a plan), not in one step; when the free
-// pair leaves the newest 64 telling pairs the term is back, and a tighter limit applies at once. By then the game's
-// own wait is the measure in use (its 1,210 µs), so the limit it comes back to is 2 I − (1,210 + 150).
+// A free pair: frame n is held and the order was in effect for it (the unit gave y), its release comes after frame
+// n + 1's native Present arrived, and frame n + 1's Present ended before that release: the game does not wait for a
+// held Present, and the term stands aside. The lead returns at the slew (100 µs a plan), not in one step; when the
+// free pair leaves the newest 64 telling pairs the term is back, and a tighter limit applies at once. The render
+// queue's resume (810 µs) is the measure in use throughout, so the limit it comes back to is 2 I − (810 + 150).
 void TestStartTermFreePair()
 {
     constexpr size_t kWarm = 40;
@@ -4738,8 +4691,8 @@ void TestStartTermFreePair()
     CHECK(statistics.start_checked_frames == plans.size() && statistics.start_aside_frames == counts.aside_plans);
     CHECK(statistics.start_stood_aside == 1 && statistics.start_came_back == 1);
     CHECK(!plans.back().guard.start_aside && plans.back().guard.start_applied);
-    CHECK(plans.back().guard.start_source == LeadStartSource::GameWait);
-    CHECK_NEAR(plans.back().returned_us, 2.0 * kInterval - (kStartWait + kStartTurnaround));
+    CHECK(plans.back().guard.start_source == LeadStartSource::Resume);
+    CHECK_NEAR(plans.back().returned_us, 2.0 * kInterval - (kStartResume + kStartTurnaround));
     const LeadStartEvidence evidence = controller->StartEvidence();
     CHECK(evidence.free_pairs == 0 && evidence.telling_pairs == LEAD_START_EVIDENCE_FRAMES);
 }
@@ -4763,30 +4716,31 @@ void TestStartTermUntiedStart()
     const LeadStatistics statistics = controller->Statistics();
     CHECK(statistics.start_untied_starts == 1 && statistics.start_stood_aside == 1 && statistics.start_came_back == 1);
     CHECK(!plans.back().guard.start_aside && plans.back().guard.start_applied);
-    CHECK(plans.back().guard.start_source == LeadStartSource::GameWait);
-    CHECK_NEAR(plans.back().returned_us, 2.0 * kInterval - (kStartWait + kStartTurnaround));
+    CHECK(plans.back().guard.start_source == LeadStartSource::Resume);
+    CHECK_NEAR(plans.back().returned_us, 2.0 * kInterval - (kStartResume + kStartTurnaround));
     const LeadStartEvidence evidence = controller->StartEvidence();
     CHECK(evidence.untied_starts == 0 && evidence.frames == LEAD_START_EVIDENCE_FRAMES);
 }
 
-// A pair needs the hold order unit's stamp of the frame's Present processed (x): the order was in effect for that
-// edge. The capture's case: a held frame whose successor's PRESENT_END came before the hold's release, and for which
-// the unit gave no event, is no evidence, telling or free, and the term keeps applying on every plan; the same pair
-// with the event stands it aside (TestStartTermFreePair).
-void TestStartTermNeedsProcessed()
+// A pair needs the hold order unit's stamp y of the frame (the render queue passed the order's Wait behind its
+// Present): the order was in effect for that edge. The capture's case: a held frame whose successor's PRESENT_END
+// came before the hold's release, and for which the unit gave no event, is no evidence, telling or free, and the term
+// keeps applying on every plan; the same pair with the event stands it aside (TestStartTermFreePair).
+void TestStartTermNeedsPassed()
 {
     constexpr size_t kWarm = 40;
     std::vector<StartFrame> frames = WarmedGame(230);
     const size_t at = kWarm + 50; // an even game position: its pair with the next frame tells
     CHECK(frames[at].output_us > frames[at + 1].present_us);
     frames[at + 1].end_us = frames[at].output_us - 200.0;
-    frames[at].processed_us = -1.0;
+    frames[at].passed_us = -1.0;
 
     auto controller = MakeController();
     const std::vector<StartPlan> plans = StartPlanned(controller.get(), frames, kWarm, StartRequest());
     const StartOracle oracle = BuildOracle(frames);
     CHECK(oracle.free_pairs == 0 && oracle.telling == 114 && oracle.untied == 0); // 115 telling positions less one
     CheckStartMatches(*controller, oracle);
+    CHECK(controller->Statistics().start_resume_samples == 229); // 230 game frames, one without y: no sample
     for (const StartPlan& plan : plans) CHECK(plan.guard.start_applied && !plan.guard.start_aside);
     const LeadStatistics statistics = controller->Statistics();
     CHECK(statistics.start_checked_frames == plans.size() && statistics.start_aside_frames == 0);
@@ -4794,7 +4748,7 @@ void TestStartTermNeedsProcessed()
     CHECK(controller->StartEvidence().free_pairs == 0);
 }
 
-// Only a frame the executor held gives a service or a pair: Unknown, SourceOnly, Late, Missing, Stale, Duplicate,
+// Only a frame the executor held gives a resume or a pair: Unknown, SourceOnly, Late, Missing, Stale, Duplicate,
 // Undeliverable and Passthrough give neither (the built guard counts Unknown as held; this term does not). The
 // turnaround is one sample per frame, held or not.
 void TestStartTermNeedsHeld()
@@ -4807,22 +4761,22 @@ void TestStartTermNeedsHeld()
         for (StartFrame& frame : frames) frame.status = status;
         auto controller = StartPlayed(frames, false);
         const LeadStatistics statistics = controller->Statistics();
-        CHECK(statistics.start_service_samples == 0 && statistics.start_telling_pairs == 0 &&
+        CHECK(statistics.start_resume_samples == 0 && statistics.start_telling_pairs == 0 &&
             statistics.start_free_pairs == 0);
         CHECK(statistics.start_turnaround_samples == 39);
         CheckStartMatches(*controller, BuildOracle(frames));
     }
     const std::vector<StartFrame> held = MakeGame(1, 40);
     auto controller = StartPlayed(held, false);
-    CHECK(controller->Statistics().start_service_samples == 40 && controller->Statistics().start_telling_pairs > 0);
+    CHECK(controller->Statistics().start_resume_samples == 40 && controller->Statistics().start_telling_pairs > 0);
     CheckStartMatches(*controller, BuildOracle(held));
 }
 
 // Each pair and sample is judged once, by whichever callback completes it, so the order of delivery does not matter:
 // a script played in time order and in the reverse order (within a chunk of eight frames every pair is completed by
 // an event, not a release) gives the same windows and rings, and both give what the stamps say. The script holds a
-// free pair, an untied start, three frames not held (Late), one with an Unknown status and one whose Present the
-// unit never saw.
+// free pair, an untied start, three frames not held (Late), one with an Unknown status and one for which the unit
+// gave no y.
 void TestStartTermDeliveryOrder()
 {
     std::vector<StartFrame> frames = MakeGame(1, 65);
@@ -4834,7 +4788,7 @@ void TestStartTermDeliveryOrder()
     frames[31].arrival_us = frames[30].end_us - 500.0;
     for (size_t i = 40; i < 43; ++i) frames[i].status = PacingPlanStatus::Late;
     frames[45].status = PacingPlanStatus::Unknown;
-    frames[50].processed_us = -1.0;
+    frames[50].passed_us = -1.0;
     const StartOracle oracle = BuildOracle(frames);
     CHECK(oracle.free_pairs == 1 && oracle.untied == 1 && oracle.telling > 5);
 
@@ -4847,15 +4801,14 @@ void TestStartTermDeliveryOrder()
     const LeadStartEvidence second = reversed->StartEvidence();
     CHECK(first.telling_pairs == second.telling_pairs && first.free_pairs == second.free_pairs);
     CHECK(first.frames == second.frames && first.untied_starts == second.untied_starts);
-    CHECK(first.service_samples == second.service_samples && first.turnaround_samples == second.turnaround_samples);
-    CHECK(first.service_measured == second.service_measured);
-    CHECK(first.wait_samples == second.wait_samples && first.wait_measured == second.wait_measured);
+    CHECK(first.resume_samples == second.resume_samples && first.turnaround_samples == second.turnaround_samples);
+    CHECK(first.resume_measured == second.resume_measured);
     CHECK(first.free_pairs == 1 && first.untied_starts == 1);
 }
 
 // No pair crosses a gap: a rung change, an FG divisor change, a mode that does not sample and a skipped grid index
 // each take the pairs at their frame (the frame before and after it), and a change of lifecycle takes the pair
-// across it; the frames' own services still count where they are held and sampled.
+// across it; the frames' own resumes still count where they are held and sampled.
 void TestStartTermNeverBridgesAGap()
 {
     std::vector<StartFrame> frames = MakeGame(1, 30);
@@ -4866,7 +4819,7 @@ void TestStartTermNeverBridgesAGap()
     const StartOracle oracle = BuildOracle(frames);
     // 29 pairs, of which (4,5), (5,6), (9,10), (10,11), (14,15), (15,16) and (20,21) are gaps; 28 frames are sampled
     // GPU queue wait frames (not the FG input wait one and not the idle one).
-    CHECK(oracle.turnarounds == 22 && oracle.services == 28);
+    CHECK(oracle.turnarounds == 22 && oracle.resumes == 28);
     auto controller = StartPlayed(frames, false);
     CheckStartMatches(*controller, oracle);
 
@@ -4876,7 +4829,7 @@ void TestStartTermNeverBridgesAGap()
     for (StartFrame& frame : second) frame.generation = 2;
     first.insert(first.end(), second.begin(), second.end());
     const StartOracle lifecycle_oracle = BuildOracle(first);
-    CHECK(lifecycle_oracle.turnarounds == 38 && lifecycle_oracle.services == 40);
+    CHECK(lifecycle_oracle.turnarounds == 38 && lifecycle_oracle.resumes == 40);
     auto lifecycle = StartPlayed(first, false);
     CheckStartMatches(*lifecycle, lifecycle_oracle);
 
@@ -4897,9 +4850,9 @@ void TestStartTermReset()
     const std::vector<StartFrame> game = MakeGame(1, 40);
     auto controller = MakeController();
     PlayNatural(controller.get(), std::vector<StartFrame>(game.begin(), game.begin() + 20), nullptr, false);
-    CHECK(controller->StartEvidence().service_samples == 20 && controller->StartEvidence().turnaround_samples > 0);
+    CHECK(controller->StartEvidence().resume_samples == 20 && controller->StartEvidence().turnaround_samples > 0);
 
-    // Frame 21 (position 20) is released and its p, r and o are in; its Present's service and PRESENT_END are not.
+    // Frame 21 (position 20) is released and its p, r and o are in; its y and PRESENT_END are not.
     const std::vector<StartPiece> pieces = PiecesOf(game, false);
     const auto frame_21 = [&](bool late_events) {
         for (const StartPiece& piece : pieces) {
@@ -4908,52 +4861,50 @@ void TestStartTermReset()
                 if (!late_events) StartDeliver(controller.get(), game, piece);
                 continue;
             }
-            const bool late = piece.event.kind == Kind::PresentProcessed || piece.event.kind == Kind::PresentEnd;
+            const bool late = piece.event.kind == Kind::OrderPassed || piece.event.kind == Kind::PresentEnd;
             if (late == late_events) StartDeliver(controller.get(), game, piece);
         }
     };
     frame_21(false);
     controller->ResetBuckets();
     const auto empty = [](const LeadStartEvidence& evidence) {
-        return evidence.service_samples == 0 && evidence.wait_samples == 0 && evidence.turnaround_samples == 0 &&
-            evidence.telling_pairs == 0 && evidence.free_pairs == 0 && evidence.frames == 0 &&
-            evidence.untied_starts == 0 && !evidence.service_measured && !evidence.wait_measured;
+        return evidence.resume_samples == 0 && evidence.turnaround_samples == 0 && evidence.telling_pairs == 0 &&
+            evidence.free_pairs == 0 && evidence.frames == 0 && evidence.untied_starts == 0 &&
+            !evidence.resume_measured;
     };
     CHECK(empty(controller->StartEvidence()));
     const LeadStatistics before = controller->Statistics();
-    frame_21(true); // x and PRESENT_END of a frame released before the reset
+    frame_21(true); // y and PRESENT_END of a frame released before the reset
     CHECK(empty(controller->StartEvidence()));
-    CHECK(controller->Statistics().start_service_samples == before.start_service_samples);
+    CHECK(controller->Statistics().start_resume_samples == before.start_resume_samples);
     CHECK(controller->Statistics().start_turnaround_samples == before.start_turnaround_samples);
     CHECK(controller->Statistics().start_telling_pairs == before.start_telling_pairs);
 
-    // Frames 22 to 40 are released after it: 19 services and the 18 pairs among them, not the one with frame 21.
+    // Frames 22 to 40 are released after it: 19 resumes and the 18 pairs among them, not the one with frame 21.
     const std::vector<StartFrame> rest(game.begin() + 21, game.end());
     PlayNatural(controller.get(), rest, nullptr, false);
     const StartOracle oracle = BuildOracle(rest);
     const LeadStartEvidence evidence = controller->StartEvidence();
-    CHECK(evidence.service_samples == 19 && evidence.turnaround_samples == 18);
+    CHECK(evidence.resume_samples == 19 && evidence.turnaround_samples == 18);
     CHECK(evidence.telling_pairs == oracle.telling && evidence.free_pairs == oracle.free_pairs);
-    CHECK_NEAR(evidence.service_us, oracle.service_us);
-    CHECK(evidence.wait_samples == oracle.waits && oracle.waits > 0);
-    CHECK_NEAR(evidence.wait_us, oracle.wait_us);
+    CHECK_NEAR(evidence.resume_us, oracle.resume_us);
     CHECK_NEAR(evidence.turnaround_us, oracle.turnaround_us);
 
     // The lifecycle reset clears the windows, the rings, the pending frames and the statistics.
     controller->Reset(kFrequency);
     CHECK(empty(controller->StartEvidence()));
     const LeadStatistics cleared = controller->Statistics();
-    CHECK(cleared.start_service_samples == 0 && cleared.start_turnaround_samples == 0 &&
+    CHECK(cleared.start_resume_samples == 0 && cleared.start_turnaround_samples == 0 &&
         cleared.start_telling_pairs == 0 && cleared.start_checked_frames == 0);
 }
 
-// The measured service is in use from 32 samples on, while one arrived among the newest LEAD_WORK_STALE_FRAMES
+// The measured resume is in use from 32 samples on, while one arrived among the newest LEAD_WORK_STALE_FRAMES
 // frames planned with the GPU queue wait's lead; fewer samples, or none that recent, put the release headroom in
 // its place until the next one arrives.
-void TestStartTermServiceAge()
+void TestStartTermResumeAge()
 {
     // Frames 100 ms apart: each one's events end before the next release, so the age counts are exact.
-    const auto play = [](LeadController* controller, uint64_t first, size_t count, bool service) {
+    const auto play = [](LeadController* controller, uint64_t first, size_t count, bool passed) {
         std::vector<StartFrame> frames;
         for (size_t i = 0; i < count; ++i) {
             StartFrame frame;
@@ -4963,7 +4914,7 @@ void TestStartTermServiceAge()
             frame.present_us = frame.release_us + 5000.0;
             frame.ready_us = frame.release_us + 8000.0;
             frame.output_us = frame.release_us + 9000.0;
-            frame.processed_us = service ? frame.output_us + kStartService : -1.0;
+            frame.passed_us = passed ? frame.output_us + kStartResume : -1.0;
             frame.end_us = frame.present_us + 310.0;
             frames.push_back(frame);
         }
@@ -4972,109 +4923,108 @@ void TestStartTermServiceAge()
 
     auto few = MakeController();
     play(few.get(), 1, LEAD_WARM_SAMPLES - 1, true);
-    CHECK(!few->StartEvidence().service_measured && few->StartEvidence().service_samples == LEAD_WARM_SAMPLES - 1);
+    CHECK(!few->StartEvidence().resume_measured && few->StartEvidence().resume_samples == LEAD_WARM_SAMPLES - 1);
     play(few.get(), LEAD_WARM_SAMPLES, 1, true);
-    CHECK(few->StartEvidence().service_measured && few->StartEvidence().service_samples == LEAD_WARM_SAMPLES);
+    CHECK(few->StartEvidence().resume_measured && few->StartEvidence().resume_samples == LEAD_WARM_SAMPLES);
 
     auto controller = MakeController();
     play(controller.get(), 1, 40, true);
-    CHECK(controller->StartEvidence().service_measured);
-    play(controller.get(), 41, LEAD_WORK_STALE_FRAMES, false); // 64 frames without a service: still current
-    CHECK(controller->StartEvidence().service_measured);
+    CHECK(controller->StartEvidence().resume_measured);
+    play(controller.get(), 41, LEAD_WORK_STALE_FRAMES, false); // 64 frames without a resume: still current
+    CHECK(controller->StartEvidence().resume_measured);
     play(controller.get(), 41 + LEAD_WORK_STALE_FRAMES, 1, false); // the 65th: the headroom stands in
-    CHECK(!controller->StartEvidence().service_measured && controller->StartEvidence().service_samples == 40);
-    play(controller.get(), 42 + LEAD_WORK_STALE_FRAMES, 1, true); // a service arrives: current at once
-    CHECK(controller->StartEvidence().service_measured && controller->StartEvidence().service_samples == 41);
+    CHECK(!controller->StartEvidence().resume_measured && controller->StartEvidence().resume_samples == 40);
+    CHECK(controller->StartEvidence().source == LeadStartSource::Headroom);
+    play(controller.get(), 42 + LEAD_WORK_STALE_FRAMES, 1, true); // a resume arrives: current at once
+    CHECK(controller->StartEvidence().resume_measured && controller->StartEvidence().resume_samples == 41);
+    CHECK(controller->StartEvidence().source == LeadStartSource::Resume);
 }
 
-// The three measures of the game's wait, best first: the game's own wait after the release (the window of the telling
-// pairs that are not free), else the hold order unit's Present service, else the release headroom; each in use only
-// while its window is warm (32 samples) and current (one among the newest 64 frames planned with the GPU queue wait's
-// lead), and the better one takes over again as soon as it is. The script is singles and pairs 100 ms apart: a single
-// gives one Present service and no pair; a pair is two frames 5.5 ms apart whose first hold ends after the second
-// Present arrived, not free: one game wait of 1,210 µs, two services and one turnaround of 150 µs. Each run is whole,
-// all its events included, before the next starts, so the ages count exactly.
-void TestStartTermSources()
+// The regression the render queue's resume was chosen for: holds that end before the game's next Present arrives
+// (which is where a limit puts them) leave no telling pair, so a measure taken from the pairs went stale after 64
+// frames and a lower stand-in took its place, silently. The resume is sampled on every held frame the order was in
+// effect for, whether or not a pair comes: over a long stretch of such frames the window stays current, and the limit
+// keeps the measured figure (here 1,410 µs, above the 1,000 µs headroom, so a stand-in would be seen as a looser
+// limit), also after a stretch that gave pairs.
+void TestStartTermStaysCurrent()
 {
-    auto controller = MakeController();
-    uint64_t next_index = 1;
-    double next_us = 100000.0;
-    const auto singles = [&](size_t count, bool service) {
-        std::vector<StartFrame> frames;
-        for (size_t i = 0; i < count; ++i) {
-            std::vector<StartFrame> one = MakeGame(next_index++, 1, StartShape{}, next_us);
-            if (!service) one[0].processed_us = -1.0;
-            frames.push_back(one[0]);
-            next_us += 100000.0;
-        }
-        PlayNatural(controller.get(), frames, nullptr, false);
-    };
-    const auto pairs = [&](size_t count) {
-        std::vector<StartFrame> frames;
-        for (size_t i = 0; i < count; ++i) {
-            const std::vector<StartFrame> pair = MakeGame(next_index, 2, StartShape{}, next_us);
-            next_index += 2;
-            next_us += 100000.0;
-            frames.insert(frames.end(), pair.begin(), pair.end());
-        }
-        PlayNatural(controller.get(), frames, nullptr, false);
-    };
-    const auto source = [&]() { return controller->StartEvidence().source; };
-    const auto limit_us = [&]() {
-        LeadGuardOutcome outcome{};
-        controller->NextLeadUs(StartRequest(), nullptr, &outcome);
-        return outcome.start_limit_us;
-    };
+    StartShape quick;
+    quick.lead_us = 9000.0;    // o = a + 9,000, before the next Present call at a + 10,460
+    quick.resume_us = 1410.0;
+    quick.waits = false;
+    const double limit_us = 2.0 * kInterval - (quick.resume_us + kStartTurnaround);
 
-    // Nothing seen: the release headroom, and no turnaround.
-    CHECK(source() == LeadStartSource::Headroom);
-    CHECK_NEAR(limit_us(), 2.0 * kInterval - LEAD_RELEASE_HEADROOM_US);
+    // A game of quick holds only: 150 frames, none of them with a telling pair.
+    {
+        const std::vector<StartFrame> frames = WarmedGame(150, quick);
+        auto controller = MakeController();
+        const size_t first_part = 40 + LEAD_WARM_SAMPLES + 8;
+        PlayNatural(controller.get(), std::vector<StartFrame>(frames.begin(), frames.begin() + first_part), nullptr,
+            false);
+        CHECK(controller->StartEvidence().resume_measured);
+        PlayNatural(controller.get(), std::vector<StartFrame>(frames.begin() + first_part, frames.end()), nullptr,
+            false);
+        const StartOracle oracle = BuildOracle(frames);
+        CHECK(oracle.telling == 0 && oracle.resumes == 150);
+        CheckStartMatches(*controller, oracle);
+        const LeadStartEvidence evidence = controller->StartEvidence();
+        CHECK(evidence.telling_pairs == 0 && evidence.resume_samples == 150);
+        CHECK(evidence.resume_measured && evidence.source == LeadStartSource::Resume);
+        CHECK_NEAR(evidence.resume_us, quick.resume_us);
+        LeadGuardOutcome guard{};
+        controller->NextLeadUs(StartRequest(), nullptr, &guard);
+        CHECK(guard.start_applied && !guard.start_aside && guard.start_source == LeadStartSource::Resume);
+        CHECK_NEAR(guard.start_limit_us, limit_us);
+        CHECK(controller->Statistics().start_fallback_frames == 0);
+    }
 
-    // 40 singles: Present services only, so the unit's service (810 µs) is the measure.
-    singles(40, true);
-    CHECK(controller->StartEvidence().service_measured && !controller->StartEvidence().wait_measured);
-    CHECK(controller->StartEvidence().wait_samples == 0 && source() == LeadStartSource::Service);
-    CHECK_NEAR(limit_us(), 2.0 * kInterval - kStartService);
+    // The same after a game that gave pairs (60 frames at the usual resume of 810 µs): 130 quick frames follow, twice
+    // the age at which the window of the pairs used to go stale, and the 99th percentile is the quick figure.
+    {
+        std::vector<StartFrame> frames = WarmedGame(60);
+        const std::vector<StartFrame> stretch = MakeGame(101, 130, quick, frames.back().end_us + 100000.0);
+        frames.insert(frames.end(), stretch.begin(), stretch.end());
+        auto controller = StartPlayed(frames, false);
+        const StartOracle oracle = BuildOracle(frames);
+        CHECK(oracle.telling == 30 && oracle.resumes == 190);
+        CheckStartMatches(*controller, oracle);
+        const LeadStartEvidence evidence = controller->StartEvidence();
+        CHECK(evidence.resume_measured && evidence.source == LeadStartSource::Resume);
+        CHECK(evidence.telling_pairs == 30 && evidence.free_pairs == 0);
+        CHECK_NEAR(evidence.resume_us, quick.resume_us);
+        LeadGuardOutcome guard{};
+        controller->NextLeadUs(StartRequest(), nullptr, &guard);
+        CHECK(guard.start_applied && guard.start_source == LeadStartSource::Resume);
+        CHECK_NEAR(guard.start_limit_us, limit_us);
+    }
+}
 
-    // 31 pairs: 31 game waits, not warm yet, so still the unit's service; the turnaround (150 µs) is measured now.
-    pairs(31);
-    CHECK(controller->StartEvidence().wait_samples == 31 && !controller->StartEvidence().wait_measured);
-    CHECK(source() == LeadStartSource::Service);
-    CHECK_NEAR(limit_us(), 2.0 * kInterval - (kStartService + kStartTurnaround));
-
-    // The 32nd: the game's own wait (1,210 µs) takes over and the limit is tighter.
-    pairs(1);
-    CHECK(controller->StartEvidence().wait_samples == 32 && controller->StartEvidence().wait_measured);
-    CHECK(source() == LeadStartSource::GameWait);
-    CHECK_NEAR(limit_us(), 2.0 * kInterval - (kStartWait + kStartTurnaround));
-
-    // 64 frames without a game wait: still current. The 65th: not current, and the unit's service stands in (its own
-    // window is current, every single gave a service).
-    singles(LEAD_WORK_STALE_FRAMES, true);
-    CHECK(controller->StartEvidence().wait_measured && source() == LeadStartSource::GameWait);
-    singles(1, true);
-    CHECK(!controller->StartEvidence().wait_measured && controller->StartEvidence().wait_samples == 32);
-    CHECK(source() == LeadStartSource::Service);
-    CHECK_NEAR(limit_us(), 2.0 * kInterval - (kStartService + kStartTurnaround));
-
-    // One pair brings the game's own wait back at once: its window is still warm.
-    pairs(1);
-    CHECK(controller->StartEvidence().wait_measured && source() == LeadStartSource::GameWait);
-
-    // 65 frames with no service and no game wait: neither is current, the release headroom is. A service brings the
-    // unit's back.
-    singles(LEAD_WORK_STALE_FRAMES + 1, false);
-    CHECK(!controller->StartEvidence().service_measured && !controller->StartEvidence().wait_measured);
-    CHECK(source() == LeadStartSource::Headroom);
-    CHECK_NEAR(limit_us(), 2.0 * kInterval - (LEAD_RELEASE_HEADROOM_US + kStartTurnaround));
-    singles(1, true);
-    CHECK(source() == LeadStartSource::Service);
+// The resume counts from the release alone, whatever the frame's GPU readiness: a frame the GPU finished after its
+// release (r = a + 12,000 against o = a + 9,000) still has its Present processed after the GPU is done with it, the
+// render queue's next frame starts behind that, and the game with it, so the 3,000 µs between o and r are part of
+// the wait the limit has to see (y = r + 810, so the resume is 3,810 µs, not 810 µs).
+void TestStartTermResumeFromRelease()
+{
+    StartShape late_gpu;
+    late_gpu.lead_us = 9000.0;
+    late_gpu.ready_us = 12000.0;
+    late_gpu.resume_us = 3810.0;
+    late_gpu.waits = false;
+    const std::vector<StartFrame> frames = MakeGame(1, 60, late_gpu);
+    CHECK(frames[10].ready_us > frames[10].output_us);
+    CHECK_NEAR(frames[10].passed_us - frames[10].ready_us, kStartResume);
+    auto controller = StartPlayed(frames, false);
+    CheckStartMatches(*controller, BuildOracle(frames));
+    const LeadStartEvidence evidence = controller->StartEvidence();
+    CHECK(evidence.resume_measured && evidence.resume_samples == 60);
+    CHECK_NEAR(evidence.resume_us, 3810.0);
+    CHECK(controller->Statistics().start_resume_excluded == 0);
 }
 
 // The plan: the key off or only observing, the guard off, other rungs, a plan that is not ordered, the built limit
 // that is lower, an interval that falls between plans, the anchor's delta and a limit that would be below 0. One
-// controller per case: the plan itself moves the bucket's slew state. The 60 frame game is on the unit's Present
-// service (30 telling pairs: too few for the game's own wait), so its limit is 19,040 µs.
+// controller per case: the plan itself moves the bucket's slew state. The 60 frame game gives the render queue's
+// resume (810 µs) and the turnaround (150 µs), so its limit is 19,040 µs.
 void TestStartTermPlan()
 {
     const std::vector<StartFrame> frames = WarmedGame(60);
@@ -5087,7 +5037,7 @@ void TestStartTermPlan()
         request.start_limit = false;
         request.start_observe = true;
         CHECK_NEAR(controller->NextLeadUs(request, nullptr, &guard), 21510.0);
-        CHECK(!guard.start_applied && !guard.start_aside && guard.start_source == LeadStartSource::Service);
+        CHECK(!guard.start_applied && !guard.start_aside && guard.start_source == LeadStartSource::Resume);
         CHECK_NEAR(guard.start_limit_us, 19040.0);
         CHECK(guard.release_limit_us == 0.0 && guard.reduction_us == 0.0);
         CHECK(controller->Statistics().start_checked_frames == 1 && controller->Statistics().start_lowered_frames == 0);
@@ -5166,7 +5116,7 @@ void TestStartTermPlan()
         CHECK_NEAR(guard.start_limit_us, 19040.0);
         CHECK_NEAR(guard.release_limit_us, 19040.0);
     }
-    // A limit below 0 (two intervals shorter than the service and the turnaround) is 0 for the lead and the row, but
+    // A limit below 0 (two intervals shorter than the resume and the turnaround) is 0 for the lead and the row, but
     // never for the executor: 0 reads as no limit there, and a lead of 0 does not guarantee no hold (the previous
     // output can lift the spacing floor above this frame's release), so the plan carries LEAD_START_EXECUTOR_MIN_US.
     {
@@ -5267,13 +5217,14 @@ int main()
     TestStartTermWindows();
     TestStartTermFreePair();
     TestStartTermUntiedStart();
-    TestStartTermNeedsProcessed();
+    TestStartTermNeedsPassed();
     TestStartTermNeedsHeld();
     TestStartTermDeliveryOrder();
     TestStartTermNeverBridgesAGap();
     TestStartTermReset();
-    TestStartTermServiceAge();
-    TestStartTermSources();
+    TestStartTermResumeAge();
+    TestStartTermStaysCurrent();
+    TestStartTermResumeFromRelease();
     TestStartTermPlan();
 
     if (s_failures != 0) {
