@@ -409,7 +409,7 @@ void TestSimulationRenderQueue()
     CHECK(controller->Statistics().unmatched_events == 0);
 }
 
-// The same queue on the GPU queue wait (developer key lead_queue_correction, default off). Under present-first
+// The same queue on the GPU queue wait (developer key lead_queue_correction, default on). Under present-first
 // ordering the render thread stays inside the previous Present until the hold is released, so a finished frame waits
 // behind the hold and the lead learned that wait again. With the key a frame's sample leaves q out when the frame was
 // planned with the key on, its predecessor was planned ordered and the sample is judged behind the wait (Reflex

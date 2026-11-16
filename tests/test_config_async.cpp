@@ -520,6 +520,9 @@ void TestPacingPipelineDefaults() {
     // The start limit is on by default as well (one constant); the published switch follows the configuration.
     CHECK(g_config.gpu_wait_start_limit && kPacingGpuWaitStartLimitDefault && g_gpu_wait_start_limit.load());
     CHECK(Value(local_path, "FrameLimiter", "gpu_wait_start_limit") == "true");
+    // The lead queue correction is on by default too (one constant); the published switch follows the configuration.
+    CHECK(g_config.lead_queue_correction && kPacingLeadQueueCorrectionDefault && g_lead_queue_correction.load());
+    CHECK(Value(local_path, "FrameLimiter", "lead_queue_correction") == "true");
     CheckProductionDefaults();
     // The startup rewrite saves every key, including the developer keys.
     CHECK(Value(local_path, "FrameLimiter", "flip_metering_off") == "false");
@@ -719,10 +722,10 @@ void TestGpuWaitStartLimitIsOnByDefault() {
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
-// Developer lead_queue_correction is off by default (kPacingLeadQueueCorrectionDefault, an A/B switch): a launch
-// without the key publishes false and logs nothing about it; true loads, is saved, is published, is a live key,
-// counts as one developer override and logs one Warn line. The lines are counted, not read.
-void TestLeadQueueCorrectionIsOffByDefault() {
+// Developer lead_queue_correction is on by default (kPacingLeadQueueCorrectionDefault): a launch without the key
+// publishes it and logs nothing about it; false loads, is saved, is published, is a live key, counts as one developer
+// override and logs one Warn line. The lines are counted, not read.
+void TestLeadQueueCorrectionIsOnByDefault() {
     const auto launch = [](const std::vector<IniEntry>& extra) {
         std::vector<IniEntry> ini{{"config_version", "6"}};
         ini.insert(ini.end(), extra.begin(), extra.end());
@@ -730,22 +733,21 @@ void TestLeadQueueCorrectionIsOffByDefault() {
         return WarnCount("");
     };
     const size_t quiet = launch({});
-    CHECK(g_config.lead_queue_correction == kPacingLeadQueueCorrectionDefault && !kPacingLeadQueueCorrectionDefault);
-    CHECK(!g_lead_queue_correction.load() && Config_DeveloperOverrides() == 0);
-    CHECK(Value(local_path, "FrameLimiter", "lead_queue_correction") == "false");
+    CHECK(g_config.lead_queue_correction && g_lead_queue_correction.load() && Config_DeveloperOverrides() == 0);
+    CHECK(Value(local_path, "FrameLimiter", "lead_queue_correction") == "true");
     ReleaseStart();CHECK(OwnerShutdown());
 
-    CHECK(launch({{"lead_queue_correction", "true"}}) == quiet + 1);
-    CHECK(g_config.lead_queue_correction && g_lead_queue_correction.load());
-    CHECK(Value(local_path, "FrameLimiter", "lead_queue_correction") == "true");
+    CHECK(launch({{"lead_queue_correction", "false"}}) == quiet + 1);
+    CHECK(!g_config.lead_queue_correction && !g_lead_queue_correction.load());
+    CHECK(Value(local_path, "FrameLimiter", "lead_queue_correction") == "false");
     CHECK(Config_DeveloperOverrides() == 1);
     char error[128] = {};
-    CHECK(Config_SetLiveKey("lead_queue_correction", "off", error, sizeof(error)) && !g_config.lead_queue_correction);
-    CHECK(!g_lead_queue_correction.load() && Config_DeveloperOverrides() == 0);
     CHECK(Config_SetLiveKey("lead_queue_correction", "on", error, sizeof(error)) && g_config.lead_queue_correction);
-    CHECK(g_lead_queue_correction.load() && Config_DeveloperOverrides() == 1);
+    CHECK(g_lead_queue_correction.load() && Config_DeveloperOverrides() == 0);
+    CHECK(Config_SetLiveKey("lead_queue_correction", "off", error, sizeof(error)) && !g_config.lead_queue_correction);
+    CHECK(!g_lead_queue_correction.load() && Config_DeveloperOverrides() == 1);
     Config_ResetDeveloperSettings();
-    CHECK(!g_config.lead_queue_correction && !g_lead_queue_correction.load() && Config_DeveloperOverrides() == 0);
+    CHECK(g_config.lead_queue_correction && g_lead_queue_correction.load() && Config_DeveloperOverrides() == 0);
     ReleaseStart();CHECK(OwnerShutdown());
 }
 
@@ -2202,7 +2204,7 @@ const IniKey non_default_ini[] = {
     {"developer_settings", "true", "true"}, {"config_version", "6", "6"}, {"flip_metering_off", "true", "true"},
     {"gpu_wait_late_guard", "true", "true"}, {"gpu_wait_present_first", "false", "false"},
     {"gpu_wait_start_limit", "false", "false"},
-    {"lead_queue_correction", "true", "true"},
+    {"lead_queue_correction", "false", "false"},
     {"gpu_wait_ab_interleave_s", "30", "30"},
     {"gpu_queue_probe", "false", "false"}, {"gpu_queue_probe_source", "0", "0"},
     {"pacing_test_mode", "driver_limiter", "driver_limiter"}, {"unified_hold_share", "0.125", "0.125000"},
@@ -2287,7 +2289,7 @@ void TestIniWritesExactlyTheKeysThatExist() {
     CHECK(g_config.flip_metering_off && g_config.control_file && !g_config.gpu_present_gate_probes);
     CHECK(g_config.gpu_wait_late_guard && !g_config.gpu_wait_present_first && g_config.gpu_wait_ab_interleave_s == 30);
     CHECK(!g_gpu_wait_present_first.load());
-    CHECK(g_config.lead_queue_correction && g_lead_queue_correction.load());
+    CHECK(!g_config.lead_queue_correction && !g_lead_queue_correction.load());
     CHECK(!g_config.gpu_queue_probe && g_config.gpu_queue_probe_source == 0 && g_config.unified_queue_margin_end == 0);
     CHECK(g_config.unified_hold_share == 0.125 && !g_config.unified_queue_law && g_config.unified_queue_rank == 3);
     CHECK(g_config.unified_queue_need_frames == 6 && g_config.unified_queue_upstream == 1 && g_config.unified_queue_allow_us == 2500);
@@ -2407,7 +2409,7 @@ const LiveKey live_keys[] = {
     {"unified_queue_margin_end", "0"}, {"unified_hold_share", "0.1"}, {"pacing_test_mode", "reflex_only"},
     {"unified_queue_law", "off"}, {"unified_queue_rank", "3"}, {"unified_queue_need_frames", "6"},
     {"gpu_wait_late_guard", "on"}, {"gpu_wait_present_first", "off"}, {"gpu_wait_start_limit", "off"},
-    {"lead_queue_correction", "on"},
+    {"lead_queue_correction", "off"},
     {"gpu_wait_ab_interleave_s", "30"},
     {"unified_queue_upstream", "1"}, {"unified_queue_allow_us", "2500"}};
 static_assert(sizeof(live_keys) / sizeof(live_keys[0]) == 20, "the contract lists 20 live keys");
@@ -2455,7 +2457,7 @@ const DeveloperField developer_fields[] = {
     {"gpu_wait_late_guard", [] { g_config.gpu_wait_late_guard = true; }, [] { return !g_config.gpu_wait_late_guard; }},
     {"gpu_wait_present_first", [] { g_config.gpu_wait_present_first = false; }, [] { return g_config.gpu_wait_present_first; }},
     {"gpu_wait_start_limit", [] { g_config.gpu_wait_start_limit = false; }, [] { return g_config.gpu_wait_start_limit; }},
-    {"lead_queue_correction", [] { g_config.lead_queue_correction = true; }, [] { return !g_config.lead_queue_correction; }},
+    {"lead_queue_correction", [] { g_config.lead_queue_correction = false; }, [] { return g_config.lead_queue_correction; }},
     {"gpu_wait_ab_interleave_s", [] { g_config.gpu_wait_ab_interleave_s = 30; }, [] { return g_config.gpu_wait_ab_interleave_s == 0; }},
     {"control_file", [] { g_config.control_file = true; }, [] { return !g_config.control_file; }},
     {"gpu_queue_probe", [] { g_config.gpu_queue_probe = false; }, [] { return g_config.gpu_queue_probe; }},
@@ -2692,7 +2694,7 @@ int main() {
     TestGpuPresentGateProbesKey();
     TestGpuWaitPresentFirstIsOnByDefault();
     TestGpuWaitStartLimitIsOnByDefault();
-    TestLeadQueueCorrectionIsOffByDefault();
+    TestLeadQueueCorrectionIsOnByDefault();
     TestUnifiedHoldShareKey();
     TestUnifiedQueueLawKeys();
     TestUnifiedQueueNeedFramesKey();

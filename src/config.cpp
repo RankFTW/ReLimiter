@@ -1127,10 +1127,11 @@ void ApplyConfig() {
         LOG_WARN("Diagnostic GPU wait present first interleaved: present-first ordering acts only in alternate "
                  "periods of %d s, and the plan is made without it in the others "
                  "(gpu_wait_ab_interleave_s=%d; 64-bit Direct3D 12)", interleave_s, interleave_s);
+    // The lead queue correction is on by default: a line only when it is off.
     if (g_config.lead_queue_correction != kPacingLeadQueueCorrectionDefault)
-        LOG_WARN("Diagnostic lead queue correction on: on present-first ordering the GPU queue wait's lead samples "
-                 "leave out the time a finished frame waited for the game's render thread "
-                 "(lead_queue_correction=true; 64-bit Direct3D 12)");
+        LOG_WARN("Diagnostic lead queue correction off: the GPU queue wait's lead samples keep the time a finished "
+                 "frame waited for the game's render thread, and under present-first ordering that wait follows "
+                 "the lead (lead_queue_correction=false; 64-bit Direct3D 12)");
     if (g_config.gpu_queue_probe != kPacingGpuQueueProbeDefault)
         LOG_WARN("Diagnostic GPU queue probe off: the presenting queue's submissions are not measured "
                  "(gpu_queue_probe=false; the queue law needs it and forces it on)");

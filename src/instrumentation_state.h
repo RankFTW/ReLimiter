@@ -44,10 +44,11 @@ inline std::atomic<bool> g_gpu_wait_late_guard{false};
 // at each plan. Its own initial value stays false as the present-first switch's does: nothing is limited before
 // the configuration is published.
 inline std::atomic<bool> g_gpu_wait_start_limit{false};
-// Developer key lead_queue_correction (default off, kPacingLeadQueueCorrectionDefault; lead_controller.h, the game's
+// Developer key lead_queue_correction (default on, kPacingLeadQueueCorrectionDefault; lead_controller.h, the game's
 // simulation → render queue): the GPU queue wait's lead samples of frames planned on present-first ordering leave
 // out the time a finished frame waited for the game's render thread. Published by Config_ApplyPacingPipeline; read
-// by the scheduler owner at each plan, and the lead keeps the word with the frame.
+// by the scheduler owner at each plan, and the lead keeps the word with the frame. Its own initial value stays false
+// as the start limit's does: nothing is corrected before the configuration is published.
 inline std::atomic<bool> g_lead_queue_correction{false};
 // Developer switch gpu_wait_present_first (default on, kPacingGpuWaitPresentFirstDefault; gpu_hold_order.h): in a
 // game whose render queue is not its presenting queue, the render queue's next frame waits until a held frame's

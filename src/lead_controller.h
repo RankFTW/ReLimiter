@@ -381,23 +381,32 @@ enum class LeadStartSource : uint8_t {
 // (SampleUs) starts at w or later.
 // The FG input wait learns X − q whatever the plan says. Its back-pressure comes from its own
 // GPU gate, and its output point lies a GPU frame after the Present call.
-// The GPU queue wait learns it on present-first ordering with developer key lead_queue_correction (default off, an
-// A/B switch until captures decide), for a frame whose predecessor was planned ordered and whose sample is judged
-// behind the wait (QueueUs: the regime SampleUs judges d by). The order puts the hold in front of the render thread:
-// the render queue's next frame waits for the held frame's Present and the game's own frame sync ties its Present's
-// return to the render queue (the start term, above), so a finished frame waits behind the hold, q grows with the
-// lead and the lead that covers it learns it again, the one-frame-deep queue above. Nothing stops that where the
-// collision guard stands aside under the order and the start term does too (a game whose starts are untied): the lead
-// is the bucket's own Q99(X) + allowance. Phantom Blade Zero, no frame generation, present-first ordering, a cap of
-// 72 on a scene the game runs at 70 fps: lead 30.6, 35.0 and 37.6 ms in three runs of one launch, with excursions to
-// the 3 I budget; q above 0.5 ms on 63–83% of frames (p50 4.0–8.2 ms) and following the lead (the render submission
-// started 7.2, 10.1 and 12.6 ms after the release), the slope of X on the lead 0.86–0.94, of X − q 0.10–0.21. The
-// extra lead bought nothing: PC latency rose 0.6 ms for every ms of lead (40.7 to 46.5 ms across nine ordered runs),
-// the displayed frame-to-frame change stayed 0.75–0.88 ms from 30.6 ms up and the share of frames ready by their
-// target 43–45%; at 24 ms the change was 1.26–1.31 ms, so the lead has to cover the frame's own work and not less.
-// Replayed with q taken out of every sample the lead is 28.9–29.9 ms in all three runs (own work p50 19.6–19.9 ms,
-// p99 30–32 ms), and unchanged at a cap of 60, where the render thread is free and q stands on 5–14% of frames.
-// Rogue Core, a serial engine: q is 0 on every frame (123,817 frames), so nothing changes there. Live result pending.
+// The GPU queue wait learns it on present-first ordering with developer key lead_queue_correction (default on), for
+// a frame whose predecessor was planned ordered and whose sample is judged behind the wait (QueueUs: the regime
+// SampleUs judges d by). The order puts the hold in front of the render thread: the render queue's next frame waits
+// for the held frame's Present and the game's own frame sync ties its Present's return to the render queue (the
+// start term, above), so a finished frame waits behind the hold, q grows with the lead and the lead that covers it
+// learns it again, the one-frame-deep queue above. Nothing stops that where the collision guard stands aside under
+// the order and the start term does too (a game whose starts are untied): the lead is the bucket's own Q99(X) +
+// allowance. Phantom Blade Zero, no frame generation, present-first ordering, a cap of 72 on a scene the game runs
+// at 70 fps, without the key: lead 30.6, 35.0 and 37.6 ms in three runs of one launch, with excursions to the 3 I
+// budget; q above 0.5 ms on 63–83% of frames (p50 4.0–8.2 ms) and following the lead (the render submission started
+// 7.2, 10.1 and 12.6 ms after the release), the slope of X on the lead 0.86–0.94, of X − q 0.10–0.21. The extra lead
+// bought nothing: PC latency rose 0.6 ms for every ms of lead (40.7 to 46.5 ms across nine ordered runs), the
+// displayed frame-to-frame change stayed 0.75–0.88 ms from 30.6 ms up and the share of frames ready by their target
+// 43–45%; at 24 ms the change was 1.26–1.31 ms, so the lead has to cover the frame's own work and not less. Replayed
+// with q taken out of every sample the lead is 28.9–29.9 ms in all three runs (own work p50 19.6–19.9 ms, p99 30–32
+// ms), and unchanged at a cap of 60, where the render thread is free and q stands on 5–14% of frames. Rogue Core, a
+// serial engine: q is 0 on every frame (123,817 frames), so nothing changes there.
+// Live, the key off against on inside one launch (four runs an arm), same game and scene: at the cap of 72 the lead
+// fell from 35.4 to 29.9 ms and PC latency from 44.5 to 38.7 ms (−5.8 ± 0.5; against the driver limiter +8.8 → +3.0
+// ms) at the same frame rate (+0.11 ± 0.05 fps), q standing above 0.5 ms on 55% of frames, from 77% (p50 of those 3.0
+// ms, from 5.9). With no cap the lead fell from 32.8 to 28.5 ms and nothing else moved. What remains: the lead covers
+// the 99th percentile of the frame's own work and no longer the wait behind a long frame before it; at the cap the
+// displayed frame-to-frame change went from 0.89 to 0.96 ms and the changes above 4 ms from 19 to 25 per 1,000 (the
+// driver limiter: 1.87 ms and 86). The 1% low was 0.8 ± 0.4 fps lower at the cap (50.6 against 51.4; the driver
+// limiter 47.0) and 0.8 ± 1.1 and 1.0 ± 1.1 higher without a cap and at a cap of 60: no difference shown. At a cap
+// of 60, where the render thread is free, nothing moved (PC latency −0.3 ± 0.3 ms, the change 0.40 and 0.38 ms).
 // Other cases keep X:
 // - On source only (FG unqualified) q was the game's own pipeline
 //   depth (p50 16 ms on half the frames), and the PRESENT_START output point
@@ -624,7 +633,7 @@ struct LeadRequest {
     bool collision_guard = false;
     // Spike floor (above; developer key lead_spike_floor).
     bool spike_floor = true;
-    // Developer key lead_queue_correction (default off; above): the GPU queue wait's lead sample of this frame leaves
+    // Developer key lead_queue_correction (default on; above): the GPU queue wait's lead sample of this frame leaves
     // out the game's simulation → render queue when its predecessor was planned ordered and the sample is judged
     // behind the wait. The FG input wait leaves it out always; no other rung reads this.
     bool queue_correction = false;

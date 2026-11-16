@@ -97,10 +97,11 @@ constexpr bool kPacingGpuWaitPresentFirstDefault = true;
 // after the hold's release and the game's turnaround, which keeps a hold from ending after the start the game
 // needs for the frame two ahead. It stands aside by the game's own times.
 constexpr bool kPacingGpuWaitStartLimitDefault = true;
-// Developer key lead_queue_correction (default off, an A/B switch until captures decide; lead_controller.h, the game's
-// simulation → render queue): the GPU queue wait's lead samples of frames planned on present-first ordering leave
-// out the time a finished frame waited for the game's render thread. The FG input wait always does.
-constexpr bool kPacingLeadQueueCorrectionDefault = false;
+// Developer key lead_queue_correction (default on; lead_controller.h, the game's simulation → render queue): the GPU
+// queue wait's lead samples of frames planned on present-first ordering leave out the time a finished frame waited
+// for the game's render thread (the FG input wait always does). False keeps that wait in the samples, the developer's
+// off switch.
+constexpr bool kPacingLeadQueueCorrectionDefault = true;
 
 // ── Constants of the removed pacing settings ──
 // Each fixes the value of a setting that no longer exists. Under the unified pacer it is what
