@@ -288,7 +288,7 @@ constexpr double LEAD_CONCURRENCY_TOLERANCE_US = 100.0;
 // presenting queue does not block the render queue, no capture shows a delayed start there, and the built limit is
 // that plan's own.
 // W is the render queue's resume after the release: y_n − o_n of a frame n with status Held on the GPU queue wait's
-// rung, in a mode that samples. o is its OutputRelease; y is the hold order unit's stamp
+// rung, in a mode that samples. o is its OutputRelease; y is the GPU queue probe's stamp
 // (PacingStageEventKind::OrderPassed) of the render queue passing the order's Wait behind that frame's Present, the
 // upper end of the GPU queue probe's interval for the Wait's release. It is counted from the release alone: what the
 // game waits for is the render queue, and when the GPU finishes a frame after its release that wait is longer by the

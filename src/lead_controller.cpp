@@ -1270,7 +1270,7 @@ void LeadController::RecordConcurrency(PendingFrame* frame) noexcept
 }
 
 // The render queue's resume y − o after the release of a held GPU queue wait frame (the start term,
-// lead_controller.h): y is the hold order unit's stamp of the render queue passing the order's Wait behind the
+// lead_controller.h): y is the GPU queue probe's stamp of the render queue passing the order's Wait behind the
 // frame's Present, o the frame's release. It is counted from the release alone, whatever the frame's GPU readiness:
 // the game waits for the render queue, and a frame the GPU finished after its release makes that wait longer by the
 // lateness. Only a frame the executor held has one: a frame with another status is decided at its release, and an
@@ -1301,7 +1301,7 @@ void LeadController::RecordStartResume(PendingFrame* frame) noexcept
 // A frame n and its successor n + 1 (the start term, lead_controller.h): the turnaround a_{n+1} − b_n, one sample
 // per frame whether or not anything is held, with the sign of an untied start (a_{n+1} < b_n: the game asked for the
 // frame before its previous Present ended; a negative turnaround is no sample), and the pair (o_n, p_{n+1}, b_{n+1})
-// of a Held frame n for which the hold order unit gave y_n (the render queue passed the order's Wait behind its
+// of a Held frame n that has y_n (the probe saw the render queue pass the order's Wait behind its
 // Present: the order was in effect for that edge; a frame without it gives no pair): telling when the release came
 // after the next frame's native Present arrived, free when the next Present also ended before the release. Both
 // frames must be of one lifecycle, consecutive, released, and of one GPU queue wait bucket in a mode that samples: a
