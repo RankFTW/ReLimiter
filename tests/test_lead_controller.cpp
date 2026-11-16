@@ -4968,13 +4968,34 @@ void TestStartTermPlan()
         CHECK_NEAR(guard.start_limit_us, 19040.0);
         CHECK_NEAR(guard.release_limit_us, 19040.0);
     }
-    // A limit below 0 (two intervals shorter than the service and the turnaround) is 0: the lead is 0, which holds
-    // nothing, and the executor gets no limit.
+    // A limit below 0 (two intervals shorter than the service and the turnaround) is 0 for the lead and the row, but
+    // never for the executor: 0 reads as no limit there, and a lead of 0 does not guarantee no hold (the previous
+    // output can lift the spacing floor above this frame's release), so the plan carries LEAD_START_EXECUTOR_MIN_US.
     {
         auto controller = StartPlayed(frames);
         LeadRequest request = StartRequest(400.0);
         CHECK_NEAR(controller->NextLeadUs(request, nullptr, &guard), 0.0);
-        CHECK(guard.start_applied && guard.start_limit_us == 0.0 && guard.release_limit_us == 0.0);
+        CHECK(guard.start_applied && guard.start_limit_us == 0.0);
+        CHECK_NEAR(guard.release_limit_us, LEAD_START_EXECUTOR_MIN_US);
+    }
+    // The same with the late guard's key on and its larger limit present (the built guard judging: 400 + 2,510 µs):
+    // the lower of the two goes to the executor, so the tighter zero is not lost behind the late guard's bound.
+    {
+        auto controller = StartPlayed(frames, false);
+        LeadRequest request = StartRequest(400.0);
+        request.ordered = false;
+        request.late_guard = true;
+        CHECK_NEAR(controller->NextLeadUs(request, nullptr, &guard), 0.0);
+        CHECK(guard.judged && guard.start_applied && guard.start_limit_us == 0.0);
+        CHECK_NEAR(guard.release_limit_us, LEAD_START_EXECUTOR_MIN_US);
+    }
+    // A limit above the minimum is carried as it is: 2 I − (S + G) = 40 µs at I = 500 µs.
+    {
+        auto controller = StartPlayed(frames);
+        LeadRequest request = StartRequest(500.0);
+        CHECK_NEAR(controller->NextLeadUs(request, nullptr, &guard), 40.0);
+        CHECK_NEAR(guard.start_limit_us, 40.0);
+        CHECK_NEAR(guard.release_limit_us, 40.0);
     }
 }
 

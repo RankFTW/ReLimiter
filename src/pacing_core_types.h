@@ -224,7 +224,8 @@ struct PacingFramePlan {
     // which the GPU queue wait's executor resolves no target past: the spacing floor may otherwise lift a target
     // past the limit when the lead drops by more than the floor's slack in one plan. The lower of the late
     // state's limit (developer key gpu_wait_late_guard) and the start term's (developer key gpu_wait_start_limit,
-    // lead_controller.h), each only while it was applied; 0 = none (neither applied).
+    // lead_controller.h), each only while it was applied; 0 = none (neither applied). An applied start limit that
+    // reaches 0 is carried as 1 µs (LEAD_START_EXECUTOR_MIN_US), never as 0.
     float lead_limit_us = 0.0f;
     // Developer key gpu_wait_present_first (gpu_hold_order.h): this frame's plan was made on the word that the
     // render queue's next frame waits for this frame's Present (LeadRequest::ordered). The GPU queue wait's

@@ -318,6 +318,13 @@ constexpr double LEAD_CONCURRENCY_TOLERANCE_US = 100.0;
 // adds nothing to the new ones. The windows and rings are fed with the key off too; only the limit reads it.
 constexpr double LEAD_START_QUANTILE = 0.99;      // S99 and G99
 constexpr size_t LEAD_START_EVIDENCE_FRAMES = 64; // newest telling pairs and newest frames the stand-aside reads
+// The smallest limit the start term hands the executor. In LeadGuardOutcome::release_limit_us and
+// PacingFramePlan::lead_limit_us 0 means no limit, and a limit that reaches 0 (S99 + G99 at or above 2 I) must still
+// bind: the lead is then 0, but a lead of 0 does not guarantee no hold, because the previous output can lift the
+// spacing floor above this frame's release, and a Present that arrives before that floored target would be held
+// past the applied bound if the executor read the limit as none. With 1 µs Decide resolves max(s + 1 µs, the
+// nominal target), the nominal target. The row's limit and the lead's own bound keep the true value.
+constexpr double LEAD_START_EXECUTOR_MIN_US = 1.0;
 
 // Lockstep engines (CONTROL Resonant): the game finishes
 // frame n's render submission and Present only after ReLimiter releases
@@ -469,7 +476,8 @@ struct LeadGuardOutcome {
     // The limit on the release → target distance, in µs with the anchor's delta not in it, that the executor
     // resolves no target past (PacingFramePlan::lead_limit_us): the lower of the built guard's, I + offset when
     // judged, while developer key gpu_wait_late_guard is on, and the start term's while it was applied (below);
-    // 0 when neither. A start limit at or below 0 holds nothing (the lead is 0) and sets none.
+    // 0 when neither. An applied start limit below 1 µs (the lead is 0) is carried as LEAD_START_EXECUTOR_MIN_US,
+    // never as 0, which the plan and the executor read as no limit.
     double release_limit_us = 0.0;
     // Start term (above), GPU queue wait plans with the guard on and LeadRequest::start_limit or start_observe:
     // the limit computed for the plan, 2 I − (S + G) in µs on the release → target distance (the anchor's delta not

@@ -524,7 +524,10 @@ bool LeadController::StartServiceMeasured() const noexcept
 // show a free pair or an untied start among the newest evidence. The verdict is reported whether the plan applies the
 // term or only observes it (LeadRequest::start_observe); only an applied limit reaches *bound_us, the limit plus
 // the anchor's delta that bounds the lead, and the executor's limit (LeadGuardOutcome::release_limit_us). A limit
-// below 0 is 0: the lead is then 0 and the executor gets no limit, because a lead of 0 holds nothing.
+// below 0 is 0 for the lead and the rows, but never for the executor: 0 means no limit there, and a lead of 0 does
+// not guarantee no hold (the previous output can lift the spacing floor above this frame's release, and a Present
+// that arrives before that floored target would be held past the applied bound), so the executor is given at least
+// LEAD_START_EXECUTOR_MIN_US, and Decide then resolves the nominal target.
 bool LeadController::StartTerm(const LeadRequest& request, LeadGuardOutcome* guard, double* bound_us) noexcept
 {
     const bool measured = StartServiceMeasured();
@@ -554,9 +557,10 @@ bool LeadController::StartTerm(const LeadRequest& request, LeadGuardOutcome* gua
         guard->start_applied = applied;
         guard->start_aside = aside;
         guard->start_measured = measured;
-        if (applied && limit_us > 0.0) {
+        if (applied) {
+            const double executor_us = std::max(limit_us, LEAD_START_EXECUTOR_MIN_US);
             guard->release_limit_us = guard->release_limit_us > 0.0
-                ? std::min(guard->release_limit_us, limit_us) : limit_us;
+                ? std::min(guard->release_limit_us, executor_us) : executor_us;
         }
     }
     if (!applied) return false;

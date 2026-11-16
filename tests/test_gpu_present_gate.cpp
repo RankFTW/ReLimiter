@@ -761,6 +761,7 @@ void TestExecutor() {
         CHECK(lifted(12000.0f)==1612);
         CHECK(lifted(9500.0f)==500);
         CHECK(lifted(8000.0f)==0);
+        CHECK(lifted(1.0f)==0); // the start term's smallest limit (its limit reached 0): the nominal target
     }
     // Hold credit, Decide level: the plan's hold advance moves the resolved target (here the
     // floored one) earlier by exactly that under the live key; 0 and the key off resolve as today.
