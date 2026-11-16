@@ -45,9 +45,13 @@
 // order was in effect for that frame (only such a frame gives it a pair), and as the Present's service, its stand-in
 // while the game's own wait after the release cannot be seen. It is not when the game resumes: the game resumes when
 // the render queue has passed the order's Wait, after this thread signalled the order.
-// Nothing is reported for a value let go late, by the watchdog, by a drop or by a removed device (the Present was not
-// seen processed then), for a hold whose plan gave no identity, or for a frame the plan did not order: only an ordered
-// frame is given a value and a Signal behind its Present.
+// Only a frame the order was in effect for is reported: its order Wait went on R's queue, the check after it found no
+// Execute of another thread in front of it, and R stood at the Wait (its `reached` fence got there) until this Present
+// released it. Nothing is reported for a frame whose edge was rejected or never judged, whose Wait R had not reached,
+// or that was raced (a release that comes before the check of the race is not told either), for a value let go late,
+// by the watchdog, by a drop or by a removed device (the Present was not seen processed then), for a hold whose plan
+// gave no identity, or for a frame the plan did not order: only an ordered frame is given a value and a Signal behind
+// its Present.
 //
 // Threads and locks. The Present thread (OnHold, AfterNativePresent, AfterWait), the threads that submit to R
 // (BeforeSignal, AfterSignal, BeforeExecute), the gate's worker (OnGateRelease), the release thread, the installer's

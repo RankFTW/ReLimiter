@@ -32,9 +32,10 @@
 //      release while the gate has not released the hold is the gate's own delay (the runtime can hold up its Signal of
 //      the time fence): the Wait is let go, the release is counted and said, and the rule is told nothing. Every Wait
 //      its Present released tells the rule (OnReleased), and enough of them in a row forgive its trips.
-//      Every value let go because `issued` reached it is also reported to the pacer: the stage event PresentProcessed of
-//      the plan its hold belongs to, once and after the lock, stamped by a clock read behind the pass's read of `issued`
-//      (Pass, FlushProcessed).
+//      A value let go because `issued` reached it is also reported to the pacer when the order was in effect for its
+//      frame's edge (its Wait went on R's queue with nothing of another thread in front of it, and R stood at it): the
+//      stage event PresentProcessed of the plan its hold belongs to, once and after the lock, stamped by a clock read
+//      behind the pass's read of `issued` (ReleaseThroughLocked, Pass, FlushProcessed).
 // Locks. `lock` guards the binding, the rule, the books, the edges and the values' side data; it is held for loads and
 // stores and for the CPU side of the unit's own fences, never across a native queue call, a call into the probe or a
 // log line. `track_lock` guards the Signal histories and Execute counts of the followed fences: the Signal and Execute
@@ -337,6 +338,7 @@ struct Meta {
     void* render = nullptr;                  // the queue and fence of the order Wait, as announced
     const void* order = nullptr;
     int64_t enqueued = 0;                    // the announce's time
+    bool clean = false;                      // the check after the Wait found no Execute of another thread in front of it
     Told told;
 };
 Meta metas[kMetas];
@@ -369,15 +371,17 @@ void Flush(const ProbeReleases& list) noexcept {
 }
 
 // ── The pacer is told, after the lock, which held frames' Presents were processed ──
-// Collected under the lock (ReleaseThroughLocked, How::Issued) and told after it, like the probe's releases. A hold whose
-// plan gave no identity has nothing to report. The queue takes any thread; no lock of the unit is held while it is told.
-// `stamp`: the clock read the pass took behind its read of `issued` (Pass), the one stamp of every report of the pass.
+// Collected under the lock (ReleaseThroughLocked, How::Issued) and told after it, like the probe's releases. A hold is
+// reported only when the order was in effect for its frame's edge (`clean`: nothing of another thread passed in front
+// of its Wait; the caller has seen R stand at it) and its plan gave an identity. The queue takes any thread; no lock of
+// the unit is held while it is told. `stamp`: the clock read the pass took behind its read of `issued` (Pass), the one
+// stamp of every report of the pass.
 struct ProcessedReport { PacingPlanKey key{}; uint64_t grid_index = 0; };
 struct ProcessedReports {
     ProcessedReport items[kMetas];
     unsigned count = 0;
     void Add(const Meta& meta) noexcept {
-        if (count < kMetas && meta.grid_index != 0 && PacingPlanKey_IsValid(meta.key))
+        if (count < kMetas && meta.clean && meta.grid_index != 0 && PacingPlanKey_IsValid(meta.key))
             items[count++] = {meta.key, meta.grid_index};
     }
 };
@@ -459,10 +463,13 @@ bool ReleaseOrderLocked(uint64_t value) noexcept {
 enum class How { Issued, Late, Watchdog };
 // Lock held. The values up to `value` leave the books, their order Waits released first; `waited_out` gets how many of
 // them had a Wait. Each Wait its Present released tells the rule (OnReleased: enough of them in a row forgive its
-// trips); a late release proves nothing about the order, and the watchdog's is for the caller to judge. Only a release
-// because `issued` reached the value (How::Issued) says its Present was processed: the identities of those holds go to
-// `processed`, each once (a value's side data is released here, and a released one is skipped), to be told after the
-// lock. A late or a watchdog release says nothing of the Present, which may still be to run.
+// trips); a late release proves nothing about the order, and the watchdog's is for the caller to judge. A release
+// because `issued` reached the value (How::Issued) says its Present was processed, and the pacer is told so for a frame
+// the order was in effect for: its Wait went on R's queue, nothing of another thread passed in front of it (`clean`) and
+// R stood at it (the entry's `reached`) until this release. Those identities go to `processed`, each once (the entry
+// leaves the books here), to be told after the lock. A frame whose edge was rejected, whose Wait R had not reached or
+// that was raced is not told, nor one let go late or by the watchdog (its Present may still be to run): the pacer would
+// take the game's own Present time for a wait of the order.
 bool ReleaseThroughLocked(uint64_t value, How how, int64_t now, ProbeReleases* probe, ProcessedReports* processed,
     uint64_t* waited_out = nullptr) noexcept {
     if (!ReleaseOrderLocked(value)) return false;
@@ -472,7 +479,11 @@ bool ReleaseThroughLocked(uint64_t value, How how, int64_t now, ProbeReleases* p
         if (!entry.waited) continue;
         ++waited;
         if (entry.reached) RecordWait(now - entry.reached);
-        if (how == How::Issued) rule.OnReleased();
+        if (how == How::Issued) {
+            rule.OnReleased();
+            if (entry.reached)
+                if (const Meta* meta = FindMeta(entry.value)) processed->Add(*meta);
+        }
     }
     if (waited_out) *waited_out = waited;
     book.ReleaseThrough(value);
@@ -480,7 +491,6 @@ bool ReleaseThroughLocked(uint64_t value, How how, int64_t now, ProbeReleases* p
         .fetch_add(waited, relaxed);
     for (Meta& meta : metas) {
         if (!meta.value || meta.value > value || meta.told.released) continue;
-        if (how == How::Issued) processed->Add(meta);
         TellRelease(meta.told.Released(), meta, now, probe);
         FreeIfDone(meta);
     }
@@ -1186,14 +1196,23 @@ Evidence EvidenceOf(const Edge& edge, const void* queue, uint64_t* since, const 
 }
 // After an order Wait went on R's queue: an Execute another thread counted since the judgement (its hook counts in
 // front of the native call) may have landed in front of the Wait. The Wait stays, and is released like any other, but
-// the frame did not qualify after all: it is counted as raced and the rule is told.
-void CheckRaced(const void* queue, const void* witness, uint64_t witness_executes) noexcept {
+// the frame did not qualify after all: it is counted as raced and the rule is told. A Wait nothing passed in front of
+// is marked clean, and only such a frame is told to the pacer when its Present was processed (ReleaseThroughLocked): a
+// release that comes before this check is not told either.
+void CheckRaced(uint64_t value, uint64_t generation, const void* queue, const void* witness,
+    uint64_t witness_executes) noexcept {
     bool moved = true;   // a track that is gone cannot show that nothing passed
     AcquireSRWLockExclusive(&track_lock);
     const Track* track = FindTrack(witness);
     if (track && track->queue.load(relaxed) == queue) moved = track->history.executes != witness_executes;
     ReleaseSRWLockExclusive(&track_lock);
-    if (!moved) return;
+    if (!moved) {
+        AcquireSRWLockExclusive(&lock);
+        if (binding.valid && binding.generation == generation)
+            if (Meta* meta = FindMeta(value)) meta->clean = true;
+        ReleaseSRWLockExclusive(&lock);
+        return;
+    }
     counters.raced.fetch_add(1, relaxed);
     Rule::Change change = Rule::Change::None;
     AcquireSRWLockExclusive(&lock);
@@ -1264,7 +1283,7 @@ void Judge(ID3D12CommandQueue* queue, GpuHoldOrder_FenceFn native_signal, GpuHol
     ReleaseSRWLockExclusive(&lock);
     for (unsigned i = 0; i < order_count; ++i)
         if (EnqueueOrder(queue, orders[i].value, orders[i].generation, native_signal, native_wait))
-            CheckRaced(queue, orders[i].witness, orders[i].witness_executes);
+            CheckRaced(orders[i].value, orders[i].generation, queue, orders[i].witness, orders[i].witness_executes);
     for (unsigned i = 0; i < change_count; ++i) ReportChange(changes[i]);
 }
 } // namespace gpu_hold_order

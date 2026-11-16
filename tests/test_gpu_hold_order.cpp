@@ -1,10 +1,12 @@
 // The present-first unit itself (src/gpu_hold_order.cpp, included here) against fake fences, on one thread: what its
-// release thread tells the pacer when a held frame's Present was processed. The unit's own Issue gives the values and
-// its own pass, called with a clock of the test's choosing for the books' times, lets them go, so the books, the side
-// data and the release path are the production ones; the stubs below stand for the probe, the pacer's queue and the
-// logger. The report's stamp is a real clock read inside the pass, behind its read of `issued`: the tests bracket it.
-// It proves the unit's bookkeeping (which holds are reported, once each, with which identity and stamp, and outside its
-// lock), not the order on a GPU, the release thread's wake or the Present thread's hooks.
+// release thread tells the pacer when a held frame's Present was processed, and for which frames. The frames go
+// through the unit's own hooks (the Present thread's, and R's Signal and Execute, with the unit's own queue Signal and
+// Wait replaced by fakes that do nothing), so the boundary check, the Wait's enqueue, the check of a race and the pass
+// that lets the value go are the production ones; the fences' values are set by the test, as the GPU would. The stubs
+// below stand for the probe, the pacer's queue and the logger. The report's stamp is a real clock read inside the pass,
+// behind its read of `issued`: the tests bracket it. It proves the unit's bookkeeping (which holds are reported, once
+// each, with which identity and stamp, and outside its lock), not the order on a GPU, the release thread's wake or the
+// threads of the game.
 // The unit is part of the add-on only (RELIMITER_GPU_HOLD_ORDER, 64-bit): this file compiles it itself, as x64 only.
 #ifndef RELIMITER_GPU_HOLD_ORDER
 #define RELIMITER_GPU_HOLD_ORDER 1
@@ -92,7 +94,8 @@ public:
 
 Fence s_issued, s_reached, s_order;
 ID3D12CommandQueue* const kPresent = reinterpret_cast<ID3D12CommandQueue*>(uintptr_t{0x1000});
-const void* const kRender = reinterpret_cast<const void*>(uintptr_t{0x2000});
+ID3D12CommandQueue* const kRenderQueue = reinterpret_cast<ID3D12CommandQueue*>(uintptr_t{0x2000});
+const void* const kRender = kRenderQueue;
 const void* const kDevice = reinterpret_cast<const void*>(uintptr_t{0x3000});
 const void* const kHoldFence = reinterpret_cast<const void*>(uintptr_t{0x4000});
 const void* const kDependency = reinterpret_cast<const void*>(uintptr_t{0x5000});
@@ -101,6 +104,7 @@ const void* const kDependency = reinterpret_cast<const void*>(uintptr_t{0x5000})
 constexpr int64_t kNow = 1'000'000;
 constexpr int64_t kFar = kNow + 1'000'000'000'000;    // a hold's target that no pass of these tests reaches
 uint64_t s_ticket = 0;
+uint64_t s_need = 10;   // the value of the readiness fence R signals for the next frame (the history starts at 1)
 
 PacingPlanKey Key(uint64_t frame) { return {PacingIdentityDomain::NvApiFrame, 5, 7, frame}; }
 
@@ -139,18 +143,78 @@ void Bind() {
     unit::thread_idle.store(true, std::memory_order_relaxed);
 }
 
+// The fence P waits for in front of the gate's own Wait is one the render queue signals: a track the unit follows,
+// whose history holds one old Signal (the oldest never counts as the first that satisfied a Wait) and no Execute.
+void FollowDependency() {
+    AcquireSRWLockExclusive(&unit::track_lock);
+    unit::Track& track = unit::tracks[0];
+    track.fence.store(kDependency, std::memory_order_relaxed);
+    track.queue.store(kRender, std::memory_order_relaxed);
+    track.device.store(kDevice, std::memory_order_relaxed);
+    track.history.Reset();
+    track.history.Signal(1, 0);
+    ReleaseSRWLockExclusive(&unit::track_lock);
+    unit::present_hint.store(kPresent, std::memory_order_relaxed);
+}
+
 // The end of a binding as any drop makes it: every outstanding value is released, no report is made.
 void Unbind() {
     unit::ProbeReleases probe;
     AcquireSRWLockExclusive(&unit::lock);
     unit::DropLocked(&probe);
     ReleaseSRWLockExclusive(&unit::lock);
+    AcquireSRWLockExclusive(&unit::track_lock);
+    for (unit::Track& track : unit::tracks) {
+        track.fence.store(nullptr, std::memory_order_relaxed);
+        track.queue.store(nullptr, std::memory_order_relaxed);
+        track.device.store(nullptr, std::memory_order_relaxed);
+        track.history.Reset();
+    }
+    ReleaseSRWLockExclusive(&unit::track_lock);
+    unit::present_hint.store(nullptr, std::memory_order_relaxed);
     unit::thread_running.store(false, std::memory_order_relaxed);
     unit::thread_idle.store(false, std::memory_order_relaxed);
 }
 
-// A held frame as the Present thread leaves it behind: the unit's own Issue gives its value (`issued` is signalled
-// behind the Present, here by a stub that does nothing) and keeps the plan's identity with it.
+// R's outermost Signal of the fence the next Present waits for (the Signal detour's hooks around the native call).
+void RenderSignals(uint64_t value) {
+    const uint64_t mark = GpuHoldOrder_BeforeSignalActive(kRender, kDependency);
+    GpuHoldOrder_AfterSignalActive(kRender, kDependency, value, mark);
+}
+
+// R's outermost Execute (the Execute detour's hook in front of the native call): the edge due is judged and the order
+// Wait goes on the queue in front of this Execute's lists, by the unit's own Signal and Wait, which here are fakes (the
+// Wait may be one that does something meanwhile).
+void RenderExecutes(GpuHoldOrder_FenceFn wait = &FakeSignal) {
+    GpuHoldOrder_BeforeExecuteActive(kRenderQueue, 1, &FakeSignal, wait);
+}
+
+// The Present thread's side of one held frame: its Wait on the fence R signals, the gate's hold, the native Present's
+// return. The value the unit gave the frame, 0 when it gave none.
+uint64_t PresentHeld(const PacingPlanKey& key, uint64_t grid_index, uint64_t need, int64_t target, bool ordered) {
+    const uint64_t ticket = ++s_ticket;
+    const uint64_t before = unit::next_value;
+    GpuHoldOrder_AfterWaitActive(kPresent, kDependency, need);
+    GpuHoldOrder_OnHoldActive(kPresent, kHoldFence, ticket, target, unit::Frequency() / 60, 0, ordered, 1, key,
+        grid_index);
+    unit::thread_idle.store(true, std::memory_order_relaxed);   // the release thread is served when the value is issued
+    GpuHoldOrder_AfterNativePresentActive(true, ticket);
+    return unit::next_value != before ? unit::next_value : 0;
+}
+
+// A held frame as the hooks leave it behind: R signalled the fence, the frame was held and issued, and R's next Execute
+// judged its edge (qualified: nothing of R ran since the Signal) and put the Wait on the queue. The value.
+uint64_t CoveredHold(const PacingPlanKey& key, uint64_t grid_index, int64_t target,
+    GpuHoldOrder_FenceFn wait = &FakeSignal) {
+    const uint64_t need = ++s_need;
+    RenderSignals(need);
+    const uint64_t value = PresentHeld(key, grid_index, need, target, true);
+    CHECK(value != 0);
+    RenderExecutes(wait);
+    return value;
+}
+
+// A held frame as Issue leaves it when no Execute of R judged its edge: no Wait.
 uint64_t Hold(const PacingPlanKey& key, uint64_t grid_index, int64_t target) {
     unit::Pending pending;
     pending.valid = true;
@@ -183,6 +247,22 @@ bool RunPass(int64_t now) {
     return unit::Pass(now, &deadline, &outstanding);
 }
 
+// A frame the order covered whose Present was processed with R standing at its Wait, and the pass that lets it go.
+// Returns the real clock at the completion.
+int64_t CoveredAndProcessed(const PacingPlanKey& key, uint64_t grid_index, int64_t now) {
+    const uint64_t value = CoveredHold(key, grid_index, kFar);
+    s_reached.value = value;
+    const int64_t done = Complete(value);
+    CHECK(RunPass(now));
+    return done;
+}
+
+// An Execute of another thread lands in front of the order Wait while it is being enqueued.
+HRESULT STDMETHODCALLTYPE WaitRacedByExecute(ID3D12CommandQueue*, ID3D12Fence*, UINT64) {
+    GpuHoldOrder_BeforeExecuteActive(kRenderQueue, 1, &FakeSignal, &FakeSignal);
+    return S_OK;
+}
+
 // The gate hands the plan's identity to the unit with the hold; the unit keeps it with the Present it follows.
 void TestOnHoldKeepsTheIdentity() {
     const PacingPlanKey key = Key(7);
@@ -194,78 +274,158 @@ void TestOnHoldKeepsTheIdentity() {
     CHECK(!unit::t_pending.valid && unit::meta_live.load() == 0 && s_events.empty());
 }
 
-// From the hold the gate told, through the Present's return that gives an ordered frame its value, to the report: the
-// plan's identity is the one the gate gave. A frame the plan did not order is judged at its edge but gets no value, so
-// nothing is reported for it.
-void TestIdentityFlowsFromTheGateToTheReport() {
+// A frame the order covered, from the hold the gate told to the report, through the unit's own hooks: its edge
+// qualified, the Wait is on R's queue with nothing in front of it, R stands at it, and the Present is processed. The
+// report names the plan the gate gave with the hold. A frame the plan did not order is judged too, gets no value and
+// reports nothing.
+void TestCoveredFrameIsReportedWithItsPlan() {
     Bind();
-    // The fence P waits for in front of the gate's own Wait is one the render queue signals: a track the unit follows.
-    unit::tracks[0].fence.store(kDependency, std::memory_order_relaxed);
-    unit::tracks[0].queue.store(kRender, std::memory_order_relaxed);
-    unit::tracks[0].device.store(kDevice, std::memory_order_relaxed);
-    unit::present_hint.store(kPresent, std::memory_order_relaxed);
-    const int64_t interval = unit::Frequency() / 60;
-    GpuHoldOrder_AfterWaitActive(kPresent, kDependency, 5);
-    GpuHoldOrder_OnHoldActive(kPresent, kHoldFence, 21, kFar, interval, 0, true, 1, Key(9), 90);
-    GpuHoldOrder_AfterNativePresentActive(true, 21);
-    CHECK(unit::book.count == 1);
-    const uint64_t ordered_value = unit::book.entries[0].value;
-    const unit::Meta* meta = unit::FindMeta(ordered_value);
-    CHECK(meta && meta->key == Key(9) && meta->grid_index == 90);
-    GpuHoldOrder_AfterWaitActive(kPresent, kDependency, 6);
-    GpuHoldOrder_OnHoldActive(kPresent, kHoldFence, 22, kFar, interval, 0, false, 1, Key(10), 100);
-    GpuHoldOrder_AfterNativePresentActive(true, 22);
-    CHECK(unit::book.count == 1);
-    const int64_t done = Complete(ordered_value);
+    FollowDependency();
+    const uint64_t value = CoveredHold(Key(9), 90, kFar);
+    const unit::Book::Entry* entry = unit::book.Find(value);
+    const unit::Meta* meta = unit::FindMeta(value);
+    CHECK(entry && entry->waited && meta && meta->clean && meta->key == Key(9) && meta->grid_index == 90);
+    s_reached.value = value;   // R stands at the Wait
+    const int64_t done = Complete(value);
     CHECK(RunPass(kNow + 700));
     const int64_t after = unit::Qpc();
     CHECK(s_events.size() == 1 && Count(Key(9), 90, done, after) == 1 && s_events[0].unit_unlocked);
-    unit::tracks[0].fence.store(nullptr, std::memory_order_relaxed);
-    unit::tracks[0].queue.store(nullptr, std::memory_order_relaxed);
-    unit::tracks[0].device.store(nullptr, std::memory_order_relaxed);
+    const uint64_t need = ++s_need;
+    RenderSignals(need);
+    CHECK(PresentHeld(Key(10), 100, need, kFar, false) == 0);
+    RenderExecutes();
+    CHECK(unit::book.count == 0);
+    CHECK(RunPass(kNow + 800));
+    CHECK(s_events.size() == 1);
     Unbind();
 }
 
-// A hold let go because `issued` reached its value is reported once, with its own identity and one stamp for the pass,
-// a real clock read behind the completion; every report is made with the unit's lock free.
+// A covered frame is reported once, when its Present was processed and not before, with the stamp of its pass (a real
+// clock read behind the completion); every report is made with the unit's lock free, and the counter counts them.
 void TestReportedOnceWhenThePresentWasProcessed() {
     Bind();
+    FollowDependency();
     const uint64_t told_before = unit::counters.processed.load();
-    const uint64_t first = Hold(Key(1), 10, kFar);
-    Hold(Key(2), 11, kFar);
-    const uint64_t third = Hold(Key(3), 12, kFar);
+    const uint64_t first = CoveredHold(Key(1), 10, kFar);
+    s_reached.value = first;   // R stands at the first Wait
     CHECK(RunPass(kNow));
     CHECK(s_events.empty());   // no Present was processed yet
     const int64_t first_done = Complete(first);
     CHECK(RunPass(kNow + 1000));
     const int64_t first_after = unit::Qpc();
     CHECK(s_events.size() == 1 && Count(Key(1), 10, first_done, first_after) == 1);
-    const int64_t third_done = Complete(third);   // two at once: both, with the one stamp of their pass
-    CHECK(RunPass(kNow + 2000));
-    const int64_t third_after = unit::Qpc();
-    CHECK(s_events.size() == 3 && Count(Key(2), 11, third_done, third_after) == 1 &&
-        Count(Key(3), 12, third_done, third_after) == 1);
-    CHECK(s_events[1].stamp == s_events[2].stamp);
-    CHECK(RunPass(kNow + 3000));   // a pass after that tells nothing again
-    CHECK(s_events.size() == 3 && unit::book.count == 0);
+    CHECK(RunPass(kNow + 1500));   // a pass after that tells nothing again
+    CHECK(s_events.size() == 1 && unit::book.count == 0);
+    const int64_t second_done = CoveredAndProcessed(Key(2), 11, kNow + 2000);
+    const int64_t second_after = unit::Qpc();
+    CHECK(s_events.size() == 2 && Count(Key(2), 11, second_done, second_after) == 1);
     for (const Event& event : s_events) CHECK(event.unit_unlocked);
-    CHECK(unit::counters.processed.load() - told_before == 3);
+    CHECK(unit::counters.processed.load() - told_before == 2);
+    Unbind();
+}
+
+// The reports of one pass share its stamp: the clock is read once, behind the read of `issued`. (The fence R signals is
+// only a number here, and the unit does not depend on how many frames a pass lets go; the frames are as the hooks leave
+// a covered one.)
+void TestOneStampPerPass() {
+    Bind();
+    const uint64_t first = Hold(Key(1), 10, kFar);
+    const uint64_t second = Hold(Key(2), 11, kFar);
+    for (const uint64_t value : {first, second}) {
+        unit::book.Find(value)->waited = true;
+        unit::FindMeta(value)->clean = true;
+    }
+    s_reached.value = second;
+    const int64_t done = Complete(second);
+    CHECK(RunPass(kNow + 100));
+    const int64_t after = unit::Qpc();
+    CHECK(s_events.size() == 2 && Count(Key(1), 10, done, after) == 1 && Count(Key(2), 11, done, after) == 1);
+    CHECK(s_events[0].stamp == s_events[1].stamp);
+    Unbind();
+}
+
+// A frame whose edge the boundary check rejected (an Execute of R followed the Signal its Present waits for) has no
+// Wait: its Present is let go like any other and R never stood at an order for it, so nothing is reported, whatever
+// the fence R signals says.
+void TestRejectedEdgeReportsNothing() {
+    Bind();
+    FollowDependency();
+    const uint64_t told_before = unit::counters.processed.load();
+    const uint64_t behind_before = unit::counters.behind.load();
+    const uint64_t need = ++s_need;
+    RenderSignals(need);
+    RenderExecutes();   // an Execute behind the Signal, in front of the frame's edge
+    const uint64_t value = PresentHeld(Key(1), 10, need, kFar, true);
+    CHECK(value != 0);
+    RenderExecutes();   // judges the edge: one Execute followed the Signal, so it does not qualify
+    const unit::Book::Entry* entry = unit::book.Find(value);
+    CHECK(entry && !entry->waited && unit::counters.behind.load() - behind_before == 1);
+    s_reached.value = value;
+    Complete(value);
+    CHECK(RunPass(kNow + 100));
+    CHECK(unit::book.count == 0 && s_events.empty() && unit::counters.processed.load() == told_before);
+    Unbind();
+}
+
+// A value no Execute of R judged (R was idle) has no Wait either.
+void TestNoWaitNoReport() {
+    Bind();
+    const uint64_t told_before = unit::counters.processed.load();
+    const uint64_t value = Hold(Key(1), 10, kFar);
+    CHECK(!unit::book.Find(value)->waited);
+    s_reached.value = value;
+    Complete(value);
+    CHECK(RunPass(kNow + 100));
+    CHECK(unit::book.count == 0 && s_events.empty() && unit::counters.processed.load() == told_before);
+    Unbind();
+}
+
+// A Wait R had not reached when its Present was processed (R was late to the edge, its readiness fence stayed behind)
+// did not hold R: the Wait was on the queue and nothing was in front of it, but nothing is reported.
+void TestWaitNotReachedReportsNothing() {
+    Bind();
+    FollowDependency();
+    const uint64_t told_before = unit::counters.processed.load();
+    const uint64_t value = CoveredHold(Key(1), 10, kFar);
+    const unit::Meta* meta = unit::FindMeta(value);
+    CHECK(unit::book.Find(value)->waited && meta && meta->clean);
+    Complete(value);
+    CHECK(RunPass(kNow + 100));
+    CHECK(unit::book.count == 0 && s_events.empty() && unit::counters.processed.load() == told_before);
+    Unbind();
+}
+
+// Another thread's Execute landed in front of the Wait (the check after the Wait found it): the frame is counted as
+// raced, the Wait stays and is released like any other, and the frame is not reported although R stood at the Wait.
+void TestRacedEdgeReportsNothing() {
+    Bind();
+    FollowDependency();
+    const uint64_t told_before = unit::counters.processed.load();
+    const uint64_t raced_before = unit::counters.raced.load();
+    const uint64_t value = CoveredHold(Key(1), 10, kFar, &WaitRacedByExecute);
+    const unit::Book::Entry* entry = unit::book.Find(value);
+    const unit::Meta* meta = unit::FindMeta(value);
+    CHECK(entry && entry->waited && meta && !meta->clean);
+    CHECK(unit::counters.raced.load() - raced_before == 1);
+    s_reached.value = value;
+    Complete(value);
+    CHECK(RunPass(kNow + 100));
+    CHECK(unit::book.count == 0 && s_events.empty() && unit::counters.processed.load() == told_before);
     Unbind();
 }
 
 // A hold whose plan gave no identity (no key, no grid index, or a key that is not valid) is let go like the others and
-// reports nothing.
+// reports nothing, even when the order was in effect for it.
 void TestNoIdentityNoReport() {
     Bind();
+    FollowDependency();
     const PacingPlanKey no_epoch{PacingIdentityDomain::NvApiFrame, 0, 7, 4};
-    Hold(PacingPlanKey{}, 0, kFar);
-    Hold(Key(2), 0, kFar);
-    Hold(no_epoch, 13, kFar);
-    const uint64_t last = Hold(Key(5), 14, kFar);
-    const int64_t done = Complete(last);
-    CHECK(RunPass(kNow + 100));
+    CoveredAndProcessed(PacingPlanKey{}, 0, kNow + 100);
+    CoveredAndProcessed(Key(2), 0, kNow + 200);
+    CoveredAndProcessed(no_epoch, 13, kNow + 300);
+    CHECK(s_events.empty() && unit::book.count == 0);
+    const int64_t done = CoveredAndProcessed(Key(5), 14, kNow + 400);
     const int64_t after = unit::Qpc();
-    CHECK(unit::book.count == 0);
     CHECK(s_events.size() == 1 && Count(Key(5), 14, done, after) == 1);
     Unbind();
 }
@@ -274,7 +434,9 @@ void TestNoIdentityNoReport() {
 // Present is processed afterwards.
 void TestLateIsNotReported() {
     Bind();
-    const uint64_t value = Hold(Key(1), 10, kNow + 10);
+    FollowDependency();
+    const uint64_t value = CoveredHold(Key(1), 10, kNow + 10);
+    CHECK(unit::book.Find(value)->waited);
     CHECK(RunPass(kNow + 1000));
     CHECK(unit::book.count == 0 && s_order.value >= value && s_events.empty());
     Complete(value);
@@ -287,8 +449,10 @@ void TestLateIsNotReported() {
 // is let go as late is not.
 void TestProcessedBeforeLate() {
     Bind();
-    const uint64_t first = Hold(Key(1), 10, kNow + 10);
-    Hold(Key(2), 11, kNow + 20);
+    FollowDependency();
+    const uint64_t first = CoveredHold(Key(1), 10, kNow + 10);
+    CoveredHold(Key(2), 11, kNow + 20);
+    s_reached.value = first;   // R stands at the first Wait, the second is behind it
     const int64_t done = Complete(first);
     CHECK(RunPass(kNow + 1000));
     const int64_t after = unit::Qpc();
@@ -300,12 +464,12 @@ void TestProcessedBeforeLate() {
 // The watchdog's release says nothing of the Present: not reported then, nor when the Present is processed at last.
 void TestWatchdogIsNotReported() {
     Bind();
-    const uint64_t value = Hold(Key(1), 10, kNow + 10);
-    unit::Book::Entry* entry = unit::book.Find(value);
-    CHECK(entry != nullptr);
-    entry->waited = true;   // the render queue's Wait is on the queue and it stands at it
-    s_reached.value = value;
+    FollowDependency();
+    const uint64_t value = CoveredHold(Key(1), 10, kNow + 10);
+    const unit::Book::Entry* entry = unit::book.Find(value);
+    CHECK(entry && entry->waited);
     const int64_t bound = entry->bound;
+    s_reached.value = value;   // R stands at the Wait
     CHECK(RunPass(kNow + 1000));   // the books note when the render queue reached the Wait
     CHECK(unit::book.count == 1 && s_events.empty());
     CHECK(RunPass(kNow + 1000 + bound + 1));   // the bound passed with the Present still not processed
@@ -320,7 +484,9 @@ void TestWatchdogIsNotReported() {
 // pass that does let the value go reports it, once, with a stamp of its own.
 void TestFailedReleaseIsReportedWhenItGoesThrough() {
     Bind();
-    const uint64_t value = Hold(Key(1), 10, kFar);
+    FollowDependency();
+    const uint64_t value = CoveredHold(Key(1), 10, kFar);
+    s_reached.value = value;
     Complete(value);
     s_order.fail = true;
     CHECK(RunPass(kNow + 100));
@@ -339,16 +505,9 @@ void TestFailedReleaseIsReportedWhenItGoesThrough() {
 // queue law reads) keeps the pass's time.
 void TestProbeKeepsThePassTime() {
     Bind();
-    const uint64_t value = Hold(Key(1), 10, kFar);
-    unit::Meta* meta = unit::FindMeta(value);
-    CHECK(meta != nullptr);
-    // As EnqueueOrder leaves it: the Wait was announced to the probe and is on the render queue.
-    meta->render = const_cast<void*>(kRender);
-    meta->order = &s_order;
-    meta->enqueued = kNow - 5;
-    meta->told.Announcing();
-    meta->told.Announced(true, false);
-    unit::book.Find(value)->waited = true;
+    FollowDependency();
+    const uint64_t value = CoveredHold(Key(1), 10, kFar);
+    s_reached.value = value;
     const int64_t done = Complete(value);
     CHECK(RunPass(kNow + 400));
     const int64_t after = unit::Qpc();
@@ -357,18 +516,23 @@ void TestProbeKeepsThePassTime() {
     Unbind();
 }
 
-// A drop (the render queue is destroyed) and a removed device let every outstanding value go and report none of them.
+// A drop (the render queue is destroyed) and a removed device let every outstanding value go and report none of them,
+// covered frames included.
 void TestDropAndDeviceRemovalAreNotReported() {
     Bind();
-    Hold(Key(1), 10, kFar);
-    Hold(Key(2), 11, kFar);
+    FollowDependency();
+    const uint64_t first = CoveredHold(Key(1), 10, kFar);
+    CoveredHold(Key(2), 11, kFar);
+    s_reached.value = first;
     GpuHoldOrder_OnQueueDestroy(const_cast<void*>(kRender));
     CHECK(!unit::binding.valid && unit::meta_live.load() == 0 && s_events.empty());
     s_issued.value = UINT64_MAX;
     CHECK(!RunPass(kNow + 100));
     CHECK(s_events.empty());
     Bind();
-    Hold(Key(3), 12, kFar);
+    FollowDependency();
+    const uint64_t third = CoveredHold(Key(3), 12, kFar);
+    s_reached.value = third;
     s_issued.value = UINT64_MAX;   // a fence read on a removed device answers with the largest value
     CHECK(!RunPass(kNow + 200));
     CHECK(!unit::binding.valid && unit::meta_live.load() == 0 && s_events.empty());
@@ -378,8 +542,13 @@ void TestDropAndDeviceRemovalAreNotReported() {
 
 int main() {
     TestOnHoldKeepsTheIdentity();
-    TestIdentityFlowsFromTheGateToTheReport();
+    TestCoveredFrameIsReportedWithItsPlan();
     TestReportedOnceWhenThePresentWasProcessed();
+    TestOneStampPerPass();
+    TestRejectedEdgeReportsNothing();
+    TestNoWaitNoReport();
+    TestWaitNotReachedReportsNothing();
+    TestRacedEdgeReportsNothing();
     TestNoIdentityNoReport();
     TestLateIsNotReported();
     TestProcessedBeforeLate();
