@@ -94,15 +94,13 @@ std::atomic<uint32_t> ahead_stamp_seq{0};
 std::atomic<uint64_t> ahead_stamp_value{0};
 std::atomic<int64_t> ahead_stamp_qpc{0};
 std::atomic<uint64_t> ahead_early{0}, ahead_behind{0}, ahead_at_marker{0};
-// 3x and 4x (EarlyFirstPresentShared): frames whose first Present returned before the marker completed, and the
-// marker whose release set g_fg_present_order_later_left (written under the release lock, behind the count).
+// 3x and 4x (EarlyFirstPresentShared): frames whose first Present returned before the marker completed.
 std::atomic<uint64_t> first_early{0};
-std::atomic<uint64_t> later_frame{0};
 std::atomic<uint64_t> ahead_held{0}, ahead_held_us{0}, ahead_held_max_us{0}, ahead_unheld{0}, ahead_gave_up{0};
 std::atomic<uint64_t> ahead_spacing_us{0}, ahead_lead_us{0};
 std::atomic<unsigned> ahead_lines{0};
 void AheadAtMarker(int64_t woke) noexcept;
-uint64_t EarlyFirstPresentShared() noexcept;
+uint64_t EarlyFirstPresentShared(uint64_t frame) noexcept;
 // What the installer's worker last said (FgPresentOrder_Service): a queue is bound only while frame generation
 // presents, and the binding stands for one multiplier.
 std::atomic<bool> presenting{false};
@@ -463,8 +461,7 @@ void DropLocked() noexcept {
     g_fg_present_order_queue.store(nullptr, std::memory_order_release);
     g_fg_present_order_real_awaited.store(0, std::memory_order_release);
     // What a Present left for this binding's markers ends with them: the next binding counts its markers from 0 again.
-    g_fg_present_order_later_left.store(0, std::memory_order_release);
-    later_frame.store(0, std::memory_order_release);
+    g_fg_present_order_later.store(0, std::memory_order_release);
     ahead_presented.store(0, std::memory_order_release);
     ReleaseSRWLockExclusive(&release_lock);
     ReleaseFence(&marker);
@@ -613,6 +610,15 @@ void ApplyTrailChange(TrailRule::Change change) noexcept {
 // trailing path, which its own rule judges, and it must not take the ordering itself down.
 void FinishLocked(Origin origin, uint64_t reached, int64_t now, Finish* finish) noexcept {
     const int64_t since = trail.since;
+    // 3x and 4x (EarlyFirstPresentShared; the count is 0 at 2x, where nothing reads it): the marker and, in the low
+    // byte, its frame's Presents still to come, the generated frames after its first and the real one. The watchdog
+    // released with no Present: they cannot be told apart, none is awaited, and the next Present that finds a marker
+    // issued and not completed is taken as a frame's first. One word, published before the marker itself: a Present
+    // reads the count and the marker it is for together, and takes one only while they are still that word.
+    const int generated = multiplier.load(relaxed);
+    g_fg_present_order_later.store(
+        reached << 8 | (origin != Origin::Watchdog && generated >= 2 ? static_cast<uint64_t>(generated) : 0),
+        std::memory_order_release);
     g_fg_present_order_released.store(reached, std::memory_order_release);
     (origin == Origin::Present ? by_present : origin == Origin::Watchdog ? by_watchdog
         : origin == Origin::Trailed ? by_trailing : origin == Origin::Missing ? left_missing : left_late)
@@ -639,15 +645,6 @@ void FinishLocked(Origin origin, uint64_t reached, int64_t now, Finish* finish) 
         origin != Origin::Watchdog && window_live.load(relaxed) && g_fg_render_break_window.load(relaxed) != 0
             ? reached : 0,
         std::memory_order_release);
-    // 3x and 4x (EarlyFirstPresentShared; 0 at 2x, where nothing reads it): the frame's Presents still to come, the
-    // generated frames after its first and the real one. The watchdog released with no Present: they cannot be told
-    // apart, none is awaited, and the next Present that finds a marker issued and not completed is taken as a frame's
-    // first. The count, then the marker it is for: a Present that finds the marker published above without it waits
-    // for this lock (ReleaseDue).
-    const int generated = multiplier.load(relaxed);
-    g_fg_present_order_later_left.store(origin != Origin::Watchdog && generated >= 2 ? generated : 0,
-        std::memory_order_release);
-    later_frame.store(reached, std::memory_order_release);
 }
 // release_lock held. A Present's release was made at its return and the rule observes: the thread's first outermost
 // submission after it, before the marker's deadline, is what the evidence is about.
@@ -835,22 +832,25 @@ void ReleaseDue(bool watchdog, bool wait, bool at_marker = false, uint64_t only 
     uint64_t later = 0;   // a Present that returned while a release waits for its anchor: the frame it is an output of
     uint64_t reached = ReleasableShared();
     // 3x and 4x (EarlyFirstPresentShared): the frame's Presents are told by their count from its marker's release.
-    // One still to come of the released frame is a later output (the branch below). The one after them, with the next
-    // marker issued and not completed, is the next frame's first and leaves the marker to the unit's thread. That
-    // marker may have completed meanwhile and the thread woken for it before the value was left: then this Present
-    // releases, as one that returns after the completion does.
-    if (!watchdog && !at_marker && reached == 0 && multiplier.load(relaxed) >= 2) {
-        // A release publishes its marker before the count for it (FinishLocked): one that is between the two is waited
-        // for, a few instructions under a lock held for microseconds, so the count read is the published marker's.
-        if (later_frame.load(std::memory_order_acquire) != g_fg_present_order_released.load(std::memory_order_acquire)) {
-            AcquireSRWLockExclusive(&release_lock);
-            ReleaseSRWLockExclusive(&release_lock);
+    // One still to come of the released frame is a later output of it and releases nothing, whatever has completed
+    // since: the breaks are told and that is all. So is one whose count a release ended while it was taken (it was
+    // that older frame's). The Present after them, with the next marker issued and not completed, is the next frame's
+    // first and leaves the marker to the unit's thread. That marker may have completed meanwhile and the thread woken
+    // for it before the value was left: then this Present releases, as one that returns after the completion does.
+    if (!watchdog && !at_marker && multiplier.load(relaxed) >= 2) {
+        uint64_t state = g_fg_present_order_later.load(std::memory_order_acquire);
+        const uint64_t frame = state >> 8;
+        bool counted = false;
+        while ((state & 0xff) != 0 && state >> 8 == frame && !counted)
+            counted = g_fg_present_order_later.compare_exchange_weak(state, state - 1, std::memory_order_acq_rel);
+        if (counted || state >> 8 != frame) {
+            if (counted && g_fg_present_order_real_awaited.load(std::memory_order_acquire) == frame)
+                BreakLaterPresentShared(frame);
+            ReleaseSRWLockShared(&lock);
+            return;
         }
-        int left = g_fg_present_order_later_left.load(std::memory_order_acquire);
-        while (left > 0 &&
-            !g_fg_present_order_later_left.compare_exchange_weak(left, left - 1, std::memory_order_acq_rel)) {}
-        if (left <= 0) {
-            if (uint64_t early = EarlyFirstPresentShared()) {
+        if (reached == 0) {
+            if (uint64_t early = EarlyFirstPresentShared(frame)) {
                 reached = ReleasableShared();
                 if (reached == 0 || !ahead_presented.compare_exchange_strong(early, 0, std::memory_order_acq_rel)) {
                     ReleaseSRWLockShared(&lock);
@@ -1245,12 +1245,14 @@ void GateWorkSeen(uint64_t value, uint32_t epoch) noexcept {
     ReleaseDue(false, true, true, value, epoch);
 }
 // Shared lock held; 3x and 4x; a Present of another thread than the worker has returned with nothing releasable and
-// none of the released frame's Presents still to come. There DLSS-G's presenting thread presents the first generated
-// frame when the first generation is done, and DLSS-G's return Signal, behind which the marker stands, comes when the
-// last one is done, 1.2 ms (3x) and 2.0 ms (4x) later: the frame's first Present returns before its marker completes,
-// and no Present follows the marker for 5 ms (packet traces of 2026-11-17, N.165; judged as at 2x the unit never left
-// its probes there, so neither it nor what waits for it acted). Such a Present leaves the marker to the unit's thread,
-// which releases it when it completes, as that Present's release (AheadAtMarker). Returns the marker left, 0 none.
+// none of the Presents of frame `frame` (the marker released last, as the count read it) still to come. There DLSS-G's
+// presenting thread presents the first generated frame when the first generation is done, and DLSS-G's return Signal,
+// behind which the marker stands, comes when the last one is done, 1.2 ms (3x) and 2.0 ms (4x) later: the frame's
+// first Present returns before its marker completes, and no Present follows the marker for 5 ms (packet traces of
+// 2026-11-17, N.165; judged as at 2x the unit never left its probes there, so neither it nor what waits for it
+// acted). Such a Present leaves the marker to the unit's thread, which releases that marker when it completes, as
+// that Present's release (AheadAtMarker). Returns the marker left, 0 none (also where the marker released last is no
+// longer `frame`: a release was made since the count was read).
 // Which Present is a frame's first is told by the count from the release before (ReleaseDue, FinishLocked): a marker
 // completes between its frame's first Present and the second, so the Presents after a release are that frame's later
 // ones, as many as the multiplier, and the next is the first of the frame after. A marker's issue tells nothing: it
@@ -1261,20 +1263,28 @@ void GateWorkSeen(uint64_t value, uint32_t epoch) noexcept {
 // books, which starts the count again. The first generated frame is in front of the render queue by DLSS-G's own
 // order, so no order Wait is enqueued at these multipliers (FgPresentOrder_AfterWaitActive) and a first Present not
 // told costs the render queue nothing.
-uint64_t EarlyFirstPresentShared() noexcept {
+uint64_t EarlyFirstPresentShared(uint64_t frame) noexcept {
     if (!marker) return 0;
-    const uint64_t released = g_fg_present_order_released.load(relaxed);
+    const uint64_t released = g_fg_present_order_released.load(std::memory_order_acquire);
+    if (released != frame) return 0;
     if (g_fg_present_order_issued.load(std::memory_order_acquire) <= released || Completed(marker) > released) return 0;
     ahead_presented.store(released + 1, std::memory_order_release);
     first_early.fetch_add(1, relaxed);
     return released + 1;
 }
-// The unit's thread, at its wake for a marker.
+// The unit's thread, at its wake for a marker. The value a Present left is taken under the lock, with the binding it
+// was left in (a drop clears the value and counts the epoch under the exclusive lock), and releases that marker and
+// none after it in that binding: taken and then released without either, a value could release a marker of the next
+// binding, or a later marker whose own first Present had not returned.
 void AheadAtMarker(int64_t woke) noexcept {
     AcquireSRWLockShared(&lock);
     uint64_t passed = marker ? Completed(marker) : 0;
     const uint64_t issued = g_fg_present_order_issued.load(std::memory_order_acquire);
     if (passed > issued) passed = issued;
+    const uint32_t epoch = gate_epoch.load(relaxed);
+    uint64_t presented = ahead_presented.load(std::memory_order_acquire);
+    const bool taken = presented != 0 && presented <= passed &&
+        ahead_presented.compare_exchange_strong(presented, 0, std::memory_order_acq_rel);
     ReleaseSRWLockShared(&lock);
     if (const uint64_t before = ahead_stamp_value.load(relaxed); passed != before) {
         ahead_stamp_seq.fetch_add(1, std::memory_order_acq_rel);
@@ -1288,11 +1298,9 @@ void AheadAtMarker(int64_t woke) noexcept {
         }
     }
     if (const HANDLE event = gate_event.load(relaxed)) SetEvent(event);
-    uint64_t presented = ahead_presented.load(std::memory_order_acquire);
-    if (presented != 0 && presented <= passed &&
-        ahead_presented.compare_exchange_strong(presented, 0, std::memory_order_acq_rel)) {
+    if (taken) {
         ahead_at_marker.fetch_add(1, relaxed);
-        if (!GateHandRelease(passed)) ReleaseDue(false, true, true);
+        if (!GateHandRelease(passed)) ReleaseDue(false, true, true, presented, epoch);
     }
 }
 // The completion time stamped for marker `value`: 1 stamped (in *done), 0 not yet, -1 a later marker is stamped already.

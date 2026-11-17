@@ -131,10 +131,11 @@ inline std::atomic<int> g_fg_render_break_every{0};
 inline std::atomic<int> g_fg_render_break_window{-1};
 // The marker value whose frame's later Presents are awaited to place its windows, 0 when none is.
 inline std::atomic<uint64_t> g_fg_present_order_real_awaited{0};
-// 3x and 4x (more than one generated frame a real one): the Presents still to come of the frame whose marker was
-// released last; 0 at 2x and where none is. By it a Present is told as that frame's later one or the next frame's
-// first (EarlyFirstPresentShared), so every Present reaches the release side while it is not 0.
-inline std::atomic<int> g_fg_present_order_later_left{0};
+// 3x and 4x (more than one generated frame a real one): the marker released last and, in the low byte, the Presents
+// of its frame still to come; the count is 0 at 2x and where none is. By it a Present is told as that frame's later
+// one or the next frame's first (EarlyFirstPresentShared), so every Present reaches the release side while the count
+// is not 0.
+inline std::atomic<uint64_t> g_fg_present_order_later{0};
 // Present ahead (developer experiment, live key `fg_present_ahead`: 0 off (default) | 1 observe | 2 act | 3 act with
 // the flip gate | 4 as 3, the render queue waiting for the generated frame's own work; 64-bit; see the section of
 // that name in fg_present_order.cpp). Without hardware flip metering DLSS-G's presenting thread sleeps until frame
@@ -246,7 +247,7 @@ inline void FgPresentOrder_AfterNativePresent(bool presented) noexcept {
     if (g_fg_present_order_issued.load(std::memory_order_relaxed) !=
             g_fg_present_order_released.load(std::memory_order_relaxed) ||
         g_fg_present_order_real_awaited.load(std::memory_order_relaxed) != 0 ||
-        g_fg_present_order_later_left.load(std::memory_order_relaxed) != 0) FgPresentOrder_ReleaseActive(false);
+        (g_fg_present_order_later.load(std::memory_order_relaxed) & 0xff) != 0) FgPresentOrder_ReleaseActive(false);
 }
 #else
 inline void FgPresentOrder_NoteSignal(void*, void*) noexcept {}
