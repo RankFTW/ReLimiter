@@ -1126,7 +1126,6 @@ struct GateArm {
     unsigned signals = 0;   // outermost Signals the thread made inside this native Present
     uint8_t note = 0;       // the real frame's: how its Present's hold ended (AheadBeforePresent)
     uint32_t released = 0, issued = 0;   // the ordering's markers when it was armed
-    bool open = false;      // its native Present is running; closed, the gate waits for the thread's next one (a retry)
 };
 thread_local GateArm gate_arm;
 thread_local uint64_t gate_marker = 0;    // the marker of the thread's newest generated Present
@@ -1300,13 +1299,6 @@ bool GateEnqueue(ID3D12CommandQueue* queue, const GateArm& arm) noexcept {
     }
     return done;
 }
-// The gate's Wait in front of the call, where the thread's last Present made no Signal inside the native call.
-void GatePlaceInFront() noexcept {
-    if (!gate_in_call && present_queue && GateEnqueue(present_queue, gate_arm)) {
-        gate_arm.placed = true;
-        gate_front.fetch_add(1, relaxed);
-    }
-}
 // The presenting thread, in front of a native Present of a cycle woken ahead: the gate for that Present. Where the
 // thread's last Present made a Signal inside the native call the Wait is left to that Signal's return
 // (FgPresentOrder_AfterSignalActive); else it goes in front of the call.
@@ -1316,30 +1308,20 @@ void GateArmFor(bool real, uint64_t marker_value, int64_t spacing, uint8_t note)
     gate_arm = GateArm{true, real, false, marker_value, spacing, 0, note,
         static_cast<uint32_t>(g_fg_present_order_released.load(relaxed)),
         static_cast<uint32_t>(g_fg_present_order_issued.load(relaxed))};
-    gate_arm.open = true;
-    GatePlaceInFront();
-}
-// The presenting thread, in front of a native Present for which nothing is armed anew: where the thread's Present
-// before failed with its gate armed and not placed, this call is that frame's again and gets that gate, with the
-// frame's marker as it was.
-void GateRetry() noexcept {
-    if (!gate_arm.armed || gate_arm.open) return;
-    gate_arm.open = true;
-    gate_arm.signals = 0;
-    GatePlaceInFront();
+    if (!gate_in_call && present_queue && GateEnqueue(present_queue, gate_arm)) {
+        gate_arm.placed = true;
+        gate_front.fetch_add(1, relaxed);
+    }
 }
 // The presenting thread, at the return of a native Present a gate was armed for, whatever the call returned and
-// whatever the key is by now. A call that presented, or whose gate went on the queue, ends the arm: a gate armed and
-// not placed is counted, and whether the thread made a Signal inside the call decides where the next Present's gate
-// goes. A call that failed with its gate not placed leaves the gate armed and closed for the thread's next native
-// Present (GateRetry); closed, no Signal outside a Present gets it (FgPresentOrder_AfterSignalActive), and it still
-// counts, so that Present's entry and return come here.
+// whatever the key is by now: the arm ends with its call. An arm left behind would put its Wait behind the thread's
+// next Signal outside a Present, and kept for a retry it would gate whatever the thread presents next (the frame
+// again, or the next one where the frame was skipped: nothing at a Present says which) and keep its count for good
+// where the thread presents no more. So the Present after one that failed is not gated; no failed Present has been
+// captured. A gate armed and not placed is counted; where the call presented, whether the thread made a Signal
+// inside it decides where the next Present's gate goes.
 void GateAfterPresent(bool presented) noexcept {
     if (!gate_arm.armed) return;
-    if (!presented && !gate_arm.placed) {
-        gate_arm.open = false;
-        return;
-    }
     if (!gate_arm.placed) gate_missed.fetch_add(1, relaxed);
     if (presented) gate_in_call = gate_arm.signals != 0;
     gate_arm = GateArm{};
@@ -2040,7 +2022,7 @@ void FgPresentOrder_NoteQueueWaitActive(ID3D12CommandQueue* queue, ID3D12Fence* 
 // DXGI's, behind its own command list: the gate's Wait goes directly behind the first one.
 void FgPresentOrder_AfterSignalActive(ID3D12CommandQueue* queue) noexcept {
     using namespace fg_present_order;
-    if (!gate_arm.armed || !gate_arm.open) return;
+    if (!gate_arm.armed) return;
     ++gate_arm.signals;
     if (!gate_arm.placed && GateEnqueue(queue, gate_arm)) {
         gate_arm.placed = true;
@@ -2089,15 +2071,10 @@ void FgPresentOrder_AheadBeforePresent() noexcept {
                     GateArmFor(false, value, 0, 0);
                 }
             }
-        } else {
-            GateRetry();
         }
         return;
     }
-    if (!ahead.real) {
-        GateRetry();
-        return;
-    }
+    if (!ahead.real) return;
     const int64_t entry = Qpc();
     const uint64_t value = ahead.value;
     const int64_t spacing = entry - ahead.first, wake = ahead.wake;
