@@ -95,9 +95,9 @@ std::atomic<uint64_t> ahead_stamp_value{0};
 std::atomic<int64_t> ahead_stamp_qpc{0};
 std::atomic<uint64_t> ahead_early{0}, ahead_behind{0}, ahead_at_marker{0};
 // 3x and 4x (EarlyFirstPresentShared): frames whose first Present returned before the marker completed, and the
-// Presents still to come of the frame whose marker was released last.
+// marker whose release set g_fg_present_order_later_left (written under the release lock, behind the count).
 std::atomic<uint64_t> first_early{0};
-std::atomic<int> later_left{0};
+std::atomic<uint64_t> later_frame{0};
 std::atomic<uint64_t> ahead_held{0}, ahead_held_us{0}, ahead_held_max_us{0}, ahead_unheld{0}, ahead_gave_up{0};
 std::atomic<uint64_t> ahead_spacing_us{0}, ahead_lead_us{0};
 std::atomic<unsigned> ahead_lines{0};
@@ -462,7 +462,10 @@ void DropLocked() noexcept {
     trailing_said.store(0, relaxed);
     g_fg_present_order_queue.store(nullptr, std::memory_order_release);
     g_fg_present_order_real_awaited.store(0, std::memory_order_release);
-    later_left.store(0, relaxed);
+    // What a Present left for this binding's markers ends with them: the next binding counts its markers from 0 again.
+    g_fg_present_order_later_left.store(0, std::memory_order_release);
+    later_frame.store(0, std::memory_order_release);
+    ahead_presented.store(0, std::memory_order_release);
     ReleaseSRWLockExclusive(&release_lock);
     ReleaseFence(&marker);
     ReleaseFence(&order);
@@ -636,10 +639,15 @@ void FinishLocked(Origin origin, uint64_t reached, int64_t now, Finish* finish) 
         origin != Origin::Watchdog && window_live.load(relaxed) && g_fg_render_break_window.load(relaxed) != 0
             ? reached : 0,
         std::memory_order_release);
-    // 3x and 4x (EarlyFirstPresentShared; not read at 2x): the frame's Presents still to come, the generated frames
-    // after its first and the real one. The watchdog released with no Present: they cannot be told apart, none is
-    // awaited, and the next Present that finds a marker issued and not completed is taken as a frame's first.
-    later_left.store(origin != Origin::Watchdog ? multiplier.load(relaxed) : 0, relaxed);
+    // 3x and 4x (EarlyFirstPresentShared; 0 at 2x, where nothing reads it): the frame's Presents still to come, the
+    // generated frames after its first and the real one. The watchdog released with no Present: they cannot be told
+    // apart, none is awaited, and the next Present that finds a marker issued and not completed is taken as a frame's
+    // first. The count, then the marker it is for: a Present that finds the marker published above without it waits
+    // for this lock (ReleaseDue).
+    const int generated = multiplier.load(relaxed);
+    g_fg_present_order_later_left.store(origin != Origin::Watchdog && generated >= 2 ? generated : 0,
+        std::memory_order_release);
+    later_frame.store(reached, std::memory_order_release);
 }
 // release_lock held. A Present's release was made at its return and the rule observes: the thread's first outermost
 // submission after it, before the marker's deadline, is what the evidence is about.
@@ -832,8 +840,15 @@ void ReleaseDue(bool watchdog, bool wait, bool at_marker = false, uint64_t only 
     // marker may have completed meanwhile and the thread woken for it before the value was left: then this Present
     // releases, as one that returns after the completion does.
     if (!watchdog && !at_marker && reached == 0 && multiplier.load(relaxed) >= 2) {
-        int left = later_left.load(relaxed);
-        while (left > 0 && !later_left.compare_exchange_weak(left, left - 1, relaxed)) {}
+        // A release publishes its marker before the count for it (FinishLocked): one that is between the two is waited
+        // for, a few instructions under a lock held for microseconds, so the count read is the published marker's.
+        if (later_frame.load(std::memory_order_acquire) != g_fg_present_order_released.load(std::memory_order_acquire)) {
+            AcquireSRWLockExclusive(&release_lock);
+            ReleaseSRWLockExclusive(&release_lock);
+        }
+        int left = g_fg_present_order_later_left.load(std::memory_order_acquire);
+        while (left > 0 &&
+            !g_fg_present_order_later_left.compare_exchange_weak(left, left - 1, std::memory_order_acq_rel)) {}
         if (left <= 0) {
             if (uint64_t early = EarlyFirstPresentShared()) {
                 reached = ReleasableShared();
