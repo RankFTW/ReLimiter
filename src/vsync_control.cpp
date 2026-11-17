@@ -1078,8 +1078,9 @@ __declspec(noinline) static HRESULT PresentBody(
     readiness.Complete(hr == S_OK, retried);
     PushPacingPresent(reinterpret_cast<uint64_t>(self), pacing_attempt, native_gate.trace, replaced);
     // fg_present_order: this Present's packets are on the GPU's queue. Only the selected swapchain's outermost call
-    // that presented counts: a nested entry, another swapchain, a test Present or a failed one queues nothing.
-    if (hr == S_OK && !(Flags & DXGI_PRESENT_TEST)) FgPresentOrder_AfterNativePresent();
+    // that presented counts: a nested entry, another swapchain, a test Present or a failed one queues nothing. A
+    // failed one is still told (as it was in front of the call): what was armed for it is taken back.
+    if (!(Flags & DXGI_PRESENT_TEST)) FgPresentOrder_AfterNativePresent(hr == S_OK);
     // gpu_hold_order (key off: one load and a branch): the hold the gate committed for this call (its ticket) is taken
     // over by the unit when the call presented; a hold whose Present failed or is not this one is dropped.
     GpuHoldOrder_AfterNativePresent(hr == S_OK && !(Flags & DXGI_PRESENT_TEST), first_attempt.gpu_present.ticket);
@@ -1224,7 +1225,7 @@ __declspec(noinline) static HRESULT Present1Body(
     readiness.Complete(result == S_OK, false);
     PushPacingPresent(reinterpret_cast<uint64_t>(self), pacing_attempt, native_gate.trace, replaced);
     // fg_present_order: as in PresentBody.
-    if (result == S_OK && !(PresentFlags & DXGI_PRESENT_TEST)) FgPresentOrder_AfterNativePresent();
+    if (!(PresentFlags & DXGI_PRESENT_TEST)) FgPresentOrder_AfterNativePresent(result == S_OK);
     // gpu_hold_order: as in PresentBody.
     GpuHoldOrder_AfterNativePresent(result == S_OK && !(PresentFlags & DXGI_PRESENT_TEST), attempt.gpu_present.ticket);
     return result;

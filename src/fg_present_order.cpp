@@ -360,7 +360,8 @@ std::atomic<uint64_t> cycle_marker[kCycleRing];
 std::atomic<int64_t> cycle_ticks[kCycleRing];
 std::atomic<uint64_t> done_marker[kCycleRing];
 std::atomic<int64_t> done_qpc[kCycleRing];
-HANDLE gate_thread = nullptr;
+HANDLE gate_thread = nullptr;                  // under `gate_thread_lock`
+SRWLOCK gate_thread_lock = SRWLOCK_INIT;       // the installer's worker makes and reaps the clock, the shutdown joins it
 std::atomic<HANDLE> gate_event{nullptr};
 std::atomic<bool> gate_running{false}, gate_stop{false};
 std::atomic<uint64_t> gate_enqueued{0}, gate_on_target{0}, gate_immediate{0}, gate_bounded{0};
@@ -385,7 +386,9 @@ std::atomic<unsigned> gate_pair_lines{0};
 // Exclusive lock held: every gate Wait is let go, then the fences are released.
 void GateDropLocked() noexcept {
     if (gate) {
-        CpuSignal(gate, gate_issued.load(relaxed));
+        // As the ordering's fence at a drop; a Signal that failed on a device that is not removed is counted.
+        if (FAILED(CpuSignal(gate, gate_issued.load(relaxed))) && Completed(gate) != UINT64_MAX)
+            release_failures.fetch_add(1, relaxed);
         ReleaseFence(&gate);
     }
     ReleaseFence(&gate_ready);
@@ -791,10 +794,17 @@ void EndTrailing() noexcept {
 // be the only releaser: a try that lost cost 4 ms and a fresh bound.
 // `at_marker` (fg_present_ahead): the unit's thread makes the release of a generated frame's Present that returned
 // before frame generation was done; it is that Present's release, made when the marker completes, never deferred.
-void ReleaseDue(bool watchdog, bool wait, bool at_marker = false) noexcept {
+void ReleaseDue(bool watchdog, bool wait, bool at_marker = false, uint64_t only = 0, uint32_t only_epoch = 0) noexcept {
     if (!watchdog && !at_marker && GetCurrentThreadId() == worker_thread.load(relaxed)) return;
     if (wait) AcquireSRWLockShared(&lock);
     else if (!TryAcquireSRWLockShared(&lock)) return;
+    // `only` (the flip gate's clock, for a release handed to it): that marker and none after it, in the binding it was
+    // handed in. The clock may come here late: the watchdog has then released the marker, and a later marker's
+    // generated Present may not have returned.
+    if (only != 0 && gate_epoch.load(relaxed) != only_epoch) {
+        ReleaseSRWLockShared(&lock);
+        return;
+    }
     Finish finish;
     Origin origin = watchdog ? Origin::Watchdog : Origin::Present;
     bool released = false;
@@ -809,6 +819,7 @@ void ReleaseDue(bool watchdog, bool wait, bool at_marker = false) noexcept {
         else locked = TryAcquireSRWLockExclusive(&release_lock) != FALSE;
         if (locked) {
             reached = ReleasableShared();
+            if (only != 0 && reached > only) reached = g_fg_present_order_released.load(relaxed) < only ? only : 0;
             Plan plan = Plan::Release;
             int64_t now = 0;
             // The developer switch (off: this load and branch are all it adds): a Present's release may be deferred to
@@ -895,10 +906,12 @@ DWORD WINAPI Watchdog(void*) noexcept {
             const int64_t now = Qpc();
             if (now >= deadline) {
                 // A deferred release whose Signal has completed by now is the Signal's, not the watchdog's. With the
-                // trailing key on this thread may be the only releaser of the marker, so its locks are waited for,
-                // not given up (a try that lost cost 4 ms and a fresh bound).
+                // trailing key on, or with present ahead (a generated frame's Present that returned early releases
+                // nothing, and the flip gate's clock may owe the release), this thread may be the only releaser of
+                // the marker, so its locks are waited for, not given up (a try that lost cost 4 ms and a fresh bound).
                 if (trail_signalled.load(relaxed)) ReleaseTrailed();
-                ReleaseDue(true, g_fg_present_order_trailing.load(relaxed));
+                ReleaseDue(true, g_fg_present_order_trailing.load(relaxed) || g_fg_present_ahead.load(relaxed) != 0 ||
+                    gate_release_marker.load(relaxed) != 0);
                 break;
             }
             WaitUntil(timer, released_event, trailed_event.load(relaxed), now, deadline);
@@ -1138,16 +1151,18 @@ void AheadEnd() noexcept {
 // bounds a release the clock owes as it bounds any.
 bool GateHandRelease(uint64_t value) noexcept {
     if (g_fg_present_ahead.load(relaxed) < 4 || !gate_running.load(relaxed)) return false;
+    // Handed under the shared lock: a drop, which releases every marker and clears the hand-over, is before or after.
     AcquireSRWLockShared(&lock);
     const uint32_t head = gate_head.load(std::memory_order_acquire);
     const bool any = head != gate_tail.load(std::memory_order_acquire);
     const GateEntry entry = any ? gate_ring[head % kGateRing] : GateEntry{};
+    const bool hand = any && !entry.real && entry.marker == value && entry.stamped;
+    if (hand) gate_release_marker.store(value);
     ReleaseSRWLockShared(&lock);
-    if (!any || entry.real || entry.marker != value || !entry.stamped) {
+    if (!hand) {
         gate_kept.fetch_add(1, relaxed);
         return false;
     }
-    gate_release_marker.store(value);
     // The clock may have seen the work done in between: then the release is taken back, unless the clock took it.
     if (gate_work_marker.load() == value) {
         uint64_t expected = value;
@@ -1155,18 +1170,26 @@ bool GateHandRelease(uint64_t value) noexcept {
     }
     return true;
 }
-// The clock thread: the generated frame of marker `value` has its own work done, or its gate is finished with. Lets
-// the render queue go where the unit's thread left that to the clock.
-void GateWorkSeen(uint64_t value) noexcept {
-    gate_work_marker.store(value);
-    uint64_t expected = value;
-    if (value == 0 || !gate_release_marker.compare_exchange_strong(expected, 0)) return;
+// The clock thread: the generated frame of marker `value` (an entry of the binding `epoch`) has its own work done, or
+// its gate is finished with. Lets the render queue go where the unit's thread left that to the clock: that marker
+// only, and only in the binding the entry belongs to (after a drop nothing is owed).
+void GateWorkSeen(uint64_t value, uint32_t epoch) noexcept {
+    if (value == 0) return;
+    AcquireSRWLockShared(&lock);
+    bool taken = false;
+    if (gate_epoch.load(relaxed) == epoch) {
+        gate_work_marker.store(value);
+        uint64_t expected = value;
+        taken = gate_release_marker.compare_exchange_strong(expected, 0);
+    }
+    ReleaseSRWLockShared(&lock);
+    if (!taken) return;
     if (const int64_t done = GateDoneOf(value)) {
         const int64_t now = Qpc();
         if (now > done) gate_hand_us.fetch_add(static_cast<uint64_t>((now - done) * 1'000'000 / frequency), relaxed);
     }
     gate_handed.fetch_add(1, relaxed);
-    ReleaseDue(false, true, true);
+    ReleaseDue(false, true, true, value, epoch);
 }
 // The unit's thread, at its wake for a marker.
 void AheadAtMarker(int64_t woke) noexcept {
@@ -1280,6 +1303,8 @@ bool GateEnqueue(ID3D12CommandQueue* queue, const GateArm& arm) noexcept {
 // thread's last Present made a Signal inside the native call the Wait is left to that Signal's return
 // (FgPresentOrder_AfterSignalActive); else it goes in front of the call.
 void GateArmFor(bool real, uint64_t marker_value, int64_t spacing, uint8_t note) noexcept {
+    // An armed gate counts with the cycles woken ahead, so the Present's return accounts it whatever the key is then.
+    if (!gate_arm.armed) g_fg_present_ahead_woken.fetch_add(1, relaxed);
     gate_arm = GateArm{true, real, false, marker_value, spacing, 0, note,
         static_cast<uint32_t>(g_fg_present_order_released.load(relaxed)),
         static_cast<uint32_t>(g_fg_present_order_issued.load(relaxed))};
@@ -1287,6 +1312,17 @@ void GateArmFor(bool real, uint64_t marker_value, int64_t spacing, uint8_t note)
         gate_arm.placed = true;
         gate_front.fetch_add(1, relaxed);
     }
+}
+// The presenting thread, at the return of a native Present a gate was armed for, whatever the call returned and
+// whatever the key is by now: an arm left behind would put its Wait behind the thread's next Signal outside a Present.
+// A gate armed and not placed is counted; where the call presented, whether the thread made a Signal inside it
+// decides where the next Present's gate goes.
+void GateAfterPresent(bool presented) noexcept {
+    if (!gate_arm.armed) return;
+    if (!gate_arm.placed) gate_missed.fetch_add(1, relaxed);
+    if (presented) gate_in_call = gate_arm.signals != 0;
+    gate_arm = GateArm{};
+    g_fg_present_ahead_woken.fetch_sub(1, relaxed);
 }
 // The clock thread. Waits until the readiness stamp of `value` has completed (the queue has done the frame's own
 // work in front of its gate) or `deadline`: the time it was seen complete, 0 at the deadline, at a stop or where the
@@ -1362,9 +1398,10 @@ int64_t GateSleepReal(HANDLE timer, const FgFlipGateRule& rule, uint64_t next, i
         if (!looked) {
             if (const int64_t done = GateDoneOf(next); done != 0) {
                 looked = true;
+                // Forward only, never before now: a time that has passed already stays as it is.
                 int64_t sooner = rule.RealBefore(target, done);
+                if (sooner < now) sooner = now;
                 if (sooner < target) {
-                    if (sooner < now) sooner = now;
                     gate_moved.fetch_add(1, relaxed);
                     gate_moved_us.fetch_add(static_cast<uint64_t>((target - sooner) * 1'000'000 / frequency), relaxed);
                     target = sooner;
@@ -1393,7 +1430,7 @@ DWORD WINAPI GateClock(void*) noexcept {
     FgFlipGateRule gate_rule;
     GateSeen seen[kGateSeen];
     unsigned seen_next = 0;
-    int64_t last_flip = 0;
+    int64_t last_shown = 0;
     uint64_t generated_marker = 0;   // the marker of the cycle's generated frame, 0 none
     while (!gate_stop.load(relaxed)) {
         AcquireSRWLockShared(&lock);
@@ -1437,7 +1474,7 @@ DWORD WINAPI GateClock(void*) noexcept {
                     ready = stamps ? GateWaitReady(timer, ready_event, epoch, entry.value,
                         earliest < bound_qpc ? earliest : bound_qpc) : Qpc();
                     if (ready != 0) {
-                        GateWorkSeen(entry.marker);
+                        GateWorkSeen(entry.marker, epoch);
                         // The hold's limit counts from generation's completion: the frame's own work may have stood
                         // behind the gate before it. From the work where the completion was not stamped.
                         int64_t done = GateDoneOf(entry.marker);
@@ -1470,21 +1507,37 @@ DWORD WINAPI GateClock(void*) noexcept {
             else
                 AheadSleepUntil(target, bound_qpc);
         }
-        AcquireSRWLockShared(&lock);
-        if (gate && gate_head.load(relaxed) == head) {
-            CpuSignal(gate, entry.value);
-            gate_head.store(head + 1, std::memory_order_release);
+        // A Signal that failed lets nothing go (as the render queue's release): the entry stays the head and is
+        // signalled again until it is let go, the gate is dropped (the drop signals every value) or the thread stops.
+        // The release is stamped in front of the Signal, the point the clock aims at the flip's time: the Signal's own
+        // duration (12 us in the mean) is the same for every flip and is not lateness.
+        int64_t released = 0;
+        for (;;) {
+            AcquireSRWLockShared(&lock);
+            const bool mine = gate && gate_epoch.load(relaxed) == epoch && gate_head.load(relaxed) == head;
+            released = Qpc();
+            const bool gone = !mine || SUCCEEDED(CpuSignal(gate, entry.value)) || Completed(gate) == UINT64_MAX;
+            if (mine && gone) gate_head.store(head + 1, std::memory_order_release);
+            ReleaseSRWLockShared(&lock);
+            if (gone || gate_stop.load(relaxed)) break;
+            release_failures.fetch_add(1, relaxed);
+            Sleep(1);
         }
-        ReleaseSRWLockShared(&lock);
-        const int64_t released = Qpc();
         if (timed) {
             gate_on_target.fetch_add(1, relaxed);
             gate_wake_err_us.fetch_add(released > target ? static_cast<uint64_t>((released - target) * 1'000'000 / frequency) : 0, relaxed);
         } else {
             gate_immediate.fetch_add(1, relaxed);
         }
-        // When the flip happened: at its release where the frame's own work was done by then (a generated frame held
-        // to a time was ready before it), else when the work is done.
+        // When the flip happened (`shown`, which the pairs are counted by): at its release as the clock made it where
+        // the frame's own work was done by then (a generated frame held to a time was ready before it), else when the
+        // work is done. The rule is given a flip held to a time at that time, not at the release: 14 to 20% of those
+        // releases are 20 to 600 us late (the timer's wake; none over 1 ms in 12,333), and carried into the distance
+        // kept they slow the hundredth given back per flip by their mean (12 to 18 us of 83 to 96). Measured inside
+        // one launch with the release given to the rule: the generated flips 0.5 ms further behind generation and PC
+        // Latency 1.0 ± 0.35 ms higher, for 0.03 to 0.05 ms less displayed change (N.164). The price of the time:
+        // the flip behind a late release comes that much sooner after it.
+        int64_t shown = released;
         int64_t flip = timed ? target : released;
         bool after = false;
         if (stamps && ready == 0 && GateWaitReady(timer, ready_event, epoch, entry.value, 0) == 0) {
@@ -1495,6 +1548,7 @@ DWORD WINAPI GateClock(void*) noexcept {
                     gate_real_late_us.fetch_add(static_cast<uint64_t>((done - flip) * 1'000'000 / frequency), relaxed);
                 }
                 flip = done;
+                shown = done;
                 ready = done;
                 after = true;
             }
@@ -1502,7 +1556,7 @@ DWORD WINAPI GateClock(void*) noexcept {
         gate_rule.Flipped(entry.real, flip);
         if (entry.real) generated_marker = 0;
         if (!entry.real) {
-            GateWorkSeen(entry.marker);
+            GateWorkSeen(entry.marker, epoch);
             if (row.done == 0) row.done = GateDoneOf(entry.marker);
             if (row.done != 0 && flip >= row.done) {
                 gate_lag_sum_us.fetch_add(static_cast<uint64_t>((flip - row.done) * 1'000'000 / frequency), relaxed);
@@ -1515,11 +1569,11 @@ DWORD WINAPI GateClock(void*) noexcept {
         row.flip = flip;
         row.after = after;
         seen[seen_next++ % kGateSeen] = row;
-        if (last_flip != 0 && flip - last_flip < frequency / 250) {
+        if (last_shown != 0 && shown - last_shown < frequency / 250) {
             gate_pairs.fetch_add(1, relaxed);
             GateSayPair(seen, seen_next);
         }
-        last_flip = flip;
+        last_shown = shown;
     }
     if (timer) CloseHandle(timer);
     if (ready_event) CloseHandle(ready_event);
@@ -1563,16 +1617,28 @@ HRESULT STDMETHODCALLTYPE AheadRegister(ID3D12Fence* fence, UINT64 value, HANDLE
 }
 // The installer's worker: the detour, once, when the key is first on and a bind has read the runtime's method.
 void AheadService() noexcept {
-    // fg_present_ahead 3: the flip gate's clock thread, once (it lives until shutdown).
-    if (g_fg_present_ahead.load(relaxed) >= 3 && !gate_thread && !RuntimeLifecycle_IsStopping() && frequency > 0) {
-        if (!gate_event.load(relaxed)) gate_event.store(CreateEventW(nullptr, FALSE, FALSE, nullptr), relaxed);
-        if (gate_event.load(relaxed)) {
-            gate_stop.store(false, relaxed);
-            gate_running.store(true, std::memory_order_release);
-            gate_thread = CreateThread(nullptr, 0, &GateClock, nullptr, 0, nullptr);
-            if (!gate_thread) gate_running.store(false, relaxed);
-            LOG_INFO("FG flip gate: the clock thread %s", gate_thread ? "runs" : "could not be created");
+    // fg_present_ahead 3: the flip gate's clock thread (it lives until shutdown; one that ended behind a shutdown that
+    // could not wait for it is replaced). A shutdown that is joining it has the lock: the next pass looks again.
+    if (g_fg_present_ahead.load(relaxed) >= 3 && !RuntimeLifecycle_IsStopping() && frequency > 0 &&
+        TryAcquireSRWLockExclusive(&gate_thread_lock)) {
+        if (gate_thread && WaitForSingleObject(gate_thread, 0) == WAIT_OBJECT_0) {
+            CloseHandle(gate_thread);
+            gate_thread = nullptr;
         }
+        bool tried = false, runs = false;
+        if (!gate_thread) {
+            if (!gate_event.load(relaxed)) gate_event.store(CreateEventW(nullptr, FALSE, FALSE, nullptr), relaxed);
+            if (gate_event.load(relaxed)) {
+                gate_stop.store(false, relaxed);
+                gate_running.store(true, std::memory_order_release);
+                gate_thread = CreateThread(nullptr, 0, &GateClock, nullptr, 0, nullptr);
+                if (!gate_thread) gate_running.store(false, relaxed);
+                tried = true;
+                runs = gate_thread != nullptr;
+            }
+        }
+        ReleaseSRWLockExclusive(&gate_thread_lock);
+        if (tried) LOG_INFO("FG flip gate: the clock thread %s", runs ? "runs" : "could not be created");
     }
     if (g_fg_present_ahead.load(relaxed) == 0 || ahead_installed.load(relaxed) || ahead_refused.load(relaxed)) return;
     void* const target = ahead_target.load(relaxed);
@@ -1905,22 +1971,27 @@ void FgPresentOrder_OnQueueDestroy(void* native_queue) noexcept {
 
 bool FgPresentOrder_Shutdown(unsigned long timeout_ms) noexcept {
     using namespace fg_present_order;
-    // The flip gate's clock first (it takes `lock` shared); the drop below signals every gate value.
+    // The flip gate's clock first (it takes `lock` shared); the drop below signals every gate value. A clock that
+    // does not end in time is not stopped: the caller hears that, and the thread ends at its next look at the flag.
+    bool clock_stopped = true;
+    AcquireSRWLockExclusive(&gate_thread_lock);
     if (gate_thread) {
         gate_stop.store(true, relaxed);
         if (const HANDLE event = gate_event.load(relaxed)) SetEvent(event);
-        if (WaitForSingleObject(gate_thread, timeout_ms) == WAIT_OBJECT_0) {
+        clock_stopped = WaitForSingleObject(gate_thread, timeout_ms) == WAIT_OBJECT_0;
+        if (clock_stopped) {
             CloseHandle(gate_thread);
             gate_thread = nullptr;
         }
     }
+    ReleaseSRWLockExclusive(&gate_thread_lock);
     // The key goes first: from here BindLocked refuses, so nothing is bound behind the drop below.
     g_fg_present_order.store(false, relaxed);
     AcquireSRWLockExclusive(&lock);
     DropLocked();
     const HANDLE worker = thread;
     ReleaseSRWLockExclusive(&lock);
-    if (!worker) return true;
+    if (!worker) return clock_stopped;
     SetEvent(stop_event);
     if (WaitForSingleObject(worker, timeout_ms) == WAIT_TIMEOUT) return false;
     // The events go under the exclusive lock: a release that is still running reads them under the shared one.
@@ -1935,22 +2006,12 @@ bool FgPresentOrder_Shutdown(unsigned long timeout_ms) noexcept {
              "failures, %llu release failures",
         static_cast<unsigned long long>(by_present.load()), static_cast<unsigned long long>(by_watchdog.load()),
         static_cast<unsigned long long>(enqueue_failures.load()), static_cast<unsigned long long>(release_failures.load()));
-    return true;
+    return clock_stopped;
 }
 
 void FgPresentOrder_NoteQueueWaitActive(ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t value) noexcept {
     using namespace fg_present_order;
     ahead_wait = AheadWait{fence, value, Qpc(), queue};
-}
-
-// fg_present_ahead 3: a native Present of the selected swapchain has returned. A gate armed for it and not placed is
-// counted; whether the thread made a Signal inside the call decides where the next Present's gate goes.
-void FgPresentOrder_GateAfterPresentActive() noexcept {
-    using namespace fg_present_order;
-    if (!gate_arm.armed) return;
-    if (!gate_arm.placed) gate_missed.fetch_add(1, relaxed);
-    gate_in_call = gate_arm.signals != 0;
-    gate_arm = GateArm{};
 }
 
 // fg_present_ahead 3: an outermost Signal went on `queue`. Inside a native Present of a cycle woken ahead it is
@@ -2063,16 +2124,18 @@ void FgPresentOrder_AheadBeforePresent() noexcept {
     if (g_fg_present_ahead.load(relaxed) >= 3) GateArmFor(true, value, spacing, how);
 }
 
-// A native Present of a thread in a cycle woken ahead has returned. True: it was the generated frame's and returned
-// before frame generation was done, so nothing is released here. Where the trailing rule defers, the release is left
-// as a deferred one: the unit's Signal goes behind the thread's next submission and completes when its queue has
-// finished the generated frame's work, so the render queue cannot take the GPU in front of that work (released at
-// the marker, it did in 1 frame of 200 at a cap, and the generated frame was then shown 4 to 7 ms late; packet
-// traces of 2026-11-16). Elsewhere the marker's value is left for the unit's thread, which releases when the marker
-// completes. False: the caller goes on as for any Present.
-bool FgPresentOrder_AheadAfterPresent() noexcept {
+// A native Present of a thread in a cycle woken ahead, or with a gate armed, has returned; `presented`: it was not a
+// test and returned S_OK. The gate armed for it is accounted first, on every return. True: it was the generated
+// frame's, it presented and returned before frame generation was done, so nothing is released here. Where the
+// trailing rule defers, the release is left as a deferred one: the unit's Signal goes behind the thread's next
+// submission and completes when its queue has finished the generated frame's work, so the render queue cannot take
+// the GPU in front of that work (released at the marker, it did in 1 frame of 200 at a cap, and the generated frame
+// was then shown 4 to 7 ms late; packet traces of 2026-11-16). Elsewhere the marker's value is left for the unit's
+// thread, which releases when the marker completes. False: the caller goes on as for any Present.
+bool FgPresentOrder_AheadAfterPresent(bool presented) noexcept {
     using namespace fg_present_order;
-    if (!ahead.woken || ahead.first == 0) return false;
+    GateAfterPresent(presented);
+    if (!presented || !ahead.woken || ahead.first == 0) return false;
     ahead.woken = false;
     ahead.real = true;
     const HANDLE event = ahead_event.load(relaxed);

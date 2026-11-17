@@ -531,15 +531,16 @@ static void on_present(reshade::api::command_queue* queue,
         if (sc && sc->get_device() && sc->get_device()->get_api() == reshade::api::device_api::d3d12) {
             const bool d3d12_queue = queue && queue->get_device() &&
                 queue->get_device()->get_api() == reshade::api::device_api::d3d12;
-            StreamlineProxy_RecordInner(sc->get_native(), d3d12_queue ? queue->get_native() : 0,
-                sc->get_device()->get_native());
+            // One read of the native queue for the three consumers.
+            const uint64_t native_queue = d3d12_queue ? queue->get_native() : 0;
+            StreamlineProxy_RecordInner(sc->get_native(), native_queue, sc->get_device()->get_native());
             StreamlineDiscovery_RecordBoundary({StreamlineBoundaryStage::Present,
-                sc->get_native(), d3d12_queue ? queue->get_native() : 0,
+                sc->get_native(), native_queue,
                 sc->get_device()->get_native(),
                 FrameTimeline_GetPresentSwapchainGeneration(sc->get_native()), 0, false,
                 d3d12_queue ? queue->get_device()->get_native() : 0});
             // fg_present_ahead 3 (key below 3: one load and a branch): the swapchain's queue, for the flip gate.
-            if (d3d12_queue) FgPresentOrder_NotePresentQueue(reinterpret_cast<void*>(static_cast<uintptr_t>(queue->get_native())));
+            if (d3d12_queue) FgPresentOrder_NotePresentQueue(reinterpret_cast<void*>(static_cast<uintptr_t>(native_queue)));
         }
         on_present_impl(
             queue,

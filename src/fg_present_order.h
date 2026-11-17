@@ -146,7 +146,8 @@ inline std::atomic<int> g_fg_present_ahead{0};
 // default 100): the share of the displayed interval given back per flip after a late frame, as 1/this
 // (fg_flip_gate_rule.h).
 inline std::atomic<int> g_fg_flip_gate_give_back{100};
-// Threads woken ahead that have not presented since: the gate of the hold at the Present's return.
+// Threads in a cycle woken ahead that have not presented since, and threads with a flip gate armed for the native
+// Present they are in: the gate of the unit's work in front of a native Present and at its return.
 inline std::atomic<int> g_fg_present_ahead_woken{0};
 
 #if defined(_WIN64) && defined(RELIMITER_FG_PRESENT_ORDER)
@@ -170,7 +171,6 @@ void FgPresentOrder_BeforeExecuteActive(ID3D12CommandQueue* queue, FgPresentOrde
     FgPresentOrder_FenceFn native_wait) noexcept;
 void FgPresentOrder_NoteQueueWaitActive(ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t value) noexcept;
 void FgPresentOrder_NotePlanActive(bool held, double interval_us) noexcept;
-void FgPresentOrder_GateAfterPresentActive() noexcept;
 void FgPresentOrder_NotePresentQueueActive(void* queue) noexcept;
 // ReShade's present event, in front of the native Present (key below 3: one load and a branch): the swapchain's queue.
 inline void FgPresentOrder_NotePresentQueue(void* queue) noexcept {
@@ -183,7 +183,7 @@ inline void FgPresentOrder_AfterSignal(ID3D12CommandQueue* queue) noexcept {
     if (g_fg_present_ahead.load(std::memory_order_relaxed) >= 3) FgPresentOrder_AfterSignalActive(queue);
 }
 void FgPresentOrder_AheadBeforePresent() noexcept;
-bool FgPresentOrder_AheadAfterPresent() noexcept;
+bool FgPresentOrder_AheadAfterPresent(bool presented) noexcept;
 
 // Queue Signal detour, outermost calls only (key off: one load and a branch).
 inline void FgPresentOrder_NoteSignal(void* queue, void* fence) noexcept {
@@ -231,13 +231,14 @@ inline void FgPresentOrder_AfterExecute(ID3D12CommandQueue* queue, unsigned list
 inline void FgPresentOrder_BeforeNativePresent() noexcept {
     if (g_fg_present_ahead_woken.load(std::memory_order_relaxed) != 0) FgPresentOrder_AheadBeforePresent();
 }
-// Native Present entries, after the native call returned (nothing pending: three loads and a branch).
-inline void FgPresentOrder_AfterNativePresent() noexcept {
-    // fg_present_ahead 3 (key below 3: one load and a branch): the gate armed for this Present is accounted.
-    if (g_fg_present_ahead.load(std::memory_order_relaxed) >= 3) FgPresentOrder_GateAfterPresentActive();
-    // fg_present_ahead (no thread woken ahead: one load and a branch): a generated frame's Present that returned
-    // before frame generation was done releases nothing here; the unit's thread does, when the marker completes.
-    if (g_fg_present_ahead_woken.load(std::memory_order_relaxed) != 0 && FgPresentOrder_AheadAfterPresent()) return;
+// Native Present entries that are not a test, after the native call returned; `presented`: it returned S_OK (present
+// ahead idle and nothing pending: four loads and two branches).
+inline void FgPresentOrder_AfterNativePresent(bool presented) noexcept {
+    // fg_present_ahead (no thread in a cycle woken ahead and no gate armed: one load and a branch): a gate armed for
+    // this Present is accounted whatever the call returned; a generated frame's Present that returned before frame
+    // generation was done releases nothing here, the unit's thread does, when the marker completes.
+    if (g_fg_present_ahead_woken.load(std::memory_order_relaxed) != 0 && FgPresentOrder_AheadAfterPresent(presented)) return;
+    if (!presented) return;
     if (g_fg_present_order_issued.load(std::memory_order_relaxed) !=
             g_fg_present_order_released.load(std::memory_order_relaxed) ||
         g_fg_present_order_real_awaited.load(std::memory_order_relaxed) != 0) FgPresentOrder_ReleaseActive(false);
@@ -251,7 +252,7 @@ template <class... Arguments> inline void FgPresentOrder_NotePlan(Arguments&&...
 inline void FgPresentOrder_NotePresentQueue(void*) noexcept {}
 template <class... Arguments> inline void FgPresentOrder_AfterSignal(Arguments&&...) noexcept {}
 template <class... Arguments> inline void FgPresentOrder_BeforeExecute(Arguments&&...) noexcept {}
-inline void FgPresentOrder_AfterNativePresent() noexcept {}
+inline void FgPresentOrder_AfterNativePresent(bool) noexcept {}
 inline void FgPresentOrder_BeforeNativePresent() noexcept {}
 inline void FgPresentOrder_OnQueueDestroy(void*) noexcept {}
 inline bool FgPresentOrder_Shutdown(unsigned long) noexcept { return true; }
