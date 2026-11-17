@@ -17,6 +17,8 @@ struct ID3D12CommandQueue;
 struct ID3D12Fence;
 using StreamlineQueue_SignalFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
 StreamlineQueue_SignalFn StreamlineQueue_NativeSignal() noexcept;
+// The original (native) ID3D12CommandQueue::Wait behind the shared detour (same signature); null until installed.
+StreamlineQueue_SignalFn StreamlineQueue_NativeWait() noexcept;
 void StreamlineQueue_BlockFeature() noexcept;
 void StreamlineQueue_Drain(bool final = false) noexcept;
 // The GPU gate's own queue calls (Wait, timestamps, retirement Signal) made

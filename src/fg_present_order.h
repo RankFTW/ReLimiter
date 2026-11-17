@@ -131,6 +131,23 @@ inline std::atomic<int> g_fg_render_break_every{0};
 inline std::atomic<int> g_fg_render_break_window{-1};
 // The marker value whose frame's later Presents are awaited to place its windows, 0 when none is.
 inline std::atomic<uint64_t> g_fg_present_order_real_awaited{0};
+// Present ahead (developer experiment, live key `fg_present_ahead`: 0 off (default) | 1 observe | 2 act | 3 act with
+// the flip gate | 4 as 3, the render queue waiting for the generated frame's own work; 64-bit; see the section of
+// that name in fg_present_order.cpp). Without hardware flip metering DLSS-G's presenting thread sleeps until frame
+// generation is done and only then prepares and calls its Present, and the ordered render queue sits out that CPU
+// time. Acting, the unit answers that thread's event registration at once where the thread's own queue already waits
+// for the same fence value, so its work is recorded while the GPU still renders. 2: the real frame's Present is held
+// on the CPU to DLSS-G's own spacing after generation is done. 3: that hold stays, and a Wait of the unit's own fence
+// on DLSS-G's presenting queue, directly behind DXGI's Signal inside each native Present, is signalled from the CPU
+// at the flip's time (fg_flip_gate_rule.h), as hardware flip metering would flip it. 4: the render queue is let go
+// when the generated frame's own work in front of its gate is done, not when frame generation is done.
+inline std::atomic<int> g_fg_present_ahead{0};
+// fg_present_ahead 3, while the flip gate's dial is measured (developer live key `fg_flip_gate_give_back`, 4 to 1000,
+// default 100): the share of the displayed interval given back per flip after a late frame, as 1/this
+// (fg_flip_gate_rule.h).
+inline std::atomic<int> g_fg_flip_gate_give_back{100};
+// Threads woken ahead that have not presented since: the gate of the hold at the Present's return.
+inline std::atomic<int> g_fg_present_ahead_woken{0};
 
 #if defined(_WIN64) && defined(RELIMITER_FG_PRESENT_ORDER)
 #include <Windows.h>
@@ -151,6 +168,22 @@ bool FgPresentOrder_Shutdown(unsigned long timeout_ms) noexcept;
 void FgPresentOrder_Service(bool fg_presenting, int fg_multiplier) noexcept;
 void FgPresentOrder_BeforeExecuteActive(ID3D12CommandQueue* queue, FgPresentOrder_FenceFn native_signal,
     FgPresentOrder_FenceFn native_wait) noexcept;
+void FgPresentOrder_NoteQueueWaitActive(ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t value) noexcept;
+void FgPresentOrder_NotePlanActive(bool held, double interval_us) noexcept;
+void FgPresentOrder_GateAfterPresentActive() noexcept;
+void FgPresentOrder_NotePresentQueueActive(void* queue) noexcept;
+// ReShade's present event, in front of the native Present (key below 3: one load and a branch): the swapchain's queue.
+inline void FgPresentOrder_NotePresentQueue(void* queue) noexcept {
+    if (g_fg_present_ahead.load(std::memory_order_relaxed) >= 3) FgPresentOrder_NotePresentQueueActive(queue);
+}
+void FgPresentOrder_AfterSignalActive(ID3D12CommandQueue* queue) noexcept;
+// Queue Signal detour, behind a native outermost Signal that succeeded (key below 3: one load and a branch): the flip
+// gate's Wait goes behind the first one the presenting thread makes inside a native Present.
+inline void FgPresentOrder_AfterSignal(ID3D12CommandQueue* queue) noexcept {
+    if (g_fg_present_ahead.load(std::memory_order_relaxed) >= 3) FgPresentOrder_AfterSignalActive(queue);
+}
+void FgPresentOrder_AheadBeforePresent() noexcept;
+bool FgPresentOrder_AheadAfterPresent() noexcept;
 
 // Queue Signal detour, outermost calls only (key off: one load and a branch).
 inline void FgPresentOrder_NoteSignal(void* queue, void* fence) noexcept {
@@ -161,6 +194,17 @@ inline void FgPresentOrder_AfterWait(ID3D12CommandQueue* queue, ID3D12Fence* fen
     FgPresentOrder_FenceFn native_wait) noexcept {
     if (g_fg_present_order.load(std::memory_order_relaxed))
         FgPresentOrder_AfterWaitActive(queue, fence, native_signal, native_wait);
+}
+// Queue Wait detour, right after the native Wait returned S_OK, outermost calls only (key off: one load and a
+// branch): the calling thread's newest Wait, which its next event registration is compared with.
+inline void FgPresentOrder_NoteQueueWait(ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t value) noexcept {
+    if (g_fg_present_ahead.load(std::memory_order_relaxed) != 0) FgPresentOrder_NoteQueueWaitActive(queue, fence, value);
+}
+// The FG input wait's outcome for the frame of the current proxy Present scope (key below 3: one load and a branch):
+// the pacer's grid interval for the input, and whether it holds the input to the grid (a planned input not held was
+// late for its slot).
+inline void FgPresentOrder_NotePlan(bool held, double interval_us) noexcept {
+    if (g_fg_present_ahead.load(std::memory_order_relaxed) >= 3) FgPresentOrder_NotePlanActive(held, interval_us);
 }
 // Queue Execute detour, in front of the native call, outermost calls only. The ordering's queue is tested first, so
 // where the unit does not order (hardware flip metering, no frame generation) this gate is one load and a branch.
@@ -183,8 +227,17 @@ inline void FgPresentOrder_AfterExecute(ID3D12CommandQueue* queue, unsigned list
         g_fg_present_order_trailing.load(std::memory_order_relaxed))
         FgPresentOrder_AfterExecuteActive(queue, lists, native_signal.load(std::memory_order_acquire));
 }
+// Native Present entries, in front of the native call (no thread woken ahead: one load and a branch).
+inline void FgPresentOrder_BeforeNativePresent() noexcept {
+    if (g_fg_present_ahead_woken.load(std::memory_order_relaxed) != 0) FgPresentOrder_AheadBeforePresent();
+}
 // Native Present entries, after the native call returned (nothing pending: three loads and a branch).
 inline void FgPresentOrder_AfterNativePresent() noexcept {
+    // fg_present_ahead 3 (key below 3: one load and a branch): the gate armed for this Present is accounted.
+    if (g_fg_present_ahead.load(std::memory_order_relaxed) >= 3) FgPresentOrder_GateAfterPresentActive();
+    // fg_present_ahead (no thread woken ahead: one load and a branch): a generated frame's Present that returned
+    // before frame generation was done releases nothing here; the unit's thread does, when the marker completes.
+    if (g_fg_present_ahead_woken.load(std::memory_order_relaxed) != 0 && FgPresentOrder_AheadAfterPresent()) return;
     if (g_fg_present_order_issued.load(std::memory_order_relaxed) !=
             g_fg_present_order_released.load(std::memory_order_relaxed) ||
         g_fg_present_order_real_awaited.load(std::memory_order_relaxed) != 0) FgPresentOrder_ReleaseActive(false);
@@ -193,8 +246,13 @@ inline void FgPresentOrder_AfterNativePresent() noexcept {
 inline void FgPresentOrder_NoteSignal(void*, void*) noexcept {}
 template <class... Arguments> inline void FgPresentOrder_AfterExecute(Arguments&&...) noexcept {}
 template <class... Arguments> inline void FgPresentOrder_AfterWait(Arguments&&...) noexcept {}
+template <class... Arguments> inline void FgPresentOrder_NoteQueueWait(Arguments&&...) noexcept {}
+template <class... Arguments> inline void FgPresentOrder_NotePlan(Arguments&&...) noexcept {}
+inline void FgPresentOrder_NotePresentQueue(void*) noexcept {}
+template <class... Arguments> inline void FgPresentOrder_AfterSignal(Arguments&&...) noexcept {}
 template <class... Arguments> inline void FgPresentOrder_BeforeExecute(Arguments&&...) noexcept {}
 inline void FgPresentOrder_AfterNativePresent() noexcept {}
+inline void FgPresentOrder_BeforeNativePresent() noexcept {}
 inline void FgPresentOrder_OnQueueDestroy(void*) noexcept {}
 inline bool FgPresentOrder_Shutdown(unsigned long) noexcept { return true; }
 inline void FgPresentOrder_Service(bool, int) noexcept {}

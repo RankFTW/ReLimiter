@@ -1017,6 +1017,9 @@ __declspec(noinline) static HRESULT PresentBody(
             NativeGate_Execute(&native_gate,reinterpret_cast<uint64_t>(self));
         first_attempt.native_gate=native_gate.trace;
     }
+    // fg_present_ahead (no thread woken ahead: one load and a branch): the real frame's Present of a presenting thread
+    // that was woken ahead is held here, in front of the telemetry's bracket.
+    if (!(override_flags & DXGI_PRESENT_TEST)) FgPresentOrder_BeforeNativePresent();
     // Pacing telemetry always brackets the native call; the Present span
     // shares the same two reads when one was allocated.
     PacingPresentAttempt pacing_attempt{override_interval, override_flags,
@@ -1197,6 +1200,8 @@ __declspec(noinline) static HRESULT Present1Body(
             NativeGate_Execute(&native_gate,reinterpret_cast<uint64_t>(self));
         attempt.native_gate=native_gate.trace;
     }
+    // fg_present_ahead: as in PresentBody.
+    if (!(PresentFlags & DXGI_PRESENT_TEST)) FgPresentOrder_BeforeNativePresent();
     // Pacing telemetry always brackets the native call; the Present span
     // shares the same two reads when one was allocated.
     PacingPresentAttempt pacing_attempt{SyncInterval, PresentFlags,

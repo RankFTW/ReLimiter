@@ -406,6 +406,8 @@ void LoadConfig(HMODULE hModule) {
     g_config.gpu_wait_ab_interleave_s=ReadINIInt(S,"gpu_wait_ab_interleave_s",0,P);
     g_config.fg_render_break_every=ReadINIInt(S,"fg_render_break_every",1,P);
     g_config.fg_render_break_window=ReadINIInt(S,"fg_render_break_window",-1,P);
+    g_config.fg_present_ahead=ReadINIInt(S,"fg_present_ahead",0,P);
+    g_config.fg_flip_gate_give_back=ReadINIInt(S,"fg_flip_gate_give_back",100,P);
     g_config.unified_hold_share=ReadINIDouble(S,"unified_hold_share",kPacingUnifiedHoldShareDefault,P);
     g_config.unified_queue_law=ReadINIBool(S,"unified_queue_law",kPacingUnifiedQueueLawDefault,P);
     g_config.unified_queue_rank=ReadINIInt(S,"unified_queue_rank",kPacingUnifiedQueueRankDefault,P);
@@ -911,6 +913,8 @@ void Config_ApplyPacingPipeline() {
     g_gpu_wait_ab_interleave_s.store(std::clamp(g_config.gpu_wait_ab_interleave_s, 0, 600), std::memory_order_relaxed);
     g_fg_render_break_every.store(sizeof(void*) == 8 ? std::clamp(g_config.fg_render_break_every, 0, 64) : 0, std::memory_order_relaxed);
     g_fg_render_break_window.store(std::clamp(g_config.fg_render_break_window, -1, 32), std::memory_order_relaxed);
+    g_fg_present_ahead.store(sizeof(void*) == 8 ? std::clamp(g_config.fg_present_ahead, 0, 4) : 0, std::memory_order_relaxed);
+    g_fg_flip_gate_give_back.store(std::clamp(g_config.fg_flip_gate_give_back, 4, 1000), std::memory_order_relaxed);
 }
 
 // ── Live keys (developer control file) ──
@@ -974,6 +978,8 @@ constexpr Key kKeys[] = {
     {"gpu_wait_ab_interleave_s", &SetInt<&Config::gpu_wait_ab_interleave_s>, Publish::Pipeline},
     {"fg_render_break_every", &SetInt<&Config::fg_render_break_every>, Publish::Pipeline},
     {"fg_render_break_window", &SetInt<&Config::fg_render_break_window>, Publish::Pipeline},
+    {"fg_present_ahead", &SetInt<&Config::fg_present_ahead>, Publish::Pipeline},
+    {"fg_flip_gate_give_back", &SetInt<&Config::fg_flip_gate_give_back>, Publish::Pipeline},
     {"unified_queue_margin_end", &SetInt<&Config::unified_queue_margin_end>, Publish::Pipeline},
     {"unified_hold_share", &SetDouble<&Config::unified_hold_share>, Publish::Pipeline},
     {"pacing_test_mode", &SetEnum<PacingTestMode, &Config::pacing_test_mode, PacingTestMode_FromText>, Publish::Pipeline},

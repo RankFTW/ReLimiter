@@ -22,6 +22,7 @@
 #include "render_handoff.h"
 #include "gpu_queue_probe.h"
 #include "gpu_hold_order.h"
+#include "fg_present_order.h"
 #include "instrumentation_state.h"
 #include <d3d12.h>
 #include <avrt.h>
@@ -1517,6 +1518,9 @@ bool GpuPresent_BeginFgInput(uint64_t native,const GpuPresentFgInput& input) noe
         request.floor_base_qpc=late_spacing?decision.grid_target:0;
         if(!Enqueue(request,&trace))outcome=AdmissionOutcome(trace);
     }
+    // fg_present_ahead 3 (key below 3: one load and a branch): whether this input is held to the grid, and the grid's
+    // interval, go with this scope's marker, for the flip gate.
+    FgPresentOrder_NotePlan(outcome==PacingPlanStatus::Held,plan.interval_us);
     trace.queue=native;trace.swapchain=input.swapchain;trace.present_sequence=0;
     trace.plan_status=static_cast<uint8_t>(outcome);
     RecordOutcome(plan,PacingRung::FgInputWait,outcome,trace.target_qpc,Qpc());

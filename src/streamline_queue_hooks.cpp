@@ -142,6 +142,9 @@ template<class Forward> HRESULT ObserveFence(ID3D12CommandQueue* queue, ID3D12Fe
     // gpu_hold_order (key off: one load and a branch): an outermost Signal that went on its queue, for the fences the
     // presenting queue waits for.
     if (outermost_signal && result == S_OK) GpuHoldOrder_AfterSignal(queue, fence, value, hold_mark);
+    // fg_present_ahead 3 (key below 3: one load and a branch): the flip gate's Wait goes behind the first outermost
+    // Signal the presenting thread makes inside a native Present (DXGI's, behind its own command list).
+    if (outermost_signal && result == S_OK) FgPresentOrder_AfterSignal(queue);
     SetLastError(outgoing);
     return result;
 }
@@ -173,6 +176,9 @@ HRESULT STDMETHODCALLTYPE ObserveWait(ID3D12CommandQueue* queue, ID3D12Fence* fe
         if (result == S_OK && depth == 1)
             FgPresentOrder_AfterWait(queue, fence, original_signal.load(std::memory_order_acquire),
                 original_wait.load(std::memory_order_acquire));
+        // fg_present_ahead (key off: one load and a branch): the calling thread's newest outermost Wait that went on
+        // a queue, which its next fence event registration is compared with.
+        if (result == S_OK && depth == 1) FgPresentOrder_NoteQueueWait(queue, fence, value);
         // gpu_hold_order (key off: one load and a branch): an outermost Wait that went on the queue, for the
         // presenting queue's Waits (the dependency of the Present in progress).
         if (result == S_OK && depth == 1) GpuHoldOrder_AfterWait(queue, fence, value);
@@ -292,6 +298,9 @@ void StreamlineQueue_SetFeatureModule(void* options, void* state) noexcept {
 void StreamlineQueue_Drain(bool final) noexcept { StreamlineHandoff_Service(final); }
 StreamlineQueue_SignalFn StreamlineQueue_NativeSignal() noexcept {
     return streamline_queue::original_signal.load(std::memory_order_acquire);
+}
+StreamlineQueue_SignalFn StreamlineQueue_NativeWait() noexcept {
+    return streamline_queue::original_wait.load(std::memory_order_acquire);
 }
 StreamlineQueueOwnedScope::StreamlineQueueOwnedScope() noexcept { ++streamline_queue::depth; }
 StreamlineQueueOwnedScope::~StreamlineQueueOwnedScope() { --streamline_queue::depth; }
