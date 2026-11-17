@@ -136,16 +136,19 @@ inline std::atomic<uint64_t> g_fg_present_order_real_awaited{0};
 // one or the next frame's first (EarlyFirstPresentShared), so every Present reaches the release side while the count
 // is not 0.
 inline std::atomic<uint64_t> g_fg_present_order_later{0};
-// Present ahead (developer experiment, live key `fg_present_ahead`: 0 off (default) | 1 observe | 2 act | 3 act with
-// the flip gate | 4 as 3, the render queue waiting for the generated frame's own work; 64-bit; see the section of
-// that name in fg_present_order.cpp). Without hardware flip metering DLSS-G's presenting thread sleeps until frame
+// Present ahead and the flip gate (live key `fg_present_ahead`: 0 off | 1 observe | 2 act | 3 act with the flip gate |
+// 4 (default) as 3, the render queue waiting for the generated frame's own work; 64-bit; see the sections of those
+// names in fg_present_order.cpp). Without hardware flip metering DLSS-G's presenting thread sleeps until frame
 // generation is done and only then prepares and calls its Present, and the ordered render queue sits out that CPU
 // time. Acting, the unit answers that thread's event registration at once where the thread's own queue already waits
-// for the same fence value, so its work is recorded while the GPU still renders. 2: the real frame's Present is held
-// on the CPU to DLSS-G's own spacing after generation is done. 3: that hold stays, and a Wait of the unit's own fence
-// on DLSS-G's presenting queue, directly behind DXGI's Signal inside each native Present, is signalled from the CPU
-// at the flip's time (fg_flip_gate_rule.h), as hardware flip metering would flip it. 4: the render queue is let go
-// when the generated frame's own work in front of its gate is done, not when frame generation is done.
+// for the same fence value, so its work is recorded while the GPU still renders. 2: the later Presents of the frame
+// are held on the CPU to DLSS-G's own spacing after generation is done. 3: those holds stay, and a Wait of the unit's
+// own fence on DLSS-G's presenting queue, directly behind DXGI's Signal inside each native Present, is signalled from
+// the CPU at the flip's time (fg_flip_gate_rule.h), as hardware flip metering would flip it. 4: the render queue is
+// let go when the first generated frame's own work in front of its gate is done, not when frame generation is done.
+// It acts only where the unit has established the ordering: with hardware flip metering and without frame generation
+// the key's gates below cost one relaxed load and a branch each, and neither the clock thread nor the detour of the
+// fence event registration is made (AheadService).
 inline std::atomic<int> g_fg_present_ahead{0};
 // fg_present_ahead 3, while the flip gate's dial is measured (developer live key `fg_flip_gate_give_back`, 4 to 1000,
 // default 100): the share of the displayed interval given back per flip after a late frame, as 1/this
@@ -177,15 +180,19 @@ void FgPresentOrder_BeforeExecuteActive(ID3D12CommandQueue* queue, FgPresentOrde
 void FgPresentOrder_NoteQueueWaitActive(ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t value) noexcept;
 void FgPresentOrder_NotePlanActive(bool held, double interval_us) noexcept;
 void FgPresentOrder_NotePresentQueueActive(void* queue) noexcept;
-// ReShade's present event, in front of the native Present (key below 3: one load and a branch): the swapchain's queue.
+// ReShade's present event, in front of the native Present (no thread in a cycle woken ahead: one load and a branch):
+// the swapchain's queue, for the gate of a Present of such a cycle.
 inline void FgPresentOrder_NotePresentQueue(void* queue) noexcept {
-    if (g_fg_present_ahead.load(std::memory_order_relaxed) >= 3) FgPresentOrder_NotePresentQueueActive(queue);
+    if (g_fg_present_ahead_woken.load(std::memory_order_relaxed) != 0 &&
+        g_fg_present_ahead.load(std::memory_order_relaxed) >= 3) FgPresentOrder_NotePresentQueueActive(queue);
 }
 void FgPresentOrder_AfterSignalActive(ID3D12CommandQueue* queue) noexcept;
-// Queue Signal detour, behind a native outermost Signal that succeeded (key below 3: one load and a branch): the flip
-// gate's Wait goes behind the first one the presenting thread makes inside a native Present.
+// Queue Signal detour, behind a native outermost Signal that succeeded (no gate armed, which counts with the threads
+// woken ahead: one load and a branch): the flip gate's Wait goes behind the first one the presenting thread makes
+// inside a native Present.
 inline void FgPresentOrder_AfterSignal(ID3D12CommandQueue* queue) noexcept {
-    if (g_fg_present_ahead.load(std::memory_order_relaxed) >= 3) FgPresentOrder_AfterSignalActive(queue);
+    if (g_fg_present_ahead_woken.load(std::memory_order_relaxed) != 0 &&
+        g_fg_present_ahead.load(std::memory_order_relaxed) >= 3) FgPresentOrder_AfterSignalActive(queue);
 }
 void FgPresentOrder_AheadBeforePresent() noexcept;
 bool FgPresentOrder_AheadAfterPresent(bool presented) noexcept;
@@ -200,16 +207,19 @@ inline void FgPresentOrder_AfterWait(ID3D12CommandQueue* queue, ID3D12Fence* fen
     if (g_fg_present_order.load(std::memory_order_relaxed))
         FgPresentOrder_AfterWaitActive(queue, fence, native_signal, native_wait);
 }
-// Queue Wait detour, right after the native Wait returned S_OK, outermost calls only (key off: one load and a
-// branch): the calling thread's newest Wait, which its next event registration is compared with.
+// Queue Wait detour, right after the native Wait returned S_OK, outermost calls only (the unit not ordering, which
+// is tested first: one load and a branch): the calling thread's newest Wait, which its next event registration is
+// compared with.
 inline void FgPresentOrder_NoteQueueWait(ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t value) noexcept {
-    if (g_fg_present_ahead.load(std::memory_order_relaxed) != 0) FgPresentOrder_NoteQueueWaitActive(queue, fence, value);
+    if (g_fg_present_order_queue.load(std::memory_order_relaxed) != nullptr &&
+        g_fg_present_ahead.load(std::memory_order_relaxed) != 0) FgPresentOrder_NoteQueueWaitActive(queue, fence, value);
 }
-// The FG input wait's outcome for the frame of the current proxy Present scope (key below 3: one load and a branch):
-// the pacer's grid interval for the input, and whether it holds the input to the grid (a planned input not held was
-// late for its slot).
+// The FG input wait's outcome for the frame of the current proxy Present scope (the unit not ordering, which is tested
+// first: one load and a branch): the pacer's grid interval for the input, and whether it holds the input to the grid
+// (a planned input not held was late for its slot).
 inline void FgPresentOrder_NotePlan(bool held, double interval_us) noexcept {
-    if (g_fg_present_ahead.load(std::memory_order_relaxed) >= 3) FgPresentOrder_NotePlanActive(held, interval_us);
+    if (g_fg_present_order_queue.load(std::memory_order_relaxed) != nullptr &&
+        g_fg_present_ahead.load(std::memory_order_relaxed) >= 3) FgPresentOrder_NotePlanActive(held, interval_us);
 }
 // Queue Execute detour, in front of the native call, outermost calls only. The ordering's queue is tested first, so
 // where the unit does not order (hardware flip metering, no frame generation) this gate is one load and a branch.

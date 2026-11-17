@@ -406,7 +406,7 @@ void LoadConfig(HMODULE hModule) {
     g_config.gpu_wait_ab_interleave_s=ReadINIInt(S,"gpu_wait_ab_interleave_s",0,P);
     g_config.fg_render_break_every=ReadINIInt(S,"fg_render_break_every",1,P);
     g_config.fg_render_break_window=ReadINIInt(S,"fg_render_break_window",-1,P);
-    g_config.fg_present_ahead=ReadINIInt(S,"fg_present_ahead",0,P);
+    g_config.fg_present_ahead=ReadINIInt(S,"fg_present_ahead",4,P);
     g_config.fg_flip_gate_give_back=ReadINIInt(S,"fg_flip_gate_give_back",100,P);
     g_config.unified_hold_share=ReadINIDouble(S,"unified_hold_share",kPacingUnifiedHoldShareDefault,P);
     g_config.unified_queue_law=ReadINIBool(S,"unified_queue_law",kPacingUnifiedQueueLawDefault,P);

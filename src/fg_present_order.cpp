@@ -857,6 +857,13 @@ void ReleaseDue(bool watchdog, bool wait, bool at_marker = false, uint64_t only 
         // None still to come: this Present is the first of the frame after `frame`.
         if (reached == 0) {
             uint64_t early = EarlyFirstPresentShared(frame);
+            // fg_present_ahead: the thread whose Present is a frame's first is DLSS-G's presenting thread, as the one
+            // whose Present releases a marker is (below). At these multipliers a first Present seldom finds its marker
+            // completed, and present ahead, which answers that thread only, waited for one that did: 10 to 20 s into
+            // the first gated run at 4x in two launches (nothing woken ahead in the first ten-second line, 30 and 206
+            // flips gated in the second, 1,560 from the third; sessions of 2026-11-17).
+            if (early != 0 && g_fg_present_ahead.load(relaxed) != 0 &&
+                ahead_thread.load(relaxed) != GetCurrentThreadId()) ahead_thread.store(GetCurrentThreadId(), relaxed);
             // The marker may have completed since `reached` was read, whether or not a value was left.
             reached = ReleasableShared();
             if (early != 0 &&
@@ -1762,8 +1769,13 @@ HRESULT STDMETHODCALLTYPE AheadRegister(ID3D12Fence* fence, UINT64 value, HANDLE
     SetEvent(event);
     return S_OK;
 }
-// The installer's worker: the detour, once, when the key is first on and a bind has read the runtime's method.
+// The installer's worker: the flip gate's clock thread and the detour of the fence event registration, each made once
+// and only where the unit has established the ordering (frame generation presenting from its own thread without
+// hardware flip metering); they then stay until shutdown. Where the unit never orders (hardware flip metering, no
+// frame generation) neither is made, so the key, on by default, costs there what its gates in the header say.
+// Observing (1) installs the detour at the first bind, to log the registrations.
 void AheadService() noexcept {
+    const bool orders = g_fg_present_order_queue.load(relaxed) != nullptr;
     // fg_present_ahead 3: the flip gate's clock thread (it lives until shutdown; one that ended behind a shutdown that
     // could not wait for it is replaced). A shutdown that is joining it has the lock: the next pass looks again.
     if (g_fg_present_ahead.load(relaxed) >= 3 && !RuntimeLifecycle_IsStopping() && frequency > 0 &&
@@ -1774,7 +1786,7 @@ void AheadService() noexcept {
         }
         bool tried = false, runs = false;
         // Stopping is looked at again under the lock: a shutdown that joined the clock in between gets no new one.
-        if (!gate_thread && !RuntimeLifecycle_IsStopping()) {
+        if (!gate_thread && orders && !RuntimeLifecycle_IsStopping()) {
             if (!gate_event.load(relaxed)) gate_event.store(CreateEventW(nullptr, FALSE, FALSE, nullptr), relaxed);
             if (gate_event.load(relaxed)) {
                 gate_stop.store(false, relaxed);
@@ -1788,7 +1800,8 @@ void AheadService() noexcept {
         ReleaseSRWLockExclusive(&gate_thread_lock);
         if (tried) LOG_INFO("FG flip gate: the clock thread %s", runs ? "runs" : "could not be created");
     }
-    if (g_fg_present_ahead.load(relaxed) == 0 || ahead_installed.load(relaxed) || ahead_refused.load(relaxed)) return;
+    const int mode = g_fg_present_ahead.load(relaxed);
+    if (mode == 0 || (!orders && mode != 1) || ahead_installed.load(relaxed) || ahead_refused.load(relaxed)) return;
     void* const target = ahead_target.load(relaxed);
     if (!target || RuntimeLifecycle_IsStopping()) return;
     if (!ahead_event.load(relaxed)) ahead_event.store(CreateEventW(nullptr, FALSE, FALSE, nullptr), relaxed);

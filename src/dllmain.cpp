@@ -539,7 +539,7 @@ static void on_present(reshade::api::command_queue* queue,
                 sc->get_device()->get_native(),
                 FrameTimeline_GetPresentSwapchainGeneration(sc->get_native()), 0, false,
                 d3d12_queue ? queue->get_device()->get_native() : 0});
-            // fg_present_ahead 3 (key below 3: one load and a branch): the swapchain's queue, for the flip gate.
+            // fg_present_ahead 3 and 4 (no thread woken ahead: one load and a branch): the swapchain's queue, for the flip gate.
             if (d3d12_queue) FgPresentOrder_NotePresentQueue(reinterpret_cast<void*>(static_cast<uintptr_t>(native_queue)));
         }
         on_present_impl(
