@@ -851,14 +851,22 @@ void ReleaseDue(bool watchdog, bool wait, bool at_marker = false, uint64_t only 
             ReleaseSRWLockShared(&lock);
             return;
         }
+        // None still to come: this Present is the first of the frame after `frame`.
         if (reached == 0) {
-            if (uint64_t early = EarlyFirstPresentShared(frame)) {
-                reached = ReleasableShared();
-                if (reached == 0 || !ahead_presented.compare_exchange_strong(early, 0, std::memory_order_acq_rel)) {
-                    ReleaseSRWLockShared(&lock);
-                    return;
-                }
+            uint64_t early = EarlyFirstPresentShared(frame);
+            // The marker may have completed since `reached` was read, whether or not a value was left.
+            reached = ReleasableShared();
+            if (early != 0 &&
+                (reached == 0 || !ahead_presented.compare_exchange_strong(early, 0, std::memory_order_acq_rel))) {
+                ReleaseSRWLockShared(&lock);
+                return;
             }
+        }
+        // It releases its own frame's marker and none after it: nothing waits behind a marker at these multipliers, so
+        // the next frame's can have completed too, and that frame's first Present has not returned.
+        if (reached != 0) {
+            only = frame + 1;
+            only_epoch = gate_epoch.load(relaxed);
         }
     }
     // fg_present_ahead: the thread whose Present releases a marker is DLSS-G's presenting thread.
@@ -874,8 +882,11 @@ void ReleaseDue(bool watchdog, bool wait, bool at_marker = false, uint64_t only 
             Plan plan = Plan::Release;
             int64_t now = 0;
             // The developer switch (off: this load and branch are all it adds): a Present's release may be deferred to
-            // the presenting thread's anchor, and the watchdog finds a release deferred and not made in time.
-            if (reached != 0 && !at_marker && g_fg_present_order_trailing.load(relaxed)) {
+            // the presenting thread's anchor, and the watchdog finds a release deferred and not made in time. Not at
+            // 3x and 4x: no Wait stands behind the marker there, so a deferred release would hold nothing back, and
+            // the frame's later Presents would return before the release their count starts from.
+            if (reached != 0 && !at_marker && g_fg_present_order_trailing.load(relaxed) &&
+                multiplier.load(relaxed) < 2) {
                 now = Qpc();
                 plan = PlanTrailingLocked(&origin, now, reached, &finish.trail_change, &later);
             }
