@@ -610,11 +610,21 @@ void ApplyTrailChange(TrailRule::Change change) noexcept {
 // trailing path, which its own rule judges, and it must not take the ordering itself down.
 void FinishLocked(Origin origin, uint64_t reached, int64_t now, Finish* finish) noexcept {
     const int64_t since = trail.since;
-    // 3x and 4x (EarlyFirstPresentShared; the count is 0 at 2x, where nothing reads it): the marker and, in the low
-    // byte, its frame's Presents still to come, the generated frames after its first and the real one. The watchdog
-    // released with no Present: they cannot be told apart, none is awaited, and the next Present that finds a marker
-    // issued and not completed is taken as a frame's first. One word, published before the marker itself: a Present
-    // reads the count and the marker it is for together, and takes one only while they are still that word.
+    // This Present was the frame's first: the later ones of other threads than the worker, until the next release,
+    // are its other outputs, which the breaks' windows are placed by (a deferred release is the first Present's too:
+    // it returned before the release was made). No window in use, or the watchdog released with no Present: nothing
+    // is awaited and the next Present does no work here. Published before the count below: a Present that takes one
+    // of the count tells the breaks by this value, and one that came between the two would be lost to them.
+    g_fg_present_order_real_awaited.store(
+        origin != Origin::Watchdog && window_live.load(relaxed) && g_fg_render_break_window.load(relaxed) != 0
+            ? reached : 0,
+        std::memory_order_release);
+    // 3x and 4x (EarlyFirstPresentShared; the count is 0 at 2x, where only the Present detour's condition reads it):
+    // the marker and, in the low byte, its frame's Presents still to come, the generated frames after its first and
+    // the real one. The watchdog released with no Present: they cannot be told apart, none is awaited, and the next
+    // Present that finds a marker issued and not completed is taken as a frame's first. One word, published before
+    // the marker itself: a Present reads the count and the marker it is for together, and takes one only while they
+    // are still that word.
     const int generated = multiplier.load(relaxed);
     g_fg_present_order_later.store(
         reached << 8 | (origin != Origin::Watchdog && generated >= 2 ? static_cast<uint64_t>(generated) : 0),
@@ -637,14 +647,6 @@ void FinishLocked(Origin origin, uint64_t reached, int64_t now, Finish* finish) 
         ApplyTrailChange(finish->trail_change);
         ClearTrail();
     }
-    // This Present was the frame's first: the later ones of other threads than the worker, until the next release,
-    // are its other outputs, which the breaks' windows are placed by (a deferred release is the first Present's too:
-    // it returned before the release was made). No window in use, or the watchdog released with no Present: nothing
-    // is awaited and the next Present does no work here.
-    g_fg_present_order_real_awaited.store(
-        origin != Origin::Watchdog && window_live.load(relaxed) && g_fg_render_break_window.load(relaxed) != 0
-            ? reached : 0,
-        std::memory_order_release);
 }
 // release_lock held. A Present's release was made at its return and the rule observes: the thread's first outermost
 // submission after it, before the marker's deadline, is what the evidence is about.
@@ -1195,21 +1197,22 @@ void AheadEnd() noexcept {
     ahead = AheadCycle{};
     if (counted) g_fg_present_ahead_woken.fetch_sub(1, relaxed);
 }
-// fg_present_ahead 4. The unit's thread, at a marker whose generated Present has returned: true where the flip gate's
-// clock lets the render queue go instead, when the generated frame's own work in front of its gate is done. The
-// render queue's burst, let go at the marker, took the GPU from that work in 13 frames of 64 s of packet traces (the
-// work reached the hardware 0.01 ms after generation, the first render packet 0.04 to 0.07 ms after it, and the work
-// ended 3 to 15 ms later: N.162). The clock can say only where the gate next to be let go is that frame's (its work
-// then stands behind no closed gate) and carries a readiness stamp; else the release stays here. The unit's watchdog
-// bounds a release the clock owes as it bounds any.
-bool GateHandRelease(uint64_t value) noexcept {
+// fg_present_ahead 4. The unit's thread, at the marker `value` whose generated Present has returned, taken in the
+// binding `epoch`: true where the flip gate's clock lets the render queue go instead, when the generated frame's own
+// work in front of its gate is done. The render queue's burst, let go at the marker, took the GPU from that work in
+// 13 frames of 64 s of packet traces (the work reached the hardware 0.01 ms after generation, the first render packet
+// 0.04 to 0.07 ms after it, and the work ended 3 to 15 ms later: N.162). The clock can say only where the gate next
+// to be let go is that frame's (its work then stands behind no closed gate) and carries a readiness stamp; else the
+// release stays here. Nothing is handed in another binding than the value's: the clock would let go the marker of
+// that number there. The unit's watchdog bounds a release the clock owes as it bounds any.
+bool GateHandRelease(uint64_t value, uint32_t epoch) noexcept {
     if (g_fg_present_ahead.load(relaxed) < 4 || !gate_running.load(relaxed)) return false;
     // Handed under the shared lock: a drop, which releases every marker and clears the hand-over, is before or after.
     AcquireSRWLockShared(&lock);
     const uint32_t head = gate_head.load(std::memory_order_acquire);
     const bool any = head != gate_tail.load(std::memory_order_acquire);
     const GateEntry entry = any ? gate_ring[head % kGateRing] : GateEntry{};
-    const bool hand = any && !entry.real && entry.marker == value && entry.stamped;
+    const bool hand = any && gate_epoch.load(relaxed) == epoch && !entry.real && entry.marker == value && entry.stamped;
     if (hand) gate_release_marker.store(value);
     ReleaseSRWLockShared(&lock);
     if (!hand) {
@@ -1300,7 +1303,7 @@ void AheadAtMarker(int64_t woke) noexcept {
     if (const HANDLE event = gate_event.load(relaxed)) SetEvent(event);
     if (taken) {
         ahead_at_marker.fetch_add(1, relaxed);
-        if (!GateHandRelease(passed)) ReleaseDue(false, true, true, presented, epoch);
+        if (!GateHandRelease(presented, epoch)) ReleaseDue(false, true, true, presented, epoch);
     }
 }
 // The completion time stamped for marker `value`: 1 stamped (in *done), 0 not yet, -1 a later marker is stamped already.
