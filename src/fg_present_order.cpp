@@ -89,7 +89,7 @@ std::atomic<uint64_t> ahead_matched{0}, ahead_other{0}, ahead_woke{0}, ahead_aga
 // A generated frame's Present that returned before frame generation was done leaves its marker here: the unit's thread
 // releases the render queue when that marker completes (0: none).
 std::atomic<uint64_t> ahead_presented{0};
-// The unit's thread stamps each marker's completion with its wake for it: the real frame's Present is timed from it.
+// The unit's thread stamps each marker's completion with its wake for it: the cycle's later Presents are timed from it.
 std::atomic<uint32_t> ahead_stamp_seq{0};
 std::atomic<uint64_t> ahead_stamp_value{0};
 std::atomic<int64_t> ahead_stamp_qpc{0};
@@ -959,8 +959,8 @@ DWORD WINAPI Watchdog(void*) noexcept {
         // The render queue has passed DLSS-G's Wait (frame generation is done): the Present has until the deadline,
         // a share of the frame time.
         const int64_t woke = Qpc();
-        // fg_present_ahead: the completion is stamped for the real frame's Present, and a generated frame's Present
-        // that has returned already releases the render queue now.
+        // fg_present_ahead: the completion is stamped for the cycle's later Presents, and a first generated frame's
+        // Present that has returned already releases the render queue now.
         if (g_fg_present_ahead.load(relaxed) >= 2 || ahead_presented.load(relaxed) != 0) AheadAtMarker(woke);
         const int64_t deadline = woke + frequency * Rule::BoundUs(frame_us.load(relaxed)) / 1'000'000;
         // With the trailing key on, the evidence judges an anchor against this deadline (TrailRule::Followed).
@@ -1056,7 +1056,7 @@ DWORD WINAPI Watchdog(void*) noexcept {
                          "for a value its own queue waits for and %llu others; woken ahead %llu (registered again "
                          "%llu); its generated Present returned before frame generation was done %llu times (the "
                          "unit's thread released the render queue at the completion %llu times) and after it %llu "
-                         "times; the real frame's Present was held %llu times, %.0f us on average, %.0f us at most, to "
+                         "times; the Presents after a cycle's first were held %llu times, %.0f us on average, %.0f us at most, to "
                          "stand %.0f us behind the completion, which the wake preceded by %.0f us; not held %llu, "
                          "gave up %llu",
                     ahead_mode, ahead_installed.load(relaxed) ? "installed" : ahead_refused.load(relaxed) ? "refused" : "not installed",
@@ -1163,6 +1163,11 @@ DWORD WINAPI Watchdog(void*) noexcept {
 // frame generation's completion as DLSS-G put it behind the generated frame's Present (DLSS-G's own spacing, from the
 // moment the generated frame is shown at). A second registration for the same value before the Present (DLSS-G
 // looking again) is handed on unchanged, so the thread then sleeps as it did. Only while the unit orders.
+// 3x and 4x (N.165). A cycle is the frame's generated Presents and then the real one's. The thread waits and
+// registers once more for each later generation, right after the Present before it: those registrations are answered
+// inside the cycle and start none (AheadRegister). Every Present after the first is held at its entry to its place
+// times DLSS-G's own spacing behind the completion (FgPresentOrder_AheadBeforePresent), and the marker completes with
+// the frame's last generation there, 1.2 and 2.0 ms after the first.
 // Observing. Nothing is changed: the presenting thread's registrations are counted and the first few logged.
 // Measured 2026-11-16, first form (the thread held at the generated Present's return instead): DLSS-G never looked
 // again and nothing failed; the render queue's wait fell from 0.92 ms to 0.03 ms and the frame rate rose 6.7 fps; but
