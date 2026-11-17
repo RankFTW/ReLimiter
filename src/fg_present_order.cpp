@@ -344,11 +344,14 @@ std::atomic<uint32_t> gate_epoch{0};           // counts the drops: a value belo
 struct GateEntry {
     uint64_t value = 0;                        // the fence value its Wait is for
     uint64_t marker = 0;                       // the cycle's marker: the pacer's interval for the frame goes by it
-    int64_t spacing = 0;                       // the real frame's: DLSS-G's own call spacing (QPC), else 0
+    int64_t spacing = 0;                       // a later Present's: how far DLSS-G's own spacing puts it behind the
+                                               // cycle's first (QPC), else 0
     int64_t enqueued = 0;                      // QPC
-    bool real = false;                         // the cycle's second Present (the real frame's)
+    bool real = false;                         // the cycle's last Present (the real frame's)
     bool stamped = false;                      // its readiness stamp went on the queue in front of the Wait
-    uint8_t note = 0;                          // the real frame's: how its Present's hold ended (for the pair lines)
+    uint8_t note = 0;                          // a later Present's: how its hold ended (for the pair lines)
+    uint8_t index = 0;                         // its place in the cycle: 0 the first generated frame's
+    uint8_t outputs = 2;                       // the cycle's Presents: 2 at 2x, 3 at 3x, 4 at 4x
     uint32_t released = 0, issued = 0;         // the ordering's markers when it was armed (for the pair lines)
 };
 constexpr unsigned kGateRing = 16;
@@ -1093,8 +1096,8 @@ DWORD WINAPI Watchdog(void*) noexcept {
                          "did not hold %llu, had no plan for %llu); released at their time %llu (wake %.0f us late "
                          "on average), at once %llu, at the bound %llu; generated flips held behind their own work "
                          "%llu, by %llu us on average; generated flips behind generation's completion by %llu us on "
-                         "average (%llu held with no stamp of it); the real one half a cycle (%lld us) after a held "
-                         "one; real flips whose own work came after their time %llu, by %llu us on average; real "
+                         "average (%llu held with no stamp of it); the later ones a step (%lld us) apart behind a held "
+                         "one; later flips whose own work came after their time %llu, by %llu us on average; later "
                          "flips moved forward for the next frame %llu, by %llu us on average; flips under 4 ms behind "
                          "the one before %llu",
                     static_cast<unsigned long long>(now_gate[0] - reported_gate[0]),
@@ -1167,14 +1170,19 @@ DWORD WINAPI Watchdog(void*) noexcept {
 // shown 0.5 ms apart.
 struct AheadWait { ID3D12Fence* fence = nullptr; uint64_t value = 0; int64_t qpc = 0; ID3D12CommandQueue* queue = nullptr; };
 thread_local AheadWait ahead_wait;       // the calling thread's newest outermost queue Wait
-// One cycle of a thread woken ahead: its next native Present is the generated frame's, the one after it the real one's.
+// One cycle of a thread woken ahead: its next native Present is the first generated frame's, the ones after it the
+// later generated frames' (3x and 4x) and then the real one's.
 struct AheadCycle {
     AheadWait answered;        // what the thread was woken for
     int64_t wake = 0;          // QPC at the wake
-    int64_t first = 0;         // QPC at the generated frame's Present (0: not made yet)
+    int64_t first = 0;         // QPC at the first generated frame's Present (0: not made yet)
+    int64_t spacing = 0;       // how far DLSS-G put the cycle's second Present behind its first (0: not made yet)
     uint64_t value = 0;        // the marker whose completion says frame generation is done for this cycle (0: unknown)
-    bool woken = false;        // the generated frame's Present has not returned yet
-    bool real = false;         // it has: the next native Present is the real frame's
+    uint64_t later_value = 0;  // the newest fence value of the same frame answered after the first (3x and 4x)
+    int generated = 1;         // the generated frames a real one when the cycle began: its Presents after the first
+    int made = 0;              // the cycle's Presents made after its first
+    bool woken = false;        // the first generated frame's Present has not returned yet
+    bool real = false;         // it has: the cycle's later Presents follow
     bool counted = false;      // g_fg_present_ahead_woken counts this thread
 };
 thread_local AheadCycle ahead;
@@ -1190,8 +1198,9 @@ struct GateArm {
     uint64_t marker = 0;
     int64_t spacing = 0;
     unsigned signals = 0;   // outermost Signals the thread made inside this native Present
-    uint8_t note = 0;       // the real frame's: how its Present's hold ended (AheadBeforePresent)
+    uint8_t note = 0;       // a later Present's: how its hold ended (AheadBeforePresent)
     uint32_t released = 0, issued = 0;   // the ordering's markers when it was armed
+    uint8_t index = 0, outputs = 2;      // its place in the cycle and the cycle's Presents
 };
 thread_local GateArm gate_arm;
 thread_local uint64_t gate_marker = 0;    // the marker of the thread's newest generated Present
@@ -1223,7 +1232,7 @@ bool GateHandRelease(uint64_t value, uint32_t epoch) noexcept {
     const uint32_t head = gate_head.load(std::memory_order_acquire);
     const bool any = head != gate_tail.load(std::memory_order_acquire);
     const GateEntry entry = any ? gate_ring[head % kGateRing] : GateEntry{};
-    const bool hand = any && gate_epoch.load(relaxed) == epoch && !entry.real && entry.marker == value && entry.stamped;
+    const bool hand = any && gate_epoch.load(relaxed) == epoch && entry.index == 0 && entry.marker == value && entry.stamped;
     if (hand) gate_release_marker.store(value);
     ReleaseSRWLockShared(&lock);
     if (!hand) {
@@ -1356,12 +1365,15 @@ void AheadSleepUntil(int64_t target, int64_t limit) noexcept {
 // ── Flip gate (fg_present_ahead 3) ──
 // The presenting thread, for the Present `arm` describes: the readiness stamp and the gate's Wait on `queue`, in that
 // order (the stamp completes when the queue has done everything in front of the gate), and the entry the clock thread
-// lets the Wait go by. Only at 2x, while the clock runs, on a queue of the render queue's device.
+// lets the Wait go by. At 2x to 4x, while the clock runs, on a queue of the render queue's device.
 bool GateEnqueue(ID3D12CommandQueue* queue, const GateArm& arm) noexcept {
     if (g_fg_present_ahead.load(relaxed) < 3 || !gate_running.load(std::memory_order_acquire) ||
         RuntimeLifecycle_IsStopping() || arm.marker == 0) { gate_refused[0].fetch_add(1, relaxed); return false; }
-    // g_fg_multiplier counts the generated frames per real one: 1 is 2x, the only arrangement a cycle here describes.
-    if (multiplier.load(relaxed) != 1) { gate_refused[1].fetch_add(1, relaxed); return false; }
+    // The generated frames per real one: a cycle here describes 1 to 3 of them (2x to 4x).
+    if (const int generated = multiplier.load(relaxed); generated < 1 || generated > 3) {
+        gate_refused[1].fetch_add(1, relaxed);
+        return false;
+    }
     const StreamlineQueue_SignalFn native_wait = StreamlineQueue_NativeWait();
     const StreamlineQueue_SignalFn native_signal = StreamlineQueue_NativeSignal();
     if (!queue || !native_wait) { gate_refused[2].fetch_add(1, relaxed); return false; }
@@ -1383,6 +1395,8 @@ bool GateEnqueue(ID3D12CommandQueue* queue, const GateArm& arm) noexcept {
         entry.spacing = arm.spacing;
         entry.enqueued = Qpc();
         entry.real = arm.real;
+        entry.index = arm.index;
+        entry.outputs = arm.outputs;
         entry.note = arm.note;
         entry.released = arm.released;
         entry.issued = arm.issued;
@@ -1399,15 +1413,16 @@ bool GateEnqueue(ID3D12CommandQueue* queue, const GateArm& arm) noexcept {
     }
     return done;
 }
-// The presenting thread, in front of a native Present of a cycle woken ahead: the gate for that Present. Where the
-// thread's last Present made a Signal inside the native call the Wait is left to that Signal's return
-// (FgPresentOrder_AfterSignalActive); else it goes in front of the call.
-void GateArmFor(bool real, uint64_t marker_value, int64_t spacing, uint8_t note) noexcept {
+// The presenting thread, in front of a native Present of a cycle woken ahead: the gate for that Present, the
+// `index`-th behind the cycle's first of `outputs` (`real`: the last). Where the thread's last Present made a Signal
+// inside the native call the Wait is left to that Signal's return (FgPresentOrder_AfterSignalActive); else it goes in
+// front of the call.
+void GateArmFor(bool real, uint8_t index, uint8_t outputs, uint64_t marker_value, int64_t spacing, uint8_t note) noexcept {
     // An armed gate counts with the cycles woken ahead, so the Present's return accounts it whatever the key is then.
     if (!gate_arm.armed) g_fg_present_ahead_woken.fetch_add(1, relaxed);
     gate_arm = GateArm{true, real, false, marker_value, spacing, 0, note,
         static_cast<uint32_t>(g_fg_present_order_released.load(relaxed)),
-        static_cast<uint32_t>(g_fg_present_order_issued.load(relaxed))};
+        static_cast<uint32_t>(g_fg_present_order_issued.load(relaxed)), index, outputs};
     if (!gate_in_call && present_queue && GateEnqueue(present_queue, gate_arm)) {
         gate_arm.placed = true;
         gate_front.fetch_add(1, relaxed);
@@ -1457,7 +1472,7 @@ int64_t GateWaitReady(HANDLE timer, HANDLE event, uint32_t epoch, uint64_t value
 // The clock thread's newest decisions, for the lines it writes when a flip came under 4 ms behind the one before.
 struct GateSeen {
     bool real = false, after = false, moved = false;
-    uint8_t note = 0;
+    uint8_t note = 0, index = 0;
     uint64_t marker = 0;
     uint32_t marker_released = 0, marker_issued = 0;
     int64_t cycle = 0, enqueued = 0, earliest = 0, done = 0, ready = 0, target = 0, released = 0, flip = 0;
@@ -1476,10 +1491,11 @@ void GateSayPair(const GateSeen* seen, unsigned next) noexcept {
     const unsigned count = next < 5 ? next : 5;
     for (unsigned i = count; i > 0; --i) {
         const GateSeen& s = seen[(next - i) % kGateSeen];
-        LOG_INFO("FG flip gate pair %u, flip -%u: %s frame, marker %llu (released %u, issued %u, the real frame's "
-                 "hold %u), cycle %lld us; enqueued %lld, earliest %lld, generation done %lld, work done %lld, target "
-                 "%lld, let go %lld, flip %lld (%s)",
-            pair + 1, i - 1, s.real ? "real" : "generated", static_cast<unsigned long long>(s.marker),
+        LOG_INFO("FG flip gate pair %u, flip -%u: %s frame, place %u of its cycle, marker %llu (released %u, issued "
+                 "%u, its Present's hold %u), cycle %lld us; enqueued %lld, earliest %lld, generation done %lld, work "
+                 "done %lld, target %lld, let go %lld, flip %lld (%s)",
+            pair + 1, i - 1, s.real ? "real" : "generated", static_cast<unsigned>(s.index),
+            static_cast<unsigned long long>(s.marker),
             s.marker_released, s.marker_issued, static_cast<unsigned>(s.note),
             static_cast<long long>(s.cycle * 1'000'000 / frequency), us(s.enqueued), us(s.earliest), us(s.done),
             us(s.ready), us(s.target), us(s.released), us(s.flip),
@@ -1487,12 +1503,12 @@ void GateSayPair(const GateSeen* seen, unsigned next) noexcept {
                 : s.moved ? "when let go, moved forward for the next frame" : "when let go");
     }
 }
-// The clock thread, toward a real flip's time `target` (never past `limit`). Where the next frame's generation (its
-// marker is `next`) completes first, the time moves forward as the rule says (RealBefore), never before now. Returns
-// the time slept to. The unit's thread sets the clock's event at each marker; a timer to 0.4 ms before the time, the
-// rest on the clock.
-int64_t GateSleepReal(HANDLE timer, const FgFlipGateRule& rule, uint64_t next, int64_t target, int64_t limit,
-    bool* moved) noexcept {
+// The clock thread, toward a later flip's time `target` (never past `limit`); `remaining`: the cycle's flips not yet
+// let go, this one included. Where the next frame's generation (its marker is `next`) completes first, the time
+// moves forward as the rule says (LaterBefore), never before now. Returns the time slept to. The unit's thread sets
+// the clock's event at each marker; a timer to 0.4 ms before the time, the rest on the clock.
+int64_t GateSleepLater(HANDLE timer, const FgFlipGateRule& rule, uint64_t next, int64_t target, int64_t limit,
+    int remaining, bool* moved) noexcept {
     if (target > limit) target = limit;
     const HANDLE event = gate_event.load(relaxed);
     bool looked = false;
@@ -1502,7 +1518,7 @@ int64_t GateSleepReal(HANDLE timer, const FgFlipGateRule& rule, uint64_t next, i
             if (const int64_t done = GateDoneOf(next); done != 0) {
                 looked = true;
                 // Forward only, never before now: a time that has passed already stays as it is.
-                int64_t sooner = rule.RealBefore(target, done);
+                int64_t sooner = rule.LaterBefore(target, done, remaining);
                 if (sooner < now) sooner = now;
                 if (sooner < target) {
                     gate_moved.fetch_add(1, relaxed);
@@ -1551,6 +1567,7 @@ DWORD WINAPI GateClock(void*) noexcept {
         const bool stamps = entry.stamped && ready_event != nullptr;
         GateSeen row;
         row.real = entry.real;
+        row.index = entry.index;
         row.note = entry.note;
         row.marker = entry.marker;
         row.marker_released = entry.released;
@@ -1558,7 +1575,7 @@ DWORD WINAPI GateClock(void*) noexcept {
         row.enqueued = entry.enqueued;
         int64_t target = 0, ready = 0;
         if (g_fg_present_ahead.load(relaxed) >= 3 && !RuntimeLifecycle_IsStopping()) {
-            if (!entry.real) {
+            if (entry.index == 0) {
                 gate_rule.give_back = g_fg_flip_gate_give_back.load(relaxed);
                 generated_marker = entry.marker;
                 // The pacer's interval for this frame: where it held the frame's FG input to its grid, or had a plan
@@ -1566,10 +1583,10 @@ DWORD WINAPI GateClock(void*) noexcept {
                 const int64_t noted = GateCycleOf(entry.marker);
                 const int64_t cycle = noted < 0 ? -noted : noted;
                 (noted > 0 ? gate_planned : noted < 0 ? gate_late : gate_unplanned).fetch_add(1, relaxed);
-                const int64_t earliest = gate_rule.Begin(cycle);
+                const int64_t earliest = gate_rule.Begin(cycle, entry.outputs);
                 row.cycle = gate_rule.cycle;
                 row.earliest = earliest;
-                gate_half_us.store(gate_rule.cycle * 1'000'000 / frequency / 2, relaxed);
+                gate_half_us.store(gate_rule.Step() * 1'000'000 / frequency, relaxed);
                 // The distance from the flip before is still to keep: when the frame's own work is done and when
                 // its generation completed say for how long. A frame whose work is not done by then is let go and
                 // flips with its work.
@@ -1579,12 +1596,14 @@ DWORD WINAPI GateClock(void*) noexcept {
                     if (ready != 0) {
                         GateWorkSeen(entry.marker, epoch);
                         // The hold's limit counts from generation's completion: the frame's own work may have stood
-                        // behind the gate before it. From the work where the completion was not stamped.
+                        // behind the gate before it. From the work where the completion was not stamped (counted at
+                        // 2x, where it always should be), and where the work was done first: at 3x and 4x the marker
+                        // completes with the frame's last generation, 1.2 and 2.0 ms after the first, whose frame
+                        // this is, so its work is normally done before the marker (442 of 465 held flips in 10 s at
+                        // 3x).
                         int64_t done = GateDoneOf(entry.marker);
-                        if (done == 0 || done > ready) {
-                            done = ready;
-                            gate_undated.fetch_add(1, relaxed);
-                        }
+                        if (done == 0 && entry.outputs == 2) gate_undated.fetch_add(1, relaxed);
+                        if (done == 0 || done > ready) done = ready;
                         row.done = done;
                         target = gate_rule.Generated(ready, done);
                         if (target > ready) {
@@ -1595,7 +1614,7 @@ DWORD WINAPI GateClock(void*) noexcept {
                 }
             } else {
                 row.cycle = gate_rule.cycle;
-                target = gate_rule.Real(entry.spacing, frequency / 10);
+                target = gate_rule.Later(entry.index, entry.spacing, frequency / 10);
             }
         }
         if (target > bound_qpc) {
@@ -1604,9 +1623,10 @@ DWORD WINAPI GateClock(void*) noexcept {
         }
         const bool timed = target > Qpc();
         if (timed) {
-            // A real flip gives way to the next frame where that frame's generation completes first.
-            if (entry.real && generated_marker != 0)
-                target = GateSleepReal(timer, gate_rule, generated_marker + 1, target, bound_qpc, &row.moved);
+            // A later flip gives way to the next frame where that frame's generation completes first.
+            if (entry.index != 0 && generated_marker != 0)
+                target = GateSleepLater(timer, gate_rule, generated_marker + 1, target, bound_qpc,
+                    entry.outputs - entry.index, &row.moved);
             else
                 AheadSleepUntil(target, bound_qpc);
         }
@@ -1646,7 +1666,7 @@ DWORD WINAPI GateClock(void*) noexcept {
         if (stamps && ready == 0 && GateWaitReady(timer, ready_event, epoch, entry.value, 0) == 0) {
             const int64_t done = GateWaitReady(timer, ready_event, epoch, entry.value, bound_qpc);
             if (done != 0) {
-                if (entry.real) {
+                if (entry.index != 0) {
                     gate_real_late.fetch_add(1, relaxed);
                     gate_real_late_us.fetch_add(static_cast<uint64_t>((done - flip) * 1'000'000 / frequency), relaxed);
                 }
@@ -1656,9 +1676,9 @@ DWORD WINAPI GateClock(void*) noexcept {
                 after = true;
             }
         }
-        gate_rule.Flipped(entry.real, flip);
+        gate_rule.Flipped(entry.index, entry.real, flip, entry.spacing);
         if (entry.real) generated_marker = 0;
-        if (!entry.real) {
+        if (entry.index == 0) {
             GateWorkSeen(entry.marker, epoch);
             if (row.done == 0) row.done = GateDoneOf(entry.marker);
             if (row.done != 0 && flip >= row.done) {
@@ -1705,14 +1725,30 @@ HRESULT STDMETHODCALLTYPE AheadRegister(ID3D12Fence* fence, UINT64 value, HANDLE
         SetLastError(error);
     }
     if (match) ahead_wait.fence = nullptr;   // one answer per Wait
-    // 3x and 4x: a cycle here is two Presents (the generated frame's, the real one's); with more generated frames the
-    // thread registers and presents more often a frame, so nothing is answered there (N.165).
+    const int generated = multiplier.load(relaxed);
     if (mode < 2 || !match || again || !ahead_event.load(relaxed) || RuntimeLifecycle_IsStopping() ||
-        multiplier.load(relaxed) != 1 || g_fg_present_order_queue.load(relaxed) == nullptr)
+        generated < 1 || generated > 3 || g_fg_present_order_queue.load(relaxed) == nullptr)
         return native(fence, value, event);
+    // 3x and 4x: the thread waits and registers once more a frame for each later generation, right after the Present
+    // before it; a frame's values follow one another and the next frame's first is 6 further on (N.165). Such a
+    // registration in a cycle woken ahead is answered like the first and starts no cycle: the thread goes on to its
+    // next Present, DLSS-G's own spacing behind the one before. Handed on, it would put the thread to sleep until
+    // that generation is done, and the sleep would be in the spacing the later Presents are held by. Twice for one
+    // value (DLSS-G looking again) it is handed on, as for the first.
+    if ((ahead.woken || ahead.real) && ahead.answered.fence == fence && value > ahead.answered.value &&
+        value - ahead.answered.value < static_cast<uint64_t>(ahead.generated)) {
+        if (value == ahead.later_value) {
+            ahead_again.fetch_add(1, relaxed);
+            return native(fence, value, event);
+        }
+        ahead.later_value = value;
+        SetEvent(event);
+        return S_OK;
+    }
     const bool counted = ahead.counted;
     ahead = AheadCycle{};
     ahead.answered = AheadWait{fence, value, 0};
+    ahead.generated = generated;
     ahead.wake = Qpc();
     ahead.woken = true;
     ahead.counted = true;
@@ -2148,12 +2184,12 @@ void FgPresentOrder_NotePresentQueueActive(void* queue) noexcept {
     fg_present_order::present_queue = static_cast<ID3D12CommandQueue*>(queue);
 }
 
-// A native Present is about to be made by a thread in a cycle woken ahead. The cycle's first is the generated frame's:
-// its time is taken. The second is the real frame's: it is held until it stands as far behind frame generation's
-// completion as DLSS-G put it behind the generated frame's Present. fg_present_ahead 3: each of the two gets the flip
-// gate, and the real frame's hold stays: it keeps the thread from running Presents ahead (without it three to four
-// stood queued, each behind its gate, and DLSS-G's generator waited for the thread's queue in 9 cycles of 10; packet
-// trace of 2026-11-16, N.159).
+// A native Present is about to be made by a thread in a cycle woken ahead. The cycle's first is the first generated
+// frame's: its time is taken. Each one after it (the later generated frames' at 3x and 4x, then the real frame's) is
+// held until it stands as far behind frame generation's completion as DLSS-G's own spacing puts it behind the first
+// Present. fg_present_ahead 3: each of the cycle's Presents gets the flip gate, and the holds stay: they keep the
+// thread from running Presents ahead (without the real frame's, at 2x, three to four stood queued, each behind its
+// gate, and DLSS-G's generator waited for the thread's queue in 9 cycles of 10; packet trace of 2026-11-16, N.159).
 void FgPresentOrder_AheadBeforePresent() noexcept {
     using namespace fg_present_order;
     if (ahead.woken) {
@@ -2173,7 +2209,7 @@ void FgPresentOrder_AheadBeforePresent() noexcept {
                         gate_ambiguous.fetch_add(1, relaxed);
                     }
                     gate_marker = value;
-                    GateArmFor(false, value, 0, 0);
+                    GateArmFor(false, 0, static_cast<uint8_t>(ahead.generated + 1), value, 0, 0);
                 }
             }
         }
@@ -2182,8 +2218,15 @@ void FgPresentOrder_AheadBeforePresent() noexcept {
     if (!ahead.real) return;
     const int64_t entry = Qpc();
     const uint64_t value = ahead.value;
-    const int64_t spacing = entry - ahead.first, wake = ahead.wake;
-    AheadEnd();
+    // The cycle's Present after its first: its place, and whether it is the last (the real frame's). DLSS-G's own
+    // spacing is how far it put the cycle's second Present behind its first, and every later Present is held to its
+    // place times that behind generation's completion: taken from each Present's own entry, the spacing would carry
+    // the holds of the Presents before it wherever DLSS-G times a Present from the one before.
+    const int index = ++ahead.made, generated = ahead.generated;
+    const bool last = index >= generated;
+    if (index == 1) ahead.spacing = entry - ahead.first;
+    const int64_t spacing = ahead.spacing * index, wake = ahead.wake;
+    if (last) AheadEnd();
     // How the hold ended, for the gate's pair lines: 0 the completion was stamped when the Present came, 1 its event
     // was waited for and the stamp found, 2 the event came without a stamp, 3 not held, 4 the wait was given up.
     const auto hold = [&]() noexcept -> uint8_t {
@@ -2230,7 +2273,8 @@ void FgPresentOrder_AheadBeforePresent() noexcept {
         return how;
     };
     const uint8_t how = hold();
-    if (g_fg_present_ahead.load(relaxed) >= 3) GateArmFor(true, value, spacing, how);
+    if (g_fg_present_ahead.load(relaxed) >= 3)
+        GateArmFor(last, static_cast<uint8_t>(index), static_cast<uint8_t>(generated + 1), value, spacing, how);
 }
 
 // A native Present of a thread in a cycle woken ahead, or with a gate armed, has returned; `presented`: it was not a
@@ -2268,8 +2312,10 @@ bool FgPresentOrder_AheadAfterPresent(bool presented) noexcept {
         return false;
     }
     // fg_present_ahead 3: the gate's Wait stands on the presenting thread's queue, so a Signal of the unit's behind the
-    // thread's next submission would complete only at the flip: the release is made at the marker.
-    if (g_fg_present_ahead.load(relaxed) < 3 && g_fg_present_order_trailing.load(relaxed)) {
+    // thread's next submission would complete only at the flip: the release is made at the marker. So it is at 3x and
+    // 4x, where nothing is deferred (ReleaseDue).
+    if (g_fg_present_ahead.load(relaxed) < 3 && multiplier.load(relaxed) < 2 &&
+        g_fg_present_order_trailing.load(relaxed)) {
         bool deferred = false;
         AcquireSRWLockShared(&lock);
         AcquireSRWLockExclusive(&release_lock);
