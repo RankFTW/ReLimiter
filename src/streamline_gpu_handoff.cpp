@@ -394,7 +394,18 @@ void AggregateChain(const ChainRecord& record) noexcept {
     if (const auto* signalled = (worker ? a.presenter : a.worker).signals.Find(record.fence)) {
         const bool below = record.value < signalled->last;
         ++(record.value == signalled->last ? entry->at : below ? entry->below : entry->above);
-        if (!worker) ++(below ? entry->pass_below : entry->pass_ok); // the presenter's evidence of this pass
+        // The presenter's evidence of this pass. With more than one generated frame a real one (3x, 4x) the worker
+        // signals the frame's generations together and the presenter waits for them one after the other, so its wait
+        // for a later one of the frame is below the worker's newest Signal by less than their number: at 4x its second
+        // wait of every frame, a third of its waits, which left the route unproven there for good (the chain's own
+        // counts and packet traces of 2026-11-17, N.165). A frame's values are consecutive and the next frame's start
+        // 6 further on (3x and 4x alike), so a wait that far below is still one for an older frame and unproves.
+        if (!worker) {
+            const int generated = g_fg_multiplier.load(std::memory_order_relaxed);
+            const bool older = below &&
+                signalled->last - record.value >= static_cast<uint64_t>(generated > 1 ? generated : 1);
+            ++(older ? entry->pass_below : entry->pass_ok);
+        }
     }
 }
 // Nothing recorded so far counts. A destroyed queue's address can be reused by a later queue, and a record the queue
@@ -443,10 +454,11 @@ void ReportChain(bool final) noexcept {
     for (unsigned i = 0; i < 4096 && chain.records.Pop(&record); ++i) AggregateChain(record);
     // A destroy without records since: unpublish now, so no reused address is matched.
     if (const uint64_t epoch = chain.epoch.load(std::memory_order_acquire); epoch > a.epoch) AdvanceChainEpoch(epoch);
-    // The presenter's waits of this pass, per entry: waits only at or above the worker's newest Signal prove it, a
-    // wait below it unproves it, and a pass that saw none changes nothing. The cumulative counts stay for the report
-    // lines. The records are in the order the threads pushed them, not the order of the GPU's work, so one late
-    // record (a wait pushed behind the worker's next Signal) voids the proof for its pass, not for the epoch.
+    // The presenter's waits of this pass, per entry: waits only at or above the worker's newest Signal, or below it
+    // by less than the generated frames a real one (AggregateChain), prove it, a wait further below unproves it, and
+    // a pass that saw none changes nothing. The cumulative counts stay for the report lines. The records are in the
+    // order the threads pushed them, not the order of the GPU's work, so one late record (a wait pushed behind the
+    // worker's next frame's Signal) voids the proof for its pass, not for the epoch.
     for (auto& wait : a.presenter.waits.entries) {
         if (wait.pass_below) wait.proves = false;
         else if (wait.pass_ok) wait.proves = true;
