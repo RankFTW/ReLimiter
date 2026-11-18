@@ -24,6 +24,7 @@
 #include "pacing_telemetry.h"
 #include "reflex_clock_map.h"
 #include "runtime_lifecycle.h"
+#include "display_state.h"
 #include "wake_guard.h"
 #include "logger.h"
 #include "startup_breadcrumb.h"
@@ -1004,12 +1005,15 @@ static void LogSleepStatus(const char* source, NvAPI_Status status, const NV_GET
 }
 
 // The driver's own sleep status, read by ReLimiter at most once per second from
-// Hook_Sleep (the presenting device, under developer_settings), through the
-// trampoline: the game's hook never sees it. The only driver call this
-// observation adds; the status poll reads it once a second.
+// Hook_Sleep (the presenting device), through the trampoline: the game's hook
+// never sees it. It carries the driver's answer about the game's frames
+// (DisplayState_OnSleepStatus) for games that do not ask for it themselves: a
+// game call within the last second skips it, unless the developer
+// instrumentation (developer_settings) records and logs the status.
 static constexpr uint32_t kPolledSleepStatusLogLimit = 64;
 static SleepStatusTracker s_polled_sleep_status;
 static std::atomic<ULONGLONG> s_sleep_status_poll_ms{0};
+static std::atomic<ULONGLONG> s_game_sleep_status_ms{0};   // tick of the newest successful game call
 
 // The newest successful result of NvAPI_D3D_GetSleepStatus, from the game's
 // call or from the poll (g_sleep_status_newest).
@@ -1043,17 +1047,23 @@ static void PublishSleepStatusAtSleepReturn(uint32_t publication_token) noexcept
 }
 
 static void PollSleepStatus(IUnknown* device, uint32_t publication_token) noexcept {
-    if (!g_config.developer_settings || !s_orig_get_sleep_status) return;
+    if (!s_orig_get_sleep_status) return;
+    const bool developer = g_config.developer_settings;
     const ULONGLONG now = GetTickCount64();
+    if (!developer && now - s_game_sleep_status_ms.load(std::memory_order_relaxed) < 1000) return;
     ULONGLONG next = s_sleep_status_poll_ms.load(std::memory_order_relaxed);
     if (now < next ||
         !s_sleep_status_poll_ms.compare_exchange_strong(next, now + 1000, std::memory_order_relaxed))
         return;
     // The token is the retained Sleep device's (passed in), not whatever publication is
-    // current now: RecordSleepStatus drops the result when that lifetime has ended.
+    // current now: a query that straddled a publication change describes the old one, so
+    // neither RecordSleepStatus nor the driver's answer about the game's frames takes it.
     NV_GET_SLEEP_STATUS_PARAMS status{};
     status.version = static_cast<NvU32>(NV_GET_SLEEP_STATUS_PARAMS_VER);
     const NvAPI_Status result = SafeInvokeGetSleepStatus(device, &status);
+    if (result == NVAPI_OK && publication_token == g_sleep_status_token.load(std::memory_order_acquire))
+        DisplayState_OnSleepStatus(status.bFsVrr != 0, status.bFullscreenIFlip != 0, /*own_read=*/true);
+    if (!developer) return;
     RecordSleepStatus(result, status, publication_token);
     if (s_polled_sleep_status.Changed(result, status) &&
         ReflexObserveBudget(s_polled_sleep_status.lines, kPolledSleepStatusLogLimit, "sleep status poll changed again"))
@@ -2579,21 +2589,27 @@ static SleepStatusTracker s_game_sleep_status;
 static NvAPI_Status __cdecl Hook_GetSleepStatus(IUnknown* device, NV_GET_SLEEP_STATUS_PARAMS* params) {
     void* const caller_address = _ReturnAddress();
     RuntimeCallbackGuard callback;
-    // Without the status instrumentation (developer_settings) the game's call is only
-    // forwarded and logged: no feedback-device lookup. With it, the publication token of the
-    // published feedback device is read before the driver query (the incoming pointer is the
-    // publication's alias, or unwrapped once; no reference is taken and no ReShade lock is
-    // entered): a result is the frame's sleep status only when it came from that device and the
-    // publication has not changed since (RecordSleepStatus). The lookup does not wait and never
-    // drains retired references.
+    // The published feedback device's token, read before the driver query (the incoming pointer is the
+    // publication's alias, or unwrapped once; no reference is taken and no ReShade lock is entered; the lookup does
+    // not wait and never drains retired references). A result counts only when it came from that device while it
+    // presents, and its publication has not changed since: as the frame's sleep status (RecordSleepStatus, under
+    // the status instrumentation, developer_settings) and as the driver's answer about the game's frames
+    // (display_state.h). Another device's answer never decides the pacing mode and never stops ReLimiter's own read.
     const bool observe = g_config.developer_settings;
     NvAPIFeedbackDevice published{};
-    if (observe) ResolvePublishedToken(device, &published);
+    const bool presenting = ResolvePublishedToken(device, &published) &&
+        SwapMgr_GetActiveAPI() != ActiveAPI::None && FeedbackIsPresenting(published);
     const NvAPI_Status result = SafeInvokeGetSleepStatus(device, params);
     NV_GET_SLEEP_STATUS_PARAMS seen{};
     // The driver's answer, read after the call.
     if (callback.IsStopping() || !params || !SafeCopySleepStatus(params, &seen)) return result;
-    if (published.device)
+    // While the game asks (Streamline does), ReLimiter's own read (PollSleepStatus) stays off.
+    if (presenting && result == NVAPI_OK &&
+        PublicationToken(published) == g_sleep_status_token.load(std::memory_order_acquire)) {
+        s_game_sleep_status_ms.store(GetTickCount64(), std::memory_order_relaxed);
+        DisplayState_OnSleepStatus(seen.bFsVrr != 0, seen.bFullscreenIFlip != 0, /*own_read=*/false);
+    }
+    if (observe && published.device)
         RecordSleepStatus(result, seen, PublicationToken(published));
     if (!s_game_sleep_status.Changed(result, seen) ||
         !ReflexObserveBudget(s_game_sleep_status.lines, kGameSleepStatusLogLimit, "GetSleepStatus changed again"))

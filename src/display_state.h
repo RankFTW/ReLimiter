@@ -25,11 +25,12 @@ void QueryVRRCeiling();
 void QueryVRRFloor();
 void PollGSyncState();
 void OnGSyncStateChange(bool new_gsync_active);
-// The display changed (its mode or connection) or turned on (display_events.h): read the G-Sync state again for the
-// resolved display. A positive answer makes G-Sync active; a negative one waits for the game's next swapchain
-// resolve, because the display may still be changing. `reason` is for the log. Any thread; nothing before the first
-// resolve.
-void DisplayState_OnDisplayEvent(const char* reason);
+// The driver's answer about the game's own frames (NvAPI_D3D_GetSleepStatus: bFsVrr, taken while bFullscreenIFlip
+// says the swapchain is in independent flip), from the game's own calls and ReLimiter's read (nvapi_hooks.cpp). Once
+// known it decides G-Sync in both directions; the display's flags decide only until then. Any thread, cheap: a
+// changed answer wakes the display worker (display_worker.h), which applies it with DisplayState_ApplyGameVrr.
+void DisplayState_OnSleepStatus(bool fullscreen_vrr, bool fullscreen_iflip, bool own_read) noexcept;
+void DisplayState_ApplyGameVrr();
 // The resolver's swapchain teardown: runs `retire` (it clears the resolved display) and publishes no display to frame
-// splitting, under the lock of the G-Sync polls, so a display event's poll cannot publish the retired display after it.
+// splitting, under the lock of the G-Sync polls, so the display worker cannot publish the retired display after it.
 void DisplayState_RetireDisplay(void (*retire)());

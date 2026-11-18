@@ -31,7 +31,7 @@
 #include "display_state.h"
 #include "vblank_thread.h"
 #include "display_poll_thread.h"
-#include "display_events.h"
+#include "display_worker.h"
 #include "flush.h"
 #include "frame_splitting.h"
 #include "config.h"
@@ -676,17 +676,16 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
 
         StartDisplayPollThread();
         s_display_poll_started = true;
-        // Display mode, connection and power changes read the display state again (display_events.h).
-        DisplayEvents_Start(hModule);
+        // The driver's answer about the game's frames is applied off the game's threads (display_worker.h).
+        DisplayWorker_Start();
         // The vblank worker is started only after an owning HWND exists and the
         // fixed-mode PLL has an explicit handoff. Starting it here races loader
         // initialization and leaves a false running state when no HWND exists.
         LOG_INFO("Background threads started");
 
+        // G-Sync is decided at the game's first swapchain and by the driver's answer about its frames; nothing is
+        // known here unless a previous load of the addon in this process resolved a display.
         PollGSyncState();
-        LOG_INFO("G-Sync: %s, mode: %s",
-                 g_gsync_active.load() ? "active" : "inactive",
-                 g_pacing_mode.load() == PacingMode::VRR ? "VRR" : "Fixed");
 
         // Developer flip_metering_off: before the game's frame generation
         // resolves NvAPI_D3D12_SetFlipConfig, so not with the deferred hooks.
@@ -791,9 +790,9 @@ static bool StopOwnedProducers() {
         auxiliary_workers_stopped =
             Blackout_Shutdown() && auxiliary_workers_stopped;
     auxiliary_workers_stopped = HWMonitor_Shutdown() && auxiliary_workers_stopped;
-    // Before the vblank and display workers: a display event can change the pacing mode (vblank worker) and the
-    // display published to frame splitting.
-    auxiliary_workers_stopped = DisplayEvents_Stop() && auxiliary_workers_stopped;
+    // Before the vblank and display workers: an answer of the driver about the game's frames can change the pacing
+    // mode (vblank worker) and the display published to frame splitting.
+    auxiliary_workers_stopped = DisplayWorker_Stop() && auxiliary_workers_stopped;
     auxiliary_workers_stopped =
         StopVBlankThread() && auxiliary_workers_stopped;
     if (s_display_poll_started)

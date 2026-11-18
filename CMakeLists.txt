@@ -53,10 +53,10 @@ set(ADDON_SOURCES
     src/dllmain.cpp
     src/config.cpp
     src/correlator.cpp
-    src/display_events.cpp
     src/display_poll_thread.cpp
     src/display_resolver.cpp
     src/display_state.cpp
+    src/display_worker.cpp
     src/enforcement_dispatcher.cpp
     src/feedback.cpp
     src/feedback_device_identity.cpp

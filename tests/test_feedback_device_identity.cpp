@@ -227,6 +227,12 @@ std::vector<NV_SET_SLEEP_MODE_PARAMS> s_forwarded_modes; // recorded while s_rec
 bool s_record_modes = false;
 NvAPI_Status s_mode_result = -9;
 void (*s_on_mode_forward)() = nullptr; // an interleaving point inside the driver's SetSleepMode
+// DisplayState_OnSleepStatus (display_state.cpp is not linked): the driver's answer about the game's frames as the
+// hooks hand it over.
+int s_game_vrr_calls = 0;
+bool s_game_vrr_fullscreen_vrr = false;
+bool s_game_vrr_fullscreen_iflip = false;
+bool s_game_vrr_own_read = false;
 
 IUnknown* s_last_driver_device = nullptr; // the device the newest fake driver call received
 NvAPI_Status __cdecl FakeSleepMode(IUnknown* device, NV_SET_SLEEP_MODE_PARAMS* params) {
@@ -1689,10 +1695,13 @@ void TestReflexObservation() {
     NV_GET_SLEEP_STATUS_PARAMS out{};
     out.version = static_cast<NvU32>(NV_GET_SLEEP_STATUS_PARAMS_VER);
     logs = s_reflex_observe_log_writes;
+    const int game_vrr_calls = s_game_vrr_calls;
     CHECK(Hook_GetSleepStatus(device, &out) == NVAPI_OK);
     CHECK(s_status_calls == 1 && s_status_input.version == static_cast<NvU32>(NV_GET_SLEEP_STATUS_PARAMS_VER) &&
           s_reflex_observe_log_writes == logs + 1);
     CHECK(out.bLowLatencyMode == 1 && out.sleepIntervalUs == 8000 && out.fgMultiplier == 2);
+    // No device presents and none is published: its answer about the game's frames goes nowhere.
+    CHECK(s_game_vrr_calls == game_vrr_calls);
     Hook_GetSleepStatus(device, &out);
     s_status_answer.sleepIntervalUs = 8200;   // 2.5%
     Hook_GetSleepStatus(device, &out);
@@ -1712,12 +1721,23 @@ void TestReflexObservation() {
     CHECK(NvAPI_CaptureFeedbackDevice(&presenting));
     s_status_answer.sleepIntervalUs = 8333;
     s_status_answer.bUseGameSleep = 1;
-    // Without the status instrumentation (developer_settings) the game's call is not observed at
-    // all.
+    // Without the status instrumentation (developer_settings) the game's call is not recorded.
     const bool saved_developer = g_config.developer_settings;
     g_config.developer_settings = false;
     Hook_GetSleepStatus(&presenting, &out);
     CHECK(g_sleep_status_newest.load() == 0);
+    // The driver's answer about the game's frames counts only from the published device while it presents: not
+    // before it presents, not from another device (which also does not stop ReLimiter's own read), and not from a
+    // failed call.
+    CHECK(s_game_vrr_calls == game_vrr_calls);
+    s_test_presenting = &presenting;
+    s_test_presenting_sequence = 2;
+    s_test_api = ActiveAPI::DX12;
+    s_game_sleep_status_ms.store(0);
+    Hook_GetSleepStatus(device, &out);
+    CHECK(s_game_vrr_calls == game_vrr_calls && s_game_sleep_status_ms.load() == 0);
+    Hook_GetSleepStatus(&presenting, &out);
+    CHECK(s_game_vrr_calls == game_vrr_calls + 1 && !s_game_vrr_own_read && s_game_sleep_status_ms.load() != 0);
     g_sleep_status_newest = 0;
     g_config.developer_settings = true;
     Hook_GetSleepStatus(device, &out);
@@ -1726,8 +1746,13 @@ void TestReflexObservation() {
     CHECK(g_sleep_status_newest.load() == CurrentStatusWord(8333, true));
     s_status_answer.sleepIntervalUs = 1111;
     s_status_result = -9;
+    const int vrr_calls_before_failure = s_game_vrr_calls;
     Hook_GetSleepStatus(&presenting, &out);
     CHECK(g_sleep_status_newest.load() == CurrentStatusWord(8333, true));
+    CHECK(s_game_vrr_calls == vrr_calls_before_failure);
+    s_test_presenting = nullptr;
+    s_test_presenting_sequence = 0;
+    s_test_api = ActiveAPI::None;
     s_status_result = NVAPI_OK;
     const auto saved_demand = g_pacing_telemetry_demand.exchange(kPacingReadout);
     PublishSleepStatusAtSleepReturn(g_sleep_status_token.load());
@@ -1754,37 +1779,56 @@ void TestReflexObservation() {
     s_status_answer.bUseGameSleep = 0;
     s_status_answer.sleepIntervalUs = 9000;
 
-    // The poll: off without developer_settings; with it, one driver call per second
-    // with a zeroed structure of the current version, through the trampoline.
+    // The poll. Without developer_settings it reads only when no game call carried the answer within the last
+    // second, and then only hands the answer to the display state (no record, no line). With it, one driver call
+    // per second with a zeroed structure of the current version, through the trampoline.
     g_config.developer_settings = saved_developer;
     const bool old_developer = g_config.developer_settings;
     g_config.developer_settings = false;
     s_sleep_status_poll_ms.store(0);
     const int status_calls = s_status_calls;
-    PollSleepStatus(device, g_sleep_status_token.load());
+    PollSleepStatus(device, g_sleep_status_token.load());   // the game asked just now
     CHECK(s_status_calls == status_calls);
-    g_config.developer_settings = true;
+    s_game_sleep_status_ms.store(0);                         // it has not asked within the last second
+    s_status_answer.bFsVrr = 1;
+    s_status_answer.bFullscreenIFlip = 1;
+    const int vrr_calls = s_game_vrr_calls;
     logs = s_reflex_observe_log_writes;
     PollSleepStatus(device, g_sleep_status_token.load());
-    CHECK(s_status_calls == status_calls + 1);
+    CHECK(s_status_calls == status_calls + 1 && s_game_vrr_calls == vrr_calls + 1);
+    CHECK(s_game_vrr_fullscreen_vrr && s_game_vrr_fullscreen_iflip && s_game_vrr_own_read);
+    CHECK(g_sleep_status_newest.load() == 0 && s_reflex_observe_log_writes == logs);
+    PollSleepStatus(device, g_sleep_status_token.load());
+    CHECK(s_status_calls == status_calls + 1);   // once per second
+    s_status_answer.bFsVrr = 0;
+    s_status_answer.bFullscreenIFlip = 0;
+    s_sleep_status_poll_ms.store(0);
+    g_config.developer_settings = true;
+    const int developer_calls = s_status_calls;
+    logs = s_reflex_observe_log_writes;
+    PollSleepStatus(device, g_sleep_status_token.load());
+    CHECK(s_status_calls == developer_calls + 1);
     CHECK(s_status_input.version == static_cast<NvU32>(NV_GET_SLEEP_STATUS_PARAMS_VER) &&
           s_status_input.sleepIntervalUs == 0 && s_status_input.fgMultiplier == 0 &&
           s_status_input.bLowLatencyMode == 0);
     CHECK(s_reflex_observe_log_writes == logs + 1);
     PollSleepStatus(device, g_sleep_status_token.load());
-    CHECK(s_status_calls == status_calls + 1);
+    CHECK(s_status_calls == developer_calls + 1);
     // The poll's result is the newest one.
     CHECK(g_sleep_status_newest.load() == CurrentStatusWord(9000, false));
     // A poll whose Sleep retained a publication that is no longer current: the query runs,
-    // the result is dropped (not tagged with the current publication's token).
+    // the result is dropped (not tagged with the current publication's token, and not the
+    // driver's answer about the game's frames).
     s_sleep_status_poll_ms.store(0);
     s_status_answer.sleepIntervalUs = 7777;
     g_sleep_status_newest = 0;
+    const int vrr_calls_before_stale = s_game_vrr_calls;
     PollSleepStatus(device, g_sleep_status_token.load() + 1);
-    CHECK(s_status_calls == status_calls + 2 && g_sleep_status_newest.load() == 0);
+    CHECK(s_status_calls == developer_calls + 2 && g_sleep_status_newest.load() == 0);
+    CHECK(s_game_vrr_calls == vrr_calls_before_stale);
     g_sleep_status_newest = CurrentStatusWord(7777, false);
     PollSleepStatus(device, g_sleep_status_token.load());
-    CHECK(s_status_calls == status_calls + 2); // once per second again
+    CHECK(s_status_calls == developer_calls + 2); // once per second again
     // The snapshot a Sleep leaves for the next Source record.
     PublishSleepStatusAtSleepReturn(g_sleep_status_token.load());
     const auto row = TakeSleepRow();
@@ -3144,6 +3188,13 @@ void OnMarker(uint64_t frame_id, int64_t, SchedulerTrigger, PacingSourceMarker) 
 void Scheduler_RecordReflexSleep(int64_t qpc) noexcept {
     ++s_record_sleep_calls;
     s_recorded_sleep_qpc = qpc;
+}
+// display_state.cpp is not linked: the driver's answer about the game's frames as the hooks hand it over.
+void DisplayState_OnSleepStatus(bool fullscreen_vrr, bool fullscreen_iflip, bool own_read) noexcept {
+    ++s_game_vrr_calls;
+    s_game_vrr_fullscreen_vrr = fullscreen_vrr;
+    s_game_vrr_fullscreen_iflip = fullscreen_iflip;
+    s_game_vrr_own_read = own_read;
 }
 // With s_scheduler_from_pipeline the next answer as scheduler.cpp does, from the published pipeline.
 bool Scheduler_PacesSource() noexcept {
