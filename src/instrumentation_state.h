@@ -93,10 +93,11 @@ struct FlipConfigState {
     FlipConfigEntry ring[FLIP_CONFIG_RING];
 };
 inline FlipConfigState g_flip_config;
-// QPC of the newest SetFlipConfig call that asked for metering (nFramesPerBatch > 0) and that the driver answered
-// with NVAPI_OK; 0 none. The ring above keeps every such call for the capture, accepted or not; this is what says
-// hardware flip metering is at work (the telemetry worker's FG input source, pacing_telemetry.cpp). One relaxed
-// store on the caller's thread per accepted call.
+// QPC of the newest SetFlipConfig call that put two or more frames in a batch, that the driver answered with
+// NVAPI_OK and whose feedback names no obstacle (no missing independent flip, no mirroring); 0 none. The ring
+// above keeps every call with frames in its batch for the capture, a batch of one and a refused call included;
+// this is what says hardware flip metering is spacing generated frames (the telemetry worker's FG input source,
+// pacing_telemetry.cpp). One relaxed store on the caller's thread per such call.
 inline std::atomic<int64_t> g_flip_metering_accepted_qpc{0};
 
 inline void FlipConfig_Record(int64_t qpc, uint32_t time_per_batch_us) noexcept

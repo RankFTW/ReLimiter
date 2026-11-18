@@ -2328,7 +2328,12 @@ static NvAPI_Status __cdecl Hook_SetFlipConfig(IUnknown* queue, UINT source, NV_
             ? static_cast<double>(seen.timePerBatchMs) * 1000.0 : 0.0;
         FlipConfig_Record(call_qpc.QuadPart, batch_us >= 4294967295.0 ? UINT32_MAX
             : static_cast<uint32_t>(batch_us + 0.5));
-        if (result == NVAPI_OK) g_flip_metering_accepted_qpc.store(call_qpc.QuadPart, std::memory_order_relaxed);
+        // Hardware flip metering is at work only where the batch has frames to space and the driver names no
+        // obstacle. A game without frame generation configures a batch of ONE in every frame, status 0 (Rogue
+        // Core and Phantom Blade Zero, logs of 2026-11-17: frames_per_batch=1; 3 and 4 with frame generation at
+        // 3x and 4x), and the driver's feedback says where it cannot meter (no independent flip, mirroring).
+        if (result == NVAPI_OK && seen.nFramesPerBatch >= 2 && seen.flipConfigFeedbackMask == 0)
+            g_flip_metering_accepted_qpc.store(call_qpc.QuadPart, std::memory_order_relaxed);
     }
     const NvU32 presented = v2 ? seen.nPresentedFramesPerBatch : 0;
     const uint64_t signature = (static_cast<uint64_t>(static_cast<uint32_t>(result)) << 32) |
