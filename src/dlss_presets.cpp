@@ -228,39 +228,56 @@ static HANDLE OpenProfileDatabaseDirectory() noexcept {
         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
 }
 
+// Issues the next directory read. ERROR_NOTIFY_ENUM_DIR (Windows could not record every change) counts as a change
+// of unknown files: `*changed` is set and the read is issued once more.
+static bool IssueDirectoryRead(HANDLE directory, BYTE* buffer, DWORD size, OVERLAPPED* overlapped, bool* changed) noexcept {
+    if (ReadDirectoryChangesW(directory, buffer, size, FALSE, kDrsChangeFilter, nullptr, overlapped, nullptr)) return true;
+    if (GetLastError() != ERROR_NOTIFY_ENUM_DIR) return false;
+    *changed = true;
+    return ReadDirectoryChangesW(directory, buffer, size, FALSE, kDrsChangeFilter, nullptr, overlapped, nullptr) != FALSE;
+}
+
 // Reads the profile once, then again only after the driver's profile database changed (the NVIDIA Control Panel,
-// the NVIDIA App or another tool saved it), instead of reloading the whole database every 10 s. Without a
-// watchable directory the values read at start stay.
+// the NVIDIA App or another tool saved it), instead of reloading the whole database every 10 s. The watch is armed
+// before the first read, so a save after that read is always reported. Without a watchable directory the values
+// read at start stay.
 static void PollThreadImpl() {
     if (s_stop_requested.load(std::memory_order_acquire)) return;
-    DoPoll();
-
     const HANDLE directory = OpenProfileDatabaseDirectory();
-    if (directory == INVALID_HANDLE_VALUE) {
-        LOG_INFO("DLSS presets: driver profile changes are not watched (error %lu); the values read at start stay",
-                 GetLastError());
-        WaitForSingleObject(s_stop_event, INFINITE);
-        return;
-    }
     OVERLAPPED overlapped = {};
-    overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     alignas(DWORD) BYTE buffer[4096];
-    bool reading = overlapped.hEvent != nullptr &&
-        ReadDirectoryChangesW(directory, buffer, sizeof(buffer), FALSE, kDrsChangeFilter, nullptr, &overlapped, nullptr);
-    if (!reading) {
-        LOG_INFO("DLSS presets: driver profile changes are not watched (error %lu); the values read at start stay",
-                 GetLastError());
-        WaitForSingleObject(s_stop_event, INFINITE);
+    bool reading = false;
+    bool changed = false;
+    DWORD watch_error = directory == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+    if (directory != INVALID_HANDLE_VALUE) {
+        overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        reading = overlapped.hEvent != nullptr && IssueDirectoryRead(directory, buffer, sizeof(buffer), &overlapped, &changed);
+        if (!reading) watch_error = GetLastError();
     }
+    DoPoll();
+    if (!reading)
+        LOG_INFO("DLSS presets: driver profile changes are not watched (error %lu); the values read at start stay",
+                 watch_error);
     while (reading) {
         const HANDLE handles[2] = { s_stop_event, overlapped.hEvent };
         if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) break;
         DWORD bytes = 0;
-        const bool completed = GetOverlappedResult(directory, &overlapped, &bytes, FALSE) != FALSE;
-        const bool changed = completed && NamesProfileDatabase(buffer, bytes);
+        changed = false;
+        if (GetOverlappedResult(directory, &overlapped, &bytes, FALSE)) {
+            changed = NamesProfileDatabase(buffer, bytes);
+        } else if (GetLastError() == ERROR_NOTIFY_ENUM_DIR) {
+            changed = true;
+        } else {
+            reading = false;
+            LOG_INFO("DLSS presets: watching driver profile changes stopped (error %lu); the values read last stay",
+                     GetLastError());
+            break;
+        }
         ResetEvent(overlapped.hEvent);
-        reading = completed &&
-            ReadDirectoryChangesW(directory, buffer, sizeof(buffer), FALSE, kDrsChangeFilter, nullptr, &overlapped, nullptr);
+        reading = IssueDirectoryRead(directory, buffer, sizeof(buffer), &overlapped, &changed);
+        if (!reading)
+            LOG_INFO("DLSS presets: watching driver profile changes stopped (error %lu); the values read last stay",
+                     GetLastError());
         if (!changed) continue;
         if (WaitForSingleObject(s_stop_event, kDrsSettleMilliseconds) == WAIT_OBJECT_0) break;
         DoPoll();
@@ -272,7 +289,8 @@ static void PollThreadImpl() {
         GetOverlappedResult(directory, &overlapped, &bytes, TRUE);
     }
     if (overlapped.hEvent) CloseHandle(overlapped.hEvent);
-    CloseHandle(directory);
+    if (directory != INVALID_HANDLE_VALUE) CloseHandle(directory);
+    WaitForSingleObject(s_stop_event, INFINITE);
 }
 
 static DWORD WINAPI PollThreadProc(LPVOID) noexcept {
