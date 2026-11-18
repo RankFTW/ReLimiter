@@ -75,6 +75,13 @@ private:
 // one, before frame n + 1's readiness: frame n is emitted then, one frame late. The caller keeps that order: it
 // takes a batch of readiness records off their queue FIRST, then adds every release queued by then, then the batch
 // (drained the other way round, a release pushed between the two drains would be missed).
+//
+// One order the producer does not keep (gpu_present_gate_d3d12.cpp, Service): a ticket it signals in the pass that
+// still read it as armed, its Wait being enqueued by the submitting thread at that moment, gets its record a pass
+// later, and frame n + 1's readiness can be pushed in between. Frame n then enters here with its readiness. The
+// hold it misses is no longer than from the Wait's enqueue to that Signal, the two short paths of those two
+// threads (a frame armed at or after its target: microseconds, not a paced hold). Closing it would mean holding
+// back the readback in the service, which feeds the pacer; the telemetry does not get to change that.
 struct PacingFgInputSample {
     PacingFrameKey key{};
     int64_t entry_qpc = 0;
