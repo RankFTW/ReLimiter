@@ -233,7 +233,7 @@ bool TryOwnSleep(int64_t target_qpc) {
                  qpc_to_us(qpc_after.QuadPart - target_qpc));
     }
 
-    // Record final wake accuracy (post-spin) for PQI deadline scoring.
+    // Record final wake accuracy (post-spin).
     g_adaptive_wake_guard.RecordFinalWake(target_qpc, qpc_after.QuadPart);
     return true;
 }

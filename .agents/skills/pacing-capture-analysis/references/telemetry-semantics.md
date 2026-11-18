@@ -281,7 +281,7 @@ Each capture file's state block also carries the current `grid_epoch` (value and
 |---|---|
 | `snapshot_sequence` | Published snapshot sequence, from 1 at worker start |
 | `window_first_row_sequence`, `window_last_row_sequence` | Row sequences of the oldest and newest retained row of the selected swapchain; empty when none was retained |
-| `snapshot_display_source` | 0 none, 1 ETW display samples received within the window, 2 DXGI frame-statistics samples (Phase 2, while ETW samples are not flowing) |
+| `snapshot_display_source` | 0 none, 1 ETW display samples received within the window, 2 DXGI frame-statistics samples (Phase 2, while ETW samples are not flowing), 3 the flip gate's flips (frame generation presenting from its own thread; each flip at the gate's release, or at its work's completion where that came later), 4 the real frames entering frame generation (the FG input wait's release or the frame's readiness, only while hardware flip metering is seen). Sources 3 and 4 feed the runtime window without rows: the window's display values (changes, intervals, jitter, deviation, long and short frames) of such a snapshot are those of the in-process samples and cannot be recomputed from the rows file, so `analyze_pacing.py` skips its comparison (`in_process_source`). The rows keep `display_source` 1 or 2 only |
 | `snapshot_loss_window` | 1 when the newest recent display sample was inside an ETW loss window |
 | `snapshot_target_output_interval_us` | The selected chain's current T_out; empty while unknown |
 | `window_display_changes`, `window_long_frames`, `window_short_frames` | Rows with `display_change`, `long_frame` or `short_frame` = 1 |

@@ -41,7 +41,7 @@ std::atomic<double> g_actual_frame_time_us{0.0};
 std::atomic<uint64_t> g_actual_frame_sample_sequence{0};
 std::atomic<double> g_effective_interval_us{0.0};
 
-// ── OSD cadence and Smoothness publication ──
+// ── OSD cadence publication ──
 // Changes only on lifecycle invalidation. Plain cadence state remains
 // scheduler-owned.
 static std::atomic<uint64_t> s_cadence_bypass_generation{0};
@@ -50,11 +50,9 @@ static std::atomic<uint32_t> s_published_cadence_epoch{0};
 static std::atomic<uint32_t> s_published_cadence_controller_generation{0};
 static std::atomic<SchedulerTrigger> s_published_cadence_trigger{
     SchedulerTrigger::NvApiMarker};
-static SchedulerCadenceVariation s_cadence_variation; // scheduler owner only
-static std::atomic<double> s_published_cadence_variation_us{-1.0}; // -1 = unavailable
 static SchedulerCadenceTracker s_telemetry_cadence;
 
-void Scheduler_ResetSmoothness() noexcept {
+void Scheduler_ResetCadenceReadout() noexcept {
     s_cadence_bypass_generation.fetch_add(1, std::memory_order_seq_cst);
 }
 
@@ -141,7 +139,6 @@ static SchedulerCadenceObservation PublishCadence(
             s_cadence_bypass_generation.load(std::memory_order_seq_cst);
     const SchedulerCadenceObservation observation = s_telemetry_cadence.Observe(
         context, timestamp_qpc, generation_current);
-    s_cadence_variation.Observe(observation);
 
     // Atomic payload plus a bounded sequence read: no reader/writer spinning,
     // no extra owner acquisition, and no torn double on Win32. Sequentially
@@ -150,10 +147,6 @@ static SchedulerCadenceObservation PublishCadence(
     g_actual_frame_time_us.store(
         observation.valid ? qpc_to_us(observation.interval_qpc) : 0.0,
         std::memory_order_seq_cst);
-    s_published_cadence_variation_us.store(s_cadence_variation.IsValid()
-        ? s_cadence_variation.ValueQpc() * 1'000'000.0 /
-            static_cast<double>(GetQPCFrequency())
-        : -1.0, std::memory_order_seq_cst);
     s_published_cadence_generation.store(
         context.bypass_generation, std::memory_order_seq_cst);
     s_published_cadence_epoch.store(
@@ -174,8 +167,6 @@ bool Scheduler_ReadActualFrameSample(SchedulerActualFrameSample* sample) noexcep
     if ((sequence & 1u) != 0) return false;
     const double frame_time_us =
         g_actual_frame_time_us.load(std::memory_order_seq_cst);
-    const double variation_us =
-        s_published_cadence_variation_us.load(std::memory_order_seq_cst);
     const uint64_t generation =
         s_published_cadence_generation.load(std::memory_order_seq_cst);
     const uint32_t epoch =
@@ -195,9 +186,6 @@ bool Scheduler_ReadActualFrameSample(SchedulerActualFrameSample* sample) noexcep
     sample->sequence = sequence;
     sample->valid = sequence != 0 && generation_current && frame_time_us > 0.0;
     sample->frame_time_us = sample->valid ? frame_time_us : 0.0;
-    sample->variation_valid = sample->valid && std::isfinite(variation_us) &&
-        variation_us >= 0.0;
-    sample->variation_us = sample->variation_valid ? variation_us : 0.0;
     return true;
 }
 
@@ -501,7 +489,7 @@ static void ResetUnifiedLaw() noexcept
 static void ResetAdaptationRegime(const char* reason) noexcept
 {
     DiscardReflexFrameTimeSamples();
-    Scheduler_ResetSmoothness();
+    Scheduler_ResetCadenceReadout();
     s_lfc.Reset();
     ResetUnifiedLaw();
     LOG_INFO("Scheduler: cadence readout reset (%s)", reason);

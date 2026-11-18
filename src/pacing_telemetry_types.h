@@ -439,3 +439,19 @@ struct PacingDisplaySample {
     double pcl_total_us = 0.0;
     double pcl_dropped_accumulation_us = 0.0;
 };
+
+// The flip gate's clock thread (fg_present_order.cpp), once per flip it let go: frame generation presenting from its
+// own thread, where ReLimiter times each displayed frame. flip_qpc is when the flip happened as the gate knows it:
+// its release as the clock made it, or the frame's own work where that was done later (the flip follows by 0.14 ms
+// in the packet traces, the same for every flip). Not a display observation: what the driver and the display add
+// below the Present is not in it.
+struct PacingFlipSample {
+    int64_t flip_qpc = 0;
+    int64_t cycle_ticks = 0; // the pacer's interval for the flip's frame (QPC ticks); 0 = none known
+    uint64_t marker = 0;     // the ordering's marker of the flip's cycle: rises by one per frame within a binding
+    uint32_t epoch = 0;      // the gate's binding; markers start again with each
+    uint32_t cycle = 0;      // the presenting thread's count of cycles woken ahead: one value per frame's flips
+    uint8_t index = 0;       // the flip's place in its cycle: 0 the first generated frame's
+    uint8_t outputs = 0;     // the cycle's flips: 2 at 2x, 3 at 3x, 4 at 4x
+    uint8_t real = 0;        // the cycle's last flip, the real frame's
+};

@@ -50,7 +50,7 @@ The OSD shows real-time stats organized by category:
 
 - **Performance** — FPS, 1% Low, 0.1% Low, Frametime, Frametime Graph
 - **Latency** — CPU Latency, GPU Render Time, Total Frame Cost, FG Time
-- **Quality** — PQI (Pacing Quality Index, scored from measured display pacing: Consistency, Stutter, Animation) with optional breakdown, Smoothness, Display Pacing (measured display intervals, jitter and animation error from ETW PC Latency timing or, on DX11/DX12, DXGI frame statistics)
+- **Quality** — Jitter (the average change from one frame interval to the next), Frame Pacing (frame time, jitter, hitches and animation error over the last 5 seconds, measured on displayed frames from ETW PC Latency timing, DXGI frame statistics or ReLimiter's flip gate, or on the real frames entering frame generation where hardware flip metering places the generated ones)
 - **Pipeline** — Frame Generation status, time added by the limiter
 - **System** — GPU Temp, GPU Clock, GPU Usage, VRAM, CPU Usage, RAM
 

@@ -173,6 +173,7 @@ struct PacingMetricDistribution {
     uint32_t count = 0;
     double p50_us = 0.0;
     double p99_us = 0.0;
+    double mean_us = 0.0;
 };
 
 struct PacingWindowSummary {
@@ -193,6 +194,9 @@ struct PacingWindowSummary {
     PacingMetricDistribution cpu_hold;
     uint32_t long_frames = 0;
     uint32_t short_frames = 0;
+    // Display intervals over 1.5 times their median in the window: the capture reports' hitch. Needs no target,
+    // unlike long_frames, so it also counts where the pacer has no plan for the frames.
+    uint32_t hitches = 0;
 };
 
 constexpr size_t PACING_METRIC_WINDOW_CAPACITY = 8192; // 5 s at 1600 rows/s

@@ -628,12 +628,14 @@ class SnapshotTests(TemporaryDirectoryTest):
             snapshot_row(4, SWAPCHAIN, 106, 110, WINDOW_A_105_106),  # extends past the file's last row
             snapshot_row(5, None, None, None, {}),                   # no swapchain selected
             snapshot_row(6, SWAPCHAIN, None, None, {}),              # no retained rows
+            # The flip gate's samples are no rows: the window's values cannot be recomputed from the file.
+            snapshot_row(7, SWAPCHAIN, 105, 106, WINDOW_A_101_106, snapshot_display_source=3),
         ])
         self.assertEqual((snapshots["status"], snapshots["compared"], snapshots["mismatching"]), ("match", 1, 0))
-        self.assertEqual(snapshots["skipped_total"], 5)
+        self.assertEqual(snapshots["skipped_total"], 6)
         self.assertEqual({name: count for name, count in snapshots["skipped"].items() if count},
                          {"range_before_file": 1, "sequence_gap": 1, "range_after_file": 1,
-                          "no_selected_swapchain": 1, "empty_window": 1})
+                          "no_selected_swapchain": 1, "empty_window": 1, "in_process_source": 1})
 
     def test_unavailable_without_snapshot_columns_or_events(self):
         historical = inspector.CURRENT_PACING_EVENTS_HEADER[:50]

@@ -39,14 +39,12 @@ struct Config {
     bool osd_show_frametime_graph = false;
     bool osd_show_fg = false;
     bool osd_show_limiter = false;
-    bool osd_show_pqi = false;
+    bool osd_show_jitter = false;
     bool osd_show_cpu_latency = false;
     bool osd_show_native_pcl = false;
     bool osd_show_native_pcl_breakdown = false;
-    bool osd_show_pqi_breakdown = false;
     bool osd_show_1pct_low = false;
-    bool osd_show_smoothness = false;
-    bool osd_show_pacing_quality = false; // measured display pacing (ETW or DXGI display timing)
+    bool osd_show_pacing_quality = false; // Frame Pacing block: measured frame pacing, no ETW needed
 
     // OSD appearance
     float osd_scale = 1.0f;                // 0.5 – 2.0 (50% – 200%)
@@ -199,13 +197,11 @@ struct OSDPreset {
     bool show_frametime_graph = false;
     bool show_fg = false;
     bool show_limiter = false;
-    bool show_pqi = false;
+    bool show_jitter = false;
     bool show_cpu_latency = false;
     bool show_native_pcl = false;
     bool show_native_pcl_breakdown = false;
-    bool show_pqi_breakdown = false;
     bool show_1pct_low = false;
-    bool show_smoothness = false;
     bool show_pacing_quality = false;
     bool show_0_1pct_low = false;
     bool show_gpu_render_time = false;

@@ -694,17 +694,20 @@ if(MSVC)
     target_compile_options(test_source_stage PRIVATE /W4 /utf-8 /permissive-)
 endif()
 
-## ── DXGI display source and display-metric PQI tests ──
+## ── DXGI display source and in-process sample source tests ──
 # Directly test the production present-count matcher with its join and chain
-# contract, and PQI_FromSnapshot golden vectors. The Present hook, correlator
-# polling and live DXGI statistics need live validation.
+# contract, and the frame pacing window's in-process sources (the flip gate's
+# flips, the real frames at the FG input) with the window's mean and hitch
+# count. The Present hook, correlator polling, live DXGI statistics and the
+# flip gate's own stamps need live validation.
 
 add_executable(test_dxgi_display_source test_dxgi_display_source.cpp
     ${CMAKE_SOURCE_DIR}/src/dxgi_display_source.cpp
     ${CMAKE_SOURCE_DIR}/src/pacing_join.cpp
     ${CMAKE_SOURCE_DIR}/src/pacing_metrics.cpp)
-add_executable(test_pqi test_pqi.cpp ${CMAKE_SOURCE_DIR}/src/pqi.cpp)
-foreach(display_target IN ITEMS test_dxgi_display_source test_pqi)
+add_executable(test_pacing_sample_sources test_pacing_sample_sources.cpp
+    ${CMAKE_SOURCE_DIR}/src/pacing_metrics.cpp)
+foreach(display_target IN ITEMS test_dxgi_display_source test_pacing_sample_sources)
     set_target_properties(${display_target} PROPERTIES
         CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
     target_include_directories(${display_target} PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -1102,4 +1105,4 @@ add_test(NAME frame_plan COMMAND test_frame_plan)
 set_tests_properties(frame_plan PROPERTIES TIMEOUT 60)
 add_test(NAME control_file COMMAND test_control_file)
 add_test(NAME dxgi_display_source COMMAND test_dxgi_display_source)
-add_test(NAME pqi COMMAND test_pqi)
+add_test(NAME pacing_sample_sources COMMAND test_pacing_sample_sources)

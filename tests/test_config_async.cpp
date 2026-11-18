@@ -2220,7 +2220,7 @@ std::vector<std::string> WrittenValues(const char* key) {
     return values;
 }
 
-// The 28 OSD element toggles of the live config and of a preset, written once here as the fixture of the contract:
+// The 26 OSD element toggles of the live config and of a preset, written once here as the fixture of the contract:
 // the INI key of the config flag, the key of the preset section, and the two fields.
 struct OsdToggle {
     const char* config_key;
@@ -2231,17 +2231,17 @@ struct OsdToggle {
 #define OSD_TOGGLE(name) { "osd_show_" #name, "show_" #name, &Config::osd_show_##name, &OSDPreset::show_##name }
 const OsdToggle osd_toggles[] = {
     OSD_TOGGLE(fps), OSD_TOGGLE(frametime), OSD_TOGGLE(frametime_graph), OSD_TOGGLE(fg), OSD_TOGGLE(limiter),
-    OSD_TOGGLE(pqi), OSD_TOGGLE(cpu_latency), OSD_TOGGLE(native_pcl), OSD_TOGGLE(native_pcl_breakdown),
-    OSD_TOGGLE(pqi_breakdown), OSD_TOGGLE(1pct_low), OSD_TOGGLE(smoothness), OSD_TOGGLE(pacing_quality),
+    OSD_TOGGLE(jitter), OSD_TOGGLE(cpu_latency), OSD_TOGGLE(native_pcl), OSD_TOGGLE(native_pcl_breakdown),
+    OSD_TOGGLE(1pct_low), OSD_TOGGLE(pacing_quality),
     OSD_TOGGLE(0_1pct_low), OSD_TOGGLE(gpu_render_time), OSD_TOGGLE(total_frame_cost), OSD_TOGGLE(fg_time),
     OSD_TOGGLE(gpu_temp), OSD_TOGGLE(gpu_clock), OSD_TOGGLE(gpu_usage), OSD_TOGGLE(vram), OSD_TOGGLE(cpu_usage),
     OSD_TOGGLE(ram), OSD_TOGGLE(dlss_quality), OSD_TOGGLE(dlss_features), OSD_TOGGLE(dlss_resolution),
     OSD_TOGGLE(dlss_presets), OSD_TOGGLE(dlss_versions)};
 #undef OSD_TOGGLE
 constexpr size_t osd_toggle_count = sizeof(osd_toggles) / sizeof(osd_toggles[0]);
-static_assert(osd_toggle_count == 28, "the contract lists 28 OSD element toggles");
+static_assert(osd_toggle_count == 26, "the contract lists 26 OSD element toggles");
 
-// The 60 keys of the [FrameLimiter] section that are not OSD element toggles (88 with the 28 toggles), each with a value
+// The 60 keys of the [FrameLimiter] section that are not OSD element toggles (86 with the 26 toggles), each with a value
 // away from its default as an earlier launch left it, and the value the clean rewrite saves back. The keybind keys are
 // written to the local INI only while the presets are not shared. Derived by running the writer, then pinned. Which keys
 // exist is not decided here: ExpectedIniKeys reads the config_key lines of the shared fixture.
@@ -2498,7 +2498,7 @@ void TestOnlyTheListedKeysAreLive() {
         CHECK(std::strstr(unknown, "not a live key") != nullptr);
         ++refused;
     }
-    CHECK(refused == 88 - 20);
+    CHECK(refused == 86 - 20);
     SaveConfig();
     CHECK(SectionFields(local_path, "FrameLimiter") == before); // nothing a refused key named changed
     ReleaseStart();CHECK(OwnerShutdown());
@@ -2621,6 +2621,37 @@ void TestOsdElementTogglesCoverLoadSaveAndEveryPresetPath() {
         for (size_t i = 0; i < osd_toggle_count; ++i) CHECK(FieldIs(preset, osd_toggles[i].preset_key, i == k ? "true" : "false"));
         CHECK(SectionFields(local_path, "OSD_Preset_2").empty());
     }
+}
+
+// Jitter replaces PQI and Smoothness: an INI or a preset section that still has either on, and no jitter key, loads
+// with Jitter on; a jitter key it carries wins; the rewritten INI carries the old keys no more.
+void TestJitterTakesOverPqiAndSmoothness() {
+    for (const char* old_key : {"osd_show_pqi", "osd_show_smoothness"}) {
+        Reset(false, false, {{"config_version", "6"}, {old_key, "true"}});
+        CHECK(g_config.osd_show_jitter);
+        ReleaseStart();CHECK(OwnerShutdown());
+        CHECK(Value(local_path, "FrameLimiter", "osd_show_jitter") == "true");
+        CHECK(Value(local_path, "FrameLimiter", old_key).empty());
+    }
+    Reset(false, false, {{"config_version", "6"}, {"osd_show_pqi", "true"}, {"osd_show_smoothness", "true"},
+        {"osd_show_jitter", "false"}});
+    CHECK(!g_config.osd_show_jitter);
+    ReleaseStart();CHECK(OwnerShutdown());
+    Reset(false, false, {{"config_version", "6"}, {"osd_show_pqi", "false"}, {"osd_show_pqi_breakdown", "true"}});
+    CHECK(!g_config.osd_show_jitter);
+    ReleaseStart();CHECK(OwnerShutdown());
+    CHECK(Value(local_path, "FrameLimiter", "osd_show_pqi_breakdown").empty());
+
+    // A preset saved with the old keys.
+    extra_seed = {{local_path, "OSD_Preset_1", "name", "Old"}, {local_path, "OSD_Preset_1", "show_smoothness", "true"},
+        {local_path, "OSD_Preset_2", "name", "Kept"}, {local_path, "OSD_Preset_2", "show_pqi", "true"},
+        {local_path, "OSD_Preset_2", "show_jitter", "false"}, {local_path, "OSD_Preset_3", "name", "Off"},
+        {local_path, "OSD_Preset_3", "show_pqi_breakdown", "true"}};
+    Reset(false, false, {{"config_version", "6"}});
+    CHECK(OSDPreset_GetSlot(0).show_jitter);
+    CHECK(!OSDPreset_GetSlot(1).show_jitter);
+    CHECK(!OSDPreset_GetSlot(2).show_jitter);
+    ReleaseStart();CHECK(OwnerShutdown());
 }
 
 // Deleting a preset compacts the slots (the ones after it move down), keeps at least the initial slots, and clears the
@@ -2782,6 +2813,7 @@ int main() {
     TestOnlyTheListedKeysAreLive();
     TestDeveloperFieldsAreCountedAndResetOneByOne();
     TestOsdElementTogglesCoverLoadSaveAndEveryPresetPath();
+    TestJitterTakesOverPqiAndSmoothness();
     TestPresetDeleteCompactsAndClearsTheTail();
     TestUiRequestsDoNoCallerIo();
     TestSyncSaveAndReloadDrainQueuedWritesFirst();

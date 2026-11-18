@@ -171,6 +171,8 @@ The main view shows one plain status line; the technical lines are under **Detai
 
 **Mode | Output | Reason.** `vrr` or `fixed` from the display, `idle` while an idle cap (Background FPS, FG-Off Cap, OLED Care) is active, or `off` when ReLimiter is not pacing. Output is one of `gpu_queue_wait`, `fg_input_wait`, `marker_hold`, `source_only` (`native_hold`, which nothing produces now, appears only in captures of older builds). Reason is listed under [Fallback Reasons](#fallback-reasons).
 
+**Jitter.** `Jitter: 0.26 ms (displayed frames, flip gate)`: the same figure as the OSD's **Jitter**, the average change from one frame interval to the next over the last 5 seconds, with what was measured in brackets (`displayed frames, ETW`, `displayed frames, DXGI`, `displayed frames, flip gate`, or `real frames, N displayed per real frame` where hardware flip metering places the generated frames). Shown only once a source has intervals; there is no line otherwise.
+
 **Placement.**
 - `unified` is the pacer's own wait inside the game's Reflex Sleep call, `marker` waits at the game's frame-start marker (a game that does not call the Reflex Sleep), `present` at the Present call, `none` means ReLimiter is not pacing.
 - `Reflex driver limiter (x.xx ms)` shows the presented-frame interval applied in the test mode `driver_limiter`; an orange `Reflex driver limiter (not applied)` can appear briefly while the driver limit is not in effect. Where the limiter cannot apply, the game runs as it is (reason `driver_limiter_unavailable`).
@@ -329,7 +331,7 @@ Turn on **Telemetry Logging** (Advanced) to record a capture; the User Guide des
 
 - ReLimiter's release and frame plan: cadence epoch and index, output target, lead, output point and its outcome.
 - The game's Present call, GPU wait and readiness timing, Reflex timing.
-- The display time and its source (ETW or DXGI), and Display Pacing measurements.
+- The display time and its source (ETW or DXGI), and Frame Pacing measurements.
 - Columns this build no longer writes. The header of this build has 195 columns; the pre-removal header has 199 and carries seven that this build does not write: `predicted_render_us`, `governor_step`, `governor_interval_us` (the removed period governor's step and interval), `plan_signal_advance_us`, `pre_sleep_margin_us` (the margin of the removed pre-Sleep placement) and `gpu_first_submit_qpc` and `gpu_start_qpc` (the stamps of the removed GPU start probe); it has no `plan_ordered`, `plan_start_limit_us` or `plan_start_applied` (below). An older capture carries them with their old meaning and the analysis tools read both headers. In `source_flags` the bits 4 `gpu_paced`, 64 `overload` and 128 `stall_injected` are never set by this build; an older capture can carry them.
 - `gate_pre_wait_qpc` and `gate_post_wait_qpc`, the GPU queue wait's GPU time before and after the wait (with **GPU Wait Probes**; empty when unknown).
 - PC Latency (with PC latency collection).
@@ -356,7 +358,7 @@ Turn on **Telemetry Logging** (Advanced) to record a capture; the User Guide des
 - Cadence restarts (grid epochs) with their reason (`governor_step` as a reason appears only in captures of older builds).
 - `stall_injected`, `governor_step` and `rung_feasibility` events appear only in captures of older builds (a stall injected into a frame, a period governor step, and hold feasibility changes: value 1 while holds were off, 0 when they resumed, cause `overload`, `retry` or `none`); this build writes none of them. The event columns are unchanged.
 - `gpu_wait_cap` events appear only in files from older builds that had a GPU wait cap (the level 0..3 as value, 255 for the open top; cause `late_resumes`, `trial_failed`, `calm`, `reset`, `opened` or `closed`); current builds write none.
-- Measurement loss (dropped records and lost ETW events), PC latency status changes and every Display Pacing snapshot.
+- Measurement loss (dropped records and lost ETW events), PC latency status changes and every Frame Pacing snapshot.
 
 Release and Present times describe ReLimiter's pacing, not what reached the display, especially with frame generation. Captures made by older builds can have other column counts (the earlier header has 199 columns) and other event types and causes.
 

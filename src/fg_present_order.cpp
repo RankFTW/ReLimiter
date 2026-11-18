@@ -7,6 +7,7 @@
 #include "gpu_hold_order.h"
 #include "gpu_queue_probe.h"
 #include "runtime_lifecycle.h"
+#include "pacing_telemetry.h"
 #include "logger.h"
 #include "hooks.h"
 #include <d3d12.h>
@@ -357,6 +358,7 @@ struct GateEntry {
     uint8_t index = 0;                         // its place in the cycle: 0 the first generated frame's
     uint8_t outputs = 2;                       // the cycle's Presents: 2 at 2x, 3 at 3x, 4 at 4x
     uint32_t released = 0, issued = 0;         // the ordering's markers when it was armed (for the pair lines)
+    uint32_t cycle = 0;                        // the presenting thread's count of its cycle (for the flip samples)
 };
 constexpr unsigned kGateRing = 16;
 constexpr int64_t kGateMostMs = 60;
@@ -1197,6 +1199,7 @@ struct AheadCycle {
     int64_t spacing = 0;       // how far DLSS-G put the cycle's second Present behind its first (0: not made yet)
     uint64_t value = 0;        // the marker whose completion says frame generation is done for this cycle (0: unknown)
     uint32_t epoch = 0;        // the binding `value` was taken in (gate_epoch): the cycle's holds end with it
+    uint32_t serial = 0;       // the thread's count of cycles woken ahead at this one: one value for a frame's flips
     uint64_t later_value = 0;  // the newest fence value of the same frame answered after the first (3x and 4x)
     int generated = 1;         // the generated frames a real one when the cycle began: its Presents after the first
     int made = 0;              // the cycle's Presents made after its first
@@ -1205,6 +1208,7 @@ struct AheadCycle {
     bool counted = false;      // g_fg_present_ahead_woken counts this thread
 };
 thread_local AheadCycle ahead;
+thread_local uint32_t ahead_serial = 0;   // the thread's cycles woken ahead so far (AheadCycle::serial)
 // fg_present_ahead 3: the gate a Present of a cycle woken ahead is to get. The flip waits, on the swapchain's own
 // queue, for a Signal the D3D12 runtime makes on the presenting thread's work queue inside the native Present, behind
 // a command list and a Signal of DXGI's own (CD3D12Device::CloseAndSubmitCommandList; packet trace, hook log and
@@ -1220,6 +1224,7 @@ struct GateArm {
     uint8_t note = 0;       // a later Present's: how its hold ended (AheadBeforePresent)
     uint32_t released = 0, issued = 0;   // the ordering's markers when it was armed
     uint8_t index = 0, outputs = 2;      // its place in the cycle and the cycle's Presents
+    uint32_t cycle = 0;                  // the cycle's count on its thread (AheadCycle::serial)
 };
 thread_local GateArm gate_arm;
 thread_local uint64_t gate_marker = 0;    // the marker of the thread's newest generated Present
@@ -1425,6 +1430,7 @@ bool GateEnqueue(ID3D12CommandQueue* queue, const GateArm& arm) noexcept {
         entry.note = arm.note;
         entry.released = arm.released;
         entry.issued = arm.issued;
+        entry.cycle = arm.cycle;
         gate_ring[tail % kGateRing] = entry;
         gate_tail.store(tail + 1, std::memory_order_release);
         done = true;
@@ -1442,12 +1448,13 @@ bool GateEnqueue(ID3D12CommandQueue* queue, const GateArm& arm) noexcept {
 // `index`-th behind the cycle's first of `outputs` (`real`: the last). Where the thread's last Present made a Signal
 // inside the native call the Wait is left to that Signal's return (FgPresentOrder_AfterSignalActive); else it goes in
 // front of the call.
-void GateArmFor(bool real, uint8_t index, uint8_t outputs, uint64_t marker_value, int64_t spacing, uint8_t note) noexcept {
+void GateArmFor(bool real, uint8_t index, uint8_t outputs, uint64_t marker_value, int64_t spacing, uint8_t note,
+    uint32_t cycle) noexcept {
     // An armed gate counts with the cycles woken ahead, so the Present's return accounts it whatever the key is then.
     if (!gate_arm.armed) g_fg_present_ahead_woken.fetch_add(1, relaxed);
     gate_arm = GateArm{true, real, false, marker_value, spacing, 0, note,
         static_cast<uint32_t>(g_fg_present_order_released.load(relaxed)),
-        static_cast<uint32_t>(g_fg_present_order_issued.load(relaxed)), index, outputs};
+        static_cast<uint32_t>(g_fg_present_order_issued.load(relaxed)), index, outputs, cycle};
     if (!gate_in_call && present_queue && GateEnqueue(present_queue, gate_arm)) {
         gate_arm.placed = true;
         gate_front.fetch_add(1, relaxed);
@@ -1660,6 +1667,7 @@ DWORD WINAPI GateClock(void*) noexcept {
         // The release is stamped in front of the Signal, the point the clock aims at the flip's time: the Signal's own
         // duration (12 us in the mean) is the same for every flip and is not lateness.
         int64_t released = 0;
+        bool let_go = false;   // the clock's own Signal let this binding's flip go: a flip it timed
         for (;;) {
             AcquireSRWLockShared(&lock);
             const bool mine = gate && gate_epoch.load(relaxed) == epoch && gate_head.load(relaxed) == head;
@@ -1667,6 +1675,7 @@ DWORD WINAPI GateClock(void*) noexcept {
             const bool gone = !mine || SUCCEEDED(CpuSignal(gate, entry.value)) || Completed(gate) == UINT64_MAX;
             if (mine && gone) gate_head.store(head + 1, std::memory_order_release);
             ReleaseSRWLockShared(&lock);
+            let_go = mine && gone;
             if (gone || gate_stop.load(relaxed)) break;
             release_failures.fetch_add(1, relaxed);
             Sleep(1);
@@ -1702,6 +1711,20 @@ DWORD WINAPI GateClock(void*) noexcept {
             }
         }
         gate_rule.Flipped(entry.index, entry.real, flip, entry.spacing);
+        // The telemetry's frame pacing window (pacing_telemetry.h): every flip the clock let go, a displayed frame,
+        // at the time the pairs are counted by. One lock-free push on this thread; nothing on a thread of the game.
+        if (let_go) {
+            PacingFlipSample sample;
+            sample.flip_qpc = shown;
+            sample.cycle_ticks = gate_rule.cycle;
+            sample.marker = entry.index == 0 ? entry.marker : generated_marker;
+            sample.epoch = epoch;
+            sample.cycle = entry.cycle;
+            sample.index = entry.index;
+            sample.outputs = entry.outputs;
+            sample.real = entry.real ? 1 : 0;
+            PacingTelemetry_PushFlip(sample);
+        }
         if (entry.real) generated_marker = 0;
         if (entry.index == 0) {
             GateWorkSeen(entry.marker, epoch);
@@ -1772,6 +1795,7 @@ HRESULT STDMETHODCALLTYPE AheadRegister(ID3D12Fence* fence, UINT64 value, HANDLE
     }
     const bool counted = ahead.counted;
     ahead = AheadCycle{};
+    ahead.serial = ++ahead_serial;
     ahead.answered = AheadWait{fence, value, 0};
     ahead.generated = generated;
     ahead.wake = Qpc();
@@ -2246,7 +2270,7 @@ void FgPresentOrder_AheadBeforePresent() noexcept {
                         gate_ambiguous.fetch_add(1, relaxed);
                     }
                     gate_marker = value;
-                    GateArmFor(false, 0, static_cast<uint8_t>(ahead.generated + 1), value, 0, 0);
+                    GateArmFor(false, 0, static_cast<uint8_t>(ahead.generated + 1), value, 0, 0, ahead.serial);
                 }
             }
         }
@@ -2256,6 +2280,7 @@ void FgPresentOrder_AheadBeforePresent() noexcept {
     const int64_t entry = Qpc();
     const uint64_t value = ahead.value;
     const uint32_t epoch = ahead.epoch;
+    const uint32_t serial = ahead.serial;
     // The cycle's Present after its first: its place, and whether it is the last (the real frame's). DLSS-G's own
     // spacing is how far it put the cycle's second Present behind its first, and every later Present is held to its
     // place times that behind generation's completion: taken from each Present's own entry, the spacing would carry
@@ -2314,7 +2339,7 @@ void FgPresentOrder_AheadBeforePresent() noexcept {
     };
     const uint8_t how = hold();
     if (g_fg_present_ahead.load(relaxed) >= 3)
-        GateArmFor(last, static_cast<uint8_t>(index), static_cast<uint8_t>(generated + 1), value, spacing, how);
+        GateArmFor(last, static_cast<uint8_t>(index), static_cast<uint8_t>(generated + 1), value, spacing, how, serial);
 }
 
 // A native Present of a thread in a cycle woken ahead, or with a gate armed, has returned; `presented`: it was not a

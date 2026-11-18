@@ -9,6 +9,7 @@ namespace
     constexpr double kGapTargetMultiple = 8.0;
     constexpr double kLongFrameMultiple = 1.5;
     constexpr double kShortFrameMultiple = 0.5;
+    constexpr double kHitchMedianMultiple = 1.5;
     // fg_divisor is "1" for the Unknown-classification rule within this tolerance.
     constexpr double kUnitDivisorTolerance = 1e-3;
 
@@ -372,6 +373,13 @@ PacingWindowSummary PacingMetricWindow::Summarize(uint64_t native_swapchain) noe
         if (sample.short_frame) ++summary.short_frames;
     }
     summary.display_interval = Distribution(native_swapchain, MetricDisplayInterval);
+    // Distribution leaves the metric's values sorted in the scratch buffer.
+    if (summary.display_interval.count != 0) {
+        const double* const begin = scratch_.data();
+        const double* const end = begin + summary.display_interval.count;
+        summary.hitches = static_cast<uint32_t>(
+            end - std::upper_bound(begin, end, kHitchMedianMultiple * summary.display_interval.p50_us));
+    }
     summary.adjacent_jitter = Distribution(native_swapchain, MetricAdjacentJitter);
     summary.abs_deviation = Distribution(native_swapchain, MetricAbsDeviation);
     summary.abs_animation_error = Distribution(native_swapchain, MetricAbsAnimationError);
@@ -397,8 +405,11 @@ PacingMetricDistribution PacingMetricWindow::Distribution(
     PacingMetricDistribution distribution{};
     if (count == 0) return distribution;
     std::sort(scratch_.data(), scratch_.data() + count);
+    double sum = 0.0;
+    for (size_t index = 0; index < count; ++index) sum += scratch_[index];
     distribution.count = static_cast<uint32_t>(count);
     distribution.p50_us = PacingMetrics_QuantileOfSorted(scratch_.data(), count, 0.50);
     distribution.p99_us = PacingMetrics_QuantileOfSorted(scratch_.data(), count, 0.99);
+    distribution.mean_us = sum / static_cast<double>(count);
     return distribution;
 }

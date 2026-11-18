@@ -69,9 +69,6 @@ struct SchedulerActualFrameSample {
 	uint64_t sequence = 0;
 	double frame_time_us = 0.0;
 	bool valid = false;
-	// Target-independent adjacent-interval variation; zero is a valid value.
-	double variation_us = 0.0;
-	bool variation_valid = false;
 };
 
 // Nonblocking: false if publication overlapped the read; retry on a later OSD
@@ -85,11 +82,10 @@ bool Scheduler_ReadActualFrameSample(SchedulerActualFrameSample* sample) noexcep
 // not read it; they read the frame plan and the grid snapshot.
 extern std::atomic<double> g_effective_interval_us;
 
-// Invalidate the cadence snapshots behind OSD Smoothness (the variation in
-// Scheduler_ReadActualFrameSample()) across asynchronous lifecycle
-// transitions. The next owner observation reseeds its cadence timestamp and
-// previous-interval state; old-regime in-flight samples are rejected.
-void Scheduler_ResetSmoothness() noexcept;
+// Invalidate the cadence readout (the frame time in Scheduler_ReadActualFrameSample()) across asynchronous
+// lifecycle transitions. The next owner observation reseeds its cadence timestamp and previous-interval state;
+// old-regime in-flight samples are rejected.
+void Scheduler_ResetCadenceReadout() noexcept;
 
 // Reflex Sleep hook: records Sleep activity on
 // the presenting device. Any thread; never blocks.

@@ -100,7 +100,7 @@ set(ADDON_SOURCES
     src/hang_report_policy.h
     src/hang_report_policy.cpp
     src/csv_writer.cpp
-    src/pqi.cpp
+    src/pacing_sample_sources.h
     src/presentation_gate.cpp
     src/native_present_gate.cpp
     src/native_present_gate_runtime.cpp

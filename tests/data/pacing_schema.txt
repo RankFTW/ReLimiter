@@ -368,6 +368,8 @@ plan_status 8 passthrough
 # display_source
 display_source 1 etw
 display_source 2 dxgi
+display_source 3 flip_gate
+display_source 4 fg_input
 
 # output_kind
 output_kind 0 unknown
@@ -549,13 +551,11 @@ config_key osd_show_frametime
 config_key osd_show_frametime_graph
 config_key osd_show_fg
 config_key osd_show_limiter
-config_key osd_show_pqi
+config_key osd_show_jitter
 config_key osd_show_cpu_latency
 config_key osd_show_native_pcl
 config_key osd_show_native_pcl_breakdown
-config_key osd_show_pqi_breakdown
 config_key osd_show_1pct_low
-config_key osd_show_smoothness
 config_key osd_show_pacing_quality
 config_key osd_show_0_1pct_low
 config_key osd_show_gpu_render_time

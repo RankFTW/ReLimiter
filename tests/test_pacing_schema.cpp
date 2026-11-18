@@ -106,6 +106,8 @@ const char* DisplaySourceName(PacingDisplaySource value)
     case PacingDisplaySource::None: return nullptr; // an empty display_source cell
     case PacingDisplaySource::Etw: return "etw";
     case PacingDisplaySource::Dxgi: return "dxgi";
+    case PacingDisplaySource::FlipGate: return "flip_gate";
+    case PacingDisplaySource::FgInput: return "fg_input";
     }
     return nullptr;
 }

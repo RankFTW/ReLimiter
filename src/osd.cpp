@@ -12,7 +12,6 @@
 #include "streamline_hooks.h"
 #include "streamline_gpu_handoff.h"
 #include "wake_guard.h"
-#include "pqi.h"
 #include "csv_writer.h"
 #include "swapchain_manager.h"
 #include "enforcement_dispatcher.h"
@@ -179,6 +178,11 @@ static const char* PacingRouteLabel() {
     return "waiting for a presenting swapchain";
 }
 
+// The Frame Pacing readings are defined with the OSD drawing below; the settings panel's Details tree prints
+// the same Jitter figure.
+static const PacingTelemetrySnapshot* ReadFreshPacingSnapshot();
+static void FormatPacingSourceWhat(const PacingTelemetrySnapshot& snapshot, char* buf, size_t size);
+
 // Resolved pipeline (resolver publication) and the source stage's lead and grid.
 static void DrawPacingPipelineStatus() {
     const PacingPipelineSnapshot pipeline = PacingPipeline_Read();
@@ -186,6 +190,14 @@ static void DrawPacingPipelineStatus() {
     ImGui::TextDisabled("Mode: %s | Output: %s | Reason: %s",
         PacingTimingMode_Text(pipeline.mode), PacingRung_Text(pipeline.rung),
         PacingFallbackReason_Text(pipeline.reason));
+    // The Jitter the OSD shows, with what was measured; nothing while no source has samples.
+    if (const PacingTelemetrySnapshot* pacing = ReadFreshPacingSnapshot()) {
+        if (pacing->display_valid && pacing->jitter_samples != 0) {
+            char what[96];
+            FormatPacingSourceWhat(*pacing, what, sizeof(what));
+            ImGui::TextDisabled("Jitter: %.2f ms (%s)", pacing->adjacent_jitter_mean_us / 1000.0, what);
+        }
+    }
     SchedulerPacingStatus status;
     const bool has_status = Scheduler_ReadPacingStatus(&status);
     // Source placement.
@@ -709,8 +721,7 @@ static void DrawSettingsImpl() {
             p.show_frametime = true;
             p.show_frametime_graph = true;
             p.show_gpu_render_time = true;
-            p.show_pqi = true;
-            p.show_smoothness = true;
+            p.show_jitter = true;
             p.show_fg = true;
             p.show_gpu_temp = true;
             p.show_gpu_usage = true;
@@ -731,9 +742,7 @@ static void DrawSettingsImpl() {
             p.show_gpu_render_time = true;
             p.show_total_frame_cost = true;
             p.show_fg_time = true;
-            p.show_pqi = true;
-            p.show_pqi_breakdown = true;
-            p.show_smoothness = true;
+            p.show_jitter = true;
             p.show_pacing_quality = true;
             p.show_fg = true;
             p.show_limiter = true;
@@ -876,7 +885,7 @@ static void DrawSettingsImpl() {
                     OSDPreset p = {};
                     p.show_fps = true; p.show_1pct_low = true; p.show_frametime = true;
                     p.show_frametime_graph = true; p.show_gpu_render_time = true;
-                    p.show_pqi = true; p.show_smoothness = true; p.show_fg = true;
+                    p.show_jitter = true; p.show_fg = true;
                     p.show_gpu_temp = true; p.show_gpu_usage = true; p.show_vram = true;
                     OSDPreset_ApplyTogglesOnly(p);
                 } else if (idx == 2) {
@@ -885,8 +894,7 @@ static void DrawSettingsImpl() {
                     p.show_frametime = true; p.show_frametime_graph = true;
                     p.show_cpu_latency = true; p.show_native_pcl = true; p.show_native_pcl_breakdown = true; p.show_gpu_render_time = true;
                     p.show_total_frame_cost = true; p.show_fg_time = true;
-                    p.show_pqi = true; p.show_pqi_breakdown = true;
-                    p.show_smoothness = true; p.show_pacing_quality = true; p.show_fg = true; p.show_limiter = true;
+                    p.show_jitter = true; p.show_pacing_quality = true; p.show_fg = true; p.show_limiter = true;
                     p.show_gpu_temp = true;
                     p.show_gpu_clock = true; p.show_gpu_usage = true; p.show_vram = true;
                     p.show_cpu_usage = true; p.show_ram = true;
@@ -1031,10 +1039,10 @@ static void DrawSettingsImpl() {
         HelpTip("Show the current FPS. When Frame Generation is active, shows both output and render FPS.");
         FlowSeparator();
         if (ImGui::Checkbox("1%% Low##osd_elem", &g_config.osd_show_1pct_low)) config_dirty = true;
-        HelpTip("Show the 1%% low FPS over a rolling window. Uses display FPS when Frame Generation is active.");
+        HelpTip("Show the 1% low FPS over a rolling window. With frame generation it is the real-frame figure multiplied by the frame generation multiplier, an estimate of the displayed frames; the generated frames are not measured.");
         FlowSeparator();
         if (ImGui::Checkbox("0.1%% Low##osd_elem", &g_config.osd_show_0_1pct_low)) config_dirty = true;
-        HelpTip("Show the 0.1%% low FPS over a rolling window. Requires more samples than 1%% low to stabilize.");
+        HelpTip("Show the 0.1% low FPS over a rolling window. Requires more samples than 1% low to stabilize. With frame generation it is the real-frame figure multiplied by the frame generation multiplier, an estimate of the displayed frames.");
         FlowSeparator();
         if (ImGui::Checkbox("Frametime##osd_elem", &g_config.osd_show_frametime)) config_dirty = true;
         HelpTip("Show the current frame time in milliseconds.");
@@ -1072,26 +1080,21 @@ static void DrawSettingsImpl() {
 
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "Quality");
-        if (ImGui::Checkbox("PQI##osd_elem", &g_config.osd_show_pqi)) config_dirty = true;
-        HelpTip("Pacing Quality Index: a 0-100% score of the displayed frames over the display pacing window, "
-            "from ETW or DXGI display timing. Green=great, yellow=ok, red=poor; '-' until display timing "
-            "and an output target are available.");
-        if (g_config.osd_show_pqi) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("-");
-            ImGui::SameLine();
-            if (ImGui::Checkbox("Breakdown##osd_elem", &g_config.osd_show_pqi_breakdown)) config_dirty = true;
-            HelpTip("PQI sub-scores. Consistency (40%): p99 adjacent display jitter against half the output interval. "
-                "Stutter (30%): long and short displayed frames, 10% per 1% of intervals. Animation (30%): p99 "
-                "animation error against half the output interval; '-' without animation data, and PQI then "
-                "weights Consistency and Stutter only.");
-        }
+        if (ImGui::Checkbox("Jitter##osd_elem", &g_config.osd_show_jitter)) config_dirty = true;
+        HelpTip("Average change from one frame interval to the next over the last 5 seconds. Lower is smoother. "
+            "Measured on the displayed frames where ReLimiter can time them: DLSS Frame Generation presenting from "
+            "its own thread, no frame generation, or PC latency collection. With hardware flip metering it is "
+            "measured on the real frames entering frame generation and marked (real frames). Other frame generation "
+            "reads '-' without PC latency collection. Green under 8% of the frame interval, yellow under 16%, red "
+            "above.");
         FlowSeparator();
-        if (ImGui::Checkbox("Smoothness##osd_elem", &g_config.osd_show_smoothness)) config_dirty = true;
-        HelpTip("Smoothed absolute difference between consecutive valid scheduler frame intervals. A steady rate is smooth even below the FPS cap. Lower means less frame-to-frame variation, not closer to the target. Resets on cadence gaps; real long frames are included. Not a displayed-frame measurement. Green < 0.5ms, yellow < 1.5ms, red above.");
-        FlowSeparator();
-        if (ImGui::Checkbox("Display Pacing##osd_elem", &g_config.osd_show_pacing_quality)) config_dirty = true;
-        HelpTip("Measured displayed-frame pacing as p50 / p99 over a 5 s window: display interval and target, adjacent jitter, deviation and long/short frames, animation error, release-to-display latency, GPU residence and CPU hold. Display times come from ETW (native PC Latency measurement) when it is collecting, otherwise from DXGI frame statistics; the label shows the source. Measures pacing without changing it.");
+        if (ImGui::Checkbox("Frame Pacing##osd_elem", &g_config.osd_show_pacing_quality)) config_dirty = true;
+        HelpTip("How evenly frames arrive over the last 5 seconds: the typical and slowest frame time, the average "
+            "and worst change between frames, and hitches (frames over 1.5 times the typical frame time). The "
+            "heading names what is measured: displayed frames (ETW with PC latency collection, DXGI without frame "
+            "generation, or ReLimiter's flip gate where DLSS Frame Generation presents from its own thread), or the "
+            "real frames entering frame generation where hardware flip metering places the generated ones. Other "
+            "frame generation is measured only with PC latency collection. Measures pacing without changing it.");
 
 #ifdef _WIN64
         ImGui::Spacing();
@@ -1857,10 +1860,11 @@ static ImVec4 ColDLSS()     { float b = g_config.osd_text_brightness; return ImV
 static ImVec4 ColStatus()   { float b = g_config.osd_text_brightness; return ImVec4(1.0f*b, 0.3f*b, 0.3f*b, 1.0f); }
 static ImVec4 ColWarning()  { float b = g_config.osd_text_brightness; return ImVec4(0.9f*b, 0.7f*b, 0.2f*b, 1.0f); }
 
-static ImVec4 PQIColor(double score) {
+// Jitter as a share of the frame interval: green under 8%, yellow under 16%, red above.
+static ImVec4 JitterColor(double ratio) {
     float b = g_config.osd_text_brightness;
-    if (score >= 0.9) return ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f);
-    if (score >= 0.7) return ImVec4(0.9f*b, 0.9f*b, 0.2f*b, 1.0f);
+    if (ratio < 0.08) return ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f);
+    if (ratio < 0.16) return ImVec4(0.9f*b, 0.9f*b, 0.2f*b, 1.0f);
     return ImVec4(0.9f*b, 0.2f*b, 0.2f*b, 1.0f);
 }
 
@@ -1874,40 +1878,55 @@ static void OSDTextColored(ImVec4 col, const char* text) {
     ImGui::TextColored(col, "%s", text);
 }
 
-// ── Display Pacing (pacing telemetry snapshot) ──
+// ── Frame Pacing (pacing telemetry snapshot) ──
 
-static const char* DisplaySourceLabel(PacingDisplaySource source) {
-    if (source == PacingDisplaySource::Etw) return "ETW";
-    if (source == PacingDisplaySource::Dxgi) return "DXGI";
-    return "none";
+// What the snapshot's samples are: displayed frames (ETW, DXGI or ReLimiter's flip gate), or the real frames
+// entering frame generation where hardware flip metering places the generated ones.
+static void FormatPacingSourceWhat(const PacingTelemetrySnapshot& snapshot, char* buf, size_t size) {
+    switch (snapshot.display_source) {
+        case PacingDisplaySource::Etw: snprintf(buf, size, "displayed frames, ETW"); break;
+        case PacingDisplaySource::Dxgi: snprintf(buf, size, "displayed frames, DXGI"); break;
+        case PacingDisplaySource::FlipGate: snprintf(buf, size, "displayed frames, flip gate"); break;
+        case PacingDisplaySource::FgInput:
+            if (snapshot.frames_per_sample > 1)
+                snprintf(buf, size, "real frames, %u displayed per real frame", snapshot.frames_per_sample);
+            else
+                snprintf(buf, size, "real frames");
+            break;
+        default: snprintf(buf, size, "no frames"); break;
+    }
 }
 
 // Single unavailable-state line; snapshot is null without a fresh publication.
-static void DrawDisplayPacingUnavailable(const PacingTelemetrySnapshot* snapshot) {
+static void DrawFramePacingUnavailable(const PacingTelemetrySnapshot* snapshot) {
     const float brightness = g_config.osd_text_brightness;
     const PacingDisplaySource source = snapshot ? snapshot->display_source : PacingDisplaySource::None;
     const bool loss_window = snapshot && snapshot->loss_window;
     const ImVec4 color = loss_window ? ColWarning()
         : ImVec4(0.6f * brightness, 0.6f * brightness, 0.6f * brightness, 1.0f);
-    char buf[128];
+    char buf[160];
     if (source == PacingDisplaySource::None) {
-        // DXGI frame statistics stand in for ETW, so a failed ETW collector is
-        // reported as context, not as the reason display timing is missing.
-        const NativePclStatus status = NativePcl_GetSnapshot().status;
-        if (g_resolved_fg_divisor.load(std::memory_order_relaxed) > 1)
-            // DXGI statistics cannot time generated frames (pacing_telemetry.cpp).
-            snprintf(buf, sizeof(buf), "Display Pacing: needs PC latency collection with frame generation (ETW: %s)",
-                     NativePcl_StatusText(status));
-        else if (status == NativePclStatus::EtwAccessDenied || status == NativePclStatus::StartFailed)
-            snprintf(buf, sizeof(buf), "Display Pacing: waiting for DXGI display timing (ETW: %s)",
-                     NativePcl_StatusText(status));
-        else
-            snprintf(buf, sizeof(buf), "Display Pacing: waiting for display timing");
+        if (g_resolved_fg_divisor.load(std::memory_order_relaxed) > 1) {
+            // With frame generation presenting, DXGI statistics cannot time the generated frames. ReLimiter times
+            // the flips its gate lets go, or the real frames under hardware flip metering; nothing else but ETW.
+            snprintf(buf, sizeof(buf),
+                     "Frame Pacing: not timed with this frame generation (PC latency collection times it)");
+        } else {
+            // DXGI frame statistics stand in for ETW, so a failed ETW collector is
+            // reported as context, not as the reason display timing is missing.
+            const NativePclStatus status = NativePcl_GetSnapshot().status;
+            if (status == NativePclStatus::EtwAccessDenied || status == NativePclStatus::StartFailed)
+                snprintf(buf, sizeof(buf), "Frame Pacing: waiting for DXGI display timing (ETW: %s)",
+                         NativePcl_StatusText(status));
+            else
+                snprintf(buf, sizeof(buf), "Frame Pacing: waiting for display timing");
+        }
         OSDTextColored(color, buf);
         return;
     }
-    snprintf(buf, sizeof(buf), "Display Pacing (%s): waiting for display timing%s",
-             DisplaySourceLabel(source), loss_window ? ", event loss" : "");
+    char what[96];
+    FormatPacingSourceWhat(*snapshot, what, sizeof(what));
+    snprintf(buf, sizeof(buf), "Frame Pacing (%s): waiting for frames%s", what, loss_window ? ", event loss" : "");
     OSDTextColored(color, buf);
 }
 
@@ -1933,75 +1952,59 @@ static const PacingTelemetrySnapshot* ReadFreshPacingSnapshot() {
     return fresh ? &s_snapshot : nullptr;
 }
 
-// Display-metric PQI; '-' when invalid.
-static void DrawPQI(const PacingTelemetrySnapshot* snapshot, bool breakdown) {
-    const PQIDisplayScores scores = snapshot ? PQI_FromSnapshot(*snapshot) : PQIDisplayScores{};
-    const float b = g_config.osd_text_brightness;
-    const ImVec4 unavailable(0.6f * b, 0.6f * b, 0.6f * b, 1.0f);
+// Jitter: the mean change from one frame interval to the next over the window, '-' when not measured.
+static void DrawJitter(const PacingTelemetrySnapshot* snapshot) {
     char buf[48];
-    if (scores.valid) {
-        snprintf(buf, sizeof(buf), "PQI (%s): %.0f%%", DisplaySourceLabel(snapshot->display_source), scores.pqi);
-        OSDTextColored(PQIColor(scores.pqi / 100.0), buf);
+    if (snapshot && snapshot->display_valid && snapshot->jitter_samples != 0 &&
+        snapshot->display_interval_p50_us > 0.0) {
+        snprintf(buf, sizeof(buf), "Jitter: %.2f ms%s", snapshot->adjacent_jitter_mean_us / 1000.0,
+                 snapshot->display_source == PacingDisplaySource::FgInput ? " (real frames)" : "");
+        OSDTextColored(JitterColor(snapshot->adjacent_jitter_mean_us / snapshot->display_interval_p50_us), buf);
     } else {
-        OSDTextColored(unavailable, "PQI: -");
-    }
-    if (!breakdown) return;
-    if (!scores.valid) {
-        OSDTextColored(unavailable, " Consistency: -");
-        OSDTextColored(unavailable, " Stutter: -");
-        OSDTextColored(unavailable, " Animation: -");
-        return;
-    }
-    snprintf(buf, sizeof(buf), " Consistency: %.0f%%", scores.consistency * 100.0);
-    OSDTextColored(PQIColor(scores.consistency), buf);
-    snprintf(buf, sizeof(buf), " Stutter: %.0f%%", scores.stutter * 100.0);
-    OSDTextColored(PQIColor(scores.stutter), buf);
-    if (scores.animation_valid) {
-        snprintf(buf, sizeof(buf), " Animation: %.0f%%", scores.animation * 100.0);
-        OSDTextColored(PQIColor(scores.animation), buf);
-    } else {
-        OSDTextColored(unavailable, " Animation: -");
+        const float b = g_config.osd_text_brightness;
+        OSDTextColored(ImVec4(0.6f * b, 0.6f * b, 0.6f * b, 1.0f), "Jitter: -");
     }
 }
 
-// Measured displayed-frame pacing, p50 / p99 over the telemetry window.
-static void DrawDisplayPacing(const PacingTelemetrySnapshot* snapshot) {
+// Measured frame pacing over the telemetry window: the frame time, jitter and hitches of what the source
+// measures, then the latency lines the source has data for.
+static void DrawFramePacing(const PacingTelemetrySnapshot* snapshot) {
     if (!snapshot || !snapshot->display_valid) {
-        DrawDisplayPacingUnavailable(snapshot);
+        DrawFramePacingUnavailable(snapshot);
         return;
     }
 
     const PacingTelemetrySnapshot& pacing = *snapshot;
     const ImVec4 color = ColPerf();
-    char buf[96];
-    snprintf(buf, sizeof(buf), "Display Pacing (%s): p50 / p99 over %u s",
-             DisplaySourceLabel(pacing.display_source),
-             pacing.window_ms / 1000u);
+    char what[96];
+    FormatPacingSourceWhat(pacing, what, sizeof(what));
+    char buf[160];
+    snprintf(buf, sizeof(buf), "Frame Pacing (%s), last %u s", what, pacing.window_ms / 1000u);
     OSDTextColored(color, buf);
     if (pacing.loss_window)
         OSDTextColored(ColWarning(), " ETW event loss: some intervals excluded");
+    if (pacing.display_source == PacingDisplaySource::FgInput)
+        OSDTextColored(color, " Generated frames are placed after ReLimiter and are not measured here");
 
-    // Deviation and long/short frames exist only against a known target.
-    const bool target_known = pacing.target_output_interval_us > 0.0;
-    if (target_known) {
-        snprintf(buf, sizeof(buf), " Interval: %.2f / %.2f ms (target %.2f ms)",
+    if (pacing.target_output_interval_us > 0.0) {
+        snprintf(buf, sizeof(buf), " Frame time: %.2f ms, slowest 1%%: %.2f ms (target %.2f ms)",
                  pacing.display_interval_p50_us / 1000.0, pacing.display_interval_p99_us / 1000.0,
                  pacing.target_output_interval_us / 1000.0);
     } else {
-        snprintf(buf, sizeof(buf), " Interval: %.2f / %.2f ms (target N/A)",
+        snprintf(buf, sizeof(buf), " Frame time: %.2f ms, slowest 1%%: %.2f ms",
                  pacing.display_interval_p50_us / 1000.0, pacing.display_interval_p99_us / 1000.0);
     }
     OSDTextColored(color, buf);
 
-    snprintf(buf, sizeof(buf), " Jitter: %.0f / %.0f us",
-             pacing.adjacent_jitter_p50_us, pacing.adjacent_jitter_p99_us);
-    OSDTextColored(color, buf);
-
-    if (target_known) {
-        snprintf(buf, sizeof(buf), " Deviation p99: %.0f us, Long / Short: %u / %u",
-                 pacing.abs_deviation_p99_us, pacing.long_frames, pacing.short_frames);
+    if (pacing.jitter_samples != 0) {
+        snprintf(buf, sizeof(buf), " Jitter: %.2f ms, worst 1%%: %.2f ms",
+                 pacing.adjacent_jitter_mean_us / 1000.0, pacing.adjacent_jitter_p99_us / 1000.0);
         OSDTextColored(color, buf);
     }
+
+    snprintf(buf, sizeof(buf), " Hitches: %u", pacing.hitches);
+    OSDTextColored(color, buf);
+
     if (pacing.animation_valid) {
         snprintf(buf, sizeof(buf), " Animation Error: %.0f / %.0f us",
                  pacing.animation_error_p50_us, pacing.animation_error_p99_us);
@@ -2246,7 +2249,7 @@ static void DrawOSDImpl() {
                 OSDPreset p = {};
                 p.show_fps = true; p.show_1pct_low = true; p.show_frametime = true;
                 p.show_frametime_graph = true; p.show_gpu_render_time = true;
-                p.show_pqi = true; p.show_smoothness = true; p.show_fg = true;
+                p.show_jitter = true; p.show_fg = true;
                 p.show_gpu_temp = true; p.show_gpu_usage = true; p.show_vram = true;
                 OSDPreset_ApplyTogglesOnly(p);
             } else if (idx == 2) {
@@ -2255,8 +2258,7 @@ static void DrawOSDImpl() {
                 p.show_frametime = true; p.show_frametime_graph = true;
                 p.show_cpu_latency = true; p.show_native_pcl = true; p.show_native_pcl_breakdown = true; p.show_gpu_render_time = true;
                 p.show_total_frame_cost = true; p.show_fg_time = true;
-                p.show_pqi = true; p.show_pqi_breakdown = true;
-                p.show_smoothness = true; p.show_pacing_quality = true; p.show_fg = true; p.show_limiter = true;
+                p.show_jitter = true; p.show_pacing_quality = true; p.show_fg = true; p.show_limiter = true;
                 p.show_gpu_temp = true;
                 p.show_gpu_clock = true; p.show_gpu_usage = true; p.show_vram = true;
                 p.show_cpu_usage = true; p.show_ram = true;
@@ -2586,32 +2588,16 @@ static void DrawOSDImpl() {
 
         // ═══════════════════════════════════
         // QUALITY (green/yellow/red)
-        // — hidden during DMFG passthrough (scheduler isn't pacing, scores are meaningless)
         // ═══════════════════════════════════
-        const bool show_pqi = !IsDmfgActive() && g_config.osd_show_pqi;
         const PacingTelemetrySnapshot* pacing_snapshot =
-            show_pqi || g_config.osd_show_pacing_quality ? ReadFreshPacingSnapshot() : nullptr;
-        if (show_pqi)
-            DrawPQI(pacing_snapshot, g_config.osd_show_pqi_breakdown);
+            g_config.osd_show_jitter || g_config.osd_show_pacing_quality ? ReadFreshPacingSnapshot() : nullptr;
+        if (g_config.osd_show_jitter)
+            DrawJitter(pacing_snapshot);
 
-        if (g_config.osd_show_smoothness && coherent_sample && ft > 0.0) {
-            const double smooth = scheduler_sample.variation_us;
-            if (scheduler_sample.variation_valid) {
-                char buf[32];
-                snprintf(buf, sizeof(buf), "Smoothness: %.2f ms", smooth / 1000.0);
-                // Color: green < 0.5ms, yellow < 1.5ms, red >= 1.5ms
-                ImVec4 col;
-                float b = g_config.osd_text_brightness;
-                if (smooth < 500.0)       col = ImVec4(0.2f*b, 0.9f*b, 0.2f*b, 1.0f);
-                else if (smooth < 1500.0) col = ImVec4(0.9f*b, 0.9f*b, 0.2f*b, 1.0f);
-                else                      col = ImVec4(0.9f*b, 0.2f*b, 0.2f*b, 1.0f);
-                OSDTextColored(col, buf);
-            }
-        }
-
-        // Measured displayed-frame pacing from ETW or DXGI display timing.
+        // Measured frame pacing: displayed frames (ETW, DXGI or the flip gate) or the real frames entering
+        // frame generation.
         if (g_config.osd_show_pacing_quality)
-            DrawDisplayPacing(pacing_snapshot);
+            DrawFramePacing(pacing_snapshot);
 
         // ═══════════════════════════════════
         // PIPELINE (light blue)

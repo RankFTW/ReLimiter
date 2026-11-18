@@ -23,7 +23,7 @@ void Flush(uint32_t modules) {
     // (cadence readout, LFC, unified law) resets on the scheduler owner only:
     // lifecycle (below), cap, raw FG divisor, DMFG, OLED Care and focus; a
     // correlator-only flush keeps it.
-    Scheduler_ResetSmoothness();
+    Scheduler_ResetCadenceReadout();
     if (modules & FLUSH_PREDICTOR) {
         // Lifecycle: every FLUSH_ALL caller is an API change, a full
         // swapchain teardown or device loss. The scheduler

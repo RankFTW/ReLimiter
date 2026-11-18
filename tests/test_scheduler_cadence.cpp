@@ -231,55 +231,6 @@ void TestNonpositiveAndBackwardTimestamps()
     CHECK(sample.interval_qpc == 0);
 }
 
-void TestTargetIndependentVariation()
-{
-    for (int target : {60, 144, 157, 360}) {
-        SchedulerCadenceTracker tracker;
-        SchedulerCadenceVariation variation;
-        for (uint64_t id = 0; id < 100; ++id) {
-            auto context = Context(id);
-            context.target_fps = target;
-            variation.Observe(tracker.Observe(context, 1000 + id * 7800));
-        }
-        CHECK(variation.IsValid());
-        CHECK(variation.ValueQpc() == 0.0); // Constant ~128 FPS, any target.
-    }
-    SchedulerCadenceVariation variation;
-    variation.Observe({7800, 7800, true});
-    CHECK(variation.IsValid() && variation.ValueQpc() == 0.0);
-    variation.Observe({7900, 7800, true});
-    CHECK(std::abs(variation.ValueQpc() - 16.0) < 1e-9); // Zero is initialized.
-    for (int i = 0; i < 200; ++i)
-        variation.Observe(i % 2 ? SchedulerCadenceObservation{10000, 6000, true}
-                                : SchedulerCadenceObservation{6000, 10000, true});
-    CHECK(std::abs(variation.ValueQpc() - 4000.0) < 1e-9);
-}
-
-void TestVariationContinuityAndRealStall()
-{
-    SchedulerCadenceTracker tracker;
-    SchedulerCadenceVariation variation;
-    int64_t timestamp = 1000;
-    variation.Observe(tracker.Observe(Context(0), timestamp));
-    CHECK(!variation.IsValid());
-    variation.Observe(tracker.Observe(Context(1), timestamp += 7800));
-    CHECK(!variation.IsValid()); // Need two consecutive measured intervals.
-    variation.Observe(tracker.Observe(Context(2), timestamp += 7800));
-    CHECK(variation.IsValid() && variation.ValueQpc() == 0.0);
-    variation.Observe(tracker.Observe(Context(3), timestamp += 50000));
-    CHECK(std::abs(variation.ValueQpc() - 6752.0) < 1e-9); // Genuine hitch retained.
-    variation.Observe(tracker.Observe(Context(5), timestamp += 15600));
-    CHECK(!variation.IsValid()); // Unknown intervening frame is not a hitch.
-    variation.Observe(tracker.Observe(Context(6), timestamp += 7800));
-    CHECK(!variation.IsValid());
-    variation.Observe(tracker.Observe(Context(7), timestamp += 7800));
-    CHECK(variation.IsValid() && variation.ValueQpc() == 0.0);
-    auto next = Context(8);
-    ++next.controller_generation;
-    variation.Observe(tracker.Observe(next, timestamp += 7800));
-    CHECK(!variation.IsValid());
-}
-
 } // namespace
 
 int main()
@@ -293,8 +244,6 @@ int main()
     TestSourcePoliciesRejectUnprovenAdjacency();
     TestMidFrameInvalidationAndUnavailableIdentity();
     TestNonpositiveAndBackwardTimestamps();
-    TestTargetIndependentVariation();
-    TestVariationContinuityAndRealStall();
     std::cout << "Scheduler cadence tests passed\n";
     return 0;
 }

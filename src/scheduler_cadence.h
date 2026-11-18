@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <cmath>
 
 enum class SchedulerTrigger : uint8_t {
     NvApiMarker = 0,
@@ -92,33 +91,5 @@ private:
     SchedulerCadenceContext previous_{};
     int64_t previous_timestamp_qpc_ = 0;
     int64_t previous_interval_qpc_ = 0;
-    bool initialized_ = false;
-};
-
-// Readout-only EMA of absolute differences between consecutive valid cadence
-// intervals. No FPS target enters this calculation. Unknown adjacency resets
-// the EMA; a real long frame is retained rather than filtered by target size.
-class SchedulerCadenceVariation final {
-public:
-    void Observe(const SchedulerCadenceObservation& sample) noexcept {
-        if (!sample.valid || sample.interval_qpc <= 0 ||
-            sample.previous_interval_qpc <= 0) {
-            initialized_ = false;
-            variation_qpc_ = 0.0;
-            return;
-        }
-        const double delta = std::abs(static_cast<double>(sample.interval_qpc) -
-            static_cast<double>(sample.previous_interval_qpc));
-        variation_qpc_ = initialized_
-            ? variation_qpc_ + 0.16 * (delta - variation_qpc_)
-            : delta;
-        initialized_ = true; // Zero variation is valid, not a cold sentinel.
-    }
-
-    bool IsValid() const noexcept { return initialized_; }
-    double ValueQpc() const noexcept { return variation_qpc_; }
-
-private:
-    double variation_qpc_ = 0.0;
     bool initialized_ = false;
 };

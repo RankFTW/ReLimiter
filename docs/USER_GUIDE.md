@@ -192,6 +192,7 @@ The technical lines are under **Details**, a collapsed node below the status lin
 |--------------|---------|
 | **Route** | `Reflex markers`, `Present-based`, or `waiting for a presenting swapchain`. |
 | **Mode** | `vrr` or `fixed` from the display, `idle` while an idle cap is active, or `off` when ReLimiter is not pacing. |
+| **Jitter** | The OSD's Jitter figure with what was measured, for example `Jitter: 0.26 ms (displayed frames, flip gate)`. Shown only once frames have been measured. |
 | **Output** | The output point from the table above. |
 | **Reason** | Why that output was chosen; see the reason table below. |
 | **Placement** | Where the source wait happens: `unified` (inside the game's Reflex Sleep call), `marker`, `present`, `Reflex driver limiter` (developer test mode) or `none`. |
@@ -257,7 +258,7 @@ Enable **Show OSD** in the OSD section. The default visibility key is **PageUp**
 | Group | Readings |
 |-------|----------|
 | **Performance** | FPS, 1% Low, 0.1% Low, Frametime and Frametime Graph |
-| **Quality** | PQI and its Breakdown, Smoothness, Display Pacing |
+| **Quality** | Jitter, Frame Pacing |
 | **Latency** | CPU Latency, GPU Render, Frame Cost, FG Time, PC Latency and its Breakdown |
 | **Pipeline** | Frame Generation, Limiter |
 | **Hardware** | GPU temperature, clock, usage and VRAM; CPU and RAM usage |
@@ -265,46 +266,47 @@ Enable **Show OSD** in the OSD section. The default visibility key is **PageUp**
 
 Availability depends on the game, API, addon architecture and driver. GPU hardware monitoring requires NVIDIA hardware; Reflex timing and DLSS information require compatible games. Missing data does not mean zero latency or zero work.
 
-FPS, lows and the frametime graph describe ReLimiter's measured pacing cadence. FG output FPS may be estimated; these readings are not a direct measurement of every displayed frame.
+FPS, lows and the frametime graph describe ReLimiter's measured pacing cadence. FG output FPS may be estimated; these readings are not a direct measurement of every displayed frame. With frame generation, 1% Low and 0.1% Low are the real-frame figure multiplied by the frame generation multiplier: an estimate of the displayed frames, not a measurement of them.
 
-**Smoothness** describes variation between consecutive scheduler frame intervals. Lower is better. A steady frame rate can show nearly zero variation even when it is below the chosen cap. It is not a displayed-frame measurement.
-
-**PQI** (Pacing Quality Index) scores the frames that actually reached the display over the Display Pacing window, from 0 to 100%. It needs display timing (see [Display Pacing](#display-pacing)) and a known output target, and shows `PQI: -` until both are available. The label names the display source, for example `PQI (DXGI): 92%`. **Breakdown** shows the sub-scores:
-
-| Sub-score | Weight | What it measures |
-|-----------|--------|------------------|
-| **Consistency** | 40% | p99 change between adjacent display intervals, against half the output interval |
-| **Stutter** | 30% | Long and short displayed frames; each 1% of intervals costs 10% |
-| **Animation** | 30% | p99 animation error, against half the output interval. Shows `-` without animation data; PQI then weights Consistency and Stutter only |
-
-PQI is hidden during Dynamic MFG passthrough. Use it alongside the graph and how the game feels.
+**Jitter** is the average change from one frame interval to the next over the last 5 seconds. Lower is smoother; a steady frame rate has almost none, even when it is below the cap. It is green under 8% of the frame interval, yellow under 16% and red above, and reads `Jitter: -` while no frames are measured. It is measured on the frames named under [Frame Pacing](#frame-pacing) and needs no PC latency collection, also with DLSS Frame Generation. Where hardware flip metering places the generated frames, it is measured on the real frames entering frame generation and reads `(real frames)`: the generated frames are not measured. In ReLimiter's own captures that figure rose and fell with the displayed one from scene to scene, and read about 0.1 ms lower in calm scenes and higher in rough ones.
 
 **PC Latency** and its **Breakdown** option are available only when `native_pcl_enabled=true` in the INI. Otherwise, those controls and readouts stay hidden, including when loading an OSD preset. See [Optional PC Latency Measurement](#optional-pc-latency-measurement) for setup. Measurements can arrive with a delay; a stale or unavailable reading should not be treated as a current result.
 
-### Display Pacing
+### Frame Pacing
 
-**Display Pacing** measures when frames actually reach the display. Display times come from PC latency collection (Windows ETW tracing) while it is collecting; otherwise, on DX11 and DX12, from DXGI frame statistics. The heading names the source: `Display Pacing (ETW)` or `Display Pacing (DXGI)`. Display Pacing does not need `native_pcl_enabled`; without it, DX11 and DX12 games use DXGI. It observes pacing only; enabling it does not change the cap or how frames are paced.
+**Frame Pacing** shows how evenly frames arrive over the last 5 seconds. It needs no PC latency collection (`native_pcl_enabled`) without frame generation and with DLSS Frame Generation; other frame generation is measured only with PC latency collection. It observes pacing only; enabling it does not change the cap or how frames are paced.
+
+The heading names what is measured:
+
+| Heading | What is measured |
+|---------|------------------|
+| `Frame Pacing (displayed frames, ETW)` | Displayed frames, timed by PC latency collection (Windows ETW tracing) while it is collecting |
+| `Frame Pacing (displayed frames, DXGI)` | Displayed frames, timed by DXGI frame statistics, on DX11 and DX12 without frame generation |
+| `Frame Pacing (displayed frames, flip gate)` | Displayed frames where frame generation presents from its own thread (DLSS Frame Generation without hardware flip metering): ReLimiter's flip gate releases each displayed frame, and that release is the time |
+| `Frame Pacing (real frames, N displayed per real frame)` | The real frames entering DLSS Frame Generation, where hardware flip metering places the generated frames after ReLimiter. The generated frames are not measured; the block says so. Frame time, Jitter and Hitches are then those of the real frames |
+
+The first of these sources that has frames is used, and the readings start again when the source changes.
 
 A DXGI display time that cannot belong to the frame, earlier than the frame's Present call or not after the previous frame's display, leaves that frame unmeasured. This is common when Windows composes the game window, for example a game scaled by Windows display scaling: such games show fewer DXGI samples, or **waiting for display timing**, instead of invented long frames. PC latency collection measures them.
 
-Values cover the last 5 seconds and refresh four times per second. Pairs are shown as p50 / p99: the median and the 99th percentile, which reflects the worst 1% of the window.
+Values refresh four times per second. Animation Error, Release to Display, GPU Residence and CPU Hold are shown as p50 / p99: the median and the 99th percentile, which reflects the worst 1% of the window.
 
 | Reading | Meaning |
 |---------|---------|
-| **Interval** | Time between consecutive new frames on the display, including generated frames, with ReLimiter's target output interval when known |
-| **Jitter** | Change from one display interval to the next. Lower means more even pacing |
-| **Deviation p99**, **Long / Short** | How far display intervals are from the target, and how many intervals in the window were longer than 1.5× or shorter than 0.5× the target. Shown only when the target is known |
+| **Frame time** | The typical (median) time between frames and the slowest 1%, with ReLimiter's target output interval when known |
+| **Jitter** | The average change from one frame interval to the next, and the worst 1% of those changes. Lower means more even pacing |
+| **Hitches** | How many frames in the window took more than 1.5 times the typical frame time |
 | **Animation Error** | Difference between how far apart ReLimiter released two consecutive rendered frames and how far apart they were displayed. High values can make motion look uneven even at a steady frame rate |
 | **Release to Display** | Time from ReLimiter releasing a rendered frame to its display. This is not PC Latency, which starts at input |
 | **GPU Residence** | How long finished GPU work waited in a GPU wait (64-bit DX12) |
 | **CPU Hold** | How long ReLimiter held a frame on the CPU before presentation |
 | **Dropped Records** | Measurement records discarded since launch, for example when a queue was full; values may be incomplete |
 
-Each line appears only when it can be measured. Animation Error and Release to Display need frames that ReLimiter paced and can match to the display. Vulkan and OpenGL games have no DXGI display source, so they need PC latency collection for Display Pacing and may show only Interval and Jitter.
+Each line appears only when it can be measured. Animation Error and Release to Display need frames that ReLimiter paced and can match to the display. Vulkan and OpenGL games have no DXGI display source, so they need PC latency collection for Frame Pacing and may show only Frame time, Jitter and Hitches.
 
-- **Display Pacing: waiting for display timing** means no display times have arrived recently. **Display Pacing (ETW)** or **(DXGI): waiting for display timing** means they are arriving but no display interval has been measured yet.
-- **Display Pacing: needs PC latency collection with frame generation** means frame generation is presenting and PC latency collection is off or not collecting. DXGI frame statistics cannot time generated frames, so turn on PC latency collection to measure Display Pacing with frame generation.
-- **waiting for DXGI display timing (ETW: ETW access denied)** or **(ETW: start failed)** means PC latency collection could not start, so Display Pacing waits for DXGI instead. See [PC Latency: Access Denied](#pc-latency-access-denied).
+- **Frame Pacing: waiting for display timing** means no frames have been timed recently. **Frame Pacing (...): waiting for frames** means frames are arriving but no frame interval has been measured yet.
+- **Frame Pacing: not timed with this frame generation (PC latency collection times it)** means frame generation is presenting and ReLimiter has no time for its frames: neither its flip gate (DLSS Frame Generation presenting from its own thread) nor its hold on the real frames under hardware flip metering is at work. It also shows for a moment when frame generation starts. DXGI frame statistics cannot time generated frames, so [PC latency collection](#optional-pc-latency-measurement) is the way to measure them there.
+- **waiting for DXGI display timing (ETW: ETW access denied)** or **(ETW: start failed)** means PC latency collection could not start, so Frame Pacing waits for DXGI instead. See [PC Latency: Access Denied](#pc-latency-access-denied).
 - **ETW event loss** (amber) means Windows dropped trace events. Intervals around the loss are excluded, so values may be incomplete until the warning clears.
 
 ### Appearance and Position
@@ -506,8 +508,8 @@ Recording starts off on every game launch. Each time it is turned on, a new capt
 
 | File prefix | Contents |
 |-------------|----------|
-| `relimiter_pacing_` | One row per displayed frame, or per Present call when no display time is available: ReLimiter's release and frame plan, the game's Present call, GPU wait and readiness timing, Reflex timing, the display time and its source (ETW or DXGI), Display Pacing measurements and PC Latency when PC latency collection is on. Rows are written only for DXGI games (DX10, DX11, DX12); in Vulkan, OpenGL and DX9 games the file has only its header |
-| `relimiter_pacing_events_` | Capture start and end, pipeline changes, cadence restarts, measurement loss, PC latency status changes and Display Pacing snapshots |
+| `relimiter_pacing_` | One row per displayed frame, or per Present call when no display time is available: ReLimiter's release and frame plan, the game's Present call, GPU wait and readiness timing, Reflex timing, the display time and its source (ETW or DXGI), Frame Pacing measurements and PC Latency when PC latency collection is on. Rows are written only for DXGI games (DX10, DX11, DX12); in Vulkan, OpenGL and DX9 games the file has only its header |
+| `relimiter_pacing_events_` | Capture start and end, pipeline changes, cadence restarts, measurement loss, PC latency status changes and Frame Pacing snapshots |
 
 Display times come from [PC latency collection](#optional-pc-latency-measurement) or, on DX11 and DX12 without it, from DXGI frame statistics. PC Latency needs PC latency collection. Without display times, rows still record releases, Present calls and the available GPU and Reflex timing, but the display columns stay empty. An empty cell means the value was unavailable, not zero. Not every game supplies every measurement. Release and Present times describe ReLimiter's pacing, not what reached the display, especially with frame generation. Column-level detail is in the [Developer Reference](DEVELOPER_REFERENCE.md#capture-files).
 
@@ -527,7 +529,7 @@ This requires suitable NVIDIA PCL markers from the game and Windows tracing perm
 - Without frame generation, the GPU queue wait needs collection. ReLimiter pairs each marker with its Present, but uses the pairing only after ETW frame IDs confirm it. Confirmation takes 64 matching frames and is logged as `hand-off verified by ETW frame IDs`.
 - Without collection, these games stay on the marker hold when frame generation is off.
 
-While collection is running, Display Pacing uses its ETW display times instead of DXGI. While **Telemetry Logging** is on, display times and PC Latency are also written to the `relimiter_pacing_` file. To disable collection, close the game and set the value back to `false`.
+While collection is running, Frame Pacing uses its ETW display times instead of the other sources. While **Telemetry Logging** is on, display times and PC Latency are also written to the `relimiter_pacing_` file. To disable collection, close the game and set the value back to `false`.
 
 With frame generation, PC Latency is measured on the real rendered frame, not on the generated frames between them. The readout and the capture rows then update about one displayed frame after the display they describe.
 
@@ -587,6 +589,7 @@ These keys no longer exist. ReLimiter always behaves as its defaults did, and dr
 - GPU cadence and A/B switches: `gpu_paced_cadence`, `gpu_wait_interleave_s`, `stall_inject_ms` and `stall_inject_period_s`.
 - Measurement experiments: `sleep_status_every_frame`, `gpu_start_probe`, `gpu_priority_probe` and `fg_presenter_probe_us`.
 - Pacer switches: `unified_pacer`, `unified_every_frame_service` and `unified_queue_target_us`. The pacer is on in 64-bit games unless a developer test mode takes over.
+- OSD readings: `osd_show_pqi`, `osd_show_pqi_breakdown` and `osd_show_smoothness`, and the `show_pqi`, `show_pqi_breakdown` and `show_smoothness` entries of the OSD presets. Jitter replaces PQI, its Breakdown and Smoothness: an INI or preset that had PQI or Smoothness on and has no Jitter setting gets `osd_show_jitter=true` (`show_jitter=true` in a preset). The INI is rewritten without the old keys at any `config_version`; a preset keeps its old entries, which are ignored, until it is saved again.
 - An INI saved before `config_version=5` also moved once to the defaults `unified_queue_law=true`, `gpu_queue_probe=true` and `gpu_queue_probe_source=1` (the queue-based pacer, which only does anything in 64-bit DirectX 12 games); those developer keys still exist, so set them to `false`, `false` and `0` to keep the report-based pacing.
 
 Keys removed by earlier versions are dropped the same way: `pacing_method`, `smoothing_percentile`, `smoothing_window`, `smoothing_release_speed`, `smoothing_bias_us`, `gpu_present_gate_mode`, `gpu_present_gate_slack_us`, `gpu_present_gate_max_delay_us`, `estimator_a_mode`, `estimator_a_fixed_reserve_us`, `native_arrival_predictor_mode`, `presentation_gate_location`, `adaptive_deadline_reserve_mode`, `gpu_readiness_observer`, `reflex_pre_sleep_pacing`, `reflex_gpu_combined`, `gpu_present_gate_phase_controller`, `gpu_present_gate_hold`, `marker_gate_bypass`, `adaptive_cycle_trial`, `ready_present_*`, `readiness_phase_*`, `gpu_paced_hold_margin`, `gpu_paced_release_smoothing` and `dmfg_output_cap`.
@@ -628,8 +631,8 @@ Keys removed by earlier versions are dropped the same way: `pacing_method`, `smo
 | `osd_text_brightness` | 1.0 | Brightness from 0.0–1.0 |
 | `osd_show_native_pcl` | false | Show PC latency when collection is available |
 | `osd_show_native_pcl_breakdown` | false | Show PC latency components |
-| `osd_show_pacing_quality` | false | Show Display Pacing (ETW or DXGI display timing) |
-| `osd_show_pqi` / `osd_show_pqi_breakdown` | false | Show PQI and its sub-scores |
+| `osd_show_pacing_quality` | false | Show Frame Pacing (frame time, jitter, hitches and the latency lines, from ETW, DXGI, the flip gate or the real frames entering frame generation) |
+| `osd_show_jitter` | false | Show Jitter, the average change from one frame interval to the next |
 | `native_pcl_enabled` | false | Optional PC latency collection; INI-only |
 | `csv_enabled` | false | Recording is reset to off at each launch |
 | `log_level` | warn | `error`, `warn`, `info`, `debug` |

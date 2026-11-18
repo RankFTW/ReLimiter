@@ -654,7 +654,7 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
         // we start intercepting driver and Streamline calls.
         LOG_INFO("NvAPI + LoadLibrary hooks deferred to first present");
 
-        // CSV + PQI
+        // CSV
         {
             char csv_dir[MAX_PATH] = {};
             GetModuleFileNameA(hModule, csv_dir, MAX_PATH);

@@ -373,13 +373,15 @@ void LoadConfig(HMODULE hModule) {
     g_config.osd_show_frametime_graph = ReadINIBool(S, "osd_show_frametime_graph", false, P);
     g_config.osd_show_fg             = ReadINIBool(S, "osd_show_fg", false, P);
     g_config.osd_show_limiter        = ReadINIBool(S, "osd_show_limiter", false, P);
-    g_config.osd_show_pqi            = ReadINIBool(S, "osd_show_pqi", false, P);
+    // Jitter replaces PQI and Smoothness: an INI that had either on and has no osd_show_jitter key yet gets Jitter on.
+    // The old keys are read here only for that; the rewrite that ends this load drops them, so it happens once.
+    const bool legacy_quality_reading =
+        ReadINIBool(S, "osd_show_pqi", false, P) || ReadINIBool(S, "osd_show_smoothness", false, P);
+    g_config.osd_show_jitter         = ReadINIBool(S, "osd_show_jitter", legacy_quality_reading, P);
     g_config.osd_show_cpu_latency    = ReadINIBool(S, "osd_show_cpu_latency", false, P);
     g_config.osd_show_native_pcl     = ReadINIBool(S, "osd_show_native_pcl", false, P);
     g_config.osd_show_native_pcl_breakdown = ReadINIBool(S, "osd_show_native_pcl_breakdown", false, P);
-    g_config.osd_show_pqi_breakdown  = ReadINIBool(S, "osd_show_pqi_breakdown", false, P);
     g_config.osd_show_1pct_low       = ReadINIBool(S, "osd_show_1pct_low", false, P);
-    g_config.osd_show_smoothness     = ReadINIBool(S, "osd_show_smoothness", false, P);
     g_config.osd_show_pacing_quality = ReadINIBool(S, "osd_show_pacing_quality", false, P);
     g_config.osd_scale               = static_cast<float>(ReadINIDouble(S, "osd_scale", 1.0, P));
     g_config.osd_drop_shadow         = ReadINIBool(S, "osd_drop_shadow", true, P);
@@ -582,9 +584,7 @@ static void WriteConfigSnapshot(const ConfigSaveSnapshot& snapshot) {
     WriteINIBool(S, "osd_show_gpu_render_time", config.osd_show_gpu_render_time, P);
     WriteINIBool(S, "osd_show_total_frame_cost", config.osd_show_total_frame_cost, P);
     WriteINIBool(S, "osd_show_fg_time", config.osd_show_fg_time, P);
-    WriteINIBool(S, "osd_show_pqi", config.osd_show_pqi, P);
-    WriteINIBool(S, "osd_show_pqi_breakdown", config.osd_show_pqi_breakdown, P);
-    WriteINIBool(S, "osd_show_smoothness", config.osd_show_smoothness, P);
+    WriteINIBool(S, "osd_show_jitter", config.osd_show_jitter, P);
     WriteINIBool(S, "osd_show_pacing_quality", config.osd_show_pacing_quality, P);
     WriteINIBool(S, "osd_show_fg", config.osd_show_fg, P);
     WriteINIBool(S, "osd_show_limiter", config.osd_show_limiter, P);
@@ -1208,13 +1208,11 @@ OSDPreset OSDPreset_FromConfig() {
     p.show_frametime_graph  = g_config.osd_show_frametime_graph;
     p.show_fg               = g_config.osd_show_fg;
     p.show_limiter          = g_config.osd_show_limiter;
-    p.show_pqi              = g_config.osd_show_pqi;
+    p.show_jitter           = g_config.osd_show_jitter;
     p.show_cpu_latency      = g_config.osd_show_cpu_latency;
     p.show_native_pcl       = g_config.osd_show_native_pcl;
     p.show_native_pcl_breakdown = g_config.osd_show_native_pcl_breakdown;
-    p.show_pqi_breakdown    = g_config.osd_show_pqi_breakdown;
     p.show_1pct_low         = g_config.osd_show_1pct_low;
-    p.show_smoothness       = g_config.osd_show_smoothness;
     p.show_pacing_quality   = g_config.osd_show_pacing_quality;
     p.show_0_1pct_low       = g_config.osd_show_0_1pct_low;
     p.show_gpu_render_time  = g_config.osd_show_gpu_render_time;
@@ -1245,13 +1243,11 @@ void OSDPreset_ApplyToConfig(const OSDPreset& p) {
     g_config.osd_show_frametime_graph  = p.show_frametime_graph;
     g_config.osd_show_fg               = p.show_fg;
     g_config.osd_show_limiter          = p.show_limiter;
-    g_config.osd_show_pqi              = p.show_pqi;
+    g_config.osd_show_jitter           = p.show_jitter;
     g_config.osd_show_cpu_latency      = p.show_cpu_latency;
     g_config.osd_show_native_pcl       = p.show_native_pcl;
     g_config.osd_show_native_pcl_breakdown = p.show_native_pcl_breakdown;
-    g_config.osd_show_pqi_breakdown    = p.show_pqi_breakdown;
     g_config.osd_show_1pct_low         = p.show_1pct_low;
-    g_config.osd_show_smoothness       = p.show_smoothness;
     g_config.osd_show_pacing_quality   = p.show_pacing_quality;
     g_config.osd_show_0_1pct_low       = p.show_0_1pct_low;
     g_config.osd_show_gpu_render_time  = p.show_gpu_render_time;
@@ -1276,13 +1272,11 @@ void OSDPreset_ApplyTogglesOnly(const OSDPreset& p) {
     g_config.osd_show_frametime_graph  = p.show_frametime_graph;
     g_config.osd_show_fg               = p.show_fg;
     g_config.osd_show_limiter          = p.show_limiter;
-    g_config.osd_show_pqi              = p.show_pqi;
+    g_config.osd_show_jitter           = p.show_jitter;
     g_config.osd_show_cpu_latency      = p.show_cpu_latency;
     g_config.osd_show_native_pcl       = p.show_native_pcl;
     g_config.osd_show_native_pcl_breakdown = p.show_native_pcl_breakdown;
-    g_config.osd_show_pqi_breakdown    = p.show_pqi_breakdown;
     g_config.osd_show_1pct_low         = p.show_1pct_low;
-    g_config.osd_show_smoothness       = p.show_smoothness;
     g_config.osd_show_pacing_quality   = p.show_pacing_quality;
     g_config.osd_show_0_1pct_low       = p.show_0_1pct_low;
     g_config.osd_show_gpu_render_time  = p.show_gpu_render_time;
@@ -1344,13 +1338,14 @@ static void ReadPresetFromINI(int i, const char* P) {
     p.show_frametime_graph  = ReadINIBool(S, "show_frametime_graph", false, P);
     p.show_fg               = ReadINIBool(S, "show_fg", false, P);
     p.show_limiter          = ReadINIBool(S, "show_limiter", false, P);
-    p.show_pqi              = ReadINIBool(S, "show_pqi", false, P);
+    // A preset saved with PQI or Smoothness on and no show_jitter key gets Jitter on; a saved show_jitter wins.
+    const bool legacy_quality_reading =
+        ReadINIBool(S, "show_pqi", false, P) || ReadINIBool(S, "show_smoothness", false, P);
+    p.show_jitter           = ReadINIBool(S, "show_jitter", legacy_quality_reading, P);
     p.show_cpu_latency      = ReadINIBool(S, "show_cpu_latency", false, P);
     p.show_native_pcl       = ReadINIBool(S, "show_native_pcl", false, P);
     p.show_native_pcl_breakdown = ReadINIBool(S, "show_native_pcl_breakdown", false, P);
-    p.show_pqi_breakdown    = ReadINIBool(S, "show_pqi_breakdown", false, P);
     p.show_1pct_low         = ReadINIBool(S, "show_1pct_low", false, P);
-    p.show_smoothness       = ReadINIBool(S, "show_smoothness", false, P);
     p.show_pacing_quality   = ReadINIBool(S, "show_pacing_quality", false, P);
     p.show_0_1pct_low       = ReadINIBool(S, "show_0_1pct_low", false, P);
     p.show_gpu_render_time  = ReadINIBool(S, "show_gpu_render_time", false, P);
@@ -1428,13 +1423,11 @@ static void WritePresetToINI(int slot, const OSDPreset& p, const char* P) {
     WriteINIBool(S, "show_frametime_graph", p.show_frametime_graph, P);
     WriteINIBool(S, "show_fg", p.show_fg, P);
     WriteINIBool(S, "show_limiter", p.show_limiter, P);
-    WriteINIBool(S, "show_pqi", p.show_pqi, P);
+    WriteINIBool(S, "show_jitter", p.show_jitter, P);
     WriteINIBool(S, "show_cpu_latency", p.show_cpu_latency, P);
     WriteINIBool(S, "show_native_pcl", p.show_native_pcl, P);
     WriteINIBool(S, "show_native_pcl_breakdown", p.show_native_pcl_breakdown, P);
-    WriteINIBool(S, "show_pqi_breakdown", p.show_pqi_breakdown, P);
     WriteINIBool(S, "show_1pct_low", p.show_1pct_low, P);
-    WriteINIBool(S, "show_smoothness", p.show_smoothness, P);
     WriteINIBool(S, "show_pacing_quality", p.show_pacing_quality, P);
     WriteINIBool(S, "show_0_1pct_low", p.show_0_1pct_low, P);
     WriteINIBool(S, "show_gpu_render_time", p.show_gpu_render_time, P);

@@ -526,13 +526,13 @@ flowchart LR
     PRS["Present threads: Present records"] --> W
     GATE["GPU gate: wait and readiness records"] --> W
     RFX["Reflex reports through the clock map"] --> W
-    DSP["Display times from ETW or DXGI"] --> W
-    W["Telemetry worker: exact-key joins and runtime metrics"] --> OSD["OSD Display Pacing: 5 s window, 250 ms refresh"]
+    DSP["Frame times: ETW or DXGI display times, the flip gate's releases, or the FG input wait's releases"] --> W
+    W["Telemetry worker: exact-key joins and runtime metrics"] --> OSD["OSD Jitter and Frame Pacing: 5 s window, 250 ms refresh"]
     W --> CSV["Capture rows and events when recording"]
     RFX --> LEAD["Lead inputs"]
 ```
 
-**What you see.** The OSD's **Display Pacing** shows, over the last 5 seconds, refreshed four times per second: the display interval, jitter (the change from one display interval to the next), long and short frame counts, animation error (the difference between how far apart ReLimiter released two rendered frames and how far apart they were displayed), release to display, GPU residence and CPU hold. Display times come from PC latency collection (ETW) when it is collecting, otherwise from DXGI frame statistics. A capture (Telemetry Logging) records one joined row per displayed frame plus an events file with pipeline changes, cadence restarts and measurement status changes; see [Capture Files](DEVELOPER_REFERENCE.md#capture-files).
+**What you see.** The OSD's **Frame Pacing** shows, over the last 5 seconds, refreshed four times per second: the typical frame time and the slowest 1%, jitter (the average and worst change from one frame interval to the next), hitches (frames over 1.5 times the typical frame time), animation error (the difference between how far apart ReLimiter released two rendered frames and how far apart they were displayed), release to display, GPU residence and CPU hold. **Jitter** is the average change on one line, green under 8% of the frame interval, yellow under 16%. The frames measured depend on who places them on the display. With PC latency collection they are the displayed frames, timed by ETW; without frame generation, DXGI frame statistics time them; where frame generation presents from its own thread, ReLimiter's flip gate releases each displayed frame and that release is the time. Where hardware flip metering or frame generation itself places the generated frames after ReLimiter, ReLimiter cannot time them; the readings are then the real frames entering frame generation, the heading says so, and the generated frames are not measured. None of this needs PC latency collection. A capture (Telemetry Logging) records one joined row per displayed frame plus an events file with pipeline changes, cadence restarts and measurement status changes; see [Capture Files](DEVELOPER_REFERENCE.md#capture-files).
 
 **Analysis.** A capture's rows hold each frame's plan, release, output and display times, so pacing can be compared offline; the [Developer Reference](DEVELOPER_REFERENCE.md#capture-files) lists the columns and events.
 

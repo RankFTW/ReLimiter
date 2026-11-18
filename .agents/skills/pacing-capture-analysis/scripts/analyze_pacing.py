@@ -150,8 +150,10 @@ FALLBACK_REASON_NAMES = {0: "none", 1: "passthrough", 2: "idle_cap", 3: "smoothi
                          9: "no_native_route", 10: "no_gpu_queue", 11: "fg_unqualified", 12: "infeasible",
                          13: "fg_route_unsupported",
                          14: "driver_limiter_unavailable"}
-# PacingDisplaySource: display_source cells (empty without a display sample).
-DISPLAY_SOURCE_NAMES = {1: "etw", 2: "dxgi"}
+# PacingDisplaySource: display_source cells (empty without a display sample) and the events' snapshot_display_source.
+# Rows carry 1 or 2 only: the in-process sources (3, 4) feed the runtime window without joined rows.
+DISPLAY_SOURCE_NAMES = {1: "etw", 2: "dxgi", 3: "flip_gate", 4: "fg_input"}
+IN_PROCESS_DISPLAY_SOURCES = (3, 4)
 PLAN_COLUMNS = ("plan_rung", "plan_status", "display_source")
 OUTPUT_KIND_GPU_QUEUE_WAIT = 4
 # Stall recovery (section 9): tol = max(T_out / 4, 500 us); the long interval
@@ -1321,6 +1323,7 @@ SNAPSHOT_ROW_COLUMNS = (
 SNAPSHOT_SKIP_REASONS = (
     "unreadable_event",         # a snapshot cell does not parse
     "no_selected_swapchain",    # the runtime selected no swapchain and published no metrics
+    "in_process_source",        # the window's display samples are the flip gate's or the FG input's: no rows
     "empty_window",             # the selected swapchain had no retained rows
     "range_before_file",        # the range starts before the file's first row
     "range_after_file",         # the range extends past the file's last row
@@ -1340,6 +1343,7 @@ class SnapshotEvent:
     counts: dict[str, int | None]
     distributions: dict[str, tuple[int | None, float | None, float | None]]
     readable: bool = True
+    display_source: int | None = None
 
 
 def _snapshot_event(row: dict[str, str]) -> SnapshotEvent:
@@ -1354,7 +1358,8 @@ def _snapshot_event(row: dict[str, str]) -> SnapshotEvent:
             last=_integer(row, "window_last_row_sequence"),
             counts={name: _integer(row, column) for name, (column, _) in SNAPSHOT_COUNT_COLUMNS.items()},
             distributions={name: (_integer(row, count), _decimal(row, p50), _decimal(row, p99))
-                           for name, (count, p50, p99) in SNAPSHOT_DISTRIBUTION_COLUMNS.items()})
+                           for name, (count, p50, p99) in SNAPSHOT_DISTRIBUTION_COLUMNS.items()},
+            display_source=_event_int(row, "snapshot_display_source") if "snapshot_display_source" in row else None)
     except ValueError:
         return unreadable
 
@@ -1378,6 +1383,8 @@ def _snapshot_skip_reason(snapshot: SnapshotEvent) -> str | None:
         return "unreadable_event"
     if snapshot.swapchain is None:
         return "no_selected_swapchain"
+    if snapshot.display_source in IN_PROCESS_DISPLAY_SOURCES:
+        return "in_process_source"
     if snapshot.first is None or snapshot.last is None or snapshot.last < snapshot.first:
         return "empty_window"
     return None

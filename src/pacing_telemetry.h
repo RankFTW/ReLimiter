@@ -17,6 +17,7 @@ void PacingTelemetry_PushGpuQueue(const PacingGpuQueueRecord& record) noexcept; 
 void PacingTelemetry_PushReflex(const PacingReflexRecord& record) noexcept;   // scheduler owner
 void PacingTelemetry_PushWait(const PacingWaitRecord& record) noexcept;       // async marker hook
 void PacingTelemetry_PushDisplay(const PacingDisplaySample& sample) noexcept; // ETW collector thread
+void PacingTelemetry_PushFlip(const PacingFlipSample& sample) noexcept;       // the flip gate's clock thread
 
 struct IDXGISwapChain;
 
@@ -31,13 +32,27 @@ void PacingTelemetry_RecordDxgiPresent(IDXGISwapChain* swapchain, const PacingPr
 bool PacingTelemetry_Start() noexcept;
 bool PacingTelemetry_Stop() noexcept;
 
-// Source of the snapshot window's display samples: Etw while ETW display
-// samples are flowing, Dxgi when the DXGI frame-statistics source produced them.
+// What the snapshot window's samples are. Displayed frames: Etw while ETW display samples are flowing (PC latency
+// collection), Dxgi from DXGI frame statistics (no frame generation), FlipGate from the flip gate's release of each
+// flip (frame generation presenting from its own thread, fg_present_order.cpp). FgInput: the real frames entering
+// frame generation (the FG input wait's release, or the frame's readiness where it came later), only while hardware
+// flip metering spaces the displayed frames from them; the displayed frames are not measured. Frame generation that
+// presents by itself without the flip gate has no source but Etw: the real frames say little about its flips.
+// The first source in that order that has samples is the window's; a change of source empties the window.
 enum class PacingDisplaySource : uint8_t {
     None = 0,
     Etw = 1,
-    Dxgi = 2
+    Dxgi = 2,
+    FlipGate = 3,
+    FgInput = 4
 };
+
+// True where the samples are displayed frames, false for FgInput (real frames) and None.
+inline bool PacingDisplaySource_IsDisplayed(PacingDisplaySource source) noexcept
+{
+    return source == PacingDisplaySource::Etw || source == PacingDisplaySource::Dxgi ||
+        source == PacingDisplaySource::FlipGate;
+}
 
 struct PacingTelemetrySnapshot {
     uint64_t sequence = 0;
@@ -53,6 +68,14 @@ struct PacingTelemetrySnapshot {
     double display_interval_p99_us = 0.0;
     double adjacent_jitter_p50_us = 0.0;
     double adjacent_jitter_p99_us = 0.0;
+    // The readout's headline: the mean change from one interval to the next over the window (the "displayed
+    // frame-to-frame change" of the capture reports). Valid with display_valid and jitter_samples != 0.
+    double adjacent_jitter_mean_us = 0.0;
+    uint32_t jitter_samples = 0;
+    // Intervals over 1.5 times the window's median interval (the capture reports' hitch); needs no target.
+    uint32_t hitches = 0;
+    // Displayed frames per sample: the frame generation multiplier for FgInput (a sample is a real frame), else 1.
+    uint32_t frames_per_sample = 1;
     double abs_deviation_p99_us = 0.0;
     uint32_t long_frames = 0;
     uint32_t short_frames = 0;
