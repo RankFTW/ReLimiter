@@ -87,24 +87,41 @@ void PacingJoiner::Reset(uint64_t qpc_frequency) noexcept
     retention_ticks_ = MillisecondsToTicks(PACING_JOIN_RETENTION_MS, qpc_frequency);
     unjoined_present_ticks_ = MillisecondsToTicks(PACING_JOIN_UNJOINED_PRESENT_MS, qpc_frequency);
     display_grace_ticks_ = MillisecondsToTicks(PACING_JOIN_DISPLAY_GRACE_MS, qpc_frequency);
-    sources_.Clear();
     presents_.Clear();
+    pending_displays_.Clear();
+    pending_evidence_ = 0;
+    statistics_ = {};
+    RestartReadout(0);
+}
+
+void PacingJoiner::RestartReadout(int64_t window_start_qpc) noexcept
+{
+    window_start_qpc_ = window_start_qpc;
+    // Old Present spans can still match delayed ETW IDs, but are never new
+    // readout rows, including on retention expiry or a final drain.
+    for (uint64_t n = presents_.HeadSequence(); n < presents_.TailSequence(); ++n)
+        if (presents_.At(n).record.p_qpc < window_start_qpc) presents_.At(n).claimed = true;
+    sources_.Clear();
     gates_.Clear();
     readies_.Clear();
     gpu_queues_.Clear();
     reflexes_.Clear();
     waits_.Clear();
-    pending_displays_.Clear();
     swapchains_ = {};
     swapchain_use_clock_ = 0;
-    unjoined_cursor_ = 0;
+    unjoined_cursor_ = presents_.HeadSequence();
     marker_epoch_valid_ = false;
     marker_domain_ = PacingIdentityDomain::Unknown;
     marker_epoch_ = 0;
     latest_present_valid_ = false;
     latest_present_swapchain_ = 0;
     latest_present_received_qpc_ = 0;
+    // Evidence is counted and reported across readout boundaries.
+    const auto agreements = statistics_.cross_thread_agreements;
+    const auto disagreements = statistics_.cross_thread_disagreements;
     statistics_ = {};
+    statistics_.cross_thread_agreements = agreements;
+    statistics_.cross_thread_disagreements = disagreements;
 }
 
 void PacingJoiner::AddSource(const PacingSourceRecord& record, int64_t now_qpc) noexcept
@@ -124,9 +141,12 @@ void PacingJoiner::AddSource(const PacingSourceRecord& record, int64_t now_qpc) 
 
 void PacingJoiner::AddPresent(const PacingPresentRecord& record, int64_t now_qpc) noexcept
 {
-    latest_present_valid_ = true;
-    latest_present_swapchain_ = record.native_swapchain;
-    latest_present_received_qpc_ = now_qpc;
+    const bool before_window = record.p_qpc < window_start_qpc_;
+    if (!before_window) {
+        latest_present_valid_ = true;
+        latest_present_swapchain_ = record.native_swapchain;
+        latest_present_received_qpc_ = now_qpc;
+    }
     // Aged records leave through TryTakeRow so undecided ones still get a row.
     if (presents_.Full()) {
         const RetainedPresent& oldest = presents_.Oldest();
@@ -137,6 +157,7 @@ void PacingJoiner::AddPresent(const PacingPresentRecord& record, int64_t now_qpc
     RetainedPresent entry{};
     entry.record = record;
     entry.received_qpc = now_qpc;
+    entry.claimed = before_window;
     presents_.PushBack(entry);
 }
 
@@ -223,7 +244,9 @@ bool PacingJoiner::AddDisplay(const PacingDisplaySample& sample, int64_t now_qpc
         return false;
     }
     pending_displays_.PushBack(PendingDisplay{ sample, now_qpc, context });
-    FindOrAddSwapchain(sample.native_swapchain); // the swapchain now has a display stream
+    if (sample.pcl_frame_id != 0) ++pending_evidence_;
+    if (PacingJoin_DisplayFrameQpc(sample) >= static_cast<uint64_t>(window_start_qpc_))
+        FindOrAddSwapchain(sample.native_swapchain); // the swapchain now has a display stream
     return true;
 }
 
@@ -255,7 +278,7 @@ void PacingJoiner::EvictAgedRecords(int64_t now_qpc) noexcept
     EvictOlderThan(&waits_, now_qpc, retention_ticks_);
 }
 
-bool PacingJoiner::TakeDisplayRow(int64_t now_qpc, bool final_drain, PacingJoinedRow* row) noexcept
+bool PacingJoiner::TakeDisplay(int64_t now_qpc, bool final_drain, PendingDisplay* output) noexcept
 {
     while (pending_displays_.Count() != 0) {
         const PendingDisplay& pending = pending_displays_.Oldest();
@@ -263,18 +286,54 @@ bool PacingJoiner::TakeDisplayRow(int64_t now_qpc, bool final_drain, PacingJoine
             if (!pending_displays_.Full()) return false;
             ++statistics_.pending_display_forced;
         }
-        const PacingDisplaySample sample = pending.sample;
-        const PacingDisplayContext context = pending.context;
+        *output = pending;
+        if (pending.sample.pcl_frame_id != 0) --pending_evidence_;
         pending_displays_.PopFront();
-        if (sample.qpc_frequency != 0 && sample.qpc_frequency != qpc_frequency_) {
+        if (output->sample.qpc_frequency != 0 && output->sample.qpc_frequency != qpc_frequency_) {
             ++statistics_.clock_mismatches;
             continue;
         }
-        BuildDisplayRow(sample, row);
-        row->display_continuity_break = context.continuity_break;
         return true;
     }
     return false;
+}
+
+bool PacingJoiner::TakeDisplayRow(int64_t now_qpc, bool final_drain, PacingJoinedRow* row) noexcept
+{
+    PendingDisplay pending;
+    while (TakeDisplay(now_qpc, final_drain, &pending)) {
+        if (PacingJoin_DisplayFrameQpc(pending.sample) < static_cast<uint64_t>(window_start_qpc_)) {
+            MatchEvidence(pending.sample);
+            continue;
+        }
+        BuildDisplayRow(pending.sample, row);
+        row->display_continuity_break = pending.context.continuity_break;
+        return true;
+    }
+    return false;
+}
+
+void PacingJoiner::DrainEvidence(int64_t now_qpc, bool final_drain) noexcept
+{
+    PendingDisplay pending;
+    while (TakeDisplay(now_qpc, final_drain, &pending)) MatchEvidence(pending.sample);
+    EvictOlderThan(&presents_, now_qpc, retention_ticks_);
+}
+
+void PacingJoiner::MatchEvidence(const PacingDisplaySample& sample) noexcept
+{
+    if (sample.pcl_frame_id == 0) return;
+    uint32_t candidates;
+    if (const auto* present = FindPresentForDisplay(sample, &candidates))
+        RecordEvidence(*present, sample.pcl_frame_id);
+}
+
+void PacingJoiner::RecordEvidence(const RetainedPresent& present, uint32_t frame_id) noexcept
+{
+    const auto& taken = present.record.cross_thread_key;
+    if (!PacingFrameKey_IsValid(taken) || !frame_id) return;
+    if (static_cast<uint32_t>(taken.frame_id) == frame_id) ++statistics_.cross_thread_agreements;
+    else ++statistics_.cross_thread_disagreements;
 }
 
 bool PacingJoiner::TakeUnjoinedPresentRow(
@@ -330,14 +389,7 @@ void PacingJoiner::BuildDisplayRow(const PacingDisplaySample& sample, PacingJoin
             ++statistics_.late_display_joins;
         }
         present->claimed = true;
-        const PacingFrameKey& taken = present->record.cross_thread_key;
-        if (PacingFrameKey_IsValid(taken) && sample.pcl_frame_id != 0) {
-            if (static_cast<uint32_t>(taken.frame_id) == sample.pcl_frame_id) {
-                ++statistics_.cross_thread_agreements;
-            } else {
-                ++statistics_.cross_thread_disagreements;
-            }
-        }
+        RecordEvidence(*present, sample.pcl_frame_id);
     }
     SwapchainDisplayState* state = FindOrAddSwapchain(sample.native_swapchain);
     if (sample.present_start_qpc > state->joined_present_start_qpc) {

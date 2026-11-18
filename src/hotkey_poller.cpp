@@ -24,6 +24,7 @@ struct Slot {
 };
 
 std::array<Slot, kSlotCount> s_slots;
+std::atomic<bool> s_pending{false};
 std::atomic<bool> s_suppressed{false};
 std::atomic<bool> s_suppress_latch{false};
 // Advanced by every transition of what a sample may not straddle: a capture beginning or ending
@@ -32,7 +33,7 @@ std::atomic<bool> s_suppress_latch{false};
 // rejects a trigger whose generation is no longer the current one, so a poll in flight across a
 // transition (a capture that begins and ends while it is paused) publishes nothing that is applied.
 std::atomic<uint64_t> s_generation{0};
-// A service thread polls (blackout.cpp); false: the OSD callback polls (Hotkeys_PollFallback).
+// A service thread polls (blackout.cpp); false: the present callback polls.
 std::atomic<bool> s_service_polling{false};
 
 bool AsyncKeyDown(int vk) noexcept {
@@ -46,8 +47,18 @@ Slot& SlotOf(HotkeySlot slot) noexcept {
 }  // namespace
 
 void Hotkeys_SetBinding(HotkeySlot slot, uint32_t packed_binding) noexcept {
-    SlotOf(slot).binding.store(packed_binding, std::memory_order_release);
+    Slot& target = SlotOf(slot);
+    target.binding.store(packed_binding, std::memory_order_release);
+    // A parked service may not have observed the cleared state between
+    // clearing and rebinding the same key. Require release in that case too.
+    target.rearm.store(true, std::memory_order_release);
     s_generation.fetch_add(1, std::memory_order_acq_rel);
+}
+
+bool Hotkeys_HasBindings() noexcept {
+    for (const Slot& slot : s_slots)
+        if (hotkey_edge::Unpack(slot.binding.load(std::memory_order_relaxed)).vk != 0) return true;
+    return false;
 }
 
 void Hotkeys_Rearm(HotkeySlot slot) noexcept {
@@ -68,6 +79,14 @@ bool Hotkeys_Take(HotkeySlot slot) noexcept {
     if (trigger.load(std::memory_order_relaxed) == 0) return false;
     const uint64_t sampled = trigger.exchange(0, std::memory_order_acq_rel);
     return sampled != 0 && sampled - 1 == s_generation.load(std::memory_order_acquire);
+}
+
+bool Hotkeys_HasPending() noexcept {
+    return s_pending.load(std::memory_order_acquire);
+}
+
+void Hotkeys_BeginDrain() noexcept {
+    s_pending.exchange(false, std::memory_order_acq_rel);
 }
 
 void Hotkeys_SetServiceThreadPolling(bool polling) noexcept {
@@ -106,7 +125,10 @@ void Hotkeys_PollWith(HotkeyKeyReader read_key) noexcept {
         const bool triggered = hotkey_edge::Step(
             binding, &slot.state, suppressed,
             [read_key, vk = binding.vk]() noexcept { return read_key(vk); }, read_modifiers);
-        if (triggered) slot.trigger.store(generation + 1, std::memory_order_release);
+        if (triggered) {
+            slot.trigger.store(generation + 1, std::memory_order_release);
+            s_pending.store(true, std::memory_order_release);
+        }
     }
 }
 

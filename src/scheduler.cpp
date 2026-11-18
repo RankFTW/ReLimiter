@@ -4,6 +4,7 @@
 #include "pacing_resolver.h"
 #include "instrumentation_state.h"
 #include "fg_divisor.h"
+#include "frame_splitting.h"
 #include "display_state.h"
 #include "vblank_thread.h"
 #include "wake_guard.h"
@@ -373,7 +374,7 @@ bool s_logged_ordered_behind_wait = false;
 // retired Sleep cannot overwrite another frame's slot), and the marker uses a snapshot only
 // when its token and sequence validate, else it discards it.
 std::atomic<uint64_t> s_up_mailbox{0};
-std::atomic<uint32_t> s_up_pending_flags{0}; // kUpOwnerBusy / kUpDuplicateSleep seen since the last record
+PacingPendingWarning s_up_owner_busy, s_up_duplicate_sleep;
 constexpr uint32_t kUpStatsSlots = 4;
 struct UnifiedSleepStats {
     std::atomic<uint32_t> sequence{0};  // odd while a writer owns the slot
@@ -481,7 +482,8 @@ static void ResetUnifiedLaw() noexcept
     if (!s_source_stage.UnifiedEnabled()) return;
     s_source_stage.ResetUnified(FrameTimeline_CurrentControllerGeneration());
     s_up_mailbox.store(0, std::memory_order_release);
-    s_up_pending_flags.store(0, std::memory_order_relaxed);
+    s_up_owner_busy.Clear();
+    s_up_duplicate_sleep.Clear();
 }
 
 // Starts a fresh cadence-readout history. Reflex reports admitted before the
@@ -739,7 +741,8 @@ static void ApplyUnifiedKeyTransition(const PacingPipelineConfig& config) noexce
     if (key_changed && !s_up_key) LogQueueLawSummary("unified pacer off"); // s_up_key is the new value: the key went off
     s_source_stage.SetUnifiedEnabled(s_up_key, FrameTimeline_CurrentControllerGeneration());
     s_up_mailbox.store(0, std::memory_order_release);
-    s_up_pending_flags.store(0, std::memory_order_relaxed);
+    s_up_owner_busy.Clear();
+    s_up_duplicate_sleep.Clear();
     // The waker is installed before the publication starts (frame_plan.cpp stays free of Windows).
     FramePlan_SetReadyWaker([](const void* address) noexcept { WakeByAddressAll(const_cast<void*>(address)); });
     g_up_ready_publish.store(s_up_key, std::memory_order_relaxed);
@@ -753,7 +756,8 @@ static void ApplyUnifiedKeyTransition(const PacingPipelineConfig& config) noexce
     }
 }
 
-// Exactly one source record per OnMarker call, pushed after its release, just
+
+// One source record per observed OnMarker call, pushed after its release, just
 // before it returns toward the game. The frame identity is read here.
 static void PushSourceRelease(
     const SchedulerCadenceContext& context,
@@ -770,16 +774,7 @@ static void PushSourceRelease(
     // The driver's sleep status as it stood when this frame's Reflex Sleep
     // returned (Hook_Sleep, presenting device): taken once, so a record
     // without a Sleep before it carries none.
-    uint64_t sleep_status = g_sleep_status_at_sleep_return.exchange(0, std::memory_order_relaxed);
-    // A result of another feedback-device publication is not this frame's.
-    if ((sleep_status >> 63) != 0 &&
-        SleepStatusToken(sleep_status) != g_sleep_status_token.load(std::memory_order_acquire))
-        sleep_status = 0;
-    if ((sleep_status >> 63) != 0) {
-        record->driver_sleep_status_valid = 1;
-        record->driver_use_game_sleep = static_cast<uint8_t>((sleep_status >> 32) & 1u);
-        record->driver_sleep_interval_us = static_cast<uint32_t>(sleep_status & 0xFFFFFFFFu);
-    }
+    g_pacing_pending_sleep.Take(*record);
     PacingTelemetry_PushSource(*record);
 }
 
@@ -843,12 +838,14 @@ static void RunPassthrough(
             static_cast<PacingSourceMarker>(context.marker), 0.0);
     }
     PublishCadence(context, release);
-    PacingSourceRecord source{};
-    source.flags = static_cast<uint8_t>(PACING_SOURCE_PASSTHROUGH | extra_flags);
-    source.release_qpc = release;
-    source.fg_divisor = fg_divisor;
-    SourceStage::FillSourceRecord({}, pipeline, &source);
-    PushSourceRelease(context, &source);
+    if (PacingTelemetry_Active()) {
+        PacingSourceRecord source{};
+        source.flags = static_cast<uint8_t>(PACING_SOURCE_PASSTHROUGH | extra_flags);
+        source.release_qpc = release;
+        source.fg_divisor = fg_divisor;
+        SourceStage::FillSourceRecord({}, pipeline, &source);
+        PushSourceRelease(context, &source);
+    }
 
     SchedulerPacingStatus status{};
     status.stage_events_dropped = FramePlan_DroppedStageEvents();
@@ -881,22 +878,28 @@ static void RunDmfg(
         const int bg_fps = g_background_fps.load(std::memory_order_relaxed);
         const SchedulerCadenceContext cadence_context = GetCadenceContext(
             key, trigger, marker, SchedulerCadenceRegime::DmfgBackground, bg_fps);
-        PacingSourceRecord source{};
+        double bg_interval_us = 0.0;
+        int64_t wake_target = 0;
+        bool slept = false;
         if (bg_fps > 0) {
-            const double bg_interval_us = 1000000.0 / static_cast<double>(bg_fps);
-            source.interval_us = bg_interval_us;
+            bg_interval_us = 1000000.0 / static_cast<double>(bg_fps);
             const int64_t now_qpc = QpcNow();
             if (s_prev_enforcement_ts > 0) {
                 const double remaining = bg_interval_us - qpc_to_us(now_qpc - s_prev_enforcement_ts);
                 if (remaining > 500.0) {
-                    source.wake_target_qpc = now_qpc + us_to_qpc(remaining);
-                    if (TryOwnSleep(source.wake_target_qpc)) source.flags |= PACING_SOURCE_SLEPT;
+                    wake_target = now_qpc + us_to_qpc(remaining);
+                    slept = TryOwnSleep(wake_target);
                 }
             }
         }
         const int64_t release = QpcNow();
         s_prev_enforcement_ts = release;
         PublishCadence(cadence_context, release);
+        if (!PacingTelemetry_Active()) return;
+        PacingSourceRecord source{};
+        source.interval_us = bg_interval_us;
+        source.wake_target_qpc = wake_target;
+        if (slept) source.flags |= PACING_SOURCE_SLEPT;
         source.flags |= PACING_SOURCE_BACKGROUND;
         if (bg_fps <= 0) source.flags |= PACING_SOURCE_PASSTHROUGH;
         source.release_qpc = release;
@@ -911,16 +914,16 @@ static void RunDmfg(
         const SchedulerCadenceContext cadence_context = GetCadenceContext(
             key, trigger, marker, SchedulerCadenceRegime::DmfgFgOffCap, fg_off_cap);
         const double cap_interval_us = 1000000.0 / static_cast<double>(fg_off_cap);
-        PacingSourceRecord source{};
-        source.interval_us = cap_interval_us;
+        int64_t wake_target = 0;
+        bool slept = false;
         const int64_t now_qpc = QpcNow();
         int64_t own_sleep_start = 0;
         if (s_prev_enforcement_ts > 0) {
             const double remaining = cap_interval_us - qpc_to_us(now_qpc - s_prev_enforcement_ts);
             if (remaining > 500.0) {
                 own_sleep_start = now_qpc;
-                source.wake_target_qpc = now_qpc + us_to_qpc(remaining);
-                if (TryOwnSleep(source.wake_target_qpc)) source.flags |= PACING_SOURCE_SLEPT;
+                wake_target = now_qpc + us_to_qpc(remaining);
+                slept = TryOwnSleep(wake_target);
             }
         }
         const int64_t release = QpcNow();
@@ -935,6 +938,11 @@ static void RunDmfg(
         }
         s_prev_enforcement_ts = release;
         PublishCadence(cadence_context, release);
+        if (!PacingTelemetry_Active()) return;
+        PacingSourceRecord source{};
+        source.interval_us = cap_interval_us;
+        source.wake_target_qpc = wake_target;
+        if (slept) source.flags |= PACING_SOURCE_SLEPT;
         source.release_qpc = release;
         SourceStage::FillSourceRecord({}, pipeline, &source);
         PushSourceRelease(cadence_context, &source);
@@ -951,6 +959,7 @@ static void RunDmfg(
     s_prev_enforcement_ts = release;
     if (control_ft > 0.0) s_control_actual_frame_time_us = control_ft;
     const SchedulerCadenceObservation cadence = PublishCadence(cadence_context, release);
+    if (!PacingTelemetry_Active()) return;
     const double telemetry_ft = qpc_to_us(cadence.interval_qpc);
     const double output_fps = g_output_fps.load(std::memory_order_relaxed);
     const double render_fps = cadence.valid ? 1000000.0 / telemetry_ft : 0.0;
@@ -1168,7 +1177,10 @@ static void FillUnifiedRecord(const SourceStageFrame& frame, PacingSourceRecord*
     if (!frame.planned || !frame.unified.valid) return;
     const SourceStageUnifiedFrame& unified = frame.unified;
     const UnifiedStart& start = unified.start;
-    uint32_t flags = unified.flags | s_up_pending_flags.exchange(0, std::memory_order_relaxed);
+    const auto birth = static_cast<int64_t>(g_pacing_telemetry_demand.load(std::memory_order_relaxed) >> kPacingWindowShift);
+    uint32_t flags = unified.flags;
+    if (s_up_owner_busy.Take(birth, record->release_qpc)) flags |= kUpOwnerBusy;
+    if (s_up_duplicate_sleep.Take(birth, record->release_qpc)) flags |= kUpDuplicateSleep;
     // The Sleep hook's hard-limit statistics, when this frame consumed that Sleep's word and the
     // snapshot of its token validates; otherwise the cells stay empty.
     UnifiedStatsSnapshot stats{};
@@ -1368,19 +1380,21 @@ static SourceStageFrame RunPlanned(
     ObserveCollisionGuard(unified && frame.planned ? frame.plan.fg_divisor : input.fg_divisor,
         frame.planned && frame.plan.ordered);
 
-    PacingSourceRecord source{};
-    source.flags = input.extra_flags;
-    if (!frame.planned) source.flags |= PACING_SOURCE_PASSTHROUGH;
-    source.release_qpc = release;
-    source.interval_us = input.interval_us;
-    source.fg_divisor = input.fg_divisor;
-    if (pre_slept) {
-        source.flags |= PACING_SOURCE_PRE_SLEEP;
-        source.pre_sleep_end_qpc = pre_sleep_end_qpc;
+    if (PacingTelemetry_Active()) {
+        PacingSourceRecord source{};
+        source.flags = input.extra_flags;
+        if (!frame.planned) source.flags |= PACING_SOURCE_PASSTHROUGH;
+        source.release_qpc = release;
+        source.interval_us = input.interval_us;
+        source.fg_divisor = input.fg_divisor;
+        if (pre_slept) {
+            source.flags |= PACING_SOURCE_PRE_SLEEP;
+            source.pre_sleep_end_qpc = pre_sleep_end_qpc;
+        }
+        SourceStage::FillSourceRecord(frame, pipeline, &source);
+        if (unified) FillUnifiedRecord(frame, &source);
+        PushSourceRelease(cadence_context, &source);
     }
-    SourceStage::FillSourceRecord(frame, pipeline, &source);
-    if (unified) FillUnifiedRecord(frame, &source);
-    PushSourceRelease(cadence_context, &source);
 
     SchedulerPacingStatus status{};
     status.valid = frame.planned;
@@ -1429,13 +1443,15 @@ static void RunDriverLimited(
         PublishReflexOwnedSleep(input.frame_id, key.producer_epoch, input.marker, 0.0);
     }
     PublishCadence(context, release);
-    PacingSourceRecord source{};
-    source.flags = static_cast<uint8_t>(PACING_SOURCE_PASSTHROUGH | input.extra_flags);
-    source.release_qpc = release;
-    source.interval_us = input.interval_us;
-    source.fg_divisor = input.fg_divisor;
-    SourceStage::FillSourceRecord({}, pipeline, &source);
-    PushSourceRelease(context, &source);
+    if (PacingTelemetry_Active()) {
+        PacingSourceRecord source{};
+        source.flags = static_cast<uint8_t>(PACING_SOURCE_PASSTHROUGH | input.extra_flags);
+        source.release_qpc = release;
+        source.interval_us = input.interval_us;
+        source.fg_divisor = input.fg_divisor;
+        SourceStage::FillSourceRecord({}, pipeline, &source);
+        PushSourceRelease(context, &source);
+    }
 
     SchedulerPacingStatus status{};
     status.stage_events_dropped = FramePlan_DroppedStageEvents();
@@ -1511,7 +1527,7 @@ SchedulerUnifiedReserve Scheduler_UnifiedReserve(int64_t arrival_qpc, SchedulerU
     if (out == nullptr || !Scheduler_UnifiedActive()) return SchedulerUnifiedReserve::Inactive;
     SchedulerOwnerGuard owner;
     if (!owner) {
-        s_up_pending_flags.fetch_or(kUpOwnerBusy, std::memory_order_relaxed);
+        if (PacingTelemetry_Active()) s_up_owner_busy.Record(arrival_qpc);
         return SchedulerUnifiedReserve::Busy;
     }
     // The reservation's I_gpu comes from the records drained now, including those the probe
@@ -1524,7 +1540,7 @@ SchedulerUnifiedReserve Scheduler_UnifiedReserve(int64_t arrival_qpc, SchedulerU
         s_source_stage.Grid().NextIndex(), FrameTimeline_CurrentControllerGeneration(), arrival_qpc,
         BuildUnifiedTerms(pipeline.mode, s_up_idle_interval_us), &start);
     if (status == UnifiedReserveStatus::Duplicate) {
-        s_up_pending_flags.fetch_or(kUpDuplicateSleep, std::memory_order_relaxed);
+        if (PacingTelemetry_Active()) s_up_duplicate_sleep.Record(arrival_qpc);
         return SchedulerUnifiedReserve::Duplicate;
     }
     if (status != UnifiedReserveStatus::Reserved) return SchedulerUnifiedReserve::Inactive;
@@ -1702,7 +1718,7 @@ void OnMarker(
             s_dmfg_logged = true;
         }
         runtime.dmfg_passthrough = true;
-        g_resolved_fg_divisor.store(ComputeFGDivisorRaw(), std::memory_order_relaxed);
+        FrameSplitting_PublishFgDivisor(ComputeFGDivisorRaw());
         RunDmfg(frameID, trigger, marker, nvapi_producer_epoch,
             ResolvePipeline(trigger, config, runtime));
         return;
@@ -1719,7 +1735,7 @@ void OnMarker(
         PollReflexLatencyReport(ReportFeedbackIntervalUs());
         fg_divisor_raw = ComputeFGDivisorRaw();
     }
-    g_resolved_fg_divisor.store(fg_divisor_raw, std::memory_order_relaxed);
+    FrameSplitting_PublishFgDivisor(fg_divisor_raw);
     // This is a resolved scheduler observation, not native-gate actuation;
     // the native gate and GPU readiness read it.
     NativeGate_ObserveFrameGeneration(fg_divisor_raw, FrameTimeline_CurrentControllerGeneration());

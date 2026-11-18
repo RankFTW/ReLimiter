@@ -842,6 +842,22 @@ bool TestCrossThreadEvidence()
     const PacingJoinStatistics statistics = g_joiner.Statistics();
     ok = Check(statistics.cross_thread_agreements == 1 && statistics.cross_thread_disagreements == 1,
         "one agreement, one disagreement, no evidence without a frame ID") && ok;
+    // A readout may close/start with ETW samples still inside their grace.
+    agreeing.p_qpc = Ms(410);
+    agreeing.e_qpc = Ms(411);
+    g_joiner.AddPresent(agreeing, Ms(411));
+    g_joiner.AddDisplay(Display(Ms(410) + kMillisecond / 2, Ms(420), 7), Ms(430));
+    g_joiner.RestartReadout(Ms(431));
+    g_joiner.DrainEvidence(Ms(431), false);
+    ok = Check(g_joiner.HasPendingEvidence() && g_joiner.Statistics().cross_thread_agreements == 1,
+        "readout restart keeps the pending ETW ID and its original grace") && ok;
+    g_joiner.DrainEvidence(Ms(600), false);
+    ok = Check(!g_joiner.HasPendingEvidence() && g_joiner.Statistics().cross_thread_agreements == 2 &&
+        g_joiner.Statistics().cross_thread_disagreements == 1 && g_joiner.Statistics().display_samples == 0,
+        "evidence-only drain matches the retained Present without assembling a display row") && ok;
+    g_joiner.AddDisplay(Display(Ms(410) + kMillisecond / 2, Ms(420), 7), Ms(610));
+    ok = Check(TakeRows(Ms(900), true, rows, 4) == 0 && g_joiner.Statistics().cross_thread_agreements == 3,
+        "an old ETW burst still qualifies the route but cannot become a row of the new capture") && ok;
     return ok;
 }
 

@@ -2,9 +2,12 @@
 #include "shutdown_admission.h"
 #include "startup_breadcrumb.h"
 #include "log_level_state.h"
+#include "nvapi_marker_census.h"
 #include <reshade.hpp>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <atomic>
 
@@ -30,13 +33,14 @@ private:
 
 static LARGE_INTEGER s_start_qpc;
 static double s_qpc_freq_inv = 0.0;
+static uint64_t s_qpc_frequency = 0;
 static std::atomic<bool> s_init_phase{true};
 static char s_process_name[MAX_PATH] = "unknown";
 static char s_log_path[MAX_PATH] = "";
 
 // ── Buffered logging ──
 // Log messages are appended to a ring buffer. A background thread flushes
-// to disk every 500ms. This keeps file I/O off the render thread entirely.
+// a batch within 500 ms of its first line, sleeping indefinitely when empty.
 // During init phase, writes are immediate (crash safety before game starts).
 static constexpr size_t LOG_BUF_SIZE = 64 * 1024;  // 64KB ring buffer
 static char s_log_buf[LOG_BUF_SIZE];
@@ -44,7 +48,9 @@ static char s_flush_buf[LOG_BUF_SIZE];
 static size_t s_log_buf_pos = 0;
 static std::mutex s_buf_mutex;
 static HANDLE s_flush_thread = nullptr;
-static std::atomic<bool> s_flush_running{false};
+static std::condition_variable s_flush_changed;
+static bool s_flush_running = false; // under s_buf_mutex
+static std::chrono::steady_clock::time_point s_flush_deadline;
 
 static void FlushBuffer() {
     // Serialize file access and the shared flush scratch buffer with init-phase
@@ -74,26 +80,68 @@ static void FlushBuffer() {
     }
 }
 
+// A debug log batch is the consumer for the changed marker census. Do not
+// poll the marker thread (or wake an otherwise idle worker) for diagnostics.
+static void LogNvApiMarkerCensus(int64_t* last_qpc,
+    std::array<uint64_t, NvApiMarkerCensus::Types * 4>* counts) {
+    if (s_levels.Effective() < static_cast<uint8_t>(LogLevel::Debug)) return;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (*last_qpc && now.QuadPart - *last_qpc < static_cast<int64_t>(s_qpc_frequency) * 5) return;
+    *last_qpc = now.QuadPart;
+    for (uint32_t type = 0; type < NvApiMarkerCensus::Types; ++type) {
+        for (uint32_t stage = 0; stage < 4; ++stage) {
+            NvApiMarkerCensus::Snapshot snapshot;
+            uint64_t& logged_count = (*counts)[type * 4 + stage];
+            if (!g_nvapi_marker_census.Read(type, static_cast<MarkerCensusStage>(stage), &snapshot) ||
+                snapshot.count == logged_count) continue;
+            logged_count = snapshot.count;
+            const auto& first = snapshot.first;
+            const auto& last = snapshot.last;
+            LOG_DEBUG("NvAPI census type=%u stage=%u count=%llu sample_misses=%llu "
+                "first_frame=%llu first_qpc=%lld first_caller=0x%llx first_device=0x%llx "
+                "last_frame=%llu last_qpc=%lld caller=0x%llx device=0x%llx thread=%u producer=%u reason=%u selected=%u frequency=%llu",
+                type, stage, snapshot.count, snapshot.misses, first.frame, first.qpc, first.caller, first.device,
+                last.frame, last.qpc, last.caller, last.device, last.thread, last.producer, last.reason,
+                last.selected, s_qpc_frequency);
+        }
+    }
+}
+
 static DWORD WINAPI LogFlushThread(LPVOID) {
-    while (s_flush_running.load(std::memory_order_relaxed)) {
-        Sleep(500);
+    int64_t census_qpc = 0;
+    std::array<uint64_t, NvApiMarkerCensus::Types * 4> census_counts{};
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(s_buf_mutex);
+            s_flush_changed.wait(lock, [] { return !s_flush_running || s_log_buf_pos != 0; });
+            if (!s_flush_running) break;
+            // Batch subsequent lines without waking for each one. Shutdown interrupts the delay.
+            s_flush_changed.wait_until(lock, s_flush_deadline, [] { return !s_flush_running; });
+        }
+        LogNvApiMarkerCensus(&census_qpc, &census_counts);
         FlushBuffer();
     }
-    FlushBuffer();  // final flush on shutdown
+    FlushBuffer();
     return 0;
 }
 
 static void StartFlushThread() {
     if (s_flush_thread) return;
-    s_flush_running.store(true, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(s_buf_mutex);
+    s_flush_running = true;
     s_flush_thread = CreateThread(nullptr, 0, LogFlushThread, nullptr, 0, nullptr);
     if (!s_flush_thread)
-        s_flush_running.store(false, std::memory_order_relaxed);
+        s_flush_running = false;
 }
 
 static bool StopFlushThread() {
     if (!s_flush_thread) return true;
-    s_flush_running.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(s_buf_mutex);
+        s_flush_running = false;
+    }
+    s_flush_changed.notify_one();
     DWORD wait_status = WaitForSingleObject(s_flush_thread, 2000);
     if (wait_status != WAIT_OBJECT_0) {
         CancelSynchronousIo(s_flush_thread);
@@ -108,11 +156,16 @@ static bool StopFlushThread() {
 static void BufferedWrite(const char* str, int len) {
     std::lock_guard<std::mutex> lock(s_buf_mutex);
     if (static_cast<size_t>(len) > LOG_BUF_SIZE) return;  // message too large
+    const bool was_empty = s_log_buf_pos == 0;
     // If buffer would overflow, drop oldest content
     if (s_log_buf_pos + static_cast<size_t>(len) > LOG_BUF_SIZE)
         s_log_buf_pos = 0;
     memcpy(s_log_buf + s_log_buf_pos, str, len);
     s_log_buf_pos += len;
+    if (was_empty) {
+        s_flush_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+        s_flush_changed.notify_one();
+    }
 }
 
 static const char* LevelTag(LogLevel lv) {
@@ -178,6 +231,7 @@ static bool InitLocked(HMODULE hModule, LogLevel level, BreadcrumbVerdict* previ
 
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
+    s_qpc_frequency = static_cast<uint64_t>(freq.QuadPart);
     s_qpc_freq_inv = 1.0 / static_cast<double>(freq.QuadPart);
     QueryPerformanceCounter(&s_start_qpc);
 
@@ -351,10 +405,9 @@ void Log_EndInitPhase() {
     std::lock_guard<std::mutex> lifecycle_lock(s_lifecycle_mutex);
     if (s_write_admission.IsClosed() ||
         !s_init_phase.load(std::memory_order_acquire)) return;
-    s_init_phase.store(false, std::memory_order_release);
-    // Flush any remaining init-phase messages, then start background flushing
-    FlushBuffer();
+    // Keep synchronous logging if the worker cannot start.
     StartFlushThread();
+    if (s_flush_thread) s_init_phase.store(false, std::memory_order_release);
 }
 
 const char* Log_GetProcessName() {

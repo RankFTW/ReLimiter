@@ -698,6 +698,8 @@ void TestHistogramQuantile()
             std::vector<double> sorted = recent;
             const double expected = PacingMetrics_Quantile(sorted.data(), sorted.size(), probability);
             const double actual = window->Quantile(probability);
+            CHECK(actual == LeadSampleWindow::BinCenterUs(LeadSampleWindow::BinOf(expected)));
+            CHECK(window->Quantile(probability) == actual); // repeat with no window mutation
             if (std::fabs(actual - expected) > LEAD_HISTOGRAM_BIN_US / 2.0 + 1e-9) {
                 std::fprintf(stderr, "FAIL quantile seed=0x%X sample=%d p=%.2f: %.3f vs %.3f\n",
                     seed, sample_index, probability, actual, expected);
@@ -1275,6 +1277,18 @@ void TestResumeHistoryMedian()
     controller->Reset(kFrequency);
     CHECK_NEAR(FallbackMedianUs(controller.get()), 0.0);
     CHECK(controller->Statistics().invalid_inputs == 0);
+    std::vector<double> recent;
+    for (uint64_t index = 1; index <= 128; ++index) {
+        const double delay = static_cast<double>((index * 173) % 2011);
+        FeedProbedGpuFrame(controller.get(), index, delay);
+        recent.push_back(delay);
+        if (recent.size() > LEAD_RESUME_MEDIAN_SAMPLES) recent.erase(recent.begin());
+        auto sorted = recent;
+        std::sort(sorted.begin(), sorted.end());
+        const double expected = sorted[(sorted.size() - 1) / 2];
+        CHECK(FallbackMedianUs(controller.get()) == expected);
+        CHECK(FallbackMedianUs(controller.get()) == expected);
+    }
 }
 
 void TestResumeDelayRequiresWait()

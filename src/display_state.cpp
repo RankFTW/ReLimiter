@@ -1,5 +1,6 @@
 #include "display_state.h"
 #include "display_resolver.h"
+#include "frame_splitting.h"
 #include "swapchain_manager.h"
 #include "wake_guard.h"
 #include "config.h"
@@ -207,11 +208,7 @@ void QueryVRRFloor() {
     g_floor_interval_us.store(1000000.0 / 30.0, std::memory_order_relaxed);
 }
 
-void PollGSyncState() {
-    NvU32 display_id = DispRes_GetDisplayID();
-    // No display before the first swapchain is expected: the resolver polls
-    // again once it resolves one and reports its own failures.
-    if (display_id == 0) return;
+static void RefreshGSyncState(NvU32 display_id) {
     if (!s_GetVRRInfo) {
         static bool s_warned = false;
         if (!s_warned) {
@@ -266,6 +263,16 @@ void PollGSyncState() {
     // fixed 165 Hz panel shows 1-1-2 refresh judder).
     if (first_poll || new_state != old_state)
         OnGSyncStateChange(new_state);
+}
+
+void PollGSyncState() {
+    // Called once at startup and once for each successful swapchain resolve.
+    // Publish the display exactly once, after its G-Sync state is available
+    // (or the query failed and kept the previously known state).
+    const NvU32 display_id = DispRes_GetDisplayID();
+    if (display_id == 0) return;
+    RefreshGSyncState(display_id);
+    FrameSplitting_DisplayChanged(DispRes_IsResolved() ? display_id : 0);
 }
 
 void OnGSyncStateChange(bool new_gsync_active) {

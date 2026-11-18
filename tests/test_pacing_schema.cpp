@@ -11,6 +11,8 @@
 // same file with the analyzer. The logger and the native PCL snapshot are stubs; no source text is read.
 
 #include "csv_writer.h"
+#include "frame_timeline.h"
+#include "pacing_telemetry.h"
 #include "logger.h"
 #include "pacing_resolver.h"
 #include "pacing_telemetry.h"
@@ -40,6 +42,7 @@
 // ── Stubs for the production dependencies of csv_writer.cpp ──
 
 void Log_Write(LogLevel, const char*, ...) {}
+void PacingTelemetry_CaptureChanged() noexcept {}
 
 const char* Log_GetProcessName()
 {
@@ -364,9 +367,11 @@ void CheckWriterFiles(const Fixture& fixture)
 
     CSV_Init(directory.string().c_str());
     CSV_SetEnabled(true);
-    CSV_PushPacingRow(1, PacingJoinedRow{}, PacingDerivedMetrics{});
+    const auto capture = FrameTimeline_CurrentCaptureState();
+    CSV_PushPacingRow(capture.epoch, 1, PacingJoinedRow{}, PacingDerivedMetrics{});
     for (int value = 0; value <= 255; ++value) {
         PacingCsvEvent event{};
+        event.capture_epoch = capture.epoch;
         event.type = static_cast<PacingCsvEventType>(value);
         event.event_qpc = 1000 + value;
         CSV_PushPacingEvent(event);

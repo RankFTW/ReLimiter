@@ -41,10 +41,14 @@ bool MatchesQueue(ID3D12CommandQueue* queue) noexcept {
         return table[10] == targets[0] && table[14] == targets[1] && table[15] == targets[2];
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
-uint64_t PluginSite() noexcept {
+uint64_t PluginSite(uint64_t caller) noexcept {
     const auto begin = plugin_begin.load(std::memory_order_acquire);
     const auto end = plugin_end.load(std::memory_order_acquire);
     if (!begin || end <= begin) return 0;
+    // A call directly from the selected DLL is already the first plugin frame. A shared
+    // wrapper can be called by several plugin sites (or none) on the very same queue;
+    // its caller PC is never authority to reuse a previous unwind.
+    if (caller >= begin && caller < end) return caller;
     void* stack[12]{};
     const auto count = CaptureStackBackTrace(1, 12, stack, nullptr);
     for (unsigned i = 0; i < count; ++i) {
@@ -93,7 +97,7 @@ void STDMETHODCALLTYPE ObserveExecute(ID3D12CommandQueue* queue, UINT count, ID3
     SetLastError(outgoing);
 }
 template<class Forward> HRESULT ObserveFence(ID3D12CommandQueue* queue, ID3D12Fence* fence,
-    uint64_t value, bool signal, Forward forward) {
+    uint64_t value, bool signal, uint64_t caller, Forward forward) {
     const DWORD incoming = GetLastError();
     RuntimeCallbackGuard callback;
     Depth nested;
@@ -118,7 +122,7 @@ template<class Forward> HRESULT ObserveFence(ID3D12CommandQueue* queue, ID3D12Fe
         StreamlineHandoff_RecordQueueFence(queue, fence, value, signal);
         recorded = true;
         if (StreamlineHandoff_Interested(fence)) {
-            if (MatchesQueue(queue)) call = StreamlineHandoff_BeforeFence(queue, fence, value, PluginSite(), signal);
+            if (MatchesQueue(queue)) call = StreamlineHandoff_BeforeFence(queue, fence, value, PluginSite(caller), signal);
             else StreamlineHandoff_RejectQueueMethods();
         }
     }
@@ -150,7 +154,8 @@ template<class Forward> HRESULT ObserveFence(ID3D12CommandQueue* queue, ID3D12Fe
 }
 HRESULT STDMETHODCALLTYPE ObserveSignal(ID3D12CommandQueue* queue, ID3D12Fence* fence, UINT64 value) {
     Breadcrumb_TrailFirst(first_signal, TrailKind::FirstQueueSignal, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(queue)));
-    return ObserveFence(queue, fence, value, true, [&] { return original_signal.load(std::memory_order_acquire)(queue, fence, value); });
+    return ObserveFence(queue, fence, value, true, reinterpret_cast<uint64_t>(_ReturnAddress()),
+        [&] { return original_signal.load(std::memory_order_acquire)(queue, fence, value); });
 }
 HRESULT STDMETHODCALLTYPE ObserveWait(ID3D12CommandQueue* queue, ID3D12Fence* fence, UINT64 value) {
     Breadcrumb_TrailFirst(first_wait, TrailKind::FirstQueueWait, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(queue)));
@@ -167,7 +172,7 @@ HRESULT STDMETHODCALLTYPE ObserveWait(ID3D12CommandQueue* queue, ID3D12Fence* fe
         g_gpu_queue_probe_source.load(std::memory_order_relaxed) != 0 ? GpuQueueProbe_Now() : 0;
     if (depth == 0) GpuQueueProbe_DependencyWait(queue, fence, value, now);
     const unsigned probe = GpuQueueProbe_WaitBegin(queue, fence, value, now);
-    return ObserveFence(queue, fence, value, false, [&] {
+    return ObserveFence(queue, fence, value, false, reinterpret_cast<uint64_t>(_ReturnAddress()), [&] {
         const HRESULT result = original_wait.load(std::memory_order_acquire)(queue, fence, value);
         const DWORD error = GetLastError(); // the original's, for ObserveFence to hand back
         // fg_present_order (key off: one load and a branch): behind DLSS-G's Wait on the render queue, this unit's

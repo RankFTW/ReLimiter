@@ -1722,7 +1722,7 @@ DWORD WINAPI GateClock(void*) noexcept {
         // presented, a displayed frame, at the time the pairs are counted by. One lock-free push on this thread and
         // one relaxed store per gated Present's return on DLSS-G's presenting thread (GateAfterPresent); nothing on
         // a thread of the game. A flip left out is a gap to the window, not an interval.
-        if (let_go && gate_presented.load(relaxed)) {
+        if (PacingTelemetry_Active() && let_go && gate_presented.load(relaxed)) {
             PacingFlipSample sample;
             sample.flip_qpc = shown;
             sample.cycle_ticks = gate_rule.cycle;

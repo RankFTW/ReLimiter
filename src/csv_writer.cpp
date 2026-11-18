@@ -1,7 +1,7 @@
 #include "csv_writer.h"
 #include "frame_timeline.h"
 #include "logger.h"
-#include "nvapi_marker_census.h"
+#include "pacing_telemetry.h"
 #include "instrumentation_state.h"
 
 #include <Windows.h>
@@ -49,6 +49,22 @@ static uint64_t s_qpc_frequency = 0;
 static uint64_t s_capture_session = 0;
 static uint32_t s_open_capture_epoch = 0;
 static std::array<uint32_t, FRAME_TIMELINE_CAPTURE_CAPACITY> s_opened_captures{};
+
+// A static address survives a timed-out shutdown and concurrent capture-control calls.
+// Clear BEFORE the writer checks the journal/leases/rings, never between its check and wait.
+static std::atomic<DWORD> s_writer_dirty{0};
+enum : DWORD { kWriterData = 1, kWriterControl = 2 };
+static void WakeWriter(DWORD reason = kWriterControl) noexcept
+{
+    const DWORD before = s_writer_dirty.fetch_or(reason, std::memory_order_release);
+    if (!before || (reason == kWriterControl && !(before & kWriterControl))) WakeByAddressSingle(&s_writer_dirty);
+}
+
+// Signal after the lease is released, including a producer racing a capture close.
+// Otherwise the writer could see a live lease, drain the ring, and sleep forever.
+struct NotifyWriterAfterLease {
+    ~NotifyWriterAfterLease() { WakeWriter(kWriterData); }
+};
 
 static void CloseFiles()
 {
@@ -1177,12 +1193,11 @@ static void SelectCapture(uint32_t epoch)
     }
 }
 
-static bool DrainPacingRows()
+static void DrainPacingRows()
 {
-    if (!s_pacing_row_ring) return false;
+    if (!s_pacing_row_ring) return;
     uint64_t read_position = s_pacing_row_read_pos.load(std::memory_order_relaxed);
     const uint64_t write_position = s_pacing_row_write_pos.load(std::memory_order_acquire);
-    bool consumed_rows = false;
 
     while (read_position < write_position) {
         const CapturedRow<PacingCsvRow>& captured =
@@ -1190,17 +1205,14 @@ static bool DrainPacingRows()
         SelectCapture(captured.capture_epoch);
         WritePacingRow(captured.row);
         ++read_position;
-        consumed_rows = true;
     }
     s_pacing_row_read_pos.store(read_position, std::memory_order_release);
-    return consumed_rows;
 }
 
-static bool DrainPacingEvents()
+static void DrainPacingEvents()
 {
     uint64_t read_position = s_pacing_event_read_pos.load(std::memory_order_relaxed);
     const uint64_t write_position = s_pacing_event_write_pos.load(std::memory_order_acquire);
-    bool consumed_events = false;
 
     while (read_position < write_position) {
         const CapturedRow<PacingCsvEvent>& captured =
@@ -1208,10 +1220,8 @@ static bool DrainPacingEvents()
         SelectCapture(captured.capture_epoch);
         WritePacingEvent(captured.row);
         ++read_position;
-        consumed_events = true;
     }
     s_pacing_event_read_pos.store(read_position, std::memory_order_release);
-    return consumed_events;
 }
 
 static void FlushFiles()
@@ -1220,54 +1230,21 @@ static void FlushFiles()
     if (s_pacing_events_file) fflush(s_pacing_events_file);
 }
 
-// Process-lifetime NvAPI marker census, logged (debug level) at most every 5 s
-// when a count changed.
-using MarkerCensusCounts = std::array<uint64_t, NvApiMarkerCensus::Types * 4>;
-
-static void LogNvApiMarkerCensus(int64_t now_qpc, int64_t* last_qpc, MarkerCensusCounts* counts)
-{
-    if (*last_qpc != 0 && now_qpc - *last_qpc < static_cast<int64_t>(s_qpc_frequency) * 5) return;
-    *last_qpc = now_qpc;
-    for (uint32_t type = 0; type < NvApiMarkerCensus::Types; ++type) {
-        for (uint32_t stage = 0; stage < 4; ++stage) {
-            NvApiMarkerCensus::Snapshot snapshot;
-            uint64_t& logged_count = (*counts)[type * 4 + stage];
-            if (!g_nvapi_marker_census.Read(type, static_cast<MarkerCensusStage>(stage), &snapshot) ||
-                snapshot.count == logged_count) {
-                continue;
-            }
-            logged_count = snapshot.count;
-            const auto& first = snapshot.first;
-            const auto& last = snapshot.last;
-            LOG_DEBUG("NvAPI census type=%u stage=%u count=%llu sample_misses=%llu "
-                "first_frame=%llu first_qpc=%lld first_caller=0x%llx first_device=0x%llx "
-                "last_frame=%llu last_qpc=%lld caller=0x%llx device=0x%llx thread=%u producer=%u reason=%u selected=%u frequency=%llu",
-                type, stage, snapshot.count, snapshot.misses, first.frame, first.qpc, first.caller, first.device,
-                last.frame, last.qpc, last.caller, last.device, last.thread, last.producer, last.reason,
-                last.selected, s_qpc_frequency);
-        }
-    }
-}
-
 static void WriterThreadImpl()
 {
     uint32_t retired_epoch = FrameTimeline_RetiredCaptureEpoch();
     uint32_t observed_epoch = retired_epoch;
     uint32_t closed_through_epoch = retired_epoch;
     uint64_t reported_rejections = FrameTimeline_RejectedCaptureTransitions();
-    int64_t census_last_qpc = 0;
-    MarkerCensusCounts census_counts{};
 
     for (;;) {
+        s_writer_dirty.exchange(0, std::memory_order_acquire);
         const uint64_t rejected = FrameTimeline_RejectedCaptureTransitions();
         if (rejected != reported_rejections) {
             LOG_WARN("CSV: rejected %llu capture transitions (journal full, stopped, or epoch exhausted)",
                 static_cast<unsigned long long>(rejected - reported_rejections));
             reported_rejections = rejected;
         }
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
-        LogNvApiMarkerCensus(now.QuadPart, &census_last_qpc, &census_counts);
         FrameTimelineCaptureState checkpoint{};
         const bool quiescent = FrameTimeline_TryCaptureCheckpoint(&checkpoint);
 
@@ -1283,8 +1260,8 @@ static void WriterThreadImpl()
         // Every accepted row of a closed checkpoint epoch is already published.
         // Drain AFTER taking that checkpoint, including the entire ring prefix.
         // Epochs may interleave: never stop at (or discard) a newer epoch's row.
-        bool consumed = DrainPacingRows();
-        consumed = DrainPacingEvents() || consumed;
+        DrainPacingRows();
+        DrainPacingEvents();
         if (quiescent) {
             closed_through_epoch = checkpoint.enabled
                 ? checkpoint.epoch - 1 : checkpoint.epoch;
@@ -1308,7 +1285,13 @@ static void WriterThreadImpl()
                 break;
             }
         }
-        if (!consumed) Sleep(50); // bounded retry; no producer waits on the worker
+        DWORD clean = 0;
+        WaitOnAddress(&s_writer_dirty, &clean, sizeof(clean), INFINITE);
+        // Batch data for at most the old 50 ms flush interval. A capture control
+        // change (including shutdown) interrupts this wait; empty rings never arm it.
+        DWORD data = kWriterData;
+        if (s_writer_dirty.load(std::memory_order_relaxed) == data)
+            WaitOnAddress(&s_writer_dirty, &data, sizeof(data), 50);
     }
 }
 
@@ -1375,6 +1358,8 @@ bool CSV_Shutdown()
     // Stop is sticky: a racing UI enable/rotation cannot reopen admission.
     FrameTimeline_StopCapture();
     s_stop_requested.store(true, std::memory_order_release);
+    PacingTelemetry_CaptureChanged();
+    WakeWriter();
     if (s_writer_thread) {
         DWORD wait_status = WaitForSingleObject(s_writer_thread, 2500);
         if (wait_status != WAIT_OBJECT_0) {
@@ -1410,11 +1395,12 @@ bool CSV_Shutdown()
 
 // ── Producers (pacing telemetry worker) ──
 
-void CSV_PushPacingRow(uint64_t sequence, const PacingJoinedRow& row, const PacingDerivedMetrics& derived)
+void CSV_PushPacingRow(uint32_t capture_epoch, uint64_t sequence, const PacingJoinedRow& row, const PacingDerivedMetrics& derived)
 {
+    const NotifyWriterAfterLease notify;
     const FrameTimelineCaptureLease lease;
     const FrameTimelineCaptureState capture = lease.capture;
-    if (!capture.enabled) return;
+    if (!capture.enabled || capture.epoch != capture_epoch) return;
     if (!s_pacing_row_ring) {
         s_pacing_row_dropped_rows.fetch_add(1, std::memory_order_relaxed);
         return;
@@ -1451,9 +1437,10 @@ void CSV_PushPacingRow(uint64_t sequence, const PacingJoinedRow& row, const Paci
 
 void CSV_PushPacingEvent(const PacingCsvEvent& event)
 {
+    const NotifyWriterAfterLease notify;
     const FrameTimelineCaptureLease lease;
     const FrameTimelineCaptureState capture = lease.capture;
-    if (!capture.enabled) return;
+    if (!capture.enabled || capture.epoch != event.capture_epoch) return;
 
     const uint64_t sequence =
         s_next_pacing_event_sequence.fetch_add(1, std::memory_order_relaxed);
@@ -1481,6 +1468,16 @@ void CSV_PushPacingEvent(const PacingCsvEvent& event)
 void CSV_SetEnabled(bool enabled)
 {
     FrameTimeline_SetEnabled(enabled);
+    PacingTelemetry_CaptureChanged();
+    WakeWriter();
+}
+
+FrameTimelineCaptureState CSV_StartCapture()
+{
+    const auto capture = FrameTimeline_StartCapture();
+    PacingTelemetry_CaptureChanged();
+    WakeWriter();
+    return capture;
 }
 
 bool CSV_IsEnabled()

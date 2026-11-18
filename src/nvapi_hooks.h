@@ -15,15 +15,8 @@ extern PFN_NvAPI_D3D_SetLatencyMarker  s_orig_set_latency_marker;
 // feedback-device publication the result belongs to (SleepStatusToken), bit 32 =
 // bUseGameSleep, low 32 bits = sleepIntervalUs. g_sleep_status_newest is the
 // newest successful NvAPI_D3D_GetSleepStatus result (the game's own call or the
-// poll); g_sleep_status_at_sleep_return is the newest one when the presenting
-// device's Reflex Sleep last returned, taken by the next source record (the
-// scheduler owner exchanges it to 0), so a frame without a Sleep has none.
-// g_sleep_status_token is the current publication's token, set where the
-// publication changes (before the words are cleared); a result stores the token
-// captured before its driver query, and is rejected at publication to
-// g_sleep_status_at_sleep_return and at consumption when it does not equal the
-// current one, so a query that straddled a publication change never answers for
-// the new publication.
+// poll). Its device token is validated at Sleep return; the pending source-row
+// result (PacingPendingSleep) is invalidated on every device and readout change.
 constexpr uint32_t kSleepStatusTokenMask = 0x7FFFFFu; // bits 40..62 of the word
 constexpr uint64_t SleepStatusWord(uint32_t interval_us, bool use_game_sleep, uint32_t token = 0) noexcept {
 	return (uint64_t{1} << 63) | ((uint64_t{token} & kSleepStatusTokenMask) << 40) |
@@ -34,7 +27,6 @@ constexpr uint32_t SleepStatusToken(uint64_t word) noexcept {
 }
 inline std::atomic<uint32_t> g_sleep_status_token{0};
 inline std::atomic<uint64_t> g_sleep_status_newest{0};
-inline std::atomic<uint64_t> g_sleep_status_at_sleep_return{0};
 
 // OSD readouts, EMA-smoothed (µs). CPU latency: SIM_START → RENDERSUBMIT_END
 // of the same frame, written by the marker hooks. Pacer latency: time spent in

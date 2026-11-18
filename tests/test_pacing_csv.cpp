@@ -9,6 +9,7 @@
 // worker that produces these records is not exercised here.
 
 #include "csv_writer.h"
+#include "pacing_telemetry.h"
 #include "instrumentation_state.h"
 #include "logger.h"
 
@@ -28,6 +29,7 @@
 // ── Stubs for the production dependencies of csv_writer.cpp ──
 
 void Log_Write(LogLevel, const char*, ...) {}
+void PacingTelemetry_CaptureChanged() noexcept {}
 
 const char* Log_GetProcessName()
 {
@@ -926,20 +928,25 @@ int main()
     g_pcl_snapshot.overflowed_present_count = 8;
 
     CSV_Init(directory.string().c_str());
-    CSV_SetEnabled(true);
-    CSV_PushPacingRow(1, DisplayRow(true), PacingDerivedMetrics{});
+    const auto capture = CSV_StartCapture();
+    Check(capture.enabled && capture.epoch != 0, "explicit capture start activates the writer");
+    CSV_PushPacingRow(capture.epoch, 1, DisplayRow(true), PacingDerivedMetrics{});
     FlipConfig_Record(500, 8333);  // metering SetFlipConfig calls before and after the rows' present starts
     FlipConfig_Record(1500, 0);    // one without a batch time
     FlipConfig_Record(5000, 7000); // a later one no row sees
-    CSV_PushPacingRow(2, DisplayRow(false), PacingDerivedMetrics{});
-    CSV_PushPacingRow(3, UnjoinedPresentRow(), PacingDerivedMetrics{});
-    CSV_PushPacingRow(4, UnifiedEmptyRuleRow(), PacingDerivedMetrics{});
-    CSV_PushPacingRow(5, UnifiedZeroBudgetRow(), PacingDerivedMetrics{});
-    CSV_PushPacingRow(6, UnifiedDebtRow(), PacingDerivedMetrics{});
-    CSV_PushPacingRow(7, UnorderedPlanRow(), PacingDerivedMetrics{});
-    CSV_PushPacingRow(8, ObservedStartLimitRow(), PacingDerivedMetrics{});
+    CSV_PushPacingRow(capture.epoch, 2, DisplayRow(false), PacingDerivedMetrics{});
+    CSV_PushPacingRow(capture.epoch, 3, UnjoinedPresentRow(), PacingDerivedMetrics{});
+    CSV_PushPacingRow(capture.epoch, 4, UnifiedEmptyRuleRow(), PacingDerivedMetrics{});
+    CSV_PushPacingRow(capture.epoch, 5, UnifiedZeroBudgetRow(), PacingDerivedMetrics{});
+    CSV_PushPacingRow(capture.epoch, 6, UnifiedDebtRow(), PacingDerivedMetrics{});
+    CSV_PushPacingRow(capture.epoch, 7, UnorderedPlanRow(), PacingDerivedMetrics{});
+    CSV_PushPacingRow(capture.epoch, 8, ObservedStartLimitRow(), PacingDerivedMetrics{});
+    // A batch still running from another epoch must not contaminate the active file.
+    CSV_PushPacingRow(capture.epoch - 1, 9, UnjoinedPresentRow(), PacingDerivedMetrics{});
 
     PacingCsvEvent status{};
+    CSV_PushPacingEvent(status); // no matching capture epoch: not admitted
+    status.capture_epoch = capture.epoch;
     status.type = PacingCsvEventType::PclStatus;
     status.event_qpc = 5000;
     status.has_previous = true;
@@ -949,18 +956,21 @@ int main()
     CSV_PushPacingEvent(status);
 
     PacingCsvEvent drops{};
+    drops.capture_epoch = capture.epoch;
     drops.type = PacingCsvEventType::QueueDrops;
     drops.event_qpc = 6000;
     drops.pcl_loss = { 1, 2, 3, 4 };
     CSV_PushPacingEvent(drops);
 
     PacingCsvEvent first_observation{};
+    first_observation.capture_epoch = capture.epoch;
     first_observation.type = PacingCsvEventType::PclStatus;
     first_observation.event_qpc = 7000;
     first_observation.value = 7; // EventLoss
     CSV_PushPacingEvent(first_observation);
 
     PacingCsvEvent grid_epoch{};
+    grid_epoch.capture_epoch = capture.epoch;
     grid_epoch.type = PacingCsvEventType::GridEpoch;
     grid_epoch.event_qpc = 8000;
     grid_epoch.has_previous = true;
@@ -970,6 +980,7 @@ int main()
     CSV_PushPacingEvent(grid_epoch);
 
     PacingCsvEvent pipeline{};
+    pipeline.capture_epoch = capture.epoch;
     pipeline.type = PacingCsvEventType::PipelineChange;
     pipeline.event_qpc = 9000;
     pipeline.value = 3;  // PacingRung::GpuQueueWait

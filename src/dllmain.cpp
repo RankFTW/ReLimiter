@@ -63,7 +63,6 @@ static bool    s_minhook_initialised = false;
 static bool    s_sleep_timer_initialised = false;
 static bool    s_csv_initialised = false;
 static bool    s_display_poll_started = false;
-static bool    s_hw_monitor_started = false;
 static bool    s_blackout_started = false;
 static bool    s_imgui_available = false;
 static bool    s_fail_inert = false;
@@ -698,8 +697,6 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
             batch.Apply();
         }
         ReportFlipMeteringBlock();
-        HWMonitor_Init();
-        s_hw_monitor_started = true;
         Blackout_Init();
         s_blackout_started = true;
 
@@ -756,7 +753,6 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
 static void ResetInitializationMilestones() noexcept {
     s_imgui_available = false;
     s_blackout_started = false;
-    s_hw_monitor_started = false;
     s_display_poll_started = false;
     s_csv_initialised = false;
     s_sleep_timer_initialised = false;
@@ -791,9 +787,7 @@ static bool StopOwnedProducers() {
     if (s_blackout_started)
         auxiliary_workers_stopped =
             Blackout_Shutdown() && auxiliary_workers_stopped;
-    if (s_hw_monitor_started)
-        auxiliary_workers_stopped =
-            HWMonitor_Shutdown() && auxiliary_workers_stopped;
+    auxiliary_workers_stopped = HWMonitor_Shutdown() && auxiliary_workers_stopped;
     auxiliary_workers_stopped =
         StopVBlankThread() && auxiliary_workers_stopped;
     if (s_display_poll_started)
@@ -825,6 +819,7 @@ static MH_STATUS DisableHooksForShutdown() {
 
 static bool RollbackInitialization(HMODULE addon_module) {
     RuntimeLifecycle_BeginShutdown();
+    if (s_imgui_available) StopOSD();
     if (s_addon_registered) {
         reshade::unregister_addon(addon_module);
         s_addon_registered = false;
@@ -949,6 +944,7 @@ static void AddonUninitImpl(HMODULE addon_module) {
     LOG_INFO("AddonUninit called");
 
     RuntimeLifecycle_BeginShutdown();
+    if (s_imgui_available) StopOSD();
     if (s_addon_registered) {
         reshade::unregister_addon(addon_module);
         s_addon_registered = false;

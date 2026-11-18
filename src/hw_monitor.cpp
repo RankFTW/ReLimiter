@@ -1,11 +1,7 @@
 #include "hw_monitor.h"
 #include "logger.h"
 #include <Windows.h>
-#include <Psapi.h>
-#include <powrprof.h>
-#pragma comment(lib, "PowrProf.lib")
 #include <cstdint>
-#include <cstring>
 #include <atomic>
 
 // ── NVAPI types needed for GPU queries ──
@@ -80,28 +76,7 @@ using PFN_NvAPI_EnumPhysicalGPUs     = NvAPI_Status(__cdecl*)(NvPhysicalGpuHandl
 using PFN_NvAPI_GPU_GetThermalSettings       = NvAPI_Status(__cdecl*)(NvPhysicalGpuHandle, NvU32, HW_NV_GPU_THERMAL_SETTINGS*);
 using PFN_NvAPI_GPU_GetAllClockFrequencies   = NvAPI_Status(__cdecl*)(NvPhysicalGpuHandle, HW_NV_GPU_CLOCK_FREQUENCIES*);
 using PFN_NvAPI_GPU_GetDynamicPstatesInfoEx  = NvAPI_Status(__cdecl*)(NvPhysicalGpuHandle, HW_NV_GPU_DYNAMIC_PSTATES_INFO_EX*);
-using PFN_NvAPI_GPU_GetTachReading           = NvAPI_Status(__cdecl*)(NvPhysicalGpuHandle, NvU32*);
 using PFN_NvAPI_GPU_GetMemoryInfoEx          = NvAPI_Status(__cdecl*)(NvPhysicalGpuHandle, HW_NV_GPU_MEMORY_INFO_EX*);
-
-static constexpr int HW_NVAPI_MAX_COOLERS = 20;
-struct HW_NV_GPU_COOLER_SETTINGS_ENTRY {
-    NvU32 type;
-    NvU32 controller;
-    NvU32 defaultMinLevel;
-    NvU32 defaultMaxLevel;
-    NvU32 currentLevel;
-    NvU32 defaultPolicy;
-    NvU32 currentPolicy;
-    NvU32 target;
-    NvU32 controlType;
-    NvU32 active;
-};
-struct HW_NV_GPU_COOLER_SETTINGS {
-    NvU32 version;
-    NvU32 count;
-    HW_NV_GPU_COOLER_SETTINGS_ENTRY cooler[HW_NVAPI_MAX_COOLERS];
-};
-using PFN_NvAPI_GPU_GetCoolerSettings = NvAPI_Status(__cdecl*)(NvPhysicalGpuHandle, NvU32, HW_NV_GPU_COOLER_SETTINGS*);
 
 // ── Resolved function pointers ──
 static PFN_NvAPI_Initialize                  s_NvAPI_Initialize = nullptr;
@@ -109,9 +84,7 @@ static PFN_NvAPI_EnumPhysicalGPUs            s_NvAPI_EnumPhysicalGPUs = nullptr;
 static PFN_NvAPI_GPU_GetThermalSettings      s_GetThermalSettings = nullptr;
 static PFN_NvAPI_GPU_GetAllClockFrequencies  s_GetAllClockFrequencies = nullptr;
 static PFN_NvAPI_GPU_GetDynamicPstatesInfoEx s_GetDynamicPstatesInfoEx = nullptr;
-static PFN_NvAPI_GPU_GetTachReading          s_GetTachReading = nullptr;
 static PFN_NvAPI_GPU_GetMemoryInfoEx         s_GetMemoryInfoEx = nullptr;
-static PFN_NvAPI_GPU_GetCoolerSettings       s_GetCoolerSettings = nullptr;
 
 // ── State ──
 static bool s_nvapi_available = false;
@@ -126,13 +99,9 @@ struct AtomicHWMonitorData {
     std::atomic<int> gpu_clock_mhz{-1};
     std::atomic<int> gpu_mem_clock_mhz{-1};
     std::atomic<int> gpu_usage_pct{-1};
-    std::atomic<int> gpu_fan_rpm{-1};
-    std::atomic<int> gpu_fan_pct{-1};
-    std::atomic<int> gpu_power_pct{-1};
     std::atomic<int64_t> vram_used_mb{-1};
     std::atomic<int64_t> vram_total_mb{-1};
     std::atomic<int> cpu_usage_pct{-1};
-    std::atomic<int> cpu_clock_mhz{-1};
     std::atomic<int64_t> ram_used_mb{-1};
     std::atomic<int64_t> ram_total_mb{-1};
 };
@@ -145,20 +114,18 @@ static void PublishSnapshot(const HWMonitorData& data) noexcept {
     s_snapshot.gpu_clock_mhz.store(data.gpu_clock_mhz, std::memory_order_relaxed);
     s_snapshot.gpu_mem_clock_mhz.store(data.gpu_mem_clock_mhz, std::memory_order_relaxed);
     s_snapshot.gpu_usage_pct.store(data.gpu_usage_pct, std::memory_order_relaxed);
-    s_snapshot.gpu_fan_rpm.store(data.gpu_fan_rpm, std::memory_order_relaxed);
-    s_snapshot.gpu_fan_pct.store(data.gpu_fan_pct, std::memory_order_relaxed);
-    s_snapshot.gpu_power_pct.store(data.gpu_power_pct, std::memory_order_relaxed);
     s_snapshot.vram_used_mb.store(data.vram_used_mb, std::memory_order_relaxed);
     s_snapshot.vram_total_mb.store(data.vram_total_mb, std::memory_order_relaxed);
     s_snapshot.cpu_usage_pct.store(data.cpu_usage_pct, std::memory_order_relaxed);
-    s_snapshot.cpu_clock_mhz.store(data.cpu_clock_mhz, std::memory_order_relaxed);
     s_snapshot.ram_used_mb.store(data.ram_used_mb, std::memory_order_relaxed);
     s_snapshot.ram_total_mb.store(data.ram_total_mb, std::memory_order_relaxed);
     s_snapshot.sequence.store(write_sequence + 1, std::memory_order_release);
 }
 
 // Background poll thread
-static std::atomic<bool> s_running{false};
+static std::atomic<unsigned> s_sensors{0};
+static HANDLE s_wake = nullptr; // auto-reset: a demand change or shutdown
+static constexpr unsigned kStop = ~0u;
 static HANDLE s_poll_thread = nullptr;
 
 // ── CPU usage tracking (thread-local to poll thread) ──
@@ -173,9 +140,7 @@ static constexpr NvU32 ID_NvAPI_EnumPhysicalGPUs            = 0xE5AC921F;
 static constexpr NvU32 ID_NvAPI_GPU_GetThermalSettings      = 0xE3640A56;
 static constexpr NvU32 ID_NvAPI_GPU_GetAllClockFrequencies  = 0xDCB616C3;
 static constexpr NvU32 ID_NvAPI_GPU_GetDynamicPstatesInfoEx = 0x60DED2ED;
-static constexpr NvU32 ID_NvAPI_GPU_GetTachReading          = 0x5F608315;
 static constexpr NvU32 ID_NvAPI_GPU_GetMemoryInfoEx         = 0xC0599498;
-static constexpr NvU32 ID_NvAPI_GPU_GetCoolerSettings       = 0xDA141340;
 
 static bool InitNVAPI() {
 #ifdef _WIN64
@@ -208,9 +173,7 @@ static bool InitNVAPI() {
     s_GetThermalSettings         = reinterpret_cast<PFN_NvAPI_GPU_GetThermalSettings>(QI(ID_NvAPI_GPU_GetThermalSettings));
     s_GetAllClockFrequencies     = reinterpret_cast<PFN_NvAPI_GPU_GetAllClockFrequencies>(QI(ID_NvAPI_GPU_GetAllClockFrequencies));
     s_GetDynamicPstatesInfoEx    = reinterpret_cast<PFN_NvAPI_GPU_GetDynamicPstatesInfoEx>(QI(ID_NvAPI_GPU_GetDynamicPstatesInfoEx));
-    s_GetTachReading             = reinterpret_cast<PFN_NvAPI_GPU_GetTachReading>(QI(ID_NvAPI_GPU_GetTachReading));
     s_GetMemoryInfoEx            = reinterpret_cast<PFN_NvAPI_GPU_GetMemoryInfoEx>(QI(ID_NvAPI_GPU_GetMemoryInfoEx));
-    s_GetCoolerSettings          = reinterpret_cast<PFN_NvAPI_GPU_GetCoolerSettings>(QI(ID_NvAPI_GPU_GetCoolerSettings));
 
     if (!s_NvAPI_Initialize || !s_NvAPI_EnumPhysicalGPUs) {
         LOG_WARN("HWMonitor: core NVAPI functions not resolved");
@@ -236,10 +199,10 @@ static bool InitNVAPI() {
     return true;
 }
 
-static void PollGPU(HWMonitorData& d) {
+static void PollGPU(HWMonitorData& d, unsigned sensors) {
     if (!s_nvapi_available || !s_gpu_handle) return;
 
-    if (s_GetThermalSettings) {
+    if ((sensors & HWSensorTemp) && s_GetThermalSettings) {
         HW_NV_GPU_THERMAL_SETTINGS thermal = {};
         thermal.version = HW_MAKE_VER(HW_NV_GPU_THERMAL_SETTINGS, 2);
         if (s_GetThermalSettings(s_gpu_handle, 15, &thermal) == NVAPI_OK_LOCAL) {
@@ -254,7 +217,7 @@ static void PollGPU(HWMonitorData& d) {
         }
     }
 
-    if (s_GetAllClockFrequencies) {
+    if ((sensors & HWSensorClock) && s_GetAllClockFrequencies) {
         HW_NV_GPU_CLOCK_FREQUENCIES clocks = {};
         clocks.version = HW_MAKE_VER(HW_NV_GPU_CLOCK_FREQUENCIES, 3);
         if (s_GetAllClockFrequencies(s_gpu_handle, &clocks) == NVAPI_OK_LOCAL) {
@@ -265,7 +228,7 @@ static void PollGPU(HWMonitorData& d) {
         }
     }
 
-    if (s_GetDynamicPstatesInfoEx) {
+    if ((sensors & HWSensorGpuUsage) && s_GetDynamicPstatesInfoEx) {
         HW_NV_GPU_DYNAMIC_PSTATES_INFO_EX pstates = {};
         pstates.version = HW_MAKE_VER(HW_NV_GPU_DYNAMIC_PSTATES_INFO_EX, 1);
         if (s_GetDynamicPstatesInfoEx(s_gpu_handle, &pstates) == NVAPI_OK_LOCAL) {
@@ -274,19 +237,7 @@ static void PollGPU(HWMonitorData& d) {
         }
     }
 
-    if (s_GetCoolerSettings) {
-        HW_NV_GPU_COOLER_SETTINGS cooler = {};
-        cooler.version = HW_MAKE_VER(HW_NV_GPU_COOLER_SETTINGS, 1);
-        if (s_GetCoolerSettings(s_gpu_handle, 0, &cooler) == NVAPI_OK_LOCAL && cooler.count > 0)
-            d.gpu_fan_pct = static_cast<int>(cooler.cooler[0].currentLevel);
-    }
-    if (s_GetTachReading) {
-        NvU32 rpm = 0;
-        if (s_GetTachReading(s_gpu_handle, &rpm) == NVAPI_OK_LOCAL)
-            d.gpu_fan_rpm = static_cast<int>(rpm);
-    }
-
-    if (s_GetMemoryInfoEx) {
+    if ((sensors & HWSensorVram) && s_GetMemoryInfoEx) {
         HW_NV_GPU_MEMORY_INFO_EX memInfo = {};
         memInfo.version = HW_MAKE_VER(HW_NV_GPU_MEMORY_INFO_EX, 1);
         if (s_GetMemoryInfoEx(s_gpu_handle, &memInfo) == NVAPI_OK_LOCAL) {
@@ -320,38 +271,6 @@ static void PollCPU(HWMonitorData& d) {
         s_prev_user = user;
         s_cpu_first_sample = false;
     }
-
-    {
-        typedef struct {
-            ULONG Number;
-            ULONG MaxMhz;
-            ULONG CurrentMhz;
-            ULONG MhzLimit;
-            ULONG MaxIdleState;
-            ULONG CurrentIdleState;
-        } PROCESSOR_POWER_INFORMATION;
-
-        SYSTEM_INFO si;
-        GetSystemInfo(&si);
-        int nproc = static_cast<int>(si.dwNumberOfProcessors);
-        if (nproc > 256) nproc = 256;
-
-        PROCESSOR_POWER_INFORMATION ppi[256] = {};
-        ULONG buf_size = static_cast<ULONG>(nproc * sizeof(PROCESSOR_POWER_INFORMATION));
-
-        LONG status = CallNtPowerInformation(
-            static_cast<POWER_INFORMATION_LEVEL>(11),
-            nullptr, 0, ppi, buf_size);
-        if (status == 0) {
-            ULONG max_mhz = 0;
-            for (int i = 0; i < nproc; i++) {
-                if (ppi[i].CurrentMhz > max_mhz)
-                    max_mhz = ppi[i].CurrentMhz;
-            }
-            if (max_mhz > 0)
-                d.cpu_clock_mhz = static_cast<int>(max_mhz);
-        }
-    }
 }
 
 static void PollRAM(HWMonitorData& d) {
@@ -363,12 +282,12 @@ static void PollRAM(HWMonitorData& d) {
     }
 }
 
-static bool PollSensors(HWMonitorData* data) noexcept {
-    if (!data) return false;
+static bool PollSensors(HWMonitorData* data, unsigned sensors) noexcept {
     __try {
-        PollGPU(*data);
-        PollCPU(*data);
-        PollRAM(*data);
+        PollGPU(*data, sensors);
+        if (sensors & HWSensorCpuUsage) PollCPU(*data);
+        else s_cpu_first_sample = true;
+        if (sensors & HWSensorRam) PollRAM(*data);
         return true;
     }
     __except(EXCEPTION_EXECUTE_HANDLER) {
@@ -376,64 +295,57 @@ static bool PollSensors(HWMonitorData* data) noexcept {
     }
 }
 
-// ── Background poll thread ──
-// All sensor queries run here, never on the render/present thread.
-// Results are written to s_write_data, then atomically published via
-// pointer swap. The OSD reads s_read_data which is always a complete,
-// consistent snapshot — no partial updates, no locks, no stalls.
-static DWORD WINAPI PollThreadProc(LPVOID) noexcept {
-    while (s_running.load(std::memory_order_acquire)) {
-        // Start from a clean slate each poll. Opaque driver faults are contained
-        // at PollSensors and never escape the worker entry point.
-        HWMonitorData fresh = {};
-        if (!PollSensors(&fresh)) {
-            OutputDebugStringA("ReLimiter: hardware monitor poll rejected a driver fault.\n");
-            s_running.store(false, std::memory_order_release);
-            break;
-        }
-
-        PublishSnapshot(fresh);
-
-        // Sleep 1 second between polls
-        for (int i = 0; i < 100 && s_running.load(std::memory_order_relaxed); i++)
-            Sleep(10);  // 10ms chunks so shutdown is responsive
-    }
-    return 0;
-}
-
 static bool SafeInitNVAPI() noexcept {
     __try { return InitNVAPI(); }
     __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-// ── Public API ──
+static DWORD WINAPI PollThreadProc(LPVOID) noexcept {
+    bool gpu_probed = false;
+    for (;;) {
+        const unsigned sensors = s_sensors.load(std::memory_order_acquire);
+        if (sensors == kStop) break;
+        if (sensors == 0) {
+            s_cpu_first_sample = true;
+            PublishSnapshot({});
+            if (WaitForSingleObject(s_wake, INFINITE) != WAIT_OBJECT_0) break;
+            continue;
+        }
+        if (!gpu_probed && (sensors & (HWSensorTemp | HWSensorClock | HWSensorGpuUsage | HWSensorVram))) {
+            s_nvapi_available = SafeInitNVAPI();
+            gpu_probed = true;
+        }
+        HWMonitorData fresh{};
+        if (!PollSensors(&fresh, sensors)) {
+            OutputDebugStringA("ReLimiter: hardware monitor poll rejected a driver fault.\n");
+            break;
+        }
+        PublishSnapshot(fresh);
+        if (WaitForSingleObject(s_wake, 1000) == WAIT_FAILED) break;
+    }
+    return 0;
+}
 
-void HWMonitor_Init() {
-    s_nvapi_available = SafeInitNVAPI();
-
-    // Do one synchronous poll so data is available immediately
-    HWMonitorData initial = {};
-    PollSensors(&initial);
-    PublishSnapshot(initial);
-
-    // Start background poll thread
-    bool expected = false;
-    if (!s_running.compare_exchange_strong(
-            expected, true, std::memory_order_acq_rel)) return;
-    s_poll_thread = CreateThread(
-        nullptr, 0, PollThreadProc, nullptr, 0, nullptr);
-    if (!s_poll_thread) {
-        s_running.store(false, std::memory_order_release);
-        LOG_WARN("HWMonitor: failed to start poll thread (%lu)", GetLastError());
+void HWMonitor_SetSensors(unsigned sensors) {
+    if (s_sensors.exchange(sensors, std::memory_order_acq_rel) == sensors) return;
+    if (s_poll_thread) {
+        SetEvent(s_wake);
         return;
     }
-
-    LOG_INFO("HWMonitor: initialized (NVAPI=%s), poll thread started", s_nvapi_available ? "yes" : "no");
+    if (!sensors) return;
+    s_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (s_wake) s_poll_thread = CreateThread(nullptr, 0, PollThreadProc, nullptr, 0, nullptr);
+    if (!s_poll_thread) {
+        LOG_WARN("HWMonitor: failed to start poll worker (%lu)", GetLastError());
+        if (s_wake) CloseHandle(s_wake);
+        s_wake = nullptr;
+    }
 }
 
 bool HWMonitor_Shutdown() {
-    s_running.store(false, std::memory_order_release);
+    s_sensors.store(kStop, std::memory_order_release);
     if (s_poll_thread) {
+        SetEvent(s_wake);
         if (WaitForSingleObject(s_poll_thread, 2500) != WAIT_OBJECT_0) {
             OutputDebugStringA(
                 "ReLimiter: hardware monitor worker did not stop; state retained.\n");
@@ -441,10 +353,15 @@ bool HWMonitor_Shutdown() {
         }
         CloseHandle(s_poll_thread);
         s_poll_thread = nullptr;
+        CloseHandle(s_wake);
+        s_wake = nullptr;
+        LOG_INFO("HWMonitor: shutdown");
     }
     s_nvapi_available = false;
     s_gpu_handle = nullptr;
-    LOG_INFO("HWMonitor: shutdown");
+    s_cpu_first_sample = true;
+    s_sensors.store(0, std::memory_order_relaxed);
+    PublishSnapshot({});
     return true;
 }
 
@@ -459,13 +376,9 @@ HWMonitorData HWMonitor_GetData() {
         data.gpu_clock_mhz = s_snapshot.gpu_clock_mhz.load(std::memory_order_relaxed);
         data.gpu_mem_clock_mhz = s_snapshot.gpu_mem_clock_mhz.load(std::memory_order_relaxed);
         data.gpu_usage_pct = s_snapshot.gpu_usage_pct.load(std::memory_order_relaxed);
-        data.gpu_fan_rpm = s_snapshot.gpu_fan_rpm.load(std::memory_order_relaxed);
-        data.gpu_fan_pct = s_snapshot.gpu_fan_pct.load(std::memory_order_relaxed);
-        data.gpu_power_pct = s_snapshot.gpu_power_pct.load(std::memory_order_relaxed);
         data.vram_used_mb = s_snapshot.vram_used_mb.load(std::memory_order_relaxed);
         data.vram_total_mb = s_snapshot.vram_total_mb.load(std::memory_order_relaxed);
         data.cpu_usage_pct = s_snapshot.cpu_usage_pct.load(std::memory_order_relaxed);
-        data.cpu_clock_mhz = s_snapshot.cpu_clock_mhz.load(std::memory_order_relaxed);
         data.ram_used_mb = s_snapshot.ram_used_mb.load(std::memory_order_relaxed);
         data.ram_total_mb = s_snapshot.ram_total_mb.load(std::memory_order_relaxed);
 

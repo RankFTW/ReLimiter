@@ -120,6 +120,7 @@ QueueSlot* FindOrRequest(ID3D12CommandQueue* queue, uint64_t expected_device=0) 
 // Pacing telemetry: one record per published
 // sample. ready_qpc is the mapped GPU completion query, 0 when not valid.
 void PushPacingReady(const SampleSlot& slot) noexcept {
+    if (!PacingTelemetry_Active()) return;
     const auto& sample = slot.sample;
     const bool valid = sample.status == GpuReadinessStatus::Completed &&
         sample.timestamp.status == GpuTimestampStatus::Valid;
@@ -190,10 +191,11 @@ void FinishScope(bool valid) noexcept {
     s_scope = {};
     s_scope.depth = depth;
 }
-void ReclaimRetiredQueues() noexcept {
+bool ReclaimRetiredQueues() noexcept {
+    bool retry=false;
     for(auto& queue:s_queues) {
         if(!queue.retired.load(std::memory_order_acquire) || queue.faulted.load() || queue.uncertain_submission.load())continue;
-        if(!TryAcquireSRWLockExclusive(&s_registration))continue;
+        if(!TryAcquireSRWLockExclusive(&s_registration)) {retry=true;continue;}
         const auto state=queue.state.load(std::memory_order_acquire);
         bool idle=state!=QueueState::Empty && state!=QueueState::Creating &&
             queue.scope_pins.load(std::memory_order_acquire)==0;
@@ -204,12 +206,11 @@ void ReclaimRetiredQueues() noexcept {
         }
         if(idle)queue.state.store(QueueState::Reclaiming,std::memory_order_release);
         ReleaseSRWLockExclusive(&s_registration);
-        if(!idle)continue;
+        if(!idle) {retry=true;continue;}
         // Sole worker; Reclaiming rejects scopes. COM release is outside the
         // registry lock, and failures retain a non-reusable tombstone.
         if(!queue.resources_released)queue.resources_released=GpuReadinessQueue_Release(&queue);
-        if(!queue.resources_released)continue;
-        if(!TryAcquireSRWLockExclusive(&s_registration))continue;
+        if(!queue.resources_released || !TryAcquireSRWLockExclusive(&s_registration)) {retry=true;continue;}
         queue.next_value=1;queue.generation=0;queue.device_identity=0;queue.latest_prehold={};queue.resources_released=false;
         queue.observation_faults.store(0,std::memory_order_relaxed);
         queue.last_submitted=0;queue.calibration={};queue.wake_value=0;queue.wake_qpc=0;
@@ -222,8 +223,12 @@ void ReclaimRetiredQueues() noexcept {
         queue.state.store(QueueState::Empty,std::memory_order_release);
         ReleaseSRWLockExclusive(&s_registration);
     }
+    return retry;
 }
-void Poll(bool stopping) noexcept {
+// No periodic wake without an obligation. A pending CPU row still has its 250 ms expiry
+// and unnotified cancellation/eligibility changes even when fence notification succeeded.
+DWORD Poll(bool stopping) noexcept {
+    DWORD wait_ms = INFINITE;
     for (auto& queue : s_queues) {
         if (!stopping && !queue.retired.load() && queue.state.load(std::memory_order_acquire) == QueueState::Requested) {
             const HRESULT result = GpuReadinessQueue_Initialize(&queue);
@@ -260,13 +265,15 @@ void Poll(bool stopping) noexcept {
             }
         }
         if (sample.status == GpuReadinessStatus::Pending || sample.status == GpuReadinessStatus::Completed) {
+            if (!expired && (finish == base || sample.status == GpuReadinessStatus::Pending)) {
+                wait_ms = 50;
+                continue;
+            }
             if (finish == base) {
-                if (!expired) continue; // GPU result may be ready before native finish
                 if (!slot.finish_token.compare_exchange_strong(finish, base | kFinishClosed, std::memory_order_acq_rel))
                     continue; // finish won the expiry race; its work event wakes us
                 sample.status = GpuReadinessStatus::InvalidScope;
             } else if (sample.status == GpuReadinessStatus::Pending) {
-                if (!expired) continue;
                 sample.status = GpuReadinessStatus::Timeout;
             }
         }
@@ -281,7 +288,7 @@ void Poll(bool stopping) noexcept {
         if (completed == UINT64_MAX) queue.retired.store(true, std::memory_order_release);
         GpuReadinessQueue_Reclaim(&queue, completed);
         if (stopping || completed == UINT64_MAX || queue.faulted.load() || queue.uncertain_submission.load() ||
-            queue.armed_value || queue.notification_failed) continue;
+            queue.armed_value) continue;
         uint64_t next = UINT64_MAX;
         SampleSlot* armed_sample = nullptr;
         for (auto& slot : s_samples) {
@@ -302,6 +309,10 @@ void Poll(bool stopping) noexcept {
             }
         }
         if (next == UINT64_MAX) continue;
+        if (queue.notification_failed) {
+            wait_ms = 50; // failed registration, including a GPU resource still retiring after its row
+            continue;
+        }
         const int64_t arm_qpc = Qpc();
         const HRESULT result = GpuReadinessQueue_Arm(&queue, next);
         if (armed_sample) {
@@ -311,14 +322,17 @@ void Poll(bool stopping) noexcept {
         if (SUCCEEDED(result)) queue.armed_value = next;
         else {
             queue.notification_failed = true; // fallback is work-event/50ms watchdog, never busy-spin
+            wait_ms = 50;
             LOG_WARN("GPU readiness: completion notification unavailable (hr=0x%08X)", result);
         }
     }
-    if(!stopping)ReclaimRetiredQueues();
+    // A scope pin or a contended registry lock can defer reclamation without a new event.
+    if (!stopping && ReclaimRetiredQueues()) return 50;
+    return wait_ms;
 }
 DWORD WINAPI Worker(void*) noexcept {
     while (!s_stopping.load(std::memory_order_acquire)) {
-        Poll(false);
+        const DWORD wait_ms = Poll(false);
         HANDLE handles[2 + 2 * kQueueCapacity]{s_stop_event, s_work_event};
         QueueSlot* owners[2 + 2 * kQueueCapacity]{};
         DWORD count = 2;
@@ -327,7 +341,7 @@ DWORD WINAPI Worker(void*) noexcept {
             handles[count] = queue.completion_event;
             owners[count++] = &queue;
         }
-        const DWORD wait = WaitForMultipleObjects(count, handles, FALSE, 50);
+        const DWORD wait = WaitForMultipleObjects(count, handles, FALSE, wait_ms);
         const int64_t wake_qpc = Qpc();
         if (wait == WAIT_OBJECT_0) break;
         if (wait >= WAIT_OBJECT_0 + 2 && wait < WAIT_OBJECT_0 + count) {
@@ -504,7 +518,9 @@ GpuReadinessCall::GpuReadinessCall(const PresentTimelineSpan* span, bool before_
         ++s_dropped; queue->retired.store(true);
         slot->timestamp_slot->ownership.store(GpuTimestampOwnership::Free, std::memory_order_release);
         slot->state.store(SampleState::Empty, std::memory_order_release);
-        queue->signal_busy.clear(std::memory_order_release); return;
+        queue->signal_busy.clear(std::memory_order_release);
+        WakeWorker(); // retirement with no pending row: no completion or FinishScope wake follows
+        return;
     }
     sample.queue_generation = queue->generation;
     sample.native_queue = reinterpret_cast<uint64_t>(queue->queue);

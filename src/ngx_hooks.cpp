@@ -13,8 +13,6 @@
 #include <MinHook.h>
 #include <array>
 #include <atomic>
-#include <chrono>
-#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -534,6 +532,7 @@ static constexpr size_t kMaxHookTargets = 16;
 static constexpr size_t kMaxHookPlans = 4;
 static SRWLOCK s_hook_lifecycle_lock = SRWLOCK_INIT;
 static NGXHookState s_hook_state = NGXHookState::Uninstalled;
+static std::atomic<bool> s_installed{false};
 static std::array<NGXHookRecord, kMaxHookTargets> s_hook_records{};
 static size_t s_hook_count = 0;
 static std::atomic<bool> s_version_start_allowed{true};
@@ -934,6 +933,7 @@ void NGXHooks_TryInstall() {
     switch (result) {
         case InstallTransactionResult::Success:
             s_hook_state = NGXHookState::Installed;
+            s_installed.store(true, std::memory_order_release);
             break;
         case InstallTransactionResult::CleanupRequired:
             s_hook_state = NGXHookState::CleanupRequired;
@@ -947,6 +947,10 @@ void NGXHooks_TryInstall() {
     }
     LogLoadedNGXModulesOnce();
     ReleaseSRWLockExclusive(&s_hook_lifecycle_lock);
+}
+
+bool NGXHooks_HasInstalled() {
+    return s_installed.load(std::memory_order_acquire);
 }
 
 void NGXHooks_Init() {
@@ -984,6 +988,7 @@ bool NGXHooks_Shutdown() {
     const bool removed_all = RemoveOwnedHooksAfterRundown();
     if (removed_all) {
         s_hook_state = NGXHookState::Uninstalled;
+        s_installed.store(false, std::memory_order_release);
         s_dlss_sr_handle.store(nullptr, std::memory_order_release);
         ClearVersionSnapshot();
     } else {
@@ -1024,27 +1029,19 @@ struct NGXVersionSnapshot {
     char sl[24] = {};
 };
 
-static std::mutex s_version_snapshot_mutex;
+// A published field is immutable until post-rundown cleanup. Readers only
+// copy fields whose release-published bit they observed; no render-thread lock.
+enum : unsigned { VersionSR = 1, VersionRR = 2, VersionFG = 4, VersionSL = 8 };
+static std::atomic<unsigned> s_version_ready{0};
 static NGXVersionSnapshot s_version_snapshot;
 static std::mutex s_version_lifecycle_mutex;
-static std::mutex s_version_wait_mutex;
-static std::condition_variable s_version_wakeup;
-static std::atomic<bool> s_version_stop_requested{false};
-static std::atomic<bool> s_version_thread_started{false};
+static constexpr unsigned kStopVersions = ~0u;
+static std::atomic<unsigned> s_requested_features{0};
 static HANDLE s_version_thread = nullptr;
 
-static NGXVersionSnapshot GetVersionSnapshot() {
-    std::lock_guard<std::mutex> lock(s_version_snapshot_mutex);
-    return s_version_snapshot;
-}
-
-static void PublishVersionSnapshot(const NGXVersionSnapshot& snapshot) {
-    std::lock_guard<std::mutex> lock(s_version_snapshot_mutex);
-    s_version_snapshot = snapshot;
-}
-
 static void ClearVersionSnapshot() {
-    PublishVersionSnapshot({});
+    s_version_snapshot = {};
+    s_version_ready.store(0, std::memory_order_release);
 }
 
 // Function pointer types for version.dll (loaded dynamically to avoid import table bloat)
@@ -1099,69 +1096,35 @@ static void VersionPollThreadImpl() {
         return;
     }
 
-    NGXVersionSnapshot versions = GetVersionSnapshot();
-    std::unique_lock<std::mutex> wait_lock(s_version_wait_mutex);
-    for (int attempt = 0; attempt < 15; ++attempt) {
-        if (s_version_wakeup.wait_for(
-                wait_lock,
-                std::chrono::seconds(2),
-                [] { return s_version_stop_requested.load(std::memory_order_acquire); })) {
-            break;
+    unsigned processed = 0;
+    for (;;) {
+        unsigned requested = s_requested_features.load(std::memory_order_acquire);
+        if (requested == kStopVersions) break;
+        if (requested == processed) {
+            WaitOnAddress(&s_requested_features, &requested, sizeof(requested), INFINITE);
+            continue;
         }
-        wait_lock.unlock();
-
-        bool found_any = false;
-        if (!versions.sr[0]) {
-            found_any = ReadDllVersionBG(
-                fnSize, fnInfo, fnQuery,
-                L"nvngx_dlss.dll", versions.sr, sizeof(versions.sr)) ||
-                ReadDllVersionBG(
-                    fnSize, fnInfo, fnQuery,
-                    L"_nvngx_dlss.dll", versions.sr, sizeof(versions.sr));
+        processed = requested;
+        const unsigned previous = s_version_ready.load(std::memory_order_relaxed);
+        unsigned ready = previous;
+        auto discover = [&](unsigned bit, char (&out)[24], const wchar_t* first, const wchar_t* second) {
+            if (!(ready & bit) && (ReadDllVersionBG(fnSize, fnInfo, fnQuery, first, out, sizeof(out)) ||
+                                  ReadDllVersionBG(fnSize, fnInfo, fnQuery, second, out, sizeof(out))))
+                ready |= bit;
+        };
+        auto& v = s_version_snapshot;
+        discover(VersionSR, v.sr, L"nvngx_dlss.dll", L"_nvngx_dlss.dll");
+        discover(VersionRR, v.rr, L"nvngx_dlssd.dll", L"_nvngx_dlssd.dll");
+        discover(VersionFG, v.fg, L"nvngx_dlssg.dll", L"_nvngx_dlssg.dll");
+        discover(VersionSL, v.sl, L"sl.interposer.dll", L"sl.common.dll");
+        if (ready != previous) {
+            s_version_ready.store(ready, std::memory_order_release);
+            LOG_INFO("NGX versions: SR=%s RR=%s FG=%s SL=%s", v.sr[0] ? v.sr : "-",
+                     v.rr[0] ? v.rr : "-", v.fg[0] ? v.fg : "-", v.sl[0] ? v.sl : "-");
         }
-        if (!versions.rr[0]) {
-            found_any = ReadDllVersionBG(
-                fnSize, fnInfo, fnQuery,
-                L"nvngx_dlssd.dll", versions.rr, sizeof(versions.rr)) ||
-                ReadDllVersionBG(
-                    fnSize, fnInfo, fnQuery,
-                    L"_nvngx_dlssd.dll", versions.rr, sizeof(versions.rr)) ||
-                found_any;
-        }
-        if (!versions.fg[0]) {
-            found_any = ReadDllVersionBG(
-                fnSize, fnInfo, fnQuery,
-                L"nvngx_dlssg.dll", versions.fg, sizeof(versions.fg)) ||
-                ReadDllVersionBG(
-                    fnSize, fnInfo, fnQuery,
-                    L"_nvngx_dlssg.dll", versions.fg, sizeof(versions.fg)) ||
-                found_any;
-        }
-        if (!versions.sl[0]) {
-            found_any = ReadDllVersionBG(
-                fnSize, fnInfo, fnQuery,
-                L"sl.interposer.dll", versions.sl, sizeof(versions.sl)) ||
-                ReadDllVersionBG(
-                    fnSize, fnInfo, fnQuery,
-                    L"sl.common.dll", versions.sl, sizeof(versions.sl)) ||
-                found_any;
-        }
-
-        if (found_any) {
-            PublishVersionSnapshot(versions);
-            LOG_INFO("NGX versions: SR=%s RR=%s FG=%s SL=%s",
-                     versions.sr[0] ? versions.sr : "-",
-                     versions.rr[0] ? versions.rr : "-",
-                     versions.fg[0] ? versions.fg : "-",
-                     versions.sl[0] ? versions.sl : "-");
-        }
-        const bool complete =
-            (versions.sr[0] || versions.rr[0]) && versions.sl[0];
-        wait_lock.lock();
-        if (complete) break;
+        if (ready == (VersionSR | VersionRR | VersionFG | VersionSL)) break;
     }
 
-    wait_lock.unlock();
     FreeLibrary(version_module);
 }
 
@@ -1175,34 +1138,26 @@ static DWORD WINAPI VersionPollThread(LPVOID) noexcept {
     return 0;
 }
 
-static void StartVersionThread() {
-    if (!s_version_start_allowed.load(std::memory_order_acquire) ||
-        s_version_thread_started.load(std::memory_order_acquire)) {
-        return;
-    }
-
+static void RequestVersions(unsigned features) {
+    if (s_requested_features.load(std::memory_order_relaxed) == features ||
+        !s_version_start_allowed.load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> lifecycle_lock(s_version_lifecycle_mutex);
     if (!s_version_start_allowed.load(std::memory_order_acquire) ||
-        s_version_thread_started.load(std::memory_order_relaxed)) {
-        return;
-    }
-
-    s_version_stop_requested.store(false, std::memory_order_release);
-    s_version_thread = CreateThread(
-        nullptr, 0, VersionPollThread, nullptr, 0, nullptr);
+        s_requested_features.load(std::memory_order_relaxed) == features) return;
+    s_requested_features.store(features, std::memory_order_release);
     if (s_version_thread) {
-        s_version_thread_started.store(true, std::memory_order_release);
-    }
-    else {
-        s_version_stop_requested.store(true, std::memory_order_release);
-        LOG_ERROR("NGX: failed to start version worker (%lu)", GetLastError());
+        WakeByAddressSingle(&s_requested_features);
+    } else {
+        s_version_thread = CreateThread(nullptr, 0, VersionPollThread, nullptr, 0, nullptr);
+        if (!s_version_thread)
+            LOG_ERROR("NGX: failed to start version worker (%lu)", GetLastError());
     }
 }
 
 static bool StopVersionThread() {
     std::lock_guard<std::mutex> lifecycle_lock(s_version_lifecycle_mutex);
-    s_version_stop_requested.store(true, std::memory_order_release);
-    s_version_wakeup.notify_all();
+    s_requested_features.store(kStopVersions, std::memory_order_release);
+    WakeByAddressSingle(&s_requested_features);
     if (s_version_thread) {
         if (WaitForSingleObject(s_version_thread, 2500) != WAIT_OBJECT_0) {
             OutputDebugStringA(
@@ -1212,15 +1167,11 @@ static bool StopVersionThread() {
         CloseHandle(s_version_thread);
         s_version_thread = nullptr;
     }
-    s_version_thread_started.store(false, std::memory_order_release);
-    s_version_stop_requested.store(false, std::memory_order_release);
+    s_requested_features.store(0, std::memory_order_release);
     return true;
 }
 
-NGXDLSSInfo NGXHooks_GetInfo() {
-    // Start version poll thread on first call (runs in background, zero render impact)
-    StartVersionThread();
-
+NGXDLSSInfo NGXHooks_GetInfo(bool include_versions) {
     NGXDLSSInfo info = {};
     info.render_width  = s_render_w.load(std::memory_order_relaxed);
     info.render_height = s_render_h.load(std::memory_order_relaxed);
@@ -1232,13 +1183,20 @@ NGXDLSSInfo NGXHooks_GetInfo() {
     info.sr_active     = s_has_data.load(std::memory_order_relaxed);
     info.rr_active     = s_ray_reconstruction.load(std::memory_order_relaxed);
     info.fg_active     = s_fg_created.load(std::memory_order_relaxed);
-    info.available     = s_has_data.load(std::memory_order_relaxed);
+    info.available     = info.sr_active;
 
-    const NGXVersionSnapshot versions = GetVersionSnapshot();
-    memcpy(info.sr_version, versions.sr, sizeof(info.sr_version));
-    memcpy(info.rr_version, versions.rr, sizeof(info.rr_version));
-    memcpy(info.fg_version, versions.fg, sizeof(info.fg_version));
-    memcpy(info.sl_version, versions.sl, sizeof(info.sl_version));
+    if (include_versions && info.available) {
+        const unsigned ready = s_version_ready.load(std::memory_order_acquire);
+        if (ready != (VersionSR | VersionRR | VersionFG | VersionSL)) {
+            // One scan on first demand, then on feature changes (e.g. enabling
+            // FG loads another DLL). No scans/timers while the UI is hidden.
+            RequestVersions(VersionSR | (info.rr_active ? VersionRR : 0u) | (info.fg_active ? VersionFG : 0u));
+        }
+        if (ready & VersionSR) memcpy(info.sr_version, s_version_snapshot.sr, sizeof(info.sr_version));
+        if (ready & VersionRR) memcpy(info.rr_version, s_version_snapshot.rr, sizeof(info.rr_version));
+        if (ready & VersionFG) memcpy(info.fg_version, s_version_snapshot.fg, sizeof(info.fg_version));
+        if (ready & VersionSL) memcpy(info.sl_version, s_version_snapshot.sl, sizeof(info.sl_version));
+    }
 
     // Output resolution fallback: if CreateFeature was missed (hooks installed
     // late) and EvaluateFeature doesn't provide OutWidth/OutHeight, use the

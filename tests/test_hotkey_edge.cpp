@@ -189,6 +189,7 @@ void Reset() {
     for (auto& key : g_keys) key.store(false);
     Poll();  // takes the suppression latch, resets every slot
     Poll();
+    Hotkeys_BeginDrain();
     for (int slot = 0; slot < static_cast<int>(HotkeySlot::Count); ++slot)
         while (Hotkeys_Take(static_cast<HotkeySlot>(slot))) {}
     for (auto& reads : g_reads) reads.store(0);
@@ -196,15 +197,21 @@ void Reset() {
 
 void TestPollerEdges() {
     Reset();
+    CHECK(!Hotkeys_HasBindings());
     // Unbound slots read no key at all.
     Poll();
     for (auto& reads : g_reads) CHECK(reads.load() == 0);
 
     Hotkeys_SetBinding(kToggle, Bind(kK));
+    CHECK(Hotkeys_HasBindings());
     Poll();  // the new binding is armed: it must be seen released first
     CHECK(!Hotkeys_Take(kToggle));
+    CHECK(!Hotkeys_HasPending());
     Hold(kK, true);
     Poll();  // the first poll after binding saw it up (above): this press is an edge
+    CHECK(Hotkeys_HasPending());
+    Hotkeys_BeginDrain();
+    CHECK(!Hotkeys_HasPending());
     CHECK(Hotkeys_Take(kToggle));
     CHECK(!Hotkeys_Take(kToggle));  // consumed
     for (int i = 0; i < 5; ++i) { Poll(); CHECK(!Hotkeys_Take(kToggle)); }  // held: no repeat
@@ -226,6 +233,17 @@ void TestPollerEdges() {
     Hold(kK, true); Poll(); Hold(kK, false); Poll(); Hold(kK, true); Poll(); Hold(kK, false); Poll();
     CHECK(Hotkeys_Take(kToggle));
     CHECK(!Hotkeys_Take(kToggle));
+
+    // An unbound service parks: no poll observes the clear or the next
+    // down transition. Rebinding the same still-held key must not toggle.
+    Hotkeys_SetBinding(kToggle, 0);
+    Hold(kK, true);
+    Hotkeys_SetBinding(kToggle, Bind(kK));
+    Poll();
+    CHECK(!Hotkeys_Take(kToggle));
+    Hold(kK, false); Poll();
+    Hold(kK, true); Poll();
+    CHECK(Hotkeys_Take(kToggle));
 }
 
 void TestPollerBindingChangeAndRearm() {
@@ -262,6 +280,7 @@ void TestPollerBindingChangeAndRearm() {
 
     // Cleared: unbound again, the key is no longer read.
     Hotkeys_SetBinding(kToggle, 0);
+    CHECK(!Hotkeys_HasBindings());
     Poll();
     g_reads[kL].store(0);
     Hold(kL, true);

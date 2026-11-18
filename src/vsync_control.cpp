@@ -312,6 +312,8 @@ struct PacingPresentAttempt {
     int64_t p_qpc = 0;
     int64_t e_qpc = 0;
     HRESULT result = S_OK;
+    uint64_t demand = g_pacing_telemetry_demand.load(std::memory_order_relaxed);
+    bool Requested() const noexcept { return (demand & kPacingPresentDemand) != 0; }
 };
 
 // NativeGate_Execute (H2) holds a NativeHold plan from native_arrival_qpc
@@ -335,9 +337,29 @@ static bool NativeGateHeld(const NativeGateTrace& trace) noexcept {
 // call, then the PRESENT_START executor's.
 static void PushPacingPresent(uint64_t native_swapchain, const PacingPresentAttempt& attempt,
     const NativeGateTrace& native_trace, bool replaced) noexcept {
+    const auto demand = attempt.demand;
+    if (!(demand & kPacingReadout)) {
+        // The queue probe peeks at this TLS attribution before Present. Always
+        // consume the slot at Present return; it must not reach the next frame.
+        t_pacing_present_attribution = {};
+        PacingTelemetry_ResetGpuOutputAttribution();
+        if (!attempt.Requested()) return;
+    }
     PacingPresentRecord record{};
     record.native_swapchain = native_swapchain;
     record.thread_id = GetCurrentThreadId();
+    if (native_trace.cross_thread) {
+        record.cross_thread_key = {PacingIdentityDomain::NvApiFrame, native_trace.producer_epoch,
+            native_trace.source_frame_id};
+    }
+    record.p_qpc = attempt.p_qpc;
+    record.e_qpc = attempt.e_qpc;
+    if (!(demand & kPacingReadout)) {
+        // Keep every candidate span (not only attributed ones): they determine
+        // whether the route's cross-thread ETW match is unique.
+        PacingTelemetry_PushPresent(record);
+        return;
+    }
     record.sync_interval = attempt.sync_interval;
     record.present_flags = attempt.present_flags;
     record.result = static_cast<uint32_t>(attempt.result);
@@ -345,16 +367,10 @@ static void PushPacingPresent(uint64_t native_swapchain, const PacingPresentAtte
         PacingTelemetry_TakePresentAttribution(attempt.p_qpc, GetQPCFrequency() / 10);
     record.key = attribution.key;
     record.present_marker_qpc = attribution.marker_qpc;
-    if (native_trace.cross_thread) {
-        record.cross_thread_key = {PacingIdentityDomain::NvApiFrame, native_trace.producer_epoch,
-            native_trace.source_frame_id};
-    }
     if (attempt.span) {
         record.swapchain_generation = attempt.span->key.swapchain_generation;
         record.present_sequence = attempt.span->key.present_sequence;
     }
-    record.p_qpc = attempt.p_qpc;
-    record.e_qpc = attempt.e_qpc;
     const PacingGpuOutputAttribution gpu = PacingTelemetry_TakeGpuOutputAttribution();
     if (gpu.kind != PacingOutputKind::Unknown) {
         record.output_kind = gpu.kind;
@@ -1020,8 +1036,7 @@ __declspec(noinline) static HRESULT PresentBody(
     // fg_present_ahead (no thread woken ahead: one load and a branch): the real frame's Present of a presenting thread
     // that was woken ahead is held here, in front of the telemetry's bracket.
     if (!(override_flags & DXGI_PRESENT_TEST)) FgPresentOrder_BeforeNativePresent();
-    // Pacing telemetry always brackets the native call; the Present span
-    // shares the same two reads when one was allocated.
+    // A timeline span or telemetry consumer needs the native call's bracket.
     PacingPresentAttempt pacing_attempt{override_interval, override_flags,
         capture_first_attempt ? &first_attempt : nullptr};
     HRESULT hr;
@@ -1031,9 +1046,9 @@ __declspec(noinline) static HRESULT PresentBody(
         first_attempt.e_qpc = pacing_attempt.e_qpc = CapturePresentQpc();
     }
     else {
-        pacing_attempt.p_qpc = CapturePresentQpc();
+        if (pacing_attempt.Requested()) pacing_attempt.p_qpc = CapturePresentQpc();
         hr = InvokePresent(original, self, override_interval, override_flags);
-        pacing_attempt.e_qpc = CapturePresentQpc();
+        if (pacing_attempt.Requested()) pacing_attempt.e_qpc = CapturePresentQpc();
     }
 
     PresentTimelineSpan retry_attempt{};
@@ -1067,9 +1082,9 @@ __declspec(noinline) static HRESULT PresentBody(
             retry_attempt.e_qpc = pacing_attempt.e_qpc = CapturePresentQpc();
         }
         else {
-            pacing_attempt.p_qpc = CapturePresentQpc();
+            if (pacing_attempt.Requested()) pacing_attempt.p_qpc = CapturePresentQpc();
             hr = InvokePresent(original, self, 0, Flags);
-            pacing_attempt.e_qpc = CapturePresentQpc();
+            if (pacing_attempt.Requested()) pacing_attempt.e_qpc = CapturePresentQpc();
         }
     }
     pacing_attempt.result = hr;
@@ -1203,8 +1218,7 @@ __declspec(noinline) static HRESULT Present1Body(
     }
     // fg_present_ahead: as in PresentBody.
     if (!(PresentFlags & DXGI_PRESENT_TEST)) FgPresentOrder_BeforeNativePresent();
-    // Pacing telemetry always brackets the native call; the Present span
-    // shares the same two reads when one was allocated.
+    // A timeline span or telemetry consumer needs the native call's bracket.
     PacingPresentAttempt pacing_attempt{SyncInterval, PresentFlags,
         capture_attempt ? &attempt : nullptr};
     HRESULT result;
@@ -1215,10 +1229,10 @@ __declspec(noinline) static HRESULT Present1Body(
         attempt.e_qpc = pacing_attempt.e_qpc = CapturePresentQpc();
     }
     else {
-        pacing_attempt.p_qpc = CapturePresentQpc();
+        if (pacing_attempt.Requested()) pacing_attempt.p_qpc = CapturePresentQpc();
         result = InvokePresent1(
             original, self, SyncInterval, PresentFlags, PresentParameters);
-        pacing_attempt.e_qpc = CapturePresentQpc();
+        if (pacing_attempt.Requested()) pacing_attempt.e_qpc = CapturePresentQpc();
     }
     pacing_attempt.result = result;
     native_gate.Complete(result == S_OK, false);

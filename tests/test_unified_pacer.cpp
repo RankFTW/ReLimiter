@@ -2877,6 +2877,53 @@ namespace
         CHECK(ShareCredit(0.06, kShareC, 0.0) == 0.0);
     }
 
+    void TestWindowCacheRingEviction()
+    {
+        auto driver = ShareDriver(0.06);
+        constexpr unsigned frames = 220;
+        int64_t ready[frames + 1]{kReadyBase};
+        bool reported[frames + 1]{};
+        const auto ai = [](unsigned k) { return static_cast<double>(k * 31 % 251); };
+        const auto check = [&](unsigned frame, unsigned oldest) {
+            std::vector<double> generation, spacing;
+            for (unsigned k = frame; k >= oldest && generation.size() < kUnifiedWindow; --k) {
+                if (!reported[k]) continue;
+                generation.push_back(ai(k));
+                if (k > oldest && ready[k] > ready[k - 1])
+                    spacing.push_back(static_cast<double>(ready[k] - ready[k - 1]) / 10.0);
+            }
+            const auto median = [](std::vector<double>& v) {
+                if (v.size() < kUnifiedMinPairs) return 0.0;
+                std::sort(v.begin(), v.end());
+                return v[(v.size() - 1) / 2];
+            };
+            // Vary J after the grant to bypass Status's separate same-index cache.
+            const auto status = driver.law.Status(frame + 1, 8000.0 + oldest);
+            CHECK(status.generation_us == median(generation));
+            CHECK(status.cycle_valid == (spacing.size() >= kUnifiedMinPairs));
+            CHECK(status.cycle_us == median(spacing));
+        };
+        for (unsigned k = 1; k <= frames; ++k) {
+            const auto frame = driver.Frame();
+            ready[k] = ready[k - 1] + Ticks(8000 + k * 73 % 491);
+            driver.law.OnReady(k, frame.key, ready[k]);
+            driver.law.OnOutput(k, frame.key, ready[k], false);
+            // Dense, then sparse reports: GrantHold can evict a used report or just its predecessor.
+            reported[k] = k > 1 && (k < 80 || k % 3 == 0);
+            if (reported[k]) driver.law.OnReport(frame.key, 3000.0, 9000.0, ai(k));
+            const unsigned oldest = k >= kUnifiedRingSize ? k - static_cast<unsigned>(kUnifiedRingSize) + 1 : 1;
+            check(k, oldest);
+            if (k > 22 && k % 13 == 0) {
+                // Late correction in the already measured span.
+                ready[k - 4] += Ticks(1300);
+                driver.law.OnReady(k - 4, Key(1000 + k - 4), ready[k - 4]);
+                check(k, oldest);
+            }
+            driver.law.GrantHold(k + 1, 8000.0);
+            check(k, k >= kUnifiedRingSize ? oldest + 1 : oldest);
+        }
+    }
+
     void TestHoldShareLeavesTheStartLawAndDisplayIntervalAlone()
     {
         // The display-side interval stays the free function's value and the start law
@@ -3154,6 +3201,7 @@ int main()
     TestHoldShareNoRoomRefillsTheAllowance();
     TestHoldShareCaseFlipsBothWays();
     TestHoldShareWindowMedians();
+    TestWindowCacheRingEviction();
     TestHoldShareLeavesTheStartLawAndDisplayIntervalAlone();
     TestHoldShareOptionClamp();
     TestHoldShareGrantClampsWhenTheCaseIsEntered();

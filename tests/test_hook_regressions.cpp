@@ -1238,6 +1238,17 @@ extern "C" MH_STATUS WINAPI MH_ApplyQueued(VOID) {
 }
 
 int main() {
+    PacingPresentAttribution previous{};
+    previous.key = {PacingIdentityDomain::NvApiFrame, 1, 1};
+    previous.marker_qpc = 1;
+    PacingTelemetry_SetPresentAttribution(previous);
+    PushPacingPresent(0x1000, {}, {}, false);
+    Check(s_pacing_present_records == 0 && !PacingFrameKey_IsValid(t_pacing_present_attribution.key),
+        "without consumers a Present clears probe attribution but publishes no record");
+    g_pacing_telemetry_demand.store(kPacingRouteEvidence);
+    PushPacingPresent(0x1000, {}, {}, false);
+    Check(s_pacing_present_records == 1, "native PCL alone still receives Present candidates");
+    g_pacing_telemetry_demand.store(kPacingReadout);
       NativeGate_SetMode(NativeGateMode::Shadow);
       TracePresentImplementation("Present", reinterpret_cast<void*>(1), reinterpret_cast<void*>(2),
                                  MH_ERROR_NOT_EXECUTABLE, false);

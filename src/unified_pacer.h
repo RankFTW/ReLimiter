@@ -692,7 +692,11 @@ private:
         double generation_us = 0.0;  // A, the median frame-generation time (0 below 16 reports)
         double active_us = 0.0;      // Am, the median GPU active time (0 below 16 reports)
     };
-    WindowMedians MeasureWindow() const noexcept;
+    mutable WindowMedians medians_{};
+    // Lowest dependency of the last measurement (including its oldest possible predecessor); 0 = not measured.
+    mutable uint64_t measured_floor_ = 0;
+    void InvalidateMediansAt(uint64_t index) noexcept;
+    const WindowMedians& MeasureWindow() const noexcept;
     double NoRoomAllowance(double j_us) const noexcept;
     void TryUseReport(Entry* entry, uint64_t next_index) noexcept;
     void ResolveReports(uint64_t next_index) noexcept;

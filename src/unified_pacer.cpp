@@ -182,6 +182,7 @@ UnifiedPacer::Entry* UnifiedPacer::Touch(uint64_t grid_index) noexcept
             !entry.hold_debited && entry.held_us < 0.0)
             ++summary_.holds_lost_unmeasured; // no record and no report named its hold in 64 frames: never paid
         NoteHoldLeaves(&entry); // the frame that held this slot leaves the ring
+        InvalidateMediansAt(entry.grid_index);
         entry = Entry{};
         entry.grid_index = grid_index;
     }
@@ -402,6 +403,7 @@ void UnifiedPacer::TryUseReport(Entry* entry, uint64_t next_index) noexcept
         const double used = entry->z_raw_us - pred->held_us;
         entry->z_used_us = used > 0.0 ? used : 0.0;
         entry->report_used = true;
+        measured_floor_ = 0; // this report joins the window before its credit refill below
         ++counters_.reports_used;
         used_any_ = true;
         if (used_count_ == kUnifiedRingSize) { // full: drop the oldest
@@ -508,6 +510,8 @@ void UnifiedPacer::Reset(uint64_t lifecycle_base, uint32_t controller_generation
     for (Entry& entry : ring_)
         NoteHoldLeaves(&entry); // the lifecycle ends: holds still unpaid are counted
     ring_ = {};
+    measured_floor_ = 0;
+    medians_ = {};
     frequency_ = qpc_frequency;
     generation_ = controller_generation;
     lifecycle_base_ = lifecycle_base;
@@ -550,6 +554,7 @@ void UnifiedPacer::OnPlan(uint64_t grid_index, const PacingPlanKey& key, int64_t
     Entry* entry = Touch(grid_index);
     if (!entry)
         return;
+    InvalidateMediansAt(grid_index); // the key participates in predecessor matching
     entry->key = key;
     entry->key_valid = true;
     entry->gpu_paced = gpu_paced;
@@ -577,6 +582,7 @@ void UnifiedPacer::OnReady(uint64_t grid_index, const PacingPlanKey& key, int64_
     Entry* entry = EntryFor(grid_index);
     if (!entry || qpc <= 0 || (entry->key_valid && entry->key != key))
         return;
+    InvalidateMediansAt(grid_index);
     if (!entry->key_valid) {
         entry->key = key;
         entry->key_valid = true;
@@ -593,6 +599,7 @@ void UnifiedPacer::OnOutput(uint64_t grid_index, const PacingPlanKey& key, int64
     Entry* entry = EntryFor(grid_index);
     if (!entry || qpc <= 0 || (entry->key_valid && entry->key != key))
         return;
+    InvalidateMediansAt(grid_index);
     if (!entry->key_valid) {
         entry->key = key;
         entry->key_valid = true;
@@ -874,6 +881,12 @@ void UnifiedPacer::SetOptions(const UnifiedOptions& options) noexcept
     ++version_;
 }
 
+void UnifiedPacer::InvalidateMediansAt(uint64_t index) noexcept
+{
+    if (index >= measured_floor_ && index <= newest_used_index_)
+        measured_floor_ = 0;
+}
+
 // The medians of the newest window of used reports (the frames the every-frame
 // service loop walks); computed only with hold_share > 0. Each is the MEDIAN, the
 // lower middle value for an even count (sorted ascending, index (n − 1) / 2), because
@@ -886,14 +899,13 @@ void UnifiedPacer::SetOptions(const UnifiedOptions& options) noexcept
 //   Am: the per-report GPU active time, a report with an unknown one counting 0; 0
 //      with fewer than kUnifiedMinPairs reports in the window.
 // Fixed stack storage, no heap.
-UnifiedPacer::WindowMedians UnifiedPacer::MeasureWindow() const noexcept
+const UnifiedPacer::WindowMedians& UnifiedPacer::MeasureWindow() const noexcept
 {
-    WindowMedians result{};
-    if (!used_any_)
-        return result;
-    std::array<double, kUnifiedWindow> spacings{};
-    std::array<double, kUnifiedWindow> generation{};
-    std::array<double, kUnifiedWindow> active{};
+    if (measured_floor_ || !used_any_)
+        return medians_;
+    WindowMedians& result = medians_;
+    result = {};
+    std::array<double, kUnifiedWindow> spacings, generation, active; // only their populated prefixes are read
     uint32_t count = 0;
     const uint64_t floor_index = std::max<uint64_t>(lifecycle_base_, 1);
     uint64_t index = newest_used_index_ + 1;
@@ -916,6 +928,9 @@ UnifiedPacer::WindowMedians UnifiedPacer::MeasureWindow() const noexcept
             continue;
         spacings[count++] = spacing_us;
     }
+    // Also depend on the predecessor just outside the walk. GrantHold's Touch may evict it
+    // between Status and the grant, especially when reports are sparse or far behind.
+    measured_floor_ = index > floor_index ? index - 1 : floor_index;
     if (reported >= kUnifiedMinPairs) {
         const uint32_t middle = (reported - 1) / 2;
         std::nth_element(generation.begin(), generation.begin() + middle, generation.begin() + reported);
@@ -940,7 +955,7 @@ double UnifiedPacer::NoRoomAllowance(double j_us) const noexcept
 {
     if (!(options_.hold_share > 0.0))
         return 0.0;
-    const WindowMedians window = MeasureWindow();
+    const WindowMedians& window = MeasureWindow();
     if (!window.cycle_valid || !(window.generation_us > 0.0))
         return 0.0;
     const double allowance = std::min(options_.hold_share * window.cycle_us, window.generation_us);
@@ -1089,7 +1104,7 @@ UnifiedStatus UnifiedPacer::Status(uint64_t next_index, double display_interval_
     // hold_share > 0; with the share 0 nothing here runs): the hold credit's share
     // term, see MeasureWindow.
     if (options_.hold_share > 0.0 && used_any_ && status.age <= kUnifiedExpireAge) {
-        const WindowMedians window = MeasureWindow();
+        const WindowMedians& window = MeasureWindow();
         status.generation_us = window.generation_us;
         if (window.cycle_valid) {
             status.cycle_valid = true;

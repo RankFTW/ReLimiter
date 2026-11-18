@@ -34,7 +34,7 @@
 
 // Pacing telemetry worker.
 // Producers push into bounded MPSC queues; one worker owns joins, metrics,
-// the OSD snapshot and CSV rows. Nothing here feeds pacing.
+// the OSD snapshot and CSV rows. Its ETW/Present join also verifies the native gate's route.
 
 // The joined row's display_source (CSV) uses the snapshot's source values,
 // and the DXGI source is recognised by its observer epoch.
@@ -50,18 +50,6 @@ namespace
     constexpr size_t kReflexQueueCapacity = 2048; // at most one report per frame
     constexpr size_t kWaitQueueCapacity = 2048;   // a few async marker calls per frame
 
-    enum PacingQueue : size_t {
-        QueueSource,
-        QueuePresent,
-        QueueGate,
-        QueueReady,
-        QueueGpuQueue,
-        QueueReflex,
-        QueueWait,
-        QueueDisplay,
-        QueueCount
-    };
-
     relimiter::BoundedMpscQueue<PacingSourceRecord, kRecordQueueCapacity> s_source_queue;
     relimiter::BoundedMpscQueue<PacingPresentRecord, kRecordQueueCapacity> s_present_queue;
     relimiter::BoundedMpscQueue<PacingGateRecord, kRecordQueueCapacity> s_gate_queue;
@@ -71,25 +59,10 @@ namespace
     relimiter::BoundedMpscQueue<PacingWaitRecord, kWaitQueueCapacity> s_wait_queue;
     relimiter::BoundedMpscQueue<PacingDisplaySample, kRecordQueueCapacity> s_display_queue;
 
-    // Pushes before Start and after Stop are dropped and counted here.
-    std::atomic<bool> s_accepting{ false };
-    std::array<std::atomic<uint64_t>, QueueCount> s_inactive_drops{};
-
-    template <typename Queue, typename Record>
-    void PushRecord(Queue* queue, PacingQueue index, const Record& record) noexcept
-    {
-        if (!s_accepting.load(std::memory_order_acquire)) {
-            s_inactive_drops[index].fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
-        queue->Push(record); // a full queue drops and counts
-    }
-
     // ── DXGI display source: Present hook → worker ──
     // Separate from PacingQueueDrops (the CSV queue-drop schema); its drops
     // are logged when the source turns inactive.
     DxgiPresentQueue s_dxgi_present_queue;
-    std::atomic<uint64_t> s_dxgi_inactive_drops{ 0 };
     std::atomic<uint64_t> s_dxgi_present_count_failures{ 0 };
 
     // ── Flip gate samples: the gate's clock thread → worker ──
@@ -97,7 +70,6 @@ namespace
     // frame pacing log line.
     constexpr size_t kFlipQueueCapacity = 1024; // 2 s of flips at 480 a second
     relimiter::BoundedMpscQueue<PacingFlipSample, kFlipQueueCapacity> s_flip_queue;
-    std::atomic<uint64_t> s_flip_inactive_drops{ 0 };
 
     // Present thread: SEH stays around the one COM call into the swapchain.
     bool SafeGetLastPresentCount(IDXGISwapChain* swapchain, UINT* present_count) noexcept
@@ -131,6 +103,11 @@ namespace
 
     HANDLE s_worker_thread = nullptr;
     HANDLE s_stop_event = nullptr;
+    HANDLE s_change_event = nullptr; // auto-reset, signalled only by control/lifecycle transitions
+    SRWLOCK s_control_lock = SRWLOCK_INIT;
+    bool s_osd_shown = false, s_route_evidence = false, s_running = false;
+    uint32_t s_capture_epoch = 0; // enabled capture, or 0; under s_control_lock
+    uint64_t s_route_close = 0; // distinguishes coalesced stop/start/stop while an ETW batch drains
     HANDLE s_dxgi_poll_timer = nullptr; // auto-reset; armed only while the DXGI source is active
     uint64_t s_qpc_frequency = 0;
 
@@ -156,16 +133,16 @@ namespace
     };
 
     struct WorkerState {
-        bool capture_enabled = false;     // sampled once per cycle
-        uint32_t context_capture_epoch = 0;
+        uint64_t demand = 0;
+        uint64_t route_close = 0;
+        int64_t window_start_qpc = 0;
+        uint32_t capture_epoch = 0;
         KnownValue observer_epoch;
         std::array<KnownValue, 4> producer_epochs{}; // indexed by PacingIdentityDomain
         KnownValue controller_generation;
         KnownValue grid_epoch;            // Source records with a plan (grid_index != 0)
-        uint8_t grid_epoch_reason = 0;    // PacingEpochReason of grid_epoch
         KnownValue pipeline_generation;   // Source records with pipeline_generation != 0
         uint32_t pipeline_rung = 0;       // plan_rung of the record that showed pipeline_generation
-        uint8_t pipeline_reason = 0;      // PacingFallbackReason of pipeline_generation
         bool loss_window_active = false;
         uint64_t loss_window_swapchain = 0;
         PacingClockMapStatus clock_map_status = PacingClockMapStatus::Unknown;
@@ -202,6 +179,13 @@ namespace
         int64_t last_record_p_qpc = 0;
         double present_interval_ticks = 0.0; // EMA of Present-to-Present intervals; 0 = unknown
         int64_t next_poll_qpc = 0;
+        void Reset(uint64_t frequency) noexcept
+        {
+            matcher.Reset(frequency);
+            active = failure_logged = false;
+            last_record_received_qpc = last_record_p_qpc = next_poll_qpc = 0;
+            present_interval_ticks = 0;
+        }
     };
     DxgiSourceState s_dxgi;
 
@@ -239,6 +223,27 @@ namespace
         return now.QuadPart;
     }
 
+    // Control changes only, under s_control_lock. The window birth time travels with
+    // the flags: an off/on pair cannot be lost even if the worker missed both wakes.
+    void PublishDemandLocked() noexcept
+    {
+        if (!s_running) return;
+        const uint64_t previous = g_pacing_telemetry_demand.load(std::memory_order_relaxed);
+        const auto capture = FrameTimeline_CurrentCaptureState();
+        const uint32_t epoch = capture.enabled ? capture.epoch : 0;
+        const bool readout = s_osd_shown || epoch != 0;
+        const bool restart = readout && (!(previous & kPacingReadout) || (epoch && epoch != s_capture_epoch));
+        const uint64_t old_birth = previous >> kPacingWindowShift;
+        const uint64_t birth = restart ? (std::max)(static_cast<uint64_t>(QpcNow()), old_birth + 1) : old_birth;
+        const uint64_t next = (birth << kPacingWindowShift) | (readout ? kPacingReadout : 0) |
+            (s_route_evidence ? kPacingRouteEvidence :
+                (previous & (kPacingRouteEvidence | kPacingRouteTail)) ? kPacingRouteTail : 0);
+        if (next == previous && epoch == s_capture_epoch) return;
+        s_capture_epoch = epoch;
+        PacingTelemetry_PublishDemand(next, restart);
+        SetEvent(s_change_event);
+    }
+
     int64_t MillisecondsToTicks(uint64_t milliseconds) noexcept
     {
         return static_cast<int64_t>(s_qpc_frequency * milliseconds / 1000);
@@ -247,20 +252,13 @@ namespace
     PacingQueueDrops CurrentDrops() noexcept
     {
         PacingQueueDrops drops{};
-        drops.source = s_source_queue.DroppedValues() +
-            s_inactive_drops[QueueSource].load(std::memory_order_relaxed);
-        drops.present = s_present_queue.DroppedValues() +
-            s_inactive_drops[QueuePresent].load(std::memory_order_relaxed);
-        drops.gate = s_gate_queue.DroppedValues() +
-            s_inactive_drops[QueueGate].load(std::memory_order_relaxed);
-        drops.ready = s_ready_queue.DroppedValues() +
-            s_inactive_drops[QueueReady].load(std::memory_order_relaxed);
-        drops.gpu_queue = s_gpu_queue_queue.DroppedValues() +
-            s_inactive_drops[QueueGpuQueue].load(std::memory_order_relaxed);
-        drops.reflex = s_reflex_queue.DroppedValues() +
-            s_inactive_drops[QueueReflex].load(std::memory_order_relaxed);
-        drops.display = s_display_queue.DroppedValues() +
-            s_inactive_drops[QueueDisplay].load(std::memory_order_relaxed);
+        drops.source = s_source_queue.DroppedValues();
+        drops.present = s_present_queue.DroppedValues();
+        drops.gate = s_gate_queue.DroppedValues();
+        drops.ready = s_ready_queue.DroppedValues();
+        drops.gpu_queue = s_gpu_queue_queue.DroppedValues();
+        drops.reflex = s_reflex_queue.DroppedValues();
+        drops.display = s_display_queue.DroppedValues();
         return drops;
     }
 
@@ -287,9 +285,10 @@ namespace
 
     void PushEvent(PacingCsvEventType type, int64_t event_qpc, PacingCsvEvent event = {}) noexcept
     {
-        if (!s_state.capture_enabled) return;
+        if (!s_state.capture_epoch) return;
         event.type = type;
         event.event_qpc = event_qpc;
+        event.capture_epoch = s_state.capture_epoch;
         CSV_PushPacingEvent(event);
     }
 
@@ -335,49 +334,8 @@ namespace
         PushEvent(PacingCsvEventType::ClockMapStatus, event_qpc, event);
     }
 
-    // Each capture file starts with the current state (previous_value empty).
-    void PushCaptureContext(int64_t now_qpc) noexcept
-    {
-        const FrameTimelineCaptureState capture = FrameTimeline_CurrentCaptureState();
-        if (!capture.enabled || capture.epoch == s_state.context_capture_epoch) return;
-        s_state.context_capture_epoch = capture.epoch;
-        const KnownValue none{};
-        if (s_state.observer_epoch.valid) {
-            PushValueEvent(PacingCsvEventType::ObserverEpoch, now_qpc, none, s_state.observer_epoch.value);
-        }
-        for (size_t domain = 0; domain < s_state.producer_epochs.size(); ++domain) {
-            if (!s_state.producer_epochs[domain].valid) continue;
-            PacingCsvEvent event{};
-            event.identity_domain = static_cast<PacingIdentityDomain>(domain);
-            event.value = s_state.producer_epochs[domain].value;
-            PushEvent(PacingCsvEventType::ProducerEpoch, now_qpc, event);
-        }
-        if (s_state.controller_generation.valid) {
-            PushValueEvent(PacingCsvEventType::ControllerGeneration, now_qpc, none,
-                s_state.controller_generation.value);
-        }
-        if (s_state.grid_epoch.valid) {
-            PushValueEvent(PacingCsvEventType::GridEpoch, now_qpc, none,
-                s_state.grid_epoch.value, s_state.grid_epoch_reason);
-        }
-        if (s_state.pipeline_generation.valid) {
-            PushValueEvent(PacingCsvEventType::PipelineChange, now_qpc, none,
-                s_state.pipeline_rung, s_state.pipeline_reason);
-        }
-        if (s_state.loss_window_active) PushLossWindowEvent(true, now_qpc);
-        if (s_state.clock_map_status != PacingClockMapStatus::Unknown) {
-            PushClockMapEvent(false, PacingClockMapStatus::Unknown, now_qpc);
-        }
-        if (s_state.pcl_status.valid) {
-            PushValueEvent(PacingCsvEventType::PclStatus, now_qpc, none, s_state.pcl_status.value);
-        }
-        PushStatisticsEvents(now_qpc);
-    }
-
-    // Polls the native PCL snapshot the OSD reads: its status (one event per
-    // change) and the cumulative loss counters for queue-drop rows. Runs before
-    // PushCaptureContext; a capture whose context rows are still pending gets
-    // the new status there instead of as a change event.
+    // A new capture starts with fresh event state. Publish its initial PCL status
+    // and statistics before draining the first records (which report their own context).
     void TrackNativePcl(int64_t now_qpc) noexcept
     {
         const NativePclSnapshot snapshot = NativePcl_GetSnapshot();
@@ -385,9 +343,8 @@ namespace
         const uint32_t status = static_cast<uint32_t>(snapshot.status);
         KnownValue& known = s_state.pcl_status;
         if (known.valid && known.value == status) return;
-        if (FrameTimeline_CurrentCaptureState().epoch == s_state.context_capture_epoch) {
-            PushValueEvent(PacingCsvEventType::PclStatus, now_qpc, known, status);
-        }
+        PushValueEvent(PacingCsvEventType::PclStatus, now_qpc, known, status);
+        if (!known.valid) PushStatisticsEvents(now_qpc);
         known = { true, status };
     }
 
@@ -404,7 +361,6 @@ namespace
                 PushValueEvent(PacingCsvEventType::GridEpoch, event_qpc, epoch,
                     record.grid_epoch, record.epoch_reason);
                 epoch = { true, record.grid_epoch };
-                s_state.grid_epoch_reason = record.epoch_reason;
             }
         }
         KnownValue& pipeline = s_state.pipeline_generation;
@@ -416,12 +372,16 @@ namespace
                 rung, record.fallback_reason);
             pipeline = { true, record.pipeline_generation };
             s_state.pipeline_rung = rung;
-            s_state.pipeline_reason = record.fallback_reason;
         }
     }
 
     void TrackSource(const PacingSourceRecord& record, int64_t now_qpc) noexcept
     {
+        const bool paced = (record.flags & PACING_SOURCE_PASSTHROUGH) == 0 &&
+            std::isfinite(record.interval_us) && record.interval_us > 0.0;
+        s_samples.source_interval_us = paced ? record.interval_us : 0.0;
+        s_samples.source_fg_divisor = record.fg_divisor;
+        if (!s_state.capture_epoch) return;
         const int64_t event_qpc = record.release_qpc != 0 ? record.release_qpc : now_qpc;
         const size_t domain = static_cast<size_t>(record.key.domain);
         if (domain != 0 && domain < s_state.producer_epochs.size() && record.key.producer_epoch != 0) {
@@ -443,18 +403,15 @@ namespace
             generation = { true, record.controller_generation };
         }
         TrackPlan(record, event_qpc);
-        const bool paced = (record.flags & PACING_SOURCE_PASSTHROUGH) == 0 &&
-            std::isfinite(record.interval_us) && record.interval_us > 0.0;
-        s_samples.source_interval_us = paced ? record.interval_us : 0.0;
-        s_samples.source_fg_divisor = record.fg_divisor;
     }
 
     void TrackDisplay(const PacingDisplaySample& sample, int64_t now_qpc) noexcept
     {
-        const int64_t event_qpc = sample.report_qpc != 0 ? static_cast<int64_t>(sample.report_qpc) : now_qpc;
         s_state.last_display_received_qpc = now_qpc;
         s_state.last_display_loss_window = sample.loss_window != 0;
         if (sample.display_qpc != 0) s_state.last_etw_display_change_qpc = now_qpc;
+        if (!s_state.capture_epoch) return;
+        const int64_t event_qpc = sample.report_qpc != 0 ? static_cast<int64_t>(sample.report_qpc) : now_qpc;
         KnownValue& epoch = s_state.observer_epoch;
         if (!epoch.valid || epoch.value != sample.observer_epoch) {
             PushValueEvent(PacingCsvEventType::ObserverEpoch, event_qpc, epoch, sample.observer_epoch);
@@ -639,6 +596,9 @@ namespace
 
     void ProcessRow(PacingJoinedRow& row, int64_t now_qpc) noexcept
     {
+        // Keep the ETW join's evidence across a readout restart, but never publish a
+        // row retained for that join (or a delayed ETW burst) from before this window.
+        if (row.has_present && row.present.p_qpc < s_state.window_start_qpc) return;
         // One sequence for the window and the CSV row: snapshot events name
         // their window by row-sequence range.
         const uint64_t row_sequence = ++s_state.row_sequence;
@@ -647,9 +607,9 @@ namespace
         const PacingMetricInput input = PacingJoin_MetricInput(row, s_qpc_frequency);
         const PacingDerivedMetrics derived = Chains().Process(input);
         Window().Add(now_qpc, row_sequence, input.native_swapchain, derived);
-        if (s_state.capture_enabled) {
+        if (s_state.capture_epoch) {
             FillMarkerStamps(&row);
-            CSV_PushPacingRow(row_sequence, row, derived);
+            CSV_PushPacingRow(s_state.capture_epoch, row_sequence, row, derived);
         }
     }
 
@@ -666,7 +626,11 @@ namespace
     void AddDisplaySample(const PacingDisplaySample& sample,
         const PacingDisplayContext& context, int64_t now_qpc) noexcept
     {
-        while (Joiner().PendingDisplayFull() && EmitRow(now_qpc, false)) {}
+        if (!(s_state.demand & kPacingReadout)) {
+            if (Joiner().PendingDisplayFull()) Joiner().DrainEvidence(now_qpc, false);
+        } else {
+            while (Joiner().PendingDisplayFull() && EmitRow(now_qpc, false)) {}
+        }
         Joiner().AddDisplay(sample, now_qpc, context);
     }
 
@@ -684,6 +648,7 @@ namespace
         // looks for a Present record still waiting in its queue.
         DrainQueue<decltype(s_source_queue), PacingSourceRecord>(&s_source_queue, kRecordQueueCapacity,
             [now_qpc](const PacingSourceRecord& record) {
+                if (record.release_qpc < s_state.window_start_qpc) return;
                 TrackSource(record, now_qpc);
                 Joiner().AddSource(record, now_qpc);
             });
@@ -695,9 +660,16 @@ namespace
         // The joiner gets gates before readiness records as before.
         size_t ready_count = 0;
         DrainQueue<decltype(s_ready_queue), PacingReadyRecord>(&s_ready_queue, kRecordQueueCapacity,
-            [&ready_count](const PacingReadyRecord& record) { s_storage->ready_batch[ready_count++] = record; });
+            [&ready_count](const PacingReadyRecord& record) {
+                // An invalid readback may have no timestamp. It is joined by its exact
+                // Present identity, never by recency; it must still break FG continuity.
+                const int64_t qpc = record.submit_qpc ? record.submit_qpc : record.ready_qpc;
+                if (!qpc || qpc >= s_state.window_start_qpc) s_storage->ready_batch[ready_count++] = record;
+            });
         DrainQueue<decltype(s_gate_queue), PacingGateRecord>(&s_gate_queue, kRecordQueueCapacity,
             [now_qpc](const PacingGateRecord& record) {
+                const int64_t qpc = record.event == PacingGateEvent::PostWait ? record.post_wait_qpc : record.signal_before_qpc;
+                if (qpc && qpc < s_state.window_start_qpc) return;
                 s_samples.fg_inputs.AddGate(record);
                 Joiner().AddGate(record, now_qpc);
             });
@@ -707,21 +679,31 @@ namespace
             Joiner().AddReady(record, now_qpc);
         }
         DrainQueue<decltype(s_gpu_queue_queue), PacingGpuQueueRecord>(&s_gpu_queue_queue, kRecordQueueCapacity,
-            [now_qpc](const PacingGpuQueueRecord& record) { Joiner().AddGpuQueue(record, now_qpc); });
+            [now_qpc](const PacingGpuQueueRecord& record) {
+                // Unstamped records still join through exact frame/Present identity.
+                if (!record.first_submit_qpc || record.first_submit_qpc >= s_state.window_start_qpc)
+                    Joiner().AddGpuQueue(record, now_qpc);
+            });
         DrainQueue<decltype(s_reflex_queue), PacingReflexRecord>(&s_reflex_queue, kReflexQueueCapacity,
             [now_qpc](const PacingReflexRecord& record) {
-                TrackClockMap(record, now_qpc);
+                if (record.report_qpc < s_state.window_start_qpc) return;
+                if (s_state.capture_epoch) TrackClockMap(record, now_qpc);
                 Joiner().AddReflex(record, now_qpc);
             });
         DrainQueue<decltype(s_wait_queue), PacingWaitRecord>(&s_wait_queue, kWaitQueueCapacity,
-            [now_qpc](const PacingWaitRecord& record) { Joiner().AddWait(record, now_qpc); });
+            [now_qpc](const PacingWaitRecord& record) {
+                if (record.entry_qpc >= s_state.window_start_qpc) Joiner().AddWait(record, now_qpc);
+            });
         DrainQueue<decltype(s_display_queue), PacingDisplaySample>(&s_display_queue, kRecordQueueCapacity,
             [now_qpc](const PacingDisplaySample& sample) {
-                TrackDisplay(sample, now_qpc);
+                if (PacingJoin_DisplayFrameQpc(sample) >= static_cast<uint64_t>(s_state.window_start_qpc))
+                    TrackDisplay(sample, now_qpc);
                 AddDisplaySample(sample, PacingDisplayContext{}, now_qpc);
             });
         DrainQueue<decltype(s_flip_queue), PacingFlipSample>(&s_flip_queue, kFlipQueueCapacity,
-            [now_qpc](const PacingFlipSample& sample) { AddFlipSample(sample, now_qpc); });
+            [now_qpc](const PacingFlipSample& sample) {
+                if (sample.flip_qpc >= s_state.window_start_qpc) AddFlipSample(sample, now_qpc);
+            });
         RetireInProcessWindow(now_qpc);
     }
 
@@ -746,6 +728,7 @@ namespace
     {
         DxgiPresentRecord record{};
         for (size_t count = 0; count < DXGI_DISPLAY_QUEUE_CAPACITY && s_dxgi_present_queue.Pop(&record); ++count) {
+            if (record.p_qpc < s_state.window_start_qpc) continue;
             const int64_t interval = record.p_qpc - s_dxgi.last_record_p_qpc;
             if (s_dxgi.last_record_p_qpc > 0 && interval > 0 &&
                 interval <= MillisecondsToTicks(kDxgiPresentPauseMilliseconds)) {
@@ -800,7 +783,7 @@ namespace
             reason, statistics.emitted, statistics.continuity_breaks, statistics.unobserved_presents,
             statistics.late_observations, statistics.stale_observations, statistics.unmatched_displays,
             statistics.repeats, statistics.rejected_statistics, statistics.duplicate_records, statistics.record_evictions,
-            s_dxgi_present_queue.DroppedValues() + s_dxgi_inactive_drops.load(std::memory_order_relaxed),
+            s_dxgi_present_queue.DroppedValues(),
             s_dxgi_present_count_failures.load(std::memory_order_relaxed));
     }
 
@@ -911,6 +894,7 @@ namespace
         PacingTelemetrySnapshot snapshot{};
         snapshot.sequence = ++s_state.snapshot_sequence;
         snapshot.publication_qpc = now_qpc;
+        snapshot.window_start_qpc = s_state.window_start_qpc;
         snapshot.window_ms = static_cast<uint32_t>(kWindowMilliseconds);
         // Etw while ETW display samples flow (the other sources are idle then). Else what the window holds: an
         // in-process source only while it is the window's source and fed it within the window (a change of source
@@ -980,7 +964,7 @@ namespace
         }
         s_samples.snapshot = snapshot;
         PublishSnapshot(snapshot);
-        PushSnapshotEvent(snapshot, selection, now_qpc);
+        if (s_state.capture_epoch) PushSnapshotEvent(snapshot, selection, now_qpc);
     }
 
     void LogStatistics() noexcept
@@ -1003,7 +987,7 @@ namespace
                 shown.display_source == PacingDisplaySource::FlipGate ? "the flip gate"
                     : shown.display_source == PacingDisplaySource::FgInput ? "the FG input" : "another source",
                 s_samples.flip_samples, s_samples.flip_gaps,
-                s_flip_queue.DroppedValues() + s_flip_inactive_drops.load(std::memory_order_relaxed),
+                s_flip_queue.DroppedValues(),
                 s_samples.fg_input_samples, s_samples.fg_input_gaps,
                 shown.display_intervals, shown.display_interval_p50_us / 1000.0,
                 shown.target_output_interval_us / 1000.0, shown.adjacent_jitter_mean_us / 1000.0,
@@ -1059,29 +1043,83 @@ namespace
         }
     }
 
+    void ApplyDemand() noexcept
+    {
+        AcquireSRWLockShared(&s_control_lock);
+        const uint64_t demand = g_pacing_telemetry_demand.load(std::memory_order_relaxed);
+        const uint32_t epoch = s_capture_epoch;
+        const uint64_t route_close = s_route_close;
+        ReleaseSRWLockShared(&s_control_lock);
+        const int64_t birth = static_cast<int64_t>(demand >> kPacingWindowShift);
+        if (birth != s_state.window_start_qpc) {
+            SetDxgiActive(false, "new readout", birth);
+            Joiner().RestartReadout(birth); // ETW evidence awaiting its grace must survive
+            Chains().Reset();
+            Window().Reset();
+            s_dxgi.Reset(s_qpc_frequency);
+            s_samples = SampleSourceState{};
+            const uint64_t sequence = s_state.row_sequence, publication = s_state.snapshot_sequence;
+            const uint64_t agreements = s_state.reported_cross_agreements, disagreements = s_state.reported_cross_disagreements;
+            s_state = WorkerState{};
+            s_state.row_sequence = sequence;
+            s_state.snapshot_sequence = publication;
+            s_state.reported_cross_agreements = agreements;
+            s_state.reported_cross_disagreements = disagreements;
+            s_state.window_start_qpc = birth;
+            s_state.last_log_qpc = s_state.last_periodic_qpc = birth;
+        } else if (!(demand & kPacingReadout)) {
+            SetDxgiActive(false, "no readout", birth);
+        }
+        s_state.demand = demand;
+        s_state.route_close = route_close;
+        s_state.capture_epoch = epoch;
+    }
+
     void RunWorkerCycle(bool final_drain) noexcept
     {
         const int64_t now_qpc = QpcNow();
-        s_state.capture_enabled = CSV_IsEnabled();
-        // Poll native PCL first so a capture's context rows carry this
-        // cycle's status and loss counters, not the previous cycle's.
-        TrackNativePcl(now_qpc);
-        if (s_state.capture_enabled) PushCaptureContext(now_qpc);
-        DrainProducerQueues(now_qpc);
-        StepDxgiDisplaySource(now_qpc, final_drain);
+        const bool readout = (s_state.demand & kPacingReadout) != 0;
+        if (s_state.capture_epoch) TrackNativePcl(now_qpc);
+        if (readout) {
+            DrainProducerQueues(now_qpc);
+            StepDxgiDisplaySource(now_qpc, final_drain);
+        } else {
+            // The native gate needs the exact Present/ETW candidate set and the
+            // original 5 ms delivery and 100 ms grace. No DXGI or metrics here.
+            DrainQueue<decltype(s_present_queue), PacingPresentRecord>(&s_present_queue, kRecordQueueCapacity,
+                [now_qpc](const PacingPresentRecord& record) { Joiner().AddPresent(record, now_qpc); });
+            DrainQueue<decltype(s_display_queue), PacingDisplaySample>(&s_display_queue, kRecordQueueCapacity,
+                [now_qpc](const PacingDisplaySample& sample) { AddDisplaySample(sample, {}, now_qpc); });
+        }
         s_state.last_cycle_qpc = now_qpc;
-        while (EmitRow(now_qpc, final_drain)) {}
+        if (readout) {
+            while (EmitRow(now_qpc, final_drain)) {}
+        } else {
+            Joiner().DrainEvidence(now_qpc, final_drain);
+        }
         // Developer key unified_queue_upstream >= 1: the one-shot cycle-rate calibration for the
         // marker CPU time cells, one 5 ms slice per cycle on this worker (never on a hook).
-        if (!final_drain && g_unified_queue_upstream.load(std::memory_order_relaxed) >= 1)
+        if (!final_drain && s_state.capture_epoch && g_unified_queue_upstream.load(std::memory_order_relaxed) >= 1)
             MarkerCycles_CalibrateStep();
         ReportCrossThreadEvidence();
+        // A Present can return after the ETW collector stops. Keep admitting its
+        // bracket through the original grace of the last pending frame ID.
+        if ((s_state.demand & kPacingRouteTail) && !Joiner().HasPendingEvidence()) {
+            AcquireSRWLockExclusive(&s_control_lock);
+            if (!s_route_evidence && s_route_close == s_state.route_close) {
+                g_pacing_telemetry_demand.fetch_and(~kPacingRouteTail, std::memory_order_release);
+                s_state.demand &= ~kPacingRouteTail;
+            }
+            ReleaseSRWLockExclusive(&s_control_lock);
+        }
+        if (!readout) return;
 
         if (final_drain || now_qpc - s_state.last_snapshot_qpc >= MillisecondsToTicks(kSnapshotIntervalMilliseconds)) {
             s_state.last_snapshot_qpc = now_qpc;
             UpdateSnapshot(now_qpc);
         }
-        if (final_drain || now_qpc - s_state.last_periodic_qpc >= MillisecondsToTicks(kPeriodicEventMilliseconds)) {
+        if (s_state.capture_epoch && (final_drain ||
+            now_qpc - s_state.last_periodic_qpc >= MillisecondsToTicks(kPeriodicEventMilliseconds))) {
             s_state.last_periodic_qpc = now_qpc;
             PushStatisticsEvents(now_qpc);
         }
@@ -1094,20 +1132,23 @@ namespace
     DWORD WINAPI PacingTelemetryWorker(LPVOID) noexcept
     {
         try {
-            const HANDLE handles[] = { s_stop_event, s_dxgi_poll_timer };
-            const DWORD handle_count = s_dxgi_poll_timer != nullptr ? 2 : 1;
+            const HANDLE handles[] = { s_stop_event, s_change_event, s_dxgi_poll_timer };
+            const DWORD handle_count = s_dxgi_poll_timer != nullptr ? 3 : 2;
             for (;;) {
-                const DWORD wait = WaitForMultipleObjects(handle_count, handles, FALSE, kWorkerWakeMilliseconds);
-                // Any wait result other than a timeout or the DXGI poll timer
-                // (stop or failure) ends with a final drain.
-                const bool poll_timer = wait == WAIT_OBJECT_0 + 1;
-                if (wait != WAIT_TIMEOUT && !poll_timer) {
-                    RunWorkerCycle(true);
+                const bool busy = (s_state.demand & (kPacingReadout | kPacingRouteEvidence)) != 0 ||
+                    Joiner().HasPendingEvidence();
+                const DWORD wait = WaitForMultipleObjects(handle_count, handles, FALSE, busy ? kWorkerWakeMilliseconds : INFINITE);
+                const bool poll_timer = wait == WAIT_OBJECT_0 + 2;
+                const bool changed = wait == WAIT_OBJECT_0 + 1;
+                if (changed) ApplyDemand();
+                if (wait != WAIT_TIMEOUT && !poll_timer && !changed) {
+                    ApplyDemand();
+                    RunWorkerCycle(true); // includes a final ETW batch even if off/on/off coalesced
                     break;
                 }
                 // Poll-timer wakes between full cycles run only the DXGI source.
                 const int64_t now_qpc = QpcNow();
-                if (poll_timer &&
+                if (poll_timer && (s_state.demand & kPacingReadout) &&
                     now_qpc - s_state.last_cycle_qpc < MillisecondsToTicks(kWorkerWakeMilliseconds)) {
                     StepDxgiDisplaySource(now_qpc, false);
                     continue;
@@ -1139,69 +1180,86 @@ namespace
     }
 }
 
+void PacingTelemetry_SetOsdReadout(bool shown) noexcept
+{
+    AcquireSRWLockExclusive(&s_control_lock);
+    s_osd_shown = shown;
+    PublishDemandLocked();
+    ReleaseSRWLockExclusive(&s_control_lock);
+}
+
+void PacingTelemetry_SetRouteEvidence(bool collecting) noexcept
+{
+    AcquireSRWLockExclusive(&s_control_lock);
+    if (!collecting && s_route_evidence) ++s_route_close;
+    s_route_evidence = collecting;
+    PublishDemandLocked();
+    ReleaseSRWLockExclusive(&s_control_lock);
+}
+
+void PacingTelemetry_CaptureChanged() noexcept
+{
+    AcquireSRWLockExclusive(&s_control_lock);
+    PublishDemandLocked();
+    ReleaseSRWLockExclusive(&s_control_lock);
+}
+
 // ── Producers ──
 
 void PacingTelemetry_PushSource(const PacingSourceRecord& record) noexcept
 {
-    PushRecord(&s_source_queue, QueueSource, record);
+    if (PacingTelemetry_Active()) s_source_queue.Push(record);
 }
 
 void PacingTelemetry_PushPresent(const PacingPresentRecord& record) noexcept
 {
-    PushRecord(&s_present_queue, QueuePresent, record);
+    if (PacingTelemetry_NeedsPresent()) s_present_queue.Push(record);
 }
 
 void PacingTelemetry_PushGate(const PacingGateRecord& record) noexcept
 {
-    PushRecord(&s_gate_queue, QueueGate, record);
+    if (PacingTelemetry_Active()) s_gate_queue.Push(record);
 }
 
 void PacingTelemetry_PushReady(const PacingReadyRecord& record) noexcept
 {
-    PushRecord(&s_ready_queue, QueueReady, record);
+    if (PacingTelemetry_Active()) s_ready_queue.Push(record);
 }
 
 void PacingTelemetry_PushGpuQueue(const PacingGpuQueueRecord& record) noexcept
 {
-    PushRecord(&s_gpu_queue_queue, QueueGpuQueue, record);
+    if (PacingTelemetry_Active()) s_gpu_queue_queue.Push(record);
 }
 
 void PacingTelemetry_PushReflex(const PacingReflexRecord& record) noexcept
 {
-    PushRecord(&s_reflex_queue, QueueReflex, record);
+    if (PacingTelemetry_Active()) s_reflex_queue.Push(record);
 }
 
 void PacingTelemetry_PushWait(const PacingWaitRecord& record) noexcept
 {
-    PushRecord(&s_wait_queue, QueueWait, record);
+    if (PacingTelemetry_Active()) s_wait_queue.Push(record);
 }
 
 void PacingTelemetry_PushDisplay(const PacingDisplaySample& sample) noexcept
 {
-    PushRecord(&s_display_queue, QueueDisplay, sample);
+    if (PacingTelemetry_NeedsPresent()) s_display_queue.Push(sample);
 }
 
 void PacingTelemetry_PushFlip(const PacingFlipSample& sample) noexcept
 {
-    if (!s_accepting.load(std::memory_order_acquire)) {
-        s_flip_inactive_drops.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    s_flip_queue.Push(sample); // a full queue drops and counts
+    if (PacingTelemetry_Active()) s_flip_queue.Push(sample);
 }
 
 void PacingTelemetry_RecordDxgiPresent(IDXGISwapChain* swapchain, const PacingPresentRecord& record) noexcept
 {
+    if (!PacingTelemetry_Active() || g_resolved_fg_divisor.load(std::memory_order_relaxed) > 1) return;
     // A failed Present takes no present ID. DX9, Vulkan and OpenGL never
     // record: their handles are not DXGI swapchains and the correlator is off.
     if (swapchain == nullptr || FAILED(static_cast<HRESULT>(record.result))) return;
     const ActiveAPI api = SwapMgr_GetActiveAPI();
     if ((api != ActiveAPI::DX11 && api != ActiveAPI::DX12) ||
         g_correlator.permanently_disabled.load(std::memory_order_relaxed)) {
-        return;
-    }
-    if (!s_accepting.load(std::memory_order_acquire)) {
-        s_dxgi_inactive_drops.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     UINT present_count = 0;
@@ -1245,14 +1303,8 @@ bool PacingTelemetry_Start() noexcept
     Chains().Reset();
     Window().Reset();
     s_state = WorkerState{};
-    s_dxgi = DxgiSourceState{};
+    s_dxgi.Reset(s_qpc_frequency);
     s_samples = SampleSourceState{};
-    s_dxgi.matcher.Reset(s_qpc_frequency);
-    const int64_t now_qpc = QpcNow();
-    s_state.last_cycle_qpc = now_qpc;
-    s_state.last_snapshot_qpc = now_qpc;
-    s_state.last_periodic_qpc = now_qpc;
-    s_state.last_log_qpc = now_qpc;
     s_snapshot_sequence.store(0, std::memory_order_relaxed);
 
     s_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -1268,11 +1320,20 @@ bool PacingTelemetry_Start() noexcept
         LOG_WARN("Pacing telemetry: failed to create the DXGI poll timer (%lu); DXGI display polls follow the %lu ms wake",
             GetLastError(), kWorkerWakeMilliseconds);
     }
-    s_accepting.store(true, std::memory_order_release);
+    s_change_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!s_change_event) {
+        LOG_ERROR("Pacing telemetry: failed to create consumer event (%lu)", GetLastError());
+        CloseHandle(s_stop_event);
+        s_stop_event = nullptr;
+        if (s_dxgi_poll_timer) CloseHandle(s_dxgi_poll_timer);
+        s_dxgi_poll_timer = nullptr;
+        return false;
+    }
     s_worker_thread = CreateThread(nullptr, 0, PacingTelemetryWorker, nullptr, 0, nullptr);
     if (!s_worker_thread) {
         const DWORD error = GetLastError();
-        s_accepting.store(false, std::memory_order_release);
+        CloseHandle(s_change_event);
+        s_change_event = nullptr;
         CloseHandle(s_stop_event);
         s_stop_event = nullptr;
         if (s_dxgi_poll_timer) CloseHandle(s_dxgi_poll_timer);
@@ -1280,6 +1341,10 @@ bool PacingTelemetry_Start() noexcept
         LOG_ERROR("Pacing telemetry: failed to start worker thread (%lu); records will be dropped", error);
         return false;
     }
+    AcquireSRWLockExclusive(&s_control_lock);
+    s_running = true;
+    PublishDemandLocked();
+    ReleaseSRWLockExclusive(&s_control_lock);
     LOG_INFO("Pacing telemetry worker started (wake=%lu ms, snapshot=%llu ms, window=%llu ms, queue=%zu records)",
         kWorkerWakeMilliseconds, kSnapshotIntervalMilliseconds, kWindowMilliseconds, kRecordQueueCapacity);
     return true;
@@ -1287,24 +1352,28 @@ bool PacingTelemetry_Start() noexcept
 
 bool PacingTelemetry_Stop() noexcept
 {
-    s_accepting.store(false, std::memory_order_release);
     if (s_worker_thread == nullptr) return true;
     SetEvent(s_stop_event);
     if (WaitForSingleObject(s_worker_thread, kWorkerJoinMilliseconds) != WAIT_OBJECT_0) {
         LOG_ERROR("Pacing telemetry: worker did not stop within %lu ms; retaining its state", kWorkerJoinMilliseconds);
         return false;
     }
+    AcquireSRWLockExclusive(&s_control_lock);
+    s_running = false;
+    g_pacing_telemetry_demand.store(0, std::memory_order_release);
+    s_capture_epoch = 0;
+    ReleaseSRWLockExclusive(&s_control_lock);
+    CloseHandle(s_change_event);
+    s_change_event = nullptr;
     CloseHandle(s_worker_thread);
     s_worker_thread = nullptr;
     CloseHandle(s_stop_event);
     s_stop_event = nullptr;
 
-    // The worker has exited, so this thread owns its state. Catch records
-    // pushed between the worker's final drain and the admission flag. The
-    // final drain never polls DXGI, so the timer can close first.
+    // Producer callbacks and native PCL are drained before Stop; the worker
+    // finalizes the last admitted batch before exiting.
     if (s_dxgi_poll_timer) CloseHandle(s_dxgi_poll_timer);
     s_dxgi_poll_timer = nullptr;
-    RunWorkerCycle(true);
     LOG_INFO("Pacing telemetry worker stopped (display_samples=%llu, unjoined_presents=%llu, dropped=%llu)",
         Joiner().Statistics().display_samples, Joiner().Statistics().unjoined_presents,
         TotalDrops(CurrentDrops()));
@@ -1318,7 +1387,7 @@ bool PacingTelemetry_ReadSnapshot(PacingTelemetrySnapshot* snapshot) noexcept
     if (snapshot == nullptr) return false;
     for (int attempt = 0; attempt < kSnapshotReadAttempts; ++attempt) {
         const uint64_t before = s_snapshot_sequence.load(std::memory_order_acquire);
-        if (before == 0) return false; // nothing published yet
+        if (before == 0) { *snapshot = {}; return true; }
         if ((before & 1) != 0) {
             YieldProcessor();
             continue;
@@ -1330,6 +1399,9 @@ bool PacingTelemetry_ReadSnapshot(PacingTelemetrySnapshot* snapshot) noexcept
         std::atomic_thread_fence(std::memory_order_acquire);
         if (s_snapshot_sequence.load(std::memory_order_relaxed) != before) continue;
         std::memcpy(snapshot, words.data(), sizeof(*snapshot));
+        const auto demand = g_pacing_telemetry_demand.load(std::memory_order_acquire);
+        if (!(demand & kPacingReadout) || snapshot->window_start_qpc != static_cast<int64_t>(demand >> kPacingWindowShift))
+            *snapshot = {};
         return true;
     }
     return false;

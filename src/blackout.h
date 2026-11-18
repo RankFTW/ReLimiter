@@ -6,6 +6,8 @@
 
 // Initialize the blackout system. Call once during addon init.
 void Blackout_Init();
+// A change to whether the background service has any bound key to sample.
+void Blackout_SetHotkeyDemand(bool bound);
 
 // Shut down — destroys any active blackout windows and stops the thread.
 bool Blackout_Shutdown();

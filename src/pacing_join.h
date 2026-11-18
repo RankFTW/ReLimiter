@@ -29,6 +29,13 @@ enum class PacingJoinRule : uint8_t {
     PclSimulationStart = 3
 };
 
+// Prefer the observed frame's own clock over ETW delivery time when deciding
+// whether a delayed sample belongs to the current readout.
+inline uint64_t PacingJoin_DisplayFrameQpc(const PacingDisplaySample& sample) noexcept
+{
+    return sample.present_start_qpc ? sample.present_start_qpc : sample.display_qpc ? sample.display_qpc : sample.report_qpc;
+}
+
 // Worker-side facts about a display sample that PacingDisplaySample does not carry.
 struct PacingDisplayContext {
     // Presents of the sample's stream since its previous sample were not
@@ -168,6 +175,13 @@ private:
 class PacingJoiner {
 public:
     void Reset(uint64_t qpc_frequency) noexcept;
+    // A new readout while ETW verifies the native route: retain Present spans and
+    // pending display samples until their ordinary grace/expiry, not other joins.
+    void RestartReadout(int64_t window_start_qpc) noexcept;
+    // With only the route consumer, match eligible ETW IDs using the same grace,
+    // candidate search and retention, without assembling telemetry rows.
+    void DrainEvidence(int64_t now_qpc, bool final_drain) noexcept;
+    bool HasPendingEvidence() const noexcept { return pending_evidence_ != 0; }
 
     void AddSource(const PacingSourceRecord& record, int64_t now_qpc) noexcept;
     void AddPresent(const PacingPresentRecord& record, int64_t now_qpc) noexcept;
@@ -239,6 +253,9 @@ private:
     using RetainedWait = Retained<PacingWaitJoin>;
 
     void EvictAgedRecords(int64_t now_qpc) noexcept;
+    bool TakeDisplay(int64_t now_qpc, bool final_drain, PendingDisplay* sample) noexcept;
+    void RecordEvidence(const RetainedPresent& present, uint32_t frame_id) noexcept;
+    void MatchEvidence(const PacingDisplaySample& sample) noexcept;
     bool TakeDisplayRow(int64_t now_qpc, bool final_drain, PacingJoinedRow* row) noexcept;
     bool TakeUnjoinedPresentRow(int64_t now_qpc, bool final_drain, PacingJoinedRow* row) noexcept;
     void BuildDisplayRow(const PacingDisplaySample& sample, PacingJoinedRow* row) noexcept;
@@ -255,6 +272,8 @@ private:
     SwapchainDisplayState* FindOrAddSwapchain(uint64_t native_swapchain) noexcept;
 
     uint64_t qpc_frequency_ = 0;
+    uint32_t pending_evidence_ = 0;
+    int64_t window_start_qpc_ = 0;
     int64_t retention_ticks_ = 0;
     int64_t unjoined_present_ticks_ = 0;
     int64_t display_grace_ticks_ = 0;

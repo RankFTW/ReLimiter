@@ -35,6 +35,13 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     target_compile_definitions(test_gpu_hold_order PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     set_property(TARGET test_gpu_hold_order PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     add_test(NAME gpu_hold_order COMMAND test_gpu_hold_order)
+    add_executable(test_frame_splitting test_frame_splitting.cpp)
+    set_target_properties(test_frame_splitting PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_definitions(test_frame_splitting PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(test_frame_splitting PRIVATE Synchronization)
+    add_test(NAME frame_splitting COMMAND test_frame_splitting)
+    set_tests_properties(frame_splitting PROPERTIES TIMEOUT 10)
 endif()
 
 
@@ -981,6 +988,7 @@ add_executable(test_pacing_csv test_pacing_csv.cpp
 set_target_properties(test_pacing_csv PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
 target_include_directories(test_pacing_csv PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_pacing_csv PRIVATE Synchronization)
 target_compile_definitions(test_pacing_csv PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 if(MSVC)
     set_property(TARGET test_pacing_csv PROPERTY
@@ -997,6 +1005,7 @@ add_executable(test_pacing_schema test_pacing_schema.cpp
 set_target_properties(test_pacing_schema PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
 target_include_directories(test_pacing_schema PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_pacing_schema PRIVATE Synchronization)
 target_compile_definitions(test_pacing_schema PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
     PACING_SCHEMA_FIXTURE="${CMAKE_SOURCE_DIR}/tests/data/pacing_schema.txt")
 if(MSVC)

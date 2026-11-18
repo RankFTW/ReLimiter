@@ -290,6 +290,7 @@ void TestQueueReclamation() {
     identity_queue.device_identity=nullptr;
     CHECK(!GpuReadinessQueue_MatchesDevice(&identity_queue,&first));
     CHECK(first.refs==1 && second.refs==1 && alias.refs==1);
+    CHECK(Poll(false)==INFINITE); // no CPU row, retirement, or failed notification to service
     uint64_t previous_generation=0;
     for(unsigned cycle=0;cycle<70;++cycle) {
         FakeQueue native;FakeFence fence;
@@ -299,7 +300,7 @@ void TestQueueReclamation() {
         previous_generation=queue.generation;
         queue.fence=&fence;fence.AddRef();queue.state=QueueState::Ready;
         auto* pinned=FindOrRequest(&native);CHECK(pinned==&queue && queue.scope_pins==1);
-        queue.retired=true;ReclaimRetiredQueues();
+        queue.retired=true;CHECK(Poll(false)==50); // the paused scope can leave without signalling the worker
         CHECK(queue.queue==&native && native.refs==2); // paused callback owns the lifetime
         queue.last_submitted=7;queue.timestamps[0].retire_value=7;
         queue.timestamps[0].ownership=GpuTimestampOwnership::Retired;
@@ -439,7 +440,7 @@ void TestRuntime() {
             for (auto& slot:s_samples) if (slot.state.load()==SampleState::Pending) slot.sample.signal_before_qpc -= s_frequency;
             Poll(false); consume(GpuReadinessStatus::Timeout); continue;
         }
-        Poll(false);
+        CHECK(Poll(false)==50); // the CPU row's expiry still runs alongside fence notification
         CHECK(nothing_published());
         complete_gpu();
         Poll(false);
@@ -618,9 +619,9 @@ void TestRuntime() {
     CHECK(GpuReadinessQueue_Arm(&no_event,1)==E_INVALIDARG && fence.registrations==registration_count);
     span=prepare(); fence.arm_status=E_FAIL;
     { GpuReadinessCall call(&span); call.Complete(true,false); }
-    FinishScope(true); Poll(false);
+    FinishScope(true); CHECK(Poll(false)==50);
     CHECK(registered.notification_failed);
-    complete_gpu(); Poll(false);
+    complete_gpu(); CHECK(Poll(false)==INFINITE);
     CHECK(consume(GpuReadinessStatus::Completed).timestamp.notification_result==E_FAIL);
     fence.arm_status=S_OK; registered.notification_failed=false; // test-only retry reset
 
@@ -725,6 +726,7 @@ void PacingTelemetry_PushReady(const PacingReadyRecord& record) noexcept {
 int main() {
     TestBounds();
 #ifdef _WIN64
+    g_pacing_telemetry_demand.store(kPacingReadout);
     TestQueueReclamation();
     TestRuntime();
     CHECK(s_pacing_ready_records.load() > 0 && s_pacing_ready_valid.load() > 0);

@@ -162,7 +162,7 @@ public:
     // The three conditions of "in use"; planned: the position of the frame being planned
     // (invalid = unknown: the arrival-count rule).
     bool InUse(const UnifiedQueuePosition& planned = {}) const noexcept;
-    uint32_t ValidArrivals() const noexcept;
+    uint32_t ValidArrivals() const noexcept { return valid_arrivals_; }
     uint32_t WindowCount() const noexcept { return sample_count_; }
     // j_us: the display-side interval J (<= 0 or non-finite: unknown, no limit from it).
     UnifiedQueueResult Compute(double j_us, const UnifiedQueueParams& params,
@@ -174,7 +174,15 @@ private:
     uint32_t sample_count_ = 0;
     bool arrivals_[kWindow] = {};             // validity of the newest arrivals
     uint32_t arrival_head_ = 0;
+    uint32_t valid_arrivals_ = 0;
     uint32_t frames_since_valid_ = UINT32_MAX; // planned frames since the newest valid arrival
     UnifiedQueuePosition newest_position_{};   // the largest position among the valid arrivals
     bool last_valid_positioned_ = false;       // the newest valid arrival carried a position
+    // Freshness and arrival validity change without a new valid sample; neither belongs in the statistics cache.
+    mutable bool measured_ = false;
+    mutable double sorted_margins_[kWindow]{}; // same window for every J, rank and allowance
+    mutable double measured_j_us_ = 0.0;
+    mutable UnifiedQueueParams measured_params_{};
+    mutable UnifiedQueueResult statistics_{};
+    void Measure(double j_us, const UnifiedQueueParams& params) const noexcept;
 };

@@ -85,6 +85,14 @@ static uint64_t CurrentStatusWord(uint32_t interval_us, bool use_game_sleep) {
     return SleepStatusWord(interval_us, use_game_sleep, g_sleep_status_token.load());
 }
 
+// The same consume-once operation the scheduler applies to each source row.
+static PacingSourceRecord TakeSleepRow(int64_t release = INT64_MAX) {
+    PacingSourceRecord row{};
+    row.release_qpc = release;
+    g_pacing_pending_sleep.Take(row);
+    return row;
+}
+
 class FakeDevice final : public IUnknown {
 public:
     // Graph edges are borrowed from fixtures whose lifetimes enclose each
@@ -471,18 +479,32 @@ void TestSleepStatusAtSleepReturn() {
     g_user_target_fps = 157;
     PublishSleepPipeline(false);
 
-    // The sleep status the next Source record carries: the newest result when the Sleep returned.
+    const auto saved_demand = g_pacing_telemetry_demand.load();
+    PacingTelemetry_PublishDemand((uint64_t{100} << kPacingWindowShift) | kPacingReadout, true);
     g_sleep_status_newest = CurrentStatusWord(6500, true);
-    g_sleep_status_at_sleep_return = 0;
+    const auto previous_window = g_pacing_pending_sleep.Observe();
     CHECK(Hook_Sleep(&device) == -7);
-    CHECK(g_sleep_status_at_sleep_return.load() == CurrentStatusWord(6500, true));
-    g_sleep_status_at_sleep_return = 0;
+    const auto first = TakeSleepRow(101);
+    CHECK(first.driver_sleep_status_valid && first.driver_sleep_interval_us == 6500 && first.driver_use_game_sleep);
+    CHECK(!TakeSleepRow(102).driver_sleep_status_valid);
+    // Rotation before the first source callback: a delayed prior-window writer
+    // and an old source release may neither overwrite nor steal the new result.
+    PacingTelemetry_PublishDemand((uint64_t{200} << kPacingWindowShift) | kPacingReadout, true);
+    g_sleep_status_newest = CurrentStatusWord(7200, false);
     PublishSleepPipeline(true);
     CHECK(Hook_Sleep(&device) == NVAPI_OK);
-    CHECK(g_sleep_status_at_sleep_return.load() == CurrentStatusWord(6500, true));
+    g_pacing_pending_sleep.Publish(previous_window, true, 1000, true);
+    CHECK(!TakeSleepRow(199).driver_sleep_status_valid);
+    const auto rotated = TakeSleepRow(202);
+    CHECK(rotated.driver_sleep_status_valid && rotated.driver_sleep_interval_us == 7200 && !rotated.driver_use_game_sleep);
+    PacingPendingWarning busy, duplicate;
+    busy.Record(199);
+    duplicate.Record(201);
+    CHECK(!duplicate.Take(200, 199) && !busy.Take(200, 202));
+    CHECK(duplicate.Take(200, 202) && !duplicate.Take(200, 203));
 
     g_sleep_status_newest = 0;
-    g_sleep_status_at_sleep_return = 0;
+    g_pacing_telemetry_demand.store(saved_demand);
     g_user_target_fps = 0;
     RestoreSleepPipeline(old_pipeline);
     s_orig_sleep = old_sleep;
@@ -1204,6 +1226,28 @@ void TestUnifiedSleepHook() {
     CHECK(!g_unified_driver_pacing.load());
     UnifiedSleepSelfCheck(slow);
     CHECK(!g_unified_driver_pacing.load()); // the ring started over
+    {
+        // Original 64-slot scan versus the bit history, including wrap, a reset, and
+        // homogeneous stretches that need no atomic update once the window is full.
+        bool slots[64]{};
+        bool expected = false;
+        NvAPI_BumpSleepModeEpoch();
+        for (unsigned i = 0; i < 640; ++i) {
+            if (i == 303) {
+                NvAPI_BumpSleepModeEpoch();
+                for (bool& slot : slots) slot = false;
+                expected = false;
+            }
+            const bool is_slow = i % 231 < 70 || (i % 231 < 141 && i % 5 == 0);
+            slots[(i >= 303 ? i - 303 : i) % 64] = is_slow;
+            unsigned count = 0;
+            for (bool slot : slots) count += slot;
+            if (count >= 16) expected = true;
+            if (count < 3) expected = false;
+            UnifiedSleepSelfCheck(is_slow ? slow : fast);
+            CHECK(g_unified_driver_pacing.load() == expected);
+        }
+    }
 
     // Not on the presenting device: the Sleep neither reserves nor publishes.
     {
@@ -1685,9 +1729,10 @@ void TestReflexObservation() {
     Hook_GetSleepStatus(&presenting, &out);
     CHECK(g_sleep_status_newest.load() == CurrentStatusWord(8333, true));
     s_status_result = NVAPI_OK;
-    g_sleep_status_at_sleep_return = CurrentStatusWord(8333, true);
+    const auto saved_demand = g_pacing_telemetry_demand.exchange(kPacingReadout);
+    PublishSleepStatusAtSleepReturn(g_sleep_status_token.load());
     NvAPI_ClearFeedbackDevice();
-    CHECK(g_sleep_status_newest.load() == 0 && g_sleep_status_at_sleep_return.load() == 0);
+    CHECK(g_sleep_status_newest.load() == 0 && !TakeSleepRow().driver_sleep_status_valid);
     // A result whose driver query straddled a publication change carries the old
     // publication's token: it is not recorded, and a stale word is not carried to the
     // next Source record.
@@ -1700,11 +1745,11 @@ void TestReflexObservation() {
     CHECK(g_sleep_status_newest.load() == CurrentStatusWord(4321, false));
     g_sleep_status_newest = SleepStatusWord(4321, false, stale_token);
     PublishSleepStatusAtSleepReturn(g_sleep_status_token.load());
-    CHECK(g_sleep_status_at_sleep_return.load() == 0);
+    CHECK(!TakeSleepRow().driver_sleep_status_valid);
     // A Sleep that retained the old publication does not carry the new publication's result.
     g_sleep_status_newest = CurrentStatusWord(4321, false);
     PublishSleepStatusAtSleepReturn(stale_token);
-    CHECK(g_sleep_status_at_sleep_return.load() == 0);
+    CHECK(!TakeSleepRow().driver_sleep_status_valid);
     g_sleep_status_newest = 0;
     s_status_answer.bUseGameSleep = 0;
     s_status_answer.sleepIntervalUs = 9000;
@@ -1741,10 +1786,10 @@ void TestReflexObservation() {
     PollSleepStatus(device, g_sleep_status_token.load());
     CHECK(s_status_calls == status_calls + 2); // once per second again
     // The snapshot a Sleep leaves for the next Source record.
-    g_sleep_status_at_sleep_return = 0;
     PublishSleepStatusAtSleepReturn(g_sleep_status_token.load());
-    CHECK(g_sleep_status_at_sleep_return.load() == CurrentStatusWord(7777, false));
-    g_sleep_status_at_sleep_return = 0;
+    const auto row = TakeSleepRow();
+    CHECK(row.driver_sleep_status_valid && row.driver_sleep_interval_us == 7777 && !row.driver_use_game_sleep);
+    g_pacing_telemetry_demand.store(saved_demand);
     g_sleep_status_newest = 0;
     g_config.developer_settings = old_developer;
 
@@ -1762,6 +1807,16 @@ void TestReflexObservation() {
     ObserveAsyncMarkerThread(9, queue);
     ObserveReflexSleep();
     CHECK(s_reflex_observe_log_writes == logs + 2);
+    const auto generation = s_reflex_threads.generation.load();
+    const auto signature = ThreadMapSignature();
+    ObserveAsyncMarkerThread(9, queue);
+    CHECK(s_reflex_threads.generation.load() == generation);
+    ObserveAsyncMarkerThread(9, nullptr);
+    CHECK(ThreadMapSignature() != signature);
+    ObserveAsyncMarkerThread(9, queue);
+    CHECK(ThreadMapSignature() == signature && s_reflex_threads.generation.load() != generation);
+    ObserveReflexSleep();
+    CHECK(s_reflex_observe_log_writes == logs + 2); // a reverted tuple did not consume a line
     ObserveLatencyMarkerThread(SIMULATION_START); // a Sleep came before it
     CHECK(s_reflex_threads.frames_without_sleep.load() == without_sleep);
     ObserveLatencyMarkerThread(SIMULATION_START); // none did

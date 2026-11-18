@@ -30,7 +30,6 @@
 #include <atomic>
 #include <algorithm>
 #include <cmath>
-#include <optional>
 
 namespace gpu_present_shared { // gpu_present_gate.cpp
 extern std::atomic<bool> outstanding;
@@ -166,10 +165,9 @@ PacingGateRecord GateRecord(const Ticket& ticket,PacingGateEvent event) noexcept
 }
 // FG input prefix readback: the timestamp list runs on the FG input queue
 // before this input's Wait (BeginFgInput, then Enqueue), so it is pre-hold.
-PacingReadyRecord PrefixReadyRecord(const FgMeasurement& measurement) noexcept {
+PacingReadyRecord PrefixReadyRecord(const FgMeasurement& measurement,bool valid) noexcept {
     const auto& sample=measurement.sample;
     const auto& context=measurement.context;
-    const bool valid=sample.status==GpuReadinessStatus::Completed && sample.timestamp.status==GpuTimestampStatus::Valid;
     PacingReadyRecord record;
     if(context.source_frame && context.identity.producer)
         record.key={PacingIdentityDomain::NvApiFrame,context.identity.producer,context.source_frame};
@@ -468,14 +466,17 @@ void FinishPostWait(Queue* queue,Ticket* ticket) noexcept {
         sample.completion_upper_qpc=Qpc();
         sample.status=SUCCEEDED(sample.signal_result)?GpuReadinessStatus::Completed:GpuReadinessStatus::NativeFault;
         if(SUCCEEDED(sample.signal_result))GpuReadinessQueue_ReadTimestamp(&queue->post_queue,ticket->post_slot,&sample,frequency);
-        auto gate=GateRecord(*ticket,PacingGateEvent::PostWait);
-        gate.post_wait_qpc=sample.timestamp.status==GpuTimestampStatus::Valid?sample.timestamp.mapped_qpc:0;
-        gate.pre_wait_qpc=pre_wait_qpc;
-        PacingTelemetry_PushGate(gate);
+        const int64_t post_wait_qpc=sample.timestamp.status==GpuTimestampStatus::Valid?sample.timestamp.mapped_qpc:0;
+        if(PacingTelemetry_Active()) {
+            auto gate=GateRecord(*ticket,PacingGateEvent::PostWait);
+            gate.post_wait_qpc=post_wait_qpc;
+            gate.pre_wait_qpc=pre_wait_qpc;
+            PacingTelemetry_PushGate(gate);
+        }
         // GpuResume u: the post-Wait probe mapped to QPC (probes on only),
         // with the pre-Wait time when it read back valid.
         PushStage(ticket->key,ticket->trace.grid_index,PacingStageEventKind::GpuResume,TicketRung(*ticket),
-            gate.post_wait_qpc,PacingPlanStatus::Unknown,pre_wait_qpc);
+            post_wait_qpc,PacingPlanStatus::Unknown,pre_wait_qpc);
         ticket->post_slot->ownership.store(GpuTimestampOwnership::Retired,std::memory_order_release);
         ticket->post_slot=nullptr;
     }
@@ -580,14 +581,14 @@ void DrainFgReadback(Queue& queue,int64_t* next,bool before_signal) noexcept {
         sample.completion_upper_qpc=now;
         sample.status=measurement.valid?GpuReadinessStatus::Completed:GpuReadinessStatus::InvalidScope;
         GpuReadinessQueue_ReadTimestamp(&queue.fg_queue,measurement.slot,&sample,frequency);
-        const auto ready=PrefixReadyRecord(measurement);
-        PacingTelemetry_PushReady(ready);
+        const bool valid=sample.status==GpuReadinessStatus::Completed && sample.timestamp.status==GpuTimestampStatus::Valid;
+        if(PacingTelemetry_Active()) PacingTelemetry_PushReady(PrefixReadyRecord(measurement,valid));
         // GpuReady r of an FG input: its pre-hold prefix, only when the
         // input and its FG route stayed valid through the callback.
-        if(ready.valid && (!measurement.binding || StreamlineHandoff_IsCurrent(measurement.binding)) &&
+        if(valid && (!measurement.binding || StreamlineHandoff_IsCurrent(measurement.binding)) &&
             measurement.multiplier==g_fg_multiplier.load(std::memory_order_acquire)) {
-            PushStage(measurement.key,measurement.grid_index,PacingStageEventKind::GpuReady,PacingRung::FgInputWait,ready.ready_qpc);
-            if(late_spacing)g_cadence_output_tracker.RecordLater(measurement.key.controller_generation,measurement.grid_index,ready.ready_qpc);
+            PushStage(measurement.key,measurement.grid_index,PacingStageEventKind::GpuReady,PacingRung::FgInputWait,sample.timestamp.mapped_qpc);
+            if(late_spacing)g_cadence_output_tracker.RecordLater(measurement.key.controller_generation,measurement.grid_index,sample.timestamp.mapped_qpc);
         }
         measurement.slot->ownership.store(GpuTimestampOwnership::Retired,std::memory_order_release);
         GpuReadinessQueue_Reclaim(&queue.fg_queue,completed);
@@ -724,7 +725,7 @@ int64_t Service() noexcept {
                 if(state!=TicketState::Submitted)continue;
                 if(FAILED(ticket.trace.wait_result) || FAILED(ticket.trace.retire_result))ticket.trace.status=GpuPresentStatus::Failed;
                 // Once per signalled time fence, with its final status.
-                PacingTelemetry_PushGate(GateRecord(ticket,PacingGateEvent::Signalled));
+                if(PacingTelemetry_Active()) PacingTelemetry_PushGate(GateRecord(ticket,PacingGateEvent::Signalled));
                 ticket.state.store(TicketState::Retired,std::memory_order_release);
             }
             if(ticket.state.load()==TicketState::Retired && ticket.signalled &&
@@ -780,48 +781,56 @@ bool Idle() noexcept {
     }
     return true;
 }
-// Worker wait policy. A stop drains
-// at 1ms. With no H3 rung resolved and nothing outstanding, the worker sleeps
-// until work_event or the bounded idle timeout; otherwise 50ms polling keeps
-// the heartbeat, GPU retirement and queue reclamation current. An admission
-// that finds a stale heartbeat signals work_event.
+// Registration and shutdown set work_event. With a ready queue a rung may be selected
+// without registering again: keep its old idle heartbeat (the first admission tests
+// its actual age) and FG capability expiry. Retirement can also need a reclamation retry.
 constexpr DWORD kWorkerStopWaitMs=1,kWorkerPollWaitMs=50,kWorkerIdleWaitMs=250;
 DWORD WorkerWaitMs(bool stopping_now,bool idle_off) noexcept {
     if(stopping_now)return kWorkerStopWaitMs;
-    return idle_off?kWorkerIdleWaitMs:kWorkerPollWaitMs;
+    if(!idle_off)return kWorkerPollWaitMs;
+    for(const auto& queue:queues)
+        if(queue.state.load(std::memory_order_acquire)==QueueState::Ready ||
+            queue.retired.load(std::memory_order_acquire))return kWorkerIdleWaitMs;
+    return INFINITE;
 }
 // Owned by the worker stack: registration and reversion must run on that
 // thread, including a stop that first has to discharge committed GPU waits.
-// The worker holds one only while an H3 rung is resolved or obligations exist.
+// Load avrt at first demand and keep its entry points until the worker exits;
+// only the MMCSS registration follows the demand edges.
 class WorkerMmcssRegistration {
     HMODULE module_=nullptr;
+    decltype(&AvSetMmMaxThreadCharacteristicsA) set_=nullptr;
+    decltype(&AvSetMmThreadPriority) priority_=nullptr;
     HANDLE task_=nullptr;
     decltype(&AvRevertMmThreadCharacteristics) revert_=nullptr;
-public:
-    WorkerMmcssRegistration() noexcept {
+    bool resolved_=false,demand_=false;
+    void Resolve() noexcept {
+        resolved_=true;
         module_=LoadLibraryExW(L"avrt.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
         if(!module_) {
             LOG_WARN("GPU deadline worker TID=%lu: avrt load failed err=%lu; retaining ordinary scheduling",
                 GetCurrentThreadId(),GetLastError());
             return;
         }
-        const auto set=reinterpret_cast<decltype(&AvSetMmMaxThreadCharacteristicsA)>(
+        set_=reinterpret_cast<decltype(set_)>(
             GetProcAddress(module_,"AvSetMmMaxThreadCharacteristicsA"));
-        const auto priority=reinterpret_cast<decltype(&AvSetMmThreadPriority)>(
+        priority_=reinterpret_cast<decltype(priority_)>(
             GetProcAddress(module_,"AvSetMmThreadPriority"));
         revert_=reinterpret_cast<decltype(revert_)>(GetProcAddress(module_,"AvRevertMmThreadCharacteristics"));
-        if(!set || !priority || !revert_) {
+        if(!set_ || !priority_ || !revert_)
             LOG_WARN("GPU deadline worker TID=%lu: incomplete avrt API; retaining ordinary scheduling",GetCurrentThreadId());
-            return;
-        }
+    }
+    void Register() noexcept {
+        if(!resolved_)Resolve();
+        if(!set_ || !priority_ || !revert_)return;
         DWORD index=0;
-        task_=set("Games","Window Manager",&index);
+        task_=set_("Games","Window Manager",&index);
         if(!task_) {
             LOG_WARN("GPU deadline worker TID=%lu: MMCSS registration failed err=%lu; retaining ordinary scheduling",
                 GetCurrentThreadId(),GetLastError());
             return;
         }
-        if(!priority(task_,AVRT_PRIORITY_HIGH)) {
+        if(!priority_(task_,AVRT_PRIORITY_HIGH)) {
             LOG_WARN("GPU deadline worker TID=%lu: MMCSS HIGH failed err=%lu; reverting registration",
                 GetCurrentThreadId(),GetLastError());
             if(revert_(task_))task_=nullptr;
@@ -832,9 +841,24 @@ public:
         LOG_INFO("GPU deadline worker TID=%lu: MMCSS Games/Window Manager HIGH accepted (task=%lu); effective priority requires ETW verification",
             GetCurrentThreadId(),index);
     }
-    ~WorkerMmcssRegistration() noexcept {
+    void Revert() noexcept {
         if(task_ && !revert_(task_))
             LOG_WARN("GPU deadline worker TID=%lu: MMCSS revert failed err=%lu",GetCurrentThreadId(),GetLastError());
+        task_=nullptr;
+    }
+public:
+    WorkerMmcssRegistration()=default;
+    void SetDemand(bool demand) noexcept {
+        if(demand_==demand)return;
+        demand_=demand;
+        if(demand)Register();
+        else {
+            Revert();
+            LOG_INFO("GPU deadline worker TID=%lu: no H3 rung or obligations, MMCSS request reverted",GetCurrentThreadId());
+        }
+    }
+    ~WorkerMmcssRegistration() noexcept {
+        Revert();
         if(module_)FreeLibrary(module_);
     }
     WorkerMmcssRegistration(const WorkerMmcssRegistration&)=delete;
@@ -844,7 +868,7 @@ DWORD WINAPI Worker(void*) noexcept {
     const auto description=SetThreadDescription(GetCurrentThread(),L"ReLimiter GPU deadline");
     if(FAILED(description))LOG_WARN("GPU deadline worker TID=%lu: thread description failed hr=0x%08X",
         GetCurrentThreadId(),description);
-    std::optional<WorkerMmcssRegistration> scheduling; // held only while H3 demand exists
+    WorkerMmcssRegistration scheduling;
     worker_wake_qpc=worker_arm_before_qpc=worker_arm_after_qpc=worker_requested_wake_qpc=0;
     worker_wait_result=UINT32_MAX;
     AdaptiveWakeGuard wake_guard; // private: never share scheduler history/timer
@@ -854,12 +878,7 @@ DWORD WINAPI Worker(void*) noexcept {
     for(;;) {
         // Follow H3 demand on this thread. Evaluated before the stop check,
         // so every worker lifetime applies the policy at least once.
-        const bool demand=gpu_present_shared::H3Demand();
-        if(demand && !scheduling)scheduling.emplace();
-        else if(!demand && scheduling) {
-            scheduling.reset();
-            LOG_INFO("GPU deadline worker TID=%lu: no H3 rung or obligations, MMCSS request reverted",GetCurrentThreadId());
-        }
+        scheduling.SetDemand(gpu_present_shared::H3Demand());
         const auto next=Service();
         if(stopping.load(std::memory_order_acquire) && Discharged())break;
         const auto now=Qpc();

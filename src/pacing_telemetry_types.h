@@ -112,9 +112,8 @@ struct PacingSourceRecord {
     int64_t driver_sleep_end_qpc = 0;
     // The driver's sleep status (NvAPI_D3D_GetSleepStatus) as the newest
     // successful result stood when this frame's Reflex Sleep returned (the
-    // game's own call or ReLimiter's poll, nvapi_hooks.h
-    // g_sleep_status_at_sleep_return); no result, or no Sleep before this
-    // record: driver_sleep_status_valid 0. CSV row columns
+    // game's own call or ReLimiter's poll). No result, or no Sleep in this
+    // readout before the source record: driver_sleep_status_valid 0. CSV row columns
     // driver_sleep_interval_us and driver_use_game_sleep.
     uint8_t driver_sleep_status_valid = 0;
     uint8_t driver_use_game_sleep = 0;

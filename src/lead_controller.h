@@ -846,6 +846,10 @@ private:
     static constexpr size_t kBlockBins = 32;
     static constexpr size_t kBlockCount = LEAD_HISTOGRAM_BINS / kBlockBins;
 
+    // The planner and status typically ask for both the median and a tail.
+    mutable uint32_t cached_rank_[2]{UINT32_MAX, UINT32_MAX};
+    mutable uint32_t cached_bin_[2]{};
+    uint32_t BinAtRank(uint32_t rank) const noexcept;
     std::array<uint32_t, LEAD_WINDOW_CAPACITY> ring_bins_{};
     std::array<uint16_t, LEAD_HISTOGRAM_BINS> bin_counts_{};
     std::array<uint16_t, kBlockCount> block_counts_{};
@@ -1291,6 +1295,8 @@ private:
     std::array<float, LEAD_RESUME_DELAY_CAPACITY> resume_delays_us_{};
     size_t resume_delay_head_ = 0;
     size_t resume_delay_count_ = 0;
+    mutable bool resume_delay_median_valid_ = true;
+    mutable double resume_delay_median_us_ = 0.0;
     // Collision guard: release → Present call times C and release → heavy
     // GPU work times D of GPU queue wait frames per FG divisor, and the frames
     // planned with the GPU queue wait's lead since the newest Reflex report

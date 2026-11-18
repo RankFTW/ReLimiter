@@ -3,11 +3,94 @@
 // Pacing telemetry worker API. Producers are
 // nonblocking: no locks, allocation or I/O; full queues drop and count. The
 // worker joins records, computes runtime metrics, publishes a snapshot for the
-// OSD and writes CSV rows while capture is enabled. Nothing here feeds pacing.
+// OSD and writes CSV rows while capture is enabled. The ETW/Present identity
+// join also verifies the native gate's cross-thread route, independently of either readout.
 
 #include "pacing_telemetry_types.h"
 
+#include <atomic>
 #include <cstdint>
+
+// Low bits are the consumers; upper bits identify the start of this readout window.
+// The control owners publish changes, never the per-frame producers.
+inline constexpr uint64_t kPacingReadout = 1, kPacingRouteEvidence = 2, kPacingRouteTail = 4;
+inline constexpr uint64_t kPacingPresentDemand = kPacingReadout | kPacingRouteEvidence | kPacingRouteTail;
+inline constexpr unsigned kPacingWindowShift = 3;
+inline std::atomic<uint64_t> g_pacing_telemetry_demand{0};
+inline bool PacingTelemetry_Active() noexcept {
+    return (g_pacing_telemetry_demand.load(std::memory_order_relaxed) & kPacingReadout) != 0;
+}
+inline bool PacingTelemetry_NeedsPresent() noexcept {
+    return (g_pacing_telemetry_demand.load(std::memory_order_relaxed) & kPacingPresentDemand) != 0;
+}
+
+// Latest Sleep return for the next source row. The high 30 bits are a version
+// advanced before a readout starts/rotates or a new feedback device is exposed.
+// A delayed writer cannot replace a result in the new lifetime. The version
+// and returned status change atomically in one word on both architectures.
+class PacingPendingSleep {
+    static constexpr uint64_t kValid = uint64_t{1} << 33;
+    static constexpr uint64_t kGeneration = kValid << 1;
+    static constexpr uint64_t kTagMask = ~(kGeneration - 1);
+    std::atomic<uint64_t> word_{0};
+    std::atomic<int64_t> birth_{0};
+public:
+    void StartReadout(int64_t birth) noexcept {
+        birth_.store(birth, std::memory_order_relaxed);
+        Invalidate();
+    }
+    void Invalidate() noexcept {
+        auto word = word_.load(std::memory_order_relaxed);
+        while (!word_.compare_exchange_weak(word, (word & kTagMask) + kGeneration, std::memory_order_acq_rel)) {}
+    }
+    uint64_t Observe() const noexcept { return word_.load(std::memory_order_acquire); }
+    void Publish(uint64_t word, bool valid, uint32_t interval, bool use_game_sleep) noexcept {
+        const auto tag = word & kTagMask;
+        const uint64_t next = valid ? tag | kValid | (uint64_t{use_game_sleep} << 32) | interval : tag;
+        while ((word & kTagMask) == tag && !word_.compare_exchange_weak(word, next, std::memory_order_release)) {}
+    }
+    void Take(PacingSourceRecord& record) noexcept {
+        auto word = Observe();
+        if (!(word & kValid) || record.release_qpc < birth_.load(std::memory_order_relaxed)) return;
+        const auto tag = word & kTagMask;
+        while (!word_.compare_exchange_weak(word, tag, std::memory_order_relaxed)) {
+            if (!(word & kValid) || (word & kTagMask) != tag) return;
+        }
+        record.driver_sleep_status_valid = 1;
+        record.driver_use_game_sleep = static_cast<uint8_t>((word >> 32) & 1);
+        record.driver_sleep_interval_us = static_cast<uint32_t>(word);
+    }
+};
+inline PacingPendingSleep g_pacing_pending_sleep;
+
+// Control owner only. An observer of a new window must never clear diagnostics
+// later on its first source callback: Sleep may already have published them.
+inline void PacingTelemetry_PublishDemand(uint64_t demand, bool new_readout) noexcept {
+    if (new_readout) g_pacing_pending_sleep.StartReadout(static_cast<int64_t>(demand >> kPacingWindowShift));
+    g_pacing_telemetry_demand.store(demand, std::memory_order_release);
+}
+
+// A pending warning is just the time it occurred. A descheduled older Sleep
+// must not displace a newer warning (including one from a newer readout).
+class PacingPendingWarning {
+    std::atomic<int64_t> last_{0};
+public:
+    void Record(int64_t qpc) noexcept {
+        auto last = last_.load(std::memory_order_relaxed);
+        while (last < qpc && !last_.compare_exchange_weak(last, qpc, std::memory_order_relaxed)) {}
+    }
+    bool Take(int64_t birth, int64_t release) noexcept {
+        auto qpc = last_.load(std::memory_order_relaxed);
+        while (qpc && qpc <= release) {
+            if (last_.compare_exchange_weak(qpc, 0, std::memory_order_relaxed)) return qpc >= birth;
+        }
+        return false;
+    }
+    void Clear() noexcept { last_.store(0, std::memory_order_relaxed); }
+};
+void PacingTelemetry_SetOsdReadout(bool shown) noexcept;
+void PacingTelemetry_SetRouteEvidence(bool collecting) noexcept;
+void PacingTelemetry_CaptureChanged() noexcept;
 
 void PacingTelemetry_PushSource(const PacingSourceRecord& record) noexcept;   // scheduler owner
 void PacingTelemetry_PushPresent(const PacingPresentRecord& record) noexcept; // Present threads
@@ -57,6 +140,7 @@ inline bool PacingDisplaySource_IsDisplayed(PacingDisplaySource source) noexcept
 struct PacingTelemetrySnapshot {
     uint64_t sequence = 0;
     int64_t publication_qpc = 0;
+    int64_t window_start_qpc = 0;
     PacingDisplaySource display_source = PacingDisplaySource::None;
     bool loss_window = false;
     uint32_t window_ms = 0;

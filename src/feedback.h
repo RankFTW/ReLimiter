@@ -7,11 +7,6 @@
 #include <atomic>
 #include <limits>
 
-// DrainCorrelator: every frame on the scheduler owner. Reflex latency-report
-// ingestion only (period governor demand, PacingReflexRecord, clock map);
-// the historical name is kept. The DXGI bias path is retired.
-void DrainCorrelator(double effective_interval_us);
-
 // Reset feedback state (called on flush).
 void ResetFeedbackAccumulators();
 

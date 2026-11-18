@@ -636,6 +636,8 @@ static void PushReflexPacingRecord(
         local_present_start_qpc,
         report.presentStartTime);
 
+    LogReflexClockMapStatus(producer_epoch, report_qpc, qpc_frequency);
+    if (!PacingTelemetry_Active()) return;
     PacingReflexRecord record{};
     record.key = {
         PacingIdentityDomain::NvApiFrame,
@@ -661,7 +663,6 @@ static void PushReflexPacingRecord(
     record.clock_map_status = s_reflex_clock_map.Status();
     record.clock_map_offset_us = s_reflex_clock_map.OffsetUs();
     PacingTelemetry_PushReflex(record);
-    LogReflexClockMapStatus(producer_epoch, report_qpc, qpc_frequency);
 }
 
 static bool TryIngestReflexLatency(double effective_interval_us) {
@@ -1154,21 +1155,6 @@ bool PollReflexLatencyReport(double effective_interval_us) {
     const bool cadence_fed = TryIngestReflexLatency(effective_interval_us);
     s_reflex_poll_active.clear(std::memory_order_release);
     return cadence_fed;
-}
-
-// Reflex latency-report ingestion only. The DXGI frame-statistics bias path
-// (CadenceMeter, VRR refresh estimation from SyncQPCTime) is retired: in VRR
-// g_estimated_refresh_us keeps the display-state ceiling seed, in fixed
-// refresh the vblank thread owns it, and the DXGI display source polls frame
-// statistics on the telemetry worker.
-void DrainCorrelator(double effective_interval_us) {
-    PollReflexLatencyReport(effective_interval_us);
-
-    static int s_drain_count = 0;
-    if (++s_drain_count % 300 == 0) {
-        LOG_INFO("Feedback: Reflex reports found=%d/%d",
-                 s_reflex_found_count, s_reflex_call_count);
-    }
 }
 
 void ResetFeedbackAccumulators() {

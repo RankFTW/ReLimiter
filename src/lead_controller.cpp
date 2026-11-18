@@ -52,6 +52,7 @@ void LeadSampleWindow::Reset() noexcept
     beyond_count_ = 0;
     head_ = 0;
     count_ = 0;
+    cached_rank_[0] = cached_rank_[1] = UINT32_MAX;
 }
 
 uint32_t LeadSampleWindow::BinOf(double sample_us) noexcept
@@ -72,6 +73,10 @@ void LeadSampleWindow::Add(double sample_us) noexcept
     const uint32_t bin = BinOf(sample_us);
     if (count_ == LEAD_WINDOW_CAPACITY) {
         const uint32_t evicted = ring_bins_[head_];
+        if (bin == evicted) {
+            head_ = (head_ + 1) % static_cast<uint32_t>(LEAD_WINDOW_CAPACITY);
+            return; // same histogram, including bins beyond its dense part
+        }
         if (evicted < LEAD_HISTOGRAM_BINS) {
             --bin_counts_[evicted];
             --block_counts_[evicted / kBlockBins];
@@ -81,6 +86,7 @@ void LeadSampleWindow::Add(double sample_us) noexcept
     } else {
         ++count_;
     }
+    cached_rank_[0] = cached_rank_[1] = UINT32_MAX;
     ring_bins_[head_] = bin;
     if (bin < LEAD_HISTOGRAM_BINS) {
         ++bin_counts_[bin];
@@ -95,13 +101,23 @@ double LeadSampleWindow::Quantile(double probability) const noexcept
 {
     if (count_ == 0) return 0.0;
     const double clamped = probability > 0.0 ? (probability < 1.0 ? probability : 1.0) : 0.0;
-    size_t rank = static_cast<size_t>(std::floor(clamped * static_cast<double>(count_ - 1)));
+    uint32_t rank = static_cast<uint32_t>(std::floor(clamped * static_cast<double>(count_ - 1)));
     if (rank >= count_) rank = count_ - 1;
+    const unsigned slot = probability == 0.5 ? 0 : 1;
+    if (cached_rank_[slot] != rank) {
+        cached_bin_[slot] = BinAtRank(rank);
+        cached_rank_[slot] = rank;
+    }
+    return BinCenterUs(cached_bin_[slot]);
+}
+
+uint32_t LeadSampleWindow::BinAtRank(uint32_t rank) const noexcept
+{
     const size_t in_histogram = count_ - beyond_count_;
     if (rank >= in_histogram) {
         // Among the samples beyond the histogram: rank their bins from the
         // ring (positions below count_ hold the newest count_ samples).
-        std::array<uint32_t, LEAD_WINDOW_CAPACITY> beyond{};
+        std::array<uint32_t, LEAD_WINDOW_CAPACITY> beyond; // initialized through found below
         size_t found = 0;
         for (size_t index = 0; index < count_; ++index) {
             if (ring_bins_[index] >= LEAD_HISTOGRAM_BINS) beyond[found++] = ring_bins_[index];
@@ -109,7 +125,7 @@ double LeadSampleWindow::Quantile(double probability) const noexcept
         const size_t nth = rank - in_histogram;
         std::nth_element(beyond.begin(), beyond.begin() + static_cast<std::ptrdiff_t>(nth),
             beyond.begin() + static_cast<std::ptrdiff_t>(found));
-        return BinCenterUs(beyond[nth]);
+        return beyond[nth];
     }
     // Samples before the current block/bin; the ranked sample is the first
     // position where the running count passes its rank.
@@ -124,7 +140,7 @@ double LeadSampleWindow::Quantile(double probability) const noexcept
         before += bin_counts_[bin];
         ++bin;
     }
-    return BinCenterUs(static_cast<uint32_t>(bin));
+    return static_cast<uint32_t>(bin);
 }
 
 // ── Lifecycle ──
@@ -136,6 +152,8 @@ void LeadController::Reset(int64_t qpc_frequency) noexcept
     resume_delays_us_.fill(0.0f);
     resume_delay_head_ = 0;
     resume_delay_count_ = 0;
+    resume_delay_median_us_ = 0.0;
+    resume_delay_median_valid_ = true;
     for (LeadSampleWindow& calls : call_windows_) calls.Reset();
     for (LeadSampleWindow& work : work_windows_) work.Reset();
     ordered_order_ = QueueOrderWindow{};
@@ -1087,6 +1105,7 @@ void LeadController::RecordResumeDelay(PendingFrame* frame) noexcept
     resume_delays_us_[resume_delay_head_] = static_cast<float>(delay_us);
     resume_delay_head_ = (resume_delay_head_ + 1) % LEAD_RESUME_DELAY_CAPACITY;
     if (resume_delay_count_ < LEAD_RESUME_DELAY_CAPACITY) ++resume_delay_count_;
+    resume_delay_median_valid_ = false;
     ++statistics_.resume_waited_samples;
     frame->resume_waited = true;
     frame->resume_late = delay_us > LEAD_RESUME_LATE_US;
@@ -1438,13 +1457,15 @@ void LeadController::NewestResumeDelays(size_t count, double* delays_us) const n
 // Lower-index median of the newest 32 u − o observations; 0 before any.
 double LeadController::MedianResumeDelayUs() const noexcept
 {
+    if (resume_delay_median_valid_) return resume_delay_median_us_;
     const size_t count = std::min(resume_delay_count_, LEAD_RESUME_MEDIAN_SAMPLES);
-    if (count == 0) return 0.0;
-    std::array<double, LEAD_RESUME_MEDIAN_SAMPLES> newest{};
+    std::array<double, LEAD_RESUME_MEDIAN_SAMPLES> newest;
     NewestResumeDelays(count, newest.data());
     const auto middle = newest.begin() + static_cast<std::ptrdiff_t>((count - 1) / 2);
     std::nth_element(newest.begin(), middle, newest.begin() + static_cast<std::ptrdiff_t>(count));
-    return *middle;
+    resume_delay_median_us_ = *middle;
+    resume_delay_median_valid_ = true;
+    return resume_delay_median_us_;
 }
 
 // ── Sample assembly ──

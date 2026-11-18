@@ -1,6 +1,6 @@
 #include "control_file.h"
 #include "bounded_mpsc_queue.h"
-#include "capture_lifecycle.h"
+#include "csv_writer.h"
 #include "config.h"
 #include "frame_timeline.h"
 #include "health.h"
@@ -108,13 +108,13 @@ void Run(const Command& command, Result* result) noexcept
         const FrameTimelineCaptureState before = FrameTimeline_CurrentCaptureState();
         if (strcmp(rest, "start") == 0) {
             // A start while capturing rotates to a new epoch, so each start is its own capture.
-            const FrameTimelineCaptureState after = FrameTimeline_StartCapture();
+            const FrameTimelineCaptureState after = CSV_StartCapture();
             result->ok = after.enabled && after.epoch != before.epoch;
             g_config.csv_enabled = after.enabled; // as the OSD's Telemetry Logging toggle
             snprintf(message, message_size, result->ok ? "capture on epoch %u"
                 : "capture start rejected (epoch %u; the CSV writer is behind)", after.epoch);
         } else if (strcmp(rest, "stop") == 0) {
-            FrameTimeline_SetEnabled(false);
+            CSV_SetEnabled(false);
             const FrameTimelineCaptureState after = FrameTimeline_CurrentCaptureState();
             result->ok = !after.enabled;
             g_config.csv_enabled = after.enabled;

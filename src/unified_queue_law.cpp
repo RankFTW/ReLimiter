@@ -74,10 +74,13 @@ void UnifiedQueueWindow::Reset() noexcept
 
 void UnifiedQueueWindow::Push(const UnifiedQueueSample& sample, const UnifiedQueuePosition& position) noexcept
 {
+    valid_arrivals_ -= arrivals_[arrival_head_];
+    valid_arrivals_ += sample.valid;
     arrivals_[arrival_head_] = sample.valid;
     arrival_head_ = (arrival_head_ + 1) % static_cast<uint32_t>(kWindow);
     if (!sample.valid)
         return;
+    measured_ = false;
     samples_[sample_head_] = sample;
     sample_head_ = (sample_head_ + 1) % static_cast<uint32_t>(kWindow);
     if (sample_count_ < kWindow)
@@ -101,14 +104,6 @@ void UnifiedQueueWindow::NotePlanned() noexcept
         ++frames_since_valid_;
 }
 
-uint32_t UnifiedQueueWindow::ValidArrivals() const noexcept
-{
-    uint32_t count = 0;
-    for (const bool valid : arrivals_)
-        count += valid ? 1u : 0u;
-    return count;
-}
-
 bool UnifiedQueueWindow::InUse(const UnifiedQueuePosition& planned) const noexcept
 {
     // Fresh: by position when the newest valid arrival carried one that is comparable with the
@@ -124,14 +119,32 @@ bool UnifiedQueueWindow::InUse(const UnifiedQueuePosition& planned) const noexce
 UnifiedQueueResult UnifiedQueueWindow::Compute(double j_us, const UnifiedQueueParams& params,
     const UnifiedQueuePosition& planned) const noexcept
 {
-    UnifiedQueueResult result{};
-    result.valid_frames = ValidArrivals();
-    const uint32_t count = sample_count_;
-    if (count < kMinValidInWindow)
+    if (sample_count_ < kMinValidInWindow) {
+        UnifiedQueueResult result{};
+        result.valid_frames = ValidArrivals();
         return result;
+    }
+    if (!measured_ || measured_j_us_ != j_us || measured_params_.rank != params.rank ||
+        measured_params_.allow_us != params.allow_us || measured_params_.need_frames != params.need_frames ||
+        measured_params_.hold_share != params.hold_share) {
+        Measure(j_us, params);
+        measured_j_us_ = j_us;
+        measured_params_ = params;
+        measured_ = true;
+    }
+    UnifiedQueueResult result = statistics_;
+    result.valid_frames = ValidArrivals();
+    result.in_use = result.computable && InUse(planned);
+    return result;
+}
+
+void UnifiedQueueWindow::Measure(double j_us, const UnifiedQueueParams& params) const noexcept
+{
+    auto& result = statistics_;
+    result = {};
+    const uint32_t count = sample_count_;
 
     // The samples newest first: index 0 is the newest valid arrival.
-    double sorted[kWindow] = {};     // s'
     double cycle_sum_us = 0.0;
     double paced_starve_sum_us = 0.0; // starve of the GPU-paced frames, over the window
     double base_need_sum_us = 0.0;    // cycle - starve - min(hold block, slack), over the newest F
@@ -144,7 +157,7 @@ UnifiedQueueResult UnifiedQueueWindow::Compute(double j_us, const UnifiedQueuePa
     for (uint32_t age = 0; age < count; ++age) {
         const UnifiedQueueSample& sample =
             samples_[(sample_head_ + static_cast<uint32_t>(kWindow) - 1 - age) % static_cast<uint32_t>(kWindow)];
-        sorted[age] = sample.s_prime_us;
+        if (!measured_) sorted_margins_[age] = sample.s_prime_us;
         cycle_sum_us += sample.cycle_us;
         if (sample.paced)
             paced_starve_sum_us += std::min(sample.starve_us, sample.paced_wait_us);
@@ -180,16 +193,17 @@ UnifiedQueueResult UnifiedQueueWindow::Compute(double j_us, const UnifiedQueuePa
     const double base_us = need_frames_param >= kWindow
         ? cycle_sum_us / static_cast<double>(count)
         : base_need_sum_us / static_cast<double>(need_frames) + paced_starve_sum_us / static_cast<double>(count);
+    // Even when this J/F gives an unusable base, another J/F can use these same samples.
+    if (!measured_) std::sort(sorted_margins_, sorted_margins_ + count);
     if (!(base_us > 0.0) || !std::isfinite(base_us))
-        return result;
-    std::sort(sorted, sorted + count);
+        return;
 
     const double allow_us = std::isfinite(params.allow_us) && params.allow_us > 0.0 ? params.allow_us : 0.0;
     // The rank is clamped to the number of valid samples in the window.
     const uint32_t rank = static_cast<uint32_t>(
         std::min<int64_t>(std::max<int64_t>(params.rank, 1), static_cast<int64_t>(count)));
-    const double ranked_us = sorted[rank - 1];                // q_gpu
-    const double median_us = sorted[(count - 1) / 2];
+    const double ranked_us = sorted_margins_[rank - 1];       // q_gpu
+    const double median_us = sorted_margins_[(count - 1) / 2];
     const double q_us = std::max(ranked_us, median_us - allow_us);
     const double guard_us = std::max(0.0, newest_min_us - 2.0 * allow_us) * kGuardGain;
     // The positive part of P is bound by the GPU's deficit B - J (the cap rule): at a cap the GPU
@@ -206,7 +220,6 @@ UnifiedQueueResult UnifiedQueueWindow::Compute(double j_us, const UnifiedQueuePa
     const double sigma = std::isfinite(params.hold_share) && params.hold_share > 0.0 ? params.hold_share : 0.0;
 
     result.computable = true;
-    result.in_use = InUse(planned);
     result.limited = raw_us > deficit_us && deficit_us < clamp_us;
     result.guard_active = guard_us > 0.0;
     result.base_us = base_us;
@@ -232,5 +245,4 @@ UnifiedQueueResult UnifiedQueueWindow::Compute(double j_us, const UnifiedQueuePa
     result.refill_slack_us = std::max(0.0, j - service_us);
     result.refill_share_us = std::min(sigma * service_us, std::max(0.0, service_us - j));
     result.refill_us = result.refill_slack_us + result.refill_share_us;
-    return result;
 }

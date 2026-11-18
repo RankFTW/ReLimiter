@@ -17,6 +17,17 @@ static std::atomic<bool> s_thread_running{false};
 static std::atomic<bool> s_user_enabled{false};  // user wants blackout on (persists across alt-tab)
 static HANDLE s_thread = nullptr;
 static HANDLE s_stop_event = nullptr; // Retained with the thread on a failed join.
+static std::atomic<bool> s_hotkeys_bound{false};
+static std::atomic<uint32_t> s_work_epoch{0};
+
+static void NotifyService() noexcept {
+    s_work_epoch.fetch_add(1, std::memory_order_release);
+    WakeByAddressSingle(&s_work_epoch);
+}
+
+void Blackout_SetHotkeyDemand(bool bound) {
+    if (s_hotkeys_bound.exchange(bound, std::memory_order_relaxed) != bound) NotifyService();
+}
 
 // Only atomic value snapshots cross the config/UI -> worker boundary.
 static std::atomic<unsigned int> s_oled_config{1}; // (minutes << 1) | all_monitors
@@ -276,16 +287,16 @@ private:
 // ── Background thread ──
 // Blackout windows need a message pump. This thread creates/destroys
 // them and pumps messages while they're alive. It is also the hotkey poller
-// (hotkey_poller.h): Hotkeys_Poll on every wake, kHotkeyPollPeriodMs apart; the
-// window and OLED work of the loop keeps its 16 ms cadence on every second wake.
+// (hotkey_poller.h) while any key is bound. With no bound keys, ordinary
+// blackout, or OLED session/idle deadline, it parks until a request or shutdown.
 // One wake: a high-resolution waitable timer when there is one (the global timer
 // resolution can be the default 15.6 ms), else the stop event's timeout. Shutdown's
 // SetEvent wakes it at once.
-static void WaitForNextTick(HANDLE timer) {
+static void WaitForNextTick(HANDLE timer, DWORD period_ms = kHotkeyPollPeriodMs) {
     LARGE_INTEGER due;
-    due.QuadPart = -static_cast<LONGLONG>(kHotkeyPollPeriodMs) * 10000;
+    due.QuadPart = -static_cast<LONGLONG>(period_ms) * 10000;
     if (!timer || !SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
-        WaitForSingleObject(s_stop_event, kHotkeyPollPeriodMs);
+        WaitForSingleObject(s_stop_event, period_ms);
         return;
     }
     const HANDLE waits[] = { s_stop_event, timer };
@@ -308,7 +319,13 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
         else {
             LOG_ERROR("Blackout: window class registration failed (%lu)", GetLastError());
             // No window can be made, but the hotkeys still need their poller.
-            while (s_thread_running.load(std::memory_order_relaxed)) {
+            for (;;) {
+                uint32_t epoch = s_work_epoch.load(std::memory_order_acquire);
+                if (!s_thread_running.load(std::memory_order_relaxed)) break;
+                if (!s_hotkeys_bound.load(std::memory_order_relaxed)) {
+                    WaitOnAddress(&s_work_epoch, &epoch, sizeof(epoch), INFINITE);
+                    continue;
+                }
                 Hotkeys_Poll();
                 WaitForNextTick(tick_timer);
             }
@@ -319,6 +336,7 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
     }
 
     unsigned wake = 0;
+    uint32_t serviced_epoch = s_work_epoch.load(std::memory_order_relaxed) - 1;
     bool was_focused = true;
     OLEDCarePolicy oled_policy(GetTickCount64());
     OLEDInputPoller oled_input;
@@ -326,12 +344,22 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
     uint64_t oled_retry_ms = 0;
     bool oled_creation_failed = false;
 
-    while (s_thread_running.load(std::memory_order_relaxed)) {
-        Hotkeys_Poll();
-        if ((wake++ & 1u) != 0) {
+    for (;;) {
+        uint32_t epoch = s_work_epoch.load(std::memory_order_acquire);
+        if (!s_thread_running.load(std::memory_order_relaxed)) break;
+        const bool keys = s_hotkeys_bound.load(std::memory_order_relaxed);
+        if (keys) Hotkeys_Poll();
+        if (serviced_epoch == epoch && !s_user_enabled.load(std::memory_order_relaxed) &&
+            !oled_policy.WantsWindows() && oled_policy.IdleMinutes() == 0) {
+            if (keys) WaitForNextTick(tick_timer);
+            else WaitOnAddress(&s_work_epoch, &epoch, sizeof(epoch), INFINITE);
+            continue;
+        }
+        if (keys && (wake++ & 1u) != 0 && serviced_epoch == epoch) {
             WaitForNextTick(tick_timer);
             continue;
         }
+        serviced_epoch = epoch;
         // Check for show/hide requests
         if (s_request_show.exchange(false, std::memory_order_relaxed)) {
             s_user_enabled.store(true, std::memory_order_relaxed);
@@ -422,7 +450,7 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
             DispatchMessageW(&msg);
         }
 
-        WaitForNextTick(tick_timer);
+        WaitForNextTick(tick_timer, keys ? kHotkeyPollPeriodMs : 2 * kHotkeyPollPeriodMs);
     }
     if (tick_timer) CloseHandle(tick_timer);
 
@@ -442,13 +470,12 @@ static DWORD WINAPI BlackoutThread(LPVOID) {
 
 // ── Public API ──
 
-// The hotkey poller's thread is the blackout service thread; when it cannot exist the OSD
-// callback polls per frame on the presenting thread (hotkey_poller.h), as before the service thread existed.
+// If the service thread cannot exist, the non-ImGui present callback polls
+// the keys instead; this fallback is never active alongside the worker.
 // One line per transition into that state (Blackout_Init runs once per addon load).
 static void LogHotkeyFallback() {
     Hotkeys_SetServiceThreadPolling(false);
-    LOG_WARN("Hotkeys: the poller thread could not be created; hotkeys are polled per frame by the overlay "
-             "callback on the presenting thread instead");
+    LOG_WARN("Hotkeys: the service thread could not be created; hotkeys are polled by the present callback instead");
 }
 
 void Blackout_Init() {
@@ -483,6 +510,7 @@ void Blackout_Init() {
 bool Blackout_Shutdown() {
     if (!s_thread) return true;
     s_thread_running.store(false, std::memory_order_relaxed);
+    NotifyService();
     SetEvent(s_stop_event);
     if (WaitForSingleObject(s_thread, 2500) != WAIT_OBJECT_0) {
         OutputDebugStringA(
@@ -493,7 +521,7 @@ bool Blackout_Shutdown() {
     s_thread = nullptr;
     CloseHandle(s_stop_event);
     s_stop_event = nullptr;
-    Hotkeys_SetServiceThreadPolling(false);  // joined: nothing polls but the overlay callback
+    Hotkeys_SetServiceThreadPolling(false);
     s_active.store(false, std::memory_order_relaxed);
     s_oled_active.store(false, std::memory_order_relaxed);
     s_user_enabled.store(false, std::memory_order_relaxed);
@@ -509,13 +537,13 @@ void Blackout_Toggle() {
         s_request_hide.store(true, std::memory_order_relaxed);
     else
         s_request_show.store(true, std::memory_order_relaxed);
+    NotifyService();
 }
 
 void Blackout_SetActive(bool active) {
-    if (active && !s_active.load(std::memory_order_relaxed))
-        s_request_show.store(true, std::memory_order_relaxed);
-    else if (!active && s_active.load(std::memory_order_relaxed))
-        s_request_hide.store(true, std::memory_order_relaxed);
+    if (active == s_active.load(std::memory_order_relaxed)) return;
+    (active ? s_request_show : s_request_hide).store(true, std::memory_order_relaxed);
+    NotifyService();
 }
 
 bool Blackout_IsActive() {
@@ -527,6 +555,7 @@ static void PostOLEDCommand(OLEDCareCommand command) {
     OLEDCareCommand pending = s_oled_command.load(std::memory_order_relaxed);
     while (!s_oled_command.compare_exchange_weak(pending,
         OLEDCare_ComposeCommand(pending, command), std::memory_order_relaxed)) {}
+    NotifyService();
 }
 
 void OLEDCare_Toggle() {
@@ -545,6 +574,6 @@ void OLEDCare_SetConfig(bool all_monitors, int idle_minutes) {
     const int clamped_minutes = OLEDCarePolicy::ClampIdleMinutes(idle_minutes);
     if (clamped_minutes != idle_minutes)
         LOG_WARN("OLED Care: idle minutes %d clamped to %d", idle_minutes, clamped_minutes);
-    s_oled_config.store((static_cast<unsigned int>(clamped_minutes) << 1) |
-                       (all_monitors ? 1U : 0U), std::memory_order_relaxed);
+    const unsigned config = (static_cast<unsigned>(clamped_minutes) << 1) | (all_monitors ? 1u : 0u);
+    if (s_oled_config.exchange(config, std::memory_order_relaxed) != config) NotifyService();
 }

@@ -21,7 +21,6 @@ namespace
 
 void DxgiDisplayMatcher::Reset(uint64_t qpc_frequency) noexcept
 {
-    records_ = {};
     head_ = 0;
     count_ = 0;
     qpc_frequency_ = qpc_frequency;

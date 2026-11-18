@@ -8,6 +8,7 @@
 
 #include <cstdint>
 
+#include "capture_lifecycle.h"
 #include "native_pcl_measurement.h"
 #include "pacing_join.h"
 #include "pacing_metrics.h"
@@ -51,7 +52,7 @@ enum class PacingCsvEventType : uint8_t {
     // never written by this build, older files carry them.
 };
 
-// Cumulative pacing telemetry producer drops (full queue or worker stopped).
+// Cumulative pacing telemetry producer drops (requested records lost to a full queue).
 struct PacingQueueDrops {
     uint64_t source = 0;
     uint64_t present = 0;
@@ -124,10 +125,11 @@ bool CSV_Shutdown();
 // The pacing telemetry worker is the single producer of both families.
 // sequence is the worker's row sequence (PacingCsvRow::sequence); a dropped
 // row leaves a gap in the file.
-void CSV_PushPacingRow(uint64_t sequence, const PacingJoinedRow& row, const PacingDerivedMetrics& derived);
+void CSV_PushPacingRow(uint32_t capture_epoch, uint64_t sequence, const PacingJoinedRow& row, const PacingDerivedMetrics& derived);
 void CSV_PushPacingEvent(const PacingCsvEvent& event);
 
 // Capture control: enabling starts a new capture epoch (new files), disabling
 // retires it after its accepted rows are written.
 void CSV_SetEnabled(bool enabled);
+FrameTimelineCaptureState CSV_StartCapture(); // enable, or rotate an enabled capture to new files
 bool CSV_IsEnabled();

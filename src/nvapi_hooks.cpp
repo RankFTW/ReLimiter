@@ -37,6 +37,7 @@
 #include <intrin.h>
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -235,7 +236,7 @@ static void ResetGameSleepParams() noexcept {
         static_cast<uint32_t>(((s_feedback_device_publication_sequence.load(std::memory_order_relaxed) + 2) >> 1) & kSleepStatusTokenMask),
         std::memory_order_release);
     g_sleep_status_newest.store(0, std::memory_order_relaxed);
-    g_sleep_status_at_sleep_return.store(0, std::memory_order_relaxed);
+    g_pacing_pending_sleep.Invalidate();
     s_game_params_identity = {};
     s_game_params_captured = false;
     g_game_requested_interval.store(0, std::memory_order_relaxed);
@@ -1028,15 +1029,17 @@ static uint32_t PublicationToken(const NvAPIFeedbackDevice& identity) noexcept {
 }
 
 // The newest result when the presenting device's Sleep returns: the next
-// source record carries it (g_sleep_status_at_sleep_return). `publication_token` is
+// source record carries it. `publication_token` is
 // the token of the publication the Sleep retained at entry
 // (PublicationToken(sleep_device.identity)): the result is carried only when it
 // belongs to that publication and that publication is still the current one.
 static void PublishSleepStatusAtSleepReturn(uint32_t publication_token) noexcept {
+    if (!PacingTelemetry_Active()) return;
+    const auto pending = g_pacing_pending_sleep.Observe();
     const uint64_t newest = g_sleep_status_newest.load(std::memory_order_relaxed);
     const bool current = (newest >> 63) != 0 && SleepStatusToken(newest) == publication_token &&
         publication_token == g_sleep_status_token.load(std::memory_order_acquire);
-    g_sleep_status_at_sleep_return.store(current ? newest : 0, std::memory_order_relaxed);
+    g_pacing_pending_sleep.Publish(pending, current, static_cast<uint32_t>(newest), ((newest >> 32) & 1) != 0);
 }
 
 static void PollSleepStatus(IUnknown* device, uint32_t publication_token) noexcept {
@@ -1059,8 +1062,8 @@ static void PollSleepStatus(IUnknown* device, uint32_t publication_token) noexce
 
 // Thread map: the thread of the newest call of the Reflex Sleep, of each
 // latency marker type and of each async marker type (with its queue), and
-// the Sleeps that did not follow the frame pattern. Relaxed atomics only; the
-// Present is left out (no accessor of the game Present's thread exists).
+// the Sleeps that did not follow the frame pattern. A changed field publishes a
+// generation; the Present is left out (no accessor of the game Present's thread exists).
 static constexpr uint32_t kObserveMarkerTypes = 13;   // NV_LATENCY_MARKER_TYPE 0..12
 static constexpr uint64_t kThreadMapAfterSleeps = 600;
 static constexpr uint32_t kThreadMapLogLimit = 16;
@@ -1074,10 +1077,18 @@ struct ReflexThreadMap {
     std::atomic<uint64_t> sleeps_since_simulation_start{0};
     std::atomic<uint64_t> double_sleeps{0};
     std::atomic<uint64_t> frames_without_sleep{0};
+    std::atomic<uint64_t> generation{0}, checked_generation{0};
     std::atomic<uint64_t> logged_signature{0};
     std::atomic<uint32_t> lines{0};
 };
 static ReflexThreadMap s_reflex_threads;
+
+template<class T>
+static void ObserveThreadMapField(std::atomic<T>& field, T value) noexcept {
+    if (field.load(std::memory_order_relaxed) == value) return;
+    field.store(value, std::memory_order_relaxed);
+    s_reflex_threads.generation.fetch_add(1, std::memory_order_release);
+}
 
 static uint64_t ThreadMapSignature() noexcept {
     uint64_t hash = kObserveHashSeed;
@@ -1120,24 +1131,30 @@ static void LogThreadMap() noexcept {
 // A Sleep on the presenting device (Hook_Sleep). One line after the first 600
 // Sleeps and again whenever a recorded thread or async queue changes.
 static void ObserveReflexSleep() noexcept {
-    s_reflex_threads.sleep_thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    ObserveThreadMapField(s_reflex_threads.sleep_thread, static_cast<uint32_t>(GetCurrentThreadId()));
     if (s_reflex_threads.sleeps_since_simulation_start.fetch_add(1, std::memory_order_relaxed) != 0)
         s_reflex_threads.double_sleeps.fetch_add(1, std::memory_order_relaxed);
     const uint64_t calls = s_reflex_threads.sleep_calls.fetch_add(1, std::memory_order_relaxed) + 1;
     if (calls < kThreadMapAfterSleeps) return;
-    const uint64_t signature = ThreadMapSignature();
+    const uint64_t generation = s_reflex_threads.generation.load(std::memory_order_acquire);
     const bool first = calls == kThreadMapAfterSleeps;
-    if (!first && s_reflex_threads.logged_signature.load(std::memory_order_relaxed) == signature) return;
-    if (s_reflex_threads.logged_signature.exchange(signature, std::memory_order_relaxed) == signature && !first)
-        return; // another thread logged it first
-    if (ReflexObserveBudget(s_reflex_threads.lines, kThreadMapLogLimit, "thread map changed again"))
+    if (!first && generation == s_reflex_threads.checked_generation.load(std::memory_order_relaxed)) return;
+    s_reflex_threads.checked_generation.store(generation, std::memory_order_relaxed);
+    // Changes that reverted between Sleeps must not consume a log line.
+    const uint64_t signature = ThreadMapSignature();
+    const uint64_t previous = s_reflex_threads.logged_signature.exchange(signature, std::memory_order_relaxed);
+    // A slower observer must not leave an obsolete signature behind a newer observer's
+    // already-checked generation. Reconcile on the next Sleep if a writer raced our scan.
+    if (generation != s_reflex_threads.generation.load(std::memory_order_acquire))
+        s_reflex_threads.checked_generation.store(UINT64_MAX, std::memory_order_relaxed);
+    if ((first || previous != signature) && ReflexObserveBudget(s_reflex_threads.lines, kThreadMapLogLimit, "thread map changed again"))
         LogThreadMap();
 }
 
 // A latency marker of the game on the presenting device (Hook_SetLatencyMarker).
 static void ObserveLatencyMarkerThread(uint32_t type) noexcept {
     if (type >= kObserveMarkerTypes) return;
-    s_reflex_threads.marker_thread[type].store(GetCurrentThreadId(), std::memory_order_relaxed);
+    ObserveThreadMapField(s_reflex_threads.marker_thread[type], static_cast<uint32_t>(GetCurrentThreadId()));
     // A SIMULATION_START with no Sleep since the previous one: a frame without a Sleep.
     if (type == SIMULATION_START &&
         s_reflex_threads.sleeps_since_simulation_start.exchange(0, std::memory_order_relaxed) == 0)
@@ -1146,8 +1163,8 @@ static void ObserveLatencyMarkerThread(uint32_t type) noexcept {
 
 static void ObserveAsyncMarkerThread(uint32_t type, IUnknown* queue) noexcept {
     if (type >= kObserveMarkerTypes) return;
-    s_reflex_threads.async_thread[type].store(GetCurrentThreadId(), std::memory_order_relaxed);
-    s_reflex_threads.async_queue[type].store(reinterpret_cast<uint64_t>(queue), std::memory_order_relaxed);
+    ObserveThreadMapField(s_reflex_threads.async_thread[type], static_cast<uint32_t>(GetCurrentThreadId()));
+    ObserveThreadMapField(s_reflex_threads.async_queue[type], reinterpret_cast<uint64_t>(queue));
 }
 
 // RenderSubmitEnd(N) and SimulationStart(N+1) can be emitted concurrently.
@@ -1594,11 +1611,11 @@ static void UnifiedSleepStart(int64_t arrival_qpc) noexcept {
 }
 
 // Self-check on the genuine Sleep call: a driver that paces on its own (the control
-// panel's low latency mode, a game limit) makes it last. A 64-entry ring of relaxed
-// atomics (game thread) of the Sleeps over 200 us: "driver paces" at 16 or more, cleared
+// panel's low latency mode, a game limit) makes it last. The low bit is the newest
+// Sleep, 1 if over 200 us: "driver paces" at 16 of the last 64 or more, cleared
 // below 3; one log line per transition, g_unified_driver_pacing for the flag and status.
-static std::array<std::atomic<uint8_t>, 64> s_unified_sleep_long{};
-static std::atomic<uint32_t> s_unified_sleep_head{ 0 };
+static std::atomic<uint64_t> s_unified_sleep_history{0};
+constexpr size_t kUnifiedSleepHistorySize = 64;
 static std::atomic<uint32_t> s_unified_check_epoch{ 0 };
 constexpr double kUnifiedDriverPacesSleepUs = 200.0;
 constexpr uint32_t kUnifiedDriverPacesSet = 16;
@@ -1608,25 +1625,27 @@ static void UnifiedSleepSelfCheck(int64_t duration_ticks) noexcept {
     const uint32_t epoch = s_sleep_mode_epoch.load(std::memory_order_relaxed);
     if (epoch != s_unified_check_epoch.load(std::memory_order_relaxed)) {
         // A key toggle or a Dynamic MFG transition: start over.
-        for (auto& entry : s_unified_sleep_long) entry.store(0, std::memory_order_relaxed);
-        s_unified_sleep_head.store(0, std::memory_order_relaxed);
+        s_unified_sleep_history.store(0, std::memory_order_relaxed);
         s_unified_check_epoch.store(epoch, std::memory_order_relaxed);
         g_unified_driver_pacing.store(false, std::memory_order_relaxed);
     }
-    const uint32_t head = s_unified_sleep_head.fetch_add(1, std::memory_order_relaxed);
-    s_unified_sleep_long[head % s_unified_sleep_long.size()].store(
-        qpc_to_us(duration_ticks) > kUnifiedDriverPacesSleepUs ? 1 : 0, std::memory_order_relaxed);
-    uint32_t count = 0;
-    for (const auto& entry : s_unified_sleep_long) count += entry.load(std::memory_order_relaxed);
+    const uint64_t bit = qpc_to_us(duration_ticks) > kUnifiedDriverPacesSleepUs ? 1 : 0;
+    uint64_t previous = s_unified_sleep_history.load(std::memory_order_relaxed);
+    uint64_t history;
+    do {
+        history = (previous << 1) | bit;
+        if (previous == history) break; // homogeneous window: the load is this push's linearization point
+    } while (!s_unified_sleep_history.compare_exchange_weak(previous, history, std::memory_order_relaxed));
+    const uint32_t count = static_cast<uint32_t>(std::bitset<kUnifiedSleepHistorySize>(history).count());
     const bool paces = g_unified_driver_pacing.load(std::memory_order_relaxed);
     if (!paces && count >= kUnifiedDriverPacesSet) {
         g_unified_driver_pacing.store(true, std::memory_order_relaxed);
         LOG_INFO("NvAPI: unified pacer: the driver's Sleep paces the game (%u of %zu Sleeps over %.0f us)",
-            count, s_unified_sleep_long.size(), kUnifiedDriverPacesSleepUs);
+            count, kUnifiedSleepHistorySize, kUnifiedDriverPacesSleepUs);
     } else if (paces && count < kUnifiedDriverPacesClear) {
         g_unified_driver_pacing.store(false, std::memory_order_relaxed);
         LOG_INFO("NvAPI: unified pacer: the driver's Sleep no longer paces the game (%u of %zu Sleeps over %.0f us)",
-            count, s_unified_sleep_long.size(), kUnifiedDriverPacesSleepUs);
+            count, kUnifiedSleepHistorySize, kUnifiedDriverPacesSleepUs);
     }
 }
 
@@ -2228,11 +2247,15 @@ static NvAPI_Status __cdecl Hook_SetAsyncFrameMarker(IUnknown* queue, NV_ASYNC_F
     uint8_t vendor_internal = 0;
     const bool known = SafeReadAsyncFrameMarker(params, &frame_id, &marker_type, &present_frame_id,
         &vendor_internal);
+    static std::atomic<uint32_t> s_first_call_types{ 0 };
+    const uint32_t type_bit = known && marker_type < 32 ? 1u << marker_type : 0u;
+    const bool readout = PacingTelemetry_Active();
+    const bool time_call = readout || (type_bit && !(s_first_call_types.load(std::memory_order_relaxed) & type_bit));
     LARGE_INTEGER call_entry{};
-    QueryPerformanceCounter(&call_entry);
+    if (time_call) QueryPerformanceCounter(&call_entry);
     const NvAPI_Status result = SafeInvokeAsyncFrameMarker(queue, params);
     LARGE_INTEGER call_exit{};
-    QueryPerformanceCounter(&call_exit);
+    if (time_call) QueryPerformanceCounter(&call_exit);
     if (!known) return result;
 
     // The frame id this call states for the frame being presented (PRESENT_START names the frame the Present of this
@@ -2243,8 +2266,6 @@ static NvAPI_Status __cdecl Hook_SetAsyncFrameMarker(IUnknown* queue, NV_ASYNC_F
 
     ObserveAsyncMarkerThread(marker_type, queue);
     // The first call of each marker type (types above 31 are not logged).
-    static std::atomic<uint32_t> s_first_call_types{ 0 };
-    const uint32_t type_bit = marker_type < 32 ? 1u << marker_type : 0u;
     if (type_bit != 0 && (s_first_call_types.load(std::memory_order_relaxed) & type_bit) == 0 &&
         (s_first_call_types.fetch_or(type_bit, std::memory_order_relaxed) & type_bit) == 0) {
         char module[MAX_PATH];
@@ -2257,6 +2278,7 @@ static NvAPI_Status __cdecl Hook_SetAsyncFrameMarker(IUnknown* queue, NV_ASYNC_F
                  qpc_to_us(call_exit.QuadPart - call_entry.QuadPart), vendor_internal ? 1u : 0u,
                  static_cast<void*>(queue), module);
     }
+    if (!readout) return result;
     PacingWaitRecord record{};
     record.key = PacingFrameKey{PacingIdentityDomain::NvApiFrame,
         FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::NvApiFrame), frame_id};

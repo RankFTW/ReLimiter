@@ -1262,7 +1262,7 @@ bool SessionEnding() noexcept {
 // the private fence) and blocks in its wait; the helper thread, after a bounded timed wait,
 // takes QPC t0 immediately before signalling that value from the CPU, so the worker's wake
 // stamp minus t0 is the wake latency of a blocked thread. It includes the Signal call, so it is
-// conservative. The worker keeps the last 16: nearest-rank p95 and max go to the core.
+// conservative. Over the trailing calibration window, both the nearest-rank p95 and max matter.
 void ArmCalibration(Thread& t) noexcept {
     ResetEvent(g.calibration_event);
     const uint64_t value = ++t.cal_value;
@@ -1280,11 +1280,14 @@ void CalibrationWake(Thread& t, int64_t wake_qpc) noexcept {
         t.samples[t.sample_next] = sample > 0.0 ? sample : 0.0;
         t.sample_next = (t.sample_next + 1) % kCalibrationSamples;
         t.sample_count = (std::min)(t.sample_count + 1, kCalibrationSamples);
-        std::array<double, kCalibrationSamples> sorted = t.samples;
-        std::sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(t.sample_count));
+        std::array<double, kCalibrationSamples> sorted;
+        std::copy_n(t.samples.begin(), t.sample_count, sorted.begin());
+        const auto end = sorted.begin() + static_cast<std::ptrdiff_t>(t.sample_count);
         const size_t rank = static_cast<size_t>(std::ceil(0.95 * static_cast<double>(t.sample_count)));
-        t.p95_us = sorted[(std::max<size_t>)(rank, 1) - 1];
-        t.max_us = sorted[t.sample_count - 1];
+        const auto nth = sorted.begin() + static_cast<std::ptrdiff_t>(rank - 1);
+        std::nth_element(sorted.begin(), nth, end);
+        t.p95_us = *nth;
+        t.max_us = *std::max_element(nth, end); // the partition below p95 cannot contain a larger value
         g_core.SetWakeLatencyUs(t.p95_us);
         g.cal_p95_us.store(t.p95_us, std::memory_order_relaxed);
         g.cal_max_us.store(t.max_us, std::memory_order_relaxed);

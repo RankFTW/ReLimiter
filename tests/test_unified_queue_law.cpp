@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace
@@ -129,6 +130,45 @@ namespace
     {
         for (int i = 0; i < count; ++i)
             window->Push(sample);
+    }
+
+    void TestWindowCacheReplay()
+    {
+        const auto fields = [](const UnifiedQueueResult& r) {
+            return std::make_tuple(r.computable, r.in_use, r.limited, r.guard_active, r.bound_active,
+                r.valid_frames, r.base_us, r.need_us, r.service_us, r.q_us, r.p_us, r.guard_us,
+                r.gpu_interval_us, r.refill_us, r.refill_slack_us, r.refill_share_us);
+        };
+        UnifiedQueueWindow warm, unread;
+        bool arrivals[UnifiedQueueWindow::kWindow]{};
+        for (unsigned frame = 1; frame <= 128; ++frame) {
+            if (frame == 75) {
+                warm.Reset(); unread.Reset();
+                for (bool& valid : arrivals) valid = false;
+            }
+            auto sample = SampleS(static_cast<int>(frame * 193 % 7001) - 2000, 8000.0 + frame * 23);
+            sample.valid = frame % 19 < 16;
+            const auto measured = frame % 7 ? Position(frame) : UnifiedQueuePosition{};
+            warm.Push(sample, measured);
+            unread.Push(sample, measured);
+            arrivals[frame % UnifiedQueueWindow::kWindow] = sample.valid;
+            uint32_t valid = 0;
+            for (bool arrived : arrivals) valid += arrived;
+            CHECK(warm.ValidArrivals() == valid);
+            for (unsigned age = 0; age <= 6; ++age) {
+                const auto planned = age % 2 ? Position(frame + age) : UnifiedQueuePosition{};
+                // Change a single cache key at a time, then repeat the final query.
+                for (unsigned query = 0; query <= 6; ++query) {
+                    const auto params = Params(query >= 2 ? 4 : 2, query >= 3 ? 900.0 : 4000.0,
+                        query >= 4 ? 0.1 : 0.0, query >= 5 ? 4 : 16);
+                    const double j = query ? 8500.0 : 10900.0;
+                    auto cold = unread; // never queried: the same window, always measured from scratch
+                    CHECK(fields(warm.Compute(j, params, planned)) == fields(cold.Compute(j, params, planned)));
+                }
+                warm.NotePlanned();
+                unread.NotePlanned();
+            }
+        }
     }
 
     // ── Samples ──
@@ -2291,6 +2331,7 @@ int main()
 {
     std::printf("=== Unified queue law tests ===\n");
     TestSampleFromRecord();
+    TestWindowCacheReplay();
     TestOrderStatisticsMedianAndGuard();
     TestPositivePartBoundAndClamp();
     TestGpuBoundPositiveMarginShrinks();

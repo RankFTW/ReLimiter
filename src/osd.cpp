@@ -1,6 +1,7 @@
 #include "osd.h"
 #include "osd_position_policy.h"
 #include "osd_cadence_policy.h"
+#include "osd_overlay_policy.h"
 #include "config.h"
 #include "scheduler.h"
 #include "pacing_resolver.h"
@@ -41,6 +42,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 #include <new>
 
 // ── OSD readout state ──
@@ -57,17 +59,35 @@ static int   s_ft_history_count = 0;
 static float s_graph_scale_min = 0.0f;
 static float s_graph_scale_max = 33.0f;
 
-// The UI's handle of one hotkey: which poller slot a binding control drives (hotkey_poller.h).
-// The edge state of the key lives with the poller.
-struct HotkeyState {
-    HotkeySlot slot;
-};
-static HotkeyState s_position_hotkey{ HotkeySlot::PositionCycle };
-static HotkeyState s_oled_care_hotkey{ HotkeySlot::OledCare };
-static HotkeyState* s_capturing_hotkey = nullptr;
-static int s_binding_frame = -1;
+static HotkeySlot s_capturing_hotkey = HotkeySlot::Count;
+static bool s_binding_drawn = false;
+static std::atomic<reshade::api::effect_runtime*> s_capture_runtime{nullptr};
+static bool s_overlay_registered = false;
+static unsigned s_runtime_count = 0;
+static bool s_readout = false;
+static osd_overlay_policy::DetailsPanels s_details;
+static bool s_showing = false;
+static unsigned s_sensor_mask = 0;
+static std::atomic<bool> s_registration_pending{false};
+static std::atomic<bool> s_poll_fallback{false};
+// Teardown must not wait for an entire settings callback (it can be in a
+// driver call). Only cold registration and consumer admission take this lock.
+static std::mutex s_transition_lock;
 
-static bool DrawKeybind(const char* label, std::string* binding, HotkeyState* state);
+// ReShade draws the settings panel before reshade_overlay in one ImGui frame.
+// Reuse its DRS and NGX reads when both surfaces are visible. The runtime and
+// frame token prevent replay after a skipped draw; the config owner serializes
+// the callbacks even when two runtimes have independent ImGui contexts.
+static struct {
+    reshade::api::effect_runtime* runtime = nullptr;
+    int frame = -1;
+    DLSSPresets presets{};
+    NGXDLSSInfo dlss{};
+} s_panel;
+static void PublishHotkeyBindings();
+static void UpdateOsdDemand();
+
+static bool DrawKeybind(const char* label, std::string* binding, HotkeySlot slot, bool editable);
 
 void OSD_CyclePosition() {
     const auto next = osd_position_policy::NextClockwise(g_config.osd_x, g_config.osd_y);
@@ -328,7 +348,7 @@ static void DrawPacingSummaryLine(const PacingPipelineSnapshot& pipeline, bool h
 
 // Main view: the plain state, a warning while developer diagnostics differ
 // from the recommended defaults, and the technical lines under Details.
-static void DrawPacingSummary(bool* config_dirty) {
+static void DrawPacingSummary(reshade::api::effect_runtime* runtime, bool* config_dirty) {
     const PacingPipelineSnapshot pipeline = PacingPipeline_Read();
     SchedulerPacingStatus status;
     const bool has_status = Scheduler_ReadPacingStatus(&status);
@@ -346,6 +366,7 @@ static void DrawPacingSummary(bool* config_dirty) {
             "recommended defaults, which can make pacing worse. Reset returns all of them to the defaults.");
     }
     if (ImGui::TreeNode("Details##pacing")) {
+        if (s_details.Draw(runtime)) UpdateOsdDemand();
         DrawPacingPipelineStatus();
         ImGui::TreePop();
     }
@@ -431,7 +452,7 @@ static void DrawPacingDiagnostics(bool* config_dirty) {
     ImGui::Spacing();
 }
 
-static void DrawSettingsImpl() {
+static void DrawSettingsImpl(reshade::api::effect_runtime* runtime, bool editable_bindings) {
     // Dirty flag — enqueue an immutable save snapshot at end of frame.
     bool config_dirty = false;
 
@@ -466,12 +487,11 @@ static void DrawSettingsImpl() {
         reflex_cap = static_cast<int>(ceiling_hz - (ceiling_hz * ceiling_hz / 3600.0));
 
     // Check for Dynamic DMFG early — affects all FPS controls
-    bool dmfg_dynamic_active = false;
-    {
-        DLSSPresets p_drs = DLSSPresets_Get();
-        if (p_drs.available && p_drs.mfg_mode_override == 4)
-            dmfg_dynamic_active = true;
-    }
+    s_panel.runtime = runtime;
+    s_panel.frame = s_overlay_registered ? ImGui::GetFrameCount() : -1;
+    const auto& presets = (s_panel.presets = DLSSPresets_Get());
+    const auto& dlss = (s_panel.dlss = NGXHooks_GetInfo(true));
+    const bool dmfg_dynamic_active = presets.available && presets.mfg_mode_override == 4;
 
     if (dmfg_dynamic_active) ImGui::BeginDisabled();
     if (ImGui::RadioButton("VRR Cap", reflex_cap > 0 && target == reflex_cap)) {
@@ -515,8 +535,7 @@ static void DrawSettingsImpl() {
 
     if (dmfg_dynamic_active) {
         // Dynamic DMFG: show driver target, slider disabled
-        DLSSPresets p_drs_fps = DLSSPresets_Get();
-        int drs_target = p_drs_fps.mfg_dynamic_target_fps;
+        int drs_target = presets.mfg_dynamic_target_fps;
 
         // Resolve display value
         int display_target = 0;
@@ -652,7 +671,7 @@ static void DrawSettingsImpl() {
     // ════════════════════════════════════════════
     // Primary pacing controls belong with the FPS controls, before display/OSD customization.
     ImGui::Separator();
-    DrawPacingSummary(&config_dirty);
+    DrawPacingSummary(runtime, &config_dirty);
     if (dmfg_dynamic_active) ImGui::TextDisabled("Dynamic frame generation: pacing passthrough");
 #ifdef _WIN64
     if (!dmfg_dynamic_active)
@@ -668,7 +687,7 @@ static void DrawSettingsImpl() {
         HelpTip("Toggle the in-game overlay on or off.");
         if (ImGui::Button("Move OSD")) OSD_CyclePosition();
         HelpTip("Move clockwise: top-left, top-right, bottom-right, bottom-left.");
-        if (DrawKeybind("Move OSD Key", &g_config.osd_position_cycle_key, &s_position_hotkey))
+        if (DrawKeybind("Move OSD Key", &g_config.osd_position_cycle_key, HotkeySlot::PositionCycle, editable_bindings))
             config_dirty = true;
         float osd_x_pct = g_config.osd_x * 100.0f;
         float osd_y_pct = g_config.osd_y * 100.0f;
@@ -874,144 +893,13 @@ static void DrawSettingsImpl() {
 
         // ── Preset cycling keybinds ──
         {
-            // Built-in preset definitions for cycling
-            // Index: 0=Min, 1=Med, 2=Full, then 3..N = user presets (occupied only)
-            auto ApplyPresetByIndex = [&](int idx) {
-                if (idx == 0) {
-                    OSDPreset p = {};
-                    p.show_fps = true; p.show_frametime = true; p.show_gpu_temp = true;
-                    OSDPreset_ApplyTogglesOnly(p);
-                } else if (idx == 1) {
-                    OSDPreset p = {};
-                    p.show_fps = true; p.show_1pct_low = true; p.show_frametime = true;
-                    p.show_frametime_graph = true; p.show_gpu_render_time = true;
-                    p.show_jitter = true; p.show_fg = true;
-                    p.show_gpu_temp = true; p.show_gpu_usage = true; p.show_vram = true;
-                    OSDPreset_ApplyTogglesOnly(p);
-                } else if (idx == 2) {
-                    OSDPreset p = {};
-                    p.show_fps = true; p.show_1pct_low = true; p.show_0_1pct_low = true;
-                    p.show_frametime = true; p.show_frametime_graph = true;
-                    p.show_cpu_latency = true; p.show_native_pcl = true; p.show_native_pcl_breakdown = true; p.show_gpu_render_time = true;
-                    p.show_total_frame_cost = true; p.show_fg_time = true;
-                    p.show_jitter = true; p.show_pacing_quality = true; p.show_fg = true; p.show_limiter = true;
-                    p.show_gpu_temp = true;
-                    p.show_gpu_clock = true; p.show_gpu_usage = true; p.show_vram = true;
-                    p.show_cpu_usage = true; p.show_ram = true;
-                    p.show_dlss_quality = true; p.show_dlss_features = true;
-                    p.show_dlss_resolution = true; p.show_dlss_presets = true;
-                    p.show_dlss_versions = true;
-                    OSDPreset_ApplyTogglesOnly(p);
-                } else {
-                    // User preset (idx - 3)
-                    int user_idx = idx - 3;
-                    if (user_idx >= 0 && user_idx < OSDPreset_GetCount()) {
-                        OSDPreset& slot = OSDPreset_GetSlot(user_idx);
-                        if (slot.occupied)
-                            OSDPreset_ApplyToConfig(slot);
-                    }
-                }
-                config_dirty = true;
-            };
-
-            // Count total presets: 3 built-in + occupied user presets
-            static int s_current_preset = 0;
-            int total_presets = 3;
-            for (int i = 0; i < OSDPreset_GetCount(); i++)
-                if (OSDPreset_GetSlot(i).occupied) total_presets++;
-
-            // Keybind UI
+            // The present callback applies cycle requests, even with the OSD hidden.
             ImGui::Spacing();
 
-            // Prev Preset keybind
-            {
-                static bool s_capturing = false;
-                ImGui::Text("Prev Preset:");
-                ImGui::SameLine();
-                if (s_capturing) {
-                    ImGui::TextColored(ImVec4(1,1,0.3f,1), "Press key...");
-                    ImGui::SameLine();
-                    if (ImGui::Button("Cancel##prev")) s_capturing = false;
-                    for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k++) {
-                        ImGuiKey key = static_cast<ImGuiKey>(k);
-                        if (key == ImGuiKey_LeftCtrl || key == ImGuiKey_RightCtrl) continue;
-                        if (key == ImGuiKey_LeftShift || key == ImGuiKey_RightShift) continue;
-                        if (key == ImGuiKey_LeftAlt || key == ImGuiKey_RightAlt) continue;
-                        if (key == ImGuiKey_LeftSuper || key == ImGuiKey_RightSuper) continue;
-                        if (k == ImGuiMod_Ctrl || k == ImGuiMod_Shift || k == ImGuiMod_Alt || k == ImGuiMod_Super) continue;
-                        if (key >= ImGuiKey_MouseLeft && key <= ImGuiKey_MouseWheelY) continue;
-                        const char* kn = ImGui::GetKeyName(key);
-                        if (kn && kn[0] == 'M' && kn[1] == 'o' && kn[2] == 'd') continue;
-                        if (ImGui::IsKeyPressed(key, false)) {
-                            std::string name;
-                            if (ImGui::IsKeyDown(ImGuiMod_Ctrl)) name += "Ctrl+";
-                            if (ImGui::IsKeyDown(ImGuiMod_Alt)) name += "Alt+";
-                            if (ImGui::IsKeyDown(ImGuiMod_Shift)) name += "Shift+";
-                            name += ImGui::GetKeyName(key);
-                            g_config.osd_preset_prev_key = name;
-                            s_capturing = false;
-                            config_dirty = true;
-                            break;
-                        }
-                    }
-                } else {
-                    ImGui::Text("%s", g_config.osd_preset_prev_key.empty() ? "None" : g_config.osd_preset_prev_key.c_str());
-                    ImGui::SameLine();
-                    if (ImGui::Button("Bind##prev")) s_capturing = true;
-                    if (!g_config.osd_preset_prev_key.empty()) {
-                        ImGui::SameLine();
-                        if (ImGui::Button("Clear##prev")) {
-                            g_config.osd_preset_prev_key.clear();
-                            config_dirty = true;
-                        }
-                    }
-                }
-            }
-
-            // Next Preset keybind
-            {
-                static bool s_capturing = false;
-                ImGui::Text("Next Preset:");
-                ImGui::SameLine();
-                if (s_capturing) {
-                    ImGui::TextColored(ImVec4(1,1,0.3f,1), "Press key...");
-                    ImGui::SameLine();
-                    if (ImGui::Button("Cancel##next")) s_capturing = false;
-                    for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k++) {
-                        ImGuiKey key = static_cast<ImGuiKey>(k);
-                        if (key == ImGuiKey_LeftCtrl || key == ImGuiKey_RightCtrl) continue;
-                        if (key == ImGuiKey_LeftShift || key == ImGuiKey_RightShift) continue;
-                        if (key == ImGuiKey_LeftAlt || key == ImGuiKey_RightAlt) continue;
-                        if (key == ImGuiKey_LeftSuper || key == ImGuiKey_RightSuper) continue;
-                        if (k == ImGuiMod_Ctrl || k == ImGuiMod_Shift || k == ImGuiMod_Alt || k == ImGuiMod_Super) continue;
-                        if (key >= ImGuiKey_MouseLeft && key <= ImGuiKey_MouseWheelY) continue;
-                        const char* kn = ImGui::GetKeyName(key);
-                        if (kn && kn[0] == 'M' && kn[1] == 'o' && kn[2] == 'd') continue;
-                        if (ImGui::IsKeyPressed(key, false)) {
-                            std::string name;
-                            if (ImGui::IsKeyDown(ImGuiMod_Ctrl)) name += "Ctrl+";
-                            if (ImGui::IsKeyDown(ImGuiMod_Alt)) name += "Alt+";
-                            if (ImGui::IsKeyDown(ImGuiMod_Shift)) name += "Shift+";
-                            name += ImGui::GetKeyName(key);
-                            g_config.osd_preset_next_key = name;
-                            s_capturing = false;
-                            config_dirty = true;
-                            break;
-                        }
-                    }
-                } else {
-                    ImGui::Text("%s", g_config.osd_preset_next_key.empty() ? "None" : g_config.osd_preset_next_key.c_str());
-                    ImGui::SameLine();
-                    if (ImGui::Button("Bind##next")) s_capturing = true;
-                    if (!g_config.osd_preset_next_key.empty()) {
-                        ImGui::SameLine();
-                        if (ImGui::Button("Clear##next")) {
-                            g_config.osd_preset_next_key.clear();
-                            config_dirty = true;
-                        }
-                    }
-                }
-            }
+            if (DrawKeybind("Prev Preset", &g_config.osd_preset_prev_key, HotkeySlot::PresetPrev, editable_bindings))
+                config_dirty = true;
+            if (DrawKeybind("Next Preset", &g_config.osd_preset_next_key, HotkeySlot::PresetNext, editable_bindings))
+                config_dirty = true;
         }
 
         // ── Elements by category ──
@@ -1106,9 +994,7 @@ static void DrawSettingsImpl() {
         HelpTip("Show how much time the limiter added.");
 #endif
 
-        {
-        NGXDLSSInfo dlss_check = NGXHooks_GetInfo();
-        if (dlss_check.available) {
+        if (dlss.available) {
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "DLSS");
         if (ImGui::Checkbox("Quality Level##osd_elem", &g_config.osd_show_dlss_quality)) config_dirty = true;
@@ -1125,7 +1011,6 @@ static void DrawSettingsImpl() {
         FlowSeparator();
         if (ImGui::Checkbox("Versions##osd_elem", &g_config.osd_show_dlss_versions)) config_dirty = true;
         HelpTip("Show DLSS DLL versions (SR, RR, FG) and Streamline version if loaded.");
-        }
         }
 
         ImGui::Spacing();
@@ -1291,48 +1176,8 @@ static void DrawSettingsImpl() {
                     "Useful for reducing distractions and light bleed in dark rooms. "
                     "Toggle with the keybind below or this checkbox.");
 
-            // Blackout keybind
-            static bool s_blackout_capturing = false;
-            ImGui::Text("Blackout Key:");
-            ImGui::SameLine();
-            if (s_blackout_capturing) {
-                ImGui::TextColored(ImVec4(1,1,0.3f,1), "Press key...");
-                ImGui::SameLine();
-                if (ImGui::Button("Cancel##blackout")) s_blackout_capturing = false;
-                for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k++) {
-                    ImGuiKey key = static_cast<ImGuiKey>(k);
-                    if (key == ImGuiKey_LeftCtrl || key == ImGuiKey_RightCtrl) continue;
-                    if (key == ImGuiKey_LeftShift || key == ImGuiKey_RightShift) continue;
-                    if (key == ImGuiKey_LeftAlt || key == ImGuiKey_RightAlt) continue;
-                    if (key == ImGuiKey_LeftSuper || key == ImGuiKey_RightSuper) continue;
-                    if (k == ImGuiMod_Ctrl || k == ImGuiMod_Shift || k == ImGuiMod_Alt || k == ImGuiMod_Super) continue;
-                    if (key >= ImGuiKey_MouseLeft && key <= ImGuiKey_MouseWheelY) continue;
-                    const char* kn = ImGui::GetKeyName(key);
-                    if (kn && kn[0] == 'M' && kn[1] == 'o' && kn[2] == 'd') continue;
-                    if (ImGui::IsKeyPressed(key, false)) {
-                        std::string name;
-                        if (ImGui::IsKeyDown(ImGuiMod_Ctrl)) name += "Ctrl+";
-                        if (ImGui::IsKeyDown(ImGuiMod_Alt)) name += "Alt+";
-                        if (ImGui::IsKeyDown(ImGuiMod_Shift)) name += "Shift+";
-                        name += ImGui::GetKeyName(key);
-                        g_config.blackout_key = name;
-                        s_blackout_capturing = false;
-                        config_dirty = true;
-                        break;
-                    }
-                }
-            } else {
-                ImGui::Text("%s", g_config.blackout_key.empty() ? "None" : g_config.blackout_key.c_str());
-                ImGui::SameLine();
-                if (ImGui::Button("Bind##blackout")) s_blackout_capturing = true;
-                if (!g_config.blackout_key.empty()) {
-                    ImGui::SameLine();
-                    if (ImGui::Button("Clear##blackout")) {
-                        g_config.blackout_key.clear();
-                        config_dirty = true;
-                    }
-                }
-            }
+            if (DrawKeybind("Blackout Key", &g_config.blackout_key, HotkeySlot::Blackout, editable_bindings))
+                config_dirty = true;
         }
 
         // ── OLED Care ──
@@ -1352,7 +1197,7 @@ static void DrawSettingsImpl() {
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) config_dirty = true;
         HelpTip("Automatically activate after this many idle minutes. 0 disables automatic activation.");
-        if (DrawKeybind("OLED Care Key", &g_config.oled_care_key, &s_oled_care_hotkey))
+        if (DrawKeybind("OLED Care Key", &g_config.oled_care_key, HotkeySlot::OledCare, editable_bindings))
             config_dirty = true;
 
         // ── Focus Lock ──
@@ -1538,61 +1383,8 @@ static void DrawSettingsImpl() {
     // ════════════════════════════════════════════
     ImGui::Separator();
     {
-        static bool s_capturing = false;
-
-        ImGui::Text("OSD Toggle Key:");
-        ImGui::SameLine();
-
-        if (s_capturing) {
-            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.3f, 1.0f), "Press key combo...");
-            ImGui::SameLine();
-            if (ImGui::Button("Cancel")) {
-                s_capturing = false;
-            }
-
-            // Use ImGui key state — works inside the ReShade overlay
-            bool ctrl  = ImGui::IsKeyDown(ImGuiMod_Ctrl);
-            bool alt   = ImGui::IsKeyDown(ImGuiMod_Alt);
-            bool shift = ImGui::IsKeyDown(ImGuiMod_Shift);
-
-            // Scan ImGuiKey range for a non-modifier key press
-            for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; k++) {
-                ImGuiKey key = static_cast<ImGuiKey>(k);
-                // Skip modifiers (both physical keys and mod flags)
-                if (key == ImGuiKey_LeftCtrl  || key == ImGuiKey_RightCtrl)  continue;
-                if (key == ImGuiKey_LeftShift || key == ImGuiKey_RightShift) continue;
-                if (key == ImGuiKey_LeftAlt   || key == ImGuiKey_RightAlt)   continue;
-                if (key == ImGuiKey_LeftSuper || key == ImGuiKey_RightSuper) continue;
-                if (k == ImGuiMod_Ctrl || k == ImGuiMod_Shift || k == ImGuiMod_Alt || k == ImGuiMod_Super) continue;
-                // Skip mouse buttons
-                if (key == ImGuiKey_MouseLeft || key == ImGuiKey_MouseRight ||
-                    key == ImGuiKey_MouseMiddle || key == ImGuiKey_MouseX1 ||
-                    key == ImGuiKey_MouseX2 || key == ImGuiKey_MouseWheelX ||
-                    key == ImGuiKey_MouseWheelY) continue;
-                // Skip any key whose name starts with "Mod" (catches ModCtrl, ModAlt, etc.)
-                const char* kname = ImGui::GetKeyName(key);
-                if (kname && kname[0] == 'M' && kname[1] == 'o' && kname[2] == 'd') continue;
-
-                if (ImGui::IsKeyPressed(key, false)) {
-                    std::string name;
-                    if (ctrl)  name += "Ctrl+";
-                    if (alt)   name += "Alt+";
-                    if (shift) name += "Shift+";
-                    name += ImGui::GetKeyName(key);
-
-                    g_config.osd_toggle_key = name;
-                    s_capturing = false;
-                    config_dirty = true;
-                    break;
-                }
-            }
-        } else {
-            ImGui::Text("%s", g_config.osd_toggle_key.c_str());
-            ImGui::SameLine();
-            if (ImGui::Button("Bind")) {
-                s_capturing = true;
-            }
-        }
+        if (DrawKeybind("OSD Toggle Key", &g_config.osd_toggle_key, HotkeySlot::OsdToggle, editable_bindings))
+            config_dirty = true;
         HelpTip("Keybind to toggle the OSD overlay on/off. Click Bind, then press a key combo (e.g. Ctrl+F12, Alt+P). Works in-game and with the ReShade UI open.");
     }
 
@@ -1642,7 +1434,7 @@ static void DrawSettingsImpl() {
 #ifdef _WIN64
         // FG pacing status
         const int fg_div_raw = g_resolved_fg_divisor.load(std::memory_order_relaxed);
-        if (IsDmfgActive()) {
+        if (dmfg_dynamic_active || g_config.dynamic_mfg_passthrough) {
             ImGui::Text("FG Pacing: Dynamic (passthrough)");
         } else if (fg_div_raw > 1) {
             double eff_us = g_effective_interval_us.load(std::memory_order_relaxed);
@@ -1672,10 +1464,8 @@ static void DrawSettingsImpl() {
 
     // DLSS / Streamline info — always visible in settings panel
     {
-        NGXDLSSInfo dlss = NGXHooks_GetInfo();
         if (dlss.available) {
-            DLSSPresets_Poll();
-            DLSSPresets presets = DLSSPresets_Get();
+            DLSSPresets_EnsureStarted();
 
             // Quality level
             const char* quality_str = "Unknown";
@@ -1777,16 +1567,27 @@ static void DrawSettingsImpl() {
     }
 
     // Snapshot changed settings now; persistence runs on the save worker.
-    if (config_dirty)
+    if (config_dirty) {
+        PublishHotkeyBindings();
+        UpdateOsdDemand();
         RequestSaveConfig();
+    }
 }
 
-void DrawSettings(reshade::api::effect_runtime*) {
+static void DrawSettings(reshade::api::effect_runtime* runtime) {
     RuntimeCallbackGuard callback;
     if (callback.IsStopping()) return;
     try {
         ConfigOwnerLock owner;
-        DrawSettingsImpl();
+        if (RuntimeLifecycle_IsStopping()) return;
+        auto* capture = s_capture_runtime.load(std::memory_order_relaxed);
+        const bool editable = !capture || capture == runtime;
+        if (editable) s_binding_drawn = false;
+        DrawSettingsImpl(runtime, editable);
+        if (editable && s_binding_drawn) {
+            s_capture_runtime.store(runtime, std::memory_order_release);
+            Hotkeys_SetSuppressed(true);
+        }
     }
     catch (...) {
         OutputDebugStringA("ReLimiter: settings callback rejected an exception.\n");
@@ -1818,35 +1619,9 @@ static void ResetCadenceHistory() {
 }
 
 static void RecomputeLowFPS() {
-    int n = s_low_history_count < LOW_HISTORY_SIZE ? s_low_history_count : LOW_HISTORY_SIZE;
-
-    // 1% low
-    if (n >= 30) {
-        static double sorted[LOW_HISTORY_SIZE];
-        for (int i = 0; i < n; i++)
-            sorted[i] = s_low_history[i];
-        std::sort(sorted, sorted + n);
-
-        int tail_start = static_cast<int>(0.99 * (n - 1));
-        int tail_count = n - tail_start;
-        double sum = 0.0;
-        for (int i = tail_start; i < n; i++)
-            sum += sorted[i];
-        double avg_worst = sum / tail_count;
-        s_cached_1pct_low = (avg_worst > 0.0) ? 1000000.0 / avg_worst : 0.0;
-
-        // 0.1% low (reuse sorted array)
-        if (n >= 100) {
-            int tail_01 = static_cast<int>(0.999 * (n - 1));
-            int count_01 = n - tail_01;
-            if (count_01 < 1) count_01 = 1;
-            double sum_01 = 0.0;
-            for (int i = tail_01; i < n; i++)
-                sum_01 += sorted[i];
-            double avg_01 = sum_01 / count_01;
-            s_cached_01pct_low = (avg_01 > 0.0) ? 1000000.0 / avg_01 : 0.0;
-        }
-    }
+    const auto lows = osd_cadence_policy::GetLowFps(s_low_history, s_low_history_count);
+    s_cached_1pct_low = lows.one_percent;
+    s_cached_01pct_low = lows.tenth_percent;
 }
 
 // ── Category colors ──
@@ -2130,18 +1905,22 @@ static ParsedKeybind ParseKeybind(const std::string& str) {
     return kb;
 }
 
-static bool DrawKeybind(const char* label, std::string* binding, HotkeyState* state) {
+static bool DrawKeybind(const char* label, std::string* binding, HotkeySlot slot, bool editable) {
+    if (!editable) {
+        ImGui::Text("%s: %s", label, binding->empty() ? "None" : binding->c_str());
+        return false;
+    }
     bool changed = false;
     ImGui::PushID(label);
     ImGui::Text("%s:", label);
     ImGui::SameLine();
-    if (s_capturing_hotkey == state) {
-        Hotkeys_Rearm(state->slot);
-        s_binding_frame = ImGui::GetFrameCount();
+    if (s_capturing_hotkey == slot) {
+        Hotkeys_Rearm(slot);
+        s_binding_drawn = true;
         ImGui::TextColored(ImVec4(1, 1, 0.3f, 1), "Press key...");
         ImGui::SameLine();
         if (ImGui::Button("Cancel")) {
-            s_capturing_hotkey = nullptr;
+            s_capturing_hotkey = HotkeySlot::Count;
         } else if (!ImGui::IsKeyDown(ImGuiMod_Super)) {
             for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; ++k) {
                 const ImGuiKey key = static_cast<ImGuiKey>(k);
@@ -2153,7 +1932,7 @@ static bool DrawKeybind(const char* label, std::string* binding, HotkeyState* st
                 if (ImGui::IsKeyDown(ImGuiMod_Alt)) *binding += "Alt+";
                 if (ImGui::IsKeyDown(ImGuiMod_Shift)) *binding += "Shift+";
                 *binding += name;
-                s_capturing_hotkey = nullptr;
+                s_capturing_hotkey = HotkeySlot::Count;
                 changed = true;
                 break;
             }
@@ -2162,15 +1941,15 @@ static bool DrawKeybind(const char* label, std::string* binding, HotkeyState* st
         ImGui::TextUnformatted(binding->empty() ? "None" : binding->c_str());
         ImGui::SameLine();
         if (ImGui::Button("Bind")) {
-            s_capturing_hotkey = state;
-            s_binding_frame = ImGui::GetFrameCount();
-            Hotkeys_Rearm(state->slot);
+            s_capturing_hotkey = slot;
+            s_binding_drawn = true;
+            Hotkeys_Rearm(slot);
         }
         if (!binding->empty()) {
             ImGui::SameLine();
             if (ImGui::Button("Clear")) {
                 binding->clear();
-                s_binding_frame = ImGui::GetFrameCount();
+                s_binding_drawn = true;
                 changed = true;
             }
         }
@@ -2202,36 +1981,22 @@ static void PublishHotkeyBindings() {
     PublishHotkeyBinding(HotkeySlot::Blackout, g_config.blackout_key);
     PublishHotkeyBinding(HotkeySlot::PositionCycle, g_config.osd_position_cycle_key);
     PublishHotkeyBinding(HotkeySlot::OledCare, g_config.oled_care_key);
+    const bool bound = Hotkeys_HasBindings();
+    Blackout_SetHotkeyDemand(bound);
+    s_poll_fallback.store(bound && !Hotkeys_ServiceThreadPolling(), std::memory_order_release);
 }
 
-static void DrawOSDImpl() {
-    // Cancel capture if its settings control stopped being drawn (closed UI
-    // or collapsed section), allowing either overlay callback order.
-    if (s_capturing_hotkey && s_binding_frame < ImGui::GetFrameCount() - 1) {
-        s_capturing_hotkey = nullptr;
-        s_binding_frame = ImGui::GetFrameCount();
-    }
-    const bool suppress_hotkeys = s_capturing_hotkey != nullptr || s_binding_frame == ImGui::GetFrameCount();
-    // ── Keybind polling ──
-    // The keys are not sampled here: the hotkey poller (hotkey_poller.h, the blackout service
-    // thread) samples them every 8 ms, with or without a frame, and latches the release -> press
-    // edges. This callback runs every frame via the reshade_overlay event, whether or not the
-    // overlay is visible; it publishes the bindings, tells the poller whether a capture is
-    // drawing, and applies the latched triggers below on this thread, which owns g_config here.
-    PublishHotkeyBindings();
-    Hotkeys_SetSuppressed(suppress_hotkeys);
-    // Only when the poller thread could not be created (logged once at start-up): the old per-frame
-    // poll, here on the presenting thread. With the thread this is a load and a branch.
+static void ApplyHotkeys() {
     Hotkeys_PollFallback();
-    const auto hotkey_fired = [suppress_hotkeys](HotkeySlot slot) {
-        const bool fired = Hotkeys_Take(slot);  // consumed also while suppressed
-        return fired && !suppress_hotkeys;
-    };
-    if (hotkey_fired(HotkeySlot::OsdToggle))
+    if (!Hotkeys_HasPending()) return;
+    Hotkeys_BeginDrain();
+    if (Hotkeys_Take(HotkeySlot::OsdToggle))
         g_config.osd_enabled = !g_config.osd_enabled;
 
     // ── Preset cycling keybind polling ──
-    {
+    const bool prev = Hotkeys_Take(HotkeySlot::PresetPrev);
+    const bool next = Hotkeys_Take(HotkeySlot::PresetNext);
+    if (prev || next) {
         static int s_active_preset = -1;  // -1 = no preset selected via keybind yet
 
         // Count total presets: 3 built-in + occupied user presets
@@ -2267,23 +2032,25 @@ static void DrawOSDImpl() {
                 p.show_dlss_versions = true;
                 OSDPreset_ApplyTogglesOnly(p);
             } else {
-                int user_idx = idx - 3;
-                if (user_idx >= 0 && user_idx < OSDPreset_GetCount()) {
-                    OSDPreset& slot = OSDPreset_GetSlot(user_idx);
-                    if (slot.occupied)
+                int ordinal = idx - 3;
+                for (int i = 0; i < OSDPreset_GetCount(); ++i) {
+                    OSDPreset& slot = OSDPreset_GetSlot(i);
+                    if (slot.occupied && ordinal-- == 0) {
                         OSDPreset_ApplyToConfig(slot);
+                        break;
+                    }
                 }
             }
             RequestSaveConfig();
         };
 
         if (total_presets > 0) {
-            if (hotkey_fired(HotkeySlot::PresetPrev)) {
+            if (prev) {
                 s_active_preset = (s_active_preset <= 0) ? total_presets - 1 : s_active_preset - 1;
                 LOG_INFO("OSD: Preset cycle prev -> %d/%d", s_active_preset, total_presets);
                 ApplyCyclePreset(s_active_preset);
             }
-            if (hotkey_fired(HotkeySlot::PresetNext)) {
+            if (next) {
                 s_active_preset = (s_active_preset >= total_presets - 1) ? 0 : s_active_preset + 1;
                 LOG_INFO("OSD: Preset cycle next -> %d/%d", s_active_preset, total_presets);
                 ApplyCyclePreset(s_active_preset);
@@ -2291,26 +2058,27 @@ static void DrawOSDImpl() {
         }
     }
 
-    // ── Blackout keybind polling ──
-    {
-        if (hotkey_fired(HotkeySlot::Blackout))
-            Blackout_Toggle();
-    }
-
-    if (hotkey_fired(HotkeySlot::PositionCycle))
+    if (Hotkeys_Take(HotkeySlot::Blackout))
+        Blackout_Toggle();
+    if (Hotkeys_Take(HotkeySlot::PositionCycle))
         OSD_CyclePosition();
-    if (hotkey_fired(HotkeySlot::OledCare))
+    if (Hotkeys_Take(HotkeySlot::OledCare))
         OLEDCare_Toggle();
 
-    // Read even while hidden, consuming tokens without training histories so
-    // reopening cannot replay a cached pre-toggle sample.
+    UpdateOsdDemand();
+}
+
+static void DrawOSDImpl(reshade::api::effect_runtime* runtime) {
+    if (!g_config.osd_enabled) return;
+    const bool panel_frame = s_panel.runtime == runtime && s_panel.frame == ImGui::GetFrameCount();
+    s_panel.runtime = nullptr;
     SchedulerActualFrameSample scheduler_sample;
     const bool coherent_sample = Scheduler_ReadActualFrameSample(&scheduler_sample);
     const osd_cadence_policy::Sample sample{
         scheduler_sample.sequence, scheduler_sample.frame_time_us, scheduler_sample.valid};
     const ULONGLONG cadence_now = GetTickCount64();
     const auto cadence = s_cadence_consumer.Observe(
-        coherent_sample ? &sample : nullptr, cadence_now, g_config.osd_enabled);
+        coherent_sample ? &sample : nullptr, cadence_now);
     if (cadence.reset_history)
         ResetCadenceHistory();
 
@@ -2324,19 +2092,16 @@ static void DrawOSDImpl() {
         s_display_fps = 0.0;
         s_display_output_fps = 0.0;
     }
-    if (!g_config.osd_enabled) return;
 
-    // Retry NGX hook installation for games where DLLs load late.
-    // TryInstall is idempotent — no-ops once hooks are installed.
-    // Stops after ~30 seconds.
-    {
-        static int s_ngx_retry_counter = 0;
-        if (s_ngx_retry_counter < 5000) {  // ~30s at 165fps
-            s_ngx_retry_counter++;
-            if (s_ngx_retry_counter % 60 == 0 && g_config.dlss_info_hooks)
-                NGXHooks_TryInstall();
-        }
+#ifdef _WIN64
+    // Keep the existing observation window for late loads. Stop scanning as
+    // soon as init, the loader worker, or our own retry installs the hooks.
+    static int ngx_frames = 0;
+    if (g_config.dlss_info_hooks && ngx_frames < 5000) {
+        if (NGXHooks_HasInstalled()) ngx_frames = 5000;
+        else if (++ngx_frames % 60 == 0) NGXHooks_TryInstall();
     }
+#endif
 
     // Real FPS from enforcement-to-enforcement interval (CPU frames only)
     // EMA advances only once per new valid coherent scheduler observation.
@@ -2360,23 +2125,19 @@ static void DrawOSDImpl() {
     const char* fg_label = "off";
     int fg_mult = g_fg_multiplier.load(std::memory_order_relaxed);
     bool fg_presenting = g_fg_presenting.load(std::memory_order_relaxed);
-    int fg_mode = g_fg_mode.load(std::memory_order_relaxed);
     char fg_buf[32] = {};
-    // Determine if FG is actively producing frames:
-    // - With Streamline mode data: mode > 0 AND presenting
-    // - Without mode data: just presenting (mode is always 0)
-    bool fg_display_active = fg_presenting && fg_mult > 0;
-    if (Streamline_HasModeData() && fg_mode == 0)
-        fg_display_active = false;
     // Histories are independent of ImGui window visibility/collapse and never
     // train on overlay repeats, invalid zeros, or publication overlap.
-    if (cadence.new_sample) {
+    if (cadence.new_sample && g_config.osd_show_frametime_graph) {
         s_ft_history[s_ft_history_idx] = static_cast<float>(ft_ms);
         s_ft_history_idx = (s_ft_history_idx + 1) % FT_HISTORY_SIZE;
         if (s_ft_history_count < FT_HISTORY_SIZE) s_ft_history_count++;
+    }
+    const bool smooth_motion = IsNvSmoothMotionActive();
+    if (cadence.new_sample && (g_config.osd_show_1pct_low || g_config.osd_show_0_1pct_low)) {
 
         double display_ft = ft;
-        if (IsNvSmoothMotionActive())
+        if (smooth_motion)
             display_ft = ft / 2.0;  // SM always 2x
         else if (fg_presenting && fg_mult > 0) {
             // Preserve the existing low-FPS divisor/label semantics.
@@ -2398,21 +2159,30 @@ static void DrawOSDImpl() {
     // Driver-authoritative FG confirmation: if the Reflex ring is reporting GPU data
     // but aiFrameTimeUs is 0, FG isn't actually producing interpolated frames.
     // Prevents false positives where compat poll reports FG active but it's off in-game.
-    if (fg_display_active) {
-        double ai_ft = g_reflex_ai_frame_time_us.load(std::memory_order_relaxed);
-        double gpu_active = g_reflex_gpu_active_us.load(std::memory_order_relaxed);
-        if (gpu_active > 0.0 && ai_ft == 0.0)
-            fg_display_active = false;
-    }
-    if (fg_display_active) {
+    const double ai_us = (g_config.osd_show_fg || g_config.osd_show_fg_time)
+        ? g_reflex_ai_frame_time_us.load(std::memory_order_relaxed) : 0.0;
+    const double active_us = (g_config.osd_show_fg || g_config.osd_show_gpu_render_time)
+        ? g_reflex_gpu_active_us.load(std::memory_order_relaxed) : 0.0;
+    const bool fg_display_active = g_config.osd_show_fg && fg_presenting && fg_mult > 0 &&
+        !(Streamline_HasModeData() && g_fg_mode.load(std::memory_order_relaxed) == 0) &&
+        !(active_us > 0.0 && ai_us == 0.0);
+    if (!panel_frame && (g_config.osd_show_fps || g_config.osd_show_fg ||
+        g_config.osd_show_limiter || g_config.osd_show_dlss_presets))
+        s_panel.presets = DLSSPresets_Get();
+    const auto& presets = s_panel.presets;
+#ifdef _WIN64
+    const bool dmfg = (presets.available && presets.mfg_mode_override == 4) || g_config.dynamic_mfg_passthrough;
+#else
+    constexpr bool dmfg = false;
+#endif
+    if (fg_display_active && !dmfg && !smooth_motion) {
         // Use actual driver multiplier when available (handles control panel overrides)
         int actual = g_fg_actual_multiplier.load(std::memory_order_relaxed);
         int display_mult = (actual >= 2) ? actual : (fg_mult + 1);
 
         // DRS MFG override: if Profile Inspector sets a higher generation factor, show that
-        DLSSPresets presets_fg = DLSSPresets_Get();
-        if (presets_fg.available && presets_fg.mfg_generation_factor > 0) {
-            int drs_mult = presets_fg.mfg_generation_factor + 1;
+        if (presets.available && presets.mfg_generation_factor > 0) {
+            int drs_mult = presets.mfg_generation_factor + 1;
             if (drs_mult > display_mult)
                 display_mult = drs_mult;
         }
@@ -2443,9 +2213,9 @@ static void DrawOSDImpl() {
         if (g_config.osd_show_fps && ft > 0.0) {
             double output = s_display_output_fps;
             char buf[64];
-            if (IsNvSmoothMotionActive()) {
+            if (smooth_motion) {
                 snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", s_display_fps * 2.0, s_display_fps);
-            } else if (IsDmfgActive() && output > 0.0) {
+            } else if (dmfg && output > 0.0) {
                 snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", output, s_display_fps);
             } else if (output > 0.0 && fg_presenting && fg_mult > 0)
                 snprintf(buf, sizeof(buf), "%.0f fps (%.1f render)", output, s_display_fps);
@@ -2560,7 +2330,7 @@ static void DrawOSDImpl() {
         }
 
         if (g_config.osd_show_gpu_render_time) {
-            double gpu_us = g_reflex_gpu_active_us.load(std::memory_order_relaxed);
+            double gpu_us = active_us;
             if (gpu_us > 0.0) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "GPU: %.1f ms", gpu_us / 1000.0);
@@ -2578,7 +2348,7 @@ static void DrawOSDImpl() {
         }
 
         if (g_config.osd_show_fg_time) {
-            double fg_us = g_reflex_ai_frame_time_us.load(std::memory_order_relaxed);
+            double fg_us = ai_us;
             if (fg_us > 0.0) {
                 char buf[32];
                 snprintf(buf, sizeof(buf), "FG: %.1f ms", fg_us / 1000.0);
@@ -2605,9 +2375,9 @@ static void DrawOSDImpl() {
 #ifdef _WIN64
         if (g_config.osd_show_fg) {
             char buf[48];
-            if (IsNvSmoothMotionActive()) {
+            if (smooth_motion) {
                 snprintf(buf, sizeof(buf), "FG: Smooth Motion");
-            } else if (IsDmfgActive()) {
+            } else if (dmfg) {
                 // For DMFG, infer the real-time multiplier from output/render ratio.
                 // This shows what the driver is actually doing right now (fluctuates with load).
                 int display_mult = 0;
@@ -2618,14 +2388,12 @@ static void DrawOSDImpl() {
                 }
                 // Fallback to DRS configured max if inference not ready
                 if (display_mult < 2) {
-                    DLSSPresets presets_dmfg = DLSSPresets_Get();
-                    if (presets_dmfg.available && presets_dmfg.mfg_generation_factor > 0)
-                        display_mult = presets_dmfg.mfg_generation_factor + 1;
+                    if (presets.available && presets.mfg_generation_factor > 0)
+                        display_mult = presets.mfg_generation_factor + 1;
                 }
 
                 // Show DRS target FPS on OSD when set
-                DLSSPresets presets_osd = DLSSPresets_Get();
-                int drs_target = presets_osd.mfg_dynamic_target_fps;
+                int drs_target = presets.mfg_dynamic_target_fps;
                 int display_cap = 0;
                 if (drs_target == 0x01000000) {
                     double ceil = g_ceiling_hz.load(std::memory_order_relaxed);
@@ -2648,7 +2416,7 @@ static void DrawOSDImpl() {
             OSDTextColored(ColPipeline(), buf);
         }
 
-        if (g_config.osd_show_limiter && !IsDmfgActive()) {
+        if (g_config.osd_show_limiter && !dmfg) {
             // Limiter-added latency: only the gate hold adds to input-to-photon
             // latency. own_sleep happens at SIMULATION_START (before input
             // sampling with Reflex), so it's frame pacing, not added latency.
@@ -2666,10 +2434,12 @@ static void DrawOSDImpl() {
         // ═══════════════════════════════════
         // DLSS (green — NGX feature info)
         // ═══════════════════════════════════
-        {
-            NGXDLSSInfo dlss = NGXHooks_GetInfo();
-            DLSSPresets_Poll();
-            DLSSPresets presets = DLSSPresets_Get();
+        // Once requested, the profile also feeds the pacer's MFG divisor and mode.
+        DLSSPresets_EnsureStarted();
+        if (g_config.osd_show_dlss_quality || g_config.osd_show_dlss_features ||
+            g_config.osd_show_dlss_resolution || g_config.osd_show_dlss_presets || g_config.osd_show_dlss_versions) {
+            if (!panel_frame) s_panel.dlss = NGXHooks_GetInfo(g_config.osd_show_dlss_versions);
+            const auto& dlss = s_panel.dlss;
 
             // Quality level
             if (g_config.osd_show_dlss_quality && dlss.available) {
@@ -2824,7 +2594,7 @@ static void DrawOSDImpl() {
         // ═══════════════════════════════════
         // SYSTEM (grey — hardware sensors)
         // ═══════════════════════════════════
-        {
+        if (s_sensor_mask) {
             const HWMonitorData hw = HWMonitor_GetData();
 
             // GPU metrics
@@ -2901,28 +2671,17 @@ static void DrawOSDImpl() {
         // FRAMETIME GRAPH
         // ═══════════════════════════════════
         if (g_config.osd_show_frametime_graph && s_ft_history_count > 0) {
-            float ordered[FT_HISTORY_SIZE];
-            float data_max = 0.0f;
-            float data_min = 1e9f;
-            const int first = (s_ft_history_idx + FT_HISTORY_SIZE - s_ft_history_count) % FT_HISTORY_SIZE;
-            for (int i = 0; i < s_ft_history_count; i++) {
-                float v = s_ft_history[(first + i) % FT_HISTORY_SIZE];
-                ordered[i] = v;
-                if (v > 0.0f) {
-                    if (v > data_max) data_max = v;
-                    if (v < data_min) data_min = v;
-                }
-            }
-
-            float current = static_cast<float>(ft_ms);
-            float ideal_min = (std::max)(0.0f, current - 4.0f);
-            float ideal_max = current + 4.0f;
-
-            float needed_min = (std::min)(ideal_min, data_min - 1.0f);
-            float needed_max = (std::max)(ideal_max, data_max + 1.0f);
-            needed_min = (std::max)(0.0f, needed_min);
-
             if (cadence.new_sample) {
+                // Every live sample is positive; the unfilled tail is excluded.
+                const auto bounds = std::minmax_element(s_ft_history, s_ft_history + s_ft_history_count);
+                const float data_min = *bounds.first;
+                const float data_max = *bounds.second;
+
+                const float current = static_cast<float>(ft_ms);
+                const float ideal_min = (std::max)(0.0f, current - 4.0f);
+                const float ideal_max = current + 4.0f;
+                const float needed_min = (std::max)(0.0f, (std::min)(ideal_min, data_min - 1.0f));
+                const float needed_max = (std::max)(ideal_max, data_max + 1.0f);
                 if (needed_min < s_graph_scale_min) s_graph_scale_min = needed_min;
                 if (needed_max > s_graph_scale_max) s_graph_scale_max = needed_max;
 
@@ -2935,16 +2694,20 @@ static void DrawOSDImpl() {
 
             float scale_min = s_graph_scale_min;
             float scale_max = s_graph_scale_max;
-            float scale_mid = (scale_min + scale_max) * 0.5f;
 
             constexpr float GRAPH_W = 300.0f;
             constexpr float GRAPH_H = 80.0f;
             constexpr float LABEL_W = 40.0f;
 
-            char top_label[16], mid_label[16], bot_label[16];
-            snprintf(top_label, sizeof(top_label), "%.0f", scale_max);
-            snprintf(mid_label, sizeof(mid_label), "%.0f", scale_mid);
-            snprintf(bot_label, sizeof(bot_label), "%.0f", scale_min);
+            static char top_label[16], mid_label[16], bot_label[16];
+            static float last_min = -1.0f, last_max = -1.0f;
+            if (scale_min != last_min || scale_max != last_max) {
+                last_min = scale_min;
+                last_max = scale_max;
+                snprintf(top_label, sizeof(top_label), "%.0f", scale_max);
+                snprintf(mid_label, sizeof(mid_label), "%.0f", (scale_max + scale_min) * 0.5f);
+                snprintf(bot_label, sizeof(bot_label), "%.0f", scale_min);
+            }
 
             ImVec2 cursor = ImGui::GetCursorScreenPos();
 
@@ -2956,8 +2719,9 @@ static void DrawOSDImpl() {
                 {cursor.x, cursor.y + GRAPH_H - 12.0f}, 0xFFCCCCCC, bot_label);
 
             ImGui::SetCursorScreenPos({cursor.x + LABEL_W, cursor.y});
-            ImGui::PlotLines("##ft_graph", ordered, s_ft_history_count,
-                             0, nullptr, scale_min, scale_max,
+            const int first = s_ft_history_count == FT_HISTORY_SIZE ? s_ft_history_idx : 0;
+            ImGui::PlotLines("##ft_graph", [](void*, int index) { return s_ft_history[index]; },
+                             nullptr, s_ft_history_count, first, nullptr, scale_min, scale_max,
                              ImVec2(GRAPH_W, GRAPH_H));
 
             ImGui::SetCursorScreenPos({cursor.x, cursor.y + GRAPH_H + 4.0f});
@@ -2969,19 +2733,154 @@ static void DrawOSDImpl() {
     ImGui::End();
 }
 
-void DrawOSD(reshade::api::effect_runtime*) {
+static void DrawOSD(reshade::api::effect_runtime* runtime) {
     RuntimeCallbackGuard callback;
     if (callback.IsStopping()) return;
     try {
         ConfigOwnerLock owner;
-        DrawOSDImpl();
+        if (RuntimeLifecycle_IsStopping()) return;
+        DrawOSDImpl(runtime);
     }
     catch (...) {
         OutputDebugStringA("ReLimiter: OSD callback rejected an exception.\n");
     }
 }
 
+// State transitions hold the config owner lock. Blackout and OLED Care draw
+// native windows on their own worker; neither needs a ReShade ImGui frame.
+static void UpdateOsdDemandLocked() {
+    const auto demand = osd_overlay_policy::Resolve(s_runtime_count, s_overlay_registered, g_config.osd_enabled);
+    s_registration_pending.store(demand.change_registration, std::memory_order_release);
+    const bool showing = demand.drawing;
+    if (showing != s_showing) {
+        s_showing = showing;
+        s_cadence_consumer.Reopen();
+        ResetCadenceHistory();
+    }
+    if (!g_config.osd_show_frametime_graph) {
+        s_ft_history_idx = s_ft_history_count = 0;
+        s_graph_scale_min = 0.0f;
+        s_graph_scale_max = 33.0f;
+    }
+    if (!g_config.osd_show_1pct_low && !g_config.osd_show_0_1pct_low) {
+        s_low_history_idx = s_low_history_count = s_low_recompute_counter = 0;
+        s_cached_1pct_low = s_cached_01pct_low = 0.0;
+    }
+    const bool readout = osd_overlay_policy::NeedsReadout(showing,
+        g_config.osd_show_jitter || g_config.osd_show_pacing_quality, s_details.Any());
+    if (s_readout != readout) {
+        s_readout = readout;
+        PacingTelemetry_SetOsdReadout(readout);
+    }
+    const unsigned sensors = showing ?
+        (g_config.osd_show_gpu_temp  ? HWSensorTemp : 0u) |
+        (g_config.osd_show_gpu_clock ? HWSensorClock : 0u) |
+        (g_config.osd_show_gpu_usage ? HWSensorGpuUsage : 0u) |
+        (g_config.osd_show_vram      ? HWSensorVram : 0u) |
+        (g_config.osd_show_cpu_usage ? HWSensorCpuUsage : 0u) |
+        (g_config.osd_show_ram       ? HWSensorRam : 0u) : 0u;
+    if (s_sensor_mask != sensors) {
+        s_sensor_mask = sensors;
+        HWMonitor_SetSensors(sensors);
+    }
+}
+
+static void UpdateOsdDemand() {
+    std::lock_guard<std::mutex> transition(s_transition_lock);
+    if (!RuntimeLifecycle_IsStopping()) UpdateOsdDemandLocked();
+}
+
+static void CancelKeyCapture() {
+    s_capturing_hotkey = HotkeySlot::Count;
+    s_binding_drawn = false;
+    s_capture_runtime.store(nullptr, std::memory_order_release);
+    Hotkeys_SetSuppressed(false);
+}
+
+static void OnRuntimeInit(reshade::api::effect_runtime*) {
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) return;
+    ConfigOwnerLock owner;
+    if (RuntimeLifecycle_IsStopping()) return;
+    ++s_runtime_count;
+    UpdateOsdDemand();
+}
+
+static void OnRuntimeDestroy(reshade::api::effect_runtime* runtime) {
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) return;
+    ConfigOwnerLock owner;
+    if (RuntimeLifecycle_IsStopping()) return;
+    if (s_capture_runtime.load(std::memory_order_relaxed) == runtime) CancelKeyCapture();
+    if (s_panel.runtime == runtime) s_panel.runtime = nullptr;
+    s_details.Close(runtime);
+    if (s_runtime_count > 0) --s_runtime_count;
+    UpdateOsdDemand();
+}
+
+static void OnOsdPresent(reshade::api::effect_runtime* runtime) {
+    RuntimeCallbackGuard callback;
+    if (callback.IsStopping()) return;
+    const bool close_details = s_details.MissedDraw(runtime);
+    if (!close_details && !Hotkeys_HasPending() && !s_poll_fallback.load(std::memory_order_acquire) &&
+        !s_registration_pending.load(std::memory_order_acquire) &&
+        s_capture_runtime.load(std::memory_order_acquire) != runtime) return;
+    try {
+        ConfigOwnerLock owner;
+        if (RuntimeLifecycle_IsStopping()) return;
+        if (close_details) {
+            s_details.Close(runtime);
+            UpdateOsdDemand();
+        }
+        if (s_capture_runtime.load(std::memory_order_relaxed) == runtime) {
+            if (!s_binding_drawn) CancelKeyCapture();
+            s_binding_drawn = false;
+        }
+        ApplyHotkeys();
+        // API 18 dispatches reshade_present AFTER draw_gui returns. Its event
+        // lists are global unsynchronized vectors: never mutate the overlay
+        // list from inside the overlay dispatch, or while another runtime can draw.
+        if (s_registration_pending.load(std::memory_order_relaxed)) {
+            std::lock_guard<std::mutex> transition(s_transition_lock);
+            if (RuntimeLifecycle_IsStopping()) return;
+            if (g_config.osd_enabled)
+                reshade::register_event<reshade::addon_event::reshade_overlay>(DrawOSD);
+            else
+                reshade::unregister_event<reshade::addon_event::reshade_overlay>(DrawOSD);
+            s_overlay_registered = g_config.osd_enabled;
+            UpdateOsdDemandLocked();
+        }
+    } catch (...) {
+        OutputDebugStringA("ReLimiter: OSD present callback rejected an exception.\n");
+    }
+}
+
 void RegisterOSD() {
+    ConfigOwnerLock owner;
+    // ReShade may reload the add-on before gameplay using its retained image.
+    s_panel.runtime = nullptr;
+    s_details.Reset();
+    s_runtime_count = 0;
+    s_sensor_mask = 0;
+    s_showing = s_readout = false;
+    Hotkeys_SetSuppressed(true); // reject prior-lifetime edges, including held keys
+    CancelKeyCapture();
+    PublishHotkeyBindings();
+    s_overlay_registered = g_config.osd_enabled;
+    if (s_overlay_registered) reshade::register_event<reshade::addon_event::reshade_overlay>(DrawOSD);
     reshade::register_overlay("ReLimiter", DrawSettings);
-    reshade::register_event<reshade::addon_event::reshade_overlay>(DrawOSD);
+    reshade::register_event<reshade::addon_event::init_effect_runtime>(OnRuntimeInit);
+    reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnRuntimeDestroy);
+    reshade::register_event<reshade::addon_event::reshade_present>(OnOsdPresent);
+}
+
+// BeginShutdown has closed all new admission. A callback that had already
+// entered must finish its short registration/demand transition before ReShade
+// removes callbacks or the workers are joined; its ImGui/driver work needn't finish here.
+void StopOSD() {
+    std::lock_guard<std::mutex> transition(s_transition_lock);
+    s_registration_pending.store(false, std::memory_order_release);
+    if (s_readout) PacingTelemetry_SetOsdReadout(false);
+    if (s_sensor_mask) HWMonitor_SetSensors(0);
+    Blackout_SetHotkeyDemand(false);
 }

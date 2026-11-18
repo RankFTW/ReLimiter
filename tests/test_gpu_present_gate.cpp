@@ -145,7 +145,7 @@ void TestStatusIdentity() {
 namespace {
 // Atomic: the live-worker lifecycle test reads these while the worker thread
 // registers and reverts on its own stack.
-std::atomic<int> mmcss_failure{0},mmcss_registered{0},mmcss_prioritized{0},mmcss_reverted{0},mmcss_freed{0};
+std::atomic<int> mmcss_failure{0},mmcss_loaded{0},mmcss_registered{0},mmcss_prioritized{0},mmcss_reverted{0},mmcss_freed{0};
 DWORD mmcss_owner=0;
 HANDLE WINAPI FakeMmcssSet(LPCSTR first,LPCSTR second,LPDWORD index) {
     CHECK(std::strcmp(first,"Games")==0 && std::strcmp(second,"Window Manager")==0);
@@ -162,6 +162,7 @@ BOOL WINAPI FakeMmcssRevert(HANDLE task) {
 }
 HMODULE WINAPI FakeMmcssLoad(LPCWSTR name,HANDLE file,DWORD flags) {
     CHECK(std::wcscmp(name,L"avrt.dll")==0 && !file && flags==LOAD_LIBRARY_SEARCH_SYSTEM32);
+    ++mmcss_loaded;
     return mmcss_failure==1?nullptr:reinterpret_cast<HMODULE>(1);
 }
 FARPROC WINAPI FakeMmcssProc(HMODULE module,LPCSTR name) {
@@ -287,8 +288,15 @@ public:
 void TestWorkerMmcss() {
     CHECK(GpuPresentTrace{}.worker_policy==4);
     for(int failure=0;failure<=5;++failure) {
-        mmcss_failure=failure;mmcss_registered=mmcss_prioritized=mmcss_reverted=mmcss_freed=0;
-        {gpu_present::WorkerMmcssRegistration registration;}
+        mmcss_failure=failure;mmcss_loaded=mmcss_registered=mmcss_prioritized=mmcss_reverted=mmcss_freed=0;
+        {
+            gpu_present::WorkerMmcssRegistration registration;
+            registration.SetDemand(true);
+            registration.SetDemand(true); // only the rising edge registers
+            registration.SetDemand(false);
+            CHECK(mmcss_freed==0);
+        }
+        CHECK(mmcss_loaded==1);
         CHECK(mmcss_registered==(failure==1 || failure==2?0:1));
         CHECK(mmcss_prioritized==(failure==1 || failure==2 || failure==3?0:1));
         CHECK(mmcss_reverted==(failure==5?2:failure==0 || failure==4?1:0));
@@ -321,7 +329,12 @@ void TestStartupReload() {
 void TestWorkerModeLifecycle() {
     using namespace gpu_present;
     CHECK(WorkerWaitMs(true,true)==kWorkerStopWaitMs && WorkerWaitMs(true,false)==kWorkerStopWaitMs);
-    CHECK(WorkerWaitMs(false,false)==50 && WorkerWaitMs(false,true)>=250);
+    CHECK(WorkerWaitMs(false,false)==50 && WorkerWaitMs(false,true)==INFINITE);
+    queues[3].state=QueueState::Ready;
+    CHECK(WorkerWaitMs(false,true)==250); // admission can still consult this queue's heartbeat
+    queues[3].state=QueueState::Empty;
+    queues[3].retired=true;CHECK(WorkerWaitMs(false,true)==250);
+    queues[3].retired=false;
     CHECK(Idle());
     for(const auto state:{TicketState::Preparing,TicketState::Armed,TicketState::Submitted,TicketState::Retired}) {
         queues[3].tickets[5].state=state;CHECK(!Idle()); // signal obligation or GPU retirement outstanding
@@ -337,11 +350,11 @@ void TestWorkerModeLifecycle() {
     // No H3 rung for the whole lifetime: no MMCSS request, not even for the stop drain.
     PublishRung(PacingRung::SourceOnly,PacingFallbackReason::FgUnqualified);
     CHECK(GpuPresent_RequiresReadiness() && !gpu_present_shared::H3Demand());
-    mmcss_registered=mmcss_prioritized=mmcss_reverted=mmcss_freed=0;
+    mmcss_loaded=mmcss_registered=mmcss_prioritized=mmcss_reverted=mmcss_freed=0;
     CHECK(GpuPresent_Start());
     CHECK(GpuPresent_Stop());
     CHECK(GpuPresent_ReleaseAfterRundown());
-    CHECK(mmcss_registered==0 && mmcss_prioritized==0 && mmcss_freed==0);
+    CHECK(mmcss_loaded==0 && mmcss_registered==0 && mmcss_prioritized==0 && mmcss_freed==0);
     // H3 at start registers once on the worker thread. Another rung reverts it
     // while the worker keeps running; H3 again registers again; the stop drain
     // keeps the registration until exit.
@@ -352,13 +365,13 @@ void TestWorkerModeLifecycle() {
     for(int attempt=0;attempt<5000 && heartbeat.load()<=0;++attempt)Sleep(1);
     CHECK(heartbeat.load()>0 && !(admission.load()&kClosed));
     PublishRung(PacingRung::MarkerHold);SetEvent(work_event);
-    CHECK(wait_for(mmcss_freed,1) && mmcss_reverted==1);
+    CHECK(wait_for(mmcss_reverted,1) && mmcss_loaded==1 && mmcss_freed==0);
     PublishRung(PacingRung::FgInputWait);SetEvent(work_event);
     CHECK(wait_for(mmcss_prioritized,2) && mmcss_registered==2);
     CHECK(GpuPresent_Stop());
     CHECK(admission.load()&kClosed);
     CHECK(GpuPresent_ReleaseAfterRundown());
-    CHECK(mmcss_reverted==2 && mmcss_freed==2);
+    CHECK(mmcss_reverted==2 && mmcss_loaded==1 && mmcss_freed==1);
     PublishRung(PacingRung::MarkerHold);
 }
 void TestQueueReclamation() {
@@ -1069,6 +1082,7 @@ int main() {
     TestStatusText();
     TestStatusIdentity();
 #ifdef _WIN64
+    g_pacing_telemetry_demand.store(kPacingReadout);
     TestWorkerMmcss();
     TestStatusWindow();
     TestStartupReload();

@@ -1,6 +1,7 @@
 #include "display_resolver.h"
 #include "swapchain_manager.h"
 #include "display_state.h"
+#include "frame_splitting.h"
 #include "nvapi_types.h"
 #include "logger.h"
 #include <dxgi.h>
@@ -247,6 +248,9 @@ void DispRes_OnSwapchainInit(uint64_t native_handle, ActiveAPI api, HWND hwnd) {
                      static_cast<int>(api), hwnd);
             s_resolved.store(false, std::memory_order_release);
         }
+        // The init can reset adaptive sync even if resolution had to keep a
+        // cached display. Successful resolution publishes from PollGSyncState.
+        FrameSplitting_DisplayChanged(DispRes_IsResolved() ? previous_id : 0);
     }
 }
 
@@ -255,6 +259,7 @@ void DispRes_OnSwapchainDestroy() {
     // re-resolution on next init. The ID itself is not zeroed (Req 2.3).
     s_resolved.store(false, std::memory_order_release);
     s_monitor_hwnd.store(nullptr, std::memory_order_release);
+    FrameSplitting_DisplayChanged(0);
     LOG_INFO("DispRes: swapchain destroyed, resolved=0 display_id=%u",
              s_display_id.load(std::memory_order_acquire));
 }

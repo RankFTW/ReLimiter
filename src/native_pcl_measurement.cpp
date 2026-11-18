@@ -343,7 +343,13 @@ void NativePcl_StartIfReady(bool latency_markers_observed) noexcept
     }
 
     try {
-        auto* worker = new std::thread(NativePclCollector_Run);
+        auto* worker = new std::thread([] {
+            // The exact Present/ETW identity join verifies the native route even
+            // without a readout. End admission only after the collector's last batch.
+            PacingTelemetry_SetRouteEvidence(true);
+            NativePclCollector_Run();
+            PacingTelemetry_SetRouteEvidence(false);
+        });
         g_worker_thread.store(worker, std::memory_order_release);
     }
     catch (...) {

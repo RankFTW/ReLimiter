@@ -35,6 +35,7 @@ static UINT source_sync = 0;
 static unsigned begins = 0, finishes = 0, invalid_finishes = 0, retires = 0, installs = 0, fail_install = 0, signals = 0, waits = 0;
 static HRESULT host_result = S_OK;
 static thread_local uint64_t stack_site = 0x110;
+static thread_local unsigned stack_reads = 0;
 static std::vector<char> order;
 std::atomic<int> g_fg_mode{1}, g_fg_multiplier{1};
 std::atomic<bool> g_fg_presenting{true};
@@ -148,6 +149,7 @@ bool GpuPresent_BeginFgInput(uint64_t, const GpuPresentFgInput& input) noexcept 
     return accept_gpu;
 }
 static USHORT WINAPI TestStack(ULONG, ULONG capacity, PVOID* output, PULONG) {
+    ++stack_reads;
     CHECK(capacity >= 1); output[0] = reinterpret_cast<void*>(stack_site); return stack_site ? 1 : 0;
 }
 static DWORD WINAPI TestModuleName(HMODULE, LPWSTR path, DWORD size) {
@@ -648,6 +650,16 @@ int main() {
     CHECK(!q::RuntimeMethods({1,2,3})); CHECK(!q::RuntimeMethods({q::targets[0],q::targets[0],q::targets[2]}));
     q::original_execute = &Execute; q::original_signal = &Signal; q::original_wait = &Wait;
     q::streamline_ready = true; q::plugin_begin = 0x100; q::plugin_end = 0x200;
+    {
+        const auto reads = stack_reads;
+        CHECK(q::PluginSite(0x100) == 0x100 && q::PluginSite(0x1ff) == 0x1ff && stack_reads == reads);
+        // One non-plugin thunk, two different plugin ancestors, then none:
+        // neither the queue nor the thunk PC can identify the originating site.
+        stack_site = 0x123; CHECK(q::PluginSite(0x200) == 0x123);
+        stack_site = 0x157; CHECK(q::PluginSite(0x200) == 0x157);
+        stack_site = 0; CHECK(q::PluginSite(0x200) == 0 && stack_reads == reads + 3);
+        stack_site = 0x110;
+    }
         // Rejections before the first retained route must remain observable. No
         // marker/proxy/queue callback writes a log or relaxes admission to diagnose it.
         const auto quiet_logs = log_writes;

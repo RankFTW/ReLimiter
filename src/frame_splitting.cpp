@@ -1,12 +1,16 @@
 #include "frame_splitting.h"
 #include "display_state.h"
-#include "display_resolver.h"
-#include "streamline_hooks.h"
 #include "fg_divisor.h"
 #include <atomic>
 
 static SRWLOCK s_control_lock = SRWLOCK_INIT;
 static std::atomic<bool> s_stopping{true};
+// Notifications and stop share a sequence, not a handle a late publisher
+// could race with CloseHandle. Take its value before looking at any inputs.
+static std::atomic<uint64_t> s_wake_sequence{0};
+static constexpr uint64_t kDisplayChanged = uint64_t{1} << 32;
+// Atomic pair: the G-Sync-eligible target and an unconsumed display reset.
+static std::atomic<uint64_t> s_display{0};
 // Retain the actual target even if the resolver moves to another display.
 // Set before calling the driver: a fault may occur after applying the override.
 static NvU32 s_override_display_id = 0;
@@ -82,6 +86,19 @@ static bool RestoreOverride() noexcept {
     return true;
 }
 
+void FrameSplitting_InputsChanged() noexcept {
+    s_wake_sequence.fetch_add(1, std::memory_order_release);
+    WakeByAddressSingle(&s_wake_sequence);
+}
+
+void FrameSplitting_DisplayChanged(uint32_t resolved_id) noexcept {
+    // Publish ID and G-Sync eligibility together. A concurrent FG edge must
+    // not apply a new output's G-Sync state to the previous ID.
+    const NvU32 target = g_gsync_active.load(std::memory_order_relaxed) ? resolved_id : 0;
+    s_display.store(kDisplayChanged | target, std::memory_order_release);
+    FrameSplitting_InputsChanged();
+}
+
 void BeginFrameSplittingPolling() {
     FrameSplittingControlLock lock;
     // Never discard a failed restoration from an earlier lifetime.
@@ -91,23 +108,24 @@ void BeginFrameSplittingPolling() {
 
 void RequestFrameSplittingStop() noexcept {
     s_stopping.store(true, std::memory_order_release);
+    FrameSplitting_InputsChanged();
 }
 
-bool ManageFrameSplitting() {
+static bool ManageFrameSplitting() {
     FrameSplittingControlLock lock;
     if (s_stopping.load(std::memory_order_acquire)) return false;
-    EnsureResolved();
-    const NvU32 display_id = DispRes_GetDisplayID();
-    const bool disable = display_id != 0 &&
-        g_gsync_active.load(std::memory_order_relaxed) &&
-        g_resolved_fg_divisor.load(std::memory_order_relaxed) > 1;
+    const auto display = s_display.fetch_and(~kDisplayChanged, std::memory_order_acq_rel);
+    const auto display_id = static_cast<NvU32>(display);
+    const bool disable = display_id != 0 && g_resolved_fg_divisor.load(std::memory_order_relaxed) > 1;
 
     if (s_override_display_id != 0 &&
         (!disable || s_override_display_id != display_id)) {
         if (!RestoreOverride()) return false;
     }
-    if (!disable || !s_SetAdaptiveSync ||
-        s_stopping.load(std::memory_order_acquire)) return true;
+    if (!disable || (s_override_display_id == display_id && !(display & kDisplayChanged)))
+        return true;
+    EnsureResolved();
+    if (!s_SetAdaptiveSync || s_stopping.load(std::memory_order_acquire)) return true;
 
     NV_SET_ADAPTIVE_SYNC_DATA_FS data = {};
     data.version = NV_SET_ADAPTIVE_SYNC_DATA_FS_VER;
@@ -120,6 +138,21 @@ bool ManageFrameSplitting() {
         return false;
     }
     return true;
+}
+
+void RunFrameSplittingWorker() {
+    for (;;) {
+        auto observed = s_wake_sequence.load(std::memory_order_acquire);
+        if (!ManageFrameSplitting()) return;
+        // An edge during the driver call or just before the wait isn't lost.
+        // A spurious wake doesn't run the driver update again.
+        while (s_wake_sequence.load(std::memory_order_acquire) == observed) {
+            if (!WaitOnAddress(&s_wake_sequence, &observed, sizeof(observed), INFINITE)) {
+                OutputDebugStringA("ReLimiter: frame-splitting worker wait failed.\n");
+                return;
+            }
+        }
+    }
 }
 
 bool RestoreFrameSplitting() noexcept {

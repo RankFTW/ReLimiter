@@ -49,6 +49,8 @@ void NGXHooks_Init();
 // Checks for NGX modules and installs hooks if needed. Non-loader callers only:
 // LoadLibrary hooks notify the owned loader-install worker instead.
 void NGXHooks_TryInstall();
+// True after a successful install, including the init and loader-worker paths.
+bool NGXHooks_HasInstalled();
 
 // Close NGX install/version-worker admission, wake the version worker, and
 // join it. This does not disable or remove hooks. Call outside loader lock
@@ -62,8 +64,8 @@ bool NGXHooks_BeginShutdown();
 // hook records when MinHook cleanup is incomplete; the caller must not unload.
 bool NGXHooks_Shutdown();
 
-// Get the latest DLSS info. Thread-safe and performs no file I/O.
-NGXDLSSInfo NGXHooks_GetInfo();
+// Version strings are demanded only by a visible version readout. No file I/O on the caller.
+NGXDLSSInfo NGXHooks_GetInfo(bool include_versions);
 
 // Returns true if NGX CreateFeature has seen FG being created.
 // Used by Streamline hooks to avoid clearing fg_presenting when
@@ -82,9 +84,10 @@ bool NGXHooks_InFGCreateCooldown();
 
 inline void NGXHooks_Init() {}
 inline void NGXHooks_TryInstall() {}
+inline bool NGXHooks_HasInstalled() { return false; }
 inline bool NGXHooks_BeginShutdown() { return true; }
 inline bool NGXHooks_Shutdown() { return true; }
-inline NGXDLSSInfo NGXHooks_GetInfo() { return {}; }
+inline NGXDLSSInfo NGXHooks_GetInfo(bool) { return {}; }
 inline bool NGXHooks_IsFGCreated() { return false; }
 inline void NGXHooks_ClearFGCreated() {}
 inline bool NGXHooks_InFGCreateCooldown() { return false; }

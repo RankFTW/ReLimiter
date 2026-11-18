@@ -28,7 +28,7 @@ static std::mutex s_lifecycle_mutex;
 static std::mutex s_worker_wait_mutex;
 static std::condition_variable s_worker_wakeup;
 static std::atomic<bool> s_stop_requested{false};
-static bool s_initialized = false;
+static std::atomic<bool> s_initialized{false};
 static HANDLE s_poll_thread = nullptr;
 
 // All fields are atomic so the sequence protocol is valid under the C++ memory
@@ -241,8 +241,8 @@ static NvAPI_Status ProbeDrsAvailability() noexcept {
     }
 }
 
-void DLSSPresets_Init() {
-    if (RuntimeLifecycle_IsStopping()) return;
+void DLSSPresets_EnsureStarted() {
+    if (s_initialized.load(std::memory_order_acquire) || RuntimeLifecycle_IsStopping()) return;
     {
         std::lock_guard<std::mutex> lifecycle_lock(s_lifecycle_mutex);
         if (s_initialized || RuntimeLifecycle_IsStopping()) return;
@@ -276,13 +276,12 @@ void DLSSPresets_Init() {
     }
 }
 
-void DLSSPresets_Poll() {
-    DLSSPresets_Init();
-}
-
 bool DLSSPresets_Shutdown() {
     std::lock_guard<std::mutex> lifecycle_lock(s_lifecycle_mutex);
-    s_stop_requested.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> wait_lock(s_worker_wait_mutex);
+        s_stop_requested.store(true, std::memory_order_release);
+    }
     s_worker_wakeup.notify_all();
     if (s_poll_thread) {
         if (WaitForSingleObject(s_poll_thread, 2500) != WAIT_OBJECT_0) {
