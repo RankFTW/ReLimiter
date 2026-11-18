@@ -966,9 +966,11 @@ DWORD WINAPI Watchdog(void*) noexcept {
         // The render queue has passed DLSS-G's Wait (frame generation is done): the Present has until the deadline,
         // a share of the frame time.
         const int64_t woke = Qpc();
-        // fg_present_ahead: the completion is stamped for the cycle's later Presents, and a first generated frame's
-        // Present that has returned already releases the render queue now.
-        if (g_fg_present_ahead.load(relaxed) >= 2 || ahead_presented.load(relaxed) != 0) AheadAtMarker(woke);
+        // fg_present_ahead, where the unit orders: the completion is stamped for the cycle's later Presents. With
+        // any key: a first generated frame's Present that has returned already releases the render queue now. A
+        // binding that only probes (hardware flip metering) pays the two loads.
+        if ((g_fg_present_ahead.load(relaxed) >= 2 && g_fg_present_order_queue.load(relaxed) != nullptr) ||
+            ahead_presented.load(relaxed) != 0) AheadAtMarker(woke);
         const int64_t deadline = woke + frequency * Rule::BoundUs(frame_us.load(relaxed)) / 1'000'000;
         // With the trailing key on, the evidence judges an anchor against this deadline (TrailRule::Followed).
         if (g_fg_present_order_trailing.load(relaxed)) PublishDeadline(deadline);
@@ -1772,8 +1774,10 @@ HRESULT STDMETHODCALLTYPE AheadRegister(ID3D12Fence* fence, UINT64 value, HANDLE
 // The installer's worker: the flip gate's clock thread and the detour of the fence event registration, each made once
 // and only where the unit has established the ordering (frame generation presenting from its own thread without
 // hardware flip metering); they then stay until shutdown. Where the unit never orders (hardware flip metering, no
-// frame generation) neither is made, so the key, on by default, costs there what its gates in the header say.
-// Observing (1) installs the detour at the first bind, to log the registrations.
+// frame generation) neither is made, so the key, on by default, costs there what its gates in the header say: the
+// unit's own gate work (the gate's fences and the marker's plan in FgPresentOrder_AfterWaitActive, the stamp at the
+// marker's wake) is likewise done only while it orders. Observing (1) installs the detour at the first bind, to log
+// the registrations.
 void AheadService() noexcept {
     const bool orders = g_fg_present_order_queue.load(relaxed) != nullptr;
     // fg_present_ahead 3: the flip gate's clock thread (it lives until shutdown; one that ended behind a shutdown that
@@ -1854,8 +1858,10 @@ void FgPresentOrder_AfterWaitActive(ID3D12CommandQueue* queue, ID3D12Fence* fenc
         if (ReadyLocked(queue)) MakeTrailingLocked(queue, bound_device);
         ReleaseSRWLockExclusive(&lock);
     }
-    // fg_present_ahead 3: the gate's two fences, once for the binding, on the render queue's device.
-    if (g_fg_present_ahead.load(relaxed) >= 3 && !gate_tried.load(relaxed)) {
+    // fg_present_ahead 3: the gate's two fences, once for the binding, on the render queue's device, and only once the
+    // unit orders: a binding that only probes (hardware flip metering) makes none.
+    if (g_fg_present_ahead.load(relaxed) >= 3 && !gate_tried.load(relaxed) &&
+        g_fg_present_order_queue.load(relaxed) != nullptr) {
         AcquireSRWLockExclusive(&lock);
         if (ReadyLocked(queue) && !gate) {
             BindFailure ignored;
@@ -1912,8 +1918,9 @@ void FgPresentOrder_AfterWaitActive(ID3D12CommandQueue* queue, ID3D12Fence* fenc
                 }
                 // The work submitted from here on is the next frame's.
                 BreakFrameStart(value);
-                // fg_present_ahead 3: the pacer's target for this frame goes with its marker.
-                if (g_fg_present_ahead.load(relaxed) >= 3) GateNoteMarker(value);
+                // fg_present_ahead 3, where the unit orders: the pacer's target for this frame goes with its marker.
+                if (g_fg_present_ahead.load(relaxed) >= 3 && g_fg_present_order_queue.load(relaxed) != nullptr)
+                    GateNoteMarker(value);
             } else {
                 enqueue_failures.fetch_add(1, relaxed);
             }

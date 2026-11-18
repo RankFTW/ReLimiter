@@ -147,8 +147,9 @@ inline std::atomic<uint64_t> g_fg_present_order_later{0};
 // the CPU at the flip's time (fg_flip_gate_rule.h), as hardware flip metering would flip it. 4: the render queue is
 // let go when the first generated frame's own work in front of its gate is done, not when frame generation is done.
 // It acts only where the unit has established the ordering: with hardware flip metering and without frame generation
-// the key's gates below cost one relaxed load and a branch each, and neither the clock thread nor the detour of the
-// fence event registration is made (AheadService).
+// the key's gates below cost one relaxed load and a branch each (the queue Wait's two loads: the key's observing
+// value), neither the clock thread nor the detour of the fence event registration is made (AheadService), and the
+// unit makes no gate fences and notes and stamps nothing for the gate at its markers.
 inline std::atomic<int> g_fg_present_ahead{0};
 // fg_present_ahead 3, while the flip gate's dial is measured (developer live key `fg_flip_gate_give_back`, 4 to 1000,
 // default 100): the share of the displayed interval given back per flip after a late frame, as 1/this
@@ -207,12 +208,14 @@ inline void FgPresentOrder_AfterWait(ID3D12CommandQueue* queue, ID3D12Fence* fen
     if (g_fg_present_order.load(std::memory_order_relaxed))
         FgPresentOrder_AfterWaitActive(queue, fence, native_signal, native_wait);
 }
-// Queue Wait detour, right after the native Wait returned S_OK, outermost calls only (the unit not ordering, which
-// is tested first: one load and a branch): the calling thread's newest Wait, which its next event registration is
-// compared with.
+// Queue Wait detour, right after the native Wait returned S_OK, outermost calls only: the calling thread's newest
+// Wait, which its next event registration is compared with. Noted where the unit orders; before that only for the
+// observing value 1, whose log lines are for the registrations of a route that has not qualified (the unit not
+// ordering and the key not 1: two loads and a branch).
 inline void FgPresentOrder_NoteQueueWait(ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t value) noexcept {
-    if (g_fg_present_order_queue.load(std::memory_order_relaxed) != nullptr &&
-        g_fg_present_ahead.load(std::memory_order_relaxed) != 0) FgPresentOrder_NoteQueueWaitActive(queue, fence, value);
+    const int ahead = g_fg_present_ahead.load(std::memory_order_relaxed);
+    if (g_fg_present_order_queue.load(std::memory_order_relaxed) != nullptr ? ahead != 0 : ahead == 1)
+        FgPresentOrder_NoteQueueWaitActive(queue, fence, value);
 }
 // The FG input wait's outcome for the frame of the current proxy Present scope (the unit not ordering, which is tested
 // first: one load and a branch): the pacer's grid interval for the input, and whether it holds the input to the grid
