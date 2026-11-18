@@ -7,9 +7,11 @@
 #include "scheduler.h"
 #include "vblank_thread.h"
 #include "logger.h"
+#include "runtime_lifecycle.h"
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <mutex>
 
 // ── Atomic display state ──
 std::atomic<double>  g_ceiling_interval_us{6944.0};  // ~144Hz default
@@ -208,14 +210,20 @@ void QueryVRRFloor() {
     g_floor_interval_us.store(1000000.0 / 30.0, std::memory_order_relaxed);
 }
 
-static void RefreshGSyncState(NvU32 display_id) {
+// `from_event`: the poll of a display event (display_events.h). Such an event can arrive while the display is still
+// changing (waking, being reconnected, switching modes), when the driver may report variable refresh as impossible
+// for a moment, so only a positive answer is taken from it; a negative one waits for the game's next swapchain
+// resolve, which decides both ways. An event never does the first poll's work (its log line, the first launch's cap):
+// that stays with the resolve, on the thread that always ran it. False: nothing changed and nothing is to be
+// published (an event whose answer was negative, failed, or found G-Sync already active).
+static bool RefreshGSyncState(NvU32 display_id, bool from_event) {
     if (!s_GetVRRInfo) {
         static bool s_warned = false;
         if (!s_warned) {
             s_warned = true;
             LOG_WARN("PollGSyncState: GetVRRInfo function not resolved");
         }
-        return;
+        return !from_event;
     }
 
     NV_VRR_INFO vrr_info = {};
@@ -228,19 +236,39 @@ static void RefreshGSyncState(NvU32 display_id) {
             s_warned = true;
             LOG_WARN("PollGSyncState: GetVRRInfo failed status=%d displayId=%u", st, display_id);
         }
-        return;
+        return !from_event;
     }
 
-    bool new_state = vrr_info.bIsVRREnabled || vrr_info.bIsDisplayInVRRMode;
-    bool old_state = g_gsync_active.exchange(new_state, std::memory_order_relaxed);
+    // Variable refresh possible on the display counts as G-Sync (G-SYNC and G-SYNC Compatible alike; the
+    // driver reports it impossible with G-SYNC off in the control panel, on a display without it, and on a
+    // display that is asleep). Whether the display is in its variable-refresh mode at this moment depends on
+    // what is presenting right now (the desktop, a window, the game's first frames), and that one early sample
+    // used to leave a whole launch in fixed-refresh pacing.
+    const bool new_state = vrr_info.bIsVRRPossible || vrr_info.bIsVRREnabled || vrr_info.bIsDisplayInVRRMode;
+    if (from_event) {
+        if (!new_state || g_gsync_active.exchange(true, std::memory_order_relaxed)) return false;
+        LOG_INFO("VRR poll after a display event: enabled=%d possible=%d requested=%d displayInVRR=%d -> gsync=active "
+                 "(displayId=%u)", vrr_info.bIsVRREnabled, vrr_info.bIsVRRPossible,
+                 vrr_info.bIsVRRRequested, vrr_info.bIsDisplayInVRRMode, display_id);
+        OnGSyncStateChange(true);
+        return true;
+    }
+    const bool old_state = g_gsync_active.exchange(new_state, std::memory_order_relaxed);
 
     static std::atomic<bool> s_first_poll{true};
     const bool first_poll = s_first_poll.exchange(false, std::memory_order_acq_rel);
     if (first_poll) {
-        LOG_INFO("VRR poll: enabled=%d possible=%d requested=%d displayInVRR=%d -> gsync=%s (displayId=%u)",
-                 vrr_info.bIsVRREnabled, vrr_info.bIsVRRPossible,
-                 vrr_info.bIsVRRRequested, vrr_info.bIsDisplayInVRRMode,
-                 new_state ? "active" : "inactive", display_id);
+        // A display without variable refresh is worth one line in the default log: it decides fixed-refresh
+        // pacing for the launch, and a user's report needs the driver's answer to explain it.
+        if (new_state)
+            LOG_INFO("VRR poll: enabled=%d possible=%d requested=%d displayInVRR=%d -> gsync=active (displayId=%u)",
+                     vrr_info.bIsVRREnabled, vrr_info.bIsVRRPossible,
+                     vrr_info.bIsVRRRequested, vrr_info.bIsDisplayInVRRMode, display_id);
+        else
+            LOG_WARN("VRR poll: enabled=%d possible=%d requested=%d displayInVRR=%d -> gsync=inactive (displayId=%u): "
+                     "the driver reports no variable refresh on this display, so pacing follows its fixed refresh",
+                     vrr_info.bIsVRREnabled, vrr_info.bIsVRRPossible,
+                     vrr_info.bIsVRRRequested, vrr_info.bIsDisplayInVRRMode, display_id);
 
         // First launch + VRR confirmed: default cap to Reflex VRR cap (hz - hz²/3600)
         if (new_state && Config_IsFirstLaunch()) {
@@ -263,16 +291,44 @@ static void RefreshGSyncState(NvU32 display_id) {
     // fixed 165 Hz panel shows 1-1-2 refresh judder).
     if (first_poll || new_state != old_state)
         OnGSyncStateChange(new_state);
+    return true;
+}
+
+// The swapchain resolver's thread and the display events thread (display_events.h) both poll: one at a time, so
+// the state, the pacing mode it sets and the display published to frame splitting change together, for the display
+// the latest resolve stored (read under the lock: a resolve stores its display before it polls). The resolver's
+// teardown takes the lock too (DisplayState_RetireDisplay), so an event's poll is entirely before or after it.
+static std::mutex s_gsync_poll_mutex;
+
+static void PollGSyncStateFor(bool from_event) {
+    std::lock_guard<std::mutex> lock(s_gsync_poll_mutex);
+    if (from_event && !DispRes_IsResolved()) return;
+    const NvU32 display_id = DispRes_GetDisplayID();
+    if (display_id == 0) return;
+    // Publish the display after its G-Sync state is available (or the query failed and kept the previously known
+    // state); an event's answer that changed nothing publishes nothing.
+    if (!RefreshGSyncState(display_id, from_event)) return;
+    FrameSplitting_DisplayChanged(DispRes_IsResolved() ? display_id : 0);
+}
+
+void DisplayState_RetireDisplay(void (*retire)()) {
+    std::lock_guard<std::mutex> lock(s_gsync_poll_mutex);
+    retire();
+    FrameSplitting_DisplayChanged(0);
 }
 
 void PollGSyncState() {
-    // Called once at startup and once for each successful swapchain resolve.
-    // Publish the display exactly once, after its G-Sync state is available
-    // (or the query failed and kept the previously known state).
-    const NvU32 display_id = DispRes_GetDisplayID();
-    if (display_id == 0) return;
-    RefreshGSyncState(display_id);
-    FrameSplitting_DisplayChanged(DispRes_IsResolved() ? display_id : 0);
+    // Called at startup and for each successful swapchain resolve.
+    PollGSyncStateFor(false);
+}
+
+void DisplayState_OnDisplayEvent(const char* reason) {
+    // Before the first swapchain there is no display to read (its resolve reads it), and after a teardown the
+    // next resolve reads it again. The ceiling and floor are not read here: during a change the display's mode can
+    // be a passing one, and they stay as the game's last swapchain resolve found them.
+    if (RuntimeLifecycle_IsStopping() || !DispRes_IsResolved()) return;
+    LOG_INFO("Display: %s; reading the G-Sync state again", reason);
+    PollGSyncStateFor(true);
 }
 
 void OnGSyncStateChange(bool new_gsync_active) {

@@ -257,9 +257,10 @@ void DispRes_OnSwapchainInit(uint64_t native_handle, ActiveAPI api, HWND hwnd) {
 void DispRes_OnSwapchainDestroy() {
     // On full teardown, clear resolved state but keep display_id for potential
     // re-resolution on next init. The ID itself is not zeroed (Req 2.3).
-    s_resolved.store(false, std::memory_order_release);
-    s_monitor_hwnd.store(nullptr, std::memory_order_release);
-    FrameSplitting_DisplayChanged(0);
+    DisplayState_RetireDisplay([] {
+        s_resolved.store(false, std::memory_order_release);
+        s_monitor_hwnd.store(nullptr, std::memory_order_release);
+    });
     LOG_INFO("DispRes: swapchain destroyed, resolved=0 display_id=%u",
              s_display_id.load(std::memory_order_acquire));
 }

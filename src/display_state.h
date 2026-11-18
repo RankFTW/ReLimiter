@@ -25,3 +25,11 @@ void QueryVRRCeiling();
 void QueryVRRFloor();
 void PollGSyncState();
 void OnGSyncStateChange(bool new_gsync_active);
+// The display changed (its mode or connection) or turned on (display_events.h): read the G-Sync state again for the
+// resolved display. A positive answer makes G-Sync active; a negative one waits for the game's next swapchain
+// resolve, because the display may still be changing. `reason` is for the log. Any thread; nothing before the first
+// resolve.
+void DisplayState_OnDisplayEvent(const char* reason);
+// The resolver's swapchain teardown: runs `retire` (it clears the resolved display) and publishes no display to frame
+// splitting, under the lock of the G-Sync polls, so a display event's poll cannot publish the retired display after it.
+void DisplayState_RetireDisplay(void (*retire)());

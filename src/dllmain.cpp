@@ -31,6 +31,7 @@
 #include "display_state.h"
 #include "vblank_thread.h"
 #include "display_poll_thread.h"
+#include "display_events.h"
 #include "flush.h"
 #include "frame_splitting.h"
 #include "config.h"
@@ -675,6 +676,8 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
 
         StartDisplayPollThread();
         s_display_poll_started = true;
+        // Display mode, connection and power changes read the display state again (display_events.h).
+        DisplayEvents_Start(hModule);
         // The vblank worker is started only after an owning HWND exists and the
         // fixed-mode PLL has an explicit handoff. Starting it here races loader
         // initialization and leaves a false running state when no HWND exists.
@@ -788,6 +791,9 @@ static bool StopOwnedProducers() {
         auxiliary_workers_stopped =
             Blackout_Shutdown() && auxiliary_workers_stopped;
     auxiliary_workers_stopped = HWMonitor_Shutdown() && auxiliary_workers_stopped;
+    // Before the vblank and display workers: a display event can change the pacing mode (vblank worker) and the
+    // display published to frame splitting.
+    auxiliary_workers_stopped = DisplayEvents_Stop() && auxiliary_workers_stopped;
     auxiliary_workers_stopped =
         StopVBlankThread() && auxiliary_workers_stopped;
     if (s_display_poll_started)
