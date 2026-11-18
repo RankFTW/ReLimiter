@@ -91,7 +91,8 @@ std::atomic<uint64_t> ahead_matched{0}, ahead_other{0}, ahead_woke{0}, ahead_aga
 std::atomic<uint64_t> ahead_presented{0};
 // The unit's thread stamps each marker's completion with its wake for it: the cycle's later Presents are timed from it.
 // The stamp carries the binding it was made in (gate_epoch): marker values start again with each binding, and the
-// thread stamps only while the unit orders, so a binding's probes do not replace the stamp of the binding before.
+// thread stamps for the key only while the unit orders, so a binding's probes do not replace the stamp of the binding
+// before.
 std::atomic<uint32_t> ahead_stamp_seq{0};
 std::atomic<uint32_t> ahead_stamp_epoch{0};
 std::atomic<uint64_t> ahead_stamp_value{0};
@@ -1195,6 +1196,7 @@ struct AheadCycle {
     int64_t first = 0;         // QPC at the first generated frame's Present (0: not made yet)
     int64_t spacing = 0;       // how far DLSS-G put the cycle's second Present behind its first (0: not made yet)
     uint64_t value = 0;        // the marker whose completion says frame generation is done for this cycle (0: unknown)
+    uint32_t epoch = 0;        // the binding `value` was taken in (gate_epoch): the cycle's holds end with it
     uint64_t later_value = 0;  // the newest fence value of the same frame answered after the first (3x and 4x)
     int generated = 1;         // the generated frames a real one when the cycle began: its Presents after the first
     int made = 0;              // the cycle's Presents made after its first
@@ -2253,6 +2255,7 @@ void FgPresentOrder_AheadBeforePresent() noexcept {
     if (!ahead.real) return;
     const int64_t entry = Qpc();
     const uint64_t value = ahead.value;
+    const uint32_t epoch = ahead.epoch;
     // The cycle's Present after its first: its place, and whether it is the last (the real frame's). DLSS-G's own
     // spacing is how far it put the cycle's second Present behind its first, and every later Present is held to its
     // place times that behind generation's completion: taken from each Present's own entry, the spacing would carry
@@ -2264,9 +2267,11 @@ void FgPresentOrder_AheadBeforePresent() noexcept {
     if (last) AheadEnd();
     // How the hold ended, for the gate's pair lines: 0 the completion was stamped when the Present came, 1 its event
     // was waited for and the stamp found, 2 the event came without a stamp, 3 not held, 4 the wait was given up.
+    // A cycle whose binding has ended between two of its Presents (frame generation stopped, its multiplier changed)
+    // is not held: its marker and that marker's stamp went with the binding, and nothing would end the wait for them.
     const auto hold = [&]() noexcept -> uint8_t {
         if (value == 0 || frequency <= 0 || g_fg_present_ahead.load(relaxed) < 2 || RuntimeLifecycle_IsStopping() ||
-            spacing <= 0 || spacing > frequency / 10) {
+            spacing <= 0 || spacing > frequency / 10 || epoch != gate_epoch.load(relaxed)) {
             ahead_unheld.fetch_add(1, relaxed);
             return 3;
         }
@@ -2330,6 +2335,7 @@ bool FgPresentOrder_AheadAfterPresent(bool presented) noexcept {
     uint64_t value = 0;
     bool early = false;
     AcquireSRWLockShared(&lock);
+    const uint32_t epoch = gate_epoch.load(relaxed);
     if (event && marker && order && g_fg_present_ahead.load(relaxed) >= 2 && !RuntimeLifecycle_IsStopping()) {
         const uint64_t released = g_fg_present_order_released.load(relaxed);
         if (g_fg_present_order_issued.load(std::memory_order_acquire) > released) {
@@ -2342,6 +2348,7 @@ bool FgPresentOrder_AheadAfterPresent(bool presented) noexcept {
     }
     ReleaseSRWLockShared(&lock);
     ahead.value = value;
+    ahead.epoch = epoch;
     if (!early) {
         ahead_behind.fetch_add(1, relaxed);
         return false;
