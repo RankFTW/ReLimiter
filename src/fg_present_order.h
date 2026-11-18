@@ -213,8 +213,9 @@ inline void FgPresentOrder_AfterWait(ID3D12CommandQueue* queue, ID3D12Fence* fen
 // observing value 1, whose log lines are for the registrations of a route that has not qualified (the unit not
 // ordering and the key not 1: two loads and a branch).
 inline void FgPresentOrder_NoteQueueWait(ID3D12CommandQueue* queue, ID3D12Fence* fence, uint64_t value) noexcept {
-    const int ahead = g_fg_present_ahead.load(std::memory_order_relaxed);
-    if (g_fg_present_order_queue.load(std::memory_order_relaxed) != nullptr ? ahead != 0 : ahead == 1)
+    if (g_fg_present_order_queue.load(std::memory_order_relaxed) != nullptr
+            ? g_fg_present_ahead.load(std::memory_order_relaxed) != 0
+            : g_fg_present_ahead.load(std::memory_order_relaxed) == 1)
         FgPresentOrder_NoteQueueWaitActive(queue, fence, value);
 }
 // The FG input wait's outcome for the frame of the current proxy Present scope (the unit not ordering, which is tested

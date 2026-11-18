@@ -90,7 +90,10 @@ std::atomic<uint64_t> ahead_matched{0}, ahead_other{0}, ahead_woke{0}, ahead_aga
 // releases the render queue when that marker completes (0: none).
 std::atomic<uint64_t> ahead_presented{0};
 // The unit's thread stamps each marker's completion with its wake for it: the cycle's later Presents are timed from it.
+// The stamp carries the binding it was made in (gate_epoch): marker values start again with each binding, and the
+// thread stamps only while the unit orders, so a binding's probes do not replace the stamp of the binding before.
 std::atomic<uint32_t> ahead_stamp_seq{0};
+std::atomic<uint32_t> ahead_stamp_epoch{0};
 std::atomic<uint64_t> ahead_stamp_value{0};
 std::atomic<int64_t> ahead_stamp_qpc{0};
 std::atomic<uint64_t> ahead_early{0}, ahead_behind{0}, ahead_at_marker{0};
@@ -968,7 +971,7 @@ DWORD WINAPI Watchdog(void*) noexcept {
         const int64_t woke = Qpc();
         // fg_present_ahead, where the unit orders: the completion is stamped for the cycle's later Presents. With
         // any key: a first generated frame's Present that has returned already releases the render queue now. A
-        // binding that only probes (hardware flip metering) pays the two loads.
+        // binding that only probes (hardware flip metering) pays the three loads.
         if ((g_fg_present_ahead.load(relaxed) >= 2 && g_fg_present_order_queue.load(relaxed) != nullptr) ||
             ahead_presented.load(relaxed) != 0) AheadAtMarker(woke);
         const int64_t deadline = woke + frequency * Rule::BoundUs(frame_us.load(relaxed)) / 1'000'000;
@@ -1323,14 +1326,18 @@ void AheadAtMarker(int64_t woke) noexcept {
     const bool taken = presented != 0 && presented <= passed &&
         ahead_presented.compare_exchange_strong(presented, 0, std::memory_order_acq_rel);
     ReleaseSRWLockShared(&lock);
-    if (const uint64_t before = ahead_stamp_value.load(relaxed); passed != before) {
+    const uint64_t before = ahead_stamp_value.load(relaxed);
+    // A stamp of another binding says nothing about this one's markers.
+    const bool other = ahead_stamp_epoch.load(relaxed) != epoch;
+    if (other || passed != before) {
         ahead_stamp_seq.fetch_add(1, std::memory_order_acq_rel);
+        ahead_stamp_epoch.store(epoch, relaxed);
         ahead_stamp_value.store(passed, relaxed);
         ahead_stamp_qpc.store(woke, relaxed);
         ahead_stamp_seq.fetch_add(1, std::memory_order_release);
         // Every marker this wake found complete (one, unless a wake was missed).
         if (passed != 0) {
-            uint64_t value = before < passed && passed - before <= kCycleRing ? before + 1 : passed;
+            uint64_t value = !other && before < passed && passed - before <= kCycleRing ? before + 1 : passed;
             for (; value <= passed; ++value) GateNoteDone(value, woke);
         }
     }
@@ -1340,15 +1347,17 @@ void AheadAtMarker(int64_t woke) noexcept {
         if (!GateHandRelease(presented, epoch)) ReleaseDue(false, true, true, presented, epoch);
     }
 }
-// The completion time stamped for marker `value`: 1 stamped (in *done), 0 not yet, -1 a later marker is stamped already.
+// The completion time stamped for marker `value`: 1 stamped (in *done), 0 not yet (a stamp of another binding is
+// none), -1 a later marker is stamped already.
 int AheadStamped(uint64_t value, int64_t* done) noexcept {
     for (;;) {
         const uint32_t before = ahead_stamp_seq.load(std::memory_order_acquire);
         if (before & 1) { YieldProcessor(); continue; }
+        const uint32_t epoch = ahead_stamp_epoch.load(relaxed);
         const uint64_t stamped = ahead_stamp_value.load(relaxed);
         const int64_t qpc = ahead_stamp_qpc.load(relaxed);
         if (ahead_stamp_seq.load(std::memory_order_acquire) != before) continue;
-        if (stamped < value) return 0;
+        if (epoch != gate_epoch.load(relaxed) || stamped < value) return 0;
         if (stamped > value) return -1;
         *done = qpc;
         return 1;
@@ -1776,8 +1785,9 @@ HRESULT STDMETHODCALLTYPE AheadRegister(ID3D12Fence* fence, UINT64 value, HANDLE
 // hardware flip metering); they then stay until shutdown. Where the unit never orders (hardware flip metering, no
 // frame generation) neither is made, so the key, on by default, costs there what its gates in the header say: the
 // unit's own gate work (the gate's fences and the marker's plan in FgPresentOrder_AfterWaitActive, the stamp at the
-// marker's wake) is likewise done only while it orders. Observing (1) installs the detour at the first bind, to log
-// the registrations.
+// marker's wake) is likewise done only while it orders; the one exception is the wake for a marker a frame's first
+// Present left to it (3x and 4x, any key), which stamps as it releases. Observing (1) installs the detour at the
+// first bind, to log the registrations.
 void AheadService() noexcept {
     const bool orders = g_fg_present_order_queue.load(relaxed) != nullptr;
     // fg_present_ahead 3: the flip gate's clock thread (it lives until shutdown; one that ended behind a shutdown that
