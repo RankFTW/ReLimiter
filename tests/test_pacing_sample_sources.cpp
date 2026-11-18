@@ -203,20 +203,52 @@ namespace
         CHECK(sample.key == Key(1, 2) && !sample.follows);
     }
 
-    void TestAConstantFrameIdStepIsFollowed()
+    void TestEveryOtherFrameMissingNeverFollows()
     {
         PacingFgInputPairer pairer;
         PacingFgInputSample sample;
-        pairer.AddReady(Ready(100, kBase), &sample);
-        pairer.AddReady(Ready(102, kBase + 200'000), &sample);
-        CHECK(pairer.AddReady(Ready(104, kBase + 400'000), &sample));
-        CHECK(sample.key == Key(102) && !sample.follows); // the step is seen for the first time
-        CHECK(pairer.AddReady(Ready(106, kBase + 600'000), &sample));
-        CHECK(sample.key == Key(104) && sample.follows);
-        CHECK(pairer.AddReady(Ready(110, kBase + 800'000), &sample));
+        // Frames 101 and 103 did not read back valid: 100, 102 and 104 are two frames apart each time, and the
+        // same distance twice is still no pair of frames that follow each other.
+        CHECK(!pairer.AddReady(Ready(100, kBase), &sample));
+        CHECK(pairer.AddReady(Ready(101, 0, false), &sample));
+        CHECK(sample.key == Key(100) && !sample.follows);
+        CHECK(!pairer.AddReady(Ready(102, kBase + 400'000), &sample));
+        CHECK(pairer.AddReady(Ready(103, 0, false), &sample));
+        CHECK(sample.key == Key(102) && !sample.follows);
+        CHECK(!pairer.AddReady(Ready(104, kBase + 800'000), &sample));
+        CHECK(pairer.AddReady(Ready(105, kBase + 1'000'000), &sample));
+        CHECK(sample.key == Key(104) && !sample.follows);
+        CHECK(pairer.AddReady(Ready(106, kBase + 1'200'000), &sample));
+        CHECK(sample.key == Key(105) && sample.follows);
+        // Readiness records that are missing altogether, at the same distance each time.
+        CHECK(pairer.AddReady(Ready(108, kBase + 1'600'000), &sample));
         CHECK(sample.key == Key(106) && sample.follows);
-        CHECK(pairer.AddReady(Ready(112, kBase + 1'000'000), &sample));
-        CHECK(sample.key == Key(110) && !sample.follows); // a frame is missing: twice the step
+        CHECK(pairer.AddReady(Ready(110, kBase + 2'000'000), &sample));
+        CHECK(sample.key == Key(108) && !sample.follows);
+        CHECK(pairer.AddReady(Ready(112, kBase + 2'400'000), &sample));
+        CHECK(sample.key == Key(110) && !sample.follows);
+    }
+
+    void TestAReleaseLostToALaterFrameLeavesItsFrameOut()
+    {
+        PacingFgInputPairer pairer;
+        PacingFgInputSample sample;
+        // The caller fell 64 frames behind: every release of frames 100 to 164 is added before the readiness of
+        // frame 101, and frame 164's release took the place of frame 100's.
+        CHECK(!pairer.AddReady(Ready(100, kBase), &sample));
+        for (uint64_t frame = 100; frame <= 164; ++frame)
+            pairer.AddGate(Released(frame, kBase + 50'000 + static_cast<int64_t>(frame - 100) * 200'000));
+        // Whether frame 100 was held is not known any more: it is left out, not taken for a frame that was not held.
+        CHECK(!pairer.AddReady(Ready(101, kBase + 200'000), &sample));
+        CHECK(pairer.AddReady(Ready(102, kBase + 400'000), &sample));
+        CHECK(sample.key == Key(101) && sample.entry_qpc == kBase + 250'000 && !sample.follows);
+        CHECK(pairer.AddReady(Ready(103, kBase + 600'000), &sample));
+        CHECK(sample.key == Key(102) && sample.entry_qpc == kBase + 450'000 && sample.follows);
+        // A slot that still holds an earlier frame's release says the frame itself was not held.
+        CHECK(pairer.AddReady(Ready(229, kBase + 26'000'000), &sample));
+        CHECK(sample.key == Key(103));
+        CHECK(pairer.AddReady(Ready(230, kBase + 26'200'000), &sample));
+        CHECK(sample.key == Key(229) && sample.entry_qpc == kBase + 26'000'000 && !sample.follows);
     }
 
     // ── Window ──
@@ -302,7 +334,8 @@ int main()
     TestEntryIsTheLaterOfReadinessAndRelease();
     TestOnlyTheFgInputWaitCounts();
     TestAFrameWithoutReadinessIsAGap();
-    TestAConstantFrameIdStepIsFollowed();
+    TestEveryOtherFrameMissingNeverFollows();
+    TestAReleaseLostToALaterFrameLeavesItsFrameOut();
     TestWindowMeanJitterAndHitches();
     TestAGapIsNoIntervalAndNoHitch();
     TestHitchesNeedNoTarget();

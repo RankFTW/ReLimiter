@@ -1229,6 +1229,12 @@ struct GateArm {
 thread_local GateArm gate_arm;
 thread_local uint64_t gate_marker = 0;    // the marker of the thread's newest generated Present
 thread_local bool gate_in_call = false;   // the thread's last Present made a Signal inside the native call
+// Whether the newest gated native Present that has returned presented (GateAfterPresent, DLSS-G's presenting
+// thread). Read by the clock for the telemetry only: a flip the gate lets go for a Present that returned occluded or
+// failed is no displayed frame. It is the outcome of the newest Present that has RETURNED, which may be the one
+// before the entry the clock is at, so the first Present of a run that fails can still be counted once and the
+// first that succeeds again can be left out; while Presents fail in a row none is counted.
+std::atomic<bool> gate_presented{true};
 // The command queue of the swapchain this thread presents next, from ReShade's present event (in front of the native
 // call): with DLSS-G its work queue.
 thread_local ID3D12CommandQueue* present_queue = nullptr;
@@ -1470,6 +1476,7 @@ void GateArmFor(bool real, uint8_t index, uint8_t outputs, uint64_t marker_value
 void GateAfterPresent(bool presented) noexcept {
     if (!gate_arm.armed) return;
     if (!gate_arm.placed) gate_missed.fetch_add(1, relaxed);
+    else gate_presented.store(presented, relaxed);
     if (presented) gate_in_call = gate_arm.signals != 0;
     gate_arm = GateArm{};
     g_fg_present_ahead_woken.fetch_sub(1, relaxed);
@@ -1711,9 +1718,11 @@ DWORD WINAPI GateClock(void*) noexcept {
             }
         }
         gate_rule.Flipped(entry.index, entry.real, flip, entry.spacing);
-        // The telemetry's frame pacing window (pacing_telemetry.h): every flip the clock let go, a displayed frame,
-        // at the time the pairs are counted by. One lock-free push on this thread; nothing on a thread of the game.
-        if (let_go) {
+        // The telemetry's frame pacing window (pacing_telemetry.h): every flip the clock let go for a Present that
+        // presented, a displayed frame, at the time the pairs are counted by. One lock-free push on this thread and
+        // one relaxed store per gated Present's return on DLSS-G's presenting thread (GateAfterPresent); nothing on
+        // a thread of the game. A flip left out is a gap to the window, not an interval.
+        if (let_go && gate_presented.load(relaxed)) {
             PacingFlipSample sample;
             sample.flip_qpc = shown;
             sample.cycle_ticks = gate_rule.cycle;

@@ -141,6 +141,8 @@ namespace
         PacingJoiner joiner;
         PacingChainSet chains;
         PacingMetricWindow window;
+        // One cycle's readiness records, taken off their queue before the gate queue is drained (DrainProducerQueues).
+        std::array<PacingReadyRecord, kRecordQueueCapacity> ready_batch;
     };
     std::unique_ptr<WorkerStorage> s_storage;
 
@@ -209,8 +211,6 @@ namespace
         PacingFgInputPairer fg_inputs;
         PacingDisplaySource window_source = PacingDisplaySource::None; // what the window's display samples are
         bool fg_input_feeding = false;      // the FG input sample before this one went into the window
-        bool metering = false;              // FlipMeteringFlowing's answer for the cycle at metering_checked_qpc
-        int64_t metering_checked_qpc = 0;
         int64_t last_flip_qpc = 0;          // worker time of the newest flip sample that went into the window
         int64_t last_fg_input_qpc = 0;      // the same for the FG input
         // The newest paced frame's interval and displayed frames per real frame (its Source record): the samples'
@@ -541,19 +541,26 @@ namespace
             sample.flip_qpc, follows, interval_us, static_cast<double>(sample.outputs), now_qpc);
     }
 
-    // Hardware flip metering spaces the displayed frames: frame generation configured a batch within the last half
-    // second (NvAPI_D3D12_SetFlipConfig with frames in the batch, once per real frame; instrumentation_state.h).
-    // Read at most once per worker cycle, and only in a cycle that has a real frame to add.
+    // Hardware flip metering spaces the displayed frames: the driver accepted a batch configuration within the last
+    // half second (NvAPI_D3D12_SetFlipConfig with frames in the batch and NVAPI_OK, once per real frame;
+    // instrumentation_state.h). A call the driver refused does not count.
     bool FlipMeteringFlowing(int64_t now_qpc) noexcept
     {
-        if (s_samples.metering_checked_qpc != now_qpc) {
-            s_samples.metering_checked_qpc = now_qpc;
-            int64_t call_qpc = 0;
-            uint32_t time_per_batch_us = 0;
-            s_samples.metering = FlipConfig_Read(&call_qpc, &time_per_batch_us) &&
-                now_qpc - call_qpc <= MillisecondsToTicks(kFlipMeteringFlowingMilliseconds);
-        }
-        return s_samples.metering;
+        const int64_t accepted_qpc = g_flip_metering_accepted_qpc.load(std::memory_order_relaxed);
+        return accepted_qpc != 0 &&
+            now_qpc - accepted_qpc <= MillisecondsToTicks(kFlipMeteringFlowingMilliseconds);
+    }
+
+    // ETW display samples flow or DXGI statistics are active again: the in-process samples leave the window at
+    // once, so the snapshot never shows them under the other source's name.
+    void RetireInProcessWindow(int64_t now_qpc) noexcept
+    {
+        const bool in_process = s_samples.window_source == PacingDisplaySource::FlipGate ||
+            s_samples.window_source == PacingDisplaySource::FgInput;
+        if (!in_process || InProcessSourcesFeed(now_qpc)) return;
+        SwitchWindowSource(PacingDisplaySource::None, now_qpc);
+        s_samples.flips.Reset();
+        s_samples.fg_input_feeding = false;
     }
 
     void AddFgInputReady(const PacingReadyRecord& record, int64_t now_qpc) noexcept
@@ -681,16 +688,23 @@ namespace
             });
         DrainQueue<decltype(s_present_queue), PacingPresentRecord>(&s_present_queue, kRecordQueueCapacity,
             [now_qpc](const PacingPresentRecord& record) { Joiner().AddPresent(record, now_qpc); });
+        // The FG input source needs a frame's release before the next frame's readiness, the order their one
+        // producer pushes them in (pacing_sample_sources.h): the readiness batch is taken first, so every release
+        // pushed before one of its records is in the gate queue when that is drained, and added after the gates.
+        // The joiner gets gates before readiness records as before.
+        size_t ready_count = 0;
+        DrainQueue<decltype(s_ready_queue), PacingReadyRecord>(&s_ready_queue, kRecordQueueCapacity,
+            [&ready_count](const PacingReadyRecord& record) { s_storage->ready_batch[ready_count++] = record; });
         DrainQueue<decltype(s_gate_queue), PacingGateRecord>(&s_gate_queue, kRecordQueueCapacity,
             [now_qpc](const PacingGateRecord& record) {
                 s_samples.fg_inputs.AddGate(record);
                 Joiner().AddGate(record, now_qpc);
             });
-        DrainQueue<decltype(s_ready_queue), PacingReadyRecord>(&s_ready_queue, kRecordQueueCapacity,
-            [now_qpc](const PacingReadyRecord& record) {
-                AddFgInputReady(record, now_qpc);
-                Joiner().AddReady(record, now_qpc);
-            });
+        for (size_t index = 0; index < ready_count; ++index) {
+            const PacingReadyRecord& record = s_storage->ready_batch[index];
+            AddFgInputReady(record, now_qpc);
+            Joiner().AddReady(record, now_qpc);
+        }
         DrainQueue<decltype(s_gpu_queue_queue), PacingGpuQueueRecord>(&s_gpu_queue_queue, kRecordQueueCapacity,
             [now_qpc](const PacingGpuQueueRecord& record) { Joiner().AddGpuQueue(record, now_qpc); });
         DrainQueue<decltype(s_reflex_queue), PacingReflexRecord>(&s_reflex_queue, kReflexQueueCapacity,
@@ -707,6 +721,7 @@ namespace
             });
         DrainQueue<decltype(s_flip_queue), PacingFlipSample>(&s_flip_queue, kFlipQueueCapacity,
             [now_qpc](const PacingFlipSample& sample) { AddFlipSample(sample, now_qpc); });
+        RetireInProcessWindow(now_qpc);
     }
 
     // ── DXGI display source (Windows adapter; matching in dxgi_display_source.*) ──
@@ -896,22 +911,28 @@ namespace
         snapshot.sequence = ++s_state.snapshot_sequence;
         snapshot.publication_qpc = now_qpc;
         snapshot.window_ms = static_cast<uint32_t>(kWindowMilliseconds);
-        // Etw while ETW display samples flow (the other sources are idle then), else Dxgi when it produced samples
-        // in the window, else the in-process source that fed the window, else Etw for a window of ETW samples
-        // without display times.
+        // Etw while ETW display samples flow (the other sources are idle then). Else what the window holds: an
+        // in-process source only while it is the window's source and fed it within the window (a change of source
+        // empties the window, so DXGI samples that stopped when frame generation began do not name its frames),
+        // else Dxgi when it produced samples in the window, else Etw for a window of ETW samples without display
+        // times.
         const bool etw_recent = s_state.last_display_received_qpc != 0 &&
             now_qpc - s_state.last_display_received_qpc <= window_ticks;
         const bool dxgi_recent = s_state.last_dxgi_display_received_qpc != 0 &&
             now_qpc - s_state.last_dxgi_display_received_qpc <= window_ticks;
-        const bool flips_recent = s_samples.window_source == PacingDisplaySource::FlipGate &&
-            s_samples.last_flip_qpc != 0 && now_qpc - s_samples.last_flip_qpc <= window_ticks;
-        const bool fg_inputs_recent = s_samples.window_source == PacingDisplaySource::FgInput &&
-            s_samples.last_fg_input_qpc != 0 && now_qpc - s_samples.last_fg_input_qpc <= window_ticks;
-        if (EtwDisplayFlowing(now_qpc)) snapshot.display_source = PacingDisplaySource::Etw;
-        else if (dxgi_recent) snapshot.display_source = PacingDisplaySource::Dxgi;
-        else if (flips_recent) snapshot.display_source = PacingDisplaySource::FlipGate;
-        else if (fg_inputs_recent) snapshot.display_source = PacingDisplaySource::FgInput;
-        else if (etw_recent) snapshot.display_source = PacingDisplaySource::Etw;
+        if (EtwDisplayFlowing(now_qpc)) {
+            snapshot.display_source = PacingDisplaySource::Etw;
+        } else if (s_samples.window_source == PacingDisplaySource::FlipGate) {
+            if (s_samples.last_flip_qpc != 0 && now_qpc - s_samples.last_flip_qpc <= window_ticks)
+                snapshot.display_source = PacingDisplaySource::FlipGate;
+        } else if (s_samples.window_source == PacingDisplaySource::FgInput) {
+            if (s_samples.last_fg_input_qpc != 0 && now_qpc - s_samples.last_fg_input_qpc <= window_ticks)
+                snapshot.display_source = PacingDisplaySource::FgInput;
+        } else if (dxgi_recent) {
+            snapshot.display_source = PacingDisplaySource::Dxgi;
+        } else if (etw_recent) {
+            snapshot.display_source = PacingDisplaySource::Etw;
+        }
         if (snapshot.display_source == PacingDisplaySource::FgInput && std::isfinite(s_samples.source_fg_divisor) &&
             s_samples.source_fg_divisor > 1.0 && s_samples.source_fg_divisor < 16.0) {
             snapshot.frames_per_sample = static_cast<uint32_t>(s_samples.source_fg_divisor + 0.5);

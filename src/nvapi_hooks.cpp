@@ -2328,6 +2328,7 @@ static NvAPI_Status __cdecl Hook_SetFlipConfig(IUnknown* queue, UINT source, NV_
             ? static_cast<double>(seen.timePerBatchMs) * 1000.0 : 0.0;
         FlipConfig_Record(call_qpc.QuadPart, batch_us >= 4294967295.0 ? UINT32_MAX
             : static_cast<uint32_t>(batch_us + 0.5));
+        if (result == NVAPI_OK) g_flip_metering_accepted_qpc.store(call_qpc.QuadPart, std::memory_order_relaxed);
     }
     const NvU32 presented = v2 ? seen.nPresentedFramesPerBatch : 0;
     const uint64_t signature = (static_cast<uint64_t>(static_cast<uint32_t>(result)) << 32) |

@@ -71,8 +71,10 @@ private:
 // When a real frame entered frame generation: the release of its FG input wait (the Signalled gate record), or its
 // readiness there (the prefix readback, PacingReadyRecord with before_gate) where that came later or no wait was
 // queued for it (a frame late for its slot is never held). The readiness of frame n + 1 stands behind frame n's wait
-// on the same queue, so when it arrives frame n's release, if there was one, has been recorded: frame n is emitted
-// then, one frame late.
+// on the same queue and one thread pushes both records, so the producer has pushed frame n's release, if there was
+// one, before frame n + 1's readiness: frame n is emitted then, one frame late. The caller keeps that order: it
+// takes a batch of readiness records off their queue FIRST, then adds every release queued by then, then the batch
+// (drained the other way round, a release pushed between the two drains would be missed).
 struct PacingFgInputSample {
     PacingFrameKey key{};
     int64_t entry_qpc = 0;
@@ -97,18 +99,31 @@ public:
     {
         if (record.before_gate == 0 || !PacingFrameKey_IsValid(record.key)) return false;
         if (pending_valid_ && record.key == pending_key_) return false; // one readiness per frame
-        const bool emitted = pending_valid_;
-        if (emitted) {
+        bool emitted = false;
+        if (pending_valid_) {
             int64_t entry_qpc = pending_ready_qpc_;
             const Release& release = releases_[pending_key_.frame_id % releases_.size()];
-            if (release.key == pending_key_ && release.signal_qpc > entry_qpc) entry_qpc = release.signal_qpc;
-            sample->key = pending_key_;
-            sample->entry_qpc = entry_qpc;
-            sample->follows = FollowsEmitted(pending_key_);
-            emitted_valid_ = true;
-            emitted_key_ = pending_key_;
+            if (release.key == pending_key_) {
+                if (release.signal_qpc > entry_qpc) entry_qpc = release.signal_qpc;
+                emitted = true;
+            } else {
+                // The frame's slot holds no release or an older frame's: the frame was not held. A newer frame's
+                // (the caller fell a whole ring of frames behind) says nothing about this one: whether it was
+                // held is not known, so it is left out and the frame behind it follows nothing.
+                emitted = Older(release.key, pending_key_);
+            }
+            if (emitted) {
+                sample->key = pending_key_;
+                sample->entry_qpc = entry_qpc;
+                sample->follows = emitted_valid_ && pending_key_.domain == emitted_key_.domain &&
+                    pending_key_.producer_epoch == emitted_key_.producer_epoch &&
+                    pending_key_.frame_id == emitted_key_.frame_id + 1;
+                emitted_key_ = pending_key_;
+            }
+            emitted_valid_ = emitted;
         }
-        // A readiness that did not read back valid leaves its frame out: the frame after it follows nothing.
+        // A readiness that did not read back valid leaves its frame out: the frame after it follows nothing,
+        // because the frame IDs of two frames that follow each other differ by one.
         pending_valid_ = record.valid != 0 && record.ready_qpc > 0;
         pending_key_ = record.key;
         pending_ready_qpc_ = record.ready_qpc;
@@ -121,27 +136,17 @@ private:
         int64_t signal_qpc = 0;
     };
 
-    // Frame IDs rise by one per frame in the games seen; a game that steps by another constant is followed once
-    // the step has repeated, so a missing frame (twice the step) is a gap there too.
-    bool FollowsEmitted(const PacingFrameKey& key) noexcept
+    // `slot` is empty or names a frame before `key`'s: an earlier producer epoch, or an earlier frame of the same.
+    static bool Older(const PacingFrameKey& slot, const PacingFrameKey& key) noexcept
     {
-        if (!emitted_valid_ || key.domain != emitted_key_.domain ||
-            key.producer_epoch != emitted_key_.producer_epoch || key.frame_id <= emitted_key_.frame_id) {
-            step_ = 0;
-            return false;
-        }
-        const uint64_t step = key.frame_id - emitted_key_.frame_id;
-        const bool follows = step == 1 || (step == step_ && step <= kMostStep);
-        step_ = step;
-        return follows;
+        if (!PacingFrameKey_IsValid(slot) || slot.producer_epoch < key.producer_epoch) return true;
+        return slot.domain == key.domain && slot.producer_epoch == key.producer_epoch && slot.frame_id < key.frame_id;
     }
 
-    static constexpr uint64_t kMostStep = 4;
-    std::array<Release, 16> releases_{};
+    std::array<Release, 64> releases_{}; // by frame ID: over a second of real frames at 60 a second
     bool pending_valid_ = false;
     PacingFrameKey pending_key_{};
     int64_t pending_ready_qpc_ = 0;
     bool emitted_valid_ = false;
     PacingFrameKey emitted_key_{};
-    uint64_t step_ = 0;
 };
