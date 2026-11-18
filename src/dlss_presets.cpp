@@ -5,10 +5,9 @@
 #include <NvApiDriverSettings.h>
 #include <Windows.h>
 #include <atomic>
-#include <chrono>
-#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
 
 // DRS setting IDs
@@ -22,14 +21,19 @@ static constexpr NvU32 DRS_ID_MFG_GENERATION_FACTOR = 0x104D6667;
 static constexpr NvU32 DRS_ID_MFG_MODE_OVERRIDE     = 0x10308298;
 static constexpr NvU32 DRS_ID_MFG_DYNAMIC_TARGET_FPS = 0x10CF4125;
 
-// Lifecycle operations are serialized independently from the worker's wait.
-// Shutdown may therefore hold this lock while joining without blocking worker exit.
+// Lifecycle operations are serialized. The worker waits on its stop event and on changes of the driver profile
+// database; shutdown sets the event and joins.
 static std::mutex s_lifecycle_mutex;
-static std::mutex s_worker_wait_mutex;
-static std::condition_variable s_worker_wakeup;
 static std::atomic<bool> s_stop_requested{false};
 static std::atomic<bool> s_initialized{false};
 static HANDLE s_poll_thread = nullptr;
+static HANDLE s_stop_event = nullptr;
+
+// The driver keeps its profile database in %ProgramData%\NVIDIA Corporation\Drs (nvdrsdb0.bin, nvdrsdb1.bin,
+// nvdrssel.bin). Other files there (the NVIDIA App's nvAppTimestamps) change without any profile change.
+static constexpr DWORD kDrsChangeFilter =
+    FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE;
+static constexpr DWORD kDrsSettleMilliseconds = 250;   // the writer replaces several files in a burst
 
 // All fields are atomic so the sequence protocol is valid under the C++ memory
 // model. Writers are rare (poll/UI threads) and serialized; readers stay lock-free.
@@ -200,22 +204,75 @@ static void DoPoll() {
     DoPollUnlocked();
 }
 
-static void PollThreadImpl() {
-    if (!s_stop_requested.load(std::memory_order_acquire)) DoPoll();
-
-    std::unique_lock<std::mutex> wait_lock(s_worker_wait_mutex);
-    while (!s_stop_requested.load(std::memory_order_acquire)) {
-        if (s_worker_wakeup.wait_for(
-                wait_lock,
-                std::chrono::seconds(10),
-                [] { return s_stop_requested.load(std::memory_order_acquire); })) {
-            break;
-        }
-
-        wait_lock.unlock();
-        DoPoll();
-        wait_lock.lock();
+// True when a completed directory read names a profile database file, or when the read overflowed (bytes == 0:
+// the changes are unknown, so they may include one).
+static bool NamesProfileDatabase(const BYTE* buffer, DWORD bytes) noexcept {
+    if (bytes == 0) return true;
+    for (DWORD offset = 0;;) {
+        const auto* info = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(buffer + offset);
+        const size_t length = info->FileNameLength / sizeof(wchar_t);
+        if (length >= 5 && _wcsnicmp(info->FileName, L"nvdrs", 5) == 0) return true;
+        if (info->NextEntryOffset == 0) return false;
+        offset += info->NextEntryOffset;
+        if (offset >= bytes) return false;
     }
+}
+
+static HANDLE OpenProfileDatabaseDirectory() noexcept {
+    wchar_t root[MAX_PATH] = {};
+    const DWORD length = GetEnvironmentVariableW(L"ProgramData", root, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) return INVALID_HANDLE_VALUE;
+    wchar_t path[MAX_PATH] = {};
+    if (_snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\NVIDIA Corporation\\Drs", root) < 0) return INVALID_HANDLE_VALUE;
+    return CreateFileW(path, FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+}
+
+// Reads the profile once, then again only after the driver's profile database changed (the NVIDIA Control Panel,
+// the NVIDIA App or another tool saved it), instead of reloading the whole database every 10 s. Without a
+// watchable directory the values read at start stay.
+static void PollThreadImpl() {
+    if (s_stop_requested.load(std::memory_order_acquire)) return;
+    DoPoll();
+
+    const HANDLE directory = OpenProfileDatabaseDirectory();
+    if (directory == INVALID_HANDLE_VALUE) {
+        LOG_INFO("DLSS presets: driver profile changes are not watched (error %lu); the values read at start stay",
+                 GetLastError());
+        WaitForSingleObject(s_stop_event, INFINITE);
+        return;
+    }
+    OVERLAPPED overlapped = {};
+    overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    alignas(DWORD) BYTE buffer[4096];
+    bool reading = overlapped.hEvent != nullptr &&
+        ReadDirectoryChangesW(directory, buffer, sizeof(buffer), FALSE, kDrsChangeFilter, nullptr, &overlapped, nullptr);
+    if (!reading) {
+        LOG_INFO("DLSS presets: driver profile changes are not watched (error %lu); the values read at start stay",
+                 GetLastError());
+        WaitForSingleObject(s_stop_event, INFINITE);
+    }
+    while (reading) {
+        const HANDLE handles[2] = { s_stop_event, overlapped.hEvent };
+        if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) break;
+        DWORD bytes = 0;
+        const bool completed = GetOverlappedResult(directory, &overlapped, &bytes, FALSE) != FALSE;
+        const bool changed = completed && NamesProfileDatabase(buffer, bytes);
+        ResetEvent(overlapped.hEvent);
+        reading = completed &&
+            ReadDirectoryChangesW(directory, buffer, sizeof(buffer), FALSE, kDrsChangeFilter, nullptr, &overlapped, nullptr);
+        if (!changed) continue;
+        if (WaitForSingleObject(s_stop_event, kDrsSettleMilliseconds) == WAIT_OBJECT_0) break;
+        DoPoll();
+    }
+    if (reading) {
+        // The pending read writes into `buffer`: cancel it and wait for it before the frame is left.
+        CancelIoEx(directory, &overlapped);
+        DWORD bytes = 0;
+        GetOverlappedResult(directory, &overlapped, &bytes, TRUE);
+    }
+    if (overlapped.hEvent) CloseHandle(overlapped.hEvent);
+    CloseHandle(directory);
 }
 
 static DWORD WINAPI PollThreadProc(LPVOID) noexcept {
@@ -267,10 +324,11 @@ void DLSSPresets_EnsureStarted() {
 
     LOG_INFO("DLSS presets: DRS API available");
     s_stop_requested.store(false, std::memory_order_release);
-    s_poll_thread = CreateThread(
-        nullptr, 0, PollThreadProc, nullptr, 0, nullptr);
+    s_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    s_poll_thread = s_stop_event ? CreateThread(nullptr, 0, PollThreadProc, nullptr, 0, nullptr) : nullptr;
     if (!s_poll_thread) {
         s_stop_requested.store(true, std::memory_order_release);
+        if (s_stop_event) { CloseHandle(s_stop_event); s_stop_event = nullptr; }
         PublishSnapshot({});
         LOG_ERROR("DLSS presets: failed to start poll worker (%lu)", GetLastError());
     }
@@ -278,11 +336,8 @@ void DLSSPresets_EnsureStarted() {
 
 bool DLSSPresets_Shutdown() {
     std::lock_guard<std::mutex> lifecycle_lock(s_lifecycle_mutex);
-    {
-        std::lock_guard<std::mutex> wait_lock(s_worker_wait_mutex);
-        s_stop_requested.store(true, std::memory_order_release);
-    }
-    s_worker_wakeup.notify_all();
+    s_stop_requested.store(true, std::memory_order_release);
+    if (s_stop_event) SetEvent(s_stop_event);
     if (s_poll_thread) {
         if (WaitForSingleObject(s_poll_thread, 2500) != WAIT_OBJECT_0) {
             OutputDebugStringA(
@@ -292,6 +347,7 @@ bool DLSSPresets_Shutdown() {
         CloseHandle(s_poll_thread);
         s_poll_thread = nullptr;
     }
+    if (s_stop_event) { CloseHandle(s_stop_event); s_stop_event = nullptr; }
     s_initialized = false;
     s_stop_requested.store(false, std::memory_order_release);
     PublishSnapshot({});
