@@ -734,6 +734,16 @@ if(MSVC)
     target_compile_options(test_addon_exports PRIVATE /W4 /utf-8 /permissive-)
 endif()
 
+add_executable(test_addon_reload test_addon_reload.cpp)
+target_compile_features(test_addon_reload PRIVATE cxx_std_17)
+target_include_directories(test_addon_reload PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_dependencies(test_addon_reload relimiter)
+if(MSVC)
+    set_property(TARGET test_addon_reload PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_options(test_addon_reload PRIVATE /W4 /utf-8 /permissive-)
+endif()
+
 add_executable(test_hook_regressions
     test_hook_regressions.cpp
     ${CMAKE_SOURCE_DIR}/src/gpu_present_gate.cpp
@@ -1083,6 +1093,8 @@ add_test(NAME pacing_csv COMMAND test_pacing_csv)
 add_test(NAME pacing_schema COMMAND test_pacing_schema)
 add_test(NAME addon_exports
     COMMAND test_addon_exports $<TARGET_FILE:relimiter>)
+add_test(NAME addon_reload
+    COMMAND test_addon_reload $<TARGET_FILE:relimiter>)
 add_test(NAME dmfg_detection_properties COMMAND test_dmfg_detection)
 add_test(NAME scheduler_passthrough COMMAND test_scheduler_passthrough)
 add_test(NAME scheduler_safety COMMAND test_scheduler_safety)

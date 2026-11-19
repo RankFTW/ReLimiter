@@ -583,10 +583,6 @@ static bool DoInit(HMODULE hModule, HMODULE reshade_module) {
     }
     s_addon_registered = true;
 
-    // Seed the inline handle caches so register_event / unregister_addon work.
-    reshade::internal::get_current_module_handle(hModule);
-    reshade::internal::get_reshade_module_handle(reshade_mod);
-
 #if defined(IMGUI_VERSION_NUM)
     auto imgui_fn = reinterpret_cast<const imgui_function_table*(*)(uint32_t)>(
         GetProcAddress(reshade_mod, "ReShadeGetImGuiFunctionTable"));
@@ -893,6 +889,13 @@ static bool RollbackInitialization(HMODULE addon_module) {
 // may run before ReShade's addon manager is ready.
 extern "C" __declspec(dllexport)
 bool AddonInit(HMODULE addon_module, HMODULE reshade_module) {
+    // Before anything can log. ReShade's header helpers keep the add-on and ReShade module handles in
+    // function-local statics that their first call fixes. The logger forwards warnings and errors through
+    // reshade::log::message, whose first call (Log_Init's breadcrumb report can be one) would fix the add-on
+    // handle as null: reshade::unregister_addon then unregisters nothing, ReShade keeps the add-on registered
+    // through its unload, and the AddonInit of its next device is refused ("invalid module handle").
+    reshade::internal::get_current_module_handle(addon_module);
+    reshade::internal::get_reshade_module_handle(reshade_module);
     if (s_addon_initialised) return true;
     if (s_fail_inert) {
         OutputDebugStringA(
