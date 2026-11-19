@@ -295,18 +295,19 @@ struct PacingGpuQueueRecord {
     double min_margin_us = 0.0;
     double wait_block_us = 0.0;
     // Queue law inputs (gpu_queue_probe_core.h): time submissions were kept waiting by ReLimiter's
-    // own hold, the smallest queue wait not counting that time, the time the queue was free of
-    // work and of pending waits before the frame's first submission, the interval between this
-    // frame's last completion and the previous frame's, and the time queue Waits were pending
-    // with nothing queued behind them.
+    // own hold, the smallest queue wait not counting that time (a submission queued before the queue
+    // reached the hold keeps the time it sat behind the busy queue), every stretch the queue was free
+    // of work and of pending waits before the frame's first submission (before, between and after the
+    // boundary Waits), the interval between this frame's last completion and the previous frame's,
+    // and the time queue Waits were pending with nothing queued behind them.
     double hold_block_us = 0.0;
     double min_margin_free_us = 0.0;
     double boundary_idle_us = 0.0;
     double cycle_us = 0.0;
     double wait_idle_us = 0.0;
     // Which queue the record describes: 0 unknown, 1 the presenting queue, 2 the source queue of
-    // the frame generation input, 3 the render queue the presenting queue depends on (found by
-    // per-frame fence dependencies). Set when the record is pushed; CSV column gq_queue_role.
+    // the frame generation input, 3 or 4 the render queue found by per-frame fence dependencies
+    // from the presenting queue (3) or the FG input's source queue (4). CSV column gq_queue_role.
     uint8_t queue_role = 0;
     // Submissions of the frame whose completion marker was the game's own Signal (borrowed, set by
     // the probe); 0 when the probe marked every submission itself. Low part of CSV column 197, whose
@@ -330,6 +331,13 @@ struct PacingGpuQueueRecord {
     // queued behind, announced with the hold (GpuQueueProbe_OnHoldAnnounce); 0 = no law hold was announced for the
     // frame. Not written to the CSV; the law's record debit names this sequence.
     uint64_t law_hold_sequence = 0;
+    // The bounds of the frame's last completion and of its cycle (last_done_qpc and cycle_us are upper-end positions):
+    // the true last completion lies in [last_done_lo_qpc, last_done_qpc] (set with kLastDone) and the true cycle in
+    // [cycle_lo_us, cycle_hi_us] (set with kCycle). Not written to the CSV; the unified pacer's carry votes
+    // (UnifiedCarryVotes) judge with them, and its session summary counts the votes.
+    int64_t last_done_lo_qpc = 0;
+    double cycle_lo_us = 0.0;
+    double cycle_hi_us = 0.0;
 };
 
 enum class PacingClockMapStatus : uint8_t {

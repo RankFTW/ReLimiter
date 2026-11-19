@@ -29,7 +29,9 @@ UnifiedQueueSample UnifiedQueueSample_FromRecord(const PacingGpuQueueRecord& rec
         !NonNegativeFinite(record.hold_block_us) || !NonNegativeFinite(record.wait_idle_us) ||
         !NonNegativeFinite(record.cycle_us))
         return sample;
-    const double starve_us = record.empty_us + record.boundary_idle_us;
+    // Nothing queued: empty (inside the frame), boundary idle (before its first submission) and wait idle (a Wait
+    // pending with nothing behind it). Each is time the queue had no work, whichever face the interval's excess took.
+    const double starve_us = record.empty_us + record.boundary_idle_us + record.wait_idle_us;
     const bool has_margin = (record.valid & PacingGpuQueueRecord::kMinMarginFree) != 0 &&
         NonNegativeFinite(record.min_margin_free_us);
     if (!(starve_us > 0.0) && !has_margin)
@@ -37,12 +39,13 @@ UnifiedQueueSample UnifiedQueueSample_FromRecord(const PacingGpuQueueRecord& rec
     sample.valid = true;
     sample.starve_us = starve_us;
     sample.margin_free_us = has_margin ? record.min_margin_free_us : 0.0;
-    // The render queue found by dependency: its hold block is ReLimiter's own order Wait (the gate's hold is on
-    // the presenting queue), time the queue sat blocked by the pacer's choice and never the GPU's need. Under the
-    // order a target-bound frame is held I - Delta whatever the lead is, so a base that kept the block followed
-    // the interval it caused (gain 1); it is taken out of the cycle here (the invariant in unified_queue_law.h).
-    // N and S below are computed from the record as it is and do not change.
-    const bool order_block = record.queue_role == kUnifiedQueueRoleRenderQueue;
+    // The render queue found by dependency (roles 3 and 4): its hold block is ReLimiter's own order Wait (the gate's
+    // hold is on the presenting queue or the frame generation input's source queue), time the queue sat blocked by
+    // the pacer's choice and never the GPU's need. Under the order a target-bound frame is held I - Delta whatever
+    // the lead is, so a base that kept the block followed the interval it caused (gain 1); it is taken out of the
+    // cycle here (the invariant in unified_queue_law.h). N and S below are computed from the record as it is and
+    // do not change.
+    const bool order_block = UnifiedQueueRole_IsRenderQueueByDependency(record.queue_role);
     sample.cycle_us = order_block ? std::max(0.0, record.cycle_us - record.hold_block_us) : record.cycle_us;
     sample.hold_block_us = order_block ? 0.0 : record.hold_block_us;
     sample.boundary_idle_us = record.boundary_idle_us;
@@ -52,6 +55,10 @@ UnifiedQueueSample UnifiedQueueSample_FromRecord(const PacingGpuQueueRecord& rec
     sample.need_us = std::max(0.0, raw_need_us);
     sample.service_us = std::max(0.0, raw_need_us - record.empty_us);
     sample.s_prime_us = starve_us > 0.0 ? -starve_us : sample.margin_free_us;
+    // The window judges the kept parts at arrival (Push); alone, all of it is kept.
+    sample.lost_us = starve_us + sample.hold_block_us;
+    sample.kept_starve_us = starve_us;
+    sample.kept_hold_us = sample.hold_block_us;
     return sample;
 }
 
@@ -81,10 +88,25 @@ void UnifiedQueueWindow::Push(const UnifiedQueueSample& sample, const UnifiedQue
     if (!sample.valid)
         return;
     measured_ = false;
-    samples_[sample_head_] = sample;
+    UnifiedQueueSample& stored = samples_[sample_head_];
+    stored = sample;
     sample_head_ = (sample_head_ + 1) % static_cast<uint32_t>(kWindow);
     if (sample_count_ < kWindow)
         ++sample_count_;
+    // The kept parts, judged once against the window as it is now (the header: L and kept): the median loss of
+    // the valid samples, this one included (the ring holds exactly them, from index 0). Below it nothing is kept;
+    // above it the excess over L, split in proportion to the starvation and the hold block.
+    double lost_us[kWindow];
+    for (uint32_t i = 0; i < sample_count_; ++i)
+        lost_us[i] = samples_[i].lost_us;
+    const uint32_t middle = (sample_count_ - 1) / 2;
+    std::nth_element(lost_us, lost_us + middle, lost_us + sample_count_);
+    const double level_us = lost_us[middle];
+    if (level_us > 0.0) {
+        const double kept_us = std::max(0.0, stored.lost_us - level_us);
+        stored.kept_starve_us = stored.lost_us > 0.0 ? kept_us * (stored.starve_us / stored.lost_us) : 0.0;
+        stored.kept_hold_us = std::max(0.0, kept_us - stored.kept_starve_us);
+    }
     frames_since_valid_ = 0;
     last_valid_positioned_ = position.valid;
     if (position.valid) {
@@ -146,8 +168,8 @@ void UnifiedQueueWindow::Measure(double j_us, const UnifiedQueueParams& params) 
 
     // The samples newest first: index 0 is the newest valid arrival.
     double cycle_sum_us = 0.0;
-    double paced_starve_sum_us = 0.0; // starve of the GPU-paced frames, over the window
-    double base_need_sum_us = 0.0;    // cycle - starve - min(hold block, slack), over the newest F
+    double paced_starve_sum_us = 0.0; // kept starvation of the GPU-paced frames, over the window
+    double base_need_sum_us = 0.0;    // the F-term of B (the header), over the newest F
     const uint32_t need_frames_param = static_cast<uint32_t>(std::min<int64_t>(
         std::max<int64_t>(params.need_frames, 1), static_cast<int64_t>(kWindow)));
     const uint32_t need_frames = std::min(need_frames_param, count);
@@ -160,35 +182,40 @@ void UnifiedQueueWindow::Measure(double j_us, const UnifiedQueueParams& params) 
         if (!measured_) sorted_margins_[age] = sample.s_prime_us;
         cycle_sum_us += sample.cycle_us;
         if (sample.paced)
-            paced_starve_sum_us += std::min(sample.starve_us, sample.paced_wait_us);
+            paced_starve_sum_us += std::min(sample.kept_starve_us, sample.paced_wait_us);
         // (the need's part of B is summed below, once the slack is known)
         need_sum_us += sample.need_us;
         service_sum_us += sample.service_us;
         if (age == 0 || (age < kGuardFrames && sample.s_prime_us < newest_min_us))
             newest_min_us = sample.s_prime_us;
     }
-    // The slack the cap leaves: max(0, J - S^), the quantity the credit's refill funds holds from
-    // (S^ the 16-frame service). A hold up to that slack is paid by the cap's headroom, not by the
-    // GPU, so it drops out of the base; the part of a hold above the slack stays (no cap, or a cap
-    // the GPU cannot reach: S^ >= J, slack 0, and the base is cycle - starve exactly).
-    // That is a hold on the presenting queue, which the credit and the advance bound. The render queue's order
-    // block never gets here: UnifiedQueueSample_FromRecord took it out of the cycle (under the order a
-    // target-bound frame is held I - Delta whatever the lead is, and whatever the credit is while its debt is
-    // constant; a changing debt moves the hold one for one, h = I - Delta - the change of the advance. A base
-    // that kept the block would follow the interval it caused).
+    // The slack the cap leaves, max(0, J - S^), and the share, min(sigma * S^, max(0, S^ - J)): the credit's two
+    // refill terms (S^ the 16-frame service), what pays a hold. A hold block up to the slack is paid by the
+    // cap's headroom, not by the GPU, so it drops out of the base, as does the level most of the window's frames
+    // are blocked at (the interval's own excess, judged at arrival), except what the share funds; a block
+    // beyond both stays (no cap or a cap the GPU cannot reach: slack 0, and only the kept part beyond the level
+    // and the share's part of the level remain). That is a hold on the watched queue, which the credit and the
+    // advance bound. The render queue's order block never gets here: UnifiedQueueSample_FromRecord took it out of
+    // the cycle (under the order a target-bound frame is held I - Delta whatever the lead is, and whatever the
+    // credit is while its debt is constant; a changing debt moves the hold one for one, h = I - Delta - the
+    // change of the advance. A base that kept the block would follow the interval it caused).
     const double j = std::isfinite(j_us) && j_us > 0.0 ? j_us : 0.0;
     const double service_us = service_sum_us / static_cast<double>(count);
     const double slack_us = std::max(0.0, j - service_us);
+    const double sigma = std::isfinite(params.hold_share) && params.hold_share > 0.0 ? params.hold_share : 0.0;
+    const double share_us = std::min(sigma * service_us, std::max(0.0, service_us - j));
     for (uint32_t age = 0; age < need_frames; ++age) {
         const UnifiedQueueSample& sample =
             samples_[(sample_head_ + static_cast<uint32_t>(kWindow) - 1 - age) % static_cast<uint32_t>(kWindow)];
-        // need_free + held = (cycle - starve - hold) + max(0, hold - slack)
-        base_need_sum_us += sample.cycle_us - sample.starve_us - std::min(sample.hold_block_us, slack_us);
+        // free of loss + kept block beyond the slack + the share's part of the common level
+        const double common_hold_us = std::max(0.0, sample.hold_block_us - sample.kept_hold_us);
+        base_need_sum_us += sample.cycle_us - sample.starve_us - sample.hold_block_us +
+            std::max(0.0, sample.kept_hold_us - slack_us) + std::min(common_hold_us, share_us);
     }
-    // B: the need follows the GPU within F frames (the presenting queue's hold blocking beyond the cap's
-    // slack included); the starvation of the frames the GPU term paced, as far as their start wait can
-    // have caused it, is kept at its 16-frame mean (it cancels the interval's ratchet), the
-    // starvation of any other frame, and a paced frame's beyond its wait, is not B's to carry.
+    // B: the need follows the GPU within F frames (the kept hold blocking beyond the cap's slack and the funded
+    // share included); the kept starvation of the frames the GPU term paced, as far as their start wait can
+    // have caused it, is kept at its 16-frame mean; the starvation of any other frame, a paced frame's beyond
+    // its wait, and the level most frames lose, is not B's to carry.
     // F = 16 is the 16-frame mean cycle exactly (no gating, no hold term: the first build's base).
     const double base_us = need_frames_param >= kWindow
         ? cycle_sum_us / static_cast<double>(count)
@@ -216,8 +243,7 @@ void UnifiedQueueWindow::Measure(double j_us, const UnifiedQueueParams& params) 
     const double p_us = std::min(std::max(raw_us, -clamp_us), upper_us);
 
     const double need_us = need_sum_us / static_cast<double>(count);
-    // (S^ and J: see above.)
-    const double sigma = std::isfinite(params.hold_share) && params.hold_share > 0.0 ? params.hold_share : 0.0;
+    // (S^, J, the slack and the share: see above.)
 
     result.computable = true;
     result.limited = raw_us > deficit_us && deficit_us < clamp_us;
@@ -242,7 +268,48 @@ void UnifiedQueueWindow::Measure(double j_us, const UnifiedQueueParams& params) 
     // The credit's slack and allowance both use the service S^ (the frames' work without the
     // queue's own empty time): a 3.6 ms starve inside a frame is 3.6 ms of slack, not need. N^
     // (empty time counted as need) is kept for analysis only.
-    result.refill_slack_us = std::max(0.0, j - service_us);
-    result.refill_share_us = std::min(sigma * service_us, std::max(0.0, service_us - j));
+    result.refill_slack_us = slack_us;
+    result.refill_share_us = share_us;
     result.refill_us = result.refill_slack_us + result.refill_share_us;
+}
+
+UnifiedCarryVotes::Vote UnifiedCarryVotes::Judge(double tail_lo_us, double tail_hi_us, double cycle_lo_us,
+    double cycle_hi_us) noexcept
+{
+    if (!std::isfinite(tail_lo_us) || !std::isfinite(tail_hi_us) || !std::isfinite(cycle_lo_us) ||
+        !std::isfinite(cycle_hi_us) || tail_lo_us > tail_hi_us || !(cycle_lo_us > 0.0) || cycle_lo_us > cycle_hi_us)
+        return Vote::Undecided;
+    if (tail_hi_us < 0.5 * cycle_lo_us)
+        return Vote::Carried;
+    if (tail_lo_us >= 0.5 * cycle_hi_us)
+        return Vote::NotCarried;
+    return Vote::Undecided;
+}
+
+void UnifiedCarryVotes::Reset() noexcept
+{
+    *this = UnifiedCarryVotes{};
+}
+
+void UnifiedCarryVotes::Note(Vote vote, uint64_t index) noexcept
+{
+    if (vote == Vote::Undecided)
+        return;
+    const uint8_t not_carried = vote == Vote::NotCarried ? 1 : 0;
+    if (count_ == kWindow)
+        not_carried_ -= ring_[head_];
+    else
+        ++count_;
+    ring_[head_] = not_carried;
+    not_carried_ += not_carried;
+    head_ = (head_ + 1) % kWindow;
+    if (index > newest_index_)
+        newest_index_ = index;
+}
+
+bool UnifiedCarryVotes::Refuses(uint64_t planned_index, uint64_t max_age) const noexcept
+{
+    if (count_ < kNeeded || planned_index > newest_index_ + max_age)
+        return false; // no fresh evidence: the law decides
+    return 2 * not_carried_ >= count_;
 }

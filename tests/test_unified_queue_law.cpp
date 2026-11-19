@@ -175,13 +175,15 @@ namespace
 
     void TestSampleFromRecord()
     {
-        // starve = empty + boundary idle; s' = -starve; N = cycle - hold - boundary idle - wait idle.
+        // starve = empty + boundary idle + wait idle; s' = -starve; N = cycle - hold - boundary idle - wait idle;
+        // lost = starve + hold, all of it kept until a window judges it.
         const UnifiedQueueSample starved = UnifiedQueueSample_FromRecord(Record(10000.0, 300.0, 999.0, 1000.0, 200.0, 500.0));
         CHECK(starved.valid);
-        CHECK(Near(starved.starve_us, 500.0) && Near(starved.s_prime_us, -500.0));
-        CHECK(Near(starved.need_us, 8300.0) && Near(starved.cycle_us, 10000.0));
+        CHECK(Near(starved.starve_us, 1000.0) && Near(starved.s_prime_us, -1000.0));
+        CHECK(Near(starved.need_us, 8300.0) && Near(starved.service_us, 8000.0) && Near(starved.cycle_us, 10000.0));
         CHECK(Near(starved.hold_block_us, 1000.0) && Near(starved.boundary_idle_us, 200.0) &&
             Near(starved.wait_idle_us, 500.0) && Near(starved.margin_free_us, 999.0));
+        CHECK(Near(starved.lost_us, 2000.0) && Near(starved.kept_starve_us, 1000.0) && Near(starved.kept_hold_us, 1000.0));
 
         // No starve: the margin without the hold's time; without its bit the record is no sample.
         const UnifiedQueueSample fed = UnifiedQueueSample_FromRecord(Record(10000.0, 0.0, 700.0));
@@ -190,8 +192,9 @@ namespace
         // A starved frame needs no margin.
         const UnifiedQueueSample no_margin = UnifiedQueueSample_FromRecord(Record(10000.0, 50.0, 0.0, 0.0, 0.0, 0.0, false));
         CHECK(no_margin.valid && Near(no_margin.s_prime_us, -50.0));
-        // The boundary idle alone is a starve.
+        // The boundary idle alone is a starve, and so is the wait idle alone (a Wait pending with nothing behind it).
         CHECK(Near(UnifiedQueueSample_FromRecord(Record(10000.0, 0.0, 0.0, 0.0, 120.0, 0.0, false)).s_prime_us, -120.0));
+        CHECK(Near(UnifiedQueueSample_FromRecord(Record(10000.0, 0.0, 0.0, 0.0, 0.0, 150.0, false)).s_prime_us, -150.0));
 
         // Every one of the five bits is required.
         const uint32_t bits[] = {PacingGpuQueueRecord::kCycle, PacingGpuQueueRecord::kEmpty,
@@ -334,20 +337,30 @@ namespace
 
     void TestHeldCapWithSlack()
     {
-        // Cap 20 ms; the GPU needs 16 ms (4 ms of wait idle inside the 20 ms cycle) and the
-        // corrected margin is positive: P's positive part is 0, I_gpu = the cap, the limit flag is
-        // set, and the credit is refilled by the slack J - N^ = 4 ms per record.
+        // Cap 20 ms; the GPU needs 16 ms and every 20 ms cycle has 4 ms of wait idle (a Wait pending with
+        // nothing queued behind it): that is the cap's slack, starvation and not need. B is the need, q the
+        // starvation, I_gpu stays below the cap with no limit flag, and the credit is refilled by the slack
+        // J - S^ = 4 ms per record.
         UnifiedQueueWindow window;
         PushRepeated(&window, UnifiedQueueSample_FromRecord(Record(20000.0, 0.0, 3000.0, 0.0, 0.0, 4000.0)), 16);
         const UnifiedQueueResult law = window.Compute(20000.0, Params());
-        CHECK(law.in_use && law.q_us > 0.0);
-        CHECK(law.p_us == 0.0 && Near(law.gpu_interval_us, 20000.0) && law.limited);
+        CHECK(law.in_use && Near(law.q_us, -4000.0) && Near(law.p_us, -4000.0 / 32.0));
+        CHECK(Near(law.base_us, 20000.0) && law.gpu_interval_us < 20000.0 && !law.limited); // F = 16: the mean cycle
+        CHECK(Near(window.Compute(20000.0, Params(2, 4000.0, 0.0, 4)).base_us, 16000.0));     // F = 4: the need
         CHECK(Near(law.need_us, 16000.0) && Near(law.refill_us, 4000.0));
-        // The same cap with a starved queue: a negative P, I_gpu <= J, no limit flag.
+        // A cap the GPU's need reaches (B = J) with a positive margin: P's positive part is 0, I_gpu = the
+        // cap and the limit flag is set.
+        UnifiedQueueWindow reached;
+        PushRepeated(&reached, UnifiedQueueSample_FromRecord(Record(20000.0, 0.0, 3000.0)), 16);
+        const UnifiedQueueResult held = reached.Compute(20000.0, Params(2, 4000.0, 0.0, 4));
+        CHECK(held.in_use && held.q_us > 0.0);
+        CHECK(held.p_us == 0.0 && Near(held.gpu_interval_us, 20000.0) && held.limited);
+        // The same cap with a starved queue (1 ms empty and the 4 ms of wait idle): a negative P, I_gpu <= J,
+        // no limit flag.
         UnifiedQueueWindow starved;
         PushRepeated(&starved, UnifiedQueueSample_FromRecord(Record(20000.0, 1000.0, 0.0, 0.0, 0.0, 4000.0)), 16);
         const UnifiedQueueResult below = starved.Compute(20000.0, Params());
-        CHECK(Near(below.p_us, -1000.0 / 32.0) && below.gpu_interval_us < 20000.0 && !below.limited);
+        CHECK(Near(below.p_us, -5000.0 / 32.0) && below.gpu_interval_us < 20000.0 && !below.limited);
     }
 
     void TestCapRemovedIntervalFallsEveryFrame()
@@ -435,21 +448,16 @@ namespace
         CHECK(Near(compute(Record(12000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, false), 0.05).refill_us, 550.0));
     }
 
-    void TestHoldStepRaisesTheIntervalOnceAndStops()
+    void TestHoldStepAtSaturationIsPaidOnlyByTheShare()
     {
-        // No cap (J = a 144 Hz display's interval). Holds of 0.5 ms per frame start between two
-        // frames: the cycle grows by 0.5 ms and the hold block is 0.5 ms; the margin without the
-        // hold and the need do not move. The base's need mean already contains the realized hold
-        // blocking (it is in the cycle), so I_gpu is NOT given the mean hold on top: the backlog
-        // (I_gpu above the need without the hold) grows by 0.5 ms / F per arrival while the F-frame
-        // need mean catches up, then stops: F arrivals, 0.5 ms in all. F = 16 is the former
-        // 16-frame mean (31.25 us a frame for 16 frames), F = 4 the default (125 us a frame for
-        // 4 frames).
-        for (const int need_frames : {16, 4}) {
+        // No cap (J = a 144 Hz display's interval, below the GPU's 16 ms: no slack). Holds of 0.5 ms per frame
+        // start between two frames: the cycle grows by 0.5 ms and the hold block is 0.5 ms; the margin without the
+        // hold and the need do not move. The backlog is I_gpu above the hold-free need; steps its change per arrival.
+        const auto run = [](int need_frames, double share, std::vector<double>* steps) {
             UnifiedQueueWindow window;
             PushRepeated(&window, SampleS(1500.0, 16000.0), 16);
             const auto backlog = [&] {
-                const UnifiedQueueResult law = window.Compute(6944.0, Params(2, 4000.0, 0.0, need_frames));
+                const UnifiedQueueResult law = window.Compute(6944.0, Params(2, 4000.0, share, need_frames));
                 CHECK(Near(law.need_us, 16000.0)); // the hold-free need, constant
                 return law.gpu_interval_us - law.need_us;
             };
@@ -459,16 +467,35 @@ namespace
             for (int arrival = 1; arrival <= 40; ++arrival) {
                 window.Push(UnifiedQueueSample_FromRecord(Record(16500.0, 0.0, 1500.0, 500.0)));
                 const double now = backlog();
-                if (arrival <= need_frames)
-                    CHECK(Near(now - previous, 500.0 / need_frames));
-                else
-                    CHECK(Near(now, previous, 1e-9));
+                steps->push_back(now - previous);
                 previous = now;
             }
-            CHECK(Near(previous - before, 500.0));
-            std::printf("hold step, F = %d: the backlog grows 0.5 ms over %d frames (%.2f us each), then holds\n",
-                need_frames, need_frames, 500.0 / need_frames);
-        }
+            return previous - before;
+        };
+        const auto expect = [](const std::vector<double>& steps, int from, int to, double step) {
+            for (int i = from; i < to; ++i)
+                CHECK(Near(steps[static_cast<size_t>(i)], step, 1e-9));
+        };
+        // F = 16, the first build's base (the mean cycle): it grows 0.5 ms / 16 an arrival for 16 arrivals, then holds.
+        std::vector<double> first;
+        CHECK(Near(run(16, 0.0, &first), 500.0));
+        expect(first, 0, 16, 500.0 / 16.0);
+        expect(first, 16, 40, 0.0);
+        // F = 4, share 0: while the held frames are a minority of the window (8 of 16 at most) their block is a
+        // transient and stays (125 us an arrival for 4 arrivals); from the 9th on it is the level most frames are
+        // blocked at, the interval's own excess, and leaves the base as those frames enter the F-frame mean. After
+        // 12 arrivals the interval is back at the need plus P: the hold is not paid by a longer interval.
+        std::vector<double> unfunded;
+        CHECK(Near(run(4, 0.0, &unfunded), 0.0, 1e-9));
+        expect(unfunded, 0, 4, 125.0);
+        expect(unfunded, 4, 8, 0.0);
+        expect(unfunded, 8, 12, -125.0);
+        expect(unfunded, 12, 40, 0.0);
+        // F = 4, share 1/32 (Smooth: sigma * S^ = 0.5 ms): the share funds the common block, which stays: 0.5 ms in all.
+        std::vector<double> funded;
+        CHECK(Near(run(4, 1.0 / 32.0, &funded), 500.0));
+        expect(funded, 0, 4, 125.0);
+        expect(funded, 4, 40, 0.0);
     }
 
     // A valid sample of a frame the GPU term paced (or not). A paced frame's start wait is as long as its
@@ -485,6 +512,8 @@ namespace
     // with the game and render threads in series (N.107): the GPU term paced every frame at 7.96 ms over a need
     // of 7.7 ms, one frame was held for 1.05 ms and then simulated for 43 ms, and its queue sat empty for
     // 39.85 ms. Counted whole, that frame raised the base by 39.85 / 16 = 2.49 ms and the interval with it.
+    // The 0.26 ms every frame starved is the level most frames lose, the interval's own excess: it leaves the
+    // base, which is the need, 7.7 ms; the spike's starvation beyond that level counts up to its start wait.
     void TestPacedStarvationCountsOnlyUpToTheStartWait()
     {
         const auto steady = [] { return PacedSample(Record(7960.0, 260.0, 0.0, 0.0, 0.0, 0.0, false), true); };
@@ -492,24 +521,26 @@ namespace
         for (int i = 0; i < 40; ++i)
             window.Push(steady());
         const double before = window.Compute(7692.0, Params(2, 4000.0, 0.0, 4)).base_us;
-        CHECK(Near(before, 7960.0));
+        CHECK(Near(before, 7700.0));
         // The spike frame, then two ordinary ones (the need's four frames then hold one spike frame).
         window.Push(PacedSample(Record(47350.0, 39850.0, 0.0, 0.0, 0.0, 0.0, false), true, 1050.0));
         window.Push(steady());
         window.Push(steady());
         const UnifiedQueueResult bounded = window.Compute(7692.0, Params(2, 4000.0, 0.0, 4));
-        // need 7.5 ms from the spike frame and 7.7 ms from the others; counted starvation 1.05 ms and 0.26 ms.
+        // need 7.5 ms from the spike frame and 7.7 ms from the others; counted starvation 1.05 ms (the spike's
+        // 39.59 ms beyond the common 0.26 ms, bounded by its wait) and none from the others.
         const double need = (7500.0 + 3.0 * 7700.0) / 4.0;
-        CHECK(Near(bounded.base_us, need + (1050.0 + 15.0 * 260.0) / 16.0));
-        CHECK(bounded.base_us < before);
-        // The same frame with a start wait as long as its starvation is the pacer's own doing and counts whole.
+        CHECK(Near(bounded.base_us, need + 1050.0 / 16.0));
+        CHECK(bounded.base_us - before <= 1050.0 / 16.0 + 1e-9);
+        // The same frame with a start wait as long as its starvation is the pacer's own doing and counts whole
+        // beyond the common level.
         UnifiedQueueWindow whole;
         for (int i = 0; i < 40; ++i)
             whole.Push(steady());
         whole.Push(PacedSample(Record(47350.0, 39850.0, 0.0, 0.0, 0.0, 0.0, false), true));
         whole.Push(steady());
         whole.Push(steady());
-        CHECK(Near(whole.Compute(7692.0, Params(2, 4000.0, 0.0, 4)).base_us, need + (39850.0 + 15.0 * 260.0) / 16.0));
+        CHECK(Near(whole.Compute(7692.0, Params(2, 4000.0, 0.0, 4)).base_us, need + (39850.0 - 260.0) / 16.0));
         // A paced frame that was not held at all counts nothing.
         UnifiedQueueWindow unheld;
         for (int i = 0; i < 40; ++i)
@@ -527,11 +558,12 @@ namespace
             window.Push(PacedSample(Record(20000.0, 3600.0, 0.0, 0.0, 0.0, 0.0, false), false));
         const UnifiedQueueResult held = window.Compute(20000.0, Params(2, 4000.0, 0.0, 4));
         CHECK(Near(held.base_us, 16400.0) && held.gpu_interval_us < 20000.0 && !held.limited);
-        // The same frames GPU-paced: the starvation stays in B and B echoes the 20 ms.
+        // The same frames GPU-paced: the starvation every frame shares is the interval's own excess, not the
+        // GPU's need: B is the need too (before the level was taken out it echoed the 20 ms for good).
         UnifiedQueueWindow paced;
         for (int i = 0; i < 40; ++i)
             paced.Push(PacedSample(Record(20000.0, 3600.0, 0.0, 0.0, 0.0, 0.0, false), true));
-        CHECK(Near(paced.Compute(20000.0, Params(2, 4000.0, 0.0, 4)).base_us, 20000.0));
+        CHECK(Near(paced.Compute(20000.0, Params(2, 4000.0, 0.0, 4)).base_us, 16400.0));
         // F = 16 never gates: the 16-frame mean cycle, whoever paced the frames.
         CHECK(Near(window.Compute(20000.0, Params(2, 4000.0, 0.0, 16)).base_us, 20000.0));
     }
@@ -598,6 +630,84 @@ namespace
             fast, slow);
     }
 
+    // The interval's excess, closed loop (Metal Eden, N.176: frame generation, no cap the GPU can reach, the GPU
+    // term pacing every frame with a start wait of 11.7 ms). The window holds 16 fed frames of a 15.4 ms need; the
+    // need then falls to 12.2 ms and stays. Frame n is planned at I(n), the law's interval from the records that
+    // have arrived (`delay` frames late). The queue works 12.2 ms a frame: a frame planned above the need and the
+    // backlog leaves the queue without work for the excess x = I - need - backlog, which shows in one face: empty
+    // time inside the frame, idle time before its first submission (boundary idle), a Wait pending with nothing
+    // queued behind it (wait idle), or the next frame's work blocked behind the frame generation input's hold
+    // (hold block, no feeding margin); Alternating takes the gap and the hold in turns. A frame planned below
+    // the need and the backlog grows the backlog, its feeding margin. Returns I(n) for n = 1..records and the
+    // largest backlog.
+    enum class ExcessFace { Empty, Gap, WaitIdle, Hold, Alternating };
+    std::vector<double> RunExcess(ExcessFace face, int delay, int records, double* largest_backlog)
+    {
+        constexpr double kOldNeedUs = 15400.0;
+        constexpr double kNeedUs = 12200.0;
+        constexpr double kStartWaitUs = 11700.0;
+        constexpr double kCeilingUs = 6944.0; // the display's ceiling, far below the need
+        UnifiedQueueWindow window;
+        for (int i = 0; i < 16; ++i)
+            window.Push(PacedSample(Record(kOldNeedUs, 0.0, 500.0), true, kStartWaitUs));
+        std::vector<PacingGpuQueueRecord> pending; // records of planned frames that have not arrived, oldest first
+        std::vector<double> intervals;
+        double backlog = 0.0;
+        *largest_backlog = 0.0;
+        for (int n = 1; n <= records; ++n) {
+            while (static_cast<int>(pending.size()) > delay) {
+                window.Push(PacedSample(pending.front(), true, kStartWaitUs));
+                pending.erase(pending.begin());
+            }
+            const double interval = window.Compute(kCeilingUs, Params(2, 4000.0, 0.0, 4)).gpu_interval_us;
+            intervals.push_back(interval);
+            const double excess = std::max(0.0, interval - kNeedUs - backlog);
+            backlog = std::max(0.0, backlog + kNeedUs - interval);
+            *largest_backlog = std::max(*largest_backlog, backlog);
+            const double cycle = kNeedUs + excess;
+            const bool hold = face == ExcessFace::Hold || (face == ExcessFace::Alternating && n % 2 == 0);
+            if (!(excess > 0.0))
+                pending.push_back(Record(cycle, 0.0, backlog));                    // fed: the backlog is its margin
+            else if (hold)
+                pending.push_back(Record(cycle, 0.0, 0.0, excess));                // blocked behind the hold
+            else if (face == ExcessFace::WaitIdle)
+                pending.push_back(Record(cycle, 0.0, 0.0, 0.0, 0.0, excess));      // a Wait, nothing behind it
+            else if (face == ExcessFace::Empty)
+                pending.push_back(Record(cycle, excess, 0.0));                     // empty inside the frame
+            else
+                pending.push_back(Record(cycle, 0.0, 0.0, 0.0, excess));           // idle before its first submission
+        }
+        return intervals;
+    }
+
+    // Whichever face the excess takes, the interval leaves it: within 32 records it is within 0.1 ms of the need,
+    // and from then on no frame is planned more than 0.1 ms above it nor 0.5 ms below it, with the queue's
+    // backlog under 1 ms. A base that kept the excess held the interval near 15.4 ms (wait idle, hold) or let only
+    // P bring it down, x / 32 a frame (empty, gap).
+    void TestIntervalExcessLeavesWhicheverFaceItTakes()
+    {
+        constexpr double kNeedUs = 12200.0;
+        const char* names[] = {"empty", "gap", "wait idle", "hold", "alternating"};
+        for (const ExcessFace face :
+            {ExcessFace::Empty, ExcessFace::Gap, ExcessFace::WaitIdle, ExcessFace::Hold, ExcessFace::Alternating}) {
+            for (const int delay : {0, 2}) {
+                double largest_backlog = 0.0;
+                const std::vector<double> intervals = RunExcess(face, delay, 96, &largest_backlog);
+                double high = intervals[31];
+                double low = intervals[31];
+                for (size_t i = 31; i < intervals.size(); ++i) {
+                    high = std::max(high, intervals[i]);
+                    low = std::min(low, intervals[i]);
+                }
+                CHECK(high <= kNeedUs + 100.0 && low >= kNeedUs - 500.0 && largest_backlog < 1000.0);
+                std::printf("excess as %s, records %d late: I after 8 / 16 / 32 records %.0f / %.0f / %.0f us, "
+                            "then %.0f to %.0f us, largest backlog %.0f us (need %.0f us)\n",
+                    names[static_cast<int>(face)], delay, intervals[7], intervals[15], intervals[31], low, high,
+                    largest_backlog, kNeedUs);
+            }
+        }
+    }
+
     void TestNeedMeanIsUnbiasedWhenGpuPaced()
     {
         // GPU-paced frames, intermittent starvation (one frame in four, and a richer pattern) and
@@ -637,8 +747,10 @@ namespace
     void TestNeedFramesSixteenIsTheMeanCycle()
     {
         // Reference: the first build's base, the mean cycle of the newest 16 valid samples (fewer:
-        // all), whoever paced the frames. F < 16: the mean need of the newest F plus the mean over
-        // the newest 16 of the starvation of the GPU-paced frames.
+        // all), whoever paced the frames. F < 16: the mean F-term of the newest F plus the mean over the
+        // newest 16 of the kept starvation of the GPU-paced frames, each sample's kept parts judged at its
+        // arrival against the median loss of the window it entered (no cap here: no slack, no share, so the
+        // F-term is cycle - starve - hold block + the kept hold block).
         uint32_t state = 20260101u;
         const auto next = [&] {
             state = state * 1664525u + 1013904223u;
@@ -646,41 +758,57 @@ namespace
         };
         UnifiedQueueWindow window;
         std::vector<double> cycles;
-        std::vector<double> needs;         // cycle - starve
-        std::vector<double> paced_starves; // starve of a paced frame, else 0
+        std::vector<double> losts;      // starve + hold block
+        std::vector<double> terms;      // the F-term
+        std::vector<double> paced_kept; // the kept starvation of a paced frame (its start wait is its starvation), else 0
         for (int k = 0; k < 200; ++k) {
             const double cycle = 12000.0 + std::fmod(next(), 6000.0);
             const double empty = std::fmod(next(), 3.0) < 1.0 ? std::fmod(next(), 2500.0) : 0.0;
             const double idle = std::fmod(next(), 5.0) < 1.0 ? std::fmod(next(), 300.0) : 0.0;
             const bool paced = std::fmod(next(), 2.0) < 1.0;
-            window.Push(PacedSample(
-                Record(cycle, empty, 300.0, std::fmod(next(), 800.0), idle, std::fmod(next(), 500.0)), paced));
+            const double hold = std::fmod(next(), 800.0);
+            const double wait_idle = std::fmod(next(), 500.0);
+            window.Push(PacedSample(Record(cycle, empty, 300.0, hold, idle, wait_idle), paced));
+            const double starve = empty + idle + wait_idle;
             cycles.push_back(cycle);
-            needs.push_back(cycle - empty - idle);
-            paced_starves.push_back(paced ? empty + idle : 0.0);
+            losts.push_back(starve + hold);
             const size_t count = cycles.size() < 16 ? cycles.size() : 16;
+            std::vector<double> entered;
+            for (size_t i = 0; i < count; ++i)
+                entered.push_back(losts[losts.size() - 1 - i]);
+            std::sort(entered.begin(), entered.end());
+            const double level = entered[(count - 1) / 2];
+            double kept_s = starve;
+            double kept_h = hold;
+            if (level > 0.0) {
+                const double kept = std::max(0.0, starve + hold - level);
+                kept_s = starve + hold > 0.0 ? kept * (starve / (starve + hold)) : 0.0;
+                kept_h = std::max(0.0, kept - kept_s);
+            }
+            terms.push_back(cycle - starve - hold + kept_h);
+            paced_kept.push_back(paced ? kept_s : 0.0);
             if (count < UnifiedQueueWindow::kMinValidInWindow)
                 continue;
             double mean_cycle = 0.0;
-            double mean_paced_starve = 0.0;
+            double mean_paced_kept = 0.0;
             for (size_t i = 0; i < count; ++i) {
                 mean_cycle += cycles[cycles.size() - 1 - i];
-                mean_paced_starve += paced_starves[paced_starves.size() - 1 - i];
+                mean_paced_kept += paced_kept[paced_kept.size() - 1 - i];
             }
             mean_cycle /= static_cast<double>(count);
-            mean_paced_starve /= static_cast<double>(count);
+            mean_paced_kept /= static_cast<double>(count);
             CHECK(Near(window.Compute(6944.0, Params(2, 4000.0, 0.0, 16)).base_us, mean_cycle, 1e-8));
             CHECK(Near(window.Compute(6944.0, Params(2, 4000.0, 0.0, 99)).base_us, mean_cycle, 1e-8)); // clamped to the window
-            // F = 1 (and 0, clamped up): the newest need plus the gated starvation mean.
-            CHECK(Near(window.Compute(6944.0, Params(2, 4000.0, 0.0, 1)).base_us, needs.back() + mean_paced_starve, 1e-8));
-            CHECK(Near(window.Compute(6944.0, Params(2, 4000.0, 0.0, 0)).base_us, needs.back() + mean_paced_starve, 1e-8));
-            // F = 4: the mean need of the newest (up to 4) samples plus the gated starvation mean.
+            // F = 1 (and 0, clamped up): the newest F-term plus the gated kept starvation mean.
+            CHECK(Near(window.Compute(6944.0, Params(2, 4000.0, 0.0, 1)).base_us, terms.back() + mean_paced_kept, 1e-8));
+            CHECK(Near(window.Compute(6944.0, Params(2, 4000.0, 0.0, 0)).base_us, terms.back() + mean_paced_kept, 1e-8));
+            // F = 4: the mean F-term of the newest (up to 4) samples plus the gated kept starvation mean.
             const size_t f4 = count < 4 ? count : 4;
-            double need4 = 0.0;
+            double term4 = 0.0;
             for (size_t i = 0; i < f4; ++i)
-                need4 += needs[needs.size() - 1 - i];
+                term4 += terms[terms.size() - 1 - i];
             CHECK(Near(window.Compute(6944.0, Params(2, 4000.0, 0.0, 4)).base_us,
-                need4 / static_cast<double>(f4) + mean_paced_starve, 1e-8));
+                term4 / static_cast<double>(f4) + mean_paced_kept, 1e-8));
         }
     }
 
@@ -1127,11 +1255,12 @@ namespace
 
     void TestStatusFlagsAndStatistics()
     {
-        // Limited: a cap at the GPU's rate (J = B) with a positive margin.
+        // Limited: a cap at the GPU's rate (J = B) with a positive margin; 4 ms of every cycle is ReLimiter's hold,
+        // which the cap's slack pays (J - S^ = 4 ms refills the credit per record).
         Rig held(true);
         Rig::Planned frame;
         held.Plan(&frame, 20000.0); // J is known from the first grant
-        held.Records(Record(20000.0, 0.0, 3000.0, 0.0, 0.0, 4000.0), 16);
+        held.Records(Record(20000.0, 0.0, 3000.0, 4000.0), 16);
         const UnifiedHoldGrant held_grant = held.Plan(&frame, 20000.0);
         CHECK((held.last_status.flags & kUpQueueLaw) != 0 && (held.last_status.flags & kUpQueueLawLimited) != 0);
         CHECK(Near(held.last_status.gpu_interval_us, 20000.0) && held.last_status.ql_p_us == 0.0);
@@ -1418,17 +1547,20 @@ namespace
     void TestPacedEntriesGateTheStarvationInTheBase()
     {
         // The record of frame k takes `paced` from frame k's own plan entry (OnPlan), and the flag
-        // 0x1000000 says the record that entered since the last plan was paced.
+        // 0x1000000 says the record that entered since the last plan was paced. Every other frame starves
+        // 1 ms (half the window at most: a transient, all of it kept), the others are fed; the F-term is
+        // 15 ms on every frame, and the paced frames add their kept starvation's 16-frame mean, 0.5 ms.
         for (const bool paced : {true, false}) {
             Rig rig(true, 0.0, 2, 4000.0, 4);
             Rig::Planned frame;
             for (uint64_t k = 1; k <= 24; ++k) {
                 rig.Plan(&frame, 5000.0, paced);
-                rig.pacer.OnQueueRecord(Keyed(Record(16000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, false), k));
+                rig.pacer.OnQueueRecord(Keyed(k % 2 == 0 ? Record(16000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, false)
+                                                         : Record(15000.0, 0.0, 500.0), k));
             }
             rig.Plan(&frame, 5000.0, paced);
             CHECK(rig.last_status.ql_valid);
-            CHECK(Near(rig.last_status.ql_base_us, paced ? 16000.0 : 15000.0));
+            CHECK(Near(rig.last_status.ql_base_us, paced ? 15500.0 : 15000.0));
             CHECK(((rig.last_status.flags & kUpQueueLawPaced) != 0) == paced);
             rig.Plan(&frame, 5000.0, paced); // no record since the last plan
             CHECK((rig.last_status.flags & kUpQueueLawPaced) == 0);
@@ -1494,41 +1626,44 @@ namespace
 
     void TestWholeIntervalBound()
     {
-        // A case with the frames GPU-paced so the gating does not help: cap 20 ms (J), the
-        // need rises 16 -> 19.2 ms and the starvation falls 4 -> 0.8 ms while the cycles stay 20 ms.
-        // B = mean4(need) + mean16(starve) = 19.2 + 3.2 = 22.4 ms is above the attainable cap; the
-        // bound C + max(0, C - J) = 20 ms cuts I_gpu to it and sets the flag. P stays B's correction.
+        // Two windows of different lengths, frames GPU-paced, cap 20 ms (J): 9 fed frames of 16 ms, then 3 that
+        // starved 4 ms (a minority: their starvation is kept), then the need rises to 20 ms on 4 fed frames.
+        // B = mean4(F-term) + mean16(kept paced starvation) = 20 + 0.75 = 20.75 ms is above the mean cycle,
+        // 17.75 ms; the bound C + max(0, C - J) = 17.75 ms cuts I_gpu to it and sets the flag. P stays B's
+        // correction: q = max(-4 ms, 0.5 - 4 ms) = -3.5 ms.
+        const auto fill = [](const auto& push) {
+            for (uint64_t k = 1; k <= 16; ++k)
+                push(k, k <= 9 ? Record(16000.0, 0.0, 500.0)
+                       : k <= 12 ? Record(20000.0, 4000.0, 0.0, 0.0, 0.0, 0.0, false)
+                                 : Record(20000.0, 0.0, 500.0));
+        };
         UnifiedQueueWindow window;
-        for (int i = 0; i < 12; ++i)
-            window.Push(PacedSample(Record(20000.0, 4000.0, 0.0, 0.0, 0.0, 0.0, false), true));
-        for (int i = 0; i < 4; ++i)
-            window.Push(PacedSample(Record(20000.0, 800.0, 0.0, 0.0, 0.0, 0.0, false), true));
+        fill([&](uint64_t, const PacingGpuQueueRecord& record) { window.Push(PacedSample(record, true)); });
         const UnifiedQueueResult bounded = window.Compute(20000.0, Params(2, 4000.0, 0.0, 4));
-        CHECK(Near(bounded.base_us, 22400.0) && Near(bounded.p_us, -125.0));
-        CHECK(bounded.bound_active && Near(bounded.gpu_interval_us, 20000.0) && bounded.gpu_interval_us <= 20000.0);
+        CHECK(Near(bounded.base_us, 20750.0) && Near(bounded.p_us, -3500.0 / 32.0));
+        CHECK(bounded.bound_active && Near(bounded.gpu_interval_us, 17750.0));
         // F = 16: the first build's value (B = the mean cycle, B + P), no bound, no flag.
         const UnifiedQueueResult first = window.Compute(20000.0, Params(2, 4000.0, 0.0, 16));
-        CHECK(!first.bound_active && Near(first.base_us, 20000.0) && Near(first.gpu_interval_us, 19875.0));
+        CHECK(!first.bound_active && Near(first.base_us, 17750.0) && Near(first.gpu_interval_us, 17750.0 - 3500.0 / 32.0));
         // A GPU-bound stream (cycles above J): the bound C + (C - J) is far above B + P: not active.
         UnifiedQueueWindow gpu_bound;
         for (int i = 0; i < 16; ++i)
             gpu_bound.Push(PacedSample(Record(20000.0, 0.0, 500.0), true));
         const UnifiedQueueResult unbounded = gpu_bound.Compute(10000.0, Params(2, 4000.0, 0.0, 4));
         CHECK(!unbounded.bound_active && Near(unbounded.gpu_interval_us, 20000.0 + 500.0 / 32.0));
-        // Through the pacer: the same frames, planned GPU-paced; the status carries I_gpu = 20 ms and
+        // Through the pacer: the same frames, planned GPU-paced; the status carries I_gpu = 17.75 ms and
         // the flag 0x2000000 (F = 4), and neither with F = 16.
         for (const int need_frames : {4, 16}) {
             Rig rig(true, 0.0, 2, 4000.0, need_frames);
             Rig::Planned frame;
-            for (uint64_t k = 1; k <= 16; ++k) {
+            fill([&](uint64_t k, const PacingGpuQueueRecord& record) {
                 rig.Plan(&frame, 20000.0, true);
-                rig.pacer.OnQueueRecord(
-                    Keyed(Record(20000.0, k <= 12 ? 4000.0 : 800.0, 0.0, 0.0, 0.0, 0.0, false), k));
-            }
+                rig.pacer.OnQueueRecord(Keyed(record, k));
+            });
             rig.Plan(&frame, 20000.0, true);
             CHECK((rig.last_status.flags & kUpQueueLaw) != 0);
             CHECK(((rig.last_status.flags & kUpQueueLawBound) != 0) == (need_frames == 4));
-            CHECK(Near(rig.last_status.gpu_interval_us, need_frames == 4 ? 20000.0 : 19875.0));
+            CHECK(Near(rig.last_status.gpu_interval_us, need_frames == 4 ? 17750.0 : 17750.0 - 3500.0 / 32.0));
         }
     }
 
@@ -1552,10 +1687,12 @@ namespace
         // The record the probe pushes for a non-FG Present: its Present identity and that key. It
         // resolves to its frame's plan entry and counts the GPU-paced starvation; a record without a
         // key (the marker was on another thread) or with the key of a frame never planned stays unpaced.
+        // Every even frame starves 1 ms and every odd one is fed (the starved ones a minority: kept whole).
         const auto probe_record = [&](uint64_t frame_id, bool keyed) {
             attribution.key = PacingFrameKey{PacingIdentityDomain::NvApiFrame, 1, frame_id};
             PacingTelemetry_SetPresentAttribution(attribution);
-            PacingGpuQueueRecord record = Record(16000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, false);
+            PacingGpuQueueRecord record = frame_id % 2 == 0 ? Record(16000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, false)
+                                                            : Record(15000.0, 0.0, 500.0);
             record.swapchain_generation = 9;
             record.present_sequence = 1000 + frame_id;
             if (keyed)
@@ -1570,7 +1707,7 @@ namespace
         for (uint64_t k = 9; k <= 24; ++k)
             keyed.pacer.OnQueueRecord(probe_record(k, true));
         keyed.Plan(&frame, 5000.0, true);
-        CHECK(Near(keyed.last_status.ql_base_us, 16000.0)); // need 15000 + paced starve 1000
+        CHECK(Near(keyed.last_status.ql_base_us, 15500.0)); // need 15000 + paced starve 8 x 1000 / 16
         CHECK((keyed.last_status.flags & kUpQueueLawPaced) != 0);
         Rig mixed(true, 0.0, 2, 4000.0, 4);
         for (uint64_t k = 1; k <= 24; ++k)
@@ -1651,16 +1788,20 @@ namespace
         // F = 16 keeps the first build's base: the mean cycle, holds included.
         CHECK(Near(filled.Compute(20000.0, Params(2, 4000.0, 0.0, 16)).base_us, 20000.0));
 
-        // 5.2 ms of hold on every frame with the same 15.4 ms service (the cycle is 20.6 ms): the
-        // slack is 4.6 ms, 0.6 ms of every hold is above it and stays in the base: B = S^ + 0.6 ms.
+        // 5.2 ms of hold on every frame with the same 15.4 ms service (the cycle is 20.6 ms): the slack is
+        // 4.6 ms, and the hold every frame shares is the window's common level, not a transient: it leaves the
+        // base whole (B = S^), where it once kept the 0.6 ms above the slack. The cap, in the GPU's reach,
+        // keeps binding either way.
         UnifiedQueueWindow over;
         for (int i = 0; i < 40; ++i)
             over.Push(PacedSample(Record(20600.0, 0.0, 500.0, 5200.0), false));
         const UnifiedQueueResult beyond = over.Compute(20000.0, Params(2, 4000.0, 0.0, 4));
-        CHECK(Near(beyond.service_us, 15400.0) && Near(beyond.base_us, 15400.0 + 600.0));
+        CHECK(Near(beyond.service_us, 15400.0) && Near(beyond.base_us, 15400.0));
 
-        // No cap (the VRR interval is far below the service): no slack, the hold blocking stays and
-        // B = mean(cycle - starve) exactly as before; GPU-paced starvation adds the 16-frame mean.
+        // No cap (the VRR interval is far below the service): no slack. Every frame is blocked 0.5 ms and every
+        // other one also starves 0.3 ms. The 0.5 ms every frame loses is the common level and leaves the base;
+        // the odd frames' 0.3 ms beyond it stays, split in proportion between their starvation (112.5 us, which
+        // a GPU-paced frame adds back at its 16-frame mean) and their block (187.5 us).
         UnifiedQueueWindow uncapped;
         UnifiedQueueWindow uncapped_paced;
         for (int i = 0; i < 40; ++i) {
@@ -1668,8 +1809,8 @@ namespace
             uncapped.Push(PacedSample(record, false));
             uncapped_paced.Push(PacedSample(record, true));
         }
-        CHECK(Near(uncapped.Compute(6944.0, Params(2, 4000.0, 0.0, 4)).base_us, 16500.0 - 150.0));
-        CHECK(Near(uncapped_paced.Compute(6944.0, Params(2, 4000.0, 0.0, 4)).base_us, 16500.0));
+        CHECK(Near(uncapped.Compute(6944.0, Params(2, 4000.0, 0.0, 4)).base_us, (16000.0 + 15887.5) / 2.0));
+        CHECK(Near(uncapped_paced.Compute(6944.0, Params(2, 4000.0, 0.0, 4)).base_us, (16000.0 + 15887.5) / 2.0 + 56.25));
     }
 
     PacingGpuQueueRecord RoleRecord(const PacingGpuQueueRecord& record, uint8_t role)
@@ -1698,22 +1839,28 @@ namespace
             return window.Compute(j, params);
         };
 
-        // 16 records of 11.4 ms with 3.0 ms of order block: the base is the need, 8.4 ms, not the cycle.
-        const UnifiedQueueResult render = compute(kUnifiedQueueRoleRenderQueue, 0, 0.0, 0.0, 16);
-        CHECK(render.computable);
-        CHECK(Near(render.base_us, 8400.0) && Near(render.need_us, 8400.0) && Near(render.service_us, 8400.0));
-        CHECK(render.service_us > j); // the cap leaves no slack: the removal is the role's, not the slack's
-        CHECK(Near(render.gpu_interval_us, 8400.0 + 300.0 / 32.0)); // P is the margin term, as before
+        // 16 records of 11.4 ms with 3.0 ms of order block: the base is the need, 8.4 ms, not the cycle. The
+        // render queue found by dependency under frame generation (role 4) is the same.
+        for (const uint8_t role : {kUnifiedQueueRoleRenderQueue, kUnifiedQueueRoleFgRenderQueue}) {
+            const UnifiedQueueResult render = compute(role, 0, 0.0, 0.0, 16);
+            CHECK(render.computable);
+            CHECK(Near(render.base_us, 8400.0) && Near(render.need_us, 8400.0) && Near(render.service_us, 8400.0));
+            CHECK(render.service_us > j); // the cap leaves no slack: the removal is the role's, not the slack's
+            CHECK(Near(render.gpu_interval_us, 8400.0 + 300.0 / 32.0)); // P is the margin term, as before
+        }
         // The same records of a queue with no role, the presenting queue and the frame generation's input: the
-        // hold stays in the base, 11.4 ms.
+        // block every frame shares is the window's common level, ReLimiter's own excess at a cap the GPU cannot
+        // reach, and leaves the base as well (it held it at 11.4 ms before).
         for (const uint8_t role : {uint8_t{0}, uint8_t{1}, uint8_t{2}}) {
             const UnifiedQueueResult held = compute(role, 0, 0.0, 0.0, 16);
-            CHECK(Near(held.base_us, 11400.0) && Near(held.need_us, 8400.0) && Near(held.service_us, 8400.0));
+            CHECK(Near(held.base_us, 8400.0) && Near(held.need_us, 8400.0) && Near(held.service_us, 8400.0));
         }
 
         // 12 records of 8.4 ms, then 4 of 11.4 ms / 3.0 ms: the render queue's base stays at 8.4 ms (the block is
-        // the order's), the presenting queue's follows the cycle to 11.4 ms.
+        // the order's); the presenting queue's 4 blocked frames are a minority of the window, a transient that
+        // stays, so its base follows the cycle to 11.4 ms.
         CHECK(Near(compute(kUnifiedQueueRoleRenderQueue, 12, 8400.0, 0.0, 4).base_us, 8400.0));
+        CHECK(Near(compute(kUnifiedQueueRoleFgRenderQueue, 12, 8400.0, 0.0, 4).base_us, 8400.0));
         CHECK(Near(compute(1, 12, 8400.0, 0.0, 4).base_us, 11400.0));
 
         // The sample: the block is out of the cycle and the sample carries none; need, service and the starve
@@ -1762,8 +1909,9 @@ namespace
     // the interval has a neutral band [Delta, Delta + lag], the cycle the law takes is min(cycle, Delta + lag), and
     // from a latched interval above the band the base is at the top of it after the first full window and stays
     // there. The test pins that bound above the band (the block has no gain there), not a convergence to Delta. The
-    // presenting queue's sample keeps its block (the cap's own hold): a base that holds the block repeats the cycle it
-    // was made from and stays where it started, which is what the render queue's did before the block left its sample.
+    // presenting queue's and the frame generation input's samples keep their block (the hold), but a block every
+    // frame shares is the window's common level and leaves the base: from the same latch they settle at the top of
+    // the band too, where a base that held the block repeated the cycle it was made from and stayed at 11.4 ms.
     void TestRenderQueueBaseHasNoGainOnItsOwnOrderBlock()
     {
         const double j = 7690.0;
@@ -1799,18 +1947,24 @@ namespace
         };
 
         // From the capture's latched 11.4 ms: the first full window puts the base at the top of the band, 7.97 ms,
-        // it stays exactly there and never leaves the band.
-        const Settled latched = settle(kUnifiedQueueRoleRenderQueue, 11400.0);
-        CHECK(Near(latched.first, delta + lag, 1e-9) && Near(latched.last, delta + lag, 1e-9));
-        CHECK(latched.low >= delta - 1e-9 && latched.high <= delta + lag + 1e-9);
+        // it stays exactly there and never leaves the band (role 4, the same under frame generation).
+        for (const uint8_t role : {kUnifiedQueueRoleRenderQueue, kUnifiedQueueRoleFgRenderQueue}) {
+            const Settled latched = settle(role, 11400.0);
+            CHECK(Near(latched.first, delta + lag, 1e-9) && Near(latched.last, delta + lag, 1e-9));
+            CHECK(latched.low >= delta - 1e-9 && latched.high <= delta + lag + 1e-9);
+        }
         // Started inside the band no block is seen: the interval has gain 1 on itself and stays where it is (the
         // neutral band).
         const Settled inside = settle(kUnifiedQueueRoleRenderQueue, 7800.0);
         CHECK(Near(inside.first, 7800.0, 1e-9) && Near(inside.last, 7800.0, 1e-9));
         CHECK(inside.low >= delta - 1e-9 && inside.high <= delta + lag + 1e-9);
-        // The presenting queue from the same latch: its base holds the block and stays at 11.4 ms.
-        const Settled presenting = settle(1, 11400.0);
-        CHECK(Near(presenting.first, 11400.0, 1e-9) && Near(presenting.last, 11400.0, 1e-9));
+        // The presenting queue and the frame generation input from the same latch: the block is the common level
+        // of their window from the first record on, so they leave the latch with the first full window as well.
+        for (const uint8_t role : {uint8_t{1}, uint8_t{2}}) {
+            const Settled held = settle(role, 11400.0);
+            CHECK(Near(held.first, delta + lag, 1e-9) && Near(held.last, delta + lag, 1e-9));
+            CHECK(held.low >= delta - 1e-9 && held.high <= delta + lag + 1e-9);
+        }
     }
 
     void TestRole3CreditFollowsTheReportRule()
@@ -1893,6 +2047,47 @@ namespace
         const UnifiedQueueLawSummary sw = rig.pacer.QueueLawSummary();
         CHECK(sw.grants_law == 1 && sw.holds_debited_report == 0 && sw.holds_debited_record == 0 &&
             sw.holds_settled_orphan == 1);
+    }
+
+    // The carry votes (UnifiedCarryVotes): a frame is judged from the bounds of its tail (readiness minus the watched
+    // queue's last completion) and of its cycle, and the law is refused only on fresh evidence.
+    void TestCarryVotesJudgeAndRefuse()
+    {
+        using V = UnifiedCarryVotes::Vote;
+        // Resident Evil Requiem (N.180): role 4 finished 18.1 to 18.4 ms before the frame was ready, cycle 20.4 ms; the
+        // root (role 2) within 30 us of it.
+        CHECK(UnifiedCarryVotes::Judge(18100.0, 18400.0, 20300.0, 20500.0) == V::NotCarried);
+        CHECK(UnifiedCarryVotes::Judge(-30.0, 30.0, 20300.0, 20500.0) == V::Carried);
+        // Carried only when the largest tail is under half the smallest cycle, not carried only when the smallest tail
+        // reaches half the largest cycle; a tail that straddles both is undecided.
+        CHECK(UnifiedCarryVotes::Judge(9000.0, 9999.0, 20000.0, 20400.0) == V::Carried);
+        CHECK(UnifiedCarryVotes::Judge(9000.0, 10000.0, 20000.0, 20400.0) == V::Undecided);
+        CHECK(UnifiedCarryVotes::Judge(10200.0, 10300.0, 20000.0, 20400.0) == V::NotCarried);
+        CHECK(UnifiedCarryVotes::Judge(10199.0, 10300.0, 20000.0, 20400.0) == V::Undecided);
+        // Bounds that say nothing are undecided.
+        CHECK(UnifiedCarryVotes::Judge(1.0, 2.0, 0.0, 10.0) == V::Undecided);       // no cycle
+        CHECK(UnifiedCarryVotes::Judge(2.0, 1.0, 100.0, 200.0) == V::Undecided);    // tail lo > hi
+        CHECK(UnifiedCarryVotes::Judge(1.0, 2.0, 200.0, 100.0) == V::Undecided);    // cycle lo > hi
+        CHECK(UnifiedCarryVotes::Judge(NAN, 1.0, 100.0, 200.0) == V::Undecided);
+
+        UnifiedCarryVotes votes;
+        for (uint64_t index = 1; index <= 7; ++index)
+            votes.Note(V::NotCarried, index);
+        CHECK(votes.Decided() == 7 && !votes.Refuses(8, 32)); // fewer than 8 decided: no evidence, the law decides
+        votes.Note(V::Undecided, 8);
+        CHECK(votes.Decided() == 7 && !votes.Refuses(9, 32)); // an undecided frame abstains
+        votes.Note(V::NotCarried, 9);
+        CHECK(votes.Refuses(10, 32));
+        CHECK(votes.Refuses(9 + 32, 32) && !votes.Refuses(9 + 33, 32)); // stale 32 planned frames after the newest vote
+        // 8 carried join: 8 of the 16 not carried, a tie, refuses (a non-carrying queue costs latency); the next carried
+        // vote pushes the oldest not-carried one out.
+        for (uint64_t index = 10; index < 18; ++index)
+            votes.Note(V::Carried, index);
+        CHECK(votes.Decided() == 16 && votes.NotCarried() == 8 && votes.Refuses(18, 32));
+        votes.Note(V::Carried, 18);
+        CHECK(votes.Decided() == 16 && votes.NotCarried() == 7 && !votes.Refuses(19, 32));
+        votes.Reset();
+        CHECK(votes.Decided() == 0 && votes.NotCarried() == 0 && !votes.Refuses(1, 32));
     }
 
     void TestRetiredSessionAndRole3HoldsAreSettledOnce()
@@ -2341,11 +2536,12 @@ int main()
     TestLongerCycleEngagesTheGuard();
     TestSigmaAllowance();
     TestAllowanceUsesStarvationFreeService();
-    TestHoldStepRaisesTheIntervalOnceAndStops();
+    TestHoldStepAtSaturationIsPaidOnlyByTheShare();
     TestUnpacedStarvationIsNotInTheBase();
     TestPacedStarvationCountsOnlyUpToTheStartWait();
     TestCapRemovedReachesTheNeedWithinFFrames();
     TestPacedNeedFallIsFollowedWithinFFrames();
+    TestIntervalExcessLeavesWhicheverFaceItTakes();
     TestNeedMeanIsUnbiasedWhenGpuPaced();
     TestNeedFramesSixteenIsTheMeanCycle();
     TestHeldCapRefillUsesTheService();
@@ -2383,6 +2579,7 @@ int main()
     TestLawTurnedOffSettlesAnOutstandingLawGrant();
     TestUnmeasuredLawGrantLeavingTheRingIsCounted();
     TestRole3CreditFollowsTheReportRule();
+    TestCarryVotesJudgeAndRefuse();
     TestFeedRing();
     TestFeedProducerConsumer();
     std::printf("=== %d failures ===\n", s_failures);

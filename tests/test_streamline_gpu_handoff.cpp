@@ -1,6 +1,7 @@
 // Production qualifier, queue hooks, proxy wrapper and bootstrap. Fake COM and
 // hook installation boundaries; not evidence of driver/MinHook/display pacing.
 #include "../src/streamline_gpu_handoff.cpp"
+#include "../src/fg_state_policy.h"
 static USHORT WINAPI TestStack(ULONG, ULONG, PVOID*, PULONG);
 static DWORD WINAPI TestModuleName(HMODULE, LPWSTR, DWORD);
 #undef CaptureStackBackTrace
@@ -39,6 +40,12 @@ static thread_local unsigned stack_reads = 0;
 static std::vector<char> order;
 std::atomic<int> g_fg_mode{1}, g_fg_multiplier{1};
 std::atomic<bool> g_fg_presenting{true};
+// The resolver's published state (streamline_hooks.cpp), modelled on the globals above: the shared route predicate.
+const char* Streamline_RouteRejection() noexcept {
+    return FrameGeneration_RouteRejection(false, true, static_cast<uint32_t>(g_fg_mode.load()), g_fg_presenting.load(),
+        g_fg_multiplier.load());
+}
+bool Streamline_StatementAuthority() noexcept { return false; }
 static int64_t Frequency() { LARGE_INTEGER value{}; QueryPerformanceFrequency(&value); return value.QuadPart; }
 bool RuntimeLifecycle_IsStopping() noexcept { return stopping; }
 RuntimeCallbackGuard::RuntimeCallbackGuard() noexcept { stopping_ = stopping; }
@@ -592,7 +599,7 @@ static void TestInbandFrameClaim() {
     { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),5,0); CHECK(!scope.pending && LastFailure("invalid_sync_interval")); }
     { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,DXGI_PRESENT_TEST); CHECK(!scope.pending && LastFailure("special_present_flags")); }
     { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,DXGI_PRESENT_DO_NOT_WAIT); CHECK(!scope.pending && LastFailure("special_present_flags")); }
-    g_fg_mode = 2; { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0); CHECK(!scope.pending && !scope.input.transaction); }
+    g_fg_mode = 3; { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0); CHECK(!scope.pending && !scope.input.transaction); }
     g_fg_mode = 1;
     CHECK(Seen() == seen + 5);
     { StreamlineInputScope outer(reinterpret_cast<uint64_t>(&proxy),0,0);
@@ -747,6 +754,9 @@ int main() {
         g_fg_multiplier = multiplier; const auto previous_begins = begins;
         Warm(); CHECK(begins == previous_begins); Cycle(); CHECK(begins == previous_begins + 1); Reset();
     }
+    // Auto (DLSS-G mode 2) qualifies like On: the route keys its inputs to the multiplier Streamline generates at.
+    { g_fg_mode = 2; const auto previous_begins = begins;
+      Warm(); CHECK(begins == previous_begins); Cycle(); CHECK(begins == previous_begins + 1); Reset(); }
     // Frame generation that presents from its own thread and a known other queue
     // (no hardware flip metering) marks the route unsupported for its identity.
     // An unknown queue (0), no Present, or a Present of an earlier cycle is no
@@ -979,9 +989,9 @@ int main() {
             CHECK(!scope.input.transaction && !h::authorized); scope.Complete(S_OK); }
         CHECK(begins == previous_begins); Reset();
     }
-    // Module/telemetry alone, missing/stale/foreign marker, Auto, nested/special
+    // Module/telemetry alone, missing/stale/foreign marker, dynamic mode, nested/special
     // Present, and wrong source site never authorize an insertion.
-    g_fg_mode = 2; Marker(); { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0); CHECK(!scope.input.transaction); }
+    g_fg_mode = 3; Marker(); { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,0); CHECK(!scope.input.transaction); }
     g_fg_mode = 1;
     Marker(); { StreamlineInputScope scope(reinterpret_cast<uint64_t>(&proxy),0,DXGI_PRESENT_TEST); CHECK(!scope.input.transaction); }
     Marker(); { StreamlineInputScope outer(reinterpret_cast<uint64_t>(&proxy),0,0); StreamlineInputScope inner(reinterpret_cast<uint64_t>(&proxy),0,0); CHECK(outer.invalid && !inner.input.transaction); }

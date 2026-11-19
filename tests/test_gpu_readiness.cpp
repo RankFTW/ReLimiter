@@ -696,8 +696,9 @@ NativeGateContext NativeGate_GetContext(int64_t) noexcept {
     NativeGateContext context;
     context.fg_diagnostic_flags = 1u | (g_fg_mode.load()==1?2u:0u) |
         (g_fg_active.load()?4u:0u) | (g_fg_presenting.load()?8u:0u);
+    // As production: observation follows the FG input route's predicate (2x frame generation here).
     context.observe_frame_generation=s_fg_observation &&
-        FrameGeneration_CanObserveStatic(context.fg_diagnostic_flags);
+        FrameGeneration_RouteRejection(false, true, static_cast<uint32_t>(g_fg_mode.load()), g_fg_presenting.load(), 1) == nullptr;
     return context;
 }
 uint64_t NativeGate_PredictionEpoch() noexcept { return 1; }
@@ -709,7 +710,6 @@ void GpuPresent_ObservePresentQueue(uint64_t,uint64_t) noexcept {}
 void GpuQueueProbe_OnPresentBoundary(void*,uint64_t,uint64_t,const PacingFrameKey&) noexcept {}
 void GpuQueueProbe_DependencyScopeBeginActive(void*) noexcept {}
 void GpuQueueProbe_DependencyScopeEndActive() noexcept {}
-void GpuQueueProbe_OnFgPresentSiteActive(void*, uint64_t, uint64_t) noexcept {}
 std::atomic<bool> g_fg_active{false}, g_fg_presenting{false};
 std::atomic<int> g_fg_mode{0};
 void Log_Write(LogLevel,const char*,...) {}
@@ -735,7 +735,7 @@ int main() {
     CHECK(!Eligible());
     s_fg_observation=true;CHECK(Eligible());
     g_fg_presenting=false;CHECK(!Eligible());g_fg_presenting=true;
-    g_fg_mode=2;CHECK(!Eligible());g_fg_mode=1;
+    g_fg_mode=3;CHECK(!Eligible());g_fg_mode=2;CHECK(Eligible());g_fg_mode=0;CHECK(!Eligible());g_fg_mode=1;
     FrameTimeline_SetEnabled(false);CHECK(!Eligible());
     FrameTimeline_SetEnabled(true);GpuReadiness_SetEnabled(false);CHECK(!Eligible());
     s_fg_observation=false;g_fg_mode=0;g_fg_active=false;g_fg_presenting=false;

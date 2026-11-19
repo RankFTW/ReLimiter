@@ -2531,6 +2531,8 @@ static NvAPI_Status __cdecl Hook_SetReflexSync(IUnknown* device, NV_SET_REFLEX_S
     if (!read) return result;
     const uint64_t call = s_reflex_sync_calls.fetch_add(1, std::memory_order_relaxed) + 1;
     RecordReflexSyncCall(seen);
+    // Streamline's in-band statement of frame generation's multiplier (fg_state_policy.h): one lock-free fold.
+    Streamline_RecordReflexSyncStatement(seen.fgMultiplier, seen.bDisable != 0);
     const uint32_t flags = (seen.bEnable ? 1u : 0u) | (seen.bDisable ? 2u : 0u) | (seen.flagsRsvd << 2);
     uint64_t signature = kObserveHashSeed;
     signature = ObserveHash(signature, &result, sizeof(result));

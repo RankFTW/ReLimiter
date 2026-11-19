@@ -1,5 +1,4 @@
 #include "native_present_gate.h"
-#include "fg_state_policy.h"
 #include "display_state.h"
 #include "enforcement_dispatcher.h"
 #include "frame_plan.h"
@@ -36,16 +35,17 @@ NativeGateContext NativeGate_GetContext(int64_t now_qpc) noexcept
         !g_fg_active.load(std::memory_order_relaxed) &&
         !g_fg_presenting.load(std::memory_order_relaxed) &&
         g_fg_mode.load(std::memory_order_relaxed) == 0;
-    // Static DLSSG/MFG diagnostics at the game's existing Present boundary.
-    // Aggregate Streamline state is not generated-frame identity or permission
-    // to move the gate. Dynamic MFG retains its existing passthrough policy.
+    // Frame generation diagnostics at the game's existing Present boundary (bits: known mode, mode On, active,
+    // presenting, the in-band statement decided). Observation follows the FG input route's own predicate as the
+    // resolver published it (FrameGeneration_RouteRejection): Auto and an unobserved mode are observable; Dynamic MFG
+    // keeps its passthrough. Aggregate Streamline state is not generated-frame identity or permission to move the gate.
     if(NativeGate_GetMode() == NativeGateMode::Shadow) {
         context.fg_diagnostic_flags = (Streamline_HasModeData()?1u:0u) |
             (g_fg_mode.load(std::memory_order_relaxed)==1?2u:0u) |
             (g_fg_active.load(std::memory_order_relaxed)?4u:0u) |
-            (g_fg_presenting.load(std::memory_order_relaxed)?8u:0u);
-        context.observe_frame_generation = context.supported &&
-            FrameGeneration_CanObserveStatic(context.fg_diagnostic_flags);
+            (g_fg_presenting.load(std::memory_order_relaxed)?8u:0u) |
+            (Streamline_StatementAuthority()?16u:0u);
+        context.observe_frame_generation = context.supported && Streamline_RouteRejection() == nullptr;
     }
 #endif
     return context;

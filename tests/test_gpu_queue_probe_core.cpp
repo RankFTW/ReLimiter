@@ -500,7 +500,8 @@ namespace
     }
 
     // The Waits in front of a frame's first submission are the boundary Waits: first_gap holds the
-    // whole gap, empty gets nothing from them, wait_idle and boundary_idle split it.
+    // whole gap, empty gets nothing from them, wait_idle and boundary_idle split it: boundary idle is
+    // every stretch with neither work nor a pending Wait (before the Wait and after its release).
     void TestBoundaryWaitsAndFirstSubmission()
     {
         const Rec released = Frame2(150, [](H& h) {
@@ -513,7 +514,7 @@ namespace
         CHECK(Near(released.first_gap_us, 850.0));
         CHECK(Near(released.empty_us, 0.0));
         CHECK(Near(released.wait_idle_us, 400.0));     // pending 500-900
-        CHECK(Near(released.boundary_idle_us, 100.0)); // free 900-1000
+        CHECK(Near(released.boundary_idle_us, 450.0)); // free 150-500 and 900-1000
         CHECK(Near(released.wait_block_us, 0.0));
         CHECK(released.first_start_qpc == 1000);
 
@@ -527,16 +528,16 @@ namespace
         CHECK(Near(held.first_gap_us, 850.0));
         CHECK(Near(held.empty_us, 0.0));
         CHECK(Near(held.wait_idle_us, 500.0));     // pending 500-1000, then work is queued behind it
-        CHECK(Near(held.boundary_idle_us, 0.0));   // released after the submission arrived
+        CHECK(Near(held.boundary_idle_us, 350.0)); // free 150-500: a Wait released after the arrival ends
+                                                   // only the stretch after it (Metal Eden, N.176)
         CHECK(Near(held.wait_block_us, 500.0));
         CHECK(Near(held.min_margin_us, 500.0));
         CHECK(held.first_start_qpc == 1500);
     }
 
-    // boundary_idle starts when the previous work and every boundary Wait (the hold, the
-    // frame-generation wait, any other) have finished, and ends at the first submission's arrival:
-    // a frame-generation Wait released 200 before the arrival leaves 200, not the whole gap, which
-    // stays in first_gap.
+    // boundary_idle is every stretch before the first submission's arrival in which the queue had neither
+    // work nor a pending boundary Wait (the hold, the frame-generation wait, any other): before the first
+    // Wait, between the Waits and after the last. With wait_idle it splits first_gap, filed once.
     void TestBoundaryIdleAfterEveryBoundaryWait()
     {
         const Rec one = Frame2(150, [](H& h) {
@@ -546,7 +547,7 @@ namespace
             h.Stamp(a.done, 1100);
         });
         CHECK(one.valid == kAll);
-        CHECK(Near(one.boundary_idle_us, 200.0));
+        CHECK(Near(one.boundary_idle_us, 350.0 + 200.0)); // 150-500 and 800-1000
         CHECK(Near(one.first_gap_us, 850.0)); // the whole gap since the previous done
         CHECK(Near(one.empty_us, 0.0));       // never filed twice
 
@@ -560,12 +561,13 @@ namespace
             h.Stamp(a.done, 1100);
         });
         CHECK(two.valid == kAll);
-        CHECK(Near(two.boundary_idle_us, 200.0));
+        CHECK(Near(two.boundary_idle_us, 150.0 + 50.0 + 200.0)); // 150-300, 600-650 and 800-1000
         CHECK(Near(two.wait_idle_us, 300.0 + 150.0)); // 300-600 and 650-800
         CHECK(Near(two.first_gap_us, 850.0));
         CHECK(Near(two.empty_us, 0.0));
 
-        // A boundary Wait released after the arrival: no idle at all.
+        // A boundary Wait released after the arrival: the stretch after the Waits is gone, the empty time
+        // in front of them is not (150-300 and 600-650).
         const Rec late = Frame2(150, [](H& h) {
             const Wd hold = h.Wait(300, 305, true, 7);
             const Wd fg = h.Wait(650, 655, true, 3);
@@ -574,7 +576,9 @@ namespace
             h.Stamp(fg.release, 1200);
             h.Stamp(a.done, 1300);
         });
-        CHECK(Near(late.boundary_idle_us, 0.0));
+        CHECK(Near(late.boundary_idle_us, 200.0));
+        CHECK(Near(late.wait_idle_us, 300.0 + 350.0)); // 300-600 and 650-1000
+        CHECK(Near(late.first_gap_us, 850.0));
     }
 
     // The hold: a Hold event matched to its Wait by (fence, value), either arrival order.
@@ -632,6 +636,23 @@ namespace
         CHECK(Near(early.hold_block_us, 0.0));
         CHECK(Near(early.min_margin_us, 200.0));
         CHECK(Near(early.min_margin_free_us, 200.0));
+
+        // A submission queued while the queue was still busy in front of the hold: the previous work ends at
+        // 2600, the hold (enqueued at 500) is reached then and blocks until 5100, the submission arrived at 1500.
+        // The block is 2500; the free margin keeps the 1100 it sat queued behind the busy queue (the feeding the
+        // hold interrupted), not 0.
+        const Rec queued = Frame2(2600, [](H& h) {
+            const Wd w = h.Wait(500, 505, true, 7);
+            h.HoldEvent(7, w.wait_value, 500, 5100);
+            h.Stamp(w.release, 5100);
+            const Sub a = h.Submit(1500);
+            h.Stamp(a.done, 5300);
+        });
+        CHECK(queued.valid == kAll);
+        CHECK(Near(queued.hold_block_us, 2500.0));      // 5100 - max(1500, 2600)
+        CHECK(Near(queued.min_margin_us, 3600.0));      // 5100 - 1500
+        CHECK(Near(queued.min_margin_free_us, 1100.0)); // 3600 - the hold's 2500
+        CHECK(Near(queued.boundary_idle_us, 0.0) && Near(queued.wait_idle_us, 0.0));
     }
 
     // The hold's release event can arrive after the frame's submissions completed: the announced
@@ -1051,7 +1072,8 @@ namespace
     }
 
     // The hold blocks nothing before the queue reached it: previous completion 1800, hold enqueued
-    // 1200, next submission 1300, hold released 2000 -> 200, not 700.
+    // 1200, next submission 1300, hold released 2000 -> 200, not 700. The free margin keeps the 500 the
+    // submission sat queued while the queue was still busy in front of the hold (1300 to 1800).
     void TestHoldBoundedByWhenQueueReachedIt()
     {
         const Rec r = Frame2(1800, [](H& h) {
@@ -1064,7 +1086,7 @@ namespace
         CHECK(r.valid == kAll);
         CHECK(Near(r.hold_block_us, 200.0));
         CHECK(Near(r.min_margin_us, 700.0));       // 2000 - 1300: the Wait still blocks that long
-        CHECK(Near(r.min_margin_free_us, 0.0));
+        CHECK(Near(r.min_margin_free_us, 500.0));  // 700 less the hold's 200
     }
 
     // A boundary pushed at a dependency queue's Signal has no identity: the frame is held back until
@@ -2241,6 +2263,9 @@ namespace
         CHECK(seams[i2].valid && seams[i2].boundary_awaited);
         CHECK(Near(seams[i2].cycle_lo_us, 1870.0) && Near(seams[i2].cycle_hi_us, 1930.0)); // 2970 - 1100 .. 3000 - 1070
         CHECK(seams[i2].cycle_lo_us <= f2->cycle_us && f2->cycle_us <= seams[i2].cycle_hi_us);
+        // The record carries the bounds the pacer's carry votes judge with: the last completion's and the cycle's.
+        CHECK(f2->last_done_qpc == 3000 && f2->last_done_lo_qpc == 2970);
+        CHECK(Near(f2->cycle_lo_us, seams[i2].cycle_lo_us) && Near(f2->cycle_hi_us, seams[i2].cycle_hi_us));
         CHECK(Near(f2->stamp_late_us, 60.0)); // the two boundary completions together
         for (size_t i = 0; i < recs.size(); ++i)
             if (recs[i].present_sequence == 3) CHECK(!seams[i].boundary_awaited);

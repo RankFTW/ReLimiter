@@ -1084,9 +1084,12 @@ void GpuQueueProbeCore::ApplyResolved(Entry& e, Frame& f) noexcept
         if (known) f.gap_lo += pos(e.enq - p_hi);
         else f.ok_gap = f.ok_empty = false;
         if (calc_ok) {
+            // Every stretch the queue sat free of work and of pending Waits before the first submission: before
+            // the first boundary Wait, between the Waits and after the last (the walk's gaps and its tail). A
+            // boundary Wait still pending at e_1 ends the tail, never the empty time in front of it.
             f.boundary_valid = true;
-            f.boundary_idle_lo = tail_lo;
-            f.boundary_idle_hi = tail_hi;
+            f.boundary_idle_lo = gaps_lo + tail_lo;
+            f.boundary_idle_hi = gaps_hi + tail_hi;
         }
     } else if (calc_ok) {
         f.empty_lo += gaps_lo + tail_lo;
@@ -1108,11 +1111,14 @@ void GpuQueueProbeCore::ApplyResolved(Entry& e, Frame& f) noexcept
         stamped = true;
     }
     if (calc_ok) {
-        // The bracket of this submission's free margin: start - max(e, release) behind the hold, start - e otherwise.
-        const int64_t ref_lo = behind_certain ? std::max(e.enq, hold_release_) : e.enq;
-        const int64_t ref_hi = behind_possible ? std::max(e.enq, hold_release_) : e.enq;
-        const int64_t b_lo = pos(start_lo - ref_hi);
-        const int64_t b_hi = pos(start_hi - ref_lo);
+        // The bracket of this submission's free margin: its margin start - e less the time the hold blocked it,
+        // release - max(e, x_hold), when it is queued behind the hold; start - e otherwise. Time it sat queued
+        // while the queue was still busy in front of the hold (x_hold - e, when it arrived before the queue
+        // reached the hold) is feeding and stays in: a hold that released the queue leaves that much, not 0.
+        const int64_t share_lo = behind_certain ? pos(hold_release_ - reach_hi) : 0;
+        const int64_t share_hi = behind_possible ? pos(hold_release_ - reach_lo) : 0;
+        const int64_t b_lo = pos(start_lo - e.enq - share_hi);
+        const int64_t b_hi = pos(start_hi - e.enq - share_lo);
         if (!f.has_free) {
             f.free_lo = b_lo;
             f.free_hi = b_hi;
@@ -1181,6 +1187,7 @@ void GpuQueueProbeCore::Fill(const Frame& f, PacingGpuQueueRecord* out) const no
     if (f.last_done_valid) {
         v |= PacingGpuQueueRecord::kLastDone;
         out->last_done_qpc = f.last_done;
+        out->last_done_lo_qpc = f.last_lo;
     }
     if (f.ok_empty) {
         v |= PacingGpuQueueRecord::kEmpty;
@@ -1239,6 +1246,8 @@ void GpuQueueProbeCore::Fill(const Frame& f, PacingGpuQueueRecord* out) const no
         // The two completions that make the cycle: its interval is as wide as both of them together.
         const int64_t cycle_lo = std::max<int64_t>(0, f.last_lo - f.first_prev_done);
         const int64_t cycle_hi = std::max<int64_t>(0, f.last_done - f.first_prev_lo);
+        out->cycle_lo_us = Us(cycle_lo);
+        out->cycle_hi_us = Us(cycle_hi);
         late_us = std::max(late_us, Us(cycle_hi - cycle_lo));
         if (f.any_stamp) out->stamp_late_us = late_us;
     }

@@ -126,7 +126,7 @@ template<class Forward> HRESULT ObserveFence(ID3D12CommandQueue* queue, ID3D12Fe
             else StreamlineHandoff_RejectQueueMethods();
         }
     }
-    // gpu_queue_probe borrowing (role 3; key off: one load and a branch): the game's own outermost Signal on the
+    // gpu_queue_probe borrowing (roles 3 and 4; key off: one load and a branch): the game's own outermost Signal on the
     // adopted queue may be the marker of the submission before it. Bound here, after the Streamline handoff's
     // BeforeFence (whatever it enqueued natively first interrupted the pattern and settled it), and still BEFORE the
     // Signal is forwarded. `now` is the entry's clock read above: the marker's issue time is the time this hook was

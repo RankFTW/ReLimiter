@@ -4,16 +4,16 @@
 // gpu_queue_probe_d3d12.cpp) records the queues' Signals, Waits and command lists into the tables below and
 // asks the evaluator once per real frame.
 //
-// Rule. The candidates are the presenting queue and every queue reachable from it through per-frame fence
+// Rule. The candidates are the root (presenting queue, or FG input source queue) and every queue reachable from it through per-frame fence
 // dependencies: a Wait enqueued on a candidate queue in a frame whose (fence, value) was (or is later)
 // signalled by another queue's Signal adds that queue (up to kMaxHops hops). A fence no other queue signals
 // (a CPU or kernel signalled sync object) ends the branch. The match is on the fence identity AND the value
 // (never "the last Signal seen for the fence"). Over a window of kWindowFrames real frames the queue with the
-// most command lists wins; a tie goes to the presenting queue, and without any dependency the presenting
-// queue is adopted. A winner that is not the presenting queue is adoptable only when its boundary can be
-// joined to the frame identity: one hop away from the presenting queue, exactly one dependency (fence, value)
-// per frame, all over the same fence, the adopted queue Signalling that fence exactly once per real frame
-// (every Signal counted, whatever its value), a rising value, and the presenting queue's Wait of it carried
+// most command lists wins; a tie goes to the root, and without any dependency the root is adopted.
+// A winner other than the root is adoptable only when its boundary can be joined to the frame identity:
+// one hop from the root, exactly one dependency (fence, value) per frame, all over the same fence,
+// the adopted queue Signalling that fence exactly once per real frame (every Signal counted, whatever
+// its value), a rising value, and the root's Wait of it carried
 // the frame's identity every frame. A queue reached in only some frames of the window with at least as many
 // command lists as the best candidate is never adopted and leaves nothing adopted for the window. Ambiguous
 // or missing joins, and any record dropped or lost during the window, are counted; the window then adopts
@@ -24,7 +24,7 @@
 // are cleared on a swapchain, device or queue lifetime change. The tables hold identities only (an address and a
 // value) and never a reference to a fence: nothing here is dereferenced, so no game fence is kept alive by the rule.
 // The ONE exception in the probe is not the rule's: when the game's own Signal behind every submission of an adopted
-// render queue is borrowed as the submissions' done marker (gpu_queue_borrow.h, role 3), the probe takes ONE
+// render queue is borrowed as the submissions' done marker (gpu_queue_borrow.h, roles 3 and 4), the probe takes ONE
 // reference on that ONE fence at its first bind and releases it with the session (end, queue destruction, another
 // adoption, failure); a game that counts a fence's references sees one more for that time.
 //
@@ -305,7 +305,7 @@ struct Node {
     uint64_t value = 0;
     uint32_t hops = 0;     // 0 = the presenting queue
     uint32_t edges = 0;    // distinct (fence, value) Waits of the parent that lead to it this frame (1 = unambiguous)
-    bool keyed = false;    // hop 1: the presenting queue's Wait was enqueued inside the Present scope, whose boundary carried a frame identity
+    bool keyed = false;    // hop 1: the root's Wait belongs to the identified Present or FG input on its thread
     // Hop 1: the matched Signal's time, and (when the previous frame had an edge on the same queue and fence) the
     // number of Signals of this (queue, fence) from after the previous frame's matched Signal up to this one's, whatever
     // their values: exactly one is a Signal per frame. value_monotonic: the value rose against the previous edge.
@@ -328,12 +328,13 @@ struct PreviousEdge {
     int64_t signal_qpc = 0;
 };
 struct FrameInput {
-    uint64_t presenting_queue = 0;
-    uint64_t scope = 0;           // the Present scope of the evaluated frame
+    uint64_t presenting_queue = 0; // the root: presenting queue without FG, input source queue with it
+    uint64_t scope = 0;           // the identity-bearing scope of the evaluated frame
     int64_t window_begin = 0;     // (begin, end]: the Waits outside the Present scope and of the other queues
     int64_t window_end = 0;
     uint32_t current_epoch = 0;   // the frame counter now (Entry::epoch)
     bool keyed = false;           // the frame's boundary carried a real frame identity
+    bool fg_input = false;        // scope is the FG input's (thread, closing frame counter), not a ReShade Present scope
     PreviousEdge previous[kMaxNodes]; // the first-hop edges of the previous evaluated frame (Evaluator::FillPrevious)
     uint32_t previous_count = 0;
 };
@@ -344,7 +345,47 @@ struct FrameInput {
 void ResolveFrame(const FrameInput& input, const Entry* waits, size_t wait_count, const Entry* signals,
     size_t signal_count, FrameResult* out) noexcept;
 
-enum class Role : uint8_t { None = 0, Presenting = 1, FrameGenerationSource = 2, RenderQueueByDependency = 3 };
+// The FG input closes the Wait scope of this thread and frame counter. Both words are already recorded for
+// every Wait. A Wait on a different thread can make a queue a candidate, never give its Signal a frame identity.
+constexpr uint64_t FgInputScope(uint32_t thread, uint32_t counter) noexcept {
+    return (static_cast<uint64_t>(thread) << 32) | counter;
+}
+// The adopted fence's Wait can precede the keyed input. One pending value on the input thread, never
+// carried across an input, root, or session change. Conflicting values in one scope do not pick the last.
+struct FgWaitTag {
+    uint64_t queue = 0, scope = 0, value = 0, fence = 0;
+    uint32_t session = 0;
+    void Note(const Entry& wait, uint32_t generation) noexcept {
+        const uint64_t id = FgInputScope(wait.thread, wait.epoch);
+        if (queue == wait.queue && scope == id && session == generation) {
+            if (value != wait.value || fence != wait.fence) value = 0;
+        } else {
+            queue = wait.queue; scope = id; session = generation; value = wait.value; fence = wait.fence;
+        }
+    }
+    bool Matches(uint64_t root, uint64_t id) const noexcept { return value != 0 && queue == root && scope == id; }
+};
+// Both FG paths (the gate's source Wait and the marker's source Signal) name one real input inside the same proxy
+// Present scope, so on one thread. One instance per thread (thread_local in the glue) compares that thread's last
+// admitted input exactly; an input from another thread is never taken for a repeat.
+struct FgInputRepeat {
+    uint64_t frame = 0;
+    uint32_t producer = 0;
+    bool valid = false;
+    bool Repeat(uint64_t frame_id, uint32_t producer_epoch) noexcept {
+        if (!frame_id) return false;
+        if (valid && frame == frame_id && producer == producer_epoch) return true;
+        frame = frame_id;
+        producer = producer_epoch;
+        valid = true;
+        return false;
+    }
+};
+enum class Role : uint8_t { None = 0, Presenting = 1, FrameGenerationSource = 2, RenderQueueByDependency = 3,
+    FgRenderQueueByDependency = 4 };
+constexpr bool IsRenderQueueByDependency(Role role) noexcept {
+    return role == Role::RenderQueueByDependency || role == Role::FgRenderQueueByDependency;
+}
 enum class Reason : uint8_t {
     PresentingNoDependency, PresentingMostWork, DependencyQualified, NotQualifiedHops, NotQualifiedAmbiguous,
     NotQualifiedMissingJoin, NotQualifiedFence, NotQualifiedSignals, NotQualifiedValues, NotQualifiedLoss,
@@ -366,7 +407,7 @@ struct Decision {
     Role role = Role::None;
     Reason reason = Reason::PresentingNoDependency;
     uint64_t queue = 0;      // the winner
-    uint64_t fence = 0;      // Role 3: the dependency fence the boundary is the Signal of
+    uint64_t fence = 0;      // Roles 3 and 4: the dependency fence the boundary is the Signal of
     uint64_t epoch = 0;      // the tables' lifetime epoch the window was computed for (publish only while it is current)
     uint32_t hops = 0;
     uint32_t frames = 0;     // frames of the window
@@ -379,12 +420,12 @@ struct Decision {
     uint32_t candidate_count = 0;
 };
 
-// What a completed window does to a running adoption. A window that does not qualify carries no evidence and changes
-// nothing; only a QUALIFIED window with a different result (another queue, another role or fence) changes the adoption.
+// A loss window carries no evidence and keeps a running adoption. The presenting rule also keeps a running adoption
+// on a failed join; an FG winner known not to join leaves no queue watched.
 enum class AdoptionAction : uint8_t {
     None,            // nothing adopted (an unqualified window adopts nothing), or the window confirms the adoption
     KeepUnqualified, // adopted, the window did not qualify: the adoption and its feed continue untouched
-    Change           // adopted, the window qualified with another result: the session is stopped (adopted again)
+    Change           // a different qualified result, or a definite unjoinable FG winner: stop the session
 };
 AdoptionAction ApplyDecision(const Decision& decision, bool adopted, uint64_t adopted_queue, Role adopted_role,
     uint64_t adopted_fence) noexcept;
@@ -427,19 +468,17 @@ struct AdoptionSnapshot {
     Decision decision;   // role, fence, hops and the candidates' report as of the evaluation
 };
 // Fills `out` (always fully assigned) from the evaluator's decision and the queue Tables::PublishedQueue() returned
-// (0 = none or no longer current). The snapshot is valid only for an adoptable Presenting or RenderQueueByDependency
-// decision whose queue is the published one.
-bool MakeAdoptionSnapshot(const Decision& decision, uint64_t published_queue, AdoptionSnapshot* out) noexcept;
+// (0 = none or no longer current). Only an adoptable winner of the requested boundary kind may be retained.
+bool MakeAdoptionSnapshot(const Decision& decision, uint64_t published_queue, AdoptionSnapshot* out,
+    bool fg_input = false) noexcept;
 
-// The window state: one frame at a time, a decision every kWindowFrames frames. `diagnostic` evaluates the
-// rule for a frame generation session that is adopted as it is: a candidate needs half the frames and the
-// answer is only compared (the join is not required).
+// The window state: one frame at a time, a decision every kWindowFrames frames. Both roots use the same rule.
 class Evaluator {
 public:
     // `loss_baseline`: the loss counter now (records dropped before this point do not count against the first window).
-    void Reset(bool diagnostic, uint64_t loss_baseline = 0) noexcept; // window, decision and counters
+    void Reset(bool fg_input, uint64_t loss_baseline = 0) noexcept; // window, decision and counters
     // How the command list counters passed to AddFrame line up with the frame. Legacy: the counters at the frame's
-    // processing time, read at the first frame of a window (the start) and at its end (tests, the diagnostic path).
+    // processing time, read at the first frame of a window (the start) and at its end (tests).
     // Exact: the counters as of the END of this frame (a snapshot taken at the frame's own boundary); the start of a
     // window is then the end of the previous frame, so the window's count is the difference of the snapshots around it.
     // Inexact: the frame's boundary snapshot is not known (its pull was skipped; the counters are of a later pull): a
@@ -512,7 +551,7 @@ private:
     uint32_t poison_frames_ = 0;    // frames still to resolve inside the poison watermark of a pull that found loss
     bool window_poisoned_ = false;  // the current window contains a frame resolved inside a poison watermark
     bool carry_poison_ = false;     // the baseline frame was poisoned: the first window it starts is
-    bool diagnostic_ = false;
+    bool fg_input_ = false;
     Decision decision_;
     uint64_t frames_total_ = 0, windows_ = 0, ambiguous_total_ = 0, multi_edge_total_ = 0, missing_join_total_ = 0,
         unsignalled_total_ = 0, ambiguous_signals_total_ = 0;
@@ -539,12 +578,12 @@ private:
 // The first frame resolved after a restart is the one pushed after it: frames of an older generation or of an older tables epoch
 // are discarded, never evaluated against tables that were cleared.
 struct BoundaryInput {
-    uint64_t presenting_queue = 0;
-    uint64_t scope = 0;       // this Present's scope (0 = none: the frame it closes is not evaluated)
+    uint64_t presenting_queue = 0; // the root for this boundary
+    uint64_t scope = 0;       // the root's scope (0 = none: the frame it closes is not evaluated)
     int64_t qpc = 0;          // the boundary's clock
     bool keyed = false;       // the boundary carried a real frame identity
     uint32_t frame_counter = 0; // Entry::epoch now
-    uint8_t mode = 1;         // 1 the rule, 2 diagnostic (frame generation)
+    uint8_t mode = 1;         // 1 presenting root, 2 FG input root; both apply the strict join
     bool restart = false;     // the tables were cleared or the lifetime changed (a reset was pending)
 };
 struct PendingFrame {
@@ -613,7 +652,7 @@ private:
         bool keyed = false;
     };
     void Step(Tables& tables, FeedSink& sink) noexcept;
-    void ResetEvaluator(FeedSink& sink, Tables& tables, bool diagnostic, uint64_t baseline) noexcept;
+    void ResetEvaluator(FeedSink& sink, Tables& tables, bool fg_input, uint64_t baseline) noexcept;
 
     // Producer (one at a time):
     ScopeRecord ring_[3];

@@ -92,10 +92,33 @@ size_t RecordTable::IndexOfDetour(uintptr_t slot_value, bool present1) const noe
     return kNoRecord;
 }
 
+uintptr_t Forward(const RecordTable& records, size_t index, uintptr_t live, bool present1) noexcept {
+    const Record* record = records.Get(index);
+    if (!record) return 0;
+    if (live != 0 && records.IndexOfDetour(live, present1) == kNoRecord) return live;
+    return present1 ? record->original_present1 : record->original_present;
+}
+
 VptrVerdict JudgeVptr(const RecordTable& records, uintptr_t replaced_vptr, uintptr_t observed) noexcept {
     if (records.IndexOfCopy(observed) != kNoRecord) return VptrVerdict::Ours;
     if (observed == replaced_vptr) return VptrVerdict::Restored;
     return VptrVerdict::Replaced;
+}
+
+uintptr_t NativeTarget(const RecordTable& records, uintptr_t class_vptr, uintptr_t live, bool present1,
+                       const Modules& modules) noexcept {
+    const uintptr_t module = class_vptr ? modules.base_of(modules.context, class_vptr) : 0;
+    if (!module) return 0;
+    const auto in_module = [&](uintptr_t address) {
+        return address != 0 && modules.base_of(modules.context, address) == module;
+    };
+    for (size_t i = 0; i < records.Size(); ++i) {
+        const Record* record = records.Get(i);
+        if (!record || record->original_vptr != class_vptr) continue;
+        const uintptr_t value = present1 ? record->original_present1 : record->original_present;
+        if (in_module(value)) return value;
+    }
+    return in_module(live) ? live : 0;
 }
 
 bool ShouldRestoreVptr(uintptr_t current, uintptr_t our_copy) noexcept {

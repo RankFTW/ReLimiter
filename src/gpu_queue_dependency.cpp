@@ -271,11 +271,12 @@ void ResolveFrame(const FrameInput& input, const Entry* waits, size_t wait_count
             if (w.queue != current.queue || !Fresh(w, input.current_epoch)) continue;
             bool in_frame;
             bool joined_scope = false;
-            if (current.hops == 0) {
+            if (current.hops == 0 && !input.fg_input) {
                 joined_scope = input.scope != 0 && w.scope == input.scope;
                 in_frame = joined_scope || (w.scope == 0 && w.qpc > input.window_begin && w.qpc <= input.window_end);
             } else {
                 in_frame = w.qpc > input.window_begin && w.qpc <= input.window_end;
+                joined_scope = current.hops == 0 && input.scope == FgInputScope(w.thread, w.epoch);
             }
             if (!in_frame) continue;
             // The queues that signalled this (fence, value): the same value, not the newest Signal of the fence.
@@ -344,18 +345,19 @@ const char* RoleText(Role role) noexcept {
     case Role::Presenting: return "presenting";
     case Role::FrameGenerationSource: return "frame generation source";
     case Role::RenderQueueByDependency: return "render queue by dependency";
+    case Role::FgRenderQueueByDependency: return "FG render queue by dependency";
     default: return "none";
     }
 }
 
 const char* ReasonText(Reason reason) noexcept {
     switch (reason) {
-    case Reason::PresentingNoDependency: return "no dependency: the presenting queue";
-    case Reason::PresentingMostWork: return "the presenting queue has the most command lists (or a tie)";
+    case Reason::PresentingNoDependency: return "no dependency: the root queue";
+    case Reason::PresentingMostWork: return "the root queue has the most command lists (or a tie)";
     case Reason::DependencyQualified: return "dependency queue with the most command lists, boundary joined to the frame identity";
     case Reason::NotQualifiedHops: return "winner is more than one hop away: its boundary cannot be joined to the frame identity";
-    case Reason::NotQualifiedAmbiguous: return "ambiguous join: the presenting queue's own dependency is not exactly one (fence, value) to that queue per frame";
-    case Reason::NotQualifiedMissingJoin: return "missing join: the presenting queue's Wait carried no frame identity";
+    case Reason::NotQualifiedAmbiguous: return "ambiguous join: the root queue's own dependency is not exactly one (fence, value) to that queue per frame";
+    case Reason::NotQualifiedMissingJoin: return "missing join: the root queue's Wait carried no frame identity";
     case Reason::NotQualifiedFence: return "the dependency fence changed within the window";
     case Reason::NotQualifiedSignals: return "the adopted queue does not Signal the dependency fence exactly once per real frame";
     case Reason::NotQualifiedValues: return "the dependency fence value did not rise in every frame";
@@ -366,7 +368,7 @@ const char* ReasonText(Reason reason) noexcept {
 }
 
 // ── Evaluator ──
-void Evaluator::Reset(bool diagnostic, uint64_t loss_baseline) noexcept {
+void Evaluator::Reset(bool fg_input, uint64_t loss_baseline) noexcept {
     stat_count_ = 0;
     start_count_ = 0;
     presenting_ = 0;
@@ -379,7 +381,7 @@ void Evaluator::Reset(bool diagnostic, uint64_t loss_baseline) noexcept {
     carry_poison_ = false;
     last_row_count_ = 0;
     epoch_ = 0;
-    diagnostic_ = diagnostic;
+    fg_input_ = fg_input;
     decision_ = Decision{};
     frames_total_ = windows_ = ambiguous_total_ = multi_edge_total_ = missing_join_total_ = unsignalled_total_ =
         ambiguous_signals_total_ = 0;
@@ -579,9 +581,7 @@ void Evaluator::Decide(const Row* counters, size_t counter_count, uint64_t loss_
     for (size_t i = 0; i < stat_count_ && d.candidate_count < kMaxNodes; ++i) {
         const Stat& s = stats_[i];
         const bool presenting = s.queue == presenting_;
-        const bool candidate = presenting ||
-            (diagnostic_ ? static_cast<uint64_t>(s.reached) * 2 >= frames_ : s.reached == frames_);
-        if (!candidate) continue;
+        if (!presenting && s.reached != frames_) continue;
         CandidateReport& c = d.candidates[d.candidate_count++];
         c.queue = s.queue;
         c.hops = presenting ? 0 : s.hops_min;
@@ -628,14 +628,15 @@ void Evaluator::Decide(const Row* counters, size_t counter_count, uint64_t loss_
         decision_ = d;
         return;
     }
+    const Role dependency_role = fg_input_ ? Role::FgRenderQueueByDependency : Role::RenderQueueByDependency;
     d.queue = winner->queue;
     if (winner->queue == presenting_) {
-        d.role = Role::Presenting;
+        d.role = fg_input_ ? Role::FrameGenerationSource : Role::Presenting;
         d.adoptable = true;
         d.hops = 0;
         d.reason = d.candidate_count > 1 ? Reason::PresentingMostWork : Reason::PresentingNoDependency;
     } else {
-        d.role = Role::RenderQueueByDependency;
+        d.role = dependency_role;
         d.hops = winner->hops_min;
         d.fence = winner->fence;
         if (winner->hops_min != 1 || winner->hops_max != 1) d.reason = Reason::NotQualifiedHops;
@@ -651,36 +652,28 @@ void Evaluator::Decide(const Row* counters, size_t counter_count, uint64_t loss_
         else d.reason = Reason::DependencyQualified;
         d.adoptable = d.reason == Reason::DependencyQualified;
     }
-    if (!diagnostic_) {
-        // A queue not reached in every frame of the window is never adopted. When it has at least as many command
-        // lists as the best candidate (a tie included: an equally busy full candidate would otherwise win only
-        // because one frame lost the partial one's edge) its dependency is missing or ambiguous in the other
-        // frames, and nothing is adopted for the window instead of falling back to a queue with less work.
-        const Stat* partial = nullptr;
-        uint64_t partial_lists = 0;
-        for (size_t i = 0; i < stat_count_; ++i) {
-            const Stat& s = stats_[i];
-            if (s.queue == presenting_ || s.reached == 0 || s.reached == frames_) continue;
-            const uint64_t lists = delta(s.queue);
-            if (!partial || lists > partial_lists) { partial = &s; partial_lists = lists; }
-        }
-        if (partial && partial_lists > 0 && partial_lists >= (top > best ? top : best)) {
-            d.queue = partial->queue;
-            d.role = Role::RenderQueueByDependency;
-            d.hops = partial->hops_min;
-            d.fence = partial->fence;
-            d.adoptable = false;
-            d.reason = Reason::NotQualifiedPartial;
-        }
-        // Records the tables dropped or lost during the window (counted from before its first frame): what was
-        // counted may be missing a Signal, a Wait or command lists, so the window does not qualify for any queue.
-        // The window is also poisoned when a frame of it was resolved inside the poison watermark of a pull that found new
-        // loss (see BeginPull): the loss can belong to a frame that was current or unresolved when it was seen.
-        if (d.lost_records != 0 || window_poisoned_) {
-            if (d.lost_records == 0) d.lost_records = 1;
-            d.adoptable = false;
-            d.reason = Reason::NotQualifiedLoss;
-        }
+    // A partial candidate as busy as the best full candidate blocks the adoption; missing edges cannot prove a winner.
+    const Stat* partial = nullptr;
+    uint64_t partial_lists = 0;
+    for (size_t i = 0; i < stat_count_; ++i) {
+        const Stat& s = stats_[i];
+        if (s.queue == presenting_ || s.reached == 0 || s.reached == frames_) continue;
+        const uint64_t lists = delta(s.queue);
+        if (!partial || lists > partial_lists) { partial = &s; partial_lists = lists; }
+    }
+    if (partial && partial_lists > 0 && partial_lists >= (top > best ? top : best)) {
+        d.queue = partial->queue;
+        d.role = dependency_role;
+        d.hops = partial->hops_min;
+        d.fence = partial->fence;
+        d.adoptable = false;
+        d.reason = Reason::NotQualifiedPartial;
+    }
+    // The loss can belong to a frame that was current or unresolved when it was seen (BeginPull).
+    if (d.lost_records != 0 || window_poisoned_) {
+        if (d.lost_records == 0) d.lost_records = 1;
+        d.adoptable = false;
+        d.reason = Reason::NotQualifiedLoss;
     }
     decision_ = d;
 }
@@ -688,9 +681,13 @@ void Evaluator::Decide(const Row* counters, size_t counter_count, uint64_t loss_
 AdoptionAction ApplyDecision(const Decision& decision, bool adopted, uint64_t adopted_queue, Role adopted_role,
     uint64_t adopted_fence) noexcept {
     if (!adopted || !decision.valid) return AdoptionAction::None;
-    if (!decision.adoptable) return AdoptionAction::KeepUnqualified;
+    if (!decision.adoptable) {
+        if (decision.role == Role::FgRenderQueueByDependency && decision.reason != Reason::NotQualifiedLoss)
+            return AdoptionAction::Change;
+        return AdoptionAction::KeepUnqualified;
+    }
     const bool same = decision.queue == adopted_queue && decision.role == adopted_role &&
-        (decision.role != Role::RenderQueueByDependency || decision.fence == adopted_fence);
+        (!IsRenderQueueByDependency(decision.role) || decision.fence == adopted_fence);
     return same ? AdoptionAction::None : AdoptionAction::Change;
 }
 
@@ -702,10 +699,11 @@ bool RetainGate::WaitForRetainers(unsigned spins) const noexcept {
     return inflight_.load(std::memory_order_seq_cst) == 0;
 }
 
-bool MakeAdoptionSnapshot(const Decision& decision, uint64_t published_queue, AdoptionSnapshot* out) noexcept {
+bool MakeAdoptionSnapshot(const Decision& decision, uint64_t published_queue, AdoptionSnapshot* out, bool fg_input) noexcept {
     *out = AdoptionSnapshot{};
     if (!published_queue || !decision.valid || !decision.adoptable || decision.queue != published_queue ||
-        (decision.role != Role::Presenting && decision.role != Role::RenderQueueByDependency))
+        (decision.role != (fg_input ? Role::FrameGenerationSource : Role::Presenting) &&
+         decision.role != (fg_input ? Role::FgRenderQueueByDependency : Role::RenderQueueByDependency)))
         return false;
     out->valid = true;
     out->queue = published_queue;
@@ -771,8 +769,8 @@ void FrameFeed::OnBoundary(Tables& tables, const BoundaryInput& in) noexcept {
     boundaries_.fetch_add(1, std::memory_order_release);
 }
 
-void FrameFeed::ResetEvaluator(FeedSink& sink, Tables& tables, bool diagnostic, uint64_t baseline) noexcept {
-    evaluator_.Reset(diagnostic, baseline);
+void FrameFeed::ResetEvaluator(FeedSink& sink, Tables& tables, bool fg_input, uint64_t baseline) noexcept {
+    evaluator_.Reset(fg_input, baseline);
     decision_ = Decision{};
     sink.OnReset();
     tables.Unpublish();
@@ -882,6 +880,7 @@ void FrameFeed::Step(Tables& tables, FeedSink& sink) noexcept {
         input.window_end = f.window_end;
         input.current_epoch = f.current_epoch;
         input.keyed = f.keyed;
+        input.fg_input = f.mode == 2;
         evaluator_.FillPrevious(&input, reader_.epoch()); // the previous frame's first-hop edges: Signals of the fence since them
         FrameResult frame;
         ResolveFrame(input, reader_.waits(), reader_.wait_count(), reader_.signals(), reader_.signal_count(), &frame);
@@ -903,7 +902,7 @@ void FrameFeed::Step(Tables& tables, FeedSink& sink) noexcept {
             decision_ = evaluator_.decision();
             // Published (bounded lock) only while the epoch it was computed for is current; a decision of an old epoch,
             // or one that could not take the lock, is discarded and the next window publishes.
-            const uint64_t queue = f.mode == 1 && decision_.adoptable ? decision_.queue : 0;
+            const uint64_t queue = decision_.adoptable ? decision_.queue : 0;
             if (tables.PublishDecision(decision_.epoch, queue)) {
                 sink.OnDecision(f.mode, decision_);
             } else {

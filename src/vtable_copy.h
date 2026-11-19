@@ -13,9 +13,17 @@
 // never judged and never zero-filled (the entries past the vtable's real end are whatever follows it in
 // memory and are never called); it must cover the whole IDXGISwapChain4 interface (slots 0 to 40) or nothing
 // is installed. Every one of slots 0 to 40 must point into a loaded module, which is pinned before the copy
-// is published; one that does not refuses the install. Each copy has an immutable forwarding record: the
-// vptr it replaced and the slot values read at copy time. Another module replacing the vptr after our copy
-// is left alone, never copied over or chained to, and remembered (VptrHistory).
+// is published; one that does not refuses the install. Each copy has an immutable record: the vptr it replaced
+// (a class vtable: a vptr inside a loaded module's image, whose module is pinned) and the slot values read at copy
+// time. Its Present / Present1 detours call that class vtable's slot as it is at each call (Forward), not the
+// value read at copy time: another module that writes its hook into the class vtable in place and takes it out
+// again (REFramework hooks the class slot until its first Present, then moves to its own vtable on the object,
+// which saves our detour as its original) is followed exactly as for an object without our copy. A frozen value
+// keeps calling the hook after it was taken out, and that hook takes the call for a recursion and presents
+// nothing. Another module replacing the vptr after our copy is left alone, never copied over or chained to, and
+// remembered with the class vtable our copy had replaced (VptrHistory). An inline patch goes only on the
+// swapchain implementation's own Present / Present1 (NativeTarget): never on another module's hook in their slots,
+// never on one of our detours.
 // Records and copies are never freed. Every read and pin is supplied by the caller (guarded there).
 namespace vtable_copy {
 
@@ -64,10 +72,10 @@ struct Pinner {
 enum class PinStatus : uint8_t { Ok, SlotNotInModule };
 PinStatus PinSuppliers(const Image& image, const Pinner& pinner, size_t* bad_slot) noexcept;
 
-// One published copy and what its detours forward to. Immutable once it is in a RecordTable.
+// One published copy. Immutable once it is in a RecordTable.
 struct Record {
-    uintptr_t original_vptr = 0;      // the vptr the copy replaces
-    uintptr_t original_present = 0;   // slot 8 at copy time: the function the Present detour calls
+    uintptr_t original_vptr = 0;      // the vptr the copy replaces: a class vtable, in a pinned module
+    uintptr_t original_present = 0;   // slot 8 at copy time (Forward's fallback, NativeTarget's candidate)
     uintptr_t original_present1 = 0;  // slot 22 at copy time
     size_t entries = 0;
     uintptr_t copy[kMaxEntries];      // copy[0] the locator, copy[1 + i] slot i (8 and 22: the detours)
@@ -96,6 +104,28 @@ private:
     std::atomic<size_t> count_{0};
 };
 
+// The function the Present (present1 false) / Present1 detour of record `index` calls: `live`, the slot of the
+// record's class vtable (original_vptr) as read at this call, so another module's in-place hook in that slot is
+// called while it is there and no longer once that module takes it out. The slot read at copy time instead when
+// `live` is 0 (the read failed) or names one of our detours (a slot written back from one of our copies: calling
+// it would enter us again). 0 for an unknown record.
+uintptr_t Forward(const RecordTable& records, size_t index, uintptr_t live, bool present1) noexcept;
+
+// The module a code address belongs to (its base), 0 for memory that belongs to no module. Supplied by the caller.
+struct Modules {
+    void* context;
+    uintptr_t (*base_of)(void* context, uintptr_t address);
+};
+// The function an inline Present (present1 false) or Present1 patch belongs on: the implementation's own code, in
+// the module that holds `class_vptr` (the class vtable the object was created with). Another hook can write its
+// function into that vtable's slot in place (before or after a copy of it was taken) or put its own vtable on the
+// object, and a vtable copied from ours names our detours; none of those functions is ever patched. Candidates in
+// order: the slot of each record of `class_vptr`, earliest first (a copy taken before such an in-place hook keeps
+// the implementation's function), then `live` (the slot as read now). 0 when no candidate lies in that module, or
+// when `class_vptr` belongs to no module: nothing is patched.
+uintptr_t NativeTarget(const RecordTable& records, uintptr_t class_vptr, uintptr_t live, bool present1,
+                       const Modules& modules) noexcept;
+
 // What the object's vptr is at a present event, against the vptr last replaced for the object.
 enum class VptrVerdict : uint8_t {
     Ours,      // one of our copies: nothing to do
@@ -113,22 +143,26 @@ bool PrologueHoldsOurJump(const uint8_t* now, const uint8_t* at_install) noexcep
 // over our copy (Foreign). A vptr in the Foreign history is left alone on every later selection of any object,
 // whichever binding saw it first (destroy and init of the same native object do not forget it): installing over
 // a foreign vtable that saved our entry is how a hook chain turns into a cycle. When the history is full and a
-// new vptr would have to be noted, nothing is installed.
+// new vptr would have to be noted, nothing is installed. A Foreign vptr keeps the class vtable our copy had
+// replaced (ClassOf): an object that shows it has that class, though its binding may since have been dropped.
 class VptrHistory {
 public:
     static constexpr size_t kCapacity = 16;
     enum class Kind : uint8_t { Replaced, Foreign };
     // Notes `vptr`; false when it is new and the history is full. A noted vptr is never forgotten; Foreign wins
-    // over Replaced for the same vptr.
-    bool Note(uintptr_t vptr, Kind kind) noexcept {
+    // over Replaced for the same vptr. `over`: for Foreign, the class vtable our copy had replaced (the first
+    // note that names one keeps it).
+    bool Note(uintptr_t vptr, Kind kind, uintptr_t over = 0) noexcept {
         for (size_t i = 0; i < count_; ++i) {
             if (entries_[i].vptr != vptr) continue;
-            if (kind == Kind::Foreign) entries_[i].kind = Kind::Foreign;
+            if (kind == Kind::Foreign) {
+                entries_[i].kind = Kind::Foreign;
+                if (!entries_[i].over) entries_[i].over = over;
+            }
             return true;
         }
         if (count_ >= kCapacity) return false;
-        entries_[count_].vptr = vptr;
-        entries_[count_].kind = kind;
+        entries_[count_] = Entry{vptr, kind, kind == Kind::Foreign ? over : 0};
         ++count_;
         return true;
     }
@@ -136,6 +170,12 @@ public:
         for (size_t i = 0; i < count_; ++i)
             if (entries_[i].vptr == vptr) return entries_[i].kind == Kind::Foreign;
         return false;
+    }
+    // The class vtable a Foreign vptr was seen over; 0 for any other vptr or when the note named none.
+    uintptr_t ClassOf(uintptr_t vptr) const noexcept {
+        for (size_t i = 0; i < count_; ++i)
+            if (entries_[i].vptr == vptr) return entries_[i].kind == Kind::Foreign ? entries_[i].over : 0;
+        return 0;
     }
     bool Contains(uintptr_t vptr) const noexcept {
         for (size_t i = 0; i < count_; ++i)
@@ -149,6 +189,7 @@ private:
     struct Entry {
         uintptr_t vptr;
         Kind kind;
+        uintptr_t over; // Foreign: the class vtable our copy had replaced (0: unknown)
     };
     Entry entries_[kCapacity]{};
     size_t count_ = 0;

@@ -469,9 +469,6 @@ GpuReadinessCall::GpuReadinessCall(const PresentTimelineSpan* span, bool before_
             static const int64_t frequency = [] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart; }();
             GpuQueueProbe_OnReadinessSite(span ? span->key.swapchain_generation : 0, span ? span->key.present_sequence : 0,
                 PacingTelemetry_PeekPresentAttributionKey(Qpc(), frequency / 10));
-        } else {
-            // Under frame generation (source key): the dependency rule's answer for a diagnostic, no decision.
-            GpuQueueProbe_OnFgReadinessSite(span ? span->key.swapchain_generation : 0, span ? span->key.present_sequence : 0);
         }
     }
     if (!GpuReadiness_IsEnabled() && !GpuPresent_RequiresReadiness() && !s_scope.valid) return;

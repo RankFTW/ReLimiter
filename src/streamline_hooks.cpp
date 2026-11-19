@@ -112,6 +112,144 @@ static void EndOptionsStateWrite(uint64_t write_sequence) noexcept {
         std::memory_order_release);
 }
 
+// ── Legacy FG evidence: Streamline's options (SetOptions) and the GetState / deferred-inference evidence. The resolver
+// falls back on it while no fresh in-band statement decides. Written by those paths only; never read by consumers,
+// which read the published globals. ──
+static std::atomic<int> s_configured_generated{0}; // SetOptions numFramesToGenerate
+static std::atomic<bool> s_legacy_presenting{false};
+static std::atomic<int> s_legacy_actual{0};
+
+// ── Streamline's in-band statement (Streamline_RecordReflexSyncStatement; fg_state_policy.h) ──
+static std::atomic<uint64_t> s_statement_word{0};         // FgStatement_Pack: value, run, lifetime
+static std::atomic<int64_t> s_statement_qpc{0};           // the newest call that stated a multiplier
+static std::atomic<uint64_t> s_statement_present_mark{0}; // s_presents at that call
+static std::atomic<uint64_t> s_presents{0};               // FrameGeneration_OnPresent calls
+static std::atomic<uint32_t> s_statement_accepted{0};     // FgStatement_Accept in s_statement_accepted_lifetime
+static std::atomic<uint64_t> s_statement_accepted_lifetime{0};
+static std::atomic<bool> s_statement_fresh{false};
+static std::atomic<bool> s_dmfg_cached{false};            // IsDmfgActive() at the newest Present (it reads the DRS seqlock)
+// Stale only when both hold: no call for the marker flow timeout and several Presents without one, so one hitch keeps it.
+static constexpr double kStatementStaleUs = 500000.0;     // MARKER_FLOW_TIMEOUT_US
+static constexpr uint64_t kStatementStalePresents = 4;
+
+// ── The resolver's published results (besides g_fg_presenting, g_fg_actual_multiplier and g_fg_multiplier) ──
+static std::atomic<bool> s_statement_authority{false};
+static std::atomic<const char*> s_route_rejection{nullptr};
+static std::atomic<bool> s_route_published{false};       // s_route_rejection holds a resolver result
+
+static FgFacts CurrentFacts() noexcept {
+    FgFacts facts;
+    facts.mode_known = s_fg_mode_observed.load(std::memory_order_acquire);
+    facts.mode = static_cast<uint32_t>(std::clamp(g_fg_mode.load(std::memory_order_relaxed), 0, 3));
+    facts.configured_generated = s_configured_generated.load(std::memory_order_relaxed);
+    facts.legacy_presenting = s_legacy_presenting.load(std::memory_order_relaxed);
+    facts.legacy_actual = s_legacy_actual.load(std::memory_order_relaxed);
+    facts.statement_fresh = s_statement_fresh.load(std::memory_order_relaxed);
+    facts.statement = s_statement_accepted.load(std::memory_order_relaxed);
+    facts.dmfg = s_dmfg_cached.load(std::memory_order_relaxed);
+    return facts;
+}
+
+static bool SameRejection(const char* a, const char* b) noexcept {
+    return a == b || (a && b && std::strcmp(a, b) == 0);
+}
+
+static bool PublishedEquals(const FgEffective& effective, const char* rejection) noexcept {
+    return s_route_published.load(std::memory_order_relaxed) &&
+        g_fg_presenting.load(std::memory_order_relaxed) == effective.presenting &&
+        g_fg_actual_multiplier.load(std::memory_order_relaxed) == effective.actual &&
+        g_fg_multiplier.load(std::memory_order_relaxed) == effective.generated &&
+        s_statement_authority.load(std::memory_order_relaxed) == effective.statement_authority &&
+        SameRejection(s_route_rejection.load(std::memory_order_relaxed), rejection);
+}
+
+// Under the options-state write sequence: publishes the resolver's result. A change of the effective state logs one
+// line and, with `notify`, flushes the correlator once and invalidates the route's binding when the generated count
+// changes (the binding keys its inputs to one multiplier). The lifetime reset publishes without notifying: it has
+// invalidated the binding itself, and it can run at shutdown.
+static void PublishLocked(const char* why, bool notify = true) noexcept {
+    const FgFacts facts = CurrentFacts();
+    const FgEffective effective = FrameGeneration_ResolveState(facts);
+    const char* rejection = FrameGeneration_RouteRejection(facts.dmfg, facts.mode_known, facts.mode,
+        effective.presenting, effective.generated);
+    const bool previous_presenting = g_fg_presenting.load(std::memory_order_relaxed);
+    const int previous_actual = g_fg_actual_multiplier.load(std::memory_order_relaxed);
+    const int previous_generated = g_fg_multiplier.load(std::memory_order_relaxed);
+    const bool previous_authority = s_statement_authority.load(std::memory_order_relaxed);
+    g_fg_multiplier.store(effective.generated, std::memory_order_relaxed);
+    g_fg_actual_multiplier.store(effective.actual, std::memory_order_relaxed);
+    g_fg_presenting.store(effective.presenting, std::memory_order_relaxed);
+    s_statement_authority.store(effective.statement_authority, std::memory_order_relaxed);
+    s_route_rejection.store(rejection, std::memory_order_release);
+    s_route_published.store(true, std::memory_order_release);
+    if (previous_presenting == effective.presenting && previous_actual == effective.actual &&
+        previous_generated == effective.generated && previous_authority == effective.statement_authority) return;
+    LOG_INFO("FG state (%s): presenting %s, multiplier %d, generated %d, from %s (statement %u%s, mode %s%u, "
+             "configured %d, legacy presenting %d actual %d, dmfg %d); FG input route %s",
+        why, effective.presenting ? "yes" : "no", effective.actual, effective.generated,
+        effective.statement_authority ? "the in-band statement" : "the options and inference",
+        facts.statement, facts.statement_fresh ? "" : " not fresh", facts.mode_known ? "" : "unknown ", facts.mode,
+        facts.configured_generated, facts.legacy_presenting ? 1 : 0, facts.legacy_actual, facts.dmfg ? 1 : 0,
+        rejection ? rejection : "eligible");
+    if (!notify) return;
+    if (previous_generated != effective.generated) StreamlineHandoff_Invalidate("fg_multiplier_changed");
+    OnFGStateChange();
+}
+
+static void PublishIfChanged(const char* why) noexcept {
+    const FgFacts facts = CurrentFacts();
+    const FgEffective effective = FrameGeneration_ResolveState(facts);
+    if (PublishedEquals(effective, FrameGeneration_RouteRejection(facts.dmfg, facts.mode_known, facts.mode,
+            effective.presenting, effective.generated))) return;
+    const uint64_t write_sequence = BeginOptionsStateWrite();
+    PublishLocked(why);
+    EndOptionsStateWrite(write_sequence);
+}
+
+void Streamline_RecordReflexSyncStatement(uint32_t stated, bool disable) noexcept {
+    if (!FgStatement_States(stated, disable)) return;
+    const uint64_t lifetime = s_streamline_lifetime_generation.load(std::memory_order_acquire);
+    uint64_t raw = s_statement_word.load(std::memory_order_relaxed);
+    while (!s_statement_word.compare_exchange_weak(raw, FgStatement_Fold(raw, stated, lifetime),
+               std::memory_order_acq_rel, std::memory_order_relaxed)) {}
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    s_statement_present_mark.store(s_presents.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    s_statement_qpc.store(now.QuadPart, std::memory_order_release);
+}
+
+bool Streamline_StatementAuthority() noexcept {
+    return s_statement_authority.load(std::memory_order_acquire);
+}
+
+const char* Streamline_RouteRejection() noexcept {
+    return s_route_published.load(std::memory_order_acquire)
+        ? s_route_rejection.load(std::memory_order_acquire) : "fg_not_presenting";
+}
+
+// Once per Present: the accepted statement of the current lifetime and whether it is fresh.
+static void UpdateStatement() noexcept {
+    const uint64_t lifetime = s_streamline_lifetime_generation.load(std::memory_order_acquire);
+    const uint32_t accepted = FgStatement_Accept(s_statement_word.load(std::memory_order_acquire), lifetime,
+        s_statement_accepted.load(std::memory_order_relaxed),
+        s_statement_accepted_lifetime.load(std::memory_order_relaxed));
+    s_statement_accepted.store(accepted, std::memory_order_relaxed);
+    s_statement_accepted_lifetime.store(lifetime, std::memory_order_relaxed);
+    bool fresh = false;
+    const int64_t call = s_statement_qpc.load(std::memory_order_acquire);
+    if (accepted != 0 && call > 0) {
+        static const int64_t frequency = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f.QuadPart; }();
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        const double age_us = frequency > 0
+            ? static_cast<double>(now.QuadPart - call) * 1'000'000.0 / static_cast<double>(frequency) : 0.0;
+        const uint64_t presents = s_presents.load(std::memory_order_relaxed) -
+            s_statement_present_mark.load(std::memory_order_relaxed);
+        fresh = age_us <= kStatementStaleUs || presents < kStatementStalePresents;
+    }
+    s_statement_fresh.store(fresh, std::memory_order_relaxed);
+}
+
 static uint64_t GetViewportKey(const void* viewport) noexcept {
     if (!viewport) return 0;
     uint32_t value = 0;
@@ -162,8 +300,8 @@ static void ApplyExplicitFGModeTransition(
     // NGX creation/runtime state must not keep presenting true and then prevent
     // a later On/Auto transition from rearming inference.
     g_fg_active.store(false, std::memory_order_relaxed);
-    g_fg_presenting.store(false, std::memory_order_relaxed);
-    g_fg_actual_multiplier.store(0, std::memory_order_relaxed);
+    s_legacy_presenting.store(false, std::memory_order_relaxed);
+    s_legacy_actual.store(0, std::memory_order_relaxed);
 }
 
 static void UpdateConfiguredFGActivity(bool configuration_changed, uint32_t mode, int generated_frames) noexcept {
@@ -231,9 +369,8 @@ __declspec(noinline) static sl_Result SetOptionsBody(
                                          : (mode == 2) ? "Auto"
                                          : (mode == 3) ? "Dynamic"
                                          : "Unknown";
-                    LOG_INFO("DLSSG mode changed: %u -> %u (%s)%s",
-                             s_prev_mode == UINT32_MAX ? 0 : s_prev_mode, mode, mode_str,
-                             mode == 2 ? " — Dynamic MFG active" : "");
+                    LOG_INFO("DLSSG mode changed: %u -> %u (%s)",
+                             s_prev_mode == UINT32_MAX ? 0 : s_prev_mode, mode, mode_str);
                     OnFGStateChange();
                 }
             }
@@ -244,11 +381,12 @@ __declspec(noinline) static sl_Result SetOptionsBody(
                     reinterpret_cast<const uint8_t*>(opts) + 36),
                 0,
                 5);
-            int prev = g_fg_multiplier.exchange(numFrames, std::memory_order_relaxed);
+            int prev = s_configured_generated.exchange(numFrames, std::memory_order_relaxed);
             s_setoptions_ever_called.store(true, std::memory_order_relaxed);
             const bool multiplier_changed = numFrames != prev;
-            if (mode_changed || multiplier_changed || viewport_changed)
-                StreamlineHandoff_Invalidate(mode_changed ? "fg_mode_changed" : multiplier_changed ? "fg_multiplier_changed" : "fg_viewport_changed");
+            // A change of the effective generated count invalidates the binding in PublishLocked.
+            if (mode_changed || viewport_changed)
+                StreamlineHandoff_Invalidate(mode_changed ? "fg_mode_changed" : "fg_viewport_changed");
             UpdateConfiguredFGActivity(mode_changed || multiplier_changed || viewport_changed, mode, numFrames);
             if (multiplier_changed) {
                 LOG_INFO("FG multiplier changed: %d -> %d (divisor=%d)", prev, numFrames, numFrames + 1);
@@ -259,25 +397,24 @@ __declspec(noinline) static sl_Result SetOptionsBody(
                     // sending contradictory signals — trust NGX and keep FG active.
                     // Otherwise, honor the disable.
                     CancelDeferredFGInference();
-                    bool prev_presenting = g_fg_presenting.load(std::memory_order_relaxed);
+                    bool prev_presenting = s_legacy_presenting.load(std::memory_order_relaxed);
                     if (prev_presenting) {
                         if (NGXHooks_IsFGCreated()) {
                             LOG_INFO("FG presenting: SetOptions says off but NGX FG active — keeping");
                         } else {
-                            g_fg_presenting.store(false, std::memory_order_relaxed);
-                            g_fg_actual_multiplier.store(0, std::memory_order_relaxed);
+                            s_legacy_presenting.store(false, std::memory_order_relaxed);
+                            s_legacy_actual.store(0, std::memory_order_relaxed);
                             LOG_INFO("FG presenting (from SetOptions): yes -> no");
                         }
                     }
                 }
-
-                OnFGStateChange();
             }
             if (mode != 0 && numFrames > 0 &&
-                !g_fg_presenting.load(std::memory_order_relaxed) &&
+                !s_legacy_presenting.load(std::memory_order_relaxed) &&
                 (mode_changed || multiplier_changed || viewport_changed)) {
                 BeginDeferredFGInference(viewport_key, false);
             }
+            PublishLocked("options");
         }
         EndOptionsStateWrite(options_write_sequence);
         options_write_sequence = 0;
@@ -387,14 +524,14 @@ __declspec(noinline) static sl_Result GetStateBody(
                 if (!presenting && NGXHooks_InFGCreateCooldown()) {
                     // Still update the multiplier for telemetry, but don't revoke presenting
                     int clamped_mult = static_cast<int>((std::min)(frames_presented, 6u));
-                    g_fg_actual_multiplier.store(clamped_mult, std::memory_order_relaxed);
+                    s_legacy_actual.store(clamped_mult, std::memory_order_relaxed);
                 } else {
-                bool prev_presenting = g_fg_presenting.exchange(presenting, std::memory_order_relaxed);
+                bool prev_presenting = s_legacy_presenting.exchange(presenting, std::memory_order_relaxed);
 
                 // Store actual runtime multiplier, clamped to [0, 6].
                 // This is the driver's real dynamic FG ratio — independent of render pacing.
                 int clamped_mult = static_cast<int>((std::min)(frames_presented, 6u));
-                int prev_mult = g_fg_actual_multiplier.exchange(clamped_mult, std::memory_order_relaxed);
+                int prev_mult = s_legacy_actual.exchange(clamped_mult, std::memory_order_relaxed);
                 if (clamped_mult != prev_mult) {
                     LOG_INFO("FG actual multiplier changed: %d -> %d (raw numFramesActuallyPresented=%u)",
                              prev_mult, clamped_mult, frames_presented);
@@ -424,11 +561,11 @@ __declspec(noinline) static sl_Result GetStateBody(
                     }
                 }
 
+                // The resolver publishes the effective state at the next Present (FrameGeneration_OnPresent).
                 if (presenting != prev_presenting) {
-                    LOG_INFO("FG presenting: %s -> %s (numFramesActuallyPresented=%u)",
+                    LOG_INFO("FG presenting (GetState): %s -> %s (numFramesActuallyPresented=%u)",
                              prev_presenting ? "yes" : "no", presenting ? "yes" : "no",
                              frames_presented);
-                    OnFGStateChange();
                 }
                 } // end else (not in cooldown)
             } else {
@@ -544,11 +681,12 @@ __declspec(noinline) static sl_Result SetOptionsCompatBody(
                     reinterpret_cast<const uint8_t*>(opts) + 36),
                 0,
                 5);
-            int prev = g_fg_multiplier.exchange(numFrames, std::memory_order_relaxed);
+            int prev = s_configured_generated.exchange(numFrames, std::memory_order_relaxed);
             s_setoptions_ever_called.store(true, std::memory_order_relaxed);
             const bool multiplier_changed = numFrames != prev;
-            if (mode_changed || multiplier_changed || viewport_changed)
-                StreamlineHandoff_Invalidate(mode_changed ? "fg_mode_changed" : multiplier_changed ? "fg_multiplier_changed" : "fg_viewport_changed");
+            // A change of the effective generated count invalidates the binding in PublishLocked.
+            if (mode_changed || viewport_changed)
+                StreamlineHandoff_Invalidate(mode_changed ? "fg_mode_changed" : "fg_viewport_changed");
             UpdateConfiguredFGActivity(mode_changed || multiplier_changed || viewport_changed, mode, numFrames);
             if (multiplier_changed) {
                 LOG_INFO("FG multiplier changed (compat): %d -> %d (divisor=%d)",
@@ -556,17 +694,17 @@ __declspec(noinline) static sl_Result SetOptionsCompatBody(
                 if (numFrames == 0) {
                     CancelDeferredFGInference();
                     if (!NGXHooks_IsFGCreated()) {
-                        g_fg_presenting.store(false, std::memory_order_relaxed);
-                        g_fg_actual_multiplier.store(0, std::memory_order_relaxed);
+                        s_legacy_presenting.store(false, std::memory_order_relaxed);
+                        s_legacy_actual.store(0, std::memory_order_relaxed);
                     }
                 }
-                OnFGStateChange();
             }
             if (mode != 0 && numFrames > 0 &&
-                !g_fg_presenting.load(std::memory_order_relaxed) &&
+                !s_legacy_presenting.load(std::memory_order_relaxed) &&
                 (mode_changed || multiplier_changed || viewport_changed)) {
                 BeginDeferredFGInference(viewport_key, true);
             }
+            PublishLocked("options");
         }
         EndOptionsStateWrite(options_write_sequence);
         options_write_sequence = 0;
@@ -609,10 +747,14 @@ void Streamline_ResetLifetime() {
     s_inference_getstate_call_count.store(0, std::memory_order_relaxed);
     s_fg_mode_observed.store(false, std::memory_order_relaxed);
     g_fg_mode.store(0, std::memory_order_relaxed);
-    g_fg_multiplier.store(0, std::memory_order_relaxed);
-    g_fg_actual_multiplier.store(0, std::memory_order_relaxed);
+    // The statement word carries the old lifetime and is ignored from here on.
+    s_configured_generated.store(0, std::memory_order_relaxed);
+    s_legacy_presenting.store(false, std::memory_order_relaxed);
+    s_legacy_actual.store(0, std::memory_order_relaxed);
+    s_statement_accepted.store(0, std::memory_order_relaxed);
+    s_statement_fresh.store(false, std::memory_order_relaxed);
     g_fg_active.store(false, std::memory_order_relaxed);
-    g_fg_presenting.store(false, std::memory_order_relaxed);
+    PublishLocked("lifetime reset", false);
     EndOptionsStateWrite(write_sequence);
     NGXHooks_ClearFGCreated();
 }
@@ -657,8 +799,8 @@ static sl_Result __cdecl Detour_slGetFeatureFunction(uint32_t feature, const cha
     }
 }
 
-// ── Deferred FG inference check (called each frame from scheduler) ──
-void CheckDeferredFGInference() {
+// ── Deferred FG inference (FrameGeneration_OnPresent): legacy evidence, one source of the resolver ──
+static void CheckDeferredInference() {
     const uint64_t options_sequence =
         s_options_publication_sequence.load(std::memory_order_acquire);
     if ((options_sequence & 1u) != 0) return;
@@ -713,13 +855,14 @@ void CheckDeferredFGInference() {
         if (!confirmed && window_getstate_calls == 0) {
             if (!g_config.streamline_compat || passive_runtime_evidence ||
                 vulkan_without_evidence_source) {
-                g_fg_presenting.store(true, std::memory_order_relaxed);
+                s_legacy_presenting.store(true, std::memory_order_relaxed);
                 promoted = true;
             } else {
                 compat_without_evidence = true;
             }
         }
     }
+    if (promoted) PublishLocked("inference");
     EndOptionsStateWrite(write_sequence);
 
     if (promoted) {
@@ -731,7 +874,6 @@ void CheckDeferredFGInference() {
                 : "FG presenting promoted (passive runtime evidence; GetState not observed in compatibility mode, "
                   "%.1fs elapsed)",
             elapsed_us / 1000000.0);
-        OnFGStateChange();
     } else if (compat_without_evidence) {
         LOG_INFO("FG presenting NOT promoted (compatibility mode) — no NGX FG creation or Reflex AI frame time "
                  "within %.1fs", elapsed_us / 1000000.0);
@@ -739,6 +881,14 @@ void CheckDeferredFGInference() {
         LOG_INFO("FG presenting NOT promoted — GetState called %u times but never confirmed (%.1fs)",
                  window_getstate_calls, elapsed_us / 1000000.0);
     }
+}
+
+void FrameGeneration_OnPresent() {
+    s_presents.fetch_add(1, std::memory_order_relaxed);
+    s_dmfg_cached.store(IsDmfgActive(), std::memory_order_relaxed);
+    UpdateStatement();
+    CheckDeferredInference();
+    PublishIfChanged("present");
 }
 
 // ── Entry point: owned installer worker only, never under loader lock ──

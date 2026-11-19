@@ -114,7 +114,7 @@ static void ExtractDlssParams(void* params, unsigned int feature_id) {
         // before the FG pipeline has initialized can interfere with pacing and
         // prevent FG from ever starting (LEGO Batman, Clair Obscur Steam).
         // Instead, let the deferred inference in streamline_hooks.cpp handle it
-        // (CheckDeferredFGInference promotes after a timeout if GetState never
+        // (the deferred inference promotes after a timeout if GetState never
         // confirms). This preserves Horizon Remastered support (which never
         // calls GetState) while not breaking games that need time to init FG.
         static bool s_fg_first_create = true;

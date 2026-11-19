@@ -373,6 +373,14 @@ void TestHistory() {
     CHECK(history.Full() && history.Size() == VptrHistory::kCapacity);
     CHECK(!history.Note(0x9000, VptrHistory::Kind::Foreign) && !history.Contains(0x9000));
     CHECK(history.Note(0x20, VptrHistory::Kind::Foreign) && history.Size() == VptrHistory::kCapacity);
+
+    // A Foreign vptr keeps the class vtable our copy had replaced (the first note that names one); other vptrs have none.
+    VptrHistory classes;
+    CHECK(classes.Note(0x30, VptrHistory::Kind::Foreign, 0x1800) && classes.ClassOf(0x30) == 0x1800);
+    CHECK(classes.Note(0x30, VptrHistory::Kind::Foreign, 0x1900) && classes.ClassOf(0x30) == 0x1800);
+    CHECK(classes.Note(0x40, VptrHistory::Kind::Replaced, 0x1800) && classes.ClassOf(0x40) == 0);
+    CHECK(classes.Note(0x40, VptrHistory::Kind::Foreign, 0x1A00) && classes.ClassOf(0x40) == 0x1A00); // Replaced, then seen over ours
+    CHECK(classes.Note(0x50, VptrHistory::Kind::Foreign) && classes.ClassOf(0x50) == 0 && classes.ClassOf(0x60) == 0);
 }
 
 void TestFallbackCounter() {
@@ -445,6 +453,79 @@ void TestTeardownRules() {
         CHECK(!PrologueHoldsOurJump(now, installed)); // another module's jump, or the original bytes
     }
 }
+
+// Fake modules for NativeTarget: the implementation [0x1000, 0x2000), another module [0x5000, 0x6000), ours
+// [0x9000, 0xA000); everything else belongs to no module.
+uintptr_t BaseOf(void*, uintptr_t address) {
+    if (address >= 0x1000 && address < 0x2000) return 0x1000;
+    if (address >= 0x5000 && address < 0x6000) return 0x5000;
+    if (address >= 0x9000 && address < 0xA000) return 0x9000;
+    return 0;
+}
+Image ClassImage(uintptr_t vptr, uintptr_t present, uintptr_t present1) {
+    Image image;
+    image.vptr = vptr;
+    image.entries = 1 + kRequiredSlots;
+    image.values[0] = kLocator;
+    for (size_t i = 0; i < kRequiredSlots; ++i) image.values[1 + i] = 0x1000 + i * 16;
+    image.values[1 + kPresentSlot] = present;
+    image.values[1 + kPresent1Slot] = present1;
+    return image;
+}
+
+// An inline patch goes only on the implementation's own Present / Present1.
+void TestNativeTarget() {
+    const Modules modules{nullptr, BaseOf};
+    constexpr uintptr_t kClass = 0x1800, kOtherClass = 0x1900, kPresentImpl = 0x1100, kPresent1Impl = 0x1200;
+    constexpr uintptr_t kHook = 0x5100, kOurDetour = 0x9100;
+    static RecordTable records;
+    // No record: the live slot counts when it is the implementation's own function, never another module's or ours.
+    CHECK(NativeTarget(records, kClass, kPresentImpl, false, modules) == kPresentImpl);
+    CHECK(NativeTarget(records, kClass, kHook, false, modules) == 0);
+    CHECK(NativeTarget(records, kClass, kOurDetour, false, modules) == 0);
+    CHECK(NativeTarget(records, kClass, 0, false, modules) == 0);
+    // A vptr in no module (another module's private vtable) has no implementation to find: nothing is patched.
+    CHECK(NativeTarget(records, 0x7000, kPresentImpl, false, modules) == 0);
+    CHECK(NativeTarget(records, 0, kPresentImpl, false, modules) == 0);
+    // A copy taken while another module's hook sat in the class vtable's Present slot (written in place): its record
+    // forwards to the hook, which is never patched; with only that record the live implementation slot still counts.
+    records.Append(ClassImage(kClass, kHook, kPresent1Impl), 0x9200, 0x9300);
+    CHECK(NativeTarget(records, kClass, kHook, false, modules) == 0);
+    CHECK(NativeTarget(records, kClass, kPresentImpl, false, modules) == kPresentImpl);
+    CHECK(NativeTarget(records, kClass, kOurDetour, true, modules) == kPresent1Impl);
+    // An earlier copy of the class vtable, from before the hook, names the implementation: that is the target, also
+    // when the object now shows the hook (its vtable copied from ours, or the class vtable patched in place).
+    static RecordTable ordered;
+    ordered.Append(ClassImage(kClass, kPresentImpl, kPresent1Impl), 0x9200, 0x9300);
+    ordered.Append(ClassImage(kClass, kHook, kPresent1Impl), 0x9400, 0x9500);
+    CHECK(NativeTarget(ordered, kClass, kHook, false, modules) == kPresentImpl);
+    CHECK(NativeTarget(ordered, kClass, 0, false, modules) == kPresentImpl);
+    CHECK(NativeTarget(ordered, kClass, kOurDetour, true, modules) == kPresent1Impl);
+    // Records of another class vtable never supply a target.
+    static RecordTable other;
+    other.Append(ClassImage(kOtherClass, 0x1300, 0x1400), 0x9200, 0x9300);
+    CHECK(NativeTarget(other, kClass, kHook, false, modules) == 0);
+    CHECK(NativeTarget(other, kOtherClass, kHook, false, modules) == 0x1300);
+}
+
+// A detour calls the class vtable's slot as it is at the call: another module's in-place hook while it is there, the
+// implementation's function once that module took it out again (REFramework's first phase). The slot read at copy
+// time only when the read failed (0) or the slot names one of our detours (calling it would enter us again).
+void TestForward() {
+    constexpr uintptr_t kClass = 0x1800, kPresentImpl = 0x1100, kPresent1Impl = 0x1200, kHook = 0x5100;
+    constexpr uintptr_t kDetour8 = 0x9200, kDetour22 = 0x9300, kDetour8b = 0x9400, kDetour22b = 0x9500;
+    static RecordTable records;
+    const size_t hooked = records.Append(ClassImage(kClass, kHook, kPresent1Impl), kDetour8, kDetour22); // copied over the hook
+    const size_t clean = records.Append(ClassImage(kClass + 0x40, kPresentImpl, kPresent1Impl), kDetour8b, kDetour22b);
+    CHECK(Forward(records, hooked, kHook, false) == kHook);               // the hook still in the slot: called
+    CHECK(Forward(records, hooked, kPresentImpl, false) == kPresentImpl); // taken out: no longer called
+    CHECK(Forward(records, clean, kHook, false) == kHook);                // written after our copy: called, as without us
+    CHECK(Forward(records, hooked, kPresent1Impl, true) == kPresent1Impl);
+    CHECK(Forward(records, hooked, 0, false) == kHook && Forward(records, hooked, 0, true) == kPresent1Impl);
+    CHECK(Forward(records, clean, kDetour8, false) == kPresentImpl && Forward(records, hooked, kDetour8b, false) == kHook);
+    CHECK(Forward(records, clean, kDetour22b, true) == kPresent1Impl);
+    CHECK(Forward(records, 7, kPresentImpl, false) == 0);
+}
 } // namespace
 
 int main() {
@@ -456,6 +537,8 @@ int main() {
     TestHistory();
     TestFallbackCounter();
     TestTeardownRules();
+    TestNativeTarget();
+    TestForward();
     std::puts("test_vtable_copy: all tests passed");
     return 0;
 }

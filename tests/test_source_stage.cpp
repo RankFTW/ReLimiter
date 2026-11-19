@@ -2438,7 +2438,9 @@ void TestUnifiedQueueLawPlumbed()
 //  - Late arrivals (40 ms after the previous release, after every planned start): never paced:
 //    B is the need (cycle - starve = 12.7 ms), the GPU term never binds.
 //  - Early arrivals (the starts wait): from the 13th plan the law's I_gpu binds and those frames
-//    are paced: with 15 of the newest 16 records starved by 1 ms, B = 13.7 ms + 15 / 16 ms.
+//    are paced: of the newest 16 records 15 starved by 1 ms; the first 8 of them were a minority of
+//    the window they entered and are kept, the rest found the 1 ms the window's common level (the
+//    interval's own excess) and keep nothing: B = 13.7 ms + 8 / 16 ms.
 void TestUnifiedQueueLawPacedFrames()
 {
     std::printf("Test: the queue law counts the starvation of GPU-paced frames only\n");
@@ -2482,11 +2484,11 @@ void TestUnifiedQueueLawPacedFrames()
 
     const SourceStageFrame early = run(false, 1'000.0, 16);
     CHECK(early.unified.status.ql_valid && early.unified.status.bindable);
-    CHECK(Near(early.unified.status.ql_base_us, 13'700.0 + 15.0 * 1'000.0 / 16.0, 1e-6));
+    CHECK(Near(early.unified.status.ql_base_us, 13'700.0 + 8.0 * 1'000.0 / 16.0, 1e-6));
     CHECK((early.unified.flags & kUpBoundGpu) != 0 && (early.unified.flags & kUpQueueLawPaced) != 0);
 
-    // Only a wait that RAN to its target paces a frame. Frame 25 of a GPU-bound stream (records from
-    // frame 16 on starved by 1 ms) is reserved by the Sleep hook (GPU term binding, the marker
+    // Only a wait that RAN to its target paces a frame. Frame 25 of a GPU-bound stream (every other
+    // record from frame 17 on starved by 1 ms) is reserved by the Sleep hook (GPU term binding, the marker
     // before the target) and then:
     //  - the reservation reports Failed and the marker arrives AFTER the target: it waits for
     //    nothing (the release is already past the target) and no wait delayed the start;
@@ -2494,7 +2496,8 @@ void TestUnifiedQueueLawPacedFrames()
     //    release_now stayed false;
     // neither is paced: the starvation of its record leaves the base (1 ms / 16 below the stream
     // that planned frame 25 early). With the wait evidence removed (release past the target is
-    // enough) both would be paced and the base would not move.
+    // enough) both would be paced and the base would not move. The starved records are a minority of
+    // the window, so all of their starvation is kept, frame 25's included.
     enum class Reservation { None, FailedThenLateMarker, LateOutcome };
     const auto reserved_run = [&](Reservation mode) {
         ResetStage();
@@ -2534,14 +2537,162 @@ void TestUnifiedQueueLawPacedFrames()
                 CHECK(frame.unified.kind == UnifiedResolutionKind::Consumed && clock.wait_calls == waits);
             previous_release = frame.release_qpc;
             if (k <= 25)
-                g_stage.OnQueueRecord(record(frame, k >= 16 ? 1'000.0 : 0.0));
+                g_stage.OnQueueRecord(record(frame, k >= 16 && k % 2 == 1 ? 1'000.0 : 0.0));
         }
         return frame.unified.status.ql_base_us;
     };
     const double planned_early = reserved_run(Reservation::None);
-    CHECK(Near(planned_early, 13'700.0 + 10.0 * 1'000.0 / 16.0, 1e-6)); // frames 16..25 starved and paced
+    // the newest four F-terms 14.7, 13.7, 14.7, 13.7 ms; frames 17, 19, 21, 23 and 25 starved and paced
+    CHECK(Near(planned_early, 14'200.0 + 5.0 * 1'000.0 / 16.0, 1e-6));
     CHECK(Near(reserved_run(Reservation::FailedThenLateMarker), planned_early - 1'000.0 / 16.0, 1e-6));
     CHECK(Near(reserved_run(Reservation::LateOutcome), planned_early - 1'000.0 / 16.0, 1e-6));
+    g_stage.SetUnifiedEnabled(false, 1);
+}
+
+// The law is refused only on fresh evidence that the watched queue does not carry the frame (UnifiedCarryVotes): each
+// record is judged once against its frame's readiness, whichever arrives second, as carried (the largest possible tail
+// under half the smallest possible cycle), not carried (the smallest possible tail at least half the largest possible
+// cycle) or undecided (abstains); refused while at least half of at least 8 fresh decided votes say not carried, for
+// every queue role; the votes expire after 32 planned frames (Resident Evil Requiem, N.180: the frame was ready 18.4 ms
+// after the adopted queue's last completion, cycle 20.4 ms, and that queue's idle kept I_gpu under the GPU's period).
+// Every record: cycle 14.7 ms, free margin 1.5 ms; VRR terms J = 12.7 ms, so the law in use plans I_gpu = 14.7 ms +
+// 1.5 / 32 ms. Readiness 9 ms after the release.
+void TestUnifiedQueueLawRefusedWhenTheQueueDoesNotCarryTheFrame()
+{
+    std::printf("Test: the queue law is refused on fresh evidence that its queue does not carry the frame\n");
+    std::atomic<uint64_t> mailbox{0};
+    struct Case {
+        uint8_t role = kUnifiedQueueRoleFgRenderQueue;
+        double tail_us = 1'000.0;  // readiness minus the record's last completion (upper end)
+        double alternate_us = 0.0; // > 0: every other frame has this tail instead
+        double width_us = 0.0;     // the last completion's interval [hi - width, hi]; the cycle's is as wide each way
+        bool ready_first = true;   // the readiness is drained before the record arrives
+        bool readiness = true;     // false: no readiness ever (only the records)
+        int frames = 24;
+    };
+    struct Outcome {
+        bool in_use = false;
+        uint32_t flags = 0;
+        double interval_us = 0.0;
+        UnifiedQueueLawSummary summary{};
+    };
+    const auto plan = [&](uint64_t frame_id, ScriptedClock* clock) {
+        SourceStageRequest request = UnifiedMarkerRequest(Key(frame_id), &mailbox);
+        request.unified.terms = UnifiedIntervalTerms{};
+        request.unified.terms.vrr_us = 12'700.0;
+        return g_stage.RunPlannedFrame(request, clock);
+    };
+    const auto feed = [&](const SourceStageFrame& frame, const Case& c, double tail_us) {
+        const int64_t ready = frame.release_qpc + Ticks(9'000.0);
+        PacingGpuQueueRecord r{};
+        r.valid = PacingGpuQueueRecord::kCycle | PacingGpuQueueRecord::kEmpty | PacingGpuQueueRecord::kBoundaryIdle |
+            PacingGpuQueueRecord::kHoldBlock | PacingGpuQueueRecord::kWaitIdle | PacingGpuQueueRecord::kMinMarginFree |
+            PacingGpuQueueRecord::kLastDone;
+        r.cycle_us = 14'700.0;
+        r.cycle_lo_us = 14'700.0 - c.width_us;
+        r.cycle_hi_us = 14'700.0 + c.width_us;
+        r.min_margin_free_us = 1'500.0;
+        r.last_done_qpc = ready - Ticks(tail_us);
+        r.last_done_lo_qpc = r.last_done_qpc - Ticks(c.width_us);
+        r.queue_role = c.role;
+        r.key = PacingPlanKey_Frame(frame.plan.key);
+        const auto readiness = [&] {
+            if (!c.readiness) return;
+            CHECK(FramePlan_PushStageEvent(Event(frame, PacingStageEventKind::GpuReady, ready)));
+            g_stage.DrainStageEvents();
+        };
+        if (c.ready_first) readiness();
+        g_stage.OnQueueRecord(r);
+        if (!c.ready_first) readiness();
+    };
+    const auto run = [&](const Case& c, int expire_frames = 0) {
+        ResetStage();
+        g_stage.SetUnifiedEnabled(true, 1);
+        g_stage.SetUnifiedOptions(true, 2'000.0, 0.0, true, 2, 4'000, 16);
+        g_stage.Unified().ClearQueueLawSummary();
+        ScriptedClock clock;
+        int64_t previous_release = kStart - Ticks(14'700.0);
+        uint64_t id = 13'000;
+        for (int k = 0; k < c.frames + expire_frames; ++k) {
+            clock.now = previous_release + Ticks(14'700.0);
+            const SourceStageFrame frame = plan(id++, &clock);
+            CHECK(frame.planned && frame.unified.valid);
+            previous_release = frame.release_qpc;
+            Case fed = c;
+            if (k >= c.frames) fed.readiness = false; // the readiness stops; the records go on
+            feed(frame, fed, c.alternate_us > 0.0 && k % 2 == 1 ? c.alternate_us : c.tail_us);
+        }
+        clock.now = previous_release + Ticks(14'700.0);
+        const SourceStageFrame last = plan(id, &clock);
+        Outcome out;
+        out.in_use = g_stage.Unified().QueueLawInUse();
+        out.flags = last.unified.flags;
+        out.interval_us = last.unified.status.gpu_interval_us;
+        out.summary = g_stage.Unified().QueueLawSummary();
+        return out;
+    };
+    const double law_us = 14'700.0 + 1'500.0 / 32.0;
+
+    // Carried (1 ms tail of a 14.7 ms cycle), either arrival order: the law decides, the report rule keeps the credit.
+    for (const bool ready_first : {true, false}) {
+        Case c;
+        c.ready_first = ready_first;
+        const Outcome o = run(c);
+        CHECK(o.in_use && (o.flags & kUpQueueLaw) != 0 && (o.flags & kUpQueueLawNoHoldCredit) != 0);
+        CHECK(Near(o.interval_us, law_us, 1e-6));
+        CHECK(o.summary.frames_not_carried == 0 && o.summary.carry_carried == 24 && o.summary.carry_not_carried == 0);
+    }
+
+    // Not carried: ready 12 ms after the queue's last completion (Requiem's shape). The window is in use, the
+    // report-based rule decides, and the planned frames it decided are counted. The same on the FG input's source queue
+    // (role 2): one rule for every role.
+    for (const uint8_t role : {kUnifiedQueueRoleFgRenderQueue, uint8_t{2}}) {
+        Case c;
+        c.role = role;
+        c.tail_us = 12'000.0;
+        const Outcome o = run(c);
+        CHECK(!o.in_use && (o.flags & kUpQueueLaw) == 0 && (o.flags & kUpQueueLawNoHoldCredit) == 0);
+        CHECK(!Near(o.interval_us, law_us, 1e-6));
+        CHECK(o.summary.frames_not_carried > 0 && o.summary.carry_not_carried == 24);
+    }
+
+    // A tie refuses: every other frame is 12 ms late (8 of the newest 16 decided votes).
+    {
+        Case c;
+        c.alternate_us = 12'000.0;
+        CHECK(!run(c).in_use);
+    }
+
+    // Wide bounds abstain: a 6 ms tail whose completion and cycle are 3 ms wide each way is neither provably under half
+    // of the 11.7 ms smallest cycle (up to 9 ms) nor provably over half of the 17.7 ms largest one (from 6 ms). Without
+    // decided votes the law decides as before. Exact bounds: 6 ms against 7.35 ms, carried.
+    {
+        Case c;
+        c.tail_us = 6'000.0;
+        c.width_us = 3'000.0;
+        const Outcome wide = run(c);
+        CHECK(wide.in_use && wide.summary.carry_undecided == 24 && wide.summary.carry_carried == 0);
+        c.width_us = 0.0;
+        const Outcome exact = run(c);
+        CHECK(exact.in_use && exact.summary.carry_carried == 24);
+    }
+
+    // No readiness: nothing is judged, and without evidence the law decides as before.
+    {
+        Case c;
+        c.tail_us = 12'000.0;
+        c.readiness = false;
+        CHECK(run(c).in_use);
+    }
+
+    // The readiness stops after the refusal: the votes expire 32 planned frames after the newest one and the law decides
+    // again on its records.
+    {
+        Case c;
+        c.tail_us = 12'000.0;
+        CHECK(!run(c, 8).in_use);
+        CHECK(run(c, 40).in_use);
+    }
     g_stage.SetUnifiedEnabled(false, 1);
 }
 
@@ -3742,6 +3893,7 @@ int main(int argc, char** argv)
     TestUnifiedHoldSharePlumbed();
     TestUnifiedQueueLawPlumbed();
     TestUnifiedQueueLawPacedFrames();
+    TestUnifiedQueueLawRefusedWhenTheQueueDoesNotCarryTheFrame();
     TestResetClearsPlans();
     TestPresentRouteCapVrr();
     TestPresentRouteCapZeroVrrTerm();

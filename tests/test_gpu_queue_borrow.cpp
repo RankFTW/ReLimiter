@@ -854,6 +854,33 @@ void TestCoreCountsBorrowedSubmissions() {
     CHECK(recs[1].present_sequence == 2 && recs[1].borrowed_submits == 0 && recs[1].submits == 2);
 }
 
+// A dependency Signal closes the render queue frame. Its identity lives on the FG input, not a Present;
+// the same value binds them whether the CPU enqueued the Wait before or after the Signal.
+void TestBorrowedFrameWithFgInputTag() {
+    for (bool tag_first : {false, true}) {
+        auto c = std::make_unique<GpuQueueProbeCore>();
+        c->Reset(1000000);
+        Boundary(c.get(), 0, 0);
+        Submit(c.get(), 1, 100, 1, true);
+        c->Drain();
+        Stamp(c.get(), 1, 200, 0.0);
+        GpuQueueEvent signal, input;
+        signal.kind = GpuQueueEvent::Kind::Boundary;
+        input.kind = GpuQueueEvent::Kind::BoundaryTag;
+        signal.boundary_id = input.boundary_id = 700;
+        input.frame_key = PacingFrameKey{PacingIdentityDomain::NvApiFrame, 7, 41};
+        CHECK(c->Push(tag_first ? input : signal));
+        c->Drain();
+        PacingGpuQueueRecord early;
+        CHECK(!c->PopFrame(&early));
+        CHECK(c->Push(tag_first ? signal : input));
+        c->Drain();
+        const auto records = Pop(c.get());
+        CHECK(records.size() == 1 && records[0].key == input.frame_key &&
+              records[0].present_sequence == 0 && records[0].borrowed_submits == 1);
+    }
+}
+
 void TestCoreUntrustedMarker() {
     auto c = std::make_unique<GpuQueueProbeCore>();
     c->Reset(1000000);
@@ -980,6 +1007,7 @@ int main() {
     TestReferenceTakenOnceReleasedOnce();
     TestReferenceEveryEndPath();
     TestCoreCountsBorrowedSubmissions();
+    TestBorrowedFrameWithFgInputTag();
     TestCoreUntrustedMarker();
     TestReleaseWhileBinderInsideRetain();
     TestBoundaryOverlapsInFlightMarker();

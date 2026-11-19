@@ -42,13 +42,14 @@
 // marked `overlap`; the frame is invalidated instead of mis-attributed. All probe fence values
 // are claimed and signalled under one lock, so the value order is the Signal order.
 //
-// Borrowing (role 3, gpu_queue_borrow.h): with the previous frame whole, an Execute leave claims its value k under that
+// Borrowing (dependency render queues, gpu_queue_borrow.h): with the previous frame whole, an Execute leave claims its value k under that
 // lock WITHOUT a Signal and publishes it `pending` (the word, plus a slot for the worker). Exactly one of two things
 // clears the word: the game's own Signal on the same thread (BindMarker, before it is forwarded: its (fence, value) is
 // bound to k, one reference taken on that fence at the first bind) or an interrupting call (an Execute enter, a Wait,
-// the role-3 boundary, a claim of another value) which settles it with the probe's own Signal of k first (RepairPending,
+// the dependency boundary, a claim of another value) which settles it with the probe's own Signal of k first (RepairPending,
 // under the Signal lock, the frame invalid). The worker stamps in k order from whichever fence marks each k.
 namespace {
+namespace dq = gpu_queue_dependency;
 constexpr size_t kExecuteSlot = 10, kSignalSlot = 14, kWaitSlot = 15;
 constexpr int64_t kSignalLockWaitUs = 50;   // the longest a probe Signal waits for the Signal lock
 constexpr size_t kCalibrationSamples = 256; // trailing window of wake-latency samples: the awaited interval's bound is its MAX
@@ -95,10 +96,8 @@ struct Session {
     // never decreasing otherwise.
     alignas(64) std::atomic<uint32_t> phase{kIdle};
     std::atomic<uint32_t> session_generation{0}; // incremented by each adoption; publications carry it
-    // Source key: the adopted queue's role (gpu_queue_dependency.h Role: 1 presenting, 2 frame generation source,
-    // 3 render queue by dependency) and, for role 3, the dependency fence whose Signal on the adopted queue is a
-    // frame boundary. Written by Adopt before the thread starts.
-    std::atomic<uint32_t> role{1};
+    // Roles 3 and 4 delimit frames at the adopted queue's Signal of dep_fence.
+    std::atomic<dq::Role> role{dq::Role::Presenting};
     // The detours' gate: the queue while the producer path is allowed, else null.
     std::atomic<ID3D12CommandQueue*> active{nullptr};
     std::atomic<uint64_t> dep_fence{0};
@@ -114,6 +113,7 @@ struct Session {
     HANDLE event = nullptr, calibration_event = nullptr, stop_event = nullptr; // process lifetime
     HANDLE game_event = nullptr; // process lifetime; registered on the game's fence when its marker is borrowed
     const char* adopt_site = "";
+    std::atomic<uint64_t> dependency_root{0}; // identity only; a destroyed root ends its render queue session
     // Ending a session.
     std::atomic<const char*> stop_reason{nullptr};
     std::atomic<uint32_t> failure{0};      // 0 none, 1 being written, 2 published
@@ -152,10 +152,8 @@ struct Session {
     alignas(64) std::atomic<uint64_t> boundary_seq{0};
     std::atomic<bool> boundary_publishing{false};
     std::atomic<bool> logical_open{false};       // a keyed boundary was published and the gate has not seen it yet
-    std::atomic<uint32_t> last_fg_producer{0};
     std::atomic<uint64_t> logical_mark{0};       // submissions_total at the open keyed boundary
     std::atomic<int64_t> fg_boundary_qpc{0};     // the last frame generation input boundary
-    std::atomic<uint64_t> last_fg_frame{0};
     std::atomic<uint64_t> frames{0};             // per frame (boundaries)
     std::atomic<uint64_t> dep_boundaries{0}, dep_tags{0}, dep_tags_late{0};
     // ── S8 ── The worker's. Calibration of the blocked thread's wake latency: the worker arms a value on the
@@ -194,7 +192,7 @@ GQ_GROUP_STARTS(Session, cal_signalled);      GQ_GROUP_FITS(Session, cal_signall
 Session g;
 GpuQueueProbeCore g_core;
 
-// ── Borrowing the game's marker (role 3, gpu_queue_borrow.h) ──
+// ── Borrowing the game's marker (dependency render queues, gpu_queue_borrow.h) ──
 // A submission whose marker the game provides is `pending` from its Execute's return until the game's Signal binds
 // it or the probe settles it with its own Signal. The slots carry what the worker needs per value k.
 namespace gq = gpu_queue_borrow;
@@ -275,7 +273,6 @@ Borrow bw;
 // the probe's worker at the end of every step while a session runs (DependencyDrainOnWorker), otherwise the Present
 // thread right after its boundary (before an adoption, with no session: the rule must work before any exists). With the
 // key (or the probe) off none of this runs and the lock is never taken.
-namespace dq = gpu_queue_dependency;
 // LAYOUT BY WRITER (see Session). `tables` keeps its own lines (gpu_queue_dependency.h Tables: lock, read-mostly epoch and
 // decision, rows, logs, counters, each group on a line of its own). Groups of the rest:
 //   D1 read by every hook, written at most once per frame: ever_recorded (once ever), epoch, scope_counter, presenting_mirror,
@@ -289,10 +286,12 @@ struct Dependency {
     std::atomic<uint32_t> present_thread{0};   // the thread of the newest Present scope
     std::atomic<uint64_t> scope_counter{0};    // Present scope ids
     std::atomic<uint64_t> presenting_mirror{0};
-    alignas(64) std::atomic<bool> boundary_busy{false};    // keeps a second Present thread out of DependencyBoundary (the feed's producer is one)
+    alignas(64) std::atomic<bool> boundary_busy{false};    // the feed's producer is one thread at a time; a call held off misses the window (RootBoundary)
     std::atomic<bool> reset_pending{false};    // the next boundary restarts the window
     // The boundary's, under `boundary_busy`.
     uint64_t last_generation = 0, last_queue = 0;
+    uint8_t last_mode = 0;
+    uint32_t fg_producer = 0;
     // (the published decision lives in `tables`: Tables::PublishDecision / PublishedQueue, valid for its epoch)
     alignas(64) dq::FrameFeed feed;            // the boundary queue, the consumer's copy of the tables, the evaluator
     // The evaluating thread's, under the feed's evaluator guard.
@@ -300,8 +299,10 @@ struct Dependency {
     bool logged_adoptable = false;
     dq::Role logged_role = dq::Role::None;
     dq::Reason logged_reason = dq::Reason::PresentingNoDependency;
-    uint64_t logged_queue = 0;
-    bool fg_diag_logged = false;
+    uint32_t logged_hops = 0;
+    uint64_t logged_queue = 0, logged_fence = 0;
+    std::atomic<uint64_t> loss_windows{0}, unjoinable_windows{0};
+    std::atomic<uint64_t> missed_boundaries{0}; // root boundaries held off by another thread's feed (each invalidated the window)
     dq::RetainGate retain_gate;                // queue references taken atomically with the lifetime check
     std::atomic<uint64_t> windows_kept{0};     // windows that did not qualify while a queue was adopted (adoption kept)
     std::atomic<uint64_t> retain_timeouts{0};  // queue destructions that gave up waiting for a retainer inside its window
@@ -311,7 +312,7 @@ struct Dependency {
 static_assert(alignof(Dependency) == 64, "Dependency is laid out in cache lines");
 GQ_GROUP_STARTS(Dependency, tables);
 GQ_GROUP_STARTS(Dependency, ever_recorded);  GQ_GROUP_FITS(Dependency, ever_recorded, presenting_mirror, 1);
-GQ_GROUP_STARTS(Dependency, boundary_busy);  GQ_GROUP_FITS(Dependency, boundary_busy, last_queue, 1);
+GQ_GROUP_STARTS(Dependency, boundary_busy);  GQ_GROUP_FITS(Dependency, boundary_busy, fg_producer, 1);
 GQ_GROUP_STARTS(Dependency, feed);
 GQ_GROUP_STARTS(Dependency, logged);
 Dependency dep;
@@ -333,6 +334,8 @@ struct ScopeState {
 };
 thread_local ScopeState t_scope;
 thread_local PendingTag t_pre_tag; // a dependency Wait of the presenting queue enqueued before this thread's next scope
+thread_local dq::FgWaitTag t_fg_tag; // root Wait on the adopted fence, for the FG input on this very thread
+thread_local dq::FgInputRepeat t_fg_repeat; // the FG input this thread admitted last (RootBoundary)
 
 int64_t Qpc() noexcept {
     LARGE_INTEGER q{};
@@ -670,7 +673,7 @@ void RepairPending(uint64_t only, unsigned reason) noexcept {
 
 void BorrowForeignSignal(uint64_t fence_id) noexcept; // defined below (another queue's Signal of the game fence ends borrowing)
 
-// The game's own outermost Signal on the adopted queue (role 3), right before it is forwarded.
+// The game's own outermost Signal on the adopted dependency render queue, right before it is forwarded.
 void BindMarker(void* queue, void* fence, uint64_t value, int64_t now) noexcept {
     const uint64_t word = bw.pending.Peek();
     if (word == 0) return;
@@ -796,7 +799,7 @@ void BorrowForeignSignal(uint64_t fence_id) noexcept {
     g.callbacks_inflight.fetch_sub(1);
 }
 
-// The role-3 boundary (the adopted queue's Signal of the dependency fence), before its event is pushed: a pending
+// The dependency boundary (the adopted queue's Signal of the dependency fence), before its event is pushed: a pending
 // marker is settled, the frame's pattern is judged and decides the NEXT frame.
 void BorrowFrameEnd() noexcept {
     RepairPending(0, kRepairBoundary);
@@ -852,9 +855,9 @@ void BorrowReset() noexcept {
     for (BorrowSlot& slot : bw.slots) slot.claim_epoch.store(0, std::memory_order_relaxed);
 }
 
-// The borrowing counters of the session (role 3 only), logged when it ends.
+// The borrowing counters of the session (dependency render queues only), logged when it ends.
 void LogBorrow(const char* reason) noexcept {
-    if (g.role.load(std::memory_order_relaxed) != 3) return;
+    if (!dq::IsRenderQueueByDependency(g.role.load(std::memory_order_relaxed))) return;
     const auto u = [](uint64_t value) { return static_cast<unsigned long long>(value); };
     const auto r = [](unsigned i) { return static_cast<unsigned long long>(bw.repairs[i].load(std::memory_order_relaxed)); };
     unsigned long long repairs = 0;
@@ -1026,28 +1029,32 @@ void FormatCandidates(const dq::Decision& d, char* out, size_t size) noexcept {
 }
 
 // One line per transition of the rule's answer, not per window.
-void LogDecision(const dq::Decision& d) noexcept {
+void LogDecision(const dq::Decision& d, bool kept) noexcept {
     if (dep.logged && dep.logged_adoptable == d.adoptable && dep.logged_role == d.role && dep.logged_queue == d.queue &&
-        dep.logged_reason == d.reason) return;
+        dep.logged_reason == d.reason && dep.logged_fence == d.fence && dep.logged_hops == d.hops) return;
     dep.logged = true;
     dep.logged_adoptable = d.adoptable;
     dep.logged_role = d.role;
     dep.logged_queue = d.queue;
+    dep.logged_fence = d.fence;
+    dep.logged_hops = d.hops;
     dep.logged_reason = d.reason;
-    char candidates[320];
+    char candidates[dq::kMaxNodes * 64];
     FormatCandidates(d, candidates, sizeof(candidates));
     LOG_INFO("GPU queue probe: dependency rule over %u frames: %s queue %p, role %s, hops %u, %s: %s; command lists per "
-             "frame of each candidate: %s; frames with an ambiguous join %u (the presenting queue's own dependency), %u with "
+             "frame of each candidate: %s; frames with an ambiguous join %u (the root queue's own dependency), %u with "
              "several fence values at a deeper queue (not an ambiguity), %u with a missing join, %u with the dependency "
-             "fence not Signalled exactly once; %llu records dropped or lost in the window",
-             d.frames, d.adoptable ? "adoptable" : "NOT adoptable (no queue is watched, the law runs on its report)",
+             "fence not Signalled exactly once; %llu records dropped or lost in the window; windows lost %llu, unjoinable %llu",
+             d.frames, d.adoptable ? "adoptable" : kept ? "NOT adoptable (previous adoption kept)" :
+                 "NOT adoptable (no queue is watched, the law runs on its report)",
              reinterpret_cast<void*>(static_cast<uintptr_t>(d.queue)), dq::RoleText(d.role), d.hops,
              d.adoptable ? "qualified" : "not qualified", dq::ReasonText(d.reason), candidates, d.ambiguous_frames,
              d.multi_edge_frames, d.missing_join_frames, d.multi_signal_frames,
-             static_cast<unsigned long long>(d.lost_records));
+             static_cast<unsigned long long>(d.lost_records), static_cast<unsigned long long>(dep.loss_windows.load()),
+             static_cast<unsigned long long>(dep.unjoinable_windows.load()));
 }
 
-// A frame boundary's late identity (role 3): the presenting queue's Wait of the dependency fence value. Admitted
+// A frame boundary's late identity: the root queue's Wait of the dependency fence value. Admitted
 // into the session like every boundary callback.
 void PushTag(uint32_t session, uint64_t fence, uint64_t value, uint64_t generation, uint64_t sequence,
     const PacingFrameKey& key, bool late) noexcept {
@@ -1055,8 +1062,8 @@ void PushTag(uint32_t session, uint64_t fence, uint64_t value, uint64_t generati
     // Revalidated after admission against the session the caller read before its own checks: the session, its role
     // and its dependency fence must still be the ones the Wait was qualified for.
     if (g.phase.load(std::memory_order_acquire) == kRunning &&
-        g.session_generation.load(std::memory_order_acquire) == session && g.role.load(std::memory_order_relaxed) == 3 &&
-        fence == g.dep_fence.load(std::memory_order_relaxed)) {
+        g.session_generation.load(std::memory_order_acquire) == session &&
+        dq::IsRenderQueueByDependency(g.role.load(std::memory_order_relaxed)) && fence == g.dep_fence.load(std::memory_order_relaxed)) {
         GpuQueueEvent event;
         event.kind = GpuQueueEvent::Kind::BoundaryTag;
         event.boundary_id = value;
@@ -1070,14 +1077,15 @@ void PushTag(uint32_t session, uint64_t fence, uint64_t value, uint64_t generati
     g.callbacks_inflight.fetch_sub(1);
 }
 
-// A frame boundary on the adopted render queue (role 3): its Signal of the dependency fence, no identity yet
-// (the tag comes from the presenting queue's Wait of the same value). `session` was read before the caller's
+// A frame boundary on the adopted dependency render queue: its Signal of the dependency fence, no identity yet
+// (the tag comes from the root queue's Wait of the same value). `session` was read before the caller's
 // qualification (role, fence, queue); after admission the session, role, fence and queue are checked again, so a
 // call that paused between its checks and its admission never publishes into a replacement session.
 void PushDependencyBoundary(uint32_t session, void* queue, uint64_t fence, uint64_t value) noexcept {
     g.callbacks_inflight.fetch_add(1);
     if (g.phase.load(std::memory_order_acquire) == kRunning &&
-        g.session_generation.load(std::memory_order_acquire) == session && g.role.load(std::memory_order_relaxed) == 3 &&
+        g.session_generation.load(std::memory_order_acquire) == session &&
+        dq::IsRenderQueueByDependency(g.role.load(std::memory_order_relaxed)) &&
         fence == g.dep_fence.load(std::memory_order_relaxed) && queue == g.active.load(std::memory_order_acquire)) {
         BorrowFrameEnd();
         PushBoundary(0, 0, true, PacingFrameKey{}, value);
@@ -1090,57 +1098,53 @@ void PushDependencyBoundary(uint32_t session, void* queue, uint64_t fence, uint6
 // Present thread).
 void DependencyOnDecision(int mode, const dq::Decision& d) noexcept {
     const uint64_t adopted = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(g.identity.load(std::memory_order_acquire)));
-    const bool running = g.phase.load(std::memory_order_acquire) == kRunning;
-    if (mode == 2) {
-        // Frame generation: the adopted source queue stays; the rule's answer is logged once when it differs.
-        if (!dep.fg_diag_logged && running && g.role.load(std::memory_order_relaxed) == 2 && adopted != 0 &&
-            d.queue != adopted) {
-            dep.fg_diag_logged = true;
-            char candidates[320];
-            FormatCandidates(d, candidates, sizeof(candidates));
-            LOG_INFO("GPU queue probe: with frame generation the source queue %p is adopted; the dependency rule "
-                     "(diagnostic, no decision) would pick queue %p (role %s, %s); command lists per frame of each "
-                     "candidate: %s", reinterpret_cast<void*>(static_cast<uintptr_t>(adopted)),
-                     reinterpret_cast<void*>(static_cast<uintptr_t>(d.queue)), dq::RoleText(d.role),
-                     dq::ReasonText(d.reason), candidates);
-        }
-        return;
+    const uint32_t phase = g.phase.load(std::memory_order_acquire);
+    const bool running = phase == kRunning || (mode == 2 && phase == kStarting && adopted != 0);
+    if (!d.adoptable) {
+        auto& count = d.reason == dq::Reason::NotQualifiedLoss ? dep.loss_windows : dep.unjoinable_windows;
+        count.fetch_add(1, std::memory_order_relaxed);
     }
     const dq::AdoptionAction action = dq::ApplyDecision(d, running, adopted,
-        static_cast<dq::Role>(g.role.load(std::memory_order_relaxed)), g.dep_fence.load(std::memory_order_relaxed));
+        g.role.load(std::memory_order_relaxed), g.dep_fence.load(std::memory_order_relaxed));
     if (action == dq::AdoptionAction::KeepUnqualified) {
-        // A window that does not qualify carries no evidence and changes nothing: the adopted queue stays watched, its
-        // session, role and records continue. Only a qualified window with another result (below), the adopted queue's
-        // destruction, or the presenting queue or swapchain going away ends the adoption. Counted; logged once per session.
+        // A loss window, or an unqualified non-FG window, keeps the session and its records.
         dep.windows_kept.fetch_add(1, std::memory_order_relaxed);
+        if (mode == 2) { LogDecision(d, true); return; }
         const uint32_t session = g.session_generation.load(std::memory_order_acquire);
         if (dep.unqualified_logged_session != session) {
             dep.unqualified_logged_session = session;
-            char candidates[320];
+            char candidates[dq::kMaxNodes * 64];
             FormatCandidates(d, candidates, sizeof(candidates));
             LOG_INFO("GPU queue probe: a dependency window over %u frames did not qualify (%s); the adopted queue %p "
                      "(role %s) stays watched and its records continue; later windows that do not qualify are only "
                      "counted; command lists per frame of each candidate: %s", d.frames, dq::ReasonText(d.reason),
                      reinterpret_cast<void*>(static_cast<uintptr_t>(adopted)),
-                     dq::RoleText(static_cast<dq::Role>(g.role.load(std::memory_order_relaxed))), candidates);
+                     dq::RoleText(g.role.load(std::memory_order_relaxed)), candidates);
         }
         return;
     }
-    LogDecision(d);
+    LogDecision(d, false);
     // (the decision was published by the feed, under the tables' lock, for the epoch it was computed for)
-    if (action == dq::AdoptionAction::Change) RequestStop("the dependency rule selects another queue");
+    if (action == dq::AdoptionAction::Change) {
+        if (mode == 2) GpuQueueLawFeed_RetireSession(g.session_generation.load(std::memory_order_acquire));
+        RequestStop(d.adoptable ? "the dependency rule selects another queue" : "the FG dependency winner cannot be joined");
+    }
 }
 
-// The feed's callbacks on the evaluating thread. `adopt` (set only by a Present thread evaluating with mode 1): the
+// The feed's callbacks on the evaluating thread. `adopt` (set only by a root boundary thread): the
 // decision, role, fence and published queue as ONE copy taken at the end of the step, still under the evaluator guard, for the
 // adoption that follows (only while the session is idle); left invalid when that thread did not take the guard.
 struct DependencySink final : dq::FeedSink {
     AdoptionTicket* adopt = nullptr;
+    uint64_t root_queue = 0;
+    bool fg_input = false;
     void OnReset() noexcept override { dep.logged = false; }
     void OnDecision(uint8_t mode, const dq::Decision& decision) noexcept override { DependencyOnDecision(mode, decision); }
     void UnderGuard() noexcept override {
         if (!adopt || g.phase.load(std::memory_order_acquire) != kIdle) return;
-        dq::MakeAdoptionSnapshot(dep.feed.decision(), dep.tables.PublishedQueue(), &adopt->snapshot);
+        const auto& decision = dep.feed.decision();
+        if (!decision.candidate_count || decision.candidates[0].queue != root_queue) return;
+        dq::MakeAdoptionSnapshot(decision, dep.tables.PublishedQueue(), &adopt->snapshot, fg_input);
         if (adopt->snapshot.valid) {
             // The owned reference, atomically with the epoch check: a queue destroyed since the decision's epoch is
             // never touched and the snapshot is dropped.
@@ -1153,53 +1157,62 @@ struct DependencySink final : dq::FeedSink {
     }
 };
 
-// The Present thread's half, once per real frame (mode 1: the rule; mode 2: frame generation, diagnostic): the lifetime
+// The root boundary's half, once per real frame (mode 1: presenting queue; 2: FG input): the lifetime
 // checks, the scope's identity (a tag found before it is pushed now), and the boundary into the feed (a ring push, one
 // bounded snapshot of the command list counters, a queue push). The frame evaluated later is the one before this Present
 // (a Signal that comes after its Wait is in the table by then). Nothing here pulls, resolves or evaluates.
-void DependencyBoundary(ID3D12CommandQueue* presenting, uint64_t generation, uint64_t sequence,
-    const PacingFrameKey& key, int mode) noexcept {
-    if (dep.boundary_busy.exchange(true, std::memory_order_acquire)) return;
-    const uint64_t queue_id = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(presenting));
+// False: another thread holds the producer guard and nothing of this boundary was fed (RootBoundary invalidates the window).
+bool DependencyBoundary(ID3D12CommandQueue* root, uint64_t generation, uint64_t sequence,
+    const PacingFrameKey& key, uint8_t mode) noexcept {
+    if (dep.boundary_busy.exchange(true, std::memory_order_acquire)) return false;
+    const uint64_t queue_id = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(root));
     bool reset = dep.reset_pending.exchange(false, std::memory_order_acq_rel);
-    // A swapchain or presenting queue other than the previous Present's: the tables, counters and window are of
-    // another lifetime, and a session watching by the rule is stopped (adopted again by a later window).
+    // Different swapchain, root, or identity regime: a new window, even if FG uses the presenting queue itself.
     const bool lifetime = (generation != 0 && dep.last_generation != 0 && generation != dep.last_generation) ||
-        (dep.last_queue != 0 && dep.last_queue != queue_id);
+        (dep.last_queue != 0 && dep.last_queue != queue_id) || (dep.last_mode != 0 && dep.last_mode != mode) ||
+        (mode == 2 && dep.fg_producer && key.producer_epoch && key.producer_epoch != dep.fg_producer);
     if (lifetime) {
-        DependencyInvalidate();
-        dep.reset_pending.store(false, std::memory_order_release);
+        dep.tables.Clear(); // old tickets/decisions must be invalid even if there were no submissions
         reset = true;
-        if (mode == 1 && g.phase.load(std::memory_order_acquire) == kRunning && g.role.load(std::memory_order_relaxed) != 2)
-            RequestStop("the swapchain or the presenting queue changed (dependency rule)");
+        if (g.identity.load(std::memory_order_acquire)) {
+            if (mode == 2 || dep.last_mode == 2)
+                GpuQueueLawFeed_RetireSession(g.session_generation.load(std::memory_order_acquire));
+            RequestStop("the swapchain or the dependency root changed");
+        }
     }
+    dep.last_mode = mode;
+    if (mode == 2 && key.producer_epoch) dep.fg_producer = key.producer_epoch;
     dep.last_queue = queue_id;
     dep.presenting_mirror.store(queue_id, std::memory_order_relaxed);
     if (generation != 0) dep.last_generation = generation;
-    dep.epoch.fetch_add(1, std::memory_order_relaxed);
-    // This Present's scope learns its identity; a tag found before it (the Wait came first) is pushed now.
+    const uint32_t closing_counter = dep.epoch.fetch_add(1, std::memory_order_relaxed);
+    // A Present may identify a Wait before or inside its scope. An FG input closes the pre-input
+    // Wait scope on its thread; another thread's Wait is a candidate edge only, never a tag.
     ScopeState& s = t_scope;
-    const bool in_scope = s.id != 0 && s.queue == presenting;
+    const bool in_scope = mode == 1 && s.id != 0 && s.queue == root;
     if (in_scope) {
         s.identified = generation != 0 && sequence != 0;
         s.generation = generation;
         s.sequence = sequence;
         s.key = key;
-        if (mode == 1 && s.identified && s.pending.value != 0) {
+        if (s.identified && s.pending.value != 0) {
             PushTag(s.pending.session, s.pending.fence, s.pending.value, generation, sequence, key, true);
             s.pending = PendingTag{};
         }
     }
     dq::BoundaryInput boundary;
     boundary.presenting_queue = queue_id;
-    boundary.scope = in_scope ? s.id : 0;
+    boundary.scope = mode == 2 ? dq::FgInputScope(GetCurrentThreadId(), closing_counter) : in_scope ? s.id : 0;
     boundary.qpc = Qpc();
-    boundary.keyed = key.frame_id != 0;
-    boundary.frame_counter = dep.epoch.load(std::memory_order_relaxed);
-    boundary.mode = static_cast<uint8_t>(mode);
+    boundary.keyed = mode == 2 ? key.domain == PacingIdentityDomain::NvApiFrame && PacingFrameKey_IsValid(key) : key.frame_id != 0;
+    boundary.frame_counter = closing_counter + 1;
+    boundary.mode = mode;
+    if (mode == 2 && !lifetime && boundary.keyed && t_fg_tag.Matches(queue_id, boundary.scope))
+        PushTag(t_fg_tag.session, t_fg_tag.fence, t_fg_tag.value, generation, 0, key, true);
     boundary.restart = reset;
     dep.feed.OnBoundary(dep.tables, boundary);
     dep.boundary_busy.store(false, std::memory_order_release);
+    return true;
 }
 
 // After the boundary, on the Present thread: where the evaluation runs. While a session runs the probe's worker evaluates
@@ -1207,11 +1220,13 @@ void DependencyBoundary(ID3D12CommandQueue* presenting, uint64_t generation, uin
 // FrameFeed::kHelpAt frames behind (it blocks up to kWaitMs between wakes), in which case it helps. In every other phase (no
 // session before the first adoption, starting, stopping, dead: there is no worker step to run on) the Present thread
 // evaluates right here, as it always did: the decision that makes the first adoption must exist before any session does.
-// `ticket` (mode 1): the adoption snapshot of that evaluation, only while idle, left invalid when the guard was not taken.
-void DependencyEvaluateAfterBoundary(AdoptionTicket* ticket) noexcept {
+// `ticket`: the adoption snapshot of that evaluation, only while idle, left invalid when the guard was not taken.
+void DependencyEvaluateAfterBoundary(AdoptionTicket* ticket, uint64_t root_queue, bool fg_input) noexcept {
     if (g.phase.load(std::memory_order_acquire) == kRunning && dep.feed.PendingFrames() < dq::FrameFeed::kHelpAt) return;
     DependencySink sink;
     sink.adopt = ticket;
+    sink.root_queue = root_queue;
+    sink.fg_input = fg_input;
     dep.feed.Evaluate(dep.tables, sink);
 }
 
@@ -1228,24 +1243,27 @@ void LogDependency(const char* reason) noexcept {
     const auto counters = g_core.Statistics();
     const auto u = [](uint64_t value) { return static_cast<unsigned long long>(value); };
     LOG_INFO("GPU queue probe dependency rule: %s; role %s; %llu windows over %llu frames evaluated; frames with an "
-             "ambiguous join %llu (the presenting queue's own dependency), %llu with several fence values at a deeper "
+             "ambiguous join %llu (the root queue's own dependency), %llu with several fence values at a deeper "
              "queue (not an ambiguity), %llu with a missing join; Waits no other queue signals %llu, ambiguous Signals "
              "%llu; events dropped on a lock time-out (each makes its window not qualify): Signals %llu, Waits %llu, "
              "command lists %llu; queues beyond the command list rows %llu; decisions discarded (changed epoch or lock "
              "time-out) %llu, of them lock time-outs %llu; Present thread pulls skipped on a lock time-out %llu (their "
              "frames were evaluated by the next pull), backlog overflows %llu; clears applied later by the next lock "
-             "holder %llu; windows that did not qualify while a queue was adopted (adoption kept) %llu; queue "
+             "holder %llu; loss windows %llu, unjoinable windows %llu; root boundaries missed while another thread fed one "
+             "%llu (each invalidated its window); unqualified windows with adoption kept %llu; queue "
              "destructions that stopped waiting for a queue reference in flight %llu (%llu native queue references "
              "taken and never released, on purpose); boundaries from the dependency Signal "
-             "%llu, tags %llu (%llu pushed at the readiness site); "
+             "%llu, tags %llu (%llu pushed at a keyed root boundary); "
              "core join_ambiguous %llu, join_missing %llu, untagged_boundaries %llu, tags_unmatched %llu, "
              "irregular_boundary_events %llu, frames_invalidated_by_irregular_boundary %llu",
-             reason, dq::RoleText(static_cast<dq::Role>(g.role.load(std::memory_order_relaxed))), u(dep.feed.windows()),
+             reason, dq::RoleText(g.identity.load(std::memory_order_acquire) ? g.role.load(std::memory_order_relaxed) :
+                 dq::Role::None), u(dep.feed.windows()),
              u(dep.feed.frames()), u(dep.feed.ambiguous()), u(dep.feed.multi_edge()), u(dep.feed.missing()),
              u(dep.feed.unsignalled()), u(dep.feed.ambiguous_signals()), u(dep.tables.DroppedSignals()),
              u(dep.tables.DroppedWaits()), u(dep.tables.DroppedLists()), u(dep.tables.RowOverflow()),
              u(dep.feed.stale_decisions()), u(dep.tables.PublishTimeouts()), u(dep.feed.pulls_skipped()),
-             u(dep.feed.backlog_overflows()), u(dep.tables.ClearsDeferred()), u(dep.windows_kept.load()),
+             u(dep.feed.backlog_overflows()), u(dep.tables.ClearsDeferred()), u(dep.loss_windows.load()),
+             u(dep.unjoinable_windows.load()), u(dep.missed_boundaries.load()), u(dep.windows_kept.load()),
              u(dep.retain_timeouts.load()), u(dep.retain_leaks.load()), u(g.dep_boundaries.load()),
              u(g.dep_tags.load()), u(g.dep_tags_late.load()), u(counters.join_ambiguous), u(counters.join_missing),
              u(counters.untagged_boundaries), u(counters.tags_unmatched), u(counters.irregular_boundary_events),
@@ -1771,7 +1789,7 @@ DWORD WINAPI Worker(void*) noexcept {
 // Present or frame generation thread; the caller owns the session start (phase Starting, claimed
 // by compare-exchange from Idle): take the references and start the thread. Every early return
 // restores Idle (or Dead).
-void Adopt(ID3D12CommandQueue* queue, const char* site, uint32_t role, AdoptionTicket* ticket) noexcept {
+void Adopt(ID3D12CommandQueue* queue, const char* site, dq::Role role, AdoptionTicket* ticket) noexcept {
     const dq::AdoptionSnapshot* const snapshot = ticket ? &ticket->snapshot : nullptr;
     if (RuntimeLifecycle_IsStopping()) { g.phase.store(kIdle, std::memory_order_release); return; }
     LARGE_INTEGER frequency{};
@@ -1805,20 +1823,16 @@ void Adopt(ID3D12CommandQueue* queue, const char* site, uint32_t role, AdoptionT
         return;
     }
     g.adopt_site = site;
-    // The adopted queue's role and, for a render queue found by dependency, its boundary fence (the decision
-    // is the Present thread's, which calls this for roles 1 and 3).
+    // Dependency render queues take their Signal boundary fence from this same adoption snapshot.
     g.role.store(role, std::memory_order_relaxed);
-    g.dep_fence.store(role == 3 && snapshot ? snapshot->decision.fence : 0, std::memory_order_relaxed);
-    char candidates[320] = "not evaluated (the dependency rule is off)";
-    if (role != 2 && g_gpu_queue_probe_source.load(std::memory_order_relaxed) != 0 && snapshot && snapshot->valid)
-        FormatCandidates(snapshot->decision, candidates, sizeof(candidates));
-    else if (role == 2) std::snprintf(candidates, sizeof(candidates), "not applicable (adopted through the frame generation input)");
-    LOG_INFO("GPU queue probe: adopting queue %p (%s) of device %p; role: %s; hops: %u; unified_queue_margin_end %d (0 = "
-             "minimum of the bracket midpoints, 1 = minimum of the lower ends); command lists per frame of each "
-             "candidate: %s", static_cast<void*>(queue), site, static_cast<void*>(device),
-             gpu_queue_dependency::RoleText(static_cast<gpu_queue_dependency::Role>(role)),
-             role == 3 && snapshot ? snapshot->decision.hops : 0u,
-             g_unified_queue_margin_end.load(std::memory_order_relaxed), candidates);
+    g.dep_fence.store(dq::IsRenderQueueByDependency(role) && snapshot ? snapshot->decision.fence : 0, std::memory_order_relaxed);
+    const bool ruled = snapshot && snapshot->valid;
+    g.dependency_root.store(ruled && snapshot->decision.candidate_count ? snapshot->decision.candidates[0].queue : 0,
+        std::memory_order_release);
+    // The transition line already gives the winner, its hops and the lists of every candidate.
+    LOG_INFO("GPU queue probe: adopting queue %p (%s) of device %p; role: %s; unified_queue_margin_end %d (0 = "
+             "minimum of the bracket midpoints, 1 = minimum of the lower ends)", static_cast<void*>(queue), site,
+             static_cast<void*>(device), dq::RoleText(role), g_unified_queue_margin_end.load(std::memory_order_relaxed));
     ResetEvent(g.stop_event);
     g.stop_reason.store(nullptr, std::memory_order_relaxed);
     g.failure.store(0, std::memory_order_relaxed);
@@ -1826,8 +1840,13 @@ void Adopt(ID3D12CommandQueue* queue, const char* site, uint32_t role, AdoptionT
     g.queue = queue;
     g.device = device;
     g.frequency = frequency.QuadPart;
-    g.identity.store(queue, std::memory_order_release);
     g.session_generation.fetch_add(1, std::memory_order_acq_rel); // publications of an older session are dropped
+    g.identity.store(queue, std::memory_order_release);
+    // A retained queue is safe to touch, but a root/queue destruction between retain and adoption
+    // invalidates this decision. Once the identity is visible, destroy also stops the session directly.
+    if (ruled && snapshot->decision.epoch && (dep.tables.Epoch() != snapshot->decision.epoch ||
+        dep.tables.PublishedQueue() != snapshot->queue))
+        RequestStop("the dependency decision expired before adoption");
     g.thread = CreateThread(nullptr, 0, Worker, nullptr, 0, nullptr);
     if (!g.thread) {
         LOG_INFO("GPU queue probe: thread creation failed (err=%lu); the probe is off for this session", GetLastError());
@@ -1847,14 +1866,14 @@ void Adopt(ID3D12CommandQueue* queue, const char* site, uint32_t role, AdoptionT
 // Called by the shared native queue detours (streamline_queue_hooks.cpp) for the outermost
 // ExecuteCommandLists call: Enter before the original (enq), the call counted as a submission,
 // Leave right after it (Signal of the done value, ring push). Between them the producer flag
-// is held. The probe's own Signals call the native method directly (not through the detour); in role 3 the game's own
+// is held. The probe's own Signals call the native method directly (not through the detour); in roles 3 and 4 the game's own
 // Signal behind the submission can be its marker instead (pending marker, gpu_queue_borrow.h). A call that finds the flag taken (another thread submitting on
 // the same queue) is a lost event, and is tracked until its native call returns: a boundary
 // published meanwhile is `overlap`, and the call itself invalidates the frame it lands in when
 // a boundary was crossed.
 static thread_local uint64_t t_contended_boundary_seq = 0;
 static thread_local uint32_t t_contended_generation = 0;
-// The item's own observation: the completed value of the bound game fence (role 3 only; 0
+// The item's own observation: the completed value of the bound game fence (roles 3 and 4; 0
 // while none is bound) and of the probe's own fence, with the QPC taken before the reads (`before`: the clock read the
 // hook already took, the Execute's enq or the Wait's entry time) and the foreign epoch read AFTER the reads. User-mode
 // fence reads (GetCompletedValue, no kernel call); no lock, no allocation. It rides in the item's event and the core
@@ -1878,7 +1897,7 @@ void ObserveInto(GpuQueueEvent& e, int64_t before, bool producer) noexcept {
         if (producer && own != UINT64_MAX && own > g.own_seen) g.own_seen = own;
     }
     uint64_t game = 0;
-    if (g.role.load(std::memory_order_relaxed) == 3 && bw.fence.bound()) {
+    if (dq::IsRenderQueueByDependency(g.role.load(std::memory_order_relaxed)) && bw.fence.bound()) {
         ID3D12Fence* const game_fence = static_cast<ID3D12Fence*>(bw.fence.fence());
         if (game_fence) game = CompletedValue(game_fence);
     }
@@ -1892,7 +1911,7 @@ void ObserveInto(GpuQueueEvent& e, int64_t before, bool producer) noexcept {
     e.obs_before_qpc = before;
     e.obs_after_qpc = after;
 }
-// Role 3, borrowing active: the sequence value k of this submission is claimed WITHOUT a Signal (under the Signal lock,
+// Borrowing active: the sequence value k of this submission is claimed WITHOUT a Signal (under the Signal lock,
 // so the value order stays the claim order) and its slot AND ITS PENDING WORD are published for the worker and the
 // interrupting calls BEFORE the lock is dropped: a Wait on another thread that signals an own value takes the lock
 // after this, finds the word and settles k first, so own values reach the queue in order and the repair of k precedes
@@ -1975,7 +1994,7 @@ unsigned GpuQueueProbe_ExecuteEnterActive(void* native_queue) noexcept {
     if (wait_open) g.ambiguous_wait.fetch_add(1, std::memory_order_relaxed);
     const int64_t enq = Qpc();
     event.enq_qpc = enq;
-    ObserveInto(event, enq, true); // the item's own observation (role 3: both fences; roles 1/2: the own fence), in its event
+    ObserveInto(event, enq, true); // the item's own observation (roles 3/4: both fences; roles 1/2: the own fence)
     g.current_added = 0;
     return kProbeCallTaken;
 }
@@ -1998,11 +2017,11 @@ void GpuQueueProbe_ExecuteLeaveActive(unsigned status) noexcept {
         return;
     }
     ID3D12CommandQueue* const self = g.queue; // the adopted queue: the call was taken for it, under the flag
-    const bool role3 = g.role.load(std::memory_order_relaxed) == 3 && !bw.gate.disabled();
+    const bool can_borrow = dq::IsRenderQueueByDependency(g.role.load(std::memory_order_relaxed)) && !bw.gate.disabled();
     // A borrowed submission reads NO clock here: the item's enq (Enter) is its only one, the marker's issue time is the
     // game's Signal hook's (BindMarker, shared with the dependency observer) and the observation's `after` is stamped with
     // it when the Submit is pushed (the taker's, BuildSlotSubmit). Nothing at this point needs "now".
-    if (role3 && bw.gate.active() && bw.gate.candidate() != 0 &&
+    if (can_borrow && bw.gate.active() && bw.gate.candidate() != 0 &&
         g.current_generation == g.session_generation.load(std::memory_order_acquire)) {
         const uint64_t boundary_now = g.boundary_seq.load();
         const bool overlap = boundary_now != g.enter_boundary_seq || (boundary_now & 1u) != 0 || g.wait_seq.load() != g.enter_wait_seq;
@@ -2037,7 +2056,7 @@ void GpuQueueProbe_ExecuteLeaveActive(unsigned status) noexcept {
     if (boundary_now != g.enter_boundary_seq || (boundary_now & 1u) != 0 || g.wait_seq.load() != g.enter_wait_seq)
         g.current.overlap = 1;
     if (g.current_generation == g.session_generation.load(std::memory_order_acquire)) g_core.Push(g.current);
-    if (role3) {
+    if (can_borrow) {
         // Observed only: the probe's own Signal marks it; the game's Signal that directly follows (or not) is the
         // evidence for the next frames.
         bw.tracker.OnSubmission();
@@ -2200,7 +2219,7 @@ void GpuQueueProbe_DependencySignalActive(void* queue, void* fence, uint64_t val
     entry.epoch = dep.epoch.load(std::memory_order_relaxed);
     if (!dep.ever_recorded.load(std::memory_order_relaxed)) dep.ever_recorded.store(true, std::memory_order_relaxed);
     dep.tables.RecordSignal(entry); // bounded spin, else dropped and counted
-    if (g.role.load(std::memory_order_relaxed) == 3) {
+    if (dq::IsRenderQueueByDependency(g.role.load(std::memory_order_relaxed))) {
         if (queue != g.active.load(std::memory_order_acquire)) {
             // Another queue signals a fence the adopted queue's markers are read from (the pattern's, or the bound one):
             // before the Signal is forwarded, borrowing ends for the session (BorrowForeignSignal).
@@ -2214,7 +2233,7 @@ void GpuQueueProbe_DependencySignalActive(void* queue, void* fence, uint64_t val
 
 // Borrowing (gpu_queue_probe.h): the Signal detour's bind point and the nested Execute interrupt.
 void GpuQueueProbe_BorrowSignalActive(void* queue, void* fence, uint64_t value, int64_t now) noexcept {
-    if (g.role.load(std::memory_order_relaxed) != 3 || queue != g.active.load(std::memory_order_acquire)) return;
+    if (!dq::IsRenderQueueByDependency(g.role.load(std::memory_order_relaxed)) || queue != g.active.load(std::memory_order_acquire)) return;
     BindMarker(queue, fence, value, now);
 }
 void GpuQueueProbe_BorrowInterruptActive(void* queue) noexcept {
@@ -2239,32 +2258,25 @@ void GpuQueueProbe_DependencyWaitActive(void* queue, void* fence, uint64_t value
     entry.value = value;
     entry.qpc = now != 0 ? now : Qpc(); // the detour's one clock read for this entry; its own read when the hook took none (never a zero time)
     entry.thread = GetCurrentThreadId();
+    const dq::Role role = g.role.load(std::memory_order_relaxed);
     const bool inside = s.id != 0 && s.queue == queue;
-    uint64_t scope = 0;
-    if (inside) scope = s.id;
+    if (inside) entry.scope = s.id;
     else if (s.id == 0 && entry.queue == dep.presenting_mirror.load(std::memory_order_relaxed) &&
              entry.thread == dep.present_thread.load(std::memory_order_relaxed))
-        scope = dep.scope_counter.load(std::memory_order_relaxed) + 1; // the next scope of this thread
-    entry.scope = scope;
+        entry.scope = dep.scope_counter.load(std::memory_order_relaxed) + 1; // this thread's next Present
     entry.epoch = dep.epoch.load(std::memory_order_relaxed);
     if (!dep.ever_recorded.load(std::memory_order_relaxed)) dep.ever_recorded.store(true, std::memory_order_relaxed);
     dep.tables.RecordWait(entry); // bounded spin, else dropped and counted
-    if (scope != 0 && g.role.load(std::memory_order_relaxed) == 3 &&
-        entry.fence == g.dep_fence.load(std::memory_order_relaxed)) {
+    if (role == dq::Role::FgRenderQueueByDependency && entry.fence == g.dep_fence.load(std::memory_order_relaxed) &&
+        entry.queue == g.dependency_root.load(std::memory_order_relaxed)) {
+        t_fg_tag.Note(entry, session);
+    } else if (role == dq::Role::RenderQueueByDependency && entry.scope != 0 && entry.fence == g.dep_fence.load(std::memory_order_relaxed)) {
         if (inside && s.identified) PushTag(session, entry.fence, value, s.generation, s.sequence, s.key, false);
         else if (inside) s.pending = PendingTag{value, entry.fence, session};
         else t_pre_tag = PendingTag{value, entry.fence, session};
     }
 }
 
-// The readiness site of a Present under frame generation: the rule's answer, for a diagnostic only.
-void GpuQueueProbe_OnFgPresentSiteActive(void* presenting_queue, uint64_t swapchain_generation,
-    uint64_t present_sequence) noexcept {
-    if (!g_gpu_queue_probe.load(std::memory_order_relaxed) || !presenting_queue) return;
-    DependencyBoundary(static_cast<ID3D12CommandQueue*>(presenting_queue), swapchain_generation, present_sequence,
-        PacingFrameKey{}, 2);
-    DependencyEvaluateAfterBoundary(nullptr);
-}
 
 // ReLimiter's own hold Wait released (the gate's CPU Signal of the time fence, or the present-first unit's order Signal): the
 // Hold event pairs with the Wait event of the same (fence, value) and carries the plan identity the unit gave for a frame
@@ -2322,9 +2334,10 @@ namespace {
 // The boundary of one frame on `queue`: adopts it when idle, pushes it while it is the adopted
 // queue, asks for another adoption when the adopted queue is another one.
 void Boundary(ID3D12CommandQueue* queue, uint64_t swapchain_generation, uint64_t present_sequence,
-    const PacingFrameKey& frame_key, const char* site, uint32_t role, AdoptionTicket* ticket = nullptr) noexcept {
+    const PacingFrameKey& frame_key, const char* site, dq::Role role, AdoptionTicket* ticket = nullptr) noexcept {
     switch (g.phase.load(std::memory_order_acquire)) {
     case kRunning: {
+        if (ticket) return; // Another boundary already started a session. Do not inject the ticket's frame.
         // Admitted into the session before its checks, revalidated against the session generation,
         // held through publication and released last: EndSession drains these before it resets, so
         // a callback that paused here cannot publish its old frame identity into a replacement.
@@ -2332,11 +2345,8 @@ void Boundary(ID3D12CommandQueue* queue, uint64_t swapchain_generation, uint64_t
         g.callbacks_inflight.fetch_add(1);
         if (g.phase.load(std::memory_order_acquire) == kRunning &&
             g.session_generation.load(std::memory_order_acquire) == generation) {
-            if (g.role.load(std::memory_order_relaxed) == 3) {
-                // A render queue adopted by dependency has its boundaries at its Signal of the dependency fence;
-                // a boundary of another role (the frame generation input) ends that session: adopted again as
-                // the frame generation source.
-                if (role != 3) RequestStop("frame generation input: the source queue is adopted instead");
+            if (dq::IsRenderQueueByDependency(g.role.load(std::memory_order_relaxed))) {
+                RequestStop("the boundary source changed"); // a key-off direct boundary replaced the Signal boundary
             } else if (g.identity.load(std::memory_order_acquire) == queue) {
                 // Presenting queue and frame generation source can be the same queue: the role follows the caller.
                 if (g.role.load(std::memory_order_relaxed) != role) g.role.store(role, std::memory_order_relaxed);
@@ -2349,11 +2359,8 @@ void Boundary(ID3D12CommandQueue* queue, uint64_t swapchain_generation, uint64_t
         return;
     }
     case kIdle: {
-        // With the source rule on, a presenting-queue or dependency adoption needs the valid snapshot (and its owned queue)
-        // of this Present's evaluation: a boundary without one (a running-only call that found the session idle after its
-        // stop, a Present that missed the evaluator guard) adopts nothing. The frame generation source (role 2) is not
-        // decided by the rule.
-        if (role != 2 && g_gpu_queue_probe_source.load(std::memory_order_relaxed) != 0 && !ticket) return;
+        // Under the rule every adoption, including the FG source, needs the snapshot and its owned reference.
+        if (g_gpu_queue_probe_source.load(std::memory_order_relaxed) != 0 && !ticket) return;
         // Claim the session start atomically: exactly one thread initialises (the Present thread and
         // a frame generation callback can both see Idle at a frame generation shutdown).
         uint32_t expected = kIdle;
@@ -2373,6 +2380,35 @@ void Boundary(ID3D12CommandQueue* queue, uint64_t swapchain_generation, uint64_t
         return; // starting, stopping, or ended for the session
     }
 }
+
+// A qualified root gets its keyed boundary directly; a dependency render queue only gets the Signal/Wait pair.
+void RootBoundary(ID3D12CommandQueue* root, uint64_t generation, uint64_t sequence, const PacingFrameKey& key,
+    dq::Role root_role, const char* site) noexcept {
+    // Both FG paths report one real input on the same thread: the repeat is no boundary at all.
+    if (root_role == dq::Role::FrameGenerationSource && t_fg_repeat.Repeat(key.frame_id, key.producer_epoch)) return;
+    if (g_gpu_queue_probe_source.load(std::memory_order_relaxed) == 0) {
+        Boundary(root, generation, sequence, key, site, root_role);
+        return;
+    }
+    const bool fg_input = root_role == dq::Role::FrameGenerationSource;
+    AdoptionTicket ticket;
+    if (DependencyBoundary(root, generation, sequence, key, static_cast<uint8_t>(root_role))) {
+        DependencyEvaluateAfterBoundary(&ticket, reinterpret_cast<uintptr_t>(root), fg_input);
+    } else {
+        // Another thread is feeding a boundary: the rule's window misses this one, so it is invalidated (no decision
+        // rests on a frame that spans two). A watched root still gets its measurement boundary below.
+        dep.missed_boundaries.fetch_add(1, std::memory_order_relaxed);
+        DependencyInvalidate();
+    }
+    if (ticket.snapshot.valid) {
+        const dq::Role winner = ticket.snapshot.decision.role;
+        Boundary(ticket.owned.queue, generation, sequence, key, dq::IsRenderQueueByDependency(winner) ?
+            (fg_input ? "render queue by dependency from the FG input" : "render queue by dependency from the presenting queue") :
+            site, winner, &ticket);
+    } else if (g.phase.load(std::memory_order_acquire) == kRunning && g.role.load(std::memory_order_relaxed) == root_role) {
+        Boundary(root, generation, sequence, key, site, root_role);
+    }
+}
 }
 
 void GpuQueueProbe_OnPresentBoundary(void* native_queue, uint64_t swapchain_generation,
@@ -2387,62 +2423,22 @@ void GpuQueueProbe_OnPresentBoundary(void* native_queue, uint64_t swapchain_gene
     static const int64_t frequency = [] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart; }();
     const int64_t fg = g.fg_boundary_qpc.load(std::memory_order_relaxed);
     if (fg != 0 && Qpc() - fg < frequency) return;
-    auto* const presenting = static_cast<ID3D12CommandQueue*>(native_queue);
-    static const char* const kPresentingSite = "presenting queue, boundary at the readiness site of the Present";
-    if (g_gpu_queue_probe_source.load(std::memory_order_relaxed) == 0) {
-        Boundary(presenting, swapchain_generation, present_sequence, frame_key, kPresentingSite, 1);
-        return;
-    }
-    // Source key: the dependency rule decides which queue is watched (gpu_queue_dependency.h). Once per real
-    // frame the Present thread queues its boundary; the tables are evaluated by the probe's worker while a session
-    // runs, else right here; a window of frames gives the decision; the session is adopted by it, and stopped when a
-    // later window decides otherwise.
-    AdoptionTicket ticket; // invalid unless this thread evaluated and the session is idle; releases its queue on every exit
-    DependencyBoundary(presenting, swapchain_generation, present_sequence, frame_key, 1);
-    DependencyEvaluateAfterBoundary(&ticket);
-    switch (g.phase.load(std::memory_order_acquire)) {
-    case kRunning:
-        // A render queue adopted by dependency has its boundaries at its Signal of the dependency fence (the
-        // tag came from the presenting queue's Wait); the Present is not a boundary of its frames.
-        if (g.role.load(std::memory_order_relaxed) == 3) return;
-        Boundary(presenting, swapchain_generation, present_sequence, frame_key, kPresentingSite, 1);
-        return;
-    case kIdle: {
-        // The queue, role and fence come from the snapshot taken under the evaluator guard: no later read of the
-        // published decision (another thread may reset it) and a thread that did not take the guard adopts nothing.
-        if (!ticket.snapshot.valid) return; // still qualifying, or no queue whose boundary can be joined to the frames
-        const bool dependency = ticket.snapshot.decision.role == dq::Role::RenderQueueByDependency;
-        Boundary(reinterpret_cast<ID3D12CommandQueue*>(static_cast<uintptr_t>(ticket.snapshot.queue)), swapchain_generation,
-            present_sequence, frame_key,
-            dependency ? "render queue by dependency, found from the presenting queue" : kPresentingSite,
-            dependency ? 3u : 1u, &ticket);
-        return;
-    }
-    default:
-        return;
-    }
+    RootBoundary(static_cast<ID3D12CommandQueue*>(native_queue), swapchain_generation, present_sequence, frame_key,
+        dq::Role::Presenting, "presenting queue, boundary at the readiness site of the Present");
 }
 
 void GpuQueueProbe_OnFgInputBoundary(void* source_queue, uint64_t swapchain_generation,
     const PacingFrameKey& frame_key) noexcept {
     if (!g_gpu_queue_probe.load(std::memory_order_relaxed) || !source_queue) return;
     g.fg_boundary_qpc.store(Qpc(), std::memory_order_relaxed); // see GpuQueueProbe_OnPresentBoundary
-    // One boundary per real frame: the same input can reach here from more than one site (the
-    // handoff's marker path and the gate's input), so a repeated frame key is dropped.
-    if (frame_key.frame_id != 0) {
-        if (frame_key.frame_id == g.last_fg_frame.load(std::memory_order_relaxed) &&
-            frame_key.producer_epoch == g.last_fg_producer.load(std::memory_order_relaxed)) return;
-        g.last_fg_frame.store(frame_key.frame_id, std::memory_order_relaxed);
-        g.last_fg_producer.store(frame_key.producer_epoch, std::memory_order_relaxed);
-    }
-    Boundary(static_cast<ID3D12CommandQueue*>(source_queue), swapchain_generation, 0, frame_key,
-        "source queue of the frame generation input, boundary at the input", 2);
+    RootBoundary(static_cast<ID3D12CommandQueue*>(source_queue), swapchain_generation, 0, frame_key,
+        dq::Role::FrameGenerationSource, "source queue of the frame generation input, boundary at the input");
 }
 
 void GpuQueueProbe_OnGateEnqueue(void* native_queue) noexcept {
     if (!g_gpu_queue_probe.load(std::memory_order_relaxed)) return;
     // Only the adopted queue's hold is a boundary of its frames; any other queue (a render queue adopted by
-    // dependency, while the hold sits on the presenting queue) is a no-op without admission.
+    // dependency, while the hold sits on the root) is a no-op without admission.
     if (g.identity.load(std::memory_order_acquire) != static_cast<ID3D12CommandQueue*>(native_queue)) return;
     // Admitted into the session like every boundary callback: counted before the session checks,
     // revalidated after, held through publication, released last (EndSession drains it).
@@ -2474,11 +2470,11 @@ void GpuQueueProbe_OnQueueDestroy(void* native_queue) noexcept {
     // Source key: a destroyed queue restarts the dependency rule's evaluation (the epoch advances: the tables, counters
     // and the Present thread's window start over and adopt nothing until a window completes; a decision in flight is not
     // published). It does NOT retire an active adoption, on purpose: destroying a queue that is neither the adopted nor
-    // the presenting one says nothing about the adopted queue. Its boundary and tag mechanism (the Signal of the dependency
-    // fence, the presenting queue's Wait tag) does not use the tables, its samples stay valid, and stopping the law's
+    // the root says nothing about the adopted queue. Its boundary and tag mechanism (the Signal of the dependency
+    // fence, the root queue's Wait tag) does not use the tables, its samples stay valid, and stopping the law's
     // feed for a window because the game destroyed an unrelated queue would disturb pacing for nothing. The adoption
     // continues until a completed window decides otherwise (DependencyOnDecision) or the adopted queue (below), the
-    // presenting queue or the swapchain (DependencyEvaluate's lifetime check) goes away. With the probe or the source
+    // root or the swapchain goes away. With the probe or the source
     // key off, or when nothing was ever recorded, nothing is written and the lock is not taken.
     if (native_queue && g_gpu_queue_probe.load(std::memory_order_relaxed) &&
         g_gpu_queue_probe_source.load(std::memory_order_relaxed) != 0) {
@@ -2496,16 +2492,25 @@ void GpuQueueProbe_OnQueueDestroy(void* native_queue) noexcept {
         };
         if (!dep.retain_gate.WaitOrLeak(kRetainWaitSpins, leak)) dep.retain_timeouts.fetch_add(1, std::memory_order_relaxed);
     }
-    if (native_queue && g.identity.load(std::memory_order_acquire) == static_cast<ID3D12CommandQueue*>(native_queue)) {
+    ID3D12CommandQueue* const adopted = g.identity.load(std::memory_order_acquire);
+    if (native_queue && adopted && (native_queue == adopted ||
+        reinterpret_cast<uintptr_t>(native_queue) == g.dependency_root.load(std::memory_order_acquire))) {
         // The law's session of this queue is retired explicitly: its window is emptied, its outstanding grants settled
         // and records of the session still in flight are dropped (the scheduler's drain applies it before it pops).
         GpuQueueLawFeed_RetireSession(g.session_generation.load(std::memory_order_acquire));
-        RequestStop("the adopted queue was destroyed");
+        RequestStop("the adopted queue or its dependency root was destroyed");
     }
 }
 
 bool GpuQueueProbe_Shutdown(DWORD timeout_ms) noexcept {
-    if (!g.thread) return true;
+    if (!g.thread) {
+        // No adoption means no worker end-of-session line. Report the final rejection counts once.
+        if (!g.session_generation.load(std::memory_order_acquire) &&
+            (dep.loss_windows.load(std::memory_order_relaxed) || dep.unjoinable_windows.load(std::memory_order_relaxed)) &&
+            !g.summary_logged.exchange(true, std::memory_order_relaxed))
+            LogDependency("shutdown without a qualified queue");
+        return true;
+    }
     // The probe's calls in the detours stop here; the detours stay installed and keep forwarding
     // until the hooks are disabled (the module stays mapped after that, as for every other hook).
     RequestStop("shutdown");
@@ -2554,7 +2559,7 @@ bool GpuQueueProbeTest_DependencyEntryQpc(bool signal, void* queue, void* fence,
     return false;
 }
 void* GpuQueueProbeTest_AdoptedQueue() noexcept { return g.identity.load(std::memory_order_acquire); }
-unsigned GpuQueueProbeTest_AdoptedRole() noexcept { return g.role.load(std::memory_order_relaxed); }
+unsigned GpuQueueProbeTest_AdoptedRole() noexcept { return static_cast<unsigned>(g.role.load(std::memory_order_relaxed)); }
 bool GpuQueueProbeTest_AdoptRenderQueue(void* queue, uint64_t dependency_fence, uint64_t swapchain_generation,
     uint64_t present_sequence) noexcept {
     if (g.phase.load(std::memory_order_acquire) != kIdle) return false;
@@ -2572,7 +2577,7 @@ bool GpuQueueProbeTest_AdoptRenderQueue(void* queue, uint64_t dependency_fence, 
     if (!GpuReadinessQueue_Retain(native)) return false;
     ticket.owned.queue = native; // the session's reference from the adoption (released by the ticket otherwise)
     Boundary(native, swapchain_generation, present_sequence, PacingFrameKey{},
-        "test seam: render queue by dependency", 3, &ticket);
+        "test seam: render queue by dependency", dq::Role::RenderQueueByDependency, &ticket);
     return g.phase.load(std::memory_order_acquire) != kIdle;
 }
 #endif

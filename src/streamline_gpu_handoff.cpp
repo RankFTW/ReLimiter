@@ -168,8 +168,9 @@ const char* PolicyRejection() noexcept {
     if (faulted.load(std::memory_order_acquire)) return "retained_com_fault";
     if (RuntimeLifecycle_IsStopping()) return "stopping";
     if (!GpuPresent_RequiresReadiness()) return "gpu_deadline_off";
-    if (g_fg_mode.load(std::memory_order_acquire) != 1) return "mode_not_static_on";
-    if (!g_fg_presenting.load(std::memory_order_acquire)) return "fg_not_presenting";
+    // Frame generation's state as the resolver published it: Dynamic MFG, Off, dynamic mode, not presenting, or a
+    // multiplier outside 2x to 4x (FrameGeneration_RouteRejection; Auto and an unobserved mode are accepted).
+    if (const char* reason = Streamline_RouteRejection()) return reason;
     return nullptr;
 }
 bool Enabled() noexcept {
@@ -198,7 +199,7 @@ void ReportAdmission(bool final) noexcept {
     // in Gears of War: E-Day, and nothing was logged).
     if (!final && StreamlineHandoff_IsCurrent(epoch.load(std::memory_order_acquire)) &&
         GpuPresent_IsFgSupported(context.controller_generation)) return;
-    if (!final && (g_fg_mode.load(std::memory_order_acquire) != 1 || context.qpc_frequency <= 0 ||
+    if (!final && (!g_fg_presenting.load(std::memory_order_acquire) || context.qpc_frequency <= 0 ||
         context.now_qpc - last_admission_report < context.qpc_frequency * 5)) return;
     if (!marker_admission.seen.load(std::memory_order_relaxed) && !present_admission.seen.load(std::memory_order_relaxed)) return;
     last_admission_report = context.now_qpc;
@@ -547,7 +548,7 @@ void RejectRoute(const char* reason) noexcept {
 void PublishSeparatePresenter() noexcept {
     constexpr auto relaxed = std::memory_order_relaxed;
     const auto context = NativeGate_GetContext(Now());
-    const bool fg = g_fg_mode.load(std::memory_order_acquire) == 1 && g_fg_presenting.load(std::memory_order_acquire);
+    const bool fg = Streamline_RouteRejection() == nullptr;
     auto& s = separate;
     bool evident = s.evident.load(std::memory_order_acquire);
     if (evident && !(fg && s.tag_native.load(relaxed) == context.native_swapchain &&

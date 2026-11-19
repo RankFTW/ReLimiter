@@ -1,6 +1,6 @@
 #pragma once
 
-// The probe borrows the game's own marker (role 3, the render queue found by the dependency rule).
+// The probe borrows the game's own marker on a render queue found by the dependency rule (role 3 or 4).
 //
 // The probe's done marker of a submission is, today, a Signal of its own fence issued right behind
 // the Execute on the submission thread (one native call per Execute; on a submission thread that

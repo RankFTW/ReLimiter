@@ -505,11 +505,11 @@ void TestVtableCopyEntry() {
     Check(object.vptr[-1] == original_vptr[-1] && object.vptr[7] == original_vptr[7] &&
           object.vptr[kVtSlots - 1] == original_vptr[kVtSlots - 1], "the locator and every other entry are copied");
     Check(s_records.Get(first)->original_present == reinterpret_cast<uintptr_t>(&VtPresent),
-          "the record forwards to the slot value read at copy time");
-    void* inline_present = nullptr; void* inline_present1 = nullptr;
-    Check(VtableOriginalTargets(object_handle, &inline_present, &inline_present1) &&
-          inline_present == reinterpret_cast<void*>(&VtPresent),
-          "the inline patch is installed on the function the record forwards to, not on our detour");
+          "the record keeps the slot value read at copy time");
+    const NativeTargets inline_targets = ResolveNativeTargets(static_cast<uintptr_t>(object_handle), 0, 0);
+    Check(inline_targets.carried && inline_targets.present == reinterpret_cast<void*>(&VtPresent) &&
+          inline_targets.present1 == reinterpret_cast<void*>(&VtPresent1),
+          "the inline patch is installed on the implementation's function the record forwards to, not on our detour");
     char text[300];
     char text_route[800];
     DescribeVtableSlot("Present", object_handle, 8, false, s_present_targets, text, sizeof(text));
@@ -598,6 +598,13 @@ void TestVtableCopyEntry() {
     VSync_OnNativeSelected(object_handle);
     Check(object.vptr == foreign_vptr && s_records.Size() == records_before && s_vtable_failures.load() == 1 &&
           LastLogHas("foreign vtable"), "a foreign vptr seen over our copy is left alone on re-selection of the same object");
+    // The destroy dropped the binding; the history still names the class vtable our copy had replaced, so an inline
+    // patch would go on the implementation's own functions, not on the foreign vtable's hook.
+    const NativeTargets foreign_targets = ResolveNativeTargets(static_cast<uintptr_t>(object_handle),
+        reinterpret_cast<uintptr_t>(&ForeignPresent), reinterpret_cast<uintptr_t>(&VtPresent1));
+    Check(!foreign_targets.carried && foreign_targets.present == reinterpret_cast<void*>(&VtPresent) &&
+          foreign_targets.present1 == reinterpret_cast<void*>(&VtPresent1),
+          "a foreign vptr seen over our copy resolves to the class vtable that copy replaced, after its binding was dropped");
     VSync_OnNativeDestroyed(object_handle);
     other.vptr = foreign_vptr;
     VSync_OnNativeSelected(reinterpret_cast<uint64_t>(&other));
@@ -657,7 +664,7 @@ void TestVtableCopyEntry() {
     Check(page_object.vptr == good_vptr, "destroy restores it");
 
     // A copy goes only over a class vtable: a vptr in private memory (the real residency check) is refused.
-    s_vptr_in_module = &IsModuleAddress;
+    s_vptr_in_module = &PinClassVtable;
     page_object.vptr = good_vptr;
     const uint32_t failures_private = s_vtable_failures.load();
     VSync_OnNativeSelected(reinterpret_cast<uint64_t>(&page_object));
@@ -753,7 +760,7 @@ void TestVtableCopyEntry() {
     VSync_OnNativeDestroyed(reinterpret_cast<uint64_t>(&ninth));
 
     // History full: nothing NEW is installed (and it is logged); a vptr already in the history still is.
-    s_vptr_in_module = &IsModuleAddress;
+    s_vptr_in_module = &PinClassVtable;
     for (uintptr_t v = 0x1000; !s_history.Full(); v += 8) s_history.Note(v, vtable_copy::VptrHistory::Kind::Replaced);
     static void* fresh_storage[1 + kVtSlots];
     fresh_storage[0] = reinterpret_cast<void*>(&object);
@@ -791,7 +798,7 @@ void TestVtableCopyEntry() {
     prov.vptr = original_vptr;         // the overlay restores the original
     VSync_ObserveNativeVptr(handle_of(&prov));
     Check(prov.vptr == original_vptr, "a refused reinstall leaves the original vptr");
-    s_vptr_in_module = &IsModuleAddress;
+    s_vptr_in_module = &PinClassVtable;
     prov.vptr = prov_copy;             // the overlay restores our saved copy
     VSync_ObserveNativeVptr(handle_of(&prov));
     VSync_OnNativeDestroyed(handle_of(&prov));
@@ -872,7 +879,8 @@ void TestVtableCopyEntry() {
     Check(std::strstr(text_route, "inline pair: not installed, the vtable entry carries the route") != nullptr,
           "the vtable route line says so");
 
-    // The copy refused (a vptr in private memory under the real residency check): the pair is installed as before.
+    // The copy refused over a vptr in private memory (another module's vtable, not a class vtable): its slot names
+    // another module's function, so no inline Present hook is installed on it and the log says why.
     static FakeObject refused;
     void** const refused_vptr = VtableBeforeGuardPage(vtable_copy::kRequiredSlots);
     refused_vptr[8] = reinterpret_cast<void*>(&VtPresentAlt);
@@ -881,8 +889,8 @@ void TestVtableCopyEntry() {
     VSync_OnNativeSelected(handle_of(&refused));
     Check(refused.vptr == refused_vptr, "the copy is refused over a private-memory vptr");
     VSync_InstallDXGIHooksImpl(&refused);
-    Check(typed_has(reinterpret_cast<void*>(&VtPresentAlt)) && TypedTargetEnabled(s_present_targets, reinterpret_cast<void*>(&VtPresentAlt)),
-          "a refused copy installs the inline Present hook (one batch)");
+    Check(!typed_has(reinterpret_cast<void*>(&VtPresentAlt)) && LastLogHas("no inline Present patch is installed"),
+          "the slot of a vtable in private memory is never patched (the implementation's own Present is not known)");
     VSync_OnNativeDestroyed(handle_of(&refused));
 
     // The fallback counter: 31 scopes without a vtable entry install nothing; an entry resets the run; a new copy
@@ -965,6 +973,87 @@ void TestVtableCopyEntry() {
     VSync_OnNativeDestroyed(handle_of(&carried));
     s_native_handle_override = 0;
     s_present_targets[0].original = present_original;
+}
+
+// REFramework's D3D12 hook, reduced to what meets our copy (praydog/REFramework, src/D3D12Hook.cpp). Its first phase
+// writes its present into the class vtable's slot 8 in place. Its first Present takes that out again (the slot names
+// the implementation's Present once more) and puts its own vtable on the object, copied from what the object has (our
+// copy), whose saved slot 8 (our detour) it calls from then on. A thread-local depth marks its own nested calls: at
+// depth 1 it calls the saved function once more, deeper it returns S_OK WITHOUT presenting. A resize's reset takes
+// its vtable off the object and writes the class slot again.
+namespace rf {
+void* s_class[1 + kVtSlots];
+void* s_heap[1 + kVtSlots];
+VtObject s_object;
+bool s_phase1 = false;
+PFN_Present s_saved = nullptr;
+int s_depth = 0;
+unsigned s_presented = 0; // calls that reached the implementation's Present
+HRESULT STDMETHODCALLTYPE ImplPresent(IDXGISwapChain*, UINT, UINT) { ++s_presented; return S_OK; }
+HRESULT STDMETHODCALLTYPE Present(IDXGISwapChain* self, UINT interval, UINT flags) {
+    if (s_phase1) {
+        s_class[1 + 8] = reinterpret_cast<void*>(&ImplPresent);
+        void** const vptr = reinterpret_cast<VtObject*>(self)->vptr;
+        for (size_t i = 0; i <= kVtSlots; ++i) s_heap[i] = vptr[static_cast<ptrdiff_t>(i) - 1];
+        s_saved = reinterpret_cast<PFN_Present>(s_heap[1 + 8]);
+        s_heap[1 + 8] = reinterpret_cast<void*>(&Present);
+        reinterpret_cast<VtObject*>(self)->vptr = s_heap + 1;
+        s_phase1 = false;
+    }
+    if (s_depth > 1) return S_OK; // "Just returning S_OK"
+    ++s_depth;                    // at depth 1: "Attempting to call real present function"
+    const HRESULT result = s_saved(self, interval, flags);
+    --s_depth;
+    return result;
+}
+} // namespace rf
+
+// Our copy taken while REFramework's present sits in the class slot: the detours call the class slot as it is at each
+// call, so every frame reaches the implementation's Present once. A copy that kept calling the value read at copy time
+// re-entered REFramework below its own vtable on every frame, and its depth guard presented nothing (a black screen).
+void TestVtableForwardsLiveClassSlot() {
+    s_history = vtable_copy::VptrHistory{}; // a fresh process history: the test before filled it
+    rf::s_class[0] = &rf::s_object;         // the locator
+    for (size_t i = 0; i < kVtSlots; ++i) rf::s_class[1 + i] = reinterpret_cast<void*>(&VtSlot);
+    rf::s_class[1 + 0] = reinterpret_cast<void*>(&VtQueryInterface);
+    rf::s_class[1 + 22] = reinterpret_cast<void*>(&VtPresent1);
+    rf::s_class[1 + 8] = reinterpret_cast<void*>(&rf::Present);
+    rf::s_phase1 = true;
+    void** const class_vptr = rf::s_class + 1;
+    rf::s_object.vptr = class_vptr;
+    const uint64_t handle = reinterpret_cast<uint64_t>(&rf::s_object);
+    auto* self = reinterpret_cast<IDXGISwapChain*>(&rf::s_object);
+    VSync_OnNativeSelected(handle);
+    void** const copy = rf::s_object.vptr;
+    const size_t index = s_records.IndexOfCopy(reinterpret_cast<uintptr_t>(copy));
+    Check(index != vtable_copy::kNoRecord &&
+          s_records.Get(index)->original_present == reinterpret_cast<uintptr_t>(&rf::Present),
+          "our copy is taken while REFramework's present sits in the class slot");
+    const auto frame = [&] { return reinterpret_cast<PFN_Present>(rf::s_object.vptr[8])(self, 3, 4); };
+
+    uint64_t vt_before = EntryCount(NativeGateEntry::VtablePresent), inner_before = EntryCount(NativeGateEntry::InnerPassThrough);
+    Check(frame() == S_OK && rf::s_presented == 1 && rf::s_object.vptr == rf::s_heap + 1 && !rf::s_phase1 &&
+          rf::s_saved == s_vtable_present_thunks[index],
+          "the first frame reaches REFramework's first phase through our detour, and presents once");
+    Check(EntryCount(NativeGateEntry::VtablePresent) == vt_before + 2 &&
+          EntryCount(NativeGateEntry::InnerPassThrough) == inner_before + 1,
+          "REFramework calls our detour from inside it: one inner entry, which reaches the implementation");
+
+    vt_before = EntryCount(NativeGateEntry::VtablePresent); inner_before = EntryCount(NativeGateEntry::InnerPassThrough);
+    for (int i = 0; i < 3; ++i) Check(frame() == S_OK, "a later frame returns the implementation's result");
+    Check(rf::s_presented == 4 && EntryCount(NativeGateEntry::VtablePresent) == vt_before + 3 &&
+          EntryCount(NativeGateEntry::InnerPassThrough) == inner_before && rf::s_depth == 0,
+          "later frames: REFramework's vtable, our detour once, the implementation's Present once");
+
+    rf::s_object.vptr = copy; // a resize's reset: REFramework's vtable off the object, its class hook written again
+    rf::s_class[1 + 8] = reinterpret_cast<void*>(&rf::Present);
+    rf::s_phase1 = true;
+    Check(frame() == S_OK && frame() == S_OK && rf::s_presented == 6 && rf::s_object.vptr == rf::s_heap + 1,
+          "after REFramework hooks the class slot again, every frame still presents");
+
+    rf::s_object.vptr = copy;
+    VSync_OnNativeDestroyed(handle);
+    Check(rf::s_object.vptr == class_vptr, "destroy restores the class vtable");
 }
 
 // A structured exception that leaves the Present body and is caught by a caller (here the retry path's
@@ -1265,6 +1354,7 @@ int main() {
     TestExactTargetThunks();
       TestNativeGateHookPlacement();
       TestVtableCopyEntry();
+      TestVtableForwardsLiveClassSlot();
       TestLoaderNotifications();
       TestDecodeJumpPerArchitecture();
       TestTeardownLeavesDxgiHooksEnabled();

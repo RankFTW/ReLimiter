@@ -6,7 +6,7 @@
 // (vtable slot 10) and ::Wait (slot 15) detours are the ones of streamline_queue_hooks.cpp,
 // installed once through StreamlineQueue_EnsureHooks on the first adoption. For the
 // adopted queue each ExecuteCommandLists call is timestamped on entry (enq) and its done marker is a Signal of the
-// probe's own fence after the call (role 3 can borrow the game's own Signal instead, below); each unsatisfied queue
+// probe's own fence after the call (roles 3 and 4 can borrow the game's own Signal instead, below); each unsatisfied queue
 // Wait is timestamped on entry and gets a Signal right after the native Wait returned (its marker is the Wait's
 // release). Every item also carries its own observation (the completed values of the fences, user-mode reads on the
 // submission thread; its `before` is the item's enq clock read, its `after` the clock read of the Submit's push, so a
@@ -16,13 +16,12 @@
 // fence, a wake is awaited only for the armed marker) and every other marker is known as an interval; the accounting
 // itself is the pure core (gpu_queue_probe_core.h). With the key off nothing is installed or created: the call sites
 // are one relaxed load of g_gpu_queue_probe and a not-taken branch.
-// Role 3 (the render queue found by the dependency rule) can borrow the game's own Signal directly behind a
+// A render queue found by dependency (roles 3 and 4) can borrow the game's own Signal directly behind a
 // submission as its done marker instead of adding one (gpu_queue_borrow.h; the pending marker is bound by the Signal
 // detour right before it is forwarded, or settled with the probe's own Signal before any interrupting call is).
 //
-// The adopted queue is the queue the game's frames are submitted on: without frame generation
-// the presenting queue (the queue of ReShade's present event), with it the source queue of the
-// frame generation input (the queue the present gate enqueues its hold Wait on).
+// The root is the presenting queue without frame generation, the input's source queue with it. With the
+// source key on, watch the qualified winner from that root; with it off, watch the root directly.
 
 #include "instrumentation_state.h"
 #include "pacing_telemetry_types.h"
@@ -46,15 +45,15 @@ inline int64_t GpuQueueProbe_Now() noexcept {
 // carries (0 when the Present has no span), and with the real frame's key when the Present's
 // attribution (the PRESENT_START marker's, on this thread) names it: the same key the Present's
 // pacing row takes, which is also the key of the frame's plan entry (the queue law's identity
-// of the record; empty when the marker was on another thread or was rejected). Adopts the queue
-// on the first call with the key on.
+// of the record; empty when the marker was on another thread or was rejected). The root itself is watched
+// when the source key is off or the queue wins the dependency window.
 // Call sites test g_gpu_queue_probe first (GpuQueueProbe_OnReadinessSite below does).
 void GpuQueueProbe_OnPresentBoundary(void* native_queue, uint64_t swapchain_generation,
     uint64_t present_sequence, const PacingFrameKey& frame_key) noexcept;
 // The frame generation input of a real frame (GpuPresent_BeginFgInput, once per real frame, in
-// front of its eligibility checks): the boundary on the input's source queue, tagged with the
-// frame's key (what the real frame's pacing row carries) and the input's swapchain generation.
-// Adopts the source queue.
+// front of its eligibility checks): the source queue is the dependency root. Its input closes the
+// root Wait's scope and supplies the real frame key: a direct boundary on a winning root, or a tag
+// for the matching Signal boundary on a winning upstream render queue.
 void GpuQueueProbe_OnFgInputBoundary(void* source_queue, uint64_t swapchain_generation,
     const PacingFrameKey& frame_key) noexcept;
 // The gate's hold Wait enqueue, before queue->Wait (untagged boundary).
@@ -154,7 +153,7 @@ inline unsigned GpuQueueProbe_WaitBegin(void* native_queue, void* fence, uint64_
 inline void GpuQueueProbe_WaitEnd(unsigned token) noexcept {
     if (token) GpuQueueProbe_WaitEndActive(token);
 }
-// ── Borrowing the game's marker (role 3 only; gpu_queue_borrow.h) ──
+// ── Borrowing the game's marker (roles 3 and 4; gpu_queue_borrow.h) ──
 // BorrowSignal: the game's own outermost Signal on `queue`, called by the Signal detour right before it is
 // forwarded (after the Streamline handoff's own calls): when it directly follows a submission of the adopted queue
 // on the same thread it is bound as that submission's done marker. BorrowInterrupt: a nested Execute on `queue`
@@ -173,21 +172,17 @@ inline void GpuQueueProbe_BorrowInterrupt(void* queue) noexcept {
 // Which queue the probe watches. The shared native queue detours (streamline_queue_hooks.cpp) record, for every
 // queue, its Signals (fence, value), its Waits and its command list counts into bounded tables behind one small
 // lock taken with a bounded spin (a detour that does not get it drops and counts its event; outside
-// the probe's own and ReLimiter's own calls); the Present thread evaluates them once per real frame
-// (GpuQueueProbe_OnPresentBoundary) and adopts the winner, which for a render queue that is not the presenting
-// queue delimits its frames at its Signal of the dependency fence. The Present scope (ReShade's present event to
-// finish_present, on the Present thread) is what ties a Wait of the presenting queue to a frame. With the key at 0
-// these are one relaxed load and a not-taken branch at each call site and nothing else.
+// the probe's own and ReLimiter's own calls). The keyed root boundary feeds one observation per real frame.
+// A dependency winner delimits its frames at its Signal of the dependency fence. A root Wait receives
+// the frame identity from its Present scope, or under FG from the input closing its thread's Wait scope.
+// With the source key at 0, recording is one relaxed load and a not-taken branch at each call site.
 void GpuQueueProbe_DependencyScopeBeginActive(void* presenting_queue) noexcept;
 void GpuQueueProbe_DependencyScopeEndActive() noexcept;
 void GpuQueueProbe_DependencyExecuteActive(void* queue, unsigned lists) noexcept;
 void GpuQueueProbe_DependencySignalActive(void* queue, void* fence, uint64_t value, int64_t now) noexcept;
 void GpuQueueProbe_DependencyWaitActive(void* queue, void* fence, uint64_t value, int64_t now) noexcept;
-// The readiness site of a Present under frame generation: the dependency rule is evaluated there for a
-// diagnostic (logged once when its answer differs from the adopted source queue); no decision.
-void GpuQueueProbe_OnFgPresentSiteActive(void* presenting_queue, uint64_t swapchain_generation,
-    uint64_t present_sequence) noexcept;
 inline void GpuQueueProbe_DependencyScopeEnd() noexcept {
+    gpu_queue_probe_detail::t_present_queue = nullptr; // no readiness callback consumed it on an FG Present
     if (g_gpu_queue_probe_source.load(std::memory_order_relaxed) != 0) GpuQueueProbe_DependencyScopeEndActive();
 }
 inline void GpuQueueProbe_DependencyExecute(void* queue, unsigned lists) noexcept {
@@ -200,12 +195,6 @@ inline void GpuQueueProbe_DependencySignal(void* queue, void* fence, uint64_t va
 inline void GpuQueueProbe_DependencyWait(void* queue, void* fence, uint64_t value, int64_t now) noexcept {
     if (g_gpu_queue_probe_source.load(std::memory_order_relaxed) != 0)
         GpuQueueProbe_DependencyWaitActive(queue, fence, value, now);
-}
-inline void GpuQueueProbe_OnFgReadinessSite(uint64_t swapchain_generation, uint64_t present_sequence) noexcept {
-    void* const queue = gpu_queue_probe_detail::t_present_queue;
-    gpu_queue_probe_detail::t_present_queue = nullptr;
-    if (queue && g_gpu_queue_probe_source.load(std::memory_order_relaxed) != 0)
-        GpuQueueProbe_OnFgPresentSiteActive(queue, swapchain_generation, present_sequence);
 }
 #else
 // Win32 builds compile only the pure core; the D3D12 side is 64-bit.

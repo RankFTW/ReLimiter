@@ -98,7 +98,7 @@ enum UnifiedFlag : uint32_t {
     kUpQueueLawBound = 0x2000000,  // the law's I_gpu was cut to the whole-interval bound C + max(0, C - J) (F < 16)
     // 0x4000000, 0x8000000, 0x10000000 and 0x40000000 were the render-thread term, margin-valid, feed-rule and
     // raw-margin flags of the removed render-stage rules: reserved, never reused.
-    kUpQueueLawNoHoldCredit = 0x20000000, // the law is in use but the newest record's queue is a render queue by dependency (role 3): the credit and the holds follow the report-based rule, no hold is granted by the law
+    kUpQueueLawNoHoldCredit = 0x20000000, // a dependency render queue (role 3 or 4): the report-based rule governs credit and holds
     kUpLateGuard = 0x80000000,   // the lead's limit came from the late state (developer key gpu_wait_late_guard; lead_controller.h)
     kUpLateSeen = 0x100000,      // the late state's condition was met and not applied (the off period of developer key gpu_wait_ab_interleave_s)
 };
@@ -435,7 +435,11 @@ struct UnifiedQueueLawSummary {
     uint64_t holds_never_debited = 0;  // law-granted, hold measured, never paid by a record
     uint64_t holds_settled_orphan = 0; // law-granted holds settled from the measured hold: their probe record would not come
     uint64_t holds_lost_unmeasured = 0; // law-granted frames that left the ring with no record naming them and no hold measurement: their hold was never paid (the credit stays that much too high)
-    uint64_t frames_no_hold_credit = 0;     // planned frames with the law in use whose credit and holds followed the report-based rule (queue role 3)
+    uint64_t frames_no_hold_credit = 0;     // planned frames with the law in use but report-based credit and holds (roles 3 and 4)
+    uint64_t frames_not_carried = 0;   // planned frames whose window was in use while the carry votes refused the law (QueueCarriesFrame false): the report rule decided
+    uint64_t carry_carried = 0;        // judged frames (carry votes, UnifiedCarryVotes::Judge): carried
+    uint64_t carry_not_carried = 0;    // ... did not carry
+    uint64_t carry_undecided = 0;      // ... undecided by the bounds (abstained)
 };
 struct UnifiedCounters {
     uint64_t reservations = 0;
@@ -587,12 +591,21 @@ public:
     // scheduler's drain calls it from the feed's retired-session value).
     void RetireQueueSession(uint64_t session) noexcept;
     // The queue law decides at this moment (key on and the window in use, fresh against the frame
-    // the law last counted as planned).
+    // the law last counted as planned, and the watched queue carries the frame: QueueCarriesFrame).
     bool QueueLawInUse() const noexcept;
+    // The watched queue is not refused as the law's source: false only on fresh evidence that it does not carry the
+    // frame (UnifiedCarryVotes::Refuses, unified_queue_law.h). Every record with a valid key and the bounds of its last
+    // completion and cycle is judged once against its frame's readiness (ready_qpc, the readiness the pacer keys per
+    // frame), whichever of the two arrives second, inside the carry epoch (a new probe session, a new record role and every
+    // reset of the law's window start a new one); the votes date by the frame's grid index and expire after
+    // kUnifiedExpireAge planned frames. Without fresh evidence the law decides as before. Resident Evil Requiem under frame
+    // generation (N.180): the adopted one-hop queue (role 4) ran 1.9 ms of a 20.4 ms frame and the frame was ready 18.4 ms
+    // after it finished; its 0.9 ms of idle per frame, while the root rendered the previous frame, read as starvation, kept
+    // I_gpu under the GPU's period and the pacer never held (two frames queued, PC latency +27 ms).
+    bool QueueCarriesFrame() const noexcept;
     // The credit rule is the law's: the law is in use AND the newest record's queue is not a render
-    // queue found by dependency (role 3, kUnifiedQueueRoleRenderQueue in unified_queue_law.h: its hold
-    // block is the order Wait, no grant's hold, so no record pays a law grant and the law's refill would
-    // inflate the credit; the report-based rule then governs the credit and the holds).
+    // queue found by dependency (roles 3 and 4). No grant's hold sits on that queue, so no record pays a
+    // law grant and the law's refill would inflate the credit; the report-based rule governs credit and holds.
     bool CreditByLaw() const noexcept;
     // The counters of the queue law (the holds still unpaid in the ring included); the scheduler
     // logs them and clears them at a transition.
@@ -660,10 +673,17 @@ private:
         bool hold_debited = false;   // its hold was spent once (by RefreshHold, or by the record that names its sequence)
         uint64_t law_hold_sequence = 0; // the sequence given at a law grant (0 = a report-rule grant or none)
         bool hold_unpaid_counted = false; // counted in the summary as never debited
-        bool law_orphaned = false;   // granted by the law but its probe record will not come (session retired, role 3): the measured hold settles it
+        bool law_orphaned = false;   // no paying record (session retired or dependency render queue): the measured hold settles it
         uint32_t unpaid_counted_epoch = 0; // summary_epoch_ at the time it was counted as never debited
         double gpu_active_us = 0.0;  // the report's gpuActiveRenderTimeUs, 0 = unknown
         double ai_frame_us = 0.0;    // the report's frame-generation (AI frame) time, 0 = none
+        // QueueCarriesFrame: the bounds of this frame's record (its last completion and cycle), until judged.
+        int64_t queue_done_lo_qpc = 0;  // the earliest possible last completion of the frame (0 = none, or judged)
+        int64_t queue_done_hi_qpc = 0;  // the latest possible
+        double queue_cycle_lo_us = 0.0; // the record's cycle bounds
+        double queue_cycle_hi_us = 0.0;
+        uint64_t queue_carry_epoch = 0; // carry_epoch_ when the record arrived (a pair across epochs is not judged)
+        bool queue_judged = false;      // judged in queue_carry_epoch (a repeated record does not vote twice)
     };
 
     Entry* EntryFor(uint64_t grid_index) noexcept;
@@ -686,6 +706,11 @@ private:
     Entry* FindByLawSequence(uint64_t sequence) noexcept;
     void SettleLawHold(Entry* entry, double held_us) noexcept;
     void NoteHoldLeaves(Entry* entry) noexcept;
+    // QueueCarriesFrame's evidence: a record's bounds are kept on its frame's entry and judged against the frame's
+    // readiness when both are in (NoteCarryRecord / OnReady -> JudgeCarry), one vote into carry_votes_.
+    void NoteCarryRecord(const PacingGpuQueueRecord& record) noexcept;
+    void JudgeCarry(Entry* entry) noexcept;
+    void ResetCarry() noexcept;
     struct WindowMedians {
         bool cycle_valid = false;    // C valid (at least kUnifiedMinPairs spacings)
         double cycle_us = 0.0;       // C, the median completion spacing
@@ -753,6 +778,12 @@ private:
     bool queue_paced_pending_ = false;
     bool queue_paced_frame_ = false;
     uint8_t queue_role_ = 0; // queue_role of the newest accepted record (0 unknown)
+    // QueueCarriesFrame: the carry votes of the current carry epoch, and the session and role the epoch belongs to. The
+    // epoch advances (ResetCarry) whenever the law's window is reset and at a change of the records' session or role.
+    UnifiedCarryVotes carry_votes_{};
+    uint64_t carry_epoch_ = 1;
+    uint64_t carry_session_ = 0;
+    uint8_t carry_role_ = 0;
     uint64_t law_hold_sequence_counter_ = 0; // the last sequence given at a law grant (never reset: a record in flight cannot alias)
     uint32_t summary_epoch_ = 0;
     UnifiedQueueLawSummary summary_{};

@@ -1239,7 +1239,7 @@ void TestSingleFalseJoinNeverChangesTheAdoptedQueue() {
 void TestPartialCandidatesAndWindowRestarts() {
     Evaluator e;
     e.Reset(false);
-    // A queue reached in only half of the frames is no candidate in the rule, a candidate in the diagnostic mode.
+    // The same strict partial-candidate rule applies to presenting and FG input roots.
     for (int mode = 0; mode < 2; ++mode) {
         e.Reset(mode == 1);
         Row start[2] = {{kP, 0, 0}, {kM, 0, 0}};
@@ -1258,9 +1258,8 @@ void TestPartialCandidatesAndWindowRestarts() {
         CHECK(completed);
         // A queue reached in half of the frames is no candidate; with more command lists than the presenting queue it
         // blocks the adoption (its dependency is missing in the other frames) instead of the presenting queue winning.
-        if (mode == 0) CHECK(!e.decision().adoptable && e.decision().reason == Reason::NotQualifiedPartial &&
-                             e.decision().candidate_count == 1);
-        else CHECK(e.decision().queue == kM && e.decision().candidate_count == 2);
+        CHECK(!e.decision().adoptable && e.decision().reason == Reason::NotQualifiedPartial &&
+              e.decision().queue == kM && e.decision().candidate_count == 1);
     }
     // A change of the presenting queue inside a window starts a new one.
     e.Reset(false);
@@ -1603,6 +1602,105 @@ struct CollectSink final : FeedSink {
     void OnReset() noexcept override { ++resets; }
     void OnDecision(uint8_t, const Decision& d) noexcept override { decisions.push_back(d); }
 };
+
+// The presenter waits on the FG input source; the input source waits on the render queue. Only upstream
+// dependencies of the INPUT are candidates, even when the downstream presenter has many more lists.
+void TestFgInputRootWindows() {
+    enum class Shape { Render, Root, Tie, TwoFences, MissingKey, OtherThread, Deep, Loss };
+    for (Shape shape : {Shape::Render, Shape::Root, Shape::Tie, Shape::TwoFences, Shape::MissingKey,
+                        Shape::OtherThread, Shape::Deep, Shape::Loss}) {
+        Tables tables;
+        FrameFeed feed;
+        CollectSink sink;
+        const auto boundary = [&](uint32_t frame, bool keyed) {
+            BoundaryInput in;
+            in.presenting_queue = kA;
+            in.scope = FgInputScope(1, frame);
+            in.qpc = static_cast<int64_t>(frame) * 1000 + 999;
+            in.keyed = keyed;
+            in.frame_counter = frame + 1;
+            in.mode = 2;
+            feed.OnBoundary(tables, in);
+            feed.Evaluate(tables, sink);
+        };
+        boundary(0, true);
+        for (uint32_t f = 1; f <= kWindowFrames + 2; ++f) {
+            const int64_t t = static_cast<int64_t>(f) * 1000;
+            const uint64_t v = 500 + f;
+            const bool fault = f == kWindowFrames / 2;
+            CHECK(tables.NoteExecute(kP, 100)); // downstream: never a candidate
+            CHECK(tables.NoteExecute(kA, shape == Shape::Root ? 27 : shape == Shape::Tie ? 40 : 1));
+            CHECK(tables.NoteExecute(kM, shape == Shape::Root ? 1 : 40));
+            CHECK(tables.RecordSignal(E(kA, kG, v, t + 700, 0, f)));
+            CHECK(tables.RecordWait(E(kP, kG, v, t + 800, 0, f)));
+            Entry wait = E(kA, kF, v, t + 500, 0, f); // no Present scope; the FG input supplies the key
+            if (shape == Shape::OtherThread && fault) wait.thread = 2;
+            CHECK(tables.RecordWait(wait));
+            CHECK(tables.RecordSignal(E(shape == Shape::Deep ? kB : kM, kF, v, t + 400, 0, f)));
+            if (shape == Shape::Deep || (shape == Shape::TwoFences && fault)) {
+                CHECK(tables.RecordSignal(E(kM, kH, v, t + 100, 0, f)));
+                CHECK(tables.RecordWait(E(shape == Shape::Deep ? kB : kA, kH, v, t + 300, 0, f)));
+            }
+            if (shape == Shape::Loss && fault) {
+                CHECK(tables.HoldLockForTest());
+                CHECK(!tables.RecordSignal(E(kM, kI, v, t + 50, 0, f)));
+                tables.ReleaseLockForTest();
+            }
+            boundary(f, !(shape == Shape::MissingKey && fault));
+        }
+        CHECK(sink.decisions.size() == 1);
+        const Decision& d = sink.decisions[0];
+        CHECK(d.candidates[0].queue == kA);
+        for (uint32_t i = 0; i < d.candidate_count; ++i) CHECK(d.candidates[i].queue != kP);
+        AdoptionSnapshot snapshot;
+        if (shape == Shape::Render || shape == Shape::Root || shape == Shape::Tie) {
+            CHECK(MakeAdoptionSnapshot(d, tables.PublishedQueue(), &snapshot, true));
+            CHECK(!MakeAdoptionSnapshot(d, tables.PublishedQueue(), &snapshot, false)); // wrong boundary kind
+            if (shape == Shape::Render) {
+                CHECK(d.role == Role::FgRenderQueueByDependency && d.queue == kM && d.hops == 1 && d.fence == kF);
+                CHECK(d.candidates[1].keyed == kWindowFrames && d.candidates[1].lists_per_frame == 40.0);
+                CHECK(ApplyDecision(d, true, kM, d.role, kG) == AdoptionAction::Change);
+            } else {
+                CHECK(d.role == Role::FrameGenerationSource && d.queue == kA && d.hops == 0 && !d.fence);
+            }
+        } else {
+            CHECK(!d.adoptable && tables.PublishedQueue() == 0 && !MakeAdoptionSnapshot(d, kM, &snapshot, true));
+            const auto action = ApplyDecision(d, true, kA, Role::FrameGenerationSource, 0);
+            CHECK(action == (shape == Shape::Loss ? AdoptionAction::KeepUnqualified : AdoptionAction::Change));
+            if (shape == Shape::Loss) CHECK(d.reason == Reason::NotQualifiedLoss && d.lost_records != 0);
+            else if (shape == Shape::TwoFences) CHECK(d.reason == Reason::NotQualifiedAmbiguous && d.ambiguous_frames == 1);
+            else if (shape == Shape::Deep) CHECK(d.reason == Reason::NotQualifiedHops && d.hops == 2);
+            else CHECK(d.reason == Reason::NotQualifiedMissingJoin && d.missing_join_frames == 1);
+        }
+    }
+}
+
+void TestFgInputWaitTag() {
+    FgWaitTag tag;
+    Entry wait = E(kA, kF, 7, 50, 0, 20);
+    const auto scope = FgInputScope(wait.thread, wait.epoch);
+    tag.Note(wait, 3);
+    tag.Note(wait, 3);
+    CHECK(tag.Matches(kA, scope) && tag.session == 3 && tag.value == 7 && tag.fence == kF);
+    CHECK(!tag.Matches(kP, scope) && !tag.Matches(kA, FgInputScope(2, 20)) && !tag.Matches(kA, FgInputScope(1, 21)));
+    ++wait.value;
+    tag.Note(wait, 3);
+    CHECK(!tag.Matches(kA, scope)); // cannot disambiguate two root Wait values at the input boundary
+    tag.Note(wait, 4);
+    CHECK(tag.Matches(kA, scope) && tag.session == 4 && tag.value == 8);
+}
+
+// Both FG paths name one real input on one thread: only the exact same (frame id, producer epoch) is a repeat.
+void TestFgInputAdmittedOncePerInput() {
+    FgInputRepeat repeat;
+    CHECK(!repeat.Repeat(0xF1DE83E19937733Dull, 1));        // the first input of a thread is admitted, whatever its id
+    CHECK(repeat.Repeat(0xF1DE83E19937733Dull, 1));         // the second path's call for the same input
+    CHECK(!repeat.Repeat(1, 1) && repeat.Repeat(1, 1));
+    CHECK(!repeat.Repeat(0xF1DE83E19937733Eull, 2));        // another input in another producer epoch
+    CHECK(!repeat.Repeat(0xF1DE83E19937733Eull, 3));        // the same frame id in a new producer epoch: a new input
+    CHECK(!repeat.Repeat(1, 3) && !repeat.Repeat(0xF1DE83E19937733Eull, 3)); // a frame id seen earlier, not last
+    CHECK(!repeat.Repeat(0, 3) && !repeat.Repeat(0, 3));    // no identity: never a repeat
+}
 
 bool SameDecision(const Decision& a, const Decision& b) {
     if (a.valid != b.valid || a.adoptable != b.adoptable || a.role != b.role || a.reason != b.reason || a.queue != b.queue ||
@@ -1969,6 +2067,9 @@ void TestFeedEvaluatedOnAnotherThreadDecidesLikeInline() {
 
 int main() {
     TestTablesAndReader();
+    TestFgInputRootWindows();
+    TestFgInputWaitTag();
+    TestFgInputAdmittedOncePerInput();
     TestResolveMatchesFenceAndValue();
     TestResolveCpuBranchEndAndAmbiguity();
     TestResolveScopeAndWindow();

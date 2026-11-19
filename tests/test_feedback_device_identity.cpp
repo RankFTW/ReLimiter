@@ -8,6 +8,7 @@
 #ifdef _WIN64
 void FgInput_RecordMarker(uint64_t, uint32_t, uint32_t, int64_t) noexcept {}
 void StreamlineHandoff_RecordInbandFrame(uint32_t, uint64_t) noexcept {}
+void Streamline_RecordReflexSyncStatement(uint32_t, bool) noexcept {}
 #endif
 #include "feedback_device_identity.h"
 #include "config.h"

@@ -278,7 +278,7 @@ void UnifiedPacer::RefreshHold(Entry* entry) noexcept
 }
 
 // A probe session was retired (re-adoption) or the newest record's queue became a render queue by
-// dependency (role 3, whose hold block is the order Wait, no grant's hold): no record will pay the holds the law granted before.
+// dependency (roles 3 and 4, on which no grant's hold sits): no record will pay the holds the law granted before.
 // Each such law-granted frame whose hold is not yet spent is marked orphaned and, when its hold is
 // already measured, settled now from the measured hold; an unmeasured one is settled by RefreshHold when
 // its measurement arrives. hold_debited is shared with the record path, so a record that does arrive
@@ -358,7 +358,7 @@ UnifiedHoldGrant UnifiedPacer::GrantHold(uint64_t grid_index, double display_int
     // The credit's stream is live when the report stream is (QueueWaitLive) or the queue law is
     // in use (its records are the credit's stream then). The bank is W × J, or W × a while the
     // hold share's no-room case applies; under the queue law it is always W × J (no W × a bank).
-    const bool law_in_use = CreditByLaw(); // role 3: the report-based rule grants and debits (granted_by_law false)
+    const bool law_in_use = CreditByLaw(); // on a dependency render queue the report rule grants and debits
     if (!QueueWaitLive(grid_index) && !law_in_use) {
         credit_us_ = 0.0; // a stream that is not live carries no credit
     } else {
@@ -536,6 +536,7 @@ void UnifiedPacer::Reset(uint64_t lifecycle_base, uint32_t controller_generation
     granted_ = UnifiedHoldGrant{};
     queue_window_.Reset();
     queue_role_ = 0;
+    ResetCarry();
     queue_planned_index_ = 0;
     last_plan_valid_ = false;
     last_plan_grid_ = 0;
@@ -571,6 +572,8 @@ void UnifiedPacer::OnPlan(uint64_t grid_index, const PacingPlanKey& key, int64_t
         ++summary_.frames_planned;
         if (QueueLawInUse())
             ++summary_.frames_in_use;
+        else if (queue_window_.InUse(PlannedPosition()) && !QueueCarriesFrame())
+            ++summary_.frames_not_carried;
         if (status_valid_ && status_index_ == grid_index && (status_.flags & kUpQueueLawNoHoldCredit) != 0)
             ++summary_.frames_no_hold_credit;
     }
@@ -588,6 +591,8 @@ void UnifiedPacer::OnReady(uint64_t grid_index, const PacingPlanKey& key, int64_
         entry->key_valid = true;
     }
     entry->ready_qpc = qpc;
+    if (entry->queue_done_lo_qpc != 0)
+        JudgeCarry(entry); // the frame's record from a dependency queue came first
     RefreshHold(entry);
     ++version_;
     // The hold of this frame may now be known: the successor's report that waited for it is used now.
@@ -658,6 +663,7 @@ void UnifiedPacer::RetireQueueSession(uint64_t session) noexcept
     queue_window_.Reset();
     SettleOrphanedLawHolds(); // the retired session's records will not pay the holds granted before
     queue_role_ = 0;
+    ResetCarry();
     queue_session_ = session;
     queue_session_retired_ = true;
     status_valid_ = false;
@@ -694,11 +700,19 @@ void UnifiedPacer::OnQueueRecord(const PacingGpuQueueRecord& record) noexcept
         }
     }
     ++summary_.records_accepted;
-    const bool entered_role3 = record.queue_role == kUnifiedQueueRoleRenderQueue &&
-        queue_role_ != kUnifiedQueueRoleRenderQueue;
+    const bool entered_render_queue = UnifiedQueueRole_IsRenderQueueByDependency(record.queue_role) &&
+        !UnifiedQueueRole_IsRenderQueueByDependency(queue_role_);
     queue_role_ = record.queue_role;
-    if (entered_role3)
-        SettleOrphanedLawHolds(); // a role 3 record's hold block is the order Wait, no grant's hold: they will not pay the law's grants
+    if (entered_render_queue)
+        SettleOrphanedLawHolds(); // this queue's records will not pay the law's grants
+    // QueueCarriesFrame: a new session or role starts a new carry epoch; the record waits on its frame's entry for the
+    // frame's readiness (or is judged now when the readiness came first).
+    if (record.session_generation != carry_session_ || record.queue_role != carry_role_) {
+        ResetCarry();
+        carry_session_ = record.session_generation;
+        carry_role_ = record.queue_role;
+    }
+    NoteCarryRecord(record);
     UnifiedQueueSample sample = UnifiedQueueSample_FromRecord(record);
     if (sample.valid)
         ++summary_.records_valid;
@@ -723,8 +737,8 @@ void UnifiedPacer::OnQueueRecord(const PacingGpuQueueRecord& record) noexcept
     queue_window_.Push(sample, arrived);
     ++version_;
     // The credit rule: the law's only while the law is in use and the record's queue is not a render
-    // queue found by dependency (role 3: its hold block is the order Wait, no grant's hold, and its
-    // service is not the presenting queue's). Switching role keeps the one credit state; a hold granted
+    // queue found by dependency: the granted hold is on the root queue, not this queue.
+    // Switching role keeps the one credit state; a hold granted
     // under one rule is debited by that rule only.
     const bool in_use = CreditByLaw();
 
@@ -734,8 +748,8 @@ void UnifiedPacer::OnQueueRecord(const PacingGpuQueueRecord& record) noexcept
     // grant is marked paid, so neither the later measurement (RefreshHold) nor an eviction settles it
     // again, whichever of the record and the measurement arrives first. A record with sequence 0, one
     // naming a sequence that is unknown (never granted, already paid, or settled and gone from the ring)
-    // and a role-3 record (its hold block, when it has one, is the order Wait on the render queue, no grant's hold) debit nothing.
-    if (record.law_hold_sequence != 0 && record.queue_role != kUnifiedQueueRoleRenderQueue &&
+    // and a dependency render queue's record debit nothing.
+    if (record.law_hold_sequence != 0 && !UnifiedQueueRole_IsRenderQueueByDependency(record.queue_role) &&
         (record.valid & PacingGpuQueueRecord::kHoldBlock) != 0 && std::isfinite(record.hold_block_us) &&
         record.hold_block_us >= 0.0) {
         Entry* named = FindByLawSequence(record.law_hold_sequence);
@@ -773,12 +787,61 @@ void UnifiedPacer::OnQueueRecord(const PacingGpuQueueRecord& record) noexcept
 
 bool UnifiedPacer::QueueLawInUse() const noexcept
 {
-    return options_.queue_law && queue_window_.InUse(PlannedPosition());
+    return options_.queue_law && queue_window_.InUse(PlannedPosition()) && QueueCarriesFrame();
+}
+
+bool UnifiedPacer::QueueCarriesFrame() const noexcept
+{
+    return !carry_votes_.Refuses(PlannedIndex(), kUnifiedExpireAge);
+}
+
+void UnifiedPacer::NoteCarryRecord(const PacingGpuQueueRecord& record) noexcept
+{
+    constexpr uint32_t kNeeded = PacingGpuQueueRecord::kLastDone | PacingGpuQueueRecord::kCycle;
+    if ((record.valid & kNeeded) != kNeeded || record.last_done_lo_qpc <= 0 ||
+        record.last_done_lo_qpc > record.last_done_qpc || !PacingFrameKey_IsValid(record.key))
+        return; // no bounds or no frame: no vote
+    // The frame's own entry, as for paced: record k describes frame k's work on the queue.
+    Entry* own = FindByFrame(record.key.domain, record.key.producer_epoch, record.key.frame_id);
+    if (!own || (own->queue_judged && own->queue_carry_epoch == carry_epoch_))
+        return;
+    own->queue_done_lo_qpc = record.last_done_lo_qpc;
+    own->queue_done_hi_qpc = record.last_done_qpc;
+    own->queue_cycle_lo_us = record.cycle_lo_us;
+    own->queue_cycle_hi_us = record.cycle_hi_us;
+    own->queue_carry_epoch = carry_epoch_;
+    own->queue_judged = false;
+    if (own->ready_qpc > 0)
+        JudgeCarry(own); // the readiness came first
+}
+
+// One vote from the bounds (UnifiedCarryVotes::Judge): the tail is the frame's readiness minus the queue's last
+// completion of it, between [ready - latest possible completion, ready - earliest possible completion].
+void UnifiedPacer::JudgeCarry(Entry* entry) noexcept
+{
+    const int64_t done_lo_qpc = entry->queue_done_lo_qpc;
+    entry->queue_done_lo_qpc = 0;
+    if (entry->queue_carry_epoch != carry_epoch_ || entry->queue_judged || entry->ready_qpc <= 0 || frequency_ <= 0)
+        return;
+    entry->queue_judged = true;
+    const double tail_lo_us = UsFromTicks(static_cast<double>(entry->ready_qpc - entry->queue_done_hi_qpc), frequency_);
+    const double tail_hi_us = UsFromTicks(static_cast<double>(entry->ready_qpc - done_lo_qpc), frequency_);
+    const UnifiedCarryVotes::Vote vote =
+        UnifiedCarryVotes::Judge(tail_lo_us, tail_hi_us, entry->queue_cycle_lo_us, entry->queue_cycle_hi_us);
+    carry_votes_.Note(vote, entry->grid_index);
+    ++(vote == UnifiedCarryVotes::Vote::Carried ? summary_.carry_carried
+        : vote == UnifiedCarryVotes::Vote::NotCarried ? summary_.carry_not_carried : summary_.carry_undecided);
+}
+
+void UnifiedPacer::ResetCarry() noexcept
+{
+    carry_votes_.Reset();
+    ++carry_epoch_; // pairs noted before this are not judged
 }
 
 bool UnifiedPacer::CreditByLaw() const noexcept
 {
-    return QueueLawInUse() && queue_role_ != kUnifiedQueueRoleRenderQueue;
+    return QueueLawInUse() && !UnifiedQueueRole_IsRenderQueueByDependency(queue_role_);
 }
 
 // A law-granted frame whose real hold (measured by the report side) was never paid by a record:
@@ -870,6 +933,7 @@ void UnifiedPacer::SetOptions(const UnifiedOptions& options) noexcept
         queue_paced_pending_ = false;
         queue_paced_frame_ = false;
         queue_role_ = 0;
+        ResetCarry();
     }
     // A decrease of the hold share (a live switch away from the share) drops the banked surplus: the holds it funded
     // must not keep acting. A debt, the outstanding grants and their later debits stay; an increase or a rank change
@@ -1132,7 +1196,8 @@ UnifiedStatus UnifiedPacer::Status(uint64_t next_index, double display_interval_
     // reservation (one to two frames older than the frame being planned). In use (12 of the newest
     // 16 arrivals valid, the newest at most 4 planned frames old, 4 valid samples in the window)
     // its I_gpu replaces the report-based one and is bindable; otherwise the report-based rule
-    // stays in charge, unchanged.
+    // stays in charge, unchanged. A dependency queue (roles 3 and 4) decides only while it carries the frame
+    // (QueueCarriesFrame); the window's statistics are computed and reported either way.
     if (options_.queue_law) {
         const double j_us = display_interval_us > 0.0 ? display_interval_us : credit_j_us_;
         const UnifiedQueueResult law = queue_window_.Compute(j_us, QueueLawParams(options_), PlannedPosition());
@@ -1147,7 +1212,8 @@ UnifiedStatus UnifiedPacer::Status(uint64_t next_index, double display_interval_
             status.ql_q_us = law.q_us;
             status.ql_p_us = law.p_us;
         }
-        if (law.in_use) {
+        const bool in_use = law.in_use && QueueCarriesFrame();
+        if (in_use) {
             status.gpu_interval_us = law.gpu_interval_us;
             status.bindable = true;
             status.flags |= kUpQueueLaw;
@@ -1158,8 +1224,8 @@ UnifiedStatus UnifiedPacer::Status(uint64_t next_index, double display_interval_
             if (law.bound_active)
                 status.flags |= kUpQueueLawBound;
         }
-        // The law is in use but the credit and the holds follow the report-based rule (role 3).
-        if (law.in_use && queue_role_ == kUnifiedQueueRoleRenderQueue)
+        // The law is in use but the credit and the holds follow the report-based rule.
+        if (in_use && UnifiedQueueRole_IsRenderQueueByDependency(queue_role_))
             status.flags |= kUpQueueLawNoHoldCredit;
     }
 

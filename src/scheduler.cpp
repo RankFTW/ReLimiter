@@ -442,7 +442,7 @@ static void LogQueueLawSummary(const char* reason) noexcept
     if (s.frames_planned == 0 && s.records_accepted == 0 && s.records_retired == 0 &&
         s.grants_law == 0 && s.grants_report == 0)
         return;
-    char credit_note[320];
+    char credit_note[480];
     credit_note[0] = '\0';
     size_t credit_note_length = 0;
     if (s.holds_settled_orphan != 0)
@@ -450,9 +450,21 @@ static void LogQueueLawSummary(const char* reason) noexcept
             "; %llu law-granted holds settled from the measured hold (their probe record would not come)",
             static_cast<unsigned long long>(s.holds_settled_orphan)));
     if (s.frames_no_hold_credit != 0 && credit_note_length < sizeof(credit_note))
-        std::snprintf(credit_note + credit_note_length, sizeof(credit_note) - credit_note_length,
+        credit_note_length += static_cast<size_t>(std::snprintf(credit_note + credit_note_length,
+            sizeof(credit_note) - credit_note_length,
             "; %llu frames with the law in use took the report-based credit and holds (render queue found by dependency)",
-            static_cast<unsigned long long>(s.frames_no_hold_credit));
+            static_cast<unsigned long long>(s.frames_no_hold_credit)));
+    if (s.frames_not_carried != 0 && credit_note_length < sizeof(credit_note))
+        credit_note_length += static_cast<size_t>(std::snprintf(credit_note + credit_note_length,
+            sizeof(credit_note) - credit_note_length,
+            "; %llu frames the report-based rule decided because the watched queue did not carry the frame",
+            static_cast<unsigned long long>(s.frames_not_carried)));
+    if ((s.carry_carried != 0 || s.carry_not_carried != 0 || s.carry_undecided != 0) &&
+        credit_note_length < sizeof(credit_note))
+        std::snprintf(credit_note + credit_note_length, sizeof(credit_note) - credit_note_length,
+            "; carry votes %llu carried / %llu not carried / %llu undecided (frames judged against their readiness)",
+            static_cast<unsigned long long>(s.carry_carried), static_cast<unsigned long long>(s.carry_not_carried),
+            static_cast<unsigned long long>(s.carry_undecided));
     LOG_INFO("Queue law summary (%s): planned %llu, law in use %llu; records %llu accepted (%llu valid, "
              "%llu late), %llu dropped from a retired session; hold grants %llu law / %llu report; holds "
              "debited %llu by record / %llu by the report rule, %llu never debited, %llu lost unmeasured%s",
@@ -831,7 +843,7 @@ static void RunPassthrough(
     // No owned wait, as under the driver limiter: the frame's Reflex report
     // matches this release with nothing to subtract. Uncapped, that match is
     // what makes the Reflex AI frame time count as evidence that frame
-    // generation presents (CheckDeferredFGInference in compatibility mode).
+    // generation presents (the deferred inference in compatibility mode, FrameGeneration_OnPresent).
     if (context.trigger == SchedulerTrigger::NvApiMarker && context.producer_epoch != 0 &&
         context.producer_epoch == FrameTimeline_CurrentProducerEpoch(FrameIdentityDomain::NvApiFrame)) {
         PublishReflexOwnedSleep(context.frame_id, context.producer_epoch,

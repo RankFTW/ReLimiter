@@ -744,15 +744,29 @@ static bool PinModuleOf(void*, uintptr_t address) noexcept {
     return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
                               reinterpret_cast<LPCWSTR>(address), &module) != FALSE && module != nullptr;
 }
-// A vptr is a class vtable when it lies inside a loaded module (no pin, no refcount change). A seam: tests
-// that build vtables in private pages replace it.
-static bool IsModuleAddress(uintptr_t address) noexcept {
-    if (!address) return false;
+// A vptr is a class vtable when it lies inside a loaded module's image. That module is pinned: the copy's detours read
+// the class vtable's Present / Present1 slots at every call (ForwardOf). A seam: tests that build vtables in private
+// pages replace it.
+static bool PinClassVtable(uintptr_t address) noexcept { return PinModuleOf(nullptr, address); }
+// The module containing `address` (its base), 0 for memory that belongs to no module (no pin, no refcount change).
+static uintptr_t ModuleBaseOf(void*, uintptr_t address) noexcept {
     HMODULE module = nullptr;
-    return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                              reinterpret_cast<LPCWSTR>(address), &module) != FALSE && module != nullptr;
+    if (!address || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                        reinterpret_cast<LPCWSTR>(address), &module)) return 0;
+    return reinterpret_cast<uintptr_t>(module);
 }
-static bool (*s_vptr_in_module)(uintptr_t) = &IsModuleAddress;
+static bool (*s_vptr_in_module)(uintptr_t) = &PinClassVtable;
+// What the Present (present1 false) / Present1 detour of record `index` calls now (vtable_copy::Forward): the slot of
+// the class vtable the record's copy replaced, read at this call. That vtable lies in a pinned module, so the read
+// cannot fault; it is guarded anyway, and a failed read leaves the slot read at copy time.
+static uintptr_t ForwardOf(size_t index, bool present1) noexcept {
+    const vtable_copy::Record* record = s_records.Get(index);
+    if (!record) return 0;
+    uintptr_t live = 0;
+    const size_t slot = present1 ? vtable_copy::kPresent1Slot : vtable_copy::kPresentSlot;
+    GuardedReadPointer(nullptr, record->original_vptr + slot * vtable_copy::kEntrySize, &live);
+    return vtable_copy::Forward(s_records, index, live, present1);
+}
 
 // Reads that stop at anything that is not committed, readable memory without PAGE_GUARD: the region's protection
 // is queried before each new region is read, so a guard page is never touched (touching it would consume the guard
@@ -794,9 +808,10 @@ static bool CompareExchangeVptr(uintptr_t object, uintptr_t expected, uintptr_t 
 }
 
 // Whether the object the game presents on dispatches through the function the typed hook patched, or
-// through one of our vtable detours. The inline hook is a code patch on the function the vtable named at install
-// time (InstallTypedHook), so a vtable slot that now names another function (a proxy or wrapper with its own
-// vtable) is a Present the inline hook never sees. Read at the diagnostic cadence only.
+// through one of our vtable detours. The inline hook is a code patch on the implementation's own function
+// (ResolveNativeTargets), so a vtable slot that now names another function (a proxy, a wrapper with its own vtable,
+// another module's hook) is a Present the inline hook sees only when that function calls it. Read at the diagnostic
+// cadence only.
 static bool ReadVtableSlot(uint64_t object, size_t slot, uint64_t* value) noexcept {
     if (!object) return false;
     __try {
@@ -827,7 +842,7 @@ static void DescribeVtableSlot(const char* name, uint64_t object, size_t slot, b
     else if (record)
         std::snprintf(out, size, "%s vtable[%zu]=0x%llX our vtable detour (record %zu, forwards to 0x%llX) installed",
                       name, slot, static_cast<unsigned long long>(dispatched), record_index,
-                      static_cast<unsigned long long>(present1 ? record->original_present1 : record->original_present));
+                      static_cast<unsigned long long>(ForwardOf(record_index, present1)));
     else if (matched)
         std::snprintf(out, size, "%s vtable[%zu]=0x%llX patched", name, slot,
                       static_cast<unsigned long long>(dispatched));
@@ -962,15 +977,14 @@ void VSync_RouteDiagnosticsTick() {
 enum class PresentEntryKind : uint8_t { Inline, Vtable };
 static thread_local vtable_copy::DedupStack t_dedup;
 
+// A vtable entry's original is what its record forwards to at this entry (ForwardOf); an inline entry's is the trampoline.
 static PFN_Present LoadPresentOriginal(PresentEntryKind kind, size_t slot) noexcept {
     if (kind == PresentEntryKind::Inline) return s_present_targets[slot].original.load(std::memory_order_acquire);
-    const vtable_copy::Record* record = s_records.Get(slot);
-    return record ? reinterpret_cast<PFN_Present>(record->original_present) : nullptr;
+    return reinterpret_cast<PFN_Present>(ForwardOf(slot, false));
 }
 static PFN_Present1 LoadPresent1Original(PresentEntryKind kind, size_t slot) noexcept {
     if (kind == PresentEntryKind::Inline) return s_present1_targets[slot].original.load(std::memory_order_acquire);
-    const vtable_copy::Record* record = s_records.Get(slot);
-    return record ? reinterpret_cast<PFN_Present1>(record->original_present1) : nullptr;
+    return reinterpret_cast<PFN_Present1>(ForwardOf(slot, true));
 }
 
 __declspec(noinline) static HRESULT PresentBody(
@@ -1362,7 +1376,7 @@ static void NoteForeignBeforeDrop(const VtableBinding& binding) noexcept {
     uintptr_t vptr = 0;
     if (!GuardedReadPointer(nullptr, binding.object, &vptr)) return;
     if (s_records.IndexOfCopy(vptr) != vtable_copy::kNoRecord || vptr == binding.replaced_vptr || s_history.IsForeign(vptr)) return;
-    if (!s_history.Note(vptr, vtable_copy::VptrHistory::Kind::Foreign)) LogHistoryFullOnce();
+    if (!s_history.Note(vptr, vtable_copy::VptrHistory::Kind::Foreign, binding.replaced_vptr)) LogHistoryFullOnce();
     if (s_vptr_replacements.fetch_add(1, std::memory_order_relaxed) == 0)
         LOG_WARN("VSync vtable copy: object 0x%llX has the vptr 0x%llX of another module over our copy 0x%llX when its binding is "
                  "dropped; remembered, never copied over", static_cast<unsigned long long>(binding.object),
@@ -1388,14 +1402,14 @@ static void PublishExpected(uintptr_t object, uintptr_t vptr) noexcept {
 // slots 0 to 40 points outside every loaded module (that code cannot be retained), when the vptr is not
 // inside a module's image or is a foreign vtable seen before, or when the history is full: the inline patch alone
 // stays the Present entry then (logged). Every module that supplies a callable entry of slots 0 to 40 is pinned
-// before the copy is published.
+// before the copy is published, and so is the module of the class vtable (the detours read its slots 8 and 22).
 static bool InstallCopyLocked(VtableBinding& binding, uintptr_t vptr, const char* why) noexcept {
     // The binding keeps the identity of a copy it installed before (copy_vptr, and the vptr that copy replaced)
     // through a refused attempt; only a binding that never had one records the vptr it examined.
     if (binding.copy_vptr == 0) binding.replaced_vptr = vptr;
     // Two rules before anything is read. A vptr that is a foreign vtable we saw over our copy is left alone (a
     // hook that saved our entry would chain a second copy into a cycle); and a copy goes only over a class vtable,
-    // a vptr inside a loaded module's image, never over a vptr in private memory.
+    // a vptr inside a loaded module's image (that module is pinned here), never over a vptr in private memory.
     if (s_history.IsForeign(vptr)) {
         const uint32_t failures = s_vtable_failures.fetch_add(1, std::memory_order_relaxed);
         if (failures < 8)
@@ -1575,7 +1589,7 @@ static void ReconcileLocked(uintptr_t object, uintptr_t vptr, bool selected) noe
                              static_cast<unsigned long long>(object), static_cast<unsigned long long>(vptr),
                              static_cast<unsigned long long>(binding->copy_vptr));
                 binding->left_alone = true;
-                if (!s_history.Note(vptr, vtable_copy::VptrHistory::Kind::Foreign)) LogHistoryFullOnce();
+                if (!s_history.Note(vptr, vtable_copy::VptrHistory::Kind::Foreign, binding->replaced_vptr)) LogHistoryFullOnce();
             }
         } else if (vptr == binding->replaced_vptr) {
             // Refused on this very vptr before: a selection tries again (the history and the rules decide).
@@ -1666,21 +1680,61 @@ void VSync_RestoreVtables() {
                  "(the copies and detours stay mapped)", restored, foreign);
 }
 
-// The functions the inline patch belongs on: what the object's copy forwards to (DXGI's own, never one of our
-// detours). `live_only`: only while the object's vptr is one of our copies now (the vtable entry carries the
-// route); otherwise the record of the copy the binding installed. False when there is none.
-static bool VtableOriginalTargets(uintptr_t object, void** present, void** present1, bool live_only = false) noexcept {
+// The functions an inline patch belongs on (vtable_copy::NativeTarget): the implementation's own Present and Present1,
+// found from the class vtable the object was created with: the one the record of the copy it carries or last carried
+// replaced; for a foreign vtable seen over our copy, the one that copy replaced (the history: the object's binding can
+// have been dropped since, by a destroy and init of a resize); else its vptr, which counts only when it is a class
+// vtable. `live_present` / `live_present1`: the slots as read now (0: none). Null targets: nothing is patched.
+struct NativeTargets {
+    bool carried = false;       // the object's vptr is one of our copies now: the vtable entry carries the route
+    uintptr_t forward_present = 0, forward_present1 = 0; // what the record's detours forward to now (0: no record)
+    void* present = nullptr;
+    void* present1 = nullptr;
+};
+static NativeTargets ResolveNativeTargets(uintptr_t object, uintptr_t live_present, uintptr_t live_present1) noexcept {
+    NativeTargets targets;
+    uintptr_t current = 0;
+    if (!GuardedReadPointer(nullptr, object, &current)) return targets;
     VtableLock lock;
+    const size_t own = s_records.IndexOfCopy(current);
+    targets.carried = own != vtable_copy::kNoRecord;
     const VtableBinding* binding = FindBinding(object);
-    if (!binding || binding->copy_vptr == 0) return false;
-    uintptr_t current = binding->copy_vptr;
-    if (live_only && (!GuardedReadPointer(nullptr, object, &current) || s_records.IndexOfCopy(current) == vtable_copy::kNoRecord))
-        return false;
-    const vtable_copy::Record* record = s_records.Get(s_records.IndexOfCopy(current));
-    if (!record) return false;
-    *present = reinterpret_cast<void*>(record->original_present);
-    *present1 = reinterpret_cast<void*>(record->original_present1);
-    return true;
+    const size_t index = targets.carried ? own
+        : binding && binding->copy_vptr ? s_records.IndexOfCopy(binding->copy_vptr) : vtable_copy::kNoRecord;
+    const vtable_copy::Record* record = s_records.Get(index);
+    uintptr_t class_vptr = current;
+    if (record) {
+        targets.forward_present = ForwardOf(index, false);
+        targets.forward_present1 = ForwardOf(index, true);
+        class_vptr = record->original_vptr;
+    } else if (const uintptr_t over = s_history.ClassOf(current)) {
+        class_vptr = over;
+    }
+    const vtable_copy::Modules modules{nullptr, &ModuleBaseOf};
+    targets.present = reinterpret_cast<void*>(vtable_copy::NativeTarget(s_records, class_vptr, live_present, false, modules));
+    targets.present1 = reinterpret_cast<void*>(vtable_copy::NativeTarget(s_records, class_vptr, live_present1, true, modules));
+    return targets;
+}
+
+// Once per slot: the slot (or what our copy forwards to) names another function than the implementation's own, for
+// example another module's hook written into the class vtable or a vtable copied from ours.
+static void NoteNotImplementation(size_t index, uint64_t object, uintptr_t named, const void* target) noexcept {
+    static std::atomic<bool> logged[2]{};
+    if (!named || named == reinterpret_cast<uintptr_t>(target) || logged[index].exchange(true, std::memory_order_relaxed)) return;
+    const char* const name = index == 0 ? "Present" : "Present1";
+    char module[MAX_PATH];
+    ModuleOf(named, module, sizeof(module));
+    if (target) {
+        char target_module[MAX_PATH];
+        ModuleOf(reinterpret_cast<uint64_t>(target), target_module, sizeof(target_module));
+        LOG_WARN("VSync: the %s slot of swapchain 0x%llX names 0x%llX in %s, not the implementation's own %s; an inline patch "
+                 "goes only on 0x%llX in %s", name, static_cast<unsigned long long>(object), static_cast<unsigned long long>(named),
+                 module, name, static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(target)), target_module);
+    } else {
+        LOG_WARN("VSync: the %s slot of swapchain 0x%llX names 0x%llX in %s, not the implementation's own %s, and no copy of the "
+                 "class vtable names it; no inline %s patch is installed", name, static_cast<unsigned long long>(object),
+                 static_cast<unsigned long long>(named), module, name, name);
+    }
 }
 
 // Teardown: the DXGI Present / Present1 inline patches stay ENABLED and passing through (the detour forwards when
@@ -1761,12 +1815,15 @@ static void ReportTypedInstall(const char* name, size_t index, void* object,
 // kScopes consecutive present scopes of the selected native swapchain (a cached function pointer, a second
 // interface): one batch (one process freeze), never removed, never repeated.
 static void InstallInlineFallback(uint64_t native) noexcept {
-    void* present_addr = nullptr;
-    void* present1_addr = nullptr;
-    if (!VtableOriginalTargets(static_cast<uintptr_t>(native), &present_addr, &present1_addr, false)) {
-        LOG_WARN("NativeGate: the vtable entry was bypassed for %u consecutive present scopes of swapchain 0x%llX but its object has "
-                 "no forwarding record; no inline patch installed", vtable_copy::FallbackCounter::kScopes,
-                 static_cast<unsigned long long>(native));
+    const NativeTargets targets = ResolveNativeTargets(static_cast<uintptr_t>(native), 0, 0);
+    void* const present_addr = targets.present;
+    void* const present1_addr = targets.present1;
+    NoteNotImplementation(0, native, targets.forward_present, present_addr);
+    NoteNotImplementation(1, native, targets.forward_present1, present1_addr);
+    if (!present_addr && !present1_addr) {
+        LOG_WARN("NativeGate: the vtable entry was bypassed for %u consecutive present scopes of swapchain 0x%llX but the "
+                 "implementation's own Present and Present1 are not known; no inline patch installed",
+                 vtable_copy::FallbackCounter::kScopes, static_cast<unsigned long long>(native));
         return;
     }
     LOG_WARN("NativeGate: no vtable entry ran in %u consecutive present scopes of swapchain 0x%llX (the native Present bypasses "
@@ -1777,17 +1834,19 @@ static void InstallInlineFallback(uint64_t native) noexcept {
     s_diag_installed_present.store(reinterpret_cast<uint64_t>(present_addr), std::memory_order_relaxed);
     s_diag_installed_present1.store(reinterpret_cast<uint64_t>(present1_addr), std::memory_order_relaxed);
     bool already0 = false, already1 = false;
-    MH_STATUS status0, status1;
+    MH_STATUS status0 = MH_OK, status1 = MH_OK;
     {
         HookBatch batch(HookBatchSite::DxgiFallback);
-        status0 = InstallTypedHook(s_present_targets, present_addr, s_present_thunks, &already0);
-        status1 = InstallTypedHook(s_present1_targets, present1_addr, s_present1_thunks, &already1);
+        if (present_addr) status0 = InstallTypedHook(s_present_targets, present_addr, s_present_thunks, &already0);
+        if (present1_addr) status1 = InstallTypedHook(s_present1_targets, present1_addr, s_present1_thunks, &already1);
         if (batch) batch.Apply();
         FinalizeTypedEnables(s_present_targets);
         FinalizeTypedEnables(s_present1_targets);
     }
-    ReportTypedInstall("IDXGISwapChain::Present", 0, nullptr, s_present_targets, present_addr, status0, already0);
-    ReportTypedInstall("IDXGISwapChain1::Present1", 1, nullptr, s_present1_targets, present1_addr, status1, already1);
+    if (present_addr)
+        ReportTypedInstall("IDXGISwapChain::Present", 0, nullptr, s_present_targets, present_addr, status0, already0);
+    if (present1_addr)
+        ReportTypedInstall("IDXGISwapChain1::Present1", 1, nullptr, s_present1_targets, present1_addr, status1, already1);
 }
 
 void VSync_NoteFinishedPresent(uint64_t native) {
@@ -1814,20 +1873,18 @@ static void VSync_InstallDXGIHooksImpl(void* native_swapchain) {
     // Every raw read of the object happens before a batch is opened: a fault here (caught by the caller) must not
     // skip a destructor that holds the hook installer lock.
     // With the private vtable copy installed on the object (its vptr is ours) the vtable entry carries the route and
-    // no inline patch is installed; the patch belongs on the functions the copy forwards to only when the copy was
-    // refused (all bindings taken, a foreign vptr, an unsupported object) or later when it is bypassed.
-    void* copy_present = nullptr;
-    void* copy_present1 = nullptr;
-    const bool carried = VtableOriginalTargets(reinterpret_cast<uintptr_t>(sc), &copy_present, &copy_present1, true);
-    void* present_addr = nullptr;
-    if (!carried) {
-        // Get Present from vtable (index 8 in IDXGISwapChain)
-        void** vtable = *reinterpret_cast<void***>(sc);
-        present_addr = vtable[8];
-    }
+    // no inline patch is installed; otherwise the patch goes on the implementation's own functions
+    // (ResolveNativeTargets), never on what another module's vtable or hook names in their slots.
+    void** const vtable = *reinterpret_cast<void***>(sc);
+    const uintptr_t live_present = reinterpret_cast<uintptr_t>(vtable[8]);
+    const NativeTargets targets = ResolveNativeTargets(reinterpret_cast<uintptr_t>(sc), live_present,
+                                                       reinterpret_cast<uintptr_t>(vtable[22]));
+    const bool carried = targets.carried;
+    void* const present_addr = carried ? nullptr : targets.present;
+    if (!carried) NoteNotImplementation(0, reinterpret_cast<uint64_t>(sc), live_present, present_addr);
     // Diagnostics (log text only): the object the hooks were installed from and the hooked addresses.
     s_diag_installed_object.store(reinterpret_cast<uint64_t>(sc), std::memory_order_relaxed);
-    s_diag_installed_present.store(reinterpret_cast<uint64_t>(carried ? copy_present : present_addr), std::memory_order_relaxed);
+    s_diag_installed_present.store(reinterpret_cast<uint64_t>(targets.present), std::memory_order_relaxed);
 
     IDXGISwapChain1* sc1 = nullptr;
     void* present1_addr = nullptr;
@@ -1836,12 +1893,15 @@ static void VSync_InstallDXGIHooksImpl(void* native_swapchain) {
             __uuidof(IDXGISwapChain1),
             reinterpret_cast<void**>(&sc1))) && sc1) {
         // The copy covers the interface pointer of `sc` itself; another interface pointer has its own vtable.
-        want_present1 = !(carried && static_cast<void*>(sc1) == static_cast<void*>(sc));
-        if (want_present1) {
-            void** vtable1 = *reinterpret_cast<void***>(sc1);
-            present1_addr = vtable1[22];
+        const bool same = static_cast<void*>(sc1) == static_cast<void*>(sc);
+        want_present1 = !(carried && same);
+        if (want_present1 && !same) {
+            const uintptr_t live_present1 = reinterpret_cast<uintptr_t>((*reinterpret_cast<void***>(sc1))[22]);
+            present1_addr = ResolveNativeTargets(reinterpret_cast<uintptr_t>(sc1), 0, live_present1).present1;
+            NoteNotImplementation(1, reinterpret_cast<uint64_t>(sc1), live_present1, present1_addr);
         } else {
-            present1_addr = copy_present1;
+            present1_addr = targets.present1;
+            if (want_present1) NoteNotImplementation(1, reinterpret_cast<uint64_t>(sc), reinterpret_cast<uintptr_t>(vtable[22]), present1_addr);
         }
         s_diag_installed_present1.store(reinterpret_cast<uint64_t>(present1_addr), std::memory_order_relaxed);
         sc1->Release();
@@ -1853,24 +1913,26 @@ static void VSync_InstallDXGIHooksImpl(void* native_swapchain) {
         if (!logged.exchange(true, std::memory_order_relaxed))
             LOG_INFO("VSync: no inline patch on DXGI's Present 0x%llX: the vtable entry of swapchain 0x%llX carries the route "
                      "(the pair is installed only if %u consecutive present scopes pass without a vtable entry)",
-                     static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(copy_present)),
+                     static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(targets.present)),
                      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(sc)), vtable_copy::FallbackCounter::kScopes);
     }
-    if (carried && !want_present1) return;
+    const bool install_present = !carried && present_addr;
+    const bool install_present1 = want_present1 && present1_addr;
+    if (!install_present && !install_present1) return;
 
     bool already0 = false, already1 = false;
     MH_STATUS status0 = MH_OK, status1 = MH_OK;
     {
         HookBatch batch(HookBatchSite::FirstPresent); // one freeze for the pair; a no-op inside an enclosing batch
-        if (!carried) status0 = InstallTypedHook(s_present_targets, present_addr, s_present_thunks, &already0);
-        if (want_present1) status1 = InstallTypedHook(s_present1_targets, present1_addr, s_present1_thunks, &already1);
+        if (install_present) status0 = InstallTypedHook(s_present_targets, present_addr, s_present_thunks, &already0);
+        if (install_present1) status1 = InstallTypedHook(s_present1_targets, present1_addr, s_present1_thunks, &already1);
         if (batch) batch.Apply();
         FinalizeTypedEnables(s_present_targets);
         FinalizeTypedEnables(s_present1_targets);
     }
-    if (!carried)
+    if (install_present)
         ReportTypedInstall("IDXGISwapChain::Present", 0, sc, s_present_targets, present_addr, status0, already0);
-    if (want_present1)
+    if (install_present1)
         ReportTypedInstall("IDXGISwapChain1::Present1", 1, sc, s_present1_targets, present1_addr, status1, already1);
 }
 

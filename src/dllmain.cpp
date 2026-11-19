@@ -459,8 +459,8 @@ static void on_present_impl(reshade::api::command_queue* queue,
         }
     }
 
-    // Check deferred FG inference (promotes or revokes after confirmation window)
-    CheckDeferredFGInference();
+    // Frame generation's state: the deferred inference, Streamline's in-band statement, the resolver's publication
+    FrameGeneration_OnPresent();
 
     LARGE_INTEGER now_qpc;
     QueryPerformanceCounter(&now_qpc);

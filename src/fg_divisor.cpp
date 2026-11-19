@@ -60,7 +60,10 @@ int ComputeFGDivisorRaw() {
         presets.mfg_generation_factor,
         streamline_has_mode_data,
         mode,
-        GetCurrentReflexAiFrameTimeUs());
+        GetCurrentReflexAiFrameTimeUs(),
+        // The published effective state came from Streamline's in-band statement: its multiplier decides.
+        Streamline_StatementAuthority(),
+        actual);
 }
 
 double ComputeFGDivisor() {

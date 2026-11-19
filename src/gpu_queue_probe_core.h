@@ -33,10 +33,13 @@
 //   wait_block(i) = max(0, start - max(e_i, done(i-1))): the part of the margin caused by Waits.
 // The first submission of a frame has the boundary Waits (ReLimiter's hold, the frame-generation
 // wait, the game's own) in front of it. Its gap max(0, e_1 - done of the previous frame's last
-// submission) is gq_first_gap_us, an upper bound that contains the hold and CPU time; its walk
-// pieces do not go to empty (empty is exact inside the frame only). gq_boundary_idle_us =
-// max(0, e_1 - free after the boundary Waits): the time the queue was free of work and of
-// pending Waits before the first submission (0 when a boundary Wait is released after e_1).
+// submission) is gq_first_gap_us, an upper bound that contains the hold and CPU time. Its walk
+// pieces do not go to empty (empty is exact inside the frame only); its empty pieces (before the
+// first boundary Wait, between the Waits, after the last) are gq_boundary_idle_us: the time the
+// queue was free of work and of pending Waits before the first submission. A boundary Wait still
+// pending at e_1 ends the stretch after the Waits, never the empty time in front of it (Metal Eden,
+// N.176: the next frame's first work 3 ms after the previous frame's last completion, just behind a
+// Wait enqueued in front of it, is 3 ms of boundary idle, not 0).
 // gq_wait_idle_us sums wait_idle over every Wait attributed to the frame (boundary Waits and
 // Waits inside it). gq_cycle_us = last done of this frame minus last done of the previous one.
 //
@@ -52,8 +55,10 @@
 // in queue order that arrived before release(H) (after x_hold); gq_hold_block_us =
 // release(H) - max(e of the first such submission, x_hold) per hold, 0 when none queued before the
 // release (valid, the hold cost nothing). gq_min_margin_free_us is the smallest margin with the
-// hold's share removed: start(i) - max(e_i, release(H)) for submissions queued behind it, the plain
-// margin otherwise (clamped >= 0). An announced hold whose Wait never appears was satisfied
+// hold's share removed: start(i) - e_i - (release(H) - max(e_i, x_hold)) for submissions queued behind
+// it (one queued before the queue reached the hold keeps x_hold - e_i, the time it sat queued while the
+// queue was busy in front of the hold), the plain margin otherwise (clamped >= 0). An announced hold
+// whose Wait never appears was satisfied
 // before it was enqueued and is ignored (counted when evicted). The announce may carry the sequence the queue law
 // assigned to the grant of the hold (law_hold_sequence, 0 = none: not a law hold, or a zero-length hold); the frame
 // whose Wait matches the hold takes that sequence into its record (PacingGpuQueueRecord::law_hold_sequence, the same

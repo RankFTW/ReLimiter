@@ -9,8 +9,10 @@
 
 #ifdef _WIN64
 
-// FG state — read by scheduler
-extern std::atomic<int>  g_fg_multiplier;  // raw numFramesToGenerate
+// FG state, read by the scheduler, the route and the overlay: the EFFECTIVE state, published only by the resolver in
+// streamline_hooks.cpp (FrameGeneration_ResolveState in fg_state_policy.h) from Streamline's options, the legacy
+// evidence (GetState, the deferred inference) and Streamline's fresh in-band statement (SetReflexSync fgMultiplier).
+extern std::atomic<int>  g_fg_multiplier;  // effective generated frames per real frame (numFramesToGenerate's meaning)
 extern std::atomic<bool> g_fg_active;
 extern std::atomic<bool> g_fg_presenting;  // true when FG is actually producing frames
 
@@ -20,7 +22,7 @@ extern std::atomic<int>  g_fg_mode;
 // Game's requested MaxFrameLatency, captured by FLC vtable hook
 extern std::atomic<uint32_t> g_game_requested_latency;
 
-// Driver-reported actual FG multiplier from GetState
+// Effective multiplier (output frames per real frame) when known: the in-band statement or GetState's
 extern std::atomic<int> g_fg_actual_multiplier;
 
 // Owned loader-install worker only, with a referenced interposer module and
@@ -28,9 +30,18 @@ extern std::atomic<int> g_fg_actual_multiplier;
 // True once Streamline resolves slDLSSGSetOptions: slInit has loaded DLSS-G.
 bool HookStreamlinePCL(HMODULE hInterposer);
 
-// Called each frame from the scheduler to check if deferred FG inference
-// should be promoted (for games that never call GetState, e.g. HFW).
-void CheckDeferredFGInference();
+// Once per Present: the deferred inference, the in-band statement's acceptance and freshness, the Dynamic MFG
+// check, then the resolver publishes the effective state when it changed.
+void FrameGeneration_OnPresent();
+
+// Hook_SetReflexSync, every call (Streamline's DLSS-G thread): one lock-free fold of the stated multiplier. A call
+// that states nothing (0, a disable call) neither changes the statement nor keeps it fresh.
+void Streamline_RecordReflexSyncStatement(uint32_t stated, bool disable) noexcept;
+
+// The published resolver results: whether the in-band statement decided the state, and why the FG input route
+// cannot take frames now (nullptr: it can; FrameGeneration_RouteRejection).
+bool Streamline_StatementAuthority() noexcept;
+const char* Streamline_RouteRejection() noexcept;
 
 // Returns true if the FG runtime DLL is loaded (nvngx_dlssg.dll etc.)
 bool IsFGDllLoaded();
@@ -69,7 +80,10 @@ inline std::atomic<uint32_t> g_game_requested_latency{0};
 inline std::atomic<int>      g_fg_actual_multiplier{0};
 
 inline bool HookStreamlinePCL(HMODULE) { return false; }
-inline void CheckDeferredFGInference() {}
+inline void FrameGeneration_OnPresent() {}
+inline void Streamline_RecordReflexSyncStatement(uint32_t, bool) noexcept {}
+inline bool Streamline_StatementAuthority() noexcept { return false; }
+inline const char* Streamline_RouteRejection() noexcept { return "fg_not_presenting"; }
 inline bool IsFGDllLoaded() { return false; }
 inline bool IsDmfgSession() { return false; }
 inline bool IsDmfgActive() { return false; }
