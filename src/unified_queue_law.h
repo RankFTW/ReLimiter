@@ -64,9 +64,10 @@
 //       the mean cycle by more than the GPU's deficit to the cap. result.bound_active when the
 //       bound is strictly the smaller side; P (p_us) stays B's correction, so I_gpu may be below
 //       B + P.
-//   refill (per arrived valid sample, while in use) = max(0, J - S^) + min(sigma*S^, max(0, S^ - J)); the pacer bounds
-//       the second (share) term by the median frame generation time A of the used reports (UnifiedPacer::OnQueueRecord).
-//   debit (per arrived valid sample) = the sample's hold block.
+//   refill (per arrived valid sample, while in use) = J - S^ signed (slack when positive, the GPU's deficit when
+//       negative), or the share term where it funds an allowance; the pacer bounds the share by the median frame
+//       generation time A of the used reports, and A = 0 leaves the signed term (UnifiedPacer::OnQueueRecord).
+//   debit (of the law grant a record names) = the record's hold block beyond the slack max(0, J - S^).
 // The cycle includes the time a frame waited behind ReLimiter's hold; B keeps it only as above, so I_gpu
 // never adds the mean hold: a block beyond the common level and the slack moves B by its length as the
 // F-frame mean catches up (F arrivals), no sooner and no further.
@@ -169,8 +170,7 @@ struct UnifiedQueueResult {
     double p_us = 0.0;          // P after the clamp
     double guard_us = 0.0;
     double gpu_interval_us = 0.0; // I_gpu = B + P
-    double refill_us = 0.0;     // the credit's refill per arrived valid sample under the law: refill_slack_us + refill_share_us
-    double refill_slack_us = 0.0; // max(0, J - S^): the slack the cap leaves
+    double refill_slack_us = 0.0; // max(0, J - S^): the slack the cap leaves; a law grant's hold block beyond it is the debit
     double refill_share_us = 0.0; // min(sigma * S^, max(0, S^ - J)): the share part; the pacer bounds it by the frame generation time A
 };
 

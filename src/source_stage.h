@@ -189,11 +189,12 @@ struct SourceStageRequest {
     // Developer key gpu_wait_ab_interleave_s: also judge the state's condition while late_guard is
     // false, for the flag only (kUpLateSeen).
     bool late_observe = false;
-    // Start term of the collision guard (lead_controller.h; developer key gpu_wait_start_limit, default on): the GPU
-    // queue wait lead of a plan made on present-first ordering (`ordered`, below) is also limited to 2 I less the
-    // render queue's resume after the hold's release and its turnaround, and the plan carries the limit to the executor
-    // (PacingFramePlan::lead_limit_us). Both planning branches hand it to the lead; a plan that is not ordered gets
-    // no term.
+    // Start term of the collision guard (lead_controller.h; developer key gpu_wait_start_limit, default on): the lead
+    // of a GPU queue wait plan made on present-first ordering (`ordered`, below) and of every FG input wait plan is
+    // also limited to 2 I less W (the render queue's resume after the hold's release; on the FG input wait the game's
+    // Present return after the gate) and the game's turnaround, and the plan carries the limit to the executor
+    // (PacingFramePlan::lead_limit_us). Both planning branches hand it to the lead; a GPU queue wait plan that is not
+    // ordered gets no term.
     bool start_limit = false;
     // Developer key gpu_wait_ab_interleave_s: compute and report the term while start_limit is false (its off
     // periods): the source record shows the limit and plan_start_applied 0.

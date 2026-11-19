@@ -4332,18 +4332,20 @@ namespace
     constexpr double kStartResume = 810.0;     // y − o of the scripted games: the render queue's resume
     constexpr double kStartTurnaround = 150.0; // a(n + 1) − b(n) of the scripted games
 
-    // One GPU queue wait frame, in µs of the test clock; a field below 0 is a stamp the owner never gave.
+    // One GPU queue wait or FG input wait frame, in µs of the test clock; a field below 0 is a stamp the owner never
+    // gave.
     struct StartFrame {
         uint64_t index = 0;
         double interval_us = kInterval;
         double arrival_us = -1.0;   // a
         double release_us = 0.0;    // s
-        double present_us = 0.0;    // p
+        double present_us = 0.0;    // p (on the FG input wait the input callback)
         double ready_us = 0.0;      // r
         double output_us = 0.0;     // o
         double processed_us = -1.0; // x
         double passed_us = -1.0;    // y
         double end_us = -1.0;       // b
+        double marker_us = -1.0;    // m: the game's PRESENT_START (MarkerArrival; the FG input wait's)
         PacingPlanStatus status = PacingPlanStatus::Held;
         PacingRung rung = PacingRung::GpuQueueWait;
         double fg_divisor = 1.0;
@@ -4425,7 +4427,8 @@ namespace
     void ShiftFrame(StartFrame* frame, double us)
     {
         for (double* time : { &frame->arrival_us, &frame->release_us, &frame->present_us, &frame->ready_us,
-                              &frame->output_us, &frame->processed_us, &frame->passed_us, &frame->end_us }) {
+                              &frame->output_us, &frame->processed_us, &frame->passed_us, &frame->end_us,
+                              &frame->marker_us }) {
             if (*time >= 0.0) *time += us;
         }
     }
@@ -4456,6 +4459,7 @@ namespace
                 piece.event = InGeneration(Event(frame.index, kind, at_us, frame.status), frame.generation);
                 pieces.push_back(piece);
             };
+            add(Kind::MarkerArrival, frame.marker_us);
             add(Kind::PresentCall, frame.present_us);
             add(Kind::GpuReady, frame.ready_us);
             add(Kind::OutputRelease, frame.output_us);
@@ -4543,6 +4547,91 @@ namespace
         request.collision_guard = true;
         request.start_limit = true;
         request.ordered = true;
+        request.spike_floor = false;
+        return request;
+    }
+
+    // FG input wait games (the start term's FG output, lead_controller.h): W = 140 µs, the game's Present return after
+    // the later of the previous frame's gate and its own PRESENT_START, and G = 260 µs, its next arrival after that
+    // return; their 20 µs bins put W99 at 150 and G99 at 270, so the limit is 2 I − 420 µs.
+    constexpr double kFgResume = 140.0;
+    constexpr double kFgTurnaround = 260.0;
+    constexpr double kFgLimit = 2.0 * kInterval - (150.0 + 270.0);
+
+    struct FgShape {
+        double interval_us = kInterval;
+        double present_us = 6000.0; // m − s: the game's simulation and render submission
+        double ready_us = 8000.0;   // r − s
+        double lead_us = 17000.0;   // o − s
+        double odd_lead_us = -1.0;  // ≥ 0: every odd frame's lead; short, so its successor's PRESENT_START follows its gate
+        double resume_us = kFgResume;
+        double turnaround_us = kFgTurnaround;
+        bool tied = true; // false: a game thread a frame ahead asks for the next frame an interval on
+    };
+
+    // The frames first .. first + count − 1 of a game behind the FG input wait (FG 2×), each released at its arrival:
+    // PRESENT_END = max(the previous frame's gate, PRESENT_START) + W, the input callback (PresentCall) 1,500 µs after
+    // the previous frame's gate, and the next arrival G after PRESENT_END (tied) or an interval after this one
+    // (untied: before that end once PRESENT_START is more than an interval after the arrival). previous_output_us is
+    // the gate of the frame before the first (below 0: none).
+    std::vector<StartFrame> MakeFgGame(uint64_t first, size_t count, const FgShape& shape = FgShape{},
+        double first_us = 4100000.0, double previous_output_us = -1.0)
+    {
+        std::vector<StartFrame> frames;
+        frames.reserve(count);
+        double arrival_us = first_us;
+        for (size_t i = 0; i < count; ++i) {
+            StartFrame frame;
+            frame.index = first + i;
+            frame.rung = PacingRung::FgInputWait;
+            frame.fg_divisor = 2.0;
+            frame.interval_us = shape.interval_us;
+            frame.arrival_us = arrival_us;
+            frame.release_us = arrival_us;
+            frame.marker_us = arrival_us + shape.present_us;
+            frame.ready_us = arrival_us + shape.ready_us;
+            frame.output_us = arrival_us + (shape.odd_lead_us >= 0.0 && frame.index % 2 == 1
+                ? shape.odd_lead_us : shape.lead_us);
+            frame.end_us = std::max(previous_output_us, frame.marker_us) + shape.resume_us;
+            frame.present_us = (previous_output_us >= 0.0 ? previous_output_us : frame.marker_us) + 1500.0;
+            previous_output_us = frame.output_us;
+            arrival_us = shape.tied ? frame.end_us + shape.turnaround_us : arrival_us + shape.interval_us;
+            frames.push_back(frame);
+        }
+        return frames;
+    }
+
+    // 40 FG warm-up frames without evidence of the term (WarmFrames on the FG input wait, 2×): the FG bucket's lead at
+    // 21,510 µs (at 3 I with warm_ready_us just under it), then an FG game from position 40. A tied game of one lead
+    // starts in its steady state: the last warm-up frame's gate opens (L − W − G) / 2 after the game's first arrival,
+    // so every frame arrives (L + W + G) / 2 after the one before (8,700 µs) and its PRESENT_START comes (L − M − (L +
+    // W + G) / 2) before the previous gate (2,300 µs). From a gate that does not bind, the game would alternate frames
+    // whose PRESENT_START meets that gate exactly.
+    std::vector<StartFrame> FgWarmedGame(size_t count, const FgShape& shape = FgShape{}, double warm_ready_us = 21000.0)
+    {
+        std::vector<StartFrame> frames = WarmFrames(1, 40, warm_ready_us);
+        for (StartFrame& frame : frames) {
+            frame.rung = PacingRung::FgInputWait;
+            frame.fg_divisor = 2.0;
+        }
+        constexpr double kFirstUs = 4100000.0;
+        double previous_output_us = -1.0;
+        if (shape.tied && shape.odd_lead_us < 0.0) {
+            previous_output_us = kFirstUs + shape.lead_us -
+                (shape.lead_us + shape.resume_us + shape.turnaround_us) / 2.0;
+            frames.back().output_us = previous_output_us;
+        }
+        const std::vector<StartFrame> game = MakeFgGame(41, count, shape, kFirstUs, previous_output_us);
+        frames.insert(frames.end(), game.begin(), game.end());
+        return frames;
+    }
+
+    // An FG input wait plan (2×) with the guard and the term on; FG needs no present-first ordering.
+    LeadRequest FgRequest(double interval_us = kInterval)
+    {
+        LeadRequest request = Request(PacingRung::FgInputWait, 500.0, interval_us, 2.0);
+        request.collision_guard = true;
+        request.start_limit = true;
         request.spike_floor = false;
         return request;
     }
@@ -4653,7 +4742,7 @@ namespace
     void CheckStartMatches(const LeadController& controller, const StartOracle& expect)
     {
         const LeadStatistics statistics = controller.Statistics();
-        const LeadStartEvidence evidence = controller.StartEvidence();
+        const LeadStartEvidence evidence = controller.StartEvidence(PacingRung::GpuQueueWait);
         CHECK(statistics.start_resume_samples == expect.resumes);
         CHECK(statistics.start_resume_excluded == expect.resume_excluded);
         CHECK(statistics.start_turnaround_samples == expect.turnarounds);
@@ -4740,7 +4829,7 @@ void TestStartTermLimit()
     std::vector<StartFrame> frames = WarmedGame(60);
     auto controller = StartPlayed(frames);
     CheckStartMatches(*controller, BuildOracle(frames));
-    const LeadStartEvidence evidence = controller->StartEvidence();
+    const LeadStartEvidence evidence = controller->StartEvidence(PacingRung::GpuQueueWait);
     CHECK(evidence.resume_measured && evidence.resume_samples == 60 && evidence.turnaround_samples == 59);
     CHECK(evidence.source == LeadStartSource::Resume);
     CHECK_NEAR(evidence.resume_us, kStartResume);
@@ -4774,8 +4863,8 @@ void TestStartTermLimit()
     std::vector<StartFrame> blind = WarmedGame(60);
     for (StartFrame& frame : blind) frame.passed_us = -1.0;
     auto fallback = StartPlayed(blind);
-    CHECK(!fallback->StartEvidence().resume_measured && fallback->StartEvidence().resume_samples == 0);
-    CHECK(fallback->StartEvidence().telling_pairs == 30 && fallback->StartEvidence().source == LeadStartSource::Headroom);
+    CHECK(!fallback->StartEvidence(PacingRung::GpuQueueWait).resume_measured && fallback->StartEvidence(PacingRung::GpuQueueWait).resume_samples == 0);
+    CHECK(fallback->StartEvidence(PacingRung::GpuQueueWait).telling_pairs == 30 && fallback->StartEvidence(PacingRung::GpuQueueWait).source == LeadStartSource::Headroom);
     LeadRequest blind_request = StartRequest();
     LeadGuardOutcome blind_guard{};
     fallback->NextLeadUs(blind_request, nullptr, &blind_guard);
@@ -4797,7 +4886,7 @@ void TestStartTermLimit()
         frame.passed_us = -1.0;
     }
     auto none = StartPlayed(bare);
-    const LeadStartEvidence nothing = none->StartEvidence();
+    const LeadStartEvidence nothing = none->StartEvidence(PacingRung::GpuQueueWait);
     CHECK(nothing.resume_samples == 0 && nothing.turnaround_samples == 0 && nothing.telling_pairs == 0 &&
           nothing.frames == 0);
     LeadGuardOutcome none_guard{};
@@ -4836,7 +4925,7 @@ void TestStartTermWindows()
     const LeadStatistics statistics = controller->Statistics();
     CHECK(statistics.start_resume_samples == 298 && statistics.start_resume_excluded == 2);
     CHECK(statistics.start_turnaround_samples == 298 && statistics.start_turnaround_excluded == 1);
-    const LeadStartEvidence evidence = controller->StartEvidence();
+    const LeadStartEvidence evidence = controller->StartEvidence(PacingRung::GpuQueueWait);
     CHECK(evidence.resume_samples == LEAD_WINDOW_CAPACITY && evidence.turnaround_samples == LEAD_WINDOW_CAPACITY);
     // The resume of position i is 410 + 10 i: the largest four of the window are positions 299 to 296, and W99
     // (rank floor(0.99 × 255) of 256) is the fourth, 3,370 µs. Every turnaround is 150 µs.
@@ -4872,7 +4961,7 @@ void TestStartTermFreePair()
     CHECK(!plans.back().guard.start_aside && plans.back().guard.start_applied);
     CHECK(plans.back().guard.start_source == LeadStartSource::Resume);
     CHECK_NEAR(plans.back().returned_us, 2.0 * kInterval - (kStartResume + kStartTurnaround));
-    const LeadStartEvidence evidence = controller->StartEvidence();
+    const LeadStartEvidence evidence = controller->StartEvidence(PacingRung::GpuQueueWait);
     CHECK(evidence.free_pairs == 0 && evidence.telling_pairs == LEAD_START_EVIDENCE_FRAMES);
 }
 
@@ -4897,7 +4986,7 @@ void TestStartTermUntiedStart()
     CHECK(!plans.back().guard.start_aside && plans.back().guard.start_applied);
     CHECK(plans.back().guard.start_source == LeadStartSource::Resume);
     CHECK_NEAR(plans.back().returned_us, 2.0 * kInterval - (kStartResume + kStartTurnaround));
-    const LeadStartEvidence evidence = controller->StartEvidence();
+    const LeadStartEvidence evidence = controller->StartEvidence(PacingRung::GpuQueueWait);
     CHECK(evidence.untied_starts == 0 && evidence.frames == LEAD_START_EVIDENCE_FRAMES);
 }
 
@@ -4926,7 +5015,7 @@ void TestStartTermNeedsProcessed()
         const LeadStatistics statistics = controller->Statistics();
         CHECK(statistics.start_checked_frames == plans.size() && statistics.start_aside_frames == 0);
         CHECK(statistics.start_stood_aside == 0 && statistics.start_free_pairs == 0);
-        CHECK(controller->StartEvidence().free_pairs == 0);
+        CHECK(controller->StartEvidence(PacingRung::GpuQueueWait).free_pairs == 0);
     }
     {
         std::vector<StartFrame> frames = WarmedGame(230);
@@ -4976,7 +5065,7 @@ void TestStartTermStandsAsideWithoutTheProbe()
     CHECK(!plans.back().guard.start_aside && plans.back().guard.start_applied);
     CHECK(plans.back().guard.start_source == LeadStartSource::Headroom);
     CHECK_NEAR(plans.back().returned_us, 2.0 * kInterval - (LEAD_RELEASE_HEADROOM_US + kStartTurnaround));
-    const LeadStartEvidence evidence = controller->StartEvidence();
+    const LeadStartEvidence evidence = controller->StartEvidence(PacingRung::GpuQueueWait);
     CHECK(!evidence.resume_measured && evidence.free_pairs == 0 && evidence.telling_pairs == LEAD_START_EVIDENCE_FRAMES);
 }
 
@@ -5030,8 +5119,8 @@ void TestStartTermDeliveryOrder()
     PlayReversed(reversed.get(), frames, false);
     CheckStartMatches(*natural, oracle);
     CheckStartMatches(*reversed, oracle);
-    const LeadStartEvidence first = natural->StartEvidence();
-    const LeadStartEvidence second = reversed->StartEvidence();
+    const LeadStartEvidence first = natural->StartEvidence(PacingRung::GpuQueueWait);
+    const LeadStartEvidence second = reversed->StartEvidence(PacingRung::GpuQueueWait);
     CHECK(first.telling_pairs == second.telling_pairs && first.free_pairs == second.free_pairs);
     CHECK(first.frames == second.frames && first.untied_starts == second.untied_starts);
     CHECK(first.resume_samples == second.resume_samples && first.turnaround_samples == second.turnaround_samples);
@@ -5055,6 +5144,9 @@ void TestStartTermNeverBridgesAGap()
     CHECK(oracle.turnarounds == 22 && oracle.resumes == 28);
     auto controller = StartPlayed(frames, false);
     CheckStartMatches(*controller, oracle);
+    // The FG input wait frame between two GPU queue wait frames gives its own output nothing either.
+    const LeadStartEvidence lone = controller->StartEvidence(PacingRung::FgInputWait);
+    CHECK(lone.resume_samples == 0 && lone.turnaround_samples == 0 && lone.telling_pairs == 0 && lone.frames == 0);
 
     // A new lifecycle (the controller generation): the pair across it is none, and the windows persist.
     std::vector<StartFrame> first = MakeGame(1, 20);
@@ -5083,7 +5175,7 @@ void TestStartTermReset()
     const std::vector<StartFrame> game = MakeGame(1, 40);
     auto controller = MakeController();
     PlayNatural(controller.get(), std::vector<StartFrame>(game.begin(), game.begin() + 20), nullptr, false);
-    CHECK(controller->StartEvidence().resume_samples == 20 && controller->StartEvidence().turnaround_samples > 0);
+    CHECK(controller->StartEvidence(PacingRung::GpuQueueWait).resume_samples == 20 && controller->StartEvidence(PacingRung::GpuQueueWait).turnaround_samples > 0);
 
     // Frame 21 (position 20) is released and its p, r and o are in; its x, y and PRESENT_END are not.
     const std::vector<StartPiece> pieces = PiecesOf(game, false);
@@ -5106,10 +5198,10 @@ void TestStartTermReset()
             evidence.free_pairs == 0 && evidence.frames == 0 && evidence.untied_starts == 0 &&
             !evidence.resume_measured;
     };
-    CHECK(empty(controller->StartEvidence()));
+    CHECK(empty(controller->StartEvidence(PacingRung::GpuQueueWait)));
     const LeadStatistics before = controller->Statistics();
     frame_21(true); // x, y and PRESENT_END of a frame released before the reset
-    CHECK(empty(controller->StartEvidence()));
+    CHECK(empty(controller->StartEvidence(PacingRung::GpuQueueWait)));
     CHECK(controller->Statistics().start_resume_samples == before.start_resume_samples);
     CHECK(controller->Statistics().start_turnaround_samples == before.start_turnaround_samples);
     CHECK(controller->Statistics().start_telling_pairs == before.start_telling_pairs);
@@ -5118,7 +5210,7 @@ void TestStartTermReset()
     const std::vector<StartFrame> rest(game.begin() + 21, game.end());
     PlayNatural(controller.get(), rest, nullptr, false);
     const StartOracle oracle = BuildOracle(rest);
-    const LeadStartEvidence evidence = controller->StartEvidence();
+    const LeadStartEvidence evidence = controller->StartEvidence(PacingRung::GpuQueueWait);
     CHECK(evidence.resume_samples == 19 && evidence.turnaround_samples == 18);
     CHECK(evidence.telling_pairs == oracle.telling && evidence.free_pairs == oracle.free_pairs);
     CHECK_NEAR(evidence.resume_us, oracle.resume_us);
@@ -5126,10 +5218,19 @@ void TestStartTermReset()
 
     // The lifecycle reset clears the windows, the rings, the pending frames and the statistics.
     controller->Reset(kFrequency);
-    CHECK(empty(controller->StartEvidence()));
+    CHECK(empty(controller->StartEvidence(PacingRung::GpuQueueWait)));
     const LeadStatistics cleared = controller->Statistics();
     CHECK(cleared.start_resume_samples == 0 && cleared.start_turnaround_samples == 0 &&
         cleared.start_telling_pairs == 0 && cleared.start_checked_frames == 0);
+
+    // The FG input wait's output starts over with them.
+    auto fg = StartPlayed(FgWarmedGame(60));
+    CHECK(fg->StartEvidence(PacingRung::FgInputWait).resume_samples == 60);
+    fg->ResetBuckets();
+    CHECK(empty(fg->StartEvidence(PacingRung::FgInputWait)) && !fg->StartEvidence(PacingRung::FgInputWait).turnaround_shown);
+    auto fg_lifecycle = StartPlayed(FgWarmedGame(60));
+    fg_lifecycle->Reset(kFrequency);
+    CHECK(empty(fg_lifecycle->StartEvidence(PacingRung::FgInputWait)));
 }
 
 // The measured resume is in use from 32 samples on, while one arrived among the newest LEAD_WORK_STALE_FRAMES
@@ -5157,21 +5258,21 @@ void TestStartTermResumeAge()
 
     auto few = MakeController();
     play(few.get(), 1, LEAD_WARM_SAMPLES - 1, true);
-    CHECK(!few->StartEvidence().resume_measured && few->StartEvidence().resume_samples == LEAD_WARM_SAMPLES - 1);
+    CHECK(!few->StartEvidence(PacingRung::GpuQueueWait).resume_measured && few->StartEvidence(PacingRung::GpuQueueWait).resume_samples == LEAD_WARM_SAMPLES - 1);
     play(few.get(), LEAD_WARM_SAMPLES, 1, true);
-    CHECK(few->StartEvidence().resume_measured && few->StartEvidence().resume_samples == LEAD_WARM_SAMPLES);
+    CHECK(few->StartEvidence(PacingRung::GpuQueueWait).resume_measured && few->StartEvidence(PacingRung::GpuQueueWait).resume_samples == LEAD_WARM_SAMPLES);
 
     auto controller = MakeController();
     play(controller.get(), 1, 40, true);
-    CHECK(controller->StartEvidence().resume_measured);
+    CHECK(controller->StartEvidence(PacingRung::GpuQueueWait).resume_measured);
     play(controller.get(), 41, LEAD_WORK_STALE_FRAMES, false); // 64 frames without a resume: still current
-    CHECK(controller->StartEvidence().resume_measured);
+    CHECK(controller->StartEvidence(PacingRung::GpuQueueWait).resume_measured);
     play(controller.get(), 41 + LEAD_WORK_STALE_FRAMES, 1, false); // the 65th: the headroom stands in
-    CHECK(!controller->StartEvidence().resume_measured && controller->StartEvidence().resume_samples == 40);
-    CHECK(controller->StartEvidence().source == LeadStartSource::Headroom);
+    CHECK(!controller->StartEvidence(PacingRung::GpuQueueWait).resume_measured && controller->StartEvidence(PacingRung::GpuQueueWait).resume_samples == 40);
+    CHECK(controller->StartEvidence(PacingRung::GpuQueueWait).source == LeadStartSource::Headroom);
     play(controller.get(), 42 + LEAD_WORK_STALE_FRAMES, 1, true); // a resume arrives: current at once
-    CHECK(controller->StartEvidence().resume_measured && controller->StartEvidence().resume_samples == 41);
-    CHECK(controller->StartEvidence().source == LeadStartSource::Resume);
+    CHECK(controller->StartEvidence(PacingRung::GpuQueueWait).resume_measured && controller->StartEvidence(PacingRung::GpuQueueWait).resume_samples == 41);
+    CHECK(controller->StartEvidence(PacingRung::GpuQueueWait).source == LeadStartSource::Resume);
 }
 
 // The regression the render queue's resume was chosen for: holds that end before the game's next Present arrives
@@ -5195,13 +5296,13 @@ void TestStartTermStaysCurrent()
         const size_t first_part = 40 + LEAD_WARM_SAMPLES + 8;
         PlayNatural(controller.get(), std::vector<StartFrame>(frames.begin(), frames.begin() + first_part), nullptr,
             false);
-        CHECK(controller->StartEvidence().resume_measured);
+        CHECK(controller->StartEvidence(PacingRung::GpuQueueWait).resume_measured);
         PlayNatural(controller.get(), std::vector<StartFrame>(frames.begin() + first_part, frames.end()), nullptr,
             false);
         const StartOracle oracle = BuildOracle(frames);
         CHECK(oracle.telling == 0 && oracle.resumes == 150);
         CheckStartMatches(*controller, oracle);
-        const LeadStartEvidence evidence = controller->StartEvidence();
+        const LeadStartEvidence evidence = controller->StartEvidence(PacingRung::GpuQueueWait);
         CHECK(evidence.telling_pairs == 0 && evidence.resume_samples == 150);
         CHECK(evidence.resume_measured && evidence.source == LeadStartSource::Resume);
         CHECK_NEAR(evidence.resume_us, quick.resume_us);
@@ -5222,7 +5323,7 @@ void TestStartTermStaysCurrent()
         const StartOracle oracle = BuildOracle(frames);
         CHECK(oracle.telling == 30 && oracle.resumes == 190);
         CheckStartMatches(*controller, oracle);
-        const LeadStartEvidence evidence = controller->StartEvidence();
+        const LeadStartEvidence evidence = controller->StartEvidence(PacingRung::GpuQueueWait);
         CHECK(evidence.resume_measured && evidence.source == LeadStartSource::Resume);
         CHECK(evidence.telling_pairs == 30 && evidence.free_pairs == 0);
         CHECK_NEAR(evidence.resume_us, quick.resume_us);
@@ -5249,7 +5350,7 @@ void TestStartTermResumeFromRelease()
     CHECK_NEAR(frames[10].passed_us - frames[10].ready_us, kStartResume);
     auto controller = StartPlayed(frames, false);
     CheckStartMatches(*controller, BuildOracle(frames));
-    const LeadStartEvidence evidence = controller->StartEvidence();
+    const LeadStartEvidence evidence = controller->StartEvidence(PacingRung::GpuQueueWait);
     CHECK(evidence.resume_measured && evidence.resume_samples == 60);
     CHECK_NEAR(evidence.resume_us, 3810.0);
     CHECK(controller->Statistics().start_resume_excluded == 0);
@@ -5276,7 +5377,7 @@ void TestStartTermPlan()
         CHECK(guard.release_limit_us == 0.0 && guard.reduction_us == 0.0);
         CHECK(controller->Statistics().start_checked_frames == 1 && controller->Statistics().start_lowered_frames == 0);
     }
-    // Neither flag, or the collision guard off, or another rung: the term does not run, the lead is the bucket's.
+    // Neither flag, or the collision guard off, or a CPU rung: the term does not run, the lead is the bucket's.
     {
         auto controller = StartPlayed(frames);
         LeadRequest request = StartRequest();
@@ -5287,17 +5388,26 @@ void TestStartTermPlan()
         request.collision_guard = false;
         CHECK_NEAR(controller->NextLeadUs(request, nullptr, &guard), 21510.0);
         CHECK(guard.start_limit_us == 0.0 && !guard.start_applied && guard.release_limit_us == 0.0);
-        for (const PacingRung rung : { PacingRung::FgInputWait, PacingRung::SourceOnly, PacingRung::MarkerHold }) {
+        for (const PacingRung rung : { PacingRung::SourceOnly, PacingRung::MarkerHold }) {
             request = StartRequest();
             request.rung = rung;
             controller->NextLeadUs(request, nullptr, &guard);
             CHECK(guard.start_limit_us == 0.0 && !guard.start_applied && !guard.start_aside);
         }
         CHECK(controller->Statistics().start_checked_frames == 0);
+        // An FG input wait plan runs the term whatever its ordering, on its own output's evidence: here none, so it
+        // stands aside until the game's turnaround is shown.
+        request = StartRequest();
+        request.rung = PacingRung::FgInputWait;
+        request.ordered = false;
+        controller->NextLeadUs(request, nullptr, &guard);
+        CHECK(guard.start_aside && !guard.start_applied && guard.start_limit_us == 0.0 && guard.release_limit_us == 0.0);
+        CHECK(controller->Statistics().start_checked_frames == 1 && controller->Statistics().start_unshown_frames == 1);
+        CHECK(controller->Statistics().last_start_rung == PacingRung::FgInputWait);
     }
-    // A plan that is not ordered gets no term at all, applying or observing: no limit, no verdict, no count. The
-    // built guard limits it as it does every GPU queue wait frame (here the Present-call margin, I + Q10(C) − M =
-    // 12,510 µs: no Reflex reports were seen).
+    // A GPU queue wait plan that is not ordered gets no term at all, applying or observing: no limit, no verdict, no
+    // count. The built guard limits it as it does every GPU queue wait frame (here the Present-call margin, I +
+    // Q10(C) − M = 12,510 µs: no Reflex reports were seen).
     {
         auto controller = StartPlayed(frames, false);
         LeadRequest request = StartRequest();
@@ -5381,6 +5491,252 @@ void TestStartTermPlan()
     }
 }
 
+// The FG input wait's start term (lead_controller.h): behind DLSS-G the game cannot start frame n + 2 before frame n's
+// gate opens, so the lead there is at most 2 I − (W99 + G99) too. W is the game's Present return after the later of
+// the gate and its own PRESENT_START, b_{n+1} − max(o_n, m_{n+1}); G the turnaround. No present-first ordering is
+// asked, the FG bucket's own lead is left alone, and the GPU queue wait's output sees none of it.
+void TestStartTermFgLimit()
+{
+    // 40 warm-up frames and a tied game of 60: 60 W samples (the last warm-up frame's with the game's first) and 59
+    // turnarounds, none untied, no free pair.
+    const std::vector<StartFrame> frames = FgWarmedGame(60);
+    auto controller = StartPlayed(frames);
+    const LeadStartEvidence evidence = controller->StartEvidence(PacingRung::FgInputWait);
+    CHECK(evidence.resume_samples == 60 && evidence.turnaround_samples == 59);
+    CHECK(evidence.resume_measured && evidence.turnaround_shown && evidence.source == LeadStartSource::Resume);
+    CHECK_NEAR(evidence.resume_us, 150.0);
+    CHECK_NEAR(evidence.turnaround_us, 270.0);
+    CHECK(evidence.telling_pairs > 0 && evidence.free_pairs == 0 && evidence.untied_starts == 0);
+    const LeadStartEvidence queue = controller->StartEvidence(PacingRung::GpuQueueWait);
+    CHECK(queue.resume_samples == 0 && queue.turnaround_samples == 0 && queue.telling_pairs == 0 && queue.frames == 0);
+
+    LeadGuardOutcome guard{};
+    const double returned_us = controller->NextLeadUs(FgRequest(), nullptr, &guard);
+    const double own_lead_us = controller->BucketStatus(PacingRung::FgInputWait, 2.0).lead_us;
+    CHECK_NEAR(own_lead_us, 21510.0);
+    CHECK(!guard.judged && guard.start_applied && !guard.start_aside && guard.start_source == LeadStartSource::Resume);
+    CHECK_NEAR(guard.start_limit_us, kFgLimit);
+    CHECK_NEAR(guard.release_limit_us, kFgLimit);
+    CHECK_NEAR(returned_us, kFgLimit);
+    CHECK_NEAR(guard.reduction_us, own_lead_us - kFgLimit);
+    const LeadStatistics statistics = controller->Statistics();
+    CHECK(statistics.start_checked_frames == 1 && statistics.start_lowered_frames == 1);
+    CHECK(statistics.start_resume_frames == 1 && statistics.start_aside_frames == 0 &&
+          statistics.start_unshown_frames == 0);
+    CHECK(statistics.last_start_rung == PacingRung::FgInputWait && !statistics.last_start_aside);
+    CHECK_NEAR(statistics.last_start_limit_us, kFgLimit);
+    CHECK_NEAR(statistics.last_start_resume_us, 150.0);
+    CHECK_NEAR(statistics.last_start_turnaround_us, 270.0);
+
+    // Observing finds the verdict and the limit and leaves the lead alone.
+    {
+        auto observer = StartPlayed(frames);
+        LeadRequest request = FgRequest();
+        request.start_limit = false;
+        request.start_observe = true;
+        CHECK_NEAR(observer->NextLeadUs(request, nullptr, &guard), 21510.0);
+        CHECK(!guard.start_applied && !guard.start_aside && guard.release_limit_us == 0.0);
+        CHECK_NEAR(guard.start_limit_us, kFgLimit);
+    }
+    // The anchor's delta joins the bound on the lead and not the limit the executor gets.
+    {
+        auto anchored = StartPlayed(frames);
+        LeadRequest request = FgRequest();
+        request.anchor_offset_us = 1000.0;
+        CHECK_NEAR(anchored->NextLeadUs(request, nullptr, &guard), kFgLimit + 1000.0);
+        CHECK_NEAR(guard.start_limit_us, kFgLimit);
+        CHECK_NEAR(guard.release_limit_us, kFgLimit);
+    }
+    // A limit below 0 is 0 for the lead and LEAD_START_EXECUTOR_MIN_US for the executor.
+    {
+        auto tight = StartPlayed(frames);
+        CHECK_NEAR(tight->NextLeadUs(FgRequest(200.0), nullptr, &guard), 0.0);
+        CHECK(guard.start_applied && guard.start_limit_us == 0.0);
+        CHECK_NEAR(guard.release_limit_us, LEAD_START_EXECUTOR_MIN_US);
+    }
+}
+
+// W comes from every FG frame, held or not, and from the later of the two things the game's Present waits for: the
+// gate of the frame before (the even frames here, released 17 ms after their start) or its own PRESENT_START (after
+// the odd frames, released 3 ms after theirs). A W from the gate alone or from PRESENT_START alone would put the odd
+// or the even frames' samples milliseconds past their 140 µs. Only held frames give pairs, and the input callback
+// (PresentCall, after the gate) is not what tells them: the game's PRESENT_START before the release is.
+void TestStartTermFgResumeEveryFrame()
+{
+    FgShape shape;
+    shape.odd_lead_us = 3000.0;
+    std::vector<StartFrame> frames = FgWarmedGame(60, shape);
+    for (size_t i = 40; i < frames.size(); i += 3) frames[i].status = PacingPlanStatus::Late;
+    size_t telling = 0;
+    size_t gated = 0;
+    for (size_t i = 40; i + 1 < frames.size(); ++i) {
+        const bool blocked = frames[i].output_us > frames[i + 1].marker_us;
+        if (blocked) ++gated;
+        if (blocked && frames[i].status == PacingPlanStatus::Held) ++telling;
+    }
+    CHECK(gated > 20 && gated < 40 && telling > 10);
+
+    auto controller = StartPlayed(frames);
+    const LeadStartEvidence evidence = controller->StartEvidence(PacingRung::FgInputWait);
+    CHECK(evidence.resume_samples == 60 && evidence.turnaround_samples == 59);
+    CHECK(controller->Statistics().start_resume_excluded == 0);
+    CHECK_NEAR(evidence.resume_us, 150.0);
+    CHECK(evidence.telling_pairs == telling && evidence.free_pairs == 0);
+    LeadGuardOutcome guard{};
+    CHECK_NEAR(controller->NextLeadUs(FgRequest(), nullptr, &guard), kFgLimit);
+    CHECK(guard.start_applied);
+}
+
+// An untied start on the FG input wait (the game asked for frame n + 1 before frame n's PRESENT_END: a game thread a
+// frame ahead, as in Gears): the term stands aside for the newest 64 frames judged, the lead returning at the slew,
+// and is back at its limit after that. A game a frame ahead throughout keeps it aside.
+void TestStartTermFgUntiedStandsAside()
+{
+    constexpr size_t kWarm = 40;
+    std::vector<StartFrame> frames = FgWarmedGame(200);
+    const size_t at = kWarm + 60;
+    frames[at + 1].arrival_us = frames[at].end_us - 500.0; // the release stays where it was
+    auto controller = MakeController();
+    const std::vector<StartPlan> plans = StartPlanned(controller.get(), frames, kWarm, FgRequest());
+    // The arrival comes with frame at + 1's release, after its plan: the plan of frame at + 2 is the first to see it.
+    const size_t first = at + 2 - kWarm;
+    CHECK(plans[first - 1].guard.start_applied && !plans[first - 1].guard.start_aside);
+    CHECK_NEAR(plans[first - 1].returned_us, kFgLimit);
+    CHECK(plans[first].guard.start_aside && !plans[first].guard.start_applied);
+    CHECK(plans[first].guard.start_limit_us == 0.0 && plans[first].guard.release_limit_us == 0.0);
+    CHECK_NEAR(plans[first].returned_us, kFgLimit + 100.0);
+    CHECK_NEAR(plans[first + 1].returned_us, kFgLimit + 200.0);
+    CHECK(!plans.back().guard.start_aside && plans.back().guard.start_applied);
+    CHECK_NEAR(plans.back().returned_us, kFgLimit);
+    CHECK(controller->Statistics().start_untied_starts == 1);
+    const LeadStartEvidence evidence = controller->StartEvidence(PacingRung::FgInputWait);
+    CHECK(evidence.untied_starts == 0 && evidence.frames == LEAD_START_EVIDENCE_FRAMES);
+
+    FgShape ahead;
+    ahead.present_us = 12000.0;
+    ahead.tied = false;
+    auto gears = StartPlayed(FgWarmedGame(100, ahead));
+    const LeadStartEvidence untied = gears->StartEvidence(PacingRung::FgInputWait);
+    CHECK(untied.untied_starts == LEAD_START_EVIDENCE_FRAMES && untied.turnaround_samples == 0);
+    LeadGuardOutcome guard{};
+    CHECK_NEAR(gears->NextLeadUs(FgRequest(), nullptr, &guard), 21510.0);
+    CHECK(guard.start_aside && !guard.start_applied && guard.start_limit_us == 0.0 && guard.release_limit_us == 0.0);
+}
+
+// A free pair on the FG input wait: a held frame's successor reached its PRESENT_START and ended its Present before
+// the frame's gate opened, so the gate held nothing of the game's start. The term stands aside for the newest 64
+// telling pairs and is back after that; no hold order word is asked for on this output. That frame's W is below 0 and
+// no sample.
+void TestStartTermFgFreePair()
+{
+    constexpr size_t kWarm = 40;
+    std::vector<StartFrame> frames = FgWarmedGame(230);
+    const size_t at = kWarm + 100;
+    CHECK(frames[at].output_us > frames[at + 1].marker_us);
+    frames[at + 1].end_us = frames[at].output_us - 200.0;
+    auto controller = MakeController();
+    const std::vector<StartPlan> plans = StartPlanned(controller.get(), frames, kWarm, FgRequest());
+    const size_t first = at + 2 - kWarm;
+    CHECK(plans[first - 1].guard.start_applied && !plans[first - 1].guard.start_aside);
+    CHECK(plans[first].guard.start_aside && !plans[first].guard.start_applied);
+    CHECK(!plans.back().guard.start_aside && plans.back().guard.start_applied);
+    CHECK_NEAR(plans.back().returned_us, kFgLimit);
+    const LeadStatistics statistics = controller->Statistics();
+    CHECK(statistics.start_free_pairs == 1 && statistics.start_untied_starts == 0);
+    CHECK(statistics.start_resume_excluded == 1);
+    const LeadStartEvidence evidence = controller->StartEvidence(PacingRung::FgInputWait);
+    CHECK(evidence.free_pairs == 0 && evidence.telling_pairs == LEAD_START_EVIDENCE_FRAMES);
+}
+
+// The FG input wait's first link is DLSS-G's, only observed: the term stands aside there until the game's turnaround
+// is shown (32 samples, one among the newest 64 FG frames). No PRESENT_END at all, one turnaround short, or a
+// turnaround gone stale leave the FG lead the bucket's (the GPU queue wait's term applies on its release headroom
+// without any evidence: TestStartTermLimit).
+void TestStartTermFgNeedsTurnaround()
+{
+    LeadGuardOutcome guard{};
+    const auto blind = [](std::vector<StartFrame> frames, size_t from) {
+        for (size_t i = from; i < frames.size(); ++i) {
+            frames[i].end_us = -1.0;
+            frames[i].arrival_us = -1.0;
+        }
+        return frames;
+    };
+    {
+        auto controller = StartPlayed(blind(FgWarmedGame(60), 0));
+        const LeadStartEvidence evidence = controller->StartEvidence(PacingRung::FgInputWait);
+        CHECK(evidence.resume_samples == 0 && evidence.turnaround_samples == 0 && evidence.telling_pairs == 0 &&
+              evidence.frames == 0 && !evidence.turnaround_shown);
+        CHECK_NEAR(controller->NextLeadUs(FgRequest(), nullptr, &guard), 21510.0);
+        CHECK(guard.start_aside && !guard.start_applied && guard.start_limit_us == 0.0 && guard.release_limit_us == 0.0);
+        CHECK(guard.start_source == LeadStartSource::Headroom);
+        const LeadStatistics statistics = controller->Statistics();
+        CHECK(statistics.start_checked_frames == 1 && statistics.start_aside_frames == 1 &&
+              statistics.start_unshown_frames == 1 && statistics.start_lowered_frames == 0);
+    }
+    {
+        auto short_one = StartPlayed(FgWarmedGame(32));
+        CHECK(short_one->StartEvidence(PacingRung::FgInputWait).turnaround_samples == 31);
+        short_one->NextLeadUs(FgRequest(), nullptr, &guard);
+        CHECK(guard.start_aside && short_one->Statistics().start_unshown_frames == 1);
+        auto enough = StartPlayed(FgWarmedGame(33));
+        CHECK(enough->StartEvidence(PacingRung::FgInputWait).turnaround_shown);
+        enough->NextLeadUs(FgRequest(), nullptr, &guard);
+        CHECK(guard.start_applied && !guard.start_aside);
+    }
+    // A tied game, then 64 and 65 FG frames without PRESENT_END or arrival: the turnaround is shown while one is
+    // among the newest 64 FG frames, not after.
+    for (const size_t count : { size_t{64}, size_t{65} }) {
+        std::vector<StartFrame> frames = FgWarmedGame(60);
+        const std::vector<StartFrame> later = blind(MakeFgGame(101, count, FgShape{}, 6000000.0), 0);
+        frames.insert(frames.end(), later.begin(), later.end());
+        auto controller = StartPlayed(frames);
+        const LeadStartEvidence evidence = controller->StartEvidence(PacingRung::FgInputWait);
+        CHECK(evidence.turnaround_samples == 59 && evidence.turnaround_shown == (count == 64));
+        controller->NextLeadUs(FgRequest(), nullptr, &guard);
+        CHECK(guard.start_aside == (count == 65));
+    }
+}
+
+// The term bounds the FG lead whatever set it: here the bucket's lead held at 3 I by the outlier bound (warm-up
+// frames ready 29.8 ms after their release, a sample inside the window: Q95 29,810 + 500 µs is past 3 I), which the
+// term cuts to its limit while the bucket keeps it.
+void TestStartTermFgBoundsEverySource()
+{
+    auto controller = StartPlayed(FgWarmedGame(60, FgShape{}, 29800.0));
+    LeadGuardOutcome guard{};
+    bool budget_limited = false;
+    CHECK_NEAR(controller->NextLeadUs(FgRequest(), &budget_limited, &guard), kFgLimit);
+    CHECK(budget_limited && guard.start_applied);
+    CHECK_NEAR(controller->BucketStatus(PacingRung::FgInputWait, 2.0).lead_us, 3.0 * kInterval);
+    CHECK_NEAR(guard.reduction_us, 3.0 * kInterval - kFgLimit);
+}
+
+// The two outputs keep their own evidence: a game a frame ahead on the FG input wait leaves the GPU queue wait's term
+// applying on its own W and G, and neither output's samples are the other's.
+void TestStartTermOutputsSeparate()
+{
+    FgShape ahead;
+    ahead.present_us = 12000.0;
+    ahead.tied = false;
+    std::vector<StartFrame> frames = FgWarmedGame(80, ahead);
+    const std::vector<StartFrame> gpu = MakeGame(121, 60, StartShape{}, 8000000.0);
+    frames.insert(frames.end(), gpu.begin(), gpu.end());
+    auto controller = StartPlayed(frames);
+    const LeadStartEvidence fg = controller->StartEvidence(PacingRung::FgInputWait);
+    const LeadStartEvidence queue = controller->StartEvidence(PacingRung::GpuQueueWait);
+    CHECK(fg.untied_starts == LEAD_START_EVIDENCE_FRAMES && fg.turnaround_samples == 0 && fg.resume_samples == 80);
+    CHECK_NEAR(fg.resume_us, 150.0);
+    CHECK(queue.untied_starts == 0 && queue.resume_samples == 60 && queue.turnaround_samples == 59);
+    CHECK_NEAR(queue.resume_us, kStartResume);
+    LeadGuardOutcome guard{};
+    controller->NextLeadUs(StartRequest(), nullptr, &guard);
+    CHECK(guard.start_applied && !guard.start_aside);
+    CHECK_NEAR(guard.start_limit_us, 2.0 * kInterval - (kStartResume + kStartTurnaround));
+    controller->NextLeadUs(FgRequest(), nullptr, &guard);
+    CHECK(guard.start_aside && !guard.start_applied);
+}
+
 int main()
 {
     std::printf("sizeof(LeadController) = %zu bytes\n", sizeof(LeadController));
@@ -5462,6 +5818,13 @@ int main()
     TestStartTermStaysCurrent();
     TestStartTermResumeFromRelease();
     TestStartTermPlan();
+    TestStartTermFgLimit();
+    TestStartTermFgResumeEveryFrame();
+    TestStartTermFgUntiedStandsAside();
+    TestStartTermFgFreePair();
+    TestStartTermFgNeedsTurnaround();
+    TestStartTermFgBoundsEverySource();
+    TestStartTermOutputsSeparate();
 
     if (s_failures != 0) {
         std::fprintf(stderr, "%d lead controller checks failed\n", s_failures);

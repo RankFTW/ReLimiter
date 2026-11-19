@@ -1373,14 +1373,17 @@ void TestCollisionGuardSwitches()
 
 // The start term (developer key gpu_wait_start_limit, lead_controller.h): both planning branches hand the request's
 // switches to the lead, and the plan carries the limit the lead applied to the executor (lead_limit_us, in the
-// registry's copy too); the frame and the source record say what the term found and whether it was applied. The term
-// is for plans made on present-first ordering: a plan that is not ordered gets none. On a lead that has seen nothing
-// the limit is 2 I less the release headroom (1,000 µs): there is no resume or turnaround yet.
+// registry's copy too); the frame and the source record say what the term found and whether it was applied. On the
+// GPU queue wait the term is for plans made on present-first ordering: a plan that is not ordered gets none. On a
+// lead that has seen nothing the limit is 2 I less the release headroom (1,000 µs): there is no resume or turnaround
+// yet. An FG input wait plan runs the term whatever its ordering, and on a lead that has seen nothing it stands aside
+// (the game's turnaround is not shown yet).
 void TestPlanCarriesStartLimit()
 {
     std::printf("Test: the plan carries the start limit exactly when the lead applied it\n");
     const PacingPipelineSnapshot gpu = Pipeline(PacingTimingMode::Vrr, PacingRung::GpuQueueWait);
     const PacingPipelineSnapshot source_only = Pipeline(PacingTimingMode::Vrr, PacingRung::SourceOnly);
+    const PacingPipelineSnapshot fg_input = Pipeline(PacingTimingMode::Vrr, PacingRung::FgInputWait);
     const double limit_us = 2.0 * kIntervalUs - 1'000.0;
     struct Planned {
         SourceStageFrame frame{};
@@ -1435,6 +1438,15 @@ void TestPlanCarriesStartLimit()
             CHECK(!planned->frame.start_applied && planned->frame.start_limit_us == 0.0);
             CHECK(planned->record.plan_start_applied == 0 && planned->record.plan_start_limit_us == 0.0);
         }
+        const LeadStatistics before = g_stage.Lead().Statistics();
+        const Planned fg = plan(fg_input, true, true, false, false);
+        const LeadStatistics after = g_stage.Lead().Statistics();
+        CHECK(fg.frame.plan.lead_limit_us == 0.0f && fg.published.lead_limit_us == 0.0f);
+        CHECK(!fg.frame.start_applied && fg.frame.start_limit_us == 0.0);
+        CHECK(fg.record.plan_start_applied == 0 && fg.record.plan_start_limit_us == 0.0);
+        CHECK(after.start_checked_frames == before.start_checked_frames + 1);
+        CHECK(after.start_unshown_frames == before.start_unshown_frames + 1);
+        CHECK(after.last_start_rung == PacingRung::FgInputWait && after.last_start_aside);
     }
     g_stage.SetUnifiedEnabled(false, 1);
 }
@@ -1466,11 +1478,11 @@ void TestPlanGivesTheLeadTheGamesArrival()
         const int64_t present_end = first.release_qpc + Ticks(6'000.0);
         CHECK(FramePlan_PushStageEvent(Event(first, PacingStageEventKind::PresentEnd, present_end)));
         CHECK(g_stage.DrainStageEvents() == 1);
-        CHECK(g_stage.Lead().StartEvidence().turnaround_samples == 0);
+        CHECK(g_stage.Lead().StartEvidence(PacingRung::GpuQueueWait).turnaround_samples == 0);
         clock.now = present_end + Ticks(150.0);
         const SourceStageFrame second = g_stage.RunPlannedFrame(request_of(), &clock);
         CHECK(second.planned && second.release_qpc > present_end + Ticks(1'000.0));
-        const LeadStartEvidence evidence = g_stage.Lead().StartEvidence();
+        const LeadStartEvidence evidence = g_stage.Lead().StartEvidence(PacingRung::GpuQueueWait);
         CHECK(evidence.turnaround_samples == 1 && Near(evidence.turnaround_us, 150.0, 20.0));
     }
     g_stage.SetUnifiedEnabled(false, 1);

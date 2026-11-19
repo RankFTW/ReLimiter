@@ -219,12 +219,7 @@ void LeadController::ResetSpikeFloor() noexcept
 
 void LeadController::ResetStartTerm() noexcept
 {
-    start_resume_window_.Reset();
-    start_turnaround_window_.Reset();
-    start_resume_age_frames_ = LEAD_WORK_STALE_FRAMES + 1;
-    start_pairs_.Reset();
-    start_untied_.Reset();
-    start_aside_ = false;
+    for (StartLinks& links : start_links_) links.Reset();
 }
 
 // ── Saturation rule (lead_controller.h; unified pacer only) ──
@@ -421,9 +416,10 @@ double LeadController::NextLeadUs(const LeadRequest& request, bool* budget_limit
 // wait's lead.
 // The start term (lead_controller.h) follows the built block: a second limit,
 // 2 I − (W99 + G99) plus the anchor's delta, for every GPU queue wait plan made
-// on present-first ordering with the guard on, judged by the built guard or
-// not; a plan that is not ordered gets none. It joins the built limit before
-// the slew, so it too applies at once and relaxes at the slew.
+// on present-first ordering and every FG input wait plan with the guard on,
+// judged by the built guard or not; a GPU queue wait plan that is not ordered
+// gets none. It joins the built limit before the slew, so it too applies at
+// once and relaxes at the slew.
 double LeadController::CollisionGuardedLeadUs(const LeadRequest& request, size_t bucket_index,
     double lead_us, LeadGuardOutcome* guard) noexcept
 {
@@ -474,11 +470,14 @@ double LeadController::CollisionGuardedLeadUs(const LeadRequest& request, size_t
         }
     }
     // Start term: judged by the game's own times, not by the C and D windows, so `judged` and the built counters
-    // keep their meaning. Only for a plan made on present-first ordering: without the order a hold on the presenting
-    // queue does not block the render queue, and the built limit is that plan's own. A request that only observes
-    // gets the verdict and the limit, not the lowering.
-    if (request.rung == PacingRung::GpuQueueWait && request.collision_guard && request.ordered &&
-        (request.start_limit || request.start_observe)) {
+    // keep their meaning. On the GPU queue wait only for a plan made on present-first ordering: without the order a
+    // hold on the presenting queue does not block the render queue, and the built limit is that plan's own. On the FG
+    // input wait for every plan: the gate itself holds the game's next Present, and the term's own evidence says
+    // whether the game's start is tied to it. A request that only observes gets the verdict and the limit, not the
+    // lowering.
+    const bool start_output = request.rung == PacingRung::FgInputWait ||
+        (request.rung == PacingRung::GpuQueueWait && request.ordered);
+    if (start_output && request.collision_guard && (request.start_limit || request.start_observe)) {
         double bound_us = 0.0;
         if (StartTerm(request, guard, &bound_us)) {
             if (bound_us < returned_us) ++statistics_.start_lowered_frames;
@@ -538,47 +537,76 @@ bool LeadController::LateOffsetUs(size_t divisor, const LeadRequest& request, do
     return true;
 }
 
-bool LeadController::StartResumeMeasured() const noexcept
+bool LeadController::StartOutput(PacingRung rung, size_t* output) noexcept
 {
-    return start_resume_window_.Count() >= LEAD_WARM_SAMPLES && start_resume_age_frames_ <= LEAD_WORK_STALE_FRAMES;
+    if (rung == PacingRung::GpuQueueWait) {
+        *output = 0;
+        return true;
+    }
+    if (rung == PacingRung::FgInputWait) {
+        *output = 1;
+        return true;
+    }
+    return false;
 }
 
-LeadStartSource LeadController::StartSource() const noexcept
+bool LeadController::StartResumeMeasured(size_t output) const noexcept
 {
-    return StartResumeMeasured() ? LeadStartSource::Resume : LeadStartSource::Headroom;
+    const StartLinks& links = start_links_[output];
+    return links.resume.Count() >= LEAD_WARM_SAMPLES && links.resume_age <= LEAD_WORK_STALE_FRAMES;
 }
 
-// The start term (lead_controller.h) of a GPU queue wait plan made on present-first ordering with the guard on:
-// limit = 2 I − (W99 + G99) on the release → target distance. W99 is the render queue's resume after the release
-// where that is measured (y_n − o_n of the held frames the order was in effect for), else the release
-// headroom (the fallback). G99 is the turnaround, 0 while there is none. The term stands aside while the game's own
-// times show a free pair or an untied start among the newest evidence. The verdict is reported whether the plan
-// applies the term or only observes it (LeadRequest::start_observe); only an applied limit reaches *bound_us, the
-// limit plus the anchor's delta that bounds the lead, and the executor's limit (LeadGuardOutcome::release_limit_us).
-// A limit below 0 is 0 for the lead and the rows, but never for the executor: 0 means no limit there, and a lead of
-// 0 does not guarantee no hold (the previous output can lift the spacing floor above this frame's release, and a
-// Present that arrives before that floored target would be held past the applied bound), so the executor is given at
-// least LEAD_START_EXECUTOR_MIN_US, and Decide then resolves the nominal target.
+LeadStartSource LeadController::StartSource(size_t output) const noexcept
+{
+    return StartResumeMeasured(output) ? LeadStartSource::Resume : LeadStartSource::Headroom;
+}
+
+bool LeadController::StartTurnaroundShown(size_t output) const noexcept
+{
+    const StartLinks& links = start_links_[output];
+    return links.turnaround.Count() >= LEAD_WARM_SAMPLES && links.turnaround_age <= LEAD_START_EVIDENCE_FRAMES;
+}
+
+// The start term (lead_controller.h) of a GPU queue wait plan made on present-first ordering or an FG input wait
+// plan, with the guard on: limit = 2 I − (W99 + G99) on the release → target distance, from the plan's output's
+// evidence. W99 is the output's measured W where that is in use (the render queue's resume after the release, y_n − o_n
+// of the held frames the order was in effect for; on the FG input wait the game's Present return after the later of
+// the gate and its Present call), else the release headroom (the fallback). G99 is the turnaround, 0 while there is
+// none. The term stands aside while the game's own times show a free pair or an untied start among the newest
+// evidence, and on the FG input wait while the turnaround is not shown (the first link there is DLSS-G's, only
+// observed). The verdict is reported whether the plan applies the term or only observes it
+// (LeadRequest::start_observe); only an applied limit reaches *bound_us, the limit plus the anchor's delta that bounds
+// the lead, and the executor's limit (LeadGuardOutcome::release_limit_us). A limit below 0 is 0 for the lead and the
+// rows, but never for the executor: 0 means no limit there, and a lead of 0 does not guarantee no hold (the previous
+// output can lift the spacing floor above this frame's release, and a Present that arrives before that floored target
+// would be held past the applied bound), so the executor is given at least LEAD_START_EXECUTOR_MIN_US, and Decide then
+// resolves the nominal target.
 bool LeadController::StartTerm(const LeadRequest& request, LeadGuardOutcome* guard, double* bound_us) noexcept
 {
-    const LeadStartSource source = StartSource();
+    size_t output = 0;
+    if (!StartOutput(request.rung, &output)) return false; // the caller admits only the two outputs
+    StartLinks& links = start_links_[output];
+    const LeadStartSource source = StartSource(output);
     const double resume_us = source == LeadStartSource::Resume
-        ? start_resume_window_.Quantile(LEAD_START_QUANTILE)
+        ? links.resume.Quantile(LEAD_START_QUANTILE)
         : (IsPositiveFinite(request.release_headroom_us) ? request.release_headroom_us : LEAD_RELEASE_HEADROOM_US);
-    const double turnaround_us = start_turnaround_window_.Quantile(LEAD_START_QUANTILE);
+    const double turnaround_us = links.turnaround.Quantile(LEAD_START_QUANTILE);
     const double limit_us = std::max(0.0, 2.0 * request.interval_us - (resume_us + turnaround_us));
-    const bool aside = start_pairs_.set != 0 || start_untied_.set != 0;
+    const bool unshown = output == 1 && !StartTurnaroundShown(output);
+    const bool aside = links.pairs.set != 0 || links.untied.set != 0 || unshown;
     const bool applied = request.start_limit && !aside;
 
     ++statistics_.start_checked_frames;
     if (source == LeadStartSource::Resume) ++statistics_.start_resume_frames;
     else ++statistics_.start_fallback_frames;
     if (aside) ++statistics_.start_aside_frames;
-    if (aside != start_aside_) {
+    if (unshown) ++statistics_.start_unshown_frames;
+    if (aside != links.aside) {
         if (aside) ++statistics_.start_stood_aside;
         else ++statistics_.start_came_back;
-        start_aside_ = aside;
+        links.aside = aside;
     }
+    statistics_.last_start_rung = request.rung;
     statistics_.last_start_limit_us = limit_us;
     statistics_.last_start_resume_us = resume_us;
     statistics_.last_start_turnaround_us = turnaround_us;
@@ -600,19 +628,23 @@ bool LeadController::StartTerm(const LeadRequest& request, LeadGuardOutcome* gua
     return true;
 }
 
-LeadStartEvidence LeadController::StartEvidence() const noexcept
+LeadStartEvidence LeadController::StartEvidence(PacingRung rung) const noexcept
 {
     LeadStartEvidence evidence{};
-    evidence.resume_samples = start_resume_window_.Count();
-    evidence.turnaround_samples = start_turnaround_window_.Count();
-    evidence.resume_us = start_resume_window_.Quantile(LEAD_START_QUANTILE);
-    evidence.turnaround_us = start_turnaround_window_.Quantile(LEAD_START_QUANTILE);
-    evidence.resume_measured = StartResumeMeasured();
-    evidence.source = StartSource();
-    evidence.telling_pairs = start_pairs_.count;
-    evidence.free_pairs = start_pairs_.set;
-    evidence.frames = start_untied_.count;
-    evidence.untied_starts = start_untied_.set;
+    size_t output = 0;
+    if (!StartOutput(rung, &output)) return evidence;
+    const StartLinks& links = start_links_[output];
+    evidence.resume_samples = links.resume.Count();
+    evidence.turnaround_samples = links.turnaround.Count();
+    evidence.resume_us = links.resume.Quantile(LEAD_START_QUANTILE);
+    evidence.turnaround_us = links.turnaround.Quantile(LEAD_START_QUANTILE);
+    evidence.resume_measured = StartResumeMeasured(output);
+    evidence.source = StartSource(output);
+    evidence.turnaround_shown = StartTurnaroundShown(output);
+    evidence.telling_pairs = links.pairs.count;
+    evidence.free_pairs = links.pairs.set;
+    evidence.frames = links.untied.count;
+    evidence.untied_starts = links.untied.set;
     return evidence;
 }
 
@@ -752,8 +784,14 @@ void LeadController::OnSourceRelease(const LeadFrameStart& frame) noexcept
             : fg_report_age_frames_[slot.bucket % LEAD_DIVISOR_BUCKETS];
         if (age < UINT32_MAX) ++age;
     }
-    // The resume window's age counts the same frames (the start term, lead_controller.h).
-    if (slot.gpu_wait_lead && start_resume_age_frames_ < UINT32_MAX) ++start_resume_age_frames_;
+    // The start term's ages count the same frames per output (lead_controller.h): the GPU queue wait's frames planned
+    // with its lead, the FG input wait's sampled frames.
+    size_t start_output = 0;
+    if (slot.sampled && StartOutput(slot.rung, &start_output)) {
+        StartLinks& links = start_links_[start_output];
+        if (links.resume_age < UINT32_MAX) ++links.resume_age;
+        if (links.turnaround_age < UINT32_MAX) ++links.turnaround_age;
+    }
     RecordCallTime(&slot);
     RecordWorkStart(&slot);
     RecordWorkStart(Find(index + 1));
@@ -832,7 +870,7 @@ void LeadController::OnStageEvent(const PacingStageEvent& event) noexcept
     RecordConcurrency(frame);
     if (index > 0) RecordConcurrency(Find(index - 1));
     // Start term (lead_controller.h): this event may complete the frame's resume, or its pair with the next frame
-    // or with the one before (p, b and a of the later frame, o and x of the earlier).
+    // or with the one before (p or m, b and a of the later frame, o and x of the earlier).
     RecordStartResume(frame);
     RecordStartPair(frame);
     if (index > 0) RecordStartPair(Find(index - 1));
@@ -1319,47 +1357,68 @@ void LeadController::RecordStartResume(PendingFrame* frame) noexcept
         ++statistics_.start_resume_excluded;
         return;
     }
-    start_resume_window_.Add(resume_us);
+    StartLinks& links = start_links_[0];
+    links.resume.Add(resume_us);
     ++statistics_.start_resume_samples;
-    start_resume_age_frames_ = 0;
+    links.resume_age = 0;
 }
 
-// A frame n and its successor n + 1 (the start term, lead_controller.h): the turnaround a_{n+1} − b_n, one sample
-// per frame whether or not anything is held, with the sign of an untied start (a_{n+1} < b_n: the game asked for the
-// frame before its previous Present ended; a negative turnaround is no sample), and the pair (o_n, p_{n+1}, b_{n+1})
-// of a Held frame n that has x_n (the hold order unit's word that the order was in effect for that edge; a frame
-// without it gives no pair): telling when the release came after the next frame's native Present arrived, free when
-// the next Present also ended before the release. The pair needs x and not the probe's y, so it comes without the
-// probe's report. Both frames must be of one lifecycle, consecutive, released, and of one GPU queue wait bucket in a
-// mode that samples: a rung, divisor or mode change between them decides both at once as no evidence. Each is
-// judged once, when the last of its stamps is known.
+// A frame n and its successor n + 1 (the start term, lead_controller.h), on the output of the frame's rung: the
+// turnaround a_{n+1} − b_n, one sample per frame whether or not anything is held, with the sign of an untied start
+// (a_{n+1} < b_n: the game asked for the frame before its previous Present ended; a negative turnaround is no sample);
+// on the FG input wait the W sample b_{n+1} − max(o_n, m_{n+1}) of every frame n, held or not (the frame's
+// resume_recorded: RecordStartResume is the GPU queue wait's); and the pair of a Held frame n: telling when its
+// release came after the next frame's Present arrived (the native Present call p_{n+1} on the GPU queue wait, the
+// game's PRESENT_START m_{n+1} on the FG input wait, whose PresentCall is the input callback after the gate), free
+// when the next Present also ended before the release. On the GPU queue wait the pair needs the hold order unit's
+// word x_n that the order was in effect for that edge (a frame without it gives no pair), and not the probe's y, so it
+// comes without the probe's report; on the FG input wait no x. Both frames must be of one lifecycle, consecutive,
+// released, and of one bucket in a mode that samples: a rung, divisor or mode change between them decides everything
+// at once as no evidence. Each is judged once, when the last of its stamps is known.
 void LeadController::RecordStartPair(PendingFrame* frame) noexcept
 {
-    if (frame == nullptr || (frame->pair_recorded && frame->turnaround_recorded) || !frame->started ||
-        !frame->sampled || frame->rung != PacingRung::GpuQueueWait) {
-        return;
-    }
+    size_t output = 0;
+    if (frame == nullptr || !frame->started || !frame->sampled || !StartOutput(frame->rung, &output)) return;
+    const bool fg = output == 1;
+    if (frame->pair_recorded && frame->turnaround_recorded && (!fg || frame->resume_recorded)) return;
     const PendingFrame* next = Find(frame->grid_index + 1);
     if (next == nullptr || !SameLifecycle(next->key, frame->key) || !next->started) return;
     if (!next->sampled || next->rung != frame->rung || next->bucket != frame->bucket) {
         frame->pair_recorded = true;
         frame->turnaround_recorded = true;
+        if (fg) frame->resume_recorded = true;
         return;
     }
+    StartLinks& links = start_links_[output];
     if (!frame->turnaround_recorded && HasField(*frame, FieldPresentEnd) && next->arrival_qpc > 0) {
         frame->turnaround_recorded = true;
         const double turnaround_us = MicrosecondsBetween(frame->qpc[FieldPresentEnd], next->arrival_qpc);
         if (std::isfinite(turnaround_us)) {
             const bool untied = turnaround_us < 0.0;
-            start_untied_.Push(untied);
+            links.untied.Push(untied);
             if (untied) {
                 ++statistics_.start_untied_starts;
             } else if (turnaround_us > LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us) {
                 ++statistics_.start_turnaround_excluded;
             } else {
-                start_turnaround_window_.Add(turnaround_us);
+                links.turnaround.Add(turnaround_us);
+                links.turnaround_age = 0;
                 ++statistics_.start_turnaround_samples;
             }
+        }
+    }
+    if (fg && !frame->resume_recorded && HasField(*frame, FieldOutputRelease) &&
+        HasField(*next, FieldMarkerArrival) && HasField(*next, FieldPresentEnd)) {
+        frame->resume_recorded = true;
+        const int64_t input_qpc = std::max(frame->qpc[FieldOutputRelease], next->qpc[FieldMarkerArrival]);
+        const double resume_us = MicrosecondsBetween(input_qpc, next->qpc[FieldPresentEnd]);
+        if (!std::isfinite(resume_us) || resume_us < 0.0 ||
+            resume_us > LEAD_LONG_SAMPLE_INTERVALS * frame->interval_us) {
+            ++statistics_.start_resume_excluded;
+        } else {
+            links.resume.Add(resume_us);
+            links.resume_age = 0;
+            ++statistics_.start_resume_samples;
         }
     }
     if (frame->pair_recorded || !HasField(*frame, FieldOutputRelease)) return;
@@ -1367,17 +1426,19 @@ void LeadController::RecordStartPair(PendingFrame* frame) noexcept
         frame->pair_recorded = true; // only the release of a held frame can tell
         return;
     }
-    if (!HasField(*next, FieldPresentCall)) return;
+    const Field present = fg ? FieldMarkerArrival : FieldPresentCall;
+    if (!HasField(*next, present)) return;
     const int64_t release_qpc = frame->qpc[FieldOutputRelease];
-    if (release_qpc <= next->qpc[FieldPresentCall]) {
+    if (release_qpc <= next->qpc[present]) {
         frame->pair_recorded = true; // the next Present arrived after the release: this pair tells nothing
         return;
     }
-    // Only a hold the order released behind its Present gives a pair: without x the pair never completes.
-    if (!HasField(*next, FieldPresentEnd) || !HasField(*frame, FieldPresentProcessed)) return;
+    // On the GPU queue wait only a hold the order released behind its Present gives a pair: without x the pair never
+    // completes.
+    if (!HasField(*next, FieldPresentEnd) || (!fg && !HasField(*frame, FieldPresentProcessed))) return;
     frame->pair_recorded = true;
     const bool free_pair = next->qpc[FieldPresentEnd] < release_qpc;
-    start_pairs_.Push(free_pair);
+    links.pairs.Push(free_pair);
     ++statistics_.start_telling_pairs;
     if (free_pair) ++statistics_.start_free_pairs;
 }

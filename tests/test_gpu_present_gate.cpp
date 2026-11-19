@@ -842,15 +842,31 @@ void TestExecutor() {
             pass(true,4000.0f); // floor - advance is not later than the ticket's target
             CHECK(late.trace.target_qpc==nominal && !late.trace.phase_adjust_qpc);
             ExpectRecorded(45,nominal);
+            // The ticket's lead limit (the plan's, copied at admission) bounds the pass's floor as it bounds
+            // Decide's: a limit inside the floor is the target, one past the floor changes nothing, and one
+            // before the nominal target gives the nominal target (no move).
+            const auto limited=[&](int64_t limit_qpc) {
+                late.lead_limit_qpc=limit_qpc;pass(true,0.0f);late.lead_limit_qpc=0;
+            };
+            limited(floor-500);
+            CHECK(late.trace.target_qpc==floor-500 && late.trace.phase_adjust_qpc==floor-500-nominal);
+            ExpectRecorded(45,floor-500);
+            limited(floor+500);
+            CHECK(late.trace.target_qpc==floor && late.trace.phase_adjust_qpc==floor-nominal);
+            limited(nominal-1000);
+            CHECK(late.trace.target_qpc==nominal && !late.trace.phase_adjust_qpc);
+            ExpectRecorded(45,nominal);
         }
         PacingPipeline_SetConfig(saved_pipeline);
     }
-    // Hold credit, admission: the plan's hold advance reaches the admitted ticket through the real
-    // entry points (Execute -> Enqueue on the GPU queue wait, BeginFgInput -> Enqueue on the FG
-    // input), the only place the late pass reads it from. Values are unused elsewhere in this file,
-    // so a removed admission copy leaves a stale or default field and fails. The FG prefix queue
-    // gets a fake list slot and fence so BeginFgInput reaches its Enqueue (the readback itself,
-    // ReadTimestamp, needs a real device and is never driven: the measurement is dropped unread).
+    // Hold credit and lead limit, admission: the plan's hold advance and its lead limit (as an instant,
+    // source wake + lead_limit_us) reach the admitted ticket through the real entry points (Execute ->
+    // Enqueue on the GPU queue wait, BeginFgInput -> Enqueue on the FG input), the only place the late
+    // pass reads them from. Values are unused elsewhere in this file, so a removed admission copy leaves a
+    // stale or default field and fails. The limits lie past the targets, so the resolved targets are the
+    // advance's alone. The FG prefix queue gets a fake list slot and fence so BeginFgInput reaches its
+    // Enqueue (the readback itself, ReadTimestamp, needs a real device and is never driven: the measurement
+    // is dropped unread).
     {
         const auto saved_pipeline=PacingPipeline_GetConfig();
         PacingPipeline_SetConfig(WithOwner(saved_pipeline,true));
@@ -868,11 +884,13 @@ void TestExecutor() {
         gpu_plan.key=PlanKey(kGpuIndex);gpu_plan.grid_index=kGpuIndex;gpu_plan.interval_us=kInterval;
         gpu_plan.rung=PacingRung::GpuQueueWait;gpu_plan.mode=PacingTimingMode::Vrr;
         gpu_plan.output_target_qpc=GridTarget(kGpuIndex);gpu_plan.hold_advance_us=250.0f;
+        gpu_plan.source_wake_qpc=GridTarget(kGpuIndex)-9000;gpu_plan.lead_limit_us=20000.0f;
         CHECK(g_frame_plans.Publish(gpu_plan));
         const auto gpu_outcome=ExecuteFrame(kGpuIndex);
         CHECK(gpu_outcome.execution==GpuPresentExecution::WaitCommitted);
         Ticket* gpu_ticket=find_ticket(PlanKey(kGpuIndex));
         CHECK(gpu_ticket && !gpu_ticket->fg && gpu_ticket->hold_advance_us==250.0f);
+        CHECK(gpu_ticket && gpu_ticket->lead_limit_qpc==GridTarget(kGpuIndex)+11000); // 1 tick = 1 us here
         CHECK(gpu_ticket->trace.target_qpc==GridTarget(kGpuIndex)-250); // the resolver took the same advance
         // FG input route (BeginFgInput).
         fg_context=true;g_fg_multiplier=2;PublishRung(PacingRung::FgInputWait);
@@ -886,6 +904,7 @@ void TestExecutor() {
         fg_plan.key=PlanKey(kFgIndex);fg_plan.grid_index=kFgIndex;fg_plan.interval_us=kInterval;
         fg_plan.rung=PacingRung::FgInputWait;fg_plan.mode=PacingTimingMode::Vrr;fg_plan.fg_divisor=2.0;
         fg_plan.output_target_qpc=GridTarget(kFgIndex);fg_plan.hold_advance_us=321.0f;
+        fg_plan.source_wake_qpc=GridTarget(kFgIndex)-9000;fg_plan.lead_limit_us=17000.0f;
         CHECK(g_frame_plans.Publish(fg_plan));
         GpuPresentFgInput input;
         input.native=0x1000;input.swapchain=queue.fg_swapchain;input.observer=GpuReadiness_Settings();input.prediction=1;
@@ -894,6 +913,7 @@ void TestExecutor() {
         CHECK(GpuPresent_BeginFgInput(reinterpret_cast<uint64_t>(&driver),input));
         Ticket* fg_ticket=find_ticket(PlanKey(kFgIndex));
         CHECK(fg_ticket && fg_ticket->fg && fg_ticket->hold_advance_us==321.0f);
+        CHECK(fg_ticket && fg_ticket->lead_limit_qpc==GridTarget(kFgIndex)+8000);
         CHECK(fg_ticket->trace.target_qpc==GridTarget(kFgIndex)-321);
         GpuPresent_FinishFgInput(input.transaction,true);
         // Drop the unread prefix measurement and the fake prefix queue, then release both tickets.

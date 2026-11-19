@@ -58,6 +58,10 @@ struct Ticket {
     // admission. Read only by FloorAfterLatePass, as the resolver's advance_us, which ignores it
     // with the key off (display_floor false); without it the late pass would undo the advance.
     float hold_advance_us=0.0f;
+    // The plan's lead limit as an absolute instant, source wake + PacingFramePlan::lead_limit_us (0 = none), copied at
+    // admission. Read only by FloorAfterLatePass, which bounds the late pass's floor by it as Decide bounds the
+    // admission's (never below the nominal target); without it the late pass would undo the start term's limit.
+    int64_t lead_limit_qpc=0;
     // The law's identity of this frame's grant (PacingFramePlan::law_hold_sequence; 0 = none), announced with the
     // hold Wait to the gpu queue probe, which attaches it to the frame record the hold delayed.
     uint64_t law_hold_sequence=0;
@@ -602,9 +606,11 @@ void DrainFgReadback(Queue& queue,int64_t* next,bool before_signal) noexcept {
 // spacing floor again with its slack from the displayed interval I / D. A
 // frame after a late one then enters frame generation no sooner than
 // I − slack after it instead of on its original target. The
-// target only moves later, never past the H3 horizon from now, and only once
-// the input callback has recorded this frame's output (it arms the wait
-// first), so the raised record is the one the next frame's floor reads.
+// target only moves later, never past the H3 horizon from now, never past the
+// plan's lead limit (Ticket::lead_limit_qpc, as Decide; never below the nominal
+// target), and only once the input callback has recorded this frame's output
+// (it arms the wait first), so the raised record is the one the next frame's
+// floor reads.
 bool fg_late_floor_logged=false;
 void FloorAfterLatePass(Queue& queue,Ticket& ticket,int64_t* next) noexcept {
     const auto generation=ticket.key.controller_generation;
@@ -617,8 +623,13 @@ void FloorAfterLatePass(Queue& queue,Ticket& ticket,int64_t* next) noexcept {
     const bool key=PacingPipeline_Unified();
     if(!g_cadence_grid_publication.Read(&snapshot) ||
         !CadenceGrid_ResolveOutputTarget(snapshot,generation,index,g_cadence_output_tracker,&target,nullptr,
-            ticket.fg_divisor,key,key?ticket.hold_advance_us:0.0) ||
-        target<=ticket.trace.target_qpc)return;
+            ticket.fg_divisor,key,key?ticket.hold_advance_us:0.0))return;
+    if(ticket.lead_limit_qpc>0 && target>ticket.lead_limit_qpc) {
+        int64_t nominal=0;
+        CadenceGrid_TargetOf(snapshot,generation,index,&nominal);
+        target=(std::max)(ticket.lead_limit_qpc,nominal);
+    }
+    if(target<=ticket.trace.target_qpc)return;
     const double interval_us=ticket.trace.interval_qpc>0
         ?static_cast<double>(ticket.trace.interval_qpc)*1e6/static_cast<double>(frequency):0.0;
     if(target-Qpc()>GpuPresent_HorizonTicks(interval_us,frequency))return;
@@ -924,6 +935,7 @@ struct EnqueueRequest {
     double fg_divisor=1.0; // the plan's
     float hold_advance_us=0.0f; // the plan's (Ticket::hold_advance_us)
     uint64_t law_hold_sequence=0; // the plan's (Ticket::law_hold_sequence)
+    int64_t lead_limit_qpc=0; // the plan's lead limit as an instant (Ticket::lead_limit_qpc; LeadLimitQpc)
     bool ordered=false; // the plan's (PacingFramePlan::ordered): present-first ordering was assumed for this frame
     int64_t floor_base_qpc=0; // fg_late_spacing: T(n) without the floor (Ticket)
     uint64_t fg_binding=0;
@@ -992,6 +1004,7 @@ bool Enqueue(const EnqueueRequest& request,GpuPresentTrace* trace) noexcept {
     ticket.floor_base_qpc=request.floor_base_qpc;ticket.floor_checked=ticket.floor_blocked=false;
     ticket.fg_binding=request.fg_binding;
     ticket.hold_advance_us=request.hold_advance_us;
+    ticket.lead_limit_qpc=request.lead_limit_qpc;
     ticket.law_hold_sequence=request.law_hold_sequence;
     ticket.fg_epoch=fg_epoch.load(std::memory_order_acquire);
     const auto abandon_prepared=[&] {
@@ -1092,6 +1105,13 @@ struct OutputDecision {
     int64_t target=0; // 0 when Stale
     int64_t grid_target=0; // T(n) without the spacing floor; 0 when Stale
 };
+// PacingFramePlan::lead_limit_us as an instant: the plan's source wake plus the limit, 0 when the plan has none
+// (no limit, or no source wake to measure it from).
+int64_t LeadLimitQpc(const PacingFramePlan& plan) noexcept {
+    if(!(plan.lead_limit_us>0.0f) || plan.source_wake_qpc<=0)return 0;
+    return plan.source_wake_qpc+static_cast<int64_t>(std::llround(
+        static_cast<double>(plan.lead_limit_us)*static_cast<double>(frequency)/1e6));
+}
 // Grid snapshot + spacing floor -> T. Stale, Late (now >= T), Undeliverable
 // beyond the horizon clamp(3 I, 2 ms, 100 ms), otherwise Held (queue the wait).
 // displayed_slack (FG input with fg_late_spacing): the floor's slack from the
@@ -1113,14 +1133,12 @@ OutputDecision Decide(const PacingFramePlan& plan,int64_t now,bool displayed_sla
     CadenceGrid_TargetOf(snapshot,plan.key.controller_generation,plan.grid_index,&decision.grid_target);
     // PacingFramePlan::lead_limit_us is the collision guard's limit on the lead (the late state's, key gpu_wait_late_guard,
     // or the start term's, lead_controller.h), filled whenever the guard has one (0 when it has none): it bounds the
-    // resolved target too. The spacing floor lifts a target past it when the lead drops by more than the floor's slack
-    // in one plan (the end of a late state, the start term tightening), and a hold that ends past the limit ends in the
-    // next frame's heavy GPU work or makes the game late for the frame after it. Never below the nominal target.
-    if(floored && plan.lead_limit_us>0.0f && plan.source_wake_qpc>0) {
-        const auto limit=plan.source_wake_qpc+static_cast<int64_t>(std::llround(
-            static_cast<double>(plan.lead_limit_us)*static_cast<double>(frequency)/1e6));
-        if(decision.target>limit)decision.target=(std::max)(limit,decision.grid_target);
-    }
+    // resolved target too, here and in the worker's late pass (FloorAfterLatePass, Ticket::lead_limit_qpc). The spacing
+    // floor lifts a target past it when the lead drops by more than the floor's slack in one plan (the end of a late
+    // state, the start term tightening), and a hold that ends past the limit ends in the next frame's heavy GPU work or
+    // makes the game late for the frame after next. Never below the nominal target.
+    const auto limit=LeadLimitQpc(plan);
+    if(floored && limit>0 && decision.target>limit)decision.target=(std::max)(limit,decision.grid_target);
     if(now>=decision.target) {decision.status=PacingPlanStatus::Late;decision.gate=GpuPresentStatus::Late;return decision;}
     if(decision.target-now>GpuPresent_HorizonTicks(plan.interval_us,frequency)) {
         decision.status=PacingPlanStatus::Undeliverable;decision.gate=GpuPresentStatus::Budget;return decision;
@@ -1398,6 +1416,7 @@ GpuPresentExecution GpuPresent_Execute(NativeGateCall* native,GpuReadinessCall* 
             current.swapchain_generation==span->key.swapchain_generation;
         EnqueueRequest request;request.native=queue_identity;request.context=context;request.span=span;request.key=plan.key;
         request.hold_advance_us=plan.hold_advance_us;request.law_hold_sequence=plan.law_hold_sequence;
+        request.lead_limit_qpc=LeadLimitQpc(plan);
         request.ordered=plan.ordered;
         if(!eligible)trace.status=GpuPresentStatus::Unsupported;
         if(eligible && Enqueue(request,&trace))execution=GpuPresentExecution::WaitCommitted;
@@ -1534,6 +1553,7 @@ bool GpuPresent_BeginFgInput(uint64_t native,const GpuPresentFgInput& input) noe
         EnqueueRequest request;request.native=native;request.context=context;request.span=&span;request.key=plan.key;
         request.fg=true;request.fg_multiplier=multiplier;request.fg_divisor=plan.fg_divisor;request.fg_binding=input.binding;
         request.hold_advance_us=plan.hold_advance_us;request.law_hold_sequence=plan.law_hold_sequence;
+        request.lead_limit_qpc=LeadLimitQpc(plan);
         request.floor_base_qpc=late_spacing?decision.grid_target:0;
         if(!Enqueue(request,&trace))outcome=AdmissionOutcome(trace);
     }

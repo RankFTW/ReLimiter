@@ -97,6 +97,12 @@ namespace
         return record;
     }
 
+    // The law's two funding terms: the cap's slack and the share.
+    double Funding(const UnifiedQueueResult& r)
+    {
+        return r.refill_slack_us + r.refill_share_us;
+    }
+
     UnifiedQueuePosition Position(uint64_t frame_id, uint32_t epoch = 1,
         PacingIdentityDomain domain = PacingIdentityDomain::NvApiFrame)
     {
@@ -137,7 +143,7 @@ namespace
         const auto fields = [](const UnifiedQueueResult& r) {
             return std::make_tuple(r.computable, r.in_use, r.limited, r.guard_active, r.bound_active,
                 r.valid_frames, r.base_us, r.need_us, r.service_us, r.q_us, r.p_us, r.guard_us,
-                r.gpu_interval_us, r.refill_us, r.refill_slack_us, r.refill_share_us);
+                r.gpu_interval_us, r.refill_slack_us, r.refill_share_us);
         };
         UnifiedQueueWindow warm, unread;
         bool arrivals[UnifiedQueueWindow::kWindow]{};
@@ -347,7 +353,7 @@ namespace
         CHECK(law.in_use && Near(law.q_us, -4000.0) && Near(law.p_us, -4000.0 / 32.0));
         CHECK(Near(law.base_us, 20000.0) && law.gpu_interval_us < 20000.0 && !law.limited); // F = 16: the mean cycle
         CHECK(Near(window.Compute(20000.0, Params(2, 4000.0, 0.0, 4)).base_us, 16000.0));     // F = 4: the need
-        CHECK(Near(law.need_us, 16000.0) && Near(law.refill_us, 4000.0));
+        CHECK(Near(law.need_us, 16000.0) && Near(Funding(law), 4000.0));
         // A cap the GPU's need reaches (B = J) with a positive margin: P's positive part is 0, I_gpu = the
         // cap and the limit flag is set.
         UnifiedQueueWindow reached;
@@ -405,7 +411,7 @@ namespace
         const auto refill = [](double need, double share) {
             UnifiedQueueWindow window;
             PushRepeated(&window, SampleS(100.0, need), 16);
-            return window.Compute(kJ, Params(2, 4000.0, share)).refill_us;
+            return Funding(window.Compute(kJ, Params(2, 4000.0, share)));
         };
         // N^ <= J: the slack J - N^, and sigma adds nothing.
         CHECK(Near(refill(10000.0, 0.05), 0.0) && Near(refill(10000.0, 0.0), 0.0));
@@ -437,15 +443,15 @@ namespace
         // allowance (sigma applies to S^ above J only).
         const UnifiedQueueResult starved = compute(Record(12000.0, 3000.0, 0.0, 0.0, 0.0, 0.0, false), 0.05);
         CHECK(Near(starved.need_us, 12000.0) && Near(starved.service_us, 9000.0));
-        CHECK(Near(starved.refill_us, 1000.0));
+        CHECK(Near(Funding(starved), 1000.0));
         // The same cycle fed (no empty time): S^ = N^ = 12 ms above J: the allowance min(sigma S^, S^ - J).
         const UnifiedQueueResult fed = compute(Record(12000.0, 0.0, 800.0), 0.05);
-        CHECK(Near(fed.service_us, 12000.0) && Near(fed.refill_us, 600.0));
+        CHECK(Near(fed.service_us, 12000.0) && Near(Funding(fed), 600.0));
         // Wait idle and hold block are out of both.
-        CHECK(Near(compute(Record(14000.0, 0.0, 100.0, 2000.0, 0.0, 1000.0), 0.05).refill_us, 550.0));
+        CHECK(Near(Funding(compute(Record(14000.0, 0.0, 100.0, 2000.0, 0.0, 1000.0), 0.05)), 550.0));
         // Starvation that still leaves S^ above J: the allowance is against S^ (11 ms), the slack
         // against N^ (12 ms): min(0.05 * 11000, 1000) = 550.
-        CHECK(Near(compute(Record(12000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, false), 0.05).refill_us, 550.0));
+        CHECK(Near(Funding(compute(Record(12000.0, 1000.0, 0.0, 0.0, 0.0, 0.0, false), 0.05)), 550.0));
     }
 
     void TestHoldStepAtSaturationIsPaidOnlyByTheShare()
@@ -822,9 +828,9 @@ namespace
             window.Push(PacedSample(Record(20000.0, 3600.0, 0.0, 0.0, 0.0, 0.0, false), false));
         const UnifiedQueueResult law = window.Compute(20000.0, Params(2, 4000.0, 0.0, 4));
         CHECK(Near(law.service_us, 16400.0) && Near(law.need_us, 20000.0));
-        CHECK(Near(law.refill_us, 3600.0) && law.gpu_interval_us < 20000.0);
+        CHECK(Near(Funding(law), 3600.0) && law.gpu_interval_us < 20000.0);
         // sigma only adds above J: nothing here.
-        CHECK(Near(window.Compute(20000.0, Params(2, 4000.0, 0.05, 4)).refill_us, 3600.0));
+        CHECK(Near(Funding(window.Compute(20000.0, Params(2, 4000.0, 0.05, 4))), 3600.0));
     }
 
     void TestPacedEntriesGateTheStarvationInTheBase();
@@ -990,20 +996,26 @@ namespace
 
     void TestRecordDebitAndBounds()
     {
-        // The hold block of each arrived record that NAMES a law grant (its sequence) is the debit of that
-        // grant, the refill is J - N^ (N^ is the mean of the window including this record).
+        // The hold block of each arrived record that NAMES a law grant (its sequence) debits that grant beyond the cap's
+        // slack max(0, J - S^): a hold within the slack fills time the GPU would idle at the cap and spends nothing. The
+        // refill is J - S^ (S^ the mean service of the window including this record).
         Rig rig(true);
         Rig::Planned frame;
         rig.Plan(&frame); // J is known from the first grant
         rig.Records(Record(8000.0, 0.0, 500.0), 12);
         const UnifiedHoldGrant first_grant = rig.Plan(&frame);
         CHECK(Near(first_grant.credit_us, 2000.0) && first_grant.law_sequence != 0);
-        rig.pacer.OnQueueRecord(Named(Record(8000.0, 0.0, 500.0, 1500.0), first_grant.law_sequence)); // need 6500
-        const double need = (12.0 * 8000.0 + 6500.0) / 13.0;
+        rig.pacer.OnQueueRecord(Named(Record(8000.0, 0.0, 500.0, 1500.0), first_grant.law_sequence)); // service 6500
+        const double service = (12.0 * 8000.0 + 6500.0) / 13.0; // slack kJ - service = 2115: the 1500 hold is inside it
         const UnifiedHoldGrant second_grant = rig.Plan(&frame);
-        CHECK(Near(second_grant.credit_us, 2000.0 + (kJ - need) - 1500.0, 1e-6));
+        CHECK(Near(second_grant.credit_us, 2000.0 + (kJ - service), 1e-6));
+        // A hold beyond the slack debits its excess.
+        rig.pacer.OnQueueRecord(Named(Record(8000.0, 0.0, 500.0, 5000.0), second_grant.law_sequence)); // service 3000
+        const double slack = kJ - (12.0 * 8000.0 + 6500.0 + 3000.0) / 14.0;
+        const UnifiedHoldGrant third_grant = rig.Plan(&frame);
+        CHECK(Near(third_grant.credit_us, second_grant.credit_us + slack - (5000.0 - slack), 1e-6));
         // Debt is bounded by -J.
-        rig.pacer.OnQueueRecord(Named(Record(8000.0, 0.0, 500.0, 50000.0), second_grant.law_sequence));
+        rig.pacer.OnQueueRecord(Named(Record(8000.0, 0.0, 500.0, 50000.0), third_grant.law_sequence));
         CHECK(Near(rig.Plan(&frame).credit_us, -kJ));
         // The bank is W x J (the report rule's no-room bank W x a does not apply under the law).
         Rig bank(true, 0.2); // sigma 0.2: the report rule would use a bank of W x a with room < a
@@ -1012,10 +1024,30 @@ namespace
         CHECK(Near(bank.Plan(&frame).credit_us, kBank));
     }
 
+    // A window whose base is not usable (Compute's computable false) has no service to measure the slack by: its records
+    // refill nothing (J - S^ with the unset S^ = 0 would add J per record) and a law grant's hold block is debited whole.
+    void TestUncomputableWindowRefillsNothingAndDebitsTheWholeHold()
+    {
+        Rig rig(true);
+        Rig::Planned frame;
+        rig.Plan(&frame);
+        rig.Records(Record(8000.0, 0.0, 500.0), 12);
+        const UnifiedHoldGrant grant = rig.Plan(&frame);
+        CHECK(grant.law_sequence != 0);
+        const PacingGpuQueueRecord zero_cycle = Record(0.0, 0.0, 500.0); // valid; 16 of them make B = 0
+        rig.Records(zero_cycle, 16);
+        CHECK(rig.pacer.QueueLawInUse());
+        const double before = rig.Plan(&frame).credit_us;
+        rig.Records(zero_cycle, 3);
+        CHECK(Near(rig.Plan(&frame).credit_us, before));
+        rig.pacer.OnQueueRecord(Named(Record(0.0, 0.0, 500.0, 1500.0), grant.law_sequence));
+        CHECK(Near(rig.Plan(&frame).credit_us, before - 1500.0));
+    }
+
     // The share part of the law's refill, min(sigma * S^, max(0, S^ - J)), funds holds that frame generation overlaps: the pacer
-    // bounds it by the median frame generation time A of the used reports (the bound of the report-based rule). A = 0 (no frame
-    // generation: reports carry none) refills nothing; A at least the share term leaves the law's own refill; the slack part
-    // max(0, J - S^) is never bounded.
+    // bounds it by the median frame generation time A of the used reports (the bound of the report-based rule). A at least the
+    // share term leaves the law's own refill; A = 0 (no frame generation: reports carry none) funds nothing, and the signed
+    // J - S^ applies (a GPU that cannot reach J drains the credit by its deficit); the slack part max(0, J - S^) is never bounded.
     void TestLawShareRefillIsBoundedByFrameGenerationTime()
     {
         constexpr double kSigma = 1.0 / 32.0;
@@ -1033,7 +1065,7 @@ namespace
             return rig.Plan(&frame).credit_us - before;
         };
         // The law is in use from the 12th record: 16 records refill five times.
-        CHECK(Near(credit_gained_by_records(0.0, 16), 0.0));                 // no frame generation: the share refills nothing
+        CHECK(Near(credit_gained_by_records(0.0, 16), -kJ));                 // no frame generation: 4 ms deficits drain to -J
         CHECK(Near(credit_gained_by_records(300.0, 16), 5 * 300.0));         // A below the share term bounds it
         CHECK(Near(credit_gained_by_records(437.5, 16), 5 * 437.5));         // A equal to it: the law's own refill
         CHECK(Near(credit_gained_by_records(1700.0, 16), 5 * 437.5, 1e-9));  // A above it (the measured sizes): unchanged
@@ -1049,20 +1081,23 @@ namespace
             rig.Records(Record(8000.0, 0.0, 500.0), 16);
             CHECK(Near(rig.Plan(&frame).credit_us - before, 5 * 2000.0));
         }
-        // With the share 0 nothing changes either (the default: the bound is not evaluated).
+        // With the share 0 (the default: the bound is not evaluated) the deficit drains the credit to -J likewise.
         {
             Rig rig(true, 0.0);
             Rig::Planned frame;
             rig.Plan(&frame);
-            rig.Records(Record(14000.0, 0.0, 500.0), 16);
-            CHECK(Near(rig.Plan(&frame).credit_us, 0.0));
+            rig.Records(Record(14000.0, 0.0, 500.0), 13);
+            CHECK(Near(rig.Plan(&frame).credit_us, -2 * 4000.0)); // in use from the 12th record: two deficits of 4 ms
+            rig.Records(Record(14000.0, 0.0, 500.0), 3);
+            const UnifiedHoldGrant floor = rig.Plan(&frame);
+            CHECK(Near(floor.credit_us, -kJ) && floor.saturated); // R4: released at once
         }
     }
 
     // The frame generation time A that bounds the share refill counts only while the report stream is live at the planned
     // index (the rule of Status and the credit's bank: QueueWaitLive). Queue records keep arriving while the reports stop:
-    // once the reports are expired A is 0 and the share stops refilling (the status reports the evidence expired); when
-    // reports return it refills again.
+    // once the reports are expired A is 0, the share stops refilling (the status reports the evidence expired) and the
+    // signed J - S^ drains the credit by the GPU's deficit; when reports return the share refills again.
     void TestShareRefillStopsWhenTheReportsExpire()
     {
         constexpr double kSigma = 1.0 / 32.0;
@@ -1082,7 +1117,7 @@ namespace
         CHECK(Near(rig.Plan(&frame).credit_us - credit, kShareTerm)); // live reports: the law's own refill
 
         // The reports stop; the records go on, one per planned frame. While the newest used report is no older than
-        // kUnifiedExpireAge frames the share still refills; beyond it nothing does.
+        // kUnifiedExpireAge frames the share still refills; beyond it the 4 ms deficit drains the credit, to -J.
         for (uint32_t i = 0; i < kUnifiedExpireAge + 2; ++i) {
             rig.Plan(&frame);
             rig.Records(record, 1);
@@ -1092,7 +1127,9 @@ namespace
         credit = rig.Plan(&frame).credit_us;
         for (int i = 0; i < 5; ++i) {
             rig.Records(record, 1);
-            CHECK(Near(rig.Plan(&frame).credit_us, credit)); // no share refill, no slack: the credit stays
+            const double drained = std::max(-kJ, credit - 4000.0);
+            CHECK(Near(rig.Plan(&frame).credit_us, drained)); // no share refill: the deficit S^ - J
+            credit = drained;
         }
 
         // Reports return: the share refills again.
@@ -1163,11 +1200,11 @@ namespace
             const UnifiedHoldGrant grant = rig.Plan(&frame);
             CHECK(grant.law_sequence != 0 && Near(grant.credit_us, 5 * 2000.0));
             with_share(&rig.pacer, 0.0);
-            rig.pacer.OnQueueRecord(Named(Record(8000.0, 0.0, 500.0, 1500.0), grant.law_sequence));
-            // From 0 after the decrease: the record refills about 2 ms (J - N^) and its 1.5 ms hold is debited, so the credit is
-            // small and positive, never the 10 ms banked before.
-            const double credit = rig.Plan(&frame).credit_us;
-            CHECK(credit > 0.0 && credit < 1000.0);
+            rig.pacer.OnQueueRecord(Named(Record(8000.0, 0.0, 500.0, 3000.0), grant.law_sequence)); // service 5000
+            // From 0 after the decrease: the record refills the slack J - S^ and the 3 ms hold is debited beyond it, so the
+            // credit is small, never the 10 ms banked before.
+            const double slack = kJ - (15.0 * 8000.0 + 5000.0) / 16.0;
+            CHECK(Near(rig.Plan(&frame).credit_us, slack - (3000.0 - slack), 1e-6));
         }
     }
 
@@ -1446,12 +1483,14 @@ namespace
         // Frame 5's hold (3 ms) becomes known under the fallback: not spent here.
         rig.Evidence(held, 10000.0, 3000.0);
         CHECK(Near(rig.Plan(&frame).credit_us, 2000.0)); // frame 13
-        // Its record arrives late (a stale position, the fallback still in force): spent once.
+        // Its record arrives late (a stale position, the fallback still in force): spent once, beyond the slack of the window
+        // it joins (12 records of 8 ms and its own 5.5 ms of service).
         rig.pacer.OnQueueRecord(Named(Keyed(Record(8000.0, 0.0, 500.0, 2500.0), 6), held_grant.law_sequence));
         CHECK(!rig.pacer.QueueLawInUse());
-        CHECK(Near(rig.Plan(&frame).credit_us, 2000.0 - 2500.0));
+        const double slack = kJ - (12.0 * 8000.0 + 5500.0) / 13.0;
+        CHECK(Near(rig.Plan(&frame).credit_us, 2000.0 - (2500.0 - slack), 1e-6));
         rig.pacer.OnQueueRecord(Named(Keyed(Record(8000.0, 0.0, 500.0, 2500.0), 6), held_grant.law_sequence));
-        CHECK(Near(rig.Plan(&frame).credit_us, 2000.0 - 2500.0));
+        CHECK(Near(rig.Plan(&frame).credit_us, 2000.0 - (2500.0 - slack), 1e-6));
     }
 
     void TestFreshnessIsMeasuredInFrames()
@@ -2198,18 +2237,19 @@ namespace
         return next.credit_us;
     }
 
-    // What carrying the holds in the records changes in the credit against records with hold block 0: every hold
-    // is debited in full, and each record's hold also lowers the need estimate N^ (the mean over the records so
-    // far: 12 warm-up records, then these in arrival order), which raises that record's refill (J - N^) by the
-    // cumulative hold over the record count.
+    // What carrying the holds in the records changes in the credit against records with hold block 0: each named hold is
+    // debited beyond the cap's slack J - S^ at its record, and each record's hold also lowers the service S^ (the mean over
+    // the records so far: 12 warm-up records of 8 ms, then these in arrival order), which raises that record's refill and
+    // its slack by the cumulative hold over the record count.
     double NetOfRecordHolds(const std::vector<double>& holds, const std::vector<size_t>& arrival_order)
     {
         double debited = 0.0, gained = 0.0, cumulative = 0.0;
         int records = 12;
         for (const size_t index : arrival_order) {
             cumulative += holds[index];
-            debited += holds[index];
-            gained += cumulative / static_cast<double>(++records);
+            const double lowered = cumulative / static_cast<double>(++records); // S^ below the control's 8 ms
+            gained += lowered;
+            debited += std::max(0.0, holds[index] - (kJ - 8000.0 + lowered));
         }
         return debited - gained;
     }
@@ -2218,8 +2258,8 @@ namespace
     {
         UnifiedQueueLawSummary named{}, control{};
         // Two holds outstanding (3000, 1000), their records arrive out of order, each names its own grant:
-        // each debits its own hold, once. The control (the same records with hold block 0) shows the
-        // difference is the two holds (4000) less what they raise the refills by (NetOfRecordHolds).
+        // each debits its own hold beyond the slack, once. The control (the same records with hold block 0) shows the
+        // difference is those excesses less what the holds raise the refills by (NetOfRecordHolds).
         const std::vector<double> two = {3000.0, 1000.0};
         double with = RunLawHolds(two, {1, 0}, {true, true}, true, false, false, &named);
         double without = RunLawHolds(two, {1, 0}, {true, true}, false, false, false, &control);
@@ -2228,7 +2268,7 @@ namespace
         CHECK(control.holds_debited_record == 0 && control.holds_never_debited == 0);
 
         // A zero hold between two real ones: its record carries no sequence (the hold was not announced)
-        // and debits nothing; the real ones debit their own: 4000 in total (less the refill), never 3 grants' worth.
+        // and debits nothing; the real ones debit their own (beyond the slack, less the refill), never 3 grants' worth.
         const std::vector<double> three = {3000.0, 0.0, 1000.0};
         with = RunLawHolds(three, {0, 1, 2}, {true, false, true}, true, false, false, &named);
         without = RunLawHolds(three, {0, 1, 2}, {true, false, true}, false, false, false, &control);
@@ -2236,7 +2276,7 @@ namespace
         CHECK(named.holds_debited_record == 2 && named.holds_never_debited == 0);
 
         // The record arrives BEFORE the hold's measurement (the feed was drained first): it names the
-        // grant while it is unmeasured and its own hold block is the debit (3000 less the refill, against the
+        // grant while it is unmeasured and its own hold block beyond the slack is the debit (less the refill, against the
         // control record with hold block 0); the later measurement does not debit again, nor does the ring
         // pressure that follows (the grant is marked paid: never settled, never counted as unpaid).
         const std::vector<double> one = {3000.0};
@@ -2549,6 +2589,7 @@ int main()
     TestCreditContinuousAcrossRuleSwitches();
     TestLawHoldSpendsComeFromRecords();
     TestRecordDebitAndBounds();
+    TestUncomputableWindowRefillsNothingAndDebitsTheWholeHold();
     TestLawShareRefillIsBoundedByFrameGenerationTime();
     TestShareRefillStopsWhenTheReportsExpire();
     TestShareDecreaseDropsTheBankedSurplus();

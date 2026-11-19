@@ -336,6 +336,10 @@ UnifiedPacer::Entry* UnifiedPacer::FindByLawSequence(uint64_t sequence) noexcept
 //   A(k) the report's gpuActiveRenderTime: the part of the interval the GPU did
 //   not work. Spend, once per granted frame (RefreshHold, when its actual hold
 //   is known): c = max(-J, c - h(n)).
+//   Under the queue law (OnQueueRecord) the refill is the signed J - S^ per valid
+//   record (or the share where it funds an allowance) and a law grant spends only
+//   its hold block beyond the cap's slack max(0, J - S^): within the slack the
+//   hold fills time the GPU would idle at the cap anyway.
 //   Grant, at the plan of frame n: advance(n) = max(0, -c) when live.
 // J is the J of the latest grant: the bounds follow it, and a changed J clamps c
 // into the new bounds at the next grant (the interval only changes with a cap,
@@ -682,11 +686,12 @@ void UnifiedPacer::RetireQueueSession(uint64_t session) noexcept
 // Session: a record of a retired probe session is dropped; a newer session restarts the window
 // (the credit and the report-based estimator are untouched). The window takes every arrival of the
 // live session (an invalid record counts against the 12-of-16 rule). Hold: the record's hold block
-// debits the credit once for a frame granted under the queue law, whichever rule is in force now;
-// a frame granted under the report-based rule was (or will be) debited by RefreshHold and the
-// record never debits it again; an unmatched hold (no valid key, or out of the ring) debits only
-// while the law is in use. Refill: a valid sample, while the law is in use. Bounds [-J, W × J], J of
-// the latest grant (none before the first grant). Law off: one bool test.
+// beyond the cap's slack max(0, J - S^) debits the credit once for a frame granted under the queue law,
+// whichever rule is in force now (the whole block while the window is not computable); a frame granted
+// under the report-based rule was (or will be) debited by RefreshHold and the record never debits it
+// again; an unmatched hold (no valid key, or out of the ring) debits only while the law is in use.
+// Refill: a valid sample, while the law is in use: the signed J - S^, or the share where it funds an
+// allowance. Bounds [-J, W × J], J of the latest grant (none before the first grant). Law off: one bool test.
 
 void UnifiedPacer::OnQueueRecord(const PacingGpuQueueRecord& record) noexcept
 {
@@ -775,22 +780,33 @@ void UnifiedPacer::OnQueueRecord(const PacingGpuQueueRecord& record) noexcept
     }
     if (!(credit_j_us_ > 0.0))
         return;
-    if (sample.valid && in_use) {
-        const UnifiedQueueResult law = queue_window_.Compute(credit_j_us_, QueueLawParams(options_), PlannedPosition());
+    // A hold in series fills the cap's slack J - S^: the GPU would idle that long anyway, so the cap's
+    // headroom pays for it and only the block beyond the slack spends the credit. A GPU that cannot reach J
+    // loses its deficit S^ - J with every frame (the signed refill), so the credit falls to -J, where R4
+    // releases every frame, and stays there. Charging the cap's own hold against its own refill (the
+    // earlier rule) left the credit a random walk at a reachable cap: a debt was never repaid, and since a
+    // change of the advance moves the next hold one for one, the debt rang at twice the grant-to-debit
+    // delay (Veilguard, N.187). One window result serves both (Compute caches it).
+    UnifiedQueueResult law{};
+    if ((sample.valid && in_use) || debit_us > 0.0)
+        law = queue_window_.Compute(credit_j_us_, QueueLawParams(options_), PlannedPosition());
+    if (sample.valid && in_use && law.computable) {
         // The share part of the refill funds holds that frame generation overlaps: it is bounded by the median frame
         // generation time A of the used reports, the bound of the report-based rule's allowance (NoRoomAllowance). A counts
         // only while the report stream is live at the planned index (QueueWaitLive, the rule of Status and the credit's
-        // bank): with the reports expired it is 0, as in the status. A = 0 (no frame generation, too few reports, expired
-        // reports) refills nothing. The slack part is the cap's headroom and is not bounded. With A at least the share
-        // term and the reports live the refill is the law's own.
+        // bank): with the reports expired it is 0, as in the status. Where the share funds an allowance (S^ > J) it
+        // replaces the signed term; A = 0 (no frame generation, too few reports, expired reports) leaves the signed term.
         double share_us = law.refill_share_us;
         if (share_us > 0.0)
             share_us = QueueWaitLive(PlannedIndex()) ? std::min(share_us, MeasureWindow().generation_us) : 0.0;
+        const double refill_us = share_us > 0.0 ? share_us : credit_j_us_ - law.service_us;
         const double bank_us = static_cast<double>(kUnifiedExpireAge) * credit_j_us_;
-        credit_us_ = std::max(-credit_j_us_, std::min(bank_us, credit_us_ + (law.refill_slack_us + share_us)));
+        credit_us_ = std::max(-credit_j_us_, std::min(bank_us, credit_us_ + refill_us));
     }
-    if (debit_us > 0.0)
+    if (debit_us > 0.0) {
+        debit_us = std::max(0.0, debit_us - (law.computable ? law.refill_slack_us : 0.0));
         credit_us_ = std::max(-credit_j_us_, credit_us_ - debit_us);
+    }
 }
 
 bool UnifiedPacer::QueueLawInUse() const noexcept

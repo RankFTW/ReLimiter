@@ -189,8 +189,8 @@ void UnifiedQueueWindow::Measure(double j_us, const UnifiedQueueParams& params) 
         if (age == 0 || (age < kGuardFrames && sample.s_prime_us < newest_min_us))
             newest_min_us = sample.s_prime_us;
     }
-    // The slack the cap leaves, max(0, J - S^), and the share, min(sigma * S^, max(0, S^ - J)): the credit's two
-    // refill terms (S^ the 16-frame service), what pays a hold. A hold block up to the slack is paid by the
+    // The slack the cap leaves, max(0, J - S^), and the share, min(sigma * S^, max(0, S^ - J)): what pays a hold
+    // (S^ the 16-frame service; the pacer's refill is the signed J - S^ or the funded share). A hold block up to the slack is paid by the
     // cap's headroom, not by the GPU, so it drops out of the base, as does the level most of the window's frames
     // are blocked at (the interval's own excess, judged at arrival), except what the share funds; a block
     // beyond both stays (no cap or a cap the GPU cannot reach: slack 0, and only the kept part beyond the level
@@ -270,7 +270,6 @@ void UnifiedQueueWindow::Measure(double j_us, const UnifiedQueueParams& params) 
     // (empty time counted as need) is kept for analysis only.
     result.refill_slack_us = slack_us;
     result.refill_share_us = share_us;
-    result.refill_us = result.refill_slack_us + result.refill_share_us;
 }
 
 UnifiedCarryVotes::Vote UnifiedCarryVotes::Judge(double tail_lo_us, double tail_hi_us, double cycle_lo_us,
