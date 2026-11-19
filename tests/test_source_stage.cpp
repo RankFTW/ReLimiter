@@ -1982,8 +1982,9 @@ void TestUnifiedHoldAdvanceOnPlans()
             const UnifiedHoldGrant grant = g_stage.Unified().GrantHold(frame.plan.grid_index, kJ);
             CHECK(grant.live == frame.unified.hold_live);
             CHECK(frame.unified.hold_credit_us == (grant.live ? grant.credit_us : 0.0));
-            CHECK(frame.plan.hold_advance_us == (grant.live && grant.advance_us > 0.0
-                ? static_cast<float>(grant.advance_us) : 0.0f));
+            CHECK(frame.plan.hold_advance_us == (!grant.live ? 0.0f
+                : grant.saturated ? kPacingHoldAdvanceRelease
+                : grant.advance_us > 0.0 ? static_cast<float>(grant.advance_us) : 0.0f));
             CHECK(frame.plan.hold_advance_us >= 0.0f);
             PacingFramePlan published{};
             CHECK(g_frame_plans.Find(frame.plan.key, &published) &&
@@ -2012,7 +2013,8 @@ void TestUnifiedHoldAdvanceOnPlans()
 
     // Saturated with holds (GPU active 14 ms > J, holds of 1 ms): not live before the first used
     // report (plans 0 and 1: no advance, no credit); then the debt reaches -J within a few frames
-    // and stays: advance J, never more (the credit is bounded at -J).
+    // and stays there (the credit is bounded at -J): from then on every grant is saturated and its
+    // plan releases the frame at once (kPacingHoldAdvanceRelease).
     {
         std::vector<Step> steps;
         phase(&steps, 30, 14'000.0, 1'000.0);
@@ -2021,7 +2023,7 @@ void TestUnifiedHoldAdvanceOnPlans()
         CHECK(plans[2].live && plans[2].credit < 0.0 && plans[2].advance > 0.0f); // in debt at once
         for (size_t index = 6; index < plans.size(); ++index) {
             CHECK(plans[index].live);
-            CHECK(plans[index].advance == static_cast<float>(kJ));
+            CHECK(plans[index].advance == kPacingHoldAdvanceRelease);
             CHECK(plans[index].credit == -kJ);
         }
     }
@@ -2056,7 +2058,7 @@ void TestUnifiedHoldAdvanceOnPlans()
         phase(&steps, 12, 14'000.0, 1'000.0);
         phase(&steps, 45, 14'000.0, 1'000.0, false);
         const std::vector<Planned> plans = stream(steps);
-        CHECK(plans[11].live && plans[11].advance == static_cast<float>(kJ));
+        CHECK(plans[11].live && plans[11].advance == kPacingHoldAdvanceRelease);
         for (size_t index = 52; index < plans.size(); ++index) {
             CHECK(!plans[index].live && plans[index].advance == 0.0f && plans[index].credit == 0.0);
         }

@@ -437,6 +437,7 @@ struct UnifiedQueueLawSummary {
     uint64_t holds_lost_unmeasured = 0; // law-granted frames that left the ring with no record naming them and no hold measurement: their hold was never paid (the credit stays that much too high)
     uint64_t frames_no_hold_credit = 0;     // planned frames with the law in use but report-based credit and holds (roles 3 and 4)
     uint64_t frames_not_carried = 0;   // planned frames whose window was in use while the carry votes refused the law (QueueCarriesFrame false): the report rule decided
+    uint64_t grants_saturated = 0;     // grants made with the credit at its floor −J (UnifiedHoldGrant::saturated): released at once, not held
     uint64_t carry_carried = 0;        // judged frames (carry votes, UnifiedCarryVotes::Judge): carried
     uint64_t carry_not_carried = 0;    // ... did not carry
     uint64_t carry_undecided = 0;      // ... undecided by the bounds (abstained)
@@ -455,9 +456,13 @@ struct UnifiedCounters {
 // The hold credit's grant for one planned frame (GrantHold). live = the report
 // stream is live (QueueWaitLive) and the credit applies; credit_us is the signed
 // credit at the plan; advance_us = max(0, -credit_us) when live: the debt the
-// next target is pulled in by. Not live (or an invalid J): {false, 0, 0}.
+// next target is pulled in by. saturated (live only) = the credit sits at its
+// floor −J: the debt is at least J and the floor no longer represents it, so
+// the frame is released at once and not held (the plan carries
+// kPacingHoldAdvanceRelease). Not live (or an invalid J): {false, 0, 0, false}.
 struct UnifiedHoldGrant {
     bool live = false;
+    bool saturated = false;
     double credit_us = 0.0;
     double advance_us = 0.0;
     // The stable identity of a grant made under the queue law (role != 3, the law in use): the sequence
@@ -648,6 +653,12 @@ public:
     // Lag: a hold becomes known 3 to 5 frames after the plan, so frames in
     // flight see a credit that does not yet contain each other's holds; the
     // floor −J bounds the debt.
+    // Saturation: at the floor (c = −J after the clamp) the debt is at least J and
+    // the floor drops the rest, so a hold granted there would never be paid back by
+    // the credit; with the GPU the limit only the queue term could pay for it, at
+    // 1/gain, through a standing queue (N.181: z̃ = target + mean hold / gain). Such a
+    // grant is saturated and its frame is released at once; the first refill above
+    // the floor ends it.
     UnifiedHoldGrant GrantHold(uint64_t grid_index, double display_interval_us) noexcept;
 
     UnifiedCounters Counters() const noexcept { return counters_; }

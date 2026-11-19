@@ -806,6 +806,14 @@ void TestExecutor() {
                 }
             }
         }
+        // The saturated credit's release: under the key a 1-tick target, Late at once (no Wait); key off as today.
+        plan.hold_advance_us=kPacingHoldAdvanceRelease;
+        for(const bool key:{false,true}) {
+            set_key(key);
+            const auto decision=Decide(plan,now,true);
+            if(key)CHECK(decision.target==1 && decision.status==PacingPlanStatus::Late && decision.gate==GpuPresentStatus::Late);
+            else CHECK(decision.target==GridTarget(45)+3000-694 && decision.status==PacingPlanStatus::Held);
+        }
         // FloorAfterLatePass: the ticket's advance (copied from the plan at admission) is applied
         // to the late pass's floor under the key, so the pass does not undo the advance; key off
         // gives the floor itself; a floor the advance brings to or below the ticket's target moves nothing.

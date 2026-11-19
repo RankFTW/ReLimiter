@@ -9,6 +9,7 @@
 #include "pacing_telemetry_types.h"
 
 #include <cstdint>
+#include <limits>
 
 // ── Frame identity ──
 
@@ -194,6 +195,11 @@ inline bool PacingSourceRecord_PipelineRung(const PacingSourceRecord& record, ui
 
 // ── Plans and stage events ──
 
+// PacingFramePlan::hold_advance_us that releases the frame at once: the hold credit is saturated in
+// debt (UnifiedHoldGrant::saturated), so the frame is not held. CadenceGrid_ResolveOutputTarget caps
+// the advance and resolves a 1-tick target, which every executor treats as late (no wait).
+constexpr float kPacingHoldAdvanceRelease = (std::numeric_limits<float>::max)();
+
 // One real frame's plan. The source stage publishes it before its wait;
 // executors re-resolve the output target from the current grid snapshot.
 struct PacingFramePlan {
@@ -212,7 +218,8 @@ struct PacingFramePlan {
     // Unified owner, hold credit (unified_pacer.h): the ADVANCE in µs the executors
     // subtract from the resolved targets (nominal or floored) under the live key; >= 0, 0 = none
     // (key off, a report stream that is not live, no debt). A debt in the credit is repaid by
-    // releasing the next frames earlier by it. Fits the padding after the enums.
+    // releasing the next frames earlier by it; kPacingHoldAdvanceRelease when the credit is
+    // saturated in debt (the frame is released at once). Fits the padding after the enums.
     float hold_advance_us = 0.0f;
     // Key unified_queue_law: the stable identity the law gave this frame's grant (UnifiedHoldGrant::
     // law_sequence; 0 = a report-rule grant, no live grant, the law not in use, or the key off). It

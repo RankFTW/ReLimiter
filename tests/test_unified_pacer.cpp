@@ -2262,6 +2262,53 @@ namespace
         }
     }
 
+    // Saturation (N.181): at the floor −J the debt is at least J and the floor drops the rest, so the
+    // grant is saturated and its frame is released at once. Anything above the floor is not.
+    void TestHoldCreditSaturatedAtTheFloor()
+    {
+        // A first grant, a positive bank and a stream that is not live are never saturated.
+        {
+            CreditRig rig;
+            CHECK(!rig.first_grant.saturated);
+            rig.Fill(2000.0);
+            CHECK(!rig.Grant().saturated);
+            Driver driver;
+            const FrameResult frame = driver.Frame();
+            const UnifiedHoldGrant grant = driver.law.GrantHold(frame.grid, kCreditJ);
+            CHECK(!grant.live && !grant.saturated);
+        }
+        // One long hold drives the credit to −J: the next grant is saturated, and advance_us keeps
+        // the represented debt J. One µs of refill lifts it off the floor.
+        {
+            CreditRig rig;
+            rig.Grant(20000.0);
+            const UnifiedHoldGrant floor = rig.Grant();
+            CHECK(Is(floor, true, -kCreditJ, kCreditJ) && floor.saturated);
+            rig.Fill(kCreditJ - 1.0); // + 1 µs
+            const UnifiedHoldGrant above = rig.Grant();
+            CHECK(Is(above, true, -kCreditJ + 1.0, kCreditJ - 1.0) && !above.saturated);
+        }
+        // GPU active time above J on every report (Requiem's GPU limit): once at the floor every grant
+        // is saturated, and its unheld frame debits nothing, so it stays there.
+        {
+            CreditRig rig;
+            rig.Grant(20000.0);
+            for (int i = 0; i < 8; ++i) {
+                rig.Fill(12000.0); // −4000 per report
+                const UnifiedHoldGrant grant = rig.Grant(0.0);
+                CHECK(Is(grant, true, -kCreditJ, kCreditJ) && grant.saturated);
+            }
+        }
+        // A smaller J clamps the debt into its own floor: saturated at the new J.
+        {
+            CreditRig rig;
+            rig.Grant(5000.0); // c = −5000, above −8000
+            CHECK(!rig.Grant().saturated);
+            const UnifiedHoldGrant smaller = rig.Grant(0.0, nullptr, 4000.0);
+            CHECK(Is(smaller, true, -4000.0, 4000.0) && smaller.saturated);
+        }
+    }
+
     void TestHoldCreditGrantedFrameWithoutHoldDebitsNothing()
     {
         CreditRig rig;
@@ -3230,6 +3277,7 @@ int main()
     TestHoldCreditStartsAtZero();
     TestHoldCreditBanksAtMostWindowTimesJ();
     TestHoldCreditDebtAndAdvance();
+    TestHoldCreditSaturatedAtTheFloor();
     TestHoldCreditGrantedFrameWithoutHoldDebitsNothing();
     TestHoldCreditStreamNotLive();
     TestHoldCreditResets();

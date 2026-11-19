@@ -442,7 +442,7 @@ static void LogQueueLawSummary(const char* reason) noexcept
     if (s.frames_planned == 0 && s.records_accepted == 0 && s.records_retired == 0 &&
         s.grants_law == 0 && s.grants_report == 0)
         return;
-    char credit_note[480];
+    char credit_note[640];
     credit_note[0] = '\0';
     size_t credit_note_length = 0;
     if (s.holds_settled_orphan != 0)
@@ -459,6 +459,11 @@ static void LogQueueLawSummary(const char* reason) noexcept
             sizeof(credit_note) - credit_note_length,
             "; %llu frames the report-based rule decided because the watched queue did not carry the frame",
             static_cast<unsigned long long>(s.frames_not_carried)));
+    if (s.grants_saturated != 0 && credit_note_length < sizeof(credit_note))
+        credit_note_length += static_cast<size_t>(std::snprintf(credit_note + credit_note_length,
+            sizeof(credit_note) - credit_note_length,
+            "; %llu frames released at once because the hold credit was at its floor",
+            static_cast<unsigned long long>(s.grants_saturated)));
     if ((s.carry_carried != 0 || s.carry_not_carried != 0 || s.carry_undecided != 0) &&
         credit_note_length < sizeof(credit_note))
         std::snprintf(credit_note + credit_note_length, sizeof(credit_note) - credit_note_length,

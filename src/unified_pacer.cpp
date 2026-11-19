@@ -369,6 +369,11 @@ UnifiedHoldGrant UnifiedPacer::GrantHold(uint64_t grid_index, double display_int
         grant.live = true;
         grant.credit_us = credit_us_;
         grant.advance_us = credit_us_ < 0.0 ? -credit_us_ : 0.0;
+        // At the floor the debt is at least J and the floor drops the rest: a hold granted now would
+        // never be paid back by the credit, only by the queue term at 1/gain (N.181). The frame is
+        // released at once (the plan's kPacingHoldAdvanceRelease); the first refill above the floor
+        // ends it. advance_us stays the represented debt.
+        grant.saturated = credit_us_ <= -display_interval_us;
         entry->granted = true; // its hold will spend the credit
         entry->granted_by_law = law_in_use; // ... by the rule that granted it
         if (law_in_use) {
@@ -378,8 +383,11 @@ UnifiedHoldGrant UnifiedPacer::GrantHold(uint64_t grid_index, double display_int
             grant.law_sequence = ++law_hold_sequence_counter_;
             entry->law_hold_sequence = grant.law_sequence;
         }
-        if (options_.queue_law)
+        if (options_.queue_law) {
             ++(law_in_use ? summary_.grants_law : summary_.grants_report);
+            if (grant.saturated)
+                ++summary_.grants_saturated;
+        }
     }
     granted_index_ = grid_index;
     granted_ = grant;

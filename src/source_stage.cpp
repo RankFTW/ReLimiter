@@ -567,12 +567,14 @@ SourceStageFrame SourceStage::RunUnifiedFrame(
     plan.marker = request.marker;
     // Hold credit (unified_pacer.h): the law's grant for this frame, decided BEFORE the plan is
     // published so the executor reads its advance from the registry (0 = none: the stream is not
-    // live, or the credit is not in debt). One grant per frame; the frame's one Status call stays
-    // (it advances the service clamp); the grant takes no status.
+    // live, or the credit is not in debt; kPacingHoldAdvanceRelease = the credit is saturated at its
+    // floor and the frame is released at once). One grant per frame; the frame's one Status call
+    // stays (it advances the service clamp); the grant takes no status.
     const UnifiedStatus law_status = unified_.Status(n, display_interval_us);
     const UnifiedHoldGrant hold_grant = unified_.GrantHold(n, display_interval_us);
-    plan.hold_advance_us = hold_grant.live && hold_grant.advance_us > 0.0
-        ? static_cast<float>(hold_grant.advance_us) : 0.0f;
+    plan.hold_advance_us = !hold_grant.live ? 0.0f
+        : hold_grant.saturated ? kPacingHoldAdvanceRelease
+        : hold_grant.advance_us > 0.0 ? static_cast<float>(hold_grant.advance_us) : 0.0f;
     // The grant's identity (a law grant only) goes with the plan: the GPU gate announces it with the
     // hold Wait and the probe record of the frame the hold delayed names it back.
     plan.law_hold_sequence = hold_grant.live ? hold_grant.law_sequence : 0;

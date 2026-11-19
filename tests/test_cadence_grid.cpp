@@ -2289,6 +2289,12 @@ namespace
             // A target the advance overtakes stays positive (the late path releases it).
             resolve(1, true, 1e9);
             CHECK(target >= 1 && target < t1);
+            // The saturated credit's release (kPacingHoldAdvanceRelease, a float's maximum) takes the
+            // capped branch: a 1-tick target, nominal or floored, which every executor reads as late.
+            resolve(1, true, kPacingHoldAdvanceRelease);
+            CHECK(target == 1 && !floored);
+            resolve(2, true, kPacingHoldAdvanceRelease);
+            CHECK(target == 1 && floored);
             // Stale stays stale.
             CHECK(!CadenceGrid_ResolveOutputTarget(snapshot, kGeneration + 1, 2, tracker, &target,
                 &floored, divisor, true, advance_us));
