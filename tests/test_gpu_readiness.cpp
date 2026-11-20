@@ -698,7 +698,7 @@ NativeGateContext NativeGate_GetContext(int64_t) noexcept {
         (g_fg_active.load()?4u:0u) | (g_fg_presenting.load()?8u:0u);
     // As production: observation follows the FG input route's predicate (2x frame generation here).
     context.observe_frame_generation=s_fg_observation &&
-        FrameGeneration_RouteRejection(false, true, static_cast<uint32_t>(g_fg_mode.load()), g_fg_presenting.load(), 1) == nullptr;
+        FrameGeneration_RouteRejection(false, true, static_cast<uint32_t>(g_fg_mode.load()), g_fg_presenting.load(), 1) == FgRouteRejection::None;
     return context;
 }
 uint64_t NativeGate_PredictionEpoch() noexcept { return 1; }

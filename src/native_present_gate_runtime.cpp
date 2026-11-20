@@ -45,7 +45,7 @@ NativeGateContext NativeGate_GetContext(int64_t now_qpc) noexcept
             (g_fg_active.load(std::memory_order_relaxed)?4u:0u) |
             (g_fg_presenting.load(std::memory_order_relaxed)?8u:0u) |
             (Streamline_StatementAuthority()?16u:0u);
-        context.observe_frame_generation = context.supported && Streamline_RouteRejection() == nullptr;
+        context.observe_frame_generation = context.supported && Streamline_RouteRejection() == FgRouteRejection::None;
     }
 #endif
     return context;

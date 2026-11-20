@@ -312,8 +312,9 @@ if(MSVC)
 endif()
 
 ## ── Enforcement route tests ──
-# The dispatcher's route selection with the marker state scripted: marker routes are a 64-bit route, so a 32-bit
-# process takes the present route whatever the marker state says. The hooks and the scheduler need live validation.
+# Links the dispatcher, not the hooks. On x64, tests sticky NvAPI routing on DX11/DX12 and
+# live PCL routing on Vulkan; on Win32, every known graphics API dispatches through Present.
+# With no active graphics API, neither architecture selects a route.
 
 add_executable(test_enforcement_route
     test_enforcement_route.cpp

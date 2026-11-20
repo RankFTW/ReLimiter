@@ -175,8 +175,8 @@ const char* PolicyRejection() noexcept {
     if (!GpuPresent_RequiresReadiness()) return "gpu_deadline_off";
     // Frame generation's state as the resolver published it: Dynamic MFG, Off, dynamic mode, not presenting, or a
     // multiplier outside 2x to 4x (FrameGeneration_RouteRejection; Auto and an unobserved mode are accepted).
-    if (const char* reason = Streamline_RouteRejection()) return reason;
-    return nullptr;
+    const FgRouteRejection reason = Streamline_RouteRejection();
+    return reason == FgRouteRejection::None ? nullptr : FgRouteRejection_Text(reason);
 }
 bool Enabled() noexcept {
     return !PolicyRejection();
@@ -553,7 +553,7 @@ void RejectRoute(const char* reason) noexcept {
 void PublishSeparatePresenter() noexcept {
     constexpr auto relaxed = std::memory_order_relaxed;
     const auto context = NativeGate_GetContext(Now());
-    const bool fg = Streamline_RouteRejection() == nullptr;
+    const bool fg = Streamline_RouteRejection() == FgRouteRejection::None;
     auto& s = separate;
     bool evident = s.evident.load(std::memory_order_acquire);
     if (evident && !(fg && s.tag_native.load(relaxed) == context.native_swapchain &&

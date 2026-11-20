@@ -118,15 +118,28 @@ inline FgEffective FrameGeneration_ResolveState(const FgFacts& facts) noexcept {
     return effective;
 }
 
-// Why the FG input route cannot take frames now (nullptr: it can): one predicate for the handoff's policy, its
-// diagnostics, the separate presenter and the native gate's frame generation observation. Auto (2) and an unobserved
-// mode are accepted; the route keys every input to one multiplier of 2x to 4x.
-inline const char* FrameGeneration_RouteRejection(bool dmfg, bool mode_known, uint32_t mode, bool presenting,
-    int generated) noexcept {
-    if (dmfg) return "dmfg_passthrough";
-    if (mode_known && mode == 0) return "mode_off";
-    if (mode == 3) return "mode_dynamic";
-    if (!presenting) return "fg_not_presenting";
-    if (generated < 1 || generated > 3) return "unsupported_multiplier";
-    return nullptr;
+// Why the FG input route cannot take frames. Auto (2) and an unobserved mode
+// are accepted; the route keys each input to a multiplier of 2x to 4x.
+enum class FgRouteRejection : uint8_t { None, Dmfg, Off, Dynamic, NotPresenting, UnsupportedMultiplier };
+
+inline FgRouteRejection FrameGeneration_RouteRejection(bool dmfg, bool mode_known, uint32_t mode,
+    bool presenting, int generated) noexcept {
+    if (dmfg) return FgRouteRejection::Dmfg;
+    if (mode_known && mode == 0) return FgRouteRejection::Off;
+    if (mode == 3) return FgRouteRejection::Dynamic;
+    if (!presenting) return FgRouteRejection::NotPresenting;
+    if (generated < 1 || generated > 3) return FgRouteRejection::UnsupportedMultiplier;
+    return FgRouteRejection::None;
+}
+
+inline const char* FgRouteRejection_Text(FgRouteRejection reason) noexcept {
+    switch (reason) {
+        case FgRouteRejection::None: return "eligible";
+        case FgRouteRejection::Dmfg: return "dmfg_passthrough";
+        case FgRouteRejection::Off: return "mode_off";
+        case FgRouteRejection::Dynamic: return "mode_dynamic";
+        case FgRouteRejection::NotPresenting: return "fg_not_presenting";
+        case FgRouteRejection::UnsupportedMultiplier: return "unsupported_multiplier";
+    }
+    return "unknown";
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "fg_state_policy.h"
 #include <Windows.h>
 #include <atomic>
 #include <cstdint>
@@ -39,9 +40,9 @@ void FrameGeneration_OnPresent();
 void Streamline_RecordReflexSyncStatement(uint32_t stated, bool disable) noexcept;
 
 // The published resolver results: whether the in-band statement decided the state, and why the FG input route
-// cannot take frames now (nullptr: it can; FrameGeneration_RouteRejection).
+// cannot take frames now (None: it can; FrameGeneration_RouteRejection).
 bool Streamline_StatementAuthority() noexcept;
-const char* Streamline_RouteRejection() noexcept;
+FgRouteRejection Streamline_RouteRejection() noexcept;
 
 // Returns true if the FG runtime DLL is loaded (nvngx_dlssg.dll etc.)
 bool IsFGDllLoaded();
@@ -83,7 +84,7 @@ inline bool HookStreamlinePCL(HMODULE) { return false; }
 inline void FrameGeneration_OnPresent() {}
 inline void Streamline_RecordReflexSyncStatement(uint32_t, bool) noexcept {}
 inline bool Streamline_StatementAuthority() noexcept { return false; }
-inline const char* Streamline_RouteRejection() noexcept { return "fg_not_presenting"; }
+inline FgRouteRejection Streamline_RouteRejection() noexcept { return FgRouteRejection::NotPresenting; }
 inline bool IsFGDllLoaded() { return false; }
 inline bool IsDmfgSession() { return false; }
 inline bool IsDmfgActive() { return false; }

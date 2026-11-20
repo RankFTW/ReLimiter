@@ -17,6 +17,8 @@ void Log_Init(HMODULE hModule, LogLevel level);
 // the caller must retain the module and must not reinitialize the logger.
 bool Log_Shutdown();
 
+bool Log_IsEnabled(LogLevel level) noexcept;
+
 // Core write function.
 void Log_Write(LogLevel level, const char* fmt, ...);
 

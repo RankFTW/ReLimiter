@@ -166,7 +166,8 @@ enum class PacingFallbackReason : uint8_t {
     FgUnqualified = 11, // FG presenting without a qualified FG input route
     Infeasible = 12,    // historical: the overload guard demoted the Auto rung; no code produces it
     FgRouteUnsupported = 13, // FG presents its own frames on another thread and queue: no FG input wait
-    DriverLimiterUnavailable = 14 // test mode driver_limiter where the driver's limiter cannot apply: pass-through
+    DriverLimiterUnavailable = 14, // test mode driver_limiter where the driver's limiter cannot apply: pass-through
+    FgDynamic = 15      // Streamline Dynamic: source paced, FG input wait cannot qualify
 };
 
 // The rung a Source record shows for its pipeline generation (the

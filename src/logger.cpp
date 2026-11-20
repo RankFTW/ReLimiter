@@ -340,8 +340,12 @@ bool Log_Shutdown() {
     return true;
 }
 
+bool Log_IsEnabled(LogLevel level) noexcept {
+    return static_cast<uint8_t>(level) <= s_levels.Effective();
+}
+
 void Log_Write(LogLevel level, const char* fmt, ...) {
-    if (static_cast<uint8_t>(level) > s_levels.Effective()) return;
+    if (!Log_IsEnabled(level)) return;
     LogWriteGuard writer;
     if (!writer.IsAdmitted()) return;
 

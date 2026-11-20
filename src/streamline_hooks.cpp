@@ -2,7 +2,6 @@
 #include "streamline_discovery.h"
 #include "streamline_gpu_handoff.h"
 #include "streamline_queue_hooks.h"
-#include "fg_state_policy.h"
 #include "ngx_hooks.h"
 #include "hooks.h"
 #include "loadlib_hooks.h"
@@ -134,8 +133,7 @@ static constexpr uint64_t kStatementStalePresents = 4;
 
 // ── The resolver's published results (besides g_fg_presenting, g_fg_actual_multiplier and g_fg_multiplier) ──
 static std::atomic<bool> s_statement_authority{false};
-static std::atomic<const char*> s_route_rejection{nullptr};
-static std::atomic<bool> s_route_published{false};       // s_route_rejection holds a resolver result
+static std::atomic<FgRouteRejection> s_route_rejection{FgRouteRejection::NotPresenting};
 
 static FgFacts CurrentFacts() noexcept {
     FgFacts facts;
@@ -150,17 +148,12 @@ static FgFacts CurrentFacts() noexcept {
     return facts;
 }
 
-static bool SameRejection(const char* a, const char* b) noexcept {
-    return a == b || (a && b && std::strcmp(a, b) == 0);
-}
-
-static bool PublishedEquals(const FgEffective& effective, const char* rejection) noexcept {
-    return s_route_published.load(std::memory_order_relaxed) &&
-        g_fg_presenting.load(std::memory_order_relaxed) == effective.presenting &&
+static bool PublishedEquals(const FgEffective& effective, FgRouteRejection rejection) noexcept {
+    return g_fg_presenting.load(std::memory_order_relaxed) == effective.presenting &&
         g_fg_actual_multiplier.load(std::memory_order_relaxed) == effective.actual &&
         g_fg_multiplier.load(std::memory_order_relaxed) == effective.generated &&
         s_statement_authority.load(std::memory_order_relaxed) == effective.statement_authority &&
-        SameRejection(s_route_rejection.load(std::memory_order_relaxed), rejection);
+        s_route_rejection.load(std::memory_order_relaxed) == rejection;
 }
 
 // Under the options-state write sequence: publishes the resolver's result. A change of the effective state logs one
@@ -170,7 +163,7 @@ static bool PublishedEquals(const FgEffective& effective, const char* rejection)
 static void PublishLocked(const char* why, bool notify = true) noexcept {
     const FgFacts facts = CurrentFacts();
     const FgEffective effective = FrameGeneration_ResolveState(facts);
-    const char* rejection = FrameGeneration_RouteRejection(facts.dmfg, facts.mode_known, facts.mode,
+    const FgRouteRejection rejection = FrameGeneration_RouteRejection(facts.dmfg, facts.mode_known, facts.mode,
         effective.presenting, effective.generated);
     const bool previous_presenting = g_fg_presenting.load(std::memory_order_relaxed);
     const int previous_actual = g_fg_actual_multiplier.load(std::memory_order_relaxed);
@@ -181,7 +174,6 @@ static void PublishLocked(const char* why, bool notify = true) noexcept {
     g_fg_presenting.store(effective.presenting, std::memory_order_relaxed);
     s_statement_authority.store(effective.statement_authority, std::memory_order_relaxed);
     s_route_rejection.store(rejection, std::memory_order_release);
-    s_route_published.store(true, std::memory_order_release);
     if (previous_presenting == effective.presenting && previous_actual == effective.actual &&
         previous_generated == effective.generated && previous_authority == effective.statement_authority) return;
     LOG_INFO("FG state (%s): presenting %s, multiplier %d, generated %d, from %s (statement %u%s, mode %s%u, "
@@ -190,7 +182,7 @@ static void PublishLocked(const char* why, bool notify = true) noexcept {
         effective.statement_authority ? "the in-band statement" : "the options and inference",
         facts.statement, facts.statement_fresh ? "" : " not fresh", facts.mode_known ? "" : "unknown ", facts.mode,
         facts.configured_generated, facts.legacy_presenting ? 1 : 0, facts.legacy_actual, facts.dmfg ? 1 : 0,
-        rejection ? rejection : "eligible");
+        FgRouteRejection_Text(rejection));
     if (!notify) return;
     if (previous_generated != effective.generated) StreamlineHandoff_Invalidate("fg_multiplier_changed");
     OnFGStateChange();
@@ -222,9 +214,8 @@ bool Streamline_StatementAuthority() noexcept {
     return s_statement_authority.load(std::memory_order_acquire);
 }
 
-const char* Streamline_RouteRejection() noexcept {
-    return s_route_published.load(std::memory_order_acquire)
-        ? s_route_rejection.load(std::memory_order_acquire) : "fg_not_presenting";
+FgRouteRejection Streamline_RouteRejection() noexcept {
+    return s_route_rejection.load(std::memory_order_acquire);
 }
 
 // Once per Present: the accepted statement of the current lifetime and whether it is fresh.

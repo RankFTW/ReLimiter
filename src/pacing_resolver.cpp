@@ -34,17 +34,15 @@ namespace
     // The first failing FG input wait requirement; None when all hold. The
     // GPU gate keys FG inputs to NvAPI frames on DX12; no executor claims an
     // FgInputWait plan elsewhere, so only a ready route on DX12 NvAPI markers
-    // can still qualify (FgUnqualified). A route whose frame generation
-    // presents from its own thread and queue cannot (FgRouteUnsupported).
+    // can qualify.
     PacingFallbackReason FgInputBlocker(const PacingCapabilities& capabilities) noexcept
     {
         if (!capabilities.x64) return PacingFallbackReason::Architecture;
         if (capabilities.api != PacingApi::DX12) return PacingFallbackReason::Api;
         if (capabilities.route != PacingRoute::NvApiMarkers) return PacingFallbackReason::NoNativeRoute;
-        if (!capabilities.fg_input_route_ready)
-            return capabilities.fg_separate_presenter ? PacingFallbackReason::FgRouteUnsupported
-                                                      : PacingFallbackReason::FgUnqualified;
-        return PacingFallbackReason::None;
+        if (capabilities.fg_input_route_ready) return PacingFallbackReason::None;
+        return capabilities.fg_separate_presenter ? PacingFallbackReason::FgRouteUnsupported
+                                                  : PacingFallbackReason::FgUnqualified;
     }
 
     // The native route is PRESENT_START → native Present attribution, which
@@ -205,6 +203,7 @@ namespace
         std::atomic<double> lead_quantile{ kInitialSnapshot.lead_quantile };
         std::atomic<double> allowance_us{ kInitialSnapshot.allowance_us };
         std::atomic<bool> gpu_probes{ kInitialSnapshot.gpu_probes };
+        std::atomic<bool> observe_fg_inputs{ kInitialSnapshot.observe_fg_inputs };
         std::atomic<double> gpu_wait_headroom_us{ kInitialSnapshot.gpu_wait_headroom_us };
     };
     SnapshotPublication s_pipeline;
@@ -222,6 +221,7 @@ namespace
         snapshot.lead_quantile = s_pipeline.lead_quantile.load(std::memory_order_relaxed);
         snapshot.allowance_us = s_pipeline.allowance_us.load(std::memory_order_relaxed);
         snapshot.gpu_probes = s_pipeline.gpu_probes.load(std::memory_order_relaxed);
+        snapshot.observe_fg_inputs = s_pipeline.observe_fg_inputs.load(std::memory_order_relaxed);
         snapshot.gpu_wait_headroom_us = s_pipeline.gpu_wait_headroom_us.load(std::memory_order_relaxed);
         return snapshot;
     }
@@ -238,6 +238,7 @@ namespace
         s_pipeline.lead_quantile.store(snapshot.lead_quantile, std::memory_order_relaxed);
         s_pipeline.allowance_us.store(snapshot.allowance_us, std::memory_order_relaxed);
         s_pipeline.gpu_probes.store(snapshot.gpu_probes, std::memory_order_relaxed);
+        s_pipeline.observe_fg_inputs.store(snapshot.observe_fg_inputs, std::memory_order_relaxed);
         s_pipeline.gpu_wait_headroom_us.store(snapshot.gpu_wait_headroom_us, std::memory_order_relaxed);
     }
 
@@ -383,6 +384,11 @@ PacingPipelineSnapshot PacingPipeline_Resolve(
                 decision = { PacingRung::SourceOnly, PacingFallbackReason::Override };
             } else {
                 decision = ResolveRung(capabilities, runtime);
+                // Observer demand follows the actual route, not the wording used to describe it.
+                result.observe_fg_inputs = decision.reason == PacingFallbackReason::FgUnqualified ||
+                    decision.reason == PacingFallbackReason::FgRouteUnsupported;
+                if (runtime.fg_presenting && runtime.fg_dynamic && decision.rung == PacingRung::SourceOnly)
+                    decision.reason = PacingFallbackReason::FgDynamic;
             }
             result.auto_rung = decision.rung;
         }
@@ -410,6 +416,7 @@ bool PacingPipeline_SameResult(
         left.lead_quantile == right.lead_quantile &&
         left.allowance_us == right.allowance_us &&
         left.gpu_probes == right.gpu_probes &&
+        left.observe_fg_inputs == right.observe_fg_inputs &&
         left.gpu_wait_headroom_us == right.gpu_wait_headroom_us;
 }
 
@@ -613,7 +620,18 @@ const char* PacingFallbackReason_Text(PacingFallbackReason reason) noexcept
         case PacingFallbackReason::Infeasible: return "infeasible";
         case PacingFallbackReason::FgRouteUnsupported: return "fg_route_unsupported";
         case PacingFallbackReason::DriverLimiterUnavailable: return "driver_limiter_unavailable";
+        case PacingFallbackReason::FgDynamic: return "fg_dynamic";
         default: return "unknown";
+    }
+}
+
+const char* PacingFallbackReason_CappedSummary(PacingFallbackReason reason) noexcept
+{
+    switch (reason) {
+        case PacingFallbackReason::PresentRoute: return "Capped: smooth pacing needs NVIDIA Reflex in the game";
+        case PacingFallbackReason::FgRouteUnsupported: return "Capped: frame generation paces its own frames here (frames are not held)";
+        case PacingFallbackReason::FgDynamic: return "Capped: Dynamic frame generation paces its own frames (frames are not held)";
+        default: return nullptr;
     }
 }
 

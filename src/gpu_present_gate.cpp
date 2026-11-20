@@ -5,32 +5,17 @@
 #include <atomic>
 #include <cmath>
 
-namespace {
-bool H3RungResolved() noexcept {
-    const auto rung=PacingPipeline_Read().rung;
-    return rung==PacingRung::GpuQueueWait || rung==PacingRung::FgInputWait;
-}
-// The resolver would select FgInputWait but the FG input route is not
-// qualified yet (FgUnqualified, or FgRouteUnsupported while frame
-// generation presents from its own thread and queue). The FG input observers
-// must then deliver inputs, so the gate can publish PacingCapability::FgInputRoute;
-// without this the capability and the rung would each wait for the other, and an
-// unsupported route could never be judged again.
-bool FgRouteQualificationPending() noexcept {
-    const auto pipeline=PacingPipeline_Read();
-    return pipeline.reason==PacingFallbackReason::FgUnqualified ||
-        pipeline.reason==PacingFallbackReason::FgRouteUnsupported;
-}
-}
-
 // Worker-published "H3 obligations exist" (tickets or FG prefix readbacks).
 // Written by gpu_present_gate_d3d12.cpp; always false on Win32.
 namespace gpu_present_shared {
 std::atomic<bool> outstanding{false};
+static bool HasH3Demand(PacingRung rung) noexcept {
+    return rung==PacingRung::GpuQueueWait || rung==PacingRung::FgInputWait || outstanding.load(std::memory_order_acquire);
+}
 // Worker scheduling demand (MMCSS, idle wait): an H3 rung is resolved or H3
 // obligations exist. FG route qualification alone never registers MMCSS.
 bool H3Demand() noexcept {
-    return H3RungResolved() || outstanding.load(std::memory_order_acquire);
+    return HasH3Demand(PacingPipeline_Read().rung);
 }
 }
 
@@ -64,7 +49,8 @@ bool GpuPresent_IsFgSupported(uint32_t controller) noexcept {
     return controller && PacingPipeline_HasCapability(PacingCapability::FgInputRoute,controller);
 }
 bool GpuPresent_RequiresReadiness() noexcept {
-    return gpu_present_shared::H3Demand() || FgRouteQualificationPending();
+    const auto pipeline=PacingPipeline_Read();
+    return pipeline.observe_fg_inputs || gpu_present_shared::HasH3Demand(pipeline.rung);
 }
 ReadyPresentConfig GpuPresent_GetConfig() noexcept {
     const auto word=CurrentWord();

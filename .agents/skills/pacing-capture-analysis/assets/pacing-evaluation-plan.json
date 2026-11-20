@@ -70,6 +70,7 @@
           "no_gpu_queue",
           "fg_unqualified",
           "fg_route_unsupported",
+          "fg_dynamic",
           "architecture",
           "api"
         ]
@@ -92,6 +93,7 @@
           "no_gpu_queue",
           "fg_unqualified",
           "fg_route_unsupported",
+          "fg_dynamic",
           "architecture",
           "api"
         ]
@@ -114,6 +116,7 @@
           "no_gpu_queue",
           "fg_unqualified",
           "fg_route_unsupported",
+          "fg_dynamic",
           "architecture",
           "api"
         ]

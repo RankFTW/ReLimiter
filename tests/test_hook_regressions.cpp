@@ -50,6 +50,8 @@ HANDLE s_create_entered = nullptr;
 HANDLE s_release_create = nullptr;
 HANDLE s_enable_entered = nullptr;
 bool s_test_stopping = false;
+thread_local unsigned s_callback_depth = 0, s_readiness_depth = 0;
+thread_local bool s_raise_at_selection = false;
 uint64_t s_native_handle_override = 0; // the swap manager's native handle seen by the production detours (0: 0x1000)
 void* s_expected_self = nullptr;
 const DXGI_PRESENT_PARAMETERS* s_expected_parameters = nullptr;
@@ -1056,19 +1058,32 @@ void TestVtableForwardsLiveClassSlot() {
     Check(rf::s_object.vptr == class_vptr, "destroy restores the class vtable");
 }
 
-// A structured exception that leaves the Present body and is caught by a caller (here the retry path's
-// GetDesc raises): the detour's SEH __finally unlinks the dedup node, so the thread's list does not point at a dead
-// frame and the next detour for the same object is an outermost entry again.
-HRESULT STDMETHODCALLTYPE ReturnInvalidCall(IDXGISwapChain*, UINT, UINT) { return DXGI_ERROR_INVALID_CALL; }
+// The optional description query can fault after the gate/readiness scopes opened.
+// It must neither abort the retry nor unwind the Present detour's owners.
+unsigned s_desc_queries = 0;
+HRESULT STDMETHODCALLTYPE RejectTearing(IDXGISwapChain*, UINT, UINT flags) {
+    return flags & DXGI_PRESENT_ALLOW_TEARING ? DXGI_ERROR_INVALID_CALL : S_OK;
+}
 HRESULT STDMETHODCALLTYPE RaisingGetDesc(void*, DXGI_SWAP_CHAIN_DESC*) {
+    ++s_desc_queries;
     RaiseException(0xE0000042u, 0, 0, nullptr);
     return 0;
 }
-bool CallPresentCatching(IDXGISwapChain* self) {
+HRESULT STDMETHODCALLTYPE RaisingPresent(IDXGISwapChain*, UINT, UINT) {
+    RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
+    return E_FAIL;
+}
+HRESULT STDMETHODCALLTYPE RaisingPresent1(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*) {
+    RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
+    return E_FAIL;
+}
+bool CallOutermostCatching(IDXGISwapChain* self) {
     __try {
-        s_present_thunks[0](self, 3, 4);
+        // Independently exercise the dedup termination handler. Raise at selection,
+        // before the body constructs the native gate or readiness objects.
+        PresentOutermost(RejectTearing, false, 0, nullptr, self, 3, 4);
         return false;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (GetExceptionCode() == 0xE0000042u ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
         return true;
     }
 }
@@ -1084,11 +1099,25 @@ void TestDedupSehUnwind() {
     const int saved_mode = s_vsync_mode.load();
     s_native_handle_override = reinterpret_cast<uint64_t>(&object); // the body runs: this is the selected swapchain
     s_vsync_mode.store(1);                                           // VSync off: ALLOW_TEARING is added ...
-    s_present_targets[0].original = ReturnInvalidCall;                // ... and rejected: the retry path calls GetDesc
-    Check(CallPresentCatching(self), "the structured exception reaches the caller's handler");
+    s_present_targets[0].original = RejectTearing;                    // ... and rejected: the retry path calls GetDesc
+    Check(s_present_thunks[0](self, 3, 4) == S_OK && s_desc_queries == 1,
+          "a fault in the optional description query does not suppress the no-tearing retry");
+    Check(s_callback_depth == 0 && s_readiness_depth == 0 && t_dedup.Depth() == 0,
+          "the retry returned through all Present owners");
+    s_raise_at_selection = true;
+    Check(CallOutermostCatching(self), "a body exception still reaches the caller's handler");
+    s_raise_at_selection = false;
     Check(!t_dedup.Contains(reinterpret_cast<uintptr_t>(&object)) && t_dedup.Depth() == 0,
           "the dedup node was unlinked during the unwind: no dead frame left in the thread's list");
     s_vsync_mode.store(0);
+    s_present_targets[0].original = RaisingPresent;
+    const auto saved_present1 = s_present1_targets[0].original.exchange(RaisingPresent1);
+    Check(s_present_thunks[0](self, 0, 0) == DXGI_ERROR_INVALID_CALL &&
+          s_present1_thunks[0](reinterpret_cast<IDXGISwapChain1*>(self), 0, 0, nullptr) == DXGI_ERROR_INVALID_CALL,
+          "both foreign Present faults return the existing invalid-call HRESULT");
+    Check(s_callback_depth == 0 && s_readiness_depth == 0 && t_dedup.Depth() == 0,
+          "neither original-call exception skips Present cleanup");
+    s_present1_targets[0].original = saved_present1;
     s_present_targets[0].original = InlineProbeOriginal;
     const uint64_t inner_before = EntryCount(NativeGateEntry::InnerPassThrough);
     Check(s_present_thunks[0](self, 3, 4) == 7 && EntryCount(NativeGateEntry::InnerPassThrough) == inner_before,
@@ -1224,14 +1253,15 @@ void TestLoaderNotifications() {
 
 // Boundary fakes, not copied installation/forwarding implementations.
 Config g_config{};
+bool Log_IsEnabled(LogLevel) noexcept { return true; }
 void Log_Write(LogLevel, const char* format, ...) {
       va_list arguments;
       va_start(arguments, format);
       vsnprintf(s_last_test_log, sizeof(s_last_test_log), format, arguments);
       va_end(arguments);
 }
-RuntimeCallbackGuard::RuntimeCallbackGuard() noexcept : stopping_(s_test_stopping) {}
-RuntimeCallbackGuard::~RuntimeCallbackGuard() = default;
+RuntimeCallbackGuard::RuntimeCallbackGuard() noexcept : stopping_(s_test_stopping) { ++s_callback_depth; }
+RuntimeCallbackGuard::~RuntimeCallbackGuard() { --s_callback_depth; }
 bool RuntimeLifecycle_IsStopping() noexcept { return s_test_stopping; }
 HANDLE RuntimeLifecycle_GetStopEvent() noexcept { return nullptr; }
 bool BackgroundTasks_Start(BackgroundTaskProc, void*) noexcept {
@@ -1250,7 +1280,10 @@ bool FrameTimeline_BeginPresentAttempt(
 }
 uint64_t FrameTimeline_GetPresentSwapchainGeneration(uint64_t) noexcept { return 1; }
 uint64_t FrameTimeline_PresentGenerationLockFailures() noexcept { return 0; }
-uint64_t SwapMgr_GetNativeHandle() { return s_native_handle_override ? s_native_handle_override : 0x1000; }
+uint64_t SwapMgr_GetNativeHandle() {
+      if (s_raise_at_selection) RaiseException(0xE0000042u, 0, 0, nullptr);
+      return s_native_handle_override ? s_native_handle_override : 0x1000;
+}
 NativeGateContext NativeGate_GetContext(int64_t now) noexcept { auto c = s_native_context; c.now_qpc = now; return c; }
 void NativeGate_Execute(NativeGateCall* call, uint64_t) noexcept {
       if (call->trace.status != NativeGateStatus::Native) return;
@@ -1369,6 +1402,7 @@ int main() {
     return 0;
 }
 GpuReadinessCall::GpuReadinessCall(const PresentTimelineSpan* span, bool before_gate) noexcept {
+      ++s_readiness_depth;
       s_readiness_span = span;
       if (!span) return;
       Check(span->p_qpc==0 && span->e_qpc==0, "signal instrumentation outside native P/E");
@@ -1377,7 +1411,7 @@ GpuReadinessCall::GpuReadinessCall(const PresentTimelineSpan* span, bool before_
       Check(s_readiness_qpc>=span->native_gate.native_release_qpc, "signal follows existing gate hold");
       ++s_readiness_entries;
 }
-GpuReadinessCall::~GpuReadinessCall() = default;
+GpuReadinessCall::~GpuReadinessCall() { --s_readiness_depth; }
 // Completion runs after the native call, when the attempt span handed to the
 // scope holds its final gate trace and P/E; capture it for the placement checks.
 void GpuReadinessCall::Complete(bool success, bool retried) noexcept {

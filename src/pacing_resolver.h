@@ -245,6 +245,7 @@ struct PacingRuntimeState {
     // game sleep-mode parameters, or the Reflex Sleep bypass): test mode
     // driver_limiter resolves to pass-through with reason DriverLimiterUnavailable.
     bool driver_limiter_unavailable = false;
+    bool fg_dynamic = false; // Streamline mode 3, not the driver's Dynamic MFG passthrough
 };
 
 // ── Result ──
@@ -261,6 +262,7 @@ struct PacingPipelineSnapshot {
     double lead_quantile = 0.99; // q of the lead controller: L = Q_q(X) + allowance (lead_coverage, default 99)
     double allowance_us = 500.0; // defaults: On, so the initial snapshot equals default passthrough
     bool gpu_probes = true;
+    bool observe_fg_inputs = false; // unqualified DX12 NvAPI route: keep collecting handoff evidence
     double gpu_wait_headroom_us = kPacingGpuWaitHeadroomDefaultUs; // the collision guard's release headroom
 };
 
@@ -331,5 +333,7 @@ bool PacingTestMode_FromText(const char* text, PacingTestMode* mode) noexcept;
 // Log and OSD labels.
 const char* PacingRung_Text(PacingRung rung) noexcept;
 const char* PacingFallbackReason_Text(PacingFallbackReason reason) noexcept;
+// Plain summary for a capped route with no output hold; nullptr if the reason needs other status.
+const char* PacingFallbackReason_CappedSummary(PacingFallbackReason reason) noexcept;
 const char* PacingTimingMode_Text(PacingTimingMode mode) noexcept;
 const char* PacingSourcePlacement_Text(PacingSourcePlacement placement) noexcept;

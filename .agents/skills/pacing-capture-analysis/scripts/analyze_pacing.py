@@ -149,7 +149,7 @@ FALLBACK_REASON_NAMES = {0: "none", 1: "passthrough", 2: "idle_cap", 3: "smoothi
                          5: "present_route", 6: "architecture", 7: "api", 8: "fixed_refresh",
                          9: "no_native_route", 10: "no_gpu_queue", 11: "fg_unqualified", 12: "infeasible",
                          13: "fg_route_unsupported",
-                         14: "driver_limiter_unavailable"}
+                         14: "driver_limiter_unavailable", 15: "fg_dynamic"}
 # PacingDisplaySource: display_source cells (empty without a display sample) and the events' snapshot_display_source.
 # Rows carry 1 or 2 only: the in-process sources (3, 4) feed the runtime window without joined rows.
 DISPLAY_SOURCE_NAMES = {1: "etw", 2: "dxgi", 3: "flip_gate", 4: "fg_input"}

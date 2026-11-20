@@ -377,6 +377,34 @@ namespace
         CHECK_RESULT(Resolve(config, capabilities, ActiveFg()), Vrr, Marker, SourceOnly, FgRouteUnsupported);
         capabilities.fg_input_route_ready = true;
         CHECK_RESULT(Resolve(config, capabilities, ActiveFg()), Vrr, Marker, FgInputWait, None);
+
+        runtime = ActiveFg();
+        runtime.fg_dynamic = true;
+        capabilities.fg_input_route_ready = false;
+        CHECK_RESULT(Resolve(config, capabilities, runtime), Vrr, Marker, SourceOnly, FgDynamic);
+        capabilities.fg_separate_presenter = false;
+        result = Resolve(config, capabilities, runtime);
+        CHECK(result.observe_fg_inputs);
+        CHECK_RESULT(result, Vrr, Marker, SourceOnly, FgDynamic);
+        const char* summary = PacingFallbackReason_CappedSummary(result.reason);
+        CHECK(summary && std::strcmp(summary,
+            "Capped: Dynamic frame generation paces its own frames (frames are not held)") == 0);
+        runtime.pre_sleep_available = true;
+        CHECK_RESULT_PLACED(Resolve(config, capabilities, runtime), Vrr, SleepPlacement(), SourceOnly, FgDynamic);
+        runtime.pre_sleep_available = false;
+        capabilities.route = PacingRoute::PclMarkers;
+        result = Resolve(config, capabilities, runtime);
+        CHECK_RESULT(result, Vrr, Marker, SourceOnly, FgDynamic);
+        CHECK(!result.observe_fg_inputs);
+        result = Resolve(config, VulkanPcl(), runtime);
+        CHECK_RESULT(result, Vrr, Marker, SourceOnly, FgDynamic);
+        CHECK(!result.observe_fg_inputs);
+        capabilities.route = PacingRoute::PresentBased;
+        result = Resolve(config, capabilities, runtime);
+        CHECK_RESULT(result, Vrr, Present, SourceOnly, FgDynamic);
+        CHECK(!result.observe_fg_inputs);
+        runtime.dmfg_passthrough = true;
+        CHECK_RESULT(Resolve(config, capabilities, runtime), Off, None, SourceOnly, Passthrough);
     }
 
     // ── Rules 7 and 8: GPU queue wait, else marker hold ──
@@ -563,6 +591,9 @@ namespace
         CHECK(!PacingPipeline_SameResult(base, other));
         other = base;
         other.gpu_probes = !base.gpu_probes;
+        CHECK(!PacingPipeline_SameResult(base, other));
+        other = base;
+        other.observe_fg_inputs = !base.observe_fg_inputs;
         CHECK(!PacingPipeline_SameResult(base, other));
         other = base;
         other.gpu_wait_headroom_us = 1500.0;
@@ -1241,7 +1272,7 @@ namespace
     void TestLabels()
     {
         CheckLabels(static_cast<uint32_t>(PacingRung::Count), PacingRung_Text, PacingRung::Count);
-        CheckLabels(15u, PacingFallbackReason_Text, static_cast<PacingFallbackReason>(15));
+        CheckLabels(16u, PacingFallbackReason_Text, static_cast<PacingFallbackReason>(16));
         CheckLabels(static_cast<uint32_t>(PacingTestMode::Count), PacingTestMode_Text, PacingTestMode::Count);
         CheckLabels(4u, PacingTimingMode_Text, static_cast<PacingTimingMode>(4));
         CHECK(std::strcmp(PacingRung_Text(PacingRung::GpuQueueWait), "gpu_queue_wait") == 0);

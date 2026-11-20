@@ -82,7 +82,7 @@ static bool run_fg_authority_tests() {
     unknown.statement = 3;
     e = FrameGeneration_ResolveState(unknown);
     if (!e.presenting || e.actual != 3 || e.generated != 2 || !e.statement_authority) fail("unobserved mode, 3x");
-    if (FrameGeneration_RouteRejection(false, false, 0, e.presenting, e.generated) != nullptr)
+    if (FrameGeneration_RouteRejection(false, false, 0, e.presenting, e.generated) != FgRouteRejection::None)
         fail("the route refused an unobserved mode at 3x");
     if (FrameGeneration_SelectDivisor(false, e.presenting, e.generated, e.actual, false, 0, false, 0, 3200.0, true,
             e.actual) != 3) fail("divisor of a 3x statement");
@@ -91,7 +91,7 @@ static bool run_fg_authority_tests() {
     automatic.mode_known = true;
     automatic.mode = 2;
     e = FrameGeneration_ResolveState(automatic);
-    if (!e.presenting || FrameGeneration_RouteRejection(false, true, 2, e.presenting, e.generated) != nullptr)
+    if (!e.presenting || FrameGeneration_RouteRejection(false, true, 2, e.presenting, e.generated) != FgRouteRejection::None)
         fail("Auto with a fresh statement");
     // Explicit Off wins over a fresh statement.
     FgFacts off = unknown;
@@ -123,20 +123,26 @@ static bool run_fg_authority_tests() {
     FgFacts dynamic = unknown;
     dynamic.mode_known = true;
     dynamic.mode = 3;
-    if (FrameGeneration_ResolveState(dynamic).statement_authority) fail("dynamic mode took the statement");
+    dynamic.legacy_presenting = true;
+    dynamic.configured_generated = 1;
+    e = FrameGeneration_ResolveState(dynamic);
+    if (e.statement_authority || !e.presenting || e.actual != 0 || e.generated != 1)
+        fail("Dynamic mode changed the inferred state or took a static multiplier");
+    if (FrameGeneration_SelectDivisor(false, e.presenting, e.generated, e.actual, false, 0, true, 3, 0.0,
+            e.statement_authority, e.actual) != 2) fail("Dynamic render cap with one configured generated frame");
     // A higher DRS override still wins while the statement says generation runs.
     if (FrameGeneration_SelectDivisor(false, true, 1, 2, true, 3, true, 1, 0.0, true, 2) != 4)
         fail("a higher DRS override under a 2x statement");
 
     // The route predicate, in its order.
-    if (std::strcmp(FrameGeneration_RouteRejection(true, true, 0, false, 0), "dmfg_passthrough") != 0 ||
-        std::strcmp(FrameGeneration_RouteRejection(false, true, 0, true, 1), "mode_off") != 0 ||
-        std::strcmp(FrameGeneration_RouteRejection(false, true, 3, true, 1), "mode_dynamic") != 0 ||
-        std::strcmp(FrameGeneration_RouteRejection(false, true, 1, false, 1), "fg_not_presenting") != 0 ||
-        std::strcmp(FrameGeneration_RouteRejection(false, true, 1, true, 4), "unsupported_multiplier") != 0 ||
-        std::strcmp(FrameGeneration_RouteRejection(false, false, 0, true, 0), "unsupported_multiplier") != 0 ||
-        FrameGeneration_RouteRejection(false, true, 1, true, 1) != nullptr ||
-        FrameGeneration_RouteRejection(false, true, 2, true, 3) != nullptr)
+    if (FrameGeneration_RouteRejection(true, true, 0, false, 0) != FgRouteRejection::Dmfg ||
+        FrameGeneration_RouteRejection(false, true, 0, true, 1) != FgRouteRejection::Off ||
+        FrameGeneration_RouteRejection(false, true, 3, true, 1) != FgRouteRejection::Dynamic ||
+        FrameGeneration_RouteRejection(false, true, 1, false, 1) != FgRouteRejection::NotPresenting ||
+        FrameGeneration_RouteRejection(false, true, 1, true, 4) != FgRouteRejection::UnsupportedMultiplier ||
+        FrameGeneration_RouteRejection(false, false, 0, true, 0) != FgRouteRejection::UnsupportedMultiplier ||
+        FrameGeneration_RouteRejection(false, true, 1, true, 1) != FgRouteRejection::None ||
+        FrameGeneration_RouteRejection(false, true, 2, true, 3) != FgRouteRejection::None)
         fail("the route predicate");
     return ok;
 }

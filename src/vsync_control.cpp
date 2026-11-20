@@ -186,6 +186,13 @@ static HRESULT InvokePresent1(
     __except(EXCEPTION_EXECUTE_HANDLER) { return DXGI_ERROR_INVALID_CALL; }
 }
 
+// Optional diagnostics for a rejected tearing flag. Like the Present calls, contain
+// the foreign COM access below the callback, native-gate and readiness scopes.
+static HRESULT ReadRejectedPresentDesc(IDXGISwapChain* swapchain, DXGI_SWAP_CHAIN_DESC* desc) noexcept {
+    __try { return swapchain->GetDesc(desc); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return E_FAIL; }
+}
+
 template <typename Function>
 struct HookTarget {
     std::atomic<void*> target{ nullptr };
@@ -889,7 +896,7 @@ static void DescribeVtableRoute(uint64_t native, char* out, size_t size) noexcep
 }
 
 // Native route diagnostics while the route is not qualified: a scope/marker-time mismatch is logged
-// once per change (checked every 250 ms), and one line of every counter, at most every 10 s. Called per
+// once per change (checked every 250 ms), with a full counter dump at Debug at most every 10 s. Called per
 // frame after the route capability is published; unqualified, that is one QueryPerformanceCounter.
 static std::atomic<uint64_t> s_diag_logged_mismatch{0};
 static std::atomic<int64_t> s_diag_next_check_qpc{0};
@@ -916,6 +923,7 @@ void VSync_RouteDiagnosticsTick() {
     }
     if (now < s_diag_next_line_qpc.load(std::memory_order_relaxed)) return;
     s_diag_next_line_qpc.store(now + 10 * frequency, std::memory_order_relaxed);
+    if (!Log_IsEnabled(LogLevel::Debug)) return;
     char counters[1400];
     NativeGate_DiagnosticsText(counters, sizeof(counters));
     char present[200], present1[200], rejected_present[200], rejected_present1[200];
@@ -928,19 +936,19 @@ void VSync_RouteDiagnosticsTick() {
     DescribeVtableSlot("rejected-self Present1", rejected, 22, true, s_present1_targets, rejected_present1,
                        sizeof(rejected_present1));
     // Two lines: the log line limit (1024 characters) would cut the hook description behind the counters.
-    LOG_INFO("NativeGate route diagnostics (not qualified): %s; generation_lock_failures=%llu",
+    LOG_DEBUG("NativeGate route diagnostics (not qualified): %s; generation_lock_failures=%llu",
              counters, static_cast<unsigned long long>(FrameTimeline_PresentGenerationLockFailures()));
-    LOG_INFO("NativeGate route hook: %s; %s; last rejected self=0x%llX: %s; %s",
+    LOG_DEBUG("NativeGate route hook: %s; %s; last rejected self=0x%llX: %s; %s",
              present, present1, static_cast<unsigned long long>(rejected), rejected_present, rejected_present1);
     // The hooked bytes against what MinHook wrote, and who calls ReShade's Present (second and third line of
     // the same tick; the stack is captured at the first present event after each tick).
     char watch_present[420], watch_present1[420];
     DescribeWatch("Present", 0, watch_present, sizeof(watch_present));
     DescribeWatch("Present1", 1, watch_present1, sizeof(watch_present1));
-    LOG_INFO("NativeGate hook bytes: %s; %s", watch_present, watch_present1);
+    LOG_DEBUG("NativeGate hook bytes: %s; %s", watch_present, watch_present1);
     char vtable_route[700];
     DescribeVtableRoute(native, vtable_route, sizeof(vtable_route));
-    LOG_INFO("NativeGate vtable route: %s", vtable_route);
+    LOG_DEBUG("NativeGate vtable route: %s", vtable_route);
     char stack[360];
     DescribeStack(stack, sizeof(stack));
     char first_p[24], nonzero_p[24], first_p1[24], nonzero_p1[24], caller_p[64], caller_p1[64];
@@ -955,7 +963,7 @@ void VSync_RouteDiagnosticsTick() {
     const uint64_t event_native = s_event_native.load(std::memory_order_relaxed);
     const uint64_t captured = s_diag_captured.load(std::memory_order_relaxed);
     const uint64_t installed_from = s_diag_installed_object.load(std::memory_order_relaxed);
-    LOG_INFO("NativeGate hook callers: typed Present first call flags %s, first non-zero flags %s, return address "
+    LOG_DEBUG("NativeGate hook callers: typed Present first call flags %s, first non-zero flags %s, return address "
              "0x%llX [%s]; typed Present1 first call flags %s, first non-zero flags %s, return address 0x%llX [%s]; "
              "ReShade present event swapchain 0x%llX: on_present captured 0x%llX (%s), SwapMgr native 0x%llX (%s), "
              "hooks installed from 0x%llX (%s); calls on the stack at the present event, innermost first: %s",
@@ -1081,7 +1089,7 @@ __declspec(noinline) static HRESULT PresentBody(
 
             // Log the swapchain's actual flags for diagnosis
             DXGI_SWAP_CHAIN_DESC desc = {};
-            if (SUCCEEDED(self->GetDesc(&desc))) {
+            if (SUCCEEDED(ReadRejectedPresentDesc(self, &desc))) {
                 LOG_WARN("VSync: swapchain SwapEffect=%d, Flags=0x%X, BufferCount=%u, Windowed=%d",
                          desc.SwapEffect, desc.Flags, desc.BufferCount, desc.Windowed);
             }

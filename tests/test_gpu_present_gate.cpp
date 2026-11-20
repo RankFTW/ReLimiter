@@ -19,9 +19,11 @@ bool StreamlineHandoff_IsCurrent(uint64_t) noexcept { return generic_binding_cur
 #define CHECK(x) do{if(!(x)){std::fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x);std::abort();}}while(false)
 
 // ── Shared gate surface (both architectures) ──
-void PublishRung(PacingRung rung,PacingFallbackReason reason=PacingFallbackReason::None) {
+void PublishRung(PacingRung rung,PacingFallbackReason reason=PacingFallbackReason::None,
+                 bool observe_fg_inputs=false) {
     PacingPipelineSnapshot snapshot;
     snapshot.mode=PacingTimingMode::Vrr;snapshot.route=PacingRoute::NvApiMarkers;
+    snapshot.observe_fg_inputs=observe_fg_inputs;
     snapshot.rung=rung;snapshot.reason=reason;
     snapshot.auto_rung=rung;
     PacingPipeline_Publish(snapshot);
@@ -67,11 +69,16 @@ void TestConfigWord() {
         CHECK(GpuPresent_RequiresReadiness() && GpuPresent_GetConfig().mode==ReadyPresentMode::Active);
     }
     // FG route qualification keeps the observers delivering inputs.
-    PublishRung(PacingRung::SourceOnly,PacingFallbackReason::FgUnqualified);
+    PublishRung(PacingRung::SourceOnly,PacingFallbackReason::FgUnqualified,true);
     CHECK(GpuPresent_RequiresReadiness());
     // So does an unsupported route, so its evidence can still clear.
-    PublishRung(PacingRung::SourceOnly,PacingFallbackReason::FgRouteUnsupported);
+    PublishRung(PacingRung::SourceOnly,PacingFallbackReason::FgRouteUnsupported,true);
     CHECK(GpuPresent_RequiresReadiness());
+    // The Dynamic label changes neither native observer demand nor the PCL fallback.
+    PublishRung(PacingRung::SourceOnly,PacingFallbackReason::FgDynamic,true);
+    CHECK(GpuPresent_RequiresReadiness());
+    PublishRung(PacingRung::SourceOnly,PacingFallbackReason::FgDynamic,false);
+    CHECK(!GpuPresent_RequiresReadiness());
     PublishRung(PacingRung::SourceOnly,PacingFallbackReason::Override);
     CHECK(!GpuPresent_RequiresReadiness());
     PublishRung(PacingRung::MarkerHold,PacingFallbackReason::NoGpuQueue);
@@ -348,7 +355,7 @@ void TestWorkerModeLifecycle() {
     };
     mmcss_failure=0;
     // No H3 rung for the whole lifetime: no MMCSS request, not even for the stop drain.
-    PublishRung(PacingRung::SourceOnly,PacingFallbackReason::FgUnqualified);
+    PublishRung(PacingRung::SourceOnly,PacingFallbackReason::FgUnqualified,true);
     CHECK(GpuPresent_RequiresReadiness() && !gpu_present_shared::H3Demand());
     mmcss_loaded=mmcss_registered=mmcss_prioritized=mmcss_reverted=mmcss_freed=0;
     CHECK(GpuPresent_Start());

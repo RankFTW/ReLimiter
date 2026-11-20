@@ -1771,6 +1771,7 @@ void OnMarker(
     // the native gate and GPU readiness read it.
     NativeGate_ObserveFrameGeneration(fg_divisor_raw, FrameTimeline_CurrentControllerGeneration());
     runtime.fg_presenting = fg_divisor_raw > 1;
+    runtime.fg_dynamic = runtime.fg_presenting && Streamline_RouteRejection() == FgRouteRejection::Dynamic;
 
     const int target_fps = g_user_target_fps.load(std::memory_order_relaxed);
     if (target_fps != s_last_target_fps || fg_divisor_raw != s_last_fg_divisor_raw) {

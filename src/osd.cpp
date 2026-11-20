@@ -309,6 +309,10 @@ static void DrawPacingSummaryLine(const PacingPipelineSnapshot& pipeline, bool h
             ImGui::TextColored(gray, "Test mode driver_limiter: not applied right now (the game runs as it is)");
         return;
     }
+    if (const char* capped = PacingFallbackReason_CappedSummary(pipeline.reason)) {
+        ImGui::TextColored(gray, "%s", capped);
+        return;
+    }
     switch (pipeline.reason) {
     case PacingFallbackReason::Passthrough:
         ImGui::TextColored(gray, g_config.target_fps > 0 ? "Not pacing right now" : "No FPS cap set");
@@ -318,12 +322,6 @@ static void DrawPacingSummaryLine(const PacingPipelineSnapshot& pipeline, bool h
         return;
     case PacingFallbackReason::DriverLimiterUnavailable:
         ImGui::TextColored(gray, "Test mode driver_limiter: the NVIDIA limiter can't apply here (the game runs as it is)");
-        return;
-    case PacingFallbackReason::PresentRoute:
-        ImGui::TextColored(gray, "Capped: smooth pacing needs NVIDIA Reflex in the game");
-        return;
-    case PacingFallbackReason::FgRouteUnsupported:
-        ImGui::TextColored(gray, "Capped: frame generation paces its own frames here (frames are not held)");
         return;
     case PacingFallbackReason::NoNativeRoute:
     case PacingFallbackReason::NoGpuQueue:
@@ -1436,6 +1434,8 @@ static void DrawSettingsImpl(reshade::api::effect_runtime* runtime, bool editabl
         const int fg_div_raw = g_resolved_fg_divisor.load(std::memory_order_relaxed);
         if (dmfg_dynamic_active || g_config.dynamic_mfg_passthrough) {
             ImGui::Text("FG Pacing: Dynamic (passthrough)");
+        } else if (fg_div_raw > 1 && Streamline_RouteRejection() == FgRouteRejection::Dynamic) {
+            ImGui::Text("FG Pacing: Dynamic");
         } else if (fg_div_raw > 1) {
             double eff_us = g_effective_interval_us.load(std::memory_order_relaxed);
             double native_fps = (eff_us > 0.0) ? 1000000.0 / eff_us : 0.0;
@@ -2163,7 +2163,7 @@ static void DrawOSDImpl(reshade::api::effect_runtime* runtime) {
         ? g_reflex_ai_frame_time_us.load(std::memory_order_relaxed) : 0.0;
     const double active_us = (g_config.osd_show_fg || g_config.osd_show_gpu_render_time)
         ? g_reflex_gpu_active_us.load(std::memory_order_relaxed) : 0.0;
-    const bool fg_display_active = g_config.osd_show_fg && fg_presenting && fg_mult > 0 &&
+    const bool fg_display_active = g_config.osd_show_fg && fg_presenting &&
         !(Streamline_HasModeData() && g_fg_mode.load(std::memory_order_relaxed) == 0) &&
         !(active_us > 0.0 && ai_us == 0.0);
     if (!panel_frame && (g_config.osd_show_fps || g_config.osd_show_fg ||
@@ -2175,7 +2175,9 @@ static void DrawOSDImpl(reshade::api::effect_runtime* runtime) {
 #else
     constexpr bool dmfg = false;
 #endif
-    if (fg_display_active && !dmfg && !smooth_motion) {
+    if (fg_display_active && !dmfg && !smooth_motion && Streamline_RouteRejection() == FgRouteRejection::Dynamic) {
+        fg_label = "Dynamic";
+    } else if (fg_display_active && !dmfg && !smooth_motion && fg_mult > 0) {
         // Use actual driver multiplier when available (handles control panel overrides)
         int actual = g_fg_actual_multiplier.load(std::memory_order_relaxed);
         int display_mult = (actual >= 2) ? actual : (fg_mult + 1);

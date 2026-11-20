@@ -41,7 +41,7 @@ static std::vector<char> order;
 std::atomic<int> g_fg_mode{1}, g_fg_multiplier{1};
 std::atomic<bool> g_fg_presenting{true};
 // The resolver's published state (streamline_hooks.cpp), modelled on the globals above: the shared route predicate.
-const char* Streamline_RouteRejection() noexcept {
+FgRouteRejection Streamline_RouteRejection() noexcept {
     return FrameGeneration_RouteRejection(false, true, static_cast<uint32_t>(g_fg_mode.load()), g_fg_presenting.load(),
         g_fg_multiplier.load());
 }
